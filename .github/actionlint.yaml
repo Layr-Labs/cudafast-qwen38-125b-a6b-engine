@@ -1,0 +1,11 @@
+# actionlint configuration.
+#
+# actionlint validates `runs-on` against the labels GitHub itself provides and
+# rejects anything else, so a self-hosted label has to be declared here or the
+# ranked workflow fails the `lint` job on a label that is correct. Declaring it
+# is also the only place in this tree where the ranked label appears outside
+# .github/workflows/benchmark.yml and tools/box-runner/, so keep the three in
+# step: the label IS the track id.
+self-hosted-runner:
+  labels:
+    - qwen3.8-125b-a6b-cuda-v1

@@ -1,0 +1,22 @@
+{
+  "fork": {
+    "repo": "git@github.com:Layr-Labs/ds4.git",
+    "ref": "pin-5f36517",
+    "sha": "5f36517cf15c6b5b780be69a8f0532545e3b9326",
+    "signed": true
+  },
+  "upstream": {
+    "repo": "https://github.com/antirez/ds4",
+    "sha": "110afdd8886586f18fc9b28bc5533152dd10e728"
+  },
+  "vendored_at": "2026-09-04T22:55:38Z",
+  "excluded_paths": [
+    "dir-steering/out",
+    "gguf-tools/imatrix/dataset",
+    "gguf-tools/quality-testing/data",
+    "misc",
+    "speed-bench"
+  ],
+  "files": 341,
+  "bytes": 18598270
+}

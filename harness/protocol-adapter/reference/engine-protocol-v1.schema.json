@@ -1,0 +1,154 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mlxfast-bench/schema/engine-protocol-v1.schema.json",
+  "title": "Engine Protocol v1",
+  "description": "Newline-delimited JSON (NDJSON) wire between the trusted benchmarker and an untrusted inference engine, over stdio (co-located) or localhost TCP (via bench-agent / compose network). Every line is exactly one WorkerRequest or one WorkerResponse. Ported from the Swift RuntimeWorkerRequest / RuntimeWorkerResponse Codable structs (Sources/MLXFastHarness/QwenRuntimeWorker.swift) plus the Phase-0 hello handshake fields (docs/architecture.md §3).",
+  "oneOf": [
+    { "$ref": "#/$defs/WorkerRequest" },
+    { "$ref": "#/$defs/WorkerResponse" }
+  ],
+  "$defs": {
+    "WorkerRequest": {
+      "type": "object",
+      "description": "Benchmarker -> engine. Ported from Swift RuntimeWorkerRequest. `id` correlates the response; `kind` selects the message. Optional fields are present only for the kinds that use them and are OMITTED (not null) when unused, matching Swift's encodeIfPresent.",
+      "additionalProperties": false,
+      "required": ["id", "kind"],
+      "properties": {
+        "id": {
+          "type": "integer",
+          "description": "Monotonic request id echoed back on the response. 64-bit signed."
+        },
+        "kind": {
+          "type": "string",
+          "description": "Message kind.",
+          "enum": [
+            "prefill",
+            "decode_begin",
+            "decode_step",
+            "correctness",
+            "correctness_begin",
+            "correctness_step",
+            "phase_diagnostics"
+          ]
+        },
+        "prompt_tokens": {
+          "type": "array",
+          "description": "Prompt token IDs. Used by prefill, correctness, correctness_begin.",
+          "items": { "type": "integer" }
+        },
+        "token": {
+          "type": "integer",
+          "description": "Single input token ID. Used by decode_step and correctness_step."
+        },
+        "seed_tokens": {
+          "type": "array",
+          "description": "Whole-prompt seed token IDs for the single charged seed forward. Used by decode_begin.",
+          "items": { "type": "integer" }
+        },
+        "steps": {
+          "type": "integer",
+          "description": "Number of free-run greedy steps. Used by correctness."
+        }
+      }
+    },
+    "WorkerResponse": {
+      "type": "object",
+      "description": "Engine -> benchmarker. Ported from Swift RuntimeWorkerResponse. `id` echoes the request (-1 for a response to an unparseable line); `ok` is the success flag. Optional fields are present only for the kinds that produce them and are OMITTED (not null) when unused, matching Swift's encodeIfPresent. protocol_version / backend / device are new in v1 and meaningful only on the hello (id=0) message.",
+      "additionalProperties": false,
+      "required": ["id", "ok"],
+      "properties": {
+        "id": {
+          "type": "integer",
+          "description": "Echoes the request id; -1 when the request line could not be parsed."
+        },
+        "nonce": {
+          "type": "string",
+          "description": "Per-session nonce established on the hello; echoed on every subsequent response and validated by the parent."
+        },
+        "ok": {
+          "type": "boolean",
+          "description": "True on success. On false the session for that phase is discarded."
+        },
+        "error": {
+          "type": "string",
+          "description": "Human-readable error string, present only when ok is false."
+        },
+        "token": {
+          "type": "integer",
+          "description": "Materialized output token ID. Produced by prefill, decode_step, correctness_begin, correctness_step."
+        },
+        "top_logits": {
+          "type": "array",
+          "description": "Top-K (K=8) logits for the teacher-forced anchor gate. Produced by correctness_begin / correctness_step.",
+          "items": { "$ref": "#/$defs/CorrectnessTraceLogit" }
+        },
+        "seed_token": {
+          "type": "integer",
+          "description": "Token from the single seed forward. Produced by decode_begin."
+        },
+        "tokens": {
+          "type": "array",
+          "description": "Free-run greedy token IDs. Produced by correctness.",
+          "items": { "type": "integer" }
+        },
+        "expert_stats": {
+          "$ref": "#/$defs/ExpertStreamingStats",
+          "description": "Expert-streaming counters. Produced by hello, correctness_begin, correctness_step, phase_diagnostics (NOT plain correctness, which returns only tokens + peak_ram_gb — see PROTOCOL.md). Zeroed for the RAM-resident dense runtime."
+        },
+        "peak_ram_gb": {
+          "type": "number",
+          "description": "Peak resident set size in GB, engine-reported and distrusted for scoring. Produced by correctness, correctness_begin, correctness_step, phase_diagnostics."
+        },
+        "protocol_version": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "NEW in v1. Engine's implemented protocol version (currently 1). Meaningful only on the hello."
+        },
+        "backend": {
+          "type": "string",
+          "description": "NEW in v1. Compute backend, e.g. \"mlx\" or \"cuda\". Meaningful only on the hello."
+        },
+        "device": {
+          "type": "string",
+          "description": "NEW in v1. Device identity, e.g. \"m5\" or \"gb10\". Meaningful only on the hello."
+        },
+        "completed_work": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "NEW in v1. Monotonic count of timed step-requests the engine completed in the current phase, reported on phase_diagnostics. The parent fails the run if it does not equal the number of timed steps it issued (architecture §3, phase-close barrier)."
+        }
+      }
+    },
+    "CorrectnessTraceLogit": {
+      "type": "object",
+      "description": "Ported from Swift CorrectnessTraceLogit (Sources/MLXFastHarness/QwenRuntime.swift). No CodingKeys, so JSON keys are literally token/logit.",
+      "additionalProperties": false,
+      "required": ["token", "logit"],
+      "properties": {
+        "token": { "type": "integer", "description": "Token ID." },
+        "logit": { "type": "number", "description": "Logit value (f64)." }
+      }
+    },
+    "ExpertStreamingStats": {
+      "type": "object",
+      "description": "Ported from Swift ExpertStreamingStats (Sources/MLXFastCore/ExpertStreamingStats.swift). All fields required; the dense RAM-resident runtime reports the zero struct.",
+      "additionalProperties": false,
+      "required": [
+        "expert_cache_hits",
+        "expert_cache_misses",
+        "expert_cache_evictions",
+        "expert_bytes_read",
+        "expert_read_seconds",
+        "expert_peak_cached_tensors"
+      ],
+      "properties": {
+        "expert_cache_hits": { "type": "integer", "minimum": 0 },
+        "expert_cache_misses": { "type": "integer", "minimum": 0 },
+        "expert_cache_evictions": { "type": "integer", "minimum": 0 },
+        "expert_bytes_read": { "type": "integer", "minimum": 0 },
+        "expert_read_seconds": { "type": "number" },
+        "expert_peak_cached_tensors": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

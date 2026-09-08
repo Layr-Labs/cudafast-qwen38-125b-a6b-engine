@@ -1,0 +1,400 @@
+# Engine CI -- the automated gate this repository had none of.
+#
+# Scope, deliberately: BUILD AND TEST ONLY.
+#   - no credential of any kind, and a step below trips if a workflow in this
+#     tree starts referencing one, inheriting the caller's, or asking for a
+#     write permission;
+#   - no artifact upload FROM CI, same self-check -- this repository can receive
+#     organizer-material fixtures, and an artifact is a way out of the runner.
+#     The ranked pipeline's score.json upload is the one narrow exception, and
+#     the scan checks it (pinned action, score.json only, if-no-files-found:
+#     error) rather than exempting it. That scan is a named-pattern tripwire
+#     over .github/, not a proof of confinement: see the header of
+#     tools/ci-workflow-egress-scan.sh for exactly what it does and does not
+#     detect;
+#   - no submodule checkout at checkout time, and NO SUBMODULE AT ALL. The ds4
+#     engine is VENDORED into this repository as plain files, so the checkout
+#     carries it and every ds4 step below runs on every pull request with no
+#     credential. It used to be a submodule pinned to the INTERNAL Layr-Labs/ds4,
+#     which a credential-free clone could not read, so those steps skipped with
+#     a ::warning::. Vendoring closed that gap: the engine now builds in CI.
+#     benchd stays a channel prebuilt (tools/fetch-benchd.sh). The setting is
+#     retained so a future submodule cannot pull a credential into this
+#     pipeline, which is required to hold none.
+#   - no model weights, no R2, no ranked box, and no network fetch beyond one
+#     dependency graph: the protocol adapter's two crates.io dependencies
+#     (serde, serde_json), which the adapter step resolves against its committed
+#     Cargo.lock. That is dependency resolution, not data.
+#
+# TWO JOBS, both hosted, no credential in either. The Apple-Metal/Swift seed
+# package was removed in the final de-Swift (Stage 5a), and the macOS `swift
+# build`/`swift test` job went with it: the scored engine is the Rust Engine
+# Protocol v1 adapter (harness/protocol-adapter), exercised by cargo here, and
+# there is no Swift to build.
+#
+#   `lint`       hosted x86 ubuntu: hygiene, the adapter's mock-backend tests,
+#                and the CPU syntax check of the ds4 pin. No CUDA.
+#   `cuda-build` hosted aarch64 ubuntu: the REAL nvcc build of the ds4 engine,
+#                off-box. It holds no credential either, and it uploads
+#                nothing; it fetches the pinned CUDA devel image, the container
+#                packages it needs and a pinned rust toolchain, which is more
+#                network than `lint` takes and is the price of compiling CUDA
+#                at all. See tools/ds4/ci-container-build.sh for exactly what
+#                it proves and what it cannot (there is no device: nothing
+#                about execution).
+#
+# The ranked pipeline is NOT in this file and must never be. This track's
+# ranked pipeline is .github/workflows/benchmark.yml (workflow_dispatch only,
+# self-hosted, no credential), which benchmark.json's runner.workflow names.
+# That is the single ranked workflow for this track; a ranked dispatch does not
+# consult this file.
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint (repo hygiene, hosted)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          submodules: false
+          persist-credentials: false
+
+      - name: No workflow takes a credential or ships a file out
+        # The tripwire under the constraint that keeps organizer material
+        # inside the runner. The scan lives in tools/ so its patterns are not
+        # inside the directory it scans.
+        run: tools/ci-workflow-egress-scan.sh
+
+      - name: actionlint
+        # A pinned release BINARY, hash-verified before it is allowed to run.
+        # This step used to be `docker://rhysd/actionlint@sha256:b1934ee5...`,
+        # and could not stay one: the org's Actions policy admits GitHub-owned
+        # actions by 40-hex SHA plus an explicit pattern allow-list, and a
+        # `docker://` reference is on neither list. The SOURCE is what is
+        # disallowed, so digest-pinning it does not rescue it -- a container
+        # reference here makes the ENTIRE workflow a startup_failure, with zero
+        # jobs created, before any of the gates below get to run.
+        #
+        # The property the digest pin bought is kept, by the same means in a
+        # different shape. A mutable reference would be a remote party's
+        # ability to change what executes in this job, so: the version is
+        # fixed, the release tarball's sha256 is hardcoded here, and the binary
+        # runs ONLY if the hash it actually has matches. A swapped, tampered,
+        # or truncated asset fails the step instead of executing. The version
+        # below is 1.7.12 -- the same one the retired digest resolved to, so
+        # this is a mechanism change and not a version change.
+        #
+        # Kept at 1.7.12 (it once had to be >= a version that knows the macos-26
+        # label the retired swift job used; that job is gone, but there is no
+        # reason to move off a known-good pin). Bump the version and the checksum
+        # together; the checksum is the matching line from that release's
+        # actionlint_<version>_checksums.txt.
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          # linux amd64 because this job is `runs-on: ubuntu-latest`. Pick the
+          # asset that matches the runner if that ever changes.
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+
+          workdir="$(mktemp -d)"
+          tarball="${workdir}/actionlint.tar.gz"
+          url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+
+          curl --fail --silent --show-error --location --retry 3 -o "${tarball}" "${url}"
+
+          # Fail closed, and verify BEFORE extracting or executing anything:
+          # an unverified binary must never get a chance to run.
+          if ! printf '%s  %s\n' "${ACTIONLINT_SHA256}" "${tarball}" | sha256sum --check --status; then
+            echo "::error::actionlint ${ACTIONLINT_VERSION} tarball does not match its pinned sha256; refusing to execute it" >&2
+            echo "  expected ${ACTIONLINT_SHA256}" >&2
+            echo "  actual   $(sha256sum "${tarball}" | cut -d ' ' -f 1)" >&2
+            exit 1
+          fi
+          echo "ok: actionlint ${ACTIONLINT_VERSION} matches its pinned sha256"
+
+          tar -xzf "${tarball}" -C "${workdir}" actionlint
+          chmod +x "${workdir}/actionlint"
+
+          # The same invocation the container ran: the image's entrypoint IS
+          # actionlint, and `-color` was the whole of its `args:`.
+          "${workdir}/actionlint" -color
+
+      - name: Shell syntax and shellcheck
+        # Every tracked *.sh is bash or sh (the Vendor/mlx-swift zsh scripts
+        # went with the Metal-runtime scrub, and the whole Swift seed package
+        # with the final de-Swift). A future zsh shebang hits the `*)` arm and
+        # fails the run loudly rather than going unchecked.
+        #
+        # THE VENDORED ENGINE IS EXCLUDED. ds4/ is upstream code carried in this
+        # repository, not code this repository writes: it has its own shell
+        # conventions and its scripts do not pass this gate (SC1007 in
+        # download_model.sh, SC2164 in tests/test_gpu_args_cli.sh). Fixing them
+        # here would diverge from the port and be overwritten by the next
+        # tools/ds4/vendor-sync.sh. The gate is about OUR scripts; the engine is
+        # gated by whether it BUILDS, which the steps below do.
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' script; do
+            case "$(head -n 1 "${script}")" in
+              '#!/usr/bin/env bash'|'#!/bin/bash')
+                bash -n "${script}"
+                ;;
+              '#!/usr/bin/env sh'|'#!/bin/sh')
+                sh -n "${script}"
+                ;;
+              *)
+                echo "unsupported shell script interpreter: ${script}" >&2
+                exit 1
+                ;;
+            esac
+          done < <(git ls-files -z '*.sh' ':!:ds4/**')
+
+          # The sweep. Its tool ships in the hosted image, so this adds no
+          # download and no egress. The whole tree passes at warning severity
+          # today; the gate keeps it that way. A script that needs an exception
+          # carries an inline suppression with the reason next to it.
+          #
+          # No comment in this block may start with the tool's own name: the
+          # workflow linter shellchecks these run blocks, and a comment that
+          # opens that way is read as a malformed directive.
+          shellcheck --version
+          git ls-files -z '*.sh' ':!:ds4/**' | xargs -0 shellcheck -S warning
+
+      - name: Benchmark manifest lint
+        run: |
+          set -euo pipefail
+          # --gitlink-targets report downgrades a command target missing ONLY
+          # because its submodule is not checked out. Since benchd became a
+          # pinned PREBUILT there is no submodule and every command target lives
+          # in this repository, so nothing is downgraded and all three commands
+          # are fully verified here. See docs/ci-coverage.md.
+          python3 tools/lint-benchmark-manifest.py --gitlink-targets report
+
+      - name: cuda-engine staging revert-proof
+        # Asserts setup.sh stages the scored cuda-engine adapter at the fixed
+        # path benchd resolves (.build/release/mlxfast-runtime-worker) and that
+        # setup.sh actually invokes the staging step. Goes RED if the setup.sh
+        # call is dropped or the destination is repointed off that path.
+        #
+        # It also covers the ENGINE BUILD CACHE: that a restore stages
+        # byte-identical content to a build, that an incomplete or
+        # foreign-workspace entry is refused rather than run, and that setup.sh
+        # refuses a staged engine whose MANIFEST names a different ds4 commit.
+        # Fully hermetic (no toolchain, cargo build, weights, GPU, or network):
+        # each case copies the real tools into a throwaway root -- the cache
+        # cases into a synthetic git repository with a recorded ds4 gitlink --
+        # and drives them with stub binaries.
+        run: tools/test-cuda-engine-staging.sh
+
+      - name: benchd platform gate
+        # The shared bench channel publishes one benchd pair per platform and
+        # both carry the same manifest fields, so branch, byte count and sha256
+        # all PASS on the wrong pair. Only target_triple and the binary's own
+        # container format separate them. Hermetic: no network, no benchd.
+        run: tools/test-fetch-benchd-platform.sh
+
+      - name: benchd channel second binary (record-correctness-golden)
+        # The channel now publishes the golden AUTHOR beside benchd and
+        # declares it in a `binaries` object, while the six legacy top-level
+        # fields keep describing benchd. BOTH manifest shapes are live, so
+        # this pins both: the legacy shape stays benchd-only, the new shape
+        # stages and verifies the recorder, and a recorder that does not match
+        # its entry is refused by name with nothing installed. It also reads
+        # the new manifest with the LEGACY six-field expression, so a
+        # pretty-printed per-binary entry turns this red. Hermetic: no network,
+        # no benchd.
+        run: tools/test-fetch-benchd-recorder.sh
+
+      - name: Engine Protocol adapter (cargo test + clippy + fmt)
+        # The adapter is proven against its deterministic mock backend and a
+        # scripted ds4 session, so this needs no GPU and no CUDA toolchain. The
+        # `ds4-engine` feature is type-checked by clippy but never linked here:
+        # linking needs libds4qwen.so, which only tools/ds4/build.sh on a CUDA
+        # box produces.
+        #
+        # This is the ONE step that resolves crates.io, against the committed
+        # Cargo.lock (serde + serde_json and their transitive graph). The
+        # ubuntu image ships the toolchain, clippy and rustfmt.
+        run: |
+          set -euo pipefail
+          cargo fmt --manifest-path harness/protocol-adapter/Cargo.toml -- --check
+          cargo clippy --manifest-path harness/protocol-adapter/Cargo.toml \
+            --all-targets -- -D warnings
+          cargo clippy --manifest-path harness/protocol-adapter/Cargo.toml \
+            --all-targets --features ds4-engine -- -D warnings
+          cargo test --manifest-path harness/protocol-adapter/Cargo.toml
+
+      - name: G1 refuses a leg that generated nothing
+        # A zero-output regression on ds4 278b799 read as a PASSING gate: with
+        # empty stdout the stream comparison never ran and the gate said
+        # stream_mismatch, and two legs that both emitted only a banner compared
+        # byte-identical and it said ok. The driver now parses the engine's own
+        # counts -- in both the old and the new timing-line shape, since the new
+        # one arrives with a vendor-sync -- and refuses by name. Hermetic: sed,
+        # grep and bash; no GPU, artifact, lock or Linux.
+        run: tools/test-qwen4exp-g1-no-output.sh
+
+      - name: Participant may edit the engine (surface, harness hash, cache, build)
+        # THE VENDORING PROOF. ds4/ is participant-editable now, and this is what
+        # keeps that true: the REAL surface gate admits a ds4/ edit and still
+        # refuses one to fixtures/; benchd's harness hash does not move for an
+        # engine edit, does move for a harness edit, and moves for a tools/ edit
+        # so the transcribed roster is provably live; and an engine edit changes
+        # the build-cache key and still passes the CPU build. Hermetic: no
+        # weights, GPU, CUDA toolchain or network.
+        run: tools/test-participant-engine-edit.sh
+
+      - name: A fresh clone builds the engine with no submodule step
+        # THE PROPERTY VENDORING BOUGHT, asserted rather than assumed. A clone
+        # of this repository carries the engine: no `git submodule update`, no
+        # credential, no internal repository. The clone is made from the
+        # checkout itself, so it is exactly the bytes a participant's fork would
+        # carry, and the documented CPU entry point runs against it.
+        run: |
+          set -euo pipefail
+          fresh="$(mktemp -d)"
+          git clone --quiet --depth 1 "file://${GITHUB_WORKSPACE}" "${fresh}/repo"
+          cd "${fresh}/repo"
+          test ! -f .gitmodules
+          test -f ds4/ds4.c && test -f ds4/VENDOR.json && test -f ds4/Makefile
+          tools/ds4/build.sh --cpu-check
+          echo "a fresh clone carries the engine and passes the CPU build"
+
+      - name: ds4 engine and shim (CPU syntax check)
+        # Syntax-checks the VENDORED ds4.c (-DDS4_NO_GPU) and the adapter's C
+        # shim against its header. No CUDA: this proves the engine tree and the
+        # shim agree. It runs unconditionally now -- the tree is in the
+        # checkout, so there is nothing to fetch and nothing to skip.
+        run: tools/ds4/build.sh --cpu-check
+
+      - name: Resident engine (one load per window)
+        # Drives the REAL tools/serve-up.sh, the REAL resident server source
+        # and the REAL cuda-engine adapter against a synthetic ds4_shim.h
+        # engine: four fresh workers, ONE load, a session reset at every phase
+        # boundary, counters over the wire, a memory plan that refuses before
+        # any load, clean teardown, and the per-phase idle ceiling. Hermetic:
+        # cc, cargo and python3 only -- no CUDA, no driver, no checkpoint, no
+        # network.
+        run: tools/test-ds4-resident.sh
+
+      - name: Serve memory plan (the n-gram table is not resident)
+        # Drives the REAL tools/serve-up.sh memory plan against synthetic GGUF
+        # tensor indexes. Proves the subtraction of the SSD-resident n-gram
+        # table to the kilobyte (accept at the resident need, refuse one
+        # kilobyte below it), the printed plan table, the refusals when the
+        # table is absent or is a type the engine does not stream, and that no
+        # environment variable relaxes the refusal. Hermetic: bash, awk and
+        # python3 -- no weights, GPU, or network.
+        run: tools/test-serve-up-plan-memory.sh
+
+      - name: Benchmark facade exports the track id
+        # Drives the REAL tools/benchmark.sh with a stub benchd and asserts
+        # that MLXFAST_QWEN_MTP_TRACK_ID reaches benchd equal to
+        # benchmark.json's trackId in every mode, and that a manifest without
+        # one refuses before benchd is spawned. Hermetic: no toolchain,
+        # weights, GPU, or network.
+        run: tools/test-benchmark-facade-env.sh
+
+      - name: Speculative declaration envelope
+        # Drives the REAL tools/spec-declaration.sh against the REAL contract
+        # fixture and asserts the draft-depth envelope it enforces before any
+        # serve boots: 1..6 accepted, 7..8 refused as not contract-permitted, 9
+        # refused by the structural ceiling. Reads the shipping
+        # mtp_head.permitted_draft_depths, so WIDENING the envelope past 6 turns
+        # this red. Hermetic: jq only, no toolchain, serve, GPU, or network.
+        run: tools/test-spec-declaration.sh
+
+      - name: Calibration driver mechanics
+        # Drives the REAL tools/qwen4exp-calibrate.sh with stub collaborators and
+        # pins its wiring claim: ONE serve-up boot for the whole calibration (one
+        # weights load), ONE weights hash reused by every pass, one serial
+        # capture per timed-pool golden with no spec flag anywhere, one CV-gated
+        # calibrate-baseline over the merged records, and NO edit to any golden,
+        # fixture or manifest. Also pins the refusals: a non-serial declared
+        # spec, fewer than two legs, an unknown argument. Hermetic: jq only, no
+        # toolchain, lock, serve, GPU, weights or network.
+        run: tools/test-qwen4exp-calibrate.sh
+
+  cuda-build:
+    name: cuda build (ds4 engine, hosted aarch64, no GPU)
+    # THE ARCH IS THE POINT. nvcc emitting sm_121a SASS has to run natively on
+    # aarch64 -- under QEMU it is unusably slow -- so this is GitHub's hosted
+    # arm64 linux runner, which the org's Enterprise plan admits for private
+    # and internal repositories. It is a hosted runner and NOT a ranked box:
+    # no GPU, no driver, no weights, no self-hosted label. The ranked pipeline
+    # stays in benchmark.yml, as the header says.
+    runs-on: ubuntu-24.04-arm
+    # This job builds TWICE (see the script: the second pass exercises
+    # build.sh's stub fallback), and 13.0's ptxas is slower on these kernels
+    # than 13.3's -- about 2.5 minutes per build on a 4-core host, more on this
+    # 2-core runner. 30 minutes no longer left comfortable headroom for the two
+    # builds plus the image pull, apt, rustup and the tests, so this is 40.
+    timeout-minutes: 40
+    # No cache. Nothing else in this file caches, and the two candidates both
+    # cost more than they buy here: the cargo registry is two crates, and the
+    # container layers would have to be saved and reloaded through the runner's
+    # own store on every run.
+    env:
+      # The aarch64 CUDA 13.0 devel image, BY DIGEST (nvcc 13.0.88).
+      #
+      # THE TOOLKIT FAMILY IS THE FLEET'S, NOT THE RC HOST'S. A stock DGX Spark
+      # ships CUDA 13.0.x, and the goldens are authored on that toolchain, so
+      # CI has to compile with it: a gate that builds with a toolkit the fleet
+      # does not run can go green on code the fleet cannot build. The engine's
+      # RC host is on 13.3.73, and 13.3 was this job's first pin; 13.0 was then
+      # measured against the same tree and passes identically -- all 10 kernel
+      # cubins sm_121a, both links, 52/52 -- so nothing in the engine depends
+      # on a 13.3-only toolkit feature. It is only slower to compile.
+      #
+      # Pinning by digest is the point: this job's value is that the toolchain
+      # it compiles with is a fixed, known thing.
+      CUDA_IMAGE: nvcr.io/nvidia/cuda@sha256:7d2f6a8c2071d911524f95061a0db363e24d27aa51ec831fcccf9e76eb72bc92
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          # Same reason as the lint job: the engine is vendored, so there is
+          # no submodule to initialize and none can pull a credential into a
+          # pipeline that is required to hold none.
+          submodules: false
+          persist-credentials: false
+
+      - name: Build the ds4 CUDA engine off-box and test the adapter
+        # Everything happens inside the pinned container: the runner image
+        # itself is never mutated. The script installs the container's
+        # prerequisites, runs the real tools/ds4/build.sh, proves every kernel
+        # cubin is sm_121a, then runs the adapter's tests with --features ds4-engine -- the
+        # feature `lint` can only type-check, because linking it needs the
+        # libds4qwen.so this job is the first to actually produce. It builds
+        # once more with LIBRARY_PATH removed, so build.sh's stub-fallback
+        # branch is exercised rather than assumed; that second build is why
+        # the timeout has the headroom it has.
+        #
+        # The kernel-cubin assert covers the port's qwen4exp translation unit
+        # too: it is compiled without --use_fast_math and lands in the same
+        # library.
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --volume "${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}" \
+            --workdir "${GITHUB_WORKSPACE}" \
+            --env DS4_BUILD_JOBS="$(nproc)" \
+            "${CUDA_IMAGE}" \
+            bash tools/ds4/ci-container-build.sh
