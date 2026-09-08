@@ -129,7 +129,7 @@
 #     tools/ranked-box-preflight.sh (section 5) and the pinned benchd refuse to
 #     seal an official scoring artifact while it is false (or absent).
 #
-# Trigger: workflow_dispatch ONLY. There is deliberately no `pull_request`,
+# Trigger: workflow_dispatch ONLY (Yukon dispatches it for every submission). There is deliberately no `pull_request`,
 # `push` or `schedule` trigger -- Yukon dispatches a submission explicitly, and
 # a pull_request trigger would run every submission twice on the one box.
 
