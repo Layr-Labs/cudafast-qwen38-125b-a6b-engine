@@ -144,7 +144,6 @@ The benchmarker applies a per-stream token-tolerance gate with a 10% budget.
 There is ONE speculative arm. `allowed_modes` declares `serial` and `mtp`
 only. DFlash was a Gemma-era second arm and is removed from this track.
 
-The repositories stay private until launch.
 
 ## Local runs are directional
 

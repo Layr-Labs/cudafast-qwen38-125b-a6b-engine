@@ -494,7 +494,6 @@ box/organizer work. Nothing in a submission can change the arm state or the pins
 There is ONE speculative arm on this track. `allowed_modes` declares `serial`
 and `mtp` only. DFlash was a Gemma-era second arm and is removed.
 
-The repositories stay private until launch.
 
 ## Submitting
 
