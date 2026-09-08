@@ -179,6 +179,15 @@ if [[ -z "${live_golden_entry}" || "${live_golden_entry}" == "null" ]]; then
 fi
 LIVE_GOLDEN_SHA256="$(printf '%s' "${live_golden_entry}" | jq -r '.sha256 // empty')"
 LIVE_GOLDEN_BYTES="$(printf '%s' "${live_golden_entry}" | jq -r '.bytes // empty')"
+
+# THE SERIAL GOLDEN, kept aside before any per-depth override below. The
+# serial-control leg (leg 1) is serial by construction, so benchd verifies it
+# against THIS tape (--control-golden); the per-depth tape is the candidate
+# leg's oracle only. On the MLX engine the depth-1 tape forks from the serial
+# tape at step 1, so a control leg checked against it dies at step 1.
+SERIAL_GOLDEN_BASENAME="${LIVE_GOLDEN_BASENAME}"
+SERIAL_GOLDEN_SHA256="${LIVE_GOLDEN_SHA256}"
+SERIAL_GOLDEN_BYTES="${LIVE_GOLDEN_BYTES}"
 if ! printf '%s' "${LIVE_GOLDEN_SHA256}" | grep -Eq '^[0-9a-f]{64}$' \
   || ! printf '%s' "${LIVE_GOLDEN_BYTES}" | grep -Eq '^[1-9][0-9]*$'; then
   echo "qwen38-125b-a6b-measure-and-score.sh: live_golden '${LIVE_GOLDEN_NAME}' is unarmed or malformed (sha256='${LIVE_GOLDEN_SHA256}', bytes='${LIVE_GOLDEN_BYTES}'); nothing can be pin-verified against it." >&2
@@ -370,6 +379,24 @@ SCORE_PATH="${MLXFAST_SCORE_PATH:-score.json}"
 # GATE (benchd refuses, pre-GPU, unless official_scoring_enabled: true).
 # --baseline-calibration carries this box's HEALTH BAND: benchd refuses the run
 # when the control leg lands outside it, and never divides by it.
+
+# --control-golden: the serial tape for the serial-control leg. A benchd that
+# does not know the flag verifies leg 1 against the candidate's per-depth tape,
+# which is only the same tape at depth 0; a speculative declaration on such a
+# benchd is refused rather than measured against the wrong oracle.
+CONTROL_GOLDEN_PATH="${GOLDEN_DIR}/${SERIAL_GOLDEN_BASENAME}"
+CONTROL_ARGS=()
+if "${BENCHD}" iterate --help 2>&1 | grep -q -- '--control-golden'; then
+  if [[ ! -f "${CONTROL_GOLDEN_PATH}" ]]; then
+    echo "qwen38-125b-a6b-measure-and-score.sh: serial golden not found at ${CONTROL_GOLDEN_PATH}; the serial-control leg has no tape to verify against." >&2
+    exit 1
+  fi
+  CONTROL_ARGS=(--control-golden "${CONTROL_GOLDEN_PATH}" --control-golden-sha256 "${SERIAL_GOLDEN_SHA256}" --control-golden-bytes "${SERIAL_GOLDEN_BYTES}")
+  echo "qwen38-125b-a6b-measure-and-score.sh: serial-control leg verifies against ${SERIAL_GOLDEN_BASENAME} (sha256 ${SERIAL_GOLDEN_SHA256}, ${SERIAL_GOLDEN_BYTES} bytes)" >&2
+elif [[ "${SPEC_DESC}" != "serial" ]]; then
+  echo "qwen38-125b-a6b-measure-and-score.sh: REFUSING -- the declaration is ${SPEC_DESC} but this benchd has no --control-golden; the serial-control leg would be verified against the ${SPEC_DESC} tape." >&2
+  exit 1
+fi
 iterate_official=(
   "${BENCHD}" iterate
   --engine "${ENGINE_BIN}"
@@ -383,6 +410,7 @@ iterate_official=(
   --baseline-workspace "${BASELINE_WORKSPACE}"
   --baseline-calibration "${BASELINE_CALIBRATION}"
 )
+iterate_official+=( ${CONTROL_ARGS[@]+"${CONTROL_ARGS[@]}"} )
 
 # --box names the runner the band is checked against. benchd reads RUNNER_NAME
 # when the flag is absent, so this is the explicit form of what would happen

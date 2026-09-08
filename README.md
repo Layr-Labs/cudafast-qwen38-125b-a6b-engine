@@ -449,7 +449,9 @@ tools/serve-up.sh --boot --spec serial|mtp --draft-len N --socket-out FILE
 tools/serve-up.sh --stop --socket PATH
 ```
 
-The control leg always gets `--spec serial --draft-len 0`.
+The control leg always gets `--spec serial --draft-len 0`, and benchd verifies
+its tokens against the serial tape (`--control-golden`), never against the
+per-depth tape the candidate leg is scored on.
 
 ### The per-box calibration
 
