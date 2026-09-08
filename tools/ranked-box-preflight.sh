@@ -19,9 +19,10 @@
 # comes from the runner process environment under the name
 # tools/qwen38-125b-a6b-measure-and-score.sh already reads:
 #
-#   MLXFAST_QWEN38_GOLDEN_DIR          directory holding the pinned pool goldens
+#   MLXFAST_QWEN38_GOLDEN_DIR          directory holding the staged track goldens
 #                                      (the live golden this leg scores over plus
-#                                      the rotation set)
+#                                      the rotation set). Required: nothing here
+#                                      is in the checkout.
 #   MLXFAST_BASELINE_WORKSPACE         the built REFERENCE tree the serial-control
 #                                      leg runs on (section 8)
 #   MLXFAST_BASELINE_CALIBRATION       this box's calibration file, the health
@@ -283,15 +284,17 @@ printf '%s' "${hidden_bytes}" | grep -Eq '^[1-9][0-9]*$' \
 ok "timed pool armed: ${pool_count} pinned pool golden(s) + a pinned hidden correctness golden"
 
 # --- 4. the staged tapes match the pins -------------------------------------
-# The pinned pool goldens default to this repo's COMMITTED copy -- present in every
-# checkout and pin-verified below exactly like a staged copy. An env override wins, so
-# a production box points MLXFAST_QWEN38_GOLDEN_DIR at its organizer-staged (hidden)
-# goldens; a job that never wired the env then refuses on CONTENT (a pin mismatch)
-# rather than ABSENCE. The default does NOT weaken the gate: whatever directory is
-# used, every golden is verified byte-then-sha against the contract pins below.
-GOLDEN_DIR="${MLXFAST_QWEN38_GOLDEN_DIR:-${REPO_ROOT}/correctness_prompts/qwen3.8-125b-a6b-cuda-v1}"
+# THE TAPES ARE NEVER IN THE CHECKOUT. They are organizer material published in
+# R2 at the contract's r2_path keys, and the ranked box stages them out of band
+# into the directory its runner service exports as MLXFAST_QWEN38_GOLDEN_DIR.
+# There is no in-repo default to fall back on, so an unset name is a refusal
+# rather than a quiet substitution. Whatever directory is named, every golden is
+# verified byte-then-sha against the contract pins below.
+GOLDEN_DIR="${MLXFAST_QWEN38_GOLDEN_DIR:-}"
+[[ -n "${GOLDEN_DIR}" ]] \
+  || fail "MLXFAST_QWEN38_GOLDEN_DIR is unset; the track goldens are staged onto the box out of band and this job holds no credential to fetch them"
 [[ -d "${GOLDEN_DIR}" ]] \
-  || fail "the pinned pool goldens are not present: MLXFAST_QWEN38_GOLDEN_DIR is unset and the committed default ${GOLDEN_DIR} is absent. Under single-leg the scored run reads only the live golden, but the whole pinned pool is verified here -- stage the goldens (or set MLXFAST_QWEN38_GOLDEN_DIR to the staged directory), then re-dispatch"
+  || fail "MLXFAST_QWEN38_GOLDEN_DIR does not exist or is not a directory: ${GOLDEN_DIR}"
 
 verify_pin() {
   # verify_pin <path> <want_sha256> <want_bytes> <label>

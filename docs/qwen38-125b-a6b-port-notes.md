@@ -108,21 +108,30 @@ The top-level fixtures in `correctness_prompts/`
 of the 1024-token prompts. The model-identity loader rejects them against a Qwen
 target; that rejection is the fail-closed direction.
 
-The track goldens live in `correctness_prompts/qwen3.8-125b-a6b-cuda-v1/`. They
-are Qwen captures (`model_type: qwen4_exp_text`,
-`RadixArk/Qwen3.8-Flash-Next-NVFP4` provenance). There are 8, one per timed-pool
-slot. NONE of them carries a baseline pair: the ranked path is PAIRED, and the
-serial-control leg measured beside the candidate supplies the denominator
-(section 5 of `docs/participant-contract.md`). A golden that carries
+The track goldens are NOT in this repository. They are organizer material: 8
+timed-pool tapes and 6 per-depth oracles, published in R2 at the `r2_path` keys
+`fixtures/qwen3_8_125b_a6b_track.json` pins in `timed_prompt_pool[]` and
+`live_golden_speculative{}`. The ranked box stages them out of band into the
+directory its runner service exports as `MLXFAST_QWEN38_GOLDEN_DIR`.
+`tools/ranked-box-preflight.sh` verifies every file there against the fixture's
+`{sha256, bytes}`, byte count then sha256, and refuses an extra `*.json` in that
+directory. They are never in git.
+
+They are Qwen captures (`model_type: qwen4_exp_text`,
+`RadixArk/Qwen3.8-Flash-Next-NVFP4` provenance). NONE of them carries a baseline
+pair: the ranked path is PAIRED, and the serial-control leg measured beside the
+candidate supplies the denominator (section 5 of
+`docs/participant-contract.md`). A golden that carries
 `benchmark.baseline_prefill_seconds_per_token` or
 `benchmark.baseline_decode_seconds_per_token` is refused on the ranked path, and
-`tools/lint-benchmark-manifest.py` refuses one at rest. `index.tsv` pins each by
-`{sha256, bytes}`, and `fixtures/qwen3_8_125b_a6b_track.json` pins the same
-`{r2_path, sha256, bytes}` in `timed_prompt_pool[]`. `live_golden` names the one
-live scored prompt (`botany`); the other 7 rotate.
-`hidden_correctness_golden` pins the token-fidelity oracle to the live golden.
-`tools/ranked-box-preflight.sh` verifies every staged golden against its pin,
-byte count then sha256, and refuses on any mismatch.
+`tools/lint-benchmark-manifest.py` refuses one at rest. That linter also refuses
+a pinned track golden that reappears in this repository. `live_golden` names the
+one live scored prompt (`botany`); the other 7 rotate.
+`hidden_correctness_golden` pins the token-fidelity oracle to the live golden by
+digest, and the staging tool resolves it among the files it staged.
+
+The organizer stages the set with `tools/fetch-goldens.sh --all --out DIR`,
+which signs its requests with the vendored `tools/download-r2-object.sh`.
 
 LAUNCH STATE (David MTP-0 ruling). The launch reference candidate is stock
 SERIAL (`num_speculative_tokens` 0). The CANDIDATE leg's serve follows the
@@ -242,9 +251,9 @@ changes a measured value.
    the Gemma fixture; there is no geometry pin to gate until that fixture
    exists.
 4. DONE: the 8 track goldens are regenerated as Qwen captures under this track's
-   tokenizer, each carrying its serial baseline, pinned in `index.tsv` and the
-   fixture's `timed_prompt_pool[]` (`live_golden: botany`). Scoring is armed at
-   the serial launch reference (MTP-0).
+   tokenizer, published in R2 and pinned in the fixture's `timed_prompt_pool[]`
+   (`live_golden: botany`). Scoring is armed at the serial launch reference
+   (MTP-0).
 5. Record the target licence.
 6. Finish removing the staged-head residue. The staging script
    (`setup-gemma4-assistant.sh`) and the Swift assistant-head loader were removed
@@ -367,8 +376,8 @@ fork-only environment are all gone: the submodule is UPSTREAM `antirez/ds4`.
   depth 1, so the fixture's `mtp2` and `mtp3` oracle entries were unreachable.
   SUPERSEDED by section 14: the `e2f86b7` sync implements depths 1 to 3.
 
-What this change does NOT do: the goldens under `correctness_prompts/` and the
-per-depth oracles were authored on the vLLM engine over the NVFP4 checkpoint.
+What this change does NOT do: the track goldens and the per-depth oracles were
+authored on the vLLM engine over the NVFP4 checkpoint.
 They do not describe this engine. `official_scoring_enabled` is `false` until
 the goldens are re-authored on ds4 and the serial baseline is re-pinned.
 
@@ -526,9 +535,12 @@ denominator, and a golden that carries a pair is refused.)
 The tool prints the pin patch and writes it to `fixture-pins.json`. It does not
 apply it. These steps are David's:
 
-- copy the goldens into `correctness_prompts/qwen3.8-125b-a6b-cuda-v1/`;
+- publish the goldens to R2 at the `correctness_prompts/qwen3.8-125b-a6b-cuda-v1/`
+  keys, and stage them on the ranked box as `MLXFAST_QWEN38_GOLDEN_DIR`;
 - write the pins into `fixtures/qwen3_8_125b_a6b_track.json`;
 - set `official_scoring_enabled` to `true`.
+
+The goldens never enter this repository.
 
 ## 12. The submodule is our ds4 port (2026-09-03)
 

@@ -3,7 +3,7 @@
 # qwen4exp-golden-reauthor.sh -- re-author this track's goldens on the ds4
 # engine, for track qwen3.8-125b-a6b-cuda-v1.
 #
-# WHY. The pinned goldens under correctness_prompts/qwen3.8-125b-a6b-cuda-v1/
+# WHY. The pinned goldens, staged on this box in MLXFAST_QWEN38_GOLDEN_DIR,
 # were recorded on the previous vLLM engine over the NVFP4 checkpoint. They
 # carry that model's provenance and that engine's token streams, so they
 # describe no run this repository can make. `official_scoring_enabled` is
@@ -174,7 +174,15 @@ TRACK_ID="$(jq -r '.track_id' "${FIXTURE}")"
 LIVE_GOLDEN="$(jq -r '.live_golden' "${FIXTURE}")"
 PROVENANCE_REPO="$(jq -r '.target.upstream_model_id' "${FIXTURE}")"
 PROVENANCE_REV="$(jq -r '.target.upstream_revision' "${FIXTURE}")"
+# The R2 key prefix the pin patch below writes. It is an object key, never a
+# path in this checkout: the goldens are not in git.
 GOLDEN_DIR_REL="correctness_prompts/${TRACK_ID}"
+# Where the pinned goldens this re-author READS are staged on this box.
+# Required on a real run; a dry run reads nothing.
+GOLDEN_STAGE="${MLXFAST_QWEN38_GOLDEN_DIR:-}"
+if [ "${DRY_RUN}" -eq 0 ] && [ -z "${GOLDEN_STAGE}" ]; then
+  die "MLXFAST_QWEN38_GOLDEN_DIR is unset; the pinned goldens this re-author reads are staged on the box out of band"
+fi
 
 # --- refusal 1: the track must not be scoring -------------------------------
 ARMED="$(jq -r '.official_scoring_enabled' "${FIXTURE}")"
@@ -248,7 +256,7 @@ phase_prompts() {
   run mkdir -p "${PROMPT_DIR}"
   local i=0 name pinned sha bytes have_sha have_bytes
   for name in "${POOL_NAMES[@]}"; do
-    pinned="${REPO_ROOT}/${GOLDEN_DIR_REL}/${name}.golden.json"
+    pinned="${GOLDEN_STAGE}/${name}.golden.json"
     sha="$(jq -r ".timed_prompt_pool[${i}].sha256" "${FIXTURE}")"
     bytes="$(jq -r ".timed_prompt_pool[${i}].bytes" "${FIXTURE}")"
     i=$((i + 1))
@@ -385,9 +393,10 @@ phase_patch() {
   cat "${OUT}/fixture-pins.json"
   cat >&2 <<EOF
 
-golden-reauthor: the patch above is NOT applied. Copying the goldens into
-${GOLDEN_DIR_REL}/, writing these pins into fixtures/qwen3_8_125b_a6b_track.json
-and flipping official_scoring_enabled are David's calls.
+golden-reauthor: the patch above is NOT applied. Publishing the goldens to R2
+at the ${GOLDEN_DIR_REL}/ keys, writing these pins into
+fixtures/qwen3_8_125b_a6b_track.json and flipping official_scoring_enabled are
+David's calls. The goldens never enter this repository.
 
 golden-reauthor: TWO PINS THIS RUN CANNOT WRITE.
   * mtp2 and mtp3. The engine implements depths 1 to 3 since e2f86b7, so those
