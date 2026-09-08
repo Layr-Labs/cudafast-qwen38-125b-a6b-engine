@@ -260,7 +260,8 @@ EOF
   # One bad field per calibration file.
   cal_case() { # cal_case LABEL JQ_FILTER NEEDLE
     local label="$1" filter="$2" needle="$3"
-    local path="${WORK}/cal-$(printf '%s' "${label}" | tr -c 'a-z0-9' '-').json"
+    local path
+    path="${WORK}/cal-$(printf '%s' "${label}" | tr -c 'a-z0-9' '-').json"
     write_calibration "${path}" "${filter}"
     expect_refusal "${label}" "${needle}" "MLXFAST_BASELINE_CALIBRATION=${path}"
   }
