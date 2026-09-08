@@ -532,6 +532,30 @@ static int rb_head_truncate(void *ctx, uint32_t pos) {
     return 0;
 }
 
+/* The batched seam entry, bound the way the graph binds it: the same rows
+ * through the same one-row step, in order, keeping only the last row's
+ * outputs.  The exactness property below therefore runs the cycle the way the
+ * engine runs it -- seeds folded into the first draft -- and every head-cache
+ * invariant ref_draft_step checks per row is checked per row here too. */
+static int ref_draft_rows(void *ctx, const int *next_tokens,
+                          const float *hc_rows, uint32_t pos0, uint32_t n,
+                          int *draft_out, float *multi_out) {
+    if (n == 0) return -1;
+    for (uint32_t t = 0; t < n; t++) {
+        int d = -1;
+        const int last = (t + 1u == n);
+        if (ref_draft_step(ctx, next_tokens[t],
+                           hc_rows + (size_t)t * REF_HC_DIM, pos0 + t, &d,
+                           last ? multi_out : NULL) != 0) {
+            return -1;
+        }
+        if (last) *draft_out = d;
+    }
+    return 0;
+}
+
+static int g_ref_batched_draft = 1;
+
 static int ref_build(refmodel *m, ds4_qwen4exp_mtp_model *model,
                      ds4_qwen4exp_rollback_set *set) {
     memset(model, 0, sizeof(*model));
@@ -542,6 +566,7 @@ static int ref_build(refmodel *m, ds4_qwen4exp_mtp_model *model,
     model->decode_token = ref_decode_token;
     model->head_logits = ref_head_logits;
     model->draft_step = ref_draft_step;
+    model->draft_rows = g_ref_batched_draft ? ref_draft_rows : NULL;
 
     ds4_qwen4exp_rollback_init(set);
     const struct { ds4_qwen4exp_state_id id; ds4_qwen4exp_rollback_object o; } objs[] = {
@@ -1934,6 +1959,32 @@ static void test_head_wiring(void) {
           "reach every stream and the hidden half only its own", (double)worst);
     printf("  7 calls in order, eh_proj broadcast exact to %g\n", (double)worst);
 
+    /* The last-row entry the seam's draft_rows binds to: the same rows, the
+     * same launches, and only the final row's argmax and `multi` row read
+     * back.  Row HEAD_ROWS - 1 of the wide call above is the oracle. */
+    {
+        int draft_last[1] = { -1 };
+        float multi_last[HEAD_HC_DIM];
+        const int calls_before = g_log.n_log;
+        CHECK(ds4_qwen4exp_mtp_head_forward_last(&h, next_tokens, multi_in,
+                                                 12u, HEAD_ROWS, draft_last,
+                                                 multi_last,
+                                                 g_err, sizeof(g_err)) == 0,
+              "last-row head forward failed: %s", g_err);
+        CHECK(g_log.n_log - calls_before == n_want,
+              "the last-row forward made %d calls, expected %d",
+              g_log.n_log - calls_before, n_want);
+        CHECK(draft_last[0] == draft[HEAD_ROWS - 1u],
+              "the last-row forward drafted %d, the wide forward's last row "
+              "drafted %d", draft_last[0], draft[HEAD_ROWS - 1u]);
+        CHECK(memcmp(multi_last,
+                     multi_out + (size_t)(HEAD_ROWS - 1u) * HEAD_HC_DIM,
+                     sizeof(multi_last)) == 0,
+              "the last-row forward's multi row differs from the wide "
+              "forward's last row");
+        printf("  last-row entry agrees with the wide forward's final row\n");
+    }
+
     /* A row count above the built capacity is refused by name. */
     CHECK(ds4_qwen4exp_mtp_head_forward(&h, next_tokens, multi_in, 0u,
                                         HEAD_ROWS + 1u, draft, NULL,
@@ -1958,6 +2009,16 @@ int main(void) {
     printf("\n");
     test_rollback_negative_controls();
     printf("\n");
+    /* The same two, with the seam's batched entry unbound: the cycle then
+     * seeds and drafts one head row per call, which is the path a graph that
+     * binds no draft_rows takes.  Both bindings must give one stream. */
+    g_ref_batched_draft = 0;
+    printf("(again, one head row per call: draft_rows unbound)\n");
+    test_exactness();
+    printf("\n");
+    test_rollback_negative_controls();
+    printf("\n");
+    g_ref_batched_draft = 1;
     test_head_cache_boundary();
     printf("\n");
     test_row_invariance_is_load_bearing();

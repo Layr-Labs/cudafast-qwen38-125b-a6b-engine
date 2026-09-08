@@ -75854,6 +75854,34 @@ static int qwen4exp_seam_draft_step(void *ctx, int next_token,
     return 0;
 }
 
+/* Several head rows in one forward: the seed rows a round owes the head cache
+ * and the round's first draft, as one launch chain and one readback.  Same
+ * head, same cache rows, same drafts as draft_step row by row. */
+static int qwen4exp_seam_draft_rows(void *ctx, const int *next_tokens,
+                                    const float *hc_rows, uint32_t pos0,
+                                    uint32_t n, int *draft_out,
+                                    float *multi_out) {
+    ds4_session *s = ctx;
+    char err[256];
+    if (ds4_qwen4exp_mtp_head_forward_last(&s->qwen4exp_head, next_tokens,
+                                           hc_rows, pos0, n, draft_out,
+                                           multi_out, err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4: qwen4exp MTP seam: %s\n", err);
+        return -1;
+    }
+#ifdef DS4_TEST_HOOKS
+    /* The last row sits at pos0 + n - 1 and drafts the token two past it, the
+     * same rule the one-row seam applies. */
+    if (s->qwen4exp_forced_tokens) {
+        const uint32_t want = pos0 + n - 1u + 2u;
+        if (want < (uint32_t)s->qwen4exp_forced_len) {
+            *draft_out = s->qwen4exp_forced_tokens[want];
+        }
+    }
+#endif
+    return 0;
+}
+
 /* Build the seam, the rollback set and the head, once per session.  Returns
  * false with a named message when anything refuses, and the caller returns -1:
  * a half-built cycle is a refusal, not a reason to speculate anyway. */
@@ -75929,6 +75957,7 @@ static bool ds4_session_qwen4exp_spec_init(ds4_session *s,
     s->qwen4exp_seam.decode_token = qwen4exp_seam_decode_token;
     s->qwen4exp_seam.head_logits  = qwen4exp_seam_head_logits;
     s->qwen4exp_seam.draft_step   = qwen4exp_seam_draft_step;
+    s->qwen4exp_seam.draft_rows   = qwen4exp_seam_draft_rows;
 
     const int depth = ds4_qwen4exp_mtp_depth_from_draft_tokens(
             e->mtp_draft_tokens, err, errlen);

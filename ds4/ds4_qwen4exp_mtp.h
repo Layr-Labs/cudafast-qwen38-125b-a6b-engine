@@ -333,6 +333,22 @@ typedef struct {
      */
     int (*draft_step)(void *ctx, int next_token, const float *hc_row,
                       uint32_t pos, int *draft_out, float *multi_out);
+
+    /*
+     * OPTIONAL: several consecutive head rows in ONE forward.  Row t takes
+     * next_tokens[t] and hc_rows[t] (hc_dim floats each) at position pos0 + t,
+     * exactly as n calls to draft_step would in that order; only the LAST
+     * row's draft and `multi` row come back, because every row before it is a
+     * seed whose draft nobody reads.  The chain uses it to fold the seed rows
+     * a round owes the head cache into the round's first draft step, so an
+     * accepting round costs one head forward instead of one per row -- the
+     * head's block runs the rows together the way the target's verify does.
+     * NULL means the cycle seeds and drafts through draft_step, one row per
+     * call, which is the same cache and the same drafts at more launches.
+     */
+    int (*draft_rows)(void *ctx, const int *next_tokens, const float *hc_rows,
+                      uint32_t pos0, uint32_t n, int *draft_out,
+                      float *multi_out);
 } ds4_qwen4exp_mtp_model;
 
 /* ------------------------------------------------------------------------
@@ -695,6 +711,18 @@ int ds4_qwen4exp_mtp_head_forward(ds4_qwen4exp_mtp_head *h,
                                   uint32_t pos0, uint32_t n_tokens,
                                   int *draft_out, float *multi_out,
                                   char *err, size_t errlen);
+
+/* The same forward over `n_tokens` consecutive rows, handing back only the
+ * LAST row's argmax (one int) and, when `multi_out` is not NULL, only its
+ * `hyper` row (hc_dim floats).  Every row still runs the block and writes its
+ * own cache row; what is narrower is the readback and the argmax.  This is the
+ * entry the seam's draft_rows binds to. */
+int ds4_qwen4exp_mtp_head_forward_last(ds4_qwen4exp_mtp_head *h,
+                                       const int *next_tokens,
+                                       const float *multi_in,
+                                       uint32_t pos0, uint32_t n_tokens,
+                                       int *draft_out, float *multi_out,
+                                       char *err, size_t errlen);
 
 /* Greedy argmax with the canonical lowest-id tie-break the shim's ds4s_argmax
  * documents.  Shared so the head and the cycle cannot break ties apart. */

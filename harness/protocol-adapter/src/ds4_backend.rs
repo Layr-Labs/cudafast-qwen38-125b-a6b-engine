@@ -323,21 +323,17 @@ impl Engine for Ds4Engine {
                         }
                         // The cycle's outputs are every committed token after
                         // the fed one, plus the frontier argmax it left behind.
-                        // That is exactly `committed.len()` outputs: skip the
-                        // fed token and append one frontier token. Extend the
-                        // result in place so the hot loop does not allocate and
-                        // copy a second temporary Vec on every MTP round.
-                        let produced_len = committed.len();
-                        if (tokens.len() + produced_len) as i64 > count {
+                        let mut produced: Vec<i64> = committed[1..].to_vec();
+                        produced.push(s.argmax());
+                        if (tokens.len() + produced.len()) as i64 > count {
                             return Err(EngineError::Fault(format!(
                                 "ds4 speculative cycle produced {} tokens with only {budget} wanted",
-                                produced_len
+                                produced.len()
                             )));
                         }
-                        tokens.extend_from_slice(&committed[1..]);
-                        pending = s.argmax();
-                        tokens.push(pending);
-                        acceptance_lengths.push(produced_len as i64);
+                        acceptance_lengths.push(produced.len() as i64);
+                        pending = *produced.last().unwrap();
+                        tokens.extend(produced);
                     }
                     let after = s.spec_counters();
                     let drafted = after.drafts.saturating_sub(before.drafts) as i64;

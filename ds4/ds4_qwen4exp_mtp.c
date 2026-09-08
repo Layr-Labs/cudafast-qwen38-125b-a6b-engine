@@ -408,26 +408,62 @@ static int mtp_draft_chain(ds4_qwen4exp_mtp_state *st,
         return 0;
     }
 
-    for (uint32_t j = st->head_rows < pos ? pos : st->head_rows;
-         j < start; j++) {
-        const uint32_t k = j - pos;      /* 0 <= k < n, so both reads are in */
-        int discard = -1;
-        if (model->draft_step(model->ctx, toks[k + 1u],
-                              hc_rows + (size_t)k * st->hc_dim,
-                              j, &discard, NULL) != 0) {
-            return mtp_fail(err, errlen,
-                            "qwen4exp MTP: head seed for token %d at position "
-                            "%u failed", toks[k + 1u], j);
-        }
-    }
-    st->head_rows = start;
-
+    const uint32_t j0 = st->head_rows < pos ? pos : st->head_rows;
     float *const ping = st->hc_scratch +
                         (size_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * st->hc_dim;
     const float *cur_hc = hc_rows + (size_t)n * st->hc_dim;
     int cur_tok = next_fed;
     uint32_t p = pos + (uint32_t)n;
-    for (int k = 0; k < st->depth; k++) {
+    int k = 0;
+
+    if (model->draft_rows) {
+        /*
+         * The seed rows and chain step 0 in ONE head forward.  Rows j0 .. start
+         * take the tokens toks[j0 - pos + 1 .. n] and then next_fed, over the
+         * hc rows j0 - pos .. n -- which sit side by side in hc_rows, so the
+         * head reads them as one slab.  That is at most n + 1 <= depth + 1
+         * rows, the width the head was built for.  The rows are the same rows
+         * the per-row loop below would write, in the same order, from the
+         * same inputs; only the launches, the synchronising readbacks and the
+         * seed rows' unread argmaxes are gone.
+         */
+        const uint32_t k0 = j0 - pos;
+        const uint32_t seeds = start - j0;
+        int rows_tok[DS4_QWEN4EXP_MTP_MAX_COMMIT];
+        for (uint32_t i = 0; i < seeds; i++) rows_tok[i] = toks[k0 + i + 1u];
+        rows_tok[seeds] = next_fed;
+        float *multi_out = (1 < st->depth) ? ping : NULL;
+        int draft = -1;
+        if (model->draft_rows(model->ctx, rows_tok,
+                              hc_rows + (size_t)k0 * st->hc_dim,
+                              j0, seeds + 1u, &draft, multi_out) != 0) {
+            return mtp_fail(err, errlen,
+                            "qwen4exp MTP: %u-row head forward at position %u "
+                            "failed", seeds + 1u, j0);
+        }
+        st->pending[0] = draft;
+        st->n_pending = 1;
+        cur_tok = draft;
+        cur_hc = multi_out;
+        p = start + 1u;
+        st->head_rows = p;
+        k = 1;
+    } else {
+        for (uint32_t j = j0; j < start; j++) {
+            const uint32_t kk = j - pos;   /* 0 <= kk < n, so both reads are in */
+            int discard = -1;
+            if (model->draft_step(model->ctx, toks[kk + 1u],
+                                  hc_rows + (size_t)kk * st->hc_dim,
+                                  j, &discard, NULL) != 0) {
+                return mtp_fail(err, errlen,
+                                "qwen4exp MTP: head seed for token %d at "
+                                "position %u failed", toks[kk + 1u], j);
+            }
+        }
+        st->head_rows = start;
+    }
+
+    for (; k < st->depth; k++) {
         /* The last step's `multi` row would have no reader. */
         float *multi_out = (k + 1 < st->depth)
                          ? ping + (size_t)(k & 1) * st->hc_dim : NULL;
@@ -794,12 +830,16 @@ static int mtp_head_time_on(void) {
         }                                                                     \
     } while (0)
 
-int ds4_qwen4exp_mtp_head_forward(ds4_qwen4exp_mtp_head *h,
-                                  const int *next_tokens,
-                                  const float *multi_in,
-                                  uint32_t pos0, uint32_t n_tokens,
-                                  int *draft_out, float *multi_out,
-                                  char *err, size_t errlen) {
+/* The forward proper.  `last_only` narrows the readback to the final row:
+ * one row of logits and one argmax into draft_out[0], one `hyper` row into
+ * multi_out.  Nothing the device computes changes with it. */
+static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
+                                 const int *next_tokens,
+                                 const float *multi_in,
+                                 uint32_t pos0, uint32_t n_tokens,
+                                 int *draft_out, float *multi_out,
+                                 bool last_only,
+                                 char *err, size_t errlen) {
     if (n_tokens == 0 || n_tokens > h->max_tokens) {
         return mtp_fail(err, errlen,
                         "qwen4exp MTP head: %u rows, built for 1..%u",
@@ -930,16 +970,24 @@ int ds4_qwen4exp_mtp_head_forward(ds4_qwen4exp_mtp_head *h,
     else (void)ds4_gpu_synchronize();
     MTP_HEAD_TICK(MTP_HEAD_T_END);
 
+    /* Which rows come back: every one, or the last alone.  The rows before
+     * the last are seeds in the last_only case and their logits are never
+     * read, so the readback and the argmax skip them. */
+    const uint32_t first_row = last_only ? n_tokens - 1u : 0u;
+    const uint32_t out_rows = n_tokens - first_row;
     if (ok) {
         stage = "logit readback";
-        ok = ds4_gpu_tensor_read(h->t_logits, 0, h->logits_host,
-                                 (uint64_t)n_tokens * h->n_vocab * f) != 0;
+        ok = ds4_gpu_tensor_read(h->t_logits,
+                                 (uint64_t)first_row * h->n_vocab * f,
+                                 h->logits_host,
+                                 (uint64_t)out_rows * h->n_vocab * f) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_LOGITS_IN);
     if (ok && multi_out) {
         stage = "multi readback";
-        ok = ds4_gpu_tensor_read(h->t_hyper, 0, multi_out,
-                                 (uint64_t)n_tokens * hc_dim * f) != 0;
+        ok = ds4_gpu_tensor_read(h->t_hyper,
+                                 (uint64_t)first_row * hc_dim * f, multi_out,
+                                 (uint64_t)out_rows * hc_dim * f) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_MULTI_OUT);
     if (!ok) {
@@ -947,13 +995,33 @@ int ds4_qwen4exp_mtp_head_forward(ds4_qwen4exp_mtp_head *h,
                         "qwen4exp MTP head: %s failed at position %u over %u "
                         "rows", stage, pos0, n_tokens);
     }
-    for (uint32_t t = 0; t < n_tokens; t++) {
+    for (uint32_t t = 0; t < out_rows; t++) {
         draft_out[t] = ds4_qwen4exp_mtp_argmax(
             h->logits_host + (size_t)t * h->n_vocab, h->n_vocab);
     }
     MTP_HEAD_TICK(MTP_HEAD_T_ARGMAX);
     if (timing) mtp_head_stage_calls++;
     return 0;
+}
+
+int ds4_qwen4exp_mtp_head_forward(ds4_qwen4exp_mtp_head *h,
+                                  const int *next_tokens,
+                                  const float *multi_in,
+                                  uint32_t pos0, uint32_t n_tokens,
+                                  int *draft_out, float *multi_out,
+                                  char *err, size_t errlen) {
+    return mtp_head_forward_impl(h, next_tokens, multi_in, pos0, n_tokens,
+                                 draft_out, multi_out, false, err, errlen);
+}
+
+int ds4_qwen4exp_mtp_head_forward_last(ds4_qwen4exp_mtp_head *h,
+                                       const int *next_tokens,
+                                       const float *multi_in,
+                                       uint32_t pos0, uint32_t n_tokens,
+                                       int *draft_out, float *multi_out,
+                                       char *err, size_t errlen) {
+    return mtp_head_forward_impl(h, next_tokens, multi_in, pos0, n_tokens,
+                                 draft_out, multi_out, true, err, errlen);
 }
 
 #endif /* DS4_NO_GPU */
