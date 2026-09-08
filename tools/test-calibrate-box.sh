@@ -38,6 +38,9 @@
 #  10. an unattributable benchd refuses by name: the band records what measured
 #      it.
 set -uo pipefail
+# A hosted runner exports RUNNER_NAME, and calibrate-box lets it win over --box;
+# every case here names its own box, so the ambient runner identity must not leak in.
+unset RUNNER_NAME
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DRIVER="${REPO_ROOT}/tools/calibrate-box.sh"
