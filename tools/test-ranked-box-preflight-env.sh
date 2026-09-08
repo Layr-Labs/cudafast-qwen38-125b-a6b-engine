@@ -231,7 +231,7 @@ EOF
   # A reference tree at the wrong commit.
   WS_OLD="${WORK}/reference-old"
   git clone --quiet --shared --no-checkout "${REPO_ROOT}" "${WS_OLD}" 2>/dev/null
-  if git -C "${WS_OLD}" checkout --quiet --detach "${REF_COMMIT}~1" 2>/dev/null; then
+  if git -C "${WS_OLD}" checkout --quiet --detach HEAD 2>/dev/null; then
     mkdir -p "${WS_OLD}/.build/ds4" "${WS_OLD}/.build/release"
     : > "${WS_OLD}/.build/ds4/libds4qwen.so"
     : > "${WS_OLD}/.build/ds4/ds4-resident"
@@ -240,7 +240,7 @@ EOF
     expect_refusal "workspace at the wrong commit" \
       "but the fixture pins ${REF_COMMIT}" "MLXFAST_BASELINE_WORKSPACE=${WS_OLD}"
   else
-    fail "section 8 / workspace at the wrong commit: cannot check out ${REF_COMMIT}~1"
+    fail "section 8 / workspace at the wrong commit: cannot check out HEAD"
   fi
 
   # A reference tree that was staged but never built.
