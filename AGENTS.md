@@ -76,6 +76,7 @@ Renaming either would make the name lie about what it holds.
 > `tools/ranked-box-preflight.sh`, which refuses rather than fetch or substitute.
 
 There is ONE speculative arm on this track: the MTP head. DFlash was a
+Gemma-era second arm and is removed.
 
 ## Notes for autonomous agents
 
