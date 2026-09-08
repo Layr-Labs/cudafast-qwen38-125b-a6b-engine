@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.qwen38.box-runner</string>
+
+	<!-- LaunchDaemon: runs as root (no UserName key). Root is required to
+	     read the GitHub App private key (via gh-app-mint.sh, GH_APP_KEY) and
+	     to su to the unprivileged runner account. The GitHub Actions runner
+	     itself never runs as root: supervisor.sh drops to RUNNER_USER for
+	     every job. install.sh renders this template but does NOT load it --
+	     it prints the exact bootstrap command for an operator to run. -->
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>__SUPERVISOR_PATH__</string>
+		<string>run</string>
+	</array>
+
+	<key>RunAtLoad</key>
+	<true/>
+
+	<!-- Restart on every exit, including a config-error refusal (exit 78) --
+	     supervisor.sh has no "park until cleared" state (unlike the box-3
+	     lineage's quarantine flag; this loop has nothing analogous to
+	     integrity-audit drift to latch on), so a persistent config problem
+	     retries at ThrottleInterval cadence, alerting each time, until an
+	     operator fixes it. Its OWN job tree is never left running across a
+	     restart: `run`'s startup self-heal calls the same kill-tree `stop`
+	     path uses before minting anything new (see supervisor.sh's header
+	     for the box-3 orphan bug this specifically fixes). -->
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+
+	<key>ThrottleInterval</key>
+	<integer>60</integer>
+
+	<key>StandardOutPath</key>
+	<string>__LOG_DIR__/supervisor-stdout.log</string>
+	<key>StandardErrorPath</key>
+	<string>__LOG_DIR__/supervisor-stderr.log</string>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+		<key>BOX_RUNNER_CONFIG</key>
+		<string>__CONFIG_ENV_PATH__</string>
+	</dict>
+
+	<key>WorkingDirectory</key>
+	<string>__SCRIPT_DIR__</string>
+
+	<key>ProcessType</key>
+	<string>Interactive</string>
+</dict>
+</plist>

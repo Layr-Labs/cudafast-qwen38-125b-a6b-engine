@@ -1,0 +1,55 @@
+Copy the passage between the tags exactly. Preserve every heading, bullet, comma, period, and blank line. Do not summarize, translate, explain, add a preface, add a code fence, or add a closing note. Begin with the first heading of the passage.
+
+Context notes:
+- This prompt is public during testing, but the production prompt will be private.
+- The text is ordinary English so token failures can be inspected directly.
+- The copied passage is longer than the correctness window, keeping validation inside real content instead of end markers.
+- Stable copying is more important here than creative reasoning.
+- The benchmark should reward faster kernels, not prompt-specific behavior.
+- The wording covers correctness, timing, allowed optimizations, and disallowed shortcuts without repeating one filler sentence.
+- The exact same tokenizer is used to count the hidden prompt before the golden file is generated.
+Copy exactly.
+
+<passage>
+## Correctness Gate
+The runner first verifies that the reference checkpoint, tokenizer files, generated weight manifest, and Metal library match the trusted configuration. It then loads the transformed weights and performs teacher-forced token checks before any timing score is considered.
+
+## Benchmark Metrics
+The timed section records prefill latency for the fixed prompt, decode latency for the fixed continuation, resident memory during model execution, and expert bytes streamed from storage. Download time, setup work, and transform preparation are outside the score because they do not measure kernel quality.
+
+## Allowed Improvements
+A valid submission may improve expert prefetching, sparse tensor loading, cache reuse, quantized matrix multiplication, scheduling, or memory layout. The output tokens must remain compatible with the trusted golden continuation, and the same artifact rules must apply on every official runner.
+
+## Disallowed Shortcuts
+A submission must not read private prompt files, send network output, recognize hidden benchmark text, skip required layers, narrow the vocabulary, return memorized answers, or move expensive work outside the measured window. Any such behavior invalidates the score even when the run appears fast.
+
+## Review Notes
+Correctness is the gate, not the ranking metric. Every finalist that passes receives the full benchmark run, so the gate should be strict enough to reject unsafe model behavior while short enough to keep review throughput reasonable.
+
+## Final Rule
+Advance the submission only when token agreement, artifact integrity, resource accounting, and timing windows all match the trusted rules.
+## Measurement Windows
+The prefill window covers the fixed seed tokens exactly once, and the decode window covers the fixed continuation steps exactly once. The runner records wall-clock boundaries for each window from the parent process, so a submission cannot shrink a window by reporting its own timestamps. Every window boundary lands on a committed token, never inside a speculative frame.
+
+## Artifact Rules
+Every file that influences the measured run must be declared in the manifest with its digest and byte count. The runner verifies each digest after download and refuses the run when any artifact differs from its declaration. Editable paths cover only the participant surface; trusted files load from the pinned release and are compared byte for byte.
+
+## Memory Accounting
+Resident memory is sampled through the whole measured window, and the peak sample is recorded beside the timing results. A submission that spills experts to storage must still fit the declared budget during prefill and decode. Cache allocations count against the same budget as weights, so freeing memory between windows does not lower the recorded peak.
+
+## Scheduling Notes
+The runner executes one submission at a time on an otherwise idle machine. Background services are stopped before the timed window opens, and the thermal state is allowed to settle between runs. A submission must not spawn helpers that outlive the run, and any process still alive after the window closes invalidates the score.
+
+## Audit Trail
+Each run seals its configuration, artifact digests, timing samples, and token comparisons into a signed record. Reviewers replay the record against the trusted rules before a score reaches the public board. A sealed record that fails replay is discarded, and the submission returns to the queue with the failure attached.
+
+## Submission Flow
+A participant opens a submission against the pinned release, the runner executes the gate and the timed windows, and the reviewers confirm the sealed record. Scores publish only after every check agrees. A withdrawn submission leaves the queue without a score, and a failed submission may retry after the listed cooldown.
+## Cooldown Policy
+A failed run waits through a fixed cooldown before the queue accepts the same submission again. The cooldown protects the shared machine from rapid retries and keeps thermal conditions comparable between neighboring runs. Retries after the cooldown start from a clean checkout, never from the failed run's working directory.
+
+## Board Publication
+The public board lists each finalist with its sealed score, the release it ran against, and the digest of its sealed record. A published row never changes after it lands; a correction appends a new row that names the row it supersedes. Readers can therefore audit the full history of every entry without trusting the board itself.
+</passage>
+
+Now output the passage exactly as written, starting with ## Correctness Gate. Do not include the tags or any extra text.

@@ -1,0 +1,649 @@
+# qwen3.8-125b-a6b-cuda-v1 RANKED BENCHMARK -- Linux aarch64 (GB10) box.
+#
+# benchmark.json's runner.workflow names this file. Yukon dispatches it once per
+# submission; the two jobs below are the whole ranked pipeline. A hosted
+# no-credential surface check runs first, and only if it passes does the
+# measurement reach the box.
+#
+# THIS IS THE SCORING PIPELINE, NOT THE ENGINE. The box orchestration here is
+# Linux/CUDA (the GB10 Spark). The measured engine -- the Engine Protocol v1
+# adapter with the ds4 engine linked in-process -- and the on-box checkpoint verification in
+# ./setup.sh land in the SEPARATE engine-body lane; this file keeps those two
+# call sites (./setup.sh, the benchd measure-job) stable so that lane fills them
+# in without a workflow change. What this file owns is the box: the runner
+# label set, the GPU exclusive lock, the pre-timing quiescence and the score
+# upload.
+#
+# NO SECRET, ANYWHERE, BY DESIGN -- NOT AS A GAP. This file references no
+# repository secret, inherits none, and asks for no write permission, and it
+# never will: hidden material for this track (the 8 timed-pool tapes, the
+# token-fidelity oracle, the reference baseline workspace and this box's
+# calibration file) is STAGED ONTO THE BOX out of band by the organizer. A box receives bundles, never keys
+# (bundles-no-keys, ruled 2026-08-21). What replaces the credential is
+# verification: tools/ranked-box-preflight.sh re-checks every staged asset
+# against fixtures/qwen3_8_125b_a6b_track.json's own {sha256, bytes} pins --
+# byte count first, then digest -- before ./setup.sh runs, and refuses on any
+# miss. The contract fixture is trusted-side (not an editable path), so a
+# submission cannot move the pins it is measured against.
+#
+# THE STAGING CONVENTION IS THE EXISTING ONE. The ranked steps read
+# MLXFAST_QWEN38_GOLDEN_DIR out of the self-hosted runner's own process
+# environment -- the same name tools/qwen38-125b-a6b-measure-and-score.sh and
+# tools/ranked-box-preflight.sh already read (docs/participant-contract.md
+# section 6). The paired path adds two more of the same shape, and no others:
+#
+#   MLXFAST_BASELINE_WORKSPACE    the built REFERENCE tree the serial-control
+#                                 leg runs on, at the fixture's
+#                                 baseline_reference_commit
+#   MLXFAST_BASELINE_CALIBRATION  this box's calibration file -- the health band
+#                                 the control leg must land inside
+#
+# PAIRED, WITH A PER-BOX BASELINE (David 2026-09-08). A ranked run measures TWO
+# legs on THIS box in THIS job over the ONE live golden: a SERIAL CONTROL leg on
+# the reference tree and the CANDIDATE leg on the dispatched commit. The score is
+# the ratio. No pair is stored anywhere -- not in a benchd constant, not in the
+# fixture, not in a golden -- so a box that is missing either variable is refused
+# before any work rather than scored against a number from somewhere else.
+#
+# THE RUNNER LABEL IS THE TRACK ID. `runs-on: [self-hosted, Linux, ARM64,
+# qwen3.8-125b-a6b-cuda-v1]` -- the fourth label is branch = track = R2 key
+# prefix (the canonical decoder-neutral naming construction). Linux and ARM64
+# name the GB10 box's operating system and architecture; the same pair the
+# aarch64-unknown-linux-gnu benchd dist is published for. tools/box-runner/
+# RUNNER_LABELS must advertise the same set: that value is the entire coupling
+# surface between this file and the runner side, and a mismatch strands a
+# dispatch with no runner rather than failing it. (tools/box-runner/ itself is
+# still the macOS launchd supervisor; a Linux/systemd runner-provisioning port
+# is a separate box-ops lane -- see docs/qwen38-125b-a6b-port-notes.md.)
+#
+# ONE GPU WINDOW PER BOX AT A TIME -- THE BOX LOCK, NOT A CONCURRENCY GROUP.
+# The timed step holds the box-wide GPU lock the spark-gate harness uses,
+# /tmp/mtplx-gpu-exclusive.lock, taken with flock(1) (every GPU window on the
+# box takes it). That lock is what excludes a ranked run, a calibration and a
+# spark-gate bring-up run from the one GPU. The ranked job declares NO GitHub
+# concurrency group: a fixed group serialized every dispatch behind one
+# in-flight measurement across the whole fleet, so eight boxes measured one
+# submission at a time. Each dispatch now takes any idle runner with the
+# label, and two dispatches that land on the same box queue on the lock.
+# Cancelling a timed run mid-window destroys the measurement and leaves the
+# GPU hot for the next one; nothing here cancels a run.
+#
+# FAIL-CLOSED INVENTORY -- each of these aborts before a score.json can exist,
+# and none of them has a degraded path:
+#   1. benchd resolve mismatch. ./tools/fetch-benchd.sh accepts only a binary
+#      matching the channel's benchd.manifest.json {sha256, bytes} AND the
+#      aarch64-unknown-linux-gnu platform (target_triple plus the binary's own
+#      ELF magic); it never returns an unverified binary and never falls back to
+#      a PATH benchd or a source build.
+#   2. Unarmed pool or unarmed fixture. A PENDING-ORGANIZER sentinel, an empty
+#      pool, any entry whose sha256 is not 64 hex / bytes is not positive, or a
+#      fixture that does not declare official_scoring_enabled: true: refused,
+#      because there would be no armed pin to verify a staged file against.
+#   3. Missing staged asset. MLXFAST_QWEN38_GOLDEN_DIR unset or absent, a pool
+#      golden missing, the live golden not staged, the pinned benchd /
+#      benchd.manifest.json pair not staged, the reference workspace absent, not
+#      at baseline_reference_commit, edited or unbuilt, or this box's calibration
+#      file absent, malformed, from another box, from another track or from
+#      another reference commit.
+#   4. Hash mismatch on a staged asset, in either half of the pin, on any pool
+#      golden, on the pinned benchd (against its own manifest), or on a
+#      box-named MLXFAST_CORRECTNESS_GOLDEN_PATH. An unpinned extra *.json in the
+#      staging directory is also refused: it is unattributed golden material
+#      staged where the pinned pool lives.
+#   5. Credential or override in the job environment. R2 keys, an R2 signer, a
+#      dist token, BENCHD (which bypasses the benchd manifest check),
+#      MLXFAST_SKIP_WEIGHTS_DOWNLOAD / SKIP_MODEL_DOWNLOAD,
+#      MLXFAST_LOCAL_COOL_GATE, MLXFAST_LOCAL_ALLOW_GOLDEN_DRIFT,
+#      MLXFAST_GPU_TEMP_CMD.
+#   6. Model absent and unfetchable. ./setup.sh (engine-body lane) verifies the
+#      pinned target checkpoint and exits non-zero rather than proceed without
+#      it; the preflight above already refused the environment variables that
+#      would let it skip the download.
+#   7. No composite. benchd iterate --mode official is the SOLE writer of the
+#      sealed score.json; it refuses to seal (and writes no score.json) rather
+#      than substitute a diagnostic for the ruled composite. There is no separate
+#      score-conversion step to bypass.
+# A refusal is always a non-zero exit and never a written score: nothing in
+# this pipeline emits a placeholder, a fallback, or a partial score file. The
+# upload step below runs `if: always()` with `if-no-files-found: error`, so a
+# refused run ends with a red job and NO artifact rather than an empty one.
+#
+# EDITABLE PATHS ARE UNTRUSTED INPUT. The dispatched commit carries the
+# submission's editablePaths; the hosted surface-check job static-reviews them
+# before the box is reached, and the ranked box then builds and executes
+# participant code inside the sandboxed runtime worker -- the accepted design
+# for this track family, matching the qwen precedent.
+#
+# WHAT MUST EXIST BEFORE A DISPATCH CAN GO GREEN (each is external to this
+# file, and each is David-gated):
+#   - organization Actions enabled for this repository (dispatch is refused at
+#     the API today);
+#   - a registered Linux/aarch64 self-hosted runner on the GB10 box advertising
+#     the four labels below (tools/box-runner/ owns that side, and needs its own
+#     Linux/systemd port);
+#   - box staging: the pinned pool goldens in MLXFAST_QWEN38_GOLDEN_DIR (the live
+#     golden among them), benchd-bin/{benchd, benchd.manifest.json} matching
+#     the channel's aarch64-unknown-linux-gnu manifest (placed out of band; this
+#     job holds no dist token), the pinned GGUF target snapshot with its ple/
+#     sidecar beside it (verified by ./setup.sh against the fixture pins), the
+#     REFERENCE workspace staged and built by tools/stage-baseline-workspace.sh,
+#     and this box's calibration file written by tools/calibrate-box.sh;
+#   - THE LINUX GPU-TEMPERATURE READER for benchd's cool gate. On the macOS twin
+#     this was macmon, pinned into MLXFAST_MACMON_BIN. The GB10 box has no
+#     macmon, and the aarch64-unknown-linux-gnu benchd's reader discovery (and
+#     whether GB10's nvidia-smi exposes a usable GPU temperature at all --
+#     nvidia-smi reports "Not Supported" for GB10 memory) is a BENCH-SIDE + BOX fact
+#     not settled in this repository. Until it is, tools/ranked-box-preflight.sh
+#     fails closed on the absent reader (a ranked run measures nothing without
+#     thermal control), so this is a documented box/bench step, not a silent
+#     gap;
+#   - the track ARMED: fixtures/qwen3_8_125b_a6b_track.json sets
+#     official_scoring_enabled to true (it is now armed), and both
+#     tools/ranked-box-preflight.sh (section 5) and the pinned benchd refuse to
+#     seal an official scoring artifact while it is false (or absent).
+#
+# Trigger: workflow_dispatch ONLY (Yukon dispatches it for every submission). There is deliberately no `pull_request`,
+# `push` or `schedule` trigger -- Yukon dispatches a submission explicitly, and
+# a pull_request trigger would run every submission twice on the one box.
+
+name: qwen3.8 125B A6B CUDA ranked benchmark
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Real, hosted, no-GPU, no-credential checks: the same class of check
+  # ci.yml's own `lint` job already runs against this manifest on every push
+  # to main, reproduced here so a ranked-workflow dispatch also self-checks
+  # before the dispatch to the ranked box.
+  surface-check:
+    name: editable-surface + static review (hosted, no GPU, no credential)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.sha }}
+          submodules: false
+          persist-credentials: false
+
+      - name: Benchmark manifest lint
+        run: |
+          set -euo pipefail
+          # --gitlink-targets report downgrades a command target missing ONLY
+          # because its submodule is not checked out. Since benchd became a
+          # pinned PREBUILT there is no submodule and every command target lives
+          # in this repository, so nothing is downgraded and all three commands
+          # are fully verified here. The flag is kept for the next submodule --
+          # see docs/ci-coverage.md.
+          python3 tools/lint-benchmark-manifest.py --gitlink-targets report
+
+      - name: Submission static review (whole-surface, self-check)
+        run: |
+          set -euo pipefail
+          # whole-surface mode reads benchmark.json from the WORK TREE. That is
+          # safe here because the dispatched commit's benchmark.json is trusted
+          # side -- it is not an editablePath, so a submission overlay cannot
+          # widen it. See the script's own header for the self-widening hazard
+          # this mode is an explicit opt-in against.
+          CONTRACT_PATH=benchmark.json \
+          MLXFAST_SUBMISSION_REVIEW_MODE=whole-surface \
+            .github/scripts/submission-static-review-checks.sh
+
+  # The ranked measurement. `needs: surface-check` so a submission that fails
+  # the static review never reaches the box at all.
+  ranked:
+    name: ranked measurement (self-hosted, qwen3.8-125b-a6b-cuda-v1 GB10 box)
+    needs: surface-check
+    # The fourth label IS the track id (= the branch name = the R2 key prefix).
+    # Linux + ARM64 name the GB10 box. tools/box-runner RUNNER_LABELS must
+    # advertise the set.
+    runs-on: [self-hosted, Linux, ARM64, qwen3.8-125b-a6b-cuda-v1]
+    # A cold run fetches the pinned checkpoint before it measures anything, and
+    # then every timed phase waits behind benchd's per-phase cool-down that can
+    # legitimately spend up to 900 s. THE COUNT IS DERIVED FROM THE RULED PAIR
+    # COUNT, so it moves whenever that ruling moves -- it is restated here rather
+    # than left implicit:
+    #
+    #   pairsPerCohort 4 (David 2026-08-26), one cohort, so 4 pairs x 2 legs
+    #   (serial control + candidate) = 8 timed legs, and benchd gates PER PHASE
+    #   -- prefill and decode are separate cool_gate() calls on a fresh worker --
+    #   so up to 16 gated phases x 900 s = 240 min of cool-down ALONE, worst
+    #   case, before a single token is timed.
+    #
+    # 240 min of gating plus a cold checkpoint fetch, the engine build and the
+    # weight-owner upload, and the measurement
+    # itself does not fit in 180. At the cap GitHub kills the job
+    # mid-measurement, which burns the box's slot and produces nothing. 360 is
+    # the challenger's own budget for the same reason.
+    #
+    # WHY 360 STILL SUFFICES AT 16 PHASES: the 900 s ceiling is NOT an operating
+    # point. A phase that actually burns 900 s means the box never reached the
+    # gate temperature, which is itself the refusal condition -- that run is
+    # rejected and retried on a clean box rather than proceeding. Sixteen
+    # consecutive 900 s waits is not a slow run, it is a broken box, and it fails
+    # rather than finishing at minute 359. 240 min is the pathological ceiling
+    # this cap must not be BELOW, not the expected cost.
+    timeout-minutes: 360
+    env:
+      # A dispatched ranked job runs from a FRESH actions/checkout with an empty
+      # process environment (bundles-no-keys: no runner-service env is wired yet --
+      # that provisioning is the multi-box/public follow-up). Every staged asset the
+      # scored path needs but the checkout does not carry is pointed at its
+      # converge-staged location on THIS track's box (test-spark) here, so the
+      # references are committed, reviewed workflow lines -- traceable to the
+      # m5-machine-scripts staging manifest, not ad-hoc box edits. Paths verified
+      # present on the box.
+      #
+      # 1. Pinned pool goldens: COMMITTED in this repo, so point at the run's own
+      #    checkout. ranked-box-preflight.sh verifies every golden byte-then-sha
+      #    against the contract pins regardless of directory, so this cannot weaken
+      #    the gate; a production box overrides it to organizer-staged hidden goldens.
+      MLXFAST_QWEN38_GOLDEN_DIR: ${{ github.workspace }}/correctness_prompts/qwen3.8-125b-a6b-cuda-v1
+      # 2. The engine build cache root. UNLIKE the two below, this one is
+      #    OPTIONAL: a box that has not staged it, or has an empty one, builds
+      #    the engine exactly as it always did. It only ever removes work, and
+      #    tools/ds4/build-cache.sh refuses any entry whose recorded inputs do
+      #    not match this checkout. Left unset here so the runner service's own
+      #    value wins; the script falls back to ~/.cache/cudafast-engine-build.
+      # 3. The ~173 GiB GGUF target snapshot (MLXFAST_TARGET_SNAPSHOT_DIR) and
+      # 4. the pinned benchd pair (BENCHD_BIN_DIR) are NOT named here. Every
+      #    box in the fleet stages them where its converge units put them and
+      #    exports both variables from the runner service's environment
+      #    (fleet-bootstrap owns that file). No literal home path lives in this
+      #    workflow: a box that does not export them is refused by the step
+      #    below, before any work.
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          # The DISPATCHED commit, per the Yukon workflow author guide -- not
+          # the branch tip, which can move between dispatch and pickup while a
+          # run is queued behind the in-flight measurement.
+          ref: ${{ github.sha }}
+          # The ds4 engine is VENDORED into this repository, so the checkout
+          # carries it: no submodule, no box git identity, no credential. This
+          # is also what makes a PARTICIPANT'S engine edit reach the box -- the
+          # dispatched commit's own ds4/ tree is what setup.sh builds.
+          submodules: false
+          # This job must hold no credential, and a persisted checkout token
+          # would be one.
+          persist-credentials: false
+
+      - name: Runner environment carries the box paths and the toolchain
+        # The self-hosted runner runs as a systemd service whose PATH and
+        # environment come from its service unit (fleet-bootstrap). This step
+        # names every box-provided input the ranked steps rely on and refuses
+        # before any work when one is missing, so a half-bootstrapped box fails
+        # with the variable or binary named rather than deep inside setup.sh.
+        run: |
+          set -euo pipefail
+          fail=0
+          # Directories the box stages. MLXFAST_BASELINE_WORKSPACE is the
+          # REFERENCE tree the serial-control leg runs on: under the paired
+          # model there is no stored pair to fall back on, so a box without it
+          # cannot produce a score at all and is refused here.
+          for var in MLXFAST_TARGET_SNAPSHOT_DIR BENCHD_BIN_DIR MLXFAST_BASELINE_WORKSPACE; do
+            eval "value=\${${var}:-}"
+            if [[ -z "${value}" ]]; then
+              echo "::error::${var} is not exported by the runner service environment (fleet-bootstrap stages the asset and exports its path)" >&2
+              fail=1
+            elif [[ ! -d "${value}" ]]; then
+              echo "::error::${var}=${value} is not a directory on this box" >&2
+              fail=1
+            fi
+          done
+          # This box's calibration file: the health band the serial-control leg
+          # must land inside. It is a FILE, and it is per box -- tools/calibrate-box.sh
+          # writes it on the box it describes.
+          if [[ -z "${MLXFAST_BASELINE_CALIBRATION:-}" ]]; then
+            echo "::error::MLXFAST_BASELINE_CALIBRATION is not exported by the runner service environment; every ranked box carries its own serial-control band (tools/calibrate-box.sh)" >&2
+            fail=1
+          elif [[ ! -f "${MLXFAST_BASELINE_CALIBRATION}" ]]; then
+            echo "::error::MLXFAST_BASELINE_CALIBRATION=${MLXFAST_BASELINE_CALIBRATION} is not a file on this box" >&2
+            fail=1
+          fi
+          for tool in cargo nvcc cc git jq python3 curl sha256sum nvidia-smi; do
+            command -v "${tool}" >/dev/null 2>&1 || { echo "::error::${tool} is not on the runner service PATH (fleet-bootstrap owns the unit's PATH)" >&2; fail=1; }
+          done
+          [[ "${fail}" == "0" ]] || exit 1
+          echo "runner environment ok: snapshot=${MLXFAST_TARGET_SNAPSHOT_DIR} benchd=${BENCHD_BIN_DIR} reference=${MLXFAST_BASELINE_WORKSPACE} calibration=${MLXFAST_BASELINE_CALIBRATION} nvcc=$(command -v nvcc) cargo=$(command -v cargo)"
+
+      - name: Reference workspace is the pinned baseline, and it is built
+        # THE SERIAL CONTROL LEG RUNS ON THIS TREE. Under the paired model the
+        # denominator is measured, not stored, and it is measured HERE -- on the
+        # organizer-staged reference tree at the fixture's
+        # baseline_reference_commit. A tree at another commit is another engine,
+        # and its leg is not this board's control.
+        #
+        # tools/ranked-box-preflight.sh section 8 is the AUTHORITY on this, and
+        # it re-checks every line below. This step exists because it is the
+        # cheapest, earliest, most legible failure: a mis-staged reference tree
+        # names itself here, before the temperature probe and the pin sweep, and
+        # long before the GPU window.
+        run: |
+          set -euo pipefail
+          ws="${MLXFAST_BASELINE_WORKSPACE}"
+          want="$(jq -r '.baseline_reference_commit // empty' fixtures/qwen3_8_125b_a6b_track.json)"
+          if [[ ! "${want}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error title=no reference commit::fixtures/qwen3_8_125b_a6b_track.json carries no 40-hex baseline_reference_commit; the serial-control leg has no reference tree to run on" >&2
+            exit 1
+          fi
+          have="$(git -C "${ws}" rev-parse HEAD 2>/dev/null || true)"
+          if [[ "${have}" != "${want}" ]]; then
+            echo "::error title=reference workspace mismatch::${ws} is at ${have:-no git HEAD} but the fixture pins ${want}; re-stage it with tools/stage-baseline-workspace.sh" >&2
+            exit 1
+          fi
+          if ! git -C "${ws}" diff --quiet HEAD; then
+            echo "::error title=reference workspace edited::${ws} has uncommitted changes; the control leg must run the pinned reference tree" >&2
+            exit 1
+          fi
+          # The outputs tools/ds4/build.sh links and tools/stage-cuda-engine.sh
+          # copies. An unbuilt reference tree fails only when its serve boots --
+          # after the candidate has already paid for the checkpoint and the build.
+          for rel in .build/ds4/libds4qwen.so .build/ds4/ds4-resident .build/release/mlxfast-runtime-worker; do
+            if [[ ! -f "${ws}/${rel}" ]]; then
+              echo "::error title=reference workspace not built::${ws} has no ${rel}; run tools/ds4/build.sh and tools/stage-cuda-engine.sh there, or re-stage with tools/stage-baseline-workspace.sh" >&2
+              exit 1
+            fi
+          done
+          if [[ ! -x "${ws}/tools/serve-up.sh" ]]; then
+            echo "::error title=reference workspace not usable::${ws}/tools/serve-up.sh is not executable; leg 1 boots the REFERENCE tree's own serve script" >&2
+            exit 1
+          fi
+          echo "reference workspace ok: ${ws} at ${want}, ds4 build and adapter staged"
+
+      - name: Ranked box preflight (staged assets, contract pins, no credential)
+        # Items 2-5 of the fail-closed inventory in this file's header. Runs
+        # before ./setup.sh, so a mis-staged box is refused before it spends
+        # anything on a checkpoint download or a build. It also hard-fails on the
+        # absent GPU temperature reader, so an ungated timed leg is unreachable
+        # on this box.
+        run: ./tools/ranked-box-preflight.sh
+
+      - name: Resolve the pinned benchd (OFFLINE ONLY -- converge-staged pair, no network, no token)
+        # First half of benchmark.json's setupCommand, and OFFLINE-ONLY by
+        # design. On our own runner benchd is converge-staged out of band as the
+        # benchd-bin/{benchd, benchd.manifest.json} PAIR (bundles-no-keys:
+        # this job holds no dist token and reaches no network). fetch-benchd.sh's
+        # step 1 uses an already-present pair and never touches the network; it
+        # verifies the binary against its OWN manifest beside it -- sha256, bytes
+        # AND target_triple / ELF magic (the #37 dynamic-manifest model) -- and
+        # dies rather than run or replace a mismatched pair.
+        #
+        # The guard below makes the offline contract EXPLICIT and fail-closed: it
+        # asserts the staged pair is present before fetch-benchd.sh runs, so a box
+        # that was never staged fails HERE with a clear message instead of falling
+        # through to fetch-benchd.sh's network download -- a fetch this job could
+        # not authenticate anyway and must never attempt on a ranked run. No token
+        # is plumbed and none may be: ranked-box-preflight.sh (the step above)
+        # refuses BENCHD_DIST_TOKEN in the job environment. BENCHD_BIN_DIR is
+        # honoured exactly as fetch-benchd.sh resolves it, so a box that stages
+        # the pair outside the workspace is checked at the same path the script
+        # will read.
+        run: |
+          set -euo pipefail
+          benchd_dir="${BENCHD_BIN_DIR:-${PWD}/benchd-bin}"
+          if [[ ! -f "${benchd_dir}/benchd" || ! -f "${benchd_dir}/benchd.manifest.json" ]]; then
+            echo "::error title=benchd not staged::the converge-staged pair ${benchd_dir}/{benchd,benchd.manifest.json} is absent; this ranked job holds no token and does not fetch benchd over the network. Stage the pinned pair on the box, then re-dispatch." >&2
+            exit 1
+          fi
+          ./tools/fetch-benchd.sh
+
+      - name: Restore the engine build cache (optional, key-checked)
+        # THE BUILD IS THREE MINUTES OF nvcc THE BOX USUALLY DOES NOT NEED. The
+        # engine is 14 CUDA translation units plus the cargo adapter, rebuilt
+        # from scratch on every dispatch because the checkout is fresh -- for a
+        # tree that has typically not changed since the last run.
+        #
+        # tools/ds4/build-cache.sh keys an entry on everything that reaches the
+        # compiler: every tracked byte of the vendored engine tree ds4/ (so a
+        # participant's edit misses the cache and is rebuilt),
+        # every tracked byte under harness/protocol-adapter/ and tools/ds4/, the
+        # pin's own nvcc flag lines, the nvcc and rustc versions, the CUDA arch,
+        # the cargo profile, and the workspace path (the adapter bakes the
+        # library directory in as an rpath, so a binary from another workspace
+        # would resolve libds4qwen.so elsewhere).
+        #
+        # A hit exports MLXFAST_SKIP_ENGINE_BUILD=1 for the setup step below. A
+        # miss -- including a box with no cache at all -- exports nothing and
+        # setup.sh builds exactly as before. `|| true`: THE CACHE MAY NEVER
+        # DECIDE WHETHER A RUN HAPPENS. A restore that fails for any reason is a
+        # slow run, not a failed one. The one thing it must not do is hand over a
+        # wrong engine, and that is not this step's job to check twice: the
+        # script refuses a mismatched entry itself, and setup.sh refuses again
+        # from the MANIFEST the restore leaves in the workspace.
+        run: |
+          set -uo pipefail
+          if ./tools/ds4/build-cache.sh restore; then
+            echo "MLXFAST_SKIP_ENGINE_BUILD=1" >> "${GITHUB_ENV}"
+            echo "::notice title=engine build cache::hit; the engine build is skipped and the staged adapter comes from the cache"
+          else
+            echo "::notice title=engine build cache::miss; setup.sh builds the engine from scratch"
+          fi
+          exit 0
+
+      - name: Setup (engine + pinned checkpoint) -- engine-body lane owns this
+        # Second half of benchmark.json's setupCommand, verbatim. ./setup.sh
+        # fetches and verifies the pinned target checkpoint against its checked-in
+        # digest and prepares the engine; it exits non-zero rather than proceed
+        # without the checkpoint, and the preflight above already refused the
+        # environment variables that would let it skip the download. The CONTENTS
+        # of setup.sh (the ds4 engine build, the GGUF checkpoint verification)
+        # are the engine-body lane's; this call site
+        # is stable so that lane fills it in without a workflow change.
+        run: ./setup.sh
+
+      - name: Save the engine build cache (only after a build)
+        # Runs only when the restore missed, so a hit does not rewrite the entry
+        # it just read. Never fails the job: an unwritable or full cache root is
+        # a slow next run, not a broken this one.
+        if: env.MLXFAST_SKIP_ENGINE_BUILD != '1'
+        run: |
+          set -uo pipefail
+          ./tools/ds4/build-cache.sh save \
+            || echo "::warning title=engine build cache::save failed; the next dispatch rebuilds"
+          exit 0
+
+      - name: Record the dispatched candidate sha (author-at-seal)
+        # benchd's official seal AUTHORS the sha it publishes, and it fails
+        # closed without a dispatch context: it reads the recorded sha from the
+        # file named by MLXFAST_CANDIDATE_SHA_FILE, and cross-checks the
+        # untrusted proposal in MLXFAST_COMMIT_SHA. THIS is the dispatch lane, so
+        # this is where the context exists. Both values are the FULL 40-hex sha
+        # (`github.sha`), never the short form: the seal compares them for
+        # equality and an abbreviation is not equal.
+        run: |
+          printf '%s\n' "${GITHUB_SHA}" > "${RUNNER_TEMP}/candidate.sha"
+          {
+            printf 'MLXFAST_CANDIDATE_SHA_FILE=%s\n' "${RUNNER_TEMP}/candidate.sha"
+            printf 'MLXFAST_COMMIT_SHA=%s\n' "${GITHUB_SHA}"
+          } >> "${GITHUB_ENV}"
+
+      - name: GPU-exclusive measurement (lock, quiesce, benchd iterate --mode official, seal)
+        # The whole GPU window runs in THIS one step, under the box-wide GPU lock,
+        # because the idle assertion below is only meaningful while no other GPU
+        # work can start. The order is the box order, condensed: take the lock
+        # and wait for any holder;
+        # assert the box is idle; then hand off to benchd, which owns the
+        # per-phase thermal gate between the legs.
+        #
+        # THE LOCK IS SHARED WITH SPARK-GATE, NOT A NEW ONE. Same file,
+        # /tmp/mtplx-gpu-exclusive.lock, same flock(1) discipline, so a ranked
+        # run and a bring-up gate run on this box exclude each other. flock is
+        # held on file descriptor 9 for the length of this step and released when
+        # the step's shell exits (the descriptor closes), on success or failure.
+        # The lock is WAITED for, never stolen and never taken with -n and then
+        # used anyway.
+        #
+        # QUIESCENCE IS LINUX/CUDA, not the macOS macmon+sysctl probe it replaced:
+        # /proc/loadavg for host load, nvidia-smi for GPU utilization, and the
+        # spark-gate idle rule that the only compute processes on the GPU are the
+        # box's own graphics contexts. THE 50C-CLASS PER-PHASE THERMAL GATE IS
+        # BENCHD'S, NOT THIS STEP'S: it runs inside the pinned measure-job on
+        # every timed leg, baseline and candidate alike, reading the box's GPU
+        # temperature reader. This step only gets the machine to the starting
+        # line. (The Linux reader benchd uses is the documented box/bench step in
+        # this file's header; the preflight already refused the run if it is
+        # absent.)
+        #
+        # benchmark.json's benchmarkCommand runs character for character at the
+        # end: the golden pool, the reference workspace and this box's
+        # calibration file come from the runner environment, which the preflight
+        # has already verified; the dispatch sha comes from the step above via
+        # GITHUB_ENV.
+        #
+        # TWO SERVES, ONE AT A TIME. The paired run measures two legs and each
+        # leg has its OWN resident engine. benchd boots each one through the
+        # PER-LEG VERBS, run from that leg's own workspace:
+        #
+        #   tools/serve-up.sh --boot --spec serial|mtp --draft-len N --socket-out FILE
+        #   tools/serve-up.sh --stop --socket PATH
+        #
+        # --boot leaves the resident RUNNING and writes its socket path as the
+        # first line of FILE; benchd reads it back and injects it into that leg's
+        # worker spawns as DS4_RESIDENT_SOCKET and BENCH_WORKER_RESIDENT_SOCKET.
+        # --stop is idempotent and runs on success and on failure alike, so a leg
+        # that fails mid-measurement still frees the box for the other one.
+        #
+        #   leg 1  the SERIAL CONTROL, booted from
+        #          ${MLXFAST_BASELINE_WORKSPACE}/tools/serve-up.sh -- the
+        #          REFERENCE tree's own serve script, in the reference tree, so
+        #          the control leg runs the reference engine. ALWAYS
+        #          `--spec serial --draft-len 0`: in --boot mode the flag is the
+        #          authority, and serve-up.sh REFUSES a disagreeing
+        #          SERVE_UP_SPECULATIVE rather than honouring it. So leg 1 is
+        #          serial whatever the candidate declares, and the preflight
+        #          (section 7) and measure-and-score.sh refuse a box-preset value
+        #          before that.
+        #   leg 2  the CANDIDATE, booted from this checkout's tools/serve-up.sh
+        #          at the declared spec.
+        #
+        # NOTHING ELSE MAY EXPORT A RESIDENT SOCKET. benchd refuses one inherited
+        # in its own environment -- it would be a third resident neither leg
+        # booted, and every worker that inherited it would measure whatever is on
+        # the other end. The preflight (section 2) and measure-and-score.sh
+        # refuse DS4_RESIDENT_SOCKET and BENCH_WORKER_RESIDENT_SOCKET by name.
+        #
+        # THEY NEVER OVERLAP, and that is not a preference. A ds4-resident holds
+        # ~103.7 GiB of host memory, and serve-up.sh's own memory plan refuses to
+        # load unless that much is free RIGHT NOW -- so the plan has to hold for
+        # EACH serve, one at a time: leg 1's resident boots, leg 1 is measured,
+        # that resident is stopped (`--stop`, which benchd runs on success and on
+        # failure alike), and only then does leg 2's resident boot. Two at once
+        # would fail the second plan, and if it did not it would OOM the box.
+        #
+        # WITHIN a leg the weights still load ONCE. benchd spawns the cuda-engine
+        # adapter per phase, but no adapter loads anything: each connects to that
+        # leg's resident over DS4_RESIDENT_SOCKET. Two legs is therefore two
+        # loads for the whole run, not two per phase. See docs/ds4-resident.md.
+        #
+        # Both serves boot INSIDE this step's GPU lock (fd 9, held below);
+        # serve-up.sh takes no lock of its own. The 50C-class per-phase thermal
+        # gate stays benchd's, and it applies to BOTH legs identically. The box
+        # provides the snapshot as MLXFAST_TARGET_SNAPSHOT_DIR, staged out of
+        # band like every other box asset here.
+        run: |
+          set -euo pipefail
+
+          # -- box-wide GPU lock (shared with spark-gate) --------------------
+          lock=/tmp/mtplx-gpu-exclusive.lock
+          if [[ ! -e "${lock}" ]]; then
+            ( umask 0000; : > "${lock}" ) || { echo "::error::cannot create ${lock}" >&2; exit 1; }
+          fi
+          exec 9<> "${lock}"
+          echo "waiting for the box GPU lock (${lock}); a spark-gate or another GPU window may hold it"
+          flock 9
+          echo "box GPU lock held"
+
+          # -- host quiescence ----------------------------------------------
+          # load average (1-minute) and GPU utilization must both be low before
+          # the clock starts. The build and the checkpoint fetch above leave the
+          # machine warm, so this is the last point before timing.
+          command -v nvidia-smi >/dev/null 2>&1 || { echo "::error::nvidia-smi is not on PATH; GPU state is unknown, refusing to time" >&2; exit 1; }
+          # awk, not bc: bc is not guaranteed on a minimal DGX OS, and the rest
+          # of the box tooling (spark-gate) avoids it for the same reason.
+          waited=0
+          while :; do
+            load="$(awk '{print $1}' /proc/loadavg)"
+            util="$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d '[:space:]')"
+            [[ -n "${util}" ]] || util=100
+            if awk -v l="${load}" -v u="${util}" 'BEGIN{exit !(l < 2.0 && u < 10)}'; then
+              break
+            fi
+            sleep 15
+            waited=$((waited + 15))
+            if [[ "${waited}" -ge 900 ]]; then
+              echo "::error::box did not reach quiescence within 900s (load=${load} gpu_util=${util})" >&2
+              exit 1
+            fi
+          done
+
+          # -- GPU idle bookend (spark-gate rule) ---------------------------
+          # The only compute processes tolerated on the GPU before timing are the
+          # box's own graphics contexts. A foreign container or leftover worker
+          # is a refusal, not a warning: it would be measured against.
+          apps="$(nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null || true)"
+          foreign="$(printf '%s\n' "${apps}" | grep -vE '^\s*$' | grep -vE 'Xorg|gnome-shell' || true)"
+          if [[ -n "${foreign}" ]]; then
+            echo "::error::the GPU is not idle; a foreign compute process holds it:" >&2
+            printf '%s\n' "${foreign}" >&2
+            exit 1
+          fi
+          echo "qwen38-125b-a6b-cuda-ranked: quiescent after ${waited}s (load=${load} gpu_util=${util}); the per-phase thermal gate is enforced inside the pinned measure-job"
+
+          # -- the candidate leg's spec, for the log only --------------------
+          # The CANDIDATE leg follows the submission's declared spec, and the
+          # declaration is the single source: tools/spec-declaration.sh reads
+          # mtp-head.manifest.json's `spec` block (the participant-editable knob)
+          # and derives it, validating fail-closed. An ABSENT or disabled
+          # declaration derives 0 (SERIAL) -- the stock MTP-0 launch reference,
+          # bit-for-bit -- so there is no hardcoded value here. The arm gate that
+          # governs whether a declared MTP config may run at all is
+          # tools/ranked-box-preflight.sh section 7 (already run above).
+          #
+          # IT IS DELIBERATELY NOT EXPORTED. Under the paired model an exported
+          # SERVE_UP_SPECULATIVE would reach BOTH legs' serve scripts, and the
+          # serial-control leg must be serial whatever the candidate declares.
+          # measure-and-score.sh derives the candidate's depth itself and hands
+          # benchd --mtp-depth; benchd carries it to leg 2's serve alone. The
+          # preflight and measure-and-score.sh both refuse a preset value.
+          candidate_spec="$(./tools/spec-declaration.sh describe)"
+          echo "candidate leg spec, derived from mtp-head.manifest.json: ${candidate_spec} (the serial-control leg runs serial regardless)"
+
+          # -- the paired baseline, passed through --------------------------
+          # Both come from the RUNNER SERVICE environment, which a `run:` step
+          # inherits. They are deliberately NOT restated in a step `env:` block:
+          # the `env` context holds only workflow/job/step values, so naming them
+          # there would substitute an empty string for the box's real path. They
+          # are echoed instead, so what the scored run was given is in the log,
+          # and re-asserted here because the value that matters is the one this
+          # shell holds at the moment it calls the measurement.
+          for var in MLXFAST_BASELINE_WORKSPACE MLXFAST_BASELINE_CALIBRATION; do
+            eval "value=\${${var}:-}"
+            if [[ -z "${value}" ]]; then
+              echo "::error::${var} is empty in the measurement step; the paired run has no serial-control leg to divide by" >&2
+              exit 1
+            fi
+          done
+          echo "paired baseline: workspace=${MLXFAST_BASELINE_WORKSPACE} calibration=${MLXFAST_BASELINE_CALIBRATION}"
+
+          # -- measure and score (benchmark.json benchmarkCommand) ----------
+          # measure-and-score.sh forwards the two as benchd's
+          # --baseline-workspace and --baseline-calibration, and refuses by name
+          # when either is unset.
+          MLXFAST_SCORE_PATH=score.json ./tools/qwen38-125b-a6b-measure-and-score.sh
+
+      - name: Upload score artifact
+        # Matches benchmark.json scoreArtifact `benchmark-results-<run_id>/score.json`.
+        # `if: always()` so a failure after a written score still publishes it,
+        # and `if-no-files-found: error` so a refused run is loud and artifact-less
+        # instead of quietly uploading nothing.
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: benchmark-results-${{ github.run_id }}
+          path: score.json
+          if-no-files-found: error

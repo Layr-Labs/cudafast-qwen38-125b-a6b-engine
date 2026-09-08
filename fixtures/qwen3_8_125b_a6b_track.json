@@ -1,0 +1,274 @@
+{
+  "schema_version": 1,
+  "track_id": "qwen3.8-125b-a6b-cuda-v1",
+  "track_name": "Qwen 3.8 125B A6B CUDA -- composite paired speedup",
+  "official_scoring_enabled": true,
+  "runner": {
+    "provider": "github-actions",
+    "workflow": "benchmark.yml",
+    "maxConcurrentWorkflows": 1
+  },
+  "allowed_modes": [
+    "serial",
+    "mtp"
+  ],
+  "benchmark_name": "cudafast-qwen38-125b-a6b",
+  "kv_backend": "contiguous",
+  "scored_batch_size": 1,
+  "scored_exponents": {
+    "prefill_gain_exponent": 0.25,
+    "decode_gain_exponent": 0.75
+  },
+  "live_golden": "botany",
+  "baseline_reference_commit": "0000000000000000000000000000000000000000",
+  "timed_prompt_pool": [
+    {
+      "r2_path": "correctness_prompts/qwen3.8-125b-a6b-cuda-v1/beagle.golden.json",
+      "sha256": "9b7b5b5a76fef571a6ce7bb825992ee37616aec49cf59aaf923be9690fa86554",
+      "bytes": 53286
+    },
+    {
+      "r2_path": "correctness_prompts/qwen3.8-125b-a6b-cuda-v1/plutarch.golden.json",
+      "sha256": "2b229c9fc75ff6db59741c1af675e61045963b1a995523b23d1927ca8077c600",
+      "bytes": 53208
+    },
+    {
+      "r2_path": "correctness_prompts/qwen3.8-125b-a6b-cuda-v1/medicine.golden.json",
+      "sha256": "37b9e4f9b9a44cb234e2c40cbe3ec8298abe15cac1293bbc04249010f2b7b322",
+      "bytes": 53432
+    },
+    {
+      "r2_path": "correctness_prompts/qwen3.8-125b-a6b-cuda-v1/travel.golden.json",
+      "sha256": "438609930e016938cf17da5a46d148f557dfef9f61747050b15847f64e612e66",
+      "bytes": 53279
+    },
+    {
+      "r2_path": "correctness_prompts/qwen3.8-125b-a6b-cuda-v1/drama.golden.json",
+      "sha256": "375ca36f8b64ebe95dc5eba39def6e38a1482aa43dcd9bcb158aea25c998b41a",
+      "bytes": 53296
+    },
+    {
+      "r2_path": "correctness_prompts/qwen3.8-125b-a6b-cuda-v1/essays.golden.json",
+      "sha256": "0a7e6f80d416ccef6913a2bdad0c9edfa5a7f4a8a3df6cfdfc91540b1e161881",
+      "bytes": 53220
+    },
+    {
+      "r2_path": "correctness_prompts/qwen3.8-125b-a6b-cuda-v1/botany.golden.json",
+      "sha256": "b6e884b95969d31040d80e8bce9401fa31b2da16536a9a60cee97a33e5a22f85",
+      "bytes": 53650
+    },
+    {
+      "r2_path": "correctness_prompts/qwen3.8-125b-a6b-cuda-v1/republic.golden.json",
+      "sha256": "b40c83640cf0b363e8aa2e59ce305d8adc41faa397f9f71aca050b8d8e195e4d",
+      "bytes": 53420
+    }
+  ],
+  "hidden_correctness_golden": {
+    "sha256": "b6e884b95969d31040d80e8bce9401fa31b2da16536a9a60cee97a33e5a22f85",
+    "bytes": 53650
+  },
+  "live_golden_speculative": {
+    "mtp1": {
+      "r2_path": "correctness_prompts/qwen3.8-125b-a6b-cuda-v1/botany.mtp1.golden.json",
+      "sha256": "b6e884b95969d31040d80e8bce9401fa31b2da16536a9a60cee97a33e5a22f85",
+      "bytes": 53650
+    },
+    "mtp2": {
+      "r2_path": "correctness_prompts/qwen3.8-125b-a6b-cuda-v1/botany.mtp2.golden.json",
+      "sha256": "b6e884b95969d31040d80e8bce9401fa31b2da16536a9a60cee97a33e5a22f85",
+      "bytes": 53650
+    },
+    "mtp3": {
+      "r2_path": "correctness_prompts/qwen3.8-125b-a6b-cuda-v1/botany.mtp3.golden.json",
+      "sha256": "b6e884b95969d31040d80e8bce9401fa31b2da16536a9a60cee97a33e5a22f85",
+      "bytes": 53650
+    },
+    "mtp6": {
+      "r2_path": "correctness_prompts/qwen3.8-125b-a6b-cuda-v1/botany.mtp6.golden.json",
+      "sha256": "b6e884b95969d31040d80e8bce9401fa31b2da16536a9a60cee97a33e5a22f85",
+      "bytes": 53650
+    },
+    "mtp4": {
+      "r2_path": "correctness_prompts/qwen3.8-125b-a6b-cuda-v1/botany.mtp4.golden.json",
+      "sha256": "b6e884b95969d31040d80e8bce9401fa31b2da16536a9a60cee97a33e5a22f85",
+      "bytes": 53650
+    },
+    "mtp5": {
+      "r2_path": "correctness_prompts/qwen3.8-125b-a6b-cuda-v1/botany.mtp5.golden.json",
+      "sha256": "b6e884b95969d31040d80e8bce9401fa31b2da16536a9a60cee97a33e5a22f85",
+      "bytes": 53650
+    }
+  },
+  "serve_configuration": {
+    "engine": "ds4",
+    "engine_pin": "5f36517cf15c6b5b780be69a8f0532545e3b9326",
+    "toolchain": {
+      "nvcc_version": "V13.0.88",
+      "cuda_toolkit_package": "cuda-toolkit-13-0=13.0.2-1",
+      "driver_min": "580.159.03",
+      "cuda_arch": "sm_121"
+    },
+    "weight_owner": "ds4-resident",
+    "engine_env": {},
+    "depths": {
+      "serial": {
+        "num_speculative_tokens": 0,
+        "ds4_mtp_draft_tokens": 1,
+        "timed_oracle": "hidden_correctness_golden"
+      },
+      "mtp1": {
+        "num_speculative_tokens": 1,
+        "ds4_mtp_draft_tokens": 2,
+        "timed_oracle": "live_golden_speculative.mtp1"
+      },
+      "mtp2": {
+        "num_speculative_tokens": 2,
+        "ds4_mtp_draft_tokens": 3,
+        "timed_oracle": "live_golden_speculative.mtp2"
+      },
+      "mtp3": {
+        "num_speculative_tokens": 3,
+        "ds4_mtp_draft_tokens": 4,
+        "timed_oracle": "live_golden_speculative.mtp3"
+      }
+    }
+  },
+  "target": {
+    "upstream_model_id": "unsloth/Qwen3.8-Flash-Next-GGUF",
+    "upstream_revision": "38bb39ee97821de2c9009abb7e93950eec396e66",
+    "upstream_variant": "UD-Q4_K_XL",
+    "engine": "ds4",
+    "engine_pin": "5f36517cf15c6b5b780be69a8f0532545e3b9326",
+    "gguf_architecture": "qwen4exp",
+    "files": [
+      {
+        "path": "Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+        "bytes": 10946624,
+        "sha256": "4448186216b3af4cc558bbce2c3213f01608f8f8b2e5267a9767971dd3ec8082"
+      },
+      {
+        "path": "Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf",
+        "bytes": 49859583136,
+        "sha256": "3f342f1c1580473f1ee94ddd5b28206e8c07a70fa1a366f59d1d6c922919a6c9"
+      },
+      {
+        "path": "Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf",
+        "bytes": 49376141504,
+        "sha256": "56758f40269cad5cd9b0d3d6fbae0f40f6d5be6de49e4ab392dbe83157d9cbd3"
+      },
+      {
+        "path": "Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf",
+        "bytes": 12087983520,
+        "sha256": "753bda48b98ba4f1636134a90a967de1b2d3908a236c026e464777342e53510a"
+      },
+      {
+        "path": "mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
+        "bytes": 2786568256,
+        "sha256": "5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6"
+      }
+    ],
+    "architecture": "qwen4_exp",
+    "model_type": "qwen4_exp_text",
+    "num_hidden_layers": 48,
+    "hidden_size": 2560,
+    "vocab_size": 248320,
+    "max_position_embeddings": 262144,
+    "num_attention_heads": 24,
+    "num_key_value_heads": 2,
+    "head_dim": 256,
+    "partial_rotary_factor": 0.25,
+    "rope_theta": 10000000,
+    "mrope_interleaved": true,
+    "mrope_section": [
+      11,
+      11,
+      10
+    ],
+    "full_attention_interval": 4,
+    "full_attention_layer_indices": [
+      3,
+      7,
+      11,
+      15,
+      19,
+      23,
+      27,
+      31,
+      35,
+      39,
+      43,
+      47
+    ],
+    "linear_attention_layer_count": 36,
+    "linear_num_key_heads": 16,
+    "linear_num_value_heads": 48,
+    "linear_key_head_dim": 128,
+    "linear_value_head_dim": 128,
+    "linear_conv_kernel_dim": 4,
+    "indexer_n_heads": 4,
+    "indexer_kv_heads": 1,
+    "indexer_head_dim": 128,
+    "indexer_budget": 2048,
+    "indexer_compress_ratio": 4,
+    "hc_count": 4,
+    "hc_lowrank": 320,
+    "num_experts": 512,
+    "num_experts_per_tok": 10,
+    "moe_intermediate_size": 640,
+    "shared_expert_intermediate_size": 640,
+    "ngram_size": 3,
+    "heads_per_ngram": 8,
+    "ple_layer_ids": [
+      2
+    ],
+    "ple_embed_dim": 2560,
+    "ple_conv_kernel_size": 4,
+    "tie_word_embeddings": false,
+    "bos_token_id": 248044,
+    "pad_token_id": 248044,
+    "eos_token_ids": [
+      248046,
+      248044
+    ],
+    "quantization": {
+      "mode": "gguf-mixed",
+      "routed_expert_gate_up": "Q4_K",
+      "routed_expert_down": "Q5_1",
+      "ple_table": "IQ4_NL",
+      "dense_embedding_and_output": "Q8_0/F32/BF16",
+      "mtp_head": "Q8_0"
+    },
+    "upstream_base_model": "Qwen/Qwen3.8-Flash-Next",
+    "upstream_base_revision": "f5d08274bafd880402bd16f5e3e6c514136ec06c",
+    "upstream_base_model_relation": "quantized"
+  },
+  "mtp_head": {
+    "role": "spec_decode_mtp_head",
+    "source": "pinned",
+    "packaging": "separate_gguf",
+    "file": "mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
+    "engine_option": "--mtp-model",
+    "num_hidden_layers": 1,
+    "hybrid": true,
+    "layer_types": [
+      "full_attention"
+    ],
+    "rope_theta": 10000000,
+    "use_dedicated_embeddings": false,
+    "permitted_draft_depths": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6
+    ]
+  },
+  "scoring_semantics": {
+    "ruling_verbatim": [
+      "score the qwen 3.8 125b-a6b tracks (mlx and cuda) single-stream, paired serial vs the built-in mtp, on prefill gains ^ .25 * decode ^ .75"
+    ],
+    "ruling_date": "2026-08-27",
+    "formula": "composite = prefill_gain ^ 0.25 * decode_gain ^ 0.75. Per component: gain = baseline_aggregate / candidate_aggregate (serial-anchored -- a faster candidate scores > 1, matching the family's standing convention). aggregate = the PER-PROMPT SUM over the pinned pool, i.e. each pool prompt is timed in its own SINGLE-STREAM window and the elapsed times are added together -- for prefill and decode separately, on both the baseline (serial control) leg and the candidate (built-in mtp) leg, over the SAME prompts."
+  }
+}
