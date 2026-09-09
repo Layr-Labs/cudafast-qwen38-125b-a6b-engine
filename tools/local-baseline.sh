@@ -19,7 +19,8 @@ Optional environment overrides (relative paths resolve from the checkout):
   MLXFAST_SCORE_PATH                score.local-iterate.json
 
 The existing benchmark entry point verifies benchd, boots one resident engine
-through tools/serve-up.sh, and enables the cool gate.
+through tools/serve-up.sh, and enables the cool gate. It runs one leg: the
+paired ranked path (tools/qwen38-125b-a6b-measure-and-score.sh) is not involved.
 USAGE
 }
 
@@ -39,11 +40,6 @@ export MLXFAST_ENGINE_BIN="${MLXFAST_ENGINE_BIN:-.build/release/mlxfast-runtime-
 export MLXFAST_CORRECTNESS_GOLDEN_PATH="${MLXFAST_CORRECTNESS_GOLDEN_PATH:-correctness_prompts/public-longcopy-gate-english-1024.golden.json}"
 export MLXFAST_WEIGHTS_PATH="${MLXFAST_WEIGHTS_PATH:-${MLXFAST_TARGET_SNAPSHOT_DIR:-reference_weights/Qwen3.8-Flash-Next-GGUF}}"
 export MLXFAST_SCORE_PATH="${MLXFAST_SCORE_PATH:-score.local-iterate.json}"
-
-# This helper runs one candidate against the public fixture. benchd also reads
-# paired-run settings from the environment, so an operator's shell must not
-# accidentally turn this local entry point into a reference/candidate pair.
-unset MLXFAST_BASELINE_WORKSPACE MLXFAST_BASELINE_CALIBRATION
 
 if [[ ! -x "${MLXFAST_ENGINE_BIN}" ]]; then
   echo "local-baseline.sh: engine not executable: ${MLXFAST_ENGINE_BIN}" >&2

@@ -8,25 +8,28 @@
 #   1. tools/ds4/build.sh -- the vendored ds4 tree's CUDA core objects, the weight
 #      owner, the shim library and the cuda-engine adapter (staged for benchd
 #      by tools/stage-cuda-engine.sh). Needs nvcc and cargo.
-#   2. make the pinned GGUF target snapshot present and verified at
-#      MLXFAST_TARGET_SNAPSHOT_DIR: every main shard and the native MTP draft
-#      head. A file that is absent, or whose byte count does not match its pin,
-#      is downloaded from the public model repository (resumable), then every
-#      file is checked against fixtures/qwen3_8_125b_a6b_track.json, byte count
-#      first, then sha256. A verified set leaves a marker keyed on the pins and
-#      each file's size, mtime and inode, so a rerun on a machine that already
-#      holds the snapshot verifies by the marker and reads no shard.
+#   2. verify the pinned GGUF target snapshot against the pins in
+#      fixtures/qwen3_8_125b_a6b_track.json: every main shard and the native
+#      MTP draft head, byte count first, then sha256. With
+#      MLXFAST_TARGET_SNAPSHOT_DIR set (a ranked box, organizer-staged) the
+#      directory and every file must already be there: nothing is fetched,
+#      nothing is deleted, and every run hashes the set. With it UNSET (a
+#      participant's own machine) the snapshot lives under this checkout,
+#      setup downloads each missing file from the pinned public model
+#      repository (resumable, kept only when both pins match), and a verified
+#      set leaves a marker keyed on the pins and each file's size, mtime and
+#      inode, so a rerun there reads no shard.
 #
 # Environment:
 #   MLXFAST_TARGET_SNAPSHOT_DIR   the target snapshot: the GGUF shards plus the
-#                                 native MTP draft head, flat beside them. A
-#                                 ranked box exports the organizer-staged
-#                                 directory. Default when unset:
+#                                 native MTP draft head, flat beside them.
+#                                 Set: verify only. Unset: the default
 #                                 reference_weights/Qwen3.8-Flash-Next-GGUF
 #                                 under this checkout, which setup fills.
-#   MLXFAST_TARGET_BASE_URL       where a missing file is fetched from; the
-#                                 pinned revision of the public model
-#                                 repository by default. A file:// base works.
+#   MLXFAST_TARGET_BASE_URL       where a missing file is fetched from on the
+#                                 default path. Default: the fixture's
+#                                 upstream_model_id at upstream_revision on
+#                                 huggingface.co. A file:// base works.
 #   MLXFAST_SKIP_ENGINE_BUILD=1   skip step 1 (a pre-built engine is staged).
 #                                 When the staged engine came from
 #                                 tools/ds4/build-cache.sh it carries a
@@ -47,19 +50,22 @@ die() { printf 'setup.sh: %s\n' "$*" >&2; exit 1; }
 CONTRACT="${ROOT_DIR}/fixtures/qwen3_8_125b_a6b_track.json"
 command -v jq >/dev/null 2>&1 || die "jq is required"
 
-# The public model repository at the revision the target was pinned from
-# (README, "The pinned artifacts"). The four shards live under the variant
-# directory and the draft head under MTP/; the snapshot keeps them flat.
-TARGET_BASE_URL="${MLXFAST_TARGET_BASE_URL:-https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/38bb39ee97821de2c9009abb7e93950eec396e66}"
+# The public model repository the target was pinned from, at that revision
+# (the fixture's upstream_model_id / upstream_revision; README, "The pinned
+# artifacts"). The shards live under the variant directory and the draft head
+# under MTP/; the snapshot keeps them flat.
+UPSTREAM_MODEL_ID="$(jq -r '.target.upstream_model_id // empty' "${CONTRACT}")"
+UPSTREAM_REVISION="$(jq -r '.target.upstream_revision // empty' "${CONTRACT}")"
+UPSTREAM_VARIANT="$(jq -r '.target.upstream_variant // empty' "${CONTRACT}")"
+TARGET_BASE_URL="${MLXFAST_TARGET_BASE_URL:-https://huggingface.co/${UPSTREAM_MODEL_ID}/resolve/${UPSTREAM_REVISION}}"
 DEFAULT_SNAPSHOT_DIR="${ROOT_DIR}/reference_weights/Qwen3.8-Flash-Next-GGUF"
 
 source_path_for() {
-  # The repository path of one pinned file: shards under their variant
-  # directory, the draft head under MTP/.
+  # The repository path of one pinned file: the draft head under MTP/, a
+  # shard under the variant directory.
   case "$1" in
     mtp-*.gguf) printf 'MTP/%s\n' "$1" ;;
-    *-UD-Q4_K_XL-*.gguf) printf 'UD-Q4_K_XL/%s\n' "$1" ;;
-    *) printf '%s\n' "$1" ;;
+    *) printf '%s/%s\n' "${UPSTREAM_VARIANT}" "$1" ;;
   esac
 }
 
@@ -83,6 +89,8 @@ download_pinned_file() {
   local dest="${SNAPSHOT_DIR}/${rel}" partial="${SNAPSHOT_DIR}/${rel}.partial"
   local url got_bytes got_sha
   url="${TARGET_BASE_URL}/$(source_path_for "${rel}")"
+  [[ -n "${UPSTREAM_MODEL_ID}" && -n "${UPSTREAM_REVISION}" && -n "${UPSTREAM_VARIANT}" ]] \
+    || die "the contract names no upstream_model_id / upstream_revision / upstream_variant; cannot fetch ${rel}"
   command -v curl >/dev/null 2>&1 || die "curl is required to download ${rel}"
   log "downloading ${rel} (${want_bytes} bytes) from ${url}"
   curl -fL --retry 5 --retry-delay 5 -C - -o "${partial}" "${url}" \
@@ -158,33 +166,45 @@ if [[ "${MLXFAST_SKIP_WEIGHTS_DOWNLOAD:-0}" == "1" || "${SKIP_MODEL_DOWNLOAD:-0}
   log "MLXFAST_SKIP_WEIGHTS_DOWNLOAD/SKIP_MODEL_DOWNLOAD set: not verifying the checkpoint (no scored run is possible)"
 else
   SNAPSHOT_DIR="${MLXFAST_TARGET_SNAPSHOT_DIR:-}"
-  if [[ -z "${SNAPSHOT_DIR}" ]]; then
-    SNAPSHOT_DIR="${DEFAULT_SNAPSHOT_DIR}"
-    log "MLXFAST_TARGET_SNAPSHOT_DIR is unset; using ${SNAPSHOT_DIR}"
-  fi
-  mkdir -p "${SNAPSHOT_DIR}" || die "cannot create the target snapshot directory: ${SNAPSHOT_DIR}"
   pins="$(jq -r '.target.files[] | [.path, (.bytes|tostring), .sha256] | @tsv' "${CONTRACT}")"
   [[ -n "${pins}" ]] || die "the contract pins no target files (.target.files is empty)"
+  if [[ -n "${SNAPSHOT_DIR}" ]]; then
+    # A staged snapshot: present, complete, and hashed on every run. The ranked
+    # path never fetches, deletes or short-cuts organizer material.
+    local_snapshot=0
+    [[ -d "${SNAPSHOT_DIR}" ]] || die "the target snapshot directory does not exist: ${SNAPSHOT_DIR}"
+  else
+    local_snapshot=1
+    SNAPSHOT_DIR="${DEFAULT_SNAPSHOT_DIR}"
+    log "MLXFAST_TARGET_SNAPSHOT_DIR is unset; using ${SNAPSHOT_DIR}"
+    mkdir -p "${SNAPSHOT_DIR}" || die "cannot create the target snapshot directory: ${SNAPSHOT_DIR}"
+    # One setup at a time fills the directory: two would append into the same
+    # partial file.
+    setup_lock="${SNAPSHOT_DIR}/.setup-lock"
+    mkdir "${setup_lock}" 2>/dev/null \
+      || die "another setup is filling ${SNAPSHOT_DIR}, or a previous one left ${setup_lock}; remove it when no setup is running"
+    trap 'rmdir "${setup_lock}" 2>/dev/null || true' EXIT
+    # A file that is absent, or the wrong size, is fetched. A present file of
+    # the right size is left for the digest pass below to judge.
+    while IFS=$'\t' read -r rel want_bytes want_sha; do
+      [[ -n "${rel}" ]] || continue
+      f="${SNAPSHOT_DIR}/${rel}"
+      if [[ -f "${f}" ]]; then
+        got_bytes="$(wc -c < "${f}" | tr -d '[:space:]')"
+        [[ "${got_bytes}" == "${want_bytes}" ]] && continue
+        log "${rel} is ${got_bytes} bytes, pinned ${want_bytes}; fetching it again"
+        rm -f "${f}"
+      fi
+      download_pinned_file "${rel}" "${want_bytes}" "${want_sha}"
+    done <<< "${pins}"
+  fi
 
-  # A file that is absent, or the wrong size, is fetched. A present file of the
-  # right size is left for the digest pass below to judge.
-  while IFS=$'\t' read -r rel want_bytes want_sha; do
-    [[ -n "${rel}" ]] || continue
-    f="${SNAPSHOT_DIR}/${rel}"
-    if [[ -f "${f}" ]]; then
-      got_bytes="$(wc -c < "${f}" | tr -d '[:space:]')"
-      [[ "${got_bytes}" == "${want_bytes}" ]] && continue
-      log "${rel} is ${got_bytes} bytes, pinned ${want_bytes}; fetching it again"
-      rm -f "${f}"
-    fi
-    download_pinned_file "${rel}" "${want_bytes}" "${want_sha}"
-  done <<< "${pins}"
-
-  # A rerun on a machine that already holds the verified set reads no shard: the
-  # marker written after a full pass records each file's size, mtime and inode,
-  # and a set that still matches it is the set that was verified.
+  # On the default path, a rerun on a machine that already holds the verified
+  # set reads no shard: the marker written after a full pass records each
+  # file's size, mtime and inode, and a set that still matches it is the set
+  # that was verified. A staged snapshot takes no marker and hashes every run.
   marker="$(snapshot_marker_path)"
-  if [[ "${MLXFAST_SKIP_WEIGHTS_SHA256:-0}" != "1" && -f "${marker}" ]] \
+  if [[ "${local_snapshot}" == "1" && "${MLXFAST_SKIP_WEIGHTS_SHA256:-0}" != "1" && -f "${marker}" ]] \
       && identity="$(snapshot_identity)" && [[ "${identity}" == "$(cat "${marker}")" ]]; then
     log "target snapshot at ${SNAPSHOT_DIR} verified by marker: $(wc -l < "${marker}" | tr -d '[:space:]') pinned files unchanged since the last full verification"
     verified_by_marker=1
@@ -239,14 +259,12 @@ else
     done
     rm -rf "${verify_dir}"
     [[ "${verified}" == "${count}" ]] || die "sha256 verified ${verified} of ${count} pinned files"
-    # The marker is a rerun convenience, never a gate: a directory that cannot
-    # take it (an organizer-staged, read-only snapshot) is hashed again next time.
-    if identity="$(snapshot_identity)" && printf '%s\n' "${identity}" > "${marker}.tmp" 2>/dev/null \
-        && mv -f "${marker}.tmp" "${marker}" 2>/dev/null; then
+    if [[ "${local_snapshot}" == "1" ]]; then
+      # The marker is a rerun convenience on the default path, never a gate.
+      identity="$(snapshot_identity)"
+      printf '%s\n' "${identity}" > "${marker}.tmp.$$"
+      mv -f "${marker}.tmp.$$" "${marker}"
       log "wrote the verification marker $(basename "${marker}")"
-    else
-      rm -f "${marker}.tmp" 2>/dev/null || true
-      log "could not write a verification marker in ${SNAPSHOT_DIR}; the next run hashes again"
     fi
   fi
   [[ -e "${SNAPSHOT_DIR}/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf" ]] \

@@ -37,7 +37,10 @@ for f in "${FILES[@]}"; do
   pins="$(jq -c --arg p "${f}" --argjson b "$(wc -c < "${SOURCE}/$(source_path "${f}")" | tr -d ' ')" \
     --arg s "$(sha256_of "${SOURCE}/$(source_path "${f}")")" '. + [{path:$p, bytes:$b, sha256:$s}]' <<<"${pins}")"
 done
-write_fixture() { jq -n --argjson files "$1" '{target:{files:$files}}' > "${ROOT}/fixtures/qwen3_8_125b_a6b_track.json"; }
+write_fixture() {
+  jq -n --argjson files "$1" '{target:{upstream_model_id:"example/model", upstream_revision:"0000000", upstream_variant:"UD-Q4_K_XL", files:$files}}' \
+    > "${ROOT}/fixtures/qwen3_8_125b_a6b_track.json"
+}
 write_fixture "${pins}"
 
 # run_setup NAME [ENV=VALUE...]: runs setup.sh from the checkout with the
@@ -86,8 +89,8 @@ grep -q "${FILES[2]} is 10 bytes, pinned" "${WORK}/truncated.log"
 cmp -s "${truncate_target}" "${SOURCE}/$(source_path "${FILES[2]}")"
 grep -q 'by byte count and sha256' "${WORK}/truncated.log"
 
-# 4. A file whose bytes changed but whose size did not: the marker no longer
-#    matches (mtime, inode), the full pass runs and refuses by name.
+# 4. A file rewritten with the same size: its mtime and inode changed, so the
+#    marker no longer matches, the full pass runs and refuses by name.
 tamper_target="${DEFAULT_DIR}/${FILES[0]}"
 size="$(wc -c < "${tamper_target}" | tr -d ' ')"
 head -c "${size}" /dev/urandom > "${tamper_target}.tmp" && mv "${tamper_target}.tmp" "${tamper_target}"
@@ -114,26 +117,50 @@ new_pins="$(jq -c '.[0].sha256 = ("0" * 64)' <<<"${pins}")"
 write_fixture "${new_pins}"
 run_setup repinned
 [[ "${rc}" == 1 ]]
-! grep -q 'verified by marker' "${WORK}/repinned.log"
+if grep -q 'verified by marker' "${WORK}/repinned.log"; then echo 'FAIL: a marker under old pins was trusted' >&2; exit 1; fi
 grep -q "sha256 mismatch for ${FILES[0]}" "${WORK}/repinned.log"
 write_fixture "${pins}"
 
-# 7. An explicit MLXFAST_TARGET_SNAPSHOT_DIR (a box) holding the set with no
-#    marker: verified in full, nothing fetched, marker written there.
+# 7. An explicit MLXFAST_TARGET_SNAPSHOT_DIR (a box) holding the set: verified
+#    in full on every run, nothing fetched, no marker written there.
 BOX="${WORK}/box snapshot"
 mkdir -p "${BOX}"
 for f in "${FILES[@]}"; do cp "${SOURCE}/$(source_path "${f}")" "${BOX}/${f}"; done
-run_setup box MLXFAST_TARGET_SNAPSHOT_DIR="${BOX}" MLXFAST_TARGET_BASE_URL="file://${WORK}/nowhere"
-[[ "${rc}" == 0 ]] || { cat "${WORK}/box.log"; exit 1; }
-[[ "$(downloads box)" == 0 ]]
-grep -q 'by byte count and sha256' "${WORK}/box.log"
-[[ -n "$(ls "${BOX}"/.verified-* 2>/dev/null)" ]]
+for pass in box box_again; do
+  run_setup "${pass}" MLXFAST_TARGET_SNAPSHOT_DIR="${BOX}"
+  [[ "${rc}" == 0 ]] || { cat "${WORK}/${pass}.log"; exit 1; }
+  [[ "$(downloads "${pass}")" == 0 ]]
+  grep -q 'by byte count and sha256' "${WORK}/${pass}.log"
+  if grep -q 'verified by marker' "${WORK}/${pass}.log"; then echo 'FAIL: a staged snapshot used a marker' >&2; exit 1; fi
+  [[ -z "$(ls "${BOX}"/.verified-* 2>/dev/null)" ]]
+done
 
-# 8. The download skip keeps its meaning: nothing fetched, nothing verified.
+# 8. An explicit directory that is missing, or missing a file, refuses; nothing
+#    is created and nothing is fetched.
+run_setup box_missing_dir MLXFAST_TARGET_SNAPSHOT_DIR="${WORK}/no such box"
+[[ "${rc}" == 1 && ! -d "${WORK}/no such box" ]]
+grep -q 'target snapshot directory does not exist' "${WORK}/box_missing_dir.log"
+rm -f "${BOX}/${FILES[4]}"
+run_setup box_missing_file MLXFAST_TARGET_SNAPSHOT_DIR="${BOX}"
+[[ "${rc}" == 1 && "$(downloads box_missing_file)" == 0 && ! -e "${BOX}/${FILES[4]}" ]]
+grep -q "pinned checkpoint file is missing: ${FILES[4]}" "${WORK}/box_missing_file.log"
+head -c 10 "${SOURCE}/$(source_path "${FILES[4]}")" > "${BOX}/${FILES[4]}"
+run_setup box_short_file MLXFAST_TARGET_SNAPSHOT_DIR="${BOX}"
+[[ "${rc}" == 1 && "$(downloads box_short_file)" == 0 && "$(wc -c < "${BOX}/${FILES[4]}" | tr -d ' ')" == 10 ]]
+grep -q "byte-count mismatch for ${FILES[4]}" "${WORK}/box_short_file.log"
+
+# 9. A stale lock on the default directory refuses rather than racing.
+mkdir -p "${DEFAULT_DIR}/.setup-lock"
+run_setup locked
+[[ "${rc}" == 1 ]]
+grep -q 'another setup is filling' "${WORK}/locked.log"
+rmdir "${DEFAULT_DIR}/.setup-lock"
+
+# 10. The download skip keeps its meaning: nothing fetched, nothing verified.
 rm -rf "${DEFAULT_DIR}"
 run_setup skipped MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1
 [[ "${rc}" == 0 ]]
 [[ "$(downloads skipped)" == 0 && ! -d "${DEFAULT_DIR}" ]]
 grep -q 'not verifying the checkpoint' "${WORK}/skipped.log"
 
-echo 'test-setup-onboarding.sh: all 8 cases passed'
+echo 'test-setup-onboarding.sh: all 10 cases passed'

@@ -26,7 +26,6 @@ if [[ "${2:-}" == "--help" ]]; then
 fi
 printf '%s\n' "$PWD" > "${CAPTURE}.cwd"
 printf '%s\n' "$@" > "${CAPTURE}.argv"
-printf '%s\n' "${MLXFAST_BASELINE_WORKSPACE-unset}" "${MLXFAST_BASELINE_CALIBRATION-unset}" > "${CAPTURE}.pair"
 printf '%s\n' '{"score":null,"passed":true,"metrics":{"decode_seconds_per_token":0.05}}'
 exit "${STUB_EXIT:-0}"
 STUB
@@ -94,12 +93,6 @@ assert_arg overrides --golden 'custom golden.json'
 assert_arg overrides --weights 'custom weights'
 assert_arg overrides --score-path 'custom result.json'
 
-run_case inherited_pair MLXFAST_BASELINE_WORKSPACE=organizer-reference \
-  MLXFAST_BASELINE_CALIBRATION=organizer-calibration.json \
-  "${TEST_ROOT}/tools/local-baseline.sh"
-[[ "${rc}" == 0 ]]
-[[ "$(cat "${WORK}/inherited_pair.pair")" == $'unset\nunset' ]]
-
 run_case failed STUB_EXIT=1 "${TEST_ROOT}/tools/local-baseline.sh"
 [[ "${rc}" == 1 ]]
 run_case help "${TEST_ROOT}/tools/local-baseline.sh" --help
@@ -119,4 +112,4 @@ run_case missing_snapshot MLXFAST_WEIGHTS_PATH=absent-snapshot "${TEST_ROOT}/too
 [[ "${rc}" == 1 && ! -f "${WORK}/missing_snapshot.argv" ]]
 grep -q 'target snapshot directory not found' "${WORK}/missing_snapshot.stderr"
 
-echo 'test-local-baseline.sh: all 11 cases passed'
+echo 'test-local-baseline.sh: all 10 cases passed'

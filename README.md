@@ -68,16 +68,19 @@ and verifies the target snapshot. The steps need different things.
   against the shim library. The default (mock) build is portable and needs no
   GPU, so the adapter's own tests run on a laptop and in hosted CI.
 - The GGUF target snapshot: the four target shards and, flat beside them, the
-  Q8_0 MTP draft head. `MLXFAST_TARGET_SNAPSHOT_DIR` names the directory. A
-  ranked box exports its organizer-staged directory. On any other machine
-  leave it unset: `./setup.sh` then uses
-  `reference_weights/Qwen3.8-Flash-Next-GGUF` under the checkout and downloads
-  each missing file from the pinned revision of the public model repository
-  (about 114 GB, resumable). Every file is verified against the
-  `{bytes, sha256}` pins in `fixtures/qwen3_8_125b_a6b_track.json`, and a file
-  that does not match is discarded. A verified set leaves a marker, so a rerun
-  on a machine that already holds the snapshot reads no shard. Setup never
-  substitutes or re-quantizes a checkpoint.
+  Q8_0 MTP draft head. Every file is verified against the `{bytes, sha256}`
+  pins in `fixtures/qwen3_8_125b_a6b_track.json`. Where it lives depends on
+  `MLXFAST_TARGET_SNAPSHOT_DIR`:
+  - Set (a ranked box): the organizer-staged directory. Setup only verifies
+    it, on every run. It fetches nothing, deletes nothing, and FAILS CLOSED
+    when the directory or a file is absent or does not match.
+  - Unset (your own machine): `reference_weights/Qwen3.8-Flash-Next-GGUF`
+    under the checkout. Setup downloads each missing file from the pinned
+    revision of the public model repository (about 114 GB, resumable), keeps a
+    download only when both pins match, and leaves a marker after a verified
+    pass so a rerun there reads no shard.
+
+  Setup never substitutes or re-quantizes a checkpoint.
 - `jq` and Git.
 
 The benchmarker arrives as a prebuilt binary.
@@ -118,11 +121,13 @@ the channel's `benchd.manifest.json` (installed beside the binary).
 
 This command builds the ds4 engine and the `cuda-engine` adapter, stages the
 adapter at the path benchd resolves, then makes the GGUF target snapshot
-present and verified: it downloads each missing file from the pinned public
-model repository and checks every file against the contract's
-`{bytes, sha256}` pins. On a machine that already holds the verified snapshot
-the second step reads no shard. See [Requirements](#requirements) for the
-toolchain each step needs and the environment variables that skip a step.
+present and verified. With `MLXFAST_TARGET_SNAPSHOT_DIR` unset it downloads
+each missing file from the pinned public model repository into
+`reference_weights/` and checks every file against the contract's
+`{bytes, sha256}` pins; a rerun on the same machine reads no shard. With it
+set, setup only verifies the staged directory. See
+[Requirements](#requirements) for the toolchain each step needs and the
+environment variables that skip a step.
 
 ```bash
 tools/local-baseline.sh
