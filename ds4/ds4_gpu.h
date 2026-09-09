@@ -547,6 +547,18 @@ int ds4_gpu_indexer_topk_tensor(
         uint32_t                n_tokens,
         uint32_t                top_k);
 
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+/* CUDA-only MTP top-1.  This is the historical host argmax contract: entry
+ * zero seeds each row, so a NaN there pins the result to token zero.  Later
+ * NaNs are ignored, equal values choose the lower index.  The generic indexer
+ * reducer deliberately keeps its own NaN behavior. */
+int ds4_gpu_qwen4exp_mtp_top1_tensor(
+        ds4_gpu_tensor       *selected,
+        const ds4_gpu_tensor *logits,
+        uint32_t                n_vocab,
+        uint32_t                n_tokens);
+#endif
+
 /* =========================================================================
  * Qwen4-Exp (Qwen 3.8 Flash-Next) QSA block.
  *

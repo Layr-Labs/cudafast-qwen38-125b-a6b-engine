@@ -14071,6 +14071,7 @@ __global__ static void dspark_markov_argmax_kernel(
     }
 }
 
+template <bool preserve_nan0>
 __global__ static void indexer_top1_kernel(
         uint32_t *selected,
         const float *scores,
@@ -14109,7 +14110,14 @@ __global__ static void indexer_top1_kernel(
         __syncthreads();
     }
 
-    if (tid == 0u) selected[t] = idxs[0];
+    if (tid == 0u) {
+        uint32_t best_i = idxs[0];
+        if (preserve_nan0) {
+            const uint32_t bits = __float_as_uint(row[0]) & 0x7fffffffu;
+            if (bits > 0x7f800000u) best_i = 0u;
+        }
+        selected[t] = best_i;
+    }
 }
 
 __global__ static void indexer_top1_value_kernel(
@@ -15000,10 +15008,11 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         return 0;
     }
     if (top_k == 1u && !g_cuda_no_top1) {
-        indexer_top1_kernel<<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
-                                                (const float *)scores->ptr,
-                                                n_comp,
-                                                n_tokens);
+        indexer_top1_kernel<false><<<n_tokens, 1024>>>(
+                (uint32_t *)selected->ptr,
+                (const float *)scores->ptr,
+                n_comp,
+                n_tokens);
         return cuda_ok(cudaGetLastError(), "indexer top1 launch");
     }
     if (top_k == 2048u && n_comp <= 4096u &&
@@ -15233,6 +15242,31 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                          (const float *)scores->ptr,
                                          n_comp, n_tokens, top_k);
     return cuda_ok(cudaGetLastError(), "indexer topk launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_mtp_top1_tensor(
+        ds4_gpu_tensor       *selected,
+        const ds4_gpu_tensor *logits,
+        uint32_t                n_vocab,
+        uint32_t                n_tokens) {
+    if (!selected || !logits || n_vocab == 0u || n_tokens == 0u ||
+        n_vocab > UINT64_MAX / sizeof(float) / n_tokens ||
+        logits->bytes < (uint64_t)n_tokens * n_vocab * sizeof(float) ||
+        selected->bytes < (uint64_t)n_tokens * sizeof(uint32_t)) {
+        return 0;
+    }
+    /* Keep DS4_CUDA_NO_TOP1 useful as a diagnostic: the existing one-thread
+     * top-k fallback already has the CPU-seeded NaN behavior. */
+    if (g_cuda_no_top1) {
+        return ds4_gpu_indexer_topk_tensor(selected, logits, n_vocab,
+                                            n_tokens, 1u);
+    }
+    indexer_top1_kernel<true><<<n_tokens, 1024>>>(
+            (uint32_t *)selected->ptr,
+            (const float *)logits->ptr,
+            n_vocab,
+            n_tokens);
+    return cuda_ok(cudaGetLastError(), "qwen4exp MTP top1 launch");
 }
 
 extern "C" int ds4_gpu_indexer_top1_value_tensor(
