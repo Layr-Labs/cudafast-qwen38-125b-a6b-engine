@@ -8,6 +8,8 @@
  * outside shard 0.
  */
 
+#include "ds4_qwen4exp_model_registration.h"
+
 /* ======================================================================
  * Sizing.
  * ====================================================================== */
@@ -504,13 +506,49 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
         DS4_QWEN4EXP_MAX_SELECTED(top_k, (uint64_t)DS4_N_INDEXER_COMPRESS_RATIO);
     const uint64_t q_width = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
 
-    /* Register every shard mapping with the backend before the first kernel:
-     * Metal wraps mapped ranges as no-copy buffers and refuses a weight offset
-     * that no registered view covers.  A split set needs one registration per
-     * shard that carries tensor bytes; shard 0 of the production artifact is
-     * metadata only and has none.  This follows the vision-encoder precedent in
-     * ds4_engine_open: Metal accumulates views through set_model_map_range,
-     * CUDA takes a primary and then auxiliaries. */
+    /* Register every shard mapping with the backend before the first kernel.
+     * Metal keeps its existing no-copy views. ROCm keeps its existing mapping
+     * path. CUDA registration is isolated in a backend-free policy helper so
+     * its allocation decisions can be tested without a device. */
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    ds4_qwen4exp_registration_shard reg_shards[DS4_MAX_GGUF_SHARDS];
+    for (uint32_t i = 0; i < m->n_shards; i++) {
+        reg_shards[i] = (ds4_qwen4exp_registration_shard){
+            .map = m->shard[i].map,
+            .size = m->shard[i].size,
+        };
+    }
+    ds4_qwen4exp_registration_tensor *reg_tensors = xmalloc(
+            (size_t)(m->n_tensors ? m->n_tensors : 1) * sizeof(reg_tensors[0]));
+    for (uint64_t ti = 0; ti < m->n_tensors; ti++) {
+        const ds4_tensor *t = &m->tensors[ti];
+        reg_tensors[ti] = (ds4_qwen4exp_registration_tensor){
+            .shard_index = t->map_index,
+            .offset = t->abs_offset,
+            .bytes = t->bytes,
+            .ssd_resident = ds4_streq(t->name, "per_layer_token_embd.weight"),
+        };
+    }
+    const ds4_qwen4exp_registration_ops reg_ops = {
+        .lookup = ds4_gpu_model_range_device_ptr,
+        .cache = ds4_gpu_cache_model_range,
+        .replaced = ds4_gpu_model_range_replaced,
+    };
+    ds4_qwen4exp_registration_error reg_error;
+    const bool registered = ds4_qwen4exp_register_cuda_model(
+            reg_shards, m->n_shards, reg_tensors, m->n_tensors,
+            &reg_ops, &reg_error);
+    free(reg_tensors);
+    if (!registered) {
+        fprintf(stderr,
+                "ds4: qwen4exp could not register CUDA target shard %u "
+                "at offset %" PRIu64 " for %" PRIu64 " bytes: %s\n",
+                reg_error.shard_index, reg_error.offset, reg_error.bytes,
+                ds4_qwen4exp_registration_error_name(reg_error.kind));
+        free(s);
+        return NULL;
+    }
+#else
     for (uint32_t i = 0; i < m->n_shards; i++) {
         const ds4_model_shard *sh = &m->shard[i];
         if (!sh->map || sh->tensor_data_pos >= sh->size) continue;
@@ -547,6 +585,7 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
             return NULL;
         }
     }
+#endif
 
     bool ok = true;
     for (uint32_t il = 0; il < cfg->n_layer && ok; il++) {

@@ -18,6 +18,7 @@ QWEN4EXP_QSA_REF_TEST := tests/test_qwen4exp_qsa_ref
 QWEN4EXP_GRAPH_TEST := tests/test_qwen4exp_graph
 QWEN4EXP_PLE_KERNEL_TEST := tests/test_qwen4exp_ple_kernels
 QWEN4EXP_MTP_TEST := tests/test_qwen4exp_mtp
+QWEN4EXP_MODEL_REGISTRATION_TEST := tests/test_qwen4exp_model_registration
 QWEN4EXP_PARITY_TEST := tests/test_qwen4exp_parity
 
 DEBUG_FLAGS ?= -g
@@ -255,7 +256,8 @@ help:
 	@echo "  make clean               Remove build outputs"
 
 cuda-spark:
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=sm_121
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent \
+		CUDA_ARCH="$(if $(strip $(CUDA_ARCH)),$(strip $(CUDA_ARCH)),sm_121)"
 
 cuda-generic:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=native
@@ -342,7 +344,7 @@ test-mxfp4-cuda: tests/test_mxfp4_cuda
 	./tests/test_mxfp4_cuda
 endif
 
-ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_qwen4exp.h ds4_qwen4exp_moe_types.h ds4_qwen4exp_hc_types.h ds4_qwen4exp.inc ds4_qwen4exp_ple.h ds4_qwen4exp_graph.h ds4_qwen4exp_graph.inc ds4_qwen4exp_matmul.h ds4_qwen4exp_mtp.h
+ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_qwen4exp.h ds4_qwen4exp_moe_types.h ds4_qwen4exp_hc_types.h ds4_qwen4exp.inc ds4_qwen4exp_ple.h ds4_qwen4exp_graph.h ds4_qwen4exp_graph.inc ds4_qwen4exp_matmul.h ds4_qwen4exp_mtp.h ds4_qwen4exp_model_registration.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
 ds4_image.o: ds4_image.c ds4_image.h third_party/iris/jpeg.h third_party/iris/png.h
@@ -579,7 +581,7 @@ $(QWEN4EXP_QSA_TEST): tests/test_qwen4exp_qsa.o $(GPU_TEST_OBJS)
 # The graph test drives ds4.c itself, so it needs a build of ds4.c with the test
 # hooks AND a live GPU backend: ds4_cpu_test_hooks.o is -DDS4_NO_GPU and would
 # stub out every kernel the graph calls.
-ds4_metal_test_hooks.o: ds4.c ds4.h ds4_image.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h ds4_qwen4exp.h ds4_qwen4exp_moe_types.h ds4_qwen4exp_hc_types.h ds4_qwen4exp.inc ds4_qwen4exp_ple.h ds4_qwen4exp_graph.h ds4_qwen4exp_graph.inc ds4_qwen4exp_matmul.h ds4_qwen4exp_mtp.h
+ds4_metal_test_hooks.o: ds4.c ds4.h ds4_image.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h ds4_qwen4exp.h ds4_qwen4exp_moe_types.h ds4_qwen4exp_hc_types.h ds4_qwen4exp.inc ds4_qwen4exp_ple.h ds4_qwen4exp_graph.h ds4_qwen4exp_graph.inc ds4_qwen4exp_matmul.h ds4_qwen4exp_mtp.h ds4_qwen4exp_model_registration.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_TEST_HOOKS -c -o $@ ds4.c
 
 tests/test_qwen4exp_graph.o: tests/test_qwen4exp_graph.c ds4.h ds4_qwen4exp_mtp.h
@@ -742,7 +744,7 @@ tests/test_gpu_args.o: tests/test_gpu_args.c ds4_gpu_args.h ds4_gpu_mgpu.h
 tests/test_gpu_args: tests/test_gpu_args.o ds4_gpu_args_cpu.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-ds4_cpu_test_hooks.o: ds4.c ds4.h ds4_image.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h ds4_qwen4exp.h ds4_qwen4exp_moe_types.h ds4_qwen4exp_hc_types.h ds4_qwen4exp.inc ds4_qwen4exp_ple.h ds4_qwen4exp_graph.h ds4_qwen4exp_graph.inc ds4_qwen4exp_matmul.h ds4_qwen4exp_mtp.h
+ds4_cpu_test_hooks.o: ds4.c ds4.h ds4_image.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h ds4_qwen4exp.h ds4_qwen4exp_moe_types.h ds4_qwen4exp_hc_types.h ds4_qwen4exp.inc ds4_qwen4exp_ple.h ds4_qwen4exp_graph.h ds4_qwen4exp_graph.inc ds4_qwen4exp_matmul.h ds4_qwen4exp_mtp.h ds4_qwen4exp_model_registration.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -DDS4_TEST_HOOKS -c -o $@ ds4.c
 
 tests/test_engine_mgpu_placement.o: tests/test_engine_mgpu_placement.c ds4.h ds4_gpu_mgpu.h ds4_layer_pack.h
@@ -792,6 +794,19 @@ $(QWEN4EXP_MTP_TEST): tests/test_qwen4exp_mtp.o ds4_qwen4exp_mtp.o
 test-qwen4exp-mtp: $(QWEN4EXP_MTP_TEST)
 	./$(QWEN4EXP_MTP_TEST)
 
+tests/test_qwen4exp_model_registration.o: tests/test_qwen4exp_model_registration.c ds4_qwen4exp_model_registration.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+$(QWEN4EXP_MODEL_REGISTRATION_TEST): tests/test_qwen4exp_model_registration.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+.PHONY: test-qwen4exp-model-registration test-cuda-spark-arch
+test-qwen4exp-model-registration: $(QWEN4EXP_MODEL_REGISTRATION_TEST)
+	./$(QWEN4EXP_MODEL_REGISTRATION_TEST)
+
+test-cuda-spark-arch:
+	sh tests/test_cuda_spark_arch.sh
+
 ifneq ($(UNAME_S),Darwin)
 tests/test_gpu_xdev.o: tests/test_gpu_xdev.c ds4_gpu.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
@@ -821,7 +836,7 @@ tests/test_gpu_lookup_cache_strict.o: tests/test_gpu_lookup_cache_strict.c ds4_g
 tests/test_gpu_lookup_cache_strict: tests/test_gpu_lookup_cache_strict.o ds4_cuda.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-ds4_cuda_test_hooks.o: ds4.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h ds4_qwen4exp.h ds4_qwen4exp_moe_types.h ds4_qwen4exp_hc_types.h ds4_qwen4exp.inc ds4_qwen4exp_ple.h ds4_qwen4exp_graph.h ds4_qwen4exp_graph.inc ds4_qwen4exp_matmul.h ds4_qwen4exp_mtp.h
+ds4_cuda_test_hooks.o: ds4.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h ds4_qwen4exp.h ds4_qwen4exp_moe_types.h ds4_qwen4exp_hc_types.h ds4_qwen4exp.inc ds4_qwen4exp_ple.h ds4_qwen4exp_graph.h ds4_qwen4exp_graph.inc ds4_qwen4exp_matmul.h ds4_qwen4exp_mtp.h ds4_qwen4exp_model_registration.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_TEST_HOOKS -I$(CUDA_HOME)/include -c -o $@ ds4.c
 
 tests/test_engine_mgpu_refusal.o: tests/test_engine_mgpu_refusal.c ds4.h ds4_gpu_mgpu.h
@@ -879,7 +894,7 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
 	tests/test_deepseek4_vision_image $(SAMPLING_TEST) $(GPU_KERNEL_TESTS) \
 	tests/test_qwen4exp_loader tests/test_qwen4exp_ple \
-	$(QWEN4EXP_PARITY_TEST) \
+	$(QWEN4EXP_MODEL_REGISTRATION_TEST) $(QWEN4EXP_PARITY_TEST) \
 	ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
@@ -894,6 +909,8 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test \
 	./tests/test_deepseek4_vision_image
 	./$(QWEN4EXP_MTP_TEST)
 	./tests/test_qwen4exp_loader.sh
+	./$(QWEN4EXP_MODEL_REGISTRATION_TEST)
+	sh tests/test_cuda_spark_arch.sh
 	sh tests/qwen4exp_cuda_moe_parity.sh
 	$(GPU_KERNEL_TEST_RUN)
 
@@ -931,4 +948,4 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 	./tests/test_mxfp4_dot
 
 clean:
-	rm -f ds4_qwen4exp_mtp.o ds4_qwen4exp_mtp_hooks.o ds4_qwen4exp_mtp_cpu.o ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_qwen4exp_gdn tests/test_qwen4exp_moe tests/test_qwen4exp_hc_norm tests/test_qwen4exp_qsa tests/test_qwen4exp_graph tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_model_shard_fd tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_qwen4exp_loader tests/test_qwen4exp_ple tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4_qwen4exp_mtp.o ds4_qwen4exp_mtp_hooks.o ds4_qwen4exp_mtp_cpu.o ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_qwen4exp_gdn tests/test_qwen4exp_moe tests/test_qwen4exp_hc_norm tests/test_qwen4exp_qsa tests/test_qwen4exp_graph tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_model_shard_fd tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_qwen4exp_loader tests/test_qwen4exp_model_registration tests/test_qwen4exp_ple tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

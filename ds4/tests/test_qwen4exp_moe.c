@@ -775,6 +775,275 @@ static void run_row_invariance_case(const uint8_t *model,
     free(x);
 }
 
+/* The grouping scan is internal scratch, so exercise it through the routed-MoE
+ * API rather than adding a test-only production hook.  Compact and
+ * non-compact dispatch are independent consumers of the same counts/offsets;
+ * their bitwise equality checks active ids and pair segments.  Comparing a
+ * multi-token call with one-token calls checks the same metadata at every
+ * expert-count boundary while keeping the floating-point path unchanged. */
+enum {
+    SCAN_DIM = 32,
+    SCAN_MAX_EXPERT = 513,
+    SCAN_MAX_USED = 8,
+    SCAN_TOKENS = 3,
+};
+
+static void run_scan_call(
+        ds4_gpu_tensor *out_t,
+        ds4_gpu_tensor *mid_t,
+        ds4_gpu_tensor *part_t,
+        const ds4_gpu_qwen4exp_slab *gate_slab,
+        const ds4_gpu_qwen4exp_slab *up_slab,
+        const ds4_gpu_qwen4exp_slab *down_slab,
+        const ds4_gpu_tensor *selected_t,
+        const ds4_gpu_tensor *weights_t,
+        uint32_t n_total_expert,
+        uint32_t n_expert_used,
+        const ds4_gpu_tensor *x_t,
+        uint32_t n_tokens,
+        const char *what) {
+    const size_t mid_count = (size_t)n_tokens * n_expert_used * SCAN_DIM;
+    float *poison = malloc(mid_count * sizeof(float));
+    if (!poison) fail("scan boundary poison allocation");
+    for (size_t i = 0; i < mid_count; i++) poison[i] = 12345.0f;
+    require_ok(ds4_gpu_tensor_write(mid_t, 0, poison,
+                                    (uint64_t)mid_count * sizeof(float)),
+               "scan boundary mid poison write");
+    free(poison);
+
+    require_ok(ds4_gpu_qwen4exp_routed_moe_tensor(
+                   out_t, mid_t, part_t, gate_slab, up_slab, down_slab,
+                   SCAN_DIM, SCAN_DIM, SCAN_DIM, selected_t, weights_t,
+                   n_total_expert, n_expert_used, x_t, n_tokens,
+                   n_expert_used * SCAN_DIM),
+               what);
+}
+
+static void scan_boundary_routing(uint32_t n_total_expert,
+                                  uint32_t n_expert_used,
+                                  int32_t *selected) {
+    if (n_total_expert == 1u) {
+        selected[0] = 0;
+        selected[1] = 0;
+        selected[2] = -1;
+        return;
+    }
+
+    const int32_t last = (int32_t)n_total_expert - 1;
+    const int32_t edge30 = last < 30 ? last : 30;
+    const int32_t edge31 = last < 31 ? last : 31;
+    const int32_t edge32 = last < 32 ? last : 32;
+    const int32_t first[SCAN_MAX_USED] = {
+        0, edge30, edge31, edge32, last, edge30, edge31, edge32,
+    };
+    memcpy(selected, first, sizeof(first));
+
+    const int32_t duplicate = n_total_expert > 32u ? 32 : last;
+    for (uint32_t i = 0; i < n_expert_used; i++)
+        selected[n_expert_used + i] = duplicate;
+
+    for (uint32_t i = 0; i < n_expert_used; i++) {
+        const int which = (int)(i % 3u);
+        selected[2u * n_expert_used + i] =
+            which == 0 ? -1 : (which == 1 ? (int32_t)n_total_expert : INT32_MAX);
+    }
+}
+
+static void run_group_scan_boundary_cases(void) {
+    static const uint32_t expert_counts[] = { 1, 31, 32, 33, 511, 512, 513 };
+    const char *compact_env = getenv("DS4_QWEN4EXP_NO_EXPERT_COMPACT");
+    char *saved_compact_env = NULL;
+    if (compact_env) {
+        const size_t bytes = strlen(compact_env) + 1u;
+        saved_compact_env = malloc(bytes);
+        if (!saved_compact_env) fail("scan boundary environment copy");
+        memcpy(saved_compact_env, compact_env, bytes);
+    }
+    const uint64_t row_bytes = (uint64_t)SCAN_DIM * sizeof(float);
+    const uint64_t expert_bytes = (uint64_t)SCAN_DIM * row_bytes;
+    const uint64_t slab_bytes = (uint64_t)SCAN_MAX_EXPERT * expert_bytes;
+    const uint64_t gate_offset = 0;
+    const uint64_t up_offset = ALIGN64(gate_offset + slab_bytes);
+    const uint64_t down_offset = ALIGN64(up_offset + slab_bytes);
+    const uint64_t image_bytes = ALIGN64(down_offset + slab_bytes);
+
+    uint8_t *image = mmap(NULL, image_bytes, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (image == MAP_FAILED) fail("scan boundary model mmap");
+    memset(image, 0, image_bytes);
+    for (uint32_t e = 0; e < SCAN_MAX_EXPERT; e++) {
+        for (uint32_t r = 0; r < SCAN_DIM; r++) {
+            const uint64_t at = (uint64_t)e * expert_bytes +
+                                (uint64_t)r * row_bytes +
+                                (uint64_t)r * sizeof(float);
+            const float gate = 0.015625f * (float)(1u + e % 7u);
+            const float up = 0.03125f * (float)(1u + e % 11u);
+            const float down = 0.0625f * (float)(1u + e % 13u);
+            memcpy(image + gate_offset + at, &gate, sizeof(gate));
+            memcpy(image + up_offset + at, &up, sizeof(up));
+            memcpy(image + down_offset + at, &down, sizeof(down));
+        }
+    }
+    require_ok(ds4_gpu_set_model_map(image, image_bytes),
+               "scan boundary model map");
+
+    const ds4_gpu_qwen4exp_slab gate_slab = {
+        image, image_bytes, gate_offset, expert_bytes, row_bytes, TYPE_F32 };
+    const ds4_gpu_qwen4exp_slab up_slab = {
+        image, image_bytes, up_offset, expert_bytes, row_bytes, TYPE_F32 };
+    const ds4_gpu_qwen4exp_slab down_slab = {
+        image, image_bytes, down_offset, expert_bytes, row_bytes, TYPE_F32 };
+
+    float x[SCAN_TOKENS * SCAN_DIM];
+    for (uint32_t t = 0; t < SCAN_TOKENS; t++)
+        for (uint32_t k = 0; k < SCAN_DIM; k++)
+            x[t * SCAN_DIM + k] = (float)(1u + t + k % 5u) * 0.125f;
+
+    ds4_gpu_tensor *selected_t = ds4_gpu_tensor_alloc(
+        (uint64_t)SCAN_TOKENS * SCAN_MAX_USED * sizeof(int32_t));
+    ds4_gpu_tensor *weights_t = ds4_gpu_tensor_alloc(
+        (uint64_t)SCAN_TOKENS * SCAN_MAX_USED * sizeof(float));
+    ds4_gpu_tensor *x_t = ds4_gpu_tensor_alloc(sizeof(x));
+    ds4_gpu_tensor *mid_t = ds4_gpu_tensor_alloc(
+        (uint64_t)SCAN_TOKENS * SCAN_MAX_USED * SCAN_DIM * sizeof(float));
+    ds4_gpu_tensor *out_t = ds4_gpu_tensor_alloc(
+        (uint64_t)SCAN_TOKENS * SCAN_DIM * sizeof(float));
+    ds4_gpu_tensor *part_t = ds4_gpu_tensor_alloc(
+        (uint64_t)SCAN_TOKENS * SCAN_MAX_USED * SCAN_DIM * sizeof(float));
+    ds4_gpu_tensor *selected1_t = ds4_gpu_tensor_alloc(
+        (uint64_t)SCAN_MAX_USED * sizeof(int32_t));
+    ds4_gpu_tensor *weights1_t = ds4_gpu_tensor_alloc(
+        (uint64_t)SCAN_MAX_USED * sizeof(float));
+    ds4_gpu_tensor *x1_t = ds4_gpu_tensor_alloc(
+        (uint64_t)SCAN_DIM * sizeof(float));
+    ds4_gpu_tensor *mid1_t = ds4_gpu_tensor_alloc(
+        (uint64_t)SCAN_MAX_USED * SCAN_DIM * sizeof(float));
+    ds4_gpu_tensor *out1_t = ds4_gpu_tensor_alloc(
+        (uint64_t)SCAN_DIM * sizeof(float));
+    ds4_gpu_tensor *part1_t = ds4_gpu_tensor_alloc(
+        (uint64_t)SCAN_MAX_USED * SCAN_DIM * sizeof(float));
+    require_ok(selected_t && weights_t && x_t && mid_t && out_t && part_t &&
+               selected1_t && weights1_t && x1_t && mid1_t && out1_t && part1_t,
+               "scan boundary tensor allocation");
+    require_ok(ds4_gpu_tensor_write(x_t, 0, x, sizeof(x)),
+               "scan boundary activation write");
+
+    for (size_t c = 0; c < sizeof(expert_counts) / sizeof(expert_counts[0]); c++) {
+        const uint32_t n_total = expert_counts[c];
+        const uint32_t n_used = n_total == 1u ? 1u : SCAN_MAX_USED;
+        int32_t selected[SCAN_TOKENS * SCAN_MAX_USED];
+        float weights[SCAN_TOKENS * SCAN_MAX_USED];
+        float compact[SCAN_TOKENS * SCAN_DIM];
+        float noncompact[SCAN_TOKENS * SCAN_DIM];
+        float reused[SCAN_TOKENS * SCAN_DIM];
+        float narrow[SCAN_TOKENS * SCAN_DIM];
+        scan_boundary_routing(n_total, n_used, selected);
+        for (uint32_t i = 0; i < SCAN_TOKENS * n_used; i++)
+            weights[i] = 0.125f * (float)(1u + i % n_used);
+        require_ok(ds4_gpu_tensor_write(selected_t, 0, selected,
+                    (uint64_t)SCAN_TOKENS * n_used * sizeof(int32_t)),
+                   "scan boundary selection write");
+        require_ok(ds4_gpu_tensor_write(weights_t, 0, weights,
+                    (uint64_t)SCAN_TOKENS * n_used * sizeof(float)),
+                   "scan boundary weight write");
+
+        require_ok(unsetenv("DS4_QWEN4EXP_NO_EXPERT_COMPACT") == 0,
+                   "scan boundary compact environment");
+        run_scan_call(out_t, mid_t, part_t, &gate_slab, &up_slab, &down_slab,
+                      selected_t, weights_t, n_total, n_used, x_t, SCAN_TOKENS,
+                      "scan boundary compact call");
+        require_ok(ds4_gpu_tensor_read(out_t, 0, compact, sizeof(compact)),
+                   "scan boundary compact read");
+
+        /* Change the routing in the shared scratch, then restore the original.
+         * Stale counts/cursors/active ids must not survive the intervening call. */
+        for (uint32_t i = 0; i < SCAN_TOKENS * n_used; i++)
+            selected[i] = (int32_t)((i * 17u + 3u) % n_total);
+        require_ok(ds4_gpu_tensor_write(selected_t, 0, selected,
+                    (uint64_t)SCAN_TOKENS * n_used * sizeof(int32_t)),
+                   "scan boundary changed selection write");
+        run_scan_call(out_t, mid_t, part_t, &gate_slab, &up_slab, &down_slab,
+                      selected_t, weights_t, n_total, n_used, x_t, SCAN_TOKENS,
+                      "scan boundary changed routing call");
+        scan_boundary_routing(n_total, n_used, selected);
+        require_ok(ds4_gpu_tensor_write(selected_t, 0, selected,
+                    (uint64_t)SCAN_TOKENS * n_used * sizeof(int32_t)),
+                   "scan boundary restored selection write");
+        run_scan_call(out_t, mid_t, part_t, &gate_slab, &up_slab, &down_slab,
+                      selected_t, weights_t, n_total, n_used, x_t, SCAN_TOKENS,
+                      "scan boundary scratch reuse call");
+        require_ok(ds4_gpu_tensor_read(out_t, 0, reused, sizeof(reused)),
+                   "scan boundary scratch reuse read");
+        if (memcmp(compact, reused, sizeof(compact)) != 0)
+            fail("scan metadata survived changed routing");
+
+        require_ok(setenv("DS4_QWEN4EXP_NO_EXPERT_COMPACT", "1", 1) == 0,
+                   "scan boundary non-compact environment");
+        run_scan_call(out_t, mid_t, part_t, &gate_slab, &up_slab, &down_slab,
+                      selected_t, weights_t, n_total, n_used, x_t, SCAN_TOKENS,
+                      "scan boundary non-compact call");
+        require_ok(unsetenv("DS4_QWEN4EXP_NO_EXPERT_COMPACT") == 0,
+                   "scan boundary compact environment restore");
+        require_ok(ds4_gpu_tensor_read(out_t, 0, noncompact, sizeof(noncompact)),
+                   "scan boundary non-compact read");
+        if (memcmp(compact, noncompact, sizeof(compact)) != 0)
+            fail("scan active ids or pair segments changed routed output");
+
+        for (uint32_t t = 0; t < SCAN_TOKENS; t++) {
+            require_ok(ds4_gpu_tensor_write(selected1_t, 0,
+                        selected + (size_t)t * n_used,
+                        (uint64_t)n_used * sizeof(int32_t)),
+                       "scan boundary one-token selection write");
+            require_ok(ds4_gpu_tensor_write(weights1_t, 0,
+                        weights + (size_t)t * n_used,
+                        (uint64_t)n_used * sizeof(float)),
+                       "scan boundary one-token weight write");
+            require_ok(ds4_gpu_tensor_write(x1_t, 0, x + (size_t)t * SCAN_DIM,
+                        (uint64_t)SCAN_DIM * sizeof(float)),
+                       "scan boundary one-token activation write");
+            run_scan_call(out1_t, mid1_t, part1_t,
+                          &gate_slab, &up_slab, &down_slab,
+                          selected1_t, weights1_t, n_total, n_used, x1_t, 1u,
+                          "scan boundary one-token call");
+            require_ok(ds4_gpu_tensor_read(out1_t, 0,
+                        narrow + (size_t)t * SCAN_DIM,
+                        (uint64_t)SCAN_DIM * sizeof(float)),
+                       "scan boundary one-token read");
+        }
+        if (memcmp(compact, narrow, sizeof(compact)) != 0)
+            fail("scan boundary changed one-token versus multi-token output");
+        for (uint32_t r = 0; r < SCAN_DIM; r++) {
+            if (compact[2u * SCAN_DIM + r] != 0.0f)
+                fail("all-invalid route did not clear poisoned mid rows");
+        }
+        printf("group scan boundary %u experts: bitwise output parity\n", n_total);
+    }
+
+    if (saved_compact_env) {
+        require_ok(setenv("DS4_QWEN4EXP_NO_EXPERT_COMPACT",
+                          saved_compact_env, 1) == 0,
+                   "scan boundary original environment restore");
+    } else {
+        require_ok(unsetenv("DS4_QWEN4EXP_NO_EXPERT_COMPACT") == 0,
+                   "scan boundary absent environment restore");
+    }
+    free(saved_compact_env);
+
+    ds4_gpu_tensor_free(part1_t);
+    ds4_gpu_tensor_free(out1_t);
+    ds4_gpu_tensor_free(mid1_t);
+    ds4_gpu_tensor_free(x1_t);
+    ds4_gpu_tensor_free(weights1_t);
+    ds4_gpu_tensor_free(selected1_t);
+    ds4_gpu_tensor_free(part_t);
+    ds4_gpu_tensor_free(out_t);
+    ds4_gpu_tensor_free(mid_t);
+    ds4_gpu_tensor_free(x_t);
+    ds4_gpu_tensor_free(weights_t);
+    ds4_gpu_tensor_free(selected_t);
+    munmap(image, image_bytes);
+}
+
 static void run_production_expert_cases(void) {
     const uint32_t n_gate_up = (uint32_t)(sizeof(PROD_GATE_UP_TYPES) /
                                           sizeof(PROD_GATE_UP_TYPES[0]));
@@ -1370,6 +1639,8 @@ int main(void) {
     run_row_invariance_case(model, model_bytes, gate_offset, up_offset,
                             down_offset, sh_router_offset, sh_gate_offset,
                             sh_up_offset, sh_down_offset);
+
+    run_group_scan_boundary_cases();
 
     run_production_expert_cases();
 

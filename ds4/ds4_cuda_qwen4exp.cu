@@ -1207,30 +1207,50 @@ __global__ static void qwen4exp_moe_group_count_kernel(
     atomicAdd(&counts[e], 1);
 }
 
-/* One block, one thread: n_expert is 512, so the serial scan is a few hundred
- * adds against a kernel launch.  `cursor` starts at the offset and the scatter
- * bumps it. */
+/* One full warp scans 32 experts at a time.  Every lane participates in every
+ * shuffle and ballot, including the tail, where out-of-range counts are zero.
+ * `cursor` starts at the offset and the scatter bumps it. */
 __global__ static void qwen4exp_moe_group_scan_kernel(
         int32_t *offsets,
         int32_t *cursor,
         int32_t *active,
         const int32_t *counts,
         uint32_t n_expert) {
-    if (threadIdx.x != 0u || blockIdx.x != 0u) return;
+    if (blockIdx.x != 0u) return;
+    const uint32_t lane = threadIdx.x & 31u;
     int32_t run = 0;
     int32_t live = 0;
-    for (uint32_t e = 0; e < n_expert; e++) {
-        offsets[e] = run;
-        cursor[e] = run;
-        run += counts[e];
-        /* The experts that have work, compacted.  A block of the expert
-         * kernels below indexes this list rather than the expert id, so a
-         * narrow call launches one block row per expert it actually chose
-         * instead of one per expert that exists.  At one row that is ten
-         * instead of five hundred and twelve. */
-        if (counts[e] > 0) active[1 + live++] = (int32_t)e;
+    for (uint64_t base = 0; base < (uint64_t)n_expert; base += 32u) {
+        const uint64_t e = base + lane;
+        const int32_t count = e < (uint64_t)n_expert ? counts[e] : 0;
+        int32_t inclusive = count;
+#pragma unroll
+        for (uint32_t delta = 1u; delta < 32u; delta <<= 1u) {
+            const int32_t prior = __shfl_up_sync(0xffffffffu, inclusive, delta);
+            if (lane >= delta) inclusive += prior;
+        }
+
+        if (e < (uint64_t)n_expert) {
+            const int32_t offset = run + inclusive - count;
+            offsets[e] = offset;
+            cursor[e] = offset;
+        }
+
+        /* The experts that have work, compacted in ascending id order.  The
+         * 64-bit mask expression is defined for lane 31 as well as lane 0. */
+        const uint32_t live_mask = __ballot_sync(
+                0xffffffffu, e < (uint64_t)n_expert && count > 0);
+        if (e < (uint64_t)n_expert && count > 0) {
+            const uint32_t lower_lanes =
+                (uint32_t)((1ull << lane) - 1ull);
+            const int32_t rank = (int32_t)__popc(live_mask & lower_lanes);
+            active[1 + live + rank] = (int32_t)e;
+        }
+
+        run += __shfl_sync(0xffffffffu, inclusive, 31);
+        live += (int32_t)__popc(live_mask);
     }
-    active[0] = live;
+    if (lane == 0u) active[0] = live;
 }
 
 __global__ static void qwen4exp_moe_group_scatter_kernel(
@@ -2234,7 +2254,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     }
     qwen4exp_moe_group_count_kernel<<<pair_blocks, threads, 0, stream>>>(
             sc.counts, (const int32_t *)selected->ptr, n_total_expert, n_pairs);
-    qwen4exp_moe_group_scan_kernel<<<1, 1, 0, stream>>>(
+    qwen4exp_moe_group_scan_kernel<<<1, 32, 0, stream>>>(
             sc.offsets, sc.cursor, sc.active, sc.counts, n_total_expert);
     qwen4exp_moe_group_scatter_kernel<<<pair_blocks, threads, 0, stream>>>(
             sc.pairs, sc.cursor, (const int32_t *)selected->ptr, n_total_expert,
