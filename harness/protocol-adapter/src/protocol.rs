@@ -167,6 +167,13 @@ pub struct WorkerRequest {
     /// The speculative spec. Rides ONLY on `decode_begin` and
     /// `free_decode_begin`; anywhere else it is refused rather than ignored,
     /// because a silently-ignored spec is a false statement about what ran.
+    ///
+    /// THE TWO OPENERS TAKE DIFFERENT SETS. `free_decode_begin` runs either
+    /// route and echoes the one the ENGINE resolved. `decode_begin` is the
+    /// teacher-forced v1 verb and runs serial only: an absent spec and
+    /// `{"mode":"serial"}` are the same request, a drafting spec is refused by
+    /// name there (the mtp route runs through `free_decode_begin`), and the
+    /// response echoes the serial `effective_spec` either way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec: Option<Spec>,
 }

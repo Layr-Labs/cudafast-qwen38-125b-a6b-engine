@@ -393,6 +393,50 @@ fn correctness_freerun_returns_tokens_untimed() {
     );
 }
 
+/// `correctness` carries the only `steps` on the wire, and BOTH backends size a
+/// `Vec` on it. An unbounded `steps` therefore left the protocol: the process
+/// died on a capacity overflow (exit 101) where the contract has an `ok:false`
+/// line. The bound is checked before the engine is minted, so the answer is a
+/// refusal and the reader is still alive to receive it.
+#[test]
+fn correctness_steps_out_of_range_are_refused_not_panicked() {
+    for bad in [
+        0i64,
+        -1,
+        crate::adapter::CORRECTNESS_MAX_STEPS + 1,
+        4_611_686_018_427_387_903, // the reported capacity-overflow value
+        i64::MAX,
+    ] {
+        let line =
+            format!(r#"{{"id":1,"kind":"correctness","prompt_tokens":[1,2],"steps":{bad}}}"#);
+        let resp = run(&[&line]);
+        assert_all_conform(&resp);
+        assert_eq!(resp[1]["ok"], false, "steps {bad} must be refused");
+        assert_eq!(resp[1]["id"], 1, "the refusal answers the request's own id");
+        let err = resp[1]["error"].as_str().unwrap();
+        assert!(err.contains("steps"), "the refusal names the field: {err}");
+        assert!(
+            resp[1].get("tokens").is_none(),
+            "a refused correctness returns no tokens"
+        );
+    }
+}
+
+/// The bound itself runs: the largest permitted `steps` is served, so the check
+/// refuses only what is outside the envelope.
+#[test]
+fn correctness_at_the_step_bound_is_served() {
+    let steps = crate::adapter::CORRECTNESS_MAX_STEPS;
+    let line = format!(r#"{{"id":1,"kind":"correctness","prompt_tokens":[1,2],"steps":{steps}}}"#);
+    let resp = run(&[&line]);
+    assert_eq!(resp[1]["ok"], true);
+    assert_eq!(
+        resp[1]["tokens"].as_array().unwrap().len(),
+        steps as usize,
+        "the mock commits one token per step"
+    );
+}
+
 #[test]
 fn fresh_engine_per_phase_lifecycle() {
     let (factory, log) = MockFactory::new();
@@ -1177,6 +1221,153 @@ fn a_free_run_phase_mints_its_own_engine_and_drops_it_at_the_barrier() {
 }
 
 // ---------------------------------------------------------------------------
+// 4b. SPEC PLACEMENT — honoured on the two decode openers, refused elsewhere
+// ---------------------------------------------------------------------------
+//
+// `WorkerRequest.spec` rides on `decode_begin` and `free_decode_begin` and
+// nowhere else. The rule has two halves and BOTH are behaviour, not prose:
+// a verb that takes a spec must ACT on it and say what it ran, and a verb that
+// does not must REFUSE it rather than answer `ok` to a request it dropped.
+
+/// A spec on any verb but the two decode openers is refused BY NAME. The check
+/// sits before the dispatch, so it does not depend on an arm remembering it.
+#[test]
+fn a_spec_on_a_verb_that_does_not_take_one_is_refused() {
+    let cases: &[(&str, &str)] = &[
+        (
+            "prefill",
+            r#"{"id":1,"kind":"prefill","prompt_tokens":[1,2],"spec":{"mode":"mtp"}}"#,
+        ),
+        (
+            "decode_step",
+            r#"{"id":1,"kind":"decode_step","token":5,"spec":{"mode":"serial"}}"#,
+        ),
+        (
+            "correctness",
+            r#"{"id":1,"kind":"correctness","prompt_tokens":[1],"steps":2,"spec":{"mode":"mtp"}}"#,
+        ),
+        (
+            "correctness_begin",
+            r#"{"id":1,"kind":"correctness_begin","prompt_tokens":[1],"spec":{"mode":"mtp"}}"#,
+        ),
+        (
+            "correctness_step",
+            r#"{"id":1,"kind":"correctness_step","token":5,"spec":{"mode":"mtp"}}"#,
+        ),
+        (
+            "free_decode_run",
+            r#"{"id":1,"kind":"free_decode_run","count":4,"spec":{"mode":"mtp"}}"#,
+        ),
+        (
+            "phase_diagnostics",
+            r#"{"id":1,"kind":"phase_diagnostics","spec":{"mode":"serial"}}"#,
+        ),
+    ];
+    for (kind, line) in cases {
+        let resp = run(&[line]);
+        assert_all_conform(&resp);
+        assert_eq!(resp[1]["ok"], false, "a spec on {kind} must be refused");
+        assert_eq!(resp[1]["id"], 1, "the refusal answers the request's own id");
+        let err = resp[1]["error"].as_str().unwrap();
+        assert!(err.contains(kind), "the refusal names the kind: {err}");
+        assert!(
+            err.contains("decode_begin") && err.contains("free_decode_begin"),
+            "the refusal names where a spec DOES ride: {err}"
+        );
+    }
+}
+
+/// `decode_begin` HONOURS a serial spec: it runs exactly as the no-spec form
+/// and echoes the serial `effective_spec`. Before this it answered `ok` and
+/// echoed nothing, which benchd (spec-never-ignored) refuses as an echo
+/// divergence -- so the masked case cost a leg rather than scoring one.
+#[test]
+fn a_serial_spec_on_decode_begin_runs_and_echoes_serial() {
+    let resp = run(&[
+        r#"{"id":1,"kind":"decode_begin","seed_tokens":[7,8,9],"spec":{"mode":"serial"}}"#,
+        r#"{"id":2,"kind":"decode_step","token":40}"#,
+        r#"{"id":3,"kind":"phase_diagnostics"}"#,
+    ]);
+    assert_all_conform(&resp);
+    let begin = &resp[1];
+    assert_eq!(begin["ok"], true);
+    assert_eq!(
+        begin["seed_token"],
+        SEED_BASE + 3,
+        "a serial spec runs the same forward the no-spec form runs"
+    );
+    assert_eq!(begin["effective_spec"]["mode"], "serial");
+    assert!(
+        begin["effective_spec"].get("mtp").is_none(),
+        "the serial echo carries NO mtp block: benchd matches the module-key sets"
+    );
+    assert_eq!(resp[2]["token"], 41, "the phase steps as usual");
+    assert_eq!(resp[3]["completed_work"], 2, "1 + 1, unchanged");
+}
+
+/// THE ECHO IS UNCONDITIONAL ON `decode_begin`, because the statement is true
+/// either way: the verb runs serial. benchd checks the echo only against a spec
+/// it sent, so an unsolicited echo gates nothing.
+#[test]
+fn decode_begin_without_a_spec_still_echoes_what_ran() {
+    let resp = run(&[r#"{"id":1,"kind":"decode_begin","seed_tokens":[1,2]}"#]);
+    assert_all_conform(&resp);
+    assert_eq!(resp[1]["ok"], true);
+    assert_eq!(resp[1]["seed_token"], SEED_BASE + 2);
+    assert_eq!(resp[1]["effective_spec"]["mode"], "serial");
+}
+
+/// A DRAFTING spec on `decode_begin` is refused by name. The verb is
+/// teacher-forced v1 and has no drafting path (`Engine::decode_begin` takes no
+/// route), so running it as serial would answer `ok` to a request for
+/// something else.
+#[test]
+fn an_mtp_spec_on_decode_begin_is_refused_and_names_free_decode_begin() {
+    let resp = run(&[
+        r#"{"id":1,"kind":"decode_begin","seed_tokens":[1,2],"spec":{"mode":"mtp","mtp":{"depth":2}}}"#,
+    ]);
+    assert_all_conform(&resp);
+    assert_eq!(resp[1]["ok"], false);
+    assert_eq!(resp[1]["id"], 1);
+    let err = resp[1]["error"].as_str().unwrap();
+    assert!(err.contains("mtp"), "the refusal names the mode: {err}");
+    assert!(
+        err.contains("free_decode_begin"),
+        "the refusal names the verb that DOES run mtp: {err}"
+    );
+    assert!(
+        resp[1].get("seed_token").is_none(),
+        "a refused opener runs no forward"
+    );
+}
+
+/// An unknown mode keeps the `resolve_spec` refusal on this verb too.
+#[test]
+fn an_undeclared_mode_on_decode_begin_is_refused_by_name() {
+    let resp =
+        run(&[r#"{"id":1,"kind":"decode_begin","seed_tokens":[1,2],"spec":{"mode":"dflash"}}"#]);
+    assert_eq!(resp[1]["ok"], false);
+    let err = resp[1]["error"].as_str().unwrap();
+    assert!(err.contains("dflash"), "{err}");
+    assert!(err.contains("is not a mode this track runs"), "{err}");
+}
+
+/// A refused spec discards the session, like every other refusal.
+#[test]
+fn a_refused_spec_discards_the_session() {
+    let resp = run(&[
+        r#"{"id":1,"kind":"decode_begin","seed_tokens":[1,2]}"#,
+        r#"{"id":2,"kind":"decode_step","token":5,"spec":{"mode":"serial"}}"#,
+        r#"{"id":3,"kind":"phase_diagnostics"}"#,
+    ]);
+    assert_eq!(resp[2]["ok"], false);
+    assert_eq!(
+        resp[3]["ok"], false,
+        "the barrier finds no open phase, because the refusal discarded it"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 5. THE ds4 BACKEND — driven through a SCRIPTED SESSION (no GPU)
 // ---------------------------------------------------------------------------
 //
@@ -1867,16 +2058,19 @@ mod resident {
         server.finish();
     }
 
-    /// THE ONE-LOAD PROOF REACHES THE SEALED ARTIFACT.
+    /// THE ONE-LOAD RECORD REACHES THE SEALED ARTIFACT.
     ///
     /// The worker announces this string as its hello `backend`, and benchd
     /// seals it as `engine_backend`. It names the topology and carries the
     /// resident's `load_epoch` (the resident's pid), so every phase of one
     /// window seals the SAME value and a repeated load would seal a different
-    /// one. Before this, `load_epoch` appeared nowhere in benchd
-    /// (`git grep load_epoch` at the pinned dist tip returns nothing), so "the
-    /// weights loaded once" was provable only from the resident log and
-    /// `serve-identity.json`.
+    /// one. This is provenance the worker REPORTS about itself, not an
+    /// independent check: it records that no second load was booted by this
+    /// serve, and a claim that must hold against a hostile worker needs a
+    /// supervisor observation instead. Before this, `load_epoch` appeared
+    /// nowhere in benchd (`git grep load_epoch` at the pinned dist tip returns
+    /// nothing), so "the weights loaded once" was readable only from the
+    /// resident log and `serve-identity.json`.
     #[test]
     fn the_attached_worker_announces_the_resident_and_its_load_epoch() {
         let server = Server::start(scripted);

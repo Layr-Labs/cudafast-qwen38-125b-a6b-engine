@@ -26,6 +26,9 @@
 //!   `docs/PROTOCOL-v1.1.md` **Amendment 4** (2026-08-18) reconciles the signed
 //!   spec's §2.6/§2.7 prose to this classification (correctness IS timed for the
 //!   counter; "not on the timed path" there means the scored speed path only);
+//! * the spec's PLACEMENT: it rides on `decode_begin` and `free_decode_begin`
+//!   and is refused by name on every other verb, so no request is answered
+//!   `ok` while the spec it carried was dropped;
 //! * session-discard-on-error and on early EOF (fail-closed);
 //! * fail-closed on a step with no matching opener and on a double-open;
 //! * one JSON object per line, echoing the request `id`.
@@ -34,7 +37,7 @@ use std::io::{BufRead, Write};
 
 use crate::engine::{Engine, EngineError, EngineFactory, Route};
 use crate::protocol::{
-    ExpertStreamingStats, RequestKind, Spec, WorkerRequest, WorkerResponse,
+    EffectiveSpec, ExpertStreamingStats, RequestKind, Spec, WorkerRequest, WorkerResponse,
     FREE_RUN_DECODE_CAPABILITY, PROTOCOL_VERSION,
 };
 
@@ -43,6 +46,14 @@ use crate::protocol::{
 /// phase length. Same value the Swift reference worker uses
 /// (`MLXFastConstants.freeRunMaxConfiguredTotalTokens`).
 pub const FREE_RUN_MAX_COUNT: i64 = 1_536;
+
+/// The bound on `correctness`'s `steps`. The wire leaves it unbounded and the
+/// backends ALLOCATE on it (`Vec::with_capacity(steps)`), so an absurd value
+/// aborted the process on a capacity overflow instead of answering with a
+/// protocol error. The value is the resident session context
+/// (`tools/serve-up.sh` `SERVE_UP_CTX_SIZE`, default 8192, and its ceiling):
+/// a golden tape longer than the context the engine serves cannot exist.
+pub const CORRECTNESS_MAX_STEPS: i64 = 8_192;
 
 /// Which opener started the currently-open phase. Steps must match their
 /// opener (`decode_step` only inside a `Decode` phase, `correctness_step` only
@@ -235,6 +246,23 @@ impl<F: EngineFactory> Adapter<F> {
         })?;
         let id = request.id;
 
+        // THE SPEC RIDES ON THE DECODE OPENERS AND NOWHERE ELSE, and a spec
+        // that arrives anywhere else is REFUSED rather than dropped. A verb
+        // that read no spec but answered `ok` said, by answering, that it ran
+        // what was asked for -- and on every verb but these two, it did not.
+        // Checked once here, on the resolved kind, so no arm can forget it.
+        if request.spec.is_some()
+            && !matches!(
+                kind,
+                RequestKind::DecodeBegin | RequestKind::FreeDecodeBegin
+            )
+        {
+            return Err(ReqError::Malformed(format!(
+                "spec is not accepted on {}; it rides only on decode_begin and free_decode_begin",
+                kind.as_str()
+            )));
+        }
+
         let response = match kind {
             // ---- opener: prefill (single forward, NOT a timed step) ----
             RequestKind::Prefill => {
@@ -250,11 +278,38 @@ impl<F: EngineFactory> Adapter<F> {
             // ---- opener: decode_begin (seed forward, TIMED) ----
             RequestKind::DecodeBegin => {
                 let seed = self.require_tokens(&request.seed_tokens, "seed_tokens")?;
+                // DECODE_BEGIN IS THE TEACHER-FORCED v1 VERB, AND IT RUNS
+                // SERIAL. It takes a spec so that a caller who names the
+                // control leg is answered rather than second-guessed: an
+                // absent spec and `{"mode":"serial"}` are the same request.
+                // A DRAFTING spec is refused BY NAME here, because the verb
+                // has no drafting path -- `engine.decode_begin` takes no route
+                // -- and running it as serial would answer `ok` to a request
+                // for something else.
+                let (route, _) = Self::resolve_spec(request.spec.as_ref())?;
+                if route != Route::Serial {
+                    return Err(ReqError::Malformed(format!(
+                        "spec mode {:?} is not accepted on decode_begin; decode_begin is the \
+                         teacher-forced v1 verb and runs serial, and the mtp route runs through \
+                         free_decode_begin",
+                        route.as_str()
+                    )));
+                }
                 let mut engine = self.open_phase(PhaseKind::Decode)?;
                 let seed_token = engine.decode_begin(seed).map_err(ReqError::Engine)?;
                 self.install(engine, kind);
                 let mut r = self.ok(id);
                 r.seed_token = Some(seed_token);
+                // THE ECHO IS ALWAYS EMITTED, spec or no spec, and it is the
+                // same serial shape the engines build for `free_decode_begin`
+                // (`mode: "serial"`, no `mtp` block). It states what ran, which
+                // on this verb is serial in every case. benchd checks the echo
+                // only when it sent a spec (`require_spec_echo`), so echoing on
+                // a no-spec opener adds a true statement and gates nothing.
+                r.effective_spec = Some(EffectiveSpec {
+                    mode: Route::Serial.as_str().to_string(),
+                    mtp: None,
+                });
                 r
             }
 
@@ -275,6 +330,21 @@ impl<F: EngineFactory> Adapter<F> {
                 let steps = request
                     .steps
                     .ok_or_else(|| ReqError::Malformed("correctness missing steps".into()))?;
+                // BOUNDED BEFORE THE ENGINE SEES IT, the same posture as
+                // `free_decode_run`'s count. The backends size a `Vec` on this
+                // number, so an absurd `steps` killed the process with a
+                // capacity overflow -- the caller got an exit code where the
+                // protocol has an error message, and the session died with it.
+                if steps <= 0 {
+                    return Err(ReqError::Malformed(format!(
+                        "correctness steps must be positive, got {steps}"
+                    )));
+                }
+                if steps > CORRECTNESS_MAX_STEPS {
+                    return Err(ReqError::Malformed(format!(
+                        "correctness steps {steps} is above the bound {CORRECTNESS_MAX_STEPS}"
+                    )));
+                }
                 let mut engine = self.open_phase(PhaseKind::CorrectnessFreeRun)?;
                 let tokens = engine
                     .correctness_freerun(prompt, steps)
