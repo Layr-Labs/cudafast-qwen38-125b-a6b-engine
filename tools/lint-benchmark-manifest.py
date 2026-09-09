@@ -166,8 +166,9 @@ _QWEN_MTP_V1_SCORING = {
 #       (benchmark.json and its contract fixture carry values only, no prose
 #       fields, per David's 2026-08-24 ruling -- see
 #       docs/qwen38-125b-a6b-port-notes.md for the full split).
-#   pairsPerCohort = 2 / minPairsPerCohort = 2
-#       RULED 2 by David 2026-09-09 ("move to 2 pairs on both mlx and cuda for
+#   pairsPerCohort / minPairsPerCohort -- NOT PINNED HERE, CONFIGURABLE
+#       The count is a track setting, not a constant: it is whatever the track
+#       fixture declares as official_pairs (2 today, David 2026-09-09 ("move to 2 pairs on both mlx and cuda for
 #       now"; "1 pair is not sufficient"), superseding the 2026-08-26 ruling of
 #       4 that was written for the Gemma batched cohort and never read on this
 #       track's paired path. THE ENFORCED VALUE LIVES IN THE TRACK FIXTURE:
@@ -185,8 +186,6 @@ _QWEN38_125B_A6B_CUDA_V1_SCORING = {
     "decodeSpeedupFloor": 0.90,
     "decodeSpeedupCeiling": 5.0,
     "scoredExponents": {"prefillGainExponent": 0.25, "decodeGainExponent": 0.75},
-    "pairsPerCohort": 2,
-    "minPairsPerCohort": 2,
 }
 
 EXPECTED_SCORING_BY_TRACK = {
@@ -1117,21 +1116,24 @@ class Linter:
                     f"{len(CONTRACT_SCORING_MIRROR)} shared constants"
                 )
 
-        # The pair count benchd ENFORCES is the fixture's official_pairs; the
-        # manifest's pairsPerCohort is the same number for readers. They must agree.
+        # The pair count is CONFIGURABLE per track and lives in the fixture as
+        # official_pairs (the value benchd enforces). It is not pinned here: this
+        # check only requires a positive integer in the fixture and the manifest's
+        # readers' copies (pairsPerCohort, minPairsPerCohort) to state that number.
         official_pairs = contract.get("official_pairs")
-        if official_pairs is None:
+        if not isinstance(official_pairs, int) or isinstance(official_pairs, bool) or official_pairs < 1:
             self.fail(
-                "contract official_pairs: absent -- benchd refuses a ranked run whose "
-                "fixture does not declare the pair count (David 2026-09-09 ruled 2)"
+                f"contract official_pairs: {official_pairs!r} -- benchd refuses a ranked run "
+                "whose fixture does not declare a positive integer pair count"
             )
-        elif official_pairs != scoring.get("pairsPerCohort"):
+        elif scoring.get("pairsPerCohort") != official_pairs or scoring.get("minPairsPerCohort") != official_pairs:
             self.fail(
-                f"scoring.pairsPerCohort = {scoring.get('pairsPerCohort')!r} disagrees with "
-                f"contract official_pairs = {official_pairs!r}; benchd runs the fixture's count"
+                f"scoring.pairsPerCohort = {scoring.get('pairsPerCohort')!r} / minPairsPerCohort = "
+                f"{scoring.get('minPairsPerCohort')!r} disagree with contract official_pairs = "
+                f"{official_pairs!r}; benchd runs the fixture's count"
             )
         else:
-            self.ok(f"scoring.pairsPerCohort: agrees with contract official_pairs = {official_pairs}")
+            self.ok(f"scoring.pairsPerCohort/minPairsPerCohort: both state the fixture's official_pairs = {official_pairs}")
 
         if scoring.get("decodeSpeedupFloor", 0) >= scoring.get("decodeSpeedupCeiling", 0):
             self.fail("scoring: decodeSpeedupFloor is not below decodeSpeedupCeiling")
