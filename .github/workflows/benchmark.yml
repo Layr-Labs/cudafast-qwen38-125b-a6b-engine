@@ -93,8 +93,9 @@
 #   5. Credential or override in the job environment. R2 keys, an R2 signer, a
 #      dist token, BENCHD (which bypasses the benchd manifest check),
 #      MLXFAST_SKIP_WEIGHTS_DOWNLOAD / SKIP_MODEL_DOWNLOAD,
-#      MLXFAST_LOCAL_COOL_GATE, MLXFAST_LOCAL_ALLOW_GOLDEN_DRIFT,
-#      MLXFAST_GPU_TEMP_CMD.
+#      MLXFAST_LOCAL_COOL_GATE, MLXFAST_LOCAL_ALLOW_GOLDEN_DRIFT.
+#      MLXFAST_GPU_TEMP_CMD is NOT in that list: tools/ranked-box-preflight.sh
+#      deliberately permits it as benchd's documented optional reader override.
 #   6. Model absent and unfetchable. ./setup.sh (engine-body lane) verifies the
 #      pinned target checkpoint and exits non-zero rather than proceed without
 #      it; the preflight above already refused the environment variables that

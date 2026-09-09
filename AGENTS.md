@@ -46,13 +46,10 @@ This repository descends from `Layr-Labs/mlxfast-qwen-38-27b-mtp-engine`, which
 descends from `Layr-Labs/mlxfast-challenge-dev`. Those repositories rank
 different models under different rules. Only this track's rules apply here.
 
-The engine's own sources are Gemma-named, because the engine is still the seed
-(see the warning at the top). A few fixtures and transform validators carry
-`Qwen 3.6` or `Laguna` in their names, and those are not leftovers: they name
-real foreign checkpoints that this track's gates are proven against. `Qwen35CheckpointValidation` and `fixtures/qwen3_6_27b_config.json`
-build the Qwen-shaped config the Gemma trusted-config gate must REJECT;
-`LagunaConfig` is the fixture substrate the generic transform tests run on.
-Renaming either would make the name lie about what it holds.
+Some fixtures still carry `Gemma`, `Qwen 3.6` or `Laguna` in their names. Those
+are not leftovers. They name real foreign checkpoints, and they are the negative
+controls and the fixture substrate this track's own gates are tested against.
+Renaming one would make the name lie about what it holds.
 
 ## Current state
 
@@ -168,40 +165,27 @@ Gemma-era second arm and is removed.
 
 These behaviors are expected. They are not bugs.
 
-> **NOTE — the local-iteration guidance below is SEED material.**
-> The cool-down gate, the startup memory profile, the non-M5
-> near-tie caveat and the `mlxfast-swift` local modes describe the removed
-> Apple-Metal runtime. The CUDA engine's local-iteration workflow is deferred to
-> a David/organizer ruling with the participant-editable surface. Today the local
-> signal is `cargo test --manifest-path harness/protocol-adapter/Cargo.toml`,
-> which runs the adapter against a mock transport with no GPU. The ranked cool
-> gate itself persists on the CUDA box (`docs/qwen38-125b-a6b-port-notes.md`
-> section 7).
+> **NOTE — the local signals off the box.**
+> The GPU, the pinned target snapshot and the ranked goldens are box material.
+> Off the box the signals are `cargo test --manifest-path
+> harness/protocol-adapter/Cargo.toml`, which runs the adapter against a mock
+> transport with no GPU, `tools/ds4/build.sh --cpu-check`, and the shell tests
+> `tools/test-*.sh`. The cool gate below runs on the box.
 
 ### The cool-down gate
 
 The benchmarker waits for the GPU to cool before it starts a timed run. The
 local modes pass `--cool-gate` to the benchmarker automatically. The gate reads
-the GPU temperature through `macmon`.
+the GPU temperature from the box's native reader. On the CUDA box that reader is
+`nvidia-smi`.
 
 **The gate lives in the benchmarker, and only `./benchmark.sh` arms it.**
 `./benchmark.sh` passes `--cool-gate` to `benchd`, and `benchd` runs the gate
 itself before each timed phase. Prefill and decode are gated separately.
 
-> **WARNING — driving the Swift CLI directly runs UNGATED.**
-> `mlxfast-swift --local-iterate` and `--local-submit` do not go through
-> `./benchmark.sh`. The seed's Swift harness dispatched its per-phase gate to an
-> external helper named by `MLXFAST_LOCAL_COOL_GATE_HELPER`. Nothing sets that
-> variable. Unset, the gate returns immediately and times a hot GPU without
-> saying so. These local modes belonged to the removed Apple-Metal runtime.
-
-Set the variable to the pinned benchmarker to arm that path.
-
-```bash
-MLXFAST_LOCAL_COOL_GATE_HELPER="$PWD/benchd-bin/benchd" mlxfast-swift --local-iterate
-```
-
-Prefer `./benchmark.sh`. It is the measured path and it needs no such variable.
+> **WARNING — a timing taken outside `./benchmark.sh` runs UNGATED.**
+> `./benchmark.sh` is what passes `--cool-gate`. Any other invocation times
+> whatever temperature the GPU happens to be at, and it does not say so.
 
 `./benchmark.sh --local-cool-gate-only` exits 0 without probing anything. The
 bare probe is the benchmarker's own entry point.
@@ -217,13 +201,11 @@ The gate aborts with a non-zero exit when the GPU stays hot and is not trending
 down. That abort means something else is loading the GPU. Free the GPU and
 retry. The abort does not mean your change is wrong.
 
-`./setup.sh` installs `macmon` as a pinned, hash-verified release binary. The
-gate warns and skips when `macmon` is absent. Skip the install with
-`MLXFAST_SKIP_MACMON_INSTALL=1`.
+The gate warns and skips when no temperature reader resolves.
 
 > **WARNING — a skipped gate still produces a number.**
 > Locally, no reader means no gate, and the run times whatever temperature the
-> GPU happens to be at. Treat a timing taken without `macmon` as unmeasured.
+> GPU happens to be at. Treat a timing taken with no reader as unmeasured.
 
 The ranked box does the opposite. A missing or frozen reader is a hard refusal
 there, before any measurement (`tools/ranked-box-preflight.sh`, sections 2b and
@@ -257,10 +239,9 @@ The target model is RAM-resident. Two model residencies at once can exhaust a
 local machine's memory.
 
 > **WARNING — run one model-holding command at a time.**
-> Do not start a second local run while the first is alive. Do not run a
-> model-holding `mlxfast-swift` command next to a local test. These commands are
-> `correctness`, `correctness-trace`, `generate-golden`, and
-> `generate-gpqa-answers`.
+> Do not start a second local run while the first is alive. Do not run any
+> second model-holding command next to a local test. One resident engine at a
+> time is the only arrangement that fits.
 
 No run lock enforces this. The discipline is yours to keep.
 
@@ -270,25 +251,13 @@ alongside.
 Check for an orphaned worker when a run aborts. A worker whose parent process
 identifier is 1 is usually an orphan. Verify it, then kill it.
 
-### The startup memory profile
+### The near-tie caveat
 
-The runtime selects a low-memory profile automatically below 64 GiB of physical
-memory. The profile caps the MLX allocator cache at 6 GiB, shortens command
-buffers, and releases free warmup buffers before the worker serves requests.
+The checked-in public goldens are greedy continuations captured on ranked
+hardware. A near-tie argmax can diverge on other hardware, even for correct
+code.
 
-The profile is pure memory management. It disables no code path and no
-output-affecting feature. It announces itself on stderr. Force it either way
-with `DARKBLOOM_STARTUP_MEMORY_PROFILE=full|low|auto`.
-
-A machine that is too small fails loudly with an out-of-memory error. It does
-not diverge silently from ranked behavior.
-
-### The non-M5 near-tie caveat
-
-The checked-in public goldens are M5-generated greedy continuations. A near-tie
-argmax can diverge on another Apple Silicon generation, even for correct code.
-
-> **WARNING — a local gate failure on non-M5 hardware may not be your bug.**
+> **WARNING — a local gate failure on other hardware may not be your bug.**
 > Check whether an unmodified `main` fails at the same token position on your
 > machine. Do that before you treat a local failure as a regression.
 
@@ -388,19 +357,17 @@ toolchain; `rust-analyzer` is the standard language server. Point your editor at
 
 Good changes improve one or more of these.
 
-- Kernel-level work inside the vendored Metal sources. Prioritize kernels the
-  cohort prefill and the timed decode window reach.
-- The batching engine. Admission, scheduling, round driving, and stream drain
-  are competitive surface.
-- Attention dispatch. The sliding-window and full-attention layer types use
-  different masks and different head dimensions.
+- CUDA kernel work inside the vendored engine (`ds4/`). Prioritize the kernels
+  the prefill and the timed decode window reach.
+- Attention dispatch. The full-attention layers and the gated deltanet linear
+  layers take different paths.
 - The quantized matmul and the MoE gather-GEMM for the routed experts.
-- KV-cache handling. The sliding-window cache only ever needs the last 1024
-  positions.
+- KV-cache handling on the 12 full-attention layers, and the recurrent state on
+  the other 36.
+- The n-gram / PLE table reader on layer 1.
 - Weight loading and reuse. Prepare eagerly at init. Warm kernels before the
   first scored forward. Avoid redundant conversions.
-- MLX operation scheduling and synchronization.
-- Transform metadata that lets the runtime skip work safely.
+- The speculative cycle: the drafter, the draft depth, and the target verify.
 
 ## Wrong strategies
 
@@ -409,12 +376,11 @@ prompt-independent and model-general. The hidden prompts differ from the public
 fixtures.
 
 Do not assume the ranked box has your local machine's memory budget. A strategy
-tuned on one Apple Silicon generation can move differently on another.
+tuned on one machine can move differently on another.
 
 Do not treat a local-only environment override as proof of a valid improvement.
-Disabling the sandbox, skipping the transform without verifying `weights/`, and
-pointing at a user-specific reference path are debugging aids. They do not
-establish a rankable optimization.
+Skipping the checkpoint verification and pointing at a user-specific reference
+path are debugging aids. They do not establish a rankable optimization.
 
 Do not draw a conclusion from a tiny local run alone. A local run is a smoke
 test. It is especially weak for sequence-length-dependent changes, because it
@@ -423,28 +389,23 @@ may not exercise the ranked sequence lengths or the ranked memory pressure.
 Be conservative with numeric reassociation. A changed accumulation order can
 flip a near-tie greedy argmax.
 
-> **WARNING — the target quantization is frozen as shipped.**
-> Do not re-quantize any target weight. Do not re-represent one. Do not change
-> the numerical format of one. This holds even when the result passes every
-> correctness gate. Nothing licenses a change of target format: a lossier target
-> substitutes a degraded model instead of optimizing the accepted one. The MTP
-> head is a narrow exception, and the exception is RE-QUANTIZATION ONLY
-> (David ruling 2026-08-26) — re-quantize it within its 2 GiB
-> declaration cap, but do not replace it and do not upload head weights.
-> `mtp-head/` is not an editable path, and a head declaration
-> accepts `"source": "pinned"` only. A head re-quantization happens ON LOAD, in
-> memory: the head loader quantizes the head's parameters while it binds the
-> checkpoint. On this CUDA track the engine is the ds4 engine behind the Rust
-> adapter, so the editable seam is the adapter in `harness/`. Nothing on disk
-> changes
-> (`docs/participant-contract.md` section 4.4).
-> They only propose tokens; the pinned target decides every emitted token.
-> The target's own quantization is verified on the LOADED model TWICE: once at
-> worker startup, and again at the top of every window that gets measured,
-> immediately before the measured work starts. The second check is there because
-> the first alone verifies a model that later code can still change in place. An
-> in-memory re-quantization of the target is refused by name, and the refusal
-> stops the worker before any measurement.
+> **WARNING — the weights are frozen as shipped.**
+> Do not re-quantize any weight. Do not re-represent one. Do not change the
+> numerical format of one. Do not mirror one. This holds on disk and in memory,
+> and it holds even when the result passes every correctness gate. Nothing
+> licenses a change of weight format: a lossier target substitutes a degraded
+> model instead of optimizing the accepted one.
+> The MTP head is NO exception. It is the organizer's pinned weights, a separate
+> Q8_0 GGUF staged in the target snapshot beside the shards, and the engine uses
+> it exactly as staged. Do not re-quantize it, replace it, or upload head
+> weights of your own.
+> `mtp-head/` IS an editable path; it holds only its `README.md`, and the byte
+> budget bars a weight file there. The declaration
+> `mtp-head.manifest.json` is editable and optional. It accepts
+> `"source": "pinned"` only, and its live field is `spec`
+> (`docs/participant-contract.md` section 4).
+> Nothing about the head is participant-tunable except the draft depth.
+> A head only proposes tokens; the pinned target decides every emitted token.
 
 > **WARNING — do not add a cache keyed on a request's input tokens whose only
 > possible hit is the harness repeating one identical computation.**
@@ -494,7 +455,7 @@ declare MTP.
 
 This command resolves the pinned benchmarker. Run a local test afterwards.
 
-Check the non-M5 near-tie caveat above when local correctness fails. Prefer a
+Check the near-tie caveat above when local correctness fails. Prefer a
 more conservative optimization when performance improves but correctness turns
 fragile.
 

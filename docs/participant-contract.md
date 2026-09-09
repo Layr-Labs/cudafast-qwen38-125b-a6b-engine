@@ -64,10 +64,11 @@ model.
 
 There is no sliding-window attention on this model.
 
-The speculative-decode arm is the native MTP head. It is embedded in the pinned
-target checkpoint under `language_model.mtp.*`: 76 tensors, 1 hidden layer,
-hybrid full attention. It has no embedding and no `lm_head` of its own. It
-rides the target's `language_model.embed_tokens` and `language_model.lm_head`.
+The speculative-decode arm is the native MTP head. It is a separate pinned
+Q8_0 GGUF (`mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`) that the organizer stages
+in the target snapshot beside the shards. `tools/serve-up.sh` passes it to the
+engine with `--mtp-model`. It carries 1 hidden layer of hybrid full attention.
+It has no embedding and no `lm_head` of its own: it rides the target's.
 
 `kv_backend` is pinned `contiguous` on both legs. The benchmarker refuses when
 it cannot honour the pinned backend. It does not degrade to another backend.
@@ -78,8 +79,9 @@ it cannot honour the pinned backend. It does not degrade to another backend.
 
 | Path | What it is |
 |---|---|
+| `ds4/` | The vendored ds4 engine (see section 3.5). |
 | `harness/` | The Engine Protocol v1 adapter (`harness/protocol-adapter`), the scored binary. |
-| `mtp-head/` | The MTP head area (see section 4). |
+| `mtp-head/` | The MTP head area (see section 4). It holds only its `README.md`. |
 | `mtp-head.manifest.json` | The MTP head declaration (see section 4). |
 
 The rule behind the list: anything that only **proposes** tokens or computes
@@ -89,8 +91,9 @@ contract (`fixtures/`), and this manifest.
 
 The scored engine is the Engine Protocol v1 adapter with the ds4 C/CUDA engine
 linked in-process (`harness/protocol-adapter`, `ds4/`). The `ds4/` tree is
-`Layr-Labs/ds4`, our port of `antirez/ds4`. It is pinned and read-only, and
-there is no patch overlay over it.
+`Layr-Labs/ds4`, our port of `antirez/ds4`, vendored as plain files. It is
+editable: you submit the engine you edited. `ds4/VENDOR.json` records the
+signed base the tree was exported from.
 
 ### 3.1 Optional paths
 
@@ -108,9 +111,9 @@ contract, never from the submission.
 
 | Key | Value |
 |---|---|
-| `maxTotalBytes` | 1048644 |
-| `maxFileBytes` | 524288 |
-| `maxGrowthBytes` | 262144 |
+| `maxTotalBytes` | 19550883 |
+| `maxFileBytes` | 4473321 |
+| `maxGrowthBytes` | 19550883 |
 | `exemptPathMaxBytes` | 512000000 |
 | `exemptPathMaxFileBytes` | 100000000 |
 
@@ -126,9 +129,10 @@ compiled-in fallbacks, and this manifest is what holds those constants to a
 reviewed value. `tools/lint-benchmark-manifest.py` check 3b enforces that
 equality.
 
-No head weight file is staged, so this budget never meets one. The head is part
-of the pinned target checkpoint, which is outside the editable surface. What
-the runner LOADS is bounded instead by the 2 GiB declaration cap in section 4.
+No head weight file is staged in an editable path, so this budget never meets
+one. The head sits in the organizer-staged target snapshot, which is outside the
+editable surface. What the runner LOADS is bounded instead by the 2 GiB
+declaration cap in section 4.
 
 ### 3.3 What you may not edit
 
@@ -138,57 +142,41 @@ tokenizer, the goldens, the gates, and the timing and telemetry code.
 `fixtures/` is outside the editable surface. The scoring step reads the contract
 from the trusted checkout for that reason.
 
-### 3.4 The target quantization is frozen
+### 3.4 The weights are frozen
 
-The target model's quantization is frozen as shipped.
+The target model's quantization is frozen as shipped. So is the MTP head's.
 
-A submission must not re-quantize any target weight. It must not re-represent a
-target weight. It must not change the numerical format of a target weight. This
-holds even when the result passes every correctness gate.
+A submission must not re-quantize any weight. It must not re-represent one. It
+must not change the numerical format of one. It must not mirror one. This holds
+on disk and in memory, and it holds even when the result passes every
+correctness gate.
 
-No editable path licenses a change of target format. A lossier target
+No editable path licenses a change of weight format. A lossier target
 substitutes a degraded model. It does not optimize the accepted one.
 
-The MTP head is a narrow exception, and the exception is re-quantization only.
+The MTP head is no exception. It is the organizer's pinned weights, and the
+engine uses it exactly as staged. You may **not** re-quantize it. You may
+**not** replace it. You may **not** upload head weights of your own. Custom
+head weights are not accepted on this track.
 
-You may re-quantize the MTP head. You may **not** replace it. You may **not**
-upload head weights of your own. Custom head weights are not accepted on this
-track.
+The head is the organizer's pinned weights, staged with the target snapshot.
+`fixtures/qwen3_8_125b_a6b_track.json` names the repository and the variant, and
+its `target.files` list pins every shard and the MTP draft head by bytes and
+sha256; `./setup.sh` verifies the staged snapshot against that list. The
+contract fixture lives in `fixtures/`, which is outside the editable surface.
 
-This is the 2026-08-26 ruling. It replaces the earlier bring-your-own-head
-design, under which a participant could declare and ship a head of their own
-choosing. That design is retired.
+Two things enforce this, and section 4 states each one:
 
-The head is the organizer's pinned weights, because it is part of the pinned
-target checkpoint. `fixtures/qwen3_8_125b_a6b_track.json` names the repository
-and variant, and its `target.files` list pins every shard and the MTP draft
-head by bytes and sha256; `./setup.sh` verifies the staged snapshot against
-that list. The contract fixture lives in `fixtures/`, which is outside the
-editable surface.
-
-Three things enforce this, and section 4 states each one:
-
-1. No head weights directory exists and no submission path can hold head
-   weights. A submission that carries a weight file is refused.
+1. No editable path can hold head weights. The byte budget bars a weight file,
+   and a submission that carries one is refused.
 2. The head declaration accepts `"source": "pinned"` only. `"remote"` and
    `"in_branch"` are refused by name.
-3. A re-quantization happens on load, in memory, on the benchmark machine.
-   No re-quantized file is made, so there is no artifact to travel in a
-   submission. Section 4.4 states the mechanism.
 
-The loader reads a `quantization` block in the shape an MLX conversion writes.
-That block selects which modules load quantized and at what geometry. The
-accepted parameters are `group_size` (positive, at most 65536), `bits` between
-2 and 8, and optional per-layer overrides (at most 8192 entries). A value
-outside those bounds is refused by name.
+Nothing about the head is participant-tunable except the draft depth. Section
+4.1 states how you declare it.
 
-The MTP head loader does not check a declare-versus-carry mismatch. An absent
-declaration skips quantization, and packed weights then fail later inside the
-weight bind with a shape error. A declaration with no packed tensor quantizes
-nothing, silently. That limit is stated here rather than promised away.
-
-The reason for the whole exception is the propose-and-decide split. The head
-only proposes tokens. The pinned target model decides every emitted token.
+The reason is the propose-and-decide split. The head only proposes tokens. The
+pinned target model decides every emitted token.
 
 ### 3.5 Editing the engine
 
@@ -219,175 +207,111 @@ engine's session API (`ds4/ds4.h`: `ds4_session_sync`, `ds4_session_eval`,
 `ds4_session_eval_speculative_argmax`). The pinned port carries the `qwen4exp`
 model family, so the shim opens the target with no refusal.
 
-**Draft depth.** The pinned engine drafts **up to three** tokens per
+**Draft depth.** The pinned engine drafts **up to six** tokens per
 target-verified cycle (`ds4_session_eval_speculative_argmax` in `ds4.c`, which
-the port routes to `ds4_qwen4exp_mtp_cycle`). Depths **1, 2 and 3 all run** —
-the whole track envelope — and the depth that ran is echoed as `effective_spec`
-rather than clamped. A depth outside 1..3 is refused by name
-(`harness/protocol-adapter/src/ds4_backend.rs`, `DS4_IMPLEMENTED_DEPTH`, which
-must equal the vendored engine's `DS4_QWEN4EXP_IMPLEMENTED_DEPTH`).
+the port routes to `ds4_qwen4exp_mtp_cycle`). Depths **1 to 6 all run**: that is
+the whole track envelope (`mtp_head.permitted_draft_depths` in the contract
+fixture). The depth that ran is echoed as `effective_spec` rather than clamped.
+A depth outside 1 to 6 is refused by name. In
+`harness/protocol-adapter/src/ds4_backend.rs`, `MTP_MIN_DEPTH` is 1,
+`MTP_MAX_DEPTH` is 6, and `DS4_IMPLEMENTED_DEPTH` is 6. The last one must equal
+the vendored engine's `DS4_QWEN4EXP_IMPLEMENTED_DEPTH`.
 
 Depth 1 was the only implemented depth until the `e2f86b7` vendor-sync. Which
 depth is *fastest* is yours to find: a deeper draft proposes more per cycle and
 accepts less often.
 
-## 4. The embedded MTP head
+## 4. The MTP head
 
-The track carries one speculative head. It is the organizer's weights, because
-it is part of the pinned target checkpoint.
+The track carries one speculative head. It is the organizer's weights.
 
 | Item | Value |
 |---|---|
 | Declaration | `mtp-head.manifest.json` |
-| Where the weights are | A pinned Q8_0 GGUF in the target snapshot, beside the shards |
-| Organizer pin | `unsloth/Qwen3.8-Flash-Next-GGUF`, `UD-Q4_K_XL` |
+| Where the weights are | A separate pinned Q8_0 GGUF in the target snapshot, flat beside the shards |
+| File | `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` |
+| Organizer pin | `fixtures/qwen3_8_125b_a6b_track.json` `target.files`, by bytes and sha256 |
+| How the engine gets it | `tools/serve-up.sh` passes it with `--mtp-model` |
 
-The declaration file is editable. The checkpoint is not.
+The declaration file is editable. The head is not.
 
-Nothing stages a head weight file. There is no head stager and no head weights
-directory. `./setup.sh` provisions the target checkpoint, and the head arrives
-with it.
+Nothing in a submission stages a head weight file. There is no head stager and
+no head weights directory. `./setup.sh` verifies the target snapshot, and the
+head arrives with it.
 
 ### 4.1 What you may declare
 
-`"source": "pinned"` is the only accepted source. On this track it means the
-head embedded in the pinned target checkpoint. A declaration may also state
-`max_bytes` (it may lower the 2 GiB track cap and may not raise it), a `bytes`
-count, and an optional `sha256`. It carries no `arm` key; there is one arm, so
-there is nothing to select.
+`mtp-head.manifest.json` is editable and optional. Its live field is `spec`,
+which `tools/spec-declaration.sh` reads:
+
+```json
+"spec": { "enabled": true, "num_speculative_tokens": 1 }
+```
+
+`spec.enabled` is a boolean. `spec.num_speculative_tokens` is an integer. An
+enabled depth must be one of the contract's `mtp_head.permitted_draft_depths`,
+which are 1 to 6. An absent file, an absent `spec` block, `enabled: false`, or
+`num_speculative_tokens: 0` all mean serial: the drafter is off. An unknown key
+inside `spec` is refused by name, so a mistyped key never reads as its default.
+
+The rest of the file is bounded the same way. The accepted top-level keys are
+`version`, `source`, `max_bytes`, `bytes`, `sha256` and `spec`. An unknown
+top-level key is refused by name. `"source"` must be `"pinned"`. `max_bytes` is
+an integer from 1 to 2147483648, so a declaration may lower the 2 GiB track cap
+and may not raise it.
 
 `"source": "remote"` is refused by name. `"source": "in_branch"` is refused by
 name. Both were accepted before the 2026-08-26 ruling and both meant "load
 weights the participant chose". The refusal names the retired source and names
 `pinned` as what replaced it.
 
-An absent declaration selects the embedded head. A declaration that is present
-but broken is a refusal. The runner never falls back silently.
+The file carries no `arm` key. There is one arm, so there is nothing to select.
+
+A declaration that is present but broken is a refusal. The runner never falls
+back silently.
 
 ### 4.2 What you may not do
 
 You may not ship head weights. The editable byte budget bars them: a real head
-weight file far exceeds `maxFileBytes` (524288), so
+weight file far exceeds `maxFileBytes` (4473321), so
 `.github/scripts/submission-static-review-checks.sh` refuses it before any
 measurement. `.github/scripts/enforce-modifiable-surface.sh` refuses any file
 outside the editable surface, and `.github/scripts/overlay-editable-paths.sh`
-overlays only the declared editable paths from the trusted contract. The
-benchmarker's own write-divergence gate refuses any content that differs from
-the trusted baseline outside the editable surface. `mtp-head/` is an editable
-path (it holds only its `README.md`), but the byte budget still bars a weight
-file there.
+overlays only the declared editable paths from the trusted contract.
+`mtp-head/` is an editable path and it holds only its `README.md`, but the byte
+budget still bars a weight file there.
 
-You may not edit the checkpoint's head tensors. The checkpoint is not an
-editable path, so any change to it is outside the surface.
+You may not re-quantize the head. You may not re-cast it, mirror it, or alter it
+in any other way, on disk or in memory. The engine loads the staged bytes and
+uses them as they are.
+
+You may not edit the target snapshot. It is not an editable path, so any change
+to it is outside the surface.
 
 ### 4.3 What the size cap does and does not do
 
 The 2 GiB declaration cap (`max_bytes` = 2147483648) bounds what the runner
 loads.
 
-The size cap is the only gate on the declaration. A declared `sha256` is
-optional, and the runner does not verify it against the head bytes. It treats a
-wrong digest and an absent digest alike. That is stated here plainly because it
-is a real limit, not a detail: **nothing in this repository binds the loaded
-head bytes to the organizer's pinned digests at run time.** The harness
-computes a head digest that it reports and never compares.
+A declared `sha256` is optional, and the runner does not verify it against the
+head bytes. It treats a wrong digest and an absent digest alike. That is stated
+here plainly because it is a real limit, not a detail: a declared digest is a
+statement of intent, not a check.
 
-What does bind at run time is relative, not absolute: the benchmarker compares
-the candidate workspace against the trusted baseline workspace and refuses any
-divergence outside the editable surface. A correctly provisioned baseline is
-therefore load-bearing for the whole property.
+The head bytes are bound one level up. They are part of the organizer-staged
+target snapshot, and `./setup.sh` verifies every staged file against the
+`{bytes, sha256}` pins in `target.files`. Both legs load the head out of that
+one verified snapshot.
 
-The head bytes themselves are bound one level up. They are part of the pinned
-target checkpoint, and the ranked box verifies every staged byte against the
-per-file digests in `target.sha256` beside the snapshot. Both legs load the
-head out of that one verified checkpoint.
-
-### 4.4 How a re-quantization reaches the box
-
-A re-quantization happens ON LOAD, in memory. Nothing on disk changes.
-
-You do not make a re-quantized checkpoint. Your code quantizes the head's
-parameters in memory, in the same pass that binds them. The staged bytes are
-only read.
-
-#### What to edit
-
-The head loader quantizes the head's parameters while it binds the checkpoint.
-That call is the seam. On this CUDA track the scored engine is the ds4 engine
-behind the Engine Protocol v1 adapter. `editablePaths` lists `harness`,
-`mtp-head` and `mtp-head.manifest.json`, so the seam lives in the adapter.
-The mechanism below is what that surface honours.
-
-Change the geometry that seam selects. The default reads the checkpoint's own
-quantization block. Your code may select a different geometry instead.
-
-Section 3.4 states the bounds the loader accepts: `group_size` positive and at
-most 65536, `bits` between 2 and 8, and at most 8192 per-layer overrides. A
-value outside those bounds is refused by name. The loader does not check a
-declare-versus-carry mismatch; section 3.4 states that limit.
-
-#### Why nothing is written
-
-Two properties follow from the in-memory rule, and both are why this mechanism
-is the safe one.
-
-1. The benchmarker compares the candidate workspace against the trusted
-   baseline workspace and refuses any change outside the editable surface. That
-   comparison reads the disk. A re-quantization on load is not a disk
-   operation, so there is nothing for the gate to see.
-2. The ranked worker runs under a sandbox profile that denies file writes. Code
-   that tried to rewrite a staged head would fail there.
-
-Do not rewrite the head tensors on disk. Do not rewrite them from `setup.sh` or
-from the `mlxfast-swift transform` command. Each of those runs before the
-workspace comparison, and the benchmarker refuses the change.
-
-#### What changes in the record
-
-The worker reports the digest of the head it loaded. That digest is the digest
-of the ORGANIZER's checkpoint bytes, before and after a re-quantization,
-because the bytes do not change. The geometry you selected is not visible in
-that digest.
-
-#### What this does not permit
-
-The exception is for the HEAD's OWN weights only. The target model's
-quantization stays frozen, as section 3.4 states.
-
-**The head is embedded, so the rule is drawn by module path.** David ruling
-2026-08-27, relayed by orchestrator: "Exempt mtp.* from the freeze."
-`language_model.mtp.*` loads into the target's own module tree, so the
-loaded-target check has to say which side of the line each module is on. It
-says it this way:
-
-| Module path | Treatment |
-|---|---|
-| `mtp.*` | EXEMPT. Re-quantize it on load. |
-| `mtp.*` naming `embed_tokens` or `lm_head` | REFUSED BY NAME. |
-| Everything else, `model.embed_tokens` and `lm_head` included | FROZEN. |
-
-**The shared tensors are the middle row, and they are shared for a real
-reason.** The head owns no embedding table and no output projection. It READS
-the target's embedding table for its next-token vectors and the target's output
-projection for its logits, which is what `use_dedicated_embeddings: false`
-means on this checkpoint. Those two tensors decide the TARGET's tokens.
-Coarsening one of them is a target re-quantization whatever path it is spelled
-under, so a quantized module inside the head subtree that names either one is
-refused, and the refusal says which shared tensor it reached.
-
-The target is verified TWICE, and both checks read the loaded model, not the
-declaration:
-
-1. At worker startup, immediately after the target is loaded.
-2. Again at the top of each window that gets measured, immediately before the
-   measured work starts.
-
-The second check exists because the first one alone verifies a model that code
-can still change afterwards. Both refuse by name, and a refusal stops the worker
-before any measurement.
+### 4.4 What the head does in a run
 
 The head only **proposes** tokens. The organizer-pinned target model decides
-every emitted token. The serial control leg always runs the embedded head.
+every emitted token.
+
+The serial control leg always runs with the drafter off
+(`--spec serial --draft-len 0`). The candidate leg runs at the depth the
+declaration names. Section 3.5 states the envelope, and section 7 states what
+each run seals.
 
 ## 5. Scoring
 
@@ -814,16 +738,11 @@ stager, because there is none. The checked-in `mtp-head.manifest.json` declares
 | Target model | `unsloth/Qwen3.8-Flash-Next-GGUF`, variant `UD-Q4_K_XL` |
 | Target manifest | `fixtures/qwen3_8_125b_a6b_track.json` `target.files` (bytes + sha256 per file) |
 | Engine | vendored at `ds4/` from `Layr-Labs/ds4` @ `278b799b974cb580e0f96ed3dce68bfbe0d8675b` (`ds4/VENDOR.json`) |
-| MTP head | A pinned Q8_0 GGUF in the target snapshot |
-| Model fork revision | `ed55bee83beb0623152f4c2e70f0cf99ad379e35` |
+| MTP head | `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`, a pinned Q8_0 GGUF in the target snapshot |
 
 The staged snapshot holds the four main GGUF shards (111,334,654,784 bytes)
 and, flat beside them, the Q8_0 MTP draft head (2,786,568,256 bytes). The
 fixture pins all five by bytes and sha256.
-
-`Sources/MLXFastCore/Constants.swift` does NOT mirror this pin yet. It still
-carries the seed's Gemma checkpoint identity; that constant moves with the
-engine port (`docs/qwen38-125b-a6b-port-notes.md` section 7).
 
 The model repository is public and downloads without a token. There is no
 organizer-hosted mirror for this checkpoint, so
@@ -832,18 +751,18 @@ organizer-hosted mirror for this checkpoint, so
 Participants never supply the target weights. Substituting or re-deriving the
 target is a failure.
 
-The rectangular cap is `B * (1 + k) <= 8` on M3 and later. Batch size is locked
-at 8.
+Batch size is locked at 1. The track is scored single-stream.
 
 You can select the draft depth. It is not pinned at 1.
 
-Your drafter code sets the depth. That code is an editable path, so the depth is
-a free lever. A request above the ceiling is clamped to the ceiling. It is not
-refused.
+You declare the depth in `mtp-head.manifest.json` under
+`spec.num_speculative_tokens`. That file is an editable path, so the depth is a
+free lever.
 
-The permitted values are 1, 2 and 3. The MTP envelope limits the depth to 3.
-The envelope is trusted code and is not an editable path: `maxDraftTokens` is 3,
-and `maxAutomaticRectangularTokens` is 32 at batch size 8.
+The permitted values are 1 to 6 (`mtp_head.permitted_draft_depths` in the track
+fixture). The envelope is trusted code and is not an editable path. A depth
+outside 1 to 6 is refused by name, never clamped, so the serve that boots and
+the `effective_spec` the adapter seals can never disagree.
 
 An absent depth does not mean 1. Two layers supply a depth when a request does
 not name one. Do not confuse them.
@@ -851,11 +770,7 @@ not name one. Do not confuse them.
 | Request | Result |
 |---|---|
 | benchd invocation gives no `--mtp-depth` | benchd measures at depth 2 |
-| the `mtp` block has no `depth` key | the envelope uses its ceiling of 3 |
-
-The `fixed_depth = 1` constant in the track fixture is a darkbloom reference
-constant. It records a protocol value that this track inherited. It is not a
-limit on your draft depth.
+| the `mtp` block has no `depth` key | the envelope uses its ceiling of 6 |
 
 Every run seals the depth that operated. Read `effective_spec` for the depth the
 run declared. Read `effective_mean_draft_len` for the draft length that the run
@@ -896,12 +811,9 @@ The ranked run on the official runner is the gate that ranks a submission.
 
 ## 10. License
 
-The pinned checkpoint carries the Qwen Community License 1.0. That is the
-license name the checkpoint records, not an SPDX identifier: the contract
-fixture records `"spdx": "other"` with `"license_name": "qwen-community-1.0"`.
-The terms ship with the checkpoint at its pinned revision.
-
-The checkpoint is a 4-bit MLX conversion of `Qwen/Qwen3.8-Flash-Next`.
+The pinned checkpoint is a GGUF conversion of `Qwen/Qwen3.8-Flash-Next`. The
+model's own license terms apply to it. They ship with the checkpoint at its
+pinned revision.
 
 This repository distributes no model weights.
 
@@ -941,15 +853,12 @@ The channel host is the public bench repository `Layr-Labs/mlxfast-bench`, so
 ### 11.2 The model port HAS landed
 
 The engine constructs, gates, loads and runs `qwen4_exp_text`. The geometry in
-`Sources/MLXFastCore/Constants.swift`, its mirror in `Sources/MLXFastModel`,
-the checkpoint validator in `Sources/MLXFastTransform` and this contract's
-`target.*` block are all this target's, and they move as ONE SET: a gate
-holding some fields of one model and some of another rejects every checkpoint
-and explains none of them.
+the vendored engine and this contract's `target.*` block are both this target's,
+and they move as ONE SET: a gate holding some fields of one model and some of
+another rejects every checkpoint and explains none of them.
 
-The four `Qwen4Exp*.swift` model files are editable paths, as is
-`Sources/MLXFastModel`, which is where a submission changes how the target is
-built and how its n-gram rows are fetched.
+The vendored engine (`ds4/`) is an editable path. It is where a submission
+changes how the target is built and how its n-gram rows are fetched.
 
 What remains is named in 11.4 and 11.5: the cohort path refuses, and the
 speculative arm is correct but not yet fast.
