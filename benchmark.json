@@ -52,8 +52,8 @@
     },
     "scoredBatchSize": 1,
     "kvBackend": "contiguous",
-    "pairsPerCohort": 4,
-    "minPairsPerCohort": 4,
+    "pairsPerCohort": 2,
+    "minPairsPerCohort": 2,
     "decodeSpeedupFloor": 0.9,
     "decodeSpeedupCeiling": 5.0
   },

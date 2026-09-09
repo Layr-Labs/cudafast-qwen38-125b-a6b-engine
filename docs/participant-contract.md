@@ -444,8 +444,8 @@ or implausible value. Only pairs accepted under that gate feed the composite.
 | `scoredBatchSize` | 1 |
 | `prefillGainExponent` | 0.25 |
 | `decodeGainExponent` | 0.75 |
-| `pairsPerCohort` | 4 |
-| `minPairsPerCohort` | 4 |
+| `pairsPerCohort` | 2 |
+| `minPairsPerCohort` | 2 |
 | `decodeSpeedupFloor` | 0.90 |
 | `decodeSpeedupCeiling` | 5.0 |
 | `kvBackend` | `contiguous` |

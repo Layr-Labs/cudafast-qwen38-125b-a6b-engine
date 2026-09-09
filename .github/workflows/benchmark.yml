@@ -209,25 +209,24 @@ jobs:
     # COUNT, so it moves whenever that ruling moves -- it is restated here rather
     # than left implicit:
     #
-    #   pairsPerCohort 4 (David 2026-08-26), one cohort, so 4 pairs x 2 legs
-    #   (serial control + candidate) = 8 timed legs, and benchd gates PER PHASE
-    #   -- prefill and decode are separate cool_gate() calls on a fresh worker --
-    #   so up to 16 gated phases x 900 s = 240 min of cool-down ALONE, worst
-    #   case, before a single token is timed.
+    #   official_pairs 2 (David 2026-09-09, the fixture's value that benchd
+    #   enforces), so 2 pairs x 2 legs (serial control + candidate) = 4 timed
+    #   legs, and benchd gates PER PHASE -- prefill and decode are separate
+    #   cool_gate() calls on each leg -- so up to 8 gated phases x 900 s =
+    #   120 min of cool-down ALONE, worst case, before a single token is timed.
     #
-    # 240 min of gating plus a cold checkpoint fetch, the engine build and the
-    # weight-owner upload, and the measurement
-    # itself does not fit in 180. At the cap GitHub kills the job
+    # 120 min of gating plus a cold checkpoint fetch, the engine build and the
+    # measurement itself does not fit in 180. At the cap GitHub kills the job
     # mid-measurement, which burns the box's slot and produces nothing. 360 is
     # the challenger's own budget for the same reason.
     #
-    # WHY 360 STILL SUFFICES AT 16 PHASES: the 900 s ceiling is NOT an operating
-    # point. A phase that actually burns 900 s means the box never reached the
-    # gate temperature, which is itself the refusal condition -- that run is
-    # rejected and retried on a clean box rather than proceeding. Sixteen
+    # WHY 360 STILL SUFFICES: the 900 s ceiling is NOT an operating point. A
+    # phase that actually burns 900 s means the box never reached the gate
+    # temperature, which is itself the refusal condition -- that run is
+    # rejected and retried on a clean box rather than proceeding. Eight
     # consecutive 900 s waits is not a slow run, it is a broken box, and it fails
-    # rather than finishing at minute 359. 240 min is the pathological ceiling
-    # this cap must not be BELOW, not the expected cost.
+    # rather than finishing at minute 359. 120 min is the pathological ceiling
+    # this cap must not be BELOW, not the expected cost (about 6 min measured).
     timeout-minutes: 360
     # THIS JOB SETS NO ENVIRONMENT OF ITS OWN. Every staged asset the scored path
     # needs but the checkout does not carry comes from the runner service's

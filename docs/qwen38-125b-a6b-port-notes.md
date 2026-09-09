@@ -277,18 +277,14 @@ live only in `benchd measure-job`. So this track's wrapper targets
 TRUSTED-side: it is not in `editablePaths`, so a submission cannot rewrite the
 measurement pipeline from inside its archive.
 
-**The ruled pair count.** `--target-pairs` and `--min-pairs` are both 4, the
-ruled contest parameter (David 2026-08-26, "you run it using 4 pairs instead of
-2 of 8 batches"). The served benchmarker enforces it: an official run whose
-`target_pairs` or `min_pairs` is not `PAIRS_PER_COHORT_TARGET` is refused
-pre-GPU, by name. That constant is `4` on the served channel
-(qwen3.8-125b-a6b-v1, source_commit `8439d6fe`, verified 2026-08-30), so the
-wrapper's `--min-pairs 4 --target-pairs 4` is accepted. The wrapper's literals
-are a belt-and-suspenders declaration of the ruled floor at the call site; the
-guarantee that a published median covers 4 pairs comes from the benchmarker's
-refusal, which no argv can talk past. `benchmark.json` `scoring.pairsPerCohort`
-and `tools/lint-benchmark-manifest.py` are the authority on the value and its
-supersession chain.
+**The ruled pair count.** The paired per-box path measures `official_pairs`
+pairs per ranked run: 2, David 2026-09-09 ("move to 2 pairs on both mlx and
+cuda for now"; "1 pair is not sufficient"). Each pair is one serial-control leg
+on the reference tree and one candidate leg at the declared depth. benchd reads
+the count from the `--contract` fixture and refuses a ranked run whose fixture
+does not declare it, so no argv can change how many pairs a published score
+covers. `benchmark.json` `scoring.pairsPerCohort` carries the same number for
+readers, and `tools/lint-benchmark-manifest.py` fails when the two disagree.
 
 **The thermal contract is benchd's, not the wrapper's.** Every timed phase runs
 behind the benchmarker's own per-platform cool-down gate: a 50 °C threshold on
