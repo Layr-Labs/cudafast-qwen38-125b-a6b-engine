@@ -3,6 +3,7 @@
   "track_id": "qwen3.8-125b-a6b-cuda-v1",
   "track_name": "Qwen 3.8 125B A6B CUDA -- composite paired speedup",
   "official_scoring_enabled": true,
+  "official_pairs": 2,
   "runner": {
     "provider": "github-actions",
     "workflow": "benchmark.yml",

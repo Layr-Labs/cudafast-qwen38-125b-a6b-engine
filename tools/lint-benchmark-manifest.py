@@ -45,14 +45,9 @@ What it asserts, in order:
                         global expectation: qwen3.8-27b-mtp-v1 and
                         qwen3.8-125b-a6b-cuda-v1 are ruled differently and neither's
                         pins apply to the other), and agree with the contract
-                        fixture's scoring_semantics where both state a value. A
-                        manifest value ruled AHEAD of the pinned benchd source
-                        (this recurs at EVERY pairs ruling: pairsPerCohort=2 was
-                        ruled ahead of the then-pinned compiled
-                        PAIRS_PER_COHORT_TARGET=4 until the 2026-08-24
-                        gitlink-advance brought the pin into agreement, and
-                        pairsPerCohort=4 is ruled ahead of it again under the
-                        2026-08-26 ruling until the channel tip carries it) is
+                        fixture's scoring_semantics where both state a value, and
+                        the fixture's official_pairs (the count benchd enforces).
+                        A manifest value ruled AHEAD of the pinned benchd is
                         NOT machine-cross-checked against benchd here -- benchd is a
                         prebuilt binary now, not a source tree this linter could
                         grep, so a check of that shape has nowhere to read from. The honest, load-bearing
@@ -171,51 +166,19 @@ _QWEN_MTP_V1_SCORING = {
 #       (benchmark.json and its contract fixture carry values only, no prose
 #       fields, per David's 2026-08-24 ruling -- see
 #       docs/qwen38-125b-a6b-port-notes.md for the full split).
-#   pairsPerCohort = 4
-#       RULED 4 by David 2026-08-26, verbatim: "you run it using 4 pairs
-#       instead of 2 of 8 batches" -- 8 prompts x 4 pairs is the
-#       challenger-grade sample mass the ruling buys. SUPERSESSION CHAIN, each
-#       link superseding the one above it:
-#         1. batch-8 brief D2 -- default 4;
-#         2. David 2026-08-24 ("do 2") -- RULED 2, landed in benchd as commit
-#            bb1a6216655912b8a57967bb9cd45cff973a82df, merged PR #184 at
-#            047e21833a66264310307e1cb86ae3a290b0fc27 on the
-#            qwen3.8-125b-a6b-cuda-v1 release branch;
-#         3. David 2026-08-26 -- RULED 4 (this value), returning to the
-#            brief's sample count on sample-mass grounds.
-#       CHANNEL AGREEMENT WAS A TWO-PHASE LANDING, and it has landed: the
-#       benchd side (PAIRS_PER_COHORT_TARGET 2 -> 4) merged and PUBLISHED, so
-#       the served channel now compiles `PAIRS_PER_COHORT_TARGET: usize = 4`
-#       (dist channel qwen3.8-125b-a6b-v1, source_commit 8439d6fe, verified
-#       2026-08-30). An OFFICIAL run declaring target_pairs=4 is accepted; the
-#       earlier ruled-ahead-of-pin state (the channel compiling 2 and refusing
-#       4) is closed. See docs/qwen38-125b-a6b-port-notes.md
-#       section 3 (which this dict's value must always match) for the full citation
-#       chain. NOT machine-cross-checked against the pinned benchd source here
-#       -- CI runs this linter without a benchd checkout, so that check could
-#       only ever run locally; docs/qwen38-125b-a6b-port-notes.md remains
-#       the load-bearing, always-visible instrument for any future drift of
-#       this kind.
-#   minPairsPerCohort = 4
-#       ENFORCED AT THE PIN, same as pairsPerCohort. benchd refuses an OFFICIAL
-#       batched cohort run whose min_pairs != PAIRS_PER_COHORT_TARGET, by name,
-#       at the same pre-GPU seam as the target refusal (--local-dev still
-#       explores other floors). Before that gate landed, benchd's only floor
-#       rule was the parse-time `min_pairs <= target_pairs`, so a run declaring
-#       min 2 / target 4 passed every trusted-side check and then published a
-#       median over half the ruled support; the ruled floor rode entirely on
-#       the wrapper's argv. It no longer does.
-#
-#       WHAT THIS LINTER ITSELF CHECKS, stated exactly, because the two are
-#       easy to conflate: it pins the value of scoring.minPairsPerCohort in
-#       benchmark.json against the registry below. It does NOT read
-#       tools/qwen38-125b-a6b-measure-and-score.sh, so it does not compare the manifest
-#       against the wrapper's actual --min-pairs literal -- a wrapper edited to
-#       --min-pairs 2 while this manifest still said 4 would not be caught HERE.
-#       That drift is caught at the pin instead: benchd refuses the run. The
-#       wrapper's --min-pairs 4 is a belt-and-suspenders DECLARATION of the
-#       ruled floor, and the wrapper lives under tools/ -- organizer-controlled,
-#       outside editablePaths -- so a submission cannot rewrite it either way.
+#   pairsPerCohort / minPairsPerCohort -- NOT PINNED HERE, CONFIGURABLE
+#       The count is a track setting, not a constant: it is whatever the track
+#       fixture declares as official_pairs (2 today, David 2026-09-09 ("move to 2 pairs on both mlx and cuda for
+#       now"; "1 pair is not sufficient"), superseding the 2026-08-26 ruling of
+#       4 that was written for the Gemma batched cohort and never read on this
+#       track's paired path. THE ENFORCED VALUE LIVES IN THE TRACK FIXTURE:
+#       benchd reads `official_pairs` from the --contract fixture and refuses a
+#       ranked run whose fixture does not declare it. benchmark.json carries the
+#       same number for readers, and check_scoring below fails when the two
+#       disagree, so the manifest can never say one count while the box runs
+#       another. Each pair is one serial-control leg on the reference tree and
+#       one candidate leg; per role the per-token times are summed over the
+#       pairs and the score is the ratio of the sums.
 _QWEN38_125B_A6B_CUDA_V1_SCORING = {
     "mode": "qwen-native-mtp-paired-decode-only",
     "scoredBatchSize": 1,
@@ -223,8 +186,6 @@ _QWEN38_125B_A6B_CUDA_V1_SCORING = {
     "decodeSpeedupFloor": 0.90,
     "decodeSpeedupCeiling": 5.0,
     "scoredExponents": {"prefillGainExponent": 0.25, "decodeGainExponent": 0.75},
-    "pairsPerCohort": 4,
-    "minPairsPerCohort": 4,
 }
 
 EXPECTED_SCORING_BY_TRACK = {
@@ -1154,6 +1115,25 @@ class Linter:
                     f"scoring: agrees with contract scoring_semantics on all "
                     f"{len(CONTRACT_SCORING_MIRROR)} shared constants"
                 )
+
+        # The pair count is CONFIGURABLE per track and lives in the fixture as
+        # official_pairs (the value benchd enforces). It is not pinned here: this
+        # check only requires a positive integer in the fixture and the manifest's
+        # readers' copies (pairsPerCohort, minPairsPerCohort) to state that number.
+        official_pairs = contract.get("official_pairs")
+        if not isinstance(official_pairs, int) or isinstance(official_pairs, bool) or official_pairs < 1:
+            self.fail(
+                f"contract official_pairs: {official_pairs!r} -- benchd refuses a ranked run "
+                "whose fixture does not declare a positive integer pair count"
+            )
+        elif scoring.get("pairsPerCohort") != official_pairs or scoring.get("minPairsPerCohort") != official_pairs:
+            self.fail(
+                f"scoring.pairsPerCohort = {scoring.get('pairsPerCohort')!r} / minPairsPerCohort = "
+                f"{scoring.get('minPairsPerCohort')!r} disagree with contract official_pairs = "
+                f"{official_pairs!r}; benchd runs the fixture's count"
+            )
+        else:
+            self.ok(f"scoring.pairsPerCohort/minPairsPerCohort: both state the fixture's official_pairs = {official_pairs}")
 
         if scoring.get("decodeSpeedupFloor", 0) >= scoring.get("decodeSpeedupCeiling", 0):
             self.fail("scoring: decodeSpeedupFloor is not below decodeSpeedupCeiling")
