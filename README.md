@@ -233,10 +233,11 @@ live field is `spec`, and `tools/spec-declaration.sh` reads it:
 "spec": { "enabled": true, "num_speculative_tokens": 1 }
 ```
 
-The other keys are recorded, not read. `source` is `"pinned"`: the only head
-that can load is the organizer-staged one, and the value selects nothing.
-`max_bytes`, `bytes` and `sha256` are not checked against the staged head;
-`./setup.sh` verifies the head bytes against the contract's own pin instead.
+`source` must be `"pinned"`, and an unknown top-level key is refused by name;
+`tools/spec-declaration.sh` checks both. The only head that can load is the
+organizer-staged one, so the value selects nothing. `max_bytes`, `bytes` and
+`sha256` are recorded, not read; `./setup.sh` verifies the head bytes against
+the contract's own pin instead.
 
 A declared `sha256` is optional and the runner does not verify it against the
 head bytes. The head bytes are bound one level up: the head is part of the
