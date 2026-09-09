@@ -107,9 +107,9 @@ pub const MOCK_PEAK_RAM_GB: f64 = 18.5;
 pub const PREFILL_BASE: i64 = 100_000;
 pub const SEED_BASE: i64 = 200_000;
 
-/// The MTP envelope's ceiling on this track: permitted depths are 1 to 6
+/// The MTP envelope's ceiling on this track: permitted depths are 1, 2 and 3
 /// (`fixtures/qwen3_8_125b_a6b_track.json` `mtp_head.permitted_draft_depths`).
-/// An EXPLICITLY REQUESTED depth outside 1...6 is REFUSED (benchd echoes an
+/// An EXPLICITLY REQUESTED depth outside 1...3 is REFUSED (benchd echoes an
 /// explicit request verbatim, so a clamp would read as divergence); an ABSENT
 /// depth is the engine's to choose, and it chooses inside this bound.
 pub const MTP_MAX_DEPTH: i64 = 6;
