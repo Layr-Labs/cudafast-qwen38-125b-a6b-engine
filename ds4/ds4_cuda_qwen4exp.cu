@@ -1253,6 +1253,84 @@ __global__ static void qwen4exp_moe_group_scan_kernel(
     if (lane == 0u) active[0] = live;
 }
 
+/* The shipped router admits at most 512 experts.  Scan that fixed envelope in
+ * parallel: both prefixes use integers, so this produces exactly the reference
+ * offsets, cursor values, live count, and ascending active-expert list.  Slots
+ * above n_expert carry zero and make non-power-of-two expert counts safe. */
+enum { QWEN4EXP_MOE_SCAN_THREADS = 512 };
+
+__global__ static void qwen4exp_moe_group_scan_parallel_kernel(
+        int32_t *offsets,
+        int32_t *cursor,
+        int32_t *active,
+        const int32_t *counts,
+        uint32_t n_expert) {
+    __shared__ int32_t warp_count_prefix[QWEN4EXP_MOE_SCAN_THREADS / 32];
+    __shared__ int32_t warp_live_prefix[QWEN4EXP_MOE_SCAN_THREADS / 32];
+    const uint32_t e = threadIdx.x;
+    const uint32_t lane = e & 31u;
+    const uint32_t warp = e >> 5u;
+    const int32_t count = e < n_expert ? counts[e] : 0;
+    int32_t count_prefix = count;
+    int32_t live_prefix = count > 0 ? 1 : 0;
+
+#pragma unroll
+    for (uint32_t delta = 1u; delta < 32u; delta <<= 1u) {
+        const int32_t prior_count =
+            __shfl_up_sync(0xffffffffu, count_prefix, delta);
+        const int32_t prior_live =
+            __shfl_up_sync(0xffffffffu, live_prefix, delta);
+        if (lane >= delta) {
+            count_prefix += prior_count;
+            live_prefix += prior_live;
+        }
+    }
+    if (lane == 31u) {
+        warp_count_prefix[warp] = count_prefix;
+        warp_live_prefix[warp] = live_prefix;
+    }
+    __syncthreads();
+
+    /* Warp zero scans the sixteen warp totals.  Lanes 16-31 carry zero but
+     * participate in every shuffle, keeping the full-warp mask valid. */
+    if (warp == 0u) {
+        const uint32_t n_warps = QWEN4EXP_MOE_SCAN_THREADS / 32;
+        int32_t warp_count = lane < n_warps ? warp_count_prefix[lane] : 0;
+        int32_t warp_live = lane < n_warps ? warp_live_prefix[lane] : 0;
+#pragma unroll
+        for (uint32_t delta = 1u; delta < 32u; delta <<= 1u) {
+            const int32_t prior_count =
+                __shfl_up_sync(0xffffffffu, warp_count, delta);
+            const int32_t prior_live =
+                __shfl_up_sync(0xffffffffu, warp_live, delta);
+            if (lane >= delta) {
+                warp_count += prior_count;
+                warp_live += prior_live;
+            }
+        }
+        if (lane < n_warps) {
+            warp_count_prefix[lane] = warp_count;
+            warp_live_prefix[lane] = warp_live;
+        }
+    }
+    __syncthreads();
+
+    if (warp > 0u) {
+        count_prefix += warp_count_prefix[warp - 1u];
+        live_prefix += warp_live_prefix[warp - 1u];
+    }
+
+    if (e < n_expert) {
+        const int32_t offset = count_prefix - count;
+        offsets[e] = offset;
+        cursor[e] = offset;
+        if (count > 0) active[live_prefix] = (int32_t)e;
+    }
+    if (e == 0u) {
+        active[0] = warp_live_prefix[QWEN4EXP_MOE_SCAN_THREADS / 32 - 1u];
+    }
+}
+
 __global__ static void qwen4exp_moe_group_scatter_kernel(
         int32_t *pairs,
         int32_t *cursor,
@@ -2254,8 +2332,15 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     }
     qwen4exp_moe_group_count_kernel<<<pair_blocks, threads, 0, stream>>>(
             sc.counts, (const int32_t *)selected->ptr, n_total_expert, n_pairs);
-    qwen4exp_moe_group_scan_kernel<<<1, 32, 0, stream>>>(
-            sc.offsets, sc.cursor, sc.active, sc.counts, n_total_expert);
+    if (n_total_expert <= QWEN4EXP_MOE_SCAN_THREADS &&
+        getenv("DS4_QWEN4EXP_SERIAL_GROUP_SCAN") == NULL) {
+        qwen4exp_moe_group_scan_parallel_kernel<<<
+                1, QWEN4EXP_MOE_SCAN_THREADS, 0, stream>>>(
+                sc.offsets, sc.cursor, sc.active, sc.counts, n_total_expert);
+    } else {
+        qwen4exp_moe_group_scan_kernel<<<1, 32, 0, stream>>>(
+                sc.offsets, sc.cursor, sc.active, sc.counts, n_total_expert);
+    }
     qwen4exp_moe_group_scatter_kernel<<<pair_blocks, threads, 0, stream>>>(
             sc.pairs, sc.cursor, (const int32_t *)selected->ptr, n_total_expert,
             n_pairs);

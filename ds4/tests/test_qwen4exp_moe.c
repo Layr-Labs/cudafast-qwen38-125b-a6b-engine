@@ -723,6 +723,30 @@ static void run_row_invariance_case(const uint8_t *model,
             fail("a width the speculative cycle runs is not bit-identical to a "
                  "serial decode");
         }
+        float *reference_scan = calloc((size_t)w * OUT_DIM, sizeof(float));
+        if (!reference_scan) fail("reference group-scan comparison allocation");
+        setenv("DS4_QWEN4EXP_SERIAL_GROUP_SCAN", "1", 1);
+        require_ok(ds4_gpu_qwen4exp_routed_moe_tensor(
+                       out_t, mid_t, part_t, &gate_slab, &up_slab, &down_slab,
+                       IN_DIM, MID_DIM, OUT_DIM, sel_t, w_t, N_EXPERT,
+                       N_EXPERT_USED, x_t, w, N_EXPERT_USED * MID_DIM),
+                   "reference group-scan routed MoE");
+        require_ok(ds4_gpu_qwen4exp_shared_expert_tensor(
+                       out_t, shmid_t, shgate_t, &sh_router_slab, &sh_gate_slab,
+                       &sh_up_slab, &sh_down_slab, IN_DIM, SHARED_MID, OUT_DIM,
+                       x_t, w),
+                   "reference group-scan shared expert");
+        require_ok(ds4_gpu_tensor_read(
+                       out_t, 0, reference_scan,
+                       (uint64_t)w * OUT_DIM * sizeof(float)),
+                   "reference group-scan read");
+        unsetenv("DS4_QWEN4EXP_SERIAL_GROUP_SCAN");
+        if (memcmp(got, reference_scan,
+                   (size_t)w * OUT_DIM * sizeof(float)) != 0) {
+            fail("parallel group scan differs from the reference metadata scan");
+        }
+        printf("  parallel group scan output matches reference at width %u\n", w);
+        free(reference_scan);
         free(got);
     }
 
@@ -934,6 +958,7 @@ static void run_group_scan_boundary_cases(void) {
         int32_t selected[SCAN_TOKENS * SCAN_MAX_USED];
         float weights[SCAN_TOKENS * SCAN_MAX_USED];
         float compact[SCAN_TOKENS * SCAN_DIM];
+        float reference_scan[SCAN_TOKENS * SCAN_DIM];
         float noncompact[SCAN_TOKENS * SCAN_DIM];
         float reused[SCAN_TOKENS * SCAN_DIM];
         float narrow[SCAN_TOKENS * SCAN_DIM];
@@ -954,6 +979,19 @@ static void run_group_scan_boundary_cases(void) {
                       "scan boundary compact call");
         require_ok(ds4_gpu_tensor_read(out_t, 0, compact, sizeof(compact)),
                    "scan boundary compact read");
+
+        require_ok(setenv("DS4_QWEN4EXP_SERIAL_GROUP_SCAN", "1", 1) == 0,
+                   "scan boundary reference environment");
+        run_scan_call(out_t, mid_t, part_t, &gate_slab, &up_slab, &down_slab,
+                      selected_t, weights_t, n_total, n_used, x_t, SCAN_TOKENS,
+                      "scan boundary reference call");
+        require_ok(unsetenv("DS4_QWEN4EXP_SERIAL_GROUP_SCAN") == 0,
+                   "scan boundary reference environment restore");
+        require_ok(ds4_gpu_tensor_read(out_t, 0, reference_scan,
+                                       sizeof(reference_scan)),
+                   "scan boundary reference read");
+        if (memcmp(compact, reference_scan, sizeof(compact)) != 0)
+            fail("parallel group scan differs from reference at boundary");
 
         /* Change the routing in the shared scratch, then restore the original.
          * Stale counts/cursors/active ids must not survive the intervening call. */
