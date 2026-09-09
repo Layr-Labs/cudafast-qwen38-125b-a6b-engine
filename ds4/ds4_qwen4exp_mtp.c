@@ -727,8 +727,9 @@ int ds4_qwen4exp_mtp_head_init(ds4_qwen4exp_mtp_head *h,
     h->t_mix_wide     = mtp_alloc(rows * hc_dim * f, &ok);
     h->t_sample       = mtp_alloc(rows * n_embd * f, &ok);
     h->t_logits       = mtp_alloc(rows * h->n_vocab * f, &ok);
-    h->logits_host    = malloc((size_t)(rows * h->n_vocab * f));
-    if (!ok || !h->logits_host) {
+    h->t_top1         = mtp_alloc(rows * sizeof(uint32_t), &ok);
+    h->top1_host      = malloc((size_t)rows * sizeof(uint32_t));
+    if (!ok || !h->top1_host) {
         ds4_qwen4exp_mtp_head_free(h);
         return mtp_fail(err, errlen,
                         "qwen4exp MTP head: scratch allocation failed for %u "
@@ -742,7 +743,7 @@ void ds4_qwen4exp_mtp_head_free(ds4_qwen4exp_mtp_head *h) {
     ds4_gpu_tensor *all[] = {
         h->t_tokens, h->t_embed_rows, h->t_embed_out, h->t_e_normed,
         h->t_h_normed, h->t_ehx, h->t_hyper, h->t_mix_normed,
-        h->t_mix_lowrank, h->t_mix_wide, h->t_sample, h->t_logits,
+        h->t_mix_lowrank, h->t_mix_wide, h->t_sample, h->t_logits, h->t_top1,
     };
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
         ds4_gpu_tensor_free(all[i]);
@@ -750,8 +751,9 @@ void ds4_qwen4exp_mtp_head_free(ds4_qwen4exp_mtp_head *h) {
     h->t_tokens = h->t_embed_rows = h->t_embed_out = h->t_e_normed = NULL;
     h->t_h_normed = h->t_ehx = h->t_hyper = h->t_mix_normed = NULL;
     h->t_mix_lowrank = h->t_mix_wide = h->t_sample = h->t_logits = NULL;
-    free(h->logits_host);
-    h->logits_host = NULL;
+    h->t_top1 = NULL;
+    free(h->top1_host);
+    h->top1_host = NULL;
 }
 
 /*
@@ -776,17 +778,19 @@ enum {
     MTP_HEAD_T_BLOCK,
     MTP_HEAD_T_MIXER,
     MTP_HEAD_T_LM_HEAD,
+    MTP_HEAD_T_TOP1,
     MTP_HEAD_T_END,
-    MTP_HEAD_T_LOGITS_IN,
+    MTP_HEAD_T_TOP1_IN,
+    MTP_HEAD_T_LOGIT0_IN,
     MTP_HEAD_T_MULTI_OUT,
-    MTP_HEAD_T_ARGMAX,
     MTP_HEAD_T_N
 };
 
 static const char *const mtp_head_stage_names[MTP_HEAD_T_N] = {
     "token upload", "multi upload", "embed", "enorm", "hnorm",
     "ehx copies", "eh_proj", "block", "hc mixer", "lm head",
-    "end commands", "logit readback", "multi readback", "argmax"
+    "gpu top-1", "end commands", "top-1 readback", "logit-0 readback",
+    "multi readback"
 };
 
 static uint64_t mtp_head_stage_ns[MTP_HEAD_T_N];
@@ -831,8 +835,8 @@ static int mtp_head_time_on(void) {
     } while (0)
 
 /* The forward proper.  `last_only` narrows the readback to the final row:
- * one row of logits and one argmax into draft_out[0], one `hyper` row into
- * multi_out.  Nothing the device computes changes with it. */
+ * one top-1 id plus its entry-zero logit, and one `hyper` row into multi_out.
+ * The logits and their device-side top-1 reduction still run for every row. */
 static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                                  const int *next_tokens,
                                  const float *multi_in,
@@ -966,23 +970,54 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                                   h->t_sample, n_tokens) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_LM_HEAD);
+    if (ok) {
+        stage = "gpu top-1";
+        /* The head exposes only draft ids.  Keep the LM-head arithmetic intact,
+         * reduce each finite logit row on the device and read back one id
+         * instead of the full vocabulary row for a host scan. */
+        ok = ds4_gpu_indexer_topk_tensor(h->t_top1, h->t_logits,
+                                         h->n_vocab, n_tokens, 1u) != 0;
+    }
+    MTP_HEAD_TICK(MTP_HEAD_T_TOP1);
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
     MTP_HEAD_TICK(MTP_HEAD_T_END);
 
-    /* Which rows come back: every one, or the last alone.  The rows before
-     * the last are seeds in the last_only case and their logits are never
-     * read, so the readback and the argmax skip them. */
+    /* Which results come back: every one, or the last alone.  The rows before
+     * the last are seeds in the last_only case; reducing them is cheap, and
+     * only the final id and its entry-zero logit cross to the host. */
     const uint32_t first_row = last_only ? n_tokens - 1u : 0u;
     const uint32_t out_rows = n_tokens - first_row;
     if (ok) {
-        stage = "logit readback";
-        ok = ds4_gpu_tensor_read(h->t_logits,
-                                 (uint64_t)first_row * h->n_vocab * f,
-                                 h->logits_host,
-                                 (uint64_t)out_rows * h->n_vocab * f) != 0;
+        stage = "top-1 readback";
+        ok = ds4_gpu_tensor_read(h->t_top1,
+                                 (uint64_t)first_row * sizeof(uint32_t),
+                                 h->top1_host,
+                                 (uint64_t)out_rows * sizeof(uint32_t)) != 0;
     }
-    MTP_HEAD_TICK(MTP_HEAD_T_LOGITS_IN);
+    MTP_HEAD_TICK(MTP_HEAD_T_TOP1_IN);
+    if (ok) {
+        stage = "logit-0 readback";
+        for (uint32_t t = 0; ok && t < out_rows; t++) {
+            float logit0;
+            const uint64_t row = (uint64_t)first_row + t;
+            ok = ds4_gpu_tensor_read(h->t_logits,
+                                     row * h->n_vocab * f,
+                                     &logit0, sizeof(logit0)) != 0;
+            /* The former CPU scan seeded its comparison with row[0].  A NaN
+             * there therefore kept token zero regardless of later values;
+             * the generic GPU reducer deliberately ignores NaNs.  Preserve
+             * the MTP proposal contract without changing that shared reducer. */
+            if (ok) {
+                uint32_t logit0_bits;
+                memcpy(&logit0_bits, &logit0, sizeof(logit0_bits));
+                if ((logit0_bits & 0x7fffffffu) > 0x7f800000u) {
+                    h->top1_host[t] = 0u;
+                }
+            }
+        }
+    }
+    MTP_HEAD_TICK(MTP_HEAD_T_LOGIT0_IN);
     if (ok && multi_out) {
         stage = "multi readback";
         ok = ds4_gpu_tensor_read(h->t_hyper,
@@ -996,10 +1031,8 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                         "rows", stage, pos0, n_tokens);
     }
     for (uint32_t t = 0; t < out_rows; t++) {
-        draft_out[t] = ds4_qwen4exp_mtp_argmax(
-            h->logits_host + (size_t)t * h->n_vocab, h->n_vocab);
+        draft_out[t] = (int)h->top1_host[t];
     }
-    MTP_HEAD_TICK(MTP_HEAD_T_ARGMAX);
     if (timing) mtp_head_stage_calls++;
     return 0;
 }

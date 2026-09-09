@@ -22,6 +22,7 @@
 
 #include "../ds4_qwen4exp_mtp.h"
 
+#include <math.h>
 #include <stdarg.h>
 
 #include <stdio.h>
@@ -1550,6 +1551,32 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_off,
     memmove(dst->data + dst_off, src->data + src_off, (size_t)bytes);
     return 1;
 }
+int ds4_gpu_indexer_topk_tensor(ds4_gpu_tensor *selected,
+                                const ds4_gpu_tensor *scores,
+                                uint32_t n_comp, uint32_t n_tokens,
+                                uint32_t top_k) {
+    if (!selected || !scores || top_k != 1u ||
+        scores->bytes < (uint64_t)n_comp * n_tokens * sizeof(float) ||
+        selected->bytes < (uint64_t)n_tokens * sizeof(uint32_t)) {
+        return 0;
+    }
+    uint32_t *out = (uint32_t *)selected->data;
+    const float *in = (const float *)scores->data;
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        const float *row = in + (size_t)t * n_comp;
+        float best_v = -INFINITY;
+        uint32_t best_i = 0u;
+        for (uint32_t i = 0; i < n_comp; i++) {
+            const float v = row[i];
+            if (v > best_v || (v == best_v && i < best_i)) {
+                best_v = v;
+                best_i = i;
+            }
+        }
+        out[t] = best_i;
+    }
+    return 1;
+}
 int ds4_gpu_begin_commands(void) { return 1; }
 int ds4_gpu_end_commands(void) { return 1; }
 int ds4_gpu_synchronize(void) { return 1; }
@@ -1607,6 +1634,8 @@ typedef struct {
 static head_log g_log;
 static const float *g_head_map;
 static const float *g_target_map;
+static const float *g_forced_lm_logits;
+static uint32_t g_forced_lm_rows;
 
 static void log_call(const char *what) {
     if (g_log.n_log < 16) {
@@ -1653,6 +1682,12 @@ static int stub_matmul(ds4_gpu_tensor *out, const void *map, uint64_t map_size,
         g_log.mm_ntok[g_log.n_mm] = n_tok;
         g_log.mm_map[g_log.n_mm] = map;
         g_log.n_mm++;
+    }
+    if (g_forced_lm_logits && map == g_target_map && offset == OFF_OUTPUT) {
+        if (n_tok > g_forced_lm_rows || out_dim != HEAD_N_VOCAB) return 0;
+        memcpy(out->data, g_forced_lm_logits,
+               (size_t)n_tok * HEAD_N_VOCAB * sizeof(float));
+        return 1;
     }
     const float *w = map_at(map, offset);
     const float *xs = (const float *)x->data;
@@ -1985,12 +2020,65 @@ static void test_head_wiring(void) {
         printf("  last-row entry agrees with the wide forward's final row\n");
     }
 
+    /* The CUDA top-1 reducer seeds every lane with -infinity and ignores NaNs.
+     * The historical CPU scan instead seeds from entry zero, so a NaN there
+     * pins the proposal to token zero.  Exercise the real head forward around
+     * that one semantic difference, while retaining coverage for later NaNs,
+     * ties, signed zero and infinities. */
+    {
+        static const float cases[][HEAD_ROWS * HEAD_N_VOCAB] = {
+            {
+                NAN, -INFINITY, 2.0f, 9.0f, 8.0f, -0.0f, +0.0f, 1.0f,
+                -INFINITY, -0.0f, +0.0f, NAN, 5.0f, 5.0f, -INFINITY, 4.0f,
+            },
+            {
+                -INFINITY, -INFINITY, NAN, -INFINITY,
+                -INFINITY, -INFINITY, -INFINITY, -INFINITY,
+                1.0f, INFINITY, NAN, INFINITY, -INFINITY, 0.0f, -0.0f, 3.0f,
+            },
+            {
+                -0.0f, +0.0f, NAN, -0.0f, +0.0f, -INFINITY, -0.0f, +0.0f,
+                NAN, -INFINITY, 3.0f, 11.0f, 10.0f, +0.0f, -0.0f, 9.0f,
+            },
+        };
+        for (uint32_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+            int got[HEAD_ROWS] = { -1, -1 };
+            int got_last[1] = { -1 };
+            g_forced_lm_logits = cases[c];
+            g_forced_lm_rows = HEAD_ROWS;
+            CHECK(ds4_qwen4exp_mtp_head_forward(&h, next_tokens, multi_in,
+                                                 12u, HEAD_ROWS, got, NULL,
+                                                 g_err, sizeof(g_err)) == 0,
+                  "special-value head forward failed: %s", g_err);
+            for (uint32_t t = 0; t < HEAD_ROWS; t++) {
+                const int want = ds4_qwen4exp_mtp_argmax(
+                    cases[c] + (size_t)t * HEAD_N_VOCAB, HEAD_N_VOCAB);
+                CHECK(got[t] == want,
+                      "special-value case %u row %u drafted %d, CPU reference %d",
+                      c, t, got[t], want);
+            }
+            CHECK(ds4_qwen4exp_mtp_head_forward_last(
+                      &h, next_tokens, multi_in, 12u, HEAD_ROWS, got_last,
+                      NULL, g_err, sizeof(g_err)) == 0,
+                  "special-value last-row forward failed: %s", g_err);
+            CHECK(got_last[0] == got[HEAD_ROWS - 1u],
+                  "special-value case %u last-only drafted %d, multi-row %d",
+                  c, got_last[0], got[HEAD_ROWS - 1u]);
+        }
+        g_forced_lm_logits = NULL;
+        g_forced_lm_rows = 0u;
+        printf("  GPU-style top-1 matches CPU proposals for NaNs, ties, "
+               "signed zero and infinities\n");
+    }
+
     /* A row count above the built capacity is refused by name. */
     CHECK(ds4_qwen4exp_mtp_head_forward(&h, next_tokens, multi_in, 0u,
                                         HEAD_ROWS + 1u, draft, NULL,
                                         g_err, sizeof(g_err)) < 0,
           "the head accepted more rows than it was built for");
     ds4_qwen4exp_mtp_head_free(&h);
+    CHECK(h.t_top1 == NULL && h.top1_host == NULL,
+          "the head left its top-1 scratch allocated after free");
 
     /* The shipped head's eh_proj is [5120, 2560]: the embedding half occupies
      * the first n_embd input rows and the hidden half the rest, so a head that
