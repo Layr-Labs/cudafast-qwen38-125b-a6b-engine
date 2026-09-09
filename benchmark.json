@@ -54,7 +54,8 @@
     "kvBackend": "contiguous",
     "pairsPerCohort": 2,
     "minPairsPerCohort": 2,
-    "decodeSpeedupFloor": 0.9,
+    "decodeSpeedupFloor": 0.95,
+    "prefillSpeedupFloor": 0.95,
     "decodeSpeedupCeiling": 5.0
   },
   "leaderboard": {

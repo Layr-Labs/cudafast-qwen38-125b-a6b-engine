@@ -46,7 +46,8 @@ What it asserts, in order:
                         qwen3.8-125b-a6b-cuda-v1 are ruled differently and neither's
                         pins apply to the other), and agree with the contract
                         fixture's scoring_semantics where both state a value, and
-                        the fixture's official_pairs (the count benchd enforces).
+                        the fixture's official_pairs, decode_speedup_floor and
+                        prefill_speedup_floor (the values benchd enforces).
                         A manifest value ruled AHEAD of the pinned benchd is
                         NOT machine-cross-checked against benchd here -- benchd is a
                         prebuilt binary now, not a source tree this linter could
@@ -179,11 +180,20 @@ _QWEN_MTP_V1_SCORING = {
 #       another. Each pair is one serial-control leg on the reference tree and
 #       one candidate leg; per role the per-token times are summed over the
 #       pairs and the score is the ratio of the sums.
+#   decodeSpeedupFloor / prefillSpeedupFloor -- NOT PINNED HERE, CONFIGURABLE
+#       The floors are 0.95 on BOTH axes (David 2026-09-09): a candidate that
+#       regresses either axis by more than 5 % is refused. They are track
+#       settings, like the pair count, and the enforced values live in the track
+#       fixture as `decode_speedup_floor` and `prefill_speedup_floor`.
+#       benchmark.json carries the same two numbers for readers, and
+#       check_scoring below fails when the two files disagree. The earlier
+#       0.90 decode floor and the absent prefill floor were authoring errors:
+#       0.90 is the qwen3.8-27b-mtp-v1 free-run constant and never governed
+#       this track's composite.
 _QWEN38_125B_A6B_CUDA_V1_SCORING = {
     "mode": "qwen-native-mtp-paired-decode-only",
     "scoredBatchSize": 1,
     "kvBackend": "contiguous",
-    "decodeSpeedupFloor": 0.90,
     "decodeSpeedupCeiling": 5.0,
     "scoredExponents": {"prefillGainExponent": 0.25, "decodeGainExponent": 0.75},
 }
@@ -1134,6 +1144,28 @@ class Linter:
             )
         else:
             self.ok(f"scoring.pairsPerCohort/minPairsPerCohort: both state the fixture's official_pairs = {official_pairs}")
+
+        # The speedup floors are CONFIGURABLE per track too, and the fixture is
+        # the authority: benchd reads `decode_speedup_floor` and
+        # `prefill_speedup_floor` from the --contract fixture. benchmark.json's
+        # readers' copies must state the same two numbers.
+        for fkey, mkey in (
+            ("decode_speedup_floor", "decodeSpeedupFloor"),
+            ("prefill_speedup_floor", "prefillSpeedupFloor"),
+        ):
+            floor = contract.get(fkey)
+            if not isinstance(floor, (int, float)) or isinstance(floor, bool) or not 0 < floor <= 1:
+                self.fail(
+                    f"contract {fkey}: {floor!r} -- the fixture must declare a speedup floor "
+                    "above 0 and at or below 1; benchd refuses a candidate below it"
+                )
+            elif scoring.get(mkey) != floor:
+                self.fail(
+                    f"scoring.{mkey} = {scoring.get(mkey)!r} disagrees with contract "
+                    f"{fkey} = {floor!r}; benchd enforces the fixture's floor"
+                )
+            else:
+                self.ok(f"scoring.{mkey}: states the fixture's {fkey} = {floor}")
 
         if scoring.get("decodeSpeedupFloor", 0) >= scoring.get("decodeSpeedupCeiling", 0):
             self.fail("scoring: decodeSpeedupFloor is not below decodeSpeedupCeiling")

@@ -16,6 +16,8 @@
   "benchmark_name": "cudafast-qwen38-125b-a6b",
   "kv_backend": "contiguous",
   "scored_batch_size": 1,
+  "decode_speedup_floor": 0.95,
+  "prefill_speedup_floor": 0.95,
   "scored_exponents": {
     "prefill_gain_exponent": 0.25,
     "decode_gain_exponent": 0.75
