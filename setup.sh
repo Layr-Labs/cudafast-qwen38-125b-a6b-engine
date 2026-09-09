@@ -54,11 +54,17 @@ command -v jq >/dev/null 2>&1 || die "jq is required"
 # (the fixture's upstream_model_id / upstream_revision; README, "The pinned
 # artifacts"). The shards live under the variant directory and the draft head
 # under MTP/; the snapshot keeps them flat.
-UPSTREAM_MODEL_ID="$(jq -r '.target.upstream_model_id // empty' "${CONTRACT}")"
-UPSTREAM_REVISION="$(jq -r '.target.upstream_revision // empty' "${CONTRACT}")"
-UPSTREAM_VARIANT="$(jq -r '.target.upstream_variant // empty' "${CONTRACT}")"
-TARGET_BASE_URL="${MLXFAST_TARGET_BASE_URL:-https://huggingface.co/${UPSTREAM_MODEL_ID}/resolve/${UPSTREAM_REVISION}}"
 DEFAULT_SNAPSHOT_DIR="${ROOT_DIR}/reference_weights/Qwen3.8-Flash-Next-GGUF"
+
+resolve_target_source() {
+  # Read once, in step 2, when the default path may fetch.
+  UPSTREAM_MODEL_ID="$(jq -r '.target.upstream_model_id // empty' "${CONTRACT}")"
+  UPSTREAM_REVISION="$(jq -r '.target.upstream_revision // empty' "${CONTRACT}")"
+  UPSTREAM_VARIANT="$(jq -r '.target.upstream_variant // empty' "${CONTRACT}")"
+  [[ -n "${UPSTREAM_MODEL_ID}" && -n "${UPSTREAM_REVISION}" && -n "${UPSTREAM_VARIANT}" ]] \
+    || die "the contract names no upstream_model_id / upstream_revision / upstream_variant; cannot fetch a missing file"
+  TARGET_BASE_URL="${MLXFAST_TARGET_BASE_URL:-https://huggingface.co/${UPSTREAM_MODEL_ID}/resolve/${UPSTREAM_REVISION}}"
+}
 
 source_path_for() {
   # The repository path of one pinned file: the draft head under MTP/, a
@@ -89,8 +95,6 @@ download_pinned_file() {
   local dest="${SNAPSHOT_DIR}/${rel}" partial="${SNAPSHOT_DIR}/${rel}.partial"
   local url got_bytes got_sha
   url="${TARGET_BASE_URL}/$(source_path_for "${rel}")"
-  [[ -n "${UPSTREAM_MODEL_ID}" && -n "${UPSTREAM_REVISION}" && -n "${UPSTREAM_VARIANT}" ]] \
-    || die "the contract names no upstream_model_id / upstream_revision / upstream_variant; cannot fetch ${rel}"
   command -v curl >/dev/null 2>&1 || die "curl is required to download ${rel}"
   log "downloading ${rel} (${want_bytes} bytes) from ${url}"
   curl -fL --retry 5 --retry-delay 5 -C - -o "${partial}" "${url}" \
@@ -184,6 +188,7 @@ else
     mkdir "${setup_lock}" 2>/dev/null \
       || die "another setup is filling ${SNAPSHOT_DIR}, or a previous one left ${setup_lock}; remove it when no setup is running"
     trap 'rmdir "${setup_lock}" 2>/dev/null || true' EXIT
+    resolve_target_source
     # A file that is absent, or the wrong size, is fetched. A present file of
     # the right size is left for the digest pass below to judge.
     while IFS=$'\t' read -r rel want_bytes want_sha; do
