@@ -64,10 +64,11 @@ model.
 
 There is no sliding-window attention on this model.
 
-The speculative-decode arm is the native MTP head. It is embedded in the pinned
-target checkpoint under `language_model.mtp.*`: 76 tensors, 1 hidden layer,
-hybrid full attention. It has no embedding and no `lm_head` of its own. It
-rides the target's `language_model.embed_tokens` and `language_model.lm_head`.
+The speculative-decode arm is the native MTP head. It is a separate pinned
+Q8_0 GGUF (`mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`) that the organizer stages
+in the target snapshot beside the shards. `tools/serve-up.sh` passes it to the
+engine with `--mtp-model`. It carries 1 hidden layer of hybrid full attention.
+It has no embedding and no `lm_head` of its own: it rides the target's.
 
 `kv_backend` is pinned `contiguous` on both legs. The benchmarker refuses when
 it cannot honour the pinned backend. It does not degrade to another backend.
@@ -78,8 +79,9 @@ it cannot honour the pinned backend. It does not degrade to another backend.
 
 | Path | What it is |
 |---|---|
+| `ds4/` | The vendored ds4 engine (see section 3.5). |
 | `harness/` | The Engine Protocol v1 adapter (`harness/protocol-adapter`), the scored binary. |
-| `mtp-head/` | The MTP head area (see section 4). |
+| `mtp-head/` | The MTP head area (see section 4). It holds only its `README.md`. |
 | `mtp-head.manifest.json` | The MTP head declaration (see section 4). |
 
 The rule behind the list: anything that only **proposes** tokens or computes
@@ -89,8 +91,9 @@ contract (`fixtures/`), and this manifest.
 
 The scored engine is the Engine Protocol v1 adapter with the ds4 C/CUDA engine
 linked in-process (`harness/protocol-adapter`, `ds4/`). The `ds4/` tree is
-`Layr-Labs/ds4`, our port of `antirez/ds4`. It is pinned and read-only, and
-there is no patch overlay over it.
+`Layr-Labs/ds4`, our port of `antirez/ds4`, vendored as plain files. It is
+editable: you submit the engine you edited. `ds4/VENDOR.json` records the
+signed base the tree was exported from.
 
 ### 3.1 Optional paths
 
@@ -108,9 +111,9 @@ contract, never from the submission.
 
 | Key | Value |
 |---|---|
-| `maxTotalBytes` | 1048644 |
-| `maxFileBytes` | 524288 |
-| `maxGrowthBytes` | 262144 |
+| `maxTotalBytes` | 19550883 |
+| `maxFileBytes` | 4473321 |
+| `maxGrowthBytes` | 19550883 |
 | `exemptPathMaxBytes` | 512000000 |
 | `exemptPathMaxFileBytes` | 100000000 |
 
@@ -126,9 +129,9 @@ compiled-in fallbacks, and this manifest is what holds those constants to a
 reviewed value. `tools/lint-benchmark-manifest.py` check 3b enforces that
 equality.
 
-No head weight file is staged, so this budget never meets one. The head is part
-of the pinned target checkpoint, which is outside the editable surface. What
-the runner LOADS is bounded instead by the 2 GiB declaration cap in section 4.
+No head weight file is staged in an editable path, so this budget never meets
+one. The head sits in the organizer-staged target snapshot, which is outside the
+editable surface.
 
 ### 3.3 What you may not edit
 
@@ -138,57 +141,41 @@ tokenizer, the goldens, the gates, and the timing and telemetry code.
 `fixtures/` is outside the editable surface. The scoring step reads the contract
 from the trusted checkout for that reason.
 
-### 3.4 The target quantization is frozen
+### 3.4 The weights are frozen
 
-The target model's quantization is frozen as shipped.
+The target model's quantization is frozen as shipped. So is the MTP head's.
 
-A submission must not re-quantize any target weight. It must not re-represent a
-target weight. It must not change the numerical format of a target weight. This
-holds even when the result passes every correctness gate.
+A submission must not re-quantize any weight. It must not re-represent one. It
+must not change the numerical format of one. It must not mirror one. This holds
+on disk and in memory, and it holds even when the result passes every
+correctness gate.
 
-No editable path licenses a change of target format. A lossier target
+No editable path licenses a change of weight format. A lossier target
 substitutes a degraded model. It does not optimize the accepted one.
 
-The MTP head is a narrow exception, and the exception is re-quantization only.
+The MTP head is no exception. It is the organizer's pinned weights, and the
+engine uses it exactly as staged. You may **not** re-quantize it. You may
+**not** replace it. You may **not** upload head weights of your own. Custom
+head weights are not accepted on this track.
 
-You may re-quantize the MTP head. You may **not** replace it. You may **not**
-upload head weights of your own. Custom head weights are not accepted on this
-track.
+The head is the organizer's pinned weights, staged with the target snapshot.
+`fixtures/qwen3_8_125b_a6b_track.json` names the repository and the variant, and
+its `target.files` list pins every shard and the MTP draft head by bytes and
+sha256; `./setup.sh` verifies the staged snapshot against that list. The
+contract fixture lives in `fixtures/`, which is outside the editable surface.
 
-This is the 2026-08-26 ruling. It replaces the earlier bring-your-own-head
-design, under which a participant could declare and ship a head of their own
-choosing. That design is retired.
+Two things enforce this, and section 4 states each one:
 
-The head is the organizer's pinned weights, because it is part of the pinned
-target checkpoint. `fixtures/qwen3_8_125b_a6b_track.json` names the repository
-and variant, and its `target.files` list pins every shard and the MTP draft
-head by bytes and sha256; `./setup.sh` verifies the staged snapshot against
-that list. The contract fixture lives in `fixtures/`, which is outside the
-editable surface.
+1. No editable path can hold head weights. The byte budget bars a weight file,
+   and a submission that carries one is refused.
+2. The head declaration selects nothing. `source` is `"pinned"`, and the
+   only head that can load is the organizer-staged one.
 
-Three things enforce this, and section 4 states each one:
+Nothing about the head is participant-tunable except the draft depth. Section
+4.1 states how you declare it.
 
-1. No head weights directory exists and no submission path can hold head
-   weights. A submission that carries a weight file is refused.
-2. The head declaration accepts `"source": "pinned"` only. `"remote"` and
-   `"in_branch"` are refused by name.
-3. A re-quantization happens on load, in memory, on the benchmark machine.
-   No re-quantized file is made, so there is no artifact to travel in a
-   submission. Section 4.4 states the mechanism.
-
-The loader reads a `quantization` block in the shape an MLX conversion writes.
-That block selects which modules load quantized and at what geometry. The
-accepted parameters are `group_size` (positive, at most 65536), `bits` between
-2 and 8, and optional per-layer overrides (at most 8192 entries). A value
-outside those bounds is refused by name.
-
-The MTP head loader does not check a declare-versus-carry mismatch. An absent
-declaration skips quantization, and packed weights then fail later inside the
-weight bind with a shape error. A declaration with no packed tensor quantizes
-nothing, silently. That limit is stated here rather than promised away.
-
-The reason for the whole exception is the propose-and-decide split. The head
-only proposes tokens. The pinned target model decides every emitted token.
+The reason is the propose-and-decide split. The head only proposes tokens. The
+pinned target model decides every emitted token.
 
 ### 3.5 Editing the engine
 
@@ -219,175 +206,104 @@ engine's session API (`ds4/ds4.h`: `ds4_session_sync`, `ds4_session_eval`,
 `ds4_session_eval_speculative_argmax`). The pinned port carries the `qwen4exp`
 model family, so the shim opens the target with no refusal.
 
-**Draft depth.** The pinned engine drafts **up to three** tokens per
+**Draft depth.** The pinned engine drafts **up to six** tokens per
 target-verified cycle (`ds4_session_eval_speculative_argmax` in `ds4.c`, which
-the port routes to `ds4_qwen4exp_mtp_cycle`). Depths **1, 2 and 3 all run** —
-the whole track envelope — and the depth that ran is echoed as `effective_spec`
-rather than clamped. A depth outside 1..3 is refused by name
-(`harness/protocol-adapter/src/ds4_backend.rs`, `DS4_IMPLEMENTED_DEPTH`, which
-must equal the vendored engine's `DS4_QWEN4EXP_IMPLEMENTED_DEPTH`).
+the port routes to `ds4_qwen4exp_mtp_cycle`). Depths **1 to 6 all run**: that is
+the whole track envelope (`mtp_head.permitted_draft_depths` in the contract
+fixture). The depth that ran is echoed as `effective_spec` rather than clamped.
+A depth outside 1 to 6 is refused by name. In
+`harness/protocol-adapter/src/ds4_backend.rs`, `MTP_MIN_DEPTH` is 1,
+`MTP_MAX_DEPTH` is 6, and `DS4_IMPLEMENTED_DEPTH` is 6. The last one must equal
+the vendored engine's `DS4_QWEN4EXP_IMPLEMENTED_DEPTH`.
 
 Depth 1 was the only implemented depth until the `e2f86b7` vendor-sync. Which
 depth is *fastest* is yours to find: a deeper draft proposes more per cycle and
 accepts less often.
 
-## 4. The embedded MTP head
+## 4. The MTP head
 
-The track carries one speculative head. It is the organizer's weights, because
-it is part of the pinned target checkpoint.
+The track carries one speculative head. It is the organizer's weights.
 
 | Item | Value |
 |---|---|
 | Declaration | `mtp-head.manifest.json` |
-| Where the weights are | A pinned Q8_0 GGUF in the target snapshot, beside the shards |
-| Organizer pin | `unsloth/Qwen3.8-Flash-Next-GGUF`, `UD-Q4_K_XL` |
+| Where the weights are | A separate pinned Q8_0 GGUF in the target snapshot, flat beside the shards |
+| File | `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` |
+| Organizer pin | `fixtures/qwen3_8_125b_a6b_track.json` `target.files`, by bytes and sha256 |
+| How the engine gets it | `tools/serve-up.sh` passes it with `--mtp-model` |
 
-The declaration file is editable. The checkpoint is not.
+The declaration file is editable. The head is not.
 
-Nothing stages a head weight file. There is no head stager and no head weights
-directory. `./setup.sh` provisions the target checkpoint, and the head arrives
-with it.
+Nothing in a submission stages a head weight file. There is no head stager and
+no head weights directory. `./setup.sh` verifies the target snapshot, and the
+head arrives with it.
 
 ### 4.1 What you may declare
 
-`"source": "pinned"` is the only accepted source. On this track it means the
-head embedded in the pinned target checkpoint. A declaration may also state
-`max_bytes` (it may lower the 2 GiB track cap and may not raise it), a `bytes`
-count, and an optional `sha256`. It carries no `arm` key; there is one arm, so
-there is nothing to select.
+`mtp-head.manifest.json` is editable and optional. Its live field is `spec`,
+which `tools/spec-declaration.sh` reads:
 
-`"source": "remote"` is refused by name. `"source": "in_branch"` is refused by
-name. Both were accepted before the 2026-08-26 ruling and both meant "load
-weights the participant chose". The refusal names the retired source and names
-`pinned` as what replaced it.
+```json
+"spec": { "enabled": true, "num_speculative_tokens": 1 }
+```
 
-An absent declaration selects the embedded head. A declaration that is present
-but broken is a refusal. The runner never falls back silently.
+`spec.enabled` is a boolean. `spec.num_speculative_tokens` is an integer. An
+enabled depth must be one of the contract's `mtp_head.permitted_draft_depths`,
+which are 1 to 6. An absent file, an absent `spec` block, `enabled: false`, or
+`num_speculative_tokens: 0` all mean serial: the drafter is off. An unknown key
+inside `spec` is refused by name, so a mistyped key never reads as its default.
+
+The other keys are recorded, not read. `source` is `"pinned"`: the only head
+that can load is the organizer-staged one, and the value selects nothing.
+`max_bytes`, `bytes` and `sha256` are not checked against the staged head;
+`./setup.sh` verifies the head bytes against the contract's own pin instead.
+
+The file carries no `arm` key. There is one arm, so there is nothing to select.
+
+A declaration that is present but broken is a refusal. The runner never falls
+back silently.
 
 ### 4.2 What you may not do
 
 You may not ship head weights. The editable byte budget bars them: a real head
-weight file far exceeds `maxFileBytes` (524288), so
+weight file far exceeds `maxFileBytes` (4473321), so
 `.github/scripts/submission-static-review-checks.sh` refuses it before any
 measurement. `.github/scripts/enforce-modifiable-surface.sh` refuses any file
 outside the editable surface, and `.github/scripts/overlay-editable-paths.sh`
-overlays only the declared editable paths from the trusted contract. The
-benchmarker's own write-divergence gate refuses any content that differs from
-the trusted baseline outside the editable surface. `mtp-head/` is an editable
-path (it holds only its `README.md`), but the byte budget still bars a weight
-file there.
+overlays only the declared editable paths from the trusted contract.
+`mtp-head/` is an editable path and it holds only its `README.md`, but the byte
+budget still bars a weight file there.
 
-You may not edit the checkpoint's head tensors. The checkpoint is not an
-editable path, so any change to it is outside the surface.
+You may not re-quantize the head. You may not re-cast it, mirror it, or alter it
+in any other way, on disk or in memory. The engine loads the staged bytes and
+uses them as they are.
+
+You may not edit the target snapshot. It is not an editable path, so any change
+to it is outside the surface.
 
 ### 4.3 What the size cap does and does not do
 
-The 2 GiB declaration cap (`max_bytes` = 2147483648) bounds what the runner
-loads.
+`max_bytes` is recorded, not read. Nothing bounds a load by it.
 
-The size cap is the only gate on the declaration. A declared `sha256` is
-optional, and the runner does not verify it against the head bytes. It treats a
-wrong digest and an absent digest alike. That is stated here plainly because it
-is a real limit, not a detail: **nothing in this repository binds the loaded
-head bytes to the organizer's pinned digests at run time.** The harness
-computes a head digest that it reports and never compares.
+A declared `sha256` is optional, and the runner does not verify it against the
+head bytes. It treats a wrong digest and an absent digest alike. That is stated
+here plainly because it is a real limit, not a detail: a declared digest is a
+statement of intent, not a check.
 
-What does bind at run time is relative, not absolute: the benchmarker compares
-the candidate workspace against the trusted baseline workspace and refuses any
-divergence outside the editable surface. A correctly provisioned baseline is
-therefore load-bearing for the whole property.
+The head bytes are bound one level up. They are part of the organizer-staged
+target snapshot, and `./setup.sh` verifies every staged file against the
+`{bytes, sha256}` pins in `target.files`. Both legs load the head out of that
+one verified snapshot.
 
-The head bytes themselves are bound one level up. They are part of the pinned
-target checkpoint, and the ranked box verifies every staged byte against the
-per-file digests in `target.sha256` beside the snapshot. Both legs load the
-head out of that one verified checkpoint.
-
-### 4.4 How a re-quantization reaches the box
-
-A re-quantization happens ON LOAD, in memory. Nothing on disk changes.
-
-You do not make a re-quantized checkpoint. Your code quantizes the head's
-parameters in memory, in the same pass that binds them. The staged bytes are
-only read.
-
-#### What to edit
-
-The head loader quantizes the head's parameters while it binds the checkpoint.
-That call is the seam. On this CUDA track the scored engine is the ds4 engine
-behind the Engine Protocol v1 adapter. `editablePaths` lists `harness`,
-`mtp-head` and `mtp-head.manifest.json`, so the seam lives in the adapter.
-The mechanism below is what that surface honours.
-
-Change the geometry that seam selects. The default reads the checkpoint's own
-quantization block. Your code may select a different geometry instead.
-
-Section 3.4 states the bounds the loader accepts: `group_size` positive and at
-most 65536, `bits` between 2 and 8, and at most 8192 per-layer overrides. A
-value outside those bounds is refused by name. The loader does not check a
-declare-versus-carry mismatch; section 3.4 states that limit.
-
-#### Why nothing is written
-
-Two properties follow from the in-memory rule, and both are why this mechanism
-is the safe one.
-
-1. The benchmarker compares the candidate workspace against the trusted
-   baseline workspace and refuses any change outside the editable surface. That
-   comparison reads the disk. A re-quantization on load is not a disk
-   operation, so there is nothing for the gate to see.
-2. The ranked worker runs under a sandbox profile that denies file writes. Code
-   that tried to rewrite a staged head would fail there.
-
-Do not rewrite the head tensors on disk. Do not rewrite them from `setup.sh` or
-from the `mlxfast-swift transform` command. Each of those runs before the
-workspace comparison, and the benchmarker refuses the change.
-
-#### What changes in the record
-
-The worker reports the digest of the head it loaded. That digest is the digest
-of the ORGANIZER's checkpoint bytes, before and after a re-quantization,
-because the bytes do not change. The geometry you selected is not visible in
-that digest.
-
-#### What this does not permit
-
-The exception is for the HEAD's OWN weights only. The target model's
-quantization stays frozen, as section 3.4 states.
-
-**The head is embedded, so the rule is drawn by module path.** David ruling
-2026-08-27, relayed by orchestrator: "Exempt mtp.* from the freeze."
-`language_model.mtp.*` loads into the target's own module tree, so the
-loaded-target check has to say which side of the line each module is on. It
-says it this way:
-
-| Module path | Treatment |
-|---|---|
-| `mtp.*` | EXEMPT. Re-quantize it on load. |
-| `mtp.*` naming `embed_tokens` or `lm_head` | REFUSED BY NAME. |
-| Everything else, `model.embed_tokens` and `lm_head` included | FROZEN. |
-
-**The shared tensors are the middle row, and they are shared for a real
-reason.** The head owns no embedding table and no output projection. It READS
-the target's embedding table for its next-token vectors and the target's output
-projection for its logits, which is what `use_dedicated_embeddings: false`
-means on this checkpoint. Those two tensors decide the TARGET's tokens.
-Coarsening one of them is a target re-quantization whatever path it is spelled
-under, so a quantized module inside the head subtree that names either one is
-refused, and the refusal says which shared tensor it reached.
-
-The target is verified TWICE, and both checks read the loaded model, not the
-declaration:
-
-1. At worker startup, immediately after the target is loaded.
-2. Again at the top of each window that gets measured, immediately before the
-   measured work starts.
-
-The second check exists because the first one alone verifies a model that code
-can still change afterwards. Both refuse by name, and a refusal stops the worker
-before any measurement.
+### 4.4 What the head does in a run
 
 The head only **proposes** tokens. The organizer-pinned target model decides
-every emitted token. The serial control leg always runs the embedded head.
+every emitted token.
+
+The serial control leg always runs with the drafter off
+(`--spec serial --draft-len 0`). The candidate leg runs at the depth the
+declaration names. Section 3.5 states the envelope, and section 7 states what
+each run seals.
 
 ## 5. Scoring
 
@@ -408,8 +324,7 @@ The score is serial-anchored. A faster candidate scores above 1.
 **THE SCORED SHAPE IS SINGLE-STREAM.** David ruling 2026-08-27, relayed by
 orchestrator: this track scores a PAIRED serial-against-MTP comparison over the
 pinned prompt pool, ONE stream at a time, at `scored_batch_size` 1. The batch-8
-cohort adaptation is NOT pursued. Section 11.4 states why: the batched path
-cannot run this model.
+cohort adaptation is NOT pursued.
 
 `aggregate` is the **per-prompt sum**. Run each of the 8 pinned prompts in its
 own single-stream window and add the 8 elapsed times together. Do this for
@@ -500,16 +415,6 @@ mtp leg. The mtp leg is the sharper case: it feeds tokens it may take back, so
 its forward count legitimately exceeds N, and what must hold is that its
 offsets land exactly on `seed + N` -- rollback took back the drafts and nothing
 else, and never re-prefilled.
-
-**NO SCORED RUN IS POSSIBLE ON THIS TRACK TODAY**, and section 11.4 states the
-full reason. The short form is that the benchmarker has to catch up with the
-ruling: at the published channel tip it certifies B = 8 as the ONE scored width
-and computes the composite only on the batched regime, so this fixture's
-`scored_batch_size` 1 refuses at its width certification. A separate bench lane
-carries the single-stream regime -- the certified width, the prefill window on
-the single-stream free-run verbs, and the exponent pair certified on the B = 1
-point. Until that lands, the refusal is the correct behavior, not a defect in
-this repository.
 
 ### 5.2 The measured window
 
@@ -681,7 +586,8 @@ token). A decode mean of 0.06451959972265625 s/tok is shown as 15.50 tok/s.
 
 | Object | Where it lives | Can you have it? |
 |---|---|---|
-| `correctness_prompts/public_longcopy_gate_english_1024_256.json` and `..._1024_1024.json` | Checked into git | **Yes.** They are already in your clone. See section 11.3. |
+| `correctness_prompts/public_longcopy_gate_english_1024_256.json` and `..._1024_1024.json` | Checked into git | **Yes.** They are Gemma-era captures kept for their 1024-token prompts; they do not load against the Qwen target. |
+| `correctness_prompts/public-longcopy-gate-english-1024.golden.json` | Checked into git | **Yes.** A public Qwen capture (`unsloth/Qwen3.8-Flash-Next-GGUF` @ `38bb39ee97821de2c9009abb7e93950eec396e66`) for local runs. |
 | `timed_prompt_pool[]`, 8 tapes | R2, at the `r2_path` keys the fixture pins. The ranked box stages them out of band into `MLXFAST_QWEN38_GOLDEN_DIR`. | **No.** They are organizer material and they are never in git. |
 | `live_golden_speculative{}`, 6 per-depth oracles | The same: R2 keys, staged on the box. | **No.** Same material, same handling. |
 | `hidden_correctness_golden` | The live golden, pinned by digest only. It is one of the staged files. | **No.** It is the token-fidelity oracle and it stays on the box. |
@@ -804,8 +710,8 @@ the box at a time. A second dispatch queues rather than cancelling the first.
 
 `setupCommand` is `./tools/fetch-benchd.sh && ./setup.sh`. It chains no head
 stager, because there is none. The checked-in `mtp-head.manifest.json` declares
-`"source": "pinned"`, and the head arrives inside the target checkpoint that
-`./setup.sh` downloads and verifies.
+`"source": "pinned"`, and the head arrives beside the target shards in the
+snapshot that `./setup.sh` verifies.
 
 ## 7. The pinned artifacts
 
@@ -814,36 +720,29 @@ stager, because there is none. The checked-in `mtp-head.manifest.json` declares
 | Target model | `unsloth/Qwen3.8-Flash-Next-GGUF`, variant `UD-Q4_K_XL` |
 | Target manifest | `fixtures/qwen3_8_125b_a6b_track.json` `target.files` (bytes + sha256 per file) |
 | Engine | vendored at `ds4/` from `Layr-Labs/ds4` @ `278b799b974cb580e0f96ed3dce68bfbe0d8675b` (`ds4/VENDOR.json`) |
-| MTP head | A pinned Q8_0 GGUF in the target snapshot |
-| Model fork revision | `ed55bee83beb0623152f4c2e70f0cf99ad379e35` |
+| MTP head | `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`, a pinned Q8_0 GGUF in the target snapshot |
 
 The staged snapshot holds the four main GGUF shards (111,334,654,784 bytes)
 and, flat beside them, the Q8_0 MTP draft head (2,786,568,256 bytes). The
 fixture pins all five by bytes and sha256.
 
-`Sources/MLXFastCore/Constants.swift` does NOT mirror this pin yet. It still
-carries the seed's Gemma checkpoint identity; that constant moves with the
-engine port (`docs/qwen38-125b-a6b-port-notes.md` section 7).
-
-The model repository is public and downloads without a token. There is no
-organizer-hosted mirror for this checkpoint, so
-`MLXFAST_REFERENCE_FALLBACK_BASE_URL` is empty by default.
+The model repository is public and downloads without a token.
 
 Participants never supply the target weights. Substituting or re-deriving the
 target is a failure.
 
-The rectangular cap is `B * (1 + k) <= 8` on M3 and later. Batch size is locked
-at 8.
+Batch size is locked at 1. The track is scored single-stream.
 
 You can select the draft depth. It is not pinned at 1.
 
-Your drafter code sets the depth. That code is an editable path, so the depth is
-a free lever. A request above the ceiling is clamped to the ceiling. It is not
-refused.
+You declare the depth in `mtp-head.manifest.json` under
+`spec.num_speculative_tokens`. That file is an editable path, so the depth is a
+free lever.
 
-The permitted values are 1, 2 and 3. The MTP envelope limits the depth to 3.
-The envelope is trusted code and is not an editable path: `maxDraftTokens` is 3,
-and `maxAutomaticRectangularTokens` is 32 at batch size 8.
+The permitted values are 1 to 6 (`mtp_head.permitted_draft_depths` in the track
+fixture). The envelope is trusted code and is not an editable path. A depth
+outside 1 to 6 is refused by name, never clamped, so the serve that boots and
+the `effective_spec` the adapter seals can never disagree.
 
 An absent depth does not mean 1. Two layers supply a depth when a request does
 not name one. Do not confuse them.
@@ -851,11 +750,7 @@ not name one. Do not confuse them.
 | Request | Result |
 |---|---|
 | benchd invocation gives no `--mtp-depth` | benchd measures at depth 2 |
-| the `mtp` block has no `depth` key | the envelope uses its ceiling of 3 |
-
-The `fixed_depth = 1` constant in the track fixture is a darkbloom reference
-constant. It records a protocol value that this track inherited. It is not a
-limit on your draft depth.
+| the `mtp` block has no `depth` key | the envelope uses its ceiling of 6 |
 
 Every run seals the depth that operated. Read `effective_spec` for the depth the
 run declared. Read `effective_mean_draft_len` for the draft length that the run
@@ -896,179 +791,8 @@ The ranked run on the official runner is the gate that ranks a submission.
 
 ## 10. License
 
-The pinned checkpoint carries the Qwen Community License 1.0. That is the
-license name the checkpoint records, not an SPDX identifier: the contract
-fixture records `"spdx": "other"` with `"license_name": "qwen-community-1.0"`.
-The terms ship with the checkpoint at its pinned revision.
-
-The checkpoint is a 4-bit MLX conversion of `Qwen/Qwen3.8-Flash-Next`.
+The pinned checkpoint is a GGUF conversion of `Qwen/Qwen3.8-Flash-Next`. The
+model's own license terms apply to it. They ship with the checkpoint at its
+pinned revision.
 
 This repository distributes no model weights.
-
-## 11. What is not in place yet
-
-Read this section before you conclude that something is broken.
-
-### 11.1 No ranked box is staged yet
-
-Section 5.5 states the arm state: `official_scoring_enabled` is `true`, and the
-timed prompt pool and the hidden correctness oracle are pinned to real goldens.
-The arm state is not what is missing.
-
-What is missing is the box. No runner advertises the ranked label set
-`[self-hosted, Linux, ARM64, qwen3.8-125b-a6b-cuda-v1]`, no box has the reference
-workspace staged and built (`tools/stage-baseline-workspace.sh`), and no box has
-a calibration file (`tools/calibrate-box.sh`). `tools/ranked-box-preflight.sh`
-refuses a dispatch until all three exist.
-
-The bench release branch and dist channel are `qwen3.8-125b-a6b-v1`, which is
-the PROJECT name, not this track's id. David ruling 2026-08-27: the MLX and
-CUDA tracks of this model share one benchmarker, so they share one channel. The
-track id `qwen3.8-125b-a6b-cuda-v1` is unchanged and still names the leaderboard
-namespace, the runner labels and the R2 prefix.
-
-THE CHANNEL RESOLVES FROM THE RELEASE BRANCH. Bench pull request 217 has
-merged. The release branch tip `56a9821a` carries the dist pair for
-`source_commit` `379f37fe8db99a4d5265f4f856b3612f5b3b13cc`, `sha256`
-`fb68adf8928600b4ae53cb773802e08f67ba9badccf40d1aa4985cea4c898d3c`, `bytes`
-2571088, and `./tools/fetch-benchd.sh` resolves and verifies it with no
-override: manifest branch, sha256 and byte count all check out.
-
-The channel host is the public bench repository `Layr-Labs/mlxfast-bench`, so
-`./tools/fetch-benchd.sh` needs no token. A verified pair through
-`BENCHD_DIST_LOCAL` still works.
-
-### 11.2 The model port HAS landed
-
-The engine constructs, gates, loads and runs `qwen4_exp_text`. The geometry in
-`Sources/MLXFastCore/Constants.swift`, its mirror in `Sources/MLXFastModel`,
-the checkpoint validator in `Sources/MLXFastTransform` and this contract's
-`target.*` block are all this target's, and they move as ONE SET: a gate
-holding some fields of one model and some of another rejects every checkpoint
-and explains none of them.
-
-The four `Qwen4Exp*.swift` model files are editable paths, as is
-`Sources/MLXFastModel`, which is where a submission changes how the target is
-built and how its n-gram rows are fetched.
-
-What remains is named in 11.4 and 11.5: the cohort path refuses, and the
-speculative arm is correct but not yet fast.
-
-### 11.3 The checked-in goldens are REGENERATED and they load
-
-The two `correctness_prompts/*.json` goldens were regenerated on 2026-08-28 on
-ranked hardware, against the pinned target
-(`RadixArk/Qwen3.8-Flash-Next-NVFP4` @ `7b719225242aacd3dbd3f9407468c2ee9a9d2594`),
-carrying `model_type` `qwen4_exp_text`. They were double generated -- a fresh
-process each, byte-identical before either was pinned -- and they LOAD through
-the model-identity loader.
-
-So `./benchmark.sh --local-iterate` reaches a golden, and the local public
-drift gate can pass. The PROMPT file is unchanged; only the expected tokens and
-the provenance block moved.
-
-The HIDDEN correctness oracle is untouched and is still the pending sentinel:
-these are the PUBLIC goldens. Section 5.5 remains the authority on the arm
-state.
-
-### 11.4 The cohort path REFUSES, and no scored run is possible today
-
-**(a) The batched cohort path refuses by name.** `makeCohortEngine` throws.
-There are TWO blockers and the second is decisive:
-
-1. The QSA sparse attention emits a custom array mask, and the
-   ContinuousBatchingV2 path owns the attention call and discards a custom
-   mask. A cohort engine would serve DENSE attention under a model trained
-   sparse.
-2. A ContinuousBatchingV2 layer is full attention or a sliding window. On this
-   tower 36 of the 48 layers carry a constant-size RECURRENT state and NO
-   key-value tape, so three quarters of the model has no shape in that engine's
-   cache bank. This holds at EVERY context length, so no budget or window
-   check avoids it.
-
-The engine also stops ADVERTISING the batched capability in its hello, so the
-benchmarker refuses at its pre-measurement capability check rather than after
-it has sent a batched begin. There is no dense-attention fallback: below the
-indexer budget a cohort engine would look correct and would diverge exactly
-where the score is measured, so a fallback is worse than a refusal.
-
-**(b) That question is RULED, and the ruling is single-stream.** David ruling
-2026-08-27, relayed by orchestrator: this track is scored single-stream, and the
-ContinuousBatchingV2 adaptation is not pursued. The fixture therefore pins
-`scored_batch_size` 1 and `scoring.mode`
-`qwen-native-mtp-paired-decode-only`, and section 5 describes a single-stream
-paired series.
-
-**The bench-side dependency is MET.** Bench pull request 217 merged at the
-release branch tip `56a9821a`. At that tip `effective_candidate_regime` keeps
-`scored_batch_size` 1 on the single-stream regime (it never reaches the cohort
-width match), the composite is sealed on the single-stream series at the top
-level of the record beside `composite_scored_exponents`
-(`prefill_gain_exponent` / `decode_gain_exponent`), and the dist pair built
-from `source_commit` `379f37fe` is what `./tools/fetch-benchd.sh` resolves
-(section 11.1). The width certification no longer refuses the shape this
-fixture declares. What still stops a scored run is section 5.5: the sentinels,
-and the goldens.
-
-**(c) The mtp arm can now be faster than serial, and whether it is depends on
-your drafter.** Its verify runs at the draft depth (see 11.5), so a round pays
-one target forward for its whole chain rather than one per committed token. It
-still pays the depth head forwards that proposed the chain, and one full-stack
-snapshot per round, so an accepted draft is what buys the target forward back.
-Making it fast is the point of the track.
-
-**WHAT "CORRECT" MEANS FOR THIS ARM, stated precisely, because an earlier
-wording overstated it.** This section used to say the arm is "token-exact
-against the serial control". That is a FIXTURE-PROVEN property, not a
-pinned-weight one, and the two are not the same claim:
-
-* ON THE FIXTURE, token equality with the serial leg is asserted by test, at
-  every depth the envelope permits.
-* ON THE PINNED WEIGHTS, the recorded population is five near-tie argmax flips
-  among the 1,728 non-row-0 rows compared, with ZERO among the 576 row-0
-  samples. So the mtp stream MAY diverge from the serial stream at a near-tie
-  row.
-
-Under the ruled semantics that divergence is NOT an error. The verify runs at
-the draft depth, and the wide forward is the oracle: a committed token is
-correct when it matches what that forward says, not when it matches what a
-one-token-at-a-time decode would have said. Section 5.4 is the gate that prices
-any resulting difference in emitted tokens, and it already says this track does
-not require token-for-token equality with the serial trajectory. The engine's
-`docs/qwen38-125b-a6b-port-notes.md` section 5.2.1.4 has the measured
-population.
-
-### 11.5 The verify runs at the draft depth
-
-A speculative round verifies its whole draft chain in ONE target forward. The
-verify width is the resolved draft depth on the mtp leg; the serial control
-still runs one token at a time.
-
-**THE CAP THIS SECTION USED TO DESCRIBE IS GONE (David ruling 2026-08-28).**
-It existed because a measurement said a multi-token forward disagreed with the
-same tokens fed one at a time, and that measurement named the keep mask as
-ruled out. The keep mask WAS the cause: the QSA indexer computed its
-complete-block count with true division instead of floor division, so the mask
-let a query attend to future keys inside its own partial block, and how many
-depended on the segment width. That, a wrong RMSNorm convention for this
-checkpoint, and a vendored quantized-gather defect were all fixed, and the
-survey was re-run on ranked hardware against the fixed engine.
-
-**WHAT THE WIDE VERIFY RESTS ON.** Not bit-identity -- MLX dispatches a
-different kernel at one row than at several, by design, so the logits differ in
-their last bits. It rests on ARGMAX AGREEMENT: the wide forward picking the
-same tokens.
-
-Two separate pieces of evidence, and they are not interchangeable. On the
-FIXTURE, a test asserts that the speculative leg commits the serial leg's
-stream token for token at every permitted depth. On the PINNED WEIGHTS, the
-re-survey found argmax agreement on every one of its 576 row-0 samples, and
-five near-tie flips among the 1,728 non-row-0 rows -- so a wide verify may
-commit a token a one-at-a-time decode would not have, at a near-tie. That is
-the oracle doing its job, not a defect: see 11.4(c).
-
-**WHAT THIS MEANS FOR YOU.** The arm is no longer strictly more work than
-serial for the same output: a round pays one target forward for its whole
-chain instead of one per committed token. Whether that becomes a speedup on the
-ranked box is a measurement, not a promise, and it depends on the drafter -- an
-accepted draft is what buys the forward back.

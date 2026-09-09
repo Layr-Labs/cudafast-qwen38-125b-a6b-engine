@@ -11,9 +11,10 @@ The track identifier is `qwen3.8-125b-a6b-cuda-v1`.
 > conversion of Qwen 3.8 Flash Next, four shards plus a Q8_0 MTP draft head.
 > The port carries the `qwen4exp` family the target needs: the multi-shard
 > loader, the qwen4exp kernels and graph, the nextn MTP head behind
-> `--mtp-model` and the depth-1 speculative cycle.
-> The participant-editable surface is the engine adapter (`harness/`) and the
-> MTP head declaration (`mtp-head/`, `mtp-head.manifest.json`);
+> `--mtp-model` and the speculative cycle at depths 1 to 6.
+> The participant-editable surface is the vendored engine (`ds4/`), the engine
+> adapter (`harness/`) and the MTP head declaration (`mtp-head/`,
+> `mtp-head.manifest.json`);
 > `benchmark.json` `editablePaths` is the authority. This repository was seeded from the
 > Gemma 4 26B A4B MLX engine and then carried a vLLM engine; both are gone.
 > `docs/qwen38-125b-a6b-port-notes.md` is the engineering record.
@@ -67,8 +68,8 @@ and verifies the target snapshot. The steps need different things.
   against the shim library. The default (mock) build is portable and needs no
   GPU, so the adapter's own tests run on a laptop and in hosted CI.
 - The organizer-staged GGUF target snapshot on the box, pointed to by
-  `MLXFAST_TARGET_SNAPSHOT_DIR`: the three main shards with the `ple/` sidecar
-  directory beside them. `./setup.sh` verifies every file against the
+  `MLXFAST_TARGET_SNAPSHOT_DIR`: the four target shards and, flat beside them,
+  the Q8_0 MTP draft head. `./setup.sh` verifies every file against the
   `{bytes, sha256}` pins in `fixtures/qwen3_8_125b_a6b_track.json` and FAILS
   CLOSED when a file or the sidecar manifest is absent. It never fetches,
   substitutes, or re-quantizes a checkpoint.
@@ -123,19 +124,20 @@ cargo test --manifest-path harness/protocol-adapter/Cargo.toml
 ```
 
 This command exercises the protocol loop, the verb translation, and every error
-path against a mock transport. It is the local signal available today.
+path against a mock transport. It needs no GPU and no checkpoint.
 
-> **NOTE — participant local iteration is deferred.**
-> The Apple-Metal local test (`./benchmark.sh --local-iterate`, the Swift
-> runtime worker, and the transform into `weights/`) was removed with the seed's
-> runtime. The participant-editable CUDA engine surface and its local-iteration
-> workflow are deferred to a David/organizer ruling
-> (`docs/qwen38-125b-a6b-port-notes.md` section 7).
+> **NOTE — the ranked run is box work.**
+> The GPU, the pinned target snapshot and the ranked goldens all live on the
+> box. Off the box the local signals are the adapter tests above, the engine
+> syntax check (`tools/ds4/build.sh --cpu-check`) and the shell tests
+> (`tools/test-*.sh`). See "Local testing vs the ranked run".
 
-The public prompts in `correctness_prompts/` are Gemma captures kept for reuse
-of their 1024-token prompts; the model-identity loader rejects them against the
-current target, so they are not runnable against this track today
-(`docs/qwen38-125b-a6b-port-notes.md` section 5).
+`correctness_prompts/` holds three public files. The two
+`public_longcopy_gate_english_1024_*.json` files are Gemma-era captures kept for
+their 1024-token prompts; they do not load against the Qwen target.
+`public-longcopy-gate-english-1024.golden.json` is a public Qwen capture
+(`unsloth/Qwen3.8-Flash-Next-GGUF` @ `38bb39ee97821de2c9009abb7e93950eec396e66`)
+for local runs (`docs/qwen38-125b-a6b-port-notes.md` section 5).
 
 ## Repository structure
 
@@ -146,42 +148,38 @@ current target, so they are not runnable against this track today
 | `fixtures/` | The track contract and the pinned checkpoint manifests. | Trusted |
 | `tools/` | Setup, build (`tools/ds4/`), staging, lint, and measurement scripts. | Trusted |
 | `benchd-bin/` | Where `./tools/fetch-benchd.sh` installs the verified binary. Git ignores it. | Fetched |
-| `mtp-head/` | The organizer-staged MTP head slot (holds only its `README.md`). | Editable |
+| `mtp-head/` | The MTP head area. It holds only its `README.md`. The head weights are not here. | Editable |
 | `correctness_prompts/` | The public prompts and public goldens for local runs (Gemma captures). The track goldens are NOT here: they live in R2 and on the ranked box. | Trusted |
 | `benchmark.json` | The Yukon track manifest. It lists every editable path. | Trusted |
 
-`benchmark.json` `editablePaths` lists three entries: `harness/`,
+`benchmark.json` `editablePaths` lists four entries: `ds4/`, `harness/`,
 `mtp-head/` and `mtp-head.manifest.json`.
 
 ### The MTP head
 
-This track's MTP head is NATIVE: it is a Q8_0 GGUF that the organizer stages
-in the target snapshot beside the shards
-(`docs/qwen38-125b-a6b-port-notes.md` section 6). No submission downloads or
-carries a head weight.
+This track's MTP head is NATIVE: it is a separate Q8_0 GGUF that the organizer
+stages in the target snapshot beside the shards
+(`docs/qwen38-125b-a6b-port-notes.md` section 6). `tools/serve-up.sh` loads that
+file. No submission downloads or carries a head weight.
 
-The seed's separate staged-head path — `setup-gemma4-assistant.sh`, the
-`fixtures/gemma4_assistant.sha256` manifest, and the Swift assistant-head loader
-— has been removed with the seed's runtime. `mtp-head/` and
-`fixtures/gemma4_assistant.sha256` remain as seed residue slated for removal with
-the engine port (`docs/qwen38-125b-a6b-port-notes.md` section 7). No custom head
-is accepted: a head declaration accepts `"source": "pinned"` only.
+The head is used exactly as staged. No custom head is accepted: a head
+declaration accepts `"source": "pinned"` only.
 
-### The head directories
+### The head directory
 
-`mtp-head/` holds one `README.md` and nothing else.
+`mtp-head/` holds one `README.md` and nothing else. It is an editable path, and
+the byte budget bars a weight file in it.
 
 > **NOTE — keep that `README.md` in place.**
-> It documents what the organizer stages in that directory, and it keeps
-> the directory present in a fresh clone. The file is inert for scoring: the
-> head tree digest excludes a top-level `README.md`. The directory is not an
-> editable path, so neither travels in a submission.
+> It records what the directory is, and it keeps the directory present in a
+> fresh clone.
 
 ## What you may change
 
-`benchmark.json` `editablePaths` is the authority. It lists three entries:
-`harness/` (the engine adapter), and `mtp-head/` plus
-`mtp-head.manifest.json` (the MTP head). The rule behind the list is simple.
+`benchmark.json` `editablePaths` is the authority. It lists four entries:
+`ds4/` (the vendored engine), `harness/` (the engine adapter), and `mtp-head/`
+plus `mtp-head.manifest.json` (the MTP head declaration). The rule behind the
+list is simple.
 Code that **proposes** tokens or computes the forward pass is editable. Code
 that **verifies**, **measures**, or **ledgers** stays trusted — the
 benchmarker (benchd), the gates, `fixtures/` and this manifest.
@@ -196,17 +194,17 @@ lists `ds4`.
 `ds4/VENDOR.json` records the signed commit of `Layr-Labs/ds4` the tree came
 from. You do not need that repository: the engine is here.
 
-**How to iterate.** Edit under `ds4/`, then:
+**How to iterate.** Edit under `ds4/`, then rebuild and test:
 
-```
-./benchmark.sh --local-iterate
+```bash
+tools/ds4/build.sh
+cargo test --manifest-path harness/protocol-adapter/Cargo.toml
 ```
 
-That builds your engine (`./setup.sh` -> `tools/ds4/build.sh`) and measures it.
 The build cache keys on the engine's CONTENT, so your edit is always rebuilt and
 never served from a previous build.
 
-**What is protected.** `harness/` is the measurement adapter, and `benchmark.json`,
+**What is protected.** `benchmark.json`,
 `benchmark.sh`, `fixtures/`, `correctness_prompts/` and `tools/` are the
 contract, the gates and the oracles. A commit that touches them is refused by
 `.github/scripts/enforce-modifiable-surface.sh` before it is measured. Code that
@@ -219,37 +217,41 @@ optimizing; the tokens are what you must preserve.
 
 ### The organizer-pinned head
 
-The speculative head is the organizer's pinned weights. You may re-quantize it.
-You may not replace it, and you may not upload head weights of your own. Custom
-head weights are not accepted on this track.
+The speculative head is the organizer's pinned weights. It is used exactly as
+staged. You may not re-quantize it, replace it, or upload head weights of your
+own. Nothing about the head is participant-tunable except the draft depth, which
+you declare in `mtp-head.manifest.json`.
 
 `mtp-head/` is an editable path, but the editable byte budget bars a head
-weight file: a real head weight far exceeds `maxFileBytes` (524288) and is
+weight file: a real head weight far exceeds `maxFileBytes` (4473321) and is
 refused before any measurement.
 
-The declaration file stays editable: `mtp-head.manifest.json`. It accepts
-`"source": "pinned"` only. `"source": "remote"` and `"source": "in_branch"` are
-refused by name. The head has a 2 GiB declaration cap
-(`max_bytes` = 2147483648); a declaration may lower it and may not raise it.
+The declaration file stays editable and optional: `mtp-head.manifest.json`. Its
+live field is `spec`, and `tools/spec-declaration.sh` reads it:
 
-On this track the engine is the vendored `ds4/` tree behind the Rust adapter,
-both editable; a head re-quantization is done on load, in memory, within that
-editable surface.
-`docs/participant-contract.md` section 4.4 is the authority for the declaration
-rules that remain in force.
+```json
+"spec": { "enabled": true, "num_speculative_tokens": 1 }
+```
 
-The size cap is the only gate on a declaration. A declared `sha256` is optional,
-and the runner does not verify it against the head bytes. Nothing in this
-repository binds the staged head bytes to the organizer's pinned digests at run
-time; `docs/participant-contract.md` section 4.3 states that limit plainly.
+The other keys are recorded, not read. `source` is `"pinned"`: the only head
+that can load is the organizer-staged one, and the value selects nothing.
+`max_bytes`, `bytes` and `sha256` are not checked against the staged head;
+`./setup.sh` verifies the head bytes against the contract's own pin instead.
 
-An absent declaration selects the organizer-pinned head. That is the normal
-case. A declaration that is present but broken is a refusal. The runner never
-falls back silently.
+A declared `sha256` is optional and the runner does not verify it against the
+head bytes. The head bytes are bound one level up: the head is part of the
+pinned target snapshot, and `./setup.sh` verifies every staged file against the
+contract's `{bytes, sha256}` pins.
+`docs/participant-contract.md` section 4 is the authority for the declaration
+rules.
+
+An absent declaration is serial: the drafter is off. That is the normal case. A
+declaration that is present but broken is a refusal. The runner never falls back
+silently.
 
 A head only **proposes** tokens. The organizer-pinned target model decides
-every emitted token. The serial control leg always runs the organizer-pinned
-head.
+every emitted token. The serial control leg always runs with the drafter
+off.
 
 ### Batch size and draft depth
 
@@ -257,22 +259,18 @@ head.
 > The scored batch size is 1: this track is scored single-stream (David ruling
 > 2026-08-27). You may not tune it.
 >
-> The draft depth is a free lever, and it is not pinned at 1. Your drafter
-> code sets it, and that code is editable. A request above the ceiling is
-> clamped, not refused.
+> The draft depth is a free lever, and it is not pinned at 1. You declare it in
+> `mtp-head.manifest.json` under `spec.num_speculative_tokens`.
 >
-> Select a depth from 1 to 6. The non-editable MTP envelope refuses 7 and
-> above (`permitted_draft_depths` in the track fixture). benchd
-> measures at depth 2 when the invocation names no depth; an `mtp` block with no
-> `depth` key resolves to the ceiling of 6.
->
-> The `fixed_depth = 1` constant in the track fixture is a darkbloom reference
-> constant for stateless Gemma. It is not a limit on your draft depth.
+> Select a depth from 1 to 6. The pinned engine implements all six
+> (`DS4_IMPLEMENTED_DEPTH` in `harness/protocol-adapter/src/ds4_backend.rs`). A
+> depth outside 1 to 6 is refused by name, never clamped
+> (`permitted_draft_depths` in the track fixture). benchd measures at depth 2
+> when the invocation names no depth; an `mtp` block with no `depth` key
+> resolves to the ceiling of 6.
 >
 > Every run seals what actually ran: `effective_spec` for the declared arm and
 > depth, `effective_mean_draft_len` for the realized draft length.
-
-The rectangular cap is `B * (1 + k) <= 8` on M3 and later.
 
 ### The byte budget
 
@@ -281,9 +279,9 @@ surface.
 
 | Key | Value |
 |---|---|
-| `maxTotalBytes` | 1048644 |
-| `maxFileBytes` | 524288 |
-| `maxGrowthBytes` | 262144 |
+| `maxTotalBytes` | 19550883 |
+| `maxFileBytes` | 4473321 |
+| `maxGrowthBytes` | 19550883 |
 | `exemptPathMaxBytes` | 512000000 |
 | `exemptPathMaxFileBytes` | 100000000 |
 
@@ -295,22 +293,23 @@ head weights any more, so there is nothing to exempt. The two exempt caps stay
 declared because both enforcers carry the same numbers as compiled-in fallbacks
 and this manifest is what holds them to a reviewed value.
 
-An organizer-pinned head staged on-box is not walked by this budget at all. The
-head directories are not editable paths, so the walk never visits them.
-`max_bytes` bounds what the runner **loads**, and stays at 2 GiB.
+The organizer-staged head is not walked by this budget at all. It sits in the
+target snapshot on the box, which is not an editable path, so the walk never
+visits it.
 
-### The target quantization is frozen
+### The weights are frozen
 
-The target model's quantization is frozen as shipped. Do not re-quantize a
-target weight. Do not re-represent one. Do not change the numerical format of
-one. This holds even when the result passes every correctness gate.
+The target model's quantization is frozen as shipped, and so is the MTP head's.
+Do not re-quantize a weight. Do not re-represent one. Do not change the
+numerical format of one. Do not mirror one. This holds on disk and in memory,
+and it holds even when the result passes every correctness gate.
 
-Nothing licenses a change of target format. A lossier target substitutes a
+Nothing licenses a change of weight format. A lossier target substitutes a
 degraded model instead of optimizing the accepted one.
 
-The speculative decoder is a narrow exception, and the exception is
-re-quantization only. You may re-quantize the MTP head. You may not replace it.
-It stays within its 2 GiB cap. A decoder only proposes tokens, and the pinned
+The MTP head is no exception. It is the organizer's pinned weights, and it is
+used exactly as staged. No weight on this track may be re-quantized, re-cast or
+mirrored, on disk or in memory. A decoder only proposes tokens, and the pinned
 target decides every emitted token.
 
 ### What you must not change
@@ -333,58 +332,22 @@ Within-request KV reuse also stays legal.
 
 ## Local testing vs the ranked run
 
-> **NOTE — the local-iteration guidance below is SEED material.**
-> The `--local-iterate` / `--local-submit` modes, the `128`/`129` and
-> `1023`/`1024` step counts, the `./benchmark.sh` cool gate and the
-> `mlxfast-swift` CLI all describe the removed Apple-Metal runtime. The CUDA
-> engine's local-iteration workflow is deferred to a David/organizer ruling with
-> the participant-editable surface; local iteration against this track is not
-> runnable today and the goldens are not yet armed. Today the local signal is
-> `cargo test --manifest-path harness/protocol-adapter/Cargo.toml`, which runs
-> the Engine Protocol v1 adapter against a mock transport with no GPU. The
-> ranked cool gate itself persists on the CUDA box
-> (`docs/qwen38-125b-a6b-port-notes.md` section 7).
+The ranked run is box work. It needs the GB10 box, the staged target snapshot
+and the staged goldens. Off the box this repository gives you three signals.
 
-The local test and the ranked run are different by design. Read this section
-before you tune.
+| Signal | Command | What it proves |
+|---|---|---|
+| The engine builds | `tools/ds4/build.sh` on the box, `tools/ds4/build.sh --cpu-check` off it | Your engine edit compiles, and the shim agrees with the vendored engine. |
+| The adapter is correct | `cargo test --manifest-path harness/protocol-adapter/Cargo.toml` | The protocol loop, the verb translation and every error path, against a mock transport. No GPU. |
+| The scripts hold | `tools/test-*.sh` | The setup, serve, preflight and calibration scripts, against stubs. No GPU. |
 
-The local test runs a **single stream**. It uses a public golden. It prints a
-single-stream estimate.
+On the box, `tools/serve-up.sh` boots and stops one resident engine, and
+`tools/calibrate-box.sh` records the box's control band. Both are organizer
+tools. Read each one before you run it.
 
-### What each local mode checks
-
-Both local modes run one fused checked-timing pass. The pass teacher-forces the
-golden's expected tokens and times the wall clock. It judges correctness from
-that same pass. A mismatch is reported as a teacher-forced token mismatch.
-
-A correctness failure does not discard the timing. The benchmarker reruns the
-timing phase in a mismatch-tolerant form. It then reports the correctness
-failure together with real timing numbers.
-
-| Mode | Decode steps | Expected tokens the golden must hold | Cool gate |
-|---|---|---|---|
-| `--local-iterate` | 128 | 129 | On, because `./benchmark.sh` always passes `--cool-gate` |
-| `--local-submit` | 1023 | 1024 | On |
-
-The gate is on because `./benchmark.sh` arms it. Driving the Swift CLI directly
-skips it and times a hot GPU. Use `./benchmark.sh`. See AGENTS.md, "The
-cool-down gate".
-
-The two public goldens differ in length for this reason. Use the 256-token
-golden for `--local-iterate`. Use the 1024-token golden for `--local-submit`.
-
-> **NOTE — both local modes check correctness and speed.**
-> Neither local mode is a speed-only signal. Both apply the teacher-forced
-> check. Neither one runs the ranked cohort gates.
-
-The ranked run is single-stream, and so is local testing, so the two exercise
-the same width. What still differs is the machine, the pinned prompts and the
-staged checkpoint.
-
-> **WARNING — a local score is directional, not predictive.**
-> Treat a local score as a smoke signal for speed and correctness. Do not treat
-> it as a prediction of the ranked composite. The ranked box run is the
-> authority.
+> **WARNING — a local signal is directional, not predictive.**
+> No local signal measures the ranked composite. The ranked box run is the
+> authority on any score.
 
 ## Scoring and gates
 
@@ -519,8 +482,8 @@ The benchmarker applies a per-stream token-tolerance gate with a **10% budget**.
 > pass at near-tie argmaxes. The gate prices that divergence against the 10%
 > budget. Do not read the gate as lossless.
 
-The checked-in public goldens are M5-generated. A near-tie argmax can diverge
-on another Apple Silicon generation, even for correct code. Before you treat a
+The checked-in public goldens were captured on ranked hardware. A near-tie
+argmax can diverge on other hardware, even for correct code. Before you treat a
 local failure as your own regression, check whether an unmodified `main` fails
 at the same token position on your machine.
 
@@ -626,35 +589,35 @@ No local run blocks the upload. Run the local test yourself before you submit.
 
 | Artifact | Identity |
 |---|---|
-| Target model | `mlx-community/gemma-4-26B-A4B-it-qat-4bit` @ `0e3cbab38ce568cf6e23543010d08d03b731910c` |
-| Target manifest | `fixtures/reference_gemma4_26b_a4b_qat4bit.sha256` (11 records, 15,641,239,658 bytes) |
-| MTP head | `mlx-community/gemma-4-26B-A4B-it-qat-assistant-4bit` @ `bb94eae1b70a80dac16cbf959bb4b7d56bd1fb8c` |
-| MTP head manifest | `fixtures/gemma4_assistant.sha256` (8 records) |
+| Target model | `unsloth/Qwen3.8-Flash-Next-GGUF`, variant `UD-Q4_K_XL`. It is a GGUF conversion of `Qwen/Qwen3.8-Flash-Next` @ `f5d08274bafd880402bd16f5e3e6c514136ec06c`. |
+| Target manifest | `fixtures/qwen3_8_125b_a6b_track.json` `target.files`, which pins each file by bytes and sha256 |
+| MTP head | `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`, pinned in the same `target.files` list |
+| Engine | vendored at `ds4/` from `Layr-Labs/ds4`, our port of `antirez/ds4`. `ds4/VENDOR.json` records the signed base. |
 | Benchmarker | dist channel: branch `qwen3.8-125b-a6b-v1` on the public bench repository `Layr-Labs/mlxfast-bench`. The channel's `benchd.manifest.json` is the authority for the commit, the sha256, the byte count and the platform; `tools/fetch-benchd.sh` enforces all four. Nothing is pinned here, because the channel tip is the intended source. |
-| Model fork revision | `ed55bee83beb0623152f4c2e70f0cf99ad379e35` |
 
-Both model repositories are public. They download without a token. There is no
-organizer-hosted mirror for this checkpoint, so
-`MLXFAST_REFERENCE_FALLBACK_BASE_URL` is empty by default.
+The staged snapshot holds the four target shards (111,334,654,784 bytes) and,
+flat beside them, the Q8_0 MTP draft head (2,786,568,256 bytes). The fixture
+pins all five files.
+
+The model repository is public. It downloads without a token.
 
 ### The target model
 
 | Property | Value |
 |---|---|
-| Model type | `gemma4_text` |
-| Hidden layers | 30 |
-| Full-attention layers | 5, at indices 5, 11, 17, 23, and 29 |
-| Attention pattern | A six-layer repeat. The other layers use a sliding window. |
-| Sliding window | 1024 |
-| Routed experts | 128 |
-| Experts per token | 8 |
-| Hidden size | 2816 |
-| Head dimension | 256. The full-attention layers use 512. |
-| Vocabulary | 262144 |
-| Embeddings | Tied. There is no `lm_head` tensor. |
-| Quantization | Affine, group size 64, 4 bits, mixed precision |
-| Raw tensors | 1697 across 3 shards |
-| Text tower tensors | 1339 |
+| Architecture | `qwen4_exp`. The text tower is `qwen4_exp_text`. |
+| Hidden layers | 48, on a four-layer repeat |
+| Full-attention layers | 12, at every index where `index % 4 == 3` |
+| Linear-attention layers | The other 36. They are gated deltanet and carry a constant-size recurrent state. |
+| Full-attention heads | 24 query heads, 2 KV heads, head dimension 256 |
+| Rotary | Partial 0.25, `rope_theta` 1e7, interleaved mrope |
+| QSA indexer | 4 heads, 1 KV head, dimension 128, budget 2048, compress 4 |
+| Hyper-connections | `hc_count` 4, `hc_lowrank` 320 |
+| Routed experts | 512, 10 per token, `moe_intermediate` 640, plus a shared expert of the same width |
+| Hidden size | 2560 |
+| Vocabulary | 248320 |
+| Embeddings | Untied |
+| Quantization | GGUF mixed: `Q4_K` routed expert gate and up, `Q5_1` routed expert down, `IQ4_NL` for the PLE table, `Q8_0`/F32/BF16 for the dense embedding and output |
 
 ## Building the engine
 
@@ -682,12 +645,10 @@ tools/stage-cuda-engine.sh
 This command copies the finished `cuda-engine` binary to the fixed workspace path
 benchd resolves and spawns (`.build/release/mlxfast-runtime-worker`). That name
 is retained from the seed on purpose: it is a contract with the benchmarker, not
-a preference, so this repository honours the path rather than renaming it. There
-is no `mlx.metallib` any more — the adapter carries no Metal kernels.
+a preference, so this repository honours the path rather than renaming it. The
+adapter carries no Metal kernels, so there is no `mlx.metallib`.
 
-There is no Swift build any more either: the Apple-Metal/Swift seed package was
-removed in the final de-Swift. `cargo` is the only toolchain this repository
-builds with.
+`cargo` is the only toolchain this repository builds with.
 
 ## Continuous integration
 
@@ -725,7 +686,7 @@ artifact.
 | Agent and contributor guidance | `AGENTS.md` |
 
 > **NOTE — the order of authority.**
-> The ranked M5 run is the authority on any score. The contract fixture
+> The ranked box run is the authority on any score. The contract fixture
 > `fixtures/qwen3_8_125b_a6b_track.json` wins over this document. This document
 > only explains; it never overrides. If either disagrees with the benchmarker
 > about measurement, the benchmarker wins.
@@ -733,7 +694,6 @@ artifact.
 ## License and attribution
 
 This repository's harness code is licensed per [LICENSE](LICENSE). The pinned
-checkpoints carry the `gemma` license tag. The terms are at
-<https://ai.google.dev/gemma/terms>. This repository distributes no model
-weights. [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) holds the full
+checkpoint is a GGUF conversion of `Qwen/Qwen3.8-Flash-Next`. The model's own
+license terms apply to it. This repository distributes no model weights. [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) holds the full
 third-party attribution.

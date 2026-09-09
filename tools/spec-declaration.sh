@@ -8,7 +8,7 @@
 # between the arm gate and the serve that actually boots.
 #
 # NOT AN EDITABLE PATH. benchmark.json editablePaths is
-# {harness, mtp-head, mtp-head.manifest.json}. The DECLARATION (mtp-head.manifest.json) is editable
+# {ds4, harness, mtp-head, mtp-head.manifest.json}. The DECLARATION (mtp-head.manifest.json) is editable
 # -- a submission EXPRESSES a value there -- but this DERIVATION is trusted, so a
 # submission cannot rewrite how the value is interpreted or relax the envelope.
 #

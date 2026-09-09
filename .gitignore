@@ -38,12 +38,13 @@ reference_weights/*
 # is not a benchmark.json editablePaths entry, so it need not pre-exist.
 weights/*
 
-# The speculative head directory. This track's MTP head is EMBEDDED in the
-# pinned target checkpoint (language_model.mtp.*), so nothing stages a head
-# weight file here and no submission carries one. mtp-head/ is not an
-# editablePaths entry; only its DECLARATION, mtp-head.manifest.json, is. The
-# ignore stays so a hand-staged experiment cannot be committed into the tree by
-# a stray `git add -A`.
+# The speculative head directory. This track's MTP head is a SEPARATE pinned
+# Q8_0 GGUF that the organizer stages in the target snapshot beside the shards,
+# so nothing stages a head weight file here and no submission carries one.
+# mtp-head/ IS a benchmark.json editablePaths entry, and so is its DECLARATION,
+# mtp-head.manifest.json. The directory's README.md is tracked already. The
+# ignore stays so a hand-staged weight experiment cannot be committed into the
+# tree by a stray `git add -A`.
 mtp-head/
 
 # Local results log

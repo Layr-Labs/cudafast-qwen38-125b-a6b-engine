@@ -141,6 +141,11 @@ ok "no R2 credential, signer, or dist token in the job environment"
 # below (nvidia-smi) is what benchd's cool gate reads anyway. It stays an
 # OPTIONAL override -- never required, never set here for the job -- so a box
 # needs no environment variable at all to get a temperature reading.
+#
+# The loop below refuses a value that is PRESET in the job environment, before
+# this preflight runs. The workflow's engine-build-cache step sets
+# MLXFAST_SKIP_ENGINE_BUILD=1 LATER in the same job, after this preflight, and
+# only on a verified cache hit, so that write and this refusal are consistent.
 for var in BENCHD MLXFAST_SKIP_WEIGHTS_DOWNLOAD SKIP_MODEL_DOWNLOAD MLXFAST_LOCAL_COOL_GATE MLXFAST_LOCAL_ALLOW_GOLDEN_DRIFT MLXFAST_SKIP_ENGINE_BUILD MLXFAST_SKIP_WEIGHTS_SHA256 DS4_MODEL DS4_MTP_PATH DS4_MTP_DRAFT_TOKENS DS4_CTX_SIZE DS4_EOS_IDS DS4_RESIDENT_SOCKET BENCH_WORKER_RESIDENT_SOCKET; do
   eval "value=\${${var}:-}"
   [[ -z "${value}" ]] || fail "${var} is set in the ranked job's environment; it weakens or bypasses what the ranked run measures"
