@@ -151,16 +151,18 @@ use it.
 > refuses one in its own environment, and so do the preflight and the two
 > drivers.
 
-> **WARNING — no ranked runner advertises the label yet.**
-> `.github/workflows/benchmark.yml` is the real ranked pipeline: a hosted
-> surface check, then a self-hosted ranked job on
-> `[self-hosted, Linux, ARM64, qwen3.8-125b-a6b-cuda-v1]`. The label is the ruled
-> one and the job body is the real Linux/CUDA one (the stale macOS/M5 duplicate
-> was deleted with #41). What remains is box work: no runner advertises the label
-> yet and the box is not staged, so a dispatch queues or refuses until the box is
-> registered and the goldens are staged (test-3 prep). It holds no credential by
-> design: the goldens are staged onto the box and pin-verified by
-> `tools/ranked-box-preflight.sh`, which refuses rather than fetch or substitute.
+> **NOTE — ranked pipeline and runner availability.**
+> `.github/workflows/benchmark.yml` is the configured ranked pipeline: a hosted
+> surface check followed by a self-hosted ranked job on
+> `[self-hosted, Linux, ARM64, qwen3.8-125b-a6b-cuda-v1]`. A dispatch reaches
+> measurement only when a live self-hosted runner advertises all four labels and
+> its staged inputs pass `tools/ranked-box-preflight.sh`. Official workflow
+> [34370162983](https://github.com/Layr-Labs/cudafast-qwen38-125b-a6b-engine/actions/runs/34370162983)
+> completed on 2026-09-09 on Spark 3 (`spark-3`), passing hosted static review
+> and GPU measurement. Runner availability and staged box state are runtime
+> state, so check the live Actions runner inventory or queued run before another
+> dispatch. The job holds no credential by design: organizer-staged goldens and
+> box assets are pin-verified rather than fetched or substituted.
 
 There is ONE speculative arm on this track: the MTP head. DFlash was a
 Gemma-era second arm and is removed.

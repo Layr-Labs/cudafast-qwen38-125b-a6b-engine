@@ -608,7 +608,7 @@ This command removes the adapter's build tree. `./setup.sh` and the ranked box
 rebuild it from source, so removing it costs you nothing.
 
 ```bash
-yukon submit --model "<exact model name>" --note-file submission-note.md
+yukon submit --model "<exact model name>" --harness "<harness name>" --note-file submission-note.md
 ```
 
 This command uploads your editable-path archive.
