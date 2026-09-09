@@ -2039,8 +2039,8 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     }
     QW_TRACE(QW_SLICE_HEAD);
     QW_TRACE_REPORT(n_tokens);
-    /* Commit and wait: the logits are read on the host from here on. */
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
+    /* end_commands completes the batch before the synchronous host readback. */
+    if (!ds4_gpu_end_commands()) {
         fprintf(stderr, "ds4: qwen4exp command batch did not complete\n");
         return false;
     }
