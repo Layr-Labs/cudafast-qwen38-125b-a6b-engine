@@ -303,6 +303,148 @@ else
   fail "case 10: refused for the wrong reason ($(cat "${WORK}/case10.log"))"
 fi
 
+# ============================================================================
+# --all: staging the whole pinned set for a ranked box
+# ============================================================================
+# The same stand-in bucket, three more objects, and a synthetic contract whose
+# pins are their real digests. The credentialed branch is exercised through a
+# STUB signer -- the vendored one speaks SigV4 to real R2, which this test must
+# never do -- so what is under test here is the staging loop: what it fetches,
+# what it verifies, what it refuses, and what it leaves behind.
+ALL_KEY_A="correctness_prompts/qwen3.8-125b-a6b-cuda-v1/all-pool-a.golden.json"
+ALL_KEY_B="correctness_prompts/qwen3.8-125b-a6b-cuda-v1/all-pool-b.golden.json"
+ALL_KEY_C="correctness_prompts/qwen3.8-125b-a6b-cuda-v1/all-oracle-mtp1.golden.json"
+printf '{"version":1,"case":"all-pool-a"}\n' > "${WORK}/bucket/${ALL_KEY_A}"
+printf '{"version":1,"case":"all-pool-b"}\n' > "${WORK}/bucket/${ALL_KEY_B}"
+printf '{"version":1,"case":"all-oracle-mtp1"}\n' > "${WORK}/bucket/${ALL_KEY_C}"
+
+pin_sha() { shasum -a 256 "$1" | awk '{print $1}'; }
+pin_bytes() { wc -c < "$1" | tr -d '[:space:]'; }
+
+A_SHA="$(pin_sha "${WORK}/bucket/${ALL_KEY_A}")"; A_BYTES="$(pin_bytes "${WORK}/bucket/${ALL_KEY_A}")"
+B_SHA="$(pin_sha "${WORK}/bucket/${ALL_KEY_B}")"; B_BYTES="$(pin_bytes "${WORK}/bucket/${ALL_KEY_B}")"
+C_SHA="$(pin_sha "${WORK}/bucket/${ALL_KEY_C}")"; C_BYTES="$(pin_bytes "${WORK}/bucket/${ALL_KEY_C}")"
+
+# write_all_contract PATH B_BYTES -- the second tape's byte pin is a parameter
+# so the truncation case can make exactly one thing wrong.
+write_all_contract() {
+  cat > "$1" <<ALLJSON
+{
+  "timed_prompt_pool": [
+    {"r2_path": "${ALL_KEY_A}", "sha256": "${A_SHA}", "bytes": ${A_BYTES}},
+    {"r2_path": "${ALL_KEY_B}", "sha256": "${B_SHA}", "bytes": $2}
+  ],
+  "live_golden_speculative": {
+    "mtp1": {"r2_path": "${ALL_KEY_C}", "sha256": "${C_SHA}", "bytes": ${C_BYTES}}
+  },
+  "hidden_correctness_golden": {"sha256": "${A_SHA}", "bytes": ${A_BYTES}}
+}
+ALLJSON
+}
+
+# The stub signer: the `download-r2-object.sh KEY DEST` contract, over loopback
+# and with no credential. The real signer's SigV4 is not this test's subject.
+SIGNER="${WORK}/stub-signer.sh"
+cat > "${SIGNER}" <<SIGNEREOF
+#!/usr/bin/env bash
+set -euo pipefail
+curl --fail --silent --show-error --output "\$2" "${ENDPOINT}/\$1"
+SIGNEREOF
+chmod +x "${SIGNER}"
+
+all_root() { # all_root DIR B_BYTES -- a stand-in repo root with the copy + contract
+  mkdir -p "$1/tools" "$1/fixtures"
+  cp "${RELAXED}" "$1/tools/fetch-goldens-loopback.sh"
+  chmod +x "$1/tools/fetch-goldens-loopback.sh"
+  write_all_contract "$1/fixtures/qwen3_8_125b_a6b_track.json" "$2"
+}
+
+# --- case 11: --all stages and verifies the whole pinned set -----------------
+all_root "${WORK}/allrepo" "${B_BYTES}"
+ALL_OUT="${WORK}/staged"
+if R2_BUCKET_ENDPOINT="${ENDPOINT}" \
+   R2_ACCESS_KEY_ID="stub-key" R2_SECRET_ACCESS_KEY="stub-secret" \
+   MLXFAST_QWEN38_R2_DOWNLOADER="${SIGNER}" \
+   "${WORK}/allrepo/tools/fetch-goldens-loopback.sh" --all --out "${ALL_OUT}" \
+   >"${WORK}/case11.log" 2>&1; then
+  ok11=1
+  for want in all-pool-a.golden.json all-pool-b.golden.json all-oracle-mtp1.golden.json; do
+    [[ -f "${ALL_OUT}/${want}" ]] || { fail "case 11: ${want} was not staged"; ok11=0; }
+  done
+  [[ "$(pin_sha "${ALL_OUT}/all-pool-a.golden.json")" == "${A_SHA}" ]] \
+    || { fail "case 11: the staged pool tape does not match its pin"; ok11=0; }
+  # No .partial may survive a successful run, and the staged files are read-only.
+  compgen -G "${ALL_OUT}/*.partial" >/dev/null \
+    && { fail "case 11: a .partial file survived a successful run"; ok11=0; }
+  perms="$(ls -l "${ALL_OUT}/all-pool-a.golden.json" | cut -c2-10)"
+  [[ "${perms}" == "r--r--r--" ]] \
+    || { fail "case 11: staged golden is ${perms}, expected r--r--r-- (0444)"; ok11=0; }
+  grep -q "hidden_correctness_golden resolves to all-pool-a.golden.json" "${WORK}/case11.log" \
+    || { fail "case 11: the digest-only hidden oracle was not resolved among the staged files"; ok11=0; }
+  grep -q "staged 3 object(s)" "${WORK}/case11.log" \
+    || { fail "case 11: the run did not report 3 staged objects"; ok11=0; }
+  [[ "${ok11}" == "1" ]] && pass "--all staged the whole pinned set, verified it, and resolved the hidden oracle"
+else
+  fail "case 11: --all refused a healthy set ($(tail -3 "${WORK}/case11.log"))"
+fi
+
+# --- case 12: a second run is a no-op ---------------------------------------
+# Idempotence is what makes this safe to put in a converge script: a box that is
+# already staged must not re-fetch, and must not rewrite files it already holds.
+before="$(shasum -a 256 "${ALL_OUT}"/*.json | shasum -a 256 | awk '{print $1}')"
+if R2_BUCKET_ENDPOINT="${ENDPOINT}" \
+   R2_ACCESS_KEY_ID="stub-key" R2_SECRET_ACCESS_KEY="stub-secret" \
+   MLXFAST_QWEN38_R2_DOWNLOADER="${SIGNER}" \
+   "${WORK}/allrepo/tools/fetch-goldens-loopback.sh" --all --out "${ALL_OUT}" \
+   >"${WORK}/case12.log" 2>&1; then
+  after="$(shasum -a 256 "${ALL_OUT}"/*.json | shasum -a 256 | awk '{print $1}')"
+  if [[ "${before}" != "${after}" ]]; then
+    fail "case 12: the second run changed the staged files"
+  elif ! grep -q "staged 0 object(s), kept 3" "${WORK}/case12.log"; then
+    fail "case 12: the second run did not report every file as already staged ($(tail -2 "${WORK}/case12.log"))"
+  else
+    pass "a second --all run fetched nothing and left the staged set untouched"
+  fi
+else
+  fail "case 12: the second --all run refused ($(tail -3 "${WORK}/case12.log"))"
+fi
+
+# --- case 13: a one-byte-short object refuses and leaves no .partial ---------
+all_root "${WORK}/allrepo-short" "$((B_BYTES + 1))"
+SHORT_OUT="${WORK}/staged-short"
+if R2_BUCKET_ENDPOINT="${ENDPOINT}" \
+   R2_ACCESS_KEY_ID="stub-key" R2_SECRET_ACCESS_KEY="stub-secret" \
+   MLXFAST_QWEN38_R2_DOWNLOADER="${SIGNER}" \
+   "${WORK}/allrepo-short/tools/fetch-goldens-loopback.sh" --all --out "${SHORT_OUT}" \
+   >"${WORK}/case13.log" 2>&1; then
+  fail "case 13: --all accepted an object that is a byte short of its pin"
+elif compgen -G "${SHORT_OUT}/*.partial" >/dev/null; then
+  fail "case 13: refused but left a .partial file in the staging directory"
+elif [[ -e "${SHORT_OUT}/all-pool-b.golden.json" ]]; then
+  fail "case 13: refused but staged the object anyway"
+elif grep -q "byte-count mismatch for ${ALL_KEY_B}" "${WORK}/case13.log"; then
+  pass "--all refuses a short object by name and stages no partial bytes"
+else
+  fail "case 13: refused for the wrong reason ($(tail -3 "${WORK}/case13.log"))"
+fi
+
+# --- case 14: --all without credentials refuses, naming them ----------------
+# The default signer speaks SigV4, so there is no anonymous way to stage this
+# material. The refusal must name what is missing rather than fail inside curl.
+NOCRED_OUT="${WORK}/staged-nocred"
+if env -u R2_ACCESS_KEY_ID -u R2_SECRET_ACCESS_KEY -u MLXFAST_QWEN38_R2_DOWNLOADER \
+   R2_BUCKET_ENDPOINT="${ENDPOINT}" \
+   "${WORK}/allrepo/tools/fetch-goldens-loopback.sh" --all --out "${NOCRED_OUT}" \
+   >"${WORK}/case14.log" 2>&1; then
+  fail "case 14: --all ran with no R2 credentials"
+elif ! grep -q "R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY" "${WORK}/case14.log"; then
+  fail "case 14: refused without naming the credentials ($(tail -3 "${WORK}/case14.log"))"
+elif compgen -G "${NOCRED_OUT}/*.json" >/dev/null; then
+  fail "case 14: refused but staged a file anyway"
+else
+  pass "--all without credentials refuses and names the two variables"
+fi
+
 echo
 if (( failures > 0 )); then
   echo "${failures} case(s) failed" >&2

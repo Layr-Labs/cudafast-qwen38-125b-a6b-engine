@@ -344,6 +344,11 @@ BUDGET_CAP_KEYS = (
 # meaning two things.
 SHELL_ENFORCER = os.path.join(".github", "scripts", "submission-static-review-checks.sh")
 
+# The directory every golden in this repository lives under. Check 5b walks it
+# recursively, so a golden in a subdirectory the contract does not pin is still
+# scanned for a stored baseline pair.
+GOLDEN_ROOT = "correctness_prompts"
+
 # `resolve_cap VAR_NAME CONTRACT_KEY FALLBACK`, one per line at column 0. Read
 # from the real call sites rather than from a restated list, so a renamed key or
 # a fourth cap cannot slip past by not being in a list here. The suite's
@@ -861,6 +866,70 @@ class Linter:
             )
         return contract
 
+    # -- 5a2 ---------------------------------------------------------------
+    def check_track_goldens_absent(self, contract: dict) -> None:
+        """No pinned track golden may sit in this repository.
+
+        THE TAPES ARE ORGANIZER MATERIAL, AND THEY ARE NOT IN GIT. The 8
+        timed-pool tapes and the per-depth oracles are published in R2 at the
+        r2_path keys the contract pins, and the ranked box stages them out of
+        band into the directory its runner service exports as
+        MLXFAST_QWEN38_GOLDEN_DIR. tools/ranked-box-preflight.sh verifies every
+        staged file against the contract's {sha256, bytes} and refuses an extra
+        *.json there.
+
+        So the correct state of this tree is that every pinned r2_path is
+        ABSENT, and this check says so out loud rather than leaving it to
+        nobody. A pinned golden that reappears in the checkout is refused by
+        name: a committed copy is organizer material in a participant's clone,
+        and it is also a second source of truth for bytes the box already pins.
+
+        The PUBLIC goldens beside them (correctness_prompts/public_*) are
+        participant material for local runs. They are not pinned in
+        timed_prompt_pool or live_golden_speculative, so this check never looks
+        at them.
+        """
+        pinned: set[str] = set()
+        for entry in contract.get("timed_prompt_pool", []):
+            if isinstance(entry, dict) and isinstance(entry.get("r2_path"), str):
+                pinned.add(entry["r2_path"])
+        spec = contract.get("live_golden_speculative", {})
+        if isinstance(spec, dict):
+            for entry in spec.values():
+                if isinstance(entry, dict) and isinstance(entry.get("r2_path"), str):
+                    pinned.add(entry["r2_path"])
+        if not pinned:
+            # A track stamped by tools/new-track.sh pins nothing yet: its
+            # goldens are recorded on its own box after the port runs. That is
+            # legal only while official_scoring_enabled is false, exactly as the
+            # empty-pool case above is.
+            if contract.get("official_scoring_enabled", False):
+                self.fail(
+                    "goldens: the contract pins no r2_path but scoring is ARMED; there is "
+                    "nothing for the box to stage and nothing to assert about this tree"
+                )
+            else:
+                self.ok(
+                    "goldens: the contract pins no r2_path and scoring is not armed "
+                    "(a stamped track pending its goldens)"
+                )
+            return
+
+        present = [rel for rel in sorted(pinned) if os.path.exists(self.abspath(rel))]
+        if present:
+            for rel in present:
+                self.fail(
+                    f"goldens: {rel} is present in this repository. The track tapes are "
+                    "organizer material: they are published in R2 at the pinned r2_path "
+                    "keys and staged on the ranked box as MLXFAST_QWEN38_GOLDEN_DIR, and "
+                    "they are never in git. Delete the file"
+                )
+            return
+        self.ok(
+            f"goldens: none of the {len(pinned)} pinned track golden(s) is in this tree "
+            "(they live in R2 and on the box, staged as MLXFAST_QWEN38_GOLDEN_DIR)"
+        )
+
     # -- 5b ----------------------------------------------------------------
     def check_paired_baseline(self, contract: dict) -> None:
         """No golden may carry a stored baseline pair; the fixture must name the
@@ -885,6 +954,13 @@ class Linter:
         # Every golden the fixture names, plus every *.json beside them. The
         # directory sweep is what catches a per-depth tape that is staged but
         # not yet pinned.
+        #
+        # THE PINNED TRACK GOLDENS ARE NOT IN THE TREE, AND MUST NOT BE. They
+        # are organizer material published in R2 at the contract's r2_path keys
+        # and staged on the ranked box out of band, so an absent file is the
+        # correct state and is skipped below. A pinned golden that IS present is
+        # refused by name in check_track_goldens_absent(): this scan then reads
+        # whatever else lives beside the goldens the tree does carry.
         rels: set[str] = set()
         for entry in contract.get("timed_prompt_pool", []):
             if isinstance(entry, dict) and isinstance(entry.get("r2_path"), str):
@@ -894,13 +970,24 @@ class Linter:
             for entry in spec.values():
                 if isinstance(entry, dict) and isinstance(entry.get("r2_path"), str):
                     rels.add(entry["r2_path"])
+        # The sweep is RECURSIVE over every golden root in the tree, not a flat
+        # listing of each pinned file's own directory: the pinned directories
+        # are empty here by design, and the goldens the tree DOES carry -- the
+        # public ones a participant runs locally -- would otherwise go unread.
+        roots = {GOLDEN_ROOT}
         for rel in sorted(rels):
-            d = os.path.dirname(rel)
-            if not os.path.isdir(self.abspath(d)):
+            parts = rel.split(os.sep)
+            roots.add(parts[0] if len(parts) > 1 else os.path.dirname(rel) or ".")
+        for root in sorted(roots):
+            root_abs = self.abspath(root)
+            if not os.path.isdir(root_abs):
                 continue
-            for name in os.listdir(self.abspath(d)):
-                if name.endswith(".json"):
-                    rels.add(os.path.join(d, name))
+            for dirpath, _dirnames, filenames in os.walk(root_abs):
+                for name in filenames:
+                    if name.endswith(".golden.json"):
+                        rels.add(
+                            os.path.relpath(os.path.join(dirpath, name), self.root)
+                        )
 
         if not rels:
             self.fail(
@@ -910,11 +997,13 @@ class Linter:
             return
 
         carriers: list[str] = []
+        scanned = 0
         for rel in sorted(rels):
             path = self.abspath(rel)
             if not os.path.exists(path):
-                self.fail(f"goldens: {rel} is named by the contract but is not in the tree")
+                # Expected: the pinned track goldens live in R2 and on the box.
                 continue
+            scanned += 1
             try:
                 with open(path, encoding="utf-8") as fh:
                     golden = json.load(fh)
@@ -937,11 +1026,17 @@ class Linter:
                     "re-pin the golden"
                 )
         else:
-            self.ok(
-                f"goldens: none of the {len(rels)} golden file(s) carries "
-                "benchmark.baseline_prefill_seconds_per_token or "
-                "benchmark.baseline_decode_seconds_per_token (paired per-box baseline)"
-            )
+            if scanned == 0:
+                self.ok(
+                    "goldens: this tree carries no golden file to scan for a stored "
+                    "baseline pair; the pinned tapes live in R2 and on the box (check 5a2)"
+                )
+            else:
+                self.ok(
+                    f"goldens: none of the {scanned} golden file(s) in the tree carries "
+                    "benchmark.baseline_prefill_seconds_per_token or "
+                    "benchmark.baseline_decode_seconds_per_token (paired per-box baseline)"
+                )
 
         # ANY TREE THAT CAN BE PROMOTED AS A REFERENCE MUST SPEAK THE PER-LEG
         # VERBS. benchd boots each leg's resident by running that leg's own
@@ -1091,6 +1186,7 @@ class Linter:
         self.check_byte_budget(manifest)
         self.check_commands(manifest)
         contract = self.check_contract(manifest)
+        self.check_track_goldens_absent(contract)
         self.check_paired_baseline(contract)
         self.check_scoring(manifest, contract)
         self.check_runner(manifest)

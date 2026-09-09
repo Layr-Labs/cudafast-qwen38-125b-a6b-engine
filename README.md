@@ -147,7 +147,7 @@ current target, so they are not runnable against this track today
 | `tools/` | Setup, build (`tools/ds4/`), staging, lint, and measurement scripts. | Trusted |
 | `benchd-bin/` | Where `./tools/fetch-benchd.sh` installs the verified binary. Git ignores it. | Fetched |
 | `mtp-head/` | The organizer-staged MTP head slot (holds only its `README.md`). | Editable |
-| `correctness_prompts/` | The seed's public prompts (Gemma captures). | Trusted |
+| `correctness_prompts/` | The public prompts and public goldens for local runs (Gemma captures). The track goldens are NOT here: they live in R2 and on the ranked box. | Trusted |
 | `benchmark.json` | The Yukon track manifest. It lists every editable path. | Trusted |
 
 `benchmark.json` `editablePaths` lists three entries: `harness/`,
@@ -550,11 +550,22 @@ Staging the goldens onto the ranked box and registering the runner remain
 box/organizer work. Nothing in a submission can change the arm state or the pins
 -- the contract fixture is trusted-side and is not an editable path.
 
-> **NOTE — the track goldens are checked into this repository.**
-> The 8 timed-pool goldens live in
-> `correctness_prompts/qwen3.8-125b-a6b-cuda-v1/` and are pinned by
-> `{sha256, bytes}`. Keep every change prompt-independent and model-general
-> regardless.
+> **NOTE — the track goldens are not in this repository.**
+> The 8 timed-pool tapes and the 6 per-depth oracles are organizer material.
+> They are published in R2 at the `r2_path` keys the contract pins. The ranked
+> box stages them out of band into the directory its runner service exports as
+> `MLXFAST_QWEN38_GOLDEN_DIR`. `tools/ranked-box-preflight.sh` verifies every
+> file there against the contract's `{sha256, bytes}` and refuses an extra
+> `*.json`. They are never in git, so your clone does not carry them. Keep every
+> change prompt-independent and model-general.
+>
+> The organizer stages them with the signer this repository vendors:
+>
+> ```bash
+> R2_BUCKET_ENDPOINT=... R2_ACCESS_KEY_ID=... R2_SECRET_ACCESS_KEY=... \
+>   tools/fetch-goldens.sh --all --out "$MLXFAST_QWEN38_GOLDEN_DIR"
+> tools/ranked-box-preflight.sh
+> ```
 
 There is ONE speculative arm on this track. `allowed_modes` declares `serial`
 and `mtp` only. DFlash was a Gemma-era second arm and is removed.

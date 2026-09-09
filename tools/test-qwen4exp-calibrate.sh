@@ -124,9 +124,25 @@ POOL_NAMES="$(jq -r '.timed_prompt_pool[] | (.r2_path | split("/") | last | sub(
 POOL_COUNT="$(printf '%s\n' "${POOL_NAMES}" | wc -l | tr -d ' ')"
 LIVE_GOLDEN="$(jq -r '.live_golden' "${REPO_ROOT}/fixtures/qwen3_8_125b_a6b_track.json")"
 
+# The staged golden pool. The track goldens are organizer material published in
+# R2 and staged on the box, so nothing in this checkout can stand in for them:
+# the pool is synthesized from the contract's own names and handed to the driver
+# through the same variable the box exports. The driver builds capture argv from
+# the paths; the bytes are benchd's business, and benchd is a stub here.
+GOLDEN_DIR="${WORK}/goldens"
+mkdir -p "${GOLDEN_DIR}"
+while read -r base; do
+  [ -n "${base}" ] || continue
+  echo '{}' > "${GOLDEN_DIR}/${base}"
+done <<POOLEOF
+$(jq -r '.timed_prompt_pool[].r2_path | split("/") | last' \
+  "${REPO_ROOT}/fixtures/qwen3_8_125b_a6b_track.json")
+POOLEOF
+
 drive() { # drive OUTFILE [args...]
   local out="$1"; shift
   env PATH="${BIN}:${PATH}" \
+      MLXFAST_QWEN38_GOLDEN_DIR="${GOLDEN_DIR_OVERRIDE-${GOLDEN_DIR}}" \
       QWEN4EXP_CALIBRATE_SETSID=1 \
       QWEN4EXP_CALIBRATE_SERVE_UP="${BIN}/serve-up.sh" \
       QWEN4EXP_CALIBRATE_SPEC_DECLARATION="${BIN}/spec-declaration.sh" \
@@ -267,7 +283,7 @@ exit 1
 TRIPEOF
   chmod 755 "${FETCH}"
 
-  env -u BENCHD PATH="${BIN}:${PATH}"       QWEN4EXP_CALIBRATE_SETSID=1       QWEN4EXP_CALIBRATE_SERVE_UP="${BIN}/serve-up.sh"       QWEN4EXP_CALIBRATE_SPEC_DECLARATION="${BIN}/spec-declaration.sh"       STUB_SERVE_LOG="${WORK}/serve.log"       STUB_BENCHD_LOG="${WORK}/benchd.log"       "${DRIVER}" --weights "${WEIGHTS}" --lock "${LOCK}" --dry-run       > "${WORK}/nofetch.out" 2>&1
+  env -u BENCHD PATH="${BIN}:${PATH}"       MLXFAST_QWEN38_GOLDEN_DIR="${GOLDEN_DIR}"       QWEN4EXP_CALIBRATE_SETSID=1       QWEN4EXP_CALIBRATE_SERVE_UP="${BIN}/serve-up.sh"       QWEN4EXP_CALIBRATE_SPEC_DECLARATION="${BIN}/spec-declaration.sh"       STUB_SERVE_LOG="${WORK}/serve.log"       STUB_BENCHD_LOG="${WORK}/benchd.log"       "${DRIVER}" --weights "${WEIGHTS}" --lock "${LOCK}" --dry-run       > "${WORK}/nofetch.out" 2>&1
   rc=$?
   restore_fetch
 

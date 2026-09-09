@@ -115,6 +115,64 @@ else
 fi
 
 if [[ "${scaffold_ready}" == "1" ]]; then
+  # --- the submission root ---------------------------------------------------
+  # THE PINNED GOLDENS ARE NOT IN ANY TREE. They are organizer material
+  # published in R2 and staged on the box, so this suite stages a SYNTHETIC pool
+  # and re-pins a COPY of the contract to it. Everything else in the root is
+  # this checkout, entry by entry, so the preflight under test is the real one
+  # reading the real serve script, the real spec declaration and the real
+  # engine tree.
+  #
+  # tools/ must be a real directory holding symlinks rather than a symlink to
+  # tools/: the preflight derives its repository root from its own PHYSICAL
+  # location, and a symlinked tools/ would resolve back to this checkout and
+  # read the shipped contract instead of the re-pinned copy.
+  ROOT="${WORK}/root"
+  mkdir -p "${ROOT}/tools" "${ROOT}/fixtures"
+  for entry in "${REPO_ROOT}"/tools/*; do
+    ln -s "${entry}" "${ROOT}/tools/$(basename "${entry}")"
+  done
+  for entry in "${REPO_ROOT}"/*; do
+    case "$(basename "${entry}")" in
+      tools|fixtures|correctness_prompts) continue ;;
+    esac
+    ln -s "${entry}" "${ROOT}/$(basename "${entry}")"
+  done
+  PREFLIGHT8="${ROOT}/tools/ranked-box-preflight.sh"
+
+  # The staged pool, and the contract re-pinned to it. Only sha256 and bytes
+  # move; every other field is the shipped fixture's, so the arm gate, the
+  # depth envelope and baseline_reference_commit stay under test.
+  GOLDEN_DIR="${WORK}/goldens"
+  mkdir -p "${GOLDEN_DIR}"
+  python3 - "${FIXTURE}" "${GOLDEN_DIR}" "${ROOT}/fixtures/qwen3_8_125b_a6b_track.json" <<'REPINEOF'
+import hashlib, json, os, sys
+
+src, golden_dir, dst = sys.argv[1:4]
+contract = json.load(open(src, encoding="utf-8"))
+
+
+def stage(r2_path):
+    base = r2_path.rsplit("/", 1)[-1]
+    path = os.path.join(golden_dir, base)
+    if not os.path.exists(path):
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"synthetic_golden": base}) + "\n")
+    data = open(path, "rb").read()
+    return hashlib.sha256(data).hexdigest(), len(data)
+
+
+for entry in contract.get("timed_prompt_pool", []):
+    entry["sha256"], entry["bytes"] = stage(entry["r2_path"])
+for entry in (contract.get("live_golden_speculative") or {}).values():
+    entry["sha256"], entry["bytes"] = stage(entry["r2_path"])
+with open(dst, "w", encoding="utf-8") as fh:
+    json.dump(contract, fh, indent=2)
+    fh.write("\n")
+REPINEOF
+  [[ -s "${ROOT}/fixtures/qwen3_8_125b_a6b_track.json" ]] \
+    || { echo "FAIL: could not re-pin the contract onto the synthetic golden pool" >&2; exit 1; }
+
   STUB="${WORK}/bin"
   mkdir -p "${STUB}"
   cat > "${STUB}/nvcc" <<EOF
@@ -186,9 +244,10 @@ EOF
         MLXFAST_GPU_TEMP_CMD="echo 42" \
         BENCHD_BIN_DIR="${BENCHD_DIR}" \
         RUNNER_NAME="${RUNNER}" \
+        MLXFAST_QWEN38_GOLDEN_DIR="${GOLDEN_DIR}" \
         MLXFAST_BASELINE_WORKSPACE="${WS}" \
         MLXFAST_BASELINE_CALIBRATION="${CAL_OK}" \
-        "$@" "${PREFLIGHT}" 2>&1
+        "$@" "${PREFLIGHT8}" 2>&1
   }
 
   expect_refusal() { # expect_refusal LABEL NEEDLE [env overrides...]
@@ -223,8 +282,16 @@ EOF
     "MLXFAST_BASELINE_CALIBRATION is not set" MLXFAST_BASELINE_CALIBRATION=
   expect_refusal "workspace absent" \
     "is not a directory on this box" "MLXFAST_BASELINE_WORKSPACE=${WORK}/absent"
+  # The candidate tree is the root the preflight runs FROM, which is ${ROOT}
+  # here, so that is the value the refusal has to recognise.
   expect_refusal "workspace is the candidate" \
-    "points at this checkout" "MLXFAST_BASELINE_WORKSPACE=${REPO_ROOT}"
+    "points at this checkout" "MLXFAST_BASELINE_WORKSPACE=${ROOT}"
+  # The staged goldens. They are not in any checkout, so an unset name has
+  # nothing to fall back on and an extra *.json changes the measured cohort.
+  expect_refusal "goldens unstaged" \
+    "MLXFAST_QWEN38_GOLDEN_DIR is unset" MLXFAST_QWEN38_GOLDEN_DIR=
+  expect_refusal "goldens directory absent" \
+    "does not exist or is not a directory" "MLXFAST_QWEN38_GOLDEN_DIR=${WORK}/no-such-goldens"
   expect_refusal "runner unnamed" \
     "has no RUNNER_NAME" RUNNER_NAME=
 

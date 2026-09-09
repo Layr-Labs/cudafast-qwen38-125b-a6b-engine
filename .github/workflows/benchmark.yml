@@ -228,34 +228,25 @@ jobs:
     # rather than finishing at minute 359. 240 min is the pathological ceiling
     # this cap must not be BELOW, not the expected cost.
     timeout-minutes: 360
-    env:
-      # A dispatched ranked job runs from a FRESH actions/checkout with an empty
-      # process environment (bundles-no-keys: no runner-service env is wired yet --
-      # that provisioning is the multi-box/public follow-up). Every staged asset the
-      # scored path needs but the checkout does not carry is pointed at its
-      # converge-staged location on THIS track's box (test-spark) here, so the
-      # references are committed, reviewed workflow lines -- traceable to the
-      # m5-machine-scripts staging manifest, not ad-hoc box edits. Paths verified
-      # present on the box.
-      #
-      # 1. Pinned pool goldens: COMMITTED in this repo, so point at the run's own
-      #    checkout. ranked-box-preflight.sh verifies every golden byte-then-sha
-      #    against the contract pins regardless of directory, so this cannot weaken
-      #    the gate; a production box overrides it to organizer-staged hidden goldens.
-      MLXFAST_QWEN38_GOLDEN_DIR: ${{ github.workspace }}/correctness_prompts/qwen3.8-125b-a6b-cuda-v1
-      # 2. The engine build cache root. UNLIKE the two below, this one is
-      #    OPTIONAL: a box that has not staged it, or has an empty one, builds
-      #    the engine exactly as it always did. It only ever removes work, and
-      #    tools/ds4/build-cache.sh refuses any entry whose recorded inputs do
-      #    not match this checkout. Left unset here so the runner service's own
-      #    value wins; the script falls back to ~/.cache/cudafast-engine-build.
-      # 3. The ~173 GiB GGUF target snapshot (MLXFAST_TARGET_SNAPSHOT_DIR) and
-      # 4. the pinned benchd pair (BENCHD_BIN_DIR) are NOT named here. Every
-      #    box in the fleet stages them where its converge units put them and
-      #    exports both variables from the runner service's environment
-      #    (fleet-bootstrap owns that file). No literal home path lives in this
-      #    workflow: a box that does not export them is refused by the step
-      #    below, before any work.
+    # THIS JOB SETS NO ENVIRONMENT OF ITS OWN. Every staged asset the scored path
+    # needs but the checkout does not carry comes from the runner service's
+    # environment, which fleet-bootstrap owns:
+    #
+    #   MLXFAST_TARGET_SNAPSHOT_DIR   the ~173 GiB GGUF target snapshot
+    #   BENCHD_BIN_DIR                the pinned benchd pair
+    #   MLXFAST_QWEN38_GOLDEN_DIR     the staged track goldens. They are
+    #                                 organizer material published in R2 and
+    #                                 staged on the box out of band, so no
+    #                                 checkout carries them and there is nothing
+    #                                 here to point at.
+    #   MLXFAST_BASELINE_WORKSPACE    the built reference tree
+    #   MLXFAST_BASELINE_CALIBRATION  this box's calibration file
+    #
+    # Every box in the fleet stages them where its converge units put them, so no
+    # literal home path lives in this workflow: a box that does not export them
+    # is refused by the step below, before any work. The engine build cache root
+    # is OPTIONAL and is likewise left to the runner service; the script falls
+    # back to ~/.cache/cudafast-engine-build.
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -285,7 +276,11 @@ jobs:
           # REFERENCE tree the serial-control leg runs on: under the paired
           # model there is no stored pair to fall back on, so a box without it
           # cannot produce a score at all and is refused here.
-          for var in MLXFAST_TARGET_SNAPSHOT_DIR BENCHD_BIN_DIR MLXFAST_BASELINE_WORKSPACE; do
+          # MLXFAST_QWEN38_GOLDEN_DIR holds the staged track goldens. They are
+          # organizer material published in R2 and staged on the box out of
+          # band; they are never in the checkout, so an unset variable here has
+          # no in-repo copy to fall back on and is refused.
+          for var in MLXFAST_TARGET_SNAPSHOT_DIR BENCHD_BIN_DIR MLXFAST_BASELINE_WORKSPACE MLXFAST_QWEN38_GOLDEN_DIR; do
             eval "value=\${${var}:-}"
             if [[ -z "${value}" ]]; then
               echo "::error::${var} is not exported by the runner service environment (fleet-bootstrap stages the asset and exports its path)" >&2
@@ -309,7 +304,7 @@ jobs:
             command -v "${tool}" >/dev/null 2>&1 || { echo "::error::${tool} is not on the runner service PATH (fleet-bootstrap owns the unit's PATH)" >&2; fail=1; }
           done
           [[ "${fail}" == "0" ]] || exit 1
-          echo "runner environment ok: snapshot=${MLXFAST_TARGET_SNAPSHOT_DIR} benchd=${BENCHD_BIN_DIR} reference=${MLXFAST_BASELINE_WORKSPACE} calibration=${MLXFAST_BASELINE_CALIBRATION} nvcc=$(command -v nvcc) cargo=$(command -v cargo)"
+          echo "runner environment ok: snapshot=${MLXFAST_TARGET_SNAPSHOT_DIR} benchd=${BENCHD_BIN_DIR} reference=${MLXFAST_BASELINE_WORKSPACE} calibration=${MLXFAST_BASELINE_CALIBRATION} goldens=${MLXFAST_QWEN38_GOLDEN_DIR} nvcc=$(command -v nvcc) cargo=$(command -v cargo)"
 
       - name: Reference workspace is the pinned baseline, and it is built
         # THE SERIAL CONTROL LEG RUNS ON THIS TREE. Under the paired model the

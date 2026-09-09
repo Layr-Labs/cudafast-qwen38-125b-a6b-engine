@@ -127,6 +127,15 @@ jq --arg c "${REF_COMMIT}" '.baseline_reference_commit = $c' \
   "${REPO_ROOT}/fixtures/qwen3_8_125b_a6b_track.json" > "${FIXTURE}"
 LIVE_GOLDEN="$(jq -r '.live_golden' "${FIXTURE}")"
 
+# The staged golden pool. The track goldens are organizer material published in
+# R2 and staged on the box, so there is no copy in this checkout to point at:
+# the pool is synthesized here and named through the same variable the box
+# exports. The driver resolves the live golden's PATH from it; the bytes are
+# benchd's business, and benchd is a stub in this suite.
+GOLDEN_DIR="${WORK}/goldens"
+mkdir -p "${GOLDEN_DIR}"
+echo '{}' > "${GOLDEN_DIR}/${LIVE_GOLDEN}.golden.json"
+
 WEIGHTS="${WORK}/weights"; mkdir -p "${WEIGHTS}"
 LOCK="${WORK}/never-taken.lock"
 BOX="test-box-1"
@@ -137,6 +146,7 @@ drive() { # drive OUTFILE [args...]
       CALIBRATE_BOX_SETSID=1 \
       MLXFAST_BASELINE_WORKSPACE="${WS_OVERRIDE-${WS}}" \
       MLXFAST_TARGET_SNAPSHOT_DIR="${WEIGHTS}" \
+      MLXFAST_QWEN38_GOLDEN_DIR="${GOLDEN_DIR_OVERRIDE-${GOLDEN_DIR}}" \
       BENCHD_BIN_DIR="${BENCHD_DIR}" \
       STUB_SERVE_LOG="${WORK}/serve.log" \
       STUB_BENCHD_LOG="${WORK}/benchd.log" \
@@ -163,7 +173,7 @@ DRY_FLAGS=(
   "--baseline-workspace ${WS}"
   "--engine .build/release/mlxfast-runtime-worker"
   "--weights ${WEIGHTS}"
-  "--golden ${REPO_ROOT}/correctness_prompts/qwen3.8-125b-a6b-cuda-v1/${LIVE_GOLDEN}.golden.json"
+  "--golden ${GOLDEN_DIR}/${LIVE_GOLDEN}.golden.json"
   "--out ${WORK}/out1/baseline-calibration.json"
   "--passes 4"
   "--box ${BOX}"
@@ -212,7 +222,7 @@ run_missing=0
 for needle in "--baseline-workspace ${WS}" \
               "--engine .build/release/mlxfast-runtime-worker" \
               "--weights ${WEIGHTS}" \
-              "--golden ${REPO_ROOT}/correctness_prompts/qwen3.8-125b-a6b-cuda-v1/${LIVE_GOLDEN}.golden.json" \
+              "--golden ${GOLDEN_DIR}/${LIVE_GOLDEN}.golden.json" \
               "--out ${OUT}" "--passes 4" "--box ${BOX}" \
               "--track qwen3.8-125b-a6b-cuda-v1" "--prompt ${LIVE_GOLDEN}" \
               "--reference-commit ${REF_COMMIT}" \
@@ -338,6 +348,7 @@ mkdir -p "${BAD_BENCHD_DIR}"
 printf '{"sha256":"aa","bytes":1}\n' > "${BAD_BENCHD_DIR}/benchd.manifest.json"
 env PATH="${BIN}:${PATH}" CALIBRATE_BOX_SETSID=1 \
     MLXFAST_BASELINE_WORKSPACE="${WS}" MLXFAST_TARGET_SNAPSHOT_DIR="${WEIGHTS}" \
+    MLXFAST_QWEN38_GOLDEN_DIR="${GOLDEN_DIR}" \
     BENCHD_BIN_DIR="${BAD_BENCHD_DIR}" \
     STUB_SERVE_LOG="${WORK}/serve.log" STUB_BENCHD_LOG="${WORK}/benchd.log" \
     BENCHD="${BIN}/benchd" \
@@ -347,6 +358,16 @@ env PATH="${BIN}:${PATH}" CALIBRATE_BOX_SETSID=1 \
 grep -q 'REFUSE unattributable-benchd' "${WORK}/benchdcommit.out" \
   && ok "case 10: a band cannot be captured by an unattributable benchd" \
   || fail "case 10: the refusal did not name unattributable-benchd"
+
+# --- case 11: the staged golden pool is required ----------------------------
+# There is no in-repo copy any more, so an unset variable has nothing to fall
+# back on. It must be refused by name, before the lock and before any serve.
+GOLDEN_DIR_OVERRIDE="" \
+drive "${WORK}/case11.out" "${BOX}" "${WORK}/out11.json" --dry-run
+[ $? -ne 0 ] || fail "case 11: the driver ran with no staged golden pool"
+grep -q "MLXFAST_QWEN38_GOLDEN_DIR is unset" "${WORK}/case11.out" \
+  && ok "case 11: an unstaged golden pool refuses by name" \
+  || fail "case 11: the refusal did not name MLXFAST_QWEN38_GOLDEN_DIR"
 
 if [ "${failures}" -eq 0 ]; then
   echo "PASS: test-calibrate-box.sh"

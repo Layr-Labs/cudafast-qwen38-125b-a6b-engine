@@ -118,7 +118,7 @@ usage: calibrate-box.sh <box> <out> [options]
 ENV:
   MLXFAST_BASELINE_WORKSPACE     the built reference tree (required)
   MLXFAST_TARGET_SNAPSHOT_DIR    the pinned target snapshot (required)
-  MLXFAST_QWEN38_GOLDEN_DIR      staged goldens (default: this repo's correctness_prompts)
+  MLXFAST_QWEN38_GOLDEN_DIR      the staged goldens. Required: they are box material
   BENCHD                         a benchd to use as-is (default: tools/fetch-benchd.sh)
   BENCHD_BIN_DIR                 where benchd.manifest.json is read for the
                                  benchd source commit (default: <repo>/benchd-bin)
@@ -234,10 +234,12 @@ export MLXFAST_QWEN_MTP_TRACK_ID="${TRACK_ID}"
 # it. A band captured on another prompt does not describe the scored leg.
 LIVE_GOLDEN="$(jq -r '.live_golden // empty' "${FIXTURE}")"
 [ -n "${LIVE_GOLDEN}" ] || refuse missing-live-golden "${FIXTURE} declares no live_golden"
-GOLDEN_DIR="${MLXFAST_QWEN38_GOLDEN_DIR:-${REPO_DIR}/correctness_prompts/qwen3.8-125b-a6b-cuda-v1}"
+GOLDEN_DIR="${MLXFAST_QWEN38_GOLDEN_DIR:-}"
+[ -n "${GOLDEN_DIR}" ] || refuse missing-golden \
+  "MLXFAST_QWEN38_GOLDEN_DIR is unset; the live golden is staged on the box out of band and this script fetches nothing"
 GOLDEN_PATH="${GOLDEN_DIR}/${LIVE_GOLDEN}.golden.json"
 [ -r "${GOLDEN_PATH}" ] || refuse missing-golden \
-  "cannot read the live golden ${GOLDEN_PATH}; stage the pool, or set MLXFAST_QWEN38_GOLDEN_DIR"
+  "cannot read the live golden ${GOLDEN_PATH}; stage the pool into MLXFAST_QWEN38_GOLDEN_DIR"
 
 # --- benchd -----------------------------------------------------------------
 # Honoured as-is when the caller sets it, exactly as measure-and-score.sh does.

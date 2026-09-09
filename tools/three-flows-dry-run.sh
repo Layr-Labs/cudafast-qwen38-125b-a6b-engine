@@ -189,7 +189,12 @@ ENGINE_HEADER="${WORK}/ds4_qwen4exp.h"
 synthetic_window_engine_header "${ENGINE_HEADER}"
 printf 'MemTotal:       268435456 kB\nMemAvailable:   268435456 kB\n' > "${WORK}/meminfo"
 
-GOLDEN_DIR="${ROOT_DIR}/correctness_prompts/qwen3.8-125b-a6b-cuda-v1"
+# The track goldens are organizer material published in R2 and staged on the
+# box out of band; no tree here carries them, so the staged directory is
+# named and required.
+GOLDEN_DIR="${MLXFAST_QWEN38_GOLDEN_DIR:-}"
+[ -n "${GOLDEN_DIR}" ] || die "MLXFAST_QWEN38_GOLDEN_DIR is unset; stage the track goldens and export the directory"
+[ -d "${GOLDEN_DIR}" ] || die "MLXFAST_QWEN38_GOLDEN_DIR is not a directory: ${GOLDEN_DIR}"
 CONTRACT="${ROOT_DIR}/fixtures/qwen3_8_125b_a6b_track.json"
 
 serve() {
@@ -272,7 +277,7 @@ PY
 
   run_official() {
     local score="$1"
-    MLXFAST_QWEN38_GOLDEN_DIR="${SHADOW}/correctness_prompts/qwen3.8-125b-a6b-cuda-v1" \
+    MLXFAST_QWEN38_GOLDEN_DIR="${GOLDEN_DIR}" \
     MLXFAST_ENGINE_BIN="${ENGINE}" \
     MLXFAST_WEIGHTS_PATH="${WEIGHTS}" \
     MLXFAST_SCORE_PATH="${score}" \
@@ -378,7 +383,7 @@ preflight_in() {
   env -u BENCHD \
       PATH="${STUBBIN}:${PATH}" \
       MLXFAST_GPU_TEMP_CMD="echo 45" \
-      MLXFAST_QWEN38_GOLDEN_DIR="$1/correctness_prompts/qwen3.8-125b-a6b-cuda-v1" \
+      MLXFAST_QWEN38_GOLDEN_DIR="${GOLDEN_DIR}" \
       BENCHD_BIN_DIR="$(cd -- "$(dirname -- "${BENCHD}")" && pwd -P)" \
       "$1/tools/ranked-box-preflight.sh"
 }

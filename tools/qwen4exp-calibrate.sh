@@ -112,7 +112,7 @@ usage: qwen4exp-calibrate.sh --weights DIR [options]
 
 ENV:
   BENCHD                              a benchd to use as-is (default: tools/fetch-benchd.sh)
-  MLXFAST_QWEN38_GOLDEN_DIR           staged goldens (default: this repo's correctness_prompts)
+  MLXFAST_QWEN38_GOLDEN_DIR           the staged goldens. Required: they are box material
   QWEN4EXP_CALIBRATE_SERVE_UP         serve-up.sh to use
   QWEN4EXP_CALIBRATE_SPEC_DECLARATION spec-declaration.sh to use
 EOF
@@ -209,14 +209,13 @@ PIN="${PIN:-${LIVE_GOLDEN}}"
 # The timed pool, as `<name>\t<path>\t<sha256>\t<bytes>` lines. The names, pins
 # and byte counts all come from the fixture; this driver invents none of them.
 GOLDEN_DIR="${MLXFAST_QWEN38_GOLDEN_DIR:-}"
-POOL="$(jq -r --arg dir "${GOLDEN_DIR}" --arg repo "${REPO_DIR}" '
+[ -n "${GOLDEN_DIR}" ] || refuse missing-golden-dir \
+  "MLXFAST_QWEN38_GOLDEN_DIR is unset; the timed-pool goldens are staged on the box out of band and this driver fetches nothing"
+POOL="$(jq -r --arg dir "${GOLDEN_DIR}" '
   .timed_prompt_pool[]
   | (.r2_path | split("/") | last) as $base
   | ($base | sub("\\.golden\\.json$"; "")) as $name
-  | [$name,
-     (if $dir == "" then $repo + "/" + .r2_path else $dir + "/" + $base end),
-     .sha256,
-     (.bytes | tostring)]
+  | [$name, $dir + "/" + $base, .sha256, (.bytes | tostring)]
   | @tsv' "${FIXTURE}")"
 [ -n "${POOL}" ] || refuse empty-pool "${FIXTURE} declares no timed_prompt_pool"
 
