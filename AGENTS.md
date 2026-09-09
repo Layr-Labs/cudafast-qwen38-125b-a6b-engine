@@ -64,16 +64,20 @@ Renaming one would make the name lie about what it holds.
 
 ### Scoring is PAIRED, with a per-box baseline
 
-David ruling 2026-09-08. A ranked run measures TWO legs on the same box, in the
-same job, on the fixture's one `live_golden`.
+David ruling 2026-09-08. A ranked run measures the number of pairs the fixture
+declares in `official_pairs`, which is 2 (David ruling 2026-09-09), on the same
+box in the same job, on the fixture's one `live_golden`.
 
 | Leg | What runs | Speculation |
 |---|---|---|
 | Serial control | the reference tree at the fixture's `baseline_reference_commit` | off, always |
 | Candidate | the dispatched commit | the declared draft depth |
 
-The score is the ratio:
-`(ref_prefill / cand_prefill) ^ 0.25 * (ref_decode / cand_decode) ^ 0.75`.
+The legs run strictly one after the other and each leg loads the model once. Per
+role the per-token times are summed over the pairs, and the score is the live
+ratio of those sums:
+`(ref_prefill / cand_prefill) ^ 0.25 * (ref_decode / cand_decode) ^ 0.75`. Both
+speedup floors are 0.95 and the ceiling is 5.0, applied to that aggregate.
 
 > **WARNING — no file holds a baseline pair, and none may.**
 > Not a benchmarker constant, not the fixture, not a golden. A golden that

@@ -365,18 +365,16 @@ gain = baseline_aggregate / candidate_aggregate
 
 The score is serial-anchored. A faster candidate scores above 1.
 
-`aggregate` is the **per-prompt sum**. Each pool prompt is timed in its own
-single-stream window, and the elapsed times are added together. Do this for
-prefill and for decode separately. Do it on the baseline leg (the serial
-control) and on the candidate leg (the built-in MTP), over the same prompts.
+`aggregate` is a **sum over the pairs**, per role. Each gain is therefore a
+ratio of sums, not a mean of per-pair ratios. The scored ranked run times the
+ONE prompt `live_golden` names, on every leg.
 
-> **NOTE — the aggregate is a sum of separate windows.**
-> It is not one elapsed time covering all the prompts at once.
+### The pair is measured, not stored
 
-### The two legs
-
-The ranked run measures TWO legs. It measures both on the same machine, in the
-same job, on the same prompt.
+A ranked run measures PAIRS OF LEGS. It measures them on the SAME box, in the
+SAME job, over the ONE prompt the fixture names in `live_golden`. The fixture's
+`official_pairs` sets the count, and it is 2 (David ruling 2026-09-09). Every
+pair is the same two legs in the same order:
 
 | Leg | What runs | Speculation |
 |---|---|---|
@@ -387,7 +385,10 @@ The reference tree is the engine commit that the fixture pins as
 `baseline_reference_commit`. Every ranked box runs the same reference commit, so
 one board compares one control.
 
-The score is the ratio of the two legs.
+The legs run strictly one after the other, and each leg loads the model once.
+Per role the per-token times are summed over the pairs, and the score is the
+ratio of those sums. Every control leg is checked against this box's baseline
+calibration. All the numbers come from the same machine, minutes apart.
 
 > **NOTE — the baseline is measured, not stored.**
 > No file holds a baseline pair. The goldens hold none, the fixture holds none,
@@ -395,15 +396,14 @@ The score is the ratio of the two legs.
 > `benchmark.baseline_prefill_seconds_per_token` or
 > `benchmark.baseline_decode_seconds_per_token` is refused.
 
-This is why the two legs are measured together. A stored number describes the
+This is why each pair is measured together. A stored number describes the
 machine that produced it, at the temperature and on the engine of that day. The
 control leg describes YOUR run, on the same box, minutes before your candidate
 leg.
 
-Each leg loads the model once. The two legs never run at the same time: the
-first leg boots its engine, is measured, and is stopped, and only then does the
-second leg boot. The box holds about 103.7 GiB of weights, so one engine at a
-time is the only arrangement that fits.
+The legs never run at the same time: each leg boots its engine, is measured, and
+is stopped, and only then does the next leg boot. The box holds about 103.7 GiB
+of weights, so one engine at a time is the only arrangement that fits.
 
 The benchmarker boots each leg's engine from that leg's own tree:
 
@@ -446,7 +446,14 @@ measures.
 | Checked decode steps | 128 |
 | Golden shape | 1024 prompt tokens and 129 expected tokens |
 | Concurrent streams | 1 |
-| Prompts in the pinned pool | 8, timed one window each |
+| Timed prompts per leg | 1 (the fixture's `live_golden`) |
+| Prompts in the pinned correctness pool | 8 |
+| Pairs per ranked job | 2 (the fixture's `official_pairs`) |
+| Legs per ranked job | 4 (each pair is serial control, then candidate) |
+
+The correctness-pool row is not the scored timing. The box stages all 8 pinned
+prompts and the preflight verifies all 8. Each timed leg runs the one prompt
+`live_golden` names.
 
 ### The parameters
 
@@ -457,17 +464,22 @@ measures.
 | `decodeGainExponent` | 0.75 |
 | `pairsPerCohort` | 2 |
 | `minPairsPerCohort` | 2 |
-| `decodeSpeedupFloor` | 0.90 |
+| `decodeSpeedupFloor` | 0.95 |
+| `prefillSpeedupFloor` | 0.95 |
 | `decodeSpeedupCeiling` | 5.0 |
 | `kvBackend` | `contiguous` |
 
 The width is fixed at 1. A width other than the declared one has no certified
 series tag, and the benchmarker refuses it rather than run it.
 
-THE B = 1 POINT IS RULED AHEAD OF THE PUBLISHED BENCHMARKER. At the published
-channel tip the width certification accepts 8 only, so a fixture declaring 1 is
-refused there today. The refusal is fail-closed and correct; this repository
-declares the ruled shape and does not work around it.
+**BOTH FLOORS ARE 0.95** (David ruling 2026-09-09). A candidate that regresses
+prefill or decode by more than 5 percent is refused. The floors and the ceiling
+apply to the aggregate over the 2 pairs, not to one pair. The fixture declares
+them as `decode_speedup_floor` and `prefill_speedup_floor`, and the benchmarker
+enforces the fixture's values.
+
+There is no median. Each role's per-token times are summed over the pairs, and
+each gain is the ratio of those sums.
 
 `kvBackend` is pinned `contiguous` on both legs. The benchmarker refuses when
 it cannot honour the pinned backend. It does not degrade to another backend.
@@ -679,9 +691,8 @@ artifact.
 |---|---|
 | What the track measures, path by path | `benchmark.json` |
 | Pins, the timed pool, scoring values | `fixtures/qwen3_8_125b_a6b_track.json` |
-| Why the manifest says what it says | `docs/participant-contract.md` |
+| Why the manifest says what it says, and the measured window | `docs/participant-contract.md` |
 | The engineering log for this port | `docs/qwen38-125b-a6b-port-notes.md` |
-| The measured window and the decode target | `docs/timed-decode-evaluation.md` |
 | What CI covers | `docs/ci-coverage.md` |
 | Agent and contributor guidance | `AGENTS.md` |
 

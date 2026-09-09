@@ -38,12 +38,14 @@
 #   MLXFAST_BASELINE_CALIBRATION  this box's calibration file -- the health band
 #                                 the control leg must land inside
 #
-# PAIRED, WITH A PER-BOX BASELINE (David 2026-09-08). A ranked run measures TWO
-# legs on THIS box in THIS job over the ONE live golden: a SERIAL CONTROL leg on
-# the reference tree and the CANDIDATE leg on the dispatched commit. The score is
-# the ratio. No pair is stored anywhere -- not in a benchd constant, not in the
-# fixture, not in a golden -- so a box that is missing either variable is refused
-# before any work rather than scored against a number from somewhere else.
+# PAIRED, WITH A PER-BOX BASELINE (David 2026-09-08). A ranked run measures the
+# fixture's `official_pairs` PAIRS OF LEGS on THIS box in THIS job over the ONE
+# live golden: each pair is a SERIAL CONTROL leg on the reference tree and a
+# CANDIDATE leg on the dispatched commit. Per role the per-token times are summed
+# over the pairs, and the score is the ratio of those sums. No pair is stored
+# anywhere -- not in a benchd constant, not in the fixture, not in a golden -- so
+# a box that is missing either variable is refused before any work rather than
+# scored against a number from somewhere else.
 #
 # THE RUNNER LABEL IS THE TRACK ID. `runs-on: [self-hosted, Linux, ARM64,
 # qwen3.8-125b-a6b-cuda-v1]` -- the fourth label is branch = track = R2 key
@@ -490,8 +492,8 @@ jobs:
         # has already verified; the dispatch sha comes from the step above via
         # GITHUB_ENV.
         #
-        # TWO SERVES, ONE AT A TIME. The paired run measures two legs and each
-        # leg has its OWN resident engine. benchd boots each one through the
+        # ONE SERVE AT A TIME. The paired run measures 2 pairs, so 4 legs, and
+        # each leg has its OWN resident engine. benchd boots each one through the
         # PER-LEG VERBS, run from that leg's own workspace:
         #
         #   tools/serve-up.sh --boot --spec serial|mtp --draft-len N --socket-out FILE
@@ -533,11 +535,11 @@ jobs:
         # WITHIN a leg the weights still load ONCE. benchd spawns the cuda-engine
         # adapter per phase, but no adapter loads anything: each connects to that
         # leg's resident over DS4_RESIDENT_SOCKET. Two legs is therefore two
-        # loads for the whole run, not two per phase. See docs/ds4-resident.md.
+        # loads per pair, not two per phase. See docs/ds4-resident.md.
         #
         # Both serves boot INSIDE this step's GPU lock (fd 9, held below);
         # serve-up.sh takes no lock of its own. The 50C-class per-phase thermal
-        # gate stays benchd's, and it applies to BOTH legs identically. The box
+        # gate stays benchd's, and it applies to EVERY leg identically. The box
         # provides the snapshot as MLXFAST_TARGET_SNAPSHOT_DIR, staged out of
         # band like every other box asset here.
         run: |

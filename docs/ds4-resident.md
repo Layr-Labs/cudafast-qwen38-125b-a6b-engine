@@ -4,7 +4,7 @@
 
 benchd starts a new `cuda-engine` process for each phase. The phases are
 warmup, timed prefill, timed decode and correctness. An official run repeats
-this for each pair in each cohort, and for both legs.
+this for each leg of each pair.
 
 When the engine is linked into the worker, each phase loads the checkpoint
 again. An official run then does 16 loads or more. The artifact is 103.7 GiB.
