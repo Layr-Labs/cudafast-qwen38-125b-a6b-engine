@@ -347,9 +347,19 @@ This command resolves and verifies the pinned benchmarker binary.
 ```
 
 This command builds the ds4 engine and the `cuda-engine` adapter, stages the
-adapter, then verifies the GGUF target snapshot (box steps that fail closed off
-the box). This track's MTP head is native to the target checkpoint; there is
-no separate head-staging step.
+adapter, then makes the GGUF target snapshot present and verified. With
+`MLXFAST_TARGET_SNAPSHOT_DIR` unset, missing files are downloaded from the
+pinned public model repository into `reference_weights/`, every file is
+checked against the contract's pins, and a rerun there reads no shard. With it
+set (a ranked box), setup only verifies the staged directory, on every run.
+This track's MTP head is native to the target checkpoint; there is no separate
+head-staging step.
+
+```bash
+tools/local-baseline.sh
+```
+
+This command runs the local test on the public golden. It seals no score.
 
 ## Engine tooling
 

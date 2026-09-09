@@ -319,6 +319,17 @@ jobs:
         # weights, GPU, or network.
         run: tools/test-benchmark-facade-env.sh
 
+      - name: Setup fills and verifies the target snapshot, and reruns read no shard
+        # Drives the REAL setup.sh (engine build skipped) against a tiny pinned
+        # snapshot served from a file:// base. Hermetic: no toolchain, GPU,
+        # checkpoint, credential, or network.
+        run: tools/test-setup-onboarding.sh
+
+      - name: Local baseline entry point reaches benchd
+        # Drives the REAL tools/local-baseline.sh, root proxy and facade with
+        # a stub benchd. Hermetic: no toolchain, GPU, checkpoint, or network.
+        run: tools/test-local-baseline.sh
+
       - name: Overlay refuses non-regular submissions before it touches the trusted copy
         # Drives the REAL .github/scripts/overlay-editable-paths.sh over synthetic
         # submissions and asserts the property a rejected submission depends on:

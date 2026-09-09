@@ -67,12 +67,20 @@ and verifies the target snapshot. The steps need different things.
 - A Rust toolchain (`cargo`). The adapter builds with `--features ds4-engine`
   against the shim library. The default (mock) build is portable and needs no
   GPU, so the adapter's own tests run on a laptop and in hosted CI.
-- The organizer-staged GGUF target snapshot on the box, pointed to by
-  `MLXFAST_TARGET_SNAPSHOT_DIR`: the four target shards and, flat beside them,
-  the Q8_0 MTP draft head. `./setup.sh` verifies every file against the
-  `{bytes, sha256}` pins in `fixtures/qwen3_8_125b_a6b_track.json` and FAILS
-  CLOSED when a file or the sidecar manifest is absent. It never fetches,
-  substitutes, or re-quantizes a checkpoint.
+- The GGUF target snapshot: the four target shards and, flat beside them, the
+  Q8_0 MTP draft head. Every file is verified against the `{bytes, sha256}`
+  pins in `fixtures/qwen3_8_125b_a6b_track.json`. Where it lives depends on
+  `MLXFAST_TARGET_SNAPSHOT_DIR`:
+  - Set (a ranked box): the organizer-staged directory. Setup only verifies
+    it, on every run. It fetches nothing, deletes nothing, and FAILS CLOSED
+    when the directory or a file is absent or does not match.
+  - Unset (your own machine): `reference_weights/Qwen3.8-Flash-Next-GGUF`
+    under the checkout. Setup downloads each missing file from the pinned
+    revision of the public model repository (about 114 GB, resumable), keeps a
+    download only when both pins match, and leaves a marker after a verified
+    pass so a rerun there reads no shard.
+
+  Setup never substitutes or re-quantizes a checkpoint.
 - `jq` and Git.
 
 The benchmarker arrives as a prebuilt binary.
@@ -112,10 +120,24 @@ the channel's `benchd.manifest.json` (installed beside the binary).
 ```
 
 This command builds the ds4 engine and the `cuda-engine` adapter, stages the
-adapter at the path benchd resolves, then — as box work that fails closed off
-the box — verifies the GGUF target snapshot against the contract's
-`{bytes, sha256}` pins. See [Requirements](#requirements) for the toolchain
-each step needs and the environment variables that skip a step.
+adapter at the path benchd resolves, then makes the GGUF target snapshot
+present and verified. With `MLXFAST_TARGET_SNAPSHOT_DIR` unset it downloads
+each missing file from the pinned public model repository into
+`reference_weights/` and checks every file against the contract's
+`{bytes, sha256}` pins; a rerun on the same machine reads no shard. With it
+set, setup only verifies the staged directory. See
+[Requirements](#requirements) for the toolchain each step needs and the
+environment variables that skip a step.
+
+```bash
+tools/local-baseline.sh
+```
+
+This command runs the local test: one leg of your engine on the public golden,
+through `./benchmark.sh --local-iterate`, with the cool gate on. It needs no
+organizer material and it seals no score (`score: null` is the expected
+result). It needs the GPU and the snapshot, so it is a box command; off the box
+it stops before the engine boots.
 
 The adapter's own unit tests run without a GPU or a checkpoint:
 
@@ -341,6 +363,10 @@ and the staged goldens. Off the box this repository gives you three signals.
 | The engine builds | `tools/ds4/build.sh` on the box, `tools/ds4/build.sh --cpu-check` off it | Your engine edit compiles, and the shim agrees with the vendored engine. |
 | The adapter is correct | `cargo test --manifest-path harness/protocol-adapter/Cargo.toml` | The protocol loop, the verb translation and every error path, against a mock transport. No GPU. |
 | The scripts hold | `tools/test-*.sh` | The setup, serve, preflight and calibration scripts, against stubs. No GPU. |
+
+On a machine with a GPU and the snapshot, `tools/local-baseline.sh` runs one
+leg of your engine on the public golden through the normal benchmark entry
+point. It measures local correctness and timing and seals no score.
 
 On the box, `tools/serve-up.sh` boots and stops one resident engine, and
 `tools/calibrate-box.sh` records the box's control band. Both are organizer
