@@ -620,3 +620,6 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
                                    char *err, size_t errlen);
 
 #endif
+
+/* organizer verification submission 2026-09-09: benchmark upgrade to official_pairs=2; no behavior change */
+#define DS4_OFFICIAL_PAIRS_VERIFICATION_20260909 1 /* organizer verification of the official_pairs=2 upgrade; unused, no behavior change */
