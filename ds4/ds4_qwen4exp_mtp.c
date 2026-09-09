@@ -781,7 +781,9 @@ enum {
     MTP_HEAD_T_TOP1,
     MTP_HEAD_T_END,
     MTP_HEAD_T_TOP1_IN,
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD)
     MTP_HEAD_T_LOGIT0_IN,
+#endif
     MTP_HEAD_T_MULTI_OUT,
     MTP_HEAD_T_N
 };
@@ -789,7 +791,10 @@ enum {
 static const char *const mtp_head_stage_names[MTP_HEAD_T_N] = {
     "token upload", "multi upload", "embed", "enorm", "hnorm",
     "ehx copies", "eh_proj", "block", "hc mixer", "lm head",
-    "gpu top-1", "end commands", "top-1 readback", "logit-0 readback",
+    "gpu top-1", "end commands", "top-1 readback",
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD)
+    "logit-0 readback",
+#endif
     "multi readback"
 };
 
@@ -834,9 +839,10 @@ static int mtp_head_time_on(void) {
         }                                                                     \
     } while (0)
 
-/* The forward proper.  `last_only` narrows the readback to the final row:
- * one top-1 id plus its entry-zero logit, and one `hyper` row into multi_out.
- * The logits and their device-side top-1 reduction still run for every row. */
+/* The forward proper.  `last_only` narrows the CUDA readback to the final
+ * row's top-1 id and one `hyper` row into multi_out.  Metal and ROCm retain a
+ * scalar logit-zero readback for their host NaN guard.  The logits and their
+ * device-side top-1 reduction still run for every row. */
 static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                                  const int *next_tokens,
                                  const float *multi_in,
@@ -975,8 +981,13 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
         /* The head exposes only draft ids.  Keep the LM-head arithmetic intact,
          * reduce each finite logit row on the device and read back one id
          * instead of the full vocabulary row for a host scan. */
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        ok = ds4_gpu_qwen4exp_mtp_top1_tensor(h->t_top1, h->t_logits,
+                                               h->n_vocab, n_tokens) != 0;
+#else
         ok = ds4_gpu_indexer_topk_tensor(h->t_top1, h->t_logits,
                                          h->n_vocab, n_tokens, 1u) != 0;
+#endif
     }
     MTP_HEAD_TICK(MTP_HEAD_T_TOP1);
     if (ok) ok = ds4_gpu_end_commands() != 0;
@@ -984,8 +995,9 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
     MTP_HEAD_TICK(MTP_HEAD_T_END);
 
     /* Which results come back: every one, or the last alone.  The rows before
-     * the last are seeds in the last_only case; reducing them is cheap, and
-     * only the final id and its entry-zero logit cross to the host. */
+     * the last are seeds in the last_only case; reducing them is cheap.  CUDA
+     * returns only the final id; Metal and ROCm also return its logit zero for
+     * the host NaN guard below. */
     const uint32_t first_row = last_only ? n_tokens - 1u : 0u;
     const uint32_t out_rows = n_tokens - first_row;
     if (ok) {
@@ -996,6 +1008,7 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                                  (uint64_t)out_rows * sizeof(uint32_t)) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_TOP1_IN);
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD)
     if (ok) {
         stage = "logit-0 readback";
         for (uint32_t t = 0; ok && t < out_rows; t++) {
@@ -1018,6 +1031,7 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
         }
     }
     MTP_HEAD_TICK(MTP_HEAD_T_LOGIT0_IN);
+#endif
     if (ok && multi_out) {
         stage = "multi readback";
         ok = ds4_gpu_tensor_read(h->t_hyper,

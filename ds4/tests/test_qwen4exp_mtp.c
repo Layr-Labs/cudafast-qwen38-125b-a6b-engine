@@ -1518,6 +1518,9 @@ struct ds4_gpu_tensor {
     int is_view;
 };
 
+static uint64_t g_tensor_read_calls;
+static uint64_t g_tensor_read_bytes;
+
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     ds4_gpu_tensor *t = calloc(1, sizeof(*t));
     if (!t) return NULL;
@@ -1540,6 +1543,8 @@ int ds4_gpu_tensor_write(ds4_gpu_tensor *t, uint64_t off, const void *src,
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *t, uint64_t off, void *dst,
                         uint64_t bytes) {
     if (!t || off + bytes > t->bytes) return 0;
+    g_tensor_read_calls++;
+    g_tensor_read_bytes += bytes;
     memcpy(dst, t->data + off, (size_t)bytes);
     return 1;
 }
@@ -1577,6 +1582,26 @@ int ds4_gpu_indexer_topk_tensor(ds4_gpu_tensor *selected,
     }
     return 1;
 }
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+int ds4_gpu_qwen4exp_mtp_top1_tensor(ds4_gpu_tensor *selected,
+                                      const ds4_gpu_tensor *logits,
+                                      uint32_t n_vocab,
+                                      uint32_t n_tokens) {
+    if (!selected || !logits || n_vocab == 0u || n_tokens == 0u ||
+        n_vocab > UINT64_MAX / sizeof(float) / n_tokens ||
+        logits->bytes < (uint64_t)n_vocab * n_tokens * sizeof(float) ||
+        selected->bytes < (uint64_t)n_tokens * sizeof(uint32_t)) {
+        return 0;
+    }
+    uint32_t *out = (uint32_t *)selected->data;
+    const float *in = (const float *)logits->data;
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        out[t] = (uint32_t)ds4_qwen4exp_mtp_argmax(
+            in + (size_t)t * n_vocab, n_vocab);
+    }
+    return 1;
+}
+#endif
 int ds4_gpu_begin_commands(void) { return 1; }
 int ds4_gpu_end_commands(void) { return 1; }
 int ds4_gpu_synchronize(void) { return 1; }
@@ -1863,10 +1888,20 @@ static void test_head_wiring(void) {
     }
     int draft[HEAD_ROWS] = { -1, -1 };
     float multi_out[HEAD_ROWS * HEAD_HC_DIM];
+    g_tensor_read_calls = 0u;
+    g_tensor_read_bytes = 0u;
     CHECK(ds4_qwen4exp_mtp_head_forward(&h, next_tokens, multi_in, 12u,
                                         HEAD_ROWS, draft, multi_out,
                                         g_err, sizeof(g_err)) == 0,
           "head forward failed: %s", g_err);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    CHECK(g_tensor_read_calls == 2u &&
+          g_tensor_read_bytes == sizeof(draft) + sizeof(multi_out),
+          "head forward made %llu reads over %llu bytes, expected only top-1 "
+          "and multi readbacks",
+          (unsigned long long)g_tensor_read_calls,
+          (unsigned long long)g_tensor_read_bytes);
+#endif
 
     /* Call order. */
     static const char *want[] = { "embed", "rms_norm", "rms_norm", "matmul",
@@ -2001,11 +2036,21 @@ static void test_head_wiring(void) {
         int draft_last[1] = { -1 };
         float multi_last[HEAD_HC_DIM];
         const int calls_before = g_log.n_log;
+        g_tensor_read_calls = 0u;
+        g_tensor_read_bytes = 0u;
         CHECK(ds4_qwen4exp_mtp_head_forward_last(&h, next_tokens, multi_in,
                                                  12u, HEAD_ROWS, draft_last,
                                                  multi_last,
                                                  g_err, sizeof(g_err)) == 0,
               "last-row head forward failed: %s", g_err);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        CHECK(g_tensor_read_calls == 2u &&
+              g_tensor_read_bytes == sizeof(draft_last) + sizeof(multi_last),
+              "last-row forward made %llu reads over %llu bytes, expected "
+              "only top-1 and multi readbacks",
+              (unsigned long long)g_tensor_read_calls,
+              (unsigned long long)g_tensor_read_bytes);
+#endif
         CHECK(g_log.n_log - calls_before == n_want,
               "the last-row forward made %d calls, expected %d",
               g_log.n_log - calls_before, n_want);
@@ -2046,10 +2091,19 @@ static void test_head_wiring(void) {
             int got_last[1] = { -1 };
             g_forced_lm_logits = cases[c];
             g_forced_lm_rows = HEAD_ROWS;
+            g_tensor_read_calls = 0u;
+            g_tensor_read_bytes = 0u;
             CHECK(ds4_qwen4exp_mtp_head_forward(&h, next_tokens, multi_in,
                                                  12u, HEAD_ROWS, got, NULL,
                                                  g_err, sizeof(g_err)) == 0,
                   "special-value head forward failed: %s", g_err);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+            CHECK(g_tensor_read_calls == 1u && g_tensor_read_bytes == sizeof(got),
+                  "special-value case %u made %llu reads over %llu bytes; "
+                  "logits must stay on device",
+                  c, (unsigned long long)g_tensor_read_calls,
+                  (unsigned long long)g_tensor_read_bytes);
+#endif
             for (uint32_t t = 0; t < HEAD_ROWS; t++) {
                 const int want = ds4_qwen4exp_mtp_argmax(
                     cases[c] + (size_t)t * HEAD_N_VOCAB, HEAD_N_VOCAB);
@@ -2057,10 +2111,20 @@ static void test_head_wiring(void) {
                       "special-value case %u row %u drafted %d, CPU reference %d",
                       c, t, got[t], want);
             }
+            g_tensor_read_calls = 0u;
+            g_tensor_read_bytes = 0u;
             CHECK(ds4_qwen4exp_mtp_head_forward_last(
                       &h, next_tokens, multi_in, 12u, HEAD_ROWS, got_last,
                       NULL, g_err, sizeof(g_err)) == 0,
                   "special-value last-row forward failed: %s", g_err);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+            CHECK(g_tensor_read_calls == 1u &&
+                  g_tensor_read_bytes == sizeof(got_last),
+                  "special-value case %u last-only made %llu reads over %llu "
+                  "bytes; logits must stay on device",
+                  c, (unsigned long long)g_tensor_read_calls,
+                  (unsigned long long)g_tensor_read_bytes);
+#endif
             CHECK(got_last[0] == got[HEAD_ROWS - 1u],
                   "special-value case %u last-only drafted %d, multi-row %d",
                   c, got_last[0], got[HEAD_ROWS - 1u]);
