@@ -2117,9 +2117,6 @@ static int qwen4exp_moe_tile(uint32_t n_rows) {
     }
     if (n_rows >= 8u) return 8;
     if (n_rows >= 4u) return 4;
-    /* Decode/verify widths (1-7 rows): the 8-wide padded dp4a tile is
-     * measurably faster on GB10 than the per-row kernel and emits identical
-     * output (row-invariant by construction; stream-diffed over three seeds). */
     return 8;
 }
 
@@ -3159,8 +3156,26 @@ __global__ static void qwen4exp_qsa_attention_kernel(
             if (key >= 0 && (uint32_t)key < cache_cap) {
                 const float *kv = k_cache +
                     (uint64_t)key * kv_stride + (uint64_t)kv_head * head_dim;
+                /* Vector loads, scalar order.  The dot keeps the one running
+                 * accumulator and the ascending-d multiply-adds of the loop it
+                 * replaces -- same operands, same order, same contraction --
+                 * so the score is the same bits; only the load count drops
+                 * (one 16-byte load where four 4-byte ones stood, both sides
+                 * 16-byte aligned: kv rows start at a multiple of head_dim
+                 * floats and d walks in fours).  The QK dot is a dependent
+                 * FMA chain, so the fetch width was the instruction budget
+                 * of the whole attention kernel. */
                 float dot = 0.0f;
-                for (uint32_t d = 0; d < head_dim; d++) dot += qvec[d] * kv[d];
+                uint32_t d = 0;
+                for (; d + 4u <= head_dim; d += 4u) {
+                    const float4 q4 = *(const float4 *)(qvec + d);
+                    const float4 k4 = *(const float4 *)(kv + d);
+                    dot += q4.x * k4.x;
+                    dot += q4.y * k4.y;
+                    dot += q4.z * k4.z;
+                    dot += q4.w * k4.w;
+                }
+                for (; d < head_dim; d++) dot += qvec[d] * kv[d];
                 score = dot * scale;
             } else {
                 key = -1;

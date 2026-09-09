@@ -17083,20 +17083,35 @@ __global__ static void matmul_f32_rows_exact_tile_kernel(
         }
     }
 
-    __shared__ float partial[256];
-#pragma unroll 1
+    /* One INTERLEAVED tree instead of R sequential ones.  Row r still gets
+     * the identical reduction it always had: partial[r][tid] starts from
+     * sum[r] and the same stride-halving adds the same partner lanes in the
+     * same order, so every output is the same bits.  What changes is only
+     * that the R trees share their barriers -- one __syncthreads per stride
+     * level for all rows together (R + 8 syncs instead of R x 10), which
+     * takes the kernel off the barrier budget it was measured on. */
+    __shared__ float partial[R][256];
+#pragma unroll
     for (int r = 0; r < R; r++) {
-        __syncthreads();
-        partial[threadIdx.x] = sum[r];
-        __syncthreads();
-        for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-            if (threadIdx.x < stride) {
-                partial[threadIdx.x] += partial[threadIdx.x + stride];
+        partial[r][threadIdx.x] = sum[r];
+    }
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                partial[r][threadIdx.x] += partial[r][threadIdx.x + stride];
             }
-            __syncthreads();
         }
-        if (threadIdx.x == 0 && (uint32_t)r < take) {
-            out[((uint64_t)row0 + (uint64_t)r) * out_dim + row] = partial[0];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            if ((uint32_t)r < take) {
+                out[((uint64_t)row0 + (uint64_t)r) * out_dim + row] =
+                    partial[r][0];
+            }
         }
     }
 }
