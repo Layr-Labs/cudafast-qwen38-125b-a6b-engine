@@ -323,19 +323,19 @@ gain = baseline_aggregate / candidate_aggregate
 The score is serial-anchored. A faster candidate scores above 1.
 
 **THE SCORED SHAPE IS SINGLE-STREAM.** David ruling 2026-08-27, relayed by
-orchestrator: this track scores a PAIRED serial-against-MTP comparison over the
-pinned prompt pool, ONE stream at a time, at `scored_batch_size` 1. The batch-8
-cohort adaptation is NOT pursued.
+orchestrator: this track scores a PAIRED serial-against-MTP comparison, ONE
+stream at a time, at `scored_batch_size` 1. The batched cohort adaptation is NOT
+pursued.
 
-`aggregate` is the **per-prompt sum**. Run each of the 8 pinned prompts in its
-own single-stream window and add the 8 elapsed times together. Do this for
-prefill and for decode separately. Do it on the baseline leg and on the
-candidate leg, over the same 8 prompts. Each gain is therefore a RATIO OF SUMS
-over the accepted pairs, not a mean of per-pair ratios.
+`aggregate` is a **sum over the pairs**, per role. Each gain is therefore a
+RATIO OF SUMS, not a mean of per-pair ratios. The scored ranked run times the
+ONE prompt `live_golden` names, on every leg.
 
-**THE BASELINE LEG IS MEASURED, NOT STORED.** David ruling 2026-09-08. The
-ranked run measures two legs on the same machine, in the same job, on the same
-prompt:
+**THE BASELINE LEG IS MEASURED, NOT STORED.** David ruling 2026-09-08. A ranked
+run measures PAIRS OF LEGS. It measures them on the SAME box, in the SAME job,
+over the ONE prompt the fixture names in `live_golden`. The fixture's
+`official_pairs` sets the count, and it is 2 (David ruling 2026-09-09). Every
+pair is the same two legs in the same order:
 
 | Leg | What runs | Speculation |
 |---|---|---|
@@ -352,7 +352,16 @@ composite = (ref_prefill_spt / cand_prefill_spt) ^ 0.25
           * (ref_decode_spt  / cand_decode_spt)  ^ 0.75
 ```
 
-The floors and the ceilings do not change.
+The legs run STRICTLY ONE AFTER THE OTHER, and each leg loads the model once.
+Per role the per-token times are SUMMED over the pairs, and each gain is the
+ratio of those two sums. The floors, the ceiling and the acceptance bands apply
+to that aggregate, not to one pair. Every control leg is checked against this
+box's own baseline calibration (section 5.5.1).
+
+**BOTH SPEEDUP FLOORS ARE 0.95** (David ruling 2026-09-09). A candidate that
+regresses prefill or decode by more than 5 percent is refused. The fixture
+declares them as `decode_speedup_floor` and `prefill_speedup_floor`, and the
+benchmarker enforces the fixture's values. The ceiling stays 5.0.
 
 NO FILE HOLDS A BASELINE PAIR. The goldens hold none, the fixture holds none,
 and the benchmarker holds none. A golden that carries
@@ -425,8 +434,19 @@ else, and never re-prefilled.
 | Checked decode steps | 128 |
 | Golden shape | 1024 `prompt_tokens` and 129 `expected_tokens` |
 | Streams per window | 1 |
-| Prompts in the scored pool | 8 |
-| Prefill tokens per pool pass | 8 x 1024 |
+| Timed prompts per leg | 1 (the fixture's `live_golden`) |
+| Prompts in the pinned correctness pool | 8 |
+| Prefill tokens per correctness-pool pass | 8 x 1024 |
+| Pairs per ranked job | 2 (the fixture's `official_pairs`) |
+| Legs per ranked job | 4 (each pair is serial control, then candidate) |
+
+The correctness-pool rows are not the scored timing. The box stages all 8 pinned
+prompts and `tools/ranked-box-preflight.sh` verifies all 8 against the fixture
+pins. Each timed leg runs the ONE prompt `live_golden` names, and section 5.1
+states what that timing produces.
+
+The legs run one after the other, in one job. Each leg loads the weights once,
+and each leg gets its own worker residency.
 
 `MLXFastConstants.correctnessPromptTokens`, `benchmarkPrefillPromptTokens`, and
 `benchmarkDecodeSeedTokens` all equal 1024. `benchmarkDecodeSteps` is 128.
@@ -447,17 +467,17 @@ or implausible value. Only pairs accepted under that gate feed the composite.
 | `decodeGainExponent` | 0.75 |
 | `pairsPerCohort` | 2 |
 | `minPairsPerCohort` | 2 |
-| `decodeSpeedupFloor` | 0.90 |
+| `decodeSpeedupFloor` | 0.95 |
+| `prefillSpeedupFloor` | 0.95 |
 | `decodeSpeedupCeiling` | 5.0 |
 | `kvBackend` | `contiguous` |
 
-The pinned 8-prompt pool runs ONE prompt at a time. There is no sweep and no
-per-run choice of width. A width the benchmarker has not certified has no
-series tag, and the benchmarker refuses that width rather than run it.
+The scored run times ONE prompt at a time. There is no sweep and no per-run
+choice of width. A width the benchmarker has not certified has no series tag,
+and the benchmarker refuses that width rather than run it.
 
-The even-n median over the 4 paired ratios is the mean of the two central
-order statistics -- the fastest and the slowest of the four scored windows do
-not enter the published number.
+There is NO MEDIAN on this track. Each role's per-token times are summed over
+the 2 pairs, and each gain is the ratio of those sums.
 
 ### 5.4 Token fidelity
 
@@ -480,16 +500,13 @@ than armed. The flag is `true`: the track is ARMED. What remains before a ranked
 dispatch is box work, not repository state -- the reference workspace staged and
 built, and each ranked box calibrated.
 
-The benchmarker, not the engine, produces the composite. It computes
-`per_cohort[].composite` from benchd's own parent-clocked prefill and decode
-windows, summed over the accepted pairs, at the certified exponent pair. No
-engine-reported value feeds it, and it does not depend on per-stream
-instrumentation. Each record seals exactly one of `composite` and
-`composite_absent_reason`. A composite is absent only when the record accepted
-no pair, or when a window is degenerate, and the reason names which. At the
-published channel tip that computation runs on the batched cohort regime only;
-carrying it to the ruled single-stream series is the bench lane named in
-section 5.1.
+The benchmarker, not the engine, produces the composite. It computes it from
+benchd's own parent-clocked prefill and decode windows, summed over the pairs,
+at the certified exponent pair. No engine-reported value feeds it, and it does
+not depend on per-stream instrumentation. Each record seals exactly one of
+`composite` and `composite_absent_reason`. A composite is absent only when the
+record accepted no pair, or when a window is degenerate, and the reason names
+which.
 
 Refuse, not degrade, stays the standing posture for this track.
 `tools/qwen38-125b-a6b-measure-and-score.sh` refuses with a non-zero exit rather

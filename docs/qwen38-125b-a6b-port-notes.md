@@ -52,16 +52,32 @@ The enforced values that follow from it are:
 | `scored_batch_size` | 1 |
 | `scored_exponents.prefill_gain_exponent` | 0.25 |
 | `scored_exponents.decode_gain_exponent` | 0.75 |
+| `decode_speedup_floor` | 0.95 |
+| `prefill_speedup_floor` | 0.95 |
 | `benchmark.json` `scoring.mode` | `qwen-native-mtp-paired-decode-only` |
 
-`scored_batch_size` 1 is RULED AHEAD OF THE PUBLISHED BENCHMARKER. At the
-published channel tip, the width certification accepts B = 8 only, so a
-fixture that declares 1 is refused there. The refusal is fail-closed and
-correct. This repository declares the ruled shape. It does not work around the
-refusal.
+The speedup floors are 0.95 on BOTH axes (David 2026-09-09): a candidate that
+regresses prefill or decode by more than 5 % is refused. They are track settings,
+like the pair count, and the enforced values live in the fixture as
+`decode_speedup_floor` and `prefill_speedup_floor`; `benchmark.json` carries the
+same two numbers and the lint cross-checks them. The ceiling stays 5.0. Before
+2026-09-09 this repository declared a decode floor of 0.90 and no prefill floor
+at all. Both were authoring errors: 0.90 is the `qwen3.8-27b-mtp-v1` free-run
+constant, and benchd's own `SCORE_DECODE_SPEEDUP_FLOOR` and
+`SCORE_PREFILL_SPEEDUP_FLOOR` have read 0.95 throughout.
 
-`tools/lint-benchmark-manifest.py` pins these values per track. A change to
-any of them must move the fixture, the manifest and that linter together.
+`scored_batch_size` 1 WAS RULED AHEAD OF THE PUBLISHED BENCHMARKER, as of
+2026-08-27. At the channel tip of that day the width certification accepted
+B = 8 only, so a fixture that declared 1 was refused there. The refusal was
+fail-closed and correct, and this repository declared the ruled shape rather
+than work around it. It is history: the bench lane has since merged, and scored
+runs happen.
+
+`tools/lint-benchmark-manifest.py` pins the mode, the width, the KV backend and
+the exponents per track. The pair count and the two floors are track settings
+that live in the fixture, and the linter cross-checks the manifest against it.
+A change to any of them must move the fixture, the manifest and that linter
+together.
 
 ## 4. The benchmarker channel and the platform expectation
 
@@ -365,9 +381,11 @@ fork-only environment are all gone: the submodule is UPSTREAM `antirez/ds4`.
 - Bit-exactness gate: `tools/ds4/mtp-exactness-gate.py` runs every pool
   prompt serial and MTP and requires identical token streams.
 
-- The scored leg requests its spec. benchd's single-leg path only sends a
+- The scored leg requests its spec. benchd's official path only sends a
   spec when `benchd iterate --mtp-depth N` names one; the measure script
   passes the declared depth and refuses on a benchd without the flag.
+  (As of this entry the ranked run was single-leg. It is PAIRED, 2 pairs,
+  since 2026-09-08; the spec request works the same way on each candidate leg.)
   The adapter refused depths 2 and 3 by name while the engine implemented only
   depth 1, so the fixture's `mtp2` and `mtp3` oracle entries were unreachable.
   SUPERSEDED by section 14: the `e2f86b7` sync implements depths 1 to 3.

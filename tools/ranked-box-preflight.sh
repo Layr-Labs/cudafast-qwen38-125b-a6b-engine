@@ -257,11 +257,12 @@ if grep -q 'PENDING-ORGANIZER' "${CONTRACT}"; then
   fail "the track contract still carries ${TRACK_SENTINEL} sentinels; the timed pool is unarmed and nothing can be pin-verified against it"
 fi
 
-# SINGLE-LEG: the pool need only carry the live golden (plus the rotation set),
-# so the retired "exactly 8" cohort-size assertion is dropped -- a rigid count
-# was the paired eight-tape model. What still must hold is that the pool is
-# non-empty, so there IS a live golden to pin-verify against; every entry's pin
-# is then checked below and the live golden is asserted present in section 4.
+# ONE LIVE GOLDEN: the pool need only carry the live golden (plus the rotation
+# set), so the retired "exactly 8" cohort-size assertion is dropped -- a rigid
+# count was the eight-tape cohort model. What still must hold is that the pool
+# is non-empty, so there IS a live golden to pin-verify against; every entry's
+# pin is then checked below and the live golden is asserted present in
+# section 4.
 pool_count="$(jq -r '.timed_prompt_pool | length' "${CONTRACT}")"
 [[ "${pool_count}" =~ ^[1-9][0-9]*$ ]] || fail "timed_prompt_pool is empty; there is no live golden to pin-verify against"
 
@@ -361,11 +362,12 @@ $(jq -r '(.live_golden_speculative // {}) | to_entries[] | [.value.r2_path, .val
 EOF
 [[ "${spec_count}" -eq 0 ]] || ok "all ${spec_count} per-depth oracle pin(s) match their staged golden(s)"
 
-# The staging directory must hold ONLY pinned goldens. Under single-leg the
-# scored run reads just the live golden, but an unpinned *.json staged where the
-# pool lives is still an unattributed golden -- a mis-staged or leftover file
-# that has no contract pin behind it -- so it is a refusal rather than a
-# warning: this directory carries pinned material only.
+# The staging directory must hold ONLY pinned goldens. The scored run reads just
+# the live golden -- every leg of every pair scores over that one prompt -- but
+# an unpinned *.json staged where the pool lives is still an unattributed
+# golden -- a mis-staged or leftover file that has no contract pin behind it --
+# so it is a refusal rather than a warning: this directory carries pinned
+# material only.
 unexpected=""
 for staged in "${GOLDEN_DIR}"/*.json; do
   [[ -e "${staged}" ]] || continue
@@ -390,9 +392,9 @@ else
   ok "MLXFAST_CORRECTNESS_GOLDEN_PATH unset; benchd resolves the oracle from the contract"
 fi
 
-# --- 4b. the live golden the single-leg run scores over is staged -----------
-# Single-leg reads exactly ONE golden: the fixture's live_golden, resolved by
-# tools/qwen38-125b-a6b-measure-and-score.sh as <live_golden>.golden.json. The
+# --- 4b. the live golden the ranked run scores over is staged ---------------
+# The ranked run reads exactly ONE golden: the fixture's live_golden, resolved
+# by tools/qwen38-125b-a6b-measure-and-score.sh as <live_golden>.golden.json. The
 # loop above already pin-verified it AS a pool member; this asserts the
 # fixture's live_golden actually NAMES a pinned pool entry and is staged, so a
 # live_golden rotation that points at a golden absent from the pool -- or a box
@@ -400,13 +402,13 @@ fi
 # rather than at measure time.
 LIVE_GOLDEN_NAME="$(jq -r '.live_golden // ""' "${CONTRACT}")"
 [[ -n "${LIVE_GOLDEN_NAME}" ]] \
-  || fail "the fixture declares no live_golden; there is no golden for the single-leg run to score over"
+  || fail "the fixture declares no live_golden; there is no golden for the ranked run to score over"
 live_golden_base="${LIVE_GOLDEN_NAME}.golden.json"
 printf '%s' "${expected_list}" | grep -Fxq "${live_golden_base}" \
   || fail "live_golden '${LIVE_GOLDEN_NAME}' names no timed_prompt_pool entry (looked for ${live_golden_base}); it carries no pin and cannot be pin-verified"
 [[ -f "${GOLDEN_DIR}/${live_golden_base}" ]] \
-  || fail "the live golden ${live_golden_base} is not staged in ${GOLDEN_DIR}; it is the one golden the single-leg run scores over"
-ok "live golden ${live_golden_base} is pinned and staged (the single-leg scored golden)"
+  || fail "the live golden ${live_golden_base} is not staged in ${GOLDEN_DIR}; it is the one golden the ranked run scores over"
+ok "live golden ${live_golden_base} is pinned and staged (the one scored golden)"
 
 # --- 5. the fixture is armed for official scoring ---------------------------
 # benchd refuses, pre-GPU, to seal an official artifact unless the fixture
@@ -453,11 +455,11 @@ verify_pin "${BENCHD_BIN}" "${benchd_sha}" "${benchd_bytes}" "pinned benchd"
 ok "pinned benchd matches its manifest (source_commit ${benchd_commit:-unrecorded}, sha256 ${benchd_sha})"
 
 # --- 7. the serve spec matches the participant declaration (the ARM GATE) ----
-# Single-leg scores ONE serve, and that serve's spec IS part of the identity: a
-# resident SERIAL serve and a scored MTP serve are different runs. The serve spec
-# is DERIVED from the participant declaration (mtp-head.manifest.json `spec`) by
-# the single trusted source tools/spec-declaration.sh, which validates it
-# fail-closed. This gate resolves the SAME derivation and:
+# The candidate leg's serve spec IS part of the identity: a resident SERIAL
+# serve and a scored MTP serve are different runs. The serve spec is DERIVED
+# from the participant declaration (mtp-head.manifest.json `spec`) by the single
+# trusted source tools/spec-declaration.sh, which validates it fail-closed. This
+# gate resolves the SAME derivation and:
 #   * REFUSES an invalid declaration (the helper exits non-zero and names why);
 #   * when the declaration ENABLES speculation, requires the fixture to be ARMED
 #     for official scoring (official_scoring_enabled: true) -- a valid declaration
