@@ -419,8 +419,8 @@ if [[ -n "${RUNNER_NAME:-}" ]]; then
   iterate_official+=( --box "${RUNNER_NAME}" )
 fi
 
-# The scored leg must REQUEST the declared spec. benchd's single-leg official
-# path sends free_decode_begin with no spec unless it is told one, and the
+# The candidate legs must REQUEST the declared spec. benchd's official path
+# sends free_decode_begin with no spec unless it is told one, and the
 # adapter then resolves serial, so a declared MTP leg would be measured as
 # serial while its oracle is the MTP one. benchd carries the declared depth
 # with --mtp-depth N; a benchd that does not know the flag cannot run an MTP
@@ -439,9 +439,9 @@ fi
 # TWO SERVES, ONE AT A TIME -- AND benchd SEQUENCES THEM.
 #
 # tools/serve-up.sh boots ONE ds4-resident and holds ~103.7 GiB of host memory
-# and the GPU for as long as it runs. Under the single-leg model this script
-# wrapped the whole benchd invocation in ONE such serve. Under the paired model
-# that is no longer possible, for two separate reasons:
+# and the GPU for as long as it runs. Under the RETIRED single-leg model this
+# script wrapped the whole benchd invocation in ONE such serve. Under the paired
+# model that is no longer possible, for two separate reasons:
 #
 #   * leg 1 must run the REFERENCE tree's engine. A candidate-tree resident
 #     serving both legs would divide the candidate by itself.

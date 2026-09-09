@@ -381,9 +381,11 @@ fork-only environment are all gone: the submodule is UPSTREAM `antirez/ds4`.
 - Bit-exactness gate: `tools/ds4/mtp-exactness-gate.py` runs every pool
   prompt serial and MTP and requires identical token streams.
 
-- The scored leg requests its spec. benchd's single-leg path only sends a
+- The scored leg requests its spec. benchd's official path only sends a
   spec when `benchd iterate --mtp-depth N` names one; the measure script
   passes the declared depth and refuses on a benchd without the flag.
+  (As of this entry the ranked run was single-leg. It is PAIRED, 2 pairs,
+  since 2026-09-08; the spec request works the same way on each candidate leg.)
   The adapter refused depths 2 and 3 by name while the engine implemented only
   depth 1, so the fixture's `mtp2` and `mtp3` oracle entries were unreachable.
   SUPERSEDED by section 14: the `e2f86b7` sync implements depths 1 to 3.
