@@ -272,6 +272,6 @@
       "score the qwen 3.8 125b-a6b tracks (mlx and cuda) single-stream, paired serial vs the built-in mtp, on prefill gains ^ .25 * decode ^ .75"
     ],
     "ruling_date": "2026-08-27",
-    "formula": "composite = prefill_gain ^ 0.25 * decode_gain ^ 0.75. Per component: gain = baseline_aggregate / candidate_aggregate (serial-anchored -- a faster candidate scores > 1, matching the family's standing convention). aggregate = the PER-PROMPT SUM over the pinned pool, i.e. each pool prompt is timed in its own SINGLE-STREAM window and the elapsed times are added together -- for prefill and decode separately, on both the baseline (serial control) leg and the candidate (built-in mtp) leg, over the SAME prompts."
+    "formula": "composite = prefill_gain ^ 0.25 * decode_gain ^ 0.75. Per component: gain = baseline_aggregate / candidate_aggregate (serial-anchored -- a faster candidate scores > 1). The run is PAIRED on the box: official_pairs pairs, each one serial-control leg on the organizer-staged reference tree and one candidate (built-in mtp) leg, single-stream, over the SAME live_golden prompt. aggregate = the per-token time summed over the pairs, for prefill and decode separately, per role. Floors and bands apply to the aggregate."
   }
 }
