@@ -1536,10 +1536,13 @@ int ds4_gpu_tensor_write(ds4_gpu_tensor *t, uint64_t off, const void *src,
     memcpy(t->data + off, src, (size_t)bytes);
     return 1;
 }
+static uint64_t g_tensor_read_bytes;
+
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *t, uint64_t off, void *dst,
                         uint64_t bytes) {
     if (!t || off + bytes > t->bytes) return 0;
     memcpy(dst, t->data + off, (size_t)bytes);
+    g_tensor_read_bytes += bytes;
     return 1;
 }
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_off,
@@ -1548,6 +1551,23 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_off,
     if (!dst || !src) return 0;
     if (dst_off + bytes > dst->bytes || src_off + bytes > src->bytes) return 0;
     memmove(dst->data + dst_off, src->data + src_off, (size_t)bytes);
+    return 1;
+}
+int ds4_gpu_indexer_topk_tensor(ds4_gpu_tensor *selected,
+                                const ds4_gpu_tensor *scores,
+                                uint32_t n_comp, uint32_t n_tokens,
+                                uint32_t top_k) {
+    if (!selected || !scores || top_k != 1u || n_comp == 0u || n_tokens == 0u ||
+        selected->bytes < (uint64_t)n_tokens * sizeof(uint32_t) ||
+        scores->bytes < (uint64_t)n_tokens * n_comp * sizeof(float)) {
+        return 0;
+    }
+    const float *rows = (const float *)scores->data;
+    uint32_t *out = (uint32_t *)selected->data;
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        out[t] = (uint32_t)ds4_qwen4exp_mtp_argmax(
+                rows + (size_t)t * n_comp, n_comp);
+    }
     return 1;
 }
 int ds4_gpu_begin_commands(void) { return 1; }
@@ -1828,10 +1848,16 @@ static void test_head_wiring(void) {
     }
     int draft[HEAD_ROWS] = { -1, -1 };
     float multi_out[HEAD_ROWS * HEAD_HC_DIM];
+    const uint64_t read_bytes_before = g_tensor_read_bytes;
     CHECK(ds4_qwen4exp_mtp_head_forward(&h, next_tokens, multi_in, 12u,
                                         HEAD_ROWS, draft, multi_out,
                                         g_err, sizeof(g_err)) == 0,
           "head forward failed: %s", g_err);
+    CHECK(g_tensor_read_bytes - read_bytes_before ==
+          (uint64_t)HEAD_ROWS * (sizeof(int32_t) +
+                                 HEAD_HC_DIM * sizeof(float)),
+          "wide head read back %llu bytes, expected only argmax ids and multi",
+          (unsigned long long)(g_tensor_read_bytes - read_bytes_before));
 
     /* Call order. */
     static const char *want[] = { "embed", "rms_norm", "rms_norm", "matmul",
@@ -1966,11 +1992,18 @@ static void test_head_wiring(void) {
         int draft_last[1] = { -1 };
         float multi_last[HEAD_HC_DIM];
         const int calls_before = g_log.n_log;
+        const uint64_t last_read_bytes_before = g_tensor_read_bytes;
         CHECK(ds4_qwen4exp_mtp_head_forward_last(&h, next_tokens, multi_in,
                                                  12u, HEAD_ROWS, draft_last,
                                                  multi_last,
                                                  g_err, sizeof(g_err)) == 0,
               "last-row head forward failed: %s", g_err);
+        CHECK(g_tensor_read_bytes - last_read_bytes_before ==
+              sizeof(int32_t) + HEAD_HC_DIM * sizeof(float),
+              "last-row head read back %llu bytes, expected one argmax id and "
+              "one multi row",
+              (unsigned long long)(g_tensor_read_bytes -
+                                   last_read_bytes_before));
         CHECK(g_log.n_log - calls_before == n_want,
               "the last-row forward made %d calls, expected %d",
               g_log.n_log - calls_before, n_want);
