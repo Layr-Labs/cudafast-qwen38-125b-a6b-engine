@@ -86,9 +86,13 @@ changed="$("${HARDENED_GIT}" -c core.quotePath=false diff --name-only "${BASE_SH
 # spellings reach the pinned scorer. Before this port the surface gate carried
 # only arm (1) where the overlay and the linter already carried both.
 #
-#   (1) CASE FOLD. The ranked box is macOS and APFS is case-INSENSITIVE by
-#       default, so `BENCHD.PIN` and `benchd.pin` are the same file there and a
-#       byte-comparison guard would stop only one spelling of the same write.
+#   (1) CASE FOLD. On a case-INSENSITIVE filesystem `BENCHD.PIN` and
+#       `benchd.pin` are the same file, and a byte-comparison guard would stop
+#       only one spelling of the same write. This track's ranked box is Linux
+#       (GB10, ext4) and is case-SENSITIVE, so the fold is not there for the
+#       box: it is there so this gate behaves the SAME on a contributor's
+#       macOS/APFS checkout and on any case-insensitive mount as it does on the
+#       box, instead of having a refusal that only some filesystems produce.
 #   (2) FILESYSTEM IDENTITY (device:inode). A changed path whose own prefix
 #       RESOLVES to the protected inode is refused even when ASCII case folding
 #       does not normalise its spelling (Unicode case folding, HFS+/APFS
@@ -101,13 +105,20 @@ fold_case() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 
 # Filesystem identity of an existing path, as device:inode. Empty (status 1)
 # when the path does not exist. Byte-for-byte the overlay's path_identity so the
-# two gates resolve identity the same way (BSD `stat -f`, GNU `stat -c`
-# fallback). Not a git read -- `stat` ignores the attacker-influenced repo-local
+# two gates resolve identity the same way: GNU `stat -c` FIRST, BSD `stat -f`
+# as the fallback. The order is load-bearing and used to be the other way round
+# (issue #36 work item B) -- on GNU coreutils `-f` is "file system status" and
+# takes no format, so `stat -f '%d:%i' PATH` read the format as a FILE operand,
+# printed a multi-line filesystem-status block for PATH on stdout, exited 1, and
+# the `||` arm appended the real dev:inode to that block. Identity comparisons on
+# Linux, which is what this gate runs on, compared those paragraphs. BSD stat has
+# no `-c`, so it fails with nothing on stdout and the `-f` arm answers.
+# Not a git read -- `stat` ignores the attacker-influenced repo-local
 # git config the header warns about, exactly as the overlay relies on.
 path_identity() {
   local path="$1"
   [[ -e "${path}" ]] || return 1
-  stat -f '%d:%i' "${path}" 2>/dev/null || stat -c '%d:%i' "${path}" 2>/dev/null
+  stat -c '%d:%i' "${path}" 2>/dev/null || stat -f '%d:%i' "${path}" 2>/dev/null
 }
 
 reaches_forbidden_path() {

@@ -34,7 +34,19 @@
 # (David MTP-0 ruling). `enabled: true` with N in the track's permitted draft
 # depths => the engine opens with the drafter armed at N (DS4_MTP_DRAFT_TOKENS=N+1).
 #
+# THE REST OF THE DECLARATION is validated here too, because this is the one
+# trusted reader of the file (issue #24 work item A). docs/participant-contract.md
+# 4.1 and 4.3 promise that `pinned` is the only accepted source, that the 2 GiB
+# `max_bytes` cap may be LOWERED and never raised, and that there is no `arm`
+# key -- there is one arm, so there is nothing to select. Only the `spec` block
+# was ever read, so `"source": "remote"`, `max_bytes` past the cap and an
+# unknown top-level key all passed a `validate`.
+#
 # VALIDATION is fail-closed. A REFUSAL (exit 1, message on stderr) for:
+#   * a declaration that is not a JSON object, or carries an unknown top-level
+#     key (allowed: version, source, max_bytes, bytes, sha256, spec);
+#   * a `source` other than "pinned" -- "remote" and "in_branch" by name;
+#   * a `max_bytes` that is not an integer in 1..2147483648;
 #   * a `spec` block that is not an object, or carries an unknown key;
 #   * `enabled` that is not a boolean, or `num_speculative_tokens` not an integer;
 #   * a value outside the structural range 0..8 (the a8/David sanity ceiling);
@@ -64,6 +76,10 @@ CONTRACT="${SPEC_DECLARATION_CONTRACT:-${REPO_ROOT}/fixtures/qwen3_8_125b_a6b_tr
 # the value is enabled; this is the outer type/range guard around it.
 SPEC_MAX_TOKENS=8
 
+# The track's declaration byte cap, 2 GiB (docs/participant-contract.md 4.3). A
+# declaration may state a LOWER max_bytes; it may not raise this one.
+DECLARATION_MAX_BYTES=2147483648
+
 fail() {
   echo "spec-declaration.sh: REFUSING -- $*" >&2
   exit 1
@@ -79,6 +95,38 @@ enabled="false"
 raw_tokens="0"
 if [[ -f "${MANIFEST}" ]]; then
   jq -e . >/dev/null 2>&1 < "${MANIFEST}" || fail "mtp-head.manifest.json is not valid JSON"
+
+  # --- the whole declaration, not just the spec block ------------------------
+  # Everything the file promises is checked, in the same fail-closed style as
+  # the spec block below. An ABSENT key is fine throughout: an absent
+  # declaration, an absent source and an absent spec block are all the default
+  # (organizer-pinned head, serial), which is what most submissions carry.
+  [[ "$(jq -r 'type' "${MANIFEST}")" == "object" ]] \
+    || fail "mtp-head.manifest.json must be a JSON object with keys {version, source, max_bytes, bytes, sha256, spec}"
+
+  # A typo'd or invented top-level key must not read as its default, exactly as
+  # for the spec block. `arm` is the one worth naming: this track has a single
+  # speculative arm, so a declaration that tries to select one is stating
+  # something the runner will not honour, and silence there is the wrong answer.
+  unknown_top="$(jq -r 'keys[] | select(. != "version" and . != "source" and . != "max_bytes" and . != "bytes" and . != "sha256" and . != "spec")' "${MANIFEST}")"
+  [[ -z "${unknown_top}" ]] \
+    || fail "the declaration carries unknown top-level key(s): $(printf '%s' "${unknown_top}" | tr '\n' ' '); allowed keys are version, source, max_bytes, bytes, sha256, spec"
+
+  if [[ "$(jq -r 'has("source")' "${MANIFEST}")" == "true" ]]; then
+    declared_source="$(jq -r '.source | if type == "string" then . else tojson end' "${MANIFEST}")"
+    [[ "${declared_source}" == "pinned" ]] \
+      || fail "source \"${declared_source}\" is not accepted; the head is the organizer-staged pinned head, so the only accepted source is \"pinned\""
+  fi
+
+  if [[ "$(jq -r 'has("max_bytes")' "${MANIFEST}")" == "true" ]]; then
+    # jq does the range test, not bash arithmetic: a 30-digit literal would wrap
+    # silently in `(( ))` and could land back inside the range.
+    declared_max="$(jq -r '.max_bytes | if type == "number" then tostring else tojson end' "${MANIFEST}")"
+    [[ "$(jq -r --argjson cap "${DECLARATION_MAX_BYTES}" \
+          '.max_bytes | (type == "number" and . == floor and . >= 1 and . <= $cap)' "${MANIFEST}")" == "true" ]] \
+      || fail "max_bytes ${declared_max} is not an integer in 1..${DECLARATION_MAX_BYTES}; a declaration may lower the track's 2 GiB cap and may not raise it"
+  fi
+
   if [[ "$(jq -r 'has("spec")' "${MANIFEST}")" == "true" ]]; then
     [[ "$(jq -r '.spec | type' "${MANIFEST}")" == "object" ]] \
       || fail "the \"spec\" declaration must be an object with keys {enabled, num_speculative_tokens}"

@@ -27,22 +27,46 @@ CONTRACT_PATH="${CONTRACT_PATH:-benchmark.json}"
 # this editable surface must not disagree about which spellings reach the scorer.
 FORBIDDEN_OVERLAY_PATHS=("benchd" ".gitmodules" "benchd.pin" "benchd-bin")
 
-# CASE FOLDING. The ranked box is macOS and APFS is case-INSENSITIVE by
-# default, so `BENCHD.PIN` names the same file as `benchd.pin`. A byte-comparison
-# guard passes the spelling, and the `rm -rf "${target_path}"` below then
-# deletes the real pin before the overlay writes the submission's copy over it. Both halves of the guard below exist because neither is
-# sufficient alone: the folded-string test catches an entry whose target does
-# not exist yet, and the filesystem-identity test catches a spelling that ASCII
-# folding does not normalise (Unicode case folding, HFS+ decomposition) but the
-# filesystem still resolves to the protected path.
+# CASE FOLDING. On a case-INSENSITIVE filesystem `BENCHD.PIN` names the same
+# file as `benchd.pin`. A byte-comparison guard passes the second spelling, and
+# the `rm -rf "${target_path}"` below then deletes the real pin before the
+# overlay writes the submission's copy over it.
+#
+# WHERE THAT HAPPENS. Not on the ranked box: this track's ranked box is Linux
+# (GB10, ext4), which is case-SENSITIVE, so the two spellings are different
+# files there. The guard exists so this script behaves the SAME wherever it
+# runs -- a contributor's macOS/APFS checkout, a case-insensitive mount, or the
+# Linux box -- rather than having a refusal that only some filesystems produce.
+#
+# Both halves of the guard below exist because neither is sufficient alone: the
+# folded-string test catches an entry whose target does not exist yet, and the
+# filesystem-identity test catches a spelling that ASCII folding does not
+# normalise (Unicode case folding, HFS+ decomposition) but the filesystem still
+# resolves to the protected path.
 fold_case() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 
 # Filesystem identity of an existing path, as device:inode. Empty (status 1)
 # when the path does not exist.
+#
+# GNU FIRST, and the ORDER IS LOAD-BEARING (issue #36 work item B). The two
+# implementations spell the format flag differently -- GNU `stat -c`, BSD
+# `stat -f` -- but only one order fails cleanly. On GNU coreutils `-f` means
+# "file system status" and takes no format there, so `stat -f '%d:%i' PATH`
+# reads '%d:%i' as a FILE operand: that operand errors on stderr (suppressed),
+# PATH itself SUCCEEDS and prints a multi-line filesystem-status block on
+# STDOUT, and the overall status is 1 -- so the `||` arm ran as well and
+# appended the real dev:inode to that block. The identity string was a
+# paragraph, and every identity comparison below silently compared paragraphs
+# that differ by the path name they quote. Both the hosted job and the ranked
+# box are Linux, so that was the live behaviour, not the fallback.
+#
+# The reverse order has no such failure: BSD stat has no `-c` at all, so it
+# prints its usage on stderr, writes NOTHING to stdout, and the `-f` arm
+# answers.
 path_identity() {
   local path="$1"
   [[ -e "${path}" ]] || return 1
-  stat -f '%d:%i' "${path}" 2>/dev/null || stat -c '%d:%i' "${path}" 2>/dev/null
+  stat -c '%d:%i' "${path}" 2>/dev/null || stat -f '%d:%i' "${path}" 2>/dev/null
 }
 
 # True when `path` names, contains, or lives inside a forbidden path on THIS
@@ -261,6 +285,21 @@ for editable_path in "${EDITABLE_PATHS[@]}"; do
   fi
   if find "${source_path}" -type l -print -quit | grep -q .; then
     echo "::error file=${editable_path}::submitted editable paths must not contain symlinks" >&2
+    exit 1
+  fi
+  # SHAPE, BEFORE THE TRUSTED COPY GOES (issue #36 work item A). The pre-copy
+  # check above is symlink-ONLY, so every other non-regular shape -- a FIFO, a
+  # socket, a device node -- reached the copy below with the trusted copy
+  # ALREADY DELETED by the `rm -rf`. `cp` then blocks on the FIFO or refuses the
+  # node instead of overlaying anything, and validate_overlay_tree is a
+  # POST-copy check that never gets to run: the refusal was correct but it cost
+  # the verifier its trusted content. The same test runs here, on the SOURCE,
+  # before anything is removed -- a rejected submission must leave the trusted
+  # checkout exactly as it found it. validate_overlay_tree keeps its own copy of
+  # the test for what actually landed.
+  if [[ ! -f "${source_path}" && ! -d "${source_path}" ]] \
+     || find "${source_path}" ! -type f ! -type d -print -quit | grep -q .; then
+    echo "::error file=${editable_path}::submitted editable paths must contain only regular files and directories" >&2
     exit 1
   fi
 
