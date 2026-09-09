@@ -15,6 +15,10 @@ fn main() {
     println!("cargo:rerun-if-changed=ds4_shim/ds4_shim.h");
     println!("cargo:rerun-if-env-changed=DS4_LIB_DIR");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    // src/bin/cuda-engine.rs bakes DS4_CUDA_ARCH into the device label with
+    // option_env!, which cargo does not track on its own; a changed arch must
+    // rebuild the adapter rather than relabel nothing.
+    println!("cargo:rerun-if-env-changed=DS4_CUDA_ARCH");
     if std::env::var_os("CARGO_FEATURE_DS4_ENGINE").is_none() {
         return;
     }
