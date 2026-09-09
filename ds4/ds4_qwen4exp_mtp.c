@@ -781,6 +781,7 @@ enum {
     MTP_HEAD_T_TOP1,
     MTP_HEAD_T_END,
     MTP_HEAD_T_TOP1_IN,
+    MTP_HEAD_T_LOGIT0_IN,
     MTP_HEAD_T_MULTI_OUT,
     MTP_HEAD_T_N
 };
@@ -788,7 +789,8 @@ enum {
 static const char *const mtp_head_stage_names[MTP_HEAD_T_N] = {
     "token upload", "multi upload", "embed", "enorm", "hnorm",
     "ehx copies", "eh_proj", "block", "hc mixer", "lm head",
-    "gpu top-1", "end commands", "top-1 readback", "multi readback"
+    "gpu top-1", "end commands", "top-1 readback", "logit-0 readback",
+    "multi readback"
 };
 
 static uint64_t mtp_head_stage_ns[MTP_HEAD_T_N];
@@ -833,8 +835,8 @@ static int mtp_head_time_on(void) {
     } while (0)
 
 /* The forward proper.  `last_only` narrows the readback to the final row:
- * one top-1 id into draft_out[0] and one `hyper` row into multi_out.  The
- * logits and their device-side top-1 reduction still run for every row. */
+ * one top-1 id plus its entry-zero logit, and one `hyper` row into multi_out.
+ * The logits and their device-side top-1 reduction still run for every row. */
 static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                                  const int *next_tokens,
                                  const float *multi_in,
@@ -983,7 +985,7 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
 
     /* Which results come back: every one, or the last alone.  The rows before
      * the last are seeds in the last_only case; reducing them is cheap, and
-     * only the final id crosses to the host. */
+     * only the final id and its entry-zero logit cross to the host. */
     const uint32_t first_row = last_only ? n_tokens - 1u : 0u;
     const uint32_t out_rows = n_tokens - first_row;
     if (ok) {
@@ -994,6 +996,28 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                                  (uint64_t)out_rows * sizeof(uint32_t)) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_TOP1_IN);
+    if (ok) {
+        stage = "logit-0 readback";
+        for (uint32_t t = 0; ok && t < out_rows; t++) {
+            float logit0;
+            const uint64_t row = (uint64_t)first_row + t;
+            ok = ds4_gpu_tensor_read(h->t_logits,
+                                     row * h->n_vocab * f,
+                                     &logit0, sizeof(logit0)) != 0;
+            /* The former CPU scan seeded its comparison with row[0].  A NaN
+             * there therefore kept token zero regardless of later values;
+             * the generic GPU reducer deliberately ignores NaNs.  Preserve
+             * the MTP proposal contract without changing that shared reducer. */
+            if (ok) {
+                uint32_t logit0_bits;
+                memcpy(&logit0_bits, &logit0, sizeof(logit0_bits));
+                if ((logit0_bits & 0x7fffffffu) > 0x7f800000u) {
+                    h->top1_host[t] = 0u;
+                }
+            }
+        }
+    }
+    MTP_HEAD_TICK(MTP_HEAD_T_LOGIT0_IN);
     if (ok && multi_out) {
         stage = "multi readback";
         ok = ds4_gpu_tensor_read(h->t_hyper,
