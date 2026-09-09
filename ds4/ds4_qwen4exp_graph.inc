@@ -425,6 +425,45 @@ static ds4_gpu_tensor *qwen4exp_alloc_zeroed(uint64_t bytes, bool *ok) {
     return t;
 }
 
+#if !defined(__APPLE__)
+typedef const void *(*qwen4exp_device_range_lookup)(const void *, uint64_t,
+                                                     uint64_t);
+
+/* CUDA startup has already copied every resident tensor span into its device
+ * cache.  A split shard is represented there by several merged tensor ranges,
+ * so asking the auxiliary-map path whether the WHOLE shard is cached misses
+ * those ranges and copies the shard a second time.  Judge the same residency
+ * unit the loader used: every tensor that belongs on the device.  The PLE
+ * table is the sole exception; it deliberately remains SSD-backed.  A shard
+ * carrying only that table therefore needs no device mapping. */
+static bool qwen4exp_shard_required_tensors_cached(
+        const ds4_model              *m,
+        uint32_t                      shard_index,
+        qwen4exp_device_range_lookup  lookup,
+        uint64_t                     *required_out,
+        uint64_t                     *streamed_out) {
+    uint64_t required = 0;
+    uint64_t streamed = 0;
+    bool cached = true;
+
+    if (!m || shard_index >= m->n_shards || !lookup) return false;
+    const ds4_model_shard *sh = &m->shard[shard_index];
+    for (uint64_t ti = 0; ti < m->n_tensors; ti++) {
+        const ds4_tensor *t = &m->tensors[ti];
+        if (t->map_index != shard_index || t->bytes == 0) continue;
+        if (ds4_streq(t->name, "per_layer_token_embd.weight")) {
+            streamed++;
+            continue;
+        }
+        required++;
+        if (!lookup(sh->map, t->abs_offset, t->bytes)) cached = false;
+    }
+    if (required_out) *required_out = required;
+    if (streamed_out) *streamed_out = streamed;
+    return cached;
+}
+#endif
+
 ds4_qwen4exp_session *ds4_qwen4exp_session_open(
         const ds4_qwen4exp_weights *w,
         const ds4_model            *m,
@@ -535,9 +574,22 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
         rc = ds4_gpu_set_model_map_range(sh->map, sh->size, off, len,
                                          shard_max_tensor);
 #else
-        rc = (i == 0)
-            ? ds4_gpu_set_model_map(sh->map, sh->size)
-            : ds4_gpu_set_aux_model_map_range(sh->map, sh->size, off, len);
+        uint64_t required = 0;
+        const int already = qwen4exp_shard_required_tensors_cached(
+                m, i, ds4_gpu_model_range_device_ptr, &required, NULL);
+        if (already) {
+            rc = 1;
+            if (required != 0) {
+                fprintf(stderr,
+                        "ds4: qwen4exp reusing %llu cached tensor spans from "
+                        "shard %u\n",
+                        (unsigned long long)required, i);
+            }
+        } else {
+            rc = (i == 0)
+                ? ds4_gpu_set_model_map(sh->map, sh->size)
+                : ds4_gpu_set_aux_model_map_range(sh->map, sh->size, off, len);
+        }
 #endif
         if (!rc) {
             fprintf(stderr,
@@ -2816,6 +2868,61 @@ bool ds4_qwen4exp_test_graph_session_open(const char *path,
     model_close(&model);
     return opened;
 }
+
+#if !defined(__APPLE__)
+static int g_qwen4exp_test_range_present = 0;
+
+static const void *qwen4exp_test_range_lookup(const void *map,
+                                               uint64_t offset,
+                                               uint64_t bytes) {
+    (void)offset;
+    (void)bytes;
+    return g_qwen4exp_test_range_present ? map : NULL;
+}
+
+/* Exercise the session's exact shard-residency predicate without uploading the
+ * multi-GiB synthetic model.  The callback says all/none of the required
+ * ranges are resident; the real tensor inventory still supplies the shard
+ * placement and the streamed-PLE exception. */
+int ds4_qwen4exp_test_shard_cache_policy(const char *path,
+                                         uint64_t *required_out,
+                                         uint64_t *streamed_out,
+                                         uint32_t *required_shards_out,
+                                         uint32_t *stream_only_shards_out) {
+    static ds4_model model;
+    uint64_t required_total = 0;
+    uint64_t streamed_total = 0;
+    uint32_t required_shards = 0;
+    uint32_t stream_only_shards = 0;
+    int ok = 1;
+
+    model_open(&model, path, true, false);
+    config_validate_qwen4exp_model(&model);
+    for (uint32_t i = 0; i < model.n_shards; i++) {
+        uint64_t required = 0, streamed = 0;
+        g_qwen4exp_test_range_present = 1;
+        if (!qwen4exp_shard_required_tensors_cached(
+                    &model, i, qwen4exp_test_range_lookup,
+                    &required, &streamed)) {
+            ok = 0;
+        }
+        g_qwen4exp_test_range_present = 0;
+        const int none_cached = qwen4exp_shard_required_tensors_cached(
+                &model, i, qwen4exp_test_range_lookup, NULL, NULL);
+        if ((required == 0) != (none_cached != 0)) ok = 0;
+        if (required != 0) required_shards++;
+        if (required == 0 && streamed != 0) stream_only_shards++;
+        required_total += required;
+        streamed_total += streamed;
+    }
+    model_close(&model);
+    if (required_out) *required_out = required_total;
+    if (streamed_out) *streamed_out = streamed_total;
+    if (required_shards_out) *required_shards_out = required_shards;
+    if (stream_only_shards_out) *stream_only_shards_out = stream_only_shards;
+    return ok ? 0 : -1;
+}
+#endif
 #endif /* DS4_TEST_HOOKS */
 
 #else /* DS4_NO_GPU */
