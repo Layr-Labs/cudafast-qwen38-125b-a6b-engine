@@ -656,7 +656,8 @@ typedef struct {
     ds4_gpu_tensor *t_mix_wide;
     ds4_gpu_tensor *t_sample;
     ds4_gpu_tensor *t_logits;
-    float          *logits_host;
+    ds4_gpu_tensor *t_top1;
+    uint32_t       *top1_host;
 } ds4_qwen4exp_mtp_head;
 
 /*
