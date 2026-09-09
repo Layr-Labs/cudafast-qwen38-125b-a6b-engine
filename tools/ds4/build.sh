@@ -152,7 +152,10 @@ log "linked ${OUT}/ds4-resident (weight owner; tools/serve-up.sh boots one per w
 
 # --- 5. the adapter ---------------------------------------------------------
 command -v cargo >/dev/null 2>&1 || die "cargo is required to build the cuda-engine adapter"
-DS4_LIB_DIR="${OUT}" cargo build --release --features ds4-engine \
+# DS4_CUDA_ARCH reaches cargo too: src/bin/cuda-engine.rs reads it at compile
+# time for the device label benchd seals (sm_121 on the GB10, sm_120 on an
+# x86 workstation), so the engine and the label are built from one value.
+DS4_LIB_DIR="${OUT}" DS4_CUDA_ARCH="${DS4_CUDA_ARCH}" cargo build --release --features ds4-engine \
   --manifest-path "${ROOT_DIR}/harness/protocol-adapter/Cargo.toml" --bin cuda-engine
 "${ROOT_DIR}/tools/stage-cuda-engine.sh"
 log "done: adapter staged against ${OUT}/libds4qwen.so"
