@@ -106,21 +106,20 @@ expect_refuse "unknown-key-refused" '{"spec":{"enabled":true,"num_speculative_to
 expect_refuse "bad-enabled-refused" '{"spec":{"enabled":"yes","num_speculative_tokens":1}}' "must be a boolean"
 
 # --- the declaration AROUND the spec block (issue #24 work item A) ----------
-# docs/participant-contract.md 4.1 and 4.3 promise three things this validator
-# did not check, because it read `.spec` and nothing else: `pinned` is the only
-# accepted source, `max_bytes` may be lowered from the 2 GiB track cap and never
-# raised, and there is no `arm` key. Each promise gets its refusal case and the
+# docs/participant-contract.md 4.1 promises two things this validator did not
+# check, because it read `.spec` and nothing else: `pinned` is the only accepted
+# source, and there is no `arm` key. Each promise gets its refusal case and the
 # accepting side gets one too, so a fix that simply refused everything would not
-# pass.
+# pass. max_bytes is recorded, not read, so any value passes.
 expect_refuse "source-remote-refused"    '{"source":"remote"}'    'the only accepted source is "pinned"'
 expect_refuse "source-in-branch-refused" '{"source":"in_branch"}' 'source "in_branch" is not accepted'
-expect_refuse "max-bytes-over-cap-refused" '{"max_bytes":2147483649}' "1..2147483648"
-expect_refuse "max-bytes-zero-refused"     '{"max_bytes":0}'         "1..2147483648"
 expect_refuse "unknown-top-key-refused"    '{"version":1,"arm":"dflash","spec":{"enabled":true,"num_speculative_tokens":1}}' \
   "unknown top-level key(s): arm"
-# The cap itself is a legal declaration (it is what the repository ships), and a
-# declaration that states only a version and a spec block is the ordinary case.
-expect_ok "max-bytes-at-cap-accepted"  '{"source":"pinned","max_bytes":2147483648}' describe serial
+# The shipped declaration is legal, a max_bytes above the staged head's size is
+# legal too (the key is not read), and a declaration that states only a version
+# and a spec block is the ordinary case.
+expect_ok "shipped-declaration-accepted" '{"source":"pinned","max_bytes":2147483648}' describe serial
+expect_ok "max-bytes-not-read"           '{"source":"pinned","max_bytes":3000000000}' describe serial
 expect_ok "version-plus-spec-accepted" '{"version":1,"spec":{"enabled":true,"num_speculative_tokens":1}}' describe mtp1
 
 if [[ ${fails} -eq 0 ]]; then
