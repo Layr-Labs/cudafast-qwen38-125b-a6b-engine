@@ -38,10 +38,11 @@ An absent file, an absent `spec` block, `enabled: false`, or
 depth must be one of the contract's `mtp_head.permitted_draft_depths`, which are
 1 to 6.
 
-The other keys are recorded, not read. `source` is `"pinned"`: the only head
-that can load is the organizer-staged one, and the value selects nothing.
-`max_bytes`, `bytes` and `sha256` are not checked against the staged head;
-`./setup.sh` verifies the head bytes against the contract's own pin instead.
+`source` must be `"pinned"`, and an unknown top-level key is refused by name;
+`tools/spec-declaration.sh` checks both. The only head that can load is the
+organizer-staged one, so the value selects nothing. `max_bytes`, `bytes` and
+`sha256` are recorded, not read; `./setup.sh` verifies the head bytes against
+the contract's own pin instead.
 
 A declared `sha256` is not verified against the head bytes.
 `docs/participant-contract.md` section 4.3 states that limit plainly.

@@ -13,6 +13,9 @@
 # future fixture edit ever WIDENS mtp_head.permitted_draft_depths past 6, the
 # depth-7 case below turns this test red -- that is the tripwire.
 #
+# It also pins the rest of the DECLARATION, which the same script validates:
+# source, the max_bytes cap and the top-level key set (issue #24 work item A).
+#
 # Usage: tools/test-spec-declaration.sh
 # Exit:  0 all cases pass, 1 a case failed (printed with a FAIL prefix)
 set -uo pipefail
@@ -101,6 +104,23 @@ expect_refuse "negative-refused"    '{"spec":{"enabled":true,"num_speculative_to
 expect_refuse "non-integer-refused" '{"spec":{"enabled":true,"num_speculative_tokens":1.5}}' "must be an integer"
 expect_refuse "unknown-key-refused" '{"spec":{"enabled":true,"num_speculative_tokens":1,"foo":1}}' "unknown key"
 expect_refuse "bad-enabled-refused" '{"spec":{"enabled":"yes","num_speculative_tokens":1}}' "must be a boolean"
+
+# --- the declaration AROUND the spec block (issue #24 work item A) ----------
+# docs/participant-contract.md 4.1 promises two things this validator did not
+# check, because it read `.spec` and nothing else: `pinned` is the only accepted
+# source, and there is no `arm` key. Each promise gets its refusal case and the
+# accepting side gets one too, so a fix that simply refused everything would not
+# pass. max_bytes is recorded, not read, so any value passes.
+expect_refuse "source-remote-refused"    '{"source":"remote"}'    'the only accepted source is "pinned"'
+expect_refuse "source-in-branch-refused" '{"source":"in_branch"}' 'source "in_branch" is not accepted'
+expect_refuse "unknown-top-key-refused"    '{"version":1,"arm":"dflash","spec":{"enabled":true,"num_speculative_tokens":1}}' \
+  "unknown top-level key(s): arm"
+# The shipped declaration is legal, a max_bytes above the staged head's size is
+# legal too (the key is not read), and a declaration that states only a version
+# and a spec block is the ordinary case.
+expect_ok "shipped-declaration-accepted" '{"source":"pinned","max_bytes":2147483648}' describe serial
+expect_ok "max-bytes-not-read"           '{"source":"pinned","max_bytes":3000000000}' describe serial
+expect_ok "version-plus-spec-accepted" '{"version":1,"spec":{"enabled":true,"num_speculative_tokens":1}}' describe mtp1
 
 if [[ ${fails} -eq 0 ]]; then
   echo "OK: all spec-declaration envelope cases passed"
