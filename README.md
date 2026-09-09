@@ -132,10 +132,12 @@ path against a mock transport. It needs no GPU and no checkpoint.
 > syntax check (`tools/ds4/build.sh --cpu-check`) and the shell tests
 > (`tools/test-*.sh`). See "Local testing vs the ranked run".
 
-The public prompts in `correctness_prompts/` are Gemma captures kept for reuse
-of their 1024-token prompts; the model-identity loader rejects them against the
-current target, so they are not runnable against this track today
-(`docs/qwen38-125b-a6b-port-notes.md` section 5).
+`correctness_prompts/` holds three public files. The two
+`public_longcopy_gate_english_1024_*.json` files are Gemma-era captures kept for
+their 1024-token prompts; they do not load against the Qwen target.
+`public-longcopy-gate-english-1024.golden.json` is a public Qwen capture
+(`unsloth/Qwen3.8-Flash-Next-GGUF` @ `38bb39ee97821de2c9009abb7e93950eec396e66`)
+for local runs (`docs/qwen38-125b-a6b-port-notes.md` section 5).
 
 ## Repository structure
 

@@ -332,8 +332,7 @@ The score is serial-anchored. A faster candidate scores above 1.
 **THE SCORED SHAPE IS SINGLE-STREAM.** David ruling 2026-08-27, relayed by
 orchestrator: this track scores a PAIRED serial-against-MTP comparison over the
 pinned prompt pool, ONE stream at a time, at `scored_batch_size` 1. The batch-8
-cohort adaptation is NOT pursued. Section 11.4 states why: the batched path
-cannot run this model.
+cohort adaptation is NOT pursued.
 
 `aggregate` is the **per-prompt sum**. Run each of the 8 pinned prompts in its
 own single-stream window and add the 8 elapsed times together. Do this for
@@ -424,16 +423,6 @@ mtp leg. The mtp leg is the sharper case: it feeds tokens it may take back, so
 its forward count legitimately exceeds N, and what must hold is that its
 offsets land exactly on `seed + N` -- rollback took back the drafts and nothing
 else, and never re-prefilled.
-
-**NO SCORED RUN IS POSSIBLE ON THIS TRACK TODAY**, and section 11.4 states the
-full reason. The short form is that the benchmarker has to catch up with the
-ruling: at the published channel tip it certifies B = 8 as the ONE scored width
-and computes the composite only on the batched regime, so this fixture's
-`scored_batch_size` 1 refuses at its width certification. A separate bench lane
-carries the single-stream regime -- the certified width, the prefill window on
-the single-stream free-run verbs, and the exponent pair certified on the B = 1
-point. Until that lands, the refusal is the correct behavior, not a defect in
-this repository.
 
 ### 5.2 The measured window
 
@@ -605,7 +594,8 @@ token). A decode mean of 0.06451959972265625 s/tok is shown as 15.50 tok/s.
 
 | Object | Where it lives | Can you have it? |
 |---|---|---|
-| `correctness_prompts/public_longcopy_gate_english_1024_256.json` and `..._1024_1024.json` | Checked into git | **Yes.** They are already in your clone. See section 11.3. |
+| `correctness_prompts/public_longcopy_gate_english_1024_256.json` and `..._1024_1024.json` | Checked into git | **Yes.** They are Gemma-era captures kept for their 1024-token prompts; they do not load against the Qwen target. |
+| `correctness_prompts/public-longcopy-gate-english-1024.golden.json` | Checked into git | **Yes.** A public Qwen capture (`unsloth/Qwen3.8-Flash-Next-GGUF` @ `38bb39ee97821de2c9009abb7e93950eec396e66`) for local runs. |
 | `timed_prompt_pool[]`, 8 tapes | R2, at the `r2_path` keys the fixture pins. The ranked box stages them out of band into `MLXFAST_QWEN38_GOLDEN_DIR`. | **No.** They are organizer material and they are never in git. |
 | `live_golden_speculative{}`, 6 per-depth oracles | The same: R2 keys, staged on the box. | **No.** Same material, same handling. |
 | `hidden_correctness_golden` | The live golden, pinned by digest only. It is one of the staged files. | **No.** It is the token-fidelity oracle and it stays on the box. |
@@ -816,168 +806,3 @@ model's own license terms apply to it. They ship with the checkpoint at its
 pinned revision.
 
 This repository distributes no model weights.
-
-## 11. What is not in place yet
-
-Read this section before you conclude that something is broken.
-
-### 11.1 No ranked box is staged yet
-
-Section 5.5 states the arm state: `official_scoring_enabled` is `true`, and the
-timed prompt pool and the hidden correctness oracle are pinned to real goldens.
-The arm state is not what is missing.
-
-What is missing is the box. No runner advertises the ranked label set
-`[self-hosted, Linux, ARM64, qwen3.8-125b-a6b-cuda-v1]`, no box has the reference
-workspace staged and built (`tools/stage-baseline-workspace.sh`), and no box has
-a calibration file (`tools/calibrate-box.sh`). `tools/ranked-box-preflight.sh`
-refuses a dispatch until all three exist.
-
-The bench release branch and dist channel are `qwen3.8-125b-a6b-v1`, which is
-the PROJECT name, not this track's id. David ruling 2026-08-27: the MLX and
-CUDA tracks of this model share one benchmarker, so they share one channel. The
-track id `qwen3.8-125b-a6b-cuda-v1` is unchanged and still names the leaderboard
-namespace, the runner labels and the R2 prefix.
-
-THE CHANNEL RESOLVES FROM THE RELEASE BRANCH. Bench pull request 217 has
-merged. The release branch tip `56a9821a` carries the dist pair for
-`source_commit` `379f37fe8db99a4d5265f4f856b3612f5b3b13cc`, `sha256`
-`fb68adf8928600b4ae53cb773802e08f67ba9badccf40d1aa4985cea4c898d3c`, `bytes`
-2571088, and `./tools/fetch-benchd.sh` resolves and verifies it with no
-override: manifest branch, sha256 and byte count all check out.
-
-The channel host is the public bench repository `Layr-Labs/mlxfast-bench`, so
-`./tools/fetch-benchd.sh` needs no token. A verified pair through
-`BENCHD_DIST_LOCAL` still works.
-
-### 11.2 The model port HAS landed
-
-The engine constructs, gates, loads and runs `qwen4_exp_text`. The geometry in
-the vendored engine and this contract's `target.*` block are both this target's,
-and they move as ONE SET: a gate holding some fields of one model and some of
-another rejects every checkpoint and explains none of them.
-
-The vendored engine (`ds4/`) is an editable path. It is where a submission
-changes how the target is built and how its n-gram rows are fetched.
-
-What remains is named in 11.4 and 11.5: the cohort path refuses, and the
-speculative arm is correct but not yet fast.
-
-### 11.3 The checked-in goldens are REGENERATED and they load
-
-The two `correctness_prompts/*.json` goldens were regenerated on 2026-08-28 on
-ranked hardware, against the pinned target
-(`RadixArk/Qwen3.8-Flash-Next-NVFP4` @ `7b719225242aacd3dbd3f9407468c2ee9a9d2594`),
-carrying `model_type` `qwen4_exp_text`. They were double generated -- a fresh
-process each, byte-identical before either was pinned -- and they LOAD through
-the model-identity loader.
-
-So `./benchmark.sh --local-iterate` reaches a golden, and the local public
-drift gate can pass. The PROMPT file is unchanged; only the expected tokens and
-the provenance block moved.
-
-The HIDDEN correctness oracle is untouched and is still the pending sentinel:
-these are the PUBLIC goldens. Section 5.5 remains the authority on the arm
-state.
-
-### 11.4 The cohort path REFUSES, and no scored run is possible today
-
-**(a) The batched cohort path refuses by name.** `makeCohortEngine` throws.
-There are TWO blockers and the second is decisive:
-
-1. The QSA sparse attention emits a custom array mask, and the
-   ContinuousBatchingV2 path owns the attention call and discards a custom
-   mask. A cohort engine would serve DENSE attention under a model trained
-   sparse.
-2. A ContinuousBatchingV2 layer is full attention or a sliding window. On this
-   tower 36 of the 48 layers carry a constant-size RECURRENT state and NO
-   key-value tape, so three quarters of the model has no shape in that engine's
-   cache bank. This holds at EVERY context length, so no budget or window
-   check avoids it.
-
-The engine also stops ADVERTISING the batched capability in its hello, so the
-benchmarker refuses at its pre-measurement capability check rather than after
-it has sent a batched begin. There is no dense-attention fallback: below the
-indexer budget a cohort engine would look correct and would diverge exactly
-where the score is measured, so a fallback is worse than a refusal.
-
-**(b) That question is RULED, and the ruling is single-stream.** David ruling
-2026-08-27, relayed by orchestrator: this track is scored single-stream, and the
-ContinuousBatchingV2 adaptation is not pursued. The fixture therefore pins
-`scored_batch_size` 1 and `scoring.mode`
-`qwen-native-mtp-paired-decode-only`, and section 5 describes a single-stream
-paired series.
-
-**The bench-side dependency is MET.** Bench pull request 217 merged at the
-release branch tip `56a9821a`. At that tip `effective_candidate_regime` keeps
-`scored_batch_size` 1 on the single-stream regime (it never reaches the cohort
-width match), the composite is sealed on the single-stream series at the top
-level of the record beside `composite_scored_exponents`
-(`prefill_gain_exponent` / `decode_gain_exponent`), and the dist pair built
-from `source_commit` `379f37fe` is what `./tools/fetch-benchd.sh` resolves
-(section 11.1). The width certification no longer refuses the shape this
-fixture declares. What still stops a scored run is section 5.5: the sentinels,
-and the goldens.
-
-**(c) The mtp arm can now be faster than serial, and whether it is depends on
-your drafter.** Its verify runs at the draft depth (see 11.5), so a round pays
-one target forward for its whole chain rather than one per committed token. It
-still pays the depth head forwards that proposed the chain, and one full-stack
-snapshot per round, so an accepted draft is what buys the target forward back.
-Making it fast is the point of the track.
-
-**WHAT "CORRECT" MEANS FOR THIS ARM, stated precisely, because an earlier
-wording overstated it.** This section used to say the arm is "token-exact
-against the serial control". That is a FIXTURE-PROVEN property, not a
-pinned-weight one, and the two are not the same claim:
-
-* ON THE FIXTURE, token equality with the serial leg is asserted by test, at
-  every depth the envelope permits.
-* ON THE PINNED WEIGHTS, the recorded population is five near-tie argmax flips
-  among the 1,728 non-row-0 rows compared, with ZERO among the 576 row-0
-  samples. So the mtp stream MAY diverge from the serial stream at a near-tie
-  row.
-
-Under the ruled semantics that divergence is NOT an error. The verify runs at
-the draft depth, and the wide forward is the oracle: a committed token is
-correct when it matches what that forward says, not when it matches what a
-one-token-at-a-time decode would have said. Section 5.4 is the gate that prices
-any resulting difference in emitted tokens, and it already says this track does
-not require token-for-token equality with the serial trajectory. The engine's
-`docs/qwen38-125b-a6b-port-notes.md` section 5.2.1.4 has the measured
-population.
-
-### 11.5 The verify runs at the draft depth
-
-A speculative round verifies its whole draft chain in ONE target forward. The
-verify width is the resolved draft depth on the mtp leg; the serial control
-still runs one token at a time.
-
-**THE CAP THIS SECTION USED TO DESCRIBE IS GONE (David ruling 2026-08-28).**
-It existed because a measurement said a multi-token forward disagreed with the
-same tokens fed one at a time, and that measurement named the keep mask as
-ruled out. The keep mask WAS the cause: the QSA indexer computed its
-complete-block count with true division instead of floor division, so the mask
-let a query attend to future keys inside its own partial block, and how many
-depended on the segment width. That, a wrong RMSNorm convention for this
-checkpoint, and a vendored quantized-gather defect were all fixed, and the
-survey was re-run on ranked hardware against the fixed engine.
-
-**WHAT THE WIDE VERIFY RESTS ON.** Not bit-identity -- MLX dispatches a
-different kernel at one row than at several, by design, so the logits differ in
-their last bits. It rests on ARGMAX AGREEMENT: the wide forward picking the
-same tokens.
-
-Two separate pieces of evidence, and they are not interchangeable. On the
-FIXTURE, a test asserts that the speculative leg commits the serial leg's
-stream token for token at every permitted depth. On the PINNED WEIGHTS, the
-re-survey found argmax agreement on every one of its 576 row-0 samples, and
-five near-tie flips among the 1,728 non-row-0 rows -- so a wide verify may
-commit a token a one-at-a-time decode would not have, at a near-tie. That is
-the oracle doing its job, not a defect: see 11.4(c).
-
-**WHAT THIS MEANS FOR YOU.** The arm is no longer strictly more work than
-serial for the same output: a round pays one target forward for its whole
-chain instead of one per committed token. Whether that becomes a speedup on the
-ranked box is a measurement, not a promise, and it depends on the drafter -- an
-accepted draft is what buys the forward back.
