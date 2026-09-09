@@ -1550,6 +1550,23 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_off,
     memmove(dst->data + dst_off, src->data + src_off, (size_t)bytes);
     return 1;
 }
+int ds4_gpu_indexer_topk_tensor(ds4_gpu_tensor *selected,
+                                const ds4_gpu_tensor *scores,
+                                uint32_t n_comp, uint32_t n_tokens,
+                                uint32_t top_k) {
+    if (!selected || !scores || top_k != 1u ||
+        scores->bytes < (uint64_t)n_comp * n_tokens * sizeof(float) ||
+        selected->bytes < (uint64_t)n_tokens * sizeof(uint32_t)) {
+        return 0;
+    }
+    uint32_t *out = (uint32_t *)selected->data;
+    const float *in = (const float *)scores->data;
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        out[t] = (uint32_t)ds4_qwen4exp_mtp_argmax(
+            in + (size_t)t * n_comp, n_comp);
+    }
+    return 1;
+}
 int ds4_gpu_begin_commands(void) { return 1; }
 int ds4_gpu_end_commands(void) { return 1; }
 int ds4_gpu_synchronize(void) { return 1; }
@@ -1991,6 +2008,8 @@ static void test_head_wiring(void) {
                                         g_err, sizeof(g_err)) < 0,
           "the head accepted more rows than it was built for");
     ds4_qwen4exp_mtp_head_free(&h);
+    CHECK(h.t_top1 == NULL && h.top1_host == NULL,
+          "the head left its top-1 scratch allocated after free");
 
     /* The shipped head's eh_proj is [5120, 2560]: the embedding half occupies
      * the first n_embd input rows and the hidden half the rest, so a head that
