@@ -1207,9 +1207,8 @@ __global__ static void qwen4exp_moe_group_count_kernel(
     atomicAdd(&counts[e], 1);
 }
 
-/* One block, one thread: n_expert is 512, so the serial scan is a few hundred
- * adds against a kernel launch.  `cursor` starts at the offset and the scatter
- * bumps it. */
+/* Reference path retained for the CUDA MoE equivalence test and expert counts
+ * above the router's 512-expert envelope. */
 __global__ static void qwen4exp_moe_group_scan_kernel(
         int32_t *offsets,
         int32_t *cursor,
@@ -1231,6 +1230,49 @@ __global__ static void qwen4exp_moe_group_scan_kernel(
         if (counts[e] > 0) active[1 + live++] = (int32_t)e;
     }
     active[0] = live;
+}
+
+/* The shipped router admits at most 512 experts.  Scan that fixed envelope in
+ * parallel: both prefixes use integers, so this produces exactly the serial
+ * offsets, cursor values, live count, and ascending active-expert list.  Slots
+ * above n_expert carry zero and make non-power-of-two expert counts safe. */
+enum { QWEN4EXP_MOE_SCAN_THREADS = 512 };
+
+__global__ static void qwen4exp_moe_group_scan_parallel_kernel(
+        int32_t *offsets,
+        int32_t *cursor,
+        int32_t *active,
+        const int32_t *counts,
+        uint32_t n_expert) {
+    __shared__ int32_t count_prefix[QWEN4EXP_MOE_SCAN_THREADS];
+    __shared__ int32_t live_prefix[QWEN4EXP_MOE_SCAN_THREADS];
+    const uint32_t e = threadIdx.x;
+    const int32_t count = e < n_expert ? counts[e] : 0;
+    count_prefix[e] = count;
+    live_prefix[e] = count > 0 ? 1 : 0;
+    __syncthreads();
+
+    /* Inclusive Hillis-Steele scans.  Each iteration reads the preceding
+     * complete prefix before any lane writes the next one. */
+    for (uint32_t stride = 1u; stride < QWEN4EXP_MOE_SCAN_THREADS;
+         stride <<= 1u) {
+        const int32_t add_count = e >= stride ? count_prefix[e - stride] : 0;
+        const int32_t add_live = e >= stride ? live_prefix[e - stride] : 0;
+        __syncthreads();
+        if (e >= stride) {
+            count_prefix[e] += add_count;
+            live_prefix[e] += add_live;
+        }
+        __syncthreads();
+    }
+
+    if (e < n_expert) {
+        const int32_t offset = count_prefix[e] - count;
+        offsets[e] = offset;
+        cursor[e] = offset;
+        if (count > 0) active[live_prefix[e]] = (int32_t)e;
+    }
+    if (e == 0u) active[0] = live_prefix[QWEN4EXP_MOE_SCAN_THREADS - 1u];
 }
 
 __global__ static void qwen4exp_moe_group_scatter_kernel(
@@ -2231,8 +2273,15 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     }
     qwen4exp_moe_group_count_kernel<<<pair_blocks, threads, 0, stream>>>(
             sc.counts, (const int32_t *)selected->ptr, n_total_expert, n_pairs);
-    qwen4exp_moe_group_scan_kernel<<<1, 1, 0, stream>>>(
-            sc.offsets, sc.cursor, sc.active, sc.counts, n_total_expert);
+    if (n_total_expert <= QWEN4EXP_MOE_SCAN_THREADS &&
+        getenv("DS4_QWEN4EXP_SERIAL_GROUP_SCAN") == NULL) {
+        qwen4exp_moe_group_scan_parallel_kernel<<<
+                1, QWEN4EXP_MOE_SCAN_THREADS, 0, stream>>>(
+                sc.offsets, sc.cursor, sc.active, sc.counts, n_total_expert);
+    } else {
+        qwen4exp_moe_group_scan_kernel<<<1, 1, 0, stream>>>(
+                sc.offsets, sc.cursor, sc.active, sc.counts, n_total_expert);
+    }
     qwen4exp_moe_group_scatter_kernel<<<pair_blocks, threads, 0, stream>>>(
             sc.pairs, sc.cursor, (const int32_t *)selected->ptr, n_total_expert,
             n_pairs);
