@@ -31,13 +31,6 @@ use std::process::ExitCode;
 
 use protocol_adapter::Adapter;
 
-fn cuda_device() -> String {
-    // tools/ds4/build.sh supplies DS4_CUDA_ARCH for CUDA builds. Keep the GB10
-    // default for a direct Cargo build, but never label an explicitly targeted
-    // sm_120 workstation build as sm_121 in the artifact benchd seals.
-    format!("cuda {}", option_env!("DS4_CUDA_ARCH").unwrap_or("sm_121"))
-}
-
 fn main() -> ExitCode {
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -68,7 +61,7 @@ fn main() -> ExitCode {
             hello.ident
         );
         let backend = hello.backend_string();
-        Adapter::with_backend(factory, backend, cuda_device()).run(stdin.lock(), out)
+        Adapter::with_backend(factory, backend, "cuda sm_121").run(stdin.lock(), out)
     } else {
         #[cfg(not(feature = "ds4-engine"))]
         {
@@ -102,7 +95,7 @@ fn main() -> ExitCode {
                  session open. This loads the model per phase -- the scored path boots one \
                  ds4-resident per window (tools/serve-up.sh) and exports DS4_RESIDENT_SOCKET."
             );
-            Adapter::with_backend(factory, backend, cuda_device()).run(stdin.lock(), out)
+            Adapter::with_backend(factory, backend, "cuda sm_121").run(stdin.lock(), out)
         }
     };
 

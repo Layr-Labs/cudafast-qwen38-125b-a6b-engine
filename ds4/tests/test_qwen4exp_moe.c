@@ -723,30 +723,6 @@ static void run_row_invariance_case(const uint8_t *model,
             fail("a width the speculative cycle runs is not bit-identical to a "
                  "serial decode");
         }
-        float *serial_scan = calloc((size_t)w * OUT_DIM, sizeof(float));
-        if (!serial_scan) fail("serial group-scan comparison allocation");
-        setenv("DS4_QWEN4EXP_SERIAL_GROUP_SCAN", "1", 1);
-        require_ok(ds4_gpu_qwen4exp_routed_moe_tensor(
-                       out_t, mid_t, part_t, &gate_slab, &up_slab, &down_slab,
-                       IN_DIM, MID_DIM, OUT_DIM, sel_t, w_t, N_EXPERT,
-                       N_EXPERT_USED, x_t, w, N_EXPERT_USED * MID_DIM),
-                   "serial group-scan routed MoE");
-        require_ok(ds4_gpu_qwen4exp_shared_expert_tensor(
-                       out_t, shmid_t, shgate_t, &sh_router_slab, &sh_gate_slab,
-                       &sh_up_slab, &sh_down_slab, IN_DIM, SHARED_MID, OUT_DIM,
-                       x_t, w),
-                   "serial group-scan shared expert");
-        require_ok(ds4_gpu_tensor_read(
-                       out_t, 0, serial_scan,
-                       (uint64_t)w * OUT_DIM * sizeof(float)),
-                   "serial group-scan read");
-        unsetenv("DS4_QWEN4EXP_SERIAL_GROUP_SCAN");
-        if (memcmp(got, serial_scan,
-                   (size_t)w * OUT_DIM * sizeof(float)) != 0) {
-            fail("parallel group scan differs from the serial metadata scan");
-        }
-        printf("  parallel group scan output matches serial at width %u\n", w);
-        free(serial_scan);
         free(got);
     }
 

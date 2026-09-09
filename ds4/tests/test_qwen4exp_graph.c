@@ -247,13 +247,6 @@ bool ds4_qwen4exp_test_graph_session_open(const char *path, uint32_t n_ctx,
                                           uint64_t session_free_bytes,
                                           uint64_t already_resident_bytes,
                                           session_plan *plan_out);
-#if !defined(__APPLE__)
-int ds4_qwen4exp_test_shard_cache_policy(const char *path,
-                                         uint64_t *required_out,
-                                         uint64_t *streamed_out,
-                                         uint32_t *required_shards_out,
-                                         uint32_t *stream_only_shards_out);
-#endif
 
 static int g_checks = 0;
 static int g_failures = 0;
@@ -300,27 +293,6 @@ int main(int argc, char **argv) {
     if (argc == 4 && strcmp(argv[1], "--support-probe") == 0) {
         return ds4_qwen4exp_test_support_probe(argv[2], argv[3]);
     }
-
-#if !defined(__APPLE__)
-    if (argc == 3 && strcmp(argv[1], "--cache-policy") == 0) {
-        uint64_t required = 0, streamed = 0;
-        uint32_t required_shards = 0, stream_only_shards = 0;
-        const int rc = ds4_qwen4exp_test_shard_cache_policy(
-                argv[2], &required, &streamed,
-                &required_shards, &stream_only_shards);
-        check(rc == 0,
-              "all cached required tensors reuse their existing device ranges");
-        check(required > 0 && required_shards > 0,
-              "the fixture exercises required tensors on device shards");
-        check(streamed == 1,
-              "only per_layer_token_embd.weight is exempt as SSD-resident");
-        printf("cache policy: %llu required tensors on %u shards, %llu "
-               "streamed tensor, %u stream-only shards\n",
-               (unsigned long long)required, required_shards,
-               (unsigned long long)streamed, stream_only_shards);
-        return g_failures ? 1 : 0;
-    }
-#endif
 
     /* --textprobe <model> <prompt file>: one prompt per LINE, tokenized by the
      * engine's own tokenizer and run through the same harness loop the ladder

@@ -69,13 +69,6 @@ mkdir -p "$DIR/head"
 "$PY" "$WRITER" --out "$DIR/head" --name qw4x --quiet --shards 1 --mtp-head \
     --dense-threshold 67108864 >/dev/null
 
-# CUDA startup caches tensor spans rather than whole shards.  This focused
-# pre-GPU check proves the session recognizes that representation and excludes
-# only the PLE table that the memory plan deliberately leaves on SSD.
-if [ "$(uname -s)" != "Darwin" ]; then
-    "$BIN" --cache-policy "$DIR/q4k/qw4x-00001-of-00008.gguf"
-fi
-
 "$BIN" "$DIR/q4k" "$DIR/q4k1"
 "$BIN" --session "$DIR/q4k1" "$DIR/head"
 "$BIN" --mixed "$DIR/mixed"
