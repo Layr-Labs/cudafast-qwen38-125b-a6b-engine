@@ -84,11 +84,15 @@ impl ResidentHello {
     ///
     /// It carries three things a reader of a sealed artifact needs: the
     /// topology (`ds4-resident`), the `load_epoch`, and the resident's own
-    /// engine identity. THE `load_epoch` IS THE ONE-LOAD PROOF. It is the
-    /// resident's pid, so every phase of one window seals the same value and a
-    /// second load would seal a second value. Before this, the proof lived only
-    /// in the resident log and `serve-identity.json`, neither of which the
-    /// score carries.
+    /// engine identity. THE `load_epoch` IS THE ONE-LOAD RECORD, NOT A PROOF.
+    /// It is the resident's pid, composed by the worker and reported by it:
+    /// every phase of one window seals the same value, so the artifact records
+    /// that this serve booted no second load, and a differing value across
+    /// phases would show one. It is PROVENANCE the worker states about itself
+    /// -- it checks nothing independently, and an assertion that must hold
+    /// against a hostile worker needs a supervisor observation instead. Before
+    /// this, even the record lived only in the resident log and
+    /// `serve-identity.json`, neither of which the score carries.
     pub fn backend_string(&self) -> String {
         format!(
             "{RESIDENT_BACKEND} load_epoch={} {}",
