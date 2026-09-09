@@ -233,11 +233,10 @@ live field is `spec`, and `tools/spec-declaration.sh` reads it:
 "spec": { "enabled": true, "num_speculative_tokens": 1 }
 ```
 
-The rest of the file is bounded too. The accepted top-level keys are `version`,
-`source`, `max_bytes`, `bytes`, `sha256` and `spec`. An unknown key is refused
-by name. `"source"` must be `"pinned"`; `"source": "remote"` and
-`"source": "in_branch"` are refused by name. `max_bytes` is an integer from 1 to
-2147483648, so a declaration may lower the 2 GiB cap and may not raise it.
+The other keys are recorded, not read. `source` is `"pinned"`: the only head
+that can load is the organizer-staged one, and the value selects nothing.
+`max_bytes`, `bytes` and `sha256` are not checked against the staged head;
+`./setup.sh` verifies the head bytes against the contract's own pin instead.
 
 A declared `sha256` is optional and the runner does not verify it against the
 head bytes. The head bytes are bound one level up: the head is part of the
@@ -296,7 +295,7 @@ and this manifest is what holds them to a reviewed value.
 
 The organizer-staged head is not walked by this budget at all. It sits in the
 target snapshot on the box, which is not an editable path, so the walk never
-visits it. `max_bytes` bounds what the runner **loads**, and stays at 2 GiB.
+visits it.
 
 ### The weights are frozen
 
@@ -600,9 +599,7 @@ The staged snapshot holds the four target shards (111,334,654,784 bytes) and,
 flat beside them, the Q8_0 MTP draft head (2,786,568,256 bytes). The fixture
 pins all five files.
 
-The model repository is public. It downloads without a token. There is no
-organizer-hosted mirror for this checkpoint, so
-`MLXFAST_REFERENCE_FALLBACK_BASE_URL` is empty by default.
+The model repository is public. It downloads without a token.
 
 ### The target model
 

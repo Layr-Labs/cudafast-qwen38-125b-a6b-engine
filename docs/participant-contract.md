@@ -131,8 +131,7 @@ equality.
 
 No head weight file is staged in an editable path, so this budget never meets
 one. The head sits in the organizer-staged target snapshot, which is outside the
-editable surface. What the runner LOADS is bounded instead by the 2 GiB
-declaration cap in section 4.
+editable surface.
 
 ### 3.3 What you may not edit
 
@@ -169,8 +168,8 @@ Two things enforce this, and section 4 states each one:
 
 1. No editable path can hold head weights. The byte budget bars a weight file,
    and a submission that carries one is refused.
-2. The head declaration accepts `"source": "pinned"` only. `"remote"` and
-   `"in_branch"` are refused by name.
+2. The head declaration selects nothing. `source` is `"pinned"`, and the
+   only head that can load is the organizer-staged one.
 
 Nothing about the head is participant-tunable except the draft depth. Section
 4.1 states how you declare it.
@@ -254,16 +253,10 @@ which are 1 to 6. An absent file, an absent `spec` block, `enabled: false`, or
 `num_speculative_tokens: 0` all mean serial: the drafter is off. An unknown key
 inside `spec` is refused by name, so a mistyped key never reads as its default.
 
-The rest of the file is bounded the same way. The accepted top-level keys are
-`version`, `source`, `max_bytes`, `bytes`, `sha256` and `spec`. An unknown
-top-level key is refused by name. `"source"` must be `"pinned"`. `max_bytes` is
-an integer from 1 to 2147483648, so a declaration may lower the 2 GiB track cap
-and may not raise it.
-
-`"source": "remote"` is refused by name. `"source": "in_branch"` is refused by
-name. Both were accepted before the 2026-08-26 ruling and both meant "load
-weights the participant chose". The refusal names the retired source and names
-`pinned` as what replaced it.
+The other keys are recorded, not read. `source` is `"pinned"`: the only head
+that can load is the organizer-staged one, and the value selects nothing.
+`max_bytes`, `bytes` and `sha256` are not checked against the staged head;
+`./setup.sh` verifies the head bytes against the contract's own pin instead.
 
 The file carries no `arm` key. There is one arm, so there is nothing to select.
 
@@ -290,8 +283,7 @@ to it is outside the surface.
 
 ### 4.3 What the size cap does and does not do
 
-The 2 GiB declaration cap (`max_bytes` = 2147483648) bounds what the runner
-loads.
+`max_bytes` is recorded, not read. Nothing bounds a load by it.
 
 A declared `sha256` is optional, and the runner does not verify it against the
 head bytes. It treats a wrong digest and an absent digest alike. That is stated
@@ -718,8 +710,8 @@ the box at a time. A second dispatch queues rather than cancelling the first.
 
 `setupCommand` is `./tools/fetch-benchd.sh && ./setup.sh`. It chains no head
 stager, because there is none. The checked-in `mtp-head.manifest.json` declares
-`"source": "pinned"`, and the head arrives inside the target checkpoint that
-`./setup.sh` downloads and verifies.
+`"source": "pinned"`, and the head arrives beside the target shards in the
+snapshot that `./setup.sh` verifies.
 
 ## 7. The pinned artifacts
 
@@ -734,9 +726,7 @@ The staged snapshot holds the four main GGUF shards (111,334,654,784 bytes)
 and, flat beside them, the Q8_0 MTP draft head (2,786,568,256 bytes). The
 fixture pins all five by bytes and sha256.
 
-The model repository is public and downloads without a token. There is no
-organizer-hosted mirror for this checkpoint, so
-`MLXFAST_REFERENCE_FALLBACK_BASE_URL` is empty by default.
+The model repository is public and downloads without a token.
 
 Participants never supply the target weights. Substituting or re-deriving the
 target is a failure.
