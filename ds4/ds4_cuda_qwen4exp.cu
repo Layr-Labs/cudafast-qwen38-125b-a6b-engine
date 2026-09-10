@@ -1198,6 +1198,85 @@ __device__ __forceinline__ static float dev_qwen4exp_block_sum(
     return scratch[0];
 }
 
+/* The checkpoint asks for ten of at most 512 experts.  One warp can read that
+ * envelope as sixteen coalesced rows, keep them in registers, and select the
+ * small top-k without sorting the 502 entries the model will discard. */
+__global__ static void qwen4exp_router_select_topk_kernel(
+        int32_t *selected,
+        float *weights_out,
+        const float *logits,
+        uint32_t n_expert,
+        uint32_t n_expert_used,
+        uint32_t n_tokens) {
+    const uint32_t tok = blockIdx.x;
+    if (tok >= n_tokens) return;
+    const uint32_t lane = threadIdx.x;
+    const float *lg = logits + (uint64_t)tok * n_expert;
+    int32_t *sel = selected + (uint64_t)tok * n_expert_used;
+    float *w = weights_out + (uint64_t)tok * n_expert_used;
+
+    float scores[16];
+    uint32_t live = 0u;
+#pragma unroll
+    for (uint32_t j = 0; j < 16u; j++) {
+        const uint32_t e = lane + j * 32u;
+        scores[j] = e < n_expert ? lg[e] : -FLT_MAX;
+        if (e < n_expert) live |= 1u << j;
+    }
+
+    for (uint32_t rank = 0; rank < n_expert_used; rank++) {
+        float best_v = -FLT_MAX;
+        int32_t best_i = INT32_MAX;
+#pragma unroll
+        for (uint32_t j = 0; j < 16u; j++) {
+            if ((live & (1u << j)) == 0u) continue;
+            const int32_t e = (int32_t)(lane + j * 32u);
+            const float v = scores[j];
+            if (v > best_v || (v == best_v && e < best_i)) {
+                best_v = v;
+                best_i = e;
+            }
+        }
+
+#pragma unroll
+        for (uint32_t off = 16u; off > 0u; off >>= 1u) {
+            const float other_v =
+                __shfl_down_sync(0xffffffffu, best_v, off);
+            const int32_t other_i =
+                __shfl_down_sync(0xffffffffu, best_i, off);
+            if (other_v > best_v ||
+                (other_v == best_v && other_i < best_i)) {
+                best_v = other_v;
+                best_i = other_i;
+            }
+        }
+        const int32_t chosen =
+            __shfl_sync(0xffffffffu, best_i, 0u);
+        if (lane == 0u) sel[rank] = chosen;
+        if (((uint32_t)chosen & 31u) == lane) {
+            live &= ~(1u << ((uint32_t)chosen >> 5u));
+        }
+    }
+
+    /* Same serial softmax and the same selected-logit order as the full-sort
+     * path below. */
+    if (lane == 0u) {
+        float m = -FLT_MAX;
+        for (uint32_t i = 0; i < n_expert_used; i++) {
+            const float v = lg[(uint32_t)sel[i]];
+            if (v > m) m = v;
+        }
+        float sum = 0.0f;
+        for (uint32_t i = 0; i < n_expert_used; i++) {
+            const float e = expf(lg[(uint32_t)sel[i]] - m);
+            w[i] = e;
+            sum += e;
+        }
+        const float inv = 1.0f / sum;
+        for (uint32_t i = 0; i < n_expert_used; i++) w[i] *= inv;
+    }
+}
+
 /* One block per token.  Bitonic sort over the raw logits with ties going to
  * the lower expert index, then a serial softmax over the selected logits. */
 __global__ static void qwen4exp_router_select_kernel(
@@ -1430,6 +1509,112 @@ __global__ static void qwen4exp_moe_group_scan_parallel_kernel(
     }
     if (e == 0u) {
         active[0] = warp_live_prefix[QWEN4EXP_MOE_SCAN_THREADS / 32 - 1u];
+    }
+}
+
+/* At decode and verify widths there are at most seventy pairs.  A single
+ * 512-thread block can build the complete expert metadata without a memset,
+ * count launch, scan launch, scatter launch, or inter-block atomics.  Each
+ * expert thread scans the short pair list, the block performs the same integer
+ * prefix scans as the wide path, and each expert writes its pairs in ascending
+ * pair order. */
+__global__ static void qwen4exp_moe_group_small_kernel(
+        int32_t *counts,
+        int32_t *offsets,
+        int32_t *cursor,
+        int32_t *active,
+        int32_t *pairs,
+        float *mid,
+        const int32_t *selected,
+        uint32_t n_expert,
+        uint32_t n_pairs,
+        uint32_t n_expert_used,
+        uint32_t mid_dim,
+        uint32_t mid_token_stride) {
+    __shared__ int32_t warp_count_prefix[QWEN4EXP_MOE_SCAN_THREADS / 32];
+    __shared__ int32_t warp_live_prefix[QWEN4EXP_MOE_SCAN_THREADS / 32];
+    const uint32_t e = threadIdx.x;
+    const uint32_t lane = e & 31u;
+    const uint32_t warp = e >> 5u;
+
+    int32_t count = 0;
+    if (e < n_expert) {
+        for (uint32_t p = 0; p < n_pairs; p++) {
+            count += selected[p] == (int32_t)e;
+        }
+        counts[e] = count;
+    }
+    int32_t count_prefix = count;
+    int32_t live_prefix = count > 0 ? 1 : 0;
+#pragma unroll
+    for (uint32_t delta = 1u; delta < 32u; delta <<= 1u) {
+        const int32_t prior_count =
+            __shfl_up_sync(0xffffffffu, count_prefix, delta);
+        const int32_t prior_live =
+            __shfl_up_sync(0xffffffffu, live_prefix, delta);
+        if (lane >= delta) {
+            count_prefix += prior_count;
+            live_prefix += prior_live;
+        }
+    }
+    if (lane == 31u) {
+        warp_count_prefix[warp] = count_prefix;
+        warp_live_prefix[warp] = live_prefix;
+    }
+    __syncthreads();
+
+    if (warp == 0u) {
+        const uint32_t n_warps = QWEN4EXP_MOE_SCAN_THREADS / 32;
+        int32_t warp_count = lane < n_warps ? warp_count_prefix[lane] : 0;
+        int32_t warp_live = lane < n_warps ? warp_live_prefix[lane] : 0;
+#pragma unroll
+        for (uint32_t delta = 1u; delta < 32u; delta <<= 1u) {
+            const int32_t prior_count =
+                __shfl_up_sync(0xffffffffu, warp_count, delta);
+            const int32_t prior_live =
+                __shfl_up_sync(0xffffffffu, warp_live, delta);
+            if (lane >= delta) {
+                warp_count += prior_count;
+                warp_live += prior_live;
+            }
+        }
+        if (lane < n_warps) {
+            warp_count_prefix[lane] = warp_count;
+            warp_live_prefix[lane] = warp_live;
+        }
+    }
+    __syncthreads();
+
+    if (warp > 0u) {
+        count_prefix += warp_count_prefix[warp - 1u];
+        live_prefix += warp_live_prefix[warp - 1u];
+    }
+    if (e < n_expert) {
+        const int32_t offset = count_prefix - count;
+        offsets[e] = offset;
+        cursor[e] = offset + count;
+        if (count > 0) active[live_prefix] = (int32_t)e;
+        int32_t at = offset;
+        for (uint32_t p = 0; p < n_pairs; p++) {
+            if (selected[p] == (int32_t)e) pairs[at++] = (int32_t)p;
+        }
+    }
+    if (e == 0u) {
+        active[0] = warp_live_prefix[QWEN4EXP_MOE_SCAN_THREADS / 32 - 1u];
+    }
+    /* The normal router never emits an invalid id.  Preserve the public
+     * tensor helper's defensive zero semantics without paying a second launch
+     * in the normal case; an invalid pair's one thread writes its short
+     * intermediate row here. */
+    if (e < n_pairs) {
+        const int32_t expert = selected[e];
+        if (expert < 0 || (uint32_t)expert >= n_expert) {
+            const uint32_t token = e / n_expert_used;
+            const uint32_t slot = e - token * n_expert_used;
+            float *dst = mid + (uint64_t)token * mid_token_stride +
+                         (uint64_t)slot * mid_dim;
+            for (uint32_t row = 0; row < mid_dim; row++) dst[row] = 0.0f;
+        }
     }
 }
 
@@ -2626,12 +2811,22 @@ extern "C" int ds4_gpu_qwen4exp_router_select_tensor(
         fprintf(stderr, "ds4: CUDA qwen4exp router received undersized buffers\n");
         return 0;
     }
-    const unsigned threads = n_expert > 256u ? 512u : 256u;
-    qwen4exp_router_select_kernel<<<n_tokens, threads, 0, cuda_decode_stream()>>>(
-            (int32_t *)selected->ptr,
-            (float *)weights->ptr,
-            (const float *)logits->ptr,
-            n_expert, n_expert_used, n_tokens);
+    if (n_expert_used <= 32u) {
+        qwen4exp_router_select_topk_kernel<<<
+                n_tokens, 32u, 0, cuda_decode_stream()>>>(
+                (int32_t *)selected->ptr,
+                (float *)weights->ptr,
+                (const float *)logits->ptr,
+                n_expert, n_expert_used, n_tokens);
+    } else {
+        const unsigned threads = n_expert > 256u ? 512u : 256u;
+        qwen4exp_router_select_kernel<<<
+                n_tokens, threads, 0, cuda_decode_stream()>>>(
+                (int32_t *)selected->ptr,
+                (float *)weights->ptr,
+                (const float *)logits->ptr,
+                n_expert, n_expert_used, n_tokens);
+    }
     return cuda_ok(cudaGetLastError(), "qwen4exp router select launch");
 }
 /* Scratch for one expert call: the pair list, then the Q8_0 form of the
@@ -2795,29 +2990,47 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     const unsigned threads = 256u;
     const unsigned pair_blocks = (n_pairs + threads - 1u) / threads;
 
-    if (!cuda_ok(cudaMemsetAsync(sc.counts, 0,
-                                 (size_t)n_total_expert * sizeof(int32_t),
-                                 stream),
-                 "qwen4exp MoE group counts reset")) {
-        return 0;
-    }
-    qwen4exp_moe_group_count_kernel<<<pair_blocks, threads, 0, stream>>>(
-            sc.counts, (const int32_t *)selected->ptr, n_total_expert, n_pairs);
-    if (n_total_expert <= QWEN4EXP_MOE_SCAN_THREADS &&
-        getenv("DS4_QWEN4EXP_SERIAL_GROUP_SCAN") == NULL) {
-        qwen4exp_moe_group_scan_parallel_kernel<<<
+    const int small_group =
+        n_tokens < 8u && n_total_expert <= QWEN4EXP_MOE_SCAN_THREADS &&
+        getenv("DS4_QWEN4EXP_SERIAL_GROUP_SCAN") == NULL;
+    if (small_group) {
+        qwen4exp_moe_group_small_kernel<<<
                 1, QWEN4EXP_MOE_SCAN_THREADS, 0, stream>>>(
-                sc.offsets, sc.cursor, sc.active, sc.counts, n_total_expert);
+                sc.counts, sc.offsets, sc.cursor, sc.active, sc.pairs,
+                (float *)mid->ptr, (const int32_t *)selected->ptr,
+                n_total_expert, n_pairs, n_expert_used, mid_dim,
+                mid_token_stride);
     } else {
-        qwen4exp_moe_group_scan_kernel<<<1, 32, 0, stream>>>(
-                sc.offsets, sc.cursor, sc.active, sc.counts, n_total_expert);
+        if (!cuda_ok(cudaMemsetAsync(sc.counts, 0,
+                                     (size_t)n_total_expert * sizeof(int32_t),
+                                     stream),
+                     "qwen4exp MoE group counts reset")) {
+            return 0;
+        }
+        qwen4exp_moe_group_count_kernel<<<pair_blocks, threads, 0, stream>>>(
+                sc.counts, (const int32_t *)selected->ptr,
+                n_total_expert, n_pairs);
+        if (n_total_expert <= QWEN4EXP_MOE_SCAN_THREADS &&
+            getenv("DS4_QWEN4EXP_SERIAL_GROUP_SCAN") == NULL) {
+            qwen4exp_moe_group_scan_parallel_kernel<<<
+                    1, QWEN4EXP_MOE_SCAN_THREADS, 0, stream>>>(
+                    sc.offsets, sc.cursor, sc.active, sc.counts,
+                    n_total_expert);
+        } else {
+            qwen4exp_moe_group_scan_kernel<<<1, 32, 0, stream>>>(
+                    sc.offsets, sc.cursor, sc.active, sc.counts,
+                    n_total_expert);
+        }
+        qwen4exp_moe_group_scatter_kernel<<<pair_blocks, threads, 0, stream>>>(
+                sc.pairs, sc.cursor, (const int32_t *)selected->ptr,
+                n_total_expert, n_pairs);
     }
-    qwen4exp_moe_group_scatter_kernel<<<pair_blocks, threads, 0, stream>>>(
-            sc.pairs, sc.cursor, (const int32_t *)selected->ptr, n_total_expert,
-            n_pairs);
-    qwen4exp_moe_zero_invalid_kernel<<<n_pairs, threads, 0, stream>>>(
-            (float *)mid->ptr, (const int32_t *)selected->ptr,
-            n_total_expert, n_expert_used, mid_dim, mid_token_stride, n_pairs);
+    if (!small_group) {
+        qwen4exp_moe_zero_invalid_kernel<<<n_pairs, threads, 0, stream>>>(
+                (float *)mid->ptr, (const int32_t *)selected->ptr,
+                n_total_expert, n_expert_used, mid_dim, mid_token_stride,
+                n_pairs);
+    }
     if (!cuda_ok(cudaGetLastError(), "qwen4exp MoE pair list")) return 0;
 
     if (!qwen4exp_quantize_rows(sc.xq, sc.xs, sc.xsum, (const float *)x->ptr,
