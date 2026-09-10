@@ -2830,6 +2830,52 @@ extern "C" int ds4_gpu_qwen4exp_router_select_tensor(
     }
     return cuda_ok(cudaGetLastError(), "qwen4exp router select launch");
 }
+
+/* The MTP head forms n_hc rows [e_normed(t) | h_normed(t,s)] before its
+ * eh_proj.  At the production shape the portable implementation records eight
+ * short device copies for every one-row head step.  The rows are pure copies,
+ * so one flat kernel produces the identical layout while paying one launch. */
+__global__ static void qwen4exp_ehx_pack_kernel(
+        float *out, const float *embedding, const float *hidden,
+        uint32_t n_hc, uint32_t n_embd) {
+    const uint64_t pair = blockIdx.x;
+    const uint32_t t = (uint32_t)(pair / n_hc);
+    const uint64_t dst = pair * 2ull * n_embd;
+    const uint64_t e_src = (uint64_t)t * n_embd;
+    const uint64_t h_src = pair * n_embd;
+    for (uint32_t k = threadIdx.x; k < n_embd; k += blockDim.x) {
+        out[dst + k] = embedding[e_src + k];
+        out[dst + n_embd + k] = hidden[h_src + k];
+    }
+}
+
+extern "C" int ds4_gpu_qwen4exp_ehx_pack_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *embedding,
+        const ds4_gpu_tensor *hidden,
+        uint32_t              n_tokens,
+        uint32_t              n_hc,
+        uint32_t              n_embd) {
+    if (!out || !embedding || !hidden || n_tokens == 0u || n_hc == 0u ||
+        n_embd == 0u) {
+        return 0;
+    }
+    const uint64_t pairs = (uint64_t)n_tokens * n_hc;
+    const uint64_t total = pairs * 2ull * n_embd;
+    if (out->bytes < total * sizeof(float) ||
+        embedding->bytes < (uint64_t)n_tokens * n_embd * sizeof(float) ||
+        hidden->bytes < pairs * n_embd * sizeof(float)) {
+        fprintf(stderr, "ds4: CUDA qwen4exp ehx pack received undersized buffers\n");
+        return 0;
+    }
+    const unsigned threads = 256u;
+    qwen4exp_ehx_pack_kernel<<<
+            (unsigned)pairs, threads, 0,
+            cuda_decode_stream()>>>(
+            (float *)out->ptr, (const float *)embedding->ptr,
+            (const float *)hidden->ptr, n_hc, n_embd);
+    return cuda_ok(cudaGetLastError(), "qwen4exp ehx pack launch");
+}
 /* Scratch for one expert call: the pair list, then the Q8_0 form of the
  * activation the projections consume.  Laid out here so the sizes are visible
  * beside the kernels that read them.
