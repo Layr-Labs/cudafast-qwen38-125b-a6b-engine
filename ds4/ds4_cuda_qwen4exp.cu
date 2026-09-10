@@ -2806,7 +2806,10 @@ __device__ __forceinline__ static uint32_t qw_shared_q8_word(const char *p) {
     return qw_pack4((const int8_t *)p);
 }
 
-enum { QW_SH_BM = 16, QW_SH_BN = 32, QW_SH_NT = QW_SH_BN / 8,
+/* A 16-token tile lowers gate/up register use and removes its stack spill
+ * on sm_121. Each output keeps the same group chain and reduction tree;
+ * only the number of independent token columns per block changes. */
+enum { QW_SH_BM = 16, QW_SH_BN = 16, QW_SH_NT = QW_SH_BN / 8,
        QW_SH_WARPS = 16, QW_SH_THREADS = QW_SH_WARPS * 32 };
 
 /* Each warp computes the group sums of dp4a lanes W and W+16 separately:
@@ -3100,22 +3103,21 @@ static int qwen4exp_quantize_rows(
     return cuda_ok(cudaGetLastError(), "qwen4exp activation quantise");
 }
 
-/* The row tile changes work sharing, not the arithmetic of a live row.
- * DS4_QWEN4EXP_MOE_R pins the tile for direct comparison of the variants. */
+/* The row tile.  One row is the decode call and takes the same kernel at
+ * R = 1, which is what makes the tower row invariant by construction rather
+ * than by comparison.  DS4_QWEN4EXP_MOE_R pins the tile so a test can run two
+ * of them over the same rows. */
 static int qwen4exp_moe_tile(uint32_t n_rows) {
     const char *forced = getenv("DS4_QWEN4EXP_MOE_R");
     if (forced) {
         const int r = atoi(forced);
-        if (r == 1 || r == 2 || r == 4 || r == 8) return r;
+        if (r == 1 || r == 4 || r == 8) return r;
     }
     if (n_rows >= 8u) return 8;
     if (n_rows >= 4u) return 4;
-    /* The usual one-row decode and two-row verify need at most two live
-     * accumulators.  Keep their weight reuse while reducing the padded
-     * register tile now that the format-specific kernels are available. */
-    if (n_rows <= 2u) return 2;
-    /* A three-row call retains the previously measured eight-row tile.
-     * Its live per-row arithmetic agrees with the other tile widths. */
+    /* Decode/verify widths (1-7 rows): the 8-wide padded dp4a tile is
+     * measurably faster on GB10 than the per-row kernel and emits identical
+     * output (row-invariant by construction; stream-diffed over three seeds). */
     return 8;
 }
 
@@ -3349,7 +3351,6 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     }
     else if (tile == 8) { QWEN4EXP_GATEUP(8); }
     else if (tile == 4) { QWEN4EXP_GATEUP(4); }
-    else if (tile == 2) { QWEN4EXP_GATEUP(2); }
     else { QWEN4EXP_GATEUP(1); }
 #undef QWEN4EXP_GATEUP
 #undef QWEN4EXP_GATEUP_IMPL
@@ -3409,7 +3410,6 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     }
     if (tile == 8) { QWEN4EXP_DOWN(8); }
     else if (tile == 4) { QWEN4EXP_DOWN(4); }
-    else if (tile == 2) { QWEN4EXP_DOWN(2); }
     else { QWEN4EXP_DOWN(1); }
 #undef QWEN4EXP_DOWN
 #undef QWEN4EXP_DOWN_IMPL
@@ -3553,7 +3553,6 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_tensor(
             gate_slab->type, up_slab->type, xgroups, mid_dim, n_tokens)
     if (tile == 8) { QWEN4EXP_SH_GATEUP(8); }
     else if (tile == 4) { QWEN4EXP_SH_GATEUP(4); }
-    else if (tile == 2) { QWEN4EXP_SH_GATEUP(2); }
     else { QWEN4EXP_SH_GATEUP(1); }
 #undef QWEN4EXP_SH_GATEUP
     }
@@ -3588,7 +3587,6 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_tensor(
             down_slab->type, mgroups, out_dim, n_tokens)
     if (tile == 8) { QWEN4EXP_SH_DOWN(8); }
     else if (tile == 4) { QWEN4EXP_SH_DOWN(4); }
-    else if (tile == 2) { QWEN4EXP_SH_DOWN(2); }
     else { QWEN4EXP_SH_DOWN(1); }
 #undef QWEN4EXP_SH_DOWN
     }
