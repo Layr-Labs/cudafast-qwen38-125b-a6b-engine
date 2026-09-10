@@ -3486,6 +3486,169 @@ __global__ static void qwen4exp_qsa_attention_kernel(
     }
 }
 
+/* Prefill-only grouped-query attention.  Qwen4-Exp has twelve query heads for
+ * each KV head.  The scalar-head kernel above consequently reads every K and
+ * V row twelve times.  At prefill widths there are enough token blocks to
+ * saturate the device without using the query-head dimension for occupancy,
+ * so one block can carry the whole query group and reuse each KV value.
+ *
+ * G is a template argument rather than a runtime loop bound so the per-head
+ * online-softmax state remains in registers.  Within each head, dot products,
+ * reductions and value accumulation retain exactly the scalar kernel's order.
+ * Narrow decode/verify calls keep the scalar-head kernel: their token grid is
+ * too small to trade away its head-level parallelism. */
+template <uint32_t G>
+__global__ static void qwen4exp_qsa_attention_grouped_kernel(
+        const float *q,
+        const float *k_cache,
+        const float *v_cache,
+        const int32_t *selected,
+        const int32_t *counts,
+        float *out,
+        uint32_t n_tokens,
+        uint32_t n_head,
+        uint32_t n_kv_head,
+        uint32_t head_dim,
+        uint32_t pos0,
+        uint32_t cache_cap,
+        uint32_t max_selected,
+        uint32_t sparse,
+        float scale) {
+    extern __shared__ __align__(16) float qwen4exp_grouped_attn_shared[];
+    const uint32_t kv_head = blockIdx.x;
+    const uint32_t token = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t nth = blockDim.x;
+    if (kv_head >= n_kv_head || token >= n_tokens) return;
+
+    const uint32_t head0 = kv_head * G;
+    float *qvecs = qwen4exp_grouped_attn_shared;
+    float *probs = qvecs + G * head_dim;
+    float *tile = probs + G * nth;
+    int32_t *keys = (int32_t *)(tile + nth);
+
+    const float *qsrc = q + ((uint64_t)token * n_head + head0) * head_dim;
+    for (uint32_t i = tid; i < G * head_dim; i += nth) qvecs[i] = qsrc[i];
+    __syncthreads();
+
+    const uint32_t pos = pos0 + token;
+    const uint32_t count = sparse ? (uint32_t)counts[token] : pos + 1u;
+    const uint32_t kv_stride = n_kv_head * head_dim;
+    if (count == 0u) {
+        for (uint32_t h = 0; h < G; h++) {
+            float *dst = out + ((uint64_t)token * n_head + head0 + h) * head_dim;
+            for (uint32_t d = tid; d < head_dim; d += nth) dst[d] = 0.0f;
+        }
+        return;
+    }
+
+    float run_max[G];
+    float run_sum[G];
+    float acc[G];
+#pragma unroll
+    for (uint32_t h = 0; h < G; h++) {
+        run_max[h] = QWEN4EXP_QSA_MASKED_SCORE;
+        run_sum[h] = 0.0f;
+        acc[h] = 0.0f;
+    }
+
+    for (uint32_t base = 0; base < count; base += nth) {
+        const uint32_t n_in_tile = min(nth, count - base);
+        int32_t key = -1;
+        if (tid < n_in_tile) {
+            key = sparse ? selected[(uint64_t)token * max_selected + base + tid]
+                         : (int32_t)(base + tid);
+            if (key < 0 || (uint32_t)key >= cache_cap) key = -1;
+        }
+        keys[tid] = key;
+
+        float dot[G];
+#pragma unroll
+        for (uint32_t h = 0; h < G; h++) dot[h] = 0.0f;
+        if (key >= 0) {
+            const float *kv = k_cache +
+                (uint64_t)key * kv_stride + (uint64_t)kv_head * head_dim;
+            if ((head_dim & 3u) == 0u) {
+                const float4 *kv4 = (const float4 *)kv;
+                const uint32_t words = head_dim >> 2u;
+                for (uint32_t w = 0; w < words; w++) {
+                    const float4 kk = kv4[w];
+#pragma unroll
+                    for (uint32_t h = 0; h < G; h++) {
+                        const float4 qq = ((const float4 *)(qvecs + h * head_dim))[w];
+                        dot[h] += qq.x * kk.x;
+                        dot[h] += qq.y * kk.y;
+                        dot[h] += qq.z * kk.z;
+                        dot[h] += qq.w * kk.w;
+                    }
+                }
+            } else {
+                for (uint32_t d = 0; d < head_dim; d++) {
+                    const float kk = kv[d];
+#pragma unroll
+                    for (uint32_t h = 0; h < G; h++) {
+                        dot[h] += qvecs[h * head_dim + d] * kk;
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (uint32_t h = 0; h < G; h++) {
+            probs[h * nth + tid] =
+                (key >= 0) ? dot[h] * scale : QWEN4EXP_QSA_MASKED_SCORE;
+        }
+        __syncthreads();
+
+        float rescale[G];
+#pragma unroll
+        for (uint32_t h = 0; h < G; h++) {
+            tile[tid] = probs[h * nth + tid];
+            const float tile_max = qwen4exp_blk_max(tile, tid, nth);
+            const float new_max = fmaxf(run_max[h], tile_max);
+            __syncthreads();
+
+            const float probability = (key >= 0)
+                ? expf(probs[h * nth + tid] - new_max) : 0.0f;
+            probs[h * nth + tid] = probability;
+            tile[tid] = probability;
+            const float tile_sum = qwen4exp_blk_sum(tile, tid, nth);
+            rescale[h] = (run_max[h] > QWEN4EXP_QSA_MASKED_LIMIT)
+                ? expf(run_max[h] - new_max) : 0.0f;
+            run_sum[h] = run_sum[h] * rescale[h] + tile_sum;
+            run_max[h] = new_max;
+        }
+
+        if (tid < head_dim) {
+            float contrib[G];
+#pragma unroll
+            for (uint32_t h = 0; h < G; h++) contrib[h] = 0.0f;
+            for (uint32_t j = 0; j < n_in_tile; j++) {
+                const int32_t kj = keys[j];
+                if (kj < 0) continue;
+                const float vv = v_cache[
+                    (uint64_t)kj * kv_stride + (uint64_t)kv_head * head_dim + tid];
+#pragma unroll
+                for (uint32_t h = 0; h < G; h++) {
+                    contrib[h] += probs[h * nth + j] * vv;
+                }
+            }
+#pragma unroll
+            for (uint32_t h = 0; h < G; h++) {
+                acc[h] = acc[h] * rescale[h] + contrib[h];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid < head_dim) {
+#pragma unroll
+        for (uint32_t h = 0; h < G; h++) {
+            float *dst = out + ((uint64_t)token * n_head + head0 + h) * head_dim;
+            dst[tid] = (run_sum[h] > 0.0f) ? acc[h] / run_sum[h] : 0.0f;
+        }
+    }
+}
+
 __global__ static void qwen4exp_qsa_output_gate_kernel(
         const float *gate,
         float *out,
@@ -3751,6 +3914,27 @@ extern "C" int ds4_gpu_qwen4exp_qsa_attention_tensor(
      * block narrower than head_dim would leave the tail channels unwritten
      * with no error anywhere.  Refuse instead. */
     if (nth < head_dim) return 0;
+    /* The target has twelve query heads per KV head.  On wide prefill calls,
+     * group them so each K/V cache row is fetched once instead of twelve
+     * times.  Decode and speculative verify are deliberately left on the
+     * head-parallel kernel because they expose only one or two token blocks. */
+    const uint32_t group = n_head / n_kv_head;
+    if (group == 12u && head_dim == 256u && n_tokens >= 32u) {
+        const size_t grouped_shared =
+            ((size_t)group * head_dim + (size_t)group * nth + nth) * sizeof(float) +
+            (size_t)nth * sizeof(int32_t);
+        qwen4exp_qsa_attention_grouped_kernel<12><<<
+            dim3(n_kv_head, n_tokens), nth, grouped_shared, cuda_decode_stream()>>>(
+                (const float *)q->ptr, (const float *)k_cache->ptr,
+                (const float *)v_cache->ptr,
+                sparse ? (const int32_t *)selected->ptr : NULL,
+                sparse ? (const int32_t *)counts->ptr : NULL,
+                (float *)out->ptr, n_tokens, n_head, n_kv_head, head_dim, pos0,
+                cache_cap, max_selected, sparse ? 1u : 0u, scale);
+        return cuda_ok(cudaGetLastError(),
+                       "Qwen4-Exp grouped QSA attention launch");
+    }
+
     const size_t shared = ((size_t)head_dim + 2u * nth) * sizeof(float) +
                           (size_t)nth * sizeof(int32_t);
     qwen4exp_qsa_attention_kernel<<<dim3(n_head, n_tokens), nth, shared,
