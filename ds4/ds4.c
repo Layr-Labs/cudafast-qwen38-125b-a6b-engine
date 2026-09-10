@@ -68657,12 +68657,45 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
     return i;
 }
 
+/* Compact speculative verification leaves the selected full distribution in
+ * the target graph.  Most ranked decode calls need only its exact GPU top-1;
+ * materialize lazily for the less common APIs that inspect other logits. */
+static bool ds4_session_materialize_qwen4exp_frontier(ds4_session *s) {
+#ifndef DS4_NO_GPU
+    if (s && s->qwen4exp &&
+        s->qwen4exp_spec.frontier_logits_deferred) {
+        if (!s->qwen4exp_seam.read_logit_row ||
+            s->qwen4exp_seam.read_logit_row(
+                s->qwen4exp_seam.ctx,
+                s->qwen4exp_spec.frontier_row, s->logits) != 0) {
+            return false;
+        }
+        s->qwen4exp_spec.frontier_logits_deferred = false;
+    }
+#else
+    (void)s;
+#endif
+    return true;
+}
+
 int ds4_session_argmax(ds4_session *s) {
+#ifndef DS4_NO_GPU
+    if (s && s->qwen4exp && s->qwen4exp_spec.frontier_top1_valid) {
+        return s->qwen4exp_spec.frontier_top1;
+    }
+#endif
     return sample_argmax(s->logits, DS4_N_VOCAB);
 }
 
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
     if (!s || !s->logits) return -1;
+#ifndef DS4_NO_GPU
+    if (s->qwen4exp && s->qwen4exp_spec.frontier_top1_valid &&
+        s->qwen4exp_spec.frontier_top1 != excluded_id) {
+        return s->qwen4exp_spec.frontier_top1;
+    }
+#endif
+    if (!ds4_session_materialize_qwen4exp_frontier(s)) return -1;
     if (getenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == NULL) {
         return argmax_f32_excluding_unrolled8(
                 s->logits, DS4_N_VOCAB, excluded_id);
@@ -68683,6 +68716,14 @@ int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
 int ds4_session_argmax_ignoring_eos(ds4_session *s,
                                     ds4_think_mode think_mode) {
     if (!s || !s->logits) return -1;
+#ifndef DS4_NO_GPU
+    if (s->qwen4exp && s->qwen4exp_spec.frontier_top1_valid &&
+        !ds4_token_is_stop_for_think_mode(
+            s->engine, s->qwen4exp_spec.frontier_top1, think_mode)) {
+        return s->qwen4exp_spec.frontier_top1;
+    }
+#endif
+    if (!ds4_session_materialize_qwen4exp_frontier(s)) return -1;
     int best = -1;
     float best_logit = DS4_NEG_INF;
     for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
@@ -68711,12 +68752,20 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 }
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
+#ifndef DS4_NO_GPU
+    if (s && s->qwen4exp && temperature <= 0.0f &&
+        s->qwen4exp_spec.frontier_top1_valid) {
+        return s->qwen4exp_spec.frontier_top1;
+    }
+#endif
+    if (!ds4_session_materialize_qwen4exp_frontier(s)) return -1;
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
                               top_p, min_p, rng, s->sample_probs);
 }
 
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
     if (!s || !out || k <= 0) return 0;
+    if (!ds4_session_materialize_qwen4exp_frontier(s)) return 0;
     if (k > (int)DS4_N_VOCAB) k = (int)DS4_N_VOCAB;
     for (int i = 0; i < k; i++) {
         out[i].id = -1;
@@ -76089,6 +76138,7 @@ static bool ds4_session_qwen4exp_spec_init(ds4_session *s,
     s->qwen4exp_seam.verify_rows  = qwen4exp_seam_verify_rows;
     s->qwen4exp_seam.verify_rows_top1 = qwen4exp_seam_verify_rows_top1;
     s->qwen4exp_seam.read_logit_row = qwen4exp_seam_read_logit_row;
+    s->qwen4exp_seam.defer_frontier_logits = true;
     s->qwen4exp_seam.decode_token = qwen4exp_seam_decode_token;
     s->qwen4exp_seam.head_logits  = qwen4exp_seam_head_logits;
     s->qwen4exp_seam.draft_step   = qwen4exp_seam_draft_step;
