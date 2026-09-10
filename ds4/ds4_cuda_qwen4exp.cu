@@ -408,9 +408,22 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
         const float v_row = qkv[slot * conv_dim + 2u * (uint64_t)key_dim +
             head * QWEN4EXP_GDN_DIM + value];
         const uint64_t gate = slot * n_value_head + head;
-        const float g = expf(decay_coeff *
-            qwen4exp_gdn_softplus(raw_alpha[gate] + bias));
-        const float beta = qwen4exp_gdn_sigmoid(raw_beta[gate]);
+        /* `gate` is BLOCK-uniform here: `head` is blockIdx.x and `slot` is
+         * uniform across the block, so every thread evaluates the same
+         * expression on the same operands and gets bit-identical results.
+         * One lane therefore performs the transcendentals and the warp
+         * broadcasts those bits; the shuffle hands each lane exactly the value
+         * it would have computed itself, so the state update is unchanged.
+         * The early return above is warp-uniform (its `value` term is), so the
+         * full-mask shuffle is well defined. */
+        float g, beta;
+        if (lane == 0u) {
+            g = expf(decay_coeff *
+                qwen4exp_gdn_softplus(raw_alpha[gate] + bias));
+            beta = qwen4exp_gdn_sigmoid(raw_beta[gate]);
+        }
+        g = __shfl_sync(0xffffffffu, g, 0u);
+        beta = __shfl_sync(0xffffffffu, beta, 0u);
 
         h.x *= g;
         h.y *= g;

@@ -56,6 +56,14 @@ int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *dat
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
+/* Identical bounds checks and identical bytes, but queued instead of awaited:
+ * the copy rides the decode stream, so ordering against the producer and the
+ * next consumer comes from stream order and the host does not block.  Used on
+ * paths whose source and destination cannot overlap within the call that
+ * issues them. */
+int ds4_gpu_tensor_copy_async_off(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                                  const ds4_gpu_tensor *src, uint64_t src_offset,
+                                  uint64_t bytes);
 int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                    const ds4_gpu_tensor *src, uint64_t src_offset,
                                    uint64_t count);

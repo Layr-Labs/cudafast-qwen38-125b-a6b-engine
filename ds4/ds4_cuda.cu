@@ -3154,6 +3154,36 @@ extern "C" int ds4_gpu_tensor_copy_async(ds4_gpu_tensor *dst,
                    "tensor copy async");
 }
 
+/* The offset form of the above: same bounds checks and the same bytes as
+ * ds4_gpu_tensor_copy, but queued on the decode stream instead of awaited.
+ * cuda_decode_stream() is the capture stream inside a decode-graph capture and
+ * stream 0 outside it, so ordering against every surrounding launch is
+ * preserved either way; only the host-blocking rendezvous is removed.  A
+ * caller may use this only where the destination range is not read by work
+ * already queued ahead of it in the same call. */
+extern "C" int ds4_gpu_tensor_copy_async_off(ds4_gpu_tensor *dst,
+                                             uint64_t dst_offset,
+                                             const ds4_gpu_tensor *src,
+                                             uint64_t src_offset,
+                                             uint64_t bytes) {
+    if (!dst || !src || dst_offset > dst->bytes || src_offset > src->bytes ||
+        bytes > dst->bytes - dst_offset || bytes > src->bytes - src_offset) {
+        return 0;
+    }
+    if (bytes == 0) return 1;
+    int d = ds4_tensor_device_idx(dst);
+    int ok = 0;
+    WITH_DEVICE(g_gpu[d].device_id) {
+        ok = cuda_ok(cudaMemcpyAsync((char *)dst->ptr + dst_offset,
+                                     (const char *)src->ptr + src_offset,
+                                     (size_t)bytes,
+                                     cudaMemcpyDeviceToDevice,
+                                     cuda_decode_stream()),
+                     "tensor copy async off");
+    }
+    return ok;
+}
+
 extern "C" void ds4_gpu_tensor_free_in_place(ds4_gpu_tensor *t) {
     if (!t) return;
     int d = ds4_tensor_device_idx(t);

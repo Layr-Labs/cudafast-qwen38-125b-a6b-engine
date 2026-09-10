@@ -1373,11 +1373,19 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
         return false;
     }
 
-    /* Append k and v to the caches. */
+    /* Append k and v to the caches.
+     *
+     * Queued rather than awaited.  These wrote rows [pos0, pos0 + n_tokens),
+     * and the only reader in this call, the attention kernel below, reads
+     * [0, pos0): the ranges cannot overlap, so the copy's completion is owed to
+     * the NEXT call, not to this one.  Stream order supplies that, while the
+     * synchronous form cost a host-blocking, device-wide rendezvous on each of
+     * the two appends per full-attention layer per step, inside the timed
+     * decode window.  The bytes and the addresses are unchanged. */
     const uint64_t kv_row = (uint64_t)cfg->qsa_kv_dim * sizeof(float);
-    if (!ds4_gpu_tensor_copy(s->qsa_k[il], (uint64_t)pos0 * kv_row,
+    if (!ds4_gpu_tensor_copy_async_off(s->qsa_k[il], (uint64_t)pos0 * kv_row,
                                    s->qsa_kin, 0, (uint64_t)n_tokens * kv_row) ||
-        !ds4_gpu_tensor_copy(s->qsa_v[il], (uint64_t)pos0 * kv_row,
+        !ds4_gpu_tensor_copy_async_off(s->qsa_v[il], (uint64_t)pos0 * kv_row,
                                    s->qsa_vin, 0, (uint64_t)n_tokens * kv_row)) {
         fprintf(stderr, "ds4: qwen4exp QSA cache append failed at block %u\n", il);
         return false;
