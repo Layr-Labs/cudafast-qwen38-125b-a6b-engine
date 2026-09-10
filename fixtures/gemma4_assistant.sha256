@@ -1,0 +1,35 @@
+# SHA256 manifest for mlx-community/gemma-4-26B-A4B-it-qat-assistant-4bit.
+# Revision: bb94eae1b70a80dac16cbf959bb4b7d56bd1fb8c
+#
+# The Gemma 4 26B A4B MTP arm's assistant (spec-decode drafter) checkpoint --
+# see fixtures/qwen3_8_125b_a6b_track.json `assistant` and mtp-head.manifest.json
+# (source: remote, same repository/revision). Public repository, anonymous
+# fetch. The seed's staging script setup-gemma4-assistant.sh was removed with
+# the Apple-Metal runtime; this manifest is seed residue (this track's MTP head
+# is native to the target checkpoint, docs/qwen38-125b-a6b-port-notes.md
+# section 6).
+#
+# Verified against the pinned revision's published tree via the Hugging Face
+# tree API. LFS-backed entries (model.safetensors, tokenizer.json) use the
+# LFS object's own sha256 (`lfs.oid`); the rest were fetched and hashed
+# directly. `.gitattributes` (git blob oid
+# 52373fe24473b1aa44333d318f578ae6bf04b49b, 1570 bytes) is DELIBERATELY NOT
+# pinned, for the same reason as the target manifest. tokenizer.json IS
+# pinned even though the loader never reads it (the drafter reuses the
+# target's tokenizer, docs/qwen38-125b-a6b-port-notes.md section 4.0a) -- the loader
+# itself only required config.json plus *.safetensors in the staged directory.
+# The seed's Swift assistant-head loader (in the removed vendored MLX model fork)
+# no longer exists.
+#
+#   MLXFAST_GEMMA4_ASSISTANT_MANIFEST_RECORDS: 8
+#   MLXFAST_GEMMA4_ASSISTANT_MANIFEST_BYTES:   268325817
+#
+# Format: <sha256> <byte_count> <relative_path>
+e64d900d38bae76885f8e43d7704b6e89c1eb4385df98ed83946231fa82d1b34 1957 README.md
+2f1b4d75d067bae3fe44e676721c7f077d243bc007156cb9c2f8b5836613d082 17336 chat_template.jinja
+0cd54ff36e53a258532c5c1433bc44b88ba758cfe9b59bb4e6eecfd5453fabcf 2961 config.json
+fb53f4c64e58896a63472e8eb304397db4a39453e1da0f5d57625ec5a8c1050e 209 generation_config.json
+3c4d43863abbbf455ec537c726eff7abeb88bb361e3ab23ff0d2d6006f620f74 236124704 model.safetensors
+ab54b0e481714d358d800ad10366f585841e678f982be3274ea6660e9bedd3eb 6528 model.safetensors.index.json
+75a6583c1a418e2bbd79c60d95d28e0f5bf549ad3f2990b5bdb5238c6c2bf70c 32169440 tokenizer.json
+2084566efe9ae430fa5fa7f901373d9c2e027865a417e119c3598fdcc69a35f8 2682 tokenizer_config.json

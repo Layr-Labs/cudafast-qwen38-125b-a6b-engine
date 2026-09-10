@@ -1,0 +1,169 @@
+{
+  "schema_version": 1,
+  "track_id": "qwen3.8-27b-mtp-v1",
+  "official_scoring_enabled": false,
+  "mlx_swift_lm_revision": "6a3bee95eadaef0445b8201304f3417ec431f0f0",
+  "timed_prompt_pool": [
+    {
+      "r2_path": "correctness_prompts/qwen3.8-27b-mtp-v1/qwen3.8-27b-pool-beagle.json",
+      "sha256": "919318e117fd04fd827e4cbc82abc30f37f6aea0e1c2609b27e3679c64c25fca",
+      "bytes": 110395,
+      "noop_decode_speedup": 1.0,
+      "noop_decode_speedup_pairs": 4,
+      "noop_decode_speedup_spread_pct": 0.144,
+      "noop_decode_speedup_role": "informational_diagnostic_not_scored"
+    },
+    {
+      "r2_path": "correctness_prompts/qwen3.8-27b-mtp-v1/qwen3.8-27b-pool-botany.json",
+      "sha256": "192fb6218ae7c1950dffb24b13ce3608857162bcd17853d3892f1d70876ad313",
+      "bytes": 109627,
+      "noop_decode_speedup": 1.0,
+      "noop_decode_speedup_pairs": 4,
+      "noop_decode_speedup_spread_pct": 0.331,
+      "noop_decode_speedup_role": "informational_diagnostic_not_scored"
+    },
+    {
+      "r2_path": "correctness_prompts/qwen3.8-27b-mtp-v1/qwen3.8-27b-pool-drama.json",
+      "sha256": "4b9e88cdbe5aa2e76c03dcd76c5d2166e1e89c40ec2f777720aa87b225d7e1ff",
+      "bytes": 109722,
+      "noop_decode_speedup": 1.0,
+      "noop_decode_speedup_pairs": 3,
+      "noop_decode_speedup_spread_pct": 0.219,
+      "noop_decode_speedup_role": "informational_diagnostic_not_scored"
+    },
+    {
+      "r2_path": "correctness_prompts/qwen3.8-27b-mtp-v1/qwen3.8-27b-pool-essays.json",
+      "sha256": "a2ea8b60458057ae731c11ff841eb95ad66f6f785b9bc8a6ef169d59ccca679b",
+      "bytes": 109685,
+      "noop_decode_speedup": 1.0,
+      "noop_decode_speedup_pairs": 4,
+      "noop_decode_speedup_spread_pct": 0.155,
+      "noop_decode_speedup_role": "informational_diagnostic_not_scored"
+    },
+    {
+      "r2_path": "correctness_prompts/qwen3.8-27b-mtp-v1/qwen3.8-27b-pool-medicine.json",
+      "sha256": "00142a4454b01e746b517c35eb23d1f248cd934bc3a743250b03745b9e711986",
+      "bytes": 110440,
+      "noop_decode_speedup": 1.0,
+      "noop_decode_speedup_pairs": 8,
+      "noop_decode_speedup_spread_pct": 0.207,
+      "noop_decode_speedup_role": "informational_diagnostic_not_scored"
+    },
+    {
+      "r2_path": "correctness_prompts/qwen3.8-27b-mtp-v1/qwen3.8-27b-pool-plutarch.json",
+      "sha256": "c1ec58669d032878b7fd82d811132bca19e79c91e19bf1414fe47c9b6d16e09e",
+      "bytes": 109643,
+      "noop_decode_speedup": 1.0,
+      "noop_decode_speedup_pairs": 4,
+      "noop_decode_speedup_spread_pct": 0.437,
+      "noop_decode_speedup_role": "informational_diagnostic_not_scored"
+    },
+    {
+      "r2_path": "correctness_prompts/qwen3.8-27b-mtp-v1/qwen3.8-27b-pool-republic.json",
+      "sha256": "ea82dcb5931a2d78a42cebd4fb4189bf875a31c947b67792782e455f88a155a1",
+      "bytes": 109875,
+      "noop_decode_speedup": 1.0,
+      "noop_decode_speedup_pairs": 4,
+      "noop_decode_speedup_spread_pct": 0.269,
+      "noop_decode_speedup_role": "informational_diagnostic_not_scored"
+    },
+    {
+      "r2_path": "correctness_prompts/qwen3.8-27b-mtp-v1/qwen3.8-27b-pool-travel.json",
+      "sha256": "3b10cb4dcae4b7f8222b1594861c4bbcc72aa890d72b46e97caee994884c82a5",
+      "bytes": 109677,
+      "noop_decode_speedup": 1.0,
+      "noop_decode_speedup_pairs": 4,
+      "noop_decode_speedup_spread_pct": 0.167,
+      "noop_decode_speedup_role": "informational_diagnostic_not_scored"
+    }
+  ],
+  "hidden_correctness_golden": {
+    "sha256": "07424017a7b4efdcffdcc274256b78a0dc73afa410a21481e71b98fb709f8778",
+    "bytes": 49930
+  },
+  "target": {
+    "upstream_revision": "eda45ab47f465d08d6558f0353a2346e2eb9d5b3",
+    "upstream_source_model_id": "Qwen/Qwen3.8-27B",
+    "upstream_source_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+    "manifest_path": "fixtures/reference_qwen3_8_27b_4bit.sha256",
+    "manifest_sha256": "0cb384fd0d27834d74e90a27c66699f8d9c7bb985e71f2828554ad48de59d062",
+    "expected_source_bytes": 15153237117,
+    "model_type": "qwen3_5_text",
+    "num_hidden_layers": 64,
+    "full_attention_interval": 4,
+    "vocab_size": 248320,
+    "quantization": {
+      "mode": "affine",
+      "group_size": 64,
+      "bits": 4
+    }
+  },
+  "mtp_head": {
+    "upstream_revision": "26a328e070875b0314d652a039b6b59902690f03",
+    "manifest_path": "fixtures/qwen3_8_27b_mtp_head.sha256",
+    "manifest_sha256": "30775324c28887f63841185753a7d57c4d11719f8d73998827c5b83fd933304b",
+    "expected_total_bytes": 849406438,
+    "weights_file_bytes": 849400347,
+    "tensor_bytes": 849398784,
+    "dtype": "bf16",
+    "tensor_count": 15
+  },
+  "protocol": {
+    "name": "trusted_qwen_mtp_block_v1",
+    "serial_control_depth": 0,
+    "maximum_depth": 8,
+    "decode_tokens": 512,
+    "parent_oracle_required": true,
+    "worker_timing_is_authoritative": false,
+    "offered_draft_depth_ceiling": 8,
+    "empty_draft_rounds_legal": true,
+    "candidate_declares_no_depth": true,
+    "shipped_default_draft_policy": 2
+  },
+  "reference_baseline": {
+    "status": "measured",
+    "publication_allowed": true
+  },
+  "scoring_semantics": {
+    "status": "operator_ratified",
+    "aggregation": "median_of_per_prompt_raw_serial_relative_speedup",
+    "score_anchor": "serial = 1.0",
+    "published_score": "median(raw_p over all timed prompts)",
+    "median_rule": "even_n_mean_of_two_central_order_statistics",
+    "floor": 0.9,
+    "ceiling": 5.0,
+    "pairs_per_prompt": 1
+  },
+  "license": {
+    "spdx": "Apache-2.0",
+    "url": "https://huggingface.co/Qwen/Qwen3.8-27B",
+    "verified_repositories": [
+      "Qwen/Qwen3.6-27B",
+      "mlx-community/Qwen3.6-27B-4bit",
+      "mlx-community/Qwen3.6-27B-MTP-4bit"
+    ]
+  },
+  "mtp_head_delivery": {
+    "status": "operator_ratified",
+    "declaration_path": "mtp-head.manifest.json",
+    "declaration_is_editable": true,
+    "weights_path": "mtp-head",
+    "sources": [
+      "pinned",
+      "remote",
+      "in_branch"
+    ],
+    "default": "pinned",
+    "max_bytes": 2147483648,
+    "primary_path": "remote",
+    "applies_to": "candidate_leg_only",
+    "provenance_recorded": "head_provenance"
+  },
+  "calibration": {
+    "status": "measured",
+    "expected_raw_median": 0.9940390645,
+    "band_pct": 2.0,
+    "serial_denominator_band_unchanged": true,
+    "clears_submission_floor": true
+  }
+}

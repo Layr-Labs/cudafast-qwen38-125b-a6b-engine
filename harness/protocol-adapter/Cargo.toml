@@ -1,0 +1,32 @@
+# Engine Protocol v1 adapter for this track's CUDA engine.
+#
+# A STANDALONE crate, deliberately: building and testing the protocol plumbing
+# must not require a GPU or the CUDA toolchain. The adapter drives the engine
+# through the `Engine` trait (src/engine.rs); a deterministic `mock` backend
+# proves the protocol behaviour with no GPU, and the `ds4-engine` feature (off
+# by default) compiles the real backend: the upstream ds4 (antirez/ds4) engine in
+# the `ds4/` submodule, linked in-process through ds4_shim/ (see build.rs).
+[package]
+name = "protocol-adapter"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Engine Protocol v1 NDJSON-over-stdio adapter for the Qwen 3.8 125B A6B CUDA track."
+build = "build.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+default = []
+# Compiles the real ds4 backend (src/ds4_backend.rs). It links libds4qwen.so,
+# which tools/ds4/build.sh builds from the submodule's CUDA objects, so a
+# `cargo build --features ds4-engine` needs that library staged (DS4_LIB_DIR).
+# `cargo clippy --features ds4-engine` type-checks it anywhere. Off by default
+# so `cuda-engine` serves the mock unless the box build asks for ds4.
+ds4-engine = []
+
+[[bin]]
+name = "cuda-engine"
+path = "src/bin/cuda-engine.rs"
