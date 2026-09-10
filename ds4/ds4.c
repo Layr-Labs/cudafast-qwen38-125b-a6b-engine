@@ -3878,6 +3878,115 @@ static bool accelerator_cache_q8_tensors(const ds4_model *m,
     return true;
 }
 
+
+/* ----------------------------------------------------------------------
+ * Bring the SSD-resident n-gram table into the page cache before the first
+ * timed window.
+ *
+ * WHAT PAYS FOR THIS.  The table stays mapped rather than device resident by
+ * design (see the note in accelerator_collect_tensor_spans): 26.82 GiB the
+ * memory plan books as ssd_bytes.  A step reads sixteen 90-byte rows out of
+ * it, one per n-gram head, and the hash scatters them over all 320,001,536
+ * rows, so a row this process has not read before is a major fault -- 324 us
+ * cold against 5 us warm on this box.
+ *
+ * A SPECULATIVE LEG FAULTS WHERE A SERIAL LEG DOES NOT.  The rows a step names
+ * are a function of the token history, so a REJECTED draft token names row ids
+ * that no committed token ever names.  The serial run of the same prompt
+ * therefore leaves those rows cold, and the speculative leg pays for them
+ * inside its timed decode window -- but only the FIRST time the prompt is run
+ * that way.  That is what makes the cost look like a coin flip between two
+ * pairs of the same paired job rather than a property of the engine.
+ *
+ * THE FIX IS TO READ THE TABLE EARLY, NOT DIFFERENTLY.  Unified memory here is
+ * 121 GiB against a 76.86 GiB resident set, so the whole table fits in what is
+ * left; page cache is reclaimable and is counted by MemAvailable, which is
+ * what the memory guard reads, so this takes nothing the model needs.  One
+ * sequential pass, eight ways, run to COMPLETION after the device copy has
+ * finished -- after, so the copy's own reads do not evict what it brings in,
+ * and to completion because a pass still running is itself the slow leg: left
+ * on a background thread it took 33 s on a cold table and the first timed
+ * window opened inside it, which cost that pair 0.9 ms a token while the pair
+ * after it gained 0.5.  It costs seconds of untimed boot and removes the
+ * faults from every window after it.
+ *
+ * A HINT, NEVER A VALUE.  The pass reads bytes and discards them.  It changes
+ * no row the gather returns and no order it returns them in.
+ * ---------------------------------------------------------------------- */
+#define DS4_PLE_PAGE_WARM_THREADS 8
+
+typedef struct {
+    const unsigned char *base;
+    uint64_t             bytes;
+    uint64_t             sink;
+} ds4_ple_page_warm_job;
+
+static void *ds4_ple_page_warm_worker(void *arg) {
+    ds4_ple_page_warm_job *job = (ds4_ple_page_warm_job *)arg;
+    const long page_long = sysconf(_SC_PAGESIZE);
+    const uint64_t page = page_long > 0 ? (uint64_t)page_long : 4096ull;
+    const uint64_t chunk = 64ull * 1024ull * 1024ull;
+    uint64_t sink = 0;
+    for (uint64_t off = 0; off < job->bytes; off += chunk) {
+        uint64_t len = job->bytes - off;
+        if (len > chunk) len = chunk;
+#if defined(POSIX_MADV_WILLNEED)
+        (void)posix_madvise((void *)(uintptr_t)(job->base + off), (size_t)len,
+                            POSIX_MADV_WILLNEED);
+#endif
+        for (uint64_t at = 0; at < len; at += page) sink += job->base[off + at];
+    }
+    /* The sum is never read; storing it is what keeps the loads. */
+    job->sink = sink;
+    return NULL;
+}
+
+static void ds4_ple_page_warm(const ds4_model *m) {
+    static int done = 0;
+    if (done || !m) return;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        if (!ds4_streq(t->name, "per_layer_token_embd.weight")) continue;
+        if (t->bytes == 0 || t->map_index >= m->n_shards) return;
+        const ds4_model_shard *sh = &m->shard[t->map_index];
+        if (!sh->map || t->abs_offset > sh->size ||
+            t->bytes > sh->size - t->abs_offset) {
+            return;
+        }
+        done = 1;
+        const unsigned char *base = (const unsigned char *)sh->map + t->abs_offset;
+        ds4_ple_page_warm_job jobs[DS4_PLE_PAGE_WARM_THREADS];
+        pthread_t tids[DS4_PLE_PAGE_WARM_THREADS];
+        const uint64_t span =
+            (t->bytes + DS4_PLE_PAGE_WARM_THREADS - 1u) / DS4_PLE_PAGE_WARM_THREADS;
+        const double t0 = now_sec();
+        uint32_t started = 0;
+        for (uint32_t k = 0; k < DS4_PLE_PAGE_WARM_THREADS; k++) {
+            const uint64_t off = (uint64_t)k * span;
+            if (off >= t->bytes) break;
+            uint64_t len = t->bytes - off;
+            if (len > span) len = span;
+            jobs[k].base = base + off;
+            jobs[k].bytes = len;
+            jobs[k].sink = 0;
+            if (pthread_create(&tids[started], NULL, ds4_ple_page_warm_worker,
+                               &jobs[k]) == 0) {
+                started++;
+            } else {
+                /* A segment no thread took is read here, so the pass still
+                 * covers the whole table before it returns. */
+                (void)ds4_ple_page_warm_worker(&jobs[k]);
+            }
+        }
+        for (uint32_t k = 0; k < started; k++) pthread_join(tids[k], NULL);
+        fprintf(stderr,
+                "ds4: warmed the page cache for the %.2f GiB n-gram table in "
+                "%.3fs\n",
+                (double)t->bytes / 1073741824.0, now_sec() - t0);
+        return;
+    }
+}
+
 static bool accelerator_cache_model_tensors(ds4_backend backend,
                                             const ds4_model *m,
                                             const uint64_t *span_offsets,
@@ -3908,6 +4017,9 @@ static bool accelerator_cache_model_tensors(ds4_backend backend,
     fprintf(stderr,
             "ds4: %s startup model preparation covered %.2f GiB of tensor spans in %.3fs\n",
             accelerator_name, (double)prepared / 1073741824.0, t1 - t0);
+    /* The device copy is done, so nothing after this evicts what the warm
+     * brings in. */
+    ds4_ple_page_warm(m);
     /* What the session guard must NOT ask for again. */
     if (prepared_out) *prepared_out = prepared;
     return true;
