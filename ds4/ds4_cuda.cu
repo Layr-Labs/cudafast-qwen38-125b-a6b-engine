@@ -5259,16 +5259,17 @@ __device__ __forceinline__ static int32_t load_i8x4_i32_unaligned(const int8_t *
  * what the byte-at-a-time loop produced -- which is what the speculative
  * cycle's serial identity needs, and what the correctness gate checks.
  */
-/* The rolling reader already holds the first part of the final operand.  An
- * even payload needs only its last two bytes; odd payloads keep the safe byte
- * fallback. */
-__device__ __forceinline__ static int32_t q8_0_tail_word(
-        const int8_t *payload, uint32_t previous, uint32_t shift) {
-    if ((((uintptr_t)payload) & 1u) == 0u) {
-        const uint16_t last = *(const uint16_t *)(const void *)(payload + 30);
-        return (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
+/* Q8 payloads are normally even-aligned: the GGUF base and 34-byte block
+ * stride both preserve that alignment.  Read the final four bytes with two
+ * aligned halfwords, retaining byte loads for a caller with an odd pointer.
+ * Unlike an aligned word read across the tail, neither path crosses the
+ * four-byte range supplied by the caller. */
+__device__ __forceinline__ static int32_t q8_tail_i8x4(const int8_t *p) {
+    if (((uintptr_t)p & 1u) == 0u) {
+        const uint16_t *h = (const uint16_t *)(const void *)p;
+        return (int32_t)((uint32_t)h[0] | ((uint32_t)h[1] << 16u));
     }
-    return load_i8x4_i32_unaligned(payload + 28);
+    return load_i8x4_i32_unaligned(p);
 }
 
 __device__ __forceinline__ static int32_t dot_i8x32_dp4a(const int8_t *a, const int8_t *b) {
@@ -5289,7 +5290,7 @@ __device__ __forceinline__ static int32_t dot_i8x32_dp4a(const int8_t *a, const 
         dot = __dp4a((int32_t)__funnelshift_r(prev, next, sh), xb[i], dot);
         prev = next;
     }
-    dot = __dp4a(q8_0_tail_word(a, prev, sh), xb[7], dot);
+    dot = __dp4a(q8_tail_i8x4(a + 28), xb[7], dot);
     return dot;
 }
 
@@ -5318,7 +5319,7 @@ __device__ __forceinline__ static int32_t dot_i8_block(const int8_t *a, const in
  * WHAT MOVES.  Nothing arithmetic.  q8_0_group_words() computes exactly the
  * eight int32 operands dot_i8x32_dp4a() builds -- the same seven
  * __funnelshift_r of the same aligned word pair at the same shift, then the
- * same q8_0_tail_word(a, prev, sh) -- and dot_i8x32_dp4a_words() feeds them
+ * same q8_tail_i8x4(a + 28) -- and dot_i8x32_dp4a_words() feeds them
  * to the same eight __dp4a against the same activation words in the same order
  * into the same int32 accumulator.  An integer dot has no rounding, so the
  * value is the one the pointer form returned, bit for bit, and the float tail
@@ -5339,7 +5340,7 @@ __device__ __forceinline__ static void q8_0_group_words(int32_t w[8],
         w[i] = (int32_t)__funnelshift_r(prev, next, sh);
         prev = next;
     }
-    w[7] = q8_0_tail_word(a, prev, sh);
+    w[7] = q8_tail_i8x4(a + 28);
 }
 
 __device__ __forceinline__ static int32_t dot_i8x32_dp4a_words(
@@ -16398,55 +16399,26 @@ static int cuda_q8_mma_available(void) {
                 in_dim, out_dim, n_rows, blocks);                              \
     } while (0)
 
-extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
-        ds4_gpu_tensor       *out,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
-        uint32_t                n_rows) {
-    if (!out || !x || !model_map || in_dim == 0u || out_dim == 0u ||
-        n_rows == 0u ||
-        x->bytes < (uint64_t)n_rows * in_dim * sizeof(float) ||
-        out->bytes < (uint64_t)n_rows * out_dim * sizeof(float)) {
-        return 0;
-    }
-    const uint64_t blocks = (in_dim + 31u) / 32u;
-    if (weight_offset > model_size ||
-        out_dim > UINT64_MAX / (blocks * 34u)) {
-        return 0;
-    }
-    const uint64_t weight_bytes = out_dim * blocks * 34u;
-    if (weight_bytes > model_size - weight_offset) return 0;
-    const int logical_tier = ds4_tensor_device_idx(out);
-    if (logical_tier < 0 || logical_tier >= g_n_gpus ||
-        ds4_tensor_device_idx(x) != logical_tier) {
-        return 0;
-    }
-    const char *wptr = cuda_resolve_weight_ptr(
-            model_map, weight_offset, weight_bytes, logical_tier,
-            "q8_0 decode rows exact");
-    if (!wptr) return 0;
-
-    const uint64_t xq_bytes = (uint64_t)n_rows * blocks * 32u;
-    const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
-    const uint64_t tmp_bytes =
-        scale_offset + (uint64_t)n_rows * blocks * sizeof(float);
-    void *tmp = cuda_tmp_alloc_on(
-            logical_tier, tmp_bytes, "q8_0 decode rows exact prequant");
-    if (!tmp) return 0;
-    int8_t *xq = (int8_t *)tmp;
-    float *xscale = (float *)((char *)tmp + scale_offset);
-    const uint64_t qpairs = (uint64_t)n_rows * blocks;
-    const unsigned qgrid = (unsigned)((qpairs + 7u) / 8u);
-    quantize_q8_0_f32_rows_warp_kernel<<<qgrid, 256, 0, cuda_decode_stream()>>>(
-            xq, xscale, (const float *)x->ptr, in_dim, blocks, n_rows);
-    if (!cuda_ok(cudaGetLastError(),
-                 "q8_0 decode rows exact quantize launch")) {
-        return 0;
-    }
+/* Everything the Q8_0 row-exact matmul does once its input is already
+ * quantized: the MMA tile at prefill widths and the older per-row and
+ * row-tile kernels below it.
+ *
+ * Lifted verbatim out of ds4_gpu_matmul_q8_0_decode_rows_exact_tensor so the
+ * two entry points below share ONE copy of the launch ladder.  A caller that
+ * has already produced xq/xscale -- the fused hyper-connection norm does,
+ * because it holds the normalized value in a register and would otherwise
+ * write 41.9 MB of it to DRAM for a quantize kernel to read straight back --
+ * reaches the same kernels with the same arguments, so the two paths cannot
+ * pick different arithmetic. */
+static int cuda_matmul_q8_0_preq_rows_exact(
+        ds4_gpu_tensor *out,
+        const char     *wptr,
+        const int8_t   *xq,
+        const float    *xscale,
+        uint64_t        in_dim,
+        uint64_t        out_dim,
+        uint32_t        n_rows,
+        uint64_t        blocks) {
     /* The int8 MMA GEMM, at PREFILL widths only.
      *
      * The tile is the right kernel when there are rows to share a weight read
@@ -16547,6 +16519,111 @@ extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
     }
     return cuda_ok(cudaGetLastError(),
                    "q8_0 decode rows exact tile launch");
+}
+
+extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t                n_rows) {
+    if (!out || !x || !model_map || in_dim == 0u || out_dim == 0u ||
+        n_rows == 0u ||
+        x->bytes < (uint64_t)n_rows * in_dim * sizeof(float) ||
+        out->bytes < (uint64_t)n_rows * out_dim * sizeof(float)) {
+        return 0;
+    }
+    const uint64_t blocks = (in_dim + 31u) / 32u;
+    if (weight_offset > model_size ||
+        out_dim > UINT64_MAX / (blocks * 34u)) {
+        return 0;
+    }
+    const uint64_t weight_bytes = out_dim * blocks * 34u;
+    if (weight_bytes > model_size - weight_offset) return 0;
+    const int logical_tier = ds4_tensor_device_idx(out);
+    if (logical_tier < 0 || logical_tier >= g_n_gpus ||
+        ds4_tensor_device_idx(x) != logical_tier) {
+        return 0;
+    }
+    const char *wptr = cuda_resolve_weight_ptr(
+            model_map, weight_offset, weight_bytes, logical_tier,
+            "q8_0 decode rows exact");
+    if (!wptr) return 0;
+
+    const uint64_t xq_bytes = (uint64_t)n_rows * blocks * 32u;
+    const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+    const uint64_t tmp_bytes =
+        scale_offset + (uint64_t)n_rows * blocks * sizeof(float);
+    void *tmp = cuda_tmp_alloc_on(
+            logical_tier, tmp_bytes, "q8_0 decode rows exact prequant");
+    if (!tmp) return 0;
+    int8_t *xq = (int8_t *)tmp;
+    float *xscale = (float *)((char *)tmp + scale_offset);
+    const uint64_t qpairs = (uint64_t)n_rows * blocks;
+    const unsigned qgrid = (unsigned)((qpairs + 7u) / 8u);
+    quantize_q8_0_f32_rows_warp_kernel<<<qgrid, 256, 0, cuda_decode_stream()>>>(
+            xq, xscale, (const float *)x->ptr, in_dim, blocks, n_rows);
+    if (!cuda_ok(cudaGetLastError(),
+                 "q8_0 decode rows exact quantize launch")) {
+        return 0;
+    }
+    return cuda_matmul_q8_0_preq_rows_exact(out, wptr, xq, xscale, in_dim,
+                                            out_dim, n_rows, blocks);
+}
+
+/* The same matmul over an input the caller has ALREADY quantized into `q`:
+ * the Q8_0 bytes at `q_offset` and the per-block scales at `s_offset`, in the
+ * layout quantize_q8_0_f32_rows_warp_kernel writes and every preq kernel
+ * reads (pair = row * blocks + block, 32 bytes then one f32 scale each).
+ *
+ * Same weight resolution, same bounds, same launch ladder as the entry above;
+ * it differs only in not running the quantize itself. */
+extern "C" int ds4_gpu_matmul_q8_0_preq_rows_exact_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *q,
+        uint64_t              q_offset,
+        uint64_t              s_offset,
+        uint32_t              n_rows) {
+    if (!out || !q || !model_map || in_dim == 0u || out_dim == 0u ||
+        n_rows == 0u || (in_dim & 31u) != 0u ||
+        out->bytes < (uint64_t)n_rows * out_dim * sizeof(float)) {
+        return 0;
+    }
+    const uint64_t blocks = in_dim / 32u;
+    if (weight_offset > model_size ||
+        out_dim > UINT64_MAX / (blocks * 34u)) {
+        return 0;
+    }
+    const uint64_t weight_bytes = out_dim * blocks * 34u;
+    if (weight_bytes > model_size - weight_offset) return 0;
+    const uint64_t qbytes = (uint64_t)n_rows * blocks * 32u;
+    const uint64_t sbytes = (uint64_t)n_rows * blocks * sizeof(float);
+    if ((q_offset & 15u) != 0u || (s_offset & 15u) != 0u ||
+        q_offset > q->bytes || s_offset > q->bytes ||
+        q->bytes - q_offset < qbytes || q->bytes - s_offset < sbytes) {
+        return 0;
+    }
+    const int logical_tier = ds4_tensor_device_idx(out);
+    if (logical_tier < 0 || logical_tier >= g_n_gpus ||
+        ds4_tensor_device_idx(q) != logical_tier) {
+        return 0;
+    }
+    const char *wptr = cuda_resolve_weight_ptr(
+            model_map, weight_offset, weight_bytes, logical_tier,
+            "q8_0 preq rows exact");
+    if (!wptr) return 0;
+    return cuda_matmul_q8_0_preq_rows_exact(
+            out, wptr, (const int8_t *)((const char *)q->ptr + q_offset),
+            (const float *)((const char *)q->ptr + s_offset), in_dim, out_dim,
+            n_rows, blocks);
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(

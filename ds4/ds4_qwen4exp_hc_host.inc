@@ -12,7 +12,11 @@
 extern "C" {
 #endif
 
-int ds4_gpu_qwen4exp_hc_mixer_tensor(
+/* The chain, op by op.  This is the DEFINITION of the mixer: a backend fusion
+ * is only allowed to be a faster way to compute exactly what these calls
+ * compute, and ds4_gpu_qwen4exp_hc_mixer_unfused_tensor below keeps it
+ * reachable so a test can hold the two side by side at zero tolerance. */
+static int qwen4exp_hc_mixer_chain(
         ds4_gpu_tensor       *mixed,
         ds4_gpu_tensor       *inject,
         ds4_gpu_tensor       *normed_scratch,
@@ -35,13 +39,6 @@ int ds4_gpu_qwen4exp_hc_mixer_tensor(
         float                 eps,
         float                 weight_bias,
         int                   round_bf16) {
-    if (!mixed || !normed_scratch || !lowrank_scratch || !wide_scratch ||
-        !hyper || !norm_weight || !down_weight || !up_weight ||
-        n_embd == 0 || n_hc == 0 || n_lowrank == 0 ||
-        rows == 0) {
-        return 0;
-    }
-
     const uint32_t wide = n_hc * n_embd;
 
     /* normed = hcNorm(hyper): grouped, one statistic per stream, one weight
@@ -87,6 +84,81 @@ int ds4_gpu_qwen4exp_hc_mixer_tensor(
     return ds4_gpu_qwen4exp_hc_inject_weights_tensor(inject, normed_scratch,
                                                      inject_weight,
                                                      n_embd, n_hc, rows);
+}
+
+#define DS4_QWEN4EXP_HC_MIXER_ARGS                                            \
+    mixed, inject, normed_scratch, lowrank_scratch, wide_scratch, hyper,      \
+    norm_weight, down_weight, up_weight, inject_weight,                       \
+    n_embd, n_hc, n_lowrank, rows, eps, weight_bias, round_bf16
+
+#define DS4_QWEN4EXP_HC_MIXER_GUARD                                           \
+    if (!mixed || !normed_scratch || !lowrank_scratch || !wide_scratch ||     \
+        !hyper || !norm_weight || !down_weight || !up_weight ||               \
+        n_embd == 0 || n_hc == 0 || n_lowrank == 0 ||                         \
+        rows == 0) {                                                          \
+        return 0;                                                             \
+    }
+
+/* The op-by-op chain, exported.  Nothing in the engine calls this: it exists
+ * so tests/test_qwen4exp_hc_norm.c can require the fused path to agree with it
+ * bit for bit, which is the only evidence that the fusion is a scheduling
+ * change and not a numerical one. */
+int ds4_gpu_qwen4exp_hc_mixer_unfused_tensor(
+        ds4_gpu_tensor       *mixed,
+        ds4_gpu_tensor       *inject,
+        ds4_gpu_tensor       *normed_scratch,
+        ds4_gpu_tensor       *lowrank_scratch,
+        ds4_gpu_tensor       *wide_scratch,
+        const ds4_gpu_tensor *hyper,
+        const ds4_gpu_qwen4exp_slab *norm_weight,
+        const ds4_gpu_qwen4exp_slab *down_weight,
+        const ds4_gpu_qwen4exp_slab *up_weight,
+        const ds4_gpu_qwen4exp_slab *inject_weight,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              n_lowrank,
+        uint32_t              rows,
+        float                 eps,
+        float                 weight_bias,
+        int                   round_bf16) {
+    DS4_QWEN4EXP_HC_MIXER_GUARD
+    return qwen4exp_hc_mixer_chain(DS4_QWEN4EXP_HC_MIXER_ARGS);
+}
+
+/* The mixer the engine calls.
+ *
+ * The fused backend path is the DEFAULT and needs no environment to reach: the
+ * harness clears the environment on a ranked run, so a win behind a switch is
+ * not a win.  DS4_QWEN4EXP_NO_HC_FUSE is a debugging valve in the other
+ * direction, and the fused entry itself declines (-1) any shape it cannot
+ * serve, so the chain above stays the fallback rather than a refusal. */
+int ds4_gpu_qwen4exp_hc_mixer_tensor(
+        ds4_gpu_tensor       *mixed,
+        ds4_gpu_tensor       *inject,
+        ds4_gpu_tensor       *normed_scratch,
+        ds4_gpu_tensor       *lowrank_scratch,
+        ds4_gpu_tensor       *wide_scratch,
+        const ds4_gpu_tensor *hyper,
+        const ds4_gpu_qwen4exp_slab *norm_weight,
+        const ds4_gpu_qwen4exp_slab *down_weight,
+        const ds4_gpu_qwen4exp_slab *up_weight,
+        const ds4_gpu_qwen4exp_slab *inject_weight,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              n_lowrank,
+        uint32_t              rows,
+        float                 eps,
+        float                 weight_bias,
+        int                   round_bf16) {
+    DS4_QWEN4EXP_HC_MIXER_GUARD
+#ifdef DS4_QWEN4EXP_HC_HAVE_FUSED
+    if (!ds4_qwen4exp_hc_fuse_off()) {
+        const int fused =
+            qwen4exp_hc_mixer_fused_cuda(DS4_QWEN4EXP_HC_MIXER_ARGS);
+        if (fused >= 0) return fused;
+    }
+#endif
+    return qwen4exp_hc_mixer_chain(DS4_QWEN4EXP_HC_MIXER_ARGS);
 }
 
 int ds4_gpu_qwen4exp_embed_tokens_hc_tensor(

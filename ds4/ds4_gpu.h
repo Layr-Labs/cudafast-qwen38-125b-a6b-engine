@@ -870,6 +870,29 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         uint64_t              out_dim,
         const ds4_gpu_tensor *x,
         uint32_t              n_rows);
+/* The same projection over an input the CALLER has already quantized, in the
+ * exact layout the internal quantize writes: `q_offset` bytes into `q` are
+ * n_rows * (in_dim/32) Q8_0 blocks of 32 int8, and `s_offset` bytes in are the
+ * matching n_rows * (in_dim/32) f32 block scales.  Both offsets must be
+ * 16-byte aligned.
+ *
+ * Same weights, same bounds and the SAME launch ladder as the entry above --
+ * it is one function with the quantize step lifted out -- so a caller that
+ * produced xq/xscale some other way lands on identical arithmetic.  The fused
+ * hyper-connection norm is that caller: it already holds the normalized value
+ * in a register, and writing it to DRAM only for a quantize kernel to read it
+ * straight back was 95.6 MB of round trip per mixer call at a 1024-row chunk. */
+int ds4_gpu_matmul_q8_0_preq_rows_exact_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *q,
+        uint64_t              q_offset,
+        uint64_t              s_offset,
+        uint32_t              n_rows);
 int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
         ds4_gpu_tensor       *out,
         const void           *model_map,
@@ -3634,6 +3657,30 @@ int ds4_gpu_qwen4exp_hc_mixer_tensor(
         const ds4_gpu_tensor *hyper,
         /* One slab per tensor: a shard boundary can fall between any two of a
          * mixer's four weights. */
+        const ds4_gpu_qwen4exp_slab *norm_weight,
+        const ds4_gpu_qwen4exp_slab *down_weight,
+        const ds4_gpu_qwen4exp_slab *up_weight,
+        const ds4_gpu_qwen4exp_slab *inject_weight,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              n_lowrank,
+        uint32_t              rows,
+        float                 eps,
+        float                 weight_bias,
+        int                   round_bf16);
+
+/* The same mixer, built ONLY out of the per-op wrappers -- no backend fusion.
+ *
+ * Nothing in the engine calls it.  It exists so a test can require the entry
+ * above, which does fuse where the backend can, to agree with the op-by-op
+ * chain bit for bit at the production shapes. */
+int ds4_gpu_qwen4exp_hc_mixer_unfused_tensor(
+        ds4_gpu_tensor       *mixed,
+        ds4_gpu_tensor       *inject,
+        ds4_gpu_tensor       *normed_scratch,
+        ds4_gpu_tensor       *lowrank_scratch,
+        ds4_gpu_tensor       *wide_scratch,
+        const ds4_gpu_tensor *hyper,
         const ds4_gpu_qwen4exp_slab *norm_weight,
         const ds4_gpu_qwen4exp_slab *down_weight,
         const ds4_gpu_qwen4exp_slab *up_weight,

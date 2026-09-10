@@ -129,7 +129,7 @@ endif
 # memory, so it runs on every host alongside the tests that do need a device.
 GPU_KERNEL_TESTS += $(QWEN4EXP_MTP_TEST)
 
-.PHONY: all help clean test test-qwen4exp test-qwen4exp-ple test-qwen4exp-ple-kernels test-qwen4exp-ple-kernel-mutants test-qwen4exp-gdn test-qwen4exp-gdn-ref test-qwen4exp-qsa-ref test-qwen4exp-moe test-qwen4exp-moe-mutants test-qwen4exp-cuda-moe test-qwen4exp-hc test-qwen4exp-hc-mutants test-qwen4exp-qsa test-qwen4exp-mtp test-qwen4exp-graph test-qwen4exp-parity test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-qwen4exp test-qwen4exp-ple test-qwen4exp-ple-kernels test-qwen4exp-ple-kernel-mutants test-qwen4exp-gdn test-qwen4exp-gdn-ref test-qwen4exp-qsa-ref test-qwen4exp-moe test-qwen4exp-moe-mutants test-qwen4exp-cuda-moe test-qwen4exp-hc test-qwen4exp-hc-mutants test-qwen4exp-hc-fuse-mutants test-qwen4exp-qsa test-qwen4exp-mtp test-qwen4exp-graph test-qwen4exp-parity test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
@@ -551,6 +551,14 @@ test-qwen4exp-hc: $(QWEN4EXP_HC_TEST)
 .PHONY: test-qwen4exp-hc-mutants
 test-qwen4exp-hc-mutants: $(QWEN4EXP_HC_TEST)
 	sh tests/qwen4exp_hc_mutants.sh
+
+# Proves the FUSED mixer's zero-tolerance equivalence check bites.  Each mutant
+# rewrites one line of the fused kernels in ds4_cuda_qwen4exp.cu and rebuilds,
+# so this is minutes rather than seconds and is not part of test-qwen4exp-hc.
+# The last few mutants are deliberate no-ops and must SURVIVE.
+.PHONY: test-qwen4exp-hc-fuse-mutants
+test-qwen4exp-hc-fuse-mutants: $(QWEN4EXP_HC_TEST)
+	sh tests/qwen4exp_hc_fuse_mutants.sh
 
 # The PLE kernel test asserts bit exactness on the rolling convolution window
 # and on the in-place gate, so the reference side is built without -ffast-math

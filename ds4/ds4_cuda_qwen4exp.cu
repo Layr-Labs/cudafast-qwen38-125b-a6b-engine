@@ -2806,9 +2806,7 @@ __device__ __forceinline__ static uint32_t qw_shared_q8_word(const char *p) {
     return qw_pack4((const int8_t *)p);
 }
 
-/* A 16-token tile lowers gate/up register use and removes its stack spill on
- * sm_121 without changing the per-output reduction tree. */
-enum { QW_SH_BM = 16, QW_SH_BN = 16, QW_SH_NT = QW_SH_BN / 8,
+enum { QW_SH_BM = 16, QW_SH_BN = 32, QW_SH_NT = QW_SH_BN / 8,
        QW_SH_WARPS = 16, QW_SH_THREADS = QW_SH_WARPS * 32 };
 
 /* Each warp computes the group sums of dp4a lanes W and W+16 separately:
@@ -3871,6 +3869,498 @@ extern "C" int ds4_gpu_qwen4exp_hc_inject_tensor(
             n_embd, n_hc, rows);
     return cuda_ok(cudaGetLastError(), "qwen4exp_hc_inject launch");
 }
+
+/* =========================================================================
+ * The FUSED hyper-connection mixer.
+ * =========================================================================
+ *
+ * Same eight values out of the chain above, with the 41.9 MB `normed` buffer
+ * removed from DRAM entirely.  At a 1024-row prefill chunk, hidden 2560 and
+ * hyper-connection width 4, one mixer call moved 340.8 MB; `normed` alone was
+ * written once and read three times inside that.  What the four kernels here
+ * do instead:
+ *
+ *   norm+quantize   holds the normalized value in the register that produced
+ *                   it and quantizes it there, so the Q8_0 input to the down
+ *                   projection costs no round trip.  The per-stream 1/rms is
+ *                   published -- four floats per token -- and that is all that
+ *                   leaves the kernel besides xq.
+ *   mix, inject     rebuild the normalized value from `hyper` and that scale.
+ *                   The read is the SAME 41.9 MB it used to be, against the
+ *                   residual instead of the scratch, so the write is pure
+ *                   saving.
+ *
+ * EXACTNESS.  Every value below is computed by the same expression, on the
+ * same input, in the same order as the unfused chain:
+ *
+ *   - the sum of squares is the same per-thread stride-blockDim ascending
+ *     partial and the same qwen4exp_block_sum_f32 tree, at the same 256
+ *     threads and the same one-block-per-(token, stream) shape, so the
+ *     statistic is bit-identical and so is 1/sqrtf(total/group + eps);
+ *   - the normalized value is qwen4exp_hc_normed_value, which is the three
+ *     lines of qwen4exp_rms_norm_kernel character for character -- multiply,
+ *     optional bf16 round, multiply by (weight_bias + w) -- so the bf16
+ *     rounding point and the position of the weight multiply do not move;
+ *   - the quantize is the warp butterfly of quantize_q8_0_f32_rows_warp_kernel
+ *     over the same 32 values, and it reaches the same launch ladder through
+ *     ds4_gpu_matmul_q8_0_preq_rows_exact_tensor, which IS the unfused entry
+ *     with its quantize step lifted out;
+ *   - the mix accumulates over the streams low to high per channel, and the
+ *     inject dot accumulates the flat row ascending with stride blockDim.x,
+ *     both exactly as before.  Only the SOURCE of `normed` changed.
+ *
+ * Storing a float and loading it back is the identity, so recomputing it is
+ * the identity too.  tests/test_qwen4exp_hc_norm.c asserts that against the
+ * untouched unfused entry at zero tolerance, over 84 combinations of row
+ * count, inject-weight encoding, weight_bias and round_bf16, and
+ * tests/qwen4exp_hc_fuse_mutants.sh proves that assertion bites.
+ *
+ * The thread mapping needs n_embd to be a multiple of blockDim.x (which is a
+ * multiple of 32), so that (a) a Q8_0 block is exactly one warp's 32 lanes at
+ * one loop step, and (b) the inject dot's ascending flat order survives being
+ * written as a stream-outer loop.  2560 and 256 satisfy it; anything else
+ * refuses here and the caller runs the unfused chain.
+ */
+
+#include "ds4_qwen4exp_matmul.h"
+
+#define QWEN4EXP_HC_THREADS 256u
+
+/* The scale qwen4exp_rms_norm_kernel computes, factored out unchanged. */
+__device__ __forceinline__ static float qwen4exp_hc_norm_scale(
+        const float *xg, uint32_t group, float eps, float *partial) {
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < group; i += blockDim.x) {
+        const float v = xg[i];
+        sum += v * v;
+    }
+    const float total = qwen4exp_block_sum_f32(sum, partial);
+    /* 1/sqrt rather than rsqrtf, for the same reason as the unfused kernel. */
+    return 1.0f / sqrtf(total / (float)group + eps);
+}
+
+/* The three lines qwen4exp_rms_norm_kernel stores, as a value. */
+__device__ __forceinline__ static float qwen4exp_hc_normed_value(
+        float x, float scale, float w, float weight_bias, int round_bf16) {
+    float normed = x * scale;
+    if (round_bf16) normed = qwen4exp_round_bf16(normed);
+    return normed * (weight_bias + w);
+}
+
+/* THE FAST-MATH SEAM.
+ *
+ * quantize_q8_0_f32_rows_warp_kernel lives in ds4_cuda.cu, which the Makefile
+ * builds with --use_fast_math; this translation unit is built WITHOUT it
+ * (-ftz=false -prec-div=true -prec-sqrt=true), which is what lets the norm
+ * above be bit-exact.  Reproducing the quantize here therefore means
+ * reproducing the arithmetic --use_fast_math chose for it, not the arithmetic
+ * this file's flags would choose.  Read off its SASS:
+ *
+ *   FADD.FTZ  R0, |R8|, -RZ                 fabsf, flushing
+ *   FMNMX.FTZ                               fmaxf over the shuffle butterfly
+ *   FMUL.FTZ  R15, R14, 0.00787401572       a / 127.0f became a * rcp(127)
+ *   MUFU.RCP  R0, R15                       1.0f / d became the APPROXIMATE
+ *                                           reciprocal (-prec-div=false)
+ *   FMUL.FTZ  R0, R6, R9                    x * id
+ *   F2I.S64                                 lrintf, round to nearest even
+ *
+ * The two that are not the obvious instruction are the ones that bite: a
+ * correctly rounded divide by 127 disagrees with the multiply by rcp(127) on
+ * roughly half of all inputs, and __frcp_rn disagrees with MUFU.RCP by up to
+ * an ulp.  Either would move an occasional int8 by one, which is a changed
+ * value, so both are pinned here -- the constant by its exact bit pattern and
+ * the reciprocal by the PTX instruction that IS MUFU.RCP.
+ *
+ * .FTZ is pinned too.  It cannot fire on any activation this model produces
+ * -- the normalized stream is order 1 -- but "cannot" is not "does not", and
+ * a denormal block scale is the one input on which flush-to-zero and
+ * IEEE disagree about whether every value in the block quantizes to zero. */
+
+/* __frcp_rn(127.0f), the constant --use_fast_math folds `x / 127.0f` into. */
+#define QWEN4EXP_Q8_RCP127 0x1.020408p-7f   /* 0x3c010204 */
+
+/* What .FTZ does to an operand and to a result: a denormal becomes a zero of
+ * the same sign, everything else is left alone (NaN included). */
+__device__ __forceinline__ static float qwen4exp_q8_ftz(float v) {
+    if (fabsf(v) < 1.17549435082228750797e-38f) {
+        return v < 0.0f ? -0.0f : 0.0f;
+    }
+    return v;
+}
+
+/* MUFU.RCP itself.  __frcp_rn is the correctly rounded reciprocal and is a
+ * different number; there is no intrinsic for this one. */
+__device__ __forceinline__ static float qwen4exp_q8_rcp_approx(float d) {
+    float r;
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(d));
+    return r;
+}
+
+/* hcNorm, then the Q8_0 row quantize the down projection wants, in one pass.
+ *
+ * Grid (n_hc, rows), blockDim.x QWEN4EXP_HC_THREADS: one block per (token,
+ * stream), the shape qwen4exp_rms_norm_kernel launches, so the reduction is
+ * the same one.  `group` (= n_embd) must be a multiple of blockDim.x, so loop
+ * step k of thread t covers flat index g*group + k*blockDim.x + t and warp w
+ * of that step covers exactly one 32-value Q8_0 block, in lane order. */
+__global__ static void qwen4exp_hc_norm_quant_kernel(
+        int8_t *xq, float *xscale, float *nscale,
+        const float *x, const float *w,
+        uint32_t n, uint32_t group, uint32_t rows,
+        float eps, float weight_bias, int round_bf16) {
+    const uint32_t g = blockIdx.x;
+    const uint32_t row = blockIdx.y;
+    if (row >= rows) return;
+
+    const uint64_t base = (uint64_t)row * n + (uint64_t)g * group;
+    const float *xg = x + base;
+    const float *wg = w + (uint64_t)g * group;
+
+    __shared__ float partial[QWEN4EXP_HC_THREADS];
+    const float scale = qwen4exp_hc_norm_scale(xg, group, eps, partial);
+    if (threadIdx.x == 0u) nscale[(uint64_t)row * (n / group) + g] = scale;
+
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t warps = blockDim.x >> 5u;
+    const uint64_t row_blocks = n / 32u;
+    const uint64_t blk0 = (uint64_t)row * row_blocks + (uint64_t)g * (group / 32u);
+
+    uint32_t k = 0;
+    for (uint32_t i = threadIdx.x; i < group; i += blockDim.x, k++) {
+        const float v = qwen4exp_hc_normed_value(xg[i], scale, wg[i],
+                                                 weight_bias, round_bf16);
+        /* quantize_q8_0_f32_rows_warp_kernel, on the value in hand: the same
+         * butterfly over the same 32 values in the same lanes, and the same
+         * five arithmetic steps in the form --use_fast_math gave them.  The
+         * block is full by construction, so the `bn` guard the standalone
+         * kernel carries for a ragged tail cannot fire. */
+        const float vz = qwen4exp_q8_ftz(v);
+        float a = qwen4exp_q8_ftz(fabsf(v));
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            /* fmaxf, not the .FTZ one: both operands are already flushed and
+             * non-negative, so the two instructions cannot disagree. */
+            a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+        }
+        const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
+        const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
+        const uint64_t pair = blk0 + (uint64_t)(k * warps + warp);
+        if (lane == 0u) xscale[pair] = d;
+        int q = (int)lrintf(qwen4exp_q8_ftz(vz * id));
+        q = q > 127 ? 127 : (q < -128 ? -128 : q);
+        xq[pair * 32u + lane] = (int8_t)q;
+    }
+}
+
+/* qwen4exp_hc_mix_kernel with `normed` rebuilt from the residual.  Same grid,
+ * same per-channel accumulation over the streams low to high. */
+__global__ static void qwen4exp_hc_mix_renorm_kernel(
+        float *out, const float *hyper, const float *nscale,
+        const float *normw, const float *wide,
+        uint32_t n_embd, uint32_t n_hc, uint32_t n_tokens,
+        float weight_bias, int round_bf16) {
+    const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t t = blockIdx.y;
+    if (d >= n_embd || t >= n_tokens) return;
+
+    const uint64_t row = ((uint64_t)t * n_hc) * n_embd + d;
+
+    float acc = 0.0f;
+    for (uint32_t h = 0; h < n_hc; h++) {
+        const uint64_t idx = row + (uint64_t)h * n_embd;
+        const float normed = qwen4exp_hc_normed_value(
+                hyper[idx], nscale[(uint64_t)t * n_hc + h],
+                normw[(uint64_t)h * n_embd + d], weight_bias, round_bf16);
+        acc += qwen4exp_sigmoid(wide[idx]) * normed;
+    }
+    out[(uint64_t)t * n_embd + d] = acc * (1.0f / (float)n_hc);
+}
+
+/* qwen4exp_hc_inject_weights_kernel with `normed` rebuilt from the residual.
+ *
+ * The flat loop `for (i = threadIdx.x; i < wide; i += blockDim.x)` is written
+ * as a stream-outer pair so the per-stream scale is loaded once; because
+ * n_embd is a multiple of blockDim.x the visited sequence is the SAME
+ * ascending stride-blockDim.x sequence, so the partial sums are the same. */
+__global__ static void qwen4exp_hc_inject_weights_renorm_kernel(
+        float *out, const float *hyper, const float *nscale,
+        const float *normw, const char *w,
+        uint32_t n_embd, uint32_t n_hc, uint32_t rows,
+        float weight_bias, int round_bf16,
+        uint32_t weight_type, uint32_t weight_row_bytes) {
+    const uint32_t h = blockIdx.x;
+    const uint32_t t = blockIdx.y;
+    if (t >= rows || h >= n_hc) return;
+
+    const uint32_t wide = n_hc * n_embd;
+    const float *xr = hyper + (uint64_t)t * wide;
+    const char *wr = w + (uint64_t)h * weight_row_bytes;
+
+    float sum = 0.0f;
+    for (uint32_t hs = 0; hs < n_hc; hs++) {
+        const float sc = nscale[(uint64_t)t * n_hc + hs];
+        for (uint32_t k = 0; k < n_embd; k += blockDim.x) {
+            const uint32_t i = hs * n_embd + k + threadIdx.x;
+            const float normed = qwen4exp_hc_normed_value(
+                    xr[i], sc, normw[i], weight_bias, round_bf16);
+            sum += normed * dev_qwen4exp_inject_value(weight_type, wr, i);
+        }
+    }
+    __shared__ float partial[QWEN4EXP_HC_THREADS];
+    const float total = qwen4exp_block_sum_f32(sum, partial);
+    if (threadIdx.x == 0) {
+        out[(uint64_t)t * n_hc + h] =
+            2.0f * qwen4exp_sigmoid(total * (1.0f / (float)n_hc));
+    }
+}
+
+/* Both of the above in ONE pass over the residual, one block per token.
+ *
+ * The two kernels read the same 41.9 MB; together they read it once.  The mix
+ * accumulator cannot live in a register (a thread owns n_embd/blockDim.x
+ * channels, a count only known at launch), so it sits in dynamic shared
+ * memory -- n_embd floats, 10 KB at the production width.  Adding into shared
+ * memory adds in the same order as adding into a register, so the value is
+ * the one the split kernels produce.
+ *
+ * The inject accumulators DO live in registers: the ho loop is unrolled over
+ * a compile-time bound and masked, which is why n_hc is capped here.
+ *
+ * One block per token is the price: at prefill widths the grid is the token
+ * count and the device is full, but at decode width it is a single block,
+ * which is why the caller only takes this path above a row threshold.  Both
+ * paths are bit-identical, so the threshold is a scheduling choice and not a
+ * numerical one. */
+#define QWEN4EXP_HC_MAX_STREAMS 8
+
+__global__ static void qwen4exp_hc_mix_inject_renorm_kernel(
+        float *mixed, float *inject,
+        const float *hyper, const float *nscale, const float *normw,
+        const float *wide, const char *iw,
+        uint32_t n_embd, uint32_t n_hc, uint32_t rows,
+        float weight_bias, int round_bf16,
+        uint32_t weight_type, uint32_t weight_row_bytes) {
+    extern __shared__ float smix[];
+    const uint32_t t = blockIdx.x;
+    if (t >= rows) return;
+
+    for (uint32_t d = threadIdx.x; d < n_embd; d += blockDim.x) smix[d] = 0.0f;
+
+    float iacc[QWEN4EXP_HC_MAX_STREAMS];
+#pragma unroll
+    for (int ho = 0; ho < QWEN4EXP_HC_MAX_STREAMS; ho++) iacc[ho] = 0.0f;
+
+    const uint64_t wide_stride = (uint64_t)n_hc * n_embd;
+    const float *xr = hyper + (uint64_t)t * wide_stride;
+    const float *gr = wide + (uint64_t)t * wide_stride;
+    __syncthreads();
+
+    for (uint32_t hs = 0; hs < n_hc; hs++) {
+        const float sc = nscale[(uint64_t)t * n_hc + hs];
+        for (uint32_t k = 0; k < n_embd; k += blockDim.x) {
+            const uint32_t d = k + threadIdx.x;
+            const uint32_t i = hs * n_embd + d;
+            const float normed = qwen4exp_hc_normed_value(
+                    xr[i], sc, normw[i], weight_bias, round_bf16);
+            smix[d] += qwen4exp_sigmoid(gr[i]) * normed;
+#pragma unroll
+            for (int ho = 0; ho < QWEN4EXP_HC_MAX_STREAMS; ho++) {
+                if ((uint32_t)ho < n_hc) {
+                    iacc[ho] += normed * dev_qwen4exp_inject_value(
+                            weight_type,
+                            iw + (uint64_t)ho * weight_row_bytes, i);
+                }
+            }
+        }
+    }
+
+    for (uint32_t d = threadIdx.x; d < n_embd; d += blockDim.x) {
+        mixed[(uint64_t)t * n_embd + d] = smix[d] * (1.0f / (float)n_hc);
+    }
+
+    /* Unrolled and masked, not a runtime `ho` loop: a register array indexed
+     * by a runtime value spills to local memory.  The mask is block-uniform,
+     * so the barrier inside is reached by every thread or by none. */
+    __shared__ float partial[QWEN4EXP_HC_THREADS];
+#pragma unroll
+    for (int ho = 0; ho < QWEN4EXP_HC_MAX_STREAMS; ho++) {
+        if ((uint32_t)ho < n_hc) {
+            /* qwen4exp_block_sum_f32 leaves partial[0] live for every thread,
+             * so the next call may not write it until all have read it. */
+            __syncthreads();
+            const float total = qwen4exp_block_sum_f32(iacc[ho], partial);
+            if (threadIdx.x == 0) {
+                inject[(uint64_t)t * n_hc + (uint32_t)ho] =
+                    2.0f * qwen4exp_sigmoid(total * (1.0f / (float)n_hc));
+            }
+        }
+    }
+}
+
+/* One block per token is a bad shape at decode width -- the split kernels put
+ * n_embd/256 and n_hc blocks on the device instead of one -- so the fused
+ * mix/inject only runs when there are tokens enough to fill it.  48 is the
+ * GB10's SM count; the two paths agree bit for bit, so this line is free to
+ * be a scheduling judgement.
+ *
+ * It also puts the line clear of decode-graph capture, which
+ * qwen4exp_graph_layer_island takes only at n_tokens <=
+ * DS4_QWEN4EXP_MTP_MAX_COMMIT (7).  Every captured island therefore holds the
+ * split pair, one fixed sequence per key, and the widths the speculative cycle
+ * compares are all on the same side of this line. */
+#define QWEN4EXP_HC_FUSE_MIX_MIN_ROWS 48u
+
+/* The fused path is the default; this is a debugging valve, read once. */
+static int ds4_qwen4exp_hc_fuse_off(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_QWEN4EXP_NO_HC_FUSE");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
+
+/* Returns 1 on success, 0 on a hard failure, -1 when this shape is not one the
+ * fused kernels above can serve and the caller should run the unfused chain. */
+static int qwen4exp_hc_mixer_fused_cuda(
+        ds4_gpu_tensor       *mixed,
+        ds4_gpu_tensor       *inject,
+        ds4_gpu_tensor       *normed_scratch,
+        ds4_gpu_tensor       *lowrank_scratch,
+        ds4_gpu_tensor       *wide_scratch,
+        const ds4_gpu_tensor *hyper,
+        const ds4_gpu_qwen4exp_slab *norm_weight,
+        const ds4_gpu_qwen4exp_slab *down_weight,
+        const ds4_gpu_qwen4exp_slab *up_weight,
+        const ds4_gpu_qwen4exp_slab *inject_weight,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              n_lowrank,
+        uint32_t              rows,
+        float                 eps,
+        float                 weight_bias,
+        int                   round_bf16) {
+    const uint32_t threads = QWEN4EXP_HC_THREADS;
+    if (n_embd % threads != 0u || n_hc > QWEN4EXP_HC_MAX_STREAMS) return -1;
+
+    const uint64_t wide = (uint64_t)n_hc * n_embd;
+    const uint64_t row_blocks = wide / 32u;
+    const uint64_t hc_bytes = (uint64_t)rows * wide * sizeof(float);
+
+    /* xq, its block scales and the per-stream 1/rms all live in the scratch
+     * the unfused chain used for `normed`, which is four times the size of the
+     * three together, so the fused path allocates nothing. */
+    const uint64_t q_bytes = (uint64_t)rows * row_blocks * 32u;
+    const uint64_t s_off = (q_bytes + 15u) & ~15ull;
+    const uint64_t s_bytes = (uint64_t)rows * row_blocks * sizeof(float);
+    const uint64_t n_off = (s_off + s_bytes + 15u) & ~15ull;
+    const uint64_t n_bytes = (uint64_t)rows * n_hc * sizeof(float);
+    if (!normed_scratch->ptr || normed_scratch->bytes < n_off + n_bytes) {
+        return -1;
+    }
+    if (hyper->bytes < hc_bytes || wide_scratch->bytes < hc_bytes ||
+        mixed->bytes < (uint64_t)rows * n_embd * sizeof(float) ||
+        lowrank_scratch->bytes < (uint64_t)rows * n_lowrank * sizeof(float)) {
+        return -1;
+    }
+
+    const int tier = ds4_tensor_device_idx(mixed);
+    if (tier < 0 || tier >= g_n_gpus ||
+        ds4_tensor_device_idx(hyper) != tier ||
+        ds4_tensor_device_idx(normed_scratch) != tier ||
+        ds4_tensor_device_idx(wide_scratch) != tier ||
+        ds4_tensor_device_idx(lowrank_scratch) != tier ||
+        (inject && ds4_tensor_device_idx(inject) != tier)) {
+        return -1;
+    }
+
+    if (norm_weight->offset > norm_weight->map_size ||
+        norm_weight->map_size - norm_weight->offset < wide * sizeof(float)) {
+        return -1;
+    }
+    const float *normw = (const float *)cuda_resolve_weight_ptr(
+            norm_weight->map, norm_weight->offset, wide * sizeof(float),
+            tier, "qwen4exp_norm_weight");
+    if (!normw) return 0;
+
+    const char *iw = NULL;
+    uint64_t iw_row_bytes = 0;
+    if (inject) {
+        if (!inject_weight || !inject_weight->map) return -1;
+        iw_row_bytes = inject_weight->row_bytes ? inject_weight->row_bytes
+                                                : wide * sizeof(float);
+        const uint64_t iw_bytes = (uint64_t)n_hc * iw_row_bytes;
+        if (inject_weight->offset > inject_weight->map_size ||
+            inject_weight->map_size - inject_weight->offset < iw_bytes ||
+            inject->bytes < (uint64_t)rows * n_hc * sizeof(float)) {
+            return -1;
+        }
+        iw = cuda_resolve_weight_ptr(inject_weight->map, inject_weight->offset,
+                                     iw_bytes, tier, "qwen4exp_inject_weight");
+        if (!iw) return 0;
+    }
+
+    int8_t *xq = (int8_t *)normed_scratch->ptr;
+    float *xscale = (float *)((char *)normed_scratch->ptr + s_off);
+    float *nscale = (float *)((char *)normed_scratch->ptr + n_off);
+
+    qwen4exp_hc_norm_quant_kernel<<<dim3(n_hc, rows, 1u), threads, 0,
+                                    cuda_decode_stream()>>>(
+            xq, xscale, nscale, (const float *)hyper->ptr, normw,
+            (uint32_t)wide, n_embd, rows, eps, weight_bias, round_bf16);
+    if (!cuda_ok(cudaGetLastError(), "qwen4exp_hc_norm_quant launch")) return 0;
+
+    if (!ds4_gpu_matmul_q8_0_preq_rows_exact_tensor(
+                lowrank_scratch, down_weight->map, down_weight->map_size,
+                down_weight->offset, wide, n_lowrank, normed_scratch,
+                0, s_off, rows)) {
+        return 0;
+    }
+    if (!ds4_gpu_qwen4exp_scale_silu_tensor(lowrank_scratch,
+                                            rows * n_lowrank,
+                                            1.0f / (float)n_hc)) {
+        return 0;
+    }
+    if (!ds4_qwen4exp_matmul_q8_0(wide_scratch, up_weight->map,
+                                  up_weight->map_size, up_weight->offset,
+                                  n_lowrank, wide, lowrank_scratch, rows)) {
+        return 0;
+    }
+
+    if (inject && rows >= QWEN4EXP_HC_FUSE_MIX_MIN_ROWS) {
+        qwen4exp_hc_mix_inject_renorm_kernel<<<
+                dim3(rows, 1u, 1u), threads,
+                (size_t)n_embd * sizeof(float), cuda_decode_stream()>>>(
+                (float *)mixed->ptr, (float *)inject->ptr,
+                (const float *)hyper->ptr, nscale, normw,
+                (const float *)wide_scratch->ptr, iw,
+                n_embd, n_hc, rows, weight_bias, round_bf16,
+                inject_weight->type, (uint32_t)iw_row_bytes);
+        return cuda_ok(cudaGetLastError(),
+                       "qwen4exp_hc_mix_inject_renorm launch");
+    }
+
+    qwen4exp_hc_mix_renorm_kernel<<<dim3((n_embd + threads - 1u) / threads,
+                                         rows, 1u), threads, 0,
+                                    cuda_decode_stream()>>>(
+            (float *)mixed->ptr, (const float *)hyper->ptr, nscale, normw,
+            (const float *)wide_scratch->ptr, n_embd, n_hc, rows,
+            weight_bias, round_bf16);
+    if (!cuda_ok(cudaGetLastError(), "qwen4exp_hc_mix_renorm launch")) return 0;
+    if (!inject) return 1;
+
+    qwen4exp_hc_inject_weights_renorm_kernel<<<dim3(n_hc, rows, 1u), threads, 0,
+                                               cuda_decode_stream()>>>(
+            (float *)inject->ptr, (const float *)hyper->ptr, nscale, normw, iw,
+            n_embd, n_hc, rows, weight_bias, round_bf16,
+            inject_weight->type, (uint32_t)iw_row_bytes);
+    return cuda_ok(cudaGetLastError(),
+                   "qwen4exp_hc_inject_weights_renorm launch");
+}
+
+#define DS4_QWEN4EXP_HC_HAVE_FUSED 1
 
 /* =========================================================================
  * Qwen4-Exp QSA block, the CUDA twin of metal/qwen4exp_qsa.metal.

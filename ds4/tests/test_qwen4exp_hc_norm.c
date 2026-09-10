@@ -416,6 +416,138 @@ static void check_q8_row_tile(const uint8_t *model) {
     }
 }
 
+/* ---- the fused mixer against the op-by-op one ----------------------- */
+
+/* ds4_gpu_qwen4exp_hc_mixer_tensor may fuse the chain inside the backend.  The
+ * fusion is only allowed to be a faster way to compute the SAME numbers, so
+ * this holds it against ds4_gpu_qwen4exp_hc_mixer_unfused_tensor -- the same
+ * per-op wrappers, in the same order, with nothing fused -- and requires the
+ * two to agree BIT FOR BIT.  No band, no cosine: a tolerance here would let a
+ * moved rounding point through, and a moved rounding point in a 48-layer tower
+ * flips an argmax and diverges an autoregressive stream.
+ *
+ * Every axis the fused path branches on is swept:
+ *
+ *   rows        1 and 2 (decode and the speculative verify width), 4, then
+ *               either side of the row threshold at which the fused mix and
+ *               inject collapse into one kernel, then a full prefill chunk;
+ *   inject      present (F32 weights and Q8_0 weights, the target's encoding
+ *               and the MTP head's) and absent, which is the tower's final
+ *               mixer;
+ *   weight_bias 0, the baked-offset checkpoint, and 1, the zero-centered one;
+ *   round_bf16  on, which is production, and off.
+ */
+static void check_mixer_equivalence(uint8_t *model) {
+    static const uint32_t row_set[] = { 1u, 2u, 4u, 47u, 48u, 64u, ROWS_LONG };
+    const ds4_gpu_qwen4exp_slab norm_slab =
+        hc_slab(model, MODEL_BYTES, NORM_WIDE_OFF);
+    const ds4_gpu_qwen4exp_slab down_slab =
+        hc_slab(model, MODEL_BYTES, DOWN_OFF);
+    const ds4_gpu_qwen4exp_slab up_slab =
+        hc_slab(model, MODEL_BYTES, UP_OFF);
+    ds4_gpu_qwen4exp_slab inject_f32 =
+        hc_slab(model, MODEL_BYTES, INJECT_OFF);
+    ds4_gpu_qwen4exp_slab inject_q8 =
+        hc_slab(model, MODEL_BYTES, INJECT_Q8_OFF);
+    inject_q8.row_bytes = (uint64_t)(WIDE / 32) * 34u;
+    inject_q8.type = TENSOR_Q8_0;
+
+    uint64_t cases = 0;
+    for (uint32_t ri = 0; ri < sizeof(row_set) / sizeof(row_set[0]); ri++) {
+        const uint32_t rows = row_set[ri];
+        const uint64_t hc_count = (uint64_t)rows * WIDE;
+        const uint64_t embd_count = (uint64_t)rows * N_EMBD;
+        const uint64_t inj_count = (uint64_t)rows * N_HC;
+
+        float *hyper = alloc_floats(hc_count);
+        for (uint64_t i = 0; i < hc_count; i++) hyper[i] = next_unit();
+        ds4_gpu_tensor *hyper_t = upload(hyper, hc_count);
+
+        ds4_gpu_tensor *normed_t = ds4_gpu_tensor_alloc(hc_count * sizeof(float));
+        ds4_gpu_tensor *wide_t = ds4_gpu_tensor_alloc(hc_count * sizeof(float));
+        ds4_gpu_tensor *lowrank_t =
+            ds4_gpu_tensor_alloc((uint64_t)rows * N_LOWRANK * sizeof(float));
+        ds4_gpu_tensor *mixed_a = ds4_gpu_tensor_alloc(embd_count * sizeof(float));
+        ds4_gpu_tensor *mixed_b = ds4_gpu_tensor_alloc(embd_count * sizeof(float));
+        ds4_gpu_tensor *inject_a = ds4_gpu_tensor_alloc(inj_count * sizeof(float));
+        ds4_gpu_tensor *inject_b = ds4_gpu_tensor_alloc(inj_count * sizeof(float));
+        require_ok(normed_t && wide_t && lowrank_t && mixed_a && mixed_b &&
+                   inject_a && inject_b, "equivalence tensor allocation");
+
+        float *mixed_ref = alloc_floats(embd_count);
+        float *mixed_got = alloc_floats(embd_count);
+        float *inject_ref = alloc_floats(inj_count);
+        float *inject_got = alloc_floats(inj_count);
+        float *hyper_after = alloc_floats(hc_count);
+
+        for (int head = 0; head < 3; head++) {
+            const ds4_gpu_qwen4exp_slab *iw =
+                head == 0 ? &inject_f32 : (head == 1 ? &inject_q8 : NULL);
+            ds4_gpu_tensor *ia = head == 2 ? NULL : inject_a;
+            ds4_gpu_tensor *ib = head == 2 ? NULL : inject_b;
+            for (int bias = 0; bias < 2; bias++) {
+                for (int bf16 = 0; bf16 < 2; bf16++) {
+                    const float weight_bias = bias ? 1.0f : 0.0f;
+                    /* Unfused first: it writes normed_scratch as a norm, the
+                     * fused path writes the same buffer as quantized bytes,
+                     * so running it second proves it does not depend on what
+                     * the chain happened to leave there. */
+                    require_ok(ds4_gpu_qwen4exp_hc_mixer_unfused_tensor(
+                                   mixed_a, ia, normed_t, lowrank_t, wide_t,
+                                   hyper_t, &norm_slab, &down_slab, &up_slab,
+                                   iw, N_EMBD, N_HC, N_LOWRANK, rows, 1e-6f,
+                                   weight_bias, bf16),
+                               "unfused HC mixer");
+                    download(mixed_a, mixed_ref, embd_count);
+                    if (ia) download(inject_a, inject_ref, inj_count);
+
+                    require_ok(ds4_gpu_qwen4exp_hc_mixer_tensor(
+                                   mixed_b, ib, normed_t, lowrank_t, wide_t,
+                                   hyper_t, &norm_slab, &down_slab, &up_slab,
+                                   iw, N_EMBD, N_HC, N_LOWRANK, rows, 1e-6f,
+                                   weight_bias, bf16),
+                               "fused HC mixer");
+                    download(mixed_b, mixed_got, embd_count);
+                    if (ib) download(inject_b, inject_got, inj_count);
+
+                    require_identical("fused HC mixer block input", mixed_got,
+                                      mixed_ref, embd_count * sizeof(float));
+                    if (ia) {
+                        require_identical("fused HC inject weights", inject_got,
+                                          inject_ref, inj_count * sizeof(float));
+                    }
+                    /* The residual is an input to both, and the fused path
+                     * reads it three times instead of once; it must still not
+                     * write it. */
+                    download(hyper_t, hyper_after, hc_count);
+                    require_identical("fused HC mixer leaves the residual alone",
+                                      hyper_after, hyper,
+                                      hc_count * sizeof(float));
+                    cases++;
+                }
+            }
+        }
+
+        free(hyper_after);
+        free(inject_got);
+        free(inject_ref);
+        free(mixed_got);
+        free(mixed_ref);
+        ds4_gpu_tensor_free(inject_b);
+        ds4_gpu_tensor_free(inject_a);
+        ds4_gpu_tensor_free(mixed_b);
+        ds4_gpu_tensor_free(mixed_a);
+        ds4_gpu_tensor_free(lowrank_t);
+        ds4_gpu_tensor_free(wide_t);
+        ds4_gpu_tensor_free(normed_t);
+        ds4_gpu_tensor_free(hyper_t);
+        free(hyper);
+    }
+    printf("  %-56s exact over %llu cases\n",
+           "fused HC mixer equals the op-by-op chain",
+           (unsigned long long)cases);
+}
+
 int main(void) {
     uint8_t *model = mmap(NULL, MODEL_BYTES, PROT_READ | PROT_WRITE,
                           MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -587,6 +719,18 @@ int main(void) {
                     hc_slab(model, MODEL_BYTES, INJECT_Q8_OFF);
                 q8_slab.type = TENSOR_Q8_0;
                 q8_slab.row_bytes = (uint64_t)(WIDE / 32u) * 34u;
+
+                /* `normed_scratch` is scratch: a backend that fuses the
+                 * chain may leave the down projection's quantized bytes there
+                 * rather than the normalized stream, and nothing in the engine
+                 * reads it after the mixer returns.  Rebuild it here, with the
+                 * mixer's own norm arguments, so this check reads exactly the
+                 * values the mixer's inject head read. */
+                require_ok(ds4_gpu_qwen4exp_rms_norm_tensor(
+                               normed_t, hyper_t, model, MODEL_BYTES,
+                               NORM_WIDE_OFF, WIDE, N_EMBD, rows, 1e-6f, 0.0f,
+                               1),
+                           "qwen4exp normed rebuild for the Q8_0 inject check");
 
                 float *inject_q8 = alloc_floats((uint64_t)rows * N_HC);
                 ds4_gpu_tensor *inject_q8_t =
@@ -837,6 +981,8 @@ int main(void) {
         printf("qwen4exp HC/norm/rope/embedding/head: %u row%s ok\n", rows,
                rows == 1u ? "" : "s");
     }
+
+    check_mixer_equivalence(model);
 
     munmap(model, MODEL_BYTES);
     printf("test_qwen4exp_hc_norm: ok\n");
