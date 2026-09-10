@@ -524,10 +524,9 @@ class Linter:
     def _illegal_editable_entry(entry: str) -> str | None:
         """Why `entry` is not a legal repo-relative editable path, or None.
 
-        Mirrors the overlay's validity rule byte for byte
-        (.github/scripts/overlay-editable-paths.sh:87,91-96), whose own comment
-        says the two validators must not disagree about what a legal editable
-        path is. Checked BEFORE the overlap arithmetic in BOTH guards, because
+        The one validity rule for a legal editable path (the static review
+        applies the same one). Checked BEFORE the overlap arithmetic in BOTH
+        guards, because
         every spelling here defeats that arithmetic rather than failing it:
 
           ''  '.'  './'   resolve to the repository ROOT, which contains every

@@ -29,8 +29,8 @@
 #     (benchd-bin/benchd.manifest.json), so any run's harness identity can be
 #     read off the box afterwards.
 #   * SUBMISSION-PROOFNESS: unchanged. This script and the channel constants
-#     live under tools/, outside editablePaths, and the modifiable-surface
-#     guard still forbids `benchd.pin`/`benchd-bin` spellings in submissions,
+#     live under tools/, outside editablePaths, and the manifest linter
+#     (FORBIDDEN_EDITABLE) still forbids `benchd.pin`/`benchd-bin` spellings,
 #     so a submission can neither redirect the fetch nor resurrect a pin.
 #
 # THE FILE NAMES FOLLOW THE CHANNEL. The channel publishes `benchd` and

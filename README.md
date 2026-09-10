@@ -228,8 +228,8 @@ never served from a previous build.
 
 **What is protected.** `benchmark.json`,
 `benchmark.sh`, `fixtures/`, `correctness_prompts/` and `tools/` are the
-contract, the gates and the oracles. A commit that touches them is refused by
-`.github/scripts/enforce-modifiable-surface.sh` before it is measured. Code that
+contract, the gates and the oracles. Yukon archives and overlays only
+`editablePaths`, so a change outside them never reaches the measured tree. Code that
 **proposes** tokens or computes the forward pass is editable; code that
 **verifies**, **measures** or **ledgers** is not.
 
