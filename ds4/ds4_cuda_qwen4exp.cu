@@ -3874,6 +3874,278 @@ __global__ static void qwen4exp_qsa_attention_kernel(
     }
 }
 
+/* The same attention, one block per HEAD GROUP instead of one per head.
+ *
+ * This model is grouped-query: 24 query heads share 2 KV heads, so twelve
+ * heads read the identical key and value rows.  One block per head means the
+ * unit fetches every K row and every V row twelve times over.  A block that
+ * owns GROUP heads of one KV head fetches each row ONCE and hands it to all
+ * GROUP heads out of a register (K) or a register broadcast (V).
+ *
+ * The reuse is a change of WHERE the bytes come from, and of nothing else.
+ * Every float this kernel adds, it adds to the same running sum, in the same
+ * position of the same sequence, as the per-head kernel above:
+ *
+ *   - `nth` is the same block width, so the tile partition `base += nth` cuts
+ *     the key list at the same places and the online softmax takes the same
+ *     number of rescales in the same order.
+ *   - qwen4exp_blk_max / qwen4exp_blk_sum are called with the same `nth` and
+ *     the same one scratch row, so the reduction tree and its warp-shuffle
+ *     tail are the identical shape over the identical lane values.
+ *   - the score dot keeps its accumulator per head and walks `w` upward,
+ *     x then y then z then w, exactly as the per-head float4 walk does; the
+ *     only difference is that the float4 `kk` it multiplies was loaded once
+ *     for all GROUP heads instead of once per head.
+ *   - the value accumulation keeps its accumulator per head and walks `j`
+ *     upward skipping the same masked slots; `vv` is read once per j and
+ *     broadcast, where the per-head kernel read it once per (head, j).
+ *   - every product-accumulate this kernel performs is written as an
+ *     explicit __fmaf_rn.  The per-head kernel writes the same four places as
+ *     `a += b * c` and `a * b + c` and nvcc contracts all four into FFMA, and
+ *     a fused multiply-add is one IEEE operation with one rounding, so the
+ *     two agree bit for bit today.  Spelling the fusion out here is what
+ *     keeps them agreeing: contraction is a decision the compiler makes per
+ *     expression, and the array-of-accumulators shape this kernel needs is
+ *     exactly the sort of rewrite that could talk it into an FMUL and an
+ *     FADD instead -- two roundings, a different number.  The intrinsic
+ *     takes that decision away from it.
+ *
+ * A line-by-line read of the two kernels' SASS says the same thing: every
+ * floating-point opcode this one issues per head is the one the per-head
+ * kernel issues, in the same count, down to the six instructions expf expands
+ * to and the six the divide expands to.  Three of a head's fused multiply-adds
+ * come out as UFFMA rather than FFMA, because the three operands are block-
+ * uniform and ptxas puts uniform arithmetic on the uniform datapath.  Both are
+ * the same PTX fma.rn.f32 -- one IEEE fused multiply-add, one rounding, no
+ * flush, since this unit is built -ftz=false -- so the choice of datapath is
+ * ptxas's and is not ours to see.  It is the one difference between the two
+ * that this file cannot settle by reading; tests/test_qwen4exp_qsa.c settles
+ * it on the device, by running the pipeline both ways and requiring the bytes
+ * to match.
+ *
+ * The block-wide helpers are re-entered GROUP times per tile.  Every thread
+ * of the block runs the same `for (h < GROUP)` over a compile-time bound with
+ * no head-dependent branch in it, and the three early returns above are all
+ * block-uniform (`head0`, `token`, `count`), so all threads enter all GROUP
+ * calls in the same order and each internal __syncthreads is met by the whole
+ * block.  `tile` is the one scratch row shared by those calls, so each head's
+ * pass ends on a barrier before the next head overwrites it -- the barrier
+ * the per-head kernel spends at the bottom of its tile loop, no more and no
+ * fewer per reduction.
+ *
+ * `keys`, `count` and the selection do not depend on the head at all, so the
+ * group shares them unchanged.  GROUP must divide n_head / n_kv_head, which
+ * puts all GROUP heads under one `kv_head`.
+ */
+/* Key words a lane asks for before it consumes any of them, so several key
+ * loads are outstanding at once.  A scheduling number: it changes how many
+ * loads are in flight, not which products land in which accumulator. */
+#define QWEN4EXP_QSA_KSTEP 4u
+
+template <uint32_t GROUP>
+__global__ static void qwen4exp_qsa_attention_group_kernel(
+        const float *q,
+        const float *k_cache,
+        const float *v_cache,
+        const int32_t *selected,
+        const int32_t *counts,
+        float *out,
+        uint32_t n_tokens,
+        uint32_t n_head,
+        uint32_t n_kv_head,
+        uint32_t head_dim,
+        uint32_t pos0,
+        uint32_t cache_cap,
+        uint32_t max_selected,
+        uint32_t sparse,
+        float scale) {
+    extern __shared__ __align__(16) float qwen4exp_attn_grp_shared[];
+    const uint32_t group = blockIdx.x;
+    const uint32_t token = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t nth = blockDim.x;
+    const uint32_t head0 = group * GROUP;
+    if (head0 + GROUP > n_head || token >= n_tokens) return;
+
+    float *qvec = qwen4exp_attn_grp_shared;          /* GROUP * head_dim */
+    float *tile = qvec + GROUP * head_dim;           /* nth              */
+    float *probs = tile + nth;                       /* GROUP * nth      */
+    int32_t *keys = (int32_t *)(probs + GROUP * nth);/* nth              */
+
+    const uint32_t pos = pos0 + token;
+    const uint32_t count = sparse ? (uint32_t)counts[token] : pos + 1u;
+    const uint32_t kv_head = head0 / (n_head / n_kv_head);
+    const uint32_t kv_stride = n_kv_head * head_dim;
+
+    /* The GROUP query rows are adjacent in `q`, so one flat copy stages them
+     * all; each row lands at qvec + h * head_dim, the layout the per-head
+     * kernel's single row had. */
+    const float *qsrc = q + ((uint64_t)token * n_head + head0) * head_dim;
+    const uint32_t qspan = GROUP * head_dim;
+    for (uint32_t d = tid; d < qspan; d += nth) qvec[d] = qsrc[d];
+    __syncthreads();
+
+    float *dst = out + ((uint64_t)token * n_head + head0) * head_dim;
+    if (count == 0u) {
+        for (uint32_t d = tid; d < qspan; d += nth) dst[d] = 0.0f;
+        return;
+    }
+
+    float run_max[GROUP];
+    float run_sum[GROUP];
+    float acc[GROUP];
+#pragma unroll
+    for (uint32_t h = 0; h < GROUP; h++) {
+        run_max[h] = QWEN4EXP_QSA_MASKED_SCORE;
+        run_sum[h] = 0.0f;
+        acc[h] = 0.0f;
+    }
+
+    for (uint32_t base = 0; base < count; base += nth) {
+        const uint32_t n_in_tile = min(nth, count - base);
+        int32_t key = -1;
+        float score[GROUP];
+#pragma unroll
+        for (uint32_t h = 0; h < GROUP; h++) score[h] = QWEN4EXP_QSA_MASKED_SCORE;
+        if (tid < n_in_tile) {
+            key = sparse ? selected[(uint64_t)token * max_selected + base + tid]
+                         : (int32_t)(base + tid);
+            if (key >= 0 && (uint32_t)key < cache_cap) {
+                const float *kv = k_cache +
+                    (uint64_t)key * kv_stride + (uint64_t)kv_head * head_dim;
+                float dot[GROUP];
+#pragma unroll
+                for (uint32_t h = 0; h < GROUP; h++) dot[h] = 0.0f;
+                /* One 16-byte K load per four channels FOR THE WHOLE GROUP.
+                 * `kk` is the same word the per-head kernel loaded; it is
+                 * simply held in a register across the head loop instead of
+                 * being asked of the memory system again for every head.
+                 * Each dot[h] therefore sees q.x*k.x, q.y*k.y, q.z*k.z,
+                 * q.w*k.w for w = 0, 1, 2 ... in that order, which is the
+                 * per-head walk verbatim. */
+                if ((head_dim & 3u) == 0u) {
+                    const float4 *kv4 = (const float4 *)kv;
+                    const uint32_t words = head_dim >> 2u;
+                    uint32_t w = 0;
+                    /* QWEN4EXP_QSA_KSTEP words are asked for before any of
+                     * them is used, so the lane keeps that many key loads in
+                     * flight the way the per-head kernel's unrolled walk does.
+                     * One word at a time would leave exactly one load
+                     * outstanding per lane and spend the whole loop waiting on
+                     * it.  The heads still consume the words in the order the
+                     * words were loaded, and each head still consumes all four
+                     * channels of a word before moving to the next word, so
+                     * every dot[h] sees w ascending and x, y, z, w within each
+                     * -- the per-head sequence exactly. */
+                    for (; w + QWEN4EXP_QSA_KSTEP <= words;
+                           w += QWEN4EXP_QSA_KSTEP) {
+                        float4 kk[QWEN4EXP_QSA_KSTEP];
+#pragma unroll
+                        for (uint32_t i = 0; i < QWEN4EXP_QSA_KSTEP; i++) {
+                            kk[i] = kv4[w + i];
+                        }
+#pragma unroll
+                        for (uint32_t h = 0; h < GROUP; h++) {
+                            const float4 *qh =
+                                (const float4 *)(qvec + h * head_dim);
+#pragma unroll
+                            for (uint32_t i = 0; i < QWEN4EXP_QSA_KSTEP; i++) {
+                                const float4 qq = qh[w + i];
+                                dot[h] = __fmaf_rn(qq.x, kk[i].x, dot[h]);
+                                dot[h] = __fmaf_rn(qq.y, kk[i].y, dot[h]);
+                                dot[h] = __fmaf_rn(qq.z, kk[i].z, dot[h]);
+                                dot[h] = __fmaf_rn(qq.w, kk[i].w, dot[h]);
+                            }
+                        }
+                    }
+                    for (; w < words; w++) {
+                        const float4 kk = kv4[w];
+#pragma unroll
+                        for (uint32_t h = 0; h < GROUP; h++) {
+                            const float4 qq =
+                                ((const float4 *)(qvec + h * head_dim))[w];
+                            dot[h] = __fmaf_rn(qq.x, kk.x, dot[h]);
+                            dot[h] = __fmaf_rn(qq.y, kk.y, dot[h]);
+                            dot[h] = __fmaf_rn(qq.z, kk.z, dot[h]);
+                            dot[h] = __fmaf_rn(qq.w, kk.w, dot[h]);
+                        }
+                    }
+                } else {
+                    for (uint32_t d = 0; d < head_dim; d++) {
+                        const float kd = kv[d];
+#pragma unroll
+                        for (uint32_t h = 0; h < GROUP; h++) {
+                            dot[h] = __fmaf_rn(qvec[h * head_dim + d], kd, dot[h]);
+                        }
+                    }
+                }
+#pragma unroll
+                for (uint32_t h = 0; h < GROUP; h++) score[h] = dot[h] * scale;
+            } else {
+                key = -1;
+            }
+        }
+        keys[tid] = key;
+
+        /* One softmax pass per head, each over the same single `tile` row and
+         * the same `nth`, so each is the per-head kernel's pass unchanged.
+         * The trailing barrier is the one the per-head kernel spends at the
+         * bottom of its tile loop, moved to the bottom of each head's pass
+         * because `tile` is now reused GROUP times inside one tile. */
+        float new_max[GROUP];
+        float rescale[GROUP];
+#pragma unroll
+        for (uint32_t h = 0; h < GROUP; h++) {
+            tile[tid] = score[h];
+            const float tile_max = qwen4exp_blk_max(tile, tid, nth);
+            new_max[h] = fmaxf(run_max[h], tile_max);
+            __syncthreads();
+
+            float *ph = probs + h * nth;
+            ph[tid] = (key >= 0) ? expf(score[h] - new_max[h]) : 0.0f;
+            tile[tid] = ph[tid];
+            const float tile_sum = qwen4exp_blk_sum(tile, tid, nth);
+            rescale[h] = (run_max[h] > QWEN4EXP_QSA_MASKED_LIMIT)
+                ? expf(run_max[h] - new_max[h]) : 0.0f;
+            run_sum[h] = __fmaf_rn(run_sum[h], rescale[h], tile_sum);
+            __syncthreads();
+        }
+
+        if (tid < head_dim) {
+            float contrib[GROUP];
+#pragma unroll
+            for (uint32_t h = 0; h < GROUP; h++) contrib[h] = 0.0f;
+            for (uint32_t j = 0; j < n_in_tile; j++) {
+                const int32_t kj = keys[j];
+                if (kj < 0) continue;
+                /* One V channel read for the whole group, where the per-head
+                 * kernel read the same address once per head. */
+                const float vvj = v_cache[
+                    (uint64_t)kj * kv_stride + (uint64_t)kv_head * head_dim + tid];
+#pragma unroll
+                for (uint32_t h = 0; h < GROUP; h++) {
+                    contrib[h] = __fmaf_rn(probs[h * nth + j], vvj, contrib[h]);
+                }
+            }
+#pragma unroll
+            for (uint32_t h = 0; h < GROUP; h++) {
+                acc[h] = __fmaf_rn(acc[h], rescale[h], contrib[h]);
+            }
+        }
+#pragma unroll
+        for (uint32_t h = 0; h < GROUP; h++) run_max[h] = new_max[h];
+        __syncthreads();
+    }
+
+    if (tid < head_dim) {
+#pragma unroll
+        for (uint32_t h = 0; h < GROUP; h++) {
+            dst[h * head_dim + tid] =
+                (run_sum[h] > 0.0f) ? acc[h] / run_sum[h] : 0.0f;
+        }
+    }
+}
+
 __global__ static void qwen4exp_qsa_output_gate_kernel(
         const float *gate,
         float *out,
@@ -3888,6 +4160,48 @@ static uint32_t qwen4exp_cuda_threads(uint32_t value) {
     uint32_t nth = 1;
     while (nth * 2u <= value && nth * 2u <= 1024u) nth *= 2;
     return nth;
+}
+
+/* How wide a head group qwen4exp_qsa_attention_group_kernel may take, and the
+ * two limits the choice lives inside.
+ *
+ * The group kernel's block is the per-head block plus GROUP query rows and
+ * GROUP probability rows of shared memory, so the width is bounded by the
+ * 48 KiB a block gets without an opt-in carveout.  It also divides the grid
+ * by GROUP, so it is only offered to a call wide enough that the smaller grid
+ * still fills the device -- a prefill chunk, not a decode row.
+ *
+ * Both bounds are scheduling bounds.  The kernel's arithmetic does not depend
+ * on GROUP at all (see its note), so moving these numbers cannot move a
+ * single output bit. */
+#define QWEN4EXP_QSA_GROUP_MIN_ROWS   64u
+#define QWEN4EXP_QSA_GROUP_SHARED_CAP (48u * 1024u)
+
+static size_t qwen4exp_qsa_group_shared(uint32_t group, uint32_t head_dim,
+                                        uint32_t nth) {
+    return ((size_t)group * head_dim + (size_t)group * nth + nth) *
+               sizeof(float) +
+           (size_t)nth * sizeof(int32_t);
+}
+
+/* Group width.  DS4_QWEN4EXP_NO_QSA_GROUP turns the group kernel off outright;
+ * DS4_QWEN4EXP_QSA_GROUP sets the width (0 or 1 also turns it off).  The
+ * default is the model's full 24/2 group.
+ *
+ * Read fresh rather than cached, so a test can put the two kernels side by
+ * side in one process and diff their bytes -- tests/test_qwen4exp_qsa.c does
+ * exactly that.  The caller asks only after it has already decided the row is
+ * wide enough for the group kernel, so a decode step never reaches this and a
+ * prefill chunk pays one getenv per layer against a kernel that runs for
+ * milliseconds. */
+static uint32_t qwen4exp_qsa_group_width(void) {
+    if (getenv("DS4_QWEN4EXP_NO_QSA_GROUP") != NULL) return 1u;
+    const char *forced = getenv("DS4_QWEN4EXP_QSA_GROUP");
+    if (forced != NULL) {
+        const long v = strtol(forced, NULL, 10);
+        return (v > 0 && v <= 32) ? (uint32_t)v : 1u;
+    }
+    return 12u;
 }
 
 extern "C" void ds4_gpu_qwen4exp_rope_inv_freq(
@@ -4139,6 +4453,48 @@ extern "C" int ds4_gpu_qwen4exp_qsa_attention_tensor(
      * block narrower than head_dim would leave the tail channels unwritten
      * with no error anywhere.  Refuse instead. */
     if (nth < head_dim) return 0;
+
+    /* Wide rows go to the head-group kernel, which reads each K and each V
+     * row once for the whole group instead of once per head.  It is the same
+     * arithmetic in the same order (see the kernel's own note), so the choice
+     * is a scheduling one only; a narrow call keeps the per-head kernel,
+     * whose grid is n_head times wider and which is what a one-row decode
+     * needs to fill the device at all. */
+    const uint32_t gqa = n_head / n_kv_head;
+    const uint32_t want = (n_tokens >= QWEN4EXP_QSA_GROUP_MIN_ROWS)
+        ? qwen4exp_qsa_group_width() : 1u;
+    if (want > 1u) {
+        uint32_t g = want < gqa ? want : gqa;
+        while (g > 1u && (gqa % g) != 0u) g--;
+        const size_t gshared = qwen4exp_qsa_group_shared(g, head_dim, nth);
+        if (g > 1u && gshared <= QWEN4EXP_QSA_GROUP_SHARED_CAP) {
+            const dim3 grid(n_head / g, n_tokens);
+#define QWEN4EXP_QSA_GROUP_LAUNCH(G)                                          \
+            qwen4exp_qsa_attention_group_kernel<G><<<grid, nth, gshared,      \
+                cuda_decode_stream()>>>(                                      \
+                    (const float *)q->ptr, (const float *)k_cache->ptr,       \
+                    (const float *)v_cache->ptr,                              \
+                    sparse ? (const int32_t *)selected->ptr : NULL,           \
+                    sparse ? (const int32_t *)counts->ptr : NULL,             \
+                    (float *)out->ptr, n_tokens, n_head, n_kv_head, head_dim, \
+                    pos0, cache_cap, max_selected, sparse ? 1u : 0u, scale)
+            switch (g) {
+                case 12u: QWEN4EXP_QSA_GROUP_LAUNCH(12u); break;
+                case 8u:  QWEN4EXP_QSA_GROUP_LAUNCH(8u);  break;
+                case 6u:  QWEN4EXP_QSA_GROUP_LAUNCH(6u);  break;
+                case 4u:  QWEN4EXP_QSA_GROUP_LAUNCH(4u);  break;
+                case 3u:  QWEN4EXP_QSA_GROUP_LAUNCH(3u);  break;
+                case 2u:  QWEN4EXP_QSA_GROUP_LAUNCH(2u);  break;
+                default:  g = 1u; break;
+            }
+#undef QWEN4EXP_QSA_GROUP_LAUNCH
+            if (g > 1u) {
+                return cuda_ok(cudaGetLastError(),
+                               "Qwen4-Exp QSA grouped attention launch");
+            }
+        }
+    }
+
     const size_t shared = ((size_t)head_dim + 2u * nth) * sizeof(float) +
                           (size_t)nth * sizeof(int32_t);
     qwen4exp_qsa_attention_kernel<<<dim3(n_head, n_tokens), nth, shared,

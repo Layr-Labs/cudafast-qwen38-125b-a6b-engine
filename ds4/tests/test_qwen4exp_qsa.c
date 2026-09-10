@@ -896,6 +896,42 @@ int main(void) {
     }
     printf("  %-38s %zu values bit-exact across two runs\n", "determinism", attn_len);
 
+    /* The same pipeline again with the head-group attention kernel switched
+     * off, so the two kernels stand side by side in one process.  They read
+     * the same K and V rows out of different places -- the group kernel reads
+     * each row once for all twelve heads of its KV head, the per-head kernel
+     * once per head -- but every product they add, they add to the same
+     * running sum in the same position of the same sequence.  So this is not
+     * a tolerance band: the bytes must be equal.  A single differing float
+     * here is the whole reason to leave the group kernel switched off.
+     *
+     * The segment list covers both sides of the width gate: the 1024-row and
+     * 64-row segments take the group kernel, the 1-row one does not. */
+    float *ungrouped = xcalloc(attn_len, sizeof(float));
+    setenv("DS4_QWEN4EXP_NO_QSA_GROUP", "1", 1);
+    run_pipeline(&in, false, ungrouped);
+    unsetenv("DS4_QWEN4EXP_NO_QSA_GROUP");
+
+    if (memcmp(first, ungrouped, attn_len * sizeof(float)) != 0) {
+        size_t differing = 0;
+        size_t at = 0;
+        for (size_t i = 0; i < attn_len; i++) {
+            if (first[i] != ungrouped[i]) {
+                if (differing == 0) at = i;
+                differing++;
+            }
+        }
+        fprintf(stderr,
+                "test_qwen4exp_qsa: head-group attention is not bit-exact: "
+                "%zu of %zu values differ, first at %zu: %.9g vs %.9g\n",
+                differing, attn_len, at, (double)first[at],
+                (double)ungrouped[at]);
+        return 1;
+    }
+    printf("  %-38s %zu values bit-exact against the per-head kernel\n",
+           "head-group attention", attn_len);
+
+    free(ungrouped);
     free(first);
     free(second);
     inputs_free(&in);
