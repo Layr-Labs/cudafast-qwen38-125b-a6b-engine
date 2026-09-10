@@ -16379,7 +16379,7 @@ static int cuda_q8_mma_available(void) {
         dim3 grid((n_rows + bm - 1u) / bm,                                     \
                   (unsigned)((out_dim + bn - 1u) / bn), 1u);                   \
         matmul_q8_0_preq_rows_mma_kernel<WM, WN, MT, NT, G>                    \
-            <<<grid, (WM) * (WN) * 32>>>(                                      \
+            <<<grid, (WM) * (WN) * 32, 0, cuda_decode_stream()>>>(             \
                 (float *)out->ptr,                                             \
                 reinterpret_cast<const unsigned char *>(wptr), xq, xscale,     \
                 in_dim, out_dim, n_rows, blocks);                              \
@@ -16428,7 +16428,7 @@ extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
     float *xscale = (float *)((char *)tmp + scale_offset);
     const uint64_t qpairs = (uint64_t)n_rows * blocks;
     const unsigned qgrid = (unsigned)((qpairs + 7u) / 8u);
-    quantize_q8_0_f32_rows_warp_kernel<<<qgrid, 256>>>(
+    quantize_q8_0_f32_rows_warp_kernel<<<qgrid, 256, 0, cuda_decode_stream()>>>(
             xq, xscale, (const float *)x->ptr, in_dim, blocks, n_rows);
     if (!cuda_ok(cudaGetLastError(),
                  "q8_0 decode rows exact quantize launch")) {
@@ -16493,7 +16493,7 @@ extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
      * eight rows with the SAME per-row arithmetic. */
     if (n_rows == 1u || getenv("DS4_QWEN4EXP_NO_ROW_TILE") != NULL) {
         dim3 grid(wgrid, n_rows, 1u);
-        matmul_q8_0_preq_warp8_kernel<<<grid, 256>>>(
+        matmul_q8_0_preq_warp8_kernel<<<grid, 256, 0, cuda_decode_stream()>>>(
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
                 xq, xscale, in_dim, out_dim, blocks, use_dp4a);
@@ -16502,19 +16502,22 @@ extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
     }
     if (n_rows >= 8u) {
         dim3 grid(wgrid, (n_rows + 7u) / 8u, 1u);
-        matmul_q8_0_preq_rows_exact_tile_kernel<8><<<grid, 256>>>(
+        matmul_q8_0_preq_rows_exact_tile_kernel<8>
+            <<<grid, 256, 0, cuda_decode_stream()>>>(
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
                 xq, xscale, in_dim, out_dim, n_rows, blocks, use_dp4a);
     } else if (n_rows >= 4u) {
         dim3 grid(wgrid, (n_rows + 3u) / 4u, 1u);
-        matmul_q8_0_preq_rows_exact_tile_kernel<4><<<grid, 256>>>(
+        matmul_q8_0_preq_rows_exact_tile_kernel<4>
+            <<<grid, 256, 0, cuda_decode_stream()>>>(
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
                 xq, xscale, in_dim, out_dim, n_rows, blocks, use_dp4a);
     } else {
         dim3 grid(wgrid, (n_rows + 1u) / 2u, 1u);
-        matmul_q8_0_preq_rows_exact_tile_kernel<2><<<grid, 256>>>(
+        matmul_q8_0_preq_rows_exact_tile_kernel<2>
+            <<<grid, 256, 0, cuda_decode_stream()>>>(
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
                 xq, xscale, in_dim, out_dim, n_rows, blocks, use_dp4a);
