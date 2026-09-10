@@ -2238,6 +2238,345 @@ __global__ static void qwen4exp_shared_down_q_kernel(
     }
 }
 
+/* =========================================================================
+ * The shared expert, with the decoded row staged in shared memory.
+ * =========================================================================
+ *
+ * WHAT THE PER-ROW KERNELS ABOVE SPEND.  `qwen4exp_shared_gateup_q_kernel`
+ * gives one warp one output row and one tile of R tokens, so at a prefill of
+ * n tokens the same weight row is decoded ceil(n / R) times -- 128 times at
+ * 1024 tokens with R = 8 -- and every one of those decodes reads the same
+ * bytes out of the same row.  Worse, `qwen4exp_dp4a` assembles each four-byte
+ * operand out of four single-byte loads, so the activation side of the inner
+ * loop issues 32 LDG.E.U8 per group per token: in the emitted SASS the R = 8
+ * shared kernels carry more than five byte loads for every IDP.4A they feed.
+ * The kernel is neither weight-bound nor MAC-bound; it is bound on
+ * load-issue slots spent one byte at a time.
+ *
+ * WHAT THESE KERNELS DO INSTEAD.  A block owns ONE output row and all 256 of
+ * its threads decode that row's groups once, cooperatively, into shared
+ * memory -- as the eight four-byte words `qwen4exp_dp4a` would have assembled
+ * from the decoded bytes, plus the (wa, wb) pair and the half count that group
+ * produced.  After one barrier each of the eight warps takes its own tile of R
+ * tokens and walks `for (g = lane; g < groups; g += 32)` exactly as the per-row
+ * kernel does, reading the staged group instead of decoding it.  Eight warps
+ * times R = 8 is 64 tokens served by one decode of the row, so the decode count
+ * per row drops by eight, and the activation group is read as two sixteen-byte
+ * loads instead of thirty-two one-byte loads.
+ *
+ * WHY THE NUMBERS DO NOT MOVE.  The staged value IS the decoder's output: the
+ * words are `qwen4exp_load_i8x4` of the very bytes `dev_qwen4exp_group_decode`
+ * wrote, and shared memory is a copy, not a re-representation.  The activation
+ * words are the same four bytes the byte path packed, in the same little-endian
+ * order, so every __dp4a takes the operands it took before.  Above all the
+ * SCHEDULE is untouched: for a given (row, token) it is still lane `l` of one
+ * warp that accumulates groups l, l + 32, l + 64, ... in ascending order into
+ * one private float, and it is still the same `warp_sum_f32` butterfly that
+ * folds the thirty-two lane partials.  Only which block that warp sits in, and
+ * how many tokens share the decode with it, change -- and neither is an
+ * operand.  Nothing above this comment is edited: the per-row kernels remain
+ * available (DS4_QWEN4EXP_SHARED_STAGE=0, or any forced DS4_QWEN4EXP_MOE_R)
+ * and are the bit-for-bit oracle the test compares this path against.
+ */
+
+enum {
+    QWEN4EXP_STAGE_WARPS = 8,
+    QWEN4EXP_STAGE_THREADS = 32 * QWEN4EXP_STAGE_WARPS,
+    /* The token tile one warp carries.  It is the tile the per-row kernel
+     * runs at a prefill, and it is only a schedule: `take` clamps it, so a
+     * token's arithmetic does not depend on how many neighbours share its
+     * warp.  Raising it alone is what the register file refuses; raising the
+     * warps per decode is what this path does instead. */
+    QWEN4EXP_STAGE_R = 8,
+    /* Below this many tokens the per-row kernels are still the faster pair,
+     * and they stay the ones that run.  Measured on the GB10 at the
+     * checkpoint's shared-expert shape (in 2560, mid 640, out 2560, Q8_0),
+     * one call, milliseconds:
+     *
+     *     tokens      1      4      8     12     16     32    128   1024
+     *     per-row  0.029  0.049  0.086  0.111  0.152  0.263  0.987  7.755
+     *     staged   0.068  0.085  0.113  0.120  0.127  0.137  0.299  3.113
+     *
+     * A staged block spends its whole decode phase on one row whatever the
+     * token count, so at a decode width most of its work and seven of its
+     * eight warps are wasted; the per-row kernel is DRAM-bound there and
+     * cannot be beaten by moving the decode.  They cross near twelve tokens.
+     * Both paths return the same bits, so this is only ever a speed choice. */
+    QWEN4EXP_STAGE_MIN_TOKENS = 16,
+};
+
+/* `qwen4exp_dp4a` over operands already packed into four-byte words.  Same
+ * number of __dp4a, same order, same accumulator chain; a word here is the
+ * little-endian packing `qwen4exp_load_i8x4` returns for the four bytes it
+ * replaces, so each __dp4a takes the identical pair of operands. */
+template <int N>
+__device__ __forceinline__ static int32_t qwen4exp_dp4a_w(const int32_t *a,
+                                                          const int32_t *b) {
+    int32_t d = 0;
+#pragma unroll
+    for (int i = 0; i < N / 4; i++) {
+        d = __dp4a(a[i], b[i], d);
+    }
+    return d;
+}
+
+/* `qwen4exp_group_accumulate` over word operands.  The two floating-point
+ * statements are the ones above, character for character, so the compiler
+ * builds the same expression tree and contracts it the same way; only the
+ * integer dot's operand form differs, and that form holds the same bits. */
+__device__ __forceinline__ static void qwen4exp_group_accumulate_w(
+        float *acc, const int32_t *wq, const float *wa, const float *wb,
+        int halves, const int32_t *xqg, float xscale, int32_t xsum) {
+    if (halves == 1) {
+        const int32_t dot = qwen4exp_dp4a_w<32>(wq, xqg);
+        *acc += (wa[0] * xscale) * (float)dot;
+        *acc += (wb[0] * xscale) * (float)xsum;
+    } else {
+        const int32_t d0 = qwen4exp_dp4a_w<16>(wq, xqg);
+        const int32_t d1 = qwen4exp_dp4a_w<16>(wq + 4, xqg + 4);
+        *acc += (wa[0] * xscale) * (float)d0;
+        *acc += (wa[1] * xscale) * (float)d1;
+    }
+}
+
+/* The thirty-two decoded bytes of one group as the eight words the dot wants.
+ * This is `qwen4exp_load_i8x4` at the eight offsets the dot reads, run once at
+ * staging time instead of once per token. */
+__device__ __forceinline__ static void qwen4exp_pack_group(
+        int4 *lo, int4 *hi, const int8_t *wq) {
+    lo->x = qwen4exp_load_i8x4(wq + 0);
+    lo->y = qwen4exp_load_i8x4(wq + 4);
+    lo->z = qwen4exp_load_i8x4(wq + 8);
+    lo->w = qwen4exp_load_i8x4(wq + 12);
+    hi->x = qwen4exp_load_i8x4(wq + 16);
+    hi->y = qwen4exp_load_i8x4(wq + 20);
+    hi->z = qwen4exp_load_i8x4(wq + 24);
+    hi->w = qwen4exp_load_i8x4(wq + 28);
+}
+
+/* One quantised activation group, read as two sixteen-byte loads.  The
+ * scratch base is a cudaMalloc return and a group starts at a multiple of
+ * thirty-two bytes from it, so the address is sixteen-byte aligned; the host
+ * checks that before it picks this kernel and keeps the per-row path when it
+ * does not hold. */
+__device__ __forceinline__ static void qwen4exp_load_group_w(
+        int32_t *out, const int8_t *xqg) {
+    const int4 *v = (const int4 *)(const void *)xqg;
+    const int4 a = v[0];
+    const int4 b = v[1];
+    out[0] = a.x; out[1] = a.y; out[2] = a.z; out[3] = a.w;
+    out[4] = b.x; out[5] = b.y; out[6] = b.z; out[7] = b.w;
+}
+
+/* Shared-memory bytes one staged row needs.  Two int4 arrays hold the eight
+ * words of a group; the scalar arrays hold what the decoder returned in
+ * (wa[0], wa[1], wb[0]) and the half count. */
+static uint64_t qwen4exp_stage_bytes(uint64_t groups, int matrices) {
+    return (uint64_t)matrices * groups * (2u * sizeof(int4) +
+                                          3u * sizeof(float) + sizeof(int));
+}
+
+/* Is the staged path the right one for this call?
+ *
+ * It is declined when a test pins the tile (DS4_QWEN4EXP_MOE_R selects among
+ * the per-row kernels and must keep selecting among them), when
+ * DS4_QWEN4EXP_SHARED_STAGE is set to 0 -- which is how the test runs the
+ * per-row kernels as this path's oracle -- when the activation scratch is not
+ * sixteen-byte aligned, so the wide group load would fault, when one row's
+ * staged form does not fit the default 48 KiB dynamic shared-memory budget,
+ * and when the call is narrower than QWEN4EXP_STAGE_MIN_TOKENS, where the
+ * per-row kernels are still faster.  Setting the variable to 1 asks for the
+ * staged path at every width, which is how the test sweeps its tails.
+ * Every decline lands on the untouched per-row kernels, which produce the same
+ * bits, so a decline costs speed and never accuracy. */
+static int qwen4exp_shared_stage_ok(const void *quant, uint32_t groups,
+                                    int matrices, uint32_t n_tokens) {
+    const char *sel = getenv("DS4_QWEN4EXP_SHARED_STAGE");
+    const int forced = sel && sel[0] == '1' && sel[1] == '\0';
+    if (sel && sel[0] == '0' && sel[1] == '\0') return 0;
+    if (getenv("DS4_QWEN4EXP_MOE_R")) return 0;
+    if (groups == 0u) return 0;
+    if (((uintptr_t)quant & 15u) != 0u) return 0;
+    if (qwen4exp_stage_bytes(groups, matrices) > 48u * 1024u) return 0;
+    if (!forced && n_tokens < (uint32_t)QWEN4EXP_STAGE_MIN_TOKENS) return 0;
+    return 1;
+}
+
+template <int R>
+__global__ static void qwen4exp_shared_gateup_stage_kernel(
+        float *mid,
+        const char *gate,
+        const char *up,
+        const int8_t *xq,
+        const float *xs,
+        const int32_t *xsum,
+        uint64_t gate_row_bytes,
+        uint64_t up_row_bytes,
+        uint32_t gate_type,
+        uint32_t up_type,
+        uint32_t groups,
+        uint32_t mid_dim,
+        uint32_t n_tokens) {
+    extern __shared__ __align__(16) char qwen4exp_stage_smem[];
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t row = blockIdx.x;
+    const char *gate_row = gate + (uint64_t)row * gate_row_bytes;
+    const char *up_row = up + (uint64_t)row * up_row_bytes;
+
+    int4 *s_lo = (int4 *)qwen4exp_stage_smem;            /* [2][groups] */
+    int4 *s_hi = s_lo + 2u * groups;                     /* [2][groups] */
+    float *s_a0 = (float *)(s_hi + 2u * groups);         /* [2][groups] */
+    float *s_a1 = s_a0 + 2u * groups;
+    float *s_b0 = s_a1 + 2u * groups;
+    int *s_h = (int *)(s_b0 + 2u * groups);
+
+    /* Decode the row once for the whole block.  Item `g` is the gate group,
+     * item `groups + g` the up group, so consecutive threads read consecutive
+     * blocks of one row exactly as consecutive lanes did before. */
+    for (uint32_t item = threadIdx.x; item < groups * 2u; item += blockDim.x) {
+        const bool second = item >= groups;
+        const uint32_t g = second ? item - groups : item;
+        int8_t wq[32];
+        float wa[2], wb[2];
+        int halves = 1;
+        dev_qwen4exp_group_decode(second ? up_type : gate_type,
+                                  second ? up_row : gate_row, g,
+                                  wq, wa, wb, &halves);
+        qwen4exp_pack_group(&s_lo[item], &s_hi[item], wq);
+        s_a0[item] = wa[0];
+        s_a1[item] = wa[1];
+        s_b0[item] = wb[0];
+        s_h[item] = halves;
+    }
+    __syncthreads();
+
+    const uint32_t tok0 = blockIdx.y * (uint32_t)(R * QWEN4EXP_STAGE_WARPS) +
+                          warp * (uint32_t)R;
+    if (tok0 >= n_tokens) return;
+    const uint32_t take = n_tokens - tok0 < (uint32_t)R ? n_tokens - tok0
+                                                        : (uint32_t)R;
+
+    float ag[R];
+    float au[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) { ag[r] = 0.0f; au[r] = 0.0f; }
+
+    for (uint32_t g = lane; g < groups; g += 32u) {
+        const int4 glo = s_lo[g], ghi = s_hi[g];
+        const int4 ulo = s_lo[groups + g], uhi = s_hi[groups + g];
+        const int32_t gw[8] = { glo.x, glo.y, glo.z, glo.w,
+                                ghi.x, ghi.y, ghi.z, ghi.w };
+        const int32_t uw[8] = { ulo.x, ulo.y, ulo.z, ulo.w,
+                                uhi.x, uhi.y, uhi.z, uhi.w };
+        const float ga[2] = { s_a0[g], s_a1[g] };
+        const float gb[2] = { s_b0[g], 0.0f };
+        const int gh = s_h[g];
+        const float ua[2] = { s_a0[groups + g], s_a1[groups + g] };
+        const float ub[2] = { s_b0[groups + g], 0.0f };
+        const int uh = s_h[groups + g];
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            if ((uint32_t)r < take) {
+                const uint64_t at_g = (uint64_t)(tok0 + (uint32_t)r) * groups + g;
+                int32_t xqg[8];
+                qwen4exp_load_group_w(xqg, xq + at_g * 32u);
+                const float sc = xs[at_g];
+                const int32_t sm = xsum[at_g];
+                qwen4exp_group_accumulate_w(&ag[r], gw, ga, gb, gh, xqg, sc, sm);
+                qwen4exp_group_accumulate_w(&au[r], uw, ua, ub, uh, xqg, sc, sm);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < R; r++) {
+        const float g = warp_sum_f32(ag[r]);
+        const float u = warp_sum_f32(au[r]);
+        if (lane == 0u && (uint32_t)r < take) {
+            mid[(uint64_t)(tok0 + (uint32_t)r) * mid_dim + row] =
+                (g / (1.0f + expf(-g))) * u;
+        }
+    }
+}
+
+template <int R>
+__global__ static void qwen4exp_shared_down_stage_kernel(
+        float *out,
+        const char *down,
+        const int8_t *mq,
+        const float *ms,
+        const int32_t *msum,
+        const float *gate_scale,
+        uint64_t down_row_bytes,
+        uint32_t down_type,
+        uint32_t groups,
+        uint32_t out_dim,
+        uint32_t n_tokens) {
+    extern __shared__ __align__(16) char qwen4exp_stage_smem[];
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t row = blockIdx.x;
+    const char *down_row = down + (uint64_t)row * down_row_bytes;
+
+    int4 *s_lo = (int4 *)qwen4exp_stage_smem;
+    int4 *s_hi = s_lo + groups;
+    float *s_a0 = (float *)(s_hi + groups);
+    float *s_a1 = s_a0 + groups;
+    float *s_b0 = s_a1 + groups;
+    int *s_h = (int *)(s_b0 + groups);
+
+    for (uint32_t g = threadIdx.x; g < groups; g += blockDim.x) {
+        int8_t wq[32];
+        float wa[2], wb[2];
+        int halves = 1;
+        dev_qwen4exp_group_decode(down_type, down_row, g, wq, wa, wb, &halves);
+        qwen4exp_pack_group(&s_lo[g], &s_hi[g], wq);
+        s_a0[g] = wa[0];
+        s_a1[g] = wa[1];
+        s_b0[g] = wb[0];
+        s_h[g] = halves;
+    }
+    __syncthreads();
+
+    const uint32_t tok0 = blockIdx.y * (uint32_t)(R * QWEN4EXP_STAGE_WARPS) +
+                          warp * (uint32_t)R;
+    if (tok0 >= n_tokens) return;
+    const uint32_t take = n_tokens - tok0 < (uint32_t)R ? n_tokens - tok0
+                                                        : (uint32_t)R;
+
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) acc[r] = 0.0f;
+
+    for (uint32_t g = lane; g < groups; g += 32u) {
+        const int4 wlo = s_lo[g], whi = s_hi[g];
+        const int32_t wq[8] = { wlo.x, wlo.y, wlo.z, wlo.w,
+                                whi.x, whi.y, whi.z, whi.w };
+        const float wa[2] = { s_a0[g], s_a1[g] };
+        const float wb[2] = { s_b0[g], 0.0f };
+        const int halves = s_h[g];
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            if ((uint32_t)r < take) {
+                const uint64_t at_g = (uint64_t)(tok0 + (uint32_t)r) * groups + g;
+                int32_t mqg[8];
+                qwen4exp_load_group_w(mqg, mq + at_g * 32u);
+                qwen4exp_group_accumulate_w(&acc[r], wq, wa, wb, halves,
+                                            mqg, ms[at_g], msum[at_g]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < R; r++) {
+        const float tot = warp_sum_f32(acc[r]);
+        if (lane == 0u && (uint32_t)r < take) {
+            const uint64_t off = (uint64_t)(tok0 + (uint32_t)r) * out_dim + row;
+            out[off] += gate_scale[tok0 + (uint32_t)r] * tot;
+        }
+    }
+}
 
 
 __global__ static void qwen4exp_shared_gate_kernel(
@@ -2673,6 +3012,22 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_tensor(
 
     const int tile = qwen4exp_moe_tile(n_tokens);
     const uint32_t tiles = (n_tokens + (uint32_t)tile - 1u) / (uint32_t)tile;
+
+    /* Tokens one staged block serves, and the tiles that many needs. */
+    const uint32_t stage_span =
+        (uint32_t)QWEN4EXP_STAGE_R * (uint32_t)QWEN4EXP_STAGE_WARPS;
+    const uint32_t stage_tiles = (n_tokens + stage_span - 1u) / stage_span;
+    const int stage_gateup = qwen4exp_shared_stage_ok(xq, xgroups, 2, n_tokens);
+    const int stage_down = qwen4exp_shared_stage_ok(mq, mgroups, 1, n_tokens);
+
+    if (stage_gateup) {
+        qwen4exp_shared_gateup_stage_kernel<QWEN4EXP_STAGE_R>
+            <<<dim3(mid_dim, stage_tiles, 1), QWEN4EXP_STAGE_THREADS,
+               (size_t)qwen4exp_stage_bytes(xgroups, 2), stream>>>(
+                (float *)mid->ptr, gate, up, xq, xs, xsum,
+                gate_slab->row_bytes, up_slab->row_bytes,
+                gate_slab->type, up_slab->type, xgroups, mid_dim, n_tokens);
+    } else {
 #define QWEN4EXP_SH_GATEUP(R) \
     qwen4exp_shared_gateup_q_kernel<R> \
         <<<dim3((mid_dim + 7u) / 8u, tiles, 1), threads, 0, stream>>>( \
@@ -2683,6 +3038,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_tensor(
     else if (tile == 4) { QWEN4EXP_SH_GATEUP(4); }
     else { QWEN4EXP_SH_GATEUP(1); }
 #undef QWEN4EXP_SH_GATEUP
+    }
     if (!cuda_ok(cudaGetLastError(), "qwen4exp shared gate/up launch")) return 0;
 
     if (!qwen4exp_quantize_rows(mq, ms, msum, (const float *)mid->ptr,
@@ -2691,6 +3047,14 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_tensor(
         return 0;
     }
 
+    if (stage_down) {
+        qwen4exp_shared_down_stage_kernel<QWEN4EXP_STAGE_R>
+            <<<dim3(out_dim, stage_tiles, 1), QWEN4EXP_STAGE_THREADS,
+               (size_t)qwen4exp_stage_bytes(mgroups, 1), stream>>>(
+                (float *)out->ptr, down, mq, ms, msum,
+                (const float *)gate_scale->ptr, down_slab->row_bytes,
+                down_slab->type, mgroups, out_dim, n_tokens);
+    } else {
 #define QWEN4EXP_SH_DOWN(R) \
     qwen4exp_shared_down_q_kernel<R> \
         <<<dim3((out_dim + 7u) / 8u, tiles, 1), threads, 0, stream>>>( \
@@ -2701,6 +3065,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_tensor(
     else if (tile == 4) { QWEN4EXP_SH_DOWN(4); }
     else { QWEN4EXP_SH_DOWN(1); }
 #undef QWEN4EXP_SH_DOWN
+    }
     return cuda_ok(cudaGetLastError(), "qwen4exp shared down launch");
 }
 

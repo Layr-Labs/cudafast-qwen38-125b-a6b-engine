@@ -505,6 +505,194 @@ static void ref_q8_0_roundtrip(const float *src, float *dst, int n) {
 }
 
 /* ------------------------------------------------------------------ */
+/* The staged shared expert against the per-row shared expert.
+ *
+ * The staged kernels give one BLOCK one output row: all 256 threads decode
+ * that row's groups once into shared memory, and then each of the eight warps
+ * takes its own tile of eight tokens, so 64 tokens share one decode where the
+ * per-row kernel gave one warp one row and eight tokens.  That is a schedule
+ * change and a caching change, not an arithmetic change: for one (row, token)
+ * it is still lane l that accumulates groups l, l + 32, l + 64, ... in
+ * ascending order into one private float, and still the same warp_sum_f32 that
+ * folds the lanes.
+ *
+ * Nothing but a bit comparison settles that, so this runs the SAME rows
+ * through both kernels -- DS4_QWEN4EXP_SHARED_STAGE=0 selects the untouched
+ * per-row path -- and requires the gate/up output and the final sum to be
+ * identical to the last bit.  Widths are swept across the per-row tile
+ * boundary (8), across the staged block's 64-token span and across both
+ * tails, because a token's arithmetic must not depend on how many neighbours
+ * ride in its warp or its block.
+ *
+ * Every weight type the decoder returns is run through it: Q8_0 is what the
+ * checkpoint's shared expert carries, Q6_K is the only type whose group comes
+ * back in two halves, and a group's two halves are the second arm of the fold
+ * the staged path has to reproduce. */
+enum { STAGE_AB_TOKENS = 200 };
+
+static const uint32_t STAGE_AB_WIDTHS[] = {
+    1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 21, 63, 64, 65, 127, 128, 129,
+    STAGE_AB_TOKENS,
+};
+
+static void run_shared_stage_case(const ds4_gpu_qwen4exp_slab *router_slab,
+                                  const ds4_gpu_qwen4exp_slab *gate_slab,
+                                  const ds4_gpu_qwen4exp_slab *up_slab,
+                                  const ds4_gpu_qwen4exp_slab *down_slab,
+                                  uint32_t in_dim, uint32_t shared_mid,
+                                  uint32_t out_dim,
+                                  ds4_gpu_tensor *x_t,
+                                  const char *what) {
+    const size_t out_n = (size_t)STAGE_AB_TOKENS * out_dim;
+    const size_t mid_n = (size_t)STAGE_AB_TOKENS * shared_mid;
+    ds4_gpu_tensor *out_t = ds4_gpu_tensor_alloc((uint64_t)out_n * sizeof(float));
+    ds4_gpu_tensor *mid_t = ds4_gpu_tensor_alloc((uint64_t)mid_n * sizeof(float));
+    ds4_gpu_tensor *gsc_t = ds4_gpu_tensor_alloc((uint64_t)STAGE_AB_TOKENS * sizeof(float));
+    float *zero = calloc(out_n, sizeof(float));
+    /* The gate/up kernel WRITES mid and the down kernel reads it, so a token
+     * the gate/up kernel forgot to write would otherwise be compared against
+     * the value the previous pass left there.  Poison it before every call. */
+    float *poison = malloc(mid_n * sizeof(float));
+    if (poison) for (size_t i = 0; i < mid_n; i++) poison[i] = -7777.0f;
+    float *out_got[2], *mid_got[2];
+    for (int i = 0; i < 2; i++) {
+        out_got[i] = calloc(out_n, sizeof(float));
+        mid_got[i] = calloc(mid_n, sizeof(float));
+    }
+    require_ok(out_t && mid_t && gsc_t && zero && poison && out_got[0] &&
+               out_got[1] && mid_got[0] && mid_got[1],
+               "staged shared expert allocation");
+
+    const size_t n_widths = sizeof(STAGE_AB_WIDTHS) / sizeof(STAGE_AB_WIDTHS[0]);
+    for (size_t wi = 0; wi < n_widths; wi++) {
+        const uint32_t w = STAGE_AB_WIDTHS[wi];
+        for (int pass = 0; pass < 2; pass++) {
+            /* pass 0 is the per-row kernels, pass 1 the staged ones. */
+            /* "1" asks for the staged kernels at EVERY width, past the
+             * token count below which the launcher prefers the per-row pair
+             * on speed; the tails this sweep is here to check live below it. */
+            setenv("DS4_QWEN4EXP_SHARED_STAGE", pass == 0 ? "0" : "1", 1);
+            /* The down kernel ADDS into out, so both passes must start from
+             * the same zeros or the comparison is meaningless. */
+            require_ok(ds4_gpu_tensor_write(out_t, 0, zero,
+                                            (uint64_t)w * out_dim * sizeof(float)),
+                       "staged shared expert output clear");
+            require_ok(ds4_gpu_tensor_write(mid_t, 0, poison,
+                                            (uint64_t)w * shared_mid * sizeof(float)),
+                       "staged shared expert mid poison");
+            require_ok(ds4_gpu_qwen4exp_shared_expert_tensor(
+                           out_t, mid_t, gsc_t, router_slab, gate_slab, up_slab,
+                           down_slab, in_dim, shared_mid, out_dim, x_t, w),
+                       what);
+            require_ok(ds4_gpu_tensor_read(out_t, 0, out_got[pass],
+                                           (uint64_t)w * out_dim * sizeof(float)),
+                       "staged shared expert output read");
+            require_ok(ds4_gpu_tensor_read(mid_t, 0, mid_got[pass],
+                                           (uint64_t)w * shared_mid * sizeof(float)),
+                       "staged shared expert mid read");
+        }
+        unsetenv("DS4_QWEN4EXP_SHARED_STAGE");
+
+        size_t bad_mid = 0, bad_out = 0;
+        for (size_t i = 0; i < (size_t)w * shared_mid; i++) {
+            if (memcmp(&mid_got[0][i], &mid_got[1][i], sizeof(float)) != 0) bad_mid++;
+        }
+        for (size_t i = 0; i < (size_t)w * out_dim; i++) {
+            if (memcmp(&out_got[0][i], &out_got[1][i], sizeof(float)) != 0) bad_out++;
+        }
+        if (bad_mid != 0) {
+            fprintf(stderr, "staged shared gate/up (%s) at width %u: %zu of %zu "
+                            "outputs differ\n", what, w, bad_mid,
+                    (size_t)w * shared_mid);
+            fail("the staged shared gate/up changed a number");
+        }
+        if (bad_out != 0) {
+            fprintf(stderr, "staged shared down (%s) at width %u: %zu of %zu "
+                            "outputs differ\n", what, w, bad_out,
+                    (size_t)w * out_dim);
+            fail("the staged shared down changed a number");
+        }
+    }
+    printf("shared expert staged against per-row, %s (in %u, mid %u, out %u): "
+           "%zu widths to %u tokens, every output bit-identical\n",
+           what, in_dim, shared_mid, out_dim, n_widths,
+           (unsigned)STAGE_AB_TOKENS);
+
+    for (int i = 0; i < 2; i++) { free(mid_got[i]); free(out_got[i]); }
+    free(poison);
+    free(zero);
+    ds4_gpu_tensor_free(gsc_t);
+    ds4_gpu_tensor_free(mid_t);
+    ds4_gpu_tensor_free(out_t);
+}
+
+static void run_shared_stage_cases(const uint8_t *model, uint64_t model_bytes,
+                                   uint64_t gate_offset, uint64_t up_offset,
+                                   uint64_t down_offset,
+                                   uint64_t sh_router_offset,
+                                   uint64_t sh_gate_offset,
+                                   uint64_t sh_up_offset,
+                                   uint64_t sh_down_offset,
+                                   uint64_t sh_gate_q5k_offset,
+                                   uint64_t sh_up_q5k_offset,
+                                   uint64_t sh_gate_q6k_offset,
+                                   uint64_t sh_up_q6k_offset,
+                                   uint64_t sh_q5k_row, uint64_t sh_q6k_row) {
+    float *x = calloc((size_t)STAGE_AB_TOKENS * IN_DIM, sizeof(float));
+    if (!x) fail("staged shared expert activation allocation");
+    for (size_t i = 0; i < (size_t)STAGE_AB_TOKENS * IN_DIM; i++)
+        x[i] = rng_unit() * 0.5f;
+    ds4_gpu_tensor *x_t = ds4_gpu_tensor_alloc(
+            (uint64_t)STAGE_AB_TOKENS * IN_DIM * sizeof(float));
+    require_ok(x_t != NULL, "staged shared expert activation tensor");
+    require_ok(ds4_gpu_tensor_write(x_t, 0, x,
+                                    (uint64_t)STAGE_AB_TOKENS * IN_DIM * sizeof(float)),
+               "staged shared expert activation write");
+
+    const ds4_gpu_qwen4exp_slab router = {
+        model, model_bytes, sh_router_offset, 0, IN_DIM * sizeof(float), TYPE_F32 };
+    const ds4_gpu_qwen4exp_slab q80_gate = {
+        model, model_bytes, sh_gate_offset, 0, Q80_IN_ROW, TYPE_Q8_0 };
+    const ds4_gpu_qwen4exp_slab q80_up = {
+        model, model_bytes, sh_up_offset, 0, Q80_IN_ROW, TYPE_Q8_0 };
+    const ds4_gpu_qwen4exp_slab q80_down = {
+        model, model_bytes, sh_down_offset, 0, Q80_MID_ROW, TYPE_Q8_0 };
+    /* The routed slabs carry [IN_DIM, MID_DIM] gate/up rows and
+     * [MID_DIM, OUT_DIM] down rows, which is exactly the shared expert's
+     * shape here, so expert zero doubles as a Q4_K / Q5_1 shared expert. */
+    const ds4_gpu_qwen4exp_slab q4k_gate = {
+        model, model_bytes, gate_offset, 0, Q4K_ROW_BYTES, TYPE_Q4_K };
+    const ds4_gpu_qwen4exp_slab q4k_up = {
+        model, model_bytes, up_offset, 0, Q4K_ROW_BYTES, TYPE_Q4_K };
+    const ds4_gpu_qwen4exp_slab q51_down = {
+        model, model_bytes, down_offset, 0, Q51_ROW_BYTES, TYPE_Q5_1 };
+    const ds4_gpu_qwen4exp_slab q5k_gate = {
+        model, model_bytes, sh_gate_q5k_offset, 0, sh_q5k_row, TYPE_Q5_K };
+    const ds4_gpu_qwen4exp_slab q5k_up = {
+        model, model_bytes, sh_up_q5k_offset, 0, sh_q5k_row, TYPE_Q5_K };
+    const ds4_gpu_qwen4exp_slab q6k_gate = {
+        model, model_bytes, sh_gate_q6k_offset, 0, sh_q6k_row, TYPE_Q6_K };
+    const ds4_gpu_qwen4exp_slab q6k_up = {
+        model, model_bytes, sh_up_q6k_offset, 0, sh_q6k_row, TYPE_Q6_K };
+
+    run_shared_stage_case(&router, &q80_gate, &q80_up, &q80_down,
+                          IN_DIM, SHARED_MID, OUT_DIM, x_t,
+                          "Q8_0 gate/up, Q8_0 down");
+    run_shared_stage_case(&router, &q4k_gate, &q4k_up, &q51_down,
+                          IN_DIM, SHARED_MID, OUT_DIM, x_t,
+                          "Q4_K gate/up, Q5_1 down");
+    run_shared_stage_case(&router, &q5k_gate, &q5k_up, &q80_down,
+                          IN_DIM, SHARED_MID, OUT_DIM, x_t,
+                          "Q5_K gate/up, Q8_0 down");
+    run_shared_stage_case(&router, &q6k_gate, &q6k_up, &q80_down,
+                          IN_DIM, SHARED_MID, OUT_DIM, x_t,
+                          "Q6_K gate/up, Q8_0 down");
+
+    ds4_gpu_tensor_free(x_t);
+    free(x);
+}
+
+/* ------------------------------------------------------------------ */
 /* Row invariance of the expert GEMMs.
  *
  * The prefill kernels share a decoded weight across a tile of rows, and the
@@ -1102,6 +1290,9 @@ static void run_production_expert_cases(void) {
                              type_row_bytes(PROD_DOWN_TYPES[j], PROD_MID_DIM);
         down_off[j] = cursor; cursor = ALIGN64(cursor + down_slab_bytes[j]);
     }
+    /* An F32 router row, so the shared expert can be run at this shape too. */
+    const uint64_t sh_router_off = cursor;
+    cursor = ALIGN64(cursor + (uint64_t)PROD_IN_DIM * sizeof(float));
     const uint64_t image_bytes = cursor;
 
     uint8_t *image = mmap(NULL, image_bytes, PROT_READ | PROT_WRITE,
@@ -1121,6 +1312,11 @@ static void run_production_expert_cases(void) {
         const uint64_t row = type_row_bytes(ty, PROD_MID_DIM);
         for (uint64_t r = 0; r < (uint64_t)PROD_EXPERTS * PROD_OUT_DIM; r++)
             prod_seed_row_scales(image + down_off[j] + r * row, ty, PROD_MID_DIM);
+    }
+
+    for (uint32_t k = 0; k < PROD_IN_DIM; k++) {
+        const float v = rng_unit() * 0.05f;
+        memcpy(image + sh_router_off + (uint64_t)k * sizeof(float), &v, sizeof(v));
     }
 
     /* A second mapping carrying a copy of the Q5_1 down slab: the split-shard
@@ -1293,6 +1489,56 @@ static void run_production_expert_cases(void) {
         puts("split-shard routed MoE: identical to the single-mapping run");
     }
 
+    /* THE STAGED SHARED EXPERT AT THE CHECKPOINT'S SHAPE.  The small case in
+     * run_shared_stage_cases has in_dim 256, so a row is eight groups and every
+     * lane of the warp holds at most one of them -- which cannot see a change
+     * in how the lanes chain their partials.  Here in_dim is 2560, so a row is
+     * eighty groups and a lane sums two or three of them in a fixed order, and
+     * mid_dim is 640, so the down row is twenty.  These are the widths the
+     * tower actually runs. */
+    {
+        const ds4_gpu_qwen4exp_slab router = {
+            image, image_bytes, sh_router_off, 0,
+            (uint64_t)PROD_IN_DIM * sizeof(float), TYPE_F32 };
+        float *sx = calloc((size_t)STAGE_AB_TOKENS * PROD_IN_DIM, sizeof(float));
+        if (!sx) fail("production staged shared activation allocation");
+        for (size_t i = 0; i < (size_t)STAGE_AB_TOKENS * PROD_IN_DIM; i++)
+            sx[i] = rng_unit() * 0.5f;
+        ds4_gpu_tensor *sx_t = ds4_gpu_tensor_alloc(
+                (uint64_t)STAGE_AB_TOKENS * PROD_IN_DIM * sizeof(float));
+        require_ok(sx_t != NULL, "production staged shared activation tensor");
+        require_ok(ds4_gpu_tensor_write(sx_t, 0, sx,
+                       (uint64_t)STAGE_AB_TOKENS * PROD_IN_DIM * sizeof(float)),
+                   "production staged shared activation write");
+
+        static const uint32_t pairs[][2] = {
+            { TYPE_Q8_0, TYPE_Q8_0 },   /* what the checkpoint carries */
+            { TYPE_Q4_K, TYPE_Q5_1 },
+            { TYPE_Q6_K, TYPE_Q8_0 },   /* the two-half group fold */
+        };
+        for (uint32_t pi = 0; pi < 3u; pi++) {
+            const uint32_t gt = pairs[pi][0], dt = pairs[pi][1];
+            const uint32_t gi = prod_type_slot(PROD_GATE_UP_TYPES, n_gate_up, gt);
+            const uint32_t dj = prod_type_slot(PROD_DOWN_TYPES, n_down, dt);
+            const uint64_t grow = type_row_bytes(gt, PROD_IN_DIM);
+            const uint64_t drow = type_row_bytes(dt, PROD_MID_DIM);
+            const ds4_gpu_qwen4exp_slab g_slab = {
+                image, image_bytes, gate_off[gi], 0, grow, gt };
+            const ds4_gpu_qwen4exp_slab u_slab = {
+                image, image_bytes, up_off[gi], 0, grow, gt };
+            const ds4_gpu_qwen4exp_slab d_slab = {
+                image, image_bytes, down_off[dj], 0, drow, dt };
+            char label[64];
+            snprintf(label, sizeof(label), "%s gate/up, %s down",
+                     type_name(gt), type_name(dt));
+            run_shared_stage_case(&router, &g_slab, &u_slab, &d_slab,
+                                  PROD_IN_DIM, PROD_MID_DIM, PROD_OUT_DIM,
+                                  sx_t, label);
+        }
+        ds4_gpu_tensor_free(sx_t);
+        free(sx);
+    }
+
     free(single_shard_q51);
     free(expected);
     free(got);
@@ -1322,7 +1568,21 @@ int main(void) {
     const uint64_t sh_up_bytes = sh_gate_bytes;
     const uint64_t sh_down_offset = ALIGN64(sh_up_offset + sh_up_bytes);
     const uint64_t sh_down_bytes = (uint64_t)OUT_DIM * Q80_MID_ROW;
-    const uint64_t model_bytes = ALIGN64(sh_down_offset + sh_down_bytes);
+    /* Two more shared-expert gate/up slabs, in Q5_K and in Q6_K.  The staged
+     * shared kernels cache what the decoder returned, so the check that they
+     * cache it faithfully has to see every shape the decoder returns -- and
+     * Q6_K is the only type that returns two halves, which is the second arm
+     * of the group fold.  A shared down slab cannot take these types here:
+     * SHARED_MID is 64 and a K-quant superblock is 256 wide. */
+    const uint64_t sh_q5k_row = (uint64_t)(IN_DIM / 256u) * 176u;
+    const uint64_t sh_q6k_row = (uint64_t)(IN_DIM / 256u) * 210u;
+    const uint64_t sh_gate_q5k_offset = ALIGN64(sh_down_offset + sh_down_bytes);
+    const uint64_t sh_gu_q5k_bytes = (uint64_t)SHARED_MID * sh_q5k_row;
+    const uint64_t sh_up_q5k_offset = ALIGN64(sh_gate_q5k_offset + sh_gu_q5k_bytes);
+    const uint64_t sh_gate_q6k_offset = ALIGN64(sh_up_q5k_offset + sh_gu_q5k_bytes);
+    const uint64_t sh_gu_q6k_bytes = (uint64_t)SHARED_MID * sh_q6k_row;
+    const uint64_t sh_up_q6k_offset = ALIGN64(sh_gate_q6k_offset + sh_gu_q6k_bytes);
+    const uint64_t model_bytes = ALIGN64(sh_up_q6k_offset + sh_gu_q6k_bytes);
 
     uint8_t *model = mmap(NULL, model_bytes, PROT_READ | PROT_WRITE,
                           MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -1377,6 +1637,16 @@ int main(void) {
             model[base + b * 34 + 0] = (uint8_t)(d & 0xff);
             model[base + b * 34 + 1] = (uint8_t)(d >> 8);
         }
+    }
+    for (uint32_t r = 0; r < SHARED_MID; r++) {
+        prod_seed_row_scales(model + sh_gate_q5k_offset + (uint64_t)r * sh_q5k_row,
+                             TYPE_Q5_K, IN_DIM);
+        prod_seed_row_scales(model + sh_up_q5k_offset + (uint64_t)r * sh_q5k_row,
+                             TYPE_Q5_K, IN_DIM);
+        prod_seed_row_scales(model + sh_gate_q6k_offset + (uint64_t)r * sh_q6k_row,
+                             TYPE_Q6_K, IN_DIM);
+        prod_seed_row_scales(model + sh_up_q6k_offset + (uint64_t)r * sh_q6k_row,
+                             TYPE_Q6_K, IN_DIM);
     }
     for (uint32_t k = 0; k < IN_DIM; k++) {
         const float v = rng_unit() * 0.05f;
@@ -1677,6 +1947,13 @@ int main(void) {
     run_row_invariance_case(model, model_bytes, gate_offset, up_offset,
                             down_offset, sh_router_offset, sh_gate_offset,
                             sh_up_offset, sh_down_offset);
+
+    run_shared_stage_cases(model, model_bytes, gate_offset, up_offset,
+                           down_offset, sh_router_offset, sh_gate_offset,
+                           sh_up_offset, sh_down_offset,
+                           sh_gate_q5k_offset, sh_up_q5k_offset,
+                           sh_gate_q6k_offset, sh_up_q6k_offset,
+                           sh_q5k_row, sh_q6k_row);
 
     run_group_scan_boundary_cases();
 
