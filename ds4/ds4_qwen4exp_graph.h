@@ -217,6 +217,12 @@ bool ds4_qwen4exp_graph_read_logit_row(ds4_qwen4exp_session *s,
                                        uint32_t row,
                                        float *logits);
 
+/* Resolve consecutive absolute positions in the most recent target forward
+ * to the still-live device hyper tensor and byte offset. */
+bool ds4_qwen4exp_graph_hyper_rows_device(
+        const ds4_qwen4exp_session *s, uint32_t pos0, uint32_t n_tokens,
+        const ds4_gpu_tensor **tensor, uint64_t *offset);
+
 /* The target's LM head over ONE supplied pre-final-mixer row.  Runs the final
  * mixer and the head, the same two ops the forward ends with, so a row that
  * came out of a verify yields exactly the logits that verify would have. */

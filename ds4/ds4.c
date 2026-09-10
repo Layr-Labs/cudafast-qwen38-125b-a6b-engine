@@ -75923,6 +75923,7 @@ static int qwen4exp_seam_verify_rows(void *ctx, const int *tokens, uint32_t n,
 static int qwen4exp_seam_verify_rows_top1(void *ctx, const int *tokens,
                                           uint32_t n, uint32_t pos0,
                                           float *hc_rows, int *row_top1) {
+    (void)hc_rows; /* the co-resident draft seam consumes this row on device */
     ds4_session *s = ctx;
     ds4_engine *e = s->engine;
     const uint32_t at = ds4_qwen4exp_session_pos(e->qwen4exp_session);
@@ -75931,7 +75932,7 @@ static int qwen4exp_seam_verify_rows_top1(void *ctx, const int *tokens,
     for (uint32_t i = 0; i < n; i++) buf[i] = (int32_t)tokens[i];
     return ds4_qwen4exp_graph_verify_top1_rows(
                e->qwen4exp_session, e->qwen4exp_weights, &e->model,
-               buf, n, hc_rows, row_top1) ? 0 : -1;
+               buf, n, NULL, row_top1) ? 0 : -1;
 }
 
 static int qwen4exp_seam_read_logit_row(void *ctx, uint32_t row,
@@ -75939,6 +75940,28 @@ static int qwen4exp_seam_read_logit_row(void *ctx, uint32_t row,
     ds4_session *s = ctx;
     return ds4_qwen4exp_graph_read_logit_row(
                s->engine->qwen4exp_session, row, logits) ? 0 : -1;
+}
+
+static int qwen4exp_seam_draft_rows_device(void *ctx,
+                                            const int *next_tokens,
+                                            uint32_t pos0, uint32_t n,
+                                            int *draft_out,
+                                            float *multi_out) {
+    ds4_session *s = ctx;
+    const ds4_gpu_tensor *hyper = NULL;
+    uint64_t offset = 0;
+    if (!ds4_qwen4exp_graph_hyper_rows_device(
+            s->engine->qwen4exp_session, pos0, n, &hyper, &offset)) {
+        return -1;
+    }
+    char err[256];
+    if (ds4_qwen4exp_mtp_head_forward_last_device(
+            &s->qwen4exp_head, next_tokens, hyper, offset, pos0, n,
+            draft_out, multi_out, err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4: qwen4exp MTP seam: %s\n", err);
+        return -1;
+    }
+    return 0;
 }
 
 /* One row, through the SAME entry point as the verify: the cycle requires row
@@ -76089,6 +76112,7 @@ static bool ds4_session_qwen4exp_spec_init(ds4_session *s,
     s->qwen4exp_seam.verify_rows  = qwen4exp_seam_verify_rows;
     s->qwen4exp_seam.verify_rows_top1 = qwen4exp_seam_verify_rows_top1;
     s->qwen4exp_seam.read_logit_row = qwen4exp_seam_read_logit_row;
+    s->qwen4exp_seam.draft_rows_device = qwen4exp_seam_draft_rows_device;
     s->qwen4exp_seam.decode_token = qwen4exp_seam_decode_token;
     s->qwen4exp_seam.head_logits  = qwen4exp_seam_head_logits;
     s->qwen4exp_seam.draft_step   = qwen4exp_seam_draft_step;
