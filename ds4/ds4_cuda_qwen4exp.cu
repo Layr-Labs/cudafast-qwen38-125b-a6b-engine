@@ -913,6 +913,18 @@ __device__ __forceinline__ static int32_t qwen4exp_dp4a(const int8_t *a,
     return d;
 }
 
+/* Is this weight address a whole number of four-byte words from zero?
+ *
+ * The quantised block types are declared with two-byte alignment, so the
+ * compiler cannot assume more.  A GGUF tensor starts on a 32-byte boundary and
+ * every block and row stride of the expert slabs is a multiple of four, so the
+ * answer is yes for every lane of every warp on the pinned checkpoint, and the
+ * branch below is warp uniform rather than a divergence.  It is asked rather
+ * than assumed because an unaligned word load on the device faults. */
+__device__ __forceinline__ static bool qwen4exp_word_aligned(const void *p) {
+    return (((uintptr_t)p) & 3u) == 0u;
+}
+
 /* Decode one 32-element group of a quantised weight row into int8 quants and
  * the one or two (wa, wb) pairs that turn an integer dot into the row's
  * contribution.  Called once per group per output row, not once per element. */
@@ -935,11 +947,38 @@ __device__ __forceinline__ static void dev_qwen4exp_group_decode(
     }
     case (uint32_t)DS4_QWEN4EXP_TY_q5_1: {
         const cuda_block_q5_1 *xb = (const cuda_block_q5_1 *)row + g;
+        wa[0] = dev_f16_to_f32(xb->d);
+        wb[0] = dev_f16_to_f32(xb->m);
+        /* THE ROUTED DOWN PROJECTION IS THIS TYPE on the pinned checkpoint --
+         * 43 of the 48 blocks -- and it is the largest thing the experts read.
+         * A block is 24 bytes, so every block of a word-aligned row is word
+         * aligned, and so are its high-bit plane at offset four and its
+         * nibbles at offset eight.  Reading them as five words instead of
+         * twenty bytes issues four times fewer loads for the same bytes; the
+         * nibbles, the fifth bit and the order they are written in do not
+         * move, so every dot is bit for bit what the byte loop produced. */
+        if (qwen4exp_word_aligned(xb)) {
+            const uint32_t *w = (const uint32_t *)(const void *)xb;
+            const uint32_t qh = w[1];
+#pragma unroll
+            for (int k = 0; k < 4; k++) {
+                const uint32_t v = w[2 + k];
+                const uint32_t lo = v & 0x0f0f0f0fu;
+                const uint32_t hi = (v >> 4u) & 0x0f0f0f0fu;
+#pragma unroll
+                for (int b = 0; b < 4; b++) {
+                    const int j = k * 4 + b;
+                    wq[j] = (int8_t)(((lo >> (b * 8)) & 0xffu) |
+                                     (((qh >> j) & 1u) << 4u));
+                    wq[16 + j] = (int8_t)(((hi >> (b * 8)) & 0xffu) |
+                                          (((qh >> (j + 16u)) & 1u) << 4u));
+                }
+            }
+            return;
+        }
         const uint32_t qh = (uint32_t)xb->qh[0] | ((uint32_t)xb->qh[1] << 8u) |
                             ((uint32_t)xb->qh[2] << 16u) |
                             ((uint32_t)xb->qh[3] << 24u);
-        wa[0] = dev_f16_to_f32(xb->d);
-        wb[0] = dev_f16_to_f32(xb->m);
 #pragma unroll
         for (int j = 0; j < 16; j++) {
             wq[j] = (int8_t)(((uint32_t)(xb->qs[j] & 0x0fu)) |
