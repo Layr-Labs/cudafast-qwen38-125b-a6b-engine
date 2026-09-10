@@ -314,6 +314,108 @@ static void check_norm(uint8_t *model, const float *hyper_host,
     }
 }
 
+/* ---- the dense Q8_0 decode entry: the row tile against one row ------ */
+
+/* THE INVARIANT THE SPECULATIVE CYCLE STANDS ON.
+ *
+ * ds4_gpu_matmul_q8_0_decode_rows_exact_tensor() serves the serial decode at
+ * width one and the MTP verify at width two out of two different kernels:
+ * width one takes matmul_q8_0_preq_warp8_kernel, and every width above it
+ * takes matmul_q8_0_preq_rows_exact_tile_kernel<R>, which reads a weight
+ * block ONCE for R activation rows.  Row j of an n-row call has to be the
+ * same BITS as that row computed alone, or a batched verify and a one-row
+ * decode of the same row disagree and the accept loop commits a token the
+ * serial leg would never have emitted.  The gate on this track is exact token
+ * equality, so a band here would hide the only failure that matters.
+ *
+ * The one-row kernel is the oracle: it is not part of the tile and nothing in
+ * the tile's weight sharing touches it.  Every row of every width below is
+ * compared against it byte for byte, at the checkpoint's real hidden width,
+ * over BOTH group shapes the kernel has -- an in_dim that is a whole number
+ * of 32-element groups, and one whose last group is a 16-wide tail, which is
+ * the case that falls off the dp4a form onto the scalar loop -- and with the
+ * dp4a form both enabled and disabled.  Widths 2 and 3 exercise the R = 2
+ * tile, 4 and 5 the R = 4 tile, 8 and 9 the R = 8 tile, and 9 also exercises
+ * a tile whose last slot is padded.
+ */
+enum { TILE_MAX_ROWS = 9 };
+
+static void check_q8_row_tile_case(const uint8_t *model, uint64_t in_dim,
+                                   const char *what) {
+    static const uint32_t widths[] = { 1u, 2u, 3u, 4u, 5u, 8u, 9u };
+    const uint64_t n_widths = sizeof(widths) / sizeof(widths[0]);
+    const uint64_t x_count = (uint64_t)TILE_MAX_ROWS * in_dim;
+
+    float *x = alloc_floats(x_count);
+    for (uint64_t i = 0; i < x_count; i++) x[i] = next_unit();
+
+    float *tiled = alloc_floats((uint64_t)TILE_MAX_ROWS * N_VOCAB);
+    float *alone = alloc_floats(N_VOCAB);
+
+    ds4_gpu_tensor *x_all = upload(x, x_count);
+    ds4_gpu_tensor *out_all = ds4_gpu_tensor_alloc(
+            (uint64_t)TILE_MAX_ROWS * N_VOCAB * sizeof(float));
+    ds4_gpu_tensor *out_one =
+        ds4_gpu_tensor_alloc((uint64_t)N_VOCAB * sizeof(float));
+    require_ok(out_all != NULL && out_one != NULL,
+               "q8_0 row tile output allocation");
+
+    for (uint64_t w = 0; w < n_widths; w++) {
+        const uint32_t rows = widths[w];
+        require_ok(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+                       out_all, model, MODEL_BYTES, HEAD_OFF, in_dim, N_VOCAB,
+                       x_all, rows),
+                   "q8_0 decode rows exact, tiled call");
+        download(out_all, tiled, (uint64_t)rows * N_VOCAB);
+        for (uint32_t r = 0; r < rows; r++) {
+            ds4_gpu_tensor *x_row = upload(x + (uint64_t)r * in_dim, in_dim);
+            require_ok(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+                           out_one, model, MODEL_BYTES, HEAD_OFF, in_dim,
+                           N_VOCAB, x_row, 1u),
+                       "q8_0 decode rows exact, one-row call");
+            download(out_one, alone, N_VOCAB);
+            require_identical(what, tiled + (uint64_t)r * N_VOCAB, alone,
+                              (uint64_t)N_VOCAB * sizeof(float));
+            ds4_gpu_tensor_free(x_row);
+        }
+    }
+
+    printf("  %-56s exact\n", what);
+    ds4_gpu_tensor_free(out_one);
+    ds4_gpu_tensor_free(out_all);
+    ds4_gpu_tensor_free(x_all);
+    free(alone);
+    free(tiled);
+    free(x);
+}
+
+static void check_q8_row_tile(const uint8_t *model) {
+    const char *saved = getenv("DS4_CUDA_NO_Q8_DP4A");
+    char *keep = saved ? strdup(saved) : NULL;
+    require_ok(saved == NULL || keep != NULL, "environment save");
+
+    if (saved != NULL) unsetenv("DS4_CUDA_NO_Q8_DP4A");
+    check_q8_row_tile_case(model, N_EMBD,
+                           "q8_0 row tile == one row, 2560 in, dp4a");
+    check_q8_row_tile_case(model, N_EMBD - 16u,
+                           "q8_0 row tile == one row, 2544 in, dp4a");
+
+    /* The scalar form of the block dot, which a 16-wide tail group takes on
+     * every device and which a device without dp4a takes for every group. */
+    setenv("DS4_CUDA_NO_Q8_DP4A", "1", 1);
+    check_q8_row_tile_case(model, N_EMBD,
+                           "q8_0 row tile == one row, 2560 in, scalar");
+    check_q8_row_tile_case(model, N_EMBD - 16u,
+                           "q8_0 row tile == one row, 2544 in, scalar");
+
+    if (keep != NULL) {
+        setenv("DS4_CUDA_NO_Q8_DP4A", keep, 1);
+        free(keep);
+    } else {
+        unsetenv("DS4_CUDA_NO_Q8_DP4A");
+    }
+}
+
 int main(void) {
     uint8_t *model = mmap(NULL, MODEL_BYTES, PROT_READ | PROT_WRITE,
                           MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -344,6 +446,8 @@ int main(void) {
 
     require_ok(ds4_gpu_init(), "GPU initialization");
     require_ok(ds4_gpu_set_model_map(model, MODEL_BYTES), "model map registration");
+
+    check_q8_row_tile(model);
 
     const uint32_t row_counts[2] = { 1u, ROWS_LONG };
     for (uint32_t which = 0; which < 2u; which++) {

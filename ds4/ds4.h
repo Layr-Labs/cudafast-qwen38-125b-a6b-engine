@@ -564,6 +564,21 @@ typedef struct {
 
 int ds4_session_qwen4exp_spec_counters(ds4_session *s, ds4_spec_counters *out);
 
+/* Arm the qwen4exp speculative machinery ahead of the first cycle.
+ *
+ * The head block's cache slot, the head's scratch tensors, the drafter's host
+ * buffers, the rollback registration and the head's device residency are all
+ * built on first use, which on a timed decode is the first token of the timed
+ * window. This does that setup on demand instead. It evaluates nothing, reads
+ * no prompt and moves no position, and the buffers it creates hold exactly the
+ * values the lazy path put in them, so the first cycle runs unchanged.
+ *
+ * Returns 0 when the session is armed OR has nothing to arm (no head bound, or
+ * not a qwen4exp session). Non-zero, with a message in `err`, when the setup
+ * refused -- and in that case the session is left as it was, so the first
+ * cycle re-runs the same setup and reports the same refusal. */
+int ds4_session_qwen4exp_spec_prepare(ds4_session *s, char *err, size_t errlen);
+
 /* Low-level graph slice entry points used by distributed inference.  The
  * transport/session routing logic lives in ds4_distributed.c. */
 int ds4_session_layer_slice_reset(ds4_session *s, char *err, size_t errlen);

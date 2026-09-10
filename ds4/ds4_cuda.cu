@@ -5287,6 +5287,59 @@ __device__ __forceinline__ static int32_t dot_i8_block(const int8_t *a, const in
     return dot;
 }
 
+/* dot_i8x32_dp4a() SPLIT IN TWO, so the weight half runs once for a tile of
+ * activation rows instead of once per row.
+ *
+ * WHY.  dot_i8x32_dp4a() reads its weight operand THROUGH a pointer, and the
+ * row tile below calls it once per row of the tile with the same `qs`.  The
+ * pointer is loop-invariant and the values are provably the same, but nvcc does
+ * not common the loads across the unrolled row loop: the emitted SASS for
+ * matmul_q8_0_preq_rows_exact_tile_kernel<2> carries the eight LD.E of the
+ * payload words and the four LDG.E.U8 of the tail TWICE, once inside each row's
+ * copy of the dot.  Those repeats hit L1 -- the same warp read the same
+ * addresses a few dozen instructions earlier -- so they were never DRAM
+ * traffic; what they spend is load-issue slots, and at a decode width the
+ * weight half is twelve of the forty-two loads a lane issues per group per
+ * row-pair.
+ *
+ * WHAT MOVES.  Nothing arithmetic.  q8_0_group_words() computes exactly the
+ * eight int32 operands dot_i8x32_dp4a() builds -- the same seven
+ * __funnelshift_r of the same aligned word pair at the same shift, then the
+ * same load_i8x4_i32_unaligned(a + 28) -- and dot_i8x32_dp4a_words() feeds them
+ * to the same eight __dp4a against the same activation words in the same order
+ * into the same int32 accumulator.  An integer dot has no rounding, so the
+ * value is the one the pointer form returned, bit for bit, and the float tail
+ * that consumes it is untouched.
+ *
+ * This is the pointer form's own body with the split drawn between the weight
+ * words and the products; the pointer form STAYS, and is what every other
+ * caller and the equivalence test still run. */
+__device__ __forceinline__ static void q8_0_group_words(int32_t w[8],
+                                                        const int8_t *a) {
+    const uintptr_t ua = (uintptr_t)a;
+    const uint32_t sh = (uint32_t)(ua & 3u) * 8u;
+    const uint32_t *wa = (const uint32_t *)(ua - (ua & 3u));
+    uint32_t prev = wa[0];
+#pragma unroll
+    for (uint32_t i = 0; i < 7u; i++) {
+        const uint32_t next = wa[i + 1u];
+        w[i] = (int32_t)__funnelshift_r(prev, next, sh);
+        prev = next;
+    }
+    w[7] = load_i8x4_i32_unaligned(a + 28);
+}
+
+__device__ __forceinline__ static int32_t dot_i8x32_dp4a_words(
+        const int32_t w[8], const int8_t *b) {
+    const int32_t *xb = (const int32_t *)b;
+    int32_t dot = 0;
+#pragma unroll
+    for (uint32_t i = 0; i < 8u; i++) {
+        dot = __dp4a(w[i], xb[i], dot);
+    }
+    return dot;
+}
+
 __global__ static DS4_CUDA_UNUSED void matmul_q8_0_kernel(
         float *out,
         const unsigned char *w,
@@ -5571,11 +5624,20 @@ __global__ static void matmul_q8_0_preq_rows_exact_tile_kernel(
         const __half *scale_h = (const __half *)(wr + b * 34u);
         const int8_t *qs = (const int8_t *)(wr + b * 34u + 2u);
         const float ws = __half2float(*scale_h);
+        /* The weight half of the dot, once for the whole tile.  `words` is
+         * dot_i8x32_dp4a()'s own weight operand set; when the dp4a form is not
+         * the one this group takes -- a short tail block, or a device without
+         * dp4a -- the pointer form below runs unchanged, exactly as before. */
+        const bool words = (use_dp4a != 0) && (bn == 32u);
+        int32_t wq[8];
+        if (words) q8_0_group_words(wq, qs);
 #pragma unroll
         for (int r = 0; r < R; r++) {
             if ((uint32_t)r < take) {
                 const uint64_t at = ((uint64_t)row0 + (uint64_t)r) * blocks + b;
-                const int dot = dot_i8_block(qs, xq + at * 32u, bn, use_dp4a);
+                const int dot = words
+                    ? dot_i8x32_dp4a_words(wq, xq + at * 32u)
+                    : dot_i8_block(qs, xq + at * 32u, bn, use_dp4a);
                 acc[r] += ws * xscale[at] * (float)dot;
             }
         }

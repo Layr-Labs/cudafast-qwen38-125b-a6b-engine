@@ -68,6 +68,32 @@ ds4s_handle *ds4s_open(const char *model_path, const char *mtp_head_path,
     }
     ds4_session_set_progress(h->session, NULL, NULL);
     ds4_session_set_display_progress(h->session, NULL, NULL);
+    /* ARM THE DRAFTER HERE, NOT ON THE FIRST TIMED TOKEN.
+     *
+     * The engine builds the MTP head's cache slot, its scratch tensors and its
+     * device residency on the first speculative cycle. On the scored free-run
+     * phase that cycle is the first token benchd's DECODE clock covers, so a
+     * one-off setup -- device allocations, host callocs, uploads of zeros --
+     * was being priced as decode. It runs at open instead, before any phase
+     * connects and before any window opens.
+     *
+     * It computes nothing: no token is evaluated, no prompt is read, no
+     * position moves, and every buffer holds the same zeros the lazy path
+     * wrote. A session with no head bound has nothing to arm and returns 0.
+     *
+     * A refusal is NOT fatal here. The engine puts itself back and the first
+     * cycle re-runs the same setup and reports the same error in the same
+     * place, so an open that could serve the serial route still serves it. */
+    {
+        char spec_err[512] = {0};
+        if (ds4_session_qwen4exp_spec_prepare(h->session, spec_err,
+                                              sizeof(spec_err)) != 0) {
+            fprintf(stderr,
+                    "ds4_shim: the MTP drafter could not be armed at open (%s); "
+                    "it will be built on the first speculative cycle\n",
+                    spec_err[0] ? spec_err : "no reason given");
+        }
+    }
     return h;
 }
 

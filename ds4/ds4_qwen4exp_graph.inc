@@ -241,6 +241,23 @@ struct ds4_qwen4exp_session {
     ds4_qwen4exp_session_plan plan;
     uint32_t pos;
 
+    /* FALSE means every state object below is byte-for-byte what a reset
+     * leaves: the caches, the recurrent states, the convolution histories,
+     * the indexer tape and the n-gram history are all zero (or, for the
+     * history, the reset value) and `pos` is 0.  It is TRUE from the moment
+     * anything that writes state runs, and back to FALSE only at the end of a
+     * full reset.
+     *
+     * WHY IT EXISTS.  A phase does three resets before its first forward: the
+     * resident invalidates on accept, the worker's drain invalidates again,
+     * and the sync that opens the prefill resets a third time -- and the last
+     * two land INSIDE benchd's timed prefill window.  Zeroing buffers that
+     * are already zero is not a cheaper reset, it is the same reset; the flag
+     * makes the second and third ones free.  Skipping is exact by
+     * construction: the skipped work writes the values that are already
+     * there. */
+    bool state_dirty;
+
     /* Per-layer state.  Only the slots the layer type uses are non-NULL. */
     ds4_gpu_tensor *gdn_conv[DS4_MAX_LAYER];
     ds4_gpu_tensor *gdn_state[DS4_MAX_LAYER];
@@ -838,6 +855,14 @@ static void qwen4exp_zero_tensor(ds4_gpu_tensor *t) {
 
 void ds4_qwen4exp_session_reset(ds4_qwen4exp_session *s) {
     if (!s) return;
+    if (!s->state_dirty) {
+        /* Already at the reset state and nothing has written since, so every
+         * store below would write the value the buffer already holds.  `pos`
+         * is set anyway: it costs nothing and keeps this the single place the
+         * position is cleared. */
+        s->pos = 0;
+        return;
+    }
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
         qwen4exp_zero_tensor(s->gdn_conv[il]);
         qwen4exp_zero_tensor(s->gdn_state[il]);
@@ -849,6 +874,7 @@ void ds4_qwen4exp_session_reset(ds4_qwen4exp_session *s) {
     qwen4exp_zero_tensor(s->ple_conv_state);
     ds4_ple_history_reset(&s->ple_constants, &s->ple_history);
     s->pos = 0;
+    s->state_dirty = false;
 }
 
 /* ======================================================================
@@ -1356,13 +1382,17 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
     }
 
     /* Indexer: BF16 projections, the exact unrotated key tape, pooled blocks,
-     * block scores, top-k, and the "keep OR own" expansion. */
-    if (!ds4_qwen4exp_matmul_bf16(s->idx_q, QW_MAP(m, l->indexer_q_proj),
-                                  QW_MAPSZ(m, l->indexer_q_proj),
-                                  QW_OFF(l->indexer_q_proj),
-                                  DS4_N_EMBD, cfg->indexer_q_dim,
-                                  s->mixed, n_tokens) ||
-        !ds4_qwen4exp_matmul_bf16(s->idx_k, QW_MAP(m, l->indexer_k_proj),
+     * block scores, top-k, and the "keep OR own" expansion.
+     *
+     * The k projection feeds the pool update, which runs on every call so the
+     * tape stays exact for the positions that DO index later.  The q
+     * projection feeds only the norm/rope/scores/select chain below, and that
+     * chain runs only when `indexed`.  Below the budget its result was written
+     * and never read, so it moves under the same condition.  This removes a
+     * computation whose output no reader observes; it does not change one. */
+    const bool indexed = (uint64_t)pos0 + n_tokens > DS4_N_INDEXER_TOP_K;
+
+    if (!ds4_qwen4exp_matmul_bf16(s->idx_k, QW_MAP(m, l->indexer_k_proj),
                                   QW_MAPSZ(m, l->indexer_k_proj),
                                   QW_OFF(l->indexer_k_proj),
                                   DS4_N_EMBD, cfg->indexer_k_dim,
@@ -1370,8 +1400,15 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
         fprintf(stderr, "ds4: qwen4exp indexer projections failed at block %u\n", il);
         return false;
     }
-
-    const bool indexed = (uint64_t)pos0 + n_tokens > DS4_N_INDEXER_TOP_K;
+    if (indexed &&
+        !ds4_qwen4exp_matmul_bf16(s->idx_q, QW_MAP(m, l->indexer_q_proj),
+                                  QW_MAPSZ(m, l->indexer_q_proj),
+                                  QW_OFF(l->indexer_q_proj),
+                                  DS4_N_EMBD, cfg->indexer_q_dim,
+                                  s->mixed, n_tokens)) {
+        fprintf(stderr, "ds4: qwen4exp indexer projections failed at block %u\n", il);
+        return false;
+    }
     if (!ds4_gpu_qwen4exp_qsa_indexer_pool_update_tensor(
             s->idx_pool[il], s->idx_tape[il], s->idx_k, s->idx_k_norm[il],
             s->inv_freq, pos0, n_tokens, s->plan.n_ctx,
@@ -1867,6 +1904,10 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         return false;
     }
 
+    /* From here on this call writes the caches, the recurrent states, the
+     * convolution histories and `pos`; see `state_dirty`. */
+    s->state_dirty = true;
+
 #ifdef DS4_TEST_HOOKS
     g_qwen4exp_trace_len = 0;
     g_qwen4exp_trace_overflow = false;
@@ -2073,6 +2114,7 @@ static bool qwen4exp_session_select_layers(ds4_qwen4exp_session *s,
                                            uint32_t row,
                                            bool recurrent, bool conv) {
     const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
+    if (s) s->state_dirty = true;   /* see `state_dirty` */
     if (row >= DS4_QWEN4EXP_IMPLEMENTED_DEPTH) return false;
     if (!ds4_gpu_begin_commands()) return false;
     bool ok = true;
@@ -2141,6 +2183,12 @@ bool ds4_qwen4exp_session_add_head_block(ds4_qwen4exp_session             *s,
         return false;
     }
     if (s->qsa_k[il]) return true;   /* already set up */
+
+    /* Conservative: the slot's own buffers come out of qwen4exp_alloc_zeroed
+     * and so match a reset, but this also uploads the head's three norms and
+     * registers its mapping, so let the next reset run in full rather than
+     * reason about which of those a reset covers. */
+    s->state_dirty = true;
 
     /* Register the HEAD's mapping with the backend.  The session registered the
      * target's shards at open; the head is a second GGUF and every weight the
@@ -2290,6 +2338,10 @@ int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
         return 0;
     }
     if (!c->l->is_full_attention) return 0;
+
+    /* The head's QSA block appends to the slot's key/value caches and its
+     * indexer tape; see `state_dirty`. */
+    s->state_dirty = true;
 
     ds4_gpu_tensor *saved_hyper = s->hyper;
     const uint32_t saved_pos = s->pos;
@@ -2626,12 +2678,14 @@ static int qwen4exp_rb_gdn_conv_select(void *ctx, uint32_t row) {
 static int qwen4exp_rb_ple_hist_select(void *ctx, uint32_t row) {
     ds4_qwen4exp_session *s = ctx;
     if (row >= DS4_QWEN4EXP_IMPLEMENTED_DEPTH) return -1;
+    s->state_dirty = true;   /* see `state_dirty` */
     s->ple_history = s->ple_history_rows[row];
     return 0;
 }
 static int qwen4exp_rb_ple_conv_select(void *ctx, uint32_t row) {
     ds4_qwen4exp_session *s = ctx;
     if (row >= DS4_QWEN4EXP_IMPLEMENTED_DEPTH) return -1;
+    s->state_dirty = true;   /* see `state_dirty` */
     const uint64_t bytes = ds4_gpu_tensor_bytes(s->ple_conv_state);
     if (!ds4_gpu_begin_commands()) return -1;
     const bool ok = ds4_gpu_tensor_copy(s->ple_conv_state, 0,
@@ -2645,6 +2699,7 @@ static int qwen4exp_rb_qsa_kv_truncate(void *ctx, uint32_t pos) {
     /* The caches are addressed by position and only appended to, so dropping
      * rows is bookkeeping: the next write starts at `pos`. */
     if (pos > s->plan.n_ctx) return -1;
+    s->state_dirty = true;   /* see `state_dirty` */
     s->pos = pos;
     return 0;
 }
@@ -2655,6 +2710,7 @@ static int qwen4exp_rb_qsa_indexer_truncate(void *ctx, uint32_t pos) {
      * Rebuilding the pool from a truncated tape is what keeps a later offset
      * bump from re-exposing rows the tape no longer covers. */
     if (pos > s->plan.n_ctx) return -1;
+    s->state_dirty = true;   /* see `state_dirty` */
     s->indexer_valid_blocks = pos / DS4_N_INDEXER_COMPRESS_RATIO;
     return 0;
 }
@@ -2662,6 +2718,7 @@ static int qwen4exp_rb_head_cache_truncate(void *ctx, uint32_t pos) {
     ds4_qwen4exp_session *s = ctx;
     /* The head keeps its own cache stack; the session only records how far it
      * is seeded so a rejecting round cannot leave it ahead of the target. */
+    s->state_dirty = true;   /* see `state_dirty` */
     s->head_cache_pos = pos;
     return 0;
 }

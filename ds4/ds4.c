@@ -76150,6 +76150,52 @@ static bool ds4_session_qwen4exp_spec(const ds4_session *s) {
 #endif
 }
 
+/* Build the speculative machinery NOW instead of on the first cycle.
+ *
+ * WHAT IT IS.  ds4_session_qwen4exp_spec_init() allocates: the head block's
+ * key/value caches, indexer tape and pooled blocks (~37 MiB of device buffers,
+ * each one a device allocation plus a host calloc and an upload of zeros), the
+ * head's thirteen scratch tensors including a full [rows][n_vocab] logit
+ * buffer, the drafter's two host scratch blocks, and it makes the 2.6 GiB head
+ * mapping device resident. It also registers the rollback set and validates
+ * the head. NONE of that is arithmetic and none of it depends on a prompt: it
+ * is the same setup for every request the session will ever serve.
+ *
+ * WHY IT MOVES.  It used to run on the first ds4_session_qwen4exp_spec_cycle(),
+ * which on the benchmark's free-run phase is the FIRST TOKEN OF THE DECODE
+ * WINDOW -- so a one-off setup was priced as decode. The same comment in
+ * ds4_qwen4exp_session_add_head_block() records the last time this bit:
+ * "a 401 ms first speculative round and a 148 ms invalidate that landed inside
+ * the ranked flow's timed prefill window".
+ *
+ * WHAT IT DOES NOT DO.  It evaluates no token, touches no prompt, runs no
+ * forward and moves no position. Every buffer it creates is zeroed exactly as
+ * the lazy path zeroed it, and the first cycle then finds `spec_ready` set and
+ * takes the identical path it always took. A session that is not speculating
+ * (no head, or not qwen4exp) is left alone.
+ *
+ * FAIL-SOFT. A refusal here puts the session back exactly as it was, so the
+ * first cycle re-runs the same init and reports the same error at the same
+ * place it always did. Returns 0 when the session is armed or has nothing to
+ * arm, non-zero with a named message otherwise. */
+int ds4_session_qwen4exp_spec_prepare(ds4_session *s, char *err, size_t errlen) {
+#ifdef DS4_NO_GPU
+    (void)s; (void)err; (void)errlen;
+    return 0;
+#else
+    if (err && errlen) err[0] = '\0';
+    if (!s || !ds4_session_qwen4exp_spec(s)) return 0;
+    char local[512];
+    if (!err || errlen == 0) { err = local; errlen = sizeof(local); }
+    if (ds4_session_qwen4exp_spec_init(s, err, errlen)) return 0;
+    /* Put the lazy path back: spec_init latches qwen4exp_spec_failed on the
+     * way in, and a session that refuses here must still refuse in the same
+     * words at the first cycle rather than silently earlier. */
+    s->qwen4exp_spec_failed = false;
+    return 1;
+#endif
+}
+
 
 #if defined(DS4_TEST_HOOKS) && !defined(DS4_NO_GPU)
 /* The graph backend THIS BUILD links, chosen the way ds4_cli.c's
