@@ -3762,6 +3762,7 @@ __global__ static void qwen4exp_qsa_attention_kernel(
         uint32_t sparse,
         float scale) {
     extern __shared__ __align__(16) float qwen4exp_attn_shared[];
+    __shared__ float qwen4exp_attn_uniform[2];
     const uint32_t head = blockIdx.x;
     const uint32_t token = blockIdx.y;
     const uint32_t tid = threadIdx.x;
@@ -3844,14 +3845,23 @@ __global__ static void qwen4exp_qsa_attention_kernel(
         keys[tid] = key;
         tile[tid] = score;
         const float tile_max = qwen4exp_blk_max(tile, tid, nth);
-        const float new_max = fmaxf(run_max, tile_max);
+        if (tid == 0u) {
+            const float new_max = fmaxf(run_max, tile_max);
+            qwen4exp_attn_uniform[0] = new_max;
+            qwen4exp_attn_uniform[1] =
+                (run_max > QWEN4EXP_QSA_MASKED_LIMIT)
+                    ? expf(run_max - new_max) : 0.0f;
+        }
+        /* This existing barrier protects tile[0] from the probability write;
+         * it also publishes the two uniform online-softmax scalars, so doing
+         * their identical work once adds no synchronization. */
         __syncthreads();
+        const float new_max = qwen4exp_attn_uniform[0];
+        const float rescale = qwen4exp_attn_uniform[1];
 
         probs[tid] = (key >= 0) ? expf(score - new_max) : 0.0f;
         tile[tid] = probs[tid];
         const float tile_sum = qwen4exp_blk_sum(tile, tid, nth);
-        const float rescale = (run_max > QWEN4EXP_QSA_MASKED_LIMIT)
-            ? expf(run_max - new_max) : 0.0f;
         run_sum = run_sum * rescale + tile_sum;
 
         if (tid < head_dim) {
