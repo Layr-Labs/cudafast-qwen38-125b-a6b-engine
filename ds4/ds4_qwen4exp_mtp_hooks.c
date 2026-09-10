@@ -45,15 +45,6 @@
 
 #ifndef DS4_NO_GPU
 
-/* The CUDA Qwen object supplies this symbol.  Metal and ROCm builds leave the
- * weak reference empty and retain the portable tensor-copy packer in
- * ds4_qwen4exp_mtp.c. */
-#if !defined(__APPLE__) && (defined(__GNUC__) || defined(__clang__))
-extern int ds4_gpu_qwen4exp_ehx_pack_tensor(
-        ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *,
-        uint32_t, uint32_t, uint32_t) __attribute__((weak));
-#endif
-
 /* The hook takes uint64_t rows because that is the upstream entry's type; the
  * decode-order entry takes uint32_t.  The head is built for at most
  * DS4_QWEN4EXP_MTP_MAX_COMMIT rows and the widest call is that many times n_hc,
@@ -75,11 +66,6 @@ void ds4_qwen4exp_mtp_default_hooks(ds4_qwen4exp_mtp_gpu_hooks *hooks) {
     hooks->rms_norm    = ds4_gpu_qwen4exp_rms_norm_tensor;
     hooks->hc_mixer    = ds4_gpu_qwen4exp_hc_mixer_tensor;
     hooks->embed       = ds4_gpu_qwen4exp_embed_tokens_hc_tensor;
-#if !defined(__APPLE__) && (defined(__GNUC__) || defined(__clang__))
-    hooks->ehx_pack    = ds4_gpu_qwen4exp_ehx_pack_tensor;
-#else
-    hooks->ehx_pack    = NULL;
-#endif
     hooks->matmul_q8_0 = mtp_matmul_q8_0_decode_rows;
     hooks->block       = ds4_qwen4exp_graph_head_block;
 }

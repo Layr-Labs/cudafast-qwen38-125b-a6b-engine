@@ -1553,7 +1553,147 @@ static void run_production_expert_cases(void) {
     munmap(image, image_bytes);
 }
 
-int main(void) {
+/* Shared-only comparison: the routed MMA path has different numerics and
+ * must not be part of this reference.  Compare all three public tensors,
+ * including the unused tail, with both zero and nonzero initial out.
+ *
+ * The reference is the per-row dp4a pair, pinned with
+ * DS4_QWEN4EXP_SHARED_STAGE=0, and the candidate is the dispatch the tower
+ * actually gets, so the widths below 64 check the staged path and the widths
+ * from 64 up check the MMA pair, both against the same oracle. */
+static void run_shared_exact_case(uint32_t in_dim, uint32_t mid_dim,
+                                  uint32_t out_dim) {
+    enum { MAX_TOKENS = 1024 };
+    const uint32_t widths[] = {1, 7, 63, 64, 65, 96, MAX_TOKENS};
+    const uint64_t grow = type_row_bytes(TYPE_Q8_0, in_dim);
+    const uint64_t drow = type_row_bytes(TYPE_Q8_0, mid_dim);
+    const uint64_t goff = ALIGN64((uint64_t)in_dim * sizeof(float));
+    const uint64_t uoff = ALIGN64(goff + mid_dim * grow);
+    const uint64_t doff = ALIGN64(uoff + mid_dim * grow);
+    const uint64_t bytes = ALIGN64(doff + out_dim * drow);
+    uint8_t *image = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (image == MAP_FAILED) fail("shared exact model mmap");
+    for (uint64_t i = 0; i < bytes; i++) image[i] = (uint8_t)rng_u32();
+    for (uint32_t k = 0; k < in_dim; k++) {
+        const float v = rng_unit() * 0.02f;
+        memcpy(image + (uint64_t)k * sizeof(float), &v, sizeof(v));
+    }
+    for (uint32_t r = 0; r < mid_dim; r++) {
+        prod_seed_row_scales(image + goff + r * grow, TYPE_Q8_0, in_dim);
+        prod_seed_row_scales(image + uoff + r * grow, TYPE_Q8_0, in_dim);
+    }
+    for (uint32_t r = 0; r < out_dim; r++)
+        prod_seed_row_scales(image + doff + r * drow, TYPE_Q8_0, mid_dim);
+    /* Negative scales, signed zero and the smallest half subnormal. */
+    const uint16_t scales[] = {0x0000, 0x8000, 0x0001, 0x8001, 0xa400};
+    for (size_t i = 0; i < sizeof(scales) / sizeof(scales[0]); i++) {
+        memcpy(image + goff + i * grow, &scales[i], sizeof(uint16_t));
+        memcpy(image + uoff + i * grow, &scales[i], sizeof(uint16_t));
+        memcpy(image + doff + i * drow, &scales[i], sizeof(uint16_t));
+    }
+#if defined(__APPLE__)
+    require_ok(ds4_gpu_set_model_map_range(image, bytes, 0, bytes, 0),
+               "shared exact model map");
+#else
+    require_ok(ds4_gpu_set_model_map(image, bytes), "shared exact model map");
+#endif
+    const ds4_gpu_qwen4exp_slab router = {
+        image, bytes, 0, 0, (uint64_t)in_dim * sizeof(float), TYPE_F32 };
+    const ds4_gpu_qwen4exp_slab gate = { image, bytes, goff, 0, grow, TYPE_Q8_0 };
+    const ds4_gpu_qwen4exp_slab up = { image, bytes, uoff, 0, grow, TYPE_Q8_0 };
+    const ds4_gpu_qwen4exp_slab down = { image, bytes, doff, 0, drow, TYPE_Q8_0 };
+    const size_t nx = (size_t)MAX_TOKENS * in_dim;
+    float *x = calloc(nx, sizeof(float));
+    if (!x) fail("shared exact activation allocation");
+    for (size_t i = in_dim; i < nx; i++) {
+        const float scale = (i / in_dim) % 3 == 0 ? 0.0001f : 0.5f;
+        x[i] = rng_unit() * scale;
+    }
+    ds4_gpu_tensor *xt = ds4_gpu_tensor_alloc(nx * sizeof(float));
+    require_ok(xt != NULL, "shared exact activation tensor");
+    require_ok(ds4_gpu_tensor_write(xt, 0, x, nx * sizeof(float)),
+               "shared exact activation write");
+    const char *names[] = {"out", "mid", "gate_scale"};
+    const size_t sizes[] = {(size_t)MAX_TOKENS * out_dim * sizeof(float),
+                            (size_t)MAX_TOKENS * mid_dim * sizeof(float),
+                            (size_t)MAX_TOKENS * sizeof(float)};
+    ds4_gpu_tensor *t[3];
+    float *ref[3], *got[3];
+    for (int j = 0; j < 3; j++) {
+        t[j] = ds4_gpu_tensor_alloc(sizes[j]);
+        ref[j] = malloc(sizes[j]);
+        got[j] = malloc(sizes[j]);
+        require_ok(t[j] && ref[j] && got[j], "shared exact output allocation");
+    }
+    const char *env = getenv("DS4_QWEN4EXP_SHARED_STAGE");
+    char *saved = env ? strdup(env) : NULL;
+    require_ok(!env || saved, "shared exact environment copy");
+    for (size_t w = 0; w < sizeof(widths) / sizeof(widths[0]); w++) {
+        for (int add = 0; add < 2; add++) {
+            for (int pass = 0; pass < 2; pass++) {
+                /* Pass 0 pins the per-row dp4a kernels at every width and is
+                 * the reference; pass 1 takes whatever the launcher picks --
+                 * per-row, staged, or the MMA pair from 64 tokens up. */
+                require_ok((pass == 0
+                    ? setenv("DS4_QWEN4EXP_SHARED_STAGE", "0", 1)
+                    : unsetenv("DS4_QWEN4EXP_SHARED_STAGE")) == 0,
+                    "shared exact dispatch switch");
+                for (int j = 0; j < 3; j++) {
+                    for (size_t i = 0; i < sizes[j] / sizeof(float); i++)
+                        got[j][i] = j == 0 && !add ? 0.0f : (float)((int)(i % 17) - 8) * 0.125f;
+                    require_ok(ds4_gpu_tensor_write(t[j], 0, got[j], sizes[j]),
+                               "shared exact reset");
+                }
+                require_ok(ds4_gpu_qwen4exp_shared_expert_tensor(
+                               t[0], t[1], t[2], &router, &gate, &up, &down,
+                               in_dim, mid_dim, out_dim, xt, widths[w]),
+                           "shared exact projection");
+                for (int j = 0; j < 3; j++) {
+                    require_ok(ds4_gpu_tensor_read(t[j], 0,
+                                pass == 0 ? ref[j] : got[j], sizes[j]),
+                               "shared exact read");
+                    if (pass == 0) continue;
+                    for (size_t i = 0; i < sizes[j] / sizeof(float); i++) {
+                        if (memcmp(ref[j] + i, got[j] + i, sizeof(float)) != 0) {
+                            uint32_t a, b;
+                            memcpy(&a, ref[j] + i, sizeof(a));
+                            memcpy(&b, got[j] + i, sizeof(b));
+                            fprintf(stderr, "shared %u/%u/%u width %u add %d %s[%zu]: "
+                                    "dp4a %08x, candidate %08x\n", in_dim, mid_dim,
+                                    out_dim, widths[w], add, names[j], i, a, b);
+                            fail("shared expert is not bit-identical to dp4a");
+                        }
+                    }
+                }
+            }
+        }
+        printf("shared %u/%u/%u width %u: out, mid, gate_scale bit-identical\n",
+               in_dim, mid_dim, out_dim, widths[w]);
+    }
+    require_ok((saved ? setenv("DS4_QWEN4EXP_SHARED_STAGE", saved, 1)
+                      : unsetenv("DS4_QWEN4EXP_SHARED_STAGE")) == 0,
+               "shared exact environment restore");
+    free(saved);
+    for (int j = 0; j < 3; j++) {
+        free(got[j]);
+        free(ref[j]);
+        ds4_gpu_tensor_free(t[j]);
+    }
+    ds4_gpu_tensor_free(xt);
+    free(x);
+    munmap(image, bytes);
+}
+
+int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], "--shared-exact") == 0) {
+        require_ok(ds4_gpu_init(), "GPU init");
+        run_shared_exact_case(PROD_IN_DIM, PROD_MID_DIM, PROD_OUT_DIM);
+        run_shared_exact_case(1056, 1056, 19); /* 33 groups and an output tail */
+        run_shared_exact_case(32, 32, 17);     /* one group and zero lane sums */
+        ds4_gpu_cleanup();
+        return 0;
+    }
     const uint64_t gate_offset = 0;
     const uint64_t gate_bytes = (uint64_t)N_EXPERT * GATE_EXPERT_BYTES;
     const uint64_t up_offset = ALIGN64(gate_offset + gate_bytes);
@@ -1958,6 +2098,9 @@ int main(void) {
     run_group_scan_boundary_cases();
 
     run_production_expert_cases();
+    run_shared_exact_case(PROD_IN_DIM, PROD_MID_DIM, PROD_OUT_DIM);
+    run_shared_exact_case(1056, 1056, 19);
+    run_shared_exact_case(32, 32, 17);
 
     free(xq_ref);
     free(routed_again);
