@@ -260,8 +260,8 @@ jobs:
 
       - name: Participant may edit the engine (surface, harness hash, cache, build)
         # THE VENDORING PROOF. ds4/ is participant-editable now, and this is what
-        # keeps that true: the REAL surface gate admits a ds4/ edit and still
-        # refuses one to fixtures/; benchd's harness hash does not move for an
+        # keeps that true: the REAL manifest lists ds4; benchd's harness hash
+        # does not move for an
         # engine edit, does move for a harness edit, and moves for a tools/ edit
         # so the transcribed roster is provably live; and an engine edit changes
         # the build-cache key and still passes the CPU build. Hermetic: no
@@ -329,22 +329,6 @@ jobs:
         # Drives the REAL tools/local-baseline.sh, root proxy and facade with
         # a stub benchd. Hermetic: no toolchain, GPU, checkpoint, or network.
         run: tools/test-local-baseline.sh
-
-      - name: Overlay refuses non-regular submissions before it touches the trusted copy
-        # Drives the REAL .github/scripts/overlay-editable-paths.sh over synthetic
-        # submissions and asserts the property a rejected submission depends on:
-        # the trusted checkout is left exactly as it was found. A FIFO at an
-        # editable root, and one nested inside an editable directory, are refused
-        # BEFORE the overlay deletes the trusted copy -- the check used to be
-        # symlink-only, so the delete happened first and the copy then blocked.
-        # An ordinary submission still overlays, so a gate that refused
-        # everything would not pass. It also pins path_identity's output shape
-        # (device:inode, not the multi-line filesystem-status block GNU stat
-        # prints for the retired flag order) and the forbidden-path identity arm
-        # that shape feeds, through a second hardlinked name for the pinned
-        # scorer. Hermetic: jq, find and mkfifo -- no git, credential, toolchain,
-        # GPU, or network.
-        run: tools/test-overlay-editable-paths.sh
 
       - name: Speculative declaration envelope
         # Drives the REAL tools/spec-declaration.sh against the REAL contract

@@ -45,17 +45,18 @@ checkout (`1af12bc`, 2026-08-14) of the same tree. It was consulted only to
 confirm the files exist there too; nothing in this document is cited from it,
 because `upstream/main` is both newer and independently verifiable.
 
-The four files this document extracts rule by rule — the gates that decide what
+The files this document extracts rule by rule — the gates that decide what
 a submission may CONTAIN and how much of it — are:
 
 | File | Role |
 |---|---|
-| `Sources/MLXFastTrustedHarness/EditableSurfaceByteBudget.swift` | launch-time byte budget |
+| `Sources/MLXFastTrustedHarness/EditableSurfaceByteBudget.swift` | launch-time byte budget (upstream; this repository carries no Swift package) |
 | `.github/scripts/run-submission-static-review.sh` | pre-dispatch deterministic caps + LLM bypass judge |
-| `.github/scripts/overlay-editable-paths.sh` | archive -> trusted checkout overlay, REPLACE semantics |
-| `.github/scripts/enforce-modifiable-surface.sh` | diff-level surface allowlist |
 
-`.github/scripts/hardened-git.sh` supports the last two.
+`.github/scripts/hardened-git.sh` supports the static review. The in-repository
+overlay and modifiable-surface gate that this document once extracted (R3, R4)
+were retired on 2026-09-09: neither had a caller on any scoring path. Yukon's
+service overlays the archive, and benchd enforces the surface at scoring (§1).
 
 **These four are not the whole submission-restriction surface upstream.** At
 least three further gates are load-bearing against a hostile submission and are
@@ -77,27 +78,26 @@ re-implements, not a census of upstream.
 
 ## 1. Layer map
 
-An untrusted submission passes four independent gates. Each is fail-closed on
-its own; none is load-bearing alone.
+An untrusted submission passes three gates. One runs in this repository; the
+other two are outside it. Each is fail-closed on its own; none is load-bearing
+alone.
 
 ```text
-archive ──► overlay-editable-paths.sh      REPLACE only editablePaths; refuse
-            (trusted checkout as cwd)      symlinks, non-regular, hardlink,
-                                           setuid; skip missing OPTIONAL paths
-                                           and keep the trusted copy
-   │
-   ├──────► enforce-modifiable-surface.sh  diff vs BASE must touch nothing
-            (submission checkout as cwd)   outside the BASE contract's surface
+archive ──► Yukon's overlay                REPLACE only editablePaths, read
+            (Yukon's service)              from the trusted contract; an absent
+                                           OPTIONAL path keeps the trusted copy
    │
    ├──────► static-review checks           per-file / total / growth byte caps,
-            (deterministic half)           path validation, exempt handling
-   │                                       ── then the LLM bypass judge
+            (this repository, hosted)      path validation, exempt handling
+                                           ── then the LLM bypass judge
    │
-   └──────► EditableSurfaceByteBudget      launch-time re-enforcement of the
-            (trusted CLI, worker spawn)    per-file and total caps, binding
-                                           every dispatch path including ones
-                                           that never ran the review step
+   └──────► benchd, at scoring             refuses a candidate that diverges
+            (the trust boundary)           from its baseline outside the surface
 ```
+
+The upstream launch-time byte budget (`EditableSurfaceByteBudget`) does not run
+here: this repository carries no Swift package. benchd applies the byte budget
+at scoring.
 
 The double enforcement of the byte caps is explicit in the original:
 `EditableSurfaceByteBudget.swift@bfab0de:4-13` states that the judge applies the
@@ -209,7 +209,13 @@ D6).
 
 ## 4. R3 — overlay, REPLACE semantics
 
-Source: `.github/scripts/overlay-editable-paths.sh@bfab0de:1-186`.
+Retired 2026-09-09. The in-repository re-implementation
+(`.github/scripts/overlay-editable-paths.sh`) had no caller on any scoring
+path: Yukon's service performs the overlay of a submission archive. The rules
+below describe the original for the record; R3.6 (an absent optional path keeps
+the trusted copy) is the one the participant contract still states.
+
+Source: `overlay@bfab0de:1-186` (the original).
 
 | # | Rule | Original |
 |---|---|---|
@@ -232,12 +238,17 @@ failing the overlay would turn the default case into a refusal. The optional set
 is read from the trusted contract precisely so "a submission cannot make its own
 missing source files optional."
 
-**Re-implementation:** `.github/scripts/overlay-editable-paths.sh`. R3.1–R3.10
-hold, plus additions A1 and A2 in §7.
+**Re-implementation:** none. Retired; see above.
 
 ## 5. R4 — modifiable-surface gate
 
-Source: `.github/scripts/enforce-modifiable-surface.sh@bfab0de:1-77`.
+Retired 2026-09-09. The in-repository re-implementation
+(`.github/scripts/enforce-modifiable-surface.sh`) had no caller on any scoring
+path. What enforces the surface is benchd at scoring: a candidate that diverges
+from its baseline outside `editablePaths` is refused. The rules below describe
+the original for the record.
+
+Source: `enforce@bfab0de:1-77` (the original).
 
 | # | Rule | Original |
 |---|---|---|
@@ -249,8 +260,7 @@ Source: `.github/scripts/enforce-modifiable-surface.sh@bfab0de:1-77`.
 | R4.6 | A changed file matches the surface by exact equality OR by allowed-directory prefix | `bfab0de:61-76` |
 | R4.7 | Every git read goes through `hardened-git.sh` from the trusted checkout | `bfab0de:18-27` |
 
-**Re-implementation:** `.github/scripts/enforce-modifiable-surface.sh`,
-behaviour unchanged.
+**Re-implementation:** none. Retired; see above.
 
 ## 6. R5 — Seatbelt profile generation (KNOWN LEDGER ITEM, not resolved here)
 
@@ -357,31 +367,23 @@ BASE_SHA unset, MODE anything else        -> fatal (no mode selected)
 A caller that forgets to compute a base gets a refusal instead of the
 permissive mode. Diff-mode selection is unchanged.
 
-**A1 (addition) — the gitlink is untouchable by construction.** The overlay
-refuses to act on any editable entry equal to, or inside, `benchd` or
-`.gitmodules`. `benchd` is the SHA-pinned submodule that MEASURES a submission;
-an editable entry over the gitlink would let a submission repoint its own
-scorer. The original had no submodule to protect. `tools/lint-benchmark-manifest.py`
-already asserted the manifest side; this makes the overlay refuse independently
-of the linter having run.
+**A1 (addition) — the gitlink is untouchable by construction.**
+`tools/lint-benchmark-manifest.py` refuses any editable entry equal to, or
+inside, a trusted-scope path or a gitlink. An editable entry over a gitlink
+would let a submission repoint its own scorer. The original had no submodule to
+protect.
 
-The guard is CASE-FOLDED, and separately checks filesystem identity. The ranked
-box is macOS and APFS is case-insensitive by default, so an entry spelled
-`BENCHD` names the real submodule: a byte-comparison guard passes it and the
-overlay's `rm -rf "${target_path}"` then deletes the pinned scorer before
-writing the submission's copy over it. ASCII folding normalises the spellings it
-reaches; a `stat` device+inode comparison over every prefix of the entry catches
-the ones it does not. The same fold is applied in
-`tools/lint-benchmark-manifest.py` (plus `os.path.samefile`) and, newly, in
-`enforce-modifiable-surface.sh`, which previously carried no gitlink guard at
-all — it was the one layer of the three that would have admitted the write had
-the trusted contract ever drifted to list the gitlink.
+The guard is CASE-FOLDED, and separately checks filesystem identity, so an
+entry spelled in another case names the same real path and is refused. ASCII
+folding normalises the spellings it reaches; `os.path.samefile` over every
+prefix of the entry catches the ones it does not. The retired overlay and
+surface gate carried the same guard; the linter is where it lives now.
 
 **A2 (addition) — one path-validation rule, not two.** Upstream's overlay
 validator (`overlay@bfab0de:22-34`) and its static-review validator
 (`review@bfab0de:136-149`) implement the same concept with different rules: only
 the latter rejects a leading `:`. This repository applies the stricter rule in
-both. See Q1 below.
+the static review and the linter. See Q1 below.
 
 **D8 — the fail-closed hardening of issue #20 (a–d).** Four upstream behaviours
 that read as clean passes are refusals here (§8 Q2/Q3/Q4/Q8 carry the

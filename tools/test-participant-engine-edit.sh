@@ -4,11 +4,10 @@
 # ds4/ used to be a submodule pinned to the internal Layr-Labs/ds4. A participant
 # could not read it, fork it, diff it or submit a change to it. It is vendored
 # now -- plain files, declared in benchmark.json editablePaths -- and this suite
-# is what keeps that true. It asserts the four properties the change rests on:
+# is what keeps that true. It asserts the properties the change rests on:
 #
-#   1. AN ENGINE EDIT IS IN THE SURFACE. .github/scripts/enforce-modifiable-surface.sh
-#      accepts a commit that touches ds4/ and still refuses one that touches a
-#      trusted path. This is the gate the ranked pipeline actually runs.
+#   1. AN ENGINE EDIT IS IN THE SURFACE. benchmark.json editablePaths carries
+#      ds4/, and that manifest is what Yukon archives and benchd enforces.
 #   2. AN ENGINE EDIT IS BUILT, NOT CACHED PAST. The build-cache key hashes the
 #      vendored tree's CONTENT, so an edit misses the cache and is rebuilt. A
 #      key that ignored ds4/ would serve the participant a binary built from
@@ -36,7 +35,7 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null && pwd -P)"
 VERBOSE=0
 [[ "${1:-}" == "-v" ]] && VERBOSE=1
 
-EXPECTED_MIN_ASSERTIONS=12
+EXPECTED_MIN_ASSERTIONS=9
 PASSED=0; FAILED=0; FAILURES=()
 pass() { PASSED=$((PASSED+1)); [[ "${VERBOSE}" == "1" ]] && echo "ok    $1"; return 0; }
 fail() { FAILED=$((FAILED+1)); FAILURES+=("$1"); echo "FAIL  $1" >&2; }
@@ -84,13 +83,10 @@ PY
 }
 
 # ---------------------------------------------------------------------------
-# A sandbox repository: the real gate scripts and manifest, a miniature engine.
+# A sandbox repository: the real manifest, a miniature engine.
 # ---------------------------------------------------------------------------
 SB="${WORK}/repo"
-mkdir -p "${SB}/.github/scripts" "${SB}/ds4" "${SB}/harness" "${SB}/tools" "${SB}/fixtures"
-cp "${REPO_ROOT}/.github/scripts/enforce-modifiable-surface.sh" "${SB}/.github/scripts/"
-cp "${REPO_ROOT}/.github/scripts/hardened-git.sh" "${SB}/.github/scripts/"
-chmod +x "${SB}/.github/scripts/"*.sh
+mkdir -p "${SB}/ds4" "${SB}/harness" "${SB}/tools" "${SB}/fixtures"
 # The REAL manifest, so editablePaths is the shipping list and not a fixture.
 cp "${REPO_ROOT}/benchmark.json" "${SB}/benchmark.json"
 printf 'int engine(void) { return 1; }\n' > "${SB}/ds4/ds4.c"
@@ -101,48 +97,12 @@ printf '{}\n' > "${SB}/fixtures/contract.json"
 git -C "${SB}" init --quiet
 git -C "${SB}" add -A
 git -C "${SB}" -c user.email=t@t -c user.name=t commit --quiet -m base
-BASE="$(git -C "${SB}" rev-parse HEAD)"
-
-commit_edit() {  # $1 path, $2 appended text -> prints the new sha
-  printf '%s\n' "$2" >> "${SB}/$1"
-  git -C "${SB}" add -A >/dev/null
-  git -C "${SB}" -c user.email=t@t -c user.name=t commit --quiet -m "edit $1"
-  git -C "${SB}" rev-parse HEAD
-}
-
-surface_gate() {  # $1 head sha -> exit status of the real enforcer
-  ( cd "${SB}" && BASE_SHA="${BASE}" HEAD_SHA="$1" \
-      ./.github/scripts/enforce-modifiable-surface.sh ) >"${WORK}/gate.out" 2>&1
-}
 
 # ---------------------------------------------------------------------------
-# 1. The surface gate admits an engine edit and still refuses a trusted one.
+# 1. The engine is in the surface: the real manifest lists ds4.
 # ---------------------------------------------------------------------------
-HEAD_DS4="$(commit_edit ds4/ds4.c '/* participant tuning */')"
-if surface_gate "${HEAD_DS4}"; then
-  pass "the surface gate ADMITS a ds4/ engine edit"
-else
-  fail "the surface gate ADMITS a ds4/ engine edit ($(head -2 "${WORK}/gate.out"))"
-fi
-git -C "${SB}" reset --hard --quiet "${BASE}"
-
-HEAD_FIX="$(commit_edit fixtures/contract.json '{"tampered":true}')"
-if surface_gate "${HEAD_FIX}"; then
-  fail "the surface gate REFUSES an edit to fixtures/"
-else
-  pass "the surface gate REFUSES an edit to fixtures/"
-fi
-if grep -q 'outside the modifiable surface' "${WORK}/gate.out"; then
-  pass "the fixtures/ refusal names the modifiable surface"
-else
-  fail "the fixtures/ refusal names the modifiable surface ($(head -2 "${WORK}/gate.out"))"
-fi
-git -C "${SB}" reset --hard --quiet "${BASE}"
-
-# The real manifest is what admitted ds4/: prove the entry is actually there,
-# so case 1 cannot pass because the gate admits everything.
 if grep -q '"ds4"' "${SB}/benchmark.json"; then
-  pass "benchmark.json editablePaths carries ds4 (the gate read the real manifest)"
+  pass "benchmark.json editablePaths carries ds4"
 else
   fail "benchmark.json editablePaths carries ds4"
 fi

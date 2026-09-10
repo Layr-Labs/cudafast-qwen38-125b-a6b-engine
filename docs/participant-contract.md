@@ -102,8 +102,8 @@ signed base the tree was exported from.
 A submission archive has REPLACE semantics over `editablePaths`. An absent head
 declaration means the organizer-pinned head. The overlay therefore skips a missing
 optional path instead of failing closed.
-`.github/scripts/overlay-editable-paths.sh` reads this list from the trusted
-contract, never from the submission.
+Yukon's overlay reads this list from the trusted contract, never from the
+submission.
 
 ### 3.2 The byte budget
 
@@ -269,9 +269,8 @@ back silently.
 You may not ship head weights. The editable byte budget bars them: a real head
 weight file far exceeds `maxFileBytes` (4473321), so
 `.github/scripts/submission-static-review-checks.sh` refuses it before any
-measurement. `.github/scripts/enforce-modifiable-surface.sh` refuses any file
-outside the editable surface, and `.github/scripts/overlay-editable-paths.sh`
-overlays only the declared editable paths from the trusted contract.
+measurement. Yukon overlays only the declared editable paths from the trusted
+contract, and benchd refuses a candidate that diverges outside them.
 `mtp-head/` is an editable path and it holds only its `README.md`, but the byte
 budget still bars a weight file there.
 
