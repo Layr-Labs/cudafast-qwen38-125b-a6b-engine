@@ -951,8 +951,27 @@ __device__ __forceinline__ static void dev_qwen4exp_group_decode(
         const uint16_t d = (uint16_t)((uint8_t)blk[0]) |
                            (uint16_t)((uint16_t)(uint8_t)blk[1] << 8u);
         wa[0] = dev_f16_to_f32(d);
+        const uint8_t *payload = (const uint8_t *)blk + 2u;
+        const uintptr_t address = (uintptr_t)payload;
+        const uint32_t shift = (uint32_t)(address & 3u) * 8u;
+        const uint32_t *words =
+            (const uint32_t *)(const void *)(address - (address & 3u));
+        uint32_t previous = words[0];
 #pragma unroll
-        for (int i = 0; i < 32; i++) wq[i] = (int8_t)blk[2 + i];
+        for (int i = 0; i < 7; i++) {
+            const uint32_t next = words[i + 1];
+            const uint32_t packed = __funnelshift_r(previous, next, shift);
+            wq[i * 4 + 0] = (int8_t)(packed & 0xffu);
+            wq[i * 4 + 1] = (int8_t)((packed >> 8u) & 0xffu);
+            wq[i * 4 + 2] = (int8_t)((packed >> 16u) & 0xffu);
+            wq[i * 4 + 3] = (int8_t)(packed >> 24u);
+            previous = next;
+        }
+        /* The final four bytes are still inside this 34-byte block, but the
+         * next aligned word can extend past it.  Keep that group on the byte
+         * path rather than issue a speculative read into the next row. */
+#pragma unroll
+        for (int i = 28; i < 32; i++) wq[i] = (int8_t)payload[i];
         return;
     }
     case (uint32_t)DS4_QWEN4EXP_TY_q5_1: {
