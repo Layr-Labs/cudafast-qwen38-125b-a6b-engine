@@ -834,9 +834,10 @@ static int mtp_head_time_on(void) {
         }                                                                     \
     } while (0)
 
-/* The forward proper.  `last_only` narrows the readback to the final row:
- * one top-1 id plus its entry-zero logit, and one `hyper` row into multi_out.
- * The logits and their device-side top-1 reduction still run for every row. */
+/* The forward proper.  Seed rows must update the head block's caches, but
+ * their final mixer and vocabulary projections have no consumer when only
+ * the last proposal is requested.  Narrow those stateless operations within
+ * the decode-order envelope; wider diagnostic calls retain their dispatch. */
 static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                                  const int *next_tokens,
                                  const float *multi_in,
@@ -854,6 +855,12 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
     const uint64_t hc_dim = (uint64_t)n_hc * n_embd;
     const uint64_t f = sizeof(float);
     const uint64_t embd_bytes = (uint64_t)n_embd * f;
+    const uint32_t first_row = last_only ? n_tokens - 1u : 0u;
+    const uint32_t out_rows = n_tokens - first_row;
+    const bool narrow_logits = last_only && n_tokens > 1u &&
+        n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT;
+    const uint32_t logit_rows = narrow_logits ? 1u : n_tokens;
+    const uint32_t logit_first = narrow_logits ? 0u : first_row;
     const int timing = mtp_head_time_on();
     uint64_t tmark = timing ? mtp_now_ns() : 0;
 
@@ -946,6 +953,15 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                             pos0, n_tokens) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_BLOCK);
+    /* t_h_normed's previous contents were consumed by eh_proj.  Reuse it for
+     * the final hyper row so the stateless tail needs neither tensor views
+     * nor an extra allocation.  Keep t_hyper intact for multi_out. */
+    if (ok && narrow_logits) {
+        stage = "last head row";
+        ok = ds4_gpu_tensor_copy(h->t_h_normed, 0, h->t_hyper,
+                                  (uint64_t)first_row * hc_dim * f,
+                                  hc_dim * f) != 0;
+    }
     /* The head's own mixer: a gated residual with no inject head, the same
      * shape as the tower's final mixer. */
     if (ok) {
@@ -962,9 +978,10 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
         const ds4_gpu_qwen4exp_slab up_slab = {
             h->head_map, h->head_size, h->hc_head_up_offset, 0, 0, 0 };
         ok = h->hooks.hc_mixer(h->t_sample, NULL, h->t_mix_normed,
-                               h->t_mix_lowrank, h->t_mix_wide, h->t_hyper,
+                               h->t_mix_lowrank, h->t_mix_wide,
+                               narrow_logits ? h->t_h_normed : h->t_hyper,
                                &norm_slab, &down_slab, &up_slab, NULL,
-                               n_embd, n_hc, h->n_lowrank, n_tokens,
+                               n_embd, n_hc, h->n_lowrank, logit_rows,
                                h->rms_eps, h->weight_bias, h->round_bf16) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_MIXER);
@@ -973,7 +990,7 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
         stage = "borrowed lm head";
         ok = h->hooks.matmul_q8_0(h->t_logits, h->target_map, h->target_size,
                                   h->output_offset, n_embd, h->n_vocab,
-                                  h->t_sample, n_tokens) != 0;
+                                  h->t_sample, logit_rows) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_LM_HEAD);
     if (ok) {
@@ -982,22 +999,19 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
          * reduce each finite logit row on the device and read back one id
          * instead of the full vocabulary row for a host scan. */
         ok = ds4_gpu_indexer_topk_tensor(h->t_top1, h->t_logits,
-                                         h->n_vocab, n_tokens, 1u) != 0;
+                                         h->n_vocab, logit_rows, 1u) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_TOP1);
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
     MTP_HEAD_TICK(MTP_HEAD_T_END);
 
-    /* Which results come back: every one, or the last alone.  The rows before
-     * the last are seeds in the last_only case; reducing them is cheap, and
-     * only the final id and its entry-zero logit cross to the host. */
-    const uint32_t first_row = last_only ? n_tokens - 1u : 0u;
-    const uint32_t out_rows = n_tokens - first_row;
+    /* A narrowed projection writes its sole result at logit row zero;
+     * multi_out still reads the original last hyper row. */
     if (ok) {
         stage = "top-1 readback";
         ok = ds4_gpu_tensor_read(h->t_top1,
-                                 (uint64_t)first_row * sizeof(uint32_t),
+                                 (uint64_t)logit_first * sizeof(uint32_t),
                                  h->top1_host,
                                  (uint64_t)out_rows * sizeof(uint32_t)) != 0;
     }
@@ -1006,7 +1020,7 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
         stage = "logit-0 readback";
         for (uint32_t t = 0; ok && t < out_rows; t++) {
             float logit0;
-            const uint64_t row = (uint64_t)first_row + t;
+            const uint64_t row = (uint64_t)logit_first + t;
             ok = ds4_gpu_tensor_read(h->t_logits,
                                      row * h->n_vocab * f,
                                      &logit0, sizeof(logit0)) != 0;
