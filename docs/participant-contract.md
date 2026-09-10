@@ -269,8 +269,8 @@ back silently.
 You may not ship head weights. The editable byte budget bars them: a real head
 weight file far exceeds `maxFileBytes` (4473321), so
 `.github/scripts/submission-static-review-checks.sh` refuses it before any
-measurement. Yukon overlays only the declared editable paths from the trusted
-contract, and benchd refuses a candidate that diverges outside them.
+measurement. Yukon archives and overlays only the declared editable paths from
+the trusted contract, so a file outside them never reaches the measured tree.
 `mtp-head/` is an editable path and it holds only its `README.md`, but the byte
 budget still bars a weight file there.
 

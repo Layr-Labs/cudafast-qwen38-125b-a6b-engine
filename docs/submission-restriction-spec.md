@@ -56,9 +56,9 @@ a submission may CONTAIN and how much of it — are:
 `.github/scripts/hardened-git.sh` supports the static review. The in-repository
 overlay and modifiable-surface gate that this document once extracted (R3, R4)
 were retired on 2026-09-09: neither had a caller on any scoring path. Yukon's
-service overlays the archive, and benchd enforces the surface at scoring (§1).
+service overlays the archive, and it archives only `editablePaths` (§1).
 
-**These four are not the whole submission-restriction surface upstream.** At
+**These files are not the whole submission-restriction surface upstream.** At
 least three further gates are load-bearing against a hostile submission and are
 NOT extracted here; §9 records each as not-ported, with what it would cost to
 be wrong about it:
@@ -69,35 +69,33 @@ be wrong about it:
 | `.github/scripts/pin-trusted-harness.sh` | content pins over the built trusted and worker artifacts | binds every scored phase to the binaries built from the reviewed source, so a submitted transform cannot rewrite the worker after the build |
 | `.github/scripts/deny-private-artifacts.sh` | artifact/cache upload refusal | bounds exfiltration of hidden prompts, goldens and shards through the artifact channel |
 
-The earlier revision of this section claimed the four-file table was the whole
+The earlier revision of this section claimed the file table was the whole
 surface. It was false, and the fail-closed reading is the one written above:
-treat the extracted four as a floor, not a boundary. Nothing in §§2-5 depends on
-the difference — those sections cite the four files directly — but §1's "four
-independent gates" is likewise a statement about what this repository
+treat the extracted files as a floor, not a boundary. Nothing in §§2-5 depends
+on the difference — those sections cite the files directly — but §1's gate
+count is likewise a statement about what this repository
 re-implements, not a census of upstream.
 
 ## 1. Layer map
 
-An untrusted submission passes three gates. One runs in this repository; the
-other two are outside it. Each is fail-closed on its own; none is load-bearing
-alone.
+An untrusted submission passes two gates. One runs in this repository; the
+other is Yukon's. Each is fail-closed on its own.
 
 ```text
-archive ──► Yukon's overlay                REPLACE only editablePaths, read
-            (Yukon's service)              from the trusted contract; an absent
-                                           OPTIONAL path keeps the trusted copy
+archive ──► Yukon's overlay                archives and REPLACES only
+            (Yukon's service)              editablePaths, read from the trusted
+                                           contract; an absent OPTIONAL path
+                                           keeps the trusted copy
    │
-   ├──────► static-review checks           per-file / total / growth byte caps,
+   └──────► static-review checks           per-file / total / growth byte caps,
             (this repository, hosted)      path validation, exempt handling
                                            ── then the LLM bypass judge
-   │
-   └──────► benchd, at scoring             refuses a candidate that diverges
-            (the trust boundary)           from its baseline outside the surface
 ```
 
 The upstream launch-time byte budget (`EditableSurfaceByteBudget`) does not run
-here: this repository carries no Swift package. benchd applies the byte budget
-at scoring.
+here: this repository carries no Swift package. The static review is the one
+enforcer of the byte caps here (`tools/lint-benchmark-manifest.py` check 3b
+drifts against it and nothing else).
 
 The double enforcement of the byte caps is explicit in the original:
 `EditableSurfaceByteBudget.swift@bfab0de:4-13` states that the judge applies the
@@ -244,9 +242,9 @@ missing source files optional."
 
 Retired 2026-09-09. The in-repository re-implementation
 (`.github/scripts/enforce-modifiable-surface.sh`) had no caller on any scoring
-path. What enforces the surface is benchd at scoring: a candidate that diverges
-from its baseline outside `editablePaths` is refused. The rules below describe
-the original for the record.
+path. What bounds the surface is Yukon: it archives and overlays only
+`editablePaths`, so a file outside them never reaches the measured tree. The
+rules below describe the original for the record.
 
 Source: `enforce@bfab0de:1-77` (the original).
 
@@ -369,9 +367,11 @@ permissive mode. Diff-mode selection is unchanged.
 
 **A1 (addition) — the gitlink is untouchable by construction.**
 `tools/lint-benchmark-manifest.py` refuses any editable entry equal to, or
-inside, a trusted-scope path or a gitlink. An editable entry over a gitlink
-would let a submission repoint its own scorer. The original had no submodule to
-protect.
+inside, `benchd`, `.gitmodules`, `benchd.pin` or `benchd-bin`
+(`FORBIDDEN_EDITABLE`). An editable entry over the scorer's pin would let a
+submission repoint its own scorer. The original had no submodule to protect.
+(A general trusted-scope overlap check briefly stood in as linter check 3c and
+was removed 2026-08-30: no unnecessary guards.)
 
 The guard is CASE-FOLDED, and separately checks filesystem identity, so an
 entry spelled in another case names the same real path and is refused. ASCII

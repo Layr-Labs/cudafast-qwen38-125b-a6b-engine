@@ -258,10 +258,10 @@ jobs:
         # grep and bash; no GPU, artifact, lock or Linux.
         run: tools/test-qwen4exp-g1-no-output.sh
 
-      - name: Participant may edit the engine (surface, harness hash, cache, build)
+      - name: Participant may edit the engine (manifest, harness hash, cache, build)
         # THE VENDORING PROOF. ds4/ is participant-editable now, and this is what
-        # keeps that true: the REAL manifest lists ds4; benchd's harness hash
-        # does not move for an
+        # keeps that true: the REAL manifest's editablePaths lists ds4; benchd's
+        # harness hash does not move for an
         # engine edit, does move for a harness edit, and moves for a tools/ edit
         # so the transcribed roster is provably live; and an engine edit changes
         # the build-cache key and still passes the CPU build. Hermetic: no

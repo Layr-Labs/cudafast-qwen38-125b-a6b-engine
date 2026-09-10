@@ -228,8 +228,8 @@ never served from a previous build.
 
 **What is protected.** `benchmark.json`,
 `benchmark.sh`, `fixtures/`, `correctness_prompts/` and `tools/` are the
-contract, the gates and the oracles. Yukon archives only `editablePaths`, and
-benchd refuses a candidate that diverges outside them before it is scored. Code that
+contract, the gates and the oracles. Yukon archives and overlays only
+`editablePaths`, so a change outside them never reaches the measured tree. Code that
 **proposes** tokens or computes the forward pass is editable; code that
 **verifies**, **measures** or **ledgers** is not.
 

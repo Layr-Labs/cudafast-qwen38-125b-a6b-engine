@@ -86,22 +86,21 @@ PY
 # A sandbox repository: the real manifest, a miniature engine.
 # ---------------------------------------------------------------------------
 SB="${WORK}/repo"
-mkdir -p "${SB}/ds4" "${SB}/harness" "${SB}/tools" "${SB}/fixtures"
+mkdir -p "${SB}/ds4" "${SB}/harness" "${SB}/tools"
 # The REAL manifest, so editablePaths is the shipping list and not a fixture.
 cp "${REPO_ROOT}/benchmark.json" "${SB}/benchmark.json"
 printf 'int engine(void) { return 1; }\n' > "${SB}/ds4/ds4.c"
-printf '{"fork":{"sha":"1111111111111111111111111111111111111111"}}\n' > "${SB}/ds4/VENDOR.json"
 printf 'harness\n' > "${SB}/harness/adapter.rs"
 printf 'tool\n' > "${SB}/tools/thing.sh"
-printf '{}\n' > "${SB}/fixtures/contract.json"
 git -C "${SB}" init --quiet
 git -C "${SB}" add -A
 git -C "${SB}" -c user.email=t@t -c user.name=t commit --quiet -m base
 
 # ---------------------------------------------------------------------------
-# 1. The engine is in the surface: the real manifest lists ds4.
+# 1. The engine is in the surface: the real manifest's editablePaths lists ds4
+#    (not merely somewhere in the file, and not only as an optional path).
 # ---------------------------------------------------------------------------
-if grep -q '"ds4"' "${SB}/benchmark.json"; then
+if jq -e '.editablePaths | index("ds4") != null' "${SB}/benchmark.json" >/dev/null; then
   pass "benchmark.json editablePaths carries ds4"
 else
   fail "benchmark.json editablePaths carries ds4"
