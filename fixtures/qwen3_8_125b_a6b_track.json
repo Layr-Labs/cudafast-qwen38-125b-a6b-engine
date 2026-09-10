@@ -23,7 +23,7 @@
     "decode_gain_exponent": 0.75
   },
   "live_golden": "botany",
-  "baseline_reference_commit": "0000000000000000000000000000000000000000",
+  "baseline_reference_commit": "3a4d2b119beeea99b1eb5f825bef459fffd98370",
   "timed_prompt_pool": [
     {
       "r2_path": "correctness_prompts/qwen3.8-125b-a6b-cuda-v1/beagle.golden.json",
