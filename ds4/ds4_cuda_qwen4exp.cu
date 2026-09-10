@@ -1146,18 +1146,24 @@ __global__ static void qwen4exp_quantize_rows_kernel(
     const float *xr = x + (uint64_t)outer * outer_stride +
                       (uint64_t)inner * inner_stride + i0;
 
-    __shared__ float vals[32];
+    /* The only launch site is <<<dim3(groups, rows, 1), 32, 0, stream>>>, so a
+     * block is exactly one warp and the two reductions below are
+     * warp-synchronous.  A shuffle tree pairs lane i with lane i + stride for
+     * the same strides, in the same order, with the same operand order, so the
+     * max and the sum are the values the shared-memory trees returned; the
+     * block barriers they spent on lanes that had already finished are what
+     * goes away.  Every lane of the block reaches here (the early return above
+     * is on blockIdx.x, uniform across the block), so the full mask is the
+     * active set. */
     float a = 0.0f;
     if (threadIdx.x < n) a = fabsf(xr[threadIdx.x]);
-    vals[threadIdx.x] = a;
-    __syncthreads();
+    float m = a;
+#pragma unroll
     for (uint32_t stride = 16u; stride > 0u; stride >>= 1u) {
-        if (threadIdx.x < stride) {
-            vals[threadIdx.x] = fmaxf(vals[threadIdx.x], vals[threadIdx.x + stride]);
-        }
-        __syncthreads();
+        m = fmaxf(m, __shfl_down_sync(0xffffffffu, m, stride));
     }
-    const float d = vals[0] / 127.0f;
+    m = __shfl_sync(0xffffffffu, m, 0);
+    const float d = m / 127.0f;
     const float id = d != 0.0f ? 1.0f / d : 0.0f;
     const uint64_t at = (uint64_t)r * groups + g;
     if (threadIdx.x == 0u) xscale[at] = d;
@@ -1170,14 +1176,12 @@ __global__ static void qwen4exp_quantize_rows_kernel(
     }
     dst[threadIdx.x] = (int8_t)v;
 
-    __shared__ int sums[32];
-    sums[threadIdx.x] = v;
-    __syncthreads();
+    int sv = v;
+#pragma unroll
     for (uint32_t stride = 16u; stride > 0u; stride >>= 1u) {
-        if (threadIdx.x < stride) sums[threadIdx.x] += sums[threadIdx.x + stride];
-        __syncthreads();
+        sv += __shfl_down_sync(0xffffffffu, sv, stride);
     }
-    if (threadIdx.x == 0u) xsum[at] = sums[0];
+    if (threadIdx.x == 0u) xsum[at] = sv;
 }
 
 /* Block-wide sum over blockDim.x threads using a caller-supplied scratch of
