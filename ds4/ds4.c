@@ -54817,6 +54817,8 @@ struct ds4_session {
     ds4_qwen4exp_head_block_ctx qwen4exp_head_ctx;
     bool                       qwen4exp_spec_ready;
     bool                       qwen4exp_spec_failed;
+    int                        qwen4exp_frontier_top1;
+    bool                       qwen4exp_frontier_top1_valid;
 #ifdef DS4_TEST_HOOKS
     /* TEST ONLY.  The synthetic head is random weights, so it drafts the right
      * token about once in n_vocab tries and the ACCEPTING half of the cycle is
@@ -67558,6 +67560,9 @@ static int ds4_session_qwen4exp_rows(ds4_session *s, const int *tokens,
                  (unsigned)n);
         return 1;
     }
+    /* This direct serial forward replaces whatever distribution a preceding
+     * speculative cycle left, so its cached winner is no longer current. */
+    s->qwen4exp_frontier_top1_valid = false;
     int32_t buf[DS4_QWEN4EXP_SERIAL_MAX_ROWS];
     if (n > (uint32_t)(sizeof(buf) / sizeof(buf[0]))) {
         snprintf(err, errlen, "qwen4exp: chunk of %u exceeds the serial buffer",
@@ -67588,6 +67593,7 @@ static int ds4_session_qwen4exp_rows(ds4_session *s, const int *tokens,
  * computation. */
 static int ds4_session_qwen4exp_sync(ds4_session *s, const ds4_tokens *prompt,
                                      char *err, size_t errlen) {
+    s->qwen4exp_frontier_top1_valid = false;
     ds4_engine *e = s->engine;
     const ds4_qwen4exp_session_plan *plan =
         ds4_qwen4exp_session_plan_of(e->qwen4exp_session);
@@ -68658,6 +68664,11 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
 }
 
 int ds4_session_argmax(ds4_session *s) {
+#ifndef DS4_NO_GPU
+    if (s && s->qwen4exp && s->qwen4exp_frontier_top1_valid) {
+        return s->qwen4exp_frontier_top1;
+    }
+#endif
     return sample_argmax(s->logits, DS4_N_VOCAB);
 }
 
@@ -76116,6 +76127,7 @@ static int ds4_session_qwen4exp_spec_cycle(ds4_session *s, int first_token,
                                            int *accepted, int accepted_cap,
                                            char *err, size_t errlen) {
     ds4_engine *e = s->engine;
+    s->qwen4exp_frontier_top1_valid = false;
     if (!ds4_session_qwen4exp_spec_init(s, err, errlen)) return -1;
     const uint32_t pos = ds4_qwen4exp_session_pos(e->qwen4exp_session);
     /* s->logits, not a scratch buffer.  The cycle leaves the distribution for
@@ -76128,6 +76140,12 @@ static int ds4_session_qwen4exp_spec_cycle(ds4_session *s, int first_token,
                                          first_token, pos, max_tokens,
                                          accepted, accepted_cap, s->logits,
                                          err, errlen);
+    if (n > 0 && s->qwen4exp_spec.frontier_top1_valid) {
+        s->qwen4exp_frontier_top1 = s->qwen4exp_spec.frontier_top1;
+        s->qwen4exp_frontier_top1_valid = true;
+    } else {
+        s->qwen4exp_frontier_top1_valid = false;
+    }
     /* Push what the round committed, the way every sibling verifier does.  The
      * serial path appends inside the forward, but the cycle's rows go through
      * the seam, so without this ds4_session_pos() freezes at the prompt length
@@ -78024,6 +78042,7 @@ void ds4_session_invalidate(ds4_session *s) {
          * pending_parent would verify against it and commit two tokens while
          * the caller believes nothing was drafted. */
         ds4_qwen4exp_mtp_invalidate(&s->qwen4exp_spec);
+        s->qwen4exp_frontier_top1_valid = false;
         s->checkpoint_valid = false;
         s->checkpoint.len = 0;
         return;

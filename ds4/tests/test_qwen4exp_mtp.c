@@ -355,6 +355,13 @@ static int ref_read_logit_row(void *ctx, uint32_t row, float *logits) {
     return 0;
 }
 
+static int ref_read_logit_row_nonfinite(void *ctx, uint32_t row,
+                                        float *logits) {
+    if (ref_read_logit_row(ctx, row, logits) != 0) return -1;
+    logits[0] = NAN;
+    return 0;
+}
+
 static int ref_decode_token(void *ctx, int token, uint32_t pos,
                             float *hc_row, float *logits) {
     refmodel *m = ctx;
@@ -782,6 +789,13 @@ static int run_mtp(int first_token, int n, int *out, mtp_run *run,
         for (int i = 1; i < got; i++) out[produced++] = committed[i];
         const int fed = pending;
         pending = ds4_qwen4exp_mtp_argmax(logits, REF_VOCAB);
+        if (verify_before != m.n_verify &&
+            (!st.frontier_top1_valid || st.frontier_top1 != pending)) {
+            snprintf(run->err, sizeof(run->err),
+                     "cycle cached frontier %d (valid=%d), host logits chose %d",
+                     st.frontier_top1, st.frontier_top1_valid ? 1 : 0, pending);
+            run->faulted = 1; rc = -1; free(pre); break;
+        }
         out[produced++] = pending;
 
         /*
@@ -1220,6 +1234,8 @@ static void test_head_cache_boundary(void) {
          */
         const uint32_t back = pos / 2u;
         ds4_qwen4exp_mtp_invalidate(&st);
+        CHECK(!st.frontier_top1_valid,
+              "invalidate retained the previous frontier winner");
         for (int i = 0; i < DS4_QWEN4EXP_STATE_COUNT; i++) {
             const ds4_qwen4exp_rollback_object *o = &set.obj[i];
             if (o->truncate) (void)o->truncate(o->ctx, back);
@@ -1486,9 +1502,49 @@ static void test_budget(void) {
         if (got != 1) break;
         pos += 1;
         pending = ds4_qwen4exp_mtp_argmax(logits, REF_VOCAB);
+        CHECK(!st.frontier_top1_valid,
+              "budget-1 fallback incorrectly exposed a compact GPU winner");
     }
     CHECK(st.counters.drafted == 0, "a budget of 1 drafted %llu times",
           (unsigned long long)st.counters.drafted);
+    ds4_qwen4exp_mtp_state_free(&st);
+}
+
+/* Only the compact finite-row path may advertise a reusable GPU winner.
+ * Ordinary one-row fallback and nonfinite distributions retain the session's
+ * original host argmax behavior. */
+static void test_frontier_cache_eligibility(void) {
+    printf("frontier top-1 cache eligibility\n");
+    refmodel m;
+    ds4_qwen4exp_mtp_model model;
+    ds4_qwen4exp_rollback_set set;
+    ds4_qwen4exp_mtp_state st;
+    ref_reset(&m, BREAK_NONE, 0);
+    CHECK(ref_build(&m, &model, &set) == 0, "reference build failed");
+    CHECK(ds4_qwen4exp_mtp_state_init(&st, 1, &set, REF_HC_DIM, REF_VOCAB,
+                                      g_err, sizeof(g_err)) == 0,
+          "state init failed: %s", g_err);
+
+    float logits[REF_VOCAB];
+    int committed[DS4_QWEN4EXP_MTP_MAX_COMMIT];
+    CHECK(ds4_qwen4exp_mtp_cycle(&st, &model, 3, 0, 2, committed, 2,
+                                 logits, g_err, sizeof(g_err)) == 1,
+          "plain first cycle failed: %s", g_err);
+    CHECK(!st.frontier_top1_valid,
+          "plain one-row cycle advertised a compact GPU winner");
+
+    const int pending = ds4_qwen4exp_mtp_argmax(logits, REF_VOCAB);
+    const uint64_t verify_before = m.n_verify;
+    model.read_logit_row = ref_read_logit_row_nonfinite;
+    const int got = ds4_qwen4exp_mtp_cycle(&st, &model, pending, 1, 2,
+                                           committed, 2, logits,
+                                           g_err, sizeof(g_err));
+    CHECK(got > 0, "nonfinite compact cycle failed: %s", g_err);
+    CHECK(m.n_verify == verify_before + 1,
+          "nonfinite case did not exercise the compact verify seam");
+    CHECK(isnan(logits[0]), "nonfinite frontier fixture did not reach the cycle");
+    CHECK(!st.frontier_top1_valid,
+          "nonfinite frontier advertised a cached winner");
     ds4_qwen4exp_mtp_state_free(&st);
 }
 
@@ -2153,6 +2209,8 @@ int main(void) {
     test_rollback_contract();
     printf("\n");
     test_budget();
+    printf("\n");
+    test_frontier_cache_eligibility();
     printf("\n");
     test_head_wiring();
     printf("\n");

@@ -439,6 +439,11 @@ typedef struct {
     float   *logits_rows;    /* MAX_COMMIT rows of n_vocab                  */
     uint32_t hc_dim;
     uint32_t n_vocab;
+    /* The greedy winner of the finite frontier distribution a compact verify
+     * left in `logits`.  Exposing the GPU result lets the session avoid
+     * scanning the same full row again; validity is conservative otherwise. */
+    int      frontier_top1;
+    bool     frontier_top1_valid;
     ds4_qwen4exp_mtp_counters counters;
 } ds4_qwen4exp_mtp_state;
 

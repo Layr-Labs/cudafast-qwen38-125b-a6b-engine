@@ -5,6 +5,7 @@
 
 #include "ds4_qwen4exp_mtp.h"
 
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -259,6 +260,7 @@ void ds4_qwen4exp_mtp_invalidate(ds4_qwen4exp_mtp_state *st) {
     for (int k = 0; k < DS4_QWEN4EXP_IMPLEMENTED_DEPTH; k++) st->pending[k] = -1;
     st->n_pending = 0;
     st->pending_parent = -1;
+    st->frontier_top1_valid = false;
 }
 
 int ds4_qwen4exp_mtp_counters_check(const ds4_qwen4exp_mtp_counters *c,
@@ -547,6 +549,7 @@ int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
                         model->hc_dim, model->n_vocab, st->hc_dim, st->n_vocab);
     }
     st->counters.rounds += 1;
+    st->frontier_top1_valid = false;
 
     /* A chain belongs to the token it was drafted from.  Anything else -- a
      * rewind, a different sampled token -- makes the whole chain stale, not
@@ -649,6 +652,15 @@ int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
                             err, errlen) != 0) {
             return -1;
         }
+        /* The compact reducer and the session's host argmax agree for an
+         * ordinary finite row. Leave the cache invalid for exceptional rows
+         * so the public session API retains its original scan semantics. */
+        if (compact_logits && next_fed >= 0 &&
+            (uint32_t)next_fed < st->n_vocab &&
+            isfinite(logits[0]) && isfinite(logits[next_fed])) {
+            st->frontier_top1 = next_fed;
+            st->frontier_top1_valid = true;
+        }
         return n + 1;
     }
 
@@ -682,6 +694,12 @@ int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
     if (mtp_draft_chain(st, model, hc, toks, a, pos, first_mismatch,
                         err, errlen) != 0) {
         return -1;
+    }
+    if (compact_logits && first_mismatch >= 0 &&
+        (uint32_t)first_mismatch < st->n_vocab &&
+        isfinite(logits[0]) && isfinite(logits[first_mismatch])) {
+        st->frontier_top1 = first_mismatch;
+        st->frontier_top1_valid = true;
     }
     return a + 1;
 }
