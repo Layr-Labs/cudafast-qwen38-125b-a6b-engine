@@ -913,6 +913,7 @@ static void run_row_invariance_case(const uint8_t *model,
         }
         float *reference_scan = calloc((size_t)w * OUT_DIM, sizeof(float));
         if (!reference_scan) fail("reference group-scan comparison allocation");
+        setenv("DS4_QWEN4EXP_NO_DIRECT_PAIRS", "1", 1);
         setenv("DS4_QWEN4EXP_SERIAL_GROUP_SCAN", "1", 1);
         require_ok(ds4_gpu_qwen4exp_routed_moe_tensor(
                        out_t, mid_t, part_t, &gate_slab, &up_slab, &down_slab,
@@ -929,11 +930,12 @@ static void run_row_invariance_case(const uint8_t *model,
                        (uint64_t)w * OUT_DIM * sizeof(float)),
                    "reference group-scan read");
         unsetenv("DS4_QWEN4EXP_SERIAL_GROUP_SCAN");
+        unsetenv("DS4_QWEN4EXP_NO_DIRECT_PAIRS");
         if (memcmp(got, reference_scan,
                    (size_t)w * OUT_DIM * sizeof(float)) != 0) {
-            fail("parallel group scan differs from the reference metadata scan");
+            fail("direct pairs differ from the reference grouped path");
         }
-        printf("  parallel group scan output matches reference at width %u\n", w);
+        printf("  direct pairs match the reference grouped path at width %u\n", w);
         free(reference_scan);
         free(got);
     }

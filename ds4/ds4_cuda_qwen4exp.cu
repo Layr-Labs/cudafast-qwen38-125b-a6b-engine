@@ -1217,6 +1217,84 @@ __global__ static void qwen4exp_router_select_kernel(
     const float *lg = logits + (uint64_t)tok * n_expert;
     int32_t *sel = selected + (uint64_t)tok * n_expert_used;
     float *w = weights_out + (uint64_t)tok * n_expert_used;
+    const uint32_t k_used = min(n_expert_used, n_expert);
+
+    /* The model asks for ten of 512 experts.  Sorting all 512 entries with a
+     * 45-barrier bitonic network does substantially more work than selecting
+     * those ten.  For a small top-k, reduce the best remaining (score,index)
+     * pair once per output slot.  The comparison is exactly the sort's:
+     * greater score first, with the lower expert index winning a tie. */
+    if (k_used <= 32u) {
+        __shared__ float warp_v[16];
+        __shared__ int32_t warp_i[16];
+        __shared__ int32_t chosen;
+        const uint32_t lane = tid & 31u;
+        const uint32_t warp = tid >> 5u;
+        const uint32_t nwarp = width >> 5u;
+        bool live = tid < n_expert;
+
+        for (uint32_t rank = 0; rank < k_used; rank++) {
+            float best_v = live ? lg[tid] : -FLT_MAX;
+            int32_t best_i = live ? (int32_t)tid : INT32_MAX;
+#pragma unroll
+            for (uint32_t off = 16u; off > 0u; off >>= 1u) {
+                const float other_v =
+                    __shfl_down_sync(0xffffffffu, best_v, off);
+                const int32_t other_i =
+                    __shfl_down_sync(0xffffffffu, best_i, off);
+                if (other_v > best_v ||
+                    (other_v == best_v && other_i < best_i)) {
+                    best_v = other_v;
+                    best_i = other_i;
+                }
+            }
+            if (lane == 0u) {
+                warp_v[warp] = best_v;
+                warp_i[warp] = best_i;
+            }
+            __syncthreads();
+
+            if (warp == 0u) {
+                best_v = lane < nwarp ? warp_v[lane] : -FLT_MAX;
+                best_i = lane < nwarp ? warp_i[lane] : INT32_MAX;
+#pragma unroll
+                for (uint32_t off = 16u; off > 0u; off >>= 1u) {
+                    const float other_v =
+                        __shfl_down_sync(0xffffffffu, best_v, off);
+                    const int32_t other_i =
+                        __shfl_down_sync(0xffffffffu, best_i, off);
+                    if (other_v > best_v ||
+                        (other_v == best_v && other_i < best_i)) {
+                        best_v = other_v;
+                        best_i = other_i;
+                    }
+                }
+                if (lane == 0u) {
+                    chosen = best_i;
+                    sel[rank] = best_i;
+                }
+            }
+            __syncthreads();
+            if ((int32_t)tid == chosen) live = false;
+        }
+
+        if (tid == 0u) {
+            float m = -FLT_MAX;
+            for (uint32_t i = 0; i < k_used; i++) {
+                const float v = lg[(uint32_t)sel[i]];
+                if (v > m) m = v;
+            }
+            float sum = 0.0f;
+            for (uint32_t i = 0; i < k_used; i++) {
+                const float e = expf(lg[(uint32_t)sel[i]] - m);
+                w[i] = e;
+                sum += e;
+            }
+            const float inv = 1.0f / sum;
+            for (uint32_t i = 0; i < k_used; i++) w[i] *= inv;
+        }
+        return;
+    }
 
     /* Padding lanes sit below every real logit and past every top-k slot.
      * The Metal twin pads with -INFINITY; nvcc builds with --use_fast_math, so
@@ -1248,7 +1326,6 @@ __global__ static void qwen4exp_router_select_kernel(
         }
     }
 
-    const uint32_t k_used = min(n_expert_used, n_expert);
     if (tid < k_used) sel[tid] = sh_i[tid];
     __syncthreads();
 
@@ -2059,6 +2136,80 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
     }
 }
 
+/* Small decode/verify widths have at most seven rows and almost never choose
+ * the same expert twice.  Building counts, offsets, cursors and a scattered
+ * pair list costs five launches before the projection can start, but provides
+ * no useful weight reuse in that shape.  Give each (token,slot) pair directly
+ * to one block row instead.  The warp still walks the same weight groups in
+ * ascending order, uses the same two accumulators and the same reduction, so
+ * the value written for a pair is the grouped kernel's R=8 value. */
+__global__ static void qwen4exp_moe_gateup_direct_kernel(
+        float *mid,
+        const char *gate,
+        const char *up,
+        const int8_t *xq,
+        const float *xs,
+        const int32_t *xsum,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint64_t up_expert_bytes,
+        uint64_t up_row_bytes,
+        uint32_t gate_type,
+        uint32_t up_type,
+        uint32_t groups,
+        uint32_t mid_dim,
+        uint32_t mid_token_stride,
+        uint32_t n_total_expert,
+        uint32_t n_expert_used,
+        uint32_t n_pairs) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t row = blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t p = blockIdx.y;
+    if (row >= mid_dim || p >= n_pairs) return;
+
+    const uint32_t token = p / n_expert_used;
+    const uint32_t slot = p - token * n_expert_used;
+    const int32_t expert_i = selected[p];
+    if (expert_i < 0 || (uint32_t)expert_i >= n_total_expert) {
+        if (lane == 0u) {
+            mid[(uint64_t)token * mid_token_stride +
+                (uint64_t)slot * mid_dim + row] = 0.0f;
+        }
+        return;
+    }
+    const uint32_t expert = (uint32_t)expert_i;
+    const char *gate_row = gate + (uint64_t)expert * gate_expert_bytes +
+                           (uint64_t)row * gate_row_bytes;
+    const char *up_row = up + (uint64_t)expert * up_expert_bytes +
+                         (uint64_t)row * up_row_bytes;
+
+    float ag = 0.0f;
+    float au = 0.0f;
+    for (uint32_t g = lane; g < groups; g += 32u) {
+        int8_t gw[32], uw[32];
+        float ga[2], gb[2], ua[2], ub[2];
+        int gh = 1, uh = 1;
+        dev_qwen4exp_group_decode(gate_type, gate_row, g, gw, ga, gb, &gh);
+        dev_qwen4exp_group_decode(up_type, up_row, g, uw, ua, ub, &uh);
+        const uint64_t at_g = (uint64_t)token * groups + g;
+        const int8_t *xqg = xq + at_g * 32u;
+        const float sc = xs[at_g];
+        const int32_t sm = xsum[at_g];
+        qwen4exp_group_accumulate(&ag, gw, ga, gb, gh, xqg, sc, sm);
+        qwen4exp_group_accumulate(&au, uw, ua, ub, uh, xqg, sc, sm);
+    }
+
+    const float g = warp_sum_f32(ag);
+    const float u = warp_sum_f32(au);
+    if (lane == 0u) {
+        mid[(uint64_t)token * mid_token_stride +
+            (uint64_t)slot * mid_dim + row] =
+            (g / (1.0f + expf(-g))) * u * weights[p];
+    }
+}
+
 /* Grid (ceil(out_dim / 8), ceil(n_tokens / R)).  The slots of a token are
  * walked in ascending order into ONE accumulator, which is what the per-token
  * kernel did; the rows of the tile do not share a weight here, because each
@@ -2794,31 +2945,40 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     cudaStream_t stream = cuda_decode_stream();
     const unsigned threads = 256u;
     const unsigned pair_blocks = (n_pairs + threads - 1u) / threads;
+    const int direct_pairs =
+        n_tokens < 8u && getenv("DS4_QWEN4EXP_NO_DIRECT_PAIRS") == NULL &&
+        getenv("DS4_QWEN4EXP_MOE_R") == NULL;
 
-    if (!cuda_ok(cudaMemsetAsync(sc.counts, 0,
-                                 (size_t)n_total_expert * sizeof(int32_t),
-                                 stream),
-                 "qwen4exp MoE group counts reset")) {
-        return 0;
+    if (!direct_pairs) {
+        if (!cuda_ok(cudaMemsetAsync(sc.counts, 0,
+                                     (size_t)n_total_expert * sizeof(int32_t),
+                                     stream),
+                     "qwen4exp MoE group counts reset")) {
+            return 0;
+        }
+        qwen4exp_moe_group_count_kernel<<<pair_blocks, threads, 0, stream>>>(
+                sc.counts, (const int32_t *)selected->ptr,
+                n_total_expert, n_pairs);
+        if (n_total_expert <= QWEN4EXP_MOE_SCAN_THREADS &&
+            getenv("DS4_QWEN4EXP_SERIAL_GROUP_SCAN") == NULL) {
+            qwen4exp_moe_group_scan_parallel_kernel<<<
+                    1, QWEN4EXP_MOE_SCAN_THREADS, 0, stream>>>(
+                    sc.offsets, sc.cursor, sc.active, sc.counts,
+                    n_total_expert);
+        } else {
+            qwen4exp_moe_group_scan_kernel<<<1, 32, 0, stream>>>(
+                    sc.offsets, sc.cursor, sc.active, sc.counts,
+                    n_total_expert);
+        }
+        qwen4exp_moe_group_scatter_kernel<<<pair_blocks, threads, 0, stream>>>(
+                sc.pairs, sc.cursor, (const int32_t *)selected->ptr,
+                n_total_expert, n_pairs);
+        qwen4exp_moe_zero_invalid_kernel<<<n_pairs, threads, 0, stream>>>(
+                (float *)mid->ptr, (const int32_t *)selected->ptr,
+                n_total_expert, n_expert_used, mid_dim, mid_token_stride,
+                n_pairs);
+        if (!cuda_ok(cudaGetLastError(), "qwen4exp MoE pair list")) return 0;
     }
-    qwen4exp_moe_group_count_kernel<<<pair_blocks, threads, 0, stream>>>(
-            sc.counts, (const int32_t *)selected->ptr, n_total_expert, n_pairs);
-    if (n_total_expert <= QWEN4EXP_MOE_SCAN_THREADS &&
-        getenv("DS4_QWEN4EXP_SERIAL_GROUP_SCAN") == NULL) {
-        qwen4exp_moe_group_scan_parallel_kernel<<<
-                1, QWEN4EXP_MOE_SCAN_THREADS, 0, stream>>>(
-                sc.offsets, sc.cursor, sc.active, sc.counts, n_total_expert);
-    } else {
-        qwen4exp_moe_group_scan_kernel<<<1, 32, 0, stream>>>(
-                sc.offsets, sc.cursor, sc.active, sc.counts, n_total_expert);
-    }
-    qwen4exp_moe_group_scatter_kernel<<<pair_blocks, threads, 0, stream>>>(
-            sc.pairs, sc.cursor, (const int32_t *)selected->ptr, n_total_expert,
-            n_pairs);
-    qwen4exp_moe_zero_invalid_kernel<<<n_pairs, threads, 0, stream>>>(
-            (float *)mid->ptr, (const int32_t *)selected->ptr,
-            n_total_expert, n_expert_used, mid_dim, mid_token_stride, n_pairs);
-    if (!cuda_ok(cudaGetLastError(), "qwen4exp MoE pair list")) return 0;
 
     if (!qwen4exp_quantize_rows(sc.xq, sc.xs, sc.xsum, (const float *)x->ptr,
                                 n_tokens, in_dim, xgroups, in_dim, 0, 1,
@@ -2864,7 +3024,18 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             up_slab->expert_bytes, up_slab->row_bytes, \
             gate_slab->type, up_slab->type, xgroups, mid_dim, \
             mid_token_stride, n_expert_used)
-    if (use_mma) {
+    if (direct_pairs) {
+        qwen4exp_moe_gateup_direct_kernel<<<
+                dim3((mid_dim + 7u) / 8u, n_pairs, 1), threads, 0, stream>>>(
+                (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum,
+                (const int32_t *)selected->ptr,
+                (const float *)weights->ptr,
+                gate_slab->expert_bytes, gate_slab->row_bytes,
+                up_slab->expert_bytes, up_slab->row_bytes,
+                gate_slab->type, up_slab->type, xgroups, mid_dim,
+                mid_token_stride, n_total_expert, n_expert_used, n_pairs);
+    }
+    else if (use_mma) {
         qwen4exp_moe_gateup_mma_kernel<<<
                 dim3(mid_dim / QW_MMA_BM, gu_rows, 1),
                 QW_MMA_THREADS, 0, stream>>>(
