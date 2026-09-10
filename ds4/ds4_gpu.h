@@ -3661,6 +3661,18 @@ int ds4_gpu_qwen4exp_embed_tokens_hc_tensor(
         uint32_t              n_embd,
         uint32_t              n_hc);
 
+/* CUDA's MTP head packs all [embedding | hidden-stream] rows in one launch.
+ * Other backends may leave the optional MTP hook unbound and use tensor
+ * copies, so this entry is implemented only by the CUDA Qwen translation
+ * unit. */
+int ds4_gpu_qwen4exp_ehx_pack_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *embedding,
+        const ds4_gpu_tensor *hidden,
+        uint32_t              n_tokens,
+        uint32_t              n_hc,
+        uint32_t              n_embd);
+
 /* =========================================================================
  * Qwen4exp per-layer embedding (PLE) block.
  * =========================================================================

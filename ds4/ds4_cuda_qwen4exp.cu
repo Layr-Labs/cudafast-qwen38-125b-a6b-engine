@@ -1776,6 +1776,7 @@ __device__ __forceinline__ static void qw_mma_m16n8k32(
 }
 
 /* Grid (mid_dim / BM, the experts this call chose). */
+template <int GateType = -1, int UpType = -1>
 __global__ __launch_bounds__(QW_MMA_THREADS) static void
 qwen4exp_moe_gateup_mma_kernel(
         float *mid,
@@ -1851,13 +1852,15 @@ qwen4exp_moe_gateup_mma_kernel(
                 int halves = 1;
                 const uint32_t mrow = row0 + r;
                 if (mrow < mid_dim && g < groups) {
-                    dev_qwen4exp_group_decode(gate_type,
+                    dev_qwen4exp_group_decode(
+                            GateType < 0 ? gate_type : (uint32_t)GateType,
                             gate_e + (uint64_t)mrow * gate_row_bytes, g,
                             wq, wa, wb, &halves);
                     qw_tile_store_group(&sAg[r * QW_MMA_LD + gg * 32], wq);
                     sWAg[r * QW_MMA_G + gg] = wa[0];
                     sWBg[r * QW_MMA_G + gg] = wb[0];
-                    dev_qwen4exp_group_decode(up_type,
+                    dev_qwen4exp_group_decode(
+                            UpType < 0 ? up_type : (uint32_t)UpType,
                             up_e + (uint64_t)mrow * up_row_bytes, g,
                             wq, wa, wb, &halves);
                     qw_tile_store_group(&sAu[r * QW_MMA_LD + gg * 32], wq);
@@ -1910,6 +1913,11 @@ qwen4exp_moe_gateup_mma_kernel(
                 const uint32_t m1 = m0 + 8u;
 #pragma unroll
                 for (int nt = 0; nt < QW_MMA_NT; nt++) {
+                    /* An MMA column covers eight pairs.  Expert tails often
+                     * occupy only one or two columns; whole empty columns
+                     * have no consumer.  take is block-uniform, so all lanes
+                     * still participate in every live MMA instruction. */
+                    if (nt * 8 >= take) break;
                     const uint32_t bn = nt * 8u + (lane >> 2);
 #pragma unroll
                     for (int r = 0; r < 2; r++) {
@@ -1983,6 +1991,7 @@ qwen4exp_moe_gateup_mma_kernel(
  * The activation is the routed intermediate, quantised per (token, slot) pair,
  * so the pair index addresses it directly.
  */
+template <int DownType = -1>
 __global__ __launch_bounds__(QW_MMA_THREADS) static void
 qwen4exp_moe_down_mma_kernel(
         float *partial,
@@ -2043,7 +2052,8 @@ qwen4exp_moe_down_mma_kernel(
                 float wa[2], wb[2];
                 int halves = 1;
                 if (orow < out_dim && g < groups) {
-                    dev_qwen4exp_group_decode(down_type,
+                    dev_qwen4exp_group_decode(
+                            DownType < 0 ? down_type : (uint32_t)DownType,
                             down_e + (uint64_t)orow * down_row_bytes, g,
                             wq, wa, wb, &halves);
                     qw_tile_store_group(&sA[r * QW_MMA_LD + gg * 32], wq);
@@ -2090,6 +2100,11 @@ qwen4exp_moe_down_mma_kernel(
                 const uint32_t m0 = warp * 16u + (lane >> 2);
 #pragma unroll
                 for (int nt = 0; nt < QW_MMA_NT; nt++) {
+                    /* An MMA column covers eight pairs.  Expert tails often
+                     * occupy only one or two columns; whole empty columns
+                     * have no consumer.  take is block-uniform, so all lanes
+                     * still participate in every live MMA instruction. */
+                    if (nt * 8 >= take) break;
                     const uint32_t bn = nt * 8u + (lane >> 2);
 #pragma unroll
                     for (int r = 0; r < 2; r++) {
@@ -2161,7 +2176,9 @@ __global__ static void qwen4exp_moe_down_combine_kernel(
 /* Grid (ceil(mid_dim / 8), n_expert).  The block owns one expert; the pair
  * list gives it the (token, slot) pairs that chose it, so a decoded group
  * serves R of them. */
-template <int R>
+/* Common slab formats get compile-time decoders below.  Keeping the
+ * generic instantiation preserves every supported format combination. */
+template <int R, int GateType = -1, int UpType = -1>
 __global__ static void qwen4exp_moe_gateup_q_kernel(
         float *mid,
         const char *gate,
@@ -2222,8 +2239,12 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
             int8_t gw[32], uw[32];
             float ga[2], gb[2], ua[2], ub[2];
             int gh = 1, uh = 1;
-            dev_qwen4exp_group_decode(gate_type, gate_row, g, gw, ga, gb, &gh);
-            dev_qwen4exp_group_decode(up_type, up_row, g, uw, ua, ub, &uh);
+            dev_qwen4exp_group_decode(
+                    GateType < 0 ? gate_type : (uint32_t)GateType,
+                    gate_row, g, gw, ga, gb, &gh);
+            dev_qwen4exp_group_decode(
+                    UpType < 0 ? up_type : (uint32_t)UpType,
+                    up_row, g, uw, ua, ub, &uh);
 #pragma unroll
             for (int r = 0; r < R; r++) {
                 if (r < take) {
@@ -2258,7 +2279,7 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
  * kernel did; the rows of the tile do not share a weight here, because each
  * one picked its own expert for the slot.  What the tile buys is that the
  * activation groups are read once for R rows and the decode is per group. */
-template <int R>
+template <int R, int DownType = -1>
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
@@ -2300,8 +2321,9 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                     int8_t wq[32];
                     float wa[2], wb[2];
                     int halves = 1;
-                    dev_qwen4exp_group_decode(down_type, drow, g, wq, wa, wb,
-                                              &halves);
+                    dev_qwen4exp_group_decode(
+                            DownType < 0 ? down_type : (uint32_t)DownType,
+                            drow, g, wq, wa, wb, &halves);
                     const uint64_t at_g = mrow * groups + g;
                     qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves,
                                               mq + at_g * 32u, ms[at_g],
@@ -2993,6 +3015,51 @@ extern "C" int ds4_gpu_qwen4exp_router_select_tensor(
     }
     return cuda_ok(cudaGetLastError(), "qwen4exp router select launch");
 }
+/* The MTP head forms n_hc rows [e_normed(t) | h_normed(t,s)] before its
+ * eh_proj.  At the production shape the portable implementation records eight
+ * short device copies for every one-row head step.  The rows are pure copies,
+ * so one flat kernel produces the identical layout while paying one launch. */
+__global__ static void qwen4exp_ehx_pack_kernel(
+        float *out, const float *embedding, const float *hidden,
+        uint32_t n_hc, uint32_t n_embd) {
+    const uint64_t pair = blockIdx.x;
+    const uint32_t t = (uint32_t)(pair / n_hc);
+    const uint64_t dst = pair * 2ull * n_embd;
+    const uint64_t e_src = (uint64_t)t * n_embd;
+    const uint64_t h_src = pair * n_embd;
+    for (uint32_t k = threadIdx.x; k < n_embd; k += blockDim.x) {
+        out[dst + k] = embedding[e_src + k];
+        out[dst + n_embd + k] = hidden[h_src + k];
+    }
+}
+
+extern "C" int ds4_gpu_qwen4exp_ehx_pack_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *embedding,
+        const ds4_gpu_tensor *hidden,
+        uint32_t              n_tokens,
+        uint32_t              n_hc,
+        uint32_t              n_embd) {
+    if (!out || !embedding || !hidden || n_tokens == 0u || n_hc == 0u ||
+        n_embd == 0u) {
+        return 0;
+    }
+    const uint64_t pairs = (uint64_t)n_tokens * n_hc;
+    const uint64_t total = pairs * 2ull * n_embd;
+    if (out->bytes < total * sizeof(float) ||
+        embedding->bytes < (uint64_t)n_tokens * n_embd * sizeof(float) ||
+        hidden->bytes < pairs * n_embd * sizeof(float)) {
+        fprintf(stderr, "ds4: CUDA qwen4exp ehx pack received undersized buffers\n");
+        return 0;
+    }
+    const unsigned threads = 256u;
+    qwen4exp_ehx_pack_kernel<<<
+            (unsigned)pairs, threads, 0,
+            cuda_decode_stream()>>>(
+            (float *)out->ptr, (const float *)embedding->ptr,
+            (const float *)hidden->ptr, n_hc, n_embd);
+    return cuda_ok(cudaGetLastError(), "qwen4exp ehx pack launch");
+}
 /* Scratch for one expert call: the pair list, then the Q8_0 form of the
  * activation the projections consume.  Laid out here so the sizes are visible
  * beside the kernels that read them.
@@ -3232,8 +3299,8 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         : (n_pairs < n_total_expert ? n_pairs : n_total_expert);
     const int32_t *gu_active = compact ? sc.active : NULL;
     const dim3 gu_grid((mid_dim + 7u) / 8u, gu_rows, 1);
-#define QWEN4EXP_GATEUP(R) \
-    qwen4exp_moe_gateup_q_kernel<R><<<gu_grid, threads, 0, stream>>>( \
+#define QWEN4EXP_GATEUP_IMPL(R, GT, UT) \
+    qwen4exp_moe_gateup_q_kernel<R, GT, UT><<<gu_grid, threads, 0, stream>>>( \
             (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum, \
             sc.pairs, sc.counts, sc.offsets, gu_active, \
             (const float *)weights->ptr, \
@@ -3241,22 +3308,49 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             up_slab->expert_bytes, up_slab->row_bytes, \
             gate_slab->type, up_slab->type, xgroups, mid_dim, \
             mid_token_stride, n_expert_used)
+    /* Resolve the format once on the host, where tensor metadata already
+     * lives.  This exposes fixed nibble decoding and a fixed one-half
+     * accumulation to nvcc, without converting or copying any weight. */
+    const bool specialize = getenv("DS4_QWEN4EXP_GENERIC_EXPERTS") == NULL;
+#define QWEN4EXP_GATEUP(R) do { \
+    if (specialize && gate_slab->type == DS4_QWEN4EXP_TY_q4_K && \
+                      up_slab->type == DS4_QWEN4EXP_TY_q4_K) { \
+        QWEN4EXP_GATEUP_IMPL(R, DS4_QWEN4EXP_TY_q4_K, DS4_QWEN4EXP_TY_q4_K); \
+    } else if (specialize && gate_slab->type == DS4_QWEN4EXP_TY_q8_0 && \
+                             up_slab->type == DS4_QWEN4EXP_TY_q8_0) { \
+        QWEN4EXP_GATEUP_IMPL(R, DS4_QWEN4EXP_TY_q8_0, DS4_QWEN4EXP_TY_q8_0); \
+    } else { \
+        QWEN4EXP_GATEUP_IMPL(R, -1, -1); \
+    } \
+} while (0)
     if (use_mma) {
-        qwen4exp_moe_gateup_mma_kernel<<<
-                dim3(mid_dim / QW_MMA_BM, gu_rows, 1),
-                QW_MMA_THREADS, 0, stream>>>(
-                (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum,
-                sc.pairs, sc.counts, sc.offsets, gu_active,
-                (const float *)weights->ptr,
-                gate_slab->expert_bytes, gate_slab->row_bytes,
-                up_slab->expert_bytes, up_slab->row_bytes,
-                gate_slab->type, up_slab->type, xgroups, mid_dim,
-                mid_token_stride, n_expert_used);
+#define QWEN4EXP_GATEUP_MMA(GT, UT) \
+        qwen4exp_moe_gateup_mma_kernel<GT, UT><<< \
+                dim3(mid_dim / QW_MMA_BM, gu_rows, 1), \
+                QW_MMA_THREADS, 0, stream>>>( \
+                (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum, \
+                sc.pairs, sc.counts, sc.offsets, gu_active, \
+                (const float *)weights->ptr, \
+                gate_slab->expert_bytes, gate_slab->row_bytes, \
+                up_slab->expert_bytes, up_slab->row_bytes, \
+                gate_slab->type, up_slab->type, xgroups, mid_dim, \
+                mid_token_stride, n_expert_used)
+        if (specialize && gate_slab->type == DS4_QWEN4EXP_TY_q4_K &&
+                          up_slab->type == DS4_QWEN4EXP_TY_q4_K) {
+            QWEN4EXP_GATEUP_MMA(DS4_QWEN4EXP_TY_q4_K, DS4_QWEN4EXP_TY_q4_K);
+        } else if (specialize && gate_slab->type == DS4_QWEN4EXP_TY_q8_0 &&
+                                 up_slab->type == DS4_QWEN4EXP_TY_q8_0) {
+            QWEN4EXP_GATEUP_MMA(DS4_QWEN4EXP_TY_q8_0, DS4_QWEN4EXP_TY_q8_0);
+        } else {
+            QWEN4EXP_GATEUP_MMA(-1, -1);
+        }
+#undef QWEN4EXP_GATEUP_MMA
     }
     else if (tile == 8) { QWEN4EXP_GATEUP(8); }
     else if (tile == 4) { QWEN4EXP_GATEUP(4); }
     else { QWEN4EXP_GATEUP(1); }
 #undef QWEN4EXP_GATEUP
+#undef QWEN4EXP_GATEUP_IMPL
     if (!cuda_ok(cudaGetLastError(), "qwen4exp MoE gate/up launch")) return 0;
 
     if (!qwen4exp_quantize_rows(sc.mq, sc.ms, sc.msum, (const float *)mid->ptr,
@@ -3267,22 +3361,40 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
 
     const dim3 dn_grid((out_dim + 7u) / 8u,
                        (n_tokens + (uint32_t)tile - 1u) / (uint32_t)tile, 1);
-#define QWEN4EXP_DOWN(R) \
-    qwen4exp_moe_down_q_kernel<R><<<dn_grid, threads, 0, stream>>>( \
+#define QWEN4EXP_DOWN_IMPL(R, DT) \
+    qwen4exp_moe_down_q_kernel<R, DT><<<dn_grid, threads, 0, stream>>>( \
             (float *)out->ptr, down, (const int32_t *)selected->ptr, \
             sc.mq, sc.ms, sc.msum, \
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
             mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
+#define QWEN4EXP_DOWN(R) do { \
+    if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q5_1) { \
+        QWEN4EXP_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q5_1); \
+    } else if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q8_0) { \
+        QWEN4EXP_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q8_0); \
+    } else { \
+        QWEN4EXP_DOWN_IMPL(R, -1); \
+    } \
+} while (0)
     const int down_mma = use_mma && (out_dim % QW_MMA_BM) == 0 &&
                          down_slab->type != (uint32_t)DS4_QWEN4EXP_TY_q6_K;
     if (down_mma) {
-        qwen4exp_moe_down_mma_kernel<<<
-                dim3(out_dim / QW_MMA_BM, gu_rows, 1),
-                QW_MMA_THREADS, 0, stream>>>(
-                (float *)down_partial->ptr, down, sc.mq, sc.ms, sc.msum,
-                sc.pairs, sc.counts, sc.offsets, gu_active,
-                down_slab->expert_bytes, down_slab->row_bytes, down_slab->type,
-                mgroups, out_dim);
+#define QWEN4EXP_DOWN_MMA(DT) \
+        qwen4exp_moe_down_mma_kernel<DT><<< \
+                dim3(out_dim / QW_MMA_BM, gu_rows, 1), \
+                QW_MMA_THREADS, 0, stream>>>( \
+                (float *)down_partial->ptr, down, sc.mq, sc.ms, sc.msum, \
+                sc.pairs, sc.counts, sc.offsets, gu_active, \
+                down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
+                mgroups, out_dim)
+        if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q5_1) {
+            QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q5_1);
+        } else if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q8_0) {
+            QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q8_0);
+        } else {
+            QWEN4EXP_DOWN_MMA(-1);
+        }
+#undef QWEN4EXP_DOWN_MMA
         if (!cuda_ok(cudaGetLastError(), "qwen4exp MoE down tile launch")) return 0;
         const uint64_t combine_n = (uint64_t)n_tokens * out_dim;
         qwen4exp_moe_down_combine_kernel<<<
@@ -3297,6 +3409,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     else if (tile == 4) { QWEN4EXP_DOWN(4); }
     else { QWEN4EXP_DOWN(1); }
 #undef QWEN4EXP_DOWN
+#undef QWEN4EXP_DOWN_IMPL
     return cuda_ok(cudaGetLastError(), "qwen4exp MoE down launch");
 }
 

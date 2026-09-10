@@ -5248,8 +5248,9 @@ __device__ __forceinline__ static int32_t load_i8x4_i32_unaligned(const int8_t *
  * Read the aligned words that CONTAIN the payload instead, and shift the bytes
  * into place: eight word loads plus one four-byte read for the last group,
  * whose top bytes live in a word the block does not own and which is therefore
- * left to the byte path rather than read past the block.  Twelve loads where
- * there were thirty-two, and the shift amount is a value rather than a branch,
+ * read only within its four-byte tail rather than past the block.  Even
+ * payloads use two halfword tail loads; odd payloads keep four byte loads.
+ * The shift amount is a value rather than a branch,
  * so lanes whose blocks land on different alignments stay in step.
  *
  * THE ARITHMETIC IS UNTOUCHED.  The dp4a groups are the same four bytes in the
@@ -5258,6 +5259,19 @@ __device__ __forceinline__ static int32_t load_i8x4_i32_unaligned(const int8_t *
  * what the byte-at-a-time loop produced -- which is what the speculative
  * cycle's serial identity needs, and what the correctness gate checks.
  */
+/* Q8 payloads are normally even-aligned: the GGUF base and 34-byte block
+ * stride both preserve that alignment.  Read the final four bytes with two
+ * aligned halfwords, retaining byte loads for a caller with an odd pointer.
+ * Unlike an aligned word read across the tail, neither path crosses the
+ * four-byte range supplied by the caller. */
+__device__ __forceinline__ static int32_t q8_tail_i8x4(const int8_t *p) {
+    if (((uintptr_t)p & 1u) == 0u) {
+        const uint16_t *h = (const uint16_t *)(const void *)p;
+        return (int32_t)((uint32_t)h[0] | ((uint32_t)h[1] << 16u));
+    }
+    return load_i8x4_i32_unaligned(p);
+}
+
 __device__ __forceinline__ static int32_t dot_i8x32_dp4a(const int8_t *a, const int8_t *b) {
     /* The activation side is quantised into a 32-byte-aligned scratch row, so
      * it is read as whole words with no shifting. */
@@ -5276,7 +5290,7 @@ __device__ __forceinline__ static int32_t dot_i8x32_dp4a(const int8_t *a, const 
         dot = __dp4a((int32_t)__funnelshift_r(prev, next, sh), xb[i], dot);
         prev = next;
     }
-    dot = __dp4a(load_i8x4_i32_unaligned(a + 28), xb[7], dot);
+    dot = __dp4a(q8_tail_i8x4(a + 28), xb[7], dot);
     return dot;
 }
 
@@ -5305,7 +5319,7 @@ __device__ __forceinline__ static int32_t dot_i8_block(const int8_t *a, const in
  * WHAT MOVES.  Nothing arithmetic.  q8_0_group_words() computes exactly the
  * eight int32 operands dot_i8x32_dp4a() builds -- the same seven
  * __funnelshift_r of the same aligned word pair at the same shift, then the
- * same load_i8x4_i32_unaligned(a + 28) -- and dot_i8x32_dp4a_words() feeds them
+ * same q8_tail_i8x4(a + 28) -- and dot_i8x32_dp4a_words() feeds them
  * to the same eight __dp4a against the same activation words in the same order
  * into the same int32 accumulator.  An integer dot has no rounding, so the
  * value is the one the pointer form returned, bit for bit, and the float tail
@@ -5326,7 +5340,7 @@ __device__ __forceinline__ static void q8_0_group_words(int32_t w[8],
         w[i] = (int32_t)__funnelshift_r(prev, next, sh);
         prev = next;
     }
-    w[7] = load_i8x4_i32_unaligned(a + 28);
+    w[7] = q8_tail_i8x4(a + 28);
 }
 
 __device__ __forceinline__ static int32_t dot_i8x32_dp4a_words(
@@ -5556,7 +5570,7 @@ __global__ static void matmul_q8_0_preq_warp8_kernel(
         uint64_t out_dim,
         uint64_t blocks,
         int use_dp4a) {
-    uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    uint64_t row = (uint64_t)blockIdx.x * (blockDim.x >> 5u) + (threadIdx.x >> 5u);
     const uint64_t tok = (uint64_t)blockIdx.y;
     uint32_t lane = threadIdx.x & 31u;
     if (row >= out_dim) return;
@@ -5606,7 +5620,7 @@ __global__ static void matmul_q8_0_preq_rows_exact_tile_kernel(
         uint32_t n_rows,
         uint64_t blocks,
         int use_dp4a) {
-    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint64_t row = (uint64_t)blockIdx.x * (blockDim.x >> 5u) + (threadIdx.x >> 5u);
     const uint32_t row0 = (uint32_t)blockIdx.y * (uint32_t)R;
     const uint32_t lane = threadIdx.x & 31u;
     if (row >= out_dim || row0 >= n_rows) return;
@@ -16484,7 +16498,17 @@ extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
 #undef DS4_Q8_DENSE_MMA_LAUNCH
 
     const int use_dp4a = cuda_q8_use_dp4a();
-    const unsigned wgrid = ((unsigned)out_dim + 7u) / 8u;
+    /* A warp owns an independent output row.  Narrow projections (notably
+     * the HC 10240->320 down projection) had only forty eight-warp blocks,
+     * leaving SMs idle even though each row has a long K walk.  Spread those
+     * same warps across one-warp blocks so all SMs can schedule live rows.
+     * Each lane retains its groups, accumulator and reduction; no split-K or
+     * extra synchronization is involved.  Wide/prefill calls keep their old
+     * block geometry.  The override permits a same-binary geometry check. */
+    const unsigned warps = n_rows < 8u && out_dim <= 512u &&
+        getenv("DS4_QWEN4EXP_Q8_WIDE_BLOCKS") == NULL ? 1u : 8u;
+    const unsigned wthreads = warps * 32u;
+    const unsigned wgrid = ((unsigned)out_dim + warps - 1u) / warps;
 
     /* Without the MMA -- an older card, or DS4_QWEN4EXP_NO_ROW_TILE, which is
      * how the before/after prefill measurement runs on one binary -- the older
@@ -16493,7 +16517,7 @@ extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
      * eight rows with the SAME per-row arithmetic. */
     if (n_rows == 1u || getenv("DS4_QWEN4EXP_NO_ROW_TILE") != NULL) {
         dim3 grid(wgrid, n_rows, 1u);
-        matmul_q8_0_preq_warp8_kernel<<<grid, 256, 0, cuda_decode_stream()>>>(
+        matmul_q8_0_preq_warp8_kernel<<<grid, wthreads, 0, cuda_decode_stream()>>>(
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
                 xq, xscale, in_dim, out_dim, blocks, use_dp4a);
@@ -16503,21 +16527,21 @@ extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
     if (n_rows >= 8u) {
         dim3 grid(wgrid, (n_rows + 7u) / 8u, 1u);
         matmul_q8_0_preq_rows_exact_tile_kernel<8>
-            <<<grid, 256, 0, cuda_decode_stream()>>>(
+            <<<grid, wthreads, 0, cuda_decode_stream()>>>(
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
                 xq, xscale, in_dim, out_dim, n_rows, blocks, use_dp4a);
     } else if (n_rows >= 4u) {
         dim3 grid(wgrid, (n_rows + 3u) / 4u, 1u);
         matmul_q8_0_preq_rows_exact_tile_kernel<4>
-            <<<grid, 256, 0, cuda_decode_stream()>>>(
+            <<<grid, wthreads, 0, cuda_decode_stream()>>>(
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
                 xq, xscale, in_dim, out_dim, n_rows, blocks, use_dp4a);
     } else {
         dim3 grid(wgrid, (n_rows + 1u) / 2u, 1u);
         matmul_q8_0_preq_rows_exact_tile_kernel<2>
-            <<<grid, 256, 0, cuda_decode_stream()>>>(
+            <<<grid, wthreads, 0, cuda_decode_stream()>>>(
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
                 xq, xscale, in_dim, out_dim, n_rows, blocks, use_dp4a);
