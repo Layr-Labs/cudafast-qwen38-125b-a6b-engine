@@ -1607,7 +1607,12 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
     }
     QW_MOE_TICK(QW_MOE_T_ROUTED);
 
-    /* The shared expert ADDS into block_out: routed + sigmoid(gate) * shared. */
+    /* The shared expert ADDS into block_out: routed + sigmoid(gate) * shared.
+     * It receives the same s->mixed rows and shape as the successful routed
+     * call immediately above.  Both CUDA operations use the current tier's
+     * decode stream, so the shared expert can reuse the routed input's exact
+     * quantized scratch prefix; its backend falls back to fresh quantization
+     * if a scratch growth displaced that prefix. */
     const ds4_gpu_qwen4exp_slab sh_router_slab = QW_SLAB(m, l->ffn_gate_inp_shexp);
     const ds4_gpu_qwen4exp_slab sh_gate_slab = QW_SLAB(m, l->ffn_gate_shexp);
     const ds4_gpu_qwen4exp_slab sh_up_slab = QW_SLAB(m, l->ffn_up_shexp);
@@ -1615,7 +1620,8 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
     if (!ds4_gpu_qwen4exp_shared_expert_tensor(
             s->block_out, s->shexp_mid, s->shexp_gate,
             &sh_router_slab, &sh_gate_slab, &sh_up_slab, &sh_down_slab,
-            DS4_N_EMBD, DS4_N_FF_SHEXP, DS4_N_EMBD, s->mixed, n_tokens)) {
+            DS4_N_EMBD, DS4_N_FF_SHEXP, DS4_N_EMBD, s->mixed, n_tokens,
+            true)) {
         fprintf(stderr, "ds4: qwen4exp shared expert failed at block %u\n", il);
         return false;
     }

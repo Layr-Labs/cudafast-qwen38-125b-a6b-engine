@@ -97,11 +97,11 @@ static inline int ds4_tensor_device_idx(const ds4_gpu_tensor *t) {
     return d;
 }
 
-/* Scratch for the routed MoE's pair list: three int32 arrays of n_expert and
- * one of n_tokens * n_expert_used, so tens of kilobytes at the widest prefill.
- * It is kept and grown rather than allocated per call, the way the backend
- * keeps its other per-device scratch.  The qwen4exp graph does not capture, so
- * a growth here cannot land inside a CUDA graph. */
+/* Per-device Qwen4-Exp MoE scratch.  The routed operation lays its input
+ * quantization at the prefix also used by the immediately following shared
+ * expert; grouping metadata and intermediate quantization follow it.  The
+ * allocation is kept and grown rather than allocated per call.  The qwen4exp
+ * graph does not capture, so a growth here cannot land inside a CUDA graph. */
 static void *g_qwen4exp_group_scratch[16];
 static uint64_t g_qwen4exp_group_bytes[16];
 
@@ -2962,26 +2962,32 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     const uint32_t n_pairs = n_tokens * n_expert_used;
     const uint32_t xgroups = in_dim / 32u;
     const uint32_t mgroups = mid_dim / 32u;
+    const uint64_t xq_bytes = qwen4exp_quant_bytes(n_tokens, xgroups);
     const uint64_t idx_bytes =
         ((uint64_t)n_total_expert * 4u + 1u) * sizeof(int32_t);
     const uint64_t pair_bytes = (uint64_t)n_pairs * sizeof(int32_t);
-    const uint64_t xq_bytes = qwen4exp_quant_bytes(n_tokens, xgroups);
     const uint64_t mq_bytes = qwen4exp_quant_bytes(n_pairs, mgroups);
 
+    /* Keep the input quantization at the scratch prefix shared by the routed
+     * and shared experts.  qwen4exp_graph_moe_block calls them immediately in
+     * that order on this stream with the identical input/shape; the shared
+     * operation may therefore consume these exact bytes instead of repeating
+     * the quantizer.  Metadata and routed-mid quantization live after the
+     * prefix, so none of their writes overlap it. */
     char *base = (char *)qwen4exp_group_scratch(
-            logical_tier, idx_bytes + pair_bytes + xq_bytes + mq_bytes);
+            logical_tier, xq_bytes + idx_bytes + pair_bytes + mq_bytes);
     if (!base) return 0;
     qwen4exp_moe_scratch sc;
-    sc.counts = (int32_t *)base;
+    sc.xq = (int8_t *)base;
+    sc.xs = (float *)(base + (uint64_t)n_tokens * xgroups * 32u);
+    sc.xsum = (int32_t *)(sc.xs + (uint64_t)n_tokens * xgroups);
+    char *at = base + xq_bytes;
+    sc.counts = (int32_t *)at;
     sc.offsets = sc.counts + n_total_expert;
     sc.cursor = sc.offsets + n_total_expert;
     sc.active = sc.cursor + n_total_expert;
     sc.pairs = sc.active + n_total_expert + 1u;
-    char *at = base + idx_bytes + pair_bytes;
-    sc.xq = (int8_t *)at;
-    sc.xs = (float *)(at + (uint64_t)n_tokens * xgroups * 32u);
-    sc.xsum = (int32_t *)(sc.xs + (uint64_t)n_tokens * xgroups);
-    at += xq_bytes;
+    at += idx_bytes + pair_bytes;
     sc.mq = (int8_t *)at;
     sc.ms = (float *)(at + (uint64_t)n_pairs * mgroups * 32u);
     sc.msum = (int32_t *)(sc.ms + (uint64_t)n_pairs * mgroups);
@@ -3148,7 +3154,8 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_tensor(
         uint32_t                     mid_dim,
         uint32_t                     out_dim,
         const ds4_gpu_tensor        *x,
-        uint32_t                     n_tokens) {
+        uint32_t                     n_tokens,
+        bool                         reuse_routed_input_quant) {
     if (!out || !mid || !gate_scale || !x ||
         !router_slab || !gate_slab || !up_slab || !down_slab ||
         !router_slab->map || !gate_slab->map || !up_slab->map || !down_slab->map ||
@@ -3204,11 +3211,21 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_tensor(
 
     const uint32_t xgroups = in_dim / 32u;
     const uint32_t mgroups = mid_dim / 32u;
-    char *base = (char *)qwen4exp_group_scratch(
-            logical_tier,
-            qwen4exp_quant_bytes(n_tokens, xgroups) +
-            qwen4exp_quant_bytes(n_tokens, mgroups));
+    const uint64_t scratch_bytes =
+        qwen4exp_quant_bytes(n_tokens, xgroups) +
+        qwen4exp_quant_bytes(n_tokens, mgroups);
+    void *const prior_base = logical_tier >= 0 && logical_tier < 16 ?
+        g_qwen4exp_group_scratch[logical_tier] : NULL;
+    const uint64_t prior_bytes = logical_tier >= 0 && logical_tier < 16 ?
+        g_qwen4exp_group_bytes[logical_tier] : 0u;
+    char *base = (char *)qwen4exp_group_scratch(logical_tier, scratch_bytes);
     if (!base) return 0;
+    /* A larger shared-expert shape can grow the scratch allocation.  Such a
+     * growth frees the routed prefix, so honor reuse only when the exact prior
+     * allocation survived and already covered the full shared layout. */
+    const bool reuse_input_quant =
+        reuse_routed_input_quant && base == prior_base &&
+        prior_bytes >= scratch_bytes;
     int8_t *xq = (int8_t *)base;
     float *xs = (float *)(base + (uint64_t)n_tokens * xgroups * 32u);
     int32_t *xsum = (int32_t *)(xs + (uint64_t)n_tokens * xgroups);
@@ -3217,10 +3234,12 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_tensor(
     float *ms = (float *)(at + (uint64_t)n_tokens * mgroups * 32u);
     int32_t *msum = (int32_t *)(ms + (uint64_t)n_tokens * mgroups);
 
-    if (!qwen4exp_quantize_rows(xq, xs, xsum, (const float *)x->ptr,
-                                n_tokens, in_dim, xgroups, in_dim, 0, 1,
-                                stream)) {
-        return 0;
+    if (!reuse_input_quant) {
+        if (!qwen4exp_quantize_rows(xq, xs, xsum, (const float *)x->ptr,
+                                    n_tokens, in_dim, xgroups, in_dim, 0, 1,
+                                    stream)) {
+            return 0;
+        }
     }
 
     const int tile = qwen4exp_moe_tile(n_tokens);

@@ -582,7 +582,8 @@ static void run_shared_stage_case(const ds4_gpu_qwen4exp_slab *router_slab,
                        "staged shared expert mid poison");
             require_ok(ds4_gpu_qwen4exp_shared_expert_tensor(
                            out_t, mid_t, gsc_t, router_slab, gate_slab, up_slab,
-                           down_slab, in_dim, shared_mid, out_dim, x_t, w),
+                           down_slab, in_dim, shared_mid, out_dim, x_t, w,
+                           false),
                        what);
             require_ok(ds4_gpu_tensor_read(out_t, 0, out_got[pass],
                                            (uint64_t)w * out_dim * sizeof(float)),
@@ -795,7 +796,7 @@ static void run_row_invariance_case(const uint8_t *model,
     require_ok(ds4_gpu_qwen4exp_shared_expert_tensor(
                    out_t, shmid_t, shgate_t, &sh_router_slab, &sh_gate_slab,
                    &sh_up_slab, &sh_down_slab, IN_DIM, SHARED_MID, OUT_DIM,
-                   x_t, INV_TOKENS),
+                   x_t, INV_TOKENS, true),
                "invariance wide shared expert");
     require_ok(ds4_gpu_tensor_read(out_t, 0, wide, out_bytes),
                "invariance wide read");
@@ -836,7 +837,7 @@ static void run_row_invariance_case(const uint8_t *model,
         require_ok(ds4_gpu_qwen4exp_shared_expert_tensor(
                        out1_t, shmid1_t, shgate1_t, &sh_router_slab,
                        &sh_gate_slab, &sh_up_slab, &sh_down_slab,
-                       IN_DIM, SHARED_MID, OUT_DIM, x1_t, 1u),
+                       IN_DIM, SHARED_MID, OUT_DIM, x1_t, 1u, true),
                    "invariance one-row shared expert");
         require_ok(ds4_gpu_tensor_read(out1_t, 0, narrow + (size_t)t * OUT_DIM,
                                        (uint64_t)OUT_DIM * sizeof(float)),
@@ -863,7 +864,8 @@ static void run_row_invariance_case(const uint8_t *model,
             require_ok(ds4_gpu_qwen4exp_shared_expert_tensor(
                            out_t, shmid_t, shgate_t, &sh_router_slab,
                            &sh_gate_slab, &sh_up_slab, &sh_down_slab,
-                           IN_DIM, SHARED_MID, OUT_DIM, x_t, INV_TOKENS),
+                           IN_DIM, SHARED_MID, OUT_DIM, x_t, INV_TOKENS,
+                           true),
                        "tile comparison shared expert");
             require_ok(ds4_gpu_tensor_read(out_t, 0, pass == 0 ? t1 : t4,
                                            out_bytes),
@@ -894,7 +896,7 @@ static void run_row_invariance_case(const uint8_t *model,
         require_ok(ds4_gpu_qwen4exp_shared_expert_tensor(
                        out_t, shmid_t, shgate_t, &sh_router_slab, &sh_gate_slab,
                        &sh_up_slab, &sh_down_slab, IN_DIM, SHARED_MID, OUT_DIM,
-                       x_t, w),
+                       x_t, w, true),
                    "cycle-width shared expert");
         float *got = calloc((size_t)w * OUT_DIM, sizeof(float));
         if (!got) fail("cycle-width allocation");
@@ -922,8 +924,8 @@ static void run_row_invariance_case(const uint8_t *model,
         require_ok(ds4_gpu_qwen4exp_shared_expert_tensor(
                        out_t, shmid_t, shgate_t, &sh_router_slab, &sh_gate_slab,
                        &sh_up_slab, &sh_down_slab, IN_DIM, SHARED_MID, OUT_DIM,
-                       x_t, w),
-                   "reference group-scan shared expert");
+                       x_t, w, false),
+                   "fresh-quant reference group-scan shared expert");
         require_ok(ds4_gpu_tensor_read(
                        out_t, 0, reference_scan,
                        (uint64_t)w * OUT_DIM * sizeof(float)),
@@ -931,9 +933,11 @@ static void run_row_invariance_case(const uint8_t *model,
         unsetenv("DS4_QWEN4EXP_SERIAL_GROUP_SCAN");
         if (memcmp(got, reference_scan,
                    (size_t)w * OUT_DIM * sizeof(float)) != 0) {
-            fail("parallel group scan differs from the reference metadata scan");
+            fail("reused input quantization differs from fresh quantization or "
+                 "parallel group scan differs from its reference");
         }
-        printf("  parallel group scan output matches reference at width %u\n", w);
+        printf("  reused input quantization + parallel group scan matches fresh "
+               "quantization + reference scan at width %u\n", w);
         free(reference_scan);
         free(got);
     }
@@ -1889,7 +1893,7 @@ int main(void) {
     require_ok(ds4_gpu_qwen4exp_shared_expert_tensor(
                    out_t, sh_mid_t, sh_gate_t,
                    &sh_router_slab, &sh_gate_slab, &sh_up_slab, &sh_down_slab,
-                   IN_DIM, SHARED_MID, OUT_DIM, x_t, MOE_TOKENS),
+                   IN_DIM, SHARED_MID, OUT_DIM, x_t, MOE_TOKENS, false),
                "shared expert");
     require_ok(ds4_gpu_tensor_read(out_t, 0, combined,
                                    (uint64_t)MOE_TOKENS * OUT_DIM * sizeof(float)),

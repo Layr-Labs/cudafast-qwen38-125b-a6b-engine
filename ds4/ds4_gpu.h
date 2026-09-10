@@ -2773,6 +2773,16 @@ int ds4_gpu_qwen4exp_routed_moe_tensor(
         uint32_t                     n_tokens,
         uint32_t                     mid_token_stride);
 
+/* CUDA keeps the routed and shared-expert activation quantization at the same
+ * scratch prefix.  Passing true is an explicit caller contract: this call must
+ * immediately follow a successful routed-MoE call with the same x, n_tokens,
+ * in_dim, current tier, and decode stream, with no intervening group-scratch
+ * use or mutation of x.  The production graph satisfies that contract, so the
+ * shared expert can consume the routed operation's byte-identical Q8 rows
+ * instead of launching the quantizer again.  Standalone callers pass false and
+ * retain the self-contained path.  The CUDA backend also falls back to fresh
+ * quantization if allocation growth displaced the prefix; that guard checks
+ * storage lifetime, not caller provenance or shape equality. */
 int ds4_gpu_qwen4exp_shared_expert_tensor(
         ds4_gpu_tensor              *out,
         ds4_gpu_tensor              *mid,
@@ -2785,7 +2795,8 @@ int ds4_gpu_qwen4exp_shared_expert_tensor(
         uint32_t                     mid_dim,
         uint32_t                     out_dim,
         const ds4_gpu_tensor        *x,
-        uint32_t                     n_tokens);
+        uint32_t                     n_tokens,
+        bool                         reuse_routed_input_quant);
 
 int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
         ds4_gpu_tensor       *out,

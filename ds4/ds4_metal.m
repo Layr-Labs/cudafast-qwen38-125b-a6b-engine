@@ -36864,7 +36864,11 @@ int ds4_gpu_qwen4exp_shared_expert_tensor(
         uint32_t                     mid_dim,
         uint32_t                     out_dim,
         const ds4_gpu_tensor        *x,
-        uint32_t                     n_tokens) {
+        uint32_t                     n_tokens,
+        bool                         reuse_routed_input_quant) {
+    /* The CUDA backend implements this optional within-block reuse.  Metal's
+     * separate group/quant buffers keep their existing self-contained path. */
+    (void)reuse_routed_input_quant;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out || !mid || !gate_scale || !x ||
         !router_slab || !gate_slab || !up_slab || !down_slab ||
