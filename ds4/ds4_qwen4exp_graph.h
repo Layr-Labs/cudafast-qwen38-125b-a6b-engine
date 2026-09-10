@@ -203,6 +203,20 @@ bool ds4_qwen4exp_graph_verify_rows(ds4_qwen4exp_session       *s,
                                     float                      *logits,
                                     uint32_t                    logit_rows);
 
+/* Speculative fast path: run the same wide head, retain its logits on device,
+ * and return only each row's greedy winner.  The cycle subsequently reads one
+ * selected frontier row with read_logit_row(). */
+bool ds4_qwen4exp_graph_verify_top1_rows(ds4_qwen4exp_session       *s,
+                                         const ds4_qwen4exp_weights *w,
+                                         const ds4_model            *m,
+                                         const int32_t              *tokens,
+                                         uint32_t                    n_tokens,
+                                         float                      *hc_rows,
+                                         int                        *row_top1);
+bool ds4_qwen4exp_graph_read_logit_row(ds4_qwen4exp_session *s,
+                                       uint32_t row,
+                                       float *logits);
+
 /* The target's LM head over ONE supplied pre-final-mixer row.  Runs the final
  * mixer and the head, the same two ops the forward ends with, so a row that
  * came out of a verify yields exactly the logits that verify would have. */
