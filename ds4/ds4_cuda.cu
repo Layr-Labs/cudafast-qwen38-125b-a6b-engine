@@ -5234,12 +5234,49 @@ __device__ __forceinline__ static int32_t load_i8x4_i32_unaligned(const int8_t *
                      ((uint32_t)u[3] << 24));
 }
 
+/*
+ * One 32-element int8 dot product, four WEIGHT bytes at a time.
+ *
+ * The weight side is a Q8_0 block payload.  A block is 34 bytes -- two bytes of
+ * scale then thirty-two quants -- so the payload starts two bytes into the
+ * block and is usually not four-byte aligned.  load_i8x4_i32_unaligned()
+ * therefore rebuilt every dp4a operand out of FOUR single-byte loads, which is
+ * thirty-two byte loads per block; and in these kernels a warp has each lane on
+ * a block of its own, thirty-four bytes apart, so each of those instructions
+ * asks the cache for a span of nine lines to use four bytes of them.
+ *
+ * Read the aligned words that CONTAIN the payload instead, and shift the bytes
+ * into place: eight word loads plus one four-byte read for the last group,
+ * whose top bytes live in a word the block does not own and which is therefore
+ * left to the byte path rather than read past the block.  Twelve loads where
+ * there were thirty-two, and the shift amount is a value rather than a branch,
+ * so lanes whose blocks land on different alignments stay in step.
+ *
+ * THE ARITHMETIC IS UNTOUCHED.  The dp4a groups are the same four bytes in the
+ * same order against the same activation words, and an integer dot does not
+ * depend on how its bytes reached the register, so every output is bit for bit
+ * what the byte-at-a-time loop produced -- which is what the speculative
+ * cycle's serial identity needs, and what the correctness gate checks.
+ */
 __device__ __forceinline__ static int32_t dot_i8x32_dp4a(const int8_t *a, const int8_t *b) {
+    /* The activation side is quantised into a 32-byte-aligned scratch row, so
+     * it is read as whole words with no shifting. */
+    const int32_t *xb = (const int32_t *)b;
+    const uintptr_t ua = (uintptr_t)a;
+    const uint32_t sh = (uint32_t)(ua & 3u) * 8u;
+    const uint32_t *wa = (const uint32_t *)(ua - (ua & 3u));
     int32_t dot = 0;
+    uint32_t prev = wa[0];
 #pragma unroll
-    for (uint32_t i = 0; i < 32u; i += 4u) {
-        dot = __dp4a(load_i8x4_i32_unaligned(a + i), load_i8x4_i32_aligned(b + i), dot);
+    for (uint32_t i = 0; i < 7u; i++) {
+        const uint32_t next = wa[i + 1u];
+        /* Bytes sh .. sh + 31 of {next, prev}: the four payload bytes of group
+         * i.  At sh == 0 this is `prev` itself, so an aligned payload costs the
+         * same eight loads and no shift. */
+        dot = __dp4a((int32_t)__funnelshift_r(prev, next, sh), xb[i], dot);
+        prev = next;
     }
+    dot = __dp4a(load_i8x4_i32_unaligned(a + 28), xb[7], dot);
     return dot;
 }
 

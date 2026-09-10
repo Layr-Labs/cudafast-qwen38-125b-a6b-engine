@@ -913,9 +913,31 @@ __device__ __forceinline__ static int32_t qwen4exp_dp4a(const int8_t *a,
     return d;
 }
 
+/* Is this weight address a whole number of four-byte words from zero?
+ *
+ * The quantised block types below are declared with two-byte alignment, so the
+ * compiler cannot assume more, and the payload loops read them one byte at a
+ * time.  A GGUF tensor starts on a 32-byte boundary and every block and row
+ * stride of the expert slabs is a multiple of four, so the answer is yes for
+ * every lane of every warp on the pinned checkpoint -- and the branch below is
+ * therefore warp uniform, not a divergence.  It is asked rather than assumed
+ * because an unaligned word load on the device is a fault, not a slow path. */
+__device__ __forceinline__ static bool qwen4exp_word_aligned(const void *p) {
+    return (((uintptr_t)p) & 3u) == 0u;
+}
+
 /* Decode one 32-element group of a quantised weight row into int8 quants and
  * the one or two (wa, wb) pairs that turn an integer dot into the row's
- * contribution.  Called once per group per output row, not once per element. */
+ * contribution.  Called once per group per output row, not once per element.
+ *
+ * WHY THE WORD PATHS.  A group is thirty-two quants; read a byte at a time
+ * that is thirty-two load instructions per group per row, and these kernels
+ * decode two or three groups per thread per staging step, so the byte loads
+ * outnumber the tensor-core instructions they feed by more than ten to one.
+ * Reading the same payload as eight words and splitting the nibbles in
+ * registers issues four times fewer loads for the same bytes.  The nibbles,
+ * their order and the values they produce are unchanged, so every dot is bit
+ * for bit what the byte loop produced. */
 __device__ __forceinline__ static void dev_qwen4exp_group_decode(
         uint32_t type, const char *row, uint32_t g,
         int8_t *wq, float *wa, float *wb, int *halves) {
@@ -935,11 +957,33 @@ __device__ __forceinline__ static void dev_qwen4exp_group_decode(
     }
     case (uint32_t)DS4_QWEN4EXP_TY_q5_1: {
         const cuda_block_q5_1 *xb = (const cuda_block_q5_1 *)row + g;
+        wa[0] = dev_f16_to_f32(xb->d);
+        wb[0] = dev_f16_to_f32(xb->m);
+        if (qwen4exp_word_aligned(xb)) {
+            /* A q5_1 block is 24 bytes, so every block of a 4-byte-aligned row
+             * is 4-byte aligned, and so are its qh at offset 4 and its qs at
+             * offset 8.  Read both as words. */
+            const uint32_t *qw = (const uint32_t *)(const void *)xb;
+            const uint32_t qh = qw[1];
+#pragma unroll
+            for (int k = 0; k < 4; k++) {
+                const uint32_t v = qw[2 + k];
+                const uint32_t lo = v & 0x0f0f0f0fu;
+                const uint32_t hi = (v >> 4u) & 0x0f0f0f0fu;
+#pragma unroll
+                for (int b = 0; b < 4; b++) {
+                    const int j = k * 4 + b;
+                    wq[j] = (int8_t)(((lo >> (b * 8)) & 0xffu) |
+                                     (((qh >> j) & 1u) << 4u));
+                    wq[16 + j] = (int8_t)(((hi >> (b * 8)) & 0xffu) |
+                                          (((qh >> (j + 16u)) & 1u) << 4u));
+                }
+            }
+            return;
+        }
         const uint32_t qh = (uint32_t)xb->qh[0] | ((uint32_t)xb->qh[1] << 8u) |
                             ((uint32_t)xb->qh[2] << 16u) |
                             ((uint32_t)xb->qh[3] << 24u);
-        wa[0] = dev_f16_to_f32(xb->d);
-        wb[0] = dev_f16_to_f32(xb->m);
 #pragma unroll
         for (int j = 0; j < 16; j++) {
             wq[j] = (int8_t)(((uint32_t)(xb->qs[j] & 0x0fu)) |
@@ -958,6 +1002,21 @@ __device__ __forceinline__ static void dev_qwen4exp_group_decode(
         wb[0] = -dev_f16_to_f32(xb->dmin) * (float)m;
         const uint8_t *qs = xb->qs + (grp >> 1u) * 32u;
         const uint32_t shift = (grp & 1u) ? 4u : 0u;
+        if (qwen4exp_word_aligned(qs)) {
+            const uint32_t *qw = (const uint32_t *)(const void *)qs;
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+                /* Shifting the whole word moves each byte's wanted nibble to
+                 * that byte's low four bits; the mask then takes exactly the
+                 * four bits the byte-at-a-time loop took. */
+                const uint32_t v = (qw[i] >> shift) & 0x0f0f0f0fu;
+                wq[i * 4 + 0] = (int8_t)(v & 0xffu);
+                wq[i * 4 + 1] = (int8_t)((v >> 8u) & 0xffu);
+                wq[i * 4 + 2] = (int8_t)((v >> 16u) & 0xffu);
+                wq[i * 4 + 3] = (int8_t)(v >> 24u);
+            }
+            return;
+        }
 #pragma unroll
         for (int i = 0; i < 32; i++) {
             wq[i] = (int8_t)(((uint32_t)qs[i] >> shift) & 0x0fu);
@@ -973,6 +1032,26 @@ __device__ __forceinline__ static void dev_qwen4exp_group_decode(
         wb[0] = -dev_f16_to_f32(xb->dmin) * (float)m;
         const uint8_t *qs = xb->qs + (grp >> 1u) * 32u;
         const uint32_t shift = (grp & 1u) * 4u;
+        if (qwen4exp_word_aligned(qs) && qwen4exp_word_aligned(xb->qh)) {
+            const uint32_t *qw = (const uint32_t *)(const void *)qs;
+            const uint32_t *hw = (const uint32_t *)(const void *)xb->qh;
+            const uint32_t hbit = 0x01010101u << grp;
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+                const uint32_t v = (qw[i] >> shift) & 0x0f0f0f0fu;
+                /* The fifth bit is byte i's bit `grp`; the compare turns each
+                 * byte that carries it into 0x10, which is the +16 the
+                 * byte-at-a-time loop added. */
+                const uint32_t h = hw[i] & hbit;
+                const uint32_t add = ((h >> grp) & 0x01010101u) << 4u;
+                const uint32_t q = v | add;
+                wq[i * 4 + 0] = (int8_t)(q & 0xffu);
+                wq[i * 4 + 1] = (int8_t)((q >> 8u) & 0xffu);
+                wq[i * 4 + 2] = (int8_t)((q >> 16u) & 0xffu);
+                wq[i * 4 + 3] = (int8_t)(q >> 24u);
+            }
+            return;
+        }
 #pragma unroll
         for (int i = 0; i < 32; i++) {
             uint32_t q = ((uint32_t)qs[i] >> shift) & 0x0fu;
@@ -1429,6 +1508,47 @@ __device__ __forceinline__ static uint32_t qw_pack4(const int8_t *p) {
            ((uint32_t)(uint8_t)p[2] << 16) | ((uint32_t)(uint8_t)p[3] << 24);
 }
 
+/* The same four bytes, read as the one word that holds them.
+ *
+ * Every tile below is declared sixteen-byte aligned and QW_MMA_LD is a
+ * multiple of four, so every (row, k) offset a fragment names is a whole
+ * number of words from the base.  The four bytes reach the register in the
+ * same order qw_pack4 put them in, which is the order mma.sync reads them, so
+ * the operand is the same value -- one shared load instead of four. */
+__device__ __forceinline__ static uint32_t qw_tile_word(const int8_t *p) {
+    return *(const uint32_t *)(const void *)p;
+}
+
+/* Write one decoded 32-quant group into a tile row as eight words.
+ *
+ * The byte-at-a-time store this replaces put element e at byte e of the row,
+ * which is exactly what a little-endian word of elements 4i..4i+3 holds, so
+ * the tile bytes are unchanged and only the instruction count moves. */
+__device__ __forceinline__ static void qw_tile_store_group(int8_t *dst,
+                                                           const int8_t *wq) {
+    uint32_t *w = (uint32_t *)(void *)dst;
+#pragma unroll
+    for (int i = 0; i < 8; i++) w[i] = qw_pack4(wq + i * 4);
+}
+
+__device__ __forceinline__ static void qw_tile_store_zero(int8_t *dst) {
+    uint32_t *w = (uint32_t *)(void *)dst;
+#pragma unroll
+    for (int i = 0; i < 8; i++) w[i] = 0u;
+}
+
+/* Copy one 32-quant activation group from the quantised scratch into a tile
+ * row.  The scratch is a device allocation and every offset the caller cuts it
+ * at -- the group index block, the pair list and the quantised rows -- is a
+ * whole number of words, so a group start is always word aligned. */
+__device__ __forceinline__ static void qw_tile_copy_group(int8_t *dst,
+                                                          const int8_t *src) {
+    uint32_t *w = (uint32_t *)(void *)dst;
+    const uint32_t *s = (const uint32_t *)(const void *)src;
+#pragma unroll
+    for (int i = 0; i < 8; i++) w[i] = s[i];
+}
+
 __device__ __forceinline__ static void qw_mma_m16n8k32(
         int32_t *d, const uint32_t *a, const uint32_t *b) {
     asm volatile(
@@ -1462,9 +1582,9 @@ qwen4exp_moe_gateup_mma_kernel(
         uint32_t mid_dim,
         uint32_t mid_token_stride,
         uint32_t n_expert_used) {
-    __shared__ int8_t sAg[QW_MMA_BM * QW_MMA_LD];
-    __shared__ int8_t sAu[QW_MMA_BM * QW_MMA_LD];
-    __shared__ int8_t sB [QW_MMA_BN * QW_MMA_LD];
+    __shared__ __align__(16) int8_t sAg[QW_MMA_BM * QW_MMA_LD];
+    __shared__ __align__(16) int8_t sAu[QW_MMA_BM * QW_MMA_LD];
+    __shared__ __align__(16) int8_t sB [QW_MMA_BN * QW_MMA_LD];
     __shared__ float  sWAg[QW_MMA_BM * QW_MMA_G], sWBg[QW_MMA_BM * QW_MMA_G];
     __shared__ float  sWAu[QW_MMA_BM * QW_MMA_G], sWBu[QW_MMA_BM * QW_MMA_G];
     __shared__ float  sXS [QW_MMA_BN * QW_MMA_G];
@@ -1517,23 +1637,18 @@ qwen4exp_moe_gateup_mma_kernel(
                     dev_qwen4exp_group_decode(gate_type,
                             gate_e + (uint64_t)mrow * gate_row_bytes, g,
                             wq, wa, wb, &halves);
-#pragma unroll
-                    for (int i = 0; i < 32; i++) sAg[r * QW_MMA_LD + gg * 32 + i] = wq[i];
+                    qw_tile_store_group(&sAg[r * QW_MMA_LD + gg * 32], wq);
                     sWAg[r * QW_MMA_G + gg] = wa[0];
                     sWBg[r * QW_MMA_G + gg] = wb[0];
                     dev_qwen4exp_group_decode(up_type,
                             up_e + (uint64_t)mrow * up_row_bytes, g,
                             wq, wa, wb, &halves);
-#pragma unroll
-                    for (int i = 0; i < 32; i++) sAu[r * QW_MMA_LD + gg * 32 + i] = wq[i];
+                    qw_tile_store_group(&sAu[r * QW_MMA_LD + gg * 32], wq);
                     sWAu[r * QW_MMA_G + gg] = wa[0];
                     sWBu[r * QW_MMA_G + gg] = wb[0];
                 } else {
-#pragma unroll
-                    for (int i = 0; i < 32; i++) {
-                        sAg[r * QW_MMA_LD + gg * 32 + i] = 0;
-                        sAu[r * QW_MMA_LD + gg * 32 + i] = 0;
-                    }
+                    qw_tile_store_zero(&sAg[r * QW_MMA_LD + gg * 32]);
+                    qw_tile_store_zero(&sAu[r * QW_MMA_LD + gg * 32]);
                     sWAg[r * QW_MMA_G + gg] = 0.0f; sWBg[r * QW_MMA_G + gg] = 0.0f;
                     sWAu[r * QW_MMA_G + gg] = 0.0f; sWBu[r * QW_MMA_G + gg] = 0.0f;
                 }
@@ -1549,15 +1664,12 @@ qwen4exp_moe_gateup_mma_kernel(
                 if (p != 0xffffffffu && g < groups) {
                     const uint32_t token = p / n_expert_used;
                     const uint64_t at = (uint64_t)token * groups + g;
-#pragma unroll
-                    for (int i = 0; i < 32; i++) {
-                        sB[tk * QW_MMA_LD + gg * 32 + i] = xq[at * 32u + i];
-                    }
+                    qw_tile_copy_group(&sB[tk * QW_MMA_LD + gg * 32],
+                                       xq + at * 32u);
                     sXS  [tk * QW_MMA_G + gg] = xs[at];
                     sXSUM[tk * QW_MMA_G + gg] = (float)xsum[at];
                 } else {
-#pragma unroll
-                    for (int i = 0; i < 32; i++) sB[tk * QW_MMA_LD + gg * 32 + i] = 0;
+                    qw_tile_store_zero(&sB[tk * QW_MMA_LD + gg * 32]);
                     sXS[tk * QW_MMA_G + gg] = 0.0f;
                     sXSUM[tk * QW_MMA_G + gg] = 0.0f;
                 }
@@ -1574,8 +1686,8 @@ qwen4exp_moe_gateup_mma_kernel(
                 for (int r = 0; r < 4; r++) {
                     const uint32_t rr = ar + ((r & 1) ? 8u : 0u);
                     const uint32_t kk = gg * 32u + ak + ((r & 2) ? 16u : 0u);
-                    ag[r] = qw_pack4(&sAg[rr * QW_MMA_LD + kk]);
-                    au[r] = qw_pack4(&sAu[rr * QW_MMA_LD + kk]);
+                    ag[r] = qw_tile_word(&sAg[rr * QW_MMA_LD + kk]);
+                    au[r] = qw_tile_word(&sAu[rr * QW_MMA_LD + kk]);
                 }
                 const uint32_t m0 = warp * 16u + (lane >> 2);
                 const uint32_t m1 = m0 + 8u;
@@ -1584,8 +1696,9 @@ qwen4exp_moe_gateup_mma_kernel(
                     const uint32_t bn = nt * 8u + (lane >> 2);
 #pragma unroll
                     for (int r = 0; r < 2; r++) {
-                        bf[r] = qw_pack4(&sB[bn * QW_MMA_LD + gg * 32u +
-                                             (lane & 3u) * 4u + (r ? 16u : 0u)]);
+                        bf[r] = qw_tile_word(&sB[bn * QW_MMA_LD + gg * 32u +
+                                                 (lane & 3u) * 4u +
+                                                 (r ? 16u : 0u)]);
                     }
                     int32_t dg[4] = {0, 0, 0, 0}, du[4] = {0, 0, 0, 0};
                     qw_mma_m16n8k32(dg, ag, bf);
@@ -1669,8 +1782,8 @@ qwen4exp_moe_down_mma_kernel(
         uint32_t down_type,
         uint32_t groups,
         uint32_t out_dim) {
-    __shared__ int8_t sA[QW_MMA_BM * QW_MMA_LD];
-    __shared__ int8_t sB[QW_MMA_BN * QW_MMA_LD];
+    __shared__ __align__(16) int8_t sA[QW_MMA_BM * QW_MMA_LD];
+    __shared__ __align__(16) int8_t sB[QW_MMA_BN * QW_MMA_LD];
     __shared__ float  sWA[QW_MMA_BM * QW_MMA_G], sWB[QW_MMA_BM * QW_MMA_G];
     __shared__ float  sXS[QW_MMA_BN * QW_MMA_G], sXSUM[QW_MMA_BN * QW_MMA_G];
     __shared__ uint32_t sPair[QW_MMA_BN];
@@ -1716,13 +1829,11 @@ qwen4exp_moe_down_mma_kernel(
                     dev_qwen4exp_group_decode(down_type,
                             down_e + (uint64_t)orow * down_row_bytes, g,
                             wq, wa, wb, &halves);
-#pragma unroll
-                    for (int i = 0; i < 32; i++) sA[r * QW_MMA_LD + gg * 32 + i] = wq[i];
+                    qw_tile_store_group(&sA[r * QW_MMA_LD + gg * 32], wq);
                     sWA[r * QW_MMA_G + gg] = wa[0];
                     sWB[r * QW_MMA_G + gg] = wb[0];
                 } else {
-#pragma unroll
-                    for (int i = 0; i < 32; i++) sA[r * QW_MMA_LD + gg * 32 + i] = 0;
+                    qw_tile_store_zero(&sA[r * QW_MMA_LD + gg * 32]);
                     sWA[r * QW_MMA_G + gg] = 0.0f;
                     sWB[r * QW_MMA_G + gg] = 0.0f;
                 }
@@ -1735,15 +1846,12 @@ qwen4exp_moe_down_mma_kernel(
                 const uint32_t p = sPair[tk];
                 if (p != 0xffffffffu && g < groups) {
                     const uint64_t at = (uint64_t)p * groups + g;
-#pragma unroll
-                    for (int i = 0; i < 32; i++) {
-                        sB[tk * QW_MMA_LD + gg * 32 + i] = mq[at * 32u + i];
-                    }
+                    qw_tile_copy_group(&sB[tk * QW_MMA_LD + gg * 32],
+                                       mq + at * 32u);
                     sXS  [tk * QW_MMA_G + gg] = ms[at];
                     sXSUM[tk * QW_MMA_G + gg] = (float)msum[at];
                 } else {
-#pragma unroll
-                    for (int i = 0; i < 32; i++) sB[tk * QW_MMA_LD + gg * 32 + i] = 0;
+                    qw_tile_store_zero(&sB[tk * QW_MMA_LD + gg * 32]);
                     sXS[tk * QW_MMA_G + gg] = 0.0f;
                     sXSUM[tk * QW_MMA_G + gg] = 0.0f;
                 }
@@ -1760,7 +1868,7 @@ qwen4exp_moe_down_mma_kernel(
                 for (int r = 0; r < 4; r++) {
                     const uint32_t rr = ar + ((r & 1) ? 8u : 0u);
                     const uint32_t kk = gg * 32u + ak + ((r & 2) ? 16u : 0u);
-                    af[r] = qw_pack4(&sA[rr * QW_MMA_LD + kk]);
+                    af[r] = qw_tile_word(&sA[rr * QW_MMA_LD + kk]);
                 }
                 const uint32_t m0 = warp * 16u + (lane >> 2);
 #pragma unroll
@@ -1768,8 +1876,9 @@ qwen4exp_moe_down_mma_kernel(
                     const uint32_t bn = nt * 8u + (lane >> 2);
 #pragma unroll
                     for (int r = 0; r < 2; r++) {
-                        bf[r] = qw_pack4(&sB[bn * QW_MMA_LD + gg * 32u +
-                                             (lane & 3u) * 4u + (r ? 16u : 0u)]);
+                        bf[r] = qw_tile_word(&sB[bn * QW_MMA_LD + gg * 32u +
+                                                 (lane & 3u) * 4u +
+                                                 (r ? 16u : 0u)]);
                     }
                     int32_t d[4] = {0, 0, 0, 0};
                     qw_mma_m16n8k32(d, af, bf);
