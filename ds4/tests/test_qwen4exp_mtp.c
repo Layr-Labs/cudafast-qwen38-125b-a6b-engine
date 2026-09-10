@@ -1994,9 +1994,9 @@ static void test_head_wiring(void) {
           "reach every stream and the hidden half only its own", (double)worst);
     printf("  7 calls in order, eh_proj broadcast exact to %g\n", (double)worst);
 
-    /* The last-row entry the seam's draft_rows binds to: the same rows, the
-     * same launches, and only the final row's argmax and `multi` row read
-     * back.  Row HEAD_ROWS - 1 of the wide call above is the oracle. */
+    /* Seeds still reach the block, but only the last row reaches its
+     * stateless final mixer and vocabulary projection.  The wide call is
+     * the independent oracle for the proposal and preserved hyper row. */
     {
         int draft_last[1] = { -1 };
         float multi_last[HEAD_HC_DIM];
@@ -2009,6 +2009,9 @@ static void test_head_wiring(void) {
         CHECK(g_log.n_log - calls_before == n_want,
               "the last-row forward made %d calls, expected %d",
               g_log.n_log - calls_before, n_want);
+        CHECK(g_log.block_tokens == HEAD_ROWS && g_log.mixer_rows == 1u &&
+                  g_log.mm_ntok[3] == 1u,
+              "last-only must keep all block rows and project one logit row");
         CHECK(draft_last[0] == draft[HEAD_ROWS - 1u],
               "the last-row forward drafted %d, the wide forward's last row "
               "drafted %d", draft_last[0], draft[HEAD_ROWS - 1u]);
@@ -2057,6 +2060,11 @@ static void test_head_wiring(void) {
                       "special-value case %u row %u drafted %d, CPU reference %d",
                       c, t, got[t], want);
             }
+            /* Inject the same final-row distribution at the narrowed
+             * vocabulary projection's output.  Its physical row is zero. */
+            g_forced_lm_logits = cases[c] +
+                (size_t)(HEAD_ROWS - 1u) * HEAD_N_VOCAB;
+            g_forced_lm_rows = 1u;
             CHECK(ds4_qwen4exp_mtp_head_forward_last(
                       &h, next_tokens, multi_in, 12u, HEAD_ROWS, got_last,
                       NULL, g_err, sizeof(g_err)) == 0,
