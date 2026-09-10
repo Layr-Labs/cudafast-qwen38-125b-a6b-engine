@@ -5556,7 +5556,7 @@ __global__ static void matmul_q8_0_preq_warp8_kernel(
         uint64_t out_dim,
         uint64_t blocks,
         int use_dp4a) {
-    uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    uint64_t row = (uint64_t)blockIdx.x * (blockDim.x >> 5u) + (threadIdx.x >> 5u);
     const uint64_t tok = (uint64_t)blockIdx.y;
     uint32_t lane = threadIdx.x & 31u;
     if (row >= out_dim) return;
@@ -5606,7 +5606,7 @@ __global__ static void matmul_q8_0_preq_rows_exact_tile_kernel(
         uint32_t n_rows,
         uint64_t blocks,
         int use_dp4a) {
-    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint64_t row = (uint64_t)blockIdx.x * (blockDim.x >> 5u) + (threadIdx.x >> 5u);
     const uint32_t row0 = (uint32_t)blockIdx.y * (uint32_t)R;
     const uint32_t lane = threadIdx.x & 31u;
     if (row >= out_dim || row0 >= n_rows) return;
@@ -16484,7 +16484,17 @@ extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
 #undef DS4_Q8_DENSE_MMA_LAUNCH
 
     const int use_dp4a = cuda_q8_use_dp4a();
-    const unsigned wgrid = ((unsigned)out_dim + 7u) / 8u;
+    /* A warp owns an independent output row.  Narrow projections (notably
+     * the HC 10240->320 down projection) had only forty eight-warp blocks,
+     * leaving SMs idle even though each row has a long K walk.  Spread those
+     * same warps across one-warp blocks so all SMs can schedule live rows.
+     * Each lane retains its groups, accumulator and reduction; no split-K or
+     * extra synchronization is involved.  Wide/prefill calls keep their old
+     * block geometry.  The override permits a same-binary geometry check. */
+    const unsigned warps = n_rows < 8u && out_dim <= 512u &&
+        getenv("DS4_QWEN4EXP_Q8_WIDE_BLOCKS") == NULL ? 1u : 8u;
+    const unsigned wthreads = warps * 32u;
+    const unsigned wgrid = ((unsigned)out_dim + warps - 1u) / warps;
 
     /* Without the MMA -- an older card, or DS4_QWEN4EXP_NO_ROW_TILE, which is
      * how the before/after prefill measurement runs on one binary -- the older
@@ -16493,7 +16503,7 @@ extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
      * eight rows with the SAME per-row arithmetic. */
     if (n_rows == 1u || getenv("DS4_QWEN4EXP_NO_ROW_TILE") != NULL) {
         dim3 grid(wgrid, n_rows, 1u);
-        matmul_q8_0_preq_warp8_kernel<<<grid, 256, 0, cuda_decode_stream()>>>(
+        matmul_q8_0_preq_warp8_kernel<<<grid, wthreads, 0, cuda_decode_stream()>>>(
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
                 xq, xscale, in_dim, out_dim, blocks, use_dp4a);
@@ -16503,21 +16513,21 @@ extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
     if (n_rows >= 8u) {
         dim3 grid(wgrid, (n_rows + 7u) / 8u, 1u);
         matmul_q8_0_preq_rows_exact_tile_kernel<8>
-            <<<grid, 256, 0, cuda_decode_stream()>>>(
+            <<<grid, wthreads, 0, cuda_decode_stream()>>>(
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
                 xq, xscale, in_dim, out_dim, n_rows, blocks, use_dp4a);
     } else if (n_rows >= 4u) {
         dim3 grid(wgrid, (n_rows + 3u) / 4u, 1u);
         matmul_q8_0_preq_rows_exact_tile_kernel<4>
-            <<<grid, 256, 0, cuda_decode_stream()>>>(
+            <<<grid, wthreads, 0, cuda_decode_stream()>>>(
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
                 xq, xscale, in_dim, out_dim, n_rows, blocks, use_dp4a);
     } else {
         dim3 grid(wgrid, (n_rows + 1u) / 2u, 1u);
         matmul_q8_0_preq_rows_exact_tile_kernel<2>
-            <<<grid, 256, 0, cuda_decode_stream()>>>(
+            <<<grid, wthreads, 0, cuda_decode_stream()>>>(
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
                 xq, xscale, in_dim, out_dim, n_rows, blocks, use_dp4a);

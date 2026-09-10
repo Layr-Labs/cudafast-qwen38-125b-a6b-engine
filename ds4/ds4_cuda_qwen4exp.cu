@@ -1902,6 +1902,11 @@ qwen4exp_moe_gateup_mma_kernel(
                 const uint32_t m1 = m0 + 8u;
 #pragma unroll
                 for (int nt = 0; nt < QW_MMA_NT; nt++) {
+                    /* An MMA column covers eight pairs.  Expert tails often
+                     * occupy only one or two columns; whole empty columns
+                     * have no consumer.  take is block-uniform, so all lanes
+                     * still participate in every live MMA instruction. */
+                    if (nt * 8 >= take) break;
                     const uint32_t bn = nt * 8u + (lane >> 2);
 #pragma unroll
                     for (int r = 0; r < 2; r++) {
@@ -2082,6 +2087,11 @@ qwen4exp_moe_down_mma_kernel(
                 const uint32_t m0 = warp * 16u + (lane >> 2);
 #pragma unroll
                 for (int nt = 0; nt < QW_MMA_NT; nt++) {
+                    /* An MMA column covers eight pairs.  Expert tails often
+                     * occupy only one or two columns; whole empty columns
+                     * have no consumer.  take is block-uniform, so all lanes
+                     * still participate in every live MMA instruction. */
+                    if (nt * 8 >= take) break;
                     const uint32_t bn = nt * 8u + (lane >> 2);
 #pragma unroll
                     for (int r = 0; r < 2; r++) {
