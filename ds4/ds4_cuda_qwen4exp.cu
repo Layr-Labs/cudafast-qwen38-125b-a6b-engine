@@ -2970,12 +2970,36 @@ extern "C" int ds4_gpu_qwen4exp_hc_inject_tensor(
 #define QWEN4EXP_QSA_MASKED_SCORE (-3.0e38f)
 #define QWEN4EXP_QSA_MASKED_LIMIT (-1.0e30f)
 
-/* Sum sdata[0 .. nth) into sdata[0]; `nth` must be a power of two. */
+/* Sum sdata[0 .. nth) into sdata[0]; `nth` must be a power of two.
+ *
+ * The last five steps of the tree pair lanes of the first warp with each
+ * other, so they are that warp's own shuffle tree: the same operands added in
+ * the same order, without the five block barriers the shared-memory form
+ * spends on threads that have already finished.  A block narrower than a warp
+ * keeps the shared-memory form, which has no lane mask to get wrong.  The
+ * maximum below takes the same shape. */
 __device__ __forceinline__ static float qwen4exp_blk_sum(
         float *sdata, uint32_t tid, uint32_t nth) {
-    for (uint32_t step = nth >> 1; step > 0u; step >>= 1) {
+    if (nth < 32u) {
+        for (uint32_t step = nth >> 1; step > 0u; step >>= 1) {
+            __syncthreads();
+            if (tid < step) sdata[tid] += sdata[tid + step];
+        }
+        __syncthreads();
+        return sdata[0];
+    }
+    for (uint32_t step = nth >> 1; step >= 32u; step >>= 1) {
         __syncthreads();
         if (tid < step) sdata[tid] += sdata[tid + step];
+    }
+    __syncthreads();
+    if (tid < 32u) {
+        float v = sdata[tid];
+#pragma unroll
+        for (uint32_t step = 16u; step > 0u; step >>= 1) {
+            v += __shfl_down_sync(0xffffffffu, v, step);
+        }
+        if (tid == 0u) sdata[0] = v;
     }
     __syncthreads();
     return sdata[0];
@@ -2983,9 +3007,26 @@ __device__ __forceinline__ static float qwen4exp_blk_sum(
 
 __device__ __forceinline__ static float qwen4exp_blk_max(
         float *sdata, uint32_t tid, uint32_t nth) {
-    for (uint32_t step = nth >> 1; step > 0u; step >>= 1) {
+    if (nth < 32u) {
+        for (uint32_t step = nth >> 1; step > 0u; step >>= 1) {
+            __syncthreads();
+            if (tid < step) sdata[tid] = fmaxf(sdata[tid], sdata[tid + step]);
+        }
+        __syncthreads();
+        return sdata[0];
+    }
+    for (uint32_t step = nth >> 1; step >= 32u; step >>= 1) {
         __syncthreads();
         if (tid < step) sdata[tid] = fmaxf(sdata[tid], sdata[tid + step]);
+    }
+    __syncthreads();
+    if (tid < 32u) {
+        float v = sdata[tid];
+#pragma unroll
+        for (uint32_t step = 16u; step > 0u; step >>= 1) {
+            v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, step));
+        }
+        if (tid == 0u) sdata[0] = v;
     }
     __syncthreads();
     return sdata[0];
@@ -3332,7 +3373,7 @@ __global__ static void qwen4exp_qsa_attention_kernel(
         uint32_t max_selected,
         uint32_t sparse,
         float scale) {
-    extern __shared__ float qwen4exp_attn_shared[];
+    extern __shared__ __align__(16) float qwen4exp_attn_shared[];
     const uint32_t head = blockIdx.x;
     const uint32_t token = blockIdx.y;
     const uint32_t tid = threadIdx.x;
@@ -3374,7 +3415,39 @@ __global__ static void qwen4exp_qsa_attention_kernel(
                 const float *kv = k_cache +
                     (uint64_t)key * kv_stride + (uint64_t)kv_head * head_dim;
                 float dot = 0.0f;
-                for (uint32_t d = 0; d < head_dim; d++) dot += qvec[d] * kv[d];
+                /* One 16-byte load per four channels instead of four 4-byte
+                 * ones.  Consecutive lanes hold DIFFERENT keys, so the row a
+                 * lane walks is its own: a scalar walk asks the cache for a
+                 * 32-byte sector per lane per channel and uses four bytes of
+                 * it, and this unit's key rows are far too many to keep those
+                 * sectors in L1 between channels.  A word load spends one
+                 * sector on sixteen bytes and issues a quarter of the
+                 * instructions.  The products are the same four, added to
+                 * `dot` in the same order, so the score is bit for bit the
+                 * one the scalar walk returned.
+                 *
+                 * head_dim divides four here, and both `kv_stride` and the
+                 * head offset are whole multiples of head_dim, so the row
+                 * base is 16-byte aligned; the shared query block is aligned
+                 * by its declaration.  The scalar walk stays for a head_dim
+                 * that is not a multiple of four. */
+                if ((head_dim & 3u) == 0u) {
+                    const float4 *kv4 = (const float4 *)kv;
+                    const float4 *qv4 = (const float4 *)qvec;
+                    const uint32_t words = head_dim >> 2u;
+                    for (uint32_t w = 0; w < words; w++) {
+                        const float4 kk = kv4[w];
+                        const float4 qq = qv4[w];
+                        dot += qq.x * kk.x;
+                        dot += qq.y * kk.y;
+                        dot += qq.z * kk.z;
+                        dot += qq.w * kk.w;
+                    }
+                } else {
+                    for (uint32_t d = 0; d < head_dim; d++) {
+                        dot += qvec[d] * kv[d];
+                    }
+                }
                 score = dot * scale;
             } else {
                 key = -1;
