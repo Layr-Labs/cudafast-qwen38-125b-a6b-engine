@@ -2764,6 +2764,161 @@ __global__ static void qwen4exp_shared_down_stage_kernel(
 }
 
 
+/* Q8_0 blocks have a two-byte header and a 34-byte stride.  Read the same
+ * packed quants without an unaligned word load or a read past the block. */
+__device__ __forceinline__ static uint32_t qw_shared_q8_word(const char *p) {
+    if (qwen4exp_word_aligned(p)) return qw_tile_word((const int8_t *)p);
+    if (((uintptr_t)p & 1u) == 0u) {
+        const uint16_t *h = (const uint16_t *)(const void *)p;
+        return (uint32_t)h[0] | ((uint32_t)h[1] << 16u);
+    }
+    return qw_pack4((const int8_t *)p);
+}
+
+enum { QW_SH_BM = 16, QW_SH_BN = 32, QW_SH_NT = QW_SH_BN / 8,
+       QW_SH_WARPS = 16, QW_SH_THREADS = QW_SH_WARPS * 32 };
+
+/* Each warp computes the group sums of dp4a lanes W and W+16 separately:
+ * g = L, L+32, ... .  Adding these two sums is reduction step 16.  Shared
+ * memory then performs steps 8, 4, 2, 1 with the same left/right operands as
+ * warp_sum_f32.  Each MMA starts at int32 zero and covers ONE group only.
+ * Weights go straight from the original Q8_0 bytes to operand registers.
+ *
+ * GateUp fuses gate/up/SiLU; the other instance adds gate_scale * down to out.
+ * wb is passed as +0.0f: keep the dp4a offset expression as a runtime operand,
+ * including its signed-zero behavior.  Do not fold it away or reassociate.
+ */
+template <bool GateUp>
+__global__ __launch_bounds__(QW_SH_THREADS) static void
+qwen4exp_shared_q8_mma_kernel(
+        float *out, const char *w0, const char *w1,
+        const int8_t *xq, const float *xs, const int32_t *xsum,
+        const float *gate_scale, uint64_t row_bytes0, uint64_t row_bytes1,
+        uint32_t groups, uint32_t out_dim, uint32_t n_tokens, float wb) {
+    enum { NP = GateUp ? 2 : 1, NF = QW_SH_NT * 4 };
+    __shared__ float partial[NP][QW_SH_WARPS / 2][NF][32];
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t row0 = blockIdx.x * QW_SH_BM;
+    const uint32_t tok0 = blockIdx.y * QW_SH_BN;
+    const uint32_t mr0 = row0 + (lane >> 2u);
+    const uint32_t ak = (lane & 3u) * 4u;
+    float total[NP][NF];
+
+#pragma unroll
+    for (int half = 0; half < 2; half++) {
+        float acc[NP][NF];
+#pragma unroll
+        for (int p = 0; p < NP; p++) {
+#pragma unroll
+            for (int i = 0; i < NF; i++) acc[p][i] = 0.0f;
+        }
+        for (uint32_t g = warp + (uint32_t)half * 16u; g < groups; g += 32u) {
+            uint32_t a[NP][4];
+            float wa[NP][2];
+#pragma unroll
+            for (int p = 0; p < NP; p++) {
+                const char *weight = p == 0 ? w0 : w1;
+                const uint64_t row_bytes = p == 0 ? row_bytes0 : row_bytes1;
+#pragma unroll
+                for (int r = 0; r < 2; r++) {
+                    const uint32_t mr = mr0 + (uint32_t)r * 8u;
+                    a[p][r] = a[p][r + 2] = 0u;
+                    wa[p][r] = 0.0f;
+                    if (mr < out_dim) {
+                        const char *blk = weight + (uint64_t)mr * row_bytes +
+                                          (uint64_t)g * 34u;
+                        const uint16_t d = (uint16_t)(uint8_t)blk[0] |
+                                          ((uint16_t)(uint8_t)blk[1] << 8u);
+                        wa[p][r] = dev_f16_to_f32(d);
+                        a[p][r] = qw_shared_q8_word(blk + 2u + ak);
+                        a[p][r + 2] = qw_shared_q8_word(blk + 18u + ak);
+                    }
+                }
+            }
+#pragma unroll
+            for (int nt = 0; nt < QW_SH_NT; nt++) {
+                const uint32_t bt = tok0 + (uint32_t)nt * 8u + (lane >> 2u);
+                uint32_t b[2] = {0u, 0u};
+                if (bt < n_tokens) {
+                    const int8_t *q = xq + ((uint64_t)bt * groups + g) * 32u;
+                    b[0] = qw_tile_word(q + ak);
+                    b[1] = qw_tile_word(q + ak + 16u);
+                }
+#pragma unroll
+                for (int p = 0; p < NP; p++) {
+                    int32_t dot[4] = {0, 0, 0, 0};
+                    qw_mma_m16n8k32(dot, a[p], b);
+#pragma unroll
+                    for (int r = 0; r < 4; r++) {
+                        const uint32_t tok = tok0 + (uint32_t)nt * 8u +
+                                             (lane & 3u) * 2u + (r & 1);
+                        if (tok < n_tokens) {
+                            const uint64_t at = (uint64_t)tok * groups + g;
+                            const float sc = xs[at];
+                            const int32_t sm = xsum[at];
+                            /* qwen4exp_group_accumulate, halves == 1. */
+                            acc[p][nt * 4 + r] += (wa[p][r >> 1] * sc) * (float)dot[r];
+                            acc[p][nt * 4 + r] += (wb * sc) * (float)sm;
+                        }
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int p = 0; p < NP; p++) {
+#pragma unroll
+            for (int i = 0; i < NF; i++) {
+                if (half == 0) total[p][i] = acc[p][i];
+                else total[p][i] += acc[p][i];
+            }
+        }
+    }
+
+#pragma unroll
+    for (int offset = 8; offset > 0; offset >>= 1) {
+        if (warp >= (uint32_t)offset && warp < (uint32_t)offset * 2u) {
+#pragma unroll
+            for (int p = 0; p < NP; p++) {
+#pragma unroll
+                for (int i = 0; i < NF; i++)
+                    partial[p][warp - offset][i][lane] = total[p][i];
+            }
+        }
+        __syncthreads();
+        if (warp < (uint32_t)offset) {
+#pragma unroll
+            for (int p = 0; p < NP; p++) {
+#pragma unroll
+                for (int i = 0; i < NF; i++)
+                    total[p][i] += partial[p][warp][i][lane];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (warp == 0u) {
+#pragma unroll
+        for (int nt = 0; nt < QW_SH_NT; nt++) {
+#pragma unroll
+            for (int r = 0; r < 4; r++) {
+                const uint32_t row = mr0 + ((r & 2) ? 8u : 0u);
+                const uint32_t tok = tok0 + (uint32_t)nt * 8u +
+                                     (lane & 3u) * 2u + (r & 1);
+                if (row < out_dim && tok < n_tokens) {
+                    const uint64_t at = (uint64_t)tok * out_dim + row;
+                    const float v = total[0][nt * 4 + r];
+                    if (GateUp) {
+                        out[at] = (v / (1.0f + expf(-v))) * total[1][nt * 4 + r];
+                    } else {
+                        out[at] += gate_scale[tok] * v;
+                    }
+                }
+            }
+        }
+    }
+}
+
 __global__ static void qwen4exp_shared_gate_kernel(
         float *gate_out,
         const char *router,
@@ -3233,7 +3388,31 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_tensor(
     const int stage_gateup = qwen4exp_shared_stage_ok(xq, xgroups, 2, n_tokens);
     const int stage_down = qwen4exp_shared_stage_ok(mq, mgroups, 1, n_tokens);
 
-    if (stage_gateup) {
+    /* The m16n8k32 pair, taken ahead of both paths above when the whole shared
+     * expert is Q8_0 and the call is a prefill.  It returns the per-row
+     * kernels' bits and is the faster of the three there (GB10, prefill 528 ->
+     * 638 tok/s); below 64 tokens it never runs, so a decode and a verify
+     * dispatch exactly as they did before it existed.  It declines to the same
+     * two pins the staged path declines to, so a test that fixes the shared
+     * expert on one path still gets that path -- DS4_QWEN4EXP_SHARED_STAGE=0
+     * is the per-row oracle for all three, and =1 the staged path at every
+     * width.  Only the shared expert is affected; routed MMA is untouched. */
+    const int use_mma = n_tokens >= 64u &&
+        gate_slab->type == (uint32_t)DS4_QWEN4EXP_TY_q8_0 &&
+        up_slab->type == (uint32_t)DS4_QWEN4EXP_TY_q8_0 &&
+        down_slab->type == (uint32_t)DS4_QWEN4EXP_TY_q8_0 &&
+        getenv("DS4_QWEN4EXP_SHARED_STAGE") == NULL &&
+        getenv("DS4_QWEN4EXP_MOE_R") == NULL;
+    const uint32_t mma_tiles = (n_tokens + QW_SH_BN - 1u) / QW_SH_BN;
+
+    if (use_mma) {
+        qwen4exp_shared_q8_mma_kernel<true><<<
+                dim3((mid_dim + QW_SH_BM - 1u) / QW_SH_BM, mma_tiles, 1),
+                QW_SH_THREADS, 0, stream>>>(
+                (float *)mid->ptr, gate, up, xq, xs, xsum, NULL,
+                gate_slab->row_bytes, up_slab->row_bytes,
+                xgroups, mid_dim, n_tokens, 0.0f);
+    } else if (stage_gateup) {
         qwen4exp_shared_gateup_stage_kernel<QWEN4EXP_STAGE_R>
             <<<dim3(mid_dim, stage_tiles, 1), QWEN4EXP_STAGE_THREADS,
                (size_t)qwen4exp_stage_bytes(xgroups, 2), stream>>>(
@@ -3260,7 +3439,14 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_tensor(
         return 0;
     }
 
-    if (stage_down) {
+    if (use_mma) {
+        qwen4exp_shared_q8_mma_kernel<false><<<
+                dim3((out_dim + QW_SH_BM - 1u) / QW_SH_BM, mma_tiles, 1),
+                QW_SH_THREADS, 0, stream>>>(
+                (float *)out->ptr, down, NULL, mq, ms, msum,
+                (const float *)gate_scale->ptr, down_slab->row_bytes, 0,
+                mgroups, out_dim, n_tokens, 0.0f);
+    } else if (stage_down) {
         qwen4exp_shared_down_stage_kernel<QWEN4EXP_STAGE_R>
             <<<dim3(out_dim, stage_tiles, 1), QWEN4EXP_STAGE_THREADS,
                (size_t)qwen4exp_stage_bytes(mgroups, 1), stream>>>(
