@@ -742,8 +742,6 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
 
 void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     if (!s) return;
-    /* Graph nodes retain session buffer addresses, even across resets. */
-    ds4_gpu_decode_graphs_invalidate();
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
         ds4_gpu_tensor_free(s->gdn_conv[il]);
         ds4_gpu_tensor_free(s->gdn_state[il]);
@@ -1803,118 +1801,6 @@ static bool qwen4exp_graph_residual(ds4_qwen4exp_session *s,
         DS4_HC_EPS, norm_weight_offset, 1) != 0;
 }
 
-/* Two fixed launch sequences per layer.  The GDN reads and updates tensor
- * state in place and takes no position argument; QSA, PLE and token uploads
- * stay outside capture.  Every replay still computes on the current inputs.
- * Only small decode/verify widths capture; prefill retains its eager kernels.
- */
-static bool qwen4exp_graph_layer_island_encode(
-        ds4_qwen4exp_session *s, const ds4_qwen4exp_layer_weights *l,
-        const ds4_model *m, uint32_t il, uint32_t n_tokens, uint32_t island) {
-    if (island == 0u) {
-        /* --- attention side ------------------------------------------- */
-        if (!qwen4exp_graph_residual(s, m, l->hc_attn_norm, l->hc_attn_down,
-                                     l->hc_attn_up, l->hc_attn_inject,
-                                     l->hc_attn_norm_offset, n_tokens)) {
-            fprintf(stderr, "ds4: qwen4exp attention mixer failed at block %u\n", il);
-            return false;
-        }
-        QW_TRACE(QW_SLICE_ATTN_MIX);
-        if (!l->is_full_attention) {
-            if (!qwen4exp_graph_gdn_block(s, l, m, il, n_tokens)) return false;
-            QW_TRACE(QW_SLICE_GDN);
-        }
-    } else {
-        if (!ds4_gpu_qwen4exp_hc_inject_tensor(s->hyper, s->hyper, s->block_out,
-                                               s->inject, DS4_N_EMBD, DS4_N_HC,
-                                               n_tokens)) {
-            fprintf(stderr, "ds4: qwen4exp attention inject failed at block %u\n", il);
-            return false;
-        }
-        QW_TRACE(QW_SLICE_ATTN_INJECT);
-
-        /* --- feed-forward side ---------------------------------------- */
-        if (!qwen4exp_graph_residual(s, m, l->hc_ffn_norm, l->hc_ffn_down,
-                                     l->hc_ffn_up, l->hc_ffn_inject,
-                                     l->hc_ffn_norm_offset, n_tokens)) {
-            fprintf(stderr, "ds4: qwen4exp FFN mixer failed at block %u\n", il);
-            return false;
-        }
-        QW_TRACE(QW_SLICE_FFN_MIX);
-        if (!qwen4exp_graph_moe_block(s, l, m, il, n_tokens)) {
-            return false;
-        }
-        QW_TRACE(QW_SLICE_MOE);
-        if (!ds4_gpu_qwen4exp_hc_inject_tensor(s->hyper, s->hyper, s->block_out,
-                                               s->inject, DS4_N_EMBD, DS4_N_HC,
-                                               n_tokens)) {
-            fprintf(stderr, "ds4: qwen4exp FFN inject failed at block %u\n", il);
-            return false;
-        }
-        QW_TRACE(QW_SLICE_FFN_INJECT);
-    }
-    return true;
-}
-
-static bool qwen4exp_graph_layer_island(
-        ds4_qwen4exp_session *s, const ds4_qwen4exp_layer_weights *l,
-        const ds4_model *m, uint32_t il, uint32_t n_tokens, uint32_t island) {
-    /* Profilers synchronize between operations, which is forbidden inside
-     * capture.  They must also execute the individual call sites on replay. */
-    const bool capture_ok =
-        n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
-        !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
-        ds4_gpu_decode_graphs_supported();
-    if (capture_ok) {
-        ds4_decode_graph_key key;
-        memset(&key, 0, sizeof(key));
-        key.il = il;
-        key.island = island;
-        /* Snapshot writes are part of GDN: an ordinary two-row feed and a
-         * two-row verify must not share an executable with different writes. */
-        key.variant = n_tokens | (s->spec_snapshot_rows << 8u);
-        key._pad = 0x5157454eu;  /* QWEN: separate from other model families */
-        key.cur_hc = s->hyper;
-        key.after_attn_hc = s;
-        key.after_ffn_hc = (void *)l;
-        key.attn_norm = (void *)m;
-        const int state = ds4_gpu_decode_graph_begin(&key);
-        if (state == 1) {
-            /* Preserve the diagnostic slice sequence when host encoding is
-             * skipped.  The synchronizing profiler takes the eager path. */
-            if (island == 0u) {
-                QW_TRACE(QW_SLICE_ATTN_MIX);
-                if (!l->is_full_attention) QW_TRACE(QW_SLICE_GDN);
-            } else {
-                QW_TRACE(QW_SLICE_ATTN_INJECT);
-                QW_TRACE(QW_SLICE_FFN_MIX);
-                QW_TRACE(QW_SLICE_MOE);
-                QW_TRACE(QW_SLICE_FFN_INJECT);
-            }
-            return true;
-        }
-        if (state == 0) {
-#ifdef DS4_TEST_HOOKS
-            const uint32_t trace_len = g_qwen4exp_trace_len;
-            const bool trace_overflow = g_qwen4exp_trace_overflow;
-#endif
-            if (qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens,
-                                                   island)) {
-                if (ds4_gpu_decode_graph_end(&key) == 0) return true;
-            } else {
-                ds4_gpu_decode_graph_abort(&key);
-            }
-#ifdef DS4_TEST_HOOKS
-            g_qwen4exp_trace_len = trace_len;
-            g_qwen4exp_trace_overflow = trace_overflow;
-#endif
-            /* Failed capture executed nothing.  The backend retires it;
-             * re-encode this call eagerly exactly once, including on error. */
-        }
-    }
-    return qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens, island);
-}
-
 /* ======================================================================
  * The forward.
  * ====================================================================== */
@@ -2102,18 +1988,52 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
             QW_TRACE(QW_SLICE_PLE);
         }
 
-        if (!qwen4exp_graph_layer_island(s, l, m, il, n_tokens, 0u)) {
+        /* --- attention side ------------------------------------------- */
+        if (!qwen4exp_graph_residual(s, m, l->hc_attn_norm, l->hc_attn_down,
+                                     l->hc_attn_up, l->hc_attn_inject,
+                                     l->hc_attn_norm_offset, n_tokens)) {
+            fprintf(stderr, "ds4: qwen4exp attention mixer failed at block %u\n", il);
             return qwen4exp_forward_fail();
         }
+        QW_TRACE(QW_SLICE_ATTN_MIX);
         if (l->is_full_attention) {
             if (!qwen4exp_graph_qsa_block(s, l, m, il, n_tokens)) {
                 return qwen4exp_forward_fail();
             }
             QW_TRACE(QW_SLICE_QSA);
+        } else {
+            if (!qwen4exp_graph_gdn_block(s, l, m, il, n_tokens)) {
+                return qwen4exp_forward_fail();
+            }
+            QW_TRACE(QW_SLICE_GDN);
         }
-        if (!qwen4exp_graph_layer_island(s, l, m, il, n_tokens, 1u)) {
+        if (!ds4_gpu_qwen4exp_hc_inject_tensor(s->hyper, s->hyper, s->block_out,
+                                               s->inject, DS4_N_EMBD, DS4_N_HC,
+                                               n_tokens)) {
+            fprintf(stderr, "ds4: qwen4exp attention inject failed at block %u\n", il);
             return qwen4exp_forward_fail();
         }
+        QW_TRACE(QW_SLICE_ATTN_INJECT);
+
+        /* --- feed-forward side ---------------------------------------- */
+        if (!qwen4exp_graph_residual(s, m, l->hc_ffn_norm, l->hc_ffn_down,
+                                     l->hc_ffn_up, l->hc_ffn_inject,
+                                     l->hc_ffn_norm_offset, n_tokens)) {
+            fprintf(stderr, "ds4: qwen4exp FFN mixer failed at block %u\n", il);
+            return qwen4exp_forward_fail();
+        }
+        QW_TRACE(QW_SLICE_FFN_MIX);
+        if (!qwen4exp_graph_moe_block(s, l, m, il, n_tokens)) {
+            return qwen4exp_forward_fail();
+        }
+        QW_TRACE(QW_SLICE_MOE);
+        if (!ds4_gpu_qwen4exp_hc_inject_tensor(s->hyper, s->hyper, s->block_out,
+                                               s->inject, DS4_N_EMBD, DS4_N_HC,
+                                               n_tokens)) {
+            fprintf(stderr, "ds4: qwen4exp FFN inject failed at block %u\n", il);
+            return qwen4exp_forward_fail();
+        }
+        QW_TRACE(QW_SLICE_FFN_INJECT);
 #ifdef DS4_TEST_HOOKS
         qwen4exp_layer_dump(s, il, n_tokens);
 #endif

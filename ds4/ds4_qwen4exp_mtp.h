@@ -593,12 +593,6 @@ typedef struct {
                  uint64_t model_size, uint64_t weight_offset,
                  uint32_t weight_type, uint32_t n_vocab, uint32_t n_tokens,
                  uint32_t n_embd, uint32_t n_hc);
-    /* Optional backend packer for [embedding | hidden-stream] rows.  NULL
-     * keeps the portable tensor-copy sequence used by the tests and by
-     * backends without a fused implementation. */
-    int (*ehx_pack)(ds4_gpu_tensor *out, const ds4_gpu_tensor *embedding,
-                    const ds4_gpu_tensor *hidden, uint32_t n_tokens,
-                    uint32_t n_hc, uint32_t n_embd);
     int (*matmul_q8_0)(ds4_gpu_tensor *out, const void *model_map,
                        uint64_t model_size, uint64_t weight_offset,
                        uint64_t in_dim, uint64_t out_dim,
