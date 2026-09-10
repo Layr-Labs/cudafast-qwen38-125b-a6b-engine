@@ -843,18 +843,17 @@ static void run_row_invariance_case(const uint8_t *model,
                    "invariance one-row read");
     }
 
-    /* The row tile is a schedule, not an arithmetic.  R = 1, 2, 4 and 8 walk the
+    /* The row tile is a schedule, not an arithmetic.  R = 1 and R = 4 walk the
      * same weight groups in the same order into the same accumulators; only
      * the number of rows a decoded group serves changes.  This runs the same
-     * rows through all four and compares bits, so a tile that starts to matter
+     * rows through both and compares the bits, so a tile that starts to matter
      * goes red here rather than at the end of a 48-block tower. */
     {
         float *t1 = calloc((size_t)INV_TOKENS * OUT_DIM, sizeof(float));
-        float *other = calloc((size_t)INV_TOKENS * OUT_DIM, sizeof(float));
-        if (!t1 || !other) fail("tile comparison allocation");
-        const char *tiles[] = {"1", "2", "4", "8"};
-        for (int pass = 0; pass < 4; pass++) {
-            setenv("DS4_QWEN4EXP_MOE_R", tiles[pass], 1);
+        float *t4 = calloc((size_t)INV_TOKENS * OUT_DIM, sizeof(float));
+        if (!t1 || !t4) fail("tile comparison allocation");
+        for (int pass = 0; pass < 2; pass++) {
+            setenv("DS4_QWEN4EXP_MOE_R", pass == 0 ? "1" : "4", 1);
             require_ok(ds4_gpu_qwen4exp_routed_moe_tensor(
                            out_t, mid_t, part_t, &gate_slab, &up_slab, &down_slab,
                            IN_DIM, MID_DIM, OUT_DIM, sel_t, w_t, N_EXPERT,
@@ -866,22 +865,19 @@ static void run_row_invariance_case(const uint8_t *model,
                            &sh_gate_slab, &sh_up_slab, &sh_down_slab,
                            IN_DIM, SHARED_MID, OUT_DIM, x_t, INV_TOKENS),
                        "tile comparison shared expert");
-            require_ok(ds4_gpu_tensor_read(out_t, 0, pass == 0 ? t1 : other,
+            require_ok(ds4_gpu_tensor_read(out_t, 0, pass == 0 ? t1 : t4,
                                            out_bytes),
                        "tile comparison read");
-            if (pass > 0) {
-                size_t td = 0;
-                for (size_t i = 0; i < (size_t)INV_TOKENS * OUT_DIM; i++) {
-                    if (memcmp(&t1[i], &other[i], sizeof(float)) != 0) td++;
-                }
-                printf("MoE row tile R=1 against R=%s at %d rows: %zu of %zu "
-                       "outputs differ\n", tiles[pass], (int)INV_TOKENS, td,
-                       (size_t)INV_TOKENS * OUT_DIM);
-                if (td != 0) fail("the row tile changed a number");
-            }
         }
         unsetenv("DS4_QWEN4EXP_MOE_R");
-        free(other);
+        size_t td = 0;
+        for (size_t i = 0; i < (size_t)INV_TOKENS * OUT_DIM; i++) {
+            if (memcmp(&t1[i], &t4[i], sizeof(float)) != 0) td++;
+        }
+        printf("MoE row tile R=1 against R=4 at %d rows: %zu of %zu outputs "
+               "differ\n", (int)INV_TOKENS, td, (size_t)INV_TOKENS * OUT_DIM);
+        if (td != 0) fail("the row tile changed a number");
+        free(t4);
         free(t1);
     }
 

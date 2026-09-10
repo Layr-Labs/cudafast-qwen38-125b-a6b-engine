@@ -305,6 +305,15 @@ typedef struct {
     int (*verify_rows)(void *ctx, const int *tokens, uint32_t n, uint32_t pos0,
                        float *hc_rows, float *row_logits);
 
+    /* Optional compact verify path.  It runs the identical target forward but
+     * leaves the full logit matrix on the device and returns only each row's
+     * exact greedy winner.  read_logit_row then transfers the one frontier
+     * distribution the caller keeps.  Supplying either callback without the
+     * other is ignored, preserving the portable verify_rows contract. */
+    int (*verify_rows_top1)(void *ctx, const int *tokens, uint32_t n,
+                            uint32_t pos0, float *hc_rows, int *row_top1);
+    int (*read_logit_row)(void *ctx, uint32_t row, float *logits);
+
     /* One row at `pos`: the serial decode step, and the replay a rejecting
      * round runs.  Same outputs for a single row. */
     int (*decode_token)(void *ctx, int token, uint32_t pos,

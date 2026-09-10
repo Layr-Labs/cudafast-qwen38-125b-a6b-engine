@@ -159,6 +159,7 @@ typedef struct {
      * the row it committed through, and that row is now one of these. */
     int      row_argmax[DS4_QWEN4EXP_MTP_MAX_COMMIT];
     uint32_t row_argmax_n;
+    float compact_logits[DS4_QWEN4EXP_MTP_MAX_COMMIT][REF_VOCAB];
     /* The speculative chain the head is walking, so the draft oracle can look
      * one position past the frontier for each step.  Without this every step
      * after the first would draft from the frontier again and depth 2 and 3
@@ -329,6 +330,28 @@ static int ref_verify_rows(void *ctx, const int *tokens, uint32_t n,
                 row_logits + (size_t)t * REF_VOCAB, REF_VOCAB);
     }
     m->row_argmax_n = n;
+    return 0;
+}
+
+/* Exercise the production compact-logit seam with the same reduced model.
+ * The target computation is still ref_verify_rows; only its return transport
+ * changes, exactly as on CUDA. */
+static int ref_verify_rows_top1(void *ctx, const int *tokens, uint32_t n,
+                                uint32_t pos0, float *hc_rows,
+                                int *row_top1) {
+    refmodel *m = ctx;
+    if (ref_verify_rows(ctx, tokens, n, pos0, hc_rows,
+                        &m->compact_logits[0][0]) != 0) return -1;
+    for (uint32_t t = 0; t < n; t++) {
+        row_top1[t] = ds4_qwen4exp_mtp_argmax(m->compact_logits[t], REF_VOCAB);
+    }
+    return 0;
+}
+
+static int ref_read_logit_row(void *ctx, uint32_t row, float *logits) {
+    refmodel *m = ctx;
+    if (row >= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT) return -1;
+    memcpy(logits, m->compact_logits[row], REF_VOCAB * sizeof(float));
     return 0;
 }
 
@@ -564,6 +587,8 @@ static int ref_build(refmodel *m, ds4_qwen4exp_mtp_model *model,
     model->hc_dim = REF_HC_DIM;
     model->n_vocab = REF_VOCAB;
     model->verify_rows = ref_verify_rows;
+    model->verify_rows_top1 = ref_verify_rows_top1;
+    model->read_logit_row = ref_read_logit_row;
     model->decode_token = ref_decode_token;
     model->head_logits = ref_head_logits;
     model->draft_step = ref_draft_step;

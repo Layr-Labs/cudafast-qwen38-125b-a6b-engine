@@ -579,10 +579,16 @@ int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
      * nothing to rewind to afterwards. */
     float *const hc = st->hc_scratch;
     float *const row_logits = st->logits_rows;
+    int row_top1[DS4_QWEN4EXP_MTP_MAX_COMMIT];
+    const bool compact_logits =
+        model->verify_rows_top1 != NULL && model->read_logit_row != NULL;
     st->counters.drafted += (uint64_t)n;
     const uint64_t verify_t0 = mtp_now_ns();
-    const int vrc = model->verify_rows(model->ctx, toks, (uint32_t)n + 1u, pos,
-                                       hc, row_logits);
+    const int vrc = compact_logits
+        ? model->verify_rows_top1(model->ctx, toks, (uint32_t)n + 1u, pos,
+                                  hc, row_top1)
+        : model->verify_rows(model->ctx, toks, (uint32_t)n + 1u, pos,
+                             hc, row_logits);
     st->counters.verify_ns += mtp_now_ns() - verify_t0;
     if (vrc != 0) {
         return mtp_fail(err, errlen,
@@ -606,12 +612,27 @@ int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
     int a = 0;
     int first_mismatch = -1;
     while (a < n) {
-        const int chosen = ds4_qwen4exp_mtp_argmax(
-                row_logits + (size_t)a * st->n_vocab, st->n_vocab);
+        const int chosen = compact_logits
+            ? row_top1[a]
+            : ds4_qwen4exp_mtp_argmax(
+                    row_logits + (size_t)a * st->n_vocab, st->n_vocab);
         if (chosen != toks[a + 1]) { first_mismatch = chosen; break; }
         a++;
     }
     st->counters.accepted += (uint64_t)a;
+
+    /* The target head has already produced every row.  The compact CUDA seam
+     * deferred the D2H transfer until acceptance identified the one frontier
+     * row; the portable seam already has that row in row_logits. */
+    if (compact_logits) {
+        if (model->read_logit_row(model->ctx, (uint32_t)a, logits) != 0) {
+            return mtp_fail(err, errlen,
+                            "qwen4exp MTP: target logit row %d read failed", a);
+        }
+    } else {
+        memcpy(logits, row_logits + (size_t)a * st->n_vocab,
+               (size_t)st->n_vocab * sizeof(float));
+    }
 
     if (a == n) {
         /* Every draft is the target's own greedy argmax, so the whole run is
@@ -621,9 +642,9 @@ int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
         for (int k = 0; k <= n; k++) accepted[k] = toks[k];
         st->counters.committed += (uint64_t)(n + 1);
         st->counters.commit_hist[n + 1] += 1;
-        memcpy(logits, row_logits + (size_t)n * st->n_vocab,
-               (size_t)st->n_vocab * sizeof(float));
-        const int next_fed = ds4_qwen4exp_mtp_argmax(logits, st->n_vocab);
+        const int next_fed = compact_logits
+            ? row_top1[n]
+            : ds4_qwen4exp_mtp_argmax(logits, st->n_vocab);
         if (mtp_draft_chain(st, model, hc, toks, n, pos, next_fed,
                             err, errlen) != 0) {
             return -1;
@@ -655,8 +676,6 @@ int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
      * the row block.  No head call and no forward: the token the caller feeds
      * next is the first one the target chose that the chain had not
      * drafted. */
-    memcpy(logits, row_logits + (size_t)a * st->n_vocab,
-           (size_t)st->n_vocab * sizeof(float));
     for (int k = 0; k <= a; k++) accepted[k] = toks[k];
     st->counters.committed += (uint64_t)(a + 1);
     st->counters.commit_hist[a + 1] += 1;

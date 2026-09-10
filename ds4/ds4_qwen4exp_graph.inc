@@ -311,6 +311,10 @@ struct ds4_qwen4exp_session {
      * from the one forward rather than a borrowed-head call per row.  Armed by
      * ds4_qwen4exp_graph_verify_rows and cleared right after it. */
     uint32_t        spec_logit_rows;
+    /* Compact speculative return: the wide LM head still computes every row,
+     * but argmax runs before the command batch closes and only these indices
+     * cross to the host until acceptance selects one full frontier row. */
+    uint32_t        spec_top1_rows;
     uint32_t        indexer_valid_blocks;
     uint32_t        head_cache_pos;
 
@@ -356,6 +360,7 @@ struct ds4_qwen4exp_session {
     ds4_gpu_tensor *shexp_gate;
 
     ds4_gpu_tensor *logits;
+    ds4_gpu_tensor *spec_top1;
 
 #ifdef DS4_TEST_HOOKS
     /* A copy of the stream taken INSIDE the batch, immediately before the final
@@ -728,6 +733,8 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
     s->shexp_gate   = qwen4exp_alloc_zeroed(B * f, &ok);
     s->logits       = qwen4exp_alloc_zeroed(
             (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * cfg->n_vocab * f, &ok);
+    s->spec_top1     = qwen4exp_alloc_zeroed(
+            (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * sizeof(int32_t), &ok);
 #ifdef DS4_TEST_HOOKS
     s->final_mixer_snapshot = qwen4exp_alloc_zeroed(B * H * E * f, &ok);
 #endif
@@ -801,6 +808,7 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->shexp_mid);
     ds4_gpu_tensor_free(s->shexp_gate);
     ds4_gpu_tensor_free(s->logits);
+    ds4_gpu_tensor_free(s->spec_top1);
 #ifdef DS4_TEST_HOOKS
     ds4_gpu_tensor_free(s->final_mixer_snapshot);
 #endif
@@ -1996,7 +2004,8 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     /* NO SILENT FALSE.  Every refusal below this line names itself, and so
      * does this one: an argument that is missing is a wiring fault in the
      * caller, and the caller has no other way to find out which. */
-    if (!s || !w || !m || !tokens || !logits_out || n_tokens == 0) {
+    if (!s || !w || !m || !tokens ||
+        (!logits_out && s->spec_top1_rows == 0u) || n_tokens == 0) {
         fprintf(stderr,
                 "ds4: qwen4exp forward called with %s%s%s%s%s%s\n",
                 s ? "" : "no session ", w ? "" : "no weights ",
@@ -2158,6 +2167,13 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         fprintf(stderr, "ds4: qwen4exp LM head failed\n");
         return qwen4exp_forward_fail();
     }
+    if (s->spec_top1_rows != 0u &&
+        (s->spec_top1_rows != logit_rows ||
+         !ds4_gpu_indexer_topk_tensor(s->spec_top1, s->logits,
+                                      cfg->n_vocab, logit_rows, 1u))) {
+        fprintf(stderr, "ds4: qwen4exp compact verify top-1 failed\n");
+        return qwen4exp_forward_fail();
+    }
     QW_TRACE(QW_SLICE_HEAD);
     QW_TRACE_REPORT(n_tokens);
     /* Commit and wait: the logits are read on the host from here on. */
@@ -2165,7 +2181,8 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         fprintf(stderr, "ds4: qwen4exp command batch did not complete\n");
         return false;
     }
-    if (!ds4_gpu_tensor_read(s->logits, 0, logits_out,
+    if (logits_out &&
+        !ds4_gpu_tensor_read(s->logits, 0, logits_out,
                              (uint64_t)logit_rows * cfg->n_vocab *
                                      sizeof(float))) {
         fprintf(stderr, "ds4: qwen4exp logit read failed\n");
@@ -2549,6 +2566,46 @@ bool ds4_qwen4exp_graph_verify_rows(ds4_qwen4exp_session       *s,
         return false;
     }
     return true;
+}
+
+bool ds4_qwen4exp_graph_verify_top1_rows(ds4_qwen4exp_session       *s,
+                                         const ds4_qwen4exp_weights *w,
+                                         const ds4_model            *m,
+                                         const int32_t              *tokens,
+                                         uint32_t                    n_tokens,
+                                         float                      *hc_rows,
+                                         int                        *row_top1) {
+    if (!s || !row_top1 || n_tokens == 0u ||
+        n_tokens > (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT) {
+        return false;
+    }
+    s->spec_snapshot_rows = n_tokens > 1u ? n_tokens - 1u : 0u;
+    s->spec_logit_rows = n_tokens > 1u ? n_tokens : 0u;
+    s->spec_top1_rows = n_tokens;
+    const bool forward_ok =
+        ds4_qwen4exp_graph_forward(s, w, m, tokens, n_tokens, NULL);
+    s->spec_snapshot_rows = 0u;
+    s->spec_logit_rows = 0u;
+    s->spec_top1_rows = 0u;
+    if (!forward_ok) return false;
+    if (hc_rows && !ds4_qwen4exp_session_read_hyper(s, 0, n_tokens, hc_rows)) {
+        fprintf(stderr, "ds4: qwen4exp compact verify hyper read failed\n");
+        return false;
+    }
+    return ds4_gpu_tensor_read(s->spec_top1, 0, row_top1,
+                               (uint64_t)n_tokens * sizeof(int32_t)) != 0;
+}
+
+bool ds4_qwen4exp_graph_read_logit_row(ds4_qwen4exp_session *s,
+                                       uint32_t row,
+                                       float *logits) {
+    const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
+    if (!s || !logits || row >= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT) {
+        return false;
+    }
+    const uint64_t bytes = (uint64_t)cfg->n_vocab * sizeof(float);
+    return ds4_gpu_tensor_read(s->logits, (uint64_t)row * bytes,
+                               logits, bytes) != 0;
 }
 
 /* The target's LM head over ONE supplied pre-final-mixer row.

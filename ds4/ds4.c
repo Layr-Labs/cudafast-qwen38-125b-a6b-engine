@@ -75920,6 +75920,27 @@ static int qwen4exp_seam_verify_rows(void *ctx, const int *tokens, uint32_t n,
                                           n) ? 0 : -1;
 }
 
+static int qwen4exp_seam_verify_rows_top1(void *ctx, const int *tokens,
+                                          uint32_t n, uint32_t pos0,
+                                          float *hc_rows, int *row_top1) {
+    ds4_session *s = ctx;
+    ds4_engine *e = s->engine;
+    const uint32_t at = ds4_qwen4exp_session_pos(e->qwen4exp_session);
+    if (at != pos0 || n > (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT) return -1;
+    int32_t buf[DS4_QWEN4EXP_MTP_MAX_COMMIT];
+    for (uint32_t i = 0; i < n; i++) buf[i] = (int32_t)tokens[i];
+    return ds4_qwen4exp_graph_verify_top1_rows(
+               e->qwen4exp_session, e->qwen4exp_weights, &e->model,
+               buf, n, hc_rows, row_top1) ? 0 : -1;
+}
+
+static int qwen4exp_seam_read_logit_row(void *ctx, uint32_t row,
+                                        float *logits) {
+    ds4_session *s = ctx;
+    return ds4_qwen4exp_graph_read_logit_row(
+               s->engine->qwen4exp_session, row, logits) ? 0 : -1;
+}
+
 /* One row, through the SAME entry point as the verify: the cycle requires row
  * t of an n-row verify to equal a one-row decode from the same state bit for
  * bit, and one implementation is how that is guaranteed rather than tested. */
@@ -76066,6 +76087,8 @@ static bool ds4_session_qwen4exp_spec_init(ds4_session *s,
     s->qwen4exp_seam.hc_dim       = (uint32_t)DS4_N_HC * DS4_N_EMBD;
     s->qwen4exp_seam.n_vocab      = g_ds4_qwen4exp.n_vocab;
     s->qwen4exp_seam.verify_rows  = qwen4exp_seam_verify_rows;
+    s->qwen4exp_seam.verify_rows_top1 = qwen4exp_seam_verify_rows_top1;
+    s->qwen4exp_seam.read_logit_row = qwen4exp_seam_read_logit_row;
     s->qwen4exp_seam.decode_token = qwen4exp_seam_decode_token;
     s->qwen4exp_seam.head_logits  = qwen4exp_seam_head_logits;
     s->qwen4exp_seam.draft_step   = qwen4exp_seam_draft_step;
