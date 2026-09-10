@@ -951,27 +951,8 @@ __device__ __forceinline__ static void dev_qwen4exp_group_decode(
         const uint16_t d = (uint16_t)((uint8_t)blk[0]) |
                            (uint16_t)((uint16_t)(uint8_t)blk[1] << 8u);
         wa[0] = dev_f16_to_f32(d);
-        const uint8_t *payload = (const uint8_t *)blk + 2u;
-        const uintptr_t address = (uintptr_t)payload;
-        const uint32_t shift = (uint32_t)(address & 3u) * 8u;
-        const uint32_t *words =
-            (const uint32_t *)(const void *)(address - (address & 3u));
-        uint32_t previous = words[0];
 #pragma unroll
-        for (int i = 0; i < 7; i++) {
-            const uint32_t next = words[i + 1];
-            const uint32_t packed = __funnelshift_r(previous, next, shift);
-            wq[i * 4 + 0] = (int8_t)(packed & 0xffu);
-            wq[i * 4 + 1] = (int8_t)((packed >> 8u) & 0xffu);
-            wq[i * 4 + 2] = (int8_t)((packed >> 16u) & 0xffu);
-            wq[i * 4 + 3] = (int8_t)(packed >> 24u);
-            previous = next;
-        }
-        /* The final four bytes are still inside this 34-byte block, but the
-         * next aligned word can extend past it.  Keep that group on the byte
-         * path rather than issue a speculative read into the next row. */
-#pragma unroll
-        for (int i = 28; i < 32; i++) wq[i] = (int8_t)payload[i];
+        for (int i = 0; i < 32; i++) wq[i] = (int8_t)blk[2 + i];
         return;
     }
     case (uint32_t)DS4_QWEN4EXP_TY_q5_1: {
@@ -1131,7 +1112,7 @@ __device__ __forceinline__ static void qwen4exp_group_accumulate(
  * that the `wb` term needs.  One block per (row, group); the row is the only
  * thing it reads, so the result does not depend on how many rows the call
  * carries.  The scale and the rounding are ds4_cuda.cu's
- * quantize_q8_0_f32_kernel, unchanged. */
+ * quantize_q8_0_f32_kernel, unchanged.  Single-warp shuffle reduction, same order. */
 __global__ static void qwen4exp_quantize_rows_kernel(
         int8_t *xq, float *xscale, int32_t *xsum,
         const float *x, uint32_t width, uint32_t groups,
@@ -1146,18 +1127,13 @@ __global__ static void qwen4exp_quantize_rows_kernel(
     const float *xr = x + (uint64_t)outer * outer_stride +
                       (uint64_t)inner * inner_stride + i0;
 
-    __shared__ float vals[32];
-    float a = 0.0f;
-    if (threadIdx.x < n) a = fabsf(xr[threadIdx.x]);
-    vals[threadIdx.x] = a;
-    __syncthreads();
-    for (uint32_t stride = 16u; stride > 0u; stride >>= 1u) {
-        if (threadIdx.x < stride) {
-            vals[threadIdx.x] = fmaxf(vals[threadIdx.x], vals[threadIdx.x + stride]);
-        }
-        __syncthreads();
+    float a = (threadIdx.x < n) ? fabsf(xr[threadIdx.x]) : 0.0f;
+#pragma unroll
+    for (uint32_t off = 16u; off > 0u; off >>= 1u) {
+        a = fmaxf(a, __shfl_down_sync(0xffffffffu, a, off));
     }
-    const float d = vals[0] / 127.0f;
+    const float m = __shfl_sync(0xffffffffu, a, 0);
+    const float d = m / 127.0f;
     const float id = d != 0.0f ? 1.0f / d : 0.0f;
     const uint64_t at = (uint64_t)r * groups + g;
     if (threadIdx.x == 0u) xscale[at] = d;
@@ -1170,27 +1146,42 @@ __global__ static void qwen4exp_quantize_rows_kernel(
     }
     dst[threadIdx.x] = (int8_t)v;
 
-    __shared__ int sums[32];
-    sums[threadIdx.x] = v;
-    __syncthreads();
-    for (uint32_t stride = 16u; stride > 0u; stride >>= 1u) {
-        if (threadIdx.x < stride) sums[threadIdx.x] += sums[threadIdx.x + stride];
-        __syncthreads();
+#pragma unroll
+    for (uint32_t off = 16u; off > 0u; off >>= 1u) {
+        v += __shfl_down_sync(0xffffffffu, v, off);
     }
-    if (threadIdx.x == 0u) xsum[at] = sums[0];
+    if (threadIdx.x == 0u) xsum[at] = v;
 }
 
 /* Block-wide sum over blockDim.x threads using a caller-supplied scratch of
- * blockDim.x floats.  The reduction tree matches the Metal kernels. */
+ * blockDim.x floats.  The reduction tree matches the Metal kernels.
+ * The shuffle tail mirrors qwen4exp_blk_sum with identical order. */
 __device__ __forceinline__ static float dev_qwen4exp_block_sum(
         float *scratch, float value) {
     const uint32_t tid = threadIdx.x;
     scratch[tid] = value;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) scratch[tid] += scratch[tid + stride];
+    if (blockDim.x < 32u) {
         __syncthreads();
+        for (uint32_t stride = blockDim.x >> 1u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) scratch[tid] += scratch[tid + stride];
+            __syncthreads();
+        }
+        return scratch[0];
     }
+    for (uint32_t stride = blockDim.x >> 1u; stride >= 32u; stride >>= 1u) {
+        __syncthreads();
+        if (tid < stride) scratch[tid] += scratch[tid + stride];
+    }
+    __syncthreads();
+    if (tid < 32u) {
+        float v = scratch[tid];
+#pragma unroll
+        for (uint32_t step = 16u; step > 0u; step >>= 1u) {
+            v += __shfl_down_sync(0xffffffffu, v, step);
+        }
+        if (tid == 0u) scratch[0] = v;
+    }
+    __syncthreads();
     return scratch[0];
 }
 
