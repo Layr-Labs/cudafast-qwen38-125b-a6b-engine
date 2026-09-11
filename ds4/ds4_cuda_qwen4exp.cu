@@ -5645,6 +5645,7 @@ __global__ static void qwen4exp_qsa_attention_kernel(
         const float *v_cache,
         const int32_t *selected,
         const int32_t *counts,
+        const float *gate,
         float *out,
         uint32_t n_tokens,
         uint32_t n_head,
@@ -5764,7 +5765,11 @@ __global__ static void qwen4exp_qsa_attention_kernel(
     }
 
     if (tid < head_dim) {
-        dst[tid] = (run_sum > 0.0f) ? acc / run_sum : 0.0f;
+        float val = (run_sum > 0.0f) ? acc / run_sum : 0.0f;
+        if (gate) {
+            val *= qwen4exp_sigmoid(gate[((uint64_t)token * n_head + head) * head_dim + tid]);
+        }
+        dst[tid] = val;
     }
 }
 
@@ -5843,6 +5848,7 @@ __global__ static void qwen4exp_qsa_attention_group_kernel(
         const float *v_cache,
         const int32_t *selected,
         const int32_t *counts,
+        const float *gate,
         float *out,
         uint32_t n_tokens,
         uint32_t n_head,
@@ -6034,8 +6040,11 @@ __global__ static void qwen4exp_qsa_attention_group_kernel(
     if (tid < head_dim) {
 #pragma unroll
         for (uint32_t h = 0; h < GROUP; h++) {
-            dst[h * head_dim + tid] =
-                (run_sum[h] > 0.0f) ? acc[h] / run_sum[h] : 0.0f;
+            float val = (run_sum[h] > 0.0f) ? acc[h] / run_sum[h] : 0.0f;
+            if (gate) {
+                val *= qwen4exp_sigmoid(gate[((uint64_t)token * n_head + head0 + h) * head_dim + tid]);
+            }
+            dst[h * head_dim + tid] = val;
         }
     }
 }
@@ -6386,8 +6395,9 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_select_tensor(
     return cuda_ok(cudaGetLastError(), "Qwen4-Exp indexer selection launch");
 }
 
-extern "C" int ds4_gpu_qwen4exp_qsa_attention_tensor(
+extern "C" int ds4_gpu_qwen4exp_qsa_attention_gated_tensor(
         ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *gate,
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *k_cache,
         const ds4_gpu_tensor *v_cache,
@@ -6410,6 +6420,7 @@ extern "C" int ds4_gpu_qwen4exp_qsa_attention_tensor(
     const uint64_t q_elems = (uint64_t)n_tokens * n_head * head_dim;
     const uint64_t cache_elems = (uint64_t)cache_cap * n_kv_head * head_dim;
     if (!glm53_cuda_tensor_has(out, q_elems, sizeof(float)) ||
+        (gate && !glm53_cuda_tensor_has(gate, q_elems, sizeof(float))) ||
         !glm53_cuda_tensor_has(q, q_elems, sizeof(float)) ||
         !glm53_cuda_tensor_has(k_cache, cache_elems, sizeof(float)) ||
         !glm53_cuda_tensor_has(v_cache, cache_elems, sizeof(float)) ||
@@ -6447,6 +6458,7 @@ extern "C" int ds4_gpu_qwen4exp_qsa_attention_tensor(
                     (const float *)v_cache->ptr,                              \
                     sparse ? (const int32_t *)selected->ptr : NULL,           \
                     sparse ? (const int32_t *)counts->ptr : NULL,             \
+                    gate ? (const float *)gate->ptr : NULL,                   \
                     (float *)out->ptr, n_tokens, n_head, n_kv_head, head_dim, \
                     pos0, cache_cap, max_selected, sparse ? 1u : 0u, scale)
             switch (g) {
@@ -6474,9 +6486,31 @@ extern "C" int ds4_gpu_qwen4exp_qsa_attention_tensor(
             (const float *)v_cache->ptr,
             sparse ? (const int32_t *)selected->ptr : NULL,
             sparse ? (const int32_t *)counts->ptr : NULL,
+            gate ? (const float *)gate->ptr : NULL,
             (float *)out->ptr, n_tokens, n_head, n_kv_head, head_dim, pos0,
             cache_cap, max_selected, sparse ? 1u : 0u, scale);
     return cuda_ok(cudaGetLastError(), "Qwen4-Exp QSA attention launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_qsa_attention_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k_cache,
+        const ds4_gpu_tensor *v_cache,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *counts,
+        uint32_t              n_tokens,
+        uint32_t              n_head,
+        uint32_t              n_kv_head,
+        uint32_t              head_dim,
+        uint32_t              pos0,
+        uint32_t              cache_cap,
+        uint32_t              max_selected,
+        float                 scale) {
+    return ds4_gpu_qwen4exp_qsa_attention_gated_tensor(
+            out, NULL, q, k_cache, v_cache, selected, counts,
+            n_tokens, n_head, n_kv_head, head_dim, pos0,
+            cache_cap, max_selected, scale);
 }
 
 extern "C" int ds4_gpu_qwen4exp_qsa_output_gate_tensor(
