@@ -1725,6 +1725,46 @@ static void run_production_expert_cases(void) {
                                        (uint64_t)PROD_TOKENS * PROD_OUT_DIM * sizeof(float)),
                    "production output read");
 
+        /* Compare every intermediate and output against the former joint
+         * gate/up projection, including the Q8 and Q5_1 down consumers. */
+        if (gate_type == TYPE_Q4_K) {
+            const char *pin = getenv("DS4_QWEN4EXP_NO_SPLIT_GATEUP");
+            char *saved = pin ? strdup(pin) : NULL;
+            require_ok(!pin || saved, "split gate/up pin save");
+            ds4_gpu_tensor *tensors[] = {out_t, mid_t, part_t};
+            const size_t sizes[] = {
+                (size_t)PROD_TOKENS * PROD_OUT_DIM * sizeof(float),
+                (size_t)PROD_TOKENS * PROD_USED * PROD_MID_DIM * sizeof(float),
+                (size_t)PROD_TOKENS * PROD_USED * PROD_OUT_DIM * sizeof(float)};
+            void *reference[3], *candidate[3];
+            for (unsigned j = 0; j < 3; j++) {
+                reference[j] = malloc(sizes[j]); candidate[j] = malloc(sizes[j]);
+                require_ok(reference[j] && candidate[j], "split gate/up buffers");
+                require_ok(ds4_gpu_tensor_read(tensors[j], 0, candidate[j], sizes[j]),
+                           "split gate/up candidate read");
+            }
+            require_ok(setenv("DS4_QWEN4EXP_NO_SPLIT_GATEUP", "1", 1) == 0,
+                       "joint gate/up pin");
+            require_ok(ds4_gpu_qwen4exp_routed_moe_tensor(
+                           out_t, mid_t, part_t, &gate_slab, &up_slab, &down_slab,
+                           PROD_IN_DIM, PROD_MID_DIM, PROD_OUT_DIM,
+                           selected_t, weights_t, PROD_EXPERTS, PROD_USED,
+                           x_t, PROD_TOKENS, PROD_USED * PROD_MID_DIM),
+                       "joint gate/up oracle");
+            for (unsigned j = 0; j < 3; j++) {
+                require_ok(ds4_gpu_tensor_read(tensors[j], 0, reference[j], sizes[j]),
+                           "joint gate/up read");
+                require_ok(memcmp(reference[j], candidate[j], sizes[j]) == 0,
+                           "split gate/up exact intermediates");
+                free(reference[j]); free(candidate[j]);
+            }
+            require_ok((saved ? setenv("DS4_QWEN4EXP_NO_SPLIT_GATEUP", saved, 1) :
+                                unsetenv("DS4_QWEN4EXP_NO_SPLIT_GATEUP")) == 0,
+                       "split gate/up pin restore");
+            free(saved);
+            puts("split gate/up: complete out, mid and down partials bit-identical");
+        }
+
         prod_reference(image + gate_off[gi], image + up_off[gi], image + down_off[dj],
                        gate_type, down_type, x, selected, weights, expected);
 
