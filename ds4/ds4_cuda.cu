@@ -3394,20 +3394,17 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
     int d = ds4_tensor_device_idx(dst);
     int ok = 0;
     WITH_DEVICE(g_gpu[d].device_id) {
-        if (g_decode_graph_capturing) {
-            ok = cuda_ok(cudaMemcpyAsync((char *)dst->ptr + dst_offset,
-                                         (const char *)src->ptr + src_offset,
-                                         (size_t)bytes,
-                                         cudaMemcpyDeviceToDevice,
-                                         cuda_decode_stream()),
-                         "tensor copy");
-        } else {
-            ok = cuda_ok(cudaMemcpy((char *)dst->ptr + dst_offset,
-                                    (const char *)src->ptr + src_offset,
-                                    (size_t)bytes,
-                                    cudaMemcpyDeviceToDevice),
-                         "tensor copy");
-        }
+        /* Always enqueue on the decode stream.  Sync cudaMemcpy drained the
+         * device before the next kernel (notably the LM head) could launch;
+         * same-stream async preserves D2D->consumer order without a host
+         * barrier.  Callers that need host-visible completion already
+         * synchronize via end_commands / tensor_read. */
+        ok = cuda_ok(cudaMemcpyAsync((char *)dst->ptr + dst_offset,
+                                     (const char *)src->ptr + src_offset,
+                                     (size_t)bytes,
+                                     cudaMemcpyDeviceToDevice,
+                                     cuda_decode_stream()),
+                     "tensor copy");
     }
     return ok;
 }

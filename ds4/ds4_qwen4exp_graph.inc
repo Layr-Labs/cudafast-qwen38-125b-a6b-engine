@@ -2069,6 +2069,16 @@ static bool qwen4exp_graph_layers_encode(
         ds4_qwen4exp_session *s, const ds4_qwen4exp_weights *w,
         const ds4_model *m, uint32_t n_tokens, bool use_islands) {
     const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
+    /* Embed is device-only once tokens sit in s->tokens.  Folding it into the
+     * stack capture removes one eager launch before every decode/verify. */
+    if (!ds4_gpu_qwen4exp_embed_tokens_hc_tensor(
+            s->hyper, s->embed_rows, s->tokens,
+            QW_MAP(m, w->token_embd), QW_MAPSZ(m, w->token_embd),
+            QW_OFF(w->token_embd), w->token_embd->type, cfg->n_vocab,
+            n_tokens, DS4_N_EMBD, DS4_N_HC)) {
+        return false;
+    }
+    QW_TRACE(QW_SLICE_EMBED);
     for (uint32_t il = 0; il < cfg->n_layer; il++) {
         const ds4_qwen4exp_layer_weights *l = &w->layer[il];
 
@@ -2129,13 +2139,14 @@ static bool qwen4exp_graph_layers(
         key.il = 0u;
         key.island = 3u;
         key.variant = n_tokens | (s->spec_snapshot_rows << 8u);
-        key._pad = 0x51575354u; /* QWST: the complete target layer stack */
+        key._pad = 0x51575345u; /* QWSE: stack + embedding gather */
         key.cur_hc = s->hyper;
         key.after_attn_hc = s;
         key.after_ffn_hc = (void *)w;
         key.attn_norm = (void *)m;
         const int state = ds4_gpu_decode_graph_begin(&key);
         if (state == 1) {
+            QW_TRACE(QW_SLICE_EMBED);
 #ifdef DS4_TEST_HOOKS
             /* Preserve the logical slice trace even when encoding is skipped. */
             const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
@@ -2270,17 +2281,7 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         return false;
     }
 
-    /* Layer-0 seed: gather the embedding row and tile it into every stream. */
-    if (!ds4_gpu_qwen4exp_embed_tokens_hc_tensor(
-            s->hyper, s->embed_rows, s->tokens,
-            QW_MAP(m, w->token_embd), QW_MAPSZ(m, w->token_embd),
-            QW_OFF(w->token_embd), w->token_embd->type, cfg->n_vocab,
-            n_tokens, DS4_N_EMBD, DS4_N_HC)) {
-        fprintf(stderr, "ds4: qwen4exp embedding gather failed\n");
-        return qwen4exp_forward_fail();
-    }
-    QW_TRACE(QW_SLICE_EMBED);
-
+    /* Embedding rides inside qwen4exp_graph_layers (captured as QWSE). */
     if (!qwen4exp_graph_layers(s, w, m, n_tokens)) {
         return qwen4exp_forward_fail();
     }
