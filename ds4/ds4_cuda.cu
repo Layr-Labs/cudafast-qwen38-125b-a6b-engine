@@ -16569,12 +16569,18 @@ static int cuda_matmul_q8_0_preq_rows_exact(
     if (use_dp4a && n_rows <= 2u && out_dim > 512u && (in_dim & 31u) == 0u &&
         getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
         (((uintptr_t)wptr & 1u) == 0u)) {
-        matmul_q8_0_preq_pair_lanes_kernel<2><<<
-                dim3((unsigned)((out_dim + 3u) / 4u),
-                     (n_rows + 1u) / 2u, 1u),
-                256, 0, cuda_decode_stream()>>>(
-                (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
-                out_dim, n_rows, blocks);
+        const dim3 grid((unsigned)((out_dim + 3u) / 4u), 1u, 1u);
+        if (n_rows == 1u) {
+            matmul_q8_0_preq_pair_lanes_kernel<1><<<
+                    grid, 256, 0, cuda_decode_stream()>>>(
+                    (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
+                    out_dim, n_rows, blocks);
+        } else {
+            matmul_q8_0_preq_pair_lanes_kernel<2><<<
+                    grid, 256, 0, cuda_decode_stream()>>>(
+                    (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
+                    out_dim, n_rows, blocks);
+        }
         return cuda_ok(cudaGetLastError(), "q8 pair lanes launch");
     }
     /* A warp owns an independent output row.  Narrow projections (notably
