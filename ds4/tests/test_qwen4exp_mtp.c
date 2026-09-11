@@ -1620,6 +1620,28 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_off,
     memmove(dst->data + dst_off, src->data + src_off, (size_t)bytes);
     return 1;
 }
+int ds4_gpu_tensor_copy_async_offset(ds4_gpu_tensor *dst, uint64_t dst_off,
+                                     const ds4_gpu_tensor *src, uint64_t src_off,
+                                     uint64_t bytes) {
+    return ds4_gpu_tensor_copy(dst, dst_off, src, src_off, bytes);
+}
+int ds4_gpu_mtp_apply_logit0_nan_contract(ds4_gpu_tensor *top1,
+                                          const ds4_gpu_tensor *logits,
+                                          uint32_t n_vocab, uint32_t rows,
+                                          uint32_t first_row) {
+    if (!top1 || !logits || n_vocab == 0 || rows == 0) return 0;
+    uint32_t *ids = (uint32_t *)top1->data;
+    const float *in = (const float *)logits->data;
+    for (uint32_t t = 0; t < rows; t++) {
+        const float logit0 = in[((uint64_t)first_row + t) * n_vocab];
+        uint32_t bits;
+        memcpy(&bits, &logit0, sizeof(bits));
+        if ((bits & 0x7fffffffu) > 0x7f800000u) {
+            ids[(uint64_t)first_row + t] = 0u;
+        }
+    }
+    return 1;
+}
 int ds4_gpu_indexer_topk_tensor(ds4_gpu_tensor *selected,
                                 const ds4_gpu_tensor *scores,
                                 uint32_t n_comp, uint32_t n_tokens,

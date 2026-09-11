@@ -47500,6 +47500,25 @@ int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
         cache_cap, max_selected, scale);
 }
 
+int ds4_gpu_tensor_copy_async_offset(
+        ds4_gpu_tensor       *dst,
+        uint64_t              dst_offset,
+        const ds4_gpu_tensor *src,
+        uint64_t              src_offset,
+        uint64_t              bytes) {
+    return ds4_gpu_tensor_copy(dst, dst_offset, src, src_offset, bytes);
+}
+
+int ds4_gpu_mtp_apply_logit0_nan_contract(
+        ds4_gpu_tensor       *top1,
+        const ds4_gpu_tensor *logits,
+        uint32_t              n_vocab,
+        uint32_t              rows,
+        uint32_t              first_row) {
+    (void)top1; (void)logits; (void)n_vocab; (void)rows; (void)first_row;
+    return 0;
+}
+
 int ds4_gpu_qwen4exp_qsa_attention_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *q,

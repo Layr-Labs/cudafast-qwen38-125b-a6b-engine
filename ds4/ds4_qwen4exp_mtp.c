@@ -981,6 +981,9 @@ static int mtp_head_time_on(void) {
 static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                                  const int *next_tokens,
                                  const float *multi_in,
+                                 const ds4_gpu_tensor *multi_dev,
+                                 uint64_t multi_dev_offset,
+                                 uint64_t multi_dev_bytes,
                                  uint32_t pos0, uint32_t n_tokens,
                                  int *draft_out, float *multi_out,
                                  bool last_only,
@@ -1031,9 +1034,24 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
     if (ids != ids_stack) free(ids);
     MTP_HEAD_TICK(MTP_HEAD_T_TOKEN);
     if (ok) {
-        stage = "multi-stream upload";
-        ok = ds4_gpu_tensor_write(h->t_hyper, 0, multi_in,
-                                  (uint64_t)n_tokens * hc_dim * f) != 0;
+        const uint64_t need = (uint64_t)n_tokens * hc_dim * f;
+        if (multi_dev) {
+            stage = "multi-stream device copy";
+            if (multi_dev_bytes < need) {
+                ok = 0;
+            } else {
+                ok = ds4_gpu_tensor_copy_async_offset(
+                         h->t_hyper, 0, multi_dev, multi_dev_offset,
+                         need) != 0;
+            }
+        } else {
+            stage = "multi-stream upload";
+            if (!multi_in) {
+                ok = 0;
+            } else {
+                ok = ds4_gpu_tensor_write(h->t_hyper, 0, multi_in, need) != 0;
+            }
+        }
     }
     MTP_HEAD_TICK(MTP_HEAD_T_MULTI_IN);
     if (ok) ok = ds4_gpu_begin_commands() != 0;
@@ -1192,6 +1210,15 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                                          draft_width, logit_rows, 1u) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_TOP1);
+    if (ok) {
+        stage = "logit-0 nan contract";
+        /* Fold the historical CPU-scan NaN@logit0 -> token 0 contract into the
+         * same command batch, removing one blocking 4-byte D2H per output row. */
+        ok = ds4_gpu_mtp_apply_logit0_nan_contract(
+                 h->t_top1, h->t_logits, draft_width, out_rows,
+                 logit_first) != 0;
+    }
+    MTP_HEAD_TICK(MTP_HEAD_T_LOGIT0_IN);
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
     MTP_HEAD_TICK(MTP_HEAD_T_END);
@@ -1206,28 +1233,6 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                                  (uint64_t)out_rows * sizeof(uint32_t)) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_TOP1_IN);
-    if (ok) {
-        stage = "logit-0 readback";
-        for (uint32_t t = 0; ok && t < out_rows; t++) {
-            float logit0;
-            const uint64_t row = (uint64_t)logit_first + t;
-            ok = ds4_gpu_tensor_read(h->t_logits,
-                                     row * (uint64_t)draft_width * f,
-                                     &logit0, sizeof(logit0)) != 0;
-            /* The former CPU scan seeded its comparison with row[0].  A NaN
-             * there therefore kept token zero regardless of later values;
-             * the generic GPU reducer deliberately ignores NaNs.  Preserve
-             * the MTP proposal contract without changing that shared reducer. */
-            if (ok) {
-                uint32_t logit0_bits;
-                memcpy(&logit0_bits, &logit0, sizeof(logit0_bits));
-                if ((logit0_bits & 0x7fffffffu) > 0x7f800000u) {
-                    h->top1_host[t] = 0u;
-                }
-            }
-        }
-    }
-    MTP_HEAD_TICK(MTP_HEAD_T_LOGIT0_IN);
     if (ok && multi_out) {
         stage = "multi readback";
         ok = ds4_gpu_tensor_read(h->t_hyper,
@@ -1260,8 +1265,9 @@ int ds4_qwen4exp_mtp_head_forward(ds4_qwen4exp_mtp_head *h,
                                   uint32_t pos0, uint32_t n_tokens,
                                   int *draft_out, float *multi_out,
                                   char *err, size_t errlen) {
-    return mtp_head_forward_impl(h, next_tokens, multi_in, pos0, n_tokens,
-                                 draft_out, multi_out, false, err, errlen);
+    return mtp_head_forward_impl(h, next_tokens, multi_in, NULL, 0, 0,
+                                 pos0, n_tokens, draft_out, multi_out,
+                                 false, err, errlen);
 }
 
 int ds4_qwen4exp_mtp_head_forward_last(ds4_qwen4exp_mtp_head *h,
@@ -1270,8 +1276,37 @@ int ds4_qwen4exp_mtp_head_forward_last(ds4_qwen4exp_mtp_head *h,
                                        uint32_t pos0, uint32_t n_tokens,
                                        int *draft_out, float *multi_out,
                                        char *err, size_t errlen) {
-    return mtp_head_forward_impl(h, next_tokens, multi_in, pos0, n_tokens,
-                                 draft_out, multi_out, true, err, errlen);
+    return mtp_head_forward_impl(h, next_tokens, multi_in, NULL, 0, 0,
+                                 pos0, n_tokens, draft_out, multi_out,
+                                 true, err, errlen);
+}
+
+int ds4_qwen4exp_mtp_head_forward_from_gpu(ds4_qwen4exp_mtp_head *h,
+                                           const int *next_tokens,
+                                           const ds4_gpu_tensor *multi_dev,
+                                           uint64_t multi_dev_offset,
+                                           uint64_t multi_dev_bytes,
+                                           uint32_t pos0, uint32_t n_tokens,
+                                           int *draft_out, float *multi_out,
+                                           char *err, size_t errlen) {
+    return mtp_head_forward_impl(h, next_tokens, NULL, multi_dev,
+                                 multi_dev_offset, multi_dev_bytes,
+                                 pos0, n_tokens, draft_out, multi_out,
+                                 false, err, errlen);
+}
+
+int ds4_qwen4exp_mtp_head_forward_last_from_gpu(ds4_qwen4exp_mtp_head *h,
+                                                const int *next_tokens,
+                                                const ds4_gpu_tensor *multi_dev,
+                                                uint64_t multi_dev_offset,
+                                                uint64_t multi_dev_bytes,
+                                                uint32_t pos0, uint32_t n_tokens,
+                                                int *draft_out, float *multi_out,
+                                                char *err, size_t errlen) {
+    return mtp_head_forward_impl(h, next_tokens, NULL, multi_dev,
+                                 multi_dev_offset, multi_dev_bytes,
+                                 pos0, n_tokens, draft_out, multi_out,
+                                 true, err, errlen);
 }
 
 #endif /* DS4_NO_GPU */
