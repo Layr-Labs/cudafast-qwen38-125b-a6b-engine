@@ -2063,12 +2063,24 @@ static bool qwen4exp_forward_fail(void) {
 }
 
 /* The PLE host gather and token/position uploads precede this device-only
- * layer stack.  A captured stack retains the same operations and scratch
- * addresses while replacing the per-layer graph launch train with one call. */
+ * stack. A captured stack retains the embedding and layer operations and their
+ * scratch addresses while replacing the eager launch train with one call. */
 static bool qwen4exp_graph_layers_encode(
         ds4_qwen4exp_session *s, const ds4_qwen4exp_weights *w,
         const ds4_model *m, uint32_t n_tokens, bool use_islands) {
     const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
+
+    /* Layer-0 seed: gather the embedding row and tile it into every stream. */
+    if (!ds4_gpu_qwen4exp_embed_tokens_hc_tensor(
+            s->hyper, s->embed_rows, s->tokens,
+            QW_MAP(m, w->token_embd), QW_MAPSZ(m, w->token_embd),
+            QW_OFF(w->token_embd), w->token_embd->type, cfg->n_vocab,
+            n_tokens, DS4_N_EMBD, DS4_N_HC)) {
+        fprintf(stderr, "ds4: qwen4exp embedding gather failed\n");
+        return false;
+    }
+    QW_TRACE(QW_SLICE_EMBED);
+
     for (uint32_t il = 0; il < cfg->n_layer; il++) {
         const ds4_qwen4exp_layer_weights *l = &w->layer[il];
 
@@ -2139,6 +2151,7 @@ static bool qwen4exp_graph_layers(
 #ifdef DS4_TEST_HOOKS
             /* Preserve the logical slice trace even when encoding is skipped. */
             const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
+            QW_TRACE(QW_SLICE_EMBED);
             for (uint32_t il = 0; il < cfg->n_layer; il++) {
                 const ds4_qwen4exp_layer_weights *l = &w->layer[il];
                 if (l->has_ple) QW_TRACE(QW_SLICE_PLE);
@@ -2270,17 +2283,6 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         return false;
     }
 
-    /* Layer-0 seed: gather the embedding row and tile it into every stream. */
-    if (!ds4_gpu_qwen4exp_embed_tokens_hc_tensor(
-            s->hyper, s->embed_rows, s->tokens,
-            QW_MAP(m, w->token_embd), QW_MAPSZ(m, w->token_embd),
-            QW_OFF(w->token_embd), w->token_embd->type, cfg->n_vocab,
-            n_tokens, DS4_N_EMBD, DS4_N_HC)) {
-        fprintf(stderr, "ds4: qwen4exp embedding gather failed\n");
-        return qwen4exp_forward_fail();
-    }
-    QW_TRACE(QW_SLICE_EMBED);
-
     if (!qwen4exp_graph_layers(s, w, m, n_tokens)) {
         return qwen4exp_forward_fail();
     }
@@ -2375,18 +2377,37 @@ static bool qwen4exp_session_select_layers(ds4_qwen4exp_session *s,
     for (uint32_t il = 0; il < cfg->n_layer && ok; il++) {
         if (recurrent && s->gdn_state[il]) {
             const uint64_t bytes = ds4_gpu_tensor_bytes(s->gdn_state[il]);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+            ds4_gpu_tensor src = *s->gdn_state_snapshot[il];
+            src.ptr = (char *)src.ptr + (uint64_t)row * bytes;
+            src.bytes = bytes;
+            src.owner = 0;
+            ok = ds4_gpu_tensor_copy_async(s->gdn_state[il], &src, bytes) != 0;
+#else
             ok = ds4_gpu_tensor_copy(s->gdn_state[il], 0,
                                      s->gdn_state_snapshot[il],
                                      (uint64_t)row * bytes, bytes) != 0;
+#endif
         }
         if (ok && conv && s->gdn_conv[il]) {
             const uint64_t bytes = ds4_gpu_tensor_bytes(s->gdn_conv[il]);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+            ds4_gpu_tensor src = *s->gdn_conv_snapshot[il];
+            src.ptr = (char *)src.ptr + (uint64_t)row * bytes;
+            src.bytes = bytes;
+            src.owner = 0;
+            ok = ds4_gpu_tensor_copy_async(s->gdn_conv[il], &src, bytes) != 0;
+#else
             ok = ds4_gpu_tensor_copy(s->gdn_conv[il], 0,
                                      s->gdn_conv_snapshot[il],
                                      (uint64_t)row * bytes, bytes) != 0;
+#endif
         }
     }
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) return false;
+    if (!ds4_gpu_end_commands()) return false;
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD) || defined(DS4_NO_GPU)
+    if (!ds4_gpu_synchronize()) return false;
+#endif
     return ok;
 }
 
@@ -3044,10 +3065,21 @@ static int qwen4exp_rb_ple_conv_select(void *ctx, uint32_t row) {
     s->state_dirty = true;   /* see `state_dirty` */
     const uint64_t bytes = ds4_gpu_tensor_bytes(s->ple_conv_state);
     if (!ds4_gpu_begin_commands()) return -1;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    ds4_gpu_tensor src = *s->ple_conv_snapshot;
+    src.ptr = (char *)src.ptr + (uint64_t)row * bytes;
+    src.bytes = bytes;
+    src.owner = 0;
+    const bool ok = ds4_gpu_tensor_copy_async(s->ple_conv_state, &src, bytes) != 0;
+#else
     const bool ok = ds4_gpu_tensor_copy(s->ple_conv_state, 0,
                                         s->ple_conv_snapshot,
                                         (uint64_t)row * bytes, bytes) != 0;
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) return -1;
+#endif
+    if (!ds4_gpu_end_commands()) return -1;
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD) || defined(DS4_NO_GPU)
+    if (!ds4_gpu_synchronize()) return -1;
+#endif
     return ok ? 0 : -1;
 }
 static int qwen4exp_rb_qsa_kv_truncate(void *ctx, uint32_t pos) {

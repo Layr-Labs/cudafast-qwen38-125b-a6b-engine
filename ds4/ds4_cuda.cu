@@ -17945,7 +17945,9 @@ extern "C" int ds4_gpu_repeat_hc_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_
     }
     const uint64_t blocks = (out_elems + 255u) / 256u;
     if (blocks > UINT32_MAX) return 0;
-    repeat_hc_rows_kernel<<<(unsigned)blocks, 256>>>((float *)out->ptr, (const float *)rows->ptr, n_tokens, n_embd, n_hc);
+    repeat_hc_rows_kernel<<<(unsigned)blocks, 256, 0, cuda_decode_stream()>>>(
+            (float *)out->ptr, (const float *)rows->ptr,
+            n_tokens, n_embd, n_hc);
     return cuda_ok(cudaGetLastError(), "repeat_hc_rows launch");
 }
 
@@ -28541,7 +28543,8 @@ extern "C" int ds4_gpu_embed_tokens_quant_tensor(
             logical_tier, "glm_token_embd");
     if (!w) return 0;
     uint64_t n = (uint64_t)n_tokens * n_embd;
-    glm_embed_tokens_q8_0_kernel<<<(n + 255) / 256, 256>>>(
+    glm_embed_tokens_q8_0_kernel<<<
+            (n + 255) / 256, 256, 0, cuda_decode_stream()>>>(
             (float *)out->ptr,
             (const int32_t *)tokens->ptr,
             w, n_tokens, n_embd);
