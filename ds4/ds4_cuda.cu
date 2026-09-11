@@ -5170,6 +5170,49 @@ __global__ static void matmul_f32_kernel(
     if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
 }
 
+/* Two independent copies of matmul_f32_kernel's arithmetic in one block.
+ * Each accumulator visits the same i values and each reduction uses the same
+ * stride-halving tree as the single-output kernel.  Only the activation load,
+ * launch, and barriers are shared. */
+__global__ static void matmul_f32_pair_kernel(
+        float *out0,
+        float *out1,
+        const float *w0,
+        const float *w1,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out_dim) {
+    const uint64_t row = (uint64_t)blockIdx.x;
+    if (row >= out_dim) return;
+
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    const float *wr0 = w0 + row * in_dim;
+    const float *wr1 = w1 + row * in_dim;
+    for (uint64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        const float xv = x[i];
+        sum0 += wr0[i] * xv;
+        sum1 += wr1[i] * xv;
+    }
+
+    __shared__ float partial0[256];
+    __shared__ float partial1[256];
+    partial0[threadIdx.x] = sum0;
+    partial1[threadIdx.x] = sum1;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            partial0[threadIdx.x] += partial0[threadIdx.x + stride];
+            partial1[threadIdx.x] += partial1[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        out0[row] = partial0[0];
+        out1[row] = partial1[0];
+    }
+}
+
 __global__ static void repeat_hc_kernel(float *out, const float *row, uint32_t n_embd, uint32_t n_hc) {
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)n_embd * n_hc;
@@ -17407,6 +17450,68 @@ extern "C" int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
                 in_dim, out_dim, n_rows);
     }
     return cuda_ok(cudaGetLastError(), "matmul_f32 decode rows tile launch");
+}
+
+extern "C" int ds4_gpu_matmul_f32_pair_decode_rows_exact_tensor(
+        ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
+        const void *model_map0, uint64_t model_size0,
+        uint64_t weight_offset0,
+        const void *model_map1, uint64_t model_size1,
+        uint64_t weight_offset1,
+        uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint32_t n_rows) {
+    if (!out0 || !out1 || !x || !model_map0 || !model_map1 ||
+        in_dim == 0 || out_dim == 0 || n_rows == 0) {
+        return 0;
+    }
+
+    /* Pair only the latency-sensitive one-row path.  Keeping the established
+     * row-tiled functions for verification and prefill avoids changing their
+     * occupancy or exact reduction layout. */
+    if (n_rows != 1u || getenv("DS4_CUDA_NO_F32_PAIR_MATMUL") != NULL) {
+        return ds4_gpu_matmul_f32_decode_rows_exact_tensor(
+                       out0, model_map0, model_size0, weight_offset0,
+                       in_dim, out_dim, x, n_rows) &&
+               ds4_gpu_matmul_f32_decode_rows_exact_tensor(
+                       out1, model_map1, model_size1, weight_offset1,
+                       in_dim, out_dim, x, n_rows);
+    }
+    if (out_dim > UINT64_MAX / in_dim) return 0;
+    const uint64_t weight_elems = out_dim * in_dim;
+    if (weight_elems > UINT64_MAX / sizeof(float)) return 0;
+    const uint64_t weight_bytes = weight_elems * sizeof(float);
+    if (weight_offset0 > model_size0 ||
+        weight_bytes > model_size0 - weight_offset0 ||
+        weight_offset1 > model_size1 ||
+        weight_bytes > model_size1 - weight_offset1 ||
+        x->bytes < in_dim * sizeof(float) ||
+        out0->bytes < out_dim * sizeof(float) ||
+        out1->bytes < out_dim * sizeof(float)) {
+        return 0;
+    }
+    const int logical_tier = ds4_tensor_device_idx(out0);
+    if (ds4_tensor_device_idx(out1) != logical_tier) {
+        return ds4_gpu_matmul_f32_decode_rows_exact_tensor(
+                       out0, model_map0, model_size0, weight_offset0,
+                       in_dim, out_dim, x, n_rows) &&
+               ds4_gpu_matmul_f32_decode_rows_exact_tensor(
+                       out1, model_map1, model_size1, weight_offset1,
+                       in_dim, out_dim, x, n_rows);
+    }
+    const char *w0 = cuda_resolve_weight_ptr(
+            model_map0, weight_offset0, weight_bytes, logical_tier,
+            "f32 pair0");
+    const char *w1 = cuda_resolve_weight_ptr(
+            model_map1, weight_offset1, weight_bytes, logical_tier,
+            "f32 pair1");
+    if (!w0 || !w1) return 0;
+
+    matmul_f32_pair_kernel<<<(unsigned)out_dim, 256, 0,
+                             cuda_decode_stream()>>>(
+            (float *)out0->ptr, (float *)out1->ptr,
+            (const float *)w0, (const float *)w1,
+            (const float *)x->ptr, in_dim, out_dim);
+    return cuda_ok(cudaGetLastError(), "matmul_f32 pair launch");
 }
 
 extern "C" int ds4_gpu_repeat_hc_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *row, uint32_t n_embd, uint32_t n_hc) {

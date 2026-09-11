@@ -20616,6 +20616,24 @@ int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
     }
 }
 
+/* CUDA pairs the one-row alpha/beta projections in a single kernel.  Metal
+ * retains its established exact per-projection dispatches. */
+int ds4_gpu_matmul_f32_pair_decode_rows_exact_tensor(
+        ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
+        const void *model_map0, uint64_t model_size0,
+        uint64_t weight_offset0,
+        const void *model_map1, uint64_t model_size1,
+        uint64_t weight_offset1,
+        uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint32_t n_rows) {
+    return ds4_gpu_matmul_f32_decode_rows_exact_tensor(
+                   out0, model_map0, model_size0, weight_offset0,
+                   in_dim, out_dim, x, n_rows) &&
+           ds4_gpu_matmul_f32_decode_rows_exact_tensor(
+                   out1, model_map1, model_size1, weight_offset1,
+                   in_dim, out_dim, x, n_rows);
+}
+
 int ds4_gpu_matmul_f32_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,

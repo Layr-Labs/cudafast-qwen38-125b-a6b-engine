@@ -94,6 +94,28 @@ static inline int ds4_qwen4exp_matmul_f32(ds4_gpu_tensor       *out,
             out, map, map_size, offset, in_dim, out_dim, x, rows);
 }
 
+/* The GDN alpha and beta projections have identical F32 shapes and consume
+ * the same activation.  Pair their one-row CUDA work so both exact reduction
+ * trees share one launch and one activation read.  Wider rows retain the
+ * established exact-row implementations, as does the Metal backend. */
+static inline int ds4_qwen4exp_matmul_f32_pair(
+        ds4_gpu_tensor       *out0,
+        ds4_gpu_tensor       *out1,
+        const void           *map0,
+        uint64_t              map_size0,
+        uint64_t              offset0,
+        const void           *map1,
+        uint64_t              map_size1,
+        uint64_t              offset1,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              rows) {
+    return ds4_gpu_matmul_f32_pair_decode_rows_exact_tensor(
+            out0, out1, map0, map_size0, offset0,
+            map1, map_size1, offset1, in_dim, out_dim, x, rows);
+}
+
 /* The indexer's BF16 projections.
  *
  * ds4_gpu_glm53_matmul_bf16 tiers by row count at EIGHT, and on BOTH backends
