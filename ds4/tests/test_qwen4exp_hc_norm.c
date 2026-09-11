@@ -548,6 +548,157 @@ static void check_mixer_equivalence(uint8_t *model) {
            (unsigned long long)cases);
 }
 
+/* ---- the inject-fused mixer against inject-then-mixer ----------------- */
+
+/* ds4_gpu_qwen4exp_hc_inject_mixer_tensor is DEFINED as hc_inject followed by
+ * the mixer; a backend may fold the inject into the mixer's first pass over
+ * the stream.  Same contract as above, one more output: the fused path
+ * rewrites `hyper` with the injected stream, and those bytes must be the
+ * standalone inject kernel's bytes, because every later reader of the
+ * residual -- the next inject, the next mixer, the MTP head -- reads them. */
+static void check_inject_mixer_equivalence(uint8_t *model) {
+    static const uint32_t row_set[] = { 1u, 2u, 4u, 47u, 48u, 64u, ROWS_LONG };
+    const ds4_gpu_qwen4exp_slab norm_slab =
+        hc_slab(model, MODEL_BYTES, NORM_WIDE_OFF);
+    const ds4_gpu_qwen4exp_slab down_slab =
+        hc_slab(model, MODEL_BYTES, DOWN_OFF);
+    const ds4_gpu_qwen4exp_slab up_slab =
+        hc_slab(model, MODEL_BYTES, UP_OFF);
+    ds4_gpu_qwen4exp_slab inject_f32 =
+        hc_slab(model, MODEL_BYTES, INJECT_OFF);
+    ds4_gpu_qwen4exp_slab inject_q8 =
+        hc_slab(model, MODEL_BYTES, INJECT_Q8_OFF);
+    inject_q8.row_bytes = (uint64_t)(WIDE / 32) * 34u;
+    inject_q8.type = TENSOR_Q8_0;
+
+    uint64_t cases = 0;
+    for (uint32_t ri = 0; ri < sizeof(row_set) / sizeof(row_set[0]); ri++) {
+        const uint32_t rows = row_set[ri];
+        const uint64_t hc_count = (uint64_t)rows * WIDE;
+        const uint64_t embd_count = (uint64_t)rows * N_EMBD;
+        const uint64_t inj_count = (uint64_t)rows * N_HC;
+        const uint64_t hc_bytes = hc_count * sizeof(float);
+
+        float *hyper = alloc_floats(hc_count);
+        float *block = alloc_floats(embd_count);
+        float *inj_in = alloc_floats(inj_count);
+        for (uint64_t i = 0; i < hc_count; i++) hyper[i] = next_unit();
+        for (uint64_t i = 0; i < embd_count; i++) block[i] = next_unit();
+        /* 2 * sigmoid(.) is what the head produces: (0, 2), around 1. */
+        for (uint64_t i = 0; i < inj_count; i++) inj_in[i] = 1.0f + 0.5f * next_unit();
+        ds4_gpu_tensor *hyper_t = upload(hyper, hc_count);
+        ds4_gpu_tensor *block_t = upload(block, embd_count);
+        ds4_gpu_tensor *inj_in_t = upload(inj_in, inj_count);
+
+        ds4_gpu_tensor *normed_t = ds4_gpu_tensor_alloc(hc_bytes);
+        ds4_gpu_tensor *wide_t = ds4_gpu_tensor_alloc(hc_bytes);
+        ds4_gpu_tensor *lowrank_t =
+            ds4_gpu_tensor_alloc((uint64_t)rows * N_LOWRANK * sizeof(float));
+        ds4_gpu_tensor *mixed_a = ds4_gpu_tensor_alloc(embd_count * sizeof(float));
+        ds4_gpu_tensor *mixed_b = ds4_gpu_tensor_alloc(embd_count * sizeof(float));
+        ds4_gpu_tensor *inject_a = ds4_gpu_tensor_alloc(inj_count * sizeof(float));
+        ds4_gpu_tensor *inject_b = ds4_gpu_tensor_alloc(inj_count * sizeof(float));
+        require_ok(normed_t && wide_t && lowrank_t && mixed_a && mixed_b &&
+                   inject_a && inject_b, "inject-mixer tensor allocation");
+
+        float *mixed_ref = alloc_floats(embd_count);
+        float *mixed_got = alloc_floats(embd_count);
+        float *inject_ref = alloc_floats(inj_count);
+        float *inject_got = alloc_floats(inj_count);
+        float *hyper_ref = alloc_floats(hc_count);
+        float *hyper_got = alloc_floats(hc_count);
+
+        for (int head = 0; head < 3; head++) {
+            const ds4_gpu_qwen4exp_slab *iw =
+                head == 0 ? &inject_f32 : (head == 1 ? &inject_q8 : NULL);
+            ds4_gpu_tensor *ia = head == 2 ? NULL : inject_a;
+            ds4_gpu_tensor *ib = head == 2 ? NULL : inject_b;
+            for (int bias = 0; bias < 2; bias++) {
+                for (int bf16 = 0; bf16 < 2; bf16++) {
+                    const float weight_bias = bias ? 1.0f : 0.0f;
+
+                    /* Both sides start from the SAME residual: the call
+                     * rewrites it, so it is restored before each. */
+                    require_ok(ds4_gpu_tensor_write(hyper_t, 0, hyper, hc_bytes),
+                               "residual reset");
+                    require_ok(ds4_gpu_qwen4exp_hc_inject_mixer_unfused_tensor(
+                                   mixed_a, ia, normed_t, lowrank_t, wide_t,
+                                   hyper_t, block_t, inj_in_t,
+                                   &norm_slab, &down_slab, &up_slab, iw,
+                                   N_EMBD, N_HC, N_LOWRANK, rows, 1e-6f,
+                                   weight_bias, bf16),
+                               "unfused inject + HC mixer");
+                    download(mixed_a, mixed_ref, embd_count);
+                    if (ia) download(inject_a, inject_ref, inj_count);
+                    download(hyper_t, hyper_ref, hc_count);
+
+                    require_ok(ds4_gpu_tensor_write(hyper_t, 0, hyper, hc_bytes),
+                               "residual reset");
+                    require_ok(ds4_gpu_qwen4exp_hc_inject_mixer_tensor(
+                                   mixed_b, ib, normed_t, lowrank_t, wide_t,
+                                   hyper_t, block_t, inj_in_t,
+                                   &norm_slab, &down_slab, &up_slab, iw,
+                                   N_EMBD, N_HC, N_LOWRANK, rows, 1e-6f,
+                                   weight_bias, bf16),
+                               "fused inject + HC mixer");
+                    download(mixed_b, mixed_got, embd_count);
+                    if (ib) download(inject_b, inject_got, inj_count);
+                    download(hyper_t, hyper_got, hc_count);
+
+                    require_identical("fused inject + HC mixer rewrites the residual",
+                                      hyper_got, hyper_ref, hc_bytes);
+                    /* And the residual it leaves is a CHANGED one: a fused
+                     * path that forgot the inject would match an unfused
+                     * path that forgot it too, so hold both to the
+                     * standalone inject kernel as well. */
+                    require_ok(ds4_gpu_tensor_write(hyper_t, 0, hyper, hc_bytes),
+                               "residual reset");
+                    require_ok(ds4_gpu_qwen4exp_hc_inject_tensor(
+                                   hyper_t, hyper_t, block_t, inj_in_t,
+                                   N_EMBD, N_HC, rows),
+                               "standalone inject");
+                    download(hyper_t, hyper_ref, hc_count);
+                    require_identical("fused inject + HC mixer residual is the inject's",
+                                      hyper_got, hyper_ref, hc_bytes);
+
+                    require_identical("fused inject + HC mixer block input",
+                                      mixed_got, mixed_ref,
+                                      embd_count * sizeof(float));
+                    if (ia) {
+                        require_identical("fused inject + HC mixer inject weights",
+                                          inject_got, inject_ref,
+                                          inj_count * sizeof(float));
+                    }
+                    cases++;
+                }
+            }
+        }
+
+        free(hyper_got);
+        free(hyper_ref);
+        free(inject_got);
+        free(inject_ref);
+        free(mixed_got);
+        free(mixed_ref);
+        ds4_gpu_tensor_free(inject_b);
+        ds4_gpu_tensor_free(inject_a);
+        ds4_gpu_tensor_free(mixed_b);
+        ds4_gpu_tensor_free(mixed_a);
+        ds4_gpu_tensor_free(lowrank_t);
+        ds4_gpu_tensor_free(wide_t);
+        ds4_gpu_tensor_free(normed_t);
+        ds4_gpu_tensor_free(inj_in_t);
+        ds4_gpu_tensor_free(block_t);
+        ds4_gpu_tensor_free(hyper_t);
+        free(inj_in);
+        free(block);
+        free(hyper);
+    }
+    printf("  %-56s exact over %llu cases\n",
+           "fused inject + HC mixer equals inject then the chain",
+           (unsigned long long)cases);
+}
+
 int main(void) {
     uint8_t *model = mmap(NULL, MODEL_BYTES, PROT_READ | PROT_WRITE,
                           MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -983,6 +1134,7 @@ int main(void) {
     }
 
     check_mixer_equivalence(model);
+    check_inject_mixer_equivalence(model);
 
     munmap(model, MODEL_BYTES);
     printf("test_qwen4exp_hc_norm: ok\n");

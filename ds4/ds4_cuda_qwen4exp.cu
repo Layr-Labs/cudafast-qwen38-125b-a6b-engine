@@ -2175,6 +2175,133 @@ __device__ __forceinline__ static bool qw_raw_load(
     }
 }
 
+/* LANE-PAIR PAYLOAD SPLIT.
+ *
+ * A q4_K or q5_K group and its nibble-pair neighbour are two halves of ONE
+ * 32-byte payload slice: group g takes the low nibble of each byte, g^1 the
+ * high nibble, and ((g % 8) >> 1) * 32 is the same offset for both.  The
+ * decode lanes are laid out dec_r = tid / QW_MMA_G, dec_gg = tid % QW_MMA_G
+ * with QW_MMA_G even, so lane tid and lane tid^1 carry the SAME dec_r and a
+ * dec_gg differing only in bit 0 -- the same weight row, the same slice, the
+ * same address.  Both were reading all 32 bytes; the warp asked for every
+ * group's payload twice.
+ *
+ * Below, each lane reads the 16 bytes of its half (bit 0 of dec_gg picks it)
+ * and the pair swaps halves with one __shfl_xor_sync over lane^1.  The bytes
+ * are the bytes the whole-slice load read, from the same addresses; the swap
+ * only changes which lane issued the read.  Word i of the low half is w[i]
+ * and word i of the high half is w[4 + i], which is the order the whole-slice
+ * load filled w[0..7] in, so the decode sees the identical eight registers
+ * and every quant, scale and accumulation is unchanged.
+ *
+ * The partner is lane^1 within one warp, so the mask is the whole warp and
+ * the statement carrying the swap sits outside every branch, immediately
+ * after a __syncthreads().  The STAGING guard is the pair's and not the
+ * lane's -- a lane must read its half whenever its partner may want it --
+ * which is what (dec_gg & ~1u) in the guards says.  (The tile's launch
+ * precondition groups % QW_MMA_G == 0 already makes the lane form and the
+ * pair form equal; the pair form is what makes that irrelevant.)
+ *
+ * Only q4_K and q5_K share a slice.  q5_1's group IS its own block and q8_0
+ * stages nothing at all, so both keep the whole-group load and no swap. */
+#ifndef DS4_QWEN4EXP_PAIR_SPLIT
+/* 1, the shipped default, splits the shared slice across the nibble pair; 0
+ * restores the whole-slice load the split is argued equal to, for bisecting a
+ * suspected decode fault without reverting the change. */
+#define DS4_QWEN4EXP_PAIR_SPLIT 1
+#endif
+static_assert((QW_MMA_G % 2) == 0,
+              "the nibble pair must be two lanes of one decode row");
+
+/* The types whose 32-byte payload slice is shared by the nibble pair.  The
+ * slab types are block uniform, so every branch on this is uniform. */
+__device__ __forceinline__ static bool qw_type_pair_shared(uint32_t type) {
+    return type == (uint32_t)DS4_QWEN4EXP_TY_q4_K ||
+           type == (uint32_t)DS4_QWEN4EXP_TY_q5_K;
+}
+
+/* Four consecutive payload words -- the half a lane now reads -- through the
+ * same arms qw_load_words8 uses, and exact for the same reason: uint4 .x .y
+ * .z .w and uint2 .x .y ARE the words at p in address order. */
+__device__ __forceinline__ static void qw_load_words4(const uint32_t *qw,
+                                                      uint32_t *w) {
+#if DS4_QWEN4EXP_WIDE_PAYLOAD
+    if ((((uintptr_t)qw) & 15u) == 0u) {
+        const uint4 a = *(const uint4 *)(const void *)qw;
+        w[0] = a.x; w[1] = a.y; w[2] = a.z; w[3] = a.w;
+        return;
+    }
+    if ((((uintptr_t)qw) & 7u) == 0u) {
+        const uint2 *q2 = (const uint2 *)(const void *)qw;
+        const uint2 v0 = q2[0];
+        const uint2 v1 = q2[1];
+        w[0] = v0.x; w[1] = v0.y; w[2] = v1.x; w[3] = v1.y;
+        return;
+    }
+#endif
+#pragma unroll
+    for (int i = 0; i < 4; i++) w[i] = qw[i];
+}
+
+/* Half of the slice group `gpair` shares with `gpair ^ 1`: words 4*half ..
+ * 4*half+3 of the very words qw_raw_load reads for either member.  gpair is
+ * the pair's even member, so the address does not depend on which lane asks
+ * -- which is why one guard covers both. */
+__device__ __forceinline__ static bool qw_raw_load_half(
+        uint32_t type, const char *row, uint32_t gpair, uint32_t half,
+        uint32_t *w) {
+    const uint8_t *qs;
+    if (type == (uint32_t)DS4_QWEN4EXP_TY_q4_K) {
+        const cuda_block_q4_K *xb = (const cuda_block_q4_K *)row + (gpair / 8u);
+        qs = xb->qs + ((gpair % 8u) >> 1u) * 32u;
+    } else {
+        const cuda_block_q5_K *xb = (const cuda_block_q5_K *)row + (gpair / 8u);
+        qs = xb->qs + ((gpair % 8u) >> 1u) * 32u;
+    }
+    if (!qwen4exp_word_aligned(qs)) return false;
+    qw_load_words4((const uint32_t *)(const void *)qs + half * 4u, w);
+    return true;
+}
+
+/* Stage this lane's contribution to group g's payload: its half of the pair's
+ * slice where the type shares one, the whole group otherwise. */
+template <int PairSplit>
+__device__ __forceinline__ static bool qw_raw_stage(
+        uint32_t type, const char *row, uint32_t g, uint32_t gpair,
+        uint32_t half, uint32_t *w) {
+    if (PairSplit && qw_type_pair_shared(type))
+        return qw_raw_load_half(type, row, gpair, half, w);
+    return qw_raw_load(type, row, g, w);
+}
+
+/* Hand each lane of the pair the half its partner read.  w[0..3] holds this
+ * lane's half on entry and w[0..7] the whole slice on exit, low half first --
+ * the order qw_raw_load's word loop wrote.  __shfl_xor_sync with the full
+ * warp mask and laneMask 1 returns lane^1's value, which is the partner,
+ * because the pair is two adjacent lanes of one warp. */
+__device__ __forceinline__ static void qw_pair_join(uint32_t *w,
+                                                    uint32_t half) {
+    uint32_t o[4];
+#pragma unroll
+    for (int i = 0; i < 4; i++) o[i] = __shfl_xor_sync(0xffffffffu, w[i], 1);
+    if (half) {
+        /* This lane read the high half; the partner read the low one. */
+        w[4] = w[0]; w[5] = w[1]; w[6] = w[2]; w[7] = w[3];
+        w[0] = o[0]; w[1] = o[1]; w[2] = o[2]; w[3] = o[3];
+    } else {
+        w[4] = o[0]; w[5] = o[1]; w[6] = o[2]; w[7] = o[3];
+    }
+}
+
+/* Warp-converged completion of a staged pair.  Must sit outside every branch
+ * of the decode loop: the mask names the whole warp. */
+template <int PairSplit>
+__device__ __forceinline__ static void qw_raw_join(uint32_t type,
+                                                   uint32_t half,
+                                                   uint32_t *w) {
+    if (PairSplit && qw_type_pair_shared(type)) qw_pair_join(w, half);
+}
+
 /* Decode one 32-element group straight into the eight words of a tile row,
  * plus the (wa, wb) the scaling chain needs.  `raw` is the group's payload as
  * qw_raw_load staged it, or NULL to decode from the row -- which is what
@@ -2269,7 +2396,8 @@ __device__ __forceinline__ static void qw_mma_m16n8k32(
 }
 
 /* Grid (mid_dim / BM, the experts this call chose). */
-template <int GateType = -1, int UpType = -1>
+template <int GateType = -1, int UpType = -1,
+          int PairSplit = DS4_QWEN4EXP_PAIR_SPLIT>
 __global__ __launch_bounds__(QW_MMA_THREADS) static void
 qwen4exp_moe_gateup_mma_kernel(
         float *mid,
@@ -2334,6 +2462,9 @@ qwen4exp_moe_gateup_mma_kernel(
     const uint32_t act_gg = tid - act_tk * QW_MMA_G;
     const char *gate_row = gate_e + (uint64_t)dec_mrow * gate_row_bytes;
     const char *up_row   = up_e + (uint64_t)dec_mrow * up_row_bytes;
+    /* Bit 0 of dec_gg is which half of the pair's shared slice this lane
+     * reads, and lane^1 reads the other. */
+    const uint32_t dec_half = dec_gg & 1u;
 
     for (int32_t nbase = 0; nbase < cnt; nbase += QW_MMA_BN) {
         const int32_t take = (cnt - nbase) < QW_MMA_BN ? (cnt - nbase)
@@ -2348,9 +2479,18 @@ qwen4exp_moe_gateup_mma_kernel(
         uint32_t rawg[8], rawu[8], rawb[8];
         int haveg = 0, haveu = 0, haveb = 0;
         float act_scale = 0.0f, act_sum = 0.0f;
-        if (dec_mrow < mid_dim && dec_gg < groups) {
-            haveg = qw_raw_load(gate_type, gate_row, dec_gg, rawg);
-            haveu = qw_raw_load(up_type, up_row, dec_gg, rawu);
+        /* The swap at the top of the chunk loop reads the low half of
+         * these registers whether or not this slot staged anything into
+         * them, so they start defined rather than merely unread. */
+        if (PairSplit) {
+#pragma unroll
+            for (int i = 0; i < 4; i++) { rawg[i] = 0u; rawu[i] = 0u; }
+        }
+        if (dec_mrow < mid_dim && (dec_gg & ~1u) < groups) {
+            haveg = qw_raw_stage<PairSplit>(gate_type, gate_row, dec_gg,
+                                            dec_gg & ~1u, dec_half, rawg);
+            haveu = qw_raw_stage<PairSplit>(up_type, up_row, dec_gg,
+                                            dec_gg & ~1u, dec_half, rawu);
         }
         if (sTok[act_tk] != 0xffffffffu && act_gg < groups) {
             const uint32_t token = sTok[act_tk] / n_expert_used;
@@ -2368,6 +2508,12 @@ qwen4exp_moe_gateup_mma_kernel(
 
         for (uint32_t kc = 0; kc < groups; kc += QW_MMA_G) {
             __syncthreads();
+            /* Complete this chunk's staging: each lane read half the slice
+             * its nibble pair shares, and the swap hands it the half its
+             * partner read, into the registers the whole-slice load filled.
+             * Outside every branch, so the whole warp is here. */
+            qw_raw_join<PairSplit>(gate_type, dec_half, rawg);
+            qw_raw_join<PairSplit>(up_type, dec_half, rawu);
             /* The next chunk's weight payload is issued the moment this
              * chunk's copy of the register is dead -- between the two
              * decodes -- rather than after both, so the load has the rest of
@@ -2375,8 +2521,10 @@ qwen4exp_moe_gateup_mma_kernel(
              * depth, same registers, same values; only the issue point moves,
              * and the guard is the one the prefetch block used. */
             const uint32_t gnext = kc + QW_MMA_G + dec_gg;
+            const uint32_t gnpair = kc + QW_MMA_G + (dec_gg & ~1u);
             const bool next_w = kc + QW_MMA_G < groups &&
-                                dec_mrow < mid_dim && gnext < groups;
+                                dec_mrow < mid_dim &&
+                                (PairSplit ? gnpair : gnext) < groups;
             /* Weight tile: this thread's one (row, group) of 32, decoded from
              * registers into the eight words of the tile row. */
             {
@@ -2389,14 +2537,16 @@ qwen4exp_moe_gateup_mma_kernel(
                             &sAg[dec_r * QW_MMA_LD + dec_gg * 32], wa, wb);
                     sWAg[dec_r * QW_MMA_G + dec_gg] = wa[0];
                     sWBg[dec_r * QW_MMA_G + dec_gg] = wb[0];
-                    haveg = next_w && qw_raw_load(gate_type, gate_row, gnext, rawg);
+                    haveg = next_w && qw_raw_stage<PairSplit>(
+                            gate_type, gate_row, gnext, gnpair, dec_half, rawg);
                     dev_qwen4exp_group_decode_w(
                             UpType < 0 ? up_type : (uint32_t)UpType, up_row, g,
                             haveu ? rawu : NULL,
                             &sAu[dec_r * QW_MMA_LD + dec_gg * 32], wa, wb);
                     sWAu[dec_r * QW_MMA_G + dec_gg] = wa[0];
                     sWBu[dec_r * QW_MMA_G + dec_gg] = wb[0];
-                    haveu = next_w && qw_raw_load(up_type, up_row, gnext, rawu);
+                    haveu = next_w && qw_raw_stage<PairSplit>(
+                            up_type, up_row, gnext, gnpair, dec_half, rawu);
                 } else {
                     qw_tile_store_zero(&sAg[dec_r * QW_MMA_LD + dec_gg * 32]);
                     qw_tile_store_zero(&sAu[dec_r * QW_MMA_LD + dec_gg * 32]);
@@ -2404,8 +2554,13 @@ qwen4exp_moe_gateup_mma_kernel(
                     sWBg[dec_r * QW_MMA_G + dec_gg] = 0.0f;
                     sWAu[dec_r * QW_MMA_G + dec_gg] = 0.0f;
                     sWBu[dec_r * QW_MMA_G + dec_gg] = 0.0f;
-                    haveg = 0;
-                    haveu = 0;
+                    /* Still stage: this slot writes no tile row, but its
+                     * nibble-pair partner may, and the swap below is a warp
+                     * instruction both lanes execute. */
+                    haveg = next_w && qw_raw_stage<PairSplit>(
+                            gate_type, gate_row, gnext, gnpair, dec_half, rawg);
+                    haveu = next_w && qw_raw_stage<PairSplit>(
+                            up_type, up_row, gnext, gnpair, dec_half, rawu);
                 }
             }
             /* Activation tile: a padded token row is zero, and zero contributes
@@ -4704,9 +4859,16 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         QWEN4EXP_GATEUP_IMPL(R, -1, -1); \
     } \
 } while (0)
+    /* The whole-slice load the lane-pair split is argued equal to, kept as
+     * a runtime pin so the suite can compare the two arms byte for byte the
+     * way DS4_QWEN4EXP_NO_SPLIT_GATEUP pins the joint projection.  Host side
+     * only: the launch picks an instantiation, the device code carries no
+     * branch, and the default is the split. */
+    const int pair_split = getenv("DS4_QWEN4EXP_NO_PAIR_SPLIT") == NULL
+                               ? DS4_QWEN4EXP_PAIR_SPLIT : 0;
     if (use_mma) {
-#define QWEN4EXP_GATEUP_MMA(GT, UT) \
-        qwen4exp_moe_gateup_mma_kernel<GT, UT><<< \
+#define QWEN4EXP_GATEUP_MMA_PS(GT, UT, PS) \
+        qwen4exp_moe_gateup_mma_kernel<GT, UT, PS><<< \
                 dim3(mid_dim / QW_MMA_BM, gu_rows, 1), \
                 QW_MMA_THREADS, 0, stream>>>( \
                 (float *)mid->ptr, \
@@ -4720,6 +4882,10 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
                 up_slab->expert_bytes, up_slab->row_bytes, \
                 gate_slab->type, up_slab->type, xgroups, mid_dim, \
                 mid_token_stride, n_expert_used)
+#define QWEN4EXP_GATEUP_MMA(GT, UT) do { \
+        if (pair_split) { QWEN4EXP_GATEUP_MMA_PS(GT, UT, 1); } \
+        else            { QWEN4EXP_GATEUP_MMA_PS(GT, UT, 0); } \
+    } while (0)
         if (specialize && gate_slab->type == DS4_QWEN4EXP_TY_q4_K &&
                           up_slab->type == DS4_QWEN4EXP_TY_q4_K) {
             QWEN4EXP_GATEUP_MMA(DS4_QWEN4EXP_TY_q4_K, DS4_QWEN4EXP_TY_q4_K);
@@ -4730,6 +4896,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             QWEN4EXP_GATEUP_MMA(-1, -1);
         }
 #undef QWEN4EXP_GATEUP_MMA
+#undef QWEN4EXP_GATEUP_MMA_PS
     }
     /* The measured Q4 path for the R=2 tile (one-row decode and two-row
      * verify). qwen4exp_moe_tile already returns 2 for n_tokens <= 2, so the
@@ -5468,16 +5635,47 @@ __device__ __forceinline__ static float qwen4exp_q8_rcp_approx(float d) {
     return r;
 }
 
+/* qwen4exp_hc_inject_kernel's one line, then qwen4exp_hc_norm_scale, in the
+ * same pass: the injected stream is stored -- it IS the residual from here on
+ * and every later kernel reads it -- and squared from the register that
+ * produced it.
+ *
+ * __fmaf_rn, not `a + b * c`: the inject kernel's expression contracts to one
+ * FFMA (SASS: `FFMA R7, R9, R10, R2`, block * inject + residual), and the
+ * reference says fmaf for the same reason.  Naming the instruction pins the
+ * single rounding rather than leaving it to the contraction pass.  The
+ * product is commutative before it is rounded, so operand order is free. */
+__device__ __forceinline__ static float qwen4exp_hc_inject_norm_scale(
+        float *hg, const float *br, float s_inj, uint32_t group, float eps,
+        float *partial) {
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < group; i += blockDim.x) {
+        const float v = __fmaf_rn(br[i], s_inj, hg[i]);
+        hg[i] = v;
+        sum += v * v;
+    }
+    const float total = qwen4exp_block_sum_f32(sum, partial);
+    return 1.0f / sqrtf(total / (float)group + eps);
+}
+
 /* hcNorm, then the Q8_0 row quantize the down projection wants, in one pass.
  *
  * Grid (n_hc, rows), blockDim.x QWEN4EXP_HC_THREADS: one block per (token,
  * stream), the shape qwen4exp_rms_norm_kernel launches, so the reduction is
  * the same one.  `group` (= n_embd) must be a multiple of blockDim.x, so loop
  * step k of thread t covers flat index g*group + k*blockDim.x + t and warp w
- * of that step covers exactly one 32-value Q8_0 block, in lane order. */
+ * of that step covers exactly one 32-value Q8_0 block, in lane order.
+ *
+ * INJECT folds the preceding hc_inject into the same pass: `x` is then the
+ * residual, read and REWRITTEN in place as residual + block * inj[row][g]
+ * before it is normalized.  The second loop re-reads the values this thread
+ * itself just stored, which is the program-order guarantee and needs no
+ * barrier; the unfused norm kernel reads its input twice the same way. */
+template <bool INJECT>
 __global__ static void qwen4exp_hc_norm_quant_kernel(
         int8_t *xq, float *xscale, float *nscale,
-        const float *x, const float *w,
+        float *x, const float *w,
+        const float *block, const float *inj,
         uint32_t n, uint32_t group, uint32_t rows,
         float eps, float weight_bias, int round_bf16) {
     const uint32_t g = blockIdx.x;
@@ -5485,11 +5683,18 @@ __global__ static void qwen4exp_hc_norm_quant_kernel(
     if (row >= rows) return;
 
     const uint64_t base = (uint64_t)row * n + (uint64_t)g * group;
-    const float *xg = x + base;
+    float *xg = x + base;
     const float *wg = w + (uint64_t)g * group;
 
     __shared__ float partial[QWEN4EXP_HC_THREADS];
-    const float scale = qwen4exp_hc_norm_scale(xg, group, eps, partial);
+    float scale;
+    if (INJECT) {
+        scale = qwen4exp_hc_inject_norm_scale(
+                xg, block + (uint64_t)row * group,
+                inj[(uint64_t)row * (n / group) + g], group, eps, partial);
+    } else {
+        scale = qwen4exp_hc_norm_scale(xg, group, eps, partial);
+    }
     if (threadIdx.x == 0u) nscale[(uint64_t)row * (n / group) + g] = scale;
 
     const uint32_t lane = threadIdx.x & 31u;
@@ -5732,6 +5937,10 @@ static int qwen4exp_hc_mixer_fused_cuda(
         ds4_gpu_tensor       *lowrank_scratch,
         ds4_gpu_tensor       *wide_scratch,
         const ds4_gpu_tensor *hyper,
+        /* A pending hc_inject to apply to `hyper` IN PLACE before the norm, or
+         * NULL for none.  See ds4_gpu_qwen4exp_hc_inject_mixer_tensor. */
+        const ds4_gpu_tensor *block,
+        const ds4_gpu_tensor *inject_in,
         const ds4_gpu_qwen4exp_slab *norm_weight,
         const ds4_gpu_qwen4exp_slab *down_weight,
         const ds4_gpu_qwen4exp_slab *up_weight,
@@ -5766,6 +5975,12 @@ static int qwen4exp_hc_mixer_fused_cuda(
         lowrank_scratch->bytes < (uint64_t)rows * n_lowrank * sizeof(float)) {
         return -1;
     }
+    if ((block != NULL) != (inject_in != NULL)) return -1;
+    if (block &&
+        (block->bytes < (uint64_t)rows * n_embd * sizeof(float) ||
+         inject_in->bytes < (uint64_t)rows * n_hc * sizeof(float))) {
+        return -1;
+    }
 
     const int tier = ds4_tensor_device_idx(mixed);
     if (tier < 0 || tier >= g_n_gpus ||
@@ -5773,7 +5988,9 @@ static int qwen4exp_hc_mixer_fused_cuda(
         ds4_tensor_device_idx(normed_scratch) != tier ||
         ds4_tensor_device_idx(wide_scratch) != tier ||
         ds4_tensor_device_idx(lowrank_scratch) != tier ||
-        (inject && ds4_tensor_device_idx(inject) != tier)) {
+        (inject && ds4_tensor_device_idx(inject) != tier) ||
+        (block && (ds4_tensor_device_idx(block) != tier ||
+                   ds4_tensor_device_idx(inject_in) != tier))) {
         return -1;
     }
 
@@ -5807,10 +6024,18 @@ static int qwen4exp_hc_mixer_fused_cuda(
     float *xscale = (float *)((char *)normed_scratch->ptr + s_off);
     float *nscale = (float *)((char *)normed_scratch->ptr + n_off);
 
-    qwen4exp_hc_norm_quant_kernel<<<dim3(n_hc, rows, 1u), threads, 0,
-                                    cuda_decode_stream()>>>(
-            xq, xscale, nscale, (const float *)hyper->ptr, normw,
-            (uint32_t)wide, n_embd, rows, eps, weight_bias, round_bf16);
+    if (block) {
+        qwen4exp_hc_norm_quant_kernel<true><<<dim3(n_hc, rows, 1u), threads, 0,
+                                              cuda_decode_stream()>>>(
+                xq, xscale, nscale, (float *)hyper->ptr, normw,
+                (const float *)block->ptr, (const float *)inject_in->ptr,
+                (uint32_t)wide, n_embd, rows, eps, weight_bias, round_bf16);
+    } else {
+        qwen4exp_hc_norm_quant_kernel<false><<<dim3(n_hc, rows, 1u), threads, 0,
+                                               cuda_decode_stream()>>>(
+                xq, xscale, nscale, (float *)hyper->ptr, normw, NULL, NULL,
+                (uint32_t)wide, n_embd, rows, eps, weight_bias, round_bf16);
+    }
     if (!cuda_ok(cudaGetLastError(), "qwen4exp_hc_norm_quant launch")) return 0;
 
     if (!ds4_gpu_matmul_q8_0_preq_rows_exact_tensor(

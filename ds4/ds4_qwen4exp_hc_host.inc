@@ -153,11 +153,98 @@ int ds4_gpu_qwen4exp_hc_mixer_tensor(
     DS4_QWEN4EXP_HC_MIXER_GUARD
 #ifdef DS4_QWEN4EXP_HC_HAVE_FUSED
     if (!ds4_qwen4exp_hc_fuse_off()) {
-        const int fused =
-            qwen4exp_hc_mixer_fused_cuda(DS4_QWEN4EXP_HC_MIXER_ARGS);
+        const int fused = qwen4exp_hc_mixer_fused_cuda(
+                mixed, inject, normed_scratch, lowrank_scratch, wide_scratch,
+                hyper, NULL, NULL, norm_weight, down_weight, up_weight,
+                inject_weight, n_embd, n_hc, n_lowrank, rows, eps,
+                weight_bias, round_bf16);
         if (fused >= 0) return fused;
     }
 #endif
+    return qwen4exp_hc_mixer_chain(DS4_QWEN4EXP_HC_MIXER_ARGS);
+}
+
+/* hc_inject, then the mixer, as one call.
+ *
+ * DEFINITION: exactly
+ *
+ *     ds4_gpu_qwen4exp_hc_inject_tensor(hyper, hyper, block, inject_in, ...)
+ *     ds4_gpu_qwen4exp_hc_mixer_tensor(..., hyper, ...)
+ *
+ * which is what the unfused entry below does, statement for statement.  The
+ * two ops are adjacent wherever the graph emits them -- an attention inject
+ * is followed by nothing but the FFN mixer that reads the stream it wrote --
+ * so a backend may fold the inject into the mixer's first pass over `hyper`
+ * and skip one write-then-read of the whole stream.  `hyper` is REWRITTEN
+ * either way: it is the residual from here on, and every later kernel of the
+ * mixer reads the injected values from it. */
+#define DS4_QWEN4EXP_HC_INJECT_MIXER_GUARD                                    \
+    DS4_QWEN4EXP_HC_MIXER_GUARD                                               \
+    if (!block || !inject_in) return 0;
+
+int ds4_gpu_qwen4exp_hc_inject_mixer_unfused_tensor(
+        ds4_gpu_tensor       *mixed,
+        ds4_gpu_tensor       *inject,
+        ds4_gpu_tensor       *normed_scratch,
+        ds4_gpu_tensor       *lowrank_scratch,
+        ds4_gpu_tensor       *wide_scratch,
+        ds4_gpu_tensor       *hyper,
+        const ds4_gpu_tensor *block,
+        const ds4_gpu_tensor *inject_in,
+        const ds4_gpu_qwen4exp_slab *norm_weight,
+        const ds4_gpu_qwen4exp_slab *down_weight,
+        const ds4_gpu_qwen4exp_slab *up_weight,
+        const ds4_gpu_qwen4exp_slab *inject_weight,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              n_lowrank,
+        uint32_t              rows,
+        float                 eps,
+        float                 weight_bias,
+        int                   round_bf16) {
+    DS4_QWEN4EXP_HC_INJECT_MIXER_GUARD
+    if (!ds4_gpu_qwen4exp_hc_inject_tensor(hyper, hyper, block, inject_in,
+                                           n_embd, n_hc, rows)) {
+        return 0;
+    }
+    return qwen4exp_hc_mixer_chain(DS4_QWEN4EXP_HC_MIXER_ARGS);
+}
+
+int ds4_gpu_qwen4exp_hc_inject_mixer_tensor(
+        ds4_gpu_tensor       *mixed,
+        ds4_gpu_tensor       *inject,
+        ds4_gpu_tensor       *normed_scratch,
+        ds4_gpu_tensor       *lowrank_scratch,
+        ds4_gpu_tensor       *wide_scratch,
+        ds4_gpu_tensor       *hyper,
+        const ds4_gpu_tensor *block,
+        const ds4_gpu_tensor *inject_in,
+        const ds4_gpu_qwen4exp_slab *norm_weight,
+        const ds4_gpu_qwen4exp_slab *down_weight,
+        const ds4_gpu_qwen4exp_slab *up_weight,
+        const ds4_gpu_qwen4exp_slab *inject_weight,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              n_lowrank,
+        uint32_t              rows,
+        float                 eps,
+        float                 weight_bias,
+        int                   round_bf16) {
+    DS4_QWEN4EXP_HC_INJECT_MIXER_GUARD
+#ifdef DS4_QWEN4EXP_HC_HAVE_FUSED
+    if (!ds4_qwen4exp_hc_fuse_off()) {
+        const int fused = qwen4exp_hc_mixer_fused_cuda(
+                mixed, inject, normed_scratch, lowrank_scratch, wide_scratch,
+                hyper, block, inject_in, norm_weight, down_weight, up_weight,
+                inject_weight, n_embd, n_hc, n_lowrank, rows, eps,
+                weight_bias, round_bf16);
+        if (fused >= 0) return fused;
+    }
+#endif
+    if (!ds4_gpu_qwen4exp_hc_inject_tensor(hyper, hyper, block, inject_in,
+                                           n_embd, n_hc, rows)) {
+        return 0;
+    }
     return qwen4exp_hc_mixer_chain(DS4_QWEN4EXP_HC_MIXER_ARGS);
 }
 

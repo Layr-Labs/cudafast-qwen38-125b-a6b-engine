@@ -1803,6 +1803,14 @@ static void qwen4exp_trace_report(uint32_t n_tokens) {
 #endif
 
 
+/* `pending_inject` non-NULL means "apply hc_inject(hyper, block_out, this)
+ * first": the attention inject that precedes the FFN mixer, folded into the
+ * mixer's own pass over the stream on a backend that can.  The values are the
+ * inject's and then the mixer's exactly; only the write-then-read of the whole
+ * stream between them is skipped.  The final mixer and the attention mixer
+ * pass NULL: nothing is pending at either, and the FFN inject's consumer is
+ * the NEXT layer, across the PLE block and the decode-graph island boundary,
+ * which is why it stays an explicit op. */
 static bool qwen4exp_graph_residual(ds4_qwen4exp_session *s,
                                     const ds4_model *m,
                                     const ds4_tensor *norm,
@@ -1810,7 +1818,8 @@ static bool qwen4exp_graph_residual(ds4_qwen4exp_session *s,
                                     const ds4_tensor *up,
                                     const ds4_tensor *inject,
                                     float norm_weight_offset,
-                                    uint32_t n_tokens) {
+                                    uint32_t n_tokens,
+                                    const ds4_gpu_tensor *pending_inject) {
 #ifdef DS4_TEST_HOOKS
     /* The tower's final mixer is the only call with no inject head.  Copy what
      * it is about to read, inside this batch so the ordering is the GPU's and
@@ -1831,6 +1840,14 @@ static bool qwen4exp_graph_residual(ds4_qwen4exp_session *s,
     const ds4_gpu_qwen4exp_slab inject_slab =
         inject ? QW_SLAB(m, inject) : (ds4_gpu_qwen4exp_slab){0};
 
+    if (pending_inject) {
+        return ds4_gpu_qwen4exp_hc_inject_mixer_tensor(
+            s->mixed, inject ? s->inject : NULL, s->normed, s->lowrank,
+            s->wide, s->hyper, s->block_out, pending_inject,
+            &norm_slab, &down_slab, &up_slab, inject ? &inject_slab : NULL,
+            DS4_N_EMBD, DS4_N_HC, DS4_N_HC_LOWRANK, n_tokens,
+            DS4_HC_EPS, norm_weight_offset, 1) != 0;
+    }
     return ds4_gpu_qwen4exp_hc_mixer_tensor(
         s->mixed, inject ? s->inject : NULL, s->normed, s->lowrank, s->wide,
         s->hyper, &norm_slab, &down_slab, &up_slab,
@@ -1851,7 +1868,7 @@ static bool qwen4exp_graph_layer_island_encode(
         /* --- attention side ------------------------------------------- */
         if (!qwen4exp_graph_residual(s, m, l->hc_attn_norm, l->hc_attn_down,
                                      l->hc_attn_up, l->hc_attn_inject,
-                                     l->hc_attn_norm_offset, n_tokens)) {
+                                     l->hc_attn_norm_offset, n_tokens, NULL)) {
             fprintf(stderr, "ds4: qwen4exp attention mixer failed at block %u\n", il);
             return false;
         }
@@ -1861,19 +1878,18 @@ static bool qwen4exp_graph_layer_island_encode(
             QW_TRACE(QW_SLICE_GDN);
         }
     } else {
-        if (!ds4_gpu_qwen4exp_hc_inject_tensor(s->hyper, s->hyper, s->block_out,
-                                               s->inject, DS4_N_EMBD, DS4_N_HC,
-                                               n_tokens)) {
-            fprintf(stderr, "ds4: qwen4exp attention inject failed at block %u\n", il);
-            return false;
-        }
+        /* --- attention inject, folded into the feed-forward mixer -------
+         * The inject writes the stream and the FFN mixer's norm is its next
+         * reader, with nothing between them; one call lets the backend do
+         * both in the mixer's first pass.  The ATTN_INJECT slice is still
+         * marked so the trace keeps its shape; under the timing profiler it
+         * reads as zero and its time lands in FFN_MIX. */
         QW_TRACE(QW_SLICE_ATTN_INJECT);
-
-        /* --- feed-forward side ---------------------------------------- */
         if (!qwen4exp_graph_residual(s, m, l->hc_ffn_norm, l->hc_ffn_down,
                                      l->hc_ffn_up, l->hc_ffn_inject,
-                                     l->hc_ffn_norm_offset, n_tokens)) {
-            fprintf(stderr, "ds4: qwen4exp FFN mixer failed at block %u\n", il);
+                                     l->hc_ffn_norm_offset, n_tokens,
+                                     s->inject)) {
+            fprintf(stderr, "ds4: qwen4exp attention inject + FFN mixer failed at block %u\n", il);
             return false;
         }
         QW_TRACE(QW_SLICE_FFN_MIX);
@@ -2289,7 +2305,7 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
      * n_embd and stands in for the model.norm this checkpoint does not have. */
     if (!qwen4exp_graph_residual(s, m, w->output_hc_norm, w->output_hc_down,
                                  w->output_hc_up, NULL,
-                                 w->output_hc_norm_offset, n_tokens)) {
+                                 w->output_hc_norm_offset, n_tokens, NULL)) {
         fprintf(stderr, "ds4: qwen4exp final mixer failed\n");
         return qwen4exp_forward_fail();
     }
@@ -2584,22 +2600,19 @@ static bool qwen4exp_graph_head_block_encode(
     const char *stage = "attention mixer";
     bool ok = qwen4exp_graph_residual(s, m, l->hc_attn_norm, l->hc_attn_down,
                                       l->hc_attn_up, l->hc_attn_inject,
-                                      l->hc_attn_norm_offset, n_tokens);
+                                      l->hc_attn_norm_offset, n_tokens, NULL);
     QW_HB_TICK(QW_HB_T_ATTN_MIX);
     if (ok) { stage = "QSA"; ok = qwen4exp_graph_qsa_block(s, l, m, il, n_tokens); }
     QW_HB_TICK(QW_HB_T_QSA);
-    if (ok) {
-        stage = "attention inject";
-        ok = ds4_gpu_qwen4exp_hc_inject_tensor(s->hyper, s->hyper, s->block_out,
-                                               s->inject, DS4_N_EMBD, DS4_N_HC,
-                                               n_tokens) != 0;
-    }
+    /* Attention inject folded into the FFN mixer, as in the target layers;
+     * the ATTN_INJECT tick is kept so the head profile keeps its columns. */
     QW_HB_TICK(QW_HB_T_ATTN_INJECT);
     if (ok) {
-        stage = "FFN mixer";
+        stage = "attention inject + FFN mixer";
         ok = qwen4exp_graph_residual(s, m, l->hc_ffn_norm, l->hc_ffn_down,
                                      l->hc_ffn_up, l->hc_ffn_inject,
-                                     l->hc_ffn_norm_offset, n_tokens);
+                                     l->hc_ffn_norm_offset, n_tokens,
+                                     s->inject);
     }
     QW_HB_TICK(QW_HB_T_FFN_MIX);
     if (ok) {
@@ -2863,7 +2876,7 @@ bool ds4_qwen4exp_graph_head_logits(ds4_qwen4exp_session       *s,
     }
     if (!qwen4exp_graph_residual(s, m, w->output_hc_norm, w->output_hc_down,
                                  w->output_hc_up, NULL,
-                                 w->output_hc_norm_offset, 1u)) {
+                                 w->output_hc_norm_offset, 1u, NULL)) {
         fprintf(stderr, "ds4: qwen4exp final mixer failed on the head row\n");
         return qwen4exp_forward_fail();
     }

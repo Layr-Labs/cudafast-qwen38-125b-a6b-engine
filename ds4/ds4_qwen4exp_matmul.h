@@ -115,6 +115,19 @@ static inline int ds4_qwen4exp_matmul_f32(ds4_gpu_tensor       *out,
  *
  * This is the third rule of the same kind, and the last op in the tower that
  * chose a strategy by row count.
+ *
+ * The loop is the PORTABLE spelling of the rule, not the only one.  Where a
+ * backend can issue the same groups in one dispatch it should, because the
+ * cost of the loop is entirely dispatch: the per-row kernel reduces each
+ * (row, column) pair inside one warp and never reads the row count, so the
+ * groups are a partition of the launch grid and nothing else.  CUDA does this
+ * in ds4_gpu_glm53_matmul_bf16_rows_exact -- same kernel, same operands, same
+ * reduction tree, grid.y raised from eight to rows -- which is bit-identical
+ * to the loop by construction rather than by comparison.  A backend without
+ * one returns -1 and gets the loop below, unchanged.
+ *
+ * At or below eight rows nothing moves at all: that call was already a single
+ * dispatch, and it is the one inside decode's CUDA graph capture.
  */
 #define DS4_QWEN4EXP_BF16_DECODE_ROWS 8u
 
@@ -130,6 +143,9 @@ static inline int ds4_qwen4exp_matmul_bf16(ds4_gpu_tensor       *out,
         return ds4_gpu_glm53_matmul_bf16(out, map, map_size, offset,
                                          in_dim, out_dim, x, rows);
     }
+    const int one_dispatch = ds4_gpu_glm53_matmul_bf16_rows_exact(
+            out, map, map_size, offset, in_dim, out_dim, x, rows);
+    if (one_dispatch >= 0) return one_dispatch;
     for (uint32_t at = 0; at < rows; at += DS4_QWEN4EXP_BF16_DECODE_ROWS) {
         const uint32_t left = rows - at;
         const uint32_t take = left < DS4_QWEN4EXP_BF16_DECODE_ROWS

@@ -3419,6 +3419,20 @@ int ds4_gpu_glm53_matmul_bf16(
         const ds4_gpu_tensor *x,
         uint32_t              n_rows);
 
+/* The same matmul with the eight-row decode reduction order held at EVERY
+ * width, in one dispatch.  Returns 1 on success, 0 on failure, and -1 when
+ * the backend has no single-dispatch form -- callers that need the order
+ * (ds4_qwen4exp_matmul.h) fall back to their eight-row chunk loop on -1. */
+int ds4_gpu_glm53_matmul_bf16_rows_exact(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows);
+
 int ds4_gpu_glm53_matmul_bf16_qkv(
         ds4_gpu_tensor       *out_q,
         ds4_gpu_tensor       *out_k,
@@ -3819,6 +3833,54 @@ int ds4_gpu_qwen4exp_hc_mixer_unfused_tensor(
         ds4_gpu_tensor       *lowrank_scratch,
         ds4_gpu_tensor       *wide_scratch,
         const ds4_gpu_tensor *hyper,
+        const ds4_gpu_qwen4exp_slab *norm_weight,
+        const ds4_gpu_qwen4exp_slab *down_weight,
+        const ds4_gpu_qwen4exp_slab *up_weight,
+        const ds4_gpu_qwen4exp_slab *inject_weight,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              n_lowrank,
+        uint32_t              rows,
+        float                 eps,
+        float                 weight_bias,
+        int                   round_bf16);
+
+/* hc_inject followed by the mixer, as one call: exactly
+ *     ds4_gpu_qwen4exp_hc_inject_tensor(hyper, hyper, block, inject_in, ...)
+ *     ds4_gpu_qwen4exp_hc_mixer_tensor(..., hyper, ...)
+ * `hyper` is rewritten in place with the injected stream either way.  The
+ * graph uses it where an attention inject is immediately followed by the FFN
+ * mixer, so a backend can fold the inject into the mixer's first pass over the
+ * stream.  The _unfused_ twin is the definition, kept for the test. */
+int ds4_gpu_qwen4exp_hc_inject_mixer_tensor(
+        ds4_gpu_tensor       *mixed,
+        ds4_gpu_tensor       *inject,
+        ds4_gpu_tensor       *normed_scratch,
+        ds4_gpu_tensor       *lowrank_scratch,
+        ds4_gpu_tensor       *wide_scratch,
+        ds4_gpu_tensor       *hyper,
+        const ds4_gpu_tensor *block,
+        const ds4_gpu_tensor *inject_in,
+        const ds4_gpu_qwen4exp_slab *norm_weight,
+        const ds4_gpu_qwen4exp_slab *down_weight,
+        const ds4_gpu_qwen4exp_slab *up_weight,
+        const ds4_gpu_qwen4exp_slab *inject_weight,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              n_lowrank,
+        uint32_t              rows,
+        float                 eps,
+        float                 weight_bias,
+        int                   round_bf16);
+int ds4_gpu_qwen4exp_hc_inject_mixer_unfused_tensor(
+        ds4_gpu_tensor       *mixed,
+        ds4_gpu_tensor       *inject,
+        ds4_gpu_tensor       *normed_scratch,
+        ds4_gpu_tensor       *lowrank_scratch,
+        ds4_gpu_tensor       *wide_scratch,
+        ds4_gpu_tensor       *hyper,
+        const ds4_gpu_tensor *block,
+        const ds4_gpu_tensor *inject_in,
         const ds4_gpu_qwen4exp_slab *norm_weight,
         const ds4_gpu_qwen4exp_slab *down_weight,
         const ds4_gpu_qwen4exp_slab *up_weight,

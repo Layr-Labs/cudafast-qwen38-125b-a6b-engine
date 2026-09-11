@@ -270,6 +270,16 @@ int ds4_gpu_matmul_f16_router_rows_exact_tensor(
             out, model_map, model_size, weight_offset,
             4096u, 256u, x, n_rows);
 }
+/* Metal has no single-encoder form of the eight-row BF16 decode order; decline
+ * and let ds4_qwen4exp_matmul_bf16 keep its chunk loop, byte for byte. */
+int ds4_gpu_glm53_matmul_bf16_rows_exact(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *x, uint32_t n_rows) {
+    (void)out; (void)model_map; (void)model_size; (void)weight_offset;
+    (void)in_dim; (void)out_dim; (void)x; (void)n_rows;
+    return -1;
+}
 int ds4_gpu_q8_cache_suppressed(void) { return 0; }
 void ds4_gpu_set_q8_cache_suppressed(int suppressed) { (void)suppressed; }
 int ds4_gpu_set_decode_fast_attention(int enabled) { (void)enabled; return 0; }

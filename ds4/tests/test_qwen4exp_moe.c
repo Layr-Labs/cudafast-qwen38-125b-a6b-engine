@@ -1704,6 +1704,164 @@ static void run_group_scan_boundary_cases(void) {
     munmap(image, image_bytes);
 }
 
+/* ------------------------------------------------------------------ */
+/* THE LANE-PAIR PAYLOAD SPLIT, AND Q5_K ON THE TILE AT ALL.
+ *
+ * A q4_K or q5_K group and its nibble-pair neighbour are two halves of one
+ * 32-byte payload slice, and the tile's decode lanes for them are lane tid and
+ * lane tid^1 of one warp.  Both used to read all 32 bytes; each now reads its
+ * own 16 and the pair swaps halves across __shfl_xor_sync.  That is a claim
+ * about WHICH LANE ISSUES A LOAD and nothing else, so the two arms must write
+ * the IDENTICAL float32 image -- not a small relative error.  A swap that took
+ * the wrong partner, or delivered the partner's words in the wrong register
+ * order, changes only decoded weights, and nothing downstream would notice
+ * before the logits.
+ *
+ * DS4_QWEN4EXP_NO_PAIR_SPLIT pins the whole-slice load the split replaces, the
+ * way DS4_QWEN4EXP_NO_SPLIT_GATEUP pins the joint projection, so the two arms
+ * can be compared at the real shape.  All three public tensors are compared:
+ * mid is the gate/up product the tile writes directly and is where a wrong
+ * half shows first, and part and out carry it through the down projection.
+ *
+ * THE SHAPE MATTERS.  At in 2560 a gate/up row is EIGHTY groups, so the chunk
+ * loop runs twenty times and the staging, the swap and the register prefetch
+ * of the next chunk interleave; at the in 256 of run_row_invariance_case a row
+ * is eight groups and the loop runs twice.  THE WIDTH MATTERS TOO: the tile
+ * takes width eight and above and run_production_expert_cases runs at two
+ * tokens, so before this case Q5_K had never reached the tile anywhere in this
+ * suite, and a Q5_K group decoded wrongly by the tile passed everything.
+ *
+ * The two arms are not required to equal the per-row dp4a kernels: those keep
+ * every width below eight, the tile is prefill-only, and a prefill is free to
+ * use different numerics as long as it is deterministic.  Measured, the tile
+ * and the per-row kernels agree at in 256 and differ by about 1e-4 at in 2560,
+ * which is the longer accumulation chain and not this change.  So this case
+ * asserts what the change actually claims. */
+enum { PROD_SPLIT_TOKENS = 21 };
+
+static void run_prod_pair_split_case(const uint8_t *image, uint64_t image_bytes,
+                                     uint64_t gate_offset, uint64_t up_offset,
+                                     uint64_t down_offset, uint32_t gate_type,
+                                     uint32_t down_type) {
+    const uint64_t gate_row = type_row_bytes(gate_type, PROD_IN_DIM);
+    const uint64_t down_row = type_row_bytes(down_type, PROD_MID_DIM);
+    const ds4_gpu_qwen4exp_slab gate_slab = {
+        image, image_bytes, gate_offset,
+        (uint64_t)PROD_MID_DIM * gate_row, gate_row, gate_type };
+    const ds4_gpu_qwen4exp_slab up_slab = {
+        image, image_bytes, up_offset,
+        (uint64_t)PROD_MID_DIM * gate_row, gate_row, gate_type };
+    const ds4_gpu_qwen4exp_slab down_slab = {
+        image, image_bytes, down_offset,
+        (uint64_t)PROD_OUT_DIM * down_row, down_row, down_type };
+
+    const size_t xn = (size_t)PROD_SPLIT_TOKENS * PROD_IN_DIM;
+    const size_t sn = (size_t)PROD_SPLIT_TOKENS * PROD_USED;
+    float *x = calloc(xn, sizeof(float));
+    float *logits = calloc((size_t)PROD_SPLIT_TOKENS * PROD_EXPERTS, sizeof(float));
+    if (!x || !logits) fail("pair split allocation");
+    for (size_t i = 0; i < xn; i++) x[i] = rng_unit() * 0.02f;
+    for (size_t i = 0; i < (size_t)PROD_SPLIT_TOKENS * PROD_EXPERTS; i++)
+        logits[i] = rng_unit() * 3.0f;
+
+    ds4_gpu_tensor *logits_t = ds4_gpu_tensor_alloc(
+        (uint64_t)PROD_SPLIT_TOKENS * PROD_EXPERTS * sizeof(float));
+    ds4_gpu_tensor *sel_t = ds4_gpu_tensor_alloc((uint64_t)sn * sizeof(int32_t));
+    ds4_gpu_tensor *w_t = ds4_gpu_tensor_alloc((uint64_t)sn * sizeof(float));
+    ds4_gpu_tensor *x_t = ds4_gpu_tensor_alloc((uint64_t)xn * sizeof(float));
+    ds4_gpu_tensor *mid_t = ds4_gpu_tensor_alloc(
+        (uint64_t)sn * PROD_MID_DIM * sizeof(float));
+    ds4_gpu_tensor *out_t = ds4_gpu_tensor_alloc(
+        (uint64_t)PROD_SPLIT_TOKENS * PROD_OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *part_t = ds4_gpu_tensor_alloc(
+        (uint64_t)sn * PROD_OUT_DIM * sizeof(float));
+    require_ok(logits_t && sel_t && w_t && x_t && mid_t && out_t && part_t,
+               "pair split tensor allocation");
+    require_ok(ds4_gpu_tensor_write(logits_t, 0, logits,
+                   (uint64_t)PROD_SPLIT_TOKENS * PROD_EXPERTS * sizeof(float)),
+               "pair split logit write");
+    require_ok(ds4_gpu_tensor_write(x_t, 0, x, (uint64_t)xn * sizeof(float)),
+               "pair split activation write");
+    require_ok(ds4_gpu_qwen4exp_router_select_tensor(
+                   sel_t, w_t, logits_t, PROD_EXPERTS, PROD_USED,
+                   PROD_SPLIT_TOKENS),
+               "pair split router select");
+
+    ds4_gpu_tensor *tensors[3] = { mid_t, part_t, out_t };
+    const char *names[3] = { "mid", "down partials", "out" };
+    const size_t sizes[3] = {
+        (size_t)sn * PROD_MID_DIM * sizeof(float),
+        (size_t)sn * PROD_OUT_DIM * sizeof(float),
+        (size_t)PROD_SPLIT_TOKENS * PROD_OUT_DIM * sizeof(float) };
+    void *split[3], *whole[3];
+    for (unsigned j = 0; j < 3; j++) {
+        split[j] = malloc(sizes[j]); whole[j] = malloc(sizes[j]);
+        require_ok(split[j] && whole[j], "pair split buffers");
+    }
+
+    /* The shipping arm. */
+    require_ok(ds4_gpu_qwen4exp_routed_moe_tensor(
+                   out_t, mid_t, part_t, &gate_slab, &up_slab, &down_slab,
+                   PROD_IN_DIM, PROD_MID_DIM, PROD_OUT_DIM, sel_t, w_t,
+                   PROD_EXPERTS, PROD_USED, x_t, PROD_SPLIT_TOKENS,
+                   PROD_USED * PROD_MID_DIM),
+               "pair split routed MoE");
+    for (unsigned j = 0; j < 3; j++)
+        require_ok(ds4_gpu_tensor_read(tensors[j], 0, split[j], sizes[j]),
+                   "pair split read");
+
+    /* The whole-slice load it is argued equal to. */
+    {
+        const char *pin = getenv("DS4_QWEN4EXP_NO_PAIR_SPLIT");
+        char *saved = pin ? strdup(pin) : NULL;
+        require_ok(!pin || saved, "pair split pin save");
+        require_ok(setenv("DS4_QWEN4EXP_NO_PAIR_SPLIT", "1", 1) == 0,
+                   "pair split pin");
+        require_ok(ds4_gpu_qwen4exp_routed_moe_tensor(
+                       out_t, mid_t, part_t, &gate_slab, &up_slab, &down_slab,
+                       PROD_IN_DIM, PROD_MID_DIM, PROD_OUT_DIM, sel_t, w_t,
+                       PROD_EXPERTS, PROD_USED, x_t, PROD_SPLIT_TOKENS,
+                       PROD_USED * PROD_MID_DIM),
+                   "whole-slice oracle routed MoE");
+        for (unsigned j = 0; j < 3; j++)
+            require_ok(ds4_gpu_tensor_read(tensors[j], 0, whole[j], sizes[j]),
+                       "whole-slice oracle read");
+        if (saved) { setenv("DS4_QWEN4EXP_NO_PAIR_SPLIT", saved, 1); free(saved); }
+        else unsetenv("DS4_QWEN4EXP_NO_PAIR_SPLIT");
+    }
+
+    for (unsigned j = 0; j < 3; j++) {
+        const size_t n = sizes[j] / sizeof(float);
+        const float *a = (const float *)split[j], *b = (const float *)whole[j];
+        size_t differ = 0, nonzero = 0;
+        double worst = 0.0;
+        for (size_t i = 0; i < n; i++) {
+            if (a[i] != 0.0f) nonzero++;
+            if (memcmp(&a[i], &b[i], sizeof(float)) != 0) {
+                differ++;
+                const double d = fabs((double)a[i] - (double)b[i]);
+                if (d > worst) worst = d;
+            }
+        }
+        printf("routed MoE lane-pair split, %s gate/up + %s down at in %d "
+               "mid %d out %d, %d rows on the tile: %zu of %zu %s outputs "
+               "differ from the whole-slice load (%zu nonzero, worst %.3e)\n",
+               type_name(gate_type), type_name(down_type), (int)PROD_IN_DIM,
+               (int)PROD_MID_DIM, (int)PROD_OUT_DIM, (int)PROD_SPLIT_TOKENS,
+               differ, n, names[j], nonzero, worst);
+        /* A tile that wrote nothing would agree with itself. */
+        if (nonzero == 0) fail("the lane-pair split case computed only zeros");
+        if (differ != 0) fail("the lane-pair payload split changed a number");
+    }
+
+    for (unsigned j = 0; j < 3; j++) { free(split[j]); free(whole[j]); }
+    ds4_gpu_tensor_free(part_t); ds4_gpu_tensor_free(out_t);
+    ds4_gpu_tensor_free(mid_t); ds4_gpu_tensor_free(x_t);
+    ds4_gpu_tensor_free(w_t); ds4_gpu_tensor_free(sel_t);
+    ds4_gpu_tensor_free(logits_t);
+    free(logits); free(x);
+}
+
 static void run_production_expert_cases(void) {
     const uint32_t n_gate_up = (uint32_t)(sizeof(PROD_GATE_UP_TYPES) /
                                           sizeof(PROD_GATE_UP_TYPES[0]));
@@ -2065,6 +2223,23 @@ static void run_production_expert_cases(void) {
         }
         ds4_gpu_tensor_free(sx_t);
         free(sx);
+    }
+
+    /* The lane-pair payload split, on the tile, at the production shape, for
+     * the two types whose nibble pair shares a payload slice.  Q5_K reaches
+     * the tile here and nowhere else in this suite. */
+    {
+        static const uint32_t split_pairs[][2] = {
+            { TYPE_Q5_K, TYPE_Q8_0 },
+            { TYPE_Q4_K, TYPE_Q5_1 },
+        };
+        for (uint32_t ti = 0; ti < 2u; ti++) {
+            const uint32_t gt = split_pairs[ti][0], dt = split_pairs[ti][1];
+            const uint32_t gi = prod_type_slot(PROD_GATE_UP_TYPES, n_gate_up, gt);
+            const uint32_t dj = prod_type_slot(PROD_DOWN_TYPES, n_down, dt);
+            run_prod_pair_split_case(image, image_bytes, gate_off[gi],
+                                     up_off[gi], down_off[dj], gt, dt);
+        }
     }
 
     free(single_shard_q51);

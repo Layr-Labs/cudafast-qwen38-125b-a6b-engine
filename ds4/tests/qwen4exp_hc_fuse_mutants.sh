@@ -4,7 +4,8 @@
 #
 # tests/test_qwen4exp_hc_norm requires ds4_gpu_qwen4exp_hc_mixer_tensor to
 # agree with ds4_gpu_qwen4exp_hc_mixer_unfused_tensor BIT FOR BIT over 84
-# shape/head/flag combinations.  That assertion is worth exactly as much as its
+# shape/head/flag combinations, and the inject-folded entry with its own
+# unfused twin over 84 more.  That assertion is worth exactly as much as its
 # ability to fail, so this script breaks the fused kernels one line at a time
 # and requires the test to notice.
 #
@@ -183,7 +184,33 @@ mutant fused_mix_no_fma caught \
 mutant fused_inject_row caught \
     's|                            iw + (uint64_t)ho \* weight_row_bytes, i);|                            iw, i);|'
 
+# ---- the inject folded into the norm ---------------------------------------
+
+# Two roundings where the inject kernel has one FFMA.
+mutant inj_two_roundings caught \
+    's|        const float v = __fmaf_rn(br\[i\], s_inj, hg\[i\]);|        const float v = __fadd_rn(hg[i], __fmul_rn(br[i], s_inj));|'
+
+# Every stream scaled by stream 0'"'"'s inject weight.
+mutant inj_stream_zero caught \
+    's|                inj\[(uint64_t)row \* (n / group) + g\], group, eps, partial);|                inj[(uint64_t)row * (n / group)], group, eps, partial);|'
+
+# Normalize the injected value but leave the residual un-injected: the mixer
+# outputs are right and every later reader of the stream is wrong.
+mutant inj_not_stored caught \
+    's|        hg\[i\] = v;|        (void)v;|'
+
+# Store the right stream but fold the block'"'"'s energy into the statistic:
+# every later reader is right and the norm is wrong.
+mutant inj_stat_perturbed caught \
+    's|        hg\[i\] = v;|        hg[i] = v; sum += br[i] * br[i];|'
+
 # ---- deliberate no-ops -----------------------------------------------------
+
+# The product inside an FFMA is exact before it is rounded, so its operand
+# order cannot matter.
+mutant inj_fma_operands_swapped survives \
+    's|        const float v = __fmaf_rn(br\[i\], s_inj, hg\[i\]);|        const float v = __fmaf_rn(s_inj, br[i], hg[i]);|'
+
 
 # fmaxf is exact and associative over the finite non-negative values the
 # butterfly sees, so reversing it is the same number.
