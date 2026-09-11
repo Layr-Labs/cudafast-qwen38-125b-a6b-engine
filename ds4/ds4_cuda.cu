@@ -5755,6 +5755,127 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
     }
 }
 
+/* The verify width, BOTH rows per loaded weight word, on the one-row kernel's
+ * own layout.
+ *
+ * matmul_q8_0_preq_pair_lanes_kernel above puts every group in TWO lanes'
+ * hands: each lane owns half the payload, extracts its own four words, runs
+ * half the dp4a chain per row, and the halves are married back with a
+ * shuffle before the even lane's float step.  That keeps the one-row
+ * arithmetic while making every group's weight bytes a per-lane HALF-fetch
+ * -- two lanes' word extractions and a shuffle where one lane's eight words
+ * would do -- and at the two-row verify width a warp's issue slots went to
+ * ~31 loads and a shuffle per 34-byte group to reach sixteen dp4a, with
+ * each lane's loads consumed by the very dp4a chain that followed them.
+ * The dense projections measured about half the byte floor there, against
+ * the ~70% the one-row warp8 kernel reaches on the same weights.
+ *
+ * This kernel is the warp8 layout carried over two rows.  A warp still owns
+ * one output row and lane L still walks groups L, L+32, L+64 ... in that
+ * order; what changes is only that a group's weight is READ once and SPENT
+ * twice.  Per group the lane stages, into registers and before anything
+ * consumes them: the eight weight words (q8_0_group_words -- the same
+ * bounded funnel-shift reader the row tile proved), the scale, and BOTH
+ * rows' Q8_1 words for the group -- a prequant pair is 32 bytes at a
+ * 16-byte-aligned address (pair = row * blocks + group, 32 bytes each, the
+ * scratch itself 16-byte aligned), so a row's eight words are two aligned
+ * int4 loads.  Then two dp4a per weight word, into two per-row int32
+ * accumulators: sixteen load instructions in flight ahead of the group's
+ * sixteen dp4a, and no shuffle anywhere in the walk.
+ *
+ * EXACTNESS.  Row r's arithmetic is the one-row kernel's, value for value:
+ * the same lane-to-group walk, the same int32 group dot -- each row's dp4a
+ * chain is the same eight operands in the same order against the same
+ * activation words, and an integer dot does not depend on how its bytes
+ * reached a register -- the same float step `ws * xs[r] * (float)dot`
+ * accumulated into acc[r] in the same ascending group order, and the same
+ * warp_sum_f32 butterfly per row.  The two rows share NOTHING arithmetic:
+ * separate accumulators, separate butterflies, separate stores.  So row r of
+ * the pair is bit for bit what the one-row kernel computes for row r alone,
+ * which is the row-count invariance the speculative cycle's accept loop
+ * stands on, and what tests/test_qwen4exp_hc_norm.c holds against the
+ * one-row call.  A short tail group or a device without dp4a keeps
+ * dot_i8_block per row, exactly as the one-row kernel takes it.
+ *
+ * Launched at n_rows == 2 only -- the MTP verify width.  Width 1 keeps its
+ * kernel, widths 3..7 keep the row tile, and DS4_QWEN4EXP_TILE_UNPAIRED
+ * gives the previous ladder back (pair lanes above the wide-block line, the
+ * R = 2 row tile below it). */
+__global__ static void matmul_q8_0_preq_tile_unpaired_kernel(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks,
+        int use_dp4a) {
+    const uint64_t row = (uint64_t)blockIdx.x * (blockDim.x >> 5u) + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+    const unsigned char *wr = w + row * blocks * 34u;
+    float acc[2] = { 0.0f, 0.0f };
+
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const uint64_t i0 = b * 32u;
+        const uint64_t bn = in_dim - i0 < 32u ? in_dim - i0 : 32u;
+        const __half *scale_h = (const __half *)(wr + b * 34u);
+        const int8_t *qs = (const int8_t *)(wr + b * 34u + 2u);
+        const bool words = (use_dp4a != 0) && (bn == 32u);
+        int32_t wq[8];
+        int32_t xw[2][8];
+        float xs[2];
+        if (words) q8_0_group_words(wq, qs);
+        const float ws = __half2float(*scale_h);
+#pragma unroll
+        for (int r = 0; r < 2; r++) {
+            const uint64_t at = (uint64_t)r * blocks + b;
+            xs[r] = xscale[at];
+            if (words) {
+                const int4 lo = *(const int4 *)(xq + at * 32u);
+                const int4 hi = *(const int4 *)(xq + at * 32u + 16u);
+                xw[r][0] = lo.x; xw[r][1] = lo.y; xw[r][2] = lo.z; xw[r][3] = lo.w;
+                xw[r][4] = hi.x; xw[r][5] = hi.y; xw[r][6] = hi.z; xw[r][7] = hi.w;
+            }
+        }
+        if (words) {
+            /* Two dp4a per weight word: the word feeds row 0's chain and
+             * row 1's chain, each the same eight-operand order
+             * dot_i8x32_dp4a runs for that row alone. */
+            int32_t dot0 = 0;
+            int32_t dot1 = 0;
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                dot0 = __dp4a(wq[j], xw[0][j], dot0);
+                dot1 = __dp4a(wq[j], xw[1][j], dot1);
+            }
+            /* THE FLOAT STEP, SPELLED AS THE ONE-ROW KERNELS COMPILE IT.
+             * `acc += ws * xs * (float)dot` reaches SASS in the one-row and
+             * pair-lane kernels as one rounded FMUL (ws * xs) and one FFMA
+             * (that product times dot, plus acc).  Left to the source form,
+             * nvcc emitted FMUL, FMUL, FADD here instead -- no contraction --
+             * and 58% of the outputs landed one ulp away from the one-row
+             * call (tests/test_qwen4exp_hc_norm.c, 2026-09-11).  The
+             * intrinsics pin the two roundings the oracle makes. */
+            acc[0] = fmaf(__fmul_rn(ws, xs[0]), (float)dot0, acc[0]);
+            acc[1] = fmaf(__fmul_rn(ws, xs[1]), (float)dot1, acc[1]);
+        } else {
+#pragma unroll
+            for (int r = 0; r < 2; r++) {
+                const uint64_t at = (uint64_t)r * blocks + b;
+                const int dot = dot_i8_block(qs, xq + at * 32u, bn, use_dp4a);
+                acc[r] = fmaf(__fmul_rn(ws, xs[r]), (float)dot, acc[r]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < 2; r++) {
+        const float tot = warp_sum_f32(acc[r]);
+        if (lane == 0u) out[(uint64_t)r * out_dim + row] = tot;
+    }
+}
+
 /* The same per-output-element arithmetic as the tile kernel above, on the int8
  * tensor cores, with the whole prefill width in ONE tile.
  *
@@ -16557,9 +16678,45 @@ static int cuda_matmul_q8_0_preq_rows_exact(
 #undef DS4_Q8_DENSE_MMA_LAUNCH
 
     const int use_dp4a = cuda_q8_use_dp4a();
-    /* Two lanes read each full group at one/two-row decode widths. Integer
-     * partials combine exactly, then the original 32 float chains and warp
-     * tree are restored. Wider calls and partial groups keep their kernels. */
+    /* A warp owns an independent output row in every kernel below.  Narrow
+     * projections (notably the HC 10240->320 down projection) had only forty
+     * eight-warp blocks, leaving SMs idle even though each row has a long K
+     * walk.  Spread those same warps across one-warp blocks so all SMs can
+     * schedule live rows.  Each lane retains its groups, accumulator and
+     * reduction; no split-K or extra synchronization is involved.  Wide and
+     * prefill calls keep their old block geometry.  The override permits a
+     * same-binary geometry check. */
+    const unsigned warps = n_rows < 8u && out_dim <= 512u &&
+        getenv("DS4_QWEN4EXP_Q8_WIDE_BLOCKS") == NULL ? 1u : 8u;
+    const unsigned wthreads = warps * 32u;
+    const unsigned wgrid = ((unsigned)out_dim + warps - 1u) / warps;
+
+    /* The MTP verify width takes the unpaired two-row kernel: both rows per
+     * loaded weight word, no paired lanes.  The kernel's activation staging
+     * reads each row's group as two int4 vectors, so the prequant rows must
+     * be 16-byte aligned; both producers are (the decode scratch is a device
+     * allocation, the pre-quantized entry enforces the offset), and anything
+     * else falls through to the ladder below, which wants no alignment.
+     * DS4_QWEN4EXP_TILE_UNPAIRED gives the previous ladder back, and
+     * DS4_QWEN4EXP_NO_ROW_TILE still forces the per-row warp kernel for a
+     * same-binary before/after. */
+    if (n_rows == 2u && getenv("DS4_QWEN4EXP_TILE_UNPAIRED") == NULL &&
+        getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
+        (((uintptr_t)xq & 15u) == 0u)) {
+        dim3 grid(wgrid, 1u, 1u);
+        matmul_q8_0_preq_tile_unpaired_kernel
+            <<<grid, wthreads, 0, cuda_decode_stream()>>>(
+                (float *)out->ptr,
+                reinterpret_cast<const unsigned char *>(wptr),
+                xq, xscale, in_dim, out_dim, blocks, use_dp4a);
+        return cuda_ok(cudaGetLastError(),
+                       "q8_0 tile unpaired launch");
+    }
+    /* Two lanes read each full group: the one-row width above the wide-block
+     * line, and the two-row width when DS4_QWEN4EXP_TILE_UNPAIRED asks for
+     * the previous ladder. Integer partials combine exactly, then the
+     * original 32 float chains and warp tree are restored. Wider calls and
+     * partial groups keep their kernels. */
     if (use_dp4a && n_rows <= 2u && out_dim > 512u && (in_dim & 31u) == 0u &&
         getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
         (((uintptr_t)wptr & 1u) == 0u)) {
@@ -16570,17 +16727,6 @@ static int cuda_matmul_q8_0_preq_rows_exact(
                 out_dim, n_rows, blocks);
         return cuda_ok(cudaGetLastError(), "q8 pair lanes launch");
     }
-    /* A warp owns an independent output row.  Narrow projections (notably
-     * the HC 10240->320 down projection) had only forty eight-warp blocks,
-     * leaving SMs idle even though each row has a long K walk.  Spread those
-     * same warps across one-warp blocks so all SMs can schedule live rows.
-     * Each lane retains its groups, accumulator and reduction; no split-K or
-     * extra synchronization is involved.  Wide/prefill calls keep their old
-     * block geometry.  The override permits a same-binary geometry check. */
-    const unsigned warps = n_rows < 8u && out_dim <= 512u &&
-        getenv("DS4_QWEN4EXP_Q8_WIDE_BLOCKS") == NULL ? 1u : 8u;
-    const unsigned wthreads = warps * 32u;
-    const unsigned wgrid = ((unsigned)out_dim + warps - 1u) / warps;
 
     /* Without the MMA -- an older card, or DS4_QWEN4EXP_NO_ROW_TILE, which is
      * how the before/after prefill measurement runs on one binary -- the older
