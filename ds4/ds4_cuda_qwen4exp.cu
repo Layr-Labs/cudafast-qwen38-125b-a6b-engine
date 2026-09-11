@@ -5286,11 +5286,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
             down_slab->type, mgroups, out_dim, n_tokens)
 #define QWEN4EXP_SH_DOWN(R) do { \
     if (specialize_shared && down_slab->type == DS4_QWEN4EXP_TY_q8_0) { \
-        if (vector_shared && (((uintptr_t)mq & 15u) == 0u)) { \
-            QWEN4EXP_SH_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q8_0, true); \
-        } else { \
-            QWEN4EXP_SH_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q8_0, false); \
-        } \
+        QWEN4EXP_SH_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q8_0, false); \
     } else { \
         QWEN4EXP_SH_DOWN_IMPL(R, -1, false); \
     } \
