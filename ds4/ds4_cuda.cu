@@ -28830,6 +28830,91 @@ extern "C" int ds4_gpu_glm53_matmul_bf16(
     return cublas_ok(status, "GLM-5.3 BF16 matmul");
 }
 
+/* The indexer's BF16 projections at prefill width, in ONE launch.
+ *
+ * ds4_qwen4exp_matmul_bf16 has to hold the eight-row decode reduction order at
+ * every width because the indexer key tape, and the pooled blocks built from
+ * it, are carried state.  It held it by cutting the call into groups of eight
+ * and issuing a dispatch per group.  Correct -- but at n_tokens = 1024 that is
+ * 128 launches of a 128-block kernel, each re-reading the whole weight, and
+ * the wall time is launch latency almost end to end.
+ *
+ * glm53_matvec_bf16_f32_kernel gives every (row, column) pair its own warp and
+ * reduces inside it: `sum = fmaf(w, x, sum)` walked over i = lane, lane + 32,
+ * ... in thread order, then warp_sum_f32's butterfly.  Nothing in that chain
+ * reads n_rows.  The row index only selects blockIdx.y, and blockIdx.y only
+ * shifts the two base pointers.  So a chunk starting at row `at` computes
+ * output element (at + r, col) with precisely the instruction sequence a
+ * single launch computes element (at + r, col) with -- the chunking is a
+ * partition of grid.y and nothing else.  Raising grid.y from eight to n_rows
+ * is therefore bit-identical to the chunk loop BY CONSTRUCTION: same kernel,
+ * same operands, same order, same reduction tree.  It just reads the weight
+ * once instead of ceil(rows / 8) times.
+ *
+ * This is deliberately NOT a retiling.  A tile would be faster still and would
+ * not be the decode order, which is the whole point of the rule.
+ *
+ * Returns -1 only when it declines before touching anything, so the caller can
+ * fall back to the chunk loop without losing the success/failure distinction.
+ */
+extern "C" int ds4_gpu_glm53_matmul_bf16_rows_exact(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows) {
+    static int rows_exact_off = -1;
+    if (rows_exact_off < 0) {
+        rows_exact_off =
+            getenv("DS4_QWEN4EXP_NO_BF16_ROWS_EXACT") != NULL ? 1 : 0;
+    }
+    if (rows_exact_off) return -1;
+    if (!out || !x || !model_map || in_dim == 0u || out_dim == 0u ||
+        n_rows == 0u ||
+        (uint64_t)out_dim > UINT64_MAX / in_dim ||
+        weight_offset > model_size) {
+        return -1;
+    }
+    const uint64_t weight_elements = (uint64_t)out_dim * in_dim;
+    const uint64_t weight_bytes = weight_elements * sizeof(uint16_t);
+    const uint64_t input_elements = (uint64_t)n_rows * in_dim;
+    const uint64_t output_elements = (uint64_t)n_rows * out_dim;
+    if (weight_bytes > model_size - weight_offset ||
+        x->bytes < input_elements * sizeof(float) ||
+        out->bytes < output_elements * sizeof(float)) {
+        return -1;
+    }
+    const int logical_tier = ds4_tensor_device_idx(out);
+    const char *weights = cuda_resolve_weight_ptr(
+            model_map, weight_offset, weight_bytes, logical_tier,
+            "GLM-5.3 BF16 matrix");
+    if (!weights) return -1;
+    /* gridDim.y caps at 65535.  Step in whole eight-row groups so that a
+     * split, if a call ever needs one, lands on the same boundaries the chunk
+     * loop used -- the rows are independent, so this is cosmetic, but it keeps
+     * the correspondence with the rule exact. */
+    const uint32_t rows_per_launch = 65528u;
+    for (uint32_t at = 0; at < n_rows; at += rows_per_launch) {
+        const uint32_t left = n_rows - at;
+        const uint32_t take = left < rows_per_launch ? left : rows_per_launch;
+        const dim3 grid((out_dim + 7u) / 8u, take, 1u);
+        glm53_matvec_bf16_f32_kernel<<<grid, 256u, 0,
+            cuda_decode_stream()>>>(
+                (float *)out->ptr + (uint64_t)at * out_dim,
+                (const uint16_t *)weights,
+                (const float *)x->ptr + (uint64_t)at * in_dim,
+                in_dim, out_dim);
+        if (!cuda_ok(cudaGetLastError(),
+                     "GLM-5.3 BF16/F32 matvec rows-exact launch")) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 enum {
     GLM53_CUDA_KDA_DIM = 128,
     GLM53_CUDA_KDA_HISTORY = 3,

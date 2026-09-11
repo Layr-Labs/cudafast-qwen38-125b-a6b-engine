@@ -260,6 +260,16 @@ extern "C" int ds4_gpu_matmul_f16_router_rows_exact_tensor(
                                      4096u, 256u, x, n_rows);
 }
 
+/* ROCm keeps the eight-row chunk loop (see ds4_qwen4exp_matmul.h). */
+extern "C" int ds4_gpu_glm53_matmul_bf16_rows_exact(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *x, uint32_t n_rows) {
+    (void)out; (void)model_map; (void)model_size; (void)weight_offset;
+    (void)in_dim; (void)out_dim; (void)x; (void)n_rows;
+    return -1;
+}
+
 extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor(
         ds4_gpu_tensor *q_out, const ds4_gpu_tensor *q,
         const void *model_map, uint64_t model_size,

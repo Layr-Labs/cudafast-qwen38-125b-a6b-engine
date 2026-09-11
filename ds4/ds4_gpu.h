@@ -3419,6 +3419,20 @@ int ds4_gpu_glm53_matmul_bf16(
         const ds4_gpu_tensor *x,
         uint32_t              n_rows);
 
+/* The same matmul with the eight-row decode reduction order held at EVERY
+ * width, in one dispatch.  Returns 1 on success, 0 on failure, and -1 when
+ * the backend has no single-dispatch form -- callers that need the order
+ * (ds4_qwen4exp_matmul.h) fall back to their eight-row chunk loop on -1. */
+int ds4_gpu_glm53_matmul_bf16_rows_exact(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows);
+
 int ds4_gpu_glm53_matmul_bf16_qkv(
         ds4_gpu_tensor       *out_q,
         ds4_gpu_tensor       *out_k,
