@@ -183,7 +183,50 @@ mutant fused_mix_no_fma caught \
 mutant fused_inject_row caught \
     's|                            iw + (uint64_t)ho \* weight_row_bytes, i);|                            iw, i);|'
 
+# ---- the up+mix tile and the norm+inject pass ------------------------------
+
+# The tile's K loop: split its FFMA into a rounded product and an add.
+mutant wide_kloop_no_fma caught \
+    's|acc\[mi\]\[ni\]\[0\] = qwen4exp_fma_ftz(qwen4exp_fmul_ftz(w0, xs\[mi\]\[0\]), (float)d\[0\], acc\[mi\]\[ni\]\[0\]);|acc[mi][ni][0] = __fadd_rn(acc[mi][ni][0], __fmul_rn(qwen4exp_fmul_ftz(w0, xs[mi][0]), (float)d[0]));|'
+
+# Scale the dot first and the weight after: the same three factors, one
+# rounding point moved.
+mutant wide_kloop_scale_order caught \
+    's|acc\[mi\]\[ni\]\[1\] = qwen4exp_fma_ftz(qwen4exp_fmul_ftz(w1, xs\[mi\]\[0\]), (float)d\[1\], acc\[mi\]\[ni\]\[1\]);|acc[mi][ni][1] = qwen4exp_fma_ftz(w1, qwen4exp_fmul_ftz(xs[mi][0], (float)d[1]), acc[mi][ni][1]);|'
+
+# The mix in the epilogue, streams high to low.
+mutant wide_mix_stream_order caught \
+    's|            for (int h = 0; h < NT; h++) {|            for (int h = NT - 1; h >= 0; h--) {|'
+
+# Two roundings where the mix has one FFMA.
+mutant wide_mix_no_fma caught \
+    's|                mix = __fmaf_rn(qwen4exp_sigmoid(acc\[mi\]\[h\]\[e\]), normed, mix);|                mix = __fadd_rn(mix, __fmul_rn(qwen4exp_sigmoid(acc[mi][h][e]), normed));|'
+
+# The sigmoid must see the whole projection: apply it to the accumulator one
+# stage early by dropping the last stage'"'"'s contribution from it.
+mutant wide_mix_partial_sigmoid caught \
+    's|                mix = __fmaf_rn(qwen4exp_sigmoid(acc\[mi\]\[h\]\[e\]), normed, mix);|                mix = __fmaf_rn(qwen4exp_sigmoid(acc[mi][h][e] * 0.999f), normed, mix);|'
+
+# The inject dot in the norm pass, streams high to low: every quantized byte
+# is still right, only the dot'"'"'s order moves.
+mutant wide_inject_stream_order caught \
+    's|    for (uint32_t g = 0; g < n_hc; g++) {|    for (uint32_t g = n_hc; g-- > 0;) {|'
+
+# The inject accumulate as a rounded product and an add: the FFMA's addend
+# becomes zero and the accumulator is added after.
+mutant wide_inject_no_fma caught \
+    's|                            iacc\[ho\]);|                            0.0f) + iacc[ho];|'
+
 # ---- deliberate no-ops -----------------------------------------------------
+
+# The tile shape does not enter the tile'"'"'s arithmetic: run the wide shape
+# at every width, then the narrow one at every width.
+mutant wide_tile_always_big survives \
+    's|            if (rows <= 64u) {|            if (rows <= 0u) {|'
+
+mutant wide_tile_always_small survives \
+    's|            if (rows <= 64u) {|            if (rows <= 0xffffffffu) {|'
+
 
 # fmaxf is exact and associative over the finite non-negative values the
 # butterfly sees, so reversing it is the same number.

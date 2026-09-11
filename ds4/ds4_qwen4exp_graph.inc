@@ -14,6 +14,23 @@
  * Sizing.
  * ====================================================================== */
 
+/* The QSA split attention path (ds4_cuda_qwen4exp.cu) serves the captured
+ * decode and verify widths, so its scratch is sized for those rows and for
+ * the largest key count a call inside the indexer budget can carry: the
+ * budget itself on the dense side, the selection cap on the sparse side. */
+static uint64_t qwen4exp_qsa_split_rows(uint64_t n_batch) {
+    return n_batch < (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT
+        ? n_batch : (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT;
+}
+
+static uint64_t qwen4exp_qsa_split_max_count(void) {
+    const uint64_t top_k = (uint64_t)DS4_N_INDEXER_TOP_K / DS4_N_INDEXER_COMPRESS_RATIO;
+    const uint64_t max_selected =
+        DS4_QWEN4EXP_MAX_SELECTED(top_k, (uint64_t)DS4_N_INDEXER_COMPRESS_RATIO);
+    return max_selected > (uint64_t)DS4_N_INDEXER_TOP_K
+        ? max_selected : (uint64_t)DS4_N_INDEXER_TOP_K;
+}
+
 void ds4_qwen4exp_session_plan_compute(ds4_qwen4exp_session_plan *plan,
                                        uint32_t n_ctx,
                                        uint32_t n_batch) {
@@ -114,6 +131,10 @@ void ds4_qwen4exp_session_plan_compute(ds4_qwen4exp_session_plan *plan,
      * every compared row's distribution out of one forward, so the LM head
      * runs once over the whole chain instead of once per row afterwards. */
     act += (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * cfg->n_vocab * f;
+    plan->activation_bytes = act;
+    act += ds4_gpu_qwen4exp_qsa_split_scratch_bytes(
+        (uint32_t)qwen4exp_qsa_split_rows(B), DS4_N_HEAD, DS4_N_HEAD_DIM,
+        (uint32_t)qwen4exp_qsa_split_max_count());
     plan->activation_bytes = act;
 
     plan->spec_snapshot_bytes =
@@ -351,6 +372,7 @@ struct ds4_qwen4exp_session {
     ds4_gpu_tensor *qsa_kin;
     ds4_gpu_tensor *qsa_vin;
     ds4_gpu_tensor *qsa_out;
+    ds4_gpu_tensor *qsa_split;  /* split attention scratch, decode widths */
     ds4_gpu_tensor *idx_q;
     ds4_gpu_tensor *idx_k;
     ds4_gpu_tensor *idx_scores;
@@ -727,6 +749,12 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
     s->qsa_q       = qwen4exp_alloc_zeroed(B * q_width * f, &ok);
     s->qsa_gate    = qwen4exp_alloc_zeroed(B * q_width * f, &ok);
     s->qsa_out     = qwen4exp_alloc_zeroed(B * q_width * f, &ok);
+    {
+        const uint64_t split_bytes = ds4_gpu_qwen4exp_qsa_split_scratch_bytes(
+            (uint32_t)qwen4exp_qsa_split_rows(B), DS4_N_HEAD, DS4_N_HEAD_DIM,
+            (uint32_t)qwen4exp_qsa_split_max_count());
+        s->qsa_split = split_bytes ? qwen4exp_alloc_zeroed(split_bytes, &ok) : NULL;
+    }
     s->qsa_kin     = qwen4exp_alloc_zeroed(B * cfg->qsa_kv_dim * f, &ok);
     s->qsa_vin     = qwen4exp_alloc_zeroed(B * cfg->qsa_kv_dim * f, &ok);
     s->idx_q       = qwen4exp_alloc_zeroed(B * cfg->indexer_q_dim * f, &ok);
@@ -807,6 +835,7 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->qsa_q);
     ds4_gpu_tensor_free(s->qsa_gate);
     ds4_gpu_tensor_free(s->qsa_out);
+    ds4_gpu_tensor_free(s->qsa_split);
     ds4_gpu_tensor_free(s->qsa_kin);
     ds4_gpu_tensor_free(s->qsa_vin);
     ds4_gpu_tensor_free(s->idx_q);
@@ -1579,7 +1608,11 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
     if (!ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
             s->qsa_out, s->qsa_q, s->qsa_k[il], s->qsa_v[il], sel, counts,
             n_tokens, DS4_N_HEAD, DS4_N_HEAD_KV, head_dim, pos0,
-            s->plan.n_ctx, max_selected, scale, s->d_pos) ||
+            s->plan.n_ctx, max_selected, scale, s->d_pos, s->qsa_split,
+            /* Below the budget every row's count is pos + 1 <= the budget,
+             * captured replays included (the island captures only there);
+             * above it the selection caps the count. */
+            indexed ? max_selected : (uint32_t)DS4_N_INDEXER_TOP_K) ||
         !ds4_gpu_qwen4exp_qsa_output_gate_tensor(s->qsa_out, s->qsa_gate,
                                                  n_tokens * q_width)) {
         fprintf(stderr, "ds4: qwen4exp QSA attention failed at block %u\n", il);

@@ -859,6 +859,164 @@ static void run_pipeline(const inputs *in, bool verify, float *attn_out) {
     ds4_gpu_tensor_free(t_inv_freq);
 }
 
+/* ------------------------------------------------ split attention path */
+
+/* The decode-width split path against the per-head kernel, byte for byte.
+ *
+ * The split path (ds4_cuda_qwen4exp.cu, qwen4exp_qsa_split_*) computes the
+ * per-head kernel's recurrence over a (head group, tile) grid and folds the
+ * tiles at the end.  Its note argues that every expf sees the same argument
+ * and every fused multiply-add nests the same way; this is the check that
+ * the argument holds on the device.  The same random cache serves every
+ * width 1..7 at positions on both sides of every tile edge, up to the
+ * indexer budget, in the dense form and in a sparse form with a masked tail
+ * and holes; half the calls take the position through `d_pos`, the form the
+ * captured decode graph uses. */
+static void check_split_path(void) {
+    const uint32_t kv_width = N_KV_HEAD * HEAD_DIM;
+    const uint32_t q_width = N_HEAD * HEAD_DIM;
+    const uint32_t cap = TOKEN_BUDGET + 64u;
+    const uint32_t max_count = MAX_SELECTED > TOKEN_BUDGET ? MAX_SELECTED : TOKEN_BUDGET;
+    const float scale = 1.0f / sqrtf((float)HEAD_DIM);
+    const size_t rows = (size_t)7 * q_width;
+
+    float *host = xcalloc((size_t)cap * kv_width, sizeof(float));
+    rng_seed(0x5157u);
+    ds4_gpu_tensor *t_k = tensor_new((size_t)cap * kv_width, sizeof(float));
+    rng_fill(host, (size_t)cap * kv_width);
+    tensor_put(t_k, host, (size_t)cap * kv_width * sizeof(float));
+    ds4_gpu_tensor *t_v = tensor_new((size_t)cap * kv_width, sizeof(float));
+    rng_fill(host, (size_t)cap * kv_width);
+    tensor_put(t_v, host, (size_t)cap * kv_width * sizeof(float));
+    free(host);
+    float *hq = xcalloc(rows, sizeof(float));
+    rng_fill(hq, rows);
+    ds4_gpu_tensor *t_q = tensor_new(rows, sizeof(float));
+    tensor_put(t_q, hq, rows * sizeof(float));
+    free(hq);
+    ds4_gpu_tensor *t_a = tensor_new(rows, sizeof(float));
+    ds4_gpu_tensor *t_b = tensor_new(rows, sizeof(float));
+    ds4_gpu_tensor *t_dpos = tensor_new(1, sizeof(uint32_t));
+    const uint64_t scratch_bytes = ds4_gpu_qwen4exp_qsa_split_scratch_bytes(
+        7u, N_HEAD, HEAD_DIM, max_count);
+    require(scratch_bytes > 0u, "split scratch size");
+    ds4_gpu_tensor *t_scratch = ds4_gpu_tensor_alloc(scratch_bytes);
+    require(t_scratch != NULL, "split scratch alloc");
+    int32_t *hsel = xcalloc((size_t)7 * MAX_SELECTED, sizeof(int32_t));
+    int32_t hcnt[7];
+    ds4_gpu_tensor *t_sel = tensor_new((size_t)7 * MAX_SELECTED, sizeof(int32_t));
+    ds4_gpu_tensor *t_cnt = tensor_new(7, sizeof(int32_t));
+    float *got_a = xcalloc(rows, sizeof(float));
+    float *got_b = xcalloc(rows, sizeof(float));
+
+    static const uint32_t positions[] = {
+        0u, 1u, 200u, 254u, 255u, 256u, 257u, 511u, 512u, 513u, 1000u, 1145u,
+        1152u, 1535u, 1600u, 2000u, 2040u, 2041u
+    };
+    size_t checked = 0;
+    size_t calls = 0;
+    for (uint32_t form = 0; form < 2u; form++) {
+        const bool sparse = form == 1u;
+        for (uint32_t w = 1; w <= 7u; w++) {
+            for (size_t pi = 0; pi < sizeof(positions) / sizeof(positions[0]); pi++) {
+                const uint32_t pos0 = positions[pi];
+                if ((uint64_t)pos0 + w > TOKEN_BUDGET) continue;
+                const bool via_dpos = ((pi + w) & 1u) != 0u;
+                if (via_dpos) tensor_put(t_dpos, &pos0, sizeof(pos0));
+                if (sparse) {
+                    /* Per row: a count near pos + 1 with a few keys dropped
+                     * (never the first, so every row has a key to score),
+                     * one out-of-cache key and a -1 hole, ascending as the
+                     * selection kernel emits them, then a -1 tail. */
+                    for (uint32_t t = 0; t < w; t++) {
+                        int32_t *sel = hsel + (size_t)t * MAX_SELECTED;
+                        uint32_t n = 0;
+                        for (uint32_t k = 0; k <= pos0 + t && n < (uint32_t)MAX_SELECTED; k++) {
+                            if (k > 0u && (rng_next() & 15u) == 0u) continue;
+                            sel[n++] = (int32_t)k;
+                        }
+                        if (n > 3u) sel[n / 2u] = -1;
+                        if (n > 5u) sel[n / 3u] = (int32_t)cap + 7;
+                        for (uint32_t k = n; k < (uint32_t)MAX_SELECTED; k++) sel[k] = -1;
+                        hcnt[t] = (int32_t)n;
+                    }
+                    tensor_put(t_sel, hsel, (size_t)w * MAX_SELECTED * sizeof(int32_t));
+                    tensor_put(t_cnt, hcnt, (size_t)w * sizeof(int32_t));
+                }
+                require(ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
+                            t_a, t_q, t_k, t_v, sparse ? t_sel : NULL,
+                            sparse ? t_cnt : NULL, w, N_HEAD, N_KV_HEAD,
+                            HEAD_DIM, pos0, cap, MAX_SELECTED, scale,
+                            via_dpos ? t_dpos : NULL, NULL, 0u),
+                        "per-head attention");
+                /* The split path is what is under test, so the call must
+                 * not have quietly fallen through to the per-head kernel:
+                 * the scratch's first tile row of scores is zeroed before
+                 * and must be written after. */
+                memset(got_b, 0, HEAD_DIM * sizeof(float));
+                require(ds4_gpu_tensor_write(t_scratch, 0, got_b, HEAD_DIM * sizeof(float)),
+                        "scratch clear");
+                require(ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
+                            t_b, t_q, t_k, t_v, sparse ? t_sel : NULL,
+                            sparse ? t_cnt : NULL, w, N_HEAD, N_KV_HEAD,
+                            HEAD_DIM, pos0, cap, MAX_SELECTED, scale,
+                            via_dpos ? t_dpos : NULL, t_scratch, max_count),
+                        "split attention");
+                const size_t n = (size_t)w * q_width;
+                tensor_get(t_scratch, got_b, HEAD_DIM * sizeof(float));
+                {
+                    float touched = 0.0f;
+                    for (uint32_t d = 0; d < HEAD_DIM; d++) touched += fabsf(got_b[d]);
+                    require(touched > 0.0f, "split path did not run (scratch untouched)");
+                }
+                tensor_get(t_a, got_a, n * sizeof(float));
+                tensor_get(t_b, got_b, n * sizeof(float));
+                if (memcmp(got_a, got_b, n * sizeof(float)) != 0) {
+                    size_t at = 0;
+                    size_t differing = 0;
+                    for (size_t i = 0; i < n; i++) {
+                        if (got_a[i] != got_b[i]) {
+                            if (differing == 0) at = i;
+                            differing++;
+                        }
+                    }
+                    fprintf(stderr,
+                            "test_qwen4exp_qsa: split attention is not bit-exact "
+                            "(%s, width %u, pos %u%s): %zu of %zu values differ, "
+                            "first at %zu (head %zu, channel %zu): %.9g vs %.9g\n",
+                            sparse ? "sparse" : "dense", w, pos0,
+                            via_dpos ? ", d_pos" : "", differing, n, at,
+                            (at / HEAD_DIM) % N_HEAD, at % HEAD_DIM,
+                            (double)got_a[at], (double)got_b[at]);
+                    exit(1);
+                }
+                /* A zero row would agree trivially; the cache is random, so
+                 * it means a kernel did not run. */
+                float any = 0.0f;
+                for (size_t i = 0; i < n; i++) any += fabsf(got_b[i]);
+                require(any > 0.0f, "split attention produced an all-zero row");
+                checked += n;
+                calls++;
+            }
+        }
+    }
+    printf("  %-38s %zu values bit-exact against the per-head kernel over %zu calls\n",
+           "split attention (widths 1..7)", checked, calls);
+
+    free(got_a);
+    free(got_b);
+    free(hsel);
+    ds4_gpu_tensor_free(t_k);
+    ds4_gpu_tensor_free(t_v);
+    ds4_gpu_tensor_free(t_q);
+    ds4_gpu_tensor_free(t_a);
+    ds4_gpu_tensor_free(t_b);
+    ds4_gpu_tensor_free(t_dpos);
+    ds4_gpu_tensor_free(t_scratch);
+    ds4_gpu_tensor_free(t_sel);
+    ds4_gpu_tensor_free(t_cnt);
+}
+
 int main(void) {
     if (!ds4_gpu_init()) {
         printf("test_qwen4exp_qsa: no GPU backend, skipping\n");
@@ -930,6 +1088,8 @@ int main(void) {
     }
     printf("  %-38s %zu values bit-exact against the per-head kernel\n",
            "head-group attention", attn_len);
+
+    check_split_path();
 
     free(ungrouped);
     free(first);

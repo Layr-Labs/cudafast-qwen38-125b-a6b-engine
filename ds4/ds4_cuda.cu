@@ -16596,6 +16596,16 @@ static int cuda_q8_mma_available(void) {
     return cached;
 }
 
+/* Whether cuda_matmul_q8_0_preq_rows_exact below would take the int8 MMA
+ * tile for a wide (out_dim > 512) call of n_rows: the same four conditions,
+ * so a caller that reproduces the tile's arithmetic in its own epilogue
+ * (the fused hyper-connection up-mix in ds4_cuda_qwen4exp.cu) is on the MMA
+ * path exactly when the unfused chain would be. */
+int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows) {
+    return g_q8_dense_mma_enabled && cuda_q8_mma_available() &&
+           n_rows >= 8u && getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL;
+}
+
 #define DS4_Q8_DENSE_MMA_LAUNCH(WM, WN, MT, NT, G)                                   \
     do {                                                                       \
         const unsigned bm = (unsigned)((WM) * (MT) * 16);                      \

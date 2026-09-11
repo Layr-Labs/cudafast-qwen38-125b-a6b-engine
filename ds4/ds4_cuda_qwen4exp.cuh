@@ -26,4 +26,7 @@ const char *ds4_cuda_qwen4exp_weight_ptr(
         int         logical_tier,
         const char *label);
 
+/* 1 when the Q8_0 row-exact matmul takes the int8 MMA tile at this width. */
+int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows);
+
 #endif /* DS4_CUDA_QWEN4EXP_CUH */

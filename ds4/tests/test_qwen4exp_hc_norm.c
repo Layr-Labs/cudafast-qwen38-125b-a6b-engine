@@ -227,7 +227,17 @@ static void require_bf16_rounding_band(const char *what, const float *actual,
 static void require_identical(const char *what, const void *a, const void *b,
                               uint64_t bytes) {
     if (memcmp(a, b, (size_t)bytes) != 0) {
-        fprintf(stderr, "%s: byte streams differ\n", what);
+        /* Where and by how much, for a float stream: an ulp on one element
+         * points at a rounding point, a whole stream at an index. */
+        const float *fa = (const float *)a, *fb = (const float *)b;
+        uint64_t nd = 0, first = 0;
+        for (uint64_t i = 0; i < bytes / 4; i++) {
+            if (fa[i] != fb[i] && nd++ == 0) first = i;
+        }
+        fprintf(stderr, "%s: byte streams differ (%llu of %llu floats, first "
+                "[%llu] %.9g vs %.9g)\n", what, (unsigned long long)nd,
+                (unsigned long long)(bytes / 4), (unsigned long long)first,
+                fa[first], fb[first]);
         exit(1);
     }
 }
@@ -437,7 +447,9 @@ static void check_q8_row_tile(const uint8_t *model) {
  *   weight_bias 0, the baked-offset checkpoint, and 1, the zero-centered one;
  *   round_bf16  on, which is production, and off.
  */
-static void check_mixer_equivalence(uint8_t *model) {
+void ds4_gpu_enable_q8_dense_mma(void);
+
+static void check_mixer_equivalence(uint8_t *model, const char *up_path) {
     static const uint32_t row_set[] = { 1u, 2u, 3u, 4u, 7u, 47u, 48u, 64u, ROWS_LONG };
     const ds4_gpu_qwen4exp_slab norm_slab =
         hc_slab(model, MODEL_BYTES, NORM_WIDE_OFF);
@@ -612,9 +624,9 @@ static void check_mixer_equivalence(uint8_t *model) {
         ds4_gpu_tensor_free(hyper_t);
         free(hyper);
     }
-    printf("  %-56s exact over %llu cases\n",
+    printf("  %-56s exact over %llu cases (%s)\n",
            "fused HC mixer equals the op-by-op chain",
-           (unsigned long long)cases);
+           (unsigned long long)cases, up_path);
 #if !defined(__APPLE__) && !defined(__HIP_PLATFORM_AMD__)
     printf("  HC changed-input graph replay: %llu complete comparisons passed\n",
            (unsigned long long)graph_cases);
@@ -1055,7 +1067,16 @@ int main(void) {
                rows == 1u ? "" : "s");
     }
 
-    check_mixer_equivalence(model);
+    check_mixer_equivalence(model, "eight-row tile");
+
+    /* The qwen4exp tower switches the dense Q8_0 projections onto the int8
+     * MMA tile (ds4_qwen4exp.inc, qwen4exp_finish_derived), and the fused
+     * mixer's up+mix epilogue reproduces THAT tile's arithmetic, so the same
+     * 84 cases run again with the switch thrown: the unfused chain now takes
+     * the MMA at eight rows and up, and the fused path takes the epilogue.
+     * The switch is one-way, which is why this pass is last. */
+    ds4_gpu_enable_q8_dense_mma();
+    check_mixer_equivalence(model, "MMA tile");
 
     munmap(model, MODEL_BYTES);
     printf("test_qwen4exp_hc_norm: ok\n");

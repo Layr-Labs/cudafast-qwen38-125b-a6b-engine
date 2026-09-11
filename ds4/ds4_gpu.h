@@ -670,7 +670,16 @@ int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
         uint32_t              cache_cap,
         uint32_t              max_selected,
         float                 scale,
-        const ds4_gpu_tensor *d_pos);
+        const ds4_gpu_tensor *d_pos,
+        const ds4_gpu_tensor *scratch,
+        uint32_t              max_count);
+
+/* Bytes of `scratch` the attention call above wants to take its split path
+ * for `n_tokens` rows of at most `max_count` keys each; 0 for a shape the
+ * split path does not serve.  Passing NULL scratch keeps the per-head kernel. */
+uint64_t ds4_gpu_qwen4exp_qsa_split_scratch_bytes(
+        uint32_t n_tokens, uint32_t n_head, uint32_t head_dim,
+        uint32_t max_count);
 
 int ds4_gpu_qwen4exp_qsa_prep_q_fused_tensor(
         ds4_gpu_tensor       *q,
