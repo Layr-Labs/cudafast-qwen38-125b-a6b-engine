@@ -6434,6 +6434,7 @@ __global__ static void qwen4exp_qsa_indexer_select_kernel(
     if (tid == 0u) counts[token] = (int32_t)total;
 }
 
+template<bool GatedQ8>
 __global__ static void qwen4exp_qsa_attention_kernel(
         const float *q,
         const float *k_cache,
@@ -6441,6 +6442,7 @@ __global__ static void qwen4exp_qsa_attention_kernel(
         const int32_t *selected,
         const int32_t *counts,
         float *out,
+        const float *gate, int8_t *xq, float *xscale,
         uint32_t n_tokens,
         uint32_t n_head,
         uint32_t n_kv_head,
@@ -6473,8 +6475,8 @@ __global__ static void qwen4exp_qsa_attention_kernel(
     for (uint32_t d = tid; d < head_dim; d += nth) qvec[d] = qsrc[d];
     __syncthreads();
 
-    float *dst = out + ((uint64_t)token * n_head + head) * head_dim;
-    if (count == 0u) {
+    if (!GatedQ8 && count == 0u) {
+        float *dst = out + ((uint64_t)token * n_head + head) * head_dim;
         for (uint32_t d = tid; d < head_dim; d += nth) dst[d] = 0.0f;
         return;
     }
@@ -6613,8 +6615,29 @@ __global__ static void qwen4exp_qsa_attention_kernel(
         __syncthreads();
     }
 
-    if (tid < head_dim) {
-        dst[tid] = (run_sum > 0.0f) ? acc / run_sum : 0.0f;
+    /* At decode widths the next consumer is the output projection's Q8
+     * input. Fuse the separate sigmoid gate and activation quantizer here.
+     * Each full warp owns one 32-channel group, so the existing butterfly,
+     * fast-math reciprocal and FTZ helpers reproduce the original quantizer.
+     * Only activation scratch is written; model weights are never changed. */
+    if (GatedQ8 && tid < head_dim) {
+        const uint64_t index = ((uint64_t)token*n_head + head)*head_dim + tid;
+        float v = (run_sum > 0.0f) ? acc / run_sum : 0.0f;
+        v = v * (1.0f / (1.0f + expf(-gate[index])));
+        const float vz = qwen4exp_q8_ftz(v);
+        float a = qwen4exp_q8_ftz(fabsf(v));
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+        const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
+        const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
+        if ((tid & 31u) == 0u) xscale[index / 32u] = d;
+        int qv = (int)lrintf(qwen4exp_q8_ftz(vz * id));
+        qv = qv > 127 ? 127 : (qv < -128 ? -128 : qv);
+        xq[index] = (int8_t)qv;
+    } else if (!GatedQ8 && tid < head_dim) {
+        out[((uint64_t)token*n_head + head)*head_dim + tid] =
+            (run_sum > 0.0f) ? acc / run_sum : 0.0f;
     }
 }
 
@@ -7414,15 +7437,60 @@ extern "C" int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
 
     const size_t shared = ((size_t)head_dim + 2u * nth) * sizeof(float) +
                           (size_t)nth * sizeof(int32_t);
-    qwen4exp_qsa_attention_kernel<<<dim3(n_head, n_tokens), nth, shared,
+    qwen4exp_qsa_attention_kernel<false><<<dim3(n_head, n_tokens), nth, shared,
         cuda_decode_stream()>>>(
             (const float *)q->ptr, (const float *)k_cache->ptr,
             (const float *)v_cache->ptr,
             sparse ? (const int32_t *)selected->ptr : NULL,
             sparse ? (const int32_t *)counts->ptr : NULL,
-            (float *)out->ptr, n_tokens, n_head, n_kv_head, head_dim, pos0,
+            (float *)out->ptr, NULL, NULL, NULL,
+            n_tokens, n_head, n_kv_head, head_dim, pos0,
             cache_cap, max_selected, sparse ? 1u : 0u, scale, d_pos_ptr);
     return cuda_ok(cudaGetLastError(), "Qwen4-Exp QSA attention launch");
+}
+
+
+extern "C" int ds4_gpu_qwen4exp_qsa_attention_gated_q8_dpos_tensor(
+        ds4_gpu_tensor *out_q8, uint64_t q_offset, uint64_t s_offset,
+        const ds4_gpu_tensor *gate, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *counts,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_kv_head,
+        uint32_t head_dim, uint32_t pos0, uint32_t cache_cap,
+        uint32_t max_selected, float scale, const ds4_gpu_tensor *d_pos) {
+    if (!out_q8 || !n_tokens || n_tokens > 7u || !n_head || !n_kv_head ||
+        (n_head % n_kv_head) || head_dim < 32u || head_dim > 1024u ||
+        (uint64_t)n_head*head_dim > UINT32_MAX ||
+        (head_dim & (head_dim - 1u)) ||
+        (!d_pos && (uint64_t)pos0+n_tokens > cache_cap)) return 0;
+    const uint64_t elems = (uint64_t)n_tokens*n_head*head_dim;
+    const uint64_t cache_elems = (uint64_t)cache_cap*n_kv_head*head_dim;
+    const uint64_t qbytes = elems, sbytes = (elems/32u)*sizeof(float);
+    const bool sparse = selected != NULL;
+    if ((q_offset & 15u) || (s_offset & 15u) ||
+        q_offset > out_q8->bytes || s_offset > out_q8->bytes ||
+        out_q8->bytes-q_offset < qbytes || out_q8->bytes-s_offset < sbytes ||
+        !(q_offset+qbytes <= s_offset || s_offset+sbytes <= q_offset) ||
+        !glm53_cuda_tensor_has(gate, elems, sizeof(float)) ||
+        !glm53_cuda_tensor_has(q, elems, sizeof(float)) ||
+        !glm53_cuda_tensor_has(k_cache, cache_elems, sizeof(float)) ||
+        !glm53_cuda_tensor_has(v_cache, cache_elems, sizeof(float)) ||
+        (d_pos && !glm53_cuda_tensor_has(d_pos, 1u, sizeof(uint32_t))) ||
+        (sparse && (!max_selected ||
+            !glm53_cuda_tensor_has(selected, (uint64_t)n_tokens*max_selected, sizeof(int32_t)) ||
+            !glm53_cuda_tensor_has(counts, n_tokens, sizeof(int32_t))))) return 0;
+    const uint32_t nth = head_dim;
+    const size_t shared = ((size_t)head_dim + 3u*nth)*sizeof(float);
+    qwen4exp_qsa_attention_kernel<true><<<dim3(n_head,n_tokens),nth,shared,cuda_decode_stream()>>>(
+        (const float *)q->ptr, (const float *)k_cache->ptr, (const float *)v_cache->ptr,
+        sparse ? (const int32_t *)selected->ptr : NULL,
+        sparse ? (const int32_t *)counts->ptr : NULL,
+        NULL, (const float *)gate->ptr,
+        (int8_t *)((char *)out_q8->ptr+q_offset),
+        (float *)((char *)out_q8->ptr+s_offset),
+        n_tokens,n_head,n_kv_head,head_dim,pos0,cache_cap,max_selected,
+        sparse ? 1u : 0u,scale,d_pos ? (const uint32_t *)d_pos->ptr : NULL);
+    return cuda_ok(cudaGetLastError(), "QSA attention gated quantization");
 }
 
 extern "C" int ds4_gpu_qwen4exp_qsa_attention_tensor(

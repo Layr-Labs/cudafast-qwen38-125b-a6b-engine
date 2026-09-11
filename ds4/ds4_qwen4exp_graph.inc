@@ -1486,6 +1486,30 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
     }
 
     const float scale = 1.0f / sqrtf((float)head_dim);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    /* The float attention scratch has ample room for the temporary int8
+     * activation plus its float scales. Its only subsequent reader is this
+     * output projection, so narrow CUDA calls need no float materialization
+     * or separate gate/quantize launches. Wider calls keep the grouped path. */
+    if (n_tokens <= 7u && head_dim >= 32u && head_dim <= 1024u &&
+        (head_dim & (head_dim-1u)) == 0u &&
+        getenv("DS4_QSA_NO_GATED_Q8") == NULL) {
+        const uint64_t out_soff = (uint64_t)n_tokens*q_width;
+        if (!ds4_gpu_qwen4exp_qsa_attention_gated_q8_dpos_tensor(
+                s->qsa_out, 0, out_soff, s->qsa_gate, s->qsa_q,
+                s->qsa_k[il], s->qsa_v[il], sel, counts,
+                n_tokens, DS4_N_HEAD, DS4_N_HEAD_KV, head_dim, pos0,
+                s->plan.n_ctx, max_selected, scale, s->d_pos) ||
+            !ds4_qwen4exp_matmul_q8_0_preq(
+                s->block_out, QW_MAP(m, l->attn_output),
+                QW_MAPSZ(m, l->attn_output), QW_OFF(l->attn_output),
+                q_width, DS4_N_EMBD, s->qsa_out, 0, out_soff, n_tokens)) {
+            fprintf(stderr, "ds4: qwen4exp fused QSA output failed at block %u\n", il);
+            return false;
+        }
+        return true;
+    }
+#endif
     if (!ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
             s->qsa_out, s->qsa_q, s->qsa_k[il], s->qsa_v[il], sel, counts,
             n_tokens, DS4_N_HEAD, DS4_N_HEAD_KV, head_dim, pos0,

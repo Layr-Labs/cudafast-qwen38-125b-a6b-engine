@@ -815,6 +815,19 @@ int ds4_gpu_qwen4exp_qsa_attention_tensor(
         uint32_t              max_selected,
         float                 scale);
 
+/* CUDA decode path: attention, sigmoid gate, then the same Q8 activation
+ * quantization consumed by ds4_gpu_matmul_q8_0_preq_rows_exact_tensor.
+ * q_offset/s_offset address non-overlapping int8/float regions of out_q8.
+ * Full 32-channel groups and at most seven rows are required. */
+int ds4_gpu_qwen4exp_qsa_attention_gated_q8_dpos_tensor(
+        ds4_gpu_tensor *out_q8, uint64_t q_offset, uint64_t s_offset,
+        const ds4_gpu_tensor *gate, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *counts,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_kv_head,
+        uint32_t head_dim, uint32_t pos0, uint32_t cache_cap,
+        uint32_t max_selected, float scale, const ds4_gpu_tensor *d_pos);
+
 /* `out *= sigmoid(gate)`, the gate carried by the doubled `q_proj`. */
 int ds4_gpu_qwen4exp_qsa_output_gate_tensor(
         ds4_gpu_tensor       *out,
