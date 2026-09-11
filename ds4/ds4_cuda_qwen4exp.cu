@@ -8467,7 +8467,7 @@ static uint32_t qwen4exp_qsa_split_width(void) {
         const long v = strtol(forced, NULL, 10);
         return (v > 0 && v <= 32) ? (uint32_t)v : 0u;
     }
-    return 4u;
+    return 6u;
 }
 
 /* The split path.  Returns 1 when it launched, 0 when the shape or the
