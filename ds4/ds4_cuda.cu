@@ -5234,20 +5234,6 @@ __device__ __forceinline__ static int32_t load_i8x4_i32_unaligned(const int8_t *
                      ((uint32_t)u[3] << 24));
 }
 
-/* The rolling aligned-word reader already holds the first part of the
- * final Q8_0 operand. An even payload needs only its final two bytes:
- * shift 0 selects previous, and shift 16 joins its upper half to those
- * bytes. The halfword load remains within the original 34-byte block.
- * Odd payloads retain the byte fallback. */
-__device__ __forceinline__ static int32_t q8_0_tail_word(
-        const int8_t *payload, uint32_t previous, uint32_t shift) {
-    if ((((uintptr_t)payload) & 1u) == 0u) {
-        const uint16_t last = *(const uint16_t *)(const void *)(payload + 30);
-        return (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
-    }
-    return load_i8x4_i32_unaligned(payload + 28);
-}
-
 /*
  * One 32-element int8 dot product, four WEIGHT bytes at a time.
  *
@@ -5260,11 +5246,12 @@ __device__ __forceinline__ static int32_t q8_0_tail_word(
  * asks the cache for a span of nine lines to use four bytes of them.
  *
  * Read the aligned words that CONTAIN the payload instead, and shift the bytes
- * into place: eight word loads plus one in-bounds halfword read for the last
- * group on an even Q8_0 payload. Its other bytes are already in the last word.
- * Nine loads where there were thirty-two, and the shift amount is a value
- * rather than a branch, so lanes whose blocks alternate between word and
- * halfword alignment stay in step. Odd payloads retain the byte tail reader.
+ * into place: eight word loads plus one halfword read for the last group,
+ * whose top bytes live past the rolling reader's final word.  Even payloads
+ * reuse that word and read only the two missing bytes; odd payloads keep four
+ * byte loads within the payload.
+ * The shift amount is a value rather than a branch,
+ * so lanes whose blocks land on different alignments stay in step.
  *
  * THE ARITHMETIC IS UNTOUCHED.  The dp4a groups are the same four bytes in the
  * same order against the same activation words, and an integer dot does not
@@ -5272,6 +5259,18 @@ __device__ __forceinline__ static int32_t q8_0_tail_word(
  * what the byte-at-a-time loop produced -- which is what the speculative
  * cycle's serial identity needs, and what the correctness gate checks.
  */
+/* The rolling reader already holds the first part of the final operand.  An
+ * even payload needs only its last two bytes; odd payloads keep the safe byte
+ * fallback. */
+__device__ __forceinline__ static int32_t q8_0_tail_word(
+        const int8_t *payload, uint32_t previous, uint32_t shift) {
+    if ((((uintptr_t)payload) & 1u) == 0u) {
+        const uint16_t last = *(const uint16_t *)(const void *)(payload + 30);
+        return (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
+    }
+    return load_i8x4_i32_unaligned(payload + 28);
+}
+
 __device__ __forceinline__ static int32_t dot_i8x32_dp4a(const int8_t *a, const int8_t *b) {
     /* The activation side is quantised into a 32-byte-aligned scratch row, so
      * it is read as whole words with no shifting. */
