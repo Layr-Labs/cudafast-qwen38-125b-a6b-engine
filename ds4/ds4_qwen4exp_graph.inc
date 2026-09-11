@@ -1687,10 +1687,15 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
     const ds4_gpu_qwen4exp_slab sh_gate_slab = QW_SLAB(m, l->ffn_gate_shexp);
     const ds4_gpu_qwen4exp_slab sh_up_slab = QW_SLAB(m, l->ffn_up_shexp);
     const ds4_gpu_qwen4exp_slab sh_down_slab = QW_SLAB(m, l->ffn_down_shexp);
-    if (!ds4_gpu_qwen4exp_shared_expert_tensor(
+    /* Routed and shared experts read the same mixed activation in this
+     * stream. Routed scratch retains its quantization through this call;
+     * Metal's prequantized entry point keeps its ordinary implementation. */
+    const int reuse_quant = getenv("DS4_QWEN4EXP_NO_MOE_QUANT_REUSE") == NULL;
+    if (!ds4_gpu_qwen4exp_shared_expert_preq_tensor(
             s->block_out, s->shexp_mid, s->shexp_gate,
             &sh_router_slab, &sh_gate_slab, &sh_up_slab, &sh_down_slab,
-            DS4_N_EMBD, DS4_N_FF_SHEXP, DS4_N_EMBD, s->mixed, n_tokens)) {
+            DS4_N_EMBD, DS4_N_FF_SHEXP, DS4_N_EMBD, s->mixed, n_tokens,
+            reuse_quant)) {
         fprintf(stderr, "ds4: qwen4exp shared expert failed at block %u\n", il);
         return false;
     }

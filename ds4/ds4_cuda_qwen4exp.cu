@@ -1533,6 +1533,7 @@ __device__ __forceinline__ static float dev_qwen4exp_block_sum(
 /* The checkpoint asks for ten of at most 512 experts.  One warp can read that
  * envelope as sixteen coalesced rows, keep them in registers, and select the
  * small top-k without sorting the 502 entries the model will discard. */
+template<bool Native>
 __global__ static void qwen4exp_router_select_topk_kernel(
         int32_t *selected,
         float *weights_out,
@@ -1570,16 +1571,29 @@ __global__ static void qwen4exp_router_select_topk_kernel(
             }
         }
 
+#if __CUDA_ARCH__ >= 800
+        if (Native) {
+            /* Float order as unsigned integer order. Canonical zero keeps
+             * the old comparison's equal treatment of positive/negative zero. */
+            const uint32_t bits = best_v == 0.0f ? 0u : __float_as_uint(best_v);
+            const uint32_t key = bits & 0x80000000u ? ~bits : bits ^ 0x80000000u;
+            const uint32_t winning_key = __reduce_max_sync(0xffffffffu, key);
+            best_i = __reduce_min_sync(0xffffffffu,
+                    key == winning_key ? best_i : INT32_MAX);
+        } else
+#endif
+        {
 #pragma unroll
-        for (uint32_t off = 16u; off > 0u; off >>= 1u) {
-            const float other_v =
-                __shfl_down_sync(0xffffffffu, best_v, off);
-            const int32_t other_i =
-                __shfl_down_sync(0xffffffffu, best_i, off);
-            if (other_v > best_v ||
-                (other_v == best_v && other_i < best_i)) {
-                best_v = other_v;
-                best_i = other_i;
+            for (uint32_t off = 16u; off > 0u; off >>= 1u) {
+                const float other_v =
+                    __shfl_down_sync(0xffffffffu, best_v, off);
+                const int32_t other_i =
+                    __shfl_down_sync(0xffffffffu, best_i, off);
+                if (other_v > best_v ||
+                    (other_v == best_v && other_i < best_i)) {
+                    best_v = other_v;
+                    best_i = other_i;
+                }
             }
         }
         const int32_t chosen =
@@ -1590,22 +1604,47 @@ __global__ static void qwen4exp_router_select_topk_kernel(
         }
     }
 
-    /* Same serial softmax and the same selected-logit order as the full-sort
-     * path below. */
-    if (lane == 0u) {
+    if (Native) {
         float m = -FLT_MAX;
-        for (uint32_t i = 0; i < n_expert_used; i++) {
-            const float v = lg[(uint32_t)sel[i]];
-            if (v > m) m = v;
+        if (lane == 0u) {
+            for (uint32_t i = 0; i < n_expert_used; i++) {
+                const float v = lg[(uint32_t)sel[i]];
+                if (v > m) m = v;
+            }
         }
+        m = __shfl_sync(0xffffffffu, m, 0u);
+        /* Selected ids were stored by lane zero above. Publish them before
+         * other lanes read; no block-wide barrier is needed in one warp. */
+        __syncwarp();
+        const float e = lane < n_expert_used
+                ? expf(lg[(uint32_t)sel[lane]] - m) : 0.0f;
         float sum = 0.0f;
         for (uint32_t i = 0; i < n_expert_used; i++) {
-            const float e = expf(lg[(uint32_t)sel[i]] - m);
-            w[i] = e;
-            sum += e;
+            const float term = __shfl_sync(0xffffffffu, e, i);
+            if (lane == 0u) sum += term;
         }
-        const float inv = 1.0f / sum;
-        for (uint32_t i = 0; i < n_expert_used; i++) w[i] *= inv;
+        float inv = 0.0f;
+        if (lane == 0u) inv = 1.0f / sum;
+        inv = __shfl_sync(0xffffffffu, inv, 0u);
+        if (lane < n_expert_used) w[lane] = e * inv;
+    } else {
+        /* Same serial softmax and the same selected-logit order as the full-sort
+         * path below. */
+        if (lane == 0u) {
+            float m = -FLT_MAX;
+            for (uint32_t i = 0; i < n_expert_used; i++) {
+                const float v = lg[(uint32_t)sel[i]];
+                if (v > m) m = v;
+            }
+            float sum = 0.0f;
+            for (uint32_t i = 0; i < n_expert_used; i++) {
+                const float e = expf(lg[(uint32_t)sel[i]] - m);
+                w[i] = e;
+                sum += e;
+            }
+            const float inv = 1.0f / sum;
+            for (uint32_t i = 0; i < n_expert_used; i++) w[i] *= inv;
+        }
     }
 }
 
@@ -3051,7 +3090,7 @@ __global__ static void qwen4exp_moe_down_q_kernel(
 
 /* The shared expert: no routing, so the tile is consecutive tokens and the
  * decoded group serves all of them. */
-template <int R>
+template <int R, int GateType = -1, int UpType = -1>
 __global__ static void qwen4exp_shared_gateup_q_kernel(
         float *mid,
         const char *gate,
@@ -3084,8 +3123,12 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
         int8_t gw[32], uw[32];
         float ga[2], gb[2], ua[2], ub[2];
         int gh = 1, uh = 1;
-        dev_qwen4exp_group_decode(gate_type, gate_row, g, gw, ga, gb, &gh);
-        dev_qwen4exp_group_decode(up_type, up_row, g, uw, ua, ub, &uh);
+        dev_qwen4exp_group_decode(
+                GateType < 0 ? gate_type : (uint32_t)GateType,
+                gate_row, g, gw, ga, gb, &gh);
+        dev_qwen4exp_group_decode(
+                UpType < 0 ? up_type : (uint32_t)UpType,
+                up_row, g, uw, ua, ub, &uh);
 #pragma unroll
         for (int r = 0; r < R; r++) {
             if ((uint32_t)r < take) {
@@ -3110,7 +3153,7 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
     }
 }
 
-template <int R>
+template <int R, int DownType = -1>
 __global__ static void qwen4exp_shared_down_q_kernel(
         float *out,
         const char *down,
@@ -3139,7 +3182,9 @@ __global__ static void qwen4exp_shared_down_q_kernel(
         int8_t wq[32];
         float wa[2], wb[2];
         int halves = 1;
-        dev_qwen4exp_group_decode(down_type, down_row, g, wq, wa, wb, &halves);
+        dev_qwen4exp_group_decode(
+                DownType < 0 ? down_type : (uint32_t)DownType,
+                down_row, g, wq, wa, wb, &halves);
 #pragma unroll
         for (int r = 0; r < R; r++) {
             if ((uint32_t)r < take) {
@@ -4316,6 +4361,7 @@ static int qwen4exp_shared_mma_ok(const uint32_t *types, uint32_t n_types,
         }                                                                    \
     } while (0)
 
+template <int RouterType = -1>
 __global__ static void qwen4exp_shared_gate_kernel(
         float *gate_out,
         const char *router,
@@ -4329,7 +4375,9 @@ __global__ static void qwen4exp_shared_gate_kernel(
     const float *token_x = x + (uint64_t)token * in_dim;
     float acc = 0.0f;
     for (uint32_t k = threadIdx.x; k < in_dim; k += blockDim.x) {
-        acc += dev_qwen4exp_weight_value(router_type, router, k) * token_x[k];
+        acc += dev_qwen4exp_weight_value(
+                RouterType < 0 ? router_type : (uint32_t)RouterType,
+                router, k) * token_x[k];
     }
     const float total = dev_qwen4exp_block_sum(ds4_qwen4exp_smem, acc);
     if (threadIdx.x == 0u) gate_out[token] = 1.0f / (1.0f + expf(-total));
@@ -4364,12 +4412,22 @@ extern "C" int ds4_gpu_qwen4exp_router_select_tensor(
         return 0;
     }
     if (n_expert_used <= 32u) {
-        qwen4exp_router_select_topk_kernel<<<
+        if (getenv("DS4_QWEN4EXP_NO_ROUTER_NATIVE") == NULL) {
+            qwen4exp_router_select_topk_kernel<true><<<
                 n_tokens, 32u, 0, cuda_decode_stream()>>>(
                 (int32_t *)selected->ptr,
                 (float *)weights->ptr,
                 (const float *)logits->ptr,
                 n_expert, n_expert_used, n_tokens);
+        } else {
+            qwen4exp_router_select_topk_kernel<false><<<
+                n_tokens, 32u, 0, cuda_decode_stream()>>>(
+                (int32_t *)selected->ptr,
+                (float *)weights->ptr,
+                (const float *)logits->ptr,
+                n_expert, n_expert_used, n_tokens);
+        }
+
     } else {
         const unsigned threads = n_expert > 256u ? 512u : 256u;
         qwen4exp_router_select_kernel<<<
@@ -4426,8 +4484,8 @@ extern "C" int ds4_gpu_qwen4exp_ehx_pack_tensor(
             (const float *)hidden->ptr, n_hc, n_embd);
     return cuda_ok(cudaGetLastError(), "qwen4exp ehx pack launch");
 }
-/* Scratch for one expert call: the pair list, then the Q8_0 form of the
- * activation the projections consume.  Laid out here so the sizes are visible
+/* Scratch for one expert call: the Q8_0 activation prefix, then the pair
+ * list and routed intermediate.  Laid out here so the sizes are visible
  * beside the kernels that read them.
  *
  * At a prefill width of 512 with this model's shape the whole block is about
@@ -4569,17 +4627,20 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     char *base = (char *)qwen4exp_group_scratch(
             logical_tier, idx_bytes + pair_bytes + xq_bytes + mq_bytes);
     if (!base) return 0;
+    /* The immediately following shared expert consumes this same input.
+     * Keep its quantized bytes/scales/sums at the shared scratch prefix;
+     * expert metadata and the routed intermediate live after that prefix. */
     qwen4exp_moe_scratch sc;
-    sc.counts = (int32_t *)base;
+    sc.xq = (int8_t *)base;
+    sc.xs = (float *)(base + (uint64_t)n_tokens * xgroups * 32u);
+    sc.xsum = (int32_t *)(sc.xs + (uint64_t)n_tokens * xgroups);
+    char *at = base + xq_bytes;
+    sc.counts = (int32_t *)at;
     sc.offsets = sc.counts + n_total_expert;
     sc.cursor = sc.offsets + n_total_expert;
     sc.active = sc.cursor + n_total_expert;
     sc.pairs = sc.active + n_total_expert + 1u;
-    char *at = base + idx_bytes + pair_bytes;
-    sc.xq = (int8_t *)at;
-    sc.xs = (float *)(at + (uint64_t)n_tokens * xgroups * 32u);
-    sc.xsum = (int32_t *)(sc.xs + (uint64_t)n_tokens * xgroups);
-    at += xq_bytes;
+    at += idx_bytes + pair_bytes;
     sc.mq = (int8_t *)at;
     sc.ms = (float *)(at + (uint64_t)n_pairs * mgroups * 32u);
     sc.msum = (int32_t *)(sc.ms + (uint64_t)n_pairs * mgroups);
@@ -4880,12 +4941,25 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
     cudaStream_t stream = cuda_decode_stream();
     const unsigned threads = 256u;
     const size_t shared = (size_t)threads * sizeof(float);
+    const bool specialize_shared =
+        getenv("DS4_QWEN4EXP_GENERIC_EXPERTS") == NULL;
 
     /* The sigmoid gate is one dot against ONE F32 row per token.  It reads
-     * kilobytes, not megabytes, so it keeps the scalar reduction. */
-    qwen4exp_shared_gate_kernel<<<n_tokens, threads, shared, stream>>>(
-            (float *)gate_scale->ptr, router, (const float *)x->ptr,
-            router_slab->type, in_dim, n_tokens);
+     * kilobytes, not megabytes, so it keeps the scalar reduction. Resolve its
+     * checkpoint-wide F32 type at launch just as the Q8 projections below do;
+     * other supported layouts retain the generic decoder. */
+    if (specialize_shared &&
+        router_slab->type == (uint32_t)DS4_QWEN4EXP_TY_f32) {
+        qwen4exp_shared_gate_kernel<DS4_QWEN4EXP_TY_f32>
+            <<<n_tokens, threads, shared, stream>>>(
+                (float *)gate_scale->ptr, router, (const float *)x->ptr,
+                router_slab->type, in_dim, n_tokens);
+    } else {
+        qwen4exp_shared_gate_kernel<-1>
+            <<<n_tokens, threads, shared, stream>>>(
+                (float *)gate_scale->ptr, router, (const float *)x->ptr,
+                router_slab->type, in_dim, n_tokens);
+    }
     if (!cuda_ok(cudaGetLastError(), "qwen4exp shared gate launch")) return 0;
 
     const uint32_t xgroups = in_dim / 32u;
@@ -4974,7 +5048,10 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
                                                   n_tokens, 2u, &gu_logch);
     const int mma_down = qwen4exp_shared_mma_ok(dn_types, 1u, mgroups,
                                                 n_tokens, 1u, &dn_logch);
-
+    /* The shipped checkpoint's shared expert is Q8_0 throughout. Resolve
+     * that uniform type at launch time so the decode loop does not carry the
+     * generic six-format switch through every group. Other supported layouts
+     * retain the generic instantiation and exactly the same arithmetic. */
     if (mma_gateup) {
         const uint32_t ks = ((xgroups + 31u) / 32u) << gu_logch;
         const dim3 grid((mid_dim + (uint32_t)QS_MMA_BM - 1u) / (uint32_t)QS_MMA_BM,
@@ -5004,17 +5081,28 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
                 gate_slab->row_bytes, up_slab->row_bytes,
                 gate_slab->type, up_slab->type, xgroups, mid_dim, n_tokens);
     } else {
-#define QWEN4EXP_SH_GATEUP(R) \
-    qwen4exp_shared_gateup_q_kernel<R> \
+#define QWEN4EXP_SH_GATEUP_IMPL(R, GT, UT) \
+    qwen4exp_shared_gateup_q_kernel<R, GT, UT> \
         <<<dim3((mid_dim + 7u) / 8u, tiles, 1), threads, 0, stream>>>( \
             (float *)mid->ptr, gate, up, xq, xs, xsum, \
             gate_slab->row_bytes, up_slab->row_bytes, \
             gate_slab->type, up_slab->type, xgroups, mid_dim, n_tokens)
+#define QWEN4EXP_SH_GATEUP(R) do { \
+    if (specialize_shared && \
+        gate_slab->type == DS4_QWEN4EXP_TY_q8_0 && \
+        up_slab->type == DS4_QWEN4EXP_TY_q8_0) { \
+        QWEN4EXP_SH_GATEUP_IMPL(R, DS4_QWEN4EXP_TY_q8_0, \
+                                  DS4_QWEN4EXP_TY_q8_0); \
+    } else { \
+        QWEN4EXP_SH_GATEUP_IMPL(R, -1, -1); \
+    } \
+} while (0)
     if (tile == 8) { QWEN4EXP_SH_GATEUP(8); }
     else if (tile == 4) { QWEN4EXP_SH_GATEUP(4); }
     else if (tile == 2) { QWEN4EXP_SH_GATEUP(2); }
     else { QWEN4EXP_SH_GATEUP(1); }
 #undef QWEN4EXP_SH_GATEUP
+#undef QWEN4EXP_SH_GATEUP_IMPL
     }
     if (!cuda_ok(cudaGetLastError(), "qwen4exp shared gate/up launch")) return 0;
 
@@ -5052,17 +5140,25 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
                 (const float *)gate_scale->ptr, down_slab->row_bytes,
                 down_slab->type, mgroups, out_dim, n_tokens);
     } else {
-#define QWEN4EXP_SH_DOWN(R) \
-    qwen4exp_shared_down_q_kernel<R> \
+#define QWEN4EXP_SH_DOWN_IMPL(R, DT) \
+    qwen4exp_shared_down_q_kernel<R, DT> \
         <<<dim3((out_dim + 7u) / 8u, tiles, 1), threads, 0, stream>>>( \
             (float *)out->ptr, down, mq, ms, msum, \
             (const float *)gate_scale->ptr, down_slab->row_bytes, \
             down_slab->type, mgroups, out_dim, n_tokens)
+#define QWEN4EXP_SH_DOWN(R) do { \
+    if (specialize_shared && down_slab->type == DS4_QWEN4EXP_TY_q8_0) { \
+        QWEN4EXP_SH_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q8_0); \
+    } else { \
+        QWEN4EXP_SH_DOWN_IMPL(R, -1); \
+    } \
+} while (0)
     if (tile == 8) { QWEN4EXP_SH_DOWN(8); }
     else if (tile == 4) { QWEN4EXP_SH_DOWN(4); }
     else if (tile == 2) { QWEN4EXP_SH_DOWN(2); }
     else { QWEN4EXP_SH_DOWN(1); }
 #undef QWEN4EXP_SH_DOWN
+#undef QWEN4EXP_SH_DOWN_IMPL
     }
     return cuda_ok(cudaGetLastError(), "qwen4exp shared down launch");
 }
@@ -5587,6 +5683,73 @@ __global__ static void qwen4exp_hc_inject_weights_renorm_kernel(
     }
 }
 
+/* The narrow mixer has independent mix and inject outputs. Put their
+ * existing CTAs in one launch: neither reduction nor its thread mapping
+ * changes, and the short mix can overlap the underfilled inject grid. */
+__global__ static void qwen4exp_hc_mix_inject_dual_kernel(
+        float *mixed, float *inject, const float *hyper, const float *nscale,
+        const float *normw, const float *gate_values, const char *w,
+        uint32_t n_embd, uint32_t n_hc, uint32_t rows,
+        float weight_bias, int round_bf16,
+        uint32_t weight_type, uint32_t weight_row_bytes) {
+    const uint32_t mix_blocks = (n_embd + 255u) / 256u;
+    if (blockIdx.x < mix_blocks) {
+        float *out = mixed;
+        const uint32_t n_tokens = rows;
+        const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
+        const uint32_t t = blockIdx.y;
+        if (d >= n_embd || t >= n_tokens) return;
+
+        const uint64_t row = ((uint64_t)t * n_hc) * n_embd + d;
+
+        float acc = 0.0f;
+        /* Keep this pointer walk rolled. With nvcc 13 the automatically unrolled
+         * combined kernel truncated a norm-weight address above 4 GiB. The rolled
+         * form passes changed-input replay and CUDA memcheck. */
+#pragma unroll 1
+        for (uint32_t h = 0; h < n_hc; h++) {
+            const uint64_t idx = row + (uint64_t)h * n_embd;
+            const float normed = qwen4exp_hc_normed_value(
+                    hyper[idx], nscale[(uint64_t)t * n_hc + h],
+                    normw[(uint64_t)h * n_embd + d], weight_bias, round_bf16);
+            acc += qwen4exp_sigmoid(gate_values[idx]) * normed;
+        }
+        out[(uint64_t)t * n_embd + d] = acc * (1.0f / (float)n_hc);
+    } else {
+        float *out = inject;
+        const uint32_t h = blockIdx.x - mix_blocks;
+        const uint32_t t = blockIdx.y;
+        if (t >= rows || h >= n_hc) return;
+
+        const uint32_t wide = n_hc * n_embd;
+        const float *xr = hyper + (uint64_t)t * wide;
+        const char *wr = w + (uint64_t)h * weight_row_bytes;
+
+        float sum = 0.0f;
+        for (uint32_t hs = 0; hs < n_hc; hs++) {
+            const float sc = nscale[(uint64_t)t * n_hc + hs];
+            for (uint32_t k = 0; k < n_embd; k += blockDim.x) {
+                const uint32_t i = hs * n_embd + k + threadIdx.x;
+                const float normed = qwen4exp_hc_normed_value(
+                        xr[i], sc, normw[i], weight_bias, round_bf16);
+                sum += normed * dev_qwen4exp_inject_value(weight_type, wr, i);
+            }
+        }
+        __shared__ float partial[QWEN4EXP_HC_THREADS];
+        const float total = qwen4exp_block_sum_f32(sum, partial);
+        if (threadIdx.x == 0) {
+            out[(uint64_t)t * n_hc + h] =
+                2.0f * qwen4exp_sigmoid(total * (1.0f / (float)n_hc));
+        }
+    }
+}
+
+static int qwen4exp_hc_ranges_disjoint(const void *a, uint64_t an,
+                                       const void *b, uint64_t bn) {
+    const uintptr_t ap = (uintptr_t)a, bp = (uintptr_t)b;
+    return ap >= bp ? ap - bp >= bn : bp - ap >= an;
+}
+
 /* Both of the above in ONE pass over the residual, one block per token.
  *
  * The two kernels read the same 41.9 MB; together they read it once.  The mix
@@ -5853,6 +6016,38 @@ static int qwen4exp_hc_mixer_fused_cuda(
                 inject_weight->type, (uint32_t)iw_row_bytes);
         return cuda_ok(cudaGetLastError(),
                        "qwen4exp_hc_mix_inject_renorm launch");
+    }
+
+    /* Preserve sequential semantics for overlapping caller-supplied views.
+     * The graph's mixed/inject outputs are separate allocations. */
+    if (inject && rows <= 7u && n_embd == 2560u && n_hc == 4u &&
+        getenv("DS4_QWEN4EXP_NO_HC_DUAL") == NULL) {
+        const uint64_t mix_bytes = (uint64_t)rows * n_embd * sizeof(float);
+        const uint64_t inj_bytes = (uint64_t)rows * n_hc * sizeof(float);
+        const uint64_t norm_bytes = wide * sizeof(float);
+        const uint64_t iw_bytes = (uint64_t)n_hc * iw_row_bytes;
+        const int disjoint =
+            qwen4exp_hc_ranges_disjoint(mixed->ptr, mix_bytes, inject->ptr, inj_bytes) &&
+            qwen4exp_hc_ranges_disjoint(mixed->ptr, mix_bytes, hyper->ptr, hc_bytes) &&
+            qwen4exp_hc_ranges_disjoint(mixed->ptr, mix_bytes, nscale, n_bytes) &&
+            qwen4exp_hc_ranges_disjoint(mixed->ptr, mix_bytes, normw, norm_bytes) &&
+            qwen4exp_hc_ranges_disjoint(mixed->ptr, mix_bytes, iw, iw_bytes) &&
+            qwen4exp_hc_ranges_disjoint(inject->ptr, inj_bytes, hyper->ptr, hc_bytes) &&
+            qwen4exp_hc_ranges_disjoint(inject->ptr, inj_bytes, nscale, n_bytes) &&
+            qwen4exp_hc_ranges_disjoint(inject->ptr, inj_bytes, normw, norm_bytes) &&
+            qwen4exp_hc_ranges_disjoint(inject->ptr, inj_bytes, wide_scratch->ptr, hc_bytes);
+        if (disjoint) {
+            const unsigned mix_blocks = (n_embd + threads - 1u) / threads;
+            qwen4exp_hc_mix_inject_dual_kernel<<<
+                    dim3(mix_blocks + n_hc, rows, 1u), threads, 0,
+                    cuda_decode_stream()>>>(
+                    (float *)mixed->ptr, (float *)inject->ptr,
+                    (const float *)hyper->ptr, nscale, normw,
+                    (const float *)wide_scratch->ptr, iw,
+                    n_embd, n_hc, rows, weight_bias, round_bf16,
+                    inject_weight->type, (uint32_t)iw_row_bytes);
+            return cuda_ok(cudaGetLastError(), "qwen4exp_hc_mix_inject_dual launch");
+        }
     }
 
     qwen4exp_hc_mix_renorm_kernel<<<dim3((n_embd + threads - 1u) / threads,
