@@ -4952,7 +4952,10 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
                 n_expert_used, n_total_expert);
         return cuda_ok(cudaGetLastError(), "qwen4exp MoE down combine launch");
     }
-    if (tile == 8) { QWEN4EXP_DOWN(8); }
+    if (n_tokens == 1u && getenv("DS4_QWEN4EXP_NO_ROUTED_DOWN_R1") == NULL) {
+        QWEN4EXP_DOWN(1);
+    }
+    else if (tile == 8) { QWEN4EXP_DOWN(8); }
     else if (tile == 4) { QWEN4EXP_DOWN(4); }
     else if (tile == 2) { QWEN4EXP_DOWN(2); }
     else { QWEN4EXP_DOWN(1); }
