@@ -3049,6 +3049,52 @@ __global__ static void qwen4exp_moe_down_q_kernel(
     }
 }
 
+/* Exactly two token rows. Keep each row's slot/group float order while
+ * carrying the decoded raw group across the two accumulations. */
+__global__ static void qwen4exp_moe_down_q5_pair_kernel(
+        float *out, const char *down, const int32_t *selected,
+        const int8_t *mq, const float *ms, const int32_t *msum,
+        uint64_t expert_bytes, uint64_t row_bytes, uint32_t groups,
+        uint32_t out_dim, uint32_t total_expert, uint32_t used) {
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned row = blockIdx.x * 8u + (threadIdx.x >> 5u);
+    if (row >= out_dim) return;
+    float a0 = 0.0f, a1 = 0.0f;
+    for (unsigned slot = 0; slot < used; slot++) {
+        const int e0 = selected[slot], e1 = selected[used + slot];
+        const bool live0 = e0 >= 0 && (unsigned)e0 < total_expert;
+        const bool live1 = e1 >= 0 && (unsigned)e1 < total_expert;
+        if (!live0 && !live1) continue;
+        /* Form only valid weight pointers; invalid expert IDs never alias a
+         * real expert or participate in the cross-row reuse. */
+        const char *w0 = live0 ? down + (uint64_t)(unsigned)e0 * expert_bytes +
+                                     (uint64_t)row * row_bytes : NULL;
+        const char *w1 = live1 ? down + (uint64_t)(unsigned)e1 * expert_bytes +
+                                     (uint64_t)row * row_bytes : NULL;
+        for (unsigned g = lane; g < groups; g += 32u) {
+            int8_t wq[32];
+            float wa[2], wb[2];
+            int halves = 1;
+            const uint64_t at0 = (uint64_t)slot * groups + g;
+            const uint64_t at1 = at0 + (uint64_t)used * groups;
+            if (live0) {
+                dev_qwen4exp_group_decode(DS4_QWEN4EXP_TY_q5_1, w0, g, wq, wa, wb, &halves);
+                qwen4exp_group_accumulate(&a0, wq, wa, wb, halves,
+                                          mq + at0 * 32u, ms[at0], msum[at0]);
+            }
+            if (live1) {
+                if (!live0 || e1 != e0)
+                    dev_qwen4exp_group_decode(DS4_QWEN4EXP_TY_q5_1, w1, g, wq, wa, wb, &halves);
+                qwen4exp_group_accumulate(&a1, wq, wa, wb, halves,
+                                          mq + at1 * 32u, ms[at1], msum[at1]);
+            }
+        }
+    }
+    a0 = warp_sum_f32(a0);
+    a1 = warp_sum_f32(a1);
+    if (lane == 0u) { out[row] = a0; out[(uint64_t)out_dim + row] = a1; }
+}
+
 /* The shared expert: no routing, so the tile is consecutive tokens and the
  * decoded group serves all of them. */
 template <int R>
@@ -4812,7 +4858,17 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
                 n_expert_used, n_total_expert);
         return cuda_ok(cudaGetLastError(), "qwen4exp MoE down combine launch");
     }
-    if (tile == 8) { QWEN4EXP_DOWN(8); }
+    if (n_tokens == 2u && tile == 2 && specialize &&
+        down_slab->type == DS4_QWEN4EXP_TY_q5_1 &&
+        mgroups == 20u && out_dim == 2560u &&
+        getenv("DS4_QWEN4EXP_NO_MOE_DOWN_REUSE") == NULL) {
+        qwen4exp_moe_down_q5_pair_kernel<<<dn_grid.x, threads, 0, stream>>>(
+                (float *)out->ptr, down, (const int32_t *)selected->ptr,
+                sc.mq, sc.ms, sc.msum, down_slab->expert_bytes,
+                down_slab->row_bytes, mgroups, out_dim,
+                n_total_expert, n_expert_used);
+    }
+    else if (tile == 8) { QWEN4EXP_DOWN(8); }
     else if (tile == 4) { QWEN4EXP_DOWN(4); }
     else if (tile == 2) { QWEN4EXP_DOWN(2); }
     else { QWEN4EXP_DOWN(1); }
