@@ -47374,6 +47374,34 @@ int ds4_gpu_qwen4exp_qsa_indexer_select_tensor(
     }
 }
 
+int ds4_gpu_qwen4exp_qsa_attention_gated_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k_cache,
+        const ds4_gpu_tensor *v_cache,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *counts,
+        uint32_t              n_tokens,
+        uint32_t              n_head,
+        uint32_t              n_kv_head,
+        uint32_t              head_dim,
+        uint32_t              pos0,
+        uint32_t              cache_cap,
+        uint32_t              max_selected,
+        float                 scale) {
+    int rc = ds4_gpu_qwen4exp_qsa_attention_tensor(
+            out, q, k_cache, v_cache, selected, counts,
+            n_tokens, n_head, n_kv_head, head_dim, pos0,
+            cache_cap, max_selected, scale);
+    if (!rc) return 0;
+    if (gate) {
+        return ds4_gpu_qwen4exp_qsa_output_gate_tensor(
+                out, gate, n_tokens * n_head * head_dim);
+    }
+    return 1;
+}
+
 int ds4_gpu_qwen4exp_qsa_attention_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *q,

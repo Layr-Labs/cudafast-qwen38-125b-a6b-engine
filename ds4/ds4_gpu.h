@@ -739,6 +739,23 @@ int ds4_gpu_qwen4exp_qsa_attention_tensor(
         uint32_t              max_selected,
         float                 scale);
 
+int ds4_gpu_qwen4exp_qsa_attention_gated_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k_cache,
+        const ds4_gpu_tensor *v_cache,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *counts,
+        uint32_t              n_tokens,
+        uint32_t              n_head,
+        uint32_t              n_kv_head,
+        uint32_t              head_dim,
+        uint32_t              pos0,
+        uint32_t              cache_cap,
+        uint32_t              max_selected,
+        float                 scale);
+
 /* `out *= sigmoid(gate)`, the gate carried by the doubled `q_proj`. */
 int ds4_gpu_qwen4exp_qsa_output_gate_tensor(
         ds4_gpu_tensor       *out,

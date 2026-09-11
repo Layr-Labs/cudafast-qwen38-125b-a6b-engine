@@ -242,6 +242,47 @@ static bool qwen4exp_ple_read_constants(const ds4_model            *m,
     return true;
 }
 
+#include <stdatomic.h>
+
+#define DS4_QWEN4EXP_PLE_MAX_THREADS 16u
+
+struct ds4_qwen4exp_session;
+
+typedef struct {
+    const ds4_qwen4exp_ple_table *ple;
+    const struct ds4_qwen4exp_session *s;
+    const int32_t                *tokens;
+    uint32_t                      n_tokens;
+    uint32_t                      t0;
+    uint32_t                      t1;
+    uint32_t                      blocks_per_row;
+    int                           ok;
+} qw_ple_gather_seg;
+
+struct ds4_ple_worker_pool;
+
+typedef struct ds4_ple_worker_thread {
+    pthread_t                   thread;
+    struct ds4_ple_worker_pool *pool;
+    uint32_t                    worker_id; /* 1 .. DS4_QWEN4EXP_PLE_MAX_THREADS - 1 */
+} ds4_ple_worker_thread;
+
+typedef struct ds4_ple_worker_pool {
+    ds4_ple_worker_thread workers[DS4_QWEN4EXP_PLE_MAX_THREADS];
+    qw_ple_gather_seg     segs[DS4_QWEN4EXP_PLE_MAX_THREADS];
+    pthread_mutex_t       mutex;
+    pthread_cond_t        cv_work;
+    pthread_cond_t        cv_done;
+    uint32_t              n_threads;         /* total pool threads, e.g. 16 */
+    atomic_uint           workers_remaining; /* dispatched workers still running */
+    atomic_uint           generation;        /* generation counter */
+    atomic_bool           stop;              /* shutdown signal */
+    bool                  initialized;       /* true if pool was initialized */
+} ds4_ple_worker_pool;
+
+static bool ds4_ple_worker_pool_init(ds4_ple_worker_pool *pool);
+static void ds4_ple_worker_pool_destroy(ds4_ple_worker_pool *pool);
+
 struct ds4_qwen4exp_session {
     ds4_qwen4exp_session_plan plan;
     uint32_t pos;
@@ -322,6 +363,9 @@ struct ds4_qwen4exp_session {
     uint32_t        spec_top1_rows;
     uint32_t        indexer_valid_blocks;
     uint32_t        head_cache_pos;
+
+    /* Persistent worker pool for PLE n-gram table prefill gather. */
+    ds4_ple_worker_pool ple_pool;
 
     /* Shared, position-independent. */
     ds4_gpu_tensor *inv_freq;
@@ -755,11 +799,17 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
         ds4_qwen4exp_session_close(s);
         return NULL;
     }
+    if (!ds4_ple_worker_pool_init(&s->ple_pool)) {
+        fprintf(stderr, "ds4: qwen4exp ple worker pool could not be initialized\n");
+        ds4_qwen4exp_session_close(s);
+        return NULL;
+    }
     return s;
 }
 
 void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     if (!s) return;
+    ds4_ple_worker_pool_destroy(&s->ple_pool);
     /* Graph nodes retain session buffer addresses, even across resets. */
     ds4_gpu_decode_graphs_invalidate();
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
@@ -976,17 +1026,6 @@ void ds4_qwen4exp_session_reset(ds4_qwen4exp_session *s) {
  * knob); a positive value pins the thread count.  Unset, the gather takes
  * the online CPUs capped at 16 -- enough to keep the SSD queue deep without
  * starving the decode path's own helpers. */
-typedef struct {
-    const ds4_qwen4exp_ple_table *ple;
-    const ds4_qwen4exp_session   *s;
-    const int32_t                *tokens;
-    uint32_t                      n_tokens;
-    uint32_t                      t0;
-    uint32_t                      t1;
-    uint32_t                      blocks_per_row;
-    int                           ok;
-} qw_ple_gather_seg;
-
 static void *qw_ple_gather_worker(void *arg) {
     qw_ple_gather_seg *seg = (qw_ple_gather_seg *)arg;
     ds4_ple_history local;
@@ -1028,6 +1067,118 @@ static void *qw_ple_gather_worker(void *arg) {
         }
     }
     return NULL;
+}
+
+static void *qw_ple_pool_worker_entry(void *arg) {
+    ds4_ple_worker_thread *w = (ds4_ple_worker_thread *)arg;
+    ds4_ple_worker_pool   *pool = w->pool;
+    const uint32_t         wid = w->worker_id;
+    uint32_t               last_gen = 0;
+
+    while (1) {
+        pthread_mutex_lock(&pool->mutex);
+        while (atomic_load_explicit(&pool->generation, memory_order_acquire) == last_gen &&
+               !atomic_load_explicit(&pool->stop, memory_order_acquire)) {
+            pthread_cond_wait(&pool->cv_work, &pool->mutex);
+        }
+        if (atomic_load_explicit(&pool->stop, memory_order_acquire)) {
+            pthread_mutex_unlock(&pool->mutex);
+            break;
+        }
+        last_gen = atomic_load_explicit(&pool->generation, memory_order_acquire);
+        pthread_mutex_unlock(&pool->mutex);
+
+        /* Check if this worker was assigned an active token segment */
+        bool run = false;
+        if (wid < pool->n_threads && pool->segs[wid].t0 < pool->segs[wid].n_tokens) {
+            run = true;
+        }
+
+        if (run) {
+            qw_ple_gather_worker(&pool->segs[wid]);
+
+            /* Fast atomic decrement. Only the last completing worker signals the main thread */
+            if (atomic_fetch_sub_explicit(&pool->workers_remaining, 1u, memory_order_acq_rel) == 1u) {
+                pthread_mutex_lock(&pool->mutex);
+                pthread_cond_signal(&pool->cv_done);
+                pthread_mutex_unlock(&pool->mutex);
+            }
+        }
+    }
+    return NULL;
+}
+
+static bool ds4_ple_worker_pool_init(ds4_ple_worker_pool *pool) {
+    if (!pool) return false;
+    memset(pool, 0, sizeof(*pool));
+
+    long nthreads = 1;
+    const char * const thr_env = getenv("DS4_QWEN4EXP_PLE_GATHER_THREADS");
+    if (thr_env && thr_env[0]) {
+        char *end = NULL;
+        long v = strtol(thr_env, &end, 10);
+        if (end != thr_env && v >= 0) nthreads = v;
+    } else {
+        nthreads = sysconf(_SC_NPROCESSORS_ONLN);
+        if (nthreads > (long)DS4_QWEN4EXP_PLE_MAX_THREADS) {
+            nthreads = (long)DS4_QWEN4EXP_PLE_MAX_THREADS;
+        }
+        if (nthreads < 1) nthreads = 1;
+    }
+
+    if (nthreads <= 1) {
+        pool->n_threads = 1;
+        pool->initialized = true;
+        return true;
+    }
+
+    pool->n_threads = (uint32_t)nthreads;
+    pthread_mutex_init(&pool->mutex, NULL);
+    pthread_cond_init(&pool->cv_work, NULL);
+    pthread_cond_init(&pool->cv_done, NULL);
+    atomic_init(&pool->generation, 0);
+    atomic_init(&pool->workers_remaining, 0);
+    atomic_init(&pool->stop, false);
+
+    uint32_t spawned = 1; /* thread 0 is the calling thread */
+    for (uint32_t i = 1; i < pool->n_threads; i++) {
+        pool->workers[i].pool = pool;
+        pool->workers[i].worker_id = i;
+        if (pthread_create(&pool->workers[i].thread, NULL,
+                           qw_ple_pool_worker_entry, &pool->workers[i]) == 0) {
+            spawned++;
+        } else {
+            fprintf(stderr,
+                    "ds4: warning: ple worker pool failed to spawn thread %u; "
+                    "clamping pool to %u threads\n", i, spawned);
+            pool->n_threads = spawned;
+            break;
+        }
+    }
+
+    pool->initialized = true;
+    return true;
+}
+
+static void ds4_ple_worker_pool_destroy(ds4_ple_worker_pool *pool) {
+    if (!pool || !pool->initialized) return;
+
+    if (pool->n_threads > 1) {
+        pthread_mutex_lock(&pool->mutex);
+        atomic_store_explicit(&pool->stop, true, memory_order_release);
+        atomic_fetch_add_explicit(&pool->generation, 1u, memory_order_release);
+        pthread_cond_broadcast(&pool->cv_work);
+        pthread_mutex_unlock(&pool->mutex);
+
+        for (uint32_t i = 1; i < pool->n_threads; i++) {
+            pthread_join(pool->workers[i].thread, NULL);
+        }
+
+        pthread_mutex_destroy(&pool->mutex);
+        pthread_cond_destroy(&pool->cv_work);
+        pthread_cond_destroy(&pool->cv_done);
+    }
+    pool->initialized = false;
 }
 
 static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
@@ -1114,21 +1265,10 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
          * disjoint token range; the tail thread's local history -- the state
          * a sequential scan would have ended with -- is copied back after
          * the join, so the session still carries the same history forward. */
-        long nthreads = 1;
-        const char * const thr_env =
-            getenv("DS4_QWEN4EXP_PLE_GATHER_THREADS");
-        if (thr_env && thr_env[0]) {
-            char *end = NULL;
-            long v = strtol(thr_env, &end, 10);
-            if (end != thr_env && v >= 0) nthreads = v;
-        } else {
-            nthreads = sysconf(_SC_NPROCESSORS_ONLN);
-            if (nthreads > 16) nthreads = 16;
-            if (nthreads < 1) nthreads = 1;
-        }
-        if (nthreads <= 1 || n_tokens < 64u) nthreads = 1;
+        uint32_t active_threads = s->ple_pool.n_threads;
+        if (active_threads > n_tokens) active_threads = n_tokens;
 
-        if (nthreads == 1) {
+        if (active_threads <= 1u || n_tokens < 64u) {
             ds4_ple_row_ids(&s->ple_constants, &s->ple_history, tokens,
                             n_tokens, s->ple_ids);
             for (uint32_t t = 0; t < n_tokens; t++) {
@@ -1151,65 +1291,70 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 }
             }
         } else {
-            if ((uint32_t)nthreads > n_tokens) nthreads = (long)n_tokens;
-            qw_ple_gather_seg *segs =
-                calloc((size_t)nthreads, sizeof(*segs));
-            pthread_t *tids = calloc((size_t)nthreads, sizeof(*tids));
-            if (!segs || !tids) {
-                free(segs);
-                free(tids);
-                fprintf(stderr,
-                        "ds4: qwen4exp PLE gather could not stage %ld threads\n",
-                        nthreads);
-                return false;
-            }
-            const uint32_t per = (n_tokens + (uint32_t)nthreads - 1u) /
-                                 (uint32_t)nthreads;
-            int spawned = 0;
-            for (long i = 0; i < nthreads; i++) {
-                const uint32_t t0 = (uint32_t)i * per;
-                if (t0 >= n_tokens) break;
+            const uint32_t per =
+                (n_tokens + active_threads - 1u) / active_threads;
+            uint32_t bg_workers_dispatched = 0;
+
+            for (uint32_t i = 0; i < active_threads; i++) {
+                const uint32_t t0 = i * per;
                 uint32_t t1 = t0 + per;
                 if (t1 > n_tokens) t1 = n_tokens;
-                segs[i].ple = &w->ple;
-                segs[i].s = s;
-                segs[i].tokens = tokens;
-                segs[i].n_tokens = n_tokens;
-                segs[i].t0 = t0;
-                segs[i].t1 = t1;
-                segs[i].blocks_per_row = blocks_per_row;
-                segs[i].ok = 0;
-                if (i == 0) {
-                    qw_ple_gather_worker(&segs[0]);
-                    spawned = 1;
-                } else if (pthread_create(&tids[i], NULL,
-                                          qw_ple_gather_worker,
-                                          &segs[i]) == 0) {
-                    spawned++;
-                } else {
-                    segs[i].ok = -1;   /* run it inline after the joins */
+                s->ple_pool.segs[i].ple = &w->ple;
+                s->ple_pool.segs[i].s = s;
+                s->ple_pool.segs[i].tokens = tokens;
+                s->ple_pool.segs[i].n_tokens = n_tokens;
+                s->ple_pool.segs[i].t0 = t0;
+                s->ple_pool.segs[i].t1 = t1;
+                s->ple_pool.segs[i].blocks_per_row = blocks_per_row;
+                s->ple_pool.segs[i].ok = 0;
+
+                if (i > 0 && t0 < n_tokens) {
+                    bg_workers_dispatched++;
                 }
             }
-            for (long i = 1; i < nthreads; i++) {
-                if (segs[i].t0 < n_tokens && segs[i].ok != -1) {
-                    pthread_join(tids[i], NULL);
-                }
+            for (uint32_t i = active_threads; i < s->ple_pool.n_threads; i++) {
+                s->ple_pool.segs[i].t0 = n_tokens;
+                s->ple_pool.segs[i].t1 = n_tokens;
+                s->ple_pool.segs[i].n_tokens = n_tokens;
+                s->ple_pool.segs[i].ok = 1;
             }
-            for (long i = 0; i < nthreads; i++) {
-                if (segs[i].t0 >= n_tokens) break;
-                if (segs[i].ok == -1) qw_ple_gather_worker(&segs[i]);
-                if (segs[i].ok != 1) {
+
+            if (bg_workers_dispatched > 0) {
+                atomic_store_explicit(&s->ple_pool.workers_remaining,
+                                      bg_workers_dispatched,
+                                      memory_order_release);
+                pthread_mutex_lock(&s->ple_pool.mutex);
+                atomic_fetch_add_explicit(&s->ple_pool.generation, 1u,
+                                          memory_order_release);
+                pthread_cond_broadcast(&s->ple_pool.cv_work);
+                pthread_mutex_unlock(&s->ple_pool.mutex);
+            }
+
+            /* Main thread executes segment 0 concurrently */
+            if (active_threads > 0 && s->ple_pool.segs[0].t0 < n_tokens) {
+                qw_ple_gather_worker(&s->ple_pool.segs[0]);
+            }
+
+            /* Wait for background workers to complete */
+            if (bg_workers_dispatched > 0) {
+                pthread_mutex_lock(&s->ple_pool.mutex);
+                while (atomic_load_explicit(&s->ple_pool.workers_remaining,
+                                            memory_order_acquire) > 0) {
+                    pthread_cond_wait(&s->ple_pool.cv_done, &s->ple_pool.mutex);
+                }
+                pthread_mutex_unlock(&s->ple_pool.mutex);
+            }
+
+            for (uint32_t i = 0; i < active_threads; i++) {
+                if (s->ple_pool.segs[i].t0 >= n_tokens) break;
+                if (s->ple_pool.segs[i].ok != 1) {
                     fprintf(stderr,
-                            "ds4: qwen4exp block %u gather segment %ld hashed "
+                            "ds4: qwen4exp block %u gather segment %u hashed "
                             "past the %" PRIu64 " rows the table holds\n",
                             il, i, w->ple.rows);
-                    free(segs);
-                    free(tids);
                     return false;
                 }
             }
-            free(segs);
-            free(tids);
             /* The carried history is the state after the LAST token; re-warm
              * a fresh history over the final (ngram - 1) tokens and leave it
              * in the session -- exactly what the sequential scan leaves. */
@@ -1283,14 +1428,25 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
                                      uint32_t n_tokens) {
     const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
 
-    if (!ds4_qwen4exp_matmul_q8_0(s->gdn_qkv, QW_MAP(m, l->attn_qkv),
-                                    QW_MAPSZ(m, l->attn_qkv), QW_OFF(l->attn_qkv),
-                                    DS4_N_EMBD, cfg->gdn_qkv_dim,
-                                    s->mixed, n_tokens) ||
-        !ds4_qwen4exp_matmul_q8_0(s->gdn_gate, QW_MAP(m, l->attn_gate),
-                                    QW_MAPSZ(m, l->attn_gate), QW_OFF(l->attn_gate),
-                                    DS4_N_EMBD, cfg->gdn_inner,
-                                    s->mixed, n_tokens) ||
+    /* Pre-quantize s->mixed ONCE for GDN qkv and gate projections */
+    const uint64_t q8_blocks = (uint64_t)DS4_N_EMBD / 32u;
+    const uint64_t q8_qbytes = (uint64_t)n_tokens * q8_blocks * 32u;
+    const uint64_t q8_soff = (q8_qbytes + 15u) & ~15ull;
+
+    if (!ds4_qwen4exp_quantize_q8_0(s->qsa_mixed_q8, 0, q8_soff, s->mixed,
+                                    DS4_N_EMBD, n_tokens)) {
+        fprintf(stderr, "ds4: qwen4exp GDN pre-quantize failed at block %u\n", il);
+        return false;
+    }
+
+    if (!ds4_qwen4exp_matmul_q8_0_preq(s->gdn_qkv, QW_MAP(m, l->attn_qkv),
+                                       QW_MAPSZ(m, l->attn_qkv), QW_OFF(l->attn_qkv),
+                                       DS4_N_EMBD, cfg->gdn_qkv_dim,
+                                       s->qsa_mixed_q8, 0, q8_soff, n_tokens) ||
+        !ds4_qwen4exp_matmul_q8_0_preq(s->gdn_gate, QW_MAP(m, l->attn_gate),
+                                       QW_MAPSZ(m, l->attn_gate), QW_OFF(l->attn_gate),
+                                       DS4_N_EMBD, cfg->gdn_inner,
+                                       s->qsa_mixed_q8, 0, q8_soff, n_tokens) ||
         !ds4_qwen4exp_matmul_f32(s->gdn_alpha, QW_MAP(m, l->ssm_alpha),
                                    QW_MAPSZ(m, l->ssm_alpha), QW_OFF(l->ssm_alpha),
                                    DS4_N_EMBD, DS4_N_GDN_VALUE_HEAD,
@@ -1469,12 +1625,10 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
     }
 
     const float scale = 1.0f / sqrtf((float)head_dim);
-    if (!ds4_gpu_qwen4exp_qsa_attention_tensor(
-            s->qsa_out, s->qsa_q, s->qsa_k[il], s->qsa_v[il], sel, counts,
+    if (!ds4_gpu_qwen4exp_qsa_attention_gated_tensor(
+            s->qsa_out, s->qsa_gate, s->qsa_q, s->qsa_k[il], s->qsa_v[il], sel, counts,
             n_tokens, DS4_N_HEAD, DS4_N_HEAD_KV, head_dim, pos0,
-            s->plan.n_ctx, max_selected, scale) ||
-        !ds4_gpu_qwen4exp_qsa_output_gate_tensor(s->qsa_out, s->qsa_gate,
-                                                 n_tokens * q_width)) {
+            s->plan.n_ctx, max_selected, scale)) {
         fprintf(stderr, "ds4: qwen4exp QSA attention failed at block %u\n", il);
         return false;
     }
