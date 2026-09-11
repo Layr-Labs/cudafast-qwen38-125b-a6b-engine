@@ -324,7 +324,6 @@ struct ds4_qwen4exp_session {
     uint32_t        head_cache_pos;
 
     /* Shared, position-independent. */
-    ds4_gpu_tensor *d_pos;
     ds4_gpu_tensor *inv_freq;
 
     /* Activations.  All sized for n_batch tokens and reused every layer. */
@@ -693,7 +692,6 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
         }
     }
 
-    s->d_pos = qwen4exp_alloc_zeroed(sizeof(uint32_t), &ok);
     s->inv_freq = qwen4exp_alloc_zeroed((uint64_t)DS4_N_ROT / 2u * f, &ok);
     if (ok) {
         float freqs[DS4_MAX_KDA_HEAD_DIM];
@@ -786,7 +784,6 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->ple_value);
     free(s->ple_ids);
     free(s->ple_rows_host);
-    ds4_gpu_tensor_free(s->d_pos);
     ds4_gpu_tensor_free(s->inv_freq);
     ds4_gpu_tensor_free(s->tokens);
     ds4_gpu_tensor_free(s->hyper);
@@ -1286,25 +1283,14 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
                                      uint32_t n_tokens) {
     const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
 
-    /* Pre-quantize s->mixed ONCE for GDN qkv and gate projections */
-    const uint64_t q8_blocks_gdn = (uint64_t)DS4_N_EMBD / 32u;
-    const uint64_t q8_qbytes_gdn = (uint64_t)n_tokens * q8_blocks_gdn * 32u;
-    const uint64_t q8_soff_gdn = (q8_qbytes_gdn + 15u) & ~15ull;
-
-    if (!ds4_qwen4exp_quantize_q8_0(s->qsa_mixed_q8, 0, q8_soff_gdn, s->mixed,
-                                    DS4_N_EMBD, n_tokens)) {
-        fprintf(stderr, "ds4: qwen4exp GDN pre-quantize failed at block %u\n", il);
-        return false;
-    }
-
-    if (!ds4_qwen4exp_matmul_q8_0_preq(s->gdn_qkv, QW_MAP(m, l->attn_qkv),
-                                       QW_MAPSZ(m, l->attn_qkv), QW_OFF(l->attn_qkv),
-                                       DS4_N_EMBD, cfg->gdn_qkv_dim,
-                                       s->qsa_mixed_q8, 0, q8_soff_gdn, n_tokens) ||
-        !ds4_qwen4exp_matmul_q8_0_preq(s->gdn_gate, QW_MAP(m, l->attn_gate),
-                                       QW_MAPSZ(m, l->attn_gate), QW_OFF(l->attn_gate),
-                                       DS4_N_EMBD, cfg->gdn_inner,
-                                       s->qsa_mixed_q8, 0, q8_soff_gdn, n_tokens) ||
+    if (!ds4_qwen4exp_matmul_q8_0(s->gdn_qkv, QW_MAP(m, l->attn_qkv),
+                                    QW_MAPSZ(m, l->attn_qkv), QW_OFF(l->attn_qkv),
+                                    DS4_N_EMBD, cfg->gdn_qkv_dim,
+                                    s->mixed, n_tokens) ||
+        !ds4_qwen4exp_matmul_q8_0(s->gdn_gate, QW_MAP(m, l->attn_gate),
+                                    QW_MAPSZ(m, l->attn_gate), QW_OFF(l->attn_gate),
+                                    DS4_N_EMBD, cfg->gdn_inner,
+                                    s->mixed, n_tokens) ||
         !ds4_qwen4exp_matmul_f32(s->gdn_alpha, QW_MAP(m, l->ssm_alpha),
                                    QW_MAPSZ(m, l->ssm_alpha), QW_OFF(l->ssm_alpha),
                                    DS4_N_EMBD, DS4_N_GDN_VALUE_HEAD,
@@ -1398,21 +1384,20 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
     }
 
     /* Fused Q-Prep: split doubled-query, per-head RMS norm, and RoPE in 1 launch */
-    if (!ds4_gpu_qwen4exp_qsa_prep_q_fused_dpos_tensor(
+    if (!ds4_gpu_qwen4exp_qsa_prep_q_fused_tensor(
             s->qsa_q, s->qsa_gate, s->qsa_doubled, s->attn_q_norm[il],
             s->inv_freq, n_tokens, DS4_N_HEAD, head_dim, DS4_N_ROT, pos0,
-            DS4_RMS_EPS, l->attn_q_norm_offset, s->d_pos)) {
+            DS4_RMS_EPS, l->attn_q_norm_offset)) {
         fprintf(stderr, "ds4: qwen4exp fused Q-prep failed at block %u\n", il);
         return false;
     }
 
     /* Fused KV-Prep & Append: per-head RMS norm on K, RoPE on K, and direct write into
      * k_cache and v_cache in 1 launch (no sync CPU memcpy) */
-    if (!ds4_gpu_qwen4exp_qsa_prep_kv_append_fused_dpos_tensor(
+    if (!ds4_gpu_qwen4exp_qsa_prep_kv_append_fused_tensor(
             s->qsa_k[il], s->qsa_v[il], s->qsa_kin, s->qsa_kin, s->qsa_vin,
             s->attn_k_norm[il], s->inv_freq, pos0, n_tokens, DS4_N_HEAD_KV,
-            head_dim, DS4_N_ROT, s->plan.n_ctx, DS4_RMS_EPS, l->attn_k_norm_offset,
-            s->d_pos)) {
+            head_dim, DS4_N_ROT, s->plan.n_ctx, DS4_RMS_EPS, l->attn_k_norm_offset)) {
         fprintf(stderr, "ds4: qwen4exp fused KV prep & append failed at block %u\n", il);
         return false;
     }
@@ -1445,11 +1430,11 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
         fprintf(stderr, "ds4: qwen4exp indexer projections failed at block %u\n", il);
         return false;
     }
-    if (!ds4_gpu_qwen4exp_qsa_indexer_pool_update_dpos_tensor(
+    if (!ds4_gpu_qwen4exp_qsa_indexer_pool_update_tensor(
             s->idx_pool[il], s->idx_tape[il], s->idx_k, s->idx_k_norm[il],
             s->inv_freq, pos0, n_tokens, s->plan.n_ctx,
             DS4_N_INDEXER_HEAD_DIM, ratio, DS4_N_ROT, DS4_RMS_EPS,
-            l->indexer_k_norm_offset, s->d_pos)) {
+            l->indexer_k_norm_offset)) {
         fprintf(stderr, "ds4: qwen4exp indexer pool update failed at block %u\n", il);
         return false;
     }
@@ -1484,10 +1469,10 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
     }
 
     const float scale = 1.0f / sqrtf((float)head_dim);
-    if (!ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
+    if (!ds4_gpu_qwen4exp_qsa_attention_tensor(
             s->qsa_out, s->qsa_q, s->qsa_k[il], s->qsa_v[il], sel, counts,
             n_tokens, DS4_N_HEAD, DS4_N_HEAD_KV, head_dim, pos0,
-            s->plan.n_ctx, max_selected, scale, s->d_pos) ||
+            s->plan.n_ctx, max_selected, scale) ||
         !ds4_gpu_qwen4exp_qsa_output_gate_tensor(s->qsa_out, s->qsa_gate,
                                                  n_tokens * q_width)) {
         fprintf(stderr, "ds4: qwen4exp QSA attention failed at block %u\n", il);
@@ -1685,10 +1670,10 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
     const ds4_gpu_qwen4exp_slab sh_gate_slab = QW_SLAB(m, l->ffn_gate_shexp);
     const ds4_gpu_qwen4exp_slab sh_up_slab = QW_SLAB(m, l->ffn_up_shexp);
     const ds4_gpu_qwen4exp_slab sh_down_slab = QW_SLAB(m, l->ffn_down_shexp);
-    if (!ds4_gpu_qwen4exp_shared_expert_preq_tensor(
+    if (!ds4_gpu_qwen4exp_shared_expert_tensor(
             s->block_out, s->shexp_mid, s->shexp_gate,
             &sh_router_slab, &sh_gate_slab, &sh_up_slab, &sh_down_slab,
-            DS4_N_EMBD, DS4_N_FF_SHEXP, DS4_N_EMBD, s->mixed, n_tokens, 1)) {
+            DS4_N_EMBD, DS4_N_FF_SHEXP, DS4_N_EMBD, s->mixed, n_tokens)) {
         fprintf(stderr, "ds4: qwen4exp shared expert failed at block %u\n", il);
         return false;
     }
@@ -1949,49 +1934,6 @@ static bool qwen4exp_graph_layer_island(
     return qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens, island);
 }
 
-static bool qwen4exp_graph_qsa_island(
-        ds4_qwen4exp_session *s, const ds4_qwen4exp_layer_weights *l,
-        const ds4_model *m, uint32_t il, uint32_t n_tokens) {
-    const bool qsa_capture_ok =
-        n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
-        (uint64_t)s->pos + n_tokens <= DS4_N_INDEXER_TOP_K &&
-        !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
-        ds4_gpu_decode_graphs_supported();
-    if (qsa_capture_ok) {
-        ds4_decode_graph_key key;
-        memset(&key, 0, sizeof(key));
-        key.il = il;
-        key.island = 2u;
-        key.variant = n_tokens | (s->spec_snapshot_rows << 8u);
-        key._pad = 0x5157454eu;
-        key.cur_hc = s->hyper;
-        key.after_attn_hc = s;
-        key.after_ffn_hc = (void *)l;
-        key.attn_norm = (void *)m;
-        const int state = ds4_gpu_decode_graph_begin(&key);
-        if (state == 1) {
-            QW_TRACE(QW_SLICE_QSA);
-            return true;
-        }
-        if (state == 0) {
-#ifdef DS4_TEST_HOOKS
-            const uint32_t trace_len = g_qwen4exp_trace_len;
-            const bool trace_overflow = g_qwen4exp_trace_overflow;
-#endif
-            if (qwen4exp_graph_qsa_block(s, l, m, il, n_tokens)) {
-                if (ds4_gpu_decode_graph_end(&key) == 0) return true;
-            } else {
-                ds4_gpu_decode_graph_abort(&key);
-            }
-#ifdef DS4_TEST_HOOKS
-            g_qwen4exp_trace_len = trace_len;
-            g_qwen4exp_trace_overflow = trace_overflow;
-#endif
-        }
-    }
-    return qwen4exp_graph_qsa_block(s, l, m, il, n_tokens);
-}
-
 /* ======================================================================
  * The forward.
  * ====================================================================== */
@@ -2147,9 +2089,6 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
      * than taking its own command buffer, and the blits that append to the KV
      * caches only work inside a batch at all.  qwen4exp_forward_fail() ends the
      * batch on the way out so a refusal does not leave one open. */
-    if (s->d_pos) {
-        ds4_gpu_qwen4exp_update_dpos(s->d_pos, s->pos);
-    }
     if (!ds4_gpu_begin_commands()) {
         fprintf(stderr, "ds4: qwen4exp could not open a command batch\n");
         return false;
@@ -2187,7 +2126,7 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
             return qwen4exp_forward_fail();
         }
         if (l->is_full_attention) {
-            if (!qwen4exp_graph_qsa_island(s, l, m, il, n_tokens)) {
+            if (!qwen4exp_graph_qsa_block(s, l, m, il, n_tokens)) {
                 return qwen4exp_forward_fail();
             }
             QW_TRACE(QW_SLICE_QSA);
@@ -2516,9 +2455,6 @@ int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
     const uint32_t saved_pos = s->pos;
     s->hyper = hyper;
     s->pos = pos0;
-    if (s->d_pos) {
-        ds4_gpu_qwen4exp_update_dpos(s->d_pos, s->pos);
-    }
 
     const ds4_qwen4exp_layer_weights *l = c->l;
     const ds4_model *m = c->m;
@@ -2563,9 +2499,6 @@ int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
 
     s->hyper = saved_hyper;
     s->pos = saved_pos;
-    if (s->d_pos) {
-        ds4_gpu_qwen4exp_update_dpos(s->d_pos, s->pos);
-    }
     if (!ok) {
         fprintf(stderr, "ds4: qwen4exp head block %u failed at the %s\n",
                 il, stage);

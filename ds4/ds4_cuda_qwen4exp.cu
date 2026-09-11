@@ -1996,6 +1996,14 @@ __global__ static void qwen4exp_moe_zero_invalid_kernel(
 #define QW_MMA_THREADS (QW_MMA_WARPS * 32)
 #define QW_MMA_NT (QW_MMA_BN / 16)
 
+/* The down projection has one weight tile and a shorter K loop.  Its former
+ * 64-row tile avoids doubling the block count without losing gate/up's
+ * latency-hiding benefit from the 32-row pipeline. */
+#define QW_DOWN_MMA_BM 64
+#define QW_DOWN_MMA_WARPS (QW_DOWN_MMA_BM / 16)
+#define QW_DOWN_MMA_THREADS (QW_DOWN_MMA_WARPS * 32)
+#define QW_DOWN_MMA_NT (QW_MMA_BN / 8)
+
 /* The pipeline gives every thread exactly one slot of each tile per chunk,
  * which is what makes the one-chunk-deep register prefetch enough. */
 static_assert(QW_MMA_BM * QW_MMA_G == QW_MMA_THREADS,
@@ -2455,7 +2463,7 @@ qwen4exp_moe_gateup_mma_kernel(
  * so the pair index addresses it directly.
  */
 template <int DownType = -1>
-__global__ __launch_bounds__(QW_MMA_THREADS) static void
+__global__ __launch_bounds__(QW_DOWN_MMA_THREADS) static void
 qwen4exp_moe_down_mma_kernel(
         float *partial,
         const char *down,
@@ -2471,19 +2479,17 @@ qwen4exp_moe_down_mma_kernel(
         uint32_t down_type,
         uint32_t groups,
         uint32_t out_dim) {
-    __shared__ __align__(16) int8_t sA[QW_MMA_BM * QW_MMA_LD];
+    __shared__ __align__(16) int8_t sA[QW_DOWN_MMA_BM * QW_MMA_LD];
     __shared__ __align__(16) int8_t sB[QW_MMA_BN * QW_MMA_LD];
-    __shared__ float  sWA[QW_MMA_BM * QW_MMA_G], sWB[QW_MMA_BM * QW_MMA_G];
+    __shared__ float  sWA[QW_DOWN_MMA_BM * QW_MMA_G];
+    __shared__ float  sWB[QW_DOWN_MMA_BM * QW_MMA_G];
     __shared__ float  sXS[QW_MMA_BN * QW_MMA_G], sXSUM[QW_MMA_BN * QW_MMA_G];
     __shared__ uint32_t sPair[QW_MMA_BN];
 
     const uint32_t tid  = threadIdx.x;
     const uint32_t warp = tid >> 5;
     const uint32_t lane = tid & 31;
-    /* This warp's quadrant of the tile. */
-    const uint32_t wr = (warp & 1u) * 16u;
-    const uint32_t wn = (warp >> 1) * 16u;
-    const uint32_t row0 = blockIdx.x * QW_MMA_BM;
+    const uint32_t row0 = blockIdx.x * QW_DOWN_MMA_BM;
     if (row0 >= out_dim) return;
     if (active && (int32_t)blockIdx.y >= active[0]) return;
     const uint32_t expert = active ? (uint32_t)active[1 + blockIdx.y]
@@ -2493,100 +2499,60 @@ qwen4exp_moe_down_mma_kernel(
     const int32_t base = offsets[expert];
     const char *down_e = down + (uint64_t)expert * down_expert_bytes;
 
-    /* One thread's slots, fixed for every chunk: a (row, group) of the weight
-     * tile and a (pair, group) of the activation tile. */
-    const uint32_t dec_r  = tid / QW_MMA_G;
-    const uint32_t dec_gg = tid - dec_r * QW_MMA_G;
-    const uint32_t dec_orow = row0 + dec_r;
-    const uint32_t act_tk = tid / QW_MMA_G;
-    const uint32_t act_gg = tid - act_tk * QW_MMA_G;
-    const char *down_row = down_e + (uint64_t)dec_orow * down_row_bytes;
-
     for (int32_t nbase = 0; nbase < cnt; nbase += QW_MMA_BN) {
         const int32_t take = (cnt - nbase) < QW_MMA_BN ? (cnt - nbase)
                                                        : QW_MMA_BN;
-        for (uint32_t i = tid; i < QW_MMA_BN; i += QW_MMA_THREADS) {
+        for (uint32_t i = tid; i < QW_MMA_BN; i += QW_DOWN_MMA_THREADS) {
             sPair[i] = (int32_t)i < take
                 ? (uint32_t)pairs[base + nbase + i] : 0xffffffffu;
         }
         __syncthreads();
 
-        /* The raw bytes chunk zero decodes from. */
-        uint32_t raww[8], rawb[8];
-        int havew = 0, haveb = 0;
-        float act_scale = 0.0f, act_sum = 0.0f;
-        if (dec_orow < out_dim && dec_gg < groups) {
-            havew = qw_raw_load(down_type, down_row, dec_gg, raww);
-        }
-        if (sPair[act_tk] != 0xffffffffu && act_gg < groups) {
-            const uint64_t at_g = (uint64_t)sPair[act_tk] * groups + act_gg;
-            const uint32_t *qw =
-                    (const uint32_t *)(const void *)(mq + at_g * 32u);
+        float acc[QW_DOWN_MMA_NT * 4];
 #pragma unroll
-            for (int i = 0; i < 8; i++) rawb[i] = qw[i];
-            act_scale = ms[at_g];
-            act_sum = (float)msum[at_g];
-            haveb = 1;
-        }
-
-        float acc[QW_MMA_NT * 4];
-#pragma unroll
-        for (int i = 0; i < QW_MMA_NT * 4; i++) acc[i] = 0.0f;
+        for (int i = 0; i < QW_DOWN_MMA_NT * 4; i++) acc[i] = 0.0f;
 
         for (uint32_t kc = 0; kc < groups; kc += QW_MMA_G) {
             __syncthreads();
-            /* Weight tile: this thread's one (row, group) of 32, decoded from
-             * registers into the eight words of the tile row. */
-            {
-                const uint32_t g = kc + dec_gg;
-                if (dec_orow < out_dim && g < groups) {
-                    float wa[2], wb[2];
-                    dev_qwen4exp_group_decode_w(
-                            DownType < 0 ? down_type : (uint32_t)DownType, down_row, g,
-                            havew ? raww : NULL,
-                            &sA[dec_r * QW_MMA_LD + dec_gg * 32], wa, wb);
-                    sWA[dec_r * QW_MMA_G + dec_gg] = wa[0];
-                    sWB[dec_r * QW_MMA_G + dec_gg] = wb[0];
+            for (uint32_t idx = tid; idx < QW_DOWN_MMA_BM * QW_MMA_G;
+                 idx += QW_DOWN_MMA_THREADS) {
+                const uint32_t r = idx / QW_MMA_G;
+                const uint32_t gg = idx - r * QW_MMA_G;
+                const uint32_t g = kc + gg;
+                const uint32_t orow = row0 + r;
+                int8_t wq[32];
+                float wa[2], wb[2];
+                int halves = 1;
+                if (orow < out_dim && g < groups) {
+                    dev_qwen4exp_group_decode(
+                            DownType < 0 ? down_type : (uint32_t)DownType,
+                            down_e + (uint64_t)orow * down_row_bytes, g,
+                            wq, wa, wb, &halves);
+                    qw_tile_store_group(&sA[r * QW_MMA_LD + gg * 32], wq);
+                    sWA[r * QW_MMA_G + gg] = wa[0];
+                    sWB[r * QW_MMA_G + gg] = wb[0];
                 } else {
-                    qw_tile_store_zero(&sA[dec_r * QW_MMA_LD + dec_gg * 32]);
-                    sWA[dec_r * QW_MMA_G + dec_gg] = 0.0f;
-                    sWB[dec_r * QW_MMA_G + dec_gg] = 0.0f;
+                    qw_tile_store_zero(&sA[r * QW_MMA_LD + gg * 32]);
+                    sWA[r * QW_MMA_G + gg] = 0.0f;
+                    sWB[r * QW_MMA_G + gg] = 0.0f;
                 }
             }
-            /* Activation tile: a padded pair row is zero, and zero contributes
-             * nothing to an integer dot, so the pad is exact. */
-            if (haveb && kc + act_gg < groups) {
-                qw_tile_store_words(&sB[act_tk * QW_MMA_LD + act_gg * 32],
-                                    rawb);
-                sXS  [act_tk * QW_MMA_G + act_gg] = act_scale;
-                sXSUM[act_tk * QW_MMA_G + act_gg] = act_sum;
-            } else {
-                qw_tile_store_zero(&sB[act_tk * QW_MMA_LD + act_gg * 32]);
-                sXS  [act_tk * QW_MMA_G + act_gg] = 0.0f;
-                sXSUM[act_tk * QW_MMA_G + act_gg] = 0.0f;
-            }
-            /* Chunk kc+G's raw bytes, issued now so they land while the MMA
-             * below runs. */
-            if (kc + QW_MMA_G < groups) {
-                const uint32_t g = kc + QW_MMA_G + dec_gg;
-                if (dec_orow < out_dim && g < groups) {
-                    havew = qw_raw_load(down_type, down_row, g, raww);
+            for (uint32_t idx = tid; idx < QW_MMA_BN * QW_MMA_G;
+                 idx += QW_DOWN_MMA_THREADS) {
+                const uint32_t tk = idx / QW_MMA_G;
+                const uint32_t gg = idx - tk * QW_MMA_G;
+                const uint32_t g = kc + gg;
+                const uint32_t p = sPair[tk];
+                if (p != 0xffffffffu && g < groups) {
+                    const uint64_t at = (uint64_t)p * groups + g;
+                    qw_tile_copy_group(&sB[tk * QW_MMA_LD + gg * 32],
+                                       mq + at * 32u);
+                    sXS  [tk * QW_MMA_G + gg] = ms[at];
+                    sXSUM[tk * QW_MMA_G + gg] = (float)msum[at];
                 } else {
-                    havew = 0;
-                }
-                const uint32_t ga = kc + QW_MMA_G + act_gg;
-                if (sPair[act_tk] != 0xffffffffu && ga < groups) {
-                    const uint64_t at_g =
-                            (uint64_t)sPair[act_tk] * groups + ga;
-                    const uint32_t *qw =
-                            (const uint32_t *)(const void *)(mq + at_g * 32u);
-#pragma unroll
-                    for (int i = 0; i < 8; i++) rawb[i] = qw[i];
-                    act_scale = ms[at_g];
-                    act_sum = (float)msum[at_g];
-                    haveb = 1;
-                } else {
-                    haveb = 0;
+                    qw_tile_store_zero(&sB[tk * QW_MMA_LD + gg * 32]);
+                    sXS[tk * QW_MMA_G + gg] = 0.0f;
+                    sXSUM[tk * QW_MMA_G + gg] = 0.0f;
                 }
             }
             __syncthreads();
@@ -2594,7 +2560,7 @@ qwen4exp_moe_down_mma_kernel(
 #pragma unroll
             for (int gg = 0; gg < QW_MMA_G; gg++) {
                 if (kc + (uint32_t)gg >= groups) break;
-                const uint32_t ar = wr + (lane >> 2);
+                const uint32_t ar = warp * 16u + (lane >> 2);
                 const uint32_t ak = (lane & 3u) * 4u;
                 uint32_t af[4], bf[2];
 #pragma unroll
@@ -2603,15 +2569,15 @@ qwen4exp_moe_down_mma_kernel(
                     const uint32_t kk = gg * 32u + ak + ((r & 2) ? 16u : 0u);
                     af[r] = qw_tile_word(&sA[rr * QW_MMA_LD + kk]);
                 }
-                const uint32_t m0 = wr + (lane >> 2);
+                const uint32_t m0 = warp * 16u + (lane >> 2);
 #pragma unroll
-                for (int nt = 0; nt < QW_MMA_NT; nt++) {
+                for (int nt = 0; nt < QW_DOWN_MMA_NT; nt++) {
                     /* An MMA column covers eight pairs.  Expert tails often
                      * occupy only one or two columns; whole empty columns
                      * have no consumer.  take is block-uniform, so all lanes
                      * still participate in every live MMA instruction. */
-                    if (wn + nt * 8u >= take) break;
-                    const uint32_t bn = wn + nt * 8u + (lane >> 2);
+                    if (nt * 8 >= take) break;
+                    const uint32_t bn = nt * 8u + (lane >> 2);
 #pragma unroll
                     for (int r = 0; r < 2; r++) {
                         bf[r] = qw_tile_word(&sB[bn * QW_MMA_LD + gg * 32u +
@@ -2620,7 +2586,7 @@ qwen4exp_moe_down_mma_kernel(
                     }
                     int32_t d[4] = {0, 0, 0, 0};
                     qw_mma_m16n8k32(d, af, bf);
-                    const uint32_t n0 = wn + nt * 8u + (lane & 3u) * 2u;
+                    const uint32_t n0 = nt * 8u + (lane & 3u) * 2u;
 #pragma unroll
                     for (int r = 0; r < 4; r++) {
                         const uint32_t mr = m0 + ((r & 2) ? 8u : 0u);
@@ -2636,12 +2602,12 @@ qwen4exp_moe_down_mma_kernel(
             }
         }
 
-        const uint32_t m0 = wr + (lane >> 2);
+        const uint32_t m0 = warp * 16u + (lane >> 2);
 #pragma unroll
-        for (int nt = 0; nt < QW_MMA_NT; nt++) {
+        for (int nt = 0; nt < QW_DOWN_MMA_NT; nt++) {
 #pragma unroll
             for (int r = 0; r < 4; r++) {
-                const uint32_t nn = wn + nt * 8u + (lane & 3u) * 2u + (r & 1);
+                const uint32_t nn = nt * 8u + (lane & 3u) * 2u + (r & 1);
                 if ((int32_t)nn >= take) continue;
                 const uint32_t mr = m0 + ((r & 2) ? 8u : 0u);
                 const uint32_t orow = row0 + mr;
@@ -4369,16 +4335,16 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             logical_tier, idx_bytes + pair_bytes + xq_bytes + mq_bytes);
     if (!base) return 0;
     qwen4exp_moe_scratch sc;
-    sc.xq = (int8_t *)base;
-    sc.xs = (float *)(base + (uint64_t)n_tokens * xgroups * 32u);
-    sc.xsum = (int32_t *)(sc.xs + (uint64_t)n_tokens * xgroups);
-    char *at = base + xq_bytes;
-    sc.counts = (int32_t *)at;
+    sc.counts = (int32_t *)base;
     sc.offsets = sc.counts + n_total_expert;
     sc.cursor = sc.offsets + n_total_expert;
     sc.active = sc.cursor + n_total_expert;
     sc.pairs = sc.active + n_total_expert + 1u;
-    at += idx_bytes + pair_bytes;
+    char *at = base + idx_bytes + pair_bytes;
+    sc.xq = (int8_t *)at;
+    sc.xs = (float *)(at + (uint64_t)n_tokens * xgroups * 32u);
+    sc.xsum = (int32_t *)(sc.xs + (uint64_t)n_tokens * xgroups);
+    at += xq_bytes;
     sc.mq = (int8_t *)at;
     sc.ms = (float *)(at + (uint64_t)n_pairs * mgroups * 32u);
     sc.msum = (int32_t *)(sc.ms + (uint64_t)n_pairs * mgroups);
@@ -4543,13 +4509,13 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         QWEN4EXP_DOWN_IMPL(R, -1); \
     } \
 } while (0)
-    const int down_mma = use_mma && (out_dim % QW_MMA_BM) == 0 &&
+    const int down_mma = use_mma && (out_dim % QW_DOWN_MMA_BM) == 0 &&
                          down_slab->type != (uint32_t)DS4_QWEN4EXP_TY_q6_K;
     if (down_mma) {
 #define QWEN4EXP_DOWN_MMA(DT) \
         qwen4exp_moe_down_mma_kernel<DT><<< \
-                dim3(out_dim / QW_MMA_BM, gu_rows, 1), \
-                QW_MMA_THREADS, 0, stream>>>( \
+                dim3(out_dim / QW_DOWN_MMA_BM, gu_rows, 1), \
+                QW_DOWN_MMA_THREADS, 0, stream>>>( \
                 (float *)down_partial->ptr, down, sc.mq, sc.ms, sc.msum, \
                 sc.pairs, sc.counts, sc.offsets, gu_active, \
                 down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
@@ -4581,7 +4547,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     return cuda_ok(cudaGetLastError(), "qwen4exp MoE down launch");
 }
 
-extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
+extern "C" int ds4_gpu_qwen4exp_shared_expert_tensor(
         ds4_gpu_tensor              *out,
         ds4_gpu_tensor              *mid,
         ds4_gpu_tensor              *gate_scale,
@@ -4593,8 +4559,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         uint32_t                     mid_dim,
         uint32_t                     out_dim,
         const ds4_gpu_tensor        *x,
-        uint32_t                     n_tokens,
-        int                          pre_quantized) {
+        uint32_t                     n_tokens) {
     if (!out || !mid || !gate_scale || !x ||
         !router_slab || !gate_slab || !up_slab || !down_slab ||
         !router_slab->map || !gate_slab->map || !up_slab->map || !down_slab->map ||
@@ -4650,25 +4615,23 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
 
     const uint32_t xgroups = in_dim / 32u;
     const uint32_t mgroups = mid_dim / 32u;
-    const uint64_t xq_bytes = qwen4exp_quant_bytes(n_tokens, xgroups);
-    const uint64_t mq_bytes = qwen4exp_quant_bytes(n_tokens, mgroups);
     char *base = (char *)qwen4exp_group_scratch(
-            logical_tier, xq_bytes + mq_bytes);
+            logical_tier,
+            qwen4exp_quant_bytes(n_tokens, xgroups) +
+            qwen4exp_quant_bytes(n_tokens, mgroups));
     if (!base) return 0;
     int8_t *xq = (int8_t *)base;
     float *xs = (float *)(base + (uint64_t)n_tokens * xgroups * 32u);
     int32_t *xsum = (int32_t *)(xs + (uint64_t)n_tokens * xgroups);
-    char *at = base + xq_bytes;
+    char *at = base + qwen4exp_quant_bytes(n_tokens, xgroups);
     int8_t *mq = (int8_t *)at;
     float *ms = (float *)(at + (uint64_t)n_tokens * mgroups * 32u);
     int32_t *msum = (int32_t *)(ms + (uint64_t)n_tokens * mgroups);
 
-    if (!pre_quantized) {
-        if (!qwen4exp_quantize_rows(xq, xs, xsum, (const float *)x->ptr,
-                                    n_tokens, in_dim, xgroups, in_dim, 0, 1,
-                                    stream)) {
-            return 0;
-        }
+    if (!qwen4exp_quantize_rows(xq, xs, xsum, (const float *)x->ptr,
+                                n_tokens, in_dim, xgroups, in_dim, 0, 1,
+                                stream)) {
+        return 0;
     }
 
     const int tile = qwen4exp_moe_tile(n_tokens);
@@ -5827,8 +5790,7 @@ __global__ static void qwen4exp_rope_head_kernel(
         uint32_t n_head,
         uint32_t head_dim,
         uint32_t rot_dim,
-        uint32_t pos0,
-        const uint32_t *d_pos) {
+        uint32_t pos0) {
     const uint32_t rot_half = rot_dim / 2u;
     const uint32_t per_token = n_head * rot_half;
     const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -5839,9 +5801,8 @@ __global__ static void qwen4exp_rope_head_kernel(
     const uint32_t head = lane / rot_half;
     const uint32_t d = lane % rot_half;
 
-    const uint32_t p0 = d_pos ? *d_pos : pos0;
     float *vec = x + ((uint64_t)token * n_head + head) * head_dim;
-    const float theta = (float)(p0 + token) * inv_freq[d];
+    const float theta = (float)(pos0 + token) * inv_freq[d];
     const float c = cosf(theta);
     const float s = sinf(theta);
     const float x1 = vec[d];
@@ -5866,8 +5827,7 @@ __global__ static void qwen4exp_qsa_prep_q_fused_kernel(
         uint32_t                   rot_dim,
         uint32_t                   pos0,
         float                      eps,
-        float                      weight_offset,
-        const uint32_t *           d_pos) {
+        float                      weight_offset) {
     extern __shared__ float qwen4exp_qprep_shared[];
 
     const uint32_t head = blockIdx.x;
@@ -5904,10 +5864,9 @@ __global__ static void qwen4exp_qsa_prep_q_fused_kernel(
     __syncthreads();
 
     /* 3. Partial RoPE rotary embedding (rot_half = rot_dim / 2) */
-    const uint32_t p0 = d_pos ? *d_pos : pos0;
     const uint32_t rot_half = rot_dim / 2u;
     if (tid < rot_half) {
-        const float theta = (float)(p0 + token) * inv_freq[tid];
+        const float theta = (float)(pos0 + token) * inv_freq[tid];
         const float c = cosf(theta);
         const float s = sinf(theta);
         const float x1 = qwen4exp_qprep_shared[tid];
@@ -5938,8 +5897,7 @@ __global__ static void qwen4exp_qsa_prep_kv_append_fused_kernel(
         uint32_t                   rot_dim,
         uint32_t                   cache_cap,
         float                      eps,
-        float                      weight_offset,
-        const uint32_t *           d_pos) {
+        float                      weight_offset) {
     extern __shared__ float qwen4exp_kvprep_shared[];
 
     const uint32_t head = blockIdx.x;
@@ -5950,8 +5908,7 @@ __global__ static void qwen4exp_qsa_prep_kv_append_fused_kernel(
     const uint32_t nth = blockDim.x;
     const uint32_t kv_dim = n_head_kv * head_dim;
     const uint64_t token_elem = (uint64_t)token * kv_dim + head * head_dim + tid;
-    const uint32_t p0 = d_pos ? *d_pos : pos0;
-    const uint32_t pos = p0 + token;
+    const uint32_t pos = pos0 + token;
 
     /* 1. Append V directly into v_cache */
     if (tid < head_dim) {
@@ -5982,7 +5939,7 @@ __global__ static void qwen4exp_qsa_prep_kv_append_fused_kernel(
     /* 3. Partial RoPE on K */
     const uint32_t rot_half = rot_dim / 2u;
     if (tid < rot_half) {
-        const float theta = (float)(p0 + token) * inv_freq[tid];
+        const float theta = (float)(pos0 + token) * inv_freq[tid];
         const float c = cosf(theta);
         const float s = sinf(theta);
         const float x1 = qwen4exp_kvprep_shared[tid];
@@ -6013,14 +5970,12 @@ __global__ static void qwen4exp_qsa_tape_append_kernel(
         uint32_t n_tokens,
         uint32_t head_dim,
         uint32_t pos0,
-        uint32_t cache_cap,
-        const uint32_t *d_pos) {
+        uint32_t cache_cap) {
     const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= (uint64_t)n_tokens * head_dim) return;
     const uint32_t token = (uint32_t)(gid / head_dim);
     const uint32_t d = (uint32_t)(gid - (uint64_t)token * head_dim);
-    const uint32_t p0 = d_pos ? *d_pos : pos0;
-    const uint32_t pos = p0 + token;
+    const uint32_t pos = pos0 + token;
     if (pos >= cache_cap) return;
     tape[(uint64_t)pos * head_dim + d] = raw_k[gid];
 }
@@ -6037,23 +5992,13 @@ __global__ static void qwen4exp_qsa_pool_update_kernel(
         uint32_t rot_dim,
         uint32_t cache_cap,
         float eps,
-        float weight_offset,
-        const uint32_t *d_pos,
-        uint32_t n_tokens) {
+        float weight_offset) {
     extern __shared__ float qwen4exp_pool_shared[];
+    const uint32_t slot = blockIdx.x;
     const uint32_t tid = threadIdx.x;
     const uint32_t nth = blockDim.x;
-
-    uint32_t block;
-    if (d_pos) {
-        const uint32_t p0 = *d_pos;
-        if (((p0 + n_tokens) % pool_size) != 0u) return;
-        block = (p0 + n_tokens) / pool_size - 1u;
-    } else {
-        const uint32_t slot = blockIdx.x;
-        if (slot >= n_blocks) return;
-        block = block0 + slot;
-    }
+    if (slot >= n_blocks) return;
+    const uint32_t block = block0 + slot;
     if ((block + 1u) * pool_size > cache_cap) return;
 
     float *vec = qwen4exp_pool_shared;
@@ -6222,8 +6167,7 @@ __global__ static void qwen4exp_qsa_attention_kernel(
         uint32_t cache_cap,
         uint32_t max_selected,
         uint32_t sparse,
-        float scale,
-        const uint32_t *d_pos) {
+        float scale) {
     extern __shared__ __align__(16) float qwen4exp_attn_shared[];
     const uint32_t head = blockIdx.x;
     const uint32_t token = blockIdx.y;
@@ -6236,8 +6180,7 @@ __global__ static void qwen4exp_qsa_attention_kernel(
     float *probs = tile + nth;
     int32_t *keys = (int32_t *)(probs + nth);
 
-    const uint32_t p0 = d_pos ? *d_pos : pos0;
-    const uint32_t pos = p0 + token;
+    const uint32_t pos = pos0 + token;
     const uint32_t count = sparse ? (uint32_t)counts[token] : pos + 1u;
     const uint32_t kv_head = head / (n_head / n_kv_head);
     const uint32_t kv_stride = n_kv_head * head_dim;
@@ -6422,8 +6365,7 @@ __global__ static void qwen4exp_qsa_attention_group_kernel(
         uint32_t cache_cap,
         uint32_t max_selected,
         uint32_t sparse,
-        float scale,
-        const uint32_t *d_pos) {
+        float scale) {
     extern __shared__ __align__(16) float qwen4exp_attn_grp_shared[];
     const uint32_t group = blockIdx.x;
     const uint32_t token = blockIdx.y;
@@ -6437,8 +6379,7 @@ __global__ static void qwen4exp_qsa_attention_group_kernel(
     float *probs = tile + nth;                       /* GROUP * nth      */
     int32_t *keys = (int32_t *)(probs + GROUP * nth);/* nth              */
 
-    const uint32_t p0 = d_pos ? *d_pos : pos0;
-    const uint32_t pos = p0 + token;
+    const uint32_t pos = pos0 + token;
     const uint32_t count = sparse ? (uint32_t)counts[token] : pos + 1u;
     const uint32_t kv_head = head0 / (n_head / n_kv_head);
     const uint32_t kv_stride = n_kv_head * head_dim;
@@ -6750,15 +6691,14 @@ extern "C" int ds4_gpu_qwen4exp_head_rms_norm_tensor(
     return cuda_ok(cudaGetLastError(), "Qwen4-Exp head RMS norm launch");
 }
 
-extern "C" int ds4_gpu_qwen4exp_rope_head_dpos_tensor(
+extern "C" int ds4_gpu_qwen4exp_rope_head_tensor(
         ds4_gpu_tensor       *x,
         const ds4_gpu_tensor *inv_freq,
         uint32_t              n_tokens,
         uint32_t              n_head,
         uint32_t              head_dim,
         uint32_t              rot_dim,
-        uint32_t              pos0,
-        const ds4_gpu_tensor *d_pos) {
+        uint32_t              pos0) {
     if (n_tokens == 0u || n_head == 0u || head_dim == 0u || rot_dim == 0u ||
         rot_dim > head_dim || (rot_dim % 2u) != 0u ||
         !glm53_cuda_tensor_has(x, (uint64_t)n_tokens * n_head * head_dim, sizeof(float)) ||
@@ -6769,54 +6709,8 @@ extern "C" int ds4_gpu_qwen4exp_rope_head_dpos_tensor(
     qwen4exp_rope_head_kernel<<<
         (unsigned)((total + 255u) / 256u), 256u, 0, cuda_decode_stream()>>>(
             (float *)x->ptr, (const float *)inv_freq->ptr, n_tokens, n_head,
-            head_dim, rot_dim, pos0, d_pos ? (const uint32_t *)d_pos->ptr : NULL);
+            head_dim, rot_dim, pos0);
     return cuda_ok(cudaGetLastError(), "Qwen4-Exp partial rope launch");
-}
-
-extern "C" int ds4_gpu_qwen4exp_rope_head_tensor(
-        ds4_gpu_tensor       *x,
-        const ds4_gpu_tensor *inv_freq,
-        uint32_t              n_tokens,
-        uint32_t              n_head,
-        uint32_t              head_dim,
-        uint32_t              rot_dim,
-        uint32_t              pos0) {
-    return ds4_gpu_qwen4exp_rope_head_dpos_tensor(
-            x, inv_freq, n_tokens, n_head, head_dim, rot_dim, pos0, NULL);
-}
-
-extern "C" int ds4_gpu_qwen4exp_qsa_prep_q_fused_dpos_tensor(
-        ds4_gpu_tensor       *q,
-        ds4_gpu_tensor       *gate,
-        const ds4_gpu_tensor *doubled,
-        const ds4_gpu_tensor *weight,
-        const ds4_gpu_tensor *inv_freq,
-        uint32_t              n_tokens,
-        uint32_t              n_head,
-        uint32_t              head_dim,
-        uint32_t              rot_dim,
-        uint32_t              pos0,
-        float                 eps,
-        float                 weight_offset,
-        const ds4_gpu_tensor *d_pos) {
-    if (n_tokens == 0u || n_head == 0u || head_dim == 0u || rot_dim == 0u ||
-        rot_dim > head_dim || (rot_dim % 2u) != 0u) return 0;
-    const uint64_t q_elems = (uint64_t)n_tokens * n_head * head_dim;
-    if (!glm53_cuda_tensor_has(q, q_elems, sizeof(float)) ||
-        !glm53_cuda_tensor_has(gate, q_elems, sizeof(float)) ||
-        !glm53_cuda_tensor_has(doubled, 2u * q_elems, sizeof(float)) ||
-        !glm53_cuda_tensor_has(weight, head_dim, sizeof(float)) ||
-        !glm53_cuda_tensor_has(inv_freq, rot_dim / 2u, sizeof(float))) {
-        return 0;
-    }
-    const dim3 grid(n_head, n_tokens);
-    const uint32_t nth = qwen4exp_cuda_threads(head_dim);
-    qwen4exp_qsa_prep_q_fused_kernel<<<grid, nth, nth * sizeof(float), cuda_decode_stream()>>>(
-            (const float *)doubled->ptr, (const float *)weight->ptr,
-            (const float *)inv_freq->ptr, (float *)q->ptr, (float *)gate->ptr,
-            n_tokens, n_head, head_dim, rot_dim, pos0, eps, weight_offset,
-            d_pos ? (const uint32_t *)d_pos->ptr : NULL);
-    return cuda_ok(cudaGetLastError(), "Qwen4-Exp fused Q-prep launch");
 }
 
 extern "C" int ds4_gpu_qwen4exp_qsa_prep_q_fused_tensor(
@@ -6832,12 +6726,26 @@ extern "C" int ds4_gpu_qwen4exp_qsa_prep_q_fused_tensor(
         uint32_t              pos0,
         float                 eps,
         float                 weight_offset) {
-    return ds4_gpu_qwen4exp_qsa_prep_q_fused_dpos_tensor(
-            q, gate, doubled, weight, inv_freq, n_tokens, n_head, head_dim,
-            rot_dim, pos0, eps, weight_offset, NULL);
+    if (n_tokens == 0u || n_head == 0u || head_dim == 0u || rot_dim == 0u ||
+        rot_dim > head_dim || (rot_dim % 2u) != 0u) return 0;
+    const uint64_t q_elems = (uint64_t)n_tokens * n_head * head_dim;
+    if (!glm53_cuda_tensor_has(q, q_elems, sizeof(float)) ||
+        !glm53_cuda_tensor_has(gate, q_elems, sizeof(float)) ||
+        !glm53_cuda_tensor_has(doubled, 2u * q_elems, sizeof(float)) ||
+        !glm53_cuda_tensor_has(weight, head_dim, sizeof(float)) ||
+        !glm53_cuda_tensor_has(inv_freq, rot_dim / 2u, sizeof(float))) {
+        return 0;
+    }
+    const dim3 grid(n_head, n_tokens);
+    const uint32_t nth = qwen4exp_cuda_threads(head_dim);
+    qwen4exp_qsa_prep_q_fused_kernel<<<grid, nth, nth * sizeof(float), cuda_decode_stream()>>>(
+            (const float *)doubled->ptr, (const float *)weight->ptr,
+            (const float *)inv_freq->ptr, (float *)q->ptr, (float *)gate->ptr,
+            n_tokens, n_head, head_dim, rot_dim, pos0, eps, weight_offset);
+    return cuda_ok(cudaGetLastError(), "Qwen4-Exp fused Q-prep launch");
 }
 
-extern "C" int ds4_gpu_qwen4exp_qsa_prep_kv_append_fused_dpos_tensor(
+extern "C" int ds4_gpu_qwen4exp_qsa_prep_kv_append_fused_tensor(
         ds4_gpu_tensor       *k_cache,
         ds4_gpu_tensor       *v_cache,
         ds4_gpu_tensor       *k_out,
@@ -6852,10 +6760,9 @@ extern "C" int ds4_gpu_qwen4exp_qsa_prep_kv_append_fused_dpos_tensor(
         uint32_t              rot_dim,
         uint32_t              cache_cap,
         float                 eps,
-        float                 weight_offset,
-        const ds4_gpu_tensor *d_pos) {
+        float                 weight_offset) {
     if (n_tokens == 0u || n_head_kv == 0u || head_dim == 0u || rot_dim == 0u ||
-        rot_dim > head_dim || (rot_dim % 2u) != 0u || (!d_pos && (uint64_t)pos0 + n_tokens > cache_cap)) {
+        rot_dim > head_dim || (rot_dim % 2u) != 0u || (uint64_t)pos0 + n_tokens > cache_cap) {
         return 0;
     }
     const uint64_t kv_elems = (uint64_t)n_tokens * n_head_kv * head_dim;
@@ -6879,94 +6786,8 @@ extern "C" int ds4_gpu_qwen4exp_qsa_prep_kv_append_fused_dpos_tensor(
             (float *)k_cache->ptr, (float *)v_cache->ptr,
             k_out ? (float *)k_out->ptr : NULL,
             pos0, n_tokens, n_head_kv, head_dim, rot_dim, cache_cap,
-            eps, weight_offset, d_pos ? (const uint32_t *)d_pos->ptr : NULL);
+            eps, weight_offset);
     return cuda_ok(cudaGetLastError(), "Qwen4-Exp fused KV prep & append launch");
-}
-
-extern "C" int ds4_gpu_qwen4exp_qsa_prep_kv_append_fused_tensor(
-        ds4_gpu_tensor       *k_cache,
-        ds4_gpu_tensor       *v_cache,
-        ds4_gpu_tensor       *k_out,
-        const ds4_gpu_tensor *raw_k,
-        const ds4_gpu_tensor *raw_v,
-        const ds4_gpu_tensor *weight,
-        const ds4_gpu_tensor *inv_freq,
-        uint32_t              pos0,
-        uint32_t              n_tokens,
-        uint32_t              n_head_kv,
-        uint32_t              head_dim,
-        uint32_t              rot_dim,
-        uint32_t              cache_cap,
-        float                 eps,
-        float                 weight_offset) {
-    return ds4_gpu_qwen4exp_qsa_prep_kv_append_fused_dpos_tensor(
-            k_cache, v_cache, k_out, raw_k, raw_v, weight, inv_freq,
-            pos0, n_tokens, n_head_kv, head_dim, rot_dim, cache_cap,
-            eps, weight_offset, NULL);
-}
-
-extern "C" int ds4_gpu_qwen4exp_qsa_indexer_pool_update_dpos_tensor(
-        ds4_gpu_tensor       *pool,
-        ds4_gpu_tensor       *tape,
-        const ds4_gpu_tensor *raw_k,
-        const ds4_gpu_tensor *k_norm_weight,
-        const ds4_gpu_tensor *inv_freq,
-        uint32_t              pos0,
-        uint32_t              n_tokens,
-        uint32_t              cache_cap,
-        uint32_t              head_dim,
-        uint32_t              pool_size,
-        uint32_t              rot_dim,
-        float                 eps,
-        float                 weight_offset,
-        const ds4_gpu_tensor *d_pos) {
-    if (n_tokens == 0u || head_dim == 0u || pool_size == 0u || rot_dim == 0u ||
-        rot_dim > head_dim || (!d_pos && (uint64_t)pos0 + n_tokens > cache_cap) ||
-        !glm53_cuda_tensor_has(tape, (uint64_t)cache_cap * head_dim, sizeof(float)) ||
-        !glm53_cuda_tensor_has(pool, (uint64_t)(cache_cap / pool_size) * head_dim,
-                               sizeof(float)) ||
-        !glm53_cuda_tensor_has(raw_k, (uint64_t)n_tokens * head_dim, sizeof(float)) ||
-        !glm53_cuda_tensor_has(k_norm_weight, head_dim, sizeof(float)) ||
-        !glm53_cuda_tensor_has(inv_freq, rot_dim / 2u, sizeof(float))) {
-        return 0;
-    }
-    const uint32_t *d_pos_ptr = d_pos ? (const uint32_t *)d_pos->ptr : NULL;
-    const uint64_t append = (uint64_t)n_tokens * head_dim;
-    qwen4exp_qsa_tape_append_kernel<<<
-        (unsigned)((append + 255u) / 256u), 256u, 0, cuda_decode_stream()>>>(
-            (const float *)raw_k->ptr, (float *)tape->ptr, n_tokens, head_dim,
-            pos0, cache_cap, d_pos_ptr);
-    if (!cuda_ok(cudaGetLastError(), "Qwen4-Exp indexer tape append launch")) {
-        return 0;
-    }
-
-    const uint32_t nth = qwen4exp_cuda_threads(head_dim);
-    const size_t shared = ((size_t)head_dim + nth) * sizeof(float);
-    if (d_pos) {
-        qwen4exp_qsa_pool_update_kernel<<<1, nth, shared, cuda_decode_stream()>>>(
-                (const float *)tape->ptr, (const float *)k_norm_weight->ptr,
-                (const float *)inv_freq->ptr, (float *)pool->ptr, 0,
-                1, head_dim, pool_size, rot_dim, cache_cap, eps,
-                weight_offset, d_pos_ptr, n_tokens);
-        if (!cuda_ok(cudaGetLastError(), "Qwen4-Exp indexer pool update launch")) {
-            return 0;
-        }
-    } else {
-        const uint32_t block0 = pos0 / pool_size;
-        const uint32_t block1 = (pos0 + n_tokens) / pool_size;
-        if (block1 > block0) {
-            qwen4exp_qsa_pool_update_kernel<<<block1 - block0, nth, shared,
-                cuda_decode_stream()>>>(
-                    (const float *)tape->ptr, (const float *)k_norm_weight->ptr,
-                    (const float *)inv_freq->ptr, (float *)pool->ptr, block0,
-                    block1 - block0, head_dim, pool_size, rot_dim, cache_cap, eps,
-                    weight_offset, NULL, n_tokens);
-            if (!cuda_ok(cudaGetLastError(), "Qwen4-Exp indexer pool update launch")) {
-                return 0;
-            }
-        }
-    }
-    return 1;
 }
 
 extern "C" int ds4_gpu_qwen4exp_qsa_indexer_pool_update_tensor(
@@ -6983,9 +6804,41 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_pool_update_tensor(
         uint32_t              rot_dim,
         float                 eps,
         float                 weight_offset) {
-    return ds4_gpu_qwen4exp_qsa_indexer_pool_update_dpos_tensor(
-            pool, tape, raw_k, k_norm_weight, inv_freq, pos0, n_tokens,
-            cache_cap, head_dim, pool_size, rot_dim, eps, weight_offset, NULL);
+    if (n_tokens == 0u || head_dim == 0u || pool_size == 0u || rot_dim == 0u ||
+        rot_dim > head_dim || (uint64_t)pos0 + n_tokens > cache_cap ||
+        !glm53_cuda_tensor_has(tape, (uint64_t)cache_cap * head_dim, sizeof(float)) ||
+        !glm53_cuda_tensor_has(pool, (uint64_t)(cache_cap / pool_size) * head_dim,
+                               sizeof(float)) ||
+        !glm53_cuda_tensor_has(raw_k, (uint64_t)n_tokens * head_dim, sizeof(float)) ||
+        !glm53_cuda_tensor_has(k_norm_weight, head_dim, sizeof(float)) ||
+        !glm53_cuda_tensor_has(inv_freq, rot_dim / 2u, sizeof(float))) {
+        return 0;
+    }
+    const uint64_t append = (uint64_t)n_tokens * head_dim;
+    qwen4exp_qsa_tape_append_kernel<<<
+        (unsigned)((append + 255u) / 256u), 256u, 0, cuda_decode_stream()>>>(
+            (const float *)raw_k->ptr, (float *)tape->ptr, n_tokens, head_dim,
+            pos0, cache_cap);
+    if (!cuda_ok(cudaGetLastError(), "Qwen4-Exp indexer tape append launch")) {
+        return 0;
+    }
+
+    const uint32_t block0 = pos0 / pool_size;
+    const uint32_t block1 = (pos0 + n_tokens) / pool_size;
+    if (block1 > block0) {
+        const uint32_t nth = qwen4exp_cuda_threads(head_dim);
+        const size_t shared = ((size_t)head_dim + nth) * sizeof(float);
+        qwen4exp_qsa_pool_update_kernel<<<block1 - block0, nth, shared,
+            cuda_decode_stream()>>>(
+                (const float *)tape->ptr, (const float *)k_norm_weight->ptr,
+                (const float *)inv_freq->ptr, (float *)pool->ptr, block0,
+                block1 - block0, head_dim, pool_size, rot_dim, cache_cap, eps,
+                weight_offset);
+        if (!cuda_ok(cudaGetLastError(), "Qwen4-Exp indexer pool update launch")) {
+            return 0;
+        }
+    }
+    return 1;
 }
 
 extern "C" int ds4_gpu_qwen4exp_qsa_indexer_scores_tensor(
@@ -7046,7 +6899,7 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_select_tensor(
     return cuda_ok(cudaGetLastError(), "Qwen4-Exp indexer selection launch");
 }
 
-extern "C" int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
+extern "C" int ds4_gpu_qwen4exp_qsa_attention_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *k_cache,
@@ -7060,10 +6913,9 @@ extern "C" int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
         uint32_t              pos0,
         uint32_t              cache_cap,
         uint32_t              max_selected,
-        float                 scale,
-        const ds4_gpu_tensor *d_pos) {
+        float                 scale) {
     if (n_tokens == 0u || n_head == 0u || n_kv_head == 0u || head_dim == 0u ||
-        (n_head % n_kv_head) != 0u || (!d_pos && (uint64_t)pos0 + n_tokens > cache_cap)) {
+        (n_head % n_kv_head) != 0u || (uint64_t)pos0 + n_tokens > cache_cap) {
         return 0;
     }
     const bool sparse = selected != NULL;
@@ -7085,7 +6937,6 @@ extern "C" int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
      * block narrower than head_dim would leave the tail channels unwritten
      * with no error anywhere.  Refuse instead. */
     if (nth < head_dim) return 0;
-    const uint32_t *d_pos_ptr = d_pos ? (const uint32_t *)d_pos->ptr : NULL;
 
     /* Wide rows go to the head-group kernel, which reads each K and each V
      * row once for the whole group instead of once per head.  It is the same
@@ -7110,7 +6961,7 @@ extern "C" int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
                     sparse ? (const int32_t *)selected->ptr : NULL,           \
                     sparse ? (const int32_t *)counts->ptr : NULL,             \
                     (float *)out->ptr, n_tokens, n_head, n_kv_head, head_dim, \
-                    pos0, cache_cap, max_selected, sparse ? 1u : 0u, scale, d_pos_ptr)
+                    pos0, cache_cap, max_selected, sparse ? 1u : 0u, scale)
             switch (g) {
                 case 12u: QWEN4EXP_QSA_GROUP_LAUNCH(12u); break;
                 case 8u:  QWEN4EXP_QSA_GROUP_LAUNCH(8u);  break;
@@ -7137,29 +6988,8 @@ extern "C" int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
             sparse ? (const int32_t *)selected->ptr : NULL,
             sparse ? (const int32_t *)counts->ptr : NULL,
             (float *)out->ptr, n_tokens, n_head, n_kv_head, head_dim, pos0,
-            cache_cap, max_selected, sparse ? 1u : 0u, scale, d_pos_ptr);
+            cache_cap, max_selected, sparse ? 1u : 0u, scale);
     return cuda_ok(cudaGetLastError(), "Qwen4-Exp QSA attention launch");
-}
-
-extern "C" int ds4_gpu_qwen4exp_qsa_attention_tensor(
-        ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *k_cache,
-        const ds4_gpu_tensor *v_cache,
-        const ds4_gpu_tensor *selected,
-        const ds4_gpu_tensor *counts,
-        uint32_t              n_tokens,
-        uint32_t              n_head,
-        uint32_t              n_kv_head,
-        uint32_t              head_dim,
-        uint32_t              pos0,
-        uint32_t              cache_cap,
-        uint32_t              max_selected,
-        float                 scale) {
-    return ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
-            out, q, k_cache, v_cache, selected, counts,
-            n_tokens, n_head, n_kv_head, head_dim, pos0,
-            cache_cap, max_selected, scale, NULL);
 }
 
 extern "C" int ds4_gpu_qwen4exp_qsa_output_gate_tensor(
@@ -7372,21 +7202,3 @@ extern "C" int ds4_gpu_qwen4exp_ple_conv_tensor(
 
 #include "ds4_qwen4exp_hc_host.inc"
 #include "ds4_qwen4exp_ple_host.inc"
-
-extern "C" int ds4_gpu_qwen4exp_shared_expert_tensor(
-        ds4_gpu_tensor              *out,
-        ds4_gpu_tensor              *mid,
-        ds4_gpu_tensor              *gate_scale,
-        const ds4_gpu_qwen4exp_slab *router_slab,
-        const ds4_gpu_qwen4exp_slab *gate_slab,
-        const ds4_gpu_qwen4exp_slab *up_slab,
-        const ds4_gpu_qwen4exp_slab *down_slab,
-        uint32_t                     in_dim,
-        uint32_t                     mid_dim,
-        uint32_t                     out_dim,
-        const ds4_gpu_tensor        *x,
-        uint32_t                     n_tokens) {
-    return ds4_gpu_qwen4exp_shared_expert_preq_tensor(
-            out, mid, gate_scale, router_slab, gate_slab, up_slab, down_slab,
-            in_dim, mid_dim, out_dim, x, n_tokens, 0);
-}

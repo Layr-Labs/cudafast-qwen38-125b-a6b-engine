@@ -920,7 +920,7 @@ static inline cublasHandle_t cuda_cublas_for_tier(int logical_tier) {
  *
  * DS4_CUDA_DECODE_GRAPHS=0 (or off/no/false) disables everything. */
 #define CUDA_DECODE_GRAPH_LAYERS   64u
-#define CUDA_DECODE_GRAPH_ISLANDS   3u
+#define CUDA_DECODE_GRAPH_ISLANDS   2u
 #define CUDA_DECODE_GRAPH_VARIANTS  4u
 
 /* Mirrors the public `struct ds4_decode_graph_key` decl in ds4_gpu.h
@@ -1007,16 +1007,6 @@ extern "C" void ds4_gpu_decode_graphs_invalidate(void) {
             }
         }
     }
-}
-
-extern "C" int ds4_gpu_qwen4exp_update_dpos(
-        ds4_gpu_tensor *d_pos,
-        uint32_t pos) {
-    if (!d_pos || !d_pos->ptr) return 0;
-    cudaStream_t s = cuda_decode_stream();
-    cudaError_t err = cudaMemcpyAsync(d_pos->ptr, &pos, sizeof(uint32_t),
-                                      cudaMemcpyHostToDevice, s);
-    return err == cudaSuccess;
 }
 
 static cuda_decode_graph_entry *cuda_decode_graph_find(
