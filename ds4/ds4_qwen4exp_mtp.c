@@ -1060,6 +1060,10 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                                  (uint64_t)out_rows * sizeof(uint32_t)) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_TOP1_IN);
+    /* CUDA's top-1 kernel preserves the historical CPU seed-at-zero NaN
+     * behavior directly.  Metal, ROCm, and CPU-test backends retain the
+     * compatibility read until their reducers make the same guarantee. */
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD) || defined(DS4_NO_GPU)
     if (ok) {
         stage = "logit-0 readback";
         for (uint32_t t = 0; ok && t < out_rows; t++) {
@@ -1081,6 +1085,7 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
             }
         }
     }
+#endif
     MTP_HEAD_TICK(MTP_HEAD_T_LOGIT0_IN);
     if (ok && multi_out) {
         stage = "multi readback";

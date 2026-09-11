@@ -14221,7 +14221,13 @@ __global__ static void indexer_top1_kernel(
         __syncthreads();
     }
 
-    if (tid == 0u) selected[t] = idxs[0];
+    if (tid == 0u) {
+        /* The engine's historical CPU argmax seeds from element zero.  A NaN
+         * there makes every later `v > best` comparison false and therefore
+         * pins the result to token zero.  Preserve that rule on device so MTP
+         * does not need a second synchronous readback of logit zero. */
+        selected[t] = isnan(row[0]) ? 0u : idxs[0];
+    }
 }
 
 __global__ static void indexer_top1_value_kernel(
