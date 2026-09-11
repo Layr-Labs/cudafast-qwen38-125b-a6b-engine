@@ -5683,9 +5683,22 @@ __global__ static void matmul_q8_0_preq_rows_exact_tile_kernel(
 
 /* Two adjacent lanes share a Q8 group. Their integer partials may be
  * combined freely; each even lane keeps its original float group chain.
- * Shared memory remaps the 32 finished chains onto one reduction warp. */
+ * Shared memory remaps the 32 finished chains onto one reduction warp.
+ *
+ * SIX BLOCKS PER SM.  The block is 256 threads, so six of them is 1536 and the
+ * whole thread budget of an SM; the register file allows six only at 40
+ * registers a thread.  The R = 1 instantiation already allocated 40 and so
+ * already reached six, but R = 2 allocated 47 and reached five, and R = 2 is
+ * the width the speculative verify runs -- including its LM head, which is the
+ * largest single weight read in the decode.  Asking ptxas for six makes it
+ * allocate 40 for R = 2 as well, with no stack frame and no spill in either
+ * instantiation, so the extra block per SM costs nothing.
+ *
+ * The bound is an allocation constraint and touches no arithmetic: the same
+ * funnelshifts on the same operands, the same dp4a chain, the same
+ * `__shfl_xor_sync`, the same per-row accumulation order. */
 template <int R>
-__global__ static void matmul_q8_0_preq_pair_lanes_kernel(
+__global__ __launch_bounds__(256, 6) static void matmul_q8_0_preq_pair_lanes_kernel(
         float *out, const unsigned char *w,
         const int8_t *xq, const float *xscale,
         uint64_t out_dim, uint32_t n_rows, uint64_t blocks) {
