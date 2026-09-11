@@ -2825,25 +2825,9 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
         for (int r = 0; r < R; r++) acc[r] = 0.0f;
         if (live) {
             for (uint32_t g = lane; g < groups; g += 32u) {
-                int8_t wq[32];
-                float wa[2] = {0.0f, 0.0f};
-                float wb[2] = {0.0f, 0.0f};
-                /* WORD DECODE, the same one the routed-MoE MMA kernels use.
-                 * This kernel took the byte-array decoder, which rebuilds
-                 * each of the eight payload words from single bytes; the
-                 * word path derives them by shifting the group's own raw
-                 * words and is proven byte-identical to it (the byte
-                 * decoder is kept as the fallback for a payload that does
-                 * not stage).  This kernel is only ever instantiated for
-                 * Q4_K, whose group stages, and whose decode leaves
-                 * `halves` at one -- the value passed to the accumulate
-                 * below -- so the accumulated value is unchanged. */
-                uint32_t raw[8];
-                const uint32_t *rawp =
-                    qw_raw_load((uint32_t)Type, weight_row, g, raw) ? raw : NULL;
-                dev_qwen4exp_group_decode_w((uint32_t)Type, weight_row, g,
-                                            rawp, wq, wa, wb);
-                const int halves = 1;
+                int8_t wq[32]; float wa[2], wb[2]; int halves = 1;
+                dev_qwen4exp_group_decode((uint32_t)Type, weight_row, g,
+                                          wq, wa, wb, &halves);
 #pragma unroll
                 for (int r = 0; r < R; r++) {
                     if (r < take) {
@@ -4479,7 +4463,8 @@ static int qwen4exp_moe_tile(uint32_t n_rows) {
     /* The usual one-row decode and two-row verify need at most two live
      * accumulators.  Keep their weight reuse while reducing the padded
      * register tile now that the format-specific kernels are available. */
-    if (n_rows <= 2u) return 2;
+    if (n_rows == 2u) return 2;
+    if (n_rows == 1u) return 1;
     /* A three-row call retains the previously measured eight-row tile.
      * Its live per-row arithmetic agrees with the other tile widths. */
     return 8;
@@ -4737,19 +4722,31 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
      * neighboring warps applies the same register cut there. The diagnostic
      * pin retains the joint projection as a bit-exact oracle. Other widths
      * keep their prior kernel. */
-    else if (n_tokens <= 2u && tile == 2 && specialize &&
+    else if (n_tokens <= 2u && (tile == 1 || tile == 2) && specialize &&
              gate_slab->type == DS4_QWEN4EXP_TY_q4_K &&
              up_slab->type == DS4_QWEN4EXP_TY_q4_K &&
              getenv("DS4_QWEN4EXP_NO_SPLIT_GATEUP") == NULL) {
-        qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K><<<
-            dim3((mid_dim + 3u) / 4u, gu_rows, 1), threads, 0, stream>>>(
-            (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum,
-            sc.pairs, sc.counts, sc.offsets, gu_active,
-            (const float *)weights->ptr,
-            gate_slab->expert_bytes, gate_slab->row_bytes,
-            up_slab->expert_bytes, up_slab->row_bytes,
-            gate_slab->type, up_slab->type, xgroups, mid_dim,
-            mid_token_stride, n_expert_used);
+        if (tile == 2) {
+            qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K><<<
+                dim3((mid_dim + 3u) / 4u, gu_rows, 1), threads, 0, stream>>>(
+                (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum,
+                sc.pairs, sc.counts, sc.offsets, gu_active,
+                (const float *)weights->ptr,
+                gate_slab->expert_bytes, gate_slab->row_bytes,
+                up_slab->expert_bytes, up_slab->row_bytes,
+                gate_slab->type, up_slab->type, xgroups, mid_dim,
+                mid_token_stride, n_expert_used);
+        } else {
+            qwen4exp_moe_gateup_split_kernel<1, DS4_QWEN4EXP_TY_q4_K><<<
+                dim3((mid_dim + 3u) / 4u, gu_rows, 1), threads, 0, stream>>>(
+                (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum,
+                sc.pairs, sc.counts, sc.offsets, gu_active,
+                (const float *)weights->ptr,
+                gate_slab->expert_bytes, gate_slab->row_bytes,
+                up_slab->expert_bytes, up_slab->row_bytes,
+                gate_slab->type, up_slab->type, xgroups, mid_dim,
+                mid_token_stride, n_expert_used);
+        }
     }
     else if (tile == 8) { QWEN4EXP_GATEUP(8); }
     else if (tile == 4) { QWEN4EXP_GATEUP(4); }
