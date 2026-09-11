@@ -88,7 +88,7 @@ void ds4_qwen4exp_session_plan_compute(ds4_qwen4exp_session_plan *plan,
     const uint64_t q8_qbytes = B * q8_blocks * 32ull;
     const uint64_t q8_soff = (q8_qbytes + 15ull) & ~15ull;
     const uint64_t q8_sbytes = B * q8_blocks * sizeof(float);
-    act += q8_soff + q8_sbytes;                    /* mixed_q8            */
+    act += q8_soff + q8_sbytes;                    /* qsa_mixed_q8        */
     act += B * cfg->qsa_q_dim * f;                 /* doubled query       */
     act += 3ull * B * q_width * f;                 /* q, gate, attn out   */
     act += 2ull * B * cfg->qsa_kv_dim * f;
@@ -324,7 +324,6 @@ struct ds4_qwen4exp_session {
     uint32_t        head_cache_pos;
 
     /* Shared, position-independent. */
-    ds4_gpu_tensor *d_pos;
     ds4_gpu_tensor *inv_freq;
 
     /* Activations.  All sized for n_batch tokens and reused every layer. */
@@ -344,7 +343,7 @@ struct ds4_qwen4exp_session {
     ds4_gpu_tensor *gdn_gate;
     ds4_gpu_tensor *gdn_out;
 
-    ds4_gpu_tensor *mixed_q8; /* shared by sequential GDN/QSA projections */
+    ds4_gpu_tensor *qsa_mixed_q8;
     ds4_gpu_tensor *qsa_doubled;
     ds4_gpu_tensor *qsa_q;
     ds4_gpu_tensor *qsa_gate;
@@ -631,7 +630,7 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
                 (uint64_t)DS4_N_INDEXER_HEAD_DIM * f, &ok);
             s->attn_q_norm[il] = qwen4exp_alloc_zeroed((uint64_t)DS4_N_HEAD_DIM * f, &ok);
             s->attn_k_norm[il] = qwen4exp_alloc_zeroed((uint64_t)DS4_N_HEAD_DIM * f, &ok);
-            /* These four norms take their weight as a device tensor rather
+            /* These three norms take their weight as a device tensor rather
              * than a model offset, so upload them once at session open. */
             if (ok) {
                 const ds4_qwen4exp_layer_weights *lw = &w->layer[il];
@@ -693,7 +692,6 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
         }
     }
 
-    s->d_pos = qwen4exp_alloc_zeroed(sizeof(uint32_t), &ok);
     s->inv_freq = qwen4exp_alloc_zeroed((uint64_t)DS4_N_ROT / 2u * f, &ok);
     if (ok) {
         float freqs[DS4_MAX_KDA_HEAD_DIM];
@@ -722,7 +720,7 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
     const uint64_t q8_qbytes = B * q8_blocks * 32ull;
     const uint64_t q8_soff = (q8_qbytes + 15ull) & ~15ull;
     const uint64_t q8_sbytes = B * q8_blocks * sizeof(float);
-    s->mixed_q8 = qwen4exp_alloc_zeroed(q8_soff + q8_sbytes, &ok);
+    s->qsa_mixed_q8 = qwen4exp_alloc_zeroed(q8_soff + q8_sbytes, &ok);
     s->qsa_doubled = qwen4exp_alloc_zeroed(B * cfg->qsa_q_dim * f, &ok);
     s->qsa_q       = qwen4exp_alloc_zeroed(B * q_width * f, &ok);
     s->qsa_gate    = qwen4exp_alloc_zeroed(B * q_width * f, &ok);
@@ -786,7 +784,6 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->ple_value);
     free(s->ple_ids);
     free(s->ple_rows_host);
-    ds4_gpu_tensor_free(s->d_pos);
     ds4_gpu_tensor_free(s->inv_freq);
     ds4_gpu_tensor_free(s->tokens);
     ds4_gpu_tensor_free(s->hyper);
@@ -802,7 +799,7 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->gdn_beta);
     ds4_gpu_tensor_free(s->gdn_gate);
     ds4_gpu_tensor_free(s->gdn_out);
-    ds4_gpu_tensor_free(s->mixed_q8);
+    ds4_gpu_tensor_free(s->qsa_mixed_q8);
     ds4_gpu_tensor_free(s->qsa_doubled);
     ds4_gpu_tensor_free(s->qsa_q);
     ds4_gpu_tensor_free(s->qsa_gate);
@@ -1285,28 +1282,15 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
                                      uint32_t il,
                                      uint32_t n_tokens) {
     const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
-    const uint64_t q8_blocks = (uint64_t)DS4_N_EMBD / 32u;
-    const uint64_t q8_qbytes = (uint64_t)n_tokens * q8_blocks * 32u;
-    const uint64_t q8_soff = (q8_qbytes + 15u) & ~15ull;
 
-    /* GDN and QSA run sequentially on the same stream. Reuse the existing
-     * session scratch: both GDN Q8 projections read the same mixed input.
-     * The F32 alpha/beta projections still read the original float values.
-     * Width-specific graph islands capture a stable scratch and scale offset. */
-    if (!ds4_qwen4exp_quantize_q8_0(s->mixed_q8, 0, q8_soff, s->mixed,
-                                    DS4_N_EMBD, n_tokens)) {
-        fprintf(stderr, "ds4: qwen4exp GDN pre-quantize failed at block %u\n", il);
-        return false;
-    }
-
-    if (!ds4_qwen4exp_matmul_q8_0_preq(s->gdn_qkv, QW_MAP(m, l->attn_qkv),
+    if (!ds4_qwen4exp_matmul_q8_0(s->gdn_qkv, QW_MAP(m, l->attn_qkv),
                                     QW_MAPSZ(m, l->attn_qkv), QW_OFF(l->attn_qkv),
                                     DS4_N_EMBD, cfg->gdn_qkv_dim,
-                                    s->mixed_q8, 0, q8_soff, n_tokens) ||
-        !ds4_qwen4exp_matmul_q8_0_preq(s->gdn_gate, QW_MAP(m, l->attn_gate),
+                                    s->mixed, n_tokens) ||
+        !ds4_qwen4exp_matmul_q8_0(s->gdn_gate, QW_MAP(m, l->attn_gate),
                                     QW_MAPSZ(m, l->attn_gate), QW_OFF(l->attn_gate),
                                     DS4_N_EMBD, cfg->gdn_inner,
-                                    s->mixed_q8, 0, q8_soff, n_tokens) ||
+                                    s->mixed, n_tokens) ||
         !ds4_qwen4exp_matmul_f32(s->gdn_alpha, QW_MAP(m, l->ssm_alpha),
                                    QW_MAPSZ(m, l->ssm_alpha), QW_OFF(l->ssm_alpha),
                                    DS4_N_EMBD, DS4_N_GDN_VALUE_HEAD,
@@ -1376,7 +1360,7 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
     const uint64_t q8_qbytes = (uint64_t)n_tokens * q8_blocks * 32u;
     const uint64_t q8_soff = (q8_qbytes + 15u) & ~15ull;
 
-    if (!ds4_qwen4exp_quantize_q8_0(s->mixed_q8, 0, q8_soff, s->mixed,
+    if (!ds4_qwen4exp_quantize_q8_0(s->qsa_mixed_q8, 0, q8_soff, s->mixed,
                                     DS4_N_EMBD, n_tokens)) {
         fprintf(stderr, "ds4: qwen4exp QSA pre-quantize failed at block %u\n", il);
         return false;
@@ -1386,35 +1370,34 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
     if (!ds4_qwen4exp_matmul_q8_0_preq(s->qsa_doubled, QW_MAP(m, l->attn_q),
                                        QW_MAPSZ(m, l->attn_q), QW_OFF(l->attn_q),
                                        DS4_N_EMBD, cfg->qsa_q_dim,
-                                       s->mixed_q8, 0, q8_soff, n_tokens) ||
+                                       s->qsa_mixed_q8, 0, q8_soff, n_tokens) ||
         !ds4_qwen4exp_matmul_q8_0_preq(s->qsa_kin, QW_MAP(m, l->attn_k),
                                        QW_MAPSZ(m, l->attn_k), QW_OFF(l->attn_k),
                                        DS4_N_EMBD, cfg->qsa_kv_dim,
-                                       s->mixed_q8, 0, q8_soff, n_tokens) ||
+                                       s->qsa_mixed_q8, 0, q8_soff, n_tokens) ||
         !ds4_qwen4exp_matmul_q8_0_preq(s->qsa_vin, QW_MAP(m, l->attn_v),
                                        QW_MAPSZ(m, l->attn_v), QW_OFF(l->attn_v),
                                        DS4_N_EMBD, cfg->qsa_kv_dim,
-                                       s->mixed_q8, 0, q8_soff, n_tokens)) {
+                                       s->qsa_mixed_q8, 0, q8_soff, n_tokens)) {
         fprintf(stderr, "ds4: qwen4exp QSA projections failed at block %u\n", il);
         return false;
     }
 
     /* Fused Q-Prep: split doubled-query, per-head RMS norm, and RoPE in 1 launch */
-    if (!ds4_gpu_qwen4exp_qsa_prep_q_fused_dpos_tensor(
+    if (!ds4_gpu_qwen4exp_qsa_prep_q_fused_tensor(
             s->qsa_q, s->qsa_gate, s->qsa_doubled, s->attn_q_norm[il],
             s->inv_freq, n_tokens, DS4_N_HEAD, head_dim, DS4_N_ROT, pos0,
-            DS4_RMS_EPS, l->attn_q_norm_offset, s->d_pos)) {
+            DS4_RMS_EPS, l->attn_q_norm_offset)) {
         fprintf(stderr, "ds4: qwen4exp fused Q-prep failed at block %u\n", il);
         return false;
     }
 
     /* Fused KV-Prep & Append: per-head RMS norm on K, RoPE on K, and direct write into
      * k_cache and v_cache in 1 launch (no sync CPU memcpy) */
-    if (!ds4_gpu_qwen4exp_qsa_prep_kv_append_fused_dpos_tensor(
+    if (!ds4_gpu_qwen4exp_qsa_prep_kv_append_fused_tensor(
             s->qsa_k[il], s->qsa_v[il], s->qsa_kin, s->qsa_kin, s->qsa_vin,
             s->attn_k_norm[il], s->inv_freq, pos0, n_tokens, DS4_N_HEAD_KV,
-            head_dim, DS4_N_ROT, s->plan.n_ctx, DS4_RMS_EPS, l->attn_k_norm_offset,
-            s->d_pos)) {
+            head_dim, DS4_N_ROT, s->plan.n_ctx, DS4_RMS_EPS, l->attn_k_norm_offset)) {
         fprintf(stderr, "ds4: qwen4exp fused KV prep & append failed at block %u\n", il);
         return false;
     }
@@ -1447,11 +1430,11 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
         fprintf(stderr, "ds4: qwen4exp indexer projections failed at block %u\n", il);
         return false;
     }
-    if (!ds4_gpu_qwen4exp_qsa_indexer_pool_update_dpos_tensor(
+    if (!ds4_gpu_qwen4exp_qsa_indexer_pool_update_tensor(
             s->idx_pool[il], s->idx_tape[il], s->idx_k, s->idx_k_norm[il],
             s->inv_freq, pos0, n_tokens, s->plan.n_ctx,
             DS4_N_INDEXER_HEAD_DIM, ratio, DS4_N_ROT, DS4_RMS_EPS,
-            l->indexer_k_norm_offset, s->d_pos)) {
+            l->indexer_k_norm_offset)) {
         fprintf(stderr, "ds4: qwen4exp indexer pool update failed at block %u\n", il);
         return false;
     }
@@ -1486,10 +1469,10 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
     }
 
     const float scale = 1.0f / sqrtf((float)head_dim);
-    if (!ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
+    if (!ds4_gpu_qwen4exp_qsa_attention_tensor(
             s->qsa_out, s->qsa_q, s->qsa_k[il], s->qsa_v[il], sel, counts,
             n_tokens, DS4_N_HEAD, DS4_N_HEAD_KV, head_dim, pos0,
-            s->plan.n_ctx, max_selected, scale, s->d_pos) ||
+            s->plan.n_ctx, max_selected, scale) ||
         !ds4_gpu_qwen4exp_qsa_output_gate_tensor(s->qsa_out, s->qsa_gate,
                                                  n_tokens * q_width)) {
         fprintf(stderr, "ds4: qwen4exp QSA attention failed at block %u\n", il);
@@ -1951,49 +1934,6 @@ static bool qwen4exp_graph_layer_island(
     return qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens, island);
 }
 
-static bool qwen4exp_graph_qsa_island(
-        ds4_qwen4exp_session *s, const ds4_qwen4exp_layer_weights *l,
-        const ds4_model *m, uint32_t il, uint32_t n_tokens) {
-    const bool qsa_capture_ok =
-        n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
-        (uint64_t)s->pos + n_tokens <= DS4_N_INDEXER_TOP_K &&
-        !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
-        ds4_gpu_decode_graphs_supported();
-    if (qsa_capture_ok) {
-        ds4_decode_graph_key key;
-        memset(&key, 0, sizeof(key));
-        key.il = il;
-        key.island = 2u;
-        key.variant = n_tokens | (s->spec_snapshot_rows << 8u);
-        key._pad = 0x5157454eu;
-        key.cur_hc = s->hyper;
-        key.after_attn_hc = s;
-        key.after_ffn_hc = (void *)l;
-        key.attn_norm = (void *)m;
-        const int state = ds4_gpu_decode_graph_begin(&key);
-        if (state == 1) {
-            QW_TRACE(QW_SLICE_QSA);
-            return true;
-        }
-        if (state == 0) {
-#ifdef DS4_TEST_HOOKS
-            const uint32_t trace_len = g_qwen4exp_trace_len;
-            const bool trace_overflow = g_qwen4exp_trace_overflow;
-#endif
-            if (qwen4exp_graph_qsa_block(s, l, m, il, n_tokens)) {
-                if (ds4_gpu_decode_graph_end(&key) == 0) return true;
-            } else {
-                ds4_gpu_decode_graph_abort(&key);
-            }
-#ifdef DS4_TEST_HOOKS
-            g_qwen4exp_trace_len = trace_len;
-            g_qwen4exp_trace_overflow = trace_overflow;
-#endif
-        }
-    }
-    return qwen4exp_graph_qsa_block(s, l, m, il, n_tokens);
-}
-
 /* ======================================================================
  * The forward.
  * ====================================================================== */
@@ -2060,118 +2000,6 @@ int ds4_qwen4exp_test_layer_sums(double *out, int cap, int *rows_out) {
 static bool qwen4exp_forward_fail(void) {
     (void)ds4_gpu_end_commands();
     return false;
-}
-
-/* The PLE host gather and token/position uploads precede this device-only
- * layer stack.  A captured stack retains the same operations and scratch
- * addresses while replacing the per-layer graph launch train with one call. */
-static bool qwen4exp_graph_layers_encode(
-        ds4_qwen4exp_session *s, const ds4_qwen4exp_weights *w,
-        const ds4_model *m, uint32_t n_tokens, bool use_islands) {
-    const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
-    for (uint32_t il = 0; il < cfg->n_layer; il++) {
-        const ds4_qwen4exp_layer_weights *l = &w->layer[il];
-
-        /* --- per-layer n-gram embedding, one block only ----------------
-         * FIRST in the layer, ahead of the attention mixer, and a plain
-         * residual add onto the whole hyper stream rather than an inject:
-         * MLX Qwen4Exp.swift:113-121 is
-         *     stream = stream + ple(stream, ids:, previousContext:, cache:)
-         * before mixWithInject.  Running it after the FFN inject instead
-         * would feed this block's n-gram contribution to the NEXT block. */
-        if (l->has_ple) {
-            if (!qwen4exp_graph_ple_block(s, m, l, n_tokens, il)) {
-                return false;
-            }
-            QW_TRACE(QW_SLICE_PLE);
-        }
-
-        if (!(use_islands ? qwen4exp_graph_layer_island(s, l, m, il, n_tokens, 0u) :
-                qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens, 0u))) {
-            return false;
-        }
-        if (l->is_full_attention) {
-            if (!(use_islands ? qwen4exp_graph_qsa_island(s, l, m, il, n_tokens) :
-                    qwen4exp_graph_qsa_block(s, l, m, il, n_tokens))) {
-                return false;
-            }
-            QW_TRACE(QW_SLICE_QSA);
-        }
-        if (!(use_islands ? qwen4exp_graph_layer_island(s, l, m, il, n_tokens, 1u) :
-                qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens, 1u))) {
-            return false;
-        }
-#ifdef DS4_TEST_HOOKS
-        qwen4exp_layer_dump(s, il, n_tokens);
-#endif
-    }
-
-    return true;
-}
-
-static bool qwen4exp_graph_layers(
-        ds4_qwen4exp_session *s, const ds4_qwen4exp_weights *w,
-        const ds4_model *m, uint32_t n_tokens) {
-    bool capture_ok =
-        n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
-        (uint64_t)s->pos + n_tokens <= DS4_N_INDEXER_TOP_K &&
-        !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
-        ds4_gpu_decode_graphs_supported();
-#ifdef DS4_TEST_HOOKS
-    /* Layer dumps synchronize and must execute every host call site. */
-    capture_ok = capture_ok && !qwen4exp_layer_dump_on();
-#endif
-    if (capture_ok) {
-        ds4_decode_graph_key key;
-        memset(&key, 0, sizeof(key));
-        /* Target layer zero has no island-three entry.  The existing head
-         * uses island three at its own layer index, so the caches are disjoint. */
-        key.il = 0u;
-        key.island = 3u;
-        key.variant = n_tokens | (s->spec_snapshot_rows << 8u);
-        key._pad = 0x51575354u; /* QWST: the complete target layer stack */
-        key.cur_hc = s->hyper;
-        key.after_attn_hc = s;
-        key.after_ffn_hc = (void *)w;
-        key.attn_norm = (void *)m;
-        const int state = ds4_gpu_decode_graph_begin(&key);
-        if (state == 1) {
-#ifdef DS4_TEST_HOOKS
-            /* Preserve the logical slice trace even when encoding is skipped. */
-            const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
-            for (uint32_t il = 0; il < cfg->n_layer; il++) {
-                const ds4_qwen4exp_layer_weights *l = &w->layer[il];
-                if (l->has_ple) QW_TRACE(QW_SLICE_PLE);
-                QW_TRACE(QW_SLICE_ATTN_MIX);
-                QW_TRACE(l->is_full_attention ? QW_SLICE_QSA : QW_SLICE_GDN);
-                QW_TRACE(QW_SLICE_ATTN_INJECT);
-                QW_TRACE(QW_SLICE_FFN_MIX);
-                QW_TRACE(QW_SLICE_MOE);
-                QW_TRACE(QW_SLICE_FFN_INJECT);
-            }
-#endif
-            return true;
-        }
-        if (state == 0) {
-#ifdef DS4_TEST_HOOKS
-            const uint32_t trace_len = g_qwen4exp_trace_len;
-            const bool trace_overflow = g_qwen4exp_trace_overflow;
-#endif
-            /* Encode primitives directly, without nested per-layer captures. */
-            if (qwen4exp_graph_layers_encode(s, w, m, n_tokens, false)) {
-                if (ds4_gpu_decode_graph_end(&key) == 0) return true;
-            } else {
-                ds4_gpu_decode_graph_abort(&key);
-            }
-#ifdef DS4_TEST_HOOKS
-            g_qwen4exp_trace_len = trace_len;
-            g_qwen4exp_trace_overflow = trace_overflow;
-#endif
-            /* Failed capture executed no kernels.  Retain the established
-             * per-layer path for this call and any retired/full cache entry. */
-        }
-    }
-    return qwen4exp_graph_layers_encode(s, w, m, n_tokens, true);
 }
 
 bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
@@ -2261,10 +2089,6 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
      * than taking its own command buffer, and the blits that append to the KV
      * caches only work inside a batch at all.  qwen4exp_forward_fail() ends the
      * batch on the way out so a refusal does not leave one open. */
-    if (s->d_pos && !ds4_gpu_qwen4exp_update_dpos(s->d_pos, s->pos)) {
-        fprintf(stderr, "ds4: qwen4exp position update failed\n");
-        return false;
-    }
     if (!ds4_gpu_begin_commands()) {
         fprintf(stderr, "ds4: qwen4exp could not open a command batch\n");
         return false;
@@ -2281,8 +2105,38 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     }
     QW_TRACE(QW_SLICE_EMBED);
 
-    if (!qwen4exp_graph_layers(s, w, m, n_tokens)) {
-        return qwen4exp_forward_fail();
+    for (uint32_t il = 0; il < cfg->n_layer; il++) {
+        const ds4_qwen4exp_layer_weights *l = &w->layer[il];
+
+        /* --- per-layer n-gram embedding, one block only ----------------
+         * FIRST in the layer, ahead of the attention mixer, and a plain
+         * residual add onto the whole hyper stream rather than an inject:
+         * MLX Qwen4Exp.swift:113-121 is
+         *     stream = stream + ple(stream, ids:, previousContext:, cache:)
+         * before mixWithInject.  Running it after the FFN inject instead
+         * would feed this block's n-gram contribution to the NEXT block. */
+        if (l->has_ple) {
+            if (!qwen4exp_graph_ple_block(s, m, l, n_tokens, il)) {
+                return qwen4exp_forward_fail();
+            }
+            QW_TRACE(QW_SLICE_PLE);
+        }
+
+        if (!qwen4exp_graph_layer_island(s, l, m, il, n_tokens, 0u)) {
+            return qwen4exp_forward_fail();
+        }
+        if (l->is_full_attention) {
+            if (!qwen4exp_graph_qsa_block(s, l, m, il, n_tokens)) {
+                return qwen4exp_forward_fail();
+            }
+            QW_TRACE(QW_SLICE_QSA);
+        }
+        if (!qwen4exp_graph_layer_island(s, l, m, il, n_tokens, 1u)) {
+            return qwen4exp_forward_fail();
+        }
+#ifdef DS4_TEST_HOOKS
+        qwen4exp_layer_dump(s, il, n_tokens);
+#endif
     }
 
     /* The final mixer has no inject head: it collapses n_hc * n_embd to
@@ -2439,7 +2293,7 @@ bool ds4_qwen4exp_session_add_head_block(ds4_qwen4exp_session             *s,
     if (s->qsa_k[il]) return true;   /* already set up */
 
     /* Conservative: the slot's own buffers come out of qwen4exp_alloc_zeroed
-     * and so match a reset, but this also uploads the head's four norms and
+     * and so match a reset, but this also uploads the head's three norms and
      * registers its mapping, so let the next reset run in full rather than
      * reason about which of those a reset covers. */
     s->state_dirty = true;
@@ -2542,19 +2396,13 @@ bool ds4_qwen4exp_session_add_head_block(ds4_qwen4exp_session             *s,
         (uint64_t)n_ctx * DS4_N_INDEXER_KV_HEAD * DS4_N_INDEXER_HEAD_DIM * f, &ok);
     s->idx_pool[il] = qwen4exp_alloc_zeroed(
         blocks * DS4_N_INDEXER_KV_HEAD * DS4_N_INDEXER_HEAD_DIM * f, &ok);
-    s->idx_q_norm[il] = qwen4exp_alloc_zeroed(
-        (uint64_t)DS4_N_INDEXER_HEAD_DIM * f, &ok);
     s->idx_k_norm[il] = qwen4exp_alloc_zeroed((uint64_t)DS4_N_INDEXER_HEAD_DIM * f, &ok);
     s->attn_q_norm[il] = qwen4exp_alloc_zeroed((uint64_t)DS4_N_HEAD_DIM * f, &ok);
     s->attn_k_norm[il] = qwen4exp_alloc_zeroed((uint64_t)DS4_N_HEAD_DIM * f, &ok);
     if (ok) {
-        /* From the HEAD's mapping, not the target's: these four come out of
+        /* From the HEAD's mapping, not the target's: these three come out of
          * the --mtp GGUF like the rest of blk.<il>.*. */
-        ok = l->indexer_q_norm && l->indexer_k_norm &&
-             l->attn_q_norm && l->attn_k_norm &&
-             ds4_gpu_tensor_write(s->idx_q_norm[il], 0,
-                                  tensor_data(m, l->indexer_q_norm),
-                                  (uint64_t)DS4_N_INDEXER_HEAD_DIM * f) &&
+        ok = l->indexer_k_norm && l->attn_q_norm && l->attn_k_norm &&
              ds4_gpu_tensor_write(s->idx_k_norm[il], 0,
                                   tensor_data(m, l->indexer_k_norm),
                                   (uint64_t)DS4_N_INDEXER_HEAD_DIM * f) &&
@@ -2572,13 +2420,44 @@ bool ds4_qwen4exp_session_add_head_block(ds4_qwen4exp_session             *s,
     return true;
 }
 
-/* Encode the MTP block once, either eagerly or into the decode graph stream.
- * All arguments that become kernel parameters are already stable here. */
-static bool qwen4exp_graph_head_block_encode(
-        ds4_qwen4exp_session *s,
-        const ds4_qwen4exp_layer_weights *l,
-        const ds4_model *m, uint32_t il, uint32_t n_tokens,
-        const char **failed_stage) {
+/*
+ * ds4_qwen4exp_block_forward_fn.  `graph` is the head's weight context and
+ * `cache` is the session that owns the slot; `hyper` is the head's own stream,
+ * rewritten in place.  Returns NONZERO on success -- the ds4_gpu convention,
+ * not ds4.c's.
+ *
+ * The session's hyper pointer and position are lent to the head for the call
+ * and put back afterwards, so the tower's own stream is untouched and every
+ * function below is the same code the tower runs.  The command batch is the
+ * caller's: the head opens one around its whole forward, and these ops join
+ * it.
+ */
+int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
+                                  ds4_gpu_tensor *hyper, uint32_t il,
+                                  uint32_t pos0, uint32_t n_tokens) {
+    const ds4_qwen4exp_head_block_ctx *c = graph;
+    ds4_qwen4exp_session *s = cache;
+    if (!c || !s || !c->l || !c->m || !hyper || n_tokens == 0) return 0;
+    if (n_tokens > s->plan.n_batch) return 0;
+    if (il >= DS4_MAX_LAYER || !s->qsa_k[il]) {
+        fprintf(stderr,
+                "ds4: qwen4exp head block %u has no cache slot; "
+                "ds4_qwen4exp_session_add_head_block() was not called\n", il);
+        return 0;
+    }
+    if (!c->l->is_full_attention) return 0;
+
+    /* The head's QSA block appends to the slot's key/value caches and its
+     * indexer tape; see `state_dirty`. */
+    s->state_dirty = true;
+
+    ds4_gpu_tensor *saved_hyper = s->hyper;
+    const uint32_t saved_pos = s->pos;
+    s->hyper = hyper;
+    s->pos = pos0;
+
+    const ds4_qwen4exp_layer_weights *l = c->l;
+    const ds4_model *m = c->m;
     const int timing = qw_hb_time_on();
     uint64_t tmark = timing ? qw_hb_now_ns() : 0;
     const char *stage = "attention mixer";
@@ -2618,95 +2497,8 @@ static bool qwen4exp_graph_head_block_encode(
     QW_HB_TICK(QW_HB_T_FFN_INJECT);
     if (timing && ok) qw_hb_stage_calls++;
 
-    if (failed_stage) *failed_stage = stage;
-    return ok;
-}
-
-/*
- * ds4_qwen4exp_block_forward_fn.  `graph` is the head's weight context and
- * `cache` is the session that owns the slot; `hyper` is the head's own stream,
- * rewritten in place.  Returns NONZERO on success -- the ds4_gpu convention,
- * not ds4.c's.
- *
- * Device-positioned QSA makes the complete head block position-independent.
- * Capturing it as island 3 removes the attention, mixer and MoE launch train
- * from every MTP draft round.  The session's hyper pointer and position are
- * lent to the head for the call and restored afterwards.
- */
-int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
-                                  ds4_gpu_tensor *hyper, uint32_t il,
-                                  uint32_t pos0, uint32_t n_tokens) {
-    const ds4_qwen4exp_head_block_ctx *c = graph;
-    ds4_qwen4exp_session *s = cache;
-    if (!c || !s || !c->l || !c->m || !hyper || n_tokens == 0) return 0;
-    if (n_tokens > s->plan.n_batch) return 0;
-    if (il >= DS4_MAX_LAYER || !s->qsa_k[il]) {
-        fprintf(stderr,
-                "ds4: qwen4exp head block %u has no cache slot; "
-                "ds4_qwen4exp_session_add_head_block() was not called\n", il);
-        return 0;
-    }
-    if (!c->l->is_full_attention) return 0;
-
-    /* The head's QSA block appends to the slot's key/value caches and its
-     * indexer tape; see `state_dirty`. */
-    s->state_dirty = true;
-
-    ds4_gpu_tensor *saved_hyper = s->hyper;
-    const uint32_t saved_pos = s->pos;
-    s->hyper = hyper;
-    s->pos = pos0;
-    if (s->d_pos && !ds4_gpu_qwen4exp_update_dpos(s->d_pos, s->pos)) {
-        s->hyper = saved_hyper;
-        s->pos = saved_pos;
-        fprintf(stderr, "ds4: qwen4exp head position update failed\n");
-        return 0;
-    }
-
-    const bool capture_ok =
-        n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
-        (uint64_t)s->pos + n_tokens <= DS4_N_INDEXER_TOP_K &&
-        !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
-        ds4_gpu_decode_graphs_supported();
-    ds4_decode_graph_key key;
-    int graph_state = -1;
-    if (capture_ok) {
-        memset(&key, 0, sizeof(key));
-        key.il = il;
-        key.island = 3u;
-        key.variant = n_tokens | (s->spec_snapshot_rows << 8u);
-        key._pad = 0x4d545048u;
-        key.cur_hc = hyper;
-        key.after_attn_hc = s;
-        key.after_ffn_hc = (void *)c->l;
-        key.attn_norm = (void *)c->m;
-        graph_state = ds4_gpu_decode_graph_begin(&key);
-    }
-
-    const char *stage = "attention mixer";
-    bool ok = graph_state == 1;
-    if (graph_state != 1) {
-        ok = qwen4exp_graph_head_block_encode(
-                s, c->l, c->m, il, n_tokens, &stage);
-        if (graph_state == 0) {
-            if (ok && ds4_gpu_decode_graph_end(&key) == 0) {
-                ok = true;
-            } else {
-                if (!ok) ds4_gpu_decode_graph_abort(&key);
-                /* A failed capture executed no kernels.  Re-encode the block
-                 * eagerly once so this proposal still advances its caches. */
-                ok = qwen4exp_graph_head_block_encode(
-                        s, c->l, c->m, il, n_tokens, &stage);
-            }
-        }
-    }
-
     s->hyper = saved_hyper;
     s->pos = saved_pos;
-    if (s->d_pos && !ds4_gpu_qwen4exp_update_dpos(s->d_pos, s->pos)) {
-        stage = "position restore";
-        ok = false;
-    }
     if (!ok) {
         fprintf(stderr, "ds4: qwen4exp head block %u failed at the %s\n",
                 il, stage);
