@@ -4331,20 +4331,23 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     const uint64_t xq_bytes = qwen4exp_quant_bytes(n_tokens, xgroups);
     const uint64_t mq_bytes = qwen4exp_quant_bytes(n_pairs, mgroups);
 
+    /* xq/xs/xsum sit at base[0] so the shared expert can reuse this
+     * quantization without a second pass over s->mixed.  idx/pair metadata
+     * and the mid quant follow; the shared expert only reads the head. */
     char *base = (char *)qwen4exp_group_scratch(
             logical_tier, idx_bytes + pair_bytes + xq_bytes + mq_bytes);
     if (!base) return 0;
     qwen4exp_moe_scratch sc;
-    sc.counts = (int32_t *)base;
+    sc.xq = (int8_t *)base;
+    sc.xs = (float *)(base + (uint64_t)n_tokens * xgroups * 32u);
+    sc.xsum = (int32_t *)(sc.xs + (uint64_t)n_tokens * xgroups);
+    char *at = base + xq_bytes;
+    sc.counts = (int32_t *)at;
     sc.offsets = sc.counts + n_total_expert;
     sc.cursor = sc.offsets + n_total_expert;
     sc.active = sc.cursor + n_total_expert;
     sc.pairs = sc.active + n_total_expert + 1u;
-    char *at = base + idx_bytes + pair_bytes;
-    sc.xq = (int8_t *)at;
-    sc.xs = (float *)(at + (uint64_t)n_tokens * xgroups * 32u);
-    sc.xsum = (int32_t *)(sc.xs + (uint64_t)n_tokens * xgroups);
-    at += xq_bytes;
+    at += idx_bytes + pair_bytes;
     sc.mq = (int8_t *)at;
     sc.ms = (float *)(at + (uint64_t)n_pairs * mgroups * 32u);
     sc.msum = (int32_t *)(sc.ms + (uint64_t)n_pairs * mgroups);
@@ -5421,8 +5424,8 @@ static int ds4_qwen4exp_hc_fuse_off(void) {
 
 
 /* Fuse the low-rank scale/SiLU with its following Q8 activation quantizer.
- * The float result is still written to lowrank, exactly as the separate
- * scale_silu kernel did. The quantizer uses the promoted norm fusion's
+ * The float SiLU value stays in-register; only the Q8 bytes land in the
+ * reused normed_scratch. The quantizer uses the promoted norm fusion's
  * explicit fast-math seam so it returns the standalone quantizer's bytes. */
 __global__ static void qwen4exp_hc_silu_quant_kernel(
         float *lowrank, int8_t *xq, float *xscale,
@@ -5433,7 +5436,8 @@ __global__ static void qwen4exp_hc_silu_quant_kernel(
     const uint64_t i = pair * 32u + lane;
     const float z = lowrank[i] * scale;
     const float v = z * qwen4exp_sigmoid(z);
-    lowrank[i] = v;
+    /* Do not store v back to lowrank: the up projection consumes the Q8
+     * bytes written below, and nothing else reads the float row. */
 
     const float vz = qwen4exp_q8_ftz(v);
     float a = qwen4exp_q8_ftz(fabsf(v));

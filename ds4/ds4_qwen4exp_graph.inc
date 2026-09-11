@@ -1286,14 +1286,25 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
                                      uint32_t n_tokens) {
     const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
 
-    if (!ds4_qwen4exp_matmul_q8_0(s->gdn_qkv, QW_MAP(m, l->attn_qkv),
-                                    QW_MAPSZ(m, l->attn_qkv), QW_OFF(l->attn_qkv),
-                                    DS4_N_EMBD, cfg->gdn_qkv_dim,
-                                    s->mixed, n_tokens) ||
-        !ds4_qwen4exp_matmul_q8_0(s->gdn_gate, QW_MAP(m, l->attn_gate),
-                                    QW_MAPSZ(m, l->attn_gate), QW_OFF(l->attn_gate),
-                                    DS4_N_EMBD, cfg->gdn_inner,
-                                    s->mixed, n_tokens) ||
+    /* Pre-quantize s->mixed ONCE for GDN qkv and gate projections. */
+    const uint64_t q8_blocks_gdn = (uint64_t)DS4_N_EMBD / 32u;
+    const uint64_t q8_qbytes_gdn = (uint64_t)n_tokens * q8_blocks_gdn * 32u;
+    const uint64_t q8_soff_gdn = (q8_qbytes_gdn + 15u) & ~15ull;
+
+    if (!ds4_qwen4exp_quantize_q8_0(s->qsa_mixed_q8, 0, q8_soff_gdn, s->mixed,
+                                    DS4_N_EMBD, n_tokens)) {
+        fprintf(stderr, "ds4: qwen4exp GDN pre-quantize failed at block %u\n", il);
+        return false;
+    }
+
+    if (!ds4_qwen4exp_matmul_q8_0_preq(s->gdn_qkv, QW_MAP(m, l->attn_qkv),
+                                       QW_MAPSZ(m, l->attn_qkv), QW_OFF(l->attn_qkv),
+                                       DS4_N_EMBD, cfg->gdn_qkv_dim,
+                                       s->qsa_mixed_q8, 0, q8_soff_gdn, n_tokens) ||
+        !ds4_qwen4exp_matmul_q8_0_preq(s->gdn_gate, QW_MAP(m, l->attn_gate),
+                                       QW_MAPSZ(m, l->attn_gate), QW_OFF(l->attn_gate),
+                                       DS4_N_EMBD, cfg->gdn_inner,
+                                       s->qsa_mixed_q8, 0, q8_soff_gdn, n_tokens) ||
         !ds4_qwen4exp_matmul_f32(s->gdn_alpha, QW_MAP(m, l->ssm_alpha),
                                    QW_MAPSZ(m, l->ssm_alpha), QW_OFF(l->ssm_alpha),
                                    DS4_N_EMBD, DS4_N_GDN_VALUE_HEAD,
@@ -1674,10 +1685,11 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
     const ds4_gpu_qwen4exp_slab sh_gate_slab = QW_SLAB(m, l->ffn_gate_shexp);
     const ds4_gpu_qwen4exp_slab sh_up_slab = QW_SLAB(m, l->ffn_up_shexp);
     const ds4_gpu_qwen4exp_slab sh_down_slab = QW_SLAB(m, l->ffn_down_shexp);
-    if (!ds4_gpu_qwen4exp_shared_expert_tensor(
+    /* Reuse the routed MoE's Q8 of s->mixed (xq at group-scratch base). */
+    if (!ds4_gpu_qwen4exp_shared_expert_preq_tensor(
             s->block_out, s->shexp_mid, s->shexp_gate,
             &sh_router_slab, &sh_gate_slab, &sh_up_slab, &sh_down_slab,
-            DS4_N_EMBD, DS4_N_FF_SHEXP, DS4_N_EMBD, s->mixed, n_tokens)) {
+            DS4_N_EMBD, DS4_N_FF_SHEXP, DS4_N_EMBD, s->mixed, n_tokens, 1)) {
         fprintf(stderr, "ds4: qwen4exp shared expert failed at block %u\n", il);
         return false;
     }
