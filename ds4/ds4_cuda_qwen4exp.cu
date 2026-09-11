@@ -7472,7 +7472,7 @@ extern "C" int ds4_gpu_qwen4exp_qsa_output_gate_tensor(
         return 0;
     }
     qwen4exp_qsa_output_gate_kernel<<<
-        (unsigned)((n_values + 255u) / 256u), 256u, 0, cuda_decode_stream()>>>(
+        (unsigned)((n_values + 127u) / 128u), 128u, 0, cuda_decode_stream()>>>(
             (const float *)gate->ptr, (float *)out->ptr, n_values);
     return cuda_ok(cudaGetLastError(), "Qwen4-Exp QSA output gate launch");
 }
