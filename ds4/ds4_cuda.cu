@@ -5246,10 +5246,10 @@ __device__ __forceinline__ static int32_t load_i8x4_i32_unaligned(const int8_t *
  * asks the cache for a span of nine lines to use four bytes of them.
  *
  * Read the aligned words that CONTAIN the payload instead, and shift the bytes
- * into place: eight word loads plus one halfword read for the last group,
- * whose top bytes live past the rolling reader's final word.  Even payloads
- * reuse that word and read only the two missing bytes; odd payloads keep four
- * byte loads within the payload.
+ * into place: eight word loads plus one four-byte read for the last group,
+ * whose top bytes live in a word the block does not own and which is therefore
+ * read only within its four-byte tail rather than past the block.  Even
+ * payloads use two halfword tail loads; odd payloads keep four byte loads.
  * The shift amount is a value rather than a branch,
  * so lanes whose blocks land on different alignments stay in step.
  *
@@ -5259,16 +5259,17 @@ __device__ __forceinline__ static int32_t load_i8x4_i32_unaligned(const int8_t *
  * what the byte-at-a-time loop produced -- which is what the speculative
  * cycle's serial identity needs, and what the correctness gate checks.
  */
-/* The rolling reader already holds the first part of the final operand.  An
- * even payload needs only its last two bytes; odd payloads keep the safe byte
- * fallback. */
-__device__ __forceinline__ static int32_t q8_0_tail_word(
-        const int8_t *payload, uint32_t previous, uint32_t shift) {
-    if ((((uintptr_t)payload) & 1u) == 0u) {
-        const uint16_t last = *(const uint16_t *)(const void *)(payload + 30);
-        return (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
+/* Q8 payloads are normally even-aligned: the GGUF base and 34-byte block
+ * stride both preserve that alignment.  Read the final four bytes with two
+ * aligned halfwords, retaining byte loads for a caller with an odd pointer.
+ * Unlike an aligned word read across the tail, neither path crosses the
+ * four-byte range supplied by the caller. */
+__device__ __forceinline__ static int32_t q8_tail_i8x4(const int8_t *p) {
+    if (((uintptr_t)p & 1u) == 0u) {
+        const uint16_t *h = (const uint16_t *)(const void *)p;
+        return (int32_t)((uint32_t)h[0] | ((uint32_t)h[1] << 16u));
     }
-    return load_i8x4_i32_unaligned(payload + 28);
+    return load_i8x4_i32_unaligned(p);
 }
 
 __device__ __forceinline__ static int32_t dot_i8x32_dp4a(const int8_t *a, const int8_t *b) {
@@ -5289,7 +5290,7 @@ __device__ __forceinline__ static int32_t dot_i8x32_dp4a(const int8_t *a, const 
         dot = __dp4a((int32_t)__funnelshift_r(prev, next, sh), xb[i], dot);
         prev = next;
     }
-    dot = __dp4a(q8_0_tail_word(a, prev, sh), xb[7], dot);
+    dot = __dp4a(q8_tail_i8x4(a + 28), xb[7], dot);
     return dot;
 }
 
@@ -5318,7 +5319,7 @@ __device__ __forceinline__ static int32_t dot_i8_block(const int8_t *a, const in
  * WHAT MOVES.  Nothing arithmetic.  q8_0_group_words() computes exactly the
  * eight int32 operands dot_i8x32_dp4a() builds -- the same seven
  * __funnelshift_r of the same aligned word pair at the same shift, then the
- * same q8_0_tail_word(a, prev, sh) -- and dot_i8x32_dp4a_words() feeds them
+ * same q8_tail_i8x4(a + 28) -- and dot_i8x32_dp4a_words() feeds them
  * to the same eight __dp4a against the same activation words in the same order
  * into the same int32 accumulator.  An integer dot has no rounding, so the
  * value is the one the pointer form returned, bit for bit, and the float tail
@@ -5339,7 +5340,7 @@ __device__ __forceinline__ static void q8_0_group_words(int32_t w[8],
         w[i] = (int32_t)__funnelshift_r(prev, next, sh);
         prev = next;
     }
-    w[7] = q8_0_tail_word(a, prev, sh);
+    w[7] = q8_tail_i8x4(a + 28);
 }
 
 __device__ __forceinline__ static int32_t dot_i8x32_dp4a_words(
@@ -16623,6 +16624,39 @@ extern "C" int ds4_gpu_matmul_q8_0_preq_rows_exact_tensor(
             out, wptr, (const int8_t *)((const char *)q->ptr + q_offset),
             (const float *)((const char *)q->ptr + s_offset), in_dim, out_dim,
             n_rows, blocks);
+}
+
+extern "C" int ds4_gpu_quantize_q8_0_decode_rows_exact_tensor(
+        ds4_gpu_tensor       *q,
+        uint64_t              q_offset,
+        uint64_t              s_offset,
+        const ds4_gpu_tensor *x,
+        uint64_t              in_dim,
+        uint32_t              n_rows) {
+    if (!q || !x || in_dim == 0u || n_rows == 0u || (in_dim & 31u) != 0u) {
+        return 0;
+    }
+    const uint64_t blocks = in_dim / 32u;
+    const uint64_t qbytes = (uint64_t)n_rows * blocks * 32u;
+    const uint64_t sbytes = (uint64_t)n_rows * blocks * sizeof(float);
+    if ((q_offset & 15u) != 0u || (s_offset & 15u) != 0u ||
+        q_offset > q->bytes || s_offset > q->bytes ||
+        q->bytes - q_offset < qbytes || q->bytes - s_offset < sbytes ||
+        x->bytes < (uint64_t)n_rows * in_dim * sizeof(float)) {
+        return 0;
+    }
+    const int logical_tier = ds4_tensor_device_idx(q);
+    if (logical_tier < 0 || logical_tier >= g_n_gpus ||
+        ds4_tensor_device_idx(x) != logical_tier) {
+        return 0;
+    }
+    int8_t *xq = (int8_t *)((char *)q->ptr + q_offset);
+    float *xscale = (float *)((char *)q->ptr + s_offset);
+    const uint64_t qpairs = (uint64_t)n_rows * blocks;
+    const unsigned qgrid = (unsigned)((qpairs + 7u) / 8u);
+    quantize_q8_0_f32_rows_warp_kernel<<<qgrid, 256, 0, cuda_decode_stream()>>>(
+            xq, xscale, (const float *)x->ptr, in_dim, blocks, n_rows);
+    return cuda_ok(cudaGetLastError(), "q8_0 decode rows quantize launch");
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(

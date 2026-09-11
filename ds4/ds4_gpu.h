@@ -595,6 +595,40 @@ int ds4_gpu_qwen4exp_qsa_split_qkv_tensor(
  * `attn_v` as their own tensors, so one matmul per tensor already lays k and v
  * out the way the attention kernel wants them.  The query row is head-major
  * with the gate interleaved per head, exactly as in the fused row above. */
+/* Fused Q-Prep: split doubled-query, per-head RMS norm, and partial RoPE. */
+int ds4_gpu_qwen4exp_qsa_prep_q_fused_tensor(
+        ds4_gpu_tensor       *q,
+        ds4_gpu_tensor       *gate,
+        const ds4_gpu_tensor *doubled,
+        const ds4_gpu_tensor *weight,
+        const ds4_gpu_tensor *inv_freq,
+        uint32_t              n_tokens,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        uint32_t              rot_dim,
+        uint32_t              pos0,
+        float                 eps,
+        float                 weight_offset);
+
+/* Fused KV-Prep & Append: per-head RMS norm on K, partial RoPE on K, direct write
+ * of roped K into k_cache, direct write of raw V into v_cache, and write to k_out. */
+int ds4_gpu_qwen4exp_qsa_prep_kv_append_fused_tensor(
+        ds4_gpu_tensor       *k_cache,
+        ds4_gpu_tensor       *v_cache,
+        ds4_gpu_tensor       *k_out,
+        const ds4_gpu_tensor *raw_k,
+        const ds4_gpu_tensor *raw_v,
+        const ds4_gpu_tensor *weight,
+        const ds4_gpu_tensor *inv_freq,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              n_head_kv,
+        uint32_t              head_dim,
+        uint32_t              rot_dim,
+        uint32_t              cache_cap,
+        float                 eps,
+        float                 weight_offset);
+
 int ds4_gpu_qwen4exp_qsa_split_doubled_q_tensor(
         ds4_gpu_tensor       *q,
         ds4_gpu_tensor       *gate,
@@ -892,6 +926,15 @@ int ds4_gpu_matmul_q8_0_preq_rows_exact_tensor(
         const ds4_gpu_tensor *q,
         uint64_t              q_offset,
         uint64_t              s_offset,
+        uint32_t              n_rows);
+/* Quantize an f32 input tensor into Q8_0 blocks and f32 scales in the exact
+ * layout expected by ds4_gpu_matmul_q8_0_preq_rows_exact_tensor. */
+int ds4_gpu_quantize_q8_0_decode_rows_exact_tensor(
+        ds4_gpu_tensor       *q,
+        uint64_t              q_offset,
+        uint64_t              s_offset,
+        const ds4_gpu_tensor *x,
+        uint64_t              in_dim,
         uint32_t              n_rows);
 int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
         ds4_gpu_tensor       *out,

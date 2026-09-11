@@ -42,6 +42,30 @@ static inline int ds4_qwen4exp_matmul_q8_0(ds4_gpu_tensor       *out,
             out, map, map_size, offset, in_dim, out_dim, x, rows);
 }
 
+static inline int ds4_qwen4exp_quantize_q8_0(ds4_gpu_tensor       *q,
+                                             uint64_t              q_offset,
+                                             uint64_t              s_offset,
+                                             const ds4_gpu_tensor *x,
+                                             uint64_t              in_dim,
+                                             uint32_t              rows) {
+    return ds4_gpu_quantize_q8_0_decode_rows_exact_tensor(
+            q, q_offset, s_offset, x, in_dim, rows);
+}
+
+static inline int ds4_qwen4exp_matmul_q8_0_preq(ds4_gpu_tensor       *out,
+                                                const void           *map,
+                                                uint64_t              map_size,
+                                                uint64_t              offset,
+                                                uint64_t              in_dim,
+                                                uint64_t              out_dim,
+                                                const ds4_gpu_tensor *q,
+                                                uint64_t              q_offset,
+                                                uint64_t              s_offset,
+                                                uint32_t              rows) {
+    return ds4_gpu_matmul_q8_0_preq_rows_exact_tensor(
+            out, map, map_size, offset, in_dim, out_dim, q, q_offset, s_offset, rows);
+}
+
 /* The same rule for the F32 projections.
  *
  * ds4_gpu_matmul_f32_tensor tiers by row count on BOTH backends, and harder

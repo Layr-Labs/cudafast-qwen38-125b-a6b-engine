@@ -84,6 +84,11 @@ void ds4_qwen4exp_session_plan_compute(ds4_qwen4exp_session_plan *plan,
     act += B * cfg->gdn_qkv_dim * f;
     act += 2ull * B * DS4_N_GDN_VALUE_HEAD * f;    /* alpha, beta         */
     act += 2ull * B * cfg->gdn_inner * f;          /* gate, out           */
+    const uint64_t q8_blocks = (E + 31ull) / 32ull;
+    const uint64_t q8_qbytes = B * q8_blocks * 32ull;
+    const uint64_t q8_soff = (q8_qbytes + 15ull) & ~15ull;
+    const uint64_t q8_sbytes = B * q8_blocks * sizeof(float);
+    act += q8_soff + q8_sbytes;                    /* qsa_mixed_q8        */
     act += B * cfg->qsa_q_dim * f;                 /* doubled query       */
     act += 3ull * B * q_width * f;                 /* q, gate, attn out   */
     act += 2ull * B * cfg->qsa_kv_dim * f;
@@ -338,6 +343,7 @@ struct ds4_qwen4exp_session {
     ds4_gpu_tensor *gdn_gate;
     ds4_gpu_tensor *gdn_out;
 
+    ds4_gpu_tensor *qsa_mixed_q8;
     ds4_gpu_tensor *qsa_doubled;
     ds4_gpu_tensor *qsa_q;
     ds4_gpu_tensor *qsa_gate;
@@ -710,6 +716,11 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
     s->gdn_gate  = qwen4exp_alloc_zeroed(B * cfg->gdn_inner * f, &ok);
     s->gdn_out   = qwen4exp_alloc_zeroed(B * cfg->gdn_inner * f, &ok);
 
+    const uint64_t q8_blocks = (E + 31ull) / 32ull;
+    const uint64_t q8_qbytes = B * q8_blocks * 32ull;
+    const uint64_t q8_soff = (q8_qbytes + 15ull) & ~15ull;
+    const uint64_t q8_sbytes = B * q8_blocks * sizeof(float);
+    s->qsa_mixed_q8 = qwen4exp_alloc_zeroed(q8_soff + q8_sbytes, &ok);
     s->qsa_doubled = qwen4exp_alloc_zeroed(B * cfg->qsa_q_dim * f, &ok);
     s->qsa_q       = qwen4exp_alloc_zeroed(B * q_width * f, &ok);
     s->qsa_gate    = qwen4exp_alloc_zeroed(B * q_width * f, &ok);
@@ -788,6 +799,7 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->gdn_beta);
     ds4_gpu_tensor_free(s->gdn_gate);
     ds4_gpu_tensor_free(s->gdn_out);
+    ds4_gpu_tensor_free(s->qsa_mixed_q8);
     ds4_gpu_tensor_free(s->qsa_doubled);
     ds4_gpu_tensor_free(s->qsa_q);
     ds4_gpu_tensor_free(s->qsa_gate);
@@ -1343,51 +1355,50 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
     const uint32_t n_blocks = s->plan.n_ctx / ratio;
     const uint32_t pos0 = s->pos;
 
+    /* Pre-quantize s->mixed ONCE for Q, K, and V projections. */
+    const uint64_t q8_blocks = (uint64_t)DS4_N_EMBD / 32u;
+    const uint64_t q8_qbytes = (uint64_t)n_tokens * q8_blocks * 32u;
+    const uint64_t q8_soff = (q8_qbytes + 15u) & ~15ull;
+
+    if (!ds4_qwen4exp_quantize_q8_0(s->qsa_mixed_q8, 0, q8_soff, s->mixed,
+                                    DS4_N_EMBD, n_tokens)) {
+        fprintf(stderr, "ds4: qwen4exp QSA pre-quantize failed at block %u\n", il);
+        return false;
+    }
+
     /* Projections.  q is DOUBLED: half query, half output gate. */
-    if (!ds4_qwen4exp_matmul_q8_0(s->qsa_doubled, QW_MAP(m, l->attn_q),
-                                    QW_MAPSZ(m, l->attn_q), QW_OFF(l->attn_q),
-                                    DS4_N_EMBD, cfg->qsa_q_dim, s->mixed, n_tokens) ||
-        !ds4_qwen4exp_matmul_q8_0(s->qsa_kin, QW_MAP(m, l->attn_k),
-                                    QW_MAPSZ(m, l->attn_k), QW_OFF(l->attn_k),
-                                    DS4_N_EMBD, cfg->qsa_kv_dim, s->mixed, n_tokens) ||
-        !ds4_qwen4exp_matmul_q8_0(s->qsa_vin, QW_MAP(m, l->attn_v),
-                                    QW_MAPSZ(m, l->attn_v), QW_OFF(l->attn_v),
-                                    DS4_N_EMBD, cfg->qsa_kv_dim, s->mixed, n_tokens)) {
+    if (!ds4_qwen4exp_matmul_q8_0_preq(s->qsa_doubled, QW_MAP(m, l->attn_q),
+                                       QW_MAPSZ(m, l->attn_q), QW_OFF(l->attn_q),
+                                       DS4_N_EMBD, cfg->qsa_q_dim,
+                                       s->qsa_mixed_q8, 0, q8_soff, n_tokens) ||
+        !ds4_qwen4exp_matmul_q8_0_preq(s->qsa_kin, QW_MAP(m, l->attn_k),
+                                       QW_MAPSZ(m, l->attn_k), QW_OFF(l->attn_k),
+                                       DS4_N_EMBD, cfg->qsa_kv_dim,
+                                       s->qsa_mixed_q8, 0, q8_soff, n_tokens) ||
+        !ds4_qwen4exp_matmul_q8_0_preq(s->qsa_vin, QW_MAP(m, l->attn_v),
+                                       QW_MAPSZ(m, l->attn_v), QW_OFF(l->attn_v),
+                                       DS4_N_EMBD, cfg->qsa_kv_dim,
+                                       s->qsa_mixed_q8, 0, q8_soff, n_tokens)) {
         fprintf(stderr, "ds4: qwen4exp QSA projections failed at block %u\n", il);
         return false;
     }
-    if (!ds4_gpu_qwen4exp_qsa_split_doubled_q_tensor(
-            s->qsa_q, s->qsa_gate, s->qsa_doubled, n_tokens, DS4_N_HEAD, head_dim)) {
-        fprintf(stderr, "ds4: qwen4exp doubled-query split failed at block %u\n", il);
+
+    /* Fused Q-Prep: split doubled-query, per-head RMS norm, and RoPE in 1 launch */
+    if (!ds4_gpu_qwen4exp_qsa_prep_q_fused_tensor(
+            s->qsa_q, s->qsa_gate, s->qsa_doubled, s->attn_q_norm[il],
+            s->inv_freq, n_tokens, DS4_N_HEAD, head_dim, DS4_N_ROT, pos0,
+            DS4_RMS_EPS, l->attn_q_norm_offset)) {
+        fprintf(stderr, "ds4: qwen4exp fused Q-prep failed at block %u\n", il);
         return false;
     }
 
-    /* q and k get a per-head RMS norm BEFORE rope; v is left unnormed. */
-    if (!ds4_gpu_qwen4exp_head_rms_norm_tensor(
-            s->qsa_q, s->qsa_q, s->attn_q_norm[il], n_tokens * DS4_N_HEAD,
-            head_dim, DS4_RMS_EPS, l->attn_q_norm_offset) ||
-        !ds4_gpu_qwen4exp_head_rms_norm_tensor(
-            s->qsa_kin, s->qsa_kin, s->attn_k_norm[il], n_tokens * DS4_N_HEAD_KV,
-            head_dim, DS4_RMS_EPS, l->attn_k_norm_offset)) {
-        fprintf(stderr, "ds4: qwen4exp QSA head norm failed at block %u\n", il);
-        return false;
-    }
-
-    if (!ds4_gpu_qwen4exp_rope_head_tensor(s->qsa_q, s->inv_freq, n_tokens,
-                                           DS4_N_HEAD, head_dim, DS4_N_ROT, pos0) ||
-        !ds4_gpu_qwen4exp_rope_head_tensor(s->qsa_kin, s->inv_freq, n_tokens,
-                                           DS4_N_HEAD_KV, head_dim, DS4_N_ROT, pos0)) {
-        fprintf(stderr, "ds4: qwen4exp QSA rope failed at block %u\n", il);
-        return false;
-    }
-
-    /* Append k and v to the caches. */
-    const uint64_t kv_row = (uint64_t)cfg->qsa_kv_dim * sizeof(float);
-    if (!ds4_gpu_tensor_copy(s->qsa_k[il], (uint64_t)pos0 * kv_row,
-                                   s->qsa_kin, 0, (uint64_t)n_tokens * kv_row) ||
-        !ds4_gpu_tensor_copy(s->qsa_v[il], (uint64_t)pos0 * kv_row,
-                                   s->qsa_vin, 0, (uint64_t)n_tokens * kv_row)) {
-        fprintf(stderr, "ds4: qwen4exp QSA cache append failed at block %u\n", il);
+    /* Fused KV-Prep & Append: per-head RMS norm on K, RoPE on K, and direct write into
+     * k_cache and v_cache in 1 launch (no sync CPU memcpy) */
+    if (!ds4_gpu_qwen4exp_qsa_prep_kv_append_fused_tensor(
+            s->qsa_k[il], s->qsa_v[il], s->qsa_kin, s->qsa_kin, s->qsa_vin,
+            s->attn_k_norm[il], s->inv_freq, pos0, n_tokens, DS4_N_HEAD_KV,
+            head_dim, DS4_N_ROT, s->plan.n_ctx, DS4_RMS_EPS, l->attn_k_norm_offset)) {
+        fprintf(stderr, "ds4: qwen4exp fused KV prep & append failed at block %u\n", il);
         return false;
     }
 
