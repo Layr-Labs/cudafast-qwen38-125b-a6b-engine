@@ -17452,6 +17452,220 @@ __global__ static void matmul_f32_rows_exact_tile_kernel(
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * The same arithmetic as matmul_f32_rows_exact_tile_kernel, laid out so that
+ * ONE WARP owns a TM x TN tile of outputs instead of one block owning a
+ * TM x 1 column.
+ *
+ * WHY.  At prefill width the F32 router projection (ffn_gate_inp, [2560, 512],
+ * one per block, 48 blocks) is the shape this entry is asked for most, and the
+ * one-column tile is the wrong shape for it: with TN = 1 every thread issues
+ * one weight load and R activation loads for R fused multiply-adds, so the
+ * kernel spends its time moving the same 2560-float weight row out of L2 once
+ * per token tile and the same activation rows once per column.  Measured at
+ * M = 1024, K = 2560, N = 512 on the GB10 it runs at 1.19 TFLOP/s -- 4% of the
+ * device's F32 peak -- for a weight that is 5.24 MB and L2-resident.  The tile
+ * below reads TN weight values and TM activation values for TM x TN FMAs, and
+ * measures 3.4x faster at the router shape and 3.9x at the GDN alpha/beta
+ * shape ([2560, 48]).
+ *
+ * EXACTNESS.  The router's consumer is a top-k-of-512 selection, which is a
+ * discrete decision: one ULP in a logit can swap two nearly-tied experts and
+ * change which experts run.  So this reproduces the reference's summation tree
+ * leaf for leaf rather than merely summing the same terms.
+ *
+ * The reference gives each output element a 256-thread block.  Thread t walks
+ * i = t, t + 256, ... in one FMA chain from 0.0f -- call that chain(t) -- and
+ * then the block runs partial[t] += partial[t + s] for s = 128, 64, ... 1.
+ * Expanding those strides, the value written is
+ *
+ *     BRT(c_0 .. c_255),  c_t = chain(t),
+ *     h(t,128) = c_t + c_{t+128}
+ *     h(t, s)  = h(t, 2s) + h(t + s, 2s)          (s = 64, 32, ... 1)
+ *
+ * Read the first three levels at a fixed lane p in [0, 32):
+ *
+ *     h(p,32) = [ (c_p     + c_{p+128}) + (c_{p+64} + c_{p+192}) ]
+ *             + [ (c_{p+32} + c_{p+160}) + (c_{p+96} + c_{p+224}) ]
+ *
+ * -- that is, exactly the eight chains p + 32j, j = 0..7, combined as
+ * ((j0+j4)+(j2+j6)) + ((j1+j5)+(j3+j7)).  The remaining strides 16, 8, 4, 2, 1
+ * act only on lanes 0..31, which is precisely __shfl_down_sync at those five
+ * deltas with the reduced value on the left of each add.
+ *
+ * So one warp reproduces the whole 256-lane tree: lane p computes its eight
+ * chains -- each an intact FMA chain over its own i, never split -- combines
+ * them in the order above, and the five shuffles rebuild the top of the tree.
+ * No term moves between chains and no chain is reassociated, so every output
+ * is the same bits as the block reduction it replaces.  This is the same
+ * class-major idea as qwen4exp_shared_gateup_mma_kernel's traversal: walk K so
+ * that each accumulation chain completes intact, then combine the chains in
+ * the order that rebuilds the original tree.
+ *
+ * The chains are walked in TREE-LEAF order 0,4 | 2,6 | 1,5 | 3,7 -- the order
+ * the combine above consumes them -- so at most four partial tiles are ever
+ * live (A, B and the pair being accumulated) instead of eight.  Each pair is
+ * walked in ONE loop, which is where the memory-level parallelism comes from:
+ * the two chains are independent and their loads issue together.
+ *
+ * No tensor core is used.  TF32 truncates mantissa bits, so an MMA path over
+ * these F32 inputs would not be bit-identical and is not admissible here.
+ */
+template <int TM, int TN, int MC>
+__device__ __forceinline__ void matmul_f32_warp_tile_pair(
+        float a[TM][TN], float b[TM][TN], uint32_t ja, uint32_t jb,
+        uint32_t lane, uint32_t mcnt,
+        const float *const *wr, const float *const *xr) {
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int c = 0; c < TN; c++) { a[t][c] = 0.0f; b[t][c] = 0.0f; }
+    const uint32_t ia0 = lane + 32u * ja;
+    const uint32_t ib0 = lane + 32u * jb;
+    if (MC > 0) {
+        /* in_dim == 256 * MC: chain length is a compile-time constant. */
+#pragma unroll
+        for (int m = 0; m < (MC > 0 ? MC : 1); m++) {
+            const uint32_t ia = ia0 + 256u * (uint32_t)m;
+            const uint32_t ib = ib0 + 256u * (uint32_t)m;
+            float wa[TN], wb[TN], xa[TM], xb[TM];
+#pragma unroll
+            for (int c = 0; c < TN; c++) { wa[c] = wr[c][ia]; wb[c] = wr[c][ib]; }
+#pragma unroll
+            for (int t = 0; t < TM; t++) { xa[t] = xr[t][ia]; xb[t] = xr[t][ib]; }
+#pragma unroll
+            for (int t = 0; t < TM; t++)
+#pragma unroll
+                for (int c = 0; c < TN; c++) {
+                    a[t][c] += wa[c] * xa[t];
+                    b[t][c] += wb[c] * xb[t];
+                }
+        }
+    } else {
+        for (uint32_t m = 0; m < mcnt; m++) {
+            const uint32_t ia = ia0 + 256u * m;
+            const uint32_t ib = ib0 + 256u * m;
+            float wa[TN], wb[TN], xa[TM], xb[TM];
+#pragma unroll
+            for (int c = 0; c < TN; c++) { wa[c] = wr[c][ia]; wb[c] = wr[c][ib]; }
+#pragma unroll
+            for (int t = 0; t < TM; t++) { xa[t] = xr[t][ia]; xb[t] = xr[t][ib]; }
+#pragma unroll
+            for (int t = 0; t < TM; t++)
+#pragma unroll
+                for (int c = 0; c < TN; c++) {
+                    a[t][c] += wa[c] * xa[t];
+                    b[t][c] += wb[c] * xb[t];
+                }
+        }
+    }
+}
+
+template <int TM, int TN, int WPB, int MC>
+__global__ __launch_bounds__(32 * WPB)
+static void matmul_f32_warp_tile_kernel(
+        float *out,
+        const float *w,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint32_t n_rows) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t tile = blockIdx.x * (uint32_t)WPB + (threadIdx.x >> 5);
+    const uint32_t ntn = (uint32_t)(out_dim / (uint64_t)TN);
+    if (tile >= ntn) return;
+    const uint32_t col0 = tile * (uint32_t)TN;
+    const uint32_t row0 = blockIdx.y * (uint32_t)TM;
+    if (row0 >= n_rows) return;
+    const uint32_t take = n_rows - row0 < (uint32_t)TM ? n_rows - row0
+                                                       : (uint32_t)TM;
+
+    const float *wr[TN];
+    const float *xr[TM];
+#pragma unroll
+    for (int c = 0; c < TN; c++) wr[c] = w + (uint64_t)(col0 + c) * in_dim;
+    /* Rows past `take` re-read row0 rather than running off the tensor; their
+     * results are simply not stored. */
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+        xr[t] = x + (uint64_t)(row0 + (t < (int)take ? (uint32_t)t : 0u)) * in_dim;
+    const uint32_t mcnt = (uint32_t)(in_dim >> 8);
+
+    float A[TM][TN], B[TM][TN], t0[TM][TN], t1[TM][TN];
+
+    /* h(p,64) = (c_p + c_{p+128}) + (c_{p+64} + c_{p+192}) */
+    matmul_f32_warp_tile_pair<TM, TN, MC>(t0, t1, 0u, 4u, lane, mcnt, wr, xr);
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int c = 0; c < TN; c++) A[t][c] = t0[t][c] + t1[t][c];
+    matmul_f32_warp_tile_pair<TM, TN, MC>(t0, t1, 2u, 6u, lane, mcnt, wr, xr);
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int c = 0; c < TN; c++) A[t][c] = A[t][c] + (t0[t][c] + t1[t][c]);
+    /* h(p+32,64) = (c_{p+32} + c_{p+160}) + (c_{p+96} + c_{p+224}) */
+    matmul_f32_warp_tile_pair<TM, TN, MC>(t0, t1, 1u, 5u, lane, mcnt, wr, xr);
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int c = 0; c < TN; c++) B[t][c] = t0[t][c] + t1[t][c];
+    matmul_f32_warp_tile_pair<TM, TN, MC>(t0, t1, 3u, 7u, lane, mcnt, wr, xr);
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int c = 0; c < TN; c++) B[t][c] = B[t][c] + (t0[t][c] + t1[t][c]);
+
+    /* h(p,32) = h(p,64) + h(p+32,64), then strides 16, 8, 4, 2, 1. */
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int c = 0; c < TN; c++) {
+            float s = A[t][c] + B[t][c];
+#pragma unroll
+            for (int d = 16; d > 0; d >>= 1) {
+                s = s + __shfl_down_sync(0xffffffffu, s, d);
+            }
+            A[t][c] = s;
+        }
+    if (lane == 0u) {
+#pragma unroll
+        for (int t = 0; t < TM; t++) {
+            if ((uint32_t)t < take) {
+#pragma unroll
+                for (int c = 0; c < TN; c++) {
+                    out[(uint64_t)(row0 + (uint32_t)t) * out_dim +
+                        (uint64_t)(col0 + (uint32_t)c)] = A[t][c];
+                }
+            }
+        }
+    }
+}
+
+/* Tile geometry, chosen by interleaved paired timing against the block kernel
+ * it replaces (GB10, 48 SM, sm_121a; ncu is unavailable on this box so the
+ * evidence is wall time and ptxas -v, not counters).  TM = 6, TN = 8, four
+ * warps per block: 255 registers, no spills, no shared memory, no barriers.
+ * Median paired speedup 3.4-3.5x at M = 1024 / N = 512 and 3.9-4.2x at
+ * N = 48; TM = 6 beat 4, 5, 7, 8 and TN = 8 beat 2, 4, 6, 12, 16. */
+#define DS4_F32_WARP_TILE_TM 6
+#define DS4_F32_WARP_TILE_TN 8
+#define DS4_F32_WARP_TILE_WPB 4
+
+/* The tile needs every chain to have the same length -- in_dim a multiple of
+ * 256 -- and a whole number of column tiles.  in_dim is n_embd (2560) for both
+ * callers and out_dim is 512 (router) or 48 (GDN alpha/beta); anything else
+ * falls through to the ladder below, which is unchanged. */
+static inline int matmul_f32_warp_tile_ok(uint64_t in_dim, uint64_t out_dim,
+                                          uint32_t n_rows) {
+    /* One row tile per gridDim.y, which a launch caps at 65535. */
+    const uint64_t ytiles =
+        ((uint64_t)n_rows + DS4_F32_WARP_TILE_TM - 1u) / DS4_F32_WARP_TILE_TM;
+    return n_rows >= 8u && (in_dim & 255u) == 0u && in_dim >= 256u &&
+           (out_dim % (uint64_t)DS4_F32_WARP_TILE_TN) == 0u &&
+           ytiles <= 65535u;
+}
+
 /* The F32 projection with the ONE-ROW reduction order, for any row count.
  *
  * ds4_gpu_matmul_f32_tensor sends more than one row to cuBLAS SGEMM and one row
@@ -17488,6 +17702,38 @@ extern "C" int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
                 (float *)out->ptr, (const float *)w, (const float *)x->ptr,
                 in_dim, out_dim, n_rows);
         return cuda_ok(cudaGetLastError(), "matmul_f32 decode rows launch");
+    }
+    /* Prefill widths only.  Decode runs at n_rows <= 7 and is captured into a
+     * CUDA graph; leaving the ladder below untouched there keeps the captured
+     * nodes, their stream and their allocations exactly as they were.  The
+     * warp tile is bit-identical to the <8> tile it replaces (see its header),
+     * so this is a speed split, not a numeric one -- DS4_F32_NO_WARP_TILE
+     * falls back to the shipping kernel if one is ever needed. */
+    if (matmul_f32_warp_tile_ok(in_dim, out_dim, n_rows) &&
+        getenv("DS4_F32_NO_WARP_TILE") == NULL) {
+        const unsigned ntn =
+            (unsigned)(out_dim / (uint64_t)DS4_F32_WARP_TILE_TN);
+        dim3 grid((ntn + DS4_F32_WARP_TILE_WPB - 1u) / DS4_F32_WARP_TILE_WPB,
+                  (n_rows + DS4_F32_WARP_TILE_TM - 1u) / DS4_F32_WARP_TILE_TM,
+                  1);
+        /* n_embd is 2560, so the chain length is 10 and the walk unrolls
+         * whole.  Any other multiple of 256 takes the runtime count. */
+        if (in_dim == 2560u) {
+            matmul_f32_warp_tile_kernel<DS4_F32_WARP_TILE_TM,
+                                        DS4_F32_WARP_TILE_TN,
+                                        DS4_F32_WARP_TILE_WPB, 2560 / 256>
+                <<<grid, 32 * DS4_F32_WARP_TILE_WPB, 0, cuda_decode_stream()>>>(
+                    (float *)out->ptr, (const float *)w, (const float *)x->ptr,
+                    in_dim, out_dim, n_rows);
+        } else {
+            matmul_f32_warp_tile_kernel<DS4_F32_WARP_TILE_TM,
+                                        DS4_F32_WARP_TILE_TN,
+                                        DS4_F32_WARP_TILE_WPB, 0>
+                <<<grid, 32 * DS4_F32_WARP_TILE_WPB, 0, cuda_decode_stream()>>>(
+                    (float *)out->ptr, (const float *)w, (const float *)x->ptr,
+                    in_dim, out_dim, n_rows);
+        }
+        return cuda_ok(cudaGetLastError(), "matmul_f32 warp tile launch");
     }
     if (n_rows >= 8u) {
         dim3 grid((unsigned)out_dim, (n_rows + 7u) / 8u, 1);

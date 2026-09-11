@@ -855,6 +855,154 @@ static void run_shared_stage_cases(const uint8_t *model, uint64_t model_bytes,
  * The width, 21, is not a multiple of the tile, so the shared expert's own
  * tail is exercised too.
  */
+/* ------------------------------------------------------------------ */
+/* The F32 router projection at the production shape, prefill widths.
+ *
+ * ds4_gpu_matmul_f32_decode_rows_exact_tensor now takes a warp-tile kernel at
+ * n_rows >= 8 (ds4_cuda.cu, matmul_f32_warp_tile_kernel) instead of the
+ * one-column block tile.  The claim is that the two are BIT-IDENTICAL, not
+ * merely close: this entry produces ffn_gate_inp's logits, whose consumer is a
+ * top-10-of-512 selection, and a selection is discrete -- one ULP between two
+ * nearly tied experts changes which experts run for that token and everything
+ * downstream of it.
+ *
+ * So this sweeps prefill widths at the real shape (in 2560, out 512), runs the
+ * projection once with DS4_F32_NO_WARP_TILE set (the kernel that shipped) and
+ * once without (the warp tile), and requires
+ *
+ *   - every logit byte to be equal, and
+ *   - the selected expert ids AND THEIR ORDER, and the softmax weights, to be
+ *     equal after ds4_gpu_qwen4exp_router_select_tensor has run on each.
+ *
+ * The second check is not implied by the first for a future change that is
+ * only nearly exact, which is the point of running it separately.  The case
+ * also reports the tightest logit gap it saw at the top-k boundary, so the
+ * margin the exactness has to protect is on the record rather than assumed.
+ *
+ * It runs at three shapes: the router's 2560 -> 512, the GDN alpha and beta
+ * projections' 2560 -> 48 (same entry, same tile), and 2048 -> 512, whose
+ * chain length is not the 10 that 2560 gives.  The last one exists because the
+ * tile specialises the chain length when in_dim is 2560 and falls back to a
+ * runtime count otherwise; without a shape that takes the runtime arm, a
+ * mutant of that arm survives -- it did, on the first run of
+ * tests/qwen4exp_router_f32_mutants.sh.
+ */
+enum { RF32_MAXIN = 2560, RF32_MAXOUT = 512, RF32_MAXROWS = 1024 };
+
+static void run_router_f32_prefill_exact_case(int RF32_IN, int RF32_OUT) {
+    const uint64_t wbytes = (uint64_t)RF32_OUT * RF32_IN * sizeof(float);
+    float *wmap = mmap(NULL, wbytes, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (wmap == MAP_FAILED) fail("router f32 weight mmap");
+    for (uint64_t i = 0; i < (uint64_t)RF32_OUT * RF32_IN; i++) {
+        wmap[i] = rng_unit() * 0.05f;
+    }
+
+    float *x = calloc((size_t)RF32_MAXROWS * RF32_MAXIN, sizeof(float));
+    float *la = calloc((size_t)RF32_MAXROWS * RF32_MAXOUT, sizeof(float));
+    float *lb = calloc((size_t)RF32_MAXROWS * RF32_MAXOUT, sizeof(float));
+    int32_t *sa = calloc((size_t)RF32_MAXROWS * N_EXPERT_USED, sizeof(int32_t));
+    int32_t *sb = calloc((size_t)RF32_MAXROWS * N_EXPERT_USED, sizeof(int32_t));
+    float *wa = calloc((size_t)RF32_MAXROWS * N_EXPERT_USED, sizeof(float));
+    float *wb = calloc((size_t)RF32_MAXROWS * N_EXPERT_USED, sizeof(float));
+    if (!x || !la || !lb || !sa || !sb || !wa || !wb) fail("router f32 alloc");
+    for (size_t i = 0; i < (size_t)RF32_MAXROWS * RF32_MAXIN; i++) x[i] = rng_unit();
+
+    ds4_gpu_tensor *x_t = ds4_gpu_tensor_alloc((uint64_t)RF32_MAXROWS * RF32_MAXIN * sizeof(float));
+    ds4_gpu_tensor *la_t = ds4_gpu_tensor_alloc((uint64_t)RF32_MAXROWS * RF32_MAXOUT * sizeof(float));
+    ds4_gpu_tensor *lb_t = ds4_gpu_tensor_alloc((uint64_t)RF32_MAXROWS * RF32_MAXOUT * sizeof(float));
+    ds4_gpu_tensor *sa_t = ds4_gpu_tensor_alloc((uint64_t)RF32_MAXROWS * N_EXPERT_USED * sizeof(int32_t));
+    ds4_gpu_tensor *sb_t = ds4_gpu_tensor_alloc((uint64_t)RF32_MAXROWS * N_EXPERT_USED * sizeof(int32_t));
+    ds4_gpu_tensor *wa_t = ds4_gpu_tensor_alloc((uint64_t)RF32_MAXROWS * N_EXPERT_USED * sizeof(float));
+    ds4_gpu_tensor *wb_t = ds4_gpu_tensor_alloc((uint64_t)RF32_MAXROWS * N_EXPERT_USED * sizeof(float));
+    require_ok(x_t && la_t && lb_t && sa_t && sb_t && wa_t && wb_t,
+               "router f32 tensor allocation");
+    require_ok(ds4_gpu_tensor_write(x_t, 0, x,
+                                    (uint64_t)RF32_MAXROWS * RF32_MAXIN * sizeof(float)),
+               "router f32 activation write");
+
+    static const uint32_t widths[] = {
+        1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u, 11u, 12u, 13u, 15u, 16u, 17u, 18u,
+        23u, 24u, 25u, 31u, 32u, 33u, 47u, 63u, 64u, 65u, 96u, 127u, 128u,
+        129u, 170u, 171u, 172u, 255u, 256u, 257u, 511u, 512u, 1023u, 1024u,
+    };
+    const int n_widths = (int)(sizeof(widths) / sizeof(widths[0]));
+    uint64_t differing = 0, checked = 0, sel_diff = 0, tiled = 0;
+    double tightest = 1e30;
+
+    for (int wi = 0; wi < n_widths; wi++) {
+        const uint32_t rows = widths[wi];
+        const uint64_t n = (uint64_t)rows * RF32_OUT;
+
+        setenv("DS4_F32_NO_WARP_TILE", "1", 1);
+        require_ok(ds4_gpu_matmul_f32_decode_rows_exact_tensor(
+                       la_t, wmap, wbytes, 0, RF32_IN, RF32_OUT, x_t, rows),
+                   "router f32 shipping-path projection");
+        unsetenv("DS4_F32_NO_WARP_TILE");
+        require_ok(ds4_gpu_matmul_f32_decode_rows_exact_tensor(
+                       lb_t, wmap, wbytes, 0, RF32_IN, RF32_OUT, x_t, rows),
+                   "router f32 warp-tile projection");
+        if (rows >= 8u) tiled++;
+
+        require_ok(ds4_gpu_tensor_read(la_t, 0, la, n * sizeof(float)), "router f32 read a");
+        require_ok(ds4_gpu_tensor_read(lb_t, 0, lb, n * sizeof(float)), "router f32 read b");
+        for (uint64_t i = 0; i < n; i++) {
+            checked++;
+            if (memcmp(&la[i], &lb[i], sizeof(float)) != 0) differing++;
+        }
+
+        require_ok(ds4_gpu_qwen4exp_router_select_tensor(sa_t, wa_t, la_t,
+                                                         (uint32_t)RF32_OUT,
+                                                         N_EXPERT_USED, rows),
+                   "router f32 select a");
+        require_ok(ds4_gpu_qwen4exp_router_select_tensor(sb_t, wb_t, lb_t,
+                                                         (uint32_t)RF32_OUT,
+                                                         N_EXPERT_USED, rows),
+                   "router f32 select b");
+        const uint64_t sn = (uint64_t)rows * N_EXPERT_USED;
+        require_ok(ds4_gpu_tensor_read(sa_t, 0, sa, sn * sizeof(int32_t)), "router f32 sel a");
+        require_ok(ds4_gpu_tensor_read(sb_t, 0, sb, sn * sizeof(int32_t)), "router f32 sel b");
+        require_ok(ds4_gpu_tensor_read(wa_t, 0, wa, sn * sizeof(float)), "router f32 w a");
+        require_ok(ds4_gpu_tensor_read(wb_t, 0, wb, sn * sizeof(float)), "router f32 w b");
+        for (uint64_t i = 0; i < sn; i++) {
+            if (sa[i] != sb[i]) sel_diff++;
+            if (memcmp(&wa[i], &wb[i], sizeof(float)) != 0) sel_diff++;
+        }
+
+        /* How much room the selection actually had: the gap between the 10th
+         * and 11th largest logit of each row, on the shipping path. */
+        for (uint32_t r = 0; r < rows; r++) {
+            const float *row = la + (size_t)r * RF32_OUT;
+            float top[N_EXPERT_USED + 1];
+            for (int i = 0; i <= N_EXPERT_USED; i++) top[i] = -FLT_MAX;
+            for (int e = 0; e < RF32_OUT; e++) {
+                float v = row[e];
+                for (int i = 0; i <= N_EXPERT_USED; i++) {
+                    if (v > top[i]) { const float t = top[i]; top[i] = v; v = t; }
+                }
+            }
+            const double gap = (double)top[N_EXPERT_USED - 1] - (double)top[N_EXPERT_USED];
+            if (gap < tightest) tightest = gap;
+        }
+    }
+
+    if (differing) fail("router f32 warp tile changed a logit");
+    if (sel_diff) fail("router f32 warp tile changed the expert selection");
+    printf("router f32 projection (in %d, out %d): %d widths to %u tokens, "
+           "%llu warp-tile widths, %llu of %llu logits differ, selected ids and "
+           "order identical, tightest top-%d/%d logit gap %.3e\n",
+           RF32_IN, RF32_OUT, n_widths, widths[n_widths - 1],
+           (unsigned long long)tiled, (unsigned long long)differing,
+           (unsigned long long)checked, N_EXPERT_USED, N_EXPERT_USED + 1,
+           tightest);
+
+    ds4_gpu_tensor_free(x_t); ds4_gpu_tensor_free(la_t); ds4_gpu_tensor_free(lb_t);
+    ds4_gpu_tensor_free(sa_t); ds4_gpu_tensor_free(sb_t);
+    ds4_gpu_tensor_free(wa_t); ds4_gpu_tensor_free(wb_t);
+    free(x); free(la); free(lb); free(sa); free(sb); free(wa); free(wb);
+    munmap(wmap, wbytes);
+}
+
 enum { INV_TOKENS = 21 };
 
 static void run_row_invariance_case(const uint8_t *model,
@@ -1577,46 +1725,6 @@ static void run_production_expert_cases(void) {
                                        (uint64_t)PROD_TOKENS * PROD_OUT_DIM * sizeof(float)),
                    "production output read");
 
-        /* Compare every intermediate and output against the former joint
-         * gate/up projection, including the Q8 and Q5_1 down consumers. */
-        if (gate_type == TYPE_Q4_K) {
-            const char *pin = getenv("DS4_QWEN4EXP_NO_SPLIT_GATEUP");
-            char *saved = pin ? strdup(pin) : NULL;
-            require_ok(!pin || saved, "split gate/up pin save");
-            ds4_gpu_tensor *tensors[] = {out_t, mid_t, part_t};
-            const size_t sizes[] = {
-                (size_t)PROD_TOKENS * PROD_OUT_DIM * sizeof(float),
-                (size_t)PROD_TOKENS * PROD_USED * PROD_MID_DIM * sizeof(float),
-                (size_t)PROD_TOKENS * PROD_USED * PROD_OUT_DIM * sizeof(float)};
-            void *reference[3], *candidate[3];
-            for (unsigned j = 0; j < 3; j++) {
-                reference[j] = malloc(sizes[j]); candidate[j] = malloc(sizes[j]);
-                require_ok(reference[j] && candidate[j], "split gate/up buffers");
-                require_ok(ds4_gpu_tensor_read(tensors[j], 0, candidate[j], sizes[j]),
-                           "split gate/up candidate read");
-            }
-            require_ok(setenv("DS4_QWEN4EXP_NO_SPLIT_GATEUP", "1", 1) == 0,
-                       "joint gate/up pin");
-            require_ok(ds4_gpu_qwen4exp_routed_moe_tensor(
-                           out_t, mid_t, part_t, &gate_slab, &up_slab, &down_slab,
-                           PROD_IN_DIM, PROD_MID_DIM, PROD_OUT_DIM,
-                           selected_t, weights_t, PROD_EXPERTS, PROD_USED,
-                           x_t, PROD_TOKENS, PROD_USED * PROD_MID_DIM),
-                       "joint gate/up oracle");
-            for (unsigned j = 0; j < 3; j++) {
-                require_ok(ds4_gpu_tensor_read(tensors[j], 0, reference[j], sizes[j]),
-                           "joint gate/up read");
-                require_ok(memcmp(reference[j], candidate[j], sizes[j]) == 0,
-                           "split gate/up exact intermediates");
-                free(reference[j]); free(candidate[j]);
-            }
-            require_ok((saved ? setenv("DS4_QWEN4EXP_NO_SPLIT_GATEUP", saved, 1) :
-                                unsetenv("DS4_QWEN4EXP_NO_SPLIT_GATEUP")) == 0,
-                       "split gate/up pin restore");
-            free(saved);
-            puts("split gate/up: complete out, mid and down partials bit-identical");
-        }
-
         prod_reference(image + gate_off[gi], image + up_off[gi], image + down_off[dj],
                        gate_type, down_type, x, selected, weights, expected);
 
@@ -1881,6 +1989,21 @@ static void run_shared_exact_case(uint32_t in_dim, uint32_t mid_dim,
 }
 
 int main(int argc, char **argv) {
+    /* Fast mode for tests/qwen4exp_router_f32_mutants.sh: just the F32 router
+     * projection's exactness sweep, so a mutant run costs one rebuild and a
+     * few seconds instead of the whole MoE suite. */
+    if (argc == 2 && strcmp(argv[1], "--router-f32") == 0) {
+        require_ok(ds4_gpu_init(), "GPU init");
+        /* The router (2560 -> 512), the GDN alpha/beta projections that share the
+     * entry (2560 -> 48), and one shape whose chain length is NOT the 10 the
+     * router's 2560 gives -- the tile's generic arm, which nothing in the
+     * tower reaches today and which would otherwise go unchecked. */
+    run_router_f32_prefill_exact_case(2560, 512);
+    run_router_f32_prefill_exact_case(2560, 48);
+    run_router_f32_prefill_exact_case(2048, 512);
+        ds4_gpu_cleanup();
+        return 0;
+    }
     if (argc == 2 && strcmp(argv[1], "--shared-exact") == 0) {
         require_ok(ds4_gpu_init(), "GPU init");
         run_shared_exact_case(PROD_IN_DIM, PROD_MID_DIM, PROD_OUT_DIM);
@@ -2278,6 +2401,14 @@ int main(int argc, char **argv) {
             delta += fabs((double)combined[i] - (double)routed[i]);
         if (!(delta > 0.0)) fail("shared expert contributed nothing");
     }
+
+    /* The router (2560 -> 512), the GDN alpha/beta projections that share the
+     * entry (2560 -> 48), and one shape whose chain length is NOT the 10 the
+     * router's 2560 gives -- the tile's generic arm, which nothing in the
+     * tower reaches today and which would otherwise go unchecked. */
+    run_router_f32_prefill_exact_case(2560, 512);
+    run_router_f32_prefill_exact_case(2560, 48);
+    run_router_f32_prefill_exact_case(2048, 512);
 
     run_row_invariance_case(model, model_bytes, gate_offset, up_offset,
                             down_offset, sh_router_offset, sh_gate_offset,

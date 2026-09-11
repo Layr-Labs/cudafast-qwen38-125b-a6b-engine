@@ -2656,104 +2656,6 @@ __global__ static void qwen4exp_moe_down_combine_kernel(
 }
 
 
-/* Adjacent warps own the gate and up projection of one output row. Each
- * carries one decoded matrix and its accumulators, reducing register pressure
- * during a two-token verify. Every projection retains the original ascending
- * group chain and warp reduction. Only the completed scalar projections pass
- * through shared memory before the unchanged SiLU/up/router-weight product.
- * Four rows share a 256-thread block; inactive row warps still join barriers. */
-template <int R, int Type>
-__global__ static void qwen4exp_moe_gateup_split_kernel(
-        float *mid,
-        const char *gate,
-        const char *up,
-        const int8_t *xq,
-        const float *xs,
-        const int32_t *xsum,
-        const int32_t *pairs,
-        const int32_t *counts,
-        const int32_t *offsets,
-        const int32_t *active,
-        const float *weights,
-        uint64_t gate_expert_bytes,
-        uint64_t gate_row_bytes,
-        uint64_t up_expert_bytes,
-        uint64_t up_row_bytes,
-        uint32_t gate_type,
-        uint32_t up_type,
-        uint32_t groups,
-        uint32_t mid_dim,
-        uint32_t mid_token_stride,
-        uint32_t n_expert_used) {
-    const uint32_t lane = threadIdx.x & 31u;
-    const uint32_t warp = threadIdx.x >> 5u;
-    const uint32_t row = blockIdx.x * 4u + (warp >> 1u);
-    const bool live = row < mid_dim;
-    const bool second = (warp & 1u) != 0u;
-    uint32_t expert = blockIdx.y;
-    if (active) {
-        if ((int32_t)blockIdx.y >= active[0]) return;
-        expert = (uint32_t)active[1 + blockIdx.y];
-    }
-    const int32_t cnt = counts[expert];
-    if (cnt <= 0) return;
-    const int32_t base = offsets[expert];
-    const char *weight_row = (second ? up : gate) +
-        (uint64_t)expert * (second ? up_expert_bytes : gate_expert_bytes) +
-        (uint64_t)(live ? row : 0u) * (second ? up_row_bytes : gate_row_bytes);
-    __shared__ float projected[R][8];
-    for (int32_t at = 0; at < cnt; at += R) {
-        const int32_t take = (cnt - at) < R ? (cnt - at) : R;
-        uint32_t tok[R];
-#pragma unroll
-        for (int r = 0; r < R; r++) {
-            const int32_t p = pairs[base + at + (r < take ? r : 0)];
-            tok[r] = (uint32_t)p / n_expert_used;
-        }
-        float acc[R];
-#pragma unroll
-        for (int r = 0; r < R; r++) acc[r] = 0.0f;
-        if (live) {
-            for (uint32_t g = lane; g < groups; g += 32u) {
-                int8_t wq[32]; float wa[2], wb[2]; int halves = 1;
-                dev_qwen4exp_group_decode((uint32_t)Type, weight_row, g,
-                                          wq, wa, wb, &halves);
-#pragma unroll
-                for (int r = 0; r < R; r++) {
-                    if (r < take) {
-                        const uint64_t at_g = (uint64_t)tok[r] * groups + g;
-                        qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves,
-                            xq + at_g * 32u, xs[at_g], xsum[at_g]);
-                    }
-                }
-            }
-        }
-#pragma unroll
-        for (int r = 0; r < R; r++) {
-            const float v = warp_sum_f32(acc[r]);
-            if (lane == 0u) projected[r][warp] = v;
-        }
-        __syncthreads();
-        if (live && !second && lane == 0u) {
-#pragma unroll
-            for (int r = 0; r < R; r++) {
-                if (r < take) {
-                    const uint32_t p = (uint32_t)pairs[base + at + r];
-                    const uint32_t t = p / n_expert_used;
-                    const uint32_t slot = p - t * n_expert_used;
-                    const float g = projected[r][warp];
-                    const float u = projected[r][warp + 1u];
-                    mid[(uint64_t)t * mid_token_stride +
-                        (uint64_t)slot * mid_dim + row] =
-                        (g / (1.0f + expf(-g))) * u * weights[p];
-                }
-            }
-        }
-        /* Readers finish before a fast projection warp reuses this tile. */
-        __syncthreads();
-    }
-}
-
 /* Grid (ceil(mid_dim / 8), n_expert).  The block owns one expert; the pair
  * list gives it the (token, slot) pairs that chose it, so a decoded group
  * serves R of them. */
@@ -4586,22 +4488,6 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             QWEN4EXP_GATEUP_MMA(-1, -1);
         }
 #undef QWEN4EXP_GATEUP_MMA
-    }
-    /* The measured two-token Q4 path; the diagnostic pin retains the joint
-     * projection as a bit-exact oracle. Other widths keep their prior kernel. */
-    else if (n_tokens == 2u && tile == 2 && specialize &&
-             gate_slab->type == DS4_QWEN4EXP_TY_q4_K &&
-             up_slab->type == DS4_QWEN4EXP_TY_q4_K &&
-             getenv("DS4_QWEN4EXP_NO_SPLIT_GATEUP") == NULL) {
-        qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K><<<
-            dim3((mid_dim + 3u) / 4u, gu_rows, 1), threads, 0, stream>>>(
-            (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum,
-            sc.pairs, sc.counts, sc.offsets, gu_active,
-            (const float *)weights->ptr,
-            gate_slab->expert_bytes, gate_slab->row_bytes,
-            up_slab->expert_bytes, up_slab->row_bytes,
-            gate_slab->type, up_slab->type, xgroups, mid_dim,
-            mid_token_stride, n_expert_used);
     }
     else if (tile == 8) { QWEN4EXP_GATEUP(8); }
     else if (tile == 4) { QWEN4EXP_GATEUP(4); }
