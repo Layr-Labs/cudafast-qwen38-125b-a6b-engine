@@ -7874,7 +7874,7 @@ qwen4exp_qsa_split_scores_kernel(
     }
 }
 
-template <uint32_t GROUP>
+template <uint32_t GROUP, uint32_t VSTEP>
 __global__ static void __launch_bounds__(256, 1)
 qwen4exp_qsa_split_probs_kernel(
         const float *v_cache,
@@ -7975,20 +7975,20 @@ qwen4exp_qsa_split_probs_kernel(
         for (uint32_t h = 0; h < GROUP; h++) contrib[h] = 0.0f;
         const float *vh = v_cache + (uint64_t)kv_head * head_dim + tid;
         uint32_t j = 0;
-        /* QWEN4EXP_QSA_SPLIT_VSTEP value rows in flight on the dense path,
+        /* VSTEP value rows in flight on the dense path,
          * where no key in the tile is masked (the per-head kernel's own
          * batch and its own argument); the products still land j ascending. */
         if (!sparse) {
-            for (; j + QWEN4EXP_QSA_SPLIT_VSTEP <= n_in_tile;
-                   j += QWEN4EXP_QSA_SPLIT_VSTEP) {
-                float a[QWEN4EXP_QSA_SPLIT_VSTEP];
+            for (; j + VSTEP <= n_in_tile;
+                   j += VSTEP) {
+                float a[VSTEP];
 #pragma unroll
-                for (uint32_t i = 0; i < QWEN4EXP_QSA_SPLIT_VSTEP; i++) {
+                for (uint32_t i = 0; i < VSTEP; i++) {
                     a[i] = vh[(uint64_t)keys[j + i] * kv_stride];
                 }
                 asm volatile("" ::: "memory");   /* as in the scores kernel */
 #pragma unroll
-                for (uint32_t i = 0; i < QWEN4EXP_QSA_SPLIT_VSTEP; i++) {
+                for (uint32_t i = 0; i < VSTEP; i++) {
 #pragma unroll
                     for (uint32_t h = 0; h < GROUP; h++) {
                         contrib[h] = __fmaf_rn(probs[h * nth + j + i], a[i],
@@ -8513,14 +8513,18 @@ extern "C" uint64_t ds4_gpu_qwen4exp_qsa_split_scratch_bytes(
  * off, DS4_QWEN4EXP_QSA_SPLIT_GROUP sets the width.  Read fresh for the same
  * reason qwen4exp_qsa_group_width is; a decode row pays one getenv per layer
  * and a captured one pays it once at capture. */
-static uint32_t qwen4exp_qsa_split_width(void) {
+static uint32_t qwen4exp_qsa_split_width(uint32_t n_tokens, uint32_t n_head,
+                                         uint32_t n_kv_head, uint32_t head_dim) {
     if (getenv("DS4_QWEN4EXP_NO_QSA_SPLIT") != NULL) return 0u;
     const char *forced = getenv("DS4_QWEN4EXP_QSA_SPLIT_GROUP");
     if (forced != NULL) {
         const long v = strtol(forced, NULL, 10);
         return (v > 0 && v <= 32) ? (uint32_t)v : 0u;
     }
-    return 4u;
+    /* One model-shaped row benefits from twice as many independent head
+     * groups. Multi-row calls retain four heads and their K/V reuse. */
+    return n_tokens == 1u && n_head == 24u && n_kv_head == 2u && head_dim == 256u
+        ? 2u : 4u;
 }
 
 /* The split path.  Returns 1 when it launched, 0 when the shape or the
@@ -8546,7 +8550,7 @@ static int qwen4exp_qsa_attention_split(
         return 0;
     }
     const uint32_t gqa = n_head / n_kv_head;
-    uint32_t g = qwen4exp_qsa_split_width();
+    uint32_t g = qwen4exp_qsa_split_width(n_tokens, n_head, n_kv_head, head_dim);
     if (g == 0u) return 0;
     if (g > gqa) g = gqa;
     while (g > 1u && (gqa % g) != 0u) g--;
@@ -8569,24 +8573,34 @@ static int qwen4exp_qsa_attention_split(
         pr_shared > QWEN4EXP_QSA_GROUP_SHARED_CAP) {
         return 0;
     }
-#define QWEN4EXP_QSA_SPLIT_LAUNCH(G)                                          \
+#define QWEN4EXP_QSA_SPLIT_LAUNCH(G, V)                                          \
     qwen4exp_qsa_split_scores_kernel<G><<<grid, nth, sc_shared,               \
         cuda_decode_stream()>>>(                                              \
             (const float *)q->ptr, (const float *)k_cache->ptr, sel, cnt,     \
             sc, tmax, n_tokens, n_head, n_kv_head, head_dim, pos0, cache_cap, \
             max_selected, sparse ? 1u : 0u, max_tiles, scale, d_pos);         \
-    qwen4exp_qsa_split_probs_kernel<G><<<grid, nth, pr_shared,                \
+    qwen4exp_qsa_split_probs_kernel<G, V><<<grid, nth, pr_shared,                \
         cuda_decode_stream()>>>(                                              \
             (const float *)v_cache->ptr, sel, cnt, sc, tmax, ct, tsum,        \
             n_tokens, n_head, n_kv_head, head_dim, pos0, cache_cap,           \
             max_selected, sparse ? 1u : 0u, max_tiles, d_pos)
     switch (g) {
-        case 12u: QWEN4EXP_QSA_SPLIT_LAUNCH(12u); break;
-        case 6u:  QWEN4EXP_QSA_SPLIT_LAUNCH(6u);  break;
-        case 4u:  QWEN4EXP_QSA_SPLIT_LAUNCH(4u);  break;
-        case 3u:  QWEN4EXP_QSA_SPLIT_LAUNCH(3u);  break;
-        case 2u:  QWEN4EXP_QSA_SPLIT_LAUNCH(2u);  break;
-        case 1u:  QWEN4EXP_QSA_SPLIT_LAUNCH(1u);  break;
+        case 12u: QWEN4EXP_QSA_SPLIT_LAUNCH(12u, QWEN4EXP_QSA_SPLIT_VSTEP); break;
+        case 6u:  QWEN4EXP_QSA_SPLIT_LAUNCH(6u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
+        case 4u:  QWEN4EXP_QSA_SPLIT_LAUNCH(4u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
+        case 3u:  QWEN4EXP_QSA_SPLIT_LAUNCH(3u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
+        case 2u:
+            /* Preserve the ordered products; only reduce dense V prefetch
+             * depth for the measured one-row model shape. */
+            if (!sparse && n_tokens == 1u && n_head == 24u &&
+                n_kv_head == 2u && head_dim == 256u &&
+                getenv("DS4_QWEN4EXP_NO_QSA_SHORT_V") == NULL) {
+                QWEN4EXP_QSA_SPLIT_LAUNCH(2u, 8u);
+            } else {
+                QWEN4EXP_QSA_SPLIT_LAUNCH(2u, QWEN4EXP_QSA_SPLIT_VSTEP);
+            }
+            break;
+        case 1u:  QWEN4EXP_QSA_SPLIT_LAUNCH(1u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
         default:  return 0;
     }
 #undef QWEN4EXP_QSA_SPLIT_LAUNCH
