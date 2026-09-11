@@ -1137,8 +1137,10 @@ __device__ __forceinline__ static void dev_qwen4exp_group_decode(
     switch (type) {
     case (uint32_t)DS4_QWEN4EXP_TY_q8_0: {
         const char *blk = row + (uint64_t)g * 34u;
-        const uint16_t d = (uint16_t)((uint8_t)blk[0]) |
-                           (uint16_t)((uint16_t)(uint8_t)blk[1] << 8u);
+        const uint16_t d = (((uintptr_t)blk & 1u) == 0u)
+            ? *(const uint16_t *)(const void *)blk
+            : (uint16_t)((uint8_t)blk[0]) |
+              (uint16_t)((uint16_t)(uint8_t)blk[1] << 8u);
         wa[0] = dev_f16_to_f32(d);
         const uint8_t *payload = (const uint8_t *)blk + 2u;
         const uintptr_t address = (uintptr_t)payload;
@@ -1156,11 +1158,20 @@ __device__ __forceinline__ static void dev_qwen4exp_group_decode(
             wq[i * 4 + 3] = (int8_t)(packed >> 24u);
             previous = next;
         }
-        /* The final four bytes are still inside this 34-byte block, but the
-         * next aligned word can extend past it.  Keep that group on the byte
-         * path rather than issue a speculative read into the next row. */
+        /* The last aligned word already contains the beginning of the
+         * final group. Even payloads need only the final in-bounds halfword;
+         * at shift 0 previous is the whole group, at shift 16 it supplies
+         * the first two bytes. Odd payloads retain their byte loads. */
+        if ((address & 1u) == 0u) {
+            const uint32_t last = *(const uint16_t *)(const void *)(payload + 30);
+            const uint32_t packed = __funnelshift_r(previous, last, shift);
 #pragma unroll
-        for (int i = 28; i < 32; i++) wq[i] = (int8_t)payload[i];
+            for (int b = 0; b < 4; b++)
+                wq[28 + b] = (int8_t)((packed >> (8 * b)) & 0xffu);
+        } else {
+#pragma unroll
+            for (int i = 28; i < 32; i++) wq[i] = (int8_t)payload[i];
+        }
         return;
     }
     case (uint32_t)DS4_QWEN4EXP_TY_q5_1: {
