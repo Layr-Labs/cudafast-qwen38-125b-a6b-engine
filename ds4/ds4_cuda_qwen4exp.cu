@@ -2259,6 +2259,21 @@ __device__ __forceinline__ static void dev_qwen4exp_group_decode_w(
     qw_tile_store_group(dst, wq);
 }
 
+__device__ __forceinline__ static void qwen4exp_group_decode_fast(
+        uint32_t type, const char *row, uint32_t g,
+        int8_t *wq, float *wa, float *wb, int *halves) {
+    uint32_t raw[8];
+    const uint32_t *rawp = qw_raw_load(type, row, g, raw) ? raw : NULL;
+    if (rawp && (type == (uint32_t)DS4_QWEN4EXP_TY_q4_K ||
+                 type == (uint32_t)DS4_QWEN4EXP_TY_q5_1 ||
+                 type == (uint32_t)DS4_QWEN4EXP_TY_q5_K)) {
+        dev_qwen4exp_group_decode_w(type, row, g, rawp, wq, wa, wb);
+        *halves = 1;
+    } else {
+        dev_qwen4exp_group_decode(type, row, g, wq, wa, wb, halves);
+    }
+}
+
 __device__ __forceinline__ static void qw_mma_m16n8k32(
         int32_t *d, const uint32_t *a, const uint32_t *b) {
     asm volatile(
@@ -2641,15 +2656,15 @@ qwen4exp_moe_down_mma_kernel(
                 const uint32_t gg = idx - r * QW_MMA_G;
                 const uint32_t g = kc + gg;
                 const uint32_t orow = row0 + r;
-                int8_t wq[32];
-                float wa[2], wb[2];
-                int halves = 1;
                 if (orow < out_dim && g < groups) {
-                    dev_qwen4exp_group_decode(
-                            DownType < 0 ? down_type : (uint32_t)DownType,
-                            down_e + (uint64_t)orow * down_row_bytes, g,
-                            wq, wa, wb, &halves);
-                    qw_tile_store_group(&sA[r * QW_MMA_LD + gg * 32], wq);
+                    const uint32_t dt = DownType < 0 ? down_type : (uint32_t)DownType;
+                    const char *drow = down_e + (uint64_t)orow * down_row_bytes;
+                    uint32_t raw[8];
+                    const uint32_t *rawp = qw_raw_load(dt, drow, g, raw) ? raw : NULL;
+                    float wa[2] = {0.0f, 0.0f}, wb[2] = {0.0f, 0.0f};
+                    dev_qwen4exp_group_decode_w(
+                            dt, drow, g, rawp,
+                            &sA[r * QW_MMA_LD + gg * 32], wa, wb);
                     sWA[r * QW_MMA_G + gg] = wa[0];
                     sWB[r * QW_MMA_G + gg] = wb[0];
                 } else {
@@ -2946,10 +2961,10 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
             int8_t gw[32], uw[32];
             float ga[2], gb[2], ua[2], ub[2];
             int gh = 1, uh = 1;
-            dev_qwen4exp_group_decode(
+            qwen4exp_group_decode_fast(
                     GateType < 0 ? gate_type : (uint32_t)GateType,
                     gate_row, g, gw, ga, gb, &gh);
-            dev_qwen4exp_group_decode(
+            qwen4exp_group_decode_fast(
                     UpType < 0 ? up_type : (uint32_t)UpType,
                     up_row, g, uw, ua, ub, &uh);
 #pragma unroll
@@ -3028,7 +3043,7 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                     int8_t wq[32];
                     float wa[2], wb[2];
                     int halves = 1;
-                    dev_qwen4exp_group_decode(
+                    qwen4exp_group_decode_fast(
                             DownType < 0 ? down_type : (uint32_t)DownType,
                             drow, g, wq, wa, wb, &halves);
                     const uint64_t at_g = mrow * groups + g;
@@ -3084,8 +3099,8 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
         int8_t gw[32], uw[32];
         float ga[2], gb[2], ua[2], ub[2];
         int gh = 1, uh = 1;
-        dev_qwen4exp_group_decode(gate_type, gate_row, g, gw, ga, gb, &gh);
-        dev_qwen4exp_group_decode(up_type, up_row, g, uw, ua, ub, &uh);
+        qwen4exp_group_decode_fast(gate_type, gate_row, g, gw, ga, gb, &gh);
+        qwen4exp_group_decode_fast(up_type, up_row, g, uw, ua, ub, &uh);
 #pragma unroll
         for (int r = 0; r < R; r++) {
             if ((uint32_t)r < take) {
@@ -3139,7 +3154,7 @@ __global__ static void qwen4exp_shared_down_q_kernel(
         int8_t wq[32];
         float wa[2], wb[2];
         int halves = 1;
-        dev_qwen4exp_group_decode(down_type, down_row, g, wq, wa, wb, &halves);
+        qwen4exp_group_decode_fast(down_type, down_row, g, wq, wa, wb, &halves);
 #pragma unroll
         for (int r = 0; r < R; r++) {
             if ((uint32_t)r < take) {
@@ -3363,9 +3378,9 @@ __global__ static void qwen4exp_shared_gateup_stage_kernel(
         int8_t wq[32];
         float wa[2], wb[2];
         int halves = 1;
-        dev_qwen4exp_group_decode(second ? up_type : gate_type,
-                                  second ? up_row : gate_row, g,
-                                  wq, wa, wb, &halves);
+        qwen4exp_group_decode_fast(second ? up_type : gate_type,
+                                   second ? up_row : gate_row, g,
+                                   wq, wa, wb, &halves);
         qwen4exp_pack_group(&s_lo[item], &s_hi[item], wq);
         s_a0[item] = wa[0];
         s_a1[item] = wa[1];
@@ -3453,7 +3468,7 @@ __global__ static void qwen4exp_shared_down_stage_kernel(
         int8_t wq[32];
         float wa[2], wb[2];
         int halves = 1;
-        dev_qwen4exp_group_decode(down_type, down_row, g, wq, wa, wb, &halves);
+        qwen4exp_group_decode_fast(down_type, down_row, g, wq, wa, wb, &halves);
         qwen4exp_pack_group(&s_lo[g], &s_hi[g], wq);
         s_a0[g] = wa[0];
         s_a1[g] = wa[1];
@@ -4570,16 +4585,16 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             logical_tier, idx_bytes + pair_bytes + xq_bytes + mq_bytes);
     if (!base) return 0;
     qwen4exp_moe_scratch sc;
-    sc.counts = (int32_t *)base;
+    sc.xq = (int8_t *)base;
+    sc.xs = (float *)(base + (uint64_t)n_tokens * xgroups * 32u);
+    sc.xsum = (int32_t *)(sc.xs + (uint64_t)n_tokens * xgroups);
+    char *at = base + xq_bytes;
+    sc.counts = (int32_t *)at;
     sc.offsets = sc.counts + n_total_expert;
     sc.cursor = sc.offsets + n_total_expert;
     sc.active = sc.cursor + n_total_expert;
     sc.pairs = sc.active + n_total_expert + 1u;
-    char *at = base + idx_bytes + pair_bytes;
-    sc.xq = (int8_t *)at;
-    sc.xs = (float *)(at + (uint64_t)n_tokens * xgroups * 32u);
-    sc.xsum = (int32_t *)(sc.xs + (uint64_t)n_tokens * xgroups);
-    at += xq_bytes;
+    at += idx_bytes + pair_bytes;
     sc.mq = (int8_t *)at;
     sc.ms = (float *)(at + (uint64_t)n_pairs * mgroups * 32u);
     sc.msum = (int32_t *)(sc.ms + (uint64_t)n_pairs * mgroups);
@@ -6339,7 +6354,8 @@ __global__ static void qwen4exp_qsa_indexer_scores_kernel(
         uint32_t head_dim,
         uint32_t pos0,
         uint32_t pool_size,
-        float norm_divisor) {
+        float norm_divisor,
+        const uint32_t *d_pos) {
     extern __shared__ float qwen4exp_score_shared[];
     const uint32_t block = blockIdx.x;
     const uint32_t token = blockIdx.y;
@@ -6347,8 +6363,9 @@ __global__ static void qwen4exp_qsa_indexer_scores_kernel(
     const uint32_t nth = blockDim.x;
     if (block >= n_blocks || token >= n_tokens) return;
 
+    const uint32_t p0 = d_pos ? *d_pos : pos0;
     float *dst = scores + (uint64_t)token * n_blocks + block;
-    uint32_t visible = (pos0 + token + 1u) / pool_size;
+    uint32_t visible = (p0 + token + 1u) / pool_size;
     if (visible > n_blocks) visible = n_blocks;
     if (block >= visible) {
         if (tid == 0u) *dst = QWEN4EXP_QSA_MASKED_SCORE;
@@ -6379,7 +6396,8 @@ __global__ static void qwen4exp_qsa_indexer_select_kernel(
         uint32_t sort_width,
         uint32_t pos0,
         uint32_t pool_size,
-        uint32_t max_selected) {
+        uint32_t max_selected,
+        const uint32_t *d_pos) {
     extern __shared__ int32_t qwen4exp_select_shared[];
     __shared__ uint32_t n_valid;
     const uint32_t token = blockIdx.x;
@@ -6430,7 +6448,8 @@ __global__ static void qwen4exp_qsa_indexer_select_kernel(
 
     const uint32_t m = n_valid;
     const uint32_t block_tokens = m * pool_size;
-    const uint32_t pos = pos0 + token;
+    const uint32_t p0 = d_pos ? *d_pos : pos0;
+    const uint32_t pos = p0 + token;
     const uint32_t complete = (pos + 1u) / pool_size;
     const uint32_t own_start = complete * pool_size;
     const uint32_t own_count = pos + 1u - own_start;
@@ -6466,7 +6485,8 @@ __global__ static void qwen4exp_qsa_attention_kernel(
         uint32_t max_selected,
         uint32_t sparse,
         float scale,
-        const uint32_t *d_pos) {
+        const uint32_t *d_pos,
+        const float *gate) {
     extern __shared__ __align__(16) float qwen4exp_attn_shared[];
     const uint32_t head = blockIdx.x;
     const uint32_t token = blockIdx.y;
@@ -6630,7 +6650,12 @@ __global__ static void qwen4exp_qsa_attention_kernel(
     }
 
     if (tid < head_dim) {
-        dst[tid] = (run_sum > 0.0f) ? acc / run_sum : 0.0f;
+        float val = (run_sum > 0.0f) ? acc / run_sum : 0.0f;
+        if (gate) {
+            const float g = gate[((uint64_t)token * n_head + head) * head_dim + tid];
+            val = val * (1.0f / (1.0f + expf(-g)));
+        }
+        dst[tid] = val;
     }
 }
 
@@ -6719,7 +6744,8 @@ __global__ static void qwen4exp_qsa_attention_group_kernel(
         uint32_t max_selected,
         uint32_t sparse,
         float scale,
-        const uint32_t *d_pos) {
+        const uint32_t *d_pos,
+        const float *gate) {
     extern __shared__ __align__(16) float qwen4exp_attn_grp_shared[];
     const uint32_t group = blockIdx.x;
     const uint32_t token = blockIdx.y;
@@ -6902,8 +6928,13 @@ __global__ static void qwen4exp_qsa_attention_group_kernel(
     if (tid < head_dim) {
 #pragma unroll
         for (uint32_t h = 0; h < GROUP; h++) {
-            dst[h * head_dim + tid] =
-                (run_sum[h] > 0.0f) ? acc[h] / run_sum[h] : 0.0f;
+            float val = (run_sum[h] > 0.0f) ? acc[h] / run_sum[h] : 0.0f;
+            if (gate) {
+                const uint32_t head_idx = head0 + h;
+                const float g = gate[((uint64_t)token * n_head + head_idx) * head_dim + tid];
+                val = val * (1.0f / (1.0f + expf(-g)));
+            }
+            dst[h * head_dim + tid] = val;
         }
     }
 }
@@ -7288,7 +7319,7 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_pool_update_tensor(
             cache_cap, head_dim, pool_size, rot_dim, eps, weight_offset, NULL);
 }
 
-extern "C" int ds4_gpu_qwen4exp_qsa_indexer_scores_tensor(
+extern "C" int ds4_gpu_qwen4exp_qsa_indexer_scores_dpos_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *pool,
@@ -7297,7 +7328,8 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_scores_tensor(
         uint32_t              n_head,
         uint32_t              head_dim,
         uint32_t              pos0,
-        uint32_t              pool_size) {
+        uint32_t              pool_size,
+        const ds4_gpu_tensor *d_pos) {
     if (n_tokens == 0u || n_blocks == 0u || n_head == 0u || head_dim == 0u ||
         pool_size == 0u ||
         !glm53_cuda_tensor_has(scores, (uint64_t)n_tokens * n_blocks, sizeof(float)) ||
@@ -7310,11 +7342,27 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_scores_tensor(
         nth * sizeof(float), cuda_decode_stream()>>>(
             (const float *)q->ptr, (const float *)pool->ptr,
             (float *)scores->ptr, n_tokens, n_blocks, n_head, head_dim, pos0,
-            pool_size, sqrtf((float)head_dim));
+            pool_size, sqrtf((float)head_dim),
+            d_pos ? (const uint32_t *)d_pos->ptr : NULL);
     return cuda_ok(cudaGetLastError(), "Qwen4-Exp indexer scores launch");
 }
 
-extern "C" int ds4_gpu_qwen4exp_qsa_indexer_select_tensor(
+extern "C" int ds4_gpu_qwen4exp_qsa_indexer_scores_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *pool,
+        uint32_t              n_tokens,
+        uint32_t              n_blocks,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        uint32_t              pos0,
+        uint32_t              pool_size) {
+    return ds4_gpu_qwen4exp_qsa_indexer_scores_dpos_tensor(
+            scores, q, pool, n_tokens, n_blocks, n_head, head_dim, pos0,
+            pool_size, NULL);
+}
+
+extern "C" int ds4_gpu_qwen4exp_qsa_indexer_select_dpos_tensor(
         ds4_gpu_tensor       *selected,
         ds4_gpu_tensor       *counts,
         const ds4_gpu_tensor *scores,
@@ -7324,7 +7372,8 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_select_tensor(
         uint32_t              top_k,
         uint32_t              pos0,
         uint32_t              pool_size,
-        uint32_t              max_selected) {
+        uint32_t              max_selected,
+        const ds4_gpu_tensor *d_pos) {
     if (n_tokens == 0u || n_blocks == 0u || top_k == 0u || top_k > n_blocks ||
         pool_size == 0u ||
         max_selected < (uint64_t)top_k * pool_size + pool_size - 1u ||
@@ -7342,11 +7391,28 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_select_tensor(
         (size_t)sort_width * sizeof(int32_t), cuda_decode_stream()>>>(
             (const float *)scores->ptr, (const int32_t *)topk->ptr,
             (int32_t *)selected->ptr, (int32_t *)counts->ptr, n_tokens,
-            n_blocks, top_k, sort_width, pos0, pool_size, max_selected);
+            n_blocks, top_k, sort_width, pos0, pool_size, max_selected,
+            d_pos ? (const uint32_t *)d_pos->ptr : NULL);
     return cuda_ok(cudaGetLastError(), "Qwen4-Exp indexer selection launch");
 }
 
-extern "C" int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
+extern "C" int ds4_gpu_qwen4exp_qsa_indexer_select_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *counts,
+        const ds4_gpu_tensor *scores,
+        const ds4_gpu_tensor *topk,
+        uint32_t              n_tokens,
+        uint32_t              n_blocks,
+        uint32_t              top_k,
+        uint32_t              pos0,
+        uint32_t              pool_size,
+        uint32_t              max_selected) {
+    return ds4_gpu_qwen4exp_qsa_indexer_select_dpos_tensor(
+            selected, counts, scores, topk, n_tokens, n_blocks, top_k,
+            pos0, pool_size, max_selected, NULL);
+}
+
+extern "C" int ds4_gpu_qwen4exp_qsa_attention_dpos_gate_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *k_cache,
@@ -7361,7 +7427,8 @@ extern "C" int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
         uint32_t              cache_cap,
         uint32_t              max_selected,
         float                 scale,
-        const ds4_gpu_tensor *d_pos) {
+        const ds4_gpu_tensor *d_pos,
+        const ds4_gpu_tensor *gate) {
     if (n_tokens == 0u || n_head == 0u || n_kv_head == 0u || head_dim == 0u ||
         (n_head % n_kv_head) != 0u || (!d_pos && (uint64_t)pos0 + n_tokens > cache_cap)) {
         return 0;
@@ -7374,6 +7441,7 @@ extern "C" int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
         !glm53_cuda_tensor_has(q, q_elems, sizeof(float)) ||
         !glm53_cuda_tensor_has(k_cache, cache_elems, sizeof(float)) ||
         !glm53_cuda_tensor_has(v_cache, cache_elems, sizeof(float)) ||
+        (gate && !glm53_cuda_tensor_has(gate, q_elems, sizeof(float))) ||
         (sparse &&
          (!glm53_cuda_tensor_has(selected, (uint64_t)n_tokens * max_selected,
                                  sizeof(int32_t)) ||
@@ -7381,18 +7449,10 @@ extern "C" int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
         return 0;
     }
     const uint32_t nth = qwen4exp_cuda_threads(head_dim);
-    /* The kernel accumulates the value vector under `tid < head_dim`, so a
-     * block narrower than head_dim would leave the tail channels unwritten
-     * with no error anywhere.  Refuse instead. */
     if (nth < head_dim) return 0;
     const uint32_t *d_pos_ptr = d_pos ? (const uint32_t *)d_pos->ptr : NULL;
+    const float *gate_ptr = (gate && gate->ptr) ? (const float *)gate->ptr : NULL;
 
-    /* Wide rows go to the head-group kernel, which reads each K and each V
-     * row once for the whole group instead of once per head.  It is the same
-     * arithmetic in the same order (see the kernel's own note), so the choice
-     * is a scheduling one only; a narrow call keeps the per-head kernel,
-     * whose grid is n_head times wider and which is what a one-row decode
-     * needs to fill the device at all. */
     const uint32_t gqa = n_head / n_kv_head;
     const uint32_t want = (n_tokens >= QWEN4EXP_QSA_GROUP_MIN_ROWS)
         ? qwen4exp_qsa_group_width() : 1u;
@@ -7410,7 +7470,8 @@ extern "C" int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
                     sparse ? (const int32_t *)selected->ptr : NULL,           \
                     sparse ? (const int32_t *)counts->ptr : NULL,             \
                     (float *)out->ptr, n_tokens, n_head, n_kv_head, head_dim, \
-                    pos0, cache_cap, max_selected, sparse ? 1u : 0u, scale, d_pos_ptr)
+                    pos0, cache_cap, max_selected, sparse ? 1u : 0u, scale,   \
+                    d_pos_ptr, gate_ptr)
             switch (g) {
                 case 12u: QWEN4EXP_QSA_GROUP_LAUNCH(12u); break;
                 case 8u:  QWEN4EXP_QSA_GROUP_LAUNCH(8u);  break;
@@ -7437,8 +7498,30 @@ extern "C" int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
             sparse ? (const int32_t *)selected->ptr : NULL,
             sparse ? (const int32_t *)counts->ptr : NULL,
             (float *)out->ptr, n_tokens, n_head, n_kv_head, head_dim, pos0,
-            cache_cap, max_selected, sparse ? 1u : 0u, scale, d_pos_ptr);
+            cache_cap, max_selected, sparse ? 1u : 0u, scale, d_pos_ptr, gate_ptr);
     return cuda_ok(cudaGetLastError(), "Qwen4-Exp QSA attention launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k_cache,
+        const ds4_gpu_tensor *v_cache,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *counts,
+        uint32_t              n_tokens,
+        uint32_t              n_head,
+        uint32_t              n_kv_head,
+        uint32_t              head_dim,
+        uint32_t              pos0,
+        uint32_t              cache_cap,
+        uint32_t              max_selected,
+        float                 scale,
+        const ds4_gpu_tensor *d_pos) {
+    return ds4_gpu_qwen4exp_qsa_attention_dpos_gate_tensor(
+            out, q, k_cache, v_cache, selected, counts,
+            n_tokens, n_head, n_kv_head, head_dim, pos0,
+            cache_cap, max_selected, scale, d_pos, NULL);
 }
 
 extern "C" int ds4_gpu_qwen4exp_qsa_attention_tensor(

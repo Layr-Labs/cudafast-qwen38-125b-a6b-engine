@@ -672,6 +672,24 @@ int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
         float                 scale,
         const ds4_gpu_tensor *d_pos);
 
+int ds4_gpu_qwen4exp_qsa_attention_dpos_gate_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k_cache,
+        const ds4_gpu_tensor *v_cache,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *counts,
+        uint32_t              n_tokens,
+        uint32_t              n_head,
+        uint32_t              n_kv_head,
+        uint32_t              head_dim,
+        uint32_t              pos0,
+        uint32_t              cache_cap,
+        uint32_t              max_selected,
+        float                 scale,
+        const ds4_gpu_tensor *d_pos,
+        const ds4_gpu_tensor *gate);
+
 int ds4_gpu_qwen4exp_qsa_prep_q_fused_tensor(
         ds4_gpu_tensor       *q,
         ds4_gpu_tensor       *gate,
@@ -774,6 +792,18 @@ int ds4_gpu_qwen4exp_qsa_indexer_scores_tensor(
         uint32_t              pos0,
         uint32_t              pool_size);
 
+int ds4_gpu_qwen4exp_qsa_indexer_scores_dpos_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *pool,
+        uint32_t              n_tokens,
+        uint32_t              n_blocks,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        uint32_t              pos0,
+        uint32_t              pool_size,
+        const ds4_gpu_tensor *d_pos);
+
 /* Expand the block top-k into an ASCENDING token id list per query: the
  * selected blocks' tokens followed by the tail of the query's own incomplete
  * block ("keep OR own").  `selected` is [n_tokens, max_selected] int32 padded
@@ -795,6 +825,19 @@ int ds4_gpu_qwen4exp_qsa_indexer_select_tensor(
         uint32_t              pos0,
         uint32_t              pool_size,
         uint32_t              max_selected);
+
+int ds4_gpu_qwen4exp_qsa_indexer_select_dpos_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *counts,
+        const ds4_gpu_tensor *scores,
+        const ds4_gpu_tensor *topk,
+        uint32_t              n_tokens,
+        uint32_t              n_blocks,
+        uint32_t              top_k,
+        uint32_t              pos0,
+        uint32_t              pool_size,
+        uint32_t              max_selected,
+        const ds4_gpu_tensor *d_pos);
 
 /* Attention over the selected set with an f32 softmax.  `selected == NULL`
  * runs the dense causal set.  Caches are [cache_cap, n_kv_head, head_dim];
