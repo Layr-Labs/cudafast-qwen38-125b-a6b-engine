@@ -1883,6 +1883,44 @@ __global__ static void qwen4exp_moe_group_scan_parallel_kernel(
     }
 }
 
+/* Prefix-scan ceil(count/32), then publish (expert, first_pair) work items
+ * in expert order. The count is bounded by floor(n_pairs/32) plus the number
+ * of live experts: no more than min(n_pairs, n_total_expert). Counts, offsets,
+ * active experts and the pair list remain untouched. All 512 threads join the
+ * warp/block scans, including padded expert lanes. */
+__global__ static void qwen4exp_moe_pair_tasks_kernel(
+        int32_t *tasks, const int32_t *counts, unsigned total) {
+    __shared__ int32_t warp_prefix[16];
+    const unsigned e = threadIdx.x, lane = e & 31u, warp = e >> 5u;
+    const int32_t count = e < total ? counts[e] : 0;
+    const int32_t tiles = (count + 31) / 32;
+    int32_t prefix = tiles;
+#pragma unroll
+    for (unsigned d = 1; d < 32; d <<= 1) {
+        int32_t v = __shfl_up_sync(0xffffffffu, prefix, d);
+        if (lane >= d) prefix += v;
+    }
+    if (lane == 31) warp_prefix[warp] = prefix;
+    __syncthreads();
+    if (warp == 0) {
+        int32_t v = lane < 16 ? warp_prefix[lane] : 0;
+#pragma unroll
+        for (unsigned d = 1; d < 32; d <<= 1) {
+            int32_t p = __shfl_up_sync(0xffffffffu, v, d);
+            if (lane >= d) v += p;
+        }
+        if (lane < 16) warp_prefix[lane] = v;
+    }
+    __syncthreads();
+    if (warp) prefix += warp_prefix[warp - 1];
+    const int32_t start = prefix - tiles;
+    for (int32_t t = 0; t < tiles; t++) {
+        tasks[1 + 2 * (start + t)] = (int32_t)e;
+        tasks[2 + 2 * (start + t)] = t * 32;
+    }
+    if (e == 0) tasks[0] = warp_prefix[15];
+}
+
 /* At decode and verify widths there are at most seventy pairs.  A single
  * 512-thread block can build the complete expert metadata without a memset,
  * count launch, scan launch, scatter launch, or inter-block atomics.  Each
@@ -2308,7 +2346,12 @@ __device__ __forceinline__ static void qw_mma_m16n8k32(
 }
 
 /* Grid (mid_dim / BM, the experts this call chose). */
-template <int GateType = -1, int UpType = -1>
+/* A prefill work item can name one expert's 32-pair window. Each output
+ * retains its original group accumulation and quantization; windows write
+ * disjoint pair rows. This bounds the work of a CTA when routing is uneven.
+ * The ordinary expert list remains the fallback and the down projection's
+ * input. No weight or activation representation changes. */
+template <int GateType = -1, int UpType = -1, bool PairTasks = false>
 __global__ __launch_bounds__(QW_MMA_THREADS) static void
 qwen4exp_moe_gateup_mma_kernel(
         float *mid,
@@ -2335,9 +2378,15 @@ qwen4exp_moe_gateup_mma_kernel(
         uint32_t mid_dim,
         uint32_t mid_token_stride,
         uint32_t n_expert_used) {
-    __shared__ __align__(16) int8_t sAg[QW_MMA_BM * QW_MMA_LD];
-    __shared__ __align__(16) int8_t sAu[QW_MMA_BM * QW_MMA_LD];
-    __shared__ __align__(16) int8_t sB [QW_MMA_BN * QW_MMA_LD];
+    /* The bounded Q4_K/Q5_K tasks benefit from distinct banks on MMA
+     * fragment reads. Padding only these temporary rows trades staging-store
+     * conflicts for cheaper repeated fragment loads. The Q8 task and the
+     * ordinary expert loop keep their measured 132-byte layout. */
+    enum { GU_LD = PairTasks && GateType != DS4_QWEN4EXP_TY_q8_0
+                       ? 144 : QW_MMA_LD };
+    __shared__ __align__(16) int8_t sAg[QW_MMA_BM * GU_LD];
+    __shared__ __align__(16) int8_t sAu[QW_MMA_BM * GU_LD];
+    __shared__ __align__(16) int8_t sB [QW_MMA_BN * GU_LD];
     __shared__ float  sWAg[QW_MMA_BM * QW_MMA_G], sWBg[QW_MMA_BM * QW_MMA_G];
     __shared__ float  sWAu[QW_MMA_BM * QW_MMA_G], sWBu[QW_MMA_BM * QW_MMA_G];
     __shared__ float  sXS [QW_MMA_BN * QW_MMA_G];
@@ -2355,8 +2404,8 @@ qwen4exp_moe_gateup_mma_kernel(
     if (active) {
         if ((int32_t)blockIdx.y >= active[0]) return;
     }
-    const uint32_t expert = active ? (uint32_t)active[1 + blockIdx.y]
-                                   : blockIdx.y;
+    const uint32_t expert = active
+        ? (uint32_t)active[1 + (PairTasks ? 2u : 1u) * blockIdx.y] : blockIdx.y;
     const int32_t cnt = counts[expert];
     if (cnt <= 0) return;
     const int32_t base = offsets[expert];
@@ -2374,7 +2423,9 @@ qwen4exp_moe_gateup_mma_kernel(
     const char *gate_row = gate_e + (uint64_t)dec_mrow * gate_row_bytes;
     const char *up_row   = up_e + (uint64_t)dec_mrow * up_row_bytes;
 
-    for (int32_t nbase = 0; nbase < cnt; nbase += QW_MMA_BN) {
+    const int32_t first_pair = PairTasks ? active[2u + 2u * blockIdx.y] : 0;
+    const int32_t end_pair = PairTasks ? min(cnt, first_pair + QW_MMA_BN) : cnt;
+    for (int32_t nbase = first_pair; nbase < end_pair; nbase += QW_MMA_BN) {
         const int32_t take = (cnt - nbase) < QW_MMA_BN ? (cnt - nbase)
                                                        : QW_MMA_BN;
         for (uint32_t i = tid; i < QW_MMA_BN; i += QW_MMA_THREADS) {
@@ -2425,20 +2476,20 @@ qwen4exp_moe_gateup_mma_kernel(
                     dev_qwen4exp_group_decode_w(
                             GateType < 0 ? gate_type : (uint32_t)GateType, gate_row, g,
                             haveg ? rawg : NULL,
-                            &sAg[dec_r * QW_MMA_LD + dec_gg * 32], wa, wb);
+                            &sAg[dec_r * GU_LD + dec_gg * 32], wa, wb);
                     sWAg[dec_r * QW_MMA_G + dec_gg] = wa[0];
                     sWBg[dec_r * QW_MMA_G + dec_gg] = wb[0];
                     haveg = next_w && qw_raw_load(gate_type, gate_row, gnext, rawg);
                     dev_qwen4exp_group_decode_w(
                             UpType < 0 ? up_type : (uint32_t)UpType, up_row, g,
                             haveu ? rawu : NULL,
-                            &sAu[dec_r * QW_MMA_LD + dec_gg * 32], wa, wb);
+                            &sAu[dec_r * GU_LD + dec_gg * 32], wa, wb);
                     sWAu[dec_r * QW_MMA_G + dec_gg] = wa[0];
                     sWBu[dec_r * QW_MMA_G + dec_gg] = wb[0];
                     haveu = next_w && qw_raw_load(up_type, up_row, gnext, rawu);
                 } else {
-                    qw_tile_store_zero(&sAg[dec_r * QW_MMA_LD + dec_gg * 32]);
-                    qw_tile_store_zero(&sAu[dec_r * QW_MMA_LD + dec_gg * 32]);
+                    qw_tile_store_zero(&sAg[dec_r * GU_LD + dec_gg * 32]);
+                    qw_tile_store_zero(&sAu[dec_r * GU_LD + dec_gg * 32]);
                     sWAg[dec_r * QW_MMA_G + dec_gg] = 0.0f;
                     sWBg[dec_r * QW_MMA_G + dec_gg] = 0.0f;
                     sWAu[dec_r * QW_MMA_G + dec_gg] = 0.0f;
@@ -2450,12 +2501,12 @@ qwen4exp_moe_gateup_mma_kernel(
             /* Activation tile: a padded token row is zero, and zero contributes
              * nothing to an integer dot, so the pad is exact. */
             if (haveb && kc + act_gg < groups) {
-                qw_tile_store_words(&sB[act_tk * QW_MMA_LD + act_gg * 32],
+                qw_tile_store_words(&sB[act_tk * GU_LD + act_gg * 32],
                                     rawb);
                 sXS  [act_tk * QW_MMA_G + act_gg] = act_scale;
                 sXSUM[act_tk * QW_MMA_G + act_gg] = act_sum;
             } else {
-                qw_tile_store_zero(&sB[act_tk * QW_MMA_LD + act_gg * 32]);
+                qw_tile_store_zero(&sB[act_tk * GU_LD + act_gg * 32]);
                 sXS  [act_tk * QW_MMA_G + act_gg] = 0.0f;
                 sXSUM[act_tk * QW_MMA_G + act_gg] = 0.0f;
             }
@@ -2488,8 +2539,8 @@ qwen4exp_moe_gateup_mma_kernel(
                 for (int r = 0; r < 4; r++) {
                     const uint32_t rr = ar + ((r & 1) ? 8u : 0u);
                     const uint32_t kk = gg * 32u + ak + ((r & 2) ? 16u : 0u);
-                    ag[r] = qw_tile_word(&sAg[rr * QW_MMA_LD + kk]);
-                    au[r] = qw_tile_word(&sAu[rr * QW_MMA_LD + kk]);
+                    ag[r] = qw_tile_word(&sAg[rr * GU_LD + kk]);
+                    au[r] = qw_tile_word(&sAu[rr * GU_LD + kk]);
                 }
                 const uint32_t m0 = wr + (lane >> 2);
                 const uint32_t m1 = m0 + 8u;
@@ -2503,7 +2554,7 @@ qwen4exp_moe_gateup_mma_kernel(
                     const uint32_t bn = wn + nt * 8u + (lane >> 2);
 #pragma unroll
                     for (int r = 0; r < 2; r++) {
-                        bf[r] = qw_tile_word(&sB[bn * QW_MMA_LD + gg * 32u +
+                        bf[r] = qw_tile_word(&sB[bn * GU_LD + gg * 32u +
                                                  (lane & 3u) * 4u +
                                                  (r ? 16u : 0u)]);
                     }
@@ -4623,9 +4674,23 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     const uint64_t pair_bytes = (uint64_t)n_pairs * sizeof(int32_t);
     const uint64_t xq_bytes = qwen4exp_quant_bytes(n_tokens, xgroups);
     const uint64_t mq_bytes = qwen4exp_quant_bytes(n_pairs, mgroups);
+    const uint64_t task_capacity = (uint64_t)n_pairs / QW_MMA_BN +
+        (n_pairs < n_total_expert ? n_pairs : n_total_expert);
+    const bool pair_tasks = n_tokens >= 64u && n_total_expert <= 512u &&
+        task_capacity <= 65535u && n_pairs <= 0x7fffffe0u &&
+        (mid_dim % QW_MMA_BM) == 0 && (xgroups % QW_MMA_G) == 0 &&
+        gate_slab->type == up_slab->type &&
+        (gate_slab->type == DS4_QWEN4EXP_TY_q4_K ||
+         gate_slab->type == DS4_QWEN4EXP_TY_q5_K ||
+         gate_slab->type == DS4_QWEN4EXP_TY_q8_0) &&
+        getenv("DS4_QWEN4EXP_NO_MMA") == NULL &&
+        getenv("DS4_QWEN4EXP_NO_EXPERT_COMPACT") == NULL &&
+        getenv("DS4_QWEN4EXP_GENERIC_EXPERTS") == NULL &&
+        getenv("DS4_QWEN4EXP_NO_GU_PAIR_TASKS") == NULL;
+    const uint64_t task_bytes = pair_tasks ? (1u + 2u * task_capacity) * 4u : 0u;
 
     char *base = (char *)qwen4exp_group_scratch(
-            logical_tier, idx_bytes + pair_bytes + xq_bytes + mq_bytes);
+            logical_tier, idx_bytes + pair_bytes + xq_bytes + mq_bytes + task_bytes);
     if (!base) return 0;
     /* The immediately following shared expert consumes this same input.
      * Keep its quantized bytes/scales/sums at the shared scratch prefix;
@@ -4644,6 +4709,10 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     sc.mq = (int8_t *)at;
     sc.ms = (float *)(at + (uint64_t)n_pairs * mgroups * 32u);
     sc.msum = (int32_t *)(sc.ms + (uint64_t)n_pairs * mgroups);
+    /* Append the task list; all existing metadata and Q8 scratch offsets keep
+     * their alignment and lifetime. Pool growth already invalidates graphs. */
+    int32_t *const gu_tasks = pair_tasks
+        ? (int32_t *)(base + idx_bytes + pair_bytes + xq_bytes + mq_bytes) : NULL;
 
     cudaStream_t stream = cuda_decode_stream();
     const unsigned threads = 256u;
@@ -4766,21 +4835,30 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     } \
 } while (0)
     if (use_mma) {
-#define QWEN4EXP_GATEUP_MMA(GT, UT) \
-        qwen4exp_moe_gateup_mma_kernel<GT, UT><<< \
-                dim3(mid_dim / QW_MMA_BM, gu_rows, 1), \
+        if (pair_tasks) {
+            qwen4exp_moe_pair_tasks_kernel<<<1, 512, 0, stream>>>(
+                    gu_tasks, sc.counts, n_total_expert);
+            if (!cuda_ok(cudaGetLastError(), "qwen4exp gate/up pair tasks")) return 0;
+        }
+#define QWEN4EXP_GATEUP_MMA_IMPL(GT, UT, TASKS) \
+        qwen4exp_moe_gateup_mma_kernel<GT, UT, TASKS><<< \
+                dim3(mid_dim / QW_MMA_BM, TASKS ? (unsigned)task_capacity : gu_rows, 1), \
                 QW_MMA_THREADS, 0, stream>>>( \
                 (float *)mid->ptr, \
                 moe_epilogue ? sc.mq : NULL, \
                 moe_epilogue ? sc.ms : NULL, \
                 moe_epilogue ? sc.msum : NULL, \
                 gate, up, sc.xq, sc.xs, sc.xsum, \
-                sc.pairs, sc.counts, sc.offsets, gu_active, \
+                sc.pairs, sc.counts, sc.offsets, TASKS ? gu_tasks : gu_active, \
                 (const float *)weights->ptr, \
                 gate_slab->expert_bytes, gate_slab->row_bytes, \
                 up_slab->expert_bytes, up_slab->row_bytes, \
                 gate_slab->type, up_slab->type, xgroups, mid_dim, \
                 mid_token_stride, n_expert_used)
+#define QWEN4EXP_GATEUP_MMA(GT, UT) do { \
+        if (pair_tasks) { QWEN4EXP_GATEUP_MMA_IMPL(GT, UT, true); } \
+        else { QWEN4EXP_GATEUP_MMA_IMPL(GT, UT, false); } \
+    } while (0)
         if (specialize && gate_slab->type == DS4_QWEN4EXP_TY_q4_K &&
                           up_slab->type == DS4_QWEN4EXP_TY_q4_K) {
             QWEN4EXP_GATEUP_MMA(DS4_QWEN4EXP_TY_q4_K, DS4_QWEN4EXP_TY_q4_K);
@@ -4791,6 +4869,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             QWEN4EXP_GATEUP_MMA(-1, -1);
         }
 #undef QWEN4EXP_GATEUP_MMA
+#undef QWEN4EXP_GATEUP_MMA_IMPL
     }
     /* The measured Q4 path for the R=2 tile (one-row decode and two-row
      * verify). qwen4exp_moe_tile already returns 2 for n_tokens <= 2, so the
