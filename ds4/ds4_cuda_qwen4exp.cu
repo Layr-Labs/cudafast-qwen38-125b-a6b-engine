@@ -4587,9 +4587,13 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         }
 #undef QWEN4EXP_GATEUP_MMA
     }
-    /* The measured two-token Q4 path; the diagnostic pin retains the joint
-     * projection as a bit-exact oracle. Other widths keep their prior kernel. */
-    else if (n_tokens == 2u && tile == 2 && specialize &&
+    /* The measured Q4 path for the R=2 tile (one-row decode and two-row
+     * verify). qwen4exp_moe_tile already returns 2 for n_tokens <= 2, so the
+     * joint R=2 kernel was already the decode path; splitting gate/up across
+     * neighboring warps applies the same register cut there. The diagnostic
+     * pin retains the joint projection as a bit-exact oracle. Other widths
+     * keep their prior kernel. */
+    else if (n_tokens <= 2u && tile == 2 && specialize &&
              gate_slab->type == DS4_QWEN4EXP_TY_q4_K &&
              up_slab->type == DS4_QWEN4EXP_TY_q4_K &&
              getenv("DS4_QWEN4EXP_NO_SPLIT_GATEUP") == NULL) {
