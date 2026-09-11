@@ -5064,7 +5064,17 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         }
     }
 
-    const int tile = qwen4exp_moe_tile(n_tokens);
+    /* The Q8 shared expert needs one accumulator for a one-token call.
+     * Use its existing R=1 instantiations without changing any group chain
+     * or reduction. Two-token verification keeps R=2 and its weight reuse. */
+    const bool single_q8 = n_tokens == 1u && in_dim == 2560u &&
+        mid_dim == 640u && out_dim == 2560u && specialize_shared &&
+        gate_slab->type == DS4_QWEN4EXP_TY_q8_0 &&
+        up_slab->type == DS4_QWEN4EXP_TY_q8_0 &&
+        down_slab->type == DS4_QWEN4EXP_TY_q8_0 &&
+        getenv("DS4_QWEN4EXP_MOE_R") == NULL &&
+        getenv("DS4_QWEN4EXP_NO_SHARED_R1") == NULL;
+    const int tile = single_q8 ? 1 : qwen4exp_moe_tile(n_tokens);
     const uint32_t tiles = (n_tokens + (uint32_t)tile - 1u) / (uint32_t)tile;
 
     /* Tokens one staged block serves, and the tiles that many needs. */
