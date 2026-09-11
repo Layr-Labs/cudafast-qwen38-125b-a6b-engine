@@ -5855,8 +5855,9 @@ static int qwen4exp_hc_mixer_fused_cuda(
                        "qwen4exp_hc_mix_inject_renorm launch");
     }
 
-    qwen4exp_hc_mix_renorm_kernel<<<dim3((n_embd + threads - 1u) / threads,
-                                         rows, 1u), threads, 0,
+    const uint32_t mix_threads = 64u;
+    qwen4exp_hc_mix_renorm_kernel<<<dim3((n_embd + mix_threads - 1u) / mix_threads,
+                                         rows, 1u), mix_threads, 0,
                                     cuda_decode_stream()>>>(
             (float *)mixed->ptr, (const float *)hyper->ptr, nscale, normw,
             (const float *)wide_scratch->ptr, n_embd, n_hc, rows,
