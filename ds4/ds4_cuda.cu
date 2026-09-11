@@ -5684,7 +5684,7 @@ __global__ static void matmul_q8_0_preq_rows_exact_tile_kernel(
 /* Two adjacent lanes share a Q8 group. Their integer partials may be
  * combined freely; each even lane keeps its original float group chain.
  * Shared memory remaps the 32 finished chains onto one reduction warp. */
-template <int R, bool Streaming = true>
+template <int R, bool Streaming = true, uint64_t FixedBlocks = 0>
 __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
         float *out, const unsigned char *w,
         const int8_t *xq, const float *xscale,
@@ -5700,15 +5700,20 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
 #pragma unroll
     for (int r = 0; r < R; r++) acc[r] = 0.0f;
 
+    const uint64_t nblocks = FixedBlocks ? FixedBlocks : blocks;
     if (row < out_dim) {
-        const unsigned char *wr = w + row * blocks * 34u;
-        for (uint64_t b = group; b < blocks; b += 32u) {
+        const unsigned char *wr = w + row * nblocks * 34u;
+        for (uint64_t b = group; b < nblocks; b += 32u) {
             /* Name both lanes of every live pair even if independent
              * scheduling has temporarily separated their execution. */
-            const uint64_t warp_base = b - (uint64_t)(group & 15u);
-            const uint64_t remaining = blocks - warp_base;
-            const uint32_t live_pairs = (uint32_t)(remaining < 16u ? remaining : 16u);
-            const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
+            unsigned active = 0xffffffffu;
+            if constexpr (FixedBlocks == 0) {
+                const uint64_t warp_base = b - (uint64_t)(group & 15u);
+                const uint64_t remaining = nblocks - warp_base;
+                const uint32_t live_pairs =
+                    (uint32_t)(remaining < 16u ? remaining : 16u);
+                active >>= 32u - 2u * live_pairs;
+            }
             const int8_t *payload = (const int8_t *)(wr + b * 34u + 2u) + half * 16u;
             const uintptr_t address = (uintptr_t)payload;
             const uint32_t shift = (uint32_t)(address & 3u) * 8u;
@@ -5733,7 +5738,7 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
 #pragma unroll
             for (int r = 0; r < R; r++) {
                 if ((uint32_t)r < take) {
-                    const uint64_t at = ((uint64_t)row0 + r) * blocks + b;
+                    const uint64_t at = ((uint64_t)row0 + r) * nblocks + b;
                     const int32_t *xw = (const int32_t *)(xq + at * 32u + half * 16u);
                     int dot = 0;
 #pragma unroll
@@ -16714,8 +16719,24 @@ static int cuda_matmul_q8_0_preq_rows_exact(
             /* Retain the promoted call-width specialization for the
              * general dense projections. The HC warp geometry above is
              * independent of this two-warp kernel's token-row bound. */
+            const bool fixed_2560 = blocks == 80u &&
+                getenv("DS4_QWEN4EXP_PAIR_LANES_GENERIC_K") == NULL;
             if (n_rows == 1u && getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL) {
-                matmul_q8_0_preq_pair_lanes_kernel<1, false><<<
+                if (fixed_2560) {
+                    matmul_q8_0_preq_pair_lanes_kernel<1, false, 80><<<
+                            dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u),
+                            256, 0, cuda_decode_stream()>>>(
+                            (float *)out->ptr, (const unsigned char *)wptr,
+                            xq, xscale, out_dim, n_rows, blocks);
+                } else {
+                    matmul_q8_0_preq_pair_lanes_kernel<1, false><<<
+                            dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u),
+                            256, 0, cuda_decode_stream()>>>(
+                            (float *)out->ptr, (const unsigned char *)wptr,
+                            xq, xscale, out_dim, n_rows, blocks);
+                }
+            } else if (fixed_2560) {
+                matmul_q8_0_preq_pair_lanes_kernel<2, false, 80><<<
                         dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u),
                         256, 0, cuda_decode_stream()>>>(
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
