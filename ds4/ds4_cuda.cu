@@ -3169,6 +3169,30 @@ extern "C" int ds4_gpu_tensor_copy_async(ds4_gpu_tensor *dst,
                    "tensor copy async");
 }
 
+extern "C" int ds4_gpu_tensor_copy_async_offset(
+        ds4_gpu_tensor       *dst,
+        uint64_t              dst_offset,
+        const ds4_gpu_tensor *src,
+        uint64_t              src_offset,
+        uint64_t              bytes) {
+    if (!dst || !src || dst_offset > dst->bytes || src_offset > src->bytes ||
+        bytes > dst->bytes - dst_offset || bytes > src->bytes - src_offset) {
+        return 0;
+    }
+    if (bytes == 0) return 1;
+    int d = ds4_tensor_device_idx(dst);
+    int ok = 0;
+    WITH_DEVICE(g_gpu[d].device_id) {
+        ok = cuda_ok(cudaMemcpyAsync((char *)dst->ptr + dst_offset,
+                                     (const char *)src->ptr + src_offset,
+                                     (size_t)bytes,
+                                     cudaMemcpyDeviceToDevice,
+                                     cuda_decode_stream()),
+                     "tensor copy async offset");
+    }
+    return ok;
+}
+
 extern "C" void ds4_gpu_tensor_free_in_place(ds4_gpu_tensor *t) {
     if (!t) return;
     int d = ds4_tensor_device_idx(t);
@@ -5710,28 +5734,38 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
             const uint32_t live_pairs = (uint32_t)(remaining < 16u ? remaining : 16u);
             const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
             const int8_t *payload = (const int8_t *)(wr + b * 34u + 2u) + half * 16u;
-            const uintptr_t address = (uintptr_t)payload;
-            const uint32_t shift = (uint32_t)(address & 3u) * 8u;
-            const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
-            uint32_t previous = words[0];
             int32_t wq[4];
-#pragma unroll
-            for (int j = 0; j < 3; j++) {
-                const uint32_t next = words[j + 1];
-                wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
-                previous = next;
+            if (b & 1u) {
+                const int4 *w4 = (const int4 *)(const void *)payload;
+                const int4 v = *w4;
+                wq[0] = v.x;
+                wq[1] = v.y;
+                wq[2] = v.z;
+                wq[3] = v.w;
+            } else {
+                const uint32_t *words = (const uint32_t *)((uintptr_t)payload & ~(uintptr_t)3u);
+                const uint32_t w0 = words[0];
+                const uint32_t w1 = words[1];
+                const uint32_t w2 = words[2];
+                const uint32_t w3 = words[3];
+                const uint16_t last = *(const uint16_t *)(const void *)(payload + 14);
+                wq[0] = (int32_t)__funnelshift_r(w0, w1, 16u);
+                wq[1] = (int32_t)__funnelshift_r(w1, w2, 16u);
+                wq[2] = (int32_t)__funnelshift_r(w2, w3, 16u);
+                wq[3] = (int32_t)__funnelshift_r(w3, (uint32_t)last, 16u);
             }
-            const uint16_t last = *(const uint16_t *)(const void *)(payload + 14);
-            wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
-            const float ws = __half2float(*(const __half *)(wr + b * 34u));
+            const float ws = (half == 0u) ? __half2float(*(const __half *)(wr + b * 34u)) : 0.0f;
 #pragma unroll
             for (int r = 0; r < R; r++) {
                 if ((uint32_t)r < take) {
                     const uint64_t at = ((uint64_t)row0 + r) * blocks + b;
-                    const int32_t *xw = (const int32_t *)(xq + at * 32u + half * 16u);
+                    const int4 *xw4 = (const int4 *)(const void *)(xq + at * 32u + half * 16u);
+                    const int4 xw_v = *xw4;
                     int dot = 0;
-#pragma unroll
-                    for (int j = 0; j < 4; j++) dot = __dp4a(wq[j], xw[j], dot);
+                    dot = __dp4a(wq[0], xw_v.x, dot);
+                    dot = __dp4a(wq[1], xw_v.y, dot);
+                    dot = __dp4a(wq[2], xw_v.z, dot);
+                    dot = __dp4a(wq[3], xw_v.w, dot);
                     dot += __shfl_xor_sync(active, dot, 1);
                     if (half == 0u) acc[r] += ws * xscale[at] * (float)dot;
                 }
@@ -15186,6 +15220,40 @@ extern "C" int ds4_gpu_dspark_markov_argmax_tensor(
     }
     if (logical_tier != dev_save) (void)cudaSetDevice(dev_save);
     return rc;
+}
+
+__global__ static void mtp_logit0_nan_contract_kernel(
+        uint32_t *top1,
+        const float *logits,
+        uint32_t n_vocab,
+        uint32_t rows,
+        uint32_t first_row) {
+    const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= rows) return;
+    const float logit0 = logits[((uint64_t)first_row + t) * (uint64_t)n_vocab];
+    const uint32_t bits = __float_as_uint(logit0);
+    if ((bits & 0x7fffffffu) > 0x7f800000u) {
+        top1[(uint64_t)first_row + t] = 0u;
+    }
+}
+
+extern "C" int ds4_gpu_mtp_apply_logit0_nan_contract(
+        ds4_gpu_tensor       *top1,
+        const ds4_gpu_tensor *logits,
+        uint32_t              n_vocab,
+        uint32_t              rows,
+        uint32_t              first_row) {
+    if (!top1 || !logits || n_vocab == 0 || rows == 0) return 0;
+    const uint64_t need_ids = ((uint64_t)first_row + rows) * sizeof(uint32_t);
+    const uint64_t need_logits =
+        ((uint64_t)first_row + rows) * (uint64_t)n_vocab * sizeof(float);
+    if (top1->bytes < need_ids || logits->bytes < need_logits) return 0;
+    const unsigned nth = 32u;
+    const unsigned nblocks = (rows + nth - 1u) / nth;
+    mtp_logit0_nan_contract_kernel<<<nblocks, nth, 0, cuda_decode_stream()>>>(
+            (uint32_t *)top1->ptr, (const float *)logits->ptr,
+            n_vocab, rows, first_row);
+    return cuda_ok(cudaGetLastError(), "mtp logit0 nan contract");
 }
 
 extern "C" int ds4_gpu_indexer_topk_tensor(
