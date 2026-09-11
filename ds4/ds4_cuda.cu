@@ -5684,7 +5684,7 @@ __global__ static void matmul_q8_0_preq_rows_exact_tile_kernel(
 /* Two adjacent lanes share a Q8 group. Their integer partials may be
  * combined freely; each even lane keeps its original float group chain.
  * Shared memory remaps the 32 finished chains onto one reduction warp. */
-template <int R>
+template <int R, bool FullTiles>
 __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
         float *out, const unsigned char *w,
         const int8_t *xq, const float *xscale,
@@ -5700,15 +5700,21 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
 #pragma unroll
     for (int r = 0; r < R; r++) acc[r] = 0.0f;
 
-    if (row < out_dim) {
+    if (FullTiles || row < out_dim) {
         const unsigned char *wr = w + row * blocks * 34u;
         for (uint64_t b = group; b < blocks; b += 32u) {
             /* Name both lanes of every live pair even if independent
-             * scheduling has temporarily separated their execution. */
-            const uint64_t warp_base = b - (uint64_t)(group & 15u);
-            const uint64_t remaining = blocks - warp_base;
-            const uint32_t live_pairs = (uint32_t)(remaining < 16u ? remaining : 16u);
-            const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
+             * scheduling has temporarily separated their execution.  The
+             * production dense shapes have whole 16-pair warp tiles, so their
+             * specialization turns this mask into a compile-time constant. */
+            unsigned active = 0xffffffffu;
+            if (!FullTiles) {
+                const uint64_t warp_base = b - (uint64_t)(group & 15u);
+                const uint64_t remaining = blocks - warp_base;
+                const uint32_t live_pairs =
+                    (uint32_t)(remaining < 16u ? remaining : 16u);
+                active = 0xffffffffu >> (32u - 2u * live_pairs);
+            }
             const int8_t *payload = (const int8_t *)(wr + b * 34u + 2u) + half * 16u;
             const uintptr_t address = (uintptr_t)payload;
             const uint32_t shift = (uint32_t)(address & 3u) * 8u;
@@ -5723,7 +5729,12 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
             }
             const uint16_t last = *(const uint16_t *)(const void *)(payload + 14);
             wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
-            const float ws = __half2float(*(const __half *)(wr + b * 34u));
+            /* Both lanes used to fetch the same scale, although only the even
+             * lane owns the float group chain.  Keep that lane's conversion
+             * at the same point and leave the odd lane's value unused. */
+            float ws = 0.0f;
+            if (half == 0u)
+                ws = __half2float(*(const __half *)(wr + b * 34u));
 #pragma unroll
             for (int r = 0; r < R; r++) {
                 if ((uint32_t)r < take) {
@@ -5749,7 +5760,8 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
 #pragma unroll
         for (int r = 0; r < R; r++) {
             const float total = warp_sum_f32(partial[r][local_row][local_lane]);
-            if (local_lane == 0u && row < out_dim && (uint32_t)r < take)
+            if (local_lane == 0u && (FullTiles || row < out_dim) &&
+                (uint32_t)r < take)
                 out[((uint64_t)row0 + r) * out_dim + row] = total;
         }
     }
@@ -16563,11 +16575,19 @@ static int cuda_matmul_q8_0_preq_rows_exact(
     if (use_dp4a && n_rows <= 2u && out_dim > 512u && (in_dim & 31u) == 0u &&
         getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
         (((uintptr_t)wptr & 1u) == 0u)) {
-        matmul_q8_0_preq_pair_lanes_kernel<2><<<
-                dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u),
-                256, 0, cuda_decode_stream()>>>(
-                (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
-                out_dim, n_rows, blocks);
+        const dim3 grid((unsigned)((out_dim + 3u) / 4u),
+                        (n_rows + 1u) / 2u, 1u);
+        if ((blocks & 15u) == 0u && (out_dim & 3u) == 0u) {
+            matmul_q8_0_preq_pair_lanes_kernel<2, true><<<
+                    grid, 256, 0, cuda_decode_stream()>>>(
+                    (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
+                    out_dim, n_rows, blocks);
+        } else {
+            matmul_q8_0_preq_pair_lanes_kernel<2, false><<<
+                    grid, 256, 0, cuda_decode_stream()>>>(
+                    (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
+                    out_dim, n_rows, blocks);
+        }
         return cuda_ok(cudaGetLastError(), "q8 pair lanes launch");
     }
     /* A warp owns an independent output row.  Narrow projections (notably
