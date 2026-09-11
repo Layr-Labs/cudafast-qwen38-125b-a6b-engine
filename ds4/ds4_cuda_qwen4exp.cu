@@ -1183,6 +1183,49 @@ __device__ __forceinline__ static bool qwen4exp_word_aligned(const void *p) {
     return (((uintptr_t)p) & 3u) == 0u;
 }
 
+/* WIDE PAYLOAD LOADS.  Every raw-word load below reads eight consecutive
+ * payload words out of one quantised block.  Read as words that is eight
+ * global instructions, and the threads of a warp sit on eight different rows,
+ * so each of those instructions asks the L1 for the same scattered set of
+ * lines again.  A sixteen-byte load asks once for four words at a time.
+ *
+ * uint4 .x .y .z .w ARE words 0..3 of the sixteen bytes at p, in address
+ * order, which is the order the word loop assigns w[0..3]; uint2 .x .y are
+ * words 0..1 of eight bytes the same way.  So w[] receives the identical
+ * eight values and only the instruction count moves.  A payload's alignment
+ * is fixed by the slab's strides and the scratch cut, never by the thread, so
+ * the test below is uniform across the warp and every arm is exact. */
+#ifndef DS4_QWEN4EXP_WIDE_PAYLOAD
+/* 1, the shipped default, takes the wide arms; 0 restores the word load the
+ * wide arms are argued equal to, for bisecting a suspected decode fault
+ * without reverting the change. */
+#define DS4_QWEN4EXP_WIDE_PAYLOAD 1
+#endif
+__device__ __forceinline__ static void qw_load_words8(const uint32_t *qw,
+                                                      uint32_t *w) {
+#if DS4_QWEN4EXP_WIDE_PAYLOAD
+    if ((((uintptr_t)qw) & 15u) == 0u) {
+        const uint4 a = *(const uint4 *)(const void *)qw;
+        const uint4 b = *(const uint4 *)(const void *)(qw + 4);
+        w[0] = a.x; w[1] = a.y; w[2] = a.z; w[3] = a.w;
+        w[4] = b.x; w[5] = b.y; w[6] = b.z; w[7] = b.w;
+        return;
+    }
+    if ((((uintptr_t)qw) & 7u) == 0u) {
+        const uint2 *q2 = (const uint2 *)(const void *)qw;
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const uint2 v = q2[i];
+            w[2 * i] = v.x;
+            w[2 * i + 1] = v.y;
+        }
+        return;
+    }
+#endif
+#pragma unroll
+    for (int i = 0; i < 8; i++) w[i] = qw[i];
+}
+
 /* Decode one 32-element group of a quantised weight row into int8 quants and
  * the one or two (wa, wb) pairs that turn an integer dot into the row's
  * contribution.  Called once per group per output row, not once per element.
@@ -2093,9 +2136,7 @@ __device__ __forceinline__ static bool qw_raw_load(
         const cuda_block_q4_K *xb = (const cuda_block_q4_K *)row + (g / 8u);
         const uint8_t *qs = xb->qs + ((g % 8u) >> 1u) * 32u;
         if (!qwen4exp_word_aligned(qs)) return false;
-        const uint32_t *qw = (const uint32_t *)(const void *)qs;
-#pragma unroll
-        for (int i = 0; i < 8; i++) w[i] = qw[i];
+        qw_load_words8((const uint32_t *)(const void *)qs, w);
         return true;
     }
     case (uint32_t)DS4_QWEN4EXP_TY_q5_1: {
@@ -2110,9 +2151,7 @@ __device__ __forceinline__ static bool qw_raw_load(
         const cuda_block_q5_K *xb = (const cuda_block_q5_K *)row + (g / 8u);
         const uint8_t *qs = xb->qs + ((g % 8u) >> 1u) * 32u;
         if (!qwen4exp_word_aligned(qs)) return false;
-        const uint32_t *qw = (const uint32_t *)(const void *)qs;
-#pragma unroll
-        for (int i = 0; i < 8; i++) w[i] = qw[i];
+        qw_load_words8((const uint32_t *)(const void *)qs, w);
         return true;
     }
     default:
@@ -2183,12 +2222,13 @@ __device__ __forceinline__ static void dev_qwen4exp_group_decode_w(
         wb[0] = -dev_f16_to_f32(xb->dmin) * (float)m;
         const uint32_t shift = (grp & 1u) * 4u;
         const uint32_t hbit = 0x01010101u << grp;
-        const uint32_t *hw = (const uint32_t *)(const void *)xb->qh;
+        uint32_t hv[8];
+        qw_load_words8((const uint32_t *)(const void *)xb->qh, hv);
         uint32_t *w = (uint32_t *)(void *)dst;
 #pragma unroll
         for (int i = 0; i < 8; i++) {
             const uint32_t v = (raw[i] >> shift) & 0x0f0f0f0fu;
-            const uint32_t h = hw[i] & hbit;
+            const uint32_t h = hv[i] & hbit;
             const uint32_t add = ((h >> grp) & 0x01010101u) << 4u;
             w[i] = v | add;
         }
@@ -2296,10 +2336,8 @@ qwen4exp_moe_gateup_mma_kernel(
         if (sTok[act_tk] != 0xffffffffu && act_gg < groups) {
             const uint32_t token = sTok[act_tk] / n_expert_used;
             const uint64_t at_g = (uint64_t)token * groups + act_gg;
-            const uint32_t *qw =
-                    (const uint32_t *)(const void *)(xq + at_g * 32u);
-#pragma unroll
-            for (int i = 0; i < 8; i++) rawb[i] = qw[i];
+            qw_load_words8((const uint32_t *)(const void *)(xq + at_g * 32u),
+                           rawb);
             act_scale = xs[at_g];
             act_sum = (float)xsum[at_g];
             haveb = 1;
@@ -2311,6 +2349,15 @@ qwen4exp_moe_gateup_mma_kernel(
 
         for (uint32_t kc = 0; kc < groups; kc += QW_MMA_G) {
             __syncthreads();
+            /* The next chunk's weight payload is issued the moment this
+             * chunk's copy of the register is dead -- between the two
+             * decodes -- rather than after both, so the load has the rest of
+             * the decode as well as the MMA below to land in.  Same one-chunk
+             * depth, same registers, same values; only the issue point moves,
+             * and the guard is the one the prefetch block used. */
+            const uint32_t gnext = kc + QW_MMA_G + dec_gg;
+            const bool next_w = kc + QW_MMA_G < groups &&
+                                dec_mrow < mid_dim && gnext < groups;
             /* Weight tile: this thread's one (row, group) of 32, decoded from
              * registers into the eight words of the tile row. */
             {
@@ -2323,12 +2370,14 @@ qwen4exp_moe_gateup_mma_kernel(
                             &sAg[dec_r * QW_MMA_LD + dec_gg * 32], wa, wb);
                     sWAg[dec_r * QW_MMA_G + dec_gg] = wa[0];
                     sWBg[dec_r * QW_MMA_G + dec_gg] = wb[0];
+                    haveg = next_w && qw_raw_load(gate_type, gate_row, gnext, rawg);
                     dev_qwen4exp_group_decode_w(
                             UpType < 0 ? up_type : (uint32_t)UpType, up_row, g,
                             haveu ? rawu : NULL,
                             &sAu[dec_r * QW_MMA_LD + dec_gg * 32], wa, wb);
                     sWAu[dec_r * QW_MMA_G + dec_gg] = wa[0];
                     sWBu[dec_r * QW_MMA_G + dec_gg] = wb[0];
+                    haveu = next_w && qw_raw_load(up_type, up_row, gnext, rawu);
                 } else {
                     qw_tile_store_zero(&sAg[dec_r * QW_MMA_LD + dec_gg * 32]);
                     qw_tile_store_zero(&sAu[dec_r * QW_MMA_LD + dec_gg * 32]);
@@ -2336,6 +2385,8 @@ qwen4exp_moe_gateup_mma_kernel(
                     sWBg[dec_r * QW_MMA_G + dec_gg] = 0.0f;
                     sWAu[dec_r * QW_MMA_G + dec_gg] = 0.0f;
                     sWBu[dec_r * QW_MMA_G + dec_gg] = 0.0f;
+                    haveg = 0;
+                    haveu = 0;
                 }
             }
             /* Activation tile: a padded token row is zero, and zero contributes
@@ -2350,25 +2401,16 @@ qwen4exp_moe_gateup_mma_kernel(
                 sXS  [act_tk * QW_MMA_G + act_gg] = 0.0f;
                 sXSUM[act_tk * QW_MMA_G + act_gg] = 0.0f;
             }
-            /* Chunk kc+G's raw bytes, issued now so they land while the MMA
-             * below runs. */
+            /* Chunk kc+G's activation bytes, issued now so they land while
+             * the MMA below runs; the weight payload above went earlier. */
             if (kc + QW_MMA_G < groups) {
-                const uint32_t g = kc + QW_MMA_G + dec_gg;
-                if (dec_mrow < mid_dim && g < groups) {
-                    haveg = qw_raw_load(gate_type, gate_row, g, rawg);
-                    haveu = qw_raw_load(up_type, up_row, g, rawu);
-                } else {
-                    haveg = 0;
-                    haveu = 0;
-                }
                 const uint32_t ga = kc + QW_MMA_G + act_gg;
                 if (sTok[act_tk] != 0xffffffffu && ga < groups) {
                     const uint32_t token = sTok[act_tk] / n_expert_used;
                     const uint64_t at_g = (uint64_t)token * groups + ga;
-                    const uint32_t *qw =
-                            (const uint32_t *)(const void *)(xq + at_g * 32u);
-#pragma unroll
-                    for (int i = 0; i < 8; i++) rawb[i] = qw[i];
+                    qw_load_words8(
+                            (const uint32_t *)(const void *)(xq + at_g * 32u),
+                            rawb);
                     act_scale = xs[at_g];
                     act_sum = (float)xsum[at_g];
                     haveb = 1;
