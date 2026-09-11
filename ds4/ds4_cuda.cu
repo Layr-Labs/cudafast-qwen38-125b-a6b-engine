@@ -5755,6 +5755,66 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
     }
 }
 
+/* HC down has only 320 outputs. Two lanes per group expose more integer
+ * work while one 64-thread block owns each output. Retain all 32 original
+ * float chains and their reduction tree; only the integer dot is split.
+ * The two-token verifier benefits; one-token calls keep the original warp. */
+__global__ static void matmul_q8_hc_down_pair_kernel(
+        float *out, const unsigned char *w, const int8_t *xq,
+        const float *xs, uint32_t rows) {
+    constexpr unsigned L = 2u;
+    const unsigned group = threadIdx.x / L;
+    const unsigned part = threadIdx.x % L;
+    const uint64_t row = blockIdx.x;
+    float acc[2] = {0.0f, 0.0f};
+    for (unsigned b = group; b < 320u; b += 32u) {
+        const unsigned char *blk = w + row * 10880u + b * 34u;
+        const unsigned char *payload = blk + 2u + part * (32u / L);
+        const uintptr_t address = (uintptr_t)payload;
+        const unsigned shift = (address & 3u) * 8u;
+        const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
+        uint32_t previous = words[0];
+        int32_t wq[8/L];
+#pragma unroll
+        for (int j = 0; j < 8/L - 1; j++) {
+            const uint32_t next = words[j + 1];
+            wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
+            previous = next;
+        }
+        const uint16_t last = *(const uint16_t *)(payload + 32u/L - 2u);
+        wq[8/L - 1] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
+        float ws = 0.0f;
+        if (part == 0u) ws = __half2float(*(const __half *)blk);
+#pragma unroll
+        for (unsigned r = 0; r < 2u; r++) {
+            if (r < rows) {
+                const unsigned at = r * 320u + b;
+                const int32_t *xw = (const int32_t *)(xq + at * 32u + part * (32u/L));
+                int dot = 0;
+#pragma unroll
+                for (int j = 0; j < 8/L; j++) dot = __dp4a(wq[j], xw[j], dot);
+#pragma unroll
+                for (int d = 1; d < L; d *= 2)
+                    dot += __shfl_xor_sync(0xffffffffu, dot, d);
+                if (part == 0u) acc[r] += ws * xs[at] * (float)dot;
+            }
+        }
+    }
+    __shared__ float partial[2][32];
+    if (part == 0u) {
+        partial[0][group] = acc[0];
+        partial[1][group] = acc[1];
+    }
+    __syncthreads();
+    if (threadIdx.x < 32u) {
+#pragma unroll
+        for (unsigned r = 0; r < 2u; r++) {
+            const float total = warp_sum_f32(partial[r][threadIdx.x]);
+            if (threadIdx.x == 0u && r < rows) out[r * 320u + row] = total;
+        }
+    }
+}
+
 /* The same per-output-element arithmetic as the tile kernel above, on the int8
  * tensor cores, with the whole prefill width in ONE tile.
  *
@@ -16557,6 +16617,15 @@ static int cuda_matmul_q8_0_preq_rows_exact(
 #undef DS4_Q8_DENSE_MMA_LAUNCH
 
     const int use_dp4a = cuda_q8_use_dp4a();
+    if (use_dp4a && n_rows == 2u && in_dim == 10240u && out_dim == 320u &&
+        getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
+        getenv("DS4_Q8_NO_HC_DOWN_PAIR") == NULL &&
+        (((uintptr_t)wptr & 1u) == 0u)) {
+        matmul_q8_hc_down_pair_kernel<<<320, 64, 0, cuda_decode_stream()>>>(
+                (float *)out->ptr, (const unsigned char *)wptr,
+                xq, xscale, n_rows);
+        return cuda_ok(cudaGetLastError(), "q8 HC down pair launch");
+    }
     /* Two lanes read each full group at one/two-row decode widths. Integer
      * partials combine exactly, then the original 32 float chains and warp
      * tree are restored. Wider calls and partial groups keep their kernels.
