@@ -199,7 +199,12 @@ __device__ static float dot4_f32(float4 a, float4 b) {
 
 enum {
     QWEN4EXP_GDN_DIM = 128,
-    QWEN4EXP_GDN_HISTORY = 3
+    QWEN4EXP_GDN_HISTORY = 3,
+    /* The shortest sequence the token-parallel convolution below takes over
+     * the serial one.  The decode step and the speculative verify's armed
+     * rounds are one to a few tokens and keep the serial kernel, whose
+     * in-place write needs no second buffer. */
+    QWEN4EXP_GDN_CONV_PARALLEL_MIN_TOKENS = 64
 };
 
 /*
@@ -354,6 +359,115 @@ __global__ static void qwen4exp_gdn_conv_kernel(
 }
 
 /*
+ * Prefill-width twin of the kernel above, and a CUDA-only widening of it:
+ * the same depthwise 4-tap convolution, SiLU and query/key RMS norm on the
+ * same values, but one block per (row, 128-channel block, TOKEN) instead of
+ * one block per channel block walking every token in order.
+ *
+ * The serial pass carries exactly one thing across tokens -- the three-input
+ * window -- and every value that window ever holds is a conv_state row or a
+ * raw qkv element of this chunk.  Token t's window is therefore four input
+ * rows, conv_state's three standing in when t < 3 and qkv[t-3 .. t] after,
+ * and this kernel gathers them per token and runs the same fma chain, the
+ * same activation and the same one-barrier block reduction the serial loop
+ * runs per token, on the same operands in the same order.  Every output is
+ * bit for bit the serial kernel's; only the schedule differs.
+ *
+ * What a token grid cannot do is write qkv in place: block t's window reads
+ * rows the blocks of tokens t+1..t+3 overwrite, and no order exists between
+ * blocks.  So this kernel writes a separate buffer the host keeps
+ * (qwen4exp_conv_scratch below) and the recurrence kernel reads its qkv from
+ * there.  A rollback slot carries the window as it stands after its token --
+ * the same shift the serial loop performs, here taken by choosing the token
+ * rather than by looping.  The carried history is written by the host after
+ * the kernel, from the last three input rows: a block cannot write it while
+ * the blocks of tokens 0..2 still read it.
+ */
+__global__ static void qwen4exp_gdn_conv_parallel_kernel(
+        float       *__restrict__ out,
+        const float *__restrict__ qkv,
+        float       *conv_state,
+        const float *conv_weight,
+        float       *conv_snapshot,
+        uint32_t     n_key_head,
+        uint32_t     n_value_head,
+        uint32_t     n_rows,
+        uint32_t     n_tokens,
+        uint32_t     n_snapshot_rows,
+        float        qk_norm_eps) {
+    const uint32_t block = blockIdx.x;
+    const uint32_t row = blockIdx.y;
+    const uint32_t token = blockIdx.z;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    const uint32_t key_blocks = 2u * n_key_head;
+    const uint32_t blocks = key_blocks + n_value_head;
+    if (block >= blocks || row >= n_rows || token >= n_tokens) return;
+
+    __shared__ float red[4];
+    const uint32_t conv_dim = blocks * QWEN4EXP_GDN_DIM;
+    const uint32_t channel = block * QWEN4EXP_GDN_DIM + tid;
+    const bool is_key = block < key_blocks;
+    const float post_scale = block < n_key_head
+        ? 0x1.6a09e6p-4f
+        : 1.0f;
+
+    const float *history = conv_state +
+        (uint64_t)row * QWEN4EXP_GDN_HISTORY * conv_dim;
+    const float w0 = conv_weight[(uint64_t)channel * 4u + 0u];
+    const float w1 = conv_weight[(uint64_t)channel * 4u + 1u];
+    const float w2 = conv_weight[(uint64_t)channel * 4u + 2u];
+    const float w3 = conv_weight[(uint64_t)channel * 4u + 3u];
+
+    /* The window of this token: inputs x[t-3 .. t], the carried history
+     * standing in for every x before the chunk. */
+    const uint64_t row_base = (uint64_t)row * n_tokens;
+    float x[4];
+    #pragma unroll
+    for (uint32_t k = 0; k < 4u; k++) {
+        const uint32_t back = 3u - k;
+        x[k] = token >= back
+            ? qkv[(row_base + (token - back)) * conv_dim + channel]
+            : history[(uint64_t)(k + token) * conv_dim + channel];
+    }
+
+    float acc = 0.0f;
+    acc = fmaf(x[0], w0, acc);
+    acc = fmaf(x[1], w1, acc);
+    acc = fmaf(x[2], w2, acc);
+    acc = fmaf(x[3], w3, acc);
+
+    /* The rollback slot is the window AFTER this token's shift, which is why
+     * it precedes the value-head early return below.  The carried history is
+     * NOT written here: the blocks of tokens 0..2 read it, and a block has no
+     * order against another, so the host copies the last three input rows
+     * into it after this kernel (they are the same values the serial loop
+     * leaves there, and qkv is intact because the output went to scratch). */
+    if (token < n_snapshot_rows) {
+        float *slot = conv_snapshot +
+            (uint64_t)token * QWEN4EXP_GDN_HISTORY * conv_dim;
+        slot[channel] = x[1];
+        slot[(uint64_t)conv_dim + channel] = x[2];
+        slot[(uint64_t)2u * conv_dim + channel] = x[3];
+    }
+
+    const float activated = qwen4exp_gdn_silu(acc);
+    float *dst = out + (row_base + token) * conv_dim + channel;
+    if (!is_key) {
+        *dst = activated;
+        return;
+    }
+
+    const float sumsq = warp_sum_f32(activated * activated);
+    if (lane == 0u) red[warp] = sumsq;
+    __syncthreads();
+    float total = lane < 4u ? red[lane] : 0.0f;
+    total = warp_sum_all_f32(total);
+    *dst = activated * rsqrtf(total + qk_norm_eps) * post_scale;
+}
+
+/*
  * The delta rule itself, token-serial inside the kernel like KDA and like the
  * reference: one block owns one (row, value head, four value rows), one warp
  * owns one value row, and each lane owns four adjacent key columns.
@@ -492,6 +606,37 @@ static const float *qwen4exp_gdn_weight_f32(
         model_map, offset, bytes, logical_tier, label);
 }
 
+/* The token-parallel convolution's second buffer, the shape of the caller's
+ * qkv and kept and grown the way the group scratch is.  A block's window
+ * reads rows the neighbouring token blocks rewrite, so that kernel cannot
+ * work in place; it writes here and the recurrence reads here.  Owned by
+ * the widest prefill seen, and unused by every serial call. */
+static void *g_qwen4exp_conv_scratch[16];
+static uint64_t g_qwen4exp_conv_bytes[16];
+
+static float *qwen4exp_conv_scratch(int tier, uint64_t elements) {
+    uint64_t bytes = 0;
+    if (tier < 0 || tier >= 16 ||
+        !glm53_cuda_mul_u64(elements, sizeof(float), &bytes)) {
+        return NULL;
+    }
+    if (g_qwen4exp_conv_scratch[tier] &&
+        g_qwen4exp_conv_bytes[tier] >= bytes) {
+        return (float *)g_qwen4exp_conv_scratch[tier];
+    }
+    void *next = NULL;
+    if (!cuda_ok(cudaMalloc(&next, (size_t)bytes),
+                 "qwen4exp GDN convolution scratch")) {
+        return NULL;
+    }
+    if (g_qwen4exp_conv_scratch[tier]) {
+        cudaFree(g_qwen4exp_conv_scratch[tier]);
+    }
+    g_qwen4exp_conv_scratch[tier] = next;
+    g_qwen4exp_conv_bytes[tier] = bytes;
+    return (float *)next;
+}
+
 /* The host half of qwen4exp_gpu_gdn_run in ds4_metal.m: the same validation,
  * the same four weight ranges, and the same three launches in stream order. */
 static int qwen4exp_cuda_gdn_run(
@@ -603,12 +748,46 @@ static int qwen4exp_cuda_gdn_run(
     cudaStream_t stream = cuda_decode_stream();
     const uint32_t blocks = 2u * n_key_head + n_value_head;
 
-    qwen4exp_gdn_conv_kernel<<<dim3(blocks, n_rows, 1u),
-                               QWEN4EXP_GDN_DIM, 0, stream>>>(
-            (float *)qkv->ptr, (float *)conv_state->ptr, conv_weight,
-            conv_snapshot ? (float *)conv_snapshot->ptr : NULL,
-            n_key_head, n_value_head, n_rows, n_tokens, n_snapshot_rows,
-            qk_norm_eps);
+    /* Prefill width: the token-parallel convolution, into the scratch it
+     * needs because its blocks cannot write qkv in place.  gridDim.z stops
+     * at 65535, and a wider sequence (or a scratch that will not allocate)
+     * falls back to the serial kernel, which needs neither.  Whichever ran,
+     * the recurrence reads its qkv from where that kernel wrote. */
+    float *conv_out = NULL;
+    if (n_rows == 1u && n_tokens >= QWEN4EXP_GDN_CONV_PARALLEL_MIN_TOKENS &&
+        n_tokens <= 65535u) {
+        conv_out = qwen4exp_conv_scratch(logical_tier, qkv_elements);
+    }
+    if (conv_out) {
+        qwen4exp_gdn_conv_parallel_kernel<<<
+                dim3(blocks, n_rows, n_tokens),
+                QWEN4EXP_GDN_DIM, 0, stream>>>(
+                conv_out, (const float *)qkv->ptr,
+                (float *)conv_state->ptr, conv_weight,
+                conv_snapshot ? (float *)conv_snapshot->ptr : NULL,
+                n_key_head, n_value_head, n_rows, n_tokens, n_snapshot_rows,
+                qk_norm_eps);
+        /* The carried window: the last three input rows, exactly what the
+         * serial loop leaves in the history after its final shift.  Stream
+         * order puts this after every block's read of the old history. */
+        const uint64_t conv_dim = (uint64_t)blocks * QWEN4EXP_GDN_DIM;
+        const uint64_t window = (uint64_t)QWEN4EXP_GDN_HISTORY * conv_dim;
+        if (!cuda_ok(cudaMemcpyAsync(conv_state->ptr,
+                                     (const float *)qkv->ptr +
+                                         ((uint64_t)n_tokens - QWEN4EXP_GDN_HISTORY) * conv_dim,
+                                     window * sizeof(float),
+                                     cudaMemcpyDeviceToDevice, stream),
+                     "qwen4exp GDN conv history carry")) {
+            return 0;
+        }
+    } else {
+        qwen4exp_gdn_conv_kernel<<<dim3(blocks, n_rows, 1u),
+                                   QWEN4EXP_GDN_DIM, 0, stream>>>(
+                (float *)qkv->ptr, (float *)conv_state->ptr, conv_weight,
+                conv_snapshot ? (float *)conv_snapshot->ptr : NULL,
+                n_key_head, n_value_head, n_rows, n_tokens, n_snapshot_rows,
+                qk_norm_eps);
+    }
     if (!cuda_ok(cudaGetLastError(), "qwen4exp GDN convolution launch")) {
         return 0;
     }
@@ -617,7 +796,8 @@ static int qwen4exp_cuda_gdn_run(
             dim3(n_value_head, QWEN4EXP_GDN_DIM / 4u, n_rows),
             QWEN4EXP_GDN_DIM, 0, stream>>>(
             (float *)out->ptr, (float *)recurrent_state->ptr,
-            (const float *)qkv->ptr, (const float *)raw_alpha->ptr,
+            conv_out ? conv_out : (const float *)qkv->ptr,
+            (const float *)raw_alpha->ptr,
             (const float *)raw_beta->ptr, a_log, dt_bias,
             state_snapshot ? (float *)state_snapshot->ptr : NULL,
             n_key_head, n_value_head, n_rows, n_tokens, head_layout,
