@@ -2825,9 +2825,25 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
         for (int r = 0; r < R; r++) acc[r] = 0.0f;
         if (live) {
             for (uint32_t g = lane; g < groups; g += 32u) {
-                int8_t wq[32]; float wa[2], wb[2]; int halves = 1;
-                dev_qwen4exp_group_decode((uint32_t)Type, weight_row, g,
-                                          wq, wa, wb, &halves);
+                int8_t wq[32];
+                float wa[2] = {0.0f, 0.0f};
+                float wb[2] = {0.0f, 0.0f};
+                /* WORD DECODE, the same one the routed-MoE MMA kernels use.
+                 * This kernel took the byte-array decoder, which rebuilds
+                 * each of the eight payload words from single bytes; the
+                 * word path derives them by shifting the group's own raw
+                 * words and is proven byte-identical to it (the byte
+                 * decoder is kept as the fallback for a payload that does
+                 * not stage).  This kernel is only ever instantiated for
+                 * Q4_K, whose group stages, and whose decode leaves
+                 * `halves` at one -- the value passed to the accumulate
+                 * below -- so the accumulated value is unchanged. */
+                uint32_t raw[8];
+                const uint32_t *rawp =
+                    qw_raw_load((uint32_t)Type, weight_row, g, raw) ? raw : NULL;
+                dev_qwen4exp_group_decode_w((uint32_t)Type, weight_row, g,
+                                            rawp, wq, wa, wb);
+                const int halves = 1;
 #pragma unroll
                 for (int r = 0; r < R; r++) {
                     if (r < take) {
