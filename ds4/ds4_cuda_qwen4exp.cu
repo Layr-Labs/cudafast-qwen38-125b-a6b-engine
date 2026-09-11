@@ -2259,6 +2259,21 @@ __device__ __forceinline__ static void dev_qwen4exp_group_decode_w(
     qw_tile_store_group(dst, wq);
 }
 
+__device__ __forceinline__ static void qwen4exp_group_decode_fast(
+        uint32_t type, const char *row, uint32_t g,
+        int8_t *wq, float *wa, float *wb, int *halves) {
+    uint32_t raw[8];
+    const uint32_t *rawp = qw_raw_load(type, row, g, raw) ? raw : NULL;
+    if (rawp && (type == (uint32_t)DS4_QWEN4EXP_TY_q4_K ||
+                 type == (uint32_t)DS4_QWEN4EXP_TY_q5_1 ||
+                 type == (uint32_t)DS4_QWEN4EXP_TY_q5_K)) {
+        dev_qwen4exp_group_decode_w(type, row, g, rawp, wq, wa, wb);
+        *halves = 1;
+    } else {
+        dev_qwen4exp_group_decode(type, row, g, wq, wa, wb, halves);
+    }
+}
+
 __device__ __forceinline__ static void qw_mma_m16n8k32(
         int32_t *d, const uint32_t *a, const uint32_t *b) {
     asm volatile(
@@ -2641,15 +2656,15 @@ qwen4exp_moe_down_mma_kernel(
                 const uint32_t gg = idx - r * QW_MMA_G;
                 const uint32_t g = kc + gg;
                 const uint32_t orow = row0 + r;
-                int8_t wq[32];
-                float wa[2], wb[2];
-                int halves = 1;
                 if (orow < out_dim && g < groups) {
-                    dev_qwen4exp_group_decode(
-                            DownType < 0 ? down_type : (uint32_t)DownType,
-                            down_e + (uint64_t)orow * down_row_bytes, g,
-                            wq, wa, wb, &halves);
-                    qw_tile_store_group(&sA[r * QW_MMA_LD + gg * 32], wq);
+                    const uint32_t dt = DownType < 0 ? down_type : (uint32_t)DownType;
+                    const char *drow = down_e + (uint64_t)orow * down_row_bytes;
+                    uint32_t raw[8];
+                    const uint32_t *rawp = qw_raw_load(dt, drow, g, raw) ? raw : NULL;
+                    float wa[2] = {0.0f, 0.0f}, wb[2] = {0.0f, 0.0f};
+                    dev_qwen4exp_group_decode_w(
+                            dt, drow, g, rawp,
+                            &sA[r * QW_MMA_LD + gg * 32], wa, wb);
                     sWA[r * QW_MMA_G + gg] = wa[0];
                     sWB[r * QW_MMA_G + gg] = wb[0];
                 } else {
@@ -2946,10 +2961,10 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
             int8_t gw[32], uw[32];
             float ga[2], gb[2], ua[2], ub[2];
             int gh = 1, uh = 1;
-            dev_qwen4exp_group_decode(
+            qwen4exp_group_decode_fast(
                     GateType < 0 ? gate_type : (uint32_t)GateType,
                     gate_row, g, gw, ga, gb, &gh);
-            dev_qwen4exp_group_decode(
+            qwen4exp_group_decode_fast(
                     UpType < 0 ? up_type : (uint32_t)UpType,
                     up_row, g, uw, ua, ub, &uh);
 #pragma unroll
@@ -3028,7 +3043,7 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                     int8_t wq[32];
                     float wa[2], wb[2];
                     int halves = 1;
-                    dev_qwen4exp_group_decode(
+                    qwen4exp_group_decode_fast(
                             DownType < 0 ? down_type : (uint32_t)DownType,
                             drow, g, wq, wa, wb, &halves);
                     const uint64_t at_g = mrow * groups + g;
@@ -3084,8 +3099,8 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
         int8_t gw[32], uw[32];
         float ga[2], gb[2], ua[2], ub[2];
         int gh = 1, uh = 1;
-        dev_qwen4exp_group_decode(gate_type, gate_row, g, gw, ga, gb, &gh);
-        dev_qwen4exp_group_decode(up_type, up_row, g, uw, ua, ub, &uh);
+        qwen4exp_group_decode_fast(gate_type, gate_row, g, gw, ga, gb, &gh);
+        qwen4exp_group_decode_fast(up_type, up_row, g, uw, ua, ub, &uh);
 #pragma unroll
         for (int r = 0; r < R; r++) {
             if ((uint32_t)r < take) {
@@ -3139,7 +3154,7 @@ __global__ static void qwen4exp_shared_down_q_kernel(
         int8_t wq[32];
         float wa[2], wb[2];
         int halves = 1;
-        dev_qwen4exp_group_decode(down_type, down_row, g, wq, wa, wb, &halves);
+        qwen4exp_group_decode_fast(down_type, down_row, g, wq, wa, wb, &halves);
 #pragma unroll
         for (int r = 0; r < R; r++) {
             if ((uint32_t)r < take) {
@@ -3363,9 +3378,9 @@ __global__ static void qwen4exp_shared_gateup_stage_kernel(
         int8_t wq[32];
         float wa[2], wb[2];
         int halves = 1;
-        dev_qwen4exp_group_decode(second ? up_type : gate_type,
-                                  second ? up_row : gate_row, g,
-                                  wq, wa, wb, &halves);
+        qwen4exp_group_decode_fast(second ? up_type : gate_type,
+                                   second ? up_row : gate_row, g,
+                                   wq, wa, wb, &halves);
         qwen4exp_pack_group(&s_lo[item], &s_hi[item], wq);
         s_a0[item] = wa[0];
         s_a1[item] = wa[1];
@@ -3453,7 +3468,7 @@ __global__ static void qwen4exp_shared_down_stage_kernel(
         int8_t wq[32];
         float wa[2], wb[2];
         int halves = 1;
-        dev_qwen4exp_group_decode(down_type, down_row, g, wq, wa, wb, &halves);
+        qwen4exp_group_decode_fast(down_type, down_row, g, wq, wa, wb, &halves);
         qwen4exp_pack_group(&s_lo[g], &s_hi[g], wq);
         s_a0[g] = wa[0];
         s_a1[g] = wa[1];
@@ -4570,16 +4585,16 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             logical_tier, idx_bytes + pair_bytes + xq_bytes + mq_bytes);
     if (!base) return 0;
     qwen4exp_moe_scratch sc;
-    sc.counts = (int32_t *)base;
+    sc.xq = (int8_t *)base;
+    sc.xs = (float *)(base + (uint64_t)n_tokens * xgroups * 32u);
+    sc.xsum = (int32_t *)(sc.xs + (uint64_t)n_tokens * xgroups);
+    char *at = base + xq_bytes;
+    sc.counts = (int32_t *)at;
     sc.offsets = sc.counts + n_total_expert;
     sc.cursor = sc.offsets + n_total_expert;
     sc.active = sc.cursor + n_total_expert;
     sc.pairs = sc.active + n_total_expert + 1u;
-    char *at = base + idx_bytes + pair_bytes;
-    sc.xq = (int8_t *)at;
-    sc.xs = (float *)(at + (uint64_t)n_tokens * xgroups * 32u);
-    sc.xsum = (int32_t *)(sc.xs + (uint64_t)n_tokens * xgroups);
-    at += xq_bytes;
+    at += idx_bytes + pair_bytes;
     sc.mq = (int8_t *)at;
     sc.ms = (float *)(at + (uint64_t)n_pairs * mgroups * 32u);
     sc.msum = (int32_t *)(sc.ms + (uint64_t)n_pairs * mgroups);
