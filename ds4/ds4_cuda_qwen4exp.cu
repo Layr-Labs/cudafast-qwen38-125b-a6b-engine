@@ -6861,11 +6861,33 @@ __global__ static void qwen4exp_qsa_attention_group_kernel(
             float contrib[GROUP];
 #pragma unroll
             for (uint32_t h = 0; h < GROUP; h++) contrib[h] = 0.0f;
-            for (uint32_t j = 0; j < n_in_tile; j++) {
+            uint32_t j = 0;
+            /* Dense path: eight V rows in flight, same idea as the per-head
+             * tip. Products stay j-ascending; for each key, all heads update
+             * before the next key — matching the scalar group walk. Sparse
+             * keeps the continue-bearing one-at-a-time loop. */
+            if (!sparse) {
+                for (; j + 8u <= n_in_tile; j += 8u) {
+                    float vv[8];
+#pragma unroll
+                    for (uint32_t i = 0; i < 8u; i++) {
+                        vv[i] = v_cache[
+                            (uint64_t)keys[j + i] * kv_stride +
+                            (uint64_t)kv_head * head_dim + tid];
+                    }
+#pragma unroll
+                    for (uint32_t i = 0; i < 8u; i++) {
+#pragma unroll
+                        for (uint32_t h = 0; h < GROUP; h++) {
+                            contrib[h] = __fmaf_rn(
+                                probs[h * nth + j + i], vv[i], contrib[h]);
+                        }
+                    }
+                }
+            }
+            for (; j < n_in_tile; j++) {
                 const int32_t kj = keys[j];
                 if (kj < 0) continue;
-                /* One V channel read for the whole group, where the per-head
-                 * kernel read the same address once per head. */
                 const float vvj = v_cache[
                     (uint64_t)kj * kv_stride + (uint64_t)kv_head * head_dim + tid];
 #pragma unroll
