@@ -16546,6 +16546,11 @@ static int cuda_matmul_q8_0_preq_rows_exact(
             } else {
                 DS4_Q8_DENSE_MMA_LAUNCH(2, 2, 2, 4, 8);
             }
+        } else if (n_rows <= 16u) {
+            /* Short calls need the same 64-column slab but not 64
+             * padded activation rows.  Keep four warps and G=4 while mapping
+             * them across N instead of M: BM=16, BN=64. */
+            DS4_Q8_DENSE_MMA_LAUNCH(1, 4, 1, 2, 4);
         } else if (n_rows <= 64u) {
             DS4_Q8_DENSE_MMA_LAUNCH(2, 2, 2, 4, 4);
         } else {
