@@ -3353,6 +3353,29 @@ extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, con
     return ok;
 }
 
+/* Queue a short-lived host upload on the same legacy/decode stream used by
+ * the consumer kernels.  The caller owns the source until a later ordered
+ * readback or explicit synchronization completes the stream. */
+extern "C" int ds4_gpu_tensor_write_async(ds4_gpu_tensor *tensor,
+                                            uint64_t offset,
+                                            const void *data,
+                                            uint64_t bytes) {
+    if (!tensor || !data || offset > tensor->bytes ||
+        bytes > tensor->bytes - offset) {
+        return 0;
+    }
+    if (bytes == 0) return 1;
+    const int d = ds4_tensor_device_idx(tensor);
+    int ok = 0;
+    WITH_DEVICE(g_gpu[d].device_id) {
+        ok = cuda_ok(cudaMemcpyAsync((char *)tensor->ptr + offset, data,
+                                     (size_t)bytes, cudaMemcpyHostToDevice,
+                                     cuda_decode_stream()),
+                     "tensor write async");
+    }
+    return ok;
+}
+
 extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     int d = ds4_tensor_device_idx(tensor);
@@ -14221,7 +14244,13 @@ __global__ static void indexer_top1_kernel(
         __syncthreads();
     }
 
-    if (tid == 0u) selected[t] = idxs[0];
+    if (tid == 0u) {
+        /* The engine's historical CPU argmax seeds from element zero.  A NaN
+         * there makes every later `v > best` comparison false and therefore
+         * pins the result to token zero.  Preserve that rule on device so MTP
+         * does not need a second synchronous readback of logit zero. */
+        selected[t] = isnan(row[0]) ? 0u : idxs[0];
+    }
 }
 
 __global__ static void indexer_top1_value_kernel(

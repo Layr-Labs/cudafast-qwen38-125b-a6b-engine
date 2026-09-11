@@ -919,14 +919,24 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
     for (uint32_t t = 0; t < n_tokens; t++) ids[t] = (int32_t)next_tokens[t];
 
     const char *stage = "token upload";
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    bool ok = ds4_gpu_tensor_write_async(h->t_tokens, 0, ids,
+                                         (uint64_t)n_tokens * sizeof(int32_t)) != 0;
+#else
     bool ok = ds4_gpu_tensor_write(h->t_tokens, 0, ids,
                                    (uint64_t)n_tokens * sizeof(int32_t)) != 0;
+#endif
     if (ids != ids_stack) free(ids);
     MTP_HEAD_TICK(MTP_HEAD_T_TOKEN);
     if (ok) {
         stage = "multi-stream upload";
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+        ok = ds4_gpu_tensor_write_async(h->t_hyper, 0, multi_in,
+                                       (uint64_t)n_tokens * hc_dim * f) != 0;
+#else
         ok = ds4_gpu_tensor_write(h->t_hyper, 0, multi_in,
                                   (uint64_t)n_tokens * hc_dim * f) != 0;
+#endif
     }
     MTP_HEAD_TICK(MTP_HEAD_T_MULTI_IN);
     if (ok) ok = ds4_gpu_begin_commands() != 0;
@@ -1046,8 +1056,15 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                                          h->n_vocab, logit_rows, 1u) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_TOP1);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    /* The selected-ID D2H copy below is the one synchronization the CPU
+     * actually needs.  CUDA begin_commands is a no-op, and all producers are
+     * ordered before that copy on the legacy/decode stream. */
+    if (!ok) (void)ds4_gpu_synchronize();
+#else
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
+#endif
     MTP_HEAD_TICK(MTP_HEAD_T_END);
 
     /* A narrowed projection writes its sole result at logit row zero;
@@ -1060,6 +1077,10 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                                  (uint64_t)out_rows * sizeof(uint32_t)) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_TOP1_IN);
+    /* CUDA's top-1 kernel preserves the historical CPU seed-at-zero NaN
+     * behavior directly.  Metal, ROCm, and CPU-test backends retain the
+     * compatibility read until their reducers make the same guarantee. */
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD) || defined(DS4_NO_GPU)
     if (ok) {
         stage = "logit-0 readback";
         for (uint32_t t = 0; ok && t < out_rows; t++) {
@@ -1081,6 +1102,7 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
             }
         }
     }
+#endif
     MTP_HEAD_TICK(MTP_HEAD_T_LOGIT0_IN);
     if (ok && multi_out) {
         stage = "multi readback";
