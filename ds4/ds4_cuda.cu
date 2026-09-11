@@ -5710,20 +5710,26 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
             const uint32_t live_pairs = (uint32_t)(remaining < 16u ? remaining : 16u);
             const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
             const int8_t *payload = (const int8_t *)(wr + b * 34u + 2u) + half * 16u;
-            const uintptr_t address = (uintptr_t)payload;
-            const uint32_t shift = (uint32_t)(address & 3u) * 8u;
-            const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
-            uint32_t previous = words[0];
             int32_t wq[4];
-#pragma unroll
-            for (int j = 0; j < 3; j++) {
-                const uint32_t next = words[j + 1];
-                wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
-                previous = next;
+            if (b & 1u) {
+                const uint32_t *words = (const uint32_t *)(const void *)payload;
+                wq[0] = (int32_t)words[0];
+                wq[1] = (int32_t)words[1];
+                wq[2] = (int32_t)words[2];
+                wq[3] = (int32_t)words[3];
+            } else {
+                const uint32_t *words = (const uint32_t *)((uintptr_t)payload & ~(uintptr_t)3u);
+                const uint32_t w0 = words[0];
+                const uint32_t w1 = words[1];
+                const uint32_t w2 = words[2];
+                const uint32_t w3 = words[3];
+                const uint16_t last = *(const uint16_t *)(const void *)(payload + 14);
+                wq[0] = (int32_t)__funnelshift_r(w0, w1, 16u);
+                wq[1] = (int32_t)__funnelshift_r(w1, w2, 16u);
+                wq[2] = (int32_t)__funnelshift_r(w2, w3, 16u);
+                wq[3] = (int32_t)__funnelshift_r(w3, (uint32_t)last, 16u);
             }
-            const uint16_t last = *(const uint16_t *)(const void *)(payload + 14);
-            wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
-            const float ws = __half2float(*(const __half *)(wr + b * 34u));
+            const float ws = (half == 0u) ? __half2float(*(const __half *)(wr + b * 34u)) : 0.0f;
 #pragma unroll
             for (int r = 0; r < R; r++) {
                 if ((uint32_t)r < take) {
