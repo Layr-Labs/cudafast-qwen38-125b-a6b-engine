@@ -53,6 +53,12 @@ void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
+int ds4_gpu_tensor_copy_async_offset(
+        ds4_gpu_tensor       *dst,
+        uint64_t              dst_offset,
+        const ds4_gpu_tensor *src,
+        uint64_t              src_offset,
+        uint64_t              bytes);
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
@@ -540,6 +546,15 @@ int ds4_gpu_dspark_markov_argmax_tensor(ds4_gpu_tensor *out_idx,
                                         uint32_t prev_token,
                                         uint32_t vocab,
                                         uint32_t rank);
+/* After GPU top-1, enforce the MTP proposal contract that a NaN in logit[0]
+ * forces token id 0 (historical CPU-scan seeding). Runs on the decode stream. */
+int ds4_gpu_mtp_apply_logit0_nan_contract(
+        ds4_gpu_tensor       *top1,
+        const ds4_gpu_tensor *logits,
+        uint32_t              n_vocab,
+        uint32_t              rows,
+        uint32_t              first_row);
+
 int ds4_gpu_indexer_topk_tensor(
         ds4_gpu_tensor       *selected,
         const ds4_gpu_tensor *scores,
