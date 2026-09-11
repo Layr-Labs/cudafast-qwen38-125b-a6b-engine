@@ -36852,26 +36852,6 @@ int ds4_gpu_qwen4exp_routed_moe_tensor(
     return 1;
 }
 
-int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
-        ds4_gpu_tensor              *out,
-        ds4_gpu_tensor              *mid,
-        ds4_gpu_tensor              *gate_scale,
-        const ds4_gpu_qwen4exp_slab *router_slab,
-        const ds4_gpu_qwen4exp_slab *gate_slab,
-        const ds4_gpu_qwen4exp_slab *up_slab,
-        const ds4_gpu_qwen4exp_slab *down_slab,
-        uint32_t                     in_dim,
-        uint32_t                     mid_dim,
-        uint32_t                     out_dim,
-        const ds4_gpu_tensor        *x,
-        uint32_t                     n_tokens,
-        int                          pre_quantized) {
-    (void)pre_quantized;
-    return ds4_gpu_qwen4exp_shared_expert_tensor(
-            out, mid, gate_scale, router_slab, gate_slab, up_slab, down_slab,
-            in_dim, mid_dim, out_dim, x, n_tokens);
-}
-
 int ds4_gpu_qwen4exp_shared_expert_tensor(
         ds4_gpu_tensor              *out,
         ds4_gpu_tensor              *mid,
@@ -47392,112 +47372,6 @@ int ds4_gpu_qwen4exp_qsa_indexer_select_tensor(
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, "Qwen4-Exp indexer selection");
     }
-}
-
-int ds4_gpu_qwen4exp_update_dpos(ds4_gpu_tensor *d_pos, uint32_t pos) {
-    return ds4_gpu_tensor_write(d_pos, 0, &pos, sizeof(pos));
-}
-
-int ds4_gpu_qwen4exp_qsa_prep_q_fused_dpos_tensor(
-        ds4_gpu_tensor       *q,
-        ds4_gpu_tensor       *gate,
-        const ds4_gpu_tensor *doubled,
-        const ds4_gpu_tensor *weight,
-        const ds4_gpu_tensor *inv_freq,
-        uint32_t              n_tokens,
-        uint32_t              n_head,
-        uint32_t              head_dim,
-        uint32_t              rot_dim,
-        uint32_t              pos0,
-        float                 eps,
-        float                 weight_offset,
-        const ds4_gpu_tensor *d_pos) {
-    (void)d_pos;
-    return ds4_gpu_qwen4exp_qsa_prep_q_fused_tensor(
-        q, gate, doubled, weight, inv_freq, n_tokens, n_head, head_dim,
-        rot_dim, pos0, eps, weight_offset);
-}
-
-int ds4_gpu_qwen4exp_qsa_prep_kv_append_fused_dpos_tensor(
-        ds4_gpu_tensor       *k_cache,
-        ds4_gpu_tensor       *v_cache,
-        ds4_gpu_tensor       *k_out,
-        const ds4_gpu_tensor *raw_k,
-        const ds4_gpu_tensor *raw_v,
-        const ds4_gpu_tensor *weight,
-        const ds4_gpu_tensor *inv_freq,
-        uint32_t              pos0,
-        uint32_t              n_tokens,
-        uint32_t              n_head_kv,
-        uint32_t              head_dim,
-        uint32_t              rot_dim,
-        uint32_t              cache_cap,
-        float                 eps,
-        float                 weight_offset,
-        const ds4_gpu_tensor *d_pos) {
-    (void)d_pos;
-    return ds4_gpu_qwen4exp_qsa_prep_kv_append_fused_tensor(
-        k_cache, v_cache, k_out, raw_k, raw_v, weight, inv_freq,
-        pos0, n_tokens, n_head_kv, head_dim, rot_dim, cache_cap,
-        eps, weight_offset);
-}
-
-int ds4_gpu_qwen4exp_rope_head_dpos_tensor(
-        ds4_gpu_tensor       *x,
-        const ds4_gpu_tensor *inv_freq,
-        uint32_t              n_tokens,
-        uint32_t              n_head,
-        uint32_t              head_dim,
-        uint32_t              rot_dim,
-        uint32_t              pos0,
-        const ds4_gpu_tensor *d_pos) {
-    (void)d_pos;
-    return ds4_gpu_qwen4exp_rope_head_tensor(
-        x, inv_freq, n_tokens, n_head, head_dim, rot_dim, pos0);
-}
-
-int ds4_gpu_qwen4exp_qsa_indexer_pool_update_dpos_tensor(
-        ds4_gpu_tensor       *pool,
-        ds4_gpu_tensor       *tape,
-        const ds4_gpu_tensor *raw_k,
-        const ds4_gpu_tensor *k_norm_weight,
-        const ds4_gpu_tensor *inv_freq,
-        uint32_t              pos0,
-        uint32_t              n_tokens,
-        uint32_t              cache_cap,
-        uint32_t              head_dim,
-        uint32_t              pool_size,
-        uint32_t              rot_dim,
-        float                 eps,
-        float                 weight_offset,
-        const ds4_gpu_tensor *d_pos) {
-    (void)d_pos;
-    return ds4_gpu_qwen4exp_qsa_indexer_pool_update_tensor(
-        pool, tape, raw_k, k_norm_weight, inv_freq, pos0, n_tokens,
-        cache_cap, head_dim, pool_size, rot_dim, eps, weight_offset);
-}
-
-int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
-        ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *k_cache,
-        const ds4_gpu_tensor *v_cache,
-        const ds4_gpu_tensor *selected,
-        const ds4_gpu_tensor *counts,
-        uint32_t              n_tokens,
-        uint32_t              n_head,
-        uint32_t              n_kv_head,
-        uint32_t              head_dim,
-        uint32_t              pos0,
-        uint32_t              cache_cap,
-        uint32_t              max_selected,
-        float                 scale,
-        const ds4_gpu_tensor *d_pos) {
-    (void)d_pos;
-    return ds4_gpu_qwen4exp_qsa_attention_tensor(
-        out, q, k_cache, v_cache, selected, counts,
-        n_tokens, n_head, n_kv_head, head_dim, pos0,
-        cache_cap, max_selected, scale);
 }
 
 int ds4_gpu_qwen4exp_qsa_attention_tensor(
