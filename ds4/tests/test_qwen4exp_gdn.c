@@ -21,7 +21,8 @@
  *      equals sixteen calls of 64;
  *   5. a decode step continuing a carried state, bit exact against the last
  *      step of the equivalent prefill, single row and two rows;
- *   6. determinism: the same prefill twice, bit exact.
+ *   6. determinism: the same prefill twice, bit exact;
+ *   7. staged recurrence gates against in-loop recomputation, bit exact.
  */
 
 #include <math.h>
@@ -878,6 +879,55 @@ int main(void) {
         }
         buffers_free(&step);
     }
+    /* 7. Gate staging must preserve every output and state bit. */
+    {
+        static const uint32_t widths[] = { 8u, 64u, 512u, 513u, MAX_TOKENS };
+        for (size_t w = 0; w < sizeof(widths) / sizeof(widths[0]); w++) {
+            const uint32_t tokens = widths[w];
+            char label[96];
+            unsetenv("DS4_QWEN4EXP_NO_GDN_GATE_STAGE");
+            buffers_clear_state(&big, 1u);
+            run_prefill(&big, model, &g_tiled, qkv, alpha, beta, output_gate,
+                        0u, tokens, actual);
+            require_ok(ds4_gpu_tensor_read(big.state, 0, state_actual,
+                STATE_ELEMENTS * sizeof(float)), "staged state read");
+            setenv("DS4_QWEN4EXP_NO_GDN_GATE_STAGE", "1", 1);
+            buffers_clear_state(&big, 1u);
+            run_prefill(&big, model, &g_tiled, qkv, alpha, beta, output_gate,
+                        0u, tokens, other);
+            require_ok(ds4_gpu_tensor_read(big.state, 0, state_other,
+                STATE_ELEMENTS * sizeof(float)), "in-loop state read");
+            unsetenv("DS4_QWEN4EXP_NO_GDN_GATE_STAGE");
+            snprintf(label, sizeof(label),
+                     "staged gates equal in-loop gates, %u tokens", tokens);
+            require_identical(label, actual, other,
+                              (size_t)tokens * VALUE_DIM);
+            snprintf(label, sizeof(label),
+                     "staged gates final state, %u tokens", tokens);
+            require_identical(label, state_actual, state_other,
+                              STATE_ELEMENTS);
+        }
+
+        const uint32_t tokens = 64u;
+        unsetenv("DS4_QWEN4EXP_NO_GDN_GATE_STAGE");
+        buffers_clear_state(&big, 1u);
+        run_prefill(&big, model, &g_fast_decay, qkv, alpha, beta, output_gate,
+                    0u, tokens, actual);
+        require_ok(ds4_gpu_tensor_read(big.state, 0, state_actual,
+            STATE_ELEMENTS * sizeof(float)), "staged fast decay state read");
+        setenv("DS4_QWEN4EXP_NO_GDN_GATE_STAGE", "1", 1);
+        buffers_clear_state(&big, 1u);
+        run_prefill(&big, model, &g_fast_decay, qkv, alpha, beta, output_gate,
+                    0u, tokens, other);
+        require_ok(ds4_gpu_tensor_read(big.state, 0, state_other,
+            STATE_ELEMENTS * sizeof(float)), "in-loop fast decay state read");
+        unsetenv("DS4_QWEN4EXP_NO_GDN_GATE_STAGE");
+        require_identical("staged gates equal in-loop gates, fast decay",
+                          actual, other, (size_t)tokens * VALUE_DIM);
+        require_identical("staged gates fast decay final state",
+                          state_actual, state_other, STATE_ELEMENTS);
+    }
+
     buffers_free(&big);
 
     free(state_carry);

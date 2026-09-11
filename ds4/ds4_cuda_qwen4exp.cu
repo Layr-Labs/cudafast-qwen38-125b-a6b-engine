@@ -200,6 +200,10 @@ __device__ static float dot4_f32(float4 a, float4 b) {
 enum {
     QWEN4EXP_GDN_DIM = 128,
     QWEN4EXP_GDN_HISTORY = 3,
+    /* 512 gate pairs consume 4 KiB of shared memory per block. */
+    QWEN4EXP_GDN_GATE_TILE = 512,
+    /* Short decode/verify rows are faster without staging barriers. */
+    QWEN4EXP_GDN_GATE_MIN_TOKENS = 8,
     /* The shortest sequence the token-parallel convolution below takes over
      * the serial one.  The decode step and the speculative verify's armed
      * rounds are one to a few tokens and keep the serial kernel, whose
@@ -472,6 +476,7 @@ __global__ static void qwen4exp_gdn_conv_parallel_kernel(
  * reference: one block owns one (row, value head, four value rows), one warp
  * owns one value row, and each lane owns four adjacent key columns.
  */
+template <bool STAGE_GATES>
 __global__ static void qwen4exp_gdn_recurrence_kernel(
         float       *__restrict__ out,
         float       *__restrict__ state,
@@ -491,9 +496,14 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
     const uint32_t value = blockIdx.y * 4u + (threadIdx.x >> 5u);
     const uint32_t row = blockIdx.z;
     const uint32_t lane = threadIdx.x & 31u;
-    if (head >= n_value_head || value >= QWEN4EXP_GDN_DIM || row >= n_rows) {
+    if (head >= n_value_head || row >= n_rows) {
         return;
     }
+    if (!STAGE_GATES && value >= QWEN4EXP_GDN_DIM) return;
+    const bool active = STAGE_GATES ? value < QWEN4EXP_GDN_DIM : true;
+
+    __shared__ float tile_g[QWEN4EXP_GDN_GATE_TILE];
+    __shared__ float tile_beta[QWEN4EXP_GDN_GATE_TILE];
 
     const uint32_t key_dim = n_key_head * QWEN4EXP_GDN_DIM;
     const uint32_t value_dim = n_value_head * QWEN4EXP_GDN_DIM;
@@ -508,13 +518,33 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
     float4 *state_ptr = (float4 *)(state +
         ((((uint64_t)row * n_value_head + head) * QWEN4EXP_GDN_DIM) + value) *
         QWEN4EXP_GDN_DIM + k0);
-    float4 h = *state_ptr;
+    float4 h = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (active) h = *state_ptr;
     /* ssm_a IS ALREADY -exp(A_log); see the note in metal/qwen4exp_gdn.metal.
      * Twin of that kernel -- keep the two expressions identical. */
     const float decay_coeff = a_log[head];
     const float bias = dt_bias[head];
 
     for (uint32_t token = 0; token < n_tokens; token++) {
+        if (STAGE_GATES &&
+            token % (uint32_t)QWEN4EXP_GDN_GATE_TILE == 0u) {
+            const uint32_t span =
+                n_tokens - token < (uint32_t)QWEN4EXP_GDN_GATE_TILE
+                    ? n_tokens - token
+                    : (uint32_t)QWEN4EXP_GDN_GATE_TILE;
+            __syncthreads();
+#pragma unroll 1
+            for (uint32_t i = threadIdx.x; i < span; i += blockDim.x) {
+                const uint64_t staged =
+                    ((uint64_t)row * n_tokens + token + i) * n_value_head +
+                    head;
+                tile_g[i] = expf(decay_coeff *
+                    qwen4exp_gdn_softplus(raw_alpha[staged] + bias));
+                tile_beta[i] = qwen4exp_gdn_sigmoid(raw_beta[staged]);
+            }
+            __syncthreads();
+        }
+        if (!active) continue;
         const uint64_t slot = (uint64_t)row * n_tokens + token;
         const uint64_t base = slot * conv_dim + key_head * QWEN4EXP_GDN_DIM;
         const float4 q4 = *(const float4 *)(qkv + base + k0);
@@ -522,9 +552,14 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
         const float v_row = qkv[slot * conv_dim + 2u * (uint64_t)key_dim +
             head * QWEN4EXP_GDN_DIM + value];
         const uint64_t gate = slot * n_value_head + head;
-        const float g = expf(decay_coeff *
-            qwen4exp_gdn_softplus(raw_alpha[gate] + bias));
-        const float beta = qwen4exp_gdn_sigmoid(raw_beta[gate]);
+        const uint32_t tile_slot = token % (uint32_t)QWEN4EXP_GDN_GATE_TILE;
+        const float g = STAGE_GATES
+            ? tile_g[tile_slot]
+            : expf(decay_coeff *
+                qwen4exp_gdn_softplus(raw_alpha[gate] + bias));
+        const float beta = STAGE_GATES
+            ? tile_beta[tile_slot]
+            : qwen4exp_gdn_sigmoid(raw_beta[gate]);
 
         h.x *= g;
         h.y *= g;
@@ -553,7 +588,7 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
             *snap = h;
         }
     }
-    *state_ptr = h;
+    if (active) *state_ptr = h;
 }
 
 /* Sigmoid-gated RMS output norm.  The weight is a plain scale, not an
@@ -586,6 +621,11 @@ __global__ static void qwen4exp_gdn_output_kernel(
     const float scale = rsqrtf(total / (float)QWEN4EXP_GDN_DIM + norm_eps);
     out[base + tid] = raw * scale * output_norm[tid] *
         qwen4exp_gdn_sigmoid(output_gate[base + tid]);
+}
+
+static bool qwen4exp_gdn_stage_gates(uint32_t n_tokens) {
+    if (n_tokens < (uint32_t)QWEN4EXP_GDN_GATE_MIN_TOKENS) return false;
+    return getenv("DS4_QWEN4EXP_NO_GDN_GATE_STAGE") == NULL;
 }
 
 static const float *qwen4exp_gdn_weight_f32(
@@ -792,16 +832,28 @@ static int qwen4exp_cuda_gdn_run(
         return 0;
     }
 
-    qwen4exp_gdn_recurrence_kernel<<<
-            dim3(n_value_head, QWEN4EXP_GDN_DIM / 4u, n_rows),
-            QWEN4EXP_GDN_DIM, 0, stream>>>(
-            (float *)out->ptr, (float *)recurrent_state->ptr,
-            conv_out ? conv_out : (const float *)qkv->ptr,
-            (const float *)raw_alpha->ptr,
-            (const float *)raw_beta->ptr, a_log, dt_bias,
-            state_snapshot ? (float *)state_snapshot->ptr : NULL,
-            n_key_head, n_value_head, n_rows, n_tokens, head_layout,
-            n_snapshot_rows);
+    const dim3 recurrence_grid(n_value_head, QWEN4EXP_GDN_DIM / 4u, n_rows);
+    const float *recurrence_qkv =
+        conv_out ? conv_out : (const float *)qkv->ptr;
+    if (qwen4exp_gdn_stage_gates(n_tokens)) {
+        qwen4exp_gdn_recurrence_kernel<true><<<
+                recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
+                (float *)out->ptr, (float *)recurrent_state->ptr,
+                recurrence_qkv, (const float *)raw_alpha->ptr,
+                (const float *)raw_beta->ptr, a_log, dt_bias,
+                state_snapshot ? (float *)state_snapshot->ptr : NULL,
+                n_key_head, n_value_head, n_rows, n_tokens, head_layout,
+                n_snapshot_rows);
+    } else {
+        qwen4exp_gdn_recurrence_kernel<false><<<
+                recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
+                (float *)out->ptr, (float *)recurrent_state->ptr,
+                recurrence_qkv, (const float *)raw_alpha->ptr,
+                (const float *)raw_beta->ptr, a_log, dt_bias,
+                state_snapshot ? (float *)state_snapshot->ptr : NULL,
+                n_key_head, n_value_head, n_rows, n_tokens, head_layout,
+                n_snapshot_rows);
+    }
     if (!cuda_ok(cudaGetLastError(), "qwen4exp GDN recurrence launch")) {
         return 0;
     }
