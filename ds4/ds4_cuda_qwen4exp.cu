@@ -4300,6 +4300,10 @@ static int qwen4exp_shared_mma_ok(const uint32_t *types, uint32_t n_types,
         }                                                                    \
     } while (0)
 
+/* How many elements of its strided walk a lane asks for before it uses any of
+ * them.  Scheduling only, like the norm's own step above. */
+#define QWEN4EXP_SHARED_GATE_STEPS 10u
+
 __global__ static void qwen4exp_shared_gate_kernel(
         float *gate_out,
         const char *router,
@@ -4311,8 +4315,34 @@ __global__ static void qwen4exp_shared_gate_kernel(
     const uint32_t token = blockIdx.x;
     if (token >= n_tokens) return;
     const float *token_x = x + (uint64_t)token * in_dim;
+    /* One block per token, so a decode row is a single block walking a few
+     * thousand elements -- and with a runtime trip count it walked them one
+     * memory round trip at a time.  QWEN4EXP_SHARED_GATE_STEPS of them are
+     * asked for before any is used.  The products are the same, consumed in
+     * the same ascending order into the same accumulator; only the loads
+     * moved. */
+    const uint32_t nth = blockDim.x;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t steps = (in_dim > tid) ? ((in_dim - tid + nth - 1u) / nth) : 0u;
     float acc = 0.0f;
-    for (uint32_t k = threadIdx.x; k < in_dim; k += blockDim.x) {
+    uint32_t s = 0;
+    for (; s + QWEN4EXP_SHARED_GATE_STEPS <= steps;
+           s += QWEN4EXP_SHARED_GATE_STEPS) {
+        float wv[QWEN4EXP_SHARED_GATE_STEPS];
+        float xv[QWEN4EXP_SHARED_GATE_STEPS];
+#pragma unroll
+        for (uint32_t u = 0; u < QWEN4EXP_SHARED_GATE_STEPS; u++) {
+            const uint32_t k = tid + (s + u) * nth;
+            wv[u] = dev_qwen4exp_weight_value(router_type, router, k);
+            xv[u] = token_x[k];
+        }
+#pragma unroll
+        for (uint32_t u = 0; u < QWEN4EXP_SHARED_GATE_STEPS; u++) {
+            acc += wv[u] * xv[u];
+        }
+    }
+    for (; s < steps; s++) {
+        const uint32_t k = tid + s * nth;
         acc += dev_qwen4exp_weight_value(router_type, router, k) * token_x[k];
     }
     const float total = dev_qwen4exp_block_sum(ds4_qwen4exp_smem, acc);
@@ -5100,6 +5130,22 @@ __device__ __forceinline__ static float qwen4exp_block_sum_f32(
     return partial[0];
 }
 
+/* How many elements of its strided walk a thread asks for before it uses any
+ * of them.  Scheduling only: the values land in the same registers and are
+ * consumed in the same ascending order, into the same accumulator.
+ *
+ * It has to DIVIDE the walk to do anything: a group of 2560 over a block of
+ * 256 is ten steps, so a depth above ten would leave every element to the
+ * one-at-a-time tail and change nothing at all. */
+#define QWEN4EXP_RMS_STEPS 8u
+
+/* One block per (group, row), so a hyper-connection norm of four streams is
+ * four blocks -- and each of those blocks walked its 2560 elements one memory
+ * round trip at a time, because the trip count is a runtime value and nothing
+ * was unrolled.  Both walks below now ask for QWEN4EXP_RMS_STEPS elements
+ * before consuming any, which is the only change: `sum += v * v` is still the
+ * expression it always was, applied to the same elements in the same order,
+ * and the normalise-and-scale walk is elementwise. */
 __global__ static void qwen4exp_rms_norm_kernel(
         float *out, const float *x, const float *w,
         uint32_t n, uint32_t group, uint32_t rows,
@@ -5112,19 +5158,51 @@ __global__ static void qwen4exp_rms_norm_kernel(
     const float *xg = x + base;
     float *yg = out + base;
     const float *wg = w + (uint64_t)g * group;
+    const uint32_t nth = blockDim.x;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t steps = (group > tid) ? ((group - tid + nth - 1u) / nth) : 0u;
 
     float sum = 0.0f;
-    for (uint32_t i = threadIdx.x; i < group; i += blockDim.x) {
-        const float v = xg[i];
+    uint32_t s = 0;
+    for (; s + QWEN4EXP_RMS_STEPS <= steps; s += QWEN4EXP_RMS_STEPS) {
+        float xv[QWEN4EXP_RMS_STEPS];
+#pragma unroll
+        for (uint32_t u = 0; u < QWEN4EXP_RMS_STEPS; u++) {
+            xv[u] = xg[tid + (s + u) * nth];
+        }
+#pragma unroll
+        for (uint32_t u = 0; u < QWEN4EXP_RMS_STEPS; u++) sum += xv[u] * xv[u];
+    }
+    for (; s < steps; s++) {
+        const float v = xg[tid + s * nth];
         sum += v * v;
     }
+
     __shared__ float partial[256];
     const float total = qwen4exp_block_sum_f32(sum, partial);
     /* 1/sqrt rather than rsqrtf: the exactness the qwen4exp op tests assert
      * needs the correctly rounded reciprocal square root. */
     const float scale = 1.0f / sqrtf(total / (float)group + eps);
 
-    for (uint32_t i = threadIdx.x; i < group; i += blockDim.x) {
+    s = 0;
+    for (; s + QWEN4EXP_RMS_STEPS <= steps; s += QWEN4EXP_RMS_STEPS) {
+        float xv[QWEN4EXP_RMS_STEPS];
+        float wv[QWEN4EXP_RMS_STEPS];
+#pragma unroll
+        for (uint32_t u = 0; u < QWEN4EXP_RMS_STEPS; u++) {
+            const uint32_t i = tid + (s + u) * nth;
+            xv[u] = xg[i];
+            wv[u] = wg[i];
+        }
+#pragma unroll
+        for (uint32_t u = 0; u < QWEN4EXP_RMS_STEPS; u++) {
+            float normed = xv[u] * scale;
+            if (round_bf16) normed = qwen4exp_round_bf16(normed);
+            yg[tid + (s + u) * nth] = normed * (weight_bias + wv[u]);
+        }
+    }
+    for (; s < steps; s++) {
+        const uint32_t i = tid + s * nth;
         float normed = xg[i] * scale;
         if (round_bf16) normed = qwen4exp_round_bf16(normed);
         yg[i] = normed * (weight_bias + wg[i]);
@@ -5160,25 +5238,98 @@ __global__ static void qwen4exp_hc_mix_kernel(
     out[(uint64_t)t * n_embd + d] = acc * (1.0f / (float)n_hc);
 }
 
+/* The inject dot: one block per (stream, row), so the grid is n_hc * rows --
+ * four blocks for a decode row, on a part with 48 multiprocessors.  Nothing
+ * can widen that without moving the summation: the reduction it feeds is over
+ * one block's threads, and each thread's own partial is a sequential walk of
+ * the elements `tid, tid + nth, tid + 2*nth ...` in that order.  What the four
+ * blocks CAN do is stop spending one round trip to memory per element.
+ *
+ * Two things were costing that.  The weight accessor took the format as a
+ * runtime argument, so every element of every step re-entered the switch and
+ * recomputed a block address with a division and a modulo; and the loop's trip
+ * count is a runtime value, so nothing was unrolled and each step's loads
+ * waited on the step before it.
+ *
+ * Both are addressed without touching a single arithmetic operation.  The
+ * format becomes a template parameter, which folds the switch away.  For Q8_0
+ * the stride is a multiple of the 32-element block, so a thread's position
+ * INSIDE its block never moves and its block index simply advances by
+ * `nth / 32` a step -- the same block, the same byte, reached by an add rather
+ * than by a divide.  And QWEN4EXP_HC_INJECT_STEPS steps' activations and
+ * weights are asked for before any of them is used, so a lane keeps that many
+ * loads in flight instead of one; they are then consumed by ascending step,
+ * each into the same single accumulator, which is the walk above verbatim.
+ * The accumulation keeps the `sum += x * w` the loop always wrote, so whatever
+ * the compiler decides to do with that expression it decides the same way it
+ * did before: the loads moved, the arithmetic did not. */
+#define QWEN4EXP_HC_INJECT_STEPS 20u
+
+template <uint32_t TYPE>
+__device__ __forceinline__ static float qwen4exp_hc_inject_weight(
+        const char *row, uint32_t i, uint32_t blk, uint32_t lane) {
+    if (TYPE == 8u) {
+        const char *b = row + (uint64_t)blk * 34u;
+        const uint16_t d = (uint16_t)((uint8_t)b[0]) |
+                           (uint16_t)((uint16_t)(uint8_t)b[1] << 8u);
+        return dev_f16_to_f32(d) * (float)(int8_t)b[2u + lane];
+    }
+    return dev_qwen4exp_inject_value(TYPE, row, i);
+}
+
+template <uint32_t TYPE>
 __global__ static void qwen4exp_hc_inject_weights_kernel(
         float *out, const float *normed, const char *w,
         uint32_t n_embd, uint32_t n_hc, uint32_t rows,
-        uint32_t weight_type, uint32_t weight_row_bytes) {
+        uint32_t weight_row_bytes) {
     const uint32_t h = blockIdx.x;
     const uint32_t t = blockIdx.y;
     if (t >= rows || h >= n_hc) return;
 
     const uint32_t wide = n_hc * n_embd;
+    const uint32_t nth = blockDim.x;
+    const uint32_t tid = threadIdx.x;
     const float *xr = normed + (uint64_t)t * wide;
     const char *wr = w + (uint64_t)h * weight_row_bytes;
 
+    /* Block uniform: the strength reduction wants a stride that is a whole
+     * number of quantisation blocks. */
+    const bool aligned = (nth & 31u) == 0u;
+    const uint32_t lane0 = tid & 31u;
+    const uint32_t blk0 = tid >> 5u;
+    const uint32_t blk_step = nth >> 5u;
+
+    const uint32_t steps = (wide > tid) ? ((wide - tid + nth - 1u) / nth) : 0u;
     float sum = 0.0f;
-    for (uint32_t i = threadIdx.x; i < wide; i += blockDim.x) {
-        sum += xr[i] * dev_qwen4exp_inject_value(weight_type, wr, i);
+    uint32_t s = 0;
+    for (; s + QWEN4EXP_HC_INJECT_STEPS <= steps;
+           s += QWEN4EXP_HC_INJECT_STEPS) {
+        float xv[QWEN4EXP_HC_INJECT_STEPS];
+        float wv[QWEN4EXP_HC_INJECT_STEPS];
+#pragma unroll
+        for (uint32_t u = 0; u < QWEN4EXP_HC_INJECT_STEPS; u++) {
+            const uint32_t i = tid + (s + u) * nth;
+            xv[u] = xr[i];
+            wv[u] = qwen4exp_hc_inject_weight<TYPE>(
+                wr, i, aligned ? (blk0 + (s + u) * blk_step) : (i >> 5u),
+                aligned ? lane0 : (i & 31u));
+        }
+#pragma unroll
+        for (uint32_t u = 0; u < QWEN4EXP_HC_INJECT_STEPS; u++) {
+            sum += xv[u] * wv[u];
+        }
     }
+    for (; s < steps; s++) {
+        const uint32_t i = tid + s * nth;
+        const float wv = qwen4exp_hc_inject_weight<TYPE>(
+            wr, i, aligned ? (blk0 + s * blk_step) : (i >> 5u),
+            aligned ? lane0 : (i & 31u));
+        sum += xr[i] * wv;
+    }
+
     __shared__ float partial[256];
     const float total = qwen4exp_block_sum_f32(sum, partial);
-    if (threadIdx.x == 0) {
+    if (tid == 0u) {
         out[(uint64_t)t * n_hc + h] =
             2.0f * qwen4exp_sigmoid(total * (1.0f / (float)n_hc));
     }
@@ -5294,9 +5445,21 @@ extern "C" int ds4_gpu_qwen4exp_hc_inject_weights_tensor(
             "qwen4exp_inject_weight");
     if (!w) return 0;
     dim3 grid(n_hc, rows, 1u);
-    qwen4exp_hc_inject_weights_kernel<<<grid, 256, 0, cuda_decode_stream()>>>(
-            (float *)out->ptr, (const float *)normed->ptr, w,
-            n_embd, n_hc, rows, weight->type, (uint32_t)row_bytes);
+    /* One instantiation per format the loader accepts, from the same table the
+     * scalar accessor expands. */
+#define QWEN4EXP_HC_INJECT_LAUNCH_CASE(name, id)                              \
+    case (uint32_t)(id):                                                      \
+        qwen4exp_hc_inject_weights_kernel<(uint32_t)(id)>                     \
+            <<<grid, 256, 0, cuda_decode_stream()>>>(                         \
+                (float *)out->ptr, (const float *)normed->ptr, w,             \
+                n_embd, n_hc, rows, (uint32_t)row_bytes);                     \
+        break;
+    switch (weight->type) {
+    DS4_QWEN4EXP_HC_INJECT_TYPES(QWEN4EXP_HC_INJECT_LAUNCH_CASE)
+    default:
+        return 0;
+    }
+#undef QWEN4EXP_HC_INJECT_LAUNCH_CASE
     return cuda_ok(cudaGetLastError(), "qwen4exp_hc_inject_weights launch");
 }
 
@@ -6548,12 +6711,12 @@ __global__ static void qwen4exp_qsa_attention_kernel(
         if (tid < head_dim) {
             float contrib = 0.0f;
             uint32_t j = 0;
-            /* EIGHT VALUE ROWS IN FLIGHT AT A TIME.  This loop is the longest
+            /* FOUR VALUE ROWS IN FLIGHT AT A TIME.  This loop is the longest
              * dependency chain in the kernel: one global load per key, each
              * add waiting on the one before it, up to nth keys per tile.  The
              * loads coalesce across `tid` already, so what is left to win is
-             * how many are in flight, and issuing eight before the first
-             * product covers eight times the latency.
+             * how many are in flight, and issuing four before the first
+             * product covers four times the latency.
              *
              * THE PRODUCTS ARE ADDED IN THE SAME ORDER, j ascending, so
              * `contrib` is bit for bit the value the one-at-a-time loop
@@ -6565,7 +6728,7 @@ __global__ static void qwen4exp_qsa_attention_kernel(
              * and the skip below cannot fire; the sparse path keeps the
              * one-at-a-time walk, whose `continue` is load bearing. */
             if (!sparse) {
-                for (; j + 8u <= n_in_tile; j += 8u) {
+                for (; j + 4u <= n_in_tile; j += 4u) {
                     const float *v0 = v_cache +
                         (uint64_t)keys[j] * kv_stride + (uint64_t)kv_head * head_dim;
                     const float *v1 = v_cache +
@@ -6574,30 +6737,14 @@ __global__ static void qwen4exp_qsa_attention_kernel(
                         (uint64_t)keys[j + 2u] * kv_stride + (uint64_t)kv_head * head_dim;
                     const float *v3 = v_cache +
                         (uint64_t)keys[j + 3u] * kv_stride + (uint64_t)kv_head * head_dim;
-                    const float *v4 = v_cache +
-                        (uint64_t)keys[j + 4u] * kv_stride + (uint64_t)kv_head * head_dim;
-                    const float *v5 = v_cache +
-                        (uint64_t)keys[j + 5u] * kv_stride + (uint64_t)kv_head * head_dim;
-                    const float *v6 = v_cache +
-                        (uint64_t)keys[j + 6u] * kv_stride + (uint64_t)kv_head * head_dim;
-                    const float *v7 = v_cache +
-                        (uint64_t)keys[j + 7u] * kv_stride + (uint64_t)kv_head * head_dim;
                     const float a0 = v0[tid];
                     const float a1 = v1[tid];
                     const float a2 = v2[tid];
                     const float a3 = v3[tid];
-                    const float a4 = v4[tid];
-                    const float a5 = v5[tid];
-                    const float a6 = v6[tid];
-                    const float a7 = v7[tid];
                     contrib += probs[j] * a0;
                     contrib += probs[j + 1u] * a1;
                     contrib += probs[j + 2u] * a2;
                     contrib += probs[j + 3u] * a3;
-                    contrib += probs[j + 4u] * a4;
-                    contrib += probs[j + 5u] * a5;
-                    contrib += probs[j + 6u] * a6;
-                    contrib += probs[j + 7u] * a7;
                 }
             }
             for (; j < n_in_tile; j++) {
@@ -6892,6 +7039,338 @@ __global__ static void qwen4exp_qsa_attention_group_kernel(
     }
 }
 
+/* =========================================================================
+ * THE SAME ATTENTION FOR A DECODE ROW, IN THREE LAUNCHES.
+ * =========================================================================
+ *
+ * The kernel above is shaped for a prefill: one block per (head, query row),
+ * one thread per key, and everything -- the key dot, the online softmax and
+ * the value accumulation -- inside that one block.  A decode row has one query
+ * row, so the grid is n_head blocks of head_dim threads: 24 blocks of 256 on a
+ * part with 48 multiprocessors and room for 1536 threads on each.  Under a
+ * sixteenth of the device is asked to do anything, and what it is asked to do
+ * is walk the key cache, so the row spends its time waiting on memory that
+ * nothing is there to overlap with.
+ *
+ * The work does not have to be arranged that way.  Write the one-block kernel
+ * out as a recurrence over tiles of `nth` keys (`t` counts tiles, `d` counts
+ * output channels, `j` counts keys inside a tile):
+ *
+ *   score_t[j]   = (q . K[key])       * scale        -- independent, all t, j
+ *   tmax_t       = blkmax(score_t)                   -- independent, all t
+ *   run_max_t    = fmax(run_max_{t-1}, tmax_t)       -- a running maximum
+ *   probs_t[j]   = key >= 0 ? exp(score_t[j] - run_max_t) : 0
+ *   tsum_t       = blksum(probs_t)                   -- independent, all t
+ *   rescale_t    = run_max_{t-1} > LIMIT ? exp(run_max_{t-1} - run_max_t) : 0
+ *   contrib_t[d] = SUM_j probs_t[j] * V[key_j][d]    -- independent, all t, d
+ *   run_sum_t    = run_sum_{t-1} * rescale_t + tsum_t
+ *   acc_t[d]     = acc_{t-1}[d]    * rescale_t + contrib_t[d]
+ *   out[d]       = run_sum > 0 ? acc[d] / run_sum : 0
+ *
+ * Only the last three lines carry anything from one tile to the next, and the
+ * two that are per channel are a chain of fused multiply-adds over a handful
+ * of tiles.  Everything above them is per (head, tile) or per (head, tile,
+ * channel) and depends on no other tile.  So the row splits into three
+ * launches, and each one gets a grid that is `n_tiles` times wider than the
+ * kernel above had:
+ *
+ *   1  qwen4exp_qsa_split_scores_kernel   score_t[j] and tmax_t
+ *   2  qwen4exp_qsa_split_probs_kernel    probs_t, tsum_t and contrib_t[d]
+ *   3  qwen4exp_qsa_split_combine_kernel  the two chains and the divide
+ *
+ * WHY THE BYTES ARE THE SAME.  This is a rearrangement of WHERE each operation
+ * runs and of nothing else.  Taken line by line against the kernel above:
+ *
+ *   - the score is still one thread's own sequential walk of one key row, the
+ *     same 16-byte words in the same order, each contributing x, y, z then w
+ *     to the same single accumulator.  A dot split across lanes would NOT be
+ *     this number, which is why every thread here still owns a whole key.
+ *   - `tmax` is qwen4exp_blk_max over the same `nth` scores of the same tile,
+ *     so it is the same tree over the same values; a maximum is exact anyway.
+ *   - `run_max_t` is fmaxf folded over tmax_0 .. tmax_t starting from the
+ *     masked score.  fmaxf is exact and associative, so the fold stage 2 does
+ *     over the tiles below it is the running maximum stage 1's blocks would
+ *     have handed forward, to the bit, whatever order it is taken in.  It is
+ *     the ONE place this file relies on reassociation, and it is the one
+ *     operation where reassociation is not an approximation.
+ *   - `probs`, `tsum`, `rescale` and `contrib` are then written exactly as the
+ *     kernel above writes them: the same expf of the same difference, the same
+ *     qwen4exp_blk_sum tree, the same ascending `j` skipping the same masked
+ *     slots into the same single accumulator.
+ *   - the two recurrences are replayed by stage 3 over ascending `t` with the
+ *     same operands in the same order.
+ *   - every product-accumulate is an explicit __fmaf_rn, for the reason the
+ *     head-group kernel above spells out: the kernel above writes them as
+ *     `a += b * c` and nvcc contracts each into one FFMA, and naming the fused
+ *     form here keeps that decision from being made differently under a
+ *     different surrounding expression.
+ *
+ * The masked slots need one word of care.  A slot is masked when it is past
+ * `count`, when the selection put a negative there, or when the id is outside
+ * the cache; the kernel above records that as `key < 0` and every stage here
+ * recomputes the same test from the same `selected`/`counts`/`cache_cap`
+ * rather than passing a flag along, so the three stages cannot disagree about
+ * it.  A masked slot scores QWEN4EXP_QSA_MASKED_SCORE, contributes a zero
+ * probability, and is skipped by the value walk -- not added as a zero, which
+ * would be a different operation.
+ *
+ * GROUP and the two STEP numbers below are scheduling only.  GROUP puts
+ * several query heads of one KV head in one block so the key and value rows
+ * they share are asked of the memory system once and read again out of the
+ * first-level cache; the STEPs ask for several rows before consuming any of
+ * them, so a lane keeps that many loads in flight instead of one.  Neither
+ * moves a product into a different accumulator.
+ */
+#define QWEN4EXP_QSA_SPLIT_KSTEP     16u
+#define QWEN4EXP_QSA_SPLIT_VSTEP     32u
+#define QWEN4EXP_QSA_SPLIT_GS        2u
+#define QWEN4EXP_QSA_SPLIT_GV        2u
+/* The split path is for a decode row and the widths a scored step verifies;
+ * anything wider still goes to the head-group kernel, whose grid a prefill
+ * already fills. */
+#define QWEN4EXP_QSA_SPLIT_MAX_ROWS  8u
+#define QWEN4EXP_QSA_SPLIT_MAX_BYTES (192u * 1024u * 1024u)
+
+/* The slot's key, or -1 when the slot is masked.  The kernel above computes
+ * exactly this, inline; the three stages below call it so they cannot drift
+ * apart from each other. */
+__device__ __forceinline__ static int32_t qwen4exp_qsa_slot_key(
+        const int32_t *selected, uint32_t token, uint32_t max_selected,
+        uint32_t slot, uint32_t count, uint32_t cache_cap, uint32_t sparse) {
+    if (slot >= count) return -1;
+    const int32_t key = sparse
+        ? selected[(uint64_t)token * max_selected + slot] : (int32_t)slot;
+    if (key < 0 || (uint32_t)key >= cache_cap) return -1;
+    return key;
+}
+
+template <uint32_t KSTEP, uint32_t GS>
+__global__ static void qwen4exp_qsa_split_scores_kernel(
+        const float *q,
+        const float *k_cache,
+        const int32_t *selected,
+        const int32_t *counts,
+        float *scores,
+        float *tile_max_out,
+        uint32_t n_head,
+        uint32_t n_kv_head,
+        uint32_t head_dim,
+        uint32_t pos0,
+        uint32_t cache_cap,
+        uint32_t max_selected,
+        uint32_t sparse,
+        uint32_t slot_stride,
+        uint32_t n_tiles,
+        float scale,
+        const uint32_t *d_pos) {
+    extern __shared__ __align__(16) float qwen4exp_qsa_s1_shared[];
+    const uint32_t nth = blockDim.x / GS;
+    const uint32_t hloc = threadIdx.x / nth;
+    const uint32_t tid = threadIdx.x % nth;
+    const uint32_t t = blockIdx.x;
+    const uint32_t head = blockIdx.y * GS + hloc;
+    const uint32_t token = blockIdx.z;
+
+    /* GS query rows, then GS reduction rows.  Each head's reduction row is its
+     * own, so qwen4exp_blk_max below is the one-head tree unchanged; the
+     * barriers inside it are block wide and every thread of the block reaches
+     * every one of them, because nothing above them branches on the head. */
+    float *qvec = qwen4exp_qsa_s1_shared + hloc * head_dim;
+    float *tile = qwen4exp_qsa_s1_shared + GS * head_dim + hloc * nth;
+
+    /* Under a captured decode graph the `pos0` recorded in the launch is the
+     * position capture happened at; `d_pos` is the one this replay is at.
+     * Every kernel on this path reads the position exactly this way. */
+    const uint32_t p0 = d_pos ? *d_pos : pos0;
+    const uint32_t count = sparse ? (uint32_t)counts[token] : p0 + token + 1u;
+    /* A tile at or past `count` is read by nobody: stage 2 runs only below
+     * that bound and stage 3 stops at it.  The grid is sized from the cache
+     * capacity so that its shape does not depend on the position, so those
+     * tiles exist and leave here -- block uniform, and above every barrier. */
+    if ((uint64_t)t * nth >= count) return;
+    const uint32_t kv_head = head / (n_head / n_kv_head);
+    const uint32_t kv_stride = n_kv_head * head_dim;
+    const uint32_t words = head_dim >> 2u;
+    const uint32_t slot = t * nth + tid;
+    const uint64_t row = (uint64_t)token * n_head + head;
+
+    const float *qsrc =
+        q + ((uint64_t)token * n_head + blockIdx.y * GS) * head_dim;
+    for (uint32_t d = threadIdx.x; d < GS * head_dim; d += blockDim.x) {
+        qwen4exp_qsa_s1_shared[d] = qsrc[d];
+    }
+    __syncthreads();
+
+    const int32_t key = qwen4exp_qsa_slot_key(selected, token, max_selected,
+                                              slot, count, cache_cap, sparse);
+    float score = QWEN4EXP_QSA_MASKED_SCORE;
+    if (key >= 0) {
+        const float4 *kv4 = (const float4 *)(k_cache +
+            (uint64_t)key * kv_stride + (uint64_t)kv_head * head_dim);
+        const float4 *qv4 = (const float4 *)qvec;
+        float dot = 0.0f;
+        uint32_t w = 0;
+        for (; w + KSTEP <= words; w += KSTEP) {
+            float4 kk[KSTEP];
+#pragma unroll
+            for (uint32_t i = 0; i < KSTEP; i++) kk[i] = kv4[w + i];
+#pragma unroll
+            for (uint32_t i = 0; i < KSTEP; i++) {
+                const float4 qq = qv4[w + i];
+                dot = __fmaf_rn(qq.x, kk[i].x, dot);
+                dot = __fmaf_rn(qq.y, kk[i].y, dot);
+                dot = __fmaf_rn(qq.z, kk[i].z, dot);
+                dot = __fmaf_rn(qq.w, kk[i].w, dot);
+            }
+        }
+        for (; w < words; w++) {
+            const float4 kk = kv4[w];
+            const float4 qq = qv4[w];
+            dot = __fmaf_rn(qq.x, kk.x, dot);
+            dot = __fmaf_rn(qq.y, kk.y, dot);
+            dot = __fmaf_rn(qq.z, kk.z, dot);
+            dot = __fmaf_rn(qq.w, kk.w, dot);
+        }
+        score = dot * scale;
+    }
+    scores[row * slot_stride + slot] = score;
+    tile[tid] = score;
+    const float tmax = qwen4exp_blk_max(tile, tid, nth);
+    if (tid == 0u) tile_max_out[row * n_tiles + t] = tmax;
+}
+
+template <uint32_t VSTEP, uint32_t GV>
+__global__ static void qwen4exp_qsa_split_probs_kernel(
+        const float *v_cache,
+        const float *scores,
+        const float *tile_max,
+        const int32_t *selected,
+        const int32_t *counts,
+        float *tile_sum_out,
+        float *contrib_out,
+        uint32_t n_head,
+        uint32_t n_kv_head,
+        uint32_t head_dim,
+        uint32_t pos0,
+        uint32_t cache_cap,
+        uint32_t max_selected,
+        uint32_t sparse,
+        uint32_t slot_stride,
+        uint32_t n_tiles,
+        const uint32_t *d_pos) {
+    extern __shared__ float qwen4exp_qsa_s2_shared[];
+    const uint32_t nth = blockDim.x / GV;
+    const uint32_t hloc = threadIdx.x / nth;
+    const uint32_t tid = threadIdx.x % nth;
+    const uint32_t t = blockIdx.x;
+    const uint32_t head = blockIdx.y * GV + hloc;
+    const uint32_t token = blockIdx.z;
+
+    float *tile = qwen4exp_qsa_s2_shared + hloc * nth;
+    float *probs = qwen4exp_qsa_s2_shared + GV * nth + hloc * nth;
+    /* The key list does not depend on the head, so the GV heads share one
+     * copy of it, filled by the first of them. */
+    int32_t *keys = (int32_t *)(qwen4exp_qsa_s2_shared + 2u * GV * nth);
+
+    const uint32_t p0 = d_pos ? *d_pos : pos0;
+    const uint32_t count = sparse ? (uint32_t)counts[token] : p0 + token + 1u;
+    const uint32_t base = t * nth;
+    const uint64_t row = (uint64_t)token * n_head + head;
+    /* Block uniform: every thread of the block has this `t` and this token.
+     * Stage 3 stops at the same bound, so a tile at or past `count` is read
+     * by nothing and therefore writes nothing. */
+    if (base >= count) return;
+    const uint32_t n_in_tile = min(nth, count - base);
+    const uint32_t kv_head = head / (n_head / n_kv_head);
+    const uint32_t kv_stride = n_kv_head * head_dim;
+
+    float run_max = QWEN4EXP_QSA_MASKED_SCORE;
+    for (uint32_t i = 0; i < t; i++) {
+        run_max = fmaxf(run_max, tile_max[row * n_tiles + i]);
+    }
+    const float new_max = fmaxf(run_max, tile_max[row * n_tiles + t]);
+
+    const int32_t key = qwen4exp_qsa_slot_key(selected, token, max_selected,
+                                              base + tid, count, cache_cap,
+                                              sparse);
+    const float score = scores[row * slot_stride + base + tid];
+    const float p = (key >= 0) ? expf(score - new_max) : 0.0f;
+    probs[tid] = p;
+    if (hloc == 0u) keys[tid] = key;
+    tile[tid] = p;
+    const float tile_sum = qwen4exp_blk_sum(tile, tid, nth);
+    if (tid == 0u) tile_sum_out[row * n_tiles + t] = tile_sum;
+
+    /* qwen4exp_blk_sum ends on a barrier, so `probs` and `keys` are complete. */
+    const float *vbase = v_cache + (uint64_t)kv_head * head_dim + tid;
+    float c = 0.0f;
+    uint32_t j = 0;
+    for (; j + VSTEP <= n_in_tile; j += VSTEP) {
+        float vv[VSTEP];
+        float pp[VSTEP];
+        int32_t kk[VSTEP];
+#pragma unroll
+        for (uint32_t i = 0; i < VSTEP; i++) {
+            kk[i] = keys[j + i];
+            pp[i] = probs[j + i];
+            /* A masked slot is dropped below; reading row zero for it keeps
+             * the address in range and its value unused. */
+            vv[i] = vbase[(uint64_t)max(kk[i], 0) * kv_stride];
+        }
+#pragma unroll
+        for (uint32_t i = 0; i < VSTEP; i++) {
+            if (kk[i] >= 0) c = __fmaf_rn(pp[i], vv[i], c);
+        }
+    }
+    for (; j < n_in_tile; j++) {
+        const int32_t kj = keys[j];
+        if (kj < 0) continue;
+        c = __fmaf_rn(probs[j], vbase[(uint64_t)kj * kv_stride], c);
+    }
+    contrib_out[(row * n_tiles + t) * head_dim + tid] = c;
+}
+
+__global__ static void qwen4exp_qsa_split_combine_kernel(
+        const float *tile_max,
+        const float *tile_sum,
+        const float *contrib,
+        const int32_t *counts,
+        float *out,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t pos0,
+        uint32_t sparse,
+        uint32_t n_tiles,
+        const uint32_t *d_pos) {
+    const uint32_t head = blockIdx.x;
+    const uint32_t token = blockIdx.y;
+    const uint32_t d = threadIdx.x;
+    const uint64_t row = (uint64_t)token * n_head + head;
+    const uint32_t p0 = d_pos ? *d_pos : pos0;
+    const uint32_t count = sparse ? (uint32_t)counts[token] : p0 + token + 1u;
+    float *dst = out + row * head_dim + d;
+    if (count == 0u) { *dst = 0.0f; return; }
+
+    /* The tile loop of the one-block kernel is `base < count` stepping by
+     * `nth`, and this path only runs with nth == head_dim. */
+    const uint32_t used = (count + head_dim - 1u) / head_dim;
+    const float *tm = tile_max + row * n_tiles;
+    const float *ts = tile_sum + row * n_tiles;
+    const float *cc = contrib + row * n_tiles * head_dim + d;
+    float run_max = QWEN4EXP_QSA_MASKED_SCORE;
+    float run_sum = 0.0f;
+    float acc = 0.0f;
+    for (uint32_t t = 0; t < used; t++) {
+        const float new_max = fmaxf(run_max, tm[t]);
+        const float rescale = (run_max > QWEN4EXP_QSA_MASKED_LIMIT)
+            ? expf(run_max - new_max) : 0.0f;
+        run_sum = __fmaf_rn(run_sum, rescale, ts[t]);
+        acc = __fmaf_rn(acc, rescale, cc[(uint64_t)t * head_dim]);
+        run_max = new_max;
+    }
+    *dst = (run_sum > 0.0f) ? acc / run_sum : 0.0f;
+}
+
 __global__ static void qwen4exp_qsa_output_gate_kernel(
         const float *gate,
         float *out,
@@ -6948,6 +7427,59 @@ static uint32_t qwen4exp_qsa_group_width(void) {
         return (v > 0 && v <= 32) ? (uint32_t)v : 1u;
     }
     return 12u;
+}
+
+/* DS4_QWEN4EXP_QSA_ATTN_V1 sends a narrow row back to the one-block kernel.
+ * Read fresh, for the reason the group width is: tests/test_qwen4exp_qsa.c
+ * runs the pipeline both ways in one process and requires the bytes to match.
+ * One environment lookup per attention call is a fraction of a microsecond
+ * against a launch that moves megabytes. */
+static uint32_t qwen4exp_qsa_split_disabled(void) {
+    return getenv("DS4_QWEN4EXP_QSA_ATTN_V1") != NULL ? 1u : 0u;
+}
+
+/* Per-tile scratch for the split decode attention: scores, tile maxima, tile
+ * sums and per-tile channel contributions.  Kept and grown rather than
+ * allocated per call, like the MoE group scratch above; a decode graph that
+ * captured these addresses is retired before the old allocation goes away.
+ * Growing is not a capturable operation, so a call that arrives under capture
+ * with the buffer too small says no and the caller keeps the one-block
+ * kernel. */
+static void *g_qwen4exp_qsa_scratch[16];
+static uint64_t g_qwen4exp_qsa_scratch_bytes[16];
+
+static void *qwen4exp_qsa_scratch(int tier, uint64_t bytes) {
+    if (tier < 0 || tier >= 16) return NULL;
+    if (g_qwen4exp_qsa_scratch[tier] &&
+        g_qwen4exp_qsa_scratch_bytes[tier] >= bytes) {
+        return g_qwen4exp_qsa_scratch[tier];
+    }
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(cuda_decode_stream(), &capture) != cudaSuccess ||
+        capture != cudaStreamCaptureStatusNone) {
+        return NULL;
+    }
+    void *next = NULL;
+    if (!cuda_ok(cudaMalloc(&next, (size_t)bytes),
+                 "qwen4exp QSA split scratch")) {
+        return NULL;
+    }
+    if (g_qwen4exp_qsa_scratch[tier]) {
+        ds4_gpu_decode_graphs_invalidate();
+        cudaFree(g_qwen4exp_qsa_scratch[tier]);
+    }
+    g_qwen4exp_qsa_scratch[tier] = next;
+    g_qwen4exp_qsa_scratch_bytes[tier] = bytes;
+    return next;
+}
+
+/* Largest power of two that divides `value` and is at most `cap`. */
+static uint32_t qwen4exp_qsa_split_group(uint32_t want, uint32_t value,
+                                         uint32_t cap) {
+    uint32_t g = want;
+    if (g > cap) g = cap;
+    while (g > 1u && (value % g) != 0u) g--;
+    return g;
 }
 
 extern "C" void ds4_gpu_qwen4exp_rope_inv_freq(
@@ -7370,6 +7902,95 @@ extern "C" int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
      * with no error anywhere.  Refuse instead. */
     if (nth < head_dim) return 0;
     const uint32_t *d_pos_ptr = d_pos ? (const uint32_t *)d_pos->ptr : NULL;
+
+    /* THE SCRATCH IS SIZED FOR THE SESSION, NOT FOR THIS CALL.  A decode graph
+     * records the pointer this launcher hands the kernels and the strides it
+     * hands them with, and replays both at later positions; growing a device
+     * allocation is not a capturable operation, so a buffer that first had to
+     * grow inside a capture would have left the one-block kernel recorded in
+     * the graph for the rest of the session.  Sizing from `cache_cap` and the
+     * widest row this path takes makes the size a constant of the session:
+     * the allocation happens on the first call, which is a prefill and is not
+     * captured, and every captured decode finds it already there.  Ask for it
+     * whatever this call's width is, for exactly that reason. */
+    const int split_ok = (nth == head_dim && head_dim >= 32u &&
+                          (head_dim & 3u) == 0u &&
+                          !qwen4exp_qsa_split_disabled());
+    const uint64_t tiles_cap = ((uint64_t)cache_cap + nth - 1u) / nth;
+    const uint64_t stride_cap = tiles_cap * nth;
+    const uint64_t rows_cap = (uint64_t)QWEN4EXP_QSA_SPLIT_MAX_ROWS * n_head;
+    /* scores | tile_max | tile_sum | contrib, each 16-byte aligned. */
+    const uint64_t sc_bytes = ((rows_cap * stride_cap * 4u + 15u) / 16u) * 16u;
+    const uint64_t tm_bytes = ((rows_cap * tiles_cap * 4u + 15u) / 16u) * 16u;
+    const uint64_t ct_bytes = rows_cap * tiles_cap * head_dim * 4u;
+    const uint64_t total = sc_bytes + 2u * tm_bytes + ct_bytes;
+    void *split_scratch =
+        (split_ok && tiles_cap > 0u && total <= QWEN4EXP_QSA_SPLIT_MAX_BYTES)
+        ? qwen4exp_qsa_scratch(ds4_tensor_device_idx(out), total) : NULL;
+
+    /* A decode-width row goes to the three-launch split, whose grid is
+     * n_tiles times the one-block kernel's.  Same arithmetic in the same
+     * order (see the kernels' note); the choice is a scheduling one, and
+     * DS4_QWEN4EXP_QSA_ATTN_V1 takes it back. */
+    if (split_scratch && n_tokens <= QWEN4EXP_QSA_SPLIT_MAX_ROWS) {
+        /* The bound on `count` the host can know without reading device
+         * memory AND WITHOUT THE POSITION, which under a captured graph it
+         * does not have: the sparse path is capped by the selection width;
+         * the dense one by the cache, unless the position came from the host,
+         * in which case the last row's is tighter and just as fixed.  A tile
+         * past `count` costs a block that leaves on its first instruction. */
+        const uint64_t bound = sparse ? (uint64_t)max_selected
+                             : (d_pos_ptr ? (uint64_t)cache_cap
+                                          : (uint64_t)pos0 + n_tokens);
+        const uint64_t n_tiles = (bound + nth - 1u) / nth;
+        const uint64_t slot_stride = n_tiles * nth;
+        const uint32_t gqa = n_head / n_kv_head;
+        const uint32_t gs = qwen4exp_qsa_split_group(
+                QWEN4EXP_QSA_SPLIT_GS, gqa, 1024u / nth);
+        const uint32_t gv = qwen4exp_qsa_split_group(
+                QWEN4EXP_QSA_SPLIT_GV, gqa, 1024u / nth);
+        void *scratch = (n_tiles > 0u && n_tiles <= tiles_cap)
+            ? split_scratch : NULL;
+        if (scratch) {
+            float *sc = (float *)scratch;
+            float *tm = (float *)((char *)scratch + sc_bytes);
+            float *ts = (float *)((char *)scratch + sc_bytes + tm_bytes);
+            float *ct = (float *)((char *)scratch + sc_bytes + 2u * tm_bytes);
+            const int32_t *selp = sparse ? (const int32_t *)selected->ptr : NULL;
+            const int32_t *cntp = sparse ? (const int32_t *)counts->ptr : NULL;
+#define QWEN4EXP_QSA_SPLIT_LAUNCH(GS, GV)                                      \
+            do {                                                               \
+                qwen4exp_qsa_split_scores_kernel<QWEN4EXP_QSA_SPLIT_KSTEP, GS>  \
+                    <<<dim3((unsigned)n_tiles, n_head / (GS), n_tokens),        \
+                       nth * (GS), (size_t)((GS) * head_dim + (GS) * nth) *     \
+                       sizeof(float), cuda_decode_stream()>>>(                  \
+                        (const float *)q->ptr, (const float *)k_cache->ptr,     \
+                        selp, cntp, sc, tm, n_head, n_kv_head, head_dim, pos0,  \
+                        cache_cap, max_selected, sparse ? 1u : 0u,              \
+                        (uint32_t)slot_stride, (uint32_t)n_tiles, scale,        \
+                        d_pos_ptr);                                            \
+                qwen4exp_qsa_split_probs_kernel<QWEN4EXP_QSA_SPLIT_VSTEP, GV>   \
+                    <<<dim3((unsigned)n_tiles, n_head / (GV), n_tokens),        \
+                       nth * (GV), (size_t)(2u * (GV) + 1u) * nth *             \
+                       sizeof(float), cuda_decode_stream()>>>(                  \
+                        (const float *)v_cache->ptr, sc, tm, selp, cntp, ts,    \
+                        ct, n_head, n_kv_head, head_dim, pos0, cache_cap,       \
+                        max_selected, sparse ? 1u : 0u, (uint32_t)slot_stride,  \
+                        (uint32_t)n_tiles, d_pos_ptr);                          \
+            } while (0)
+            if (gs == 2u && gv == 2u)      QWEN4EXP_QSA_SPLIT_LAUNCH(2u, 2u);
+            else if (gs == 2u && gv == 1u) QWEN4EXP_QSA_SPLIT_LAUNCH(2u, 1u);
+            else if (gs == 1u && gv == 2u) QWEN4EXP_QSA_SPLIT_LAUNCH(1u, 2u);
+            else                           QWEN4EXP_QSA_SPLIT_LAUNCH(1u, 1u);
+#undef QWEN4EXP_QSA_SPLIT_LAUNCH
+            qwen4exp_qsa_split_combine_kernel<<<dim3(n_head, n_tokens), nth, 0,
+                cuda_decode_stream()>>>(
+                    tm, ts, ct, cntp, (float *)out->ptr, n_head, head_dim, pos0,
+                    sparse ? 1u : 0u, (uint32_t)n_tiles, d_pos_ptr);
+            return cuda_ok(cudaGetLastError(),
+                           "Qwen4-Exp QSA split attention launch");
+        }
+    }
 
     /* Wide rows go to the head-group kernel, which reads each K and each V
      * row once for the whole group instead of once per head.  It is the same

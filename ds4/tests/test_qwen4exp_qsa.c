@@ -9,7 +9,9 @@
  * The run walks a single sequence through five segments so that both indexer
  * states are exercised:
  *
- *   pos    0 + 1024 tokens   kv 1024   dense, the budget still covers the tape
+ *   pos    0 +    1 token    kv    1   dense, the one-row decode shape
+ *   pos    1 +    3 tokens   kv    4   dense, the widths a scored step takes
+ *   pos    4 + 1020 tokens   kv 1024   dense, the budget still covers the tape
  *   pos 1024 + 1024 tokens   kv 2048   dense, exactly at the budget
  *   pos 2048 + 1024 tokens   kv 3072   sparse, 512 blocks selected
  *   pos 3072 +   64 tokens   kv 3136   sparse
@@ -470,7 +472,9 @@ typedef struct {
 } segment;
 
 static const segment SEGMENTS[] = {
-    { 0,    1024 },
+    { 0,    1 },
+    { 1,    3 },
+    { 4,    1020 },
     { 1024, 1024 },
     { 2048, 1024 },
     { 3072, 64 },
@@ -485,9 +489,9 @@ typedef struct {
     float *idx_q_norm_w;
     float *idx_k_norm_w;
     /* Per-segment fused projections and indexer projections. */
-    float *fused[5];
-    float *idx_q[5];
-    float *idx_k[5];
+    float *fused[8];
+    float *idx_q[8];
+    float *idx_k[8];
 } inputs;
 
 static void inputs_build(inputs *in) {
@@ -931,6 +935,39 @@ int main(void) {
     printf("  %-38s %zu values bit-exact against the per-head kernel\n",
            "head-group attention", attn_len);
 
+    /* And again with the split decode attention switched off, so the split
+     * kernels and the one-block kernel stand side by side in one process.
+     * The split rearranges WHERE each operation runs -- three launches with a
+     * grid n_tiles times wider -- and rearranges nothing about the operations
+     * themselves, so this is not a tolerance band either: the bytes must be
+     * equal.  The segment list covers both sides of its width gate and both
+     * selection modes: the one-row and three-row dense segments and the
+     * one-row sparse segment take the split, the wide ones do not. */
+    float *unsplit = xcalloc(attn_len, sizeof(float));
+    setenv("DS4_QWEN4EXP_QSA_ATTN_V1", "1", 1);
+    run_pipeline(&in, false, unsplit);
+    unsetenv("DS4_QWEN4EXP_QSA_ATTN_V1");
+
+    if (memcmp(first, unsplit, attn_len * sizeof(float)) != 0) {
+        size_t differing = 0;
+        size_t at = 0;
+        for (size_t i = 0; i < attn_len; i++) {
+            if (first[i] != unsplit[i]) {
+                if (differing == 0) at = i;
+                differing++;
+            }
+        }
+        fprintf(stderr,
+                "test_qwen4exp_qsa: split attention is not bit-exact: "
+                "%zu of %zu values differ, first at %zu: %.9g vs %.9g\n",
+                differing, attn_len, at, (double)first[at],
+                (double)unsplit[at]);
+        return 1;
+    }
+    printf("  %-38s %zu values bit-exact against the one-block kernel\n",
+           "split decode attention", attn_len);
+
+    free(unsplit);
     free(ungrouped);
     free(first);
     free(second);
