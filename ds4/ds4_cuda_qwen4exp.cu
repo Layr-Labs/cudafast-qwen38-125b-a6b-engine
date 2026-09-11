@@ -4312,7 +4312,37 @@ __global__ static void qwen4exp_shared_gate_kernel(
     if (token >= n_tokens) return;
     const float *token_x = x + (uint64_t)token * in_dim;
     float acc = 0.0f;
-    for (uint32_t k = threadIdx.x; k < in_dim; k += blockDim.x) {
+    uint32_t k = threadIdx.x;
+    /* FOUR WEIGHT/ACTIVATION PAIRS IN FLIGHT AT A TIME.  The shared expert gate
+     * is one dot product per token, so at decode width this kernel is a SINGLE
+     * block: there are no other warps resident to cover a load with, and the
+     * walk is a chain of global reads whose next add waits on the one before
+     * it.  Reading four pairs before the first product covers four times the
+     * latency, and it runs once per layer.
+     *
+     * THE PRODUCTS REACH `acc` IN THE SAME ORDER, k ascending by blockDim.x,
+     * so the sum -- and the sigmoid that closes it -- is bit for bit what the
+     * one-at-a-time walk produced.  The tail below keeps the original form for
+     * a width that does not divide four strides. */
+    {
+        const uint32_t step = blockDim.x;
+        const uint32_t step4 = step * 4u;
+        for (; k + step * 3u < in_dim; k += step4) {
+            const float w0 = dev_qwen4exp_weight_value(router_type, router, k);
+            const float w1 = dev_qwen4exp_weight_value(router_type, router, k + step);
+            const float w2 = dev_qwen4exp_weight_value(router_type, router, k + step * 2u);
+            const float w3 = dev_qwen4exp_weight_value(router_type, router, k + step * 3u);
+            const float a0 = token_x[k];
+            const float a1 = token_x[k + step];
+            const float a2 = token_x[k + step * 2u];
+            const float a3 = token_x[k + step * 3u];
+            acc += w0 * a0;
+            acc += w1 * a1;
+            acc += w2 * a2;
+            acc += w3 * a3;
+        }
+    }
+    for (; k < in_dim; k += blockDim.x) {
         acc += dev_qwen4exp_weight_value(router_type, router, k) * token_x[k];
     }
     const float total = dev_qwen4exp_block_sum(ds4_qwen4exp_smem, acc);
@@ -5483,9 +5513,27 @@ __global__ static void qwen4exp_hc_norm_quant_kernel(
     const uint64_t blk0 = (uint64_t)row * row_blocks + (uint64_t)g * (group / 32u);
 
     uint32_t k = 0;
+    /* THE NEXT PAIR IS READ BEFORE THE CURRENT ONE IS USED.  At decode width
+     * this kernel is n_hc blocks -- four on this checkpoint -- so there are no
+     * other warps resident to cover a load with, and each iteration's value
+     * waits on its own two global reads.  Carrying the following iteration's
+     * pair in registers overlaps that wait with the work in hand.
+     *
+     * THE VALUES AND THEIR ORDER ARE UNCHANGED: iteration i still consumes
+     * xg[i] and wg[i], and the warp butterfly below still runs once per
+     * iteration with every lane present, so the quantised block is bit for bit
+     * the one the plain walk produced.  The guard keeps the read in bounds on
+     * the final iteration. */
+    float x_cur = threadIdx.x < group ? xg[threadIdx.x] : 0.0f;
+    float w_cur = threadIdx.x < group ? wg[threadIdx.x] : 0.0f;
     for (uint32_t i = threadIdx.x; i < group; i += blockDim.x, k++) {
-        const float v = qwen4exp_hc_normed_value(xg[i], scale, wg[i],
+        const uint32_t i_next = i + blockDim.x;
+        const float x_next = i_next < group ? xg[i_next] : 0.0f;
+        const float w_next = i_next < group ? wg[i_next] : 0.0f;
+        const float v = qwen4exp_hc_normed_value(x_cur, scale, w_cur,
                                                  weight_bias, round_bf16);
+        x_cur = x_next;
+        w_cur = w_next;
         /* quantize_q8_0_f32_rows_warp_kernel, on the value in hand: the same
          * butterfly over the same 32 values in the same lanes, and the same
          * five arithmetic steps in the form --use_fast_math gave them.  The
