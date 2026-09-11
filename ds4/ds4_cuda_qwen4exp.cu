@@ -6877,7 +6877,69 @@ __global__ static void qwen4exp_qsa_attention_group_kernel(
             float contrib[GROUP];
 #pragma unroll
             for (uint32_t h = 0; h < GROUP; h++) contrib[h] = 0.0f;
-            for (uint32_t j = 0; j < n_in_tile; j++) {
+            uint32_t j = 0;
+            /* EIGHT VALUE ROWS IN FLIGHT, ONE READ SERVING THE WHOLE GROUP.
+             * The per-head kernel's value loop got this batching in the
+             * promoted QSA commits and the official scores showed it pays;
+             * the grouped kernel's loop is the same dependency chain -- one
+             * global V read per key, every fma waiting on the one before --
+             * with the extra property that a single channel read feeds all
+             * GROUP accumulators, so eight loads in flight cover eight times
+             * the latency at the same traffic.
+             *
+             * Each contrib[h] consumes its products in ascending j, exactly
+             * the scalar loop's order, so every accumulator is bit for bit
+             * the value the one-at-a-time loop produced; the heads are
+             * independent chains, so nesting h inside the batch moves
+             * nothing.
+             *
+             * Dense path only, the promoted commits' argument unchanged:
+             * there keys[j] is base + j, kept inside count and cache_cap by
+             * the tile bound, so no key is negative and the skip in the
+             * scalar loop cannot fire.  The sparse path keeps the
+             * one-at-a-time walk below, whose `kj < 0` continue is load
+             * bearing. */
+            if (!sparse) {
+                for (; j + 8u <= n_in_tile; j += 8u) {
+                    const float *v0 = v_cache +
+                        (uint64_t)keys[j] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float *v1 = v_cache +
+                        (uint64_t)keys[j + 1u] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float *v2 = v_cache +
+                        (uint64_t)keys[j + 2u] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float *v3 = v_cache +
+                        (uint64_t)keys[j + 3u] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float *v4 = v_cache +
+                        (uint64_t)keys[j + 4u] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float *v5 = v_cache +
+                        (uint64_t)keys[j + 5u] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float *v6 = v_cache +
+                        (uint64_t)keys[j + 6u] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float *v7 = v_cache +
+                        (uint64_t)keys[j + 7u] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float a0 = v0[tid];
+                    const float a1 = v1[tid];
+                    const float a2 = v2[tid];
+                    const float a3 = v3[tid];
+                    const float a4 = v4[tid];
+                    const float a5 = v5[tid];
+                    const float a6 = v6[tid];
+                    const float a7 = v7[tid];
+#pragma unroll
+                    for (uint32_t h = 0; h < GROUP; h++) {
+                        const float *ph = probs + h * nth;
+                        contrib[h] = __fmaf_rn(ph[j], a0, contrib[h]);
+                        contrib[h] = __fmaf_rn(ph[j + 1u], a1, contrib[h]);
+                        contrib[h] = __fmaf_rn(ph[j + 2u], a2, contrib[h]);
+                        contrib[h] = __fmaf_rn(ph[j + 3u], a3, contrib[h]);
+                        contrib[h] = __fmaf_rn(ph[j + 4u], a4, contrib[h]);
+                        contrib[h] = __fmaf_rn(ph[j + 5u], a5, contrib[h]);
+                        contrib[h] = __fmaf_rn(ph[j + 6u], a6, contrib[h]);
+                        contrib[h] = __fmaf_rn(ph[j + 7u], a7, contrib[h]);
+                    }
+                }
+            }
+            for (; j < n_in_tile; j++) {
                 const int32_t kj = keys[j];
                 if (kj < 0) continue;
                 /* One V channel read for the whole group, where the per-head
