@@ -5118,6 +5118,10 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         down_slab->type == DS4_QWEN4EXP_TY_q8_0 &&
         getenv("DS4_QWEN4EXP_MOE_R") == NULL &&
         getenv("DS4_QWEN4EXP_NO_SHARED_VECTOR") == NULL;
+    /* R1 down keeps the same 40-register allocation with aligned loads;
+     * gate/up does not, so extend only the down half to one-token decode. */
+    const bool vector_shared_down = vector_shared ||
+        (single_q8 && getenv("DS4_QWEN4EXP_NO_SHARED_VECTOR") == NULL);
     const int tile = single_q8 ? 1 : qwen4exp_moe_tile(n_tokens);
     const uint32_t tiles = (n_tokens + (uint32_t)tile - 1u) / (uint32_t)tile;
 
@@ -5286,7 +5290,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
             down_slab->type, mgroups, out_dim, n_tokens)
 #define QWEN4EXP_SH_DOWN(R) do { \
     if (specialize_shared && down_slab->type == DS4_QWEN4EXP_TY_q8_0) { \
-        if (vector_shared && (((uintptr_t)mq & 15u) == 0u)) { \
+        if (vector_shared_down && (((uintptr_t)mq & 15u) == 0u)) { \
             QWEN4EXP_SH_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q8_0, true); \
         } else { \
             QWEN4EXP_SH_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q8_0, false); \
