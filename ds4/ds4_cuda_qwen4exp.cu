@@ -5587,6 +5587,73 @@ __global__ static void qwen4exp_hc_inject_weights_renorm_kernel(
     }
 }
 
+/* The narrow mixer has independent mix and inject outputs. Put their
+ * existing CTAs in one launch: neither reduction nor its thread mapping
+ * changes, and the short mix can overlap the underfilled inject grid. */
+__global__ static void qwen4exp_hc_mix_inject_dual_kernel(
+        float *mixed, float *inject, const float *hyper, const float *nscale,
+        const float *normw, const float *gate_values, const char *w,
+        uint32_t n_embd, uint32_t n_hc, uint32_t rows,
+        float weight_bias, int round_bf16,
+        uint32_t weight_type, uint32_t weight_row_bytes) {
+    const uint32_t mix_blocks = (n_embd + 255u) / 256u;
+    if (blockIdx.x < mix_blocks) {
+        float *out = mixed;
+        const uint32_t n_tokens = rows;
+        const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
+        const uint32_t t = blockIdx.y;
+        if (d >= n_embd || t >= n_tokens) return;
+
+        const uint64_t row = ((uint64_t)t * n_hc) * n_embd + d;
+
+        float acc = 0.0f;
+        /* Keep this pointer walk rolled. With nvcc 13 the automatically unrolled
+         * combined kernel truncated a norm-weight address above 4 GiB. The rolled
+         * form passes changed-input replay and CUDA memcheck. */
+    #pragma unroll 1
+        for (uint32_t h = 0; h < n_hc; h++) {
+            const uint64_t idx = row + (uint64_t)h * n_embd;
+            const float normed = qwen4exp_hc_normed_value(
+                    hyper[idx], nscale[(uint64_t)t * n_hc + h],
+                    normw[(uint64_t)h * n_embd + d], weight_bias, round_bf16);
+            acc += qwen4exp_sigmoid(gate_values[idx]) * normed;
+        }
+        out[(uint64_t)t * n_embd + d] = acc * (1.0f / (float)n_hc);
+    } else {
+        float *out = inject;
+        const uint32_t h = blockIdx.x - mix_blocks;
+        const uint32_t t = blockIdx.y;
+        if (t >= rows || h >= n_hc) return;
+
+        const uint32_t wide = n_hc * n_embd;
+        const float *xr = hyper + (uint64_t)t * wide;
+        const char *wr = w + (uint64_t)h * weight_row_bytes;
+
+        float sum = 0.0f;
+        for (uint32_t hs = 0; hs < n_hc; hs++) {
+            const float sc = nscale[(uint64_t)t * n_hc + hs];
+            for (uint32_t k = 0; k < n_embd; k += blockDim.x) {
+                const uint32_t i = hs * n_embd + k + threadIdx.x;
+                const float normed = qwen4exp_hc_normed_value(
+                        xr[i], sc, normw[i], weight_bias, round_bf16);
+                sum += normed * dev_qwen4exp_inject_value(weight_type, wr, i);
+            }
+        }
+        __shared__ float partial[QWEN4EXP_HC_THREADS];
+        const float total = qwen4exp_block_sum_f32(sum, partial);
+        if (threadIdx.x == 0) {
+            out[(uint64_t)t * n_hc + h] =
+                2.0f * qwen4exp_sigmoid(total * (1.0f / (float)n_hc));
+        }
+    }
+}
+
+static int qwen4exp_hc_ranges_disjoint(const void *a, uint64_t an,
+                                       const void *b, uint64_t bn) {
+    const uintptr_t ap = (uintptr_t)a, bp = (uintptr_t)b;
+    return ap >= bp ? ap - bp >= bn : bp - ap >= an;
+}
+
 /* Both of the above in ONE pass over the residual, one block per token.
  *
  * The two kernels read the same 41.9 MB; together they read it once.  The mix
@@ -5853,6 +5920,38 @@ static int qwen4exp_hc_mixer_fused_cuda(
                 inject_weight->type, (uint32_t)iw_row_bytes);
         return cuda_ok(cudaGetLastError(),
                        "qwen4exp_hc_mix_inject_renorm launch");
+    }
+
+    /* Preserve sequential semantics for overlapping caller-supplied views.
+     * The graph's mixed/inject outputs are separate allocations. */
+    if (inject && rows <= 7u && n_embd == 2560u && n_hc == 4u &&
+        getenv("DS4_QWEN4EXP_NO_HC_DUAL") == NULL) {
+        const uint64_t mix_bytes = (uint64_t)rows * n_embd * sizeof(float);
+        const uint64_t inj_bytes = (uint64_t)rows * n_hc * sizeof(float);
+        const uint64_t norm_bytes = wide * sizeof(float);
+        const uint64_t iw_bytes = (uint64_t)n_hc * iw_row_bytes;
+        const int disjoint =
+            qwen4exp_hc_ranges_disjoint(mixed->ptr, mix_bytes, inject->ptr, inj_bytes) &&
+            qwen4exp_hc_ranges_disjoint(mixed->ptr, mix_bytes, hyper->ptr, hc_bytes) &&
+            qwen4exp_hc_ranges_disjoint(mixed->ptr, mix_bytes, nscale, n_bytes) &&
+            qwen4exp_hc_ranges_disjoint(mixed->ptr, mix_bytes, normw, norm_bytes) &&
+            qwen4exp_hc_ranges_disjoint(mixed->ptr, mix_bytes, iw, iw_bytes) &&
+            qwen4exp_hc_ranges_disjoint(inject->ptr, inj_bytes, hyper->ptr, hc_bytes) &&
+            qwen4exp_hc_ranges_disjoint(inject->ptr, inj_bytes, nscale, n_bytes) &&
+            qwen4exp_hc_ranges_disjoint(inject->ptr, inj_bytes, normw, norm_bytes) &&
+            qwen4exp_hc_ranges_disjoint(inject->ptr, inj_bytes, wide_scratch->ptr, hc_bytes);
+        if (disjoint) {
+            const unsigned mix_blocks = (n_embd + threads - 1u) / threads;
+            qwen4exp_hc_mix_inject_dual_kernel<<<
+                    dim3(mix_blocks + n_hc, rows, 1u), threads, 0,
+                    cuda_decode_stream()>>>(
+                    (float *)mixed->ptr, (float *)inject->ptr,
+                    (const float *)hyper->ptr, nscale, normw,
+                    (const float *)wide_scratch->ptr, iw,
+                    n_embd, n_hc, rows, weight_bias, round_bf16,
+                    inject_weight->type, (uint32_t)iw_row_bytes);
+            return cuda_ok(cudaGetLastError(), "qwen4exp_hc_mix_inject_dual launch");
+        }
     }
 
     qwen4exp_hc_mix_renorm_kernel<<<dim3((n_embd + threads - 1u) / threads,
