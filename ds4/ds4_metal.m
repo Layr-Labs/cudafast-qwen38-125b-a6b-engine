@@ -36865,11 +36865,94 @@ int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         uint32_t                     out_dim,
         const ds4_gpu_tensor        *x,
         uint32_t                     n_tokens,
-        int                          pre_quantized) {
-    (void)pre_quantized;
+        const ds4_gpu_qwen4exp_moe_handoff *reuse,
+        int                          gate_ready) {
+    (void)reuse;
+    /* The Metal backend never folds the gate into the router's GEMV (see
+     * ds4_gpu_qwen4exp_router_tail_fuse_on below), so gate_ready is always
+     * zero here and the gate this entry computes itself is the one used. */
+    (void)gate_ready;
     return ds4_gpu_qwen4exp_shared_expert_tensor(
             out, mid, gate_scale, router_slab, gate_slab, up_slab, down_slab,
             in_dim, mid_dim, out_dim, x, n_tokens);
+}
+
+/* The decode-width router-tail fuses are a CUDA launch-count decision: the
+ * four separate dispatches this backend already makes are the same arithmetic,
+ * and nothing on Metal measures them as a cost.  The predicate therefore never
+ * takes the fused branch here, which also keeps the two entries below
+ * unreachable from the graph. */
+int ds4_gpu_qwen4exp_router_tail_fuse_on(uint32_t n_tokens) {
+    (void)n_tokens;
+    return 0;
+}
+
+/* Same class of decision for the decode-width MoE quantise residue: the
+ * shared expert's reuse of the routed x quantise and the mid-quantise
+ * epilogues are CUDA launch-count choices, and this backend's preq entry
+ * ignores the region pointer and always quantises x itself.  The constant
+ * zero keeps the graph's handed-out region NULL, which is that own-quantise
+ * path, and matches the router-tail predicate above. */
+int ds4_gpu_qwen4exp_moe_decode_quant_fuse_on(void) {
+    return 0;
+}
+
+int ds4_gpu_qwen4exp_router_logits_gate_tensor(
+        ds4_gpu_tensor              *logits,
+        ds4_gpu_tensor              *shexp_gate,
+        const void                  *router_map,
+        uint64_t                     router_map_size,
+        uint64_t                     router_offset,
+        const ds4_gpu_qwen4exp_slab *shexp_router,
+        uint64_t                     in_dim,
+        uint64_t                     out_dim,
+        const ds4_gpu_tensor        *x,
+        uint32_t                     n_rows) {
+    (void)logits; (void)shexp_gate; (void)router_map; (void)router_map_size;
+    (void)router_offset; (void)shexp_router; (void)in_dim; (void)out_dim;
+    (void)x; (void)n_rows;
+    fprintf(stderr, "ds4: Metal qwen4exp does not fuse the router tail\n");
+    return 0;
+}
+
+/* The selection is built by the standalone router this backend already has,
+ * then the routed MoE runs unchanged: the unfused chain, exactly.  No
+ * quantised-x region or seat is handed out -- this backend's scratch layout
+ * is its own -- so the handoff always leaves NULL, which keeps the shared
+ * expert's preq entry on its own quantise. */
+int ds4_gpu_qwen4exp_router_tail_moe_tensor(
+        ds4_gpu_tensor              *out,
+        ds4_gpu_tensor              *mid,
+        ds4_gpu_tensor              *down_partial,
+        const ds4_gpu_qwen4exp_slab *gate_slab,
+        const ds4_gpu_qwen4exp_slab *up_slab,
+        const ds4_gpu_qwen4exp_slab *down_slab,
+        uint32_t                     in_dim,
+        uint32_t                     mid_dim,
+        uint32_t                     out_dim,
+        ds4_gpu_tensor              *selected,
+        ds4_gpu_tensor              *weights,
+        const ds4_gpu_tensor        *logits,
+        uint32_t                     n_total_expert,
+        uint32_t                     n_expert_used,
+        const ds4_gpu_tensor        *x,
+        uint32_t                     n_tokens,
+        uint32_t                     mid_token_stride,
+        ds4_gpu_qwen4exp_moe_handoff *handoff) {
+    if (handoff) {
+        handoff->xq = NULL;
+        handoff->seat = NULL;
+        handoff->seat_bytes = 0;
+    }
+    if (!ds4_gpu_qwen4exp_router_select_tensor(
+                selected, weights, logits, n_total_expert, n_expert_used,
+                n_tokens)) {
+        return 0;
+    }
+    return ds4_gpu_qwen4exp_routed_moe_tensor(
+            out, mid, down_partial, gate_slab, up_slab, down_slab,
+            in_dim, mid_dim, out_dim, selected, weights, n_total_expert,
+            n_expert_used, x, n_tokens, mid_token_stride);
 }
 
 int ds4_gpu_qwen4exp_shared_expert_tensor(
@@ -47500,6 +47583,35 @@ int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
         cache_cap, max_selected, scale);
 }
 
+/* The CUDA backend folds the output gate into the attention store; Metal
+ * runs the two launches this chain always ran, which the entry's contract
+ * allows (`out` holds the gated values on return either way). */
+int ds4_gpu_qwen4exp_qsa_attention_gate_dpos_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k_cache,
+        const ds4_gpu_tensor *v_cache,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *counts,
+        uint32_t              n_tokens,
+        uint32_t              n_head,
+        uint32_t              n_kv_head,
+        uint32_t              head_dim,
+        uint32_t              pos0,
+        uint32_t              cache_cap,
+        uint32_t              max_selected,
+        float                 scale,
+        const ds4_gpu_tensor *d_pos,
+        const ds4_gpu_tensor *gate) {
+    if (!gate) return 0;
+    return ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
+                   out, q, k_cache, v_cache, selected, counts,
+                   n_tokens, n_head, n_kv_head, head_dim, pos0,
+                   cache_cap, max_selected, scale, d_pos) &&
+           ds4_gpu_qwen4exp_qsa_output_gate_tensor(
+                   out, gate, n_tokens * n_head * head_dim);
+}
+
 int ds4_gpu_qwen4exp_qsa_attention_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *q,
@@ -47727,7 +47839,11 @@ int ds4_gpu_qwen4exp_ple_conv_tensor(
         uint32_t              channels,
         uint32_t              conv_kernel,
         uint32_t              dilation,
-        uint32_t              rows) {
+        uint32_t              rows,
+        /* Reject-path adoption is CUDA-resolved (see ds4_gpu.h); Metal always
+         * reads the live window, which is what a NULL adopt_row asks for. */
+        const ds4_gpu_tensor *adopt_row) {
+    (void)adopt_row;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!hyper || !conv_state || !gated || !conv_in || !model_map ||
         channels == 0 || conv_kernel < 2u || dilation == 0 || rows == 0) {

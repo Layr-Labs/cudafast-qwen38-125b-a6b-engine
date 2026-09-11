@@ -327,6 +327,18 @@ struct ds4_qwen4exp_session {
     ds4_gpu_tensor *d_pos;
     ds4_gpu_tensor *inv_freq;
 
+    /* Reject-path adoption (see the note in ds4_gpu.h): the device-resident
+     * row the next forward reads its initial GDN/PLE state from -- LIVE, or a
+     * snapshot row a rejecting round adopted.  The scalar sits at a fixed
+     * address for the session's life, so a captured graph bakes its ADDRESS
+     * and re-reads the value on every replay; `state_adopt_row` is the host
+     * mirror the setter compares against, so the steady accept path issues no
+     * write at all.  `rollback_table` latches the kill switch at open and is
+     * what every reader consults. */
+    ds4_gpu_tensor *d_state_adopt;
+    uint32_t        state_adopt_row;
+    bool            rollback_table;
+
     /* Activations.  All sized for n_batch tokens and reused every layer. */
     ds4_gpu_tensor *tokens;
     ds4_gpu_tensor *hyper;      /* [tok][hc][embd] -- the residual stream */
@@ -454,6 +466,48 @@ static ds4_gpu_tensor *qwen4exp_alloc_zeroed(uint64_t bytes, bool *ok) {
     if (!zeros || !ds4_gpu_tensor_write(t, 0, zeros, bytes)) *ok = false;
     free(zeros);
     return t;
+}
+
+/* The reject-path rollback table.  The CUDA/ROCm builds resolve the adopted
+ * snapshot row inside the kernels (see ds4_gpu.h); every other backend, and
+ * DS4_QWEN4EXP_NO_ROLLBACK_TABLE's presence, keep the copy-era rollback.  The
+ * switch is latched once per process at the first session open -- a mid-run
+ * flip would leave captured graphs and copied buffers disagreeing about where
+ * the state lives. */
+#if defined(DS4_ROCM_BUILD) || (!defined(DS4_NO_GPU) && !defined(__APPLE__))
+#define QWEN4EXP_ROLLBACK_TABLE_BACKEND 1
+#else
+#define QWEN4EXP_ROLLBACK_TABLE_BACKEND 0
+#endif
+
+static bool qwen4exp_rollback_table_mode(void) {
+#if QWEN4EXP_ROLLBACK_TABLE_BACKEND
+    /* OFF until the box has byte-tested adoption (the A/B hook in ds4.c's
+     * test section does that): DS4_QWEN4EXP_ROLLBACK_TABLE arms it, and
+     * DS4_QWEN4EXP_NO_ROLLBACK_TABLE forbids it outright even when the arm
+     * variable is also set, so the two never race. */
+    static int mode = -1;
+    if (mode < 0) {
+        mode = getenv("DS4_QWEN4EXP_ROLLBACK_TABLE") != NULL &&
+               getenv("DS4_QWEN4EXP_NO_ROLLBACK_TABLE") == NULL ? 1 : 0;
+    }
+    return mode != 0;
+#else
+    return false;
+#endif
+}
+
+/* Arm or clear adoption.  Every caller sits just past a completed round's
+ * synchronize, so the stream is quiet and this plain upload is ordered after
+ * the round's kernels and before whatever the next round launches. */
+static bool qwen4exp_state_adopt_set(ds4_qwen4exp_session *s, uint32_t row) {
+    if (!s || !s->rollback_table || !s->d_state_adopt) return true;
+    if (s->state_adopt_row == row) return true;
+    if (!ds4_gpu_tensor_write(s->d_state_adopt, 0, &row, sizeof(row))) {
+        return false;
+    }
+    s->state_adopt_row = row;
+    return true;
 }
 
 ds4_qwen4exp_session *ds4_qwen4exp_session_open(
@@ -694,6 +748,15 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
     }
 
     s->d_pos = qwen4exp_alloc_zeroed(sizeof(uint32_t), &ok);
+    s->rollback_table = qwen4exp_rollback_table_mode();
+    s->d_state_adopt = qwen4exp_alloc_zeroed(sizeof(uint32_t), &ok);
+    s->state_adopt_row = DS4_QWEN4EXP_STATE_ADOPT_LIVE;
+    if (ok) {
+        const uint32_t live = DS4_QWEN4EXP_STATE_ADOPT_LIVE;
+        if (!ds4_gpu_tensor_write(s->d_state_adopt, 0, &live, sizeof(live))) {
+            ok = false;
+        }
+    }
     s->inv_freq = qwen4exp_alloc_zeroed((uint64_t)DS4_N_ROT / 2u * f, &ok);
     if (ok) {
         float freqs[DS4_MAX_KDA_HEAD_DIM];
@@ -787,6 +850,7 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     free(s->ple_ids);
     free(s->ple_rows_host);
     ds4_gpu_tensor_free(s->d_pos);
+    ds4_gpu_tensor_free(s->d_state_adopt);
     ds4_gpu_tensor_free(s->inv_freq);
     ds4_gpu_tensor_free(s->tokens);
     ds4_gpu_tensor_free(s->hyper);
@@ -900,6 +964,10 @@ void ds4_qwen4exp_session_reset(ds4_qwen4exp_session *s) {
     ds4_ple_history_reset(&s->ple_constants, &s->ple_history);
     s->pos = 0;
     s->state_dirty = false;
+    /* The zeroed live buffers are the state again; adoption, if a reject had
+     * armed it, ends here.  The skip path above needs no reset: nothing has
+     * written state since the reset that cleared it. */
+    (void)qwen4exp_state_adopt_set(s, DS4_QWEN4EXP_STATE_ADOPT_LIVE);
 }
 
 /* ======================================================================
@@ -1269,7 +1337,8 @@ static bool qwen4exp_graph_ple_block(ds4_qwen4exp_session *s,
             DS4_N_EMBD, DS4_N_HC, DS4_N_PLE_EMBD,
             DS4_N_PLE_CONV, DS4_N_NGRAM, n_tokens, DS4_RMS_EPS,
             l->ple_norm_key_offset, l->ple_norm_query_offset,
-            l->ple_norm_conv_offset, 1)) {
+            l->ple_norm_conv_offset, 1,
+            s->rollback_table ? s->d_state_adopt : NULL)) {
         fprintf(stderr, "ds4: qwen4exp PLE block %u refused\n", il);
         return false;
     }
@@ -1327,6 +1396,61 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
     const ds4_gpu_qwen4exp_slab dt_bias_slab = QW_SLAB(m, l->ssm_dt_bias);
     const ds4_gpu_qwen4exp_slab ssm_norm_slab = QW_SLAB(m, l->ssm_norm);
 
+    /* The adoption scalar, handed in only when this forward can carry an
+     * armed adoption; the kernels resolve their initial state from it at
+     * run time, which is what keeps the captured islands valid across a
+     * rejecting round.  A reject arms the scalar and the very next forward
+     * -- the re-feed at the rejected position -- spends it, and that round
+     * is at most DS4_QWEN4EXP_MTP_MAX_COMMIT tokens wide, the same bound
+     * that gates capture: every width up to it hands the scalar in armed
+     * or not, so a captured island bakes its address whatever the mirror
+     * held at encode time.  A wider forward is a prefill, and a prefill
+     * never follows a reject without the session reset that clears
+     * adoption (ds4_qwen4exp_session_reset) -- graph_forward clears it
+     * after every completed round besides -- so a prefill hands in NULL:
+     * a no-op for the kernels, which read the live window either way, and
+     * what lets qwen4exp_cuda_gdn_run take the token-parallel convolution,
+     * which it refuses whenever an adoption scalar is handed in.  The
+     * check below asserts that invariant where it would be felt: a
+     * prefill-width forward that arrives with adoption still armed carries
+     * the scalar anyway, on the serial convolution, and says so. */
+    const bool adopt_armed = s->rollback_table &&
+        s->state_adopt_row != DS4_QWEN4EXP_STATE_ADOPT_LIVE;
+    const bool prefill_width =
+        n_tokens > (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT;
+    if (prefill_width && adopt_armed) {
+        fprintf(stderr,
+                "ds4: qwen4exp GDN block %u: %u-token prefill with adoption "
+                "still armed at row %u -- a prefill never follows a reject "
+                "without the session reset that clears adoption; carrying "
+                "the adoption on the serial convolution\n",
+                il, n_tokens, s->state_adopt_row);
+    }
+    const ds4_gpu_tensor *adopt =
+        s->rollback_table && (!prefill_width || adopt_armed)
+            ? s->d_state_adopt : NULL;
+#if QWEN4EXP_ROLLBACK_TABLE_BACKEND
+    const int rc = (n_tokens > 1u)
+        ? ds4_gpu_qwen4exp_gdn_prefill_adopt(
+              s->gdn_out, s->gdn_conv[il], s->gdn_state[il],
+              s->gdn_conv_snapshot[il], s->gdn_state_snapshot[il],
+              s->spec_snapshot_rows, s->gdn_qkv,
+              s->gdn_alpha, s->gdn_beta, s->gdn_gate,
+              &conv_slab, &a_log_slab, &dt_bias_slab, &ssm_norm_slab,
+              DS4_N_GDN_KEY_HEAD, DS4_N_GDN_VALUE_HEAD, n_tokens,
+              DS4_QWEN4EXP_GDN_HEADS_TILED, DS4_RMS_EPS, DS4_RMS_EPS, adopt)
+        : ds4_gpu_qwen4exp_gdn_decode_adopt(
+              /* The one-row decode reads an adopted row too -- a rejecting
+               * round's next step continues from the adopted state -- but
+               * writes no snapshots of its own. */
+              s->gdn_out, s->gdn_conv[il], s->gdn_state[il],
+              s->gdn_conv_snapshot[il], s->gdn_state_snapshot[il],
+              s->gdn_qkv, s->gdn_alpha, s->gdn_beta, s->gdn_gate,
+              &conv_slab, &a_log_slab, &dt_bias_slab, &ssm_norm_slab,
+              DS4_N_GDN_KEY_HEAD, DS4_N_GDN_VALUE_HEAD, 1u,
+              DS4_QWEN4EXP_GDN_HEADS_TILED, DS4_RMS_EPS, DS4_RMS_EPS, adopt);
+#else
+    (void)adopt;
     const int rc = (n_tokens > 1u)
         ? ds4_gpu_qwen4exp_gdn_prefill(
               s->gdn_out, s->gdn_conv[il], s->gdn_state[il],
@@ -1342,6 +1466,7 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
               &conv_slab, &a_log_slab, &dt_bias_slab, &ssm_norm_slab,
               DS4_N_GDN_KEY_HEAD, DS4_N_GDN_VALUE_HEAD, 1u,
               DS4_QWEN4EXP_GDN_HEADS_TILED, DS4_RMS_EPS, DS4_RMS_EPS);
+#endif
     if (!rc) {
         fprintf(stderr, "ds4: qwen4exp GDN block %u refused\n", il);
         return false;
@@ -1486,12 +1611,13 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
     }
 
     const float scale = 1.0f / sqrtf((float)head_dim);
-    if (!ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
+    /* One launch for the attention and its output gate, the gate folded into
+     * the attention store; the entry falls back to the two-launch chain on a
+     * declined shape or the DS4_QWEN4EXP_NO_QSA_GATE_FUSE valve. */
+    if (!ds4_gpu_qwen4exp_qsa_attention_gate_dpos_tensor(
             s->qsa_out, s->qsa_q, s->qsa_k[il], s->qsa_v[il], sel, counts,
             n_tokens, DS4_N_HEAD, DS4_N_HEAD_KV, head_dim, pos0,
-            s->plan.n_ctx, max_selected, scale, s->d_pos) ||
-        !ds4_gpu_qwen4exp_qsa_output_gate_tensor(s->qsa_out, s->qsa_gate,
-                                                 n_tokens * q_width)) {
+            s->plan.n_ctx, max_selected, scale, s->d_pos, s->qsa_gate)) {
         fprintf(stderr, "ds4: qwen4exp QSA attention failed at block %u\n", il);
         return false;
     }
@@ -1642,6 +1768,75 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
     const int moe_timing = qw_hb_time_on() && n_tokens == 1u;
     const int moe_lane = qw_moe_in_head_block ? 1 : 0;
     uint64_t moe_mark = moe_timing ? qw_hb_now_ns() : 0;
+
+    /* At the decode widths the router's tail is three launches of one to ten
+     * microseconds each -- the top-k, its softmax and the small expert-group
+     * scan -- and the shared expert's gate is a fourth.  The fused branch runs
+     * the same arithmetic in two launches: the gate as one extra block-row of
+     * the router's F32 GEMV, the top-k, softmax and scan in one kernel.
+     * DS4_QWEN4EXP_NO_ROUTER_FUSE keeps the four launches for the A/B; both
+     * paths write the same bytes (tests/test_qwen4exp_moe.c compares them). */
+    if (ds4_gpu_qwen4exp_router_tail_fuse_on(n_tokens)) {
+        const ds4_gpu_qwen4exp_slab sh_router_slab =
+            QW_SLAB(m, l->ffn_gate_inp_shexp);
+        if (!ds4_gpu_qwen4exp_router_logits_gate_tensor(
+                    s->moe_logits, s->shexp_gate,
+                    QW_MAP(m, l->ffn_gate_inp),
+                    QW_MAPSZ(m, l->ffn_gate_inp), QW_OFF(l->ffn_gate_inp),
+                    &sh_router_slab, DS4_N_EMBD, DS4_N_EXPERT, s->mixed,
+                    n_tokens)) {
+            fprintf(stderr, "ds4: qwen4exp router logits + gate failed at "
+                            "block %u\n", il);
+            return false;
+        }
+        QW_MOE_TICK(QW_MOE_T_ROUTER);
+        /* The select rides the routed launch below it. */
+        QW_MOE_TICK(QW_MOE_T_SELECT);
+
+        const ds4_gpu_qwen4exp_slab gate_slab = QW_SLAB(m, l->ffn_gate_exps);
+        const ds4_gpu_qwen4exp_slab up_slab = QW_SLAB(m, l->ffn_up_exps);
+        const ds4_gpu_qwen4exp_slab down_slab = QW_SLAB(m, l->ffn_down_exps);
+        ds4_gpu_qwen4exp_moe_handoff routed_ho = { NULL, NULL, 0 };
+        if (!ds4_gpu_qwen4exp_router_tail_moe_tensor(
+                s->block_out, s->moe_mid, s->moe_down_partial,
+                &gate_slab, &up_slab, &down_slab,
+                DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD,
+                s->moe_selected, s->moe_weights, s->moe_logits,
+                DS4_N_EXPERT, DS4_N_EXPERT_USED,
+                s->mixed, n_tokens, DS4_N_EXPERT_USED * DS4_N_FF_EXP,
+                &routed_ho)) {
+            fprintf(stderr, "ds4: qwen4exp router tail experts failed at "
+                            "block %u\n", il);
+            return false;
+        }
+        QW_MOE_TICK(QW_MOE_T_ROUTED);
+
+        const ds4_gpu_qwen4exp_slab sh_gate_slab = QW_SLAB(m, l->ffn_gate_shexp);
+        const ds4_gpu_qwen4exp_slab sh_up_slab = QW_SLAB(m, l->ffn_up_shexp);
+        const ds4_gpu_qwen4exp_slab sh_down_slab = QW_SLAB(m, l->ffn_down_shexp);
+        /* reuse: the routed launch above quantised this very x into the
+         * region IT handed back, one node earlier on the same stream -- a
+         * byte-identical duplicate launch, so the shared expert reads those
+         * bytes instead of rewriting them, and seats its own quantised mid
+         * at the dead metadata the same handoff names.  The pointers are
+         * that call's own regions; no offset is assumed here.  The kill
+         * switch stands the reuse down, NULL runs the duplicate launch, for
+         * the A/B. */
+        if (!ds4_gpu_qwen4exp_shared_expert_preq_tensor(
+                s->block_out, s->shexp_mid, s->shexp_gate,
+                &sh_router_slab, &sh_gate_slab, &sh_up_slab, &sh_down_slab,
+                DS4_N_EMBD, DS4_N_FF_SHEXP, DS4_N_EMBD, s->mixed, n_tokens,
+                ds4_gpu_qwen4exp_moe_decode_quant_fuse_on() ? &routed_ho
+                                                            : NULL,
+                1)) {
+            fprintf(stderr, "ds4: qwen4exp shared expert failed at block %u\n",
+                    il);
+            return false;
+        }
+        QW_MOE_TICK(QW_MOE_T_SHARED);
+        if (moe_timing) qw_moe_stage_calls[moe_lane]++;
+        return true;
+    }
 
     if (!ds4_qwen4exp_matmul_f32(s->moe_logits, QW_MAP(m, l->ffn_gate_inp),
                                    QW_MAPSZ(m, l->ffn_gate_inp),
@@ -1803,6 +1998,12 @@ static void qwen4exp_trace_report(uint32_t n_tokens) {
 #endif
 
 
+/* The mixer call every boundary makes.  `apply_block`/`apply_inject`, when
+ * both are given, are a PENDING hyper-connection inject -- the block output
+ * and the coefficients that go with it -- which the mixer entry applies into
+ * s->hyper and norms in the same pass (see ds4_gpu_qwen4exp_hc_mixer_apply_
+ * tensor).  NULL/NULL is a boundary with no pending apply: the layer-0
+ * attention mixer, whose input is the embedding seed. */
 static bool qwen4exp_graph_residual(ds4_qwen4exp_session *s,
                                     const ds4_model *m,
                                     const ds4_tensor *norm,
@@ -1810,12 +2011,25 @@ static bool qwen4exp_graph_residual(ds4_qwen4exp_session *s,
                                     const ds4_tensor *up,
                                     const ds4_tensor *inject,
                                     float norm_weight_offset,
-                                    uint32_t n_tokens) {
+                                    uint32_t n_tokens,
+                                    const ds4_gpu_tensor *apply_block,
+                                    const ds4_gpu_tensor *apply_inject) {
 #ifdef DS4_TEST_HOOKS
     /* The tower's final mixer is the only call with no inject head.  Copy what
      * it is about to read, inside this batch so the ordering is the GPU's and
-     * not the host's. */
+     * not the host's.  With a pending apply the stream the mixer consumes is
+     * the POST-apply one, so the apply runs separately here, ahead of the
+     * copy, exactly the sequence the unfused tower ran. */
     if (!inject && s->final_mixer_snapshot) {
+        if (apply_block &&
+            !ds4_gpu_qwen4exp_hc_inject_tensor(s->hyper, s->hyper,
+                                               apply_block, apply_inject,
+                                               DS4_N_EMBD, DS4_N_HC,
+                                               n_tokens)) {
+            return false;
+        }
+        apply_block = NULL;
+        apply_inject = NULL;
         (void)ds4_gpu_tensor_copy(s->final_mixer_snapshot, 0, s->hyper, 0,
                                   (uint64_t)n_tokens * DS4_N_HC * DS4_N_EMBD *
                                   sizeof(float));
@@ -1831,6 +2045,15 @@ static bool qwen4exp_graph_residual(ds4_qwen4exp_session *s,
     const ds4_gpu_qwen4exp_slab inject_slab =
         inject ? QW_SLAB(m, inject) : (ds4_gpu_qwen4exp_slab){0};
 
+    if (apply_block) {
+        return ds4_gpu_qwen4exp_hc_mixer_apply_tensor(
+            s->mixed, inject ? s->inject : NULL, s->normed, s->lowrank,
+            s->wide, s->hyper, &norm_slab, &down_slab, &up_slab,
+            inject ? &inject_slab : NULL,
+            DS4_N_EMBD, DS4_N_HC, DS4_N_HC_LOWRANK, n_tokens,
+            DS4_HC_EPS, norm_weight_offset, 1,
+            apply_block, apply_inject) != 0;
+    }
     return ds4_gpu_qwen4exp_hc_mixer_tensor(
         s->mixed, inject ? s->inject : NULL, s->normed, s->lowrank, s->wide,
         s->hyper, &norm_slab, &down_slab, &up_slab,
@@ -1843,15 +2066,23 @@ static bool qwen4exp_graph_residual(ds4_qwen4exp_session *s,
  * state in place and takes no position argument; QSA, PLE and token uploads
  * stay outside capture.  Every replay still computes on the current inputs.
  * Only small decode/verify widths capture; prefill retains its eager kernels.
- */
+ *
+ * `pending` is the previous boundary's deferred inject, when there is one:
+ * the attention mixer applies it into the stream as its first step.  When
+ * `defer_ffn` is set the trailing FFN inject is omitted here, folded into
+ * the next boundary's mixer the same way.  Both come from
+ * qwen4exp_ffn_inject_deferred, so an island and its neighbours agree. */
 static bool qwen4exp_graph_layer_island_encode(
         ds4_qwen4exp_session *s, const ds4_qwen4exp_layer_weights *l,
-        const ds4_model *m, uint32_t il, uint32_t n_tokens, uint32_t island) {
+        const ds4_model *m, uint32_t il, uint32_t n_tokens, uint32_t island,
+        bool pending, bool defer_ffn) {
     if (island == 0u) {
         /* --- attention side ------------------------------------------- */
         if (!qwen4exp_graph_residual(s, m, l->hc_attn_norm, l->hc_attn_down,
                                      l->hc_attn_up, l->hc_attn_inject,
-                                     l->hc_attn_norm_offset, n_tokens)) {
+                                     l->hc_attn_norm_offset, n_tokens,
+                                     pending ? s->block_out : NULL,
+                                     pending ? s->inject : NULL)) {
             fprintf(stderr, "ds4: qwen4exp attention mixer failed at block %u\n", il);
             return false;
         }
@@ -1861,18 +2092,17 @@ static bool qwen4exp_graph_layer_island_encode(
             QW_TRACE(QW_SLICE_GDN);
         }
     } else {
-        if (!ds4_gpu_qwen4exp_hc_inject_tensor(s->hyper, s->hyper, s->block_out,
-                                               s->inject, DS4_N_EMBD, DS4_N_HC,
-                                               n_tokens)) {
-            fprintf(stderr, "ds4: qwen4exp attention inject failed at block %u\n", il);
-            return false;
-        }
+        /* The attention inject is the FFN mixer's pending apply above: the
+         * mixer entry performs it ahead of its own kernels whether the
+         * backend folds it into the first one or not, so this island makes
+         * no separate launch for it. */
         QW_TRACE(QW_SLICE_ATTN_INJECT);
 
         /* --- feed-forward side ---------------------------------------- */
         if (!qwen4exp_graph_residual(s, m, l->hc_ffn_norm, l->hc_ffn_down,
                                      l->hc_ffn_up, l->hc_ffn_inject,
-                                     l->hc_ffn_norm_offset, n_tokens)) {
+                                     l->hc_ffn_norm_offset, n_tokens,
+                                     s->block_out, s->inject)) {
             fprintf(stderr, "ds4: qwen4exp FFN mixer failed at block %u\n", il);
             return false;
         }
@@ -1881,11 +2111,14 @@ static bool qwen4exp_graph_layer_island_encode(
             return false;
         }
         QW_TRACE(QW_SLICE_MOE);
-        if (!ds4_gpu_qwen4exp_hc_inject_tensor(s->hyper, s->hyper, s->block_out,
-                                               s->inject, DS4_N_EMBD, DS4_N_HC,
-                                               n_tokens)) {
-            fprintf(stderr, "ds4: qwen4exp FFN inject failed at block %u\n", il);
-            return false;
+        if (!defer_ffn) {
+            if (!ds4_gpu_qwen4exp_hc_inject_tensor(s->hyper, s->hyper,
+                                                   s->block_out, s->inject,
+                                                   DS4_N_EMBD, DS4_N_HC,
+                                                   n_tokens)) {
+                fprintf(stderr, "ds4: qwen4exp FFN inject failed at block %u\n", il);
+                return false;
+            }
         }
         QW_TRACE(QW_SLICE_FFN_INJECT);
     }
@@ -1894,7 +2127,8 @@ static bool qwen4exp_graph_layer_island_encode(
 
 static bool qwen4exp_graph_layer_island(
         ds4_qwen4exp_session *s, const ds4_qwen4exp_layer_weights *l,
-        const ds4_model *m, uint32_t il, uint32_t n_tokens, uint32_t island) {
+        const ds4_model *m, uint32_t il, uint32_t n_tokens, uint32_t island,
+        bool pending, bool defer_ffn) {
     /* Profilers synchronize between operations, which is forbidden inside
      * capture.  They must also execute the individual call sites on replay. */
     const bool capture_ok =
@@ -1907,8 +2141,13 @@ static bool qwen4exp_graph_layer_island(
         key.il = il;
         key.island = island;
         /* Snapshot writes are part of GDN: an ordinary two-row feed and a
-         * two-row verify must not share an executable with different writes. */
-        key.variant = n_tokens | (s->spec_snapshot_rows << 8u);
+         * two-row verify must not share an executable with different writes.
+         * Bit 16 is the adoption argument: a table-armed capture bakes the
+         * scalar's address, a copy-mode one bakes NULL, and the two must not
+         * share an executable even if a recycled allocation makes every
+         * buffer address agree. */
+        key.variant = n_tokens | (s->spec_snapshot_rows << 8u) |
+                      ((s->rollback_table ? 1u : 0u) << 16u);
         key._pad = 0x5157454eu;  /* QWEN: separate from other model families */
         key.cur_hc = s->hyper;
         key.after_attn_hc = s;
@@ -1935,7 +2174,8 @@ static bool qwen4exp_graph_layer_island(
             const bool trace_overflow = g_qwen4exp_trace_overflow;
 #endif
             if (qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens,
-                                                   island)) {
+                                                   island, pending,
+                                                   defer_ffn)) {
                 if (ds4_gpu_decode_graph_end(&key) == 0) return true;
             } else {
                 ds4_gpu_decode_graph_abort(&key);
@@ -1948,7 +2188,8 @@ static bool qwen4exp_graph_layer_island(
              * re-encode this call eagerly exactly once, including on error. */
         }
     }
-    return qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens, island);
+    return qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens, island,
+                                              pending, defer_ffn);
 }
 
 static bool qwen4exp_graph_qsa_island(
@@ -2062,6 +2303,45 @@ static bool qwen4exp_forward_fail(void) {
     return false;
 }
 
+/* Whether layer il's trailing FFN inject folds into the NEXT mixer's first
+ * kernel instead of running as its own launch, on the tower path.
+ *
+ * DECODE WIDTHS ONLY.  The fold's first kernel stops at
+ * QWEN4EXP_HC_INJECT_FUSE_MAX_ROWS, so at a prefill width a deferred inject
+ * would not fold at all: the mixer-apply entry would run the SAME separate
+ * apply launch, merely issued from the next mixer's entry instead of this
+ * island's tail, with nothing in between (the deferral already refuses to
+ * cross a next-layer PLE or the layer dump).  Keeping the deferral inside
+ * the decode widths makes the prefill launch train the old tree's call site
+ * for call site, rather than old-by-equivalence.
+ *
+ * Within a decode width, the fold moves the apply later, from the end of
+ * this layer's second island to the start of the next mixer, so it may not
+ * cross anything that reads the pre-apply stream: the next layer's PLE block
+ * reads (and adds to) the stream ahead of its attention mixer, and the
+ * layer-dump diagnostic photographs the stream after every layer.  Both keep
+ * the separate launch.  The last layer's inject folds into the tower's final
+ * mixer.
+ *
+ * The per-layer conditions are fixed for the life of the process and the
+ * width term is fixed per captured key (islands capture only at n_tokens <=
+ * DS4_QWEN4EXP_MTP_MAX_COMMIT, where the answer is the per-layer one), so a
+ * captured island still encodes the same sequence every time; this function
+ * is the one authority on the decision and the callers on both sides of the
+ * island boundary -- and the final mixer past the last layer -- ask it. */
+static bool qwen4exp_ffn_inject_deferred(const ds4_qwen4exp_config *cfg,
+                                         const ds4_qwen4exp_weights *w,
+                                         uint32_t il, uint32_t n_tokens) {
+    if (n_tokens > (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT) return false;
+#ifdef DS4_TEST_HOOKS
+    if (qwen4exp_layer_dump_on()) return false;
+#endif
+    if (il + 1u < (uint32_t)cfg->n_layer) {
+        return !w->layer[il + 1u].has_ple;
+    }
+    return true;
+}
+
 /* The PLE host gather and token/position uploads precede this device-only
  * layer stack.  A captured stack retains the same operations and scratch
  * addresses while replacing the per-layer graph launch train with one call. */
@@ -2069,6 +2349,12 @@ static bool qwen4exp_graph_layers_encode(
         ds4_qwen4exp_session *s, const ds4_qwen4exp_weights *w,
         const ds4_model *m, uint32_t n_tokens, bool use_islands) {
     const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
+    /* Whether the PREVIOUS layer left its FFN inject pending: it folds into
+     * this layer's attention mixer as the mixer's first step.  Layer 0 reads
+     * the embedding seed, and a layer whose own PLE block reads the stream
+     * ahead of its mixer never receives one (see
+     * qwen4exp_ffn_inject_deferred). */
+    bool pending_ffn = false;
     for (uint32_t il = 0; il < cfg->n_layer; il++) {
         const ds4_qwen4exp_layer_weights *l = &w->layer[il];
 
@@ -2086,8 +2372,14 @@ static bool qwen4exp_graph_layers_encode(
             QW_TRACE(QW_SLICE_PLE);
         }
 
-        if (!(use_islands ? qwen4exp_graph_layer_island(s, l, m, il, n_tokens, 0u) :
-                qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens, 0u))) {
+        const bool defer_ffn =
+                qwen4exp_ffn_inject_deferred(cfg, w, il, n_tokens);
+        if (!(use_islands
+                  ? qwen4exp_graph_layer_island(s, l, m, il, n_tokens, 0u,
+                                                pending_ffn, defer_ffn)
+                  : qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens,
+                                                       0u, pending_ffn,
+                                                       defer_ffn))) {
             return false;
         }
         if (l->is_full_attention) {
@@ -2097,10 +2389,15 @@ static bool qwen4exp_graph_layers_encode(
             }
             QW_TRACE(QW_SLICE_QSA);
         }
-        if (!(use_islands ? qwen4exp_graph_layer_island(s, l, m, il, n_tokens, 1u) :
-                qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens, 1u))) {
+        if (!(use_islands
+                  ? qwen4exp_graph_layer_island(s, l, m, il, n_tokens, 1u,
+                                                pending_ffn, defer_ffn)
+                  : qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens,
+                                                       1u, pending_ffn,
+                                                       defer_ffn))) {
             return false;
         }
+        pending_ffn = defer_ffn;
 #ifdef DS4_TEST_HOOKS
         qwen4exp_layer_dump(s, il, n_tokens);
 #endif
@@ -2128,7 +2425,11 @@ static bool qwen4exp_graph_layers(
          * uses island three at its own layer index, so the caches are disjoint. */
         key.il = 0u;
         key.island = 3u;
-        key.variant = n_tokens | (s->spec_snapshot_rows << 8u);
+        /* Bit 16 as above: the tower's GDN kernels carry the adoption
+         * argument, so a table-armed and a copy-mode tower are different
+         * executables even at identical buffer addresses. */
+        key.variant = n_tokens | (s->spec_snapshot_rows << 8u) |
+                      ((s->rollback_table ? 1u : 0u) << 16u);
         key._pad = 0x51575354u; /* QWST: the complete target layer stack */
         key.cur_hc = s->hyper;
         key.after_attn_hc = s;
@@ -2174,15 +2475,20 @@ static bool qwen4exp_graph_layers(
     return qwen4exp_graph_layers_encode(s, w, m, n_tokens, true);
 }
 
-bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
-                                const ds4_qwen4exp_weights *w,
-                                const ds4_model            *m,
-                                const int32_t              *tokens,
-                                uint32_t                    n_tokens,
-                                float                      *logits_out) {
+/*
+ * The forward's device half: every validation, upload and kernel through the
+ * on-device top-1, LEAVING THE COMMAND BATCH OPEN.  graph_forward closes the
+ * batch, synchronises and reads the logits out; the folded verify below keeps
+ * the batch open and appends the head's stages to it instead.  `logits_out`
+ * is used only for the missing-destination refusal -- the read is the
+ * closer's business, because a caller may arm spec_top1_rows and read ids
+ * instead of a distribution.
+ */
+static bool qwen4exp_graph_forward_encode(
+        ds4_qwen4exp_session *s, const ds4_qwen4exp_weights *w,
+        const ds4_model *m, const int32_t *tokens, uint32_t n_tokens,
+        const float *logits_out) {
     const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
-    const double wall_t0 =
-        getenv("DS4_QWEN4EXP_TIME_SLICES") != NULL ? now_sec() : 0.0;
 
     /* NO SILENT FALSE.  Every refusal below this line names itself, and so
      * does this one: an argument that is missing is a wiring fault in the
@@ -2286,10 +2592,16 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     }
 
     /* The final mixer has no inject head: it collapses n_hc * n_embd to
-     * n_embd and stands in for the model.norm this checkpoint does not have. */
+     * n_embd and stands in for the model.norm this checkpoint does not have.
+     * The last layer's FFN inject arrives here as the mixer's pending apply
+     * when the tower deferred it. */
+    const bool last_ffn_pending = cfg->n_layer > 0u &&
+            qwen4exp_ffn_inject_deferred(cfg, w, cfg->n_layer - 1u, n_tokens);
     if (!qwen4exp_graph_residual(s, m, w->output_hc_norm, w->output_hc_down,
                                  w->output_hc_up, NULL,
-                                 w->output_hc_norm_offset, n_tokens)) {
+                                 w->output_hc_norm_offset, n_tokens,
+                                 last_ffn_pending ? s->block_out : NULL,
+                                 last_ffn_pending ? s->inject : NULL)) {
         fprintf(stderr, "ds4: qwen4exp final mixer failed\n");
         return qwen4exp_forward_fail();
     }
@@ -2333,6 +2645,22 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     }
     QW_TRACE(QW_SLICE_HEAD);
     QW_TRACE_REPORT(n_tokens);
+    return true;
+}
+
+bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
+                                const ds4_qwen4exp_weights *w,
+                                const ds4_model            *m,
+                                const int32_t              *tokens,
+                                uint32_t                    n_tokens,
+                                float                      *logits_out) {
+    const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
+    const double wall_t0 =
+        getenv("DS4_QWEN4EXP_TIME_SLICES") != NULL ? now_sec() : 0.0;
+
+    if (!qwen4exp_graph_forward_encode(s, w, m, tokens, n_tokens, logits_out)) {
+        return false;
+    }
     /* Commit and wait: the logits are read on the host from here on. */
     if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
         fprintf(stderr, "ds4: qwen4exp command batch did not complete\n");
@@ -2340,13 +2668,21 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     }
     if (logits_out &&
         !ds4_gpu_tensor_read(s->logits, 0, logits_out,
-                             (uint64_t)logit_rows * cfg->n_vocab *
-                                     sizeof(float))) {
+                             (uint64_t)(s->spec_logit_rows ? n_tokens : 1u) *
+                                     cfg->n_vocab * sizeof(float))) {
         fprintf(stderr, "ds4: qwen4exp logit read failed\n");
         return false;
     }
 
     s->pos += n_tokens;
+    /* This forward's final stores landed in the live buffers, so the live
+     * buffers are the state the next reader owes: an adoption armed by an
+     * earlier reject ends here.  A rejecting cycle round re-arms below its
+     * decision, which always runs after this. */
+    if (!qwen4exp_state_adopt_set(s, DS4_QWEN4EXP_STATE_ADOPT_LIVE)) {
+        fprintf(stderr, "ds4: qwen4exp state adoption reset failed\n");
+        return false;
+    }
     if (wall_t0 != 0.0) {
         fprintf(stderr, "ds4: qwen4exp forward wall: %u rows in %.3f ms\n",
                 n_tokens, (now_sec() - wall_t0) * 1000.0);
@@ -2359,10 +2695,20 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
  * Adopt the per-GDN-layer state as it stood after verify row `row`.
  *
  * `recurrent` and `conv` select which object, because they are two rollback
- * ids and the cycle may ask for one without the other.  The slot the forward
- * wrote is copied over the live buffer; that copy is the whole rollback, and
- * it is exact because the recurrence is token-serial, so the state the forward
- * left after row k is the state a (k + 1)-row feed would have left.
+ * ids and the cycle may ask for one without the other.  With the rollback
+ * table armed, adoption is ONE device scalar naming that row: every kernel of
+ * the next round resolves its initial state from it at run time, so nothing
+ * is copied at all -- the 72 copies this path used to make over the 36 GDN
+ * layers (216 MiB with the PLE window beside them) become one 4-byte upload.
+ * The row the next round READS is the row its own verify is about to rewrite,
+ * which is safe because the recurrence and the convolution hold each state
+ * element in registers from their first read to their final store.
+ *
+ * The copy path below is what the kill switch and the other backends run: the
+ * slot the forward wrote is copied over the live buffer; that copy is the
+ * whole rollback, and it is exact because the recurrence is token-serial, so
+ * the state the forward left after row k is the state a (k + 1)-row feed
+ * would have left.
  */
 static bool qwen4exp_session_select_layers(ds4_qwen4exp_session *s,
                                            uint32_t row,
@@ -2370,6 +2716,12 @@ static bool qwen4exp_session_select_layers(ds4_qwen4exp_session *s,
     const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
     if (s) s->state_dirty = true;   /* see `state_dirty` */
     if (row >= DS4_QWEN4EXP_IMPLEMENTED_DEPTH) return false;
+    if (s->rollback_table) {
+        /* Both flags name the same row, so the cycle's second call (it asks
+         * for the two GDN objects one at a time) finds the mirror already
+         * holding it and writes nothing. */
+        return qwen4exp_state_adopt_set(s, row);
+    }
     if (!ds4_gpu_begin_commands()) return false;
     bool ok = true;
     for (uint32_t il = 0; il < cfg->n_layer && ok; il++) {
@@ -2584,22 +2936,23 @@ static bool qwen4exp_graph_head_block_encode(
     const char *stage = "attention mixer";
     bool ok = qwen4exp_graph_residual(s, m, l->hc_attn_norm, l->hc_attn_down,
                                       l->hc_attn_up, l->hc_attn_inject,
-                                      l->hc_attn_norm_offset, n_tokens);
+                                      l->hc_attn_norm_offset, n_tokens,
+                                      NULL, NULL);
     QW_HB_TICK(QW_HB_T_ATTN_MIX);
     if (ok) { stage = "QSA"; ok = qwen4exp_graph_qsa_block(s, l, m, il, n_tokens); }
     QW_HB_TICK(QW_HB_T_QSA);
-    if (ok) {
-        stage = "attention inject";
-        ok = ds4_gpu_qwen4exp_hc_inject_tensor(s->hyper, s->hyper, s->block_out,
-                                               s->inject, DS4_N_EMBD, DS4_N_HC,
-                                               n_tokens) != 0;
-    }
+    /* The attention inject runs as the FFN mixer's pending apply now, folded
+     * into its first kernel (or applied by the mixer entry ahead of its own
+     * kernels, on a declined shape): there is no separate launch to time, so
+     * the inject's slot in the report reads zero and its time lands in the
+     * FFN mixer's. */
     QW_HB_TICK(QW_HB_T_ATTN_INJECT);
     if (ok) {
         stage = "FFN mixer";
         ok = qwen4exp_graph_residual(s, m, l->hc_ffn_norm, l->hc_ffn_down,
                                      l->hc_ffn_up, l->hc_ffn_inject,
-                                     l->hc_ffn_norm_offset, n_tokens);
+                                     l->hc_ffn_norm_offset, n_tokens,
+                                     s->block_out, s->inject);
     }
     QW_HB_TICK(QW_HB_T_FFN_MIX);
     if (ok) {
@@ -2815,6 +3168,84 @@ bool ds4_qwen4exp_graph_verify_top1_rows(ds4_qwen4exp_session       *s,
                                (uint64_t)n_tokens * sizeof(int32_t)) != 0;
 }
 
+/*
+ * The folded depth-1 round: the verify's n rows, their on-device top-1s and
+ * the head's drafts over the SAME rows, in ONE command batch with ONE
+ * synchronize and ONE packed readback.
+ *
+ * The sequence past the tower's final mixer: the 2-row LM head and the
+ * on-device top-1 run exactly as verify_top1_rows runs them, then -- instead
+ * of closing the batch -- the head's rows are staged straight off the
+ * verify's own device results (spec_top1 becomes the head's next-token
+ * column, hyper its multi input) and every head stage, shortlist argmax
+ * included, is appended to the same batch.  One end+synchronize covers the
+ * round; one packed 2n-id readback (the head packs the verify's top-1s beside
+ * its drafts) carries both answers to the host, and the acceptance outcome
+ * decides which draft the cycle keeps.  Each row's head arithmetic is the
+ * arithmetic the separate calls run -- the same inputs, the same kernels at
+ * the same widths -- so the drafts are the same bits; only the batch
+ * boundaries, the hc round trip and the decision gap are gone.
+ *
+ * Row invariance is what licenses the extra row: the reject case used to run
+ * the head one row wide, and row 0 of this 2-row call is that call by
+ * construction (the property tests/test_qwen4exp_graph pins at every width,
+ * and the same kernels the accepting 2-row draft_rows call already ran).
+ * The not-chosen row's head-cache writes stay above the truncate boundary
+ * and are overwritten before any reader reaches the position.
+ */
+bool ds4_qwen4exp_graph_verify_top1_draft_rows(
+        ds4_qwen4exp_session *s, const ds4_qwen4exp_weights *w,
+        const ds4_model *m, ds4_qwen4exp_mtp_head *h,
+        const int32_t *tokens, uint32_t n_tokens,
+        int *row_top1, int *row_drafts) {
+    if (!s || !w || !m || !h || !tokens || !row_top1 || !row_drafts ||
+        n_tokens == 0u || n_tokens > (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT) {
+        fprintf(stderr,
+                "ds4: qwen4exp folded verify called with %s%s%s%s%s%s\n",
+                s ? "" : "no session ", w ? "" : "no weights ",
+                m ? "" : "no model ", h ? "" : "no head ",
+                tokens ? "" : "no token buffer ",
+                (row_top1 && row_drafts) ? "" : "no result buffers ");
+        return false;
+    }
+    char err[256];
+    err[0] = '\0';
+    s->spec_snapshot_rows = n_tokens > 1u ? n_tokens - 1u : 0u;
+    s->spec_logit_rows = n_tokens > 1u ? n_tokens : 0u;
+    s->spec_top1_rows = n_tokens;
+    const bool encoded =
+        qwen4exp_graph_forward_encode(s, w, m, tokens, n_tokens, NULL) &&
+        ds4_qwen4exp_mtp_head_fold_encode(h, s->spec_top1, s->hyper, s->pos,
+                                          n_tokens, err, sizeof(err)) == 0;
+    s->spec_snapshot_rows = 0u;
+    s->spec_logit_rows = 0u;
+    s->spec_top1_rows = 0u;
+    if (!encoded) {
+        if (err[0] != '\0') fprintf(stderr, "ds4: qwen4exp %s\n", err);
+        return false;
+    }
+    /* Commit and wait: the whole round's answers are read on the host from
+     * here on. */
+    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
+        fprintf(stderr, "ds4: qwen4exp folded command batch did not complete\n");
+        return false;
+    }
+    if (ds4_qwen4exp_mtp_head_fold_readback(h, n_tokens, row_top1, row_drafts,
+                                            err, sizeof(err)) != 0) {
+        if (err[0] != '\0') fprintf(stderr, "ds4: qwen4exp %s\n", err);
+        return false;
+    }
+    /* The folded path bypasses graph_forward, so it clears adoption itself:
+     * the round's final stores are in the live buffers, and a rejecting
+     * decision re-arms after this. */
+    if (!qwen4exp_state_adopt_set(s, DS4_QWEN4EXP_STATE_ADOPT_LIVE)) {
+        fprintf(stderr, "ds4: qwen4exp state adoption reset failed\n");
+        return false;
+    }
+    s->pos += n_tokens;
+    return true;
+}
+
 bool ds4_qwen4exp_graph_read_logit_row(ds4_qwen4exp_session *s,
                                        uint32_t row,
                                        float *logits) {
@@ -2863,7 +3294,7 @@ bool ds4_qwen4exp_graph_head_logits(ds4_qwen4exp_session       *s,
     }
     if (!qwen4exp_graph_residual(s, m, w->output_hc_norm, w->output_hc_down,
                                  w->output_hc_up, NULL,
-                                 w->output_hc_norm_offset, 1u)) {
+                                 w->output_hc_norm_offset, 1u, NULL, NULL)) {
         fprintf(stderr, "ds4: qwen4exp final mixer failed on the head row\n");
         return qwen4exp_forward_fail();
     }
@@ -2913,6 +3344,26 @@ static double qwen4exp_state_checksum(const ds4_gpu_tensor *t) {
     return acc;
 }
 
+/* The checksum of the state a later round would READ: the adopted snapshot
+ * row when the rollback table armed one, the live buffer otherwise.  With the
+ * table armed the live buffer still holds the REJECTED round's last row, so
+ * checksumming it directly would report state nothing will ever read. */
+static double qwen4exp_adopted_checksum(const ds4_qwen4exp_session *s,
+                                        const ds4_gpu_tensor *live,
+                                        const ds4_gpu_tensor *snap) {
+    if (!s->rollback_table || !snap ||
+        s->state_adopt_row == DS4_QWEN4EXP_STATE_ADOPT_LIVE) {
+        return qwen4exp_state_checksum(live);
+    }
+    const uint64_t bytes = ds4_gpu_tensor_bytes(live);
+    ds4_gpu_tensor *view =
+        ds4_gpu_tensor_view(snap, (uint64_t)s->state_adopt_row * bytes, bytes);
+    if (!view) return qwen4exp_state_checksum(live);
+    const double sum = qwen4exp_state_checksum(view);
+    ds4_gpu_tensor_free(view);
+    return sum;
+}
+
 /*
  * The same carried state, ONE OBJECT PER ENTRY rather than one sum per layer.
  *
@@ -2948,9 +3399,10 @@ int ds4_qwen4exp_test_state_object(const ds4_qwen4exp_session *s, int index,
         const uint32_t il = (uint32_t)(index / per);
         const int k = index % per;
         const ds4_gpu_tensor *t = NULL;
+        const ds4_gpu_tensor *t_snap = NULL;
         switch (k) {
-        case 0: t = s->gdn_conv[il];  break;
-        case 1: t = s->gdn_state[il]; break;
+        case 0: t = s->gdn_conv[il];  t_snap = s->gdn_conv_snapshot[il];  break;
+        case 1: t = s->gdn_state[il]; t_snap = s->gdn_state_snapshot[il]; break;
         case 2: t = s->qsa_k[il];     break;
         case 3: t = s->qsa_v[il];     break;
         case 4: t = s->idx_tape[il];  break;
@@ -2961,13 +3413,16 @@ int ds4_qwen4exp_test_state_object(const ds4_qwen4exp_session *s, int index,
         }
         /* A slot the block type does not own is NULL and checksums to zero on
          * both sides, so it never reports a difference of its own. */
-        if (sum) *sum = qwen4exp_state_checksum(t);
+        if (sum) *sum = qwen4exp_adopted_checksum(s, t, t_snap);
         return 1;
     }
     switch (index - layer_entries) {
     case 0:
         if (name && name_len) snprintf(name, name_len, "ple_conv_state");
-        if (sum) *sum = qwen4exp_state_checksum(s->ple_conv_state);
+        if (sum) {
+            *sum = qwen4exp_adopted_checksum(s, s->ple_conv_state,
+                                             s->ple_conv_snapshot);
+        }
         return 1;
     case 1: {
         if (name && name_len) snprintf(name, name_len, "ple_history");
@@ -2999,21 +3454,82 @@ void ds4_qwen4exp_test_state_checksums(const ds4_qwen4exp_session *s,
     if (!s || cap < 2) return;
     const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
     for (uint32_t il = 0; il < cfg->n_layer && (int)il + 2 <= cap; il++) {
-        out[il] = qwen4exp_state_checksum(s->gdn_conv[il]) +
-                  qwen4exp_state_checksum(s->gdn_state[il]) +
+        out[il] = qwen4exp_adopted_checksum(s, s->gdn_conv[il],
+                                            s->gdn_conv_snapshot[il]) +
+                  qwen4exp_adopted_checksum(s, s->gdn_state[il],
+                                            s->gdn_state_snapshot[il]) +
                   qwen4exp_state_checksum(s->qsa_k[il]) +
                   qwen4exp_state_checksum(s->qsa_v[il]) +
                   qwen4exp_state_checksum(s->idx_tape[il]) +
                   qwen4exp_state_checksum(s->idx_pool[il]);
     }
     if ((int)cfg->n_layer + 1 < cap) {
-        out[cfg->n_layer] = qwen4exp_state_checksum(s->ple_conv_state);
+        out[cfg->n_layer] = qwen4exp_adopted_checksum(
+            s, s->ple_conv_state, s->ple_conv_snapshot);
         double h = 0.0;
         for (uint32_t i = 0; i < DS4_PLE_MAX_NGRAM; i++) {
             h += (double)s->ple_history.previous[i] * (double)(i + 1u);
         }
         out[cfg->n_layer + 1] = h;
     }
+}
+
+/* The state bytes a later round would READ, in the object order above
+ * (conv then recurrent per GDN layer, then the PLE window), closed with the
+ * host n-gram history struct.  `out` NULL returns the byte count; a short cap
+ * refuses.  The table and copy rollback paths must answer identically here,
+ * byte for byte -- that equality is the whole exactness claim for adoption. */
+int64_t ds4_qwen4exp_test_adopted_state_bytes(const ds4_qwen4exp_session *s,
+                                              uint8_t *out, uint64_t cap) {
+    if (!s) return -1;
+    const bool adopted = s->rollback_table &&
+        s->state_adopt_row != DS4_QWEN4EXP_STATE_ADOPT_LIVE;
+    uint64_t need = sizeof(s->ple_history) +
+                    ds4_gpu_tensor_bytes(s->ple_conv_state);
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        need += ds4_gpu_tensor_bytes(s->gdn_conv[il]) +
+                ds4_gpu_tensor_bytes(s->gdn_state[il]);
+    }
+    if (!out) return (int64_t)need;
+    if (cap < need) return -1;
+    uint64_t off = 0;
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        const ds4_gpu_tensor *row[2][2] = {
+            { s->gdn_conv[il], s->gdn_conv_snapshot[il] },
+            { s->gdn_state[il], s->gdn_state_snapshot[il] },
+        };
+        for (int k = 0; k < 2; k++) {
+            const ds4_gpu_tensor *live = row[k][0];
+            if (!live) continue;
+            const uint64_t bytes = ds4_gpu_tensor_bytes(live);
+            const ds4_gpu_tensor *src = live;
+            uint64_t src_off = 0;
+            if (adopted && row[k][1]) {
+                src = row[k][1];
+                src_off = (uint64_t)s->state_adopt_row * bytes;
+            }
+            if (!ds4_gpu_tensor_read(src, src_off, out + off, bytes)) {
+                return -1;
+            }
+            off += bytes;
+        }
+    }
+    {
+        const uint64_t bytes = ds4_gpu_tensor_bytes(s->ple_conv_state);
+        const ds4_gpu_tensor *src = s->ple_conv_state;
+        uint64_t src_off = 0;
+        if (adopted && s->ple_conv_snapshot) {
+            src = s->ple_conv_snapshot;
+            src_off = (uint64_t)s->state_adopt_row * bytes;
+        }
+        if (bytes && !ds4_gpu_tensor_read(src, src_off, out + off, bytes)) {
+            return -1;
+        }
+        off += bytes;
+    }
+    memcpy(out + off, &s->ple_history, sizeof(s->ple_history));
+    off += sizeof(s->ple_history);
+    return (int64_t)off;
 }
 #endif /* DS4_TEST_HOOKS */
 
@@ -3042,6 +3558,11 @@ static int qwen4exp_rb_ple_conv_select(void *ctx, uint32_t row) {
     ds4_qwen4exp_session *s = ctx;
     if (row >= DS4_QWEN4EXP_IMPLEMENTED_DEPTH) return -1;
     s->state_dirty = true;   /* see `state_dirty` */
+    if (s->rollback_table) {
+        /* Same scalar the GDN objects arm; the PLE convolution kernel reads
+         * its rolling window from it, preloaded ahead of its stores. */
+        return qwen4exp_state_adopt_set(s, row) ? 0 : -1;
+    }
     const uint64_t bytes = ds4_gpu_tensor_bytes(s->ple_conv_state);
     if (!ds4_gpu_begin_commands()) return -1;
     const bool ok = ds4_gpu_tensor_copy(s->ple_conv_state, 0,

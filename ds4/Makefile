@@ -564,6 +564,9 @@ test-qwen4exp-hc-mutants: $(QWEN4EXP_HC_TEST)
 # rewrites one line of the fused kernels in ds4_cuda_qwen4exp.cu and rebuilds,
 # so this is minutes rather than seconds and is not part of test-qwen4exp-hc.
 # The last few mutants are deliberate no-ops and must SURVIVE.
+# Runs from this tree or from the .build/ds4/src build copy, which carries
+# tests/ with the sources (tools/ds4/build.sh copies every tracked file); the
+# build copy is preferred -- the mutants' edits and rebuild churn stay there.
 .PHONY: test-qwen4exp-hc-fuse-mutants
 test-qwen4exp-hc-fuse-mutants: $(QWEN4EXP_HC_TEST)
 	sh tests/qwen4exp_hc_fuse_mutants.sh

@@ -40,7 +40,8 @@ int ds4_gpu_qwen4exp_ple_block_tensor(
         float                 norm_key_bias,
         float                 norm_query_bias,
         float                 norm_conv_bias,
-        int                   round_bf16) {
+        int                   round_bf16,
+        const ds4_gpu_tensor *adopt_row) {
     if (!hyper || !conv_state || !key_scratch || !aux_scratch ||
         !value_scratch || !ngram_rows || !key_weight || !value_weight ||
         !norm_key || !norm_query || !norm_conv || !conv_weight ||
@@ -111,7 +112,8 @@ int ds4_gpu_qwen4exp_ple_block_tensor(
                                             aux_scratch, conv_weight->map,
                                             conv_weight->map_size,
                                             conv_weight->offset, wide,
-                                            conv_kernel, dilation, rows);
+                                            conv_kernel, dilation, rows,
+                                            adopt_row);
 }
 
 #ifdef __cplusplus

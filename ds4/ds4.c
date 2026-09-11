@@ -75990,6 +75990,59 @@ static int qwen4exp_seam_read_logit_row(void *ctx, uint32_t row,
                s->engine->qwen4exp_session, row, logits) ? 0 : -1;
 }
 
+/*
+ * The folded round's A/B switch.  DS4_QWEN4EXP_NO_HEAD_IN_BATCH=1 keeps the
+ * separate verify-then-draft sequence every round; it is the kill switch and
+ * the A/B control for the fold, so it is read once at seam build, by name,
+ * and anything that is not an explicit "0" disables rather than arms.
+ *
+ * DS4_MTP_HEAD_TIME also disarms: the per-stage timing hooks synchronize
+ * inside the head's stages, which cannot run in a batch the verify keeps
+ * open, so the standalone forward they instrument has to run instead.
+ */
+static bool qwen4exp_seam_head_fold_armed(void) {
+    const char *off = getenv("DS4_QWEN4EXP_NO_HEAD_IN_BATCH");
+    if (off && *off && strcmp(off, "0") != 0) return false;
+    const char *timing = getenv("DS4_MTP_HEAD_TIME");
+    if (timing && *timing && strcmp(timing, "0") != 0) return false;
+    return true;
+}
+
+/* The folded depth-1 round: one batch for the target's verify, its top-1s and
+ * the head's drafts over the same rows.  The drafts come back for BOTH
+ * acceptance outcomes and the cycle selects; see
+ * ds4_qwen4exp_mtp_model.verify_top1_draft_rows. */
+static int qwen4exp_seam_verify_top1_draft_rows(void *ctx, const int *tokens,
+                                                uint32_t n, uint32_t pos0,
+                                                int *row_top1,
+                                                int *row_drafts) {
+    ds4_session *s = ctx;
+    ds4_engine *e = s->engine;
+    const uint32_t at = ds4_qwen4exp_session_pos(e->qwen4exp_session);
+    if (at != pos0 || n > (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT) return -1;
+    int32_t buf[DS4_QWEN4EXP_MTP_MAX_COMMIT];
+    for (uint32_t i = 0; i < n; i++) buf[i] = (int32_t)tokens[i];
+    const int rc = ds4_qwen4exp_graph_verify_top1_draft_rows(
+                       e->qwen4exp_session, e->qwen4exp_weights, &e->model,
+                       &s->qwen4exp_head, buf, n, row_top1, row_drafts) ? 0 : -1;
+#ifdef DS4_TEST_HOOKS
+    /* The forced-draft override, per row, by the same absolute-position rule
+     * draft_step applies: the head still runs (it owns the cache row), only
+     * the token it proposed is replaced.  Row j drafts the token at
+     * pos0 + j + 2, which is the reject case's draft for j = 0 and the
+     * accept case's for j = 1 -- the two the old sequence would override. */
+    if (rc == 0 && s->qwen4exp_forced_tokens) {
+        for (uint32_t j = 0; j < n; j++) {
+            const uint32_t want = pos0 + j + 2u;
+            if (want < (uint32_t)s->qwen4exp_forced_len) {
+                row_drafts[j] = s->qwen4exp_forced_tokens[want];
+            }
+        }
+    }
+#endif
+    return rc;
+}
+
 /* One row, through the SAME entry point as the verify: the cycle requires row
  * t of an n-row verify to equal a one-row decode from the same state bit for
  * bit, and one implementation is how that is guaranteed rather than tested. */
@@ -76138,6 +76191,9 @@ static bool ds4_session_qwen4exp_spec_init(ds4_session *s,
     s->qwen4exp_seam.verify_rows  = qwen4exp_seam_verify_rows;
     s->qwen4exp_seam.verify_rows_top1 = qwen4exp_seam_verify_rows_top1;
     s->qwen4exp_seam.read_logit_row = qwen4exp_seam_read_logit_row;
+    s->qwen4exp_seam.verify_top1_draft_rows =
+        qwen4exp_seam_head_fold_armed() ? qwen4exp_seam_verify_top1_draft_rows
+                                        : NULL;
     s->qwen4exp_seam.defer_frontier_logits = true;
     s->qwen4exp_seam.decode_token = qwen4exp_seam_decode_token;
     s->qwen4exp_seam.head_logits  = qwen4exp_seam_head_logits;
@@ -77303,6 +77359,224 @@ int ds4_qwen4exp_test_session_spec(const char *path, const char *head_path,
     model_close(&e->mtp_model);
     model_close(&e->model);
     free(e);
+    return rc;
+}
+
+/* THE ROLLBACK TABLE AGAINST THE COPIES, on a leg whose every round rejects.
+ *
+ * Two sessions run the same forced-reject leg -- the fixture's head is random,
+ * so with no forced drafts every verify refuses the chain -- once with the
+ * adoption table armed and once with the copy-era path, and the leg's whole
+ * observable trace is compared byte for byte: the emitted tokens, the state a
+ * later round would read (the adopted snapshot row against the copied live
+ * buffers, through ds4_qwen4exp_test_adopted_state_bytes), and one further
+ * round run past the leg -- its committed tokens, the frontier argmax, and
+ * the state again.  Byte equality there is adoption's whole exactness claim:
+ * nothing computes differently, only where the rejected round's state is read
+ * from moves.
+ *
+ * The legs run as separate sessions because the mode is latched per session;
+ * the graph key carries the armed bit, so the two legs never share an
+ * executable even where the allocator recycles addresses. */
+int ds4_qwen4exp_test_rollback_table_ab(const char *path,
+                                        const char *head_path,
+                                        const int *prompt, int prompt_len,
+                                        int n_gen, int draft_tokens,
+                                        int *mode_table_out,
+                                        int *mode_copy_out,
+                                        int *rounds_out, int *rejects_out,
+                                        int *state_same_out,
+                                        int *tokens_same_out,
+                                        int *next_same_out) {
+    if (mode_table_out) *mode_table_out = -1;
+    if (mode_copy_out) *mode_copy_out = -1;
+    if (rounds_out) *rounds_out = -1;
+    if (rejects_out) *rejects_out = -1;
+    if (state_same_out) *state_same_out = 0;
+    if (tokens_same_out) *tokens_same_out = 0;
+    if (next_same_out) *next_same_out = 0;
+    if (!path || !head_path || !prompt || prompt_len < 1 || n_gen < 2 ||
+        n_gen > 256 ||
+        draft_tokens < 2 || draft_tokens > DS4_QWEN4EXP_MTP_MAX_COMMIT) {
+        return -1;
+    }
+
+    /* Each leg's trace: the leg-end state bytes then the after-next-round
+     * state bytes, back to back in one buffer. */
+    uint8_t *trace[2] = { NULL, NULL };
+    int tokens[2][256];
+    int next_toks[2][DS4_QWEN4EXP_MTP_MAX_COMMIT];
+    int next_argmax[2] = { -1, -1 };
+    int n_next[2] = { 0, 0 };
+    int n_out[2] = { 0, 0 };
+    int rounds[2] = { -1, -1 }, rejects[2] = { -1, -1 };
+    uint64_t one_state = 0;
+    int rc = 0;
+
+    for (int leg = 0; leg < 2 && rc == 0; leg++) {
+        char err[512];
+        ds4_engine *e = calloc(1, sizeof(*e));
+        if (!e) { rc = -2; break; }
+        e->backend = ds4_qwen4exp_test_backend();
+        e->prefill_chunk = 0;
+        e->mtp_draft_tokens = draft_tokens;
+
+        model_open(&e->model, path, true, false);
+        config_validate_model(&e->model);
+        if (!ds4_model_is_qwen4exp()) {
+            model_close(&e->model); free(e); rc = -3; break;
+        }
+        e->qwen4exp_weights = calloc(1, sizeof(*e->qwen4exp_weights));
+        if (!e->qwen4exp_weights) {
+            model_close(&e->model); free(e); rc = -2; break;
+        }
+        model_open(&e->mtp_model, head_path, true, false);
+        config_validate_qwen4exp_mtp_model(&e->mtp_model);
+        weights_bind_qwen4exp_mtp(&e->qwen4exp_mtp, &e->mtp_model);
+        e->qwen4exp_mtp_ready = true;
+
+        ds4_qwen4exp_test_set_free_memory_override(
+                64ull * 1024ull * 1024ull * 1024ull, true);
+        weights_bind_qwen4exp(e->qwen4exp_weights, &e->model);
+        ds4_session *sess = NULL;
+        const int crc = ds4_session_create(&sess, e, 256);
+        ds4_qwen4exp_test_set_free_memory_override(0, false);
+        if (crc != 0 || !sess) {
+            ds4_qwen4exp_session_close(e->qwen4exp_session);
+            free(e->qwen4exp_weights);
+            model_close(&e->mtp_model); model_close(&e->model); free(e);
+            rc = -4; break;
+        }
+
+        /* THE ONLY DIFFERENCE BETWEEN THE LEGS.  Leg 0 adopts through the
+         * device table, leg 1 rolls back with the copies -- but only where
+         * the backend compiled the adopt entries.  Everywhere else
+         * (QWEN4EXP_ROLLBACK_TABLE_BACKEND 0) arming the flag adopts
+         * nothing: the rollback callbacks check this runtime flag, take the
+         * adopt branch, and qwen4exp_state_adopt_set returns early without
+         * a device scalar, so the copies are skipped too and leg 0 would
+         * run on from the rejected end state.  Such a backend skips the
+         * table leg, says so, and the harness reports copy against copy. */
+#if QWEN4EXP_ROLLBACK_TABLE_BACKEND
+        e->qwen4exp_session->rollback_table = leg == 0;
+#else
+        if (leg == 0) {
+            fprintf(stderr, "ds4: rollback A/B leg 0 skipped: this backend "
+                            "has no rollback table, running the copies\n");
+        }
+        e->qwen4exp_session->rollback_table = 0;
+#endif
+
+        ds4_tokens tk;
+        tk.v = (int *)prompt; tk.len = prompt_len; tk.cap = prompt_len;
+        int produced = 0;
+        if (ds4_session_sync(sess, &tk, err, sizeof(err)) != 0) {
+            fprintf(stderr, "ds4: rollback A/B leg %d sync: %s\n", leg, err);
+            rc = -5;
+        }
+        while (rc == 0 && produced < n_gen) {
+            const int token = ds4_session_argmax(sess);
+            int toks[DS4_QWEN4EXP_MTP_MAX_COMMIT];
+            const int n = ds4_session_eval_speculative_argmax(
+                    sess, token, n_gen - produced, -1, toks,
+                    (int)(sizeof(toks) / sizeof(toks[0])), err, sizeof(err));
+            if (n <= 0) {
+                fprintf(stderr,
+                        "ds4: rollback A/B leg %d stopped at %d/%d: %s\n",
+                        leg, produced, n_gen, err);
+                rc = -5;
+                break;
+            }
+            for (int i = 0; i < n && produced < n_gen; i++) {
+                tokens[leg][produced] = toks[i];
+                produced++;
+            }
+        }
+        if (rc == 0 && produced != n_gen) rc = -5;
+
+        const int64_t need = rc == 0
+            ? ds4_qwen4exp_test_adopted_state_bytes(e->qwen4exp_session,
+                                                    NULL, 0)
+            : -1;
+        if (rc == 0 &&
+            (need <= 0 || (leg == 1 && (uint64_t)need != one_state))) {
+            rc = -6;
+        }
+        if (rc == 0) {
+            one_state = (uint64_t)need;
+            trace[leg] = malloc(2 * (size_t)one_state);
+            if (!trace[leg] ||
+                ds4_qwen4exp_test_adopted_state_bytes(
+                        e->qwen4exp_session, trace[leg], one_state) !=
+                    (int64_t)one_state) {
+                rc = -6;
+            }
+        }
+
+        /* ONE ROUND PAST THE LEG, from the state the last reject left. */
+        if (rc == 0) {
+            const int token = ds4_session_argmax(sess);
+            int toks[DS4_QWEN4EXP_MTP_MAX_COMMIT];
+            const int n = ds4_session_eval_speculative_argmax(
+                    sess, token, 1, -1, toks,
+                    (int)(sizeof(toks) / sizeof(toks[0])), err, sizeof(err));
+            if (n <= 0) {
+                fprintf(stderr, "ds4: rollback A/B leg %d next round: %s\n",
+                        leg, err);
+                rc = -7;
+            } else {
+                next_argmax[leg] = ds4_session_argmax(sess);
+                n_next[leg] = n;
+                for (int i = 0; i < n; i++) next_toks[leg][i] = toks[i];
+                if (ds4_qwen4exp_test_adopted_state_bytes(
+                            e->qwen4exp_session, trace[leg] + one_state,
+                            one_state) != (int64_t)one_state) {
+                    rc = -6;
+                }
+            }
+        }
+
+        if (rc == 0) {
+            const ds4_qwen4exp_mtp_counters *c = &sess->qwen4exp_spec.counters;
+            rounds[leg] = (int)c->rounds;
+            /* A round that committed only the fed token refused the chain. */
+            rejects[leg] = (int)c->commit_hist[1];
+            n_out[leg] = produced;
+            const int mode = e->qwen4exp_session->rollback_table ? 1 : 0;
+            if (leg == 0 && mode_table_out) *mode_table_out = mode;
+            if (leg == 1 && mode_copy_out) *mode_copy_out = mode;
+        }
+
+        free(sess);
+        ds4_qwen4exp_session_close(e->qwen4exp_session);
+        free(e->qwen4exp_weights);
+        model_close(&e->mtp_model);
+        model_close(&e->model);
+        free(e);
+    }
+
+    if (rc == 0) {
+        if (one_state == 0 || !trace[0] || !trace[1]) rc = -6;
+    }
+    if (rc == 0) {
+        if (rounds_out) *rounds_out = rounds[0];
+        if (rejects_out) *rejects_out = rejects[0];
+        const int same =
+            memcmp(trace[0], trace[1], (size_t)(2 * one_state)) == 0;
+        if (state_same_out) *state_same_out = same ? 1 : 0;
+        int tsame = n_out[0] == n_out[1];
+        for (int i = 0; i < n_out[0] && tsame; i++) {
+            if (tokens[0][i] != tokens[1][i]) tsame = 0;
+        }
+        if (tokens_same_out) *tokens_same_out = tsame ? 1 : 0;
+        int nsame = next_argmax[0] == next_argmax[1] && n_next[0] == n_next[1];
+        for (int i = 0; i < n_next[0] && nsame; i++) {
+            if (next_toks[0][i] != next_toks[1][i]) nsame = 0;
+        }
+        if (next_same_out) *next_same_out = (same && nsame) ? 1 : 0;
+    }
+    free(trace[0]);
+    free(trace[1]);
     return rc;
 }
 

@@ -73,7 +73,14 @@ enum {
      * decode.  Its f32 twin is rounded onto this grid, so the two regions hold
      * bit-identical values and the two paths are directly comparable. */
     INJECT_Q8_OFF = ZERO_OFF + N_LOWRANK * ((WIDE / 32) * 34),
-    MODEL_BYTES = INJECT_Q8_OFF + N_HC * ((WIDE / 32) * 34),
+    /* The unpaired two-row tile sweep's weight table: ONE Q8_0 grid of 10240
+     * output rows over 10240 inputs (320 groups), the largest shape the sweep
+     * addresses.  Every smaller (in_dim, out_dim) reads a prefix of it: a
+     * smaller grid's block starts fall on 34-byte multiples, and every
+     * 34-byte multiple they can address is a block this one fill wrote, so no
+     * shape needs its own region or a refill of this one. */
+    TILE_W_OFF = INJECT_Q8_OFF + N_HC * ((WIDE / 32) * 34),
+    MODEL_BYTES = TILE_W_OFF + 10240u * ((10240u / 32u) * 34u),
 };
 
 /* Exact half constants: every scale is a power of two, so dequantization is
@@ -227,7 +234,26 @@ static void require_bf16_rounding_band(const char *what, const float *actual,
 static void require_identical(const char *what, const void *a, const void *b,
                               uint64_t bytes) {
     if (memcmp(a, b, (size_t)bytes) != 0) {
-        fprintf(stderr, "%s: byte streams differ\n", what);
+        /* Say how far apart: a one-ulp spread over many outputs is a float
+         * step compiled differently (an FMA contraction), a few wild values
+         * are a wrong operand. */
+        const float *fa = (const float *)a;
+        const float *fb = (const float *)b;
+        const uint64_t n = bytes / sizeof(float);
+        uint64_t cnt = 0, first = 0;
+        double mx = 0.0;
+        for (uint64_t i = 0; i < n; i++) {
+            if (fa[i] == fb[i]) continue;
+            if (cnt == 0) first = i;
+            cnt++;
+            const double d = fabs((double)fa[i] - (double)fb[i]);
+            if (d > mx) mx = d;
+        }
+        fprintf(stderr,
+                "%s: byte streams differ: %llu of %llu floats, first at %llu "
+                "(%.9g vs %.9g), max abs diff %.3g\n",
+                what, (unsigned long long)cnt, (unsigned long long)n,
+                (unsigned long long)first, fa[first], fb[first], mx);
         exit(1);
     }
 }
@@ -319,24 +345,27 @@ static void check_norm(uint8_t *model, const float *hyper_host,
 /* THE INVARIANT THE SPECULATIVE CYCLE STANDS ON.
  *
  * ds4_gpu_matmul_q8_0_decode_rows_exact_tensor() serves the serial decode at
- * width one and the MTP verify at width two out of two different kernels:
- * width one takes matmul_q8_0_preq_warp8_kernel, and every width above it
- * takes matmul_q8_0_preq_rows_exact_tile_kernel<R>, which reads a weight
- * block ONCE for R activation rows.  Row j of an n-row call has to be the
+ * width one and the MTP verify at width two out of different kernels: the
+ * one-row width takes matmul_q8_0_preq_pair_lanes_kernel above the
+ * wide-block line and matmul_q8_0_preq_warp8_kernel below it, width two --
+ * the verify width -- takes matmul_q8_0_preq_tile_unpaired_kernel, which
+ * computes both rows per loaded weight word, and every width above it takes
+ * matmul_q8_0_preq_rows_exact_tile_kernel<R>, which reads a weight block
+ * ONCE for R activation rows.  Row j of an n-row call has to be the
  * same BITS as that row computed alone, or a batched verify and a one-row
  * decode of the same row disagree and the accept loop commits a token the
  * serial leg would never have emitted.  The gate on this track is exact token
  * equality, so a band here would hide the only failure that matters.
  *
- * The one-row kernel is the oracle: it is not part of the tile and nothing in
- * the tile's weight sharing touches it.  Every row of every width below is
+ * The one-row call is the oracle: it is not part of any tile and nothing in
+ * the tiles' weight sharing touches it.  Every row of every width below is
  * compared against it byte for byte, at the checkpoint's real hidden width,
  * over BOTH group shapes the kernel has -- an in_dim that is a whole number
  * of 32-element groups, and one whose last group is a 16-wide tail, which is
  * the case that falls off the dp4a form onto the scalar loop -- and with the
- * dp4a form both enabled and disabled.  Widths 2 and 3 exercise the R = 2
- * tile, 4 and 5 the R = 4 tile, 8 and 9 the R = 8 tile, and 9 also exercises
- * a tile whose last slot is padded.
+ * dp4a form both enabled and disabled.  Width 2 exercises the unpaired
+ * two-row kernel, 3 the R = 2 tile, 4 and 5 the R = 4 tile, 8 and 9 the
+ * R = 8 tile, and 9 also exercises a tile whose last slot is padded.
  */
 enum { TILE_MAX_ROWS = 9 };
 
@@ -414,6 +443,120 @@ static void check_q8_row_tile(const uint8_t *model) {
     } else {
         unsetenv("DS4_CUDA_NO_Q8_DP4A");
     }
+}
+
+/* ---- the unpaired two-row tile: the verify width against one row ------ */
+
+/* THE SAME INVARIANT, on the kernel the verify width now takes, over the
+ * projection geometry matrix it actually runs in.
+ *
+ * Width two is the MTP verify, and it takes
+ * matmul_q8_0_preq_tile_unpaired_kernel: a warp per output row, lane L on
+ * groups L, L+32 ..., both rows computed per loaded weight word.  Row r of
+ * the two-row call must be the same BITS as that row alone -- here the
+ * one-row call runs the paired-lane kernel above the wide-block line and
+ * warp8 below it, so the sweep also holds all three kernels to ONE
+ * arithmetic.  The shapes cover every dense projection geometry the verify
+ * window reaches (out_dim above and below the wide-block line, including the
+ * 48-wide router and the 512-wide k/v, over whole-group in_dims from the
+ * 2560 hidden and the 10240 hyper stream to the 81-group 2592), with the
+ * dp4a form on and off.  A final pass sets DS4_QWEN4EXP_TILE_UNPAIRED and
+ * runs two shapes down the previous ladder, so the fallback the env var
+ * buys stays proven too.  Byte equality, no band.
+ */
+static void check_q8_tile_unpaired_case(const uint8_t *model, uint32_t in_dim,
+                                        uint32_t out_dim, const char *what) {
+    const uint64_t x_count = (uint64_t)2u * in_dim;
+    float *x = alloc_floats(x_count);
+    for (uint64_t i = 0; i < x_count; i++) x[i] = next_unit();
+
+    float *paired = alloc_floats((uint64_t)2u * out_dim);
+    float *alone = alloc_floats(out_dim);
+
+    ds4_gpu_tensor *x_pair = upload(x, x_count);
+    ds4_gpu_tensor *out_pair = ds4_gpu_tensor_alloc(
+            (uint64_t)2u * out_dim * sizeof(float));
+    ds4_gpu_tensor *out_one =
+            ds4_gpu_tensor_alloc((uint64_t)out_dim * sizeof(float));
+    require_ok(out_pair != NULL && out_one != NULL,
+               "q8_0 tile unpaired output allocation");
+
+    require_ok(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+                   out_pair, model, MODEL_BYTES, TILE_W_OFF, in_dim, out_dim,
+                   x_pair, 2u),
+               "q8_0 decode rows exact, unpaired pair call");
+    download(out_pair, paired, (uint64_t)2u * out_dim);
+    for (uint32_t r = 0; r < 2u; r++) {
+        ds4_gpu_tensor *x_row = upload(x + (uint64_t)r * in_dim, in_dim);
+        require_ok(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+                       out_one, model, MODEL_BYTES, TILE_W_OFF, in_dim,
+                       out_dim, x_row, 1u),
+                   "q8_0 decode rows exact, one-row call");
+        download(out_one, alone, out_dim);
+        require_identical(what, paired + (uint64_t)r * out_dim, alone,
+                          (uint64_t)out_dim * sizeof(float));
+        ds4_gpu_tensor_free(x_row);
+    }
+
+    printf("  %-56s exact\n", what);
+    ds4_gpu_tensor_free(out_one);
+    ds4_gpu_tensor_free(out_pair);
+    ds4_gpu_tensor_free(x_pair);
+    free(alone);
+    free(paired);
+    free(x);
+}
+
+static void check_q8_tile_unpaired(const uint8_t *model) {
+    static const uint32_t ins[] = { 2560u, 10240u, 2592u };
+    static const uint32_t outs[] = { 10240u, 6144u, 512u, 48u };
+    char label[64];
+
+    const char *saved_dp4a = getenv("DS4_CUDA_NO_Q8_DP4A");
+    char *keep_dp4a = saved_dp4a ? strdup(saved_dp4a) : NULL;
+    require_ok(saved_dp4a == NULL || keep_dp4a != NULL, "environment save");
+    const char *saved_unpaired = getenv("DS4_QWEN4EXP_TILE_UNPAIRED");
+    char *keep_unpaired = saved_unpaired ? strdup(saved_unpaired) : NULL;
+    require_ok(saved_unpaired == NULL || keep_unpaired != NULL,
+               "environment save");
+    if (saved_unpaired != NULL) unsetenv("DS4_QWEN4EXP_TILE_UNPAIRED");
+
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass == 0) {
+            if (saved_dp4a != NULL) unsetenv("DS4_CUDA_NO_Q8_DP4A");
+        } else {
+            setenv("DS4_CUDA_NO_Q8_DP4A", "1", 1);
+        }
+        const char *form = pass == 0 ? "dp4a" : "scalar";
+        for (uint32_t i = 0; i < sizeof(ins) / sizeof(ins[0]); i++) {
+            for (uint32_t o = 0; o < sizeof(outs) / sizeof(outs[0]); o++) {
+                snprintf(label, sizeof(label), "q8_0 tile unpaired %u->%u, %s",
+                         ins[i], outs[o], form);
+                check_q8_tile_unpaired_case(model, ins[i], outs[o], label);
+            }
+        }
+    }
+
+    /* The ladder DS4_QWEN4EXP_TILE_UNPAIRED buys back: the paired-lane
+     * kernel wide of the line, the R = 2 row tile narrow of it.  dp4a on,
+     * as the verify width runs it. */
+    if (keep_dp4a != NULL) {
+        setenv("DS4_CUDA_NO_Q8_DP4A", keep_dp4a, 1);
+    } else {
+        unsetenv("DS4_CUDA_NO_Q8_DP4A");
+    }
+    setenv("DS4_QWEN4EXP_TILE_UNPAIRED", "0", 1);
+    check_q8_tile_unpaired_case(model, 2560u, 6144u,
+                                "q8_0 two-row fallback 2560->6144, dp4a");
+    check_q8_tile_unpaired_case(model, 2560u, 512u,
+                                "q8_0 two-row fallback 2560->512, dp4a");
+    unsetenv("DS4_QWEN4EXP_TILE_UNPAIRED");
+
+    if (keep_unpaired != NULL) {
+        setenv("DS4_QWEN4EXP_TILE_UNPAIRED", keep_unpaired, 1);
+        free(keep_unpaired);
+    }
+    free(keep_dp4a);
 }
 
 /* ---- the fused mixer against the op-by-op one ----------------------- */
@@ -548,6 +691,182 @@ static void check_mixer_equivalence(uint8_t *model) {
            (unsigned long long)cases);
 }
 
+/* ---- the folded inject apply against the separate chain ---------------- */
+
+/* ds4_gpu_qwen4exp_hc_mixer_apply_tensor folds the pending hyper-connection
+ * inject apply into the mixer's first kernel, which applies it into the
+ * residual IN PLACE and norms the result in the same pass.  The fold is only
+ * allowed to be a faster way to compute the SAME numbers, so this holds it
+ * against the two steps the tower made before it -- the separate
+ * ds4_gpu_qwen4exp_hc_inject_tensor, then the op-by-op mixer -- and requires
+ * BIT FOR BIT agreement on everything either side writes: the block input the
+ * next GDN/QSA/MoE consumes, the inject coefficients the NEXT apply consumes,
+ * and the hyper stream itself, which the MTP head reads past the tower.
+ *
+ * Widths: 1 (serial decode), 2 (the speculative verify width), 3, and a full
+ * prefill chunk, which sits past the inject fold's row ceiling
+ * (QWEN4EXP_HC_INJECT_FUSE_MAX_ROWS) and so exercises the DISPATCH PREFILL
+ * TAKES: the entry declines the fold and runs the separate apply plus the
+ * ordinary mixer entry's own fused path -- held here against the apply plus
+ * the op-by-op chain, which is the pre-fold tower's launch train.  The
+ * inject head sweep is the mixer one's -- F32 weights, Q8_0 weights (the
+ * MTP head's encoding), and absent, which is the last layer's fold into the
+ * tower's final mixer. */
+static void check_inject_mixer_equivalence(uint8_t *model) {
+    static const uint32_t row_set[] = { 1u, 2u, 3u, ROWS_LONG };
+    const ds4_gpu_qwen4exp_slab norm_slab =
+        hc_slab(model, MODEL_BYTES, NORM_WIDE_OFF);
+    const ds4_gpu_qwen4exp_slab down_slab =
+        hc_slab(model, MODEL_BYTES, DOWN_OFF);
+    const ds4_gpu_qwen4exp_slab up_slab =
+        hc_slab(model, MODEL_BYTES, UP_OFF);
+    ds4_gpu_qwen4exp_slab inject_f32 =
+        hc_slab(model, MODEL_BYTES, INJECT_OFF);
+    ds4_gpu_qwen4exp_slab inject_q8 =
+        hc_slab(model, MODEL_BYTES, INJECT_Q8_OFF);
+    inject_q8.row_bytes = (uint64_t)(WIDE / 32) * 34u;
+    inject_q8.type = TENSOR_Q8_0;
+
+    uint64_t cases = 0;
+    for (uint32_t ri = 0; ri < sizeof(row_set) / sizeof(row_set[0]); ri++) {
+        const uint32_t rows = row_set[ri];
+        const uint64_t hc_count = (uint64_t)rows * WIDE;
+        const uint64_t embd_count = (uint64_t)rows * N_EMBD;
+        const uint64_t inj_count = (uint64_t)rows * N_HC;
+
+        /* The stream before the boundary, and the block output and inject
+         * coefficients the boundary applies.  Coefficients are 2*sigmoid,
+         * so draw them from (0, 2) the way the head does. */
+        float *hyper = alloc_floats(hc_count);
+        float *block = alloc_floats(embd_count);
+        float *coef = alloc_floats(inj_count);
+        for (uint64_t i = 0; i < hc_count; i++) hyper[i] = next_unit();
+        for (uint64_t i = 0; i < embd_count; i++) block[i] = next_unit();
+        for (uint64_t i = 0; i < inj_count; i++)
+            coef[i] = 1.0f + next_unit();
+
+        ds4_gpu_tensor *hyper_a = upload(hyper, hc_count);
+        ds4_gpu_tensor *hyper_b = upload(hyper, hc_count);
+        ds4_gpu_tensor *block_t = upload(block, embd_count);
+        ds4_gpu_tensor *coef_t = upload(coef, inj_count);
+        ds4_gpu_tensor *normed_t = ds4_gpu_tensor_alloc(hc_count * sizeof(float));
+        ds4_gpu_tensor *wide_t = ds4_gpu_tensor_alloc(hc_count * sizeof(float));
+        ds4_gpu_tensor *lowrank_t =
+            ds4_gpu_tensor_alloc((uint64_t)rows * N_LOWRANK * sizeof(float));
+        ds4_gpu_tensor *mixed_a = ds4_gpu_tensor_alloc(embd_count * sizeof(float));
+        ds4_gpu_tensor *mixed_b = ds4_gpu_tensor_alloc(embd_count * sizeof(float));
+        ds4_gpu_tensor *inject_a = ds4_gpu_tensor_alloc(inj_count * sizeof(float));
+        ds4_gpu_tensor *inject_b = ds4_gpu_tensor_alloc(inj_count * sizeof(float));
+        require_ok(normed_t && wide_t && lowrank_t && mixed_a && mixed_b &&
+                   inject_a && inject_b, "apply-equivalence tensor allocation");
+
+        float *mixed_ref = alloc_floats(embd_count);
+        float *mixed_got = alloc_floats(embd_count);
+        float *inject_ref = alloc_floats(inj_count);
+        float *inject_got = alloc_floats(inj_count);
+        float *hyper_after = alloc_floats(hc_count);
+        float *hyper_got = alloc_floats(hc_count);
+        char label[80];
+
+        for (int head = 0; head < 3; head++) {
+            const ds4_gpu_qwen4exp_slab *iw =
+                head == 0 ? &inject_f32 : (head == 1 ? &inject_q8 : NULL);
+            ds4_gpu_tensor *ia = head == 2 ? NULL : inject_a;
+            ds4_gpu_tensor *ib = head == 2 ? NULL : inject_b;
+            for (int bias = 0; bias < 2; bias++) {
+                for (int bf16 = 0; bf16 < 2; bf16++) {
+                    const float weight_bias = bias ? 1.0f : 0.0f;
+                    /* Reset both streams to the same bytes first: chain A
+                     * updates hyper_a in place, so every case starts from
+                     * the pre-boundary stream again. */
+                    require_ok(ds4_gpu_tensor_write(
+                                   hyper_a, 0, hyper,
+                                   hc_count * sizeof(float)),
+                               "apply-equivalence stream reset");
+                    require_ok(ds4_gpu_tensor_write(
+                                   hyper_b, 0, hyper,
+                                   hc_count * sizeof(float)),
+                               "apply-equivalence stream reset");
+
+                    /* The separate chain: the apply kernel, then the
+                     * op-by-op mixer, in the order the tower ran them. */
+                    require_ok(ds4_gpu_qwen4exp_hc_inject_tensor(
+                                   hyper_a, hyper_a, block_t, coef_t,
+                                   N_EMBD, N_HC, rows),
+                               "separate HC inject apply");
+                    require_ok(ds4_gpu_qwen4exp_hc_mixer_unfused_tensor(
+                                   mixed_a, ia, normed_t, lowrank_t, wide_t,
+                                   hyper_a, &norm_slab, &down_slab, &up_slab,
+                                   iw, N_EMBD, N_HC, N_LOWRANK, rows, 1e-6f,
+                                   weight_bias, bf16),
+                               "unfused HC mixer after apply");
+                    download(mixed_a, mixed_ref, embd_count);
+                    if (ia) download(inject_a, inject_ref, inj_count);
+                    download(hyper_a, hyper_after, hc_count);
+
+                    require_ok(ds4_gpu_qwen4exp_hc_mixer_apply_tensor(
+                                   mixed_b, ib, normed_t, lowrank_t, wide_t,
+                                   hyper_b, &norm_slab, &down_slab, &up_slab,
+                                   iw, N_EMBD, N_HC, N_LOWRANK, rows, 1e-6f,
+                                   weight_bias, bf16, block_t, coef_t),
+                               "fused HC inject+mixer");
+                    download(mixed_b, mixed_got, embd_count);
+                    if (ib) download(inject_b, inject_got, inj_count);
+                    /* The updated stream lives on the device; download it
+                     * like every other tensor compared here.  Passing the
+                     * ds4_gpu_tensor itself would read its 16 struct bytes
+                     * plus the heap behind them, not the GPU. */
+                    download(hyper_b, hyper_got, hc_count);
+
+                    snprintf(label, sizeof(label),
+                             "fused apply+mixer block input, %u row%s",
+                             rows, rows == 1u ? "" : "s");
+                    require_identical(label, mixed_got, mixed_ref,
+                                      embd_count * sizeof(float));
+                    if (ia) {
+                        snprintf(label, sizeof(label),
+                                 "fused apply+mixer inject weights, %u rows",
+                                 rows);
+                        require_identical(label, inject_got, inject_ref,
+                                          inj_count * sizeof(float));
+                    }
+                    /* The stream the apply updated: the fused first kernel
+                     * writes the same bytes the separate kernel wrote. */
+                    snprintf(label, sizeof(label),
+                             "fused apply updates the stream, %u rows", rows);
+                    require_identical(label, hyper_got, hyper_after,
+                                      hc_count * sizeof(float));
+                    cases++;
+                }
+            }
+        }
+
+        free(hyper_after);
+        free(hyper_got);
+        free(inject_got);
+        free(inject_ref);
+        free(mixed_got);
+        free(mixed_ref);
+        ds4_gpu_tensor_free(inject_b);
+        ds4_gpu_tensor_free(inject_a);
+        ds4_gpu_tensor_free(mixed_b);
+        ds4_gpu_tensor_free(mixed_a);
+        ds4_gpu_tensor_free(lowrank_t);
+        ds4_gpu_tensor_free(wide_t);
+        ds4_gpu_tensor_free(normed_t);
+        ds4_gpu_tensor_free(coef_t);
+        ds4_gpu_tensor_free(block_t);
+        ds4_gpu_tensor_free(hyper_b);
+        ds4_gpu_tensor_free(hyper_a);
+        free(coef);
+        free(block);
+        free(hyper);
+    }
+    printf("  %-56s exact over %llu cases\n",
+           "fused inject apply equals the separate chain",
+           (unsigned long long)cases);
+}
+
 int main(void) {
     uint8_t *model = mmap(NULL, MODEL_BYTES, PROT_READ | PROT_WRITE,
                           MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -575,11 +894,13 @@ int main(void) {
     fill_q8_0(model + UP_OFF, N_LOWRANK, WIDE, HALF_2_M6);
     fill_q8_0(model + EMBD_OFF, N_EMBD, N_VOCAB, HALF_2_M8);
     fill_q8_0(model + HEAD_OFF, N_EMBD, N_VOCAB, HALF_2_M12);
+    fill_q8_0(model + TILE_W_OFF, 10240u, 10240u, HALF_2_M8);
 
     require_ok(ds4_gpu_init(), "GPU initialization");
     require_ok(ds4_gpu_set_model_map(model, MODEL_BYTES), "model map registration");
 
     check_q8_row_tile(model);
+    check_q8_tile_unpaired(model);
 
     const uint32_t row_counts[2] = { 1u, ROWS_LONG };
     for (uint32_t which = 0; which < 2u; which++) {
@@ -983,6 +1304,7 @@ int main(void) {
     }
 
     check_mixer_equivalence(model);
+    check_inject_mixer_equivalence(model);
 
     munmap(model, MODEL_BYTES);
     printf("test_qwen4exp_hc_norm: ok\n");

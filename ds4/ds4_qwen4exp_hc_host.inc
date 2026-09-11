@@ -154,11 +154,69 @@ int ds4_gpu_qwen4exp_hc_mixer_tensor(
 #ifdef DS4_QWEN4EXP_HC_HAVE_FUSED
     if (!ds4_qwen4exp_hc_fuse_off()) {
         const int fused =
-            qwen4exp_hc_mixer_fused_cuda(DS4_QWEN4EXP_HC_MIXER_ARGS);
+            qwen4exp_hc_mixer_fused_cuda(DS4_QWEN4EXP_HC_MIXER_ARGS, NULL, NULL);
         if (fused >= 0) return fused;
     }
 #endif
     return qwen4exp_hc_mixer_chain(DS4_QWEN4EXP_HC_MIXER_ARGS);
+}
+
+/* The mixer above with a PENDING inject apply in front of it.
+ *
+ * The tower runs this between every block's output and the next mixer's norm:
+ * `apply_block` is the block output (s->block_out), `apply_inject` the per-
+ * (token, stream) coefficients the PREVIOUS mixer's inject head produced.
+ * The CUDA backend folds the apply into the mixer's first kernel at decode
+ * widths, which applies it into `hyper` in place -- exactly the bytes
+ * ds4_gpu_qwen4exp_hc_inject_tensor wrote -- and norms the result in the same
+ * pass.  Every other backend, a width past the fold's row ceiling, a declined
+ * shape and the DS4_QWEN4EXP_NO_HC_INJECT_FUSE valve run the two steps the
+ * tower ran before the fold: the separate apply kernel, then the mixer entry
+ * above -- NOT the chain directly, so a declined fold still costs exactly
+ * what the boundary cost before the fold, the apply launch plus the same
+ * fused-or-chain mixer every apply-free boundary runs. */
+int ds4_gpu_qwen4exp_hc_mixer_apply_tensor(
+        ds4_gpu_tensor       *mixed,
+        ds4_gpu_tensor       *inject,
+        ds4_gpu_tensor       *normed_scratch,
+        ds4_gpu_tensor       *lowrank_scratch,
+        ds4_gpu_tensor       *wide_scratch,
+        const ds4_gpu_tensor *hyper,
+        const ds4_gpu_qwen4exp_slab *norm_weight,
+        const ds4_gpu_qwen4exp_slab *down_weight,
+        const ds4_gpu_qwen4exp_slab *up_weight,
+        const ds4_gpu_qwen4exp_slab *inject_weight,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              n_lowrank,
+        uint32_t              rows,
+        float                 eps,
+        float                 weight_bias,
+        int                   round_bf16,
+        const ds4_gpu_tensor *apply_block,
+        const ds4_gpu_tensor *apply_inject) {
+    DS4_QWEN4EXP_HC_MIXER_GUARD
+    if (!apply_block || !apply_inject) return 0;
+#ifdef DS4_QWEN4EXP_HC_HAVE_FUSED
+    if (!ds4_qwen4exp_hc_fuse_off() && !ds4_qwen4exp_hc_inject_fuse_off()) {
+        const int fused = qwen4exp_hc_mixer_fused_cuda(
+                DS4_QWEN4EXP_HC_MIXER_ARGS, apply_block, apply_inject);
+        if (fused >= 0) return fused;
+    }
+#endif
+    /* A -1 decline (a shape the fused kernels cannot serve, or a width past
+     * the inject fold's row ceiling) leaves the apply unrun: make it here,
+     * in the order the unfused tower made it, then go through the ordinary
+     * mixer entry above so the backend's own mixer fusion -- a different,
+     * older fold than this one -- still applies.  Calling the chain directly
+     * here would trade the valve path down to the op-by-op mixer at every
+     * apply-carrying boundary, which the pre-fold tower never ran. */
+    if (!ds4_gpu_qwen4exp_hc_inject_tensor((ds4_gpu_tensor *)hyper, hyper,
+                                           apply_block, apply_inject,
+                                           n_embd, n_hc, rows)) {
+        return 0;
+    }
+    return ds4_gpu_qwen4exp_hc_mixer_tensor(DS4_QWEN4EXP_HC_MIXER_ARGS);
 }
 
 int ds4_gpu_qwen4exp_embed_tokens_hc_tensor(

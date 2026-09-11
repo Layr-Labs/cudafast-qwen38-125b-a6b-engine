@@ -312,6 +312,30 @@ static void ref_attention_row(float *out, const float *q, const float *k_cache,
 
 /* ------------------------------------------------------------- comparing */
 
+/* Zero tolerance, with the three numbers that name a float-step mismatch:
+ * how many, where first, how far at worst. */
+static void compare_exact(const char *what, const float *got, const float *want,
+                          size_t count) {
+    if (memcmp(got, want, count * sizeof(float)) != 0) {
+        size_t first = 0, n_diff = 0;
+        float worst = 0.0f;
+        for (size_t i = 0; i < count; i++) {
+            if (got[i] == want[i]) continue;
+            if (n_diff == 0) first = i;
+            n_diff++;
+            const float d = fabsf(got[i] - want[i]);
+            if (d > worst) worst = d;
+        }
+        fprintf(stderr,
+                "test_qwen4exp_qsa: %s: %zu of %zu floats differ, first at "
+                "%zu (%.9g vs %.9g), max abs diff %.3g\n",
+                what, n_diff, count, first, (double)want[first],
+                (double)got[first], (double)worst);
+        exit(1);
+    }
+    printf("  %-38s exact\n", what);
+}
+
 static void compare_band(const char *what, const float *got, const float *want,
                          size_t count, float tolerance) {
     float worst = 0.0f;
@@ -541,6 +565,7 @@ static void run_pipeline(const inputs *in, bool verify, float *attn_out) {
     ds4_gpu_tensor *t_k = tensor_new((size_t)MAX_TOKENS * kv_width, sizeof(float));
     ds4_gpu_tensor *t_v = tensor_new((size_t)MAX_TOKENS * kv_width, sizeof(float));
     ds4_gpu_tensor *t_out = tensor_new((size_t)MAX_TOKENS * q_width, sizeof(float));
+    ds4_gpu_tensor *t_out2 = tensor_new((size_t)MAX_TOKENS * q_width, sizeof(float));
     ds4_gpu_tensor *t_kcache = tensor_new((size_t)CACHE_CAP * kv_width, sizeof(float));
     ds4_gpu_tensor *t_vcache = tensor_new((size_t)CACHE_CAP * kv_width, sizeof(float));
     ds4_gpu_tensor *t_qnorm = tensor_new(HEAD_DIM, sizeof(float));
@@ -575,6 +600,7 @@ static void run_pipeline(const inputs *in, bool verify, float *attn_out) {
     float *ref_v = xcalloc((size_t)MAX_TOKENS * kv_width, sizeof(float));
     float *ref_idx_q = xcalloc((size_t)MAX_TOKENS * IDX_HEAD * IDX_HEAD_DIM, sizeof(float));
     float *got = xcalloc((size_t)MAX_TOKENS * q_width, sizeof(float));
+    float *folded = xcalloc((size_t)MAX_TOKENS * q_width, sizeof(float));
     float *ref_scores = NULL;
     float *got_scores = NULL;
     int32_t *got_selected = xcalloc((size_t)MAX_TOKENS * MAX_SELECTED, sizeof(int32_t));
@@ -774,6 +800,22 @@ static void run_pipeline(const inputs *in, bool verify, float *attn_out) {
         memcpy(attn_out + attn_written, got, (size_t)n * q_width * sizeof(float));
         attn_written += (size_t)n * q_width;
 
+        /* The output gate folded into the attention store: the same bytes as
+         * the two-launch chain above, over both dispatches the entry takes --
+         * the folded per-head kernel at this decode width (the fold's token
+         * ceiling is 7), and the two-launch chain itself on the 1024- and
+         * 64-token segments, which is the dispatch prefill widths take -- or
+         * the fold is not a scheduling change. */
+        require(ds4_gpu_qwen4exp_qsa_attention_gate_dpos_tensor(
+                    t_out2, t_q, t_kcache, t_vcache,
+                    sparse ? t_selected : NULL, sparse ? t_counts : NULL,
+                    n, N_HEAD, N_KV_HEAD, HEAD_DIM, pos0, CACHE_CAP,
+                    MAX_SELECTED, 1.0f / sqrtf((float)HEAD_DIM), NULL, t_gate),
+                "qsa attention with the folded output gate");
+        tensor_get(t_out2, folded, (size_t)n * q_width * sizeof(float));
+        compare_exact("attention with folded gate", folded, got,
+                      (size_t)n * q_width);
+
         if (verify) {
             const uint32_t heads[3] = { 0, N_HEAD / 2, N_HEAD - 1 };
             double worst_cos = 1.0;
@@ -828,6 +870,7 @@ static void run_pipeline(const inputs *in, bool verify, float *attn_out) {
     free(ref_k);
     free(ref_v);
     free(ref_idx_q);
+    free(folded);
     free(got);
     free(got_selected);
     free(got_counts);
@@ -841,6 +884,7 @@ static void run_pipeline(const inputs *in, bool verify, float *attn_out) {
     ds4_gpu_tensor_free(t_gate);
     ds4_gpu_tensor_free(t_k);
     ds4_gpu_tensor_free(t_v);
+    ds4_gpu_tensor_free(t_out2);
     ds4_gpu_tensor_free(t_out);
     ds4_gpu_tensor_free(t_kcache);
     ds4_gpu_tensor_free(t_vcache);

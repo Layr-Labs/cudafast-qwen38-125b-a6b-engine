@@ -527,7 +527,7 @@ int main(void) {
 
         require_ok(ds4_gpu_qwen4exp_ple_conv_tensor(
                        hyper_t, state_t, NULL, 0u, gated_t, conv_t, model, MODEL_BYTES,
-                       CONV_OFF, WIDE, CONV_K, DILATION, rows),
+                       CONV_OFF, WIDE, CONV_K, DILATION, rows, NULL),
                    "qwen4exp PLE convolution");
         download(hyper_t, gpu_wide, wide_count);
         download(state_t, gpu_state, state_count);
@@ -606,7 +606,7 @@ int main(void) {
                            scratch_value, rows_t, &one_key, &one_value,
                            &one_nkey, &one_nquery, &one_nconv, &one_conv,
                            N_EMBD, N_HC, PLE_EMBD,
-                           CONV_K, DILATION, rows, 1e-6f, 0.0f, 0.0f, 0.0f, 1),
+                           CONV_K, DILATION, rows, 1e-6f, 0.0f, 0.0f, 0.0f, 1, NULL),
                        "qwen4exp PLE block");
             download(block_hyper, gpu_wide, wide_count);
 
@@ -639,7 +639,7 @@ int main(void) {
                                rows_t, &one_key, &one_value, &one_nkey,
                                &one_nquery, &one_nconv, &one_conv, N_EMBD,
                                N_HC, PLE_EMBD, CONV_K, DILATION, rows, 1e-6f,
-                               1.0f, 1.0f, 1.0f, 1),
+                               1.0f, 1.0f, 1.0f, 1, NULL),
                            "qwen4exp PLE block, zero-centered norm weights");
                 float *biased_gpu = alloc_floats(wide_count);
                 download(bh, biased_gpu, wide_count);
@@ -687,7 +687,7 @@ int main(void) {
                                &one_key, &one_value, &one_nkey, &one_nquery,
                                &one_nconv, &one_conv, N_EMBD,
                                N_HC, PLE_EMBD, CONV_K, DILATION, rows, 1e-6f,
-                               0.0f, 0.0f, 0.0f, 1),
+                               0.0f, 0.0f, 0.0f, 1, NULL),
                            "qwen4exp PLE block, epsilon-dominant");
                 download(small_hyper_t, gpu_wide, wide_count);
 
@@ -787,7 +787,7 @@ int main(void) {
 
         require_ok(ds4_gpu_qwen4exp_ple_conv_tensor(
                        hyper_t, state_t, NULL, 0u, gated_t, conv_t, model, MODEL_BYTES,
-                       CONV_OFF, WIDE, CONV_K, DILATION, rows),
+                       CONV_OFF, WIDE, CONV_K, DILATION, rows, NULL),
                    "chunk invariance, whole call");
         download(hyper_t, whole, wide_count);
         download(state_t, whole_state, state_count);
@@ -808,7 +808,7 @@ int main(void) {
                 require_ok(ds4_gpu_qwen4exp_ple_conv_tensor(
                                hyper_t, state_t, NULL, 0u, gated_t, conv_t, model,
                                MODEL_BYTES, CONV_OFF, WIDE, CONV_K, DILATION,
-                               chunk),
+                               chunk, NULL),
                            "chunk invariance, chunked call");
                 download(hyper_t, split + offset, count);
                 done += chunk;
@@ -906,7 +906,7 @@ int main(void) {
             require_ok(ds4_gpu_qwen4exp_ple_block_tensor(
                            h, st, NULL, 0u, sk, sa, sv, r, &k, &v, &nk, &nq, &nc, &cw,
                            N_EMBD, N_HC, PLE_EMBD, CONV_K, DILATION, rows,
-                           1e-6f, 0.0f, 0.0f, 0.0f, 1),
+                           1e-6f, 0.0f, 0.0f, 0.0f, 1, NULL),
                        "qwen4exp PLE block, one shard");
             download(h, one_out[which], wide_count);
             download(st, one_state_out[which], state_count);
@@ -974,7 +974,7 @@ int main(void) {
             require_ok(ds4_gpu_qwen4exp_ple_block_tensor(
                            h, st, NULL, 0u, sk, sa, sv, r, &k, &v, &nk, &nq, &nc, &cw,
                            N_EMBD, N_HC, PLE_EMBD, CONV_K, DILATION, rows,
-                           1e-6f, 0.0f, 0.0f, 0.0f, 1),
+                           1e-6f, 0.0f, 0.0f, 0.0f, 1, NULL),
                        "qwen4exp PLE block, two shards");
             download(h, split_out, wide_count);
             download(st, split_state_out, state_count);

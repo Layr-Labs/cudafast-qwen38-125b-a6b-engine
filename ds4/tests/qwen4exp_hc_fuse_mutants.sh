@@ -12,6 +12,13 @@
 # inject mutants each mutant here costs a rebuild of ONE object plus a relink.
 # Run it with: make test-qwen4exp-hc-fuse-mutants
 #
+# That works unchanged from the engine tree (ds4/) AND from the build copy
+# (.build/ds4/src): tools/ds4/build.sh copies every file git ls-files names in
+# the vendored tree, so the copy carries tests/ and the Makefile beside the
+# sources this script mutates.  The build copy is the better place to run it --
+# the mutants rewrite ds4_cuda_qwen4exp.cu in place, and there they stay out of
+# the participant tree entirely, erased by the next build.sh copy step.
+#
 # A mutant that is NOT caught is either a test gap or a genuine equivalence.
 # The deliberate no-ops at the end are the second kind and are asserted to
 # survive, so a change that made them observable would also be reported.
@@ -182,6 +189,37 @@ mutant fused_mix_no_fma caught \
 
 mutant fused_inject_row caught \
     's|                            iw + (uint64_t)ho \* weight_row_bytes, i);|                            iw, i);|'
+
+# ---- the folded inject apply -----------------------------------------------
+# qwen4exp_hc_inject_norm_quant_kernel applies the pending inject into the
+# residual and norms it in one pass; check_inject_mixer_equivalence holds it
+# against the separate apply + op-by-op mixer at zero tolerance, over the same
+# head/bias/bf16 sweep at rows 1, 2, 3 and 1024.
+
+# Drop the residual from the apply: the stream, the statistic and the quantize
+# all see only the block output.
+mutant apply_no_residual caught \
+    's|        const float v = xg\[i\] + bg\[i\] \* inj;|        const float v = bg[i] * inj;|'
+
+# Keep the arithmetic, never store it: the stream the MTP head reads past the
+# tower keeps its pre-apply bytes.
+mutant apply_no_store caught \
+    's|        xg\[i\] = v;||'
+
+# One coefficient for every row of the call instead of the row's own.
+mutant apply_coefficient_shared caught \
+    's|    const float inj = inject\[(uint64_t)row \* (n / group) + g\];|    const float inj = inject[g];|'
+
+# The inject fold's row ceiling only picks WHICH kernels compute the boundary
+# -- the fused first kernel, or the separate apply plus the ordinary mixer --
+# and those two were written to agree bit for bit.  The apply mutants above
+# bite at rows 1, 2 and 3, under the ceiling, so they stay caught whichever
+# side the 1024-row case lands on.
+mutant inject_fuse_threshold_never survives \
+    's|#define QWEN4EXP_HC_INJECT_FUSE_MAX_ROWS 7u|#define QWEN4EXP_HC_INJECT_FUSE_MAX_ROWS 0u|'
+
+mutant inject_fuse_threshold_always survives \
+    's|#define QWEN4EXP_HC_INJECT_FUSE_MAX_ROWS 7u|#define QWEN4EXP_HC_INJECT_FUSE_MAX_ROWS 0xffffffffu|'
 
 # ---- deliberate no-ops -----------------------------------------------------
 
