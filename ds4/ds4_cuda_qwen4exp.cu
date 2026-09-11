@@ -254,11 +254,17 @@ __device__ __forceinline__ static float qwen4exp_gdn_softplus(float x) {
  * 2 * n_key_head are query and key heads and take the RMS norm; the rest are
  * value heads and only take the activation.
  */
+template<bool PUBLISH_GATES>
 __global__ static void qwen4exp_gdn_conv_kernel(
         float       *qkv,
         float       *conv_state,
         const float *conv_weight,
         float       *conv_snapshot,
+        float2      *gate_pairs,
+        const float *raw_alpha,
+        const float *raw_beta,
+        const float *a_log,
+        const float *dt_bias,
         uint32_t     n_key_head,
         uint32_t     n_value_head,
         uint32_t     n_rows,
@@ -351,6 +357,20 @@ __global__ static void qwen4exp_gdn_conv_kernel(
         total = warp_sum_all_f32(total);
         qkv[index] = activated *
             rsqrtf(total + qk_norm_eps) * post_scale;
+    }
+
+    /* Publish the same per-token/head gates before the recurrence launch.
+     * Only one existing channel block produces them, once per head. */
+    if (PUBLISH_GATES && block == 0u) {
+        for (unsigned at = tid; at < n_tokens * n_value_head;
+             at += QWEN4EXP_GDN_DIM) {
+            const unsigned head = at % n_value_head;
+            const uint64_t gate = (uint64_t)row * n_tokens * n_value_head + at;
+            gate_pairs[gate] = make_float2(
+                expf(a_log[head] * qwen4exp_gdn_softplus(
+                    raw_alpha[gate] + dt_bias[head])),
+                qwen4exp_gdn_sigmoid(raw_beta[gate]));
+        }
     }
 
     history[channel] = h0;
@@ -653,7 +673,8 @@ static const float *qwen4exp_gdn_weight_f32(
  * reads rows the neighbouring token blocks rewrite, so that kernel cannot
  * work in place; it writes the main range here and the recurrence reads it.
  * The small tail publishes one decay and beta per token/head from that same
- * kernel.  Owned by the widest prefill seen, and unused by every serial call. */
+ * kernel. Short chunks use the beginning for at most seven 48-head gate rows.
+ * A growth invalidates captures before releasing their former allocation. */
 static void *g_qwen4exp_conv_scratch[16];
 static uint64_t g_qwen4exp_conv_bytes[16];
 
@@ -673,6 +694,7 @@ static float *qwen4exp_conv_scratch(int tier, uint64_t elements) {
         return NULL;
     }
     if (g_qwen4exp_conv_scratch[tier]) {
+        ds4_gpu_decode_graphs_invalidate();
         cudaFree(g_qwen4exp_conv_scratch[tier]);
     }
     g_qwen4exp_conv_scratch[tier] = next;
@@ -809,6 +831,12 @@ static int qwen4exp_cuda_gdn_run(
             gate_pairs = (float2 *)(conv_out + qkv_elements);
         }
     }
+    const bool short_gates = !conv_out && n_rows == 1u &&
+        n_tokens <= 7u && n_key_head == 16u && n_value_head == 48u &&
+        getenv("DS4_QWEN4EXP_NO_SHORT_GDN_GATES") == NULL;
+    if (short_gates) {
+        gate_pairs = (float2 *)qwen4exp_conv_scratch(logical_tier, 7u * 48u * 2u);
+    }
     if (conv_out) {
         qwen4exp_gdn_conv_parallel_kernel<<<
                 dim3(blocks, n_rows, n_tokens),
@@ -834,11 +862,21 @@ static int qwen4exp_cuda_gdn_run(
                      "qwen4exp GDN conv history carry")) {
             return 0;
         }
-    } else {
-        qwen4exp_gdn_conv_kernel<<<dim3(blocks, n_rows, 1u),
+    } else if (gate_pairs) {
+        qwen4exp_gdn_conv_kernel<true><<<dim3(blocks, n_rows, 1u),
                                    QWEN4EXP_GDN_DIM, 0, stream>>>(
                 (float *)qkv->ptr, (float *)conv_state->ptr, conv_weight,
                 conv_snapshot ? (float *)conv_snapshot->ptr : NULL,
+                gate_pairs, (const float *)raw_alpha->ptr,
+                (const float *)raw_beta->ptr, a_log, dt_bias,
+                n_key_head, n_value_head, n_rows, n_tokens, n_snapshot_rows,
+                qk_norm_eps);
+    } else {
+        qwen4exp_gdn_conv_kernel<false><<<dim3(blocks, n_rows, 1u),
+                                   QWEN4EXP_GDN_DIM, 0, stream>>>(
+                (float *)qkv->ptr, (float *)conv_state->ptr, conv_weight,
+                conv_snapshot ? (float *)conv_snapshot->ptr : NULL,
+                NULL, NULL, NULL, NULL, NULL,
                 n_key_head, n_value_head, n_rows, n_tokens, n_snapshot_rows,
                 qk_norm_eps);
     }
@@ -851,7 +889,8 @@ static int qwen4exp_cuda_gdn_run(
     if (gate_pairs) {
         qwen4exp_gdn_recurrence_kernel<true><<<
                 recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
-                (float *)out->ptr, (float *)recurrent_state->ptr, conv_out,
+                (float *)out->ptr, (float *)recurrent_state->ptr,
+                conv_out ? conv_out : (const float *)qkv->ptr,
                 (const float *)raw_alpha->ptr,
                 (const float *)raw_beta->ptr, a_log, dt_bias,
                 gate_pairs,
