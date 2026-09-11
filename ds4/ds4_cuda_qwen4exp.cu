@@ -6340,12 +6340,37 @@ __global__ static void qwen4exp_qsa_indexer_scores_kernel(
     }
 
     const float *k = pool + (uint64_t)block * head_dim;
+    /* One K-channel load feeds every indexer head. Each head still accumulates
+     * q*k over d = tid, tid+nth, ... in that order, then the same block sum,
+     * so every ReLU-dot matches the head-outer walk bit for bit. */
+    float partials[8];
+    if (n_head > 8u) {
+        /* Fallback: original head-outer walk for unexpected widths. */
+        float total = 0.0f;
+        for (uint32_t h = 0; h < n_head; h++) {
+            const float *qh = q + ((uint64_t)token * n_head + h) * head_dim;
+            float partial = 0.0f;
+            for (uint32_t d = tid; d < head_dim; d += nth)
+                partial += qh[d] * k[d];
+            qwen4exp_score_shared[tid] = partial;
+            const float dot = qwen4exp_blk_sum(qwen4exp_score_shared, tid, nth);
+            total += fmaxf(dot, 0.0f);
+        }
+        if (tid == 0u) *dst = total / norm_divisor;
+        return;
+    }
+#pragma unroll
+    for (uint32_t h = 0; h < 8u; h++) partials[h] = 0.0f;
+    for (uint32_t d = tid; d < head_dim; d += nth) {
+        const float kd = k[d];
+        for (uint32_t h = 0; h < n_head; h++) {
+            const float *qh = q + ((uint64_t)token * n_head + h) * head_dim;
+            partials[h] += qh[d] * kd;
+        }
+    }
     float total = 0.0f;
     for (uint32_t h = 0; h < n_head; h++) {
-        const float *qh = q + ((uint64_t)token * n_head + h) * head_dim;
-        float partial = 0.0f;
-        for (uint32_t d = tid; d < head_dim; d += nth) partial += qh[d] * k[d];
-        qwen4exp_score_shared[tid] = partial;
+        qwen4exp_score_shared[tid] = partials[h];
         const float dot = qwen4exp_blk_sum(qwen4exp_score_shared, tid, nth);
         total += fmaxf(dot, 0.0f);
     }
