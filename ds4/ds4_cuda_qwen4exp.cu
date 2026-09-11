@@ -2950,6 +2950,665 @@ qwen4exp_shared_q8_mma_kernel(
     }
 }
 
+/* =========================================================================
+ * The shared expert on the int8 tensor core, BIT FOR BIT.
+ * =========================================================================
+ *
+ * WHAT IS SLOW.  The staged kernels above deleted the redundant dequantise;
+ * what is left is the multiply itself, and it is dp4a on a warp-per-row
+ * layout.  One warp owns one output row and eight tokens, so for every 32
+ * MACs it issues eight __dp4a, two FMUL and two FFMA -- and the routed MoE
+ * already has a tensor-core tile for exactly this shape family, where one
+ * mma.sync.aligned.m16n8k32 replaces 1024 dp4a.  At a prefill of 1024 tokens
+ * the shared expert is a plain dense GEMM (M 1024, K 2560, N 640 twice, then
+ * K 640, N 2560) and there is no routing to complicate the tile.  One call at
+ * that shape, best of four after two warm-ups, on the GB10: 3.21 ms for the
+ * staged dp4a pair, 2.01 ms for the Q8_0 tile this sits in front of, 1.02 ms
+ * here -- 1.98x over that tile, and at forty-eight blocks about 96 ms of
+ * prefill becoming about 49.
+ *
+ * WHY THIS ONE IS NOT ALLOWED TO MOVE A NUMBER.  The timed goldens were
+ * authored on a reference tree.  A prefill that changes by one ulp changes the
+ * seed state, which can flip the first decoded token, and an autoregressive
+ * stream that diverges once diverges for the rest of the window.  The engine's
+ * own invariance checks only look at widths one to four, so they would not see
+ * it.  So this path is not "close enough": it reproduces the dp4a kernels'
+ * arithmetic EXACTLY, and the test beside it is a memcmp, not a tolerance.
+ *
+ * HOW EXACTNESS SURVIVES A TILE.  Two facts do the work.
+ *
+ *   1. The integer dot is EXACT.  A group is thirty-two quants, which is
+ *      exactly the k of m16n8k32.s8.s8.s32, and the largest dot a group can
+ *      produce is 32 * 128 * 127 = 520192, far inside int32.  However the
+ *      tensor core sums the thirty-two products, the int32 it returns is the
+ *      int32 the eight __dp4a returned.  So the tile is free to reassociate
+ *      the INTEGER sum; there is nothing to round.
+ *
+ *   2. The float sum is the only thing that must be reproduced, and its shape
+ *      is fixed by the dp4a launch: for one (row, token), lane L of the warp
+ *      owns the groups L, L + 32, L + 64, ... in ASCENDING order and chains
+ *      them into one private float with the two statements of
+ *      qwen4exp_group_accumulate; then warp_sum_f32 folds the thirty-two lane
+ *      partials with __shfl_down at offsets 16, 8, 4, 2, 1.
+ *
+ * So call L a CLASS rather than a lane, define
+ *
+ *      P(c) = the ascending fma chain over the groups c, c + 32, c + 64, ...
+ *
+ * and the answer is the same five-level balanced tree over P(0..31) that
+ * warp_sum_f32 builds.  This kernel walks the K axis CLASS MAJOR -- it stages
+ * the groups of a class together and finishes P(c) before it starts P(c') --
+ * so every accumulator it touches is one of those chains, and it visits the
+ * classes in BIT-REVERSED order, j = 0..31 and c = rev5(j), which is exactly
+ * the order in which a streaming pairwise sum reproduces warp_sum_f32's tree:
+ *
+ *      warp_sum_f32 at lane 0 is ((P0+P16)+(P8+P24)) + ((P4+P20)+(P12+P28)) ...
+ *      rev5(0..7)             =    0  16    8  24        4  20    12  28
+ *
+ * and every combine takes the older (lower-index) subtree on the LEFT, which
+ * is the side __shfl_down puts it on.  The streaming sum needs five registers
+ * per output element instead of thirty-two, which is what makes the tile fit.
+ *
+ * WHERE THE ORDER IS PROVABLY THE SAME, ELEMENT BY ELEMENT.
+ *   - the two statements per group are the source of qwen4exp_group_accumulate
+ *     character for character, so the compiler contracts them identically;
+ *   - the group order inside a class is ascending, as `g += 32` was;
+ *   - the class tree is warp_sum_f32's tree with the same operand sides;
+ *   - the epilogue expression is the staged kernel's, unchanged.
+ * The ONE thing that is skipped is the `wb` fma when the weight type has no
+ * offset term (Q8_0 sets wb[0] = 0 and never writes it again).  That term is
+ * then (0 * xscale) * xsum, a signed zero, and `acc += signed zero` is the
+ * identity for every acc except -0.0f -- which no accumulator here can hold,
+ * because acc starts at +0.0f and fma(t, d, acc) rounds to -0.0 only when both
+ * addends are -0.0.  The test checks this rather than trusting it.
+ *
+ * NOT ROUTED HERE.  Q6_K, whose scale changes every sixteen elements, so its
+ * group is two dots of sixteen and m16n8k32 cannot split k -- the same
+ * exclusion the routed tile makes.  And every width below
+ * QWEN4EXP_MMA_MIN_TOKENS, so the decode and every speculative verify keep
+ * today's kernels at today's launch geometry, untouched.
+ * ========================================================================= */
+
+#define QS_MMA_BM 32
+#define QS_MMA_BN 64
+#define QS_MMA_MB (QS_MMA_BM / 16)
+#define QS_MMA_NB (QS_MMA_BN / 8)
+#define QS_MMA_WARPS (QS_MMA_MB * QS_MMA_NB)
+#define QS_MMA_THREADS (QS_MMA_WARPS * 32)
+
+enum {
+    /* Tokens below which the tile does not run.  A decode is one row and a
+     * speculative verify is two to four (five and six leave room for a deeper
+     * draft); all of them keep the per-row and staged kernels they have
+     * today, at today's launch geometry, so the decode window is untouched
+     * whatever this file does.  A prefill chunk is 1024.  The number is a
+     * safety margin, not a crossover: the tile pads 31 of its 32 token rows at
+     * width one and would be slower there anyway. */
+    QWEN4EXP_MMA_MIN_TOKENS = 64,
+    /* Shared memory one staged chunk may use.  Kept under the 48 KiB a launch
+     * gets without opting in, so no cudaFuncSetAttribute and no failure mode
+     * where the opt-in is refused and the launch silently does not happen. */
+    QWEN4EXP_MMA_SMEM_CAP = 46u * 1024u,
+};
+
+/* Bit reversal of a five-bit class index.  rev5(j) for j = 0.. is
+ * 0, 16, 8, 24, 4, 20, 12, 28, 2, ... which is the leaf order of
+ * warp_sum_f32's tree read left to right. */
+__device__ __host__ __forceinline__ static uint32_t qs_rev5(uint32_t j) {
+    return ((j & 1u) << 4) | ((j & 2u) << 2) | (j & 4u) |
+           ((j & 8u) >> 2) | ((j & 16u) >> 4);
+}
+
+/* The two floating-point statements of the contract, over an int32 dot the
+ * tensor core produced instead of a dp4a chain.  The source is
+ * qwen4exp_group_accumulate's, character for character, so nvcc builds the
+ * same expression tree and contracts it the same way; `xsum` arrives already
+ * widened, which is the same (float) cast done once at staging time.
+ * `has_wb` is warp-uniform (it is a property of the weight TYPE) and drops
+ * the identity add described above when the type carries no offset. */
+__device__ __forceinline__ static void qwen4exp_mma_accumulate(
+        float *acc, float wa0, float wb0, int32_t dot, float xscale,
+        float xsum, int has_wb) {
+    *acc += (wa0 * xscale) * (float)dot;
+    if (has_wb) *acc += (wb0 * xscale) * xsum;
+}
+
+/* Shared memory a chunk of `ks` staged group slots needs.
+ *
+ * The int8 tile stride is ks * 32 + 16 bytes.  The sixteen is not slack: an
+ * m16n8k32 fragment load has each quad of lanes read one sixteen-byte run of
+ * one tile row and successive quads read successive rows, so the warp's
+ * thirty-two words fall on thirty-two distinct banks exactly when the row
+ * stride in words is 4 (mod 8) -- which ks * 32 + 16 is and ks * 32 is not. */
+__host__ __device__ __forceinline__ static uint32_t qs_mma_ld(uint32_t ks) {
+    return ks * 32u + 16u;
+}
+
+static uint32_t qs_mma_smem_bytes(uint32_t ks, uint32_t matrices) {
+    const uint32_t ld = qs_mma_ld(ks);
+    return (uint32_t)QS_MMA_BM * ld * matrices +
+           (uint32_t)QS_MMA_BN * ld +
+           2u * matrices * (uint32_t)QS_MMA_BM * ks * (uint32_t)sizeof(float) +
+           2u * (uint32_t)QS_MMA_BN * ks * (uint32_t)sizeof(float);
+}
+
+/* Classes staged per barrier, as a power of two, largest that fits.  More
+ * classes per chunk is fewer barriers for the same arithmetic; the cap is the
+ * shared-memory budget.  Returns -1 when even one class does not fit, and the
+ * caller then keeps the kernels it has. */
+static int qs_mma_logch(uint32_t kmax, uint32_t matrices) {
+    for (int logch = 5; logch >= 0; logch--) {
+        const uint32_t ks = kmax << logch;
+        if (ks == 0u) continue;
+        if (qs_mma_smem_bytes(ks, matrices) <= (uint32_t)QWEN4EXP_MMA_SMEM_CAP)
+            return logch;
+    }
+    return -1;
+}
+
+/* One (row, token) tile of the gate and up projections.
+ *
+ * Grid (ceil(mid_dim / BM), ceil(n_tokens / BN)).  BM 32 by BN 64 is sixteen
+ * warps, and warp w owns the sixteen rows mb * 16 and the eight tokens nb * 8
+ * -- ONE m16n8k32 output tile, so a thread carries four output elements per
+ * matrix and the class tree costs it six registers per element rather than
+ * the thirty-two-wide array a naive reproduction of the lane partials would
+ * need.  BM 32 rather than 64 is what lets the staged chunk hold a whole
+ * class at BN 64; measured at the checkpoint's shape and 1024 tokens, one
+ * shared-expert call, best of four after two warm-ups:
+ *
+ *     BM/BN      16/32  64/64  64/32  32/32  32/64
+ *     tile (ms)  1.324  1.541  1.087  1.030  1.023
+ *
+ * against 3.22 ms for the staged dp4a pair and 7.67 ms for the per-row pair. */
+template <int LOGCH>
+__global__ __launch_bounds__(QS_MMA_THREADS) static void
+qwen4exp_shared_gateup_mma_kernel(
+        float *mid,
+        const char *gate,
+        const char *up,
+        const int8_t *xq,
+        const float *xs,
+        const int32_t *xsum,
+        uint64_t gate_row_bytes,
+        uint64_t up_row_bytes,
+        uint32_t gate_type,
+        uint32_t up_type,
+        int gate_wb,
+        int up_wb,
+        uint32_t groups,
+        uint32_t kmax,
+        uint32_t mid_dim,
+        uint32_t n_tokens) {
+    enum { CH = 1 << LOGCH, NLEV = 5 - LOGCH, NCHUNK = 1 << (5 - LOGCH) };
+    extern __shared__ __align__(16) char qwen4exp_mma_smem[];
+
+    const uint32_t ks = kmax * (uint32_t)CH;
+    const uint32_t ld = qs_mma_ld(ks);
+    int8_t *sAg = (int8_t *)qwen4exp_mma_smem;
+    int8_t *sAu = sAg + (uint32_t)QS_MMA_BM * ld;
+    int8_t *sB  = sAu + (uint32_t)QS_MMA_BM * ld;
+    float *sWAg = (float *)(sB + (uint32_t)QS_MMA_BN * ld);
+    float *sWBg = sWAg + (uint32_t)QS_MMA_BM * ks;
+    float *sWAu = sWBg + (uint32_t)QS_MMA_BM * ks;
+    float *sWBu = sWAu + (uint32_t)QS_MMA_BM * ks;
+    float *sXS  = sWBu + (uint32_t)QS_MMA_BM * ks;
+    float *sXSUM = sXS + (uint32_t)QS_MMA_BN * ks;
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t warp = tid >> 5;
+    const uint32_t lane = tid & 31u;
+    const uint32_t mb = warp / (uint32_t)QS_MMA_NB;
+    const uint32_t nb = warp - mb * (uint32_t)QS_MMA_NB;
+    const uint32_t row0 = blockIdx.x * (uint32_t)QS_MMA_BM;
+    const uint32_t tok0 = blockIdx.y * (uint32_t)QS_MMA_BN;
+    if (row0 >= mid_dim || tok0 >= n_tokens) return;
+
+    const uint32_t ar = mb * 16u + (lane >> 2);
+    const uint32_t ak = (lane & 3u) * 4u;
+    const uint32_t bn = nb * 8u + (lane >> 2);
+    const uint32_t m0 = mb * 16u + (lane >> 2);
+    const uint32_t m1 = m0 + 8u;
+    const uint32_t n0 = nb * 8u + (lane & 3u) * 2u;
+
+    /* Across-chunk stack; the within-chunk stack is below.  Both hold the
+     * partial subtree sums of warp_sum_f32's tree, oldest in slot zero. */
+    float Sg[NLEV > 0 ? NLEV : 1][4], Su[NLEV > 0 ? NLEV : 1][4];
+    float Pg[4], Pu[4];
+#pragma unroll
+    for (int e = 0; e < 4; e++) { Pg[e] = 0.0f; Pu[e] = 0.0f; }
+#pragma unroll
+    for (int b = 0; b < (NLEV > 0 ? NLEV : 1); b++) {
+#pragma unroll
+        for (int e = 0; e < 4; e++) { Sg[b][e] = 0.0f; Su[b][e] = 0.0f; }
+    }
+
+#pragma unroll 1
+    for (uint32_t cj = 0; cj < (uint32_t)NCHUNK; cj++) {
+        __syncthreads();
+        /* Weight tile.  Slot s of a row is class jj of this chunk at its
+         * k-th group; a row past the matrix or a class past the last group
+         * is zeroed, and a zero row contributes zero to an integer dot. */
+        for (uint32_t idx = tid; idx < (uint32_t)QS_MMA_BM * ks;
+             idx += (uint32_t)QS_MMA_THREADS) {
+            const uint32_t r = idx / ks;
+            const uint32_t s = idx - r * ks;
+            const uint32_t jj = s / kmax;
+            const uint32_t kk = s - jj * kmax;
+            const uint32_t c = qs_rev5(cj * (uint32_t)CH + jj);
+            const uint32_t g = c + kk * 32u;
+            const uint32_t mrow = row0 + r;
+            int8_t wq[32];
+            float wa[2], wb[2];
+            int halves = 1;
+            if (mrow < mid_dim && g < groups) {
+                dev_qwen4exp_group_decode(gate_type,
+                        gate + (uint64_t)mrow * gate_row_bytes, g,
+                        wq, wa, wb, &halves);
+                qw_tile_store_group(&sAg[r * ld + s * 32u], wq);
+                sWAg[r * ks + s] = wa[0];
+                sWBg[r * ks + s] = wb[0];
+                dev_qwen4exp_group_decode(up_type,
+                        up + (uint64_t)mrow * up_row_bytes, g,
+                        wq, wa, wb, &halves);
+                qw_tile_store_group(&sAu[r * ld + s * 32u], wq);
+                sWAu[r * ks + s] = wa[0];
+                sWBu[r * ks + s] = wb[0];
+            } else {
+                qw_tile_store_zero(&sAg[r * ld + s * 32u]);
+                qw_tile_store_zero(&sAu[r * ld + s * 32u]);
+                sWAg[r * ks + s] = 0.0f; sWBg[r * ks + s] = 0.0f;
+                sWAu[r * ks + s] = 0.0f; sWBu[r * ks + s] = 0.0f;
+            }
+        }
+        /* Activation tile.  Same slot map, one row per token of the tile. */
+        for (uint32_t idx = tid; idx < (uint32_t)QS_MMA_BN * ks;
+             idx += (uint32_t)QS_MMA_THREADS) {
+            const uint32_t tk = idx / ks;
+            const uint32_t s = idx - tk * ks;
+            const uint32_t jj = s / kmax;
+            const uint32_t kk = s - jj * kmax;
+            const uint32_t c = qs_rev5(cj * (uint32_t)CH + jj);
+            const uint32_t g = c + kk * 32u;
+            const uint32_t tok = tok0 + tk;
+            if (tok < n_tokens && g < groups) {
+                const uint64_t at = (uint64_t)tok * groups + g;
+                qw_tile_copy_group(&sB[tk * ld + s * 32u], xq + at * 32u);
+                sXS[tk * ks + s] = xs[at];
+                sXSUM[tk * ks + s] = (float)xsum[at];
+            } else {
+                qw_tile_store_zero(&sB[tk * ld + s * 32u]);
+                sXS[tk * ks + s] = 0.0f;
+                sXSUM[tk * ks + s] = 0.0f;
+            }
+        }
+        __syncthreads();
+
+        float Wg[LOGCH > 0 ? LOGCH : 1][4], Wu[LOGCH > 0 ? LOGCH : 1][4];
+#pragma unroll
+        for (int b = 0; b < (LOGCH > 0 ? LOGCH : 1); b++) {
+#pragma unroll
+            for (int e = 0; e < 4; e++) { Wg[b][e] = 0.0f; Wu[b][e] = 0.0f; }
+        }
+
+#pragma unroll
+        for (int jj = 0; jj < CH; jj++) {
+            const uint32_t c = qs_rev5(cj * (uint32_t)CH + (uint32_t)jj);
+            const uint32_t nk = c < groups ? ((groups - c + 31u) >> 5) : 0u;
+#pragma unroll
+            for (int e = 0; e < 4; e++) { Pg[e] = 0.0f; Pu[e] = 0.0f; }
+            /* P(c): the groups c, c + 32, c + 64 ... in ascending order,
+             * which is the order lane c walked them in. */
+            for (uint32_t kk = 0; kk < nk; kk++) {
+                const uint32_t s = (uint32_t)jj * kmax + kk;
+                const uint32_t koff = s * 32u;
+                uint32_t ag[4], au[4], bf[2];
+#pragma unroll
+                for (int r = 0; r < 4; r++) {
+                    const uint32_t rr = ar + ((r & 1) ? 8u : 0u);
+                    const uint32_t kx = koff + ak + ((r & 2) ? 16u : 0u);
+                    ag[r] = qw_tile_word(&sAg[rr * ld + kx]);
+                    au[r] = qw_tile_word(&sAu[rr * ld + kx]);
+                }
+                bf[0] = qw_tile_word(&sB[bn * ld + koff + (lane & 3u) * 4u]);
+                bf[1] = qw_tile_word(&sB[bn * ld + koff + (lane & 3u) * 4u + 16u]);
+                int32_t dg[4] = {0, 0, 0, 0}, du[4] = {0, 0, 0, 0};
+                qw_mma_m16n8k32(dg, ag, bf);
+                qw_mma_m16n8k32(du, au, bf);
+#pragma unroll
+                for (int r = 0; r < 4; r++) {
+                    const uint32_t mr = (r & 2) ? m1 : m0;
+                    const uint32_t nn = n0 + (uint32_t)(r & 1);
+                    const float sc = sXS[nn * ks + s];
+                    const float sm = sXSUM[nn * ks + s];
+                    qwen4exp_mma_accumulate(&Pg[r], sWAg[mr * ks + s],
+                                            sWBg[mr * ks + s], dg[r], sc, sm,
+                                            gate_wb);
+                    qwen4exp_mma_accumulate(&Pu[r], sWAu[mr * ks + s],
+                                            sWBu[mr * ks + s], du[r], sc, sm,
+                                            up_wb);
+                }
+            }
+            /* Streaming pairwise sum over the chunk's classes; every
+             * condition here is a compile-time constant. */
+#pragma unroll
+            for (int b = 0; b < LOGCH; b++) {
+                const int m = (1 << (b + 1)) - 1;
+                if ((jj & m) == m) {
+#pragma unroll
+                    for (int e = 0; e < 4; e++) {
+                        Pg[e] = Wg[b][e] + Pg[e];
+                        Pu[e] = Wu[b][e] + Pu[e];
+                    }
+                }
+            }
+#pragma unroll
+            for (int b = 0; b < LOGCH; b++) {
+                const int lm = (1 << b) - 1;
+                if ((jj & lm) == lm && ((jj >> b) & 1) == 0) {
+#pragma unroll
+                    for (int e = 0; e < 4; e++) {
+                        Wg[b][e] = Pg[e];
+                        Wu[b][e] = Pu[e];
+                    }
+                }
+            }
+        }
+
+        /* Same streaming sum one level up, over the chunks. */
+#pragma unroll
+        for (int b = 0; b < NLEV; b++) {
+            const uint32_t m = (1u << (b + 1)) - 1u;
+            if ((cj & m) == m) {
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    Pg[e] = Sg[b][e] + Pg[e];
+                    Pu[e] = Su[b][e] + Pu[e];
+                }
+            }
+        }
+#pragma unroll
+        for (int b = 0; b < NLEV; b++) {
+            const uint32_t lm = (1u << b) - 1u;
+            if ((cj & lm) == lm && ((cj >> b) & 1u) == 0u) {
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    Sg[b][e] = Pg[e];
+                    Su[b][e] = Pu[e];
+                }
+            }
+        }
+    }
+
+    /* The last chunk carries every bit set, so nothing was stacked and the
+     * total is in P.  Same epilogue expression as the staged kernel. */
+#pragma unroll
+    for (int r = 0; r < 4; r++) {
+        const uint32_t mr = (r & 2) ? m1 : m0;
+        const uint32_t nn = n0 + (uint32_t)(r & 1);
+        const uint32_t mrow = row0 + mr;
+        const uint32_t tok = tok0 + nn;
+        if (mrow < mid_dim && tok < n_tokens) {
+            const float g = Pg[r];
+            const float u = Pu[r];
+            mid[(uint64_t)tok * mid_dim + mrow] = (g / (1.0f + expf(-g))) * u;
+        }
+    }
+}
+
+/* The down projection on the same tile and the same class walk. */
+template <int LOGCH>
+__global__ __launch_bounds__(QS_MMA_THREADS) static void
+qwen4exp_shared_down_mma_kernel(
+        float *out,
+        const char *down,
+        const int8_t *mq,
+        const float *ms,
+        const int32_t *msum,
+        const float *gate_scale,
+        uint64_t down_row_bytes,
+        uint32_t down_type,
+        int down_wb,
+        uint32_t groups,
+        uint32_t kmax,
+        uint32_t out_dim,
+        uint32_t n_tokens) {
+    enum { CH = 1 << LOGCH, NLEV = 5 - LOGCH, NCHUNK = 1 << (5 - LOGCH) };
+    extern __shared__ __align__(16) char qwen4exp_mma_smem[];
+
+    const uint32_t ks = kmax * (uint32_t)CH;
+    const uint32_t ld = qs_mma_ld(ks);
+    int8_t *sA = (int8_t *)qwen4exp_mma_smem;
+    int8_t *sB = sA + (uint32_t)QS_MMA_BM * ld;
+    float *sWA = (float *)(sB + (uint32_t)QS_MMA_BN * ld);
+    float *sWB = sWA + (uint32_t)QS_MMA_BM * ks;
+    float *sXS = sWB + (uint32_t)QS_MMA_BM * ks;
+    float *sXSUM = sXS + (uint32_t)QS_MMA_BN * ks;
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t warp = tid >> 5;
+    const uint32_t lane = tid & 31u;
+    const uint32_t mb = warp / (uint32_t)QS_MMA_NB;
+    const uint32_t nb = warp - mb * (uint32_t)QS_MMA_NB;
+    const uint32_t row0 = blockIdx.x * (uint32_t)QS_MMA_BM;
+    const uint32_t tok0 = blockIdx.y * (uint32_t)QS_MMA_BN;
+    if (row0 >= out_dim || tok0 >= n_tokens) return;
+
+    const uint32_t ar = mb * 16u + (lane >> 2);
+    const uint32_t ak = (lane & 3u) * 4u;
+    const uint32_t bn = nb * 8u + (lane >> 2);
+    const uint32_t m0 = mb * 16u + (lane >> 2);
+    const uint32_t m1 = m0 + 8u;
+    const uint32_t n0 = nb * 8u + (lane & 3u) * 2u;
+
+    float S[NLEV > 0 ? NLEV : 1][4];
+    float P[4];
+#pragma unroll
+    for (int e = 0; e < 4; e++) P[e] = 0.0f;
+#pragma unroll
+    for (int b = 0; b < (NLEV > 0 ? NLEV : 1); b++) {
+#pragma unroll
+        for (int e = 0; e < 4; e++) S[b][e] = 0.0f;
+    }
+
+#pragma unroll 1
+    for (uint32_t cj = 0; cj < (uint32_t)NCHUNK; cj++) {
+        __syncthreads();
+        for (uint32_t idx = tid; idx < (uint32_t)QS_MMA_BM * ks;
+             idx += (uint32_t)QS_MMA_THREADS) {
+            const uint32_t r = idx / ks;
+            const uint32_t s = idx - r * ks;
+            const uint32_t jj = s / kmax;
+            const uint32_t kk = s - jj * kmax;
+            const uint32_t c = qs_rev5(cj * (uint32_t)CH + jj);
+            const uint32_t g = c + kk * 32u;
+            const uint32_t mrow = row0 + r;
+            int8_t wq[32];
+            float wa[2], wb[2];
+            int halves = 1;
+            if (mrow < out_dim && g < groups) {
+                dev_qwen4exp_group_decode(down_type,
+                        down + (uint64_t)mrow * down_row_bytes, g,
+                        wq, wa, wb, &halves);
+                qw_tile_store_group(&sA[r * ld + s * 32u], wq);
+                sWA[r * ks + s] = wa[0];
+                sWB[r * ks + s] = wb[0];
+            } else {
+                qw_tile_store_zero(&sA[r * ld + s * 32u]);
+                sWA[r * ks + s] = 0.0f;
+                sWB[r * ks + s] = 0.0f;
+            }
+        }
+        for (uint32_t idx = tid; idx < (uint32_t)QS_MMA_BN * ks;
+             idx += (uint32_t)QS_MMA_THREADS) {
+            const uint32_t tk = idx / ks;
+            const uint32_t s = idx - tk * ks;
+            const uint32_t jj = s / kmax;
+            const uint32_t kk = s - jj * kmax;
+            const uint32_t c = qs_rev5(cj * (uint32_t)CH + jj);
+            const uint32_t g = c + kk * 32u;
+            const uint32_t tok = tok0 + tk;
+            if (tok < n_tokens && g < groups) {
+                const uint64_t at = (uint64_t)tok * groups + g;
+                qw_tile_copy_group(&sB[tk * ld + s * 32u], mq + at * 32u);
+                sXS[tk * ks + s] = ms[at];
+                sXSUM[tk * ks + s] = (float)msum[at];
+            } else {
+                qw_tile_store_zero(&sB[tk * ld + s * 32u]);
+                sXS[tk * ks + s] = 0.0f;
+                sXSUM[tk * ks + s] = 0.0f;
+            }
+        }
+        __syncthreads();
+
+        float W[LOGCH > 0 ? LOGCH : 1][4];
+#pragma unroll
+        for (int b = 0; b < (LOGCH > 0 ? LOGCH : 1); b++) {
+#pragma unroll
+            for (int e = 0; e < 4; e++) W[b][e] = 0.0f;
+        }
+
+#pragma unroll
+        for (int jj = 0; jj < CH; jj++) {
+            const uint32_t c = qs_rev5(cj * (uint32_t)CH + (uint32_t)jj);
+            const uint32_t nk = c < groups ? ((groups - c + 31u) >> 5) : 0u;
+#pragma unroll
+            for (int e = 0; e < 4; e++) P[e] = 0.0f;
+            for (uint32_t kk = 0; kk < nk; kk++) {
+                const uint32_t s = (uint32_t)jj * kmax + kk;
+                const uint32_t koff = s * 32u;
+                uint32_t af[4], bf[2];
+#pragma unroll
+                for (int r = 0; r < 4; r++) {
+                    const uint32_t rr = ar + ((r & 1) ? 8u : 0u);
+                    const uint32_t kx = koff + ak + ((r & 2) ? 16u : 0u);
+                    af[r] = qw_tile_word(&sA[rr * ld + kx]);
+                }
+                bf[0] = qw_tile_word(&sB[bn * ld + koff + (lane & 3u) * 4u]);
+                bf[1] = qw_tile_word(&sB[bn * ld + koff + (lane & 3u) * 4u + 16u]);
+                int32_t d[4] = {0, 0, 0, 0};
+                qw_mma_m16n8k32(d, af, bf);
+#pragma unroll
+                for (int r = 0; r < 4; r++) {
+                    const uint32_t mr = (r & 2) ? m1 : m0;
+                    const uint32_t nn = n0 + (uint32_t)(r & 1);
+                    qwen4exp_mma_accumulate(&P[r], sWA[mr * ks + s],
+                                            sWB[mr * ks + s], d[r],
+                                            sXS[nn * ks + s],
+                                            sXSUM[nn * ks + s], down_wb);
+                }
+            }
+#pragma unroll
+            for (int b = 0; b < LOGCH; b++) {
+                const int m = (1 << (b + 1)) - 1;
+                if ((jj & m) == m) {
+#pragma unroll
+                    for (int e = 0; e < 4; e++) P[e] = W[b][e] + P[e];
+                }
+            }
+#pragma unroll
+            for (int b = 0; b < LOGCH; b++) {
+                const int lm = (1 << b) - 1;
+                if ((jj & lm) == lm && ((jj >> b) & 1) == 0) {
+#pragma unroll
+                    for (int e = 0; e < 4; e++) W[b][e] = P[e];
+                }
+            }
+        }
+
+#pragma unroll
+        for (int b = 0; b < NLEV; b++) {
+            const uint32_t m = (1u << (b + 1)) - 1u;
+            if ((cj & m) == m) {
+#pragma unroll
+                for (int e = 0; e < 4; e++) P[e] = S[b][e] + P[e];
+            }
+        }
+#pragma unroll
+        for (int b = 0; b < NLEV; b++) {
+            const uint32_t lm = (1u << b) - 1u;
+            if ((cj & lm) == lm && ((cj >> b) & 1u) == 0u) {
+#pragma unroll
+                for (int e = 0; e < 4; e++) S[b][e] = P[e];
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < 4; r++) {
+        const uint32_t mr = (r & 2) ? m1 : m0;
+        const uint32_t nn = n0 + (uint32_t)(r & 1);
+        const uint32_t mrow = row0 + mr;
+        const uint32_t tok = tok0 + nn;
+        if (mrow < out_dim && tok < n_tokens) {
+            const uint64_t off = (uint64_t)tok * out_dim + mrow;
+            out[off] += gate_scale[tok] * P[r];
+        }
+    }
+}
+
+/* Does this call take the tile?
+ *
+ * DS4_QWEN4EXP_SHARED_MMA is the kill switch and the test handle: "0" keeps
+ * the kernels this file shipped with before, "1" asks for the tile at every
+ * width so the test can sweep the tails it would otherwise never reach.
+ * Unset -- which is what the ranked harness runs, since it may clear the
+ * environment -- is the shipping behaviour: the tile at and above
+ * QWEN4EXP_MMA_MIN_TOKENS, the old kernels below it.
+ *
+ * It also stands down whenever DS4_QWEN4EXP_SHARED_STAGE or
+ * DS4_QWEN4EXP_MOE_R is set, because those select among the kernels BELOW it
+ * and must keep selecting among them; when the type is Q6_K, whose group is
+ * two dots of sixteen; and when the staged chunk does not fit shared memory.
+ * Every decline lands on a kernel that produces the same bits. */
+/* How many tile launches the shared expert has made in this process.  A test
+ * that compares the tile against the dp4a kernels has to know the tile
+ * actually ran: every reason qwen4exp_shared_mma_ok declines is silent by
+ * design, and a comparison of the old path against itself passes for free. */
+extern "C" { unsigned long long ds4_gpu_qwen4exp_shared_mma_launches = 0ull; }
+
+static int qwen4exp_shared_mma_ok(const uint32_t *types, uint32_t n_types,
+                                  uint32_t groups, uint32_t n_tokens,
+                                  uint32_t matrices, int *logch_out) {
+    const char *sel = getenv("DS4_QWEN4EXP_SHARED_MMA");
+    const int forced = sel && sel[0] == '1' && sel[1] == '\0';
+    if (sel && sel[0] == '0' && sel[1] == '\0') return 0;
+    if (getenv("DS4_QWEN4EXP_SHARED_STAGE")) return 0;
+    if (getenv("DS4_QWEN4EXP_MOE_R")) return 0;
+    if (groups == 0u) return 0;
+    for (uint32_t i = 0; i < n_types; i++) {
+        /* The types whose group decodes to ONE (wa, wb) pair over all
+         * thirty-two quants -- the ones m16n8k32 can take whole.  Q6_K's
+         * scale changes every sixteen, so its group is two dots of sixteen
+         * and it keeps the dp4a kernels; anything the decoder does not know
+         * returns zeros there and must keep returning them here. */
+        if (types[i] != (uint32_t)DS4_QWEN4EXP_TY_q8_0 &&
+            types[i] != (uint32_t)DS4_QWEN4EXP_TY_q5_1 &&
+            types[i] != (uint32_t)DS4_QWEN4EXP_TY_q4_K &&
+            types[i] != (uint32_t)DS4_QWEN4EXP_TY_q5_K) return 0;
+    }
+    if (!forced && n_tokens < (uint32_t)QWEN4EXP_MMA_MIN_TOKENS) return 0;
+    const uint32_t kmax = (groups + 31u) / 32u;
+    const int logch = qs_mma_logch(kmax, matrices);
+    if (logch < 0) return 0;
+    *logch_out = logch;
+    return 1;
+}
+
+/* The launcher's switch over the staged-chunk width.  Every arm is the same
+ * kernel; LOGCH only moves where the barrier falls. */
+#define QS_MMA_DISPATCH(KERNEL, LOGCH, GRID, SMEM, STREAM, ...)              \
+    do {                                                                     \
+        switch (LOGCH) {                                                     \
+        case 0: KERNEL<0><<<GRID, QS_MMA_THREADS, SMEM, STREAM>>>(__VA_ARGS__); break; \
+        case 1: KERNEL<1><<<GRID, QS_MMA_THREADS, SMEM, STREAM>>>(__VA_ARGS__); break; \
+        case 2: KERNEL<2><<<GRID, QS_MMA_THREADS, SMEM, STREAM>>>(__VA_ARGS__); break; \
+        case 3: KERNEL<3><<<GRID, QS_MMA_THREADS, SMEM, STREAM>>>(__VA_ARGS__); break; \
+        case 4: KERNEL<4><<<GRID, QS_MMA_THREADS, SMEM, STREAM>>>(__VA_ARGS__); break; \
+        default: KERNEL<5><<<GRID, QS_MMA_THREADS, SMEM, STREAM>>>(__VA_ARGS__); break; \
+        }                                                                    \
+    } while (0)
+
 __global__ static void qwen4exp_shared_gate_kernel(
         float *gate_out,
         const char *router,
@@ -3530,7 +4189,58 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_tensor(
         getenv("DS4_QWEN4EXP_MOE_R") == NULL;
     const uint32_t mma_tiles = (n_tokens + QW_SH_BN - 1u) / QW_SH_BN;
 
-    if (use_mma) {
+    /* Two tensor-core tiles now sit here.  Both return the per-row kernels'
+     * bits; they differ in how they get there and in what they cover, so the
+     * choice is a speed choice and DS4_QWEN4EXP_SHARED_MMA switches between
+     * them without changing a number:
+     *
+     *   unset (the shipping default, and what a cleared harness environment
+     *          gives)  -- the class-major tile below, when it takes the call;
+     *   "0"           -- decline it, and the call lands on the Q8_0 tile that
+     *                    was here before, which is the current tip's
+     *                    behaviour exactly;
+     *   "1"           -- the class-major tile at every width, which is how
+     *                    the test sweeps the tails.
+     *
+     * The class-major tile also covers Q5_1, Q4_K and Q5_K, which the Q8_0
+     * tile declines; those land on it instead of on the staged pair.
+     *
+     * ON DECODE-GRAPH CAPTURE.  This entry IS inside island 1 of the captured
+     * decode island (qwen4exp_graph_layer_island_encode calls the MoE block,
+     * which calls this).  Two things keep that safe.  Capture is only
+     * attempted at n_tokens <= DS4_QWEN4EXP_MTP_MAX_COMMIT, which is seven,
+     * and both tiles are gated at sixty-four, so neither can ever be a node
+     * in a captured graph: at a capture width the shared expert takes the
+     * per-row and staged dp4a kernels it took before either tile existed.
+     * And every launch here -- both tiles, both dp4a pairs, the router and
+     * the two quantise passes -- goes on `stream`, which is
+     * cuda_decode_stream(), so it is the capture stream whenever one is
+     * active.  Nothing on this path allocates or frees, so the scratch
+     * growth above and its ds4_gpu_decode_graphs_invalidate() are untouched
+     * by anything below it. */
+    const uint32_t gu_types[2] = { gate_slab->type, up_slab->type };
+    const uint32_t dn_types[1] = { down_slab->type };
+    int gu_logch = 0, dn_logch = 0;
+    const int mma_gateup = qwen4exp_shared_mma_ok(gu_types, 2u, xgroups,
+                                                  n_tokens, 2u, &gu_logch);
+    const int mma_down = qwen4exp_shared_mma_ok(dn_types, 1u, mgroups,
+                                                n_tokens, 1u, &dn_logch);
+
+    if (mma_gateup) {
+        const uint32_t ks = ((xgroups + 31u) / 32u) << gu_logch;
+        const dim3 grid((mid_dim + (uint32_t)QS_MMA_BM - 1u) / (uint32_t)QS_MMA_BM,
+                        (n_tokens + (uint32_t)QS_MMA_BN - 1u) / (uint32_t)QS_MMA_BN,
+                        1);
+        ds4_gpu_qwen4exp_shared_mma_launches++;
+        QS_MMA_DISPATCH(qwen4exp_shared_gateup_mma_kernel, gu_logch, grid,
+                        (size_t)qs_mma_smem_bytes(ks, 2u), stream,
+                        (float *)mid->ptr, gate, up, xq, xs, xsum,
+                        gate_slab->row_bytes, up_slab->row_bytes,
+                        gate_slab->type, up_slab->type,
+                        gate_slab->type != (uint32_t)DS4_QWEN4EXP_TY_q8_0,
+                        up_slab->type != (uint32_t)DS4_QWEN4EXP_TY_q8_0,
+                        xgroups, (xgroups + 31u) / 32u, mid_dim, n_tokens);
+    } else if (use_mma) {
         qwen4exp_shared_q8_mma_kernel<true><<<
                 dim3((mid_dim + QW_SH_BM - 1u) / QW_SH_BM, mma_tiles, 1),
                 QW_SH_THREADS, 0, stream>>>(
@@ -3565,7 +4275,20 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_tensor(
         return 0;
     }
 
-    if (use_mma) {
+    if (mma_down) {
+        const uint32_t ks = ((mgroups + 31u) / 32u) << dn_logch;
+        const dim3 grid((out_dim + (uint32_t)QS_MMA_BM - 1u) / (uint32_t)QS_MMA_BM,
+                        (n_tokens + (uint32_t)QS_MMA_BN - 1u) / (uint32_t)QS_MMA_BN,
+                        1);
+        ds4_gpu_qwen4exp_shared_mma_launches++;
+        QS_MMA_DISPATCH(qwen4exp_shared_down_mma_kernel, dn_logch, grid,
+                        (size_t)qs_mma_smem_bytes(ks, 1u), stream,
+                        (float *)out->ptr, down, mq, ms, msum,
+                        (const float *)gate_scale->ptr, down_slab->row_bytes,
+                        down_slab->type,
+                        down_slab->type != (uint32_t)DS4_QWEN4EXP_TY_q8_0,
+                        mgroups, (mgroups + 31u) / 32u, out_dim, n_tokens);
+    } else if (use_mma) {
         qwen4exp_shared_q8_mma_kernel<false><<<
                 dim3((out_dim + QW_SH_BM - 1u) / QW_SH_BM, mma_tiles, 1),
                 QW_SH_THREADS, 0, stream>>>(

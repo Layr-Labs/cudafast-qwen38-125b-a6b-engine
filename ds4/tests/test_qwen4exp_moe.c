@@ -528,21 +528,65 @@ static void ref_q8_0_roundtrip(const float *src, float *dst, int n) {
  * checkpoint's shared expert carries, Q6_K is the only type whose group comes
  * back in two halves, and a group's two halves are the second arm of the fold
  * the staged path has to reproduce. */
-enum { STAGE_AB_TOKENS = 200 };
+/* 1024 is the prefill chunk the tower runs, and it is the width the tile has
+ * to be right at; the sweep below it covers both sides of every gate --
+ * the per-row tile boundary (8), the staged block's span (64), the tensor-core
+ * token tile (32) and the 64-token width gate -- and the tails between them. */
+enum { STAGE_AB_TOKENS = 1024 };
 
 static const uint32_t STAGE_AB_WIDTHS[] = {
-    1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 21, 63, 64, 65, 127, 128, 129,
-    STAGE_AB_TOKENS,
+    1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 21, 31, 32, 33, 63, 64, 65, 127, 128, 129,
+    200, 255, 256, 511, 512, 1023, STAGE_AB_TOKENS,
 };
 
-static void run_shared_stage_case(const ds4_gpu_qwen4exp_slab *router_slab,
+/* The tensor-core shared expert against the same per-row oracle.
+ *
+ * The tile changes the SCHEDULE of the float sum -- one thread now owns a
+ * whole (row, token) reduction where thirty-two lanes used to share it -- so
+ * unlike the staged kernels it cannot claim exactness by "the launch shape
+ * moved and nothing else did".  It claims it by CONSTRUCTION instead: it walks
+ * the K axis class major, finishes the ascending chain over the groups
+ * c, c + 32, c + 64 ... before it starts the next class, and folds the
+ * thirty-two class partials with the streaming pairwise sum that reproduces
+ * warp_sum_f32's __shfl_down tree leaf for leaf.  Only a memcmp settles
+ * whether the construction holds, and only a launch counter settles whether
+ * the tile ran at all -- every reason it can decline is silent, and a
+ * comparison of the dp4a path against itself passes for free.
+ *
+ * The magnitude of any difference is printed whether or not it is zero,
+ * because "how far did the numbers move" is the question a golden cares
+ * about and pass/fail does not answer it. */
+extern unsigned long long ds4_gpu_qwen4exp_shared_mma_launches;
+
+static void diff_stats(const float *a, const float *b, size_t n,
+                       size_t *bad, double *max_abs, double *max_rel) {
+    *bad = 0; *max_abs = 0.0; *max_rel = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        if (memcmp(&a[i], &b[i], sizeof(float)) == 0) continue;
+        (*bad)++;
+        const double d = fabs((double)a[i] - (double)b[i]);
+        const double m = fabs((double)a[i]) > fabs((double)b[i])
+                       ? fabs((double)a[i]) : fabs((double)b[i]);
+        if (d > *max_abs) *max_abs = d;
+        if (m > 0.0 && d / m > *max_rel) *max_rel = d / m;
+    }
+}
+
+/* pass 0 is always the untouched per-row kernels.  pass 1 is whatever
+ * (env1, val1) selects -- NULL for "clear the environment and take whatever
+ * the shipping default picks at this width", which is the case that proves
+ * the sub-gate widths are unchanged. */
+static void run_shared_stage_case_env(const ds4_gpu_qwen4exp_slab *router_slab,
                                   const ds4_gpu_qwen4exp_slab *gate_slab,
                                   const ds4_gpu_qwen4exp_slab *up_slab,
                                   const ds4_gpu_qwen4exp_slab *down_slab,
                                   uint32_t in_dim, uint32_t shared_mid,
                                   uint32_t out_dim,
                                   ds4_gpu_tensor *x_t,
-                                  const char *what) {
+                                  const char *what,
+                                  const char *env1, const char *val1,
+                                  const char *how,
+                                  unsigned long long *mma_delta) {
     const size_t out_n = (size_t)STAGE_AB_TOKENS * out_dim;
     const size_t mid_n = (size_t)STAGE_AB_TOKENS * shared_mid;
     ds4_gpu_tensor *out_t = ds4_gpu_tensor_alloc((uint64_t)out_n * sizeof(float));
@@ -571,7 +615,15 @@ static void run_shared_stage_case(const ds4_gpu_qwen4exp_slab *router_slab,
             /* "1" asks for the staged kernels at EVERY width, past the
              * token count below which the launcher prefers the per-row pair
              * on speed; the tails this sweep is here to check live below it. */
-            setenv("DS4_QWEN4EXP_SHARED_STAGE", pass == 0 ? "0" : "1", 1);
+            unsetenv("DS4_QWEN4EXP_SHARED_STAGE");
+            unsetenv("DS4_QWEN4EXP_SHARED_MMA");
+            if (pass == 0) {
+                setenv("DS4_QWEN4EXP_SHARED_STAGE", "0", 1);
+            } else if (env1) {
+                setenv(env1, val1, 1);
+            }
+            const unsigned long long mma_before =
+                ds4_gpu_qwen4exp_shared_mma_launches;
             /* The down kernel ADDS into out, so both passes must start from
              * the same zeros or the comparison is meaningless. */
             require_ok(ds4_gpu_tensor_write(out_t, 0, zero,
@@ -590,33 +642,38 @@ static void run_shared_stage_case(const ds4_gpu_qwen4exp_slab *router_slab,
             require_ok(ds4_gpu_tensor_read(mid_t, 0, mid_got[pass],
                                            (uint64_t)w * shared_mid * sizeof(float)),
                        "staged shared expert mid read");
+            if (pass == 1 && mma_delta)
+                *mma_delta += ds4_gpu_qwen4exp_shared_mma_launches - mma_before;
         }
         unsetenv("DS4_QWEN4EXP_SHARED_STAGE");
+        unsetenv("DS4_QWEN4EXP_SHARED_MMA");
 
         size_t bad_mid = 0, bad_out = 0;
-        for (size_t i = 0; i < (size_t)w * shared_mid; i++) {
-            if (memcmp(&mid_got[0][i], &mid_got[1][i], sizeof(float)) != 0) bad_mid++;
-        }
-        for (size_t i = 0; i < (size_t)w * out_dim; i++) {
-            if (memcmp(&out_got[0][i], &out_got[1][i], sizeof(float)) != 0) bad_out++;
-        }
+        double abs_mid = 0.0, rel_mid = 0.0, abs_out = 0.0, rel_out = 0.0;
+        diff_stats(mid_got[0], mid_got[1], (size_t)w * shared_mid,
+                   &bad_mid, &abs_mid, &rel_mid);
+        diff_stats(out_got[0], out_got[1], (size_t)w * out_dim,
+                   &bad_out, &abs_out, &rel_out);
         if (bad_mid != 0) {
             fprintf(stderr, "staged shared gate/up (%s) at width %u: %zu of %zu "
-                            "outputs differ\n", what, w, bad_mid,
-                    (size_t)w * shared_mid);
+                            "outputs differ, max abs %.6e, max rel %.6e\n",
+                    what, w, bad_mid, (size_t)w * shared_mid, abs_mid, rel_mid);
             fail("the staged shared gate/up changed a number");
         }
         if (bad_out != 0) {
             fprintf(stderr, "staged shared down (%s) at width %u: %zu of %zu "
-                            "outputs differ\n", what, w, bad_out,
-                    (size_t)w * out_dim);
+                            "outputs differ, max abs %.6e, max rel %.6e\n",
+                    what, w, bad_out, (size_t)w * out_dim, abs_out, rel_out);
             fail("the staged shared down changed a number");
         }
     }
-    printf("shared expert staged against per-row, %s (in %u, mid %u, out %u): "
-           "%zu widths to %u tokens, every output bit-identical\n",
-           what, in_dim, shared_mid, out_dim, n_widths,
-           (unsigned)STAGE_AB_TOKENS);
+    printf("shared expert %s against per-row, %s (in %u, mid %u, out %u): "
+           "%zu widths to %u tokens, 0 of %zu gate/up and 0 of %zu down "
+           "outputs differ, max abs 0, max rel 0\n",
+           how, what, in_dim, shared_mid, out_dim, n_widths,
+           (unsigned)STAGE_AB_TOKENS,
+           (size_t)STAGE_AB_TOKENS * shared_mid,
+           (size_t)STAGE_AB_TOKENS * out_dim);
 
     for (int i = 0; i < 2; i++) { free(mid_got[i]); free(out_got[i]); }
     free(poison);
@@ -624,6 +681,72 @@ static void run_shared_stage_case(const ds4_gpu_qwen4exp_slab *router_slab,
     ds4_gpu_tensor_free(gsc_t);
     ds4_gpu_tensor_free(mid_t);
     ds4_gpu_tensor_free(out_t);
+}
+
+/* The staged kernels, as before: DS4_QWEN4EXP_SHARED_STAGE=1 asks for them at
+ * every width and stands the tile down at the same time. */
+static void run_shared_stage_case(const ds4_gpu_qwen4exp_slab *router_slab,
+                                  const ds4_gpu_qwen4exp_slab *gate_slab,
+                                  const ds4_gpu_qwen4exp_slab *up_slab,
+                                  const ds4_gpu_qwen4exp_slab *down_slab,
+                                  uint32_t in_dim, uint32_t shared_mid,
+                                  uint32_t out_dim,
+                                  ds4_gpu_tensor *x_t,
+                                  const char *what) {
+    run_shared_stage_case_env(router_slab, gate_slab, up_slab, down_slab,
+                              in_dim, shared_mid, out_dim, x_t, what,
+                              "DS4_QWEN4EXP_SHARED_STAGE", "1", "staged", NULL);
+}
+
+/* The tile, forced at every width so the sweep reaches the tails it would
+ * otherwise never see, and then the shipping default with a cleared
+ * environment -- which is what the ranked harness runs and which must pick
+ * the OLD kernels below QWEN4EXP_MMA_MIN_TOKENS and the tile above it. */
+static void run_shared_mma_case(const ds4_gpu_qwen4exp_slab *router_slab,
+                                const ds4_gpu_qwen4exp_slab *gate_slab,
+                                const ds4_gpu_qwen4exp_slab *up_slab,
+                                const ds4_gpu_qwen4exp_slab *down_slab,
+                                uint32_t in_dim, uint32_t shared_mid,
+                                uint32_t out_dim,
+                                ds4_gpu_tensor *x_t,
+                                const char *what, int gu_tile, int dn_tile) {
+    unsigned long long forced = 0, dflt = 0, off = 0;
+    run_shared_stage_case_env(router_slab, gate_slab, up_slab, down_slab,
+                              in_dim, shared_mid, out_dim, x_t, what,
+                              "DS4_QWEN4EXP_SHARED_MMA", "1",
+                              "tensor-core tile at every width", &forced);
+    /* The kill switch: the class-major tile stands down and the call lands on
+     * the Q8_0 tile that was here before it, which is the current tip's
+     * dispatch exactly.  That path has to hold the same bits too, or the
+     * switch is not a switch. */
+    run_shared_stage_case_env(router_slab, gate_slab, up_slab, down_slab,
+                              in_dim, shared_mid, out_dim, x_t, what,
+                              "DS4_QWEN4EXP_SHARED_MMA", "0",
+                              "the tile it replaces (SHARED_MMA=0)", &off);
+    if (off != 0ull)
+        fail("DS4_QWEN4EXP_SHARED_MMA=0 did not stand the class-major tile down");
+    run_shared_stage_case_env(router_slab, gate_slab, up_slab, down_slab,
+                              in_dim, shared_mid, out_dim, x_t, what,
+                              NULL, NULL, "shipping default", &dflt);
+    size_t wide = 0;
+    for (size_t i = 0; i < sizeof(STAGE_AB_WIDTHS) / sizeof(STAGE_AB_WIDTHS[0]);
+         i++) {
+        if (STAGE_AB_WIDTHS[i] >= 64u) wide++;
+    }
+    printf("  tile launches: %llu forced over %zu widths, %llu at the "
+           "shipping default over the %zu widths at or above the 64-token "
+           "gate (two launches a width: gate/up and down)\n",
+           forced, sizeof(STAGE_AB_WIDTHS) / sizeof(STAGE_AB_WIDTHS[0]),
+           dflt, wide);
+    const unsigned long long per_width =
+        (unsigned long long)(gu_tile ? 1 : 0) + (unsigned long long)(dn_tile ? 1 : 0);
+    const size_t n_w = sizeof(STAGE_AB_WIDTHS) / sizeof(STAGE_AB_WIDTHS[0]);
+    if (forced != per_width * (unsigned long long)n_w)
+        fail("the tile did not run at exactly the projections it must take "
+             "when it is forced at every width");
+    if (dflt != per_width * (unsigned long long)wide)
+        fail("the shipping default did not take the tile at exactly the "
+             "widths at or above the gate");
 }
 
 static void run_shared_stage_cases(const uint8_t *model, uint64_t model_bytes,
@@ -687,6 +810,22 @@ static void run_shared_stage_cases(const uint8_t *model, uint64_t model_bytes,
     run_shared_stage_case(&router, &q6k_gate, &q6k_up, &q80_down,
                           IN_DIM, SHARED_MID, OUT_DIM, x_t,
                           "Q6_K gate/up, Q8_0 down");
+
+    /* The same four type pairs through the tensor-core tile.  Q6_K must
+     * DECLINE -- its scale changes inside a group, so m16n8k32 cannot take
+     * the group whole -- and the other three must run and match to the bit. */
+    run_shared_mma_case(&router, &q80_gate, &q80_up, &q80_down,
+                        IN_DIM, SHARED_MID, OUT_DIM, x_t,
+                        "Q8_0 gate/up, Q8_0 down", 1, 1);
+    run_shared_mma_case(&router, &q4k_gate, &q4k_up, &q51_down,
+                        IN_DIM, SHARED_MID, OUT_DIM, x_t,
+                        "Q4_K gate/up, Q5_1 down", 1, 1);
+    run_shared_mma_case(&router, &q5k_gate, &q5k_up, &q80_down,
+                        IN_DIM, SHARED_MID, OUT_DIM, x_t,
+                        "Q5_K gate/up, Q8_0 down", 1, 1);
+    run_shared_mma_case(&router, &q6k_gate, &q6k_up, &q80_down,
+                        IN_DIM, SHARED_MID, OUT_DIM, x_t,
+                        "Q6_K gate/up, Q8_0 down", 0, 1);
 
     ds4_gpu_tensor_free(x_t);
     free(x);
@@ -1538,6 +1677,18 @@ static void run_production_expert_cases(void) {
             run_shared_stage_case(&router, &g_slab, &u_slab, &d_slab,
                                   PROD_IN_DIM, PROD_MID_DIM, PROD_OUT_DIM,
                                   sx_t, label);
+            /* And the same pairs through the tile at the shape the tower
+             * actually runs: in 2560, so a gate/up row is EIGHTY groups and a
+             * class holds two or three of them chained in ascending order --
+             * the case the small shape above cannot reach, because eight
+             * groups leave every class with at most one and no chain to get
+             * wrong.  Down is twenty groups over thirty-two classes, so
+             * twelve of the tree's leaves are the exact zero the empty lanes
+             * contributed. */
+            run_shared_mma_case(&router, &g_slab, &u_slab, &d_slab,
+                                PROD_IN_DIM, PROD_MID_DIM, PROD_OUT_DIM,
+                                sx_t, label,
+                                gt != TYPE_Q6_K, dt != TYPE_Q6_K);
         }
         ds4_gpu_tensor_free(sx_t);
         free(sx);
