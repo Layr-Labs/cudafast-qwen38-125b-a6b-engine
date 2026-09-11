@@ -574,8 +574,59 @@ static int cuda_span_fully_replaced(
     return 1;
 }
 
+/* ------------------------------------------------------------------------
+ * Scratch for the forked half of a side-stream region.
+ *
+ * cuda_tmp_alloc hands out ONE slab per tier, and every Q8_0 projection
+ * stages its quantised activations into it.  Two such projections running
+ * CONCURRENTLY on two streams would therefore overwrite each other's rows --
+ * a race whose symptom is a wrong token, not a crash.  While a fork region is
+ * open (g_side_state == 1) every scratch request is served from this second
+ * slab instead, so the two halves never share a byte.  See the side-stream
+ * block further down for the fork/join contract itself.
+ *
+ * This is activation staging and nothing else: it holds one call's quantised
+ * rows and the next call overwrites them.  No weight is copied here.
+ *
+ * No captured decode graph can hold an address from this slab, because
+ * ds4_gpu_side_stream_begin() refuses to fork while a capture or replay is in
+ * flight.  Growth still synchronises before the free: the side stream may
+ * still be reading the slab it is replacing.
+ * ------------------------------------------------------------------------ */
+static int g_side_state = 0;   /* 0 idle, 1 forked, 2 detached (join owed) */
+static void     *g_side_tmp = NULL;
+static uint64_t  g_side_tmp_bytes = 0;
+
+static void *cuda_side_tmp_alloc(uint64_t bytes, const char *what) {
+    if (g_side_tmp_bytes >= bytes) return g_side_tmp;
+    if (g_side_tmp) {
+        if (!cuda_ok(cudaDeviceSynchronize(),
+                     "synchronize CUDA side scratch growth")) {
+            return NULL;
+        }
+        (void)cudaFree(g_side_tmp);
+        g_side_tmp = NULL;
+        g_side_tmp_bytes = 0;
+    }
+    void *ptr = NULL;
+    cudaError_t err = cudaMalloc(&ptr, (size_t)bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA side scratch alloc failed for %s (%.2f MiB): %s\n",
+                what ? what : "scratch", (double)bytes / 1048576.0,
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    g_side_tmp = ptr;
+    g_side_tmp_bytes = bytes;
+    return g_side_tmp;
+}
+
 static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
+    /* Inside a fork region the caller's kernels run beside the main stream's;
+     * they must not stage into the slab those are staging into. */
+    if (g_side_state == 1) return cuda_side_tmp_alloc(bytes, what);
     if (g_cuda_tmp_bytes >= bytes) return g_cuda_tmp;
     if (g_cuda_tmp) {
         if (!cuda_ok(cudaDeviceSynchronize(),
@@ -977,12 +1028,158 @@ extern "C" int ds4_gpu_decode_graphs_supported(void) {
     return enabled && g_n_gpus == 1;
 }
 
+/* ------------------------------------------------------------------------
+ * The side stream.
+ *
+ * Every kernel in the qwen4exp tower rides cuda_decode_stream(), so the whole
+ * forward is one serial chain.  Some of that chain is two chains: the QSA
+ * layer's indexer (key/query projections, the exact key tape, the pooled
+ * blocks and the block scores) reads the block input and nothing the QSA
+ * projections write, and the QSA projections read the block input and nothing
+ * the indexer writes.  They meet again only at the attention, which needs the
+ * rotated queries from one and the selected blocks from the other.
+ *
+ * The indexer half is small -- a bf16 matvec per projection, a tape append of
+ * one block, a pooled-block update every fourth decode, a per-head norm, a
+ * partial rope and one score kernel -- and it sits in front of the QSA
+ * projections' thirty-six megabytes of Q8_0 weight reads.  Running it on its
+ * own stream puts it underneath them.
+ *
+ * The stream is created NON-BLOCKING on purpose.  A default (blocking) stream
+ * implicitly serialises against the legacy NULL stream, which is exactly what
+ * the decode-graph capture stream wants and exactly what this one must not
+ * have: with implicit serialisation there would be no overlap at all.  The
+ * ordering is therefore ENTIRELY explicit, through two events:
+ *
+ *   begin()  records fork_event on the main stream and makes the side stream
+ *            wait on it.  Everything the main stream has already issued --
+ *            including a decode-island graph replay, which runs on a BLOCKING
+ *            stream and so is already ordered before anything issued on the
+ *            legacy stream -- completes before the side stream starts.
+ *   detach() records join_event on the side stream and routes subsequent
+ *            launches back to the main stream.  It does NOT make the main
+ *            stream wait, so the caller can issue the long half next.
+ *   join()   makes the main stream wait on join_event.  Nothing issued after
+ *            it can observe a half-written side-stream buffer.
+ *
+ * ON DECODE-GRAPH CAPTURE.  begin() REFUSES while a capture or replay is in
+ * flight (g_decode_graph_capturing).  Multi-stream capture is legal but only
+ * with a fork/join pair inside the captured region, and the one caller of
+ * this API -- the QSA block -- runs outside both islands anyway, so the
+ * captured islands keep the exact launch sequence they have today.  This is
+ * a hard refusal rather than a convention: no side-stream work can reach a
+ * capture even if a future caller forgets.
+ *
+ * DS4_QWEN4EXP_QSA_OVERLAP=0 (or off/no/false) pins every launch back on the
+ * main stream; the tower then issues the same kernels in the same order on
+ * one stream, which is what it did before this existed.
+ * ------------------------------------------------------------------------ */
+static cudaStream_t g_side_stream     = NULL;
+static cudaEvent_t  g_side_fork_event = NULL;
+static cudaEvent_t  g_side_join_event = NULL;
+/* g_side_state (0 idle, 1 forked, 2 detached) is declared beside the side
+ * scratch slab above, which reads it. */
+static int          g_side_broken     = 0;
+
 /* Stream the decode-island kernels launch on.  Legacy NULL stream in
  * eager mode (unchanged behavior); the capture stream while a capture
- * or replay is in flight. */
+ * or replay is in flight; the side stream inside a fork region. */
 static inline cudaStream_t cuda_decode_stream(void) {
+    if (g_side_state == 1) return g_side_stream;
     return g_decode_graph_capturing ? g_decode_graph_stream : (cudaStream_t)0;
 }
+
+static int cuda_side_stream_enabled(void) {
+    static int init = 0;
+    static int on = 0;
+    if (!init) {
+        init = 1;
+        const char *s = getenv("DS4_QWEN4EXP_QSA_OVERLAP");
+        const int off = s && *s &&
+            (s[0] == '0' ||
+             strcmp(s, "off") == 0 || strcmp(s, "OFF") == 0 ||
+             strcmp(s, "no") == 0 || strcmp(s, "NO") == 0 ||
+             strcmp(s, "false") == 0 || strcmp(s, "FALSE") == 0);
+        if (off) {
+            fprintf(stderr, "ds4: DS4_QWEN4EXP_QSA_OVERLAP=%s - side stream disabled\n", s);
+        }
+        on = !off;
+    }
+    return on && !g_side_broken && g_n_gpus == 1;
+}
+
+/* A failed event call leaves the two streams unordered, which would be a
+ * silent wrong answer.  Retire the side stream and join everything the hard
+ * way instead; the caller's next begin() refuses and the tower runs serial. */
+static void cuda_side_stream_fail(const char *what, cudaError_t err) {
+    fprintf(stderr, "ds4: side stream %s failed: %s - joining and disabling\n",
+            what, cudaGetErrorString(err));
+    (void)cudaGetLastError();
+    g_side_broken = 1;
+    g_side_state = 0;
+    (void)cudaDeviceSynchronize();
+}
+
+extern "C" int ds4_gpu_side_stream_begin(void) {
+    if (g_side_state != 0) return 0;            /* no nesting */
+    if (g_decode_graph_capturing) return 0;     /* never inside a capture */
+    if (!cuda_side_stream_enabled()) return 0;
+    if (!g_side_stream) {
+        cudaError_t err = cudaStreamCreateWithFlags(&g_side_stream,
+                                                    cudaStreamNonBlocking);
+        if (err == cudaSuccess) {
+            err = cudaEventCreateWithFlags(&g_side_fork_event,
+                                           cudaEventDisableTiming);
+        }
+        if (err == cudaSuccess) {
+            err = cudaEventCreateWithFlags(&g_side_join_event,
+                                           cudaEventDisableTiming);
+        }
+        if (err != cudaSuccess) {
+            if (g_side_join_event) { (void)cudaEventDestroy(g_side_join_event); }
+            if (g_side_fork_event) { (void)cudaEventDestroy(g_side_fork_event); }
+            if (g_side_stream) { (void)cudaStreamDestroy(g_side_stream); }
+            g_side_join_event = NULL;
+            g_side_fork_event = NULL;
+            g_side_stream = NULL;
+            fprintf(stderr, "ds4: side stream create failed: %s - staying serial\n",
+                    cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            g_side_broken = 1;
+            return 0;
+        }
+    }
+    cudaError_t err = cudaEventRecord(g_side_fork_event, cuda_decode_stream());
+    if (err != cudaSuccess) { cuda_side_stream_fail("fork record", err); return 0; }
+    err = cudaStreamWaitEvent(g_side_stream, g_side_fork_event, 0);
+    if (err != cudaSuccess) { cuda_side_stream_fail("fork wait", err); return 0; }
+    g_side_state = 1;
+    return 1;
+}
+
+extern "C" int ds4_gpu_side_stream_detach(void) {
+    if (g_side_state != 1) return 0;
+    g_side_state = 2;   /* launches route back to the main stream from here */
+    cudaError_t err = cudaEventRecord(g_side_join_event, g_side_stream);
+    if (err != cudaSuccess) { cuda_side_stream_fail("join record", err); return 0; }
+    return 1;
+}
+
+extern "C" int ds4_gpu_side_stream_join(void) {
+    if (g_side_state == 1) {
+        /* An error path that never reached detach().  Close the region the
+         * conservative way rather than leaving the state machine armed. */
+        if (!ds4_gpu_side_stream_detach()) return 0;
+    }
+    if (g_side_state != 2) return 0;
+    g_side_state = 0;
+    cudaError_t err = cudaStreamWaitEvent(cuda_decode_stream(),
+                                          g_side_join_event, 0);
+    if (err != cudaSuccess) { cuda_side_stream_fail("join wait", err); return 0; }
+    return 1;
+}
+
+
 
 static void cuda_decode_graph_entry_kill(cuda_decode_graph_entry *e) {
     if (e->exec) {
@@ -3009,6 +3206,15 @@ extern "C" int ds4_gpu_init(void) {
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
     g_current_logical_tier = -1;
+
+    /* The side stream and its two events, and the scratch slab a fork region
+     * stages into.  The device synchronise above has already drained the
+     * stream, so nothing here can be in flight. */
+    g_side_state = 0;
+    if (g_side_join_event) { (void)cudaEventDestroy(g_side_join_event); g_side_join_event = NULL; }
+    if (g_side_fork_event) { (void)cudaEventDestroy(g_side_fork_event); g_side_fork_event = NULL; }
+    if (g_side_stream) { (void)cudaStreamDestroy(g_side_stream); g_side_stream = NULL; }
+    if (g_side_tmp) { (void)cudaFree(g_side_tmp); g_side_tmp = NULL; g_side_tmp_bytes = 0; }
 
     /* Multi-GPU teardown: events, streams, cublas handles, scratch
      * slabs, per-pair bounce buffers. */

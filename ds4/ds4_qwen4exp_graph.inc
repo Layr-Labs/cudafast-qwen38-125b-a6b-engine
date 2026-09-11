@@ -1357,6 +1357,46 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
     return true;
 }
 
+/* The widest call the QSA fork is taken on.
+ *
+ * DECODE WIDTHS ONLY, and measured rather than assumed.  Running the indexer
+ * and the k/v projections beside the q projection helps exactly while the q
+ * projection leaves the device with warps to spare; once the call is wide
+ * enough to fill it on its own, splitting the work across two streams only
+ * adds contention.  Paired A/B of the two arrangements at checkpoint geometry
+ * on the GB10, weights rotated past the 24 MB L2, median of 200 interleaved
+ * pairs, as a ratio of serial to forked:
+ *
+ *     rows      1     2     4     8    16    24    32    48    64   512
+ *     ratio  1.12  1.04  1.08  1.08  1.06  1.03  1.01  0.98  0.99  0.96
+ *
+ * So the fork is taken to eight rows and declined above it, which keeps every
+ * decode (one row) and every speculative verify (at most
+ * DS4_QWEN4EXP_MTP_MAX_COMMIT rows) on the overlap and leaves prefill exactly
+ * the single-stream sequence it has today.  Eight is also the width this port
+ * already treats as the decode/prefill line elsewhere --
+ * DS4_QWEN4EXP_BF16_DECODE_ROWS, the Q8_0 row tile and the BF16 matvec all
+ * turn over there.
+ *
+ * DS4_QWEN4EXP_QSA_OVERLAP sweeps the line on one binary: unset is the
+ * shipping eight, "0" declines at every width (the pre-change behaviour), and
+ * any other positive integer is the threshold itself. */
+#define DS4_QWEN4EXP_QSA_OVERLAP_ROWS 8u
+
+static uint32_t qwen4exp_qsa_overlap_rows(void) {
+    static int init = 0;
+    static uint32_t rows = DS4_QWEN4EXP_QSA_OVERLAP_ROWS;
+    if (!init) {
+        init = 1;
+        const char *e = getenv("DS4_QWEN4EXP_QSA_OVERLAP");
+        if (e && *e) {
+            const long v = strtol(e, NULL, 10);
+            rows = v > 0 ? (uint32_t)v : 0u;
+        }
+    }
+    return rows;
+}
+
 static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
                                      const ds4_qwen4exp_layer_weights *l,
                                      const ds4_model *m,
@@ -1371,6 +1411,60 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
     const uint32_t n_blocks = s->plan.n_ctx / ratio;
     const uint32_t pos0 = s->pos;
 
+    /* TWO INDEPENDENT CHAINS MEET AT THE ATTENTION.
+     *
+     * Once s->mixed is quantised, everything below splits into two halves
+     * that share no buffer at all:
+     *
+     *   the INDEXER + KV half writes idx_k, idx_q, idx_tape[il],
+     *   idx_pool[il], idx_scores, qsa_kin, qsa_vin, qsa_k[il] and qsa_v[il],
+     *   and reads qsa_mixed_q8, mixed, idx_k_norm[il], idx_q_norm[il],
+     *   attn_k_norm[il], d_pos and inv_freq;
+     *
+     *   the Q half writes qsa_doubled, qsa_q and qsa_gate, and reads
+     *   qsa_mixed_q8, attn_q_norm[il], d_pos and inv_freq.
+     *
+     * qsa_mixed_q8, s->mixed, d_pos and inv_freq are the only tensors both
+     * touch and both only read them; d_pos is uploaded once at the top of the
+     * forward, so the fork event orders the side half behind it like anything
+     * else the main stream has already issued.  The halves join at the
+     * attention, which needs the rotated queries from one and the key/value
+     * cache rows and the selected blocks from the other.
+     *
+     * The q projection is 2560->12288 and the k and v projections are
+     * 2560->512 each, so the first half is a few megabytes of weight reads
+     * sitting in front of the second half's thirty-three.  Issuing it on a
+     * second stream puts it underneath them instead.  The join is taken
+     * before the top-k, which is the first op on the main stream that reads
+     * anything the side stream wrote.
+     *
+     * THE PRE-QUANTISE STAYS ON THE MAIN STREAM, ahead of the fork: all three
+     * projections read qsa_mixed_q8, so it is the last thing both halves
+     * depend on and the natural fork point.  It is also why the join matters
+     * beyond this block: qsa_mixed_q8 is one session buffer reused by every
+     * QSA layer, so the NEXT QSA layer's pre-quantise would overwrite the
+     * rows this layer's side-stream projections are still reading.  The join
+     * below is what orders that, because everything after it -- this block's
+     * tail and every later layer -- is on the main stream.
+     *
+     * SCRATCH.  Nothing in the side half asks the backend for scratch.  The
+     * three projections are pre-quantised entries that read the session
+     * buffer above and stage nothing; ds4_qwen4exp_matmul_bf16 never asks for
+     * more than eight rows at a time and the eight-row BF16 entry is a plain
+     * matvec with no staging buffer; and the pool update, the head norm, the
+     * rope, the score kernel and the fused KV prep write only the session
+     * tensors named above.  The top-k is the one op in this block that CAN
+     * take the backend's scratch slab -- its chunked tree path does -- and it
+     * is deliberately left on the main stream below the join.  The backend
+     * also serves any cuda_tmp_alloc made inside a fork region from a second
+     * slab, so a future addition to this region cannot silently share the
+     * main half's staging buffer; today nothing here exercises that path.
+     *
+     * If the fork does not take -- a backend with one stream, the kill
+     * switch, a prefill-width call, or a decode-island capture in flight --
+     * `side` is 0, every launch below stays on the main stream, and this is
+     * the same kernel sequence on one stream. */
+
     /* Pre-quantize s->mixed ONCE for Q, K, and V projections. */
     const uint64_t q8_blocks = (uint64_t)DS4_N_EMBD / 32u;
     const uint64_t q8_qbytes = (uint64_t)n_tokens * q8_blocks * 32u;
@@ -1379,43 +1473,6 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
     if (!ds4_qwen4exp_quantize_q8_0(s->mixed_q8, 0, q8_soff, s->mixed,
                                     DS4_N_EMBD, n_tokens)) {
         fprintf(stderr, "ds4: qwen4exp QSA pre-quantize failed at block %u\n", il);
-        return false;
-    }
-
-    /* Projections.  q is DOUBLED: half query, half output gate. */
-    if (!ds4_qwen4exp_matmul_q8_0_preq(s->qsa_doubled, QW_MAP(m, l->attn_q),
-                                       QW_MAPSZ(m, l->attn_q), QW_OFF(l->attn_q),
-                                       DS4_N_EMBD, cfg->qsa_q_dim,
-                                       s->mixed_q8, 0, q8_soff, n_tokens) ||
-        !ds4_qwen4exp_matmul_q8_0_preq(s->qsa_kin, QW_MAP(m, l->attn_k),
-                                       QW_MAPSZ(m, l->attn_k), QW_OFF(l->attn_k),
-                                       DS4_N_EMBD, cfg->qsa_kv_dim,
-                                       s->mixed_q8, 0, q8_soff, n_tokens) ||
-        !ds4_qwen4exp_matmul_q8_0_preq(s->qsa_vin, QW_MAP(m, l->attn_v),
-                                       QW_MAPSZ(m, l->attn_v), QW_OFF(l->attn_v),
-                                       DS4_N_EMBD, cfg->qsa_kv_dim,
-                                       s->mixed_q8, 0, q8_soff, n_tokens)) {
-        fprintf(stderr, "ds4: qwen4exp QSA projections failed at block %u\n", il);
-        return false;
-    }
-
-    /* Fused Q-Prep: split doubled-query, per-head RMS norm, and RoPE in 1 launch */
-    if (!ds4_gpu_qwen4exp_qsa_prep_q_fused_dpos_tensor(
-            s->qsa_q, s->qsa_gate, s->qsa_doubled, s->attn_q_norm[il],
-            s->inv_freq, n_tokens, DS4_N_HEAD, head_dim, DS4_N_ROT, pos0,
-            DS4_RMS_EPS, l->attn_q_norm_offset, s->d_pos)) {
-        fprintf(stderr, "ds4: qwen4exp fused Q-prep failed at block %u\n", il);
-        return false;
-    }
-
-    /* Fused KV-Prep & Append: per-head RMS norm on K, RoPE on K, and direct write into
-     * k_cache and v_cache in 1 launch (no sync CPU memcpy) */
-    if (!ds4_gpu_qwen4exp_qsa_prep_kv_append_fused_dpos_tensor(
-            s->qsa_k[il], s->qsa_v[il], s->qsa_kin, s->qsa_kin, s->qsa_vin,
-            s->attn_k_norm[il], s->inv_freq, pos0, n_tokens, DS4_N_HEAD_KV,
-            head_dim, DS4_N_ROT, s->plan.n_ctx, DS4_RMS_EPS, l->attn_k_norm_offset,
-            s->d_pos)) {
-        fprintf(stderr, "ds4: qwen4exp fused KV prep & append failed at block %u\n", il);
         return false;
     }
 
@@ -1429,12 +1486,15 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
      * and never read, so it moves under the same condition.  This removes a
      * computation whose output no reader observes; it does not change one. */
     const bool indexed = (uint64_t)pos0 + n_tokens > DS4_N_INDEXER_TOP_K;
+    const int side = n_tokens <= qwen4exp_qsa_overlap_rows()
+        ? ds4_gpu_side_stream_begin() : 0;
 
     if (!ds4_qwen4exp_matmul_bf16(s->idx_k, QW_MAP(m, l->indexer_k_proj),
                                   QW_MAPSZ(m, l->indexer_k_proj),
                                   QW_OFF(l->indexer_k_proj),
                                   DS4_N_EMBD, cfg->indexer_k_dim,
                                   s->mixed, n_tokens)) {
+        if (side) (void)ds4_gpu_side_stream_join();
         fprintf(stderr, "ds4: qwen4exp indexer projections failed at block %u\n", il);
         return false;
     }
@@ -1444,6 +1504,7 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
                                   QW_OFF(l->indexer_q_proj),
                                   DS4_N_EMBD, cfg->indexer_q_dim,
                                   s->mixed, n_tokens)) {
+        if (side) (void)ds4_gpu_side_stream_join();
         fprintf(stderr, "ds4: qwen4exp indexer projections failed at block %u\n", il);
         return false;
     }
@@ -1452,12 +1513,10 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
             s->inv_freq, pos0, n_tokens, s->plan.n_ctx,
             DS4_N_INDEXER_HEAD_DIM, ratio, DS4_N_ROT, DS4_RMS_EPS,
             l->indexer_k_norm_offset, s->d_pos)) {
+        if (side) (void)ds4_gpu_side_stream_join();
         fprintf(stderr, "ds4: qwen4exp indexer pool update failed at block %u\n", il);
         return false;
     }
-
-    const ds4_gpu_tensor *sel = NULL;
-    const ds4_gpu_tensor *counts = NULL;
     if (indexed) {
         /* The indexer's query norm.  It was bound and never applied: the k side
          * is normalised inside the pool update, and the q side simply had no
@@ -1472,8 +1531,74 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
                                                DS4_N_ROT, pos0) ||
             !ds4_gpu_qwen4exp_qsa_indexer_scores_tensor(
                 s->idx_scores, s->idx_q, s->idx_pool[il], n_tokens, n_blocks,
-                DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM, pos0, ratio) ||
-            !ds4_gpu_indexer_topk_tensor(s->idx_topk, s->idx_scores, n_blocks,
+                DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM, pos0, ratio)) {
+            if (side) (void)ds4_gpu_side_stream_join();
+            fprintf(stderr, "ds4: qwen4exp indexer selection failed at block %u\n", il);
+            return false;
+        }
+    }
+
+    /* Still on the side stream: the k and v projections and the fused KV prep
+     * that consumes them.  Their only reader below is the attention. */
+    if (!ds4_qwen4exp_matmul_q8_0_preq(s->qsa_kin, QW_MAP(m, l->attn_k),
+                                       QW_MAPSZ(m, l->attn_k), QW_OFF(l->attn_k),
+                                       DS4_N_EMBD, cfg->qsa_kv_dim,
+                                       s->mixed_q8, 0, q8_soff, n_tokens) ||
+        !ds4_qwen4exp_matmul_q8_0_preq(s->qsa_vin, QW_MAP(m, l->attn_v),
+                                       QW_MAPSZ(m, l->attn_v), QW_OFF(l->attn_v),
+                                       DS4_N_EMBD, cfg->qsa_kv_dim,
+                                       s->mixed_q8, 0, q8_soff, n_tokens)) {
+        if (side) (void)ds4_gpu_side_stream_join();
+        fprintf(stderr, "ds4: qwen4exp QSA projections failed at block %u\n", il);
+        return false;
+    }
+    if (!ds4_gpu_qwen4exp_qsa_prep_kv_append_fused_dpos_tensor(
+            s->qsa_k[il], s->qsa_v[il], s->qsa_kin, s->qsa_kin, s->qsa_vin,
+            s->attn_k_norm[il], s->inv_freq, pos0, n_tokens, DS4_N_HEAD_KV,
+            head_dim, DS4_N_ROT, s->plan.n_ctx, DS4_RMS_EPS, l->attn_k_norm_offset,
+            s->d_pos)) {
+        if (side) (void)ds4_gpu_side_stream_join();
+        fprintf(stderr, "ds4: qwen4exp fused KV prep & append failed at block %u\n", il);
+        return false;
+    }
+
+    /* Route back to the main stream; the join is owed and taken below. */
+    if (side) (void)ds4_gpu_side_stream_detach();
+
+    /* ---- main chain: the q projection -----------------------------------
+     * Projections.  q is DOUBLED: half query, half output gate. */
+    if (!ds4_qwen4exp_matmul_q8_0_preq(s->qsa_doubled, QW_MAP(m, l->attn_q),
+                                       QW_MAPSZ(m, l->attn_q), QW_OFF(l->attn_q),
+                                       DS4_N_EMBD, cfg->qsa_q_dim,
+                                       s->mixed_q8, 0, q8_soff, n_tokens)) {
+        if (side) (void)ds4_gpu_side_stream_join();
+        fprintf(stderr, "ds4: qwen4exp QSA projections failed at block %u\n", il);
+        return false;
+    }
+
+    if (!ds4_gpu_qwen4exp_qsa_prep_q_fused_dpos_tensor(
+            s->qsa_q, s->qsa_gate, s->qsa_doubled, s->attn_q_norm[il],
+            s->inv_freq, n_tokens, DS4_N_HEAD, head_dim, DS4_N_ROT, pos0,
+            DS4_RMS_EPS, l->attn_q_norm_offset, s->d_pos)) {
+        if (side) (void)ds4_gpu_side_stream_join();
+        fprintf(stderr, "ds4: qwen4exp fused Q-prep failed at block %u\n", il);
+        return false;
+    }
+
+    /* ---- join, then every reader of what the side stream wrote ----------
+     * The top-k reads idx_scores and the attention reads the key/value cache
+     * rows, so the join goes above both.  The top-k is also the one op here
+     * that can take the backend's main scratch slab, and below the join it is
+     * on the main stream behind the pre-quantise exactly as it was before. */
+    if (side && !ds4_gpu_side_stream_join()) {
+        fprintf(stderr, "ds4: qwen4exp QSA stream join failed at block %u\n", il);
+        return false;
+    }
+
+    const ds4_gpu_tensor *sel = NULL;
+    const ds4_gpu_tensor *counts = NULL;
+    if (indexed) {
+        if (!ds4_gpu_indexer_topk_tensor(s->idx_topk, s->idx_scores, n_blocks,
                                          n_tokens, top_k) ||
             !ds4_gpu_qwen4exp_qsa_indexer_select_tensor(
                 s->idx_selected, s->idx_counts, s->idx_scores, s->idx_topk,

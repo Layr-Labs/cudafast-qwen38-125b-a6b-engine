@@ -3701,6 +3701,31 @@ int  ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graphs_invalidate(void);
 
+/* -------------------------------------------------------------------------
+ * The side stream: a second stream for a chain that does not depend on the
+ * one the main stream is running.
+ *
+ * begin()  forks: records an event on the decode stream and makes the side
+ *          stream wait on it, then routes every subsequent launch that goes
+ *          through the backend's decode stream onto the side stream.
+ *          Returns 1 when the fork took, 0 when it did not -- a 0 is not an
+ *          error, it means the caller's next launches stay on the main
+ *          stream and the sequence is exactly the serial one.
+ * detach() records the join event on the side stream and routes launches
+ *          back to the main stream.  The main stream does NOT wait yet, so
+ *          the caller issues the independent half next.
+ * join()   makes the main stream wait on the join event.  MUST be called
+ *          before anything reads what the side stream wrote, and on every
+ *          error path out of a forked region.
+ *
+ * The CUDA implementation refuses to fork while a decode-island graph
+ * capture or replay is in flight, so captured islands are untouched.
+ * Backends without a second stream return 0 from begin() and the caller
+ * runs serial. */
+int ds4_gpu_side_stream_begin(void);
+int ds4_gpu_side_stream_detach(void);
+int ds4_gpu_side_stream_join(void);
+
 /* =========================================================================
  * Qwen4exp Hyper-Connections, Norms, RoPE, Embedding and Head.
  * =========================================================================

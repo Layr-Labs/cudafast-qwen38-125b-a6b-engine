@@ -155,6 +155,10 @@ int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) { (void)key; ret
 int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) { (void)key; return -1; }
 void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key) { (void)key; }
 void ds4_gpu_decode_graphs_invalidate(void) {}
+/* Metal has one command queue per engine; the tower runs serial there. */
+int ds4_gpu_side_stream_begin(void) { return 0; }
+int ds4_gpu_side_stream_detach(void) { return 0; }
+int ds4_gpu_side_stream_join(void) { return 0; }
 int ds4_gpu_set_current_device(int logical_tier) { (void)logical_tier; return -1; }
 int ds4_gpu_set_current_device_fenced(int logical_tier) { (void)logical_tier; return -1; }
 void ds4_gpu_enable_q8_dequant_gemm(void) {}
@@ -17232,6 +17236,9 @@ static inline int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) { 
 static inline int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) { (void)key; return -1; }
 static inline void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key) { (void)key; }
 static inline void ds4_gpu_decode_graphs_invalidate(void) {}
+static inline int ds4_gpu_side_stream_begin(void) { return 0; }
+static inline int ds4_gpu_side_stream_detach(void) { return 0; }
+static inline int ds4_gpu_side_stream_join(void) { return 0; }
 static inline int ds4_gpu_set_current_device(int tier) { (void)tier; return 0; }
 static inline int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst,
                                             const ds4_gpu_tensor *src,

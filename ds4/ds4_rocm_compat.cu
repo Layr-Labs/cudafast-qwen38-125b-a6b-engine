@@ -33,6 +33,11 @@ extern "C" int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) { (void
 extern "C" void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key) { (void)key; }
 extern "C" void ds4_gpu_decode_graphs_invalidate(void) {}
 
+/* One HIP stream; the tower runs serial on ROCm. */
+extern "C" int ds4_gpu_side_stream_begin(void) { return 0; }
+extern "C" int ds4_gpu_side_stream_detach(void) { return 0; }
+extern "C" int ds4_gpu_side_stream_join(void) { return 0; }
+
 extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
     if (!cfg || cfg->n_gpus != 1) {
         fprintf(stderr, "ds4: ROCm supports one GPU per process\n");
