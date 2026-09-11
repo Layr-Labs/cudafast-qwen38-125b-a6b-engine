@@ -140,7 +140,7 @@ typedef struct {
     int  faulted;
     char fault[256];
 
-    uint64_t n_decode, n_verify, n_head, n_draft, n_read_logit;
+    uint64_t n_decode, n_verify, n_head, n_draft;
 
     /* The two answers a rejecting round produces for the same position: the
      * batched verify's row-0 argmax, through the borrowed head, and the
@@ -351,7 +351,6 @@ static int ref_verify_rows_top1(void *ctx, const int *tokens, uint32_t n,
 static int ref_read_logit_row(void *ctx, uint32_t row, float *logits) {
     refmodel *m = ctx;
     if (row >= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT) return -1;
-    m->n_read_logit++;
     memcpy(logits, m->compact_logits[row], REF_VOCAB * sizeof(float));
     return 0;
 }
@@ -1493,49 +1492,6 @@ static void test_budget(void) {
     ds4_qwen4exp_mtp_state_free(&st);
 }
 
-/* A greedy compact caller needs only the reducer's exact token.  Verify that
- * opting into lazy materialization leaves the selected distribution on the
- * model seam while publishing enough metadata to fetch it later. */
-static void test_deferred_frontier_logits(void) {
-    printf("deferred compact frontier logits\n");
-    refmodel m;
-    ds4_qwen4exp_mtp_model model;
-    ds4_qwen4exp_rollback_set set;
-    ds4_qwen4exp_mtp_state st;
-    ref_reset(&m, BREAK_NONE, 0);
-    CHECK(ref_build(&m, &model, &set) == 0, "reference build failed");
-    model.defer_frontier_logits = true;
-    CHECK(ds4_qwen4exp_mtp_state_init(&st, 1, &set, REF_HC_DIM, REF_VOCAB,
-                                      g_err, sizeof(g_err)) == 0,
-          "state init failed: %s", g_err);
-
-    float logits[REF_VOCAB];
-    int committed[DS4_QWEN4EXP_MTP_MAX_COMMIT];
-    CHECK(ds4_qwen4exp_mtp_cycle(&st, &model, 3, 0, 2, committed, 2,
-                                  logits, g_err, sizeof(g_err)) == 1,
-          "seed cycle failed: %s", g_err);
-    const int next = ds4_qwen4exp_mtp_argmax(logits, REF_VOCAB);
-    for (uint32_t i = 0; i < REF_VOCAB; i++) logits[i] = -1234.0f;
-    const int got = ds4_qwen4exp_mtp_cycle(
-        &st, &model, next, 1, 2, committed, 2, logits, g_err, sizeof(g_err));
-    CHECK(got > 0, "compact cycle failed: %s", g_err);
-    CHECK(m.n_read_logit == 0,
-          "compact cycle eagerly read %llu frontier rows",
-          (unsigned long long)m.n_read_logit);
-    CHECK(st.frontier_top1_valid && st.frontier_logits_deferred,
-          "compact cycle did not publish a deferred frontier");
-    CHECK(st.frontier_top1 == ds4_qwen4exp_mtp_argmax(
-              m.compact_logits[st.frontier_row], REF_VOCAB),
-          "deferred top-1 does not match selected target row");
-    CHECK(logits[0] == -1234.0f,
-          "deferred cycle unexpectedly overwrote the host distribution");
-    CHECK(model.read_logit_row(model.ctx, st.frontier_row, logits) == 0,
-          "lazy frontier materialization failed");
-    CHECK(ds4_qwen4exp_mtp_argmax(logits, REF_VOCAB) == st.frontier_top1,
-          "materialized frontier does not match cached top-1");
-    ds4_qwen4exp_mtp_state_free(&st);
-}
-
 /* ========================================================================
  * The head wiring
  * ========================================================================
@@ -2197,8 +2153,6 @@ int main(void) {
     test_rollback_contract();
     printf("\n");
     test_budget();
-    printf("\n");
-    test_deferred_frontier_logits();
     printf("\n");
     test_head_wiring();
     printf("\n");

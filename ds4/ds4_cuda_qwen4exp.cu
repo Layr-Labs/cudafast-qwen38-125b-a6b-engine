@@ -2806,7 +2806,9 @@ __device__ __forceinline__ static uint32_t qw_shared_q8_word(const char *p) {
     return qw_pack4((const int8_t *)p);
 }
 
-enum { QW_SH_BM = 16, QW_SH_BN = 32, QW_SH_NT = QW_SH_BN / 8,
+/* A 16-token tile lowers gate/up register use and removes its stack spill on
+ * sm_121 without changing the per-output reduction tree. */
+enum { QW_SH_BM = 16, QW_SH_BN = 16, QW_SH_NT = QW_SH_BN / 8,
        QW_SH_WARPS = 16, QW_SH_THREADS = QW_SH_WARPS * 32 };
 
 /* Each warp computes the group sums of dp4a lanes W and W+16 separately:

@@ -259,8 +259,6 @@ void ds4_qwen4exp_mtp_invalidate(ds4_qwen4exp_mtp_state *st) {
     for (int k = 0; k < DS4_QWEN4EXP_IMPLEMENTED_DEPTH; k++) st->pending[k] = -1;
     st->n_pending = 0;
     st->pending_parent = -1;
-    st->frontier_top1_valid = false;
-    st->frontier_logits_deferred = false;
 }
 
 int ds4_qwen4exp_mtp_counters_check(const ds4_qwen4exp_mtp_counters *c,
@@ -549,8 +547,6 @@ int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
                         model->hc_dim, model->n_vocab, st->hc_dim, st->n_vocab);
     }
     st->counters.rounds += 1;
-    st->frontier_top1_valid = false;
-    st->frontier_logits_deferred = false;
 
     /* A chain belongs to the token it was drafted from.  Anything else -- a
      * rewind, a different sampled token -- makes the whole chain stale, not
@@ -625,18 +621,11 @@ int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
     }
     st->counters.accepted += (uint64_t)a;
 
-    /* The target head has already produced every row.  A greedy-only compact
-     * seam can carry the exact GPU winner forward and leave the full selected
-     * distribution resident until an API actually asks for it. */
-    const int compact_frontier_top1 = compact_logits
-        ? (a == n ? row_top1[n] : first_mismatch) : -1;
-    const bool defer_frontier =
-        compact_logits && model->defer_frontier_logits &&
-        compact_frontier_top1 >= 0 &&
-        (uint32_t)compact_frontier_top1 < st->n_vocab;
+    /* The target head has already produced every row.  The compact CUDA seam
+     * deferred the D2H transfer until acceptance identified the one frontier
+     * row; the portable seam already has that row in row_logits. */
     if (compact_logits) {
-        if (!defer_frontier &&
-            model->read_logit_row(model->ctx, (uint32_t)a, logits) != 0) {
+        if (model->read_logit_row(model->ctx, (uint32_t)a, logits) != 0) {
             return mtp_fail(err, errlen,
                             "qwen4exp MTP: target logit row %d read failed", a);
         }
@@ -654,18 +643,11 @@ int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
         st->counters.committed += (uint64_t)(n + 1);
         st->counters.commit_hist[n + 1] += 1;
         const int next_fed = compact_logits
-            ? compact_frontier_top1
+            ? row_top1[n]
             : ds4_qwen4exp_mtp_argmax(logits, st->n_vocab);
         if (mtp_draft_chain(st, model, hc, toks, n, pos, next_fed,
                             err, errlen) != 0) {
             return -1;
-        }
-        if (compact_logits) {
-            st->frontier_row = (uint32_t)a;
-            st->frontier_top1 = compact_frontier_top1;
-            st->frontier_top1_valid = compact_frontier_top1 >= 0 &&
-                (uint32_t)compact_frontier_top1 < st->n_vocab;
-            st->frontier_logits_deferred = defer_frontier;
         }
         return n + 1;
     }
@@ -700,13 +682,6 @@ int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
     if (mtp_draft_chain(st, model, hc, toks, a, pos, first_mismatch,
                         err, errlen) != 0) {
         return -1;
-    }
-    if (compact_logits) {
-        st->frontier_row = (uint32_t)a;
-        st->frontier_top1 = compact_frontier_top1;
-        st->frontier_top1_valid = compact_frontier_top1 >= 0 &&
-            (uint32_t)compact_frontier_top1 < st->n_vocab;
-        st->frontier_logits_deferred = defer_frontier;
     }
     return a + 1;
 }

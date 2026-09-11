@@ -313,9 +313,6 @@ typedef struct {
     int (*verify_rows_top1)(void *ctx, const int *tokens, uint32_t n,
                             uint32_t pos0, float *hc_rows, int *row_top1);
     int (*read_logit_row)(void *ctx, uint32_t row, float *logits);
-    /* A greedy-only caller may consume row_top1 directly and materialize the
-     * selected full distribution lazily only for an API that needs it. */
-    bool defer_frontier_logits;
 
     /* One row at `pos`: the serial decode step, and the replay a rejecting
      * round runs.  Same outputs for a single row. */
@@ -442,10 +439,6 @@ typedef struct {
     float   *logits_rows;    /* MAX_COMMIT rows of n_vocab                  */
     uint32_t hc_dim;
     uint32_t n_vocab;
-    int      frontier_top1;  /* exact winner returned by compact verify     */
-    uint32_t frontier_row;   /* row in the latest compact target forward    */
-    bool     frontier_top1_valid;
-    bool     frontier_logits_deferred;
     ds4_qwen4exp_mtp_counters counters;
 } ds4_qwen4exp_mtp_state;
 
