@@ -160,6 +160,7 @@ int ds4_gpu_set_current_device_fenced(int logical_tier) { (void)logical_tier; re
 void ds4_gpu_enable_q8_dequant_gemm(void) {}
 void ds4_gpu_enable_q8_dense_mma(void) {}
 int ds4_gpu_tensor_copy_async(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint64_t bytes) { (void)dst; (void)src; (void)bytes; return 0; }
+int ds4_gpu_tensor_copy_async_offset(ds4_gpu_tensor *dst, uint64_t dst_offset, const ds4_gpu_tensor *src, uint64_t src_offset, uint64_t bytes) { (void)dst; (void)dst_offset; (void)src; (void)src_offset; (void)bytes; return 0; }
 int ds4_gpu_tensor_copy_xdev_default(ds4_gpu_tensor *dst,
                                      const ds4_gpu_tensor *src,
                                      uint64_t bytes) {
@@ -54810,6 +54811,11 @@ struct ds4_session {
     ds4_qwen4exp_mtp_model     qwen4exp_seam;
     ds4_qwen4exp_rollback_set  qwen4exp_rollback;
     ds4_qwen4exp_mtp_head      qwen4exp_head;
+    /* Device snapshot of verify hyper rows.  Survives rollback select_row so
+     * draft_rows can D2D the verify-time rows without a host bounce. */
+    ds4_gpu_tensor            *qwen4exp_mtp_hc_snap;
+    uint32_t                   qwen4exp_mtp_snap_pos0;
+    uint32_t                   qwen4exp_mtp_snap_n;
     /* Set at create for a qwen4exp session.  ds4_session_is_qwen4exp() reads
      * the model shape, which is process-global; this says THIS session was
      * built on the qwen4exp path, which is what the refusals below key on. */
@@ -66022,6 +66028,10 @@ void ds4_session_free(ds4_session *s) {
     free(s->spec_row_logits);
     free(s->dspark_markov_bias);
     free(s->dspark_conf_features);
+    if (s->qwen4exp_mtp_hc_snap) {
+        ds4_gpu_tensor_free(s->qwen4exp_mtp_hc_snap);
+        s->qwen4exp_mtp_hc_snap = NULL;
+    }
 #endif
     free(s);
 }
@@ -75978,9 +75988,31 @@ static int qwen4exp_seam_verify_rows_top1(void *ctx, const int *tokens,
     if (at != pos0 || n > (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT) return -1;
     int32_t buf[DS4_QWEN4EXP_MTP_MAX_COMMIT];
     for (uint32_t i = 0; i < n; i++) buf[i] = (int32_t)tokens[i];
-    return ds4_qwen4exp_graph_verify_top1_rows(
-               e->qwen4exp_session, e->qwen4exp_weights, &e->model,
-               buf, n, hc_rows, row_top1) ? 0 : -1;
+    /* Skip host hyper readback.  Snapshot the device rows into a rollback-
+     * stable buffer the draft seam consumes via D2D. */
+    (void)hc_rows;
+    if (!ds4_qwen4exp_graph_verify_top1_rows(
+            e->qwen4exp_session, e->qwen4exp_weights, &e->model,
+            buf, n, NULL, row_top1)) {
+        return -1;
+    }
+    ds4_gpu_tensor *hyper = ds4_qwen4exp_session_hyper(e->qwen4exp_session);
+    const uint64_t bytes =
+        (uint64_t)n * (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    if (!hyper || !s->qwen4exp_mtp_hc_snap ||
+        ds4_gpu_tensor_bytes(hyper) < bytes ||
+        ds4_gpu_tensor_bytes(s->qwen4exp_mtp_hc_snap) < bytes) {
+        return -1;
+    }
+    if (!ds4_gpu_tensor_copy_async_offset(s->qwen4exp_mtp_hc_snap, 0, hyper, 0,
+                                          bytes)) {
+        return -1;
+    }
+    /* The async copy rides the decode stream; the next head forward's
+     * begin_commands / kernels / end_commands provide the rendezvous. */
+    s->qwen4exp_mtp_snap_pos0 = pos0;
+    s->qwen4exp_mtp_snap_n = n;
+    return 0;
 }
 
 static int qwen4exp_seam_read_logit_row(void *ctx, uint32_t row,
@@ -76045,9 +76077,27 @@ static int qwen4exp_seam_draft_rows(void *ctx, const int *next_tokens,
                                     float *multi_out) {
     ds4_session *s = ctx;
     char err[256];
-    if (ds4_qwen4exp_mtp_head_forward_last(&s->qwen4exp_head, next_tokens,
-                                           hc_rows, pos0, n, draft_out,
-                                           multi_out, err, sizeof(err)) != 0) {
+    const uint64_t row_bytes =
+        (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    const bool snap_ok =
+        s->qwen4exp_mtp_hc_snap && n > 0u &&
+        pos0 >= s->qwen4exp_mtp_snap_pos0 &&
+        (pos0 - s->qwen4exp_mtp_snap_pos0) + n <= s->qwen4exp_mtp_snap_n;
+    int rc;
+    if (snap_ok) {
+        const uint64_t off =
+            (uint64_t)(pos0 - s->qwen4exp_mtp_snap_pos0) * row_bytes;
+        const uint64_t need = (uint64_t)n * row_bytes;
+        rc = ds4_qwen4exp_mtp_head_forward_last_from_gpu(
+                 &s->qwen4exp_head, next_tokens, s->qwen4exp_mtp_hc_snap, off,
+                 need, pos0, n, draft_out, multi_out, err, sizeof(err));
+    } else {
+        /* Serial decode / tests that still deliver host hc_rows. */
+        rc = ds4_qwen4exp_mtp_head_forward_last(
+                 &s->qwen4exp_head, next_tokens, hc_rows, pos0, n, draft_out,
+                 multi_out, err, sizeof(err));
+    }
+    if (rc != 0) {
         fprintf(stderr, "ds4: qwen4exp MTP seam: %s\n", err);
         return -1;
     }
@@ -76143,6 +76193,18 @@ static bool ds4_session_qwen4exp_spec_init(ds4_session *s,
     s->qwen4exp_seam.head_logits  = qwen4exp_seam_head_logits;
     s->qwen4exp_seam.draft_step   = qwen4exp_seam_draft_step;
     s->qwen4exp_seam.draft_rows   = qwen4exp_seam_draft_rows;
+    if (!s->qwen4exp_mtp_hc_snap) {
+        const uint64_t snap_bytes =
+            (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT *
+            (uint64_t)DS4_N_HC * (uint64_t)DS4_N_EMBD * sizeof(float);
+        s->qwen4exp_mtp_hc_snap = ds4_gpu_tensor_alloc(snap_bytes);
+        if (!s->qwen4exp_mtp_hc_snap) {
+            snprintf(err, errlen, "qwen4exp MTP: hyper snap alloc failed");
+            return false;
+        }
+    }
+    s->qwen4exp_mtp_snap_pos0 = 0;
+    s->qwen4exp_mtp_snap_n = 0;
 
     const int depth = ds4_qwen4exp_mtp_depth_from_draft_tokens(
             e->mtp_draft_tokens, err, errlen);
