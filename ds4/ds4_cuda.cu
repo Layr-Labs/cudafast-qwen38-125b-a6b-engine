@@ -28222,6 +28222,81 @@ __global__ static void glm53_matvec_bf16_f32_kernel(
     }
 }
 
+/* R-row tiled matvec kernel for speculative verification (R in 2..8).
+ * Reads each weight element once for R activation rows instead of R times,
+ * reducing weight memory traffic by (R-1)/R while preserving 100% bit-exact
+ * floating-point arithmetic.
+ */
+template <int R>
+__global__ static void glm53_matvec_bf16_f32_tiled_kernel(
+        float *out,
+        const uint16_t *weights,
+        const float *x,
+        uint32_t in_dim,
+        uint32_t out_dim,
+        uint32_t n_rows) {
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t col = blockIdx.x * 8u + warp;
+    const uint32_t row_base = blockIdx.y * (uint32_t)R;
+
+    if (row_base >= n_rows) return;
+    const uint32_t active_rows = (row_base + (uint32_t)R <= n_rows)
+        ? (uint32_t)R
+        : (n_rows - row_base);
+
+    float sum[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        sum[r] = 0.0f;
+    }
+
+    if (col < out_dim) {
+        const uint16_t *wrow = weights + (uint64_t)col * in_dim;
+        const float *xrows[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            xrows[r] = ((uint32_t)r < active_rows)
+                ? (x + (uint64_t)(row_base + (uint32_t)r) * in_dim)
+                : nullptr;
+        }
+
+        if (active_rows == (uint32_t)R) {
+            for (uint32_t i = lane; i < in_dim; i += 32u) {
+                const float w = __uint_as_float((uint32_t)wrow[i] << 16);
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    sum[r] = fmaf(w, xrows[r][i], sum[r]);
+                }
+            }
+        } else {
+            for (uint32_t i = lane; i < in_dim; i += 32u) {
+                const float w = __uint_as_float((uint32_t)wrow[i] << 16);
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    if ((uint32_t)r < active_rows) {
+                        sum[r] = fmaf(w, xrows[r][i], sum[r]);
+                    }
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        sum[r] = warp_sum_f32(sum[r]);
+    }
+
+    if (lane == 0u && col < out_dim) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            if ((uint32_t)r < active_rows) {
+                out[(uint64_t)(row_base + (uint32_t)r) * out_dim + col] = sum[r];
+            }
+        }
+    }
+}
+
 extern "C" int ds4_gpu_glm53_embedding_bf16(
         ds4_gpu_tensor       *out,
         const void           *model_map,
@@ -28289,13 +28364,58 @@ extern "C" int ds4_gpu_glm53_matmul_bf16(
             "GLM-5.3 BF16 matrix");
     if (!weights) return 0;
     if (n_rows <= 8u) {
-        const dim3 grid((out_dim + 7u) / 8u, n_rows, 1u);
-        glm53_matvec_bf16_f32_kernel<<<grid, 256u, 0,
-            cuda_decode_stream()>>>(
-                (float *)out->ptr, (const uint16_t *)weights,
-                (const float *)x->ptr, in_dim, out_dim);
+        const cudaStream_t stream = cuda_decode_stream();
+        if (n_rows == 1u || getenv("DS4_CUDA_NO_BF16_TILED") != NULL) {
+            const dim3 grid((out_dim + 7u) / 8u, n_rows, 1u);
+            glm53_matvec_bf16_f32_kernel<<<grid, 256u, 0, stream>>>(
+                    (float *)out->ptr, (const uint16_t *)weights,
+                    (const float *)x->ptr, in_dim, out_dim);
+            return cuda_ok(cudaGetLastError(),
+                           "GLM-5.3 BF16/F32 matvec launch");
+        }
+
+        const dim3 grid((out_dim + 7u) / 8u, 1u, 1u);
+        switch (n_rows) {
+            case 2u:
+                glm53_matvec_bf16_f32_tiled_kernel<2><<<grid, 256u, 0, stream>>>(
+                        (float *)out->ptr, (const uint16_t *)weights,
+                        (const float *)x->ptr, in_dim, out_dim, 2u);
+                break;
+            case 3u:
+                glm53_matvec_bf16_f32_tiled_kernel<3><<<grid, 256u, 0, stream>>>(
+                        (float *)out->ptr, (const uint16_t *)weights,
+                        (const float *)x->ptr, in_dim, out_dim, 3u);
+                break;
+            case 4u:
+                glm53_matvec_bf16_f32_tiled_kernel<4><<<grid, 256u, 0, stream>>>(
+                        (float *)out->ptr, (const uint16_t *)weights,
+                        (const float *)x->ptr, in_dim, out_dim, 4u);
+                break;
+            case 5u:
+                glm53_matvec_bf16_f32_tiled_kernel<5><<<grid, 256u, 0, stream>>>(
+                        (float *)out->ptr, (const uint16_t *)weights,
+                        (const float *)x->ptr, in_dim, out_dim, 5u);
+                break;
+            case 6u:
+                glm53_matvec_bf16_f32_tiled_kernel<6><<<grid, 256u, 0, stream>>>(
+                        (float *)out->ptr, (const uint16_t *)weights,
+                        (const float *)x->ptr, in_dim, out_dim, 6u);
+                break;
+            case 7u:
+                glm53_matvec_bf16_f32_tiled_kernel<7><<<grid, 256u, 0, stream>>>(
+                        (float *)out->ptr, (const uint16_t *)weights,
+                        (const float *)x->ptr, in_dim, out_dim, 7u);
+                break;
+            case 8u:
+                glm53_matvec_bf16_f32_tiled_kernel<8><<<grid, 256u, 0, stream>>>(
+                        (float *)out->ptr, (const uint16_t *)weights,
+                        (const float *)x->ptr, in_dim, out_dim, 8u);
+                break;
+            default:
+                break;
+        }
         return cuda_ok(cudaGetLastError(),
-                       "GLM-5.3 BF16/F32 matvec launch");
+                       "GLM-5.3 BF16/F32 tiled matvec launch");
     }
     __nv_bfloat16 *xb = (__nv_bfloat16 *)cuda_tmp_alloc_on(
             logical_tier, input_elements * sizeof(__nv_bfloat16),
