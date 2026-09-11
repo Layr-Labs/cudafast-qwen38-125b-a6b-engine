@@ -2824,7 +2824,11 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
 #pragma unroll
         for (int r = 0; r < R; r++) acc[r] = 0.0f;
         if (live) {
-            for (uint32_t g = lane; g < groups; g += 32u) {
+            uint32_t raw[8];
+            uint32_t g = lane;
+            bool have_raw = g < groups &&
+                qw_raw_load((uint32_t)Type, weight_row, g, raw);
+            for (; g < groups; g += 32u) {
                 int8_t wq[32];
                 float wa[2] = {0.0f, 0.0f};
                 float wb[2] = {0.0f, 0.0f};
@@ -2838,11 +2842,18 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
                  * Q4_K, whose group stages, and whose decode leaves
                  * `halves` at one -- the value passed to the accumulate
                  * below -- so the accumulated value is unchanged. */
-                uint32_t raw[8];
-                const uint32_t *rawp =
-                    qw_raw_load((uint32_t)Type, weight_row, g, raw) ? raw : NULL;
                 dev_qwen4exp_group_decode_w((uint32_t)Type, weight_row, g,
-                                            rawp, wq, wa, wb);
+                                            have_raw ? raw : NULL,
+                                            wq, wa, wb);
+                /* Keep one raw payload, rather than a second decoded tile,
+                 * live across the current two-token accumulate.  Refilling
+                 * the same buffer here gives the next group's global load
+                 * that independent work to retire behind.  The eight raw
+                 * words may still extend the register live range, so this is
+                 * deliberately the only prefetched state. */
+                const uint32_t next_g = g + 32u;
+                have_raw = next_g < groups &&
+                    qw_raw_load((uint32_t)Type, weight_row, next_g, raw);
                 const int halves = 1;
 #pragma unroll
                 for (int r = 0; r < R; r++) {
