@@ -345,6 +345,7 @@ struct ds4_qwen4exp_session {
     ds4_gpu_tensor *gdn_out;
 
     ds4_gpu_tensor *mixed_q8; /* shared by sequential GDN/QSA projections */
+    bool mixed_q8_valid;
     ds4_gpu_tensor *qsa_doubled;
     ds4_gpu_tensor *qsa_q;
     ds4_gpu_tensor *qsa_gate;
@@ -900,6 +901,7 @@ void ds4_qwen4exp_session_reset(ds4_qwen4exp_session *s) {
     ds4_ple_history_reset(&s->ple_constants, &s->ple_history);
     s->pos = 0;
     s->state_dirty = false;
+    s->mixed_q8_valid = false;
 }
 
 /* ======================================================================
@@ -1033,6 +1035,97 @@ static void *qw_ple_gather_worker(void *arg) {
     return NULL;
 }
 
+#define QW_PLE_MAX_THREADS 16
+
+typedef struct {
+    pthread_mutex_t   mutex;
+    pthread_cond_t    work_cond;
+    pthread_cond_t    done_cond;
+    pthread_t         threads[QW_PLE_MAX_THREADS];
+    qw_ple_gather_seg segs[QW_PLE_MAX_THREADS];
+    uint32_t          n_threads;
+    uint32_t          active_workers;
+    uint32_t          completed_workers;
+    uint32_t          generation;
+    bool              shutdown;
+    bool              initialized;
+} qw_ple_pool_t;
+
+static qw_ple_pool_t g_qw_ple_pool = {
+    PTHREAD_MUTEX_INITIALIZER,
+    PTHREAD_COND_INITIALIZER,
+    PTHREAD_COND_INITIALIZER,
+    {0}, {{0}}, 0, 0, 0, 0, false, false
+};
+
+static void *qw_ple_pool_worker_thread(void *arg) {
+    const long idx = (long)(uintptr_t)arg;
+    uint32_t last_gen = 0;
+    while (1) {
+        pthread_mutex_lock(&g_qw_ple_pool.mutex);
+        while (g_qw_ple_pool.generation == last_gen && !g_qw_ple_pool.shutdown) {
+            pthread_cond_wait(&g_qw_ple_pool.work_cond, &g_qw_ple_pool.mutex);
+        }
+        if (g_qw_ple_pool.shutdown) {
+            pthread_mutex_unlock(&g_qw_ple_pool.mutex);
+            break;
+        }
+        last_gen = g_qw_ple_pool.generation;
+        bool has_work = ((uint32_t)idx <= g_qw_ple_pool.active_workers);
+        pthread_mutex_unlock(&g_qw_ple_pool.mutex);
+
+        if (has_work) {
+            qw_ple_gather_worker(&g_qw_ple_pool.segs[idx]);
+
+            pthread_mutex_lock(&g_qw_ple_pool.mutex);
+            g_qw_ple_pool.completed_workers++;
+            if (g_qw_ple_pool.completed_workers == g_qw_ple_pool.active_workers) {
+                pthread_cond_signal(&g_qw_ple_pool.done_cond);
+            }
+            pthread_mutex_unlock(&g_qw_ple_pool.mutex);
+        }
+    }
+    return NULL;
+}
+
+static void qw_ple_pool_shutdown(void) {
+    if (!g_qw_ple_pool.initialized) return;
+    pthread_mutex_lock(&g_qw_ple_pool.mutex);
+    g_qw_ple_pool.shutdown = true;
+    g_qw_ple_pool.generation++;
+    pthread_cond_broadcast(&g_qw_ple_pool.work_cond);
+    pthread_mutex_unlock(&g_qw_ple_pool.mutex);
+
+    for (uint32_t i = 1; i < g_qw_ple_pool.n_threads; i++) {
+        pthread_join(g_qw_ple_pool.threads[i], NULL);
+    }
+    g_qw_ple_pool.initialized = false;
+}
+
+static void qw_ple_pool_init(void) {
+    if (g_qw_ple_pool.initialized) return;
+    pthread_mutex_lock(&g_qw_ple_pool.mutex);
+    if (g_qw_ple_pool.initialized) {
+        pthread_mutex_unlock(&g_qw_ple_pool.mutex);
+        return;
+    }
+    g_qw_ple_pool.n_threads = 1;
+    g_qw_ple_pool.generation = 0;
+    g_qw_ple_pool.shutdown = false;
+
+    for (uint32_t i = 1; i < QW_PLE_MAX_THREADS; i++) {
+        if (pthread_create(&g_qw_ple_pool.threads[i], NULL,
+                           qw_ple_pool_worker_thread,
+                           (void *)(uintptr_t)i) != 0) {
+            break;
+        }
+        g_qw_ple_pool.n_threads = i + 1;
+    }
+    g_qw_ple_pool.initialized = true;
+    atexit(qw_ple_pool_shutdown);
+    pthread_mutex_unlock(&g_qw_ple_pool.mutex);
+}
+
 static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                                       const ds4_qwen4exp_weights *w,
                                       const int32_t *tokens,
@@ -1155,64 +1248,63 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
             }
         } else {
             if ((uint32_t)nthreads > n_tokens) nthreads = (long)n_tokens;
-            qw_ple_gather_seg *segs =
-                calloc((size_t)nthreads, sizeof(*segs));
-            pthread_t *tids = calloc((size_t)nthreads, sizeof(*tids));
-            if (!segs || !tids) {
-                free(segs);
-                free(tids);
-                fprintf(stderr,
-                        "ds4: qwen4exp PLE gather could not stage %ld threads\n",
-                        nthreads);
-                return false;
+            if (nthreads > QW_PLE_MAX_THREADS) nthreads = QW_PLE_MAX_THREADS;
+
+            qw_ple_pool_init();
+            if (g_qw_ple_pool.initialized && (long)g_qw_ple_pool.n_threads < nthreads) {
+                nthreads = (long)g_qw_ple_pool.n_threads;
             }
+
             const uint32_t per = (n_tokens + (uint32_t)nthreads - 1u) /
                                  (uint32_t)nthreads;
-            int spawned = 0;
+            uint32_t actual_threads = 0;
             for (long i = 0; i < nthreads; i++) {
                 const uint32_t t0 = (uint32_t)i * per;
                 if (t0 >= n_tokens) break;
+                actual_threads++;
                 uint32_t t1 = t0 + per;
                 if (t1 > n_tokens) t1 = n_tokens;
-                segs[i].ple = &w->ple;
-                segs[i].s = s;
-                segs[i].tokens = tokens;
-                segs[i].n_tokens = n_tokens;
-                segs[i].t0 = t0;
-                segs[i].t1 = t1;
-                segs[i].blocks_per_row = blocks_per_row;
-                segs[i].ok = 0;
-                if (i == 0) {
-                    qw_ple_gather_worker(&segs[0]);
-                    spawned = 1;
-                } else if (pthread_create(&tids[i], NULL,
-                                          qw_ple_gather_worker,
-                                          &segs[i]) == 0) {
-                    spawned++;
-                } else {
-                    segs[i].ok = -1;   /* run it inline after the joins */
+                g_qw_ple_pool.segs[i].ple = &w->ple;
+                g_qw_ple_pool.segs[i].s = s;
+                g_qw_ple_pool.segs[i].tokens = tokens;
+                g_qw_ple_pool.segs[i].n_tokens = n_tokens;
+                g_qw_ple_pool.segs[i].t0 = t0;
+                g_qw_ple_pool.segs[i].t1 = t1;
+                g_qw_ple_pool.segs[i].blocks_per_row = blocks_per_row;
+                g_qw_ple_pool.segs[i].ok = 0;
+            }
+
+            if (actual_threads > 1 && g_qw_ple_pool.initialized) {
+                pthread_mutex_lock(&g_qw_ple_pool.mutex);
+                g_qw_ple_pool.active_workers = actual_threads - 1u;
+                g_qw_ple_pool.completed_workers = 0;
+                g_qw_ple_pool.generation++;
+                pthread_cond_broadcast(&g_qw_ple_pool.work_cond);
+                pthread_mutex_unlock(&g_qw_ple_pool.mutex);
+
+                /* Master thread runs segment 0 concurrently with workers */
+                qw_ple_gather_worker(&g_qw_ple_pool.segs[0]);
+
+                pthread_mutex_lock(&g_qw_ple_pool.mutex);
+                while (g_qw_ple_pool.completed_workers < g_qw_ple_pool.active_workers) {
+                    pthread_cond_wait(&g_qw_ple_pool.done_cond, &g_qw_ple_pool.mutex);
+                }
+                pthread_mutex_unlock(&g_qw_ple_pool.mutex);
+            } else {
+                for (uint32_t i = 0; i < actual_threads; i++) {
+                    qw_ple_gather_worker(&g_qw_ple_pool.segs[i]);
                 }
             }
-            for (long i = 1; i < nthreads; i++) {
-                if (segs[i].t0 < n_tokens && segs[i].ok != -1) {
-                    pthread_join(tids[i], NULL);
-                }
-            }
-            for (long i = 0; i < nthreads; i++) {
-                if (segs[i].t0 >= n_tokens) break;
-                if (segs[i].ok == -1) qw_ple_gather_worker(&segs[i]);
-                if (segs[i].ok != 1) {
+
+            for (uint32_t i = 0; i < actual_threads; i++) {
+                if (g_qw_ple_pool.segs[i].ok != 1) {
                     fprintf(stderr,
-                            "ds4: qwen4exp block %u gather segment %ld hashed "
+                            "ds4: qwen4exp block %u gather segment %u hashed "
                             "past the %" PRIu64 " rows the table holds\n",
                             il, i, w->ple.rows);
-                    free(segs);
-                    free(tids);
                     return false;
                 }
             }
-            free(segs);
-            free(tids);
             /* The carried history is the state after the LAST token; re-warm
              * a fresh history over the final (ngram - 1) tokens and leave it
              * in the session -- exactly what the sequential scan leaves. */
@@ -1293,11 +1385,14 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
      * session scratch: both GDN Q8 projections read the same mixed input.
      * The F32 alpha/beta projections still read the original float values.
      * Width-specific graph islands capture a stable scratch and scale offset. */
-    if (!ds4_qwen4exp_quantize_q8_0(s->mixed_q8, 0, q8_soff, s->mixed,
-                                    DS4_N_EMBD, n_tokens)) {
-        fprintf(stderr, "ds4: qwen4exp GDN pre-quantize failed at block %u\n", il);
-        return false;
+    if (!s->mixed_q8_valid) {
+        if (!ds4_qwen4exp_quantize_q8_0(s->mixed_q8, 0, q8_soff, s->mixed,
+                                        DS4_N_EMBD, n_tokens)) {
+            fprintf(stderr, "ds4: qwen4exp GDN pre-quantize failed at block %u\n", il);
+            return false;
+        }
     }
+    s->mixed_q8_valid = false;
 
     if (!ds4_qwen4exp_matmul_q8_0_preq(s->gdn_qkv, QW_MAP(m, l->attn_qkv),
                                     QW_MAPSZ(m, l->attn_qkv), QW_OFF(l->attn_qkv),
@@ -1376,11 +1471,14 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
     const uint64_t q8_qbytes = (uint64_t)n_tokens * q8_blocks * 32u;
     const uint64_t q8_soff = (q8_qbytes + 15u) & ~15ull;
 
-    if (!ds4_qwen4exp_quantize_q8_0(s->mixed_q8, 0, q8_soff, s->mixed,
-                                    DS4_N_EMBD, n_tokens)) {
-        fprintf(stderr, "ds4: qwen4exp QSA pre-quantize failed at block %u\n", il);
-        return false;
+    if (!s->mixed_q8_valid) {
+        if (!ds4_qwen4exp_quantize_q8_0(s->mixed_q8, 0, q8_soff, s->mixed,
+                                        DS4_N_EMBD, n_tokens)) {
+            fprintf(stderr, "ds4: qwen4exp QSA pre-quantize failed at block %u\n", il);
+            return false;
+        }
     }
+    s->mixed_q8_valid = false;
 
     /* Projections.  q is DOUBLED: half query, half output gate. */
     if (!ds4_qwen4exp_matmul_q8_0_preq(s->qsa_doubled, QW_MAP(m, l->attn_q),
@@ -1815,7 +1913,8 @@ static bool qwen4exp_graph_residual(ds4_qwen4exp_session *s,
                                     const ds4_tensor *up,
                                     const ds4_tensor *inject,
                                     float norm_weight_offset,
-                                    uint32_t n_tokens) {
+                                    uint32_t n_tokens,
+                                    ds4_gpu_tensor *mixed_q8) {
 #ifdef DS4_TEST_HOOKS
     /* The tower's final mixer is the only call with no inject head.  Copy what
      * it is about to read, inside this batch so the ordering is the GPU's and
@@ -1836,12 +1935,16 @@ static bool qwen4exp_graph_residual(ds4_qwen4exp_session *s,
     const ds4_gpu_qwen4exp_slab inject_slab =
         inject ? QW_SLAB(m, inject) : (ds4_gpu_qwen4exp_slab){0};
 
-    return ds4_gpu_qwen4exp_hc_mixer_tensor(
+    const bool ok = ds4_gpu_qwen4exp_hc_mixer_quant_tensor(
         s->mixed, inject ? s->inject : NULL, s->normed, s->lowrank, s->wide,
         s->hyper, &norm_slab, &down_slab, &up_slab,
         inject ? &inject_slab : NULL,
         DS4_N_EMBD, DS4_N_HC, DS4_N_HC_LOWRANK, n_tokens,
-        DS4_HC_EPS, norm_weight_offset, 1) != 0;
+        DS4_HC_EPS, norm_weight_offset, 1, mixed_q8) != 0;
+    if (ok && mixed_q8 && (!inject || n_tokens < 48u)) {
+        s->mixed_q8_valid = true;
+    }
+    return ok;
 }
 
 /* Two fixed launch sequences per layer.  The GDN reads and updates tensor
@@ -1856,7 +1959,8 @@ static bool qwen4exp_graph_layer_island_encode(
         /* --- attention side ------------------------------------------- */
         if (!qwen4exp_graph_residual(s, m, l->hc_attn_norm, l->hc_attn_down,
                                      l->hc_attn_up, l->hc_attn_inject,
-                                     l->hc_attn_norm_offset, n_tokens)) {
+                                     l->hc_attn_norm_offset, n_tokens,
+                                     s->mixed_q8)) {
             fprintf(stderr, "ds4: qwen4exp attention mixer failed at block %u\n", il);
             return false;
         }
@@ -1877,7 +1981,8 @@ static bool qwen4exp_graph_layer_island_encode(
         /* --- feed-forward side ---------------------------------------- */
         if (!qwen4exp_graph_residual(s, m, l->hc_ffn_norm, l->hc_ffn_down,
                                      l->hc_ffn_up, l->hc_ffn_inject,
-                                     l->hc_ffn_norm_offset, n_tokens)) {
+                                     l->hc_ffn_norm_offset, n_tokens,
+                                     NULL)) {
             fprintf(stderr, "ds4: qwen4exp FFN mixer failed at block %u\n", il);
             return false;
         }
@@ -2294,7 +2399,7 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
      * n_embd and stands in for the model.norm this checkpoint does not have. */
     if (!qwen4exp_graph_residual(s, m, w->output_hc_norm, w->output_hc_down,
                                  w->output_hc_up, NULL,
-                                 w->output_hc_norm_offset, n_tokens)) {
+                                 w->output_hc_norm_offset, n_tokens, NULL)) {
         fprintf(stderr, "ds4: qwen4exp final mixer failed\n");
         return qwen4exp_forward_fail();
     }
@@ -2589,7 +2694,7 @@ static bool qwen4exp_graph_head_block_encode(
     const char *stage = "attention mixer";
     bool ok = qwen4exp_graph_residual(s, m, l->hc_attn_norm, l->hc_attn_down,
                                       l->hc_attn_up, l->hc_attn_inject,
-                                      l->hc_attn_norm_offset, n_tokens);
+                                      l->hc_attn_norm_offset, n_tokens, s->mixed_q8);
     QW_HB_TICK(QW_HB_T_ATTN_MIX);
     if (ok) { stage = "QSA"; ok = qwen4exp_graph_qsa_block(s, l, m, il, n_tokens); }
     QW_HB_TICK(QW_HB_T_QSA);
@@ -2604,7 +2709,7 @@ static bool qwen4exp_graph_head_block_encode(
         stage = "FFN mixer";
         ok = qwen4exp_graph_residual(s, m, l->hc_ffn_norm, l->hc_ffn_down,
                                      l->hc_ffn_up, l->hc_ffn_inject,
-                                     l->hc_ffn_norm_offset, n_tokens);
+                                     l->hc_ffn_norm_offset, n_tokens, NULL);
     }
     QW_HB_TICK(QW_HB_T_FFN_MIX);
     if (ok) {
@@ -2868,7 +2973,7 @@ bool ds4_qwen4exp_graph_head_logits(ds4_qwen4exp_session       *s,
     }
     if (!qwen4exp_graph_residual(s, m, w->output_hc_norm, w->output_hc_down,
                                  w->output_hc_up, NULL,
-                                 w->output_hc_norm_offset, 1u)) {
+                                 w->output_hc_norm_offset, 1u, NULL)) {
         fprintf(stderr, "ds4: qwen4exp final mixer failed on the head row\n");
         return qwen4exp_forward_fail();
     }

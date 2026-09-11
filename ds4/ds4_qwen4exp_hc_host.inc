@@ -132,6 +132,43 @@ int ds4_gpu_qwen4exp_hc_mixer_unfused_tensor(
  * not a win.  DS4_QWEN4EXP_NO_HC_FUSE is a debugging valve in the other
  * direction, and the fused entry itself declines (-1) any shape it cannot
  * serve, so the chain above stays the fallback rather than a refusal. */
+int ds4_gpu_qwen4exp_hc_mixer_quant_tensor(
+        ds4_gpu_tensor       *mixed,
+        ds4_gpu_tensor       *inject,
+        ds4_gpu_tensor       *normed_scratch,
+        ds4_gpu_tensor       *lowrank_scratch,
+        ds4_gpu_tensor       *wide_scratch,
+        const ds4_gpu_tensor *hyper,
+        const ds4_gpu_qwen4exp_slab *norm_weight,
+        const ds4_gpu_qwen4exp_slab *down_weight,
+        const ds4_gpu_qwen4exp_slab *up_weight,
+        const ds4_gpu_qwen4exp_slab *inject_weight,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              n_lowrank,
+        uint32_t              rows,
+        float                 eps,
+        float                 weight_bias,
+        int                   round_bf16,
+        ds4_gpu_tensor       *mixed_q8) {
+    DS4_QWEN4EXP_HC_MIXER_GUARD
+#ifdef DS4_QWEN4EXP_HC_HAVE_FUSED
+    if (!ds4_qwen4exp_hc_fuse_off()) {
+        const int fused =
+            qwen4exp_hc_mixer_fused_cuda(DS4_QWEN4EXP_HC_MIXER_ARGS, mixed_q8);
+        if (fused >= 0) return fused;
+    }
+#endif
+    const int ok = qwen4exp_hc_mixer_chain(DS4_QWEN4EXP_HC_MIXER_ARGS);
+    if (ok && mixed_q8) {
+        const uint64_t q8_blocks = (uint64_t)n_embd / 32u;
+        const uint64_t q8_qbytes = (uint64_t)rows * q8_blocks * 32u;
+        const uint64_t q8_soff = (q8_qbytes + 15u) & ~15ull;
+        return ds4_qwen4exp_quantize_q8_0(mixed_q8, 0, q8_soff, mixed, n_embd, rows);
+    }
+    return ok;
+}
+
 int ds4_gpu_qwen4exp_hc_mixer_tensor(
         ds4_gpu_tensor       *mixed,
         ds4_gpu_tensor       *inject,
@@ -150,15 +187,10 @@ int ds4_gpu_qwen4exp_hc_mixer_tensor(
         float                 eps,
         float                 weight_bias,
         int                   round_bf16) {
-    DS4_QWEN4EXP_HC_MIXER_GUARD
-#ifdef DS4_QWEN4EXP_HC_HAVE_FUSED
-    if (!ds4_qwen4exp_hc_fuse_off()) {
-        const int fused =
-            qwen4exp_hc_mixer_fused_cuda(DS4_QWEN4EXP_HC_MIXER_ARGS);
-        if (fused >= 0) return fused;
-    }
-#endif
-    return qwen4exp_hc_mixer_chain(DS4_QWEN4EXP_HC_MIXER_ARGS);
+    return ds4_gpu_qwen4exp_hc_mixer_quant_tensor(
+            mixed, inject, normed_scratch, lowrank_scratch, wide_scratch, hyper,
+            norm_weight, down_weight, up_weight, inject_weight,
+            n_embd, n_hc, n_lowrank, rows, eps, weight_bias, round_bf16, NULL);
 }
 
 int ds4_gpu_qwen4exp_embed_tokens_hc_tensor(

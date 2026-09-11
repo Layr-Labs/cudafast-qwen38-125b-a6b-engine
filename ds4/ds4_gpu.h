@@ -3790,6 +3790,26 @@ int ds4_gpu_qwen4exp_hc_inject_tensor(
  * 2560-wide hidden state, followed by ds4_gpu_matmul_q8_0_tensor against the
  * `output` tensor; there is no separate LM-head entry point because there is
  * nothing qwen4exp-specific left to do at that point. */
+int ds4_gpu_qwen4exp_hc_mixer_quant_tensor(
+        ds4_gpu_tensor       *mixed,
+        ds4_gpu_tensor       *inject,
+        ds4_gpu_tensor       *normed_scratch,
+        ds4_gpu_tensor       *lowrank_scratch,
+        ds4_gpu_tensor       *wide_scratch,
+        const ds4_gpu_tensor *hyper,
+        const ds4_gpu_qwen4exp_slab *norm_weight,
+        const ds4_gpu_qwen4exp_slab *down_weight,
+        const ds4_gpu_qwen4exp_slab *up_weight,
+        const ds4_gpu_qwen4exp_slab *inject_weight,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              n_lowrank,
+        uint32_t              rows,
+        float                 eps,
+        float                 weight_bias,
+        int                   round_bf16,
+        ds4_gpu_tensor       *mixed_q8);
+
 int ds4_gpu_qwen4exp_hc_mixer_tensor(
         ds4_gpu_tensor       *mixed,
         ds4_gpu_tensor       *inject,

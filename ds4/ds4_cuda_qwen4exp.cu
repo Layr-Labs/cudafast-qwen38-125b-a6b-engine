@@ -5645,6 +5645,49 @@ __global__ static void qwen4exp_hc_mix_renorm_kernel(
     out[(uint64_t)t * n_embd + d] = acc * (1.0f / (float)n_hc);
 }
 
+/* Fused HC mix renorm and Q8_0 activation quantization in a single pass.
+ * Each warp computes 32 consecutive channels, matching a 32-element Q8_0 group.
+ * Replaces a separate launch of quantize_q8_0_f32_rows_warp_kernel.
+ */
+__global__ static void qwen4exp_hc_mix_renorm_quant_kernel(
+        float *out, int8_t *xq, float *xscale,
+        const float *hyper, const float *nscale,
+        const float *normw, const float *wide,
+        uint32_t n_embd, uint32_t n_hc, uint32_t n_tokens,
+        float weight_bias, int round_bf16) {
+    const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t t = blockIdx.y;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t group_idx = blockIdx.x * (blockDim.x >> 5u) + warp;
+    const uint64_t pair = (uint64_t)t * (n_embd / 32u) + group_idx;
+    if (d >= n_embd || t >= n_tokens) return;
+
+    const uint64_t row = ((uint64_t)t * n_hc) * n_embd + d;
+    float acc = 0.0f;
+    for (uint32_t h = 0; h < n_hc; h++) {
+        const uint64_t idx = row + (uint64_t)h * n_embd;
+        const float normed = qwen4exp_hc_normed_value(
+                hyper[idx], nscale[(uint64_t)t * n_hc + h],
+                normw[(uint64_t)h * n_embd + d], weight_bias, round_bf16);
+        acc += qwen4exp_sigmoid(wide[idx]) * normed;
+    }
+    const float val = acc * (1.0f / (float)n_hc);
+    out[(uint64_t)t * n_embd + d] = val;
+
+    float a = fabsf(val);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+    }
+    const float d_scale = a / 127.0f;
+    const float id = d_scale != 0.0f ? 1.0f / d_scale : 0.0f;
+    if (lane == 0u) xscale[pair] = d_scale;
+    int v = (int)lrintf(val * id);
+    v = v > 127 ? 127 : (v < -128 ? -128 : v);
+    xq[pair * 32u + lane] = (int8_t)v;
+}
+
 /* qwen4exp_hc_inject_weights_kernel with `normed` rebuilt from the residual.
  *
  * The flat loop `for (i = threadIdx.x; i < wide; i += blockDim.x)` is written
@@ -5905,7 +5948,8 @@ static int qwen4exp_hc_mixer_fused_cuda(
         uint32_t              rows,
         float                 eps,
         float                 weight_bias,
-        int                   round_bf16) {
+        int                   round_bf16,
+        ds4_gpu_tensor       *mixed_q8) {
     const uint32_t threads = QWEN4EXP_HC_THREADS;
     if (n_embd % threads != 0u || n_hc > QWEN4EXP_HC_MAX_STREAMS) return -1;
 
@@ -6048,6 +6092,33 @@ static int qwen4exp_hc_mixer_fused_cuda(
                     inject_weight->type, (uint32_t)iw_row_bytes);
             return cuda_ok(cudaGetLastError(), "qwen4exp_hc_mix_inject_dual launch");
         }
+    }
+
+    if (mixed_q8 && mixed_q8->ptr && (!inject || rows < QWEN4EXP_HC_FUSE_MIX_MIN_ROWS)) {
+        const uint64_t q8_blocks = (uint64_t)n_embd / 32u;
+        const uint64_t q8_qbytes = (uint64_t)rows * q8_blocks * 32u;
+        const uint64_t q8_soff = (q8_qbytes + 15u) & ~15ull;
+        int8_t *xq_out = (int8_t *)mixed_q8->ptr;
+        float *xscale_out = (float *)((char *)mixed_q8->ptr + q8_soff);
+
+        qwen4exp_hc_mix_renorm_quant_kernel<<<dim3((n_embd + threads - 1u) / threads,
+                                                   rows, 1u), threads, 0,
+                                              cuda_decode_stream()>>>(
+                (float *)mixed->ptr, xq_out, xscale_out,
+                (const float *)hyper->ptr, nscale, normw,
+                (const float *)wide_scratch->ptr, n_embd, n_hc, rows,
+                weight_bias, round_bf16);
+        if (!cuda_ok(cudaGetLastError(), "qwen4exp_hc_mix_renorm_quant launch")) return 0;
+
+        if (inject) {
+            qwen4exp_hc_inject_weights_renorm_kernel<<<dim3(n_hc, rows, 1u), threads, 0,
+                                                       cuda_decode_stream()>>>(
+                    (float *)inject->ptr, (const float *)hyper->ptr, nscale, normw, iw,
+                    n_embd, n_hc, rows, weight_bias, round_bf16,
+                    inject_weight->type, (uint32_t)iw_row_bytes);
+            return cuda_ok(cudaGetLastError(), "qwen4exp_hc_inject_weights_renorm launch");
+        }
+        return 1;
     }
 
     qwen4exp_hc_mix_renorm_kernel<<<dim3((n_embd + threads - 1u) / threads,
