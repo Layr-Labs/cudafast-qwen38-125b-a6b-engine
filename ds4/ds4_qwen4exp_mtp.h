@@ -638,7 +638,7 @@ static inline uint64_t ds4_qwen4exp_q8_0_row_bytes(uint32_t in_dim) {
 #define DS4_QWEN4EXP_DRAFT_VOCAB_TAIL_DEFAULT 276u
 /* The default DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX: the lowest ids in BPE merge order
  * (the frequent tokens); 0 restores the whole-vocabulary draft argmax. */
-#define DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX_DEFAULT 98308u
+#define DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX_DEFAULT 90112u
 
 /*
  * The head reads TWO mappings.  The nextn tensors and blk.<block_index>.* come
