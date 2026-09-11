@@ -2213,6 +2213,115 @@ static void run_shared_exact_case(uint32_t in_dim, uint32_t mid_dim,
     munmap(image, bytes);
 }
 
+#if !defined(__APPLE__) && !defined(__HIP_PLATFORM_AMD__)
+/* Exact top-k and softmax checks, including signed-zero ties, finite extremes,
+ * changed graph inputs and complete output canaries. The diagnostic switch
+ * retains the original warp comparison tree and serial softmax as the oracle. */
+typedef struct {
+    ds4_gpu_tensor *logits, *selected[2], *weights[2];
+    unsigned rows, experts, k;
+} router_native_case;
+
+static void router_native_run(router_native_case *c, unsigned native) {
+    if (native) unsetenv("DS4_QWEN4EXP_NO_ROUTER_NATIVE");
+    else setenv("DS4_QWEN4EXP_NO_ROUTER_NATIVE", "1", 1);
+    require_ok(ds4_gpu_qwen4exp_router_select_tensor(
+                   c->selected[native], c->weights[native], c->logits,
+                   c->experts, c->k, c->rows), "native router operation");
+}
+
+static void router_native_compare(router_native_case *c, unsigned char *a,
+                                  unsigned char *b, size_t bytes) {
+    require_ok(ds4_gpu_tensor_read(c->selected[0], 0, a, bytes) &&
+               ds4_gpu_tensor_read(c->selected[1], 0, b, bytes), "router ids read");
+    require_ok(memcmp(a, b, bytes) == 0, "complete router ids and canaries");
+    require_ok(ds4_gpu_tensor_read(c->weights[0], 0, a, bytes) &&
+               ds4_gpu_tensor_read(c->weights[1], 0, b, bytes), "router weights read");
+    require_ok(memcmp(a, b, bytes) == 0, "complete router weights and canaries");
+}
+
+static void run_router_native_cases(void) {
+    enum { MAX_ROWS = 64, MAX_EXPERTS = 512, MAX_K = 32 };
+    const size_t output_bytes = (MAX_ROWS * MAX_K + 16u) * sizeof(float);
+    const size_t input_bytes = MAX_ROWS * MAX_EXPERTS * sizeof(float);
+    router_native_case c = {0};
+    setenv("DS4_CUDA_DECODE_GRAPHS", "1", 1);
+    c.logits = ds4_gpu_tensor_alloc(input_bytes);
+    require_ok(c.logits != NULL, "native router logits allocation");
+    for (unsigned mode = 0; mode < 2; mode++) {
+        c.selected[mode] = ds4_gpu_tensor_alloc(output_bytes);
+        c.weights[mode] = ds4_gpu_tensor_alloc(output_bytes);
+        require_ok(c.selected[mode] && c.weights[mode], "native router outputs");
+    }
+    float *x = malloc(input_bytes);
+    unsigned char *a = malloc(output_bytes), *b = malloc(output_bytes);
+    unsigned char *poison = malloc(output_bytes), *after = malloc(input_bytes);
+    require_ok(x && a && b && poison && after, "native router host buffers");
+    memset(poison, 0xa5, output_bytes);
+    const unsigned expert_counts[] = {9, 31, 32, 33, 63, 127, 511, 512};
+    const unsigned row_counts[] = {1, 2, 7, 64}, topk_counts[] = {1, 10, 32};
+    unsigned checks = 0;
+    for (unsigned ei = 0; ei < 8; ei++) {
+        for (unsigned ri = 0; ri < 4; ri++) {
+            for (unsigned ki = 0; ki < 3; ki++) {
+                c.experts = expert_counts[ei];
+                c.rows = row_counts[ri];
+                c.k = topk_counts[ki];
+                if (c.k > c.experts) continue;
+                ds4_gpu_decode_graphs_invalidate();
+                const ds4_decode_graph_key key = {.il = 1u, .island = 0u};
+                memset(x, 0, input_bytes);
+                require_ok(ds4_gpu_tensor_write(c.logits, 0, x, input_bytes),
+                           "native router warm input");
+                for (unsigned mode = 0; mode < 2; mode++) {
+                    require_ok(ds4_gpu_tensor_write(c.selected[mode], 0, poison,
+                                   output_bytes) &&
+                               ds4_gpu_tensor_write(c.weights[mode], 0, poison,
+                                   output_bytes), "native router output canaries");
+                }
+                require_ok(ds4_gpu_decode_graph_begin(&key) == -1, "router warm state");
+                router_native_run(&c, 1);
+                require_ok(ds4_gpu_decode_graph_begin(&key) == 0, "router capture state");
+                router_native_run(&c, 1);
+                require_ok(ds4_gpu_decode_graph_end(&key) == 0, "router capture complete");
+                for (unsigned pattern = 0; pattern < 5; pattern++) {
+                    for (unsigned i = 0; i < c.rows * c.experts; i++) {
+                        const uint32_t r = rng_u32();
+                        if (pattern == 0) x[i] = ((int)(r % 20001) - 10000) * .01f;
+                        else if (pattern == 1) x[i] = (int)(r % 7) - 3;
+                        else if (pattern == 2) x[i] = (r & 1u) ? 0.0f : -0.0f;
+                        else if (pattern == 3) x[i] = -(float)(r % 31) * 1e-37f;
+                        else x[i] = (i % 19) ? -FLT_MAX : FLT_MAX;
+                    }
+                    require_ok(ds4_gpu_tensor_write(c.logits, 0, x, input_bytes),
+                               "native router changed input");
+                    router_native_run(&c, 0);
+                    router_native_run(&c, 1);
+                    router_native_compare(&c, a, b, output_bytes);
+                    checks++;
+                    require_ok(ds4_gpu_decode_graph_begin(&key) == 1, "router replay");
+                    router_native_compare(&c, a, b, output_bytes);
+                    checks++;
+                    require_ok(ds4_gpu_tensor_read(c.logits, 0, after, input_bytes),
+                               "router input after replay");
+                    require_ok(memcmp(x, after, input_bytes) == 0,
+                               "complete router logit immutability");
+                }
+            }
+        }
+    }
+    printf("ROUTER_NATIVE_EXACT %u eager/replay complete comparisons pass\n", checks);
+    ds4_gpu_decode_graphs_invalidate();
+    for (unsigned mode = 0; mode < 2; mode++) {
+        ds4_gpu_tensor_free(c.selected[mode]);
+        ds4_gpu_tensor_free(c.weights[mode]);
+    }
+    ds4_gpu_tensor_free(c.logits);
+    free(x); free(a); free(b); free(poison); free(after);
+    unsetenv("DS4_QWEN4EXP_NO_ROUTER_NATIVE");
+}
+#endif
+
 int main(int argc, char **argv) {
     /* Fast mode for tests/qwen4exp_router_f32_mutants.sh: just the F32 router
      * projection's exactness sweep, so a mutant run costs one rebuild and a
@@ -2649,6 +2758,9 @@ int main(int argc, char **argv) {
                            sh_gate_q6k_offset, sh_up_q6k_offset,
                            sh_q5k_row, sh_q6k_row);
 
+#if !defined(__APPLE__) && !defined(__HIP_PLATFORM_AMD__)
+    run_router_native_cases();
+#endif
     run_group_scan_boundary_cases();
 
     run_production_expert_cases();
