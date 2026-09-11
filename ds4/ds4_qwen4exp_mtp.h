@@ -673,6 +673,7 @@ typedef struct {
     ds4_gpu_tensor *t_h_normed;
     ds4_gpu_tensor *t_ehx;
     ds4_gpu_tensor *t_hyper;
+    ds4_gpu_tensor *t_hyper_row[DS4_QWEN4EXP_MTP_MAX_COMMIT];
     ds4_gpu_tensor *t_mix_normed;
     ds4_gpu_tensor *t_mix_lowrank;
     ds4_gpu_tensor *t_mix_wide;
