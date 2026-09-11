@@ -5684,7 +5684,7 @@ __global__ static void matmul_q8_0_preq_rows_exact_tile_kernel(
 /* Two adjacent lanes share a Q8 group. Their integer partials may be
  * combined freely; each even lane keeps its original float group chain.
  * Shared memory remaps the 32 finished chains onto one reduction warp. */
-template <int R>
+template <int R, bool Streaming = true>
 __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
         float *out, const unsigned char *w,
         const int8_t *xq, const float *xscale,
@@ -5713,17 +5713,23 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
             const uintptr_t address = (uintptr_t)payload;
             const uint32_t shift = (uint32_t)(address & 3u) * 8u;
             const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
-            uint32_t previous = words[0];
+            /* Weights stream through each projection once. Mark their reads
+             * evict-first while leaving the reusable activation loads alone. */
+            uint32_t previous = Streaming ? __ldcs(words) : words[0];
             int32_t wq[4];
 #pragma unroll
             for (int j = 0; j < 3; j++) {
-                const uint32_t next = words[j + 1];
+                const uint32_t next = Streaming ? __ldcs(words + j + 1) : words[j + 1];
                 wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
                 previous = next;
             }
-            const uint16_t last = *(const uint16_t *)(const void *)(payload + 14);
+            const uint16_t *lastp = (const uint16_t *)(const void *)(payload + 14);
+            const uint16_t last = Streaming ? __ldcs(lastp) : *lastp;
             wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
-            const float ws = __half2float(*(const __half *)(wr + b * 34u));
+            const __half *scale = (const __half *)(wr + b * 34u);
+            const float ws = Streaming
+                ? __half2float(__ushort_as_half(__ldcs((const uint16_t *)scale)))
+                : __half2float(*scale);
 #pragma unroll
             for (int r = 0; r < R; r++) {
                 if ((uint32_t)r < take) {
@@ -5752,6 +5758,62 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
             if (local_lane == 0u && row < out_dim && (uint32_t)r < take)
                 out[((uint64_t)row0 + r) * out_dim + row] = total;
         }
+    }
+}
+
+/* HC up has ten Q8 groups. Pair lanes within one warp and retain the
+ * original zero-padded 32-chain tree, without a shared-memory remap. */
+template<int R>
+__global__ static void matmul_q8_hc_warp_pair_kernel(
+        float *out, const unsigned char *w,
+        const int8_t *xq, const float *xs, uint64_t out_dim, uint32_t rows) {
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned group = lane >> 1u, half = lane & 1u;
+    const uint64_t row = (uint64_t)blockIdx.x * 4u + (threadIdx.x >> 5u);
+    if (row >= out_dim) return;
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) acc[r] = 0.0f;
+    if (group < 10u) {
+        const unsigned char *blk = w + row * 340u + group * 34u;
+        const unsigned char *payload = blk + 2u + half * 16u;
+        const uintptr_t address = (uintptr_t)payload;
+        const unsigned shift = (address & 3u) * 8u;
+        const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
+        uint32_t previous = __ldcs(words);
+        int32_t wq[4];
+#pragma unroll
+        for (int j = 0; j < 3; j++) {
+            const uint32_t next = __ldcs(words + j + 1);
+            wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
+            previous = next;
+        }
+        const uint16_t last = __ldcs((const uint16_t *)(payload + 14u));
+        wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
+        const float ws = __half2float(__ushort_as_half(__ldcs((const uint16_t *)blk)));
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            if ((unsigned)r < rows) {
+                const unsigned at = (unsigned)r * 10u + group;
+                const int32_t *xw = (const int32_t *)(xq + at * 32u + half * 16u);
+                int dot = 0;
+#pragma unroll
+                for (int j = 0; j < 4; j++) dot = __dp4a(wq[j], xw[j], dot);
+                dot += __shfl_xor_sync(0x000fffffu, dot, 1);
+                if (!half) acc[r] += ws * xs[at] * (float)dot;
+            }
+        }
+    }
+    /* Original chains 16..31 are zero. Chains 0..15 now occupy the even
+     * lanes; original strides 8,4,2,1 become physical strides 16,8,4,2. */
+#pragma unroll
+    for (int r = 0; r < R; r++) {
+        acc[r] = acc[r] + 0.0f;
+#pragma unroll
+        for (int d = 16; d >= 2; d >>= 1)
+            acc[r] += __shfl_down_sync(0xffffffffu, acc[r], d);
+        if (lane == 0u && (unsigned)r < rows)
+            out[(uint64_t)r * out_dim + row] = acc[r];
     }
 }
 
@@ -16563,11 +16625,29 @@ static int cuda_matmul_q8_0_preq_rows_exact(
     if (use_dp4a && n_rows <= 2u && out_dim > 512u && (in_dim & 31u) == 0u &&
         getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
         (((uintptr_t)wptr & 1u) == 0u)) {
-        matmul_q8_0_preq_pair_lanes_kernel<2><<<
+        /* Real-input first-use timing supports streaming for HC up. Larger
+         * projections retain their ordinary cache policy. */
+        if (in_dim == 320u && out_dim == 10240u &&
+            getenv("DS4_Q8_NO_STREAM_LOADS") == NULL) {
+            if (getenv("DS4_Q8_NO_HC_WARP_PAIR") == NULL) {
+                matmul_q8_hc_warp_pair_kernel<2><<<
+                    (unsigned)((out_dim + 3u) / 4u), 128, 0, cuda_decode_stream()>>>(
+                    (float *)out->ptr, (const unsigned char *)wptr,
+                    xq, xscale, out_dim, n_rows);
+            } else {
+                matmul_q8_0_preq_pair_lanes_kernel<2><<<
+                        dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u),
+                        256, 0, cuda_decode_stream()>>>(
+                        (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
+                        out_dim, n_rows, blocks);
+            }
+        } else {
+        matmul_q8_0_preq_pair_lanes_kernel<2, false><<<
                 dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u),
                 256, 0, cuda_decode_stream()>>>(
                 (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
                 out_dim, n_rows, blocks);
+        }
         return cuda_ok(cudaGetLastError(), "q8 pair lanes launch");
     }
     /* A warp owns an independent output row.  Narrow projections (notably
