@@ -1595,6 +1595,18 @@ ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     t->bytes = bytes;
     return t;
 }
+ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base,
+                                    uint64_t offset, uint64_t bytes) {
+    if (!base || offset > base->bytes || bytes > base->bytes - offset) {
+        return NULL;
+    }
+    ds4_gpu_tensor *t = calloc(1, sizeof(*t));
+    if (!t) return NULL;
+    t->bytes = bytes;
+    t->data = base->data + offset;
+    t->is_view = 1;
+    return t;
+}
 void ds4_gpu_tensor_free(ds4_gpu_tensor *t) {
     if (!t) return;
     if (!t->is_view) free(t->data);
@@ -2089,6 +2101,26 @@ static void test_head_wiring(void) {
                      sizeof(multi_last)) == 0,
               "the last-row forward's multi row differs from the wide "
               "forward's last row");
+
+        const uint64_t prefix = 3u * sizeof(float);
+        const uint64_t input_bytes = sizeof(float) * HEAD_ROWS * HEAD_HC_DIM;
+        ds4_gpu_tensor *device_rows = ds4_gpu_tensor_alloc(prefix + input_bytes);
+        CHECK(device_rows != NULL, "device-row fixture allocation failed");
+        CHECK(ds4_gpu_tensor_write(device_rows, prefix, multi_in,
+                                   input_bytes) != 0,
+              "device-row fixture upload failed");
+        int draft_device[1] = { -1 };
+        float multi_device[HEAD_HC_DIM];
+        CHECK(ds4_qwen4exp_mtp_head_forward_last_device(
+                  &h, next_tokens, device_rows, prefix, 12u, HEAD_ROWS,
+                  draft_device, multi_device, g_err, sizeof(g_err)) == 0,
+              "device-view head forward failed: %s", g_err);
+        CHECK(draft_device[0] == draft_last[0],
+              "device-view forward drafted %d, host forward drafted %d",
+              draft_device[0], draft_last[0]);
+        CHECK(memcmp(multi_device, multi_last, sizeof(multi_device)) == 0,
+              "device-view forward's multi row differs from host input");
+        ds4_gpu_tensor_free(device_rows);
         printf("  last-row entry agrees with the wide forward's final row\n");
     }
 

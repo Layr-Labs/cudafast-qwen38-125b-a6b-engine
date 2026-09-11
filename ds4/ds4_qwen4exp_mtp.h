@@ -317,6 +317,13 @@ typedef struct {
      * selected full distribution lazily only for an API that needs it. */
     bool defer_frontier_logits;
 
+    /* Optional first-step device handoff.  The latest target verify still owns
+     * its pre-final-mixer rows on the device, so a co-resident head can consume
+     * consecutive rows directly instead of staging them through host memory. */
+    int (*draft_rows_device)(void *ctx, const int *next_tokens,
+                             uint32_t pos0, uint32_t n,
+                             int *draft_out, float *multi_out);
+
     /* One row at `pos`: the serial decode step, and the replay a rejecting
      * round runs.  Same outputs for a single row. */
     int (*decode_token)(void *ctx, int token, uint32_t pos,
@@ -746,6 +753,14 @@ int ds4_qwen4exp_mtp_head_forward_last(ds4_qwen4exp_mtp_head *h,
                                        uint32_t pos0, uint32_t n_tokens,
                                        int *draft_out, float *multi_out,
                                        char *err, size_t errlen);
+
+/* The same last-row forward, but directly view a live device multi-stream
+ * span.  No host staging and no device copy are performed. */
+int ds4_qwen4exp_mtp_head_forward_last_device(
+        ds4_qwen4exp_mtp_head *h, const int *next_tokens,
+        const ds4_gpu_tensor *multi_in, uint64_t multi_offset,
+        uint32_t pos0, uint32_t n_tokens,
+        int *draft_out, float *multi_out, char *err, size_t errlen);
 
 /* Greedy argmax with the canonical lowest-id tie-break the shim's ds4s_argmax
  * documents.  Shared so the head and the cycle cannot break ties apart. */

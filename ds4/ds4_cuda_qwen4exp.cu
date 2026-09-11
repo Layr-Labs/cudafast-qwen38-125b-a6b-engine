@@ -2811,7 +2811,10 @@ __device__ __forceinline__ static uint32_t qw_shared_q8_word(const char *p) {
     return qw_pack4((const int8_t *)p);
 }
 
-enum { QW_SH_BM = 16, QW_SH_BN = 32, QW_SH_NT = QW_SH_BN / 8,
+/* A 16-token tile lowers gate/up register use and removes its stack spill
+ * on sm_121. Each output keeps the same group chain and reduction tree;
+ * only the number of independent token columns per block changes. */
+enum { QW_SH_BM = 16, QW_SH_BN = 16, QW_SH_NT = QW_SH_BN / 8,
        QW_SH_WARPS = 16, QW_SH_THREADS = QW_SH_WARPS * 32 };
 
 /* Each warp computes the group sums of dp4a lanes W and W+16 separately:
@@ -4950,6 +4953,35 @@ static int ds4_qwen4exp_hc_fuse_off(void) {
 }
 
 
+/* Fuse the low-rank scale/SiLU with its following Q8 activation quantizer.
+ * The float result is still written to lowrank, exactly as the separate
+ * scale_silu kernel did. The quantizer uses the promoted norm fusion's
+ * explicit fast-math seam so it returns the standalone quantizer's bytes. */
+__global__ static void qwen4exp_hc_silu_quant_kernel(
+        float *lowrank, int8_t *xq, float *xscale,
+        uint64_t pairs, float scale) {
+    const uint64_t pair = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    if (pair >= pairs) return;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint64_t i = pair * 32u + lane;
+    const float z = lowrank[i] * scale;
+    const float v = z * qwen4exp_sigmoid(z);
+    lowrank[i] = v;
+
+    const float vz = qwen4exp_q8_ftz(v);
+    float a = qwen4exp_q8_ftz(fabsf(v));
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+    const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
+    const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
+    if (lane == 0u) xscale[pair] = d;
+    int q = (int)lrintf(qwen4exp_q8_ftz(vz * id));
+    q = q > 127 ? 127 : (q < -128 ? -128 : q);
+    xq[i] = (int8_t)q;
+}
+
+
 /* Returns 1 on success, 0 on a hard failure, -1 when this shape is not one the
  * fused kernels above can serve and the caller should run the unfused chain. */
 static int qwen4exp_hc_mixer_fused_cuda(
@@ -5046,15 +5078,27 @@ static int qwen4exp_hc_mixer_fused_cuda(
                 0, s_off, rows)) {
         return 0;
     }
-    if (!ds4_gpu_qwen4exp_scale_silu_tensor(lowrank_scratch,
-                                            rows * n_lowrank,
-                                            1.0f / (float)n_hc)) {
-        return 0;
-    }
-    if (!ds4_qwen4exp_matmul_q8_0(wide_scratch, up_weight->map,
-                                  up_weight->map_size, up_weight->offset,
-                                  n_lowrank, wide, lowrank_scratch, rows)) {
-        return 0;
+    if ((n_lowrank & 31u) == 0u && n_lowrank <= wide) {
+        /* The down projection has consumed its quant input. Reuse only the
+         * q/scale ranges, leaving the stream norm scales at n_off untouched.
+         * The narrow input is no larger than either reserved range. */
+        const uint64_t low_pairs = (uint64_t)rows * (n_lowrank / 32u);
+        qwen4exp_hc_silu_quant_kernel<<<(unsigned)((low_pairs + 7u) / 8u),
+                                       256, 0, cuda_decode_stream()>>>(
+                (float *)lowrank_scratch->ptr, xq, xscale, low_pairs,
+                1.0f / (float)n_hc);
+        if (!cuda_ok(cudaGetLastError(), "qwen4exp_hc_silu_quant launch")) return 0;
+        if (!ds4_gpu_matmul_q8_0_preq_rows_exact_tensor(
+                    wide_scratch, up_weight->map, up_weight->map_size,
+                    up_weight->offset, n_lowrank, wide, normed_scratch,
+                    0, s_off, rows)) return 0;
+    } else {
+        if (!ds4_gpu_qwen4exp_scale_silu_tensor(lowrank_scratch,
+                                                rows * n_lowrank,
+                                                1.0f / (float)n_hc)) return 0;
+        if (!ds4_qwen4exp_matmul_q8_0(wide_scratch, up_weight->map,
+                                      up_weight->map_size, up_weight->offset,
+                                      n_lowrank, wide, lowrank_scratch, rows)) return 0;
     }
 
     if (inject && rows >= QWEN4EXP_HC_FUSE_MIX_MIN_ROWS) {

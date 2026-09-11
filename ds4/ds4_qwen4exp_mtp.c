@@ -436,9 +436,13 @@ static int mtp_draft_chain(ds4_qwen4exp_mtp_state *st,
         rows_tok[seeds] = next_fed;
         float *multi_out = (1 < st->depth) ? ping : NULL;
         int draft = -1;
-        if (model->draft_rows(model->ctx, rows_tok,
-                              hc_rows + (size_t)k0 * st->hc_dim,
-                              j0, seeds + 1u, &draft, multi_out) != 0) {
+        const int drc = model->draft_rows_device
+            ? model->draft_rows_device(model->ctx, rows_tok, j0, seeds + 1u,
+                                       &draft, multi_out)
+            : model->draft_rows(model->ctx, rows_tok,
+                                hc_rows + (size_t)k0 * st->hc_dim,
+                                j0, seeds + 1u, &draft, multi_out);
+        if (drc != 0) {
             return mtp_fail(err, errlen,
                             "qwen4exp MTP: %u-row head forward at position %u "
                             "failed", seeds + 1u, j0);
@@ -885,6 +889,8 @@ static int mtp_head_time_on(void) {
 static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                                  const int *next_tokens,
                                  const float *multi_in,
+                                 const ds4_gpu_tensor *multi_in_device,
+                                 uint64_t multi_in_offset,
                                  uint32_t pos0, uint32_t n_tokens,
                                  int *draft_out, float *multi_out,
                                  bool last_only,
@@ -918,15 +924,30 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
     }
     for (uint32_t t = 0; t < n_tokens; t++) ids[t] = (int32_t)next_tokens[t];
 
+    const uint64_t multi_bytes = (uint64_t)n_tokens * hc_dim * f;
+    ds4_gpu_tensor *multi_view = NULL;
+    const ds4_gpu_tensor *hyper_input = h->t_hyper;
+    if (multi_in_device) {
+        multi_view = ds4_gpu_tensor_view(
+            multi_in_device, multi_in_offset, multi_bytes);
+        if (!multi_view) {
+            if (ids != ids_stack) free(ids);
+            return mtp_fail(err, errlen,
+                            "qwen4exp MTP head: device multi-stream view "
+                            "failed at position %u over %u rows",
+                            pos0, n_tokens);
+        }
+        hyper_input = multi_view;
+    }
+
     const char *stage = "token upload";
     bool ok = ds4_gpu_tensor_write(h->t_tokens, 0, ids,
                                    (uint64_t)n_tokens * sizeof(int32_t)) != 0;
     if (ids != ids_stack) free(ids);
     MTP_HEAD_TICK(MTP_HEAD_T_TOKEN);
-    if (ok) {
+    if (ok && !multi_in_device) {
         stage = "multi-stream upload";
-        ok = ds4_gpu_tensor_write(h->t_hyper, 0, multi_in,
-                                  (uint64_t)n_tokens * hc_dim * f) != 0;
+        ok = ds4_gpu_tensor_write(h->t_hyper, 0, multi_in, multi_bytes) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_MULTI_IN);
     if (ok) ok = ds4_gpu_begin_commands() != 0;
@@ -953,7 +974,7 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
      * whole n_hc * n_embd row, unlike every hyper-connection norm. */
     if (ok) {
         stage = "hnorm";
-        ok = h->hooks.rms_norm(h->t_h_normed, h->t_hyper,
+        ok = h->hooks.rms_norm(h->t_h_normed, hyper_input,
                                h->head_map, h->head_size, h->hnorm_offset,
                                (uint32_t)hc_dim, (uint32_t)hc_dim, n_tokens,
                                h->rms_eps, h->weight_bias, h->round_bf16) != 0;
@@ -1089,6 +1110,7 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                                  (uint64_t)out_rows * hc_dim * f) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_MULTI_OUT);
+    ds4_gpu_tensor_free(multi_view);
     if (!ok) {
         return mtp_fail(err, errlen,
                         "qwen4exp MTP head: %s failed at position %u over %u "
@@ -1107,7 +1129,8 @@ int ds4_qwen4exp_mtp_head_forward(ds4_qwen4exp_mtp_head *h,
                                   uint32_t pos0, uint32_t n_tokens,
                                   int *draft_out, float *multi_out,
                                   char *err, size_t errlen) {
-    return mtp_head_forward_impl(h, next_tokens, multi_in, pos0, n_tokens,
+    return mtp_head_forward_impl(h, next_tokens, multi_in, NULL, 0,
+                                 pos0, n_tokens,
                                  draft_out, multi_out, false, err, errlen);
 }
 
@@ -1117,7 +1140,22 @@ int ds4_qwen4exp_mtp_head_forward_last(ds4_qwen4exp_mtp_head *h,
                                        uint32_t pos0, uint32_t n_tokens,
                                        int *draft_out, float *multi_out,
                                        char *err, size_t errlen) {
-    return mtp_head_forward_impl(h, next_tokens, multi_in, pos0, n_tokens,
+    return mtp_head_forward_impl(h, next_tokens, multi_in, NULL, 0,
+                                 pos0, n_tokens,
+                                 draft_out, multi_out, true, err, errlen);
+}
+
+int ds4_qwen4exp_mtp_head_forward_last_device(
+        ds4_qwen4exp_mtp_head *h, const int *next_tokens,
+        const ds4_gpu_tensor *multi_in, uint64_t multi_offset,
+        uint32_t pos0, uint32_t n_tokens,
+        int *draft_out, float *multi_out, char *err, size_t errlen) {
+    if (!multi_in) {
+        return mtp_fail(err, errlen,
+                        "qwen4exp MTP head: no device multi-stream input");
+    }
+    return mtp_head_forward_impl(h, next_tokens, NULL, multi_in, multi_offset,
+                                 pos0, n_tokens,
                                  draft_out, multi_out, true, err, errlen);
 }
 
