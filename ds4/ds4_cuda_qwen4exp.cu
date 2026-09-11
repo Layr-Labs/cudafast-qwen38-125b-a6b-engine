@@ -3139,9 +3139,30 @@ __global__ static void qwen4exp_moe_down_q_kernel(
     }
 }
 
+/* Two aligned activation loads supply the same eight DP4A words and the
+ * same two ordered floating contributions as the one-half group helper.
+ * Used only for Q8 shared weights after the host checks input alignment. */
+__device__ __forceinline__ static void qwen4exp_shared_vector_accumulate(
+        float *acc, const int8_t *wq, float wa, float wb,
+        const int8_t *xq, float scale, int sum) {
+    const int4 lo = *(const int4 *)(const void *)xq;
+    const int4 hi = *(const int4 *)(const void *)(xq + 16);
+    int d = 0;
+    d = __dp4a(qwen4exp_load_i8x4(wq + 0), lo.x, d);
+    d = __dp4a(qwen4exp_load_i8x4(wq + 4), lo.y, d);
+    d = __dp4a(qwen4exp_load_i8x4(wq + 8), lo.z, d);
+    d = __dp4a(qwen4exp_load_i8x4(wq + 12), lo.w, d);
+    d = __dp4a(qwen4exp_load_i8x4(wq + 16), hi.x, d);
+    d = __dp4a(qwen4exp_load_i8x4(wq + 20), hi.y, d);
+    d = __dp4a(qwen4exp_load_i8x4(wq + 24), hi.z, d);
+    d = __dp4a(qwen4exp_load_i8x4(wq + 28), hi.w, d);
+    *acc += (wa * scale) * (float)d;
+    *acc += (wb * scale) * (float)sum;
+}
+
 /* The shared expert: no routing, so the tile is consecutive tokens and the
  * decoded group serves all of them. */
-template <int R, int GateType = -1, int UpType = -1>
+template <int R, int GateType = -1, int UpType = -1, bool Vector = false>
 __global__ static void qwen4exp_shared_gateup_q_kernel(
         float *mid,
         const char *gate,
@@ -3187,8 +3208,15 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
                 const int8_t *xqg = xq + at_g * 32u;
                 const float sc = xs[at_g];
                 const int32_t sm = xsum[at_g];
-                qwen4exp_group_accumulate(&ag[r], gw, ga, gb, gh, xqg, sc, sm);
-                qwen4exp_group_accumulate(&au[r], uw, ua, ub, uh, xqg, sc, sm);
+                if constexpr (Vector) {
+                    qwen4exp_shared_vector_accumulate(&ag[r], gw, ga[0], gb[0],
+                                                      xqg, sc, sm);
+                    qwen4exp_shared_vector_accumulate(&au[r], uw, ua[0], ub[0],
+                                                      xqg, sc, sm);
+                } else {
+                    qwen4exp_group_accumulate(&ag[r], gw, ga, gb, gh, xqg, sc, sm);
+                    qwen4exp_group_accumulate(&au[r], uw, ua, ub, uh, xqg, sc, sm);
+                }
             }
         }
     }
@@ -3204,7 +3232,7 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
     }
 }
 
-template <int R, int DownType = -1>
+template <int R, int DownType = -1, bool Vector = false>
 __global__ static void qwen4exp_shared_down_q_kernel(
         float *out,
         const char *down,
@@ -3240,9 +3268,13 @@ __global__ static void qwen4exp_shared_down_q_kernel(
         for (int r = 0; r < R; r++) {
             if ((uint32_t)r < take) {
                 const uint64_t at_g = (uint64_t)(tok0 + (uint32_t)r) * groups + g;
-                qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves,
-                                          mq + at_g * 32u, ms[at_g],
-                                          msum[at_g]);
+                if constexpr (Vector) {
+                    qwen4exp_shared_vector_accumulate(&acc[r], wq, wa[0], wb[0],
+                                                      mq + at_g * 32u, ms[at_g], msum[at_g]);
+                } else {
+                    qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves,
+                                              mq + at_g * 32u, ms[at_g], msum[at_g]);
+                }
             }
         }
     }
@@ -5074,6 +5106,18 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         down_slab->type == DS4_QWEN4EXP_TY_q8_0 &&
         getenv("DS4_QWEN4EXP_MOE_R") == NULL &&
         getenv("DS4_QWEN4EXP_NO_SHARED_R1") == NULL;
+    /* The aligned activation prefix and intermediate groups can be loaded
+     * as two int4 values. Keep the row tile, warp ownership, reduction and
+     * Q8 decoder unchanged. The rotating-weight screen supports two-token
+     * calls; single-token, wider and other-shape calls keep scalar reads. */
+    const bool vector_shared = n_tokens == 2u &&
+        in_dim == 2560u && mid_dim == 640u && out_dim == 2560u &&
+        specialize_shared &&
+        gate_slab->type == DS4_QWEN4EXP_TY_q8_0 &&
+        up_slab->type == DS4_QWEN4EXP_TY_q8_0 &&
+        down_slab->type == DS4_QWEN4EXP_TY_q8_0 &&
+        getenv("DS4_QWEN4EXP_MOE_R") == NULL &&
+        getenv("DS4_QWEN4EXP_NO_SHARED_VECTOR") == NULL;
     const int tile = single_q8 ? 1 : qwen4exp_moe_tile(n_tokens);
     const uint32_t tiles = (n_tokens + (uint32_t)tile - 1u) / (uint32_t)tile;
 
@@ -5170,8 +5214,8 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
                 gate_slab->row_bytes, up_slab->row_bytes,
                 gate_slab->type, up_slab->type, xgroups, mid_dim, n_tokens);
     } else {
-#define QWEN4EXP_SH_GATEUP_IMPL(R, GT, UT) \
-    qwen4exp_shared_gateup_q_kernel<R, GT, UT> \
+#define QWEN4EXP_SH_GATEUP_IMPL(R, GT, UT, V) \
+    qwen4exp_shared_gateup_q_kernel<R, GT, UT, V> \
         <<<dim3((mid_dim + 7u) / 8u, tiles, 1), threads, 0, stream>>>( \
             (float *)mid->ptr, gate, up, xq, xs, xsum, \
             gate_slab->row_bytes, up_slab->row_bytes, \
@@ -5180,10 +5224,15 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
     if (specialize_shared && \
         gate_slab->type == DS4_QWEN4EXP_TY_q8_0 && \
         up_slab->type == DS4_QWEN4EXP_TY_q8_0) { \
-        QWEN4EXP_SH_GATEUP_IMPL(R, DS4_QWEN4EXP_TY_q8_0, \
-                                  DS4_QWEN4EXP_TY_q8_0); \
+        if (vector_shared && (((uintptr_t)xq & 15u) == 0u)) { \
+            QWEN4EXP_SH_GATEUP_IMPL(R, DS4_QWEN4EXP_TY_q8_0, \
+                                  DS4_QWEN4EXP_TY_q8_0, true); \
+        } else { \
+            QWEN4EXP_SH_GATEUP_IMPL(R, DS4_QWEN4EXP_TY_q8_0, \
+                                  DS4_QWEN4EXP_TY_q8_0, false); \
+        } \
     } else { \
-        QWEN4EXP_SH_GATEUP_IMPL(R, -1, -1); \
+        QWEN4EXP_SH_GATEUP_IMPL(R, -1, -1, false); \
     } \
 } while (0)
     if (tile == 8) { QWEN4EXP_SH_GATEUP(8); }
@@ -5229,17 +5278,21 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
                 (const float *)gate_scale->ptr, down_slab->row_bytes,
                 down_slab->type, mgroups, out_dim, n_tokens);
     } else {
-#define QWEN4EXP_SH_DOWN_IMPL(R, DT) \
-    qwen4exp_shared_down_q_kernel<R, DT> \
+#define QWEN4EXP_SH_DOWN_IMPL(R, DT, V) \
+    qwen4exp_shared_down_q_kernel<R, DT, V> \
         <<<dim3((out_dim + 7u) / 8u, tiles, 1), threads, 0, stream>>>( \
             (float *)out->ptr, down, mq, ms, msum, \
             (const float *)gate_scale->ptr, down_slab->row_bytes, \
             down_slab->type, mgroups, out_dim, n_tokens)
 #define QWEN4EXP_SH_DOWN(R) do { \
     if (specialize_shared && down_slab->type == DS4_QWEN4EXP_TY_q8_0) { \
-        QWEN4EXP_SH_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q8_0); \
+        if (vector_shared && (((uintptr_t)mq & 15u) == 0u)) { \
+            QWEN4EXP_SH_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q8_0, true); \
+        } else { \
+            QWEN4EXP_SH_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q8_0, false); \
+        } \
     } else { \
-        QWEN4EXP_SH_DOWN_IMPL(R, -1); \
+        QWEN4EXP_SH_DOWN_IMPL(R, -1, false); \
     } \
 } while (0)
     if (tile == 8) { QWEN4EXP_SH_DOWN(8); }
