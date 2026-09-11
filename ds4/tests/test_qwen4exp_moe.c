@@ -761,6 +761,15 @@ static void run_shared_stage_cases(const uint8_t *model, uint64_t model_bytes,
                                    uint64_t sh_gate_q6k_offset,
                                    uint64_t sh_up_q6k_offset,
                                    uint64_t sh_q5k_row, uint64_t sh_q6k_row) {
+    /* This sweep's oracle is the separate float-mid chain -- it compares the
+     * mid bytes the per-row kernels write -- so the decode-quant fuse stands
+     * down for its whole body; run_moe_decode_quant_case below owns that
+     * fuse's own A/B. */
+    const char *dq_env = getenv("DS4_QWEN4EXP_NO_MOE_DECODE_QUANT_FUSE");
+    char *dq_saved = dq_env ? strdup(dq_env) : NULL;
+    require_ok(!dq_env || dq_saved, "staged shared expert environment copy");
+    require_ok(setenv("DS4_QWEN4EXP_NO_MOE_DECODE_QUANT_FUSE", "1", 1) == 0,
+               "staged shared expert decode-quant pin");
     float *x = calloc((size_t)STAGE_AB_TOKENS * IN_DIM, sizeof(float));
     if (!x) fail("staged shared expert activation allocation");
     for (size_t i = 0; i < (size_t)STAGE_AB_TOKENS * IN_DIM; i++)
@@ -827,6 +836,11 @@ static void run_shared_stage_cases(const uint8_t *model, uint64_t model_bytes,
                         IN_DIM, SHARED_MID, OUT_DIM, x_t,
                         "Q6_K gate/up, Q8_0 down", 0, 1);
 
+    require_ok((dq_saved
+                    ? setenv("DS4_QWEN4EXP_NO_MOE_DECODE_QUANT_FUSE", dq_saved, 1)
+                    : unsetenv("DS4_QWEN4EXP_NO_MOE_DECODE_QUANT_FUSE")) == 0,
+               "staged shared expert decode-quant restore");
+    free(dq_saved);
     ds4_gpu_tensor_free(x_t);
     free(x);
 }
@@ -1280,6 +1294,460 @@ static void run_row_invariance_case(const uint8_t *model,
     free(x);
 }
 
+/* ------------------------------------------------------------------ */
+/* The fused decode-width router tail.
+ *
+ * The fused path folds three launches into one GEMV and one router-tail
+ * kernel: the shared expert's sigmoid gate becomes an extra block-row of the
+ * router's F32 GEMV, and the warp top-k, its softmax and the small expert
+ * group scan become one 512-thread kernel.  Both paths claim to run the same
+ * arithmetic, so this compares them byte for byte at the widths the
+ * speculative cycle actually runs, over logits with exact ties at the
+ * selection boundary -- the discrete decision a numeric drift would move
+ * first.  The logits are compared too: their kernel MOVED translation units
+ * (ds4_cuda.cu compiles with --use_fast_math, ds4_cuda_qwen4exp.cu without),
+ * so this is where a flag-level difference would surface. */
+static void run_router_tail_fuse_case(void) {
+#if defined(__APPLE__)
+    /* The Metal backend never takes the fuse (its router-tail predicate is a
+     * constant zero), so there is no second arm to compare on that link. */
+    puts("router tail fuse comparison: skipped, CUDA-only fusion");
+    return;
+#else
+    /* The twenty-expert exact tie of the router section above, restated so
+     * this case's logit rows are the same construction. */
+    static const int tail_tied[20] = { 3, 9, 17, 40, 63, 100, 128, 129, 200,
+                                       255, 256, 257, 300, 333, 400, 401, 450,
+                                       500, 510, 511 };
+    /* The F32 router slab comes first in the image; the expert and shared
+     * slabs follow main's layout recipe. */
+    const uint64_t router_off = 0;
+    const uint64_t router_bytes = (uint64_t)N_EXPERT * IN_DIM * sizeof(float);
+    const uint64_t gate_off = ALIGN64(router_off + router_bytes);
+    const uint64_t gate_bytes = (uint64_t)N_EXPERT * GATE_EXPERT_BYTES;
+    const uint64_t up_off = ALIGN64(gate_off + gate_bytes);
+    const uint64_t up_bytes = (uint64_t)N_EXPERT * UP_EXPERT_BYTES;
+    const uint64_t down_off = ALIGN64(up_off + up_bytes);
+    const uint64_t down_bytes = (uint64_t)N_EXPERT * DOWN_EXPERT_BYTES;
+    const uint64_t sh_router_off = ALIGN64(down_off + down_bytes);
+    const uint64_t sh_router_bytes = (uint64_t)IN_DIM * sizeof(float);
+    const uint64_t sh_gate_off = ALIGN64(sh_router_off + sh_router_bytes);
+    const uint64_t sh_gate_bytes = (uint64_t)SHARED_MID * Q80_IN_ROW;
+    const uint64_t sh_up_off = ALIGN64(sh_gate_off + sh_gate_bytes);
+    const uint64_t sh_up_bytes = sh_gate_bytes;
+    const uint64_t sh_down_off = ALIGN64(sh_up_off + sh_up_bytes);
+    const uint64_t sh_down_bytes = (uint64_t)OUT_DIM * Q80_MID_ROW;
+    const uint64_t model_bytes = ALIGN64(sh_down_off + sh_down_bytes);
+
+    uint8_t *model = mmap(NULL, model_bytes, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (model == MAP_FAILED) fail("router tail model mmap");
+    for (uint64_t i = 0; i < model_bytes; i++) model[i] = (uint8_t)rng_u32();
+    for (uint32_t e = 0; e < N_EXPERT; e++) {
+        for (uint32_t r = 0; r < MID_DIM; r++) {
+            for (int which = 0; which < 2; which++) {
+                const uint64_t base = (which ? up_off : gate_off) +
+                    (uint64_t)e * GATE_EXPERT_BYTES + (uint64_t)r * Q4K_ROW_BYTES;
+                for (uint32_t b = 0; b < IN_DIM / 256u; b++) {
+                    const uint16_t d = rng_half_scale();
+                    const uint16_t dmin = rng_half_scale();
+                    model[base + b * 144 + 0] = (uint8_t)(d & 0xff);
+                    model[base + b * 144 + 1] = (uint8_t)(d >> 8);
+                    model[base + b * 144 + 2] = (uint8_t)(dmin & 0xff);
+                    model[base + b * 144 + 3] = (uint8_t)(dmin >> 8);
+                }
+            }
+        }
+        for (uint32_t r = 0; r < OUT_DIM; r++) {
+            const uint64_t base = down_off + (uint64_t)e * DOWN_EXPERT_BYTES +
+                                  (uint64_t)r * Q51_ROW_BYTES;
+            for (uint32_t b = 0; b < MID_DIM / 32u; b++) {
+                const uint16_t d = rng_half_scale();
+                const uint16_t m = rng_half_scale();
+                model[base + b * 24 + 0] = (uint8_t)(d & 0xff);
+                model[base + b * 24 + 1] = (uint8_t)(d >> 8);
+                model[base + b * 24 + 2] = (uint8_t)(m & 0xff);
+                model[base + b * 24 + 3] = (uint8_t)(m >> 8);
+            }
+        }
+    }
+    for (uint32_t r = 0; r < SHARED_MID; r++) {
+        for (int which = 0; which < 2; which++) {
+            const uint64_t base = (which ? sh_up_off : sh_gate_off) +
+                                  (uint64_t)r * Q80_IN_ROW;
+            for (uint32_t b = 0; b < IN_DIM / 32u; b++) {
+                const uint16_t d = rng_half_scale();
+                model[base + b * 34 + 0] = (uint8_t)(d & 0xff);
+                model[base + b * 34 + 1] = (uint8_t)(d >> 8);
+            }
+        }
+    }
+    for (uint32_t r = 0; r < OUT_DIM; r++) {
+        const uint64_t base = sh_down_off + (uint64_t)r * Q80_MID_ROW;
+        for (uint32_t b = 0; b < MID_DIM / 32u; b++) {
+            const uint16_t d = rng_half_scale();
+            model[base + b * 34 + 0] = (uint8_t)(d & 0xff);
+            model[base + b * 34 + 1] = (uint8_t)(d >> 8);
+        }
+    }
+    /* The two F32 rows: a dot of these against the activation stays in a
+     * well-conditioned float32 range on both sides of the sigmoid. */
+    for (uint64_t i = 0; i < (uint64_t)N_EXPERT * IN_DIM; i++) {
+        const float v = rng_unit() * 0.05f;
+        memcpy(model + router_off + i * sizeof(float), &v, sizeof(v));
+    }
+    for (uint32_t k = 0; k < IN_DIM; k++) {
+        const float v = rng_unit() * 0.05f;
+        memcpy(model + sh_router_off + (uint64_t)k * sizeof(float), &v, sizeof(v));
+    }
+    require_ok(ds4_gpu_set_model_map(model, model_bytes),
+               "router tail model map");
+
+    /* Three logit rows with exact ties, mirroring the router section above:
+     * row 0 has twenty experts sharing one top score, row 1 is all-tied, row 2
+     * is random with a six-way tie inside the selection. */
+    enum { TAIL_TOKENS = 3 };
+    float *logits = calloc((size_t)TAIL_TOKENS * N_EXPERT, sizeof(float));
+    float *x = calloc((size_t)TAIL_TOKENS * IN_DIM, sizeof(float));
+    if (!logits || !x) fail("router tail allocation");
+    for (int e = 0; e < N_EXPERT; e++) logits[e] = -1.0f;
+    for (int i = 0; i < 20; i++) logits[tail_tied[i]] = 2.5f;
+    for (int e = 0; e < N_EXPERT; e++) logits[(size_t)1 * N_EXPERT + e] = 0.25f;
+    for (int e = 0; e < N_EXPERT; e++)
+        logits[(size_t)2 * N_EXPERT + e] = rng_unit();
+    for (int i = 0; i < 6; i++)
+        logits[(size_t)2 * N_EXPERT + 20 + i * 7] = 7.0f;
+    for (size_t i = 0; i < (size_t)TAIL_TOKENS * IN_DIM; i++)
+        x[i] = rng_unit() * 0.5f;
+
+    ds4_gpu_tensor *logits_t = ds4_gpu_tensor_alloc(
+        (uint64_t)TAIL_TOKENS * N_EXPERT * sizeof(float));
+    ds4_gpu_tensor *sel_t = ds4_gpu_tensor_alloc(
+        (uint64_t)TAIL_TOKENS * N_EXPERT_USED * sizeof(int32_t));
+    ds4_gpu_tensor *w_t = ds4_gpu_tensor_alloc(
+        (uint64_t)TAIL_TOKENS * N_EXPERT_USED * sizeof(float));
+    ds4_gpu_tensor *x_t = ds4_gpu_tensor_alloc(
+        (uint64_t)TAIL_TOKENS * IN_DIM * sizeof(float));
+    ds4_gpu_tensor *mid_t = ds4_gpu_tensor_alloc(
+        (uint64_t)TAIL_TOKENS * N_EXPERT_USED * MID_DIM * sizeof(float));
+    ds4_gpu_tensor *out_t = ds4_gpu_tensor_alloc(
+        (uint64_t)TAIL_TOKENS * OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *part_t = ds4_gpu_tensor_alloc(
+        (uint64_t)TAIL_TOKENS * N_EXPERT_USED * OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *shmid_t = ds4_gpu_tensor_alloc(
+        (uint64_t)TAIL_TOKENS * SHARED_MID * sizeof(float));
+    ds4_gpu_tensor *shgate_t = ds4_gpu_tensor_alloc(
+        (uint64_t)TAIL_TOKENS * sizeof(float));
+    require_ok(logits_t && sel_t && w_t && x_t && mid_t && out_t && part_t &&
+               shmid_t && shgate_t,
+               "router tail tensor allocation");
+    require_ok(ds4_gpu_tensor_write(logits_t, 0, logits,
+                                    (uint64_t)TAIL_TOKENS * N_EXPERT * sizeof(float)),
+               "router tail logit write");
+    require_ok(ds4_gpu_tensor_write(x_t, 0, x,
+                                    (uint64_t)TAIL_TOKENS * IN_DIM * sizeof(float)),
+               "router tail activation write");
+
+    const ds4_gpu_qwen4exp_slab gate_slab = {
+        model, model_bytes, gate_off, GATE_EXPERT_BYTES, Q4K_ROW_BYTES, TYPE_Q4_K };
+    const ds4_gpu_qwen4exp_slab up_slab = {
+        model, model_bytes, up_off, UP_EXPERT_BYTES, Q4K_ROW_BYTES, TYPE_Q4_K };
+    const ds4_gpu_qwen4exp_slab down_slab = {
+        model, model_bytes, down_off, DOWN_EXPERT_BYTES, Q51_ROW_BYTES, TYPE_Q5_1 };
+    const ds4_gpu_qwen4exp_slab sh_router_slab = {
+        model, model_bytes, sh_router_off, 0, IN_DIM * sizeof(float), TYPE_F32 };
+    const ds4_gpu_qwen4exp_slab sh_gate_slab = {
+        model, model_bytes, sh_gate_off, 0, Q80_IN_ROW, TYPE_Q8_0 };
+    const ds4_gpu_qwen4exp_slab sh_up_slab = {
+        model, model_bytes, sh_up_off, 0, Q80_IN_ROW, TYPE_Q8_0 };
+    const ds4_gpu_qwen4exp_slab sh_down_slab = {
+        model, model_bytes, sh_down_off, 0, Q80_MID_ROW, TYPE_Q8_0 };
+
+    /* The switch the graph reads: on at the decode widths, off under the kill
+     * variable and at the width the small scan ends. */
+    unsetenv("DS4_QWEN4EXP_NO_ROUTER_FUSE");
+    if (ds4_gpu_qwen4exp_router_tail_fuse_on(1u) != 1 ||
+        ds4_gpu_qwen4exp_router_tail_fuse_on(7u) != 1 ||
+        ds4_gpu_qwen4exp_router_tail_fuse_on(8u) != 0) {
+        fail("router tail fuse switch is not the small-group envelope");
+    }
+    setenv("DS4_QWEN4EXP_NO_ROUTER_FUSE", "1", 1);
+    if (ds4_gpu_qwen4exp_router_tail_fuse_on(1u) != 0) {
+        fail("router tail fuse switch ignores DS4_QWEN4EXP_NO_ROUTER_FUSE");
+    }
+    /* This case's arms compare the float mid bytes the separate chain writes,
+     * so the decode-quant fuse stands down for the body; the reused-region
+     * arm below re-arms it explicitly where it needs it, and
+     * run_moe_decode_quant_case owns the fuse's own A/B. */
+    setenv("DS4_QWEN4EXP_NO_MOE_DECODE_QUANT_FUSE", "1", 1);
+
+    const size_t logit_n = (size_t)TAIL_TOKENS * N_EXPERT * sizeof(float);
+    const size_t sel_n = (size_t)TAIL_TOKENS * N_EXPERT_USED * sizeof(int32_t);
+    const size_t weight_n = (size_t)TAIL_TOKENS * N_EXPERT_USED * sizeof(float);
+    const size_t mid_n =
+        (size_t)TAIL_TOKENS * N_EXPERT_USED * MID_DIM * sizeof(float);
+    const size_t out_n = (size_t)TAIL_TOKENS * OUT_DIM * sizeof(float);
+    const size_t gate_n = (size_t)TAIL_TOKENS * sizeof(float);
+    int32_t *sel[2] = { calloc(sel_n, 1), calloc(sel_n, 1) };
+    float *lg[2] = { calloc(logit_n, 1), calloc(logit_n, 1) };
+    float *wt[2] = { calloc(weight_n, 1), calloc(weight_n, 1) };
+    float *md[2] = { calloc(mid_n, 1), calloc(mid_n, 1) };
+    float *ot[2] = { calloc(out_n, 1), calloc(out_n, 1) };
+    /* The routed stage's block_out on its own: the routed MoE OVERWRITES
+     * block_out (qwen4exp_moe_down_combine_kernel assigns) and only then does
+     * the shared expert add into it, so a check that re-runs the routed stage
+     * alone -- the declined arm below -- needs a routed-only reference, not
+     * the post-shared-expert bytes ot holds. */
+    float *otr[2] = { calloc(out_n, 1), calloc(out_n, 1) };
+    float *gt[2] = { calloc(gate_n, 1), calloc(gate_n, 1) };
+    const size_t shmid_n =
+        (size_t)TAIL_TOKENS * SHARED_MID * sizeof(float);
+    float *smd[2] = { calloc(shmid_n, 1), calloc(shmid_n, 1) };
+    if (!sel[0] || !sel[1] || !lg[0] || !lg[1] || !wt[0] || !wt[1] ||
+        !md[0] || !md[1] || !ot[0] || !ot[1] || !otr[0] || !otr[1] ||
+        !gt[0] || !gt[1] || !smd[0] || !smd[1]) {
+        fail("router tail comparison allocation");
+    }
+
+    for (uint32_t width = 1; width <= TAIL_TOKENS; width++) {
+        const uint64_t bytes = (uint64_t)width;
+        /* The unfused chain, exactly as the graph runs it under the switch. */
+        require_ok(ds4_gpu_matmul_f32_decode_rows_exact_tensor(
+                       logits_t, model, model_bytes, router_off,
+                       IN_DIM, N_EXPERT, x_t, width),
+                   "router tail unfused logits");
+        require_ok(ds4_gpu_qwen4exp_router_select_tensor(
+                       sel_t, w_t, logits_t, N_EXPERT, N_EXPERT_USED, width),
+                   "router tail unfused select");
+        require_ok(ds4_gpu_qwen4exp_routed_moe_tensor(
+                       out_t, mid_t, part_t, &gate_slab, &up_slab, &down_slab,
+                       IN_DIM, MID_DIM, OUT_DIM, sel_t, w_t, N_EXPERT,
+                       N_EXPERT_USED, x_t, width, N_EXPERT_USED * MID_DIM),
+                   "router tail unfused routed MoE");
+        require_ok(ds4_gpu_tensor_read(out_t, 0, otr[0],
+                                       bytes * OUT_DIM * sizeof(float)),
+                   "router tail unfused routed-only output read");
+        require_ok(ds4_gpu_qwen4exp_shared_expert_tensor(
+                       out_t, shmid_t, shgate_t, &sh_router_slab, &sh_gate_slab,
+                       &sh_up_slab, &sh_down_slab, IN_DIM, SHARED_MID, OUT_DIM,
+                       x_t, width),
+                   "router tail unfused shared expert");
+        require_ok(ds4_gpu_tensor_read(logits_t, 0, lg[0],
+                                       bytes * N_EXPERT * sizeof(float)),
+                   "router tail unfused logit read");
+        require_ok(ds4_gpu_tensor_read(sel_t, 0, sel[0],
+                                       bytes * N_EXPERT_USED * sizeof(int32_t)),
+                   "router tail unfused selection read");
+        require_ok(ds4_gpu_tensor_read(w_t, 0, wt[0],
+                                       bytes * N_EXPERT_USED * sizeof(float)),
+                   "router tail unfused weight read");
+        require_ok(ds4_gpu_tensor_read(mid_t, 0, md[0],
+                                       bytes * N_EXPERT_USED * MID_DIM * sizeof(float)),
+                   "router tail unfused mid read");
+        require_ok(ds4_gpu_tensor_read(out_t, 0, ot[0],
+                                       bytes * OUT_DIM * sizeof(float)),
+                   "router tail unfused output read");
+        require_ok(ds4_gpu_tensor_read(shgate_t, 0, gt[0],
+                                       bytes * sizeof(float)),
+                   "router tail unfused gate read");
+
+        /* The fused chain: two launches, the gate riding the GEMV. */
+        unsetenv("DS4_QWEN4EXP_NO_ROUTER_FUSE");
+        require_ok(ds4_gpu_qwen4exp_router_tail_fuse_on(width) == 1,
+                   "router tail fuse on at the width under test");
+        require_ok(ds4_gpu_qwen4exp_router_logits_gate_tensor(
+                       logits_t, shgate_t, model, model_bytes, router_off,
+                       &sh_router_slab, IN_DIM, N_EXPERT, x_t, width),
+                   "router tail fused logits + gate");
+        require_ok(ds4_gpu_qwen4exp_router_tail_moe_tensor(
+                       out_t, mid_t, part_t, &gate_slab, &up_slab, &down_slab,
+                       IN_DIM, MID_DIM, OUT_DIM, sel_t, w_t, logits_t,
+                       N_EXPERT, N_EXPERT_USED, x_t, width,
+                       N_EXPERT_USED * MID_DIM, NULL),
+                   "router tail fused MoE");
+        require_ok(ds4_gpu_tensor_read(out_t, 0, otr[1],
+                                       bytes * OUT_DIM * sizeof(float)),
+                   "router tail fused routed-only output read");
+        require_ok(ds4_gpu_qwen4exp_shared_expert_preq_tensor(
+                       out_t, shmid_t, shgate_t, &sh_router_slab, &sh_gate_slab,
+                       &sh_up_slab, &sh_down_slab, IN_DIM, SHARED_MID, OUT_DIM,
+                       x_t, width, NULL, 1),
+                   "router tail fused shared expert");
+        require_ok(ds4_gpu_tensor_read(logits_t, 0, lg[1],
+                                       bytes * N_EXPERT * sizeof(float)),
+                   "router tail fused logit read");
+        require_ok(ds4_gpu_tensor_read(sel_t, 0, sel[1],
+                                       bytes * N_EXPERT_USED * sizeof(int32_t)),
+                   "router tail fused selection read");
+        require_ok(ds4_gpu_tensor_read(w_t, 0, wt[1],
+                                       bytes * N_EXPERT_USED * sizeof(float)),
+                   "router tail fused weight read");
+        require_ok(ds4_gpu_tensor_read(mid_t, 0, md[1],
+                                       bytes * N_EXPERT_USED * MID_DIM * sizeof(float)),
+                   "router tail fused mid read");
+        require_ok(ds4_gpu_tensor_read(out_t, 0, ot[1],
+                                       bytes * OUT_DIM * sizeof(float)),
+                   "router tail fused output read");
+        require_ok(ds4_gpu_tensor_read(shgate_t, 0, gt[1],
+                                       bytes * sizeof(float)),
+                   "router tail fused gate read");
+
+        const char *names[7] = { "logits", "selected", "weights",
+                                 "mid", "block_out_routed", "block_out",
+                                 "shexp_gate" };
+        const void *a[7] = { lg[0], sel[0], wt[0], md[0], otr[0], ot[0], gt[0] };
+        const void *b[7] = { lg[1], sel[1], wt[1], md[1], otr[1], ot[1], gt[1] };
+        const size_t ns[7] = { (size_t)width * N_EXPERT * sizeof(float),
+                               (size_t)width * N_EXPERT_USED * sizeof(int32_t),
+                               (size_t)width * N_EXPERT_USED * sizeof(float),
+                               (size_t)width * N_EXPERT_USED * MID_DIM * sizeof(float),
+                               (size_t)width * OUT_DIM * sizeof(float),
+                               (size_t)width * OUT_DIM * sizeof(float),
+                               (size_t)width * sizeof(float) };
+        for (int i = 0; i < 7; i++) {
+            if (memcmp(a[i], b[i], ns[i]) != 0) {
+                fprintf(stderr, "router tail %s differs from the unfused "
+                        "chain at width %u\n", names[i], width);
+                fail("the fused router tail changed a number");
+            }
+        }
+        printf("router tail fused == unfused at width %u: logits, selected, "
+               "weights, mid, routed block_out, block_out, shexp_gate all "
+               "byte-identical\n", width);
+
+        /* The same entry under the switch must fall back to the standalone
+         * kernels and still match: the A/B's own escape hatch is exercised,
+         * not just trusted. */
+        setenv("DS4_QWEN4EXP_NO_ROUTER_FUSE", "1", 1);
+        require_ok(ds4_gpu_qwen4exp_router_tail_moe_tensor(
+                       out_t, mid_t, part_t, &gate_slab, &up_slab, &down_slab,
+                       IN_DIM, MID_DIM, OUT_DIM, sel_t, w_t, logits_t,
+                       N_EXPERT, N_EXPERT_USED, x_t, width,
+                       N_EXPERT_USED * MID_DIM, NULL),
+                   "router tail declined MoE");
+        require_ok(ds4_gpu_tensor_read(sel_t, 0, sel[1],
+                                       bytes * N_EXPERT_USED * sizeof(int32_t)),
+                   "router tail declined selection read");
+        require_ok(ds4_gpu_tensor_read(w_t, 0, wt[1],
+                                       bytes * N_EXPERT_USED * sizeof(float)),
+                   "router tail declined weight read");
+        require_ok(ds4_gpu_tensor_read(mid_t, 0, md[1],
+                                       bytes * N_EXPERT_USED * MID_DIM * sizeof(float)),
+                   "router tail declined mid read");
+        require_ok(ds4_gpu_tensor_read(out_t, 0, ot[1],
+                                       bytes * OUT_DIM * sizeof(float)),
+                   "router tail declined output read");
+        /* The declined call stops at the routed stage: the shared expert is
+         * not part of the router tail, so its block_out is the ROUTED-ONLY
+         * one and the reference is otr[0], read before the unfused arm's
+         * shared expert added into block_out.  Comparing against ot[0] here
+         * would demand routed == routed + shared and fail at every width. */
+        if (memcmp(sel[0], sel[1], ns[1]) != 0 ||
+            memcmp(wt[0], wt[1], ns[2]) != 0 ||
+            memcmp(md[0], md[1], ns[3]) != 0 ||
+            memcmp(otr[0], ot[1], ns[4]) != 0) {
+            fail("the declined router tail is not the unfused chain");
+        }
+        printf("router tail declined under DS4_QWEN4EXP_NO_ROUTER_FUSE at "
+               "width %u: still byte-identical\n", width);
+
+        /* The shared expert's x quantise under the pre-quantised region.  The
+         * graph's fused branch hands the shared expert the region pointer the
+         * routed launch just wrote (the decode-quant switch decides whether
+         * it hands one at all), so the shared expert reads those bytes
+         * instead of running its own byte-identical duplicate.  The dispatch
+         * stays stood down (the pin above) so both passes write the float mid
+         * and it stays comparable; the region pointer is the ONLY thing that
+         * differs.  Reference: the entry quantising x itself, exactly as it
+         * did before the pointer existed.  The candidate takes the pointer
+         * the routed call hands out -- which must be non-NULL and is seated
+         * at that call's layout offset, not at the tier scratch's base, so
+         * this A/B is where an assumed-offset regression would surface.
+         * Every byte must agree. */
+        unsetenv("DS4_QWEN4EXP_NO_ROUTER_FUSE");
+        unsetenv("DS4_QWEN4EXP_NO_MOE_DECODE_QUANT_FUSE");
+        if (ds4_gpu_qwen4exp_moe_decode_quant_fuse_on() != 1) {
+            fail("decode quant fuse switch is not on by default");
+        }
+        setenv("DS4_QWEN4EXP_NO_MOE_DECODE_QUANT_FUSE", "1", 1);
+        if (ds4_gpu_qwen4exp_moe_decode_quant_fuse_on() != 0) {
+            fail("decode quant fuse switch ignores its kill variable");
+        }
+        require_ok(ds4_gpu_qwen4exp_router_tail_moe_tensor(
+                       out_t, mid_t, part_t, &gate_slab, &up_slab, &down_slab,
+                       IN_DIM, MID_DIM, OUT_DIM, sel_t, w_t, logits_t,
+                       N_EXPERT, N_EXPERT_USED, x_t, width,
+                       N_EXPERT_USED * MID_DIM, NULL),
+                   "shared x reuse reference routed MoE");
+        require_ok(ds4_gpu_qwen4exp_shared_expert_preq_tensor(
+                       out_t, shmid_t, shgate_t, &sh_router_slab, &sh_gate_slab,
+                       &sh_up_slab, &sh_down_slab, IN_DIM, SHARED_MID, OUT_DIM,
+                       x_t, width, NULL, 1),
+                   "shared x reuse reference expert");
+        require_ok(ds4_gpu_tensor_read(out_t, 0, ot[1],
+                                       bytes * OUT_DIM * sizeof(float)),
+                   "shared x reuse reference output read");
+        require_ok(ds4_gpu_tensor_read(shmid_t, 0, smd[1],
+                                       bytes * SHARED_MID * sizeof(float)),
+                   "shared x reuse reference mid read");
+        require_ok(ds4_gpu_tensor_read(shgate_t, 0, gt[1],
+                                       bytes * sizeof(float)),
+                   "shared x reuse reference gate read");
+        ds4_gpu_qwen4exp_moe_handoff ho = { NULL, NULL, 0 };
+        require_ok(ds4_gpu_qwen4exp_router_tail_moe_tensor(
+                       out_t, mid_t, part_t, &gate_slab, &up_slab, &down_slab,
+                       IN_DIM, MID_DIM, OUT_DIM, sel_t, w_t, logits_t,
+                       N_EXPERT, N_EXPERT_USED, x_t, width,
+                       N_EXPERT_USED * MID_DIM, &ho),
+                   "shared x reuse candidate routed MoE");
+        require_ok(ho.xq != NULL && ho.seat != NULL && ho.seat_bytes > 0,
+                   "routed MoE exported its quantised-x region and seat");
+        require_ok(ds4_gpu_qwen4exp_shared_expert_preq_tensor(
+                       out_t, shmid_t, shgate_t, &sh_router_slab, &sh_gate_slab,
+                       &sh_up_slab, &sh_down_slab, IN_DIM, SHARED_MID, OUT_DIM,
+                       x_t, width, &ho, 1),
+                   "shared x reuse candidate expert");
+        require_ok(ds4_gpu_tensor_read(out_t, 0, ot[0],
+                                       bytes * OUT_DIM * sizeof(float)),
+                   "shared x reuse candidate output read");
+        require_ok(ds4_gpu_tensor_read(shmid_t, 0, smd[0],
+                                       bytes * SHARED_MID * sizeof(float)),
+                   "shared x reuse candidate mid read");
+        require_ok(ds4_gpu_tensor_read(shgate_t, 0, gt[0],
+                                       bytes * sizeof(float)),
+                   "shared x reuse candidate gate read");
+        if (memcmp(ot[0], ot[1], bytes * OUT_DIM * sizeof(float)) != 0 ||
+            memcmp(smd[0], smd[1], bytes * SHARED_MID * sizeof(float)) != 0 ||
+            memcmp(gt[0], gt[1], bytes * sizeof(float)) != 0) {
+            fprintf(stderr, "shared x reuse changed a byte at width %u\n",
+                    width);
+            fail("the reused region is not the duplicate quantise it replaces");
+        }
+        printf("shared expert pre_quantized_xq==routed quantise at width %u: "
+               "block_out, shexp_mid, shexp_gate all byte-identical\n", width);
+    }
+
+    unsetenv("DS4_QWEN4EXP_NO_MOE_DECODE_QUANT_FUSE");
+    free(smd[1]); free(smd[0]);
+    free(gt[1]); free(gt[0]); free(ot[1]); free(ot[0]);
+    free(otr[1]); free(otr[0]); free(md[1]); free(md[0]);
+    free(wt[1]); free(wt[0]);
+    free(lg[1]); free(lg[0]); free(sel[1]); free(sel[0]);
+    ds4_gpu_tensor_free(shgate_t);
+    ds4_gpu_tensor_free(shmid_t);
+    ds4_gpu_tensor_free(part_t);
+    ds4_gpu_tensor_free(out_t);
+    ds4_gpu_tensor_free(mid_t);
+    ds4_gpu_tensor_free(x_t);
+    ds4_gpu_tensor_free(w_t);
+    ds4_gpu_tensor_free(sel_t);
+    ds4_gpu_tensor_free(logits_t);
+    free(x);
+    free(logits);
+    munmap(model, model_bytes);
+#endif
+}
+
 /* The gate/up MMA tile's fused epilogue quantises the activated mid into the
  * Q8_0 scratch itself, so the float mid is never written and the standalone
  * quantise pass never runs.  Two things must hold at every prefill width the
@@ -1419,6 +1887,259 @@ static void run_moe_epilogue_case(const uint8_t *model,
     free(ref);
     free(logits);
     free(x);
+}
+
+/* The decode-width quantise fuse: below eight rows the gate/up producers are
+ * the qz twins, which quantise the activated mid into the Q8_0 scratch in
+ * their epilogues and never write the float mid -- the MMA tile's epilogue,
+ * moved down to the widths the speculative cycle actually runs.  The twins
+ * are opt-in (DS4_QWEN4EXP_MOE_DECODE_QUANT_FUSE) until this case passes on
+ * the box; the kill switch stands the whole fuse down.  Two things must hold
+ * at every decode width, through the production call shape (the router tail
+ * entry that builds its own selection, then the shared expert reading the
+ * routed call's quantised x):
+ *
+ *   - the outputs are bit-identical to the chain stood down with
+ *     DS4_QWEN4EXP_NO_MOE_DECODE_QUANT_FUSE=1.  The down legs are
+ *     deterministic functions of the quantised scratch and nothing else, so
+ *     identical bits are the observable of identical quantised bytes -- the
+ *     routed mid, the shared mid and both down legs all ride on them; and
+ *   - the float mids are untouched by the fused pass: poisoned buffers come
+ *     back exactly as they were written, where the stood-down chain overwrites
+ *     them with the activated values.  The pass-0 read asserts the stood-down
+ *     chain really does write both mids, which keeps the pass-1 assertion from
+ *     being vacuous -- and is also where an invalid router pair would surface:
+ *     the tail's defensive zeroing would disturb the poison.
+ *
+ * Widths 1 and 2 take the split twin, 3 the R=8 ladder rung and 7 the R=4
+ * rung, on both the routed and the shared side. */
+static void run_moe_decode_quant_case(const uint8_t *model,
+                                      uint64_t model_bytes,
+                                      uint64_t gate_offset,
+                                      uint64_t up_offset,
+                                      uint64_t down_offset,
+                                      uint64_t sh_router_offset,
+                                      uint64_t sh_gate_offset,
+                                      uint64_t sh_up_offset,
+                                      uint64_t sh_down_offset) {
+#if defined(__APPLE__)
+    /* The decode-quant fuses are CUDA launch-count decisions (the Metal
+     * predicate is a constant zero and the Metal preq entry quantises x
+     * itself), so there is no fused arm to compare on that link -- and the
+     * Metal chain always writes both float mids, so the poison assertions
+     * below are CUDA's question, not this backend's. */
+    (void)model; (void)model_bytes; (void)gate_offset; (void)up_offset;
+    (void)down_offset; (void)sh_router_offset; (void)sh_gate_offset;
+    (void)sh_up_offset; (void)sh_down_offset;
+    puts("MoE decode-quant fuse comparison: skipped, CUDA-only fusion");
+    return;
+#else
+    /* The twenty-expert exact tie of the router section above, restated so
+     * this case's logit rows are the same construction. */
+    static const int dq_tied[20] = { 3, 9, 17, 40, 63, 100, 128, 129, 200,
+                                     255, 256, 257, 300, 333, 400, 401, 450,
+                                     500, 510, 511 };
+    enum { DQ_TOKENS = 7 };
+    const uint32_t widths[] = {1, 2, 3, 7};
+    const uint64_t x_bytes = (uint64_t)DQ_TOKENS * IN_DIM * sizeof(float);
+    const uint64_t out_bytes = (uint64_t)DQ_TOKENS * OUT_DIM * sizeof(float);
+    const uint64_t mid_bytes =
+        (uint64_t)DQ_TOKENS * N_EXPERT_USED * MID_DIM * sizeof(float);
+    const uint64_t shmid_bytes = (uint64_t)DQ_TOKENS * SHARED_MID * sizeof(float);
+    const size_t out_floats = out_bytes / sizeof(float);
+
+    float *x = calloc((size_t)DQ_TOKENS * IN_DIM, sizeof(float));
+    float *logits = calloc((size_t)DQ_TOKENS * N_EXPERT, sizeof(float));
+    float *ref = malloc(out_bytes);
+    float *got = malloc(out_bytes);
+    float *mid_host = malloc(mid_bytes);
+    float *shmid_host = malloc(shmid_bytes);
+    float *md[2] = { malloc(mid_bytes), malloc(mid_bytes) };
+    float *smd[2] = { malloc(shmid_bytes), malloc(shmid_bytes) };
+    float *otr[2] = { malloc(out_bytes), malloc(out_bytes) };
+    float *gt[2] = { malloc((size_t)DQ_TOKENS * sizeof(float)),
+                     malloc((size_t)DQ_TOKENS * sizeof(float)) };
+    if (!x || !logits || !ref || !got || !mid_host || !shmid_host ||
+        !md[0] || !md[1] || !smd[0] || !smd[1] || !otr[0] || !otr[1] ||
+        !gt[0] || !gt[1]) {
+        fail("decode quant allocation");
+    }
+    for (size_t i = 0; i < (size_t)DQ_TOKENS * IN_DIM; i++) x[i] = rng_unit() * 0.5f;
+    /* Three tie shapes over the first rows, random elsewhere: exact ties at
+     * the selection boundary are the discrete decision a drift moves first. */
+    for (int e = 0; e < N_EXPERT; e++) logits[e] = -1.0f;
+    for (int i = 0; i < 20; i++) logits[dq_tied[i]] = 2.5f;
+    for (int e = 0; e < N_EXPERT; e++) logits[(size_t)1 * N_EXPERT + e] = 0.25f;
+    for (int e = 0; e < N_EXPERT; e++)
+        logits[(size_t)2 * N_EXPERT + e] = rng_unit();
+    for (int i = 0; i < 6; i++)
+        logits[(size_t)2 * N_EXPERT + 20 + i * 7] = 7.0f;
+    for (size_t r = (size_t)3 * N_EXPERT; r < (size_t)DQ_TOKENS * N_EXPERT; r++)
+        logits[r] = rng_unit();
+
+    ds4_gpu_tensor *logits_t = ds4_gpu_tensor_alloc(
+        (uint64_t)DQ_TOKENS * N_EXPERT * sizeof(float));
+    ds4_gpu_tensor *sel_t = ds4_gpu_tensor_alloc(
+        (uint64_t)DQ_TOKENS * N_EXPERT_USED * sizeof(int32_t));
+    ds4_gpu_tensor *w_t = ds4_gpu_tensor_alloc(
+        (uint64_t)DQ_TOKENS * N_EXPERT_USED * sizeof(float));
+    ds4_gpu_tensor *x_t = ds4_gpu_tensor_alloc(x_bytes);
+    ds4_gpu_tensor *mid_t = ds4_gpu_tensor_alloc(mid_bytes);
+    ds4_gpu_tensor *out_t = ds4_gpu_tensor_alloc(out_bytes);
+    ds4_gpu_tensor *part_t = ds4_gpu_tensor_alloc(
+        (uint64_t)DQ_TOKENS * N_EXPERT_USED * OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *shmid_t = ds4_gpu_tensor_alloc(shmid_bytes);
+    ds4_gpu_tensor *shgate_t = ds4_gpu_tensor_alloc(
+        (uint64_t)DQ_TOKENS * sizeof(float));
+    require_ok(logits_t && sel_t && w_t && x_t && mid_t && out_t && part_t &&
+               shmid_t && shgate_t,
+               "decode quant tensor allocation");
+    require_ok(ds4_gpu_tensor_write(logits_t, 0, logits,
+                                    (uint64_t)DQ_TOKENS * N_EXPERT * sizeof(float)),
+               "decode quant logit write");
+    require_ok(ds4_gpu_tensor_write(x_t, 0, x, x_bytes),
+               "decode quant activation write");
+
+    const ds4_gpu_qwen4exp_slab gate_slab = {
+        model, model_bytes, gate_offset, GATE_EXPERT_BYTES, Q4K_ROW_BYTES, TYPE_Q4_K };
+    const ds4_gpu_qwen4exp_slab up_slab = {
+        model, model_bytes, up_offset, UP_EXPERT_BYTES, Q4K_ROW_BYTES, TYPE_Q4_K };
+    const ds4_gpu_qwen4exp_slab down_slab = {
+        model, model_bytes, down_offset, DOWN_EXPERT_BYTES, Q51_ROW_BYTES, TYPE_Q5_1 };
+    const ds4_gpu_qwen4exp_slab sh_router_slab = {
+        model, model_bytes, sh_router_offset, 0, IN_DIM * sizeof(float), TYPE_F32 };
+    const ds4_gpu_qwen4exp_slab sh_gate_slab = {
+        model, model_bytes, sh_gate_offset, 0, Q80_IN_ROW, TYPE_Q8_0 };
+    const ds4_gpu_qwen4exp_slab sh_up_slab = {
+        model, model_bytes, sh_up_offset, 0, Q80_IN_ROW, TYPE_Q8_0 };
+    const ds4_gpu_qwen4exp_slab sh_down_slab = {
+        model, model_bytes, sh_down_offset, 0, Q80_MID_ROW, TYPE_Q8_0 };
+
+    const char *env = getenv("DS4_QWEN4EXP_NO_MOE_DECODE_QUANT_FUSE");
+    char *saved = env ? strdup(env) : NULL;
+    require_ok(!env || saved, "decode quant environment copy");
+    const char *opt_env = getenv("DS4_QWEN4EXP_MOE_DECODE_QUANT_FUSE");
+    char *opt_saved = opt_env ? strdup(opt_env) : NULL;
+    require_ok(!opt_env || opt_saved, "decode quant opt-in copy");
+    unsetenv("DS4_QWEN4EXP_NO_ROUTER_FUSE");
+    for (size_t wi = 0; wi < sizeof(widths) / sizeof(widths[0]); wi++) {
+        const uint32_t w = widths[wi];
+        const uint64_t bytes = (uint64_t)w;
+        for (int pass = 0; pass < 2; pass++) {
+            /* Pass 0 stands the whole fuse down and is the reference; pass 1
+             * arms the epilogues' opt-in, the combination the decode graph
+             * takes once the box has promoted it. */
+            require_ok((pass == 0
+                ? setenv("DS4_QWEN4EXP_NO_MOE_DECODE_QUANT_FUSE", "1", 1)
+                : unsetenv("DS4_QWEN4EXP_NO_MOE_DECODE_QUANT_FUSE")) == 0,
+                "decode quant dispatch switch");
+            require_ok((pass == 1
+                ? setenv("DS4_QWEN4EXP_MOE_DECODE_QUANT_FUSE", "1", 1)
+                : unsetenv("DS4_QWEN4EXP_MOE_DECODE_QUANT_FUSE")) == 0,
+                "decode quant epilogue opt-in switch");
+            memset(mid_host, 0xab, mid_bytes);
+            memset(shmid_host, 0xcd, shmid_bytes);
+            require_ok(ds4_gpu_tensor_write(mid_t, 0, mid_host, mid_bytes),
+                       "decode quant mid poison");
+            require_ok(ds4_gpu_tensor_write(shmid_t, 0, shmid_host, shmid_bytes),
+                       "decode quant shmid poison");
+            for (size_t i = 0; i < out_floats; i++)
+                got[i] = (float)((int)(i % 17) - 8) * 0.125f;
+            require_ok(ds4_gpu_tensor_write(out_t, 0, got, out_bytes),
+                       "decode quant out poison");
+            /* The production shape: the routed call builds its own selection
+             * from the logits and hands back the quantised-x region it wrote,
+             * then the shared expert takes that region at the graph's switch
+             * value -- the pointer when the fuse is on, NULL under the kill
+             * switch, exactly what the decode graph passes.  The shared gate
+             * runs standalone here; the fold that skips it is the
+             * router-tail case's own comparison. */
+            ds4_gpu_qwen4exp_moe_handoff ho = { NULL, NULL, 0 };
+            require_ok(ds4_gpu_qwen4exp_router_tail_moe_tensor(
+                           out_t, mid_t, part_t, &gate_slab, &up_slab, &down_slab,
+                           IN_DIM, MID_DIM, OUT_DIM, sel_t, w_t, logits_t,
+                           N_EXPERT, N_EXPERT_USED, x_t, w,
+                           N_EXPERT_USED * MID_DIM, &ho),
+                       "decode quant routed MoE");
+            require_ok(ho.xq != NULL && ho.seat != NULL && ho.seat_bytes > 0,
+                       "decode quant routed MoE exported its xq region and "
+                       "seat");
+            require_ok(ds4_gpu_tensor_read(out_t, 0, otr[pass],
+                                           bytes * OUT_DIM * sizeof(float)),
+                       "decode quant routed-only output read");
+            require_ok(ds4_gpu_qwen4exp_shared_expert_preq_tensor(
+                           out_t, shmid_t, shgate_t, &sh_router_slab,
+                           &sh_gate_slab, &sh_up_slab, &sh_down_slab,
+                           IN_DIM, SHARED_MID, OUT_DIM, x_t, w,
+                           ds4_gpu_qwen4exp_moe_decode_quant_fuse_on()
+                               ? &ho : NULL,
+                           0),
+                       "decode quant shared expert");
+            require_ok(ds4_gpu_tensor_read(out_t, 0, pass == 0 ? ref : got,
+                                           out_bytes),
+                       "decode quant output read");
+            require_ok(ds4_gpu_tensor_read(shgate_t, 0, gt[pass],
+                                           bytes * sizeof(float)),
+                       "decode quant gate read");
+            require_ok(ds4_gpu_tensor_read(mid_t, 0, md[pass], mid_bytes),
+                       "decode quant mid read");
+            require_ok(ds4_gpu_tensor_read(shmid_t, 0, smd[pass], shmid_bytes),
+                       "decode quant shmid read");
+            if (pass == 0) {
+                if (memcmp(md[0], mid_host, mid_bytes) == 0)
+                    fail("the stood-down chain did not write the routed mid");
+                if (memcmp(smd[0], shmid_host, shmid_bytes) == 0)
+                    fail("the stood-down chain did not write the shared mid");
+            } else {
+                const size_t live = (size_t)w * OUT_DIM;
+                size_t bad = 0;
+                for (size_t i = 0; i < live; i++) {
+                    if (memcmp(&ref[i], &got[i], sizeof(float)) != 0) bad++;
+                }
+                printf("MoE decode-quant fuse at width %u: %zu of %zu outputs "
+                       "differ from the stood-down chain\n", w, bad, live);
+                if (bad != 0)
+                    fail("the decode-quant fuse changed a number the "
+                         "stood-down chain produces");
+                if (memcmp(otr[0], otr[1], bytes * OUT_DIM * sizeof(float)) != 0)
+                    fail("the fused routed stage is not the stood-down one");
+                if (memcmp(gt[0], gt[1], bytes * sizeof(float)) != 0)
+                    fail("the fused chain moved the shared gate");
+                if (memcmp(md[1], mid_host, mid_bytes) != 0)
+                    fail("the fused leg wrote the routed mid buffer");
+                if (memcmp(smd[1], shmid_host, shmid_bytes) != 0)
+                    fail("the fused leg wrote the shared mid buffer");
+            }
+        }
+    }
+    require_ok((saved
+                    ? setenv("DS4_QWEN4EXP_NO_MOE_DECODE_QUANT_FUSE", saved, 1)
+                    : unsetenv("DS4_QWEN4EXP_NO_MOE_DECODE_QUANT_FUSE")) == 0,
+               "decode quant environment restore");
+    free(saved);
+    require_ok((opt_saved
+                    ? setenv("DS4_QWEN4EXP_MOE_DECODE_QUANT_FUSE", opt_saved, 1)
+                    : unsetenv("DS4_QWEN4EXP_MOE_DECODE_QUANT_FUSE")) == 0,
+               "decode quant opt-in restore");
+    free(opt_saved);
+    ds4_gpu_tensor_free(shgate_t);
+    ds4_gpu_tensor_free(shmid_t);
+    ds4_gpu_tensor_free(part_t);
+    ds4_gpu_tensor_free(out_t);
+    ds4_gpu_tensor_free(mid_t);
+    ds4_gpu_tensor_free(x_t);
+    ds4_gpu_tensor_free(w_t);
+    ds4_gpu_tensor_free(sel_t);
+    ds4_gpu_tensor_free(logits_t);
+    free(gt[1]); free(gt[0]); free(otr[1]); free(otr[0]);
+    free(smd[1]); free(smd[0]); free(md[1]); free(md[0]);
+    free(shmid_host);
+    free(mid_host);
+    free(got);
+    free(ref);
+    free(logits);
+    free(x);
+#endif
 }
 
 /* The grouping scan is internal scratch, so exercise it through the routed-MoE
@@ -1705,6 +2426,14 @@ static void run_group_scan_boundary_cases(void) {
 }
 
 static void run_production_expert_cases(void) {
+    /* The split-vs-joint comparison below covers the mid bytes at the decode
+     * widths, so the decode-quant fuse stands down for this whole case;
+     * run_moe_decode_quant_case owns that fuse's A/B. */
+    const char *dq_env = getenv("DS4_QWEN4EXP_NO_MOE_DECODE_QUANT_FUSE");
+    char *dq_saved = dq_env ? strdup(dq_env) : NULL;
+    require_ok(!dq_env || dq_saved, "production expert environment copy");
+    require_ok(setenv("DS4_QWEN4EXP_NO_MOE_DECODE_QUANT_FUSE", "1", 1) == 0,
+               "production expert decode-quant pin");
     const uint32_t n_gate_up = (uint32_t)(sizeof(PROD_GATE_UP_TYPES) /
                                           sizeof(PROD_GATE_UP_TYPES[0]));
     const uint32_t n_down = (uint32_t)(sizeof(PROD_DOWN_TYPES) /
@@ -2071,6 +2800,11 @@ static void run_production_expert_cases(void) {
     free(expected);
     free(got);
     free(x);
+    require_ok((dq_saved
+                    ? setenv("DS4_QWEN4EXP_NO_MOE_DECODE_QUANT_FUSE", dq_saved, 1)
+                    : unsetenv("DS4_QWEN4EXP_NO_MOE_DECODE_QUANT_FUSE")) == 0,
+               "production expert decode-quant restore");
+    free(dq_saved);
     ds4_gpu_tensor_free(out_t);
     ds4_gpu_tensor_free(mid_t);
     ds4_gpu_tensor_free(x_t);
@@ -2157,6 +2891,14 @@ static void run_shared_exact_case(uint32_t in_dim, uint32_t mid_dim,
     const char *env = getenv("DS4_QWEN4EXP_SHARED_STAGE");
     char *saved = env ? strdup(env) : NULL;
     require_ok(!env || saved, "shared exact environment copy");
+    /* The reference arm pins the per-row kernels and the comparison covers
+     * the mid bytes, so the decode-quant fuse stands down here too;
+     * run_moe_decode_quant_case owns that fuse's A/B. */
+    const char *dq_env = getenv("DS4_QWEN4EXP_NO_MOE_DECODE_QUANT_FUSE");
+    char *dq_saved = dq_env ? strdup(dq_env) : NULL;
+    require_ok(!dq_env || dq_saved, "shared exact decode-quant copy");
+    require_ok(setenv("DS4_QWEN4EXP_NO_MOE_DECODE_QUANT_FUSE", "1", 1) == 0,
+               "shared exact decode-quant pin");
     for (size_t w = 0; w < sizeof(widths) / sizeof(widths[0]); w++) {
         for (int add = 0; add < 2; add++) {
             for (int pass = 0; pass < 2; pass++) {
@@ -2203,6 +2945,11 @@ static void run_shared_exact_case(uint32_t in_dim, uint32_t mid_dim,
                       : unsetenv("DS4_QWEN4EXP_SHARED_STAGE")) == 0,
                "shared exact environment restore");
     free(saved);
+    require_ok((dq_saved
+                    ? setenv("DS4_QWEN4EXP_NO_MOE_DECODE_QUANT_FUSE", dq_saved, 1)
+                    : unsetenv("DS4_QWEN4EXP_NO_MOE_DECODE_QUANT_FUSE")) == 0,
+               "shared exact decode-quant restore");
+    free(dq_saved);
     for (int j = 0; j < 3; j++) {
         free(got[j]);
         free(ref[j]);
@@ -2642,6 +3389,10 @@ int main(int argc, char **argv) {
     run_moe_epilogue_case(model, model_bytes, gate_offset, up_offset,
                           down_offset);
 
+    run_moe_decode_quant_case(model, model_bytes, gate_offset, up_offset,
+                              down_offset, sh_router_offset, sh_gate_offset,
+                              sh_up_offset, sh_down_offset);
+
     run_shared_stage_cases(model, model_bytes, gate_offset, up_offset,
                            down_offset, sh_router_offset, sh_gate_offset,
                            sh_up_offset, sh_down_offset,
@@ -2655,6 +3406,7 @@ int main(int argc, char **argv) {
     run_shared_exact_case(PROD_IN_DIM, PROD_MID_DIM, PROD_OUT_DIM);
     run_shared_exact_case(1056, 1056, 19);
     run_shared_exact_case(32, 32, 17);
+    run_router_tail_fuse_case();
 
     free(xq_ref);
     free(routed_again);

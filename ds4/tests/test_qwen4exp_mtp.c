@@ -581,6 +581,87 @@ static int ref_draft_rows(void *ctx, const int *next_tokens,
 
 static int g_ref_batched_draft = 1;
 
+/* The folded seam entry: the reference model's half of the graph's folded
+ * round.  The verify itself is ref_verify_rows_top1; the head rows are then
+ * EVERY row j re-fed as (row_top1[j], hc row j) at pos0 + j, which is the
+ * layout the graph's folded forward encodes -- the row the rejecting outcome
+ * drafts from (row 0) and the row the accepting one seeds and drafts from
+ * (rows 0 and 1), all written before the host knows the outcome.
+ *
+ * The drafts come from the same chain-step-0 oracle ref_draft_step runs, one
+ * per outcome: outcome a has committed verify rows 0..a, so its running state
+ * is slot a (the live state at a = n - 1, which wrote no slot) with the
+ * caches cut to pos0 + a + 1, and its draft steps row_top1[a] there.  The
+ * comparison in test_head_in_batch_fold then checks the cycle's SELECTION and
+ * bookkeeping against the separate sequence, not the oracle itself. */
+static int ref_verify_top1_draft_rows(void *ctx, const int *tokens, uint32_t n,
+                                      uint32_t pos0, int *row_top1,
+                                      int *row_drafts) {
+    refmodel *m = ctx;
+    float hc[DS4_QWEN4EXP_MTP_MAX_COMMIT * REF_HC_DIM];
+    if (n == 0u || n > (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT) {
+        return ref_fault(m, "folded verify of %u rows is wider than the "
+                         "envelope", n);
+    }
+    if (ref_verify_rows_top1(ctx, tokens, n, pos0, hc, row_top1) != 0) {
+        return -1;
+    }
+    if (m->head_len != pos0) {
+        return ref_fault(m, "head cursor is %u at folded position %u",
+                         m->head_len, pos0);
+    }
+    for (uint32_t j = 0; j < n; j++) {
+        /* The cache row itself: the head's fold of (hc row j, row_top1[j]),
+         * exactly the row the separate sequence writes for the same outcome. */
+        const uint64_t hj = ref_hc_to_hidden(hc + (size_t)j * REF_HC_DIM);
+        m->head[pos0 + j] = mix64(hj ^ (uint64_t)(uint32_t)row_top1[j]);
+        m->head_stamp[pos0 + j] = 1u;
+
+        /* The draft for outcome a = j, from that outcome's committed state. */
+        refmodel *shadow = malloc(sizeof(*shadow));
+        if (!shadow) return ref_fault(m, "out of memory");
+        *shadow = *m;
+        if (j + 1u < n) {
+            if (j >= (uint32_t)DS4_QWEN4EXP_IMPLEMENTED_DEPTH ||
+                !m->slot[j].written) {
+                free(shadow);
+                return ref_fault(m, "folded row %u has no state slot", j);
+            }
+            shadow->recurrent = m->slot[j].recurrent;
+            memcpy(shadow->conv, m->slot[j].conv, sizeof(shadow->conv));
+            memcpy(shadow->ple, m->slot[j].ple, sizeof(shadow->ple));
+            memcpy(shadow->ple_hist, m->slot[j].ple_hist,
+                   sizeof(shadow->ple_hist));
+        }
+        /* else: the live state after row n - 1 IS the state outcome n - 1
+         * committed; nothing to adopt. */
+        shadow->kv_len = shadow->tape_len = pos0 + j + 1u;
+        shadow->pool_len = (pos0 + j + 1u) / REF_POOL;
+        uint64_t h2 = 0;
+        const int rc = ref_step(shadow, row_top1[j], pos0 + j + 1u, 1u, &h2);
+        int faulted = shadow->faulted;
+        free(shadow);
+        if (rc != 0 || faulted) {
+            return ref_fault(m, "folded draft shadow step at row %u", j);
+        }
+        float logits[REF_VOCAB];
+        ref_logits(h2, logits);
+        int guess = ds4_qwen4exp_mtp_argmax(logits, REF_VOCAB);
+        /* The same deliberate one-in-three corruption ref_draft_step applies,
+         * keyed on the same state, so both paths accept and reject the same
+         * rounds and the A/B comparison is like for like. */
+        if (mix64(h2 ^ 0xd1b54a32d192ed03ULL) % 3u == 0u) {
+            guess = (guess + 1) % (int)REF_VOCAB;
+        }
+        row_drafts[j] = guess;
+    }
+    m->head_len = pos0 + n;
+    m->n_draft += n;
+    return 0;
+}
+
+static int g_ref_folded_draft = 0;
+
 static int ref_build(refmodel *m, ds4_qwen4exp_mtp_model *model,
                      ds4_qwen4exp_rollback_set *set) {
     memset(model, 0, sizeof(*model));
@@ -594,6 +675,8 @@ static int ref_build(refmodel *m, ds4_qwen4exp_mtp_model *model,
     model->head_logits = ref_head_logits;
     model->draft_step = ref_draft_step;
     model->draft_rows = g_ref_batched_draft ? ref_draft_rows : NULL;
+    model->verify_top1_draft_rows =
+        g_ref_folded_draft ? ref_verify_top1_draft_rows : NULL;
 
     ds4_qwen4exp_rollback_init(set);
     const struct { ds4_qwen4exp_state_id id; ds4_qwen4exp_rollback_object o; } objs[] = {
@@ -1534,6 +1617,169 @@ static void test_deferred_frontier_logits(void) {
     CHECK(ds4_qwen4exp_mtp_argmax(logits, REF_VOCAB) == st.frontier_top1,
           "materialized frontier does not match cached top-1");
     ds4_qwen4exp_mtp_state_free(&st);
+}
+
+/*
+ * THE FOLDED ROUND against the separate sequence, round by round.
+ *
+ * Two depth-1 legs run in lockstep on the same reference model, one with the
+ * folded seam bound and one without, fed the same tokens.  What is compared
+ * is everything the fold could get wrong: the committed tokens and
+ * acceptance length, the SELECTED draft (st.pending[0]) after the round, the
+ * head-cache bookkeeping (st.head_rows and the model's head_len), and the
+ * head cache rows that remain live.  Both acceptance outcomes have to occur
+ * folded, or the selection comparison only ever exercised one branch.
+ */
+static void test_head_in_batch_fold(void) {
+    printf("head in batch: the folded round keeps the separate sequence's "
+           "drafts and state\n");
+    for (int p = 0; p < N_PROMPTS; p++) {
+        int serial[N_TOKENS];
+        CHECK(run_serial(g_prompts[p], N_TOKENS, serial) == 0,
+              "serial leg failed for prompt %d", g_prompts[p]);
+
+        refmodel mo, mf;
+        ds4_qwen4exp_mtp_model mold, mfold;
+        ds4_qwen4exp_rollback_set so, sf;
+        ds4_qwen4exp_mtp_state sto, stf;
+        ref_reset(&mo, BREAK_NONE, 0);
+        ref_reset(&mf, BREAK_NONE, 0);
+        g_ref_folded_draft = 0;
+        CHECK(ref_build(&mo, &mold, &so) == 0, "old reference build failed");
+        g_ref_folded_draft = 1;
+        CHECK(ref_build(&mf, &mfold, &sf) == 0, "folded reference build failed");
+        g_ref_folded_draft = 0;
+        CHECK(ds4_qwen4exp_mtp_state_init(&sto, 1, &so, REF_HC_DIM, REF_VOCAB,
+                                          g_err, sizeof(g_err)) == 0,
+              "old state init failed: %s", g_err);
+        CHECK(ds4_qwen4exp_mtp_state_init(&stf, 1, &sf, REF_HC_DIM, REF_VOCAB,
+                                          g_err, sizeof(g_err)) == 0,
+              "folded state init failed: %s", g_err);
+
+        float lo[REF_VOCAB], lf[REF_VOCAB];
+        /* The emitted stream, run_mtp's accounting: the tokens after the fed
+         * one plus each round's frontier argmax.  The legs are lockstep, so
+         * one stream serves both; it has to be the serial one. */
+        int stream[N_TOKENS];
+        int n_stream = 0;
+        int pending = g_prompts[p];
+        uint32_t pos = 0;
+        int produced = 0;
+        int folded_rounds = 0, folded_accepts = 0, folded_rejects = 0;
+        int bad = 0;
+        while (produced < N_TOKENS && !bad) {
+            int co[DS4_QWEN4EXP_MTP_MAX_COMMIT];
+            int cf[DS4_QWEN4EXP_MTP_MAX_COMMIT];
+            const int budget = N_TOKENS - produced;
+            const bool folded = stf.n_pending > 0 &&
+                pending == stf.pending_parent && budget > 1;
+            const int go = ds4_qwen4exp_mtp_cycle(
+                &sto, &mold, pending, pos, budget, co,
+                DS4_QWEN4EXP_MTP_MAX_COMMIT, lo, g_err, sizeof(g_err));
+            const int gf = ds4_qwen4exp_mtp_cycle(
+                &stf, &mfold, pending, pos, budget, cf,
+                DS4_QWEN4EXP_MTP_MAX_COMMIT, lf, g_err, sizeof(g_err));
+            if (go < 0 || gf < 0) {
+                CHECK(0, "prompt %d round at %u failed (separate %d, folded "
+                      "%d): %s", g_prompts[p], pos, go, gf, g_err);
+                bad = 1;
+                break;
+            }
+            if (go != gf) {
+                CHECK(0, "prompt %d round at %u: the separate round committed "
+                      "%d, the folded %d", g_prompts[p], pos, go, gf);
+                bad = 1;
+                break;
+            }
+            for (int i = 0; i < go; i++) {
+                if (co[i] != cf[i]) {
+                    CHECK(0, "prompt %d round at %u token %d: separate %d, "
+                          "folded %d", g_prompts[p], pos, i, co[i], cf[i]);
+                    bad = 1;
+                }
+            }
+            if (!bad && sto.n_pending != stf.n_pending) {
+                CHECK(0, "prompt %d round at %u: %d carried drafts against %d",
+                      g_prompts[p], pos, sto.n_pending, stf.n_pending);
+                bad = 1;
+            }
+            if (!bad && sto.n_pending > 0 &&
+                sto.pending[0] != stf.pending[0]) {
+                CHECK(0, "prompt %d round at %u: the separate sequence drafts "
+                      "%d, the folded keeps %d",
+                      g_prompts[p], pos, sto.pending[0], stf.pending[0]);
+                bad = 1;
+            }
+            if (!bad && sto.head_rows != stf.head_rows) {
+                CHECK(0, "prompt %d round at %u: head_rows %u against %u",
+                      g_prompts[p], pos, sto.head_rows, stf.head_rows);
+                bad = 1;
+            }
+            if (!bad && mo.head_len != mf.head_len) {
+                CHECK(0, "prompt %d round at %u: the head cache holds %u rows "
+                      "against %u", g_prompts[p], pos, mo.head_len, mf.head_len);
+                bad = 1;
+            }
+            for (uint32_t q = 0; !bad && q < mf.head_len; q++) {
+                if (!mf.head_stamp[q] || mo.head[q] != mf.head[q]) {
+                    CHECK(0, "prompt %d round at %u: head cache row %u of %u "
+                          "differs", g_prompts[p], pos, q, mf.head_len);
+                    bad = 1;
+                }
+            }
+            if (bad) break;
+
+            /* The frontier both legs sample the next fed token from. */
+            const int nexto = ds4_qwen4exp_mtp_argmax(lo, REF_VOCAB);
+            const int nextf = ds4_qwen4exp_mtp_argmax(lf, REF_VOCAB);
+            if (nexto != nextf) {
+                CHECK(0, "prompt %d round at %u: frontier %d against %d",
+                      g_prompts[p], pos, nexto, nextf);
+                bad = 1;
+                break;
+            }
+            if (folded) {
+                folded_rounds++;
+                if (go == 2) folded_accepts++;
+                else         folded_rejects++;
+            }
+            for (int i = 1; i < go; i++) stream[n_stream++] = co[i];
+            stream[n_stream++] = nexto;
+            pos += (uint32_t)go;
+            produced += go;
+            pending = nexto;
+        }
+        /* The lockstep above asserted the two legs committed the same tokens
+         * at every round, which is the same stream; the serial comparison is
+         * the exactness battery's, and main() runs that battery a third time
+         * with this seam bound.  A cheap end-to-end check here catches a
+         * selection bug the per-round misses could still compose around. */
+        CHECK(!bad && n_stream == N_TOKENS,
+              "prompt %d: the folded leg emitted %d of %d tokens",
+              g_prompts[p], n_stream, N_TOKENS);
+        for (int i = 0; !bad && i < n_stream && i < N_TOKENS; i++) {
+            if (stream[i] != serial[i]) {
+                CHECK(0, "prompt %d: the folded stream diverges at token %d: "
+                      "serial %d, folded %d",
+                      g_prompts[p], i, serial[i], stream[i]);
+                bad = 1;
+            }
+        }
+        /* Non-vacuity: the fold actually ran, and both of its outcomes did. */
+        CHECK(folded_rounds > 0,
+              "prompt %d: no folded round ran (n_pending never armed)",
+              g_prompts[p]);
+        CHECK(folded_accepts > 0,
+              "prompt %d: the folded round never accepted a draft",
+              g_prompts[p]);
+        CHECK(folded_rejects > 0,
+              "prompt %d: the folded round never rejected a draft",
+              g_prompts[p]);
+        printf("  prompt %2d: %d folded rounds, %d accepts, %d rejects\n",
+               g_prompts[p], folded_rounds, folded_accepts, folded_rejects);
+        ds4_qwen4exp_mtp_state_free(&sto);
+        ds4_qwen4exp_mtp_state_free(&stf);
+    }
 }
 
 /* ========================================================================
@@ -2561,6 +2807,18 @@ int main(void) {
     test_rollback_negative_controls();
     printf("\n");
     g_ref_batched_draft = 1;
+    /* A third time with the folded seam bound: at depth 1 every speculating
+     * round runs the verify and the head's drafts in one forward, and the
+     * battery above must not notice.  Deeper depths never take the fold (the
+     * chain needs the head's own multi row on the host) and must not notice
+     * either. */
+    g_ref_folded_draft = 1;
+    printf("(again, head folded into the verify batch)\n");
+    test_exactness();
+    printf("\n");
+    g_ref_folded_draft = 0;
+    test_head_in_batch_fold();
+    printf("\n");
     test_head_cache_boundary();
     printf("\n");
     test_row_invariance_is_load_bearing();

@@ -2929,6 +2929,25 @@ int ds4_gpu_qwen4exp_shared_expert_tensor(
         const ds4_gpu_tensor        *x,
         uint32_t                     n_tokens);
 
+/* What a decode-width routed MoE call hands to the shared expert that
+ * follows it on the same stream. */
+typedef struct {
+    /* The quantised-x region the routed call wrote: quants at xq, scales at
+     * xq + n_tokens * (in_dim / 32) * 32, sums after the scales -- the
+     * layout both entries derive identically from the region start. */
+    const int8_t *xq;
+    /* Dead scratch from the same call: its pair-list metadata region
+     * (counts/offsets/cursor/active/pairs), every consumer of which ran
+     * inside that call.  A caller running after it on the same stream may
+     * seat its own scratch at `seat` for `seat_bytes` bytes -- in
+     * particular the shared expert's quantised mid, whose decode-width
+     * producer (the gate/up epilogue twin) reads `xq` and writes the mid
+     * in ONE launch and so needs the two regions disjoint.  They are: the
+     * metadata ends exactly where the xq region begins. */
+    int8_t  *seat;
+    uint64_t seat_bytes;
+} ds4_gpu_qwen4exp_moe_handoff;
+
 int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         ds4_gpu_tensor              *out,
         ds4_gpu_tensor              *mid,
@@ -2942,7 +2961,81 @@ int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         uint32_t                     out_dim,
         const ds4_gpu_tensor        *x,
         uint32_t                     n_tokens,
-        int                          pre_quantized);
+        /* reuse: a routed MoE call's handoff (see above) -- the region THAT
+         * call quantised x into, seated at its own layout offset in the
+         * tier scratch, never this entry's base.  NULL quantises x here.
+         * The caller owes the same x tensor, n_tokens and in_dim the routed
+         * call used, and ordering on one stream.  A seat too small for this
+         * entry's quantised mid declines the reuse to NULL's chain. */
+        const ds4_gpu_qwen4exp_moe_handoff *reuse,
+        /* gate_ready: the router's F32 launch already wrote gate_scale (the
+         * ds4_gpu_qwen4exp_router_logits_gate_tensor fold), so this entry
+         * skips its own gate kernel instead of repeating it. */
+        int                          gate_ready);
+
+/* The decode-width router tail, fused.  Whether the two fuses below engage at
+ * all: a width below eight (the small-group envelope) and no
+ * DS4_QWEN4EXP_NO_ROUTER_FUSE in the environment.  The entries re-check their
+ * own conditions and decline to the unfused kernels, which return the same
+ * bits, so a model outside the envelope still runs correctly. */
+int ds4_gpu_qwen4exp_router_tail_fuse_on(uint32_t n_tokens);
+
+/* The decode-width MoE quantise residue's kill switch: zero when
+ * DS4_QWEN4EXP_NO_MOE_DECODE_QUANT_FUSE is set, which stands down both the
+ * shared expert's reuse of the routed x quantise (the handoff the graph
+ * passes -- NULL under the switch) and the mid-quantise
+ * epilogues inside the MoE entries below.
+ * The reuse ships on by default; the mid-quantise epilogues are new device
+ * code and engage only under DS4_QWEN4EXP_MOE_DECODE_QUANT_FUSE until the
+ * box's byte tests promote them.  The entries re-check their own width and
+ * shape conditions and decline to today's separate launches, which return
+ * the same bytes. */
+int ds4_gpu_qwen4exp_moe_decode_quant_fuse_on(void);
+
+/* The router's F32 logits with the shared expert's sigmoid gate folded in as
+ * one extra block-row of the same GEMV launch.  Writes logits[0..n_rows) and
+ * shexp_gate[0..n_rows); the caller then passes gate_ready 1 to the shared
+ * expert so the standalone gate kernel is not launched again. */
+int ds4_gpu_qwen4exp_router_logits_gate_tensor(
+        ds4_gpu_tensor              *logits,
+        ds4_gpu_tensor              *shexp_gate,
+        const void                  *router_map,
+        uint64_t                     router_map_size,
+        uint64_t                     router_offset,
+        const ds4_gpu_qwen4exp_slab *shexp_router,
+        uint64_t                     in_dim,
+        uint64_t                     out_dim,
+        const ds4_gpu_tensor        *x,
+        uint32_t                     n_rows);
+
+/* The routed MoE with the router tail folded in: BUILDS selected and weights
+ * from logits (the warp top-k, its softmax and the small metadata scan in one
+ * launch at the widths ds4_gpu_qwen4exp_router_tail_fuse_on names) instead of
+ * reading them.  Where the fuse declines, the selection is built by the
+ * standalone router dispatch and the metadata by today's paths, unchanged.
+ * handoff, when not NULL, receives this call's quantised-x region and dead
+ * seat (see ds4_gpu_qwen4exp_moe_handoff) -- what the shared expert's preq
+ * entry reuses; the regions are seated at THIS call's layout offsets, never
+ * at a scratch base. */
+int ds4_gpu_qwen4exp_router_tail_moe_tensor(
+        ds4_gpu_tensor              *out,
+        ds4_gpu_tensor              *mid,
+        ds4_gpu_tensor              *down_partial,
+        const ds4_gpu_qwen4exp_slab *gate,
+        const ds4_gpu_qwen4exp_slab *up,
+        const ds4_gpu_qwen4exp_slab *down,
+        uint32_t                     in_dim,
+        uint32_t                     mid_dim,
+        uint32_t                     out_dim,
+        ds4_gpu_tensor              *selected,
+        ds4_gpu_tensor              *weights,
+        const ds4_gpu_tensor        *logits,
+        uint32_t                     n_total_expert,
+        uint32_t                     n_expert_used,
+        const ds4_gpu_tensor        *x,
+        uint32_t                     n_tokens,
+        uint32_t                     mid_token_stride,
+        ds4_gpu_qwen4exp_moe_handoff *handoff);
 
 int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
         ds4_gpu_tensor       *out,
@@ -3669,6 +3762,87 @@ int ds4_gpu_qwen4exp_gdn_decode(
         float                 qk_norm_eps,
         float                 norm_eps);
 
+/*
+ * REJECT-PATH ADOPTION, resolved on the device.
+ *
+ * A rejecting round adopts the per-row snapshot slot `row` the verify forward
+ * left behind instead of copying it over the live buffers (216 MiB per
+ * rejecting round on the production shape).  The adopted row lives in ONE
+ * device-resident uint32 at a fixed tensor address -- the discipline `d_pos`
+ * uses -- and the kernels above read it when they run, so a captured graph
+ * stays valid while adoption changes between replays: the argument a graph
+ * bakes is the scalar's ADDRESS, never its value.
+ *
+ * DS4_QWEN4EXP_STATE_ADOPT_LIVE means the live buffers hold the state to read;
+ * any other value is a snapshot row index.  A NULL `adopt_row` always means
+ * LIVE, which is the copy-era behavior and what the kill switch and the
+ * backends without these entries pass.  The WRITE side is never redirected:
+ * a round's final stores land in the live buffers and its snapshot stores in
+ * the snapshot tensors, distinct allocations, so an end-write can never
+ * clobber a snapshot row that the same round's reject still needs.  The
+ * kernels that read an adopted row load their state elements once, before any
+ * store they issue, so a round may safely read the snapshot row it is about
+ * to rewrite.  Adoption is single-sequence: it arms only on one-row calls.
+ *
+ * The scalar is also handed in only by a forward that can carry an armed
+ * adoption -- the rejecting round's re-feed, at most one speculative commit
+ * wide.  A prefill never follows a reject without the session reset that
+ * clears adoption, so it passes NULL: LIVE either way to the kernels, and
+ * the sign qwen4exp_cuda_gdn_run uses to keep the token-parallel
+ * convolution available, which a handed-in scalar refuses.
+ */
+#define DS4_QWEN4EXP_STATE_ADOPT_LIVE 0xFFFFFFFFu
+
+#if defined(DS4_ROCM_BUILD) || (!defined(DS4_NO_GPU) && !defined(__APPLE__))
+int ds4_gpu_qwen4exp_gdn_prefill_adopt(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *conv_snapshot,
+        ds4_gpu_tensor       *state_snapshot,
+        uint32_t              n_snapshot_rows,
+        ds4_gpu_tensor       *qkv,
+        const ds4_gpu_tensor *raw_alpha,
+        const ds4_gpu_tensor *raw_beta,
+        const ds4_gpu_tensor *output_gate,
+        const ds4_gpu_qwen4exp_slab *conv_weight,
+        const ds4_gpu_qwen4exp_slab *a_log,
+        const ds4_gpu_qwen4exp_slab *dt_bias,
+        const ds4_gpu_qwen4exp_slab *output_norm,
+        uint32_t              n_key_head,
+        uint32_t              n_value_head,
+        uint32_t              n_tokens,
+        uint32_t              head_layout,
+        float                 qk_norm_eps,
+        float                 norm_eps,
+        const ds4_gpu_tensor *adopt_row);
+
+/* The decode twin reads an adopted row too (a rejecting round's replay
+ * continues from the adopted state), so it takes the snapshot tensors the
+ * plain entry never needed; it still writes no snapshots of its own. */
+int ds4_gpu_qwen4exp_gdn_decode_adopt(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *conv_snapshot,
+        ds4_gpu_tensor       *state_snapshot,
+        ds4_gpu_tensor       *qkv,
+        const ds4_gpu_tensor *raw_alpha,
+        const ds4_gpu_tensor *raw_beta,
+        const ds4_gpu_tensor *output_gate,
+        const ds4_gpu_qwen4exp_slab *conv_weight,
+        const ds4_gpu_qwen4exp_slab *a_log,
+        const ds4_gpu_qwen4exp_slab *dt_bias,
+        const ds4_gpu_qwen4exp_slab *output_norm,
+        uint32_t              n_key_head,
+        uint32_t              n_value_head,
+        uint32_t              n_rows,
+        uint32_t              head_layout,
+        float                 qk_norm_eps,
+        float                 norm_eps,
+        const ds4_gpu_tensor *adopt_row);
+#endif
+
 /* Decode-island CUDA graph capture (CUDA backend; Metal/ROCm/CPU stub it
  * out and stay eager).  Design ported from the Entrpi/ds4 batched-serving
  * fork's per-layer decode graph capture.  The key identifies a captured
@@ -3915,7 +4089,12 @@ int ds4_gpu_qwen4exp_ple_conv_tensor(
         uint32_t              channels,
         uint32_t              conv_kernel,
         uint32_t              dilation,
-        uint32_t              rows);
+        uint32_t              rows,
+        /* Adoption: read the rolling window from snapshot row `adopt_row`
+         * instead of `conv_state`.  See the note above the GDN entries; NULL
+         * and DS4_QWEN4EXP_STATE_ADOPT_LIVE read the live window, which is
+         * what the backends that do not resolve adoption always do. */
+        const ds4_gpu_tensor *adopt_row);
 
 /* The whole PLE block over already-gathered n-gram rows, composed out of the
  * two kernels above, the grouped RMS norm and the Q8_0 matmul.  This is the
@@ -3958,7 +4137,10 @@ int ds4_gpu_qwen4exp_ple_block_tensor(
         float                 norm_key_bias,
         float                 norm_query_bias,
         float                 norm_conv_bias,
-        int                   round_bf16);
+        int                   round_bf16,
+        /* Adoption, handed straight to the closing convolution.  NULL and
+         * DS4_QWEN4EXP_STATE_ADOPT_LIVE read the live window. */
+        const ds4_gpu_tensor *adopt_row);
 
 #ifdef __cplusplus
 }

@@ -368,6 +368,40 @@ static int mtp_head_cache_truncate(const ds4_qwen4exp_rollback_set *set,
 }
 
 /*
+ * Adopt the drafts a folded round already computed.  See
+ * ds4_qwen4exp_mtp_model.verify_top1_draft_rows: the folded forward ran the
+ * head over the verify's own rows, so row j < a IS the seed the accepted
+ * drafts owe the head cache, row a is the draft step, and everything above
+ * pos + a is the outcome that did not happen.  The truncate keeps the cache
+ * honest about where the confirmed rows end -- the not-chosen row's writes
+ * stay in place as position-addressed scratch and the next round overwrites
+ * them before anything reads the position, the same property the depth-2
+ * chain's speculative rows have always rested on.
+ *
+ * Depth 1 only: a deeper chain's step 1 reads the head's own `multi` row,
+ * which the folded forward leaves on the device, so the separate sequence
+ * keeps serving it.
+ */
+static int mtp_fold_pending(ds4_qwen4exp_mtp_state *st, const int *row_drafts,
+                            int a, uint32_t pos, int next_fed,
+                            char *err, size_t errlen) {
+    const uint64_t t0 = mtp_now_ns();
+    ds4_qwen4exp_mtp_invalidate(st);
+    if (mtp_head_cache_truncate(st->rollback, pos + (uint32_t)a + 1u,
+                                err, errlen) != 0) {
+        return -1;
+    }
+    st->head_rows = pos + (uint32_t)a + 1u;
+    st->pending[0] = row_drafts[a];
+    st->n_pending = 1;
+    st->pending_parent = next_fed;
+    /* The draft itself ran inside the verify call, so its time landed in
+     * verify_ns; only the host-side selection is attributed here. */
+    st->counters.draft_ns += mtp_now_ns() - t0;
+    return 0;
+}
+
+/*
  * Draft the next chain, keeping the head cache rows the round confirmed.
  *
  * The head consumes (row at p, token at p + 1) and owns cache row p, so the
@@ -585,11 +619,22 @@ int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
     float *const hc = st->hc_scratch;
     float *const row_logits = st->logits_rows;
     int row_top1[DS4_QWEN4EXP_MTP_MAX_COMMIT];
+    int row_drafts[DS4_QWEN4EXP_MTP_MAX_COMMIT];
     const bool compact_logits =
         model->verify_rows_top1 != NULL && model->read_logit_row != NULL;
+    /* The depth-1 folded round: at n == 1 both head rows the two acceptance
+     * outcomes could want are the verify's own rows re-fed to the head, so
+     * one forward can answer the verify and both drafts and the host picks
+     * by outcome.  Deeper rounds still need the head's `multi` row on the
+     * host to chain on, which the fold does not carry back. */
+    const bool head_in_batch = compact_logits && st->depth == 1 && n == 1 &&
+        model->verify_top1_draft_rows != NULL;
     st->counters.drafted += (uint64_t)n;
     const uint64_t verify_t0 = mtp_now_ns();
-    const int vrc = compact_logits
+    const int vrc = head_in_batch
+        ? model->verify_top1_draft_rows(model->ctx, toks, (uint32_t)n + 1u,
+                                        pos, row_top1, row_drafts)
+        : compact_logits
         ? model->verify_rows_top1(model->ctx, toks, (uint32_t)n + 1u, pos,
                                   hc, row_top1)
         : model->verify_rows(model->ctx, toks, (uint32_t)n + 1u, pos,
@@ -657,8 +702,11 @@ int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
         const int next_fed = compact_logits
             ? compact_frontier_top1
             : ds4_qwen4exp_mtp_argmax(logits, st->n_vocab);
-        if (mtp_draft_chain(st, model, hc, toks, n, pos, next_fed,
-                            err, errlen) != 0) {
+        if (head_in_batch
+                ? mtp_fold_pending(st, row_drafts, n, pos, next_fed,
+                                   err, errlen) != 0
+                : mtp_draft_chain(st, model, hc, toks, n, pos, next_fed,
+                                  err, errlen) != 0) {
             return -1;
         }
         if (compact_logits) {
@@ -698,8 +746,11 @@ int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
     for (int k = 0; k <= a; k++) accepted[k] = toks[k];
     st->counters.committed += (uint64_t)(a + 1);
     st->counters.commit_hist[a + 1] += 1;
-    if (mtp_draft_chain(st, model, hc, toks, a, pos, first_mismatch,
-                        err, errlen) != 0) {
+    if (head_in_batch
+            ? mtp_fold_pending(st, row_drafts, a, pos, first_mismatch,
+                               err, errlen) != 0
+            : mtp_draft_chain(st, model, hc, toks, a, pos, first_mismatch,
+                              err, errlen) != 0) {
         return -1;
     }
     if (compact_logits) {
@@ -866,6 +917,10 @@ int ds4_qwen4exp_mtp_head_init(ds4_qwen4exp_mtp_head *h,
         }
     }
     h->t_top1         = mtp_alloc(rows * sizeof(uint32_t), &ok);
+    /* The folded round's packed result, [2 * rows] ids. */
+    if (ok) {
+        h->t_fold_pack = mtp_alloc(2ull * rows * sizeof(uint32_t), &ok);
+    }
     h->top1_host      = malloc((size_t)rows * sizeof(uint32_t));
     if (!ok || !h->top1_host) {
         ds4_qwen4exp_mtp_head_free(h);
@@ -882,7 +937,7 @@ void ds4_qwen4exp_mtp_head_free(ds4_qwen4exp_mtp_head *h) {
         h->t_tokens, h->t_embed_rows, h->t_embed_out, h->t_e_normed,
         h->t_h_normed, h->t_ehx, h->t_hyper, h->t_mix_normed,
         h->t_mix_lowrank, h->t_mix_wide, h->t_sample, h->t_logits,
-        h->t_logits_prefix, h->t_logits_tail, h->t_top1,
+        h->t_logits_prefix, h->t_logits_tail, h->t_top1, h->t_fold_pack,
     };
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
         ds4_gpu_tensor_free(all[i]);
@@ -892,6 +947,7 @@ void ds4_qwen4exp_mtp_head_free(ds4_qwen4exp_mtp_head *h) {
     h->t_mix_lowrank = h->t_mix_wide = h->t_sample = h->t_logits = NULL;
     h->t_logits_prefix = h->t_logits_tail = NULL;
     h->t_top1 = NULL;
+    h->t_fold_pack = NULL;
     free(h->top1_host);
     h->top1_host = NULL;
 }
@@ -974,33 +1030,32 @@ static int mtp_head_time_on(void) {
         }                                                                     \
     } while (0)
 
-/* The forward proper.  Seed rows must update the head block's caches, but
- * their final mixer and vocabulary projections have no consumer when only
- * the last proposal is requested.  Narrow those stateless operations within
- * the decode-order envelope; wider diagnostic calls retain their dispatch. */
-static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
-                                 const int *next_tokens,
-                                 const float *multi_in,
-                                 uint32_t pos0, uint32_t n_tokens,
-                                 int *draft_out, float *multi_out,
-                                 bool last_only,
-                                 char *err, size_t errlen) {
-    if (n_tokens == 0 || n_tokens > h->max_tokens) {
-        return mtp_fail(err, errlen,
-                        "qwen4exp MTP head: %u rows, built for 1..%u",
-                        n_tokens, h->max_tokens);
-    }
+/*
+ * The stage chain of one head forward, INSIDE a command batch the caller
+ * opened: the embedding, both norms, eh_proj, the block, the mixer, the
+ * borrowed LM head's shortlist and the on-device top-1.  t_tokens and t_hyper
+ * must already hold the rows.  Who owns the batch, the uploads and the
+ * readbacks differs between the standalone forward and the folded round; the
+ * arithmetic does not, which is why it lives here once.
+ *
+ * Seed rows must update the head block's caches, but their final mixer and
+ * vocabulary projections have no consumer when only the last proposal is
+ * requested.  `last_only` narrows those stateless operations within the
+ * decode-order envelope; wider calls retain their dispatch.
+ */
+static int mtp_head_stages_encode(ds4_qwen4exp_mtp_head *h,
+                                  uint32_t pos0, uint32_t n_tokens,
+                                  bool last_only,
+                                  char *err, size_t errlen) {
     const uint32_t n_embd = h->n_embd;
     const uint32_t n_hc = h->n_hc;
     const uint64_t hc_dim = (uint64_t)n_hc * n_embd;
     const uint64_t f = sizeof(float);
     const uint64_t embd_bytes = (uint64_t)n_embd * f;
     const uint32_t first_row = last_only ? n_tokens - 1u : 0u;
-    const uint32_t out_rows = n_tokens - first_row;
     const bool narrow_logits = last_only && n_tokens > 1u &&
         n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT;
     const uint32_t logit_rows = narrow_logits ? 1u : n_tokens;
-    const uint32_t logit_first = narrow_logits ? 0u : first_row;
     /* The draft shortlist, fixed at init.  Zero keeps the whole vocabulary;
      * armed, the DRAFT's borrowed-LM-head projection narrows to rows
      * [0, prefix) plus the tail range, and `draft_width` is the width of one
@@ -1014,33 +1069,12 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
         ? draft_prefix + draft_tail : h->n_vocab;
     const int timing = mtp_head_time_on();
     uint64_t tmark = timing ? mtp_now_ns() : 0;
-
-    /* The ids the embedding gather reads.  int is the caller's type; the
-     * kernel takes int32, and the two agree on every target this builds for. */
-    int32_t ids_stack[8];
-    int32_t *ids = ids_stack;
-    if (n_tokens > sizeof(ids_stack) / sizeof(ids_stack[0])) {
-        ids = malloc((size_t)n_tokens * sizeof(int32_t));
-        if (!ids) return mtp_fail(err, errlen, "qwen4exp MTP head: out of memory");
-    }
-    for (uint32_t t = 0; t < n_tokens; t++) ids[t] = (int32_t)next_tokens[t];
-
-    const char *stage = "token upload";
-    bool ok = ds4_gpu_tensor_write(h->t_tokens, 0, ids,
-                                   (uint64_t)n_tokens * sizeof(int32_t)) != 0;
-    if (ids != ids_stack) free(ids);
-    MTP_HEAD_TICK(MTP_HEAD_T_TOKEN);
-    if (ok) {
-        stage = "multi-stream upload";
-        ok = ds4_gpu_tensor_write(h->t_hyper, 0, multi_in,
-                                  (uint64_t)n_tokens * hc_dim * f) != 0;
-    }
-    MTP_HEAD_TICK(MTP_HEAD_T_MULTI_IN);
-    if (ok) ok = ds4_gpu_begin_commands() != 0;
+    const char *stage = "embedding";
+    bool ok = true;
 
     /* e = fc_embedding(enorm(embed(next))).  The embedding is the TARGET's;
      * n_hc = 1 asks the tiling gather for plain rows. */
-    if (ok) {
+    {
         stage = "embedding";
         ok = h->hooks.embed(h->t_embed_out, h->t_embed_rows, h->t_tokens,
                             h->target_map, h->target_size,
@@ -1192,6 +1226,71 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                                          draft_width, logit_rows, 1u) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_TOP1);
+    if (!ok) {
+        return mtp_fail(err, errlen,
+                        "qwen4exp MTP head: %s failed at position %u over %u "
+                        "rows", stage, pos0, n_tokens);
+    }
+    if (timing) mtp_head_stage_calls++;
+    return 0;
+}
+
+/* The forward proper: upload the rows, run the stages in the head's own
+ * command batch and read the results back. */
+static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
+                                 const int *next_tokens,
+                                 const float *multi_in,
+                                 uint32_t pos0, uint32_t n_tokens,
+                                 int *draft_out, float *multi_out,
+                                 bool last_only,
+                                 char *err, size_t errlen) {
+    if (n_tokens == 0 || n_tokens > h->max_tokens) {
+        return mtp_fail(err, errlen,
+                        "qwen4exp MTP head: %u rows, built for 1..%u",
+                        n_tokens, h->max_tokens);
+    }
+    const uint32_t n_embd = h->n_embd;
+    const uint32_t n_hc = h->n_hc;
+    const uint64_t hc_dim = (uint64_t)n_hc * n_embd;
+    const uint64_t f = sizeof(float);
+    const uint32_t first_row = last_only ? n_tokens - 1u : 0u;
+    const uint32_t out_rows = n_tokens - first_row;
+    const bool narrow_logits = last_only && n_tokens > 1u &&
+        n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT;
+    const uint32_t logit_first = narrow_logits ? 0u : first_row;
+    const uint32_t draft_prefix = h->draft_vocab_prefix;
+    const uint32_t draft_tail = draft_prefix ? h->draft_vocab_tail : 0u;
+    const uint32_t draft_width = draft_prefix
+        ? draft_prefix + draft_tail : h->n_vocab;
+    const int timing = mtp_head_time_on();
+    uint64_t tmark = timing ? mtp_now_ns() : 0;
+
+    /* The ids the embedding gather reads.  int is the caller's type; the
+     * kernel takes int32, and the two agree on every target this builds for. */
+    int32_t ids_stack[8];
+    int32_t *ids = ids_stack;
+    if (n_tokens > sizeof(ids_stack) / sizeof(ids_stack[0])) {
+        ids = malloc((size_t)n_tokens * sizeof(int32_t));
+        if (!ids) return mtp_fail(err, errlen, "qwen4exp MTP head: out of memory");
+    }
+    for (uint32_t t = 0; t < n_tokens; t++) ids[t] = (int32_t)next_tokens[t];
+
+    const char *stage = "token upload";
+    bool ok = ds4_gpu_tensor_write(h->t_tokens, 0, ids,
+                                   (uint64_t)n_tokens * sizeof(int32_t)) != 0;
+    if (ids != ids_stack) free(ids);
+    MTP_HEAD_TICK(MTP_HEAD_T_TOKEN);
+    if (ok) {
+        stage = "multi-stream upload";
+        ok = ds4_gpu_tensor_write(h->t_hyper, 0, multi_in,
+                                  (uint64_t)n_tokens * hc_dim * f) != 0;
+    }
+    MTP_HEAD_TICK(MTP_HEAD_T_MULTI_IN);
+    if (ok) ok = ds4_gpu_begin_commands() != 0;
+    if (ok) {
+        ok = mtp_head_stages_encode(h, pos0, n_tokens, last_only,
+                                    err, errlen) == 0;
+    }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
     MTP_HEAD_TICK(MTP_HEAD_T_END);
@@ -1250,7 +1349,6 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
         }
         draft_out[t] = (int)id;
     }
-    if (timing) mtp_head_stage_calls++;
     return 0;
 }
 
@@ -1272,6 +1370,117 @@ int ds4_qwen4exp_mtp_head_forward_last(ds4_qwen4exp_mtp_head *h,
                                        char *err, size_t errlen) {
     return mtp_head_forward_impl(h, next_tokens, multi_in, pos0, n_tokens,
                                  draft_out, multi_out, true, err, errlen);
+}
+
+int ds4_qwen4exp_mtp_head_fold_encode(ds4_qwen4exp_mtp_head *h,
+                                      const ds4_gpu_tensor *row_top1,
+                                      const ds4_gpu_tensor *hyper,
+                                      uint32_t pos0, uint32_t n_tokens,
+                                      char *err, size_t errlen) {
+    if (n_tokens == 0 || n_tokens > h->max_tokens) {
+        return mtp_fail(err, errlen,
+                        "qwen4exp MTP head: folded round of %u rows, built for "
+                        "1..%u", n_tokens, h->max_tokens);
+    }
+    /* The per-stage timing hooks synchronize between stages, which cannot run
+     * inside a batch the caller keeps open.  Refuse by name so the seam falls
+     * back to the standalone forward the hooks were written to instrument. */
+    if (mtp_head_time_on()) {
+        return mtp_fail(err, errlen,
+                        "qwen4exp MTP head: DS4_MTP_HEAD_TIME needs the "
+                        "standalone forward; unset it to fold the draft into "
+                        "the verify");
+    }
+    const uint64_t hc_dim = (uint64_t)h->n_hc * h->n_embd;
+    const uint64_t ids_bytes = (uint64_t)n_tokens * sizeof(uint32_t);
+    bool ok = ds4_gpu_tensor_copy(h->t_fold_pack, 0, row_top1, 0,
+                                  ids_bytes) != 0 &&
+              ds4_gpu_tensor_copy(h->t_tokens, 0, row_top1, 0,
+                                  ids_bytes) != 0 &&
+              ds4_gpu_tensor_copy(h->t_hyper, 0, hyper, 0,
+                                  (uint64_t)n_tokens * hc_dim * sizeof(float)) != 0;
+    if (!ok) {
+        (void)mtp_fail(err, errlen,
+                       "qwen4exp MTP head: folded input copy failed at "
+                       "position %u over %u rows", pos0, n_tokens);
+    }
+    if (ok) {
+        ok = mtp_head_stages_encode(h, pos0, n_tokens, false,
+                                    err, errlen) == 0;
+    }
+    /* The drafts land beside the verify's top-1s, already packed into
+     * t_fold_pack, so the round's one readback carries both. */
+    if (ok) {
+        ok = ds4_gpu_tensor_copy(h->t_fold_pack, ids_bytes, h->t_top1, 0,
+                                 ids_bytes) != 0;
+        if (!ok) {
+            (void)mtp_fail(err, errlen,
+                           "qwen4exp MTP head: folded pack copy failed at "
+                           "position %u over %u rows", pos0, n_tokens);
+        }
+    }
+    if (!ok) {
+        /* Close the caller's batch: no caller may leave one open by way of
+         * the head.  The kernels that were encoded are lost with the round,
+         * which the caller reports as a failure the same way a failed verify
+         * does. */
+        (void)ds4_gpu_end_commands();
+        return -1;
+    }
+    return 0;
+}
+
+int ds4_qwen4exp_mtp_head_fold_readback(ds4_qwen4exp_mtp_head *h,
+                                        uint32_t n_tokens,
+                                        int *row_top1_out, int *draft_out,
+                                        char *err, size_t errlen) {
+    if (n_tokens == 0 || n_tokens > h->max_tokens) {
+        return mtp_fail(err, errlen,
+                        "qwen4exp MTP head: folded readback of %u rows, built "
+                        "for 1..%u", n_tokens, h->max_tokens);
+    }
+    const uint32_t draft_prefix = h->draft_vocab_prefix;
+    const uint32_t draft_tail = draft_prefix ? h->draft_vocab_tail : 0u;
+    const uint32_t draft_width = draft_prefix
+        ? draft_prefix + draft_tail : h->n_vocab;
+    uint32_t pack[2u * DS4_QWEN4EXP_MTP_MAX_COMMIT];
+    if ((uint64_t)n_tokens * 2u * sizeof(uint32_t) > sizeof(pack) ||
+        !ds4_gpu_tensor_read(h->t_fold_pack, 0, pack,
+                             (uint64_t)n_tokens * 2u * sizeof(uint32_t))) {
+        return mtp_fail(err, errlen,
+                        "qwen4exp MTP head: folded packed readback failed over "
+                        "%u rows", n_tokens);
+    }
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        float logit0;
+        /* The NaN row-0 patch, per draft row, with the same rule the
+         * standalone readback applies: the former CPU scan seeded its
+         * comparison with row[0], so a NaN there kept token zero, while the
+         * GPU reducer ignores NaNs. */
+        if (!ds4_gpu_tensor_read(h->t_logits,
+                                 (uint64_t)t * draft_width * sizeof(float),
+                                 &logit0, sizeof(logit0))) {
+            return mtp_fail(err, errlen,
+                            "qwen4exp MTP head: folded logit-0 readback failed "
+                            "at row %u", t);
+        }
+        uint32_t logit0_bits;
+        memcpy(&logit0_bits, &logit0, sizeof(logit0_bits));
+        if ((logit0_bits & 0x7fffffffu) > 0x7f800000u) {
+            pack[n_tokens + t] = 0u;
+        }
+    }
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        row_top1_out[t] = (int)pack[t];
+        /* Unpack the top-1's packed position back into a token id: below the
+         * prefix it IS the id; above it, rebase into the tail range. */
+        uint32_t id = pack[n_tokens + t];
+        if (draft_prefix && id >= draft_prefix) {
+            id = h->n_vocab - draft_tail + (id - draft_prefix);
+        }
+        draft_out[t] = (int)id;
+    }
+    return 0;
 }
 
 #endif /* DS4_NO_GPU */
