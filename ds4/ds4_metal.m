@@ -47394,10 +47394,6 @@ int ds4_gpu_qwen4exp_qsa_indexer_select_tensor(
     }
 }
 
-int ds4_gpu_qwen4exp_update_dpos(ds4_gpu_tensor *d_pos, uint32_t pos) {
-    return ds4_gpu_tensor_write(d_pos, 0, &pos, sizeof(pos));
-}
-
 int ds4_gpu_qwen4exp_qsa_prep_q_fused_dpos_tensor(
         ds4_gpu_tensor       *q,
         ds4_gpu_tensor       *gate,
