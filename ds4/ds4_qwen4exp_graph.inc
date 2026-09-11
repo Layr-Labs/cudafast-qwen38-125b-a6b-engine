@@ -322,6 +322,8 @@ struct ds4_qwen4exp_session {
     uint32_t        spec_top1_rows;
     uint32_t        indexer_valid_blocks;
     uint32_t        head_cache_pos;
+    uint32_t        last_forward_pos0;
+    uint32_t        last_forward_rows;
 
     /* Shared, position-independent. */
     ds4_gpu_tensor *inv_freq;
@@ -877,6 +879,8 @@ static void qwen4exp_zero_tensor(ds4_gpu_tensor *t) {
 
 void ds4_qwen4exp_session_reset(ds4_qwen4exp_session *s) {
     if (!s) return;
+    s->last_forward_pos0 = 0u;
+    s->last_forward_rows = 0u;
     if (!s->state_dirty) {
         /* Already at the reset state and nothing has written since, so every
          * store below would write the value the buffer already holds.  `pos`
@@ -2200,6 +2204,8 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         return false;
     }
 
+    s->last_forward_pos0 = s->pos;
+    s->last_forward_rows = n_tokens;
     s->pos += n_tokens;
     if (wall_t0 != 0.0) {
         fprintf(stderr, "ds4: qwen4exp forward wall: %u rows in %.3f ms\n",
@@ -2617,6 +2623,21 @@ bool ds4_qwen4exp_graph_read_logit_row(ds4_qwen4exp_session *s,
     const uint64_t bytes = (uint64_t)cfg->n_vocab * sizeof(float);
     return ds4_gpu_tensor_read(s->logits, (uint64_t)row * bytes,
                                logits, bytes) != 0;
+}
+
+bool ds4_qwen4exp_graph_hyper_rows_device(
+        const ds4_qwen4exp_session *s, uint32_t pos0, uint32_t n_tokens,
+        const ds4_gpu_tensor **tensor, uint64_t *offset) {
+    if (!s || !tensor || !offset || n_tokens == 0u ||
+        pos0 < s->last_forward_pos0 ||
+        pos0 - s->last_forward_pos0 > s->last_forward_rows ||
+        n_tokens > s->last_forward_rows - (pos0 - s->last_forward_pos0)) {
+        return false;
+    }
+    *tensor = s->hyper;
+    *offset = (uint64_t)(pos0 - s->last_forward_pos0) *
+              DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    return true;
 }
 
 /* The target's LM head over ONE supplied pre-final-mixer row.
