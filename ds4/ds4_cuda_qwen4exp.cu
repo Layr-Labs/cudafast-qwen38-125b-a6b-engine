@@ -6564,6 +6564,7 @@ __global__ static void qwen4exp_qsa_attention_kernel(
         if (tid < head_dim) {
             float contrib = 0.0f;
             uint32_t j = 0;
+            const uint64_t value_col = (uint64_t)kv_head * head_dim + tid;
             /* EIGHT VALUE ROWS IN FLIGHT AT A TIME.  This loop is the longest
              * dependency chain in the kernel: one global load per key, each
              * add waiting on the one before it, up to nth keys per tile.  The
@@ -6582,30 +6583,22 @@ __global__ static void qwen4exp_qsa_attention_kernel(
              * one-at-a-time walk, whose `continue` is load bearing. */
             if (!sparse) {
                 for (; j + 8u <= n_in_tile; j += 8u) {
-                    const float *v0 = v_cache +
-                        (uint64_t)keys[j] * kv_stride + (uint64_t)kv_head * head_dim;
-                    const float *v1 = v_cache +
-                        (uint64_t)keys[j + 1u] * kv_stride + (uint64_t)kv_head * head_dim;
-                    const float *v2 = v_cache +
-                        (uint64_t)keys[j + 2u] * kv_stride + (uint64_t)kv_head * head_dim;
-                    const float *v3 = v_cache +
-                        (uint64_t)keys[j + 3u] * kv_stride + (uint64_t)kv_head * head_dim;
-                    const float *v4 = v_cache +
-                        (uint64_t)keys[j + 4u] * kv_stride + (uint64_t)kv_head * head_dim;
-                    const float *v5 = v_cache +
-                        (uint64_t)keys[j + 5u] * kv_stride + (uint64_t)kv_head * head_dim;
-                    const float *v6 = v_cache +
-                        (uint64_t)keys[j + 6u] * kv_stride + (uint64_t)kv_head * head_dim;
-                    const float *v7 = v_cache +
-                        (uint64_t)keys[j + 7u] * kv_stride + (uint64_t)kv_head * head_dim;
-                    const float a0 = v0[tid];
-                    const float a1 = v1[tid];
-                    const float a2 = v2[tid];
-                    const float a3 = v3[tid];
-                    const float a4 = v4[tid];
-                    const float a5 = v5[tid];
-                    const float a6 = v6[tid];
-                    const float a7 = v7[tid];
+                    const float a0 = v_cache[
+                        (uint64_t)keys[j] * kv_stride + value_col];
+                    const float a1 = v_cache[
+                        (uint64_t)keys[j + 1u] * kv_stride + value_col];
+                    const float a2 = v_cache[
+                        (uint64_t)keys[j + 2u] * kv_stride + value_col];
+                    const float a3 = v_cache[
+                        (uint64_t)keys[j + 3u] * kv_stride + value_col];
+                    const float a4 = v_cache[
+                        (uint64_t)keys[j + 4u] * kv_stride + value_col];
+                    const float a5 = v_cache[
+                        (uint64_t)keys[j + 5u] * kv_stride + value_col];
+                    const float a6 = v_cache[
+                        (uint64_t)keys[j + 6u] * kv_stride + value_col];
+                    const float a7 = v_cache[
+                        (uint64_t)keys[j + 7u] * kv_stride + value_col];
                     contrib += probs[j] * a0;
                     contrib += probs[j + 1u] * a1;
                     contrib += probs[j + 2u] * a2;
@@ -6619,9 +6612,8 @@ __global__ static void qwen4exp_qsa_attention_kernel(
             for (; j < n_in_tile; j++) {
                 const int32_t kj = keys[j];
                 if (kj < 0) continue;
-                const float *vv = v_cache +
-                    (uint64_t)kj * kv_stride + (uint64_t)kv_head * head_dim;
-                contrib += probs[j] * vv[tid];
+                contrib += probs[j] * v_cache[
+                    (uint64_t)kj * kv_stride + value_col];
             }
             acc = acc * rescale + contrib;
         }
