@@ -16557,11 +16557,15 @@ static int cuda_matmul_q8_0_preq_rows_exact(
 #undef DS4_Q8_DENSE_MMA_LAUNCH
 
     const int use_dp4a = cuda_q8_use_dp4a();
-    /* Two lanes read each full group at one/two-row decode widths. Integer
-     * partials combine exactly, then the original 32 float chains and warp
-     * tree are restored. Wider calls and partial groups keep their kernels. */
+    /* Prefer the warp-per-row exact tile at two-row verify widths instead of
+     * pair-lanes. The tile already owns n_rows==2 for out_dim<=512 and matches
+     * warp8 per-row arithmetic with one weight read per group; using it for
+     * wide outs avoids the pair-lane shuffle / funnel path that a rejected
+     * unpaired rewrite also tried to escape. Opt back in with
+     * DS4_QWEN4EXP_PAIR_LANES=1. */
     if (use_dp4a && n_rows <= 2u && out_dim > 512u && (in_dim & 31u) == 0u &&
         getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
+        getenv("DS4_QWEN4EXP_PAIR_LANES") != NULL &&
         (((uintptr_t)wptr & 1u) == 0u)) {
         matmul_q8_0_preq_pair_lanes_kernel<2><<<
                 dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u),
