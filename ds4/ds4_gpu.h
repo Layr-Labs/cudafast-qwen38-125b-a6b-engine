@@ -2942,7 +2942,58 @@ int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         uint32_t                     out_dim,
         const ds4_gpu_tensor        *x,
         uint32_t                     n_tokens,
-        int                          pre_quantized);
+        int                          pre_quantized,
+        /* gate_ready: the router's F32 launch already wrote gate_scale (the
+         * ds4_gpu_qwen4exp_router_logits_gate_tensor fold), so this entry
+         * skips its own gate kernel instead of repeating it. */
+        int                          gate_ready);
+
+/* The decode-width router tail, fused.  Whether the two fuses below engage at
+ * all: a width below eight (the small-group envelope) and no
+ * DS4_QWEN4EXP_NO_ROUTER_FUSE in the environment.  The entries re-check their
+ * own conditions and decline to the unfused kernels, which return the same
+ * bits, so a model outside the envelope still runs correctly. */
+int ds4_gpu_qwen4exp_router_tail_fuse_on(uint32_t n_tokens);
+
+/* The router's F32 logits with the shared expert's sigmoid gate folded in as
+ * one extra block-row of the same GEMV launch.  Writes logits[0..n_rows) and
+ * shexp_gate[0..n_rows); the caller then passes gate_ready 1 to the shared
+ * expert so the standalone gate kernel is not launched again. */
+int ds4_gpu_qwen4exp_router_logits_gate_tensor(
+        ds4_gpu_tensor              *logits,
+        ds4_gpu_tensor              *shexp_gate,
+        const void                  *router_map,
+        uint64_t                     router_map_size,
+        uint64_t                     router_offset,
+        const ds4_gpu_qwen4exp_slab *shexp_router,
+        uint64_t                     in_dim,
+        uint64_t                     out_dim,
+        const ds4_gpu_tensor        *x,
+        uint32_t                     n_rows);
+
+/* The routed MoE with the router tail folded in: BUILDS selected and weights
+ * from logits (the warp top-k, its softmax and the small metadata scan in one
+ * launch at the widths ds4_gpu_qwen4exp_router_tail_fuse_on names) instead of
+ * reading them.  Where the fuse declines, the selection is built by the
+ * standalone router dispatch and the metadata by today's paths, unchanged. */
+int ds4_gpu_qwen4exp_router_tail_moe_tensor(
+        ds4_gpu_tensor              *out,
+        ds4_gpu_tensor              *mid,
+        ds4_gpu_tensor              *down_partial,
+        const ds4_gpu_qwen4exp_slab *gate,
+        const ds4_gpu_qwen4exp_slab *up,
+        const ds4_gpu_qwen4exp_slab *down,
+        uint32_t                     in_dim,
+        uint32_t                     mid_dim,
+        uint32_t                     out_dim,
+        ds4_gpu_tensor              *selected,
+        ds4_gpu_tensor              *weights,
+        const ds4_gpu_tensor        *logits,
+        uint32_t                     n_total_expert,
+        uint32_t                     n_expert_used,
+        const ds4_gpu_tensor        *x,
+        uint32_t                     n_tokens,
+        uint32_t                     mid_token_stride);
 
 int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
         ds4_gpu_tensor       *out,

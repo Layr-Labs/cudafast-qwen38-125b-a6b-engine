@@ -36865,11 +36865,75 @@ int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         uint32_t                     out_dim,
         const ds4_gpu_tensor        *x,
         uint32_t                     n_tokens,
-        int                          pre_quantized) {
+        int                          pre_quantized,
+        int                          gate_ready) {
     (void)pre_quantized;
+    /* The Metal backend never folds the gate into the router's GEMV (see
+     * ds4_gpu_qwen4exp_router_tail_fuse_on below), so gate_ready is always
+     * zero here and the gate this entry computes itself is the one used. */
+    (void)gate_ready;
     return ds4_gpu_qwen4exp_shared_expert_tensor(
             out, mid, gate_scale, router_slab, gate_slab, up_slab, down_slab,
             in_dim, mid_dim, out_dim, x, n_tokens);
+}
+
+/* The decode-width router-tail fuses are a CUDA launch-count decision: the
+ * four separate dispatches this backend already makes are the same arithmetic,
+ * and nothing on Metal measures them as a cost.  The predicate therefore never
+ * takes the fused branch here, which also keeps the two entries below
+ * unreachable from the graph. */
+int ds4_gpu_qwen4exp_router_tail_fuse_on(uint32_t n_tokens) {
+    (void)n_tokens;
+    return 0;
+}
+
+int ds4_gpu_qwen4exp_router_logits_gate_tensor(
+        ds4_gpu_tensor              *logits,
+        ds4_gpu_tensor              *shexp_gate,
+        const void                  *router_map,
+        uint64_t                     router_map_size,
+        uint64_t                     router_offset,
+        const ds4_gpu_qwen4exp_slab *shexp_router,
+        uint64_t                     in_dim,
+        uint64_t                     out_dim,
+        const ds4_gpu_tensor        *x,
+        uint32_t                     n_rows) {
+    (void)logits; (void)shexp_gate; (void)router_map; (void)router_map_size;
+    (void)router_offset; (void)shexp_router; (void)in_dim; (void)out_dim;
+    (void)x; (void)n_rows;
+    fprintf(stderr, "ds4: Metal qwen4exp does not fuse the router tail\n");
+    return 0;
+}
+
+/* The selection is built by the standalone router this backend already has,
+ * then the routed MoE runs unchanged: the unfused chain, exactly. */
+int ds4_gpu_qwen4exp_router_tail_moe_tensor(
+        ds4_gpu_tensor              *out,
+        ds4_gpu_tensor              *mid,
+        ds4_gpu_tensor              *down_partial,
+        const ds4_gpu_qwen4exp_slab *gate_slab,
+        const ds4_gpu_qwen4exp_slab *up_slab,
+        const ds4_gpu_qwen4exp_slab *down_slab,
+        uint32_t                     in_dim,
+        uint32_t                     mid_dim,
+        uint32_t                     out_dim,
+        ds4_gpu_tensor              *selected,
+        ds4_gpu_tensor              *weights,
+        const ds4_gpu_tensor        *logits,
+        uint32_t                     n_total_expert,
+        uint32_t                     n_expert_used,
+        const ds4_gpu_tensor        *x,
+        uint32_t                     n_tokens,
+        uint32_t                     mid_token_stride) {
+    if (!ds4_gpu_qwen4exp_router_select_tensor(
+                selected, weights, logits, n_total_expert, n_expert_used,
+                n_tokens)) {
+        return 0;
+    }
+    return ds4_gpu_qwen4exp_routed_moe_tensor(
+            out, mid, down_partial, gate_slab, up_slab, down_slab,
+            in_dim, mid_dim, out_dim, selected, weights, n_total_expert,
+            n_expert_used, x, n_tokens, mid_token_stride);
 }
 
 int ds4_gpu_qwen4exp_shared_expert_tensor(

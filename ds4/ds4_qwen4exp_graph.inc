@@ -1643,6 +1643,63 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
     const int moe_lane = qw_moe_in_head_block ? 1 : 0;
     uint64_t moe_mark = moe_timing ? qw_hb_now_ns() : 0;
 
+    /* At the decode widths the router's tail is three launches of one to ten
+     * microseconds each -- the top-k, its softmax and the small expert-group
+     * scan -- and the shared expert's gate is a fourth.  The fused branch runs
+     * the same arithmetic in two launches: the gate as one extra block-row of
+     * the router's F32 GEMV, the top-k, softmax and scan in one kernel.
+     * DS4_QWEN4EXP_NO_ROUTER_FUSE keeps the four launches for the A/B; both
+     * paths write the same bytes (tests/test_qwen4exp_moe.c compares them). */
+    if (ds4_gpu_qwen4exp_router_tail_fuse_on(n_tokens)) {
+        const ds4_gpu_qwen4exp_slab sh_router_slab =
+            QW_SLAB(m, l->ffn_gate_inp_shexp);
+        if (!ds4_gpu_qwen4exp_router_logits_gate_tensor(
+                    s->moe_logits, s->shexp_gate,
+                    QW_MAP(m, l->ffn_gate_inp),
+                    QW_MAPSZ(m, l->ffn_gate_inp), QW_OFF(l->ffn_gate_inp),
+                    &sh_router_slab, DS4_N_EMBD, DS4_N_EXPERT, s->mixed,
+                    n_tokens)) {
+            fprintf(stderr, "ds4: qwen4exp router logits + gate failed at "
+                            "block %u\n", il);
+            return false;
+        }
+        QW_MOE_TICK(QW_MOE_T_ROUTER);
+        /* The select rides the routed launch below it. */
+        QW_MOE_TICK(QW_MOE_T_SELECT);
+
+        const ds4_gpu_qwen4exp_slab gate_slab = QW_SLAB(m, l->ffn_gate_exps);
+        const ds4_gpu_qwen4exp_slab up_slab = QW_SLAB(m, l->ffn_up_exps);
+        const ds4_gpu_qwen4exp_slab down_slab = QW_SLAB(m, l->ffn_down_exps);
+        if (!ds4_gpu_qwen4exp_router_tail_moe_tensor(
+                s->block_out, s->moe_mid, s->moe_down_partial,
+                &gate_slab, &up_slab, &down_slab,
+                DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD,
+                s->moe_selected, s->moe_weights, s->moe_logits,
+                DS4_N_EXPERT, DS4_N_EXPERT_USED,
+                s->mixed, n_tokens, DS4_N_EXPERT_USED * DS4_N_FF_EXP)) {
+            fprintf(stderr, "ds4: qwen4exp router tail experts failed at "
+                            "block %u\n", il);
+            return false;
+        }
+        QW_MOE_TICK(QW_MOE_T_ROUTED);
+
+        const ds4_gpu_qwen4exp_slab sh_gate_slab = QW_SLAB(m, l->ffn_gate_shexp);
+        const ds4_gpu_qwen4exp_slab sh_up_slab = QW_SLAB(m, l->ffn_up_shexp);
+        const ds4_gpu_qwen4exp_slab sh_down_slab = QW_SLAB(m, l->ffn_down_shexp);
+        if (!ds4_gpu_qwen4exp_shared_expert_preq_tensor(
+                s->block_out, s->shexp_mid, s->shexp_gate,
+                &sh_router_slab, &sh_gate_slab, &sh_up_slab, &sh_down_slab,
+                DS4_N_EMBD, DS4_N_FF_SHEXP, DS4_N_EMBD, s->mixed, n_tokens,
+                0, 1)) {
+            fprintf(stderr, "ds4: qwen4exp shared expert failed at block %u\n",
+                    il);
+            return false;
+        }
+        QW_MOE_TICK(QW_MOE_T_SHARED);
+        if (moe_timing) qw_moe_stage_calls[moe_lane]++;
+        return true;
+    }
+
     if (!ds4_qwen4exp_matmul_f32(s->moe_logits, QW_MAP(m, l->ffn_gate_inp),
                                    QW_MAPSZ(m, l->ffn_gate_inp),
                                    QW_OFF(l->ffn_gate_inp),

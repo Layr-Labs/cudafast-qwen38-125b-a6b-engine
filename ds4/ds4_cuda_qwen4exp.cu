@@ -1891,6 +1891,205 @@ __global__ static void qwen4exp_moe_group_small_kernel(
     }
 }
 
+/* The decode-width router tail in ONE launch: the two kernels above, run one
+ * after the other by the same 512 threads.
+ *
+ * Phase one is qwen4exp_router_select_topk_kernel's body verbatim, one warp
+ * per token where the standalone launch gave each token a block of its own --
+ * the warp top-k, the shuffles and the lane-0 softmax are the same code on the
+ * same lane ids, so `selected` and `weights_out` are the same bytes.  Warps at
+ * and above n_tokens skip to the barrier; every warp that enters does so with
+ * all thirty-two lanes, which is what the full-mask shuffles require.
+ *
+ * One __syncthreads() replaces the kernel boundary: the metadata phase reads
+ * `selected` the standalone kernel would have read back from memory, and the
+ * barrier is block scope, so the writes of the first n_tokens warps are
+ * visible to every thread of the second phase.  Phase two is
+ * qwen4exp_moe_group_small_kernel's body verbatim, on the same threadIdx.x the
+ * standalone <<<1, QWEN4EXP_MOE_SCAN_THREADS>>> launch gave it.
+ *
+ * The launch is 1-10 us of work either way, so this is a launch-count
+ * decision, not an arithmetic one: every float and every selection is the
+ * standalone pair's. */
+__global__ static void qwen4exp_router_tail_small_kernel(
+        int32_t *counts,
+        int32_t *offsets,
+        int32_t *cursor,
+        int32_t *active,
+        int32_t *pairs,
+        float *mid,
+        int32_t *selected,
+        float *weights_out,
+        const float *logits,
+        uint32_t n_expert,
+        uint32_t n_expert_used,
+        uint32_t n_tokens,
+        uint32_t n_pairs,
+        uint32_t mid_dim,
+        uint32_t mid_token_stride) {
+    __shared__ int32_t warp_count_prefix[QWEN4EXP_MOE_SCAN_THREADS / 32];
+    __shared__ int32_t warp_live_prefix[QWEN4EXP_MOE_SCAN_THREADS / 32];
+
+    /* Phase one: the warp top-k and softmax, qwen4exp_router_select_topk_kernel
+     * verbatim with tok taken from the warp id instead of blockIdx.x. */
+    const uint32_t tok = threadIdx.x >> 5u;
+    if (tok < n_tokens) {
+        const uint32_t lane = threadIdx.x & 31u;
+        const float *lg = logits + (uint64_t)tok * n_expert;
+        int32_t *sel = selected + (uint64_t)tok * n_expert_used;
+        float *w = weights_out + (uint64_t)tok * n_expert_used;
+
+        float scores[16];
+        uint32_t live = 0u;
+#pragma unroll
+        for (uint32_t j = 0; j < 16u; j++) {
+            const uint32_t e = lane + j * 32u;
+            scores[j] = e < n_expert ? lg[e] : -FLT_MAX;
+            if (e < n_expert) live |= 1u << j;
+        }
+
+        for (uint32_t rank = 0; rank < n_expert_used; rank++) {
+            float best_v = -FLT_MAX;
+            int32_t best_i = INT32_MAX;
+#pragma unroll
+            for (uint32_t j = 0; j < 16u; j++) {
+                if ((live & (1u << j)) == 0u) continue;
+                const int32_t e = (int32_t)(lane + j * 32u);
+                const float v = scores[j];
+                if (v > best_v || (v == best_v && e < best_i)) {
+                    best_v = v;
+                    best_i = e;
+                }
+            }
+
+#pragma unroll
+            for (uint32_t off = 16u; off > 0u; off >>= 1u) {
+                const float other_v =
+                    __shfl_down_sync(0xffffffffu, best_v, off);
+                const int32_t other_i =
+                    __shfl_down_sync(0xffffffffu, best_i, off);
+                if (other_v > best_v ||
+                    (other_v == best_v && other_i < best_i)) {
+                    best_v = other_v;
+                    best_i = other_i;
+                }
+            }
+            const int32_t chosen =
+                __shfl_sync(0xffffffffu, best_i, 0u);
+            if (lane == 0u) sel[rank] = chosen;
+            if (((uint32_t)chosen & 31u) == lane) {
+                live &= ~(1u << ((uint32_t)chosen >> 5u));
+            }
+        }
+
+        /* Same serial softmax and the same selected-logit order as the
+         * full-sort path below. */
+        if (lane == 0u) {
+            float m = -FLT_MAX;
+            for (uint32_t i = 0; i < n_expert_used; i++) {
+                const float v = lg[(uint32_t)sel[i]];
+                if (v > m) m = v;
+            }
+            float sum = 0.0f;
+            for (uint32_t i = 0; i < n_expert_used; i++) {
+                const float e = expf(lg[(uint32_t)sel[i]] - m);
+                w[i] = e;
+                sum += e;
+            }
+            const float inv = 1.0f / sum;
+            for (uint32_t i = 0; i < n_expert_used; i++) w[i] *= inv;
+        }
+    }
+
+    __syncthreads();
+
+    /* Phase two: the expert metadata and the invalid-pair zeroing,
+     * qwen4exp_moe_group_small_kernel verbatim. */
+    const uint32_t e = threadIdx.x;
+    const uint32_t lane = e & 31u;
+    const uint32_t warp = e >> 5u;
+
+    int32_t count = 0;
+    if (e < n_expert) {
+        for (uint32_t p = 0; p < n_pairs; p++) {
+            count += selected[p] == (int32_t)e;
+        }
+        counts[e] = count;
+    }
+    int32_t count_prefix = count;
+    int32_t live_prefix = count > 0 ? 1 : 0;
+#pragma unroll
+    for (uint32_t delta = 1u; delta < 32u; delta <<= 1u) {
+        const int32_t prior_count =
+            __shfl_up_sync(0xffffffffu, count_prefix, delta);
+        const int32_t prior_live =
+            __shfl_up_sync(0xffffffffu, live_prefix, delta);
+        if (lane >= delta) {
+            count_prefix += prior_count;
+            live_prefix += prior_live;
+        }
+    }
+    if (lane == 31u) {
+        warp_count_prefix[warp] = count_prefix;
+        warp_live_prefix[warp] = live_prefix;
+    }
+    __syncthreads();
+
+    if (warp == 0u) {
+        const uint32_t n_warps = QWEN4EXP_MOE_SCAN_THREADS / 32;
+        int32_t warp_count = lane < n_warps ? warp_count_prefix[lane] : 0;
+        int32_t warp_live = lane < n_warps ? warp_live_prefix[lane] : 0;
+#pragma unroll
+        for (uint32_t delta = 1u; delta < 32u; delta <<= 1u) {
+            const int32_t prior_count =
+                __shfl_up_sync(0xffffffffu, warp_count, delta);
+            const int32_t prior_live =
+                __shfl_up_sync(0xffffffffu, warp_live, delta);
+            if (lane >= delta) {
+                warp_count += prior_count;
+                warp_live += prior_live;
+            }
+        }
+        if (lane < n_warps) {
+            warp_count_prefix[lane] = warp_count;
+            warp_live_prefix[lane] = warp_live;
+        }
+    }
+    __syncthreads();
+
+    if (warp > 0u) {
+        count_prefix += warp_count_prefix[warp - 1u];
+        live_prefix += warp_live_prefix[warp - 1u];
+    }
+    if (e < n_expert) {
+        const int32_t offset = count_prefix - count;
+        offsets[e] = offset;
+        cursor[e] = offset + count;
+        if (count > 0) active[live_prefix] = (int32_t)e;
+        int32_t at = offset;
+        for (uint32_t p = 0; p < n_pairs; p++) {
+            if (selected[p] == (int32_t)e) pairs[at++] = (int32_t)p;
+        }
+    }
+    if (e == 0u) {
+        active[0] = warp_live_prefix[QWEN4EXP_MOE_SCAN_THREADS / 32 - 1u];
+    }
+    /* The normal router never emits an invalid id.  Preserve the public
+     * tensor helper's defensive zero semantics without paying a second launch
+     * in the normal case; an invalid pair's one thread writes its short
+     * intermediate row here. */
+    if (e < n_pairs) {
+        const int32_t expert = selected[e];
+        if (expert < 0 || (uint32_t)expert >= n_expert) {
+            const uint32_t token = e / n_expert_used;
+            const uint32_t slot = e - token * n_expert_used;
+            float *dst = mid + (uint64_t)token * mid_token_stride +
+                         (uint64_t)slot * mid_dim;
+            for (uint32_t row = 0; row < mid_dim; row++) dst[row] = 0.0f;
+        }
+    }
+}
+
 __global__ static void qwen4exp_moe_group_scatter_kernel(
         int32_t *pairs,
         int32_t *cursor,
@@ -4209,6 +4408,218 @@ __global__ static void qwen4exp_shared_gate_kernel(
     if (threadIdx.x == 0u) gate_out[token] = 1.0f / (1.0f + expf(-total));
 }
 
+/* The router's F32 logits with the shared expert's gate folded in as ONE extra
+ * block-row, so the decode tail pays one launch instead of two.
+ *
+ * blockIdx.x < out_dim rows are ds4_cuda.cu's matmul_f32_rows_exact_tile_kernel
+ * moved here verbatim: the same strided k walk, the same fused multiply-add,
+ * the same interleaved stride-halving tree, so every logit is the bit the
+ * generic F32 entry writes (that entry asserts row-count invariance for this
+ * kernel, and its one-row arm is the same walk and tree, so a take of one
+ * matches it too).  The unit compiles this file without --use_fast_math, the
+ * one flag difference the move could show is denormal flushing on a product
+ * or partial sum below 2^-126; the router weights and the mixed activation
+ * this checkpoint runs are orders of magnitude above that, and the discrete
+ * top-k downstream already reads a dot computed under the fast-math flags.
+ *
+ * blockIdx.x == out_dim is qwen4exp_shared_gate_kernel's dot and sigmoid,
+ * verbatim, R tokens to a block instead of one: the same
+ * dev_qwen4exp_weight_value decode in the same walk order, and per row the
+ * same halving tree dev_qwen4exp_block_sum performs -- the interleaved tree
+ * gives each row the identical reduction it had alone -- with
+ * 1/(1+expf(-total)) after it, in this unit, under this unit's flags.  The
+ * same bits as the standalone gate kernel's output. */
+template <int R>
+__global__ static void qwen4exp_router_logits_gate_kernel(
+        float *out,
+        const float *w,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint32_t n_rows,
+        const char *gate_row,
+        uint32_t gate_type,
+        float *gate_out) {
+    const uint64_t row = (uint64_t)blockIdx.x;
+    const uint32_t row0 = (uint32_t)blockIdx.y * (uint32_t)R;
+    if (row > out_dim || row0 >= n_rows) return;
+    const uint32_t take = n_rows - row0 < (uint32_t)R ? n_rows - row0
+                                                      : (uint32_t)R;
+
+    __shared__ float partial[R][256];
+
+    if (row == out_dim) {
+        /* The shared expert's gate row. */
+        float sum[R];
+#pragma unroll
+        for (int r = 0; r < R; r++) sum[r] = 0.0f;
+
+        for (uint64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+            const float wv = dev_qwen4exp_weight_value(
+                    gate_type, gate_row, (uint32_t)i);
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                if ((uint32_t)r < take) {
+                    sum[r] += wv * x[((uint64_t)row0 + (uint64_t)r) * in_dim + i];
+                }
+            }
+        }
+
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            partial[r][threadIdx.x] = sum[r];
+        }
+        __syncthreads();
+        for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+#pragma unroll
+                for (int r = 0; r < R; r++) {
+                    partial[r][threadIdx.x] += partial[r][threadIdx.x + stride];
+                }
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0u) {
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                if ((uint32_t)r < take) {
+                    gate_out[row0 + (uint32_t)r] =
+                        1.0f / (1.0f + expf(-partial[r][0]));
+                }
+            }
+        }
+        return;
+    }
+
+    /* A router logits row. */
+    const float *wr = w + row * in_dim;
+    float sum[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) sum[r] = 0.0f;
+
+    for (uint64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        const float wv = wr[i];
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            if ((uint32_t)r < take) {
+                sum[r] += wv * x[((uint64_t)row0 + (uint64_t)r) * in_dim + i];
+            }
+        }
+    }
+
+    /* One INTERLEAVED tree instead of R sequential ones.  Row r still gets
+     * the identical reduction it always had: partial[r][tid] starts from
+     * sum[r] and the same stride-halving adds the same partner lanes in the
+     * same order, so every output is the same bits.  What changes is only
+     * that the R trees share their barriers -- one __syncthreads per stride
+     * level for all rows together (R + 8 syncs instead of R x 10), which
+     * takes the kernel off the barrier budget it was measured on. */
+#pragma unroll
+    for (int r = 0; r < R; r++) {
+        partial[r][threadIdx.x] = sum[r];
+    }
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                partial[r][threadIdx.x] += partial[r][threadIdx.x + stride];
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            if ((uint32_t)r < take) {
+                out[((uint64_t)row0 + (uint64_t)r) * out_dim + row] =
+                    partial[r][0];
+            }
+        }
+    }
+}
+
+/* The router's logits and the shared expert's gate in ONE launch: the fused
+ * kernel above, with the gate as block-row out_dim.  Same buffers, same
+ * stream, no allocation, so the call is capture-safe wherever the two calls
+ * it replaces were.  The caller then owes the shared expert a gate_ready of
+ * one, so the standalone gate launch is skipped instead of repeated. */
+extern "C" int ds4_gpu_qwen4exp_router_logits_gate_tensor(
+        ds4_gpu_tensor              *logits,
+        ds4_gpu_tensor              *shexp_gate,
+        const void                  *router_map,
+        uint64_t                     router_map_size,
+        uint64_t                     router_offset,
+        const ds4_gpu_qwen4exp_slab *shexp_router,
+        uint64_t                     in_dim,
+        uint64_t                     out_dim,
+        const ds4_gpu_tensor        *x,
+        uint32_t                     n_rows) {
+    if (!logits || !shexp_gate || !shexp_router || !shexp_router->map ||
+        !x || !router_map || in_dim == 0 || out_dim == 0 || n_rows == 0) {
+        return 0;
+    }
+    if (router_offset > router_map_size ||
+        out_dim > UINT64_MAX / in_dim) {
+        return 0;
+    }
+    const uint64_t weight_elems = in_dim * out_dim;
+    if (weight_elems > UINT64_MAX / sizeof(float)) return 0;
+    const uint64_t weight_bytes = weight_elems * sizeof(float);
+    if (weight_bytes > router_map_size - router_offset) return 0;
+    if (x->bytes < (uint64_t)n_rows * in_dim * sizeof(float) ||
+        logits->bytes < (uint64_t)n_rows * out_dim * sizeof(float) ||
+        shexp_gate->bytes < (uint64_t)n_rows * sizeof(float)) {
+        fprintf(stderr, "ds4: CUDA qwen4exp router logits + gate received "
+                        "undersized buffers\n");
+        return 0;
+    }
+
+    const int logical_tier = ds4_tensor_device_idx(logits);
+    const char *w = cuda_resolve_weight_ptr(
+            router_map, router_offset, weight_bytes, logical_tier,
+            "qwen4exp_ffn_gate_inp");
+    /* The same resolve and the same byte window the shared expert's own gate
+     * launch asks for, so the two agree on the row whatever the slab type. */
+    const char *gate = cuda_resolve_weight_ptr(
+            shexp_router->map, shexp_router->offset,
+            (uint64_t)in_dim * sizeof(float), logical_tier,
+            "qwen4exp_ffn_gate_inp_shexp");
+    if (!w || !gate) return 0;
+
+    cudaStream_t stream = cuda_decode_stream();
+    /* The generic F32 entry's own dispatch below eight rows: a two-row tile
+     * up to three, a four-row tile above.  At one row the take masks the
+     * second slot and the kernel is the one-row walk and tree. */
+    if (n_rows < 4u) {
+        const dim3 grid((unsigned)out_dim + 1u, (n_rows + 1u) / 2u, 1);
+        qwen4exp_router_logits_gate_kernel<2><<<grid, 256, 0, stream>>>(
+                (float *)logits->ptr, (const float *)w, (const float *)x->ptr,
+                in_dim, out_dim, n_rows, gate, shexp_router->type,
+                (float *)shexp_gate->ptr);
+    } else {
+        const dim3 grid((unsigned)out_dim + 1u, (n_rows + 3u) / 4u, 1);
+        qwen4exp_router_logits_gate_kernel<4><<<grid, 256, 0, stream>>>(
+                (float *)logits->ptr, (const float *)w, (const float *)x->ptr,
+                in_dim, out_dim, n_rows, gate, shexp_router->type,
+                (float *)shexp_gate->ptr);
+    }
+    return cuda_ok(cudaGetLastError(), "qwen4exp router logits + gate launch");
+}
+
+/* Whether the decode tail's fuses engage: the small-group envelope (a width
+ * below eight is what the speculative cycle and a plain decode run) and the
+ * kill switch that keeps the four separate launches for the A/B.  The width
+ * and model-shape conditions inside the two entries re-check this and decline
+ * to today's kernels on their own, so a model outside the fuse's envelope
+ * runs correctly through the same call. */
+extern "C" int ds4_gpu_qwen4exp_router_tail_fuse_on(uint32_t n_tokens) {
+    return n_tokens < 8u &&
+                   getenv("DS4_QWEN4EXP_NO_ROUTER_FUSE") == NULL
+               ? 1
+               : 0;
+}
+
 
 
 /* Twin of ds4_gpu_qwen4exp_moe_type_supported in ds4_metal.m. */
@@ -4359,7 +4770,12 @@ static int qwen4exp_moe_tile(uint32_t n_rows) {
     return 8;
 }
 
-extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
+/* The routed MoE.  `logits` is NULL for the two-call contract, where the
+ * caller built `selected` and `weights` first; non-NULL asks this entry to
+ * build them, fused with the metadata scan into one launch at the decode
+ * widths (qwen4exp_router_tail_small_kernel) or through today's standalone
+ * kernels at any width the fuse declines. */
+static int qwen4exp_routed_moe_body(
         ds4_gpu_tensor              *out,
         ds4_gpu_tensor              *mid,
         ds4_gpu_tensor              *down_partial,
@@ -4369,8 +4785,9 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         uint32_t                     in_dim,
         uint32_t                     mid_dim,
         uint32_t                     out_dim,
-        const ds4_gpu_tensor        *selected,
-        const ds4_gpu_tensor        *weights,
+        ds4_gpu_tensor              *selected,
+        ds4_gpu_tensor              *weights,
+        const ds4_gpu_tensor        *logits,
         uint32_t                     n_total_expert,
         uint32_t                     n_expert_used,
         const ds4_gpu_tensor        *x,
@@ -4465,7 +4882,30 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     const int small_group =
         n_tokens < 8u && n_total_expert <= QWEN4EXP_MOE_SCAN_THREADS &&
         getenv("DS4_QWEN4EXP_SERIAL_GROUP_SCAN") == NULL;
-    if (small_group) {
+    /* The fused decode tail: the caller passed the logits, the small scan
+     * holds, and the warp top-k's envelopes (at most 512 experts, at most 32
+     * picked) do too.  DS4_QWEN4EXP_NO_ROUTER_FUSE keeps the two launches for
+     * the A/B; every decline lands on today's kernels, which return the same
+     * bits. */
+    const int router_tail =
+        logits != NULL && small_group && n_expert_used <= 32u &&
+        getenv("DS4_QWEN4EXP_NO_ROUTER_FUSE") == NULL;
+    if (logits != NULL && !router_tail) {
+        if (!ds4_gpu_qwen4exp_router_select_tensor(
+                    selected, weights, logits, n_total_expert,
+                    n_expert_used, n_tokens)) {
+            return 0;
+        }
+    }
+    if (router_tail) {
+        qwen4exp_router_tail_small_kernel<<<
+                1, QWEN4EXP_MOE_SCAN_THREADS, 0, stream>>>(
+                sc.counts, sc.offsets, sc.cursor, sc.active, sc.pairs,
+                (float *)mid->ptr, (int32_t *)selected->ptr,
+                (float *)weights->ptr, (const float *)logits->ptr,
+                n_total_expert, n_expert_used, n_tokens, n_pairs, mid_dim,
+                mid_token_stride);
+    } else if (small_group) {
         qwen4exp_moe_group_small_kernel<<<
                 1, QWEN4EXP_MOE_SCAN_THREADS, 0, stream>>>(
                 sc.counts, sc.offsets, sc.cursor, sc.active, sc.pairs,
@@ -4676,6 +5116,69 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     return cuda_ok(cudaGetLastError(), "qwen4exp MoE down launch");
 }
 
+extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
+        ds4_gpu_tensor              *out,
+        ds4_gpu_tensor              *mid,
+        ds4_gpu_tensor              *down_partial,
+        const ds4_gpu_qwen4exp_slab *gate_slab,
+        const ds4_gpu_qwen4exp_slab *up_slab,
+        const ds4_gpu_qwen4exp_slab *down_slab,
+        uint32_t                     in_dim,
+        uint32_t                     mid_dim,
+        uint32_t                     out_dim,
+        const ds4_gpu_tensor        *selected,
+        const ds4_gpu_tensor        *weights,
+        uint32_t                     n_total_expert,
+        uint32_t                     n_expert_used,
+        const ds4_gpu_tensor        *x,
+        uint32_t                     n_tokens,
+        uint32_t                     mid_token_stride) {
+    return qwen4exp_routed_moe_body(
+            out, mid, down_partial, gate_slab, up_slab, down_slab,
+            in_dim, mid_dim, out_dim, (ds4_gpu_tensor *)selected,
+            (ds4_gpu_tensor *)weights, NULL, n_total_expert, n_expert_used,
+            x, n_tokens, mid_token_stride);
+}
+
+/* The routed MoE with the router tail folded in: this entry BUILDS
+ * `selected` and `weights` from `logits` instead of reading them, and at the
+ * decode widths the top-k, its softmax and the small metadata scan run as one
+ * launch (qwen4exp_router_tail_small_kernel -- the two standalone kernels'
+ * bodies, byte for byte).  Where the fuse declines -- a width at or above
+ * eight, DS4_QWEN4EXP_SERIAL_GROUP_SCAN, more than 32 experts picked, or
+ * DS4_QWEN4EXP_NO_ROUTER_FUSE -- the selection is built by today's
+ * ds4_gpu_qwen4exp_router_select_tensor dispatch and the metadata by today's
+ * paths, unchanged. */
+extern "C" int ds4_gpu_qwen4exp_router_tail_moe_tensor(
+        ds4_gpu_tensor              *out,
+        ds4_gpu_tensor              *mid,
+        ds4_gpu_tensor              *down_partial,
+        const ds4_gpu_qwen4exp_slab *gate_slab,
+        const ds4_gpu_qwen4exp_slab *up_slab,
+        const ds4_gpu_qwen4exp_slab *down_slab,
+        uint32_t                     in_dim,
+        uint32_t                     mid_dim,
+        uint32_t                     out_dim,
+        ds4_gpu_tensor              *selected,
+        ds4_gpu_tensor              *weights,
+        const ds4_gpu_tensor        *logits,
+        uint32_t                     n_total_expert,
+        uint32_t                     n_expert_used,
+        const ds4_gpu_tensor        *x,
+        uint32_t                     n_tokens,
+        uint32_t                     mid_token_stride) {
+    if (!logits ||
+        logits->bytes < (uint64_t)n_tokens * n_total_expert * sizeof(float)) {
+        fprintf(stderr, "ds4: CUDA qwen4exp router tail MoE received unusable "
+                        "logits\n");
+        return 0;
+    }
+    return qwen4exp_routed_moe_body(
+            out, mid, down_partial, gate_slab, up_slab, down_slab,
+            in_dim, mid_dim, out_dim, selected, weights, logits,
+            n_total_expert, n_expert_used, x, n_tokens, mid_token_stride);
+}
+
 extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         ds4_gpu_tensor              *out,
         ds4_gpu_tensor              *mid,
@@ -4689,7 +5192,8 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         uint32_t                     out_dim,
         const ds4_gpu_tensor        *x,
         uint32_t                     n_tokens,
-        int                          pre_quantized) {
+        int                          pre_quantized,
+        int                          gate_ready) {
     if (!out || !mid || !gate_scale || !x ||
         !router_slab || !gate_slab || !up_slab || !down_slab ||
         !router_slab->map || !gate_slab->map || !up_slab->map || !down_slab->map ||
@@ -4737,11 +5241,16 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
     const size_t shared = (size_t)threads * sizeof(float);
 
     /* The sigmoid gate is one dot against ONE F32 row per token.  It reads
-     * kilobytes, not megabytes, so it keeps the scalar reduction. */
-    qwen4exp_shared_gate_kernel<<<n_tokens, threads, shared, stream>>>(
-            (float *)gate_scale->ptr, router, (const float *)x->ptr,
-            router_slab->type, in_dim, n_tokens);
-    if (!cuda_ok(cudaGetLastError(), "qwen4exp shared gate launch")) return 0;
+     * kilobytes, not megabytes, so it keeps the scalar reduction.
+     * gate_ready says the router's F32 launch already computed it -- the
+     * fold in ds4_gpu_qwen4exp_router_logits_gate_tensor writes the same
+     * bits from the same dot -- so this launch is skipped, not repeated. */
+    if (!gate_ready) {
+        qwen4exp_shared_gate_kernel<<<n_tokens, threads, shared, stream>>>(
+                (float *)gate_scale->ptr, router, (const float *)x->ptr,
+                router_slab->type, in_dim, n_tokens);
+        if (!cuda_ok(cudaGetLastError(), "qwen4exp shared gate launch")) return 0;
+    }
 
     const uint32_t xgroups = in_dim / 32u;
     const uint32_t mgroups = mid_dim / 32u;
@@ -7490,5 +7999,5 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_tensor(
         uint32_t                     n_tokens) {
     return ds4_gpu_qwen4exp_shared_expert_preq_tensor(
             out, mid, gate_scale, router_slab, gate_slab, up_slab, down_slab,
-            in_dim, mid_dim, out_dim, x, n_tokens, 0);
+            in_dim, mid_dim, out_dim, x, n_tokens, 0, 0);
 }

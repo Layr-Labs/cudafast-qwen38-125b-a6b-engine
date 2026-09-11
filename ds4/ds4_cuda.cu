@@ -17675,89 +17675,6 @@ static inline int matmul_f32_warp_tile_ok(uint64_t in_dim, uint64_t out_dim,
  * reduces within it, so it IS the one-row order at every row count -- this is
  * the same entry with the cuBLAS branch left out.  One launch, no per-row cost.
  */
-/* Decode-width F32 projections. Thread t owns original block-reduction
- * leaves C*t+[0,C), loaded together with float2/float4. Each leaf keeps its
- * complete 256-stride FMA chain. Cross-warp pairs, warp shuffles and the
- * final intra-thread class reduction reproduce every original tree level.
- * R is exactly the call width (one or two); C is two or four. */
-template<int C>
-__device__ __forceinline__ void qwen_f32_vector_read(float v[C], const float *p) {
-    if (C == 2) {
-        const float2 a = *(const float2 *)p;
-        v[0] = a.x; v[1] = a.y;
-    } else {
-#pragma unroll
-        for (int j = 0; j < C; j += 4) {
-            const float4 a = *(const float4 *)(p + j);
-            v[j] = a.x; v[j+1] = a.y; v[j+2] = a.z; v[j+3] = a.w;
-        }
-    }
-}
-template<int R, int C, int U>
-__global__ __launch_bounds__(256/C)
-static void qwen_f32_vector_tree_kernel(float *out, const float *w,
-                                       const float *x, uint64_t out_dim) {
-    const unsigned t = threadIdx.x;
-    const unsigned lane = t & 31u;
-    const uint64_t col = blockIdx.x;
-    float acc[R][C];
-#pragma unroll
-    for (int r = 0; r < R; r++)
-#pragma unroll
-        for (int j = 0; j < C; j++) acc[r][j] = 0.0f;
-#pragma unroll U
-    for (int m = 0; m < 10; m++) {
-        const unsigned at = C * t + 256u * (unsigned)m;
-        float wv[C];
-        qwen_f32_vector_read<C>(wv, w + col * 2560u + at);
-#pragma unroll
-        for (int r = 0; r < R; r++) {
-            float xv[C];
-            qwen_f32_vector_read<C>(xv, x + (uint64_t)r * 2560u + at);
-#pragma unroll
-            for (int j = 0; j < C; j++) acc[r][j] += wv[j] * xv[j];
-        }
-    }
-    /* Rebuild the cross-warp levels of the original halving tree first. */
-    __shared__ float partial[R][C][256/C];
-    if (C < 8) {
-#pragma unroll
-        for (int r = 0; r < R; r++)
-#pragma unroll
-            for (int j = 0; j < C; j++) partial[r][j][t] = acc[r][j];
-        __syncthreads();
-        if (t >= 32u) return;
-#pragma unroll
-        for (int r = 0; r < R; r++)
-#pragma unroll
-            for (int j = 0; j < C; j++) {
-                if (C == 2) {
-                    acc[r][j] = (partial[r][j][lane] + partial[r][j][lane+64u]) +
-                                (partial[r][j][lane+32u] + partial[r][j][lane+96u]);
-                } else {
-                    acc[r][j] = partial[r][j][lane] + partial[r][j][lane+32u];
-                }
-            }
-    }
-#pragma unroll
-    for (int r = 0; r < R; r++) {
-#pragma unroll
-        for (int j = 0; j < C; j++) {
-#pragma unroll
-            for (int d = 16; d > 0; d >>= 1)
-                acc[r][j] = acc[r][j] + __shfl_down_sync(0xffffffffu, acc[r][j], d);
-        }
-        /* The remaining original strides are C/2, ..., 1 within a thread. */
-        if (lane == 0u) {
-#pragma unroll
-            for (int d = C/2; d > 0; d >>= 1)
-#pragma unroll
-                for (int j = 0; j < d; j++) acc[r][j] += acc[r][j+d];
-            out[(uint64_t)r * out_dim + col] = acc[r][0];
-        }
-    }
-}
-
 extern "C" int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
@@ -17779,33 +17696,6 @@ extern "C" int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
                                             "f32 decode rows exact");
     if (!w) return 0;
 
-    /* Measured decode geometries: small GDN projections use two adjacent
-     * reduction leaves per thread; two-row routers use four without K-loop
-     * unrolling. Actual device pointers must support the vector load. */
-    if (in_dim == 2560u &&
-        ((out_dim == 48u && n_rows <= 2u) ||
-         (out_dim == 512u && n_rows == 2u)) &&
-        (((uintptr_t)w | (uintptr_t)x->ptr) & 15u) == 0u &&
-        getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
-        getenv("DS4_F32_NO_VECTOR_DECODE") == NULL) {
-        if (out_dim == 48u && n_rows == 1u) {
-            qwen_f32_vector_tree_kernel<1, 2, 10><<<
-                (unsigned)out_dim, 128, 0, cuda_decode_stream()>>>(
-                    (float *)out->ptr, (const float *)w,
-                    (const float *)x->ptr, out_dim);
-        } else if (out_dim == 48u) {
-            qwen_f32_vector_tree_kernel<2, 2, 10><<<
-                (unsigned)out_dim, 128, 0, cuda_decode_stream()>>>(
-                    (float *)out->ptr, (const float *)w,
-                    (const float *)x->ptr, out_dim);
-        } else {
-            qwen_f32_vector_tree_kernel<2, 4, 1><<<
-                (unsigned)out_dim, 64, 0, cuda_decode_stream()>>>(
-                    (float *)out->ptr, (const float *)w,
-                    (const float *)x->ptr, out_dim);
-        }
-        return cuda_ok(cudaGetLastError(), "matmul_f32 vector decode launch");
-    }
     if (n_rows == 1u || getenv("DS4_QWEN4EXP_NO_ROW_TILE") != NULL) {
         dim3 grid((unsigned)out_dim, (unsigned)n_rows, 1);
         matmul_f32_kernel<<<grid, 256, 0, cuda_decode_stream()>>>(
