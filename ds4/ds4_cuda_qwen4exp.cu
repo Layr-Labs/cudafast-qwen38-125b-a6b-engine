@@ -4871,25 +4871,28 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
 #undef QWEN4EXP_GATEUP_MMA
 #undef QWEN4EXP_GATEUP_MMA_IMPL
     }
-    /* The measured Q4 path for the R=2 tile (one-row decode and two-row
-     * verify). qwen4exp_moe_tile already returns 2 for n_tokens <= 2, so the
-     * joint R=2 kernel was already the decode path; splitting gate/up across
-     * neighboring warps applies the same register cut there. The diagnostic
-     * pin retains the joint projection as a bit-exact oracle. Other widths
-     * keep their prior kernel. */
+    /* The measured split Q4 path for one-row decode and two-row verify.
+     * Decode uses one accumulator row; verify retains two-row weight reuse. */
     else if (n_tokens <= 2u && tile == 2 && specialize &&
              gate_slab->type == DS4_QWEN4EXP_TY_q4_K &&
              up_slab->type == DS4_QWEN4EXP_TY_q4_K &&
              getenv("DS4_QWEN4EXP_NO_SPLIT_GATEUP") == NULL) {
-        qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K><<<
-            dim3((mid_dim + 3u) / 4u, gu_rows, 1), threads, 0, stream>>>(
-            (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum,
-            sc.pairs, sc.counts, sc.offsets, gu_active,
-            (const float *)weights->ptr,
-            gate_slab->expert_bytes, gate_slab->row_bytes,
-            up_slab->expert_bytes, up_slab->row_bytes,
-            gate_slab->type, up_slab->type, xgroups, mid_dim,
-            mid_token_stride, n_expert_used);
+#define QWEN4EXP_SPLIT_GATEUP(R) \
+        qwen4exp_moe_gateup_split_kernel<R, DS4_QWEN4EXP_TY_q4_K><<< \
+            dim3((mid_dim + 3u) / 4u, gu_rows, 1), threads, 0, stream>>>( \
+            (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum, \
+            sc.pairs, sc.counts, sc.offsets, gu_active, \
+            (const float *)weights->ptr, \
+            gate_slab->expert_bytes, gate_slab->row_bytes, \
+            up_slab->expert_bytes, up_slab->row_bytes, \
+            gate_slab->type, up_slab->type, xgroups, mid_dim, \
+            mid_token_stride, n_expert_used)
+        if (n_tokens == 1u && getenv("DS4_QWEN4EXP_NO_ROUTED_R1") == NULL) {
+            QWEN4EXP_SPLIT_GATEUP(1);
+        } else {
+            QWEN4EXP_SPLIT_GATEUP(2);
+        }
+#undef QWEN4EXP_SPLIT_GATEUP
     }
     else if (tile == 8) { QWEN4EXP_GATEUP(8); }
     else if (tile == 4) { QWEN4EXP_GATEUP(4); }
