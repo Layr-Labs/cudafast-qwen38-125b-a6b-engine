@@ -438,7 +438,7 @@ static void check_q8_row_tile(const uint8_t *model) {
  *   round_bf16  on, which is production, and off.
  */
 static void check_mixer_equivalence(uint8_t *model) {
-    static const uint32_t row_set[] = { 1u, 2u, 4u, 47u, 48u, 64u, ROWS_LONG };
+    static const uint32_t row_set[] = { 1u, 2u, 3u, 4u, 7u, 47u, 48u, 64u, ROWS_LONG };
     const ds4_gpu_qwen4exp_slab norm_slab =
         hc_slab(model, MODEL_BYTES, NORM_WIDE_OFF);
     const ds4_gpu_qwen4exp_slab down_slab =
@@ -453,11 +453,17 @@ static void check_mixer_equivalence(uint8_t *model) {
     inject_q8.type = TENSOR_Q8_0;
 
     uint64_t cases = 0;
+#if !defined(__APPLE__) && !defined(__HIP_PLATFORM_AMD__)
+    uint64_t graph_cases = 0;
+    setenv("DS4_CUDA_DECODE_GRAPHS", "1", 1);
+#endif
     for (uint32_t ri = 0; ri < sizeof(row_set) / sizeof(row_set[0]); ri++) {
         const uint32_t rows = row_set[ri];
         const uint64_t hc_count = (uint64_t)rows * WIDE;
         const uint64_t embd_count = (uint64_t)rows * N_EMBD;
         const uint64_t inj_count = (uint64_t)rows * N_HC;
+        const uint64_t mix_slots = embd_count + 16u;
+        const uint64_t inj_slots = inj_count + 16u;
 
         float *hyper = alloc_floats(hc_count);
         for (uint64_t i = 0; i < hc_count; i++) hyper[i] = next_unit();
@@ -467,17 +473,17 @@ static void check_mixer_equivalence(uint8_t *model) {
         ds4_gpu_tensor *wide_t = ds4_gpu_tensor_alloc(hc_count * sizeof(float));
         ds4_gpu_tensor *lowrank_t =
             ds4_gpu_tensor_alloc((uint64_t)rows * N_LOWRANK * sizeof(float));
-        ds4_gpu_tensor *mixed_a = ds4_gpu_tensor_alloc(embd_count * sizeof(float));
-        ds4_gpu_tensor *mixed_b = ds4_gpu_tensor_alloc(embd_count * sizeof(float));
-        ds4_gpu_tensor *inject_a = ds4_gpu_tensor_alloc(inj_count * sizeof(float));
-        ds4_gpu_tensor *inject_b = ds4_gpu_tensor_alloc(inj_count * sizeof(float));
+        ds4_gpu_tensor *mixed_a = ds4_gpu_tensor_alloc(mix_slots * sizeof(float));
+        ds4_gpu_tensor *mixed_b = ds4_gpu_tensor_alloc(mix_slots * sizeof(float));
+        ds4_gpu_tensor *inject_a = ds4_gpu_tensor_alloc(inj_slots * sizeof(float));
+        ds4_gpu_tensor *inject_b = ds4_gpu_tensor_alloc(inj_slots * sizeof(float));
         require_ok(normed_t && wide_t && lowrank_t && mixed_a && mixed_b &&
                    inject_a && inject_b, "equivalence tensor allocation");
 
-        float *mixed_ref = alloc_floats(embd_count);
-        float *mixed_got = alloc_floats(embd_count);
-        float *inject_ref = alloc_floats(inj_count);
-        float *inject_got = alloc_floats(inj_count);
+        float *mixed_ref = alloc_floats(mix_slots);
+        float *mixed_got = alloc_floats(mix_slots);
+        float *inject_ref = alloc_floats(inj_slots);
+        float *inject_got = alloc_floats(inj_slots);
         float *hyper_after = alloc_floats(hc_count);
 
         for (int head = 0; head < 3; head++) {
@@ -488,6 +494,16 @@ static void check_mixer_equivalence(uint8_t *model) {
             for (int bias = 0; bias < 2; bias++) {
                 for (int bf16 = 0; bf16 < 2; bf16++) {
                     const float weight_bias = bias ? 1.0f : 0.0f;
+                    memset(mixed_ref, 0xa5, mix_slots * sizeof(float));
+                    memset(inject_ref, 0xa5, inj_slots * sizeof(float));
+                    require_ok(ds4_gpu_tensor_write(mixed_a, 0, mixed_ref,
+                                   mix_slots * sizeof(float)) &&
+                               ds4_gpu_tensor_write(mixed_b, 0, mixed_ref,
+                                   mix_slots * sizeof(float)) &&
+                               ds4_gpu_tensor_write(inject_a, 0, inject_ref,
+                                   inj_slots * sizeof(float)) &&
+                               ds4_gpu_tensor_write(inject_b, 0, inject_ref,
+                                   inj_slots * sizeof(float)), "HC output canaries");
                     /* Unfused first: it writes normed_scratch as a norm, the
                      * fused path writes the same buffer as quantized bytes,
                      * so running it second proves it does not depend on what
@@ -498,8 +514,8 @@ static void check_mixer_equivalence(uint8_t *model) {
                                    iw, N_EMBD, N_HC, N_LOWRANK, rows, 1e-6f,
                                    weight_bias, bf16),
                                "unfused HC mixer");
-                    download(mixed_a, mixed_ref, embd_count);
-                    if (ia) download(inject_a, inject_ref, inj_count);
+                    download(mixed_a, mixed_ref, mix_slots);
+                    if (ia) download(inject_a, inject_ref, inj_slots);
 
                     require_ok(ds4_gpu_qwen4exp_hc_mixer_tensor(
                                    mixed_b, ib, normed_t, lowrank_t, wide_t,
@@ -507,14 +523,14 @@ static void check_mixer_equivalence(uint8_t *model) {
                                    iw, N_EMBD, N_HC, N_LOWRANK, rows, 1e-6f,
                                    weight_bias, bf16),
                                "fused HC mixer");
-                    download(mixed_b, mixed_got, embd_count);
-                    if (ib) download(inject_b, inject_got, inj_count);
+                    download(mixed_b, mixed_got, mix_slots);
+                    if (ib) download(inject_b, inject_got, inj_slots);
 
                     require_identical("fused HC mixer block input", mixed_got,
-                                      mixed_ref, embd_count * sizeof(float));
+                                      mixed_ref, mix_slots * sizeof(float));
                     if (ia) {
                         require_identical("fused HC inject weights", inject_got,
-                                          inject_ref, inj_count * sizeof(float));
+                                          inject_ref, inj_slots * sizeof(float));
                     }
                     /* The residual is an input to both, and the fused path
                      * reads it three times instead of once; it must still not
@@ -524,6 +540,59 @@ static void check_mixer_equivalence(uint8_t *model) {
                                       hyper_after, hyper,
                                       hc_count * sizeof(float));
                     cases++;
+#if !defined(__APPLE__) && !defined(__HIP_PLATFORM_AMD__)
+                    if (rows <= 7u) {
+                        const ds4_decode_graph_key key = {
+                            .il = 1u, .island = 0u, .variant = rows
+                        };
+                        ds4_gpu_decode_graphs_invalidate();
+                        require_ok(ds4_gpu_decode_graph_begin(&key) == -1,
+                                   "HC graph warm state");
+                        require_ok(ds4_gpu_qwen4exp_hc_mixer_tensor(
+                                       mixed_b, ib, normed_t, lowrank_t, wide_t,
+                                       hyper_t, &norm_slab, &down_slab, &up_slab,
+                                       iw, N_EMBD, N_HC, N_LOWRANK, rows, 1e-6f,
+                                       weight_bias, bf16), "HC graph warm operation");
+                        require_ok(ds4_gpu_decode_graph_begin(&key) == 0,
+                                   "HC graph capture state");
+                        require_ok(ds4_gpu_qwen4exp_hc_mixer_tensor(
+                                       mixed_b, ib, normed_t, lowrank_t, wide_t,
+                                       hyper_t, &norm_slab, &down_slab, &up_slab,
+                                       iw, N_EMBD, N_HC, N_LOWRANK, rows, 1e-6f,
+                                       weight_bias, bf16), "HC graph capture operation");
+                        require_ok(ds4_gpu_decode_graph_end(&key) == 0,
+                                   "HC graph capture complete");
+                        const float magnitudes[] = {1.0f, 1e-30f, 1e10f};
+                        for (unsigned change = 0; change < 3u; change++) {
+                            for (uint64_t i = 0; i < hc_count; i++)
+                                hyper[i] = next_unit() * magnitudes[change];
+                            require_ok(ds4_gpu_tensor_write(hyper_t, 0, hyper,
+                                           hc_count * sizeof(float)), "HC changed input");
+                            require_ok(ds4_gpu_qwen4exp_hc_mixer_unfused_tensor(
+                                           mixed_a, ia, normed_t, lowrank_t, wide_t,
+                                           hyper_t, &norm_slab, &down_slab, &up_slab,
+                                           iw, N_EMBD, N_HC, N_LOWRANK, rows, 1e-6f,
+                                           weight_bias, bf16), "HC replay reference");
+                            require_ok(ds4_gpu_decode_graph_begin(&key) == 1,
+                                       "HC replay executes captured operation");
+                            download(mixed_a, mixed_ref, mix_slots);
+                            download(mixed_b, mixed_got, mix_slots);
+                            require_identical("HC replay mixed bytes and canaries",
+                                              mixed_got, mixed_ref, mix_slots * sizeof(float));
+                            if (ia) {
+                                download(inject_a, inject_ref, inj_slots);
+                                download(inject_b, inject_got, inj_slots);
+                                require_identical("HC replay inject bytes and canaries",
+                                                  inject_got, inject_ref, inj_slots * sizeof(float));
+                            }
+                            download(hyper_t, hyper_after, hc_count);
+                            require_identical("HC replay input immutability",
+                                              hyper_after, hyper, hc_count * sizeof(float));
+                            graph_cases++;
+                        }
+                        ds4_gpu_decode_graphs_invalidate();
+                    }
+#endif
                 }
             }
         }
@@ -546,6 +615,10 @@ static void check_mixer_equivalence(uint8_t *model) {
     printf("  %-56s exact over %llu cases\n",
            "fused HC mixer equals the op-by-op chain",
            (unsigned long long)cases);
+#if !defined(__APPLE__) && !defined(__HIP_PLATFORM_AMD__)
+    printf("  HC changed-input graph replay: %llu complete comparisons passed\n",
+           (unsigned long long)graph_cases);
+#endif
 }
 
 int main(void) {
