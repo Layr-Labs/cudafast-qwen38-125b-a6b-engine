@@ -6564,12 +6564,12 @@ __global__ static void qwen4exp_qsa_attention_kernel(
         if (tid < head_dim) {
             float contrib = 0.0f;
             uint32_t j = 0;
-            /* EIGHT VALUE ROWS IN FLIGHT AT A TIME.  This loop is the longest
+            /* SIXTEEN VALUE ROWS IN FLIGHT AT A TIME.  This loop is the longest
              * dependency chain in the kernel: one global load per key, each
              * add waiting on the one before it, up to nth keys per tile.  The
              * loads coalesce across `tid` already, so what is left to win is
-             * how many are in flight, and issuing eight before the first
-             * product covers eight times the latency.
+             * how many are in flight, and issuing sixteen before the first
+             * product covers sixteen times the latency.
              *
              * THE PRODUCTS ARE ADDED IN THE SAME ORDER, j ascending, so
              * `contrib` is bit for bit the value the one-at-a-time loop
@@ -6581,7 +6581,7 @@ __global__ static void qwen4exp_qsa_attention_kernel(
              * and the skip below cannot fire; the sparse path keeps the
              * one-at-a-time walk, whose `continue` is load bearing. */
             if (!sparse) {
-                for (; j + 8u <= n_in_tile; j += 8u) {
+                for (; j + 16u <= n_in_tile; j += 16u) {
                     const float *v0 = v_cache +
                         (uint64_t)keys[j] * kv_stride + (uint64_t)kv_head * head_dim;
                     const float *v1 = v_cache +
@@ -6598,6 +6598,22 @@ __global__ static void qwen4exp_qsa_attention_kernel(
                         (uint64_t)keys[j + 6u] * kv_stride + (uint64_t)kv_head * head_dim;
                     const float *v7 = v_cache +
                         (uint64_t)keys[j + 7u] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float *v8 = v_cache +
+                        (uint64_t)keys[j + 8u] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float *v9 = v_cache +
+                        (uint64_t)keys[j + 9u] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float *v10 = v_cache +
+                        (uint64_t)keys[j + 10u] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float *v11 = v_cache +
+                        (uint64_t)keys[j + 11u] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float *v12 = v_cache +
+                        (uint64_t)keys[j + 12u] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float *v13 = v_cache +
+                        (uint64_t)keys[j + 13u] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float *v14 = v_cache +
+                        (uint64_t)keys[j + 14u] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float *v15 = v_cache +
+                        (uint64_t)keys[j + 15u] * kv_stride + (uint64_t)kv_head * head_dim;
                     const float a0 = v0[tid];
                     const float a1 = v1[tid];
                     const float a2 = v2[tid];
@@ -6606,6 +6622,14 @@ __global__ static void qwen4exp_qsa_attention_kernel(
                     const float a5 = v5[tid];
                     const float a6 = v6[tid];
                     const float a7 = v7[tid];
+                    const float a8 = v8[tid];
+                    const float a9 = v9[tid];
+                    const float a10 = v10[tid];
+                    const float a11 = v11[tid];
+                    const float a12 = v12[tid];
+                    const float a13 = v13[tid];
+                    const float a14 = v14[tid];
+                    const float a15 = v15[tid];
                     contrib += probs[j] * a0;
                     contrib += probs[j + 1u] * a1;
                     contrib += probs[j + 2u] * a2;
@@ -6614,6 +6638,14 @@ __global__ static void qwen4exp_qsa_attention_kernel(
                     contrib += probs[j + 5u] * a5;
                     contrib += probs[j + 6u] * a6;
                     contrib += probs[j + 7u] * a7;
+                    contrib += probs[j + 8u] * a8;
+                    contrib += probs[j + 9u] * a9;
+                    contrib += probs[j + 10u] * a10;
+                    contrib += probs[j + 11u] * a11;
+                    contrib += probs[j + 12u] * a12;
+                    contrib += probs[j + 13u] * a13;
+                    contrib += probs[j + 14u] * a14;
+                    contrib += probs[j + 15u] * a15;
                 }
             }
             for (; j < n_in_tile; j++) {
