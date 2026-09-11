@@ -5721,7 +5721,10 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
                 wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
                 previous = next;
             }
-            const uint16_t last = *(const uint16_t *)(const void *)(payload + 14);
+            /* With shift zero the funnel returns `previous`; its high input is
+             * unused.  Only the 2-byte-offset groups need the bounded tail. */
+            const uint16_t last = shift != 0u
+                ? *(const uint16_t *)(const void *)(payload + 14) : 0u;
             wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
             const float ws = __half2float(*(const __half *)(wr + b * 34u));
 #pragma unroll
