@@ -1307,14 +1307,12 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
                                     QW_MAPSZ(m, l->attn_gate), QW_OFF(l->attn_gate),
                                     DS4_N_EMBD, cfg->gdn_inner,
                                     s->mixed_q8, 0, q8_soff, n_tokens) ||
-        !ds4_qwen4exp_matmul_f32(s->gdn_alpha, QW_MAP(m, l->ssm_alpha),
-                                   QW_MAPSZ(m, l->ssm_alpha), QW_OFF(l->ssm_alpha),
-                                   DS4_N_EMBD, DS4_N_GDN_VALUE_HEAD,
-                                   s->mixed, n_tokens) ||
-        !ds4_qwen4exp_matmul_f32(s->gdn_beta, QW_MAP(m, l->ssm_beta),
-                                   QW_MAPSZ(m, l->ssm_beta), QW_OFF(l->ssm_beta),
-                                   DS4_N_EMBD, DS4_N_GDN_VALUE_HEAD,
-                                   s->mixed, n_tokens)) {
+        !ds4_qwen4exp_matmul_f32_pair(
+                s->gdn_alpha, QW_MAP(m, l->ssm_alpha),
+                QW_MAPSZ(m, l->ssm_alpha), QW_OFF(l->ssm_alpha),
+                s->gdn_beta, QW_MAP(m, l->ssm_beta),
+                QW_MAPSZ(m, l->ssm_beta), QW_OFF(l->ssm_beta),
+                DS4_N_EMBD, DS4_N_GDN_VALUE_HEAD, s->mixed, n_tokens)) {
         fprintf(stderr, "ds4: qwen4exp GDN projections failed at block %u\n", il);
         return false;
     }

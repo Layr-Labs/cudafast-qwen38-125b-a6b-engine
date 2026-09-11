@@ -1021,6 +1021,23 @@ int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
         uint64_t              out_dim,
         const ds4_gpu_tensor *x,
         uint32_t              n_rows);
+
+/* CUDA decode-width pair of the entry above.  Each output keeps its own exact
+ * one-row reduction tree while the two projections share activation loads.
+ * Other shapes fall back to two ordinary exact calls. */
+int ds4_gpu_matmul_f32_pair_decode_rows_exact_tensor(
+        ds4_gpu_tensor       *out0,
+        ds4_gpu_tensor       *out1,
+        const void           *model_map0,
+        uint64_t              model_size0,
+        uint64_t              weight_offset0,
+        const void           *model_map1,
+        uint64_t              model_size1,
+        uint64_t              weight_offset1,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows);
 int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(
         ds4_gpu_tensor       *out0,
         ds4_gpu_tensor       *out1,

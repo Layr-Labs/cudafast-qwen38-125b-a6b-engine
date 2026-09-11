@@ -94,6 +94,39 @@ static inline int ds4_qwen4exp_matmul_f32(ds4_gpu_tensor       *out,
             out, map, map_size, offset, in_dim, out_dim, x, rows);
 }
 
+/* Alpha and beta read the same mixed activation and have the same [2560, 48]
+ * shape.  CUDA can preserve both independent one-row reduction trees in one
+ * decode-width launch; other backends and wider calls retain the two proven
+ * exact projections. */
+static inline int ds4_qwen4exp_matmul_f32_pair(
+        ds4_gpu_tensor       *out0,
+        const void           *map0,
+        uint64_t              map_size0,
+        uint64_t              offset0,
+        ds4_gpu_tensor       *out1,
+        const void           *map1,
+        uint64_t              map_size1,
+        uint64_t              offset1,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              rows) {
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    if (rows <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT) {
+        return ds4_gpu_matmul_f32_pair_decode_rows_exact_tensor(
+                out0, out1, map0, map_size0, offset0,
+                map1, map_size1, offset1,
+                in_dim, out_dim, x, rows);
+    }
+#endif
+    return ds4_qwen4exp_matmul_f32(
+               out0, map0, map_size0, offset0,
+               in_dim, out_dim, x, rows) &&
+           ds4_qwen4exp_matmul_f32(
+               out1, map1, map_size1, offset1,
+               in_dim, out_dim, x, rows);
+}
+
 /* The indexer's BF16 projections.
  *
  * ds4_gpu_glm53_matmul_bf16 tiers by row count at EIGHT, and on BOTH backends

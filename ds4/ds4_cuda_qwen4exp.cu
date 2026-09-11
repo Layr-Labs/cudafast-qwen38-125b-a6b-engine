@@ -259,6 +259,10 @@ __global__ static void qwen4exp_gdn_conv_kernel(
         float       *conv_state,
         const float *conv_weight,
         float       *conv_snapshot,
+        float       *raw_alpha,
+        float       *raw_beta,
+        const float *a_log,
+        const float *dt_bias,
         uint32_t     n_key_head,
         uint32_t     n_value_head,
         uint32_t     n_rows,
@@ -351,6 +355,22 @@ __global__ static void qwen4exp_gdn_conv_kernel(
         total = warp_sum_all_f32(total);
         qkv[index] = activated *
             rsqrtf(total + qk_norm_eps) * post_scale;
+
+        /* The alpha/beta projections have one consumer: the recurrence that
+         * follows this kernel on the same stream.  Publish its two gates once
+         * per token/head from block zero, in place, instead of making every
+         * one of the head's 32 value-row blocks evaluate them in each of its
+         * four warps.  The producer completion is already the publication
+         * barrier, so the short decode/verify path needs no extra launch or
+         * block synchronization.  These are the same float operations the
+         * old lane-zero path ran before broadcasting its result. */
+        if (block == 0u && tid < n_value_head) {
+            const uint64_t gate =
+                ((uint64_t)row * n_tokens + token) * n_value_head + tid;
+            raw_alpha[gate] = expf(a_log[tid] *
+                qwen4exp_gdn_softplus(raw_alpha[gate] + dt_bias[tid]));
+            raw_beta[gate] = qwen4exp_gdn_sigmoid(raw_beta[gate]);
+        }
     }
 
     history[channel] = h0;
@@ -496,15 +516,13 @@ __global__ static void qwen4exp_gdn_conv_parallel_kernel(
  * reference: one block owns one (row, value head, four value rows), one warp
  * owns one value row, and each lane owns four adjacent key columns.
  */
-template <bool PRECOMPUTED_GATES>
+template <bool PAIRED_GATES>
 __global__ static void qwen4exp_gdn_recurrence_kernel(
         float       *__restrict__ out,
         float       *__restrict__ state,
         const float *__restrict__ qkv,
         const float *__restrict__ raw_alpha,
         const float *__restrict__ raw_beta,
-        const float *__restrict__ a_log,
-        const float *__restrict__ dt_bias,
         const float2 *__restrict__ gate_pairs,
         float       *state_snapshot,
         uint32_t     n_key_head,
@@ -535,11 +553,6 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
         ((((uint64_t)row * n_value_head + head) * QWEN4EXP_GDN_DIM) + value) *
         QWEN4EXP_GDN_DIM + k0);
     float4 h = *state_ptr;
-    /* ssm_a IS ALREADY -exp(A_log); see the note in metal/qwen4exp_gdn.metal.
-     * Twin of that kernel -- keep the two expressions identical. */
-    const float decay_coeff = a_log[head];
-    const float bias = dt_bias[head];
-
     for (uint32_t token = 0; token < n_tokens; token++) {
         const uint64_t slot = (uint64_t)row * n_tokens + token;
         const uint64_t base = slot * conv_dim + key_head * QWEN4EXP_GDN_DIM;
@@ -550,19 +563,16 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
         const uint64_t gate = slot * n_value_head + head;
         float g = 0.0f;
         float beta = 0.0f;
-        if (PRECOMPUTED_GATES) {
+        if (PAIRED_GATES) {
             const float2 pair = gate_pairs[gate];
             g = pair.x;
             beta = pair.y;
         } else {
-            /* Every lane in a warp advances adjacent columns of the same
-             * value row with the same token/head gates.  Evaluate the pair
-             * once and broadcast it without a block barrier, which keeps the
-             * short decode and speculative-verify path inexpensive. */
+            /* The serial convolution producer has already transformed the
+             * single-use alpha/beta projection outputs in place. */
             if (lane == 0u) {
-                g = expf(decay_coeff *
-                    qwen4exp_gdn_softplus(raw_alpha[gate] + bias));
-                beta = qwen4exp_gdn_sigmoid(raw_beta[gate]);
+                g = raw_alpha[gate];
+                beta = raw_beta[gate];
             }
             g = __shfl_sync(0xffffffffu, g, 0);
             beta = __shfl_sync(0xffffffffu, beta, 0);
@@ -839,6 +849,8 @@ static int qwen4exp_cuda_gdn_run(
                                    QWEN4EXP_GDN_DIM, 0, stream>>>(
                 (float *)qkv->ptr, (float *)conv_state->ptr, conv_weight,
                 conv_snapshot ? (float *)conv_snapshot->ptr : NULL,
+                (float *)raw_alpha->ptr, (float *)raw_beta->ptr,
+                a_log, dt_bias,
                 n_key_head, n_value_head, n_rows, n_tokens, n_snapshot_rows,
                 qk_norm_eps);
     }
@@ -853,7 +865,7 @@ static int qwen4exp_cuda_gdn_run(
                 recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
                 (float *)out->ptr, (float *)recurrent_state->ptr, conv_out,
                 (const float *)raw_alpha->ptr,
-                (const float *)raw_beta->ptr, a_log, dt_bias,
+                (const float *)raw_beta->ptr,
                 gate_pairs,
                 state_snapshot ? (float *)state_snapshot->ptr : NULL,
                 n_key_head, n_value_head, n_rows, n_tokens, head_layout,
@@ -864,7 +876,7 @@ static int qwen4exp_cuda_gdn_run(
                 (float *)out->ptr, (float *)recurrent_state->ptr,
                 (const float *)qkv->ptr,
                 (const float *)raw_alpha->ptr,
-                (const float *)raw_beta->ptr, a_log, dt_bias,
+                (const float *)raw_beta->ptr,
                 NULL,
                 state_snapshot ? (float *)state_snapshot->ptr : NULL,
                 n_key_head, n_value_head, n_rows, n_tokens, head_layout,
