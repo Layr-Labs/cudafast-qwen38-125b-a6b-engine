@@ -213,6 +213,23 @@ bool ds4_qwen4exp_graph_verify_top1_rows(ds4_qwen4exp_session       *s,
                                          uint32_t                    n_tokens,
                                          float                      *hc_rows,
                                          int                        *row_top1);
+
+/*
+ * The depth-1 folded round: verify_top1_rows plus the head's drafts over the
+ * same rows, in ONE command batch, ONE synchronize and ONE packed readback.
+ * Row j of the head forward takes (row_top1[j], hyper row j) at position
+ * pos + j, which is exactly the forward the rejecting outcome drafts from
+ * (row a) and the accepting one seeds and drafts from (rows 0..1); the cycle
+ * keeps the draft the acceptance outcome selects and truncates the head cache
+ * to pos + a + 1.  The hc rows never cross to the host on this path: the
+ * head stages its inputs straight off the verify's device buffers.  Advances
+ * the session by n_tokens on success, like the verify above.
+ */
+bool ds4_qwen4exp_graph_verify_top1_draft_rows(
+        ds4_qwen4exp_session *s, const ds4_qwen4exp_weights *w,
+        const ds4_model *m, ds4_qwen4exp_mtp_head *h,
+        const int32_t *tokens, uint32_t n_tokens,
+        int *row_top1, int *row_drafts);
 bool ds4_qwen4exp_graph_read_logit_row(ds4_qwen4exp_session *s,
                                        uint32_t row,
                                        float *logits);
@@ -276,4 +293,11 @@ void ds4_qwen4exp_test_state_checksums(const ds4_qwen4exp_session *s,
 int ds4_qwen4exp_test_state_object_count(const ds4_qwen4exp_session *s);
 int ds4_qwen4exp_test_state_object(const ds4_qwen4exp_session *s, int index,
                                    char *name, size_t name_len, double *sum);
+
+/* The state bytes a later round would READ -- the adopted snapshot row when
+ * the rollback table armed one, the live buffers otherwise: conv then
+ * recurrent per GDN layer, then the PLE window, then the host n-gram history
+ * struct.  `out` NULL returns the byte count; a short cap refuses. */
+int64_t ds4_qwen4exp_test_adopted_state_bytes(const ds4_qwen4exp_session *s,
+                                              uint8_t *out, uint64_t cap);
 #endif

@@ -195,6 +195,16 @@ int ds4_qwen4exp_test_session_spec(const char *path, const char *head_path,
                                    int *pending_after_invalidate_out,
                                    int *pending_after_sync_out,
                                    int *pending_after_eval_out);
+int ds4_qwen4exp_test_rollback_table_ab(const char *path,
+                                        const char *head_path,
+                                        const int *prompt, int prompt_len,
+                                        int n_gen, int draft_tokens,
+                                        int *mode_table_out,
+                                        int *mode_copy_out,
+                                        int *rounds_out, int *rejects_out,
+                                        int *state_same_out,
+                                        int *tokens_same_out,
+                                        int *next_same_out);
 int ds4_qwen4exp_test_prefill_chunk_argmax(const char *path, const int *prompt,
                                            int prompt_len, uint32_t chunk,
                                            int *pos_out, float *logits_out,
@@ -1589,6 +1599,48 @@ int main(int argc, char **argv) {
             check(inv == 0, "invalidate drops the carried chain");
             check(syn == 0, "a sync drops the carried chain");
             check(evl == 0, "a serial eval drops the carried chain");
+        }
+    }
+
+    printf("ROLLBACK TABLE: a forced-reject leg, adoption against the copies\n");
+    {
+        /* The reject path's two implementations must be the same bytes: the
+         * adoption table (the next round reads the snapshot row through the
+         * device scalar) and the copy path (the reject copies the row over
+         * the live buffers) run the SAME leg on the random head, where every
+         * round refuses the chain, and the leg's tokens, the state a later
+         * round would read, and one round past the leg all have to agree
+         * byte for byte.  The modes report which of the two each leg actually
+         * ran; a backend without the table runs copy against copy and says
+         * so. */
+        char head_ab[4096];
+        snprintf(head_ab, sizeof(head_ab), "%s/qw4x-mtp.gguf",
+                 argc >= 4 ? argv[3] : argv[2]);
+        int mode_t = -1, mode_c = -1, rounds_ab = -1, rejects_ab = -1;
+        int state_same = 0, tokens_same = 0, next_same = 0;
+        const int rc_ab = ds4_qwen4exp_test_rollback_table_ab(
+                single_path, head_ab, tokens, (int)n_tokens, 32, 2,
+                &mode_t, &mode_c, &rounds_ab, &rejects_ab,
+                &state_same, &tokens_same, &next_same);
+        check(rc_ab == 0, "the rollback A/B leg ran");
+        if (rc_ab == 0) {
+            printf("        table %d copy %d, %d rounds, %d rejecting\n",
+                   mode_t, mode_c, rounds_ab, rejects_ab);
+            check(rejects_ab > 0 && rejects_ab == rounds_ab,
+                  "every round rejected the chain (the A/B's premise)");
+            if (mode_t != mode_c) {
+                check(mode_t == 1 && mode_c == 0,
+                      "leg one adopted, leg two copied");
+            } else {
+                printf("        (this backend has no rollback table; the A/B "
+                       "ran copy against copy)\n");
+            }
+            check(state_same == 1,
+                  "the adopted state bytes equal the copied ones");
+            check(tokens_same == 1,
+                  "the two reject paths emitted the same tokens");
+            check(next_same == 1,
+                  "the round after the last reject agreed, outputs and state");
         }
     }
 

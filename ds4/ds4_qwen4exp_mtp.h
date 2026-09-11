@@ -317,6 +317,36 @@ typedef struct {
      * selected full distribution lazily only for an API that needs it. */
     bool defer_frontier_logits;
 
+    /*
+     * OPTIONAL: the depth-1 folded round.  verify_rows_top1 and the head's
+     * next draft in ONE forward: the target runs its n-row verify, and the
+     * head then runs over the SAME n rows -- row j takes row_top1[j] over the
+     * verify's pre-final-mixer row j, at position pos0 + j -- inside the same
+     * batch, so one sync and one packed readback return every row's target
+     * winner AND every row's head draft.
+     *
+     * THE IDENTITY THAT MAKES THIS EXACT.  At depth 1 the accept scan leaves
+     * a in {0, 1}, and the draft the old sequence would compute is
+     * head(pos0 + a, row_top1[a], hc row a): on a reject that is row 0's
+     * forward and on an accept it is row 1's, while the row the accept path
+     * owes the head cache as a seed is row 0's forward under the same token
+     * (row_top1[0] == the accepted draft there).  So both rows are exactly
+     * the forwards the two outcomes need, each computed from the same inputs
+     * the separate calls would use -- the drafts differ only in WHICH row the
+     * host reads, never in the arithmetic, and row invariance makes each row
+     * the same bits a one-row call would produce.
+     *
+     * row_drafts[j] is the head's proposal for the outcome that accepts j
+     * drafts; the caller selects by the acceptance outcome and truncates the
+     * head cache to pos0 + a + 1, which is what leaves the not-chosen row's
+     * cache rows position-addressed scratch for the next round.  NULL, or a
+     * depth other than 1, keeps the separate draft sequence.  Requires
+     * verify_rows_top1 and read_logit_row; the cycle ignores it otherwise.
+     */
+    int (*verify_top1_draft_rows)(void *ctx, const int *tokens, uint32_t n,
+                                  uint32_t pos0, int *row_top1,
+                                  int *row_drafts);
+
     /* One row at `pos`: the serial decode step, and the replay a rejecting
      * round runs.  Same outputs for a single row. */
     int (*decode_token)(void *ctx, int token, uint32_t pos,
@@ -715,6 +745,10 @@ typedef struct {
     ds4_gpu_tensor *t_logits_prefix;
     ds4_gpu_tensor *t_logits_tail;
     ds4_gpu_tensor *t_top1;
+    /* The folded round's packed result: [2 * max_tokens] ids, the verify's
+     * row top-1s first and the head's drafts behind them, so one readback
+     * carries the whole round.  Owned by init(), released by free(). */
+    ds4_gpu_tensor *t_fold_pack;
     uint32_t       *top1_host;
 } ds4_qwen4exp_mtp_head;
 
@@ -788,6 +822,36 @@ int ds4_qwen4exp_mtp_head_forward_last(ds4_qwen4exp_mtp_head *h,
                                        uint32_t pos0, uint32_t n_tokens,
                                        int *draft_out, float *multi_out,
                                        char *err, size_t errlen);
+
+/*
+ * The folded round's encode and readback, the two halves of one head forward
+ * split around the caller's single command-batch close.
+ *
+ * fold_encode stages the head's inputs straight off the verify's device
+ * buffers -- `row_top1` is the verify's on-device top-1 tensor ([n] ids, the
+ * head's next-token column) and `hyper` its pre-final-mixer stream ([n] rows)
+ * -- and then runs every head stage through the on-device top-1, INSIDE a
+ * command batch the caller already opened.  It neither opens nor closes a
+ * batch, and on failure it closes the caller's batch itself so no caller can
+ * leave one open by way of the head.  `last_only` is false: every row's draft
+ * is wanted, because which row the round reads is decided after the batch
+ * completes.
+ *
+ * fold_readback, after the caller's one synchronize, transfers the packed
+ * results -- the verify's row top-1s were packed beside the drafts at encode
+ * time -- applies the logit-0 NaN patch and the shortlist rebase per draft
+ * row exactly as the standalone readback does, and splits the ids into
+ * row_top1_out and draft_out.  Refuses (rather than partially reads) when n
+ * exceeds what the head was built for. */
+int ds4_qwen4exp_mtp_head_fold_encode(ds4_qwen4exp_mtp_head *h,
+                                      const ds4_gpu_tensor *row_top1,
+                                      const ds4_gpu_tensor *hyper,
+                                      uint32_t pos0, uint32_t n_tokens,
+                                      char *err, size_t errlen);
+int ds4_qwen4exp_mtp_head_fold_readback(ds4_qwen4exp_mtp_head *h,
+                                        uint32_t n_tokens,
+                                        int *row_top1_out, int *draft_out,
+                                        char *err, size_t errlen);
 
 /* Greedy argmax with the canonical lowest-id tie-break the shim's ds4s_argmax
  * documents.  Shared so the head and the cycle cannot break ties apart. */
