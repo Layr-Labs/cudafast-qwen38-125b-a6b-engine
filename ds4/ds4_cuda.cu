@@ -5676,91 +5676,6 @@ __global__ static void matmul_q8_0_preq_rows_exact_tile_kernel(
 }
 
 
-/* Two adjacent lanes share a Q8 group. Their integer partials may be
- * combined freely; each even lane keeps its original float group chain.
- * Shared memory remaps the 32 finished chains onto one reduction warp. */
-template <int R>
-__global__ static void matmul_q8_0_preq_pair_lanes_kernel(
-        float *out, const unsigned char *w,
-        const int8_t *xq, const float *xscale,
-        uint64_t out_dim, uint32_t n_rows, uint64_t blocks) {
-    const uint32_t local_row = threadIdx.x >> 6u;
-    const uint32_t local_lane = threadIdx.x & 63u;
-    const uint32_t group = local_lane >> 1u;
-    const uint32_t half = local_lane & 1u;
-    const uint64_t row = (uint64_t)blockIdx.x * 4u + local_row;
-    const uint32_t row0 = blockIdx.y * R;
-    const uint32_t take = n_rows - row0 < R ? n_rows - row0 : R;
-    float acc[R];
-#pragma unroll
-    for (int r = 0; r < R; r++) acc[r] = 0.0f;
-
-    if (row < out_dim) {
-        const unsigned char *wr = w + row * blocks * 34u;
-        for (uint64_t b = group; b < blocks; b += 32u) {
-            const uint64_t warp_base = b - (uint64_t)(group & 15u);
-            const uint64_t remaining = blocks - warp_base;
-            const uint32_t live_pairs =
-                (uint32_t)(remaining < 16u ? remaining : 16u);
-            const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
-            const int8_t *payload =
-                (const int8_t *)(wr + b * 34u + 2u) + half * 16u;
-            const uintptr_t address = (uintptr_t)payload;
-            const uint32_t shift = (uint32_t)(address & 3u) * 8u;
-            const uint32_t *words =
-                (const uint32_t *)(address & ~(uintptr_t)3u);
-            uint32_t previous = words[0];
-            int32_t wq[4];
-#pragma unroll
-            for (int j = 0; j < 3; j++) {
-                const uint32_t next = words[j + 1];
-                wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
-                previous = next;
-            }
-            const uint16_t last =
-                *(const uint16_t *)(const void *)(payload + 14);
-            wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
-            const float ws = __half2float(*(const __half *)(wr + b * 34u));
-#pragma unroll
-            for (int r = 0; r < R; r++) {
-                if ((uint32_t)r < take) {
-                    const uint64_t at = ((uint64_t)row0 + r) * blocks + b;
-                    const int32_t *xw =
-                        (const int32_t *)(xq + at * 32u + half * 16u);
-                    int dot = 0;
-#pragma unroll
-                    for (int j = 0; j < 4; j++) {
-                        dot = __dp4a(wq[j], xw[j], dot);
-                    }
-                    dot += __shfl_xor_sync(active, dot, 1);
-                    if (half == 0u) {
-                        acc[r] += ws * xscale[at] * (float)dot;
-                    }
-                }
-            }
-        }
-    }
-
-    __shared__ float partial[R][4][32];
-    if (half == 0u) {
-#pragma unroll
-        for (int r = 0; r < R; r++) {
-            partial[r][local_row][group] = acc[r];
-        }
-    }
-    __syncthreads();
-    if (local_lane < 32u) {
-#pragma unroll
-        for (int r = 0; r < R; r++) {
-            const float total =
-                warp_sum_f32(partial[r][local_row][local_lane]);
-            if (local_lane == 0u && row < out_dim && (uint32_t)r < take) {
-                out[((uint64_t)row0 + r) * out_dim + row] = total;
-            }
-        }
-    }
-}
-
 /* The same per-output-element arithmetic as the tile kernel above, on the int8
  * tensor cores, with the whole prefill width in ONE tile.
  *
@@ -16563,20 +16478,6 @@ static int cuda_matmul_q8_0_preq_rows_exact(
 #undef DS4_Q8_DENSE_MMA_LAUNCH
 
     const int use_dp4a = cuda_q8_use_dp4a();
-    /* Pair lanes only for full Q8 groups at the one/two-row wide projections
-     * where operator measurements showed a gain. Other shapes retain their
-     * established kernels and the override retains a same-binary reference. */
-    if (use_dp4a && n_rows <= 2u && out_dim > 512u && (in_dim & 31u) == 0u &&
-        getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
-        (((uintptr_t)wptr & 1u) == 0u)) {
-        matmul_q8_0_preq_pair_lanes_kernel<2><<<
-                dim3((unsigned)((out_dim + 3u) / 4u),
-                     (n_rows + 1u) / 2u, 1u),
-                256, 0, cuda_decode_stream()>>>(
-                (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
-                out_dim, n_rows, blocks);
-        return cuda_ok(cudaGetLastError(), "q8 pair lanes launch");
-    }
     /* A warp owns an independent output row.  Narrow projections (notably
      * the HC 10240->320 down projection) had only forty eight-warp blocks,
      * leaving SMs idle even though each row has a long K walk.  Spread those
@@ -17497,8 +17398,25 @@ extern "C" int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
         return cuda_ok(cudaGetLastError(), "matmul_f32 decode rows launch");
     }
     if (n_rows >= 8u) {
-        dim3 grid((unsigned)out_dim, (n_rows + 7u) / 8u, 1);
-        matmul_f32_rows_exact_tile_kernel<8>
+        /* Prefill row tile, RT = 16.  The tile is over ACTIVATION rows and a
+         * weight row is read once per tile, so RT sets how many times one weight
+         * row is re-read per call: ceil(n_rows / RT).  RT is a pure SCHEDULE
+         * choice -- each row still runs the original per-thread walk, in the
+         * original i order, through the same fmaf, so every output is bit-for-bit
+         * what RT = 8 produced.  Measured on the GB10 box, two runs each, with
+         * everything else held fixed:
+         *
+         *   RT   prefill tok/s      decode tok/s
+         *    8   934.1, 935.4       26.95, 26.92
+         *   16   942.6, 942.4       27.22, 27.12     <- chosen
+         *   32   929.1              27.14
+         *
+         * 16 halves the number of blocks against 8, which is what buys the
+         * prefill; 32 pushes register pressure past the point where that still
+         * pays and gives the gain back.  Only the >= 8 row path (prefill) reaches
+         * here; the one- and two-row decode calls keep their own 2/4 tiles. */
+        dim3 grid((unsigned)out_dim, ((unsigned)n_rows + 15u) / 16u, 1);
+        matmul_f32_rows_exact_tile_kernel<16>
             <<<grid, 256, 0, cuda_decode_stream()>>>(
                 (float *)out->ptr, (const float *)w, (const float *)x->ptr,
                 in_dim, out_dim, n_rows);
