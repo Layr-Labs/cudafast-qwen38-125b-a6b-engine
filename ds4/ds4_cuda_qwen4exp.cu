@@ -2213,8 +2213,12 @@ __device__ __forceinline__ static void qw_mma_m16n8k32(
 }
 
 /* Grid (mid_dim / BM, the experts this call chose). */
+/* Cap registers so at least two 128-thread blocks co-reside on an SM.
+ * These kernels are DRAM-bound on weight decode; a second resident block
+ * hides that latency.  minBlocks=4 was measured to force spills on the
+ * dual-weight gate/up path; minBlocks=2 keeps the live set in-registers. */
 template <int GateType = -1, int UpType = -1>
-__global__ __launch_bounds__(QW_MMA_THREADS) static void
+__global__ __launch_bounds__(QW_MMA_THREADS, 2) static void
 qwen4exp_moe_gateup_mma_kernel(
         float *mid,
         const char *gate,
@@ -2474,7 +2478,7 @@ qwen4exp_moe_gateup_mma_kernel(
  * so the pair index addresses it directly.
  */
 template <int DownType = -1>
-__global__ __launch_bounds__(QW_DOWN_MMA_THREADS) static void
+__global__ __launch_bounds__(QW_DOWN_MMA_THREADS, 2) static void
 qwen4exp_moe_down_mma_kernel(
         float *partial,
         const char *down,
@@ -5444,7 +5448,7 @@ __global__ static void qwen4exp_hc_silu_quant_kernel(
     const uint64_t i = pair * 32u + lane;
     const float z = lowrank[i] * scale;
     const float v = z * qwen4exp_sigmoid(z);
-    lowrank[i] = v;
+    /* dead write removed: up projection only consumes xq/xscale */
 
     const float vz = qwen4exp_q8_ftz(v);
     float a = qwen4exp_q8_ftz(fabsf(v));

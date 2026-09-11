@@ -1951,6 +1951,60 @@ static bool qwen4exp_graph_layer_island(
     return qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens, island);
 }
 
+
+/* GDN layers have nothing between island 0 and island 1.  Capture both as
+ * one executable so each of the 36 GDN layers pays one graph launch per
+ * decode/verify width instead of two.  QSA layers keep the 0/2/1 split
+ * because island 2 still sits between the halves.  Used by the island
+ * fallback when the full QWSE stack capture is unavailable. */
+static bool qwen4exp_graph_gdn_full_layer(
+        ds4_qwen4exp_session *s, const ds4_qwen4exp_layer_weights *l,
+        const ds4_model *m, uint32_t il, uint32_t n_tokens) {
+    const bool capture_ok =
+        n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
+        !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
+        ds4_gpu_decode_graphs_supported();
+    if (capture_ok) {
+        ds4_decode_graph_key key;
+        memset(&key, 0, sizeof(key));
+        key.il = il;
+        key.island = 0u;
+        key.variant = n_tokens | (s->spec_snapshot_rows << 8u);
+        key._pad = 0x47444e46u; /* GDNF: full GDN layer, distinct from half */
+        key.cur_hc = s->hyper;
+        key.after_attn_hc = s;
+        key.after_ffn_hc = (void *)l;
+        key.attn_norm = (void *)m;
+        const int state = ds4_gpu_decode_graph_begin(&key);
+        if (state == 1) {
+            QW_TRACE(QW_SLICE_ATTN_MIX);
+            QW_TRACE(QW_SLICE_GDN);
+            QW_TRACE(QW_SLICE_ATTN_INJECT);
+            QW_TRACE(QW_SLICE_FFN_MIX);
+            QW_TRACE(QW_SLICE_MOE);
+            QW_TRACE(QW_SLICE_FFN_INJECT);
+            return true;
+        }
+        if (state == 0) {
+#ifdef DS4_TEST_HOOKS
+            const uint32_t trace_len = g_qwen4exp_trace_len;
+            const bool trace_overflow = g_qwen4exp_trace_overflow;
+#endif
+            const bool ok =
+                qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens, 0u) &&
+                qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens, 1u);
+            if (ok && ds4_gpu_decode_graph_end(&key) == 0) return true;
+            ds4_gpu_decode_graph_abort(&key);
+#ifdef DS4_TEST_HOOKS
+            g_qwen4exp_trace_len = trace_len;
+            g_qwen4exp_trace_overflow = trace_overflow;
+#endif
+        }
+    }
+    return qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens, 0u) &&
+           qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens, 1u);
+}
+
 static bool qwen4exp_graph_qsa_island(
         ds4_qwen4exp_session *s, const ds4_qwen4exp_layer_weights *l,
         const ds4_model *m, uint32_t il, uint32_t n_tokens) {
@@ -2069,6 +2123,16 @@ static bool qwen4exp_graph_layers_encode(
         ds4_qwen4exp_session *s, const ds4_qwen4exp_weights *w,
         const ds4_model *m, uint32_t n_tokens, bool use_islands) {
     const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
+    /* Embed is device-only once tokens sit in s->tokens.  Folding it into the
+     * stack capture removes one eager launch before every decode/verify. */
+    if (!ds4_gpu_qwen4exp_embed_tokens_hc_tensor(
+            s->hyper, s->embed_rows, s->tokens,
+            QW_MAP(m, w->token_embd), QW_MAPSZ(m, w->token_embd),
+            QW_OFF(w->token_embd), w->token_embd->type, cfg->n_vocab,
+            n_tokens, DS4_N_EMBD, DS4_N_HC)) {
+        return false;
+    }
+    QW_TRACE(QW_SLICE_EMBED);
     for (uint32_t il = 0; il < cfg->n_layer; il++) {
         const ds4_qwen4exp_layer_weights *l = &w->layer[il];
 
@@ -2086,20 +2150,35 @@ static bool qwen4exp_graph_layers_encode(
             QW_TRACE(QW_SLICE_PLE);
         }
 
-        if (!(use_islands ? qwen4exp_graph_layer_island(s, l, m, il, n_tokens, 0u) :
-                qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens, 0u))) {
-            return false;
-        }
-        if (l->is_full_attention) {
-            if (!(use_islands ? qwen4exp_graph_qsa_island(s, l, m, il, n_tokens) :
-                    qwen4exp_graph_qsa_block(s, l, m, il, n_tokens))) {
+        if (use_islands) {
+            if (l->is_full_attention) {
+                if (!qwen4exp_graph_layer_island(s, l, m, il, n_tokens, 0u)) {
+                    return false;
+                }
+                if (!qwen4exp_graph_qsa_island(s, l, m, il, n_tokens)) {
+                    return false;
+                }
+                QW_TRACE(QW_SLICE_QSA);
+                if (!qwen4exp_graph_layer_island(s, l, m, il, n_tokens, 1u)) {
+                    return false;
+                }
+            } else if (!qwen4exp_graph_gdn_full_layer(s, l, m, il, n_tokens)) {
                 return false;
             }
-            QW_TRACE(QW_SLICE_QSA);
-        }
-        if (!(use_islands ? qwen4exp_graph_layer_island(s, l, m, il, n_tokens, 1u) :
-                qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens, 1u))) {
-            return false;
+        } else {
+            /* Stack-capture encode path: no nested graph captures. */
+            if (!qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens, 0u)) {
+                return false;
+            }
+            if (l->is_full_attention) {
+                if (!qwen4exp_graph_qsa_block(s, l, m, il, n_tokens)) {
+                    return false;
+                }
+                QW_TRACE(QW_SLICE_QSA);
+            }
+            if (!qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens, 1u)) {
+                return false;
+            }
         }
 #ifdef DS4_TEST_HOOKS
         qwen4exp_layer_dump(s, il, n_tokens);
@@ -2129,13 +2208,14 @@ static bool qwen4exp_graph_layers(
         key.il = 0u;
         key.island = 3u;
         key.variant = n_tokens | (s->spec_snapshot_rows << 8u);
-        key._pad = 0x51575354u; /* QWST: the complete target layer stack */
+        key._pad = 0x51575345u; /* QWSE: stack + embedding gather */
         key.cur_hc = s->hyper;
         key.after_attn_hc = s;
         key.after_ffn_hc = (void *)w;
         key.attn_norm = (void *)m;
         const int state = ds4_gpu_decode_graph_begin(&key);
         if (state == 1) {
+            QW_TRACE(QW_SLICE_EMBED);
 #ifdef DS4_TEST_HOOKS
             /* Preserve the logical slice trace even when encoding is skipped. */
             const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
@@ -2270,17 +2350,7 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         return false;
     }
 
-    /* Layer-0 seed: gather the embedding row and tile it into every stream. */
-    if (!ds4_gpu_qwen4exp_embed_tokens_hc_tensor(
-            s->hyper, s->embed_rows, s->tokens,
-            QW_MAP(m, w->token_embd), QW_MAPSZ(m, w->token_embd),
-            QW_OFF(w->token_embd), w->token_embd->type, cfg->n_vocab,
-            n_tokens, DS4_N_EMBD, DS4_N_HC)) {
-        fprintf(stderr, "ds4: qwen4exp embedding gather failed\n");
-        return qwen4exp_forward_fail();
-    }
-    QW_TRACE(QW_SLICE_EMBED);
-
+    /* Embedding rides inside qwen4exp_graph_layers (captured as QWSE). */
     if (!qwen4exp_graph_layers(s, w, m, n_tokens)) {
         return qwen4exp_forward_fail();
     }
