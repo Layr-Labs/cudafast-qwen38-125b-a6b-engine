@@ -2470,47 +2470,13 @@ bool ds4_qwen4exp_session_add_head_block(ds4_qwen4exp_session             *s,
     return true;
 }
 
-/*
- * ds4_qwen4exp_block_forward_fn.  `graph` is the head's weight context and
- * `cache` is the session that owns the slot; `hyper` is the head's own stream,
- * rewritten in place.  Returns NONZERO on success -- the ds4_gpu convention,
- * not ds4.c's.
- *
- * The session's hyper pointer and position are lent to the head for the call
- * and put back afterwards, so the tower's own stream is untouched and every
- * function below is the same code the tower runs.  The command batch is the
- * caller's: the head opens one around its whole forward, and these ops join
- * it.
- */
-int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
-                                  ds4_gpu_tensor *hyper, uint32_t il,
-                                  uint32_t pos0, uint32_t n_tokens) {
-    const ds4_qwen4exp_head_block_ctx *c = graph;
-    ds4_qwen4exp_session *s = cache;
-    if (!c || !s || !c->l || !c->m || !hyper || n_tokens == 0) return 0;
-    if (n_tokens > s->plan.n_batch) return 0;
-    if (il >= DS4_MAX_LAYER || !s->qsa_k[il]) {
-        fprintf(stderr,
-                "ds4: qwen4exp head block %u has no cache slot; "
-                "ds4_qwen4exp_session_add_head_block() was not called\n", il);
-        return 0;
-    }
-    if (!c->l->is_full_attention) return 0;
-
-    /* The head's QSA block appends to the slot's key/value caches and its
-     * indexer tape; see `state_dirty`. */
-    s->state_dirty = true;
-
-    ds4_gpu_tensor *saved_hyper = s->hyper;
-    const uint32_t saved_pos = s->pos;
-    s->hyper = hyper;
-    s->pos = pos0;
-    if (s->d_pos) {
-        ds4_gpu_qwen4exp_update_dpos(s->d_pos, s->pos);
-    }
-
-    const ds4_qwen4exp_layer_weights *l = c->l;
-    const ds4_model *m = c->m;
+/* Encode the MTP block once, either eagerly or into the decode graph stream.
+ * All arguments that become kernel parameters are already stable here. */
+static bool qwen4exp_graph_head_block_encode(
+        ds4_qwen4exp_session *s,
+        const ds4_qwen4exp_layer_weights *l,
+        const ds4_model *m, uint32_t il, uint32_t n_tokens,
+        const char **failed_stage) {
     const int timing = qw_hb_time_on();
     uint64_t tmark = timing ? qw_hb_now_ns() : 0;
     const char *stage = "attention mixer";
@@ -2550,11 +2516,87 @@ int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
     QW_HB_TICK(QW_HB_T_FFN_INJECT);
     if (timing && ok) qw_hb_stage_calls++;
 
+    if (failed_stage) *failed_stage = stage;
+    return ok;
+}
+
+/*
+ * ds4_qwen4exp_block_forward_fn.  `graph` is the head's weight context and
+ * `cache` is the session that owns the slot; `hyper` is the head's own stream,
+ * rewritten in place.  Returns NONZERO on success -- the ds4_gpu convention,
+ * not ds4.c's.
+ *
+ * Device-positioned QSA makes the complete head block position-independent.
+ * Capturing it as island 3 removes the attention, mixer and MoE launch train
+ * from every MTP draft round.  The session's hyper pointer and position are
+ * lent to the head for the call and restored afterwards.
+ */
+int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
+                                  ds4_gpu_tensor *hyper, uint32_t il,
+                                  uint32_t pos0, uint32_t n_tokens) {
+    const ds4_qwen4exp_head_block_ctx *c = graph;
+    ds4_qwen4exp_session *s = cache;
+    if (!c || !s || !c->l || !c->m || !hyper || n_tokens == 0) return 0;
+    if (n_tokens > s->plan.n_batch) return 0;
+    if (il >= DS4_MAX_LAYER || !s->qsa_k[il]) {
+        fprintf(stderr,
+                "ds4: qwen4exp head block %u has no cache slot; "
+                "ds4_qwen4exp_session_add_head_block() was not called\n", il);
+        return 0;
+    }
+    if (!c->l->is_full_attention) return 0;
+
+    /* The head's QSA block appends to the slot's key/value caches and its
+     * indexer tape; see `state_dirty`. */
+    s->state_dirty = true;
+
+    ds4_gpu_tensor *saved_hyper = s->hyper;
+    const uint32_t saved_pos = s->pos;
+    s->hyper = hyper;
+    s->pos = pos0;
+    if (s->d_pos) ds4_gpu_qwen4exp_update_dpos(s->d_pos, s->pos);
+
+    const bool capture_ok =
+        n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
+        (uint64_t)s->pos + n_tokens <= DS4_N_INDEXER_TOP_K &&
+        !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
+        ds4_gpu_decode_graphs_supported();
+    ds4_decode_graph_key key;
+    int graph_state = -1;
+    if (capture_ok) {
+        memset(&key, 0, sizeof(key));
+        key.il = il;
+        key.island = 3u;
+        key.variant = n_tokens | (s->spec_snapshot_rows << 8u);
+        key._pad = 0x4d545048u;
+        key.cur_hc = hyper;
+        key.after_attn_hc = s;
+        key.after_ffn_hc = (void *)c->l;
+        key.attn_norm = (void *)c->m;
+        graph_state = ds4_gpu_decode_graph_begin(&key);
+    }
+
+    const char *stage = "attention mixer";
+    bool ok = graph_state == 1;
+    if (graph_state != 1) {
+        ok = qwen4exp_graph_head_block_encode(
+                s, c->l, c->m, il, n_tokens, &stage);
+        if (graph_state == 0) {
+            if (ok && ds4_gpu_decode_graph_end(&key) == 0) {
+                ok = true;
+            } else {
+                if (!ok) ds4_gpu_decode_graph_abort(&key);
+                /* A failed capture executed no kernels.  Re-encode the block
+                 * eagerly once so this proposal still advances its caches. */
+                ok = qwen4exp_graph_head_block_encode(
+                        s, c->l, c->m, il, n_tokens, &stage);
+            }
+        }
+    }
+
     s->hyper = saved_hyper;
     s->pos = saved_pos;
-    if (s->d_pos) {
-        ds4_gpu_qwen4exp_update_dpos(s->d_pos, s->pos);
-    }
+    if (s->d_pos) ds4_gpu_qwen4exp_update_dpos(s->d_pos, s->pos);
     if (!ok) {
         fprintf(stderr, "ds4: qwen4exp head block %u failed at the %s\n",
                 il, stage);
