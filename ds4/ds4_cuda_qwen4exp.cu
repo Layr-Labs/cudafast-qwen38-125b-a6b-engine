@@ -996,15 +996,20 @@ __device__ __forceinline__ static void dev_qwen4exp_group_decode(
 #pragma unroll
             for (int k = 0; k < 4; k++) {
                 const uint32_t v = qw[2 + k];
-                const uint32_t lo = v & 0x0f0f0f0fu;
-                const uint32_t hi = (v >> 4u) & 0x0f0f0f0fu;
+                /* Spread four high-plane bits into bit 4 of four bytes.
+                 * The multiplier's bit groups do not overlap for a nibble;
+                 * the mask selects the same four bits the scalar loop took. */
+                const uint32_t h0 = (((qh >> (k * 4)) & 0x0fu) *
+                                     0x02040810u) & 0x10101010u;
+                const uint32_t h1 = (((qh >> (16 + k * 4)) & 0x0fu) *
+                                     0x02040810u) & 0x10101010u;
+                const uint32_t lo = (v & 0x0f0f0f0fu) | h0;
+                const uint32_t hi = ((v >> 4u) & 0x0f0f0f0fu) | h1;
 #pragma unroll
                 for (int b = 0; b < 4; b++) {
                     const int j = k * 4 + b;
-                    wq[j] = (int8_t)(((lo >> (b * 8)) & 0xffu) |
-                                     (((qh >> j) & 1u) << 4u));
-                    wq[16 + j] = (int8_t)(((hi >> (b * 8)) & 0xffu) |
-                                          (((qh >> (j + 16u)) & 1u) << 4u));
+                    wq[j] = (int8_t)((lo >> (b * 8)) & 0xffu);
+                    wq[16 + j] = (int8_t)((hi >> (b * 8)) & 0xffu);
                 }
             }
             return;
