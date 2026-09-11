@@ -2825,25 +2825,9 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
         for (int r = 0; r < R; r++) acc[r] = 0.0f;
         if (live) {
             for (uint32_t g = lane; g < groups; g += 32u) {
-                int8_t wq[32];
-                float wa[2] = {0.0f, 0.0f};
-                float wb[2] = {0.0f, 0.0f};
-                /* WORD DECODE, the same one the routed-MoE MMA kernels use.
-                 * This kernel took the byte-array decoder, which rebuilds
-                 * each of the eight payload words from single bytes; the
-                 * word path derives them by shifting the group's own raw
-                 * words and is proven byte-identical to it (the byte
-                 * decoder is kept as the fallback for a payload that does
-                 * not stage).  This kernel is only ever instantiated for
-                 * Q4_K, whose group stages, and whose decode leaves
-                 * `halves` at one -- the value passed to the accumulate
-                 * below -- so the accumulated value is unchanged. */
-                uint32_t raw[8];
-                const uint32_t *rawp =
-                    qw_raw_load((uint32_t)Type, weight_row, g, raw) ? raw : NULL;
-                dev_qwen4exp_group_decode_w((uint32_t)Type, weight_row, g,
-                                            rawp, wq, wa, wb);
-                const int halves = 1;
+                int8_t wq[32]; float wa[2], wb[2]; int halves = 1;
+                dev_qwen4exp_group_decode((uint32_t)Type, weight_row, g,
+                                          wq, wa, wb, &halves);
 #pragma unroll
                 for (int r = 0; r < R; r++) {
                     if (r < take) {
@@ -3013,6 +2997,45 @@ __global__ static void qwen4exp_moe_down_q_kernel(
 #pragma unroll
     for (int r = 0; r < R; r++) acc[r] = 0.0f;
 
+    /* THE NEXT SLOT'S EXPERT ID IS READ BEFORE THE CURRENT SLOT'S WEIGHTS ARE.
+     * Every slot here is a chain of three dependent steps: read the expert id
+     * from global, form the weight row address from it, then read the weights.
+     * The ids are independent of each other and of the weights, but the inner
+     * group walk sits between them, so the id load is not hoisted on its own
+     * and each slot's weight read waits on an index read that could have been
+     * issued a slot earlier.  Carrying the following id in a register breaks
+     * that address dependency.
+     *
+     * THE IDS, THE ROWS AND THE ORDER acc[] IS ACCUMULATED IN ARE UNCHANGED,
+     * so the output row is bit for bit the original's.  Only the one-row form
+     * takes this path; wider calls keep the original loop, where the ids vary
+     * with r as well as slot. */
+    if (R == 1 && take >= 1u) {
+        const uint32_t t = tok0;
+        const int32_t *sel = selected + (uint64_t)t * n_expert_used;
+        int32_t e_cur = n_expert_used > 0u ? sel[0] : -1;
+        for (uint32_t slot = 0; slot < n_expert_used; slot++) {
+            const int32_t e = e_cur;
+            e_cur = (slot + 1u < n_expert_used) ? sel[slot + 1u] : -1;
+            if (e < 0 || (uint32_t)e >= n_total_expert) continue;
+            const char *drow = down +
+                (uint64_t)(uint32_t)e * down_expert_bytes +
+                (uint64_t)row * down_row_bytes;
+            const uint64_t mrow = (uint64_t)t * n_expert_used + slot;
+            for (uint32_t g = lane; g < groups; g += 32u) {
+                int8_t wq[32];
+                float wa[2], wb[2];
+                int halves = 1;
+                dev_qwen4exp_group_decode(
+                        DownType < 0 ? down_type : (uint32_t)DownType,
+                        drow, g, wq, wa, wb, &halves);
+                const uint64_t at_g = mrow * groups + g;
+                qwen4exp_group_accumulate(&acc[0], wq, wa, wb, halves,
+                                          mq + at_g * 32u, ms[at_g],
+                                          msum[at_g]);
+            }
+        }
+    } else
     for (uint32_t slot = 0; slot < n_expert_used; slot++) {
 #pragma unroll
         for (int r = 0; r < R; r++) {
@@ -4328,7 +4351,30 @@ __global__ static void qwen4exp_shared_gate_kernel(
     if (token >= n_tokens) return;
     const float *token_x = x + (uint64_t)token * in_dim;
     float acc = 0.0f;
-    for (uint32_t k = threadIdx.x; k < in_dim; k += blockDim.x) {
+    uint32_t k = threadIdx.x;
+    /* FOUR PAIRS IN FLIGHT.  This kernel is one block at the scored width --
+     * its grid is n_tokens -- so nothing else is resident to cover a load, and
+     * each add waits on its own two global reads.  The products reach `acc` in
+     * the same order, k ascending by blockDim.x, so the sum and the sigmoid
+     * that closes it are bit for bit the one-at-a-time walk's. */
+    {
+        const uint32_t step = blockDim.x;
+        for (; k + step * 3u < in_dim; k += step * 4u) {
+            const float w0 = dev_qwen4exp_weight_value(router_type, router, k);
+            const float w1 = dev_qwen4exp_weight_value(router_type, router, k + step);
+            const float w2 = dev_qwen4exp_weight_value(router_type, router, k + step * 2u);
+            const float w3 = dev_qwen4exp_weight_value(router_type, router, k + step * 3u);
+            const float a0 = token_x[k];
+            const float a1 = token_x[k + step];
+            const float a2 = token_x[k + step * 2u];
+            const float a3 = token_x[k + step * 3u];
+            acc += w0 * a0;
+            acc += w1 * a1;
+            acc += w2 * a2;
+            acc += w3 * a3;
+        }
+    }
+    for (; k < in_dim; k += blockDim.x) {
         acc += dev_qwen4exp_weight_value(router_type, router, k) * token_x[k];
     }
     const float total = dev_qwen4exp_block_sum(ds4_qwen4exp_smem, acc);
