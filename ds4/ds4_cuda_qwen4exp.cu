@@ -6845,16 +6845,41 @@ __global__ static void qwen4exp_qsa_attention_group_kernel(
             float contrib[GROUP];
 #pragma unroll
             for (uint32_t h = 0; h < GROUP; h++) contrib[h] = 0.0f;
-            for (uint32_t j = 0; j < n_in_tile; j++) {
-                const int32_t kj = keys[j];
-                if (kj < 0) continue;
-                /* One V channel read for the whole group, where the per-head
-                 * kernel read the same address once per head. */
-                const float vvj = v_cache[
-                    (uint64_t)kj * kv_stride + (uint64_t)kv_head * head_dim + tid];
+            {
+                uint32_t j = 0;
+                if (!sparse) {
+                    for (; j + 4u <= n_in_tile; j += 4u) {
+                        const float vv0 = v_cache[
+                            (uint64_t)keys[j] * kv_stride +
+                            (uint64_t)kv_head * head_dim + tid];
+                        const float vv1 = v_cache[
+                            (uint64_t)keys[j + 1u] * kv_stride +
+                            (uint64_t)kv_head * head_dim + tid];
+                        const float vv2 = v_cache[
+                            (uint64_t)keys[j + 2u] * kv_stride +
+                            (uint64_t)kv_head * head_dim + tid];
+                        const float vv3 = v_cache[
+                            (uint64_t)keys[j + 3u] * kv_stride +
+                            (uint64_t)kv_head * head_dim + tid];
 #pragma unroll
-                for (uint32_t h = 0; h < GROUP; h++) {
-                    contrib[h] = __fmaf_rn(probs[h * nth + j], vvj, contrib[h]);
+                        for (uint32_t h = 0; h < GROUP; h++) {
+                            contrib[h] = __fmaf_rn(probs[h * nth + j], vv0, contrib[h]);
+                            contrib[h] = __fmaf_rn(probs[h * nth + j + 1u], vv1, contrib[h]);
+                            contrib[h] = __fmaf_rn(probs[h * nth + j + 2u], vv2, contrib[h]);
+                            contrib[h] = __fmaf_rn(probs[h * nth + j + 3u], vv3, contrib[h]);
+                        }
+                    }
+                }
+                for (; j < n_in_tile; j++) {
+                    const int32_t kj = keys[j];
+                    if (kj < 0) continue;
+                    const float vvj = v_cache[
+                        (uint64_t)kj * kv_stride +
+                        (uint64_t)kv_head * head_dim + tid];
+#pragma unroll
+                    for (uint32_t h = 0; h < GROUP; h++) {
+                        contrib[h] = __fmaf_rn(probs[h * nth + j], vvj, contrib[h]);
+                    }
                 }
             }
 #pragma unroll
@@ -6904,7 +6929,11 @@ static uint32_t qwen4exp_cuda_threads(uint32_t value) {
  * Both bounds are scheduling bounds.  The kernel's arithmetic does not depend
  * on GROUP at all (see its note), so moving these numbers cannot move a
  * single output bit. */
-#define QWEN4EXP_QSA_GROUP_MIN_ROWS   64u
+/* Was 64: only prefills. Decode is 1–2 tokens with 24 heads / 2 KV heads, so
+ * the group kernel's single K/V fetch per KV head (twelve query heads share
+ * it) is exactly the reuse the per-head launch cannot get. Shared-memory and
+ * bit-exactness bounds are unchanged; this is only the scheduling floor. */
+#define QWEN4EXP_QSA_GROUP_MIN_ROWS   1u
 #define QWEN4EXP_QSA_GROUP_SHARED_CAP (48u * 1024u)
 
 static size_t qwen4exp_qsa_group_shared(uint32_t group, uint32_t head_dim,
