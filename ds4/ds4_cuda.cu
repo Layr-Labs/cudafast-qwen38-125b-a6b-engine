@@ -5684,7 +5684,7 @@ __global__ static void matmul_q8_0_preq_rows_exact_tile_kernel(
 /* Two adjacent lanes share a Q8 group. Their integer partials may be
  * combined freely; each even lane keeps its original float group chain.
  * Shared memory remaps the 32 finished chains onto one reduction warp. */
-template <int R>
+template <int R, bool ONE_ROW>
 __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
         float *out, const unsigned char *w,
         const int8_t *xq, const float *xscale,
@@ -5694,8 +5694,12 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
     const uint32_t group = local_lane >> 1u;
     const uint32_t half = local_lane & 1u;
     const uint64_t row = (uint64_t)blockIdx.x * 4u + local_row;
-    const uint32_t row0 = blockIdx.y * R;
-    const uint32_t take = n_rows - row0 < R ? n_rows - row0 : R;
+    /* ONE_ROW is stronger than R == 1: the launch contract also proves y == 0
+     * and n_rows == 1, so the compiler can erase the tile arithmetic and the
+     * per-dot live-row predicate from the dominant decode instantiation. */
+    const uint32_t row0 = ONE_ROW ? 0u : blockIdx.y * R;
+    const uint32_t take = ONE_ROW ? 1u
+                                  : (n_rows - row0 < R ? n_rows - row0 : R);
     float acc[R];
 #pragma unroll
     for (int r = 0; r < R; r++) acc[r] = 0.0f;
@@ -16573,13 +16577,13 @@ static int cuda_matmul_q8_0_preq_rows_exact(
         const bool one_row = n_rows == 1u &&
             getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL;
         if (one_row) {
-            matmul_q8_0_preq_pair_lanes_kernel<1><<<
+            matmul_q8_0_preq_pair_lanes_kernel<1, true><<<
                     dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u),
                     256, 0, cuda_decode_stream()>>>(
                     (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
                     out_dim, n_rows, blocks);
         } else {
-            matmul_q8_0_preq_pair_lanes_kernel<2><<<
+            matmul_q8_0_preq_pair_lanes_kernel<2, false><<<
                     dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u),
                     256, 0, cuda_decode_stream()>>>(
                     (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
