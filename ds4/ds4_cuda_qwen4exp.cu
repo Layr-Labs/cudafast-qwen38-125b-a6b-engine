@@ -124,6 +124,66 @@ static void *qwen4exp_group_scratch(int tier, uint64_t bytes) {
     return next;
 }
 
+#define QWEN4EXP_HC_INJ_SPLIT   16u
+#define QWEN4EXP_HC_INJ_THREADS 128u
+
+/* Scratch for the fused mixer's inject-head split reduction: rows * n_hc *
+ * QWEN4EXP_HC_INJ_SPLIT floats, so a couple of kilobytes at every width that
+ * uses it.  Kept and grown like the MoE pair list above, and for the same
+ * reason. */
+static void *g_qwen4exp_inject_scratch[16];
+static uint64_t g_qwen4exp_inject_bytes[16];
+
+static void *qwen4exp_inject_scratch(int tier, uint64_t bytes) {
+    if (tier < 0 || tier >= 16) return NULL;
+    if (g_qwen4exp_inject_scratch[tier] &&
+        g_qwen4exp_inject_bytes[tier] >= bytes) {
+        return g_qwen4exp_inject_scratch[tier];
+    }
+    void *next = NULL;
+    if (!cuda_ok(cudaMalloc(&next, (size_t)bytes),
+                 "qwen4exp inject split scratch")) {
+        return NULL;
+    }
+    if (g_qwen4exp_inject_scratch[tier]) {
+        /* Captured narrow-row mixer graphs bake this allocation's address.
+         * Retire them before growing the shared scratch. */
+        ds4_gpu_decode_graphs_invalidate();
+        cudaFree(g_qwen4exp_inject_scratch[tier]);
+    }
+    g_qwen4exp_inject_scratch[tier] = next;
+    g_qwen4exp_inject_bytes[tier] = bytes;
+    return next;
+}
+
+/* Scratch for the split-KV attention partials: n_tokens * n_head * SPLIT
+ * slices, each a head_dim accumulator plus a maximum and a sum.  Kept and
+ * grown like the scratch above. */
+static void *g_qwen4exp_qsa_split_scratch[16];
+static uint64_t g_qwen4exp_qsa_split_bytes[16];
+
+static void *qwen4exp_qsa_split_scratch(int tier, uint64_t bytes) {
+    if (tier < 0 || tier >= 16) return NULL;
+    if (g_qwen4exp_qsa_split_scratch[tier] &&
+        g_qwen4exp_qsa_split_bytes[tier] >= bytes) {
+        return g_qwen4exp_qsa_split_scratch[tier];
+    }
+    void *next = NULL;
+    if (!cuda_ok(cudaMalloc(&next, (size_t)bytes),
+                 "qwen4exp QSA split scratch")) {
+        return NULL;
+    }
+    if (g_qwen4exp_qsa_split_scratch[tier]) {
+        /* QSA graph nodes retain the partial-buffer address.  A wider
+         * speculative variant may grow it, so invalidate before freeing. */
+        ds4_gpu_decode_graphs_invalidate();
+        cudaFree(g_qwen4exp_qsa_split_scratch[tier]);
+    }
+    g_qwen4exp_qsa_split_scratch[tier] = next;
+    g_qwen4exp_qsa_split_bytes[tier] = bytes;
+    return next;
+}
+
 static bool glm53_cuda_mul_u64(uint64_t a, uint64_t b, uint64_t *out) {
     if (!out || (a != 0u && b > UINT64_MAX / a)) return false;
     *out = a * b;
@@ -5281,6 +5341,64 @@ __global__ static void qwen4exp_hc_mix_renorm_kernel(
  * as a stream-outer pair so the per-stream scale is loaded once; because
  * n_embd is a multiple of blockDim.x the visited sequence is the SAME
  * ascending stride-blockDim.x sequence, so the partial sums are the same. */
+/* Ascending chunk order, one thread per head, so the sum is the same sequence
+ * on every launch and at every width. */
+__global__ static void qwen4exp_hc_inject_weights_combine_kernel(
+        float *out, const float *partial_in, uint32_t n_hc, uint32_t rows) {
+    const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_hc * rows) return;
+    const float *p = partial_in + (uint64_t)idx * QWEN4EXP_HC_INJ_SPLIT;
+    float total = 0.0f;
+    for (uint32_t c = 0; c < QWEN4EXP_HC_INJ_SPLIT; c++) total += p[c];
+    out[idx] = 2.0f * qwen4exp_sigmoid(total * (1.0f / (float)n_hc));
+}
+
+/* The renorm inject head above reduces the whole flat row in ONE block, so its
+ * grid is n_hc by rows: at decode width that is four blocks, and this device
+ * has forty-eight streaming multiprocessors.  Each block rebuilds and reduces
+ * n_hc * n_embd normed values against a 10240-value weight row, and four blocks
+ * cannot keep enough loads in flight to cover that read.
+ *
+ * So the reduction is SPLIT along the flat row, into contiguous chunks that the
+ * combine adds in ascending order.  Chunk boundaries come from `wide` alone and
+ * never from the row count, so a row's arithmetic is the same at every width
+ * the speculative cycle can present. */
+__global__ static void qwen4exp_hc_inject_weights_renorm_split_kernel(
+        float *partial_out, const float *hyper, const float *nscale,
+        const float *normw, const char *w,
+        uint32_t n_embd, uint32_t n_hc, uint32_t rows,
+        float weight_bias, int round_bf16,
+        uint32_t weight_type, uint32_t weight_row_bytes) {
+    const uint32_t h = blockIdx.x;
+    const uint32_t t = blockIdx.y;
+    const uint32_t chunk_id = blockIdx.z;
+    if (t >= rows || h >= n_hc || chunk_id >= QWEN4EXP_HC_INJ_SPLIT) return;
+
+    const uint32_t wide = n_hc * n_embd;
+    const uint32_t chunk = (wide + QWEN4EXP_HC_INJ_SPLIT - 1u) /
+                           QWEN4EXP_HC_INJ_SPLIT;
+    const uint32_t begin = chunk_id * chunk;
+    const uint32_t end = (begin + chunk) < wide ? (begin + chunk) : wide;
+
+    const float *xr = hyper + (uint64_t)t * wide;
+    const char *wr = w + (uint64_t)h * weight_row_bytes;
+
+    float sum = 0.0f;
+    for (uint32_t i = begin + threadIdx.x; i < end; i += blockDim.x) {
+        const uint32_t hs = i / n_embd;
+        const float sc = nscale[(uint64_t)t * n_hc + hs];
+        const float normed = qwen4exp_hc_normed_value(
+                xr[i], sc, normw[i], weight_bias, round_bf16);
+        sum += normed * dev_qwen4exp_inject_value(weight_type, wr, i);
+    }
+    __shared__ float partial[QWEN4EXP_HC_INJ_THREADS];
+    const float total = qwen4exp_block_sum_f32(sum, partial);
+    if (threadIdx.x == 0u) {
+        partial_out[(((uint64_t)t * n_hc + h) * QWEN4EXP_HC_INJ_SPLIT) +
+                    chunk_id] = total;
+    }
+}
+
 __global__ static void qwen4exp_hc_inject_weights_renorm_kernel(
         float *out, const float *hyper, const float *nscale,
         const float *normw, const char *w,
@@ -5590,6 +5708,33 @@ static int qwen4exp_hc_mixer_fused_cuda(
     if (!cuda_ok(cudaGetLastError(), "qwen4exp_hc_mix_renorm launch")) return 0;
     if (!inject) return 1;
 
+    /* Widths the speculative cycle can present take the split reduction; a
+     * prefill chunk is eight rows or more and fills the grid from the row axis
+     * already. */
+    if (rows < 8u) {
+        const uint64_t pcount = (uint64_t)rows * n_hc * QWEN4EXP_HC_INJ_SPLIT;
+        float *parts = (float *)qwen4exp_inject_scratch(
+                tier, pcount * sizeof(float));
+        if (parts) {
+            qwen4exp_hc_inject_weights_renorm_split_kernel<<<
+                    dim3(n_hc, rows, QWEN4EXP_HC_INJ_SPLIT),
+                    QWEN4EXP_HC_INJ_THREADS, 0,
+                    cuda_decode_stream()>>>(
+                    parts, (const float *)hyper->ptr, (const float *)nscale,
+                    normw, iw, n_embd, n_hc, rows, weight_bias, round_bf16,
+                    inject_weight->type, (uint32_t)iw_row_bytes);
+            if (!cuda_ok(cudaGetLastError(),
+                         "qwen4exp_hc_inject_weights_renorm split launch")) {
+                return 0;
+            }
+            qwen4exp_hc_inject_weights_combine_kernel<<<
+                    (unsigned)(((uint64_t)n_hc * rows + 63u) / 64u), 64u, 0,
+                    cuda_decode_stream()>>>(
+                    (float *)inject->ptr, parts, n_hc, rows);
+            return cuda_ok(cudaGetLastError(),
+                           "qwen4exp_hc_inject_weights_renorm combine launch");
+        }
+    }
     qwen4exp_hc_inject_weights_renorm_kernel<<<dim3(n_hc, rows, 1u), threads, 0,
                                                cuda_decode_stream()>>>(
             (float *)inject->ptr, (const float *)hyper->ptr, nscale, normw, iw,
@@ -6372,6 +6517,202 @@ __global__ static void qwen4exp_qsa_attention_kernel(
  * loads are in flight, not which products land in which accumulator. */
 #define QWEN4EXP_QSA_KSTEP 4u
 
+/* SPLIT-KV DECODE ATTENTION.
+ *
+ * The kernel above gives one block to each (head, token) pair and walks the
+ * whole key range inside it, so a one-row decode launches n_head blocks --
+ * twenty-four of this device's forty-eight streaming multiprocessors, at 256
+ * threads each.  The key axis is more than a thousand positions long and it is
+ * all reduced serially inside those blocks, so the launch cannot use the
+ * machine no matter how the head group is chosen (the grouped kernel above is
+ * skipped at decode width for exactly that reason).
+ *
+ * So the KEY RANGE is split.  Each of QWEN4EXP_QSA_SPLIT blocks runs the same
+ * online-softmax walk over one contiguous slice and seals its own running
+ * maximum, running sum and unnormalised accumulator; a second launch rescales
+ * the slices onto a common maximum and divides once.  The grid becomes
+ * (n_head, n_tokens, SPLIT).
+ *
+ * THE SPLIT IS OVER THE KEY RANGE, NEVER OVER ROWS.  Slice boundaries come
+ * from a row's OWN key count -- pos0 + token + 1 dense, counts[token] sparse --
+ * so a row's arithmetic does not depend on how many rows the call carries, and
+ * a verify row equals the same row decoded alone at every width the
+ * speculative cycle can present.
+ *
+ * A slice that lands past the end of a short key range seals a neutral partial
+ * (masked maximum, zero sum, zero accumulator) and the combine skips it. */
+#define QWEN4EXP_QSA_SPLIT 8u
+
+__global__ static void qwen4exp_qsa_attention_split_kernel(
+        const float *q,
+        const float *k_cache,
+        const float *v_cache,
+        const int32_t *selected,
+        const int32_t *counts,
+        float *part_acc,
+        float *part_max,
+        float *part_sum,
+        uint32_t n_tokens,
+        uint32_t n_head,
+        uint32_t n_kv_head,
+        uint32_t head_dim,
+        uint32_t pos0,
+        uint32_t cache_cap,
+        uint32_t max_selected,
+        uint32_t sparse,
+        float scale,
+        const uint32_t *d_pos) {
+    extern __shared__ __align__(16) float qwen4exp_attn_shared[];
+    const uint32_t head = blockIdx.x;
+    const uint32_t token = blockIdx.y;
+    const uint32_t slice = blockIdx.z;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t nth = blockDim.x;
+    if (head >= n_head || token >= n_tokens || slice >= QWEN4EXP_QSA_SPLIT) {
+        return;
+    }
+
+    float *qvec = qwen4exp_attn_shared;
+    float *tile = qvec + head_dim;
+    float *probs = tile + nth;
+    int32_t *keys = (int32_t *)(probs + nth);
+
+    const uint32_t p0 = d_pos ? *d_pos : pos0;
+    const uint32_t pos = p0 + token;
+    const uint32_t count = sparse ? (uint32_t)counts[token] : pos + 1u;
+    const uint32_t kv_head = head / (n_head / n_kv_head);
+    const uint32_t kv_stride = n_kv_head * head_dim;
+
+    /* This row's own slice, from this row's own count. */
+    const uint32_t chunk = (count + QWEN4EXP_QSA_SPLIT - 1u) / QWEN4EXP_QSA_SPLIT;
+    const uint32_t begin = slice * chunk;
+    const uint32_t end = (begin + chunk) < count ? (begin + chunk) : count;
+
+    const uint64_t pslot = ((uint64_t)token * n_head + head) * QWEN4EXP_QSA_SPLIT
+                         + slice;
+    float *pacc = part_acc + pslot * head_dim;
+
+    if (begin >= end) {
+        if (tid < head_dim) pacc[tid] = 0.0f;
+        if (tid == 0u) {
+            part_max[pslot] = QWEN4EXP_QSA_MASKED_SCORE;
+            part_sum[pslot] = 0.0f;
+        }
+        return;
+    }
+
+    const float *qsrc = q + ((uint64_t)token * n_head + head) * head_dim;
+    for (uint32_t d = tid; d < head_dim; d += nth) qvec[d] = qsrc[d];
+    __syncthreads();
+
+    float run_max = QWEN4EXP_QSA_MASKED_SCORE;
+    float run_sum = 0.0f;
+    float acc = 0.0f;
+
+    for (uint32_t base = begin; base < end; base += nth) {
+        const uint32_t n_in_tile = min(nth, end - base);
+        int32_t key = -1;
+        float score = QWEN4EXP_QSA_MASKED_SCORE;
+        if (tid < n_in_tile) {
+            key = sparse ? selected[(uint64_t)token * max_selected + base + tid]
+                         : (int32_t)(base + tid);
+            if (key >= 0 && (uint32_t)key < cache_cap) {
+                const float *kv = k_cache +
+                    (uint64_t)key * kv_stride + (uint64_t)kv_head * head_dim;
+                float dot = 0.0f;
+                if ((head_dim & 3u) == 0u) {
+                    const float4 *kv4 = (const float4 *)kv;
+                    const float4 *qv4 = (const float4 *)qvec;
+                    const uint32_t words = head_dim >> 2u;
+                    for (uint32_t w = 0; w < words; w++) {
+                        const float4 kk = kv4[w];
+                        const float4 qq = qv4[w];
+                        dot += qq.x * kk.x;
+                        dot += qq.y * kk.y;
+                        dot += qq.z * kk.z;
+                        dot += qq.w * kk.w;
+                    }
+                } else {
+                    for (uint32_t d = 0; d < head_dim; d++) {
+                        dot += qvec[d] * kv[d];
+                    }
+                }
+                score = dot * scale;
+            } else {
+                key = -1;
+            }
+        }
+        keys[tid] = key;
+        tile[tid] = score;
+        const float tile_max = qwen4exp_blk_max(tile, tid, nth);
+        const float new_max = fmaxf(run_max, tile_max);
+        __syncthreads();
+
+        probs[tid] = (key >= 0) ? expf(score - new_max) : 0.0f;
+        tile[tid] = probs[tid];
+        const float tile_sum = qwen4exp_blk_sum(tile, tid, nth);
+        const float rescale = (run_max > QWEN4EXP_QSA_MASKED_LIMIT)
+            ? expf(run_max - new_max) : 0.0f;
+        run_sum = run_sum * rescale + tile_sum;
+
+        if (tid < head_dim) {
+            float contrib = 0.0f;
+            for (uint32_t j = 0; j < n_in_tile; j++) {
+                const int32_t kj = keys[j];
+                if (kj < 0) continue;
+                const float *vv = v_cache +
+                    (uint64_t)kj * kv_stride + (uint64_t)kv_head * head_dim;
+                contrib += probs[j] * vv[tid];
+            }
+            acc = acc * rescale + contrib;
+        }
+        run_max = new_max;
+        __syncthreads();
+    }
+
+    if (tid < head_dim) pacc[tid] = acc;
+    if (tid == 0u) {
+        part_max[pslot] = run_max;
+        part_sum[pslot] = run_sum;
+    }
+}
+
+/* Rescale the slices onto a common maximum and divide once.  Ascending slice
+ * order, so the sum is the same sequence on every launch and at every width. */
+__global__ static void qwen4exp_qsa_attention_combine_kernel(
+        const float *part_acc,
+        const float *part_max,
+        const float *part_sum,
+        float *out,
+        uint32_t n_tokens,
+        uint32_t n_head,
+        uint32_t head_dim) {
+    const uint32_t head = blockIdx.x;
+    const uint32_t token = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    if (head >= n_head || token >= n_tokens || tid >= head_dim) return;
+
+    const uint64_t base = ((uint64_t)token * n_head + head) * QWEN4EXP_QSA_SPLIT;
+    float gmax = QWEN4EXP_QSA_MASKED_SCORE;
+    for (uint32_t s = 0; s < QWEN4EXP_QSA_SPLIT; s++) {
+        gmax = fmaxf(gmax, part_max[base + s]);
+    }
+
+    float num = 0.0f;
+    float den = 0.0f;
+    if (gmax > QWEN4EXP_QSA_MASKED_LIMIT) {
+        for (uint32_t s = 0; s < QWEN4EXP_QSA_SPLIT; s++) {
+            const float pm = part_max[base + s];
+            if (pm <= QWEN4EXP_QSA_MASKED_LIMIT) continue;
+            const float r = expf(pm - gmax);
+            den += part_sum[base + s] * r;
+            num += part_acc[(base + s) * head_dim + tid] * r;
+        }
+    }
+    out[((uint64_t)token * n_head + head) * head_dim + tid] =
+        (den > 0.0f) ? num / den : 0.0f;
+}
+
 template <uint32_t GROUP>
 __global__ static void qwen4exp_qsa_attention_group_kernel(
         const float *q,
@@ -7096,6 +7437,49 @@ extern "C" int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
 
     const size_t shared = ((size_t)head_dim + 2u * nth) * sizeof(float) +
                           (size_t)nth * sizeof(int32_t);
+
+    /* SPECULATIVE WIDTH takes the split-KV path.  The row axis is at most
+     * DS4_QWEN4EXP_MTP_MAX_COMMIT (7) rows there, so (n_head, n_tokens) alone
+     * cannot fill the device and the key axis has to supply the rest.  Widths 1
+     * through 7 all take it, so a verify row equals the same row decoded alone.
+     * A prefill chunk is eight rows or more and fills the grid from the row
+     * axis, so it keeps the single-block walk. */
+    if (n_tokens < 8u && getenv("DS4_QWEN4EXP_NO_QSA_SPLIT") == NULL) {
+        const int split_tier = ds4_tensor_device_idx(out);
+        const uint64_t slots =
+            (uint64_t)n_tokens * n_head * QWEN4EXP_QSA_SPLIT;
+        const uint64_t acc_floats = slots * head_dim;
+        float *scratch = (float *)qwen4exp_qsa_split_scratch(
+                split_tier, (acc_floats + 2ull * slots) * sizeof(float));
+        if (scratch) {
+            float *const pacc = scratch;
+            float *const pmax = scratch + acc_floats;
+            float *const psum = pmax + slots;
+            cudaStream_t stream = cuda_decode_stream();
+            qwen4exp_qsa_attention_split_kernel<<<
+                    dim3(n_head, n_tokens, QWEN4EXP_QSA_SPLIT), nth, shared,
+                    stream>>>(
+                    (const float *)q->ptr, (const float *)k_cache->ptr,
+                    (const float *)v_cache->ptr,
+                    sparse ? (const int32_t *)selected->ptr : NULL,
+                    sparse ? (const int32_t *)counts->ptr : NULL,
+                    pacc, pmax, psum, n_tokens, n_head, n_kv_head, head_dim,
+                    pos0, cache_cap, max_selected, sparse ? 1u : 0u, scale,
+                    d_pos_ptr);
+            if (!cuda_ok(cudaGetLastError(),
+                         "Qwen4-Exp QSA split attention launch")) {
+                return 0;
+            }
+            qwen4exp_qsa_attention_combine_kernel<<<
+                    dim3(n_head, n_tokens), nth, 0, stream>>>(
+                    pacc, pmax, psum, (float *)out->ptr,
+                    n_tokens, n_head, head_dim);
+            return cuda_ok(cudaGetLastError(),
+                           "Qwen4-Exp QSA split combine launch");
+        }
+        /* Scratch refused: fall through to the single-block walk. */
+    }
+
     qwen4exp_qsa_attention_kernel<<<dim3(n_head, n_tokens), nth, shared,
         cuda_decode_stream()>>>(
             (const float *)q->ptr, (const float *)k_cache->ptr,
