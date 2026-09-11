@@ -180,6 +180,30 @@ __device__ static float dot4_f32(float4 a, float4 b) {
     return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
 }
 
+/* Blackwell sm_121a 128-bit vector cache streaming (evict-first) primitives.
+ * GDN recurrent state S is 113.25 MB across 36 layers, exceeding GB10 24 MB L2
+ * cache by 4.7x. Cache-streaming operations prevent state updates from evicting
+ * active weights and KV cache lines from L2. */
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+__device__ __forceinline__ static void st_global_cs_float4(float4 *ptr, float4 val) {
+    asm volatile("st.global.cs.v4.f32 [%0], {%1, %2, %3, %4};"
+                 :
+                 : "l"(ptr), "f"(val.x), "f"(val.y), "f"(val.z), "f"(val.w)
+                 : "memory");
+}
+__device__ __forceinline__ static float4 ld_global_cs_float4(const float4 *ptr) {
+    float4 val;
+    asm volatile("ld.global.cs.v4.f32 {%0, %1, %2, %3}, [%4];"
+                 : "=f"(val.x), "=f"(val.y), "=f"(val.z), "=f"(val.w)
+                 : "l"(ptr)
+                 : "memory");
+    return val;
+}
+#else
+__device__ __forceinline__ static void st_global_cs_float4(float4 *ptr, float4 val) { *ptr = val; }
+__device__ __forceinline__ static float4 ld_global_cs_float4(const float4 *ptr) { return *ptr; }
+#endif
+
 /* =========================================================================
  * Qwen4-Exp gated delta net (GDN), the CUDA twin of metal/qwen4exp_gdn.metal.
  *
@@ -259,6 +283,11 @@ __global__ static void qwen4exp_gdn_conv_kernel(
         float       *conv_state,
         const float *conv_weight,
         float       *conv_snapshot,
+        float2      *gate_pairs,
+        const float *raw_alpha,
+        const float *raw_beta,
+        const float *a_log,
+        const float *dt_bias,
         uint32_t     n_key_head,
         uint32_t     n_value_head,
         uint32_t     n_rows,
@@ -356,6 +385,17 @@ __global__ static void qwen4exp_gdn_conv_kernel(
     history[channel] = h0;
     history[(uint64_t)conv_dim + channel] = h1;
     history[(uint64_t)2u * conv_dim + channel] = h2;
+
+    if (gate_pairs && block == 0u) {
+        for (uint32_t head = tid; head < n_value_head; head += QWEN4EXP_GDN_DIM) {
+            for (uint32_t token = 0; token < n_tokens; token++) {
+                const uint64_t gate = ((uint64_t)row * n_tokens + token) * n_value_head + head;
+                gate_pairs[gate] = make_float2(
+                    expf(a_log[head] * qwen4exp_gdn_softplus(raw_alpha[gate] + dt_bias[head])),
+                    qwen4exp_gdn_sigmoid(raw_beta[gate]));
+            }
+        }
+    }
 }
 
 /*
@@ -534,7 +574,7 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
     float4 *state_ptr = (float4 *)(state +
         ((((uint64_t)row * n_value_head + head) * QWEN4EXP_GDN_DIM) + value) *
         QWEN4EXP_GDN_DIM + k0);
-    float4 h = *state_ptr;
+    float4 h = ld_global_cs_float4(state_ptr);
     /* ssm_a IS ALREADY -exp(A_log); see the note in metal/qwen4exp_gdn.metal.
      * Twin of that kernel -- keep the two expressions identical. */
     const float decay_coeff = a_log[head];
@@ -592,10 +632,10 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
                 (uint64_t)token * stride +
                 ((((uint64_t)row * n_value_head + head) * QWEN4EXP_GDN_DIM) +
                  value) * QWEN4EXP_GDN_DIM + k0);
-            *snap = h;
+            st_global_cs_float4(snap, h);
         }
     }
-    *state_ptr = h;
+    st_global_cs_float4(state_ptr, h);
 }
 
 /* Sigmoid-gated RMS output norm.  The weight is a plain scale, not an
@@ -604,6 +644,8 @@ __global__ static void qwen4exp_gdn_output_kernel(
         float       *out,
         const float *output_gate,
         const float *output_norm,
+        int8_t      *xq,
+        float       *xscale,
         uint32_t     n_value_head,
         uint32_t     n_rows,
         uint32_t     n_tokens,
@@ -626,8 +668,24 @@ __global__ static void qwen4exp_gdn_output_kernel(
     total = lane < 4u ? partial[lane] : 0.0f;
     total = warp_sum_all_f32(total);
     const float scale = rsqrtf(total / (float)QWEN4EXP_GDN_DIM + norm_eps);
-    out[base + tid] = raw * scale * output_norm[tid] *
+    const float activated = raw * scale * output_norm[tid] *
         qwen4exp_gdn_sigmoid(output_gate[base + tid]);
+    out[base + tid] = activated;
+    if (xq && xscale) {
+        const uint64_t slot = (uint64_t)row * n_tokens + token;
+        const uint64_t pair = slot * (value_dim / 32u) + head * 4u + warp;
+        float a = fabsf(activated);
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+        }
+        const float d = a / 127.0f;
+        const float id = d != 0.0f ? 1.0f / d : 0.0f;
+        if (lane == 0u) xscale[pair] = d;
+        int v = (int)lrintf(activated * id);
+        v = v > 127 ? 127 : (v < -128 ? -128 : v);
+        xq[pair * 32u + lane] = (int8_t)v;
+    }
 }
 
 static const float *qwen4exp_gdn_weight_f32(
@@ -808,6 +866,11 @@ static int qwen4exp_cuda_gdn_run(
         if (conv_out) {
             gate_pairs = (float2 *)(conv_out + qkv_elements);
         }
+    } else {
+        float *scratch = qwen4exp_conv_scratch(logical_tier, 2u * gate_elements);
+        if (scratch) {
+            gate_pairs = (float2 *)scratch;
+        }
     }
     if (conv_out) {
         qwen4exp_gdn_conv_parallel_kernel<<<
@@ -839,6 +902,9 @@ static int qwen4exp_cuda_gdn_run(
                                    QWEN4EXP_GDN_DIM, 0, stream>>>(
                 (float *)qkv->ptr, (float *)conv_state->ptr, conv_weight,
                 conv_snapshot ? (float *)conv_snapshot->ptr : NULL,
+                gate_pairs,
+                (const float *)raw_alpha->ptr,
+                (const float *)raw_beta->ptr, a_log, dt_bias,
                 n_key_head, n_value_head, n_rows, n_tokens, n_snapshot_rows,
                 qk_norm_eps);
     }
@@ -848,10 +914,11 @@ static int qwen4exp_cuda_gdn_run(
 
     const dim3 recurrence_grid(
         n_value_head, QWEN4EXP_GDN_DIM / 4u, n_rows);
+    const float *rec_qkv = conv_out ? conv_out : (const float *)qkv->ptr;
     if (gate_pairs) {
         qwen4exp_gdn_recurrence_kernel<true><<<
                 recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
-                (float *)out->ptr, (float *)recurrent_state->ptr, conv_out,
+                (float *)out->ptr, (float *)recurrent_state->ptr, rec_qkv,
                 (const float *)raw_alpha->ptr,
                 (const float *)raw_beta->ptr, a_log, dt_bias,
                 gate_pairs,
@@ -877,6 +944,7 @@ static int qwen4exp_cuda_gdn_run(
     qwen4exp_gdn_output_kernel<<<dim3(n_tokens, n_value_head, n_rows),
                                  QWEN4EXP_GDN_DIM, 0, stream>>>(
             (float *)out->ptr, (const float *)output_gate->ptr, output_norm,
+            NULL, NULL,
             n_value_head, n_rows, n_tokens, norm_eps);
     return cuda_ok(cudaGetLastError(), "qwen4exp GDN output norm launch");
 }
@@ -1549,6 +1617,7 @@ __global__ static void qwen4exp_router_select_topk_kernel(
 
     float scores[16];
     uint32_t live = 0u;
+    float top_val[16];
 #pragma unroll
     for (uint32_t j = 0; j < 16u; j++) {
         const uint32_t e = lane + j * 32u;
@@ -1584,7 +1653,12 @@ __global__ static void qwen4exp_router_select_topk_kernel(
         }
         const int32_t chosen =
             __shfl_sync(0xffffffffu, best_i, 0u);
-        if (lane == 0u) sel[rank] = chosen;
+        const float chosen_v =
+            __shfl_sync(0xffffffffu, best_v, 0u);
+        if (lane == 0u) {
+            top_val[rank] = chosen_v;
+            sel[rank] = chosen;
+        }
         if (((uint32_t)chosen & 31u) == lane) {
             live &= ~(1u << ((uint32_t)chosen >> 5u));
         }
@@ -1593,19 +1667,16 @@ __global__ static void qwen4exp_router_select_topk_kernel(
     /* Same serial softmax and the same selected-logit order as the full-sort
      * path below. */
     if (lane == 0u) {
-        float m = -FLT_MAX;
-        for (uint32_t i = 0; i < n_expert_used; i++) {
-            const float v = lg[(uint32_t)sel[i]];
-            if (v > m) m = v;
-        }
+        const float m = top_val[0];
         float sum = 0.0f;
+        float e_arr[16];
         for (uint32_t i = 0; i < n_expert_used; i++) {
-            const float e = expf(lg[(uint32_t)sel[i]] - m);
-            w[i] = e;
+            const float e = expf(top_val[i] - m);
+            e_arr[i] = e;
             sum += e;
         }
         const float inv = 1.0f / sum;
-        for (uint32_t i = 0; i < n_expert_used; i++) w[i] *= inv;
+        for (uint32_t i = 0; i < n_expert_used; i++) w[i] = e_arr[i] * inv;
     }
 }
 
@@ -1865,14 +1936,17 @@ __global__ static void qwen4exp_moe_group_small_kernel(
         uint32_t mid_token_stride) {
     __shared__ int32_t warp_count_prefix[QWEN4EXP_MOE_SCAN_THREADS / 32];
     __shared__ int32_t warp_live_prefix[QWEN4EXP_MOE_SCAN_THREADS / 32];
+    __shared__ int32_t sh_sel[70];
     const uint32_t e = threadIdx.x;
     const uint32_t lane = e & 31u;
     const uint32_t warp = e >> 5u;
+    if (e < n_pairs) sh_sel[e] = selected[e];
+    __syncthreads();
 
     int32_t count = 0;
     if (e < n_expert) {
         for (uint32_t p = 0; p < n_pairs; p++) {
-            count += selected[p] == (int32_t)e;
+            count += sh_sel[p] == (int32_t)e;
         }
         counts[e] = count;
     }
@@ -1928,7 +2002,7 @@ __global__ static void qwen4exp_moe_group_small_kernel(
         if (count > 0) active[live_prefix] = (int32_t)e;
         int32_t at = offset;
         for (uint32_t p = 0; p < n_pairs; p++) {
-            if (selected[p] == (int32_t)e) pairs[at++] = (int32_t)p;
+            if (sh_sel[p] == (int32_t)e) pairs[at++] = (int32_t)p;
         }
     }
     if (e == 0u) {
@@ -1939,7 +2013,7 @@ __global__ static void qwen4exp_moe_group_small_kernel(
      * in the normal case; an invalid pair's one thread writes its short
      * intermediate row here. */
     if (e < n_pairs) {
-        const int32_t expert = selected[e];
+        const int32_t expert = sh_sel[e];
         if (expert < 0 || (uint32_t)expert >= n_expert) {
             const uint32_t token = e / n_expert_used;
             const uint32_t slot = e - token * n_expert_used;
