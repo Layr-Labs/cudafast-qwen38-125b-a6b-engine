@@ -3024,13 +3024,34 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                     (uint64_t)(uint32_t)e * down_expert_bytes +
                     (uint64_t)row * down_row_bytes;
                 const uint64_t mrow = (uint64_t)t * n_expert_used + slot;
+                const uint32_t dty =
+                    DownType < 0 ? down_type : (uint32_t)DownType;
                 for (uint32_t g = lane; g < groups; g += 32u) {
                     int8_t wq[32];
                     float wa[2], wb[2];
                     int halves = 1;
-                    dev_qwen4exp_group_decode(
-                            DownType < 0 ? down_type : (uint32_t)DownType,
-                            drow, g, wq, wa, wb, &halves);
+                    /* WORD DECODE, the same pair the routed gate/up kernels
+                     * take.  qw_raw_load stages a group's payload as words
+                     * when the type allows it -- q4_K, q5_1 and q5_K, and only
+                     * when that group's payload is word aligned -- and
+                     * dev_qwen4exp_group_decode_w rebuilds from those words
+                     * the bytes the byte decoder rebuilds from single bytes.
+                     *
+                     * Every type that stages leaves `halves` at one, which is
+                     * the value pinned on that path, so the accumulate below
+                     * gets what the byte decoder would have given it.  A type
+                     * that does not stage -- q6_K, the only one that sets
+                     * `halves` to two, and q8_0 -- returns false and keeps the
+                     * byte decoder with its own halves, exactly as before. */
+                    uint32_t raw[8];
+                    if (qw_raw_load(dty, drow, g, raw)) {
+                        dev_qwen4exp_group_decode_w(dty, drow, g, raw,
+                                                    wq, wa, wb);
+                        halves = 1;
+                    } else {
+                        dev_qwen4exp_group_decode(dty, drow, g,
+                                                  wq, wa, wb, &halves);
+                    }
                     const uint64_t at_g = mrow * groups + g;
                     qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves,
                                               mq + at_g * 32u, ms[at_g],
