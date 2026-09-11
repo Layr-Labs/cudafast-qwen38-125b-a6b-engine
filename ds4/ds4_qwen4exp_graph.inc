@@ -1306,8 +1306,24 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
         !ds4_qwen4exp_matmul_q8_0_preq(s->gdn_gate, QW_MAP(m, l->attn_gate),
                                     QW_MAPSZ(m, l->attn_gate), QW_OFF(l->attn_gate),
                                     DS4_N_EMBD, cfg->gdn_inner,
-                                    s->mixed_q8, 0, q8_soff, n_tokens) ||
-        !ds4_qwen4exp_matmul_f32(s->gdn_alpha, QW_MAP(m, l->ssm_alpha),
+                                    s->mixed_q8, 0, q8_soff, n_tokens)) {
+        fprintf(stderr, "ds4: qwen4exp GDN Q8 projections failed at block %u\n", il);
+        return false;
+    }
+
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (n_tokens <= 2u && getenv("DS4_F32_NO_VECTOR_PAIR") == NULL) {
+        if (!ds4_gpu_matmul_f32_pair_decode_rows_exact_tensor(
+                s->gdn_alpha, s->gdn_beta,
+                QW_MAP(m, l->ssm_alpha), QW_MAPSZ(m, l->ssm_alpha), QW_OFF(l->ssm_alpha),
+                QW_MAP(m, l->ssm_beta), QW_MAPSZ(m, l->ssm_beta), QW_OFF(l->ssm_beta),
+                DS4_N_EMBD, DS4_N_GDN_VALUE_HEAD, s->mixed, n_tokens)) {
+            fprintf(stderr, "ds4: qwen4exp paired GDN F32 projections failed at block %u\n", il);
+            return false;
+        }
+    } else
+#endif
+    if (!ds4_qwen4exp_matmul_f32(s->gdn_alpha, QW_MAP(m, l->ssm_alpha),
                                    QW_MAPSZ(m, l->ssm_alpha), QW_OFF(l->ssm_alpha),
                                    DS4_N_EMBD, DS4_N_GDN_VALUE_HEAD,
                                    s->mixed, n_tokens) ||
@@ -1326,6 +1342,33 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
     const ds4_gpu_qwen4exp_slab a_log_slab = QW_SLAB(m, l->ssm_a);
     const ds4_gpu_qwen4exp_slab dt_bias_slab = QW_SLAB(m, l->ssm_dt_bias);
     const ds4_gpu_qwen4exp_slab ssm_norm_slab = QW_SLAB(m, l->ssm_norm);
+
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    /* QSA scratch is idle throughout a GDN block. Keep the recurrence's
+     * float result separate while its output norm writes the compact Q8
+     * activation there; the following projection consumes it before reuse. */
+    if (n_tokens <= 7u && cfg->gdn_inner <= DS4_N_HEAD * DS4_N_HEAD_DIM &&
+        getenv("DS4_GDN_NO_OUTPUT_Q8") == NULL) {
+        const uint64_t out_soff = (uint64_t)n_tokens * cfg->gdn_inner;
+        if (!ds4_gpu_qwen4exp_gdn_prefill_q8(
+                s->gdn_out, s->qsa_out, 0, out_soff,
+                s->gdn_conv[il], s->gdn_state[il],
+                s->gdn_conv_snapshot[il], s->gdn_state_snapshot[il],
+                n_tokens > 1u ? s->spec_snapshot_rows : 0u, s->gdn_qkv,
+                s->gdn_alpha, s->gdn_beta, s->gdn_gate,
+                &conv_slab, &a_log_slab, &dt_bias_slab, &ssm_norm_slab,
+                DS4_N_GDN_KEY_HEAD, DS4_N_GDN_VALUE_HEAD, n_tokens,
+                DS4_QWEN4EXP_GDN_HEADS_TILED, DS4_RMS_EPS, DS4_RMS_EPS) ||
+            !ds4_qwen4exp_matmul_q8_0_preq(
+                s->block_out, QW_MAP(m, l->ssm_out), QW_MAPSZ(m, l->ssm_out),
+                QW_OFF(l->ssm_out), cfg->gdn_inner, DS4_N_EMBD,
+                s->qsa_out, 0, out_soff, n_tokens)) {
+            fprintf(stderr, "ds4: qwen4exp fused GDN output failed at block %u\n", il);
+            return false;
+        }
+        return true;
+    }
+#endif
 
     const int rc = (n_tokens > 1u)
         ? ds4_gpu_qwen4exp_gdn_prefill(

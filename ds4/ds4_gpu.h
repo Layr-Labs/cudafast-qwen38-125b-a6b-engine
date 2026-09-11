@@ -1021,6 +1021,17 @@ int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
         uint64_t              out_dim,
         const ds4_gpu_tensor *x,
         uint32_t              n_rows);
+
+/* CUDA GDN alpha/beta pair. Independently mapped weights retain the exact
+ * one-row FMA tree; aligned 2560-by-48 widths one/two share a launch. Other
+ * shapes use the ordinary entries. Inputs and outputs must not alias. */
+int ds4_gpu_matmul_f32_pair_decode_rows_exact_tensor(
+        ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
+        const void *map0, uint64_t size0, uint64_t offset0,
+        const void *map1, uint64_t size1, uint64_t offset1,
+        uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint32_t n_rows);
+
 int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(
         ds4_gpu_tensor       *out0,
         ds4_gpu_tensor       *out1,
@@ -3641,6 +3652,39 @@ int ds4_gpu_qwen4exp_gdn_prefill(
         const ds4_gpu_qwen4exp_slab *a_log,
         const ds4_gpu_qwen4exp_slab *dt_bias,
         const ds4_gpu_qwen4exp_slab *output_norm,
+        uint32_t              n_key_head,
+        uint32_t              n_value_head,
+        uint32_t              n_tokens,
+        uint32_t              head_layout,
+        float                 qk_norm_eps,
+        float                 norm_eps);
+
+/* CUDA narrow GDN: identical carried states, with normalized/gated Q8
+ * activation output instead of a normalized float output. `out` holds the
+ * recurrence's raw floats; out_q8 must not alias any live input or state.
+ * q_offset/s_offset are aligned non-overlapping int8/F32 regions. */
+int ds4_gpu_qwen4exp_gdn_prefill_q8(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *out_q8,
+        uint64_t              q_offset,
+        uint64_t              s_offset,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *conv_snapshot,
+        ds4_gpu_tensor       *state_snapshot,
+        uint32_t              n_snapshot_rows,
+        ds4_gpu_tensor       *qkv,
+        const ds4_gpu_tensor *raw_alpha,
+        const ds4_gpu_tensor *raw_beta,
+        const ds4_gpu_tensor *output_gate,
+        /* One slab per tensor: ssm_conv1d, ssm_a, ssm_dt.bias and ssm_norm are
+         * four GGUF tensors and a shard boundary can fall between any two of
+         * them.  Resolving them all through the convolution's mapping would
+         * read the right offsets out of the wrong file on a split set. */
+        const ds4_gpu_qwen4exp_slab *conv_weight_slab,
+        const ds4_gpu_qwen4exp_slab *a_log_slab,
+        const ds4_gpu_qwen4exp_slab *dt_bias_slab,
+        const ds4_gpu_qwen4exp_slab *output_norm_slab,
         uint32_t              n_key_head,
         uint32_t              n_value_head,
         uint32_t              n_tokens,

@@ -17693,10 +17693,14 @@ __device__ __forceinline__ void qwen_f32_vector_read(float v[C], const float *p)
         }
     }
 }
-template<int R, int C, int U>
+template<int R, int C, int U, bool Pair = false>
 __global__ __launch_bounds__(256/C)
-static void qwen_f32_vector_tree_kernel(float *out, const float *w,
-                                       const float *x, uint64_t out_dim) {
+static void qwen_f32_vector_tree_kernel(float *out0, const float *w0,
+        const float *x, uint64_t out_dim, float *out1, const float *w1) {
+    /* A paired grid combines two independent, identically shaped maps.
+     * Every block retains the original projection and reduction tree. */
+    float *out = Pair && blockIdx.z ? out1 : out0;
+    const float *w = Pair && blockIdx.z ? w1 : w0;
     const unsigned t = threadIdx.x;
     const unsigned lane = t & 31u;
     const uint64_t col = blockIdx.x;
@@ -17792,17 +17796,17 @@ extern "C" int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
             qwen_f32_vector_tree_kernel<1, 2, 10><<<
                 (unsigned)out_dim, 128, 0, cuda_decode_stream()>>>(
                     (float *)out->ptr, (const float *)w,
-                    (const float *)x->ptr, out_dim);
+                    (const float *)x->ptr, out_dim, NULL, NULL);
         } else if (out_dim == 48u) {
             qwen_f32_vector_tree_kernel<2, 2, 10><<<
                 (unsigned)out_dim, 128, 0, cuda_decode_stream()>>>(
                     (float *)out->ptr, (const float *)w,
-                    (const float *)x->ptr, out_dim);
+                    (const float *)x->ptr, out_dim, NULL, NULL);
         } else {
             qwen_f32_vector_tree_kernel<2, 4, 1><<<
                 (unsigned)out_dim, 64, 0, cuda_decode_stream()>>>(
                     (float *)out->ptr, (const float *)w,
-                    (const float *)x->ptr, out_dim);
+                    (const float *)x->ptr, out_dim, NULL, NULL);
         }
         return cuda_ok(cudaGetLastError(), "matmul_f32 vector decode launch");
     }
@@ -17865,6 +17869,51 @@ extern "C" int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
                 in_dim, out_dim, n_rows);
     }
     return cuda_ok(cudaGetLastError(), "matmul_f32 decode rows tile launch");
+}
+
+extern "C" int ds4_gpu_matmul_f32_pair_decode_rows_exact_tensor(
+        ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
+        const void *map0, uint64_t size0, uint64_t offset0,
+        const void *map1, uint64_t size1, uint64_t offset1,
+        uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint32_t n_rows) {
+    if (!out0 || !out1 || !x || !map0 || !map1 || !in_dim || !out_dim ||
+        !n_rows || out_dim > UINT32_MAX ||
+        in_dim > UINT64_MAX / sizeof(float) / out_dim ||
+        in_dim > UINT64_MAX / sizeof(float) / n_rows ||
+        out_dim > UINT64_MAX / sizeof(float) / n_rows) return 0;
+    const uint64_t wbytes = in_dim * out_dim * sizeof(float);
+    const uint64_t ybytes = (uint64_t)n_rows * out_dim * sizeof(float);
+    if (offset0 > size0 || offset1 > size1 ||
+        wbytes > size0 - offset0 || wbytes > size1 - offset1 ||
+        x->bytes < (uint64_t)n_rows * in_dim * sizeof(float) ||
+        out0->bytes < ybytes || out1->bytes < ybytes ||
+        out0->ptr == out1->ptr || out0->ptr == x->ptr || out1->ptr == x->ptr) return 0;
+    const int tier = ds4_tensor_device_idx(out0);
+    if (tier < 0 || tier >= g_n_gpus || ds4_tensor_device_idx(out1) != tier ||
+        ds4_tensor_device_idx(x) != tier) return 0;
+    const char *w0 = cuda_resolve_weight_ptr(map0, offset0, wbytes, tier,
+                                            "f32 vector pair first weight");
+    const char *w1 = cuda_resolve_weight_ptr(map1, offset1, wbytes, tier,
+                                            "f32 vector pair second weight");
+    if (!w0 || !w1) return 0;
+    if (in_dim == 2560u && out_dim == 48u && n_rows <= 2u &&
+        (((uintptr_t)w0 | (uintptr_t)w1 | (uintptr_t)x->ptr) & 15u) == 0u &&
+        getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
+        getenv("DS4_F32_NO_VECTOR_DECODE") == NULL) {
+        if (n_rows == 1u) {
+            qwen_f32_vector_tree_kernel<1,2,10,true><<<dim3(48,1,2),128,0,cuda_decode_stream()>>>(
+                (float *)out0->ptr, (const float *)w0, (const float *)x->ptr,
+                out_dim, (float *)out1->ptr, (const float *)w1);
+        } else {
+            qwen_f32_vector_tree_kernel<2,2,10,true><<<dim3(48,1,2),128,0,cuda_decode_stream()>>>(
+                (float *)out0->ptr, (const float *)w0, (const float *)x->ptr,
+                out_dim, (float *)out1->ptr, (const float *)w1);
+        }
+        return cuda_ok(cudaGetLastError(), "f32 vector pair launch");
+    }
+    return ds4_gpu_matmul_f32_decode_rows_exact_tensor(out0,map0,size0,offset0,in_dim,out_dim,x,n_rows) &&
+           ds4_gpu_matmul_f32_decode_rows_exact_tensor(out1,map1,size1,offset1,in_dim,out_dim,x,n_rows);
 }
 
 extern "C" int ds4_gpu_repeat_hc_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *row, uint32_t n_embd, uint32_t n_hc) {

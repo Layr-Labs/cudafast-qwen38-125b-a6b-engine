@@ -505,6 +505,104 @@ static void run_reference(
     reference_free(&ref);
 }
 
+
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+/* The quantized epilogue may change only the output representation. Check
+ * every packed byte and every carried/snapshot float against the original
+ * GDN entry followed by its standalone activation quantizer. */
+static void test_gdn_output_q8(const void *model,
+        const float *qkv, const float *alpha, const float *beta,
+        const float *gate, const float *conv_carry, const float *state_carry) {
+    gpu_buffers b[2];
+    ds4_gpu_tensor *pack[2], *csnap[2], *ssnap[2];
+    const uint64_t cb = (uint64_t)HISTORY * CONV_DIM * sizeof(float);
+    const uint64_t sb = (uint64_t)STATE_ELEMENTS * sizeof(float);
+    const uint64_t qoff = 64, soff = qoff + 7u * VALUE_DIM + 64;
+    const uint64_t pb = soff + (7u * VALUE_DIM / 32u) * sizeof(float) + 64;
+    unsigned char *a = require_alloc(6u * sb, "Q8 comparison A");
+    unsigned char *z = require_alloc(6u * sb, "Q8 comparison B");
+    unsigned char *poison = require_alloc(pb, "Q8 canaries");
+    memset(poison, 0xa5, pb);
+    for (unsigned f = 0; f < 2; f++) {
+        buffers_alloc(&b[f], 1u, 7u);
+        pack[f] = ds4_gpu_tensor_alloc(pb);
+        csnap[f] = ds4_gpu_tensor_alloc(6u * cb);
+        ssnap[f] = ds4_gpu_tensor_alloc(6u * sb);
+        require_ok(pack[f] && csnap[f] && ssnap[f], "Q8/snapshot allocation");
+    }
+    const weight_set *layouts[] = {&g_tiled, &g_grouped};
+    const uint32_t widths[] = {1u, 2u, 3u, 7u};
+    unsigned checks = 0;
+    for (unsigned layout = 0; layout < 2; layout++) {
+        const weight_set *ws = layouts[layout];
+        const ds4_gpu_qwen4exp_slab conv = gdn_slab(model, ws->conv_offset);
+        const ds4_gpu_qwen4exp_slab al = gdn_slab(model, ws->a_log_offset);
+        const ds4_gpu_qwen4exp_slab dt = gdn_slab(model, ws->dt_bias_offset);
+        const ds4_gpu_qwen4exp_slab norm = gdn_slab(model, ws->norm_offset);
+        for (unsigned wi = 0; wi < 4; wi++) {
+            const uint32_t tokens = widths[wi];
+            for (unsigned snapshots = 0; snapshots < (tokens > 1u ? 2u : 1u); snapshots++) {
+                const uint32_t ns = snapshots ? tokens - 1u : 0u;
+                for (unsigned f = 0; f < 2; f++) {
+                    require_ok(ds4_gpu_tensor_write(b[f].conv_state, 0, conv_carry, cb), "Q8 convolution carry");
+                    require_ok(ds4_gpu_tensor_write(b[f].state, 0, state_carry, sb), "Q8 recurrent carry");
+                }
+                for (unsigned step = 0; step < 3; step++) {
+                    const uint32_t first = 17u + step * 11u;
+                    for (unsigned f = 0; f < 2; f++) {
+                        require_ok(ds4_gpu_tensor_write(b[f].qkv, 0, qkv + (uint64_t)first * CONV_DIM,
+                            (uint64_t)tokens * CONV_DIM * sizeof(float)), "Q8 qkv input");
+                        require_ok(ds4_gpu_tensor_write(b[f].alpha, 0, alpha + (uint64_t)first * VALUE_HEADS,
+                            (uint64_t)tokens * VALUE_HEADS * sizeof(float)), "Q8 alpha input");
+                        require_ok(ds4_gpu_tensor_write(b[f].beta, 0, beta + (uint64_t)first * VALUE_HEADS,
+                            (uint64_t)tokens * VALUE_HEADS * sizeof(float)), "Q8 beta input");
+                        require_ok(ds4_gpu_tensor_write(b[f].output_gate, 0, gate + (uint64_t)first * VALUE_DIM,
+                            (uint64_t)tokens * VALUE_DIM * sizeof(float)), "Q8 gate input");
+                        require_ok(ds4_gpu_tensor_write(pack[f], 0, poison, pb), "Q8 poison");
+                        require_ok(ds4_gpu_tensor_fill_f32(csnap[f], 7.25f, 6u * cb / sizeof(float)), "convolution snapshot poison");
+                        require_ok(ds4_gpu_tensor_fill_f32(ssnap[f], 7.25f, 6u * sb / sizeof(float)), "recurrent snapshot poison");
+                        if (f) {
+                            require_ok(ds4_gpu_qwen4exp_gdn_prefill_q8(
+                                b[f].out, pack[f], qoff, soff, b[f].conv_state, b[f].state,
+                                csnap[f], ssnap[f], ns, b[f].qkv, b[f].alpha, b[f].beta,
+                                b[f].output_gate, &conv, &al, &dt, &norm,
+                                KEY_HEADS, VALUE_HEADS, tokens, ws->layout, QK_NORM_EPS, NORM_EPS), "quantized GDN");
+                        } else {
+                            require_ok(ds4_gpu_qwen4exp_gdn_prefill(
+                                b[f].out, b[f].conv_state, b[f].state, csnap[f], ssnap[f], ns,
+                                b[f].qkv, b[f].alpha, b[f].beta, b[f].output_gate,
+                                &conv, &al, &dt, &norm, KEY_HEADS, VALUE_HEADS, tokens,
+                                ws->layout, QK_NORM_EPS, NORM_EPS), "reference GDN");
+                            require_ok(ds4_gpu_quantize_q8_0_decode_rows_exact_tensor(
+                                pack[f], qoff, soff, b[f].out, VALUE_DIM, tokens), "reference quantize");
+                        }
+                    }
+                    const ds4_gpu_tensor *left[] = {pack[0], b[0].conv_state, b[0].state, csnap[0], ssnap[0]};
+                    const ds4_gpu_tensor *right[] = {pack[1], b[1].conv_state, b[1].state, csnap[1], ssnap[1]};
+                    const uint64_t bytes[] = {pb, cb, sb, 6u * cb, 6u * sb};
+                    for (unsigned which = 0; which < 5; which++) {
+                        require_ok(ds4_gpu_tensor_read(left[which], 0, a, bytes[which]), "Q8 reference read");
+                        require_ok(ds4_gpu_tensor_read(right[which], 0, z, bytes[which]), "Q8 candidate read");
+                        if (memcmp(a, z, bytes[which])) {
+                            fprintf(stderr, "GDN Q8 mismatch layout=%u tokens=%u snapshots=%u step=%u buffer=%u\n",
+                                layout, tokens, ns, step, which);
+                            exit(1);
+                        }
+                    }
+                    checks++;
+                }
+            }
+        }
+    }
+    for (unsigned f = 0; f < 2; f++) {
+        ds4_gpu_tensor_free(pack[f]); ds4_gpu_tensor_free(csnap[f]);
+        ds4_gpu_tensor_free(ssnap[f]); buffers_free(&b[f]);
+    }
+    free(a); free(z); free(poison);
+    printf("  GDN output Q8: %u complete activation/state/snapshot comparisons pass\n", checks);
+}
+#endif
+
 int main(void) {
     uint8_t *model = mmap(NULL, MODEL_BYTES, PROT_READ | PROT_WRITE,
                           MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -878,6 +976,9 @@ int main(void) {
         }
         buffers_free(&step);
     }
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    test_gdn_output_q8(model, qkv, alpha, beta, output_gate, conv_carry, state_carry);
+#endif
     buffers_free(&big);
 
     free(state_carry);

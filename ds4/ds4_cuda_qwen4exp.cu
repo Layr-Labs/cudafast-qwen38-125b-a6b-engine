@@ -598,10 +598,18 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
     *state_ptr = h;
 }
 
+/* The activation quantizer's fast-math seam is defined with the HC
+ * kernels below and shared by the GDN and QSA output epilogues. */
+#define QWEN4EXP_Q8_RCP127 0x1.020408p-7f   /* 0x3c010204 */
+__device__ __forceinline__ static float qwen4exp_q8_ftz(float v);
+__device__ __forceinline__ static float qwen4exp_q8_rcp_approx(float d);
+
 /* Sigmoid-gated RMS output norm.  The weight is a plain scale, not an
  * offset-baked one, so it multiplies the normalised row directly. */
+template<bool Quantized>
 __global__ static void qwen4exp_gdn_output_kernel(
         float       *out,
+        int8_t *xq, float *xscale,
         const float *output_gate,
         const float *output_norm,
         uint32_t     n_value_head,
@@ -626,8 +634,27 @@ __global__ static void qwen4exp_gdn_output_kernel(
     total = lane < 4u ? partial[lane] : 0.0f;
     total = warp_sum_all_f32(total);
     const float scale = rsqrtf(total / (float)QWEN4EXP_GDN_DIM + norm_eps);
-    out[base + tid] = raw * scale * output_norm[tid] *
+    const float v = raw * scale * output_norm[tid] *
         qwen4exp_gdn_sigmoid(output_gate[base + tid]);
+    if (Quantized) {
+        /* The recurrence's float output remains a read-only source here.
+         * Packed activation output must be a separate scratch allocation:
+         * compacting it in place would race another head's float reads. */
+        const float vz = qwen4exp_q8_ftz(v);
+        float a = qwen4exp_q8_ftz(fabsf(v));
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+        const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
+        const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
+        const uint64_t index = base + tid;
+        if (lane == 0u) xscale[index / 32u] = d;
+        int q = (int)lrintf(qwen4exp_q8_ftz(vz * id));
+        q = q > 127 ? 127 : (q < -128 ? -128 : q);
+        xq[index] = (int8_t)q;
+    } else {
+        out[base + tid] = v;
+    }
 }
 
 static const float *qwen4exp_gdn_weight_f32(
@@ -708,7 +735,10 @@ static int qwen4exp_cuda_gdn_run(
         uint32_t              head_layout,
         float                 qk_norm_eps,
         float                 norm_eps,
-        const char           *label) {
+        const char           *label,
+        ds4_gpu_tensor       *out_q8,
+        uint64_t              q_offset,
+        uint64_t              s_offset) {
     uint64_t key_dim = 0, value_dim = 0, conv_dim = 0, slots = 0;
     uint64_t qkv_elements = 0, out_elements = 0, gate_elements = 0;
     uint64_t conv_elements = 0, state_elements = 0, state_rows = 0;
@@ -743,6 +773,22 @@ static int qwen4exp_cuda_gdn_run(
         fprintf(stderr, "ds4: qwen4exp GDN %s received invalid buffers\n",
                 label);
         return 0;
+    }
+
+    if (out_q8) {
+        const uint64_t qbytes = out_elements;
+        const uint64_t sbytes = (out_elements / 32u) * sizeof(float);
+        if (n_tokens > 7u || n_rows != 1u ||
+            (q_offset & 15u) || (s_offset & 15u) ||
+            q_offset > out_q8->bytes || s_offset > out_q8->bytes ||
+            out_q8->bytes - q_offset < qbytes ||
+            out_q8->bytes - s_offset < sbytes ||
+            !(q_offset + qbytes <= s_offset || s_offset + sbytes <= q_offset) ||
+            out_q8->ptr == out->ptr ||
+            ds4_tensor_device_idx(out_q8) != ds4_tensor_device_idx(out)) {
+            fprintf(stderr, "ds4: qwen4exp GDN %s received invalid Q8 scratch\n", label);
+            return 0;
+        }
     }
 
     /* The snapshots are optional and travel together: a caller that asks for
@@ -874,10 +920,21 @@ static int qwen4exp_cuda_gdn_run(
         return 0;
     }
 
-    qwen4exp_gdn_output_kernel<<<dim3(n_tokens, n_value_head, n_rows),
-                                 QWEN4EXP_GDN_DIM, 0, stream>>>(
-            (float *)out->ptr, (const float *)output_gate->ptr, output_norm,
+    if (out_q8) {
+        qwen4exp_gdn_output_kernel<true><<<dim3(n_tokens, n_value_head, n_rows),
+                QWEN4EXP_GDN_DIM, 0, stream>>>(
+            (float *)out->ptr,
+            (int8_t *)((char *)out_q8->ptr + q_offset),
+            (float *)((char *)out_q8->ptr + s_offset),
+            (const float *)output_gate->ptr, output_norm,
             n_value_head, n_rows, n_tokens, norm_eps);
+    } else {
+        qwen4exp_gdn_output_kernel<false><<<dim3(n_tokens, n_value_head, n_rows),
+                QWEN4EXP_GDN_DIM, 0, stream>>>(
+            (float *)out->ptr, NULL, NULL,
+            (const float *)output_gate->ptr, output_norm,
+            n_value_head, n_rows, n_tokens, norm_eps);
+    }
     return cuda_ok(cudaGetLastError(), "qwen4exp GDN output norm launch");
 }
 
@@ -912,7 +969,45 @@ extern "C" int ds4_gpu_qwen4exp_gdn_prefill(
         output_gate, conv_weight_slab, a_log_slab, dt_bias_slab,
         output_norm_slab,
         n_key_head, n_value_head, 1u, n_tokens, head_layout,
-        qk_norm_eps, norm_eps, "prefill");
+        qk_norm_eps, norm_eps, "prefill", NULL, 0, 0);
+}
+
+extern "C" int ds4_gpu_qwen4exp_gdn_prefill_q8(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *out_q8,
+        uint64_t              q_offset,
+        uint64_t              s_offset,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *conv_snapshot,
+        ds4_gpu_tensor       *state_snapshot,
+        uint32_t              n_snapshot_rows,
+        ds4_gpu_tensor       *qkv,
+        const ds4_gpu_tensor *raw_alpha,
+        const ds4_gpu_tensor *raw_beta,
+        const ds4_gpu_tensor *output_gate,
+        /* One slab per tensor: ssm_conv1d, ssm_a, ssm_dt.bias and ssm_norm are
+         * four GGUF tensors and a shard boundary can fall between any two of
+         * them.  Resolving them all through the convolution's mapping would
+         * read the right offsets out of the wrong file on a split set. */
+        const ds4_gpu_qwen4exp_slab *conv_weight_slab,
+        const ds4_gpu_qwen4exp_slab *a_log_slab,
+        const ds4_gpu_qwen4exp_slab *dt_bias_slab,
+        const ds4_gpu_qwen4exp_slab *output_norm_slab,
+        uint32_t              n_key_head,
+        uint32_t              n_value_head,
+        uint32_t              n_tokens,
+        uint32_t              head_layout,
+        float                 qk_norm_eps,
+        float                 norm_eps) {
+    if (!out_q8) return 0;
+    return qwen4exp_cuda_gdn_run(
+        out, conv_state, recurrent_state, conv_snapshot, state_snapshot,
+        n_snapshot_rows, qkv, raw_alpha, raw_beta,
+        output_gate, conv_weight_slab, a_log_slab, dt_bias_slab,
+        output_norm_slab,
+        n_key_head, n_value_head, 1u, n_tokens, head_layout,
+        qk_norm_eps, norm_eps, "quantized", out_q8, q_offset, s_offset);
 }
 
 extern "C" int ds4_gpu_qwen4exp_gdn_decode(
@@ -945,7 +1040,7 @@ extern "C" int ds4_gpu_qwen4exp_gdn_decode(
         output_gate, conv_weight_slab, a_log_slab, dt_bias_slab,
         output_norm_slab,
         n_key_head, n_value_head, n_rows, 1u, head_layout,
-        qk_norm_eps, norm_eps, "decode");
+        qk_norm_eps, norm_eps, "decode", NULL, 0, 0);
 }
 
 /* ------------------------------------------------------------------
@@ -5433,7 +5528,7 @@ __device__ __forceinline__ static float qwen4exp_hc_normed_value(
  * IEEE disagree about whether every value in the block quantizes to zero. */
 
 /* __frcp_rn(127.0f), the constant --use_fast_math folds `x / 127.0f` into. */
-#define QWEN4EXP_Q8_RCP127 0x1.020408p-7f   /* 0x3c010204 */
+/* QWEN4EXP_Q8_RCP127 is declared with the shared helper prototypes. */
 
 /* What .FTZ does to an operand and to a result: a denormal becomes a zero of
  * the same sign, everything else is left alone (NaN included). */
