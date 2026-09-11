@@ -2853,6 +2853,21 @@ int ds4_gpu_qwen4exp_shared_expert_tensor(
         const ds4_gpu_tensor        *x,
         uint32_t                     n_tokens);
 
+int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
+        ds4_gpu_tensor              *out,
+        ds4_gpu_tensor              *mid,
+        ds4_gpu_tensor              *gate_scale,
+        const ds4_gpu_qwen4exp_slab *router,
+        const ds4_gpu_qwen4exp_slab *gate,
+        const ds4_gpu_qwen4exp_slab *up,
+        const ds4_gpu_qwen4exp_slab *down,
+        uint32_t                     in_dim,
+        uint32_t                     mid_dim,
+        uint32_t                     out_dim,
+        const ds4_gpu_tensor        *x,
+        uint32_t                     n_tokens,
+        int                          pre_quantized);
+
 int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *mid,

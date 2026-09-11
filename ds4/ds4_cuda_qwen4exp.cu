@@ -4048,16 +4048,16 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             logical_tier, idx_bytes + pair_bytes + xq_bytes + mq_bytes);
     if (!base) return 0;
     qwen4exp_moe_scratch sc;
-    sc.counts = (int32_t *)base;
+    sc.xq = (int8_t *)base;
+    sc.xs = (float *)(base + (uint64_t)n_tokens * xgroups * 32u);
+    sc.xsum = (int32_t *)(sc.xs + (uint64_t)n_tokens * xgroups);
+    char *at = base + xq_bytes;
+    sc.counts = (int32_t *)at;
     sc.offsets = sc.counts + n_total_expert;
     sc.cursor = sc.offsets + n_total_expert;
     sc.active = sc.cursor + n_total_expert;
     sc.pairs = sc.active + n_total_expert + 1u;
-    char *at = base + idx_bytes + pair_bytes;
-    sc.xq = (int8_t *)at;
-    sc.xs = (float *)(at + (uint64_t)n_tokens * xgroups * 32u);
-    sc.xsum = (int32_t *)(sc.xs + (uint64_t)n_tokens * xgroups);
-    at += xq_bytes;
+    at += idx_bytes + pair_bytes;
     sc.mq = (int8_t *)at;
     sc.ms = (float *)(at + (uint64_t)n_pairs * mgroups * 32u);
     sc.msum = (int32_t *)(sc.ms + (uint64_t)n_pairs * mgroups);
@@ -4260,7 +4260,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     return cuda_ok(cudaGetLastError(), "qwen4exp MoE down launch");
 }
 
-extern "C" int ds4_gpu_qwen4exp_shared_expert_tensor(
+extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         ds4_gpu_tensor              *out,
         ds4_gpu_tensor              *mid,
         ds4_gpu_tensor              *gate_scale,
@@ -4272,7 +4272,8 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_tensor(
         uint32_t                     mid_dim,
         uint32_t                     out_dim,
         const ds4_gpu_tensor        *x,
-        uint32_t                     n_tokens) {
+        uint32_t                     n_tokens,
+        int                          pre_quantized) {
     if (!out || !mid || !gate_scale || !x ||
         !router_slab || !gate_slab || !up_slab || !down_slab ||
         !router_slab->map || !gate_slab->map || !up_slab->map || !down_slab->map ||
@@ -4328,23 +4329,25 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_tensor(
 
     const uint32_t xgroups = in_dim / 32u;
     const uint32_t mgroups = mid_dim / 32u;
+    const uint64_t xq_bytes = qwen4exp_quant_bytes(n_tokens, xgroups);
+    const uint64_t mq_bytes = qwen4exp_quant_bytes(n_tokens, mgroups);
     char *base = (char *)qwen4exp_group_scratch(
-            logical_tier,
-            qwen4exp_quant_bytes(n_tokens, xgroups) +
-            qwen4exp_quant_bytes(n_tokens, mgroups));
+            logical_tier, xq_bytes + mq_bytes);
     if (!base) return 0;
     int8_t *xq = (int8_t *)base;
     float *xs = (float *)(base + (uint64_t)n_tokens * xgroups * 32u);
     int32_t *xsum = (int32_t *)(xs + (uint64_t)n_tokens * xgroups);
-    char *at = base + qwen4exp_quant_bytes(n_tokens, xgroups);
+    char *at = base + xq_bytes;
     int8_t *mq = (int8_t *)at;
     float *ms = (float *)(at + (uint64_t)n_tokens * mgroups * 32u);
     int32_t *msum = (int32_t *)(ms + (uint64_t)n_tokens * mgroups);
 
-    if (!qwen4exp_quantize_rows(xq, xs, xsum, (const float *)x->ptr,
-                                n_tokens, in_dim, xgroups, in_dim, 0, 1,
-                                stream)) {
-        return 0;
+    if (!pre_quantized) {
+        if (!qwen4exp_quantize_rows(xq, xs, xsum, (const float *)x->ptr,
+                                    n_tokens, in_dim, xgroups, in_dim, 0, 1,
+                                    stream)) {
+            return 0;
+        }
     }
 
     const int tile = qwen4exp_moe_tile(n_tokens);
@@ -6915,3 +6918,21 @@ extern "C" int ds4_gpu_qwen4exp_ple_conv_tensor(
 
 #include "ds4_qwen4exp_hc_host.inc"
 #include "ds4_qwen4exp_ple_host.inc"
+
+extern "C" int ds4_gpu_qwen4exp_shared_expert_tensor(
+        ds4_gpu_tensor              *out,
+        ds4_gpu_tensor              *mid,
+        ds4_gpu_tensor              *gate_scale,
+        const ds4_gpu_qwen4exp_slab *router_slab,
+        const ds4_gpu_qwen4exp_slab *gate_slab,
+        const ds4_gpu_qwen4exp_slab *up_slab,
+        const ds4_gpu_qwen4exp_slab *down_slab,
+        uint32_t                     in_dim,
+        uint32_t                     mid_dim,
+        uint32_t                     out_dim,
+        const ds4_gpu_tensor        *x,
+        uint32_t                     n_tokens) {
+    return ds4_gpu_qwen4exp_shared_expert_preq_tensor(
+            out, mid, gate_scale, router_slab, gate_slab, up_slab, down_slab,
+            in_dim, mid_dim, out_dim, x, n_tokens, 0);
+}
