@@ -6514,7 +6514,28 @@ __global__ static void qwen4exp_qsa_attention_kernel(
                     const float4 *kv4 = (const float4 *)kv;
                     const float4 *qv4 = (const float4 *)qvec;
                     const uint32_t words = head_dim >> 2u;
-                    for (uint32_t w = 0; w < words; w++) {
+                    uint32_t w = 0;
+                    /* Same KSTEP prefetch the group kernel already uses:
+                     * issue several key words before consuming them, products
+                     * still in ascending word/channel order. */
+                    for (; w + 4u <= words;
+                           w += 4u) {
+                        float4 kk[4u];
+                        float4 qq[4u];
+#pragma unroll
+                        for (uint32_t i = 0; i < 4u; i++) {
+                            kk[i] = kv4[w + i];
+                            qq[i] = qv4[w + i];
+                        }
+#pragma unroll
+                        for (uint32_t i = 0; i < 4u; i++) {
+                            dot += qq[i].x * kk[i].x;
+                            dot += qq[i].y * kk[i].y;
+                            dot += qq[i].z * kk[i].z;
+                            dot += qq[i].w * kk[i].w;
+                        }
+                    }
+                    for (; w < words; w++) {
                         const float4 kk = kv4[w];
                         const float4 qq = qv4[w];
                         dot += qq.x * kk.x;
@@ -6565,6 +6586,43 @@ __global__ static void qwen4exp_qsa_attention_kernel(
              * and the skip below cannot fire; the sparse path keeps the
              * one-at-a-time walk, whose `continue` is load bearing. */
             if (!sparse) {
+                /* Eight value rows in flight: same ascending product order as
+                 * the four-wide tip path, twice the outstanding loads on the
+                 * longest dependency chain. Remainder falls through below. */
+                for (; j + 8u <= n_in_tile; j += 8u) {
+                    const float *v0 = v_cache +
+                        (uint64_t)keys[j] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float *v1 = v_cache +
+                        (uint64_t)keys[j + 1u] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float *v2 = v_cache +
+                        (uint64_t)keys[j + 2u] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float *v3 = v_cache +
+                        (uint64_t)keys[j + 3u] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float *v4 = v_cache +
+                        (uint64_t)keys[j + 4u] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float *v5 = v_cache +
+                        (uint64_t)keys[j + 5u] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float *v6 = v_cache +
+                        (uint64_t)keys[j + 6u] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float *v7 = v_cache +
+                        (uint64_t)keys[j + 7u] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float a0 = v0[tid];
+                    const float a1 = v1[tid];
+                    const float a2 = v2[tid];
+                    const float a3 = v3[tid];
+                    const float a4 = v4[tid];
+                    const float a5 = v5[tid];
+                    const float a6 = v6[tid];
+                    const float a7 = v7[tid];
+                    contrib += probs[j] * a0;
+                    contrib += probs[j + 1u] * a1;
+                    contrib += probs[j + 2u] * a2;
+                    contrib += probs[j + 3u] * a3;
+                    contrib += probs[j + 4u] * a4;
+                    contrib += probs[j + 5u] * a5;
+                    contrib += probs[j + 6u] * a6;
+                    contrib += probs[j + 7u] * a7;
+                }
                 for (; j + 4u <= n_in_tile; j += 4u) {
                     const float *v0 = v_cache +
                         (uint64_t)keys[j] * kv_stride + (uint64_t)kv_head * head_dim;
@@ -6845,16 +6903,42 @@ __global__ static void qwen4exp_qsa_attention_group_kernel(
             float contrib[GROUP];
 #pragma unroll
             for (uint32_t h = 0; h < GROUP; h++) contrib[h] = 0.0f;
-            for (uint32_t j = 0; j < n_in_tile; j++) {
-                const int32_t kj = keys[j];
-                if (kj < 0) continue;
-                /* One V channel read for the whole group, where the per-head
-                 * kernel read the same address once per head. */
-                const float vvj = v_cache[
-                    (uint64_t)kj * kv_stride + (uint64_t)kv_head * head_dim + tid];
+            {
+                uint32_t j = 0;
+                /* Dense path: four V rows in flight, same ascending j order.
+                 * Sparse keeps the skip-bearing one-at-a-time walk. */
+                if (!sparse) {
+                    for (; j + 4u <= n_in_tile; j += 4u) {
+                        const float vv0 = v_cache[
+                            (uint64_t)keys[j] * kv_stride +
+                            (uint64_t)kv_head * head_dim + tid];
+                        const float vv1 = v_cache[
+                            (uint64_t)keys[j + 1u] * kv_stride +
+                            (uint64_t)kv_head * head_dim + tid];
+                        const float vv2 = v_cache[
+                            (uint64_t)keys[j + 2u] * kv_stride +
+                            (uint64_t)kv_head * head_dim + tid];
+                        const float vv3 = v_cache[
+                            (uint64_t)keys[j + 3u] * kv_stride +
+                            (uint64_t)kv_head * head_dim + tid];
 #pragma unroll
-                for (uint32_t h = 0; h < GROUP; h++) {
-                    contrib[h] = __fmaf_rn(probs[h * nth + j], vvj, contrib[h]);
+                        for (uint32_t h = 0; h < GROUP; h++) {
+                            contrib[h] = __fmaf_rn(probs[h * nth + j], vv0, contrib[h]);
+                            contrib[h] = __fmaf_rn(probs[h * nth + j + 1u], vv1, contrib[h]);
+                            contrib[h] = __fmaf_rn(probs[h * nth + j + 2u], vv2, contrib[h]);
+                            contrib[h] = __fmaf_rn(probs[h * nth + j + 3u], vv3, contrib[h]);
+                        }
+                    }
+                }
+                for (; j < n_in_tile; j++) {
+                    const int32_t kj = keys[j];
+                    if (kj < 0) continue;
+                    const float vvj = v_cache[
+                        (uint64_t)kj * kv_stride + (uint64_t)kv_head * head_dim + tid];
+#pragma unroll
+                    for (uint32_t h = 0; h < GROUP; h++) {
+                        contrib[h] = __fmaf_rn(probs[h * nth + j], vvj, contrib[h]);
+                    }
                 }
             }
 #pragma unroll
