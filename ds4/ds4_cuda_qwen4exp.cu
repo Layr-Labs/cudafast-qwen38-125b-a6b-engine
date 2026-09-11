@@ -6434,6 +6434,11 @@ __global__ static void qwen4exp_qsa_indexer_select_kernel(
     if (tid == 0u) counts[token] = (int32_t)total;
 }
 
+/* Key words a lane asks for before it consumes any of them, so several key
+ * loads are outstanding at once.  A scheduling number: it changes how many
+ * loads are in flight, not which products land in which accumulator. */
+#define QWEN4EXP_QSA_KSTEP 4u
+
 __global__ static void qwen4exp_qsa_attention_kernel(
         const float *q,
         const float *k_cache,
@@ -6514,7 +6519,28 @@ __global__ static void qwen4exp_qsa_attention_kernel(
                     const float4 *kv4 = (const float4 *)kv;
                     const float4 *qv4 = (const float4 *)qvec;
                     const uint32_t words = head_dim >> 2u;
-                    for (uint32_t w = 0; w < words; w++) {
+                    uint32_t w = 0;
+                    /* Same KSTEP latency-hiding as the group kernel: ask for
+                     * several key words before consuming any. Product order
+                     * stays w ascending, x then y then z then w within each
+                     * word — bit-identical to the one-word walk. */
+                    for (; w + QWEN4EXP_QSA_KSTEP <= words;
+                           w += QWEN4EXP_QSA_KSTEP) {
+                        float4 kk[QWEN4EXP_QSA_KSTEP];
+#pragma unroll
+                        for (uint32_t i = 0; i < QWEN4EXP_QSA_KSTEP; i++) {
+                            kk[i] = kv4[w + i];
+                        }
+#pragma unroll
+                        for (uint32_t i = 0; i < QWEN4EXP_QSA_KSTEP; i++) {
+                            const float4 qq = qv4[w + i];
+                            dot += qq.x * kk[i].x;
+                            dot += qq.y * kk[i].y;
+                            dot += qq.z * kk[i].z;
+                            dot += qq.w * kk[i].w;
+                        }
+                    }
+                    for (; w < words; w++) {
                         const float4 kk = kv4[w];
                         const float4 qq = qv4[w];
                         dot += qq.x * kk.x;
@@ -6681,11 +6707,6 @@ __global__ static void qwen4exp_qsa_attention_kernel(
  * group shares them unchanged.  GROUP must divide n_head / n_kv_head, which
  * puts all GROUP heads under one `kv_head`.
  */
-/* Key words a lane asks for before it consumes any of them, so several key
- * loads are outstanding at once.  A scheduling number: it changes how many
- * loads are in flight, not which products land in which accumulator. */
-#define QWEN4EXP_QSA_KSTEP 4u
-
 template <uint32_t GROUP>
 __global__ static void qwen4exp_qsa_attention_group_kernel(
         const float *q,
