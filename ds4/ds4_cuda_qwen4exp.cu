@@ -6482,6 +6482,11 @@ __global__ static void qwen4exp_qsa_attention_kernel(
     const uint32_t p0 = d_pos ? *d_pos : pos0;
     const uint32_t pos = p0 + token;
     const uint32_t count = sparse ? (uint32_t)counts[token] : pos + 1u;
+    /* The normal dense contract satisfies both bounds.  Keep the staged-key
+     * path for a dynamic device position outside it, so direct addressing can
+     * neither turn the old int32 key negative nor read beyond the cache. */
+    const bool dense_direct = !sparse && count <= cache_cap &&
+                              count <= (uint32_t)INT32_MAX;
     const uint32_t kv_head = head / (n_head / n_kv_head);
     const uint32_t kv_stride = n_kv_head * head_dim;
 
@@ -6548,7 +6553,11 @@ __global__ static void qwen4exp_qsa_attention_kernel(
                 key = -1;
             }
         }
-        keys[tid] = key;
+        /* Sparse positions need their selected key after the score reduction.
+         * A dense position is exactly base + tid, so publishing that identity
+         * to shared memory only to read it back in the value pass is wasted
+         * traffic. */
+        if (!dense_direct) keys[tid] = key;
         tile[tid] = score;
         const float tile_max = qwen4exp_blk_max(tile, tid, nth);
         const float new_max = fmaxf(run_max, tile_max);
@@ -6577,27 +6586,25 @@ __global__ static void qwen4exp_qsa_attention_kernel(
              *
              * The batch runs on the DENSE path only.  There every key in
              * [0, n_in_tile) is `base + j`, which the tile bound already keeps
-             * inside `count` and `cache_cap`, so `keys[j]` is never negative
-             * and the skip below cannot fire; the sparse path keeps the
-             * one-at-a-time walk, whose `continue` is load bearing. */
-            if (!sparse) {
+             * inside `count` and `cache_cap`.  Form that index directly rather
+             * than loading the copy formerly staged in `keys`.  Consecutive
+             * rows are one `kv_stride` apart, so the eight pointers advance
+             * from v0 instead of multiplying eight separately selected keys.
+             * The sparse path keeps the one-at-a-time walk, whose `continue`
+             * is load bearing. */
+            if (dense_direct) {
+                const float *dense_values = v_cache +
+                    (uint64_t)base * kv_stride +
+                    (uint64_t)kv_head * head_dim;
                 for (; j + 8u <= n_in_tile; j += 8u) {
-                    const float *v0 = v_cache +
-                        (uint64_t)keys[j] * kv_stride + (uint64_t)kv_head * head_dim;
-                    const float *v1 = v_cache +
-                        (uint64_t)keys[j + 1u] * kv_stride + (uint64_t)kv_head * head_dim;
-                    const float *v2 = v_cache +
-                        (uint64_t)keys[j + 2u] * kv_stride + (uint64_t)kv_head * head_dim;
-                    const float *v3 = v_cache +
-                        (uint64_t)keys[j + 3u] * kv_stride + (uint64_t)kv_head * head_dim;
-                    const float *v4 = v_cache +
-                        (uint64_t)keys[j + 4u] * kv_stride + (uint64_t)kv_head * head_dim;
-                    const float *v5 = v_cache +
-                        (uint64_t)keys[j + 5u] * kv_stride + (uint64_t)kv_head * head_dim;
-                    const float *v6 = v_cache +
-                        (uint64_t)keys[j + 6u] * kv_stride + (uint64_t)kv_head * head_dim;
-                    const float *v7 = v_cache +
-                        (uint64_t)keys[j + 7u] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float *v0 = dense_values + (uint64_t)j * kv_stride;
+                    const float *v1 = v0 + kv_stride;
+                    const float *v2 = v1 + kv_stride;
+                    const float *v3 = v2 + kv_stride;
+                    const float *v4 = v3 + kv_stride;
+                    const float *v5 = v4 + kv_stride;
+                    const float *v6 = v5 + kv_stride;
+                    const float *v7 = v6 + kv_stride;
                     const float a0 = v0[tid];
                     const float a1 = v1[tid];
                     const float a2 = v2[tid];
@@ -6615,13 +6622,19 @@ __global__ static void qwen4exp_qsa_attention_kernel(
                     contrib += probs[j + 6u] * a6;
                     contrib += probs[j + 7u] * a7;
                 }
-            }
-            for (; j < n_in_tile; j++) {
-                const int32_t kj = keys[j];
-                if (kj < 0) continue;
-                const float *vv = v_cache +
-                    (uint64_t)kj * kv_stride + (uint64_t)kv_head * head_dim;
-                contrib += probs[j] * vv[tid];
+                for (; j < n_in_tile; j++) {
+                    const float *vv = dense_values + (uint64_t)j * kv_stride;
+                    contrib += probs[j] * vv[tid];
+                }
+            } else {
+                for (; j < n_in_tile; j++) {
+                    const int32_t kj = keys[j];
+                    if (kj < 0) continue;
+                    const float *vv = v_cache +
+                        (uint64_t)kj * kv_stride +
+                        (uint64_t)kv_head * head_dim;
+                    contrib += probs[j] * vv[tid];
+                }
             }
             acc = acc * rescale + contrib;
         }
