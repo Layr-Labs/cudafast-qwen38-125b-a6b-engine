@@ -3094,6 +3094,79 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
     }
 }
 
+/* Same split as the routed Q4 gate/up path, for the shared expert at the
+ * R=2 tile (one-row decode and two-row verify). Production shared gate/up is
+ * Q8_0; Q4_K is retained for the MoE exactness suite. Even warps own gate and
+ * odd warps own up for one output row; completed scalars meet in shared memory
+ * and the even warp applies the unchanged SiLU*up product. Prefill widths keep
+ * the staged / MMA paths (those win above ~12–64 tokens). */
+template <int R, int Type>
+__global__ static void qwen4exp_shared_gateup_split_kernel(
+        float *mid,
+        const char *gate,
+        const char *up,
+        const int8_t *xq,
+        const float *xs,
+        const int32_t *xsum,
+        uint64_t gate_row_bytes,
+        uint64_t up_row_bytes,
+        uint32_t gate_type,
+        uint32_t up_type,
+        uint32_t groups,
+        uint32_t mid_dim,
+        uint32_t n_tokens) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t row = blockIdx.x * 4u + (warp >> 1u);
+    const uint32_t tok0 = blockIdx.y * (uint32_t)R;
+    const bool live = row < mid_dim && tok0 < n_tokens;
+    const bool second = (warp & 1u) != 0u;
+    if (tok0 >= n_tokens) return;
+    const uint32_t take = n_tokens - tok0 < (uint32_t)R ? n_tokens - tok0
+                                                        : (uint32_t)R;
+    const char *weight_row = (second ? up : gate) +
+        (uint64_t)(live ? row : 0u) * (second ? up_row_bytes : gate_row_bytes);
+    __shared__ float projected[R][8];
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) acc[r] = 0.0f;
+    if (live) {
+        for (uint32_t g = lane; g < groups; g += 32u) {
+            int8_t wq[32]; float wa[2], wb[2]; int halves = 1;
+            (void)gate_type; (void)up_type;
+            dev_qwen4exp_group_decode((uint32_t)Type, weight_row, g,
+                                      wq, wa, wb, &halves);
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                if ((uint32_t)r < take) {
+                    const uint64_t at_g =
+                        (uint64_t)(tok0 + (uint32_t)r) * groups + g;
+                    qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves,
+                        xq + at_g * 32u, xs[at_g], xsum[at_g]);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; r++) {
+        const float v = warp_sum_f32(acc[r]);
+        if (lane == 0u) projected[r][warp] = v;
+    }
+    __syncthreads();
+    if (live && !second && lane == 0u) {
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            if ((uint32_t)r < take) {
+                const float g = projected[r][warp];
+                const float u = projected[r][warp + 1u];
+                mid[(uint64_t)(tok0 + (uint32_t)r) * mid_dim + row] =
+                    (g / (1.0f + expf(-g))) * u;
+            }
+        }
+    }
+    __syncthreads();
+}
+
 template <int R>
 __global__ static void qwen4exp_shared_down_q_kernel(
         float *out,
@@ -4994,7 +5067,26 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
             (float *)mid->ptr, gate, up, xq, xs, xsum, \
             gate_slab->row_bytes, up_slab->row_bytes, \
             gate_slab->type, up_slab->type, xgroups, mid_dim, n_tokens)
-    if (tile == 8) { QWEN4EXP_SH_GATEUP(8); }
+    if (n_tokens <= 2u && tile == 2 &&
+        getenv("DS4_QWEN4EXP_NO_SPLIT_GATEUP") == NULL &&
+        gate_slab->type == up_slab->type &&
+        (gate_slab->type == DS4_QWEN4EXP_TY_q8_0 ||
+         gate_slab->type == DS4_QWEN4EXP_TY_q4_K)) {
+        if (gate_slab->type == DS4_QWEN4EXP_TY_q8_0) {
+            qwen4exp_shared_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q8_0><<<
+                dim3((mid_dim + 3u) / 4u, tiles, 1), threads, 0, stream>>>(
+                (float *)mid->ptr, gate, up, xq, xs, xsum,
+                gate_slab->row_bytes, up_slab->row_bytes,
+                gate_slab->type, up_slab->type, xgroups, mid_dim, n_tokens);
+        } else {
+            qwen4exp_shared_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K><<<
+                dim3((mid_dim + 3u) / 4u, tiles, 1), threads, 0, stream>>>(
+                (float *)mid->ptr, gate, up, xq, xs, xsum,
+                gate_slab->row_bytes, up_slab->row_bytes,
+                gate_slab->type, up_slab->type, xgroups, mid_dim, n_tokens);
+        }
+    }
+    else if (tile == 8) { QWEN4EXP_SH_GATEUP(8); }
     else if (tile == 4) { QWEN4EXP_SH_GATEUP(4); }
     else if (tile == 2) { QWEN4EXP_SH_GATEUP(2); }
     else { QWEN4EXP_SH_GATEUP(1); }
