@@ -31,6 +31,23 @@ static uint64_t qwen4exp_qsa_split_max_count(void) {
         ? max_selected : (uint64_t)DS4_N_INDEXER_TOP_K;
 }
 
+/* Mirror the CUDA split kernel's public sizing query in the graph planner.
+ * Keeping this arithmetic local makes the session plan available to the
+ * maintained DS4_NO_GPU parser while preserving the identical GPU layout. */
+static uint64_t qwen4exp_qsa_split_plan_bytes(
+        uint32_t n_tokens, uint32_t n_head, uint32_t head_dim,
+        uint32_t max_count) {
+    uint32_t nth = 1u;
+    while (nth * 2u <= head_dim && nth * 2u <= 1024u) nth *= 2u;
+    if (n_tokens == 0u || n_head == 0u || max_count == 0u ||
+        nth != head_dim || nth < 32u || (head_dim & 31u) != 0u) {
+        return 0u;
+    }
+    const uint64_t tiles = ((uint64_t)max_count + nth - 1u) / nth;
+    return (uint64_t)n_tokens * n_head * tiles * (2ull * nth + 2ull) *
+           sizeof(float);
+}
+
 void ds4_qwen4exp_session_plan_compute(ds4_qwen4exp_session_plan *plan,
                                        uint32_t n_ctx,
                                        uint32_t n_batch) {
@@ -132,7 +149,7 @@ void ds4_qwen4exp_session_plan_compute(ds4_qwen4exp_session_plan *plan,
      * runs once over the whole chain instead of once per row afterwards. */
     act += (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * cfg->n_vocab * f;
     plan->activation_bytes = act;
-    act += ds4_gpu_qwen4exp_qsa_split_scratch_bytes(
+    act += qwen4exp_qsa_split_plan_bytes(
         (uint32_t)qwen4exp_qsa_split_rows(B), DS4_N_HEAD, DS4_N_HEAD_DIM,
         (uint32_t)qwen4exp_qsa_split_max_count());
     plan->activation_bytes = act;
@@ -750,7 +767,7 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
     s->qsa_gate    = qwen4exp_alloc_zeroed(B * q_width * f, &ok);
     s->qsa_out     = qwen4exp_alloc_zeroed(B * q_width * f, &ok);
     {
-        const uint64_t split_bytes = ds4_gpu_qwen4exp_qsa_split_scratch_bytes(
+        const uint64_t split_bytes = qwen4exp_qsa_split_plan_bytes(
             (uint32_t)qwen4exp_qsa_split_rows(B), DS4_N_HEAD, DS4_N_HEAD_DIM,
             (uint32_t)qwen4exp_qsa_split_max_count());
         s->qsa_split = split_bytes ? qwen4exp_alloc_zeroed(split_bytes, &ok) : NULL;
