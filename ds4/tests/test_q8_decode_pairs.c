@@ -76,7 +76,38 @@ static void check_shape(uint64_t in, uint64_t out, uint64_t offset) {
             }
         }
     }
-    printf("Q8 %llu->%llu offset %llu: 5 widths and output canaries exact\n",
+    /* Captured paired reads must see changed inputs at both decode widths.
+     * Compare each replay with a fresh eager one-row-order reference. */
+    const float magnitudes[] = {1.0f, 1e-30f, 1e-37f, 1e10f};
+    ds4_gpu_decode_graphs_invalidate();
+    for (uint32_t n = 1u; n <= 2u; n++) {
+        ds4_decode_graph_key key = {.il = 1u, .island = n - 1u, .variant = n};
+        require(ds4_gpu_decode_graph_begin(&key) == -1, "graph warmup");
+        require(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+            yt, model, bytes, offset, in, out, xt, n), "warm projection");
+        require(ds4_gpu_decode_graph_begin(&key) == 0, "graph capture");
+        require(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+            yt, model, bytes, offset, in, out, xt, n), "captured projection");
+        require(ds4_gpu_decode_graph_end(&key) == 0, "graph capture end");
+        for (unsigned m = 0; m < 4u; m++) {
+            for (size_t i = 0; i < xn; i++)
+                x[i] = ((int32_t)(next_word() % 2001u) - 1000) *
+                       0.001f * magnitudes[m];
+            require(ds4_gpu_tensor_write(xt, 0, x, xn * sizeof(float)), "changed input");
+            require(setenv("DS4_QWEN4EXP_NO_ROW_TILE", "1", 1) == 0, "reference dispatch");
+            require(ds4_gpu_tensor_write(yt, 0, poison, ybytes), "eager canaries");
+            require(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+                yt, model, bytes, offset, in, out, xt, n), "eager reference");
+            require(ds4_gpu_tensor_read(yt, 0, reference, ybytes), "eager read");
+            require(unsetenv("DS4_QWEN4EXP_NO_ROW_TILE") == 0, "replay dispatch");
+            require(ds4_gpu_tensor_write(yt, 0, poison, ybytes), "replay canaries");
+            require(ds4_gpu_decode_graph_begin(&key) == 1, "graph replay");
+            require(ds4_gpu_tensor_read(yt, 0, got, ybytes), "replay read");
+            require(memcmp(reference, got, ybytes) == 0, "changed-input graph mismatch");
+        }
+    }
+    ds4_gpu_decode_graphs_invalidate();
+    printf("Q8 %llu->%llu offset %llu: 5 widths and 8 changed-input graph replays exact\n",
            (unsigned long long)in, (unsigned long long)out,
            (unsigned long long)offset);
     ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(yt);
@@ -86,18 +117,20 @@ static void check_shape(uint64_t in, uint64_t out, uint64_t offset) {
 }
 
 int main(void) {
+    require(setenv("DS4_CUDA_DECODE_GRAPHS", "1", 1) == 0, "enable test graphs");
     const char *old = getenv("DS4_QWEN4EXP_NO_ROW_TILE");
     char *saved = old ? strdup(old) : NULL;
     require(!old || saved, "environment copy");
     const uint64_t shapes[][3] = {
         {33, 37, 64}, {63, 19, 66}, {96, 515, 64}, {1056, 519, 66},
-        {320, 10240, 64}, {10240, 320, 64}, {2560, 6144, 64},
+        {320, 10240, 64}, {320, 10240, 66}, {10240, 320, 64}, {10240, 320, 66},
+        {2560, 6144, 64},
         {2560, 10240, 66}, {6144, 2560, 64}, {2560, 248320, 64},
     };
     for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++)
         check_shape(shapes[i][0], shapes[i][1], shapes[i][2]);
     if (saved) { setenv("DS4_QWEN4EXP_NO_ROW_TILE", saved, 1); free(saved); }
     else unsetenv("DS4_QWEN4EXP_NO_ROW_TILE");
-    puts("Q8 decode pairs: all 50 cases passed");
+    puts("Q8 decode pairs: all 60 eager cases and 96 graph replays passed");
     return 0;
 }

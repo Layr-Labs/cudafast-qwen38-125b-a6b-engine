@@ -5684,7 +5684,7 @@ __global__ static void matmul_q8_0_preq_rows_exact_tile_kernel(
 /* Two adjacent lanes share a Q8 group. Their integer partials may be
  * combined freely; each even lane keeps its original float group chain.
  * Shared memory remaps the 32 finished chains onto one reduction warp. */
-template <int R>
+template <int R, bool Streaming = true>
 __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
         float *out, const unsigned char *w,
         const int8_t *xq, const float *xscale,
@@ -5713,17 +5713,23 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
             const uintptr_t address = (uintptr_t)payload;
             const uint32_t shift = (uint32_t)(address & 3u) * 8u;
             const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
-            uint32_t previous = words[0];
+            /* Weights stream through each projection once. Mark their reads
+             * evict-first while leaving the reusable activation loads alone. */
+            uint32_t previous = Streaming ? __ldcs(words) : words[0];
             int32_t wq[4];
 #pragma unroll
             for (int j = 0; j < 3; j++) {
-                const uint32_t next = words[j + 1];
+                const uint32_t next = Streaming ? __ldcs(words + j + 1) : words[j + 1];
                 wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
                 previous = next;
             }
-            const uint16_t last = *(const uint16_t *)(const void *)(payload + 14);
+            const uint16_t *lastp = (const uint16_t *)(const void *)(payload + 14);
+            const uint16_t last = Streaming ? __ldcs(lastp) : *lastp;
             wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
-            const float ws = __half2float(*(const __half *)(wr + b * 34u));
+            const __half *scale = (const __half *)(wr + b * 34u);
+            const float ws = Streaming
+                ? __half2float(__ushort_as_half(__ldcs((const uint16_t *)scale)))
+                : __half2float(*scale);
 #pragma unroll
             for (int r = 0; r < R; r++) {
                 if ((uint32_t)r < take) {
@@ -5752,6 +5758,122 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
             if (local_lane == 0u && row < out_dim && (uint32_t)r < take)
                 out[((uint64_t)row0 + r) * out_dim + row] = total;
         }
+    }
+}
+
+/* HC down has only 320 outputs. Two lanes per group expose more integer
+ * work while one 64-thread block owns each output. Retain all 32 original
+ * float chains and their reduction tree; only the integer dot is split.
+ * The two-token verifier benefits; one-token calls keep the original warp. */
+__global__ static void matmul_q8_hc_down_pair_kernel(
+        float *out, const unsigned char *w, const int8_t *xq,
+        const float *xs, uint32_t rows) {
+    constexpr unsigned L = 2u;
+    const unsigned group = threadIdx.x / L;
+    const unsigned part = threadIdx.x % L;
+    const uint64_t row = blockIdx.x;
+    float acc[2] = {0.0f, 0.0f};
+    for (unsigned b = group; b < 320u; b += 32u) {
+        const unsigned char *blk = w + row * 10880u + b * 34u;
+        const unsigned char *payload = blk + 2u + part * (32u / L);
+        const uintptr_t address = (uintptr_t)payload;
+        const unsigned shift = (address & 3u) * 8u;
+        const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
+        uint32_t previous = words[0];
+        int32_t wq[8/L];
+#pragma unroll
+        for (int j = 0; j < 8/L - 1; j++) {
+            const uint32_t next = words[j + 1];
+            wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
+            previous = next;
+        }
+        const uint16_t last = *(const uint16_t *)(payload + 32u/L - 2u);
+        wq[8/L - 1] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
+        float ws = 0.0f;
+        if (part == 0u) ws = __half2float(*(const __half *)blk);
+#pragma unroll
+        for (unsigned r = 0; r < 2u; r++) {
+            if (r < rows) {
+                const unsigned at = r * 320u + b;
+                const int32_t *xw = (const int32_t *)(xq + at * 32u + part * (32u/L));
+                int dot = 0;
+#pragma unroll
+                for (int j = 0; j < 8/L; j++) dot = __dp4a(wq[j], xw[j], dot);
+#pragma unroll
+                for (int d = 1; d < L; d *= 2)
+                    dot += __shfl_xor_sync(0xffffffffu, dot, d);
+                if (part == 0u) acc[r] += ws * xs[at] * (float)dot;
+            }
+        }
+    }
+    __shared__ float partial[2][32];
+    if (part == 0u) {
+        partial[0][group] = acc[0];
+        partial[1][group] = acc[1];
+    }
+    __syncthreads();
+    if (threadIdx.x < 32u) {
+#pragma unroll
+        for (unsigned r = 0; r < 2u; r++) {
+            const float total = warp_sum_f32(partial[r][threadIdx.x]);
+            if (threadIdx.x == 0u && r < rows) out[r * 320u + row] = total;
+        }
+    }
+}
+
+/* HC up has ten Q8 groups. Pair lanes within one warp and retain the
+ * original zero-padded 32-chain tree, without a shared-memory remap. */
+template<int R>
+__global__ static void matmul_q8_hc_warp_pair_kernel(
+        float *out, const unsigned char *w,
+        const int8_t *xq, const float *xs, uint64_t out_dim, uint32_t rows) {
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned group = lane >> 1u, half = lane & 1u;
+    const uint64_t row = (uint64_t)blockIdx.x * 4u + (threadIdx.x >> 5u);
+    if (row >= out_dim) return;
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) acc[r] = 0.0f;
+    if (group < 10u) {
+        const unsigned char *blk = w + row * 340u + group * 34u;
+        const unsigned char *payload = blk + 2u + half * 16u;
+        const uintptr_t address = (uintptr_t)payload;
+        const unsigned shift = (address & 3u) * 8u;
+        const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
+        uint32_t previous = words[0];
+        int32_t wq[4];
+#pragma unroll
+        for (int j = 0; j < 3; j++) {
+            const uint32_t next = words[j + 1];
+            wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
+            previous = next;
+        }
+        const uint16_t last = *(const uint16_t *)(const void *)(payload + 14u);
+        wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
+        const float ws = __half2float(*(const __half *)blk);
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            if ((unsigned)r < rows) {
+                const unsigned at = (unsigned)r * 10u + group;
+                const int32_t *xw = (const int32_t *)(xq + at * 32u + half * 16u);
+                int dot = 0;
+#pragma unroll
+                for (int j = 0; j < 4; j++) dot = __dp4a(wq[j], xw[j], dot);
+                dot += __shfl_xor_sync(0x000fffffu, dot, 1);
+                if (!half) acc[r] += ws * xs[at] * (float)dot;
+            }
+        }
+    }
+    /* Original chains 16..31 are zero. Chains 0..15 now occupy the even
+     * lanes; original strides 8,4,2,1 become physical strides 16,8,4,2. */
+#pragma unroll
+    for (int r = 0; r < R; r++) {
+        acc[r] = acc[r] + 0.0f;
+#pragma unroll
+        for (int d = 16; d >= 2; d >>= 1)
+            acc[r] += __shfl_down_sync(0xffffffffu, acc[r], d);
+        if (lane == 0u && (unsigned)r < rows)
+            out[(uint64_t)r * out_dim + row] = acc[r];
     }
 }
 
@@ -16557,33 +16679,70 @@ static int cuda_matmul_q8_0_preq_rows_exact(
 #undef DS4_Q8_DENSE_MMA_LAUNCH
 
     const int use_dp4a = cuda_q8_use_dp4a();
+    if (use_dp4a && n_rows == 2u && in_dim == 10240u && out_dim == 320u &&
+        getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
+        getenv("DS4_Q8_NO_HC_DOWN_PAIR") == NULL &&
+        (((uintptr_t)wptr & 1u) == 0u)) {
+        matmul_q8_hc_down_pair_kernel<<<320, 64, 0, cuda_decode_stream()>>>(
+                (float *)out->ptr, (const unsigned char *)wptr,
+                xq, xscale, n_rows);
+        return cuda_ok(cudaGetLastError(), "q8 HC down pair launch");
+    }
     /* Two lanes read each full group at one/two-row decode widths. Integer
      * partials combine exactly, then the original 32 float chains and warp
-     * tree are restored. Wider calls and partial groups keep their kernels.
-     *
-     * R matches the CALL width: the row slot is a compile-time loop, so an
-     * R = 2 instantiation run at one row still issues the second row's weight
-     * loads and funnelshifts before `take == 1` discards them.  A one-row call
-     * therefore gets the R = 1 instantiation, whose per-row arithmetic, even
-     * lane chain and reduction tree are identical -- row 0 is computed by the
-     * same code either way, and row 1 is never written when take == 1. */
+     * tree are restored. Wider calls and partial groups keep their kernels. */
     if (use_dp4a && n_rows <= 2u && out_dim > 512u && (in_dim & 31u) == 0u &&
         getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
         (((uintptr_t)wptr & 1u) == 0u)) {
-        const bool one_row = n_rows == 1u &&
-            getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL;
-        if (one_row) {
-            matmul_q8_0_preq_pair_lanes_kernel<1><<<
-                    dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u),
-                    256, 0, cuda_decode_stream()>>>(
-                    (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
-                    out_dim, n_rows, blocks);
+        if (in_dim == 320u && out_dim == 10240u) {
+            const bool one_row = n_rows == 1u &&
+                getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL;
+            if (getenv("DS4_Q8_NO_HC_WARP_PAIR") == NULL) {
+                if (one_row) {
+                    matmul_q8_hc_warp_pair_kernel<1><<<
+                        (unsigned)((out_dim + 3u) / 4u), 128, 0,
+                        cuda_decode_stream()>>>(
+                        (float *)out->ptr, (const unsigned char *)wptr,
+                        xq, xscale, out_dim, n_rows);
+                } else {
+                    matmul_q8_hc_warp_pair_kernel<2><<<
+                        (unsigned)((out_dim + 3u) / 4u), 128, 0,
+                        cuda_decode_stream()>>>(
+                        (float *)out->ptr, (const unsigned char *)wptr,
+                        xq, xscale, out_dim, n_rows);
+                }
+            } else {
+                if (one_row) {
+                    matmul_q8_0_preq_pair_lanes_kernel<1, false><<<
+                        dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u),
+                        256, 0, cuda_decode_stream()>>>(
+                        (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
+                        out_dim, n_rows, blocks);
+                } else {
+                    matmul_q8_0_preq_pair_lanes_kernel<2, false><<<
+                        dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u),
+                        256, 0, cuda_decode_stream()>>>(
+                        (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
+                        out_dim, n_rows, blocks);
+                }
+            }
         } else {
-            matmul_q8_0_preq_pair_lanes_kernel<2><<<
-                    dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u),
-                    256, 0, cuda_decode_stream()>>>(
-                    (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
-                    out_dim, n_rows, blocks);
+            /* Retain the promoted call-width specialization for the
+             * general dense projections. The HC warp geometry above is
+             * independent of this two-warp kernel's token-row bound. */
+            if (n_rows == 1u && getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL) {
+                matmul_q8_0_preq_pair_lanes_kernel<1, false><<<
+                        dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u),
+                        256, 0, cuda_decode_stream()>>>(
+                        (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
+                        out_dim, n_rows, blocks);
+            } else {
+                matmul_q8_0_preq_pair_lanes_kernel<2, false><<<
+                        dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u),
+                        256, 0, cuda_decode_stream()>>>(
+                        (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
+                        out_dim, n_rows, blocks);
+            }
         }
         return cuda_ok(cudaGetLastError(), "q8 pair lanes launch");
     }
