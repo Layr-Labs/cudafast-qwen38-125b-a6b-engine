@@ -6548,12 +6548,12 @@ __global__ static void qwen4exp_qsa_attention_kernel(
         if (tid < head_dim) {
             float contrib = 0.0f;
             uint32_t j = 0;
-            /* FOUR VALUE ROWS IN FLIGHT AT A TIME.  This loop is the longest
+            /* EIGHT VALUE ROWS IN FLIGHT AT A TIME.  This loop is the longest
              * dependency chain in the kernel: one global load per key, each
              * add waiting on the one before it, up to nth keys per tile.  The
              * loads coalesce across `tid` already, so what is left to win is
-             * how many are in flight, and issuing four before the first
-             * product covers four times the latency.
+             * how many are in flight, and issuing eight before the first
+             * product covers eight times the latency.
              *
              * THE PRODUCTS ARE ADDED IN THE SAME ORDER, j ascending, so
              * `contrib` is bit for bit the value the one-at-a-time loop
@@ -6565,7 +6565,7 @@ __global__ static void qwen4exp_qsa_attention_kernel(
              * and the skip below cannot fire; the sparse path keeps the
              * one-at-a-time walk, whose `continue` is load bearing. */
             if (!sparse) {
-                for (; j + 4u <= n_in_tile; j += 4u) {
+                for (; j + 8u <= n_in_tile; j += 8u) {
                     const float *v0 = v_cache +
                         (uint64_t)keys[j] * kv_stride + (uint64_t)kv_head * head_dim;
                     const float *v1 = v_cache +
@@ -6574,14 +6574,30 @@ __global__ static void qwen4exp_qsa_attention_kernel(
                         (uint64_t)keys[j + 2u] * kv_stride + (uint64_t)kv_head * head_dim;
                     const float *v3 = v_cache +
                         (uint64_t)keys[j + 3u] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float *v4 = v_cache +
+                        (uint64_t)keys[j + 4u] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float *v5 = v_cache +
+                        (uint64_t)keys[j + 5u] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float *v6 = v_cache +
+                        (uint64_t)keys[j + 6u] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float *v7 = v_cache +
+                        (uint64_t)keys[j + 7u] * kv_stride + (uint64_t)kv_head * head_dim;
                     const float a0 = v0[tid];
                     const float a1 = v1[tid];
                     const float a2 = v2[tid];
                     const float a3 = v3[tid];
+                    const float a4 = v4[tid];
+                    const float a5 = v5[tid];
+                    const float a6 = v6[tid];
+                    const float a7 = v7[tid];
                     contrib += probs[j] * a0;
                     contrib += probs[j + 1u] * a1;
                     contrib += probs[j + 2u] * a2;
                     contrib += probs[j + 3u] * a3;
+                    contrib += probs[j + 4u] * a4;
+                    contrib += probs[j + 5u] * a5;
+                    contrib += probs[j + 6u] * a6;
+                    contrib += probs[j + 7u] * a7;
                 }
             }
             for (; j < n_in_tile; j++) {
