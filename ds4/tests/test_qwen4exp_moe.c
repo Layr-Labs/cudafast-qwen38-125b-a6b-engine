@@ -935,12 +935,10 @@ static void run_router_f32_prefill_exact_case(int RF32_IN, int RF32_OUT) {
         const uint64_t n = (uint64_t)rows * RF32_OUT;
 
         setenv("DS4_F32_NO_WARP_TILE", "1", 1);
-        setenv("DS4_F32_NO_VECTOR_DECODE", "1", 1);
         require_ok(ds4_gpu_matmul_f32_decode_rows_exact_tensor(
                        la_t, wmap, wbytes, 0, RF32_IN, RF32_OUT, x_t, rows),
                    "router f32 shipping-path projection");
         unsetenv("DS4_F32_NO_WARP_TILE");
-        unsetenv("DS4_F32_NO_VECTOR_DECODE");
         require_ok(ds4_gpu_matmul_f32_decode_rows_exact_tensor(
                        lb_t, wmap, wbytes, 0, RF32_IN, RF32_OUT, x_t, rows),
                    "router f32 warp-tile projection");
@@ -1779,7 +1777,7 @@ static void run_production_expert_cases(void) {
                            "split gate/up decode candidate");
                 for (unsigned j = 0; j < 3; j++) {
                     one_cand[j] = malloc(one_sizes[j]);
-                    require_ok(one_cand[j] != NULL, "split decode buffers");
+                    require_ok(one_cand[j], "split decode buffers");
                     require_ok(ds4_gpu_tensor_read(tensors[j], 0, one_cand[j], one_sizes[j]),
                                "split decode candidate read");
                 }
@@ -1793,7 +1791,7 @@ static void run_production_expert_cases(void) {
                            "joint decode oracle");
                 for (unsigned j = 0; j < 3; j++) {
                     one_ref[j] = malloc(one_sizes[j]);
-                    require_ok(one_ref[j] != NULL, "joint decode buffers");
+                    require_ok(one_ref[j], "joint decode buffers");
                     require_ok(ds4_gpu_tensor_read(tensors[j], 0, one_ref[j], one_sizes[j]),
                                "joint decode read");
                     require_ok(memcmp(one_ref[j], one_cand[j], one_sizes[j]) == 0,
