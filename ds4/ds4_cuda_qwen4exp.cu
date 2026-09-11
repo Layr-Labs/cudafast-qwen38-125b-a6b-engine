@@ -2401,11 +2401,12 @@ qwen4exp_moe_gateup_mma_kernel(
     const uint32_t wn = (warp >> 1) * 16u;
     const uint32_t row0 = blockIdx.x * QW_MMA_BM;
     if (row0 >= mid_dim) return;
-    if (active) {
-        if ((int32_t)blockIdx.y >= active[0]) return;
-    }
+    if (active && (int32_t)blockIdx.y >= active[0]) return;
+    const uint32_t task_count = active ? (uint32_t)active[0] : gridDim.y;
+    const uint32_t task_stride = PairTasks ? gridDim.y : task_count;
+    for (uint32_t task = blockIdx.y; task < task_count; task += task_stride) {
     const uint32_t expert = active
-        ? (uint32_t)active[1 + (PairTasks ? 2u : 1u) * blockIdx.y] : blockIdx.y;
+        ? (uint32_t)active[1 + (PairTasks ? 2u : 1u) * task] : task;
     const int32_t cnt = counts[expert];
     if (cnt <= 0) return;
     const int32_t base = offsets[expert];
@@ -2423,7 +2424,7 @@ qwen4exp_moe_gateup_mma_kernel(
     const char *gate_row = gate_e + (uint64_t)dec_mrow * gate_row_bytes;
     const char *up_row   = up_e + (uint64_t)dec_mrow * up_row_bytes;
 
-    const int32_t first_pair = PairTasks ? active[2u + 2u * blockIdx.y] : 0;
+    const int32_t first_pair = PairTasks ? active[2u + 2u * task] : 0;
     const int32_t end_pair = PairTasks ? min(cnt, first_pair + QW_MMA_BN) : cnt;
     for (int32_t nbase = first_pair; nbase < end_pair; nbase += QW_MMA_BN) {
         const int32_t take = (cnt - nbase) < QW_MMA_BN ? (cnt - nbase)
@@ -2651,6 +2652,7 @@ qwen4exp_moe_gateup_mma_kernel(
             }
         }
         __syncthreads();
+    }
     }
 }
 
@@ -4842,7 +4844,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         }
 #define QWEN4EXP_GATEUP_MMA_IMPL(GT, UT, TASKS) \
         qwen4exp_moe_gateup_mma_kernel<GT, UT, TASKS><<< \
-                dim3(mid_dim / QW_MMA_BM, TASKS ? (unsigned)task_capacity : gu_rows, 1), \
+                dim3(mid_dim / QW_MMA_BM, gu_rows, 1), \
                 QW_MMA_THREADS, 0, stream>>>( \
                 (float *)mid->ptr, \
                 moe_epilogue ? sc.mq : NULL, \
