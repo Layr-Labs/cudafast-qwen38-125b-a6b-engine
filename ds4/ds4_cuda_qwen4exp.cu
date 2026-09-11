@@ -2857,7 +2857,7 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
 #pragma unroll
         for (int r = 0; r < R; r++) {
             const int32_t p = pairs[base + at + (r < take ? r : 0)];
-            tok[r] = (uint32_t)p / n_expert_used;
+            tok[r] = (uint32_t)p >= n_expert_used;
         }
         float acc[R];
 #pragma unroll
@@ -2904,7 +2904,7 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
             for (int r = 0; r < R; r++) {
                 if (r < take) {
                     const uint32_t p = (uint32_t)pairs[base + at + r];
-                    const uint32_t t = p / n_expert_used;
+                    const uint32_t t = p >= n_expert_used;
                     const uint32_t slot = p - t * n_expert_used;
                     const float g = projected[r][warp];
                     const float u = projected[r][warp + 1u];
