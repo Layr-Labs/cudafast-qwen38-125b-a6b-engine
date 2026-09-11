@@ -1704,6 +1704,152 @@ static void run_group_scan_boundary_cases(void) {
     munmap(image, image_bytes);
 }
 
+/* ------------------------------------------------------------------ */
+/* THE ROUTED PROJECTIONS WITH THEIR WEIGHTS STREAMED.
+ *
+ * qwen4exp_moe_gateup_raw_kernel and qwen4exp_moe_down_raw_kernel read the
+ * expert rows as long linear streams into shared memory and decode the mma
+ * fragments straight from the raw bytes; the tiles they replace decode each
+ * group into a byte tile first.  The claim is that every fragment word and
+ * every accumulation is the tile's, bit for bit, so the two arms must write
+ * the IDENTICAL float32 down partials and output.  DS4_QWEN4EXP_NO_GATEUP_RAW
+ * and DS4_QWEN4EXP_NO_DOWN_RAW pin the tiles.
+ *
+ * The shape matters: at mid 640 a row is twenty groups, five chunks, and the
+ * row blocks of an expert stream through one block's register buffer; the
+ * suite's small case has two groups and one chunk.  The widths matter too:
+ * 21 rows leaves every expert with fewer than 32 pairs (one pass with a
+ * tail), and 200 rows over 8 experts gives every expert several passes over
+ * the same staged rows. */
+static void run_prod_down_raw_case(const uint8_t *image, uint64_t image_bytes,
+                                   uint64_t gate_offset, uint64_t up_offset,
+                                   uint64_t down_offset, uint32_t gate_type,
+                                   uint32_t down_type, uint32_t n_rows) {
+    const uint64_t gate_row = type_row_bytes(gate_type, PROD_IN_DIM);
+    const uint64_t down_row = type_row_bytes(down_type, PROD_MID_DIM);
+    const ds4_gpu_qwen4exp_slab gate_slab = {
+        image, image_bytes, gate_offset,
+        (uint64_t)PROD_MID_DIM * gate_row, gate_row, gate_type };
+    const ds4_gpu_qwen4exp_slab up_slab = {
+        image, image_bytes, up_offset,
+        (uint64_t)PROD_MID_DIM * gate_row, gate_row, gate_type };
+    const ds4_gpu_qwen4exp_slab down_slab = {
+        image, image_bytes, down_offset,
+        (uint64_t)PROD_OUT_DIM * down_row, down_row, down_type };
+
+    const size_t xn = (size_t)n_rows * PROD_IN_DIM;
+    const size_t sn = (size_t)n_rows * PROD_USED;
+    float *x = calloc(xn, sizeof(float));
+    float *logits = calloc((size_t)n_rows * PROD_EXPERTS, sizeof(float));
+    if (!x || !logits) fail("down raw allocation");
+    for (size_t i = 0; i < xn; i++) x[i] = rng_unit() * 0.02f;
+    for (size_t i = 0; i < (size_t)n_rows * PROD_EXPERTS; i++)
+        logits[i] = rng_unit() * 3.0f;
+
+    ds4_gpu_tensor *logits_t = ds4_gpu_tensor_alloc(
+        (uint64_t)n_rows * PROD_EXPERTS * sizeof(float));
+    ds4_gpu_tensor *sel_t = ds4_gpu_tensor_alloc((uint64_t)sn * sizeof(int32_t));
+    ds4_gpu_tensor *w_t = ds4_gpu_tensor_alloc((uint64_t)sn * sizeof(float));
+    ds4_gpu_tensor *x_t = ds4_gpu_tensor_alloc((uint64_t)xn * sizeof(float));
+    ds4_gpu_tensor *mid_t = ds4_gpu_tensor_alloc(
+        (uint64_t)sn * PROD_MID_DIM * sizeof(float));
+    ds4_gpu_tensor *out_t = ds4_gpu_tensor_alloc(
+        (uint64_t)n_rows * PROD_OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *part_t = ds4_gpu_tensor_alloc(
+        (uint64_t)sn * PROD_OUT_DIM * sizeof(float));
+    require_ok(logits_t && sel_t && w_t && x_t && mid_t && out_t && part_t,
+               "down raw tensor allocation");
+    require_ok(ds4_gpu_tensor_write(logits_t, 0, logits,
+                   (uint64_t)n_rows * PROD_EXPERTS * sizeof(float)),
+               "down raw logit write");
+    require_ok(ds4_gpu_tensor_write(x_t, 0, x, (uint64_t)xn * sizeof(float)),
+               "down raw activation write");
+    require_ok(ds4_gpu_qwen4exp_router_select_tensor(
+                   sel_t, w_t, logits_t, PROD_EXPERTS, PROD_USED, n_rows),
+               "down raw router select");
+
+    /* The fused epilogue quantises mid straight into the scratch the down
+     * projection reads, so the partials carry every gate/up word too. */
+    ds4_gpu_tensor *tensors[2] = { part_t, out_t };
+    const char *names[2] = { "down partials", "out" };
+    const size_t sizes[2] = {
+        (size_t)sn * PROD_OUT_DIM * sizeof(float),
+        (size_t)n_rows * PROD_OUT_DIM * sizeof(float) };
+    void *streamed[2], *tiled[2];
+    for (unsigned j = 0; j < 2; j++) {
+        streamed[j] = malloc(sizes[j]); tiled[j] = malloc(sizes[j]);
+        require_ok(streamed[j] && tiled[j], "down raw buffers");
+    }
+
+    /* The shipping arm. */
+    require_ok(ds4_gpu_qwen4exp_routed_moe_tensor(
+                   out_t, mid_t, part_t, &gate_slab, &up_slab, &down_slab,
+                   PROD_IN_DIM, PROD_MID_DIM, PROD_OUT_DIM, sel_t, w_t,
+                   PROD_EXPERTS, PROD_USED, x_t, n_rows,
+                   PROD_USED * PROD_MID_DIM),
+               "down raw routed MoE");
+    for (unsigned j = 0; j < 2; j++)
+        require_ok(ds4_gpu_tensor_read(tensors[j], 0, streamed[j], sizes[j]),
+                   "down raw read");
+
+    /* The tiles they are argued equal to: both pins at once, so mid comes
+     * from the gate/up tile and the partials from the down tile. */
+    {
+        const char *pin = getenv("DS4_QWEN4EXP_NO_DOWN_RAW");
+        char *saved = pin ? strdup(pin) : NULL;
+        const char *gpin = getenv("DS4_QWEN4EXP_NO_GATEUP_RAW");
+        char *gsaved = gpin ? strdup(gpin) : NULL;
+        require_ok((!pin || saved) && (!gpin || gsaved), "down raw pin save");
+        require_ok(setenv("DS4_QWEN4EXP_NO_DOWN_RAW", "1", 1) == 0 &&
+                   setenv("DS4_QWEN4EXP_NO_GATEUP_RAW", "1", 1) == 0,
+                   "down raw pin");
+        require_ok(ds4_gpu_qwen4exp_routed_moe_tensor(
+                       out_t, mid_t, part_t, &gate_slab, &up_slab, &down_slab,
+                       PROD_IN_DIM, PROD_MID_DIM, PROD_OUT_DIM, sel_t, w_t,
+                       PROD_EXPERTS, PROD_USED, x_t, n_rows,
+                       PROD_USED * PROD_MID_DIM),
+                   "down tile oracle routed MoE");
+        for (unsigned j = 0; j < 2; j++)
+            require_ok(ds4_gpu_tensor_read(tensors[j], 0, tiled[j], sizes[j]),
+                       "down tile oracle read");
+        if (saved) { setenv("DS4_QWEN4EXP_NO_DOWN_RAW", saved, 1); free(saved); }
+        else unsetenv("DS4_QWEN4EXP_NO_DOWN_RAW");
+        if (gsaved) { setenv("DS4_QWEN4EXP_NO_GATEUP_RAW", gsaved, 1); free(gsaved); }
+        else unsetenv("DS4_QWEN4EXP_NO_GATEUP_RAW");
+    }
+
+    for (unsigned j = 0; j < 2; j++) {
+        const size_t n = sizes[j] / sizeof(float);
+        const float *a = (const float *)streamed[j], *b = (const float *)tiled[j];
+        size_t differ = 0, nonzero = 0;
+        double worst = 0.0;
+        for (size_t i = 0; i < n; i++) {
+            if (a[i] != 0.0f) nonzero++;
+            if (memcmp(&a[i], &b[i], sizeof(float)) != 0) {
+                differ++;
+                const double d = fabs((double)a[i] - (double)b[i]);
+                if (d > worst) worst = d;
+            }
+        }
+        printf("routed MoE streamed gate/up and down, %s gate/up + %s down at "
+               "in %d mid %d out %d, %u rows: %zu of %zu %s outputs differ from "
+               "the tiles (%zu nonzero, worst %.3e)\n",
+               type_name(gate_type), type_name(down_type), (int)PROD_IN_DIM,
+               (int)PROD_MID_DIM, (int)PROD_OUT_DIM, n_rows,
+               differ, n, names[j], nonzero, worst);
+        /* A kernel that wrote nothing would agree with itself. */
+        if (nonzero == 0) fail("the streamed down case computed only zeros");
+        if (differ != 0) fail("a streamed projection changed a number");
+    }
+
+    for (unsigned j = 0; j < 2; j++) { free(streamed[j]); free(tiled[j]); }
+    ds4_gpu_tensor_free(part_t); ds4_gpu_tensor_free(out_t);
+    ds4_gpu_tensor_free(mid_t); ds4_gpu_tensor_free(x_t);
+    ds4_gpu_tensor_free(w_t); ds4_gpu_tensor_free(sel_t);
+    ds4_gpu_tensor_free(logits_t);
+    free(logits); free(x);
+}
+
 static void run_production_expert_cases(void) {
     const uint32_t n_gate_up = (uint32_t)(sizeof(PROD_GATE_UP_TYPES) /
                                           sizeof(PROD_GATE_UP_TYPES[0]));
@@ -2065,6 +2211,17 @@ static void run_production_expert_cases(void) {
         }
         ds4_gpu_tensor_free(sx_t);
         free(sx);
+    }
+
+    /* The streamed down projection against the down tile, at the production
+     * shape, at a one-pass width and a several-pass width. */
+    {
+        const uint32_t gi = prod_type_slot(PROD_GATE_UP_TYPES, n_gate_up, TYPE_Q4_K);
+        const uint32_t dj = prod_type_slot(PROD_DOWN_TYPES, n_down, TYPE_Q5_1);
+        run_prod_down_raw_case(image, image_bytes, gate_off[gi], up_off[gi],
+                               down_off[dj], TYPE_Q4_K, TYPE_Q5_1, 21u);
+        run_prod_down_raw_case(image, image_bytes, gate_off[gi], up_off[gi],
+                               down_off[dj], TYPE_Q4_K, TYPE_Q5_1, 200u);
     }
 
     free(single_shard_q51);
