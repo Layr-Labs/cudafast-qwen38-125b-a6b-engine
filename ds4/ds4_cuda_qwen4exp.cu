@@ -199,7 +199,17 @@ __device__ static float dot4_f32(float4 a, float4 b) {
 
 enum {
     QWEN4EXP_GDN_DIM = 128,
-    QWEN4EXP_GDN_HISTORY = 3
+    QWEN4EXP_GDN_HISTORY = 3,
+    /* Tokens of staged (decay, write strength) the recurrence holds in shared
+     * memory at a time.  512 pairs is 4 KiB a block, so the twelve blocks a
+     * multiprocessor that the 40-register token loop already reaches still fit
+     * inside the 100 KiB the part carries. */
+    QWEN4EXP_GDN_GATE_TILE = 512,
+    /* Below this the two barriers and the shared round trip cost more than the
+     * gate math they save -- the measured crossover on the GB10 is five tokens
+     * -- so a decode step and a short speculative row stay on the loop that
+     * has no barrier at all. */
+    QWEN4EXP_GDN_GATE_MIN_TOKENS = 8
 };
 
 /*
@@ -357,7 +367,31 @@ __global__ static void qwen4exp_gdn_conv_kernel(
  * The delta rule itself, token-serial inside the kernel like KDA and like the
  * reference: one block owns one (row, value head, four value rows), one warp
  * owns one value row, and each lane owns four adjacent key columns.
+ *
+ * STAGE_GATES stages the token loop's two scalars.  The decay `g` and the
+ * write strength `beta` are functions of (row, token, head) ALONE, so every
+ * thread of the block -- and every one of the thirty-two blocks that own the
+ * other value rows of the same head -- recomputes the identical pair.  The
+ * pair is not cheap: the softplus is an expf and a log1pf, the decay a second
+ * expf, the sigmoid a third plus a reciprocal, which is about half of the
+ * token loop's SASS.  Staged, one thread evaluates each (token, head) pair
+ * once for the whole block and the loop reads the float back out of shared
+ * memory; the 1024-token prefill chunk goes from 4096 evaluations a block to
+ * 32.
+ *
+ * The staged pass evaluates the SAME two expressions on the SAME two loaded
+ * operands: nothing is reassociated, no operand meets a different operand, and
+ * a float through shared memory is the float that went in.  What changes is
+ * only which thread evaluates and where the loop reads the answer from.  Twin
+ * of the Metal kernel's arithmetic -- keep the expressions identical to it.
+ *
+ * `false` is the in-loop recomputation this replaces, and lowers to the same
+ * SASS the untemplated kernel did: the staging is the only branch that is not
+ * folded away, the tile loop collapses to the single token loop it was, and
+ * `active` folds to true.  DS4_QWEN4EXP_NO_GDN_GATE_STAGE selects it, and
+ * tests/test_qwen4exp_gdn.c diffs the two side by side.
  */
+template <bool STAGE_GATES>
 __global__ static void qwen4exp_gdn_recurrence_kernel(
         float       *__restrict__ out,
         float       *__restrict__ state,
@@ -377,9 +411,21 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
     const uint32_t value = blockIdx.y * 4u + (threadIdx.x >> 5u);
     const uint32_t row = blockIdx.z;
     const uint32_t lane = threadIdx.x & 31u;
-    if (head >= n_value_head || value >= QWEN4EXP_GDN_DIM || row >= n_rows) {
+    /* `head` and `row` are block-uniform, so a block that fails either leaves
+     * whole and the staging barriers stay uniform.  `value` is only
+     * warp-uniform: under the staged path an over-wide grid.y costs the warp
+     * its token loop, not its barriers.  The unstaged path has no barrier, so
+     * it leaves outright the way it always did. */
+    if (head >= n_value_head || row >= n_rows) {
         return;
     }
+    if (!STAGE_GATES && value >= QWEN4EXP_GDN_DIM) {
+        return;
+    }
+    const bool active = STAGE_GATES ? value < QWEN4EXP_GDN_DIM : true;
+
+    __shared__ float tile_g[QWEN4EXP_GDN_GATE_TILE];
+    __shared__ float tile_beta[QWEN4EXP_GDN_GATE_TILE];
 
     const uint32_t key_dim = n_key_head * QWEN4EXP_GDN_DIM;
     const uint32_t value_dim = n_value_head * QWEN4EXP_GDN_DIM;
@@ -394,13 +440,39 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
     float4 *state_ptr = (float4 *)(state +
         ((((uint64_t)row * n_value_head + head) * QWEN4EXP_GDN_DIM) + value) *
         QWEN4EXP_GDN_DIM + k0);
-    float4 h = *state_ptr;
+    float4 h = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (active) h = *state_ptr;
     /* ssm_a IS ALREADY -exp(A_log); see the note in metal/qwen4exp_gdn.metal.
      * Twin of that kernel -- keep the two expressions identical. */
     const float decay_coeff = a_log[head];
     const float bias = dt_bias[head];
 
     for (uint32_t token = 0; token < n_tokens; token++) {
+        /* Refill the staged tile.  `n_tokens`, the tile width and `token` are
+         * block-uniform, so every warp reaches both barriers together. */
+        if (STAGE_GATES &&
+            token % (uint32_t)QWEN4EXP_GDN_GATE_TILE == 0u) {
+            const uint32_t span =
+                n_tokens - token < (uint32_t)QWEN4EXP_GDN_GATE_TILE
+                    ? n_tokens - token
+                    : (uint32_t)QWEN4EXP_GDN_GATE_TILE;
+            /* The tile the previous pass staged has been read out by now. */
+            __syncthreads();
+            /* Not unrolled: this is a thirty-second of the kernel's work and
+             * an unrolled copy of it costs the token loop its registers, and
+             * with them a block a multiprocessor. */
+#pragma unroll 1
+            for (uint32_t i = threadIdx.x; i < span; i += blockDim.x) {
+                const uint64_t staged =
+                    ((uint64_t)row * n_tokens + token + i) * n_value_head +
+                    head;
+                tile_g[i] = expf(decay_coeff *
+                    qwen4exp_gdn_softplus(raw_alpha[staged] + bias));
+                tile_beta[i] = qwen4exp_gdn_sigmoid(raw_beta[staged]);
+            }
+            __syncthreads();
+        }
+        if (!active) continue;
         const uint64_t slot = (uint64_t)row * n_tokens + token;
         const uint64_t base = slot * conv_dim + key_head * QWEN4EXP_GDN_DIM;
         const float4 q4 = *(const float4 *)(qkv + base + k0);
@@ -408,9 +480,14 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
         const float v_row = qkv[slot * conv_dim + 2u * (uint64_t)key_dim +
             head * QWEN4EXP_GDN_DIM + value];
         const uint64_t gate = slot * n_value_head + head;
-        const float g = expf(decay_coeff *
-            qwen4exp_gdn_softplus(raw_alpha[gate] + bias));
-        const float beta = qwen4exp_gdn_sigmoid(raw_beta[gate]);
+        const uint32_t tile_slot = token % (uint32_t)QWEN4EXP_GDN_GATE_TILE;
+        const float g = STAGE_GATES
+            ? tile_g[tile_slot]
+            : expf(decay_coeff *
+                qwen4exp_gdn_softplus(raw_alpha[gate] + bias));
+        const float beta = STAGE_GATES
+            ? tile_beta[tile_slot]
+            : qwen4exp_gdn_sigmoid(raw_beta[gate]);
 
         h.x *= g;
         h.y *= g;
@@ -439,7 +516,7 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
             *snap = h;
         }
     }
-    *state_ptr = h;
+    if (active) *state_ptr = h;
 }
 
 /* Sigmoid-gated RMS output norm.  The weight is a plain scale, not an
@@ -472,6 +549,19 @@ __global__ static void qwen4exp_gdn_output_kernel(
     const float scale = rsqrtf(total / (float)QWEN4EXP_GDN_DIM + norm_eps);
     out[base + tid] = raw * scale * output_norm[tid] *
         qwen4exp_gdn_sigmoid(output_gate[base + tid]);
+}
+
+/* Gate staging is the shipping path; DS4_QWEN4EXP_NO_GDN_GATE_STAGE selects
+ * the in-loop recomputation it replaces.
+ *
+ * Read fresh rather than cached, so a test can put the two kernels side by
+ * side in one process and diff their bytes -- tests/test_qwen4exp_gdn.c does
+ * exactly that.  One getenv a layer, against a recurrence that runs for
+ * milliseconds on a prefill chunk and microseconds on a decode step, which
+ * does not reach the staged kernel at all. */
+static bool qwen4exp_gdn_stage_gates(uint32_t n_tokens) {
+    if (n_tokens < (uint32_t)QWEN4EXP_GDN_GATE_MIN_TOKENS) return false;
+    return getenv("DS4_QWEN4EXP_NO_GDN_GATE_STAGE") == NULL;
 }
 
 static const float *qwen4exp_gdn_weight_f32(
@@ -613,15 +703,26 @@ static int qwen4exp_cuda_gdn_run(
         return 0;
     }
 
-    qwen4exp_gdn_recurrence_kernel<<<
-            dim3(n_value_head, QWEN4EXP_GDN_DIM / 4u, n_rows),
-            QWEN4EXP_GDN_DIM, 0, stream>>>(
-            (float *)out->ptr, (float *)recurrent_state->ptr,
-            (const float *)qkv->ptr, (const float *)raw_alpha->ptr,
-            (const float *)raw_beta->ptr, a_log, dt_bias,
-            state_snapshot ? (float *)state_snapshot->ptr : NULL,
-            n_key_head, n_value_head, n_rows, n_tokens, head_layout,
-            n_snapshot_rows);
+    const dim3 recurrence_grid(n_value_head, QWEN4EXP_GDN_DIM / 4u, n_rows);
+    if (qwen4exp_gdn_stage_gates(n_tokens)) {
+        qwen4exp_gdn_recurrence_kernel<true><<<
+                recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
+                (float *)out->ptr, (float *)recurrent_state->ptr,
+                (const float *)qkv->ptr, (const float *)raw_alpha->ptr,
+                (const float *)raw_beta->ptr, a_log, dt_bias,
+                state_snapshot ? (float *)state_snapshot->ptr : NULL,
+                n_key_head, n_value_head, n_rows, n_tokens, head_layout,
+                n_snapshot_rows);
+    } else {
+        qwen4exp_gdn_recurrence_kernel<false><<<
+                recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
+                (float *)out->ptr, (float *)recurrent_state->ptr,
+                (const float *)qkv->ptr, (const float *)raw_alpha->ptr,
+                (const float *)raw_beta->ptr, a_log, dt_bias,
+                state_snapshot ? (float *)state_snapshot->ptr : NULL,
+                n_key_head, n_value_head, n_rows, n_tokens, head_layout,
+                n_snapshot_rows);
+    }
     if (!cuda_ok(cudaGetLastError(), "qwen4exp GDN recurrence launch")) {
         return 0;
     }
