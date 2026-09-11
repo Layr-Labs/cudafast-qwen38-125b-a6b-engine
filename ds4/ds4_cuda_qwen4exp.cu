@@ -2673,7 +2673,7 @@ qwen4exp_moe_gateup_mma_kernel(
  * The activation is the routed intermediate, quantised per (token, slot) pair,
  * so the pair index addresses it directly.
  */
-template <int DownType = -1>
+template <int DownType = -1, unsigned Pitch = QW_MMA_LD>
 __global__ __launch_bounds__(QW_DOWN_MMA_THREADS) static void
 qwen4exp_moe_down_mma_kernel(
         float *partial,
@@ -2690,8 +2690,8 @@ qwen4exp_moe_down_mma_kernel(
         uint32_t down_type,
         uint32_t groups,
         uint32_t out_dim) {
-    __shared__ __align__(16) int8_t sA[QW_DOWN_MMA_BM * QW_MMA_LD];
-    __shared__ __align__(16) int8_t sB[QW_MMA_BN * QW_MMA_LD];
+    __shared__ __align__(16) int8_t sA[QW_DOWN_MMA_BM * Pitch];
+    __shared__ __align__(16) int8_t sB[QW_MMA_BN * Pitch];
     __shared__ float  sWA[QW_DOWN_MMA_BM * QW_MMA_G];
     __shared__ float  sWB[QW_DOWN_MMA_BM * QW_MMA_G];
     __shared__ float  sXS[QW_MMA_BN * QW_MMA_G], sXSUM[QW_MMA_BN * QW_MMA_G];
@@ -2739,11 +2739,11 @@ qwen4exp_moe_down_mma_kernel(
                             DownType < 0 ? down_type : (uint32_t)DownType,
                             down_e + (uint64_t)orow * down_row_bytes, g,
                             wq, wa, wb, &halves);
-                    qw_tile_store_group(&sA[r * QW_MMA_LD + gg * 32], wq);
+                    qw_tile_store_group(&sA[r * Pitch + gg * 32], wq);
                     sWA[r * QW_MMA_G + gg] = wa[0];
                     sWB[r * QW_MMA_G + gg] = wb[0];
                 } else {
-                    qw_tile_store_zero(&sA[r * QW_MMA_LD + gg * 32]);
+                    qw_tile_store_zero(&sA[r * Pitch + gg * 32]);
                     sWA[r * QW_MMA_G + gg] = 0.0f;
                     sWB[r * QW_MMA_G + gg] = 0.0f;
                 }
@@ -2756,12 +2756,12 @@ qwen4exp_moe_down_mma_kernel(
                 const uint32_t p = sPair[tk];
                 if (p != 0xffffffffu && g < groups) {
                     const uint64_t at = (uint64_t)p * groups + g;
-                    qw_tile_copy_group(&sB[tk * QW_MMA_LD + gg * 32],
+                    qw_tile_copy_group(&sB[tk * Pitch + gg * 32],
                                        mq + at * 32u);
                     sXS  [tk * QW_MMA_G + gg] = ms[at];
                     sXSUM[tk * QW_MMA_G + gg] = (float)msum[at];
                 } else {
-                    qw_tile_store_zero(&sB[tk * QW_MMA_LD + gg * 32]);
+                    qw_tile_store_zero(&sB[tk * Pitch + gg * 32]);
                     sXS[tk * QW_MMA_G + gg] = 0.0f;
                     sXSUM[tk * QW_MMA_G + gg] = 0.0f;
                 }
@@ -2778,7 +2778,7 @@ qwen4exp_moe_down_mma_kernel(
                 for (int r = 0; r < 4; r++) {
                     const uint32_t rr = ar + ((r & 1) ? 8u : 0u);
                     const uint32_t kk = gg * 32u + ak + ((r & 2) ? 16u : 0u);
-                    af[r] = qw_tile_word(&sA[rr * QW_MMA_LD + kk]);
+                    af[r] = qw_tile_word(&sA[rr * Pitch + kk]);
                 }
                 const uint32_t m0 = warp * 16u + (lane >> 2);
 #pragma unroll
@@ -2791,7 +2791,7 @@ qwen4exp_moe_down_mma_kernel(
                     const uint32_t bn = nt * 8u + (lane >> 2);
 #pragma unroll
                     for (int r = 0; r < 2; r++) {
-                        bf[r] = qw_tile_word(&sB[bn * QW_MMA_LD + gg * 32u +
+                        bf[r] = qw_tile_word(&sB[bn * Pitch + gg * 32u +
                                                  (lane & 3u) * 4u +
                                                  (r ? 16u : 0u)]);
                     }
@@ -2856,13 +2856,34 @@ __global__ static void qwen4exp_moe_down_combine_kernel(
 }
 
 
+/* The quantizer owns an aligned scratch row. Two vector reads supply the
+ * same eight words to the unchanged integer dot and float accumulation. */
+__device__ __forceinline__ static void qwen4exp_split_vector_accumulate(
+        float *acc, const int8_t *wq, float wa, float wb,
+        const int8_t *xq, float scale, int sum) {
+    const int4 lo = *(const int4 *)(const void *)xq;
+    const int4 hi = *(const int4 *)(const void *)(xq + 16);
+    int d = 0;
+    d = __dp4a(qwen4exp_load_i8x4(wq + 0), lo.x, d);
+    d = __dp4a(qwen4exp_load_i8x4(wq + 4), lo.y, d);
+    d = __dp4a(qwen4exp_load_i8x4(wq + 8), lo.z, d);
+    d = __dp4a(qwen4exp_load_i8x4(wq + 12), lo.w, d);
+    d = __dp4a(qwen4exp_load_i8x4(wq + 16), hi.x, d);
+    d = __dp4a(qwen4exp_load_i8x4(wq + 20), hi.y, d);
+    d = __dp4a(qwen4exp_load_i8x4(wq + 24), hi.z, d);
+    d = __dp4a(qwen4exp_load_i8x4(wq + 28), hi.w, d);
+    *acc += (wa * scale) * (float)d;
+    *acc += (wb * scale) * (float)sum;
+}
+
 /* Adjacent warps own the gate and up projection of one output row. Each
  * carries one decoded matrix and its accumulators, reducing register pressure
  * during a two-token verify. Every projection retains the original ascending
  * group chain and warp reduction. Only the completed scalar projections pass
  * through shared memory before the unchanged SiLU/up/router-weight product.
- * Four rows share a 256-thread block; inactive row warps still join barriers. */
-template <int R, int Type>
+ * The retained schedule packs four rows into 256 threads. The aligned-vector
+ * schedule uses two rows and 128 threads; inactive row warps still join barriers. */
+template <int R, int Type, bool Vector = false, unsigned OutputRows = 4>
 __global__ static void qwen4exp_moe_gateup_split_kernel(
         float *mid,
         const char *gate,
@@ -2887,7 +2908,7 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
         uint32_t n_expert_used) {
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
-    const uint32_t row = blockIdx.x * 4u + (warp >> 1u);
+    const uint32_t row = blockIdx.x * OutputRows + (warp >> 1u);
     const bool live = row < mid_dim;
     const bool second = (warp & 1u) != 0u;
     uint32_t expert = blockIdx.y;
@@ -2901,7 +2922,7 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
     const char *weight_row = (second ? up : gate) +
         (uint64_t)expert * (second ? up_expert_bytes : gate_expert_bytes) +
         (uint64_t)(live ? row : 0u) * (second ? up_row_bytes : gate_row_bytes);
-    __shared__ float projected[R][8];
+    __shared__ float projected[R][OutputRows * 2u];
     for (int32_t at = 0; at < cnt; at += R) {
         const int32_t take = (cnt - at) < R ? (cnt - at) : R;
         uint32_t tok[R];
@@ -2938,8 +2959,12 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
                 for (int r = 0; r < R; r++) {
                     if (r < take) {
                         const uint64_t at_g = (uint64_t)tok[r] * groups + g;
-                        qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves,
-                            xq + at_g * 32u, xs[at_g], xsum[at_g]);
+                        if (Vector)
+                            qwen4exp_split_vector_accumulate(&acc[r], wq, wa[0], wb[0],
+                                xq + at_g * 32u, xs[at_g], xsum[at_g]);
+                        else
+                            qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves,
+                                xq + at_g * 32u, xs[at_g], xsum[at_g]);
                     }
                 }
             }
@@ -4881,15 +4906,24 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
              gate_slab->type == DS4_QWEN4EXP_TY_q4_K &&
              up_slab->type == DS4_QWEN4EXP_TY_q4_K &&
              getenv("DS4_QWEN4EXP_NO_SPLIT_GATEUP") == NULL) {
-        qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K><<<
-            dim3((mid_dim + 3u) / 4u, gu_rows, 1), threads, 0, stream>>>(
-            (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum,
-            sc.pairs, sc.counts, sc.offsets, gu_active,
-            (const float *)weights->ptr,
-            gate_slab->expert_bytes, gate_slab->row_bytes,
-            up_slab->expert_bytes, up_slab->row_bytes,
-            gate_slab->type, up_slab->type, xgroups, mid_dim,
-            mid_token_stride, n_expert_used);
+        /* The quantized input is the shared scratch prefix, so vector
+         * reads do not move metadata or the following shared-expert input.
+         * Keep the scalar schedule available for diagnostics and alignment. */
+        const bool vector = ((uintptr_t)sc.xq & 15u) == 0u &&
+            getenv("DS4_QWEN4EXP_NO_SPLIT_VECTOR") == NULL;
+#define QWEN4EXP_SPLIT_GATEUP(V, P) \
+        qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P><<< \
+            dim3((mid_dim + P - 1u) / P, gu_rows, 1), P * 64u, 0, stream>>>( \
+            (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum, \
+            sc.pairs, sc.counts, sc.offsets, gu_active, \
+            (const float *)weights->ptr, \
+            gate_slab->expert_bytes, gate_slab->row_bytes, \
+            up_slab->expert_bytes, up_slab->row_bytes, \
+            gate_slab->type, up_slab->type, xgroups, mid_dim, \
+            mid_token_stride, n_expert_used)
+        if (vector) { QWEN4EXP_SPLIT_GATEUP(true, 2u); }
+        else { QWEN4EXP_SPLIT_GATEUP(false, 4u); }
+#undef QWEN4EXP_SPLIT_GATEUP
     }
     else if (tile == 8) { QWEN4EXP_GATEUP(8); }
     else if (tile == 4) { QWEN4EXP_GATEUP(4); }
@@ -4926,8 +4960,13 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     } \
 } while (0)
     if (down_mma) {
-#define QWEN4EXP_DOWN_MMA(DT) \
-        qwen4exp_moe_down_mma_kernel<DT><<< \
+        /* A padded temporary row reduces repeated fragment bank conflicts
+         * for the measured 640-to-2560 down projection. The weight bytes,
+         * quantized intermediates and ordered arithmetic are unchanged. */
+        const bool pad_down = mgroups == 20u && out_dim == 2560u &&
+            getenv("DS4_QWEN4EXP_NO_DOWN_MMA_PADDING") == NULL;
+#define QWEN4EXP_DOWN_MMA(DT, P) \
+        qwen4exp_moe_down_mma_kernel<DT, P><<< \
                 dim3(out_dim / QW_DOWN_MMA_BM, gu_rows, 1), \
                 QW_DOWN_MMA_THREADS, 0, stream>>>( \
                 (float *)down_partial->ptr, down, sc.mq, sc.ms, sc.msum, \
@@ -4935,11 +4974,13 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
                 down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
                 mgroups, out_dim)
         if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q5_1) {
-            QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q5_1);
+            if (pad_down) { QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q5_1, 144); }
+            else { QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q5_1, QW_MMA_LD); }
         } else if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q8_0) {
-            QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q8_0);
+            if (pad_down) { QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q8_0, 144); }
+            else { QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q8_0, QW_MMA_LD); }
         } else {
-            QWEN4EXP_DOWN_MMA(-1);
+            QWEN4EXP_DOWN_MMA(-1, QW_MMA_LD);
         }
 #undef QWEN4EXP_DOWN_MMA
         if (!cuda_ok(cudaGetLastError(), "qwen4exp MoE down tile launch")) return 0;
