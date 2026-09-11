@@ -747,6 +747,25 @@ int ds4_qwen4exp_mtp_head_forward_last(ds4_qwen4exp_mtp_head *h,
                                        int *draft_out, float *multi_out,
                                        char *err, size_t errlen);
 
+/* Device-resident variants: copy `multi_dev_bytes` from `multi_dev` into the
+ * head's hyper buffer via decode-stream D2D instead of a blocking H2D. */
+int ds4_qwen4exp_mtp_head_forward_from_gpu(ds4_qwen4exp_mtp_head *h,
+                                           const int *next_tokens,
+                                           const ds4_gpu_tensor *multi_dev,
+                                           uint64_t multi_dev_offset,
+                                           uint64_t multi_dev_bytes,
+                                           uint32_t pos0, uint32_t n_tokens,
+                                           int *draft_out, float *multi_out,
+                                           char *err, size_t errlen);
+int ds4_qwen4exp_mtp_head_forward_last_from_gpu(ds4_qwen4exp_mtp_head *h,
+                                                const int *next_tokens,
+                                                const ds4_gpu_tensor *multi_dev,
+                                                uint64_t multi_dev_offset,
+                                                uint64_t multi_dev_bytes,
+                                                uint32_t pos0, uint32_t n_tokens,
+                                                int *draft_out, float *multi_out,
+                                                char *err, size_t errlen);
+
 /* Greedy argmax with the canonical lowest-id tie-break the shim's ds4s_argmax
  * documents.  Shared so the head and the cycle cannot break ties apart. */
 #endif /* DS4_NO_GPU */
