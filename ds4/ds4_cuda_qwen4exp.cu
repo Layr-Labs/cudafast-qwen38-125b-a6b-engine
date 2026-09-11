@@ -5324,6 +5324,97 @@ __global__ static void qwen4exp_hc_inject_weights_renorm_kernel(
     }
 }
 
+/* Decode-width mix and inject in the inject grid.
+ *
+ * The split decode path above reads and rebuilds every normalized hyper value
+ * once for the mix and once for each inject output.  The inject grid already
+ * visits the complete row for every output stream, so give each stream block
+ * a disjoint slice of mix channels and reuse the normalized values in that
+ * slice.  Four production blocks therefore publish all 2560 mix channels and
+ * the four inject scalars without the separate ten-block mix pass.
+ *
+ * Arithmetic order is unchanged.  `iacc` still walks (stream, channel) in the
+ * original ascending per-thread order and uses the same block reduction.  A
+ * mix accumulator still visits streams from zero through n_hc-1; interleaving
+ * several independent channel accumulators in one thread does not reassociate
+ * any one output.  Four named mix accumulators cover the production
+ * 2560/4/256 shape; the caller retains the split kernels for larger shapes. */
+#define QWEN4EXP_HC_MIX_SLOTS 4u
+__global__ static void qwen4exp_hc_mix_inject_decode_renorm_kernel(
+        float *mixed, float *inject,
+        const float *hyper, const float *nscale,
+        const float *normw, const float *wide, const char *iw,
+        uint32_t n_embd, uint32_t n_hc, uint32_t rows,
+        float weight_bias, int round_bf16,
+        uint32_t weight_type, uint32_t weight_row_bytes) {
+    const uint32_t h = blockIdx.x;
+    const uint32_t t = blockIdx.y;
+    if (t >= rows || h >= n_hc) return;
+
+    const uint32_t mix_tiles = n_embd / blockDim.x;
+    const uint32_t mix_base = mix_tiles / n_hc;
+    const uint32_t mix_extra = mix_tiles % n_hc;
+    const uint32_t mix_tile0 = h * mix_base +
+        (h < mix_extra ? h : mix_extra);
+    const uint32_t mix_tile_count = mix_base + (h < mix_extra ? 1u : 0u);
+    const uint32_t wide_width = n_hc * n_embd;
+    const float *xr = hyper + (uint64_t)t * wide_width;
+    const float *gr = wide + (uint64_t)t * wide_width;
+    const char *wr = iw + (uint64_t)h * weight_row_bytes;
+
+    /* Keep these as named scalars.  A runtime-indexed register array spills
+     * to local memory in this translation unit. */
+    float macc0 = 0.0f;
+    float macc1 = 0.0f;
+    float macc2 = 0.0f;
+    float macc3 = 0.0f;
+
+    float iacc = 0.0f;
+    for (uint32_t hs = 0; hs < n_hc; hs++) {
+        const float sc = nscale[(uint64_t)t * n_hc + hs];
+        for (uint32_t k = 0; k < n_embd; k += blockDim.x) {
+            const uint32_t d = k + threadIdx.x;
+            if (d >= n_embd) continue;
+            const uint32_t i = hs * n_embd + d;
+            const float normed = qwen4exp_hc_normed_value(
+                    xr[i], sc, normw[i], weight_bias, round_bf16);
+            iacc += normed * dev_qwen4exp_inject_value(
+                    weight_type, wr, i);
+
+            const uint32_t tile = k / blockDim.x;
+            if (tile >= mix_tile0 && tile < mix_tile0 + mix_tile_count) {
+                const uint32_t slot = tile - mix_tile0;
+                const float term = qwen4exp_sigmoid(gr[i]) * normed;
+                if (slot == 0u) macc0 += term;
+                else if (slot == 1u) macc1 += term;
+                else if (slot == 2u) macc2 += term;
+                else macc3 += term;
+            }
+        }
+    }
+
+    const uint64_t mix_row = (uint64_t)t * n_embd;
+    const float inv_hc = 1.0f / (float)n_hc;
+#define QWEN4EXP_HC_STORE_MIX(slot_, acc_) do {                              \
+        const uint32_t d =                                                   \
+            (mix_tile0 + (slot_)) * blockDim.x + threadIdx.x;                \
+        if ((slot_) < mix_tile_count && d < n_embd)                          \
+            mixed[mix_row + d] = (acc_) * inv_hc;                            \
+    } while (0)
+    QWEN4EXP_HC_STORE_MIX(0u, macc0);
+    QWEN4EXP_HC_STORE_MIX(1u, macc1);
+    QWEN4EXP_HC_STORE_MIX(2u, macc2);
+    QWEN4EXP_HC_STORE_MIX(3u, macc3);
+#undef QWEN4EXP_HC_STORE_MIX
+
+    __shared__ float partial[QWEN4EXP_HC_THREADS];
+    const float total = qwen4exp_block_sum_f32(iacc, partial);
+    if (threadIdx.x == 0u) {
+        inject[(uint64_t)t * n_hc + h] =
+            2.0f * qwen4exp_sigmoid(total * (1.0f / (float)n_hc));
+    }
+}
+
 /* Both of the above in ONE pass over the residual, one block per token.
  *
  * The two kernels read the same 41.9 MB; together they read it once.  The mix
@@ -5590,6 +5681,23 @@ static int qwen4exp_hc_mixer_fused_cuda(
                 inject_weight->type, (uint32_t)iw_row_bytes);
         return cuda_ok(cudaGetLastError(),
                        "qwen4exp_hc_mix_inject_renorm launch");
+    }
+
+    if (inject) {
+        const uint32_t mix_tiles = n_embd / threads;
+        const uint32_t mix_slots = (mix_tiles + n_hc - 1u) / n_hc;
+        if (mix_slots <= QWEN4EXP_HC_MIX_SLOTS) {
+            qwen4exp_hc_mix_inject_decode_renorm_kernel<<<
+                    dim3(n_hc, rows, 1u), threads, 0,
+                    cuda_decode_stream()>>>(
+                    (float *)mixed->ptr, (float *)inject->ptr,
+                    (const float *)hyper->ptr, nscale, normw,
+                    (const float *)wide_scratch->ptr, iw,
+                    n_embd, n_hc, rows, weight_bias, round_bf16,
+                    inject_weight->type, (uint32_t)iw_row_bytes);
+            return cuda_ok(cudaGetLastError(),
+                           "qwen4exp_hc mix/inject decode launch");
+        }
     }
 
     qwen4exp_hc_mix_renorm_kernel<<<dim3((n_embd + threads - 1u) / threads,
