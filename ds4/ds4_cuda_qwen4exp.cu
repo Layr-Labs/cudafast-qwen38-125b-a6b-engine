@@ -2061,7 +2061,7 @@ __global__ static void qwen4exp_moe_zero_invalid_kernel(
 #define QW_MMA_BN 32
 #define QW_MMA_G  4
 #define QW_MMA_KC (QW_MMA_G * 32)
-#define QW_MMA_LD (QW_MMA_KC + 4)
+#define QW_MMA_LD (QW_MMA_KC + 16)
 #define QW_MMA_WARPS ((QW_MMA_BM / 16) * (QW_MMA_BN / 16))
 #define QW_MMA_THREADS (QW_MMA_WARPS * 32)
 #define QW_MMA_NT (QW_MMA_BN / 16)
