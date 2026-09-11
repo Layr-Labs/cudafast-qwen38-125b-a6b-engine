@@ -76064,6 +76064,62 @@ static int qwen4exp_seam_draft_rows(void *ctx, const int *next_tokens,
     return 0;
 }
 
+/* Replace only the head's proposal when this request already demonstrated an
+ * unambiguous continuation for a matching long suffix.  The target still
+ * verifies it normally; unverified tokens never enter the lookup history. */
+static void qwen4exp_refine_draft_from_history(ds4_session *s,
+                                                const int *accepted,
+                                                int n_accepted) {
+    enum { MIN_MATCH = 4, MAX_MATCH = 16 };
+    ds4_qwen4exp_mtp_state *st = &s->qwen4exp_spec;
+    const token_vec *history = &s->checkpoint;
+    if (n_accepted < 1 || st->depth != 1 || st->n_pending != 1 ||
+        history->len < MIN_MATCH + 1) {
+        return;
+    }
+
+    const int logical_len = history->len + n_accepted + 1;
+    int max_match = logical_len;
+    if (max_match > MAX_MATCH) max_match = MAX_MATCH;
+
+    for (int match = max_match; match >= MIN_MATCH; match--) {
+        int proposal = -1;
+        bool found = false;
+        bool ambiguous = false;
+        for (int next = match; next < history->len; next++) {
+            bool equal = true;
+            for (int k = 0; k < match; k++) {
+                const int logical_i = logical_len - match + k;
+                int recent;
+                if (logical_i < history->len) {
+                    recent = history->v[logical_i];
+                } else if (logical_i < history->len + n_accepted) {
+                    recent = accepted[logical_i - history->len];
+                } else {
+                    recent = st->pending_parent;
+                }
+                if (history->v[next - match + k] != recent) {
+                    equal = false;
+                    break;
+                }
+            }
+            if (!equal) continue;
+            const int candidate = history->v[next];
+            if (!found) {
+                proposal = candidate;
+                found = true;
+            } else if (candidate != proposal) {
+                ambiguous = true;
+                break;
+            }
+        }
+        if (found && !ambiguous) {
+            st->pending[0] = proposal;
+            return;
+        }
+    }
+}
+
 /* Build the seam, the rollback set and the head, once per session.  Returns
  * false with a named message when anything refuses, and the caller returns -1:
  * a half-built cycle is a refusal, not a reason to speculate anyway. */
@@ -76178,6 +76234,7 @@ static int ds4_session_qwen4exp_spec_cycle(ds4_session *s, int first_token,
                                          first_token, pos, max_tokens,
                                          accepted, accepted_cap, s->logits,
                                          err, errlen);
+    if (n > 0) qwen4exp_refine_draft_from_history(s, accepted, n);
     /* Push what the round committed, the way every sibling verifier does.  The
      * serial path appends inside the forward, but the cycle's rows go through
      * the seam, so without this ds4_session_pos() freezes at the prompt length
