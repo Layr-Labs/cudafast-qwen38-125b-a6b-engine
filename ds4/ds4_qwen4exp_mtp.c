@@ -759,6 +759,11 @@ int ds4_qwen4exp_mtp_head_init(ds4_qwen4exp_mtp_head *h,
     const uint64_t f = sizeof(float);
     bool ok = true;
 
+    for (uint32_t i = 0; i < DS4_QWEN4EXP_MTP_MAX_COMMIT; i++) {
+        h->t_hyper_row[i] = NULL;
+    }
+    if (h->max_tokens > DS4_QWEN4EXP_MTP_MAX_COMMIT) ok = false;
+
     h->t_tokens       = mtp_alloc(rows * sizeof(int32_t), &ok);
     h->t_embed_rows   = mtp_alloc(rows * n_embd * f, &ok);
     h->t_embed_out    = mtp_alloc(rows * n_embd * f, &ok);
@@ -772,6 +777,16 @@ int ds4_qwen4exp_mtp_head_init(ds4_qwen4exp_mtp_head *h,
     h->t_sample       = mtp_alloc(rows * n_embd * f, &ok);
     h->t_logits       = mtp_alloc(rows * h->n_vocab * f, &ok);
     h->t_top1         = mtp_alloc(rows * sizeof(uint32_t), &ok);
+    if (ok) {
+        for (uint32_t i = 0; i < h->max_tokens; i++) {
+            h->t_hyper_row[i] = ds4_gpu_tensor_view(
+                h->t_hyper, (uint64_t)i * hc_dim * f, hc_dim * f);
+            if (!h->t_hyper_row[i]) {
+                ok = false;
+                break;
+            }
+        }
+    }
     h->top1_host      = malloc((size_t)rows * sizeof(uint32_t));
     if (!ok || !h->top1_host) {
         ds4_qwen4exp_mtp_head_free(h);
@@ -784,6 +799,10 @@ int ds4_qwen4exp_mtp_head_init(ds4_qwen4exp_mtp_head *h,
 
 void ds4_qwen4exp_mtp_head_free(ds4_qwen4exp_mtp_head *h) {
     if (!h) return;
+    for (uint32_t i = 0; i < DS4_QWEN4EXP_MTP_MAX_COMMIT; i++) {
+        ds4_gpu_tensor_free(h->t_hyper_row[i]);
+        h->t_hyper_row[i] = NULL;
+    }
     ds4_gpu_tensor *all[] = {
         h->t_tokens, h->t_embed_rows, h->t_embed_out, h->t_e_normed,
         h->t_h_normed, h->t_ehx, h->t_hyper, h->t_mix_normed,
@@ -997,15 +1016,11 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                             pos0, n_tokens) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_BLOCK);
-    /* t_h_normed's previous contents were consumed by eh_proj.  Reuse it for
-     * the final hyper row so the stateless tail needs neither tensor views
-     * nor an extra allocation.  Keep t_hyper intact for multi_out. */
-    if (ok && narrow_logits) {
-        stage = "last head row";
-        ok = ds4_gpu_tensor_copy(h->t_h_normed, 0, h->t_hyper,
-                                  (uint64_t)first_row * hc_dim * f,
-                                  hc_dim * f) != 0;
-    }
+    /* The stateless tail only consumes the last row on a compact call.  Its
+     * persistent non-owning view avoids a synchronous D2D copy on every MTP
+     * round while leaving t_hyper intact for an optional multi_out read. */
+    const ds4_gpu_tensor *tail_input = narrow_logits
+        ? h->t_hyper_row[first_row] : h->t_hyper;
     /* The head's own mixer: a gated residual with no inject head, the same
      * shape as the tower's final mixer. */
     if (ok) {
@@ -1023,7 +1038,7 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
             h->head_map, h->head_size, h->hc_head_up_offset, 0, 0, 0 };
         ok = h->hooks.hc_mixer(h->t_sample, NULL, h->t_mix_normed,
                                h->t_mix_lowrank, h->t_mix_wide,
-                               narrow_logits ? h->t_h_normed : h->t_hyper,
+                               tail_input,
                                &norm_slab, &down_slab, &up_slab, NULL,
                                n_embd, n_hc, h->n_lowrank, logit_rows,
                                h->rms_eps, h->weight_bias, h->round_bf16) != 0;
