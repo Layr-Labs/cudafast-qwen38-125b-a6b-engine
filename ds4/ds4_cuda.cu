@@ -5755,6 +5755,99 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
     }
 }
 
+/* The one-row paired-lane arithmetic above, with each half warp's sixteen
+ * consecutive 34-byte weight blocks copied cooperatively.  The original
+ * kernel issues its word loads after assigning two lanes to a block, so one
+ * load instruction spans sixteen 34-byte records.  Here every load
+ * instruction reads consecutive words, then the same lane pair consumes the
+ * same scale and payload from a private shared-memory tile. */
+__global__ static void matmul_q8_0_preq_pair_lanes_coalesced_kernel(
+        float *out, const unsigned char *w,
+        const int8_t *xq, const float *xscale,
+        uint64_t out_dim, uint64_t blocks) {
+    enum { ROWS = 4, SIDES = 2, GROUPS_PER_SIDE = 16,
+           TILE_BYTES = GROUPS_PER_SIDE * 34 };
+    __shared__ __align__(16) unsigned char staged[ROWS][SIDES][TILE_BYTES];
+
+    const uint32_t local_row = threadIdx.x >> 6u;
+    const uint32_t local_lane = threadIdx.x & 63u;
+    const uint32_t side = local_lane >> 5u;
+    const uint32_t warp_lane = local_lane & 31u;
+    const uint32_t pair = warp_lane >> 1u;
+    const uint32_t half = warp_lane & 1u;
+    const uint32_t group = side * GROUPS_PER_SIDE + pair;
+    const uint64_t row = (uint64_t)blockIdx.x * ROWS + local_row;
+    float acc = 0.0f;
+
+    if (row < out_dim) {
+        const unsigned char *wr = w + row * blocks * 34u;
+        unsigned char *tile = staged[local_row][side];
+        for (uint64_t base = (uint64_t)side * GROUPS_PER_SIDE;
+             base < blocks; base += 32u) {
+            const uint32_t live = (uint32_t)(blocks - base < GROUPS_PER_SIDE
+                ? blocks - base : GROUPS_PER_SIDE);
+            const uint32_t tile_bytes = live * 34u;
+            const uint32_t words = tile_bytes >> 2u;
+            const uint32_t *src = (const uint32_t *)(const void *)(wr + base * 34u);
+            uint32_t *dst = (uint32_t *)(void *)tile;
+            for (uint32_t i = warp_lane; i < words; i += 32u) dst[i] = src[i];
+            if (warp_lane == 0u && (tile_bytes & 2u)) {
+                *(uint16_t *)(void *)(tile + tile_bytes - 2u) =
+                    *(const uint16_t *)(const void *)(wr + base * 34u +
+                                                     tile_bytes - 2u);
+            }
+            __syncwarp();
+
+            if (pair < live) {
+                const uint64_t b = base + pair;
+                const int8_t *payload =
+                    (const int8_t *)(const void *)(tile + pair * 34u + 2u) +
+                    half * 16u;
+                const uintptr_t address = (uintptr_t)payload;
+                const uint32_t shift = (uint32_t)(address & 3u) * 8u;
+                const uint32_t *packed =
+                    (const uint32_t *)(address & ~(uintptr_t)3u);
+                uint32_t previous = packed[0];
+                int32_t wq[4];
+#pragma unroll
+                for (int j = 0; j < 3; j++) {
+                    const uint32_t next = packed[j + 1];
+                    wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
+                    previous = next;
+                }
+                const uint16_t last =
+                    *(const uint16_t *)(const void *)(payload + 14);
+                wq[3] = (int32_t)__funnelshift_r(
+                    previous, (uint32_t)last, shift);
+                const float ws = __half2float(
+                    *(const __half *)(const void *)(tile + pair * 34u));
+                const uint64_t at = b;
+                const int32_t *xw =
+                    (const int32_t *)(const void *)(xq + at * 32u +
+                                                   half * 16u);
+                int dot = 0;
+#pragma unroll
+                for (int j = 0; j < 4; j++)
+                    dot = __dp4a(wq[j], xw[j], dot);
+                const unsigned active =
+                    0xffffffffu >> (32u - 2u * live);
+                dot += __shfl_xor_sync(active, dot, 1);
+                if (half == 0u)
+                    acc += ws * xscale[at] * (float)dot;
+            }
+            __syncwarp();
+        }
+    }
+
+    __shared__ float partial[ROWS][32];
+    if (half == 0u) partial[local_row][group] = acc;
+    __syncthreads();
+    if (local_lane < 32u) {
+        const float total = warp_sum_f32(partial[local_row][local_lane]);
+        if (local_lane == 0u && row < out_dim) out[row] = total;
+    }
+}
+
 /* The same per-output-element arithmetic as the tile kernel above, on the int8
  * tensor cores, with the whole prefill width in ONE tile.
  *
@@ -16572,7 +16665,17 @@ static int cuda_matmul_q8_0_preq_rows_exact(
         (((uintptr_t)wptr & 1u) == 0u)) {
         const bool one_row = n_rows == 1u &&
             getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL;
-        if (one_row) {
+        const bool coalesced = one_row && blocks >= 16u &&
+            (blocks & 1u) == 0u &&
+            (((uintptr_t)wptr & 3u) == 0u) &&
+            getenv("DS4_QWEN4EXP_PAIR_LANES_SCATTERED") == NULL;
+        if (coalesced) {
+            matmul_q8_0_preq_pair_lanes_coalesced_kernel<<<
+                    dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u),
+                    256, 0, cuda_decode_stream()>>>(
+                    (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
+                    out_dim, blocks);
+        } else if (one_row) {
             matmul_q8_0_preq_pair_lanes_kernel<1><<<
                     dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u),
                     256, 0, cuda_decode_stream()>>>(
