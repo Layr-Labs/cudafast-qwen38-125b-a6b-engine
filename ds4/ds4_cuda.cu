@@ -17784,7 +17784,7 @@ extern "C" int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
      * unrolling. Actual device pointers must support the vector load. */
     if (in_dim == 2560u &&
         ((out_dim == 48u && n_rows <= 2u) ||
-         (out_dim == 512u && n_rows == 2u)) &&
+         (out_dim == 512u && n_rows <= 2u)) &&
         (((uintptr_t)w | (uintptr_t)x->ptr) & 15u) == 0u &&
         getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
         getenv("DS4_F32_NO_VECTOR_DECODE") == NULL) {
@@ -17796,6 +17796,14 @@ extern "C" int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
         } else if (out_dim == 48u) {
             qwen_f32_vector_tree_kernel<2, 2, 10><<<
                 (unsigned)out_dim, 128, 0, cuda_decode_stream()>>>(
+                    (float *)out->ptr, (const float *)w,
+                    (const float *)x->ptr, out_dim);
+        } else if (out_dim == 512u && n_rows == 1u) {
+            /* One-token router: same C=4 / U=1 geometry as the proven two-row
+             * router vector path. Prior C=2/U=10 attempt was bit-identical but
+             * slower; this matches the tip's n=2 leaf width. */
+            qwen_f32_vector_tree_kernel<1, 4, 1><<<
+                (unsigned)out_dim, 64, 0, cuda_decode_stream()>>>(
                     (float *)out->ptr, (const float *)w,
                     (const float *)x->ptr, out_dim);
         } else {
