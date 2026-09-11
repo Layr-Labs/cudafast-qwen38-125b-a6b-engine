@@ -2997,6 +2997,45 @@ __global__ static void qwen4exp_moe_down_q_kernel(
 #pragma unroll
     for (int r = 0; r < R; r++) acc[r] = 0.0f;
 
+    /* THE NEXT SLOT'S EXPERT ID IS READ BEFORE THE CURRENT SLOT'S WEIGHTS ARE.
+     * Every slot here is a chain of three dependent steps: read the expert id
+     * from global, form the weight row address from it, then read the weights.
+     * The ids are independent of each other and of the weights, but the inner
+     * group walk sits between them, so the id load is not hoisted on its own
+     * and each slot's weight read waits on an index read that could have been
+     * issued a slot earlier.  Carrying the following id in a register breaks
+     * that address dependency.
+     *
+     * THE IDS, THE ROWS AND THE ORDER acc[] IS ACCUMULATED IN ARE UNCHANGED,
+     * so the output row is bit for bit the original's.  Only the one-row form
+     * takes this path; wider calls keep the original loop, where the ids vary
+     * with r as well as slot. */
+    if (R == 1 && take >= 1u) {
+        const uint32_t t = tok0;
+        const int32_t *sel = selected + (uint64_t)t * n_expert_used;
+        int32_t e_cur = n_expert_used > 0u ? sel[0] : -1;
+        for (uint32_t slot = 0; slot < n_expert_used; slot++) {
+            const int32_t e = e_cur;
+            e_cur = (slot + 1u < n_expert_used) ? sel[slot + 1u] : -1;
+            if (e < 0 || (uint32_t)e >= n_total_expert) continue;
+            const char *drow = down +
+                (uint64_t)(uint32_t)e * down_expert_bytes +
+                (uint64_t)row * down_row_bytes;
+            const uint64_t mrow = (uint64_t)t * n_expert_used + slot;
+            for (uint32_t g = lane; g < groups; g += 32u) {
+                int8_t wq[32];
+                float wa[2], wb[2];
+                int halves = 1;
+                dev_qwen4exp_group_decode(
+                        DownType < 0 ? down_type : (uint32_t)DownType,
+                        drow, g, wq, wa, wb, &halves);
+                const uint64_t at_g = mrow * groups + g;
+                qwen4exp_group_accumulate(&acc[0], wq, wa, wb, halves,
+                                          mq + at_g * 32u, ms[at_g],
+                                          msum[at_g]);
+            }
+        }
+    } else
     for (uint32_t slot = 0; slot < n_expert_used; slot++) {
 #pragma unroll
         for (int r = 0; r < R; r++) {
