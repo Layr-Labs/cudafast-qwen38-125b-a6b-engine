@@ -7378,8 +7378,15 @@ extern "C" int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
      * whose grid is n_head times wider and which is what a one-row decode
      * needs to fill the device at all. */
     const uint32_t gqa = n_head / n_kv_head;
-    const uint32_t want = (n_tokens >= QWEN4EXP_QSA_GROUP_MIN_ROWS)
-        ? qwen4exp_qsa_group_width() : 1u;
+    /* Prefill keeps the wide group. Speculative verify is exactly two tokens:
+     * GROUP=2 shares each K/V row across a GQA pair while keeping a 24-block
+     * grid. One-token decode stays per-head. */
+    uint32_t want = 1u;
+    if (n_tokens >= QWEN4EXP_QSA_GROUP_MIN_ROWS) {
+        want = qwen4exp_qsa_group_width();
+    } else if (n_tokens == 2u) {
+        want = 2u;
+    }
     if (want > 1u) {
         uint32_t g = want < gqa ? want : gqa;
         while (g > 1u && (gqa % g) != 0u) g--;
