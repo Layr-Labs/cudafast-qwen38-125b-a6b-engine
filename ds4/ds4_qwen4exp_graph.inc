@@ -2049,6 +2049,106 @@ static bool qwen4exp_forward_fail(void) {
     return false;
 }
 
+
+/* Encode the tower tail once: final HC mixer, optional last-row gather, LM
+ * head, and optional compact top-1.  All kernel parameters are stable for a
+ * fixed (n_tokens, logit_rows, top1) variant, so the whole train can ride
+ * island 4.  Host end_commands / logit D2H stay outside capture. */
+static bool qwen4exp_graph_tail_island_encode(
+        ds4_qwen4exp_session *s, const ds4_qwen4exp_weights *w,
+        const ds4_model *m, uint32_t n_tokens, const char **failed_stage) {
+    const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
+    const char *stage = "final mixer";
+    if (!qwen4exp_graph_residual(s, m, w->output_hc_norm, w->output_hc_down,
+                                 w->output_hc_up, NULL,
+                                 w->output_hc_norm_offset, n_tokens)) {
+        if (failed_stage) *failed_stage = stage;
+        return false;
+    }
+    QW_TRACE(QW_SLICE_FINAL_MIX);
+
+    const uint32_t logit_rows = s->spec_logit_rows ? n_tokens : 1u;
+    if (logit_rows == 1u) {
+        stage = "head row copy";
+        const uint64_t last =
+            (uint64_t)(n_tokens - 1u) * DS4_N_EMBD * sizeof(float);
+        if (!ds4_gpu_tensor_copy(s->embed_rows, 0, s->mixed, last,
+                                 (uint64_t)DS4_N_EMBD * sizeof(float))) {
+            if (failed_stage) *failed_stage = stage;
+            return false;
+        }
+    }
+    stage = "LM head";
+    if (!ds4_qwen4exp_matmul_q8_0(s->logits, QW_MAP(m, w->output),
+                                    QW_MAPSZ(m, w->output), QW_OFF(w->output),
+                                    DS4_N_EMBD, cfg->n_vocab,
+                                    logit_rows == 1u ? s->embed_rows : s->mixed,
+                                    logit_rows)) {
+        if (failed_stage) *failed_stage = stage;
+        return false;
+    }
+    if (s->spec_top1_rows != 0u) {
+        stage = "compact verify top-1";
+        if (s->spec_top1_rows != logit_rows ||
+            !ds4_gpu_indexer_topk_tensor(s->spec_top1, s->logits,
+                                         cfg->n_vocab, logit_rows, 1u)) {
+            if (failed_stage) *failed_stage = stage;
+            return false;
+        }
+    }
+    QW_TRACE(QW_SLICE_HEAD);
+    if (failed_stage) *failed_stage = stage;
+    return true;
+}
+
+/* Island 4: capture the eager tower tail that still sat between the last
+ * layer island and end_commands.  Decode widths only; prefill stays eager. */
+static bool qwen4exp_graph_tail_island(
+        ds4_qwen4exp_session *s, const ds4_qwen4exp_weights *w,
+        const ds4_model *m, uint32_t n_tokens) {
+    const bool capture_ok =
+        n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
+        !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
+        ds4_gpu_decode_graphs_supported();
+    const char *stage = "final mixer";
+    if (capture_ok) {
+        ds4_decode_graph_key key;
+        memset(&key, 0, sizeof(key));
+        /* Slot the single tower-tail executable at il=0 / island=4.  Variant
+         * packs width, logit width mode, and whether compact top-1 runs. */
+        const uint32_t logit_rows = s->spec_logit_rows ? n_tokens : 1u;
+        key.il = 0u;
+        key.island = 4u;
+        key.variant = n_tokens
+                    | ((logit_rows & 0xffu) << 8u)
+                    | ((s->spec_top1_rows != 0u ? 1u : 0u) << 16u);
+        key._pad = 0x5441494cu; /* TAIL */
+        key.cur_hc = s->hyper;
+        key.after_attn_hc = s;
+        key.after_ffn_hc = (void *)w;
+        key.attn_norm = (void *)m;
+        const int state = ds4_gpu_decode_graph_begin(&key);
+        if (state == 1) {
+            QW_TRACE(QW_SLICE_FINAL_MIX);
+            QW_TRACE(QW_SLICE_HEAD);
+            return true;
+        }
+        if (state == 0) {
+            if (qwen4exp_graph_tail_island_encode(s, w, m, n_tokens, &stage) &&
+                ds4_gpu_decode_graph_end(&key) == 0) {
+                return true;
+            }
+            ds4_gpu_decode_graph_abort(&key);
+            /* Failed capture executed nothing; fall through to eager. */
+        }
+    }
+    if (!qwen4exp_graph_tail_island_encode(s, w, m, n_tokens, &stage)) {
+        fprintf(stderr, "ds4: qwen4exp tower tail failed at the %s\n", stage);
+        return false;
+    }
+    return true;
+}
+
 bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
                                 const ds4_qwen4exp_weights *w,
                                 const ds4_model            *m,
@@ -2189,53 +2289,12 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
 #endif
     }
 
-    /* The final mixer has no inject head: it collapses n_hc * n_embd to
-     * n_embd and stands in for the model.norm this checkpoint does not have. */
-    if (!qwen4exp_graph_residual(s, m, w->output_hc_norm, w->output_hc_down,
-                                 w->output_hc_up, NULL,
-                                 w->output_hc_norm_offset, n_tokens)) {
-        fprintf(stderr, "ds4: qwen4exp final mixer failed\n");
+    /* Island 4: final mixer + LM head (+ compact top-1).  Prefill widths
+     * stay on the eager encode path inside the helper. */
+    if (!qwen4exp_graph_tail_island(s, w, m, n_tokens)) {
         return qwen4exp_forward_fail();
     }
-    QW_TRACE(QW_SLICE_FINAL_MIX);
-
-    /*
-     * The LM head, over one row or over all of them.
-     *
-     * A prefill reads only the last row, and n_vocab is 248320, so a row it
-     * will not read is wasted work.  A SPECULATIVE VERIFY reads every row: the
-     * accept loop compares each drafted position against the target's own
-     * argmax there, and running the head per row afterwards re-reads the
-     * 676 MiB output weight once per comparison.  Over the chain the head is
-     * the same arithmetic either way -- the routed entry gives every row the
-     * one-row reduction order at any width -- so the wide call is the same
-     * numbers with the weight read once.
-     */
     const uint32_t logit_rows = s->spec_logit_rows ? n_tokens : 1u;
-    if (logit_rows == 1u) {
-        const uint64_t last = (uint64_t)(n_tokens - 1u) * DS4_N_EMBD * sizeof(float);
-        if (!ds4_gpu_tensor_copy(s->embed_rows, 0, s->mixed, last,
-                                       (uint64_t)DS4_N_EMBD * sizeof(float))) {
-            fprintf(stderr, "ds4: qwen4exp head row copy failed\n");
-            return qwen4exp_forward_fail();
-        }
-    }
-    if (!ds4_qwen4exp_matmul_q8_0(s->logits, QW_MAP(m, w->output),
-                                    QW_MAPSZ(m, w->output), QW_OFF(w->output),
-                                    DS4_N_EMBD, cfg->n_vocab,
-                                    logit_rows == 1u ? s->embed_rows : s->mixed,
-                                    logit_rows)) {
-        fprintf(stderr, "ds4: qwen4exp LM head failed\n");
-        return qwen4exp_forward_fail();
-    }
-    if (s->spec_top1_rows != 0u &&
-        (s->spec_top1_rows != logit_rows ||
-         !ds4_gpu_indexer_topk_tensor(s->spec_top1, s->logits,
-                                      cfg->n_vocab, logit_rows, 1u))) {
-        fprintf(stderr, "ds4: qwen4exp compact verify top-1 failed\n");
-        return qwen4exp_forward_fail();
-    }
-    QW_TRACE(QW_SLICE_HEAD);
     QW_TRACE_REPORT(n_tokens);
     /* Commit and wait: the logits are read on the host from here on. */
     if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
