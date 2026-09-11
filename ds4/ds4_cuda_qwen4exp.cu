@@ -1999,7 +1999,7 @@ __global__ static void qwen4exp_moe_zero_invalid_kernel(
 /* Gate/up benefits from the 32-row quadrant pipeline because it stages two
  * weight tiles.  Down stages only one and runs faster with its former 64-row
  * tile, which avoids doubling that projection's block count. */
-#define QW_DOWN_MMA_BM 64
+#define QW_DOWN_MMA_BM 128
 #define QW_DOWN_MMA_WARPS (QW_DOWN_MMA_BM / 16)
 #define QW_DOWN_MMA_THREADS (QW_DOWN_MMA_WARPS * 32)
 #define QW_DOWN_MMA_NT (QW_MMA_BN / 8)
