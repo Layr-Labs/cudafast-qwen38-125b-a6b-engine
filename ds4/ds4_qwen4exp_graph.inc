@@ -1283,14 +1283,30 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
                                      uint32_t n_tokens) {
     const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
 
-    if (!ds4_qwen4exp_matmul_q8_0(s->gdn_qkv, QW_MAP(m, l->attn_qkv),
-                                    QW_MAPSZ(m, l->attn_qkv), QW_OFF(l->attn_qkv),
-                                    DS4_N_EMBD, cfg->gdn_qkv_dim,
-                                    s->mixed, n_tokens) ||
-        !ds4_qwen4exp_matmul_q8_0(s->gdn_gate, QW_MAP(m, l->attn_gate),
-                                    QW_MAPSZ(m, l->attn_gate), QW_OFF(l->attn_gate),
-                                    DS4_N_EMBD, cfg->gdn_inner,
-                                    s->mixed, n_tokens) ||
+    /* Both quantized projections consume the same unmodified activation.
+     * Quantize it once into the QSA session scratch and share the exact bytes
+     * and scales instead of launching the row quantizer twice. */
+    const uint64_t q8_blocks = (uint64_t)DS4_N_EMBD / 32u;
+    const uint64_t q8_qbytes = (uint64_t)n_tokens * q8_blocks * 32u;
+    const uint64_t q8_soff = (q8_qbytes + 15u) & ~15ull;
+    if (!ds4_qwen4exp_quantize_q8_0(s->qsa_mixed_q8, 0, q8_soff, s->mixed,
+                                    DS4_N_EMBD, n_tokens)) {
+        fprintf(stderr,
+                "ds4: qwen4exp GDN activation quantize failed at block %u\n",
+                il);
+        return false;
+    }
+
+    if (!ds4_qwen4exp_matmul_q8_0_preq(
+            s->gdn_qkv, QW_MAP(m, l->attn_qkv),
+            QW_MAPSZ(m, l->attn_qkv), QW_OFF(l->attn_qkv),
+            DS4_N_EMBD, cfg->gdn_qkv_dim,
+            s->qsa_mixed_q8, 0, q8_soff, n_tokens) ||
+        !ds4_qwen4exp_matmul_q8_0_preq(
+            s->gdn_gate, QW_MAP(m, l->attn_gate),
+            QW_MAPSZ(m, l->attn_gate), QW_OFF(l->attn_gate),
+            DS4_N_EMBD, cfg->gdn_inner,
+            s->qsa_mixed_q8, 0, q8_soff, n_tokens) ||
         !ds4_qwen4exp_matmul_f32(s->gdn_alpha, QW_MAP(m, l->ssm_alpha),
                                    QW_MAPSZ(m, l->ssm_alpha), QW_OFF(l->ssm_alpha),
                                    DS4_N_EMBD, DS4_N_GDN_VALUE_HEAD,
