@@ -4731,13 +4731,27 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         }
 #undef QWEN4EXP_GATEUP_MMA
     }
-    /* The measured Q4 path for the R=2 tile (one-row decode and two-row
-     * verify). qwen4exp_moe_tile already returns 2 for n_tokens <= 2, so the
-     * joint R=2 kernel was already the decode path; splitting gate/up across
-     * neighboring warps applies the same register cut there. The diagnostic
-     * pin retains the joint projection as a bit-exact oracle. Other widths
-     * keep their prior kernel. */
-    else if (n_tokens <= 2u && tile == 2 && specialize &&
+    /* The measured split Q4 path. Decode carries one token and gets an R=1
+     * instantiation, so the second accumulator, token slot, reduction and
+     * shared-memory row of the R=2 verifier are absent rather than merely
+     * guarded by take == 1. Two-row verification keeps the established R=2
+     * kernel. Each live row retains the same group walk, accumulator and warp
+     * reduction, so this is an occupancy/instruction specialization only. */
+    else if (n_tokens == 1u && tile == 2 && specialize &&
+             gate_slab->type == DS4_QWEN4EXP_TY_q4_K &&
+             up_slab->type == DS4_QWEN4EXP_TY_q4_K &&
+             getenv("DS4_QWEN4EXP_NO_SPLIT_GATEUP") == NULL) {
+        qwen4exp_moe_gateup_split_kernel<1, DS4_QWEN4EXP_TY_q4_K><<<
+            dim3((mid_dim + 3u) / 4u, gu_rows, 1), threads, 0, stream>>>(
+            (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum,
+            sc.pairs, sc.counts, sc.offsets, gu_active,
+            (const float *)weights->ptr,
+            gate_slab->expert_bytes, gate_slab->row_bytes,
+            up_slab->expert_bytes, up_slab->row_bytes,
+            gate_slab->type, up_slab->type, xgroups, mid_dim,
+            mid_token_stride, n_expert_used);
+    }
+    else if (n_tokens == 2u && tile == 2 && specialize &&
              gate_slab->type == DS4_QWEN4EXP_TY_q4_K &&
              up_slab->type == DS4_QWEN4EXP_TY_q4_K &&
              getenv("DS4_QWEN4EXP_NO_SPLIT_GATEUP") == NULL) {
