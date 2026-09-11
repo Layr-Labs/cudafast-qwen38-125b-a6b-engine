@@ -5755,6 +5755,66 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
     }
 }
 
+/* HC up has only ten Q8 groups.  Pair lanes inside one warp and retain the
+ * original zero-padded 32-chain reduction without the second warp, shared
+ * remap or block barrier used by the general projection. */
+template <int R>
+__global__ static void matmul_q8_hc_up_warp_pair_kernel(
+        float *out, const unsigned char *w,
+        const int8_t *xq, const float *xs, uint64_t out_dim, uint32_t rows) {
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned group = lane >> 1u;
+    const unsigned half = lane & 1u;
+    const uint64_t row = (uint64_t)blockIdx.x * 4u + (threadIdx.x >> 5u);
+    if (row >= out_dim) return;
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) acc[r] = 0.0f;
+    if (group < 10u) {
+        const unsigned char *blk = w + row * 340u + group * 34u;
+        const int8_t *payload = (const int8_t *)(blk + 2u) + half * 16u;
+        const uintptr_t address = (uintptr_t)payload;
+        const unsigned shift = (unsigned)(address & 3u) * 8u;
+        const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
+        uint32_t previous = words[0];
+        int32_t wq[4];
+#pragma unroll
+        for (int j = 0; j < 3; j++) {
+            const uint32_t next = words[j + 1];
+            wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
+            previous = next;
+        }
+        const uint16_t last = *(const uint16_t *)(const void *)(payload + 14);
+        wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
+        const float ws = __half2float(*(const __half *)blk);
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            if ((unsigned)r < rows) {
+                const unsigned at = (unsigned)r * 10u + group;
+                const int32_t *xw = (const int32_t *)(xq + at * 32u + half * 16u);
+                int dot = 0;
+#pragma unroll
+                for (int j = 0; j < 4; j++) dot = __dp4a(wq[j], xw[j], dot);
+                dot += __shfl_xor_sync(0x000fffffu, dot, 1);
+                if (half == 0u) acc[r] += ws * xs[at] * (float)dot;
+            }
+        }
+    }
+
+    /* Logical chains 16..31 are zero.  Chains 0..15 occupy even lanes, so
+     * original strides 8,4,2,1 map to physical strides 16,8,4,2 after the
+     * explicit zero addition that preserves the original stride-16 level. */
+#pragma unroll
+    for (int r = 0; r < R; r++) {
+        acc[r] = acc[r] + 0.0f;
+#pragma unroll
+        for (int d = 16; d >= 2; d >>= 1)
+            acc[r] += __shfl_down_sync(0xffffffffu, acc[r], d);
+        if (lane == 0u && (unsigned)r < rows)
+            out[(uint64_t)r * out_dim + row] = acc[r];
+    }
+}
+
 /* The same per-output-element arithmetic as the tile kernel above, on the int8
  * tensor cores, with the whole prefill width in ONE tile.
  *
@@ -16572,7 +16632,22 @@ static int cuda_matmul_q8_0_preq_rows_exact(
         (((uintptr_t)wptr & 1u) == 0u)) {
         const bool one_row = n_rows == 1u &&
             getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL;
-        if (one_row) {
+        if (in_dim == 320u && out_dim == 10240u &&
+            getenv("DS4_Q8_NO_HC_WARP_PAIR") == NULL) {
+            if (one_row) {
+                matmul_q8_hc_up_warp_pair_kernel<1><<<
+                        (unsigned)((out_dim + 3u) / 4u), 128, 0,
+                        cuda_decode_stream()>>>(
+                        (float *)out->ptr, (const unsigned char *)wptr,
+                        xq, xscale, out_dim, n_rows);
+            } else {
+                matmul_q8_hc_up_warp_pair_kernel<2><<<
+                        (unsigned)((out_dim + 3u) / 4u), 128, 0,
+                        cuda_decode_stream()>>>(
+                        (float *)out->ptr, (const unsigned char *)wptr,
+                        xq, xscale, out_dim, n_rows);
+            }
+        } else if (one_row) {
             matmul_q8_0_preq_pair_lanes_kernel<1><<<
                     dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u),
                     256, 0, cuda_decode_stream()>>>(
