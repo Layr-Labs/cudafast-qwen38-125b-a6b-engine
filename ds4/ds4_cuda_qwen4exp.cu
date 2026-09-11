@@ -2883,6 +2883,10 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
 /* Grid (ceil(mid_dim / 8), n_expert).  The block owns one expert; the pair
  * list gives it the (token, slot) pairs that chose it, so a decoded group
  * serves R of them. */
+__device__ __forceinline__ static void qwen4exp_group_accumulate_w(
+        float *acc, const int32_t *wq, const float *wa, const float *wb,
+        int halves, const int32_t *xqg, float xscale, int32_t xsum);
+
 /* Common slab formats get compile-time decoders below.  Keeping the
  * generic instantiation preserves every supported format combination. */
 template <int R, int GateType = -1, int UpType = -1>
@@ -3025,16 +3029,40 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                     (uint64_t)row * down_row_bytes;
                 const uint64_t mrow = (uint64_t)t * n_expert_used + slot;
                 for (uint32_t g = lane; g < groups; g += 32u) {
-                    int8_t wq[32];
+                    int32_t wq[8];
                     float wa[2], wb[2];
                     int halves = 1;
-                    dev_qwen4exp_group_decode(
-                            DownType < 0 ? down_type : (uint32_t)DownType,
-                            drow, g, wq, wa, wb, &halves);
+                    if (DownType == DS4_QWEN4EXP_TY_q5_1) {
+                        /* The production routed-down slab is Q5_1.  Decode
+                         * its six raw words and feed the resulting eight words
+                         * straight to DP4A.  This is the byte-identical word
+                         * path already used by the routed MMA kernels; it
+                         * avoids both byte reconstruction and repacking. */
+                        uint32_t raw[8];
+                        const uint32_t *rawp = qw_raw_load(
+                                (uint32_t)DS4_QWEN4EXP_TY_q5_1,
+                                drow, g, raw) ? raw : NULL;
+                        dev_qwen4exp_group_decode_w(
+                                (uint32_t)DS4_QWEN4EXP_TY_q5_1,
+                                drow, g, rawp, (int8_t *)(void *)wq, wa, wb);
+                    } else {
+                        dev_qwen4exp_group_decode(
+                                DownType < 0 ? down_type : (uint32_t)DownType,
+                                drow, g, (int8_t *)(void *)wq,
+                                wa, wb, &halves);
+                    }
                     const uint64_t at_g = mrow * groups + g;
-                    qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves,
-                                              mq + at_g * 32u, ms[at_g],
-                                              msum[at_g]);
+                    if (DownType == DS4_QWEN4EXP_TY_q5_1) {
+                        qwen4exp_group_accumulate_w(
+                                &acc[r], wq, wa, wb, 1,
+                                (const int32_t *)(const void *)(mq + at_g * 32u),
+                                ms[at_g], msum[at_g]);
+                    } else {
+                        qwen4exp_group_accumulate(
+                                &acc[r], (const int8_t *)(const void *)wq,
+                                wa, wb, halves, mq + at_g * 32u,
+                                ms[at_g], msum[at_g]);
+                    }
                 }
             }
         }
