@@ -6547,7 +6547,44 @@ __global__ static void qwen4exp_qsa_attention_kernel(
 
         if (tid < head_dim) {
             float contrib = 0.0f;
-            for (uint32_t j = 0; j < n_in_tile; j++) {
+            uint32_t j = 0;
+            /* FOUR VALUE ROWS IN FLIGHT AT A TIME.  This loop is the longest
+             * dependency chain in the kernel: one global load per key, each
+             * add waiting on the one before it, up to nth keys per tile.  The
+             * loads coalesce across `tid` already, so what is left to win is
+             * how many are in flight, and issuing four before the first
+             * product covers four times the latency.
+             *
+             * THE PRODUCTS ARE ADDED IN THE SAME ORDER, j ascending, so
+             * `contrib` is bit for bit the value the one-at-a-time loop
+             * returned.
+             *
+             * The batch runs on the DENSE path only.  There every key in
+             * [0, n_in_tile) is `base + j`, which the tile bound already keeps
+             * inside `count` and `cache_cap`, so `keys[j]` is never negative
+             * and the skip below cannot fire; the sparse path keeps the
+             * one-at-a-time walk, whose `continue` is load bearing. */
+            if (!sparse) {
+                for (; j + 4u <= n_in_tile; j += 4u) {
+                    const float *v0 = v_cache +
+                        (uint64_t)keys[j] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float *v1 = v_cache +
+                        (uint64_t)keys[j + 1u] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float *v2 = v_cache +
+                        (uint64_t)keys[j + 2u] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float *v3 = v_cache +
+                        (uint64_t)keys[j + 3u] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float a0 = v0[tid];
+                    const float a1 = v1[tid];
+                    const float a2 = v2[tid];
+                    const float a3 = v3[tid];
+                    contrib += probs[j] * a0;
+                    contrib += probs[j + 1u] * a1;
+                    contrib += probs[j + 2u] * a2;
+                    contrib += probs[j + 3u] * a3;
+                }
+            }
+            for (; j < n_in_tile; j++) {
                 const int32_t kj = keys[j];
                 if (kj < 0) continue;
                 const float *vv = v_cache +
