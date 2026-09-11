@@ -1704,6 +1704,134 @@ static void run_group_scan_boundary_cases(void) {
     munmap(image, image_bytes);
 }
 
+/* Reuse must follow the current routed call, including after scratch growth
+ * and graph replay with changed inputs. Compare every shared output byte. */
+typedef struct {
+    ds4_gpu_qwen4exp_slab router, gate, up, down;
+    ds4_gpu_tensor *x, *selected, *weights, *routed_mid, *partial, *t[3];
+    uint32_t rows;
+} moe_reuse_case;
+
+static void moe_reuse_chain(moe_reuse_case *c, int reuse) {
+    require_ok(ds4_gpu_qwen4exp_routed_moe_tensor(
+                   c->t[0], c->routed_mid, c->partial,
+                   &c->gate, &c->up, &c->down,
+                   PROD_IN_DIM, PROD_MID_DIM, PROD_OUT_DIM,
+                   c->selected, c->weights, PROD_EXPERTS, PROD_USED,
+                   c->x, c->rows, PROD_USED * PROD_MID_DIM),
+               "reuse routed MoE");
+    require_ok(ds4_gpu_qwen4exp_shared_expert_preq_tensor(
+                   c->t[0], c->t[1], c->t[2], &c->router,
+                   &c->gate, &c->up, &c->down,
+                   PROD_IN_DIM, PROD_MID_DIM, PROD_OUT_DIM,
+                   c->x, c->rows, reuse), "reuse shared expert");
+}
+
+static void run_moe_input_reuse_case(
+        const ds4_gpu_qwen4exp_slab *router,
+        const ds4_gpu_qwen4exp_slab *gate,
+        const ds4_gpu_qwen4exp_slab *up,
+        const ds4_gpu_qwen4exp_slab *down) {
+    enum { MAX_ROWS = 1024 };
+    const uint32_t widths[] = {1, 2, 7, 8, 63, 64, 65, MAX_ROWS, 2};
+    const float magnitudes[] = {0.5f, 1e-20f, 1e3f};
+    const size_t xn = (size_t)MAX_ROWS * PROD_IN_DIM;
+    const size_t sn = (size_t)MAX_ROWS * PROD_USED;
+    const size_t sizes[3] = {(size_t)MAX_ROWS * PROD_OUT_DIM * sizeof(float),
+                            (size_t)MAX_ROWS * PROD_MID_DIM * sizeof(float),
+                            (size_t)MAX_ROWS * sizeof(float)};
+    moe_reuse_case c = {.router = *router, .gate = *gate, .up = *up, .down = *down};
+    c.gate.expert_bytes = c.up.expert_bytes = (uint64_t)PROD_MID_DIM * gate->row_bytes;
+    c.down.expert_bytes = (uint64_t)PROD_OUT_DIM * down->row_bytes;
+    float *x = malloc(xn * sizeof(float));
+    float *rw = malloc(sn * sizeof(float));
+    int32_t *ids = malloc(sn * sizeof(int32_t));
+    unsigned char *ref[3], *got = malloc(sizes[0]);
+    require_ok(x && rw && ids && got, "reuse host allocation");
+    c.x = ds4_gpu_tensor_alloc(xn * sizeof(float));
+    c.selected = ds4_gpu_tensor_alloc(sn * sizeof(int32_t));
+    c.weights = ds4_gpu_tensor_alloc(sn * sizeof(float));
+    c.routed_mid = ds4_gpu_tensor_alloc((uint64_t)MAX_ROWS * PROD_USED * PROD_MID_DIM * sizeof(float));
+    c.partial = ds4_gpu_tensor_alloc((uint64_t)PROD_EXPERTS * MAX_ROWS * PROD_OUT_DIM * sizeof(float));
+    require_ok(c.x && c.selected && c.weights && c.routed_mid && c.partial,
+               "reuse device allocation");
+    for (int j = 0; j < 3; j++) {
+        c.t[j] = ds4_gpu_tensor_alloc(sizes[j]);
+        ref[j] = malloc(sizes[j]);
+        require_ok(c.t[j] && ref[j], "reuse output allocation");
+        memset(ref[j], 0x3c, sizes[j]);
+        require_ok(ds4_gpu_tensor_write(c.t[j], 0, ref[j], sizes[j]),
+                   "reuse initial canaries");
+    }
+    unsigned eager = 0, replay = 0;
+#if !defined(__APPLE__) && !defined(__HIP_PLATFORM_AMD__)
+    require_ok(setenv("DS4_CUDA_DECODE_GRAPHS", "1", 1) == 0, "reuse graphs enable");
+#endif
+    for (size_t wi = 0; wi < sizeof(widths) / sizeof(widths[0]); wi++) {
+        c.rows = widths[wi];
+#if !defined(__APPLE__) && !defined(__HIP_PLATFORM_AMD__)
+        ds4_gpu_decode_graphs_invalidate();
+        ds4_decode_graph_key key = {.il = 1, .island = 0};
+        const bool capture = c.rows <= 7u || c.rows == 64u;
+#endif
+        for (unsigned pattern = 0; pattern < 3; pattern++) {
+            for (size_t i = 0; i < xn; i++) x[i] = rng_unit() * magnitudes[pattern];
+            for (size_t i = 0; i < sn; i++) {
+                ids[i] = (int32_t)((i + pattern) % PROD_EXPERTS);
+                if (pattern == 1u && i % PROD_USED == 0u) ids[i] = -1;
+                rw[i] = (float)(i % PROD_USED + 1u) * 0.0625f;
+            }
+            require_ok(ds4_gpu_tensor_write(c.x, 0, x, xn * sizeof(float)) &&
+                       ds4_gpu_tensor_write(c.selected, 0, ids, sn * sizeof(int32_t)) &&
+                       ds4_gpu_tensor_write(c.weights, 0, rw, sn * sizeof(float)),
+                       "reuse changed input write");
+            moe_reuse_chain(&c, 0);
+            for (int j = 0; j < 3; j++)
+                require_ok(ds4_gpu_tensor_read(c.t[j], 0, ref[j], sizes[j]),
+                           "reuse reference read");
+            moe_reuse_chain(&c, 1);
+            for (int j = 0; j < 3; j++) {
+                require_ok(ds4_gpu_tensor_read(c.t[j], 0, got, sizes[j]),
+                           "reuse eager output read");
+                require_ok(memcmp(ref[j], got, sizes[j]) == 0,
+                           "reuse complete eager output/canaries");
+            }
+            eager++;
+#if !defined(__APPLE__) && !defined(__HIP_PLATFORM_AMD__)
+            if (capture) {
+                if (pattern == 0u) {
+                    require_ok(ds4_gpu_decode_graph_begin(&key) == -1, "reuse graph warm marker");
+                    moe_reuse_chain(&c, 1);
+                    require_ok(ds4_gpu_decode_graph_begin(&key) == 0, "reuse graph capture");
+                    moe_reuse_chain(&c, 1);
+                    require_ok(ds4_gpu_decode_graph_end(&key) == 0, "reuse graph finish");
+                }
+                require_ok(ds4_gpu_decode_graph_begin(&key) == 1, "reuse changed-input replay");
+                for (int j = 0; j < 3; j++) {
+                    require_ok(ds4_gpu_tensor_read(c.t[j], 0, got, sizes[j]),
+                               "reuse graph output read");
+                    require_ok(memcmp(ref[j], got, sizes[j]) == 0,
+                               "reuse complete graph output/canaries");
+                }
+                replay++;
+            }
+#endif
+            require_ok(ds4_gpu_tensor_read(c.x, 0, got, xn * sizeof(float)),
+                       "reuse input read");
+            require_ok(memcmp(x, got, xn * sizeof(float)) == 0, "reuse input immutability");
+        }
+    }
+#if !defined(__APPLE__) && !defined(__HIP_PLATFORM_AMD__)
+    ds4_gpu_decode_graphs_invalidate();
+#endif
+    printf("MoE input reuse %u/%u: %u eager and %u replay complete output checks passed\n",
+           gate->type, down->type, eager, replay);
+    for (int j = 0; j < 3; j++) { ds4_gpu_tensor_free(c.t[j]); free(ref[j]); }
+    ds4_gpu_tensor_free(c.x); ds4_gpu_tensor_free(c.selected); ds4_gpu_tensor_free(c.weights);
+    ds4_gpu_tensor_free(c.routed_mid); ds4_gpu_tensor_free(c.partial);
+    free(x); free(rw); free(ids); free(got);
+}
+
 static void run_production_expert_cases(void) {
     const uint32_t n_gate_up = (uint32_t)(sizeof(PROD_GATE_UP_TYPES) /
                                           sizeof(PROD_GATE_UP_TYPES[0]));
@@ -2044,6 +2172,7 @@ static void run_production_expert_cases(void) {
                 image, image_bytes, up_off[gi], 0, grow, gt };
             const ds4_gpu_qwen4exp_slab d_slab = {
                 image, image_bytes, down_off[dj], 0, drow, dt };
+            run_moe_input_reuse_case(&router, &g_slab, &u_slab, &d_slab);
             char label[64];
             snprintf(label, sizeof(label), "%s gate/up, %s down",
                      type_name(gt), type_name(dt));

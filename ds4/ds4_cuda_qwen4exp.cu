@@ -4426,8 +4426,8 @@ extern "C" int ds4_gpu_qwen4exp_ehx_pack_tensor(
             (const float *)hidden->ptr, n_hc, n_embd);
     return cuda_ok(cudaGetLastError(), "qwen4exp ehx pack launch");
 }
-/* Scratch for one expert call: the pair list, then the Q8_0 form of the
- * activation the projections consume.  Laid out here so the sizes are visible
+/* Scratch for one expert call: the Q8_0 activation prefix, then the pair
+ * list and routed intermediate.  Laid out here so the sizes are visible
  * beside the kernels that read them.
  *
  * At a prefill width of 512 with this model's shape the whole block is about
@@ -4569,17 +4569,20 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     char *base = (char *)qwen4exp_group_scratch(
             logical_tier, idx_bytes + pair_bytes + xq_bytes + mq_bytes);
     if (!base) return 0;
+    /* The immediately following shared expert consumes this same input.
+     * Keep its quantized bytes/scales/sums at the shared scratch prefix;
+     * expert metadata and the routed intermediate live after that prefix. */
     qwen4exp_moe_scratch sc;
-    sc.counts = (int32_t *)base;
+    sc.xq = (int8_t *)base;
+    sc.xs = (float *)(base + (uint64_t)n_tokens * xgroups * 32u);
+    sc.xsum = (int32_t *)(sc.xs + (uint64_t)n_tokens * xgroups);
+    char *at = base + xq_bytes;
+    sc.counts = (int32_t *)at;
     sc.offsets = sc.counts + n_total_expert;
     sc.cursor = sc.offsets + n_total_expert;
     sc.active = sc.cursor + n_total_expert;
     sc.pairs = sc.active + n_total_expert + 1u;
-    char *at = base + idx_bytes + pair_bytes;
-    sc.xq = (int8_t *)at;
-    sc.xs = (float *)(at + (uint64_t)n_tokens * xgroups * 32u);
-    sc.xsum = (int32_t *)(sc.xs + (uint64_t)n_tokens * xgroups);
-    at += xq_bytes;
+    at += idx_bytes + pair_bytes;
     sc.mq = (int8_t *)at;
     sc.ms = (float *)(at + (uint64_t)n_pairs * mgroups * 32u);
     sc.msum = (int32_t *)(sc.ms + (uint64_t)n_pairs * mgroups);
