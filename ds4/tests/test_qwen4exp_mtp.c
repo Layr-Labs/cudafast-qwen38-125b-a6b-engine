@@ -1738,7 +1738,14 @@ static int stub_rms_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
     return 1;
 }
 
-/* A real f32 matmul: out[t][o] = sum_i x[t][i] * W[i * out_dim + o]. */
+/* A real f32 matmul: out[t][o] = sum_i x[t][i] * W[i * out_dim + o].
+ *
+ * The borrowed LM head may address a RANGE of output rows: the head shifts
+ * weight_offset past whole Q8_0 rows, ds4_qwen4exp_q8_0_row_bytes(in_dim)
+ * apart, the way the real kernel's row addressing does.  This stub's output
+ * table is f32 input-major [in_dim][HEAD_N_VOCAB], so a ranged call decodes
+ * its first row from the offset and gathers that row's columns; the full call
+ * is first-row 0 and reduces to the same arithmetic, term for term. */
 static int stub_matmul(ds4_gpu_tensor *out, const void *map, uint64_t map_size,
                        uint64_t offset, uint64_t in_dim, uint64_t out_dim,
                        const ds4_gpu_tensor *x, uint64_t n_tok) {
@@ -1752,10 +1759,37 @@ static int stub_matmul(ds4_gpu_tensor *out, const void *map, uint64_t map_size,
         g_log.mm_map[g_log.n_mm] = map;
         g_log.n_mm++;
     }
-    if (g_forced_lm_logits && map == g_target_map && offset == OFF_OUTPUT) {
-        if (n_tok > g_forced_lm_rows || out_dim != HEAD_N_VOCAB) return 0;
-        memcpy(out->data, g_forced_lm_logits,
-               (size_t)n_tok * HEAD_N_VOCAB * sizeof(float));
+    if (map == g_target_map && offset >= OFF_OUTPUT) {
+        const uint64_t row_bytes =
+            ds4_qwen4exp_q8_0_row_bytes((uint32_t)in_dim);
+        const uint64_t skip = offset - OFF_OUTPUT;
+        if (skip % row_bytes != 0u) return 0;
+        const uint32_t r0 = (uint32_t)(skip / row_bytes);
+        if ((uint64_t)r0 + out_dim > HEAD_N_VOCAB) return 0;
+        if (g_forced_lm_logits) {
+            if (n_tok > g_forced_lm_rows) return 0;
+            float *os = (float *)out->data;
+            for (uint64_t t = 0; t < n_tok; t++) {
+                for (uint64_t o = 0; o < out_dim; o++) {
+                    os[t * out_dim + o] =
+                        g_forced_lm_logits[t * HEAD_N_VOCAB + r0 + o];
+                }
+            }
+            return 1;
+        }
+        const float *w = map_at(map, OFF_OUTPUT);
+        const float *xs = (const float *)x->data;
+        float *os = (float *)out->data;
+        for (uint64_t t = 0; t < n_tok; t++) {
+            for (uint64_t o = 0; o < out_dim; o++) {
+                float acc = 0.0f;
+                for (uint64_t i = 0; i < in_dim; i++) {
+                    acc += xs[t * in_dim + i] *
+                           w[i * HEAD_N_VOCAB + r0 + o];
+                }
+                os[t * out_dim + o] = acc;
+            }
+        }
         return 1;
     }
     const float *w = map_at(map, offset);
@@ -2168,6 +2202,349 @@ static void test_head_wiring(void) {
           "the refusal does not name eh_proj: %s", g_err);
 }
 
+/* ========================================================================
+ * The draft vocabulary shortlist
+ * ======================================================================== */
+
+/*
+ * The same head, the same stubs, one environment knob:
+ * DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX narrows the DRAFT's borrowed-LM-head rows to
+ * [0, prefix) plus the DS4_QWEN4EXP_DRAFT_VOCAB_TAIL added-token rows at the
+ * top of the table.  What must hold:
+ *
+ *   (a) a prefix covering the whole vocabulary drafts exactly what the
+ *       off-mode head drafts, token for token;
+ *   (b) an armed prefix drafts the argmax of the FULL logits restricted to
+ *       the shortlist ids, ties to the LOWEST id -- the packed sweep is the
+ *       first-max rule over the ids in ascending order;
+ *   (c) the restriction is real: a winner outside the list is NOT drafted;
+ *   (d) the projection reads the ranges as row ranges of the SAME weight --
+ *       two calls, the second at output_offset advanced past n_vocab - tail
+ *       Q8_0 rows -- and never a copied or gathered table;
+ *   (e) init refuses a prefix or tail that overruns or overlaps.
+ */
+
+/* Build and init a head over the stub tables, with the environment as the
+ * caller left it.  The maps are refilled deterministically so every
+ * configuration sees the same weights.  Returns 0 on success. */
+static int build_shortlist_head(ds4_qwen4exp_mtp_head *h) {
+    static float head_map[HEAD_MAP_FLOATS];
+    static float target_map[TARGET_MAP_FLOATS];
+    static int graph_marker, cache_marker;
+    for (uint32_t i = 0; i < HEAD_MAP_FLOATS; i++) {
+        head_map[i] = (float)((int)(mix64(i + 1u) % 17u) - 8) * 0.125f;
+    }
+    for (uint32_t i = 0; i < TARGET_MAP_FLOATS; i++) {
+        target_map[i] = (float)((int)(mix64(i + 1000u) % 19u) - 9) * 0.0625f;
+    }
+    g_head_map = head_map;
+    g_target_map = target_map;
+    memset(&g_log, 0, sizeof(g_log));
+
+    memset(h, 0, sizeof(*h));
+    h->head_map = head_map;     h->head_size = sizeof(head_map);
+    h->target_map = target_map; h->target_size = sizeof(target_map);
+    h->enorm_offset = OFF_ENORM;
+    h->hnorm_offset = OFF_HNORM;
+    h->eh_proj_offset = OFF_EH_PROJ;
+    h->eh_proj_in_dim = 2u * HEAD_N_EMBD;
+    h->hc_head_norm_offset = OFF_HC_NORM;
+    h->hc_head_down_offset = OFF_HC_DOWN;
+    h->hc_head_up_offset = OFF_HC_UP;
+    h->token_embd_offset = OFF_TOKEN_EMBD;
+    h->token_embd_type = 8u; /* Q8_0 in the shipped file */
+    h->output_offset = OFF_OUTPUT;
+    h->block_index = HEAD_BLOCK_IL;
+    h->n_embd = HEAD_N_EMBD;
+    h->n_hc = HEAD_N_HC;
+    h->n_lowrank = HEAD_N_LOWRANK;
+    h->n_vocab = HEAD_N_VOCAB;
+    h->max_tokens = HEAD_ROWS;
+    h->rms_eps = 1.0e-6f;
+    h->weight_bias = 1.0f;
+    h->round_bf16 = 1;
+    h->hooks.rms_norm = stub_rms_norm;
+    h->hooks.matmul_q8_0 = stub_matmul;
+    h->hooks.embed = stub_embed;
+    h->hooks.hc_mixer = stub_hc_mixer;
+    h->hooks.block = stub_block;
+    h->graph = &graph_marker;
+    h->cache = &cache_marker;
+    return ds4_qwen4exp_mtp_head_init(h, g_err, sizeof(g_err));
+}
+
+/* The composition oracle: the FULL-vocabulary logits the head's own algebra
+ * produces for one row over the stub tables -- the same walk
+ * test_head_wiring checks the wide forward against. */
+static void oracle_logits(const int *next_tokens, const float *multi_in,
+                          uint32_t row, float *logits) {
+    const float *eh = map_at(g_head_map, OFF_EH_PROJ);
+    const float *emb = map_at(g_target_map, OFF_TOKEN_EMBD);
+    const float *out_w = map_at(g_target_map, OFF_OUTPUT);
+    float sample[HEAD_N_EMBD];
+    for (uint32_t d = 0; d < HEAD_N_EMBD; d++) sample[d] = 0.0f;
+    for (uint32_t s = 0; s < HEAD_N_HC; s++) {
+        for (uint32_t o = 0; o < HEAD_N_EMBD; o++) {
+            float acc = 0.0f;
+            for (uint32_t i = 0; i < HEAD_N_EMBD; i++) {
+                acc += emb[(size_t)next_tokens[row] * HEAD_N_EMBD + i] *
+                       eh[i * HEAD_N_EMBD + o];
+            }
+            for (uint32_t i = 0; i < HEAD_N_EMBD; i++) {
+                acc += multi_in[(size_t)row * HEAD_HC_DIM + s * HEAD_N_EMBD + i] *
+                       eh[(HEAD_N_EMBD + i) * HEAD_N_EMBD + o];
+            }
+            sample[o] += acc;
+        }
+    }
+    for (uint32_t v = 0; v < HEAD_N_VOCAB; v++) {
+        float acc = 0.0f;
+        for (uint32_t i = 0; i < HEAD_N_EMBD; i++) {
+            acc += sample[i] * out_w[i * HEAD_N_VOCAB + v];
+        }
+        logits[v] = acc;
+    }
+}
+
+/* The argmax of the full logits over the shortlist only, ties to the lowest
+ * id: the ids in ascending order with a strict > -- which is what the packed
+ * GPU sweep implements, since the packed order IS the id order. */
+static int shortlist_argmax(const float *logits, uint32_t prefix,
+                            uint32_t tail) {
+    int best = -1;
+    for (uint32_t k = 0; k < prefix + tail; k++) {
+        const uint32_t id = k < prefix ? k : HEAD_N_VOCAB - tail + (k - prefix);
+        if (best < 0 || logits[id] > logits[best]) best = (int)id;
+    }
+    return best;
+}
+
+static void test_draft_vocab_shortlist(void) {
+    printf("draft vocabulary shortlist\n");
+    const int next_tokens[HEAD_ROWS] = { 3, 5 };
+    float multi_in[HEAD_ROWS * HEAD_HC_DIM];
+    for (uint32_t i = 0; i < HEAD_ROWS * HEAD_HC_DIM; i++) {
+        multi_in[i] = (float)((int)(mix64(i + 77u) % 13u) - 6) * 0.25f;
+    }
+
+    /* (a) A prefix covering the whole vocabulary drafts what the off-mode
+     * head drafts: the launch parameters are the full call's, so the forward
+     * cannot tell the two configurations apart. */
+    int off_draft[HEAD_ROWS] = { -1, -1 };
+    int full_draft[HEAD_ROWS] = { -1, -1 };
+    unsetenv("DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX");
+    unsetenv("DS4_QWEN4EXP_DRAFT_VOCAB_TAIL");
+    {
+        ds4_qwen4exp_mtp_head h;
+        CHECK(build_shortlist_head(&h) == 0, "off-mode head init: %s", g_err);
+        CHECK(h.draft_vocab_prefix == 0 && h.draft_vocab_tail == 0,
+              "an unset prefix armed %u/%u",
+              h.draft_vocab_prefix, h.draft_vocab_tail);
+        CHECK(ds4_qwen4exp_mtp_head_forward(&h, next_tokens, multi_in, 12u,
+                                            HEAD_ROWS, off_draft, NULL,
+                                            g_err, sizeof(g_err)) == 0,
+              "off-mode forward failed: %s", g_err);
+        ds4_qwen4exp_mtp_head_free(&h);
+    }
+    setenv("DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX", "8", 1);
+    setenv("DS4_QWEN4EXP_DRAFT_VOCAB_TAIL", "0", 1);
+    {
+        ds4_qwen4exp_mtp_head h;
+        CHECK(build_shortlist_head(&h) == 0,
+              "whole-vocabulary prefix was refused: %s", g_err);
+        CHECK(ds4_qwen4exp_mtp_head_forward(&h, next_tokens, multi_in, 12u,
+                                            HEAD_ROWS, full_draft, NULL,
+                                            g_err, sizeof(g_err)) == 0,
+              "whole-vocabulary forward failed: %s", g_err);
+        CHECK(g_log.n_mm == 2 && g_log.mm_out[1] == HEAD_N_VOCAB &&
+              g_log.mm_offset[1] == OFF_OUTPUT,
+              "a whole-vocabulary prefix must keep the one full-width LM-head "
+              "call");
+        ds4_qwen4exp_mtp_head_free(&h);
+    }
+    CHECK(memcmp(off_draft, full_draft, sizeof(off_draft)) == 0,
+          "a whole-vocabulary prefix drafted {%d, %d}, the off-mode head "
+          "{%d, %d}", full_draft[0], full_draft[1],
+          off_draft[0], off_draft[1]);
+    printf("  prefix %u + tail %u drafts the off-mode tokens\n",
+           HEAD_N_VOCAB, 0u);
+
+    /* (b)+(c) Armed prefixes over the real stub weights: every row drafts
+     * the shortlist argmax of the full logits.  The last pair is the
+     * adjacent-range boundary (prefix ends exactly where the tail begins). */
+    static const struct { uint32_t prefix, tail; } cfg[] = {
+        { 5u, 2u }, { 6u, 2u }, { 4u, 0u }, { 1u, 7u }, { 7u, 1u },
+    };
+    for (size_t c = 0; c < sizeof(cfg) / sizeof(cfg[0]); c++) {
+        char pbuf[16], tbuf[16];
+        snprintf(pbuf, sizeof(pbuf), "%u", cfg[c].prefix);
+        snprintf(tbuf, sizeof(tbuf), "%u", cfg[c].tail);
+        setenv("DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX", pbuf, 1);
+        setenv("DS4_QWEN4EXP_DRAFT_VOCAB_TAIL", tbuf, 1);
+        ds4_qwen4exp_mtp_head h;
+        CHECK(build_shortlist_head(&h) == 0,
+              "prefix %u tail %u was refused: %s",
+              cfg[c].prefix, cfg[c].tail, g_err);
+        CHECK(h.draft_vocab_prefix == cfg[c].prefix &&
+              h.draft_vocab_tail == cfg[c].tail,
+              "prefix %u tail %u armed %u/%u", cfg[c].prefix, cfg[c].tail,
+              h.draft_vocab_prefix, h.draft_vocab_tail);
+        CHECK((h.t_logits_prefix != NULL) == (cfg[c].tail != 0u),
+              "prefix %u tail %u staged its buffers wrong",
+              cfg[c].prefix, cfg[c].tail);
+
+        int draft[HEAD_ROWS] = { -1, -1 };
+        int draft_last[1] = { -1 };
+        CHECK(ds4_qwen4exp_mtp_head_forward(&h, next_tokens, multi_in, 12u,
+                                            HEAD_ROWS, draft, NULL,
+                                            g_err, sizeof(g_err)) == 0,
+              "prefix %u forward failed: %s", cfg[c].prefix, g_err);
+        CHECK(ds4_qwen4exp_mtp_head_forward_last(&h, next_tokens, multi_in,
+                                                 12u, HEAD_ROWS, draft_last,
+                                                 NULL, g_err,
+                                                 sizeof(g_err)) == 0,
+              "prefix %u last-row forward failed: %s", cfg[c].prefix, g_err);
+        CHECK(draft_last[0] == draft[HEAD_ROWS - 1u],
+              "prefix %u: the last-row entry drafted %d, the wide forward's "
+              "last row %d", cfg[c].prefix, draft_last[0],
+              draft[HEAD_ROWS - 1u]);
+        float logits[HEAD_ROWS][HEAD_N_VOCAB];
+        for (uint32_t t = 0; t < HEAD_ROWS; t++) {
+            oracle_logits(next_tokens, multi_in, t, logits[t]);
+            const int want = shortlist_argmax(logits[t], cfg[c].prefix,
+                                              cfg[c].tail);
+            CHECK(draft[t] == want,
+                  "prefix %u tail %u row %u drafted %d, the shortlist argmax "
+                  "of the full logits is %d",
+                  cfg[c].prefix, cfg[c].tail, t, draft[t], want);
+        }
+        ds4_qwen4exp_mtp_head_free(&h);
+        printf("  prefix %u + tail %u -> drafts the shortlist argmax\n",
+               cfg[c].prefix, cfg[c].tail);
+    }
+
+    /* (d) The 5+2 configuration's call pattern: the LM head is TWO row-range
+     * calls over the one weight -- prefix at output_offset, tail at
+     * output_offset advanced past n_vocab - tail whole Q8_0 rows. */
+    setenv("DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX", "5", 1);
+    setenv("DS4_QWEN4EXP_DRAFT_VOCAB_TAIL", "2", 1);
+    {
+        ds4_qwen4exp_mtp_head h;
+        CHECK(build_shortlist_head(&h) == 0, "5+2 head init: %s", g_err);
+        int draft[HEAD_ROWS] = { -1, -1 };
+        CHECK(ds4_qwen4exp_mtp_head_forward(&h, next_tokens, multi_in, 12u,
+                                            HEAD_ROWS, draft, NULL,
+                                            g_err, sizeof(g_err)) == 0,
+              "5+2 forward failed: %s", g_err);
+        static const char *want[] = {
+            "embed", "rms_norm", "rms_norm", "matmul", "block", "hc_mixer",
+            "matmul", "matmul",
+        };
+        const int n_want = (int)(sizeof(want) / sizeof(want[0]));
+        CHECK(g_log.n_log == n_want, "the 5+2 head made %d calls, expected %d",
+              g_log.n_log, n_want);
+        for (int i = 0; i < n_want && i < g_log.n_log; i++) {
+            CHECK(strcmp(g_log.log[i], want[i]) == 0,
+                  "call %d was %s, expected %s", i, g_log.log[i], want[i]);
+        }
+        const uint64_t row_bytes =
+            ds4_qwen4exp_q8_0_row_bytes(HEAD_N_EMBD);
+        CHECK(g_log.n_mm == 3, "the 5+2 head made %d matmuls, expected 3",
+              g_log.n_mm);
+        CHECK(g_log.mm_map[1] == (const void *)g_target_map &&
+              g_log.mm_map[2] == (const void *)g_target_map,
+              "a ranged LM-head call left the target mapping");
+        CHECK(g_log.mm_out[1] == 5u && g_log.mm_offset[1] == OFF_OUTPUT,
+              "the prefix call ran width %llu at offset %llu",
+              (unsigned long long)g_log.mm_out[1],
+              (unsigned long long)g_log.mm_offset[1]);
+        CHECK(g_log.mm_out[2] == 2u &&
+              g_log.mm_offset[2] ==
+                  OFF_OUTPUT + (uint64_t)(HEAD_N_VOCAB - 2u) * row_bytes,
+              "the tail call ran width %llu at offset %llu, expected %llu",
+              (unsigned long long)g_log.mm_out[2],
+              (unsigned long long)g_log.mm_offset[2],
+              (unsigned long long)(OFF_OUTPUT +
+                                   (uint64_t)(HEAD_N_VOCAB - 2u) * row_bytes));
+        CHECK(g_log.mm_ntok[1] == HEAD_ROWS && g_log.mm_ntok[2] == HEAD_ROWS,
+              "a ranged LM-head call changed the row count");
+        printf("  5+2: the LM head is two row-range calls over one weight\n");
+        ds4_qwen4exp_mtp_head_free(&h);
+    }
+
+    /* (c) again, with the logits forced: a winner outside the list is not
+     * drafted, a tie across the ranges goes to the LOWER id, and a NaN at
+     * token zero pins the proposal to zero exactly as the full sweep does. */
+    setenv("DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX", "5", 1);
+    setenv("DS4_QWEN4EXP_DRAFT_VOCAB_TAIL", "2", 1);
+    {
+        static const float cases[][HEAD_ROWS * HEAD_N_VOCAB] = {
+            /* full winner id 5 (outside 0..4 and 6..7): draft the best of the
+             * list, id 7's 10.0, not the 11.0 at id 5. */
+            { 1, 2, 3, 9, 2, 11, 4, 10,
+              0, 8, 1, 2, 3, 4, 5, 6 },
+            /* ids 4 and 6 tie at the top: the lower id wins. */
+            { 0, 1, 2, 3, 8, 0, 8, 3,
+              4, 4, 4, 4, 4, 4, 4, 4 },
+            /* the winner is inside the prefix: unchanged. */
+            { 0, 1, 9, 2, 3, 4, 5, 6,
+              7, 6, 5, 4, 3, 2, 1, 0 },
+            /* a NaN at token zero pins the proposal to zero. */
+            { NAN, 5, 4, 3, 2, 1, 6, 7,
+              7, 6, 5, 4, 3, 2, 1, 0 },
+        };
+        for (uint32_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+            ds4_qwen4exp_mtp_head h;
+            CHECK(build_shortlist_head(&h) == 0, "forced case init: %s", g_err);
+            int got[HEAD_ROWS] = { -1, -1 };
+            g_forced_lm_logits = cases[c];
+            g_forced_lm_rows = HEAD_ROWS;
+            CHECK(ds4_qwen4exp_mtp_head_forward(&h, next_tokens, multi_in,
+                                                12u, HEAD_ROWS, got, NULL,
+                                                g_err, sizeof(g_err)) == 0,
+                  "forced case %u forward failed: %s", c, g_err);
+            for (uint32_t t = 0; t < HEAD_ROWS; t++) {
+                const int want = shortlist_argmax(
+                    cases[c] + (size_t)t * HEAD_N_VOCAB, 5u, 2u);
+                CHECK(got[t] == want,
+                      "forced case %u row %u drafted %d, the shortlist argmax "
+                      "is %d", c, t, got[t], want);
+            }
+            printf("  forced case %u -> {%d, %d}\n", c, got[0], got[1]);
+            g_forced_lm_logits = NULL;
+            g_forced_lm_rows = 0u;
+            ds4_qwen4exp_mtp_head_free(&h);
+        }
+    }
+
+    /* (e) init refuses, by name, a prefix or tail that cannot be laid out. */
+    static const struct { const char *p, *t; const char *must_name; } bad[] = {
+        { "9", "0", "DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX" },
+        { "5", "4", "exceeds the vocabulary" },
+        { "2", "9", "DS4_QWEN4EXP_DRAFT_VOCAB_TAIL" },
+        { "abc", "2", "DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX" },
+        { "5", "2x", "DS4_QWEN4EXP_DRAFT_VOCAB_TAIL" },
+    };
+    for (size_t k = 0; k < sizeof(bad) / sizeof(bad[0]); k++) {
+        setenv("DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX", bad[k].p, 1);
+        setenv("DS4_QWEN4EXP_DRAFT_VOCAB_TAIL", bad[k].t, 1);
+        ds4_qwen4exp_mtp_head h;
+        g_err[0] = '\0';
+        CHECK(build_shortlist_head(&h) < 0,
+              "prefix \"%s\" tail \"%s\" was accepted", bad[k].p, bad[k].t);
+        CHECK(strstr(g_err, bad[k].must_name) != NULL,
+              "the refusal for prefix \"%s\" tail \"%s\" does not name %s: %s",
+              bad[k].p, bad[k].t, bad[k].must_name, g_err);
+        ds4_qwen4exp_mtp_head_free(&h);
+        printf("  prefix %s tail %s -> %s\n", bad[k].p, bad[k].t, g_err);
+    }
+
+    /* Leave the environment off: nothing later in this suite may inherit a
+     * shortlist it did not ask for. */
+    unsetenv("DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX");
+    unsetenv("DS4_QWEN4EXP_DRAFT_VOCAB_TAIL");
+}
+
 int main(void) {
     printf("qwen4exp MTP tests\n\n");
     test_exactness();
@@ -2201,6 +2578,8 @@ int main(void) {
     test_deferred_frontier_logits();
     printf("\n");
     test_head_wiring();
+    printf("\n");
+    test_draft_vocab_shortlist();
     printf("\n");
     if (g_failures) {
         printf("FAILED: %d check(s)\n", g_failures);

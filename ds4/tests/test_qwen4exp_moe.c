@@ -1280,6 +1280,147 @@ static void run_row_invariance_case(const uint8_t *model,
     free(x);
 }
 
+/* The gate/up MMA tile's fused epilogue quantises the activated mid into the
+ * Q8_0 scratch itself, so the float mid is never written and the standalone
+ * quantise pass never runs.  Two things must hold at every prefill width the
+ * tile takes:
+ *
+ *   - the output is bit-identical to the unfused chain (stood down with
+ *     DS4_QWEN4EXP_NO_MOE_EPILOGUE=1).  The down leg is a deterministic
+ *     function of the quantised scratch and nothing else, so identical bits
+ *     are the observable of identical quantised bytes; and
+ *   - the float mid is untouched: a poisoned mid comes back exactly as it was
+ *     written, where the unfused chain overwrites it with the activated
+ *     values.  The pass-0 read asserts the unfused chain really does write the
+ *     mid, which is what keeps the pass-1 assertion from being vacuous.
+ *
+ * Width 8 is the tile's threshold with partial expert windows, 64 and 65 straddle
+ * a whole window plus a tail, and 1024 is the ranked prefill chunk. */
+static void run_moe_epilogue_case(const uint8_t *model,
+                                  uint64_t model_bytes,
+                                  uint64_t gate_offset,
+                                  uint64_t up_offset,
+                                  uint64_t down_offset) {
+    enum { EP_TOKENS = 1024 };
+    const uint32_t widths[] = {8, 64, 65, EP_TOKENS};
+    const uint64_t x_bytes = (uint64_t)EP_TOKENS * IN_DIM * sizeof(float);
+    const uint64_t out_bytes = (uint64_t)EP_TOKENS * OUT_DIM * sizeof(float);
+    const uint64_t mid_bytes =
+        (uint64_t)EP_TOKENS * N_EXPERT_USED * MID_DIM * sizeof(float);
+    const size_t out_floats = out_bytes / sizeof(float);
+
+    float *x = calloc((size_t)EP_TOKENS * IN_DIM, sizeof(float));
+    float *logits = calloc((size_t)EP_TOKENS * N_EXPERT, sizeof(float));
+    float *ref = malloc(out_bytes);
+    float *got = malloc(out_bytes);
+    float *mid_host = malloc(mid_bytes);
+    if (!x || !logits || !ref || !got || !mid_host) fail("epilogue allocation");
+    for (size_t i = 0; i < (size_t)EP_TOKENS * IN_DIM; i++) x[i] = rng_unit() * 0.5f;
+    for (size_t i = 0; i < (size_t)EP_TOKENS * N_EXPERT; i++)
+        logits[i] = rng_unit() * 4.0f;
+
+    ds4_gpu_tensor *logits_t = ds4_gpu_tensor_alloc(
+        (uint64_t)EP_TOKENS * N_EXPERT * sizeof(float));
+    ds4_gpu_tensor *sel_t = ds4_gpu_tensor_alloc(
+        (uint64_t)EP_TOKENS * N_EXPERT_USED * sizeof(int32_t));
+    ds4_gpu_tensor *w_t = ds4_gpu_tensor_alloc(
+        (uint64_t)EP_TOKENS * N_EXPERT_USED * sizeof(float));
+    ds4_gpu_tensor *x_t = ds4_gpu_tensor_alloc(x_bytes);
+    ds4_gpu_tensor *mid_t = ds4_gpu_tensor_alloc(mid_bytes);
+    ds4_gpu_tensor *out_t = ds4_gpu_tensor_alloc(out_bytes);
+    ds4_gpu_tensor *part_t = ds4_gpu_tensor_alloc(
+        (uint64_t)EP_TOKENS * N_EXPERT_USED * OUT_DIM * sizeof(float));
+    require_ok(logits_t && sel_t && w_t && x_t && mid_t && out_t && part_t,
+               "epilogue tensor allocation");
+    require_ok(ds4_gpu_tensor_write(logits_t, 0, logits,
+                                    (uint64_t)EP_TOKENS * N_EXPERT * sizeof(float)),
+               "epilogue logit write");
+    require_ok(ds4_gpu_tensor_write(x_t, 0, x, x_bytes),
+               "epilogue activation write");
+    require_ok(ds4_gpu_qwen4exp_router_select_tensor(sel_t, w_t, logits_t,
+                                                     N_EXPERT, N_EXPERT_USED,
+                                                     EP_TOKENS),
+               "epilogue router select");
+
+    const ds4_gpu_qwen4exp_slab gate_slab = {
+        model, model_bytes, gate_offset, GATE_EXPERT_BYTES, Q4K_ROW_BYTES, TYPE_Q4_K };
+    const ds4_gpu_qwen4exp_slab up_slab = {
+        model, model_bytes, up_offset, UP_EXPERT_BYTES, Q4K_ROW_BYTES, TYPE_Q4_K };
+    const ds4_gpu_qwen4exp_slab down_slab = {
+        model, model_bytes, down_offset, DOWN_EXPERT_BYTES, Q51_ROW_BYTES, TYPE_Q5_1 };
+
+    const char *env = getenv("DS4_QWEN4EXP_NO_MOE_EPILOGUE");
+    char *saved = env ? strdup(env) : NULL;
+    require_ok(!env || saved, "epilogue environment copy");
+    for (size_t wi = 0; wi < sizeof(widths) / sizeof(widths[0]); wi++) {
+        const uint32_t w = widths[wi];
+        for (int pass = 0; pass < 2; pass++) {
+            /* Pass 0 stands the fused epilogue down and is the reference;
+             * pass 1 takes the dispatch the tower actually gets. */
+            require_ok((pass == 0
+                ? setenv("DS4_QWEN4EXP_NO_MOE_EPILOGUE", "1", 1)
+                : unsetenv("DS4_QWEN4EXP_NO_MOE_EPILOGUE")) == 0,
+                "epilogue dispatch switch");
+            memset(mid_host, 0xab, mid_bytes);
+            require_ok(ds4_gpu_tensor_write(mid_t, 0, mid_host, mid_bytes),
+                       "epilogue mid poison");
+            for (size_t i = 0; i < out_floats; i++)
+                got[i] = (float)((int)(i % 17) - 8) * 0.125f;
+            require_ok(ds4_gpu_tensor_write(out_t, 0, got, out_bytes),
+                       "epilogue out poison");
+            require_ok(ds4_gpu_qwen4exp_routed_moe_tensor(
+                           out_t, mid_t, part_t, &gate_slab, &up_slab, &down_slab,
+                           IN_DIM, MID_DIM, OUT_DIM, sel_t, w_t, N_EXPERT,
+                           N_EXPERT_USED, x_t, w, N_EXPERT_USED * MID_DIM),
+                       "epilogue routed MoE");
+            require_ok(ds4_gpu_tensor_read(out_t, 0, pass == 0 ? ref : got,
+                                           out_bytes),
+                       "epilogue output read");
+            float *mid_back = malloc(mid_bytes);
+            require_ok(mid_back != NULL, "epilogue mid readback allocation");
+            require_ok(ds4_gpu_tensor_read(mid_t, 0, mid_back, mid_bytes),
+                       "epilogue mid read");
+            if (pass == 0) {
+                if (memcmp(mid_back, mid_host, mid_bytes) == 0)
+                    fail("the unfused chain did not write the float mid");
+            } else {
+                /* The call writes only the first w tokens' rows; the poisoned
+                 * tail is identical by construction and carries no signal. */
+                const size_t live = (size_t)w * OUT_DIM;
+                size_t bad = 0;
+                for (size_t i = 0; i < live; i++) {
+                    if (memcmp(&ref[i], &got[i], sizeof(float)) != 0) bad++;
+                }
+                printf("MoE fused epilogue at width %u: %zu of %zu outputs "
+                       "differ from the unfused chain\n",
+                       w, bad, live);
+                if (bad != 0)
+                    fail("the fused epilogue changed a number the unfused "
+                         "chain produces");
+                if (memcmp(mid_back, mid_host, mid_bytes) != 0)
+                    fail("the fused leg wrote the float mid buffer");
+            }
+            free(mid_back);
+        }
+    }
+    require_ok((saved ? setenv("DS4_QWEN4EXP_NO_MOE_EPILOGUE", saved, 1)
+                      : unsetenv("DS4_QWEN4EXP_NO_MOE_EPILOGUE")) == 0,
+               "epilogue environment restore");
+    free(saved);
+    ds4_gpu_tensor_free(part_t);
+    ds4_gpu_tensor_free(out_t);
+    ds4_gpu_tensor_free(mid_t);
+    ds4_gpu_tensor_free(x_t);
+    ds4_gpu_tensor_free(w_t);
+    ds4_gpu_tensor_free(sel_t);
+    ds4_gpu_tensor_free(logits_t);
+    free(mid_host);
+    free(got);
+    free(ref);
+    free(logits);
+    free(x);
+}
+
 /* The grouping scan is internal scratch, so exercise it through the routed-MoE
  * API rather than adding a test-only production hook.  Compact and
  * non-compact dispatch are independent consumers of the same counts/offsets;
@@ -2497,6 +2638,9 @@ int main(int argc, char **argv) {
     run_row_invariance_case(model, model_bytes, gate_offset, up_offset,
                             down_offset, sh_router_offset, sh_gate_offset,
                             sh_up_offset, sh_down_offset);
+
+    run_moe_epilogue_case(model, model_bytes, gate_offset, up_offset,
+                          down_offset);
 
     run_shared_stage_cases(model, model_bytes, gate_offset, up_offset,
                            down_offset, sh_router_offset, sh_gate_offset,

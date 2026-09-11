@@ -622,6 +622,24 @@ typedef struct {
     ds4_qwen4exp_block_forward_fn block;
 } ds4_qwen4exp_mtp_gpu_hooks;
 
+/* One output row of a Q8_0 weight as it lies in the mapping: ceil(in_dim / 32)
+ * blocks of 32 int8 weights and their 2-byte scale, 34 bytes each.  This is
+ * the row stride ds4_gpu_matmul_q8_0_decode_rows_exact_tensor reads, so a
+ * RANGE of output rows is a byte range of the weight and can be projected by
+ * the same kernel at a shifted offset -- the draft shortlist below addresses
+ * the borrowed LM head that way, and no weight is copied, gathered or
+ * re-represented anywhere. */
+static inline uint64_t ds4_qwen4exp_q8_0_row_bytes(uint32_t in_dim) {
+    return ((uint64_t)(in_dim + 31u) / 32u) * 34u;
+}
+
+/* The default DS4_QWEN4EXP_DRAFT_VOCAB_TAIL: the added tokens this family's
+ * tokenizer stacks at the TOP of the id table, above the BPE ids. */
+#define DS4_QWEN4EXP_DRAFT_VOCAB_TAIL_DEFAULT 276u
+/* The default DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX: the lowest ids in BPE merge order
+ * (the frequent tokens); 0 restores the whole-vocabulary draft argmax. */
+#define DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX_DEFAULT 98308u
+
 /*
  * The head reads TWO mappings.  The nextn tensors and blk.<block_index>.* come
  * from the --mtp GGUF, which is a separate draft model opened through
@@ -657,6 +675,19 @@ typedef struct {
     uint32_t n_vocab;
     uint32_t max_tokens;           /* rows one forward may carry             */
 
+    /* The DRAFT shortlist over the borrowed LM head.  Set once by init() from
+     * DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX (0, the default: off, the draft projects
+     * and argmaxes the whole vocabulary) and DS4_QWEN4EXP_DRAFT_VOCAB_TAIL
+     * (DS4_QWEN4EXP_DRAFT_VOCAB_TAIL_DEFAULT).  A nonzero prefix restricts the
+     * DRAFT's argmax to output rows [0, prefix) and [n_vocab - tail, n_vocab)
+     * -- the BPE merge order puts the frequent tokens in the low ids, and the
+     * added tokens sit at the top of the table.  init() refuses a prefix or
+     * tail that overruns n_vocab or overlaps the other range.  The TARGET's
+     * verify keeps the whole vocabulary whatever this says: a shortlisted miss
+     * costs one rejected draft and never a committed token. */
+    uint32_t draft_vocab_prefix;
+    uint32_t draft_vocab_tail;
+
     float rms_eps;
     float weight_bias;             /* 1 for zero-centered weights, else 0    */
     int   round_bf16;
@@ -678,6 +709,11 @@ typedef struct {
     ds4_gpu_tensor *t_mix_wide;
     ds4_gpu_tensor *t_sample;
     ds4_gpu_tensor *t_logits;
+    /* Shortlist staging, allocated only when a prefix is armed: the prefix
+     * rows and the tail rows land compactly and are packed into t_logits
+     * prefix-first, so t_logits rows are the argmax's packed shortlist. */
+    ds4_gpu_tensor *t_logits_prefix;
+    ds4_gpu_tensor *t_logits_tail;
     ds4_gpu_tensor *t_top1;
     uint32_t       *top1_host;
 } ds4_qwen4exp_mtp_head;
@@ -717,6 +753,12 @@ void ds4_qwen4exp_mtp_head_free(ds4_qwen4exp_mtp_head *h);
  *   hyper  = block(hyper)                                             in place
  *   sample = hc_head_mixer(hyper)                                [rows][n_embd]
  *   logits = target.output * sample                             [rows][n_vocab]
+ *
+ * With draft_vocab_prefix armed the last line narrows to the DRAFT's
+ * shortlist: target.output over rows [0, prefix) and [n_vocab - tail,
+ * n_vocab) only, packed prefix-first, argmaxed over that packed row.  The
+ * per-row arithmetic is the same kernel over the same weight bytes, so a
+ * shortlist id's logit is the logit the full projection produces.
  *
  * `enorm` is over n_embd; `hnorm` is UNGROUPED over the whole n_hc * n_embd
  * vector, on one statistic, unlike the hyper-connection norms.  Both fc layers

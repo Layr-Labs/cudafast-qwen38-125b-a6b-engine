@@ -1443,11 +1443,61 @@ __device__ __forceinline__ static void qwen4exp_group_accumulate(
     }
 }
 
+/* Q8_0 quantisation of one group of one row, plus the integer sum of that
+ * group that the `wb` term needs.  The row group is the only thing it reads,
+ * so the result does not depend on how many rows the call carries.  `lane` is
+ * the calling thread's element of the group (element i lives in lane i) and
+ * `n` is the group's live element count.  The scale and the rounding are
+ * ds4_cuda.cu's quantize_q8_0_f32_kernel, unchanged. */
+__device__ __forceinline__ static void dev_qwen4exp_quantize_group(
+        int8_t *xq, float *xscale, int32_t *xsum, const float *xr,
+        uint32_t lane, uint32_t n, uint64_t at) {
+    /* Both call sites run exactly one warp per group -- the standalone kernel
+     * below is <<<dim3(groups, rows, 1), 32, 0, stream>>> and the gate/up MMA
+     * epilogue hands one column's group to one warp of the tile -- so the two
+     * reductions below are warp-synchronous.  A shuffle tree pairs lane i with
+     * lane i + stride for the same strides, in the same order, with the same
+     * operand order, so the max and the sum are the values the shared-memory
+     * trees returned; the block barriers they spent on lanes that had already
+     * finished are what goes away.  Every lane reaches here (the guards above
+     * the call sites are uniform across the warp), so the full mask is the
+     * active set.  The fused epilogue reads its group out of the tile's shared
+     * memory instead of the mid buffer, so the floats the tree reduces are the
+     * ones the epilogue just computed -- the ones the standalone kernel would
+     * have read back had they been written out and quantised in a second
+     * pass. */
+    float a = 0.0f;
+    if (lane < n) a = fabsf(xr[lane]);
+    float m = a;
+#pragma unroll
+    for (uint32_t stride = 16u; stride > 0u; stride >>= 1u) {
+        m = fmaxf(m, __shfl_down_sync(0xffffffffu, m, stride));
+    }
+    m = __shfl_sync(0xffffffffu, m, 0);
+    const float d = m / 127.0f;
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    if (lane == 0u) xscale[at] = d;
+
+    int8_t *dst = xq + at * 32u;
+    int v = 0;
+    if (lane < n) {
+        v = (int)lrintf(xr[lane] * id);
+        v = v > 127 ? 127 : (v < -128 ? -128 : v);
+    }
+    dst[lane] = (int8_t)v;
+
+    int sv = v;
+#pragma unroll
+    for (uint32_t stride = 16u; stride > 0u; stride >>= 1u) {
+        sv += __shfl_down_sync(0xffffffffu, sv, stride);
+    }
+    if (lane == 0u) xsum[at] = sv;
+}
+
 /* Q8_0 quantisation of one activation row, plus the integer sum of each group
  * that the `wb` term needs.  One block per (row, group); the row is the only
  * thing it reads, so the result does not depend on how many rows the call
- * carries.  The scale and the rounding are ds4_cuda.cu's
- * quantize_q8_0_f32_kernel, unchanged. */
+ * carries. */
 __global__ static void qwen4exp_quantize_rows_kernel(
         int8_t *xq, float *xscale, int32_t *xsum,
         const float *x, uint32_t width, uint32_t groups,
@@ -1462,42 +1512,8 @@ __global__ static void qwen4exp_quantize_rows_kernel(
     const float *xr = x + (uint64_t)outer * outer_stride +
                       (uint64_t)inner * inner_stride + i0;
 
-    /* The only launch site is <<<dim3(groups, rows, 1), 32, 0, stream>>>, so a
-     * block is exactly one warp and the two reductions below are
-     * warp-synchronous.  A shuffle tree pairs lane i with lane i + stride for
-     * the same strides, in the same order, with the same operand order, so the
-     * max and the sum are the values the shared-memory trees returned; the
-     * block barriers they spent on lanes that had already finished are what
-     * goes away.  Every lane of the block reaches here (the early return above
-     * is on blockIdx.x, uniform across the block), so the full mask is the
-     * active set. */
-    float a = 0.0f;
-    if (threadIdx.x < n) a = fabsf(xr[threadIdx.x]);
-    float m = a;
-#pragma unroll
-    for (uint32_t stride = 16u; stride > 0u; stride >>= 1u) {
-        m = fmaxf(m, __shfl_down_sync(0xffffffffu, m, stride));
-    }
-    m = __shfl_sync(0xffffffffu, m, 0);
-    const float d = m / 127.0f;
-    const float id = d != 0.0f ? 1.0f / d : 0.0f;
-    const uint64_t at = (uint64_t)r * groups + g;
-    if (threadIdx.x == 0u) xscale[at] = d;
-
-    int8_t *dst = xq + at * 32u;
-    int v = 0;
-    if (threadIdx.x < n) {
-        v = (int)lrintf(xr[threadIdx.x] * id);
-        v = v > 127 ? 127 : (v < -128 ? -128 : v);
-    }
-    dst[threadIdx.x] = (int8_t)v;
-
-    int sv = v;
-#pragma unroll
-    for (uint32_t stride = 16u; stride > 0u; stride >>= 1u) {
-        sv += __shfl_down_sync(0xffffffffu, sv, stride);
-    }
-    if (threadIdx.x == 0u) xsum[at] = sv;
+    dev_qwen4exp_quantize_group(xq, xscale, xsum, xr, threadIdx.x, n,
+                                (uint64_t)r * groups + g);
 }
 
 /* Block-wide sum over blockDim.x threads using a caller-supplied scratch of
@@ -2257,6 +2273,9 @@ template <int GateType = -1, int UpType = -1>
 __global__ __launch_bounds__(QW_MMA_THREADS) static void
 qwen4exp_moe_gateup_mma_kernel(
         float *mid,
+        int8_t *mq,
+        float *ms,
+        int32_t *msum,
         const char *gate,
         const char *up,
         const int8_t *xq,
@@ -2474,22 +2493,71 @@ qwen4exp_moe_gateup_mma_kernel(
         }
 
         const uint32_t m0 = wr + (lane >> 2);
+        if (mq) {
+            /* FUSED ACTIVATION + QUANTISE EPILOGUE.  The down tile is the
+             * only consumer of the mid projection on this path and it reads
+             * the Q8_0 scratch (mq/ms/msum), never the floats, so the epilogue
+             * stages the activated column in shared memory -- repurposing the
+             * activation tile sB, dead now the K loop is done -- and quantises
+             * it right there.  The mid buffer's global round trip (write by
+             * this kernel, read back by qwen4exp_quantize_rows_kernel) and
+             * that whole second pass go away.  The SiLU*up*weight expression
+             * and the group quantise are the standalone kernels' bodies
+             * verbatim, on the same floats; only where the floats live while
+             * the quantiser reads them changes.  A padded column (nn >= take)
+             * belongs to no pair, so nothing downstream reads its group and it
+             * is simply not quantised.
+             *
+             * The first barrier retires the last K chunk's reads of sB before
+             * the reinterpretation below overwrites it; the second publishes
+             * the staged columns before the warps read each other's. */
+            __syncthreads();
+            float *const sMid = (float *)(void *)sB;
 #pragma unroll
-        for (int nt = 0; nt < QW_MMA_NT; nt++) {
+            for (int nt = 0; nt < QW_MMA_NT; nt++) {
 #pragma unroll
-            for (int r = 0; r < 4; r++) {
-                const uint32_t mr = m0 + ((r & 2) ? 8u : 0u);
-                const uint32_t nn = wn + nt * 8u + (lane & 3u) * 2u + (r & 1);
-                if ((int32_t)nn >= take) continue;
-                const uint32_t mrow = row0 + mr;
-                if (mrow >= mid_dim) continue;
-                const uint32_t p = sTok[nn];
-                const uint32_t token = p / n_expert_used;
-                const uint32_t slot = p - token * n_expert_used;
-                const float g = accG[nt * 4 + r];
-                mid[(uint64_t)token * mid_token_stride +
-                    (uint64_t)slot * mid_dim + mrow] =
-                    (g / (1.0f + expf(-g))) * accU[nt * 4 + r] * weights[p];
+                for (int r = 0; r < 4; r++) {
+                    const uint32_t mr = m0 + ((r & 2) ? 8u : 0u);
+                    const uint32_t nn = wn + nt * 8u + (lane & 3u) * 2u + (r & 1);
+                    if ((int32_t)nn >= take) continue;
+                    const uint32_t mrow = row0 + mr;
+                    if (mrow >= mid_dim) continue;
+                    const uint32_t p = sTok[nn];
+                    const float g = accG[nt * 4 + r];
+                    sMid[nn * 32u + mr] =
+                        (g / (1.0f + expf(-g))) * accU[nt * 4 + r] * weights[p];
+                }
+            }
+            __syncthreads();
+            /* One block row is exactly one 32-element group, so warp w takes
+             * the columns nn = w, w+4, ... and runs the standalone quantise on
+             * each: lane i is element i of the group, the same shuffle trees
+             * reduce the same values, and `at` is the pair-major group index
+             * the down tile reads.  take is block-uniform, so every lane of a
+             * warp visits the same columns and the shuffles stay collective. */
+            for (uint32_t nn = warp; nn < (uint32_t)take; nn += QW_MMA_WARPS) {
+                dev_qwen4exp_quantize_group(
+                        mq, ms, msum, &sMid[nn * 32u], lane, 32u,
+                        (uint64_t)sTok[nn] * (mid_dim / 32u) + blockIdx.x);
+            }
+        } else {
+#pragma unroll
+            for (int nt = 0; nt < QW_MMA_NT; nt++) {
+#pragma unroll
+                for (int r = 0; r < 4; r++) {
+                    const uint32_t mr = m0 + ((r & 2) ? 8u : 0u);
+                    const uint32_t nn = wn + nt * 8u + (lane & 3u) * 2u + (r & 1);
+                    if ((int32_t)nn >= take) continue;
+                    const uint32_t mrow = row0 + mr;
+                    if (mrow >= mid_dim) continue;
+                    const uint32_t p = sTok[nn];
+                    const uint32_t token = p / n_expert_used;
+                    const uint32_t slot = p - token * n_expert_used;
+                    const float g = accG[nt * 4 + r];
+                    mid[(uint64_t)token * mid_token_stride +
+                        (uint64_t)slot * mid_dim + mrow] =
+                        (g / (1.0f + expf(-g))) * accU[nt * 4 + r] * weights[p];
+                }
             }
         }
         __syncthreads();
@@ -4573,6 +4641,20 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         up_slab->type != (uint32_t)DS4_QWEN4EXP_TY_q6_K &&
         getenv("DS4_QWEN4EXP_NO_MMA") == NULL;
 
+    /* The down tile decides whether the mid projection has a float consumer.
+     * When the down tile runs it reads the Q8_0 scratch (mq/ms/msum) and never
+     * the floats, so the gate/up tile quantises in its epilogue and the float
+     * mid -- the write here plus the read-back of the second quantise pass --
+     * never leaves the chip.  DS4_QWEN4EXP_NO_MOE_EPILOGUE stands that down
+     * and restores the write-out + second-pass chain bit for bit.  Without the
+     * down tile the per-row down kernel reads the quantised scratch of every
+     * (token, slot) pair including the invalid ones the zeroing pass wrote, so
+     * the standalone quantise must keep running there. */
+    const int down_mma = use_mma && (out_dim % QW_DOWN_MMA_BM) == 0 &&
+                         down_slab->type != (uint32_t)DS4_QWEN4EXP_TY_q6_K;
+    const int moe_epilogue = down_mma &&
+        getenv("DS4_QWEN4EXP_NO_MOE_EPILOGUE") == NULL;
+
     const int tile = qwen4exp_moe_tile(n_tokens);
     /* One block row per expert the call CHOSE, not per expert that exists.
      * n_pairs bounds the number of distinct experts, and the kernel exits the
@@ -4611,7 +4693,11 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         qwen4exp_moe_gateup_mma_kernel<GT, UT><<< \
                 dim3(mid_dim / QW_MMA_BM, gu_rows, 1), \
                 QW_MMA_THREADS, 0, stream>>>( \
-                (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum, \
+                (float *)mid->ptr, \
+                moe_epilogue ? sc.mq : NULL, \
+                moe_epilogue ? sc.ms : NULL, \
+                moe_epilogue ? sc.msum : NULL, \
+                gate, up, sc.xq, sc.xs, sc.xsum, \
                 sc.pairs, sc.counts, sc.offsets, gu_active, \
                 (const float *)weights->ptr, \
                 gate_slab->expert_bytes, gate_slab->row_bytes, \
@@ -4657,7 +4743,10 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
 #undef QWEN4EXP_GATEUP_IMPL
     if (!cuda_ok(cudaGetLastError(), "qwen4exp MoE gate/up launch")) return 0;
 
-    if (!qwen4exp_quantize_rows(sc.mq, sc.ms, sc.msum, (const float *)mid->ptr,
+    /* The fused epilogue already quantised the live pairs' groups straight
+     * into the scratch the down tile reads. */
+    if (!moe_epilogue &&
+        !qwen4exp_quantize_rows(sc.mq, sc.ms, sc.msum, (const float *)mid->ptr,
                                 n_pairs, mid_dim, mgroups, mid_token_stride,
                                 mid_dim, n_expert_used, stream)) {
         return 0;
@@ -4680,8 +4769,6 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         QWEN4EXP_DOWN_IMPL(R, -1); \
     } \
 } while (0)
-    const int down_mma = use_mma && (out_dim % QW_DOWN_MMA_BM) == 0 &&
-                         down_slab->type != (uint32_t)DS4_QWEN4EXP_TY_q6_K;
     if (down_mma) {
 #define QWEN4EXP_DOWN_MMA(DT) \
         qwen4exp_moe_down_mma_kernel<DT><<< \

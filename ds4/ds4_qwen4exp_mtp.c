@@ -5,6 +5,7 @@
 
 #include "ds4_qwen4exp_mtp.h"
 
+#include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -723,6 +724,87 @@ static ds4_gpu_tensor *mtp_alloc(uint64_t bytes, bool *ok) {
     return t;
 }
 
+/* One unsigned decimal environment variable.  Unset or empty keeps the
+ * fallback; anything that is not exactly a decimal count in uint32 range is a
+ * named refusal, because a truncated parse would silently arm the wrong
+ * shortlist rather than fail. */
+static int mtp_env_u32(const char *name, uint32_t fallback, uint32_t *out,
+                       char *err, size_t errlen) {
+    *out = fallback;
+    const char *raw = getenv(name);
+    if (!raw || !raw[0]) return 0;
+    char *end = NULL;
+    errno = 0;
+    const unsigned long v = strtoul(raw, &end, 10);
+    if (errno != 0 || end == raw || !end || *end != '\0' ||
+        v > 0xFFFFFFFFul) {
+        return mtp_fail(err, errlen,
+                        "qwen4exp MTP head: %s=\"%s\" is not an unsigned "
+                        "decimal count below 2^32", name, raw);
+    }
+    *out = (uint32_t)v;
+    return 0;
+}
+
+/*
+ * Read the draft shortlist ONCE, at head init, and validate it against the
+ * vocabulary.  A prefix of 0 (the default) is OFF and the draft runs over the
+ * whole vocabulary; the tail is inert without a prefix and is not validated
+ * then, because a setting that arms nothing cannot mis-launch anything.
+ *
+ * The two ranges must be disjoint and inside the table: prefix first, then
+ * [n_vocab - tail, n_vocab).  That is what makes the packed argmax order the
+ * token-id order -- the top-1's first-max tie rule keeps picking the lowest id
+ * -- and what keeps every packed position a distinct id.
+ */
+static int mtp_head_draft_vocab(ds4_qwen4exp_mtp_head *h,
+                                char *err, size_t errlen) {
+    uint32_t prefix = 0, tail = 0;
+    if (mtp_env_u32("DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX", DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX_DEFAULT, &prefix,
+                    err, errlen) != 0 ||
+        mtp_env_u32("DS4_QWEN4EXP_DRAFT_VOCAB_TAIL",
+                    DS4_QWEN4EXP_DRAFT_VOCAB_TAIL_DEFAULT, &tail,
+                    err, errlen) != 0) {
+        return -1;
+    }
+    /* The built-in default is sized for the production vocabulary; on a
+     * smaller table (the reduced test artifacts) it falls back to the whole
+     * vocabulary instead of refusing.  An explicit setting is validated. */
+    if (getenv("DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX") == NULL &&
+        getenv("DS4_QWEN4EXP_DRAFT_VOCAB_TAIL") == NULL &&
+        (uint64_t)prefix + (uint64_t)tail > (uint64_t)h->n_vocab) {
+        prefix = 0u;
+    }
+    if (prefix == 0u) {
+        h->draft_vocab_prefix = 0u;
+        h->draft_vocab_tail = 0u;
+        return 0;
+    }
+    if (prefix > h->n_vocab) {
+        return mtp_fail(err, errlen,
+                        "qwen4exp MTP head: DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX=%u "
+                        "exceeds the vocabulary %u",
+                        prefix, h->n_vocab);
+    }
+    if (tail > h->n_vocab) {
+        return mtp_fail(err, errlen,
+                        "qwen4exp MTP head: DS4_QWEN4EXP_DRAFT_VOCAB_TAIL=%u "
+                        "exceeds the vocabulary %u",
+                        tail, h->n_vocab);
+    }
+    if ((uint64_t)prefix + (uint64_t)tail > (uint64_t)h->n_vocab) {
+        return mtp_fail(err, errlen,
+                        "qwen4exp MTP head: DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX=%u "
+                        "plus DS4_QWEN4EXP_DRAFT_VOCAB_TAIL=%u exceeds the "
+                        "vocabulary %u; the prefix range and the added-token "
+                        "range at the top of the table would overlap",
+                        prefix, tail, h->n_vocab);
+    }
+    h->draft_vocab_prefix = prefix;
+    h->draft_vocab_tail = tail;
+    return 0;
+}
+
 int ds4_qwen4exp_mtp_head_init(ds4_qwen4exp_mtp_head *h,
                                char *err, size_t errlen) {
     if (!h->hooks.rms_norm || !h->hooks.hc_mixer || !h->hooks.embed ||
@@ -753,6 +835,7 @@ int ds4_qwen4exp_mtp_head_init(ds4_qwen4exp_mtp_head *h,
                         h->n_embd, h->n_hc, h->n_lowrank, h->n_vocab,
                         h->max_tokens);
     }
+    if (mtp_head_draft_vocab(h, err, errlen) != 0) return -1;
     const uint64_t rows = h->max_tokens;
     const uint64_t n_embd = h->n_embd;
     const uint64_t hc_dim = (uint64_t)h->n_hc * n_embd;
@@ -771,6 +854,17 @@ int ds4_qwen4exp_mtp_head_init(ds4_qwen4exp_mtp_head *h,
     h->t_mix_wide     = mtp_alloc(rows * hc_dim * f, &ok);
     h->t_sample       = mtp_alloc(rows * n_embd * f, &ok);
     h->t_logits       = mtp_alloc(rows * h->n_vocab * f, &ok);
+    /* Shortlist staging, sized by the armed setting alone.  Off mode (the
+     * default) allocates neither, and a prefix with no tail needs none
+     * either -- its one range lands straight in t_logits -- so the
+     * full-vocabulary path keeps exactly the allocation profile it has
+     * always had. */
+    if (h->draft_vocab_prefix && h->draft_vocab_tail) {
+        h->t_logits_prefix = mtp_alloc(rows * h->draft_vocab_prefix * f, &ok);
+        if (ok) {
+            h->t_logits_tail = mtp_alloc(rows * h->draft_vocab_tail * f, &ok);
+        }
+    }
     h->t_top1         = mtp_alloc(rows * sizeof(uint32_t), &ok);
     h->top1_host      = malloc((size_t)rows * sizeof(uint32_t));
     if (!ok || !h->top1_host) {
@@ -787,7 +881,8 @@ void ds4_qwen4exp_mtp_head_free(ds4_qwen4exp_mtp_head *h) {
     ds4_gpu_tensor *all[] = {
         h->t_tokens, h->t_embed_rows, h->t_embed_out, h->t_e_normed,
         h->t_h_normed, h->t_ehx, h->t_hyper, h->t_mix_normed,
-        h->t_mix_lowrank, h->t_mix_wide, h->t_sample, h->t_logits, h->t_top1,
+        h->t_mix_lowrank, h->t_mix_wide, h->t_sample, h->t_logits,
+        h->t_logits_prefix, h->t_logits_tail, h->t_top1,
     };
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
         ds4_gpu_tensor_free(all[i]);
@@ -795,6 +890,7 @@ void ds4_qwen4exp_mtp_head_free(ds4_qwen4exp_mtp_head *h) {
     h->t_tokens = h->t_embed_rows = h->t_embed_out = h->t_e_normed = NULL;
     h->t_h_normed = h->t_ehx = h->t_hyper = h->t_mix_normed = NULL;
     h->t_mix_lowrank = h->t_mix_wide = h->t_sample = h->t_logits = NULL;
+    h->t_logits_prefix = h->t_logits_tail = NULL;
     h->t_top1 = NULL;
     free(h->top1_host);
     h->top1_host = NULL;
@@ -905,6 +1001,17 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
         n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT;
     const uint32_t logit_rows = narrow_logits ? 1u : n_tokens;
     const uint32_t logit_first = narrow_logits ? 0u : first_row;
+    /* The draft shortlist, fixed at init.  Zero keeps the whole vocabulary;
+     * armed, the DRAFT's borrowed-LM-head projection narrows to rows
+     * [0, prefix) plus the tail range, and `draft_width` is the width of one
+     * PACKED row: the prefix ids first, the tail ids behind them.  Packing
+     * prefix-first keeps the packed order the token-id order -- validated at
+     * init (the ranges are disjoint and prefix is below the tail base) -- so
+     * the top-1's first-max tie rule still picks the lowest id. */
+    const uint32_t draft_prefix = h->draft_vocab_prefix;
+    const uint32_t draft_tail = draft_prefix ? h->draft_vocab_tail : 0u;
+    const uint32_t draft_width = draft_prefix
+        ? draft_prefix + draft_tail : h->n_vocab;
     const int timing = mtp_head_time_on();
     uint64_t tmark = timing ? mtp_now_ns() : 0;
 
@@ -1029,21 +1136,60 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                                h->rms_eps, h->weight_bias, h->round_bf16) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_MIXER);
-    /* The borrowed LM head, in the target's mapping. */
+    /* The borrowed LM head, in the target's mapping.  The shortlist runs the
+     * SAME kernel over two row ranges of output.weight: Q8_0 rows are
+     * ds4_qwen4exp_q8_0_row_bytes() apart in the mapping, so a range is the
+     * same weight_offset shifted past the rows it skips, and the weight is
+     * read where it lies -- never copied, gathered or re-represented.  A
+     * range's rows get the same per-element reduction the full call gives
+     * them (the decode-order ladder is row-exact by construction, which is
+     * the property the whole speculative cycle stands on), so a shortlist
+     * id's logit is the logit the full projection produces. */
     if (ok) {
         stage = "borrowed lm head";
-        ok = h->hooks.matmul_q8_0(h->t_logits, h->target_map, h->target_size,
-                                  h->output_offset, n_embd, h->n_vocab,
-                                  h->t_sample, logit_rows) != 0;
+        ok = h->hooks.matmul_q8_0(
+                draft_tail ? h->t_logits_prefix : h->t_logits,
+                h->target_map, h->target_size, h->output_offset, n_embd,
+                draft_prefix ? draft_prefix : h->n_vocab,
+                h->t_sample, logit_rows) != 0;
+        if (ok && draft_tail) {
+            stage = "borrowed lm head tail";
+            ok = h->hooks.matmul_q8_0(
+                    h->t_logits_tail, h->target_map, h->target_size,
+                    h->output_offset + (uint64_t)(h->n_vocab - draft_tail) *
+                        ds4_qwen4exp_q8_0_row_bytes(n_embd),
+                    n_embd, draft_tail, h->t_sample, logit_rows) != 0;
+        }
+        if (ok && draft_tail) {
+            /* Pack each row's two ranges into one contiguous shortlist row:
+             * prefix first, tail behind it.  Sources are other tensors and
+             * the destinations do not overlap, so plain stream-ordered copies
+             * are enough -- there is no in-place shuffle to reason about. */
+            stage = "shortlist pack";
+            for (uint32_t r = 0; r < logit_rows; r++) {
+                ok = ds4_gpu_tensor_copy(
+                         h->t_logits, (uint64_t)r * draft_width * f,
+                         h->t_logits_prefix, (uint64_t)r * draft_prefix * f,
+                         (uint64_t)draft_prefix * f) != 0 &&
+                     ds4_gpu_tensor_copy(
+                         h->t_logits,
+                         ((uint64_t)r * draft_width + draft_prefix) * f,
+                         h->t_logits_tail, (uint64_t)r * draft_tail * f,
+                         (uint64_t)draft_tail * f) != 0;
+                if (!ok) break;
+            }
+        }
     }
     MTP_HEAD_TICK(MTP_HEAD_T_LM_HEAD);
     if (ok) {
         stage = "gpu top-1";
         /* The head exposes only draft ids.  Keep the LM-head arithmetic intact,
          * reduce each finite logit row on the device and read back one id
-         * instead of the full vocabulary row for a host scan. */
+         * instead of the full vocabulary row for a host scan.  A shortlist
+         * row is packed, so the id comes out in packed positions and is
+         * rebased below. */
         ok = ds4_gpu_indexer_topk_tensor(h->t_top1, h->t_logits,
-                                         h->n_vocab, logit_rows, 1u) != 0;
+                                         draft_width, logit_rows, 1u) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_TOP1);
     if (ok) ok = ds4_gpu_end_commands() != 0;
@@ -1066,7 +1212,7 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
             float logit0;
             const uint64_t row = (uint64_t)logit_first + t;
             ok = ds4_gpu_tensor_read(h->t_logits,
-                                     row * h->n_vocab * f,
+                                     row * (uint64_t)draft_width * f,
                                      &logit0, sizeof(logit0)) != 0;
             /* The former CPU scan seeded its comparison with row[0].  A NaN
              * there therefore kept token zero regardless of later values;
@@ -1095,7 +1241,14 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                         "rows", stage, pos0, n_tokens);
     }
     for (uint32_t t = 0; t < out_rows; t++) {
-        draft_out[t] = (int)h->top1_host[t];
+        /* Unpack the top-1's packed position back into a token id: below the
+         * prefix it IS the id; above it, rebase into the tail range.  Off
+         * mode (prefix 0) packed nothing and the position is the id. */
+        uint32_t id = h->top1_host[t];
+        if (draft_prefix && id >= draft_prefix) {
+            id = h->n_vocab - draft_tail + (id - draft_prefix);
+        }
+        draft_out[t] = (int)id;
     }
     if (timing) mtp_head_stage_calls++;
     return 0;
