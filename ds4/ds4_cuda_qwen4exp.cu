@@ -1952,11 +1952,34 @@ __global__ static void qwen4exp_moe_zero_invalid_kernel(
  * and both operands are staged through shared memory so the global reads are
  * coalesced instead of eight scattered 16-byte segments per warp.
  *
- * BM 64 output rows, BN 32 tokens, four groups staged per barrier.  BN is 32
+ * BM 32 output rows, BN 32 tokens, four groups staged per barrier.  BN is 32
  * because an expert holds about ten tokens at a prefill width of 512 and about
  * twenty at 1024, so one pass covers a whole expert and the staged weight is
- * used by every token that chose it.  Shared: two 64x132 int8 weight tiles,
- * one 32x132 activation tile, and the per-group scales, about 26 KiB.
+ * used by every token that chose it.  BM is 32 so the two weight tiles, the
+ * activation tile and the scales are about 16 KiB: six blocks fit an SM's
+ * shared budget and one block's decode phase runs under another's MMA.  At BM
+ * 64 the same tiles were 27 KiB, three blocks fit, and a barrier-separated
+ * decode stood idle for the whole of every load it issued.
+ *
+ * FOUR WARPS ON A 32x32 TILE.  The MMA is sixteen rows wide, so a warp owns a
+ * sixteen-row, sixteen-token quadrant of the tile: bit 0 of the warp id picks
+ * its row half, bit 1 its token half.  Every output element still has exactly
+ * one warp, one accumulator and the same ascending fold over the groups.
+ *
+ * THE K LOOP IS A TWO-PHASE PIPELINE.  One thread owns one (row, group) slot
+ * of each weight tile and one (token, group) slot of the activation tile, and
+ * a chunk walks three steps:
+ *
+ *   decode   the registers chunk k's raw bytes landed in -> the tile words
+ *   issue    chunk k+1's raw bytes; they are in flight through the MMA
+ *   barrier
+ *   mma      the tiles -> the accumulators
+ *
+ * The barrier at the top of the next iteration retires the last MMA's tile
+ * reads before the decode overwrites them, so two barriers per chunk remain --
+ * a single-buffered tile needs one on each side of its readers -- but the load
+ * latency no longer sits between them, and the decode writes the eight
+ * little-endian words mma.sync reads rather than repacking a byte array.
  *
  * Q6_K is NOT routed here.  Its scale changes every sixteen elements, so its
  * group needs two dots of sixteen and m16n8k32 cannot split k.  It keeps the
@@ -1964,14 +1987,21 @@ __global__ static void qwen4exp_moe_zero_invalid_kernel(
  * simply do not share an instruction.
  * ======================================================================== */
 
-#define QW_MMA_BM 64
+#define QW_MMA_BM 32
 #define QW_MMA_BN 32
 #define QW_MMA_G  4
 #define QW_MMA_KC (QW_MMA_G * 32)
 #define QW_MMA_LD (QW_MMA_KC + 4)
-#define QW_MMA_WARPS (QW_MMA_BM / 16)
+#define QW_MMA_WARPS ((QW_MMA_BM / 16) * (QW_MMA_BN / 16))
 #define QW_MMA_THREADS (QW_MMA_WARPS * 32)
-#define QW_MMA_NT (QW_MMA_BN / 8)
+#define QW_MMA_NT (QW_MMA_BN / 16)
+
+/* The pipeline gives every thread exactly one slot of each tile per chunk,
+ * which is what makes the one-chunk-deep register prefetch enough. */
+static_assert(QW_MMA_BM * QW_MMA_G == QW_MMA_THREADS,
+              "one weight slot per thread");
+static_assert(QW_MMA_BN * QW_MMA_G == QW_MMA_THREADS,
+              "one activation slot per thread");
 
 __device__ __forceinline__ static uint32_t qw_pack4(const int8_t *p) {
     return ((uint32_t)(uint8_t)p[0]) | ((uint32_t)(uint8_t)p[1] << 8) |
@@ -1994,6 +2024,16 @@ __device__ __forceinline__ static uint32_t qw_tile_word(const int8_t *p) {
  * The byte-at-a-time store this replaces put element e at byte e of the row,
  * which is exactly what a little-endian word of elements 4i..4i+3 holds, so
  * the tile bytes are unchanged and only the instruction count moves. */
+/* Word copy of one 32-byte quantised activation group into a tile row
+ * (the class-major shared-expert tile stages its B operand with it). */
+__device__ __forceinline__ static void qw_tile_copy_group(int8_t *dst,
+                                                          const int8_t *src) {
+    uint32_t *w = (uint32_t *)(void *)dst;
+    const uint32_t *s = (const uint32_t *)(const void *)src;
+#pragma unroll
+    for (int i = 0; i < 8; i++) w[i] = s[i];
+}
+
 __device__ __forceinline__ static void qw_tile_store_group(int8_t *dst,
                                                            const int8_t *wq) {
     uint32_t *w = (uint32_t *)(void *)dst;
@@ -2007,16 +2047,141 @@ __device__ __forceinline__ static void qw_tile_store_zero(int8_t *dst) {
     for (int i = 0; i < 8; i++) w[i] = 0u;
 }
 
-/* Copy one 32-quant activation group from the quantised scratch into a tile
- * row.  The scratch is a device allocation and every offset the caller cuts it
- * at -- the group index block, the pair list and the quantised rows -- is a
- * whole number of words, so a group start is always word aligned. */
-__device__ __forceinline__ static void qw_tile_copy_group(int8_t *dst,
-                                                          const int8_t *src) {
-    uint32_t *w = (uint32_t *)(void *)dst;
-    const uint32_t *s = (const uint32_t *)(const void *)src;
+/* Stage one 32-quant activation group held in registers into a tile row.
+ * The words are the little-endian words of the quantised scratch -- a device
+ * allocation every offset the caller cuts it at is a whole number of words
+ * from -- loaded one K chunk ahead of the decode that stores them, so the
+ * tile bytes are the bytes the scratch held. */
+__device__ __forceinline__ static void qw_tile_store_words(int8_t *dst,
+                                                           const uint32_t *w) {
+    uint32_t *d = (uint32_t *)(void *)dst;
 #pragma unroll
-    for (int i = 0; i < 8; i++) w[i] = s[i];
+    for (int i = 0; i < 8; i++) d[i] = w[i];
+}
+
+/* The raw payload words of one 32-element weight group: the bytes the decode
+ * below reads, nothing decoded.  A q4_K or q5_K group shares its 32-byte
+ * payload slice with its nibble-pair neighbour; a q5_1 group IS its 24-byte
+ * block, so its scale pair travels in word zero; q8_0's 34-byte stride puts
+ * every other group's payload two bytes past a word boundary, and an aligned
+ * window would read past the block the decode refuses to touch, so it stages
+ * nothing and decodes from the row.  The alignment is a property of the
+ * slab's strides, so the branch is uniform across the block. */
+__device__ __forceinline__ static bool qw_raw_load(
+        uint32_t type, const char *row, uint32_t g, uint32_t *w) {
+    switch (type) {
+    case (uint32_t)DS4_QWEN4EXP_TY_q4_K: {
+        const cuda_block_q4_K *xb = (const cuda_block_q4_K *)row + (g / 8u);
+        const uint8_t *qs = xb->qs + ((g % 8u) >> 1u) * 32u;
+        if (!qwen4exp_word_aligned(qs)) return false;
+        const uint32_t *qw = (const uint32_t *)(const void *)qs;
+#pragma unroll
+        for (int i = 0; i < 8; i++) w[i] = qw[i];
+        return true;
+    }
+    case (uint32_t)DS4_QWEN4EXP_TY_q5_1: {
+        const cuda_block_q5_1 *xb = (const cuda_block_q5_1 *)row + g;
+        if (!qwen4exp_word_aligned(xb)) return false;
+        const uint32_t *qw = (const uint32_t *)(const void *)xb;
+#pragma unroll
+        for (int i = 0; i < 6; i++) w[i] = qw[i];
+        return true;
+    }
+    case (uint32_t)DS4_QWEN4EXP_TY_q5_K: {
+        const cuda_block_q5_K *xb = (const cuda_block_q5_K *)row + (g / 8u);
+        const uint8_t *qs = xb->qs + ((g % 8u) >> 1u) * 32u;
+        if (!qwen4exp_word_aligned(qs)) return false;
+        const uint32_t *qw = (const uint32_t *)(const void *)qs;
+#pragma unroll
+        for (int i = 0; i < 8; i++) w[i] = qw[i];
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+/* Decode one 32-element group straight into the eight words of a tile row,
+ * plus the (wa, wb) the scaling chain needs.  `raw` is the group's payload as
+ * qw_raw_load staged it, or NULL to decode from the row -- which is what
+ * every type whose payload did not stage does, through the same
+ * dev_qwen4exp_group_decode the dp4a kernels use, so that decoder remains the
+ * oracle for the word algebra here.  Each word below re-derives the same
+ * nibble of the same payload byte into the same byte of the same word that
+ * decoder produced, so the tile holds the identical bytes either way. */
+__device__ __forceinline__ static void dev_qwen4exp_group_decode_w(
+        uint32_t type, const char *row, uint32_t g, const uint32_t *raw,
+        int8_t *dst, float *wa, float *wb) {
+    switch (type) {
+    case (uint32_t)DS4_QWEN4EXP_TY_q4_K: {
+        if (!raw) break;
+        const cuda_block_q4_K *xb = (const cuda_block_q4_K *)row + (g / 8u);
+        const uint32_t grp = g % 8u;
+        uint8_t sc = 0, m = 0;
+        dev_q4_K_get_scale_min(grp, xb->scales, &sc, &m);
+        wa[0] = dev_f16_to_f32(xb->d) * (float)sc;
+        wb[0] = -dev_f16_to_f32(xb->dmin) * (float)m;
+        const uint32_t shift = (grp & 1u) ? 4u : 0u;
+        uint32_t *w = (uint32_t *)(void *)dst;
+#pragma unroll
+        for (int i = 0; i < 8; i++)
+            w[i] = (raw[i] >> shift) & 0x0f0f0f0fu;
+        return;
+    }
+    case (uint32_t)DS4_QWEN4EXP_TY_q5_1: {
+        if (!raw) break;
+        const uint32_t qh = raw[1];
+        wa[0] = dev_f16_to_f32((uint16_t)(raw[0] & 0xffffu));
+        wb[0] = dev_f16_to_f32((uint16_t)(raw[0] >> 16u));
+        uint32_t *w = (uint32_t *)(void *)dst;
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            /* Byte b of word i is element 4i+b of the low nibbles and takes
+             * qh bit 4i+b as its fifth bit; byte b of word 4+i is element
+             * 16+4i+b of the high nibbles and takes qh bit 16+4i+b. */
+            const uint32_t q_lo = qh >> (4u * i);
+            const uint32_t q_hi = qh >> (16u + 4u * i);
+            const uint32_t f_lo = ((q_lo & 1u) << 4u) |
+                                  (((q_lo >> 1u) & 1u) << 12u) |
+                                  (((q_lo >> 2u) & 1u) << 20u) |
+                                  (((q_lo >> 3u) & 1u) << 28u);
+            const uint32_t f_hi = ((q_hi & 1u) << 4u) |
+                                  (((q_hi >> 1u) & 1u) << 12u) |
+                                  (((q_hi >> 2u) & 1u) << 20u) |
+                                  (((q_hi >> 3u) & 1u) << 28u);
+            w[i] = (raw[2 + i] & 0x0f0f0f0fu) | f_lo;
+            w[4 + i] = ((raw[2 + i] >> 4u) & 0x0f0f0f0fu) | f_hi;
+        }
+        return;
+    }
+    case (uint32_t)DS4_QWEN4EXP_TY_q5_K: {
+        const cuda_block_q5_K *xb = (const cuda_block_q5_K *)row + (g / 8u);
+        if (!raw || !qwen4exp_word_aligned(xb->qh)) break;
+        const uint32_t grp = g % 8u;
+        uint8_t sc = 0, m = 0;
+        dev_q4_K_get_scale_min(grp, xb->scales, &sc, &m);
+        wa[0] = dev_f16_to_f32(xb->d) * (float)sc;
+        wb[0] = -dev_f16_to_f32(xb->dmin) * (float)m;
+        const uint32_t shift = (grp & 1u) * 4u;
+        const uint32_t hbit = 0x01010101u << grp;
+        const uint32_t *hw = (const uint32_t *)(const void *)xb->qh;
+        uint32_t *w = (uint32_t *)(void *)dst;
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const uint32_t v = (raw[i] >> shift) & 0x0f0f0f0fu;
+            const uint32_t h = hw[i] & hbit;
+            const uint32_t add = ((h >> grp) & 0x01010101u) << 4u;
+            w[i] = v | add;
+        }
+        return;
+    }
+    default:
+        break;
+    }
+    int8_t wq[32];
+    int halves = 1;
+    dev_qwen4exp_group_decode(type, row, g, wq, wa, wb, &halves);
+    qw_tile_store_group(dst, wq);
 }
 
 __device__ __forceinline__ static void qw_mma_m16n8k32(
@@ -2065,6 +2230,9 @@ qwen4exp_moe_gateup_mma_kernel(
     const uint32_t tid  = threadIdx.x;
     const uint32_t warp = tid >> 5;
     const uint32_t lane = tid & 31;
+    /* This warp's quadrant of the tile. */
+    const uint32_t wr = (warp & 1u) * 16u;
+    const uint32_t wn = (warp >> 1) * 16u;
     const uint32_t row0 = blockIdx.x * QW_MMA_BM;
     if (row0 >= mid_dim) return;
     if (active) {
@@ -2079,6 +2247,16 @@ qwen4exp_moe_gateup_mma_kernel(
     const char *gate_e = gate + (uint64_t)expert * gate_expert_bytes;
     const char *up_e   = up   + (uint64_t)expert * up_expert_bytes;
 
+    /* One thread's slots, fixed for every chunk: a (row, group) of each
+     * weight tile and a (token, group) of the activation tile. */
+    const uint32_t dec_r  = tid / QW_MMA_G;
+    const uint32_t dec_gg = tid - dec_r * QW_MMA_G;
+    const uint32_t dec_mrow = row0 + dec_r;
+    const uint32_t act_tk = tid / QW_MMA_G;
+    const uint32_t act_gg = tid - act_tk * QW_MMA_G;
+    const char *gate_row = gate_e + (uint64_t)dec_mrow * gate_row_bytes;
+    const char *up_row   = up_e + (uint64_t)dec_mrow * up_row_bytes;
+
     for (int32_t nbase = 0; nbase < cnt; nbase += QW_MMA_BN) {
         const int32_t take = (cnt - nbase) < QW_MMA_BN ? (cnt - nbase)
                                                        : QW_MMA_BN;
@@ -2088,63 +2266,95 @@ qwen4exp_moe_gateup_mma_kernel(
         }
         __syncthreads();
 
+        /* The raw bytes chunk zero decodes from. */
+        uint32_t rawg[8], rawu[8], rawb[8];
+        int haveg = 0, haveu = 0, haveb = 0;
+        float act_scale = 0.0f, act_sum = 0.0f;
+        if (dec_mrow < mid_dim && dec_gg < groups) {
+            haveg = qw_raw_load(gate_type, gate_row, dec_gg, rawg);
+            haveu = qw_raw_load(up_type, up_row, dec_gg, rawu);
+        }
+        if (sTok[act_tk] != 0xffffffffu && act_gg < groups) {
+            const uint32_t token = sTok[act_tk] / n_expert_used;
+            const uint64_t at_g = (uint64_t)token * groups + act_gg;
+            const uint32_t *qw =
+                    (const uint32_t *)(const void *)(xq + at_g * 32u);
+#pragma unroll
+            for (int i = 0; i < 8; i++) rawb[i] = qw[i];
+            act_scale = xs[at_g];
+            act_sum = (float)xsum[at_g];
+            haveb = 1;
+        }
+
         float accG[QW_MMA_NT * 4], accU[QW_MMA_NT * 4];
 #pragma unroll
         for (int i = 0; i < QW_MMA_NT * 4; i++) { accG[i] = 0.0f; accU[i] = 0.0f; }
 
         for (uint32_t kc = 0; kc < groups; kc += QW_MMA_G) {
             __syncthreads();
-            /* Weight tile: one thread decodes one (row, group) of 32. */
-            for (uint32_t idx = tid; idx < QW_MMA_BM * QW_MMA_G;
-                 idx += QW_MMA_THREADS) {
-                const uint32_t r = idx / QW_MMA_G;
-                const uint32_t gg = idx - r * QW_MMA_G;
-                const uint32_t g = kc + gg;
-                int8_t wq[32];
-                float wa[2], wb[2];
-                int halves = 1;
-                const uint32_t mrow = row0 + r;
-                if (mrow < mid_dim && g < groups) {
-                    dev_qwen4exp_group_decode(
-                            GateType < 0 ? gate_type : (uint32_t)GateType,
-                            gate_e + (uint64_t)mrow * gate_row_bytes, g,
-                            wq, wa, wb, &halves);
-                    qw_tile_store_group(&sAg[r * QW_MMA_LD + gg * 32], wq);
-                    sWAg[r * QW_MMA_G + gg] = wa[0];
-                    sWBg[r * QW_MMA_G + gg] = wb[0];
-                    dev_qwen4exp_group_decode(
-                            UpType < 0 ? up_type : (uint32_t)UpType,
-                            up_e + (uint64_t)mrow * up_row_bytes, g,
-                            wq, wa, wb, &halves);
-                    qw_tile_store_group(&sAu[r * QW_MMA_LD + gg * 32], wq);
-                    sWAu[r * QW_MMA_G + gg] = wa[0];
-                    sWBu[r * QW_MMA_G + gg] = wb[0];
+            /* Weight tile: this thread's one (row, group) of 32, decoded from
+             * registers into the eight words of the tile row. */
+            {
+                const uint32_t g = kc + dec_gg;
+                if (dec_mrow < mid_dim && g < groups) {
+                    float wa[2], wb[2];
+                    dev_qwen4exp_group_decode_w(
+                            GateType < 0 ? gate_type : (uint32_t)GateType, gate_row, g,
+                            haveg ? rawg : NULL,
+                            &sAg[dec_r * QW_MMA_LD + dec_gg * 32], wa, wb);
+                    sWAg[dec_r * QW_MMA_G + dec_gg] = wa[0];
+                    sWBg[dec_r * QW_MMA_G + dec_gg] = wb[0];
+                    dev_qwen4exp_group_decode_w(
+                            UpType < 0 ? up_type : (uint32_t)UpType, up_row, g,
+                            haveu ? rawu : NULL,
+                            &sAu[dec_r * QW_MMA_LD + dec_gg * 32], wa, wb);
+                    sWAu[dec_r * QW_MMA_G + dec_gg] = wa[0];
+                    sWBu[dec_r * QW_MMA_G + dec_gg] = wb[0];
                 } else {
-                    qw_tile_store_zero(&sAg[r * QW_MMA_LD + gg * 32]);
-                    qw_tile_store_zero(&sAu[r * QW_MMA_LD + gg * 32]);
-                    sWAg[r * QW_MMA_G + gg] = 0.0f; sWBg[r * QW_MMA_G + gg] = 0.0f;
-                    sWAu[r * QW_MMA_G + gg] = 0.0f; sWBu[r * QW_MMA_G + gg] = 0.0f;
+                    qw_tile_store_zero(&sAg[dec_r * QW_MMA_LD + dec_gg * 32]);
+                    qw_tile_store_zero(&sAu[dec_r * QW_MMA_LD + dec_gg * 32]);
+                    sWAg[dec_r * QW_MMA_G + dec_gg] = 0.0f;
+                    sWBg[dec_r * QW_MMA_G + dec_gg] = 0.0f;
+                    sWAu[dec_r * QW_MMA_G + dec_gg] = 0.0f;
+                    sWBu[dec_r * QW_MMA_G + dec_gg] = 0.0f;
                 }
             }
             /* Activation tile: a padded token row is zero, and zero contributes
              * nothing to an integer dot, so the pad is exact. */
-            for (uint32_t idx = tid; idx < QW_MMA_BN * QW_MMA_G;
-                 idx += QW_MMA_THREADS) {
-                const uint32_t tk = idx / QW_MMA_G;
-                const uint32_t gg = idx - tk * QW_MMA_G;
-                const uint32_t g = kc + gg;
-                const uint32_t p = sTok[tk];
-                if (p != 0xffffffffu && g < groups) {
-                    const uint32_t token = p / n_expert_used;
-                    const uint64_t at = (uint64_t)token * groups + g;
-                    qw_tile_copy_group(&sB[tk * QW_MMA_LD + gg * 32],
-                                       xq + at * 32u);
-                    sXS  [tk * QW_MMA_G + gg] = xs[at];
-                    sXSUM[tk * QW_MMA_G + gg] = (float)xsum[at];
+            if (haveb && kc + act_gg < groups) {
+                qw_tile_store_words(&sB[act_tk * QW_MMA_LD + act_gg * 32],
+                                    rawb);
+                sXS  [act_tk * QW_MMA_G + act_gg] = act_scale;
+                sXSUM[act_tk * QW_MMA_G + act_gg] = act_sum;
+            } else {
+                qw_tile_store_zero(&sB[act_tk * QW_MMA_LD + act_gg * 32]);
+                sXS  [act_tk * QW_MMA_G + act_gg] = 0.0f;
+                sXSUM[act_tk * QW_MMA_G + act_gg] = 0.0f;
+            }
+            /* Chunk kc+G's raw bytes, issued now so they land while the MMA
+             * below runs. */
+            if (kc + QW_MMA_G < groups) {
+                const uint32_t g = kc + QW_MMA_G + dec_gg;
+                if (dec_mrow < mid_dim && g < groups) {
+                    haveg = qw_raw_load(gate_type, gate_row, g, rawg);
+                    haveu = qw_raw_load(up_type, up_row, g, rawu);
                 } else {
-                    qw_tile_store_zero(&sB[tk * QW_MMA_LD + gg * 32]);
-                    sXS[tk * QW_MMA_G + gg] = 0.0f;
-                    sXSUM[tk * QW_MMA_G + gg] = 0.0f;
+                    haveg = 0;
+                    haveu = 0;
+                }
+                const uint32_t ga = kc + QW_MMA_G + act_gg;
+                if (sTok[act_tk] != 0xffffffffu && ga < groups) {
+                    const uint32_t token = sTok[act_tk] / n_expert_used;
+                    const uint64_t at_g = (uint64_t)token * groups + ga;
+                    const uint32_t *qw =
+                            (const uint32_t *)(const void *)(xq + at_g * 32u);
+#pragma unroll
+                    for (int i = 0; i < 8; i++) rawb[i] = qw[i];
+                    act_scale = xs[at_g];
+                    act_sum = (float)xsum[at_g];
+                    haveb = 1;
+                } else {
+                    haveb = 0;
                 }
             }
             __syncthreads();
@@ -2152,7 +2362,7 @@ qwen4exp_moe_gateup_mma_kernel(
 #pragma unroll
             for (int gg = 0; gg < QW_MMA_G; gg++) {
                 if (kc + (uint32_t)gg >= groups) break;
-                const uint32_t ar = warp * 16u + (lane >> 2);
+                const uint32_t ar = wr + (lane >> 2);
                 const uint32_t ak = (lane & 3u) * 4u;
                 uint32_t ag[4], au[4], bf[2];
 #pragma unroll
@@ -2162,7 +2372,7 @@ qwen4exp_moe_gateup_mma_kernel(
                     ag[r] = qw_tile_word(&sAg[rr * QW_MMA_LD + kk]);
                     au[r] = qw_tile_word(&sAu[rr * QW_MMA_LD + kk]);
                 }
-                const uint32_t m0 = warp * 16u + (lane >> 2);
+                const uint32_t m0 = wr + (lane >> 2);
                 const uint32_t m1 = m0 + 8u;
 #pragma unroll
                 for (int nt = 0; nt < QW_MMA_NT; nt++) {
@@ -2170,8 +2380,8 @@ qwen4exp_moe_gateup_mma_kernel(
                      * occupy only one or two columns; whole empty columns
                      * have no consumer.  take is block-uniform, so all lanes
                      * still participate in every live MMA instruction. */
-                    if (nt * 8 >= take) break;
-                    const uint32_t bn = nt * 8u + (lane >> 2);
+                    if (wn + nt * 8u >= take) break;
+                    const uint32_t bn = wn + nt * 8u + (lane >> 2);
 #pragma unroll
                     for (int r = 0; r < 2; r++) {
                         bf[r] = qw_tile_word(&sB[bn * QW_MMA_LD + gg * 32u +
@@ -2181,7 +2391,7 @@ qwen4exp_moe_gateup_mma_kernel(
                     int32_t dg[4] = {0, 0, 0, 0}, du[4] = {0, 0, 0, 0};
                     qw_mma_m16n8k32(dg, ag, bf);
                     qw_mma_m16n8k32(du, au, bf);
-                    const uint32_t n0 = nt * 8u + (lane & 3u) * 2u;
+                    const uint32_t n0 = wn + nt * 8u + (lane & 3u) * 2u;
 #pragma unroll
                     for (int r = 0; r < 4; r++) {
                         const uint32_t mr = (r & 2) ? m1 : m0;
@@ -2202,13 +2412,13 @@ qwen4exp_moe_gateup_mma_kernel(
             }
         }
 
-        const uint32_t m0 = warp * 16u + (lane >> 2);
+        const uint32_t m0 = wr + (lane >> 2);
 #pragma unroll
         for (int nt = 0; nt < QW_MMA_NT; nt++) {
 #pragma unroll
             for (int r = 0; r < 4; r++) {
                 const uint32_t mr = m0 + ((r & 2) ? 8u : 0u);
-                const uint32_t nn = nt * 8u + (lane & 3u) * 2u + (r & 1);
+                const uint32_t nn = wn + nt * 8u + (lane & 3u) * 2u + (r & 1);
                 if ((int32_t)nn >= take) continue;
                 const uint32_t mrow = row0 + mr;
                 if (mrow >= mid_dim) continue;
@@ -2270,6 +2480,9 @@ qwen4exp_moe_down_mma_kernel(
     const uint32_t tid  = threadIdx.x;
     const uint32_t warp = tid >> 5;
     const uint32_t lane = tid & 31;
+    /* This warp's quadrant of the tile. */
+    const uint32_t wr = (warp & 1u) * 16u;
+    const uint32_t wn = (warp >> 1) * 16u;
     const uint32_t row0 = blockIdx.x * QW_MMA_BM;
     if (row0 >= out_dim) return;
     if (active && (int32_t)blockIdx.y >= active[0]) return;
@@ -2280,6 +2493,15 @@ qwen4exp_moe_down_mma_kernel(
     const int32_t base = offsets[expert];
     const char *down_e = down + (uint64_t)expert * down_expert_bytes;
 
+    /* One thread's slots, fixed for every chunk: a (row, group) of the weight
+     * tile and a (pair, group) of the activation tile. */
+    const uint32_t dec_r  = tid / QW_MMA_G;
+    const uint32_t dec_gg = tid - dec_r * QW_MMA_G;
+    const uint32_t dec_orow = row0 + dec_r;
+    const uint32_t act_tk = tid / QW_MMA_G;
+    const uint32_t act_gg = tid - act_tk * QW_MMA_G;
+    const char *down_row = down_e + (uint64_t)dec_orow * down_row_bytes;
+
     for (int32_t nbase = 0; nbase < cnt; nbase += QW_MMA_BN) {
         const int32_t take = (cnt - nbase) < QW_MMA_BN ? (cnt - nbase)
                                                        : QW_MMA_BN;
@@ -2289,51 +2511,82 @@ qwen4exp_moe_down_mma_kernel(
         }
         __syncthreads();
 
+        /* The raw bytes chunk zero decodes from. */
+        uint32_t raww[8], rawb[8];
+        int havew = 0, haveb = 0;
+        float act_scale = 0.0f, act_sum = 0.0f;
+        if (dec_orow < out_dim && dec_gg < groups) {
+            havew = qw_raw_load(down_type, down_row, dec_gg, raww);
+        }
+        if (sPair[act_tk] != 0xffffffffu && act_gg < groups) {
+            const uint64_t at_g = (uint64_t)sPair[act_tk] * groups + act_gg;
+            const uint32_t *qw =
+                    (const uint32_t *)(const void *)(mq + at_g * 32u);
+#pragma unroll
+            for (int i = 0; i < 8; i++) rawb[i] = qw[i];
+            act_scale = ms[at_g];
+            act_sum = (float)msum[at_g];
+            haveb = 1;
+        }
+
         float acc[QW_MMA_NT * 4];
 #pragma unroll
         for (int i = 0; i < QW_MMA_NT * 4; i++) acc[i] = 0.0f;
 
         for (uint32_t kc = 0; kc < groups; kc += QW_MMA_G) {
             __syncthreads();
-            for (uint32_t idx = tid; idx < QW_MMA_BM * QW_MMA_G;
-                 idx += QW_MMA_THREADS) {
-                const uint32_t r = idx / QW_MMA_G;
-                const uint32_t gg = idx - r * QW_MMA_G;
-                const uint32_t g = kc + gg;
-                const uint32_t orow = row0 + r;
-                int8_t wq[32];
-                float wa[2], wb[2];
-                int halves = 1;
-                if (orow < out_dim && g < groups) {
-                    dev_qwen4exp_group_decode(
-                            DownType < 0 ? down_type : (uint32_t)DownType,
-                            down_e + (uint64_t)orow * down_row_bytes, g,
-                            wq, wa, wb, &halves);
-                    qw_tile_store_group(&sA[r * QW_MMA_LD + gg * 32], wq);
-                    sWA[r * QW_MMA_G + gg] = wa[0];
-                    sWB[r * QW_MMA_G + gg] = wb[0];
+            /* Weight tile: this thread's one (row, group) of 32, decoded from
+             * registers into the eight words of the tile row. */
+            {
+                const uint32_t g = kc + dec_gg;
+                if (dec_orow < out_dim && g < groups) {
+                    float wa[2], wb[2];
+                    dev_qwen4exp_group_decode_w(
+                            DownType < 0 ? down_type : (uint32_t)DownType, down_row, g,
+                            havew ? raww : NULL,
+                            &sA[dec_r * QW_MMA_LD + dec_gg * 32], wa, wb);
+                    sWA[dec_r * QW_MMA_G + dec_gg] = wa[0];
+                    sWB[dec_r * QW_MMA_G + dec_gg] = wb[0];
                 } else {
-                    qw_tile_store_zero(&sA[r * QW_MMA_LD + gg * 32]);
-                    sWA[r * QW_MMA_G + gg] = 0.0f;
-                    sWB[r * QW_MMA_G + gg] = 0.0f;
+                    qw_tile_store_zero(&sA[dec_r * QW_MMA_LD + dec_gg * 32]);
+                    sWA[dec_r * QW_MMA_G + dec_gg] = 0.0f;
+                    sWB[dec_r * QW_MMA_G + dec_gg] = 0.0f;
                 }
             }
-            for (uint32_t idx = tid; idx < QW_MMA_BN * QW_MMA_G;
-                 idx += QW_MMA_THREADS) {
-                const uint32_t tk = idx / QW_MMA_G;
-                const uint32_t gg = idx - tk * QW_MMA_G;
-                const uint32_t g = kc + gg;
-                const uint32_t p = sPair[tk];
-                if (p != 0xffffffffu && g < groups) {
-                    const uint64_t at = (uint64_t)p * groups + g;
-                    qw_tile_copy_group(&sB[tk * QW_MMA_LD + gg * 32],
-                                       mq + at * 32u);
-                    sXS  [tk * QW_MMA_G + gg] = ms[at];
-                    sXSUM[tk * QW_MMA_G + gg] = (float)msum[at];
+            /* Activation tile: a padded pair row is zero, and zero contributes
+             * nothing to an integer dot, so the pad is exact. */
+            if (haveb && kc + act_gg < groups) {
+                qw_tile_store_words(&sB[act_tk * QW_MMA_LD + act_gg * 32],
+                                    rawb);
+                sXS  [act_tk * QW_MMA_G + act_gg] = act_scale;
+                sXSUM[act_tk * QW_MMA_G + act_gg] = act_sum;
+            } else {
+                qw_tile_store_zero(&sB[act_tk * QW_MMA_LD + act_gg * 32]);
+                sXS  [act_tk * QW_MMA_G + act_gg] = 0.0f;
+                sXSUM[act_tk * QW_MMA_G + act_gg] = 0.0f;
+            }
+            /* Chunk kc+G's raw bytes, issued now so they land while the MMA
+             * below runs. */
+            if (kc + QW_MMA_G < groups) {
+                const uint32_t g = kc + QW_MMA_G + dec_gg;
+                if (dec_orow < out_dim && g < groups) {
+                    havew = qw_raw_load(down_type, down_row, g, raww);
                 } else {
-                    qw_tile_store_zero(&sB[tk * QW_MMA_LD + gg * 32]);
-                    sXS[tk * QW_MMA_G + gg] = 0.0f;
-                    sXSUM[tk * QW_MMA_G + gg] = 0.0f;
+                    havew = 0;
+                }
+                const uint32_t ga = kc + QW_MMA_G + act_gg;
+                if (sPair[act_tk] != 0xffffffffu && ga < groups) {
+                    const uint64_t at_g =
+                            (uint64_t)sPair[act_tk] * groups + ga;
+                    const uint32_t *qw =
+                            (const uint32_t *)(const void *)(mq + at_g * 32u);
+#pragma unroll
+                    for (int i = 0; i < 8; i++) rawb[i] = qw[i];
+                    act_scale = ms[at_g];
+                    act_sum = (float)msum[at_g];
+                    haveb = 1;
+                } else {
+                    haveb = 0;
                 }
             }
             __syncthreads();
@@ -2341,7 +2594,7 @@ qwen4exp_moe_down_mma_kernel(
 #pragma unroll
             for (int gg = 0; gg < QW_MMA_G; gg++) {
                 if (kc + (uint32_t)gg >= groups) break;
-                const uint32_t ar = warp * 16u + (lane >> 2);
+                const uint32_t ar = wr + (lane >> 2);
                 const uint32_t ak = (lane & 3u) * 4u;
                 uint32_t af[4], bf[2];
 #pragma unroll
@@ -2350,15 +2603,15 @@ qwen4exp_moe_down_mma_kernel(
                     const uint32_t kk = gg * 32u + ak + ((r & 2) ? 16u : 0u);
                     af[r] = qw_tile_word(&sA[rr * QW_MMA_LD + kk]);
                 }
-                const uint32_t m0 = warp * 16u + (lane >> 2);
+                const uint32_t m0 = wr + (lane >> 2);
 #pragma unroll
                 for (int nt = 0; nt < QW_MMA_NT; nt++) {
                     /* An MMA column covers eight pairs.  Expert tails often
                      * occupy only one or two columns; whole empty columns
                      * have no consumer.  take is block-uniform, so all lanes
                      * still participate in every live MMA instruction. */
-                    if (nt * 8 >= take) break;
-                    const uint32_t bn = nt * 8u + (lane >> 2);
+                    if (wn + nt * 8u >= take) break;
+                    const uint32_t bn = wn + nt * 8u + (lane >> 2);
 #pragma unroll
                     for (int r = 0; r < 2; r++) {
                         bf[r] = qw_tile_word(&sB[bn * QW_MMA_LD + gg * 32u +
@@ -2367,7 +2620,7 @@ qwen4exp_moe_down_mma_kernel(
                     }
                     int32_t d[4] = {0, 0, 0, 0};
                     qw_mma_m16n8k32(d, af, bf);
-                    const uint32_t n0 = nt * 8u + (lane & 3u) * 2u;
+                    const uint32_t n0 = wn + nt * 8u + (lane & 3u) * 2u;
 #pragma unroll
                     for (int r = 0; r < 4; r++) {
                         const uint32_t mr = m0 + ((r & 2) ? 8u : 0u);
@@ -2383,12 +2636,12 @@ qwen4exp_moe_down_mma_kernel(
             }
         }
 
-        const uint32_t m0 = warp * 16u + (lane >> 2);
+        const uint32_t m0 = wr + (lane >> 2);
 #pragma unroll
         for (int nt = 0; nt < QW_MMA_NT; nt++) {
 #pragma unroll
             for (int r = 0; r < 4; r++) {
-                const uint32_t nn = nt * 8u + (lane & 3u) * 2u + (r & 1);
+                const uint32_t nn = wn + nt * 8u + (lane & 3u) * 2u + (r & 1);
                 if ((int32_t)nn >= take) continue;
                 const uint32_t mr = m0 + ((r & 2) ? 8u : 0u);
                 const uint32_t orow = row0 + mr;
