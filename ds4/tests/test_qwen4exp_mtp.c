@@ -1587,12 +1587,27 @@ struct ds4_gpu_tensor {
     int is_view;
 };
 
+static uint64_t g_tensor_copy_bytes[1024];
+static int g_tensor_copy_calls;
+
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     ds4_gpu_tensor *t = calloc(1, sizeof(*t));
     if (!t) return NULL;
     t->data = calloc(1, bytes ? (size_t)bytes : 1u);
     if (!t->data) { free(t); return NULL; }
     t->bytes = bytes;
+    return t;
+}
+ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base,
+                                    uint64_t offset, uint64_t bytes) {
+    if (!base || offset > base->bytes || bytes > base->bytes - offset) {
+        return NULL;
+    }
+    ds4_gpu_tensor *t = calloc(1, sizeof(*t));
+    if (!t) return NULL;
+    t->bytes = bytes;
+    t->data = base->data + offset;
+    t->is_view = 1;
     return t;
 }
 void ds4_gpu_tensor_free(ds4_gpu_tensor *t) {
@@ -1617,6 +1632,10 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_off,
                         uint64_t bytes) {
     if (!dst || !src) return 0;
     if (dst_off + bytes > dst->bytes || src_off + bytes > src->bytes) return 0;
+    if (g_tensor_copy_calls < (int)(sizeof(g_tensor_copy_bytes) /
+                                    sizeof(g_tensor_copy_bytes[0]))) {
+        g_tensor_copy_bytes[g_tensor_copy_calls++] = bytes;
+    }
     memmove(dst->data + dst_off, src->data + src_off, (size_t)bytes);
     return 1;
 }
@@ -2070,6 +2089,7 @@ static void test_head_wiring(void) {
         int draft_last[1] = { -1 };
         float multi_last[HEAD_HC_DIM];
         const int calls_before = g_log.n_log;
+        const int copies_before = g_tensor_copy_calls;
         CHECK(ds4_qwen4exp_mtp_head_forward_last(&h, next_tokens, multi_in,
                                                  12u, HEAD_ROWS, draft_last,
                                                  multi_last,
@@ -2078,6 +2098,15 @@ static void test_head_wiring(void) {
         CHECK(g_log.n_log - calls_before == n_want,
               "the last-row forward made %d calls, expected %d",
               g_log.n_log - calls_before, n_want);
+        int full_hyper_copies = 0;
+        for (int i = copies_before; i < g_tensor_copy_calls; i++) {
+            if (g_tensor_copy_bytes[i] == sizeof(multi_last)) {
+                full_hyper_copies++;
+            }
+        }
+        CHECK(full_hyper_copies == 0,
+              "last-row head forward copied a full hyper row %d time(s)",
+              full_hyper_copies);
         CHECK(g_log.block_tokens == HEAD_ROWS && g_log.mixer_rows == 1u &&
                   g_log.mm_ntok[3] == 1u,
               "last-only must keep all block rows and project one logit row");
