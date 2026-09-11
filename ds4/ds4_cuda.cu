@@ -5684,7 +5684,7 @@ __global__ static void matmul_q8_0_preq_rows_exact_tile_kernel(
 /* Two adjacent lanes share a Q8 group. Their integer partials may be
  * combined freely; each even lane keeps its original float group chain.
  * Shared memory remaps the 32 finished chains onto one reduction warp. */
-template <int R, bool Streaming = true>
+template <int R, bool Streaming = true, bool FullPairs = false>
 __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
         float *out, const unsigned char *w,
         const int8_t *xq, const float *xscale,
@@ -5705,10 +5705,14 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
         for (uint64_t b = group; b < blocks; b += 32u) {
             /* Name both lanes of every live pair even if independent
              * scheduling has temporarily separated their execution. */
-            const uint64_t warp_base = b - (uint64_t)(group & 15u);
-            const uint64_t remaining = blocks - warp_base;
-            const uint32_t live_pairs = (uint32_t)(remaining < 16u ? remaining : 16u);
-            const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
+            unsigned active = 0xffffffffu;
+            if (!FullPairs) {
+                const uint64_t warp_base = b - (uint64_t)(group & 15u);
+                const uint64_t remaining = blocks - warp_base;
+                const uint32_t live_pairs =
+                    (uint32_t)(remaining < 16u ? remaining : 16u);
+                active >>= 32u - 2u * live_pairs;
+            }
             const int8_t *payload = (const int8_t *)(wr + b * 34u + 2u) + half * 16u;
             const uintptr_t address = (uintptr_t)payload;
             const uint32_t shift = (uint32_t)(address & 3u) * 8u;
@@ -16715,17 +16719,35 @@ static int cuda_matmul_q8_0_preq_rows_exact(
              * general dense projections. The HC warp geometry above is
              * independent of this two-warp kernel's token-row bound. */
             if (n_rows == 1u && getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL) {
-                matmul_q8_0_preq_pair_lanes_kernel<1, false><<<
-                        dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u),
-                        256, 0, cuda_decode_stream()>>>(
-                        (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
-                        out_dim, n_rows, blocks);
+                if ((blocks & 15u) == 0u) {
+                    matmul_q8_0_preq_pair_lanes_kernel<1, false, true><<<
+                            dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u),
+                            256, 0, cuda_decode_stream()>>>(
+                            (float *)out->ptr, (const unsigned char *)wptr, xq,
+                            xscale, out_dim, n_rows, blocks);
+                } else {
+                    matmul_q8_0_preq_pair_lanes_kernel<1, false><<<
+                            dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u),
+                            256, 0, cuda_decode_stream()>>>(
+                            (float *)out->ptr, (const unsigned char *)wptr, xq,
+                            xscale, out_dim, n_rows, blocks);
+                }
             } else {
-                matmul_q8_0_preq_pair_lanes_kernel<2, false><<<
-                        dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u),
-                        256, 0, cuda_decode_stream()>>>(
-                        (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
-                        out_dim, n_rows, blocks);
+                if ((blocks & 15u) == 0u) {
+                    matmul_q8_0_preq_pair_lanes_kernel<2, false, true><<<
+                            dim3((unsigned)((out_dim + 3u) / 4u),
+                                 (n_rows + 1u) / 2u, 1u),
+                            256, 0, cuda_decode_stream()>>>(
+                            (float *)out->ptr, (const unsigned char *)wptr, xq,
+                            xscale, out_dim, n_rows, blocks);
+                } else {
+                    matmul_q8_0_preq_pair_lanes_kernel<2, false><<<
+                            dim3((unsigned)((out_dim + 3u) / 4u),
+                                 (n_rows + 1u) / 2u, 1u),
+                            256, 0, cuda_decode_stream()>>>(
+                            (float *)out->ptr, (const unsigned char *)wptr, xq,
+                            xscale, out_dim, n_rows, blocks);
+                }
             }
         }
         return cuda_ok(cudaGetLastError(), "q8 pair lanes launch");
