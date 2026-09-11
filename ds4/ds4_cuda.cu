@@ -16559,15 +16559,32 @@ static int cuda_matmul_q8_0_preq_rows_exact(
     const int use_dp4a = cuda_q8_use_dp4a();
     /* Two lanes read each full group at one/two-row decode widths. Integer
      * partials combine exactly, then the original 32 float chains and warp
-     * tree are restored. Wider calls and partial groups keep their kernels. */
+     * tree are restored. Wider calls and partial groups keep their kernels.
+     *
+     * R matches the CALL width: the row slot is a compile-time loop, so an
+     * R = 2 instantiation run at one row still issues the second row's weight
+     * loads and funnelshifts before `take == 1` discards them.  A one-row call
+     * therefore gets the R = 1 instantiation, whose per-row arithmetic, even
+     * lane chain and reduction tree are identical -- row 0 is computed by the
+     * same code either way, and row 1 is never written when take == 1. */
     if (use_dp4a && n_rows <= 2u && out_dim > 512u && (in_dim & 31u) == 0u &&
         getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
         (((uintptr_t)wptr & 1u) == 0u)) {
-        matmul_q8_0_preq_pair_lanes_kernel<2><<<
-                dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u),
-                256, 0, cuda_decode_stream()>>>(
-                (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
-                out_dim, n_rows, blocks);
+        const bool one_row = n_rows == 1u &&
+            getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL;
+        if (one_row) {
+            matmul_q8_0_preq_pair_lanes_kernel<1><<<
+                    dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u),
+                    256, 0, cuda_decode_stream()>>>(
+                    (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
+                    out_dim, n_rows, blocks);
+        } else {
+            matmul_q8_0_preq_pair_lanes_kernel<2><<<
+                    dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u),
+                    256, 0, cuda_decode_stream()>>>(
+                    (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
+                    out_dim, n_rows, blocks);
+        }
         return cuda_ok(cudaGetLastError(), "q8 pair lanes launch");
     }
     /* A warp owns an independent output row.  Narrow projections (notably
