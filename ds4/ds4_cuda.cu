@@ -17781,10 +17781,12 @@ extern "C" int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
 
     /* Measured decode geometries: small GDN projections use two adjacent
      * reduction leaves per thread; two-row routers use four without K-loop
-     * unrolling. Actual device pointers must support the vector load. */
+     * unrolling; one-row routers reuse the same C=2 / U=10 shape as GDN
+     * decode (C=4 at n=1 previously regressed). Actual device pointers must
+     * support the vector load. */
     if (in_dim == 2560u &&
         ((out_dim == 48u && n_rows <= 2u) ||
-         (out_dim == 512u && n_rows == 2u)) &&
+         (out_dim == 512u && n_rows <= 2u)) &&
         (((uintptr_t)w | (uintptr_t)x->ptr) & 15u) == 0u &&
         getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
         getenv("DS4_F32_NO_VECTOR_DECODE") == NULL) {
@@ -17795,6 +17797,11 @@ extern "C" int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
                     (const float *)x->ptr, out_dim);
         } else if (out_dim == 48u) {
             qwen_f32_vector_tree_kernel<2, 2, 10><<<
+                (unsigned)out_dim, 128, 0, cuda_decode_stream()>>>(
+                    (float *)out->ptr, (const float *)w,
+                    (const float *)x->ptr, out_dim);
+        } else if (out_dim == 512u && n_rows == 1u) {
+            qwen_f32_vector_tree_kernel<1, 2, 10><<<
                 (unsigned)out_dim, 128, 0, cuda_decode_stream()>>>(
                     (float *)out->ptr, (const float *)w,
                     (const float *)x->ptr, out_dim);
