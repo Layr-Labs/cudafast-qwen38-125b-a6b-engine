@@ -948,7 +948,6 @@ int main(int argc, char **argv) {
                 "ds4_session_load_payload",
                 "ds4_session_load_snapshot",
                 "ds4_session_payload_bytes",
-                "ds4_session_qwen4exp_spec_prepare",
                 "ds4_session_save_layer_payload",
                 "ds4_session_save_payload",
                 "ds4_session_save_snapshot",

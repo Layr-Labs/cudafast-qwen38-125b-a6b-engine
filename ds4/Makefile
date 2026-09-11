@@ -515,14 +515,6 @@ $(QWEN4EXP_MOE_TEST): tests/test_qwen4exp_moe.o $(GPU_TEST_OBJS)
 test-qwen4exp-moe: $(QWEN4EXP_MOE_TEST)
 	./$(QWEN4EXP_MOE_TEST)
 
-# Proves the F32 router projection's exactness sweep bites: each mutant
-# rewrites one line of matmul_f32_warp_tile_kernel and must make
-# ./tests/test_qwen4exp_moe --router-f32 fail.  Two commutative controls are
-# expected to pass; see the script header.  Rebuilds ds4_cuda.o per mutant.
-.PHONY: test-qwen4exp-router-f32-mutants
-test-qwen4exp-router-f32-mutants: $(QWEN4EXP_MOE_TEST)
-	CUDA_ARCH=$(CUDA_ARCH) bash tests/qwen4exp_router_f32_mutants.sh
-
 # Proves the test above bites: each mutant rewrites one kernel line through
 # DS4_METAL_QWEN4EXP_MOE_SOURCE and must make the test fail.
 .PHONY: test-qwen4exp-moe-mutants

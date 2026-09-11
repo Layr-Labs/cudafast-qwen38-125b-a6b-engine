@@ -1183,49 +1183,6 @@ __device__ __forceinline__ static bool qwen4exp_word_aligned(const void *p) {
     return (((uintptr_t)p) & 3u) == 0u;
 }
 
-/* WIDE PAYLOAD LOADS.  Every raw-word load below reads eight consecutive
- * payload words out of one quantised block.  Read as words that is eight
- * global instructions, and the threads of a warp sit on eight different rows,
- * so each of those instructions asks the L1 for the same scattered set of
- * lines again.  A sixteen-byte load asks once for four words at a time.
- *
- * uint4 .x .y .z .w ARE words 0..3 of the sixteen bytes at p, in address
- * order, which is the order the word loop assigns w[0..3]; uint2 .x .y are
- * words 0..1 of eight bytes the same way.  So w[] receives the identical
- * eight values and only the instruction count moves.  A payload's alignment
- * is fixed by the slab's strides and the scratch cut, never by the thread, so
- * the test below is uniform across the warp and every arm is exact. */
-#ifndef DS4_QWEN4EXP_WIDE_PAYLOAD
-/* 1, the shipped default, takes the wide arms; 0 restores the word load the
- * wide arms are argued equal to, for bisecting a suspected decode fault
- * without reverting the change. */
-#define DS4_QWEN4EXP_WIDE_PAYLOAD 1
-#endif
-__device__ __forceinline__ static void qw_load_words8(const uint32_t *qw,
-                                                      uint32_t *w) {
-#if DS4_QWEN4EXP_WIDE_PAYLOAD
-    if ((((uintptr_t)qw) & 15u) == 0u) {
-        const uint4 a = *(const uint4 *)(const void *)qw;
-        const uint4 b = *(const uint4 *)(const void *)(qw + 4);
-        w[0] = a.x; w[1] = a.y; w[2] = a.z; w[3] = a.w;
-        w[4] = b.x; w[5] = b.y; w[6] = b.z; w[7] = b.w;
-        return;
-    }
-    if ((((uintptr_t)qw) & 7u) == 0u) {
-        const uint2 *q2 = (const uint2 *)(const void *)qw;
-#pragma unroll
-        for (int i = 0; i < 4; i++) {
-            const uint2 v = q2[i];
-            w[2 * i] = v.x;
-            w[2 * i + 1] = v.y;
-        }
-        return;
-    }
-#endif
-#pragma unroll
-    for (int i = 0; i < 8; i++) w[i] = qw[i];
-}
-
 /* Decode one 32-element group of a quantised weight row into int8 quants and
  * the one or two (wa, wb) pairs that turn an integer dot into the row's
  * contribution.  Called once per group per output row, not once per element.
@@ -2136,7 +2093,9 @@ __device__ __forceinline__ static bool qw_raw_load(
         const cuda_block_q4_K *xb = (const cuda_block_q4_K *)row + (g / 8u);
         const uint8_t *qs = xb->qs + ((g % 8u) >> 1u) * 32u;
         if (!qwen4exp_word_aligned(qs)) return false;
-        qw_load_words8((const uint32_t *)(const void *)qs, w);
+        const uint32_t *qw = (const uint32_t *)(const void *)qs;
+#pragma unroll
+        for (int i = 0; i < 8; i++) w[i] = qw[i];
         return true;
     }
     case (uint32_t)DS4_QWEN4EXP_TY_q5_1: {
@@ -2151,7 +2110,9 @@ __device__ __forceinline__ static bool qw_raw_load(
         const cuda_block_q5_K *xb = (const cuda_block_q5_K *)row + (g / 8u);
         const uint8_t *qs = xb->qs + ((g % 8u) >> 1u) * 32u;
         if (!qwen4exp_word_aligned(qs)) return false;
-        qw_load_words8((const uint32_t *)(const void *)qs, w);
+        const uint32_t *qw = (const uint32_t *)(const void *)qs;
+#pragma unroll
+        for (int i = 0; i < 8; i++) w[i] = qw[i];
         return true;
     }
     default:
@@ -2222,13 +2183,12 @@ __device__ __forceinline__ static void dev_qwen4exp_group_decode_w(
         wb[0] = -dev_f16_to_f32(xb->dmin) * (float)m;
         const uint32_t shift = (grp & 1u) * 4u;
         const uint32_t hbit = 0x01010101u << grp;
-        uint32_t hv[8];
-        qw_load_words8((const uint32_t *)(const void *)xb->qh, hv);
+        const uint32_t *hw = (const uint32_t *)(const void *)xb->qh;
         uint32_t *w = (uint32_t *)(void *)dst;
 #pragma unroll
         for (int i = 0; i < 8; i++) {
             const uint32_t v = (raw[i] >> shift) & 0x0f0f0f0fu;
-            const uint32_t h = hv[i] & hbit;
+            const uint32_t h = hw[i] & hbit;
             const uint32_t add = ((h >> grp) & 0x01010101u) << 4u;
             w[i] = v | add;
         }
@@ -2336,8 +2296,10 @@ qwen4exp_moe_gateup_mma_kernel(
         if (sTok[act_tk] != 0xffffffffu && act_gg < groups) {
             const uint32_t token = sTok[act_tk] / n_expert_used;
             const uint64_t at_g = (uint64_t)token * groups + act_gg;
-            qw_load_words8((const uint32_t *)(const void *)(xq + at_g * 32u),
-                           rawb);
+            const uint32_t *qw =
+                    (const uint32_t *)(const void *)(xq + at_g * 32u);
+#pragma unroll
+            for (int i = 0; i < 8; i++) rawb[i] = qw[i];
             act_scale = xs[at_g];
             act_sum = (float)xsum[at_g];
             haveb = 1;
@@ -2349,15 +2311,6 @@ qwen4exp_moe_gateup_mma_kernel(
 
         for (uint32_t kc = 0; kc < groups; kc += QW_MMA_G) {
             __syncthreads();
-            /* The next chunk's weight payload is issued the moment this
-             * chunk's copy of the register is dead -- between the two
-             * decodes -- rather than after both, so the load has the rest of
-             * the decode as well as the MMA below to land in.  Same one-chunk
-             * depth, same registers, same values; only the issue point moves,
-             * and the guard is the one the prefetch block used. */
-            const uint32_t gnext = kc + QW_MMA_G + dec_gg;
-            const bool next_w = kc + QW_MMA_G < groups &&
-                                dec_mrow < mid_dim && gnext < groups;
             /* Weight tile: this thread's one (row, group) of 32, decoded from
              * registers into the eight words of the tile row. */
             {
@@ -2370,14 +2323,12 @@ qwen4exp_moe_gateup_mma_kernel(
                             &sAg[dec_r * QW_MMA_LD + dec_gg * 32], wa, wb);
                     sWAg[dec_r * QW_MMA_G + dec_gg] = wa[0];
                     sWBg[dec_r * QW_MMA_G + dec_gg] = wb[0];
-                    haveg = next_w && qw_raw_load(gate_type, gate_row, gnext, rawg);
                     dev_qwen4exp_group_decode_w(
                             UpType < 0 ? up_type : (uint32_t)UpType, up_row, g,
                             haveu ? rawu : NULL,
                             &sAu[dec_r * QW_MMA_LD + dec_gg * 32], wa, wb);
                     sWAu[dec_r * QW_MMA_G + dec_gg] = wa[0];
                     sWBu[dec_r * QW_MMA_G + dec_gg] = wb[0];
-                    haveu = next_w && qw_raw_load(up_type, up_row, gnext, rawu);
                 } else {
                     qw_tile_store_zero(&sAg[dec_r * QW_MMA_LD + dec_gg * 32]);
                     qw_tile_store_zero(&sAu[dec_r * QW_MMA_LD + dec_gg * 32]);
@@ -2385,8 +2336,6 @@ qwen4exp_moe_gateup_mma_kernel(
                     sWBg[dec_r * QW_MMA_G + dec_gg] = 0.0f;
                     sWAu[dec_r * QW_MMA_G + dec_gg] = 0.0f;
                     sWBu[dec_r * QW_MMA_G + dec_gg] = 0.0f;
-                    haveg = 0;
-                    haveu = 0;
                 }
             }
             /* Activation tile: a padded token row is zero, and zero contributes
@@ -2401,16 +2350,25 @@ qwen4exp_moe_gateup_mma_kernel(
                 sXS  [act_tk * QW_MMA_G + act_gg] = 0.0f;
                 sXSUM[act_tk * QW_MMA_G + act_gg] = 0.0f;
             }
-            /* Chunk kc+G's activation bytes, issued now so they land while
-             * the MMA below runs; the weight payload above went earlier. */
+            /* Chunk kc+G's raw bytes, issued now so they land while the MMA
+             * below runs. */
             if (kc + QW_MMA_G < groups) {
+                const uint32_t g = kc + QW_MMA_G + dec_gg;
+                if (dec_mrow < mid_dim && g < groups) {
+                    haveg = qw_raw_load(gate_type, gate_row, g, rawg);
+                    haveu = qw_raw_load(up_type, up_row, g, rawu);
+                } else {
+                    haveg = 0;
+                    haveu = 0;
+                }
                 const uint32_t ga = kc + QW_MMA_G + act_gg;
                 if (sTok[act_tk] != 0xffffffffu && ga < groups) {
                     const uint32_t token = sTok[act_tk] / n_expert_used;
                     const uint64_t at_g = (uint64_t)token * groups + ga;
-                    qw_load_words8(
-                            (const uint32_t *)(const void *)(xq + at_g * 32u),
-                            rawb);
+                    const uint32_t *qw =
+                            (const uint32_t *)(const void *)(xq + at_g * 32u);
+#pragma unroll
+                    for (int i = 0; i < 8; i++) rawb[i] = qw[i];
                     act_scale = xs[at_g];
                     act_sum = (float)xsum[at_g];
                     haveb = 1;
@@ -2697,104 +2655,6 @@ __global__ static void qwen4exp_moe_down_combine_kernel(
     out[idx] = acc;
 }
 
-
-/* Adjacent warps own the gate and up projection of one output row. Each
- * carries one decoded matrix and its accumulators, reducing register pressure
- * during a two-token verify. Every projection retains the original ascending
- * group chain and warp reduction. Only the completed scalar projections pass
- * through shared memory before the unchanged SiLU/up/router-weight product.
- * Four rows share a 256-thread block; inactive row warps still join barriers. */
-template <int R, int Type>
-__global__ static void qwen4exp_moe_gateup_split_kernel(
-        float *mid,
-        const char *gate,
-        const char *up,
-        const int8_t *xq,
-        const float *xs,
-        const int32_t *xsum,
-        const int32_t *pairs,
-        const int32_t *counts,
-        const int32_t *offsets,
-        const int32_t *active,
-        const float *weights,
-        uint64_t gate_expert_bytes,
-        uint64_t gate_row_bytes,
-        uint64_t up_expert_bytes,
-        uint64_t up_row_bytes,
-        uint32_t gate_type,
-        uint32_t up_type,
-        uint32_t groups,
-        uint32_t mid_dim,
-        uint32_t mid_token_stride,
-        uint32_t n_expert_used) {
-    const uint32_t lane = threadIdx.x & 31u;
-    const uint32_t warp = threadIdx.x >> 5u;
-    const uint32_t row = blockIdx.x * 4u + (warp >> 1u);
-    const bool live = row < mid_dim;
-    const bool second = (warp & 1u) != 0u;
-    uint32_t expert = blockIdx.y;
-    if (active) {
-        if ((int32_t)blockIdx.y >= active[0]) return;
-        expert = (uint32_t)active[1 + blockIdx.y];
-    }
-    const int32_t cnt = counts[expert];
-    if (cnt <= 0) return;
-    const int32_t base = offsets[expert];
-    const char *weight_row = (second ? up : gate) +
-        (uint64_t)expert * (second ? up_expert_bytes : gate_expert_bytes) +
-        (uint64_t)(live ? row : 0u) * (second ? up_row_bytes : gate_row_bytes);
-    __shared__ float projected[R][8];
-    for (int32_t at = 0; at < cnt; at += R) {
-        const int32_t take = (cnt - at) < R ? (cnt - at) : R;
-        uint32_t tok[R];
-#pragma unroll
-        for (int r = 0; r < R; r++) {
-            const int32_t p = pairs[base + at + (r < take ? r : 0)];
-            tok[r] = (uint32_t)p / n_expert_used;
-        }
-        float acc[R];
-#pragma unroll
-        for (int r = 0; r < R; r++) acc[r] = 0.0f;
-        if (live) {
-            for (uint32_t g = lane; g < groups; g += 32u) {
-                int8_t wq[32]; float wa[2], wb[2]; int halves = 1;
-                dev_qwen4exp_group_decode((uint32_t)Type, weight_row, g,
-                                          wq, wa, wb, &halves);
-#pragma unroll
-                for (int r = 0; r < R; r++) {
-                    if (r < take) {
-                        const uint64_t at_g = (uint64_t)tok[r] * groups + g;
-                        qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves,
-                            xq + at_g * 32u, xs[at_g], xsum[at_g]);
-                    }
-                }
-            }
-        }
-#pragma unroll
-        for (int r = 0; r < R; r++) {
-            const float v = warp_sum_f32(acc[r]);
-            if (lane == 0u) projected[r][warp] = v;
-        }
-        __syncthreads();
-        if (live && !second && lane == 0u) {
-#pragma unroll
-            for (int r = 0; r < R; r++) {
-                if (r < take) {
-                    const uint32_t p = (uint32_t)pairs[base + at + r];
-                    const uint32_t t = p / n_expert_used;
-                    const uint32_t slot = p - t * n_expert_used;
-                    const float g = projected[r][warp];
-                    const float u = projected[r][warp + 1u];
-                    mid[(uint64_t)t * mid_token_stride +
-                        (uint64_t)slot * mid_dim + row] =
-                        (g / (1.0f + expf(-g))) * u * weights[p];
-                }
-            }
-        }
-        /* Readers finish before a fast projection warp reuses this tile. */
-        __syncthreads();
-    }
-}
 
 /* Grid (ceil(mid_dim / 8), n_expert).  The block owns one expert; the pair
  * list gives it the (token, slot) pairs that chose it, so a decoded group
@@ -4629,26 +4489,6 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         }
 #undef QWEN4EXP_GATEUP_MMA
     }
-    /* The measured Q4 path for the R=2 tile (one-row decode and two-row
-     * verify). qwen4exp_moe_tile already returns 2 for n_tokens <= 2, so the
-     * joint R=2 kernel was already the decode path; splitting gate/up across
-     * neighboring warps applies the same register cut there. The diagnostic
-     * pin retains the joint projection as a bit-exact oracle. Other widths
-     * keep their prior kernel. */
-    else if (n_tokens <= 2u && tile == 2 && specialize &&
-             gate_slab->type == DS4_QWEN4EXP_TY_q4_K &&
-             up_slab->type == DS4_QWEN4EXP_TY_q4_K &&
-             getenv("DS4_QWEN4EXP_NO_SPLIT_GATEUP") == NULL) {
-        qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K><<<
-            dim3((mid_dim + 3u) / 4u, gu_rows, 1), threads, 0, stream>>>(
-            (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum,
-            sc.pairs, sc.counts, sc.offsets, gu_active,
-            (const float *)weights->ptr,
-            gate_slab->expert_bytes, gate_slab->row_bytes,
-            up_slab->expert_bytes, up_slab->row_bytes,
-            gate_slab->type, up_slab->type, xgroups, mid_dim,
-            mid_token_stride, n_expert_used);
-    }
     else if (tile == 8) { QWEN4EXP_GATEUP(8); }
     else if (tile == 4) { QWEN4EXP_GATEUP(4); }
     else if (tile == 2) { QWEN4EXP_GATEUP(2); }
@@ -6460,7 +6300,44 @@ __global__ static void qwen4exp_qsa_attention_kernel(
 
         if (tid < head_dim) {
             float contrib = 0.0f;
-            for (uint32_t j = 0; j < n_in_tile; j++) {
+            uint32_t j = 0;
+            /* FOUR VALUE ROWS IN FLIGHT AT A TIME.  This loop is the longest
+             * dependency chain in the kernel: one global load per key, each
+             * add waiting on the one before it, up to nth keys per tile.  The
+             * loads coalesce across `tid` already, so what is left to win is
+             * how many are in flight, and issuing four before the first
+             * product covers four times the latency.
+             *
+             * THE PRODUCTS ARE ADDED IN THE SAME ORDER, j ascending, so
+             * `contrib` is bit for bit the value the one-at-a-time loop
+             * returned.
+             *
+             * The batch runs on the DENSE path only.  There every key in
+             * [0, n_in_tile) is `base + j`, which the tile bound already keeps
+             * inside `count` and `cache_cap`, so `keys[j]` is never negative
+             * and the skip below cannot fire; the sparse path keeps the
+             * one-at-a-time walk, whose `continue` is load bearing. */
+            if (!sparse) {
+                for (; j + 4u <= n_in_tile; j += 4u) {
+                    const float *v0 = v_cache +
+                        (uint64_t)keys[j] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float *v1 = v_cache +
+                        (uint64_t)keys[j + 1u] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float *v2 = v_cache +
+                        (uint64_t)keys[j + 2u] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float *v3 = v_cache +
+                        (uint64_t)keys[j + 3u] * kv_stride + (uint64_t)kv_head * head_dim;
+                    const float a0 = v0[tid];
+                    const float a1 = v1[tid];
+                    const float a2 = v2[tid];
+                    const float a3 = v3[tid];
+                    contrib += probs[j] * a0;
+                    contrib += probs[j + 1u] * a1;
+                    contrib += probs[j + 2u] * a2;
+                    contrib += probs[j + 3u] * a3;
+                }
+            }
+            for (; j < n_in_tile; j++) {
                 const int32_t kj = keys[j];
                 if (kj < 0) continue;
                 const float *vv = v_cache +
