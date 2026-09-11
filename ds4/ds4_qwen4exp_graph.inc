@@ -631,7 +631,7 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
                 (uint64_t)DS4_N_INDEXER_HEAD_DIM * f, &ok);
             s->attn_q_norm[il] = qwen4exp_alloc_zeroed((uint64_t)DS4_N_HEAD_DIM * f, &ok);
             s->attn_k_norm[il] = qwen4exp_alloc_zeroed((uint64_t)DS4_N_HEAD_DIM * f, &ok);
-            /* These three norms take their weight as a device tensor rather
+            /* These four norms take their weight as a device tensor rather
              * than a model offset, so upload them once at session open. */
             if (ok) {
                 const ds4_qwen4exp_layer_weights *lw = &w->layer[il];
@@ -2136,8 +2136,9 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
      * than taking its own command buffer, and the blits that append to the KV
      * caches only work inside a batch at all.  qwen4exp_forward_fail() ends the
      * batch on the way out so a refusal does not leave one open. */
-    if (s->d_pos) {
-        ds4_gpu_qwen4exp_update_dpos(s->d_pos, s->pos);
+    if (s->d_pos && !ds4_gpu_qwen4exp_update_dpos(s->d_pos, s->pos)) {
+        fprintf(stderr, "ds4: qwen4exp position update failed\n");
+        return false;
     }
     if (!ds4_gpu_begin_commands()) {
         fprintf(stderr, "ds4: qwen4exp could not open a command batch\n");
@@ -2343,7 +2344,7 @@ bool ds4_qwen4exp_session_add_head_block(ds4_qwen4exp_session             *s,
     if (s->qsa_k[il]) return true;   /* already set up */
 
     /* Conservative: the slot's own buffers come out of qwen4exp_alloc_zeroed
-     * and so match a reset, but this also uploads the head's three norms and
+     * and so match a reset, but this also uploads the head's four norms and
      * registers its mapping, so let the next reset run in full rather than
      * reason about which of those a reset covers. */
     s->state_dirty = true;
@@ -2446,13 +2447,19 @@ bool ds4_qwen4exp_session_add_head_block(ds4_qwen4exp_session             *s,
         (uint64_t)n_ctx * DS4_N_INDEXER_KV_HEAD * DS4_N_INDEXER_HEAD_DIM * f, &ok);
     s->idx_pool[il] = qwen4exp_alloc_zeroed(
         blocks * DS4_N_INDEXER_KV_HEAD * DS4_N_INDEXER_HEAD_DIM * f, &ok);
+    s->idx_q_norm[il] = qwen4exp_alloc_zeroed(
+        (uint64_t)DS4_N_INDEXER_HEAD_DIM * f, &ok);
     s->idx_k_norm[il] = qwen4exp_alloc_zeroed((uint64_t)DS4_N_INDEXER_HEAD_DIM * f, &ok);
     s->attn_q_norm[il] = qwen4exp_alloc_zeroed((uint64_t)DS4_N_HEAD_DIM * f, &ok);
     s->attn_k_norm[il] = qwen4exp_alloc_zeroed((uint64_t)DS4_N_HEAD_DIM * f, &ok);
     if (ok) {
-        /* From the HEAD's mapping, not the target's: these three come out of
+        /* From the HEAD's mapping, not the target's: these four come out of
          * the --mtp GGUF like the rest of blk.<il>.*. */
-        ok = l->indexer_k_norm && l->attn_q_norm && l->attn_k_norm &&
+        ok = l->indexer_q_norm && l->indexer_k_norm &&
+             l->attn_q_norm && l->attn_k_norm &&
+             ds4_gpu_tensor_write(s->idx_q_norm[il], 0,
+                                  tensor_data(m, l->indexer_q_norm),
+                                  (uint64_t)DS4_N_INDEXER_HEAD_DIM * f) &&
              ds4_gpu_tensor_write(s->idx_k_norm[il], 0,
                                   tensor_data(m, l->indexer_k_norm),
                                   (uint64_t)DS4_N_INDEXER_HEAD_DIM * f) &&
@@ -2554,7 +2561,12 @@ int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
     const uint32_t saved_pos = s->pos;
     s->hyper = hyper;
     s->pos = pos0;
-    if (s->d_pos) ds4_gpu_qwen4exp_update_dpos(s->d_pos, s->pos);
+    if (s->d_pos && !ds4_gpu_qwen4exp_update_dpos(s->d_pos, s->pos)) {
+        s->hyper = saved_hyper;
+        s->pos = saved_pos;
+        fprintf(stderr, "ds4: qwen4exp head position update failed\n");
+        return 0;
+    }
 
     const bool capture_ok =
         n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
@@ -2596,7 +2608,10 @@ int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
 
     s->hyper = saved_hyper;
     s->pos = saved_pos;
-    if (s->d_pos) ds4_gpu_qwen4exp_update_dpos(s->d_pos, s->pos);
+    if (s->d_pos && !ds4_gpu_qwen4exp_update_dpos(s->d_pos, s->pos)) {
+        stage = "position restore";
+        ok = false;
+    }
     if (!ok) {
         fprintf(stderr, "ds4: qwen4exp head block %u failed at the %s\n",
                 il, stage);

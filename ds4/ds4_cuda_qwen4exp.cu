@@ -1205,8 +1205,10 @@ __device__ __forceinline__ static void dev_qwen4exp_group_decode(
     switch (type) {
     case (uint32_t)DS4_QWEN4EXP_TY_q8_0: {
         const char *blk = row + (uint64_t)g * 34u;
-        const uint16_t d = (uint16_t)((uint8_t)blk[0]) |
-                           (uint16_t)((uint16_t)(uint8_t)blk[1] << 8u);
+        const uint16_t d = (((uintptr_t)blk & 1u) == 0u)
+            ? *(const uint16_t *)(const void *)blk
+            : (uint16_t)((uint8_t)blk[0]) |
+              (uint16_t)((uint16_t)(uint8_t)blk[1] << 8u);
         wa[0] = dev_f16_to_f32(d);
         const uint8_t *payload = (const uint8_t *)blk + 2u;
         const uintptr_t address = (uintptr_t)payload;
@@ -1224,11 +1226,20 @@ __device__ __forceinline__ static void dev_qwen4exp_group_decode(
             wq[i * 4 + 3] = (int8_t)(packed >> 24u);
             previous = next;
         }
-        /* The final four bytes are still inside this 34-byte block, but the
-         * next aligned word can extend past it.  Keep that group on the byte
-         * path rather than issue a speculative read into the next row. */
+        /* The last aligned word already contains the beginning of the
+         * final group. Even payloads need only the final in-bounds halfword;
+         * at shift 0 previous is the whole group, at shift 16 it supplies
+         * the first two bytes. Odd payloads retain their byte loads. */
+        if ((address & 1u) == 0u) {
+            const uint32_t last = *(const uint16_t *)(const void *)(payload + 30);
+            const uint32_t packed = __funnelshift_r(previous, last, shift);
 #pragma unroll
-        for (int i = 28; i < 32; i++) wq[i] = (int8_t)payload[i];
+            for (int b = 0; b < 4; b++)
+                wq[28 + b] = (int8_t)((packed >> (8 * b)) & 0xffu);
+        } else {
+#pragma unroll
+            for (int i = 28; i < 32; i++) wq[i] = (int8_t)payload[i];
+        }
         return;
     }
     case (uint32_t)DS4_QWEN4EXP_TY_q5_1: {
@@ -6013,8 +6024,11 @@ __global__ static void qwen4exp_qsa_pool_update_kernel(
     uint32_t block;
     if (d_pos) {
         const uint32_t p0 = *d_pos;
-        if (((p0 + n_tokens) % pool_size) != 0u) return;
-        block = (p0 + n_tokens) / pool_size - 1u;
+        if (p0 > cache_cap || n_tokens > cache_cap - p0) return;
+        const uint32_t first = p0 / pool_size;
+        const uint32_t end = (p0 + n_tokens) / pool_size;
+        if (blockIdx.x >= end - first) return;
+        block = first + blockIdx.x;
     } else {
         const uint32_t slot = blockIdx.x;
         if (slot >= n_blocks) return;
@@ -6909,10 +6923,14 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_pool_update_dpos_tensor(
     const uint32_t nth = qwen4exp_cuda_threads(head_dim);
     const size_t shared = ((size_t)head_dim + nth) * sizeof(float);
     if (d_pos) {
-        qwen4exp_qsa_pool_update_kernel<<<1, nth, shared, cuda_decode_stream()>>>(
+        /* The maximum completed-block count depends only on width, keeping
+         * capture topology fixed. The device position selects the live slots.
+         * This covers both a ragged boundary crossing and every prefill block. */
+        const uint32_t slots = n_tokens / pool_size + (n_tokens % pool_size != 0u);
+        qwen4exp_qsa_pool_update_kernel<<<slots, nth, shared, cuda_decode_stream()>>>(
                 (const float *)tape->ptr, (const float *)k_norm_weight->ptr,
                 (const float *)inv_freq->ptr, (float *)pool->ptr, 0,
-                1, head_dim, pool_size, rot_dim, cache_cap, eps,
+                slots, head_dim, pool_size, rot_dim, cache_cap, eps,
                 weight_offset, d_pos_ptr, n_tokens);
         if (!cuda_ok(cudaGetLastError(), "Qwen4-Exp indexer pool update launch")) {
             return 0;
