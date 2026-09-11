@@ -1443,6 +1443,27 @@ __device__ __forceinline__ static void qwen4exp_group_accumulate(
     }
 }
 
+/* Two aligned activation loads supply the same eight DP4A words and the
+ * same two ordered floating contributions as the one-half group helper.
+ * Used only for Q8 shared weights after the host checks input alignment. */
+__device__ __forceinline__ static void qwen4exp_shared_vector_accumulate(
+        float *acc, const int8_t *wq, float wa, float wb,
+        const int8_t *xq, float scale, int sum) {
+    const int4 lo = *(const int4 *)(const void *)xq;
+    const int4 hi = *(const int4 *)(const void *)(xq + 16);
+    int d = 0;
+    d = __dp4a(qwen4exp_load_i8x4(wq + 0), lo.x, d);
+    d = __dp4a(qwen4exp_load_i8x4(wq + 4), lo.y, d);
+    d = __dp4a(qwen4exp_load_i8x4(wq + 8), lo.z, d);
+    d = __dp4a(qwen4exp_load_i8x4(wq + 12), lo.w, d);
+    d = __dp4a(qwen4exp_load_i8x4(wq + 16), hi.x, d);
+    d = __dp4a(qwen4exp_load_i8x4(wq + 20), hi.y, d);
+    d = __dp4a(qwen4exp_load_i8x4(wq + 24), hi.z, d);
+    d = __dp4a(qwen4exp_load_i8x4(wq + 28), hi.w, d);
+    *acc += (wa * scale) * (float)d;
+    *acc += (wb * scale) * (float)sum;
+}
+
 /* Q8_0 quantisation of one group of one row, plus the integer sum of that
  * group that the `wb` term needs.  The row group is the only thing it reads,
  * so the result does not depend on how many rows the call carries.  `lane` is
@@ -2862,7 +2883,7 @@ __global__ static void qwen4exp_moe_down_combine_kernel(
  * group chain and warp reduction. Only the completed scalar projections pass
  * through shared memory before the unchanged SiLU/up/router-weight product.
  * Four rows share a 256-thread block; inactive row warps still join barriers. */
-template <int R, int Type>
+template <int R, int Type, bool Vector = false>
 __global__ static void qwen4exp_moe_gateup_split_kernel(
         float *mid,
         const char *gate,
@@ -2938,8 +2959,14 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
                 for (int r = 0; r < R; r++) {
                     if (r < take) {
                         const uint64_t at_g = (uint64_t)tok[r] * groups + g;
-                        qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves,
-                            xq + at_g * 32u, xs[at_g], xsum[at_g]);
+                        if constexpr (Vector) {
+                            qwen4exp_shared_vector_accumulate(
+                                    &acc[r], wq, wa[0], wb[0],
+                                    xq + at_g * 32u, xs[at_g], xsum[at_g]);
+                        } else {
+                            qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves,
+                                xq + at_g * 32u, xs[at_g], xsum[at_g]);
+                        }
                     }
                 }
             }
@@ -3076,7 +3103,7 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
  * kernel did; the rows of the tile do not share a weight here, because each
  * one picked its own expert for the slot.  What the tile buys is that the
  * activation groups are read once for R rows and the decode is per group. */
-template <int R, int DownType = -1>
+template <int R, int DownType = -1, bool Vector = false>
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
@@ -3122,9 +3149,15 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                             DownType < 0 ? down_type : (uint32_t)DownType,
                             drow, g, wq, wa, wb, &halves);
                     const uint64_t at_g = mrow * groups + g;
-                    qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves,
-                                              mq + at_g * 32u, ms[at_g],
-                                              msum[at_g]);
+                    if constexpr (Vector) {
+                        qwen4exp_shared_vector_accumulate(
+                                &acc[r], wq, wa[0], wb[0],
+                                mq + at_g * 32u, ms[at_g], msum[at_g]);
+                    } else {
+                        qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves,
+                                                  mq + at_g * 32u, ms[at_g],
+                                                  msum[at_g]);
+                    }
                 }
             }
         }
@@ -3137,27 +3170,6 @@ __global__ static void qwen4exp_moe_down_q_kernel(
             out[(uint64_t)(tok0 + (uint32_t)r) * out_dim + row] = tot;
         }
     }
-}
-
-/* Two aligned activation loads supply the same eight DP4A words and the
- * same two ordered floating contributions as the one-half group helper.
- * Used only for Q8 shared weights after the host checks input alignment. */
-__device__ __forceinline__ static void qwen4exp_shared_vector_accumulate(
-        float *acc, const int8_t *wq, float wa, float wb,
-        const int8_t *xq, float scale, int sum) {
-    const int4 lo = *(const int4 *)(const void *)xq;
-    const int4 hi = *(const int4 *)(const void *)(xq + 16);
-    int d = 0;
-    d = __dp4a(qwen4exp_load_i8x4(wq + 0), lo.x, d);
-    d = __dp4a(qwen4exp_load_i8x4(wq + 4), lo.y, d);
-    d = __dp4a(qwen4exp_load_i8x4(wq + 8), lo.z, d);
-    d = __dp4a(qwen4exp_load_i8x4(wq + 12), lo.w, d);
-    d = __dp4a(qwen4exp_load_i8x4(wq + 16), hi.x, d);
-    d = __dp4a(qwen4exp_load_i8x4(wq + 20), hi.y, d);
-    d = __dp4a(qwen4exp_load_i8x4(wq + 24), hi.z, d);
-    d = __dp4a(qwen4exp_load_i8x4(wq + 28), hi.w, d);
-    *acc += (wa * scale) * (float)d;
-    *acc += (wb * scale) * (float)sum;
 }
 
 /* The shared expert: no routing, so the tile is consecutive tokens and the
@@ -4913,6 +4925,27 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
              gate_slab->type == DS4_QWEN4EXP_TY_q4_K &&
              up_slab->type == DS4_QWEN4EXP_TY_q4_K &&
              getenv("DS4_QWEN4EXP_NO_SPLIT_GATEUP") == NULL) {
+        /* THE ACTIVATION GROUP IS READ AS TWO ALIGNED 16-BYTE LOADS, the way
+         * the shared expert's projections read theirs.  A group is 32 bytes and
+         * the walk steps whole groups, so every group is 16-byte aligned when
+         * the scratch base is; the host checks that here and keeps the scalar
+         * form otherwise.  The eight dp4a are the same eight on the same
+         * operands in the same order, and the two float contributions are the
+         * same two in the same order, so the accumulator is unchanged. */
+        const bool split_vec =
+            (((uintptr_t)sc.xq) & 15u) == 0u &&
+            getenv("DS4_QWEN4EXP_NO_ROUTED_VEC") == NULL;
+        if (split_vec) {
+        qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, true><<<
+            dim3((mid_dim + 3u) / 4u, gu_rows, 1), threads, 0, stream>>>(
+            (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum,
+            sc.pairs, sc.counts, sc.offsets, gu_active,
+            (const float *)weights->ptr,
+            gate_slab->expert_bytes, gate_slab->row_bytes,
+            up_slab->expert_bytes, up_slab->row_bytes,
+            gate_slab->type, up_slab->type, xgroups, mid_dim,
+            mid_token_stride, n_expert_used);
+        } else
         qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K><<<
             dim3((mid_dim + 3u) / 4u, gu_rows, 1), threads, 0, stream>>>(
             (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum,
@@ -4948,11 +4981,22 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             sc.mq, sc.ms, sc.msum, \
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
             mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
+#define QWEN4EXP_DOWN_IMPL_V(R, DT) \
+    qwen4exp_moe_down_q_kernel<R, DT, true><<<dn_grid, threads, 0, stream>>>( \
+            (float *)out->ptr, down, (const int32_t *)selected->ptr, \
+            sc.mq, sc.ms, sc.msum, \
+            down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
+            mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
+    /* Same two aligned loads for the down projection's activation groups. */
+    const bool down_vec = (((uintptr_t)sc.mq) & 15u) == 0u &&
+        getenv("DS4_QWEN4EXP_NO_ROUTED_VEC") == NULL;
 #define QWEN4EXP_DOWN(R) do { \
     if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q5_1) { \
-        QWEN4EXP_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q5_1); \
+        if (down_vec) { QWEN4EXP_DOWN_IMPL_V(R, DS4_QWEN4EXP_TY_q5_1); } \
+        else { QWEN4EXP_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q5_1); } \
     } else if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q8_0) { \
-        QWEN4EXP_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q8_0); \
+        if (down_vec) { QWEN4EXP_DOWN_IMPL_V(R, DS4_QWEN4EXP_TY_q8_0); } \
+        else { QWEN4EXP_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q8_0); } \
     } else { \
         QWEN4EXP_DOWN_IMPL(R, -1); \
     } \
@@ -7874,7 +7918,7 @@ qwen4exp_qsa_split_scores_kernel(
     }
 }
 
-template <uint32_t GROUP, uint32_t VSTEP>
+template <uint32_t GROUP>
 __global__ static void __launch_bounds__(256, 1)
 qwen4exp_qsa_split_probs_kernel(
         const float *v_cache,
@@ -7975,20 +8019,20 @@ qwen4exp_qsa_split_probs_kernel(
         for (uint32_t h = 0; h < GROUP; h++) contrib[h] = 0.0f;
         const float *vh = v_cache + (uint64_t)kv_head * head_dim + tid;
         uint32_t j = 0;
-        /* VSTEP value rows in flight on the dense path,
+        /* QWEN4EXP_QSA_SPLIT_VSTEP value rows in flight on the dense path,
          * where no key in the tile is masked (the per-head kernel's own
          * batch and its own argument); the products still land j ascending. */
         if (!sparse) {
-            for (; j + VSTEP <= n_in_tile;
-                   j += VSTEP) {
-                float a[VSTEP];
+            for (; j + QWEN4EXP_QSA_SPLIT_VSTEP <= n_in_tile;
+                   j += QWEN4EXP_QSA_SPLIT_VSTEP) {
+                float a[QWEN4EXP_QSA_SPLIT_VSTEP];
 #pragma unroll
-                for (uint32_t i = 0; i < VSTEP; i++) {
+                for (uint32_t i = 0; i < QWEN4EXP_QSA_SPLIT_VSTEP; i++) {
                     a[i] = vh[(uint64_t)keys[j + i] * kv_stride];
                 }
                 asm volatile("" ::: "memory");   /* as in the scores kernel */
 #pragma unroll
-                for (uint32_t i = 0; i < VSTEP; i++) {
+                for (uint32_t i = 0; i < QWEN4EXP_QSA_SPLIT_VSTEP; i++) {
 #pragma unroll
                     for (uint32_t h = 0; h < GROUP; h++) {
                         contrib[h] = __fmaf_rn(probs[h * nth + j + i], a[i],
@@ -8513,18 +8557,14 @@ extern "C" uint64_t ds4_gpu_qwen4exp_qsa_split_scratch_bytes(
  * off, DS4_QWEN4EXP_QSA_SPLIT_GROUP sets the width.  Read fresh for the same
  * reason qwen4exp_qsa_group_width is; a decode row pays one getenv per layer
  * and a captured one pays it once at capture. */
-static uint32_t qwen4exp_qsa_split_width(uint32_t n_tokens, uint32_t n_head,
-                                         uint32_t n_kv_head, uint32_t head_dim) {
+static uint32_t qwen4exp_qsa_split_width(void) {
     if (getenv("DS4_QWEN4EXP_NO_QSA_SPLIT") != NULL) return 0u;
     const char *forced = getenv("DS4_QWEN4EXP_QSA_SPLIT_GROUP");
     if (forced != NULL) {
         const long v = strtol(forced, NULL, 10);
         return (v > 0 && v <= 32) ? (uint32_t)v : 0u;
     }
-    /* One model-shaped row benefits from twice as many independent head
-     * groups. Multi-row calls retain four heads and their K/V reuse. */
-    return n_tokens == 1u && n_head == 24u && n_kv_head == 2u && head_dim == 256u
-        ? 2u : 4u;
+    return 4u;
 }
 
 /* The split path.  Returns 1 when it launched, 0 when the shape or the
@@ -8550,7 +8590,7 @@ static int qwen4exp_qsa_attention_split(
         return 0;
     }
     const uint32_t gqa = n_head / n_kv_head;
-    uint32_t g = qwen4exp_qsa_split_width(n_tokens, n_head, n_kv_head, head_dim);
+    uint32_t g = qwen4exp_qsa_split_width();
     if (g == 0u) return 0;
     if (g > gqa) g = gqa;
     while (g > 1u && (gqa % g) != 0u) g--;
@@ -8573,34 +8613,24 @@ static int qwen4exp_qsa_attention_split(
         pr_shared > QWEN4EXP_QSA_GROUP_SHARED_CAP) {
         return 0;
     }
-#define QWEN4EXP_QSA_SPLIT_LAUNCH(G, V)                                          \
+#define QWEN4EXP_QSA_SPLIT_LAUNCH(G)                                          \
     qwen4exp_qsa_split_scores_kernel<G><<<grid, nth, sc_shared,               \
         cuda_decode_stream()>>>(                                              \
             (const float *)q->ptr, (const float *)k_cache->ptr, sel, cnt,     \
             sc, tmax, n_tokens, n_head, n_kv_head, head_dim, pos0, cache_cap, \
             max_selected, sparse ? 1u : 0u, max_tiles, scale, d_pos);         \
-    qwen4exp_qsa_split_probs_kernel<G, V><<<grid, nth, pr_shared,                \
+    qwen4exp_qsa_split_probs_kernel<G><<<grid, nth, pr_shared,                \
         cuda_decode_stream()>>>(                                              \
             (const float *)v_cache->ptr, sel, cnt, sc, tmax, ct, tsum,        \
             n_tokens, n_head, n_kv_head, head_dim, pos0, cache_cap,           \
             max_selected, sparse ? 1u : 0u, max_tiles, d_pos)
     switch (g) {
-        case 12u: QWEN4EXP_QSA_SPLIT_LAUNCH(12u, QWEN4EXP_QSA_SPLIT_VSTEP); break;
-        case 6u:  QWEN4EXP_QSA_SPLIT_LAUNCH(6u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
-        case 4u:  QWEN4EXP_QSA_SPLIT_LAUNCH(4u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
-        case 3u:  QWEN4EXP_QSA_SPLIT_LAUNCH(3u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
-        case 2u:
-            /* Preserve the ordered products; only reduce dense V prefetch
-             * depth for the measured one-row model shape. */
-            if (!sparse && n_tokens == 1u && n_head == 24u &&
-                n_kv_head == 2u && head_dim == 256u &&
-                getenv("DS4_QWEN4EXP_NO_QSA_SHORT_V") == NULL) {
-                QWEN4EXP_QSA_SPLIT_LAUNCH(2u, 8u);
-            } else {
-                QWEN4EXP_QSA_SPLIT_LAUNCH(2u, QWEN4EXP_QSA_SPLIT_VSTEP);
-            }
-            break;
-        case 1u:  QWEN4EXP_QSA_SPLIT_LAUNCH(1u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
+        case 12u: QWEN4EXP_QSA_SPLIT_LAUNCH(12u); break;
+        case 6u:  QWEN4EXP_QSA_SPLIT_LAUNCH(6u);  break;
+        case 4u:  QWEN4EXP_QSA_SPLIT_LAUNCH(4u);  break;
+        case 3u:  QWEN4EXP_QSA_SPLIT_LAUNCH(3u);  break;
+        case 2u:  QWEN4EXP_QSA_SPLIT_LAUNCH(2u);  break;
+        case 1u:  QWEN4EXP_QSA_SPLIT_LAUNCH(1u);  break;
         default:  return 0;
     }
 #undef QWEN4EXP_QSA_SPLIT_LAUNCH
