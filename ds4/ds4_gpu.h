@@ -596,82 +596,6 @@ int ds4_gpu_qwen4exp_qsa_split_qkv_tensor(
  * out the way the attention kernel wants them.  The query row is head-major
  * with the gate interleaved per head, exactly as in the fused row above. */
 /* Fused Q-Prep: split doubled-query, per-head RMS norm, and partial RoPE. */
-int ds4_gpu_qwen4exp_qsa_prep_q_fused_dpos_tensor(
-        ds4_gpu_tensor       *q,
-        ds4_gpu_tensor       *gate,
-        const ds4_gpu_tensor *doubled,
-        const ds4_gpu_tensor *weight,
-        const ds4_gpu_tensor *inv_freq,
-        uint32_t              n_tokens,
-        uint32_t              n_head,
-        uint32_t              head_dim,
-        uint32_t              rot_dim,
-        uint32_t              pos0,
-        float                 eps,
-        float                 weight_offset,
-        const ds4_gpu_tensor *d_pos);
-
-int ds4_gpu_qwen4exp_qsa_prep_kv_append_fused_dpos_tensor(
-        ds4_gpu_tensor       *k_cache,
-        ds4_gpu_tensor       *v_cache,
-        ds4_gpu_tensor       *k_out,
-        const ds4_gpu_tensor *raw_k,
-        const ds4_gpu_tensor *raw_v,
-        const ds4_gpu_tensor *weight,
-        const ds4_gpu_tensor *inv_freq,
-        uint32_t              pos0,
-        uint32_t              n_tokens,
-        uint32_t              n_head_kv,
-        uint32_t              head_dim,
-        uint32_t              rot_dim,
-        uint32_t              cache_cap,
-        float                 eps,
-        float                 weight_offset,
-        const ds4_gpu_tensor *d_pos);
-
-int ds4_gpu_qwen4exp_rope_head_dpos_tensor(
-        ds4_gpu_tensor       *x,
-        const ds4_gpu_tensor *inv_freq,
-        uint32_t              n_tokens,
-        uint32_t              n_head,
-        uint32_t              head_dim,
-        uint32_t              rot_dim,
-        uint32_t              pos0,
-        const ds4_gpu_tensor *d_pos);
-
-int ds4_gpu_qwen4exp_qsa_indexer_pool_update_dpos_tensor(
-        ds4_gpu_tensor       *pool,
-        ds4_gpu_tensor       *tape,
-        const ds4_gpu_tensor *raw_k,
-        const ds4_gpu_tensor *k_norm_weight,
-        const ds4_gpu_tensor *inv_freq,
-        uint32_t              pos0,
-        uint32_t              n_tokens,
-        uint32_t              cache_cap,
-        uint32_t              head_dim,
-        uint32_t              pool_size,
-        uint32_t              rot_dim,
-        float                 eps,
-        float                 weight_offset,
-        const ds4_gpu_tensor *d_pos);
-
-int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
-        ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *k_cache,
-        const ds4_gpu_tensor *v_cache,
-        const ds4_gpu_tensor *selected,
-        const ds4_gpu_tensor *counts,
-        uint32_t              n_tokens,
-        uint32_t              n_head,
-        uint32_t              n_kv_head,
-        uint32_t              head_dim,
-        uint32_t              pos0,
-        uint32_t              cache_cap,
-        uint32_t              max_selected,
-        float                 scale,
-        const ds4_gpu_tensor *d_pos);
-
 int ds4_gpu_qwen4exp_qsa_prep_q_fused_tensor(
         ds4_gpu_tensor       *q,
         ds4_gpu_tensor       *gate,
@@ -2929,21 +2853,6 @@ int ds4_gpu_qwen4exp_shared_expert_tensor(
         const ds4_gpu_tensor        *x,
         uint32_t                     n_tokens);
 
-int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
-        ds4_gpu_tensor              *out,
-        ds4_gpu_tensor              *mid,
-        ds4_gpu_tensor              *gate_scale,
-        const ds4_gpu_qwen4exp_slab *router,
-        const ds4_gpu_qwen4exp_slab *gate,
-        const ds4_gpu_qwen4exp_slab *up,
-        const ds4_gpu_qwen4exp_slab *down,
-        uint32_t                     in_dim,
-        uint32_t                     mid_dim,
-        uint32_t                     out_dim,
-        const ds4_gpu_tensor        *x,
-        uint32_t                     n_tokens,
-        int                          pre_quantized);
-
 int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *mid,
@@ -3677,7 +3586,7 @@ int ds4_gpu_qwen4exp_gdn_decode(
  * byte-for-byte (it does not include this header); keep both in sync. */
 typedef struct ds4_decode_graph_key {
     uint32_t il;
-    uint32_t island;    /* 0/1: layer halves; 2: QSA; 3: complete MTP block */
+    uint32_t island;    /* 0: layer top to pre-rope; 1: attn-out to layer end */
     uint32_t variant;
     uint32_t _pad;
     void    *cur_hc;
@@ -3693,10 +3602,6 @@ int  ds4_gpu_decode_graphs_supported(void);
 int  ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key);
 /* 0: capture committed and launched; -1: capture failed (entry retired;
  * the caller must re-encode the island eagerly -- no work was executed). */
-int  ds4_gpu_qwen4exp_update_dpos(
-        ds4_gpu_tensor *d_pos,
-        uint32_t        pos);
-
 int  ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graphs_invalidate(void);
