@@ -1938,6 +1938,58 @@ static bool qwen4exp_graph_layer_island(
     return qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens, island);
 }
 
+/* GDN layers have no operation between the two established layer islands.
+ * Capture both halves as one executable so each of the 36 GDN layers pays one
+ * graph launch per decode/verify width instead of two.  QSA layers retain the
+ * split because their attention island executes between the halves. */
+static bool qwen4exp_graph_gdn_full_layer(
+        ds4_qwen4exp_session *s, const ds4_qwen4exp_layer_weights *l,
+        const ds4_model *m, uint32_t il, uint32_t n_tokens) {
+    const bool capture_ok =
+        n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
+        !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
+        ds4_gpu_decode_graphs_supported();
+    if (capture_ok) {
+        ds4_decode_graph_key key;
+        memset(&key, 0, sizeof(key));
+        key.il = il;
+        key.island = 0u;
+        key.variant = n_tokens | (s->spec_snapshot_rows << 8u);
+        key._pad = 0x47444e46u; /* GDNF: distinct from the half-layer key. */
+        key.cur_hc = s->hyper;
+        key.after_attn_hc = s;
+        key.after_ffn_hc = (void *)l;
+        key.attn_norm = (void *)m;
+        const int state = ds4_gpu_decode_graph_begin(&key);
+        if (state == 1) {
+            QW_TRACE(QW_SLICE_ATTN_MIX);
+            QW_TRACE(QW_SLICE_GDN);
+            QW_TRACE(QW_SLICE_ATTN_INJECT);
+            QW_TRACE(QW_SLICE_FFN_MIX);
+            QW_TRACE(QW_SLICE_MOE);
+            QW_TRACE(QW_SLICE_FFN_INJECT);
+            return true;
+        }
+        if (state == 0) {
+#ifdef DS4_TEST_HOOKS
+            const uint32_t trace_len = g_qwen4exp_trace_len;
+            const bool trace_overflow = g_qwen4exp_trace_overflow;
+#endif
+            const bool ok =
+                qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens, 0u) &&
+                qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens, 1u);
+            if (ok && ds4_gpu_decode_graph_end(&key) == 0) return true;
+            ds4_gpu_decode_graph_abort(&key);
+#ifdef DS4_TEST_HOOKS
+            g_qwen4exp_trace_len = trace_len;
+            g_qwen4exp_trace_overflow = trace_overflow;
+#endif
+        }
+    }
+    return qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens, 0u) &&
+           qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens, 1u);
+}
+
 static bool qwen4exp_graph_qsa_island(
         ds4_qwen4exp_session *s, const ds4_qwen4exp_layer_weights *l,
         const ds4_model *m, uint32_t il, uint32_t n_tokens) {
@@ -2172,16 +2224,18 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
             QW_TRACE(QW_SLICE_PLE);
         }
 
-        if (!qwen4exp_graph_layer_island(s, l, m, il, n_tokens, 0u)) {
-            return qwen4exp_forward_fail();
-        }
         if (l->is_full_attention) {
+            if (!qwen4exp_graph_layer_island(s, l, m, il, n_tokens, 0u)) {
+                return qwen4exp_forward_fail();
+            }
             if (!qwen4exp_graph_qsa_island(s, l, m, il, n_tokens)) {
                 return qwen4exp_forward_fail();
             }
             QW_TRACE(QW_SLICE_QSA);
-        }
-        if (!qwen4exp_graph_layer_island(s, l, m, il, n_tokens, 1u)) {
+            if (!qwen4exp_graph_layer_island(s, l, m, il, n_tokens, 1u)) {
+                return qwen4exp_forward_fail();
+            }
+        } else if (!qwen4exp_graph_gdn_full_layer(s, l, m, il, n_tokens)) {
             return qwen4exp_forward_fail();
         }
 #ifdef DS4_TEST_HOOKS
