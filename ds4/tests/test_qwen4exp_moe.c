@@ -1832,6 +1832,133 @@ static void run_moe_input_reuse_case(
     free(x); free(rw); free(ids); free(got);
 }
 
+static void run_split_vector_case(
+        const ds4_gpu_qwen4exp_slab *gate,
+        const ds4_gpu_qwen4exp_slab *up,
+        const ds4_gpu_qwen4exp_slab *down) {
+    enum { CAP = 8 };
+    const char *name = "DS4_QWEN4EXP_NO_SPLIT_VECTOR";
+    const char *pin = getenv(name);
+    char *saved = pin ? strdup(pin) : NULL;
+    require_ok(!pin || saved, "split activation vectors pin save");
+    const size_t sizes[3] = {
+        (size_t)CAP * PROD_OUT_DIM * sizeof(float),
+        (size_t)CAP * PROD_USED * PROD_MID_DIM * sizeof(float),
+        (size_t)CAP * PROD_USED * PROD_OUT_DIM * sizeof(float)
+    };
+    ds4_gpu_tensor *t[2][3];
+    unsigned char *ref = malloc(sizes[2]), *got = malloc(sizes[2]);
+    unsigned char *poison = malloc(sizes[2]);
+    float *input = malloc((size_t)CAP * PROD_IN_DIM * sizeof(float));
+    float *input_copy = malloc((size_t)CAP * PROD_IN_DIM * sizeof(float));
+    require_ok(ref && got && poison && input && input_copy, "split activation vectors host buffers");
+    memset(poison, 0x3c, sizes[2]);
+    for (unsigned mode = 0; mode < 2; mode++)
+        for (unsigned j = 0; j < 3; j++) {
+            t[mode][j] = ds4_gpu_tensor_alloc(sizes[j]);
+            require_ok(t[mode][j] != NULL, "split activation vectors output allocation");
+        }
+    const size_t input_bytes = (size_t)CAP * PROD_IN_DIM * sizeof(float);
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(input_bytes);
+    ds4_gpu_tensor *ids = ds4_gpu_tensor_alloc(CAP * PROD_USED * sizeof(int32_t));
+    ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc(CAP * PROD_USED * sizeof(float));
+    require_ok(x && ids && weights, "split activation vectors inputs");
+    /* Vary the number of routed pairs and revisit decode after wider calls.
+     * Quantized input stays at the aligned scratch prefix for every case.
+     * The output stride remains the larger allocated capacity. */
+    const unsigned widths[] = {1, 2, 3, 7, 2, 1, 2, 1, 2, 1, 2};
+    const unsigned used_counts[] = {4, 4, 4, 4, 4, 1, 1, 2, 2, 3, 3};
+    const float magnitudes[] = {.02f, 1e-20f, 1e3f, 0.0f};
+    unsigned cases = 0, graph_checks = 0, replays = 0;
+    for (unsigned wi = 0; wi < sizeof(widths) / sizeof(widths[0]); wi++) {
+        const unsigned rows = widths[wi], used = used_counts[wi];
+        ds4_gpu_decode_graphs_invalidate();
+        ds4_decode_graph_key key;
+        memset(&key, 0, sizeof(key));
+        key.il = 60; key.island = 2; key.variant = rows;
+        key.cur_hc = x; key.after_attn_hc = t[1][0];
+        for (unsigned pattern = 0; pattern < 8; pattern++)
+            for (unsigned mag = 0; mag < 4; mag++) {
+                int32_t selected[CAP * PROD_USED] = {0};
+                float scales[CAP * PROD_USED] = {0};
+                for (unsigned r = 0; r < CAP; r++)
+                    for (unsigned slot = 0; slot < used; slot++) {
+                        int e = (int)((slot + r * used) % PROD_EXPERTS);
+                        if (pattern == 1 || (pattern == 2 && slot % 2 == 0))
+                            e = (int)slot;
+                        if (pattern == 3) e = (int)((slot + r) % PROD_USED);
+                        if (pattern == 4 && r == 0 && slot % 2 == 0) e = -1;
+                        if (pattern == 5 && r == 1 && slot % 2 == 1) e = PROD_EXPERTS;
+                        if (pattern == 6) e = -1;
+                        if (pattern == 7) e = (int)(slot % 2);
+                        selected[r * used + slot] = e;
+                        scales[r * used + slot] = .1f + .01f * slot + .003f * pattern;
+                    }
+                for (size_t i = 0; i < input_bytes / sizeof(float); i++)
+                    input[i] = rng_unit() * magnitudes[mag];
+                require_ok(ds4_gpu_tensor_write(x, 0, input, input_bytes) &&
+                           ds4_gpu_tensor_write(ids, 0, selected, sizeof(selected)) &&
+                           ds4_gpu_tensor_write(weights, 0, scales, sizeof(scales)),
+                           "split activation vectors input write");
+                for (unsigned mode = 0; mode < 2; mode++) {
+                    if (mode == 0) setenv(name, "1", 1); else unsetenv(name);
+                    for (unsigned j = 0; j < 3; j++)
+                        require_ok(ds4_gpu_tensor_write(t[mode][j], 0, poison, sizes[j]),
+                                   "split activation vectors canary write");
+                    require_ok(ds4_gpu_qwen4exp_routed_moe_tensor(
+                               t[mode][0], t[mode][1], t[mode][2], gate, up, down,
+                               PROD_IN_DIM, PROD_MID_DIM, PROD_OUT_DIM,
+                               ids, weights, PROD_EXPERTS, used, x, rows,
+                               PROD_USED * PROD_MID_DIM), "split activation vectors routed call");
+                }
+                for (unsigned j = 0; j < 3; j++) {
+                    require_ok(ds4_gpu_tensor_read(t[0][j], 0, ref, sizes[j]) &&
+                               ds4_gpu_tensor_read(t[1][j], 0, got, sizes[j]),
+                               "split activation vectors eager read");
+                    require_ok(memcmp(ref, got, sizes[j]) == 0, "split activation vectors eager mismatch");
+                }
+                cases++;
+                if (rows <= 2 && ds4_gpu_decode_graphs_supported()) {
+                    for (unsigned j = 0; j < 3; j++)
+                        require_ok(ds4_gpu_tensor_write(t[1][j], 0, poison, sizes[j]),
+                                   "split activation vectors graph canary write");
+                    const int state = ds4_gpu_decode_graph_begin(&key);
+                    if (pattern * 4u + mag >= 2u)
+                        require_ok(state == 1, "split activation vectors expected replay");
+                    if (state != 1) {
+                        require_ok(ds4_gpu_qwen4exp_routed_moe_tensor(
+                                   t[1][0], t[1][1], t[1][2], gate, up, down,
+                                   PROD_IN_DIM, PROD_MID_DIM, PROD_OUT_DIM,
+                                   ids, weights, PROD_EXPERTS, used, x, rows,
+                                   PROD_USED * PROD_MID_DIM), "split activation vectors graph call");
+                        require_ok(state == -1 || state == 0, "split activation vectors graph state");
+                        if (state == 0)
+                            require_ok(ds4_gpu_decode_graph_end(&key) == 0,
+                                       "split activation vectors capture end");
+                    } else replays++;
+                    for (unsigned j = 0; j < 3; j++) {
+                        require_ok(ds4_gpu_tensor_read(t[0][j], 0, ref, sizes[j]) &&
+                                   ds4_gpu_tensor_read(t[1][j], 0, got, sizes[j]),
+                                   "split activation vectors graph read");
+                        require_ok(memcmp(ref, got, sizes[j]) == 0, "split activation vectors graph mismatch");
+                    }
+                    graph_checks++;
+                }
+                require_ok(ds4_gpu_tensor_read(x, 0, input_copy, input_bytes), "split activation vectors input read");
+                require_ok(memcmp(input, input_copy, input_bytes) == 0, "split activation vectors input mutated");
+            }
+    }
+    ds4_gpu_decode_graphs_invalidate();
+    for (unsigned mode = 0; mode < 2; mode++)
+        for (unsigned j = 0; j < 3; j++) ds4_gpu_tensor_free(t[mode][j]);
+    ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(ids); ds4_gpu_tensor_free(weights);
+    free(ref); free(got); free(poison); free(input); free(input_copy);
+    if (saved) { setenv(name, saved, 1); free(saved); } else unsetenv(name);
+    printf("  split activation vectors %s: %u eager cases, %u graph cases "
+           "(%u changed-input replays) PASS\n", type_name(gate->type), cases,
+           graph_checks, replays);
+}
+
 static void run_production_expert_cases(void) {
     const uint32_t n_gate_up = (uint32_t)(sizeof(PROD_GATE_UP_TYPES) /
                                           sizeof(PROD_GATE_UP_TYPES[0]));
@@ -1986,6 +2113,10 @@ static void run_production_expert_cases(void) {
             image, image_bytes, down_off[dj],
             (uint64_t)PROD_OUT_DIM * down_row, down_row, down_type };
 
+        if (down_type == TYPE_Q5_1 &&
+            (gate_type == TYPE_Q4_K || gate_type == TYPE_Q6_K))
+            run_split_vector_case(&gate_slab, &up_slab, &down_slab);
+
         require_ok(ds4_gpu_qwen4exp_routed_moe_tensor(
                        out_t, mid_t, part_t, &gate_slab, &up_slab, &down_slab,
                        PROD_IN_DIM, PROD_MID_DIM, PROD_OUT_DIM,
@@ -2076,6 +2207,48 @@ static void run_production_expert_cases(void) {
             free(saved);
             puts("split gate/up: complete out, mid and down partials bit-identical "
                  "(verify n=2 and decode n=1)");
+        }
+
+        /* The production one-token down selector removes an unused second
+         * accumulator row.  Compare its complete output with the retained R2
+         * diagnostic path at the real model shape and both ranked down types. */
+        if (gate_type == TYPE_Q4_K &&
+            (down_type == TYPE_Q5_1 || down_type == TYPE_Q8_0)) {
+            const char *pin = getenv("DS4_QWEN4EXP_NO_ROUTED_DOWN_R1");
+            char *saved = pin ? strdup(pin) : NULL;
+            require_ok(!pin || saved, "routed down R1 pin save");
+            float *r1 = malloc((size_t)PROD_OUT_DIM * sizeof(float));
+            float *r2 = malloc((size_t)PROD_OUT_DIM * sizeof(float));
+            require_ok(r1 && r2, "routed down R1 buffers");
+            require_ok(unsetenv("DS4_QWEN4EXP_NO_ROUTED_DOWN_R1") == 0,
+                       "routed down R1 enable");
+            require_ok(ds4_gpu_qwen4exp_routed_moe_tensor(
+                           out_t, mid_t, part_t, &gate_slab, &up_slab, &down_slab,
+                           PROD_IN_DIM, PROD_MID_DIM, PROD_OUT_DIM,
+                           selected_t, weights_t, PROD_EXPERTS, PROD_USED,
+                           x_t, 1u, PROD_USED * PROD_MID_DIM),
+                       "routed down R1 candidate");
+            require_ok(ds4_gpu_tensor_read(out_t, 0, r1,
+                                           (uint64_t)PROD_OUT_DIM * sizeof(float)),
+                       "routed down R1 read");
+            require_ok(setenv("DS4_QWEN4EXP_NO_ROUTED_DOWN_R1", "1", 1) == 0,
+                       "routed down R2 pin");
+            require_ok(ds4_gpu_qwen4exp_routed_moe_tensor(
+                           out_t, mid_t, part_t, &gate_slab, &up_slab, &down_slab,
+                           PROD_IN_DIM, PROD_MID_DIM, PROD_OUT_DIM,
+                           selected_t, weights_t, PROD_EXPERTS, PROD_USED,
+                           x_t, 1u, PROD_USED * PROD_MID_DIM),
+                       "routed down R2 oracle");
+            require_ok(ds4_gpu_tensor_read(out_t, 0, r2,
+                                           (uint64_t)PROD_OUT_DIM * sizeof(float)),
+                       "routed down R2 read");
+            require_ok(memcmp(r1, r2, (size_t)PROD_OUT_DIM * sizeof(float)) == 0,
+                       "routed down R1 exact output");
+            require_ok((saved ? setenv("DS4_QWEN4EXP_NO_ROUTED_DOWN_R1", saved, 1) :
+                                unsetenv("DS4_QWEN4EXP_NO_ROUTED_DOWN_R1")) == 0,
+                       "routed down R1 pin restore");
+            free(r1); free(r2); free(saved);
+            puts("routed down R1: one-token output bit-identical to R2");
         }
 
         prod_reference(image + gate_off[gi], image + up_off[gi], image + down_off[dj],
