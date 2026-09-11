@@ -2856,13 +2856,34 @@ __global__ static void qwen4exp_moe_down_combine_kernel(
 }
 
 
+/* The quantizer owns an aligned scratch row. Two vector reads supply the
+ * same eight words to the unchanged integer dot and float accumulation. */
+__device__ __forceinline__ static void qwen4exp_split_vector_accumulate(
+        float *acc, const int8_t *wq, float wa, float wb,
+        const int8_t *xq, float scale, int sum) {
+    const int4 lo = *(const int4 *)(const void *)xq;
+    const int4 hi = *(const int4 *)(const void *)(xq + 16);
+    int d = 0;
+    d = __dp4a(qwen4exp_load_i8x4(wq + 0), lo.x, d);
+    d = __dp4a(qwen4exp_load_i8x4(wq + 4), lo.y, d);
+    d = __dp4a(qwen4exp_load_i8x4(wq + 8), lo.z, d);
+    d = __dp4a(qwen4exp_load_i8x4(wq + 12), lo.w, d);
+    d = __dp4a(qwen4exp_load_i8x4(wq + 16), hi.x, d);
+    d = __dp4a(qwen4exp_load_i8x4(wq + 20), hi.y, d);
+    d = __dp4a(qwen4exp_load_i8x4(wq + 24), hi.z, d);
+    d = __dp4a(qwen4exp_load_i8x4(wq + 28), hi.w, d);
+    *acc += (wa * scale) * (float)d;
+    *acc += (wb * scale) * (float)sum;
+}
+
 /* Adjacent warps own the gate and up projection of one output row. Each
  * carries one decoded matrix and its accumulators, reducing register pressure
  * during a two-token verify. Every projection retains the original ascending
  * group chain and warp reduction. Only the completed scalar projections pass
  * through shared memory before the unchanged SiLU/up/router-weight product.
- * Four rows share a 256-thread block; inactive row warps still join barriers. */
-template <int R, int Type>
+ * The retained schedule packs four rows into 256 threads. The aligned-vector
+ * schedule uses two rows and 128 threads; inactive row warps still join barriers. */
+template <int R, int Type, bool Vector = false, unsigned OutputRows = 4>
 __global__ static void qwen4exp_moe_gateup_split_kernel(
         float *mid,
         const char *gate,
@@ -2887,7 +2908,7 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
         uint32_t n_expert_used) {
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
-    const uint32_t row = blockIdx.x * 4u + (warp >> 1u);
+    const uint32_t row = blockIdx.x * OutputRows + (warp >> 1u);
     const bool live = row < mid_dim;
     const bool second = (warp & 1u) != 0u;
     uint32_t expert = blockIdx.y;
@@ -2901,7 +2922,7 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
     const char *weight_row = (second ? up : gate) +
         (uint64_t)expert * (second ? up_expert_bytes : gate_expert_bytes) +
         (uint64_t)(live ? row : 0u) * (second ? up_row_bytes : gate_row_bytes);
-    __shared__ float projected[R][8];
+    __shared__ float projected[R][OutputRows * 2u];
     for (int32_t at = 0; at < cnt; at += R) {
         const int32_t take = (cnt - at) < R ? (cnt - at) : R;
         uint32_t tok[R];
@@ -2938,8 +2959,12 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
                 for (int r = 0; r < R; r++) {
                     if (r < take) {
                         const uint64_t at_g = (uint64_t)tok[r] * groups + g;
-                        qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves,
-                            xq + at_g * 32u, xs[at_g], xsum[at_g]);
+                        if (Vector)
+                            qwen4exp_split_vector_accumulate(&acc[r], wq, wa[0], wb[0],
+                                xq + at_g * 32u, xs[at_g], xsum[at_g]);
+                        else
+                            qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves,
+                                xq + at_g * 32u, xs[at_g], xsum[at_g]);
                     }
                 }
             }
@@ -4881,15 +4906,24 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
              gate_slab->type == DS4_QWEN4EXP_TY_q4_K &&
              up_slab->type == DS4_QWEN4EXP_TY_q4_K &&
              getenv("DS4_QWEN4EXP_NO_SPLIT_GATEUP") == NULL) {
-        qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K><<<
-            dim3((mid_dim + 3u) / 4u, gu_rows, 1), threads, 0, stream>>>(
-            (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum,
-            sc.pairs, sc.counts, sc.offsets, gu_active,
-            (const float *)weights->ptr,
-            gate_slab->expert_bytes, gate_slab->row_bytes,
-            up_slab->expert_bytes, up_slab->row_bytes,
-            gate_slab->type, up_slab->type, xgroups, mid_dim,
-            mid_token_stride, n_expert_used);
+        /* The quantized input is the shared scratch prefix, so vector
+         * reads do not move metadata or the following shared-expert input.
+         * Keep the scalar schedule available for diagnostics and alignment. */
+        const bool vector = ((uintptr_t)sc.xq & 15u) == 0u &&
+            getenv("DS4_QWEN4EXP_NO_SPLIT_VECTOR") == NULL;
+#define QWEN4EXP_SPLIT_GATEUP(V, P) \
+        qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P><<< \
+            dim3((mid_dim + P - 1u) / P, gu_rows, 1), P * 64u, 0, stream>>>( \
+            (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum, \
+            sc.pairs, sc.counts, sc.offsets, gu_active, \
+            (const float *)weights->ptr, \
+            gate_slab->expert_bytes, gate_slab->row_bytes, \
+            up_slab->expert_bytes, up_slab->row_bytes, \
+            gate_slab->type, up_slab->type, xgroups, mid_dim, \
+            mid_token_stride, n_expert_used)
+        if (vector) { QWEN4EXP_SPLIT_GATEUP(true, 2u); }
+        else { QWEN4EXP_SPLIT_GATEUP(false, 4u); }
+#undef QWEN4EXP_SPLIT_GATEUP
     }
     else if (tile == 8) { QWEN4EXP_GATEUP(8); }
     else if (tile == 4) { QWEN4EXP_GATEUP(4); }
