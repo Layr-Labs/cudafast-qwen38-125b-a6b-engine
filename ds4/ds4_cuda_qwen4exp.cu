@@ -2061,7 +2061,7 @@ __global__ static void qwen4exp_moe_zero_invalid_kernel(
 #define QW_MMA_BN 32
 #define QW_MMA_G  4
 #define QW_MMA_KC (QW_MMA_G * 32)
-#define QW_MMA_LD (QW_MMA_KC + 4)
+#define QW_MMA_LD (QW_MMA_KC + 16)
 #define QW_MMA_WARPS ((QW_MMA_BM / 16) * (QW_MMA_BN / 16))
 #define QW_MMA_THREADS (QW_MMA_WARPS * 32)
 #define QW_MMA_NT (QW_MMA_BN / 16)
@@ -4570,19 +4570,23 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             logical_tier, idx_bytes + pair_bytes + xq_bytes + mq_bytes);
     if (!base) return 0;
     qwen4exp_moe_scratch sc;
-    sc.counts = (int32_t *)base;
-    sc.offsets = sc.counts + n_total_expert;
-    sc.cursor = sc.offsets + n_total_expert;
-    sc.active = sc.cursor + n_total_expert;
-    sc.pairs = sc.active + n_total_expert + 1u;
-    char *at = base + idx_bytes + pair_bytes;
-    sc.xq = (int8_t *)at;
-    sc.xs = (float *)(at + (uint64_t)n_tokens * xgroups * 32u);
+    /* Keep the input quantization at the arena base.  The immediately
+     * following shared expert consumes the same activation rows and can reuse
+     * these exact bytes before it repurposes the intermediate region. */
+    char *at = base;
+    sc.xq = (int8_t *)base;
+    sc.xs = (float *)(base + (uint64_t)n_tokens * xgroups * 32u);
     sc.xsum = (int32_t *)(sc.xs + (uint64_t)n_tokens * xgroups);
     at += xq_bytes;
     sc.mq = (int8_t *)at;
     sc.ms = (float *)(at + (uint64_t)n_pairs * mgroups * 32u);
     sc.msum = (int32_t *)(sc.ms + (uint64_t)n_pairs * mgroups);
+    at += mq_bytes;
+    sc.counts = (int32_t *)at;
+    sc.offsets = sc.counts + n_total_expert;
+    sc.cursor = sc.offsets + n_total_expert;
+    sc.active = sc.cursor + n_total_expert;
+    sc.pairs = sc.active + n_total_expert + 1u;
 
     cudaStream_t stream = cuda_decode_stream();
     const unsigned threads = 256u;
@@ -5587,6 +5591,65 @@ __global__ static void qwen4exp_hc_inject_weights_renorm_kernel(
     }
 }
 
+/* The narrow mixer has independent mix and inject outputs. Put their
+ * existing CTAs in one launch: neither reduction nor thread mapping changes,
+ * and the short mix can overlap the underfilled inject grid. */
+__global__ static void qwen4exp_hc_mix_inject_dual_kernel(
+        float *mixed, float *inject, const float *hyper, const float *nscale,
+        const float *normw, const float *gate_values, const char *w,
+        uint32_t n_embd, uint32_t n_hc, uint32_t rows,
+        float weight_bias, int round_bf16,
+        uint32_t weight_type, uint32_t weight_row_bytes) {
+    const uint32_t mix_blocks = (n_embd + 255u) / 256u;
+    if (blockIdx.x < mix_blocks) {
+        const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
+        const uint32_t t = blockIdx.y;
+        if (d >= n_embd || t >= rows) return;
+        const uint64_t row = ((uint64_t)t * n_hc) * n_embd + d;
+        float acc = 0.0f;
+        /* nvcc 13 truncated a norm-weight address above 4 GiB when this walk
+         * was automatically unrolled. Keep the validated rolled form. */
+#pragma unroll 1
+        for (uint32_t h = 0; h < n_hc; h++) {
+            const uint64_t idx = row + (uint64_t)h * n_embd;
+            const float normed = qwen4exp_hc_normed_value(
+                    hyper[idx], nscale[(uint64_t)t * n_hc + h],
+                    normw[(uint64_t)h * n_embd + d], weight_bias, round_bf16);
+            acc += qwen4exp_sigmoid(gate_values[idx]) * normed;
+        }
+        mixed[(uint64_t)t * n_embd + d] = acc * (1.0f / (float)n_hc);
+    } else {
+        const uint32_t h = blockIdx.x - mix_blocks;
+        const uint32_t t = blockIdx.y;
+        if (t >= rows || h >= n_hc) return;
+        const uint32_t wide = n_hc * n_embd;
+        const float *xr = hyper + (uint64_t)t * wide;
+        const char *wr = w + (uint64_t)h * weight_row_bytes;
+        float sum = 0.0f;
+        for (uint32_t hs = 0; hs < n_hc; hs++) {
+            const float sc = nscale[(uint64_t)t * n_hc + hs];
+            for (uint32_t k = 0; k < n_embd; k += blockDim.x) {
+                const uint32_t i = hs * n_embd + k + threadIdx.x;
+                const float normed = qwen4exp_hc_normed_value(
+                        xr[i], sc, normw[i], weight_bias, round_bf16);
+                sum += normed * dev_qwen4exp_inject_value(weight_type, wr, i);
+            }
+        }
+        __shared__ float partial[QWEN4EXP_HC_THREADS];
+        const float total = qwen4exp_block_sum_f32(sum, partial);
+        if (threadIdx.x == 0) {
+            inject[(uint64_t)t * n_hc + h] =
+                2.0f * qwen4exp_sigmoid(total * (1.0f / (float)n_hc));
+        }
+    }
+}
+
+static int qwen4exp_hc_ranges_disjoint(const void *a, uint64_t an,
+                                       const void *b, uint64_t bn) {
+    const uintptr_t ap = (uintptr_t)a, bp = (uintptr_t)b;
+    return ap >= bp ? ap - bp >= bn : bp - ap >= an;
+}
+
 /* Both of the above in ONE pass over the residual, one block per token.
  *
  * The two kernels read the same 41.9 MB; together they read it once.  The mix
@@ -5853,6 +5916,40 @@ static int qwen4exp_hc_mixer_fused_cuda(
                 inject_weight->type, (uint32_t)iw_row_bytes);
         return cuda_ok(cudaGetLastError(),
                        "qwen4exp_hc_mix_inject_renorm launch");
+    }
+
+    /* Preserve sequential semantics for overlapping caller-supplied views.
+     * The graph's mixed and inject outputs are separate allocations. */
+    if (inject && rows <= 7u && n_embd == 2560u && n_hc == 4u &&
+        getenv("DS4_QWEN4EXP_NO_HC_DUAL") == NULL) {
+        const uint64_t mix_bytes = (uint64_t)rows * n_embd * sizeof(float);
+        const uint64_t inj_bytes = (uint64_t)rows * n_hc * sizeof(float);
+        const uint64_t norm_bytes = wide * sizeof(float);
+        const uint64_t iw_bytes = (uint64_t)n_hc * iw_row_bytes;
+        const int disjoint =
+            qwen4exp_hc_ranges_disjoint(mixed->ptr, mix_bytes, inject->ptr, inj_bytes) &&
+            qwen4exp_hc_ranges_disjoint(mixed->ptr, mix_bytes, hyper->ptr, hc_bytes) &&
+            qwen4exp_hc_ranges_disjoint(mixed->ptr, mix_bytes, nscale, n_bytes) &&
+            qwen4exp_hc_ranges_disjoint(mixed->ptr, mix_bytes, normw, norm_bytes) &&
+            qwen4exp_hc_ranges_disjoint(mixed->ptr, mix_bytes, iw, iw_bytes) &&
+            qwen4exp_hc_ranges_disjoint(inject->ptr, inj_bytes, hyper->ptr, hc_bytes) &&
+            qwen4exp_hc_ranges_disjoint(inject->ptr, inj_bytes, nscale, n_bytes) &&
+            qwen4exp_hc_ranges_disjoint(inject->ptr, inj_bytes, normw, norm_bytes) &&
+            qwen4exp_hc_ranges_disjoint(inject->ptr, inj_bytes,
+                                        wide_scratch->ptr, hc_bytes);
+        if (disjoint) {
+            const unsigned mix_blocks = (n_embd + threads - 1u) / threads;
+            qwen4exp_hc_mix_inject_dual_kernel<<<
+                    dim3(mix_blocks + n_hc, rows, 1u), threads, 0,
+                    cuda_decode_stream()>>>(
+                    (float *)mixed->ptr, (float *)inject->ptr,
+                    (const float *)hyper->ptr, nscale, normw,
+                    (const float *)wide_scratch->ptr, iw,
+                    n_embd, n_hc, rows, weight_bias, round_bf16,
+                    inject_weight->type, (uint32_t)iw_row_bytes);
+            return cuda_ok(cudaGetLastError(),
+                           "qwen4exp_hc_mix_inject_dual launch");
+        }
     }
 
     qwen4exp_hc_mix_renorm_kernel<<<dim3((n_embd + threads - 1u) / threads,
@@ -6877,7 +6974,36 @@ __global__ static void qwen4exp_qsa_attention_group_kernel(
             float contrib[GROUP];
 #pragma unroll
             for (uint32_t h = 0; h < GROUP; h++) contrib[h] = 0.0f;
-            for (uint32_t j = 0; j < n_in_tile; j++) {
+            uint32_t j = 0;
+            /* Dense prefill keys are consecutive and valid.  Issue eight
+             * independent V loads before consuming them, while retaining the
+             * ascending-j FMA chain of every head exactly. */
+            if (!sparse) {
+                const uint64_t voff =
+                    (uint64_t)kv_head * head_dim + tid;
+                for (; j + 8u <= n_in_tile; j += 8u) {
+                    const float a0 = v_cache[(uint64_t)keys[j + 0u] * kv_stride + voff];
+                    const float a1 = v_cache[(uint64_t)keys[j + 1u] * kv_stride + voff];
+                    const float a2 = v_cache[(uint64_t)keys[j + 2u] * kv_stride + voff];
+                    const float a3 = v_cache[(uint64_t)keys[j + 3u] * kv_stride + voff];
+                    const float a4 = v_cache[(uint64_t)keys[j + 4u] * kv_stride + voff];
+                    const float a5 = v_cache[(uint64_t)keys[j + 5u] * kv_stride + voff];
+                    const float a6 = v_cache[(uint64_t)keys[j + 6u] * kv_stride + voff];
+                    const float a7 = v_cache[(uint64_t)keys[j + 7u] * kv_stride + voff];
+#pragma unroll
+                    for (uint32_t h = 0; h < GROUP; h++) {
+                        contrib[h] = __fmaf_rn(probs[h * nth + j + 0u], a0, contrib[h]);
+                        contrib[h] = __fmaf_rn(probs[h * nth + j + 1u], a1, contrib[h]);
+                        contrib[h] = __fmaf_rn(probs[h * nth + j + 2u], a2, contrib[h]);
+                        contrib[h] = __fmaf_rn(probs[h * nth + j + 3u], a3, contrib[h]);
+                        contrib[h] = __fmaf_rn(probs[h * nth + j + 4u], a4, contrib[h]);
+                        contrib[h] = __fmaf_rn(probs[h * nth + j + 5u], a5, contrib[h]);
+                        contrib[h] = __fmaf_rn(probs[h * nth + j + 6u], a6, contrib[h]);
+                        contrib[h] = __fmaf_rn(probs[h * nth + j + 7u], a7, contrib[h]);
+                    }
+                }
+            }
+            for (; j < n_in_tile; j++) {
                 const int32_t kj = keys[j];
                 if (kj < 0) continue;
                 /* One V channel read for the whole group, where the per-head
