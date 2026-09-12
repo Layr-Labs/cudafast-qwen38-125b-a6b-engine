@@ -3294,34 +3294,81 @@ __global__ static void qwen4exp_moe_down_q_kernel(
 #pragma unroll
     for (int r = 0; r < R; r++) acc[r] = 0.0f;
 
+    /* TWO ROWS IN FLIGHT.  The slot walk is the serialized chain here: at
+     * decode `groups` is mid_dim/32 == 20, so the g loop runs a single
+     * iteration and each (slot, row) pair issued one dependent read, leaving
+     * the kernel at memory latency with nothing to overlap.  A routed expert
+     * row is read exactly once per call, so there is nothing to hit in cache
+     * and reads in flight are the only lever -- the same lever that measured
+     * 0.41% of decode on the gate/up split kernel.  Staging BOTH rows'
+     * payloads for a group before either decode consumes its own keeps two
+     * reads outstanding.
+     *
+     * The g and r loops are interchanged to make that staging possible.  That
+     * is exact: for each fixed r, acc[r] still receives slot ascending on the
+     * outside and group lane, lane+32, ... ascending within a slot, so the
+     * terms and their order are unchanged, as is the warp_sum_f32 tree.
+     *
+     * Only q5_1 stages, and only at the narrow tiles decode uses.  q5_1 is the
+     * routed down type this target decodes with, its 24-byte block leaves every
+     * block of a word-aligned row word-aligned, and its decode leaves `halves`
+     * at one.  The `R <= 2` term is a compile-time constant, so the wider
+     * prefill instantiations fold `stage` to false and drop the staging array
+     * entirely: prefill keeps today's dispatch untouched.  Every other type
+     * keeps today's path through dev_qwen4exp_group_decode, which remains the
+     * oracle for the word algebra either way. */
+    const uint32_t dtype = DownType < 0 ? down_type : (uint32_t)DownType;
+    const bool stage = R <= 2 && dtype == (uint32_t)DS4_QWEN4EXP_TY_q5_1;
     for (uint32_t slot = 0; slot < n_expert_used; slot++) {
+        const char *drow[R];
+        uint64_t mrow[R];
+        bool live[R];
 #pragma unroll
         for (int r = 0; r < R; r++) {
+            live[r] = false;
+            drow[r] = NULL;
+            mrow[r] = 0;
             if ((uint32_t)r < take) {
                 const uint32_t t = tok0 + (uint32_t)r;
                 const int32_t e = Vector ? __shfl_sync(0xffffffffu, route[r], slot)
                     : selected[(uint64_t)t * n_expert_used + slot];
-                if (e < 0 || (uint32_t)e >= n_total_expert) continue;
-                const char *drow = down +
-                    (uint64_t)(uint32_t)e * down_expert_bytes +
-                    (uint64_t)row * down_row_bytes;
-                const uint64_t mrow = (uint64_t)t * n_expert_used + slot;
-                for (uint32_t g = lane; g < groups; g += 32u) {
-                    int8_t wq[32];
-                    float wa[2], wb[2];
-                    int halves = 1;
-                    dev_qwen4exp_group_decode(
-                            DownType < 0 ? down_type : (uint32_t)DownType,
-                            drow, g, wq, wa, wb, &halves);
-                    const uint64_t at_g = mrow * groups + g;
-                    if (Vector && halves == 1)
-                        qwen4exp_shared_vector_accumulate(&acc[r], wq, wa[0], wb[0],
-                            mq + at_g * 32u, ms[at_g], msum[at_g]);
-                    else
-                        qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves,
-                                                  mq + at_g * 32u, ms[at_g],
-                                                  msum[at_g]);
+                if (e >= 0 && (uint32_t)e < n_total_expert) {
+                    live[r] = true;
+                    drow[r] = down +
+                        (uint64_t)(uint32_t)e * down_expert_bytes +
+                        (uint64_t)row * down_row_bytes;
+                    mrow[r] = (uint64_t)t * n_expert_used + slot;
                 }
+            }
+        }
+        for (uint32_t g = lane; g < groups; g += 32u) {
+            uint32_t raw[R][8];
+            const uint32_t *rawp[R];
+#pragma unroll
+            for (int r = 0; r < R; r++)
+                rawp[r] = stage && live[r] &&
+                    qw_raw_load(dtype, drow[r], g, raw[r]) ? raw[r] : NULL;
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                if (!live[r]) continue;
+                int8_t wq[32];
+                float wa[2] = {0.0f, 0.0f};
+                float wb[2] = {0.0f, 0.0f};
+                int halves = 1;
+                if (rawp[r])
+                    dev_qwen4exp_group_decode_w(dtype, drow[r], g, rawp[r],
+                                                wq, wa, wb);
+                else
+                    dev_qwen4exp_group_decode(dtype, drow[r], g, wq, wa, wb,
+                                              &halves);
+                const uint64_t at_g = mrow[r] * groups + g;
+                if (Vector && halves == 1)
+                    qwen4exp_shared_vector_accumulate(&acc[r], wq, wa[0], wb[0],
+                        mq + at_g * 32u, ms[at_g], msum[at_g]);
+                else
+                    qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves,
+                                              mq + at_g * 32u, ms[at_g],
+                                              msum[at_g]);
             }
         }
     }
