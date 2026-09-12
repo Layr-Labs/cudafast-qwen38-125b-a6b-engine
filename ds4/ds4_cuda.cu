@@ -5930,16 +5930,22 @@ __global__ static void matmul_q8_hc_down_pair_kernel(
             }
         }
     }
-    __shared__ float partial[2][32];
-    if (part == 0u) {
-        partial[0][group] = acc[0];
-        partial[1][group] = acc[1];
+    /* Pair logical groups g and g + 16 before the remaining four levels
+     * of the original 32-leaf reduction tree.  Physical even lanes are
+     * logical lanes 0..15, so distances 16,8,4,2 preserve operand order. */
+    __shared__ float upper[2][16];
+    if (part == 0u && threadIdx.x >= 32u) {
+        upper[0][group - 16u] = acc[0];
+        upper[1][group - 16u] = acc[1];
     }
     __syncthreads();
-    if (threadIdx.x < 32u) {
+    if (threadIdx.x < 32u && part == 0u) {
 #pragma unroll
         for (unsigned r = 0; r < 2u; r++) {
-            const float total = warp_sum_f32(partial[r][threadIdx.x]);
+            float total = acc[r] + upper[r][group];
+#pragma unroll
+            for (int d = 16; d >= 2; d >>= 1)
+                total += __shfl_down_sync(0x55555555u, total, d);
             if (threadIdx.x == 0u && r < rows) out[r * 320u + row] = total;
         }
     }
@@ -18785,13 +18791,30 @@ static void qwen_f32_vector_tree_kernel(float *out, const float *w,
             for (int j = 0; j < C; j++) acc[r][j] += wv[j] * xv[j];
         }
     }
-    /* Rebuild the cross-warp levels of the original halving tree first. */
-    __shared__ float partial[R][C][256/C];
+    /* Rebuild the cross-warp levels of the original halving tree first.
+     * Warp 0's leaves stay in registers; only the upper warps stage, slot
+     * s holding thread s + 32's leaf.  C == 4 folds p[lane] + p[lane+32]
+     * as acc + upper[lane]; C == 2 folds (p[lane] + p[lane+64]) +
+     * (p[lane+32] + p[lane+96]) as (acc + upper[lane+32]) +
+     * (upper[lane] + upper[lane+64]) -- the same operands, in the same
+     * order, as the original shared-load fold on both arms. */
+    __shared__ float upper[R][C][C == 2 ? 96 : 32];
     if (C < 8) {
+        if (C == 2) {
+            if (t >= 32u && t < 128u) {
 #pragma unroll
-        for (int r = 0; r < R; r++)
+                for (int r = 0; r < R; r++)
 #pragma unroll
-            for (int j = 0; j < C; j++) partial[r][j][t] = acc[r][j];
+                    for (int j = 0; j < C; j++) upper[r][j][t - 32u] = acc[r][j];
+            }
+        } else {
+            if (t >= 32u) {
+#pragma unroll
+                for (int r = 0; r < R; r++)
+#pragma unroll
+                    for (int j = 0; j < C; j++) upper[r][j][t - 32u] = acc[r][j];
+            }
+        }
         __syncthreads();
         if (t >= 32u) return;
 #pragma unroll
@@ -18799,10 +18822,10 @@ static void qwen_f32_vector_tree_kernel(float *out, const float *w,
 #pragma unroll
             for (int j = 0; j < C; j++) {
                 if (C == 2) {
-                    acc[r][j] = (partial[r][j][lane] + partial[r][j][lane+64u]) +
-                                (partial[r][j][lane+32u] + partial[r][j][lane+96u]);
+                    acc[r][j] = (acc[r][j] + upper[r][j][lane + 32u]) +
+                                (upper[r][j][lane] + upper[r][j][lane + 64u]);
                 } else {
-                    acc[r][j] = partial[r][j][lane] + partial[r][j][lane+32u];
+                    acc[r][j] = acc[r][j] + upper[r][j][lane];
                 }
             }
     }
@@ -19021,13 +19044,20 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
         }
     }
     }
-    /* Rebuild the cross-warp levels of the original halving tree first. */
-    __shared__ float partial[R][C][256/C];
+    /* Rebuild the cross-warp levels of the original halving tree first.
+     * Warp 0's leaves stay in registers; warps 1..3 of the live half
+     * stage, slot s holding thread s + 32's leaf, and the fold pairs
+     * (p[lane] + p[lane+64]) + (p[lane+32] + p[lane+96]) as (acc +
+     * upper[lane+32]) + (upper[lane] + upper[lane+64]) -- the same
+     * operands, in the same order, as the original shared-load fold. */
+    __shared__ float upper[R][C][C == 2 ? 96 : 32];
     if (C < 8) {
+        if (t >= 32u && t < 128u) {
 #pragma unroll
-        for (int r = 0; r < R; r++)
+            for (int r = 0; r < R; r++)
 #pragma unroll
-            for (int j = 0; j < C; j++) if (t < 128u) partial[r][j][t] = acc[r][j];
+                for (int j = 0; j < C; j++) upper[r][j][t - 32u] = acc[r][j];
+        }
         __syncthreads();
         if (t >= 32u) return;
 #pragma unroll
@@ -19035,10 +19065,10 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
 #pragma unroll
             for (int j = 0; j < C; j++) {
                 if (C == 2) {
-                    acc[r][j] = (partial[r][j][lane] + partial[r][j][lane+64u]) +
-                                (partial[r][j][lane+32u] + partial[r][j][lane+96u]);
+                    acc[r][j] = (acc[r][j] + upper[r][j][lane + 32u]) +
+                                (upper[r][j][lane] + upper[r][j][lane + 64u]);
                 } else {
-                    acc[r][j] = partial[r][j][lane] + partial[r][j][lane+32u];
+                    acc[r][j] = acc[r][j] + upper[r][j][lane];
                 }
             }
     }
