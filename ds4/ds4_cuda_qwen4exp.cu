@@ -205,7 +205,45 @@ enum {
      * the serial one.  The decode step and the speculative verify's armed
      * rounds are one to a few tokens and keep the serial kernel, whose
      * in-place write needs no second buffer. */
-    QWEN4EXP_GDN_CONV_PARALLEL_MIN_TOKENS = 64
+    QWEN4EXP_GDN_CONV_PARALLEL_MIN_TOKENS = 64,
+    /* Consecutive tokens one block of the token-parallel convolution walks,
+     * sliding the four-tap window through registers.  A block per token had to
+     * read all four taps, so every input row was read FOUR times -- about
+     * 168 MB an activated layer at 1024 tokens, over 6 GB across the 36 gated
+     * deltanet layers.  A tile of T reads T + 3 rows instead of 4 * T, so at
+     * eight the traffic falls by 2.9x and the per-token load count from four to
+     * one.  The taps a token consumes and their fma order are unchanged, so
+     * every output stays bit-identical; only the schedule moves.  The cost is a
+     * carried three-float window and a per-token barrier pair on the key
+     * blocks in place of a single barrier per block. */
+    QWEN4EXP_GDN_CONV_TOKEN_TILE = 8,
+    /* Value rows one warp of qwen4exp_gdn_value_reuse_kernel carries through
+     * the token-serial delta rule, and so the reuse factor on that kernel's
+     * per-token q, k and gate loads.  A block is four warps, so it owns
+     * 4 * this many value rows and the grid's y extent is
+     * QWEN4EXP_GDN_DIM / (4 * this).
+     *
+     * This kernel is PREFILL ONLY: it is reached only when the token-parallel
+     * convolution above ran and published gate_pairs, which needs
+     * QWEN4EXP_GDN_CONV_PARALLEL_MIN_TOKENS tokens, so decode and every
+     * speculative verify keep qwen4exp_gdn_recurrence_kernel instead.
+     *
+     * Value rows are INDEPENDENT outputs -- row r's state row is updated only
+     * from k, q, beta, the decay and its own v -- so this number partitions
+     * work without touching any accumulation order.  Every warp still owns the
+     * same four key columns per lane and both warp_sum_all_f32 trees still fold
+     * the same 32 lanes, so the result is bit-identical at any value.  It is a
+     * pure schedule knob.
+     *
+     * The gradient is measured: the whole reason this kernel exists is that
+     * carrying four rows per warp beat qwen4exp_gdn_recurrence_kernel's one,
+     * and eight continues that direction.  Against four it halves the per-token
+     * q, k and gate traffic again and doubles the number of independent
+     * warp-reduction chains, which is what a 1024-step serial loop needs to
+     * hide latency, at the cost of half the resident blocks (192 over 48 SMs
+     * instead of 384) and twice the carried register state (32 floats a lane
+     * instead of 16). */
+    QWEN4EXP_GDN_VALUE_ROWS = 8
 };
 
 /*
@@ -404,13 +442,13 @@ __global__ static void qwen4exp_gdn_conv_parallel_kernel(
         float        qk_norm_eps) {
     const uint32_t block = blockIdx.x;
     const uint32_t row = blockIdx.y;
-    const uint32_t token = blockIdx.z;
+    const uint32_t token0 = blockIdx.z * QWEN4EXP_GDN_CONV_TOKEN_TILE;
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u;
     const uint32_t warp = tid >> 5u;
     const uint32_t key_blocks = 2u * n_key_head;
     const uint32_t blocks = key_blocks + n_value_head;
-    if (block >= blocks || row >= n_rows || token >= n_tokens) return;
+    if (block >= blocks || row >= n_rows || token0 >= n_tokens) return;
 
     __shared__ float red[4];
     const uint32_t conv_dim = blocks * QWEN4EXP_GDN_DIM;
@@ -427,69 +465,98 @@ __global__ static void qwen4exp_gdn_conv_parallel_kernel(
     const float w2 = conv_weight[(uint64_t)channel * 4u + 2u];
     const float w3 = conv_weight[(uint64_t)channel * 4u + 3u];
 
-    /* The window of this token: inputs x[t-3 .. t], the carried history
-     * standing in for every x before the chunk. */
     const uint64_t row_base = (uint64_t)row * n_tokens;
-    float x[4];
-    #pragma unroll
-    for (uint32_t k = 0; k < 4u; k++) {
-        const uint32_t back = 3u - k;
-        x[k] = token >= back
-            ? qkv[(row_base + (token - back)) * conv_dim + channel]
-            : history[(uint64_t)(k + token) * conv_dim + channel];
+
+    /* One SIGNED source index reproduces the original two-case window read.
+     * The serial form reads x[k] for back = 3 - k from qkv[token - back] when
+     * token >= back and from history[k + token] otherwise, and
+     * k + token == 3 + (token - back), so a negative offset s indexes
+     * history[3 + s] and a non-negative one indexes qkv[s].  Same values. */
+    const auto fetch = [&](int64_t s) -> float {
+        return s >= 0
+            ? qkv[(row_base + (uint64_t)s) * conv_dim + channel]
+            : history[(uint64_t)(QWEN4EXP_GDN_HISTORY + s) * conv_dim +
+                channel];
+    };
+
+    /* A block walks QWEN4EXP_GDN_CONV_TOKEN_TILE consecutive tokens and slides
+     * the four-tap window through registers, so it reads TILE + 3 input rows
+     * where a block per token read 4 * TILE.  The taps a token consumes are
+     * the same four values in the same fma order, so every output is still bit
+     * for bit the serial kernel's; only the schedule changes. */
+    float win[4];
+#pragma unroll
+    for (uint32_t j = 0; j < QWEN4EXP_GDN_HISTORY; j++) {
+        win[j] = fetch((int64_t)token0 - (int64_t)QWEN4EXP_GDN_HISTORY +
+            (int64_t)j);
     }
 
-    float acc = 0.0f;
-    acc = fmaf(x[0], w0, acc);
-    acc = fmaf(x[1], w1, acc);
-    acc = fmaf(x[2], w2, acc);
-    acc = fmaf(x[3], w3, acc);
+    for (uint32_t i = 0; i < QWEN4EXP_GDN_CONV_TOKEN_TILE; i++) {
+        const uint32_t token = token0 + i;
+        /* Uniform across the block: every thread here shares this token. */
+        if (token >= n_tokens) break;
+        win[3] = fetch((int64_t)token);
 
-    /* The rollback slot is the window AFTER this token's shift, which is why
-     * it precedes the value-head early return below.  The carried history is
-     * NOT written here: the blocks of tokens 0..2 read it, and a block has no
-     * order against another, so the host copies the last three input rows
-     * into it after this kernel (they are the same values the serial loop
-     * leaves there, and qkv is intact because the output went to scratch). */
-    if (token < n_snapshot_rows) {
-        float *slot = conv_snapshot +
-            (uint64_t)token * QWEN4EXP_GDN_HISTORY * conv_dim;
-        __stcs(&slot[channel], x[1]);
-        __stcs(&slot[(uint64_t)conv_dim + channel], x[2]);
-        __stcs(&slot[(uint64_t)2u * conv_dim + channel], x[3]);
-    }
+        float acc = 0.0f;
+        acc = fmaf(win[0], w0, acc);
+        acc = fmaf(win[1], w1, acc);
+        acc = fmaf(win[2], w2, acc);
+        acc = fmaf(win[3], w3, acc);
 
-    const float activated = qwen4exp_gdn_silu(acc);
-    float *dst = out + (row_base + token) * conv_dim + channel;
-    if (!is_key) {
-        *dst = activated;
-        return;
-    }
-
-    const float sumsq = warp_sum_f32(activated * activated);
-    if (lane == 0u) red[warp] = sumsq;
-    __syncthreads();
-    float total = lane < 4u ? red[lane] : 0.0f;
-    total = warp_sum_all_f32(total);
-    *dst = activated * rsqrtf(total + qk_norm_eps) * post_scale;
-
-    /* This token-wide kernel is already the producer immediately before the
-     * recurrence.  Use one channel block's otherwise finished lanes to
-     * evaluate the two head gates once per token, rather than once in every
-     * recurrence thread (or even once in each of its 32 value-row blocks).
-     * Kernel completion is the cross-block publication barrier; no extra
-     * launch or in-kernel grid synchronization is needed. */
-    if (block == 0u) {
-        for (uint32_t head = tid; head < n_value_head;
-             head += QWEN4EXP_GDN_DIM) {
-            const uint64_t gate =
-                ((uint64_t)row * n_tokens + token) * n_value_head + head;
-            gate_pairs[gate] = make_float2(
-                expf(a_log[head] *
-                    qwen4exp_gdn_softplus(
-                        raw_alpha[gate] + dt_bias[head])),
-                qwen4exp_gdn_sigmoid(raw_beta[gate]));
+        /* The rollback slot is the window AFTER this token's shift.  The
+         * carried history is NOT written here: the tiles of tokens 0..2 read
+         * it, and a block has no order against another, so the host copies the
+         * last three input rows into it after this kernel (they are the same
+         * values the serial loop leaves there, and qkv is intact because the
+         * output went to scratch). */
+        if (token < n_snapshot_rows) {
+            float *slot = conv_snapshot +
+                (uint64_t)token * QWEN4EXP_GDN_HISTORY * conv_dim;
+            __stcs(&slot[channel], win[1]);
+            __stcs(&slot[(uint64_t)conv_dim + channel], win[2]);
+            __stcs(&slot[(uint64_t)2u * conv_dim + channel], win[3]);
         }
+
+        const float activated = qwen4exp_gdn_silu(acc);
+        float *dst = out + (row_base + token) * conv_dim + channel;
+        if (is_key) {
+            /* is_key is blockIdx.x-uniform, so the barrier below is reached by
+             * the whole block on every iteration of this loop. */
+            const float sumsq = warp_sum_f32(activated * activated);
+            if (lane == 0u) red[warp] = sumsq;
+            __syncthreads();
+            float total = lane < 4u ? red[lane] : 0.0f;
+            total = warp_sum_all_f32(total);
+            *dst = activated * rsqrtf(total + qk_norm_eps) * post_scale;
+            __syncthreads();
+
+            /* This token-wide kernel is already the producer immediately
+             * before the recurrence.  Use one channel block's otherwise
+             * finished lanes to evaluate the two head gates once per token,
+             * rather than once in every recurrence thread (or even once in
+             * each of its value-row blocks).  Kernel completion is the
+             * cross-block publication barrier; no extra launch or in-kernel
+             * grid synchronization is needed. */
+            if (block == 0u) {
+                for (uint32_t head = tid; head < n_value_head;
+                     head += QWEN4EXP_GDN_DIM) {
+                    const uint64_t gate =
+                        ((uint64_t)row * n_tokens + token) * n_value_head +
+                        head;
+                    gate_pairs[gate] = make_float2(
+                        expf(a_log[head] *
+                            qwen4exp_gdn_softplus(
+                                raw_alpha[gate] + dt_bias[head])),
+                        qwen4exp_gdn_sigmoid(raw_beta[gate]));
+                }
+            }
+        } else {
+            *dst = activated;
+        }
+
+        win[0] = win[1];
+        win[1] = win[2];
+        win[2] = win[3];
     }
 }
 
@@ -604,10 +671,11 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
     *state_ptr = h;
 }
 
-/* Long chunks reuse one Q/K vector and gate pair across four independent
- * value rows in a warp. Each row retains its four adjacent key columns per
- * lane, ordered dot4/FMA operations, and original XOR reductions. No state
- * crosses value rows. Short chunks keep the original one-row recurrence. */
+/* Long chunks reuse one Q/K vector and gate pair across R independent
+ * value rows in a warp (QWEN4EXP_GDN_VALUE_ROWS picks R). Each row retains its
+ * four adjacent key columns per lane, ordered dot4/FMA operations, and original
+ * XOR reductions. No state crosses value rows, so R is a schedule knob and not
+ * a numeric one. Short chunks keep the original one-row recurrence. */
 template <unsigned R, bool Vector = false>
 __global__ static void qwen4exp_gdn_value_reuse_kernel(
         float *__restrict__ out, float *__restrict__ state,
@@ -644,21 +712,38 @@ __global__ static void qwen4exp_gdn_value_reuse_kernel(
         const float2 pair = gate_pairs[slot * n_value_head + head];
         const float g = pair.x;
         const float beta = pair.y;
-        static_assert(!Vector || R == 4u, "value vector requires four rows");
-        float4 values;
+        static_assert(!Vector || (R % 4u) == 0u,
+                      "value vector requires a multiple of four rows");
+        static_assert(R <= 32u, "one lane per row parks the result");
+        /* This token's R results, parked one per lane, written together at the
+         * bottom of the row loop.  warp_sum_all_f32 leaves the sum in EVERY
+         * lane, so lane r keeping row r costs nothing and turns R scattered
+         * four-byte stores from lane 0 into one contiguous R-float store. */
+        float parked = 0.0f;
+        float4 values[Vector ? R / 4u : 1u];
         if constexpr (Vector) {
-            /* value0 is a multiple of four, and every head/token stride is
-             * a multiple of 128 floats. Read the same four adjacent scalars. */
-            values = *(const float4 *)(qkv + slot * conv_dim +
-                2u * (uint64_t)key_dim + head * QWEN4EXP_GDN_DIM + value0);
+            /* value0 is a multiple of R and R is a multiple of four, and every
+             * head/token stride is a multiple of 128 floats, so each quad
+             * below is float4-aligned.  Read the same adjacent scalars. */
+            const float *vsrc = qkv + slot * conv_dim +
+                2u * (uint64_t)key_dim + head * QWEN4EXP_GDN_DIM + value0;
+#pragma unroll
+            for (unsigned q = 0; q < R / 4u; q++) {
+                values[q] = *(const float4 *)(vsrc + q * 4u);
+            }
         }
 #pragma unroll
         for (unsigned r = 0; r < R; r++) {
-            const uint32_t value = value0 + r;
-            const float v_row = Vector
-                ? (r == 0u ? values.x : r == 1u ? values.y : r == 2u ? values.z : values.w)
-                : qkv[slot * conv_dim + 2u * (uint64_t)key_dim +
-                head * QWEN4EXP_GDN_DIM + value];
+            float v_row;
+            if constexpr (Vector) {
+                const float4 vq = values[r >> 2u];
+                const unsigned s = r & 3u;
+                v_row = s == 0u ? vq.x : s == 1u ? vq.y
+                                       : s == 2u ? vq.z : vq.w;
+            } else {
+                v_row = qkv[slot * conv_dim + 2u * (uint64_t)key_dim +
+                    head * QWEN4EXP_GDN_DIM + value0 + r];
+            }
             h[r].x *= g;
             h[r].y *= g;
             h[r].z *= g;
@@ -670,9 +755,7 @@ __global__ static void qwen4exp_gdn_value_reuse_kernel(
             h[r].z = fmaf(k4.z, delta_v, h[r].z);
             h[r].w = fmaf(k4.w, delta_v, h[r].w);
             const float result = warp_sum_all_f32(dot4_f32(h[r], q4));
-            if (lane == 0u) {
-                out[slot * value_dim + head * QWEN4EXP_GDN_DIM + value] = result;
-            }
+            if (lane == r) parked = result;
             if (token < n_snapshot_rows) {
                 const uint64_t stride = (uint64_t)n_rows * n_value_head *
                     QWEN4EXP_GDN_DIM * QWEN4EXP_GDN_DIM;
@@ -684,6 +767,10 @@ __global__ static void qwen4exp_gdn_value_reuse_kernel(
                     __stcs(snap, h[r]);
                 }
             }
+        }
+        if (lane < R) {
+            out[slot * value_dim + head * QWEN4EXP_GDN_DIM + value0 + lane] =
+                parked;
         }
     }
 #pragma unroll
@@ -905,7 +992,9 @@ static int qwen4exp_cuda_gdn_run(
     }
     if (conv_out) {
         qwen4exp_gdn_conv_parallel_kernel<<<
-                dim3(blocks, n_rows, n_tokens),
+                dim3(blocks, n_rows,
+                     (n_tokens + QWEN4EXP_GDN_CONV_TOKEN_TILE - 1u) /
+                         QWEN4EXP_GDN_CONV_TOKEN_TILE),
                 QWEN4EXP_GDN_DIM, 0, stream>>>(
                 conv_out, (const float *)qkv->ptr,
                 (float *)conv_state->ptr, conv_weight,
@@ -946,8 +1035,10 @@ static int qwen4exp_cuda_gdn_run(
         if (n_key_head == 16u && n_value_head == 48u &&
             getenv("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE") == NULL) {
             if (getenv("DS4_QWEN4EXP_NO_GDN_VALUE_VECTOR") == NULL) {
-                qwen4exp_gdn_value_reuse_kernel<4u, true><<<
-                        dim3(n_value_head, QWEN4EXP_GDN_DIM / 16u, n_rows), QWEN4EXP_GDN_DIM, 0, stream>>>(
+                qwen4exp_gdn_value_reuse_kernel<QWEN4EXP_GDN_VALUE_ROWS, true><<<
+                        dim3(n_value_head,
+                             QWEN4EXP_GDN_DIM / (4u * QWEN4EXP_GDN_VALUE_ROWS),
+                             n_rows), QWEN4EXP_GDN_DIM, 0, stream>>>(
                         (float *)out->ptr, (float *)recurrent_state->ptr, conv_out,
                         (const float *)raw_alpha->ptr,
                         (const float *)raw_beta->ptr, a_log, dt_bias,
@@ -957,8 +1048,10 @@ static int qwen4exp_cuda_gdn_run(
                         n_snapshot_rows,
                         getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
             } else {
-                qwen4exp_gdn_value_reuse_kernel<4u><<<
-                        dim3(n_value_head, QWEN4EXP_GDN_DIM / 16u, n_rows), QWEN4EXP_GDN_DIM, 0, stream>>>(
+                qwen4exp_gdn_value_reuse_kernel<QWEN4EXP_GDN_VALUE_ROWS><<<
+                        dim3(n_value_head,
+                             QWEN4EXP_GDN_DIM / (4u * QWEN4EXP_GDN_VALUE_ROWS),
+                             n_rows), QWEN4EXP_GDN_DIM, 0, stream>>>(
                         (float *)out->ptr, (float *)recurrent_state->ptr, conv_out,
                         (const float *)raw_alpha->ptr,
                         (const float *)raw_beta->ptr, a_log, dt_bias,
