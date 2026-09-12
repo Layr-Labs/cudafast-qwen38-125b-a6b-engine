@@ -14,6 +14,7 @@ QWEN4EXP_GDN_TEST := tests/test_qwen4exp_gdn
 QWEN4EXP_MOE_TEST := tests/test_qwen4exp_moe
 QWEN4EXP_QSA_TEST := tests/test_qwen4exp_qsa
 QWEN4EXP_GDN_REF_TEST := tests/test_qwen4exp_gdn_ref
+QWEN4EXP_GDN_ROWS_TEST := tests/test_qwen4exp_gdn_value_reuse
 QWEN4EXP_QSA_REF_TEST := tests/test_qwen4exp_qsa_ref
 QWEN4EXP_GRAPH_TEST := tests/test_qwen4exp_graph
 QWEN4EXP_PLE_KERNEL_TEST := tests/test_qwen4exp_ple_kernels
@@ -129,7 +130,7 @@ endif
 # memory, so it runs on every host alongside the tests that do need a device.
 GPU_KERNEL_TESTS += $(QWEN4EXP_MTP_TEST)
 
-.PHONY: all help clean test test-qwen4exp test-qwen4exp-ple test-qwen4exp-ple-kernels test-qwen4exp-ple-kernel-mutants test-qwen4exp-gdn test-qwen4exp-gdn-ref test-qwen4exp-qsa-ref test-qwen4exp-moe test-qwen4exp-moe-mutants test-qwen4exp-cuda-moe test-qwen4exp-hc test-qwen4exp-hc-mutants test-qwen4exp-hc-fuse-mutants test-qwen4exp-mma-pipe-mutants test-qwen4exp-shared-pipe-mutants test-qwen4exp-hc-up-pipe-mutants test-qwen4exp-qsa test-qwen4exp-mtp test-qwen4exp-graph test-qwen4exp-parity test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-qwen4exp test-qwen4exp-ple test-qwen4exp-ple-kernels test-qwen4exp-ple-kernel-mutants test-qwen4exp-gdn test-qwen4exp-gdn-ref test-qwen4exp-gdn-rows test-qwen4exp-qsa-ref test-qwen4exp-moe test-qwen4exp-moe-mutants test-qwen4exp-cuda-moe test-qwen4exp-hc test-qwen4exp-hc-mutants test-qwen4exp-hc-fuse-mutants test-qwen4exp-mma-pipe-mutants test-qwen4exp-shared-pipe-mutants test-qwen4exp-hc-up-pipe-mutants test-qwen4exp-qsa test-qwen4exp-mtp test-qwen4exp-graph test-qwen4exp-parity test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
@@ -476,6 +477,20 @@ $(QWEN4EXP_GDN_TEST): tests/test_qwen4exp_gdn.o $(GPU_TEST_OBJS)
 .PHONY: test-qwen4exp-gdn
 test-qwen4exp-gdn: $(QWEN4EXP_GDN_TEST)
 	./$(QWEN4EXP_GDN_TEST)
+
+# The row-batching exactness pair: the prefill recurrence against the retained
+# one-row kernel over eleven widths, three head layouts and four input
+# patterns, eager and graph-captured, comparing nine buffers byte for byte.
+# It arrived in the tree without a target, so it had never been built.
+tests/test_qwen4exp_gdn_value_reuse.o: tests/test_qwen4exp_gdn_value_reuse.c tests/test_qwen4exp_gdn.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_qwen4exp_gdn_value_reuse.c
+
+$(QWEN4EXP_GDN_ROWS_TEST): tests/test_qwen4exp_gdn_value_reuse.o $(GPU_TEST_OBJS)
+	$(GPU_TEST_LINK)
+
+.PHONY: test-qwen4exp-gdn-rows
+test-qwen4exp-gdn-rows: $(QWEN4EXP_GDN_ROWS_TEST)
+	./$(QWEN4EXP_GDN_ROWS_TEST)
 
 # The double-precision reference pair.  Built WITHOUT -ffast-math: the whole
 # point is an IEEE reference the kernel is measured against, and fast math is
