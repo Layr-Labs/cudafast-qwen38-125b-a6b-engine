@@ -22,6 +22,10 @@
  * pipeline is bit-exact across two runs.
  */
 
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -873,6 +877,8 @@ static void run_pipeline(const inputs *in, bool verify, float *attn_out) {
  * and holes; half the calls take the position through `d_pos`, the form the
  * captured decode graph uses. */
 static void check_split_path(void) {
+    require(unsetenv("DS4_QWEN4EXP_NO_QSA_DENSE_DIRECT") == 0,
+            "enable direct dense keys");
     const uint32_t kv_width = N_KV_HEAD * HEAD_DIM;
     const uint32_t q_width = N_HEAD * HEAD_DIM;
     const uint32_t cap = TOKEN_BUDGET + 64u;
@@ -990,6 +996,21 @@ static void check_split_path(void) {
                             (double)got_a[at], (double)got_b[at]);
                     exit(1);
                 }
+                /* Keep the independent per-head oracle above, and also
+                 * compare against the previous split addressing schedule. */
+                require(setenv("DS4_QWEN4EXP_NO_QSA_DENSE_DIRECT", "1", 1) == 0,
+                        "select indirect split keys");
+                require(ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
+                            t_b, t_q, t_k, t_v, sparse ? t_sel : NULL,
+                            sparse ? t_cnt : NULL, w, N_HEAD, N_KV_HEAD,
+                            HEAD_DIM, pos0, cap, MAX_SELECTED, scale,
+                            via_dpos ? t_dpos : NULL, t_scratch, max_count),
+                        "indirect split attention");
+                tensor_get(t_b, got_b, n * sizeof(float));
+                require(memcmp(got_a, got_b, n * sizeof(float)) == 0,
+                        "direct and indirect split keys disagree");
+                require(unsetenv("DS4_QWEN4EXP_NO_QSA_DENSE_DIRECT") == 0,
+                        "restore direct dense keys");
                 /* A zero row would agree trivially; the cache is random, so
                  * it means a kernel did not run. */
                 float any = 0.0f;

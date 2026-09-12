@@ -8144,7 +8144,7 @@ __device__ __forceinline__ static int32_t qwen4exp_qsa_tile_key(
  * on distinct banks within each quarter warp. */
 #define QWEN4EXP_QSA_SPLIT_KPITCH (QWEN4EXP_QSA_SPLIT_KSTEP * 4u + 4u)
 
-template <uint32_t GROUP>
+template <uint32_t GROUP, bool DenseDirect = false>
 __global__ static void __launch_bounds__(256, 1)
 qwen4exp_qsa_split_scores_kernel(
         const float *q,
@@ -8164,6 +8164,7 @@ qwen4exp_qsa_split_scores_kernel(
         uint32_t max_tiles,
         float scale,
         const uint32_t *d_pos) {
+    if constexpr (DenseDirect) sparse = 0u;
     extern __shared__ __align__(16) float qwen4exp_attn_sc_shared[];
     const uint32_t group = blockIdx.x;
     const uint32_t tile = blockIdx.y;
@@ -8222,10 +8223,15 @@ qwen4exp_qsa_split_scores_kernel(
 #pragma unroll
     for (uint32_t h = 0; h < GROUP; h++) dot[h] = 0.0f;
     /* Each of the KSTEP loads covers rows 4i..4i+3 of the warp; lane l is
-     * row 4i + l/8, word l%8 of the slab. */
+     * row 4i + l/8, word l%8 of the slab. Dense keys follow those coordinates,
+     * so derive the same guarded key without a warp exchange. The uniform
+     * DenseDirect specialization preserves full-warp participation on the old path. */
 #pragma unroll
     for (uint32_t i = 0; i < QWEN4EXP_QSA_SPLIT_KSTEP; i++) {
-        const int32_t kk = __shfl_sync(0xffffffffu, key, 4u * i + rrow);
+        const int32_t kk = DenseDirect
+            ? qwen4exp_qsa_tile_key(NULL, token, max_selected, base,
+                warp * 32u + 4u * i + rrow, n_in_tile, cache_cap, 0u)
+            : __shfl_sync(0xffffffffu, key, 4u * i + rrow);
         ld[i] = (kk >= 0)
             ? *(const float4 *)(kbase + (uint64_t)kk * kv_stride)
             : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -8242,7 +8248,10 @@ qwen4exp_qsa_split_scores_kernel(
         if (wn < words) {
 #pragma unroll
             for (uint32_t i = 0; i < QWEN4EXP_QSA_SPLIT_KSTEP; i++) {
-                const int32_t kk = __shfl_sync(0xffffffffu, key, 4u * i + rrow);
+                const int32_t kk = DenseDirect
+                    ? qwen4exp_qsa_tile_key(NULL, token, max_selected, base,
+                        warp * 32u + 4u * i + rrow, n_in_tile, cache_cap, 0u)
+                    : __shfl_sync(0xffffffffu, key, 4u * i + rrow);
                 ld[i] = (kk >= 0)
                     ? *(const float4 *)(kbase + (uint64_t)kk * kv_stride +
                                         wn * 4u)
@@ -8291,7 +8300,7 @@ qwen4exp_qsa_split_scores_kernel(
     }
 }
 
-template <uint32_t GROUP, uint32_t VSTEP>
+template <uint32_t GROUP, uint32_t VSTEP, bool DenseDirect = false>
 __global__ static void __launch_bounds__(256, 1)
 qwen4exp_qsa_split_probs_kernel(
         const float *v_cache,
@@ -8311,6 +8320,7 @@ qwen4exp_qsa_split_probs_kernel(
         uint32_t sparse,
         uint32_t max_tiles,
         const uint32_t *d_pos) {
+    if constexpr (DenseDirect) sparse = 0u;
     extern __shared__ __align__(16) float qwen4exp_attn_pr_shared[];
     const uint32_t group = blockIdx.x;
     const uint32_t tile = blockIdx.y;
@@ -8396,12 +8406,19 @@ qwen4exp_qsa_split_probs_kernel(
          * where no key in the tile is masked (the per-head kernel's own
          * batch and its own argument); the products still land j ascending. */
         if (!sparse) {
+            /* Under these bounds the dense tile's stored keys are exactly
+             * base+j. Retain the original indirection outside that domain. */
+            const bool direct_values = DenseDirect &&
+                (uint64_t)base + n_in_tile <= cache_cap &&
+                (uint64_t)base + n_in_tile <= 0x80000000ULL;
             for (; j + VSTEP <= n_in_tile;
                    j += VSTEP) {
                 float a[VSTEP];
 #pragma unroll
                 for (uint32_t i = 0; i < VSTEP; i++) {
-                    a[i] = vh[(uint64_t)keys[j + i] * kv_stride];
+                    const int32_t kj = direct_values
+                        ? (int32_t)(base + j + i) : keys[j + i];
+                    a[i] = vh[(uint64_t)kj * kv_stride];
                 }
                 asm volatile("" ::: "memory");   /* as in the scores kernel */
 #pragma unroll
@@ -9045,17 +9062,23 @@ static int qwen4exp_qsa_attention_split(
         pr_shared > QWEN4EXP_QSA_GROUP_SHARED_CAP) {
         return 0;
     }
-#define QWEN4EXP_QSA_SPLIT_LAUNCH(G, V)                                          \
-    qwen4exp_qsa_split_scores_kernel<G><<<grid, nth, sc_shared,               \
+    const uint32_t dense_direct = !sparse &&
+        getenv("DS4_QWEN4EXP_NO_QSA_DENSE_DIRECT") == NULL;
+#define QWEN4EXP_QSA_SPLIT_LAUNCH_IMPL(G, V, DIRECT)                          \
+    qwen4exp_qsa_split_scores_kernel<G, DIRECT><<<grid, nth, sc_shared,       \
         cuda_decode_stream()>>>(                                              \
             (const float *)q->ptr, (const float *)k_cache->ptr, sel, cnt,     \
             sc, tmax, n_tokens, n_head, n_kv_head, head_dim, pos0, cache_cap, \
             max_selected, sparse ? 1u : 0u, max_tiles, scale, d_pos);         \
-    qwen4exp_qsa_split_probs_kernel<G, V><<<grid, nth, pr_shared,                \
+    qwen4exp_qsa_split_probs_kernel<G, V, DIRECT><<<grid, nth, pr_shared,     \
         cuda_decode_stream()>>>(                                              \
             (const float *)v_cache->ptr, sel, cnt, sc, tmax, ct, tsum,        \
             n_tokens, n_head, n_kv_head, head_dim, pos0, cache_cap,           \
             max_selected, sparse ? 1u : 0u, max_tiles, d_pos)
+#define QWEN4EXP_QSA_SPLIT_LAUNCH(G, V) do {                                  \
+    if (dense_direct) { QWEN4EXP_QSA_SPLIT_LAUNCH_IMPL(G, V, true); }         \
+    else { QWEN4EXP_QSA_SPLIT_LAUNCH_IMPL(G, V, false); }                     \
+} while (0)
     switch (g) {
         case 12u: QWEN4EXP_QSA_SPLIT_LAUNCH(12u, QWEN4EXP_QSA_SPLIT_VSTEP); break;
         case 6u:  QWEN4EXP_QSA_SPLIT_LAUNCH(6u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
@@ -9076,6 +9099,7 @@ static int qwen4exp_qsa_attention_split(
         default:  return 0;
     }
 #undef QWEN4EXP_QSA_SPLIT_LAUNCH
+#undef QWEN4EXP_QSA_SPLIT_LAUNCH_IMPL
     qwen4exp_qsa_split_fold_kernel<<<dim3(n_head, n_tokens), head_dim, 0,
         cuda_decode_stream()>>>(
             tmax, tsum, ct, cnt, (float *)out->ptr, n_tokens, n_head,
