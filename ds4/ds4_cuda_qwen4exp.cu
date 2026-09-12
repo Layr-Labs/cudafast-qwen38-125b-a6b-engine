@@ -5943,6 +5943,14 @@ __global__ static void qwen4exp_hc_norm_quant_kernel(
         const float *x, const float *w,
         uint32_t n, uint32_t group, uint32_t rows,
         float eps, float weight_bias, int round_bf16) {
+    /* PDL producer for the down projection that follows on the stream.
+     * Triggered at the two-row decode only, row-gated to the same <= 2 the
+     * converted launch sites fire at: grid is (n_hc, rows), 4*2 blocks --
+     * fewer blocks than the device has SMs, so the launch is single-wave by
+     * construction.  A verify or prefill width never carries a trigger:
+     * no PSS consumer follows one there, and its grid need not be one wave
+     * (the deadlock rule, ds4_cuda_qwen4exp.cuh). */
+    if (rows <= 2u) QWEN4EXP_PDL_TRIGGER();
     const uint32_t g = blockIdx.x;
     const uint32_t row = blockIdx.y;
     if (row >= rows) return;
@@ -6036,6 +6044,14 @@ __global__ static void qwen4exp_hc_mix_renorm_kernel(
         const float *normw, const float *wide,
         uint32_t n_embd, uint32_t n_hc, uint32_t n_tokens,
         float weight_bias, int round_bf16) {
+    /* PDL producer for the router GEMV that follows on the stream (the MoE
+     * block's first op reads `out`).  Grid is (n_embd/blockDim.x, n_tokens)
+     * -- 10*2 blocks at the two-row decode.  Triggered at the two-row decode
+     * only, row-gated to the same <= 2 the converted launch sites fire at:
+     * 20 blocks is fewer than the device has SMs, so the launch is
+     * single-wave by construction; a verify or prefill width never carries
+     * a trigger (the deadlock rule, ds4_cuda_qwen4exp.cuh). */
+    if (n_tokens <= 2u) QWEN4EXP_PDL_TRIGGER();
     const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t t = blockIdx.y;
     if (d >= n_embd || t >= n_tokens) return;
@@ -6171,6 +6187,14 @@ __global__ static void qwen4exp_hc_mix_inject_dual_kernel(
         uint32_t n_embd, uint32_t n_hc, uint32_t rows,
         float weight_bias, int round_bf16,
         uint32_t weight_type, uint32_t weight_row_bytes) {
+    /* PDL producer: the decode arm of the mix that closes the mixer, so the
+     * router GEMV behind it launches at its top.  Grid is (mix_blocks +
+     * n_hc, rows) -- 14*2 blocks at the two-row decode.  Triggered at the
+     * two-row decode only, row-gated to the same <= 2 the converted launch
+     * sites fire at: 28 blocks is fewer than the device has SMs, so the
+     * launch is single-wave by construction; a verify or prefill width never
+     * carries a trigger (the deadlock rule, ds4_cuda_qwen4exp.cuh). */
+    if (rows <= 2u) QWEN4EXP_PDL_TRIGGER();
     const uint32_t mix_blocks = (n_embd + 255u) / 256u;
     if (blockIdx.x < mix_blocks) {
         float *out = mixed;
@@ -6276,6 +6300,12 @@ __global__ static void qwen4exp_hc_mix_inject_renorm_kernel(
         uint32_t n_embd, uint32_t n_hc, uint32_t rows,
         float weight_bias, int round_bf16,
         uint32_t weight_type, uint32_t weight_row_bytes) {
+    /* PDL producer, as the dual above: one block per token, so this arm runs
+     * at the row threshold only and never ahead of a PSS consumer.  The row
+     * gate makes that structural rather than a caller convention: the
+     * threshold's widths never fire the trigger at all (the deadlock rule,
+     * ds4_cuda_qwen4exp.cuh). */
+    if (rows <= 2u) QWEN4EXP_PDL_TRIGGER();
     extern __shared__ float smix[];
     const uint32_t t = blockIdx.x;
     if (t >= rows) return;
@@ -6423,6 +6453,15 @@ static int qwen4exp_hc_staged_ok(uint32_t n_embd, uint32_t n_hc) {
 __global__ static void qwen4exp_hc_silu_quant_kernel(
         float *lowrank, int8_t *xq, float *xscale,
         uint64_t pairs, float scale) {
+    /* PDL producer for the up projection that follows on the stream.  Grid
+     * is ceil(pairs/8) -- three blocks at the two-row decode.  This kernel
+     * counts pairs, not rows, so the row gate is stated in its own unit:
+     * 20 pairs IS the two-row decode (2 rows x 10 Q8 groups, n_lowrank 320
+     * / 32), the width up to which the up-projection consumers fire, and
+     * three blocks is single-wave by construction.  A verify or prefill
+     * width never carries a trigger (the deadlock rule,
+     * ds4_cuda_qwen4exp.cuh). */
+    if (pairs <= 20u) QWEN4EXP_PDL_TRIGGER();
     const uint64_t pair = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
     if (pair >= pairs) return;
     const uint32_t lane = threadIdx.x & 31u;
@@ -6689,6 +6728,12 @@ __global__ static void qwen4exp_hc_norm_quant_inject_kernel(
         uint32_t group, uint32_t n_hc, uint32_t rows,
         float eps, float weight_bias, int round_bf16,
         uint32_t weight_type, uint32_t weight_row_bytes) {
+    /* PDL producer, as the per-stream norm above; this arm runs at the row
+     * threshold only, where the projection behind it is the plain MMA tile.
+     * The row gate makes that structural rather than a caller convention:
+     * the threshold's widths never fire the trigger at all (the deadlock
+     * rule, ds4_cuda_qwen4exp.cuh). */
+    if (rows <= 2u) QWEN4EXP_PDL_TRIGGER();
     const uint32_t row = blockIdx.x;
     if (row >= rows) return;
 
