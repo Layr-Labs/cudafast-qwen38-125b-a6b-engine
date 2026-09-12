@@ -214,3 +214,17 @@ void ds4s_spec_counters(const ds4s_handle *h, uint64_t *drafts, uint64_t *hits,
     if (quenches) *quenches = c.quenches;
     if (disagreements) *disagreements = c.verify_replay_disagreements;
 }
+
+int ds4s_profile_text(const ds4s_handle *h, char *buf, size_t cap) {
+    if (!buf || cap == 0) return -1;
+    buf[0] = '\0';
+    if (!h || !h->session) return -1;
+    return ds4_session_qwen4exp_profile_text(h->session, buf, cap) == 0 ? 0 : -1;
+}
+
+int ds4s_profile_words(const ds4s_handle *h, uint64_t words[6], double f[2]) {
+    if (words) memset(words, 0, 6 * sizeof(words[0]));
+    if (f) { f[0] = 0.0; f[1] = 0.0; }
+    if (!h || !h->session || !words || !f) return -1;
+    return ds4_session_qwen4exp_profile_words(h->session, words, f) == 0 ? 0 : -1;
+}

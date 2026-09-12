@@ -175,6 +175,122 @@ void ds4_qwen4exp_session_plan_print(const ds4_qwen4exp_session_plan *plan) {
 
 #ifndef DS4_NO_GPU
 
+/* The slice sequence one forward actually ran, recorded at each slice's own
+ * call site.  A test asserts the whole sequence, so a slice that is dropped,
+ * duplicated or moved -- the PLE block sliding from the head of the layer to
+ * the tail, say -- fails rather than passing because the forward still
+ * returned true. */
+typedef enum {
+    QW_SLICE_EMBED = 1,
+    QW_SLICE_PLE,
+    QW_SLICE_ATTN_MIX,
+    QW_SLICE_GDN,
+    QW_SLICE_QSA,
+    QW_SLICE_ATTN_INJECT,
+    QW_SLICE_FFN_MIX,
+    QW_SLICE_MOE,
+    QW_SLICE_FFN_INJECT,
+    QW_SLICE_FINAL_MIX,
+    QW_SLICE_HEAD,
+} qwen4exp_slice;
+
+#ifdef DS4_TEST_HOOKS
+#define DS4_QWEN4EXP_MAX_TRACE 1024
+static uint8_t  g_qwen4exp_trace[DS4_QWEN4EXP_MAX_TRACE];
+static uint32_t g_qwen4exp_trace_len = 0;
+static bool     g_qwen4exp_trace_overflow = false;
+#endif
+
+/* Where a forward's time goes, by slice.
+ *
+ * The trace records the ORDER of the slices; with DS4_QWEN4EXP_TIME_SLICES set
+ * it also records their COST.  Each trace point closes the command batch,
+ * waits for the device and opens a new one, so the wall time between two trace
+ * points is that slice's GPU work and nothing else.  That serialisation is the
+ * measurement: it removes the overlap between slices, so the numbers are a
+ * ranking of where the work is, not a prediction of the total.  The unmeasured
+ * run is the one that states throughput.
+ *
+ * Diagnostic only, and off unless the variable is set.  When it is off the
+ * trace point is one static-int test.  The per-width-class totals below are
+ * never reset; ds4_session_qwen4exp_profile_text() reads them out. */
+static const char *const g_qwen4exp_slice_name[] = {
+    "?", "embed", "ple", "attn_mix", "gdn", "qsa", "attn_inject",
+    "ffn_mix", "moe", "ffn_inject", "final_mix", "head",
+};
+#define DS4_QWEN4EXP_N_SLICE \
+    ((int)(sizeof(g_qwen4exp_slice_name) / sizeof(g_qwen4exp_slice_name[0])))
+
+/* Width classes: one row, two rows, three to seven rows, eight and wider, and
+ * the MTP head's own block (index 4, MoE stages only). */
+enum { QW_PROF_W1 = 0, QW_PROF_W2, QW_PROF_WS, QW_PROF_WIDE, QW_PROF_HEADBLK,
+       QW_PROF_N_CLASS };
+static const char *const g_qw_prof_class_name[QW_PROF_N_CLASS] = {
+    "w1", "w2", "w3-7", "wide", "headblk" };
+static double   g_qw_prof_slice[QW_PROF_N_CLASS][DS4_QWEN4EXP_N_SLICE];
+static uint64_t g_qw_prof_forwards[QW_PROF_N_CLASS];
+static double   g_qw_prof_wall[QW_PROF_N_CLASS];
+static double   g_qw_prof_ple_host[QW_PROF_N_CLASS];
+static double   g_qw_prof_moe[QW_PROF_N_CLASS][4];
+static uint64_t g_qw_prof_moe_calls[QW_PROF_N_CLASS];
+
+static int qw_prof_class_of(uint32_t n_tokens) {
+    if (n_tokens <= 1u) return QW_PROF_W1;
+    if (n_tokens == 2u) return QW_PROF_W2;
+    if (n_tokens < 8u) return QW_PROF_WS;
+    return QW_PROF_WIDE;
+}
+
+static double   g_qwen4exp_slice_sec[DS4_QWEN4EXP_N_SLICE];
+static uint32_t g_qwen4exp_slice_hits[DS4_QWEN4EXP_N_SLICE];
+static double   g_qwen4exp_slice_mark = 0.0;
+static int      g_qwen4exp_time_slices = -1;
+
+static int qwen4exp_time_slices_on(void) {
+    if (g_qwen4exp_time_slices < 0) {
+        g_qwen4exp_time_slices = getenv("DS4_QWEN4EXP_TIME_SLICES") != NULL;
+    }
+    return g_qwen4exp_time_slices;
+}
+
+static void qwen4exp_trace(qwen4exp_slice slice) {
+#ifdef DS4_TEST_HOOKS
+    if (g_qwen4exp_trace_len < DS4_QWEN4EXP_MAX_TRACE) {
+        g_qwen4exp_trace[g_qwen4exp_trace_len++] = (uint8_t)slice;
+    } else {
+        g_qwen4exp_trace_overflow = true;
+    }
+#endif
+    if (!qwen4exp_time_slices_on()) return;
+    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize() ||
+        !ds4_gpu_begin_commands()) {
+        return;
+    }
+    const double now = now_sec();
+    if (g_qwen4exp_slice_mark > 0.0 && (int)slice < DS4_QWEN4EXP_N_SLICE) {
+        g_qwen4exp_slice_sec[(int)slice] += now - g_qwen4exp_slice_mark;
+        g_qwen4exp_slice_hits[(int)slice]++;
+    }
+    g_qwen4exp_slice_mark = now;
+}
+
+static void qwen4exp_trace_report(uint32_t n_tokens) {
+    if (g_qwen4exp_time_slices <= 0) return;
+    double total = 0.0;
+    for (int i = 1; i < DS4_QWEN4EXP_N_SLICE; i++) total += g_qwen4exp_slice_sec[i];
+    if (!(total > 0.0)) return;
+    const int cls = qw_prof_class_of(n_tokens);
+    for (int i = 1; i < DS4_QWEN4EXP_N_SLICE; i++) {
+        g_qw_prof_slice[cls][i] += g_qwen4exp_slice_sec[i];
+        g_qwen4exp_slice_sec[i] = 0.0;
+        g_qwen4exp_slice_hits[i] = 0;
+    }
+    g_qwen4exp_slice_mark = 0.0;
+}
+
+#define QW_TRACE(slice) qwen4exp_trace(slice)
+#define QW_TRACE_REPORT(n) qwen4exp_trace_report(n)
+
 #define QW_MAP(m, t)   ((const void *)(m)->shard[(t)->map_index].map)
 #define QW_MAPSZ(m, t) ((m)->shard[(t)->map_index].size)
 #define QW_OFF(t)      ((t)->abs_offset)
@@ -1195,7 +1311,8 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
      * rows a single long call would. */
 
     const double gather_t0 =
-        getenv("DS4_QWEN4EXP_PLE_GATHER_TIME") ? now_sec() : 0.0;
+        (getenv("DS4_QWEN4EXP_PLE_GATHER_TIME") || qwen4exp_time_slices_on())
+            ? now_sec() : 0.0;
     const uint32_t block_elems = DS4_PLE_IQ4_NL_BLOCK_ELEMS;
     const uint32_t blocks_per_row = DS4_N_PLE_ROW_DIM / block_elems;
 
@@ -1347,9 +1464,13 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
         }
     }
     if (gather_t0 != 0.0) {
-        fprintf(stderr,
-                "ds4: qwen4exp PLE gather %u rows took %.3f ms\n",
-                n_tokens, (now_sec() - gather_t0) * 1000.0);
+        const double took = now_sec() - gather_t0;
+        g_qw_prof_ple_host[qw_prof_class_of(n_tokens)] += took;
+        if (getenv("DS4_QWEN4EXP_PLE_GATHER_TIME")) {
+            fprintf(stderr,
+                    "ds4: qwen4exp PLE gather %u rows took %.3f ms\n",
+                    n_tokens, took * 1000.0);
+        }
     }
     if (!ds4_gpu_tensor_write(s->ple_rows, 0, s->ple_rows_host,
                               (uint64_t)n_tokens * DS4_N_PLE_EMBD * sizeof(float))) {
@@ -1780,6 +1901,8 @@ static void qw_moe_time_dump(void) {
             (void)ds4_gpu_synchronize();                                      \
             const uint64_t qw_moe_now = qw_hb_now_ns();                       \
             qw_moe_stage_ns[moe_lane][(slot)] += qw_moe_now - moe_mark;       \
+            g_qw_prof_moe[moe_cls][(slot)] +=                                 \
+                (double)(qw_moe_now - moe_mark) * 1e-9;                       \
             moe_mark = qw_moe_now;                                            \
         }                                                                     \
     } while (0)
@@ -1796,8 +1919,10 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
      * softmax weights this feeds scale zeros -- but on a real checkpoint they
      * scale live experts, and the top-k selection they drive is discrete, so a
      * row-count difference here can move which experts a row uses. */
-    const int moe_timing = qw_hb_time_on() && n_tokens == 1u;
+    const int moe_timing = qw_hb_time_on();
     const int moe_lane = qw_moe_in_head_block ? 1 : 0;
+    const int moe_cls = qw_moe_in_head_block ? QW_PROF_HEADBLK
+                                             : qw_prof_class_of(n_tokens);
     uint64_t moe_mark = moe_timing ? qw_hb_now_ns() : 0;
 
     if (!ds4_qwen4exp_matmul_f32(s->moe_logits, QW_MAP(m, l->ffn_gate_inp),
@@ -1857,112 +1982,12 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
         return false;
     }
     QW_MOE_TICK(QW_MOE_T_SHARED);
-    if (moe_timing) qw_moe_stage_calls[moe_lane]++;
+    if (moe_timing) { qw_moe_stage_calls[moe_lane]++; g_qw_prof_moe_calls[moe_cls]++; }
     return true;
 }
 
 /* One gated residual step: mix down to the block input, run the block, inject
  * the block output back into every hyper-connection stream. */
-#ifdef DS4_TEST_HOOKS
-/* The slice sequence one forward actually ran, recorded at each slice's own
- * call site.  A test asserts the whole sequence, so a slice that is dropped,
- * duplicated or moved -- the PLE block sliding from the head of the layer to
- * the tail, say -- fails rather than passing because the forward still
- * returned true. */
-typedef enum {
-    QW_SLICE_EMBED = 1,
-    QW_SLICE_PLE,
-    QW_SLICE_ATTN_MIX,
-    QW_SLICE_GDN,
-    QW_SLICE_QSA,
-    QW_SLICE_ATTN_INJECT,
-    QW_SLICE_FFN_MIX,
-    QW_SLICE_MOE,
-    QW_SLICE_FFN_INJECT,
-    QW_SLICE_FINAL_MIX,
-    QW_SLICE_HEAD,
-} qwen4exp_slice;
-
-#define DS4_QWEN4EXP_MAX_TRACE 1024
-static uint8_t  g_qwen4exp_trace[DS4_QWEN4EXP_MAX_TRACE];
-static uint32_t g_qwen4exp_trace_len = 0;
-static bool     g_qwen4exp_trace_overflow = false;
-
-/* Where a forward's time goes, by slice.
- *
- * The trace records the ORDER of the slices; with DS4_QWEN4EXP_TIME_SLICES set
- * it also records their COST.  Each trace point closes the command batch,
- * waits for the device and opens a new one, so the wall time between two trace
- * points is that slice's GPU work and nothing else.  That serialisation is the
- * measurement: it removes the overlap between slices, so the numbers are a
- * ranking of where the work is, not a prediction of the total.  The unmeasured
- * run is the one that states throughput.
- *
- * ds4_gpu_end_commands / ds4_gpu_begin_commands around a profiled region is
- * what the Metal Q8 prefill profiler already does.  Diagnostic only, and off
- * unless the variable is set.
- *
- * The table prints at the end of the forward that fills it. */
-static const char *const g_qwen4exp_slice_name[] = {
-    "?", "embed", "ple", "attn_mix", "gdn", "qsa", "attn_inject",
-    "ffn_mix", "moe", "ffn_inject", "final_mix", "head",
-};
-#define DS4_QWEN4EXP_N_SLICE \
-    ((int)(sizeof(g_qwen4exp_slice_name) / sizeof(g_qwen4exp_slice_name[0])))
-
-static double   g_qwen4exp_slice_sec[DS4_QWEN4EXP_N_SLICE];
-static uint32_t g_qwen4exp_slice_hits[DS4_QWEN4EXP_N_SLICE];
-static double   g_qwen4exp_slice_mark = 0.0;
-static int      g_qwen4exp_time_slices = -1;
-
-static void qwen4exp_trace(qwen4exp_slice slice) {
-    if (g_qwen4exp_trace_len < DS4_QWEN4EXP_MAX_TRACE) {
-        g_qwen4exp_trace[g_qwen4exp_trace_len++] = (uint8_t)slice;
-    } else {
-        g_qwen4exp_trace_overflow = true;
-    }
-
-    if (g_qwen4exp_time_slices < 0) {
-        g_qwen4exp_time_slices = getenv("DS4_QWEN4EXP_TIME_SLICES") != NULL;
-    }
-    if (!g_qwen4exp_time_slices) return;
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize() ||
-        !ds4_gpu_begin_commands()) {
-        return;
-    }
-    const double now = now_sec();
-    if (g_qwen4exp_slice_mark > 0.0 && (int)slice < DS4_QWEN4EXP_N_SLICE) {
-        g_qwen4exp_slice_sec[(int)slice] += now - g_qwen4exp_slice_mark;
-        g_qwen4exp_slice_hits[(int)slice]++;
-    }
-    g_qwen4exp_slice_mark = now;
-}
-
-static void qwen4exp_trace_report(uint32_t n_tokens) {
-    if (g_qwen4exp_time_slices <= 0) return;
-    double total = 0.0;
-    for (int i = 1; i < DS4_QWEN4EXP_N_SLICE; i++) total += g_qwen4exp_slice_sec[i];
-    if (!(total > 0.0)) return;
-    fprintf(stderr, "ds4: qwen4exp slice times over %u rows, %.3f ms serialised "
-                    "total\n", n_tokens, total * 1000.0);
-    for (int i = 1; i < DS4_QWEN4EXP_N_SLICE; i++) {
-        if (!g_qwen4exp_slice_hits[i]) continue;
-        fprintf(stderr, "ds4:   %-12s %8.3f ms  %5.1f%%  over %u calls\n",
-                g_qwen4exp_slice_name[i], g_qwen4exp_slice_sec[i] * 1000.0,
-                100.0 * g_qwen4exp_slice_sec[i] / total,
-                g_qwen4exp_slice_hits[i]);
-        g_qwen4exp_slice_sec[i] = 0.0;
-        g_qwen4exp_slice_hits[i] = 0;
-    }
-    g_qwen4exp_slice_mark = 0.0;
-}
-
-#define QW_TRACE(slice) qwen4exp_trace(slice)
-#define QW_TRACE_REPORT(n) qwen4exp_trace_report(n)
-#else
-#define QW_TRACE(slice) ((void)0)
-#define QW_TRACE_REPORT(n) ((void)0)
-#endif
 
 
 static bool qwen4exp_graph_residual(ds4_qwen4exp_session *s,
@@ -2343,8 +2368,7 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
                                 uint32_t                    n_tokens,
                                 float                      *logits_out) {
     const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
-    const double wall_t0 =
-        getenv("DS4_QWEN4EXP_TIME_SLICES") != NULL ? now_sec() : 0.0;
+    const double wall_t0 = qwen4exp_time_slices_on() ? now_sec() : 0.0;
 
     /* NO SILENT FALSE.  Every refusal below this line names itself, and so
      * does this one: an argument that is missing is a wiring fault in the
@@ -2432,6 +2456,8 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         return false;
     }
 
+    if (wall_t0 != 0.0) g_qwen4exp_slice_mark = now_sec();
+
     /* Layer-0 seed: gather the embedding row and tile it into every stream. */
     if (!ds4_gpu_qwen4exp_embed_tokens_hc_tensor(
             s->hyper, s->embed_rows, s->tokens,
@@ -2510,8 +2536,9 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
 
     s->pos += n_tokens;
     if (wall_t0 != 0.0) {
-        fprintf(stderr, "ds4: qwen4exp forward wall: %u rows in %.3f ms\n",
-                n_tokens, (now_sec() - wall_t0) * 1000.0);
+        const int cls = qw_prof_class_of(n_tokens);
+        g_qw_prof_wall[cls] += now_sec() - wall_t0;
+        g_qw_prof_forwards[cls] += 1;
     }
     return true;
 }

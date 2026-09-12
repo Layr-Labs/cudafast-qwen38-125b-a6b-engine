@@ -76202,12 +76202,136 @@ int ds4_session_qwen4exp_spec_counters(ds4_session *s, ds4_spec_counters *out) {
     return 0;
 }
 
+static uint64_t qw_prof_u16(double us) {
+    if (!(us > 0.0)) return 0u;
+    if (us > 65535.0) return 65535u;
+    return (uint64_t)(us + 0.5);
+}
+
+static uint64_t qw_prof_pack4(double a, double b, double c, double d) {
+    return qw_prof_u16(a) | (qw_prof_u16(b) << 16) | (qw_prof_u16(c) << 32) |
+           (qw_prof_u16(d) << 48);
+}
+
+int ds4_session_qwen4exp_profile_text(ds4_session *s, char *buf, size_t cap) {
+    if (!buf || cap == 0) return 1;
+    buf[0] = '\0';
+    if (!s || !ds4_session_is_qwen4exp(s)) return 1;
+    size_t at = 0;
+#define QW_PT(...) do { \
+        if (at < cap) { \
+            const int n_ = snprintf(buf + at, cap - at, __VA_ARGS__); \
+            if (n_ > 0) at += (size_t)n_; \
+        } \
+    } while (0)
+    for (int c = 0; c < QW_PROF_N_CLASS; c++) {
+        const uint64_t n = g_qw_prof_forwards[c];
+        if (n == 0 && g_qw_prof_moe_calls[c] == 0) continue;
+        QW_PT("%s{n=%llu", g_qw_prof_class_name[c], (unsigned long long)n);
+        if (n) {
+            const double k = 1000.0 / (double)n;
+            QW_PT(" wall=%.3f pleh=%.3f", g_qw_prof_wall[c] * k,
+                  g_qw_prof_ple_host[c] * k);
+            for (int i = 1; i < DS4_QWEN4EXP_N_SLICE; i++) {
+                QW_PT(" %s=%.3f", g_qwen4exp_slice_name[i],
+                      g_qw_prof_slice[c][i] * k);
+            }
+        }
+        if (g_qw_prof_moe_calls[c]) {
+            const double k = 1000.0 / (double)g_qw_prof_moe_calls[c];
+            QW_PT(" moe/call[%llu]=%.4f/%.4f/%.4f/%.4f",
+                  (unsigned long long)g_qw_prof_moe_calls[c],
+                  g_qw_prof_moe[c][0] * k, g_qw_prof_moe[c][1] * k,
+                  g_qw_prof_moe[c][2] * k, g_qw_prof_moe[c][3] * k);
+        }
+        QW_PT("}");
+    }
+    {
+        uint64_t ns[DS4_QWEN4EXP_MTP_HEAD_STAGES];
+        uint64_t calls = 0;
+        ds4_qwen4exp_mtp_head_time_snapshot(ns, DS4_QWEN4EXP_MTP_HEAD_STAGES,
+                                            &calls);
+        if (calls) {
+            QW_PT(" head{n=%llu", (unsigned long long)calls);
+            for (int i = 0; i < DS4_QWEN4EXP_MTP_HEAD_STAGES; i++) {
+                QW_PT(" %d=%.3f", i, (double)ns[i] / (double)calls / 1e6);
+            }
+            QW_PT("}");
+        }
+    }
+    {
+        const ds4_qwen4exp_mtp_counters *c = &s->qwen4exp_spec.counters;
+        QW_PT(" cyc{r=%llu d=%llu a=%llu v=%.3f dr=%.3f rb=%.3f}",
+              (unsigned long long)c->rounds, (unsigned long long)c->drafted,
+              (unsigned long long)c->accepted, (double)c->verify_ns / 1e6,
+              (double)c->draft_ns / 1e6, (double)c->rollback_ns / 1e6);
+    }
+#undef QW_PT
+    return 0;
+}
+
+int ds4_session_qwen4exp_profile_words(ds4_session *s, uint64_t words[6],
+                                       double f[2]) {
+    if (words) memset(words, 0, 6 * sizeof(words[0]));
+    if (f) { f[0] = 0.0; f[1] = 0.0; }
+    if (!s || !words || !f || !ds4_session_is_qwen4exp(s)) return 1;
+    const int c = QW_PROF_W2;
+    const uint64_t n = g_qw_prof_forwards[c];
+    const double k = n ? 1e6 / (double)n : 0.0;      /* seconds -> us/forward */
+    const double *sl = g_qw_prof_slice[c];
+    words[0] = qw_prof_pack4(sl[QW_SLICE_EMBED] * k, sl[QW_SLICE_PLE] * k,
+                             sl[QW_SLICE_ATTN_MIX] * k, sl[QW_SLICE_GDN] * k);
+    words[1] = qw_prof_pack4(sl[QW_SLICE_QSA] * k, sl[QW_SLICE_ATTN_INJECT] * k,
+                             sl[QW_SLICE_FFN_MIX] * k, sl[QW_SLICE_MOE] * k);
+    words[2] = qw_prof_pack4(sl[QW_SLICE_FFN_INJECT] * k,
+                             sl[QW_SLICE_FINAL_MIX] * k,
+                             sl[QW_SLICE_HEAD] * k, g_qw_prof_wall[c] * k);
+    {
+        const uint64_t mc = g_qw_prof_moe_calls[c];
+        const double km = mc ? 1e7 / (double)mc : 0.0;   /* 0.1 us per call */
+        words[3] = qw_prof_pack4(g_qw_prof_moe[c][0] * km, g_qw_prof_moe[c][1] * km,
+                                 g_qw_prof_moe[c][2] * km, g_qw_prof_moe[c][3] * km);
+    }
+    {
+        uint64_t ns[DS4_QWEN4EXP_MTP_HEAD_STAGES];
+        uint64_t calls = 0;
+        ds4_qwen4exp_mtp_head_time_snapshot(ns, DS4_QWEN4EXP_MTP_HEAD_STAGES,
+                                            &calls);
+        const double kh = calls ? 1e-3 / (double)calls : 0.0;  /* ns -> us */
+        const double pre = (double)(ns[0] + ns[1] + ns[2] + ns[3] + ns[4] +
+                                    ns[5] + ns[6]) * kh;
+        const double reads = (double)(ns[12] + ns[13] + ns[14]) * kh;
+        const ds4_qwen4exp_mtp_counters *cc = &s->qwen4exp_spec.counters;
+        const double rb_us = cc->rounds
+            ? (double)cc->rollback_ns / (double)cc->rounds * 1e-3 : 0.0;
+        words[4] = qw_prof_pack4(pre, (double)ns[7] * kh, (double)ns[8] * kh,
+                                 (double)ns[9] * kh);
+        words[5] = qw_prof_pack4((double)ns[10] * kh, (double)ns[11] * kh,
+                                 reads, rb_us);
+        f[0] = (double)cc->verify_ns * 1e-9;
+        f[1] = (double)cc->draft_ns * 1e-9;
+    }
+    return 0;
+}
+
 #endif /* !DS4_NO_GPU */
 
 #ifdef DS4_NO_GPU
 /* No graph backend, so no qwen4exp session and no cycle to count. */
 int ds4_session_qwen4exp_spec_counters(ds4_session *s, ds4_spec_counters *out) {
     (void)s; (void)out;
+    return 1;
+}
+int ds4_session_qwen4exp_profile_text(ds4_session *s, char *buf, size_t cap) {
+    (void)s;
+    if (buf && cap) buf[0] = '\0';
+    return 1;
+}
+int ds4_session_qwen4exp_profile_words(ds4_session *s, uint64_t words[6],
+                                       double f[2]) {
+    (void)s;
+    if (words) memset(words, 0, 6 * sizeof(words[0]));
+    if (f) { f[0] = 0.0; f[1] = 0.0; }
     return 1;
 }
 #endif

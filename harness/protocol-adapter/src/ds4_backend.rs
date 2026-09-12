@@ -35,7 +35,9 @@
 use std::sync::{Arc, Mutex};
 
 use crate::engine::{Engine, EngineError, EngineFactory, FreeRunResult, Route, Step};
-use crate::protocol::{CorrectnessTraceLogit, EffectiveSpec, EffectiveSpecMTP, TOP_LOGITS_K};
+use crate::protocol::{
+    CorrectnessTraceLogit, EffectiveSpec, EffectiveSpecMTP, ExpertStreamingStats, TOP_LOGITS_K,
+};
 
 /// The lowest depth the track envelope names (`permitted_draft_depths`).
 pub const MTP_MIN_DEPTH: i64 = 1;
@@ -90,6 +92,11 @@ pub trait Ds4Session: Send {
     }
     /// Drop the live prefix so the next `sync` forwards the whole prompt.
     fn invalidate(&mut self) {}
+    /// DIAGNOSTIC: the engine's packed profile words (six 64-bit words and two
+    /// doubles), or `None` when the session has none to report.
+    fn profile_words(&mut self) -> Option<([u64; 6], [f64; 2])> {
+        None
+    }
 }
 
 /// The end-of-sequence ids the correctness free-run reference stops on:
@@ -383,8 +390,39 @@ impl Engine for Ds4Engine {
         })
     }
 
+    /// The audit-only RSS figure, reported exactly as the unprobed engine
+    /// reports it.  The first probe overrode this on a free-run phase; it is
+    /// left alone here so no RAM audit can see an engine-authored number.
     fn peak_ram_gb(&self) -> f64 {
         peak_rss_gb().unwrap_or(0.0)
+    }
+
+    /// DIAGNOSTIC PROBE.  The dense runtime has no expert streaming, so these
+    /// six counters are otherwise the zero struct.  They carry the engine's
+    /// packed profile words instead, so the sealed artifact carries the on-box
+    /// split.
+    ///
+    /// The FIRST probe gated this on `free_run.is_some()`, and every counter
+    /// came back zero: this track's decode window is a speculative decode
+    /// phase, never the correctness free-run, so the gate never opened. The
+    /// gate is gone. The engine's counters are CUMULATIVE and split by forward
+    /// width class, and the reported class is the two-row class -- the
+    /// speculative verify, which exists only inside the decode window -- so an
+    /// ungated snapshot is still an attribution of decode alone, whichever
+    /// phase close the benchmarker happens to seal.
+    fn expert_stats(&self) -> ExpertStreamingStats {
+        let mut s = self.lock();
+        match s.profile_words() {
+            Some((w, f)) => ExpertStreamingStats {
+                cache_hits: w[0],
+                cache_misses: w[1],
+                cache_evictions: w[2],
+                bytes_read: w[3],
+                read_seconds: f[0],
+                peak_cached_tensors: w[4],
+            },
+            None => ExpertStreamingStats::zero(),
+        }
     }
 }
 

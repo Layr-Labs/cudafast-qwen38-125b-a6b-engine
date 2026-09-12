@@ -72,6 +72,9 @@ pub struct ResidentHello {
     /// an artifact can show the load was not repeated.
     pub load_epoch: i64,
     pub ident: String,
+    /// DIAGNOSTIC: the engine's cumulative profile text at hello time (empty
+    /// unless the resident armed its profiling switches).
+    pub profile: String,
     pub model_path: String,
     pub mtp_head_path: String,
 }
@@ -94,10 +97,17 @@ impl ResidentHello {
     /// this, even the record lived only in the resident log and
     /// `serve-identity.json`, neither of which the score carries.
     pub fn backend_string(&self) -> String {
-        format!(
-            "{RESIDENT_BACKEND} load_epoch={} {}",
-            self.load_epoch, self.ident
-        )
+        if self.profile.is_empty() {
+            format!(
+                "{RESIDENT_BACKEND} load_epoch={} {}",
+                self.load_epoch, self.ident
+            )
+        } else {
+            format!(
+                "{RESIDENT_BACKEND} load_epoch={} {} prof[{}]",
+                self.load_epoch, self.ident, self.profile
+            )
+        }
     }
 }
 
@@ -142,6 +152,7 @@ impl ResidentSession {
                 ctx_size: 0,
                 load_epoch: 0,
                 ident: String::new(),
+                profile: String::new(),
                 model_path: String::new(),
                 mtp_head_path: String::new(),
             },
@@ -163,6 +174,11 @@ impl ResidentSession {
             ctx_size: int_field(&reply, "ctx_size")?,
             load_epoch: int_field(&reply, "load_epoch")?,
             ident: string_field(&reply, "ident")?,
+            profile: reply
+                .get("profile")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
             model_path: string_field(&reply, "model_path")?,
             mtp_head_path: string_field(&reply, "mtp_head_path")?,
         };
@@ -385,6 +401,24 @@ impl Ds4Session for ResidentSession {
 
     fn eos_token(&self) -> Option<i64> {
         (self.hello.eos_token >= 0).then_some(self.hello.eos_token)
+    }
+
+    fn profile_words(&mut self) -> Option<([u64; 6], [f64; 2])> {
+        let reply = self.call(json!({"op": "profile"})).ok()?;
+        let w = reply.get("w")?.as_array()?;
+        let f = reply.get("f")?.as_array()?;
+        if w.len() != 6 || f.len() != 2 {
+            return None;
+        }
+        let mut words = [0u64; 6];
+        for (i, v) in w.iter().enumerate() {
+            words[i] = v.as_u64()?;
+        }
+        let mut fl = [0f64; 2];
+        for (i, v) in f.iter().enumerate() {
+            fl[i] = v.as_f64()?;
+        }
+        Some((words, fl))
     }
 
     fn invalidate(&mut self) {

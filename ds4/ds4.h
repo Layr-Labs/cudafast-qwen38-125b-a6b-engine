@@ -564,6 +564,18 @@ typedef struct {
 
 int ds4_session_qwen4exp_spec_counters(ds4_session *s, ds4_spec_counters *out);
 
+/* DIAGNOSTIC profile readout for a qwen4exp session.  Everything here is
+ * cumulative over the process: the per-width-class slice split the forward
+ * records under DS4_QWEN4EXP_TIME_SLICES, the MoE stage split and the head
+ * stage split under DS4_MTP_HEAD_TIME, and the speculative cycle's own
+ * verify/draft/rollback wall counters.  `text` writes a compact one-line
+ * summary; `words` packs the two-row (verify) figures into six 64-bit words of
+ * four 16-bit microsecond fields each plus two doubles.  Both return 0 for a
+ * qwen4exp session and non-zero otherwise. */
+int ds4_session_qwen4exp_profile_text(ds4_session *s, char *buf, size_t cap);
+int ds4_session_qwen4exp_profile_words(ds4_session *s, uint64_t words[6],
+                                       double f[2]);
+
 /* Arm the qwen4exp speculative machinery ahead of the first cycle.
  *
  * The head block's cache slot, the head's scratch tensors, the drafter's host

@@ -317,6 +317,10 @@ static int serve_line(const resident *r, int fd, const char *line) {
     int keep = 1;
 
     if (!strcmp(op, "hello")) {
+        /* DIAGNOSTIC: the engine's cumulative profile so far, appended to the
+         * identity the worker seals.  Empty unless a profiling switch is on. */
+        static char prof[4096];
+        (void)ds4s_profile_text(r->h, prof, sizeof(prof));
         ok = buf_printf(&out,
                         "{\"ok\":true,\"vocab_size\":%d,\"eos_token\":%d,\"mtp_armed\":%s,"
                         "\"draft_tokens\":%d,\"ctx_size\":%d,\"load_epoch\":%" PRIu64 ",",
@@ -324,6 +328,7 @@ static int serve_line(const resident *r, int fd, const char *line) {
                         r->draft_tokens >= 2 ? "true" : "false", r->draft_tokens, r->ctx_size,
                         r->load_epoch) &&
              buf_puts(&out, "\"ident\":") && buf_json_string(&out, r->ident) &&
+             buf_puts(&out, ",\"profile\":") && buf_json_string(&out, prof) &&
              buf_puts(&out, ",\"model_path\":") && buf_json_string(&out, r->model_path) &&
              buf_puts(&out, ",\"mtp_head_path\":") && buf_json_string(&out, r->mtp_head_path) &&
              buf_puts(&out, "}");
@@ -400,6 +405,14 @@ static int serve_line(const resident *r, int fd, const char *line) {
                         "{\"ok\":true,\"drafts\":%" PRIu64 ",\"hits\":%" PRIu64
                         ",\"quenches\":%" PRIu64 ",\"disagreements\":%" PRIu64 "}",
                         drafts, hits, quenches, disagreements);
+    } else if (!strcmp(op, "profile")) {
+        uint64_t words[6];
+        double f[2];
+        (void)ds4s_profile_words(r->h, words, f);
+        ok = buf_puts(&out, "{\"ok\":true,\"w\":[");
+        for (int i = 0; ok && i < 6; i++)
+            ok = buf_printf(&out, "%s%" PRIu64, i ? "," : "", words[i]);
+        ok = ok && buf_printf(&out, "],\"f\":[%.9g,%.9g]}", f[0], f[1]);
     } else if (!strcmp(op, "bye")) {
         ok = buf_puts(&out, "{\"ok\":true}");
         keep = 0;
@@ -475,6 +488,15 @@ static void unlink_socket(void) {
 
 int main(void) {
     setvbuf(stderr, NULL, _IOLBF, 0);
+
+    /* PROFILING PROBE.  Arm the engine's own diagnostic timers for this
+     * resident: the per-slice split (DS4_QWEN4EXP_TIME_SLICES) and the MTP
+     * head / MoE stage split (DS4_MTP_HEAD_TIME).  Both serialise the device
+     * between stages, so this build attributes time rather than measuring
+     * throughput; the readout travels through the hello's `profile` field and
+     * the `profile` op.  Set-if-absent, so an explicit environment wins. */
+    setenv("DS4_QWEN4EXP_TIME_SLICES", "1", 0);
+    setenv("DS4_MTP_HEAD_TIME", "1", 0);
 
     const char *socket_path = env_or("DS4_RESIDENT_SOCKET", NULL);
     if (!socket_path) {
