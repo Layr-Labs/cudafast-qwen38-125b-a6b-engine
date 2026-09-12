@@ -2369,7 +2369,23 @@ static bool qwen4exp_graph_layers_encode(
 
 static uint32_t qw_decode_graph_chunks(void) {
     static int init = 0;
-    static uint32_t chunks = 4u;   /* the A/B's pick; 1 restores the single capture */
+    /* Eight, not four.  Only the FIRST launch is exposed: every later chunk's
+     * upload is paid while the device runs the chunk before it (~5 ms of work
+     * per chunk at 8, against a launch of a few hundred us).  So the exposed
+     * idle tracks chunk 0's size, and 48/8 = 6 layers halves the 12 this build
+     * ships.  The one clean datum for that is the base's own 1 -> 4 step, where
+     * the exposed launch fell 792 us (48 layers) to 183 us (12) and the
+     * top-of-tower gap fell 0.969 -> 0.257 ms.  Sized off that slope, 6 layers
+     * is worth roughly 0.09 ms of a 40.8 ms round -- about 0.2 %, which is at
+     * this instrument's within-box floor, so treat the sign as the claim and
+     * not the magnitude.  Deliberately NOT sized as 1/N: the base's per-chunk
+     * launch times (183/417/389/348 us for 7/21/20/1448 nodes) are
+     * non-monotonic in node count, so its "falls as 1/N" reading is not
+     * supported by its own table.  The base measured eight as its fastest rate
+     * arm but shipped four unprofiled; its one argument against more execs was
+     * re-instantiation pressure, which it put at 0.02/round on the resident
+     * path -- the scored one.  1 still restores the single whole-stack capture. */
+    static uint32_t chunks = 8u;
     if (!init) {
         init = 1;
         const char *s = getenv("DS4_CUDA_DECODE_GRAPH_CHUNKS");
