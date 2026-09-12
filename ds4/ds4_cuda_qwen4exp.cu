@@ -3259,12 +3259,23 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
     }
 }
 
-/* Grid (ceil(out_dim / 8), ceil(n_tokens / R)).  The slots of a token are
+/* Grid (ceil(out_dim / OutputRows), ceil(n_tokens / R)).  The slots of a token are
  * walked in ascending order into ONE accumulator, which is what the per-token
  * kernel did; the rows of the tile do not share a weight here, because each
  * one picked its own expert for the slot.  What the tile buys is that the
- * activation groups are read once for R rows and the decode is per group. */
-template <int R, int DownType = -1, bool Vector = false>
+ * activation groups are read once for R rows and the decode is per group.
+ *
+ * OutputRows is how many output rows one block owns, one warp each.  This
+ * kernel has no barrier -- the fold is warp_sum_f32 -- so the warps are not
+ * latency-coupled the way the split gate/up warps are.  What a wide block
+ * still couples is RETIREMENT: an SM holds a block's slot until its slowest
+ * warp finishes, and at decode out_dim 2560 over eight rows is 320 blocks for
+ * 48 SMs, which is 6.67 blocks per SM.  That quantum leaves the last wave
+ * one-seventh idle.  Narrowing to two rows keeps the warp count identical and
+ * turns the same work into 1280 blocks, 26.7 per SM, so the tail rounds off
+ * against a much finer grid. */
+template <int R, int DownType = -1, bool Vector = false,
+          unsigned OutputRows = 8>
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
@@ -3281,7 +3292,7 @@ __global__ static void qwen4exp_moe_down_q_kernel(
         uint32_t n_total_expert,
         uint32_t n_expert_used) {
     const uint32_t lane = threadIdx.x & 31u;
-    const uint32_t row = blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t row = blockIdx.x * OutputRows + (threadIdx.x >> 5u);
     const uint32_t tok0 = blockIdx.y * (uint32_t)R;
     if (row >= out_dim || tok0 >= n_tokens) return;
     const uint32_t take = n_tokens - tok0 < (uint32_t)R ? n_tokens - tok0
@@ -3341,7 +3352,8 @@ __global__ static void qwen4exp_moe_down_q_kernel(
 
 /* The shared expert: no routing, so the tile is consecutive tokens and the
  * decoded group serves all of them. */
-template <int R, int GateType = -1, int UpType = -1, bool Vector = false>
+template <int R, int GateType = -1, int UpType = -1, bool Vector = false,
+          unsigned OutputRows = 8>
 __global__ static void qwen4exp_shared_gateup_q_kernel(
         float *mid,
         const char *gate,
@@ -3357,7 +3369,7 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
         uint32_t mid_dim,
         uint32_t n_tokens) {
     const uint32_t lane = threadIdx.x & 31u;
-    const uint32_t row = blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t row = blockIdx.x * OutputRows + (threadIdx.x >> 5u);
     const uint32_t tok0 = blockIdx.y * (uint32_t)R;
     if (row >= mid_dim || tok0 >= n_tokens) return;
     const uint32_t take = n_tokens - tok0 < (uint32_t)R ? n_tokens - tok0
@@ -3450,7 +3462,8 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
     }
 }
 
-template <int R, int DownType = -1, bool Vector = false>
+template <int R, int DownType = -1, bool Vector = false,
+          unsigned OutputRows = 8>
 __global__ static void qwen4exp_shared_down_q_kernel(
         float *out,
         const char *down,
@@ -3464,7 +3477,7 @@ __global__ static void qwen4exp_shared_down_q_kernel(
         uint32_t out_dim,
         uint32_t n_tokens) {
     const uint32_t lane = threadIdx.x & 31u;
-    const uint32_t row = blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t row = blockIdx.x * OutputRows + (threadIdx.x >> 5u);
     const uint32_t tok0 = blockIdx.y * (uint32_t)R;
     if (row >= out_dim || tok0 >= n_tokens) return;
     const uint32_t take = n_tokens - tok0 < (uint32_t)R ? n_tokens - tok0
@@ -5260,6 +5273,14 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
 
     const dim3 dn_grid((out_dim + 7u) / 8u,
                        (n_tokens + (uint32_t)tile - 1u) / (uint32_t)tile, 1);
+#define QWEN4EXP_DOWN_ROWS_IMPL(R, DT, V, P) \
+    qwen4exp_moe_down_q_kernel<R, DT, V, P><<< \
+            dim3((out_dim + (P) - 1u) / (P), dn_grid.y, 1), (P) * 32u, 0, \
+            stream>>>( \
+            (float *)out->ptr, down, (const int32_t *)selected->ptr, \
+            sc.mq, sc.ms, sc.msum, \
+            down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
+            mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
 #define QWEN4EXP_DOWN_IMPL(R, DT, V) \
     qwen4exp_moe_down_q_kernel<R, DT, V><<<dn_grid, threads, 0, stream>>>( \
             (float *)out->ptr, down, (const int32_t *)selected->ptr, \
@@ -5303,10 +5324,16 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         return cuda_ok(cudaGetLastError(), "qwen4exp MoE down combine launch");
     }
     if (down_vector && ((uintptr_t)sc.mq & 15u) == 0u) {
+        /* TWO OUTPUT ROWS PER BLOCK on the vector schedule, for the retirement
+         * quantum the kernel comment above works out: eight rows makes 320
+         * blocks against 48 SMs and the last wave runs one-seventh empty, and
+         * the same narrowing on the split gate/up kernel was worth 0.78% of
+         * box-normalized decode.  The warp count and the per-warp work are
+         * unchanged; only the block boundary moves. */
         if (down_slab->type == DS4_QWEN4EXP_TY_q8_0) {
-            QWEN4EXP_DOWN_IMPL(2, DS4_QWEN4EXP_TY_q8_0, true);
+            QWEN4EXP_DOWN_ROWS_IMPL(2, DS4_QWEN4EXP_TY_q8_0, true, 2u);
         } else {
-            QWEN4EXP_DOWN_IMPL(2, DS4_QWEN4EXP_TY_q5_1, true);
+            QWEN4EXP_DOWN_ROWS_IMPL(2, DS4_QWEN4EXP_TY_q5_1, true, 2u);
         }
     }
     else if (tile == 8) { QWEN4EXP_DOWN(8); }
@@ -5315,6 +5342,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     else { QWEN4EXP_DOWN(1); }
 #undef QWEN4EXP_DOWN
 #undef QWEN4EXP_DOWN_IMPL
+#undef QWEN4EXP_DOWN_ROWS_IMPL
     return cuda_ok(cudaGetLastError(), "qwen4exp MoE down launch");
 }
 
@@ -5544,12 +5572,22 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
  * quantizes the input itself, that quantizer, which triggers too -- and the
  * kernel's weight-group prefetch rides that window
  * (ds4_cuda_qwen4exp.cuh).  Verify and prefill keep the plain launch. */
+/* ONE OUTPUT ROW PER BLOCK at the decode widths.  Eight rows makes mid_dim
+ * 640 into eighty blocks for 48 SMs: 32 SMs take two blocks and 16 take one,
+ * so the kernel runs at the pace of the doubly loaded half and a fifth of the
+ * machine idles through it.  The same 640 warps as 640 single-warp blocks
+ * spread 13.3 per SM, a 5% quantum instead of a 20% one, and the warp budget
+ * is untouched because 640 warps over 48 SMs never approaches the resident
+ * cap.  Narrowing the split routed gate/up block the same way was worth 0.78%
+ * of box-normalized decode.  This kernel has no shared memory, no barrier and
+ * no cross-warp traffic -- the fold is warp_sum_f32 -- so a row's arithmetic
+ * cannot depend on how many rows share its block. */
 #define QWEN4EXP_SH_GATEUP_IMPL(R, GT, UT, V) do { \
     if (n_tokens <= 2u) { \
         QWEN4EXP_LAUNCH_PDL( \
-                (qwen4exp_shared_gateup_q_kernel<R, GT, UT, V>), \
-                (dim3((mid_dim + 7u) / 8u, tiles, 1)), \
-                threads, 0, stream, \
+                (qwen4exp_shared_gateup_q_kernel<R, GT, UT, V, 1u>), \
+                (dim3(mid_dim, tiles, 1)), \
+                32u, 0, stream, \
                 (float *)mid->ptr, gate, up, xq, xs, xsum, \
                 gate_slab->row_bytes, up_slab->row_bytes, \
                 gate_slab->type, up_slab->type, xgroups, mid_dim, n_tokens); \
