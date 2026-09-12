@@ -807,6 +807,10 @@ static int mtp_head_draft_vocab(ds4_qwen4exp_mtp_head *h,
 
 int ds4_qwen4exp_mtp_head_init(ds4_qwen4exp_mtp_head *h,
                                char *err, size_t errlen) {
+    h->tail_graph_state = NULL;
+    h->tail_graph_release = NULL;
+    h->stem_graph_state = NULL;
+    h->stem_graph_release = NULL;
     if (!h->hooks.rms_norm || !h->hooks.hc_mixer || !h->hooks.embed ||
         !h->hooks.matmul_q8_0 || !h->hooks.block) {
         return mtp_fail(err, errlen,
@@ -889,8 +893,39 @@ int ds4_qwen4exp_mtp_head_init(ds4_qwen4exp_mtp_head *h,
     return 0;
 }
 
+int ds4_qwen4exp_mtp_head_mix_eager(ds4_qwen4exp_mtp_head *h,
+                                  uint32_t first_row, uint32_t rows,
+                                  int copy_last_row) {
+    if (!h || !h->hooks.hc_mixer || !rows || rows > h->max_tokens ||
+        first_row >= h->max_tokens || (copy_last_row && rows != 1u)) return 0;
+    const uint64_t hc_elems = (uint64_t)h->n_embd * h->n_hc;
+    if (!hc_elems || hc_elems > UINT64_MAX / sizeof(float)) return 0;
+    const uint64_t hc_bytes = hc_elems * sizeof(float);
+    if (copy_last_row && first_row > UINT64_MAX / hc_bytes) return 0;
+    /* eh_proj has consumed h_normed; preserve hyper for optional multi_out. */
+    if (copy_last_row && !ds4_gpu_tensor_copy(h->t_h_normed, 0, h->t_hyper,
+                                              first_row * hc_bytes, hc_bytes))
+        return 0;
+    /* The head's three weights share its GGUF mapping, but retain the
+     * mixer's per-weight slab interface used by split target mappings. */
+    const ds4_gpu_qwen4exp_slab norm_slab = {
+        h->head_map, h->head_size, h->hc_head_norm_offset, 0, 0, 0 };
+    const ds4_gpu_qwen4exp_slab down_slab = {
+        h->head_map, h->head_size, h->hc_head_down_offset, 0, 0, 0 };
+    const ds4_gpu_qwen4exp_slab up_slab = {
+        h->head_map, h->head_size, h->hc_head_up_offset, 0, 0, 0 };
+    return h->hooks.hc_mixer(h->t_sample, NULL, h->t_mix_normed,
+                           h->t_mix_lowrank, h->t_mix_wide,
+                           copy_last_row ? h->t_h_normed : h->t_hyper,
+                           &norm_slab, &down_slab, &up_slab, NULL,
+                           h->n_embd, h->n_hc, h->n_lowrank, rows,
+                           h->rms_eps, h->weight_bias, h->round_bf16) != 0;
+}
+
 void ds4_qwen4exp_mtp_head_free(ds4_qwen4exp_mtp_head *h) {
     if (!h) return;
+    if (h->tail_graph_release) h->tail_graph_release(h);
+    if (h->stem_graph_release) h->stem_graph_release(h);
     ds4_gpu_tensor *all[] = {
         h->t_tokens, h->t_embed_rows, h->t_embed_out, h->t_e_normed,
         h->t_h_normed, h->t_ehx, h->t_hyper, h->t_mix_normed,
@@ -989,70 +1024,19 @@ static int mtp_head_time_on(void) {
         }                                                                     \
     } while (0)
 
-/* The forward proper.  Seed rows must update the head block's caches, but
- * their final mixer and vocabulary projections have no consumer when only
- * the last proposal is requested.  Narrow those stateless operations within
- * the decode-order envelope; wider diagnostic calls retain their dispatch. */
-static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
-                                 const int *next_tokens,
-                                 const float *multi_in,
-                                 uint32_t pos0, uint32_t n_tokens,
-                                 int *draft_out, float *multi_out,
-                                 bool last_only,
-                                 char *err, size_t errlen) {
-    if (n_tokens == 0 || n_tokens > h->max_tokens) {
-        return mtp_fail(err, errlen,
-                        "qwen4exp MTP head: %u rows, built for 1..%u",
-                        n_tokens, h->max_tokens);
-    }
-    const uint32_t n_embd = h->n_embd;
-    const uint32_t n_hc = h->n_hc;
+/* Shared eager oracle. Timing stays outside optional graph dispatch and
+ * preserves the original per-stage synchronization/attribution. */
+static int mtp_head_stem_eager_impl(ds4_qwen4exp_mtp_head *h,
+        uint32_t n_tokens, const char **failed_stage, int timing,
+        uint64_t *time_mark) {
+    if (!h || !n_tokens || n_tokens > h->max_tokens || !h->hooks.embed ||
+        !h->hooks.rms_norm || !h->hooks.matmul_q8_0) return 0;
+    const uint32_t n_embd = h->n_embd, n_hc = h->n_hc;
     const uint64_t hc_dim = (uint64_t)n_hc * n_embd;
-    const uint64_t f = sizeof(float);
-    const uint64_t embd_bytes = (uint64_t)n_embd * f;
-    const uint32_t first_row = last_only ? n_tokens - 1u : 0u;
-    const uint32_t out_rows = n_tokens - first_row;
-    const bool narrow_logits = last_only && n_tokens > 1u &&
-        n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT;
-    const uint32_t logit_rows = narrow_logits ? 1u : n_tokens;
-    const uint32_t logit_first = narrow_logits ? 0u : first_row;
-    /* The draft shortlist, fixed at init.  Zero keeps the whole vocabulary;
-     * armed, the DRAFT's borrowed-LM-head projection narrows to rows
-     * [0, prefix) plus the tail range, and `draft_width` is the width of one
-     * PACKED row: the prefix ids first, the tail ids behind them.  Packing
-     * prefix-first keeps the packed order the token-id order -- validated at
-     * init (the ranges are disjoint and prefix is below the tail base) -- so
-     * the top-1's first-max tie rule still picks the lowest id. */
-    const uint32_t draft_prefix = h->draft_vocab_prefix;
-    const uint32_t draft_tail = draft_prefix ? h->draft_vocab_tail : 0u;
-    uint32_t draft_width = draft_prefix
-        ? draft_prefix + draft_tail : h->n_vocab;
-    const int timing = mtp_head_time_on();
-    uint64_t tmark = timing ? mtp_now_ns() : 0;
-
-    /* The ids the embedding gather reads.  int is the caller's type; the
-     * kernel takes int32, and the two agree on every target this builds for. */
-    int32_t ids_stack[8];
-    int32_t *ids = ids_stack;
-    if (n_tokens > sizeof(ids_stack) / sizeof(ids_stack[0])) {
-        ids = malloc((size_t)n_tokens * sizeof(int32_t));
-        if (!ids) return mtp_fail(err, errlen, "qwen4exp MTP head: out of memory");
-    }
-    for (uint32_t t = 0; t < n_tokens; t++) ids[t] = (int32_t)next_tokens[t];
-
-    const char *stage = "token upload";
-    bool ok = ds4_gpu_tensor_write(h->t_tokens, 0, ids,
-                                   (uint64_t)n_tokens * sizeof(int32_t)) != 0;
-    if (ids != ids_stack) free(ids);
-    MTP_HEAD_TICK(MTP_HEAD_T_TOKEN);
-    if (ok) {
-        stage = "multi-stream upload";
-        ok = ds4_gpu_tensor_write(h->t_hyper, 0, multi_in,
-                                  (uint64_t)n_tokens * hc_dim * f) != 0;
-    }
-    MTP_HEAD_TICK(MTP_HEAD_T_MULTI_IN);
-    if (ok) ok = ds4_gpu_begin_commands() != 0;
-
+    const uint64_t f = sizeof(float), embd_bytes = (uint64_t)n_embd * f;
+    uint64_t tmark = time_mark ? *time_mark : 0;
+    const char *stage = "embedding";
+    bool ok = true;
     /* e = fc_embedding(enorm(embed(next))).  The embedding is the TARGET's;
      * n_hc = 1 asks the tiling gather for plain rows. */
     if (ok) {
@@ -1113,42 +1097,97 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                                   h->t_ehx, (uint64_t)n_tokens * n_hc) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_EH_PROJ);
+    if (failed_stage) *failed_stage = stage;
+    if (time_mark) *time_mark = tmark;
+    return ok;
+}
+
+int ds4_qwen4exp_mtp_head_stem_eager(ds4_qwen4exp_mtp_head *h,
+                                     uint32_t n_tokens) {
+    return mtp_head_stem_eager_impl(h, n_tokens, NULL, 0, NULL);
+}
+
+/* The forward proper.  Seed rows must update the head block's caches, but
+ * their final mixer and vocabulary projections have no consumer when only
+ * the last proposal is requested.  Narrow those stateless operations within
+ * the decode-order envelope; wider diagnostic calls retain their dispatch. */
+static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
+                                 const int *next_tokens,
+                                 const float *multi_in,
+                                 uint32_t pos0, uint32_t n_tokens,
+                                 int *draft_out, float *multi_out,
+                                 bool last_only,
+                                 char *err, size_t errlen) {
+    if (n_tokens == 0 || n_tokens > h->max_tokens) {
+        return mtp_fail(err, errlen,
+                        "qwen4exp MTP head: %u rows, built for 1..%u",
+                        n_tokens, h->max_tokens);
+    }
+    const uint32_t n_embd = h->n_embd;
+    const uint32_t n_hc = h->n_hc;
+    const uint64_t hc_dim = (uint64_t)n_hc * n_embd;
+    const uint64_t f = sizeof(float);
+    const uint32_t first_row = last_only ? n_tokens - 1u : 0u;
+    const uint32_t out_rows = n_tokens - first_row;
+    const bool narrow_logits = last_only && n_tokens > 1u &&
+        n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT;
+    const uint32_t logit_rows = narrow_logits ? 1u : n_tokens;
+    const uint32_t logit_first = narrow_logits ? 0u : first_row;
+    /* The draft shortlist, fixed at init.  Zero keeps the whole vocabulary;
+     * armed, the DRAFT's borrowed-LM-head projection narrows to rows
+     * [0, prefix) plus the tail range, and `draft_width` is the width of one
+     * PACKED row: the prefix ids first, the tail ids behind them.  Packing
+     * prefix-first keeps the packed order the token-id order -- validated at
+     * init (the ranges are disjoint and prefix is below the tail base) -- so
+     * the top-1's first-max tie rule still picks the lowest id. */
+    const uint32_t draft_prefix = h->draft_vocab_prefix;
+    const uint32_t draft_tail = draft_prefix ? h->draft_vocab_tail : 0u;
+    uint32_t draft_width = draft_prefix
+        ? draft_prefix + draft_tail : h->n_vocab;
+    const int timing = mtp_head_time_on();
+    uint64_t tmark = timing ? mtp_now_ns() : 0;
+
+    /* The ids the embedding gather reads.  int is the caller's type; the
+     * kernel takes int32, and the two agree on every target this builds for. */
+    int32_t ids_stack[8];
+    int32_t *ids = ids_stack;
+    if (n_tokens > sizeof(ids_stack) / sizeof(ids_stack[0])) {
+        ids = malloc((size_t)n_tokens * sizeof(int32_t));
+        if (!ids) return mtp_fail(err, errlen, "qwen4exp MTP head: out of memory");
+    }
+    for (uint32_t t = 0; t < n_tokens; t++) ids[t] = (int32_t)next_tokens[t];
+
+    const char *stage = "token upload";
+    bool ok = ds4_gpu_tensor_write(h->t_tokens, 0, ids,
+                                   (uint64_t)n_tokens * sizeof(int32_t)) != 0;
+    if (ids != ids_stack) free(ids);
+    MTP_HEAD_TICK(MTP_HEAD_T_TOKEN);
+    if (ok) {
+        stage = "multi-stream upload";
+        ok = ds4_gpu_tensor_write(h->t_hyper, 0, multi_in,
+                                  (uint64_t)n_tokens * hc_dim * f) != 0;
+    }
+    MTP_HEAD_TICK(MTP_HEAD_T_MULTI_IN);
+    if (ok) ok = ds4_gpu_begin_commands() != 0;
+
+    if (ok) {
+        stage = "head stem";
+        ok = !timing && h->hooks.stem
+            ? h->hooks.stem(h, n_tokens)
+            : mtp_head_stem_eager_impl(h, n_tokens, &stage, timing, &tmark);
+    }
     if (ok) {
         stage = "block";
         ok = h->hooks.block(h->graph, h->cache, h->t_hyper, h->block_index,
                             pos0, n_tokens) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_BLOCK);
-    /* t_h_normed's previous contents were consumed by eh_proj.  Reuse it for
-     * the final hyper row so the stateless tail needs neither tensor views
-     * nor an extra allocation.  Keep t_hyper intact for multi_out. */
-    if (ok && narrow_logits) {
-        stage = "last head row";
-        ok = ds4_gpu_tensor_copy(h->t_h_normed, 0, h->t_hyper,
-                                  (uint64_t)first_row * hc_dim * f,
-                                  hc_dim * f) != 0;
-    }
-    /* The head's own mixer: a gated residual with no inject head, the same
-     * shape as the tower's final mixer. */
     if (ok) {
         stage = "hc head mixer";
-        /* All three come from the head GGUF, which the --mtp path opens as one
-         * file, so the three slabs name one mapping here.  They are still
-         * built per tensor: the mixer takes slabs because a tower mixer's
-         * weights can straddle shards, and the head must not be the one place
-         * that reintroduces a single-mapping assumption. */
-        const ds4_gpu_qwen4exp_slab norm_slab = {
-            h->head_map, h->head_size, h->hc_head_norm_offset, 0, 0, 0 };
-        const ds4_gpu_qwen4exp_slab down_slab = {
-            h->head_map, h->head_size, h->hc_head_down_offset, 0, 0, 0 };
-        const ds4_gpu_qwen4exp_slab up_slab = {
-            h->head_map, h->head_size, h->hc_head_up_offset, 0, 0, 0 };
-        ok = h->hooks.hc_mixer(h->t_sample, NULL, h->t_mix_normed,
-                               h->t_mix_lowrank, h->t_mix_wide,
-                               narrow_logits ? h->t_h_normed : h->t_hyper,
-                               &norm_slab, &down_slab, &up_slab, NULL,
-                               n_embd, n_hc, h->n_lowrank, logit_rows,
-                               h->rms_eps, h->weight_bias, h->round_bf16) != 0;
+        ok = h->hooks.mix_tail
+            ? h->hooks.mix_tail(h, first_row, logit_rows, narrow_logits)
+            : ds4_qwen4exp_mtp_head_mix_eager(h, first_row, logit_rows,
+                                              narrow_logits);
     }
     MTP_HEAD_TICK(MTP_HEAD_T_MIXER);
     bool screened = false;

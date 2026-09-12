@@ -1329,6 +1329,11 @@ extern "C" uint64_t ds4_gpu_tier_free_vram(int logical_tier) {
 
 extern "C" int ds4_gpu_register_support_map(const void *map, uint64_t size, uint64_t bias) {
     if (!map || size == 0 || bias == 0) return 0;
+    if (g_support_host_base != map || g_support_host_size != size ||
+        g_support_offset_bias != bias) {
+        if (g_decode_graph_stream) (void)cudaStreamSynchronize(g_decode_graph_stream);
+        ds4_gpu_decode_graphs_invalidate();
+    }
     g_support_host_base = map;
     g_support_host_size = size;
     g_support_offset_bias = bias;
@@ -2769,6 +2774,11 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
 }
 
 static void cuda_model_range_release_all(void) {
+    /* Graphs retain resolved weight pointers, including direct main-map
+     * pointers when this range list is empty. Retire before any map/cache
+     * replacement can free or unregister those addresses. */
+    if (g_decode_graph_stream) (void)cudaStreamSynchronize(g_decode_graph_stream);
+    ds4_gpu_decode_graphs_invalidate();
     for (const cuda_model_range &r : g_model_ranges) {
         if (r.host_registered && r.registered_base) {
             (void)cudaHostUnregister(r.registered_base);
@@ -15754,6 +15764,8 @@ extern "C" void ds4_gpu_enable_q8_dequant_gemm(void) {
 }
 
 extern "C" void ds4_gpu_enable_q8_dense_mma(void) {
+    /* A captured width-eight stem must not retain the old dispatch. */
+    if (!g_q8_dense_mma_enabled) ds4_gpu_decode_graphs_invalidate();
     g_q8_dense_mma_enabled = 1;
 }
 
@@ -18930,7 +18942,7 @@ extern "C" int ds4_gpu_repeat_hc_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_
     }
     const uint64_t blocks = (out_elems + 255u) / 256u;
     if (blocks > UINT32_MAX) return 0;
-    repeat_hc_rows_kernel<<<(unsigned)blocks, 256>>>((float *)out->ptr, (const float *)rows->ptr, n_tokens, n_embd, n_hc);
+    repeat_hc_rows_kernel<<<(unsigned)blocks, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)rows->ptr, n_tokens, n_embd, n_hc);
     return cuda_ok(cudaGetLastError(), "repeat_hc_rows launch");
 }
 
@@ -29526,7 +29538,7 @@ extern "C" int ds4_gpu_embed_tokens_quant_tensor(
             logical_tier, "glm_token_embd");
     if (!w) return 0;
     uint64_t n = (uint64_t)n_tokens * n_embd;
-    glm_embed_tokens_q8_0_kernel<<<(n + 255) / 256, 256>>>(
+    glm_embed_tokens_q8_0_kernel<<<(n + 255) / 256, 256, 0, cuda_decode_stream()>>>(
             (float *)out->ptr,
             (const int32_t *)tokens->ptr,
             w, n_tokens, n_embd);
