@@ -3019,7 +3019,11 @@ __device__ __forceinline__ static void qwen4exp_shared_vector_accumulate(
  * group chain and warp reduction. Only the completed scalar projections pass
  * through shared memory before the unchanged SiLU/up/router-weight product.
  * The retained schedule packs four rows into 256 threads. The aligned-vector
- * schedule uses two rows and 128 threads; inactive row warps still join barriers. */
+ * schedule uses ONE row and 64 threads -- one gate warp and one up warp on
+ * that row -- because four rows measured a full percent slower than two: each
+ * warp streams a different weight row and the barrier before the shared fold
+ * waits on the slowest of them, so narrowing the block narrows the latency
+ * spread it absorbs. Inactive row warps still join barriers. */
 template <int R, int Type, bool Vector = false, unsigned OutputRows = 4>
 __global__ static void qwen4exp_moe_gateup_split_kernel(
         float *mid,
@@ -5222,7 +5226,18 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             up_slab->expert_bytes, up_slab->row_bytes, \
             gate_slab->type, up_slab->type, xgroups, mid_dim, \
             mid_token_stride, n_expert_used)
-        if (vector) { QWEN4EXP_SPLIT_GATEUP(true, 2u); }
+        /* ONE OUTPUT ROW PER BLOCK on the vector schedule.  Four rows per
+         * block was measured a full percent slower than two, so the barrier
+         * is what costs: every warp in the block reads a different weight
+         * row, and the __syncthreads() before the shared `projected` fold
+         * waits on the slowest of them.  Halving the warps halves the
+         * variance the barrier absorbs, and two warps -- one gate, one up,
+         * on the SAME row -- is the narrowest block this kernel's shape
+         * admits.  Purely a packing change: with OutputRows one, `warp >> 1`
+         * is zero for both warps, so each still walks its own row in the
+         * same group order through the same warp_sum_f32 tree and every dot
+         * is bit-identical.  mid_dim 640 gives 640 blocks. */
+        if (vector) { QWEN4EXP_SPLIT_GATEUP(true, 1u); }
         else { QWEN4EXP_SPLIT_GATEUP(false, 4u); }
 #undef QWEN4EXP_SPLIT_GATEUP
     }
