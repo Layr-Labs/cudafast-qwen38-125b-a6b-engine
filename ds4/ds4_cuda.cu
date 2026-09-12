@@ -18755,9 +18755,9 @@ struct qwen_gdn_projection_args {
     uint64_t od[2]; uint32_t n_rows; uint64_t blocks;
 };
 template<int R>
-__global__ __launch_bounds__(256)
+__global__ __launch_bounds__(128)
 static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
-    constexpr unsigned B=256u;
+    constexpr unsigned B=128u;
     constexpr bool FloatFirst=true, Streaming=false;
     constexpr int C=2, U=10;
     const uint32_t split=(uint32_t)((a.od[0]+B/64u-1u)/(B/64u));
@@ -19180,15 +19180,15 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
         getenv("DS4_QWEN4EXP_NO_GDN_PROJECTION_FUSION")==NULL &&
         (((uintptr_t)a.weights[0]|(uintptr_t)a.weights[1])&1u)==0u &&
         (((uintptr_t)a.weights[2]|(uintptr_t)a.weights[3]|(uintptr_t)a.x)&15u)==0u) {
-        const unsigned grid=(unsigned)((qkv_dim+3u)/4u+(gate_dim+3u)/4u+96u);
+        const unsigned grid=(unsigned)((qkv_dim+1u)/2u+(gate_dim+1u)/2u+96u);
         /* PDL consumer: the stream predecessor is the mixed-input quantizer,
          * which triggers at its top at these decode widths. */
         if (rows==1u)
             QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1>),
-                                grid, 256, 0, cuda_decode_stream(), a);
+                                grid, 128, 0, cuda_decode_stream(), a);
         else
             QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2>),
-                                grid, 256, 0, cuda_decode_stream(), a);
+                                grid, 128, 0, cuda_decode_stream(), a);
         return cuda_ok(cudaGetLastError(),"GDN four projections launch");
     }
     for (unsigned i=0;i<2;i++)
