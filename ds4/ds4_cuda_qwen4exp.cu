@@ -205,8 +205,58 @@ enum {
      * the serial one.  The decode step and the speculative verify's armed
      * rounds are one to a few tokens and keep the serial kernel, whose
      * in-place write needs no second buffer. */
-    QWEN4EXP_GDN_CONV_PARALLEL_MIN_TOKENS = 64
+    QWEN4EXP_GDN_CONV_PARALLEL_MIN_TOKENS = 64,
+    /* Value rows one warp of qwen4exp_gdn_value_reuse_kernel carries through the
+     * token-serial delta rule.  A block is four warps, so it covers 4 * this
+     * many of a head's QWEN4EXP_GDN_DIM value rows and the grid's y extent is
+     * QWEN4EXP_GDN_DIM / (4 * this).  Value rows are INDEPENDENT outputs -- row
+     * r's state row is updated only from the shared k, q, beta and decay and
+     * from its own v scalar -- so this partitions work without touching any
+     * accumulation order and is bit-identical at every legal value.  A pure
+     * schedule knob.
+     *
+     * WIDER IS MEASURABLY WORSE.  The kernel shipped at four, and raising it to
+     * eight cost 1.68% of composite (d840e029, spark-2: 2.292315 against the
+     * base tree's 2.331358, max_abs_diff 0).  The traffic argument for widening
+     * -- each doubling halves the redundant per-token q4/k4/gate loads across
+     * the blocks of one head, and doubles the independent warp-reduction chains
+     * that hide latency in a 1024-step serial loop -- is real but is not what
+     * binds.  What binds is resident warps: eight rows leaves 192 blocks over 48
+     * SMs (16 warps an SM) against 384 at four (32 warps), and doubles carried
+     * state to 32 floats a lane.
+     *
+     * So the untested direction is NARROWER.  Four rows sits at 32 warps an SM
+     * against an sm_121a ceiling of 64, i.e. half occupancy, and two rows would
+     * push toward that ceiling with 768 blocks and 8 carried floats a lane.  The
+     * vector value load handles two rows as a float2 and multiples of four as
+     * whole float4 quads. */
+    QWEN4EXP_GDN_VALUE_ROWS = 2
 };
+
+/* MEASURED NEGATIVE RESULTS on qwen4exp_gdn_value_reuse_kernel's value-row
+ * width, so nobody repeats them.  The kernel takes its rows per warp as the
+ * template parameter R; a block is four warps, so it covers 4 * R of a head's
+ * QWEN4EXP_GDN_DIM value rows and the grid's y extent is the matching divisor.
+ * Value rows are independent outputs, so R is a pure schedule knob and every
+ * value of it is bit-identical (max_abs_diff was 0 on both runs below).
+ *
+ * The shipped width is FOUR.  Raising it looked obviously right -- each
+ * doubling halves the redundant per-token q4/k4/gate loads across the blocks
+ * of one head and doubles the independent warp-reduction chains available to
+ * hide latency in a token-serial loop -- and it is WRONG on this box:
+ *
+ *   R = 4   composite 2.331358  (the base tree, fe27e733)
+ *   R = 8   composite 2.292315  (d840e029, spark-2)   1.68% worse
+ *
+ * With eight rows a head's 128 rows fall to 192 blocks over 48 SMs instead of
+ * 384, i.e. 16 warps an SM instead of 32, and the carried state doubles to 32
+ * floats a lane.  This kernel is occupancy-bound, not latency-bound: it wants
+ * many resident warps far more than it wants deep per-warp ILP.  R = 16 would
+ * halve residency again and is not worth a run.
+ *
+ * Do not re-derive the traffic argument and try again.  The reuse it saves is
+ * already being collected in cache; what it spends is warps, and warps are
+ * what this kernel is short of. */
 
 /*
  * PER-ROW STATE SNAPSHOTS, for the speculative cycle's rollback.  Twin of the
@@ -644,19 +694,35 @@ __global__ static void qwen4exp_gdn_value_reuse_kernel(
         const float2 pair = gate_pairs[slot * n_value_head + head];
         const float g = pair.x;
         const float beta = pair.y;
-        static_assert(!Vector || R == 4u, "value vector requires four rows");
-        float4 values;
+        static_assert(!Vector || R == 2u || (R % 4u) == 0u,
+                      "value vector reads a float2 or whole float4 quads");
+        /* value0 is a multiple of R and every head/token stride is a multiple
+         * of 128 floats, so both forms below stay naturally aligned and read
+         * the same adjacent scalars the scalar path would read. */
+        float values[Vector ? R : 1u];
         if constexpr (Vector) {
-            /* value0 is a multiple of four, and every head/token stride is
-             * a multiple of 128 floats. Read the same four adjacent scalars. */
-            values = *(const float4 *)(qkv + slot * conv_dim +
-                2u * (uint64_t)key_dim + head * QWEN4EXP_GDN_DIM + value0);
+            const float *vsrc = qkv + slot * conv_dim +
+                2u * (uint64_t)key_dim + head * QWEN4EXP_GDN_DIM + value0;
+            if constexpr ((R % 4u) == 0u) {
+#pragma unroll
+                for (unsigned q = 0; q < R / 4u; q++) {
+                    const float4 t = *(const float4 *)(vsrc + q * 4u);
+                    values[q * 4u + 0u] = t.x;
+                    values[q * 4u + 1u] = t.y;
+                    values[q * 4u + 2u] = t.z;
+                    values[q * 4u + 3u] = t.w;
+                }
+            } else {
+                const float2 t = *(const float2 *)vsrc;
+                values[0] = t.x;
+                values[1] = t.y;
+            }
         }
 #pragma unroll
         for (unsigned r = 0; r < R; r++) {
             const uint32_t value = value0 + r;
             const float v_row = Vector
-                ? (r == 0u ? values.x : r == 1u ? values.y : r == 2u ? values.z : values.w)
+                ? values[Vector ? r : 0u]
                 : qkv[slot * conv_dim + 2u * (uint64_t)key_dim +
                 head * QWEN4EXP_GDN_DIM + value];
             h[r].x *= g;
@@ -946,8 +1012,10 @@ static int qwen4exp_cuda_gdn_run(
         if (n_key_head == 16u && n_value_head == 48u &&
             getenv("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE") == NULL) {
             if (getenv("DS4_QWEN4EXP_NO_GDN_VALUE_VECTOR") == NULL) {
-                qwen4exp_gdn_value_reuse_kernel<4u, true><<<
-                        dim3(n_value_head, QWEN4EXP_GDN_DIM / 16u, n_rows), QWEN4EXP_GDN_DIM, 0, stream>>>(
+                qwen4exp_gdn_value_reuse_kernel<QWEN4EXP_GDN_VALUE_ROWS, true><<<
+                        dim3(n_value_head,
+                             QWEN4EXP_GDN_DIM / (4u * QWEN4EXP_GDN_VALUE_ROWS),
+                             n_rows), QWEN4EXP_GDN_DIM, 0, stream>>>(
                         (float *)out->ptr, (float *)recurrent_state->ptr, conv_out,
                         (const float *)raw_alpha->ptr,
                         (const float *)raw_beta->ptr, a_log, dt_bias,
@@ -957,8 +1025,10 @@ static int qwen4exp_cuda_gdn_run(
                         n_snapshot_rows,
                         getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
             } else {
-                qwen4exp_gdn_value_reuse_kernel<4u><<<
-                        dim3(n_value_head, QWEN4EXP_GDN_DIM / 16u, n_rows), QWEN4EXP_GDN_DIM, 0, stream>>>(
+                qwen4exp_gdn_value_reuse_kernel<QWEN4EXP_GDN_VALUE_ROWS><<<
+                        dim3(n_value_head,
+                             QWEN4EXP_GDN_DIM / (4u * QWEN4EXP_GDN_VALUE_ROWS),
+                             n_rows), QWEN4EXP_GDN_DIM, 0, stream>>>(
                         (float *)out->ptr, (float *)recurrent_state->ptr, conv_out,
                         (const float *)raw_alpha->ptr,
                         (const float *)raw_beta->ptr, a_log, dt_bias,
