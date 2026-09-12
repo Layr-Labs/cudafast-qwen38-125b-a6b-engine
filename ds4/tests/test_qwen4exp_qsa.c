@@ -475,6 +475,9 @@ static const segment SEGMENTS[] = {
     { 2048, 1024 },
     { 3072, 64 },
     { 3136, 1 },
+    /* A ragged prefill width, past the budget so it also selects: the
+     * second-cut group kernel's partial tile and its sparse key list. */
+    { 3137, 1017 },
 };
 static const uint32_t N_SEGMENTS = (uint32_t)(sizeof(SEGMENTS) / sizeof(SEGMENTS[0]));
 
@@ -485,9 +488,9 @@ typedef struct {
     float *idx_q_norm_w;
     float *idx_k_norm_w;
     /* Per-segment fused projections and indexer projections. */
-    float *fused[5];
-    float *idx_q[5];
-    float *idx_k[5];
+    float *fused[8];
+    float *idx_q[8];
+    float *idx_k[8];
 } inputs;
 
 static void inputs_build(inputs *in) {
@@ -1088,6 +1091,28 @@ int main(void) {
     }
     printf("  %-38s %zu values bit-exact against the per-head kernel\n",
            "head-group attention", attn_len);
+
+    /* The first-cut group kernel (DS4_QWEN4EXP_NO_QSA_GROUP2) against the
+     * same per-head bytes, so both group kernels stand checked whichever
+     * one the dispatch takes. */
+    float *grouped1 = xcalloc(attn_len, sizeof(float));
+    setenv("DS4_QWEN4EXP_NO_QSA_GROUP2", "1", 1);
+    run_pipeline(&in, false, grouped1);
+    unsetenv("DS4_QWEN4EXP_NO_QSA_GROUP2");
+    if (memcmp(first, grouped1, attn_len * sizeof(float)) != 0) {
+        size_t differing = 0, at = 0;
+        for (size_t i = 0; i < attn_len; i++) {
+            if (first[i] != grouped1[i]) { if (differing == 0) at = i; differing++; }
+        }
+        fprintf(stderr,
+                "test_qwen4exp_qsa: first-cut head-group attention is not bit-exact: "
+                "%zu of %zu values differ, first at %zu: %.9g vs %.9g\n",
+                differing, attn_len, at, (double)first[at], (double)grouped1[at]);
+        return 1;
+    }
+    printf("  %-38s %zu values bit-exact against the second cut\n",
+           "first-cut head-group attention", attn_len);
+    free(grouped1);
 
     check_split_path();
 

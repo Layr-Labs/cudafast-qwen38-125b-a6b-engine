@@ -1,5 +1,7 @@
 /* Original BF16 arithmetic on one full grid: complete outputs and replay. */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "ds4_gpu.h"
 #include <stdint.h>
 #include <stdio.h>
@@ -82,7 +84,7 @@ static void check_shape(unsigned in,unsigned out,unsigned offset){
  must(memcmp(got,ref[0],yb)==0,"adjacent whole output and tail");
  must(ds4_gpu_tensor_read(ax,0,got,xb),"adjacent input read");must(memcmp(got,xh[0],xb)==0,"adjacent input immutable");
  free(got);ds4_gpu_tensor_free(ax);ds4_gpu_tensor_free(ay);ds4_gpu_tensor_free(adj);
- const unsigned widths[]={1,2,7,8,9,16,64,1024};const float scales[]={.2f,1e-20f,8.0f,0.0f};
+ const unsigned widths[]={1,2,7,8,9,16,64,1017,1024};const float scales[]={.2f,1e-20f,8.0f,0.0f};
  unsigned eager=0,captured=0,replayed=0;
  for(unsigned wi=0;wi<sizeof(widths)/sizeof(widths[0]);wi++){
   unsigned rows=widths[wi];ds4_gpu_decode_graphs_invalidate();ds4_decode_graph_key keys[MODES]={{.il=1},{.il=2}};

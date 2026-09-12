@@ -6337,6 +6337,16 @@ __device__ __forceinline__ static uint4 q8_mma_ldg_16(const void *gmem) {
     return v;
 }
 
+/* Streaming (L2-only) load for the activations, which this block never
+ * re-reads: keeps L1 for the weight windows, whose lines carry over from
+ * one stage to the next (measured 1-3% at the prefill shapes). */
+__device__ __forceinline__ static uint4 q8_mma_ldg_16_cg(const void *gmem) {
+    uint4 v;
+    asm volatile("ld.global.cg.v4.u32 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(gmem));
+    return v;
+}
+
 __device__ __forceinline__ static uint32_t q8_mma_ldg_4(const void *gmem) {
     uint32_t v;
     asm volatile("ld.global.u32 %0, [%1];" : "=r"(v) : "l"(gmem));
@@ -6517,7 +6527,7 @@ matmul_q8_0_preq_rows_mma_pipe_kernel(float *out,
                 const uint64_t row = (uint64_t)m0 + (uint32_t)r;
                 ra[k] = make_uint4(0u, 0u, 0u, 0u);
                 if (idx < BM * C::A_CHUNKS && row < (uint64_t)n_rows) {
-                    ra[k] = q8_mma_ldg_16(xq + (row * blocks + g0 + (uint32_t)(c >> 1)) * 32u + (c & 1) * 16);
+                    ra[k] = q8_mma_ldg_16_cg(xq + (row * blocks + g0 + (uint32_t)(c >> 1)) * 32u + (c & 1) * 16);
                 }
             }
 #pragma unroll
@@ -6528,7 +6538,7 @@ matmul_q8_0_preq_rows_mma_pipe_kernel(float *out,
                 const uint64_t row = (uint64_t)m0 + (uint32_t)r;
                 rs[k] = make_uint4(0u, 0u, 0u, 0u);
                 if (idx < BM * (G / 4) && row < (uint64_t)n_rows) {
-                    rs[k] = q8_mma_ldg_16(xscale + row * blocks + g0 + (uint32_t)c * 4u);
+                    rs[k] = q8_mma_ldg_16_cg(xscale + row * blocks + g0 + (uint32_t)c * 4u);
                 }
             }
 #pragma unroll
@@ -30255,6 +30265,85 @@ __global__ static void glm53_matvec_bf16_f32_kernel(
     }
 }
 
+/* glm53_matvec_bf16_f32_kernel as a register tile, for the prefill widths.
+ *
+ * The one-output warp above walks lane + 32m for m ascending in one fmaf
+ * chain from 0.0f and folds the 32 chains with warp_sum_f32.  A warp here
+ * holds TM rows by TN columns of outputs and walks the SAME chain for each:
+ * at step m it loads the TN weight words and TM activation words at
+ * lane + 32m once and issues TM*TN fmafs into TM*TN accumulators, each of
+ * which sees exactly the sequence its one-output twin saw -- w ascending,
+ * the same fmaf (one rounding) from the same 0.0f -- and then the same
+ * warp_sum_f32 butterfly.  Only the number of times a word is fetched
+ * changes: an activation row is read once per TN columns instead of once
+ * per column, a weight row once per TM rows instead of once per row.
+ * Rows past `take` re-read row0 and are not stored; a column tile past
+ * out_dim is skipped by the whole warp. */
+template <int TM, int TN>
+__global__ __launch_bounds__(256)
+static void glm53_matvec_bf16_f32_tile_kernel(
+        float *out,
+        const uint16_t *weights,
+        const float *x,
+        uint32_t in_dim,
+        uint32_t out_dim,
+        uint32_t n_rows) {
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t col0 = (blockIdx.x * 8u + warp) * (uint32_t)TN;
+    const uint32_t row0 = blockIdx.y * (uint32_t)TM;
+    if (col0 >= out_dim || row0 >= n_rows) return;
+    const uint32_t take = n_rows - row0 < (uint32_t)TM ? n_rows - row0
+                                                       : (uint32_t)TM;
+    const uint16_t *wr[TN];
+    const float *xr[TM];
+#pragma unroll
+    for (int c = 0; c < TN; c++) {
+        const uint32_t col = col0 + (uint32_t)c < out_dim ? col0 + (uint32_t)c : col0;
+        wr[c] = weights + (uint64_t)col * in_dim;
+    }
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+        xr[t] = x + (uint64_t)(row0 + (t < (int)take ? (uint32_t)t : 0u)) * in_dim;
+
+    float sum[TM][TN];
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int c = 0; c < TN; c++) sum[t][c] = 0.0f;
+    for (uint32_t i = lane; i < in_dim; i += 32u) {
+        float w[TN], xv[TM];
+#pragma unroll
+        for (int c = 0; c < TN; c++) w[c] = __uint_as_float((uint32_t)wr[c][i] << 16);
+#pragma unroll
+        for (int t = 0; t < TM; t++) xv[t] = xr[t][i];
+#pragma unroll
+        for (int t = 0; t < TM; t++)
+#pragma unroll
+            for (int c = 0; c < TN; c++) sum[t][c] = fmaf(w[c], xv[t], sum[t][c]);
+    }
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int c = 0; c < TN; c++) sum[t][c] = warp_sum_f32(sum[t][c]);
+    if (lane == 0u) {
+#pragma unroll
+        for (int t = 0; t < TM; t++) {
+            if ((uint32_t)t >= take) continue;
+#pragma unroll
+            for (int c = 0; c < TN; c++) {
+                if (col0 + (uint32_t)c < out_dim) {
+                    out[(uint64_t)(row0 + (uint32_t)t) * out_dim +
+                        (uint64_t)(col0 + (uint32_t)c)] = sum[t][c];
+                }
+            }
+        }
+    }
+}
+
+#define DS4_BF16_TILE_TM 4
+#define DS4_BF16_TILE_TN 8
+
 /* Qwen prefill needs the float-input decode tree at every row count. Use the
  * original matvec kernel on one row grid rather than issuing eight-row chunks. */
 extern "C" int ds4_gpu_qwen4exp_bf16_prefill_exact_tensor(
@@ -30271,6 +30360,17 @@ extern "C" int ds4_gpu_qwen4exp_bf16_prefill_exact_tensor(
     if (tier<0 || tier>=g_n_gpus || ds4_tensor_device_idx(x)!=tier) return 0;
     const char *weights=cuda_resolve_weight_ptr(map,off,wb,tier,"Qwen BF16 exact prefill");
     if (!weights || ((uintptr_t)weights&1u)) return 0;
+    /* The register tile at eight rows and up (the decode widths never reach
+     * this entry); DS4_QWEN4EXP_NO_BF16_TILE keeps the one-output warp. */
+    if (rows >= 8u && getenv("DS4_QWEN4EXP_NO_BF16_TILE") == NULL) {
+        const unsigned ctiles = (out_dim + DS4_BF16_TILE_TN - 1u) / DS4_BF16_TILE_TN;
+        const dim3 tgrid((ctiles + 7u) / 8u, (rows + DS4_BF16_TILE_TM - 1u) / DS4_BF16_TILE_TM, 1u);
+        glm53_matvec_bf16_f32_tile_kernel<DS4_BF16_TILE_TM, DS4_BF16_TILE_TN>
+            <<<tgrid, 256u, 0, cuda_decode_stream()>>>(
+                (float *)out->ptr, (const uint16_t *)weights, (const float *)x->ptr,
+                in_dim, out_dim, rows);
+        return cuda_ok(cudaGetLastError(), "Qwen BF16 exact prefill tile launch");
+    }
     const dim3 grid((out_dim+7u)/8u,rows,1u);
     glm53_matvec_bf16_f32_kernel<<<grid,256u,0,cuda_decode_stream()>>>(
         (float *)out->ptr,(const uint16_t *)weights,(const float *)x->ptr,in_dim,out_dim);
