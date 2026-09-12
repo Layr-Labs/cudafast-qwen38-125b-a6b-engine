@@ -1625,6 +1625,21 @@ __global__ static void qwen4exp_quantize_rows_kernel(
         int8_t *xq, float *xscale, int32_t *xsum,
         const float *x, uint32_t width, uint32_t groups,
         uint64_t outer_stride, uint64_t inner_stride, uint32_t inner_count) {
+    /* PDL producer for the shared down projection that follows the mid
+     * quantization on the stream (and, on the routed path, for whatever PSS
+     * consumer ever follows one of this kernel's other launches -- today
+     * none does, and the trigger fires into nothing there).  The grid is
+     * (groups, rows) 32-thread blocks, so the gate bounds BOTH the rows and
+     * the block count the device holds at once: 1536 is one wave of
+     * 32-thread blocks on the 48-SM GB10 (48 SMs x 32 block slots).  The
+     * worst in-model grid inside the gate is the routed mid quantizer's 320
+     * blocks; a prefill launch, or a public caller at a wider input, exceeds
+     * the bound and never triggers (the deadlock rule,
+     * ds4_cuda_qwen4exp.cuh).  The gate reads the grid in the body, not a
+     * convention at the launch sites, per the header's rule. */
+    if (gridDim.y <= 2u &&
+        (uint64_t)gridDim.x * (uint64_t)gridDim.y <= 768u)
+        QWEN4EXP_PDL_TRIGGER();
     const uint32_t g = blockIdx.x;
     const uint32_t r = blockIdx.y;
     if (g >= groups) return;
@@ -3351,7 +3366,46 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
 #pragma unroll
     for (int r = 0; r < R; r++) { ag[r] = 0.0f; au[r] = 0.0f; }
 
-    for (uint32_t g = lane; g < groups; g += 32u) {
+    /* PDL: the first walk step (g = lane) with its WEIGHT loads -- both group
+     * decodes read only the gate/up rows, fixed single-expert slabs whose
+     * addresses are launch math -- issued above the fence and held in
+     * registers, so they fly while the sigmoid gate drains.  The activation
+     * reads (xq/xs/xsum, the quantized input) stay below it; every statement
+     * is the loop's own, g ascends exactly as the rolled walk did, and the
+     * guard is the loop's own bounds check for a walk a lane does not start.
+     * The walk's remainder runs unchanged from lane + 32. */
+    if (lane < groups) {
+        const uint32_t g = lane;
+        int8_t gw[32], uw[32];
+        float ga[2], gb[2], ua[2], ub[2];
+        int gh = 1, uh = 1;
+        dev_qwen4exp_group_decode(
+                GateType < 0 ? gate_type : (uint32_t)GateType,
+                gate_row, g, gw, ga, gb, &gh);
+        dev_qwen4exp_group_decode(
+                UpType < 0 ? up_type : (uint32_t)UpType,
+                up_row, g, uw, ua, ub, &uh);
+        QWEN4EXP_PDL_SYNC();
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            if ((uint32_t)r < take) {
+                const uint64_t at_g = (uint64_t)(tok0 + (uint32_t)r) * groups + g;
+                const int8_t *xqg = xq + at_g * 32u;
+                const float sc = xs[at_g];
+                const int32_t sm = xsum[at_g];
+                if constexpr (Vector) {
+                    qwen4exp_shared_vector_accumulate(&ag[r], gw, ga[0], gb[0],
+                                                      xqg, sc, sm);
+                    qwen4exp_shared_vector_accumulate(&au[r], uw, ua[0], ub[0],
+                                                      xqg, sc, sm);
+                } else {
+                    qwen4exp_group_accumulate(&ag[r], gw, ga, gb, gh, xqg, sc, sm);
+                    qwen4exp_group_accumulate(&au[r], uw, ua, ub, uh, xqg, sc, sm);
+                }
+            }
+        }
+    }
+    for (uint32_t g = lane + 32u; g < groups; g += 32u) {
         int8_t gw[32], uw[32];
         float ga[2], gb[2], ua[2], ub[2];
         int gh = 1, uh = 1;
@@ -3417,7 +3471,40 @@ __global__ static void qwen4exp_shared_down_q_kernel(
 #pragma unroll
     for (int r = 0; r < R; r++) acc[r] = 0.0f;
 
-    for (uint32_t g = lane; g < groups; g += 32u) {
+    /* PDL: the first walk step (g = lane) with its WEIGHT loads -- the group
+     * decode reads only the down row, a fixed single-expert slab addressed
+     * by launch math, no expert indirection in this kernel -- issued above
+     * the fence and held in registers, so they fly while the mid quantizer
+     * drains.  The activation reads (mq/ms/msum, that kernel's output) and
+     * the accumulation stay below it; every statement is the loop's own, g
+     * ascends exactly as the rolled walk did, and the guard is the loop's
+     * own bounds check -- load-bearing here, the shared mid being twenty
+     * groups wide against a thirty-two lane warp.  The walk's remainder runs
+     * unchanged from lane + 32. */
+    if (lane < groups) {
+        const uint32_t g = lane;
+        int8_t wq[32];
+        float wa[2], wb[2];
+        int halves = 1;
+        dev_qwen4exp_group_decode(
+                DownType < 0 ? down_type : (uint32_t)DownType,
+                down_row, g, wq, wa, wb, &halves);
+        QWEN4EXP_PDL_SYNC();
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            if ((uint32_t)r < take) {
+                const uint64_t at_g = (uint64_t)(tok0 + (uint32_t)r) * groups + g;
+                if constexpr (Vector) {
+                    qwen4exp_shared_vector_accumulate(&acc[r], wq, wa[0], wb[0],
+                                                      mq + at_g * 32u, ms[at_g], msum[at_g]);
+                } else {
+                    qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves,
+                                              mq + at_g * 32u, ms[at_g], msum[at_g]);
+                }
+            }
+        }
+    }
+    for (uint32_t g = lane + 32u; g < groups; g += 32u) {
         int8_t wq[32];
         float wa[2], wb[2];
         int halves = 1;
@@ -4616,6 +4703,13 @@ __global__ static void qwen4exp_shared_gate_kernel(
         uint32_t router_type,
         uint32_t in_dim,
         uint32_t n_tokens) {
+    /* PDL producer for the shared gate/up projection that follows on the
+     * stream.  Grid is n_tokens blocks -- one or two at the decode widths,
+     * fewer blocks than the device has SMs, so the launch is single-wave by
+     * construction.  Row-gated to the same <= 2 the converted launch site
+     * fires at: a prefill launch runs to a thousand blocks and never carries
+     * a trigger (the deadlock rule, ds4_cuda_qwen4exp.cuh). */
+    if (n_tokens <= 2u) QWEN4EXP_PDL_TRIGGER();
     extern __shared__ float ds4_qwen4exp_smem[];
     const uint32_t token = blockIdx.x;
     if (token >= n_tokens) return;
@@ -5430,12 +5524,28 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
                 gate_slab->row_bytes, up_slab->row_bytes,
                 gate_slab->type, up_slab->type, xgroups, mid_dim, n_tokens);
     } else {
-#define QWEN4EXP_SH_GATEUP_IMPL(R, GT, UT, V) \
-    qwen4exp_shared_gateup_q_kernel<R, GT, UT, V> \
-        <<<dim3((mid_dim + 7u) / 8u, tiles, 1), threads, 0, stream>>>( \
-            (float *)mid->ptr, gate, up, xq, xs, xsum, \
-            gate_slab->row_bytes, up_slab->row_bytes, \
-            gate_slab->type, up_slab->type, xgroups, mid_dim, n_tokens)
+/* PDL consumer at the decode widths only (n_tokens <= 2): the stream
+ * predecessor is qwen4exp_shared_gate_kernel -- or, when this entry
+ * quantizes the input itself, that quantizer, which triggers too -- and the
+ * kernel's weight-group prefetch rides that window
+ * (ds4_cuda_qwen4exp.cuh).  Verify and prefill keep the plain launch. */
+#define QWEN4EXP_SH_GATEUP_IMPL(R, GT, UT, V) do { \
+    if (n_tokens <= 2u) { \
+        QWEN4EXP_LAUNCH_PDL( \
+                (qwen4exp_shared_gateup_q_kernel<R, GT, UT, V>), \
+                (dim3((mid_dim + 7u) / 8u, tiles, 1)), \
+                threads, 0, stream, \
+                (float *)mid->ptr, gate, up, xq, xs, xsum, \
+                gate_slab->row_bytes, up_slab->row_bytes, \
+                gate_slab->type, up_slab->type, xgroups, mid_dim, n_tokens); \
+    } else { \
+        qwen4exp_shared_gateup_q_kernel<R, GT, UT, V> \
+            <<<dim3((mid_dim + 7u) / 8u, tiles, 1), threads, 0, stream>>>( \
+                    (float *)mid->ptr, gate, up, xq, xs, xsum, \
+                    gate_slab->row_bytes, up_slab->row_bytes, \
+                    gate_slab->type, up_slab->type, xgroups, mid_dim, n_tokens); \
+    } \
+} while (0)
 #define QWEN4EXP_SH_GATEUP(R) do { \
     if (specialize_shared && \
         gate_slab->type == DS4_QWEN4EXP_TY_q8_0 && \
@@ -5494,12 +5604,28 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
                 (const float *)gate_scale->ptr, down_slab->row_bytes,
                 down_slab->type, mgroups, out_dim, n_tokens);
     } else {
-#define QWEN4EXP_SH_DOWN_IMPL(R, DT, V) \
-    qwen4exp_shared_down_q_kernel<R, DT, V> \
-        <<<dim3((out_dim + 7u) / 8u, tiles, 1), threads, 0, stream>>>( \
-            (float *)out->ptr, down, mq, ms, msum, \
-            (const float *)gate_scale->ptr, down_slab->row_bytes, \
-            down_slab->type, mgroups, out_dim, n_tokens)
+/* PDL consumer at the decode widths only (n_tokens <= 2): the stream
+ * predecessor is the mid quantizer qwen4exp_quantize_rows_kernel, which
+ * triggers inside its grid bound at those widths, and the kernel's
+ * weight-group prefetch rides that window (ds4_cuda_qwen4exp.cuh).  Verify
+ * and prefill keep the plain launch. */
+#define QWEN4EXP_SH_DOWN_IMPL(R, DT, V) do { \
+    if (n_tokens <= 2u) { \
+        QWEN4EXP_LAUNCH_PDL( \
+                (qwen4exp_shared_down_q_kernel<R, DT, V>), \
+                (dim3((out_dim + 7u) / 8u, tiles, 1)), \
+                threads, 0, stream, \
+                (float *)out->ptr, down, mq, ms, msum, \
+                (const float *)gate_scale->ptr, down_slab->row_bytes, \
+                down_slab->type, mgroups, out_dim, n_tokens); \
+    } else { \
+        qwen4exp_shared_down_q_kernel<R, DT, V> \
+            <<<dim3((out_dim + 7u) / 8u, tiles, 1), threads, 0, stream>>>( \
+                    (float *)out->ptr, down, mq, ms, msum, \
+                    (const float *)gate_scale->ptr, down_slab->row_bytes, \
+                    down_slab->type, mgroups, out_dim, n_tokens); \
+    } \
+} while (0)
 #define QWEN4EXP_SH_DOWN(R) do { \
     if (specialize_shared && down_slab->type == DS4_QWEN4EXP_TY_q8_0) { \
         if (vector_shared && (((uintptr_t)mq & 15u) == 0u)) { \
@@ -5708,6 +5834,14 @@ __global__ static void qwen4exp_hc_inject_kernel(
         float *out, const float *residual, const float *block,
         const float *inject, uint32_t n_embd, uint32_t n_hc,
         uint32_t n_tokens) {
+    /* PDL producer for the FFN stream norm that follows on the stream (the
+     * next slice's first kernel reads `out`).  Grid is (n_embd/256, n_hc,
+     * n_tokens) -- 10*4*2 blocks at the two-row decode, eighty of the 288
+     * 256-thread block slots the 48-SM device holds, single-wave by
+     * construction.  Row-gated to the same <= 2 the converted launch site
+     * fires at: a verify or prefill launch never carries a trigger (the
+     * deadlock rule, ds4_cuda_qwen4exp.cuh). */
+    if (n_tokens <= 2u) QWEN4EXP_PDL_TRIGGER();
     const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t h = blockIdx.y;
     const uint32_t t = blockIdx.z;
@@ -6017,6 +6151,14 @@ __global__ static void qwen4exp_hc_norm_quant_kernel(
         const float *x, const float *w,
         uint32_t n, uint32_t group, uint32_t rows,
         float eps, float weight_bias, int round_bf16) {
+    /* PDL producer for the down projection that follows on the stream.
+     * Triggered at the two-row decode only, row-gated to the same <= 2 the
+     * converted launch sites fire at: grid is (n_hc, rows), 4*2 blocks --
+     * fewer blocks than the device has SMs, so the launch is single-wave by
+     * construction.  A verify or prefill width never carries a trigger:
+     * no PSS consumer follows one there, and its grid need not be one wave
+     * (the deadlock rule, ds4_cuda_qwen4exp.cuh). */
+    if (rows <= 2u) QWEN4EXP_PDL_TRIGGER();
     const uint32_t g = blockIdx.x;
     const uint32_t row = blockIdx.y;
     if (row >= rows) return;
@@ -6024,6 +6166,28 @@ __global__ static void qwen4exp_hc_norm_quant_kernel(
     const uint64_t base = (uint64_t)row * n + (uint64_t)g * group;
     const float *xg = x + base;
     const float *wg = w + (uint64_t)g * group;
+
+    /* PDL consumer (attention inject -> this kernel) AND producer (this
+     * kernel -> the down pair) at once: the normw WEIGHT reads for the
+     * block's channel range -- pure index math from blockIdx, the staged
+     * arm's own statement -- are issued above the fence and held in
+     * registers, so they fly while the inject drains.  The hyper reads (xg,
+     * the inject's output), the scale they reduce to and everything derived
+     * from either stay below the fence; the walk consumes wv[k] in the same
+     * ascending k from the same addresses, so only the loads moved.  The
+     * trigger above stays ahead of the fence so the down pair's window opens
+     * at the top of this kernel while it waits (the both-ways rule,
+     * ds4_cuda_qwen4exp.cuh).  The rolled <0> arm stages nothing: its
+     * geometry is not fixed to STEPS * QWEN4EXP_HC_THREADS, so its walk is
+     * untouched and the array below is one dead float. */
+    float wv[Staged ? QWEN4EXP_HC_STAGED_STEPS : 1u];
+    if (Staged) {
+#pragma unroll
+        for (uint32_t s = 0; s < QWEN4EXP_HC_STAGED_STEPS; s++) {
+            wv[s] = wg[s * QWEN4EXP_HC_THREADS + threadIdx.x];
+        }
+    }
+    QWEN4EXP_PDL_SYNC();
 
     __shared__ float partial[QWEN4EXP_HC_THREADS];
     const float scale = Staged
@@ -6038,16 +6202,14 @@ __global__ static void qwen4exp_hc_norm_quant_kernel(
     const uint64_t blk0 = (uint64_t)row * row_blocks + (uint64_t)g * (group / 32u);
 
     if (Staged) {
-        /* The quantize walk's ten (value, weight) pairs staged in registers,
-         * then the seam below on them: lane k of step s owns flat index
+        /* The quantize walk's ten values staged in registers, then the seam
+         * below on them: lane k of step s owns flat index
          * s*blockDim.x + warp*32 + lane, exactly the rolled walk's step s,
          * so the butterfly's lanes and the store's pairs are unchanged. */
         float xv[QWEN4EXP_HC_STAGED_STEPS];
-        float wv[QWEN4EXP_HC_STAGED_STEPS];
 #pragma unroll
         for (uint32_t s = 0; s < QWEN4EXP_HC_STAGED_STEPS; s++) {
             xv[s] = xg[s * QWEN4EXP_HC_THREADS + threadIdx.x];
-            wv[s] = wg[s * QWEN4EXP_HC_THREADS + threadIdx.x];
         }
 #pragma unroll
         for (uint32_t k = 0; k < QWEN4EXP_HC_STAGED_STEPS; k++) {
@@ -6110,6 +6272,14 @@ __global__ static void qwen4exp_hc_mix_renorm_kernel(
         const float *normw, const float *wide,
         uint32_t n_embd, uint32_t n_hc, uint32_t n_tokens,
         float weight_bias, int round_bf16) {
+    /* PDL producer for the router GEMV that follows on the stream (the MoE
+     * block's first op reads `out`).  Grid is (n_embd/blockDim.x, n_tokens)
+     * -- 10*2 blocks at the two-row decode.  Triggered at the two-row decode
+     * only, row-gated to the same <= 2 the converted launch sites fire at:
+     * 20 blocks is fewer than the device has SMs, so the launch is
+     * single-wave by construction; a verify or prefill width never carries
+     * a trigger (the deadlock rule, ds4_cuda_qwen4exp.cuh). */
+    if (n_tokens <= 2u) QWEN4EXP_PDL_TRIGGER();
     const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t t = blockIdx.y;
     if (d >= n_embd || t >= n_tokens) return;
@@ -6245,6 +6415,14 @@ __global__ static void qwen4exp_hc_mix_inject_dual_kernel(
         uint32_t n_embd, uint32_t n_hc, uint32_t rows,
         float weight_bias, int round_bf16,
         uint32_t weight_type, uint32_t weight_row_bytes) {
+    /* PDL producer: the decode arm of the mix that closes the mixer, so the
+     * router GEMV behind it launches at its top.  Grid is (mix_blocks +
+     * n_hc, rows) -- 14*2 blocks at the two-row decode.  Triggered at the
+     * two-row decode only, row-gated to the same <= 2 the converted launch
+     * sites fire at: 28 blocks is fewer than the device has SMs, so the
+     * launch is single-wave by construction; a verify or prefill width never
+     * carries a trigger (the deadlock rule, ds4_cuda_qwen4exp.cuh). */
+    if (rows <= 2u) QWEN4EXP_PDL_TRIGGER();
     const uint32_t mix_blocks = (n_embd + 255u) / 256u;
     if (blockIdx.x < mix_blocks) {
         float *out = mixed;
@@ -6350,6 +6528,12 @@ __global__ static void qwen4exp_hc_mix_inject_renorm_kernel(
         uint32_t n_embd, uint32_t n_hc, uint32_t rows,
         float weight_bias, int round_bf16,
         uint32_t weight_type, uint32_t weight_row_bytes) {
+    /* PDL producer, as the dual above: one block per token, so this arm runs
+     * at the row threshold only and never ahead of a PSS consumer.  The row
+     * gate makes that structural rather than a caller convention: the
+     * threshold's widths never fire the trigger at all (the deadlock rule,
+     * ds4_cuda_qwen4exp.cuh). */
+    if (rows <= 2u) QWEN4EXP_PDL_TRIGGER();
     extern __shared__ float smix[];
     const uint32_t t = blockIdx.x;
     if (t >= rows) return;
@@ -6497,6 +6681,15 @@ static int qwen4exp_hc_staged_ok(uint32_t n_embd, uint32_t n_hc) {
 __global__ static void qwen4exp_hc_silu_quant_kernel(
         float *lowrank, int8_t *xq, float *xscale,
         uint64_t pairs, float scale) {
+    /* PDL producer for the up projection that follows on the stream.  Grid
+     * is ceil(pairs/8) -- three blocks at the two-row decode.  This kernel
+     * counts pairs, not rows, so the row gate is stated in its own unit:
+     * 20 pairs IS the two-row decode (2 rows x 10 Q8 groups, n_lowrank 320
+     * / 32), the width up to which the up-projection consumers fire, and
+     * three blocks is single-wave by construction.  A verify or prefill
+     * width never carries a trigger (the deadlock rule,
+     * ds4_cuda_qwen4exp.cuh). */
+    if (pairs <= 20u) QWEN4EXP_PDL_TRIGGER();
     const uint64_t pair = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
     if (pair >= pairs) return;
     const uint32_t lane = threadIdx.x & 31u;
@@ -6763,6 +6956,12 @@ __global__ static void qwen4exp_hc_norm_quant_inject_kernel(
         uint32_t group, uint32_t n_hc, uint32_t rows,
         float eps, float weight_bias, int round_bf16,
         uint32_t weight_type, uint32_t weight_row_bytes) {
+    /* PDL producer, as the per-stream norm above; this arm runs at the row
+     * threshold only, where the projection behind it is the plain MMA tile.
+     * The row gate makes that structural rather than a caller convention:
+     * the threshold's widths never fire the trigger at all (the deadlock
+     * rule, ds4_cuda_qwen4exp.cuh). */
+    if (rows <= 2u) QWEN4EXP_PDL_TRIGGER();
     const uint32_t row = blockIdx.x;
     if (row >= rows) return;
 
@@ -6970,10 +7169,26 @@ static int qwen4exp_hc_mixer_fused_cuda(
                 eps, weight_bias, round_bf16, inject_weight->type,
                 (uint32_t)iw_row_bytes);
     } else if (staged) {
-        qwen4exp_hc_norm_quant_kernel<1><<<dim3(n_hc, rows, 1u), threads, 0,
-                                        cuda_decode_stream()>>>(
-                xq, xscale, nscale, (const float *)hyper->ptr, normw,
-                (uint32_t)wide, n_embd, rows, eps, weight_bias, round_bf16);
+        /* PDL consumer at the decode widths only (rows <= 2): the stream
+         * predecessor is the attention inject qwen4exp_hc_inject_kernel,
+         * which triggers at its top, and the kernel's normw prefetch rides
+         * that window (ds4_cuda_qwen4exp.cuh).  Verify and prefill keep the
+         * plain launch. */
+        if (rows <= 2u) {
+            QWEN4EXP_LAUNCH_PDL(
+                    (qwen4exp_hc_norm_quant_kernel<1>),
+                    (dim3(n_hc, rows, 1u)), threads, 0,
+                    cuda_decode_stream(),
+                    xq, xscale, nscale, (const float *)hyper->ptr, normw,
+                    (uint32_t)wide, n_embd, rows, eps, weight_bias,
+                    round_bf16);
+        } else {
+            qwen4exp_hc_norm_quant_kernel<1><<<dim3(n_hc, rows, 1u), threads, 0,
+                                            cuda_decode_stream()>>>(
+                    xq, xscale, nscale, (const float *)hyper->ptr, normw,
+                    (uint32_t)wide, n_embd, rows, eps, weight_bias,
+                    round_bf16);
+        }
     } else {
         qwen4exp_hc_norm_quant_kernel<0><<<dim3(n_hc, rows, 1u), threads, 0,
                                         cuda_decode_stream()>>>(
