@@ -1,5 +1,6 @@
 /* Complete MoE comparison for the gate/up pair scheduler, including graph
  * replays, output guards, invalid routes and the shared-scratch growth seam.
+ * Pass --down to compare only down scheduling, keeping gate/up tasks on.
  * Synthetic weights only. Build against the normal CUDA library:
  * cc -O2 -std=c11 -D_GNU_SOURCE -Ids4 ds4/tests/test_qwen4exp_moe_pair_tasks.c \
  *   -L.build/ds4 -lds4qwen -lm -o /tmp/test-moe-pair-tasks
@@ -143,7 +144,11 @@ static void check_case(unsigned gt, unsigned dt, unsigned experts, unsigned alig
     printf("MoE pair tasks gt=%u dt=%u experts=%u offset=%u PASS\n",gt,dt,experts,64+alignment); fflush(stdout);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], "--down") == 0) {
+        disable = "DS4_QWEN4EXP_NO_DOWN_PAIR_TASKS";
+        require(unsetenv("DS4_QWEN4EXP_NO_GU_PAIR_TASKS") == 0, "enable gate/up tasks");
+    } else require(argc == 1, "usage: test-moe-pair-tasks [--down]");
     require(setenv("DS4_CUDA_COPY_MODEL","1",1) == 0 && setenv("DS4_CUDA_DECODE_GRAPHS","1",1) == 0, "test environment");
     const unsigned types[][2] = {{12,7},{13,8},{8,8},{12,14},{14,7}};
     for (unsigned t = 0; t < sizeof(types)/sizeof(types[0]); t++)

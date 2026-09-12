@@ -2796,7 +2796,7 @@ qwen4exp_moe_gateup_mma_kernel(
  * The activation is the routed intermediate, quantised per (token, slot) pair,
  * so the pair index addresses it directly.
  */
-template <int DownType = -1>
+template <int DownType = -1, bool PairTasks = false>
 __global__ __launch_bounds__(QW_DOWN_MMA_THREADS) static void
 qwen4exp_moe_down_mma_kernel(
         float *partial,
@@ -2826,14 +2826,16 @@ qwen4exp_moe_down_mma_kernel(
     const uint32_t row0 = blockIdx.x * QW_DOWN_MMA_BM;
     if (row0 >= out_dim) return;
     if (active && (int32_t)blockIdx.y >= active[0]) return;
-    const uint32_t expert = active ? (uint32_t)active[1 + blockIdx.y]
-                                   : blockIdx.y;
+    const uint32_t expert = active
+        ? (uint32_t)active[1 + (PairTasks ? 2u : 1u) * blockIdx.y] : blockIdx.y;
     const int32_t cnt = counts[expert];
     if (cnt <= 0) return;
     const int32_t base = offsets[expert];
     const char *down_e = down + (uint64_t)expert * down_expert_bytes;
 
-    for (int32_t nbase = 0; nbase < cnt; nbase += QW_MMA_BN) {
+    const int32_t first_pair = PairTasks ? active[2u + 2u * blockIdx.y] : 0;
+    const int32_t end_pair = PairTasks ? min(cnt, first_pair + QW_MMA_BN) : cnt;
+    for (int32_t nbase = first_pair; nbase < end_pair; nbase += QW_MMA_BN) {
         const int32_t take = (cnt - nbase) < QW_MMA_BN ? (cnt - nbase)
                                                        : QW_MMA_BN;
         for (uint32_t i = tid; i < QW_MMA_BN; i += QW_DOWN_MMA_THREADS) {
@@ -5167,14 +5169,20 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     } \
 } while (0)
     if (down_mma) {
-#define QWEN4EXP_DOWN_MMA(DT) \
-        qwen4exp_moe_down_mma_kernel<DT><<< \
-                dim3(out_dim / QW_DOWN_MMA_BM, gu_rows, 1), \
+#define QWEN4EXP_DOWN_MMA_IMPL(DT, TASKS) \
+        qwen4exp_moe_down_mma_kernel<DT, TASKS><<< \
+                dim3(out_dim / QW_DOWN_MMA_BM, TASKS ? (unsigned)task_capacity : gu_rows, 1), \
                 QW_DOWN_MMA_THREADS, 0, stream>>>( \
                 (float *)down_partial->ptr, down, sc.mq, sc.ms, sc.msum, \
-                sc.pairs, sc.counts, sc.offsets, gu_active, \
+                sc.pairs, sc.counts, sc.offsets, TASKS ? gu_tasks : gu_active, \
                 down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
                 mgroups, out_dim)
+        const bool down_pair_tasks = pair_tasks &&
+            getenv("DS4_QWEN4EXP_NO_DOWN_PAIR_TASKS") == NULL;
+#define QWEN4EXP_DOWN_MMA(DT) do { \
+        if (down_pair_tasks) { QWEN4EXP_DOWN_MMA_IMPL(DT, true); } \
+        else { QWEN4EXP_DOWN_MMA_IMPL(DT, false); } \
+    } while (0)
         if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q5_1) {
             QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q5_1);
         } else if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q8_0) {
@@ -5183,6 +5191,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             QWEN4EXP_DOWN_MMA(-1);
         }
 #undef QWEN4EXP_DOWN_MMA
+#undef QWEN4EXP_DOWN_MMA_IMPL
         if (!cuda_ok(cudaGetLastError(), "qwen4exp MoE down tile launch")) return 0;
         const uint64_t combine_n = (uint64_t)n_tokens * out_dim;
         qwen4exp_moe_down_combine_kernel<<<
