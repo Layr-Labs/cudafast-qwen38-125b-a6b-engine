@@ -1,3 +1,5 @@
+/* Full-width transition check: add -DPREFIX=248044u -DVOCAB=248320u
+ * -DMTP_NATIVE_TEST_TRANSITION_PREFIX=98308u to the compile command below. */
 /* Synthetic CUDA contract; needs built libds4qwen and a supported GPU, no GGUF.
  * cc -O2 -std=c11 -D_GNU_SOURCE -Ids4 ds4/tests/test_mtp_native_screen.c \
  *    -L.build/ds4 -lds4qwen -lm -o /tmp/test-mtp-native-screen
@@ -13,9 +15,13 @@
 #include <sys/mman.h>
 #define DIM 2560u
 #define CAP 2048u
+#ifndef PREFIX
 #define PREFIX 20000u
+#endif
 #define TAIL 276u
+#ifndef VOCAB
 #define VOCAB 21000u
+#endif
 #define WIDTH (PREFIX+TAIL)
 #define ROW (80u*34u)
 static void need(int ok,const char *s) {if(!ok){fprintf(stderr,"native screen: %s\n",s);exit(1);}}
@@ -86,9 +92,18 @@ static void run_case(int adversarial, uint32_t offset) {
         *winner=ds4_gpu_tensor_alloc(4);
     need(x&&out&&ids&&scratch&&full&&tail&&winner,"GPU allocations");
     float activation[DIM],selected[CAP],reference[PREFIX],tail_ref[TAIL];uint32_t found[CAP];
+#ifdef MTP_NATIVE_TEST_TRANSITION_PREFIX
+    float narrow_values[CAP];uint32_t narrow_ids[CAP];
+#endif
     for(unsigned replay=0;replay<(adversarial?1u:3u);replay++) {
         for(unsigned i=0;i<DIM;i++) activation[i]=adversarial?1.0f:(int)(rnd()%201)*0.01f-1.0f;
         need(ds4_gpu_tensor_write(x,0,activation,sizeof activation),"current activation");
+#ifdef MTP_NATIVE_TEST_TRANSITION_PREFIX
+        if(!adversarial) {
+            need(ds4_gpu_mtp_native_screen(out,ids,scratch,w,bytes,offset,DIM,VOCAB,MTP_NATIVE_TEST_TRANSITION_PREFIX,TAIL,x)==CAP,"narrow call in full reserve");
+            need(ds4_gpu_tensor_read(ids,0,narrow_ids,sizeof narrow_ids)&&ds4_gpu_tensor_read(out,0,narrow_values,sizeof narrow_values),"narrow transition outputs");
+        }
+#endif
         if(adversarial==2) {
             need(compare_key_paths(out,ids,scratch,w,bytes,offset,x)==0,"nonfinite score fallback");
             goto cleanup;
@@ -99,6 +114,14 @@ static void run_case(int adversarial, uint32_t offset) {
         need(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(full,w,bytes,offset,DIM,PREFIX,x,1),"ordinary prefix");
         need(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(tail,w,bytes,offset+(uint64_t)(VOCAB-TAIL)*ROW,DIM,TAIL,x,1),"ordinary tail");
         need(ds4_gpu_tensor_read(full,0,reference,sizeof reference)&&ds4_gpu_tensor_read(tail,0,tail_ref,sizeof tail_ref),"oracle read");
+#ifdef MTP_NATIVE_TEST_TRANSITION_PREFIX
+        if(!adversarial)for(unsigned i=0;i<CAP;i++) {
+            uint32_t id=narrow_ids[i];
+            need(id<MTP_NATIVE_TEST_TRANSITION_PREFIX||(id>=VOCAB-TAIL&&id<VOCAB),"narrow original-ID domain");
+            float exact=id<PREFIX?reference[id]:tail_ref[id-(VOCAB-TAIL)];
+            need(!memcmp(&exact,&narrow_values[i],4),"narrow/full transition preserves row dots");
+        }
+#endif
         need(found[0]==0,"mandatory zero");
         for(unsigned i=0;i<CAP;i++) {
             need(i==0||found[i]>found[i-1],"sorted unique IDs");

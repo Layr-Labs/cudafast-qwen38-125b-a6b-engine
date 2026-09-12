@@ -59,12 +59,13 @@ static void fill_weights(unsigned char *p, size_t bytes, unsigned type) {
 }
 
 static void check_case(unsigned gt, unsigned dt, unsigned experts,
-                       unsigned alignment, unsigned k) {
+                       unsigned alignment, unsigned up_alignment, unsigned k) {
     const unsigned used = experts == 17 ? 3 : 10;
     const unsigned stride = used * D + 16;
     const size_t gb = (size_t)experts * D * row_bytes(gt, k);
     const size_t db = (size_t)experts * O * row_bytes(dt, k);
-    const size_t go = 64 + alignment, uo = go + gb + 64, d_o = uo + gb + 64;
+    const size_t go = 64 + alignment, uo = 128 + gb + up_alignment,
+                 d_o = uo + gb + 64;
     const size_t image_bytes = d_o + db;
     unsigned char *image = mmap(NULL, image_bytes, PROT_READ | PROT_WRITE,
                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -142,8 +143,8 @@ static void check_case(unsigned gt, unsigned dt, unsigned experts,
                 for (unsigned j = 0; j < 3; j++) {
                     require(ds4_gpu_tensor_read(out[j],0,got[j],bytes[j]), "arm output");
                     if (memcmp(expected[j],got[j],bytes[j])) {
-                        fprintf(stderr,"gt=%u dt=%u experts=%u align=%u k=%u width=%u trial=%u leg=%u buffer=%u\n",
-                                gt,dt,experts,alignment,k,width,trial,li,j);
+                        fprintf(stderr,"gt=%u dt=%u experts=%u align=%u up_align=%u k=%u width=%u trial=%u leg=%u buffer=%u\n",
+                                gt,dt,experts,alignment,up_alignment,k,width,trial,li,j);
                         require(0,"complete output/guard mismatch between the arms");
                     }
                     comparisons++;
@@ -162,8 +163,8 @@ static void check_case(unsigned gt, unsigned dt, unsigned experts,
     }
     ds4_gpu_tensor_free(weights); ds4_gpu_tensor_free(routes); ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(xp);
     ds4_gpu_cleanup(); munmap(image,image_bytes); free(xh); free(rh); free(wh); free(input_check);
-    printf("gate/up dq valve A/B gt=%u dt=%u experts=%u offset=%u k=%u PASS\n",
-           gt,dt,experts,64+alignment,k); fflush(stdout);
+    printf("gate/up dq valve A/B gt=%u dt=%u experts=%u align=%u up_align=%u k=%u PASS\n",
+           gt,dt,experts,alignment,up_alignment,k); fflush(stdout);
 }
 
 /* The shared expert's down tile takes the same DS4_QWEN4EXP_NO_DOWN_DQ
@@ -272,12 +273,16 @@ int main(void) {
      * kernel falls back to its per-group staging, in the same specialised
      * instantiation.  Q8_0 and Q5_K never take the new staging and only
      * check that the valve leaves them alone. */
-    check_case(12, 7, 512, 0, 256);
-    check_case(12, 7, 512, 0, 512);
-    check_case(12, 7, 512, 2, 512);
-    check_case(12, 7, 17, 0, 256);
-    check_case(8, 8, 512, 0, 256);
-    check_case(13, 8, 512, 0, 256);
+    check_case(12, 7, 512, 0, 0, 256);
+    check_case(12, 7, 512, 0, 0, 512);
+    check_case(12, 7, 512, 2, 2, 512);
+    /* Independent slab offsets: either operand can require fallback.
+     * The existing width loop exercises both GU row pitches (132/144). */
+    check_case(12, 7, 512, 0, 2, 512);
+    check_case(12, 7, 512, 2, 0, 512);
+    check_case(12, 7, 17, 0, 0, 256);
+    check_case(8, 8, 512, 0, 0, 256);
+    check_case(13, 8, 512, 0, 0, 256);
     shared_case(256);
     shared_case(512);
     printf("gate/up + down dq valve A/B: %u complete-buffer comparisons PASS\n",comparisons);
