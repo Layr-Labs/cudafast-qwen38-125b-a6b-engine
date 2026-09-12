@@ -5744,12 +5744,48 @@ extern "C" int ds4_gpu_qwen4exp_hc_inject_tensor(
 
 #define QWEN4EXP_HC_THREADS 256u
 
+/* The staged walks below run one k-walk per stream out of registers.  At the
+ * production decode shape a thread owns exactly n_embd/blockDim.x = 10
+ * elements per stream, and 10 divides that walk, so the stage arrays cover
+ * every element with no one-at-a-time tail (a depth that did not divide the
+ * walk would leave exactly that).  The dispatch takes those arms only at
+ * n_embd == STEPS*QWEN4EXP_HC_THREADS; every other shape keeps the rolled
+ * kernels below. */
+#define QWEN4EXP_HC_STAGED_STEPS 10u
+
 /* The scale qwen4exp_rms_norm_kernel computes, factored out unchanged. */
 __device__ __forceinline__ static float qwen4exp_hc_norm_scale(
         const float *xg, uint32_t group, float eps, float *partial) {
     float sum = 0.0f;
     for (uint32_t i = threadIdx.x; i < group; i += blockDim.x) {
         const float v = xg[i];
+        sum += v * v;
+    }
+    const float total = qwen4exp_block_sum_f32(sum, partial);
+    /* 1/sqrt rather than rsqrtf, for the same reason as the unfused kernel. */
+    return 1.0f / sqrtf(total / (float)group + eps);
+}
+
+/* The same scale walk with its ten values staged in registers first: the
+ * rolled loop issues one load and stalls on it before the next, the staged
+ * one puts the ten loads in flight together and then accumulates them in the
+ * same ascending order, so the sum is the same chain of the same FFMAs.  The
+ * elements are xg[s*blockDim.x + threadIdx.x] for s = 0..9, exactly the
+ * indices the rolled walk visits at the shape the dispatch gates this on.
+ * The return line is qwen4exp_hc_norm_scale's own and stays
+ * character-identical to it -- the mutant script matches that text wherever
+ * it appears, so a forked copy still bites. */
+__device__ __forceinline__ static float qwen4exp_hc_norm_scale_staged(
+        const float *xg, uint32_t group, float eps, float *partial) {
+    float xv[QWEN4EXP_HC_STAGED_STEPS];
+#pragma unroll
+    for (uint32_t s = 0; s < QWEN4EXP_HC_STAGED_STEPS; s++) {
+        xv[s] = xg[s * QWEN4EXP_HC_THREADS + threadIdx.x];
+    }
+    float sum = 0.0f;
+#pragma unroll
+    for (uint32_t c = 0; c < QWEN4EXP_HC_STAGED_STEPS; c++) {
+        const float v = xv[c];
         sum += v * v;
     }
     const float total = qwen4exp_block_sum_f32(sum, partial);
@@ -5821,6 +5857,7 @@ __device__ __forceinline__ static float qwen4exp_q8_rcp_approx(float d) {
  * the same one.  `group` (= n_embd) must be a multiple of blockDim.x, so loop
  * step k of thread t covers flat index g*group + k*blockDim.x + t and warp w
  * of that step covers exactly one 32-value Q8_0 block, in lane order. */
+template <int Staged = 0>
 __global__ static void qwen4exp_hc_norm_quant_kernel(
         int8_t *xq, float *xscale, float *nscale,
         const float *x, const float *w,
@@ -5835,7 +5872,9 @@ __global__ static void qwen4exp_hc_norm_quant_kernel(
     const float *wg = w + (uint64_t)g * group;
 
     __shared__ float partial[QWEN4EXP_HC_THREADS];
-    const float scale = qwen4exp_hc_norm_scale(xg, group, eps, partial);
+    const float scale = Staged
+        ? qwen4exp_hc_norm_scale_staged(xg, group, eps, partial)
+        : qwen4exp_hc_norm_scale(xg, group, eps, partial);
     if (threadIdx.x == 0u) nscale[(uint64_t)row * (n / group) + g] = scale;
 
     const uint32_t lane = threadIdx.x & 31u;
@@ -5844,6 +5883,45 @@ __global__ static void qwen4exp_hc_norm_quant_kernel(
     const uint64_t row_blocks = n / 32u;
     const uint64_t blk0 = (uint64_t)row * row_blocks + (uint64_t)g * (group / 32u);
 
+    if (Staged) {
+        /* The quantize walk's ten (value, weight) pairs staged in registers,
+         * then the seam below on them: lane k of step s owns flat index
+         * s*blockDim.x + warp*32 + lane, exactly the rolled walk's step s,
+         * so the butterfly's lanes and the store's pairs are unchanged. */
+        float xv[QWEN4EXP_HC_STAGED_STEPS];
+        float wv[QWEN4EXP_HC_STAGED_STEPS];
+#pragma unroll
+        for (uint32_t s = 0; s < QWEN4EXP_HC_STAGED_STEPS; s++) {
+            xv[s] = xg[s * QWEN4EXP_HC_THREADS + threadIdx.x];
+            wv[s] = wg[s * QWEN4EXP_HC_THREADS + threadIdx.x];
+        }
+#pragma unroll
+        for (uint32_t k = 0; k < QWEN4EXP_HC_STAGED_STEPS; k++) {
+            const float v = qwen4exp_hc_normed_value(xv[k], scale, wv[k],
+                                                     weight_bias, round_bf16);
+            /* quantize_q8_0_f32_rows_warp_kernel, on the value in hand: the
+             * same butterfly over the same 32 values in the same lanes, and
+             * the same five arithmetic steps in the form --use_fast_math gave
+             * them.  The block is full by construction, so the `bn` guard the
+             * standalone kernel carries for a ragged tail cannot fire. */
+            const float vz = qwen4exp_q8_ftz(v);
+            float a = qwen4exp_q8_ftz(fabsf(v));
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                /* fmaxf, not the .FTZ one: both operands are already flushed
+                 * and non-negative, so the two instructions cannot disagree. */
+                a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+            }
+            const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
+            const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
+            const uint64_t pair = blk0 + (uint64_t)(k * warps + warp);
+            if (lane == 0u) xscale[pair] = d;
+            int q = (int)lrintf(qwen4exp_q8_ftz(vz * id));
+            q = q > 127 ? 127 : (q < -128 ? -128 : q);
+            xq[pair * 32u + lane] = (int8_t)q;
+        }
+        return;
+    }
     uint32_t k = 0;
     for (uint32_t i = threadIdx.x; i < group; i += blockDim.x, k++) {
         const float v = qwen4exp_hc_normed_value(xg[i], scale, wg[i],
@@ -5895,12 +5973,56 @@ __global__ static void qwen4exp_hc_mix_renorm_kernel(
     out[(uint64_t)t * n_embd + d] = acc * (1.0f / (float)n_hc);
 }
 
+/* dev_qwen4exp_inject_value with the walk's per-step parts known at compile
+ * time, for the staged inject arms.  The flat index is i = hs*n_embd + k +
+ * threadIdx.x with k a multiple of QWEN4EXP_HC_THREADS, so for Q8_0 the block
+ * index the scalar accessor divides out strength-reduces: k/32 == s*8 (k is
+ * s*256), k%32 == 0, and threadIdx.x < 256 contributes no carry, so
+ * i/32 == hs*(n_embd/32) + s*(QWEN4EXP_HC_THREADS/32) + warp and i%32 ==
+ * lane.  The 34-byte blocks therefore step by a compile-time displacement
+ * once s is unrolled, and the lane's byte is fixed.  The d decode and the
+ * value expression are dev_qwen4exp_q8_0_value's own; only the index
+ * arithmetic is resolved. */
+template <int InjectType>
+__device__ __forceinline__ static float qwen4exp_hc_inject_value_staged(
+        const char *wr, uint32_t n_embd, uint32_t hs, uint32_t s) {
+    const uint32_t tid = threadIdx.x;
+    if (InjectType == DS4_QWEN4EXP_TY_f32) {
+        return ((const float *)wr)[(uint64_t)hs * n_embd +
+                                   s * QWEN4EXP_HC_THREADS + tid];
+    }
+    if (InjectType == DS4_QWEN4EXP_TY_q8_0) {
+        const uint32_t lane = tid & 31u;
+        const uint32_t warp = tid >> 5u;
+        const char *blk = wr + ((uint64_t)hs * (n_embd / 32u) +
+                                s * (QWEN4EXP_HC_THREADS / 32u) + warp) * 34u;
+        const uint16_t d = (uint16_t)((uint8_t)blk[0]) |
+                           (uint16_t)((uint16_t)(uint8_t)blk[1] << 8u);
+        return dev_f16_to_f32(d) * (float)(int8_t)blk[2u + lane];
+    }
+    return dev_qwen4exp_inject_value((uint32_t)InjectType, wr,
+                                     hs * n_embd + s * QWEN4EXP_HC_THREADS +
+                                         tid);
+}
+
 /* qwen4exp_hc_inject_weights_kernel with `normed` rebuilt from the residual.
  *
  * The flat loop `for (i = threadIdx.x; i < wide; i += blockDim.x)` is written
  * as a stream-outer pair so the per-stream scale is loaded once; because
  * n_embd is a multiple of blockDim.x the visited sequence is the SAME
- * ascending stride-blockDim.x sequence, so the partial sums are the same. */
+ * ascending stride-blockDim.x sequence, so the partial sums are the same.
+ *
+ * InjectType < 0 keeps that rolled walk verbatim: the runtime type switch
+ * stays in the loop, one element's three loads are in flight at a time, and
+ * the valve leg and every non-decode shape run it.  A typed arm stages the
+ * walk instead: the ten residual, norm-weight and inject-value elements a
+ * thread owns per stream are loaded into registers with the thirty loads in
+ * flight together, and the consume loop then runs the same statements on
+ * them in the same ascending order, so the partial sum is the same chain of
+ * the same FFMAs.  The `i` line is the rolled walk's own and stays
+ * character-identical -- the mutant script's order check matches it here
+ * too. */
+template <int InjectType = -1>
 __global__ static void qwen4exp_hc_inject_weights_renorm_kernel(
         float *out, const float *hyper, const float *nscale,
         const float *normw, const char *w,
@@ -5918,11 +6040,32 @@ __global__ static void qwen4exp_hc_inject_weights_renorm_kernel(
     float sum = 0.0f;
     for (uint32_t hs = 0; hs < n_hc; hs++) {
         const float sc = nscale[(uint64_t)t * n_hc + hs];
-        for (uint32_t k = 0; k < n_embd; k += blockDim.x) {
-            const uint32_t i = hs * n_embd + k + threadIdx.x;
-            const float normed = qwen4exp_hc_normed_value(
-                    xr[i], sc, normw[i], weight_bias, round_bf16);
-            sum += normed * dev_qwen4exp_inject_value(weight_type, wr, i);
+        if (InjectType < 0) {
+            for (uint32_t k = 0; k < n_embd; k += blockDim.x) {
+                const uint32_t i = hs * n_embd + k + threadIdx.x;
+                const float normed = qwen4exp_hc_normed_value(
+                        xr[i], sc, normw[i], weight_bias, round_bf16);
+                sum += normed * dev_qwen4exp_inject_value(weight_type, wr, i);
+            }
+        } else {
+            float xs[QWEN4EXP_HC_STAGED_STEPS];
+            float ws[QWEN4EXP_HC_STAGED_STEPS];
+            float vs[QWEN4EXP_HC_STAGED_STEPS];
+#pragma unroll
+            for (uint32_t s = 0; s < QWEN4EXP_HC_STAGED_STEPS; s++) {
+                const uint32_t k = s * QWEN4EXP_HC_THREADS;
+                const uint32_t i = hs * n_embd + k + threadIdx.x;
+                xs[s] = xr[i];
+                ws[s] = normw[i];
+                vs[s] = qwen4exp_hc_inject_value_staged<InjectType>(
+                        wr, n_embd, hs, s);
+            }
+#pragma unroll
+            for (uint32_t c = 0; c < QWEN4EXP_HC_STAGED_STEPS; c++) {
+                const float normed = qwen4exp_hc_normed_value(
+                        xs[c], sc, ws[c], weight_bias, round_bf16);
+                sum += normed * vs[c];
+            }
         }
     }
     __shared__ float partial[QWEN4EXP_HC_THREADS];
@@ -5935,7 +6078,13 @@ __global__ static void qwen4exp_hc_inject_weights_renorm_kernel(
 
 /* The narrow mixer has independent mix and inject outputs. Put their
  * existing CTAs in one launch: neither reduction nor its thread mapping
- * changes, and the short mix can overlap the underfilled inject grid. */
+ * changes, and the short mix can overlap the underfilled inject grid.
+ *
+ * The inject leg carries the same InjectType template as the standalone
+ * kernel above: InjectType < 0 is the rolled walk verbatim, a typed arm
+ * stages the walk's elements in registers first.  The mix leg is the same
+ * in every instantiation, including its `#pragma unroll 1`. */
+template <int InjectType = -1>
 __global__ static void qwen4exp_hc_mix_inject_dual_kernel(
         float *mixed, float *inject, const float *hyper, const float *nscale,
         const float *normw, const float *gate_values, const char *w,
@@ -5978,11 +6127,32 @@ __global__ static void qwen4exp_hc_mix_inject_dual_kernel(
         float sum = 0.0f;
         for (uint32_t hs = 0; hs < n_hc; hs++) {
             const float sc = nscale[(uint64_t)t * n_hc + hs];
-            for (uint32_t k = 0; k < n_embd; k += blockDim.x) {
-                const uint32_t i = hs * n_embd + k + threadIdx.x;
-                const float normed = qwen4exp_hc_normed_value(
-                        xr[i], sc, normw[i], weight_bias, round_bf16);
-                sum += normed * dev_qwen4exp_inject_value(weight_type, wr, i);
+            if (InjectType < 0) {
+                for (uint32_t k = 0; k < n_embd; k += blockDim.x) {
+                    const uint32_t i = hs * n_embd + k + threadIdx.x;
+                    const float normed = qwen4exp_hc_normed_value(
+                            xr[i], sc, normw[i], weight_bias, round_bf16);
+                    sum += normed * dev_qwen4exp_inject_value(weight_type, wr, i);
+                }
+            } else {
+                float xs[QWEN4EXP_HC_STAGED_STEPS];
+                float ws[QWEN4EXP_HC_STAGED_STEPS];
+                float vs[QWEN4EXP_HC_STAGED_STEPS];
+#pragma unroll
+                for (uint32_t s = 0; s < QWEN4EXP_HC_STAGED_STEPS; s++) {
+                    const uint32_t k = s * QWEN4EXP_HC_THREADS;
+                    const uint32_t i = hs * n_embd + k + threadIdx.x;
+                    xs[s] = xr[i];
+                    ws[s] = normw[i];
+                    vs[s] = qwen4exp_hc_inject_value_staged<InjectType>(
+                            wr, n_embd, hs, s);
+                }
+#pragma unroll
+                for (uint32_t c = 0; c < QWEN4EXP_HC_STAGED_STEPS; c++) {
+                    const float normed = qwen4exp_hc_normed_value(
+                            xs[c], sc, ws[c], weight_bias, round_bf16);
+                    sum += normed * vs[c];
+                }
             }
         }
         __shared__ float partial[QWEN4EXP_HC_THREADS];
@@ -6105,6 +6275,65 @@ static int ds4_qwen4exp_hc_fuse_off(void) {
     }
     return cached;
 }
+
+/* The staged register walks are the default at the production decode shape;
+ * this is their valve, read once like the one above.  The value cannot change
+ * after the first call and a captured graph replays the launches it recorded,
+ * so the choice is capture-safe. */
+static int ds4_qwen4exp_hc_staged_off(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_QWEN4EXP_NO_HC_STAGED");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
+/* The staged arms stage QWEN4EXP_HC_STAGED_STEPS elements per stream, which
+ * covers the walk exactly only at n_embd == STEPS*QWEN4EXP_HC_THREADS, and
+ * their Q8_0 strength reduction assumes the QWEN4EXP_HC_THREADS-wide launch
+ * every HC kernel here uses.  The production decode shape (n_embd 2560,
+ * n_hc 4) is the one the dispatch takes them at; every other shape keeps the
+ * generic rolled kernels. */
+static int qwen4exp_hc_staged_ok(uint32_t n_embd, uint32_t n_hc) {
+    return !ds4_qwen4exp_hc_staged_off() && n_hc == 4u &&
+           n_embd == QWEN4EXP_HC_STAGED_STEPS * QWEN4EXP_HC_THREADS;
+}
+
+/* The typed staged arms and the generic <-1> one, argument for argument the
+ * same, so the only difference a leg can carry is the walk itself.  Both
+ * expand `staged`, `threads` and `inject_weight` from the caller's scope. */
+#define QWEN4EXP_HC_INJECT_RENORM_LAUNCH(GRID, ...) do {                     \
+        if (staged && inject_weight->type == (uint32_t)DS4_QWEN4EXP_TY_f32) {\
+            qwen4exp_hc_inject_weights_renorm_kernel<                        \
+                DS4_QWEN4EXP_TY_f32><<<GRID, threads, 0,                     \
+                cuda_decode_stream()>>>(__VA_ARGS__);                        \
+        } else if (staged &&                                                 \
+                   inject_weight->type == (uint32_t)DS4_QWEN4EXP_TY_q8_0) {  \
+            qwen4exp_hc_inject_weights_renorm_kernel<                        \
+                DS4_QWEN4EXP_TY_q8_0><<<GRID, threads, 0,                    \
+                cuda_decode_stream()>>>(__VA_ARGS__);                        \
+        } else {                                                             \
+            qwen4exp_hc_inject_weights_renorm_kernel<-1>                     \
+                <<<GRID, threads, 0, cuda_decode_stream()>>>(__VA_ARGS__);   \
+        }                                                                    \
+    } while (0)
+
+#define QWEN4EXP_HC_DUAL_LAUNCH(GRID, ...) do {                              \
+        if (staged && inject_weight->type == (uint32_t)DS4_QWEN4EXP_TY_f32) {\
+            qwen4exp_hc_mix_inject_dual_kernel<                              \
+                DS4_QWEN4EXP_TY_f32><<<GRID, threads, 0,                     \
+                cuda_decode_stream()>>>(__VA_ARGS__);                        \
+        } else if (staged &&                                                 \
+                   inject_weight->type == (uint32_t)DS4_QWEN4EXP_TY_q8_0) {  \
+            qwen4exp_hc_mix_inject_dual_kernel<                              \
+                DS4_QWEN4EXP_TY_q8_0><<<GRID, threads, 0,                    \
+                cuda_decode_stream()>>>(__VA_ARGS__);                        \
+        } else {                                                             \
+            qwen4exp_hc_mix_inject_dual_kernel<-1>                           \
+                <<<GRID, threads, 0, cuda_decode_stream()>>>(__VA_ARGS__);   \
+        }                                                                    \
+    } while (0)
 
 
 /* Fuse the low-rank scale/SiLU with its following Q8 activation quantizer.
@@ -6499,6 +6728,7 @@ static int qwen4exp_hc_mixer_fused_cuda(
         int                   round_bf16) {
     const uint32_t threads = QWEN4EXP_HC_THREADS;
     if (n_embd % threads != 0u || n_hc > QWEN4EXP_HC_MAX_STREAMS) return -1;
+    const int staged = qwen4exp_hc_staged_ok(n_embd, n_hc);
 
     const uint64_t wide = (uint64_t)n_hc * n_embd;
     const uint64_t row_blocks = wide / 32u;
@@ -6585,8 +6815,13 @@ static int qwen4exp_hc_mixer_fused_cuda(
                 (const float *)hyper->ptr, normw, iw, n_embd, n_hc, rows,
                 eps, weight_bias, round_bf16, inject_weight->type,
                 (uint32_t)iw_row_bytes);
+    } else if (staged) {
+        qwen4exp_hc_norm_quant_kernel<1><<<dim3(n_hc, rows, 1u), threads, 0,
+                                        cuda_decode_stream()>>>(
+                xq, xscale, nscale, (const float *)hyper->ptr, normw,
+                (uint32_t)wide, n_embd, rows, eps, weight_bias, round_bf16);
     } else {
-        qwen4exp_hc_norm_quant_kernel<<<dim3(n_hc, rows, 1u), threads, 0,
+        qwen4exp_hc_norm_quant_kernel<0><<<dim3(n_hc, rows, 1u), threads, 0,
                                         cuda_decode_stream()>>>(
                 xq, xscale, nscale, (const float *)hyper->ptr, normw,
                 (uint32_t)wide, n_embd, rows, eps, weight_bias, round_bf16);
@@ -6619,9 +6854,8 @@ static int qwen4exp_hc_mixer_fused_cuda(
             }
             if (!cuda_ok(cudaGetLastError(), "qwen4exp_hc_up_mix launch")) return 0;
             if (!inject || inject_in_norm) return 1;
-            qwen4exp_hc_inject_weights_renorm_kernel<<<dim3(n_hc, rows, 1u),
-                                                       threads, 0,
-                                                       cuda_decode_stream()>>>(
+            QWEN4EXP_HC_INJECT_RENORM_LAUNCH(
+                    dim3(n_hc, rows, 1u),
                     (float *)inject->ptr, (const float *)hyper->ptr, nscale,
                     normw, iw, n_embd, n_hc, rows, weight_bias, round_bf16,
                     inject_weight->type, (uint32_t)iw_row_bytes);
@@ -6674,9 +6908,8 @@ static int qwen4exp_hc_mixer_fused_cuda(
             qwen4exp_hc_ranges_disjoint(inject->ptr, inj_bytes, wide_scratch->ptr, hc_bytes);
         if (disjoint) {
             const unsigned mix_blocks = (n_embd + threads - 1u) / threads;
-            qwen4exp_hc_mix_inject_dual_kernel<<<
-                    dim3(mix_blocks + n_hc, rows, 1u), threads, 0,
-                    cuda_decode_stream()>>>(
+            QWEN4EXP_HC_DUAL_LAUNCH(
+                    dim3(mix_blocks + n_hc, rows, 1u),
                     (float *)mixed->ptr, (float *)inject->ptr,
                     (const float *)hyper->ptr, nscale, normw,
                     (const float *)wide_scratch->ptr, iw,
@@ -6695,8 +6928,8 @@ static int qwen4exp_hc_mixer_fused_cuda(
     if (!cuda_ok(cudaGetLastError(), "qwen4exp_hc_mix_renorm launch")) return 0;
     if (!inject) return 1;
 
-    qwen4exp_hc_inject_weights_renorm_kernel<<<dim3(n_hc, rows, 1u), threads, 0,
-                                               cuda_decode_stream()>>>(
+    QWEN4EXP_HC_INJECT_RENORM_LAUNCH(
+            dim3(n_hc, rows, 1u),
             (float *)inject->ptr, (const float *)hyper->ptr, nscale, normw, iw,
             n_embd, n_hc, rows, weight_bias, round_bf16,
             inject_weight->type, (uint32_t)iw_row_bytes);

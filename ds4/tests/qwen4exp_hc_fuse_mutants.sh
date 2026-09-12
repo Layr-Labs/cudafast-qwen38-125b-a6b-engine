@@ -175,6 +175,28 @@ mutant inject_no_two caught \
 mutant inject_dot_order caught \
     's|            const uint32_t i = hs \* n_embd + k + threadIdx.x;|            const uint32_t i = ((k + threadIdx.x) % n_embd) * n_hc + hs;|'
 
+# ---- the staged register walks ----------------------------------------------
+#
+# The staged arms load the walk's elements into registers and then consume
+# them; these break the staging in ways a byte test must notice.
+
+# Consume a staged batch in reverse: every element is the right one, the
+# accumulation order is not, which is the reassociation the byte test exists
+# to catch.  The c loop is the consume loop of both staged inject arms and of
+# the staged scale walk, so one pattern bites all three.
+mutant staged_consume_reversed caught \
+    's|for (uint32_t c = 0; c < QWEN4EXP_HC_STAGED_STEPS; c++) {|for (uint32_t c = QWEN4EXP_HC_STAGED_STEPS; c-- > 0;) {|'
+
+# Drop staged slot 0 of the residual: one zero element of the forty a thread
+# owns per stream.
+mutant staged_slot_zero caught \
+    's|xs\[s\] = xr\[i\];|xs[s] = s ? xr[i] : 0.0f;|'
+
+# The strength-reduced Q8_0 lane off by one: every staged value comes from
+# the neighbouring lane of the same 34-byte block.
+mutant staged_q8_lane_off caught \
+    's|(float)(int8_t)blk\[2u + lane\]|(float)(int8_t)blk[2u + ((lane + 1u) \& 31u)]|'
+
 # The fused mix/inject kernel is only reached above the row threshold, so it
 # needs its own mutants.
 mutant fused_mix_no_fma caught \

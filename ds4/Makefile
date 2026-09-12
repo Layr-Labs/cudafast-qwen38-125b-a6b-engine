@@ -553,6 +553,7 @@ $(QWEN4EXP_HC_TEST): tests/test_qwen4exp_hc_norm.o $(GPU_TEST_OBJS)
 test-qwen4exp-hc: $(QWEN4EXP_HC_TEST)
 	DS4_METAL_MATH_SAFE=1 ./$(QWEN4EXP_HC_TEST)
 	./$(QWEN4EXP_HC_TEST)
+	DS4_QWEN4EXP_NO_HC_STAGED=1 ./$(QWEN4EXP_HC_TEST)
 
 # Proves the inject checks bite: each mutant rewrites one line of the inject
 # kernel through DS4_METAL_QWEN4EXP_HC_SOURCE and must make the test fail.
