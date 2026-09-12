@@ -67546,43 +67546,6 @@ static bool ds4_session_qwen4exp_unsupported(const ds4_session *s,
     return true;
 }
 
-
-static bool ds4_session_qwen4exp_spec_init(ds4_session *s,
-                                           char *err, size_t errlen);
-
-/* Complete a retained target frontier with the token the caller actually
- * feeds. A speculative round normally already wrote this row for that token;
- * preserving it also preserves accepted head-origin cache rows at depth >1. */
-static int ds4_session_qwen4exp_cache_feed_tail(ds4_session *s,
-        int token, uint32_t pos, char *err, size_t errlen) {
-    if (!s->qwen4exp_head.cache_seed_capacity) return 0;
-    bool changed = false;
-    if (ds4_qwen4exp_mtp_head_feed_cache_tail(&s->qwen4exp_head, token, pos,
-                                             &changed, err, errlen) != 0) return -1;
-    if (changed) s->qwen4exp_spec.head_rows = pos;
-    return 0;
-}
-
-/* Every row except the final one has a known next token. The final target HC
- * row is retained until a later serial or speculative caller supplies it. */
-static int ds4_session_qwen4exp_cache_rows(ds4_session *s, const int *tokens,
-        uint32_t n, uint32_t pos0, char *err, size_t errlen) {
-    ds4_qwen4exp_mtp_head *h = &s->qwen4exp_head;
-    if (!h->cache_seed_capacity) return 0;
-    ds4_gpu_tensor *hyper = ds4_qwen4exp_session_hyper(s->engine->qwen4exp_session);
-    for (uint32_t at = 0; at + 1u < n;) {
-        uint32_t take = n - 1u - at;
-        if (take > h->cache_seed_capacity) take = h->cache_seed_capacity;
-        if (ds4_qwen4exp_mtp_head_seed_cache(h, tokens + at + 1u, hyper,
-                at, pos0 + at, take, err, errlen) != 0) return -1;
-        at += take;
-    }
-    if (ds4_qwen4exp_mtp_head_retain_cache_tail(h, hyper, n - 1u,
-            pos0 + n - 1u, -1, err, errlen) != 0) return -1;
-    s->qwen4exp_spec.head_rows = pos0 + n - 1u;
-    return 0;
-}
-
 /* Run `n` tokens at the session's current position and leave the last row's
  * logits in s->logits.  One chunk, bounded by the session's batch. */
 static int ds4_session_qwen4exp_rows(ds4_session *s, const int *tokens,
@@ -67602,22 +67565,12 @@ static int ds4_session_qwen4exp_rows(ds4_session *s, const int *tokens,
         return 1;
     }
     for (uint32_t i = 0; i < n; i++) buf[i] = (int32_t)tokens[i];
-    /* A caller may feed serial rows without sync or eager prepare. Initialize
-     * before its first target HC row can be overwritten by a later forward;
-     * any lazy allocation is charged to that real call. */
-    if (e->qwen4exp_mtp_ready &&
-        !ds4_session_qwen4exp_spec_init(s, err, errlen)) return 1;
-    const uint32_t pos0 = ds4_qwen4exp_session_pos(e->qwen4exp_session);
-    if (ds4_session_qwen4exp_cache_feed_tail(s, tokens[0], pos0, err, errlen) != 0)
-        return 1;
     if (!ds4_qwen4exp_graph_verify_rows(e->qwen4exp_session,
                                         e->qwen4exp_weights, &e->model,
                                         buf, n, NULL, s->logits, 1u)) {
         snprintf(err, errlen, "qwen4exp: the forward refused");
         return 1;
     }
-    if (ds4_session_qwen4exp_cache_rows(s, tokens, n, pos0, err, errlen) != 0)
-        return 1;
     /* The checkpoint IS the session's position: ds4_session_pos() returns
      * s->checkpoint.len, and the generate loop bounds itself on it, so a tape
      * that never grew would report position 0 forever and the loop would run
@@ -67649,8 +67602,6 @@ static int ds4_session_qwen4exp_sync(ds4_session *s, const ds4_tokens *prompt,
     /* A sync is a new prefix, so any carried draft is for a position that no
      * longer exists.  See ds4_session_invalidate. */
     ds4_qwen4exp_mtp_invalidate(&s->qwen4exp_spec);
-    ds4_qwen4exp_mtp_head_reset_cache(&s->qwen4exp_head);
-    s->qwen4exp_spec.head_rows = 0;
     s->checkpoint.len = 0;
     s->checkpoint_valid = false;
 
@@ -76164,13 +76115,6 @@ static bool ds4_session_qwen4exp_spec_init(ds4_session *s,
     head->weight_bias         = w->output_hc_norm_offset;
     head->round_bf16          = 1;
     ds4_qwen4exp_mtp_default_hooks(&head->hooks);
-    if (getenv("DS4_MTP_NO_PREFILL_CACHE") == NULL && head->hooks.cache_seed) {
-        const ds4_qwen4exp_session_plan *seed_plan =
-            ds4_qwen4exp_session_plan_of(e->qwen4exp_session);
-        head->cache_seed_capacity = seed_plan->n_batch;
-        if (head->cache_seed_capacity > DS4_QWEN4EXP_MTP_CACHE_SEED_MAX_ROWS)
-            head->cache_seed_capacity = DS4_QWEN4EXP_MTP_CACHE_SEED_MAX_ROWS;
-    }
     /* The 49th block is the graph's, run on the head's weights and the head's
      * own cache slot -- layer index block_index, one past the tower's last. */
     if (!ds4_qwen4exp_session_add_head_block(e->qwen4exp_session, &h->block,
@@ -76224,8 +76168,6 @@ static int ds4_session_qwen4exp_spec_cycle(ds4_session *s, int first_token,
     ds4_engine *e = s->engine;
     if (!ds4_session_qwen4exp_spec_init(s, err, errlen)) return -1;
     const uint32_t pos = ds4_qwen4exp_session_pos(e->qwen4exp_session);
-    if (ds4_session_qwen4exp_cache_feed_tail(s, first_token, pos, err, errlen) != 0)
-        return -1;
     /* s->logits, not a scratch buffer.  The cycle leaves the distribution for
      * the position after everything it committed, and the caller's next
      * iteration samples its fed token straight out of s->logits -- the serial
@@ -76236,18 +76178,6 @@ static int ds4_session_qwen4exp_spec_cycle(ds4_session *s, int first_token,
                                          first_token, pos, max_tokens,
                                          accepted, accepted_cap, s->logits,
                                          err, errlen);
-    /* Retain the selected TARGET row: successful cycle returns leave session
-     * hyper identical to hc_scratch for all verified rows. Rollback only
-     * selects recurrent/PLE state; drafting borrows/restores session hyper
-     * using the head's own t_hyper, and deferred logits only read. The return
-     * value counts committed rows, so n-1 selects the accepted frontier even
-     * when later physical verify rows were rejected. Preserve this invariant
-     * if graph/cycle scratch lifetimes change. */
-    if (n > 0 && s->qwen4exp_head.cache_seed_capacity &&
-        ds4_qwen4exp_mtp_head_retain_cache_tail(&s->qwen4exp_head,
-            ds4_qwen4exp_session_hyper(e->qwen4exp_session), (uint32_t)n - 1u,
-            pos + (uint32_t)n - 1u, s->qwen4exp_spec.pending_parent,
-            err, errlen) != 0) return -1;
     /* Push what the round committed, the way every sibling verifier does.  The
      * serial path appends inside the forward, but the cycle's rows go through
      * the seam, so without this ds4_session_pos() freezes at the prompt length
@@ -78144,8 +78074,6 @@ void ds4_session_invalidate(ds4_session *s) {
          * pending_parent would verify against it and commit two tokens while
          * the caller believes nothing was drafted. */
         ds4_qwen4exp_mtp_invalidate(&s->qwen4exp_spec);
-        ds4_qwen4exp_mtp_head_reset_cache(&s->qwen4exp_head);
-        s->qwen4exp_spec.head_rows = 0;
         s->checkpoint_valid = false;
         s->checkpoint.len = 0;
         return;
@@ -78187,9 +78115,6 @@ void ds4_session_rewind(ds4_session *s, int pos) {
          * longer prefix. */
         if (pos == 0) {
             ds4_qwen4exp_session_reset(s->engine->qwen4exp_session);
-            ds4_qwen4exp_mtp_head_reset_cache(&s->qwen4exp_head);
-            ds4_qwen4exp_mtp_invalidate(&s->qwen4exp_spec);
-            s->qwen4exp_spec.head_rows = 0;
             s->checkpoint.len = 0;
             s->checkpoint_valid = false;
             return;

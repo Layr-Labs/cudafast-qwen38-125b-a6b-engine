@@ -11,6 +11,10 @@ static constexpr uint32_t MTP_NATIVE_DIM = 2560u;
  * second warp with 8). This changes the coarse proposal heuristic, not the
  * selected-row dots. */
 static constexpr uint32_t MTP_NATIVE_SCREEN_GROUPS = 24u;
+/* The target verifier can amortize a much deeper, wider screen across both
+ * rows.  Keep the draft-head proposal policy above unchanged. */
+static constexpr uint32_t TARGET_NATIVE_CAP = 8192u;
+static constexpr uint32_t TARGET_NATIVE_SCREEN_GROUPS = 64u;
 static constexpr uint32_t MTP_NATIVE_MAX_WIDTH = 1u << 20;
 template <bool Screen, bool EmitKeys = false>
 __global__ static void mtp_native_projection_kernel(
@@ -112,6 +116,202 @@ __global__ static void mtp_native_projection_kernel(
     }
 }
 
+/* Target verification has exactly two rows at mtp1.  Share every coarse
+ * output-weight load across those rows while retaining an independent ranking
+ * for each activation.  The one-row primitive above stays byte-for-byte
+ * available to the MTP head and to its extracted key-semantics oracle. */
+__global__ static void mtp_native_projection_r2_screen_kernel(
+        uint64_t *keys, uint32_t *invalid, const unsigned char *w,
+        const int8_t *xq, const float *xscale, uint32_t width,
+        uint32_t n_vocab, uint32_t prefix, uint32_t tail) {
+    constexpr uint64_t blocks = MTP_NATIVE_DIM / 32u;
+    constexpr uint64_t work_blocks = TARGET_NATIVE_SCREEN_GROUPS;
+    const uint32_t local_row = threadIdx.x >> 6u;
+    const uint32_t local_lane = threadIdx.x & 63u;
+    const uint32_t group = local_lane >> 1u;
+    const uint32_t half = local_lane & 1u;
+    const uint32_t row = blockIdx.x * 4u + local_row;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    const uint32_t weight_row = row >= width ? n_vocab
+        : (row < prefix ? row : n_vocab - tail + (row - prefix));
+    const bool valid = row < width && weight_row < n_vocab;
+    if (valid) {
+        const unsigned char *wr = w + (uint64_t)weight_row * blocks * 34u;
+        for (uint64_t b = group; b < work_blocks; b += 32u) {
+            const uint64_t warp_base = b - (uint64_t)(group & 15u);
+            const uint64_t remaining = work_blocks - warp_base;
+            const uint32_t live_pairs =
+                (uint32_t)(remaining < 16u ? remaining : 16u);
+            const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
+            const int8_t *payload =
+                (const int8_t *)(wr + b * 34u + 2u) + half * 16u;
+            const uintptr_t address = (uintptr_t)payload;
+            const uint32_t shift = (uint32_t)(address & 3u) * 8u;
+            const uint32_t *words =
+                (const uint32_t *)(address & ~(uintptr_t)3u);
+            uint32_t previous = words[0];
+            int32_t wq[4];
+#pragma unroll
+            for (int j = 0; j < 3; j++) {
+                const uint32_t next = words[j + 1];
+                wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
+                previous = next;
+            }
+            const uint16_t last =
+                *(const uint16_t *)(const void *)(payload + 14);
+            wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
+            const float ws = __half2float(*(const __half *)(wr + b * 34u));
+            const int32_t *xw0 = (const int32_t *)(
+                xq + b * 32u + half * 16u);
+            const int32_t *xw1 = (const int32_t *)(
+                xq + (blocks + b) * 32u + half * 16u);
+            int dot0 = 0;
+            int dot1 = 0;
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                dot0 = __dp4a(wq[j], xw0[j], dot0);
+                dot1 = __dp4a(wq[j], xw1[j], dot1);
+            }
+            dot0 += __shfl_xor_sync(active, dot0, 1);
+            dot1 += __shfl_xor_sync(active, dot1, 1);
+            if (half == 0u) {
+                acc0 += ws * xscale[b] * (float)dot0;
+                acc1 += ws * xscale[blocks + b] * (float)dot1;
+            }
+        }
+    }
+
+    __shared__ float partial[2][4][32];
+    if (half == 0u) {
+        partial[0][local_row][group] = acc0;
+        partial[1][local_row][group] = acc1;
+    }
+    __syncthreads();
+    if (local_lane < 32u && row < width) {
+        const float value0 = valid
+            ? warp_sum_f32(partial[0][local_row][local_lane]) : -INFINITY;
+        const float value1 = valid
+            ? warp_sum_f32(partial[1][local_row][local_lane]) : -INFINITY;
+        if (local_lane == 0u) {
+            const uint32_t id = row < prefix ? row
+                : n_vocab - tail + (row - prefix);
+            if (!isfinite(value0) || !isfinite(value1)) atomicOr(invalid, 1u);
+            const uint64_t mandatory = UINT64_MAX - id;
+            keys[row] = (!id || row >= prefix) ? mandatory
+                : q8_top1_pack_key(value0 == 0.0f ? 0.0f : value0, id);
+            keys[(uint64_t)width + row] = (!id || row >= prefix) ? mandatory
+                : q8_top1_pack_key(value1 == 0.0f ? 0.0f : value1, id);
+        }
+    }
+}
+
+/* Exact two-row target top-1.  This is the same 80-group Q8_0 dot and the
+ * same 32-chain reduction as matmul_q8_0_preq_pair_lanes_kernel<2, false>,
+ * but it reduces the four output rows owned by a block before publishing a
+ * single key per target row.  The output weights are still read once for the
+ * two verifier rows; the full [2][vocab] logits and the following argmax
+ * traversal never touch memory. */
+__global__ static void mtp_native_projection_r2_top1_kernel(
+        unsigned long long *best_key, const unsigned char *w,
+        const int8_t *xq, const float *xscale, uint32_t vocab) {
+    constexpr uint64_t blocks = MTP_NATIVE_DIM / 32u;
+    const uint32_t local_row = threadIdx.x >> 6u;
+    const uint32_t local_lane = threadIdx.x & 63u;
+    const uint32_t group = local_lane >> 1u;
+    const uint32_t half = local_lane & 1u;
+    const uint32_t row = blockIdx.x * 4u + local_row;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    if (row < vocab) {
+        const unsigned char *wr = w + (uint64_t)row * blocks * 34u;
+        for (uint64_t b = group; b < blocks; b += 32u) {
+            const uint64_t warp_base = b - (uint64_t)(group & 15u);
+            const uint64_t remaining = blocks - warp_base;
+            const uint32_t live_pairs =
+                (uint32_t)(remaining < 16u ? remaining : 16u);
+            const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
+            const int8_t *payload =
+                (const int8_t *)(wr + b * 34u + 2u) + half * 16u;
+            const uintptr_t address = (uintptr_t)payload;
+            const uint32_t shift = (uint32_t)(address & 3u) * 8u;
+            const uint32_t *words =
+                (const uint32_t *)(address & ~(uintptr_t)3u);
+            uint32_t previous = words[0];
+            int32_t wq[4];
+#pragma unroll
+            for (int j = 0; j < 3; j++) {
+                const uint32_t next = words[j + 1];
+                wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
+                previous = next;
+            }
+            const uint16_t last =
+                *(const uint16_t *)(const void *)(payload + 14);
+            wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
+            const float ws = __half2float(*(const __half *)(wr + b * 34u));
+            const int32_t *xw0 =
+                (const int32_t *)(xq + b * 32u + half * 16u);
+            const int32_t *xw1 = (const int32_t *)(
+                xq + (blocks + b) * 32u + half * 16u);
+            int dot0 = 0;
+            int dot1 = 0;
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                dot0 = __dp4a(wq[j], xw0[j], dot0);
+                dot1 = __dp4a(wq[j], xw1[j], dot1);
+            }
+            dot0 += __shfl_xor_sync(active, dot0, 1);
+            dot1 += __shfl_xor_sync(active, dot1, 1);
+            if (half == 0u) {
+                acc0 += ws * xscale[b] * (float)dot0;
+                acc1 += ws * xscale[blocks + b] * (float)dot1;
+            }
+        }
+    }
+
+    __shared__ float partial[2][4][32];
+    __shared__ unsigned long long row_key[2][4];
+    if (half == 0u) {
+        partial[0][local_row][group] = acc0;
+        partial[1][local_row][group] = acc1;
+    }
+    __syncthreads();
+    if (local_lane < 32u) {
+        const float value0 = warp_sum_f32(partial[0][local_row][local_lane]);
+        const float value1 = warp_sum_f32(partial[1][local_row][local_lane]);
+        if (local_lane == 0u) {
+            row_key[0][local_row] = row < vocab
+                ? (unsigned long long)q8_top1_pack_key(
+                      value0 == 0.0f ? 0.0f : value0, row)
+                : 0ull;
+            row_key[1][local_row] = row < vocab
+                ? (unsigned long long)q8_top1_pack_key(
+                      value1 == 0.0f ? 0.0f : value1, row)
+                : 0ull;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        unsigned long long best0 = row_key[0][0];
+        unsigned long long best1 = row_key[1][0];
+#pragma unroll
+        for (uint32_t i = 1u; i < 4u; i++) {
+            if (row_key[0][i] > best0) best0 = row_key[0][i];
+            if (row_key[1][i] > best1) best1 = row_key[1][i];
+        }
+        (void)atomicMax(best_key, best0);
+        (void)atomicMax(best_key + 1, best1);
+    }
+}
+
+__global__ static void mtp_native_top1_r2_unpack_kernel(
+        uint32_t *winner, const unsigned long long *best_key) {
+    const uint32_t row = threadIdx.x;
+    if (row < 2u) winner[row] = UINT32_MAX - (uint32_t)best_key[row];
+}
+
 struct mtp_native_layout {
     uint64_t scores, key_in, key_out, id_tmp, flag, temporary;
 };
@@ -159,6 +359,11 @@ __global__ static void mtp_native_unpack_ids(uint32_t *ids, const uint64_t *keys
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < MTP_NATIVE_CAP) ids[i] = UINT32_MAX - (uint32_t)keys[i];
 }
+__global__ static void mtp_native_unpack_ids_count(
+        uint32_t *ids, const uint64_t *keys, uint32_t count) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) ids[i] = UINT32_MAX - (uint32_t)keys[i];
+}
 /* Moving key writes into projection is equivalent only when scratch writes
  * cannot change another input/output view or a concurrently read weight. */
 static bool mtp_native_key_range_disjoint(const void *a, uint64_t an,
@@ -166,6 +371,107 @@ static bool mtp_native_key_range_disjoint(const void *a, uint64_t an,
     const uintptr_t ap = (uintptr_t)a, bp = (uintptr_t)b;
     return a && b && an <= UINTPTR_MAX-ap && bn <= UINTPTR_MAX-bp &&
            (ap+an <= bp || bp+bn <= ap);
+}
+
+struct mtp_native_r2_layout {
+    uint64_t key_in, key_out, id_tmp, flag, temporary;
+};
+static mtp_native_r2_layout mtp_native_r2_offsets(uint32_t width) {
+    mtp_native_r2_layout l;
+    l.key_in = mtp_native_align(
+        2ull * MTP_NATIVE_DIM + 2ull * (MTP_NATIVE_DIM / 32u) * 4u);
+    l.key_out = mtp_native_align(l.key_in + 2ull * width * 8u);
+    l.id_tmp = mtp_native_align(l.key_out + 2ull * width * 8u);
+    l.flag = mtp_native_align(l.id_tmp + 2ull * TARGET_NATIVE_CAP * 4u);
+    l.temporary = mtp_native_align(l.flag + 4u);
+    return l;
+}
+
+extern "C" int ds4_gpu_mtp_native_screen_r2_init(
+        uint32_t width, uint64_t *bytes, uint32_t *capacity) {
+    if (!bytes || !capacity) return -1;
+    *bytes = 0;
+    *capacity = 0;
+    if (width <= TARGET_NATIVE_CAP || width > MTP_NATIVE_MAX_WIDTH) return 0;
+    size_t a = 0;
+    size_t b = 0;
+    if (cub::DeviceRadixSort::SortKeysDescending(
+            nullptr, a, (const uint64_t *)nullptr, (uint64_t *)nullptr,
+            width, 0, 64, cuda_decode_stream()) != cudaSuccess ||
+        cub::DeviceRadixSort::SortKeys(
+            nullptr, b, (const uint32_t *)nullptr, (uint32_t *)nullptr,
+            TARGET_NATIVE_CAP, 0, 32,
+            cuda_decode_stream()) != cudaSuccess) return -1;
+    *bytes = mtp_native_r2_offsets(width).temporary + std::max(a, b);
+    *capacity = TARGET_NATIVE_CAP;
+    return 1;
+}
+
+/* Exact fused target top-1.  Returns 1 when used, 0 for the established full
+ * logits fallback, and -1 on a backend error. */
+extern "C" int ds4_gpu_mtp_native_top1_r2(
+        ds4_gpu_tensor *winner, ds4_gpu_tensor *scratch, const void *map,
+        uint64_t map_bytes, uint64_t offset, uint32_t in_dim, uint32_t vocab,
+        const ds4_gpu_tensor *x) {
+    constexpr uint64_t blocks = MTP_NATIVE_DIM / 32u;
+    if (in_dim != MTP_NATIVE_DIM || !vocab ||
+        vocab > MTP_NATIVE_MAX_WIDTH || !cuda_q8_use_dp4a() ||
+        getenv("DS4_QWEN4EXP_NO_ROW_TILE") != nullptr ||
+        getenv("DS4_QWEN4EXP_PAIR_LANES_R2") != nullptr ||
+        getenv("DS4_QWEN4EXP_NO_TARGET_EXACT_TOP1_R2") != nullptr) return 0;
+    const uint64_t quant_bytes =
+        2ull * MTP_NATIVE_DIM + 2ull * blocks * sizeof(float);
+    const uint64_t key_offset = mtp_native_align(quant_bytes);
+    if (!winner || !scratch || !x || !map ||
+        winner->bytes < 2u * sizeof(uint32_t) ||
+        scratch->bytes < key_offset + 2u * sizeof(unsigned long long) ||
+        x->bytes < 2ull * in_dim * sizeof(float) || offset > map_bytes ||
+        (uint64_t)vocab > (map_bytes - offset) / (blocks * 34u)) return -1;
+    const int tier = ds4_tensor_device_idx(winner);
+    int current = -1;
+    cudaStreamCaptureStatus capture;
+    if (g_n_gpus != 1 || tier != 0 ||
+        ds4_tensor_device_idx(scratch) != tier ||
+        ds4_tensor_device_idx(x) != tier) return 0;
+    if (cudaGetDevice(&current) != cudaSuccess ||
+        cudaStreamIsCapturing(cuda_decode_stream(), &capture) != cudaSuccess)
+        return -1;
+    if (current != g_gpu[0].device_id ||
+        capture != cudaStreamCaptureStatusNone) return 0;
+    const char *w = cuda_resolve_weight_ptr(
+        map, offset, (uint64_t)vocab * blocks * 34u, tier,
+        "native target exact R2 output");
+    if (!w) return -1;
+    if ((uintptr_t)w & 1u) return 0;
+    if (!mtp_native_key_range_disjoint(
+            scratch->ptr, scratch->bytes, w,
+            (uint64_t)vocab * blocks * 34u) ||
+        !mtp_native_key_range_disjoint(
+            scratch->ptr, scratch->bytes, x->ptr, x->bytes) ||
+        !mtp_native_key_range_disjoint(
+            scratch->ptr, scratch->bytes, winner->ptr, winner->bytes)) return 0;
+
+    char *base = (char *)scratch->ptr;
+    int8_t *xq = (int8_t *)base;
+    float *xs = (float *)(base + 2ull * MTP_NATIVE_DIM);
+    unsigned long long *best_key =
+        (unsigned long long *)(base + key_offset);
+    if (!cuda_ok(cudaMemsetAsync(
+            best_key, 0, 2u * sizeof(*best_key), cuda_decode_stream()),
+            "native target exact R2 clear")) return -1;
+    quantize_q8_0_f32_rows_warp_kernel<<<20, 256, 0, cuda_decode_stream()>>>(
+        xq, xs, (const float *)x->ptr, in_dim, (uint32_t)blocks, 2u);
+    if (!cuda_ok(cudaGetLastError(),
+                 "native target exact R2 quantize")) return -1;
+    mtp_native_projection_r2_top1_kernel<<<
+        (vocab + 3u) / 4u, 256, 0, cuda_decode_stream()>>>(
+            best_key, (const unsigned char *)w, xq, xs, vocab);
+    if (!cuda_ok(cudaGetLastError(),
+                 "native target exact R2 projection")) return -1;
+    mtp_native_top1_r2_unpack_kernel<<<1, 2, 0, cuda_decode_stream()>>>(
+        (uint32_t *)winner->ptr, best_key);
+    return cuda_ok(cudaGetLastError(),
+                   "native target exact R2 unpack") ? 1 : -1;
 }
 
 /* -1: backend error, 0: ordinary full-static fallback, positive: exact number
@@ -246,6 +552,113 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
         (const uint32_t *)ids->ptr,vocab,prefix,tail);
     return cuda_ok(cudaGetLastError(),"native exact refinement") ? (int)MTP_NATIVE_CAP : -1;
 }
+
+/* Two-row target-head variant.  Positive means both rows occupy contiguous
+ * [2][MTP_NATIVE_CAP] regions in out and ids. */
+extern "C" int ds4_gpu_mtp_native_screen_r2(ds4_gpu_tensor *out,
+        ds4_gpu_tensor *ids, ds4_gpu_tensor *scratch, const void *map,
+        uint64_t map_bytes, uint64_t offset, uint32_t in_dim, uint32_t vocab,
+        uint32_t prefix, uint32_t tail, const ds4_gpu_tensor *x) {
+    const uint64_t wide = (uint64_t)prefix + tail;
+    if (in_dim != MTP_NATIVE_DIM || !prefix || !tail ||
+        tail >= TARGET_NATIVE_CAP || prefix > vocab || tail > vocab - prefix ||
+        wide <= TARGET_NATIVE_CAP || wide > MTP_NATIVE_MAX_WIDTH ||
+        !cuda_q8_use_dp4a() ||
+        getenv("DS4_QWEN4EXP_NO_ROW_TILE") != nullptr ||
+        getenv("DS4_QWEN4EXP_PAIR_LANES_R2") != nullptr ||
+        getenv("DS4_MTP_NO_FUSED_SCREEN_KEYS") != nullptr) return 0;
+    const uint32_t width = (uint32_t)wide;
+    const mtp_native_r2_layout l = mtp_native_r2_offsets(width);
+    if (!out || !ids || !scratch || !x || !map ||
+        out->bytes < 2ull * TARGET_NATIVE_CAP * 4u ||
+        ids->bytes < 2ull * TARGET_NATIVE_CAP * 4u ||
+        scratch->bytes <= l.temporary ||
+        x->bytes < 2ull * in_dim * 4u || offset > map_bytes ||
+        (uint64_t)vocab > (map_bytes - offset) / (80u * 34u)) return -1;
+    const int tier = ds4_tensor_device_idx(out);
+    int current = -1;
+    cudaStreamCaptureStatus capture;
+    if (g_n_gpus != 1 || tier != 0 ||
+        ds4_tensor_device_idx(ids) != tier ||
+        ds4_tensor_device_idx(scratch) != tier ||
+        ds4_tensor_device_idx(x) != tier) return 0;
+    if (cudaGetDevice(&current) != cudaSuccess ||
+        cudaStreamIsCapturing(cuda_decode_stream(), &capture) != cudaSuccess)
+        return -1;
+    if (current != g_gpu[0].device_id ||
+        capture != cudaStreamCaptureStatusNone) return 0;
+    const char *w = cuda_resolve_weight_ptr(
+        map, offset, (uint64_t)vocab * 80u * 34u, tier,
+        "native target R2 output");
+    if (!w) return -1;
+    if ((uintptr_t)w & 1u) return 0;
+    if (!mtp_native_key_range_disjoint(
+            scratch->ptr, scratch->bytes, w,
+            (uint64_t)vocab * 80u * 34u) ||
+        !mtp_native_key_range_disjoint(
+            scratch->ptr, scratch->bytes, x->ptr, x->bytes) ||
+        !mtp_native_key_range_disjoint(
+            scratch->ptr, scratch->bytes, out->ptr, out->bytes) ||
+        !mtp_native_key_range_disjoint(
+            scratch->ptr, scratch->bytes, ids->ptr, ids->bytes)) return 0;
+
+    char *base = (char *)scratch->ptr;
+    int8_t *xq = (int8_t *)base;
+    float *xs = (float *)(base + 2ull * MTP_NATIVE_DIM);
+    uint64_t *key_in = (uint64_t *)(base + l.key_in);
+    uint64_t *key_out = (uint64_t *)(base + l.key_out);
+    uint32_t *id_tmp = (uint32_t *)(base + l.id_tmp);
+    uint32_t *flag = (uint32_t *)(base + l.flag);
+    if (!cuda_ok(cudaMemsetAsync(
+            flag, 0, 4, cuda_decode_stream()), "native target R2 flag"))
+        return -1;
+    quantize_q8_0_f32_rows_warp_kernel<<<20, 256, 0, cuda_decode_stream()>>>(
+        xq, xs, (const float *)x->ptr, in_dim, 80, 2);
+    if (!cuda_ok(cudaGetLastError(), "native target R2 quantize")) return -1;
+    mtp_native_projection_r2_screen_kernel
+        <<<(width + 3u) / 4u, 256, 0, cuda_decode_stream()>>>(
+            key_in, flag, (const unsigned char *)w, xq, xs, width,
+            vocab, prefix, tail);
+    if (!cuda_ok(cudaGetLastError(), "native target R2 screen")) return -1;
+    uint32_t invalid = 0;
+    if (!ds4_gpu_tensor_read(scratch, l.flag, &invalid, 4)) return -1;
+    if (invalid) return 0;
+
+    for (uint32_t r = 0; r < 2u; r++) {
+        size_t temporary = (size_t)(scratch->bytes - l.temporary);
+        if (!cuda_ok(cub::DeviceRadixSort::SortKeysDescending(
+                base + l.temporary, temporary, key_in + (uint64_t)r * width,
+                key_out + (uint64_t)r * width, width, 0, 64,
+                cuda_decode_stream()), "native target R2 score sort"))
+            return -1;
+        mtp_native_unpack_ids_count<<<
+            (TARGET_NATIVE_CAP + 255u) / 256u, 256, 0,
+            cuda_decode_stream()>>>(
+                id_tmp + (uint64_t)r * TARGET_NATIVE_CAP,
+                key_out + (uint64_t)r * width, TARGET_NATIVE_CAP);
+        if (!cuda_ok(cudaGetLastError(),
+                     "native target R2 candidate unpack")) return -1;
+        temporary = (size_t)(scratch->bytes - l.temporary);
+        uint32_t *row_ids =
+            (uint32_t *)ids->ptr + (uint64_t)r * TARGET_NATIVE_CAP;
+        if (!cuda_ok(cub::DeviceRadixSort::SortKeys(
+                base + l.temporary, temporary,
+                id_tmp + (uint64_t)r * TARGET_NATIVE_CAP, row_ids,
+                TARGET_NATIVE_CAP, 0, 32, cuda_decode_stream()),
+                "native target R2 original-ID sort")) return -1;
+        mtp_native_projection_kernel<false><<<
+            (TARGET_NATIVE_CAP + 3u) / 4u, 256, 0,
+            cuda_decode_stream()>>>(
+                (float *)out->ptr + (uint64_t)r * TARGET_NATIVE_CAP,
+                (const unsigned char *)w,
+                xq + (uint64_t)r * MTP_NATIVE_DIM,
+                xs + (uint64_t)r * (MTP_NATIVE_DIM / 32u),
+                TARGET_NATIVE_CAP, row_ids, vocab, prefix, tail);
+        if (!cuda_ok(cudaGetLastError(),
+                     "native target R2 exact refinement")) return -1;
+    }
+    return (int)TARGET_NATIVE_CAP;
+}
 __global__ static void mtp_native_map(uint32_t *winner, const float *logits,
                                       const uint32_t *ids, uint32_t count, uint32_t vocab) {
     const uint32_t bits = __float_as_uint(logits[0]);
@@ -265,4 +678,22 @@ extern "C" int ds4_gpu_mtp_native_map(ds4_gpu_tensor *winner,
     mtp_native_map<<<1,1,0,cuda_decode_stream()>>>((uint32_t *)winner->ptr,
         (const float *)logits->ptr,(const uint32_t *)ids->ptr,count,vocab);
     return cuda_ok(cudaGetLastError(),"native original winner map");
+}
+extern "C" int ds4_gpu_mtp_native_map_r2(ds4_gpu_tensor *winner,
+        const ds4_gpu_tensor *logits, const ds4_gpu_tensor *ids,
+        uint32_t count, uint32_t vocab) {
+    if (!winner || !logits || !ids || count != TARGET_NATIVE_CAP || !vocab ||
+        winner->bytes < 4 || logits->bytes < (uint64_t)count * 4u ||
+        ids->bytes < (uint64_t)count * 4u) return 0;
+    const int tier = ds4_tensor_device_idx(winner);
+    int current = -1;
+    if (tier < 0 || tier >= g_n_gpus ||
+        ds4_tensor_device_idx(logits) != tier ||
+        ds4_tensor_device_idx(ids) != tier ||
+        cudaGetDevice(&current) != cudaSuccess ||
+        current != g_gpu[tier].device_id) return 0;
+    mtp_native_map<<<1, 1, 0, cuda_decode_stream()>>>(
+        (uint32_t *)winner->ptr, (const float *)logits->ptr,
+        (const uint32_t *)ids->ptr, count, vocab);
+    return cuda_ok(cudaGetLastError(), "native target R2 winner map");
 }
