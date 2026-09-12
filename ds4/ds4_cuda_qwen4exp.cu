@@ -208,6 +208,31 @@ enum {
     QWEN4EXP_GDN_CONV_PARALLEL_MIN_TOKENS = 64
 };
 
+/* MEASURED NEGATIVE RESULTS on qwen4exp_gdn_value_reuse_kernel's value-row
+ * width, so nobody repeats them.  The kernel takes its rows per warp as the
+ * template parameter R; a block is four warps, so it covers 4 * R of a head's
+ * QWEN4EXP_GDN_DIM value rows and the grid's y extent is the matching divisor.
+ * Value rows are independent outputs, so R is a pure schedule knob and every
+ * value of it is bit-identical (max_abs_diff was 0 on both runs below).
+ *
+ * The shipped width is FOUR.  Raising it looked obviously right -- each
+ * doubling halves the redundant per-token q4/k4/gate loads across the blocks
+ * of one head and doubles the independent warp-reduction chains available to
+ * hide latency in a token-serial loop -- and it is WRONG on this box:
+ *
+ *   R = 4   composite 2.331358  (the base tree, fe27e733)
+ *   R = 8   composite 2.292315  (d840e029, spark-2)   1.68% worse
+ *
+ * With eight rows a head's 128 rows fall to 192 blocks over 48 SMs instead of
+ * 384, i.e. 16 warps an SM instead of 32, and the carried state doubles to 32
+ * floats a lane.  This kernel is occupancy-bound, not latency-bound: it wants
+ * many resident warps far more than it wants deep per-warp ILP.  R = 16 would
+ * halve residency again and is not worth a run.
+ *
+ * Do not re-derive the traffic argument and try again.  The reuse it saves is
+ * already being collected in cache; what it spends is warps, and warps are
+ * what this kernel is short of. */
+
 /*
  * PER-ROW STATE SNAPSHOTS, for the speculative cycle's rollback.  Twin of the
  * note on qwen4exp_gdn_args in metal/qwen4exp_gdn.metal, where the same pair
