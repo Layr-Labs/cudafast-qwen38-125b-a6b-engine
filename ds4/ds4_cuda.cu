@@ -4,7 +4,6 @@
 #include <mma.h>
 #include <cublas_v2.h>
 #include <cub/block/block_radix_sort.cuh>
-#include <cub/device/device_radix_sort.cuh>
 
 #include <stdint.h>
 #include <errno.h>
@@ -5462,37 +5461,12 @@ __global__ static void quantize_q8_0_f32_kernel(
  * divide by 127, the reciprocal-or-zero, lrintf, the clamp, the zero fill of a
  * partial tail) is per element and unchanged.
  */
-/* The decode/verify widths a PSS consumer can launch behind this quantizer:
- * the graph-capture ceiling, DS4_QWEN4EXP_MTP_MAX_COMMIT (7), restated here
- * because this translation unit does not include the MTP header. */
-#define DS4_Q8_QUANT_PDL_MAX_ROWS 7u
-/* The row bound alone does not make those widths single-wave: the grid is
- * ceil(rows * blocks / 8), and `blocks` grows with the input width.  The
- * GB10 holds 48 SMs x 1536 resident threads = 288 of this kernel's
- * 256-thread blocks at once, so a grid past 288 cannot be one wave and a
- * trigger behind it is the deadlock below.  In-model widths stay far under
- * it (rows*blocks/8 = 70 at the worst); a public caller at the API's full
- * in_dim would not. */
-#define DS4_Q8_QUANT_PDL_MAX_BLOCKS 288u
-
 __global__ static void quantize_q8_0_f32_rows_warp_kernel(int8_t *xq,
                                                           float *xscale,
                                                           const float *x,
                                                           uint64_t in_dim,
                                                           uint64_t blocks,
                                                           uint32_t n_rows) {
-    /* PDL producer for the projections that read this quantization on the
-     * decode stream (the GDN in-projection and the QSA Q/K/V launches).
-     * Gated to the decode widths AND to a grid the device can hold at once:
-     * at the in-model widths the grid is rows * blocks / 8 = seventy
-     * 256-thread blocks on the 48-SM GB10, single-wave with margin under
-     * the 288-block ceiling above; a prefill launch, or a public caller at
-     * the API's full input width, exceeds it and never triggers -- the
-     * deadlock rule at the trigger macro (ds4_cuda_qwen4exp.cuh) -- not that
-     * any PSS consumer follows one at those widths. */
-    if (n_rows <= DS4_Q8_QUANT_PDL_MAX_ROWS &&
-        (n_rows * blocks + 7u) / 8u <= DS4_Q8_QUANT_PDL_MAX_BLOCKS)
-        QWEN4EXP_PDL_TRIGGER();
     const uint64_t pair =
         (uint64_t)blockIdx.x * (blockDim.x >> 5u) + (threadIdx.x >> 5u);
     if (pair >= (uint64_t)n_rows * blocks) return;
@@ -5728,57 +5702,7 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
 
     if (row < out_dim) {
         const unsigned char *wr = w + row * blocks * 34u;
-        /* PDL: the first walk step (b = group) with its WEIGHT loads issued
-         * above the fence and held in registers, so they fly while the
-         * quantizer drains.  The activation reads (xq/xscale, that kernel's
-         * output) stay below it; every statement is the loop's own, b
-         * ascends exactly as the rolled walk did, and the guard is the
-         * loop's own bounds check for a walk shorter than a warp's groups.
-         * The walk's remainder runs unchanged from group + 32. */
-        if (group < blocks) {
-            const uint64_t b = group;
-            /* Name both lanes of every live pair even if independent
-             * scheduling has temporarily separated their execution. */
-            const uint64_t warp_base = b - (uint64_t)(group & 15u);
-            const uint64_t remaining = blocks - warp_base;
-            const uint32_t live_pairs = (uint32_t)(remaining < 16u ? remaining : 16u);
-            const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
-            const int8_t *payload = (const int8_t *)(wr + b * 34u + 2u) + half * 16u;
-            const uintptr_t address = (uintptr_t)payload;
-            const uint32_t shift = (uint32_t)(address & 3u) * 8u;
-            const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
-            /* Weights stream through each projection once. Mark their reads
-             * evict-first while leaving the reusable activation loads alone. */
-            uint32_t previous = Streaming ? __ldcs(words) : words[0];
-            int32_t wq[4];
-#pragma unroll
-            for (int j = 0; j < 3; j++) {
-                const uint32_t next = Streaming ? __ldcs(words + j + 1) : words[j + 1];
-                wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
-                previous = next;
-            }
-            const uint16_t *lastp = (const uint16_t *)(const void *)(payload + 14);
-            const uint16_t last = Streaming ? __ldcs(lastp) : *lastp;
-            wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
-            const __half *scale = (const __half *)(wr + b * 34u);
-            const float ws = Streaming
-                ? __half2float(__ushort_as_half(__ldcs((const uint16_t *)scale)))
-                : __half2float(*scale);
-            QWEN4EXP_PDL_SYNC();
-#pragma unroll
-            for (int r = 0; r < R; r++) {
-                if ((uint32_t)r < take) {
-                    const uint64_t at = ((uint64_t)row0 + r) * blocks + b;
-                    const int32_t *xw = (const int32_t *)(xq + at * 32u + half * 16u);
-                    int dot = 0;
-#pragma unroll
-                    for (int j = 0; j < 4; j++) dot = __dp4a(wq[j], xw[j], dot);
-                    dot += __shfl_xor_sync(active, dot, 1);
-                    if (half == 0u) acc[r] += ws * xscale[at] * (float)dot;
-                }
-            }
-        }
-        for (uint64_t b = group + 32u; b < blocks; b += 32u) {
+        for (uint64_t b = group; b < blocks; b += 32u) {
             /* Name both lanes of every live pair even if independent
              * scheduling has temporarily separated their execution. */
             const uint64_t warp_base = b - (uint64_t)(group & 15u);
@@ -5849,49 +5773,7 @@ __global__ static void matmul_q8_hc_down_pair_kernel(
     const unsigned part = threadIdx.x % L;
     const uint64_t row = blockIdx.x;
     float acc[2] = {0.0f, 0.0f};
-    /* PDL: the first walk step (b = group, which every lane owns, group
-     * being under 32 and the walk being 320 wide) with its WEIGHT loads
-     * issued above the fence and held in registers, so they fly while the
-     * norm kernel drains.  The activation reads (xq/xs, that kernel's
-     * output) stay below it; every statement is the loop's own, and b
-     * ascends exactly as the rolled walk did, so the accumulation order is
-     * untouched.  The walk's remainder runs unchanged from group + 32. */
-    {
-        const unsigned char *blk = w + row * 10880u + group * 34u;
-        const unsigned char *payload = blk + 2u + part * (32u / L);
-        const uintptr_t address = (uintptr_t)payload;
-        const unsigned shift = (address & 3u) * 8u;
-        const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
-        uint32_t previous = words[0];
-        int32_t wq[8/L];
-#pragma unroll
-        for (int j = 0; j < 8/L - 1; j++) {
-            const uint32_t next = words[j + 1];
-            wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
-            previous = next;
-        }
-        const uint16_t last = *(const uint16_t *)(payload + 32u/L - 2u);
-        wq[8/L - 1] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
-        float ws = 0.0f;
-        if (part == 0u) ws = __half2float(*(const __half *)blk);
-        QWEN4EXP_PDL_SYNC();
-#pragma unroll
-        for (unsigned r = 0; r < 2u; r++) {
-            if (r < rows) {
-                const unsigned at = r * 320u + group;
-                const int32_t *xw =
-                        (const int32_t *)(xq + at * 32u + part * (32u/L));
-                int dot = 0;
-#pragma unroll
-                for (int j = 0; j < 8/L; j++) dot = __dp4a(wq[j], xw[j], dot);
-#pragma unroll
-                for (int d = 1; d < L; d *= 2)
-                    dot += __shfl_xor_sync(0xffffffffu, dot, d);
-                if (part == 0u) acc[r] += ws * xs[at] * (float)dot;
-            }
-        }
-    }
-    for (unsigned b = group + 32u; b < 320u; b += 32u) {
+    for (unsigned b = group; b < 320u; b += 32u) {
         const unsigned char *blk = w + row * 10880u + b * 34u;
         const unsigned char *payload = blk + 2u + part * (32u / L);
         const uintptr_t address = (uintptr_t)payload;
@@ -5969,12 +5851,6 @@ __global__ static void matmul_q8_hc_warp_pair_kernel(
         const uint16_t last = __ldcs((const uint16_t *)(payload + 14u));
         wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
         const float ws = __half2float(__ushort_as_half(__ldcs((const uint16_t *)blk)));
-        /* PDL: every weight word this lane owns is in registers -- this
-         * kernel reads the whole weight group before the first activation
-         * word -- so the fence goes here and holds the activation reads
-         * (xq/xs, the silu kernel's output) until it releases.  Nothing
-         * else moves. */
-        QWEN4EXP_PDL_SYNC();
 #pragma unroll
         for (int r = 0; r < R; r++) {
             if ((unsigned)r < rows) {
@@ -16730,31 +16606,6 @@ int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows) {
            n_rows >= 8u && getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL;
 }
 
-/* The PDL valve (see ds4_cuda_qwen4exp.cuh).  Off when
- * DS4_QWEN4EXP_NO_PDL_PREFETCH is set to a non-zero value, and on any device
- * too old to have compiled the fence in.  Resolved once; the value cannot
- * change after the first call and a captured graph replays the launches it
- * recorded, so the choice is capture-safe.  Defined here so both translation
- * units share one cached read of the environment. */
-int ds4_qwen4exp_pdl_enabled(void) {
-    static int resolved = 0;
-    static int enabled = 0;
-    if (!resolved) {
-        int dev = 0;
-        int major = 0;
-        if (cudaGetDevice(&dev) == cudaSuccess &&
-            cudaDeviceGetAttribute(&major,
-                                   cudaDevAttrComputeCapabilityMajor,
-                                   dev) == cudaSuccess) {
-            const char *e = getenv("DS4_QWEN4EXP_NO_PDL_PREFETCH");
-            enabled = major >= 9 && !(e && e[0] && e[0] != '0');
-            resolved = 1;
-        }
-        /* a failed query leaves PDL off and unresolved; it retries */
-    }
-    return enabled;
-}
-
 #define DS4_Q8_DENSE_MMA_LAUNCH(WM, WN, MT, NT, G)                                   \
     do {                                                                       \
         const unsigned bm = (unsigned)((WM) * (MT) * 16);                      \
@@ -16842,11 +16693,7 @@ static int cuda_matmul_q8_0_preq_rows_exact(
         getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
         getenv("DS4_Q8_NO_HC_DOWN_PAIR") == NULL &&
         (((uintptr_t)wptr & 1u) == 0u)) {
-        /* PDL consumer: the stream predecessor is qwen4exp_hc_norm_quant,
-         * which triggers at its top, and the kernel's weight-word prefetch
-         * rides the norm's window (ds4_cuda_qwen4exp.cuh). */
-        QWEN4EXP_LAUNCH_PDL(matmul_q8_hc_down_pair_kernel, 320, 64, 0,
-                            cuda_decode_stream(),
+        matmul_q8_hc_down_pair_kernel<<<320, 64, 0, cuda_decode_stream()>>>(
                 (float *)out->ptr, (const unsigned char *)wptr,
                 xq, xscale, n_rows);
         return cuda_ok(cudaGetLastError(), "q8 HC down pair launch");
@@ -16862,22 +16709,14 @@ static int cuda_matmul_q8_0_preq_rows_exact(
         if (in_dim == 320u && out_dim == 10240u &&
             getenv("DS4_Q8_NO_STREAM_LOADS") == NULL) {
             if (getenv("DS4_Q8_NO_HC_WARP_PAIR") == NULL) {
-                /* PDL consumer: the stream predecessor is
-                 * qwen4exp_hc_silu_quant, which triggers at its top
-                 * (ds4_cuda_qwen4exp.cuh). */
-                QWEN4EXP_LAUNCH_PDL(
-                        (matmul_q8_hc_warp_pair_kernel<2>),
-                        (unsigned)((out_dim + 3u) / 4u), 128, 0,
-                        cuda_decode_stream(),
-                        (float *)out->ptr, (const unsigned char *)wptr,
-                        xq, xscale, out_dim, n_rows);
+                matmul_q8_hc_warp_pair_kernel<2><<<
+                    (unsigned)((out_dim + 3u) / 4u), 128, 0, cuda_decode_stream()>>>(
+                    (float *)out->ptr, (const unsigned char *)wptr,
+                    xq, xscale, out_dim, n_rows);
             } else {
-                /* PDL consumer: the valve leg of the HC up edge; the stream
-                 * predecessor qwen4exp_hc_silu_quant triggers at its top. */
-                QWEN4EXP_LAUNCH_PDL(
-                        (matmul_q8_0_preq_pair_lanes_kernel<2>),
-                        (dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u)),
-                        256, 0, cuda_decode_stream(),
+                matmul_q8_0_preq_pair_lanes_kernel<2><<<
+                        dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u),
+                        256, 0, cuda_decode_stream()>>>(
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
                         out_dim, n_rows, blocks);
             }
@@ -16886,19 +16725,15 @@ static int cuda_matmul_q8_0_preq_rows_exact(
              * general dense projections. The HC warp geometry above is
              * independent of this two-warp kernel's token-row bound. */
             if (n_rows == 1u && getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL) {
-                /* PDL consumer: the stream predecessor is the decode
-                 * quantizer, which triggers at its top (decode widths). */
-                QWEN4EXP_LAUNCH_PDL(
-                        (matmul_q8_0_preq_pair_lanes_kernel<1, false>),
-                        (dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u)),
-                        256, 0, cuda_decode_stream(),
+                matmul_q8_0_preq_pair_lanes_kernel<1, false><<<
+                        dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u),
+                        256, 0, cuda_decode_stream()>>>(
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
                         out_dim, n_rows, blocks);
             } else {
-                QWEN4EXP_LAUNCH_PDL(
-                        (matmul_q8_0_preq_pair_lanes_kernel<2, false>),
-                        (dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u)),
-                        256, 0, cuda_decode_stream(),
+                matmul_q8_0_preq_pair_lanes_kernel<2, false><<<
+                        dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u),
+                        256, 0, cuda_decode_stream()>>>(
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
                         out_dim, n_rows, blocks);
             }
@@ -17977,6 +17812,110 @@ static void matmul_f32_warp_tile_kernel(
     }
 }
 
+/* The same warp tile, eight warps to a block instead of four, arranged WR
+ * row-groups by WC column-groups.  Nothing a warp computes changes: the eight
+ * chains, the pairs they are walked in, the fold order and the shuffle tree
+ * are matmul_f32_warp_tile_kernel's line for line (the pair walk IS the same
+ * function, and the fold and tree lines below are its own text, so the
+ * router mutant script's anchors bite here too).  What changes is which
+ * warps share an SM at once: the WC warps of a row group read the same TM
+ * activation rows and the WR warps of a column group read the same TN weight
+ * columns, so a block's L2 traffic per output drops from (TM + TN) row-reads
+ * per tile to (WR*TM + WC*TN) per WR*WC tiles, and the residency is one
+ * 256-thread block per SM rather than two 128-thread ones. */
+template <int TM, int TN, int WR, int WC, int MC>
+__global__ __launch_bounds__(32 * WR * WC, 1)
+static void matmul_f32_warp_tile8_kernel(
+        float *out,
+        const float *w,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint32_t n_rows) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5;
+    const uint32_t wr_i = warp / (uint32_t)WC, wc_i = warp % (uint32_t)WC;
+    const uint32_t tile = blockIdx.x * (uint32_t)WC + wc_i;
+    const uint32_t ntn = (uint32_t)(out_dim / (uint64_t)TN);
+    if (tile >= ntn) return;
+    const uint32_t col0 = tile * (uint32_t)TN;
+    const uint32_t row0 = (blockIdx.y * (uint32_t)WR + wr_i) * (uint32_t)TM;
+    if (row0 >= n_rows) return;
+    const uint32_t take = n_rows - row0 < (uint32_t)TM ? n_rows - row0
+                                                       : (uint32_t)TM;
+
+    const float *wr[TN];
+    const float *xr[TM];
+#pragma unroll
+    for (int c = 0; c < TN; c++) wr[c] = w + (uint64_t)(col0 + c) * in_dim;
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+        xr[t] = x + (uint64_t)(row0 + (t < (int)take ? (uint32_t)t : 0u)) * in_dim;
+    const uint32_t mcnt = (uint32_t)(in_dim >> 8);
+
+    float A[TM][TN], B[TM][TN], t0[TM][TN], t1[TM][TN];
+
+    /* h(p,64) = (c_p + c_{p+128}) + (c_{p+64} + c_{p+192}) */
+    matmul_f32_warp_tile_pair<TM, TN, MC>(t0, t1, 0u, 4u, lane, mcnt, wr, xr);
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int c = 0; c < TN; c++) A[t][c] = t0[t][c] + t1[t][c];
+    matmul_f32_warp_tile_pair<TM, TN, MC>(t0, t1, 2u, 6u, lane, mcnt, wr, xr);
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int c = 0; c < TN; c++) A[t][c] = A[t][c] + (t0[t][c] + t1[t][c]);
+    /* h(p+32,64) = (c_{p+32} + c_{p+160}) + (c_{p+96} + c_{p+224}) */
+    matmul_f32_warp_tile_pair<TM, TN, MC>(t0, t1, 1u, 5u, lane, mcnt, wr, xr);
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int c = 0; c < TN; c++) B[t][c] = t0[t][c] + t1[t][c];
+    matmul_f32_warp_tile_pair<TM, TN, MC>(t0, t1, 3u, 7u, lane, mcnt, wr, xr);
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int c = 0; c < TN; c++) B[t][c] = B[t][c] + (t0[t][c] + t1[t][c]);
+
+    /* h(p,32) = h(p,64) + h(p+32,64), then strides 16, 8, 4, 2, 1. */
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int c = 0; c < TN; c++) {
+            float s = A[t][c] + B[t][c];
+#pragma unroll
+            for (int d = 16; d > 0; d >>= 1) {
+                s = s + __shfl_down_sync(0xffffffffu, s, d);
+            }
+            A[t][c] = s;
+        }
+    if (lane == 0u) {
+#pragma unroll
+        for (int t = 0; t < TM; t++) {
+            if ((uint32_t)t < take) {
+#pragma unroll
+                for (int c = 0; c < TN; c++) {
+                    out[(uint64_t)(row0 + (uint32_t)t) * out_dim +
+                        (uint64_t)(col0 + (uint32_t)c)] = A[t][c];
+                }
+            }
+        }
+    }
+}
+
+/* The eight-warp arrangement: four row groups by two column groups, so a
+ * block covers 24 rows by 16 columns.  DS4_F32_NO_WARP_TILE8 keeps the
+ * four-warp kernel above. */
+#define DS4_F32_WARP_TILE8_WR 4
+#define DS4_F32_WARP_TILE8_WC 2
+
+static inline int matmul_f32_warp_tile8_off(void) {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("DS4_F32_NO_WARP_TILE8") != NULL ? 1 : 0;
+    return cached;
+}
+
 /* Tile geometry, chosen by interleaved paired timing against the block kernel
  * it replaces (GB10, 48 SM, sm_121a; ncu is unavailable on this box so the
  * evidence is wall time and ptxas -v, not counters).  TM = 6, TN = 8, four
@@ -18040,27 +17979,8 @@ static void qwen_f32_vector_tree_kernel(float *out, const float *w,
     for (int r = 0; r < R; r++)
 #pragma unroll
         for (int j = 0; j < C; j++) acc[r][j] = 0.0f;
-    /* PDL: the first walk step (m = 0) with its WEIGHT leaves issued above
-     * the fence and held in registers, so they fly while the mixer's last
-     * kernel drains.  The activation reads (x, the mixer's output) stay
-     * below it; every statement is the loop's own, and m still ascends from
-     * 0, so the chain of FMAs is untouched.  The walk's remainder runs
-     * unchanged from m = 1. */
-    {
-        const unsigned at = C * t;
-        float wv[C];
-        qwen_f32_vector_read<C>(wv, w + col * 2560u + at);
-        QWEN4EXP_PDL_SYNC();
-#pragma unroll
-        for (int r = 0; r < R; r++) {
-            float xv[C];
-            qwen_f32_vector_read<C>(xv, x + (uint64_t)r * 2560u + at);
-#pragma unroll
-            for (int j = 0; j < C; j++) acc[r][j] += wv[j] * xv[j];
-        }
-    }
 #pragma unroll U
-    for (int m = 1; m < 10; m++) {
+    for (int m = 0; m < 10; m++) {
         const unsigned at = C * t + 256u * (unsigned)m;
         float wv[C];
         qwen_f32_vector_read<C>(wv, w + col * 2560u + at);
@@ -18150,57 +18070,7 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
 
     if (row < out_dim) {
         const unsigned char *wr = w + row * blocks * 34u;
-        /* PDL: the first walk step (b = group) with its WEIGHT loads issued
-         * above the fence and held in registers, so they fly while the
-         * quantizer drains.  The activation reads (xq/xscale, that kernel's
-         * output) stay below it; every statement is the loop's own, b
-         * ascends exactly as the rolled walk did, and the guard is the
-         * loop's own bounds check for a walk shorter than a warp's groups.
-         * The walk's remainder runs unchanged from group + 32. */
-        if (group < blocks) {
-            const uint64_t b = group;
-            /* Name both lanes of every live pair even if independent
-             * scheduling has temporarily separated their execution. */
-            const uint64_t warp_base = b - (uint64_t)(group & 15u);
-            const uint64_t remaining = blocks - warp_base;
-            const uint32_t live_pairs = (uint32_t)(remaining < 16u ? remaining : 16u);
-            const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
-            const int8_t *payload = (const int8_t *)(wr + b * 34u + 2u) + half * 16u;
-            const uintptr_t address = (uintptr_t)payload;
-            const uint32_t shift = (uint32_t)(address & 3u) * 8u;
-            const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
-            /* Weights stream through each projection once. Mark their reads
-             * evict-first while leaving the reusable activation loads alone. */
-            uint32_t previous = Streaming ? __ldcs(words) : words[0];
-            int32_t wq[4];
-#pragma unroll
-            for (int j = 0; j < 3; j++) {
-                const uint32_t next = Streaming ? __ldcs(words + j + 1) : words[j + 1];
-                wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
-                previous = next;
-            }
-            const uint16_t *lastp = (const uint16_t *)(const void *)(payload + 14);
-            const uint16_t last = Streaming ? __ldcs(lastp) : *lastp;
-            wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
-            const __half *scale = (const __half *)(wr + b * 34u);
-            const float ws = Streaming
-                ? __half2float(__ushort_as_half(__ldcs((const uint16_t *)scale)))
-                : __half2float(*scale);
-            QWEN4EXP_PDL_SYNC();
-#pragma unroll
-            for (int r = 0; r < R; r++) {
-                if ((uint32_t)r < take) {
-                    const uint64_t at = ((uint64_t)row0 + r) * blocks + b;
-                    const int32_t *xw = (const int32_t *)(xq + at * 32u + half * 16u);
-                    int dot = 0;
-#pragma unroll
-                    for (int j = 0; j < 4; j++) dot = __dp4a(wq[j], xw[j], dot);
-                    dot += __shfl_xor_sync(active, dot, 1);
-                    if (half == 0u) acc[r] += ws * xscale[at] * (float)dot;
-                }
-            }
-        }
-        for (uint64_t b = group + 32u; b < blocks; b += 32u) {
+        for (uint64_t b = group; b < blocks; b += 32u) {
             /* Name both lanes of every live pair even if independent
              * scheduling has temporarily separated their execution. */
             const uint64_t warp_base = b - (uint64_t)(group & 15u);
@@ -18271,25 +18141,8 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
 #pragma unroll
         for (int j = 0; j < C; j++) acc[r][j] = 0.0f;
     if (t < 128u) {
-        /* PDL: the first walk step (m = 0) with its WEIGHT leaves above the
-         * fence, the activation reads (x, written two kernels back and
-         * complete before the quantizer started) below it; statements are
-         * the loop's own and m still ascends from 0. */
-        {
-            const unsigned at = C * t;
-            float wv[C];
-            qwen_f32_vector_read<C>(wv, w + col * 2560u + at);
-            QWEN4EXP_PDL_SYNC();
-#pragma unroll
-            for (int r = 0; r < R; r++) {
-                float xv[C];
-                qwen_f32_vector_read<C>(xv, x + (uint64_t)r * 2560u + at);
-#pragma unroll
-                for (int j = 0; j < C; j++) acc[r][j] += wv[j] * xv[j];
-            }
-        }
 #pragma unroll U
-    for (int m = 1; m < 10; m++) {
+    for (int m = 0; m < 10; m++) {
         const unsigned at = C * t + 256u * (unsigned)m;
         float wv[C];
         qwen_f32_vector_read<C>(wv, w + col * 2560u + at);
@@ -18369,48 +18222,25 @@ extern "C" int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
      * unrolling. Actual device pointers must support the vector load. */
     if (in_dim == 2560u &&
         ((out_dim == 48u && n_rows <= 2u) ||
-         (out_dim == 512u && n_rows <= 2u)) &&
+         (out_dim == 512u && n_rows == 2u)) &&
         (((uintptr_t)w | (uintptr_t)x->ptr) & 15u) == 0u &&
         getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
         getenv("DS4_F32_NO_VECTOR_DECODE") == NULL) {
         if (out_dim == 48u && n_rows == 1u) {
-            /* PDL consumer: on the router edge the stream predecessor is the
-             * mixer's closing kernel, which triggers at its top; the
-             * alpha/beta edges run the same fence harmlessly. */
-            QWEN4EXP_LAUNCH_PDL((qwen_f32_vector_tree_kernel<1, 2, 10>),
-                                (unsigned)out_dim, 128, 0,
-                                cuda_decode_stream(),
-                                (float *)out->ptr, (const float *)w,
-                                (const float *)x->ptr, out_dim);
+            qwen_f32_vector_tree_kernel<1, 2, 10><<<
+                (unsigned)out_dim, 128, 0, cuda_decode_stream()>>>(
+                    (float *)out->ptr, (const float *)w,
+                    (const float *)x->ptr, out_dim);
         } else if (out_dim == 48u) {
-            QWEN4EXP_LAUNCH_PDL((qwen_f32_vector_tree_kernel<2, 2, 10>),
-                                (unsigned)out_dim, 128, 0,
-                                cuda_decode_stream(),
-                                (float *)out->ptr, (const float *)w,
-                                (const float *)x->ptr, out_dim);
-        } else if (n_rows == 1u) {
-            /* PDL consumer, and the closing of the router asymmetry: the
-             * draft leg's one-row GEMV ran the plain matmul_f32_kernel while
-             * the two-row verify leg ran this tree.  The tree at R rows is
-             * per-row bit-equal to matmul_f32_kernel's reduction -- the
-             * cross-warp pair, the descending shuffle butterfly and the
-             * intra-thread class reduction reproduce the shared-memory
-             * halving tree's levels in the same association -- and R = 1
-             * changes only the row count, so the router's top-k sees the
-             * same logits either way (matmul.h, "The same rule for the F32
-             * projections").  The stream predecessor on this edge is the
-             * mixer's closing kernel, which triggers at its top. */
-            QWEN4EXP_LAUNCH_PDL((qwen_f32_vector_tree_kernel<1, 4, 1>),
-                                (unsigned)out_dim, 64, 0,
-                                cuda_decode_stream(),
-                                (float *)out->ptr, (const float *)w,
-                                (const float *)x->ptr, out_dim);
+            qwen_f32_vector_tree_kernel<2, 2, 10><<<
+                (unsigned)out_dim, 128, 0, cuda_decode_stream()>>>(
+                    (float *)out->ptr, (const float *)w,
+                    (const float *)x->ptr, out_dim);
         } else {
-            QWEN4EXP_LAUNCH_PDL((qwen_f32_vector_tree_kernel<2, 4, 1>),
-                                (unsigned)out_dim, 64, 0,
-                                cuda_decode_stream(),
-                                (float *)out->ptr, (const float *)w,
-                                (const float *)x->ptr, out_dim);
+            qwen_f32_vector_tree_kernel<2, 4, 1><<<
+                (unsigned)out_dim, 64, 0, cuda_decode_stream()>>>(
+                    (float *)out->ptr, (const float *)w,
+                    (const float *)x->ptr, out_dim);
         }
         return cuda_ok(cudaGetLastError(), "matmul_f32 vector decode launch");
     }
@@ -18436,6 +18266,25 @@ extern "C" int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
                   1);
         /* n_embd is 2560, so the chain length is 10 and the walk unrolls
          * whole.  Any other multiple of 256 takes the runtime count. */
+        /* The eight-warp block at the production chain length only: the
+         * runtime-count arm measured slower there, and nothing in the tower
+         * reaches it. */
+        if (in_dim == 2560u && !matmul_f32_warp_tile8_off()) {
+            const unsigned wr8 = DS4_F32_WARP_TILE8_WR, wc8 = DS4_F32_WARP_TILE8_WC;
+            const unsigned bm8 = wr8 * DS4_F32_WARP_TILE_TM;
+            const uint64_t ytiles8 = ((uint64_t)n_rows + bm8 - 1u) / bm8;
+            if (ytiles8 <= 65535u) {
+                dim3 grid8((ntn + wc8 - 1u) / wc8, (unsigned)ytiles8, 1);
+                matmul_f32_warp_tile8_kernel<DS4_F32_WARP_TILE_TM,
+                                             DS4_F32_WARP_TILE_TN,
+                                             DS4_F32_WARP_TILE8_WR,
+                                             DS4_F32_WARP_TILE8_WC, 2560 / 256>
+                    <<<grid8, 32 * wr8 * wc8, 0, cuda_decode_stream()>>>(
+                        (float *)out->ptr, (const float *)w,
+                        (const float *)x->ptr, in_dim, out_dim, n_rows);
+                return cuda_ok(cudaGetLastError(), "matmul_f32 warp tile8 launch");
+            }
+        }
         if (in_dim == 2560u) {
             matmul_f32_warp_tile_kernel<DS4_F32_WARP_TILE_TM,
                                         DS4_F32_WARP_TILE_TN,
@@ -18528,14 +18377,10 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
         (((uintptr_t)a.weights[0]|(uintptr_t)a.weights[1])&1u)==0u &&
         (((uintptr_t)a.weights[2]|(uintptr_t)a.weights[3]|(uintptr_t)a.x)&15u)==0u) {
         const unsigned grid=(unsigned)((qkv_dim+3u)/4u+(gate_dim+3u)/4u+96u);
-        /* PDL consumer: the stream predecessor is the mixed-input quantizer,
-         * which triggers at its top at these decode widths. */
         if (rows==1u)
-            QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1>),
-                                grid, 256, 0, cuda_decode_stream(), a);
+            qwen_gdn_projection_kernel<1><<<grid,256,0,cuda_decode_stream()>>>(a);
         else
-            QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2>),
-                                grid, 256, 0, cuda_decode_stream(), a);
+            qwen_gdn_projection_kernel<2><<<grid,256,0,cuda_decode_stream()>>>(a);
         return cuda_ok(cudaGetLastError(),"GDN four projections launch");
     }
     for (unsigned i=0;i<2;i++)
@@ -18576,57 +18421,7 @@ __global__ static void qwen_q8_projection_triple_kernel(
 
     if (row < out_dim) {
         const unsigned char *wr = w + row * blocks * 34u;
-        /* PDL: the first walk step (b = group) with its WEIGHT loads issued
-         * above the fence and held in registers, so they fly while the
-         * QSA pre-quantizer drains.  The activation reads (xq/xscale, that
-         * kernel's output) stay below it; every statement is the loop's
-         * own, b ascends exactly as the rolled walk did, and the guard is
-         * the loop's own bounds check for a walk shorter than a warp's
-         * groups.  The walk's remainder runs unchanged from group + 32. */
-        if (group < blocks) {
-            const uint64_t b = group;
-            /* Name both lanes of every live pair even if independent
-             * scheduling has temporarily separated their execution. */
-            const uint64_t warp_base = b - (uint64_t)(group & 15u);
-            const uint64_t remaining = blocks - warp_base;
-            const uint32_t live_pairs = (uint32_t)(remaining < 16u ? remaining : 16u);
-            const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
-            const int8_t *payload = (const int8_t *)(wr + b * 34u + 2u) + half * 16u;
-            const uintptr_t address = (uintptr_t)payload;
-            const uint32_t shift = (uint32_t)(address & 3u) * 8u;
-            const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
-            /* Weights stream through each projection once. Mark their reads
-             * evict-first while leaving the reusable activation loads alone. */
-            uint32_t previous = Streaming ? __ldcs(words) : words[0];
-            int32_t wq[4];
-#pragma unroll
-            for (int j = 0; j < 3; j++) {
-                const uint32_t next = Streaming ? __ldcs(words + j + 1) : words[j + 1];
-                wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
-                previous = next;
-            }
-            const uint16_t *lastp = (const uint16_t *)(const void *)(payload + 14);
-            const uint16_t last = Streaming ? __ldcs(lastp) : *lastp;
-            wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
-            const __half *scale = (const __half *)(wr + b * 34u);
-            const float ws = Streaming
-                ? __half2float(__ushort_as_half(__ldcs((const uint16_t *)scale)))
-                : __half2float(*scale);
-            QWEN4EXP_PDL_SYNC();
-#pragma unroll
-            for (int r = 0; r < R; r++) {
-                if ((uint32_t)r < take) {
-                    const uint64_t at = ((uint64_t)row0 + r) * blocks + b;
-                    const int32_t *xw = (const int32_t *)(xq + at * 32u + half * 16u);
-                    int dot = 0;
-#pragma unroll
-                    for (int j = 0; j < 4; j++) dot = __dp4a(wq[j], xw[j], dot);
-                    dot += __shfl_xor_sync(active, dot, 1);
-                    if (half == 0u) acc[r] += ws * xscale[at] * (float)dot;
-                }
-            }
-        }
-        for (uint64_t b = group + 32u; b < blocks; b += 32u) {
+        for (uint64_t b = group; b < blocks; b += 32u) {
             /* Name both lanes of every live pair even if independent
              * scheduling has temporarily separated their execution. */
             const uint64_t warp_base = b - (uint64_t)(group & 15u);
@@ -18720,17 +18515,13 @@ extern "C" int ds4_gpu_matmul_q8_0_preq_triple_rows_exact_tensor(
         getenv("DS4_QWEN4EXP_NO_QSA_Q8_TRIPLE")==NULL &&
         (((uintptr_t)w[0]|(uintptr_t)w[1]|(uintptr_t)w[2])&1u)==0u) {
         const unsigned grid=(unsigned)((od[0]+3u)/4u+(od[1]+3u)/4u+(od[2]+3u)/4u);
-        /* PDL consumer: the stream predecessor is the QSA pre-quantizer,
-         * which triggers at its top at these decode widths. */
         if (rows==1u)
-            QWEN4EXP_LAUNCH_PDL((qwen_q8_projection_triple_kernel<1>),
-                                grid, 256, 0, cuda_decode_stream(),
+            qwen_q8_projection_triple_kernel<1><<<grid,256,0,cuda_decode_stream()>>>(
                 (float *)outs[0]->ptr,(float *)outs[1]->ptr,(float *)outs[2]->ptr,
                 (const unsigned char *)w[0],(const unsigned char *)w[1],
                 (const unsigned char *)w[2],xq,xs,od[0],od[1],od[2],rows,blocks);
         else
-            QWEN4EXP_LAUNCH_PDL((qwen_q8_projection_triple_kernel<2>),
-                                grid, 256, 0, cuda_decode_stream(),
+            qwen_q8_projection_triple_kernel<2><<<grid,256,0,cuda_decode_stream()>>>(
                 (float *)outs[0]->ptr,(float *)outs[1]->ptr,(float *)outs[2]->ptr,
                 (const unsigned char *)w[0],(const unsigned char *)w[1],
                 (const unsigned char *)w[2],xq,xs,od[0],od[1],od[2],rows,blocks);
@@ -29576,22 +29367,7 @@ __global__ static void glm53_matvec_bf16_f32_kernel(
     if (col < out_dim) {
         const uint16_t *wrow = weights + (uint64_t)col * in_dim;
         const float *xrow = x + (uint64_t)row * in_dim;
-        /* PDL: the first K-step (i = lane) with its WEIGHT word issued above
-         * the fence and held in a register, so it flies while the QSA KV-prep
-         * kernel drains on the indexer edge.  The activation read (xrow, this
-         * projection's input) stays below it; the statements are the walk's
-         * own, i ascends exactly as the rolled walk did, and the guard is the
-         * walk's own bounds check -- a width under thirty-two starts no walk
-         * for the high lanes and reads no weight.  The walk's remainder runs
-         * unchanged from lane + 32.  The fence is a no-op in this kernel's
-         * plain launches (every GLM-5.3 path and every prefill width). */
-        const uint32_t i0 = lane;
-        float w0 = 0.0f;
-        const bool live0 = i0 < in_dim;
-        if (live0) w0 = __uint_as_float((uint32_t)wrow[i0] << 16);
-        QWEN4EXP_PDL_SYNC();
-        if (live0) sum = fmaf(w0, xrow[i0], sum);
-        for (uint32_t i = lane + 32u; i < in_dim; i += 32u) {
+        for (uint32_t i = lane; i < in_dim; i += 32u) {
             const float w = __uint_as_float((uint32_t)wrow[i] << 16);
             sum = fmaf(w, xrow[i], sum);
         }
@@ -29692,28 +29468,10 @@ extern "C" int ds4_gpu_glm53_matmul_bf16(
     if (!weights) return 0;
     if (n_rows <= 8u) {
         const dim3 grid((out_dim + 7u) / 8u, n_rows, 1u);
-        /* PDL consumer, the qwen4exp indexer's decode edge ONLY: a dedicated
-         * launch path gated to that geometry (the tower's 2560 input width
-         * and the two decode rows), so the GLM-5.3 callers, the prefill
-         * widths and every other shape keep the plain launch below byte for
-         * byte.  On that edge the stream predecessor is
-         * qwen4exp_qsa_prep_kv_append_fused_kernel, which triggers at its
-         * top, and the kernel's first K-step weight prefetch rides the
-         * window (ds4_cuda_qwen4exp.cuh).  The idx_q projection shares the
-         * entry and the gate; its own predecessor is multi-wave and never
-         * triggers, so the attribute there is inert. */
-        if (n_rows <= 2u && in_dim == 2560u) {
-            QWEN4EXP_LAUNCH_PDL(
-                    glm53_matvec_bf16_f32_kernel,
-                    grid, 256u, 0, cuda_decode_stream(),
-                    (float *)out->ptr, (const uint16_t *)weights,
-                    (const float *)x->ptr, in_dim, out_dim);
-        } else {
-            glm53_matvec_bf16_f32_kernel<<<grid, 256u, 0,
-                cuda_decode_stream()>>>(
-                    (float *)out->ptr, (const uint16_t *)weights,
-                    (const float *)x->ptr, in_dim, out_dim);
-        }
+        glm53_matvec_bf16_f32_kernel<<<grid, 256u, 0,
+            cuda_decode_stream()>>>(
+                (float *)out->ptr, (const uint16_t *)weights,
+                (const float *)x->ptr, in_dim, out_dim);
         return cuda_ok(cudaGetLastError(),
                        "GLM-5.3 BF16/F32 matvec launch");
     }
@@ -35743,5 +35501,3 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
 #define DS4_GLM53_VISION_STREAM cuda_decode_stream()
 #include "ds4_glm53_vision_gpu.cuh"
 #include "ds4_deepseek4_vision_gpu.cuh"
-
-#include "ds4_cuda_mtp_native.cuh"

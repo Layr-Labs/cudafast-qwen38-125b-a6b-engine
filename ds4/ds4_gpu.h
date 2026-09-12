@@ -845,16 +845,6 @@ int ds4_gpu_indexer_top1_value_tensor(
         uint32_t              n_tokens,
         uint32_t              index_offset);
 
-/* Native-head screening: init 1/0/-1 = ready/unsupported/error;
- * screen positive/0/-1 = refined candidate count/fallback/backend error. */
-int ds4_gpu_mtp_native_screen_init(uint32_t width, uint64_t *bytes, uint32_t *capacity);
-int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out, ds4_gpu_tensor *ids,
-    ds4_gpu_tensor *scratch, const void *map, uint64_t bytes, uint64_t offset,
-    uint32_t dim, uint32_t vocab, uint32_t prefix, uint32_t tail,
-    const ds4_gpu_tensor *x);
-int ds4_gpu_mtp_native_map(ds4_gpu_tensor *winner, const ds4_gpu_tensor *logits,
-    const ds4_gpu_tensor *ids, uint32_t count, uint32_t vocab);
-
 int ds4_gpu_matmul_q8_0_top1_tensor(
         ds4_gpu_tensor       *selected,
         ds4_gpu_tensor       *values,
@@ -3854,6 +3844,34 @@ int ds4_gpu_qwen4exp_hc_mixer_tensor(
         float                 eps,
         float                 weight_bias,
         int                   round_bf16);
+
+/* ds4_gpu_qwen4exp_hc_inject_tensor(hyper, hyper, pending_block, pending_inject)
+ * followed by ds4_gpu_qwen4exp_hc_mixer_tensor, as one call: the residual is
+ * updated in place and the mixer runs on the updated values.  A backend may
+ * fold the apply into its first read of the residual; the outputs and the
+ * residual left behind are the pair's bit for bit.  `pending_block` NULL is
+ * plain ds4_gpu_qwen4exp_hc_mixer_tensor.  `pending_inject` may be the same
+ * tensor as `inject`. */
+int ds4_gpu_qwen4exp_hc_mixer_pending_tensor(
+        ds4_gpu_tensor       *mixed,
+        ds4_gpu_tensor       *inject,
+        ds4_gpu_tensor       *normed_scratch,
+        ds4_gpu_tensor       *lowrank_scratch,
+        ds4_gpu_tensor       *wide_scratch,
+        ds4_gpu_tensor       *hyper,
+        const ds4_gpu_qwen4exp_slab *norm_weight,
+        const ds4_gpu_qwen4exp_slab *down_weight,
+        const ds4_gpu_qwen4exp_slab *up_weight,
+        const ds4_gpu_qwen4exp_slab *inject_weight,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              n_lowrank,
+        uint32_t              rows,
+        float                 eps,
+        float                 weight_bias,
+        int                   round_bf16,
+        const ds4_gpu_tensor *pending_block,
+        const ds4_gpu_tensor *pending_inject);
 
 /* The same mixer, built ONLY out of the per-op wrappers -- no backend fusion.
  *

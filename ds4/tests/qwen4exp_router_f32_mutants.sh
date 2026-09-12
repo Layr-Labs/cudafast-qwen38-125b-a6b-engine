@@ -81,6 +81,18 @@ add "lane 1 stores instead of lane 0" \
 add "row tiles overlap" \
     'const uint32_t row0 = blockIdx.y * (uint32_t)TM;' \
     'const uint32_t row0 = blockIdx.y * (uint32_t)(TM - 1);' fail
+# The eight-warp block: its own row/column placement lines.
+add "tile8 row groups overlap" \
+    'const uint32_t row0 = (blockIdx.y * (uint32_t)WR + wr_i) * (uint32_t)TM;' \
+    'const uint32_t row0 = (blockIdx.y * (uint32_t)WR + wr_i) * (uint32_t)(TM - 1);' fail
+add "tile8 last row of each group dropped" \
+    'const uint32_t take = n_rows - row0 < (uint32_t)TM ? n_rows - row0
+                                                       : (uint32_t)TM;' \
+    'const uint32_t take = n_rows - row0 < (uint32_t)TM ? n_rows - row0
+                                                       : (uint32_t)TM - 1u;' fail
+add "tile8 warp split swapped" \
+    'const uint32_t wr_i = warp / (uint32_t)WC, wc_i = warp % (uint32_t)WC;' \
+    'const uint32_t wr_i = warp % (uint32_t)WC, wc_i = warp / (uint32_t)WC;' fail
 
 # --- controls: commutative, cannot move a bit -------------------------------
 add "NO-OP: commute the final A + B" \
@@ -88,6 +100,11 @@ add "NO-OP: commute the final A + B" \
 add "NO-OP: commute the shuffle add" \
     's = s + __shfl_down_sync(0xffffffffu, s, d);' \
     's = __shfl_down_sync(0xffffffffu, s, d) + s;' pass
+# Which of the two warps of a row group takes which column tile is a
+# permutation of identical work: every tile is still computed by one warp.
+add "NO-OP: tile8 swap the two column groups" \
+    'const uint32_t tile = blockIdx.x * (uint32_t)WC + wc_i;' \
+    'const uint32_t tile = blockIdx.x * (uint32_t)WC + (wc_i ^ 1u);' pass
 
 caught=0; missed=0; control_ok=0; control_bad=0
 for i in "${!MUT_NAME[@]}"; do

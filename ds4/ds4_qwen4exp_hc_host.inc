@@ -154,11 +154,57 @@ int ds4_gpu_qwen4exp_hc_mixer_tensor(
 #ifdef DS4_QWEN4EXP_HC_HAVE_FUSED
     if (!ds4_qwen4exp_hc_fuse_off()) {
         const int fused =
-            qwen4exp_hc_mixer_fused_cuda(DS4_QWEN4EXP_HC_MIXER_ARGS);
+            qwen4exp_hc_mixer_fused_cuda(DS4_QWEN4EXP_HC_MIXER_ARGS, NULL, NULL);
         if (fused >= 0) return fused;
     }
 #endif
     return qwen4exp_hc_mixer_chain(DS4_QWEN4EXP_HC_MIXER_ARGS);
+}
+
+/* The mixer with the PREVIOUS block's inject still owed to the residual.
+ *
+ * ds4_gpu_qwen4exp_hc_inject_tensor(hyper, hyper, block, inject) followed by
+ * ds4_gpu_qwen4exp_hc_mixer_tensor(..., hyper, ...) computes exactly what this
+ * does, and that pair IS the definition: a backend may fold the apply into its
+ * first pass over the residual (one DRAM read of the 42 MB stream instead of a
+ * read, a write and a read again), but the residual must hold the updated
+ * values on return and every output must be the pair's bit for bit.  Without
+ * a backend fold, or when `pending_block` is NULL, this is that pair. */
+int ds4_gpu_qwen4exp_hc_mixer_pending_tensor(
+        ds4_gpu_tensor       *mixed,
+        ds4_gpu_tensor       *inject,
+        ds4_gpu_tensor       *normed_scratch,
+        ds4_gpu_tensor       *lowrank_scratch,
+        ds4_gpu_tensor       *wide_scratch,
+        ds4_gpu_tensor       *hyper,
+        const ds4_gpu_qwen4exp_slab *norm_weight,
+        const ds4_gpu_qwen4exp_slab *down_weight,
+        const ds4_gpu_qwen4exp_slab *up_weight,
+        const ds4_gpu_qwen4exp_slab *inject_weight,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              n_lowrank,
+        uint32_t              rows,
+        float                 eps,
+        float                 weight_bias,
+        int                   round_bf16,
+        const ds4_gpu_tensor *pending_block,
+        const ds4_gpu_tensor *pending_inject) {
+    DS4_QWEN4EXP_HC_MIXER_GUARD
+    if (pending_block && !pending_inject) return 0;
+#ifdef DS4_QWEN4EXP_HC_HAVE_PENDING
+    if (!ds4_qwen4exp_hc_fuse_off()) {
+        const int fused = qwen4exp_hc_mixer_fused_cuda(
+                DS4_QWEN4EXP_HC_MIXER_ARGS, pending_block, pending_inject);
+        if (fused >= 0) return fused;
+    }
+#endif
+    if (pending_block &&
+        !ds4_gpu_qwen4exp_hc_inject_tensor(hyper, hyper, pending_block,
+                                           pending_inject, n_embd, n_hc, rows)) {
+        return 0;
+    }
+    return ds4_gpu_qwen4exp_hc_mixer_tensor(DS4_QWEN4EXP_HC_MIXER_ARGS);
 }
 
 int ds4_gpu_qwen4exp_embed_tokens_hc_tensor(
