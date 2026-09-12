@@ -3113,6 +3113,20 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
                     } \
                 } \
             } while (0)
+            /* The production Q4_K row has 80 groups.  Lanes 0..15 revisit
+             * the loop for g+64 after consuming the first two payloads.
+             * Bring that streaming line toward L2 without holding another
+             * eight payload words live in registers; arithmetic is untouched. */
+            if constexpr (Type == DS4_QWEN4EXP_TY_q4_K) {
+                if (groups == 80u && lane < 16u) {
+                    const uint32_t pg = lane + 64u;
+                    const cuda_block_q4_K *pxb =
+                        (const cuda_block_q4_K *)weight_row + (pg / 8u);
+                    const uint8_t *pqs =
+                        pxb->qs + ((pg % 8u) >> 1u) * 32u;
+                    asm volatile("prefetch.global.L2 [%0];" :: "l"(pqs));
+                }
+            }
             uint32_t g = lane;
             for (; g + 32u < groups; g += 64u) {
                 uint32_t raw0[8];
