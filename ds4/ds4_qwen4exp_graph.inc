@@ -9,6 +9,7 @@
  */
 
 #include "ds4_qwen4exp_model_registration.h"
+#include "ds4_qwen4exp_qsa_scratch.h"
 
 /* ======================================================================
  * Sizing.
@@ -132,7 +133,7 @@ void ds4_qwen4exp_session_plan_compute(ds4_qwen4exp_session_plan *plan,
      * runs once over the whole chain instead of once per row afterwards. */
     act += (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * cfg->n_vocab * f;
     plan->activation_bytes = act;
-    act += ds4_gpu_qwen4exp_qsa_split_scratch_bytes(
+    act += ds4_qwen4exp_qsa_split_bytes(
         (uint32_t)qwen4exp_qsa_split_rows(B), DS4_N_HEAD, DS4_N_HEAD_DIM,
         (uint32_t)qwen4exp_qsa_split_max_count());
     plan->activation_bytes = act;
@@ -750,7 +751,7 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
     s->qsa_gate    = qwen4exp_alloc_zeroed(B * q_width * f, &ok);
     s->qsa_out     = qwen4exp_alloc_zeroed(B * q_width * f, &ok);
     {
-        const uint64_t split_bytes = ds4_gpu_qwen4exp_qsa_split_scratch_bytes(
+        const uint64_t split_bytes = ds4_qwen4exp_qsa_split_bytes(
             (uint32_t)qwen4exp_qsa_split_rows(B), DS4_N_HEAD, DS4_N_HEAD_DIM,
             (uint32_t)qwen4exp_qsa_split_max_count());
         s->qsa_split = split_bytes ? qwen4exp_alloc_zeroed(split_bytes, &ok) : NULL;
@@ -1552,24 +1553,40 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
         return false;
     }
 
-    /* Fused Q-Prep: split doubled-query, per-head RMS norm, and RoPE in 1 launch */
-    if (!ds4_gpu_qwen4exp_qsa_prep_q_fused_dpos_tensor(
-            s->qsa_q, s->qsa_gate, s->qsa_doubled, s->attn_q_norm[il],
-            s->inv_freq, n_tokens, DS4_N_HEAD, head_dim, DS4_N_ROT, pos0,
-            DS4_RMS_EPS, l->attn_q_norm_offset, s->d_pos)) {
-        fprintf(stderr, "ds4: qwen4exp fused Q-prep failed at block %u\n", il);
-        return false;
-    }
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (n_tokens<=2u) {
+        ds4_gpu_tensor *outs[5]={s->qsa_q,s->qsa_gate,s->qsa_k[il],s->qsa_v[il],NULL};
+        const ds4_gpu_tensor *ins[6]={s->qsa_doubled,s->qsa_kin,s->qsa_vin,
+                                    s->attn_q_norm[il],s->attn_k_norm[il],s->inv_freq};
+        if (!ds4_gpu_qwen4exp_qsa_prep_joint_dpos_tensor(outs,ins,n_tokens,
+                DS4_N_HEAD,DS4_N_HEAD_KV,head_dim,DS4_N_ROT,pos0,s->plan.n_ctx,
+                DS4_RMS_EPS,l->attn_q_norm_offset,l->attn_k_norm_offset,s->d_pos)) {
+            fprintf(stderr,"ds4: qwen4exp joint Q/KV prep failed at block %u\n",il);
+            return false;
+        }
+    } else
+#endif
+    {
+        /* Fused Q-Prep: split doubled-query, per-head RMS norm, and RoPE in 1 launch */
+        if (!ds4_gpu_qwen4exp_qsa_prep_q_fused_dpos_tensor(
+                s->qsa_q, s->qsa_gate, s->qsa_doubled, s->attn_q_norm[il],
+                s->inv_freq, n_tokens, DS4_N_HEAD, head_dim, DS4_N_ROT, pos0,
+                DS4_RMS_EPS, l->attn_q_norm_offset, s->d_pos)) {
+            fprintf(stderr, "ds4: qwen4exp fused Q-prep failed at block %u\n", il);
+            return false;
+        }
 
-    /* Fused KV-Prep & Append: per-head RMS norm on K, RoPE on K, and direct write into
-     * k_cache and v_cache in 1 launch (no sync CPU memcpy) */
-    if (!ds4_gpu_qwen4exp_qsa_prep_kv_append_fused_dpos_tensor(
-            s->qsa_k[il], s->qsa_v[il], NULL, s->qsa_kin, s->qsa_vin,
-            s->attn_k_norm[il], s->inv_freq, pos0, n_tokens, DS4_N_HEAD_KV,
-            head_dim, DS4_N_ROT, s->plan.n_ctx, DS4_RMS_EPS, l->attn_k_norm_offset,
-            s->d_pos)) {
-        fprintf(stderr, "ds4: qwen4exp fused KV prep & append failed at block %u\n", il);
-        return false;
+        /* Fused KV-Prep & Append: per-head RMS norm on K, RoPE on K, and direct write into
+         * k_cache and v_cache in 1 launch (no sync CPU memcpy) */
+        if (!ds4_gpu_qwen4exp_qsa_prep_kv_append_fused_dpos_tensor(
+                s->qsa_k[il], s->qsa_v[il], NULL, s->qsa_kin, s->qsa_vin,
+                s->attn_k_norm[il], s->inv_freq, pos0, n_tokens, DS4_N_HEAD_KV,
+                head_dim, DS4_N_ROT, s->plan.n_ctx, DS4_RMS_EPS, l->attn_k_norm_offset,
+                s->d_pos)) {
+            fprintf(stderr, "ds4: qwen4exp fused KV prep & append failed at block %u\n", il);
+            return false;
+        }
+
     }
 
     /* Indexer: BF16 projections, the exact unrotated key tape, pooled blocks,
