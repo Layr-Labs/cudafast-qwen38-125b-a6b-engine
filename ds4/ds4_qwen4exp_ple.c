@@ -18,6 +18,14 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#ifndef DS4_PLE_IQ4_NEON
+#define DS4_PLE_IQ4_NEON 1
+#endif
+#if DS4_PLE_IQ4_NEON && defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#define PLE_IQ4_NEON_ACTIVE 1
+#endif
+
 /* =========================================================================
  * Errors.
  * ========================================================================= */
@@ -717,9 +725,31 @@ static float ple_fp16_to_fp32(uint16_t h) {
     return f;
 }
 
+#if defined(PLE_IQ4_NEON_ACTIVE)
+static inline void ple_iq4_store16(float *out, int8x16_t values, float d) {
+    const int16x8_t low = vmovl_s8(vget_low_s8(values));
+    const int16x8_t high = vmovl_s8(vget_high_s8(values));
+    vst1q_f32(out, vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(low))), d));
+    vst1q_f32(out + 4, vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(low))), d));
+    vst1q_f32(out + 8, vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(high))), d));
+    vst1q_f32(out + 12, vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(high))), d));
+}
+#endif
+
 void ds4_ple_dequant_iq4_nl(const void *blocks, size_t block_count, float *out) {
     const uint8_t *p = (const uint8_t *)blocks;
     if (!p || !out) return;
+#if defined(PLE_IQ4_NEON_ACTIVE)
+    /* Scalar stores may overwrite later packed reads for overlapping views.
+     * Check whole-call ranges once; overflow retains scalar semantics. */
+    bool disjoint = false;
+    if (block_count <= SIZE_MAX / (DS4_PLE_IQ4_NL_BLOCK_ELEMS * sizeof(float))) {
+        const size_t in_bytes = block_count * DS4_PLE_IQ4_NL_BLOCK_BYTES;
+        const size_t out_bytes = block_count * DS4_PLE_IQ4_NL_BLOCK_ELEMS * sizeof(float);
+        const uintptr_t src = (uintptr_t)p, dst = (uintptr_t)out;
+        disjoint = src <= dst ? in_bytes <= dst - src : out_bytes <= src - dst;
+    }
+#endif
 
     for (size_t b = 0; b < block_count; b++) {
         uint16_t half;
@@ -728,6 +758,19 @@ void ds4_ple_dequant_iq4_nl(const void *blocks, size_t block_count, float *out) 
         const uint8_t *qs = p + 2;
         float *y = out + b * DS4_PLE_IQ4_NL_BLOCK_ELEMS;
 
+#if defined(PLE_IQ4_NEON_ACTIVE)
+        /* Normal finite half scales: identical lookup values and one FMUL.
+         * Preserve the scalar special-value path, including signed zero. */
+        const uint16_t exponent = half & 0x7c00u;
+        if (disjoint && exponent != 0u && exponent != 0x7c00u) {
+            const uint8x16_t packed = vld1q_u8(qs);
+            const int8x16_t table = vld1q_s8(ple_kvalues_iq4nl);
+            ple_iq4_store16(y, vqtbl1q_s8(table, vandq_u8(packed, vdupq_n_u8(15))), d);
+            ple_iq4_store16(y + 16, vqtbl1q_s8(table, vshrq_n_u8(packed, 4)), d);
+            p += DS4_PLE_IQ4_NL_BLOCK_BYTES;
+            continue;
+        }
+#endif
         for (int j = 0; j < DS4_PLE_IQ4_NL_BLOCK_ELEMS / 2; j++) {
             y[j]      = d * (float)ple_kvalues_iq4nl[qs[j] & 0x0F];
             y[j + 16] = d * (float)ple_kvalues_iq4nl[qs[j] >> 4];
