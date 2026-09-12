@@ -4754,7 +4754,12 @@ __global__ static void qwen4exp_shared_gate_kernel(
 
 
 
-/* Twin of ds4_gpu_qwen4exp_moe_type_supported in ds4_metal.m. */
+/* Twin of ds4_gpu_qwen4exp_moe_type_supported in ds4_metal.m.
+ *
+ * CONTROL: this comment is the whole diff.  It exists to measure what a
+ * submission of the reference tree itself scores, so that the scores of
+ * submissions that do change a kernel can be read against it rather than
+ * against a number measured in another job. */
 static bool cuda_qwen4exp_moe_type_supported(uint32_t type) {
 #define DS4_QWEN4EXP_TYPE_MATCH(name, id) if (type == (uint32_t)(id)) return true;
     DS4_QWEN4EXP_MOE_TYPES(DS4_QWEN4EXP_TYPE_MATCH)
