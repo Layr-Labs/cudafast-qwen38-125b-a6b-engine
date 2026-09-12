@@ -8,8 +8,10 @@ template <bool Screen>
 __global__ static void mtp_native_projection_kernel(
         float *out, const unsigned char *w,
         const int8_t *xq, const float *xscale,
-        uint64_t out_dim, uint32_t n_rows, uint64_t blocks,
-        const uint32_t *ids, uint64_t n_vocab, uint32_t prefix, uint32_t tail) {
+        uint32_t out_dim, uint32_t n_rows,
+        const uint32_t *ids, uint32_t n_vocab, uint32_t prefix, uint32_t tail) {
+    /* This private kernel is reachable only through the DIM=2560 guard. */
+    constexpr uint64_t blocks = MTP_NATIVE_DIM / 32u;
     constexpr int R = 1;
     constexpr bool Streaming = false;
     const uint64_t work_blocks = Screen ? blocks / 2u : blocks;
@@ -17,18 +19,20 @@ __global__ static void mtp_native_projection_kernel(
     const uint32_t local_lane = threadIdx.x & 63u;
     const uint32_t group = local_lane >> 1u;
     const uint32_t half = local_lane & 1u;
-    const uint64_t row = (uint64_t)blockIdx.x * 4u + local_row;
+    /* Host bounds output width to <=2^20 (or the 16384 refinement cap).
+     * IDs/vocabulary are uint32; retain 64-bit byte-stride multiplication. */
+    const uint32_t row = blockIdx.x * 4u + local_row;
     const uint32_t row0 = blockIdx.y * R;
     const uint32_t take = n_rows - row0 < R ? n_rows - row0 : R;
     float acc[R];
 #pragma unroll
     for (int r = 0; r < R; r++) acc[r] = 0.0f;
 
-    const uint64_t weight_row = row >= out_dim ? n_vocab : Screen
-        ? (row < prefix ? row : n_vocab - tail + row - prefix) : ids[row];
+    const uint32_t weight_row = row >= out_dim ? n_vocab : Screen
+        ? (row < prefix ? row : n_vocab - tail + (row - prefix)) : ids[row];
     const bool valid = row < out_dim && weight_row < n_vocab;
     if (valid) {
-        const unsigned char *wr = w + weight_row * blocks * 34u;
+        const unsigned char *wr = w + (uint64_t)weight_row * blocks * 34u;
         for (uint64_t b = group; b < work_blocks; b += 32u) {
             /* Name both lanes of every live pair even if independent
              * scheduling has temporarily separated their execution. */
@@ -178,7 +182,7 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
         xq,xs,(const float *)x->ptr,in_dim,80,1);
     if (!cuda_ok(cudaGetLastError(),"native screen quantize")) return -1;
     mtp_native_projection_kernel<true><<<(width+3u)/4u,256,0,cuda_decode_stream()>>>(
-        scores,(const unsigned char *)w,xq,xs,width,1,80,nullptr,vocab,prefix,tail);
+        scores,(const unsigned char *)w,xq,xs,width,1,nullptr,vocab,prefix,tail);
     if (!cuda_ok(cudaGetLastError(),"native half-column screen")) return -1;
     mtp_native_keys<<<(width+255u)/256u,256,0,cuda_decode_stream()>>>(
         key_in,flag,scores,width,prefix,tail,vocab);
@@ -196,7 +200,7 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
             id_tmp,(uint32_t *)ids->ptr,MTP_NATIVE_CAP,0,32,cuda_decode_stream()),
             "native original-ID sort")) return -1;
     mtp_native_projection_kernel<false><<<(MTP_NATIVE_CAP+3u)/4u,256,0,cuda_decode_stream()>>>(
-        (float *)out->ptr,(const unsigned char *)w,xq,xs,MTP_NATIVE_CAP,1,80,
+        (float *)out->ptr,(const unsigned char *)w,xq,xs,MTP_NATIVE_CAP,1,
         (const uint32_t *)ids->ptr,vocab,prefix,tail);
     return cuda_ok(cudaGetLastError(),"native exact refinement") ? (int)MTP_NATIVE_CAP : -1;
 }
