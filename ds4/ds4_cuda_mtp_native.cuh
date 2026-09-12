@@ -4,12 +4,13 @@
 static constexpr uint32_t MTP_NATIVE_CAP = 16384u;
 static constexpr uint32_t MTP_NATIVE_DIM = 2560u;
 static constexpr uint32_t MTP_NATIVE_MAX_WIDTH = 1u << 20;
-template <bool Screen>
+template <bool Screen, bool EmitKeys = false>
 __global__ static void mtp_native_projection_kernel(
         float *out, const unsigned char *w,
         const int8_t *xq, const float *xscale,
         uint64_t out_dim, uint32_t n_rows, uint64_t blocks,
-        const uint32_t *ids, uint64_t n_vocab, uint32_t prefix, uint32_t tail) {
+        const uint32_t *ids, uint64_t n_vocab, uint32_t prefix, uint32_t tail,
+        uint64_t *keys = nullptr, uint32_t *invalid = nullptr) {
     constexpr int R = 1;
     constexpr bool Streaming = false;
     const uint64_t work_blocks = Screen ? blocks / 2u : blocks;
@@ -82,8 +83,20 @@ __global__ static void mtp_native_projection_kernel(
 #pragma unroll
         for (int r = 0; r < R; r++) {
             const float total = warp_sum_f32(partial[r][local_row][local_lane]);
-            if (local_lane == 0u && row < out_dim && (uint32_t)r < take)
-                out[((uint64_t)row0 + r) * out_dim + row] = valid ? total : -INFINITY;
+            if (local_lane == 0u && row < out_dim && (uint32_t)r < take) {
+                const float value = valid ? total : -INFINITY;
+                if (EmitKeys) {
+                    /* Same f32 score and original key statements as the
+                     * standalone key producer; preserve its FTZ comparison. */
+                    const uint32_t id = row < prefix ? (uint32_t)row
+                        : (uint32_t)(n_vocab - tail + row - prefix);
+                    if (!isfinite(value)) atomicOr(invalid, 1u);
+                    if (!id || row >= prefix) keys[row] = UINT64_MAX - id;
+                    else keys[row] = q8_top1_pack_key(value == 0.0f ? 0.0f : value, id);
+                } else {
+                    out[((uint64_t)row0 + r) * out_dim + row] = value;
+                }
+            }
         }
     }
 }
@@ -135,6 +148,15 @@ __global__ static void mtp_native_unpack_ids(uint32_t *ids, const uint64_t *keys
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < MTP_NATIVE_CAP) ids[i] = UINT32_MAX - (uint32_t)keys[i];
 }
+/* Moving key writes into projection is equivalent only when scratch writes
+ * cannot change another input/output view or a concurrently read weight. */
+static bool mtp_native_key_range_disjoint(const void *a, uint64_t an,
+                                         const void *b, uint64_t bn) {
+    const uintptr_t ap = (uintptr_t)a, bp = (uintptr_t)b;
+    return a && b && an <= UINTPTR_MAX-ap && bn <= UINTPTR_MAX-bp &&
+           (ap+an <= bp || bp+bn <= ap);
+}
+
 /* -1: backend error, 0: ordinary full-static fallback, positive: exact number
  * of sorted candidates whose FULL refined logits now occupy out. */
 extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
@@ -177,12 +199,25 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
     quantize_q8_0_f32_rows_warp_kernel<<<10,256,0,cuda_decode_stream()>>>(
         xq,xs,(const float *)x->ptr,in_dim,80,1);
     if (!cuda_ok(cudaGetLastError(),"native screen quantize")) return -1;
-    mtp_native_projection_kernel<true><<<(width+3u)/4u,256,0,cuda_decode_stream()>>>(
-        scores,(const unsigned char *)w,xq,xs,width,1,80,nullptr,vocab,prefix,tail);
-    if (!cuda_ok(cudaGetLastError(),"native half-column screen")) return -1;
-    mtp_native_keys<<<(width+255u)/256u,256,0,cuda_decode_stream()>>>(
-        key_in,flag,scores,width,prefix,tail,vocab);
-    if (!cuda_ok(cudaGetLastError(),"native screen keys")) return -1;
+    const bool fuse_keys = getenv("DS4_MTP_NO_FUSED_SCREEN_KEYS") == nullptr &&
+        mtp_native_key_range_disjoint(scratch->ptr,scratch->bytes,
+                                     w,(uint64_t)vocab*80u*34u) &&
+        mtp_native_key_range_disjoint(scratch->ptr,scratch->bytes,x->ptr,x->bytes) &&
+        mtp_native_key_range_disjoint(scratch->ptr,scratch->bytes,out->ptr,out->bytes) &&
+        mtp_native_key_range_disjoint(scratch->ptr,scratch->bytes,ids->ptr,ids->bytes);
+    if (fuse_keys) {
+        mtp_native_projection_kernel<true,true><<<(width+3u)/4u,256,0,cuda_decode_stream()>>>(
+            scores,(const unsigned char *)w,xq,xs,width,1,80,nullptr,vocab,prefix,tail,
+            key_in,flag);
+        if (!cuda_ok(cudaGetLastError(),"native fused screen keys")) return -1;
+    } else {
+        mtp_native_projection_kernel<true><<<(width+3u)/4u,256,0,cuda_decode_stream()>>>(
+            scores,(const unsigned char *)w,xq,xs,width,1,80,nullptr,vocab,prefix,tail);
+        if (!cuda_ok(cudaGetLastError(),"native half-column screen")) return -1;
+        mtp_native_keys<<<(width+255u)/256u,256,0,cuda_decode_stream()>>>(
+            key_in,flag,scores,width,prefix,tail,vocab);
+        if (!cuda_ok(cudaGetLastError(),"native screen keys")) return -1;
+    }
     uint32_t invalid = 0;
     if (!ds4_gpu_tensor_read(scratch,l.flag,&invalid,4)) return -1;
     if (invalid) return 0;

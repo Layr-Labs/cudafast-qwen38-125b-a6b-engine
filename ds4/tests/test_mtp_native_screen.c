@@ -21,6 +21,46 @@
 static void need(int ok,const char *s) {if(!ok){fprintf(stderr,"native screen: %s\n",s);exit(1);}}
 static uint32_t seed=1234567;
 static uint32_t rnd(void){seed^=seed<<13;seed^=seed>>17;seed^=seed<<5;return seed;}
+/* Compare actual old/fused implementations, including raw pre-sort keys.
+ * Scratch scores are deliberately omitted by fusion and are not compared. */
+static uint64_t aligned(uint64_t n){return (n+255u)&~255ull;}
+static int compare_key_paths(ds4_gpu_tensor *out,ds4_gpu_tensor *ids,
+        ds4_gpu_tensor *scratch,const void *w,uint64_t bytes,uint64_t offset,
+        ds4_gpu_tensor *x) {
+    uint64_t scores_at=aligned(DIM+80u*4u);
+    uint64_t ki=aligned(scores_at+(uint64_t)WIDTH*4u);
+    uint64_t ko=aligned(ki+(uint64_t)WIDTH*8u);
+    uint64_t it=aligned(ko+(uint64_t)WIDTH*8u);
+    uint64_t flag_at=aligned(it+(uint64_t)CAP*4u);
+    uint64_t *keys[2]={malloc(WIDTH*8u),malloc(WIDTH*8u)};
+    uint32_t *selected_ids[2]={malloc(CAP*4u),malloc(CAP*4u)};
+    float *values[2]={malloc(CAP*4u),malloc(CAP*4u)};
+    unsigned char *score_canary=malloc(WIDTH*4u),*score_after=malloc(WIDTH*4u);
+    need(score_canary&&score_after,"score witness allocation");
+    memset(score_canary,0xa5,WIDTH*4u);
+    float before[DIM],after[DIM];uint32_t flags[2];int status[2];
+    need(keys[0]&&keys[1]&&selected_ids[0]&&selected_ids[1]&&values[0]&&values[1],"AB host allocation");
+    need(ds4_gpu_tensor_read(x,0,before,sizeof before),"AB input before");
+    for(unsigned mode=0;mode<2;mode++) {
+        if(mode==0)setenv("DS4_MTP_NO_FUSED_SCREEN_KEYS","1",1);
+        else unsetenv("DS4_MTP_NO_FUSED_SCREEN_KEYS");
+        memset(values[mode],0x5a,CAP*4u);memset(selected_ids[mode],0xa5,CAP*4u);
+        need(ds4_gpu_tensor_write(out,0,values[mode],CAP*4u)&&ds4_gpu_tensor_write(ids,0,selected_ids[mode],CAP*4u),"AB canary init");
+        need(ds4_gpu_tensor_write(scratch,scores_at,score_canary,WIDTH*4u),"score witness init");
+        status[mode]=ds4_gpu_mtp_native_screen(out,ids,scratch,w,bytes,offset,DIM,VOCAB,PREFIX,TAIL,x);
+        need(status[mode]>=0,"AB backend success");
+        need(ds4_gpu_tensor_read(scratch,scores_at,score_after,WIDTH*4u),"score witness read");
+        need(mode ? !memcmp(score_canary,score_after,WIDTH*4u) : memcmp(score_canary,score_after,WIDTH*4u)!=0,"actual fused/old dispatch witness");
+        need(ds4_gpu_tensor_read(scratch,ki,keys[mode],WIDTH*8u)&&ds4_gpu_tensor_read(scratch,flag_at,&flags[mode],4),"AB keys/flag");
+        need(ds4_gpu_tensor_read(out,0,values[mode],CAP*4u)&&ds4_gpu_tensor_read(ids,0,selected_ids[mode],CAP*4u),"AB outputs");
+        need(ds4_gpu_tensor_read(x,0,after,sizeof after)&&!memcmp(before,after,sizeof before),"AB input unchanged");
+    }
+    need(status[0]==status[1]&&flags[0]==flags[1],"AB status/flag parity");
+    need(!memcmp(keys[0],keys[1],WIDTH*8u),"AB raw key parity");
+    need(!memcmp(values[0],values[1],CAP*4u)&&!memcmp(selected_ids[0],selected_ids[1],CAP*4u),"AB IDs/refinement or fallback canary parity");
+    int result=status[1];for(unsigned i=0;i<2;i++){free(keys[i]);free(selected_ids[i]);free(values[i]);}
+    free(score_canary);free(score_after);return result;
+}
 static void run_case(int adversarial, uint32_t offset) {
     const uint64_t bytes=offset+(uint64_t)VOCAB*ROW;
     unsigned char *w=mmap(NULL,bytes,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
@@ -46,10 +86,10 @@ static void run_case(int adversarial, uint32_t offset) {
         for(unsigned i=0;i<DIM;i++) activation[i]=adversarial?1.0f:(int)(rnd()%201)*0.01f-1.0f;
         need(ds4_gpu_tensor_write(x,0,activation,sizeof activation),"current activation");
         if(adversarial==2) {
-            need(ds4_gpu_mtp_native_screen(out,ids,scratch,w,bytes,offset,DIM,VOCAB,PREFIX,TAIL,x)==0,"nonfinite score fallback");
+            need(compare_key_paths(out,ids,scratch,w,bytes,offset,x)==0,"nonfinite score fallback");
             goto cleanup;
         }
-        need(ds4_gpu_mtp_native_screen(out,ids,scratch,w,bytes,offset,DIM,VOCAB,PREFIX,TAIL,x)==CAP,"screen active");
+        need(compare_key_paths(out,ids,scratch,w,bytes,offset,x)==CAP,"screen active");
         need(ds4_gpu_tensor_read(ids,0,found,sizeof found),"IDs read");
         need(ds4_gpu_tensor_read(out,0,selected,sizeof selected),"refine read");
         need(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(full,w,bytes,offset,DIM,PREFIX,x,1),"ordinary prefix");
