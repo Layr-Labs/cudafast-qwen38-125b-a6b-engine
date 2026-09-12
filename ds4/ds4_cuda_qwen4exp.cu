@@ -5222,7 +5222,18 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             up_slab->expert_bytes, up_slab->row_bytes, \
             gate_slab->type, up_slab->type, xgroups, mid_dim, \
             mid_token_stride, n_expert_used)
-        if (vector) { QWEN4EXP_SPLIT_GATEUP(true, 2u); }
+        /* FOUR OUTPUT ROWS PER BLOCK on the vector schedule, matching the
+         * scalar one.  Two rows meant 128-thread blocks: four warps, and a
+         * block spanning only two consecutive weight rows before the next
+         * block picked up the third.  A routed expert row is streamed once,
+         * so what the DRAM sees is the run length one block issues; four
+         * rows doubles it and halves the block count, at the cost of a
+         * wider `projected` tile that is still eight floats per token.
+         * Purely a packing change: `row = blockIdx.x * OutputRows +
+         * (warp >> 1)` still gives each warp one row, walked in the same
+         * group order through the same warp_sum_f32 tree, so every dot is
+         * bit-identical.  mid_dim 640 divides by four exactly. */
+        if (vector) { QWEN4EXP_SPLIT_GATEUP(true, 4u); }
         else { QWEN4EXP_SPLIT_GATEUP(false, 4u); }
 #undef QWEN4EXP_SPLIT_GATEUP
     }

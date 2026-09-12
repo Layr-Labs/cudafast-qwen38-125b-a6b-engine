@@ -1,11 +1,16 @@
 /* Current native-head partial screening, then independent exact row dots.
  * Uses the original Q8_0 mapping; no transformed weight storage. New kernels
  * use ordinary stream ordering, not PDL: refinement reads freshly sorted IDs. */
-static constexpr uint32_t MTP_NATIVE_CAP = 16384u;
+/* Refinement shortlist. 276 tail rows plus id 0 hold mandatory slots, so this
+ * leaves 1771 score-selected candidates: the top 1.8% of the coarse ranking.
+ * Narrowing it is a proposal-policy change, not an exact one. */
+static constexpr uint32_t MTP_NATIVE_CAP = 2048u;
 static constexpr uint32_t MTP_NATIVE_DIM = 2560u;
-/* One complete paired-lane group wave; full refinement still uses 80 groups.
- * This changes the coarse proposal heuristic, not the selected-row dots. */
-static constexpr uint32_t MTP_NATIVE_SCREEN_GROUPS = 32u;
+/* Coarse screen depth; full refinement still uses 80 groups. Pairs 24..31 sit
+ * out, and the live_pairs mask already names a partial wave (40 groups left the
+ * second warp with 8). This changes the coarse proposal heuristic, not the
+ * selected-row dots. */
+static constexpr uint32_t MTP_NATIVE_SCREEN_GROUPS = 24u;
 static constexpr uint32_t MTP_NATIVE_MAX_WIDTH = 1u << 20;
 template <bool Screen, bool EmitKeys = false>
 __global__ static void mtp_native_projection_kernel(
