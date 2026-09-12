@@ -598,6 +598,79 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
     *state_ptr = h;
 }
 
+/* Long chunks reuse one Q/K vector and gate pair across four independent
+ * value rows in a warp. Each row retains its four adjacent key columns per
+ * lane, ordered dot4/FMA operations, and original XOR reductions. No state
+ * crosses value rows. Short chunks keep the original one-row recurrence. */
+template <unsigned R>
+__global__ static void qwen4exp_gdn_value_reuse_kernel(
+        float *__restrict__ out, float *__restrict__ state,
+        const float *__restrict__ qkv, const float *raw_alpha,
+        const float *raw_beta, const float *a_log, const float *dt_bias,
+        const float2 *__restrict__ gate_pairs, float *state_snapshot,
+        uint32_t n_key_head, uint32_t n_value_head, uint32_t n_rows,
+        uint32_t n_tokens, uint32_t head_layout, uint32_t n_snapshot_rows) {
+    const uint32_t head = blockIdx.x;
+    const uint32_t value0 = (blockIdx.y * 4u + (threadIdx.x >> 5u)) * R;
+    const uint32_t row = blockIdx.z;
+    const uint32_t lane = threadIdx.x & 31u;
+    if (head >= n_value_head || value0 + R > QWEN4EXP_GDN_DIM || row >= n_rows) return;
+    const uint32_t key_dim = n_key_head * QWEN4EXP_GDN_DIM;
+    const uint32_t value_dim = n_value_head * QWEN4EXP_GDN_DIM;
+    const uint32_t conv_dim = 2u * key_dim + value_dim;
+    const uint32_t key_head = head_layout != 0u
+        ? head % n_key_head : head / (n_value_head / n_key_head);
+    const uint32_t k0 = lane * 4u;
+    const uint64_t state_base =
+        (((uint64_t)row * n_value_head + head) * QWEN4EXP_GDN_DIM + value0) *
+        QWEN4EXP_GDN_DIM + k0;
+    float4 h[R];
+#pragma unroll
+    for (unsigned r = 0; r < R; r++) {
+        h[r] = *(const float4 *)(state + state_base + r * QWEN4EXP_GDN_DIM);
+    }
+    for (uint32_t token = 0; token < n_tokens; token++) {
+        const uint64_t slot = (uint64_t)row * n_tokens + token;
+        const uint64_t base = slot * conv_dim + key_head * QWEN4EXP_GDN_DIM;
+        const float4 q4 = *(const float4 *)(qkv + base + k0);
+        const float4 k4 = *(const float4 *)(qkv + base + key_dim + k0);
+        const float2 pair = gate_pairs[slot * n_value_head + head];
+        const float g = pair.x;
+        const float beta = pair.y;
+#pragma unroll
+        for (unsigned r = 0; r < R; r++) {
+            const uint32_t value = value0 + r;
+            const float v_row = qkv[slot * conv_dim + 2u * (uint64_t)key_dim +
+                head * QWEN4EXP_GDN_DIM + value];
+            h[r].x *= g;
+            h[r].y *= g;
+            h[r].z *= g;
+            h[r].w *= g;
+            const float hk = warp_sum_all_f32(dot4_f32(h[r], k4));
+            const float delta_v = (v_row - hk) * beta;
+            h[r].x = fmaf(k4.x, delta_v, h[r].x);
+            h[r].y = fmaf(k4.y, delta_v, h[r].y);
+            h[r].z = fmaf(k4.z, delta_v, h[r].z);
+            h[r].w = fmaf(k4.w, delta_v, h[r].w);
+            const float result = warp_sum_all_f32(dot4_f32(h[r], q4));
+            if (lane == 0u) {
+                out[slot * value_dim + head * QWEN4EXP_GDN_DIM + value] = result;
+            }
+            if (token < n_snapshot_rows) {
+                const uint64_t stride = (uint64_t)n_rows * n_value_head *
+                    QWEN4EXP_GDN_DIM * QWEN4EXP_GDN_DIM;
+                float4 *snap = (float4 *)(state_snapshot + token * stride +
+                    state_base + r * QWEN4EXP_GDN_DIM);
+                *snap = h[r];
+            }
+        }
+    }
+#pragma unroll
+    for (unsigned r = 0; r < R; r++) {
+        *(float4 *)(state + state_base + r * QWEN4EXP_GDN_DIM) = h[r];
+    }
+}
+
 /* Sigmoid-gated RMS output norm.  The weight is a plain scale, not an
  * offset-baked one, so it multiplies the normalised row directly. */
 __global__ static void qwen4exp_gdn_output_kernel(
@@ -849,15 +922,28 @@ static int qwen4exp_cuda_gdn_run(
     const dim3 recurrence_grid(
         n_value_head, QWEN4EXP_GDN_DIM / 4u, n_rows);
     if (gate_pairs) {
-        qwen4exp_gdn_recurrence_kernel<true><<<
-                recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
-                (float *)out->ptr, (float *)recurrent_state->ptr, conv_out,
-                (const float *)raw_alpha->ptr,
-                (const float *)raw_beta->ptr, a_log, dt_bias,
-                gate_pairs,
-                state_snapshot ? (float *)state_snapshot->ptr : NULL,
-                n_key_head, n_value_head, n_rows, n_tokens, head_layout,
-                n_snapshot_rows);
+        if (n_key_head == 16u && n_value_head == 48u &&
+            getenv("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE") == NULL) {
+            qwen4exp_gdn_value_reuse_kernel<4u><<<
+                    dim3(n_value_head, QWEN4EXP_GDN_DIM / 16u, n_rows), QWEN4EXP_GDN_DIM, 0, stream>>>(
+                    (float *)out->ptr, (float *)recurrent_state->ptr, conv_out,
+                    (const float *)raw_alpha->ptr,
+                    (const float *)raw_beta->ptr, a_log, dt_bias,
+                    gate_pairs,
+                    state_snapshot ? (float *)state_snapshot->ptr : NULL,
+                    n_key_head, n_value_head, n_rows, n_tokens, head_layout,
+                    n_snapshot_rows);
+        } else {
+            qwen4exp_gdn_recurrence_kernel<true><<<
+                    recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
+                    (float *)out->ptr, (float *)recurrent_state->ptr, conv_out,
+                    (const float *)raw_alpha->ptr,
+                    (const float *)raw_beta->ptr, a_log, dt_bias,
+                    gate_pairs,
+                    state_snapshot ? (float *)state_snapshot->ptr : NULL,
+                    n_key_head, n_value_head, n_rows, n_tokens, head_layout,
+                    n_snapshot_rows);
+        }
     } else {
         qwen4exp_gdn_recurrence_kernel<false><<<
                 recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
