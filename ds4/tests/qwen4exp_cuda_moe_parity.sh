@@ -63,6 +63,7 @@ extract_fn() {
 extract_struct cuda_block_q5_K
 extract_struct cuda_block_q6_K
 extract_fn '__device__ static void dev_q4_K_get_scale_min('
+extract_fn '__device__ __forceinline__ static void qw_q4k_header_scale_min('
 extract_fn '__device__ __forceinline__ static float dev_qwen4exp_q5_K_value('
 extract_fn '__device__ __forceinline__ static float dev_qwen4exp_q6_K_value('
 
