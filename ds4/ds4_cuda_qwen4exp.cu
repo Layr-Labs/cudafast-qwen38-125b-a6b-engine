@@ -607,8 +607,8 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
 /* Long chunks reuse one Q/K vector and gate pair across four independent
  * value rows in a warp. Each row retains its four adjacent key columns per
  * lane, ordered dot4/FMA operations, and original XOR reductions. No state
- * crosses value rows. Short chunks keep the original one-row recurrence. */
-template <unsigned R, bool Vector = false>
+ * crosses value rows. Short chunks derive gates with the original expression. */
+template <unsigned R, bool Vector = false, bool PrecomputedGates = true>
 __global__ static void qwen4exp_gdn_value_reuse_kernel(
         float *__restrict__ out, float *__restrict__ state,
         const float *__restrict__ qkv, const float *raw_alpha,
@@ -641,9 +641,23 @@ __global__ static void qwen4exp_gdn_value_reuse_kernel(
         const uint64_t base = slot * conv_dim + key_head * QWEN4EXP_GDN_DIM;
         const float4 q4 = *(const float4 *)(qkv + base + k0);
         const float4 k4 = *(const float4 *)(qkv + base + key_dim + k0);
-        const float2 pair = gate_pairs[slot * n_value_head + head];
-        const float g = pair.x;
-        const float beta = pair.y;
+        float g = 0.0f, beta = 0.0f;
+        if constexpr (PrecomputedGates) {
+            const float2 pair = gate_pairs[slot * n_value_head + head];
+            g = pair.x;
+            beta = pair.y;
+        } else {
+            /* Same short-recurrence gate expression and full-warp broadcast,
+             * shared by independent value rows instead of recomputed for each. */
+            const uint64_t gate = slot * n_value_head + head;
+            if (lane == 0u) {
+                g = expf(a_log[head] *
+                    qwen4exp_gdn_softplus(raw_alpha[gate] + dt_bias[head]));
+                beta = qwen4exp_gdn_sigmoid(raw_beta[gate]);
+            }
+            g = __shfl_sync(0xffffffffu, g, 0);
+            beta = __shfl_sync(0xffffffffu, beta, 0);
+        }
         static_assert(!Vector || R == 4u, "value vector requires four rows");
         float4 values;
         if constexpr (Vector) {
@@ -980,6 +994,23 @@ static int qwen4exp_cuda_gdn_run(
                     n_snapshot_rows,
                     getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
         }
+    } else if (n_rows == 1u && n_tokens <= 2u &&
+               n_key_head == 16u && n_value_head == 48u &&
+               getenv("DS4_QWEN4EXP_NO_GDN_SHORT_REUSE") == NULL) {
+        /* Short decode/verify still updates every state value. Two adjacent
+         * value rows share Q/K and gates, preserving each row's token order,
+         * dot tree, and every requested per-token rollback snapshot. */
+        qwen4exp_gdn_value_reuse_kernel<2u, false, false><<<
+                dim3(n_value_head, QWEN4EXP_GDN_DIM / 8u, n_rows),
+                QWEN4EXP_GDN_DIM, 0, stream>>>(
+                (float *)out->ptr, (float *)recurrent_state->ptr,
+                (const float *)qkv->ptr,
+                (const float *)raw_alpha->ptr,
+                (const float *)raw_beta->ptr, a_log, dt_bias, NULL,
+                state_snapshot ? (float *)state_snapshot->ptr : NULL,
+                n_key_head, n_value_head, n_rows, n_tokens, head_layout,
+                n_snapshot_rows,
+                getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
     } else {
         qwen4exp_gdn_recurrence_kernel<false><<<
                 recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(

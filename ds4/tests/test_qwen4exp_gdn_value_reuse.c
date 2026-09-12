@@ -1,4 +1,6 @@
-/* Compare long-chunk value-row reuse with the retained recurrence. Every
+/* Compare long-chunk value-row reuse with the retained recurrence.
+ * --short instead isolates one/two-token value-row reuse; other widths exercise
+ * its unchanged fallback. Every
  * comparison covers nine complete buffers, unused rows, and 64-byte tails.
  * Capture/replay changes inputs, carried state, layout, and gate magnitudes. */
 #ifndef _GNU_SOURCE
@@ -19,9 +21,11 @@ static float random_value(void) {
     rnd_state^=rnd_state<<13; rnd_state^=rnd_state>>17; rnd_state^=rnd_state<<5;
     return ((int)(rnd_state%20001)-10000)*.0001f;
 }
+static const char *mode_switch = "DS4_QWEN4EXP_NO_GDN_VALUE_REUSE";
+static unsigned short_mode;
 static void mode(unsigned candidate) {
-    if (candidate) unsetenv("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE");
-    else require_ok(setenv("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE","1",1)==0,"reference mode");
+    if (candidate) unsetenv(mode_switch);
+    else require_ok(setenv(mode_switch,"1",1)==0,"reference mode");
 }
 static void write_values(ds4_gpu_tensor *v,size_t bytes,float scale,unsigned pattern) {
     float *h=require_alloc(bytes,"host values");
@@ -93,7 +97,11 @@ static void free_case(gate_case *a) {
     for(unsigned j=0;j<FIELDS;j++)ds4_gpu_tensor_free(a->v[j]);
     for(unsigned j=0;j<4;j++)ds4_gpu_tensor_free(a->src[j]);
 }
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], "--short") == 0) {
+        short_mode = 1;
+        mode_switch = "DS4_QWEN4EXP_NO_GDN_SHORT_REUSE";
+    } else require_ok(argc == 1, "usage: test-qwen4exp-gdn-value-reuse [--short]");
     require_ok(setenv("DS4_CUDA_DECODE_GRAPHS","1",1)==0,"graphs enabled");
     uint8_t *model=mmap(NULL,MODEL_BYTES,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
     require_ok(model!=MAP_FAILED,"mapping");build_weights(model);
@@ -109,6 +117,9 @@ int main(void) {
       memset(&a,0,sizeof(a));allocate_case(&a,widths[wi]+1u,6);
       for(unsigned si=0;si<3;si++) {
         unsigned tokens=widths[wi],snap=tokens<8?tokens-1:6;
+        /* Short widths cover no snapshots, a prefix, and every live token.
+         * Snapshot count is fixed per graph key, then data change on replay. */
+        if (short_mode && tokens <= 2u) snap = si == 0u ? 0u : si == 1u ? 1u : tokens;
         ds4_gpu_decode_graphs_invalidate();
         ds4_decode_graph_key keys[2]={{.il=1},{.il=2}};
         for(unsigned trial=0;trial<4;trial++) {
@@ -138,6 +149,6 @@ int main(void) {
     }
     printf("GDN_VALUE_REUSE_COMPLETE eager=%u graph=%u changed=%u PASS\n",eager,graphs,changed);fflush(stdout);
     for(unsigned j=0;j<FIELDS;j++)free(ref[j]);
-    unsetenv("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE");
+    unsetenv(mode_switch);
     ds4_gpu_cleanup();munmap(model,MODEL_BYTES);return 0;
 }
