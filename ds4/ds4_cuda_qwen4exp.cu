@@ -512,7 +512,8 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
         uint32_t     n_rows,
         uint32_t     n_tokens,
         uint32_t     head_layout,
-        uint32_t     n_snapshot_rows) {
+        uint32_t     n_snapshot_rows,
+        uint32_t     snap_plain) {
     const uint32_t head = blockIdx.x;
     const uint32_t value = blockIdx.y * 4u + (threadIdx.x >> 5u);
     const uint32_t row = blockIdx.z;
@@ -584,7 +585,12 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
         }
 
         /* The recurrent state AFTER this token.  Same element this thread owns
-         * in the live state, one slot per row. */
+         * in the live state, one slot per row.  The slot is written once and
+         * read only by a rollback, so the plain store's L2 allocation and
+         * read-for-ownership are pure overhead: at the verify's two-row
+         * geometry the two 3.1 MB snapshot streams thrash L2 against the live
+         * state, and the streaming store removes that.  A same-binary A/B
+         * restores the plain store with DS4_QWEN4EXP_SNAP_PLAIN. */
         if (token < n_snapshot_rows) {
             const uint64_t stride = (uint64_t)n_rows * n_value_head *
                 QWEN4EXP_GDN_DIM * QWEN4EXP_GDN_DIM;
@@ -592,7 +598,11 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
                 (uint64_t)token * stride +
                 ((((uint64_t)row * n_value_head + head) * QWEN4EXP_GDN_DIM) +
                  value) * QWEN4EXP_GDN_DIM + k0);
-            *snap = h;
+            if (snap_plain) {
+                *snap = h;
+            } else {
+                __stcs(snap, h);
+            }
         }
     }
     *state_ptr = h;
@@ -609,7 +619,8 @@ __global__ static void qwen4exp_gdn_value_reuse_kernel(
         const float *raw_beta, const float *a_log, const float *dt_bias,
         const float2 *__restrict__ gate_pairs, float *state_snapshot,
         uint32_t n_key_head, uint32_t n_value_head, uint32_t n_rows,
-        uint32_t n_tokens, uint32_t head_layout, uint32_t n_snapshot_rows) {
+        uint32_t n_tokens, uint32_t head_layout, uint32_t n_snapshot_rows,
+        uint32_t snap_plain) {
     const uint32_t head = blockIdx.x;
     const uint32_t value0 = (blockIdx.y * 4u + (threadIdx.x >> 5u)) * R;
     const uint32_t row = blockIdx.z;
@@ -671,7 +682,11 @@ __global__ static void qwen4exp_gdn_value_reuse_kernel(
                     QWEN4EXP_GDN_DIM * QWEN4EXP_GDN_DIM;
                 float4 *snap = (float4 *)(state_snapshot + token * stride +
                     state_base + r * QWEN4EXP_GDN_DIM);
-                *snap = h[r];
+                if (snap_plain) {
+                    *snap = h[r];
+                } else {
+                    __stcs(snap, h[r]);
+                }
             }
         }
     }
@@ -943,7 +958,8 @@ static int qwen4exp_cuda_gdn_run(
                         gate_pairs,
                         state_snapshot ? (float *)state_snapshot->ptr : NULL,
                         n_key_head, n_value_head, n_rows, n_tokens, head_layout,
-                        n_snapshot_rows);
+                        n_snapshot_rows,
+                        getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
             } else {
                 qwen4exp_gdn_value_reuse_kernel<4u><<<
                         dim3(n_value_head, QWEN4EXP_GDN_DIM / 16u, n_rows), QWEN4EXP_GDN_DIM, 0, stream>>>(
@@ -953,7 +969,8 @@ static int qwen4exp_cuda_gdn_run(
                         gate_pairs,
                         state_snapshot ? (float *)state_snapshot->ptr : NULL,
                         n_key_head, n_value_head, n_rows, n_tokens, head_layout,
-                        n_snapshot_rows);
+                        n_snapshot_rows,
+                        getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
             }
         } else {
             qwen4exp_gdn_recurrence_kernel<true><<<
@@ -964,7 +981,8 @@ static int qwen4exp_cuda_gdn_run(
                     gate_pairs,
                     state_snapshot ? (float *)state_snapshot->ptr : NULL,
                     n_key_head, n_value_head, n_rows, n_tokens, head_layout,
-                    n_snapshot_rows);
+                    n_snapshot_rows,
+                    getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
         }
     } else {
         qwen4exp_gdn_recurrence_kernel<false><<<
@@ -976,7 +994,8 @@ static int qwen4exp_cuda_gdn_run(
                 NULL,
                 state_snapshot ? (float *)state_snapshot->ptr : NULL,
                 n_key_head, n_value_head, n_rows, n_tokens, head_layout,
-                n_snapshot_rows);
+                n_snapshot_rows,
+                getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
     }
     if (!cuda_ok(cudaGetLastError(), "qwen4exp GDN recurrence launch")) {
         return 0;
