@@ -35,7 +35,9 @@
 use std::sync::{Arc, Mutex};
 
 use crate::engine::{Engine, EngineError, EngineFactory, FreeRunResult, Route, Step};
-use crate::protocol::{CorrectnessTraceLogit, EffectiveSpec, EffectiveSpecMTP, TOP_LOGITS_K};
+use crate::protocol::{
+    CorrectnessTraceLogit, EffectiveSpec, EffectiveSpecMTP, ExpertStreamingStats, TOP_LOGITS_K,
+};
 
 /// The lowest depth the track envelope names (`permitted_draft_depths`).
 pub const MTP_MIN_DEPTH: i64 = 1;
@@ -90,6 +92,11 @@ pub trait Ds4Session: Send {
     }
     /// Drop the live prefix so the next `sync` forwards the whole prompt.
     fn invalidate(&mut self) {}
+    /// DIAGNOSTIC: the engine's packed profile words (six 64-bit words and two
+    /// doubles), or `None` when the session has none to report.
+    fn profile_words(&mut self) -> Option<([u64; 6], [f64; 2])> {
+        None
+    }
 }
 
 /// The end-of-sequence ids the correctness free-run reference stops on:
@@ -383,8 +390,37 @@ impl Engine for Ds4Engine {
         })
     }
 
+    /// DIAGNOSTIC PROBE.  On a free-run phase this audit-only field carries
+    /// the cycle's cumulative draft (head) seconds instead of the RSS.
     fn peak_ram_gb(&self) -> f64 {
+        if self.free_run.is_some() {
+            if let Some((_, f)) = self.lock().profile_words() {
+                return f[1];
+            }
+        }
         peak_rss_gb().unwrap_or(0.0)
+    }
+
+    /// DIAGNOSTIC PROBE.  The dense runtime has no expert streaming, so these
+    /// six counters are otherwise the zero struct.  A free-run phase reports
+    /// the engine's packed profile words through them instead, so the sealed
+    /// artifact carries the on-box split; every other phase keeps zeros.
+    fn expert_stats(&self) -> ExpertStreamingStats {
+        if self.free_run.is_none() {
+            return ExpertStreamingStats::zero();
+        }
+        let mut s = self.lock();
+        match s.profile_words() {
+            Some((w, f)) => ExpertStreamingStats {
+                cache_hits: w[0],
+                cache_misses: w[1],
+                cache_evictions: w[2],
+                bytes_read: w[3],
+                read_seconds: f[0],
+                peak_cached_tensors: w[4],
+            },
+            None => ExpertStreamingStats::zero(),
+        }
     }
 }
 

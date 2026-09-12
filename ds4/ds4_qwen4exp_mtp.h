@@ -118,6 +118,13 @@
  */
 #define DS4_QWEN4EXP_IMPLEMENTED_DEPTH 6
 
+/* DIAGNOSTIC.  The head forward's per-stage wall split (DS4_MTP_HEAD_TIME),
+ * fifteen stages, cumulative nanoseconds and the number of head steps that
+ * were split.  Zeros when the switch is off. */
+#define DS4_QWEN4EXP_MTP_HEAD_STAGES 15
+void ds4_qwen4exp_mtp_head_time_snapshot(uint64_t *ns, size_t cap,
+                                         uint64_t *calls);
+
 /* The most tokens one cycle can commit: the fed token plus the draft chain.
  * Also the widest verify the cycle runs, which is what sizes the head's row
  * budget and the session's prefill floor. */

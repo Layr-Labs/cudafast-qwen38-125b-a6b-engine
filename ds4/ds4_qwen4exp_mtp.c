@@ -955,6 +955,16 @@ static void mtp_head_time_dump(void) {
             (double)total / n / 1e6);
 }
 
+void ds4_qwen4exp_mtp_head_time_snapshot(uint64_t *ns, size_t cap,
+                                         uint64_t *calls) {
+    _Static_assert(MTP_HEAD_T_N == DS4_QWEN4EXP_MTP_HEAD_STAGES,
+                   "the head stage count is published in the header");
+    for (size_t i = 0; ns && i < cap; i++) {
+        ns[i] = i < (size_t)MTP_HEAD_T_N ? mtp_head_stage_ns[i] : 0u;
+    }
+    if (calls) *calls = mtp_head_stage_calls;
+}
+
 static int mtp_head_time_on(void) {
     if (mtp_head_timing < 0) {
         const char *v = getenv("DS4_MTP_HEAD_TIME");
@@ -1275,3 +1285,11 @@ int ds4_qwen4exp_mtp_head_forward_last(ds4_qwen4exp_mtp_head *h,
 }
 
 #endif /* DS4_NO_GPU */
+
+#ifdef DS4_NO_GPU
+void ds4_qwen4exp_mtp_head_time_snapshot(uint64_t *ns, size_t cap,
+                                         uint64_t *calls) {
+    for (size_t i = 0; ns && i < cap; i++) ns[i] = 0u;
+    if (calls) *calls = 0u;
+}
+#endif

@@ -111,6 +111,13 @@ int ds4s_eval_speculative(ds4s_handle *h, int32_t first_token, int budget, int32
 void ds4s_spec_counters(const ds4s_handle *h, uint64_t *drafts, uint64_t *hits,
                         uint64_t *quenches, uint64_t *disagreements);
 
+/* DIAGNOSTIC profile readout (ds4_session_qwen4exp_profile_text/_words):
+ * cumulative engine-side timing splits, a one-line text summary and six
+ * packed 64-bit words plus two doubles.  Zeros / empty text when the engine
+ * ran with no profiling switch set or the session is not qwen4exp. */
+int ds4s_profile_text(const ds4s_handle *h, char *buf, size_t cap);
+int ds4s_profile_words(const ds4s_handle *h, uint64_t words[6], double f[2]);
+
 #ifdef __cplusplus
 }
 #endif
