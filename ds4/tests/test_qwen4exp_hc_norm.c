@@ -570,6 +570,117 @@ static void check_q8_mma_pipe(void) {
     }
 }
 
+/* ---- the wide-output rung of the pipelined tile's ladder ---------------- */
+
+/* DS4_CUDA_MMA_PIPE_WIDE routes the three widest projections (below) through
+ * a wider pipe tile, halving (mode 1) or quartering (mode 2) the y-block
+ * count that re-reads the quantized activations from L2.  The tile shape
+ * does not enter the pipe's arithmetic -- every rung of the ladder must
+ * agree BIT FOR BIT with the 64-wide rung the ladder measured, on the same
+ * non-power-of-two scales and int8 extremes as the arm above.  And
+ * ds4_gpu_q8_mma_pipe_last_bn reports which rung a call actually took, so a
+ * valve that silently stops routing (a refused shared-memory opt-in falls
+ * back to the rung below) fails here instead of quietly timing the wrong
+ * tile.  Widths: 65, the first width the production pipe takes, 1024 the
+ * prefill chunk, 1017 the ragged tail.  Mode 2 accepts the 128-wide rung as
+ * well as the 256-wide one, because whether the 120 KB opt-in succeeds is
+ * the device's call. */
+void ds4_gpu_set_q8_mma_pipe_wide(int mode);
+int ds4_gpu_q8_mma_pipe_last_bn(void);
+
+static void check_q8_mma_pipe_wide_shape(uint32_t in_dim, uint32_t out_dim,
+                                         const char *what) {
+    static const uint32_t widths[] = { 65u, 1017u, 1024u };
+    const uint64_t n_widths = sizeof(widths) / sizeof(widths[0]);
+    const uint32_t max_rows = 1024u;
+    const uint64_t wbytes = (uint64_t)out_dim * (in_dim / 32u) * 34u;
+    uint8_t *w = mmap(NULL, wbytes, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANON, -1, 0);
+    require_ok(w != MAP_FAILED, "q8_0 mma pipe wide weight mapping");
+    fill_q8_0_random_scales(w, in_dim, out_dim);
+
+    const uint64_t x_count = (uint64_t)max_rows * in_dim;
+    float *x = alloc_floats(x_count);
+    for (uint64_t i = 0; i < x_count; i++) x[i] = next_unit();
+    ds4_gpu_tensor *x_all = upload(x, x_count);
+    ds4_gpu_tensor *out_t = ds4_gpu_tensor_alloc((uint64_t)max_rows * out_dim * sizeof(float));
+    require_ok(out_t != NULL, "q8_0 mma pipe wide output allocation");
+    float *ref = alloc_floats((uint64_t)max_rows * out_dim);
+    float *got = alloc_floats((uint64_t)max_rows * out_dim);
+    int saw_256 = 0;
+
+    for (uint64_t wi = 0; wi < n_widths; wi++) {
+        const uint32_t rows = widths[wi];
+        char label[128];
+
+        /* The rung the ladder measured: 64 columns. */
+        ds4_gpu_set_q8_mma_pipe_wide(0);
+        require_ok(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+                       out_t, w, wbytes, 0u, in_dim, out_dim, x_all, rows),
+                   "q8_0 mma pipe wide mode 0 call");
+        if (ds4_gpu_q8_mma_pipe_last_bn() != 64) {
+            fprintf(stderr, "%s, %u rows: wide mode 0 routing failed: BN %d, expected 64\n",
+                    what, rows, ds4_gpu_q8_mma_pipe_last_bn());
+            exit(1);
+        }
+        download(out_t, ref, (uint64_t)rows * out_dim);
+
+        /* Mode 1: the 128-column rung. */
+        ds4_gpu_set_q8_mma_pipe_wide(1);
+        require_ok(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+                       out_t, w, wbytes, 0u, in_dim, out_dim, x_all, rows),
+                   "q8_0 mma pipe wide mode 1 call");
+        if (ds4_gpu_q8_mma_pipe_last_bn() != 128) {
+            fprintf(stderr, "%s, %u rows: wide mode 1 routing failed: BN %d, expected 128\n",
+                    what, rows, ds4_gpu_q8_mma_pipe_last_bn());
+            exit(1);
+        }
+        download(out_t, got, (uint64_t)rows * out_dim);
+        snprintf(label, sizeof(label), "%s, %u rows, wide 128 == 64", what, rows);
+        require_identical(label, got, ref, (uint64_t)rows * out_dim * sizeof(float));
+
+        /* Mode 2: the 256-column rung where the device grants its opt-in,
+         * the 128-column one where it does not. */
+        ds4_gpu_set_q8_mma_pipe_wide(2);
+        require_ok(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+                       out_t, w, wbytes, 0u, in_dim, out_dim, x_all, rows),
+                   "q8_0 mma pipe wide mode 2 call");
+        const int bn2 = ds4_gpu_q8_mma_pipe_last_bn();
+        if (bn2 != 256 && bn2 != 128) {
+            fprintf(stderr, "%s, %u rows: wide mode 2 routing failed: BN %d, expected 256 or 128\n",
+                    what, rows, bn2);
+            exit(1);
+        }
+        if (bn2 == 256) saw_256 = 1;
+        download(out_t, got, (uint64_t)rows * out_dim);
+        snprintf(label, sizeof(label), "%s, %u rows, wide %d == 64", what, rows, bn2);
+        require_identical(label, got, ref, (uint64_t)rows * out_dim * sizeof(float));
+    }
+    ds4_gpu_set_q8_mma_pipe_wide(0);
+    printf("  %-56s exact (256 rung %s)\n", what,
+           saw_256 ? "engaged" : "not taken");
+    free(got);
+    free(ref);
+    ds4_gpu_tensor_free(out_t);
+    ds4_gpu_tensor_free(x_all);
+    free(x);
+    munmap(w, wbytes);
+}
+
+static void check_q8_mma_pipe_wide(void) {
+    /* The three widest dense projections of the tower, by (K, N): the GDN
+     * qkv (2560 -> 10240), the attention q (2560 -> 12288) and the GDN gate
+     * (2560 -> 6144) -- the shapes DS4_CUDA_MMA_PIPE_WIDE reroutes. */
+    static const struct { uint32_t k, n; const char *what; } shapes[] = {
+        { 2560u, 10240u, "q8_0 mma pipe wide, 2560 -> 10240" },
+        { 2560u, 12288u, "q8_0 mma pipe wide, 2560 -> 12288" },
+        { 2560u, 6144u,  "q8_0 mma pipe wide, 2560 -> 6144" },
+    };
+    for (uint64_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
+        check_q8_mma_pipe_wide_shape(shapes[i].k, shapes[i].n, shapes[i].what);
+    }
+}
+
 /* ---- the fused mixer against the op-by-op one ----------------------- */
 
 /* ds4_gpu_qwen4exp_hc_mixer_tensor may fuse the chain inside the backend.  The
@@ -1366,6 +1477,7 @@ int main(void) {
      * The switch is one-way, which is why this pass is last. */
     ds4_gpu_enable_q8_dense_mma();
     check_q8_mma_pipe();
+    check_q8_mma_pipe_wide();
     check_mixer_equivalence(model, "MMA tile");
     check_mixer_pending(model, "MMA tile");
 
