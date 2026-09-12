@@ -1808,7 +1808,13 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
         return false;
     }
     QW_MOE_TICK(QW_MOE_T_ROUTER);
-    if (!ds4_gpu_qwen4exp_router_select_tensor(s->moe_selected, s->moe_weights,
+    int select_in_moe = 0;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    select_in_moe = n_tokens <= 2u &&
+        getenv("DS4_QWEN4EXP_NO_MOE_PREPARE") == NULL &&
+        getenv("DS4_QWEN4EXP_NO_ROUTER_NATIVE") == NULL;
+#endif
+    if (!select_in_moe && !ds4_gpu_qwen4exp_router_select_tensor(s->moe_selected, s->moe_weights,
                                                s->moe_logits, DS4_N_EXPERT,
                                                DS4_N_EXPERT_USED, n_tokens)) {
         fprintf(stderr, "ds4: qwen4exp router select failed at block %u\n", il);
@@ -1828,7 +1834,12 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
     const ds4_gpu_qwen4exp_slab gate_slab = QW_SLAB(m, l->ffn_gate_exps);
     const ds4_gpu_qwen4exp_slab up_slab = QW_SLAB(m, l->ffn_up_exps);
     const ds4_gpu_qwen4exp_slab down_slab = QW_SLAB(m, l->ffn_down_exps);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (!ds4_gpu_qwen4exp_routed_moe_logits_tensor(
+            select_in_moe ? s->moe_logits : NULL,
+#else
     if (!ds4_gpu_qwen4exp_routed_moe_tensor(
+#endif
             s->block_out, s->moe_mid, s->moe_down_partial,
             &gate_slab, &up_slab, &down_slab,
             DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD,

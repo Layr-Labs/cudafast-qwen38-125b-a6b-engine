@@ -2937,6 +2937,27 @@ int ds4_gpu_qwen4exp_routed_moe_tensor(
         const ds4_gpu_tensor        *x,
         uint32_t                     n_tokens,
         uint32_t                     mid_token_stride);
+/* Optional logits select and publish experts/weights before routed MoE.
+ * NULL uses the supplied selection, as routed_moe_tensor does. */
+int ds4_gpu_qwen4exp_routed_moe_logits_tensor(
+        const ds4_gpu_tensor *logits,
+        ds4_gpu_tensor *out,
+        ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *down_partial,
+        const ds4_gpu_qwen4exp_slab *gate_slab,
+        const ds4_gpu_qwen4exp_slab *up_slab,
+        const ds4_gpu_qwen4exp_slab *down_slab,
+        uint32_t in_dim,
+        uint32_t mid_dim,
+        uint32_t out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert,
+        uint32_t n_expert_used,
+        const ds4_gpu_tensor *x,
+        uint32_t n_tokens,
+        uint32_t mid_token_stride);
+
 
 int ds4_gpu_qwen4exp_shared_expert_tensor(
         ds4_gpu_tensor              *out,

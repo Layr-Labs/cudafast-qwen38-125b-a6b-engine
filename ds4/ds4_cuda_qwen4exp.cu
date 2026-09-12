@@ -1642,16 +1642,15 @@ __device__ __forceinline__ static float dev_qwen4exp_block_sum(
  * envelope as sixteen coalesced rows, keep them in registers, and select the
  * small top-k without sorting the 502 entries the model will discard. */
 template<bool Native>
-__global__ static void qwen4exp_router_select_topk_kernel(
+__device__ __forceinline__ static void qwen4exp_router_select_topk(
         int32_t *selected,
         float *weights_out,
         const float *logits,
         uint32_t n_expert,
         uint32_t n_expert_used,
-        uint32_t n_tokens) {
-    const uint32_t tok = blockIdx.x;
+        uint32_t n_tokens, uint32_t tok) {
     if (tok >= n_tokens) return;
-    const uint32_t lane = threadIdx.x;
+    const uint32_t lane = threadIdx.x & 31u;
     const float *lg = logits + (uint64_t)tok * n_expert;
     int32_t *sel = selected + (uint64_t)tok * n_expert_used;
     float *w = weights_out + (uint64_t)tok * n_expert_used;
@@ -1754,6 +1753,14 @@ __global__ static void qwen4exp_router_select_topk_kernel(
             for (uint32_t i = 0; i < n_expert_used; i++) w[i] *= inv;
         }
     }
+}
+
+template<bool Native>
+__global__ static void qwen4exp_router_select_topk_kernel(
+        int32_t *selected, float *weights_out, const float *logits,
+        uint32_t n_expert, uint32_t n_expert_used, uint32_t n_tokens) {
+    qwen4exp_router_select_topk<Native>(selected, weights_out, logits,
+                                       n_expert, n_expert_used, n_tokens, blockIdx.x);
 }
 
 /* One block per token.  Bitonic sort over the raw logits with ties going to
@@ -2035,7 +2042,7 @@ __global__ static void qwen4exp_moe_pair_tasks_kernel(
  * expert thread scans the short pair list, the block performs the same integer
  * prefix scans as the wide path, and each expert writes its pairs in ascending
  * pair order. */
-__global__ static void qwen4exp_moe_group_small_kernel(
+__device__ __forceinline__ static void qwen4exp_moe_group_small(
         int32_t *counts,
         int32_t *offsets,
         int32_t *cursor,
@@ -2133,6 +2140,47 @@ __global__ static void qwen4exp_moe_group_small_kernel(
             for (uint32_t row = 0; row < mid_dim; row++) dst[row] = 0.0f;
         }
     }
+}
+
+__global__ static void qwen4exp_moe_group_small_kernel(
+        int32_t *counts, int32_t *offsets, int32_t *cursor, int32_t *active,
+        int32_t *pairs, float *mid, const int32_t *selected,
+        uint32_t n_expert, uint32_t n_pairs, uint32_t n_expert_used,
+        uint32_t mid_dim, uint32_t mid_token_stride) {
+    qwen4exp_moe_group_small(counts, offsets, cursor, active, pairs, mid,
+        selected, n_expert, n_pairs, n_expert_used, mid_dim, mid_token_stride);
+}
+
+/* Short routing and quantization share a launch. Only block zero selects
+ * experts; other blocks quantize the independent unchanged input. */
+__global__ static void qwen4exp_moe_prepare_kernel(
+        int32_t *selected, float *weights, const float *logits,
+        int32_t *counts, int32_t *offsets, int32_t *cursor, int32_t *active,
+        int32_t *pairs, float *mid, int8_t *q, float *scales, int32_t *sums,
+        const float *x, uint32_t experts, uint32_t used, uint32_t rows,
+        uint32_t width, uint32_t mid_dim, uint32_t mid_stride) {
+    if (blockIdx.x == 0u) {
+        __shared__ int32_t chosen[2u * 32u];
+        const uint32_t token = threadIdx.x >> 5u;
+        if (token < rows) qwen4exp_router_select_topk<true>(chosen, weights,
+                                        logits, experts, used, rows, token);
+        __syncthreads();
+        if (threadIdx.x < rows * used) selected[threadIdx.x] = chosen[threadIdx.x];
+        qwen4exp_moe_group_small(counts, offsets, cursor, active, pairs, mid,
+                                chosen, experts, rows * used, used, mid_dim, mid_stride);
+    } else {
+        const uint32_t groups = width / 32u;
+        const uint32_t at = (blockIdx.x - 1u) * 16u + (threadIdx.x >> 5u);
+        if (at >= rows * groups) return;
+        dev_qwen4exp_quantize_group(q, scales, sums, x + (uint64_t)at * 32u,
+                                    threadIdx.x & 31u, 32u, at);
+    }
+}
+
+static bool qwen4exp_moe_disjoint(const void *a, uint64_t an,
+                                     const void *b, uint64_t bn) {
+    const uintptr_t ap = (uintptr_t)a, bp = (uintptr_t)b;
+    return ap >= bp ? ap - bp >= bn : bp - ap >= an;
 }
 
 __global__ static void qwen4exp_moe_group_scatter_kernel(
@@ -4766,23 +4814,25 @@ static int qwen4exp_moe_tile(uint32_t n_rows) {
     return 8;
 }
 
-extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
-        ds4_gpu_tensor              *out,
-        ds4_gpu_tensor              *mid,
-        ds4_gpu_tensor              *down_partial,
-        const ds4_gpu_qwen4exp_slab *gate_slab,
-        const ds4_gpu_qwen4exp_slab *up_slab,
-        const ds4_gpu_qwen4exp_slab *down_slab,
-        uint32_t                     in_dim,
-        uint32_t                     mid_dim,
-        uint32_t                     out_dim,
-        const ds4_gpu_tensor        *selected,
-        const ds4_gpu_tensor        *weights,
-        uint32_t                     n_total_expert,
-        uint32_t                     n_expert_used,
-        const ds4_gpu_tensor        *x,
-        uint32_t                     n_tokens,
-        uint32_t                     mid_token_stride) {
+#define QW_MOE_PARAMS \
+        ds4_gpu_tensor *out,\
+        ds4_gpu_tensor *mid,\
+        ds4_gpu_tensor *down_partial,\
+        const ds4_gpu_qwen4exp_slab *gate_slab,\
+        const ds4_gpu_qwen4exp_slab *up_slab,\
+        const ds4_gpu_qwen4exp_slab *down_slab,\
+        uint32_t in_dim,\
+        uint32_t mid_dim,\
+        uint32_t out_dim,\
+        const ds4_gpu_tensor *selected,\
+        const ds4_gpu_tensor *weights,\
+        uint32_t n_total_expert,\
+        uint32_t n_expert_used,\
+        const ds4_gpu_tensor *x,\
+        uint32_t n_tokens,\
+        uint32_t mid_token_stride
+#define QW_MOE_ARGS out, mid, down_partial, gate_slab, up_slab, down_slab, in_dim, mid_dim, out_dim, selected, weights, n_total_expert, n_expert_used, x, n_tokens, mid_token_stride
+static int qwen4exp_routed_moe_cuda(QW_MOE_PARAMS, const ds4_gpu_tensor *logits) {
     if (!out || !mid || !gate_slab || !up_slab || !down_slab ||
         !gate_slab->map || !up_slab->map || !down_slab->map ||
         !selected || !weights || !x ||
@@ -4823,6 +4873,9 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         fprintf(stderr, "ds4: CUDA qwen4exp MoE received undersized buffers\n");
         return 0;
     }
+
+    if (logits && (!logits->ptr || logits->bytes <
+                       (uint64_t)n_tokens * n_total_expert * sizeof(float))) return 0;
 
     /* Each slab resolves through its OWN mapping: one block's expert tensors
      * can live in different shards of a split GGUF. */
@@ -4893,7 +4946,38 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     const int small_group =
         n_tokens < 8u && n_total_expert <= QWEN4EXP_MOE_SCAN_THREADS &&
         getenv("DS4_QWEN4EXP_SERIAL_GROUP_SCAN") == NULL;
-    if (small_group) {
+    bool prepare = logits && small_group && n_tokens <= 2u &&
+        n_expert_used <= 32u &&
+        getenv("DS4_QWEN4EXP_NO_MOE_PREPARE") == NULL &&
+        getenv("DS4_QWEN4EXP_NO_ROUTER_NATIVE") == NULL;
+    if (prepare) {
+        const ds4_gpu_tensor *reads[] = {x, logits};
+        const ds4_gpu_tensor *writes[] = {selected, weights, mid};
+        for (const ds4_gpu_tensor *r : reads) {
+            prepare = prepare && ds4_tensor_device_idx(r) == logical_tier &&
+                qwen4exp_moe_disjoint(base, idx_bytes + pair_bytes + xq_bytes + mq_bytes,
+                                      r->ptr, r->bytes);
+            for (const ds4_gpu_tensor *w : writes)
+                prepare = prepare && qwen4exp_moe_disjoint(r->ptr, r->bytes, w->ptr, w->bytes);
+        }
+        for (const ds4_gpu_tensor *w : writes)
+            prepare = prepare && ds4_tensor_device_idx(w) == logical_tier &&
+                qwen4exp_moe_disjoint(base, idx_bytes + pair_bytes + xq_bytes + mq_bytes,
+                                      w->ptr, w->bytes);
+        prepare = prepare && qwen4exp_moe_disjoint(selected->ptr, selected->bytes,
+                                                   weights->ptr, weights->bytes);
+    }
+    if (logits && !prepare && !ds4_gpu_qwen4exp_router_select_tensor(
+            (ds4_gpu_tensor *)selected, (ds4_gpu_tensor *)weights, logits,
+            n_total_expert, n_expert_used, n_tokens)) return 0;
+    if (prepare) {
+        qwen4exp_moe_prepare_kernel<<<1u + (n_tokens * xgroups + 15u) / 16u,
+                                      512, 0, stream>>>(
+            (int32_t *)selected->ptr, (float *)weights->ptr, (const float *)logits->ptr,
+            sc.counts, sc.offsets, sc.cursor, sc.active, sc.pairs, (float *)mid->ptr,
+            sc.xq, sc.xs, sc.xsum, (const float *)x->ptr,
+            n_total_expert, n_expert_used, n_tokens, in_dim, mid_dim, mid_token_stride);
+    } else if (small_group) {
         qwen4exp_moe_group_small_kernel<<<
                 1, QWEN4EXP_MOE_SCAN_THREADS, 0, stream>>>(
                 sc.counts, sc.offsets, sc.cursor, sc.active, sc.pairs,
@@ -4933,25 +5017,14 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     }
     if (!cuda_ok(cudaGetLastError(), "qwen4exp MoE pair list")) return 0;
 
-    if (!qwen4exp_quantize_rows(sc.xq, sc.xs, sc.xsum, (const float *)x->ptr,
+    if (!prepare && !qwen4exp_quantize_rows(sc.xq, sc.xs, sc.xsum, (const float *)x->ptr,
                                 n_tokens, in_dim, xgroups, in_dim, 0, 1,
                                 stream)) {
         return 0;
     }
 
-    /* The tensor-core tile takes the gate and up projections when the shapes
-     * divide it and neither type is Q6_K, whose scale changes inside a group.
-     * DS4_QWEN4EXP_NO_MMA keeps the dp4a kernel for the comparison. */
-    /* WIDTH DISPATCH.  The speculative cycle only ever runs one row (decode)
-     * and two to four (verify at depths one to three), and those widths carry
-     * the exactness requirement: a batched verify has to equal a serial
-     * decode.  A prefill is identical across depths by construction, so it is
-     * free to use different numerics as long as they are deterministic.
-     *
-     * So the tile takes width eight and above and the pre-existing per-row
-     * kernels keep everything below it, unchanged.  The tile at one row would
-     * pad thirty-one of its thirty-two token rows and cost a quarter of the
-     * decode rate; this is what that buys back. */
+    /* Keep rows below eight on decode-order kernels for serial/verify
+     * identity. MMA requires groupwise scales; Q6_K does not qualify. */
     const int use_mma =
         n_tokens >= 8u &&
         (mid_dim % QW_MMA_BM) == 0 && (xgroups % QW_MMA_G) == 0 &&
@@ -4959,15 +5032,9 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         up_slab->type != (uint32_t)DS4_QWEN4EXP_TY_q6_K &&
         getenv("DS4_QWEN4EXP_NO_MMA") == NULL;
 
-    /* The down tile decides whether the mid projection has a float consumer.
-     * When the down tile runs it reads the Q8_0 scratch (mq/ms/msum) and never
-     * the floats, so the gate/up tile quantises in its epilogue and the float
-     * mid -- the write here plus the read-back of the second quantise pass --
-     * never leaves the chip.  DS4_QWEN4EXP_NO_MOE_EPILOGUE stands that down
-     * and restores the write-out + second-pass chain bit for bit.  Without the
-     * down tile the per-row down kernel reads the quantised scratch of every
-     * (token, slot) pair including the invalid ones the zeroing pass wrote, so
-     * the standalone quantise must keep running there. */
+    /* MMA consumes quantized mid directly. Its gate/up epilogue can omit
+     * the float write and second quantization. NO_MOE_EPILOGUE restores that
+     * chain; the per-row down path still requires all pairs quantized. */
     const int down_mma = use_mma && (out_dim % QW_DOWN_MMA_BM) == 0 &&
                          down_slab->type != (uint32_t)DS4_QWEN4EXP_TY_q6_K;
     const int moe_epilogue = down_mma &&
@@ -4991,9 +5058,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             up_slab->expert_bytes, up_slab->row_bytes, \
             gate_slab->type, up_slab->type, xgroups, mid_dim, \
             mid_token_stride, n_expert_used)
-    /* Resolve the format once on the host, where tensor metadata already
-     * lives.  This exposes fixed nibble decoding and a fixed one-half
-     * accumulation to nvcc, without converting or copying any weight. */
+    /* Host metadata specializes decoding without changing any weight. */
     const bool specialize = getenv("DS4_QWEN4EXP_GENERIC_EXPERTS") == NULL;
 #define QWEN4EXP_GATEUP(R) do { \
     if (specialize && gate_slab->type == DS4_QWEN4EXP_TY_q4_K && \
@@ -5043,12 +5108,8 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
 #undef QWEN4EXP_GATEUP_MMA
 #undef QWEN4EXP_GATEUP_MMA_IMPL
     }
-    /* The measured Q4 path for the R=2 tile (one-row decode and two-row
-     * verify). qwen4exp_moe_tile already returns 2 for n_tokens <= 2, so the
-     * joint R=2 kernel was already the decode path; splitting gate/up across
-     * neighboring warps applies the same register cut there. The diagnostic
-     * pin retains the joint projection as a bit-exact oracle. Other widths
-     * keep their prior kernel. */
+    /* Short Q4 gate/up uses the existing split R2 tile. The diagnostic
+     * disable keeps the joint projection; other widths retain their path. */
     else if (n_tokens <= 2u && tile == 2 && specialize &&
              gate_slab->type == DS4_QWEN4EXP_TY_q4_K &&
              up_slab->type == DS4_QWEN4EXP_TY_q4_K &&
@@ -5132,6 +5193,16 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
 #undef QWEN4EXP_DOWN_IMPL
     return cuda_ok(cudaGetLastError(), "qwen4exp MoE down launch");
 }
+extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(QW_MOE_PARAMS) {
+    return qwen4exp_routed_moe_cuda(QW_MOE_ARGS, NULL);
+}
+
+extern "C" int ds4_gpu_qwen4exp_routed_moe_logits_tensor(
+        const ds4_gpu_tensor *logits, QW_MOE_PARAMS) {
+    return qwen4exp_routed_moe_cuda(QW_MOE_ARGS, logits);
+}
+#undef QW_MOE_ARGS
+#undef QW_MOE_PARAMS
 
 extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         ds4_gpu_tensor              *out,

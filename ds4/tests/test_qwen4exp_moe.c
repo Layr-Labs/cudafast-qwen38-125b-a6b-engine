@@ -2099,6 +2099,33 @@ static void run_production_expert_cases(void) {
             memcpy(single_shard_q51, got,
                    (size_t)PROD_TOKENS * PROD_OUT_DIM * sizeof(float));
         }
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        /* Selection must be recomputed; compare all five live outputs. */
+#define PREP_ARGS out_t, mid_t, part_t, &gate_slab, &up_slab, &down_slab, \
+    PROD_IN_DIM, PROD_MID_DIM, PROD_OUT_DIM, selected_t, weights_t, \
+    PROD_EXPERTS, PROD_USED, x_t, nr, PROD_USED * PROD_MID_DIM
+        for (uint32_t nr = 1; nr <= 2; nr++) {
+            ds4_gpu_tensor *ts[] = {out_t, mid_t, part_t, selected_t, weights_t};
+            size_t sz[] = {nr*PROD_OUT_DIM*4, nr*PROD_USED*PROD_MID_DIM*4,
+                          nr*PROD_USED*PROD_OUT_DIM*4, nr*PROD_USED*4, nr*PROD_USED*4};
+            void *ref[5];
+            require_ok(ds4_gpu_qwen4exp_routed_moe_tensor(PREP_ARGS), "prepare oracle");
+            for (int j=0; j<5; j++) {
+                ref[j]=malloc(sz[j]); require_ok(ref[j]!=NULL, "prepare buffer");
+                require_ok(ds4_gpu_tensor_read(ts[j],0,ref[j],sz[j]), "prepare read");
+            }
+            for (int j=3; j<5; j++)
+                require_ok(ds4_gpu_tensor_fill_f32(ts[j],0,sz[j]/4), "prepare poison");
+            require_ok(ds4_gpu_qwen4exp_routed_moe_logits_tensor(logits_t, PREP_ARGS), "prepare");
+            for (int j=0; j<5; j++) {
+                void *v=malloc(sz[j]); require_ok(v!=NULL, "prepare buffer");
+                require_ok(ds4_gpu_tensor_read(ts[j],0,v,sz[j]), "prepare read");
+                require_ok(!memcmp(v,ref[j],sz[j]), "prepare exact");
+                free(v); free(ref[j]);
+            }
+        }
+#undef PREP_ARGS
+#endif
     }
 
     /* The split-shard case: gate and up in the first mapping, down in the
