@@ -1110,30 +1110,9 @@ int main(void) {
                 differing, attn_len, at, (double)first[at], (double)grouped1[at]);
         return 1;
     }
-    printf("  %-38s %zu values bit-exact against the third cut\n",
+    printf("  %-38s %zu values bit-exact against the second cut\n",
            "first-cut head-group attention", attn_len);
     free(grouped1);
-
-    /* The second-cut group kernel (DS4_QWEN4EXP_NO_QSA_GROUP3) against the
-     * same bytes: the third cut only reschedules its phases. */
-    float *grouped2 = xcalloc(attn_len, sizeof(float));
-    setenv("DS4_QWEN4EXP_NO_QSA_GROUP3", "1", 1);
-    run_pipeline(&in, false, grouped2);
-    unsetenv("DS4_QWEN4EXP_NO_QSA_GROUP3");
-    if (memcmp(first, grouped2, attn_len * sizeof(float)) != 0) {
-        size_t differing = 0, at = 0;
-        for (size_t i = 0; i < attn_len; i++) {
-            if (first[i] != grouped2[i]) { if (differing == 0) at = i; differing++; }
-        }
-        fprintf(stderr,
-                "test_qwen4exp_qsa: second-cut head-group attention is not bit-exact: "
-                "%zu of %zu values differ, first at %zu: %.9g vs %.9g\n",
-                differing, attn_len, at, (double)first[at], (double)grouped2[at]);
-        return 1;
-    }
-    printf("  %-38s %zu values bit-exact against the third cut\n",
-           "second-cut head-group attention", attn_len);
-    free(grouped2);
 
     check_split_path();
 

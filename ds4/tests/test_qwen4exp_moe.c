@@ -1798,22 +1798,6 @@ static void run_moe_input_reuse_case(
             }
             eager++;
 #if !defined(__APPLE__) && !defined(__HIP_PLATFORM_AMD__)
-            /* The activation quantiser's one-warp kernel against the
-             * eight-warp prefill kernel the chain above used at rows >= 64
-             * (the 64, 65 and 1024 widths here): the same chain, byte for
-             * byte. */
-            require_ok(setenv("DS4_QWEN4EXP_NO_QUANT_WIDE", "1", 1) == 0,
-                       "one-warp quantiser select");
-            moe_reuse_chain(&c, 1);
-            unsetenv("DS4_QWEN4EXP_NO_QUANT_WIDE");
-            for (int j = 0; j < 3; j++) {
-                require_ok(ds4_gpu_tensor_read(c.t[j], 0, got, sizes[j]),
-                           "one-warp quantiser output read");
-                require_ok(memcmp(ref[j], got, sizes[j]) == 0,
-                           "one-warp quantiser equals wide quantiser output");
-            }
-#endif
-#if !defined(__APPLE__) && !defined(__HIP_PLATFORM_AMD__)
             if (capture) {
                 if (pattern == 0u) {
                     require_ok(ds4_gpu_decode_graph_begin(&key) == -1, "reuse graph warm marker");

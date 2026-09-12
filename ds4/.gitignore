@@ -37,7 +37,6 @@
 /tests/test_glm53_kda
 /tests/test_qwen4exp_gdn
 /tests/test_qwen4exp_gdn_ref
-/tests/test_qwen4exp_gdn_value_reuse
 /tests/test_qwen4exp_moe
 /tests/test_qwen4exp_hc_norm
 /tests/test_qwen4exp_qsa

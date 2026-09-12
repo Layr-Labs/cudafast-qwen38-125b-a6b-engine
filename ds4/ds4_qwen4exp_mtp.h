@@ -436,8 +436,8 @@ typedef struct {
      * writes one per step and a round keeps the ones its accepted drafts
      * produced, so this says whether the next chain's first row has everything
      * below it -- and, on a round that accepted its whole chain, that the
-     * bonus token's row is still owed.  Rows below the round's own position
-     * belong to the prefill and are never counted as written here. */
+     * bonus token's row is still owed. Prompt and serial cache publication
+     * also advance this count. */
     uint32_t head_rows;
     float   *hc_scratch;     /* DS4_QWEN4EXP_MTP_HC_ROWS rows of hc_dim     */
     /* The verify's own logits, one row per verified row: the accept loop reads
@@ -698,9 +698,10 @@ typedef struct {
     uint32_t cache_tail_pos;
     int cache_tail_next_token;      /* -1 until its actual next token is known */
     bool cache_tail_valid;
+    bool cache_tail_prime_disabled; /* DS4_MTP_NO_TAIL_PRIME, resolved at init */
 
-    /* The DRAFT shortlist over the borrowed LM head.  Set once by init() from
-     * DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX (0, the default: off, the draft projects
+    /* The DRAFT shortlist over the borrowed LM head. Initialized from
+     * DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX (0 disables restriction and projects
      * and argmaxes the whole vocabulary) and DS4_QWEN4EXP_DRAFT_VOCAB_TAIL
      * (DS4_QWEN4EXP_DRAFT_VOCAB_TAIL_DEFAULT).  A nonzero prefix restricts the
      * DRAFT's argmax to output rows [0, prefix) and [n_vocab - tail, n_vocab)
@@ -713,6 +714,11 @@ typedef struct {
     uint32_t native_capacity;
     uint32_t draft_vocab_prefix;
     uint32_t draft_vocab_tail;
+    /* The built-in shortlist can grow to this preallocated prefix when a
+     * head input contains an excluded ordinary token. Explicit vocab settings
+     * and DS4_MTP_NO_ADAPTIVE_VOCAB keep it fixed. No weight is copied. */
+    uint32_t draft_vocab_prefix_capacity;
+    uint32_t draft_vocab_prefix_initial; /* restored at a whole-request reset */
 
     float rms_eps;
     float weight_bias;             /* 1 for zero-centered weights, else 0    */
@@ -769,6 +775,9 @@ void ds4_qwen4exp_mtp_default_hooks(ds4_qwen4exp_mtp_gpu_hooks *hooks);
 
 int  ds4_qwen4exp_mtp_head_init(ds4_qwen4exp_mtp_head *h, char *err, size_t errlen);
 void ds4_qwen4exp_mtp_head_free(ds4_qwen4exp_mtp_head *h);
+/* Reset request-local coverage without reallocating scratch or changing the
+ * configured ranges. The resident may reuse one head for many requests. */
+void ds4_qwen4exp_mtp_head_reset_vocab(ds4_qwen4exp_mtp_head *h);
 
 /* Request-local prefix state; reset never allocates or changes vocab policy. */
 void ds4_qwen4exp_mtp_head_reset_cache(ds4_qwen4exp_mtp_head *h);
@@ -788,6 +797,16 @@ int ds4_qwen4exp_mtp_head_retain_cache_tail(ds4_qwen4exp_mtp_head *h,
         uint32_t pos, int known_next, char *err, size_t errlen);
 int ds4_qwen4exp_mtp_head_feed_cache_tail(ds4_qwen4exp_mtp_head *h,
         int token, uint32_t pos, bool *changed, char *err, size_t errlen);
+
+/* Prime a depth-one chain from an unknown retained target frontier and the
+ * actual next token. Returns 1 when primed, 0 without mutation when ineligible,
+ * or -1 on failure. The target position/state and commit counters do not move;
+ * the caller must still run the ordinary verifier. All head work is charged
+ * to draft_ns. n_ctx/n_batch are the actual target session plan's bounds. */
+int ds4_qwen4exp_mtp_prime_cache_tail(ds4_qwen4exp_mtp_state *st,
+        ds4_qwen4exp_mtp_head *h, int token, uint32_t pos,
+        int budget, int accepted_cap, uint32_t n_ctx, uint32_t n_batch,
+        char *err, size_t errlen);
 
 /*
  * One head forward.
