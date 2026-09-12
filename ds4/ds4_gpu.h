@@ -596,6 +596,13 @@ int ds4_gpu_qwen4exp_qsa_split_qkv_tensor(
  * out the way the attention kernel wants them.  The query row is head-major
  * with the gate interleaved per head, exactly as in the fused row above. */
 /* Fused Q-Prep: split doubled-query, per-head RMS norm, and partial RoPE. */
+/* Q, gate, K/V caches, optional K; doubled Q, raw K/V, Q/K norms, inv_freq. */
+int ds4_gpu_qwen4exp_qsa_prep_joint_dpos_tensor(
+        ds4_gpu_tensor *const out[5], const ds4_gpu_tensor *const in[6],
+        uint32_t rows, uint32_t qh, uint32_t kh, uint32_t dim, uint32_t rot,
+        uint32_t pos, uint32_t cap, float eps, float qo, float ko,
+        const ds4_gpu_tensor *dp);
+
 int ds4_gpu_qwen4exp_qsa_prep_q_fused_dpos_tensor(
         ds4_gpu_tensor       *q,
         ds4_gpu_tensor       *gate,
