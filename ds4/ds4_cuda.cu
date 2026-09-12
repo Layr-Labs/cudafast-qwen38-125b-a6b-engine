@@ -462,6 +462,7 @@ static cudaStream_t g_stream_selected_upload_stream;
 
 static int cuda_ok(cudaError_t err, const char *what);
 extern "C" void ds4_gpu_decode_graphs_invalidate(void);
+static void mtp_native_graphs_clear(void);
 static const char *cuda_model_range_ptr_from_fd(
         const void *model_map,
         uint64_t offset,
@@ -994,6 +995,7 @@ static void cuda_decode_graph_entry_kill(cuda_decode_graph_entry *e) {
 }
 
 extern "C" void ds4_gpu_decode_graphs_invalidate(void) {
+    mtp_native_graphs_clear();
     for (uint32_t il = 0; il < CUDA_DECODE_GRAPH_LAYERS; il++) {
         for (uint32_t is = 0; is < CUDA_DECODE_GRAPH_ISLANDS; is++) {
             for (uint32_t v = 0; v < CUDA_DECODE_GRAPH_VARIANTS; v++) {
@@ -3009,6 +3011,7 @@ extern "C" int ds4_gpu_init(void) {
 
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
+    mtp_native_graphs_clear();
     g_current_logical_tier = -1;
 
     /* Multi-GPU teardown: events, streams, cublas handles, scratch
