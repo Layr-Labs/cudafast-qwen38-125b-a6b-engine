@@ -1092,13 +1092,14 @@ int main(void) {
     printf("  %-38s %zu values bit-exact against the per-head kernel\n",
            "head-group attention", attn_len);
 
-    /* The first-cut group kernel (DS4_QWEN4EXP_NO_QSA_GROUP2) against the
-     * same per-head bytes, so both group kernels stand checked whichever
-     * one the dispatch takes. */
+    /* Disable both newer cuts to exercise the first-cut group kernel
+     * against the same per-head bytes, whichever cut is the default. */
     float *grouped1 = xcalloc(attn_len, sizeof(float));
+    setenv("DS4_QWEN4EXP_NO_QSA_GROUP3", "1", 1);
     setenv("DS4_QWEN4EXP_NO_QSA_GROUP2", "1", 1);
     run_pipeline(&in, false, grouped1);
     unsetenv("DS4_QWEN4EXP_NO_QSA_GROUP2");
+    unsetenv("DS4_QWEN4EXP_NO_QSA_GROUP3");
     if (memcmp(first, grouped1, attn_len * sizeof(float)) != 0) {
         size_t differing = 0, at = 0;
         for (size_t i = 0; i < attn_len; i++) {

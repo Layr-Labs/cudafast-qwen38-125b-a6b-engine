@@ -67649,6 +67649,7 @@ static int ds4_session_qwen4exp_sync(ds4_session *s, const ds4_tokens *prompt,
     /* A sync is a new prefix, so any carried draft is for a position that no
      * longer exists.  See ds4_session_invalidate. */
     ds4_qwen4exp_mtp_invalidate(&s->qwen4exp_spec);
+    ds4_qwen4exp_mtp_head_reset_vocab(&s->qwen4exp_head);
     ds4_qwen4exp_mtp_head_reset_cache(&s->qwen4exp_head);
     s->qwen4exp_spec.head_rows = 0;
     s->checkpoint.len = 0;
@@ -76224,6 +76225,22 @@ static int ds4_session_qwen4exp_spec_cycle(ds4_session *s, int first_token,
     ds4_engine *e = s->engine;
     if (!ds4_session_qwen4exp_spec_init(s, err, errlen)) return -1;
     const uint32_t pos = ds4_qwen4exp_session_pos(e->qwen4exp_session);
+    const ds4_qwen4exp_session_plan *plan =
+        ds4_qwen4exp_session_plan_of(e->qwen4exp_session);
+    if (!accepted || !plan) {
+        snprintf(err, errlen, "qwen4exp MTP: missing output or session plan");
+        return -1;
+    }
+    const int primed = ds4_qwen4exp_mtp_prime_cache_tail(&s->qwen4exp_spec,
+        &s->qwen4exp_head, first_token, pos, max_tokens, accepted_cap,
+        plan->n_ctx, plan->n_batch, err, errlen);
+    if (primed < 0) return -1;
+#ifdef DS4_TEST_HOOKS
+    /* Run the real head before overriding its proposal, as draft_step does. */
+    if (primed && s->qwen4exp_forced_tokens &&
+        pos + 1u < (uint32_t)s->qwen4exp_forced_len)
+        s->qwen4exp_spec.pending[0] = s->qwen4exp_forced_tokens[pos + 1u];
+#endif
     if (ds4_session_qwen4exp_cache_feed_tail(s, first_token, pos, err, errlen) != 0)
         return -1;
     /* s->logits, not a scratch buffer.  The cycle leaves the distribution for
@@ -78144,6 +78161,7 @@ void ds4_session_invalidate(ds4_session *s) {
          * pending_parent would verify against it and commit two tokens while
          * the caller believes nothing was drafted. */
         ds4_qwen4exp_mtp_invalidate(&s->qwen4exp_spec);
+        ds4_qwen4exp_mtp_head_reset_vocab(&s->qwen4exp_head);
         ds4_qwen4exp_mtp_head_reset_cache(&s->qwen4exp_head);
         s->qwen4exp_spec.head_rows = 0;
         s->checkpoint_valid = false;
@@ -78187,6 +78205,7 @@ void ds4_session_rewind(ds4_session *s, int pos) {
          * longer prefix. */
         if (pos == 0) {
             ds4_qwen4exp_session_reset(s->engine->qwen4exp_session);
+            ds4_qwen4exp_mtp_head_reset_vocab(&s->qwen4exp_head);
             ds4_qwen4exp_mtp_head_reset_cache(&s->qwen4exp_head);
             ds4_qwen4exp_mtp_invalidate(&s->qwen4exp_spec);
             s->qwen4exp_spec.head_rows = 0;

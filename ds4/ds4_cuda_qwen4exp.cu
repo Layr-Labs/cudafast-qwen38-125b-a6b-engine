@@ -3113,9 +3113,13 @@ qwen4exp_moe_gateup_mma_kernel(
     int8_t *const sWt = w_tile ? sAu : sAg;
     float *const sWAt = w_tile ? sWAu : sWAg;
     float *const sWBt = w_tile ? sWBu : sWBg;
+    /* All four threads owning one row must choose the same staging.
+     * The fallback writes both tiles, while the parity arm writes one:
+     * mixed gate/up eligibility would overlap some writes and omit others.
+     * Slabs resolve independently, so check both row addresses. */
     const bool w_fast = dq_stage != 0u &&
         GateType == DS4_QWEN4EXP_TY_q4_K && UpType == DS4_QWEN4EXP_TY_q4_K &&
-        (((uintptr_t)w_row) & 15u) == 0u;
+        (((uintptr_t)gate_row | (uintptr_t)up_row) & 15u) == 0u;
 
     const int32_t first_pair = PairTasks ? active[2u + 2u * blockIdx.y] : 0;
     const int32_t end_pair = PairTasks ? min(cnt, first_pair + QW_MMA_BN) : cnt;

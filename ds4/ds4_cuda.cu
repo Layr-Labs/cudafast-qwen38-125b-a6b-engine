@@ -17547,7 +17547,11 @@ static int cuda_matmul_q8_0_preq_rows_exact(
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
                 xq, xscale, in_dim, out_dim, n_rows, blocks, use_dp4a);
-    } else if (n_rows >= 4u) {
+    } else if (n_rows >= 4u ||
+               (n_rows == 3u && getenv("DS4_QWEN4EXP_NO_R3_ROW4") == NULL)) {
+        /* Three rows fit this tile's existing take guard, avoiding the
+         * two-row tile's second weight traversal. The override retains
+         * the original R3 dispatch for a same-binary comparison. */
         dim3 grid(wgrid, (n_rows + 3u) / 4u, 1u);
         matmul_q8_0_preq_rows_exact_tile_kernel<4>
             <<<grid, wthreads, 0, cuda_decode_stream()>>>(
