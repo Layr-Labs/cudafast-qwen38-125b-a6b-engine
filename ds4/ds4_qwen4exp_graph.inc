@@ -1418,24 +1418,44 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
         return false;
     }
 
-    if (!ds4_qwen4exp_matmul_q8_0_preq(s->gdn_qkv, QW_MAP(m, l->attn_qkv),
-                                    QW_MAPSZ(m, l->attn_qkv), QW_OFF(l->attn_qkv),
-                                    DS4_N_EMBD, cfg->gdn_qkv_dim,
-                                    s->mixed_q8, 0, q8_soff, n_tokens) ||
-        !ds4_qwen4exp_matmul_q8_0_preq(s->gdn_gate, QW_MAP(m, l->attn_gate),
-                                    QW_MAPSZ(m, l->attn_gate), QW_OFF(l->attn_gate),
-                                    DS4_N_EMBD, cfg->gdn_inner,
-                                    s->mixed_q8, 0, q8_soff, n_tokens) ||
-        !ds4_qwen4exp_matmul_f32(s->gdn_alpha, QW_MAP(m, l->ssm_alpha),
-                                   QW_MAPSZ(m, l->ssm_alpha), QW_OFF(l->ssm_alpha),
-                                   DS4_N_EMBD, DS4_N_GDN_VALUE_HEAD,
-                                   s->mixed, n_tokens) ||
-        !ds4_qwen4exp_matmul_f32(s->gdn_beta, QW_MAP(m, l->ssm_beta),
-                                   QW_MAPSZ(m, l->ssm_beta), QW_OFF(l->ssm_beta),
-                                   DS4_N_EMBD, DS4_N_GDN_VALUE_HEAD,
-                                   s->mixed, n_tokens)) {
-        fprintf(stderr, "ds4: qwen4exp GDN projections failed at block %u\n", il);
-        return false;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (n_tokens<=2u && getenv("DS4_QWEN4EXP_NO_GDN_PROJECTION_FUSION")==NULL) {
+        ds4_gpu_tensor *outs[4]={s->gdn_qkv,s->gdn_gate,s->gdn_alpha,s->gdn_beta};
+        const void *maps[4]={QW_MAP(m,l->attn_qkv),QW_MAP(m,l->attn_gate),
+                            QW_MAP(m,l->ssm_alpha),QW_MAP(m,l->ssm_beta)};
+        const uint64_t sizes[4]={QW_MAPSZ(m,l->attn_qkv),QW_MAPSZ(m,l->attn_gate),
+                                QW_MAPSZ(m,l->ssm_alpha),QW_MAPSZ(m,l->ssm_beta)};
+        const uint64_t offsets[4]={QW_OFF(l->attn_qkv),QW_OFF(l->attn_gate),
+                                  QW_OFF(l->ssm_alpha),QW_OFF(l->ssm_beta)};
+        if (!ds4_gpu_qwen4exp_gdn_projections_exact_tensor(outs,maps,sizes,offsets,
+                DS4_N_EMBD,cfg->gdn_qkv_dim,cfg->gdn_inner,
+                s->mixed,s->mixed_q8,0,q8_soff,n_tokens)) {
+            fprintf(stderr,"ds4: qwen4exp GDN projections failed at block %u\n",il);
+            return false;
+        }
+    } else
+#endif
+    {
+        if (!ds4_qwen4exp_matmul_q8_0_preq(s->gdn_qkv, QW_MAP(m, l->attn_qkv),
+                                        QW_MAPSZ(m, l->attn_qkv), QW_OFF(l->attn_qkv),
+                                        DS4_N_EMBD, cfg->gdn_qkv_dim,
+                                        s->mixed_q8, 0, q8_soff, n_tokens) ||
+            !ds4_qwen4exp_matmul_q8_0_preq(s->gdn_gate, QW_MAP(m, l->attn_gate),
+                                        QW_MAPSZ(m, l->attn_gate), QW_OFF(l->attn_gate),
+                                        DS4_N_EMBD, cfg->gdn_inner,
+                                        s->mixed_q8, 0, q8_soff, n_tokens) ||
+            !ds4_qwen4exp_matmul_f32(s->gdn_alpha, QW_MAP(m, l->ssm_alpha),
+                                       QW_MAPSZ(m, l->ssm_alpha), QW_OFF(l->ssm_alpha),
+                                       DS4_N_EMBD, DS4_N_GDN_VALUE_HEAD,
+                                       s->mixed, n_tokens) ||
+            !ds4_qwen4exp_matmul_f32(s->gdn_beta, QW_MAP(m, l->ssm_beta),
+                                       QW_MAPSZ(m, l->ssm_beta), QW_OFF(l->ssm_beta),
+                                       DS4_N_EMBD, DS4_N_GDN_VALUE_HEAD,
+                                       s->mixed, n_tokens)) {
+            fprintf(stderr, "ds4: qwen4exp GDN projections failed at block %u\n", il);
+            return false;
+        }
+
     }
 
     /* One slab per tensor.  These four are four GGUF tensors; resolving
@@ -1502,6 +1522,20 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
     }
 
     /* Projections.  q is DOUBLED: half query, half output gate. */
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (n_tokens<=2u && getenv("DS4_QWEN4EXP_NO_QSA_Q8_TRIPLE")==NULL) {
+        ds4_gpu_tensor *outs[3]={s->qsa_doubled,s->qsa_kin,s->qsa_vin};
+        const void *maps[3]={QW_MAP(m,l->attn_q),QW_MAP(m,l->attn_k),QW_MAP(m,l->attn_v)};
+        const uint64_t sizes[3]={QW_MAPSZ(m,l->attn_q),QW_MAPSZ(m,l->attn_k),QW_MAPSZ(m,l->attn_v)};
+        const uint64_t offsets[3]={QW_OFF(l->attn_q),QW_OFF(l->attn_k),QW_OFF(l->attn_v)};
+        const uint64_t dims[3]={cfg->qsa_q_dim,cfg->qsa_kv_dim,cfg->qsa_kv_dim};
+        if (!ds4_gpu_matmul_q8_0_preq_triple_rows_exact_tensor(outs,maps,sizes,offsets,
+                DS4_N_EMBD,dims,s->mixed_q8,0,q8_soff,n_tokens)) {
+            fprintf(stderr,"ds4: qwen4exp QSA projections failed at block %u\n",il);
+            return false;
+        }
+    } else
+#endif
     if (!ds4_qwen4exp_matmul_q8_0_preq(s->qsa_doubled, QW_MAP(m, l->attn_q),
                                        QW_MAPSZ(m, l->attn_q), QW_OFF(l->attn_q),
                                        DS4_N_EMBD, cfg->qsa_q_dim,

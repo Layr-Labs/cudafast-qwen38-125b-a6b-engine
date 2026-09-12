@@ -17928,6 +17928,170 @@ static void qwen_f32_vector_tree_kernel(float *out, const float *w,
     }
 }
 
+/* One block owns either a Q8 output group or an F32 projection row.
+ * Preserve each original arithmetic tree; float blocks come first in the grid.
+ * Explicit scalar pointer selection avoids a per-thread argument-array copy. */
+struct qwen_gdn_projection_args {
+    float *out[4]; const unsigned char *weights[4];
+    const int8_t *xq; const float *xscale; const float *x;
+    uint64_t od[2]; uint32_t n_rows; uint64_t blocks;
+};
+template<int R>
+__global__ __launch_bounds__(256)
+static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
+    constexpr unsigned B=256u;
+    constexpr bool FloatFirst=true, Streaming=false;
+    constexpr int C=2, U=10;
+    const uint32_t split=(uint32_t)((a.od[0]+B/64u-1u)/(B/64u));
+    const uint32_t qblocks=split+(uint32_t)((a.od[1]+B/64u-1u)/(B/64u));
+    const bool is_float=FloatFirst ? blockIdx.x<96u : blockIdx.x>=qblocks;
+    if (!is_float) {
+        const uint32_t qb=FloatFirst ? blockIdx.x-96u : blockIdx.x;
+        const bool second=qb>=split;
+        const uint32_t block=second?qb-split:qb;
+        float *out=second?a.out[1]:a.out[0]; const unsigned char *w=second?a.weights[1]:a.weights[0];
+        const uint64_t out_dim=second?a.od[1]:a.od[0],blocks=a.blocks;
+        const uint32_t n_rows=a.n_rows;
+        const int8_t *xq=a.xq; const float *xscale=a.xscale;
+    const uint32_t local_row = threadIdx.x >> 6u;
+    const uint32_t local_lane = threadIdx.x & 63u;
+    const uint32_t group = local_lane >> 1u;
+    const uint32_t half = local_lane & 1u;
+    const uint64_t row = (uint64_t)block * (B/64u) + local_row;
+    const uint32_t row0 = blockIdx.y * R;
+    const uint32_t take = n_rows - row0 < R ? n_rows - row0 : R;
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) acc[r] = 0.0f;
+
+    if (row < out_dim) {
+        const unsigned char *wr = w + row * blocks * 34u;
+        for (uint64_t b = group; b < blocks; b += 32u) {
+            /* Name both lanes of every live pair even if independent
+             * scheduling has temporarily separated their execution. */
+            const uint64_t warp_base = b - (uint64_t)(group & 15u);
+            const uint64_t remaining = blocks - warp_base;
+            const uint32_t live_pairs = (uint32_t)(remaining < 16u ? remaining : 16u);
+            const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
+            const int8_t *payload = (const int8_t *)(wr + b * 34u + 2u) + half * 16u;
+            const uintptr_t address = (uintptr_t)payload;
+            const uint32_t shift = (uint32_t)(address & 3u) * 8u;
+            const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
+            /* Weights stream through each projection once. Mark their reads
+             * evict-first while leaving the reusable activation loads alone. */
+            uint32_t previous = Streaming ? __ldcs(words) : words[0];
+            int32_t wq[4];
+#pragma unroll
+            for (int j = 0; j < 3; j++) {
+                const uint32_t next = Streaming ? __ldcs(words + j + 1) : words[j + 1];
+                wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
+                previous = next;
+            }
+            const uint16_t *lastp = (const uint16_t *)(const void *)(payload + 14);
+            const uint16_t last = Streaming ? __ldcs(lastp) : *lastp;
+            wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
+            const __half *scale = (const __half *)(wr + b * 34u);
+            const float ws = Streaming
+                ? __half2float(__ushort_as_half(__ldcs((const uint16_t *)scale)))
+                : __half2float(*scale);
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                if ((uint32_t)r < take) {
+                    const uint64_t at = ((uint64_t)row0 + r) * blocks + b;
+                    const int32_t *xw = (const int32_t *)(xq + at * 32u + half * 16u);
+                    int dot = 0;
+#pragma unroll
+                    for (int j = 0; j < 4; j++) dot = __dp4a(wq[j], xw[j], dot);
+                    dot += __shfl_xor_sync(active, dot, 1);
+                    if (half == 0u) acc[r] += ws * xscale[at] * (float)dot;
+                }
+            }
+        }
+    }
+
+    __shared__ float partial[R][B/64][32];
+    if (half == 0u) {
+#pragma unroll
+        for (int r = 0; r < R; r++) partial[r][local_row][group] = acc[r];
+    }
+    __syncthreads();
+    if (local_lane < 32u) {
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            const float total = warp_sum_f32(partial[r][local_row][local_lane]);
+            if (local_lane == 0u && row < out_dim && (uint32_t)r < take)
+                out[((uint64_t)row0 + r) * out_dim + row] = total;
+        }
+    }
+    } else {
+        const uint32_t fp_index=FloatFirst?blockIdx.x:blockIdx.x-qblocks;
+        float *out=fp_index>=48u?a.out[3]:a.out[2];
+        const float *w=(const float *)(fp_index>=48u?a.weights[3]:a.weights[2]);
+        const float *x=a.x; const uint64_t out_dim=48u;
+    const unsigned t = threadIdx.x;
+    const unsigned lane = t & 31u;
+    const uint64_t col = fp_index % 48u;
+    float acc[R][C];
+#pragma unroll
+    for (int r = 0; r < R; r++)
+#pragma unroll
+        for (int j = 0; j < C; j++) acc[r][j] = 0.0f;
+    if (t < 128u) {
+#pragma unroll U
+    for (int m = 0; m < 10; m++) {
+        const unsigned at = C * t + 256u * (unsigned)m;
+        float wv[C];
+        qwen_f32_vector_read<C>(wv, w + col * 2560u + at);
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            float xv[C];
+            qwen_f32_vector_read<C>(xv, x + (uint64_t)r * 2560u + at);
+#pragma unroll
+            for (int j = 0; j < C; j++) acc[r][j] += wv[j] * xv[j];
+        }
+    }
+    }
+    /* Rebuild the cross-warp levels of the original halving tree first. */
+    __shared__ float partial[R][C][256/C];
+    if (C < 8) {
+#pragma unroll
+        for (int r = 0; r < R; r++)
+#pragma unroll
+            for (int j = 0; j < C; j++) if (t < 128u) partial[r][j][t] = acc[r][j];
+        __syncthreads();
+        if (t >= 32u) return;
+#pragma unroll
+        for (int r = 0; r < R; r++)
+#pragma unroll
+            for (int j = 0; j < C; j++) {
+                if (C == 2) {
+                    acc[r][j] = (partial[r][j][lane] + partial[r][j][lane+64u]) +
+                                (partial[r][j][lane+32u] + partial[r][j][lane+96u]);
+                } else {
+                    acc[r][j] = partial[r][j][lane] + partial[r][j][lane+32u];
+                }
+            }
+    }
+#pragma unroll
+    for (int r = 0; r < R; r++) {
+#pragma unroll
+        for (int j = 0; j < C; j++) {
+#pragma unroll
+            for (int d = 16; d > 0; d >>= 1)
+                acc[r][j] = acc[r][j] + __shfl_down_sync(0xffffffffu, acc[r][j], d);
+        }
+        /* The remaining original strides are C/2, ..., 1 within a thread. */
+        if (lane == 0u) {
+#pragma unroll
+            for (int d = C/2; d > 0; d >>= 1)
+#pragma unroll
+                for (int j = 0; j < d; j++) acc[r][j] += acc[r][j+d];
+            out[(uint64_t)r * out_dim + col] = acc[r][0];
+        }
+    }
+    }
+}
+
 extern "C" int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
@@ -18036,6 +18200,215 @@ extern "C" int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
     }
     return cuda_ok(cudaGetLastError(), "matmul_f32 decode rows tile launch");
 }
+
+/* Compare ranges without overflowing an end address. */
+static inline bool qwen_gdn_projection_overlap(
+        const void *a, uint64_t na, const void *b, uint64_t nb) {
+    const uintptr_t pa=(uintptr_t)a, pb=(uintptr_t)b;
+    return pa<=pb ? (uint64_t)(pb-pa)<na : (uint64_t)(pa-pb)<nb;
+}
+
+extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
+        ds4_gpu_tensor *const outs[4], const void *const maps[4],
+        const uint64_t sizes[4], const uint64_t offsets[4],
+        uint64_t in_dim, uint64_t qkv_dim, uint64_t gate_dim,
+        const ds4_gpu_tensor *x, const ds4_gpu_tensor *q,
+        uint64_t qoff, uint64_t soff, uint32_t rows) {
+    if (!outs || !maps || !sizes || !offsets || !x || !q || !x->ptr || !q->ptr || !rows ||
+        !in_dim || (in_dim&31u) || in_dim>65536u ||
+        !qkv_dim || qkv_dim>65536u || !gate_dim || gate_dim>65536u) return 0;
+    const uint64_t blocks=in_dim/32u, od[4]={qkv_dim,gate_dim,48u,48u};
+    const uint64_t xb=(uint64_t)rows*in_dim*4u;
+    const uint64_t qb=(uint64_t)rows*blocks*32u, sb=(uint64_t)rows*blocks*4u;
+    if (x->bytes<xb || (qoff&15u) || (soff&15u) || qoff>q->bytes ||
+        soff>q->bytes || q->bytes-qoff<qb || q->bytes-soff<sb) return 0;
+    const int tier=ds4_tensor_device_idx(x);
+    if (tier<0 || tier>=g_n_gpus || ds4_tensor_device_idx(q)!=tier) return 0;
+    qwen_gdn_projection_args a={};
+    for (unsigned i=0;i<4;i++) {
+        const uint64_t yb=(uint64_t)rows*od[i]*4u;
+        const uint64_t stride=i<2 ? blocks*34u : in_dim*4u;
+        const uint64_t wb=od[i]*stride;
+        if (!outs[i] || !outs[i]->ptr || !maps[i] ||
+            ds4_tensor_device_idx(outs[i])!=tier || outs[i]->bytes<yb ||
+            offsets[i]>sizes[i] ||
+            sizes[i]-offsets[i]<wb ||
+            qwen_gdn_projection_overlap(outs[i]->ptr,yb,x->ptr,x->bytes) ||
+            qwen_gdn_projection_overlap(outs[i]->ptr,yb,q->ptr,q->bytes)) return 0;
+        for (unsigned j=0;j<i;j++)
+            if (qwen_gdn_projection_overlap(outs[i]->ptr,yb,outs[j]->ptr,
+                                            (uint64_t)rows*od[j]*4u)) return 0;
+        a.weights[i]=(const unsigned char *)cuda_resolve_weight_ptr(maps[i],
+            offsets[i],wb,tier,"GDN projection");
+        if (!a.weights[i]) return 0;
+        a.out[i]=(float *)outs[i]->ptr;
+    }
+    a.od[0]=qkv_dim;a.od[1]=gate_dim;a.blocks=blocks;a.n_rows=rows;
+    a.xq=(const int8_t *)((const char *)q->ptr+qoff);
+    a.xscale=(const float *)((const char *)q->ptr+soff);a.x=(const float *)x->ptr;
+    if (rows<=2u && in_dim==2560u && qkv_dim>512u && gate_dim>512u &&
+        cuda_q8_use_dp4a() && getenv("DS4_QWEN4EXP_NO_ROW_TILE")==NULL &&
+        getenv("DS4_QWEN4EXP_PAIR_LANES_R2")==NULL &&
+        getenv("DS4_F32_NO_VECTOR_DECODE")==NULL &&
+        getenv("DS4_QWEN4EXP_NO_GDN_PROJECTION_FUSION")==NULL &&
+        (((uintptr_t)a.weights[0]|(uintptr_t)a.weights[1])&1u)==0u &&
+        (((uintptr_t)a.weights[2]|(uintptr_t)a.weights[3]|(uintptr_t)a.x)&15u)==0u) {
+        const unsigned grid=(unsigned)((qkv_dim+3u)/4u+(gate_dim+3u)/4u+96u);
+        if (rows==1u)
+            qwen_gdn_projection_kernel<1><<<grid,256,0,cuda_decode_stream()>>>(a);
+        else
+            qwen_gdn_projection_kernel<2><<<grid,256,0,cuda_decode_stream()>>>(a);
+        return cuda_ok(cudaGetLastError(),"GDN four projections launch");
+    }
+    for (unsigned i=0;i<2;i++)
+        if (!cuda_matmul_q8_0_preq_rows_exact(outs[i],(const char *)a.weights[i],
+                a.xq,a.xscale,in_dim,od[i],rows,blocks)) return 0;
+    for (unsigned i=2;i<4;i++)
+        if (!ds4_gpu_matmul_f32_decode_rows_exact_tensor(outs[i],maps[i],
+                sizes[i],offsets[i],in_dim,48u,x,rows)) return 0;
+    return 1;
+}
+
+/* K/V blocks precede the large Q grid. Each output retains its original
+ * 32 float chains; paired integer partials combine exactly before scaling. */
+template<int R>
+__global__ static void qwen_q8_projection_triple_kernel(
+        float *out0, float *out1, float *out2,
+        const unsigned char *w0, const unsigned char *w1, const unsigned char *w2,
+        const int8_t *xq, const float *xscale, uint64_t od0, uint64_t od1,
+        uint64_t od2, uint32_t n_rows, uint64_t blocks) {
+    constexpr bool SmallFirst=true, Streaming=false;
+    const uint32_t nb0=(uint32_t)((od0+3u)/4u), nb1=(uint32_t)((od1+3u)/4u), nb2=(uint32_t)((od2+3u)/4u);
+    const uint32_t flat=SmallFirst ? (blockIdx.x<nb1+nb2 ? blockIdx.x+nb0 : blockIdx.x-nb1-nb2) : blockIdx.x;
+    const unsigned which=flat<nb0 ? 0u : (flat<nb0+nb1 ? 1u : 2u);
+    const uint32_t block=which==0u ? flat : (which==1u ? flat-nb0 : flat-nb0-nb1);
+    float *out=which==0u ? out0 : (which==1u ? out1 : out2);
+    const unsigned char *w=which==0u ? w0 : (which==1u ? w1 : w2);
+    const uint64_t out_dim=which==0u ? od0 : (which==1u ? od1 : od2);
+    const uint32_t local_row = threadIdx.x >> 6u;
+    const uint32_t local_lane = threadIdx.x & 63u;
+    const uint32_t group = local_lane >> 1u;
+    const uint32_t half = local_lane & 1u;
+    const uint64_t row = (uint64_t)block * 4u + local_row;
+    const uint32_t row0 = blockIdx.y * R;
+    const uint32_t take = n_rows - row0 < R ? n_rows - row0 : R;
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) acc[r] = 0.0f;
+
+    if (row < out_dim) {
+        const unsigned char *wr = w + row * blocks * 34u;
+        for (uint64_t b = group; b < blocks; b += 32u) {
+            /* Name both lanes of every live pair even if independent
+             * scheduling has temporarily separated their execution. */
+            const uint64_t warp_base = b - (uint64_t)(group & 15u);
+            const uint64_t remaining = blocks - warp_base;
+            const uint32_t live_pairs = (uint32_t)(remaining < 16u ? remaining : 16u);
+            const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
+            const int8_t *payload = (const int8_t *)(wr + b * 34u + 2u) + half * 16u;
+            const uintptr_t address = (uintptr_t)payload;
+            const uint32_t shift = (uint32_t)(address & 3u) * 8u;
+            const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
+            /* Weights stream through each projection once. Mark their reads
+             * evict-first while leaving the reusable activation loads alone. */
+            uint32_t previous = Streaming ? __ldcs(words) : words[0];
+            int32_t wq[4];
+#pragma unroll
+            for (int j = 0; j < 3; j++) {
+                const uint32_t next = Streaming ? __ldcs(words + j + 1) : words[j + 1];
+                wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
+                previous = next;
+            }
+            const uint16_t *lastp = (const uint16_t *)(const void *)(payload + 14);
+            const uint16_t last = Streaming ? __ldcs(lastp) : *lastp;
+            wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
+            const __half *scale = (const __half *)(wr + b * 34u);
+            const float ws = Streaming
+                ? __half2float(__ushort_as_half(__ldcs((const uint16_t *)scale)))
+                : __half2float(*scale);
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                if ((uint32_t)r < take) {
+                    const uint64_t at = ((uint64_t)row0 + r) * blocks + b;
+                    const int32_t *xw = (const int32_t *)(xq + at * 32u + half * 16u);
+                    int dot = 0;
+#pragma unroll
+                    for (int j = 0; j < 4; j++) dot = __dp4a(wq[j], xw[j], dot);
+                    dot += __shfl_xor_sync(active, dot, 1);
+                    if (half == 0u) acc[r] += ws * xscale[at] * (float)dot;
+                }
+            }
+        }
+    }
+
+    __shared__ float partial[R][4][32];
+    if (half == 0u) {
+#pragma unroll
+        for (int r = 0; r < R; r++) partial[r][local_row][group] = acc[r];
+    }
+    __syncthreads();
+    if (local_lane < 32u) {
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            const float total = warp_sum_f32(partial[r][local_row][local_lane]);
+            if (local_lane == 0u && row < out_dim && (uint32_t)r < take)
+                out[((uint64_t)row0 + r) * out_dim + row] = total;
+        }
+    }
+}
+
+extern "C" int ds4_gpu_matmul_q8_0_preq_triple_rows_exact_tensor(
+        ds4_gpu_tensor *const outs[3], const void *const maps[3],
+        const uint64_t sizes[3], const uint64_t offsets[3],
+        uint64_t in_dim, const uint64_t od[3],
+        const ds4_gpu_tensor *q, uint64_t qoff, uint64_t soff, uint32_t rows) {
+    if (!outs || !maps || !sizes || !offsets || !od || !q || !q->ptr ||
+        !in_dim || (in_dim&31u) || in_dim>65536u || !rows) return 0;
+    const uint64_t blocks=in_dim/32u;
+    const uint64_t qb=(uint64_t)rows*blocks*32u,sb=(uint64_t)rows*blocks*4u;
+    if ((qoff&15u) || (soff&15u) || qoff>q->bytes || soff>q->bytes ||
+        q->bytes-qoff<qb || q->bytes-soff<sb) return 0;
+    const int tier=ds4_tensor_device_idx(q);
+    if (tier<0 || tier>=g_n_gpus) return 0;
+    const char *w[3];
+    for (unsigned i=0;i<3;i++) {
+        if (!outs[i] || !outs[i]->ptr || !maps[i] || !od[i] || od[i]>65536u ||
+            ds4_tensor_device_idx(outs[i])!=tier) return 0;
+        const uint64_t yb=(uint64_t)rows*od[i]*4u,wb=od[i]*blocks*34u;
+        if (outs[i]->bytes<yb || offsets[i]>sizes[i] || sizes[i]-offsets[i]<wb ||
+            qwen_gdn_projection_overlap(outs[i]->ptr,yb,q->ptr,q->bytes)) return 0;
+        for (unsigned j=0;j<i;j++)
+            if (qwen_gdn_projection_overlap(outs[i]->ptr,yb,outs[j]->ptr,
+                                           (uint64_t)rows*od[j]*4u)) return 0;
+        w[i]=cuda_resolve_weight_ptr(maps[i],offsets[i],wb,tier,"Q8 triple projection");
+        if (!w[i]) return 0;
+    }
+    const int8_t *xq=(const int8_t *)((const char *)q->ptr+qoff);
+    const float *xs=(const float *)((const char *)q->ptr+soff);
+    if (rows<=2u && in_dim!=320u && cuda_q8_use_dp4a() &&
+        getenv("DS4_QWEN4EXP_NO_ROW_TILE")==NULL &&
+        getenv("DS4_QWEN4EXP_PAIR_LANES_R2")==NULL &&
+        getenv("DS4_QWEN4EXP_Q8_WIDE_BLOCKS")==NULL &&
+        getenv("DS4_QWEN4EXP_NO_QSA_Q8_TRIPLE")==NULL &&
+        (((uintptr_t)w[0]|(uintptr_t)w[1]|(uintptr_t)w[2])&1u)==0u) {
+        const unsigned grid=(unsigned)((od[0]+3u)/4u+(od[1]+3u)/4u+(od[2]+3u)/4u);
+        if (rows==1u)
+            qwen_q8_projection_triple_kernel<1><<<grid,256,0,cuda_decode_stream()>>>(
+                (float *)outs[0]->ptr,(float *)outs[1]->ptr,(float *)outs[2]->ptr,
+                (const unsigned char *)w[0],(const unsigned char *)w[1],
+                (const unsigned char *)w[2],xq,xs,od[0],od[1],od[2],rows,blocks);
+        else
+            qwen_q8_projection_triple_kernel<2><<<grid,256,0,cuda_decode_stream()>>>(
+                (float *)outs[0]->ptr,(float *)outs[1]->ptr,(float *)outs[2]->ptr,
+                (const unsigned char *)w[0],(const unsigned char *)w[1],
+                (const unsigned char *)w[2],xq,xs,od[0],od[1],od[2],rows,blocks);
+        return cuda_ok(cudaGetLastError(),"Q8 triple projection launch");
+    }
+    for (unsigned i=0;i<3;i++)
+        if (!cuda_matmul_q8_0_preq_rows_exact(outs[i],w[i],xq,xs,in_dim,od[i],rows,blocks)) return 0;
+    return 1;
+}
+
 
 extern "C" int ds4_gpu_repeat_hc_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *row, uint32_t n_embd, uint32_t n_hc) {
     if (!out || !row || n_embd == 0 || n_hc == 0 ||

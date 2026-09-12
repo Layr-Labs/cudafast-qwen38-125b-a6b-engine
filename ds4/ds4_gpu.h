@@ -1001,6 +1001,12 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
  * hyper-connection norm is that caller: it already holds the normalized value
  * in a register, and writing it to DRAM only for a quantize kernel to read it
  * straight back was 95.6 MB of round trip per mixer call at a 1024-row chunk. */
+/* Three prequantized projections with independent output and weight ranges. */
+int ds4_gpu_matmul_q8_0_preq_triple_rows_exact_tensor(
+        ds4_gpu_tensor *const outs[3], const void *const maps[3],
+        const uint64_t sizes[3], const uint64_t offsets[3],
+        uint64_t in_dim, const uint64_t od[3],
+        const ds4_gpu_tensor *q, uint64_t qoff, uint64_t soff, uint32_t rows);
 int ds4_gpu_matmul_q8_0_preq_rows_exact_tensor(
         ds4_gpu_tensor       *out,
         const void           *model_map,
@@ -2893,6 +2899,14 @@ typedef struct {
     uint64_t    row_bytes;
     uint32_t    type;
 } ds4_gpu_qwen4exp_slab;
+/* Four GDN projections in QKV, gate, alpha, beta order; independent mappings. */
+int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
+        ds4_gpu_tensor *const outs[4], const void *const maps[4],
+        const uint64_t sizes[4], const uint64_t offsets[4],
+        uint64_t in_dim, uint64_t qkv_dim, uint64_t gate_dim,
+        const ds4_gpu_tensor *x, const ds4_gpu_tensor *q,
+        uint64_t qoff, uint64_t soff, uint32_t rows);
+
 int ds4_gpu_qwen4exp_router_select_tensor(
         ds4_gpu_tensor       *selected,
         ds4_gpu_tensor       *weights,
