@@ -3259,12 +3259,23 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
     }
 }
 
-/* Grid (ceil(out_dim / 8), ceil(n_tokens / R)).  The slots of a token are
+/* Grid (ceil(out_dim / OutputRows), ceil(n_tokens / R)).  The slots of a token are
  * walked in ascending order into ONE accumulator, which is what the per-token
  * kernel did; the rows of the tile do not share a weight here, because each
  * one picked its own expert for the slot.  What the tile buys is that the
- * activation groups are read once for R rows and the decode is per group. */
-template <int R, int DownType = -1, bool Vector = false>
+ * activation groups are read once for R rows and the decode is per group.
+ *
+ * OutputRows is how many output rows one block owns, one warp each.  This
+ * kernel has no barrier -- the fold is warp_sum_f32 -- so the warps are not
+ * latency-coupled the way the split gate/up warps are.  What a wide block
+ * still couples is RETIREMENT: an SM holds a block's slot until its slowest
+ * warp finishes, and at decode out_dim 2560 over eight rows is 320 blocks for
+ * 48 SMs, which is 6.67 blocks per SM.  That quantum leaves the last wave
+ * one-seventh idle.  Narrowing to two rows keeps the warp count identical and
+ * turns the same work into 1280 blocks, 26.7 per SM, so the tail rounds off
+ * against a much finer grid. */
+template <int R, int DownType = -1, bool Vector = false,
+          unsigned OutputRows = 8>
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
@@ -3281,7 +3292,7 @@ __global__ static void qwen4exp_moe_down_q_kernel(
         uint32_t n_total_expert,
         uint32_t n_expert_used) {
     const uint32_t lane = threadIdx.x & 31u;
-    const uint32_t row = blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t row = blockIdx.x * OutputRows + (threadIdx.x >> 5u);
     const uint32_t tok0 = blockIdx.y * (uint32_t)R;
     if (row >= out_dim || tok0 >= n_tokens) return;
     const uint32_t take = n_tokens - tok0 < (uint32_t)R ? n_tokens - tok0
@@ -3341,7 +3352,8 @@ __global__ static void qwen4exp_moe_down_q_kernel(
 
 /* The shared expert: no routing, so the tile is consecutive tokens and the
  * decoded group serves all of them. */
-template <int R, int GateType = -1, int UpType = -1, bool Vector = false>
+template <int R, int GateType = -1, int UpType = -1, bool Vector = false,
+          unsigned OutputRows = 8>
 __global__ static void qwen4exp_shared_gateup_q_kernel(
         float *mid,
         const char *gate,
@@ -3357,7 +3369,7 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
         uint32_t mid_dim,
         uint32_t n_tokens) {
     const uint32_t lane = threadIdx.x & 31u;
-    const uint32_t row = blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t row = blockIdx.x * OutputRows + (threadIdx.x >> 5u);
     const uint32_t tok0 = blockIdx.y * (uint32_t)R;
     if (row >= mid_dim || tok0 >= n_tokens) return;
     const uint32_t take = n_tokens - tok0 < (uint32_t)R ? n_tokens - tok0
@@ -3450,7 +3462,8 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
     }
 }
 
-template <int R, int DownType = -1, bool Vector = false>
+template <int R, int DownType = -1, bool Vector = false,
+          unsigned OutputRows = 8>
 __global__ static void qwen4exp_shared_down_q_kernel(
         float *out,
         const char *down,
@@ -3464,7 +3477,7 @@ __global__ static void qwen4exp_shared_down_q_kernel(
         uint32_t out_dim,
         uint32_t n_tokens) {
     const uint32_t lane = threadIdx.x & 31u;
-    const uint32_t row = blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t row = blockIdx.x * OutputRows + (threadIdx.x >> 5u);
     const uint32_t tok0 = blockIdx.y * (uint32_t)R;
     if (row >= out_dim || tok0 >= n_tokens) return;
     const uint32_t take = n_tokens - tok0 < (uint32_t)R ? n_tokens - tok0
@@ -4633,558 +4646,6 @@ qwen4exp_shared_down_mma_kernel(
     }
 }
 
-/* =========================================================================
- * The shared expert's class-major tile, pipelined.
- * =========================================================================
- *
- * The same arithmetic as the two tiles above -- per (row, token): P(c) the
- * ascending chain `P = fma.rn(mul.rn(wa, xs), (float)dot, P)` over the
- * groups c, c + 32, c + 64, ... of class c, the classes visited in rev5
- * order and folded by the streaming pairwise sum that is warp_sum_f32's
- * tree with the older subtree on the left, and the epilogue expressions of
- * the staged kernels -- on the producer/consumer pipeline of ds4_cuda.cu's
- * matmul_q8_0_preq_rows_mma_pipe_kernel.  Q8_0 only (the shipped shared
- * expert throughout), so the offset term wb is zero and skipped exactly as
- * the tiles above skip it; every other type keeps those tiles.
- *
- * What moves the time: the tiles above give each warp ONE m16n8k32 output
- * tile and stage a class with every thread, so each of their sixteen warps
- * issues six fragment loads and a scale load per MMA and every warp copies
- * as well as computes (13.7 and 8.9 TOPS at the prefill shapes).  Here
- * four producer warps stage the slots -- each group's raw 34 Q8_0 bytes
- * loaded as the 16-byte-aligned 48 that cover them, funnel-shifted onto
- * word boundaries and stored as the aligned 32 ldmatrix wants, its half
- * scale converted -- and eight consumer warps of 16 tokens x 16 rows do
- * nothing but ldmatrix, MMAs and the chain.  A stage is CH classes x KMAX
- * slots; a slot whose group is past the end is zero on the activation side
- * (dot 0, scale 0: P += +0.0 is the identity for a chain that starts at
- * +0.0 and can never round to -0.0, so a class with no groups yields the
- * +0.0 the tiles above yield), and its weight bytes are never read.
- *
- * The conversion is the seeded one of the Q8_0 dense tile: |dot| <= 2^19,
- * the accumulator starts at 0x4B400000, and one sub.rn.f32 of 12582912.0f
- * yields (float)dot exactly.
- */
-#define QSP_BM 64
-#define QSP_CWARPS 8
-#define QSP_STAGES 2
-#define QSP_MAGIC_BITS 0x4B400000
-#define QSP_MAGIC_F 12582912.0f
-
-__device__ __forceinline__ static float qsp_fmul(float a, float b) {
-    float r;
-    asm("mul.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
-    return r;
-}
-__device__ __forceinline__ static float qsp_fma(float a, float b, float c) {
-    float r;
-    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(r) : "f"(a), "f"(b), "f"(c));
-    return r;
-}
-__device__ __forceinline__ static float qsp_fadd(float a, float b) {
-    float r;
-    asm("add.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
-    return r;
-}
-__device__ __forceinline__ static float qsp_dot_to_f32(int32_t d_magic) {
-    float r;
-    asm("sub.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(__int_as_float(d_magic)), "f"(QSP_MAGIC_F));
-    return r;
-}
-__device__ __forceinline__ static void qsp_mma_seeded(int32_t d[4], const uint32_t a[4],
-                                                      const uint32_t b[2], int32_t c) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
-        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};"
-        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(c));
-}
-__device__ __forceinline__ static void qsp_ldmatrix_x4(uint32_t r[4], const void *smem) {
-    const uint32_t s = (uint32_t)__cvta_generic_to_shared(smem);
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(s));
-}
-__device__ __forceinline__ static uint4 qsp_ldg_16(const void *g) {
-    uint4 v;
-    asm volatile("ld.global.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(g));
-    return v;
-}
-__device__ __forceinline__ static uint4 qsp_ldg_16_cg(const void *g) {
-    uint4 v;
-    asm volatile("ld.global.cg.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(g));
-    return v;
-}
-__device__ __forceinline__ static void qsp_sts_16(void *smem, uint4 v) {
-    const uint32_t s = (uint32_t)__cvta_generic_to_shared(smem);
-    asm volatile("st.shared.v4.u32 [%0], {%1,%2,%3,%4};" :: "r"(s), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
-}
-__device__ __forceinline__ static void qsp_bar_sync(int id, int count) {
-    asm volatile("bar.sync %0, %1;" :: "r"(id), "r"(count) : "memory");
-}
-__device__ __forceinline__ static void qsp_bar_arrive(int id, int count) {
-    asm volatile("bar.arrive %0, %1;" :: "r"(id), "r"(count) : "memory");
-}
-
-/* NT n8 tiles per consumer warp (16 tokens x NT*8 rows) and PWARPS
- * producer warps.  The tree state is six registers per output element, so
- * a warp tile wider than 16 x 16 spills (measured: NT 4 with one matrix,
- * 350 bytes of stack) even with the producers cut to two. */
-template <int MATRICES, int LOGCH, int KMAX>
-struct qsp_cfg {
-    static constexpr int NT = 2;
-    static constexpr int PWARPS = 4;
-    static constexpr int THREADS = (QSP_CWARPS + PWARPS) * 32;
-    static constexpr int BN = 2 * NT * 8;             /* WN = 2 */
-    static constexpr int CH = 1 << LOGCH;
-    static constexpr int NLEV = 5 - LOGCH;
-    static constexpr int NSTAGE = 1 << NLEV;         /* 32 classes / CH */
-    static constexpr int SLOTS = CH * KMAX;
-    static constexpr int LD = SLOTS * 32 + 16;       /* word stride 4 mod 8 */
-    static constexpr int A_BYTES = QSP_BM * LD;
-    static constexpr int B_BYTES = MATRICES * BN * LD;
-    static constexpr int AS_BYTES = QSP_BM * SLOTS * 4;
-    static constexpr int WS_BYTES = MATRICES * SLOTS * BN * 4;
-    static constexpr int STAGE_BYTES = A_BYTES + B_BYTES + AS_BYTES + WS_BYTES;
-    static constexpr int SMEM = QSP_STAGES * STAGE_BYTES;
-    static_assert((LD / 4) % 8 == 4, "ldmatrix rows on distinct banks");
-    static_assert(LOGCH >= 0 && LOGCH <= 5, "classes per stage");
-};
-
-/* MATRICES 2: gate and up, `mid` out.  MATRICES 1: down, `out` accumulated.
- * Rows of the weight matrices along N (BN per block), tokens along M. */
-template <int MATRICES, int LOGCH, int KMAX>
-__global__ __launch_bounds__(qsp_cfg<MATRICES, LOGCH, KMAX>::THREADS) static void
-qwen4exp_shared_pipe_mma_kernel(
-        float *out,
-        const char *w0,
-        const char *w1,
-        const int8_t *xq,
-        const float *xs,
-        const float *gate_scale,
-        uint64_t w0_row_bytes,
-        uint64_t w1_row_bytes,
-        uint32_t groups,
-        uint32_t n_dim,
-        uint32_t n_tokens) {
-    typedef qsp_cfg<MATRICES, LOGCH, KMAX> C;
-    constexpr int CH = C::CH, SLOTS = C::SLOTS, LD = C::LD, NT = C::NT, QSP_BN = C::BN;
-    constexpr int QSP_PWARPS = C::PWARPS, QSP_THREADS = C::THREADS;
-    extern __shared__ __align__(16) unsigned char qsp_smem[];
-    unsigned char *sA_all = qsp_smem;
-    unsigned char *sB_all = sA_all + QSP_STAGES * C::A_BYTES;
-    float *sAs_all = (float *)(sB_all + QSP_STAGES * C::B_BYTES);
-    float *sWs_all = sAs_all + QSP_STAGES * (C::AS_BYTES / 4);
-
-    const int tid = (int)threadIdx.x;
-    const uint32_t lane = threadIdx.x & 31u;
-    const int warp = tid >> 5;
-    const uint32_t tok0 = blockIdx.x * (uint32_t)QSP_BM;
-    const uint32_t row0 = blockIdx.y * (uint32_t)QSP_BN;
-    if (tok0 >= n_tokens || row0 >= n_dim) return;
-    constexpr int BAR_COUNT = QSP_THREADS;
-
-    if (warp >= QSP_CWARPS) {
-        /* ---- Producers.  Items per stage: activation chunks (token, slot,
-         * half), activation scales (token, slot), weight groups (matrix,
-         * row, slot); item i goes to producer lane i % PT. */
-        const int pw = warp - QSP_CWARPS;
-        constexpr int PT = 32 * QSP_PWARPS;
-        constexpr int NA = QSP_BM * SLOTS * 2;
-        constexpr int NS = QSP_BM * SLOTS;
-        constexpr int NB = MATRICES * QSP_BN * SLOTS;
-        constexpr int KA = (NA + PT - 1) / PT, KS = (NS + PT - 1) / PT, KB = (NB + PT - 1) / PT;
-        const int pl = (int)lane + 32 * pw;
-
-        for (int s = 0; s < C::NSTAGE; s++) {
-            const int buf = s % QSP_STAGES;
-            unsigned char *sA = sA_all + buf * C::A_BYTES;
-            unsigned char *sB = sB_all + buf * C::B_BYTES;
-            float *sAs = sAs_all + buf * (C::AS_BYTES / 4);
-            float *sWs = sWs_all + buf * (C::WS_BYTES / 4);
-
-            /* Activations of the stage into registers. */
-            uint4 ra[KA];
-            float rs[KS];
-#pragma unroll
-            for (int k = 0; k < KA; k++) {
-                const int i = pl + k * PT;
-                const int t = i / (SLOTS * 2);
-                const int rem = i - t * (SLOTS * 2);
-                const int slot = rem >> 1, half = rem & 1;
-                const uint32_t c = qs_rev5((uint32_t)(s * CH + slot / KMAX));
-                const uint32_t g = c + 32u * (uint32_t)(slot % KMAX);
-                const uint32_t tok = tok0 + (uint32_t)t;
-                ra[k] = make_uint4(0u, 0u, 0u, 0u);
-                if (i < NA && tok < n_tokens && g < groups) {
-                    ra[k] = qsp_ldg_16_cg(xq + ((uint64_t)tok * groups + g) * 32u + half * 16);
-                }
-            }
-#pragma unroll
-            for (int k = 0; k < KS; k++) {
-                const int i = pl + k * PT;
-                const int t = i / SLOTS;
-                const int slot = i - t * SLOTS;
-                const uint32_t c = qs_rev5((uint32_t)(s * CH + slot / KMAX));
-                const uint32_t g = c + 32u * (uint32_t)(slot % KMAX);
-                const uint32_t tok = tok0 + (uint32_t)t;
-                rs[k] = 0.0f;
-                if (i < NS && tok < n_tokens && g < groups) {
-                    rs[k] = __ldg(xs + (uint64_t)tok * groups + g);
-                }
-            }
-            /* Weight groups: the aligned 48 bytes around each. */
-            uint4 rb[KB][3];
-#pragma unroll
-            for (int k = 0; k < KB; k++) {
-                const int i = pl + k * PT;
-                const int m = i / (QSP_BN * SLOTS);
-                const int rem = i - m * (QSP_BN * SLOTS);
-                const int r = rem / SLOTS;
-                const int slot = rem - r * SLOTS;
-                const uint32_t c = qs_rev5((uint32_t)(s * CH + slot / KMAX));
-                const uint32_t g = c + 32u * (uint32_t)(slot % KMAX);
-                const uint32_t row = row0 + (uint32_t)r;
-                rb[k][0] = make_uint4(0u, 0u, 0u, 0u); rb[k][1] = rb[k][0]; rb[k][2] = rb[k][0];
-                if (i < NB && row < n_dim && g < groups) {
-                    const char *wbase = (m == 0 ? w0 : w1);
-                    const uint64_t rbytes = (m == 0 ? w0_row_bytes : w1_row_bytes);
-                    /* The group's 34 bytes, and the 16-byte-aligned 48 that
-                     * cover them (rows need not be 16-byte aligned: the
-                     * alignment is of the absolute address).  The third
-                     * chunk always holds the group's tail (34 > 32 - 14) and
-                     * only at the matrix's end can it reach past it: there it
-                     * is taken a word at a time up to the end. */
-                    const char *p = wbase + (uint64_t)row * rbytes + (uint64_t)g * 34u;
-                    const char *win = (const char *)((uintptr_t)p & ~(uintptr_t)15u);
-                    const char *mend = wbase + (uint64_t)n_dim * rbytes;
-                    rb[k][0] = qsp_ldg_16(win);
-                    rb[k][1] = qsp_ldg_16(win + 16);
-                    if (win + 48 <= mend) {
-                        rb[k][2] = qsp_ldg_16(win + 32);
-                    } else {
-                        const int inside = (int)(mend - (win + 32));
-                        uint32_t q[4] = {0u, 0u, 0u, 0u};
-#pragma unroll
-                        for (int j = 0; j < 4; j++) {
-                            if (j * 4 < inside) {
-                                uint32_t v;
-                                asm volatile("ld.global.u32 %0, [%1];" : "=r"(v) : "l"(win + 32 + j * 4));
-                                q[j] = v;
-                            }
-                        }
-                        rb[k][2] = make_uint4(q[0], q[1], q[2], q[3]);
-                    }
-                }
-            }
-
-            /* The buffer is free once the consumers are done with stage s - 2. */
-            if (s >= QSP_STAGES) qsp_bar_sync(2 + 2 * buf, BAR_COUNT);
-
-#pragma unroll
-            for (int k = 0; k < KA; k++) {
-                const int i = pl + k * PT;
-                const int t = i / (SLOTS * 2);
-                const int rem = i - t * (SLOTS * 2);
-                if (i < NA) qsp_sts_16(sA + t * LD + (rem >> 1) * 32 + (rem & 1) * 16, ra[k]);
-            }
-#pragma unroll
-            for (int k = 0; k < KS; k++) {
-                const int i = pl + k * PT;
-                const int t = i / SLOTS;
-                const int slot = i - t * SLOTS;
-                if (i < NS) sAs[t * SLOTS + slot] = rs[k];
-            }
-#pragma unroll
-            for (int k = 0; k < KB; k++) {
-                const int i = pl + k * PT;
-                const int m = i / (QSP_BN * SLOTS);
-                const int rem = i - m * (QSP_BN * SLOTS);
-                const int r = rem / SLOTS;
-                const int slot = rem - r * SLOTS;
-                const uint32_t c = qs_rev5((uint32_t)(s * CH + slot / KMAX));
-                const uint32_t g = c + 32u * (uint32_t)(slot % KMAX);
-                if (i < NB) {
-                    const uint32_t raw[12] = {
-                        rb[k][0].x, rb[k][0].y, rb[k][0].z, rb[k][0].w,
-                        rb[k][1].x, rb[k][1].y, rb[k][1].z, rb[k][1].w,
-                        rb[k][2].x, rb[k][2].y, rb[k][2].z, rb[k][2].w };
-                    /* The quants begin 2 bytes past the block's start, at
-                     * (block address mod 16) into the window: word wq, and
-                     * two bytes into it when that offset is 2 mod 4. */
-                    const char *pblk = (m == 0 ? w0 : w1) + (uint64_t)(row0 + (uint32_t)r) * (m == 0 ? w0_row_bytes : w1_row_bytes) + (uint64_t)g * 34u;
-                    const uint32_t qoff = (uint32_t)((uintptr_t)pblk & 15u) + 2u;
-                    const uint32_t wq = qoff >> 2;
-                    const uint32_t sh = (qoff & 2u) ? 16u : 0u;
-                    uint32_t q[8];
-#pragma unroll
-                    for (int j = 0; j < 8; j++) {
-                        /* wq is 0..4 (a block 14 bytes into its window
-                         * has its quants at word 4); select the words with
-                         * a small switch so the array stays in registers. */
-                        uint32_t lo = 0u, hi = 0u;
-#pragma unroll
-                        for (int w = 0; w <= 4; w++) {
-                            if (wq == (uint32_t)w) { lo = raw[w + j]; hi = (w + j + 1 < 12) ? raw[w + j + 1] : 0u; }
-                        }
-                        q[j] = __funnelshift_r(lo, hi, sh);
-                    }
-                    unsigned char *dst = sB + (m * QSP_BN + r) * LD + slot * 32;
-                    qsp_sts_16(dst, make_uint4(q[0], q[1], q[2], q[3]));
-                    qsp_sts_16(dst + 16, make_uint4(q[4], q[5], q[6], q[7]));
-                    /* The half scale: the two bytes before the quants. */
-                    const uint32_t soff = qoff - 2u;
-                    uint32_t sw = 0u;
-#pragma unroll
-                    for (int w = 0; w < 4; w++) if ((soff >> 2) == (uint32_t)w) sw = raw[w];
-                    const uint16_t h = (soff & 2u) ? (uint16_t)(sw >> 16) : (uint16_t)(sw & 0xffffu);
-                    const bool valid = (row0 + (uint32_t)r) < n_dim && g < groups;
-                    sWs[(m * SLOTS + slot) * QSP_BN + r] = valid ? __half2float(__ushort_as_half(h)) : 0.0f;
-                }
-            }
-            __syncwarp();
-            qsp_bar_arrive(1 + 2 * buf, BAR_COUNT);
-        }
-        return;
-    }
-
-    /* ---- Consumers: warp (wm, wn) owns tokens wm*16.. and rows wn*16.. */
-    const int wm = warp >> 1;          /* 0..3 */
-    const int wn = warp & 1;           /* 0..1 */
-    const uint32_t g4 = lane >> 2u;
-    const uint32_t t4 = lane & 3u;
-    const int a_lrow = (int)(lane & 15u);
-    const int a_lk = (int)(lane >> 4u) * 16;
-    const int b_lrow = (int)(lane & 7u) + (int)((lane >> 4u) & 1u) * 8;
-    const int b_lk = (int)((lane >> 3u) & 1u) * 16;
-    const int32_t magic = QSP_MAGIC_BITS;
-
-    /* Per matrix, per element (ni, e): the class chain P and the tree's
-     * pending partials -- within a stage W[LOGCH], across stages S[NLEV]. */
-    float P[MATRICES][NT][4];
-    float W[MATRICES][LOGCH > 0 ? LOGCH : 1][NT][4];
-    float S[MATRICES][C::NLEV > 0 ? C::NLEV : 1][NT][4];
-#pragma unroll
-    for (int m = 0; m < MATRICES; m++)
-#pragma unroll
-        for (int ni = 0; ni < NT; ni++)
-#pragma unroll
-            for (int e = 0; e < 4; e++) {
-                P[m][ni][e] = 0.0f;
-#pragma unroll
-                for (int b = 0; b < (LOGCH > 0 ? LOGCH : 1); b++) W[m][b][ni][e] = 0.0f;
-#pragma unroll
-                for (int b = 0; b < (C::NLEV > 0 ? C::NLEV : 1); b++) S[m][b][ni][e] = 0.0f;
-            }
-
-#pragma unroll 1
-    for (int s = 0; s < C::NSTAGE; s++) {
-        const int buf = s % QSP_STAGES;
-        qsp_bar_sync(1 + 2 * buf, BAR_COUNT);
-        const unsigned char *sA = sA_all + buf * C::A_BYTES;
-        const unsigned char *sB = sB_all + buf * C::B_BYTES;
-        const float *sAs = sAs_all + buf * (C::AS_BYTES / 4);
-        const float *sWs = sWs_all + buf * (C::WS_BYTES / 4);
-
-#pragma unroll
-        for (int cls = 0; cls < CH; cls++) {
-#pragma unroll
-            for (int m = 0; m < MATRICES; m++)
-#pragma unroll
-                for (int ni = 0; ni < NT; ni++)
-#pragma unroll
-                    for (int e = 0; e < 4; e++) P[m][ni][e] = 0.0f;
-            /* P(c): the class's groups, ascending.  A class past the last
-             * group has none: its P stays the +0.0 the tiles above yield
-             * (they never enter the loop either), so nothing is loaded or
-             * multiplied for it; the condition is warp-uniform. */
-            const uint32_t cval = qs_rev5((uint32_t)(s * CH + cls));
-            if (cval < groups)
-#pragma unroll
-            for (int kk = 0; kk < KMAX; kk++) {
-                const int slot = cls * KMAX + kk;
-                uint32_t af[4];
-                qsp_ldmatrix_x4(af, sA + (wm * 16 + a_lrow) * LD + slot * 32 + a_lk);
-                const float xs0 = sAs[(wm * 16 + (int)g4) * SLOTS + slot];
-                const float xs1 = sAs[(wm * 16 + 8 + (int)g4) * SLOTS + slot];
-#pragma unroll
-                for (int m = 0; m < MATRICES; m++) {
-                    uint32_t bq[NT / 2][4];
-#pragma unroll
-                    for (int np = 0; np < NT / 2; np++) {
-                        qsp_ldmatrix_x4(bq[np], sB + (m * QSP_BN + wn * NT * 8 + np * 16 + b_lrow) * LD + slot * 32 + b_lk);
-                    }
-#pragma unroll
-                    for (int ni = 0; ni < NT; ni++) {
-                        const uint32_t bf[2] = { bq[ni / 2][(ni & 1) * 2], bq[ni / 2][(ni & 1) * 2 + 1] };
-                        const float2 wsp = *(const float2 *)(sWs + (m * SLOTS + slot) * QSP_BN + wn * NT * 8 + ni * 8 + (int)t4 * 2);
-                        int32_t d[4];
-                        qsp_mma_seeded(d, af, bf, magic);
-                        P[m][ni][0] = qsp_fma(qsp_fmul(wsp.x, xs0), qsp_dot_to_f32(d[0]), P[m][ni][0]);
-                        P[m][ni][1] = qsp_fma(qsp_fmul(wsp.y, xs0), qsp_dot_to_f32(d[1]), P[m][ni][1]);
-                        P[m][ni][2] = qsp_fma(qsp_fmul(wsp.x, xs1), qsp_dot_to_f32(d[2]), P[m][ni][2]);
-                        P[m][ni][3] = qsp_fma(qsp_fmul(wsp.y, xs1), qsp_dot_to_f32(d[3]), P[m][ni][3]);
-                    }
-                }
-            }
-            /* Streaming pairwise sum over the stage's classes; compile-time
-             * conditions. */
-#pragma unroll
-            for (int b = 0; b < LOGCH; b++) {
-                const int mk = (1 << (b + 1)) - 1;
-                if ((cls & mk) == mk) {
-#pragma unroll
-                    for (int m = 0; m < MATRICES; m++)
-#pragma unroll
-                        for (int ni = 0; ni < NT; ni++)
-#pragma unroll
-                            for (int e = 0; e < 4; e++) P[m][ni][e] = qsp_fadd(W[m][b][ni][e], P[m][ni][e]);
-                }
-            }
-#pragma unroll
-            for (int b = 0; b < LOGCH; b++) {
-                const int lm = (1 << b) - 1;
-                if ((cls & lm) == lm && ((cls >> b) & 1) == 0) {
-#pragma unroll
-                    for (int m = 0; m < MATRICES; m++)
-#pragma unroll
-                        for (int ni = 0; ni < NT; ni++)
-#pragma unroll
-                            for (int e = 0; e < 4; e++) W[m][b][ni][e] = P[m][ni][e];
-                }
-            }
-        }
-        qsp_bar_arrive(2 + 2 * buf, BAR_COUNT);
-
-        /* Same streaming sum one level up, over the stages. */
-#pragma unroll
-        for (int b = 0; b < C::NLEV; b++) {
-            const int mk = (1 << (b + 1)) - 1;
-            if ((s & mk) == mk) {
-#pragma unroll
-                for (int m = 0; m < MATRICES; m++)
-#pragma unroll
-                    for (int ni = 0; ni < NT; ni++)
-#pragma unroll
-                        for (int e = 0; e < 4; e++) P[m][ni][e] = qsp_fadd(S[m][b][ni][e], P[m][ni][e]);
-            }
-        }
-#pragma unroll
-        for (int b = 0; b < C::NLEV; b++) {
-            const int lm = (1 << b) - 1;
-            if ((s & lm) == lm && ((s >> b) & 1) == 0) {
-#pragma unroll
-                for (int m = 0; m < MATRICES; m++)
-#pragma unroll
-                    for (int ni = 0; ni < NT; ni++)
-#pragma unroll
-                        for (int e = 0; e < 4; e++) S[m][b][ni][e] = P[m][ni][e];
-            }
-        }
-    }
-
-    /* The last stage carries every bit set, so the total is in P.  The
-     * staged kernels' epilogue expressions. */
-#pragma unroll
-    for (int ni = 0; ni < NT; ni++) {
-#pragma unroll
-        for (int e = 0; e < 4; e++) {
-            const uint32_t tok = tok0 + (uint32_t)(wm * 16 + (int)g4 + (e >> 1) * 8);
-            const uint32_t row = row0 + (uint32_t)(wn * NT * 8 + ni * 8 + (int)t4 * 2 + (e & 1));
-            if (tok < n_tokens && row < n_dim) {
-                const uint64_t off = (uint64_t)tok * n_dim + row;
-                if (MATRICES == 2) {
-                    const float g = P[0][ni][e];
-                    const float u = P[MATRICES - 1][ni][e];
-                    out[off] = (g / (1.0f + expf(-g))) * u;
-                } else {
-                    out[off] += gate_scale[tok] * P[0][ni][e];
-                }
-            }
-        }
-    }
-}
-
-/* Does this call take the pipelined class-major tile above?  Q8_0 only,
- * the same width gate and DS4_QWEN4EXP_SHARED_MMA handling as the tiles
- * below (0 stands everything down, 1 forces every width), and its own kill
- * switch DS4_QWEN4EXP_NO_SHARED_PIPE, which lands the call on those tiles.
- * Picks the classes per stage that keep a stage under 60 KB. */
-static int qwen4exp_shared_pipe_ok(const uint32_t *types, uint32_t n_types,
-                                   uint32_t groups, uint32_t n_tokens,
-                                   const void *xq, const void *w0, const void *w1,
-                                   int *kmax_out, int *logch_out) {
-    /* The activation groups are read 16 bytes at a time and the weight
-     * bytes as aligned 16-byte chunks around each group; 4-byte aligned
-     * weights keep the word-wise tail reads aligned. */
-    if ((((uintptr_t)xq) & 15u) != 0u || (((uintptr_t)w0) & 3u) != 0u ||
-        (w1 && (((uintptr_t)w1) & 3u) != 0u)) return 0;
-    const char *sel = getenv("DS4_QWEN4EXP_SHARED_MMA");
-    const int forced = sel && sel[0] == '1' && sel[1] == '\0';
-    if (sel && sel[0] == '0' && sel[1] == '\0') return 0;
-    if (getenv("DS4_QWEN4EXP_NO_SHARED_PIPE")) return 0;
-    if (getenv("DS4_QWEN4EXP_SHARED_STAGE")) return 0;
-    if (getenv("DS4_QWEN4EXP_MOE_R")) return 0;
-    if (groups == 0u) return 0;
-    for (uint32_t i = 0; i < n_types; i++) {
-        if (types[i] != (uint32_t)DS4_QWEN4EXP_TY_q8_0) return 0;
-    }
-    if (!forced && n_tokens < (uint32_t)QWEN4EXP_MMA_MIN_TOKENS) return 0;
-    const uint32_t kmax = (groups + 31u) / 32u;
-    if (kmax < 1u || kmax > 4u) return 0;
-    /* Slots per stage: at most 6 with two matrices, 8 with one. */
-    const int max_slots = n_types == 2u ? 6 : 8;
-    int logch = 0;
-    while (logch < 5 && ((2 << logch) * (int)kmax) <= max_slots) logch++;
-    *kmax_out = (int)kmax;
-    *logch_out = logch;
-    return 1;
-}
-
-template <int MATRICES, int LOGCH, int KMAX>
-static int qwen4exp_shared_pipe_launch(
-        float *out, const char *w0, const char *w1, const int8_t *xq,
-        const float *xs, const float *gate_scale, uint64_t w0_row_bytes,
-        uint64_t w1_row_bytes, uint32_t groups, uint32_t n_dim,
-        uint32_t n_tokens, cudaStream_t stream) {
-    typedef qsp_cfg<MATRICES, LOGCH, KMAX> C;
-    static int attr = 0;   /* 0 unset, 1 ok, -1 refused */
-    if (attr == 0) {
-        attr = (cudaFuncSetAttribute(qwen4exp_shared_pipe_mma_kernel<MATRICES, LOGCH, KMAX>,
-                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                     C::SMEM) == cudaSuccess) ? 1 : -1;
-        if (attr < 0) (void)cudaGetLastError();
-    }
-    if (attr < 0) return 0;
-    const dim3 grid((n_tokens + (uint32_t)QSP_BM - 1u) / (uint32_t)QSP_BM,
-                    (n_dim + (uint32_t)C::BN - 1u) / (uint32_t)C::BN, 1);
-    qwen4exp_shared_pipe_mma_kernel<MATRICES, LOGCH, KMAX>
-        <<<grid, C::THREADS, C::SMEM, stream>>>(
-            out, w0, w1, xq, xs, gate_scale, w0_row_bytes, w1_row_bytes,
-            groups, n_dim, n_tokens);
-    return 1;
-}
-
-/* KMAX and LOGCH are runtime here; one instantiation per (kmax, logch)
- * the picker above can produce. */
-template <int MATRICES>
-static int qwen4exp_shared_pipe_dispatch(
-        int kmax, int logch, float *out, const char *w0, const char *w1,
-        const int8_t *xq, const float *xs, const float *gate_scale,
-        uint64_t w0_row_bytes, uint64_t w1_row_bytes, uint32_t groups,
-        uint32_t n_dim, uint32_t n_tokens, cudaStream_t stream) {
-#define QSP_CASE(K, L) \
-    if (kmax == (K) && logch == (L)) \
-        return qwen4exp_shared_pipe_launch<MATRICES, L, K>(out, w0, w1, xq, xs, gate_scale, \
-                w0_row_bytes, w1_row_bytes, groups, n_dim, n_tokens, stream)
-    if (MATRICES == 2) {
-        QSP_CASE(1, 2); QSP_CASE(2, 1); QSP_CASE(3, 1); QSP_CASE(4, 0);
-    } else {
-        QSP_CASE(1, 3); QSP_CASE(2, 2); QSP_CASE(3, 1); QSP_CASE(4, 1);
-    }
-#undef QSP_CASE
-    return 0;
-}
-
 /* Does this call take the tile?
  *
  * DS4_QWEN4EXP_SHARED_MMA is the kill switch and the test handle: "0" keeps
@@ -5812,6 +5273,14 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
 
     const dim3 dn_grid((out_dim + 7u) / 8u,
                        (n_tokens + (uint32_t)tile - 1u) / (uint32_t)tile, 1);
+#define QWEN4EXP_DOWN_ROWS_IMPL(R, DT, V, P) \
+    qwen4exp_moe_down_q_kernel<R, DT, V, P><<< \
+            dim3((out_dim + (P) - 1u) / (P), dn_grid.y, 1), (P) * 32u, 0, \
+            stream>>>( \
+            (float *)out->ptr, down, (const int32_t *)selected->ptr, \
+            sc.mq, sc.ms, sc.msum, \
+            down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
+            mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
 #define QWEN4EXP_DOWN_IMPL(R, DT, V) \
     qwen4exp_moe_down_q_kernel<R, DT, V><<<dn_grid, threads, 0, stream>>>( \
             (float *)out->ptr, down, (const int32_t *)selected->ptr, \
@@ -5855,10 +5324,31 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         return cuda_ok(cudaGetLastError(), "qwen4exp MoE down combine launch");
     }
     if (down_vector && ((uintptr_t)sc.mq & 15u) == 0u) {
+        /* SIXTEEN OUTPUT ROWS PER BLOCK on the vector schedule.  This is a
+         * widening, and it is deliberately the opposite of the narrowing that
+         * two measured runs already rejected: eight rows down to two cost
+         * 0.80% of box-normalized decode on its own (0.482897 against the
+         * promoted 0.479067), so the retirement-quantum argument that asked
+         * for it is dead.  What survives all the down/shared/split results is
+         * DRAM locality inside a block: this kernel's warps walk CONSECUTIVE
+         * rows of ONE expert's down slab with no barrier and no shared tile,
+         * which is a single coherent stream, and chopping the run across
+         * blocks that land on different SMs at different times breaks it.  If
+         * that is the real variable then a LONGER run should pay, so this
+         * doubles the run to sixteen rows: 160 blocks of 512 threads instead
+         * of 320 of 256.  The warp count and the per-warp work are unchanged
+         * and nothing is reassociated; only the block boundary moves.
+         *
+         * This is the clean version of the test.  Restructuring the split
+         * gate/up kernel into two single-slab phases also bought locality but
+         * lost 1.14% (60f82554, 0.484539 against 0.479067 on the same box),
+         * and that change confounded locality with an extra launch per layer.
+         * This one changes nothing but the boundary, so it isolates the
+         * variable the phase experiment could not. */
         if (down_slab->type == DS4_QWEN4EXP_TY_q8_0) {
-            QWEN4EXP_DOWN_IMPL(2, DS4_QWEN4EXP_TY_q8_0, true);
+            QWEN4EXP_DOWN_ROWS_IMPL(2, DS4_QWEN4EXP_TY_q8_0, true, 16u);
         } else {
-            QWEN4EXP_DOWN_IMPL(2, DS4_QWEN4EXP_TY_q5_1, true);
+            QWEN4EXP_DOWN_ROWS_IMPL(2, DS4_QWEN4EXP_TY_q5_1, true, 16u);
         }
     }
     else if (tile == 8) { QWEN4EXP_DOWN(8); }
@@ -5867,6 +5357,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     else { QWEN4EXP_DOWN(1); }
 #undef QWEN4EXP_DOWN
 #undef QWEN4EXP_DOWN_IMPL
+#undef QWEN4EXP_DOWN_ROWS_IMPL
     return cuda_ok(cudaGetLastError(), "qwen4exp MoE down launch");
 }
 
@@ -6062,15 +5553,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
      * that uniform type at launch time so the decode loop does not carry the
      * generic six-format switch through every group. Other supported layouts
      * retain the generic instantiation and exactly the same arithmetic. */
-    int gu_pk = 0, gu_pl = 0, dn_pk = 0, dn_pl = 0;
-    const int pipe_gateup = qwen4exp_shared_pipe_ok(gu_types, 2u, xgroups, n_tokens, xq, gate, up, &gu_pk, &gu_pl);
-    const int pipe_down = qwen4exp_shared_pipe_ok(dn_types, 1u, mgroups, n_tokens, mq, down, NULL, &dn_pk, &dn_pl);
-    if (pipe_gateup &&
-        qwen4exp_shared_pipe_dispatch<2>(gu_pk, gu_pl, (float *)mid->ptr, gate, up, xq, xs,
-                                         NULL, gate_slab->row_bytes, up_slab->row_bytes,
-                                         xgroups, mid_dim, n_tokens, stream)) {
-        ds4_gpu_qwen4exp_shared_mma_launches++;
-    } else if (mma_gateup) {
+    if (mma_gateup) {
         const uint32_t ks = ((xgroups + 31u) / 32u) << gu_logch;
         const dim3 grid((mid_dim + (uint32_t)QS_MMA_BM - 1u) / (uint32_t)QS_MMA_BM,
                         (n_tokens + (uint32_t)QS_MMA_BN - 1u) / (uint32_t)QS_MMA_BN,
@@ -6104,6 +5587,20 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
  * quantizes the input itself, that quantizer, which triggers too -- and the
  * kernel's weight-group prefetch rides that window
  * (ds4_cuda_qwen4exp.cuh).  Verify and prefill keep the plain launch. */
+/* EIGHT OUTPUT ROWS PER BLOCK, and the width is load-bearing.  mid_dim 640
+ * over eight rows is only eighty blocks for 48 SMs, so 32 SMs take two blocks
+ * and 16 take one and roughly a fifth of the machine idles through the wave.
+ * Narrowing to one row per block fixes that quantum -- 640 blocks, 13.3 per SM
+ * -- and it was MEASURED SLOWER (bundled with the routed-down narrowing in
+ * `62ad52bb`, 0.482682 box-normalized decode against 0.479067 for this
+ * geometry, bit-exact both ways).  The quantum is not what this kernel is
+ * bound by; DRAM locality is.  Eight warps here walk eight CONSECUTIVE rows of
+ * the gate and up slabs, which is one coherent stream per slab per block, and
+ * splitting those rows across blocks scattered onto different SMs at different
+ * times breaks it.  Contrast qwen4exp_moe_gateup_split_kernel, whose two warps
+ * sit in two far-apart slabs and cannot have that locality at any width, and
+ * which is barrier-coupled on top of it: there narrowing to one row won 0.78%.
+ * Do not re-run this experiment. */
 #define QWEN4EXP_SH_GATEUP_IMPL(R, GT, UT, V) do { \
     if (n_tokens <= 2u) { \
         QWEN4EXP_LAUNCH_PDL( \
@@ -6151,12 +5648,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         return 0;
     }
 
-    if (pipe_down &&
-        qwen4exp_shared_pipe_dispatch<1>(dn_pk, dn_pl, (float *)out->ptr, down, NULL, mq, ms,
-                                         (const float *)gate_scale->ptr, down_slab->row_bytes,
-                                         0u, mgroups, out_dim, n_tokens, stream)) {
-        ds4_gpu_qwen4exp_shared_mma_launches++;
-    } else if (mma_down) {
+    if (mma_down) {
         const uint32_t ks = ((mgroups + 31u) / 32u) << dn_logch;
         const dim3 grid((out_dim + (uint32_t)QS_MMA_BM - 1u) / (uint32_t)QS_MMA_BM,
                         (n_tokens + (uint32_t)QS_MMA_BN - 1u) / (uint32_t)QS_MMA_BN,
@@ -7769,380 +7261,6 @@ static void qwen4exp_hc_norm_quant_inject_launch(
 #undef QWEN4EXP_HC_NQI_LAUNCH
 }
 
-/* The up+mix tile above on the producer/consumer pipeline of ds4_cuda.cu's
- * matmul_q8_0_preq_rows_mma_pipe_kernel: four producer warps stage the
- * activation groups (as they lie) and the up weights (each group's raw 34
- * Q8_0 bytes as the aligned 48 that cover them, funnel-shifted onto word
- * boundaries where ldmatrix reads them, its half scale converted), and eight
- * consumer warps of 64 tokens x (8 channels x the four streams) do nothing
- * but fragment loads, MMAs and the chain.  SAME ARITHMETIC as the tile
- * above per (token, channel, stream): the ascending-g chain
- * fma.rn.ftz(mul.rn.ftz(ws, xs), (float)dot, acc) on the same int32 dots
- * (the conversion seeded through the tensor core as the dense tile's,
- * |dot| <= 2^19), then the mix epilogue, character for character.
- * A block's weight rows are the four streams of its BC channels, staged
- * stream-minor: shared row wn*32 + h*8 + j is stream h of channel
- * d0 + wn*8 + j, so a warp's four stream tiles are contiguous.  A group
- * past n_lowrank's last is zero on the activation side (dot 0, scale 0).
- * Gated to Q8_0 up weights, 4-byte aligned, and 16-byte aligned xq. */
-#define QHP_MT 4
-#define QHP_NT 4                       /* the streams */
-#define QHP_WM 2
-#define QHP_WN 4
-#define QHP_BM (QHP_WM * QHP_MT * 16)  /* 128 tokens */
-#define QHP_BC (QHP_WN * 8)            /* 32 channels */
-#define QHP_BN (QHP_NT * QHP_BC)       /* 128 weight rows */
-#define QHP_G 4                        /* groups per stage */
-#define QHP_STAGES 2
-#define QHP_CWARPS (QHP_WM * QHP_WN)
-#define QHP_PWARPS 4
-#define QHP_THREADS ((QHP_CWARPS + QHP_PWARPS) * 32)
-#define QHP_LD (QHP_G * 32 + 16)
-#define QHP_A_BYTES (QHP_BM * QHP_LD)
-#define QHP_B_BYTES (QHP_BN * QHP_LD)
-#define QHP_AS_BYTES (QHP_BM * QHP_G * 4)
-#define QHP_WS_BYTES (QHP_G * QHP_BN * 4)
-#define QHP_STAGE_BYTES (QHP_A_BYTES + QHP_B_BYTES + QHP_AS_BYTES + QHP_WS_BYTES)
-#define QHP_SMEM (QHP_STAGES * QHP_STAGE_BYTES)
-
-__device__ __forceinline__ static float qhp_dot_to_f32(int32_t d_magic) {
-    float r;
-    asm("sub.rn.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(__int_as_float(d_magic)), "f"(QSP_MAGIC_F));
-    return r;
-}
-
-template <int UNUSED>
-__global__ __launch_bounds__(QHP_THREADS) static void
-qwen4exp_hc_up_mix_pipe_kernel(
-        float *mixed, const unsigned char *w, const int8_t *xq,
-        const float *xscale, const float *hyper, const float *nscale,
-        const float *normw, uint32_t n_embd, uint32_t n_rows,
-        uint64_t blocks, float weight_bias, int round_bf16) {
-    extern __shared__ __align__(16) unsigned char qhp_smem[];
-    unsigned char *sA_all = qhp_smem;
-    unsigned char *sB_all = sA_all + QHP_STAGES * QHP_A_BYTES;
-    float *sAs_all = (float *)(sB_all + QHP_STAGES * QHP_B_BYTES);
-    float *sWs_all = sAs_all + QHP_STAGES * (QHP_AS_BYTES / 4);
-
-    const int tid = (int)threadIdx.x;
-    const uint32_t lane = threadIdx.x & 31u;
-    const int warp = tid >> 5;
-    const uint32_t m0 = blockIdx.x * (uint32_t)QHP_BM;
-    const uint32_t d0 = blockIdx.y * (uint32_t)QHP_BC;
-    if (m0 >= n_rows || d0 >= n_embd) return;
-    const uint32_t nstage = (uint32_t)((blocks + (uint64_t)QHP_G - 1u) / (uint64_t)QHP_G);
-    const uint64_t w_row_bytes = blocks * 34u;
-    constexpr int BAR_COUNT = QHP_THREADS;
-
-    if (warp >= QHP_CWARPS) {
-        /* ---- Producers. */
-        const int pw = warp - QHP_CWARPS;
-        constexpr int PT = 32 * QHP_PWARPS;
-        constexpr int NA = QHP_BM * QHP_G * 2;
-        constexpr int NS = QHP_BM * QHP_G;
-        constexpr int NB = QHP_BN * QHP_G;
-        constexpr int KA = (NA + PT - 1) / PT, KS = (NS + PT - 1) / PT, KB = (NB + PT - 1) / PT;
-        const int pl = (int)lane + 32 * pw;
-
-        for (uint32_t s = 0; s < nstage; s++) {
-            const int buf = (int)(s % QHP_STAGES);
-            unsigned char *sA = sA_all + buf * QHP_A_BYTES;
-            unsigned char *sB = sB_all + buf * QHP_B_BYTES;
-            float *sAs = sAs_all + buf * (QHP_AS_BYTES / 4);
-            float *sWs = sWs_all + buf * (QHP_WS_BYTES / 4);
-            const uint64_t g0 = (uint64_t)s * QHP_G;
-
-            uint4 ra[KA];
-            float rs[KS];
-            uint4 rb[KB][3];
-#pragma unroll
-            for (int k = 0; k < KA; k++) {
-                const int i = pl + k * PT;
-                const int t = i / (QHP_G * 2);
-                const int rem = i - t * (QHP_G * 2);
-                const uint64_t g = g0 + (uint64_t)(rem >> 1);
-                const uint64_t tok = (uint64_t)m0 + (uint32_t)t;
-                ra[k] = make_uint4(0u, 0u, 0u, 0u);
-                if (i < NA && tok < (uint64_t)n_rows && g < blocks) {
-                    ra[k] = qsp_ldg_16_cg(xq + (tok * blocks + g) * 32u + (rem & 1) * 16);
-                }
-            }
-#pragma unroll
-            for (int k = 0; k < KS; k++) {
-                const int i = pl + k * PT;
-                const int t = i / QHP_G;
-                const uint64_t g = g0 + (uint64_t)(i - t * QHP_G);
-                const uint64_t tok = (uint64_t)m0 + (uint32_t)t;
-                rs[k] = 0.0f;
-                if (i < NS && tok < (uint64_t)n_rows && g < blocks) rs[k] = __ldg(xscale + tok * blocks + g);
-            }
-#pragma unroll
-            for (int k = 0; k < KB; k++) {
-                const int i = pl + k * PT;
-                const int r = i / QHP_G;                 /* shared row */
-                const int slot = i - r * QHP_G;
-                const uint64_t g = g0 + (uint64_t)slot;
-                /* shared row r = wn*32 + h*8 + j -> stream h, channel d0 + wn*8 + j */
-                const int wn = r >> 5, h = (r >> 3) & 3, j = r & 7;
-                const uint32_t d = d0 + (uint32_t)(wn * 8 + j);
-                rb[k][0] = make_uint4(0u, 0u, 0u, 0u); rb[k][1] = rb[k][0]; rb[k][2] = rb[k][0];
-                if (i < NB && d < n_embd && g < blocks) {
-                    const uint64_t row = (uint64_t)h * n_embd + d;
-                    const unsigned char *p = w + row * w_row_bytes + g * 34u;
-                    const unsigned char *win = (const unsigned char *)((uintptr_t)p & ~(uintptr_t)15u);
-                    const unsigned char *mend = w + (uint64_t)QHP_NT * n_embd * w_row_bytes;
-                    rb[k][0] = qsp_ldg_16(win);
-                    rb[k][1] = qsp_ldg_16(win + 16);
-                    if (win + 48 <= mend) {
-                        rb[k][2] = qsp_ldg_16(win + 32);
-                    } else {
-                        const int inside = (int)(mend - (win + 32));
-                        uint32_t q[4] = {0u, 0u, 0u, 0u};
-#pragma unroll
-                        for (int jj = 0; jj < 4; jj++) {
-                            if (jj * 4 < inside) {
-                                uint32_t v;
-                                asm volatile("ld.global.u32 %0, [%1];" : "=r"(v) : "l"(win + 32 + jj * 4));
-                                q[jj] = v;
-                            }
-                        }
-                        rb[k][2] = make_uint4(q[0], q[1], q[2], q[3]);
-                    }
-                }
-            }
-
-            if (s >= (uint32_t)QHP_STAGES) qsp_bar_sync(2 + 2 * buf, BAR_COUNT);
-
-#pragma unroll
-            for (int k = 0; k < KA; k++) {
-                const int i = pl + k * PT;
-                const int t = i / (QHP_G * 2);
-                const int rem = i - t * (QHP_G * 2);
-                if (i < NA) qsp_sts_16(sA + t * QHP_LD + (rem >> 1) * 32 + (rem & 1) * 16, ra[k]);
-            }
-#pragma unroll
-            for (int k = 0; k < KS; k++) {
-                const int i = pl + k * PT;
-                if (i < NS) sAs[i] = rs[k];             /* [t][slot] */
-            }
-#pragma unroll
-            for (int k = 0; k < KB; k++) {
-                const int i = pl + k * PT;
-                const int r = i / QHP_G;
-                const int slot = i - r * QHP_G;
-                const uint64_t g = g0 + (uint64_t)slot;
-                const int wn = r >> 5, h = (r >> 3) & 3, j = r & 7;
-                const uint32_t d = d0 + (uint32_t)(wn * 8 + j);
-                if (i < NB) {
-                    const uint32_t raw[12] = {
-                        rb[k][0].x, rb[k][0].y, rb[k][0].z, rb[k][0].w,
-                        rb[k][1].x, rb[k][1].y, rb[k][1].z, rb[k][1].w,
-                        rb[k][2].x, rb[k][2].y, rb[k][2].z, rb[k][2].w };
-                    const uint64_t row = (uint64_t)h * n_embd + d;
-                    const uintptr_t pblk = (uintptr_t)(w + row * w_row_bytes + g * 34u);
-                    const uint32_t qoff = (uint32_t)(pblk & 15u) + 2u;
-                    const uint32_t wq = qoff >> 2;
-                    const uint32_t sh = (qoff & 2u) ? 16u : 0u;
-                    uint32_t q[8];
-#pragma unroll
-                    for (int jj = 0; jj < 8; jj++) {
-                        uint32_t lo = 0u, hi = 0u;
-#pragma unroll
-                        for (int ww = 0; ww <= 4; ww++) {
-                            if (wq == (uint32_t)ww) { lo = raw[ww + jj]; hi = (ww + jj + 1 < 12) ? raw[ww + jj + 1] : 0u; }
-                        }
-                        q[jj] = __funnelshift_r(lo, hi, sh);
-                    }
-                    unsigned char *dst = sB + r * QHP_LD + slot * 32;
-                    qsp_sts_16(dst, make_uint4(q[0], q[1], q[2], q[3]));
-                    qsp_sts_16(dst + 16, make_uint4(q[4], q[5], q[6], q[7]));
-                    const uint32_t soff = qoff - 2u;
-                    uint32_t sw = 0u;
-#pragma unroll
-                    for (int ww = 0; ww < 4; ww++) if ((soff >> 2) == (uint32_t)ww) sw = raw[ww];
-                    const uint16_t hh = (soff & 2u) ? (uint16_t)(sw >> 16) : (uint16_t)(sw & 0xffffu);
-                    const bool valid = d < n_embd && g < blocks;
-                    sWs[slot * QHP_BN + r] = valid ? __half2float(__ushort_as_half(hh)) : 0.0f;
-                }
-            }
-            __syncwarp();
-            qsp_bar_arrive(1 + 2 * buf, BAR_COUNT);
-        }
-        return;
-    }
-
-    /* ---- Consumers. */
-    const int wm = warp / QHP_WN;
-    const int wn = warp % QHP_WN;
-    const uint32_t g4 = lane >> 2u;
-    const uint32_t t4 = lane & 3u;
-    const int a_lrow = (int)(lane & 15u);
-    const int a_lk = (int)(lane >> 4u) * 16;
-    const int b_lrow = (int)(lane & 7u) + (int)((lane >> 4u) & 1u) * 8;
-    const int b_lk = (int)((lane >> 3u) & 1u) * 16;
-    const int32_t magic = QSP_MAGIC_BITS;
-
-    float acc[QHP_MT][QHP_NT][4];
-#pragma unroll
-    for (int mi = 0; mi < QHP_MT; mi++)
-#pragma unroll
-        for (int ni = 0; ni < QHP_NT; ni++)
-#pragma unroll
-            for (int e = 0; e < 4; e++) acc[mi][ni][e] = 0.0f;
-
-    for (uint32_t s = 0; s < nstage; s++) {
-        const int buf = (int)(s % QHP_STAGES);
-        qsp_bar_sync(1 + 2 * buf, BAR_COUNT);
-        const unsigned char *sA = sA_all + buf * QHP_A_BYTES;
-        const unsigned char *sB = sB_all + buf * QHP_B_BYTES;
-        const float *sAs = sAs_all + buf * (QHP_AS_BYTES / 4);
-        const float *sWs = sWs_all + buf * (QHP_WS_BYTES / 4);
-
-        float xs[QHP_MT][2][QHP_G];
-#pragma unroll
-        for (int mi = 0; mi < QHP_MT; mi++) {
-#pragma unroll
-            for (int h = 0; h < 2; h++) {
-                const int r = wm * QHP_MT * 16 + mi * 16 + h * 8 + (int)g4;
-                const float4 v = *(const float4 *)(sAs + r * QHP_G);
-                xs[mi][h][0] = v.x; xs[mi][h][1] = v.y; xs[mi][h][2] = v.z; xs[mi][h][3] = v.w;
-            }
-        }
-
-#pragma unroll
-        for (int gg = 0; gg < QHP_G; gg++) { /* the stage's groups, ascending */
-            uint32_t af[QHP_MT][4];
-#pragma unroll
-            for (int mi = 0; mi < QHP_MT; mi++) {
-                const int rbase = wm * QHP_MT * 16 + mi * 16;
-                qsp_ldmatrix_x4(af[mi], sA + (rbase + a_lrow) * QHP_LD + gg * 32 + a_lk);
-            }
-#pragma unroll
-            for (int np = 0; np < QHP_NT / 2; np++) {
-                const int c = wn * 32 + np * 16;      /* shared rows: streams 2np, 2np+1 */
-                uint32_t bq[4];
-                qsp_ldmatrix_x4(bq, sB + (c + b_lrow) * QHP_LD + gg * 32 + b_lk);
-#pragma unroll
-                for (int half = 0; half < 2; half++) {
-                    const int ni = np * 2 + half;
-                    const uint32_t bf[2] = { bq[half * 2], bq[half * 2 + 1] };
-                    const float2 wsp = *(const float2 *)(sWs + gg * QHP_BN + c + half * 8 + (int)t4 * 2);
-                    int32_t d[QHP_MT][4];
-#pragma unroll
-                    for (int mi = 0; mi < QHP_MT; mi++) qsp_mma_seeded(d[mi], af[mi], bf, magic);
-#pragma unroll
-                    for (int mi = 0; mi < QHP_MT; mi++) {
-                        acc[mi][ni][0] = qwen4exp_fma_ftz(qwen4exp_fmul_ftz(wsp.x, xs[mi][0][gg]), qhp_dot_to_f32(d[mi][0]), acc[mi][ni][0]);
-                        acc[mi][ni][1] = qwen4exp_fma_ftz(qwen4exp_fmul_ftz(wsp.y, xs[mi][0][gg]), qhp_dot_to_f32(d[mi][1]), acc[mi][ni][1]);
-                        acc[mi][ni][2] = qwen4exp_fma_ftz(qwen4exp_fmul_ftz(wsp.x, xs[mi][1][gg]), qhp_dot_to_f32(d[mi][2]), acc[mi][ni][2]);
-                        acc[mi][ni][3] = qwen4exp_fma_ftz(qwen4exp_fmul_ftz(wsp.y, xs[mi][1][gg]), qhp_dot_to_f32(d[mi][3]), acc[mi][ni][3]);
-                    }
-                }
-            }
-        }
-        qsp_bar_arrive(2 + 2 * buf, BAR_COUNT);
-    }
-
-    /* The mix, with the accumulators staged through the stage buffers
-     * (every consumer is past its last fragment load once all have arrived
-     * here; the producers have returned) so that each (token, stream) of
-     * `hyper` is read as one 128-byte line by one warp instruction instead
-     * of eight lines by the fragment layout.  Per (token, channel) the
-     * arithmetic is the tile's, character for character: sigmoid of the
-     * four streams' accumulators, the normalized hyper value, one FFMA per
-     * stream low to high, then 1/n_hc. */
-    qsp_bar_sync(0, QHP_CWARPS * 32);
-    constexpr int C_TOK_STRIDE = QHP_NT * QHP_BC + 4;   /* floats; 4 pad, see below */
-    float *sC = (float *)qhp_smem;                       /* [token][stream][channel] */
-    static_assert(QHP_BM * C_TOK_STRIDE * 4 <= QHP_SMEM, "C staging fits the stage buffers");
-#pragma unroll
-    for (int mi = 0; mi < QHP_MT; mi++) {
-#pragma unroll
-        for (int h = 0; h < QHP_NT; h++) {
-#pragma unroll
-            for (int half = 0; half < 2; half++) {
-                const int t = wm * QHP_MT * 16 + mi * 16 + (int)g4 + half * 8;
-                const int c = wn * 8 + (int)t4 * 2;
-                *(float2 *)(sC + t * C_TOK_STRIDE + h * QHP_BC + c) =
-                    make_float2(acc[mi][h][half * 2], acc[mi][h][half * 2 + 1]);
-            }
-        }
-    }
-    qsp_bar_sync(0, QHP_CWARPS * 32);
-    {
-        const uint32_t c = d0 + lane;                    /* one channel per lane */
-        const bool c_ok = c < n_embd;
-        float nw[QHP_NT];
-#pragma unroll
-        for (int h = 0; h < QHP_NT; h++) nw[h] = c_ok ? normw[(uint64_t)h * n_embd + c] : 0.0f;
-        /* Eight tokens per pass, every load of the pass in flight before
-         * any of its arithmetic. */
-        constexpr int TPP = 8;
-        static_assert(QHP_BM % (QHP_CWARPS * TPP) == 0, "tokens per warp pass");
-#pragma unroll 1
-        for (int t0 = warp * TPP; t0 < QHP_BM; t0 += QHP_CWARPS * TPP) {
-            float hv[TPP][QHP_NT], ns[TPP][QHP_NT];
-#pragma unroll
-            for (int i = 0; i < TPP; i++) {
-                const uint32_t r = m0 + (uint32_t)(t0 + i);
-                const bool ok = c_ok && r < n_rows;
-#pragma unroll
-                for (int h = 0; h < QHP_NT; h++) {
-                    hv[i][h] = ok ? hyper[((uint64_t)r * QHP_NT + h) * n_embd + c] : 0.0f;
-                    ns[i][h] = ok ? nscale[(uint64_t)r * QHP_NT + h] : 0.0f;
-                }
-            }
-#pragma unroll
-            for (int i = 0; i < TPP; i++) {
-                const int t = t0 + i;
-                const uint32_t r = m0 + (uint32_t)t;
-                if (r >= n_rows || !c_ok) continue;
-                float mix = 0.0f;
-#pragma unroll
-                for (int h = 0; h < QHP_NT; h++) {
-                    const float normed = qwen4exp_hc_normed_value(hv[i][h], ns[i][h], nw[h],
-                                                                  weight_bias, round_bf16);
-                    mix = __fmaf_rn(qwen4exp_sigmoid(sC[t * C_TOK_STRIDE + h * QHP_BC + (int)lane]), normed, mix);
-                }
-                mixed[(uint64_t)r * n_embd + c] = mix * (1.0f / (float)QHP_NT);
-            }
-        }
-    }
-}
-
-/* The pipelined up+mix, or 0 when it does not take the call (its kill
- * switch DS4_QWEN4EXP_NO_HC_UP_PIPE, alignment, four streams only, or the
- * shared-memory opt-in refused) and the tile above runs. */
-static int qwen4exp_hc_up_mix_pipe_launch(
-        float *mixed, const unsigned char *upw, const int8_t *xq,
-        const float *xscale, const float *hyper, const float *nscale,
-        const float *normw, uint32_t n_embd, uint32_t n_hc, uint32_t rows,
-        uint64_t blocks, float weight_bias, int round_bf16) {
-    static int attr = 0;
-    if (n_hc != (uint32_t)QHP_NT) return 0;
-    /* Prefill widths only: below them the tile above's small config is the
-     * faster one (18 vs 32 us at 48 rows), and they are where the pipeline
-     * pays (413 -> 372 us at 1024 rows, the epilogue's 42 MB hyper read
-     * now one line per warp instruction). */
-    if (rows <= 64u) return 0;
-    if (getenv("DS4_QWEN4EXP_NO_HC_UP_PIPE")) return 0;
-    if ((((uintptr_t)xq) & 15u) != 0u || (((uintptr_t)upw) & 3u) != 0u ||
-        (((uintptr_t)xscale) & 15u) != 0u) return 0;
-    if (attr == 0) {
-        attr = (cudaFuncSetAttribute(qwen4exp_hc_up_mix_pipe_kernel<0>,
-                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                     QHP_SMEM) == cudaSuccess) ? 1 : -1;
-        if (attr < 0) (void)cudaGetLastError();
-    }
-    if (attr < 0) return 0;
-    qwen4exp_hc_up_mix_pipe_kernel<0>
-        <<<dim3((rows + QHP_BM - 1u) / QHP_BM, (n_embd + QHP_BC - 1u) / QHP_BC, 1u),
-           QHP_THREADS, QHP_SMEM, cuda_decode_stream()>>>(
-            mixed, upw, xq, xscale, hyper, nscale, normw, n_embd, rows,
-            blocks, weight_bias, round_bf16);
-    return 1;
-}
-
 /* The stream count the up+mix tile is instantiated for. */
 #define QWEN4EXP_HC_UP_MIX_NT 4
 
@@ -8359,12 +7477,7 @@ static int qwen4exp_hc_mixer_fused_cuda(
         if (upw) {
             /* The same two tile shapes the unfused ladder picks for a wide
              * output; the shape does not enter the arithmetic. */
-            if (qwen4exp_hc_up_mix_pipe_launch(
-                        (float *)mixed->ptr, (const unsigned char *)upw, xq, xscale,
-                        (const float *)hyper->ptr, nscale, normw, n_embd, n_hc, rows,
-                        n_lowrank / 32u, weight_bias, round_bf16)) {
-                /* taken */
-            } else if (rows <= 64u) {
+            if (rows <= 64u) {
                 QWEN4EXP_HC_UP_MIX_LAUNCH(2, 2, 2, 4);
             } else {
                 QWEN4EXP_HC_UP_MIX_LAUNCH(2, 4, 4, 4);
@@ -9412,330 +8525,6 @@ __global__ static void qwen4exp_qsa_attention_group_kernel(
     }
 }
 
-/* =========================================================================
- * The head-group attention, second cut: the same arithmetic, four
- * scheduling changes, for the prefill widths that take the group kernel.
- *
- * Measured against the group kernel above at a 1024-row dense chunk, that
- * kernel is bound by shared-memory load INSTRUCTIONS, not by arithmetic:
- * every thread re-reads the whole 12-head query block out of shared memory
- * for its one key (768 LDS.128 per tile), re-reads every probability of
- * every head one float at a time in the value phase (3072 LDS.32 per tile),
- * and spends twelve heads' worth of block barriers in between.  What
- * changes here, and why none of it moves a bit:
- *
- *   keys per thread   nth / KPT threads each score KPT tile slots (tid,
- *                     tid + nth/KPT, ...), so one query word read from
- *                     shared memory serves KPT keys.  A (key, head) chain
- *                     is still one thread's __fmaf_rn walk, w ascending and
- *                     x y z w within a word, from 0.0f; the score lands in
- *                     the SAME tile slot (base + slot) it always had, so the
- *                     block reductions see the same values in the same
- *                     positions.
- *   tile maximum      a warp shuffle tree over each scorer's slots plus a
- *                     fold over the scorer warps.  fmaxf is exact,
- *                     commutative and associative over finite values (a
- *                     masked slot holds the finite sentinel), so ANY tree
- *                     returns the float qwen4exp_blk_max returns; the one
- *                     thing a tree can change, the sign of a zero maximum,
- *                     reaches no output because M only feeds expf(x - M) and
- *                     x - (+0) == x - (-0).  (The argument the split decode
- *                     path already rests on.)
- *   tile sum          qwen4exp_blk_sum's tree -- the same pairs at the same
- *                     strides, then the same first-warp shuffle -- run over
- *                     all GROUP rows at once so the barriers are shared, and
- *                     run AFTER the value phase, in place on the
- *                     probabilities it no longer needs.  run_sum's fold,
- *                     __fmaf_rn(run_sum, rescale, tile_sum), does not care
- *                     when inside the tile the sum was taken.
- *   value phase       the probabilities are read four keys at a time
- *                     (float4 off a 16-byte aligned row) and VSTEP value
- *                     rows are asked for before any is used; each channel's
- *                     chain still walks j ascending with __fmaf_rn and still
- *                     skips exactly the masked slots (a predicated FMA, not
- *                     an FMA of zero: fma(0, v, c) would differ from c only
- *                     for a non-finite v, and this leaves nothing to chance).
- *
- * The shared-memory footprint drops by the scratch row (26 KB at the
- * production shape), under the 48 KB no-opt-in cap.  GROUP must divide
- * n_head / n_kv_head; nth must be a power of two in [32, 256] with KPT | nth,
- * head_dim <= nth and head_dim % 4 == 0.  tests/test_qwen4exp_qsa.c holds
- * this kernel against the per-head kernel byte for byte at 1024, 1017, 64
- * and 1 rows, dense and sparse; tests/qwen4exp_qsa_group_mutants.sh proves
- * that check bites.  DS4_QWEN4EXP_NO_QSA_GROUP2 keeps the first cut.
- * ========================================================================= */
-#ifndef QWEN4EXP_QSA2_KEYS_PER_THREAD
-#define QWEN4EXP_QSA2_KEYS_PER_THREAD 2u
-#endif
-#ifndef QWEN4EXP_QSA2_KSTEP
-#define QWEN4EXP_QSA2_KSTEP 4u
-#endif
-#ifndef QWEN4EXP_QSA2_VSTEP
-#define QWEN4EXP_QSA2_VSTEP 8u
-#endif
-#ifndef QWEN4EXP_QSA2_CHANNELS_PER_THREAD
-#define QWEN4EXP_QSA2_CHANNELS_PER_THREAD 1u
-#endif
-
-/* The per-row shared-memory sum tree of qwen4exp_blk_sum over R rows at
- * once: row r lives at sdata + r * nth, every row takes the same pairs in
- * the same order as the single-row helper, and the block barriers are
- * shared by all R rows instead of spent once per row. */
-template <uint32_t R>
-__device__ __forceinline__ static void qwen4exp_qsa2_blk_sum_rows(
-        float *sdata, uint32_t tid, uint32_t nth, float out[R]) {
-    for (uint32_t step = nth >> 1; step >= 32u; step >>= 1) {
-        __syncthreads();
-        if (tid < step) {
-#pragma unroll
-            for (uint32_t r = 0; r < R; r++)
-                sdata[r * nth + tid] += sdata[r * nth + tid + step];
-        }
-    }
-    __syncthreads();
-    if (tid < 32u) {
-#pragma unroll
-        for (uint32_t r = 0; r < R; r++) {
-            float v = sdata[r * nth + tid];
-#pragma unroll
-            for (uint32_t step = 16u; step > 0u; step >>= 1) {
-                v += __shfl_down_sync(0xffffffffu, v, step);
-            }
-            if (tid == 0u) sdata[r * nth] = v;
-        }
-    }
-    __syncthreads();
-#pragma unroll
-    for (uint32_t r = 0; r < R; r++) out[r] = sdata[r * nth];
-}
-
-template <uint32_t GROUP>
-__global__ static void __launch_bounds__(256, 2) qwen4exp_qsa2_attention_group_kernel(
-        const float *q, const float *k_cache, const float *v_cache,
-        const int32_t *selected, const int32_t *counts, float *out,
-        uint32_t n_tokens, uint32_t n_head, uint32_t n_kv_head, uint32_t head_dim,
-        uint32_t pos0, uint32_t cache_cap, uint32_t max_selected, uint32_t sparse,
-        float scale, const uint32_t *d_pos) {
-    extern __shared__ __align__(16) float qwen4exp_qsa2_shared[];
-    const uint32_t group = blockIdx.x;
-    const uint32_t token = blockIdx.y;
-    const uint32_t tid = threadIdx.x;
-    const uint32_t nth = blockDim.x;
-    const uint32_t head0 = group * GROUP;
-    if (head0 + GROUP > n_head || token >= n_tokens) return;
-
-    float *qvec = qwen4exp_qsa2_shared;                       /* GROUP * head_dim */
-    float *probs = qvec + GROUP * head_dim;          /* GROUP * nth: scores, then probabilities */
-    int32_t *keys = (int32_t *)(probs + GROUP * nth);/* nth              */
-    float *wmax = (float *)(keys + nth);             /* GROUP * (nth/32): per-warp score maxima */
-
-    const uint32_t p0 = d_pos ? *d_pos : pos0;
-    const uint32_t pos = p0 + token;
-    const uint32_t count = sparse ? (uint32_t)counts[token] : pos + 1u;
-    const uint32_t kv_head = head0 / (n_head / n_kv_head);
-    const uint32_t kv_stride = n_kv_head * head_dim;
-
-    const float *qsrc = q + ((uint64_t)token * n_head + head0) * head_dim;
-    const uint32_t qspan = GROUP * head_dim;
-    for (uint32_t d = tid; d < qspan; d += nth) qvec[d] = qsrc[d];
-    __syncthreads();
-
-    float *dst = out + ((uint64_t)token * n_head + head0) * head_dim;
-    if (count == 0u) {
-        for (uint32_t d = tid; d < qspan; d += nth) dst[d] = 0.0f;
-        return;
-    }
-
-    constexpr uint32_t CPT = QWEN4EXP_QSA2_CHANNELS_PER_THREAD;
-    const uint32_t cthreads = head_dim / CPT;
-    float run_max[GROUP], run_sum[GROUP], acc[CPT][GROUP];
-#pragma unroll
-    for (uint32_t h = 0; h < GROUP; h++) {
-        run_max[h] = QWEN4EXP_QSA_MASKED_SCORE; run_sum[h] = 0.0f;
-#pragma unroll
-        for (uint32_t c = 0; c < CPT; c++) acc[c][h] = 0.0f;
-    }
-    /* Score phase: nth / KPT threads each own KPT tile positions
-     * (tid, tid + nth/KPT, ...).  Each (key, head) chain is the per-head
-     * kernel's chain; a q word read from shared memory now serves KPT keys. */
-    constexpr uint32_t KPT = QWEN4EXP_QSA2_KEYS_PER_THREAD;
-    const uint32_t kthreads = nth / KPT;
-    const bool scorer = tid < kthreads;
-
-    for (uint32_t base = 0; base < count; base += nth) {
-        const uint32_t n_in_tile = min(nth, count - base);
-        /* Every thread has read the previous tile's sums out of probs[h][0]
-         * before a scorer overwrites that slot with a new score. */
-        __syncthreads();
-        if (scorer) {
-            int32_t key[KPT];
-            float score[KPT][GROUP];
-            const float *kv[KPT];
-            bool live[KPT];
-#pragma unroll
-            for (uint32_t s = 0; s < KPT; s++) {
-                const uint32_t slot = tid + s * kthreads;
-                key[s] = -1;
-                if (slot < n_in_tile) {
-                    key[s] = sparse ? selected[(uint64_t)token * max_selected + base + slot]
-                                    : (int32_t)(base + slot);
-                    if (!(key[s] >= 0 && (uint32_t)key[s] < cache_cap)) key[s] = -1;
-                }
-                live[s] = key[s] >= 0;
-                kv[s] = k_cache + (uint64_t)(live[s] ? key[s] : 0) * kv_stride + (uint64_t)kv_head * head_dim;
-#pragma unroll
-                for (uint32_t h = 0; h < GROUP; h++) score[s][h] = QWEN4EXP_QSA_MASKED_SCORE;
-            }
-            float dot[KPT][GROUP];
-#pragma unroll
-            for (uint32_t s = 0; s < KPT; s++)
-#pragma unroll
-                for (uint32_t h = 0; h < GROUP; h++) dot[s][h] = 0.0f;
-            const uint32_t words = head_dim >> 2u;
-            for (uint32_t w = 0; w + QWEN4EXP_QSA2_KSTEP <= words; w += QWEN4EXP_QSA2_KSTEP) {
-                float4 kk[KPT][QWEN4EXP_QSA2_KSTEP];
-#pragma unroll
-                for (uint32_t s = 0; s < KPT; s++)
-#pragma unroll
-                    for (uint32_t i = 0; i < QWEN4EXP_QSA2_KSTEP; i++)
-                        kk[s][i] = ((const float4 *)kv[s])[w + i];
-#pragma unroll
-                for (uint32_t h = 0; h < GROUP; h++) {
-                    const float4 *qh = (const float4 *)(qvec + h * head_dim);
-#pragma unroll
-                    for (uint32_t i = 0; i < QWEN4EXP_QSA2_KSTEP; i++) {
-                        const float4 qq = qh[w + i];
-#pragma unroll
-                        for (uint32_t s = 0; s < KPT; s++) {
-                            dot[s][h] = __fmaf_rn(qq.x, kk[s][i].x, dot[s][h]);
-                            dot[s][h] = __fmaf_rn(qq.y, kk[s][i].y, dot[s][h]);
-                            dot[s][h] = __fmaf_rn(qq.z, kk[s][i].z, dot[s][h]);
-                            dot[s][h] = __fmaf_rn(qq.w, kk[s][i].w, dot[s][h]);
-                        }
-                    }
-                }
-            }
-            float m[GROUP];
-#pragma unroll
-            for (uint32_t h = 0; h < GROUP; h++) m[h] = QWEN4EXP_QSA_MASKED_SCORE;
-#pragma unroll
-            for (uint32_t s = 0; s < KPT; s++) {
-                const uint32_t slot = tid + s * kthreads;
-                keys[slot] = key[s];
-#pragma unroll
-                for (uint32_t h = 0; h < GROUP; h++) {
-                    const float sc = live[s] ? dot[s][h] * scale : QWEN4EXP_QSA_MASKED_SCORE;
-                    probs[h * nth + slot] = sc;
-                    m[h] = fmaxf(m[h], sc);
-                }
-            }
-            /* The tile maximum.  fmaxf is exact, commutative and associative
-             * over the finite scores (a masked slot holds the finite
-             * sentinel), so a warp shuffle tree plus a cross-warp fold is the
-             * same float as the per-head kernel's shared-memory tree; the one
-             * thing a tree can change, the sign of a zero maximum, never
-             * reaches an output because M only feeds expf(x - M). */
-#pragma unroll
-            for (uint32_t h = 0; h < GROUP; h++) {
-                float v = m[h];
-#pragma unroll
-                for (uint32_t step = 16u; step > 0u; step >>= 1)
-                    v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, step));
-                if ((tid & 31u) == 0u) wmax[h * (nth / 32u) + (tid >> 5u)] = v;
-            }
-        }
-        __syncthreads();
-        float tile_max[GROUP], new_max[GROUP], rescale[GROUP], tile_sum[GROUP];
-        const uint32_t kwarps = kthreads >> 5u;
-#pragma unroll
-        for (uint32_t h = 0; h < GROUP; h++) {
-            float v = QWEN4EXP_QSA_MASKED_SCORE;
-            for (uint32_t w = 0; w < kwarps; w++) v = fmaxf(v, wmax[h * (nth / 32u) + w]);
-            tile_max[h] = v;
-            new_max[h] = fmaxf(run_max[h], tile_max[h]);
-            rescale[h] = (run_max[h] > QWEN4EXP_QSA_MASKED_LIMIT) ? expf(run_max[h] - new_max[h]) : 0.0f;
-        }
-        const int32_t mykey = keys[tid];
-#pragma unroll
-        for (uint32_t h = 0; h < GROUP; h++) {
-            const float sc = probs[h * nth + tid];
-            probs[h * nth + tid] = (mykey >= 0) ? expf(sc - new_max[h]) : 0.0f;
-        }
-        __syncthreads();
-
-        /* Value phase: head_dim / CPT threads each own CPT channels
-         * (tid, tid + head_dim/CPT, ...); a probability word read from shared
-         * memory serves CPT channels.  Every channel's chain walks j
-         * ascending over the same keys, skipping the same masked slots. */
-        if (tid < cthreads) {
-            float contrib[CPT][GROUP];
-#pragma unroll
-            for (uint32_t c = 0; c < CPT; c++)
-#pragma unroll
-                for (uint32_t h = 0; h < GROUP; h++) contrib[c][h] = 0.0f;
-            const float *vbase = v_cache + (uint64_t)kv_head * head_dim + tid;
-            uint32_t j = 0;
-            for (; j + QWEN4EXP_QSA2_VSTEP <= n_in_tile; j += QWEN4EXP_QSA2_VSTEP) {
-                int32_t kj[QWEN4EXP_QSA2_VSTEP]; float vv[CPT][QWEN4EXP_QSA2_VSTEP];
-#pragma unroll
-                for (uint32_t u = 0; u < QWEN4EXP_QSA2_VSTEP; u++) kj[u] = keys[j + u];
-#pragma unroll
-                for (uint32_t u = 0; u < QWEN4EXP_QSA2_VSTEP; u++)
-#pragma unroll
-                    for (uint32_t c = 0; c < CPT; c++)
-                        vv[c][u] = kj[u] >= 0 ? vbase[(uint64_t)kj[u] * kv_stride + c * cthreads] : 0.0f;
-#pragma unroll
-                for (uint32_t h = 0; h < GROUP; h++) {
-#pragma unroll
-                    for (uint32_t u = 0; u < QWEN4EXP_QSA2_VSTEP; u += 4u) {
-                        const float4 p4 = *(const float4 *)(probs + h * nth + j + u);
-#pragma unroll
-                        for (uint32_t c = 0; c < CPT; c++) {
-                            if (kj[u] >= 0) contrib[c][h] = __fmaf_rn(p4.x, vv[c][u], contrib[c][h]);
-                            if (kj[u + 1] >= 0) contrib[c][h] = __fmaf_rn(p4.y, vv[c][u + 1], contrib[c][h]);
-                            if (kj[u + 2] >= 0) contrib[c][h] = __fmaf_rn(p4.z, vv[c][u + 2], contrib[c][h]);
-                            if (kj[u + 3] >= 0) contrib[c][h] = __fmaf_rn(p4.w, vv[c][u + 3], contrib[c][h]);
-                        }
-                    }
-                }
-            }
-            for (; j < n_in_tile; j++) {
-                const int32_t k1 = keys[j];
-                if (k1 < 0) continue;
-#pragma unroll
-                for (uint32_t c = 0; c < CPT; c++) {
-                    const float v1 = vbase[(uint64_t)k1 * kv_stride + c * cthreads];
-#pragma unroll
-                    for (uint32_t h = 0; h < GROUP; h++)
-                        contrib[c][h] = __fmaf_rn(probs[h * nth + j], v1, contrib[c][h]);
-                }
-            }
-#pragma unroll
-            for (uint32_t c = 0; c < CPT; c++)
-#pragma unroll
-                for (uint32_t h = 0; h < GROUP; h++) acc[c][h] = __fmaf_rn(acc[c][h], rescale[h], contrib[c][h]);
-        }
-        /* The tile sums, taken after the value phase has consumed the
-         * probabilities: the per-head kernel's tree over the same nth values
-         * of each head, in place.  run_sum's fold is the per-head kernel's
-         * and does not depend on when within the tile the sum is taken. */
-        qwen4exp_qsa2_blk_sum_rows<GROUP>(probs, tid, nth, tile_sum);
-#pragma unroll
-        for (uint32_t h = 0; h < GROUP; h++) {
-            run_sum[h] = __fmaf_rn(run_sum[h], rescale[h], tile_sum[h]);
-            run_max[h] = new_max[h];
-        }
-    }
-    if (tid < cthreads) {
-#pragma unroll
-        for (uint32_t c = 0; c < CPT; c++)
-#pragma unroll
-            for (uint32_t h = 0; h < GROUP; h++)
-                dst[h * head_dim + tid + c * cthreads] =
-                    (run_sum[h] > 0.0f) ? acc[c][h] / run_sum[h] : 0.0f;
-    }
-}
-
 /* The same attention again, for the DECODE widths, as three launches over a
  * (head group, tile) grid instead of one block per (head, token).
  *
@@ -10207,19 +8996,6 @@ static size_t qwen4exp_qsa_group_shared(uint32_t group, uint32_t head_dim,
  * wide enough for the group kernel, so a decode step never reaches this and a
  * prefill chunk pays one getenv per layer against a kernel that runs for
  * milliseconds. */
-static size_t qwen4exp_qsa_group2_shared(uint32_t group, uint32_t head_dim,
-                                         uint32_t nth) {
-    return ((size_t)group * head_dim + (size_t)group * nth) * sizeof(float) +
-           (size_t)nth * sizeof(int32_t) +
-           (size_t)group * (nth / 32u) * sizeof(float);
-}
-
-/* Read fresh, as qwen4exp_qsa_group_width is, so a test can put the two
- * group kernels side by side in one process. */
-static int qwen4exp_qsa_group2_off(void) {
-    return getenv("DS4_QWEN4EXP_NO_QSA_GROUP2") != NULL;
-}
-
 static uint32_t qwen4exp_qsa_group_width(void) {
     if (getenv("DS4_QWEN4EXP_NO_QSA_GROUP") != NULL) return 1u;
     const char *forced = getenv("DS4_QWEN4EXP_QSA_GROUP");
@@ -10863,24 +9639,6 @@ extern "C" int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
                     sparse ? (const int32_t *)counts->ptr : NULL,             \
                     (float *)out->ptr, n_tokens, n_head, n_kv_head, head_dim, \
                     pos0, cache_cap, max_selected, sparse ? 1u : 0u, scale, d_pos_ptr)
-            /* The second-cut group kernel at the shapes it is written for;
-             * DS4_QWEN4EXP_NO_QSA_GROUP2 keeps the first cut. */
-            const size_t gshared2 = qwen4exp_qsa_group2_shared(g, head_dim, nth);
-            if (g == 12u && !qwen4exp_qsa_group2_off() &&
-                (head_dim & 3u) == 0u && nth >= 32u && nth <= 256u &&
-                (nth % QWEN4EXP_QSA2_KEYS_PER_THREAD) == 0u &&
-                gshared2 <= QWEN4EXP_QSA_GROUP_SHARED_CAP) {
-                qwen4exp_qsa2_attention_group_kernel<12u><<<grid, nth, gshared2,
-                    cuda_decode_stream()>>>(
-                        (const float *)q->ptr, (const float *)k_cache->ptr,
-                        (const float *)v_cache->ptr,
-                        sparse ? (const int32_t *)selected->ptr : NULL,
-                        sparse ? (const int32_t *)counts->ptr : NULL,
-                        (float *)out->ptr, n_tokens, n_head, n_kv_head, head_dim,
-                        pos0, cache_cap, max_selected, sparse ? 1u : 0u, scale, d_pos_ptr);
-                return cuda_ok(cudaGetLastError(),
-                               "Qwen4-Exp QSA grouped attention (2) launch");
-            }
             switch (g) {
                 case 12u: QWEN4EXP_QSA_GROUP_LAUNCH(12u); break;
                 case 8u:  QWEN4EXP_QSA_GROUP_LAUNCH(8u);  break;

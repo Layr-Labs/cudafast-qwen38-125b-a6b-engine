@@ -129,7 +129,7 @@ endif
 # memory, so it runs on every host alongside the tests that do need a device.
 GPU_KERNEL_TESTS += $(QWEN4EXP_MTP_TEST)
 
-.PHONY: all help clean test test-qwen4exp test-qwen4exp-ple test-qwen4exp-ple-kernels test-qwen4exp-ple-kernel-mutants test-qwen4exp-gdn test-qwen4exp-gdn-ref test-qwen4exp-qsa-ref test-qwen4exp-moe test-qwen4exp-moe-mutants test-qwen4exp-cuda-moe test-qwen4exp-hc test-qwen4exp-hc-mutants test-qwen4exp-hc-fuse-mutants test-qwen4exp-mma-pipe-mutants test-qwen4exp-shared-pipe-mutants test-qwen4exp-hc-up-pipe-mutants test-qwen4exp-qsa test-qwen4exp-mtp test-qwen4exp-graph test-qwen4exp-parity test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-qwen4exp test-qwen4exp-ple test-qwen4exp-ple-kernels test-qwen4exp-ple-kernel-mutants test-qwen4exp-gdn test-qwen4exp-gdn-ref test-qwen4exp-qsa-ref test-qwen4exp-moe test-qwen4exp-moe-mutants test-qwen4exp-cuda-moe test-qwen4exp-hc test-qwen4exp-hc-mutants test-qwen4exp-hc-fuse-mutants test-qwen4exp-mma-pipe-mutants test-qwen4exp-qsa test-qwen4exp-mtp test-qwen4exp-graph test-qwen4exp-parity test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
@@ -558,31 +558,6 @@ test-qwen4exp-hc: $(QWEN4EXP_HC_TEST)
 
 # Proves the inject checks bite: each mutant rewrites one line of the inject
 # kernel through DS4_METAL_QWEN4EXP_HC_SOURCE and must make the test fail.
-# Proves the second-cut head-group attention check bites: each mutant
-# rewrites one line of qwen4exp_qsa2_attention_group_kernel and rebuilds.
-# The BF16 prefill grid entry against the chunked original, byte for byte,
-# at 1..1024 rows and four shapes; the register tile it takes at eight rows
-# and up is checked here.
-BF16_GRID_TEST := tests/test_bf16_prefill_grid
-tests/test_bf16_prefill_grid.o: tests/test_bf16_prefill_grid.c ds4_gpu.h
-	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -c -o $@ tests/test_bf16_prefill_grid.c
-
-$(BF16_GRID_TEST): tests/test_bf16_prefill_grid.o $(GPU_TEST_OBJS)
-	$(GPU_TEST_LINK)
-
-.PHONY: test-bf16-prefill-grid
-test-bf16-prefill-grid: $(BF16_GRID_TEST)
-	./$(BF16_GRID_TEST)
-
-# Proves the BF16 tile check bites: one line of the tile kernel at a time.
-.PHONY: test-bf16-tile-mutants
-test-bf16-tile-mutants: $(BF16_GRID_TEST)
-	sh tests/qwen4exp_bf16_tile_mutants.sh
-
-.PHONY: test-qwen4exp-qsa-group-mutants
-test-qwen4exp-qsa-group-mutants: $(QWEN4EXP_QSA_TEST)
-	sh tests/qwen4exp_qsa_group_mutants.sh
-
 .PHONY: test-qwen4exp-hc-mutants
 test-qwen4exp-hc-mutants: $(QWEN4EXP_HC_TEST)
 	sh tests/qwen4exp_hc_mutants.sh
@@ -601,18 +576,6 @@ test-qwen4exp-hc-fuse-mutants: $(QWEN4EXP_HC_TEST)
 .PHONY: test-qwen4exp-mma-pipe-mutants
 test-qwen4exp-mma-pipe-mutants: $(QWEN4EXP_HC_TEST)
 	sh tests/qwen4exp_mma_pipe_mutants.sh
-
-# The same proof for the pipelined shared-expert tile, against the MoE
-# test's dp4a comparison.
-.PHONY: test-qwen4exp-shared-pipe-mutants
-test-qwen4exp-shared-pipe-mutants: tests/test_qwen4exp_moe
-	sh tests/qwen4exp_shared_pipe_mutants.sh
-
-# And for the pipelined hyper-connection up+mix, against the HC test's
-# fused-vs-unfused mixer comparison.
-.PHONY: test-qwen4exp-hc-up-pipe-mutants
-test-qwen4exp-hc-up-pipe-mutants: $(QWEN4EXP_HC_TEST)
-	sh tests/qwen4exp_hc_up_pipe_mutants.sh
 
 # The PLE kernel test asserts bit exactness on the rolling convolution window
 # and on the in-place gate, so the reference side is built without -ffast-math
