@@ -1145,7 +1145,16 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
      * them (the decode-order ladder is row-exact by construction, which is
      * the property the whole speculative cycle stands on), so a shortlist
      * id's logit is the logit the full projection produces. */
-    if (ok) {
+    int ranges = -1;
+    if (ok && logit_rows == 1u && draft_prefix && draft_tail &&
+        h->hooks.matmul_vocab_ranges && getenv("DS4_MTP_NO_STATIC_RANGES") == NULL) {
+        stage = "static range lm head";
+        ranges = h->hooks.matmul_vocab_ranges(h->t_logits, h->target_map,
+            h->target_size, h->output_offset, n_embd, h->n_vocab,
+            draft_prefix, draft_tail, h->t_sample);
+        if (ranges == 0) ok = false;
+    }
+    if (ok && ranges < 0) {
         /* A single row can project its prefix directly to the packed output.
          * Multiple rows retain separate prefix storage and per-row packing. */
         const bool direct_prefix = logit_rows == 1u;

@@ -2545,6 +2545,63 @@ static void test_draft_vocab_shortlist(void) {
     unsetenv("DS4_QWEN4EXP_DRAFT_VOCAB_TAIL");
 }
 
+static float static_range_values[7];
+static int static_range_status = 1;
+static unsigned static_range_calls;
+static int stub_static_ranges(ds4_gpu_tensor *out, const void *map, uint64_t bytes,
+        uint64_t offset, uint64_t in, uint32_t vocab, uint32_t prefix,
+        uint32_t tail, const ds4_gpu_tensor *x) {
+    (void)map; (void)bytes; (void)offset; (void)in; (void)x;
+    static_range_calls++;
+    CHECK(vocab == HEAD_N_VOCAB && prefix == 5 && tail == 2, "unchanged static ranges");
+    if (static_range_status != 1) return static_range_status;
+    return ds4_gpu_tensor_write(out, 0, static_range_values, sizeof(static_range_values));
+}
+static void test_static_range_head(void) {
+    setenv("DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX", "5", 1);
+    setenv("DS4_QWEN4EXP_DRAFT_VOCAB_TAIL", "2", 1);
+    ds4_qwen4exp_mtp_head h;
+    CHECK(build_shortlist_head(&h) == 0, "static range head build");
+    h.hooks.matmul_vocab_ranges = stub_static_ranges;
+    const float cases[][7] = {{-2,1,1,1,4,4,4},{-2,1,1,1,3,4,5},
+        {NAN,1,1,1,3,4,5},{-2,NAN,1,1,3,4,5},
+        {-INFINITY,-INFINITY,-INFINITY,-INFINITY,-INFINITY,-INFINITY,-INFINITY}};
+    const int expected[] = {4,7,0,7,0};
+    const int tokens[HEAD_ROWS] = {3,5};
+    float hc[HEAD_ROWS * HEAD_HC_DIM] = {0};
+    for(unsigned c=0;c<sizeof(expected)/sizeof(expected[0]);c++) {
+        memcpy(static_range_values,cases[c],sizeof(static_range_values));
+        int got=-1;
+        CHECK(ds4_qwen4exp_mtp_head_forward_last(&h,tokens,hc,12,HEAD_ROWS,
+              &got,NULL,g_err,sizeof(g_err)) == 0,"range forward: %s",g_err);
+        CHECK(got==expected[c],"range original-ID/NaN/tie winner %d vs %d",got,expected[c]);
+        CHECK(g_log.block_tokens==HEAD_ROWS && g_log.mixer_rows==1,
+              "range optimization must retain full native block seed work");
+    }
+    int got=-1, fallback=-1;
+    static_range_status=-1;
+    CHECK(ds4_qwen4exp_mtp_head_forward_last(&h,tokens,hc,12,HEAD_ROWS,
+          &fallback,NULL,g_err,sizeof(g_err))==0,"unsupported range fallback");
+    h.hooks.matmul_vocab_ranges=NULL;
+    CHECK(ds4_qwen4exp_mtp_head_forward_last(&h,tokens,hc,12,HEAD_ROWS,
+          &got,NULL,g_err,sizeof(g_err))==0 && got==fallback,"original fallback winner");
+    h.hooks.matmul_vocab_ranges=stub_static_ranges;static_range_status=0;
+    CHECK(ds4_qwen4exp_mtp_head_forward_last(&h,tokens,hc,12,HEAD_ROWS,
+          &got,NULL,g_err,sizeof(g_err))!=0,"backend error must propagate");
+    static_range_status=1;
+    const unsigned calls=static_range_calls;
+    int wide[HEAD_ROWS];
+    CHECK(ds4_qwen4exp_mtp_head_forward(&h,tokens,hc,12,HEAD_ROWS,wide,NULL,
+          g_err,sizeof(g_err))==0 && static_range_calls==calls,"multi-output path unchanged");
+    setenv("DS4_MTP_NO_STATIC_RANGES","1",1);
+    CHECK(ds4_qwen4exp_mtp_head_forward_last(&h,tokens,hc,12,HEAD_ROWS,
+          &got,NULL,g_err,sizeof(g_err))==0 && static_range_calls==calls,
+          "diagnostic must retain original static path");
+    unsetenv("DS4_MTP_NO_STATIC_RANGES");
+    ds4_qwen4exp_mtp_head_free(&h);
+    unsetenv("DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX");unsetenv("DS4_QWEN4EXP_DRAFT_VOCAB_TAIL");
+}
+
 int main(void) {
     printf("qwen4exp MTP tests\n\n");
     test_exactness();
@@ -2580,6 +2637,7 @@ int main(void) {
     test_head_wiring();
     printf("\n");
     test_draft_vocab_shortlist();
+    test_static_range_head();
     printf("\n");
     if (g_failures) {
         printf("FAILED: %d check(s)\n", g_failures);

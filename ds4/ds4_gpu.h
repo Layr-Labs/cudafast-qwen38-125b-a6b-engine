@@ -987,6 +987,11 @@ int ds4_gpu_matmul_q4_K_pair_decode_tensor(
         const ds4_gpu_tensor *x);
 
 /* Multi-row decode projections that preserve the one-row reduction order. */
+/* Single-row original-Q8 prefix+tail projection. 1 success, 0 backend error,
+ * -1 unsupported or invalid declaration (caller can use existing APIs). */
+int ds4_gpu_mtp_static_ranges(ds4_gpu_tensor *out, const void *map,
+    uint64_t map_size, uint64_t offset, uint64_t in_dim, uint32_t vocab,
+    uint32_t prefix, uint32_t tail, const ds4_gpu_tensor *x);
 int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         ds4_gpu_tensor       *out,
         const void           *model_map,

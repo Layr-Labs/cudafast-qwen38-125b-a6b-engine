@@ -5709,11 +5709,12 @@ __global__ static void matmul_q8_0_preq_rows_exact_tile_kernel(
 /* Two adjacent lanes share a Q8 group. Their integer partials may be
  * combined freely; each even lane keeps its original float group chain.
  * Shared memory remaps the 32 finished chains onto one reduction warp. */
-template <int R, bool Streaming = true>
+template <int R, bool Streaming = true, bool Ranges = false>
 __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
         float *out, const unsigned char *w,
         const int8_t *xq, const float *xscale,
-        uint64_t out_dim, uint32_t n_rows, uint64_t blocks) {
+        uint64_t out_dim, uint32_t n_rows, uint64_t blocks,
+        uint32_t prefix = 0, uint32_t tail_base = 0) {
     const uint32_t local_row = threadIdx.x >> 6u;
     const uint32_t local_lane = threadIdx.x & 63u;
     const uint32_t group = local_lane >> 1u;
@@ -5726,7 +5727,9 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
     for (int r = 0; r < R; r++) acc[r] = 0.0f;
 
     if (row < out_dim) {
-        const unsigned char *wr = w + row * blocks * 34u;
+        const uint64_t weight_row = Ranges && row >= prefix
+            ? (uint64_t)tail_base + row - prefix : row;
+        const unsigned char *wr = w + weight_row * blocks * 34u;
         /* PDL: the first walk step (b = group) with its WEIGHT loads issued
          * above the fence and held in registers, so they fly while the
          * quantizer drains.  The activation reads (xq/xscale, that kernel's
@@ -16878,7 +16881,7 @@ static int cuda_matmul_q8_0_preq_rows_exact(
                         (dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u)),
                         256, 0, cuda_decode_stream(),
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
-                        out_dim, n_rows, blocks);
+                        out_dim, n_rows, blocks, 0u, 0u);
             }
         } else {
             /* Retain the promoted call-width specialization for the
@@ -16892,14 +16895,14 @@ static int cuda_matmul_q8_0_preq_rows_exact(
                         (dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u)),
                         256, 0, cuda_decode_stream(),
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
-                        out_dim, n_rows, blocks);
+                        out_dim, n_rows, blocks, 0u, 0u);
             } else {
                 QWEN4EXP_LAUNCH_PDL(
                         (matmul_q8_0_preq_pair_lanes_kernel<2, false>),
                         (dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u)),
                         256, 0, cuda_decode_stream(),
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
-                        out_dim, n_rows, blocks);
+                        out_dim, n_rows, blocks, 0u, 0u);
             }
         }
         return cuda_ok(cudaGetLastError(), "q8 pair lanes launch");
@@ -17008,6 +17011,73 @@ extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
     return cuda_matmul_q8_0_preq_rows_exact(out, wptr, xq, xscale, in_dim,
                                             out_dim, n_rows, blocks);
 }
+
+extern "C" int ds4_gpu_mtp_static_ranges(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint32_t vocab, uint32_t prefix, uint32_t tail,
+        const ds4_gpu_tensor *x) {
+    if (!prefix || !tail || prefix > vocab || tail > vocab - prefix ||
+        !in_dim || in_dim > UINT32_MAX || (in_dim & 31u) ||
+        !cuda_q8_use_dp4a() || getenv("DS4_QWEN4EXP_NO_ROW_TILE") != NULL)
+        return -1;
+    const uint32_t n_rows = 1;
+    const uint64_t out_dim = (uint64_t)prefix + tail;
+    if (!out || !x || !model_map || in_dim == 0u || out_dim == 0u ||
+        n_rows == 0u ||
+        x->bytes < (uint64_t)n_rows * in_dim * sizeof(float) ||
+        out->bytes < (uint64_t)n_rows * out_dim * sizeof(float)) {
+        return -1;
+    }
+    const uint64_t blocks = (in_dim + 31u) / 32u;
+    if (weight_offset > model_size ||
+        vocab > UINT64_MAX / (blocks * 34u)) {
+        return -1;
+    }
+    const uint64_t weight_bytes = (uint64_t)vocab * blocks * 34u;
+    if (weight_bytes > model_size - weight_offset) return -1;
+    const int logical_tier = ds4_tensor_device_idx(out);
+    if (logical_tier < 0 || logical_tier >= g_n_gpus ||
+        ds4_tensor_device_idx(x) != logical_tier) {
+        return -1;
+    }
+    if (((uintptr_t)model_map & 1u) || (weight_offset & 1u)) return -1;
+    int current = -1;
+    if (cudaGetDevice(&current) != cudaSuccess) return 0;
+    if (current != g_gpu[logical_tier].device_id) return -1;
+    const char *wptr = cuda_resolve_weight_ptr(
+            model_map, weight_offset, weight_bytes, logical_tier,
+            "q8_0 decode rows exact");
+    if (!wptr) return 0;
+
+    const uint64_t xq_bytes = (uint64_t)n_rows * blocks * 32u;
+    const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+    const uint64_t tmp_bytes =
+        scale_offset + (uint64_t)n_rows * blocks * sizeof(float);
+    void *tmp = cuda_tmp_alloc_on(
+            logical_tier, tmp_bytes, "q8_0 decode rows exact prequant");
+    if (!tmp) return 0;
+    int8_t *xq = (int8_t *)tmp;
+    float *xscale = (float *)((char *)tmp + scale_offset);
+    const uint64_t qpairs = (uint64_t)n_rows * blocks;
+    const unsigned qgrid = (unsigned)((qpairs + 7u) / 8u);
+    quantize_q8_0_f32_rows_warp_kernel<<<qgrid, 256, 0, cuda_decode_stream()>>>(
+            xq, xscale, (const float *)x->ptr, in_dim, blocks, n_rows);
+    if (!cuda_ok(cudaGetLastError(),
+                 "q8_0 decode rows exact quantize launch")) {
+        return 0;
+    }
+    QWEN4EXP_LAUNCH_PDL((matmul_q8_0_preq_pair_lanes_kernel<1, false, true>),
+        (dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u)),
+        256, 0, cuda_decode_stream(),
+        (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
+        out_dim, 1u, blocks, prefix, vocab - tail);
+    return cuda_ok(cudaGetLastError(), "MTP static ranges projection");
+}
+
 
 /* The same matmul over an input the caller has ALREADY quantized into `q`:
  * the Q8_0 bytes at `q_offset` and the per-block scales at `s_offset`, in the

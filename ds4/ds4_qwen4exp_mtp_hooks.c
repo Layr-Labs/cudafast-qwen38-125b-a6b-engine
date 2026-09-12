@@ -49,6 +49,9 @@
  * weak reference empty and retain the portable tensor-copy packer in
  * ds4_qwen4exp_mtp.c. */
 #if !defined(__APPLE__) && (defined(__GNUC__) || defined(__clang__))
+extern int ds4_gpu_mtp_static_ranges(ds4_gpu_tensor *, const void *, uint64_t,
+    uint64_t, uint64_t, uint32_t, uint32_t, uint32_t,
+    const ds4_gpu_tensor *) __attribute__((weak));
 extern int ds4_gpu_qwen4exp_ehx_pack_tensor(
         ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *,
         uint32_t, uint32_t, uint32_t) __attribute__((weak));
@@ -77,8 +80,10 @@ void ds4_qwen4exp_mtp_default_hooks(ds4_qwen4exp_mtp_gpu_hooks *hooks) {
     hooks->embed       = ds4_gpu_qwen4exp_embed_tokens_hc_tensor;
 #if !defined(__APPLE__) && (defined(__GNUC__) || defined(__clang__))
     hooks->ehx_pack    = ds4_gpu_qwen4exp_ehx_pack_tensor;
+    hooks->matmul_vocab_ranges = ds4_gpu_mtp_static_ranges;
 #else
     hooks->ehx_pack    = NULL;
+    hooks->matmul_vocab_ranges = NULL;
 #endif
     hooks->matmul_q8_0 = mtp_matmul_q8_0_decode_rows;
     hooks->block       = ds4_qwen4exp_graph_head_block;

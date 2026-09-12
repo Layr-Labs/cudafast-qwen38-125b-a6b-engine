@@ -619,6 +619,11 @@ typedef struct {
                        uint64_t model_size, uint64_t weight_offset,
                        uint64_t in_dim, uint64_t out_dim,
                        const ds4_gpu_tensor *x, uint64_t n_tok);
+    /* Optional one-row static range projection: 1 success, 0 backend error,
+     * -1 unsupported (retain the ordinary two-projection path). Custom
+     * matmul_q8_0 overrides must also clear or replace this optional hook. */
+    int (*matmul_vocab_ranges)(ds4_gpu_tensor *, const void *, uint64_t,
+        uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, const ds4_gpu_tensor *);
     ds4_qwen4exp_block_forward_fn block;
 } ds4_qwen4exp_mtp_gpu_hooks;
 
