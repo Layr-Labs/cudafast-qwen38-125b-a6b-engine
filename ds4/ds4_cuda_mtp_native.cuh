@@ -3,33 +3,39 @@
  * use ordinary stream ordering, not PDL: refinement reads freshly sorted IDs. */
 static constexpr uint32_t MTP_NATIVE_CAP = 16384u;
 static constexpr uint32_t MTP_NATIVE_DIM = 2560u;
+/* One complete paired-lane group wave; full refinement still uses 80 groups.
+ * This changes the coarse proposal heuristic, not the selected-row dots. */
+static constexpr uint32_t MTP_NATIVE_SCREEN_GROUPS = 32u;
 static constexpr uint32_t MTP_NATIVE_MAX_WIDTH = 1u << 20;
 template <bool Screen, bool EmitKeys = false>
 __global__ static void mtp_native_projection_kernel(
         float *out, const unsigned char *w,
         const int8_t *xq, const float *xscale,
-        uint64_t out_dim, uint32_t n_rows, uint64_t blocks,
-        const uint32_t *ids, uint64_t n_vocab, uint32_t prefix, uint32_t tail,
+        uint32_t out_dim,
+        const uint32_t *ids, uint32_t n_vocab, uint32_t prefix, uint32_t tail,
         uint64_t *keys = nullptr, uint32_t *invalid = nullptr) {
+    /* All three private launches follow the DIM=2560, one-row guard. */
+    constexpr uint64_t blocks = MTP_NATIVE_DIM / 32u;
     constexpr int R = 1;
     constexpr bool Streaming = false;
-    const uint64_t work_blocks = Screen ? blocks / 2u : blocks;
+    const uint64_t work_blocks = Screen ? MTP_NATIVE_SCREEN_GROUPS : blocks;
     const uint32_t local_row = threadIdx.x >> 6u;
     const uint32_t local_lane = threadIdx.x & 63u;
     const uint32_t group = local_lane >> 1u;
     const uint32_t half = local_lane & 1u;
-    const uint64_t row = (uint64_t)blockIdx.x * 4u + local_row;
-    const uint32_t row0 = blockIdx.y * R;
-    const uint32_t take = n_rows - row0 < R ? n_rows - row0 : R;
+    /* Width <= 2^20; byte addressing is widened separately below. */
+    const uint32_t row = blockIdx.x * 4u + local_row;
+    constexpr uint32_t row0 = 0u;
+    constexpr uint32_t take = 1u;
     float acc[R];
 #pragma unroll
     for (int r = 0; r < R; r++) acc[r] = 0.0f;
 
-    const uint64_t weight_row = row >= out_dim ? n_vocab : Screen
-        ? (row < prefix ? row : n_vocab - tail + row - prefix) : ids[row];
+    const uint32_t weight_row = row >= out_dim ? n_vocab : Screen
+        ? (row < prefix ? row : n_vocab - tail + (row - prefix)) : ids[row];
     const bool valid = row < out_dim && weight_row < n_vocab;
     if (valid) {
-        const unsigned char *wr = w + weight_row * blocks * 34u;
+        const unsigned char *wr = w + (uint64_t)weight_row * blocks * 34u;
         for (uint64_t b = group; b < work_blocks; b += 32u) {
             /* Name both lanes of every live pair even if independent
              * scheduling has temporarily separated their execution. */
@@ -89,7 +95,7 @@ __global__ static void mtp_native_projection_kernel(
                     /* Same f32 score and original key statements as the
                      * standalone key producer; preserve its FTZ comparison. */
                     const uint32_t id = row < prefix ? (uint32_t)row
-                        : (uint32_t)(n_vocab - tail + row - prefix);
+                        : (uint32_t)(n_vocab - tail + (row - prefix));
                     if (!isfinite(value)) atomicOr(invalid, 1u);
                     if (!id || row >= prefix) keys[row] = UINT64_MAX - id;
                     else keys[row] = q8_top1_pack_key(value == 0.0f ? 0.0f : value, id);
@@ -207,12 +213,12 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
         mtp_native_key_range_disjoint(scratch->ptr,scratch->bytes,ids->ptr,ids->bytes);
     if (fuse_keys) {
         mtp_native_projection_kernel<true,true><<<(width+3u)/4u,256,0,cuda_decode_stream()>>>(
-            scores,(const unsigned char *)w,xq,xs,width,1,80,nullptr,vocab,prefix,tail,
+            scores,(const unsigned char *)w,xq,xs,width,nullptr,vocab,prefix,tail,
             key_in,flag);
         if (!cuda_ok(cudaGetLastError(),"native fused screen keys")) return -1;
     } else {
         mtp_native_projection_kernel<true><<<(width+3u)/4u,256,0,cuda_decode_stream()>>>(
-            scores,(const unsigned char *)w,xq,xs,width,1,80,nullptr,vocab,prefix,tail);
+            scores,(const unsigned char *)w,xq,xs,width,nullptr,vocab,prefix,tail);
         if (!cuda_ok(cudaGetLastError(),"native half-column screen")) return -1;
         mtp_native_keys<<<(width+255u)/256u,256,0,cuda_decode_stream()>>>(
             key_in,flag,scores,width,prefix,tail,vocab);
@@ -231,7 +237,7 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
             id_tmp,(uint32_t *)ids->ptr,MTP_NATIVE_CAP,0,32,cuda_decode_stream()),
             "native original-ID sort")) return -1;
     mtp_native_projection_kernel<false><<<(MTP_NATIVE_CAP+3u)/4u,256,0,cuda_decode_stream()>>>(
-        (float *)out->ptr,(const unsigned char *)w,xq,xs,MTP_NATIVE_CAP,1,80,
+        (float *)out->ptr,(const unsigned char *)w,xq,xs,MTP_NATIVE_CAP,
         (const uint32_t *)ids->ptr,vocab,prefix,tail);
     return cuda_ok(cudaGetLastError(),"native exact refinement") ? (int)MTP_NATIVE_CAP : -1;
 }
