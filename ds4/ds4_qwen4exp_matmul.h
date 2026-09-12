@@ -26,6 +26,7 @@
 #define DS4_QWEN4EXP_MATMUL_H
 
 #include <stdint.h>
+#include <stdlib.h>
 
 #include "ds4_gpu.h"
 #include "ds4_qwen4exp_mtp.h"
@@ -111,7 +112,9 @@ static inline int ds4_qwen4exp_matmul_f32(ds4_gpu_tensor       *out,
  * is the same arithmetic the one-row path would do, at any width, and needs no
  * new kernel on either backend.  Eight rather than one because eight is the
  * widest group both backends already treat as decode order, so the fix costs
- * ceil(rows / 8) dispatches instead of rows of them.
+ * ceil(rows / 8) dispatches instead of rows of them. CUDA can run the same
+ * original per-row matvec kernel over a full row grid in one dispatch; use that
+ * exact path above eight rows when its dimensions fit the kernel and grid.
  *
  * This is the third rule of the same kind, and the last op in the tower that
  * chose a strategy by row count.
@@ -130,6 +133,11 @@ static inline int ds4_qwen4exp_matmul_bf16(ds4_gpu_tensor       *out,
         return ds4_gpu_glm53_matmul_bf16(out, map, map_size, offset,
                                          in_dim, out_dim, x, rows);
     }
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (rows<=65535u && in_dim<=65536u && out_dim<=65536u && getenv("DS4_QWEN4EXP_NO_BF16_PREFILL_GRID")==NULL)
+        return ds4_gpu_qwen4exp_bf16_prefill_exact_tensor(out,map,map_size,offset,
+                                                        in_dim,out_dim,x,rows);
+#endif
     for (uint32_t at = 0; at < rows; at += DS4_QWEN4EXP_BF16_DECODE_ROWS) {
         const uint32_t left = rows - at;
         const uint32_t take = left < DS4_QWEN4EXP_BF16_DECODE_ROWS
