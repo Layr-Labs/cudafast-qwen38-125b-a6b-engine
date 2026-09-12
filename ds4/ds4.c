@@ -152,7 +152,6 @@ static uint32_t metal_graph_cuda_tp_output_tiers_for_head(
 /* Decode-island graph capture is CUDA-only; Metal decodes eagerly. */
 int ds4_gpu_decode_graphs_supported(void) { return 0; }
 int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) { (void)key; return -1; }
-int ds4_gpu_decode_graph_prefetch(const ds4_decode_graph_key *key) { (void)key; return 0; }
 int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) { (void)key; return -1; }
 void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key) { (void)key; }
 void ds4_gpu_decode_graphs_invalidate(void) {}
@@ -17230,7 +17229,6 @@ typedef struct ds4_decode_graph_key {
 } ds4_decode_graph_key;
 static inline int ds4_gpu_decode_graphs_supported(void) { return 0; }
 static inline int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) { (void)key; return -1; }
-static inline int ds4_gpu_decode_graph_prefetch(const ds4_decode_graph_key *key) { (void)key; return 0; }
 static inline int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) { (void)key; return -1; }
 static inline void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key) { (void)key; }
 static inline void ds4_gpu_decode_graphs_invalidate(void) {}
@@ -76226,6 +76224,30 @@ static int ds4_session_qwen4exp_spec_cycle(ds4_session *s, int first_token,
     ds4_engine *e = s->engine;
     if (!ds4_session_qwen4exp_spec_init(s, err, errlen)) return -1;
     const uint32_t pos = ds4_qwen4exp_session_pos(e->qwen4exp_session);
+    /* The first cycle of a request has no carried draft, so it would verify a
+     * single row.  The head state for the row it would need is already retained
+     * from the prefill, and the caller has just supplied that row's actual
+     * token, so the proposal is available for the cost of one shortlist
+     * projection.  Priming it lets this cycle verify two rows and, when the
+     * target agrees, retires one whole target round from the episode.  The
+     * cache-only publication below then early-returns, so the row's K/V is
+     * still computed exactly once.  Ineligible cases return 0 untouched. */
+    const ds4_qwen4exp_session_plan *plan =
+        ds4_qwen4exp_session_plan_of(e->qwen4exp_session);
+    if (!accepted || !plan) {
+        snprintf(err, errlen, "qwen4exp MTP: missing output or session plan");
+        return -1;
+    }
+    const int primed = ds4_qwen4exp_mtp_prime_cache_tail(&s->qwen4exp_spec,
+        &s->qwen4exp_head, first_token, pos, max_tokens, accepted_cap,
+        plan->n_ctx, plan->n_batch, err, errlen);
+    if (primed < 0) return -1;
+#ifdef DS4_TEST_HOOKS
+    /* Run the real head before overriding its proposal, as draft_step does. */
+    if (primed && s->qwen4exp_forced_tokens &&
+        pos + 1u < (uint32_t)s->qwen4exp_forced_len)
+        s->qwen4exp_spec.pending[0] = s->qwen4exp_forced_tokens[pos + 1u];
+#endif
     if (ds4_session_qwen4exp_cache_feed_tail(s, first_token, pos, err, errlen) != 0)
         return -1;
     /* s->logits, not a scratch buffer.  The cycle leaves the distribution for

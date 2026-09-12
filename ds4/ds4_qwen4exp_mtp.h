@@ -437,7 +437,8 @@ typedef struct {
      * produced, so this says whether the next chain's first row has everything
      * below it -- and, on a round that accepted its whole chain, that the
      * bonus token's row is still owed.  Rows below the round's own position
-     * belong to the prefill and are never counted as written here. */
+     * belong to the prefill and are never counted as written here.  A tail
+     * prime also advances this count, because it publishes that row itself. */
     uint32_t head_rows;
     float   *hc_scratch;     /* DS4_QWEN4EXP_MTP_HC_ROWS rows of hc_dim     */
     /* The verify's own logits, one row per verified row: the accept loop reads
@@ -698,6 +699,7 @@ typedef struct {
     uint32_t cache_tail_pos;
     int cache_tail_next_token;      /* -1 until its actual next token is known */
     bool cache_tail_valid;
+    bool cache_tail_prime_disabled; /* DS4_MTP_NO_TAIL_PRIME, resolved at init */
 
     /* The DRAFT shortlist over the borrowed LM head.  Set once by init() from
      * DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX (0, the default: off, the draft projects
@@ -788,6 +790,22 @@ int ds4_qwen4exp_mtp_head_retain_cache_tail(ds4_qwen4exp_mtp_head *h,
         uint32_t pos, int known_next, char *err, size_t errlen);
 int ds4_qwen4exp_mtp_head_feed_cache_tail(ds4_qwen4exp_mtp_head *h,
         int token, uint32_t pos, bool *changed, char *err, size_t errlen);
+
+/* Prime a depth-one chain from an unknown retained target frontier and the
+ * actual next token. Returns 1 when primed, 0 without mutation when ineligible,
+ * or -1 on failure. The target position/state and commit counters do not move;
+ * the caller must still run the ordinary verifier. All head work is charged
+ * to draft_ns. n_ctx/n_batch are the actual target session plan's bounds.
+ *
+ * This replaces, rather than adds to, the cache-only publication the caller
+ * would otherwise make for the same row: feed_cache_tail returns early once
+ * cache_tail_next_token matches, so the row's K/V is published exactly once
+ * either way.  The extra work is the head's shortlist projection and argmax,
+ * which the cache-only path computes nothing of and discards. */
+int ds4_qwen4exp_mtp_prime_cache_tail(ds4_qwen4exp_mtp_state *st,
+        ds4_qwen4exp_mtp_head *h, int token, uint32_t pos,
+        int budget, int accepted_cap, uint32_t n_ctx, uint32_t n_batch,
+        char *err, size_t errlen);
 
 /*
  * One head forward.

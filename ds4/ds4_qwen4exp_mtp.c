@@ -836,6 +836,7 @@ int ds4_qwen4exp_mtp_head_init(ds4_qwen4exp_mtp_head *h,
                         h->max_tokens);
     }
     if (mtp_head_draft_vocab(h, err, errlen) != 0) return -1;
+    h->cache_tail_prime_disabled = getenv("DS4_MTP_NO_TAIL_PRIME") != NULL;
     if (h->cache_seed_capacity > DS4_QWEN4EXP_MTP_CACHE_SEED_MAX_ROWS ||
         (h->cache_seed_capacity && !h->hooks.cache_seed)) {
         return mtp_fail(err, errlen, "qwen4exp MTP: invalid cache-seed capacity or hook");
@@ -1410,6 +1411,47 @@ int ds4_qwen4exp_mtp_head_feed_cache_tail(ds4_qwen4exp_mtp_head *h,
     h->cache_tail_next_token = token;
     if (changed) *changed = true;
     return 0;
+}
+
+int ds4_qwen4exp_mtp_prime_cache_tail(ds4_qwen4exp_mtp_state *st,
+        ds4_qwen4exp_mtp_head *h, int token, uint32_t pos,
+        int budget, int accepted_cap, uint32_t n_ctx, uint32_t n_batch,
+        char *err, size_t errlen) {
+    if (!st || !h)
+        return mtp_fail(err, errlen, "qwen4exp MTP: invalid tail-prime state");
+    /* A known tail may belong to an accepted chain. Keep that path intact,
+     * including changed-parent invalidation in the ordinary cycle. */
+    if (h->cache_tail_prime_disabled || st->depth != 1 || st->n_pending != 0 ||
+        budget < 2 || accepted_cap < 2 || !pos || n_batch < 2u ||
+        (uint64_t)pos + 2u > n_ctx || !h->cache_seed_capacity ||
+        !h->t_cache_tail || !h->cache_tail_valid ||
+        h->cache_tail_next_token != -1 ||
+        (uint64_t)h->cache_tail_pos + 1u != pos || st->head_rows != pos - 1u)
+        return 0;
+    if (token < 0 || (uint32_t)token >= h->n_vocab ||
+        !st->hc_scratch || !st->logits_rows ||
+        st->hc_dim != (uint64_t)h->n_hc * h->n_embd || st->n_vocab != h->n_vocab)
+        return mtp_fail(err, errlen, "qwen4exp MTP: invalid tail-prime input");
+
+    /* HC[pos-1] plus the actual token at pos proposes pos+1. This is the
+     * existing one-row native head, with the retained GPU input copied into
+     * its owned scratch. It runs only once the caller supplies that token. */
+    const uint64_t t0 = mtp_now_ns();
+    int draft = -1;
+    const int rc = mtp_head_forward_impl(h, &token, NULL, pos - 1u, 1u,
+        &draft, NULL, true, h->t_cache_tail, 0u, false, err, errlen);
+    st->counters.draft_ns += mtp_now_ns() - t0;
+    if (rc != 0) return -1;
+    if (draft < 0 || (uint32_t)draft >= st->n_vocab)
+        return mtp_fail(err, errlen, "qwen4exp MTP: invalid tail-prime proposal");
+
+    ds4_qwen4exp_mtp_invalidate(st);
+    st->pending[0] = draft;
+    st->n_pending = 1;
+    st->pending_parent = token;
+    st->head_rows = pos;
+    h->cache_tail_next_token = token;
+    return 1;
 }
 
 
