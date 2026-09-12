@@ -18,9 +18,9 @@ static void write_tensor(ds4_gpu_tensor *p, const void *x, uint64_t n) {
 }
 int main(void) {
     ok(ds4_gpu_init(), "GPU init");
-    const size_t tb = (size_t)CAP * DIM * sizeof(float);
-    const size_t pb = tb / POOL;
-    const size_t rb = (size_t)MAX_ROWS * DIM * sizeof(float);
+    const size_t tb = (size_t)CAP * DIM * sizeof(float) + 64;
+    const size_t pb = (size_t)(CAP / POOL) * DIM * sizeof(float) + 64;
+    const size_t rb = (size_t)MAX_ROWS * DIM * sizeof(float) + 64;
     float *tape = malloc(tb), *pool = malloc(pb), *raw = malloc(rb);
     float *a = malloc(tb), *b = malloc(tb);
     float norm[DIM], inv[ROT / 2];
@@ -53,8 +53,10 @@ int main(void) {
                 write_tensor(pa,pool,pb); write_tensor(p,pool,pb);
                 write_tensor(r,raw,rb);
                 ok(ds4_gpu_qwen4exp_update_dpos(dpos,pos), "update position");
+                setenv("DS4_QWEN4EXP_NO_POOL_APPEND_FUSED","1",1);
                 ok(ds4_gpu_qwen4exp_qsa_indexer_pool_update_tensor(
                        pa,ta,r,n,v,pos,rows,CAP,DIM,POOL,ROT,1e-6f,0.0f), "static pool");
+                unsetenv("DS4_QWEN4EXP_NO_POOL_APPEND_FUSED");
                 int state = graph ? ds4_gpu_decode_graph_begin(&key) : -1;
                 if (state != 1) {
                     /* In graph mode the stale host pos deliberately differs.
@@ -78,6 +80,7 @@ int main(void) {
                             rows,pos,graph,changed);
                     failed++;
                 }
+                ok(ds4_gpu_tensor_read(r,0,b,rb) && !memcmp(b,raw,rb),"raw input intact");
                 cases++;
             }
         }

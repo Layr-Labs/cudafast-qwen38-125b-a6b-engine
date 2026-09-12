@@ -1017,6 +1017,53 @@ static void check_split_path(void) {
     ds4_gpu_tensor_free(t_cnt);
 }
 
+/* Complete output capacities, including inactive cache rows and tail guards. */
+static void check_joint_prep(void) {
+    const size_t q=7u*N_HEAD*HEAD_DIM, k=7u*N_KV_HEAD*HEAD_DIM;
+    const size_t c=16u*N_KV_HEAD*HEAD_DIM;
+    const size_t on[5]={q,q,c,c,k}, sn[6]={2*q,k,k,HEAD_DIM,HEAD_DIM,ROT_DIM/2};
+    ds4_gpu_tensor *o[5], *src[6], *dp=tensor_new(1,4);
+    const ds4_gpu_tensor *in[6];
+    float *ref[5], *buf=xcalloc(2*q+16,4);
+    for (unsigned j=0;j<5;j++) {
+        o[j]=tensor_new(on[j]+16,4); ref[j]=xcalloc(on[j]+16,4);
+    }
+    for (unsigned j=0;j<6;j++) {
+        in[j]=src[j]=tensor_new(sn[j]+16,4);
+        rng_fill(buf,sn[j]); memset(buf+sn[j],0xa7,64);
+        tensor_put(src[j],buf,(sn[j]+16)*4);
+    }
+    const unsigned widths[]={1,2,7}, positions[]={0,3,15,18,UINT32_MAX};
+    unsigned count=0;
+    for (unsigned w=0;w<3;w++) for (unsigned p=0;p<5;p++) for (unsigned ko=0;ko<2;ko++) {
+        unsigned rows=widths[w], pos=positions[p];
+        tensor_put(dp,&pos,4);
+        ds4_gpu_tensor *out[5]={o[0],o[1],o[2],o[3],ko?o[4]:NULL};
+        for (unsigned arm=0;arm<2;arm++) {
+            memset(buf,0x5a,(2*q+16)*4);
+            for (unsigned j=0;j<5;j++) tensor_put(o[j],buf,(on[j]+16)*4);
+            if (arm) require(ds4_gpu_qwen4exp_qsa_prep_joint_dpos_tensor(
+                out,in,rows,N_HEAD,N_KV_HEAD,HEAD_DIM,ROT_DIM,0,16,1e-6f,1,0,dp),"joint prep");
+            else {
+                require(ds4_gpu_qwen4exp_qsa_prep_q_fused_dpos_tensor(
+                    o[0],o[1],in[0],in[3],in[5],rows,N_HEAD,HEAD_DIM,ROT_DIM,0,1e-6f,1,dp),"Q prep");
+                require(ds4_gpu_qwen4exp_qsa_prep_kv_append_fused_dpos_tensor(
+                    o[2],o[3],out[4],in[1],in[2],in[4],in[5],0,rows,N_KV_HEAD,
+                    HEAD_DIM,ROT_DIM,16,1e-6f,0,dp),"KV prep");
+            }
+            for (unsigned j=0;j<5;j++) {
+                tensor_get(o[j],arm?buf:ref[j],(on[j]+16)*4);
+                if (arm) require(!memcmp(buf,ref[j],(on[j]+16)*4),"joint prep bytes");
+            }
+        }
+        count++;
+    }
+    for (unsigned j=0;j<5;j++) {ds4_gpu_tensor_free(o[j]);free(ref[j]);}
+    for (unsigned j=0;j<6;j++) ds4_gpu_tensor_free(src[j]);
+    ds4_gpu_tensor_free(dp);free(buf);
+    printf("  joint Q/KV preparation: %u five-output comparisons\n",count);
+}
+
 int main(void) {
     if (!ds4_gpu_init()) {
         printf("test_qwen4exp_qsa: no GPU backend, skipping\n");
@@ -1090,6 +1137,7 @@ int main(void) {
            "head-group attention", attn_len);
 
     check_split_path();
+    check_joint_prep();
 
     free(ungrouped);
     free(first);

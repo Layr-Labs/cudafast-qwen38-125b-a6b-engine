@@ -7238,155 +7238,52 @@ __global__ static void qwen4exp_rope_head_kernel(
  * Fused Q-Prep & KV-Prep Kernels for QSA Attention
  * ========================================================================= */
 
-__global__ static void qwen4exp_qsa_prep_q_fused_kernel(
-        const float * __restrict__ doubled,
-        const float * __restrict__ weight,
-        const float * __restrict__ inv_freq,
-        float       * __restrict__ q_out,
-        float       * __restrict__ gate_out,
-        uint32_t                   n_tokens,
-        uint32_t                   n_head,
-        uint32_t                   head_dim,
-        uint32_t                   rot_dim,
-        uint32_t                   pos0,
-        float                      eps,
-        float                      weight_offset,
-        const uint32_t *           d_pos) {
-    extern __shared__ float qwen4exp_qprep_shared[];
-
-    const uint32_t head = blockIdx.x;
-    const uint32_t token = blockIdx.y;
-    if (head >= n_head || token >= n_tokens) return;
-
-    const uint32_t tid = threadIdx.x;
-    const uint32_t nth = blockDim.x;
-    const uint32_t q_width = n_head * head_dim;
-
-    const uint64_t doubled_token_base = (uint64_t)token * 2u * q_width;
-    const uint32_t head_base = head * 2u * head_dim;
-
-    /* 1. Load interleaved query and gate */
-    float q_raw = 0.0f;
-    if (tid < head_dim) {
-        q_raw = doubled[doubled_token_base + head_base + tid];
-        const float gate_val = doubled[doubled_token_base + head_base + head_dim + tid];
-        gate_out[(uint64_t)token * q_width + head * head_dim + tid] = gate_val;
+/* Part 0/1 preserve the standalone APIs; Part 2 schedules independent
+ * Q and KV heads in one grid. The per-head arithmetic and barriers are shared. */
+template<int Part, bool KVFirst=false>
+__global__ static void qwen4exp_qsa_prep_joint_kernel(
+        const float *doubled,const float *raw_k,const float *raw_v,
+        const float *qw,const float *kw,const float *inv_freq,
+        float *q_out,float *gate_out,float *k_cache,float *v_cache,float *k_out,
+        uint32_t n_tokens,uint32_t n_head,uint32_t n_head_kv,uint32_t head_dim,
+        uint32_t rot_dim,uint32_t pos0,uint32_t cache_cap,
+        float eps,float q_offset,float k_offset,const uint32_t *d_pos){
+    extern __shared__ float shared[];
+    const uint32_t token=blockIdx.y,tid=threadIdx.x,nth=blockDim.x;
+    const bool is_q=Part==0||(Part==2&&(KVFirst?blockIdx.x>=n_head_kv:blockIdx.x<n_head));
+    const uint32_t head=blockIdx.x-(Part==2?(is_q?(KVFirst?n_head_kv:0u):(KVFirst?0u:n_head)):0u);
+    const uint32_t heads=is_q?n_head:n_head_kv;
+    if(head>=heads||token>=n_tokens)return;
+    const uint32_t width=heads*head_dim;
+    const uint64_t at=(uint64_t)token*width+head*head_dim+tid;
+    const uint64_t src=is_q?(uint64_t)token*2u*width+head*2u*head_dim+tid:at;
+    const uint32_t p0=d_pos?*d_pos:pos0,pos=p0+token;
+    float raw=0.0f;
+    if(tid<head_dim){
+        raw=is_q?doubled[src]:raw_k[src];
+        if(is_q)gate_out[at]=doubled[src+head_dim];
+        else if(pos<cache_cap)v_cache[(uint64_t)pos*width+head*head_dim+tid]=raw_v[at];
     }
-
-    /* 2. Per-head RMS norm */
-    qwen4exp_qprep_shared[tid] = (tid < head_dim) ? (q_raw * q_raw) : 0.0f;
+    shared[tid]=tid<head_dim?raw*raw:0.0f;
     __syncthreads();
-
-    const float sum = qwen4exp_blk_sum(qwen4exp_qprep_shared, tid, nth);
-    const float inv = rsqrtf(sum / (float)head_dim + eps);
+    const float sum=qwen4exp_blk_sum(shared,tid,nth);
+    const float inv=rsqrtf(sum/(float)head_dim+eps);
     __syncthreads();
-
-    if (tid < head_dim) {
-        const float normed_q = q_raw * inv * (weight_offset + weight[tid]);
-        qwen4exp_qprep_shared[tid] = normed_q;
+    if(tid<head_dim)shared[tid]=raw*inv*((is_q?q_offset:k_offset)+(is_q?qw[tid]:kw[tid]));
+    __syncthreads();
+    const uint32_t half=rot_dim/2u;
+    if(tid<half){
+        const float theta=(float)(p0+token)*inv_freq[tid];
+        const float c=cosf(theta),s=sinf(theta),x1=shared[tid],x2=shared[tid+half];
+        shared[tid]=x1*c-x2*s;shared[tid+half]=x2*c+x1*s;
     }
     __syncthreads();
-
-    /* 3. Partial RoPE rotary embedding (rot_half = rot_dim / 2) */
-    const uint32_t p0 = d_pos ? *d_pos : pos0;
-    const uint32_t rot_half = rot_dim / 2u;
-    if (tid < rot_half) {
-        const float theta = (float)(p0 + token) * inv_freq[tid];
-        const float c = cosf(theta);
-        const float s = sinf(theta);
-        const float x1 = qwen4exp_qprep_shared[tid];
-        const float x2 = qwen4exp_qprep_shared[tid + rot_half];
-        qwen4exp_qprep_shared[tid]            = x1 * c - x2 * s;
-        qwen4exp_qprep_shared[tid + rot_half] = x2 * c + x1 * s;
-    }
-    __syncthreads();
-
-    /* 4. Write final query */
-    if (tid < head_dim) {
-        q_out[(uint64_t)token * q_width + head * head_dim + tid] = qwen4exp_qprep_shared[tid];
-    }
-}
-
-__global__ static void qwen4exp_qsa_prep_kv_append_fused_kernel(
-        const float * __restrict__ raw_k,
-        const float * __restrict__ raw_v,
-        const float * __restrict__ weight,
-        const float * __restrict__ inv_freq,
-        float       * __restrict__ k_cache,
-        float       * __restrict__ v_cache,
-        float       * __restrict__ k_out,
-        uint32_t                   pos0,
-        uint32_t                   n_tokens,
-        uint32_t                   n_head_kv,
-        uint32_t                   head_dim,
-        uint32_t                   rot_dim,
-        uint32_t                   cache_cap,
-        float                      eps,
-        float                      weight_offset,
-        const uint32_t *           d_pos) {
-    extern __shared__ float qwen4exp_kvprep_shared[];
-
-    const uint32_t head = blockIdx.x;
-    const uint32_t token = blockIdx.y;
-    if (head >= n_head_kv || token >= n_tokens) return;
-
-    const uint32_t tid = threadIdx.x;
-    const uint32_t nth = blockDim.x;
-    const uint32_t kv_dim = n_head_kv * head_dim;
-    const uint64_t token_elem = (uint64_t)token * kv_dim + head * head_dim + tid;
-    const uint32_t p0 = d_pos ? *d_pos : pos0;
-    const uint32_t pos = p0 + token;
-
-    /* 1. Append V directly into v_cache */
-    if (tid < head_dim) {
-        const float v_val = raw_v[token_elem];
-        if (pos < cache_cap) {
-            v_cache[(uint64_t)pos * kv_dim + head * head_dim + tid] = v_val;
-        }
-    }
-
-    /* 2. Load raw K and compute RMS norm */
-    float k_raw = 0.0f;
-    if (tid < head_dim) {
-        k_raw = raw_k[token_elem];
-    }
-    qwen4exp_kvprep_shared[tid] = (tid < head_dim) ? (k_raw * k_raw) : 0.0f;
-    __syncthreads();
-
-    const float sum = qwen4exp_blk_sum(qwen4exp_kvprep_shared, tid, nth);
-    const float inv = rsqrtf(sum / (float)head_dim + eps);
-    __syncthreads();
-
-    if (tid < head_dim) {
-        const float normed_k = k_raw * inv * (weight_offset + weight[tid]);
-        qwen4exp_kvprep_shared[tid] = normed_k;
-    }
-    __syncthreads();
-
-    /* 3. Partial RoPE on K */
-    const uint32_t rot_half = rot_dim / 2u;
-    if (tid < rot_half) {
-        const float theta = (float)(p0 + token) * inv_freq[tid];
-        const float c = cosf(theta);
-        const float s = sinf(theta);
-        const float x1 = qwen4exp_kvprep_shared[tid];
-        const float x2 = qwen4exp_kvprep_shared[tid + rot_half];
-        qwen4exp_kvprep_shared[tid]            = x1 * c - x2 * s;
-        qwen4exp_kvprep_shared[tid + rot_half] = x2 * c + x1 * s;
-    }
-    __syncthreads();
-
-    if (tid < head_dim) {
-        const float final_k = qwen4exp_kvprep_shared[tid];
-
-        /* 4. Append final K directly to k_cache */
-        if (pos < cache_cap) {
-            k_cache[(uint64_t)pos * kv_dim + head * head_dim + tid] = final_k;
-        }
-
-        /* 5. Also write to k_out (s->qsa_kin) for contract / debugging invariance */
-        if (k_out) {
-            k_out[token_elem] = final_k;
+    if(tid<head_dim){
+        const float value=shared[tid];
+        if(is_q)q_out[at]=value;
+        else{
+            if(pos<cache_cap)k_cache[(uint64_t)pos*width+head*head_dim+tid]=value;
+            if(k_out)k_out[at]=value;
         }
     }
 }
@@ -7409,8 +7306,9 @@ __global__ static void qwen4exp_qsa_tape_append_kernel(
     tape[(uint64_t)pos * head_dim + d] = raw_k[gid];
 }
 
+template<bool Append=false>
 __global__ static void qwen4exp_qsa_pool_update_kernel(
-        const float *tape,
+        float *tape,
         const float *weight,
         const float *inv_freq,
         float *pool,
@@ -7423,25 +7321,51 @@ __global__ static void qwen4exp_qsa_pool_update_kernel(
         float eps,
         float weight_offset,
         const uint32_t *d_pos,
-        uint32_t n_tokens) {
+        uint32_t n_tokens, const float *raw_k=NULL, uint32_t pos0=0) {
     extern __shared__ float qwen4exp_pool_shared[];
     const uint32_t tid = threadIdx.x;
     const uint32_t nth = blockDim.x;
 
     uint32_t block;
-    if (d_pos) {
-        const uint32_t p0 = *d_pos;
-        if (p0 > cache_cap || n_tokens > cache_cap - p0) return;
-        const uint32_t first = p0 / pool_size;
-        const uint32_t end = (p0 + n_tokens) / pool_size;
-        if (blockIdx.x >= end - first) return;
-        block = first + blockIdx.x;
+    if (Append) {
+        const uint32_t p0=d_pos?*d_pos:pos0;
+        if(p0>cache_cap||n_tokens>cache_cap-p0){
+            /* The old append still writes in-range rows on a rejected pool span,
+             * including unsigned position wrap. Preserve those writes exactly. */
+            if(blockIdx.x==0u){
+                const uint64_t count=(uint64_t)n_tokens*head_dim;
+                for(uint64_t i=tid;i<count;i+=nth){
+                    const uint32_t token=(uint32_t)(i/head_dim),d=(uint32_t)(i%head_dim),p=p0+token;
+                    if(p<cache_cap)tape[(uint64_t)p*head_dim+d]=raw_k[i];
+                }
+            }
+            return;
+        }
+        block=p0/pool_size+blockIdx.x;
+        const uint64_t begin=(uint64_t)block*pool_size,end=begin+pool_size;
+        const uint64_t call_end=(uint64_t)p0+n_tokens;
+        if(begin>=call_end||begin>=cache_cap)return;
+        const uint64_t first=begin<p0?p0:begin,last=end<call_end?end:call_end;
+        const uint64_t count=(last-first)*head_dim,src=(first-p0)*head_dim,tape_dst=first*head_dim;
+        for(uint64_t i=tid;i<count;i+=nth)tape[tape_dst+i]=raw_k[src+i];
+        __syncthreads();
+        if(end>call_end||end>cache_cap)return;
     } else {
-        const uint32_t slot = blockIdx.x;
-        if (slot >= n_blocks) return;
-        block = block0 + slot;
+        if (d_pos) {
+            const uint32_t p0 = *d_pos;
+            if (p0 > cache_cap || n_tokens > cache_cap - p0) return;
+            const uint32_t first = p0 / pool_size;
+            const uint32_t end = (p0 + n_tokens) / pool_size;
+            if (blockIdx.x >= end - first) return;
+            block = first + blockIdx.x;
+        } else {
+            const uint32_t slot = blockIdx.x;
+            if (slot >= n_blocks) return;
+            block = block0 + slot;
+        }
+        if ((block + 1u) * pool_size > cache_cap) return;
+
     }
-    if ((block + 1u) * pool_size > cache_cap) return;
 
     float *vec = qwen4exp_pool_shared;
     float *scratch = qwen4exp_pool_shared + head_dim;
@@ -8674,11 +8598,11 @@ extern "C" int ds4_gpu_qwen4exp_qsa_prep_q_fused_dpos_tensor(
     }
     const dim3 grid(n_head, n_tokens);
     const uint32_t nth = qwen4exp_cuda_threads(head_dim);
-    qwen4exp_qsa_prep_q_fused_kernel<<<grid, nth, nth * sizeof(float), cuda_decode_stream()>>>(
-            (const float *)doubled->ptr, (const float *)weight->ptr,
-            (const float *)inv_freq->ptr, (float *)q->ptr, (float *)gate->ptr,
-            n_tokens, n_head, head_dim, rot_dim, pos0, eps, weight_offset,
-            d_pos ? (const uint32_t *)d_pos->ptr : NULL);
+    qwen4exp_qsa_prep_joint_kernel<0><<<grid,nth,nth*sizeof(float),cuda_decode_stream()>>>(
+            (const float*)doubled->ptr,NULL,NULL,(const float*)weight->ptr,NULL,
+            (const float*)inv_freq->ptr,(float*)q->ptr,(float*)gate->ptr,NULL,NULL,NULL,
+            n_tokens,n_head,0,head_dim,rot_dim,pos0,0,eps,weight_offset,0.0f,
+            d_pos?(const uint32_t*)d_pos->ptr:NULL);
     return cuda_ok(cudaGetLastError(), "Qwen4-Exp fused Q-prep launch");
 }
 
@@ -8736,13 +8660,12 @@ extern "C" int ds4_gpu_qwen4exp_qsa_prep_kv_append_fused_dpos_tensor(
     }
     const dim3 grid(n_head_kv, n_tokens);
     const uint32_t nth = qwen4exp_cuda_threads(head_dim);
-    qwen4exp_qsa_prep_kv_append_fused_kernel<<<grid, nth, nth * sizeof(float), cuda_decode_stream()>>>(
-            (const float *)raw_k->ptr, (const float *)raw_v->ptr,
-            (const float *)weight->ptr, (const float *)inv_freq->ptr,
-            (float *)k_cache->ptr, (float *)v_cache->ptr,
-            k_out ? (float *)k_out->ptr : NULL,
-            pos0, n_tokens, n_head_kv, head_dim, rot_dim, cache_cap,
-            eps, weight_offset, d_pos ? (const uint32_t *)d_pos->ptr : NULL);
+    qwen4exp_qsa_prep_joint_kernel<1><<<grid,nth,nth*sizeof(float),cuda_decode_stream()>>>(
+            NULL,(const float*)raw_k->ptr,(const float*)raw_v->ptr,NULL,
+            (const float*)weight->ptr,(const float*)inv_freq->ptr,NULL,NULL,
+            (float*)k_cache->ptr,(float*)v_cache->ptr,k_out?(float*)k_out->ptr:NULL,
+            n_tokens,0,n_head_kv,head_dim,rot_dim,pos0,cache_cap,eps,0.0f,weight_offset,
+            d_pos?(const uint32_t*)d_pos->ptr:NULL);
     return cuda_ok(cudaGetLastError(), "Qwen4-Exp fused KV prep & append launch");
 }
 
@@ -8766,6 +8689,46 @@ extern "C" int ds4_gpu_qwen4exp_qsa_prep_kv_append_fused_tensor(
             k_cache, v_cache, k_out, raw_k, raw_v, weight, inv_freq,
             pos0, n_tokens, n_head_kv, head_dim, rot_dim, cache_cap,
             eps, weight_offset, NULL);
+}
+
+/* out: Q, gate, K cache, V cache, optional K; in: doubled Q, K, V,
+ * Q norm, K norm, inverse frequencies. Overlapping views retain stream order. */
+extern "C" int ds4_gpu_qwen4exp_qsa_prep_joint_dpos_tensor(
+        ds4_gpu_tensor *const out[5], const ds4_gpu_tensor *const in[6],
+        uint32_t rows, uint32_t qh, uint32_t kh, uint32_t dim, uint32_t rot,
+        uint32_t pos, uint32_t cap, float eps, float qo, float ko,
+        const ds4_gpu_tensor *dp) {
+    if (!out || !in || !rows || rows>65535u || !qh || !kh || qh>256u || kh>256u ||
+        !dim || dim>1024u || !rot || rot>dim || rot%2u ||
+        (!dp && (uint64_t)pos+rows>cap)) return 0;
+    const uint64_t qe=(uint64_t)rows*qh*dim, ke=(uint64_t)rows*kh*dim;
+    const uint64_t ce=(uint64_t)cap*kh*dim;
+    const uint64_t oe[5]={qe,qe,ce,ce,ke}, ie[6]={2u*qe,ke,ke,dim,dim,rot/2u};
+    for (unsigned i=0;i<5;i++)
+        if ((i!=4 || out[i]) && !glm53_cuda_tensor_has(out[i],oe[i],4u)) return 0;
+    for (unsigned i=0;i<6;i++) if (!glm53_cuda_tensor_has(in[i],ie[i],4u)) return 0;
+    if (dp && !glm53_cuda_tensor_has(dp,1,4u)) return 0;
+    bool joint=rows<=2u && (dim&(dim-1u))==0u &&
+               getenv("DS4_QWEN4EXP_NO_QSA_PREP_JOINT")==NULL;
+    for (unsigned i=0;joint && i<5;i++) if (out[i]) {
+        for (unsigned j=0;j<6;j++) joint &= qwen4exp_hc_ranges_disjoint(
+                out[i]->ptr,oe[i]*4u,in[j]->ptr,ie[j]*4u);
+        for (unsigned j=0;j<i;j++) if (out[j]) joint &= qwen4exp_hc_ranges_disjoint(
+                out[i]->ptr,oe[i]*4u,out[j]->ptr,oe[j]*4u);
+        if (dp) joint &= qwen4exp_hc_ranges_disjoint(out[i]->ptr,oe[i]*4u,dp->ptr,4u);
+    }
+    if (!joint) return ds4_gpu_qwen4exp_qsa_prep_q_fused_dpos_tensor(
+            out[0],out[1],in[0],in[3],in[5],rows,qh,dim,rot,pos,eps,qo,dp) &&
+        ds4_gpu_qwen4exp_qsa_prep_kv_append_fused_dpos_tensor(
+            out[2],out[3],out[4],in[1],in[2],in[4],in[5],pos,rows,kh,dim,rot,cap,eps,ko,dp);
+    const unsigned nth=qwen4exp_cuda_threads(dim);
+    qwen4exp_qsa_prep_joint_kernel<2><<<dim3(qh+kh,rows),nth,nth*4u,cuda_decode_stream()>>>(
+        (const float*)in[0]->ptr,(const float*)in[1]->ptr,(const float*)in[2]->ptr,
+        (const float*)in[3]->ptr,(const float*)in[4]->ptr,(const float*)in[5]->ptr,
+        (float*)out[0]->ptr,(float*)out[1]->ptr,(float*)out[2]->ptr,(float*)out[3]->ptr,
+        out[4]?(float*)out[4]->ptr:NULL,rows,qh,kh,dim,rot,pos,cap,eps,qo,ko,
+        dp?(const uint32_t*)dp->ptr:NULL);
+    return cuda_ok(cudaGetLastError(),"Qwen4-Exp joint Q/KV preparation launch");
 }
 
 extern "C" int ds4_gpu_qwen4exp_qsa_indexer_pool_update_dpos_tensor(
@@ -8794,6 +8757,30 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_pool_update_dpos_tensor(
         return 0;
     }
     const uint32_t *d_pos_ptr = d_pos ? (const uint32_t *)d_pos->ptr : NULL;
+    /* Each CTA owns one pool block, including its newly appended tape rows.
+     * Larger heads/compression retain the separate parallel append grid. */
+    bool fused = head_dim<=256u && pool_size<=4u && n_tokens<=65535u &&
+                 getenv("DS4_QWEN4EXP_NO_POOL_APPEND_FUSED")==NULL;
+    const ds4_gpu_tensor *outs[2]={tape,pool}, *ins[3]={raw_k,k_norm_weight,inv_freq};
+    const uint64_t ob[2]={(uint64_t)cache_cap*head_dim*4u,
+                         (uint64_t)(cache_cap/pool_size)*head_dim*4u};
+    const uint64_t ib[3]={(uint64_t)n_tokens*head_dim*4u,head_dim*4u,rot_dim/2u*4u};
+    fused &= qwen4exp_hc_ranges_disjoint(tape->ptr,ob[0],pool->ptr,ob[1]);
+    for (unsigned i=0;fused && i<2;i++) {
+        for (unsigned j=0;j<3;j++) fused &= qwen4exp_hc_ranges_disjoint(
+                outs[i]->ptr,ob[i],ins[j]->ptr,ib[j]);
+        if (d_pos) fused &= qwen4exp_hc_ranges_disjoint(outs[i]->ptr,ob[i],d_pos->ptr,4u);
+    }
+    if (fused) {
+        const uint32_t nth=qwen4exp_cuda_threads(head_dim);
+        const uint32_t slots=n_tokens/pool_size+(n_tokens%pool_size!=0u)+1u;
+        const size_t shared=((size_t)head_dim+nth)*sizeof(float);
+        qwen4exp_qsa_pool_update_kernel<true><<<slots,nth,shared,cuda_decode_stream()>>>(
+            (float*)tape->ptr,(const float*)k_norm_weight->ptr,(const float*)inv_freq->ptr,
+            (float*)pool->ptr,0,slots,head_dim,pool_size,rot_dim,cache_cap,eps,
+            weight_offset,d_pos_ptr,n_tokens,(const float*)raw_k->ptr,pos0);
+        return cuda_ok(cudaGetLastError(),"Qwen4-Exp indexer append/pool launch");
+    }
     const uint64_t append = (uint64_t)n_tokens * head_dim;
     qwen4exp_qsa_tape_append_kernel<<<
         (unsigned)((append + 255u) / 256u), 256u, 0, cuda_decode_stream()>>>(
@@ -8811,7 +8798,7 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_pool_update_dpos_tensor(
          * This covers both a ragged boundary crossing and every prefill block. */
         const uint32_t slots = n_tokens / pool_size + (n_tokens % pool_size != 0u);
         qwen4exp_qsa_pool_update_kernel<<<slots, nth, shared, cuda_decode_stream()>>>(
-                (const float *)tape->ptr, (const float *)k_norm_weight->ptr,
+                (float *)tape->ptr, (const float *)k_norm_weight->ptr,
                 (const float *)inv_freq->ptr, (float *)pool->ptr, 0,
                 slots, head_dim, pool_size, rot_dim, cache_cap, eps,
                 weight_offset, d_pos_ptr, n_tokens);
@@ -8824,7 +8811,7 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_pool_update_dpos_tensor(
         if (block1 > block0) {
             qwen4exp_qsa_pool_update_kernel<<<block1 - block0, nth, shared,
                 cuda_decode_stream()>>>(
-                    (const float *)tape->ptr, (const float *)k_norm_weight->ptr,
+                    (float *)tape->ptr, (const float *)k_norm_weight->ptr,
                     (const float *)inv_freq->ptr, (float *)pool->ptr, block0,
                     block1 - block0, head_dim, pool_size, rot_dim, cache_cap, eps,
                     weight_offset, NULL, n_tokens);
