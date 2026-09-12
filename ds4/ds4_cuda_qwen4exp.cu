@@ -3306,6 +3306,26 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                 const int32_t e = Vector ? __shfl_sync(0xffffffffu, route[r], slot)
                     : selected[(uint64_t)t * n_expert_used + slot];
                 if (e < 0 || (uint32_t)e >= n_total_expert) continue;
+                /* Q5_1 down rows are streamed once for each routed slot.  Hint
+                 * the next slot's row while this slot is decoded and dotted;
+                 * its ordinary load remains authoritative on the next pass. */
+                if constexpr (DownType == DS4_QWEN4EXP_TY_q5_1 && Vector) {
+                    if (slot + 1u < n_expert_used) {
+                        const uint32_t next_slot = slot + 1u;
+                        const int32_t next_e = Vector
+                            ? __shfl_sync(0xffffffffu, route[r], next_slot)
+                            : selected[(uint64_t)t * n_expert_used + next_slot];
+                        if (next_e >= 0 && (uint32_t)next_e < n_total_expert &&
+                            lane < groups) {
+                            const char *next_drow = down +
+                                (uint64_t)(uint32_t)next_e * down_expert_bytes +
+                                (uint64_t)row * down_row_bytes;
+                            const cuda_block_q5_1 *next_block =
+                                (const cuda_block_q5_1 *)next_drow + lane;
+                            asm volatile("prefetch.global.L2 [%0];" :: "l"(next_block));
+                        }
+                    }
+                }
                 const char *drow = down +
                     (uint64_t)(uint32_t)e * down_expert_bytes +
                     (uint64_t)row * down_row_bytes;
