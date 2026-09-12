@@ -3076,57 +3076,36 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
              * only ever instantiated for Q4_K, whose decode leaves `halves`
              * at one -- the value passed to the accumulate below.
              *
-             * TWO GROUPS IN FLIGHT.  A lane walks g, g+32, g+64 and adds
-             * them to acc[r] in that order.  The single-group body consumed
-             * its payload immediately, so a lane held one 32-byte read
-             * outstanding and the loop ran at memory latency.  A routed
-             * expert row is read exactly once per call, so there is nothing
-             * to hit in cache and the only lever is reads in flight.  The
-             * body below stages the SECOND group's payload before the FIRST
-             * group's decode consumes its own, keeping one decoded group
-             * live at a time so occupancy is unchanged.
-             *
-             * Nothing is reassociated: same terms, same order, same tail
-             * lanes, same warp_sum_f32 tree, identical bits. */
-#define QWEN4EXP_SPLIT_GROUP(GG, RAWP) do { \
-                const uint32_t g_ = (GG); \
-                int8_t wq[32]; \
-                float wa[2] = {0.0f, 0.0f}; \
-                float wb[2] = {0.0f, 0.0f}; \
-                dev_qwen4exp_group_decode_w((uint32_t)Type, weight_row, g_, \
-                                            (RAWP), wq, wa, wb); \
-                const int halves = 1; \
-                _Pragma("unroll") \
-                for (int r = 0; r < R; r++) { \
-                    if (r < take) { \
-                        const uint64_t at_g = (uint64_t)tok[r] * groups + g_; \
-                        if (Vector) \
-                            qwen4exp_shared_vector_accumulate(&acc[r], wq, wa[0], wb[0], \
-                                xq + at_g * 32u, xs[at_g], xsum[at_g]); \
-                        else \
-                            qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves, \
-                                xq + at_g * 32u, xs[at_g], xsum[at_g]); \
-                    } \
-                } \
-            } while (0)
-            uint32_t g = lane;
-            for (; g + 32u < groups; g += 64u) {
-                uint32_t raw0[8];
-                uint32_t raw1[8];
-                const uint32_t *p0 =
-                    qw_raw_load((uint32_t)Type, weight_row, g, raw0) ? raw0 : NULL;
-                const uint32_t *p1 =
-                    qw_raw_load((uint32_t)Type, weight_row, g + 32u, raw1) ? raw1 : NULL;
-                QWEN4EXP_SPLIT_GROUP(g, p0);
-                QWEN4EXP_SPLIT_GROUP(g + 32u, p1);
-            }
-            for (; g < groups; g += 32u) {
+             * ONE GROUP IN FLIGHT.  A lane walks g, g+32, g+64 and adds them
+             * to acc[r] in that order, consuming each group's payload before
+             * staging the next.  A two-groups-in-flight variant of this body
+             * was promoted and then measured, box-normalised, at about 0.6%
+             * WORSE decode: this kernel is bandwidth- and occupancy-bound, not
+             * latency-bound, so the second staged payload's registers cost
+             * more resident warps than the extra read in flight recovers. */
+            for (uint32_t g = lane; g < groups; g += 32u) {
+                int8_t wq[32];
+                float wa[2] = {0.0f, 0.0f};
+                float wb[2] = {0.0f, 0.0f};
                 uint32_t raw[8];
                 const uint32_t *rawp =
                     qw_raw_load((uint32_t)Type, weight_row, g, raw) ? raw : NULL;
-                QWEN4EXP_SPLIT_GROUP(g, rawp);
+                dev_qwen4exp_group_decode_w((uint32_t)Type, weight_row, g,
+                                            rawp, wq, wa, wb);
+                const int halves = 1;
+#pragma unroll
+                for (int r = 0; r < R; r++) {
+                    if (r < take) {
+                        const uint64_t at_g = (uint64_t)tok[r] * groups + g;
+                        if (Vector)
+                            qwen4exp_shared_vector_accumulate(&acc[r], wq, wa[0], wb[0],
+                                xq + at_g * 32u, xs[at_g], xsum[at_g]);
+                        else
+                            qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves,
+                                xq + at_g * 32u, xs[at_g], xsum[at_g]);
+                    }
+                }
             }
-#undef QWEN4EXP_SPLIT_GROUP
         }
 #pragma unroll
         for (int r = 0; r < R; r++) {
