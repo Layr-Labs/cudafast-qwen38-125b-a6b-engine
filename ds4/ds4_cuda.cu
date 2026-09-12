@@ -17397,8 +17397,9 @@ static int cuda_matmul_q8_0_preq_rows_exact(
     if (use_dp4a && n_rows <= 2u && out_dim > 512u && (in_dim & 31u) == 0u &&
         getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
         (((uintptr_t)wptr & 1u) == 0u)) {
-        /* Real-input first-use timing supports streaming for HC up. Larger
-         * projections retain their ordinary cache policy. */
+        /* Real-input first-use timing supports streaming for HC up, and the
+         * larger projections now stream on the same grounds; see the note on
+         * the general branch below for why nothing here is reused. */
         if (in_dim == 320u && out_dim == 10240u &&
             getenv("DS4_Q8_NO_STREAM_LOADS") == NULL) {
             if (getenv("DS4_Q8_NO_HC_WARP_PAIR") == NULL) {
@@ -17425,12 +17426,45 @@ static int cuda_matmul_q8_0_preq_rows_exact(
             /* Retain the promoted call-width specialization for the
              * general dense projections. The HC warp geometry above is
              * independent of this two-warp kernel's token-row bound. */
+            /* The general dense projections stream too, and they are where
+             * the decode bytes are.  This branch is decode-only (n_rows <= 2
+             * above; prefill takes the MMA path), and inside it a block owns
+             * four DISTINCT output rows at `wr = w + row * blocks * 34u`, so
+             * no block ever re-reads another block's weight bytes and no walk
+             * revisits its own: every weight byte of a projection is read
+             * exactly once per forward.  A caching load therefore allocates a
+             * line that can only be evicted unused, at the cost of the lines
+             * that ARE reused -- xq/xscale, which every output-row block of
+             * the projection reads, and the state and metadata the rest of
+             * the step carries.  Evict-first on the weight half leaves those
+             * alone; the activation loads below the fence keep their ordinary
+             * policy exactly as the HC up projection does.  The hint moves no
+             * value: __ldcs returns the same bytes, so the integer dot, the
+             * float chain and the warp tree are bit for bit the ones the
+             * plain form produced.  The override permits a same-binary A/B. */
+            const bool stream_dense = getenv("DS4_Q8_NO_DENSE_STREAM") == NULL;
             if (n_rows == 1u && getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL) {
                 /* PDL consumer: the stream predecessor is the decode
                  * quantizer, which triggers at its top (decode widths). */
+                if (stream_dense) {
+                    QWEN4EXP_LAUNCH_PDL(
+                            (matmul_q8_0_preq_pair_lanes_kernel<1, true>),
+                            (dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u)),
+                            256, 0, cuda_decode_stream(),
+                            (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
+                            out_dim, n_rows, blocks);
+                } else {
+                    QWEN4EXP_LAUNCH_PDL(
+                            (matmul_q8_0_preq_pair_lanes_kernel<1, false>),
+                            (dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u)),
+                            256, 0, cuda_decode_stream(),
+                            (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
+                            out_dim, n_rows, blocks);
+                }
+            } else if (stream_dense) {
                 QWEN4EXP_LAUNCH_PDL(
-                        (matmul_q8_0_preq_pair_lanes_kernel<1, false>),
-                        (dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u)),
+                        (matmul_q8_0_preq_pair_lanes_kernel<2, true>),
+                        (dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u)),
                         256, 0, cuda_decode_stream(),
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
                         out_dim, n_rows, blocks);

@@ -5550,7 +5550,38 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     const uint64_t mq_bytes = qwen4exp_quant_bytes(n_pairs, mgroups);
     const uint64_t task_capacity = (uint64_t)n_pairs / QW_MMA_BN +
         (n_pairs < n_total_expert ? n_pairs : n_total_expert);
-    const bool pair_tasks = n_tokens >= 64u && n_total_expert <= 512u &&
+    /* PAIR TASKS COST WEIGHT READS.  A task is (expert, chunk of QW_MMA_BN
+     * pairs), and each task's block stages that expert's gate and up rows for
+     * its own row slice from global memory.  So the gate/up weight stream is
+     * proportional to sum_e ceil(cnt_e / QW_MMA_BN), not to the number of
+     * active experts: every expert in the routing tail that holds more than a
+     * chunk pays another full read of both projections, and gate+up is two
+     * thirds of the routed expert bytes.  The PairTasks=false branch of the
+     * tile walks all of an expert's chunks inside one block instead, so it
+     * reads those rows exactly once whatever the count is.
+     *
+     * What the split buys is load balance across blockIdx.y.  That is only
+     * worth a read when the grid needs the extra blocks, and the OTHER grid
+     * dimension already supplies mid_dim / QW_MMA_BM of them per expert.  At
+     * the widths this gate admits that product is thousands of blocks for a
+     * few dozen SMs, so the device is saturated many waves over before any
+     * expert is split and the extra traffic buys nothing schedulable.
+     *
+     * Note the two paths are the SAME work whenever every count fits one
+     * chunk: ceil(cnt/BN) is then 1 for every expert, the task list is the
+     * active list, and grid.y matches.  The paths can only diverge where an
+     * expert exceeds a chunk, and there this trades a re-read for serialising
+     * that expert's chunks in one block.  Per (row, pair) output element the
+     * group walk and its accumulation order are untouched either way, so the
+     * result is bit for bit the one the split produced.
+     *
+     * The override restores the split for a same-binary A/B. */
+    const uint64_t gu_row_blocks = (mid_dim % QW_MMA_BM) == 0
+        ? (uint64_t)(mid_dim / QW_MMA_BM) * n_total_expert : 0u;
+    const bool gu_grid_saturated = gu_row_blocks >= 2048u &&
+        getenv("DS4_QWEN4EXP_FORCE_GU_PAIR_TASKS") == NULL;
+    const bool pair_tasks = !gu_grid_saturated &&
+        n_tokens >= 64u && n_total_expert <= 512u &&
         task_capacity <= 65535u && n_pairs <= 0x7fffffe0u &&
         (mid_dim % QW_MMA_BM) == 0 && (xgroups % QW_MMA_G) == 0 &&
         gate_slab->type == up_slab->type &&

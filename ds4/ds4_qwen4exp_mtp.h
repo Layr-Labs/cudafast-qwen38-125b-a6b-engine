@@ -128,9 +128,6 @@
  * `multi` row while writing its own, so they cannot be one buffer. */
 #define DS4_QWEN4EXP_MTP_HC_ROWS (DS4_QWEN4EXP_MTP_MAX_COMMIT + 2)
 
-/* Fixed input-workspace bound for native prompt-cache publication. */
-#define DS4_QWEN4EXP_MTP_CACHE_SEED_MAX_ROWS 128u
-
 /*
  * tools/serve-up.sh sets DS4_MTP_DRAFT_TOKENS = declared draft length + 1,
  * because ds4 counts the fed token; harness/protocol-adapter reads the same
@@ -571,11 +568,6 @@ typedef int (*ds4_qwen4exp_block_forward_fn)(
 int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
                                   ds4_gpu_tensor *hyper, uint32_t il,
                                   uint32_t pos0, uint32_t n_tokens);
-/* Publish only the head's K/V and indexer state from EH-projected rows.
- * No query, attention output, FFN or vocabulary output is requested. */
-int ds4_qwen4exp_graph_head_cache(void *graph, void *cache,
-                                  ds4_gpu_tensor *hyper, uint32_t il,
-                                  uint32_t pos0, uint32_t n_tokens);
 
 /*
  * The shared primitives the head composes, typed from the declarations the
@@ -636,7 +628,6 @@ typedef struct {
     int (*native_map)(ds4_gpu_tensor *, const ds4_gpu_tensor *,
                       const ds4_gpu_tensor *, uint32_t, uint32_t);
     ds4_qwen4exp_block_forward_fn block;
-    ds4_qwen4exp_block_forward_fn cache_seed; /* optional cache-only hook */
 } ds4_qwen4exp_mtp_gpu_hooks;
 
 /* One output row of a Q8_0 weight as it lies in the mapping: ceil(in_dim / 32)
@@ -691,13 +682,6 @@ typedef struct {
     uint32_t n_lowrank;
     uint32_t n_vocab;
     uint32_t max_tokens;           /* rows one forward may carry             */
-    /* Independently bounded input capacity. Logits and final-output scratch
-     * remain sized by max_tokens. Zero disables prompt-cache publication. */
-    uint32_t cache_seed_capacity;
-    ds4_gpu_tensor *t_cache_tail;   /* one retained target HC row */
-    uint32_t cache_tail_pos;
-    int cache_tail_next_token;      /* -1 until its actual next token is known */
-    bool cache_tail_valid;
 
     /* The DRAFT shortlist over the borrowed LM head.  Set once by init() from
      * DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX (0, the default: off, the draft projects
@@ -769,25 +753,6 @@ void ds4_qwen4exp_mtp_default_hooks(ds4_qwen4exp_mtp_gpu_hooks *hooks);
 
 int  ds4_qwen4exp_mtp_head_init(ds4_qwen4exp_mtp_head *h, char *err, size_t errlen);
 void ds4_qwen4exp_mtp_head_free(ds4_qwen4exp_mtp_head *h);
-
-/* Request-local prefix state; reset never allocates or changes vocab policy. */
-void ds4_qwen4exp_mtp_head_reset_cache(ds4_qwen4exp_mtp_head *h);
-/* Copy target HC rows directly from an existing device tensor, then publish
- * head cache rows at pos0. next_tokens[t] is the token AFTER HC row t.
- * This never proposes tokens or changes the draft vocabulary policy. */
-int ds4_qwen4exp_mtp_head_seed_cache(ds4_qwen4exp_mtp_head *h,
-        const int *next_tokens, const ds4_gpu_tensor *target_hyper,
-        uint32_t first_hyper_row, uint32_t pos0, uint32_t n_tokens,
-        char *err, size_t errlen);
-/* Keep one target HC row until its actual next input is known. known_next is
- * -1 for a serial frontier, or the token already used by a speculative head.
- * feed_cache_tail returns 0 on success, -1 on failure; changed says whether
- * that row was newly computed, so the caller can update head_rows. */
-int ds4_qwen4exp_mtp_head_retain_cache_tail(ds4_qwen4exp_mtp_head *h,
-        const ds4_gpu_tensor *target_hyper, uint32_t first_hyper_row,
-        uint32_t pos, int known_next, char *err, size_t errlen);
-int ds4_qwen4exp_mtp_head_feed_cache_tail(ds4_qwen4exp_mtp_head *h,
-        int token, uint32_t pos, bool *changed, char *err, size_t errlen);
 
 /*
  * One head forward.
