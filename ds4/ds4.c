@@ -152,6 +152,7 @@ static uint32_t metal_graph_cuda_tp_output_tiers_for_head(
 /* Decode-island graph capture is CUDA-only; Metal decodes eagerly. */
 int ds4_gpu_decode_graphs_supported(void) { return 0; }
 int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) { (void)key; return -1; }
+int ds4_gpu_decode_graph_prefetch(const ds4_decode_graph_key *key) { (void)key; return 0; }
 int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) { (void)key; return -1; }
 void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key) { (void)key; }
 void ds4_gpu_decode_graphs_invalidate(void) {}
@@ -17229,6 +17230,7 @@ typedef struct ds4_decode_graph_key {
 } ds4_decode_graph_key;
 static inline int ds4_gpu_decode_graphs_supported(void) { return 0; }
 static inline int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) { (void)key; return -1; }
+static inline int ds4_gpu_decode_graph_prefetch(const ds4_decode_graph_key *key) { (void)key; return 0; }
 static inline int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) { (void)key; return -1; }
 static inline void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key) { (void)key; }
 static inline void ds4_gpu_decode_graphs_invalidate(void) {}

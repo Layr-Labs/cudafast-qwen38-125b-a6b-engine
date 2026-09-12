@@ -2307,11 +2307,11 @@ static bool qwen4exp_forward_fail(void) {
 /* The PLE host gather and token/position uploads precede this device-only
  * layer stack.  A captured stack retains the same operations and scratch
  * addresses while replacing the per-layer graph launch train with one call. */
-static bool qwen4exp_graph_layers_encode(
+static bool qwen4exp_graph_layers_encode_range(
         ds4_qwen4exp_session *s, const ds4_qwen4exp_weights *w,
-        const ds4_model *m, uint32_t n_tokens, bool use_islands) {
-    const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
-    for (uint32_t il = 0; il < cfg->n_layer; il++) {
+        const ds4_model *m, uint32_t n_tokens, bool use_islands,
+        uint32_t il_first, uint32_t il_last) {
+    for (uint32_t il = il_first; il < il_last; il++) {
         const ds4_qwen4exp_layer_weights *l = &w->layer[il];
 
         /* --- per-layer n-gram embedding, one block only ----------------
@@ -2354,6 +2354,114 @@ static bool qwen4exp_graph_layers_encode(
     return true;
 }
 
+static bool qwen4exp_graph_layers_encode(
+        ds4_qwen4exp_session *s, const ds4_qwen4exp_weights *w,
+        const ds4_model *m, uint32_t n_tokens, bool use_islands) {
+    return qwen4exp_graph_layers_encode_range(s, w, m, n_tokens, use_islands,
+                                              0u, g_ds4_qwen4exp.n_layer);
+}
+
+/* How many consecutive captures the target stack is cut into.  1 is the single
+ * whole-stack capture, which is what this build did before; the default trades
+ * one long launch against an idle GPU for one short one plus launches that
+ * overlap the device work already queued. */
+#define QW_DECODE_GRAPH_MAX_CHUNKS 8u
+
+static uint32_t qw_decode_graph_chunks(void) {
+    static int init = 0;
+    static uint32_t chunks = 4u;   /* the A/B's pick; 1 restores the single capture */
+    if (!init) {
+        init = 1;
+        const char *s = getenv("DS4_CUDA_DECODE_GRAPH_CHUNKS");
+        if (s && s[0]) {
+            char *end = NULL;
+            long v = strtol(s, &end, 10);
+            if (end != s && v >= 1 && v <= (long)QW_DECODE_GRAPH_MAX_CHUNKS) {
+                chunks = (uint32_t)v;
+            }
+        }
+    }
+    return chunks;
+}
+
+#ifdef DS4_TEST_HOOKS
+/* A replayed chunk runs no host call site, so the logical slice trace the test
+ * hooks compare against has to be emitted for the layers it covered. */
+static void qw_decode_graph_trace_range(const ds4_qwen4exp_weights *w,
+                                        uint32_t il_first, uint32_t il_last) {
+    for (uint32_t il = il_first; il < il_last; il++) {
+        const ds4_qwen4exp_layer_weights *l = &w->layer[il];
+        if (l->has_ple) QW_TRACE(QW_SLICE_PLE);
+        QW_TRACE(QW_SLICE_ATTN_MIX);
+        QW_TRACE(l->is_full_attention ? QW_SLICE_QSA : QW_SLICE_GDN);
+        QW_TRACE(QW_SLICE_ATTN_INJECT);
+        QW_TRACE(QW_SLICE_FFN_MIX);
+        QW_TRACE(QW_SLICE_MOE);
+        QW_TRACE(QW_SLICE_FFN_INJECT);
+    }
+}
+#endif
+
+/* One chunk: replay it, capture it, or encode it eagerly, in that order of
+ * preference.  Returns false only when the layers could not be encoded at all.
+ * Every outcome leaves the chunk's work on the stream in stack order, so a
+ * mixed forward (some chunks replayed, some eager) is the same computation --
+ * the capture stream is a blocking stream, so it orders against the legacy
+ * stream the eager path uses. */
+static bool qw_decode_graph_chunk(ds4_qwen4exp_session *s,
+                                  const ds4_qwen4exp_weights *w,
+                                  const ds4_model *m, uint32_t n_tokens,
+                                  uint32_t chunk, uint32_t il_first,
+                                  uint32_t il_last) {
+    ds4_decode_graph_key key;
+    memset(&key, 0, sizeof(key));
+    /* Chunk index as the layer slot: island three has no per-layer entry, so
+     * chunk c and the per-layer caches of layer c cannot collide. */
+    key.il = chunk;
+    key.island = 3u;
+    key.variant = n_tokens | (s->spec_snapshot_rows << 8u);
+    key._pad = 0x51575343u; /* QWSC: one chunk of the target layer stack */
+    key.cur_hc = s->hyper;
+    key.after_attn_hc = s;
+    key.after_ffn_hc = (void *)w;
+    key.attn_norm = (void *)m;
+    const int state = ds4_gpu_decode_graph_begin(&key);
+    if (state == 1) {
+#ifdef DS4_TEST_HOOKS
+        qw_decode_graph_trace_range(w, il_first, il_last);
+#endif
+        /* Upload the NEXT chunk while the device runs this one, so its launch
+         * finds the graph resident instead of uploading it in front of an idle
+         * GPU.  A miss is a no-op. */
+        if (il_last < g_ds4_qwen4exp.n_layer) {
+            ds4_decode_graph_key next = key;
+            next.il = chunk + 1u;
+            (void)ds4_gpu_decode_graph_prefetch(&next);
+        }
+        return true;
+    }
+    if (state == 0) {
+#ifdef DS4_TEST_HOOKS
+        const uint32_t trace_len = g_qwen4exp_trace_len;
+        const bool trace_overflow = g_qwen4exp_trace_overflow;
+#endif
+        if (qwen4exp_graph_layers_encode_range(s, w, m, n_tokens, false,
+                                               il_first, il_last)) {
+            if (ds4_gpu_decode_graph_end(&key) == 0) return true;
+        } else {
+            ds4_gpu_decode_graph_abort(&key);
+            return false;
+        }
+#ifdef DS4_TEST_HOOKS
+        g_qwen4exp_trace_len = trace_len;
+        g_qwen4exp_trace_overflow = trace_overflow;
+#endif
+        /* A failed capture executed no kernels; fall through and encode. */
+    }
+    return qwen4exp_graph_layers_encode_range(s, w, m, n_tokens, true,
+                                              il_first, il_last);
+}
+
 static bool qwen4exp_graph_layers(
         ds4_qwen4exp_session *s, const ds4_qwen4exp_weights *w,
         const ds4_model *m, uint32_t n_tokens) {
@@ -2366,6 +2474,32 @@ static bool qwen4exp_graph_layers(
     /* Layer dumps synchronize and must execute every host call site. */
     capture_ok = capture_ok && !qwen4exp_layer_dump_on();
 #endif
+    /* WHY A CHUNK BOUNDARY CARRIES NO STATE.  The only host state that flows
+     * between layers of this stack is the deferred residual inject
+     * (s->hc_pending), and the deferral is prefill-only: qwen4exp_hc_defer_ok
+     * requires n_tokens >= DS4_QWEN4EXP_HC_DEFER_MIN_ROWS (48), while
+     * capture_ok requires n_tokens <= DS4_QWEN4EXP_MTP_MAX_COMMIT.  So at
+     * every width that captures, hc_pending is false at every layer boundary
+     * -- the forward clears it on entry and nothing in a decode-width layer
+     * sets it.  Cutting the capture at a layer boundary therefore cannot move
+     * an inject across it, and a forward that replays some chunks and encodes
+     * others is the same computation in the same order. */
+    if (capture_ok && qw_decode_graph_chunks() > 1u) {
+        const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
+        uint32_t chunks = qw_decode_graph_chunks();
+        if (chunks > cfg->n_layer) chunks = cfg->n_layer;
+        const uint32_t per = (cfg->n_layer + chunks - 1u) / chunks;
+        for (uint32_t c = 0; c < chunks; c++) {
+            const uint32_t il_first = c * per;
+            if (il_first >= cfg->n_layer) break;
+            uint32_t il_last = il_first + per;
+            if (il_last > cfg->n_layer) il_last = cfg->n_layer;
+            if (!qw_decode_graph_chunk(s, w, m, n_tokens, c, il_first, il_last)) {
+                return false;
+            }
+        }
+        return true;
+    }
     if (capture_ok) {
         ds4_decode_graph_key key;
         memset(&key, 0, sizeof(key));
