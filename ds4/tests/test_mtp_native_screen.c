@@ -27,8 +27,11 @@ static void run_case(int adversarial, uint32_t offset) {
     need(w!=MAP_FAILED,"host weights");
     for(uint32_t row=0;row<VOCAB;row++) for(uint32_t b=0;b<80;b++) {
         unsigned char *p=w+offset+(uint64_t)row*ROW+b*34;
-        p[0]=0;p[1]=(adversarial==2 && row==0)?0x7e:0x3c; /* half NaN or 1 */
+        p[0]=0;p[1]=(adversarial>=2 && row==0)
+            ?(adversarial==2?0x7e:adversarial==3?0x7c:0xfc):0x3c;
+        /* Exceptional row scales: NaN, +infinity or -infinity. */
         for(unsigned j=2;j<34;j++) p[j]=adversarial?0:(unsigned char)((int)(rnd()%15)-7);
+        if(adversarial>=3 && row==0) memset(p+2,1,32);
         /* Last prefix row has negative screen, positive complete dot. All
          * other rows tie at zero, so its omission is inevitable and explicit. */
         if(adversarial && row==PREFIX-1) memset(p+2,b<40?255:2,32);
@@ -36,7 +39,7 @@ static void run_case(int adversarial, uint32_t offset) {
     need(ds4_gpu_init(),"GPU init");need(ds4_gpu_set_model_map(w,bytes),"register weights");
     uint64_t scratch_bytes=0;uint32_t cap=0;
     need(ds4_gpu_mtp_native_screen_init(WIDTH,&scratch_bytes,&cap)==1 && cap==CAP,"scratch query");
-    ds4_gpu_tensor *x=ds4_gpu_tensor_alloc(DIM*4),*out=ds4_gpu_tensor_alloc(CAP*4),
+    ds4_gpu_tensor *x=ds4_gpu_tensor_alloc(DIM*4),*out=ds4_gpu_tensor_alloc(WIDTH*4),
         *ids=ds4_gpu_tensor_alloc(CAP*4),*scratch=ds4_gpu_tensor_alloc(scratch_bytes),
         *full=ds4_gpu_tensor_alloc(PREFIX*4),*tail=ds4_gpu_tensor_alloc(TAIL*4),
         *winner=ds4_gpu_tensor_alloc(4);
@@ -45,8 +48,33 @@ static void run_case(int adversarial, uint32_t offset) {
     for(unsigned replay=0;replay<(adversarial?1u:3u);replay++) {
         for(unsigned i=0;i<DIM;i++) activation[i]=adversarial?1.0f:(int)(rnd()%201)*0.01f-1.0f;
         need(ds4_gpu_tensor_write(x,0,activation,sizeof activation),"current activation");
-        if(adversarial==2) {
+        if(adversarial>=2) {
             need(ds4_gpu_mtp_native_screen(out,ids,scratch,w,bytes,offset,DIM,VOCAB,PREFIX,TAIL,x)==0,"nonfinite score fallback");
+            if(getenv("DS4_MTP_EARLY_SCREEN_CHECK")==NULL) {
+                need(ds4_gpu_tensor_read(ids,0,found,sizeof found),"rejected IDs read");
+                for(unsigned i=0;i<CAP;i++) {
+                    need(i==0||found[i]>found[i-1],"rejected IDs unique");
+                    need(found[i]<PREFIX || (found[i]>=VOCAB-TAIL && found[i]<VOCAB),"rejected IDs in domain");
+                }
+            }
+            float unchanged[DIM],packed[WIDTH];
+            need(ds4_gpu_tensor_read(x,0,unchanged,sizeof unchanged)&&
+                 !memcmp(activation,unchanged,sizeof activation),"rejected call preserves activation");
+            need(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(full,w,bytes,offset,DIM,PREFIX,x,1)&&
+                 ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(tail,w,bytes,offset+(uint64_t)(VOCAB-TAIL)*ROW,DIM,TAIL,x,1),"fallback oracle");
+            need(ds4_gpu_tensor_read(full,0,reference,sizeof reference)&&ds4_gpu_tensor_read(tail,0,tail_ref,sizeof tail_ref),"fallback oracle read");
+            need(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(out,w,bytes,offset,DIM,PREFIX,x,1)&&
+                 ds4_gpu_tensor_copy(out,PREFIX*4ull,tail,0,TAIL*4ull),"fallback overwrites rejected refinement");
+            need(ds4_gpu_tensor_read(out,0,packed,sizeof packed)&&
+                 !memcmp(packed,reference,sizeof reference)&&
+                 !memcmp(packed+PREFIX,tail_ref,sizeof tail_ref),"complete fallback output parity");
+            /* Aliased generic callers retain the old early refusal seam. */
+            ds4_gpu_tensor *alias=ds4_gpu_tensor_view(out,0,DIM*4u);
+            need(alias&&ds4_gpu_tensor_write(alias,0,activation,sizeof activation),"alias activation");
+            need(ds4_gpu_mtp_native_screen(out,ids,scratch,w,bytes,offset,DIM,VOCAB,PREFIX,TAIL,alias)==0,"alias early fallback");
+            need(ds4_gpu_tensor_read(alias,0,unchanged,sizeof unchanged)&&
+                 !memcmp(activation,unchanged,sizeof activation),"alias fallback preserves input");
+            ds4_gpu_tensor_free(alias);
             goto cleanup;
         }
         need(ds4_gpu_mtp_native_screen(out,ids,scratch,w,bytes,offset,DIM,VOCAB,PREFIX,TAIL,x)==CAP,"screen active");
@@ -98,4 +126,14 @@ cleanup:
     ds4_gpu_tensor_free(full);ds4_gpu_tensor_free(tail);ds4_gpu_tensor_free(winner);
     ds4_gpu_cleanup();munmap(w,bytes);
 }
-int main(void){setenv("DS4_CUDA_DECODE_GRAPHS","1",1);run_case(0,0);run_case(0,2);run_case(1,0);run_case(2,0);puts("native screen contracts pass (selection deliberately approximate)");return 0;}
+int main(void) {
+    setenv("DS4_CUDA_DECODE_GRAPHS","1",1);
+    for(unsigned early=0;early<2;early++) {
+        if(early)setenv("DS4_MTP_EARLY_SCREEN_CHECK","1",1);
+        else unsetenv("DS4_MTP_EARLY_SCREEN_CHECK");
+        run_case(0,0);run_case(0,2);run_case(1,0);
+        run_case(2,0);run_case(3,0);run_case(4,2);
+    }
+    unsetenv("DS4_MTP_EARLY_SCREEN_CHECK");
+    puts("native screen contracts pass (selection deliberately approximate)");return 0;
+}

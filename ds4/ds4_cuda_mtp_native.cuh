@@ -165,6 +165,25 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
                                           tier, "native MTP output");
     if (!w) return -1;
     if ((uintptr_t)w & 1u) return 0;
+    /* Queue through refinement before waiting only when rejected-call writes
+     * cannot alter inputs or scratch dependencies. Aliases retain the old
+     * early check; production owns these four allocations independently. */
+    const auto disjoint = [](const void *a, uint64_t an, const void *b, uint64_t bn) {
+        const uintptr_t ap = (uintptr_t)a, bp = (uintptr_t)b;
+        return an <= UINTPTR_MAX - ap && bn <= UINTPTR_MAX - bp &&
+               (ap + an <= bp || bp + bn <= ap);
+    };
+    bool queue_before_check = getenv("DS4_MTP_EARLY_SCREEN_CHECK") == nullptr;
+    const ds4_gpu_tensor *buffers[] = {out, ids, scratch, x};
+    for (unsigned i = 0; i < 4; i++) {
+        for (unsigned j = 0; j < i; j++)
+            queue_before_check &= disjoint(buffers[i]->ptr, buffers[i]->bytes,
+                                           buffers[j]->ptr, buffers[j]->bytes);
+        if (i < 3)
+            queue_before_check &= disjoint(buffers[i]->ptr, buffers[i]->bytes,
+                                           w, (uint64_t)vocab * 80u * 34u);
+    }
+
     char *base = (char *)scratch->ptr;
     int8_t *xq = (int8_t *)base;
     float *xs = (float *)(base + MTP_NATIVE_DIM);
@@ -184,8 +203,10 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
         key_in,flag,scores,width,prefix,tail,vocab);
     if (!cuda_ok(cudaGetLastError(),"native screen keys")) return -1;
     uint32_t invalid = 0;
-    if (!ds4_gpu_tensor_read(scratch,l.flag,&invalid,4)) return -1;
-    if (invalid) return 0;
+    if (!queue_before_check) {
+        if (!ds4_gpu_tensor_read(scratch,l.flag,&invalid,4)) return -1;
+        if (invalid) return 0;
+    }
     size_t temporary = (size_t)(scratch->bytes-l.temporary);
     if (!cuda_ok(cub::DeviceRadixSort::SortKeysDescending(base+l.temporary,temporary,
             key_in,key_out,width,0,64,cuda_decode_stream()),"native score sort")) return -1;
@@ -198,7 +219,12 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
     mtp_native_projection_kernel<false><<<(MTP_NATIVE_CAP+3u)/4u,256,0,cuda_decode_stream()>>>(
         (float *)out->ptr,(const unsigned char *)w,xq,xs,MTP_NATIVE_CAP,1,80,
         (const uint32_t *)ids->ptr,vocab,prefix,tail);
-    return cuda_ok(cudaGetLastError(),"native exact refinement") ? (int)MTP_NATIVE_CAP : -1;
+    if (!cuda_ok(cudaGetLastError(),"native exact refinement")) return -1;
+    if (queue_before_check) {
+        if (!ds4_gpu_tensor_read(scratch,l.flag,&invalid,4)) return -1;
+        if (invalid) return 0;
+    }
+    return (int)MTP_NATIVE_CAP;
 }
 __global__ static void mtp_native_map(uint32_t *winner, const float *logits,
                                       const uint32_t *ids, uint32_t count, uint32_t vocab) {
