@@ -132,6 +132,12 @@ void ds4_qwen4exp_session_plan_compute(ds4_qwen4exp_session_plan *plan,
      * every compared row's distribution out of one forward, so the LM head
      * runs once over the whole chain instead of once per row afterwards. */
     act += (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * cfg->n_vocab * f;
+    /* Optional compact target-head screening reuses the native MTP
+     * coarse/refine implementation.  Keep a fixed, conservative scratch
+     * allowance in the admission plan; the runtime only allocates it when
+     * CUB reports that the current vocabulary fits. */
+    act += 32ull * 1024ull * 1024ull;
+    act += (uint64_t)cfg->n_vocab * sizeof(uint32_t);
     plan->activation_bytes = act;
     act += ds4_qwen4exp_qsa_split_bytes(
         (uint32_t)qwen4exp_qsa_split_rows(B), DS4_N_HEAD, DS4_N_HEAD_DIM,
@@ -391,6 +397,9 @@ struct ds4_qwen4exp_session {
 
     ds4_gpu_tensor *logits;
     ds4_gpu_tensor *spec_top1;
+    ds4_gpu_tensor *target_native_scratch;
+    ds4_gpu_tensor *target_native_ids;
+    uint32_t        target_native_capacity;
 
     /* PREFILL ONLY.  True while `hyper` still owes the last block's inject:
      * the value the model means is hyper + block_out * inject, and the next
@@ -785,6 +794,23 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
             (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * cfg->n_vocab * f, &ok);
     s->spec_top1     = qwen4exp_alloc_zeroed(
             (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * sizeof(int32_t), &ok);
+    s->target_native_scratch = NULL;
+    s->target_native_ids = NULL;
+    s->target_native_capacity = 0u;
+    if (ok && cfg->n_vocab > 1u) {
+        uint64_t need = 0u;
+        uint32_t capacity = 0u;
+        const int native = ds4_gpu_mtp_native_screen_init(
+                cfg->n_vocab, &need, &capacity);
+        if (native > 0 && need <= 32ull * 1024ull * 1024ull &&
+            capacity && capacity <= cfg->n_vocab) {
+            s->target_native_scratch = qwen4exp_alloc_zeroed(
+                    32ull * 1024ull * 1024ull, &ok);
+            s->target_native_ids = qwen4exp_alloc_zeroed(
+                    (uint64_t)cfg->n_vocab * sizeof(uint32_t), &ok);
+            if (ok) s->target_native_capacity = capacity;
+        }
+    }
 #ifdef DS4_TEST_HOOKS
     s->final_mixer_snapshot = qwen4exp_alloc_zeroed(B * H * E * f, &ok);
 #endif
@@ -862,6 +888,8 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->shexp_gate);
     ds4_gpu_tensor_free(s->logits);
     ds4_gpu_tensor_free(s->spec_top1);
+    ds4_gpu_tensor_free(s->target_native_scratch);
+    ds4_gpu_tensor_free(s->target_native_ids);
 #ifdef DS4_TEST_HOOKS
     ds4_gpu_tensor_free(s->final_mixer_snapshot);
 #endif
@@ -2418,6 +2446,58 @@ static bool qwen4exp_graph_layers(
     return qwen4exp_graph_layers_encode(s, w, m, n_tokens, true);
 }
 
+/* Compact target-head top-1 for speculative verification.  The final mixer
+ * and LM head live after the captured layer island, so the existing native
+ * MTP screen can safely perform its fixed scratch sort here.  Every selected
+ * row is refined with the complete 80-group dot before top-1. */
+static int qwen4exp_target_native_top1(
+        ds4_qwen4exp_session       *s,
+        const ds4_qwen4exp_weights *w,
+        const ds4_model            *m,
+        const ds4_gpu_tensor       *x,
+        uint32_t                    rows) {
+    const uint32_t vocab = g_ds4_qwen4exp.n_vocab;
+    if (!s->target_native_scratch || !s->target_native_ids ||
+        !s->target_native_capacity || !rows || vocab <= 1u ||
+        getenv("DS4_QWEN4EXP_NO_TARGET_NATIVE_SCREEN") != NULL) {
+        return 0;
+    }
+    for (uint32_t r = 0; r < rows; r++) {
+        ds4_gpu_tensor *xrow = ds4_gpu_tensor_view(
+                (ds4_gpu_tensor *)x,
+                (uint64_t)r * DS4_N_EMBD * sizeof(float),
+                (uint64_t)DS4_N_EMBD * sizeof(float));
+        ds4_gpu_tensor *winner = ds4_gpu_tensor_view(
+                s->spec_top1, (uint64_t)r * sizeof(uint32_t),
+                sizeof(uint32_t));
+        if (!xrow || !winner) {
+            ds4_gpu_tensor_free(xrow);
+            ds4_gpu_tensor_free(winner);
+            return -1;
+        }
+        const int count = ds4_gpu_mtp_native_screen(
+                s->logits, s->target_native_ids,
+                s->target_native_scratch,
+                QW_MAP(m, w->output), QW_MAPSZ(m, w->output),
+                QW_OFF(w->output), DS4_N_EMBD, vocab,
+                vocab - 1u, 1u, xrow);
+        int ok = count >= 0;
+        if (count > 0) {
+            ok = (uint32_t)count == s->target_native_capacity &&
+                 ds4_gpu_indexer_topk_tensor(
+                         winner, s->logits, (uint32_t)count, 1u, 1u) != 0 &&
+                 ds4_gpu_mtp_native_map(
+                         winner, s->logits, s->target_native_ids,
+                         (uint32_t)count, vocab) != 0;
+        }
+        ds4_gpu_tensor_free(xrow);
+        ds4_gpu_tensor_free(winner);
+        if (!ok) return -1;
+        if (count == 0) return 0;
+    }
+    return 1;
+}
+
 bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
                                 const ds4_qwen4exp_weights *w,
                                 const ds4_model            *m,
@@ -2563,18 +2643,31 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
             return qwen4exp_forward_fail();
         }
     }
-    if (!ds4_qwen4exp_matmul_q8_0(s->logits, QW_MAP(m, w->output),
-                                    QW_MAPSZ(m, w->output), QW_OFF(w->output),
-                                    DS4_N_EMBD, cfg->n_vocab,
-                                    logit_rows == 1u ? s->embed_rows : s->mixed,
-                                    logit_rows)) {
+    bool target_screened = false;
+    if (!logits_out && s->spec_top1_rows == logit_rows) {
+        const int screen = qwen4exp_target_native_top1(
+                s, w, m, logit_rows == 1u ? s->embed_rows : s->mixed,
+                logit_rows);
+        if (screen < 0) {
+            fprintf(stderr, "ds4: qwen4exp compact target-head screen failed\n");
+            return qwen4exp_forward_fail();
+        }
+        target_screened = screen > 0;
+    }
+    if (!target_screened &&
+        !ds4_qwen4exp_matmul_q8_0(s->logits, QW_MAP(m, w->output),
+                                  QW_MAPSZ(m, w->output), QW_OFF(w->output),
+                                  DS4_N_EMBD, cfg->n_vocab,
+                                  logit_rows == 1u ? s->embed_rows : s->mixed,
+                                  logit_rows)) {
         fprintf(stderr, "ds4: qwen4exp LM head failed\n");
         return qwen4exp_forward_fail();
     }
     if (s->spec_top1_rows != 0u &&
         (s->spec_top1_rows != logit_rows ||
-         !ds4_gpu_indexer_topk_tensor(s->spec_top1, s->logits,
-                                      cfg->n_vocab, logit_rows, 1u))) {
+         (!target_screened &&
+          !ds4_gpu_indexer_topk_tensor(s->spec_top1, s->logits,
+                                       cfg->n_vocab, logit_rows, 1u)))) {
         fprintf(stderr, "ds4: qwen4exp compact verify top-1 failed\n");
         return qwen4exp_forward_fail();
     }
