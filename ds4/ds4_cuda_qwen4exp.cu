@@ -3022,7 +3022,36 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
 #pragma unroll
         for (int r = 0; r < R; r++) acc[r] = 0.0f;
         if (live) {
-            for (uint32_t g = lane; g < groups; g += 32u) {
+            /* ONE-GROUP-DEEP WEIGHT PREFETCH.
+             *
+             * The group stride is 32 and `groups` is a runtime value, so nvcc
+             * cannot unroll this loop and therefore cannot software-pipeline
+             * it: each lane issued its weight payload load and then waited on
+             * it, with nothing else in flight. At the routed gate/up
+             * projection this loop is the engine's largest weight stream, and
+             * a lane runs only two or three iterations of it, so the stalls do
+             * not amortise against anything.
+             *
+             * The loop below issues the NEXT group's payload as soon as this
+             * group's copy of `raw` is dead -- immediately after the decode
+             * that consumes it, and before the accumulate -- so the load has
+             * the whole accumulate to land in. This is the same one-chunk
+             * depth, the same registers and the same guard the routed-MoE MMA
+             * kernel already uses on the prefill path; only the issue point
+             * moves.
+             *
+             * EXACTNESS. Every group is decoded from the same bytes, in the
+             * same ascending group order, and accumulated into the same
+             * `acc[r]` in the same sequence, with the same warp reduction
+             * afterwards. No value and no order of operations changes; the
+             * loop is rewritten from `for` to `while` only so the prefetch has
+             * somewhere to sit. */
+            uint32_t raw[8];
+            uint32_t g = lane;
+            bool have = g < groups &&
+                        qw_raw_load((uint32_t)Type, weight_row, g, raw);
+            while (g < groups) {
+                const uint32_t gnext = g + 32u;
                 int8_t wq[32];
                 float wa[2] = {0.0f, 0.0f};
                 float wb[2] = {0.0f, 0.0f};
@@ -3036,11 +3065,12 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
                  * Q4_K, whose group stages, and whose decode leaves
                  * `halves` at one -- the value passed to the accumulate
                  * below -- so the accumulated value is unchanged. */
-                uint32_t raw[8];
-                const uint32_t *rawp =
-                    qw_raw_load((uint32_t)Type, weight_row, g, raw) ? raw : NULL;
                 dev_qwen4exp_group_decode_w((uint32_t)Type, weight_row, g,
-                                            rawp, wq, wa, wb);
+                                            have ? raw : NULL, wq, wa, wb);
+                /* `raw` is dead from here: issue the next group's payload now
+                 * so it overlaps the accumulate below. */
+                have = gnext < groups &&
+                       qw_raw_load((uint32_t)Type, weight_row, gnext, raw);
                 const int halves = 1;
 #pragma unroll
                 for (int r = 0; r < R; r++) {
@@ -3050,6 +3080,7 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
                             xq + at_g * 32u, xs[at_g], xsum[at_g]);
                     }
                 }
+                g = gnext;
             }
         }
 #pragma unroll
@@ -3211,6 +3242,10 @@ __global__ static void qwen4exp_moe_down_q_kernel(
 #pragma unroll
     for (int r = 0; r < R; r++) acc[r] = 0.0f;
 
+    /* A template parameter when the host specialised the type, so the branch
+     * in the group loop folds away in the specialised instantiations. */
+    const uint32_t dtype = DownType < 0 ? down_type : (uint32_t)DownType;
+
     for (uint32_t slot = 0; slot < n_expert_used; slot++) {
 #pragma unroll
         for (int r = 0; r < R; r++) {
@@ -3224,11 +3259,51 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                 const uint64_t mrow = (uint64_t)t * n_expert_used + slot;
                 for (uint32_t g = lane; g < groups; g += 32u) {
                     int8_t wq[32];
-                    float wa[2], wb[2];
+                    float wa[2] = {0.0f, 0.0f};
+                    float wb[2] = {0.0f, 0.0f};
                     int halves = 1;
-                    dev_qwen4exp_group_decode(
-                            DownType < 0 ? down_type : (uint32_t)DownType,
-                            drow, g, wq, wa, wb, &halves);
+                    if (dtype == (uint32_t)DS4_QWEN4EXP_TY_q5_1) {
+                        /* WORD DECODE for the routed Q5_1 down weights.
+                         *
+                         * The byte decoder's aligned Q5_1 path already reads
+                         * the block as words, but it then writes the decoded
+                         * group out ONE BYTE AT A TIME: for each of four
+                         * payload words it extracts eight bytes and stores
+                         * them into eight separate elements of `wq`.  `wq` is
+                         * a 32-element int8 local array, and the accumulate
+                         * below reads it back four bytes at a time through
+                         * qwen4exp_load_i8x4, so byte-granular writes feeding
+                         * word-granular reads is the shape that costs a pile
+                         * of byte-insert operations, and can cost a local
+                         * memory round trip when the array does not stay in
+                         * registers.  dev_qwen4exp_group_decode_w derives the
+                         * same 32 weights and stores them as EIGHT whole
+                         * words, which is what the accumulate wants.
+                         *
+                         * EXACTNESS.  The two decoders produce the identical
+                         * 32 bytes: both take the same four low nibbles and
+                         * four high nibbles of the same payload word and OR in
+                         * the same high-plane bit from the same `qh` bit, only
+                         * by a different bit-twiddling expression, and both
+                         * take wa[0] from the block's `d` and wb[0] from its
+                         * `m`.  This file states that relationship where the
+                         * word decoder is defined and keeps the byte decoder
+                         * as the oracle for it; the routed-MoE MMA kernels
+                         * already decode these same Q5_1 weights this way on
+                         * the prefill path.  Q5_1 leaves `halves` at one in
+                         * both decoders, which is the value passed to the
+                         * accumulate, and a group whose payload does not stage
+                         * falls back through the same byte decoder as before.
+                         * No group, order, accumulator or reduction moves. */
+                        uint32_t raw[8];
+                        const uint32_t *rawp =
+                            qw_raw_load(dtype, drow, g, raw) ? raw : NULL;
+                        dev_qwen4exp_group_decode_w(dtype, drow, g, rawp,
+                                                    wq, wa, wb);
+                    } else {
+                        dev_qwen4exp_group_decode(dtype, drow, g, wq, wa, wb,
+                                                  &halves);
+                    }
                     const uint64_t at_g = mrow * groups + g;
                     qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves,
                                               mq + at_g * 32u, ms[at_g],
