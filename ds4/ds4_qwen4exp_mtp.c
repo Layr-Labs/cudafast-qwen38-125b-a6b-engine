@@ -411,6 +411,10 @@ static int mtp_draft_chain(ds4_qwen4exp_mtp_state *st,
         return 0;
     }
 
+    if (model->draft_rows && model->prepare_draft_vocab &&
+        model->prepare_draft_vocab(model->ctx, (uint32_t)n, next_fed,
+                                    st->depth == 1) != 0)
+        return mtp_fail(err, errlen, "MTP candidate preparation backend failure");
     const uint32_t j0 = st->head_rows < pos ? pos : st->head_rows;
     float *const ping = st->hc_scratch +
                         (size_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * st->hc_dim;
@@ -465,6 +469,13 @@ static int mtp_draft_chain(ds4_qwen4exp_mtp_state *st,
         }
         st->head_rows = start;
     }
+
+    /* Without batched seeds, prepare only after the discarded seed outputs;
+     * otherwise a seed would consume the one-use candidate set. */
+    if (!model->draft_rows && model->prepare_draft_vocab &&
+        model->prepare_draft_vocab(model->ctx, (uint32_t)n, next_fed,
+                                    st->depth == 1) != 0)
+        return mtp_fail(err, errlen, "MTP candidate preparation backend failure");
 
     for (; k < st->depth; k++) {
         /* The last step's `multi` row would have no reader. */
@@ -865,6 +876,13 @@ int ds4_qwen4exp_mtp_head_init(ds4_qwen4exp_mtp_head *h,
             h->t_logits_tail = mtp_alloc(rows * h->draft_vocab_tail * f, &ok);
         }
     }
+    if (h->hooks.select_vocab && h->hooks.matmul_indexed && h->draft_vocab_prefix) {
+        h->dynamic_ids = mtp_alloc(8192u * sizeof(uint32_t), &ok);
+        h->dynamic_scratch = mtp_alloc(((uint64_t)h->n_vocab + 255u) / 256u *
+                                      sizeof(uint32_t), &ok);
+        h->dynamic_host = malloc(8192u * sizeof(uint32_t));
+        if (!h->dynamic_host) ok = false;
+    }
     h->t_top1         = mtp_alloc(rows * sizeof(uint32_t), &ok);
     h->top1_host      = malloc((size_t)rows * sizeof(uint32_t));
     if (!ok || !h->top1_host) {
@@ -882,7 +900,7 @@ void ds4_qwen4exp_mtp_head_free(ds4_qwen4exp_mtp_head *h) {
         h->t_tokens, h->t_embed_rows, h->t_embed_out, h->t_e_normed,
         h->t_h_normed, h->t_ehx, h->t_hyper, h->t_mix_normed,
         h->t_mix_lowrank, h->t_mix_wide, h->t_sample, h->t_logits,
-        h->t_logits_prefix, h->t_logits_tail, h->t_top1,
+        h->t_logits_prefix, h->t_logits_tail, h->t_top1, h->dynamic_ids, h->dynamic_scratch,
     };
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
         ds4_gpu_tensor_free(all[i]);
@@ -892,6 +910,10 @@ void ds4_qwen4exp_mtp_head_free(ds4_qwen4exp_mtp_head *h) {
     h->t_mix_lowrank = h->t_mix_wide = h->t_sample = h->t_logits = NULL;
     h->t_logits_prefix = h->t_logits_tail = NULL;
     h->t_top1 = NULL;
+    h->dynamic_ids = h->dynamic_scratch = NULL;
+    h->dynamic_count = 0;
+    free(h->dynamic_host);
+    h->dynamic_host = NULL;
     free(h->top1_host);
     h->top1_host = NULL;
 }
@@ -1008,9 +1030,11 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
      * prefix-first keeps the packed order the token-id order -- validated at
      * init (the ranges are disjoint and prefix is below the tail base) -- so
      * the top-1's first-max tie rule still picks the lowest id. */
+    const uint32_t dynamic_count = logit_rows == 1u ? h->dynamic_count : 0u;
+    h->dynamic_count = 0u; /* A prepared set may be consumed only once. */
     const uint32_t draft_prefix = h->draft_vocab_prefix;
     const uint32_t draft_tail = draft_prefix ? h->draft_vocab_tail : 0u;
-    const uint32_t draft_width = draft_prefix
+    const uint32_t draft_width = dynamic_count ? dynamic_count : draft_prefix
         ? draft_prefix + draft_tail : h->n_vocab;
     const int timing = mtp_head_time_on();
     uint64_t tmark = timing ? mtp_now_ns() : 0;
@@ -1145,7 +1169,12 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
      * them (the decode-order ladder is row-exact by construction, which is
      * the property the whole speculative cycle stands on), so a shortlist
      * id's logit is the logit the full projection produces. */
-    if (ok) {
+    if (ok && dynamic_count) {
+        stage = "indexed borrowed lm head";
+        ok = h->hooks.matmul_indexed(h->t_logits, h->target_map, h->target_size,
+                h->output_offset, n_embd, h->n_vocab, h->t_sample,
+                h->dynamic_ids, dynamic_count) != 0;
+    } else if (ok) {
         /* A single row can project its prefix directly to the packed output.
          * Multiple rows retain separate prefix storage and per-row packing. */
         const bool direct_prefix = logit_rows == 1u;
@@ -1244,7 +1273,10 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
          * prefix it IS the id; above it, rebase into the tail range.  Off
          * mode (prefix 0) packed nothing and the position is the id. */
         uint32_t id = h->top1_host[t];
-        if (draft_prefix && id >= draft_prefix) {
+        if (dynamic_count) {
+            if (id >= dynamic_count) return mtp_fail(err, errlen, "invalid indexed draft winner");
+            id = h->dynamic_host[id];
+        } else if (draft_prefix && id >= draft_prefix) {
             id = h->n_vocab - draft_tail + (id - draft_prefix);
         }
         draft_out[t] = (int)id;

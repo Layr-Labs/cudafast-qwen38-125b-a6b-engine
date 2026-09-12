@@ -213,6 +213,8 @@ bool ds4_qwen4exp_graph_verify_top1_rows(ds4_qwen4exp_session       *s,
                                          uint32_t                    n_tokens,
                                          float                      *hc_rows,
                                          int                        *row_top1);
+/* Borrowed only during a synchronous proposal-preparation callback. */
+const ds4_gpu_tensor *ds4_qwen4exp_graph_device_logits(ds4_qwen4exp_session *s);
 bool ds4_qwen4exp_graph_read_logit_row(ds4_qwen4exp_session *s,
                                        uint32_t row,
                                        float *logits);

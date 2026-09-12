@@ -987,6 +987,15 @@ int ds4_gpu_matmul_q4_K_pair_decode_tensor(
         const ds4_gpu_tensor *x);
 
 /* Multi-row decode projections that preserve the one-row reduction order. */
+/* Proposal-only dynamic vocabulary: sorted unique IDs or count zero fallback.
+ * CUDA implementation, optionally bound through weak MTP hooks elsewhere. */
+int ds4_gpu_mtp_select_vocab(ds4_gpu_tensor *ids, ds4_gpu_tensor *scratch,
+    const ds4_gpu_tensor *logits, uint32_t row, uint32_t vocab, int top1,
+    uint32_t tail, uint32_t capacity, uint32_t *count);
+int ds4_gpu_mtp_indexed_q8(ds4_gpu_tensor *out, const void *map,
+    uint64_t map_size, uint64_t offset, uint64_t in_dim, uint64_t vocab,
+    const ds4_gpu_tensor *x, const ds4_gpu_tensor *ids, uint32_t count);
+
 int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         ds4_gpu_tensor       *out,
         const void           *model_map,

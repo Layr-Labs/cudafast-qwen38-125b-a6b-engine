@@ -2994,6 +2994,10 @@ bool ds4_qwen4exp_graph_verify_top1_rows(ds4_qwen4exp_session       *s,
                                (uint64_t)n_tokens * sizeof(int32_t)) != 0;
 }
 
+const ds4_gpu_tensor *ds4_qwen4exp_graph_device_logits(ds4_qwen4exp_session *s) {
+    return s ? s->logits : NULL;
+}
+
 bool ds4_qwen4exp_graph_read_logit_row(ds4_qwen4exp_session *s,
                                        uint32_t row,
                                        float *logits) {

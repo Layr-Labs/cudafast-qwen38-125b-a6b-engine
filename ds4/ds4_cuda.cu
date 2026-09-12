@@ -5684,11 +5684,12 @@ __global__ static void matmul_q8_0_preq_rows_exact_tile_kernel(
 /* Two adjacent lanes share a Q8 group. Their integer partials may be
  * combined freely; each even lane keeps its original float group chain.
  * Shared memory remaps the 32 finished chains onto one reduction warp. */
-template <int R, bool Streaming = true>
+template <int R, bool Streaming = true, bool Indexed = false>
 __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
         float *out, const unsigned char *w,
         const int8_t *xq, const float *xscale,
-        uint64_t out_dim, uint32_t n_rows, uint64_t blocks) {
+        uint64_t out_dim, uint32_t n_rows, uint64_t blocks,
+        const uint32_t *ids = nullptr, uint64_t n_vocab = 0) {
     const uint32_t local_row = threadIdx.x >> 6u;
     const uint32_t local_lane = threadIdx.x & 63u;
     const uint32_t group = local_lane >> 1u;
@@ -5700,8 +5701,10 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
 #pragma unroll
     for (int r = 0; r < R; r++) acc[r] = 0.0f;
 
-    if (row < out_dim) {
-        const unsigned char *wr = w + row * blocks * 34u;
+    const uint64_t weight_row = Indexed && row < out_dim ? ids[row] : row;
+    const bool valid = row < out_dim && (!Indexed || weight_row < n_vocab);
+    if (valid) {
+        const unsigned char *wr = w + weight_row * blocks * 34u;
         for (uint64_t b = group; b < blocks; b += 32u) {
             /* Name both lanes of every live pair even if independent
              * scheduling has temporarily separated their execution. */
@@ -5756,7 +5759,7 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
         for (int r = 0; r < R; r++) {
             const float total = warp_sum_f32(partial[r][local_row][local_lane]);
             if (local_lane == 0u && row < out_dim && (uint32_t)r < take)
-                out[((uint64_t)row0 + r) * out_dim + row] = total;
+                out[((uint64_t)row0 + r) * out_dim + row] = valid ? total : -INFINITY;
         }
     }
 }
@@ -16843,6 +16846,68 @@ extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
     }
     return cuda_matmul_q8_0_preq_rows_exact(out, wptr, xq, xscale, in_dim,
                                             out_dim, n_rows, blocks);
+}
+
+extern "C" int ds4_gpu_mtp_indexed_q8(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *ids,
+        uint32_t count) {
+    const uint32_t n_rows = 1;
+    const uint64_t n_vocab = out_dim;
+    if (in_dim > UINT32_MAX || n_vocab > UINT32_MAX || !ids || !count || count > 8192u || ids->bytes < (uint64_t)count * 4u ||
+        (in_dim & 31u) || !cuda_q8_use_dp4a()) return 0;
+    if (!out || !x || !model_map || in_dim == 0u || out_dim == 0u ||
+        n_rows == 0u ||
+        x->bytes < (uint64_t)n_rows * in_dim * sizeof(float) ||
+        out->bytes < (uint64_t)count * sizeof(float)) {
+        return 0;
+    }
+    const uint64_t blocks = (in_dim + 31u) / 32u;
+    if (weight_offset > model_size ||
+        out_dim > UINT64_MAX / (blocks * 34u)) {
+        return 0;
+    }
+    const uint64_t weight_bytes = out_dim * blocks * 34u;
+    if (weight_bytes > model_size - weight_offset) return 0;
+    const int logical_tier = ds4_tensor_device_idx(out);
+    if (logical_tier < 0 || logical_tier >= g_n_gpus ||
+        ds4_tensor_device_idx(x) != logical_tier ||
+        ds4_tensor_device_idx(ids) != logical_tier) {
+        return 0;
+    }
+    const char *wptr = cuda_resolve_weight_ptr(
+            model_map, weight_offset, weight_bytes, logical_tier,
+            "q8_0 decode rows exact");
+    if (!wptr || ((uintptr_t)wptr & 1u)) return 0;
+
+    const uint64_t xq_bytes = (uint64_t)n_rows * blocks * 32u;
+    const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+    const uint64_t tmp_bytes =
+        scale_offset + (uint64_t)n_rows * blocks * sizeof(float);
+    void *tmp = cuda_tmp_alloc_on(
+            logical_tier, tmp_bytes, "q8_0 decode rows exact prequant");
+    if (!tmp) return 0;
+    int8_t *xq = (int8_t *)tmp;
+    float *xscale = (float *)((char *)tmp + scale_offset);
+    const uint64_t qpairs = (uint64_t)n_rows * blocks;
+    const unsigned qgrid = (unsigned)((qpairs + 7u) / 8u);
+    quantize_q8_0_f32_rows_warp_kernel<<<qgrid, 256, 0, cuda_decode_stream()>>>(
+            xq, xscale, (const float *)x->ptr, in_dim, blocks, n_rows);
+    if (!cuda_ok(cudaGetLastError(),
+                 "q8_0 decode rows exact quantize launch")) {
+        return 0;
+    }
+    matmul_q8_0_preq_pair_lanes_kernel<1, false, true><<<
+        (count + 3u) / 4u, 256, 0, cuda_decode_stream()>>>(
+        (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
+        count, 1u, blocks, (const uint32_t *)ids->ptr, n_vocab);
+    return cuda_ok(cudaGetLastError(), "MTP indexed Q8 projection");
 }
 
 /* The same matmul over an input the caller has ALREADY quantized into `q`:
@@ -35378,3 +35443,87 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
 #define DS4_GLM53_VISION_STREAM cuda_decode_stream()
 #include "ds4_glm53_vision_gpu.cuh"
 #include "ds4_deepseek4_vision_gpu.cuh"
+
+
+/* Runtime proposal heuristic, independent of prompts and token identities:
+ * retain logits within ln(10000) of the committed target maximum, token zero
+ * (historical NaN winner semantics), and the configured added-token tail.
+ * Invalid target values or a capacity overflow select the old static head. */
+__device__ static bool mtp_vocab_keep(float value, float maximum,
+                                     uint32_t id, uint32_t vocab, uint32_t tail) {
+    return id == 0u || id >= vocab - tail || value >= maximum - 9.210340371976184f;
+}
+__global__ static void mtp_vocab_counts(uint32_t *counts, const float *logits,
+                                        uint32_t vocab, int top1, uint32_t tail) {
+    const uint32_t id = blockIdx.x * 256u + threadIdx.x;
+    const float maximum = logits[top1];
+    const float value = id < vocab ? logits[id] : -INFINITY;
+    __shared__ uint32_t sums[256];
+    __shared__ uint32_t invalid[256];
+    sums[threadIdx.x] = id < vocab && mtp_vocab_keep(value, maximum, id, vocab, tail);
+    invalid[threadIdx.x] = !isfinite(maximum) || (id < vocab && isnan(value)) ||
+                           (id < vocab && value > maximum);
+    __syncthreads();
+    for (unsigned step = 128; step; step >>= 1) {
+        if (threadIdx.x < step) {
+            sums[threadIdx.x] += sums[threadIdx.x + step];
+            invalid[threadIdx.x] |= invalid[threadIdx.x + step];
+        }
+        __syncthreads();
+    }
+    if (!threadIdx.x) counts[blockIdx.x] = invalid[0] ? UINT32_MAX : sums[0];
+}
+__global__ static void mtp_vocab_scatter(uint32_t *ids, const uint32_t *offsets,
+        const float *logits, uint32_t vocab, int top1, uint32_t tail) {
+    const uint32_t id = blockIdx.x * 256u + threadIdx.x;
+    const bool keep = id < vocab && mtp_vocab_keep(logits[id], logits[top1], id, vocab, tail);
+    __shared__ uint32_t scan[256];
+    scan[threadIdx.x] = keep;
+    __syncthreads();
+    for (unsigned step = 1; step < 256; step <<= 1) {
+        const uint32_t add = threadIdx.x >= step ? scan[threadIdx.x - step] : 0u;
+        __syncthreads();
+        scan[threadIdx.x] += add;
+        __syncthreads();
+    }
+    if (keep) ids[offsets[blockIdx.x] + scan[threadIdx.x] - 1u] = id;
+}
+extern "C" int ds4_gpu_mtp_select_vocab(ds4_gpu_tensor *ids, ds4_gpu_tensor *scratch,
+        const ds4_gpu_tensor *logits, uint32_t row, uint32_t vocab, int top1,
+        uint32_t tail, uint32_t capacity, uint32_t *count) {
+    if (!count) return 0;
+    *count = 0;
+    const uint64_t blocks = ((uint64_t)vocab + 255u) / 256u;
+    if (!ids || !scratch || !logits || !vocab || !capacity || capacity > 8192u ||
+        top1 < 0 || (uint32_t)top1 >= vocab || tail > vocab ||
+        ids->bytes < (uint64_t)capacity * 4u || scratch->bytes < blocks * 4u ||
+        logits->bytes / 4u / vocab <= row ||
+        ds4_tensor_device_idx(ids) != ds4_tensor_device_idx(logits) ||
+        ds4_tensor_device_idx(scratch) != ds4_tensor_device_idx(logits)) return 1;
+    int current = -1;
+    cudaStreamCaptureStatus capture;
+    if (g_n_gpus != 1 || ds4_tensor_device_idx(logits) != 0 || !cuda_q8_use_dp4a()) return 1;
+    if (cudaGetDevice(&current) != cudaSuccess ||
+        cudaStreamIsCapturing(cuda_decode_stream(), &capture) != cudaSuccess) return 0;
+    if (current != g_gpu[0].device_id || capture != cudaStreamCaptureStatusNone) return 1;
+    const float *values = (const float *)logits->ptr + (uint64_t)row * vocab;
+    std::vector<uint32_t> offsets((size_t)blocks);
+    mtp_vocab_counts<<<(unsigned)blocks, 256, 0, cuda_decode_stream()>>>(
+        (uint32_t *)scratch->ptr, values, vocab, top1, tail);
+    if (!cuda_ok(cudaGetLastError(), "MTP candidate count") ||
+        !ds4_gpu_tensor_read(scratch, 0, offsets.data(), blocks * 4u)) return 0;
+    uint32_t total = 0;
+    for (uint32_t &n : offsets) {
+        if (n > capacity - total) return 1; /* Invalid counts also overflow. */
+        const uint32_t next = total + n;
+        n = total;
+        total = next;
+    }
+    if (!total) return 1;
+    if (!ds4_gpu_tensor_write(scratch, 0, offsets.data(), blocks * 4u)) return 0;
+    mtp_vocab_scatter<<<(unsigned)blocks, 256, 0, cuda_decode_stream()>>>(
+        (uint32_t *)ids->ptr, (const uint32_t *)scratch->ptr, values, vocab, top1, tail);
+    if (!cuda_ok(cudaGetLastError(), "MTP candidate scatter")) return 0;
+    *count = total;
+    return 1;
+}

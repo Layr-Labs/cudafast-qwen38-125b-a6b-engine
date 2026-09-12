@@ -316,6 +316,11 @@ typedef struct {
     /* A greedy-only caller may consume row_top1 directly and materialize the
      * selected full distribution lazily only for an API that needs it. */
     bool defer_frontier_logits;
+    /* Optional proposal-only preparation, called after selecting the current
+     * committed target row and before the native head updates its cache.
+     * enabled is false outside depth one; implementations must invalidate old IDs.
+     * Returns zero for prepared or static fallback, nonzero for backend failure. */
+    int (*prepare_draft_vocab)(void *ctx, uint32_t row, int top1, bool enabled);
 
     /* One row at `pos`: the serial decode step, and the replay a rejecting
      * round runs.  Same outputs for a single row. */
@@ -619,6 +624,13 @@ typedef struct {
                        uint64_t model_size, uint64_t weight_offset,
                        uint64_t in_dim, uint64_t out_dim,
                        const ds4_gpu_tensor *x, uint64_t n_tok);
+    /* Optional CUDA proposal shortlist; selection returns sorted unique IDs.
+     * A zero count denotes static fallback, including invalid/overflow input. */
+    int (*select_vocab)(ds4_gpu_tensor *, ds4_gpu_tensor *, const ds4_gpu_tensor *,
+                        uint32_t, uint32_t, int, uint32_t, uint32_t, uint32_t *);
+    int (*matmul_indexed)(ds4_gpu_tensor *, const void *, uint64_t, uint64_t,
+                          uint64_t, uint64_t, const ds4_gpu_tensor *,
+                          const ds4_gpu_tensor *, uint32_t);
     ds4_qwen4exp_block_forward_fn block;
 } ds4_qwen4exp_mtp_gpu_hooks;
 
@@ -687,6 +699,11 @@ typedef struct {
      * costs one rejected draft and never a committed token. */
     uint32_t draft_vocab_prefix;
     uint32_t draft_vocab_tail;
+    /* Request-owned, one-use IDs; prepared from the current committed target
+     * row. No borrowed target pointer survives the preparation callback. */
+    uint32_t dynamic_count;
+    ds4_gpu_tensor *dynamic_ids, *dynamic_scratch;
+    uint32_t *dynamic_host;
 
     float rms_eps;
     float weight_bias;             /* 1 for zero-centered weights, else 0    */

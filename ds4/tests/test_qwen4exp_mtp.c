@@ -159,6 +159,7 @@ typedef struct {
      * the row it committed through, and that row is now one of these. */
     int      row_argmax[DS4_QWEN4EXP_MTP_MAX_COMMIT];
     uint32_t row_argmax_n;
+    uint32_t prepare_pos0;
     float compact_logits[DS4_QWEN4EXP_MTP_MAX_COMMIT][REF_VOCAB];
     /* The speculative chain the head is walking, so the draft oracle can look
      * one position past the frontier for each step.  Without this every step
@@ -282,6 +283,7 @@ static int ref_verify_rows(void *ctx, const int *tokens, uint32_t n,
                            uint32_t pos0, float *hc_rows, float *row_logits) {
     refmodel *m = ctx;
     m->n_verify++;
+    m->prepare_pos0 = pos0;
     for (int k = 0; k < DS4_QWEN4EXP_IMPLEMENTED_DEPTH; k++) {
         m->slot[k].written = 0;
     }
@@ -366,6 +368,9 @@ static int ref_decode_token(void *ctx, int token, uint32_t pos,
     ref_logits(h, logits);
     m->last_decode_argmax = ds4_qwen4exp_mtp_argmax(logits, REF_VOCAB);
     m->last_frontier_argmax = m->last_decode_argmax;
+    m->prepare_pos0 = pos;
+    m->row_argmax_n = 1;
+    m->row_argmax[0] = m->last_decode_argmax;
     return 0;
 }
 
@@ -579,6 +584,18 @@ static int ref_draft_rows(void *ctx, const int *next_tokens,
     return 0;
 }
 
+static uint64_t prepare_enabled_calls, prepare_disabled_calls;
+static int ref_prepare_vocab(void *ctx, uint32_t row, int top1, bool enabled) {
+    refmodel *m = ctx;
+    if (enabled) prepare_enabled_calls++; else prepare_disabled_calls++;
+    if (m->broken != BREAK_NONE || m->batch_variant) return 0;
+    CHECK(row < m->row_argmax_n, "candidate row must belong to current forward");
+    if (row < m->row_argmax_n)
+        CHECK(top1 == m->row_argmax[row], "candidate max must be selected row's target winner");
+    CHECK(m->kv_len == m->prepare_pos0 + row + 1u,
+          "candidate preparation must follow rollback to the committed row");
+    return 0;
+}
 static int g_ref_batched_draft = 1;
 
 static int ref_build(refmodel *m, ds4_qwen4exp_mtp_model *model,
@@ -592,6 +609,7 @@ static int ref_build(refmodel *m, ds4_qwen4exp_mtp_model *model,
     model->read_logit_row = ref_read_logit_row;
     model->decode_token = ref_decode_token;
     model->head_logits = ref_head_logits;
+    model->prepare_draft_vocab = ref_prepare_vocab;
     model->draft_step = ref_draft_step;
     model->draft_rows = g_ref_batched_draft ? ref_draft_rows : NULL;
 
@@ -2545,6 +2563,51 @@ static void test_draft_vocab_shortlist(void) {
     unsetenv("DS4_QWEN4EXP_DRAFT_VOCAB_TAIL");
 }
 
+static float indexed_values[3];
+static unsigned indexed_calls;
+static int stub_indexed(ds4_gpu_tensor *out, const void *map, uint64_t bytes,
+        uint64_t offset, uint64_t in, uint64_t vocab, const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *ids, uint32_t count) {
+    (void)map; (void)bytes; (void)offset; (void)in; (void)x; (void)ids;
+    CHECK(count == 3u && vocab == HEAD_N_VOCAB, "indexed projection shape");
+    indexed_calls++;
+    return ds4_gpu_tensor_write(out, 0, indexed_values, sizeof(indexed_values));
+}
+static void test_indexed_head_contract(void) {
+    setenv("DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX", "5", 1);
+    setenv("DS4_QWEN4EXP_DRAFT_VOCAB_TAIL", "2", 1);
+    ds4_qwen4exp_mtp_head h;
+    CHECK(build_shortlist_head(&h) == 0, "indexed head build");
+    h.hooks.matmul_indexed = stub_indexed;
+    h.dynamic_ids = ds4_gpu_tensor_alloc(12);
+    h.dynamic_host = malloc(12);
+    const uint32_t ids[] = {0, 3, 7};
+    memcpy(h.dynamic_host, ids, sizeof(ids));
+    ds4_gpu_tensor_write(h.dynamic_ids, 0, ids, sizeof(ids));
+    const float cases[][3] = {{-2, 4, 4}, {-2, 4, 5}, {NAN, 4, 5}, {-2, NAN, 5},
+                              {-INFINITY, -INFINITY, -INFINITY}};
+    const int expected[] = {3, 7, 0, 7, 0};
+    const int tokens[HEAD_ROWS] = {3, 5};
+    float hc[HEAD_ROWS * HEAD_HC_DIM] = {0};
+    for (unsigned c = 0; c < sizeof(expected)/sizeof(expected[0]); c++) {
+        memcpy(indexed_values, cases[c], sizeof(indexed_values));
+        h.dynamic_count = 3;
+        int got = -1;
+        CHECK(ds4_qwen4exp_mtp_head_forward_last(&h, tokens, hc, 12, HEAD_ROWS,
+              &got, NULL, g_err, sizeof(g_err)) == 0, "indexed head forward: %s", g_err);
+        CHECK(got == expected[c], "indexed original-ID tie/NaN result %d vs %d", got, expected[c]);
+        CHECK(h.dynamic_count == 0, "prepared vocabulary must be consumed once");
+    }
+    const unsigned before = indexed_calls;
+    int got = -1;
+    CHECK(ds4_qwen4exp_mtp_head_forward_last(&h, tokens, hc, 12, HEAD_ROWS,
+          &got, NULL, g_err, sizeof(g_err)) == 0, "static fallback after consumption");
+    CHECK(indexed_calls == before, "old candidates must not survive next call");
+    ds4_qwen4exp_mtp_head_free(&h);
+    unsetenv("DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX");
+    unsetenv("DS4_QWEN4EXP_DRAFT_VOCAB_TAIL");
+}
+
 int main(void) {
     printf("qwen4exp MTP tests\n\n");
     test_exactness();
@@ -2580,7 +2643,9 @@ int main(void) {
     test_head_wiring();
     printf("\n");
     test_draft_vocab_shortlist();
+    test_indexed_head_contract();
     printf("\n");
+    CHECK(prepare_enabled_calls && prepare_disabled_calls, "depth-one and deeper candidate preparation exercised");
     if (g_failures) {
         printf("FAILED: %d check(s)\n", g_failures);
         return 1;

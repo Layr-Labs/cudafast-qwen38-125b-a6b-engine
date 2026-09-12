@@ -76007,6 +76007,39 @@ static int qwen4exp_seam_head_logits(void *ctx, const float *hc_row,
                                           hc_row, logits) ? 0 : -1;
 }
 
+static int qwen4exp_seam_prepare_draft_vocab(void *ctx, uint32_t row,
+                                              int top1, bool enabled) {
+    ds4_session *s = ctx;
+    ds4_qwen4exp_mtp_head *h = &s->qwen4exp_head;
+    h->dynamic_count = 0u;
+    if (!enabled || !h->dynamic_ids || !h->dynamic_scratch || !h->dynamic_host ||
+        !h->hooks.select_vocab || !h->hooks.matmul_indexed ||
+        getenv("DS4_MTP_NO_DYNAMIC_VOCAB") != NULL) return 0;
+    const uint64_t row_bytes = ds4_qwen4exp_q8_0_row_bytes(h->n_embd);
+    if (!h->target_map || !h->n_embd || (h->n_embd & 31u) ||
+        ((uintptr_t)h->target_map & 1u) || (h->output_offset & 1u) ||
+        h->output_offset > h->target_size || !row_bytes ||
+        h->n_vocab > (h->target_size - h->output_offset) / row_bytes) return 0;
+    const ds4_gpu_tensor *logits = ds4_qwen4exp_graph_device_logits(
+        s->engine->qwen4exp_session);
+    uint32_t count = 0;
+    if (!h->hooks.select_vocab(h->dynamic_ids, h->dynamic_scratch, logits,
+                               row, h->n_vocab, top1, h->draft_vocab_tail,
+                               8192u, &count)) return -1;
+    if (count == 0u || count > 8192u ||
+        count >= h->draft_vocab_prefix + h->draft_vocab_tail) return 0;
+    if (!ds4_gpu_tensor_read(h->dynamic_ids, 0, h->dynamic_host,
+                             (uint64_t)count * sizeof(uint32_t))) return -1;
+    /* Verify the representation before exposing it to the head and mapping
+     * the packed winner. This also guards alternate selector hooks. */
+    if (h->dynamic_host[0] != 0u) return 0;
+    for (uint32_t i = 0; i < count; i++)
+        if (h->dynamic_host[i] >= h->n_vocab ||
+            (i && h->dynamic_host[i] <= h->dynamic_host[i - 1u])) return 0;
+    h->dynamic_count = count;
+    return 0;
+}
+
 static int qwen4exp_seam_draft_step(void *ctx, int next_token,
                                     const float *hc_row, uint32_t pos,
                                     int *draft_out, float *multi_out) {
@@ -76141,6 +76174,7 @@ static bool ds4_session_qwen4exp_spec_init(ds4_session *s,
     s->qwen4exp_seam.defer_frontier_logits = true;
     s->qwen4exp_seam.decode_token = qwen4exp_seam_decode_token;
     s->qwen4exp_seam.head_logits  = qwen4exp_seam_head_logits;
+    s->qwen4exp_seam.prepare_draft_vocab = qwen4exp_seam_prepare_draft_vocab;
     s->qwen4exp_seam.draft_step   = qwen4exp_seam_draft_step;
     s->qwen4exp_seam.draft_rows   = qwen4exp_seam_draft_rows;
 
