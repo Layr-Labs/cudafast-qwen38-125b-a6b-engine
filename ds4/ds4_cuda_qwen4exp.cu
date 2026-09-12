@@ -3245,7 +3245,7 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
  * kernel did; the rows of the tile do not share a weight here, because each
  * one picked its own expert for the slot.  What the tile buys is that the
  * activation groups are read once for R rows and the decode is per group. */
-template <int R, int DownType = -1, bool Vector = false>
+template <int R, int DownType = -1, bool Vector = false, bool PairSlots = false>
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
@@ -3279,36 +3279,87 @@ __global__ static void qwen4exp_moe_down_q_kernel(
 #pragma unroll
     for (int r = 0; r < R; r++) acc[r] = 0.0f;
 
-    for (uint32_t slot = 0; slot < n_expert_used; slot++) {
+    /* A short Q5_1 row has at most one group per lane. Stage the next
+     * expert slot before consuming this one, retaining each accumulator's
+     * ascending slot order and the original final warp reduction. */
+    if (PairSlots && R == 2 && Vector &&
+        DownType == (int)DS4_QWEN4EXP_TY_q5_1 && groups <= 32u) {
+        for (uint32_t slot = 0; slot < n_expert_used; slot += 2u) {
 #pragma unroll
-        for (int r = 0; r < R; r++) {
-            if ((uint32_t)r < take) {
-                const uint32_t t = tok0 + (uint32_t)r;
-                const int32_t e = Vector ? __shfl_sync(0xffffffffu, route[r], slot)
-                    : selected[(uint64_t)t * n_expert_used + slot];
-                if (e < 0 || (uint32_t)e >= n_total_expert) continue;
-                const char *drow = down +
-                    (uint64_t)(uint32_t)e * down_expert_bytes +
-                    (uint64_t)row * down_row_bytes;
-                const uint64_t mrow = (uint64_t)t * n_expert_used + slot;
-                for (uint32_t g = lane; g < groups; g += 32u) {
-                    int8_t wq[32];
-                    float wa[2], wb[2];
-                    int halves = 1;
-                    dev_qwen4exp_group_decode(
-                            DownType < 0 ? down_type : (uint32_t)DownType,
-                            drow, g, wq, wa, wb, &halves);
-                    const uint64_t at_g = mrow * groups + g;
-                    if (Vector && halves == 1)
+            for (int r = 0; r < R; r++) {
+                if ((uint32_t)r >= take) continue;
+                /* All lanes participate: lanes outside groups can still
+                 * own the route IDs consumed by a live lane. */
+                const int32_t e0 = __shfl_sync(0xffffffffu, route[r], slot);
+                const int32_t e1 = slot + 1u < n_expert_used
+                    ? __shfl_sync(0xffffffffu, route[r], slot + 1u) : -1;
+                if (lane < groups) {
+                    const bool valid0 = e0 >= 0 && (uint32_t)e0 < n_total_expert;
+                    const bool valid1 = e1 >= 0 && (uint32_t)e1 < n_total_expert;
+                    const char *rows[2] = {NULL, NULL};
+                    uint32_t raw0[8], raw1[8];
+                    const uint32_t *payload[2] = {NULL, NULL};
+                    if (valid0) {
+                        rows[0] = down + (uint64_t)(uint32_t)e0 * down_expert_bytes +
+                            (uint64_t)row * down_row_bytes;
+                        if (qw_raw_load((uint32_t)DownType, rows[0], lane, raw0))
+                            payload[0] = raw0;
+                    }
+                    if (valid1) {
+                        rows[1] = down + (uint64_t)(uint32_t)e1 * down_expert_bytes +
+                            (uint64_t)row * down_row_bytes;
+                        if (qw_raw_load((uint32_t)DownType, rows[1], lane, raw1))
+                            payload[1] = raw1;
+                    }
+#pragma unroll
+                    for (int j = 0; j < 2; j++) {
+                        if (!rows[j]) continue;
+                        int8_t wq[32];
+                        float wa[2] = {0.0f, 0.0f}, wb[2] = {0.0f, 0.0f};
+                        dev_qwen4exp_group_decode_w((uint32_t)DownType,
+                            rows[j], lane, payload[j], wq, wa, wb);
+                        const uint64_t mrow = (uint64_t)(tok0 + r) *
+                            n_expert_used + slot + (uint32_t)j;
+                        const uint64_t at_g = mrow * groups + lane;
                         qwen4exp_shared_vector_accumulate(&acc[r], wq, wa[0], wb[0],
                             mq + at_g * 32u, ms[at_g], msum[at_g]);
-                    else
-                        qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves,
-                                                  mq + at_g * 32u, ms[at_g],
-                                                  msum[at_g]);
+                    }
                 }
             }
         }
+    } else {
+        for (uint32_t slot = 0; slot < n_expert_used; slot++) {
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                if ((uint32_t)r < take) {
+                    const uint32_t t = tok0 + (uint32_t)r;
+                    const int32_t e = Vector ? __shfl_sync(0xffffffffu, route[r], slot)
+                        : selected[(uint64_t)t * n_expert_used + slot];
+                    if (e < 0 || (uint32_t)e >= n_total_expert) continue;
+                    const char *drow = down +
+                        (uint64_t)(uint32_t)e * down_expert_bytes +
+                        (uint64_t)row * down_row_bytes;
+                    const uint64_t mrow = (uint64_t)t * n_expert_used + slot;
+                    for (uint32_t g = lane; g < groups; g += 32u) {
+                        int8_t wq[32];
+                        float wa[2], wb[2];
+                        int halves = 1;
+                        dev_qwen4exp_group_decode(
+                                DownType < 0 ? down_type : (uint32_t)DownType,
+                                drow, g, wq, wa, wb, &halves);
+                        const uint64_t at_g = mrow * groups + g;
+                        if (Vector && halves == 1)
+                            qwen4exp_shared_vector_accumulate(&acc[r], wq, wa[0], wb[0],
+                                mq + at_g * 32u, ms[at_g], msum[at_g]);
+                        else
+                            qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves,
+                                                      mq + at_g * 32u, ms[at_g],
+                                                      msum[at_g]);
+                    }
+                }
+            }
+        }
+
     }
 
 #pragma unroll
@@ -5151,12 +5202,13 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
 
     const dim3 dn_grid((out_dim + 7u) / 8u,
                        (n_tokens + (uint32_t)tile - 1u) / (uint32_t)tile, 1);
-#define QWEN4EXP_DOWN_IMPL(R, DT, V) \
-    qwen4exp_moe_down_q_kernel<R, DT, V><<<dn_grid, threads, 0, stream>>>( \
+#define QWEN4EXP_DOWN_IMPL_EX(R, DT, V, P) \
+    qwen4exp_moe_down_q_kernel<R, DT, V, P><<<dn_grid, threads, 0, stream>>>( \
             (float *)out->ptr, down, (const int32_t *)selected->ptr, \
             sc.mq, sc.ms, sc.msum, \
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
             mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
+#define QWEN4EXP_DOWN_IMPL(R, DT, V) QWEN4EXP_DOWN_IMPL_EX(R, DT, V, false)
 #define QWEN4EXP_DOWN(R) do { \
     if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q5_1) { \
         QWEN4EXP_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q5_1, false); \
@@ -5196,6 +5248,8 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     if (down_vector && ((uintptr_t)sc.mq & 15u) == 0u) {
         if (down_slab->type == DS4_QWEN4EXP_TY_q8_0) {
             QWEN4EXP_DOWN_IMPL(2, DS4_QWEN4EXP_TY_q8_0, true);
+        } else if (getenv("DS4_QWEN4EXP_NO_DOWN_SLOT_PREFETCH") == NULL) {
+            QWEN4EXP_DOWN_IMPL_EX(2, DS4_QWEN4EXP_TY_q5_1, true, true);
         } else {
             QWEN4EXP_DOWN_IMPL(2, DS4_QWEN4EXP_TY_q5_1, true);
         }
@@ -5206,6 +5260,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     else { QWEN4EXP_DOWN(1); }
 #undef QWEN4EXP_DOWN
 #undef QWEN4EXP_DOWN_IMPL
+#undef QWEN4EXP_DOWN_IMPL_EX
     return cuda_ok(cudaGetLastError(), "qwen4exp MoE down launch");
 }
 
