@@ -1329,6 +1329,11 @@ extern "C" uint64_t ds4_gpu_tier_free_vram(int logical_tier) {
 
 extern "C" int ds4_gpu_register_support_map(const void *map, uint64_t size, uint64_t bias) {
     if (!map || size == 0 || bias == 0) return 0;
+    if (g_support_host_base != map || g_support_host_size != size ||
+        g_support_offset_bias != bias) {
+        if (g_decode_graph_stream) (void)cudaStreamSynchronize(g_decode_graph_stream);
+        ds4_gpu_decode_graphs_invalidate();
+    }
     g_support_host_base = map;
     g_support_host_size = size;
     g_support_offset_bias = bias;
@@ -2769,6 +2774,11 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
 }
 
 static void cuda_model_range_release_all(void) {
+    /* Graphs retain resolved weight pointers, including direct main-map
+     * pointers when this range list is empty. Retire before any map/cache
+     * replacement can free or unregister those addresses. */
+    if (g_decode_graph_stream) (void)cudaStreamSynchronize(g_decode_graph_stream);
+    ds4_gpu_decode_graphs_invalidate();
     for (const cuda_model_range &r : g_model_ranges) {
         if (r.host_registered && r.registered_base) {
             (void)cudaHostUnregister(r.registered_base);

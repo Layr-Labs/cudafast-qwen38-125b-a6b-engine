@@ -807,6 +807,8 @@ static int mtp_head_draft_vocab(ds4_qwen4exp_mtp_head *h,
 
 int ds4_qwen4exp_mtp_head_init(ds4_qwen4exp_mtp_head *h,
                                char *err, size_t errlen) {
+    h->tail_graph_state = NULL;
+    h->tail_graph_release = NULL;
     if (!h->hooks.rms_norm || !h->hooks.hc_mixer || !h->hooks.embed ||
         !h->hooks.matmul_q8_0 || !h->hooks.block) {
         return mtp_fail(err, errlen,
@@ -889,8 +891,38 @@ int ds4_qwen4exp_mtp_head_init(ds4_qwen4exp_mtp_head *h,
     return 0;
 }
 
+int ds4_qwen4exp_mtp_head_mix_eager(ds4_qwen4exp_mtp_head *h,
+                                  uint32_t first_row, uint32_t rows,
+                                  int copy_last_row) {
+    if (!h || !h->hooks.hc_mixer || !rows || rows > h->max_tokens ||
+        first_row >= h->max_tokens || (copy_last_row && rows != 1u)) return 0;
+    const uint64_t hc_elems = (uint64_t)h->n_embd * h->n_hc;
+    if (!hc_elems || hc_elems > UINT64_MAX / sizeof(float)) return 0;
+    const uint64_t hc_bytes = hc_elems * sizeof(float);
+    if (copy_last_row && first_row > UINT64_MAX / hc_bytes) return 0;
+    /* eh_proj has consumed h_normed; preserve hyper for optional multi_out. */
+    if (copy_last_row && !ds4_gpu_tensor_copy(h->t_h_normed, 0, h->t_hyper,
+                                              first_row * hc_bytes, hc_bytes))
+        return 0;
+    /* The head's three weights share its GGUF mapping, but retain the
+     * mixer's per-weight slab interface used by split target mappings. */
+    const ds4_gpu_qwen4exp_slab norm_slab = {
+        h->head_map, h->head_size, h->hc_head_norm_offset, 0, 0, 0 };
+    const ds4_gpu_qwen4exp_slab down_slab = {
+        h->head_map, h->head_size, h->hc_head_down_offset, 0, 0, 0 };
+    const ds4_gpu_qwen4exp_slab up_slab = {
+        h->head_map, h->head_size, h->hc_head_up_offset, 0, 0, 0 };
+    return h->hooks.hc_mixer(h->t_sample, NULL, h->t_mix_normed,
+                           h->t_mix_lowrank, h->t_mix_wide,
+                           copy_last_row ? h->t_h_normed : h->t_hyper,
+                           &norm_slab, &down_slab, &up_slab, NULL,
+                           h->n_embd, h->n_hc, h->n_lowrank, rows,
+                           h->rms_eps, h->weight_bias, h->round_bf16) != 0;
+}
+
 void ds4_qwen4exp_mtp_head_free(ds4_qwen4exp_mtp_head *h) {
     if (!h) return;
+    if (h->tail_graph_release) h->tail_graph_release(h);
     ds4_gpu_tensor *all[] = {
         h->t_tokens, h->t_embed_rows, h->t_embed_out, h->t_e_normed,
         h->t_h_normed, h->t_ehx, h->t_hyper, h->t_mix_normed,
@@ -1119,36 +1151,12 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                             pos0, n_tokens) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_BLOCK);
-    /* t_h_normed's previous contents were consumed by eh_proj.  Reuse it for
-     * the final hyper row so the stateless tail needs neither tensor views
-     * nor an extra allocation.  Keep t_hyper intact for multi_out. */
-    if (ok && narrow_logits) {
-        stage = "last head row";
-        ok = ds4_gpu_tensor_copy(h->t_h_normed, 0, h->t_hyper,
-                                  (uint64_t)first_row * hc_dim * f,
-                                  hc_dim * f) != 0;
-    }
-    /* The head's own mixer: a gated residual with no inject head, the same
-     * shape as the tower's final mixer. */
     if (ok) {
         stage = "hc head mixer";
-        /* All three come from the head GGUF, which the --mtp path opens as one
-         * file, so the three slabs name one mapping here.  They are still
-         * built per tensor: the mixer takes slabs because a tower mixer's
-         * weights can straddle shards, and the head must not be the one place
-         * that reintroduces a single-mapping assumption. */
-        const ds4_gpu_qwen4exp_slab norm_slab = {
-            h->head_map, h->head_size, h->hc_head_norm_offset, 0, 0, 0 };
-        const ds4_gpu_qwen4exp_slab down_slab = {
-            h->head_map, h->head_size, h->hc_head_down_offset, 0, 0, 0 };
-        const ds4_gpu_qwen4exp_slab up_slab = {
-            h->head_map, h->head_size, h->hc_head_up_offset, 0, 0, 0 };
-        ok = h->hooks.hc_mixer(h->t_sample, NULL, h->t_mix_normed,
-                               h->t_mix_lowrank, h->t_mix_wide,
-                               narrow_logits ? h->t_h_normed : h->t_hyper,
-                               &norm_slab, &down_slab, &up_slab, NULL,
-                               n_embd, n_hc, h->n_lowrank, logit_rows,
-                               h->rms_eps, h->weight_bias, h->round_bf16) != 0;
+        ok = h->hooks.mix_tail
+            ? h->hooks.mix_tail(h, first_row, logit_rows, narrow_logits)
+            : ds4_qwen4exp_mtp_head_mix_eager(h, first_row, logit_rows,
+                                              narrow_logits);
     }
     MTP_HEAD_TICK(MTP_HEAD_T_MIXER);
     bool screened = false;
