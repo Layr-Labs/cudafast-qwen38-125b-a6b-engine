@@ -619,6 +619,14 @@ typedef struct {
                        uint64_t model_size, uint64_t weight_offset,
                        uint64_t in_dim, uint64_t out_dim,
                        const ds4_gpu_tensor *x, uint64_t n_tok);
+    /* Optional CUDA native-activation screen/refine/map capability. All three
+     * hooks must be bound together; other backends keep the static ranges. */
+    int (*native_init)(uint32_t, uint64_t *, uint32_t *);
+    int (*native_screen)(ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *,
+                         const void *, uint64_t, uint64_t, uint32_t, uint32_t,
+                         uint32_t, uint32_t, const ds4_gpu_tensor *);
+    int (*native_map)(ds4_gpu_tensor *, const ds4_gpu_tensor *,
+                      const ds4_gpu_tensor *, uint32_t, uint32_t);
     ds4_qwen4exp_block_forward_fn block;
 } ds4_qwen4exp_mtp_gpu_hooks;
 
@@ -685,6 +693,8 @@ typedef struct {
      * tail that overruns n_vocab or overlaps the other range.  The TARGET's
      * verify keeps the whole vocabulary whatever this says: a shortlisted miss
      * costs one rejected draft and never a committed token. */
+    ds4_gpu_tensor *t_native_ids, *t_native_scratch;
+    uint32_t native_capacity;
     uint32_t draft_vocab_prefix;
     uint32_t draft_vocab_tail;
 

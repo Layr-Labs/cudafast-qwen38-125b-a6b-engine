@@ -845,6 +845,16 @@ int ds4_gpu_indexer_top1_value_tensor(
         uint32_t              n_tokens,
         uint32_t              index_offset);
 
+/* Native-head screening: init 1/0/-1 = ready/unsupported/error;
+ * screen positive/0/-1 = refined candidate count/fallback/backend error. */
+int ds4_gpu_mtp_native_screen_init(uint32_t width, uint64_t *bytes, uint32_t *capacity);
+int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out, ds4_gpu_tensor *ids,
+    ds4_gpu_tensor *scratch, const void *map, uint64_t bytes, uint64_t offset,
+    uint32_t dim, uint32_t vocab, uint32_t prefix, uint32_t tail,
+    const ds4_gpu_tensor *x);
+int ds4_gpu_mtp_native_map(ds4_gpu_tensor *winner, const ds4_gpu_tensor *logits,
+    const ds4_gpu_tensor *ids, uint32_t count, uint32_t vocab);
+
 int ds4_gpu_matmul_q8_0_top1_tensor(
         ds4_gpu_tensor       *selected,
         ds4_gpu_tensor       *values,

@@ -865,6 +865,19 @@ int ds4_qwen4exp_mtp_head_init(ds4_qwen4exp_mtp_head *h,
             h->t_logits_tail = mtp_alloc(rows * h->draft_vocab_tail * f, &ok);
         }
     }
+    if (h->n_embd == 2560u && h->draft_vocab_prefix && h->draft_vocab_tail &&
+        h->hooks.native_init && h->hooks.native_screen && h->hooks.native_map) {
+        uint64_t bytes = 0;
+        uint32_t capacity = 0;
+        const int rc = h->hooks.native_init(h->draft_vocab_prefix + h->draft_vocab_tail,
+                                            &bytes, &capacity);
+        if (rc < 0) ok = false;
+        else if (rc > 0 && bytes && capacity && capacity <= h->n_vocab) {
+            h->t_native_scratch = mtp_alloc(bytes, &ok);
+            h->t_native_ids = mtp_alloc((uint64_t)capacity * sizeof(uint32_t), &ok);
+            h->native_capacity = capacity;
+        }
+    }
     h->t_top1         = mtp_alloc(rows * sizeof(uint32_t), &ok);
     h->top1_host      = malloc((size_t)rows * sizeof(uint32_t));
     if (!ok || !h->top1_host) {
@@ -882,7 +895,7 @@ void ds4_qwen4exp_mtp_head_free(ds4_qwen4exp_mtp_head *h) {
         h->t_tokens, h->t_embed_rows, h->t_embed_out, h->t_e_normed,
         h->t_h_normed, h->t_ehx, h->t_hyper, h->t_mix_normed,
         h->t_mix_lowrank, h->t_mix_wide, h->t_sample, h->t_logits,
-        h->t_logits_prefix, h->t_logits_tail, h->t_top1,
+        h->t_logits_prefix, h->t_logits_tail, h->t_top1, h->t_native_ids, h->t_native_scratch,
     };
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
         ds4_gpu_tensor_free(all[i]);
@@ -892,6 +905,8 @@ void ds4_qwen4exp_mtp_head_free(ds4_qwen4exp_mtp_head *h) {
     h->t_mix_lowrank = h->t_mix_wide = h->t_sample = h->t_logits = NULL;
     h->t_logits_prefix = h->t_logits_tail = NULL;
     h->t_top1 = NULL;
+    h->t_native_ids = h->t_native_scratch = NULL;
+    h->native_capacity = 0;
     free(h->top1_host);
     h->top1_host = NULL;
 }
@@ -1010,7 +1025,7 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
      * the top-1's first-max tie rule still picks the lowest id. */
     const uint32_t draft_prefix = h->draft_vocab_prefix;
     const uint32_t draft_tail = draft_prefix ? h->draft_vocab_tail : 0u;
-    const uint32_t draft_width = draft_prefix
+    uint32_t draft_width = draft_prefix
         ? draft_prefix + draft_tail : h->n_vocab;
     const int timing = mtp_head_time_on();
     uint64_t tmark = timing ? mtp_now_ns() : 0;
@@ -1136,6 +1151,19 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                                h->rms_eps, h->weight_bias, h->round_bf16) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_MIXER);
+    bool screened = false;
+    if (ok && logit_rows == 1u && h->t_native_scratch && h->t_native_ids &&
+        h->hooks.native_screen && h->hooks.native_map &&
+        getenv("DS4_MTP_NO_NATIVE_SCREEN") == NULL) {
+        stage = "native head screen and refinement";
+        const int rc = h->hooks.native_screen(h->t_logits, h->t_native_ids,
+                h->t_native_scratch, h->target_map, h->target_size,
+                h->output_offset, n_embd, h->n_vocab, draft_prefix, draft_tail,
+                h->t_sample);
+        if (rc < 0 || (uint32_t)rc > h->native_capacity) ok = false;
+        else if (rc > 0) { screened = true; draft_width = (uint32_t)rc; }
+    }
+
     /* The borrowed LM head, in the target's mapping.  The shortlist runs the
      * SAME kernel over two row ranges of output.weight: Q8_0 rows are
      * ds4_qwen4exp_q8_0_row_bytes() apart in the mapping, so a range is the
@@ -1145,7 +1173,7 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
      * them (the decode-order ladder is row-exact by construction, which is
      * the property the whole speculative cycle stands on), so a shortlist
      * id's logit is the logit the full projection produces. */
-    if (ok) {
+    if (ok && !screened) {
         /* A single row can project its prefix directly to the packed output.
          * Multiple rows retain separate prefix storage and per-row packing. */
         const bool direct_prefix = logit_rows == 1u;
@@ -1190,6 +1218,11 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
         ok = ds4_gpu_indexer_topk_tensor(h->t_top1, h->t_logits,
                                          draft_width, logit_rows, 1u) != 0;
     }
+    if (ok && screened) {
+        stage = "native original winner mapping";
+        ok = h->hooks.native_map(h->t_top1, h->t_logits, h->t_native_ids,
+                                  draft_width, h->n_vocab) != 0;
+    }
     MTP_HEAD_TICK(MTP_HEAD_T_TOP1);
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
@@ -1205,7 +1238,7 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                                  (uint64_t)out_rows * sizeof(uint32_t)) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_TOP1_IN);
-    if (ok) {
+    if (ok && !screened) {
         stage = "logit-0 readback";
         for (uint32_t t = 0; ok && t < out_rows; t++) {
             float logit0;
@@ -1244,7 +1277,9 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
          * prefix it IS the id; above it, rebase into the tail range.  Off
          * mode (prefix 0) packed nothing and the position is the id. */
         uint32_t id = h->top1_host[t];
-        if (draft_prefix && id >= draft_prefix) {
+        if (screened) {
+            if (id >= h->n_vocab) return mtp_fail(err, errlen, "invalid native-screen winner");
+        } else if (draft_prefix && id >= draft_prefix) {
             id = h->n_vocab - draft_tail + (id - draft_prefix);
         }
         draft_out[t] = (int)id;

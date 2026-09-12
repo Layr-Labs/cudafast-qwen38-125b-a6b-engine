@@ -4,6 +4,7 @@
 #include <mma.h>
 #include <cublas_v2.h>
 #include <cub/block/block_radix_sort.cuh>
+#include <cub/device/device_radix_sort.cuh>
 
 #include <stdint.h>
 #include <errno.h>
@@ -35742,3 +35743,5 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
 #define DS4_GLM53_VISION_STREAM cuda_decode_stream()
 #include "ds4_glm53_vision_gpu.cuh"
 #include "ds4_deepseek4_vision_gpu.cuh"
+
+#include "ds4_cuda_mtp_native.cuh"
