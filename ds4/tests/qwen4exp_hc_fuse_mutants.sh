@@ -239,7 +239,38 @@ mutant wide_inject_stream_order caught \
 mutant wide_inject_no_fma caught \
     's|                            iacc\[ho\]);|                            0.0f) + iacc[ho];|'
 
+# ---- the staged norm+quant+inject arm and the owed inject ------------------
+
+# The statistic off the staged registers, one element short: the chain must be
+# the rolled walk's whole chain.
+mutant nqi_staged_sum_short caught \
+    '/qwen4exp_hc_norm_scale_regs(/,/^}/ s|        sum += v \* v;|        if (c != 9u) sum += v * v;|'
+
+# The owed inject applied as a rounded product and an add instead of the
+# standalone kernel'"'"'s one FFMA.
+mutant nqi_pending_no_fma caught \
+    's|                    xv\[s\] = __fmaf_rn(pb\[d\], pi, xv\[s\]);|                    xv[s] = __fadd_rn(xv[s], __fmul_rn(pb[d], pi));|'
+
+# The updated residual computed but not written back: every later reader
+# would see the stale stream.
+mutant nqi_pending_no_writeback caught \
+    's|                    xo\[d\] = xv\[s\];|                    if (d == 0u) xo[d] = xv[s];|'
+
+# The staged inject value taken one stream over: the dot'"'"'s operands move.
+mutant nqi_staged_inject_stream caught \
+    's|                                iw + (uint64_t)ho \* weight_row_bytes, group, g, k),|                                iw + (uint64_t)ho * weight_row_bytes, group, (g + 1u) % n_hc, k),|'
+
+# The staged norm weight taken from the wrong step.
+mutant nqi_staged_weight_step caught \
+    's|                wv\[s\] = wg\[s \* QWEN4EXP_HC_THREADS + threadIdx.x\];|                wv[s] = wg[((s + 1u) % QWEN4EXP_HC_STAGED_STEPS) * QWEN4EXP_HC_THREADS + threadIdx.x];|'
+
 # ---- deliberate no-ops -----------------------------------------------------
+
+# The staged arm and the rolled arm compute the same bytes; sending the
+# production shape down the rolled arm changes nothing.
+mutant nqi_never_staged survives \
+    's|        group == QWEN4EXP_HC_STAGED_STEPS \* QWEN4EXP_HC_THREADS \&\&|        group == 0xffffffffu \&\&|'
+
 
 # The tile shape does not enter the tile'"'"'s arithmetic: run the wide shape
 # at every width, then the narrow one at every width.

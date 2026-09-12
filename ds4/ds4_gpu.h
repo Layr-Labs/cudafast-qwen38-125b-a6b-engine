@@ -3855,6 +3855,34 @@ int ds4_gpu_qwen4exp_hc_mixer_tensor(
         float                 weight_bias,
         int                   round_bf16);
 
+/* ds4_gpu_qwen4exp_hc_inject_tensor(hyper, hyper, pending_block, pending_inject)
+ * followed by ds4_gpu_qwen4exp_hc_mixer_tensor, as one call: the residual is
+ * updated in place and the mixer runs on the updated values.  A backend may
+ * fold the apply into its first read of the residual; the outputs and the
+ * residual left behind are the pair's bit for bit.  `pending_block` NULL is
+ * plain ds4_gpu_qwen4exp_hc_mixer_tensor.  `pending_inject` may be the same
+ * tensor as `inject`. */
+int ds4_gpu_qwen4exp_hc_mixer_pending_tensor(
+        ds4_gpu_tensor       *mixed,
+        ds4_gpu_tensor       *inject,
+        ds4_gpu_tensor       *normed_scratch,
+        ds4_gpu_tensor       *lowrank_scratch,
+        ds4_gpu_tensor       *wide_scratch,
+        ds4_gpu_tensor       *hyper,
+        const ds4_gpu_qwen4exp_slab *norm_weight,
+        const ds4_gpu_qwen4exp_slab *down_weight,
+        const ds4_gpu_qwen4exp_slab *up_weight,
+        const ds4_gpu_qwen4exp_slab *inject_weight,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              n_lowrank,
+        uint32_t              rows,
+        float                 eps,
+        float                 weight_bias,
+        int                   round_bf16,
+        const ds4_gpu_tensor *pending_block,
+        const ds4_gpu_tensor *pending_inject);
+
 /* The same mixer, built ONLY out of the per-op wrappers -- no backend fusion.
  *
  * Nothing in the engine calls it.  It exists so a test can require the entry

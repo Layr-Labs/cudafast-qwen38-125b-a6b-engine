@@ -392,6 +392,14 @@ struct ds4_qwen4exp_session {
     ds4_gpu_tensor *logits;
     ds4_gpu_tensor *spec_top1;
 
+    /* PREFILL ONLY.  True while `hyper` still owes the last block's inject:
+     * the value the model means is hyper + block_out * inject, and the next
+     * mixer applies it on its first read of the residual instead of a
+     * separate 42 MB read-write pass (see qwen4exp_hc_defer_ok).  Every
+     * other reader of `hyper` flushes first.  Never set inside a captured
+     * decode island: the widths that capture are below the threshold. */
+    bool hc_pending;
+
 #ifdef DS4_TEST_HOOKS
     /* A copy of the stream taken INSIDE the batch, immediately before the final
      * mixer reads it.  Comparing it with what the public accessor hands back
@@ -1982,6 +1990,39 @@ static void qwen4exp_trace_report(uint32_t n_tokens) {
 #endif
 
 
+/* The residual inject deferral (prefill only; see ds4_qwen4exp_session::
+ * hc_pending).  The hc_inject kernel is a 42 MB read plus a 42 MB write that
+ * the very next mixer reads straight back; folding the apply into that
+ * mixer's first pass saves the read.  The values are the same FFMA on the
+ * same operands, so the residual, the mixer outputs and everything after are
+ * bit for bit the separate kernel's.  Gated to widths the fused mixer takes
+ * one block per token at (its inject-in-norm threshold) and, with that, clear
+ * of every captured decode island. */
+#define DS4_QWEN4EXP_HC_DEFER_MIN_ROWS 48u
+
+static int qwen4exp_hc_defer_off(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_QWEN4EXP_NO_HC_DEFER");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
+static bool qwen4exp_hc_defer_ok(uint32_t n_tokens) {
+    return n_tokens >= DS4_QWEN4EXP_HC_DEFER_MIN_ROWS && !qwen4exp_hc_defer_off();
+}
+
+/* Settle an owed inject with the standalone kernel.  Used where the next
+ * reader of `hyper` is not a mixer (the PLE block, a diagnostic dump). */
+static bool qwen4exp_hc_flush_pending(ds4_qwen4exp_session *s, uint32_t n_tokens) {
+    if (!s->hc_pending) return true;
+    s->hc_pending = false;
+    return ds4_gpu_qwen4exp_hc_inject_tensor(s->hyper, s->hyper, s->block_out,
+                                             s->inject, DS4_N_EMBD, DS4_N_HC,
+                                             n_tokens) != 0;
+}
+
 static bool qwen4exp_graph_residual(ds4_qwen4exp_session *s,
                                     const ds4_model *m,
                                     const ds4_tensor *norm,
@@ -1990,6 +2031,10 @@ static bool qwen4exp_graph_residual(ds4_qwen4exp_session *s,
                                     const ds4_tensor *inject,
                                     float norm_weight_offset,
                                     uint32_t n_tokens) {
+    /* An owed inject is applied by the mixer itself, inside its first read
+     * of the residual; the pair (inject kernel, mixer) is what it computes. */
+    const bool pending = s->hc_pending;
+    s->hc_pending = false;
 #ifdef DS4_TEST_HOOKS
     /* The tower's final mixer is the only call with no inject head.  Copy what
      * it is about to read, inside this batch so the ordering is the GPU's and
@@ -2010,6 +2055,14 @@ static bool qwen4exp_graph_residual(ds4_qwen4exp_session *s,
     const ds4_gpu_qwen4exp_slab inject_slab =
         inject ? QW_SLAB(m, inject) : (ds4_gpu_qwen4exp_slab){0};
 
+    if (pending) {
+        return ds4_gpu_qwen4exp_hc_mixer_pending_tensor(
+            s->mixed, inject ? s->inject : NULL, s->normed, s->lowrank, s->wide,
+            s->hyper, &norm_slab, &down_slab, &up_slab,
+            inject ? &inject_slab : NULL,
+            DS4_N_EMBD, DS4_N_HC, DS4_N_HC_LOWRANK, n_tokens,
+            DS4_HC_EPS, norm_weight_offset, 1, s->block_out, s->inject) != 0;
+    }
     return ds4_gpu_qwen4exp_hc_mixer_tensor(
         s->mixed, inject ? s->inject : NULL, s->normed, s->lowrank, s->wide,
         s->hyper, &norm_slab, &down_slab, &up_slab,
@@ -2040,7 +2093,13 @@ static bool qwen4exp_graph_layer_island_encode(
             QW_TRACE(QW_SLICE_GDN);
         }
     } else {
-        if (!ds4_gpu_qwen4exp_hc_inject_tensor(s->hyper, s->hyper, s->block_out,
+        /* At prefill widths the inject is owed to the next mixer rather than
+         * applied here (qwen4exp_hc_defer_ok); the slice trace keeps its
+         * order either way, it records what the model computed. */
+        const bool defer = qwen4exp_hc_defer_ok(n_tokens);
+        if (defer) {
+            s->hc_pending = true;
+        } else if (!ds4_gpu_qwen4exp_hc_inject_tensor(s->hyper, s->hyper, s->block_out,
                                                s->inject, DS4_N_EMBD, DS4_N_HC,
                                                n_tokens)) {
             fprintf(stderr, "ds4: qwen4exp attention inject failed at block %u\n", il);
@@ -2060,7 +2119,9 @@ static bool qwen4exp_graph_layer_island_encode(
             return false;
         }
         QW_TRACE(QW_SLICE_MOE);
-        if (!ds4_gpu_qwen4exp_hc_inject_tensor(s->hyper, s->hyper, s->block_out,
+        if (defer) {
+            s->hc_pending = true;
+        } else if (!ds4_gpu_qwen4exp_hc_inject_tensor(s->hyper, s->hyper, s->block_out,
                                                s->inject, DS4_N_EMBD, DS4_N_HC,
                                                n_tokens)) {
             fprintf(stderr, "ds4: qwen4exp FFN inject failed at block %u\n", il);
@@ -2210,6 +2271,7 @@ static void qwen4exp_layer_dump(ds4_qwen4exp_session *s, uint32_t il,
         n_tokens != g_qwen4exp_layer_dump_rows) {
         return;
     }
+    if (!qwen4exp_hc_flush_pending(s, n_tokens)) return;
     if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) return;
     const uint64_t hc = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t n = (uint64_t)n_tokens * hc;
@@ -2259,6 +2321,9 @@ static bool qwen4exp_graph_layers_encode(
          * before mixWithInject.  Running it after the FFN inject instead
          * would feed this block's n-gram contribution to the NEXT block. */
         if (l->has_ple) {
+            /* The PLE residual add reads the stream directly: settle an
+             * owed inject first. */
+            if (!qwen4exp_hc_flush_pending(s, n_tokens)) return false;
             if (!qwen4exp_graph_ple_block(s, m, l, n_tokens, il)) {
                 return false;
             }
@@ -2392,6 +2457,9 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     /* From here on this call writes the caches, the recurrent states, the
      * convolution histories and `pos`; see `state_dirty`. */
     s->state_dirty = true;
+    /* A refused forward may have left an owed inject behind; the stream is
+     * re-seeded below, so it is void. */
+    s->hc_pending = false;
 
 #ifdef DS4_TEST_HOOKS
     g_qwen4exp_trace_len = 0;

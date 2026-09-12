@@ -6946,16 +6946,59 @@ qwen4exp_hc_up_mix_mma_kernel(
     }
 }
 
+/* qwen4exp_hc_norm_scale's consume half, on values already in registers.
+ * Same ascending chain of the same FFMAs, same qwen4exp_block_sum_f32 tree,
+ * and the return line is qwen4exp_hc_norm_scale's own, character for
+ * character, so the mutant script's anchor bites here too. */
+__device__ __forceinline__ static float qwen4exp_hc_norm_scale_regs(
+        const float xv[QWEN4EXP_HC_STAGED_STEPS], uint32_t group, float eps,
+        float *partial) {
+    float sum = 0.0f;
+#pragma unroll
+    for (uint32_t c = 0; c < QWEN4EXP_HC_STAGED_STEPS; c++) {
+        const float v = xv[c];
+        sum += v * v;
+    }
+    const float total = qwen4exp_block_sum_f32(sum, partial);
+    /* 1/sqrt rather than rsqrtf, for the same reason as the unfused kernel. */
+    return 1.0f / sqrtf(total / (float)group + eps);
+}
+
 /* qwen4exp_hc_norm_quant_kernel with the inject head folded in.  Grid (rows),
  * one block per token; the streams run in sequence, each with the reduction
  * and the quantize of the per-stream kernel, and the inject accumulators ride
- * along in registers exactly as in qwen4exp_hc_mix_inject_renorm_kernel. */
+ * along in registers exactly as in qwen4exp_hc_mix_inject_renorm_kernel.
+ *
+ * Staged = 0 is the rolled walk verbatim: the runtime inject-type switch stays
+ * in the loop and one element's loads are in flight at a time.  Staged = 1
+ * (group == QWEN4EXP_HC_STAGED_STEPS * QWEN4EXP_HC_THREADS, the production
+ * shape) loads a thread's ten residual and ten norm-weight elements of the
+ * stream into registers first, takes the statistic off those registers
+ * (qwen4exp_hc_norm_scale_regs: the same chain), and runs the same quantize
+ * and inject statements on them in the same ascending order.  The residual is
+ * read from DRAM once per stream instead of twice, and ten loads are in
+ * flight instead of one; no value, order or rounding point moves.
+ *
+ * Pending = 1 applies the PREVIOUS block's inject on the way in: the residual
+ * this mixer normalizes is hyper + block_out * inject, exactly what
+ * qwen4exp_hc_inject_kernel would have stored (its SASS is one FFMA, block *
+ * inject + residual, and __fmaf_rn below is that instruction; the product's
+ * operand order does not enter an FMA's rounding).  The updated value is
+ * written back to `xw` (the residual, in place) so every later reader --
+ * the up+mix tile, the next inject -- sees what the standalone kernel would
+ * have left there.  Only the DRAM traffic changes: one read of the residual
+ * instead of a read-write-read round trip through a separate kernel.
+ * `pinject` may alias `inject`: a block reads its token's four pending values
+ * at the top and writes its four new ones at the very end, after several
+ * barriers, and no block touches another token's slots. */
+template <int Staged, int InjectType, int Pending>
 __global__ static void qwen4exp_hc_norm_quant_inject_kernel(
         int8_t *xq, float *xscale, float *nscale, float *inject,
         const float *x, const float *w, const char *iw,
         uint32_t group, uint32_t n_hc, uint32_t rows,
         float eps, float weight_bias, int round_bf16,
-        uint32_t weight_type, uint32_t weight_row_bytes) {
+        uint32_t weight_type, uint32_t weight_row_bytes,
+        float *xw, const float *pblock, const float *pinject) {
     /* PDL producer, as the per-stream norm above; this arm runs at the row
      * threshold only, where the projection behind it is the plain MMA tile.
      * The row gate makes that structural rather than a caller convention:
@@ -6975,15 +7018,83 @@ __global__ static void qwen4exp_hc_norm_quant_inject_kernel(
     const uint32_t warps = blockDim.x >> 5u;
     const uint32_t n = n_hc * group;
     const uint64_t row_blocks = n / 32u;
+    const float *pb = Pending ? pblock + (uint64_t)row * group : NULL;
 
     for (uint32_t g = 0; g < n_hc; g++) {
         const float *xg = x + (uint64_t)row * n + (uint64_t)g * group;
         const float *wg = w + (uint64_t)g * group;
+        const uint64_t blk0 = (uint64_t)row * row_blocks + (uint64_t)g * (group / 32u);
+        if (Staged) {
+            float xv[QWEN4EXP_HC_STAGED_STEPS];
+            float wv[QWEN4EXP_HC_STAGED_STEPS];
+#pragma unroll
+            for (uint32_t s = 0; s < QWEN4EXP_HC_STAGED_STEPS; s++) {
+                xv[s] = xg[s * QWEN4EXP_HC_THREADS + threadIdx.x];
+                wv[s] = wg[s * QWEN4EXP_HC_THREADS + threadIdx.x];
+            }
+            if (Pending) {
+                /* qwen4exp_hc_inject_kernel's FFMA: residual + block * inject. */
+                const float pi = pinject[(uint64_t)row * n_hc + g];
+                float *xo = xw + (uint64_t)row * n + (uint64_t)g * group;
+#pragma unroll
+                for (uint32_t s = 0; s < QWEN4EXP_HC_STAGED_STEPS; s++) {
+                    const uint32_t d = s * QWEN4EXP_HC_THREADS + threadIdx.x;
+                    xv[s] = __fmaf_rn(pb[d], pi, xv[s]);
+                    xo[d] = xv[s];
+                }
+            }
+            /* partial[0] is still being read by the previous stream's callers. */
+            __syncthreads();
+            const float scale = qwen4exp_hc_norm_scale_regs(xv, group, eps, partial);
+            if (threadIdx.x == 0u) nscale[(uint64_t)row * n_hc + g] = scale;
+#pragma unroll
+            for (uint32_t k = 0; k < QWEN4EXP_HC_STAGED_STEPS; k++) {
+                const uint32_t i = k * QWEN4EXP_HC_THREADS + threadIdx.x;
+                const float v = qwen4exp_hc_normed_value(xv[k], scale, wv[k],
+                                                         weight_bias, round_bf16);
+                const float vz = qwen4exp_q8_ftz(v);
+                float a = qwen4exp_q8_ftz(fabsf(v));
+#pragma unroll
+                for (int off = 16; off > 0; off >>= 1) {
+                    a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+                }
+                const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
+                const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
+                const uint64_t pair = blk0 + (uint64_t)(k * warps + warp);
+                if (lane == 0u) xscale[pair] = d;
+                int q = (int)lrintf(qwen4exp_q8_ftz(vz * id));
+                q = q > 127 ? 127 : (q < -128 ? -128 : q);
+                xq[pair * 32u + lane] = (int8_t)q;
+
+                /* The same __fmaf_rn chain as the rolled arm, the inject value
+                 * taken by the typed staged accessor (n_embd := group, hs := g,
+                 * s := k resolves to flat index g*group + i). */
+#pragma unroll
+                for (int ho = 0; ho < QWEN4EXP_HC_MAX_STREAMS; ho++) {
+                    if ((uint32_t)ho < n_hc) {
+                        iacc[ho] = __fmaf_rn(v, qwen4exp_hc_inject_value_staged<InjectType>(
+                                iw + (uint64_t)ho * weight_row_bytes, group, g, k),
+                                iacc[ho]);
+                    }
+                }
+                (void)i;
+            }
+            continue;
+        }
+        if (Pending) {
+            /* qwen4exp_hc_inject_kernel's FFMA, applied in place before the
+             * statistic reads the stream. */
+            const float pi = pinject[(uint64_t)row * n_hc + g];
+            float *xo = xw + (uint64_t)row * n + (uint64_t)g * group;
+            for (uint32_t i = threadIdx.x; i < group; i += blockDim.x) {
+                xo[i] = __fmaf_rn(pb[i], pi, xg[i]);
+            }
+            __syncthreads();
+        }
         /* partial[0] is still being read by the previous stream's callers. */
         __syncthreads();
         const float scale = qwen4exp_hc_norm_scale(xg, group, eps, partial);
         if (threadIdx.x == 0u) nscale[(uint64_t)row * n_hc + g] = scale;
-        const uint64_t blk0 = (uint64_t)row * row_blocks + (uint64_t)g * (group / 32u);
 
         uint32_t k = 0;
         for (uint32_t i = threadIdx.x; i < group; i += blockDim.x, k++) {
@@ -7032,6 +7143,52 @@ __global__ static void qwen4exp_hc_norm_quant_inject_kernel(
     }
 }
 
+/* The staged norm+quant+inject arms are the default at the production shape;
+ * this is their valve, read once like the others. */
+static int ds4_qwen4exp_hc_nqi_staged_off(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_QWEN4EXP_NO_HC_NQI_STAGED");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
+/* Every instantiation of the kernel above behind one call.  `pending` picks
+ * the Pending arm; the staged arms need the production group width and a
+ * typed inject weight, everything else keeps the rolled generic arm. */
+static void qwen4exp_hc_norm_quant_inject_launch(
+        int8_t *xq, float *xscale, float *nscale, float *inject,
+        const float *x, const float *w, const char *iw,
+        uint32_t group, uint32_t n_hc, uint32_t rows,
+        float eps, float weight_bias, int round_bf16,
+        uint32_t weight_type, uint32_t weight_row_bytes,
+        float *xw, const float *pblock, const float *pinject) {
+    const uint32_t threads = QWEN4EXP_HC_THREADS;
+    const int pending = pblock != NULL;
+    const int staged = !ds4_qwen4exp_hc_nqi_staged_off() &&
+        group == QWEN4EXP_HC_STAGED_STEPS * QWEN4EXP_HC_THREADS &&
+        (weight_type == (uint32_t)DS4_QWEN4EXP_TY_f32 ||
+         weight_type == (uint32_t)DS4_QWEN4EXP_TY_q8_0);
+#define QWEN4EXP_HC_NQI_LAUNCH(S, T, P)                                       \
+    qwen4exp_hc_norm_quant_inject_kernel<S, T, P>                              \
+        <<<dim3(rows, 1u, 1u), threads, 0, cuda_decode_stream()>>>(            \
+            xq, xscale, nscale, inject, x, w, iw, group, n_hc, rows, eps,      \
+            weight_bias, round_bf16, weight_type, weight_row_bytes,            \
+            xw, pblock, pinject)
+    if (staged && weight_type == (uint32_t)DS4_QWEN4EXP_TY_f32) {
+        if (pending) QWEN4EXP_HC_NQI_LAUNCH(1, DS4_QWEN4EXP_TY_f32, 1);
+        else         QWEN4EXP_HC_NQI_LAUNCH(1, DS4_QWEN4EXP_TY_f32, 0);
+    } else if (staged) {
+        if (pending) QWEN4EXP_HC_NQI_LAUNCH(1, DS4_QWEN4EXP_TY_q8_0, 1);
+        else         QWEN4EXP_HC_NQI_LAUNCH(1, DS4_QWEN4EXP_TY_q8_0, 0);
+    } else {
+        if (pending) QWEN4EXP_HC_NQI_LAUNCH(0, -1, 1);
+        else         QWEN4EXP_HC_NQI_LAUNCH(0, -1, 0);
+    }
+#undef QWEN4EXP_HC_NQI_LAUNCH
+}
+
 /* The stream count the up+mix tile is instantiated for. */
 #define QWEN4EXP_HC_UP_MIX_NT 4
 
@@ -7061,6 +7218,15 @@ static int ds4_qwen4exp_hc_wide_off(void) {
 
 /* Returns 1 on success, 0 on a hard failure, -1 when this shape is not one the
  * fused kernels above can serve and the caller should run the unfused chain. */
+/* `pending_block` / `pending_inject`, when given, are the previous block's
+ * output and inject head that qwen4exp_hc_inject_kernel has NOT yet applied
+ * to `hyper`: this call applies them (hyper += block * inject, in place, the
+ * standalone kernel's FFMA) before anything reads the residual.  The
+ * norm+quant+inject pass folds that in when it runs (one residual read
+ * instead of the round trip); every other leg runs the standalone kernel
+ * first, so the residual is updated on return whichever path was taken.  A
+ * -1 (shape declined) is returned before any launch, so the caller's fallback
+ * still owes the apply. */
 static int qwen4exp_hc_mixer_fused_cuda(
         ds4_gpu_tensor       *mixed,
         ds4_gpu_tensor       *inject,
@@ -7078,9 +7244,19 @@ static int qwen4exp_hc_mixer_fused_cuda(
         uint32_t              rows,
         float                 eps,
         float                 weight_bias,
-        int                   round_bf16) {
+        int                   round_bf16,
+        const ds4_gpu_tensor *pending_block,
+        const ds4_gpu_tensor *pending_inject) {
     const uint32_t threads = QWEN4EXP_HC_THREADS;
     if (n_embd % threads != 0u || n_hc > QWEN4EXP_HC_MAX_STREAMS) return -1;
+    if (pending_block &&
+        (!pending_inject ||
+         pending_block->bytes < (uint64_t)rows * n_embd * sizeof(float) ||
+         pending_inject->bytes < (uint64_t)rows * n_hc * sizeof(float) ||
+         ds4_tensor_device_idx(pending_block) != ds4_tensor_device_idx(mixed) ||
+         ds4_tensor_device_idx(pending_inject) != ds4_tensor_device_idx(mixed))) {
+        return -1;
+    }
     const int staged = qwen4exp_hc_staged_ok(n_embd, n_hc);
 
     const uint64_t wide = (uint64_t)n_hc * n_embd;
@@ -7161,13 +7337,26 @@ static int qwen4exp_hc_mixer_fused_cuda(
     const int inject_in_norm =
         upw && inject && rows >= QWEN4EXP_HC_FUSE_MIX_MIN_ROWS;
 
+    if (pending_block && !inject_in_norm) {
+        /* No pass here folds the apply in: run the standalone kernel, so the
+         * residual every leg below reads is the updated one. */
+        qwen4exp_hc_inject_kernel<<<dim3((n_embd + 255u) / 256u, n_hc, rows),
+                                    256, 0, cuda_decode_stream()>>>(
+                (float *)hyper->ptr, (const float *)hyper->ptr,
+                (const float *)pending_block->ptr,
+                (const float *)pending_inject->ptr, n_embd, n_hc, rows);
+        if (!cuda_ok(cudaGetLastError(), "qwen4exp_hc_inject launch")) return 0;
+    }
+
     if (inject_in_norm) {
-        qwen4exp_hc_norm_quant_inject_kernel<<<dim3(rows, 1u, 1u), threads, 0,
-                                               cuda_decode_stream()>>>(
+        qwen4exp_hc_norm_quant_inject_launch(
                 xq, xscale, nscale, (float *)inject->ptr,
                 (const float *)hyper->ptr, normw, iw, n_embd, n_hc, rows,
                 eps, weight_bias, round_bf16, inject_weight->type,
-                (uint32_t)iw_row_bytes);
+                (uint32_t)iw_row_bytes,
+                (float *)hyper->ptr,
+                pending_block ? (const float *)pending_block->ptr : NULL,
+                pending_block ? (const float *)pending_inject->ptr : NULL);
     } else if (staged) {
         /* PDL consumer at the decode widths only (rows <= 2): the stream
          * predecessor is the attention inject qwen4exp_hc_inject_kernel,
@@ -7307,6 +7496,7 @@ static int qwen4exp_hc_mixer_fused_cuda(
 }
 
 #define DS4_QWEN4EXP_HC_HAVE_FUSED 1
+#define DS4_QWEN4EXP_HC_HAVE_PENDING 1
 
 /* =========================================================================
  * Qwen4-Exp QSA block, the CUDA twin of metal/qwen4exp_qsa.metal.

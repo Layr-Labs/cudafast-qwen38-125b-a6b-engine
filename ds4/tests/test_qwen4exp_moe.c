@@ -924,7 +924,7 @@ static void run_router_f32_prefill_exact_case(int RF32_IN, int RF32_OUT) {
     static const uint32_t widths[] = {
         1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u, 11u, 12u, 13u, 15u, 16u, 17u, 18u,
         23u, 24u, 25u, 31u, 32u, 33u, 47u, 63u, 64u, 65u, 96u, 127u, 128u,
-        129u, 170u, 171u, 172u, 255u, 256u, 257u, 511u, 512u, 1023u, 1024u,
+        129u, 170u, 171u, 172u, 255u, 256u, 257u, 511u, 512u, 1017u, 1023u, 1024u,
     };
     const int n_widths = (int)(sizeof(widths) / sizeof(widths[0]));
     uint64_t differing = 0, checked = 0, sel_diff = 0, tiled = 0;

@@ -450,7 +450,7 @@ static void check_q8_row_tile(const uint8_t *model) {
 void ds4_gpu_enable_q8_dense_mma(void);
 
 static void check_mixer_equivalence(uint8_t *model, const char *up_path) {
-    static const uint32_t row_set[] = { 1u, 2u, 3u, 4u, 7u, 47u, 48u, 64u, ROWS_LONG };
+    static const uint32_t row_set[] = { 1u, 2u, 3u, 4u, 7u, 47u, 48u, 64u, 1017u, ROWS_LONG };
     const ds4_gpu_qwen4exp_slab norm_slab =
         hc_slab(model, MODEL_BYTES, NORM_WIDE_OFF);
     const ds4_gpu_qwen4exp_slab down_slab =
@@ -631,6 +631,150 @@ static void check_mixer_equivalence(uint8_t *model, const char *up_path) {
     printf("  HC changed-input graph replay: %llu complete comparisons passed\n",
            (unsigned long long)graph_cases);
 #endif
+}
+
+/* ---- the mixer with an owed inject against the two-call pair ---------- */
+
+/* ds4_gpu_qwen4exp_hc_mixer_pending_tensor is DEFINED as the pair
+ *
+ *     ds4_gpu_qwen4exp_hc_inject_tensor(hyper, hyper, block, inject)
+ *     ds4_gpu_qwen4exp_hc_mixer_tensor(..., hyper, ...)
+ *
+ * and the CUDA backend folds the apply into the norm pass's first read of the
+ * residual at prefill widths.  This holds the one call against the pair at
+ * zero tolerance on all three things it touches: the residual it leaves
+ * behind, the mixed block input, and the new inject head.  The pending inject
+ * is passed AS the mixer's own inject output tensor, which is how the engine
+ * calls it (the same session slot holds last block's head and this block's),
+ * so the read-before-write inside the kernel is exercised, not assumed.
+ *
+ * Widths: below the fold threshold (the pair runs verbatim), at it, a full
+ * chunk, and a ragged one (1017: the last token block is no different, but a
+ * width that is not a multiple of anything is the one a stride error shows
+ * on).  Inject encodings f32 and Q8_0, both flags, and the final mixer
+ * (inject head absent, the pending apply still owed). */
+static void check_mixer_pending(uint8_t *model, const char *up_path) {
+    static const uint32_t row_set[] = { 1u, 7u, 47u, 48u, 64u, 1017u, ROWS_LONG };
+    const ds4_gpu_qwen4exp_slab norm_slab =
+        hc_slab(model, MODEL_BYTES, NORM_WIDE_OFF);
+    const ds4_gpu_qwen4exp_slab down_slab =
+        hc_slab(model, MODEL_BYTES, DOWN_OFF);
+    const ds4_gpu_qwen4exp_slab up_slab =
+        hc_slab(model, MODEL_BYTES, UP_OFF);
+    ds4_gpu_qwen4exp_slab inject_f32 =
+        hc_slab(model, MODEL_BYTES, INJECT_OFF);
+    ds4_gpu_qwen4exp_slab inject_q8 =
+        hc_slab(model, MODEL_BYTES, INJECT_Q8_OFF);
+    inject_q8.row_bytes = (uint64_t)(WIDE / 32) * 34u;
+    inject_q8.type = TENSOR_Q8_0;
+
+    uint64_t cases = 0;
+    for (uint32_t ri = 0; ri < sizeof(row_set) / sizeof(row_set[0]); ri++) {
+        const uint32_t rows = row_set[ri];
+        const uint64_t hc_count = (uint64_t)rows * WIDE;
+        const uint64_t embd_count = (uint64_t)rows * N_EMBD;
+        const uint64_t inj_count = (uint64_t)rows * N_HC;
+        const uint64_t mix_slots = embd_count + 16u;
+
+        float *hyper = alloc_floats(hc_count);
+        float *block = alloc_floats(embd_count);
+        float *inj0 = alloc_floats(inj_count);
+        for (uint64_t i = 0; i < hc_count; i++) hyper[i] = next_unit();
+        for (uint64_t i = 0; i < embd_count; i++) block[i] = 0.5f * next_unit();
+        for (uint64_t i = 0; i < inj_count; i++) inj0[i] = 1.0f + 0.7f * next_unit();
+
+        ds4_gpu_tensor *hyper_a = upload(hyper, hc_count);
+        ds4_gpu_tensor *hyper_b = upload(hyper, hc_count);
+        ds4_gpu_tensor *block_t = upload(block, embd_count);
+        ds4_gpu_tensor *inject_a = upload(inj0, inj_count);
+        ds4_gpu_tensor *inject_b = upload(inj0, inj_count);
+        ds4_gpu_tensor *normed_t = ds4_gpu_tensor_alloc(hc_count * sizeof(float));
+        ds4_gpu_tensor *wide_t = ds4_gpu_tensor_alloc(hc_count * sizeof(float));
+        ds4_gpu_tensor *lowrank_t =
+            ds4_gpu_tensor_alloc((uint64_t)rows * N_LOWRANK * sizeof(float));
+        ds4_gpu_tensor *mixed_a = ds4_gpu_tensor_alloc(mix_slots * sizeof(float));
+        ds4_gpu_tensor *mixed_b = ds4_gpu_tensor_alloc(mix_slots * sizeof(float));
+        require_ok(hyper_a && hyper_b && block_t && inject_a && inject_b &&
+                   normed_t && wide_t && lowrank_t && mixed_a && mixed_b,
+                   "pending tensor allocation");
+
+        float *hyper_ref = alloc_floats(hc_count);
+        float *hyper_got = alloc_floats(hc_count);
+        float *mixed_ref = alloc_floats(mix_slots);
+        float *mixed_got = alloc_floats(mix_slots);
+        float *inject_ref = alloc_floats(inj_count);
+        float *inject_got = alloc_floats(inj_count);
+
+        for (int head = 0; head < 3; head++) {
+            const ds4_gpu_qwen4exp_slab *iw =
+                head == 0 ? &inject_f32 : (head == 1 ? &inject_q8 : NULL);
+            for (int bias = 0; bias < 2; bias++) {
+                for (int bf16 = 0; bf16 < 2; bf16++) {
+                    const float weight_bias = bias ? 1.0f : 0.0f;
+                    /* Fresh residual and pending head on both sides. */
+                    require_ok(ds4_gpu_tensor_write(hyper_a, 0, hyper, hc_count * sizeof(float)) &&
+                               ds4_gpu_tensor_write(hyper_b, 0, hyper, hc_count * sizeof(float)) &&
+                               ds4_gpu_tensor_write(inject_a, 0, inj0, inj_count * sizeof(float)) &&
+                               ds4_gpu_tensor_write(inject_b, 0, inj0, inj_count * sizeof(float)),
+                               "pending inputs");
+                    memset(mixed_ref, 0xa5, mix_slots * sizeof(float));
+                    require_ok(ds4_gpu_tensor_write(mixed_a, 0, mixed_ref, mix_slots * sizeof(float)) &&
+                               ds4_gpu_tensor_write(mixed_b, 0, mixed_ref, mix_slots * sizeof(float)),
+                               "pending canaries");
+
+                    /* The pair. */
+                    require_ok(ds4_gpu_qwen4exp_hc_inject_tensor(
+                                   hyper_a, hyper_a, block_t, inject_a,
+                                   N_EMBD, N_HC, rows), "pending reference inject");
+                    require_ok(ds4_gpu_qwen4exp_hc_mixer_tensor(
+                                   mixed_a, iw ? inject_a : NULL, normed_t, lowrank_t,
+                                   wide_t, hyper_a, &norm_slab, &down_slab, &up_slab,
+                                   iw, N_EMBD, N_HC, N_LOWRANK, rows, 1e-6f,
+                                   weight_bias, bf16), "pending reference mixer");
+                    download(hyper_a, hyper_ref, hc_count);
+                    download(mixed_a, mixed_ref, mix_slots);
+                    download(inject_a, inject_ref, inj_count);
+
+                    /* The one call, the pending head in the mixer's own slot. */
+                    require_ok(ds4_gpu_qwen4exp_hc_mixer_pending_tensor(
+                                   mixed_b, iw ? inject_b : NULL, normed_t, lowrank_t,
+                                   wide_t, hyper_b, &norm_slab, &down_slab, &up_slab,
+                                   iw, N_EMBD, N_HC, N_LOWRANK, rows, 1e-6f,
+                                   weight_bias, bf16, block_t, inject_b),
+                               "pending mixer");
+                    download(hyper_b, hyper_got, hc_count);
+                    download(mixed_b, mixed_got, mix_slots);
+                    download(inject_b, inject_got, inj_count);
+
+                    require_identical("pending mixer residual", hyper_got, hyper_ref,
+                                      hc_count * sizeof(float));
+                    require_identical("pending mixer block input", mixed_got, mixed_ref,
+                                      mix_slots * sizeof(float));
+                    require_identical("pending mixer inject head", inject_got, inject_ref,
+                                      inj_count * sizeof(float));
+                    /* And it did apply: the residual moved unless the pending head
+                     * was exactly zero, which it is not. */
+                    require_ok(memcmp(hyper_got, hyper, hc_count * sizeof(float)) != 0,
+                               "pending mixer applied the inject");
+                    cases++;
+                }
+            }
+        }
+
+        free(inject_got); free(inject_ref);
+        free(mixed_got); free(mixed_ref);
+        free(hyper_got); free(hyper_ref);
+        ds4_gpu_tensor_free(mixed_b); ds4_gpu_tensor_free(mixed_a);
+        ds4_gpu_tensor_free(lowrank_t); ds4_gpu_tensor_free(wide_t);
+        ds4_gpu_tensor_free(normed_t);
+        ds4_gpu_tensor_free(inject_b); ds4_gpu_tensor_free(inject_a);
+        ds4_gpu_tensor_free(block_t);
+        ds4_gpu_tensor_free(hyper_b); ds4_gpu_tensor_free(hyper_a);
+        free(inj0); free(block); free(hyper);
+    }
+    printf("  %-56s exact over %llu cases (%s)\n",
+           "mixer with owed inject equals inject then mixer",
+           (unsigned long long)cases, up_path);
 }
 
 int main(void) {
@@ -1068,6 +1212,7 @@ int main(void) {
     }
 
     check_mixer_equivalence(model, "eight-row tile");
+    check_mixer_pending(model, "eight-row tile");
 
     /* The qwen4exp tower switches the dense Q8_0 projections onto the int8
      * MMA tile (ds4_qwen4exp.inc, qwen4exp_finish_derived), and the fused
@@ -1077,6 +1222,7 @@ int main(void) {
      * The switch is one-way, which is why this pass is last. */
     ds4_gpu_enable_q8_dense_mma();
     check_mixer_equivalence(model, "MMA tile");
+    check_mixer_pending(model, "MMA tile");
 
     munmap(model, MODEL_BYTES);
     printf("test_qwen4exp_hc_norm: ok\n");

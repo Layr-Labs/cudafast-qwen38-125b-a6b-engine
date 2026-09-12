@@ -17977,6 +17977,110 @@ static void matmul_f32_warp_tile_kernel(
     }
 }
 
+/* The same warp tile, eight warps to a block instead of four, arranged WR
+ * row-groups by WC column-groups.  Nothing a warp computes changes: the eight
+ * chains, the pairs they are walked in, the fold order and the shuffle tree
+ * are matmul_f32_warp_tile_kernel's line for line (the pair walk IS the same
+ * function, and the fold and tree lines below are its own text, so the
+ * router mutant script's anchors bite here too).  What changes is which
+ * warps share an SM at once: the WC warps of a row group read the same TM
+ * activation rows and the WR warps of a column group read the same TN weight
+ * columns, so a block's L2 traffic per output drops from (TM + TN) row-reads
+ * per tile to (WR*TM + WC*TN) per WR*WC tiles, and the residency is one
+ * 256-thread block per SM rather than two 128-thread ones. */
+template <int TM, int TN, int WR, int WC, int MC>
+__global__ __launch_bounds__(32 * WR * WC, 1)
+static void matmul_f32_warp_tile8_kernel(
+        float *out,
+        const float *w,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint32_t n_rows) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5;
+    const uint32_t wr_i = warp / (uint32_t)WC, wc_i = warp % (uint32_t)WC;
+    const uint32_t tile = blockIdx.x * (uint32_t)WC + wc_i;
+    const uint32_t ntn = (uint32_t)(out_dim / (uint64_t)TN);
+    if (tile >= ntn) return;
+    const uint32_t col0 = tile * (uint32_t)TN;
+    const uint32_t row0 = (blockIdx.y * (uint32_t)WR + wr_i) * (uint32_t)TM;
+    if (row0 >= n_rows) return;
+    const uint32_t take = n_rows - row0 < (uint32_t)TM ? n_rows - row0
+                                                       : (uint32_t)TM;
+
+    const float *wr[TN];
+    const float *xr[TM];
+#pragma unroll
+    for (int c = 0; c < TN; c++) wr[c] = w + (uint64_t)(col0 + c) * in_dim;
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+        xr[t] = x + (uint64_t)(row0 + (t < (int)take ? (uint32_t)t : 0u)) * in_dim;
+    const uint32_t mcnt = (uint32_t)(in_dim >> 8);
+
+    float A[TM][TN], B[TM][TN], t0[TM][TN], t1[TM][TN];
+
+    /* h(p,64) = (c_p + c_{p+128}) + (c_{p+64} + c_{p+192}) */
+    matmul_f32_warp_tile_pair<TM, TN, MC>(t0, t1, 0u, 4u, lane, mcnt, wr, xr);
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int c = 0; c < TN; c++) A[t][c] = t0[t][c] + t1[t][c];
+    matmul_f32_warp_tile_pair<TM, TN, MC>(t0, t1, 2u, 6u, lane, mcnt, wr, xr);
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int c = 0; c < TN; c++) A[t][c] = A[t][c] + (t0[t][c] + t1[t][c]);
+    /* h(p+32,64) = (c_{p+32} + c_{p+160}) + (c_{p+96} + c_{p+224}) */
+    matmul_f32_warp_tile_pair<TM, TN, MC>(t0, t1, 1u, 5u, lane, mcnt, wr, xr);
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int c = 0; c < TN; c++) B[t][c] = t0[t][c] + t1[t][c];
+    matmul_f32_warp_tile_pair<TM, TN, MC>(t0, t1, 3u, 7u, lane, mcnt, wr, xr);
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int c = 0; c < TN; c++) B[t][c] = B[t][c] + (t0[t][c] + t1[t][c]);
+
+    /* h(p,32) = h(p,64) + h(p+32,64), then strides 16, 8, 4, 2, 1. */
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int c = 0; c < TN; c++) {
+            float s = A[t][c] + B[t][c];
+#pragma unroll
+            for (int d = 16; d > 0; d >>= 1) {
+                s = s + __shfl_down_sync(0xffffffffu, s, d);
+            }
+            A[t][c] = s;
+        }
+    if (lane == 0u) {
+#pragma unroll
+        for (int t = 0; t < TM; t++) {
+            if ((uint32_t)t < take) {
+#pragma unroll
+                for (int c = 0; c < TN; c++) {
+                    out[(uint64_t)(row0 + (uint32_t)t) * out_dim +
+                        (uint64_t)(col0 + (uint32_t)c)] = A[t][c];
+                }
+            }
+        }
+    }
+}
+
+/* The eight-warp arrangement: four row groups by two column groups, so a
+ * block covers 24 rows by 16 columns.  DS4_F32_NO_WARP_TILE8 keeps the
+ * four-warp kernel above. */
+#define DS4_F32_WARP_TILE8_WR 4
+#define DS4_F32_WARP_TILE8_WC 2
+
+static inline int matmul_f32_warp_tile8_off(void) {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("DS4_F32_NO_WARP_TILE8") != NULL ? 1 : 0;
+    return cached;
+}
+
 /* Tile geometry, chosen by interleaved paired timing against the block kernel
  * it replaces (GB10, 48 SM, sm_121a; ncu is unavailable on this box so the
  * evidence is wall time and ptxas -v, not counters).  TM = 6, TN = 8, four
@@ -18436,6 +18540,25 @@ extern "C" int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
                   1);
         /* n_embd is 2560, so the chain length is 10 and the walk unrolls
          * whole.  Any other multiple of 256 takes the runtime count. */
+        /* The eight-warp block at the production chain length only: the
+         * runtime-count arm measured slower there, and nothing in the tower
+         * reaches it. */
+        if (in_dim == 2560u && !matmul_f32_warp_tile8_off()) {
+            const unsigned wr8 = DS4_F32_WARP_TILE8_WR, wc8 = DS4_F32_WARP_TILE8_WC;
+            const unsigned bm8 = wr8 * DS4_F32_WARP_TILE_TM;
+            const uint64_t ytiles8 = ((uint64_t)n_rows + bm8 - 1u) / bm8;
+            if (ytiles8 <= 65535u) {
+                dim3 grid8((ntn + wc8 - 1u) / wc8, (unsigned)ytiles8, 1);
+                matmul_f32_warp_tile8_kernel<DS4_F32_WARP_TILE_TM,
+                                             DS4_F32_WARP_TILE_TN,
+                                             DS4_F32_WARP_TILE8_WR,
+                                             DS4_F32_WARP_TILE8_WC, 2560 / 256>
+                    <<<grid8, 32 * wr8 * wc8, 0, cuda_decode_stream()>>>(
+                        (float *)out->ptr, (const float *)w,
+                        (const float *)x->ptr, in_dim, out_dim, n_rows);
+                return cuda_ok(cudaGetLastError(), "matmul_f32 warp tile8 launch");
+            }
+        }
         if (in_dim == 2560u) {
             matmul_f32_warp_tile_kernel<DS4_F32_WARP_TILE_TM,
                                         DS4_F32_WARP_TILE_TN,
