@@ -19,9 +19,15 @@ static float random_value(void) {
     rnd_state^=rnd_state<<13; rnd_state^=rnd_state>>17; rnd_state^=rnd_state<<5;
     return ((int)(rnd_state%20001)-10000)*.0001f;
 }
+/* 0: the retained single-row recurrence (the reference); 1: the default
+ * prefill path (the eight-lane octet kernel); 2: the four-row value-reuse
+ * kernel the octet kernel replaced.  Every mode must match mode 0 byte for
+ * byte over every field. */
 static void mode(unsigned candidate) {
-    if (candidate) unsetenv("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE");
-    else require_ok(setenv("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE","1",1)==0,"reference mode");
+    unsetenv("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE");
+    unsetenv("DS4_QWEN4EXP_NO_GDN_OCTET");
+    if (candidate==0) require_ok(setenv("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE","1",1)==0,"reference mode");
+    if (candidate==2) require_ok(setenv("DS4_QWEN4EXP_NO_GDN_OCTET","1",1)==0,"value-reuse mode");
 }
 static void write_values(ds4_gpu_tensor *v,size_t bytes,float scale,unsigned pattern) {
     float *h=require_alloc(bytes,"host values");
@@ -102,7 +108,7 @@ int main(void) {
     // Grow the convolution scratch before creating any captured operation.
     mode(0);operate(&a,model,&g_tiled,1025,6);free_case(&a);
     unsigned char *ref[FIELDS]={0};unsigned eager=0,graphs=0,changed=0;
-    const unsigned widths[]={1,2,3,7,8,63,64,65,256,1024,1025};
+    const unsigned widths[]={1,2,3,7,8,63,64,65,256,1016,1017,1024,1025};
     const float scales[]={.2f,1e-20f,10.0f,0.0f};
     const weight_set *sets[]={&g_tiled,&g_grouped,&g_fast_decay};
     for(unsigned wi=0;wi<sizeof(widths)/sizeof(widths[0]);wi++) {
@@ -110,15 +116,15 @@ int main(void) {
       for(unsigned si=0;si<3;si++) {
         unsigned tokens=widths[wi],snap=tokens<8?tokens-1:6;
         ds4_gpu_decode_graphs_invalidate();
-        ds4_decode_graph_key keys[2]={{.il=1},{.il=2}};
+        ds4_decode_graph_key keys[3]={{.il=1},{.il=2},{.il=3}};
         for(unsigned trial=0;trial<4;trial++) {
             refill(&a,scales[trial],trial==2);
-            for(unsigned v=0;v<2;v++) {
+            for(unsigned v=0;v<3;v++) {
                 mode(v);reset_case(&a,1);operate(&a,model,sets[si],tokens,snap);
                 snapshot_or_compare(&a,ref,v!=0);
                 if(v)eager++;
             }
-            for(unsigned v=0;v<2;v++) {
+            for(unsigned v=0;v<3;v++) {
                 mode(v);
                 if(trial==0) {
                     require_ok(ds4_gpu_decode_graph_begin(&keys[v])==-1,"graph warmup");
@@ -139,5 +145,6 @@ int main(void) {
     printf("GDN_VALUE_REUSE_COMPLETE eager=%u graph=%u changed=%u PASS\n",eager,graphs,changed);fflush(stdout);
     for(unsigned j=0;j<FIELDS;j++)free(ref[j]);
     unsetenv("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE");
+    unsetenv("DS4_QWEN4EXP_NO_GDN_OCTET");
     ds4_gpu_cleanup();munmap(model,MODEL_BYTES);return 0;
 }

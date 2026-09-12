@@ -8,8 +8,7 @@
 # is worth exactly as much as its ability to fail, so this script breaks the
 # pipelined kernel one line at a time and requires the test to notice: the
 # k order, the float chain's association, the pipeline's stage pairing, the
-# weight fragment's slots, the seeded conversion, and the wide-output rung's
-# routing.  The last mutant is a
+# weight fragment's slots, and the seeded conversion.  The last mutant is a
 # deliberate no-op (the commutative operands of one multiply) and must
 # SURVIVE, so a change that made it observable would also be reported.
 #
@@ -136,13 +135,6 @@ mutant fragment_lane_swap caught \
 # The seed the conversion subtracts, one off.
 mutant magic_seed caught \
     's|#define Q8_MMA_MAGIC_BITS 0x4B400000|#define Q8_MMA_MAGIC_BITS 0x4B400001|'
-
-# The wide-output rung of the ladder disabled while the valve says it is on:
-# the wide arm's outputs would still match (every rung is the same
-# arithmetic), so what must catch it is the arm's routing check,
-# ds4_gpu_q8_mma_pipe_last_bn, not its byte comparison.
-mutant wide_rung_off caught \
-    's|    const int wide = cuda_q8_mma_pipe_wide_mode();|    const int wide = 0; /* mutant */|'
 
 # The commutative operands of one multiply, which is the same rounding.
 mutant fmul_operands_swapped survives \

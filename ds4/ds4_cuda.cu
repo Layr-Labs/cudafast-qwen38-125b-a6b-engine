@@ -17234,39 +17234,6 @@ extern "C" void ds4_gpu_set_q8_mma_pipe(int mode) {
     g_q8_mma_pipe = mode;
 }
 
-/* The wide-output rung of the pipe ladder below, DS4_CUDA_MMA_PIPE_WIDE:
- * 0 keeps the prior ladder; unset or 1 routes out_dim > 4096 through the
- * 128x128 tile; 2 tries the 256-wide tile first (see the ladder).
- * The tile shape does not enter the pipe's arithmetic -- the kernel's
- * contract two hundred lines up holds every instantiation to the same per
- * output accumulation chain -- so the valve routes, it does not compute.
- * Read once like g_q8_mma_pipe; the test flips it through
- * ds4_gpu_set_q8_mma_pipe_wide. */
-static int g_q8_mma_pipe_wide = -1;
-static int cuda_q8_mma_pipe_wide_mode(void) {
-    if (g_q8_mma_pipe_wide < 0) {
-        int mode = 1;
-        const char *e = getenv("DS4_CUDA_MMA_PIPE_WIDE");
-        if (e != NULL) {
-            mode = atoi(e);
-            if (mode < 0 || mode > 2) mode = 1;
-        }
-        g_q8_mma_pipe_wide = mode;
-    }
-    return g_q8_mma_pipe_wide;
-}
-extern "C" void ds4_gpu_set_q8_mma_pipe_wide(int mode) {
-    g_q8_mma_pipe_wide = mode;
-}
-
-/* The BN of the last launch the pipe took (0 until one does), so a box can
- * tell which rung a valve setting actually routed through -- a refused
- * shared-memory opt-in falls back silently, and bytes alone cannot show it. */
-static int g_q8_mma_pipe_last_bn = 0;
-extern "C" int ds4_gpu_q8_mma_pipe_last_bn(void) {
-    return g_q8_mma_pipe_last_bn;
-}
-
 /* The dynamic shared memory opt-in, once per instantiation; done eagerly
  * from ds4_gpu_enable_q8_dense_mma so no launch has to do it inside a
  * stream capture. */
@@ -17293,7 +17260,6 @@ static int cuda_q8_mma_pipe_launch(float *out, const unsigned char *w,
     dim3 grid((n_rows + C::BM - 1u) / C::BM, (unsigned)((out_dim + C::BN - 1u) / C::BN), 1u);
     matmul_q8_0_preq_rows_mma_pipe_kernel<WM, WN, MT, NT, G, STAGES>
         <<<grid, C::THREADS, C::SMEM, cuda_decode_stream()>>>(out, w, xq, xscale, out_dim, n_rows, blocks);
-    g_q8_mma_pipe_last_bn = C::BN;
     return 1;
 }
 
@@ -17301,14 +17267,12 @@ static void cuda_q8_mma_pipe_prepare(void) {
     if (!cuda_q8_mma_available()) return;
     (void)cuda_q8_mma_pipe_attr<2, 2, 4, 4, 4, 2>();
     (void)cuda_q8_mma_pipe_attr<2, 4, 4, 4, 4, 2>();
-    (void)cuda_q8_mma_pipe_attr<2, 8, 4, 4, 4, 2>();
 }
 
 /* The pipelined tile's shape ladder.  Returns 0 when the call is not one it
  * takes (alignment, a K that is not a multiple of 256, a width below the
  * prefill regime, or a shared-memory opt-in failure) and the tile above
- * runs instead.  DS4_CUDA_MMA_PIPE_WIDE adds an opt-in rung above the
- * ladder for the widest outputs; see the wide-rung comment inside. */
+ * runs instead. */
 static int cuda_q8_mma_pipe_try(float *out, const unsigned char *w,
                                 const int8_t *xq, const float *xscale,
                                 uint64_t out_dim, uint32_t n_rows,
@@ -17325,33 +17289,6 @@ static int cuda_q8_mma_pipe_try(float *out, const unsigned char *w,
      * projection at 1024 rows -- 6144 -> 2560 401 us against the 128x128
      * tile's 452, 10240 -> 320 120 against 157 -- except the attention k/v
      * (2560 -> 512), where the 128x128 tile's 48 us beats its 50. */
-    /* The wide-output rung (DS4_CUDA_MMA_PIPE_WIDE, above): the three
-     * widest projections -- qkv 2560 -> 10240, attention q 2560 -> 12288,
-     * GDN gate 2560 -> 6144 -- sit on the 128x64 tile here, and their L2
-     * read amplification is dominated by the y-block count out_dim/BN, every
-     * y-block re-reading the quantized activations (160, 192 and 96 of them;
-     * the audit's rows 11/12/14 measured 684, 822 and 278 MB per launch).
-     * 1 halves those counts on the 128x128 tile; 2 quarters them on the
-     * 256-wide tile, a measurement arm only: 120 KB of shared memory a
-     * device may refuse the opt-in for, and 640 threads capping per-thread
-     * registers at 102 -- below what the producers stage whole and the
-     * consumers accumulate -- so it may spill as much as it saves.  A
-     * refusal falls back rung by rung to the ladder this device measured.
-     * 4096 keeps the 2560-wide out projections on the 128x64 tile, where it
-     * measured the faster of the two.  Every rung is the same arithmetic
-     * (the kernel's contract), so the choice is byte-for-byte safe; the
-     * valve only says which rung. */
-    const int wide = cuda_q8_mma_pipe_wide_mode();
-    if (wide != 0 && out_dim > 4096u) {
-        if (wide >= 2 &&
-            cuda_q8_mma_pipe_launch<2, 8, 4, 4, 4, 2>(out, w, xq, xscale, out_dim, n_rows, blocks)) {
-            return 1;
-        }
-        if (cuda_q8_mma_pipe_launch<2, 4, 4, 4, 4, 2>(out, w, xq, xscale, out_dim, n_rows, blocks)) {
-            return 1;
-        }
-        /* A refused shared-memory opt-in falls through to the rungs below. */
-    }
     if (out_dim > 384u && out_dim <= 1024u) {
         return cuda_q8_mma_pipe_launch<2, 4, 4, 4, 4, 2>(out, w, xq, xscale, out_dim, n_rows, blocks);
     }

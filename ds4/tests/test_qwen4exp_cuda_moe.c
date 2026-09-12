@@ -128,43 +128,6 @@ int main(void) {
     uint8_t b6[210 * SUPERBLOCKS];
     int mismatches = 0;
 
-    /* The slice-parity staging reads each super-block header as one sixteen-
-     * byte load and takes the scale/min pair out of the three words the load
-     * leaves in registers, rather than a byte at a time.  Both forms are in
-     * this file's extracted bodies now, so the host can hold them to the
-     * same reference over random headers: every group index, and bytes that
-     * exercise both the six-bit masks and the packed high-bit split. */
-    for (int trial = 0; trial < 50000; trial++) {
-        uint8_t hdr[12];
-        uint32_t a, b, c;
-        for (int i = 0; i < 12; i++) {
-            hdr[i] = trial < 8 ? (uint8_t)(trial * 31 + i * 37)
-                               : (uint8_t)rng_u32();
-        }
-        a = (uint32_t)hdr[0] | ((uint32_t)hdr[1] << 8) |
-            ((uint32_t)hdr[2] << 16) | ((uint32_t)hdr[3] << 24);
-        b = (uint32_t)hdr[4] | ((uint32_t)hdr[5] << 8) |
-            ((uint32_t)hdr[6] << 16) | ((uint32_t)hdr[7] << 24);
-        c = (uint32_t)hdr[8] | ((uint32_t)hdr[9] << 8) |
-            ((uint32_t)hdr[10] << 16) | ((uint32_t)hdr[11] << 24);
-        for (uint32_t j = 0; j < 8u; j++) {
-            uint8_t s1 = 0, m1 = 0;
-            uint32_t ps = 0, pm = 0;
-            int rs = 0, rm = 0;
-            dev_q4_K_get_scale_min(j, hdr, &s1, &m1);
-            qw_q4k_header_scale_min(j, a, b, c, &ps, &pm);
-            ref_scale_min(hdr, (int)j, &rs, &rm);
-            if (s1 != (uint8_t)ps || m1 != (uint8_t)pm ||
-                ps != (uint32_t)rs || pm != (uint32_t)rm) {
-                if (mismatches++ < 5) {
-                    printf("q4_K header scale/min group %u: packed (%u,%u), "
-                           "byte accessor (%u,%u), reference (%d,%d)\n",
-                           j, ps, pm, s1, m1, rs, rm);
-                }
-            }
-        }
-    }
-
     for (int trial = 0; trial < TRIALS; trial++) {
         for (size_t i = 0; i < sizeof(b5); i++) b5[i] = (uint8_t)rng_u32();
         for (size_t i = 0; i < sizeof(b6); i++) b6[i] = (uint8_t)rng_u32();

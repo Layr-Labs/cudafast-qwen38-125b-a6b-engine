@@ -822,6 +822,290 @@ __global__ static void qwen4exp_gdn_split_reduce_kernel(
     }
 }
 
+/*
+ * PREFILL-WIDTH RECURRENCE, EIGHT LANES PER VALUE ROW.
+ *
+ * The value-reuse kernel above spends most of its issue slots on the two
+ * 32-lane butterflies every (value row, token) needs: 10 shuffles and 10
+ * dependent adds per row per token, against ~70 FMA-class instructions.
+ * This kernel keeps every rounding point and every operand pair of that
+ * butterfly, but gives each value row EIGHT lanes instead of 32: lane j of
+ * an eight-lane segment holds the four key-column quads the original lanes
+ * j, j+8, j+16 and j+24 held (columns 4j+32m, m = 0..3).  The butterfly's
+ * first two levels -- offset 16 pairs lane j with j+16, offset 8 pairs the
+ * result with the lane j+8 / j+24 pair -- become two local adds of exactly
+ * the same operands, and the remaining three levels (offsets 4, 2, 1) are
+ * xor shuffles that stay inside the segment.  Four segments per warp carry
+ * four row groups, so one shuffle instruction serves four rows: a row costs
+ * 6/4 = 1.5 shuffle issues per token instead of 10, at the same FMA count.
+ *
+ * BIT-EXACTNESS.  For every (row, token) the arithmetic is the sequence
+ * the value-reuse kernel performs: decay is one FMUL per element; each
+ * quad's dot product is FMUL on the .y pair then FFMA on .x, .z, .w (the
+ * contraction the reuse kernel's `a.x*b.x + a.y*b.y + a.z*b.z + a.w*b.w`
+ * compiles to, pinned here so it cannot drift); the five-level sum tree
+ * adds the same 32 quad partials in the same pairs at the same levels --
+ * the xor butterfly leaves every lane with the same value because IEEE
+ * addition is commutative, and that is the only property the two local
+ * levels rely on; delta is FSUB then FMUL; the update is FFMA.  The carried
+ * state, the per-token snapshot rows and the outputs are written at the
+ * same addresses with the same values.  Nothing crosses between rows.
+ *
+ * Geometry: a segment carries R adjacent value rows of one head, a warp
+ * four segments (4R adjacent rows), a block four warps (16R rows).  R = 2
+ * gives 192 blocks of 128 threads, four per SM in one wave at 126
+ * registers; R = 4 halves the loads per row but its 96 blocks leave half
+ * the warp slots empty and measured slower (650 vs 590 us at 1024 tokens).
+ * The token loop is unrolled by hand two tokens per trip so the operands of
+ * token t+1 land in a second register set while token t's chains run (no
+ * register copies); the snapshot rows, when there are any, go through a
+ * plain one-token loop first so the hot loop carries no predicated stores.
+ *
+ * Off with DS4_QWEN4EXP_NO_GDN_OCTET=1 (falls back to the split-reduce
+ * kernel above, one row per eight-lane group without the operand double
+ * buffer); DS4_QWEN4EXP_NO_GDN_VALUE_REUSE=1 still selects the single-row
+ * kernel.  Decode and speculative verify never reach this gate.
+ */
+__device__ static __forceinline__ float qwen4exp_gdn_dot4_pinned(
+        float4 a, float4 b) {
+    float acc = __fmul_rn(a.y, b.y);
+    acc = __fmaf_rn(a.x, b.x, acc);
+    acc = __fmaf_rn(a.z, b.z, acc);
+    acc = __fmaf_rn(a.w, b.w, acc);
+    return acc;
+}
+
+enum {
+    QWEN4EXP_GDN_OCTET_LANES = 8,          /* lanes per value row */
+    QWEN4EXP_GDN_OCTET_QUADS = 32 / QWEN4EXP_GDN_OCTET_LANES, /* quads per lane */
+    QWEN4EXP_GDN_OCTET_SEGMENTS = 32 / QWEN4EXP_GDN_OCTET_LANES,
+    QWEN4EXP_GDN_OCTET_ROWS = 2,           /* R: value rows per segment */
+    /* 192 blocks of 128 threads at R = 2: four per SM at <= 128 registers
+     * is the single-wave geometry on 48 SMs. */
+    QWEN4EXP_GDN_OCTET_BLOCKS_PER_SM = 4
+};
+
+/* The last three butterfly levels, inside an eight-lane segment, for R
+ * independent sums at once (their shuffles interleave). */
+template <unsigned R>
+__device__ static __forceinline__ void qwen4exp_gdn_octet_sum(float v[R]) {
+#pragma unroll
+    for (int offset = 4; offset > 0; offset >>= 1) {
+        float s[R];
+#pragma unroll
+        for (unsigned r = 0; r < R; r++) {
+            s[r] = __shfl_xor_sync(0xffffffffu, v[r], offset);
+        }
+#pragma unroll
+        for (unsigned r = 0; r < R; r++) {
+            v[r] = __fadd_rn(v[r], s[r]);
+        }
+    }
+}
+
+/* One token's operands for one lane: its four query and key quads, the
+ * segment's R values and the head's gate pair. */
+template <unsigned R>
+struct qwen4exp_gdn_octet_ops {
+    float4 q[QWEN4EXP_GDN_OCTET_QUADS];
+    float4 k[QWEN4EXP_GDN_OCTET_QUADS];
+    float  v[R];
+    float2 pair;
+};
+
+template <unsigned R>
+__device__ static __forceinline__ void qwen4exp_gdn_octet_load(
+        qwen4exp_gdn_octet_ops<R> &o, const float *qp, uint32_t key_dim,
+        const float *vp, const float2 *gp) {
+#pragma unroll
+    for (unsigned m = 0; m < QWEN4EXP_GDN_OCTET_QUADS; m++) {
+        o.q[m] = *(const float4 *)(qp + m * 32u);
+        o.k[m] = *(const float4 *)(qp + key_dim + m * 32u);
+    }
+#pragma unroll
+    for (unsigned r = 0; r < R; r++) o.v[r] = vp[r];
+    o.pair = *gp;
+}
+
+/* One token of the recurrence for R rows: the arithmetic of the value-reuse
+ * kernel, rounding point for rounding point (see the header comment). */
+template <unsigned R>
+__device__ static __forceinline__ void qwen4exp_gdn_octet_step(
+        float4 (&h)[R][QWEN4EXP_GDN_OCTET_QUADS],
+        const qwen4exp_gdn_octet_ops<R> &o, float (&res)[R]) {
+    const float g = o.pair.x;
+    const float beta = o.pair.y;
+    float hk[R];
+#pragma unroll
+    for (unsigned r = 0; r < R; r++) {
+        float p[QWEN4EXP_GDN_OCTET_QUADS];
+#pragma unroll
+        for (unsigned m = 0; m < QWEN4EXP_GDN_OCTET_QUADS; m++) {
+            h[r][m].x = __fmul_rn(h[r][m].x, g);
+            h[r][m].y = __fmul_rn(h[r][m].y, g);
+            h[r][m].z = __fmul_rn(h[r][m].z, g);
+            h[r][m].w = __fmul_rn(h[r][m].w, g);
+            p[m] = qwen4exp_gdn_dot4_pinned(h[r][m], o.k[m]);
+        }
+        /* Butterfly levels 16 and 8: lane j with j+16, lane j+8 with j+24,
+         * then the two pairs. */
+        hk[r] = __fadd_rn(__fadd_rn(p[0], p[2]), __fadd_rn(p[1], p[3]));
+    }
+    qwen4exp_gdn_octet_sum<R>(hk);
+#pragma unroll
+    for (unsigned r = 0; r < R; r++) {
+        const float delta_v = __fmul_rn(__fsub_rn(o.v[r], hk[r]), beta);
+        float p[QWEN4EXP_GDN_OCTET_QUADS];
+#pragma unroll
+        for (unsigned m = 0; m < QWEN4EXP_GDN_OCTET_QUADS; m++) {
+            h[r][m].x = __fmaf_rn(o.k[m].x, delta_v, h[r][m].x);
+            h[r][m].y = __fmaf_rn(o.k[m].y, delta_v, h[r][m].y);
+            h[r][m].z = __fmaf_rn(o.k[m].z, delta_v, h[r][m].z);
+            h[r][m].w = __fmaf_rn(o.k[m].w, delta_v, h[r][m].w);
+            p[m] = qwen4exp_gdn_dot4_pinned(h[r][m], o.q[m]);
+        }
+        res[r] = __fadd_rn(__fadd_rn(p[0], p[2]), __fadd_rn(p[1], p[3]));
+    }
+    qwen4exp_gdn_octet_sum<R>(res);
+}
+
+template <unsigned R>
+__global__ static void __launch_bounds__(QWEN4EXP_GDN_DIM, QWEN4EXP_GDN_OCTET_BLOCKS_PER_SM)
+qwen4exp_gdn_octet_kernel(
+        float        *__restrict__ out,
+        float        *__restrict__ state,
+        const float  *__restrict__ qkv,
+        const float2 *__restrict__ gate_pairs,
+        float        *state_snapshot,
+        uint32_t      n_key_head,
+        uint32_t      n_value_head,
+        uint32_t      n_rows,
+        uint32_t      n_tokens,
+        uint32_t      head_layout,
+        uint32_t      n_snapshot_rows,
+        uint32_t      snap_plain) {
+    static_assert(QWEN4EXP_GDN_DIM % (4u * QWEN4EXP_GDN_OCTET_SEGMENTS * R) == 0u,
+                  "rows per block must divide the head");
+    const uint32_t head = blockIdx.x;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t seg = lane >> 3u;      /* segment: which row group */
+    const uint32_t j = lane & 7u;         /* lane within the segment */
+    const uint32_t value0 =
+        ((blockIdx.y * 4u + warp) * QWEN4EXP_GDN_OCTET_SEGMENTS + seg) * R;
+    const uint32_t row = blockIdx.z;
+    if (head >= n_value_head || value0 + R > QWEN4EXP_GDN_DIM ||
+        row >= n_rows || n_tokens == 0u) {
+        return;
+    }
+
+    const uint32_t key_dim = n_key_head * QWEN4EXP_GDN_DIM;
+    const uint32_t value_dim = n_value_head * QWEN4EXP_GDN_DIM;
+    const uint32_t conv_dim = 2u * key_dim + value_dim;
+    const uint32_t key_head = head_layout != 0u
+        ? head % n_key_head
+        : head / (n_value_head / n_key_head);
+    /* Quad m of this lane is original lane j + 8m: columns 4j + 32m. */
+    const uint32_t c0 = j * 4u;
+
+    const uint64_t state_base =
+        (((uint64_t)row * n_value_head + head) * QWEN4EXP_GDN_DIM + value0) *
+        QWEN4EXP_GDN_DIM + c0;
+    float4 h[R][QWEN4EXP_GDN_OCTET_QUADS];
+#pragma unroll
+    for (unsigned r = 0; r < R; r++) {
+#pragma unroll
+        for (unsigned m = 0; m < QWEN4EXP_GDN_OCTET_QUADS; m++) {
+            h[r][m] = *(const float4 *)(state + state_base +
+                r * QWEN4EXP_GDN_DIM + m * 32u);
+        }
+    }
+
+    /* Per-token operand cursors. */
+    const uint64_t slot0 = (uint64_t)row * n_tokens;
+    const float *qp = qkv + slot0 * conv_dim + key_head * QWEN4EXP_GDN_DIM + c0;
+    const float *vp = qkv + slot0 * conv_dim + 2u * (uint64_t)key_dim +
+        head * QWEN4EXP_GDN_DIM + value0;
+    const float2 *gp = gate_pairs + slot0 * n_value_head + head;
+    float *op = out + slot0 * value_dim + head * QWEN4EXP_GDN_DIM + value0;
+    const uint64_t snap_stride = (uint64_t)n_rows * n_value_head *
+        QWEN4EXP_GDN_DIM * QWEN4EXP_GDN_DIM;
+
+    uint32_t token = 0;
+    /* The snapshot rows (the speculative verify's rollback slots; none at a
+     * plain prefill): the simple one-token-at-a-time loop. */
+    const uint32_t n_snap = n_snapshot_rows < n_tokens ? n_snapshot_rows : n_tokens;
+    for (; token < n_snap; token++) {
+        qwen4exp_gdn_octet_ops<R> o;
+        qwen4exp_gdn_octet_load<R>(o, qp, key_dim, vp, gp);
+        float res[R];
+        qwen4exp_gdn_octet_step<R>(h, o, res);
+        if (j == 0u) {
+#pragma unroll
+            for (unsigned r = 0; r < R; r++) op[r] = res[r];
+        }
+        float *snap = state_snapshot + (uint64_t)token * snap_stride + state_base;
+#pragma unroll
+        for (unsigned r = 0; r < R; r++) {
+#pragma unroll
+            for (unsigned m = 0; m < QWEN4EXP_GDN_OCTET_QUADS; m++) {
+                float4 *dst = (float4 *)(snap + r * QWEN4EXP_GDN_DIM + m * 32u);
+                if (snap_plain) {
+                    *dst = h[r][m];
+                } else {
+                    __stcs(dst, h[r][m]);
+                }
+            }
+        }
+        qp += conv_dim; vp += conv_dim; gp += n_value_head; op += value_dim;
+    }
+
+    /* The remaining tokens, two per trip with the operands of token t+1
+     * loaded into the other register set before token t's chains run. */
+    if (token < n_tokens) {
+        qwen4exp_gdn_octet_ops<R> oa, ob;
+        qwen4exp_gdn_octet_load<R>(oa, qp, key_dim, vp, gp);
+        for (;;) {
+            float res[R];
+            if (token + 1u < n_tokens) {
+                qwen4exp_gdn_octet_load<R>(ob, qp + conv_dim, key_dim,
+                                           vp + conv_dim, gp + n_value_head);
+            }
+            qwen4exp_gdn_octet_step<R>(h, oa, res);
+            if (j == 0u) {
+#pragma unroll
+                for (unsigned r = 0; r < R; r++) op[r] = res[r];
+            }
+            op += value_dim;
+            token++;
+            if (token >= n_tokens) break;
+            qp += conv_dim; vp += conv_dim; gp += n_value_head;
+
+            if (token + 1u < n_tokens) {
+                qwen4exp_gdn_octet_load<R>(oa, qp + conv_dim, key_dim,
+                                           vp + conv_dim, gp + n_value_head);
+            }
+            qwen4exp_gdn_octet_step<R>(h, ob, res);
+            if (j == 0u) {
+#pragma unroll
+                for (unsigned r = 0; r < R; r++) op[r] = res[r];
+            }
+            op += value_dim;
+            token++;
+            if (token >= n_tokens) break;
+            qp += conv_dim; vp += conv_dim; gp += n_value_head;
+        }
+    }
+#pragma unroll
+    for (unsigned r = 0; r < R; r++) {
+#pragma unroll
+        for (unsigned m = 0; m < QWEN4EXP_GDN_OCTET_QUADS; m++) {
+            *(float4 *)(state + state_base + r * QWEN4EXP_GDN_DIM + m * 32u) =
+                h[r][m];
+        }
+    }
+}
+
 /* Sigmoid-gated RMS output norm.  The weight is a plain scale, not an
  * offset-baked one, so it multiplies the normalised row directly. */
 __global__ static void qwen4exp_gdn_output_kernel(
@@ -1073,7 +1357,23 @@ static int qwen4exp_cuda_gdn_run(
     const dim3 recurrence_grid(
         n_value_head, QWEN4EXP_GDN_DIM / 4u, n_rows);
     if (gate_pairs) {
-        if (getenv("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE") == NULL &&
+        if (n_key_head == 16u && n_value_head == 48u &&
+            getenv("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE") == NULL &&
+            getenv("DS4_QWEN4EXP_NO_GDN_OCTET") == NULL) {
+            /* Eight lanes per value row, R rows per segment: 16R rows
+             * per block, so QWEN4EXP_GDN_DIM / 16R blocks along y. */
+            qwen4exp_gdn_octet_kernel<QWEN4EXP_GDN_OCTET_ROWS><<<
+                    dim3(n_value_head,
+                         QWEN4EXP_GDN_DIM / (16u * QWEN4EXP_GDN_OCTET_ROWS),
+                         n_rows),
+                    QWEN4EXP_GDN_DIM, 0, stream>>>(
+                    (float *)out->ptr, (float *)recurrent_state->ptr,
+                    conv_out, gate_pairs,
+                    state_snapshot ? (float *)state_snapshot->ptr : NULL,
+                    n_key_head, n_value_head, n_rows, n_tokens, head_layout,
+                    n_snapshot_rows,
+                    getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
+        } else if (getenv("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE") == NULL &&
             getenv("DS4_QWEN4EXP_NO_GDN_SPLIT_REDUCE") == NULL) {
             qwen4exp_gdn_split_reduce_kernel<<<
                     dim3(n_value_head, QWEN4EXP_GDN_DIM / 16u, n_rows),
@@ -1795,6 +2095,36 @@ __global__ static void qwen4exp_quantize_rows_kernel(
                                 (uint64_t)r * groups + g);
 }
 
+/* The same quantiser at prefill widths: eight groups of one row per
+ * 256-thread block, one warp per group, so the grid is one eighth as many
+ * blocks (81920 one-warp blocks at 1024 rows x 2560 columns pay more in
+ * block scheduling than in arithmetic).  dev_qwen4exp_quantize_group is
+ * warp-synchronous and every value it computes depends on its own group
+ * alone, so the bytes are the one-warp kernel's.  No PDL trigger: the
+ * one-warp kernel's gate (gridDim.y <= 2) never fires at the widths this
+ * kernel takes, and the dispatch below keeps it to prefill widths (rows >=
+ * QWEN4EXP_QUANT_WIDE_MIN_ROWS), so every decode and verify launch -- the
+ * captured graphs included -- keeps the one-warp kernel. */
+enum { QWEN4EXP_QUANT_WIDE_MIN_ROWS = 64 };
+
+__global__ static void __launch_bounds__(256) qwen4exp_quantize_rows_wide_kernel(
+        int8_t *xq, float *xscale, int32_t *xsum,
+        const float *x, uint32_t width, uint32_t groups,
+        uint64_t outer_stride, uint64_t inner_stride, uint32_t inner_count) {
+    const uint32_t g = blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t r = blockIdx.y;
+    if (g >= groups) return;
+    const uint32_t i0 = g * 32u;
+    const uint32_t n = width - i0 < 32u ? width - i0 : 32u;
+    const uint32_t outer = r / inner_count;
+    const uint32_t inner = r - outer * inner_count;
+    const float *xr = x + (uint64_t)outer * outer_stride +
+                      (uint64_t)inner * inner_stride + i0;
+
+    dev_qwen4exp_quantize_group(xq, xscale, xsum, xr, threadIdx.x & 31u, n,
+                                (uint64_t)r * groups + g);
+}
+
 /* Block-wide sum over blockDim.x threads using a caller-supplied scratch of
  * blockDim.x floats.  The reduction tree matches the Metal kernels. */
 __device__ __forceinline__ static float dev_qwen4exp_block_sum(
@@ -2493,42 +2823,6 @@ __device__ __forceinline__ static void qw_tile_store_words(int8_t *dst,
     for (int i = 0; i < 8; i++) d[i] = w[i];
 }
 
-/* One parity of one staged q4_K payload slice, written straight into the
- * eight words of its group's tile row.  `shift` is 0 for the slice's even
- * group and 4 for the odd one, and every call site passes a literal, so the
- * even parity compiles to the mask alone.  Each word is the
- * (raw >> shift) & 0x0f0f0f0f the per-group decoder produced from the same
- * slice -- the invariant documented above dev_qwen4exp_group_decode_w -- so
- * the tile bytes do not move; only who computes them does. */
-__device__ __forceinline__ static void qw_q4k_parity_store(
-        int8_t *dst, const uint32_t *raw, uint32_t shift) {
-    uint32_t *w = (uint32_t *)(void *)dst;
-#pragma unroll
-    for (int i = 0; i < 8; i++) w[i] = (raw[i] >> shift) & 0x0f0f0f0fu;
-}
-
-/* The same eight words as two sixteen-byte stores, for the tiles whose row
- * stride keeps every group slot sixteen-byte aligned (GU_LD 144; the
- * 132-byte tile keeps the word form).  uint4 .x .y .z .w are words 0..3 at
- * dst in address order -- the argument documented above qw_load_words8 --
- * so the pair writes the same words to the same addresses as the loop form
- * beside it. */
-__device__ __forceinline__ static void qw_q4k_parity_store16(
-        int8_t *dst, const uint32_t *raw, uint32_t shift) {
-    uint4 *const v = (uint4 *)(void *)dst;
-    uint4 a, b;
-    a.x = (raw[0] >> shift) & 0x0f0f0f0fu;
-    a.y = (raw[1] >> shift) & 0x0f0f0f0fu;
-    a.z = (raw[2] >> shift) & 0x0f0f0f0fu;
-    a.w = (raw[3] >> shift) & 0x0f0f0f0fu;
-    b.x = (raw[4] >> shift) & 0x0f0f0f0fu;
-    b.y = (raw[5] >> shift) & 0x0f0f0f0fu;
-    b.z = (raw[6] >> shift) & 0x0f0f0f0fu;
-    b.w = (raw[7] >> shift) & 0x0f0f0f0fu;
-    v[0] = a;
-    v[1] = b;
-}
-
 /* The raw payload words of one 32-element weight group: the bytes the decode
  * below reads, nothing decoded.  A q4_K or q5_K group shares its 32-byte
  * payload slice with its nibble-pair neighbour; a q5_1 group IS its 24-byte
@@ -2564,29 +2858,6 @@ __device__ __forceinline__ static bool qw_raw_load(
     }
     default:
         return false;
-    }
-}
-
-/* The q4_K scale/min pair of group j out of the three words that follow
- * d/dmin in one sixteen-byte super-block header load: `a` holds scale bytes
- * 0..3, `b` bytes 4..7, `c` bytes 8..11.  This is dev_q4_K_get_scale_min on
- * the same twelve bytes.  For j < 4 the pair is the low six bits of byte j
- * of `a` and of `b`.  For j >= 4, with i = j - 4, the oracle takes
- * (c_byte(i) & 0x0f) | ((a_byte(i) >> 6) << 4) and
- * (c_byte(i) >> 4) | ((b_byte(i) >> 6) << 4); ((x >> (8i+6)) & 3) << 4 and
- * (x >> (8i+2)) & 0x30 are those same four bits in the same places, and the
- * 0x30 mask takes nothing from the neighbouring byte's low bits, so for
- * every header the words return the pair the byte accessor returned. */
-__device__ __forceinline__ static void qw_q4k_header_scale_min(
-        uint32_t j, uint32_t a, uint32_t b, uint32_t c,
-        uint32_t *sc, uint32_t *mn) {
-    if (j < 4u) {
-        *sc = (a >> (8u * j)) & 63u;
-        *mn = (b >> (8u * j)) & 63u;
-    } else {
-        const uint32_t s = 8u * (j - 4u);
-        *sc = ((c >> s) & 0x0fu) | ((a >> (s + 2u)) & 0x30u);
-        *mn = ((c >> (s + 4u)) & 0x0fu) | ((b >> (s + 2u)) & 0x30u);
     }
 }
 
@@ -2630,14 +2901,14 @@ __device__ __forceinline__ static void dev_qwen4exp_group_decode_w(
              * 16+4i+b of the high nibbles and takes qh bit 16+4i+b. */
             const uint32_t q_lo = qh >> (4u * i);
             const uint32_t q_hi = qh >> (16u + 4u * i);
-            /* The spread is the oracle's own expression for those four
-             * bits -- ((qh >> (4i)) & 0x0f) * 0x02040810 & 0x10101010 --
-             * whose multiplier's bit groups do not overlap for a nibble,
-             * so it plants qh bit 4i+b at bit 4 of byte b exactly as the
-             * four shifts and ors the four-term form used to, for every
-             * nibble value. */
-            const uint32_t f_lo = ((q_lo & 0x0fu) * 0x02040810u) & 0x10101010u;
-            const uint32_t f_hi = ((q_hi & 0x0fu) * 0x02040810u) & 0x10101010u;
+            const uint32_t f_lo = ((q_lo & 1u) << 4u) |
+                                  (((q_lo >> 1u) & 1u) << 12u) |
+                                  (((q_lo >> 2u) & 1u) << 20u) |
+                                  (((q_lo >> 3u) & 1u) << 28u);
+            const uint32_t f_hi = ((q_hi & 1u) << 4u) |
+                                  (((q_hi >> 1u) & 1u) << 12u) |
+                                  (((q_hi >> 2u) & 1u) << 20u) |
+                                  (((q_hi >> 3u) & 1u) << 28u);
             w[i] = (raw[2 + i] & 0x0f0f0f0fu) | f_lo;
             w[4 + i] = ((raw[2 + i] >> 4u) & 0x0f0f0f0fu) | f_hi;
         }
@@ -2715,8 +2986,7 @@ qwen4exp_moe_gateup_mma_kernel(
         uint32_t groups,
         uint32_t mid_dim,
         uint32_t mid_token_stride,
-        uint32_t n_expert_used,
-        uint32_t dq_stage) {
+        uint32_t n_expert_used) {
     /* The bounded Q4_K/Q5_K tasks benefit from distinct banks on MMA
      * fragment reads. Padding only these temporary rows trades staging-store
      * conflicts for cheaper repeated fragment loads. The Q8 task and the
@@ -2762,31 +3032,6 @@ qwen4exp_moe_gateup_mma_kernel(
     const char *gate_row = gate_e + (uint64_t)dec_mrow * gate_row_bytes;
     const char *up_row   = up_e + (uint64_t)dec_mrow * up_row_bytes;
 
-    /* The q4_K staging's weight slot, when dq_stage asks for it.  h = tid & 3
-     * picks the tile (h & 1, gate against up) and the payload slice (h >> 1);
-     * the row stays tid >> 2, so 32 rows x 2 slices x 2 tiles is exactly the
-     * 128 threads, and every (tile, row, group-column) of a chunk has exactly
-     * one owner -- the coverage the pipeline asserts on the activation side.
-     * A thread stages BOTH parity groups of its slice: g0 = kc + 2*slice on
-     * the low nibbles and g0 + 1 on the high ones.  The two share one payload
-     * slice, one super-block and one scale-decode arm ((g0 & 7) is even, so
-     * g0 and g0+1 fall on the same side of 4), so one header load, one pair
-     * of f16 conversions and one payload load serve both.  The alignment
-     * guard is the slab's, not the thread's: a q4_K row stride is a multiple
-     * of sixteen, so either every super-block of the slab takes the vector
-     * header or the guard stands the whole block down to the per-group
-     * staging below, which decodes the same bytes its own way. */
-    const uint32_t w_sel = tid & 3u;
-    const uint32_t w_tile = w_sel & 1u;
-    const uint32_t w_slice = w_sel >> 1;
-    const char *const w_row = w_tile ? up_row : gate_row;
-    int8_t *const sWt = w_tile ? sAu : sAg;
-    float *const sWAt = w_tile ? sWAu : sWAg;
-    float *const sWBt = w_tile ? sWBu : sWBg;
-    const bool w_fast = dq_stage != 0u &&
-        GateType == DS4_QWEN4EXP_TY_q4_K && UpType == DS4_QWEN4EXP_TY_q4_K &&
-        (((uintptr_t)w_row) & 15u) == 0u;
-
     const int32_t first_pair = PairTasks ? active[2u + 2u * blockIdx.y] : 0;
     const int32_t end_pair = PairTasks ? min(cnt, first_pair + QW_MMA_BN) : cnt;
     for (int32_t nbase = first_pair; nbase < end_pair; nbase += QW_MMA_BN) {
@@ -2799,20 +3044,12 @@ qwen4exp_moe_gateup_mma_kernel(
         __syncthreads();
 
         /* The raw bytes chunk zero decodes from. */
-        uint32_t rawg[8], rawu[8], rawb[8], raww[8];
+        uint32_t rawg[8], rawu[8], rawb[8];
         int haveg = 0, haveu = 0, haveb = 0;
         float act_scale = 0.0f, act_sum = 0.0f;
-        if (!w_fast && dec_mrow < mid_dim && dec_gg < groups) {
+        if (dec_mrow < mid_dim && dec_gg < groups) {
             haveg = qw_raw_load(gate_type, gate_row, dec_gg, rawg);
             haveu = qw_raw_load(up_type, up_row, dec_gg, rawu);
-        }
-        /* The slice-parity staging's chunk-zero slice: one load covering
-         * groups 2*slice and 2*slice+1.  The row alignment w_fast checked
-         * makes qw_raw_load take its widest arm, but the value it returns is
-         * the same words any arm of it loads. */
-        if (w_fast && dec_mrow < mid_dim && 2u * w_slice < groups) {
-            qw_raw_load((uint32_t)DS4_QWEN4EXP_TY_q4_K, w_row, 2u * w_slice,
-                        raww);
         }
         if (sTok[act_tk] != 0xffffffffu && act_gg < groups) {
             const uint32_t token = sTok[act_tk] / n_expert_used;
@@ -2843,89 +3080,7 @@ qwen4exp_moe_gateup_mma_kernel(
              * registers into the eight words of the tile row. */
             {
                 const uint32_t g = kc + dec_gg;
-                if (w_fast) {
-                    /* SLICE-PARITY STAGING (q4_K).  This thread's tile and
-                     * slice, both groups of the pair: the header is read once
-                     * as the sixteen bytes at the super-block (d, dmin and all
-                     * twelve scale bytes -- one load where the per-group
-                     * staging paid four), the two f16 conversions are taken
-                     * once per slice rather than once per group, and the one
-                     * payload slice both groups live in is shifted by its
-                     * literal parity, so the even group pays the mask alone.
-                     * Every stored word, scale integer and float is the one
-                     * the per-group arms below derive from the same bytes:
-                     * wa is dev_f16_to_f32 of the same d bits times the
-                     * cvt.rn.f32 of the same scale integer, wb the same with
-                     * the negation applied to the dmin conversion before the
-                     * multiply, and the tile words the (raw >> shift) & mask
-                     * of the same slice.  The tail guard is per group, as the
-                     * per-group staging's own: a group past the end stages
-                     * zeros, and the pair's two columns are two of its four.
-                     */
-                    const uint32_t gs = kc + 2u * w_slice;
-                    if (dec_mrow < mid_dim && gs < groups) {
-                        const cuda_block_q4_K *xb =
-                            (const cuda_block_q4_K *)(const void *)w_row +
-                            (uint64_t)(gs >> 3);
-                        const uint4 hdr = *(const uint4 *)(const void *)xb;
-                        const uint32_t j0 = gs & 7u;
-                        uint32_t sc[2], mn[2];
-                        qw_q4k_header_scale_min(j0, hdr.y, hdr.z, hdr.w,
-                                                &sc[0], &mn[0]);
-                        qw_q4k_header_scale_min(j0 + 1u, hdr.y, hdr.z, hdr.w,
-                                                &sc[1], &mn[1]);
-                        const float df =
-                            dev_f16_to_f32((uint16_t)(hdr.x & 0xffffu));
-                        const float ndmf =
-                            -dev_f16_to_f32((uint16_t)(hdr.x >> 16u));
-#pragma unroll
-                        for (int p = 0; p < 2; p++) {
-                            int8_t *const dst =
-                                &sWt[dec_r * GU_LD +
-                                     (2u * w_slice + (uint32_t)p) * 32u];
-                            const uint32_t col =
-                                dec_r * QW_MMA_G + 2u * w_slice +
-                                (uint32_t)p;
-                            if (gs + (uint32_t)p < groups) {
-                                if ((GU_LD % 16) == 0) {
-                                    qw_q4k_parity_store16(dst, raww,
-                                                          p ? 4u : 0u);
-                                } else {
-                                    qw_q4k_parity_store(dst, raww,
-                                                        p ? 4u : 0u);
-                                }
-                                sWAt[col] = df * (float)sc[p];
-                                sWBt[col] = ndmf * (float)mn[p];
-                            } else {
-                                qw_tile_store_zero(dst);
-                                sWAt[col] = 0.0f;
-                                sWBt[col] = 0.0f;
-                            }
-                        }
-                    } else {
-#pragma unroll
-                        for (int p = 0; p < 2; p++) {
-                            qw_tile_store_zero(
-                                &sWt[dec_r * GU_LD +
-                                     (2u * w_slice + (uint32_t)p) * 32u]);
-                            const uint32_t col =
-                                dec_r * QW_MMA_G + 2u * w_slice +
-                                (uint32_t)p;
-                            sWAt[col] = 0.0f;
-                            sWBt[col] = 0.0f;
-                        }
-                    }
-                    /* The next chunk's slice, issued once this chunk's raw
-                     * words are consumed -- same one-chunk depth as the
-                     * per-group prefetch, over the two groups it covers. */
-                    if (kc + QW_MMA_G < groups && dec_mrow < mid_dim) {
-                        const uint32_t gn = kc + QW_MMA_G + 2u * w_slice;
-                        if (gn < groups) {
-                            qw_raw_load((uint32_t)DS4_QWEN4EXP_TY_q4_K, w_row,
-                                        gn, raww);
-                        }
-                    }
-                } else if (dec_mrow < mid_dim && g < groups) {
+                if (dec_mrow < mid_dim && g < groups) {
                     float wa[2], wb[2];
                     dev_qwen4exp_group_decode_w(
                             GateType < 0 ? gate_type : (uint32_t)GateType, gate_row, g,
@@ -3143,8 +3298,7 @@ qwen4exp_moe_down_mma_kernel(
         uint64_t down_row_bytes,
         uint32_t down_type,
         uint32_t groups,
-        uint32_t out_dim,
-        uint32_t dq_stage) {
+        uint32_t out_dim) {
     __shared__ __align__(16) int8_t sA[QW_DOWN_MMA_BM * QW_MMA_LD];
     __shared__ __align__(16) int8_t sB[QW_MMA_BN * QW_MMA_LD];
     __shared__ float  sWA[QW_DOWN_MMA_BM * QW_MMA_G];
@@ -3164,20 +3318,6 @@ qwen4exp_moe_down_mma_kernel(
     if (cnt <= 0) return;
     const int32_t base = offsets[expert];
     const char *down_e = down + (uint64_t)expert * down_expert_bytes;
-
-    /* WORD-DIRECT q5_1 STAGING.  dq_stage is DS4_QWEN4EXP_NO_DOWN_DQ left
-     * unset; it stages the 24-byte block's six words and decodes them
-     * straight into the tile row, where the oracle path decodes into a
-     * byte array and repacks it with qw_tile_store_group's shifts and ors.
-     * A q5_1 block carries no super-block structure to share (R1/R2 do not
-     * apply) and the down tile's 132-byte stride is not a multiple of
-     * sixteen (STS.128 does not apply), so the cut is the repack
-     * elimination plus the spread-form high bits.  Q8_0 and the generic
-     * instantiation keep the oracle; a row whose blocks are not word
-     * aligned stages nothing and decodes from the row, exactly as before. */
-    const uint32_t dtype = DownType < 0 ? down_type : (uint32_t)DownType;
-    const bool w_dq = dq_stage != 0u &&
-                      dtype == (uint32_t)DS4_QWEN4EXP_TY_q5_1;
 
     for (int32_t nbase = 0; nbase < cnt; nbase += QW_MMA_BN) {
         const int32_t take = (cnt - nbase) < QW_MMA_BN ? (cnt - nbase)
@@ -3204,18 +3344,11 @@ qwen4exp_moe_down_mma_kernel(
                 float wa[2], wb[2];
                 int halves = 1;
                 if (orow < out_dim && g < groups) {
-                    const char *const drow =
-                        down_e + (uint64_t)orow * down_row_bytes;
-                    if (w_dq) {
-                        uint32_t raw[6];
-                        dev_qwen4exp_group_decode_w(dtype, drow, g,
-                                qw_raw_load(dtype, drow, g, raw) ? raw : NULL,
-                                &sA[r * QW_MMA_LD + gg * 32], wa, wb);
-                    } else {
-                        dev_qwen4exp_group_decode(dtype, drow, g,
-                                wq, wa, wb, &halves);
-                        qw_tile_store_group(&sA[r * QW_MMA_LD + gg * 32], wq);
-                    }
+                    dev_qwen4exp_group_decode(
+                            DownType < 0 ? down_type : (uint32_t)DownType,
+                            down_e + (uint64_t)orow * down_row_bytes, g,
+                            wq, wa, wb, &halves);
+                    qw_tile_store_group(&sA[r * QW_MMA_LD + gg * 32], wq);
                     sWA[r * QW_MMA_G + gg] = wa[0];
                     sWB[r * QW_MMA_G + gg] = wb[0];
                 } else {
@@ -4796,8 +4929,7 @@ qwen4exp_shared_down_mma_kernel(
         uint32_t groups,
         uint32_t kmax,
         uint32_t out_dim,
-        uint32_t n_tokens,
-        uint32_t dq_stage) {
+        uint32_t n_tokens) {
     enum { CH = 1 << LOGCH, NLEV = 5 - LOGCH, NCHUNK = 1 << (5 - LOGCH) };
     extern __shared__ __align__(16) char qwen4exp_mma_smem[];
 
@@ -4826,16 +4958,6 @@ qwen4exp_shared_down_mma_kernel(
     const uint32_t m1 = m0 + 8u;
     const uint32_t n0 = nb * 8u + (lane & 3u) * 2u;
 
-    /* The routed down tile's WORD-DIRECT q5_1 staging, on the shared side:
-     * dq_stage is DS4_QWEN4EXP_NO_DOWN_DQ left unset.  The shipped
-     * artifacts carry the shared expert whole in Q8_0, where this stands
-     * down and the oracle keeps staging as it always has; a Q5_1 shared
-     * down takes the word-direct path.  The tile bytes and the (wa, wb)
-     * floats are the oracle's either way -- dev_qwen4exp_group_decode_w's
-     * q5_1 arm is the oracle's own algebra on the staged words. */
-    const bool w_dq = dq_stage != 0u &&
-                      down_type == (uint32_t)DS4_QWEN4EXP_TY_q5_1;
-
     float S[NLEV > 0 ? NLEV : 1][4];
     float P[4];
 #pragma unroll
@@ -4862,18 +4984,10 @@ qwen4exp_shared_down_mma_kernel(
             float wa[2], wb[2];
             int halves = 1;
             if (mrow < out_dim && g < groups) {
-                const char *const drow =
-                    down + (uint64_t)mrow * down_row_bytes;
-                if (w_dq) {
-                    uint32_t raw[6];
-                    dev_qwen4exp_group_decode_w(down_type, drow, g,
-                            qw_raw_load(down_type, drow, g, raw) ? raw : NULL,
-                            &sA[r * ld + s * 32u], wa, wb);
-                } else {
-                    dev_qwen4exp_group_decode(down_type, drow, g,
-                            wq, wa, wb, &halves);
-                    qw_tile_store_group(&sA[r * ld + s * 32u], wq);
-                }
+                dev_qwen4exp_group_decode(down_type,
+                        down + (uint64_t)mrow * down_row_bytes, g,
+                        wq, wa, wb, &halves);
+                qw_tile_store_group(&sA[r * ld + s * 32u], wq);
                 sWA[r * ks + s] = wa[0];
                 sWB[r * ks + s] = wb[0];
             } else {
@@ -5800,9 +5914,17 @@ static int qwen4exp_quantize_rows(
         uint32_t rows, uint32_t width, uint32_t groups,
         uint64_t outer_stride, uint64_t inner_stride, uint32_t inner_count,
         cudaStream_t stream) {
-    qwen4exp_quantize_rows_kernel<<<dim3(groups, rows, 1), 32, 0, stream>>>(
-            xq, xs, xsum, src, width, groups,
-            outer_stride, inner_stride, inner_count);
+    if (rows >= QWEN4EXP_QUANT_WIDE_MIN_ROWS &&
+        getenv("DS4_QWEN4EXP_NO_QUANT_WIDE") == NULL) {
+        qwen4exp_quantize_rows_wide_kernel<<<
+                dim3((groups + 7u) / 8u, rows, 1), 256, 0, stream>>>(
+                xq, xs, xsum, src, width, groups,
+                outer_stride, inner_stride, inner_count);
+    } else {
+        qwen4exp_quantize_rows_kernel<<<dim3(groups, rows, 1), 32, 0, stream>>>(
+                xq, xs, xsum, src, width, groups,
+                outer_stride, inner_stride, inner_count);
+    }
     return cuda_ok(cudaGetLastError(), "qwen4exp activation quantise");
 }
 
@@ -6076,15 +6198,6 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     } \
 } while (0)
     if (use_mma) {
-        /* DS4_QWEN4EXP_NO_GATEUP_DQ stands the q4_K-specialised tile's
-         * slice-parity weight staging down and runs the per-group staging
-         * the kernel has always had, byte for byte (same grid, block and
-         * shared memory).  Read once here, before any launch, so both task
-         * shapes of both specialised and generic instantiations see one
-         * answer.  The other weight formats never take the new staging and
-         * are unaffected either way. */
-        const uint32_t gu_dq_stage =
-            getenv("DS4_QWEN4EXP_NO_GATEUP_DQ") == NULL ? 1u : 0u;
         if (pair_tasks) {
             qwen4exp_moe_pair_tasks_kernel<<<1, 512, 0, stream>>>(
                     gu_tasks, sc.counts, n_total_expert);
@@ -6104,7 +6217,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
                 gate_slab->expert_bytes, gate_slab->row_bytes, \
                 up_slab->expert_bytes, up_slab->row_bytes, \
                 gate_slab->type, up_slab->type, xgroups, mid_dim, \
-                mid_token_stride, n_expert_used, gu_dq_stage)
+                mid_token_stride, n_expert_used)
 #define QWEN4EXP_GATEUP_MMA(GT, UT) do { \
         if (pair_tasks) { QWEN4EXP_GATEUP_MMA_IMPL(GT, UT, true); } \
         else { QWEN4EXP_GATEUP_MMA_IMPL(GT, UT, false); } \
@@ -6194,11 +6307,6 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     } \
 } while (0)
     if (down_mma) {
-        /* DS4_QWEN4EXP_NO_DOWN_DQ stands the down tile's word-direct q5_1
-         * staging down and runs the oracle decode + repack the kernel has
-         * always had, byte for byte.  Read once, before the launch. */
-        const uint32_t dn_dq_stage =
-            getenv("DS4_QWEN4EXP_NO_DOWN_DQ") == NULL ? 1u : 0u;
 #define QWEN4EXP_DOWN_MMA(DT) \
         qwen4exp_moe_down_mma_kernel<DT><<< \
                 dim3(out_dim / QW_DOWN_MMA_BM, gu_rows, 1), \
@@ -6206,7 +6314,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
                 (float *)down_partial->ptr, down, sc.mq, sc.ms, sc.msum, \
                 sc.pairs, sc.counts, sc.offsets, gu_active, \
                 down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
-                mgroups, out_dim, dn_dq_stage)
+                mgroups, out_dim)
         if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q5_1) {
             QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q5_1);
         } else if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q8_0) {
@@ -6532,12 +6640,6 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         const dim3 grid((out_dim + (uint32_t)QS_MMA_BM - 1u) / (uint32_t)QS_MMA_BM,
                         (n_tokens + (uint32_t)QS_MMA_BN - 1u) / (uint32_t)QS_MMA_BN,
                         1);
-        /* The same DS4_QWEN4EXP_NO_DOWN_DQ valve as the routed down tile:
-         * unset, a Q5_1 shared down stages its words directly; set, the
-         * oracle decode + repack runs.  The shipped shared expert is Q8_0
-         * and never takes either arm's difference. */
-        const uint32_t dn_dq_stage =
-            getenv("DS4_QWEN4EXP_NO_DOWN_DQ") == NULL ? 1u : 0u;
         ds4_gpu_qwen4exp_shared_mma_launches++;
         QS_MMA_DISPATCH(qwen4exp_shared_down_mma_kernel, dn_logch, grid,
                         (size_t)qs_mma_smem_bytes(ks, 1u), stream,
@@ -6545,8 +6647,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
                         (const float *)gate_scale->ptr, down_slab->row_bytes,
                         down_slab->type,
                         down_slab->type != (uint32_t)DS4_QWEN4EXP_TY_q8_0,
-                        mgroups, (mgroups + 31u) / 32u, out_dim, n_tokens,
-                        dn_dq_stage);
+                        mgroups, (mgroups + 31u) / 32u, out_dim, n_tokens);
     } else if (use_mma) {
         qwen4exp_shared_q8_mma_kernel<false><<<
                 dim3((out_dim + QW_SH_BM - 1u) / QW_SH_BM, mma_tiles, 1),
@@ -10114,6 +10215,353 @@ __global__ static void __launch_bounds__(256, 2) qwen4exp_qsa2_attention_group_k
     }
 }
 
+/* =========================================================================
+ * THIRD CUT of the head-group attention: the second cut's arithmetic with
+ * its two phases run side by side.
+ *
+ * The second cut is latency bound: two blocks per SM, and inside a block
+ * the score phase (four warps) and the value phase (eight warps) run one
+ * after the other with barriers between.  Here warps 0-3 score tile t+1
+ * while warps 4-7 consume tile t, over a double-buffered probability/key
+ * array (39 KB of shared memory at the production shape):
+ *
+ *   score phase       qwen4exp_qsa3_score_tile: the second cut's scorer
+ *                     block verbatim -- 128 threads, two tile slots each
+ *                     (slot = tid + s * 128), the same (key, head) FMA
+ *                     chain over the query words, the same slot-to-key
+ *                     assignment, the same per-warp shuffle maximum --
+ *                     written into the other buffer.
+ *   softmax stats     tile maximum, new running maximum and rescale are
+ *                     the second cut's expressions, computed by valuer
+ *                     thread h for head h and kept in shared memory (fmaxf
+ *                     is exact and associative, so the fold over eight
+ *                     per-warp slots, four of them MASKED, is the same
+ *                     float as the fold over four).
+ *   numerators        expf(score - new_max) for live slots, 0 for masked
+ *                     ones, from the same score at the same slot.
+ *   value phase       each of the 128 valuers owns channels 2vt and 2vt+1
+ *                     (one 8-byte load per key serves both); each channel's
+ *                     chain walks j ascending over the tile with __fmaf_rn,
+ *                     skipping exactly the masked slots, then folds into
+ *                     acc with the tile's rescale -- the second cut's chain
+ *                     for that channel, unchanged.
+ *   tile sum          qwen4exp_blk_sum's 256-slot tree per head, one warp
+ *                     per head: levels 128, 64 and 32 pair the same slots
+ *                     in the same order in-lane, the last five are the
+ *                     same __shfl_down_sync tree.  run_sum's fold is the
+ *                     second cut's __fmaf_rn.
+ *
+ * Nothing about any chain, argument, fold or tree pair changes; only who
+ * computes it when.  The valuers synchronise among themselves with a named
+ * barrier (bar.sync 1, 128); the whole block meets once per tile.
+ * 2.25 ms -> 1.55 ms at a 1024-row chunk.  Taken at GROUP 12, head_dim 256,
+ * nth 256; DS4_QWEN4EXP_NO_QSA_GROUP3 keeps the second cut.
+ * tests/test_qwen4exp_qsa holds it against the per-head kernel byte for
+ * byte; tests/qwen4exp_qsa_group3_mutants.sh proves that check bites.
+ * ========================================================================= */
+#ifndef QWEN4EXP_QSA3_KEYS_PER_THREAD
+#define QWEN4EXP_QSA3_KEYS_PER_THREAD 2u
+#endif
+#ifndef QWEN4EXP_QSA3_KSTEP
+#define QWEN4EXP_QSA3_KSTEP 4u
+#endif
+#ifndef QWEN4EXP_QSA3_VSTEP
+#define QWEN4EXP_QSA3_VSTEP 8u
+#endif
+
+__device__ __forceinline__ static void qwen4exp_qsa3_bar(uint32_t id, uint32_t n) {
+    asm volatile("bar.sync %0, %1;" :: "r"(id), "r"(n) : "memory");
+}
+
+/* Score one tile into buffer b: raw scores, keys, per-warp maxima.  The
+ * second cut's scorer block over SCORERS threads at KPT slots each (slot =
+ * tid + s * SCORERS / KPT); every (key, head) chain is that kernel's.  Called
+ * with 256 threads x 1 slot for the prologue tile and 128 x 2 inside the
+ * pipelined loop; wmax carries eight per-warp slots, the unused four MASKED. */
+template <uint32_t GROUP, uint32_t SCORERS, uint32_t KPT>
+__device__ __forceinline__ static void qwen4exp_qsa3_score_tile(
+        const float *qvec, float *probs, int32_t *keys, float *wmax,
+        const float *k_cache, const int32_t *selected, uint32_t token,
+        uint32_t max_selected, uint32_t sparse, uint32_t cache_cap,
+        uint32_t kv_stride, uint32_t kv_head, uint32_t head_dim, float scale,
+        uint32_t count, uint32_t base, uint32_t tid) {
+    constexpr uint32_t NTH = 256u;
+    const uint32_t n_in_tile = min(NTH, count - base);
+    constexpr uint32_t kthreads = SCORERS;        /* KPT * SCORERS == NTH slots */
+    {
+        /* The 256 tile slots over SCORERS threads: slot = tid + s * kthreads. */
+        int32_t key[KPT];
+        const float *kv[KPT];
+        bool live[KPT];
+#pragma unroll
+        for (uint32_t s = 0; s < KPT; s++) {
+            const uint32_t slot = tid + s * kthreads;
+            key[s] = -1;
+            if (slot < n_in_tile) {
+                key[s] = sparse ? selected[(uint64_t)token * max_selected + base + slot]
+                                : (int32_t)(base + slot);
+                if (!(key[s] >= 0 && (uint32_t)key[s] < cache_cap)) key[s] = -1;
+            }
+            live[s] = key[s] >= 0;
+            kv[s] = k_cache + (uint64_t)(live[s] ? key[s] : 0) * kv_stride + (uint64_t)kv_head * head_dim;
+        }
+        float dot[KPT][GROUP];
+#pragma unroll
+        for (uint32_t s = 0; s < KPT; s++)
+#pragma unroll
+            for (uint32_t h = 0; h < GROUP; h++) dot[s][h] = 0.0f;
+        const uint32_t words = head_dim >> 2u;
+        for (uint32_t w = 0; w + QWEN4EXP_QSA3_KSTEP <= words; w += QWEN4EXP_QSA3_KSTEP) {
+            float4 kk[KPT][QWEN4EXP_QSA3_KSTEP];
+#pragma unroll
+            for (uint32_t s = 0; s < KPT; s++)
+#pragma unroll
+                for (uint32_t i = 0; i < QWEN4EXP_QSA3_KSTEP; i++)
+                    kk[s][i] = ((const float4 *)kv[s])[w + i];
+#pragma unroll
+            for (uint32_t h = 0; h < GROUP; h++) {
+                const float4 *qh = (const float4 *)(qvec + h * head_dim);
+#pragma unroll
+                for (uint32_t i = 0; i < QWEN4EXP_QSA3_KSTEP; i++) {
+                    const float4 qq = qh[w + i];
+#pragma unroll
+                    for (uint32_t s = 0; s < KPT; s++) {
+                        dot[s][h] = __fmaf_rn(qq.x, kk[s][i].x, dot[s][h]);
+                        dot[s][h] = __fmaf_rn(qq.y, kk[s][i].y, dot[s][h]);
+                        dot[s][h] = __fmaf_rn(qq.z, kk[s][i].z, dot[s][h]);
+                        dot[s][h] = __fmaf_rn(qq.w, kk[s][i].w, dot[s][h]);
+                    }
+                }
+            }
+        }
+        float m[GROUP];
+#pragma unroll
+        for (uint32_t h = 0; h < GROUP; h++) m[h] = QWEN4EXP_QSA_MASKED_SCORE;
+#pragma unroll
+        for (uint32_t s = 0; s < KPT; s++) {
+            const uint32_t slot = tid + s * kthreads;
+            keys[slot] = key[s];
+#pragma unroll
+            for (uint32_t h = 0; h < GROUP; h++) {
+                const float sc = live[s] ? dot[s][h] * scale : QWEN4EXP_QSA_MASKED_SCORE;
+                probs[h * NTH + slot] = sc;
+                m[h] = fmaxf(m[h], sc);
+            }
+        }
+        /* The per-warp maximum, as the second cut takes it. */
+#pragma unroll
+        for (uint32_t h = 0; h < GROUP; h++) {
+            float v = m[h];
+#pragma unroll
+            for (uint32_t step = 16u; step > 0u; step >>= 1)
+                v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, step));
+            if ((tid & 31u) == 0u) wmax[h * 8u + (tid >> 5u)] = v;
+        }
+    }
+    if (SCORERS < NTH && tid < NTH / 32u - SCORERS / 32u) {
+#pragma unroll
+        for (uint32_t h = 0; h < GROUP; h++) wmax[h * 8u + SCORERS / 32u + tid] = QWEN4EXP_QSA_MASKED_SCORE;
+    }
+}
+
+template <uint32_t GROUP>
+__global__ static void __launch_bounds__(256, 2) qwen4exp_qsa3_attention_group_kernel(
+        const float *q, const float *k_cache, const float *v_cache,
+        const int32_t *selected, const int32_t *counts, float *out,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_kv_head, uint32_t head_dim,
+        uint32_t pos0, uint32_t cache_cap, uint32_t max_selected, uint32_t sparse,
+        float scale, const uint32_t *d_pos) {
+    extern __shared__ __align__(16) float qwen4exp_qsa3_shared[];
+    constexpr uint32_t NTH = 256u;
+    constexpr uint32_t HALF = 128u;
+    const uint32_t group = blockIdx.x;
+    const uint32_t token = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t head0 = group * GROUP;
+    if (head0 + GROUP > n_head || token >= n_tokens) return;
+
+    float *qvec = qwen4exp_qsa3_shared;                     /* GROUP * head_dim */
+    float *probs0 = qvec + GROUP * head_dim;                /* 2 x GROUP * NTH */
+    int32_t *keys0 = (int32_t *)(probs0 + 2u * GROUP * NTH); /* 2 x NTH */
+    float *wmax0 = (float *)(keys0 + 2u * NTH);             /* 2 x GROUP * 8 */
+    float *tsum0 = wmax0 + 2u * GROUP * 8u;                  /* 2 x GROUP */
+    float *st_newmax = tsum0 + 2u * GROUP;                   /* GROUP */
+    float *st_rescale = st_newmax + GROUP;                   /* GROUP */
+    float *st_runmax = st_rescale + GROUP;                   /* GROUP */
+    float *st_runsum = st_runmax + GROUP;                    /* GROUP */
+
+    const uint32_t p0 = d_pos ? *d_pos : pos0;
+    const uint32_t pos = p0 + token;
+    const uint32_t count = sparse ? (uint32_t)counts[token] : pos + 1u;
+    const uint32_t kv_head = head0 / (n_head / n_kv_head);
+    const uint32_t kv_stride = n_kv_head * head_dim;
+
+    const float *qsrc = q + ((uint64_t)token * n_head + head0) * head_dim;
+    const uint32_t qspan = GROUP * head_dim;
+    for (uint32_t d = tid; d < qspan; d += NTH) qvec[d] = qsrc[d];
+    __syncthreads();
+
+    float *dst = out + ((uint64_t)token * n_head + head0) * head_dim;
+    if (count == 0u) {
+        for (uint32_t d = tid; d < qspan; d += NTH) dst[d] = 0.0f;
+        return;
+    }
+
+    const bool scorer = tid < HALF;
+    const uint32_t vt = tid - HALF;               /* valuer index 0..127 */
+    constexpr uint32_t KPT = QWEN4EXP_QSA3_KEYS_PER_THREAD;
+    constexpr uint32_t CPT = 2u;                  /* channels per valuer: vt, vt + 128 */
+
+    float acc[CPT][GROUP];
+#pragma unroll
+    for (uint32_t h = 0; h < GROUP; h++) {
+#pragma unroll
+        for (uint32_t c = 0; c < CPT; c++) acc[c][h] = 0.0f;
+    }
+    /* The running maximum and sum per head live in shared memory, owned by
+     * valuer thread h (only that thread reads or writes head h's pair). */
+    if (!scorer && vt < GROUP) {
+        st_runmax[vt] = QWEN4EXP_QSA_MASKED_SCORE;
+        st_runsum[vt] = 0.0f;
+    }
+
+    /* Prologue: tile 0's scores.  (Scoring it with all eight warps at one
+     * slot each was measured slower: the extra instantiation pushed the
+     * kernel past its register budget.) */
+    if (scorer) qwen4exp_qsa3_score_tile<GROUP, HALF, KPT>(qvec, probs0, keys0, wmax0, k_cache, selected, token,
+        max_selected, sparse, cache_cap, kv_stride, kv_head, head_dim, scale, count, 0u, tid);
+    __syncthreads();
+
+    uint32_t cur = 0;
+    for (uint32_t base = 0; base < count; base += NTH, cur ^= 1u) {
+        const uint32_t n_in_tile = min(NTH, count - base);
+        const bool has_next = base + NTH < count;
+        if (scorer) {
+            if (has_next) {
+                const uint32_t b = cur ^ 1u;
+                qwen4exp_qsa3_score_tile<GROUP, HALF, KPT>(qvec, probs0 + b * GROUP * NTH, keys0 + b * NTH,
+                    wmax0 + b * GROUP * 8u, k_cache, selected, token, max_selected, sparse,
+                    cache_cap, kv_stride, kv_head, head_dim, scale, count, base + NTH, tid);
+            }
+        } else {
+            float *probs = probs0 + cur * GROUP * NTH;
+            int32_t *keys = keys0 + cur * NTH;
+            const float *wmax = wmax0 + cur * GROUP * 8u;
+            float *tsum = tsum0 + cur * GROUP;
+            /* Tile maximum, new running maximum and rescale for head vt:
+             * the second cut's expressions, one head per thread. */
+            if (vt < GROUP) {
+                const float rm = st_runmax[vt];
+                float v = QWEN4EXP_QSA_MASKED_SCORE;
+#pragma unroll
+                for (uint32_t w = 0; w < 8u; w++) v = fmaxf(v, wmax[vt * 8u + w]);
+                const float nm = fmaxf(rm, v);
+                st_newmax[vt] = nm;
+                st_rescale[vt] = (rm > QWEN4EXP_QSA_MASKED_LIMIT) ? expf(rm - nm) : 0.0f;
+            }
+            qwen4exp_qsa3_bar(1u, HALF);
+            /* The softmax numerators, slots vt and vt + 128. */
+#pragma unroll
+            for (uint32_t s = 0; s < 2u; s++) {
+                const uint32_t slot = vt + s * HALF;
+                const int32_t mykey = keys[slot];
+#pragma unroll
+                for (uint32_t h = 0; h < GROUP; h++) {
+                    const float sc = probs[h * NTH + slot];
+                    probs[h * NTH + slot] = (mykey >= 0) ? expf(sc - st_newmax[h]) : 0.0f;
+                }
+            }
+            qwen4exp_qsa3_bar(1u, HALF);
+
+            float contrib[CPT][GROUP];
+#pragma unroll
+            for (uint32_t c = 0; c < CPT; c++)
+#pragma unroll
+                for (uint32_t h = 0; h < GROUP; h++) contrib[c][h] = 0.0f;
+            /* Valuer vt owns channels 2vt and 2vt+1: one 8-byte load per
+             * key serves both chains. */
+            const float *vbase = v_cache + (uint64_t)kv_head * head_dim + 2u * vt;
+            uint32_t j = 0;
+            for (; j + QWEN4EXP_QSA3_VSTEP <= n_in_tile; j += QWEN4EXP_QSA3_VSTEP) {
+                int32_t kj[QWEN4EXP_QSA3_VSTEP]; float vv[CPT][QWEN4EXP_QSA3_VSTEP];
+#pragma unroll
+                for (uint32_t u = 0; u < QWEN4EXP_QSA3_VSTEP; u++) kj[u] = keys[j + u];
+#pragma unroll
+                for (uint32_t u = 0; u < QWEN4EXP_QSA3_VSTEP; u++) {
+                    const float2 v2 = kj[u] >= 0
+                        ? *(const float2 *)(vbase + (uint64_t)kj[u] * kv_stride)
+                        : make_float2(0.0f, 0.0f);
+                    vv[0][u] = v2.x;
+                    vv[1][u] = v2.y;
+                }
+#pragma unroll
+                for (uint32_t h = 0; h < GROUP; h++) {
+#pragma unroll
+                    for (uint32_t u = 0; u < QWEN4EXP_QSA3_VSTEP; u += 4u) {
+                        const float4 p4 = *(const float4 *)(probs + h * NTH + j + u);
+#pragma unroll
+                        for (uint32_t c = 0; c < CPT; c++) {
+                            if (kj[u] >= 0) contrib[c][h] = __fmaf_rn(p4.x, vv[c][u], contrib[c][h]);
+                            if (kj[u + 1] >= 0) contrib[c][h] = __fmaf_rn(p4.y, vv[c][u + 1], contrib[c][h]);
+                            if (kj[u + 2] >= 0) contrib[c][h] = __fmaf_rn(p4.z, vv[c][u + 2], contrib[c][h]);
+                            if (kj[u + 3] >= 0) contrib[c][h] = __fmaf_rn(p4.w, vv[c][u + 3], contrib[c][h]);
+                        }
+                    }
+                }
+            }
+            for (; j < n_in_tile; j++) {
+                const int32_t k1 = keys[j];
+                if (k1 < 0) continue;
+                const float2 v2 = *(const float2 *)(vbase + (uint64_t)k1 * kv_stride);
+#pragma unroll
+                for (uint32_t c = 0; c < CPT; c++) {
+                    const float v1 = c == 0u ? v2.x : v2.y;
+#pragma unroll
+                    for (uint32_t h = 0; h < GROUP; h++)
+                        contrib[c][h] = __fmaf_rn(probs[h * NTH + j], v1, contrib[c][h]);
+                }
+            }
+#pragma unroll
+            for (uint32_t c = 0; c < CPT; c++)
+#pragma unroll
+                for (uint32_t h = 0; h < GROUP; h++) acc[c][h] = __fmaf_rn(acc[c][h], st_rescale[h], contrib[c][h]);
+
+            /* The tile sums: qwen4exp_blk_sum's 256-slot tree per head,
+             * one warp per head (three heads per valuer warp).  Levels 128,
+             * 64 and 32 pair the same slots in the same order in-lane; the
+             * last five are the same shuffle-down tree. */
+            const uint32_t vw = vt >> 5u, vl = vt & 31u;
+#pragma unroll
+            for (uint32_t hh = 0; hh < GROUP / 4u; hh++) {
+                const uint32_t h = vw * (GROUP / 4u) + hh;
+                const float *p = probs + h * NTH;
+                float v = ((p[vl] + p[vl + 128u]) + (p[vl + 64u] + p[vl + 192u])) +
+                          ((p[vl + 32u] + p[vl + 160u]) + (p[vl + 96u] + p[vl + 224u]));
+#pragma unroll
+                for (uint32_t step = 16u; step > 0u; step >>= 1)
+                    v += __shfl_down_sync(0xffffffffu, v, step);
+                if (vl == 0u) tsum[h] = v;
+            }
+            qwen4exp_qsa3_bar(1u, HALF);
+            if (vt < GROUP) {
+                st_runsum[vt] = __fmaf_rn(st_runsum[vt], st_rescale[vt], tsum[vt]);
+                st_runmax[vt] = st_newmax[vt];
+            }
+        }
+        __syncthreads();
+    }
+    if (!scorer) {
+#pragma unroll
+        for (uint32_t c = 0; c < CPT; c++)
+#pragma unroll
+            for (uint32_t h = 0; h < GROUP; h++) {
+                const float rs = st_runsum[h];
+                dst[h * head_dim + 2u * vt + c] =
+                    (rs > 0.0f) ? acc[c][h] / rs : 0.0f;
+            }
+    }
+}
+
 /* The same attention again, for the DECODE widths, as three launches over a
  * (head group, tile) grid instead of one block per (head, token).
  *
@@ -10596,6 +11044,22 @@ static size_t qwen4exp_qsa_group2_shared(uint32_t group, uint32_t head_dim,
  * group kernels side by side in one process. */
 static int qwen4exp_qsa_group2_off(void) {
     return getenv("DS4_QWEN4EXP_NO_QSA_GROUP2") != NULL;
+}
+
+/* The third cut's shared bytes: the query group, two probability buffers,
+ * two key buffers, two eight-slot per-warp maxima, two tile sums and the
+ * four running statistics. */
+static size_t qwen4exp_qsa_group3_shared(uint32_t group, uint32_t head_dim,
+                                         uint32_t nth) {
+    return ((size_t)group * head_dim + 2u * (size_t)group * nth) * sizeof(float) +
+           2u * (size_t)nth * sizeof(int32_t) +
+           2u * (size_t)group * 8u * sizeof(float) +
+           2u * (size_t)group * sizeof(float) +
+           4u * (size_t)group * sizeof(float);
+}
+
+static int qwen4exp_qsa_group3_off(void) {
+    return getenv("DS4_QWEN4EXP_NO_QSA_GROUP3") != NULL;
 }
 
 static uint32_t qwen4exp_qsa_group_width(void) {
@@ -11241,6 +11705,23 @@ extern "C" int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
                     sparse ? (const int32_t *)counts->ptr : NULL,             \
                     (float *)out->ptr, n_tokens, n_head, n_kv_head, head_dim, \
                     pos0, cache_cap, max_selected, sparse ? 1u : 0u, scale, d_pos_ptr)
+            /* The third-cut group kernel at the production shape;
+             * DS4_QWEN4EXP_NO_QSA_GROUP3 keeps the second cut. */
+            const size_t gshared3 = qwen4exp_qsa_group3_shared(g, head_dim, nth);
+            if (g == 12u && head_dim == 256u && nth == 256u &&
+                !qwen4exp_qsa_group3_off() &&
+                gshared3 <= QWEN4EXP_QSA_GROUP_SHARED_CAP) {
+                qwen4exp_qsa3_attention_group_kernel<12u><<<grid, nth, gshared3,
+                    cuda_decode_stream()>>>(
+                        (const float *)q->ptr, (const float *)k_cache->ptr,
+                        (const float *)v_cache->ptr,
+                        sparse ? (const int32_t *)selected->ptr : NULL,
+                        sparse ? (const int32_t *)counts->ptr : NULL,
+                        (float *)out->ptr, n_tokens, n_head, n_kv_head, head_dim,
+                        pos0, cache_cap, max_selected, sparse ? 1u : 0u, scale, d_pos_ptr);
+                return cuda_ok(cudaGetLastError(),
+                               "Qwen4-Exp QSA grouped attention (3) launch");
+            }
             /* The second-cut group kernel at the shapes it is written for;
              * DS4_QWEN4EXP_NO_QSA_GROUP2 keeps the first cut. */
             const size_t gshared2 = qwen4exp_qsa_group2_shared(g, head_dim, nth);
