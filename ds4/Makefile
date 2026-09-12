@@ -482,7 +482,7 @@ test-qwen4exp-gdn: $(QWEN4EXP_GDN_TEST)
 # The row-batching exactness pair: the prefill recurrence against the retained
 # one-row kernel over eleven widths, three head layouts and four input
 # patterns, eager and graph-captured, comparing nine buffers byte for byte.
-# It arrived in the tree without a target, so it had never been built.
+# Expose the retained row oracle through an explicit make target.
 tests/test_qwen4exp_gdn_value_reuse.o: tests/test_qwen4exp_gdn_value_reuse.c tests/test_qwen4exp_gdn.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_qwen4exp_gdn_value_reuse.c
 
