@@ -56,27 +56,40 @@ static void run_case(int adversarial, uint32_t offset) {
         need(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(tail,w,bytes,offset+(uint64_t)(VOCAB-TAIL)*ROW,DIM,TAIL,x,1),"ordinary tail");
         need(ds4_gpu_tensor_read(full,0,reference,sizeof reference)&&ds4_gpu_tensor_read(tail,0,tail_ref,sizeof tail_ref),"oracle read");
         need(found[0]==0,"mandatory zero");
+        unsigned char seen[VOCAB]={0};
         for(unsigned i=0;i<CAP;i++) {
-            need(i==0||found[i]>found[i-1],"sorted unique IDs");
+            need(found[i]<VOCAB && !seen[found[i]],"unique IDs");seen[found[i]]=1;
             need(found[i]<PREFIX || (found[i]>=VOCAB-TAIL && found[i]<VOCAB),"static domain");
             float exact=found[i]<PREFIX?reference[found[i]]:tail_ref[found[i]-(VOCAB-TAIL)];
             need(!memcmp(&exact,&selected[i],4),"full refinement differs from ordinary row");
         }
-        for(unsigned i=0;i<TAIL;i++) need(found[CAP-TAIL+i]==VOCAB-TAIL+i,"mandatory tail");
+        for(unsigned i=0;i<TAIL;i++) need(seen[VOCAB-TAIL+i],"mandatory tail");
         if(adversarial) {
             need(reference[PREFIX-1]>0,"adversarial full winner");
             for(unsigned i=0;i<CAP;i++) need(found[i]!=PREFIX-1 && selected[i]==0,"screen is approximate");
-            for(unsigned i=1;i<CAP-TAIL;i++) need(found[i]==i,"coarse tie lowest ID");
+            for(unsigned i=1;i<CAP-TAIL;i++) need(seen[i],"coarse tie lowest ID");
         }
     }
-    /* Map original IDs, reject bad packed IDs, and preserve legacy NaN0. */
-    uint32_t packed=CAP-1,mapped=0;
-    need(ds4_gpu_tensor_write(winner,0,&packed,4)&&ds4_gpu_mtp_native_map(winner,out,ids,CAP,VOCAB)&&ds4_gpu_tensor_read(winner,0,&mapped,4),"winner map");
-    need(mapped==VOCAB-1,"mapped tail ID");
-    packed=CAP;
-    need(ds4_gpu_tensor_write(winner,0,&packed,4)&&ds4_gpu_mtp_native_map(winner,out,ids,CAP,VOCAB)&&ds4_gpu_tensor_read(winner,0,&mapped,4)&&mapped==UINT32_MAX,"bad winner guard");
-    float nan=NAN;
-    need(ds4_gpu_tensor_write(out,0,&nan,4)&&ds4_gpu_mtp_native_map(winner,out,ids,CAP,VOCAB)&&ds4_gpu_tensor_read(winner,0,&mapped,4)&&mapped==0,"NaN0 pin");
+    /* Operator oracle is a scan in ascending ORIGINAL ID order, independently
+     * of score-ranked physical layout. Include zero ties, nonzero NaN, both
+     * infinities, all negative infinities and mandatory-zero NaN. */
+    for(unsigned test=0;test<7;test++) {
+        for(unsigned i=0;i<CAP;i++) {
+            found[i]=i?CAP-i:0;
+            selected[i]=test==0?-INFINITY:test==1?(i&1?-0.0f:0.0f):(float)(int)(rnd()%21)-10;
+        }
+        if(test==2) selected[5]=NAN;
+        if(test==3) selected[CAP-1]=selected[8]=INFINITY;
+        if(test==4) selected[0]=NAN;
+        if(test==5) for(unsigned i=1;i<CAP;i++) selected[i]=NAN;
+        if(test==6) selected[0]=-INFINITY;
+        float by_id[CAP];for(unsigned i=0;i<CAP;i++) by_id[found[i]]=selected[i];
+        uint32_t expected=0;for(unsigned i=1;i<CAP;i++) if(by_id[i]>by_id[expected]) expected=i;
+        uint32_t mapped=UINT32_MAX;
+        need(ds4_gpu_tensor_write(out,0,selected,sizeof selected)&&ds4_gpu_tensor_write(ids,0,found,sizeof found),"reducer data");
+        need(ds4_gpu_mtp_native_map(winner,out,ids,CAP,VOCAB)&&ds4_gpu_tensor_read(winner,0,&mapped,4),"original-ID reducer");
+        need(mapped==expected,"sorted original-ID oracle mismatch");
+    }
     need(ds4_gpu_mtp_native_screen(out,ids,scratch,w,bytes,offset,DIM,VOCAB,100,TAIL,x)==0,"small width fallback");
     setenv("DS4_QWEN4EXP_NO_ROW_TILE","1",1);
     need(ds4_gpu_mtp_native_screen(out,ids,scratch,w,bytes,offset,DIM,VOCAB,PREFIX,TAIL,x)==0,"diagnostic fallback");

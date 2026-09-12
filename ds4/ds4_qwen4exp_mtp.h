@@ -619,7 +619,7 @@ typedef struct {
                        uint64_t model_size, uint64_t weight_offset,
                        uint64_t in_dim, uint64_t out_dim,
                        const ds4_gpu_tensor *x, uint64_t n_tok);
-    /* Optional CUDA native-activation screen/refine/map capability. All three
+    /* Optional CUDA native-activation screen/refine/original-ID-top1 capability. All three
      * hooks must be bound together; other backends keep the static ranges. */
     int (*native_init)(uint32_t, uint64_t *, uint32_t *);
     int (*native_screen)(ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *,

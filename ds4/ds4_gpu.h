@@ -852,6 +852,8 @@ int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out, ds4_gpu_tensor *ids,
     ds4_gpu_tensor *scratch, const void *map, uint64_t bytes, uint64_t offset,
     uint32_t dim, uint32_t vocab, uint32_t prefix, uint32_t tail,
     const ds4_gpu_tensor *x);
+/* Reduce selected full logits using original-ID ties; overwrites winner.
+ * IDs must be unique and ID zero must occupy slot zero, as screen guarantees. */
 int ds4_gpu_mtp_native_map(ds4_gpu_tensor *winner, const ds4_gpu_tensor *logits,
     const ds4_gpu_tensor *ids, uint32_t count, uint32_t vocab);
 

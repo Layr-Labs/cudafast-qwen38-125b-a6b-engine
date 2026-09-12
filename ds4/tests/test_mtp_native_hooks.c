@@ -28,8 +28,9 @@ static int map_mock(ds4_gpu_tensor *winner,const ds4_gpu_tensor *logits,
                     const ds4_gpu_tensor *ids,uint32_t count,uint32_t vocab) {
     maps++;CHECK(count==4 && vocab==HEAD_N_VOCAB,"map inputs");
     uint32_t bits;memcpy(&bits,logits->data,4);
-    uint32_t p=(bits&0x7fffffffu)>0x7f800000u?0:*(uint32_t *)winner->data;
-    *(uint32_t *)winner->data=p<count?((uint32_t *)ids->data)[p]:UINT32_MAX;return 1;
+    float best=-INFINITY;uint32_t id=0;
+    for(uint32_t i=0;i<count;i++) {float v=((float *)logits->data)[i];uint32_t oi=((uint32_t *)ids->data)[i];if(v>best||(v==best&&oi<id)){best=v;id=oi;}}
+    *(uint32_t *)winner->data=(bits&0x7fffffffu)>0x7f800000u?0:id;return 1;
 }
 static void attach(ds4_qwen4exp_mtp_head *h) {
     h->hooks.native_screen=screen_mock;h->hooks.native_map=map_mock;
