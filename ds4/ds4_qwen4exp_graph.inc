@@ -918,6 +918,7 @@ static void qwen4exp_zero_tensor(ds4_gpu_tensor *t) {
 
 void ds4_qwen4exp_session_reset(ds4_qwen4exp_session *s) {
     if (!s) return;
+    s->head_cache_pos = 0;
     if (!s->state_dirty) {
         /* Already at the reset state and nothing has written since, so every
          * store below would write the value the buffer already holds.  `pos`
@@ -2817,6 +2818,70 @@ bool ds4_qwen4exp_session_add_head_block(ds4_qwen4exp_session             *s,
         return false;
     }
     return true;
+}
+
+
+/* Native prompt-cache publication. Historical head outputs have no reader:
+ * K/V and the indexer tape depend only on the attention mixer's input. Keep
+ * the native primitive calls and pinned weight bytes; omit the query,
+ * attention output and FFN rather than evaluating discarded head outputs. */
+static bool qwen4exp_graph_head_cache_encode(ds4_qwen4exp_session *s,
+        const ds4_qwen4exp_layer_weights *l, const ds4_model *m,
+        uint32_t il, uint32_t n_tokens) {
+    const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
+    if (!qwen4exp_graph_residual(s, m, l->hc_attn_norm, l->hc_attn_down,
+            l->hc_attn_up, l->hc_attn_inject, l->hc_attn_norm_offset, n_tokens))
+        return false;
+    const uint64_t blocks = (uint64_t)DS4_N_EMBD / 32u;
+    const uint64_t qbytes = (uint64_t)n_tokens * blocks * 32u;
+    const uint64_t soff = (qbytes + 15u) & ~15ull;
+    if (!ds4_qwen4exp_quantize_q8_0(s->mixed_q8, 0, soff, s->mixed,
+                                   DS4_N_EMBD, n_tokens) ||
+        !ds4_qwen4exp_matmul_q8_0_preq(s->qsa_kin, QW_MAP(m, l->attn_k),
+            QW_MAPSZ(m, l->attn_k), QW_OFF(l->attn_k), DS4_N_EMBD,
+            cfg->qsa_kv_dim, s->mixed_q8, 0, soff, n_tokens) ||
+        !ds4_qwen4exp_matmul_q8_0_preq(s->qsa_vin, QW_MAP(m, l->attn_v),
+            QW_MAPSZ(m, l->attn_v), QW_OFF(l->attn_v), DS4_N_EMBD,
+            cfg->qsa_kv_dim, s->mixed_q8, 0, soff, n_tokens) ||
+        !ds4_gpu_qwen4exp_qsa_prep_kv_append_fused_dpos_tensor(
+            s->qsa_k[il], s->qsa_v[il], NULL, s->qsa_kin, s->qsa_vin,
+            s->attn_k_norm[il], s->inv_freq, s->pos, n_tokens, DS4_N_HEAD_KV,
+            DS4_N_HEAD_DIM, DS4_N_ROT, s->plan.n_ctx, DS4_RMS_EPS,
+            l->attn_k_norm_offset, s->d_pos) ||
+        !ds4_qwen4exp_matmul_bf16(s->idx_k, QW_MAP(m, l->indexer_k_proj),
+            QW_MAPSZ(m, l->indexer_k_proj), QW_OFF(l->indexer_k_proj),
+            DS4_N_EMBD, cfg->indexer_k_dim, s->mixed, n_tokens) ||
+        !ds4_gpu_qwen4exp_qsa_indexer_pool_update_dpos_tensor(
+            s->idx_pool[il], s->idx_tape[il], s->idx_k, s->idx_k_norm[il],
+            s->inv_freq, s->pos, n_tokens, s->plan.n_ctx,
+            DS4_N_INDEXER_HEAD_DIM, DS4_N_INDEXER_COMPRESS_RATIO,
+            DS4_N_ROT, DS4_RMS_EPS, l->indexer_k_norm_offset, s->d_pos))
+        return false;
+    return true;
+}
+
+int ds4_qwen4exp_graph_head_cache(void *graph, void *cache,
+        ds4_gpu_tensor *hyper, uint32_t il, uint32_t pos0, uint32_t n_tokens) {
+    const ds4_qwen4exp_head_block_ctx *c = graph;
+    ds4_qwen4exp_session *s = cache;
+    if (!c || !s || !c->l || !c->m || !hyper || !n_tokens ||
+        n_tokens > s->plan.n_batch || il >= DS4_MAX_LAYER ||
+        il < g_ds4_qwen4exp.n_layer || !s->qsa_k[il] ||
+        !c->l->is_full_attention || s->hc_pending ||
+        (uint64_t)pos0 + n_tokens > s->plan.n_ctx) return 0;
+    ds4_gpu_tensor *saved_hyper = s->hyper;
+    const uint32_t saved_pos = s->pos;
+    s->state_dirty = true;
+    s->hyper = hyper;
+    s->pos = pos0;
+    bool ok = !s->d_pos || ds4_gpu_qwen4exp_update_dpos(s->d_pos, s->pos);
+    if (ok) ok = qwen4exp_graph_head_cache_encode(s, c->l, c->m, il, n_tokens);
+    s->hyper = saved_hyper;
+    s->pos = saved_pos;
+    if (s->d_pos && !ds4_gpu_qwen4exp_update_dpos(s->d_pos, s->pos)) ok = false;
+    if (ok) s->head_cache_pos = pos0 + n_tokens;
+    if (!ok) fprintf(stderr, "ds4: qwen4exp native head cache publication failed\n");
+    return ok ? 1 : 0;
 }
 
 /* Encode the MTP block once, either eagerly or into the decode graph stream.

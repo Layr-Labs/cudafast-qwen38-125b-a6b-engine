@@ -836,19 +836,25 @@ int ds4_qwen4exp_mtp_head_init(ds4_qwen4exp_mtp_head *h,
                         h->max_tokens);
     }
     if (mtp_head_draft_vocab(h, err, errlen) != 0) return -1;
+    if (h->cache_seed_capacity > DS4_QWEN4EXP_MTP_CACHE_SEED_MAX_ROWS ||
+        (h->cache_seed_capacity && !h->hooks.cache_seed)) {
+        return mtp_fail(err, errlen, "qwen4exp MTP: invalid cache-seed capacity or hook");
+    }
+    const uint64_t input_rows = h->cache_seed_capacity > h->max_tokens
+        ? h->cache_seed_capacity : h->max_tokens;
     const uint64_t rows = h->max_tokens;
     const uint64_t n_embd = h->n_embd;
     const uint64_t hc_dim = (uint64_t)h->n_hc * n_embd;
     const uint64_t f = sizeof(float);
     bool ok = true;
 
-    h->t_tokens       = mtp_alloc(rows * sizeof(int32_t), &ok);
-    h->t_embed_rows   = mtp_alloc(rows * n_embd * f, &ok);
-    h->t_embed_out    = mtp_alloc(rows * n_embd * f, &ok);
-    h->t_e_normed     = mtp_alloc(rows * n_embd * f, &ok);
-    h->t_h_normed     = mtp_alloc(rows * hc_dim * f, &ok);
-    h->t_ehx          = mtp_alloc(rows * h->n_hc * 2ull * n_embd * f, &ok);
-    h->t_hyper        = mtp_alloc(rows * hc_dim * f, &ok);
+    h->t_tokens       = mtp_alloc(input_rows * sizeof(int32_t), &ok);
+    h->t_embed_rows   = mtp_alloc(input_rows * n_embd * f, &ok);
+    h->t_embed_out    = mtp_alloc(input_rows * n_embd * f, &ok);
+    h->t_e_normed     = mtp_alloc(input_rows * n_embd * f, &ok);
+    h->t_h_normed     = mtp_alloc(input_rows * hc_dim * f, &ok);
+    h->t_ehx          = mtp_alloc(input_rows * h->n_hc * 2ull * n_embd * f, &ok);
+    h->t_hyper        = mtp_alloc(input_rows * hc_dim * f, &ok);
     h->t_mix_normed   = mtp_alloc(rows * hc_dim * f, &ok);
     h->t_mix_lowrank  = mtp_alloc(rows * h->n_lowrank * f, &ok);
     h->t_mix_wide     = mtp_alloc(rows * hc_dim * f, &ok);
@@ -878,6 +884,9 @@ int ds4_qwen4exp_mtp_head_init(ds4_qwen4exp_mtp_head *h,
             h->native_capacity = capacity;
         }
     }
+    if (h->cache_seed_capacity) h->t_cache_tail = mtp_alloc(hc_dim * f, &ok);
+    h->cache_tail_valid = false;
+    h->cache_tail_next_token = -1;
     h->t_top1         = mtp_alloc(rows * sizeof(uint32_t), &ok);
     h->top1_host      = malloc((size_t)rows * sizeof(uint32_t));
     if (!ok || !h->top1_host) {
@@ -895,7 +904,7 @@ void ds4_qwen4exp_mtp_head_free(ds4_qwen4exp_mtp_head *h) {
         h->t_tokens, h->t_embed_rows, h->t_embed_out, h->t_e_normed,
         h->t_h_normed, h->t_ehx, h->t_hyper, h->t_mix_normed,
         h->t_mix_lowrank, h->t_mix_wide, h->t_sample, h->t_logits,
-        h->t_logits_prefix, h->t_logits_tail, h->t_top1, h->t_native_ids, h->t_native_scratch,
+        h->t_logits_prefix, h->t_logits_tail, h->t_top1, h->t_native_ids, h->t_native_scratch, h->t_cache_tail,
     };
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
         ds4_gpu_tensor_free(all[i]);
@@ -906,6 +915,9 @@ void ds4_qwen4exp_mtp_head_free(ds4_qwen4exp_mtp_head *h) {
     h->t_logits_prefix = h->t_logits_tail = NULL;
     h->t_top1 = NULL;
     h->t_native_ids = h->t_native_scratch = NULL;
+    h->t_cache_tail = NULL;
+    h->cache_seed_capacity = 0;
+    ds4_qwen4exp_mtp_head_reset_cache(h);
     h->native_capacity = 0;
     free(h->top1_host);
     h->top1_host = NULL;
@@ -999,11 +1011,14 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                                  uint32_t pos0, uint32_t n_tokens,
                                  int *draft_out, float *multi_out,
                                  bool last_only,
+                                 const ds4_gpu_tensor *multi_device,
+                                 uint32_t first_device_row, bool cache_only,
                                  char *err, size_t errlen) {
-    if (n_tokens == 0 || n_tokens > h->max_tokens) {
+    const uint32_t capacity = cache_only ? h->cache_seed_capacity : h->max_tokens;
+    if (n_tokens == 0 || n_tokens > capacity) {
         return mtp_fail(err, errlen,
                         "qwen4exp MTP head: %u rows, built for 1..%u",
-                        n_tokens, h->max_tokens);
+                        n_tokens, capacity);
     }
     const uint32_t n_embd = h->n_embd;
     const uint32_t n_hc = h->n_hc;
@@ -1032,7 +1047,7 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
 
     /* The ids the embedding gather reads.  int is the caller's type; the
      * kernel takes int32, and the two agree on every target this builds for. */
-    int32_t ids_stack[8];
+    int32_t ids_stack[DS4_QWEN4EXP_MTP_CACHE_SEED_MAX_ROWS];
     int32_t *ids = ids_stack;
     if (n_tokens > sizeof(ids_stack) / sizeof(ids_stack[0])) {
         ids = malloc((size_t)n_tokens * sizeof(int32_t));
@@ -1047,7 +1062,11 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
     MTP_HEAD_TICK(MTP_HEAD_T_TOKEN);
     if (ok) {
         stage = "multi-stream upload";
-        ok = ds4_gpu_tensor_write(h->t_hyper, 0, multi_in,
+        ok = multi_device
+            ? ds4_gpu_tensor_copy(h->t_hyper, 0, multi_device,
+                                  (uint64_t)first_device_row * hc_dim * f,
+                                  (uint64_t)n_tokens * hc_dim * f) != 0
+            : ds4_gpu_tensor_write(h->t_hyper, 0, multi_in,
                                   (uint64_t)n_tokens * hc_dim * f) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_MULTI_IN);
@@ -1115,10 +1134,21 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
     MTP_HEAD_TICK(MTP_HEAD_T_EH_PROJ);
     if (ok) {
         stage = "block";
-        ok = h->hooks.block(h->graph, h->cache, h->t_hyper, h->block_index,
+        ds4_qwen4exp_block_forward_fn block = cache_only
+            ? h->hooks.cache_seed : h->hooks.block;
+        ok = block && block(h->graph, h->cache, h->t_hyper, h->block_index,
                             pos0, n_tokens) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_BLOCK);
+    if (cache_only) {
+        /* Everything after this point is stateless output nobody requested.
+         * Publish the cache before the borrowed graph scratch is reused. */
+        const bool completed = ds4_gpu_end_commands() != 0;
+        if (!ok || !completed) return mtp_fail(err, errlen,
+            "qwen4exp MTP cache seed: %s failed at position %u over %u rows",
+            stage, pos0, n_tokens);
+        return 0;
+    }
     /* t_h_normed's previous contents were consumed by eh_proj.  Reuse it for
      * the final hyper row so the stateless tail needs neither tensor views
      * nor an extra allocation.  Keep t_hyper intact for multi_out. */
@@ -1295,7 +1325,7 @@ int ds4_qwen4exp_mtp_head_forward(ds4_qwen4exp_mtp_head *h,
                                   int *draft_out, float *multi_out,
                                   char *err, size_t errlen) {
     return mtp_head_forward_impl(h, next_tokens, multi_in, pos0, n_tokens,
-                                 draft_out, multi_out, false, err, errlen);
+                                 draft_out, multi_out, false, NULL, 0u, false, err, errlen);
 }
 
 int ds4_qwen4exp_mtp_head_forward_last(ds4_qwen4exp_mtp_head *h,
@@ -1305,7 +1335,82 @@ int ds4_qwen4exp_mtp_head_forward_last(ds4_qwen4exp_mtp_head *h,
                                        int *draft_out, float *multi_out,
                                        char *err, size_t errlen) {
     return mtp_head_forward_impl(h, next_tokens, multi_in, pos0, n_tokens,
-                                 draft_out, multi_out, true, err, errlen);
+                                 draft_out, multi_out, true, NULL, 0u, false, err, errlen);
 }
+
+
+void ds4_qwen4exp_mtp_head_reset_cache(ds4_qwen4exp_mtp_head *h) {
+    if (!h) return;
+    h->cache_tail_valid = false;
+    h->cache_tail_pos = 0;
+    h->cache_tail_next_token = -1;
+}
+
+static bool mtp_cache_source_range(const ds4_qwen4exp_mtp_head *h,
+                                    uint32_t first, uint32_t rows) {
+    const uint64_t hc = (uint64_t)h->n_hc * h->n_embd;
+    if (!hc || hc > UINT64_MAX / sizeof(float)) return false;
+    const uint64_t row_bytes = hc * sizeof(float);
+    return first <= UINT64_MAX / row_bytes &&
+           rows <= UINT64_MAX / row_bytes &&
+           (uint64_t)first * row_bytes <= UINT64_MAX - (uint64_t)rows * row_bytes;
+}
+
+int ds4_qwen4exp_mtp_head_seed_cache(ds4_qwen4exp_mtp_head *h,
+        const int *next_tokens, const ds4_gpu_tensor *target_hyper,
+        uint32_t first_hyper_row, uint32_t pos0, uint32_t n_tokens,
+        char *err, size_t errlen) {
+    if (!h || !next_tokens || !target_hyper || !h->hooks.cache_seed ||
+        !h->cache_seed_capacity || !n_tokens || n_tokens > h->cache_seed_capacity ||
+        (uint64_t)pos0 + n_tokens > UINT32_MAX ||
+        !mtp_cache_source_range(h, first_hyper_row, n_tokens)) {
+        return mtp_fail(err, errlen, "qwen4exp MTP: invalid cache-seed input");
+    }
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        if (next_tokens[t] < 0 || (uint32_t)next_tokens[t] >= h->n_vocab)
+            return mtp_fail(err, errlen, "qwen4exp MTP: invalid cache-seed token");
+    }
+    return mtp_head_forward_impl(h, next_tokens, NULL, pos0, n_tokens,
+        NULL, NULL, false, target_hyper, first_hyper_row, true, err, errlen);
+}
+
+int ds4_qwen4exp_mtp_head_retain_cache_tail(ds4_qwen4exp_mtp_head *h,
+        const ds4_gpu_tensor *target_hyper, uint32_t first_hyper_row,
+        uint32_t pos, int known_next, char *err, size_t errlen) {
+    if (!h || !h->t_cache_tail || !target_hyper ||
+        known_next < -1 || (known_next >= 0 && (uint32_t)known_next >= h->n_vocab) ||
+        !mtp_cache_source_range(h, first_hyper_row, 1u)) {
+        return mtp_fail(err, errlen, "qwen4exp MTP: invalid retained cache tail");
+    }
+    const uint64_t bytes = (uint64_t)h->n_hc * h->n_embd * sizeof(float);
+    h->cache_tail_valid = false;
+    if (!ds4_gpu_tensor_copy(h->t_cache_tail, 0, target_hyper,
+                            (uint64_t)first_hyper_row * bytes, bytes)) {
+        return mtp_fail(err, errlen, "qwen4exp MTP: cache-tail copy failed");
+    }
+    h->cache_tail_pos = pos;
+    h->cache_tail_next_token = known_next;
+    h->cache_tail_valid = true;
+    return 0;
+}
+
+int ds4_qwen4exp_mtp_head_feed_cache_tail(ds4_qwen4exp_mtp_head *h,
+        int token, uint32_t pos, bool *changed, char *err, size_t errlen) {
+    if (changed) *changed = false;
+    if (!h || token < 0 || (uint32_t)token >= h->n_vocab) {
+        return mtp_fail(err, errlen, "qwen4exp MTP: invalid cache-tail token");
+    }
+    if (!h->cache_seed_capacity || !h->cache_tail_valid) return 0;
+    if ((uint64_t)h->cache_tail_pos + 1u != pos) {
+        return mtp_fail(err, errlen, "qwen4exp MTP: cache-tail position mismatch");
+    }
+    if (h->cache_tail_next_token == token) return 0;
+    if (ds4_qwen4exp_mtp_head_seed_cache(h, &token, h->t_cache_tail,
+            0u, h->cache_tail_pos, 1u, err, errlen) != 0) return -1;
+    h->cache_tail_next_token = token;
+    if (changed) *changed = true;
+    return 0;
+}
+
 
 #endif /* DS4_NO_GPU */
