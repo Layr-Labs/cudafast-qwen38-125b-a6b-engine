@@ -3109,6 +3109,19 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
                     } \
                 } \
             } while (0)
+            /* PDL: this kernel is launched with the programmatic stream
+             * serialization attribute behind the decode quantizer, whose
+             * trigger fires at its top at these widths.  The pair list, the
+             * offsets and the router weights this block has already read were
+             * written by kernels that completed before that quantizer began,
+             * and the expert row address depends on none of its output, so
+             * the first two weight payloads are issued here and fly while the
+             * quantizer drains.  xq/xs/xsum ARE its output: the fence below
+             * sits after those two loads and before the first accumulate,
+             * which is the first read of any of the three, and every later
+             * read is later still.  The fence is a per-thread wait, a no-op
+             * in a plainly launched kernel, and it is passed exactly once. */
+            bool qw_fenced = false;
             uint32_t g = lane;
             for (; g + 32u < groups; g += 64u) {
                 uint32_t raw0[8];
@@ -3117,6 +3130,7 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
                     qw_raw_load((uint32_t)Type, weight_row, g, raw0) ? raw0 : NULL;
                 const uint32_t *p1 =
                     qw_raw_load((uint32_t)Type, weight_row, g + 32u, raw1) ? raw1 : NULL;
+                if (!qw_fenced) { QWEN4EXP_PDL_SYNC(); qw_fenced = true; }
                 QWEN4EXP_SPLIT_GROUP(g, p0);
                 QWEN4EXP_SPLIT_GROUP(g + 32u, p1);
             }
@@ -3124,6 +3138,7 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
                 uint32_t raw[8];
                 const uint32_t *rawp =
                     qw_raw_load((uint32_t)Type, weight_row, g, raw) ? raw : NULL;
+                if (!qw_fenced) { QWEN4EXP_PDL_SYNC(); qw_fenced = true; }
                 QWEN4EXP_SPLIT_GROUP(g, rawp);
             }
 #undef QWEN4EXP_SPLIT_GROUP
@@ -5212,19 +5227,33 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         /* Vector reads require alignment; the scalar schedule remains available. */
         const bool vector = ((uintptr_t)sc.xq & 15u) == 0u &&
             getenv("DS4_QWEN4EXP_NO_SPLIT_VECTOR") == NULL;
-#define QWEN4EXP_SPLIT_GATEUP(V, P) \
-        qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P><<< \
-            dim3((mid_dim + P - 1u) / P, gu_rows, 1), P * 64u, 0, stream>>>( \
+        /* PDL consumer of the quantizer that just wrote sc.xq/xs/xsum (its
+         * trigger is row-gated to these widths).  The valve keeps the plain
+         * launch from the same binary. */
+        const bool split_pdl = getenv("DS4_QWEN4EXP_NO_SPLIT_PDL") == NULL;
+#define QWEN4EXP_SPLIT_GATEUP_ARGS \
             (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum, \
             sc.pairs, sc.counts, sc.offsets, gu_active, \
             (const float *)weights->ptr, \
             gate_slab->expert_bytes, gate_slab->row_bytes, \
             up_slab->expert_bytes, up_slab->row_bytes, \
             gate_slab->type, up_slab->type, xgroups, mid_dim, \
-            mid_token_stride, n_expert_used)
+            mid_token_stride, n_expert_used
+#define QWEN4EXP_SPLIT_GATEUP(V, P) do { \
+        if (split_pdl) { \
+            QWEN4EXP_LAUNCH_PDL( \
+                (qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P>), \
+                dim3((mid_dim + P - 1u) / P, gu_rows, 1), P * 64u, 0, stream, \
+                QWEN4EXP_SPLIT_GATEUP_ARGS); \
+        } else { \
+            qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P><<< \
+                dim3((mid_dim + P - 1u) / P, gu_rows, 1), P * 64u, 0, stream>>>( \
+                QWEN4EXP_SPLIT_GATEUP_ARGS); \
+        } } while (0)
         if (vector) { QWEN4EXP_SPLIT_GATEUP(true, 2u); }
         else { QWEN4EXP_SPLIT_GATEUP(false, 4u); }
 #undef QWEN4EXP_SPLIT_GATEUP
+#undef QWEN4EXP_SPLIT_GATEUP_ARGS
     }
     else if (tile == 8) { QWEN4EXP_GATEUP(8); }
     else if (tile == 4) { QWEN4EXP_GATEUP(4); }
