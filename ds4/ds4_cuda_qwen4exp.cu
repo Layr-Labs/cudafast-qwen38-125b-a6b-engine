@@ -3179,12 +3179,33 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
     }
 }
 
+/* Two aligned activation loads supply the same eight DP4A words and the
+ * same two ordered floating contributions as the one-half group helper.
+ * Used for one-half typed weights after the host checks input alignment. */
+__device__ __forceinline__ static void qwen4exp_shared_vector_accumulate(
+        float *acc, const int8_t *wq, float wa, float wb,
+        const int8_t *xq, float scale, int sum) {
+    const int4 lo = *(const int4 *)(const void *)xq;
+    const int4 hi = *(const int4 *)(const void *)(xq + 16);
+    int d = 0;
+    d = __dp4a(qwen4exp_load_i8x4(wq + 0), lo.x, d);
+    d = __dp4a(qwen4exp_load_i8x4(wq + 4), lo.y, d);
+    d = __dp4a(qwen4exp_load_i8x4(wq + 8), lo.z, d);
+    d = __dp4a(qwen4exp_load_i8x4(wq + 12), lo.w, d);
+    d = __dp4a(qwen4exp_load_i8x4(wq + 16), hi.x, d);
+    d = __dp4a(qwen4exp_load_i8x4(wq + 20), hi.y, d);
+    d = __dp4a(qwen4exp_load_i8x4(wq + 24), hi.z, d);
+    d = __dp4a(qwen4exp_load_i8x4(wq + 28), hi.w, d);
+    *acc += (wa * scale) * (float)d;
+    *acc += (wb * scale) * (float)sum;
+}
+
 /* Grid (ceil(out_dim / 8), ceil(n_tokens / R)).  The slots of a token are
  * walked in ascending order into ONE accumulator, which is what the per-token
  * kernel did; the rows of the tile do not share a weight here, because each
  * one picked its own expert for the slot.  What the tile buys is that the
  * activation groups are read once for R rows and the decode is per group. */
-template <int R, int DownType = -1>
+template <int R, int DownType = -1, bool Vector = false>
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
@@ -3207,6 +3228,14 @@ __global__ static void qwen4exp_moe_down_q_kernel(
     const uint32_t take = n_tokens - tok0 < (uint32_t)R ? n_tokens - tok0
                                                         : (uint32_t)R;
 
+    /* At most 32 selected IDs: each lane loads one, then the slot walk
+     * broadcasts it. IDs are read anew on every invocation and graph replay. */
+    int32_t route[R];
+#pragma unroll
+    for (int r = 0; r < R; r++)
+        route[r] = Vector && (uint32_t)r < take && lane < n_expert_used
+            ? selected[(uint64_t)(tok0 + r) * n_expert_used + lane] : -1;
+
     float acc[R];
 #pragma unroll
     for (int r = 0; r < R; r++) acc[r] = 0.0f;
@@ -3216,7 +3245,8 @@ __global__ static void qwen4exp_moe_down_q_kernel(
         for (int r = 0; r < R; r++) {
             if ((uint32_t)r < take) {
                 const uint32_t t = tok0 + (uint32_t)r;
-                const int32_t e = selected[(uint64_t)t * n_expert_used + slot];
+                const int32_t e = Vector ? __shfl_sync(0xffffffffu, route[r], slot)
+                    : selected[(uint64_t)t * n_expert_used + slot];
                 if (e < 0 || (uint32_t)e >= n_total_expert) continue;
                 const char *drow = down +
                     (uint64_t)(uint32_t)e * down_expert_bytes +
@@ -3230,9 +3260,13 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                             DownType < 0 ? down_type : (uint32_t)DownType,
                             drow, g, wq, wa, wb, &halves);
                     const uint64_t at_g = mrow * groups + g;
-                    qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves,
-                                              mq + at_g * 32u, ms[at_g],
-                                              msum[at_g]);
+                    if (Vector && halves == 1)
+                        qwen4exp_shared_vector_accumulate(&acc[r], wq, wa[0], wb[0],
+                            mq + at_g * 32u, ms[at_g], msum[at_g]);
+                    else
+                        qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves,
+                                                  mq + at_g * 32u, ms[at_g],
+                                                  msum[at_g]);
                 }
             }
         }
@@ -3245,27 +3279,6 @@ __global__ static void qwen4exp_moe_down_q_kernel(
             out[(uint64_t)(tok0 + (uint32_t)r) * out_dim + row] = tot;
         }
     }
-}
-
-/* Two aligned activation loads supply the same eight DP4A words and the
- * same two ordered floating contributions as the one-half group helper.
- * Used only for Q8 shared weights after the host checks input alignment. */
-__device__ __forceinline__ static void qwen4exp_shared_vector_accumulate(
-        float *acc, const int8_t *wq, float wa, float wb,
-        const int8_t *xq, float scale, int sum) {
-    const int4 lo = *(const int4 *)(const void *)xq;
-    const int4 hi = *(const int4 *)(const void *)(xq + 16);
-    int d = 0;
-    d = __dp4a(qwen4exp_load_i8x4(wq + 0), lo.x, d);
-    d = __dp4a(qwen4exp_load_i8x4(wq + 4), lo.y, d);
-    d = __dp4a(qwen4exp_load_i8x4(wq + 8), lo.z, d);
-    d = __dp4a(qwen4exp_load_i8x4(wq + 12), lo.w, d);
-    d = __dp4a(qwen4exp_load_i8x4(wq + 16), hi.x, d);
-    d = __dp4a(qwen4exp_load_i8x4(wq + 20), hi.y, d);
-    d = __dp4a(qwen4exp_load_i8x4(wq + 24), hi.z, d);
-    d = __dp4a(qwen4exp_load_i8x4(wq + 28), hi.w, d);
-    *acc += (wa * scale) * (float)d;
-    *acc += (wb * scale) * (float)sum;
 }
 
 /* The shared expert: no routing, so the tile is consecutive tokens and the
@@ -4861,8 +4874,20 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         getenv("DS4_QWEN4EXP_NO_GU_PAIR_TASKS") == NULL;
     const uint64_t task_bytes = pair_tasks ? (1u + 2u * task_capacity) * 4u : 0u;
 
+    const int tile = qwen4exp_moe_tile(n_tokens);
+    const bool down_vector = tile == 2 && n_tokens <= 2u &&
+        n_expert_used <= 32u &&
+        (down_slab->type == DS4_QWEN4EXP_TY_q8_0 ||
+         (n_tokens == 2u && down_slab->type == DS4_QWEN4EXP_TY_q5_1)) &&
+        getenv("DS4_QWEN4EXP_GENERIC_EXPERTS") == NULL &&
+        getenv("DS4_QWEN4EXP_NO_DOWN_VECTOR") == NULL;
+    uint64_t mq_offset = xq_bytes + idx_bytes + pair_bytes;
+    /* Align only the short down activation bytes. The shared input prefix and
+     * routing metadata retain their offsets; no weight layout changes. */
+    if (down_vector) mq_offset = (mq_offset + 15u) & ~uint64_t(15u);
+
     char *base = (char *)qwen4exp_group_scratch(
-            logical_tier, idx_bytes + pair_bytes + xq_bytes + mq_bytes + task_bytes);
+            logical_tier, mq_offset + mq_bytes + task_bytes);
     if (!base) return 0;
     /* The immediately following shared expert consumes this same input.
      * Keep its quantized bytes/scales/sums at the shared scratch prefix;
@@ -4877,14 +4902,14 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     sc.cursor = sc.offsets + n_total_expert;
     sc.active = sc.cursor + n_total_expert;
     sc.pairs = sc.active + n_total_expert + 1u;
-    at += idx_bytes + pair_bytes;
+    at = base + mq_offset;
     sc.mq = (int8_t *)at;
     sc.ms = (float *)(at + (uint64_t)n_pairs * mgroups * 32u);
     sc.msum = (int32_t *)(sc.ms + (uint64_t)n_pairs * mgroups);
     /* Append the task list; all existing metadata and Q8 scratch offsets keep
      * their alignment and lifetime. Pool growth already invalidates graphs. */
     int32_t *const gu_tasks = pair_tasks
-        ? (int32_t *)(base + idx_bytes + pair_bytes + xq_bytes + mq_bytes) : NULL;
+        ? (int32_t *)(base + mq_offset + mq_bytes) : NULL;
 
     cudaStream_t stream = cuda_decode_stream();
     const unsigned threads = 256u;
@@ -4973,7 +4998,6 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     const int moe_epilogue = down_mma &&
         getenv("DS4_QWEN4EXP_NO_MOE_EPILOGUE") == NULL;
 
-    const int tile = qwen4exp_moe_tile(n_tokens);
     /* One block row per expert the call CHOSE, not per expert that exists.
      * n_pairs bounds the number of distinct experts, and the kernel exits the
      * rows past active[0]. */
@@ -5082,19 +5106,19 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
 
     const dim3 dn_grid((out_dim + 7u) / 8u,
                        (n_tokens + (uint32_t)tile - 1u) / (uint32_t)tile, 1);
-#define QWEN4EXP_DOWN_IMPL(R, DT) \
-    qwen4exp_moe_down_q_kernel<R, DT><<<dn_grid, threads, 0, stream>>>( \
+#define QWEN4EXP_DOWN_IMPL(R, DT, V) \
+    qwen4exp_moe_down_q_kernel<R, DT, V><<<dn_grid, threads, 0, stream>>>( \
             (float *)out->ptr, down, (const int32_t *)selected->ptr, \
             sc.mq, sc.ms, sc.msum, \
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
             mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
 #define QWEN4EXP_DOWN(R) do { \
     if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q5_1) { \
-        QWEN4EXP_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q5_1); \
+        QWEN4EXP_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q5_1, false); \
     } else if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q8_0) { \
-        QWEN4EXP_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q8_0); \
+        QWEN4EXP_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q8_0, false); \
     } else { \
-        QWEN4EXP_DOWN_IMPL(R, -1); \
+        QWEN4EXP_DOWN_IMPL(R, -1, false); \
     } \
 } while (0)
     if (down_mma) {
@@ -5124,7 +5148,14 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
                 n_expert_used, n_total_expert);
         return cuda_ok(cudaGetLastError(), "qwen4exp MoE down combine launch");
     }
-    if (tile == 8) { QWEN4EXP_DOWN(8); }
+    if (down_vector && ((uintptr_t)sc.mq & 15u) == 0u) {
+        if (down_slab->type == DS4_QWEN4EXP_TY_q8_0) {
+            QWEN4EXP_DOWN_IMPL(2, DS4_QWEN4EXP_TY_q8_0, true);
+        } else {
+            QWEN4EXP_DOWN_IMPL(2, DS4_QWEN4EXP_TY_q5_1, true);
+        }
+    }
+    else if (tile == 8) { QWEN4EXP_DOWN(8); }
     else if (tile == 4) { QWEN4EXP_DOWN(4); }
     else if (tile == 2) { QWEN4EXP_DOWN(2); }
     else { QWEN4EXP_DOWN(1); }

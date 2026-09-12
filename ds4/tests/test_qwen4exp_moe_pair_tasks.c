@@ -1,5 +1,7 @@
 /* Complete MoE comparison for the gate/up pair scheduler, including graph
  * replays, output guards, invalid routes and the shared-scratch growth seam.
+ * Pass down-vector to compare the short down path with its scalar oracle,
+ * including the 32-ID shuffle limit and ineligible widths/types.
  * Synthetic weights only. Build against the normal CUDA library:
  * cc -O2 -std=c11 -D_GNU_SOURCE -Ids4 ds4/tests/test_qwen4exp_moe_pair_tasks.c \
  *   -L.build/ds4 -lds4qwen -lm -o /tmp/test-moe-pair-tasks
@@ -13,6 +15,7 @@
 
 enum { K = 256, D = 256, O = 256, CAP = 1024, GUARD = 64 };
 static const char *disable = "DS4_QWEN4EXP_NO_GU_PAIR_TASKS";
+static int short_down;
 static uint32_t rng = 0xa231e599u;
 static unsigned comparisons, graph_checks, actual_replays;
 static uint32_t random_word(void) {
@@ -39,7 +42,8 @@ static void fill_weights(unsigned char *p, size_t bytes, unsigned type) {
 }
 
 static void check_case(unsigned gt, unsigned dt, unsigned experts, unsigned alignment) {
-    const unsigned used = experts == 1 ? 1 : experts == 17 ? 3 : 10;
+    const unsigned used = short_down && (experts == 32 || experts == 33)
+        ? experts : experts == 1 ? 1 : experts == 17 ? 3 : 10;
     const unsigned stride = used * D + 16;
     const size_t gb = (size_t)experts * D * row_bytes(gt);
     const size_t db = (size_t)experts * O * row_bytes(dt);
@@ -78,9 +82,13 @@ static void check_case(unsigned gt, unsigned dt, unsigned experts, unsigned alig
     &gate,&up,&down,K,D,O,routes,weights,experts,used,x,W,stride),"routed MoE")
 #define POISON(M) do { for(unsigned pj=0;pj<3;pj++) \
     require(ds4_gpu_tensor_write(out[M][pj],0,poison[pj],bytes[pj]),"output poison"); } while(0)
-    const unsigned widths[] = {63, 64, 65, 257, CAP};
+    const unsigned long_widths[] = {63, 64, 65, 257, CAP};
+    const unsigned short_widths[] = {1, 2, 3, 7, 8, 2, 1};
+    const unsigned *widths = short_down ? short_widths : long_widths;
+    const unsigned nw = short_down ? sizeof(short_widths)/sizeof(short_widths[0])
+                                   : sizeof(long_widths)/sizeof(long_widths[0]);
     const float scale[] = {0.2f, 1e-30f, 1e6f, 0.0f};
-    for (unsigned wi = 0; wi < sizeof(widths)/sizeof(widths[0]); wi++) {
+    for (unsigned wi = 0; wi < nw; wi++) {
         const unsigned width = widths[wi];
         ds4_decode_graph_key keys[2]; memset(keys, 0, sizeof(keys));
         for (unsigned m = 0; m < 2; m++) { keys[m].il = m; keys[m].cur_hc = x; keys[m].after_attn_hc = out[m][0]; }
@@ -97,6 +105,8 @@ static void check_case(unsigned gt, unsigned dt, unsigned experts, unsigned alig
                     if (trial % 5 == 1) e = (int)(experts - 1 - slot);
                     if (trial % 5 == 2 && (t + slot) % 3 == 0) e = -1;
                     if (trial % 5 == 3) e = -1;
+                    if (short_down && trial % 5 == 4 && slot % 3 == 0)
+                        e = (int)experts + 1;
                     ids[(size_t)t*used+slot] = e;
                     w[(size_t)t*used+slot] = 0.05f + (float)((t+slot)%13)*0.005f;
                 }
@@ -143,13 +153,19 @@ static void check_case(unsigned gt, unsigned dt, unsigned experts, unsigned alig
     printf("MoE pair tasks gt=%u dt=%u experts=%u offset=%u PASS\n",gt,dt,experts,64+alignment); fflush(stdout);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    short_down = argc == 2 && !strcmp(argv[1], "down-vector");
+    if (short_down) disable = "DS4_QWEN4EXP_NO_DOWN_VECTOR";
     require(setenv("DS4_CUDA_COPY_MODEL","1",1) == 0 && setenv("DS4_CUDA_DECODE_GRAPHS","1",1) == 0, "test environment");
     const unsigned types[][2] = {{12,7},{13,8},{8,8},{12,14},{14,7}};
     for (unsigned t = 0; t < sizeof(types)/sizeof(types[0]); t++)
         for (unsigned a = 0; a < 2; a++) check_case(types[t][0],types[t][1],512,a*2);
     check_case(12,7,1,0); check_case(13,8,17,2);
-    printf("MoE pair tasks: %u complete buffers, %u graph checks, %u actual replays PASS\n",
-           comparisons,graph_checks,actual_replays);
+    if (short_down) {
+        check_case(8,8,32,0); check_case(8,8,33,2);
+        check_case(12,7,32,2); check_case(12,7,33,0);
+    }
+    printf("MoE pair tasks%s: %u complete buffers, %u graph checks, %u actual replays PASS\n",
+           short_down ? " / short down vectors" : "",comparisons,graph_checks,actual_replays);
     return 0;
 }
