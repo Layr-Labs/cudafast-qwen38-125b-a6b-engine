@@ -8430,6 +8430,7 @@ qwen4exp_qsa_split_probs_kernel(
     }
 }
 
+template <bool Gated = false>
 __global__ static void qwen4exp_qsa_split_fold_kernel(
         const float *tmax,
         const float *tsum,
@@ -8443,7 +8444,7 @@ __global__ static void qwen4exp_qsa_split_fold_kernel(
         uint32_t sparse,
         uint32_t max_tiles,
         uint32_t tile_width,
-        const uint32_t *d_pos) {
+        const uint32_t *d_pos, const float *gate) {
     const uint32_t head = blockIdx.x;
     const uint32_t token = blockIdx.y;
     const uint32_t tid = threadIdx.x;
@@ -8451,8 +8452,9 @@ __global__ static void qwen4exp_qsa_split_fold_kernel(
     const uint32_t p0 = d_pos ? *d_pos : pos0;
     const uint32_t count = sparse ? (uint32_t)counts[token] : p0 + token + 1u;
     float *dst = out + ((uint64_t)token * n_head + head) * head_dim;
+    const uint64_t gid = ((uint64_t)token * n_head + head) * head_dim + tid;
     if (count == 0u) {
-        dst[tid] = 0.0f;
+        dst[tid] = Gated ? 0.0f * (1.0f / (1.0f + expf(-gate[gid]))) : 0.0f;
         return;
     }
     const uint32_t n_tiles = (count + tile_width - 1u) / tile_width;
@@ -8468,7 +8470,15 @@ __global__ static void qwen4exp_qsa_split_fold_kernel(
         acc = __fmaf_rn(acc, rescale, ct[(row + t) * head_dim + tid]);
         run_max = new_max;
     }
-    dst[tid] = (run_sum > 0.0f) ? acc / run_sum : 0.0f;
+    if (Gated) {
+        /* The explicit round-to-nearest division retains the old f32
+         * store/load boundary without a volatile local-memory spill.
+         * This unit already builds with -prec-div=true and -ftz=false. */
+        const float normalized = (run_sum > 0.0f) ? __fdiv_rn(acc, run_sum) : 0.0f;
+        dst[tid] = normalized * (1.0f / (1.0f + expf(-gate[gid])));
+    } else {
+        dst[tid] = (run_sum > 0.0f) ? acc / run_sum : 0.0f;
+    }
 }
 
 __global__ static void qwen4exp_qsa_output_gate_kernel(
@@ -9009,7 +9019,7 @@ static int qwen4exp_qsa_attention_split(
         uint32_t n_tokens, uint32_t n_head, uint32_t n_kv_head,
         uint32_t head_dim, uint32_t pos0, uint32_t cache_cap,
         uint32_t max_selected, float scale, const uint32_t *d_pos,
-        const ds4_gpu_tensor *scratch, uint32_t max_count) {
+        const ds4_gpu_tensor *scratch, uint32_t max_count, const float *gate) {
     const bool sparse = selected != NULL;
     const uint32_t nth = qwen4exp_cuda_threads(head_dim);
     const uint64_t need = ds4_gpu_qwen4exp_qsa_split_scratch_bytes(
@@ -9076,15 +9086,19 @@ static int qwen4exp_qsa_attention_split(
         default:  return 0;
     }
 #undef QWEN4EXP_QSA_SPLIT_LAUNCH
-    qwen4exp_qsa_split_fold_kernel<<<dim3(n_head, n_tokens), head_dim, 0,
-        cuda_decode_stream()>>>(
-            tmax, tsum, ct, cnt, (float *)out->ptr, n_tokens, n_head,
-            head_dim, pos0, sparse ? 1u : 0u, max_tiles, nth, d_pos);
+#define QWEN4EXP_QSA_FOLD(GATED) \
+    qwen4exp_qsa_split_fold_kernel<GATED><<<dim3(n_head, n_tokens), head_dim, 0, \
+        cuda_decode_stream()>>>( \
+            tmax, tsum, ct, cnt, (float *)out->ptr, n_tokens, n_head, \
+            head_dim, pos0, sparse ? 1u : 0u, max_tiles, nth, d_pos, gate)
+    if (gate) { QWEN4EXP_QSA_FOLD(true); }
+    else { QWEN4EXP_QSA_FOLD(false); }
+#undef QWEN4EXP_QSA_FOLD
     return cuda_ok(cudaGetLastError(), "Qwen4-Exp QSA split attention launch")
         ? 1 : -1;
 }
 
-extern "C" int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
+static int qwen4exp_qsa_attention_dpos_impl(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *k_cache,
@@ -9101,7 +9115,7 @@ extern "C" int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
         float                 scale,
         const ds4_gpu_tensor *d_pos,
         const ds4_gpu_tensor *scratch,
-        uint32_t              max_count) {
+        uint32_t              max_count, const float *fold_gate, bool *gated) {
     if (n_tokens == 0u || n_head == 0u || n_kv_head == 0u || head_dim == 0u ||
         (n_head % n_kv_head) != 0u || (!d_pos && (uint64_t)pos0 + n_tokens > cache_cap)) {
         return 0;
@@ -9134,8 +9148,11 @@ extern "C" int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
         const int split = qwen4exp_qsa_attention_split(
             out, q, k_cache, v_cache, selected, counts, n_tokens, n_head,
             n_kv_head, head_dim, pos0, cache_cap, max_selected, scale,
-            d_pos_ptr, scratch, max_count);
-        if (split != 0) return split > 0;
+            d_pos_ptr, scratch, max_count, fold_gate);
+        if (split != 0) {
+            if (gated) *gated = split > 0 && fold_gate != NULL;
+            return split > 0;
+        }
     }
 
     /* Wide rows go to the head-group kernel, which reads each K and each V
@@ -9190,6 +9207,79 @@ extern "C" int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
             (float *)out->ptr, n_tokens, n_head, n_kv_head, head_dim, pos0,
             cache_cap, max_selected, sparse ? 1u : 0u, scale, d_pos_ptr);
     return cuda_ok(cudaGetLastError(), "Qwen4-Exp QSA attention launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k_cache,
+        const ds4_gpu_tensor *v_cache,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *counts,
+        uint32_t              n_tokens,
+        uint32_t              n_head,
+        uint32_t              n_kv_head,
+        uint32_t              head_dim,
+        uint32_t              pos0,
+        uint32_t              cache_cap,
+        uint32_t              max_selected,
+        float                 scale,
+        const ds4_gpu_tensor *d_pos,
+        const ds4_gpu_tensor *scratch,
+        uint32_t              max_count) {
+    return qwen4exp_qsa_attention_dpos_impl(
+        out, q, k_cache, v_cache, selected, counts, n_tokens, n_head,
+        n_kv_head, head_dim, pos0, cache_cap, max_selected, scale,
+        d_pos, scratch, max_count, NULL, NULL);
+}
+
+/* Whole-view overlap checks are deliberately conservative: aliased views
+ * keep the original two-launch semantics. Subtraction avoids address wrap. */
+static bool qwen4exp_qsa_disjoint(const ds4_gpu_tensor *a,
+                                 const ds4_gpu_tensor *b) {
+    if (!a || !b || !a->ptr || !b->ptr) return true;
+    const uintptr_t x = (uintptr_t)a->ptr, y = (uintptr_t)b->ptr;
+    return x <= y ? a->bytes <= y - x : b->bytes <= x - y;
+}
+
+extern "C" int ds4_gpu_qwen4exp_qsa_attention_gated_dpos_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k_cache,
+        const ds4_gpu_tensor *v_cache,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *counts,
+        uint32_t              n_tokens,
+        uint32_t              n_head,
+        uint32_t              n_kv_head,
+        uint32_t              head_dim,
+        uint32_t              pos0,
+        uint32_t              cache_cap,
+        uint32_t              max_selected,
+        float                 scale,
+        const ds4_gpu_tensor *d_pos,
+        const ds4_gpu_tensor *scratch,
+        uint32_t              max_count, const ds4_gpu_tensor *gate) {
+    const uint64_t rows = (uint64_t)n_tokens * n_head;
+    if (rows == 0u || head_dim == 0u || rows > UINT32_MAX / head_dim) return 0;
+    const uint64_t values = rows * head_dim;
+    if (!glm53_cuda_tensor_has(gate, values, sizeof(float)) ||
+        (d_pos && !glm53_cuda_tensor_has(d_pos, 1u, sizeof(uint32_t)))) return 0;
+    bool fuse = n_tokens <= 2u &&
+        getenv("DS4_QWEN4EXP_NO_QSA_FOLD_GATE") == NULL;
+    const ds4_gpu_tensor *inputs[] = {out, q, k_cache, v_cache, selected,
+                                      counts, d_pos, scratch};
+    for (const ds4_gpu_tensor *input : inputs)
+        fuse = fuse && qwen4exp_qsa_disjoint(gate, input);
+    /* Fold reads counts/position and its scratch while writing output. */
+    fuse = fuse && qwen4exp_qsa_disjoint(out, counts) &&
+        qwen4exp_qsa_disjoint(out, d_pos) && qwen4exp_qsa_disjoint(out, scratch);
+    bool gated = false;
+    if (!qwen4exp_qsa_attention_dpos_impl(
+        out, q, k_cache, v_cache, selected, counts, n_tokens, n_head,
+        n_kv_head, head_dim, pos0, cache_cap, max_selected, scale,
+        d_pos, scratch, max_count, fuse ? (const float *)gate->ptr : NULL, &gated)) return 0;
+    return gated || ds4_gpu_qwen4exp_qsa_output_gate_tensor(out, gate, (uint32_t)values);
 }
 
 extern "C" int ds4_gpu_qwen4exp_qsa_attention_tensor(

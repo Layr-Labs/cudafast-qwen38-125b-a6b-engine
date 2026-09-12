@@ -1656,16 +1656,14 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
     }
 
     const float scale = 1.0f / sqrtf((float)head_dim);
-    if (!ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
+    if (!ds4_gpu_qwen4exp_qsa_attention_gated_dpos_tensor(
             s->qsa_out, s->qsa_q, s->qsa_k[il], s->qsa_v[il], sel, counts,
             n_tokens, DS4_N_HEAD, DS4_N_HEAD_KV, head_dim, pos0,
             s->plan.n_ctx, max_selected, scale, s->d_pos, s->qsa_split,
             /* Below the budget every row's count is pos + 1 <= the budget,
              * captured replays included (the island captures only there);
              * above it the selection caps the count. */
-            indexed ? max_selected : (uint32_t)DS4_N_INDEXER_TOP_K) ||
-        !ds4_gpu_qwen4exp_qsa_output_gate_tensor(s->qsa_out, s->qsa_gate,
-                                                 n_tokens * q_width)) {
+            indexed ? max_selected : (uint32_t)DS4_N_INDEXER_TOP_K, s->qsa_gate)) {
         fprintf(stderr, "ds4: qwen4exp QSA attention failed at block %u\n", il);
         return false;
     }

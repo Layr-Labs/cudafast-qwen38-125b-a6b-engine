@@ -681,6 +681,27 @@ int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
         const ds4_gpu_tensor *scratch,
         uint32_t              max_count);
 
+/* Attention followed by output gating. CUDA short split rows may fuse the
+ * final store; all other shapes retain sequential attention and gating. */
+int ds4_gpu_qwen4exp_qsa_attention_gated_dpos_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k_cache,
+        const ds4_gpu_tensor *v_cache,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *counts,
+        uint32_t              n_tokens,
+        uint32_t              n_head,
+        uint32_t              n_kv_head,
+        uint32_t              head_dim,
+        uint32_t              pos0,
+        uint32_t              cache_cap,
+        uint32_t              max_selected,
+        float                 scale,
+        const ds4_gpu_tensor *d_pos,
+        const ds4_gpu_tensor *scratch,
+        uint32_t              max_count, const ds4_gpu_tensor *gate);
+
 /* Bytes of `scratch` the attention call above wants to take its split path
  * for `n_tokens` rows of at most `max_count` keys each; 0 for a shape the
  * split path does not serve.  Passing NULL scratch keeps the per-head kernel. */
