@@ -12,7 +12,7 @@
 #include <math.h>
 #include <sys/mman.h>
 #define DIM 2560u
-#define CAP 2048u
+#define CAP 16384u
 #define PREFIX 20000u
 #define TAIL 276u
 #define VOCAB 21000u
@@ -72,10 +72,9 @@ static void run_case(int adversarial, uint32_t offset) {
         /* Last prefix row has negative screen, positive complete dot. All
          * other rows tie at zero, so its omission is inevitable and explicit. */
         if(adversarial && row==PREFIX-1) memset(p+2,b<40?255:2,32);
-        /* 24 groups are negative; adding groups 24..31 makes the previous
-         * 32-group screen positive. Both complete dots are positive, so
-         * requiring exclusion witnesses the 24-group policy itself. */
-        if(adversarial==3 && row==PREFIX-1) memset(p+2,b<24?255:b<32?8:2,32);
+        /* 32 groups are negative; adding groups 32..39 makes the old
+         * 40-group screen positive. Both complete dots are positive. */
+        if(adversarial==3 && row==PREFIX-1) memset(p+2,b<32?255:b<40?8:2,32);
     }
     need(ds4_gpu_init(),"GPU init");need(ds4_gpu_set_model_map(w,bytes),"register weights");
     uint64_t scratch_bytes=0;uint32_t cap=0;
