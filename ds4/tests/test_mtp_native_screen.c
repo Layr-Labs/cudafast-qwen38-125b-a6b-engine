@@ -32,6 +32,11 @@ static void run_case(int adversarial, uint32_t offset) {
         /* Last prefix row has negative screen, positive complete dot. All
          * other rows tie at zero, so its omission is inevitable and explicit. */
         if(adversarial && row==PREFIX-1) memset(p+2,b<40?255:2,32);
+        /* A policy witness: the 32-group score is negative, but adding the
+         * next 8 groups makes the 40-group score positive. The full row wins.
+         * It must now be excluded, illustrating intentional quality risk. */
+        if(adversarial==3 && row==PREFIX-1)
+            memset(p+2,b<32?255:b<40?8:2,32);
     }
     need(ds4_gpu_init(),"GPU init");need(ds4_gpu_set_model_map(w,bytes),"register weights");
     uint64_t scratch_bytes=0;uint32_t cap=0;
@@ -98,4 +103,4 @@ cleanup:
     ds4_gpu_tensor_free(full);ds4_gpu_tensor_free(tail);ds4_gpu_tensor_free(winner);
     ds4_gpu_cleanup();munmap(w,bytes);
 }
-int main(void){setenv("DS4_CUDA_DECODE_GRAPHS","1",1);run_case(0,0);run_case(0,2);run_case(1,0);run_case(2,0);puts("native screen contracts pass (selection deliberately approximate)");return 0;}
+int main(void){setenv("DS4_CUDA_DECODE_GRAPHS","1",1);run_case(0,0);run_case(0,2);run_case(1,0);run_case(2,0);run_case(3,0);run_case(3,2);puts("native screen contracts pass (selection deliberately approximate)");return 0;}
