@@ -1146,9 +1146,12 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
      * the property the whole speculative cycle stands on), so a shortlist
      * id's logit is the logit the full projection produces. */
     if (ok) {
+        /* A single row can project its prefix directly to the packed output.
+         * Multiple rows retain separate prefix storage and per-row packing. */
+        const bool direct_prefix = logit_rows == 1u;
         stage = "borrowed lm head";
         ok = h->hooks.matmul_q8_0(
-                draft_tail ? h->t_logits_prefix : h->t_logits,
+                draft_tail && !direct_prefix ? h->t_logits_prefix : h->t_logits,
                 h->target_map, h->target_size, h->output_offset, n_embd,
                 draft_prefix ? draft_prefix : h->n_vocab,
                 h->t_sample, logit_rows) != 0;
@@ -1161,21 +1164,17 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                     n_embd, draft_tail, h->t_sample, logit_rows) != 0;
         }
         if (ok && draft_tail) {
-            /* Pack each row's two ranges into one contiguous shortlist row:
-             * prefix first, tail behind it.  Sources are other tensors and
-             * the destinations do not overlap, so plain stream-ordered copies
-             * are enough -- there is no in-place shuffle to reason about. */
             stage = "shortlist pack";
             for (uint32_t r = 0; r < logit_rows; r++) {
-                ok = ds4_gpu_tensor_copy(
-                         h->t_logits, (uint64_t)r * draft_width * f,
-                         h->t_logits_prefix, (uint64_t)r * draft_prefix * f,
-                         (uint64_t)draft_prefix * f) != 0 &&
-                     ds4_gpu_tensor_copy(
-                         h->t_logits,
-                         ((uint64_t)r * draft_width + draft_prefix) * f,
-                         h->t_logits_tail, (uint64_t)r * draft_tail * f,
-                         (uint64_t)draft_tail * f) != 0;
+                ok = (direct_prefix || ds4_gpu_tensor_copy(
+                             h->t_logits, (uint64_t)r * draft_width * f,
+                             h->t_logits_prefix, (uint64_t)r * draft_prefix * f,
+                             (uint64_t)draft_prefix * f) != 0) &&
+                         ds4_gpu_tensor_copy(
+                             h->t_logits,
+                             ((uint64_t)r * draft_width + draft_prefix) * f,
+                             h->t_logits_tail, (uint64_t)r * draft_tail * f,
+                             (uint64_t)draft_tail * f) != 0;
                 if (!ok) break;
             }
         }
