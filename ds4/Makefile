@@ -539,6 +539,30 @@ tests/test_qwen4exp_moe.o: tests/test_qwen4exp_moe.c ds4_gpu.h
 $(QWEN4EXP_MOE_TEST): tests/test_qwen4exp_moe.o $(GPU_TEST_OBJS)
 	$(GPU_TEST_LINK)
 
+tests/test_q8_decode_pairs.o: tests/test_q8_decode_pairs.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_q8_decode_pairs.c
+
+tests/test_q8_decode_pairs: tests/test_q8_decode_pairs.o $(GPU_TEST_OBJS)
+	$(GPU_TEST_LINK)
+
+tests/test_gdn_projections.o: tests/test_gdn_projections.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_gdn_projections.c
+
+tests/test_gdn_projections: tests/test_gdn_projections.o $(GPU_TEST_OBJS)
+	$(GPU_TEST_LINK)
+
+tests/test_mtp_native_screen.o: tests/test_mtp_native_screen.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_mtp_native_screen.c
+
+tests/test_mtp_native_screen: tests/test_mtp_native_screen.o $(GPU_TEST_OBJS)
+	$(GPU_TEST_LINK)
+
+tests/test_f32_vector_decode.o: tests/test_f32_vector_decode.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_f32_vector_decode.c
+
+tests/test_f32_vector_decode: tests/test_f32_vector_decode.o $(GPU_TEST_OBJS)
+	$(GPU_TEST_LINK)
+
 .PHONY: test-qwen4exp-moe
 test-qwen4exp-moe: $(QWEN4EXP_MOE_TEST)
 	./$(QWEN4EXP_MOE_TEST)

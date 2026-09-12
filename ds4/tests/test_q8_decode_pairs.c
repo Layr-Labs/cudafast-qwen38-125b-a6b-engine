@@ -76,6 +76,34 @@ static void check_shape(uint64_t in, uint64_t out, uint64_t offset) {
             }
         }
     }
+    /* The HC down pair kernel (two rows, 10240->320) has its own valve; this
+     * second oracle pins its paired-group fold directly against the original
+     * per-row kernel, with the rest of the dispatch at production settings
+     * instead of the global NO_ROW_TILE override above. */
+    if (in == 10240u && out == 320u) {
+        for (uint32_t n = 1u; n <= 2u; n++) {
+            for (int pass = 0; pass < 2; pass++) {
+                require((pass == 0
+                    ? setenv("DS4_Q8_NO_HC_DOWN_PAIR", "1", 1)
+                    : unsetenv("DS4_Q8_NO_HC_DOWN_PAIR")) == 0, "HC pair switch");
+                require(ds4_gpu_tensor_write(yt, 0, poison, ybytes), "HC output reset");
+                require(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+                    yt, model, bytes, offset, in, out, xt, n), "HC projection");
+                require(ds4_gpu_tensor_read(yt, 0, pass == 0 ? reference : got, ybytes),
+                        "HC output read");
+            }
+            for (size_t i = 0; i < yn; i++) {
+                if (!isfinite(reference[i]) || !isfinite(got[i]) ||
+                    memcmp(reference + i, got + i, sizeof(float)) != 0) {
+                    fprintf(stderr, "HC pair %llu->%llu offset %llu rows %u at %zu: "
+                                    "reference %.9g, candidate %.9g\n",
+                            (unsigned long long)in, (unsigned long long)out,
+                            (unsigned long long)offset, n, i, reference[i], got[i]);
+                    exit(1);
+                }
+            }
+        }
+    }
     /* Captured paired reads must see changed inputs at both decode widths.
      * Compare each replay with a fresh eager one-row-order reference. */
     const float magnitudes[] = {1.0f, 1e-30f, 1e-37f, 1e10f};

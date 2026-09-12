@@ -80,6 +80,10 @@ static void shape(uint64_t in, uint64_t out, uint64_t offset) {
            (unsigned long long)in, (unsigned long long)out, (unsigned long long)offset);
 }
 int main(void) {
+    /* Shapes 2560->512 (router) and 2560->48 (GDN alpha/beta) at widths 1
+     * and 2 are the old-vs-new oracle for the vector tree's half-shared
+     * fold: the pinned leg runs the original shared-staged F32 kernels,
+     * the unpinned leg the C==4 / C==2 upper-staging arms. */
     shape(2560, 512, 64); shape(2560, 512, 68);
     shape(2560, 48, 64); shape(2560, 48, 68);
     shape(2560, 49, 68); shape(257, 48, 64);

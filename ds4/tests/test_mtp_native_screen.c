@@ -13,11 +13,10 @@
 #include <sys/mman.h>
 #define DIM 2560u
 #define CAP 2048u
-#define PREFIX 20000u
-#define TAIL 276u
-#define VOCAB 21000u
-#define WIDTH (PREFIX+TAIL)
 #define ROW (80u*34u)
+/* PREFIX/TAIL/VOCAB/WIDTH are per-case: TAIL 277 leaves screen rows past
+ * out_dim in the last 4-row block -- the fold's invalid-row path. */
+static uint32_t PREFIX=20000u, TAIL=276u, VOCAB=21000u, WIDTH=20276u;
 static void need(int ok,const char *s) {if(!ok){fprintf(stderr,"native screen: %s\n",s);exit(1);}}
 static uint32_t seed=1234567;
 static uint32_t rnd(void){seed^=seed<<13;seed^=seed>>17;seed^=seed<<5;return seed;}
@@ -142,4 +141,14 @@ cleanup:
     ds4_gpu_tensor_free(full);ds4_gpu_tensor_free(tail);ds4_gpu_tensor_free(winner);
     ds4_gpu_cleanup();munmap(w,bytes);
 }
-int main(void){setenv("DS4_CUDA_DECODE_GRAPHS","1",1);run_case(0,0);run_case(0,2);run_case(1,0);run_case(2,0);run_case(3,0);run_case(3,2);puts("native screen contracts pass (selection deliberately approximate)");return 0;}
+int main(void){
+    setenv("DS4_CUDA_DECODE_GRAPHS","1",1);
+    PREFIX=20000u;TAIL=276u;VOCAB=21000u;WIDTH=PREFIX+TAIL;
+    run_case(0,0);run_case(0,2);run_case(1,0);run_case(2,0);run_case(3,0);run_case(3,2);
+    /* A width the 4-row screen blocks do not divide: the last block owns
+     * rows past out_dim, whose threads fold all-zero leaves (invalid rows,
+     * staging zeros exactly as the old shared array held them) and must
+     * write neither scores nor keys for them. */
+    TAIL=277u;WIDTH=PREFIX+TAIL;run_case(0,0);
+    puts("native screen contracts pass (selection deliberately approximate)");return 0;
+}

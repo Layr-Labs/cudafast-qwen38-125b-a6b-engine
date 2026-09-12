@@ -84,16 +84,22 @@ __global__ static void mtp_native_projection_kernel(
         }
     }
 
-    __shared__ float partial[R][4][32];
-    if (half == 0u) {
+    /* Pair logical groups g and g + 16 before the remaining four levels
+     * of the original 32-leaf reduction tree.  Physical even lanes are
+     * logical lanes 0..15, so distances 16,8,4,2 preserve operand order. */
+    __shared__ float upper[R][4][16];
+    if (half == 0u && local_lane >= 32u) {
 #pragma unroll
-        for (int r = 0; r < R; r++) partial[r][local_row][group] = acc[r];
+        for (int r = 0; r < R; r++) upper[r][local_row][group - 16u] = acc[r];
     }
     __syncthreads();
-    if (local_lane < 32u) {
+    if (local_lane < 32u && half == 0u) {
 #pragma unroll
         for (int r = 0; r < R; r++) {
-            const float total = warp_sum_f32(partial[r][local_row][local_lane]);
+            float total = acc[r] + upper[r][local_row][group];
+#pragma unroll
+            for (int d = 16; d >= 2; d >>= 1)
+                total += __shfl_down_sync(0x55555555u, total, d);
             if (local_lane == 0u && row < out_dim && (uint32_t)r < take) {
                 const float value = valid ? total : -INFINITY;
                 if (EmitKeys) {
