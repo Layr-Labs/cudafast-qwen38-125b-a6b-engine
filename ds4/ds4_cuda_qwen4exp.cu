@@ -3003,9 +3003,23 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
         if ((int32_t)blockIdx.y >= active[0]) return;
         expert = (uint32_t)active[1 + blockIdx.y];
     }
+    /* BOTH ROUTING LOADS ISSUE BEFORE THE GUARD.
+     *
+     * `counts[expert]` and `offsets[expert]` are independent loads of two
+     * different arrays at the same validated index, and `pairs[base + ...]`
+     * below is a third load that depends on the second. Reading `counts`,
+     * branching on it, and only then reading `offsets` serialised three
+     * global latencies into this block's prologue where two suffice.
+     *
+     * EXACTNESS. `expert` is already fully resolved and range-checked above
+     * (either `blockIdx.y` under a grid the host sized, or `active[1 + ...]`
+     * behind the `blockIdx.y >= active[0]` return), so `offsets[expert]` is
+     * in bounds whatever `cnt` turns out to be. The early return still
+     * happens at the same point and `base` is not read on that path. No
+     * value, order or rounding changes. */
     const int32_t cnt = counts[expert];
-    if (cnt <= 0) return;
     const int32_t base = offsets[expert];
+    if (cnt <= 0) return;
     const char *weight_row = (second ? up : gate) +
         (uint64_t)expert * (second ? up_expert_bytes : gate_expert_bytes) +
         (uint64_t)(live ? row : 0u) * (second ? up_row_bytes : gate_row_bytes);
@@ -3022,7 +3036,36 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
 #pragma unroll
         for (int r = 0; r < R; r++) acc[r] = 0.0f;
         if (live) {
-            for (uint32_t g = lane; g < groups; g += 32u) {
+            /* ONE-GROUP-DEEP WEIGHT PREFETCH.
+             *
+             * The group stride is 32 and `groups` is a runtime value, so nvcc
+             * cannot unroll this loop and therefore cannot software-pipeline
+             * it: each lane issued its weight payload load and then waited on
+             * it, with nothing else in flight. At the routed gate/up
+             * projection this loop is the engine's largest weight stream, and
+             * a lane runs only two or three iterations of it, so the stalls do
+             * not amortise against anything.
+             *
+             * The loop below issues the NEXT group's payload as soon as this
+             * group's copy of `raw` is dead -- immediately after the decode
+             * that consumes it, and before the accumulate -- so the load has
+             * the whole accumulate to land in. This is the same one-chunk
+             * depth, the same registers and the same guard the routed-MoE MMA
+             * kernel already uses on the prefill path; only the issue point
+             * moves.
+             *
+             * EXACTNESS. Every group is decoded from the same bytes, in the
+             * same ascending group order, and accumulated into the same
+             * `acc[r]` in the same sequence, with the same warp reduction
+             * afterwards. No value and no order of operations changes; the
+             * loop is rewritten from `for` to `while` only so the prefetch has
+             * somewhere to sit. */
+            uint32_t raw[8];
+            uint32_t g = lane;
+            bool have = g < groups &&
+                        qw_raw_load((uint32_t)Type, weight_row, g, raw);
+            while (g < groups) {
+                const uint32_t gnext = g + 32u;
                 int8_t wq[32];
                 float wa[2] = {0.0f, 0.0f};
                 float wb[2] = {0.0f, 0.0f};
@@ -3036,11 +3079,12 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
                  * Q4_K, whose group stages, and whose decode leaves
                  * `halves` at one -- the value passed to the accumulate
                  * below -- so the accumulated value is unchanged. */
-                uint32_t raw[8];
-                const uint32_t *rawp =
-                    qw_raw_load((uint32_t)Type, weight_row, g, raw) ? raw : NULL;
                 dev_qwen4exp_group_decode_w((uint32_t)Type, weight_row, g,
-                                            rawp, wq, wa, wb);
+                                            have ? raw : NULL, wq, wa, wb);
+                /* `raw` is dead from here: issue the next group's payload now
+                 * so it overlaps the accumulate below. */
+                have = gnext < groups &&
+                       qw_raw_load((uint32_t)Type, weight_row, gnext, raw);
                 const int halves = 1;
 #pragma unroll
                 for (int r = 0; r < R; r++) {
@@ -3050,6 +3094,7 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
                             xq + at_g * 32u, xs[at_g], xsum[at_g]);
                     }
                 }
+                g = gnext;
             }
         }
 #pragma unroll
@@ -9008,7 +9053,31 @@ static int qwen4exp_qsa_attention_split(
     switch (g) {
         case 12u: QWEN4EXP_QSA_SPLIT_LAUNCH(12u, QWEN4EXP_QSA_SPLIT_VSTEP); break;
         case 6u:  QWEN4EXP_QSA_SPLIT_LAUNCH(6u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
-        case 4u:  QWEN4EXP_QSA_SPLIT_LAUNCH(4u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
+        case 4u:
+            /* The same dense V prefetch depth the one-row shape above was
+             * measured into, extended to the TWO-row call. A depth-1
+             * speculative round verifies two rows, so this width, not the
+             * one-row width, is the attention call the decode window spends
+             * in; it reached this switch at the untuned default. GROUP is 4
+             * here rather than 2, so `float a[VSTEP]` costs 4 accumulators'
+             * worth of company in the same register file and the deeper batch
+             * is the more expensive of the two.
+             *
+             * EXACTNESS. VSTEP sets only how many value rows the dense loop
+             * asks for before it multiplies. Every product still lands j
+             * ascending, through the same `__fmaf_rn` into the same
+             * `contrib[h]`, and the remainder loop that follows is the same
+             * loop over the same tail; a shallower batch simply moves the
+             * boundary between them without reordering or regrouping a single
+             * multiply-add. The sparse path does not read VSTEP at all. */
+            if (!sparse && n_tokens == 2u && n_head == 24u &&
+                n_kv_head == 2u && head_dim == 256u &&
+                getenv("DS4_QWEN4EXP_NO_QSA_SHORT_V") == NULL) {
+                QWEN4EXP_QSA_SPLIT_LAUNCH(4u, 8u);
+            } else {
+                QWEN4EXP_QSA_SPLIT_LAUNCH(4u, QWEN4EXP_QSA_SPLIT_VSTEP);
+            }
+            break;
         case 3u:  QWEN4EXP_QSA_SPLIT_LAUNCH(3u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
         case 2u:
             /* Preserve the ordered products; only reduce dense V prefetch
