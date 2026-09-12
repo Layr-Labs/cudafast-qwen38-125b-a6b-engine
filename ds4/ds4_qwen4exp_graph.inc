@@ -1530,7 +1530,7 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
     /* Fused KV-Prep & Append: per-head RMS norm on K, RoPE on K, and direct write into
      * k_cache and v_cache in 1 launch (no sync CPU memcpy) */
     if (!ds4_gpu_qwen4exp_qsa_prep_kv_append_fused_dpos_tensor(
-            s->qsa_k[il], s->qsa_v[il], s->qsa_kin, s->qsa_kin, s->qsa_vin,
+            s->qsa_k[il], s->qsa_v[il], NULL, s->qsa_kin, s->qsa_vin,
             s->attn_k_norm[il], s->inv_freq, pos0, n_tokens, DS4_N_HEAD_KV,
             head_dim, DS4_N_ROT, s->plan.n_ctx, DS4_RMS_EPS, l->attn_k_norm_offset,
             s->d_pos)) {
