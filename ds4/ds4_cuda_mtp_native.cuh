@@ -1,6 +1,6 @@
 /* Current native-head partial screening, then independent exact row dots.
  * Uses the original Q8_0 mapping; no transformed weight storage. New kernels
- * use ordinary stream ordering, not PDL: refinement reads freshly sorted IDs. */
+ * use ordinary stream ordering, not PDL: refinement reads freshly selected IDs. */
 static constexpr uint32_t MTP_NATIVE_CAP = 16384u;
 static constexpr uint32_t MTP_NATIVE_DIM = 2560u;
 static constexpr uint32_t MTP_NATIVE_MAX_WIDTH = 1u << 20;
@@ -89,7 +89,7 @@ __global__ static void mtp_native_projection_kernel(
 }
 
 struct mtp_native_layout {
-    uint64_t scores, key_in, key_out, id_tmp, flag, temporary;
+    uint64_t scores, key_in, key_out, flag, temporary;
 };
 static uint64_t mtp_native_align(uint64_t n) { return (n + 255u) & ~255ull; }
 static mtp_native_layout mtp_native_offsets(uint32_t width) {
@@ -97,8 +97,7 @@ static mtp_native_layout mtp_native_offsets(uint32_t width) {
     l.scores = mtp_native_align(MTP_NATIVE_DIM + (MTP_NATIVE_DIM / 32u) * 4u);
     l.key_in = mtp_native_align(l.scores + (uint64_t)width * 4u);
     l.key_out = mtp_native_align(l.key_in + (uint64_t)width * 8u);
-    l.id_tmp = mtp_native_align(l.key_out + (uint64_t)width * 8u);
-    l.flag = mtp_native_align(l.id_tmp + (uint64_t)MTP_NATIVE_CAP * 4u);
+    l.flag = mtp_native_align(l.key_out + (uint64_t)width * 8u);
     l.temporary = mtp_native_align(l.flag + 4u);
     return l;
 }
@@ -107,14 +106,11 @@ extern "C" int ds4_gpu_mtp_native_screen_init(uint32_t width,
     if (!bytes || !capacity) return -1;
     *bytes = 0; *capacity = 0;
     if (width <= MTP_NATIVE_CAP || width > MTP_NATIVE_MAX_WIDTH) return 0;
-    size_t a = 0, b = 0;
+    size_t a = 0;
     if (cub::DeviceRadixSort::SortKeysDescending(nullptr, a,
             (const uint64_t *)nullptr, (uint64_t *)nullptr, width, 0, 64,
-            cuda_decode_stream()) != cudaSuccess ||
-        cub::DeviceRadixSort::SortKeys(nullptr, b,
-            (const uint32_t *)nullptr, (uint32_t *)nullptr, MTP_NATIVE_CAP, 0, 32,
             cuda_decode_stream()) != cudaSuccess) return -1;
-    *bytes = mtp_native_offsets(width).temporary + std::max(a,b);
+    *bytes = mtp_native_offsets(width).temporary + a;
     *capacity = MTP_NATIVE_CAP;
     return 1;
 }
@@ -136,7 +132,7 @@ __global__ static void mtp_native_unpack_ids(uint32_t *ids, const uint64_t *keys
     if (i < MTP_NATIVE_CAP) ids[i] = UINT32_MAX - (uint32_t)keys[i];
 }
 /* -1: backend error, 0: ordinary full-static fallback, positive: exact number
- * of sorted candidates whose FULL refined logits now occupy out. */
+ * of score-ordered candidates whose FULL refined logits now occupy out. */
 extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
         ds4_gpu_tensor *ids, ds4_gpu_tensor *scratch, const void *map,
         uint64_t map_bytes, uint64_t offset, uint32_t in_dim, uint32_t vocab,
@@ -171,7 +167,6 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
     float *scores = (float *)(base + l.scores);
     uint64_t *key_in = (uint64_t *)(base + l.key_in);
     uint64_t *key_out = (uint64_t *)(base + l.key_out);
-    uint32_t *id_tmp = (uint32_t *)(base + l.id_tmp);
     uint32_t *flag = (uint32_t *)(base + l.flag);
     if (!cuda_ok(cudaMemsetAsync(flag,0,4,cuda_decode_stream()),"native screen flag")) return -1;
     quantize_q8_0_f32_rows_warp_kernel<<<10,256,0,cuda_decode_stream()>>>(
@@ -189,23 +184,39 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
     size_t temporary = (size_t)(scratch->bytes-l.temporary);
     if (!cuda_ok(cub::DeviceRadixSort::SortKeysDescending(base+l.temporary,temporary,
             key_in,key_out,width,0,64,cuda_decode_stream()),"native score sort")) return -1;
-    mtp_native_unpack_ids<<<(MTP_NATIVE_CAP+255u)/256u,256,0,cuda_decode_stream()>>>(id_tmp,key_out);
+    mtp_native_unpack_ids<<<(MTP_NATIVE_CAP+255u)/256u,256,0,cuda_decode_stream()>>>((uint32_t *)ids->ptr,key_out);
     if (!cuda_ok(cudaGetLastError(),"native candidate unpack")) return -1;
-    temporary = (size_t)(scratch->bytes-l.temporary);
-    if (!cuda_ok(cub::DeviceRadixSort::SortKeys(base+l.temporary,temporary,
-            id_tmp,(uint32_t *)ids->ptr,MTP_NATIVE_CAP,0,32,cuda_decode_stream()),
-            "native original-ID sort")) return -1;
     mtp_native_projection_kernel<false><<<(MTP_NATIVE_CAP+3u)/4u,256,0,cuda_decode_stream()>>>(
         (float *)out->ptr,(const unsigned char *)w,xq,xs,MTP_NATIVE_CAP,1,80,
         (const uint32_t *)ids->ptr,vocab,prefix,tail);
     return cuda_ok(cudaGetLastError(),"native exact refinement") ? (int)MTP_NATIVE_CAP : -1;
 }
+/* Original IDs provide the same tie order as sorting IDs before the old
+ * compact top1. NaNs other than row0 never beat (-infinity,0); row0 keeps
+ * the inherited NaN pin. Signed zeros compare equal. */
 __global__ static void mtp_native_map(uint32_t *winner, const float *logits,
                                       const uint32_t *ids, uint32_t count, uint32_t vocab) {
-    const uint32_t bits = __float_as_uint(logits[0]);
-    const uint32_t packed = (bits & 0x7fffffffu) > 0x7f800000u ? 0u : winner[0];
-    const uint32_t original = packed < count ? ids[packed] : UINT32_MAX;
-    winner[0] = original < vocab ? original : UINT32_MAX;
+    const uint32_t tid = threadIdx.x;
+    float best = -INFINITY; uint32_t id = 0;
+    for (uint32_t i = tid; i < count; i += 1024u) {
+        const float value = logits[i]; const uint32_t original = ids[i];
+        if (topk_score_better(value, original, best, id)) { best = value; id = original; }
+    }
+    __shared__ float values[1024];
+    __shared__ uint32_t indices[1024];
+    values[tid] = best; indices[tid] = id;
+    __syncthreads();
+    for (uint32_t stride = 512u; stride; stride >>= 1u) {
+        if (tid < stride && topk_score_better(values[tid+stride], indices[tid+stride], values[tid], indices[tid])) {
+            values[tid] = values[tid+stride]; indices[tid] = indices[tid+stride];
+        }
+        __syncthreads();
+    }
+    if (!tid) {
+        const uint32_t bits = __float_as_uint(logits[0]);
+        const uint32_t original = (bits & 0x7fffffffu) > 0x7f800000u ? 0u : indices[0];
+        winner[0] = original < vocab ? original : UINT32_MAX;
+    }
 }
 extern "C" int ds4_gpu_mtp_native_map(ds4_gpu_tensor *winner,
         const ds4_gpu_tensor *logits, const ds4_gpu_tensor *ids,
@@ -216,7 +227,7 @@ extern "C" int ds4_gpu_mtp_native_map(ds4_gpu_tensor *winner,
     if (tier<0 || tier>=g_n_gpus || ds4_tensor_device_idx(logits)!=tier ||
         ds4_tensor_device_idx(ids)!=tier || cudaGetDevice(&current)!=cudaSuccess ||
         current!=g_gpu[tier].device_id) return 0;
-    mtp_native_map<<<1,1,0,cuda_decode_stream()>>>((uint32_t *)winner->ptr,
+    mtp_native_map<<<1,1024,0,cuda_decode_stream()>>>((uint32_t *)winner->ptr,
         (const float *)logits->ptr,(const uint32_t *)ids->ptr,count,vocab);
     return cuda_ok(cudaGetLastError(),"native original winner map");
 }

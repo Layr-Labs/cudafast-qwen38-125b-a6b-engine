@@ -1208,7 +1208,7 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
         }
     }
     MTP_HEAD_TICK(MTP_HEAD_T_LM_HEAD);
-    if (ok) {
+    if (ok && !screened) {
         stage = "gpu top-1";
         /* The head exposes only draft ids.  Keep the LM-head arithmetic intact,
          * reduce each finite logit row on the device and read back one id
@@ -1219,7 +1219,7 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                                          draft_width, logit_rows, 1u) != 0;
     }
     if (ok && screened) {
-        stage = "native original winner mapping";
+        stage = "native original-ID top-1";
         ok = h->hooks.native_map(h->t_top1, h->t_logits, h->t_native_ids,
                                   draft_width, h->n_vocab) != 0;
     }
