@@ -748,7 +748,7 @@ static int mtp_env_u32(const char *name, uint32_t fallback, uint32_t *out,
 
 /*
  * Read the draft shortlist ONCE, at head init, and validate it against the
- * vocabulary.  A prefix of 0 (the default) is OFF and the draft runs over the
+ * vocabulary.  A prefix of 0 is OFF and the draft runs over the
  * whole vocabulary; the tail is inert without a prefix and is not validated
  * then, because a setting that arms nothing cannot mis-launch anything.
  *
@@ -836,6 +836,21 @@ int ds4_qwen4exp_mtp_head_init(ds4_qwen4exp_mtp_head *h,
                         h->max_tokens);
     }
     if (mtp_head_draft_vocab(h, err, errlen) != 0) return -1;
+    h->draft_vocab_prefix_initial = h->draft_vocab_prefix;
+    h->draft_vocab_prefix_capacity = h->draft_vocab_prefix;
+    /* Reserve scratch from model metadata before decoding. A request whose
+     * head inputs stay in the initial shortlist keeps the original launches.
+     * Once an excluded ordinary token is seen, keep the full vocabulary for
+     * this request, until reset_vocab(). The target still verifies every
+     * proposed token. */
+    if (h->n_embd == 2560u && h->draft_vocab_prefix && h->draft_vocab_tail &&
+        h->hooks.native_init && h->hooks.native_screen && h->hooks.native_map &&
+        getenv("DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX") == NULL &&
+        getenv("DS4_QWEN4EXP_DRAFT_VOCAB_TAIL") == NULL &&
+        getenv("DS4_MTP_NO_ADAPTIVE_VOCAB") == NULL) {
+        h->draft_vocab_prefix_capacity = h->n_vocab - h->draft_vocab_tail;
+    }
+
     const uint64_t rows = h->max_tokens;
     const uint64_t n_embd = h->n_embd;
     const uint64_t hc_dim = (uint64_t)h->n_hc * n_embd;
@@ -854,13 +869,13 @@ int ds4_qwen4exp_mtp_head_init(ds4_qwen4exp_mtp_head *h,
     h->t_mix_wide     = mtp_alloc(rows * hc_dim * f, &ok);
     h->t_sample       = mtp_alloc(rows * n_embd * f, &ok);
     h->t_logits       = mtp_alloc(rows * h->n_vocab * f, &ok);
-    /* Shortlist staging, sized by the armed setting alone.  Off mode (the
-     * default) allocates neither, and a prefix with no tail needs none
+    /* Shortlist staging covers the largest reserved prefix. Off mode
+     * allocates neither, and a prefix with no tail needs none
      * either -- its one range lands straight in t_logits -- so the
      * full-vocabulary path keeps exactly the allocation profile it has
      * always had. */
     if (h->draft_vocab_prefix && h->draft_vocab_tail) {
-        h->t_logits_prefix = mtp_alloc(rows * h->draft_vocab_prefix * f, &ok);
+        h->t_logits_prefix = mtp_alloc(rows * h->draft_vocab_prefix_capacity * f, &ok);
         if (ok) {
             h->t_logits_tail = mtp_alloc(rows * h->draft_vocab_tail * f, &ok);
         }
@@ -869,7 +884,7 @@ int ds4_qwen4exp_mtp_head_init(ds4_qwen4exp_mtp_head *h,
         h->hooks.native_init && h->hooks.native_screen && h->hooks.native_map) {
         uint64_t bytes = 0;
         uint32_t capacity = 0;
-        const int rc = h->hooks.native_init(h->draft_vocab_prefix + h->draft_vocab_tail,
+        const int rc = h->hooks.native_init(h->draft_vocab_prefix_capacity + h->draft_vocab_tail,
                                             &bytes, &capacity);
         if (rc < 0) ok = false;
         else if (rc > 0 && bytes && capacity && capacity <= h->n_vocab) {
@@ -887,6 +902,10 @@ int ds4_qwen4exp_mtp_head_init(ds4_qwen4exp_mtp_head *h,
                         "rows", h->max_tokens);
     }
     return 0;
+}
+
+void ds4_qwen4exp_mtp_head_reset_vocab(ds4_qwen4exp_mtp_head *h) {
+    if (h) h->draft_vocab_prefix = h->draft_vocab_prefix_initial;
 }
 
 void ds4_qwen4exp_mtp_head_free(ds4_qwen4exp_mtp_head *h) {
@@ -907,6 +926,8 @@ void ds4_qwen4exp_mtp_head_free(ds4_qwen4exp_mtp_head *h) {
     h->t_top1 = NULL;
     h->t_native_ids = h->t_native_scratch = NULL;
     h->native_capacity = 0;
+    h->draft_vocab_prefix_capacity = 0;
+    h->draft_vocab_prefix_initial = 0;
     free(h->top1_host);
     h->top1_host = NULL;
 }
@@ -1016,7 +1037,21 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
         n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT;
     const uint32_t logit_rows = narrow_logits ? 1u : n_tokens;
     const uint32_t logit_first = narrow_logits ? 0u : first_row;
-    /* The draft shortlist, fixed at init.  Zero keeps the whole vocabulary;
+    /* A token in the excluded ordinary range demonstrates a coverage miss.
+     * Special tokens already belong to the tail and do not trigger expansion.
+     * The reserve belongs to this head; no allocation enters the hot path. */
+    if (h->t_native_scratch && h->t_native_ids &&
+        h->draft_vocab_prefix < h->draft_vocab_prefix_capacity) {
+        const uint32_t tail_base = h->n_vocab - h->draft_vocab_tail;
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            const uint32_t token = (uint32_t)next_tokens[t];
+            if (token >= h->draft_vocab_prefix && token < tail_base) {
+                h->draft_vocab_prefix = h->draft_vocab_prefix_capacity;
+                break;
+            }
+        }
+    }
+    /* The current draft shortlist. Zero keeps the whole vocabulary;
      * armed, the DRAFT's borrowed-LM-head projection narrows to rows
      * [0, prefix) plus the tail range, and `draft_width` is the width of one
      * PACKED row: the prefix ids first, the tail ids behind them.  Packing

@@ -67602,6 +67602,7 @@ static int ds4_session_qwen4exp_sync(ds4_session *s, const ds4_tokens *prompt,
     /* A sync is a new prefix, so any carried draft is for a position that no
      * longer exists.  See ds4_session_invalidate. */
     ds4_qwen4exp_mtp_invalidate(&s->qwen4exp_spec);
+    ds4_qwen4exp_mtp_head_reset_vocab(&s->qwen4exp_head);
     s->checkpoint.len = 0;
     s->checkpoint_valid = false;
 
@@ -78074,6 +78075,7 @@ void ds4_session_invalidate(ds4_session *s) {
          * pending_parent would verify against it and commit two tokens while
          * the caller believes nothing was drafted. */
         ds4_qwen4exp_mtp_invalidate(&s->qwen4exp_spec);
+        ds4_qwen4exp_mtp_head_reset_vocab(&s->qwen4exp_head);
         s->checkpoint_valid = false;
         s->checkpoint.len = 0;
         return;
@@ -78115,6 +78117,7 @@ void ds4_session_rewind(ds4_session *s, int pos) {
          * longer prefix. */
         if (pos == 0) {
             ds4_qwen4exp_session_reset(s->engine->qwen4exp_session);
+            ds4_qwen4exp_mtp_head_reset_vocab(&s->qwen4exp_head);
             s->checkpoint.len = 0;
             s->checkpoint_valid = false;
             return;

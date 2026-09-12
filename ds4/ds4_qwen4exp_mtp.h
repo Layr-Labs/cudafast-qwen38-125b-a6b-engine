@@ -683,8 +683,8 @@ typedef struct {
     uint32_t n_vocab;
     uint32_t max_tokens;           /* rows one forward may carry             */
 
-    /* The DRAFT shortlist over the borrowed LM head.  Set once by init() from
-     * DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX (0, the default: off, the draft projects
+    /* The DRAFT shortlist over the borrowed LM head. Initialized from
+     * DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX (0 disables restriction and projects
      * and argmaxes the whole vocabulary) and DS4_QWEN4EXP_DRAFT_VOCAB_TAIL
      * (DS4_QWEN4EXP_DRAFT_VOCAB_TAIL_DEFAULT).  A nonzero prefix restricts the
      * DRAFT's argmax to output rows [0, prefix) and [n_vocab - tail, n_vocab)
@@ -697,6 +697,11 @@ typedef struct {
     uint32_t native_capacity;
     uint32_t draft_vocab_prefix;
     uint32_t draft_vocab_tail;
+    /* The built-in shortlist can grow to this preallocated prefix when a
+     * head input contains an excluded ordinary token. Explicit vocab settings
+     * and DS4_MTP_NO_ADAPTIVE_VOCAB keep it fixed. No weight is copied. */
+    uint32_t draft_vocab_prefix_capacity;
+    uint32_t draft_vocab_prefix_initial; /* restored at a whole-request reset */
 
     float rms_eps;
     float weight_bias;             /* 1 for zero-centered weights, else 0    */
@@ -753,6 +758,9 @@ void ds4_qwen4exp_mtp_default_hooks(ds4_qwen4exp_mtp_gpu_hooks *hooks);
 
 int  ds4_qwen4exp_mtp_head_init(ds4_qwen4exp_mtp_head *h, char *err, size_t errlen);
 void ds4_qwen4exp_mtp_head_free(ds4_qwen4exp_mtp_head *h);
+/* Reset request-local coverage without reallocating scratch or changing the
+ * configured ranges. The resident may reuse one head for many requests. */
+void ds4_qwen4exp_mtp_head_reset_vocab(ds4_qwen4exp_mtp_head *h);
 
 /*
  * One head forward.
