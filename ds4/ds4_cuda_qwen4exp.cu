@@ -255,6 +255,7 @@ __device__ __forceinline__ static float qwen4exp_gdn_softplus(float x) {
  * 2 * n_key_head are query and key heads and take the RMS norm; the rest are
  * value heads and only take the activation.
  */
+template <bool ShortGates = false>
 __global__ static void qwen4exp_gdn_conv_kernel(
         float       *qkv,
         float       *conv_state,
@@ -265,7 +266,10 @@ __global__ static void qwen4exp_gdn_conv_kernel(
         uint32_t     n_rows,
         uint32_t     n_tokens,
         uint32_t     n_snapshot_rows,
-        float        qk_norm_eps) {
+        float        qk_norm_eps,
+        float2      *gate_pairs,
+        const float *raw_alpha, const float *raw_beta,
+        const float *a_log, const float *dt_bias) {
     const uint32_t block = blockIdx.x;
     const uint32_t row = blockIdx.y;
     const uint32_t tid = threadIdx.x;
@@ -358,6 +362,23 @@ __global__ static void qwen4exp_gdn_conv_kernel(
     history[channel] = h0;
     history[(uint64_t)conv_dim + channel] = h1;
     history[(uint64_t)2u * conv_dim + channel] = h2;
+    /* Completion publishes current gates before the unchanged R1 recurrence.
+     * Raw gates and convolution snapshots remain untouched. */
+    if constexpr (ShortGates) {
+        if (block == 0u) {
+            for (uint32_t token = 0; token < n_tokens; token++) {
+                for (uint32_t head = tid; head < n_value_head;
+                     head += QWEN4EXP_GDN_DIM) {
+                    const uint64_t gate =
+                        ((uint64_t)row * n_tokens + token) * n_value_head + head;
+                    gate_pairs[gate] = make_float2(
+                        expf(a_log[head] * qwen4exp_gdn_softplus(
+                            raw_alpha[gate] + dt_bias[head])),
+                        qwen4exp_gdn_sigmoid(raw_beta[gate]));
+                }
+            }
+        }
+    }
 }
 
 /*
@@ -802,7 +823,8 @@ static int qwen4exp_cuda_gdn_run(
         uint32_t              head_layout,
         float                 qk_norm_eps,
         float                 norm_eps,
-        const char           *label) {
+        const char           *label,
+        ds4_gpu_tensor       *short_gates = NULL) {
     uint64_t key_dim = 0, value_dim = 0, conv_dim = 0, slots = 0;
     uint64_t qkv_elements = 0, out_elements = 0, gate_elements = 0;
     uint64_t conv_elements = 0, state_elements = 0, state_rows = 0;
@@ -865,6 +887,28 @@ static int qwen4exp_cuda_gdn_run(
         }
     }
 
+    /* Optional session-owned scratch: validate before any mutable launch.
+     * Compare whole tensor ranges conservatively, including unused capacity. */
+    if (short_gates && n_rows == 1u && n_tokens <= 2u) {
+        uint64_t bytes = 0;
+        if (!glm53_cuda_mul_u64(gate_elements, sizeof(float2), &bytes) ||
+            !short_gates->ptr || short_gates->bytes < bytes ||
+            ((uintptr_t)short_gates->ptr & (alignof(float2) - 1u)) != 0u ||
+            short_gates->device_id != out->device_id) return 0;
+        const ds4_gpu_tensor *live[] = {out, conv_state, recurrent_state,
+            conv_snapshot, state_snapshot, qkv, raw_alpha, raw_beta, output_gate};
+        const uintptr_t base = (uintptr_t)short_gates->ptr;
+        if (short_gates->bytes > UINTPTR_MAX - base) return 0;
+        for (const ds4_gpu_tensor *v : live) {
+            if (!v) continue;
+            const uintptr_t other = (uintptr_t)v->ptr;
+            if (v->device_id != out->device_id ||
+                v->bytes > UINTPTR_MAX - other ||
+                (base < other + v->bytes && other < base + short_gates->bytes)) return 0;
+        }
+    } else short_gates = NULL;
+    if (getenv("DS4_QWEN4EXP_NO_GDN_SHORT_GATES") != NULL) short_gates = NULL;
+
     const int logical_tier = ds4_tensor_device_idx(out);
     const float *conv_weight = qwen4exp_gdn_weight_f32(
         conv_weight_slab->map, conv_weight_slab->map_size,
@@ -881,6 +925,26 @@ static int qwen4exp_cuda_gdn_run(
         output_norm_slab->offset, QWEN4EXP_GDN_DIM,
         logical_tier, "GDN output norm");
     if (!conv_weight || !a_log || !dt_bias || !output_norm) return 0;
+    if (short_gates) {
+        int current_device = -1;
+        cudaPointerAttributes attr;
+        if (!cuda_ok(cudaGetDevice(&current_device), "GDN short gate current device") ||
+            !cuda_ok(cudaPointerGetAttributes(&attr, short_gates->ptr),
+                     "GDN short gate pointer device") ||
+            (attr.type != cudaMemoryTypeDevice && attr.type != cudaMemoryTypeManaged) ||
+            attr.device != current_device) return 0;
+        const float *weights[] = {conv_weight, a_log, dt_bias, output_norm};
+        const uint64_t sizes[] = {conv_dim * 4u * sizeof(float),
+            (uint64_t)n_value_head * sizeof(float),
+            (uint64_t)n_value_head * sizeof(float), QWEN4EXP_GDN_DIM * sizeof(float)};
+        const uintptr_t base = (uintptr_t)short_gates->ptr;
+        for (unsigned i = 0; i < 4; i++) {
+            const uintptr_t other = (uintptr_t)weights[i];
+            if (sizes[i] > UINTPTR_MAX - other ||
+                (base < other + sizes[i] && other < base + short_gates->bytes)) return 0;
+        }
+    }
+
 
     cudaStream_t stream = cuda_decode_stream();
     const uint32_t blocks = 2u * n_key_head + n_value_head;
@@ -928,13 +992,22 @@ static int qwen4exp_cuda_gdn_run(
                      "qwen4exp GDN conv history carry")) {
             return 0;
         }
+    } else if (short_gates) {
+        qwen4exp_gdn_conv_kernel<true><<<dim3(blocks, n_rows, 1u),
+                                       QWEN4EXP_GDN_DIM, 0, stream>>>(
+                (float *)qkv->ptr, (float *)conv_state->ptr, conv_weight,
+                conv_snapshot ? (float *)conv_snapshot->ptr : NULL,
+                n_key_head, n_value_head, n_rows, n_tokens, n_snapshot_rows,
+                qk_norm_eps, (float2 *)short_gates->ptr,
+                (const float *)raw_alpha->ptr, (const float *)raw_beta->ptr,
+                a_log, dt_bias);
     } else {
-        qwen4exp_gdn_conv_kernel<<<dim3(blocks, n_rows, 1u),
+        qwen4exp_gdn_conv_kernel<false><<<dim3(blocks, n_rows, 1u),
                                    QWEN4EXP_GDN_DIM, 0, stream>>>(
                 (float *)qkv->ptr, (float *)conv_state->ptr, conv_weight,
                 conv_snapshot ? (float *)conv_snapshot->ptr : NULL,
                 n_key_head, n_value_head, n_rows, n_tokens, n_snapshot_rows,
-                qk_norm_eps);
+                qk_norm_eps, NULL, NULL, NULL, NULL, NULL);
     }
     if (!cuda_ok(cudaGetLastError(), "qwen4exp GDN convolution launch")) {
         return 0;
@@ -942,7 +1015,18 @@ static int qwen4exp_cuda_gdn_run(
 
     const dim3 recurrence_grid(
         n_value_head, QWEN4EXP_GDN_DIM / 4u, n_rows);
-    if (gate_pairs) {
+    if (short_gates) {
+        qwen4exp_gdn_recurrence_kernel<true><<<
+                recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
+                (float *)out->ptr, (float *)recurrent_state->ptr,
+                (const float *)qkv->ptr,
+                (const float *)raw_alpha->ptr, (const float *)raw_beta->ptr,
+                a_log, dt_bias, (const float2 *)short_gates->ptr,
+                state_snapshot ? (float *)state_snapshot->ptr : NULL,
+                n_key_head, n_value_head, n_rows, n_tokens, head_layout,
+                n_snapshot_rows,
+                getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
+    } else if (gate_pairs) {
         if (n_key_head == 16u && n_value_head == 48u &&
             getenv("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE") == NULL) {
             if (getenv("DS4_QWEN4EXP_NO_GDN_VALUE_VECTOR") == NULL) {
@@ -1036,6 +1120,41 @@ extern "C" int ds4_gpu_qwen4exp_gdn_prefill(
         output_norm_slab,
         n_key_head, n_value_head, 1u, n_tokens, head_layout,
         qk_norm_eps, norm_eps, "prefill");
+}
+
+extern "C" int ds4_gpu_qwen4exp_gdn_prefill_short_gates(
+        ds4_gpu_tensor       *short_gates,
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *conv_snapshot,
+        ds4_gpu_tensor       *state_snapshot,
+        uint32_t              n_snapshot_rows,
+        ds4_gpu_tensor       *qkv,
+        const ds4_gpu_tensor *raw_alpha,
+        const ds4_gpu_tensor *raw_beta,
+        const ds4_gpu_tensor *output_gate,
+        /* One slab per tensor: ssm_conv1d, ssm_a, ssm_dt.bias and ssm_norm are
+         * four GGUF tensors and a shard boundary can fall between any two of
+         * them.  Resolving them all through the convolution's mapping would
+         * read the right offsets out of the wrong file on a split set. */
+        const ds4_gpu_qwen4exp_slab *conv_weight_slab,
+        const ds4_gpu_qwen4exp_slab *a_log_slab,
+        const ds4_gpu_qwen4exp_slab *dt_bias_slab,
+        const ds4_gpu_qwen4exp_slab *output_norm_slab,
+        uint32_t              n_key_head,
+        uint32_t              n_value_head,
+        uint32_t              n_tokens,
+        uint32_t              head_layout,
+        float                 qk_norm_eps,
+        float                 norm_eps) {
+    return qwen4exp_cuda_gdn_run(
+        out, conv_state, recurrent_state, conv_snapshot, state_snapshot,
+        n_snapshot_rows, qkv, raw_alpha, raw_beta,
+        output_gate, conv_weight_slab, a_log_slab, dt_bias_slab,
+        output_norm_slab,
+        n_key_head, n_value_head, 1u, n_tokens, head_layout,
+        qk_norm_eps, norm_eps, "prefill-short-gates", short_gates);
 }
 
 extern "C" int ds4_gpu_qwen4exp_gdn_decode(

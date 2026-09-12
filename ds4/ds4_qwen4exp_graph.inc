@@ -101,6 +101,7 @@ void ds4_qwen4exp_session_plan_compute(ds4_qwen4exp_session_plan *plan,
     act += B * H * f;                              /* inject              */
     act += B * cfg->gdn_qkv_dim * f;
     act += 2ull * B * DS4_N_GDN_VALUE_HEAD * f;    /* alpha, beta         */
+    act += 2ull * (B < 2u ? B : 2u) * DS4_N_GDN_VALUE_HEAD * f; /* short gates */
     act += 2ull * B * cfg->gdn_inner * f;          /* gate, out           */
     const uint64_t q8_blocks = (E + 31ull) / 32ull;
     const uint64_t q8_qbytes = B * q8_blocks * 32ull;
@@ -361,6 +362,7 @@ struct ds4_qwen4exp_session {
     ds4_gpu_tensor *embed_rows;
 
     ds4_gpu_tensor *gdn_qkv;
+    ds4_gpu_tensor *gdn_short_gates;
     ds4_gpu_tensor *gdn_alpha;
     ds4_gpu_tensor *gdn_beta;
     ds4_gpu_tensor *gdn_gate;
@@ -736,6 +738,8 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
     s->inject      = qwen4exp_alloc_zeroed(B * H * f, &ok);
 
     s->gdn_qkv   = qwen4exp_alloc_zeroed(B * cfg->gdn_qkv_dim * f, &ok);
+    s->gdn_short_gates = qwen4exp_alloc_zeroed(
+        2ull * (B < 2u ? B : 2u) * DS4_N_GDN_VALUE_HEAD * f, &ok);
     s->gdn_alpha = qwen4exp_alloc_zeroed(B * DS4_N_GDN_VALUE_HEAD * f, &ok);
     s->gdn_beta  = qwen4exp_alloc_zeroed(B * DS4_N_GDN_VALUE_HEAD * f, &ok);
     s->gdn_gate  = qwen4exp_alloc_zeroed(B * cfg->gdn_inner * f, &ok);
@@ -827,6 +831,7 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->embed_rows);
     ds4_gpu_tensor_free(s->inject);
     ds4_gpu_tensor_free(s->gdn_qkv);
+    ds4_gpu_tensor_free(s->gdn_short_gates);
     ds4_gpu_tensor_free(s->gdn_alpha);
     ds4_gpu_tensor_free(s->gdn_beta);
     ds4_gpu_tensor_free(s->gdn_gate);
@@ -1467,7 +1472,22 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
     const ds4_gpu_qwen4exp_slab dt_bias_slab = QW_SLAB(m, l->ssm_dt_bias);
     const ds4_gpu_qwen4exp_slab ssm_norm_slab = QW_SLAB(m, l->ssm_norm);
 
-    const int rc = (n_tokens > 1u)
+    int rc;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (n_tokens <= 2u) {
+        rc = ds4_gpu_qwen4exp_gdn_prefill_short_gates(
+              s->gdn_short_gates, s->gdn_out, s->gdn_conv[il], s->gdn_state[il],
+              /* Width one retains decode's round-start-only rollback seam. */
+              n_tokens > 1u ? s->gdn_conv_snapshot[il] : NULL,
+              n_tokens > 1u ? s->gdn_state_snapshot[il] : NULL,
+              n_tokens > 1u ? s->spec_snapshot_rows : 0u, s->gdn_qkv,
+              s->gdn_alpha, s->gdn_beta, s->gdn_gate,
+              &conv_slab, &a_log_slab, &dt_bias_slab, &ssm_norm_slab,
+              DS4_N_GDN_KEY_HEAD, DS4_N_GDN_VALUE_HEAD, n_tokens,
+              DS4_QWEN4EXP_GDN_HEADS_TILED, DS4_RMS_EPS, DS4_RMS_EPS);
+    } else
+#endif
+    rc = (n_tokens > 1u)
         ? ds4_gpu_qwen4exp_gdn_prefill(
               s->gdn_out, s->gdn_conv[il], s->gdn_state[il],
               s->gdn_conv_snapshot[il], s->gdn_state_snapshot[il],

@@ -3696,6 +3696,34 @@ int ds4_gpu_qwen4exp_gdn_prefill(
         float                 qk_norm_eps,
         float                 norm_eps);
 
+/* CUDA additive entry: disjoint same-device short_gates holds two floats per
+ * token/value-head for widths <=2. NULL or wider calls retain the old path.
+ * The scratch must remain alive and stable through captured graph use. */
+int ds4_gpu_qwen4exp_gdn_prefill_short_gates(
+        ds4_gpu_tensor       *short_gates,
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *conv_snapshot,
+        ds4_gpu_tensor       *state_snapshot,
+        uint32_t              n_snapshot_rows,
+        ds4_gpu_tensor       *qkv,
+        const ds4_gpu_tensor *raw_alpha,
+        const ds4_gpu_tensor *raw_beta,
+        const ds4_gpu_tensor *output_gate,
+        /* One slab per tensor: a shard boundary can fall between any two of
+         * ssm_conv1d, ssm_a, ssm_dt.bias and ssm_norm. */
+        const ds4_gpu_qwen4exp_slab *conv_weight,
+        const ds4_gpu_qwen4exp_slab *a_log,
+        const ds4_gpu_qwen4exp_slab *dt_bias,
+        const ds4_gpu_qwen4exp_slab *output_norm,
+        uint32_t              n_key_head,
+        uint32_t              n_value_head,
+        uint32_t              n_tokens,
+        uint32_t              head_layout,
+        float                 qk_norm_eps,
+        float                 norm_eps);
+
 int ds4_gpu_qwen4exp_gdn_decode(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *conv_state,
