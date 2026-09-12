@@ -27,16 +27,17 @@ static void run_case(int adversarial, uint32_t offset) {
     need(w!=MAP_FAILED,"host weights");
     for(uint32_t row=0;row<VOCAB;row++) for(uint32_t b=0;b<80;b++) {
         unsigned char *p=w+offset+(uint64_t)row*ROW+b*34;
-        p[0]=0;p[1]=(adversarial==2 && row==0)?0x7e:0x3c; /* half NaN or 1 */
+        p[0]=0;p[1]=(adversarial>=2 && row==0)?(adversarial==2?0x7e:adversarial==3?0x7c:0xfc):0x3c; /* half NaN or 1 */
         for(unsigned j=2;j<34;j++) p[j]=adversarial?0:(unsigned char)((int)(rnd()%15)-7);
         /* Last prefix row has negative screen, positive complete dot. All
          * other rows tie at zero, so its omission is inevitable and explicit. */
+        if(adversarial>=2 && row==0) memset(p+2,1,32);
         if(adversarial && row==PREFIX-1) memset(p+2,b<40?255:2,32);
     }
     need(ds4_gpu_init(),"GPU init");need(ds4_gpu_set_model_map(w,bytes),"register weights");
     uint64_t scratch_bytes=0;uint32_t cap=0;
     need(ds4_gpu_mtp_native_screen_init(WIDTH,&scratch_bytes,&cap)==1 && cap==CAP,"scratch query");
-    ds4_gpu_tensor *x=ds4_gpu_tensor_alloc(DIM*4),*out=ds4_gpu_tensor_alloc(CAP*4),
+    ds4_gpu_tensor *x=ds4_gpu_tensor_alloc(DIM*4),*out=ds4_gpu_tensor_alloc(WIDTH*4),
         *ids=ds4_gpu_tensor_alloc(CAP*4),*scratch=ds4_gpu_tensor_alloc(scratch_bytes),
         *full=ds4_gpu_tensor_alloc(PREFIX*4),*tail=ds4_gpu_tensor_alloc(TAIL*4),
         *winner=ds4_gpu_tensor_alloc(4);
@@ -45,8 +46,20 @@ static void run_case(int adversarial, uint32_t offset) {
     for(unsigned replay=0;replay<(adversarial?1u:3u);replay++) {
         for(unsigned i=0;i<DIM;i++) activation[i]=adversarial?1.0f:(int)(rnd()%201)*0.01f-1.0f;
         need(ds4_gpu_tensor_write(x,0,activation,sizeof activation),"current activation");
-        if(adversarial==2) {
+        if(adversarial>=2) {
             need(ds4_gpu_mtp_native_screen(out,ids,scratch,w,bytes,offset,DIM,VOCAB,PREFIX,TAIL,x)==0,"nonfinite score fallback");
+            uint64_t flag_off=UINT64_MAX;uint32_t id=0,flag=0;
+            need(ds4_gpu_mtp_native_propose_async(winner,out,ids,scratch,w,bytes,offset,DIM,VOCAB,PREFIX,TAIL,x,&flag_off)==CAP,"async invalid queues");
+            need(ds4_gpu_tensor_read(winner,0,&id,4)&&id==UINT32_MAX,"async invalid sentinel");
+            need(flag_off<=scratch_bytes-4&&ds4_gpu_tensor_read(scratch,flag_off,&flag,4)&&flag,"cold reason remains live");
+            need(ds4_gpu_tensor_read(ids,0,found,sizeof found),"invalid IDs");
+            for(unsigned i=0;i<CAP;i++)need(found[i]<VOCAB&&(!i||found[i]>found[i-1]),"invalid-case IDs bounded and unique");
+            float unchanged[DIM];need(ds4_gpu_tensor_read(x,0,unchanged,sizeof unchanged)&&!memcmp(activation,unchanged,sizeof unchanged),"fallback activation preserved");
+            need(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(full,w,bytes,offset,DIM,PREFIX,x,1),"static oracle prefix");
+            need(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(tail,w,bytes,offset+(uint64_t)(VOCAB-TAIL)*ROW,DIM,TAIL,x,1),"static oracle tail");
+            need(ds4_gpu_tensor_read(full,0,reference,sizeof reference)&&ds4_gpu_tensor_read(tail,0,tail_ref,sizeof tail_ref),"static oracle read");
+            need(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(out,w,bytes,offset,DIM,PREFIX,x,1)&&ds4_gpu_tensor_copy(out,PREFIX*4ull,tail,0,TAIL*4ull),"static overwrites discarded output");
+            float packed[WIDTH];need(ds4_gpu_tensor_read(out,0,packed,sizeof packed)&&!memcmp(packed,reference,sizeof reference)&&!memcmp(packed+PREFIX,tail_ref,sizeof tail_ref),"complete static overwrite parity");
             goto cleanup;
         }
         need(ds4_gpu_mtp_native_screen(out,ids,scratch,w,bytes,offset,DIM,VOCAB,PREFIX,TAIL,x)==CAP,"screen active");
@@ -63,6 +76,13 @@ static void run_case(int adversarial, uint32_t offset) {
             need(!memcmp(&exact,&selected[i],4),"full refinement differs from ordinary row");
         }
         for(unsigned i=0;i<TAIL;i++) need(found[CAP-TAIL+i]==VOCAB-TAIL+i,"mandatory tail");
+        uint32_t old_id,new_id;uint64_t flag_off=UINT64_MAX;
+        need(ds4_gpu_indexer_topk_tensor(winner,out,CAP,1,1)&&ds4_gpu_mtp_native_map(winner,out,ids,CAP,VOCAB)&&ds4_gpu_tensor_read(winner,0,&old_id,4),"old complete proposal");
+        need(ds4_gpu_mtp_native_propose_async(winner,out,ids,scratch,w,bytes,offset,DIM,VOCAB,PREFIX,TAIL,x,&flag_off)==CAP,"async proposal active");
+        need(ds4_gpu_tensor_read(winner,0,&new_id,4)&&new_id==old_id,"async original proposal parity");
+        uint32_t async_ids[CAP];float async_logits[CAP];
+        need(ds4_gpu_tensor_read(ids,0,async_ids,sizeof async_ids)&&!memcmp(found,async_ids,sizeof found),"same selected IDs");
+        need(ds4_gpu_tensor_read(out,0,async_logits,sizeof async_logits)&&!memcmp(selected,async_logits,sizeof selected),"same refined rows");
         if(adversarial) {
             need(reference[PREFIX-1]>0,"adversarial full winner");
             for(unsigned i=0;i<CAP;i++) need(found[i]!=PREFIX-1 && selected[i]==0,"screen is approximate");
@@ -85,11 +105,23 @@ static void run_case(int adversarial, uint32_t offset) {
     ds4_gpu_tensor *tiny=ds4_gpu_tensor_alloc(4);
     need(ds4_gpu_mtp_native_screen(out,ids,tiny,w,bytes,offset,DIM,VOCAB,PREFIX,TAIL,x)==-1,"scratch bound");
     ds4_gpu_tensor_free(tiny);
+    uint64_t flag_off;
+    ds4_gpu_tensor *alias=ds4_gpu_tensor_view(out,0,DIM*4ull);
+    need(alias&&ds4_gpu_tensor_write(alias,0,activation,sizeof activation),"alias activation");
+    need(ds4_gpu_mtp_native_propose_async(winner,out,ids,scratch,w,bytes,offset,DIM,VOCAB,PREFIX,TAIL,alias,&flag_off)==0,"async output/input alias declines");
+    float unchanged[DIM];need(ds4_gpu_tensor_read(alias,0,unchanged,sizeof unchanged)&&!memcmp(unchanged,activation,sizeof activation),"alias decline before writes");ds4_gpu_tensor_free(alias);
+    alias=ds4_gpu_tensor_view(ids,0,4);
+    need(alias&&ds4_gpu_mtp_native_propose_async(alias,out,ids,scratch,w,bytes,offset,DIM,VOCAB,PREFIX,TAIL,x,&flag_off)==0,"winner/ID alias declines");ds4_gpu_tensor_free(alias);
+    alias=ds4_gpu_tensor_view(scratch,0,CAP*4ull);
+    need(alias&&ds4_gpu_mtp_native_propose_async(winner,alias,ids,scratch,w,bytes,offset,DIM,VOCAB,PREFIX,TAIL,x,&flag_off)==0,"output/scratch alias declines");ds4_gpu_tensor_free(alias);
+    tiny=ds4_gpu_tensor_alloc(1);
+    need(ds4_gpu_mtp_native_propose_async(tiny,out,ids,scratch,w,bytes,offset,DIM,VOCAB,PREFIX,TAIL,x,&flag_off)==-1,"winner size guard");ds4_gpu_tensor_free(tiny);
     ds4_gpu_decode_graphs_invalidate();
     ds4_decode_graph_key key={.il=3,.island=0,.variant=1};
     need(ds4_gpu_decode_graph_begin(&key)==-1,"graph warmup");
     need(ds4_gpu_decode_graph_begin(&key)==0,"capture start");
     need(ds4_gpu_mtp_native_screen(out,ids,scratch,w,bytes,offset,DIM,VOCAB,PREFIX,TAIL,x)==0,"capture declines screening");
+    need(ds4_gpu_mtp_native_propose_async(winner,out,ids,scratch,w,bytes,offset,DIM,VOCAB,PREFIX,TAIL,x,&flag_off)==0,"capture declines async");
     need(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(full,w,bytes,offset,DIM,PREFIX,x,1),"captured static fallback");
     need(ds4_gpu_decode_graph_end(&key)==0,"capture end");
     ds4_gpu_decode_graphs_invalidate();
@@ -98,4 +130,4 @@ cleanup:
     ds4_gpu_tensor_free(full);ds4_gpu_tensor_free(tail);ds4_gpu_tensor_free(winner);
     ds4_gpu_cleanup();munmap(w,bytes);
 }
-int main(void){setenv("DS4_CUDA_DECODE_GRAPHS","1",1);run_case(0,0);run_case(0,2);run_case(1,0);run_case(2,0);puts("native screen contracts pass (selection deliberately approximate)");return 0;}
+int main(void){setenv("DS4_CUDA_DECODE_GRAPHS","1",1);run_case(0,0);run_case(0,2);run_case(1,0);run_case(2,0);run_case(3,0);run_case(4,0);puts("native screen contracts pass (selection deliberately approximate)");return 0;}

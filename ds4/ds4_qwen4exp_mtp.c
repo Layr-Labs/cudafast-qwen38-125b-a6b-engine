@@ -989,6 +989,51 @@ static int mtp_head_time_on(void) {
         }                                                                     \
     } while (0)
 
+/* One exact static prefix/tail projection sequence, also used after a
+ * pending native result requests fallback. It never reruns the head/block. */
+static int mtp_head_static_project(ds4_qwen4exp_mtp_head *h,
+        uint32_t draft_prefix, uint32_t draft_tail, uint32_t draft_width,
+        uint32_t logit_rows, const char **failed_stage) {
+    const uint32_t n_embd = h->n_embd;
+    const uint64_t f = sizeof(float);
+    bool ok = true;
+    const char *stage = "borrowed lm head";
+    /* A single row can project its prefix directly to the packed output.
+     * Multiple rows retain separate prefix storage and per-row packing. */
+    const bool direct_prefix = logit_rows == 1u;
+    stage = "borrowed lm head";
+    ok = h->hooks.matmul_q8_0(
+            draft_tail && !direct_prefix ? h->t_logits_prefix : h->t_logits,
+            h->target_map, h->target_size, h->output_offset, n_embd,
+            draft_prefix ? draft_prefix : h->n_vocab,
+            h->t_sample, logit_rows) != 0;
+    if (ok && draft_tail) {
+        stage = "borrowed lm head tail";
+        ok = h->hooks.matmul_q8_0(
+                h->t_logits_tail, h->target_map, h->target_size,
+                h->output_offset + (uint64_t)(h->n_vocab - draft_tail) *
+                    ds4_qwen4exp_q8_0_row_bytes(n_embd),
+                n_embd, draft_tail, h->t_sample, logit_rows) != 0;
+    }
+    if (ok && draft_tail) {
+        stage = "shortlist pack";
+        for (uint32_t r = 0; r < logit_rows; r++) {
+            ok = (direct_prefix || ds4_gpu_tensor_copy(
+                         h->t_logits, (uint64_t)r * draft_width * f,
+                         h->t_logits_prefix, (uint64_t)r * draft_prefix * f,
+                         (uint64_t)draft_prefix * f) != 0) &&
+                     ds4_gpu_tensor_copy(
+                         h->t_logits,
+                         ((uint64_t)r * draft_width + draft_prefix) * f,
+                         h->t_logits_tail, (uint64_t)r * draft_tail * f,
+                         (uint64_t)draft_tail * f) != 0;
+            if (!ok) break;
+        }
+    }
+    if (failed_stage) *failed_stage = stage;
+    return ok;
+}
+
 /* The forward proper.  Seed rows must update the head block's caches, but
  * their final mixer and vocabulary projections have no consumer when only
  * the last proposal is requested.  Narrow those stateless operations within
@@ -1151,17 +1196,35 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                                h->rms_eps, h->weight_bias, h->round_bf16) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_MIXER);
-    bool screened = false;
+    bool screened = false, pending_native = false;
+    uint64_t pending_flag_offset = 0;
+    const uint32_t static_width = draft_width;
     if (ok && logit_rows == 1u && h->t_native_scratch && h->t_native_ids &&
         h->hooks.native_screen && h->hooks.native_map &&
         getenv("DS4_MTP_NO_NATIVE_SCREEN") == NULL) {
-        stage = "native head screen and refinement";
-        const int rc = h->hooks.native_screen(h->t_logits, h->t_native_ids,
-                h->t_native_scratch, h->target_map, h->target_size,
-                h->output_offset, n_embd, h->n_vocab, draft_prefix, draft_tail,
-                h->t_sample);
-        if (rc < 0 || (uint32_t)rc > h->native_capacity) ok = false;
-        else if (rc > 0) { screened = true; draft_width = (uint32_t)rc; }
+        if (!timing && out_rows == 1u && logit_first == 0u &&
+            h->hooks.native_propose_async &&
+            getenv("DS4_MTP_NO_ASYNC_PROPOSAL") == NULL) {
+            stage = "asynchronous native proposal";
+            const int queued = h->hooks.native_propose_async(h, &pending_flag_offset);
+            if (queued < 0) ok = false;
+            else if (queued > 0) {
+                const uint64_t bytes = ds4_gpu_tensor_bytes(h->t_native_scratch);
+                if ((uint32_t)queued != h->native_capacity ||
+                    (uint32_t)queued >= static_width || pending_flag_offset > bytes ||
+                    bytes - pending_flag_offset < sizeof(uint32_t)) ok = false;
+                else { pending_native = screened = true; draft_width = (uint32_t)queued; }
+            }
+        }
+        if (ok && !pending_native) {
+            stage = "native head screen and refinement";
+            const int rc = h->hooks.native_screen(h->t_logits, h->t_native_ids,
+                    h->t_native_scratch, h->target_map, h->target_size,
+                    h->output_offset, n_embd, h->n_vocab, draft_prefix, draft_tail,
+                    h->t_sample);
+            if (rc < 0 || (uint32_t)rc > h->native_capacity) ok = false;
+            else if (rc > 0) { screened = true; draft_width = (uint32_t)rc; }
+        }
     }
 
     /* The borrowed LM head, in the target's mapping.  The shortlist runs the
@@ -1173,42 +1236,11 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
      * them (the decode-order ladder is row-exact by construction, which is
      * the property the whole speculative cycle stands on), so a shortlist
      * id's logit is the logit the full projection produces. */
-    if (ok && !screened) {
-        /* A single row can project its prefix directly to the packed output.
-         * Multiple rows retain separate prefix storage and per-row packing. */
-        const bool direct_prefix = logit_rows == 1u;
-        stage = "borrowed lm head";
-        ok = h->hooks.matmul_q8_0(
-                draft_tail && !direct_prefix ? h->t_logits_prefix : h->t_logits,
-                h->target_map, h->target_size, h->output_offset, n_embd,
-                draft_prefix ? draft_prefix : h->n_vocab,
-                h->t_sample, logit_rows) != 0;
-        if (ok && draft_tail) {
-            stage = "borrowed lm head tail";
-            ok = h->hooks.matmul_q8_0(
-                    h->t_logits_tail, h->target_map, h->target_size,
-                    h->output_offset + (uint64_t)(h->n_vocab - draft_tail) *
-                        ds4_qwen4exp_q8_0_row_bytes(n_embd),
-                    n_embd, draft_tail, h->t_sample, logit_rows) != 0;
-        }
-        if (ok && draft_tail) {
-            stage = "shortlist pack";
-            for (uint32_t r = 0; r < logit_rows; r++) {
-                ok = (direct_prefix || ds4_gpu_tensor_copy(
-                             h->t_logits, (uint64_t)r * draft_width * f,
-                             h->t_logits_prefix, (uint64_t)r * draft_prefix * f,
-                             (uint64_t)draft_prefix * f) != 0) &&
-                         ds4_gpu_tensor_copy(
-                             h->t_logits,
-                             ((uint64_t)r * draft_width + draft_prefix) * f,
-                             h->t_logits_tail, (uint64_t)r * draft_tail * f,
-                             (uint64_t)draft_tail * f) != 0;
-                if (!ok) break;
-            }
-        }
-    }
+    if (ok && !screened)
+        ok = mtp_head_static_project(h, draft_prefix, draft_tail, draft_width,
+                                     logit_rows, &stage);
     MTP_HEAD_TICK(MTP_HEAD_T_LM_HEAD);
-    if (ok) {
+    if (ok && !pending_native) {
         stage = "gpu top-1";
         /* The head exposes only draft ids.  Keep the LM-head arithmetic intact,
          * reduce each finite logit row on the device and read back one id
@@ -1218,7 +1250,7 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
         ok = ds4_gpu_indexer_topk_tensor(h->t_top1, h->t_logits,
                                          draft_width, logit_rows, 1u) != 0;
     }
-    if (ok && screened) {
+    if (ok && screened && !pending_native) {
         stage = "native original winner mapping";
         ok = h->hooks.native_map(h->t_top1, h->t_logits, h->t_native_ids,
                                   draft_width, h->n_vocab) != 0;
@@ -1238,6 +1270,39 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                                  (uint64_t)out_rows * sizeof(uint32_t)) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_TOP1_IN);
+    if (ok && pending_native && h->top1_host[0] == UINT32_MAX) {
+        /* UINT32_MAX is outside every uint32 vocabulary. The cold reason read
+         * distinguishes nonfinite fallback from the old malformed-winner
+         * error; successful finite calls perform no flag D2H at all. */
+        uint32_t invalid = 0;
+        stage = "pending native reason readback";
+        ok = ds4_gpu_tensor_read(h->t_native_scratch, pending_flag_offset,
+                                 &invalid, sizeof(invalid)) != 0;
+        if (ok && !invalid)
+            return mtp_fail(err, errlen, "invalid native-screen winner");
+        if (ok) {
+            pending_native = screened = false;
+            draft_width = static_width;
+            stage = "static fallback begin";
+            ok = ds4_gpu_begin_commands() != 0;
+            if (ok) ok = mtp_head_static_project(h, draft_prefix, draft_tail,
+                                                 draft_width, 1u, &stage);
+            if (ok) {
+                stage = "static fallback top-1";
+                ok = ds4_gpu_indexer_topk_tensor(h->t_top1,h->t_logits,
+                                                 draft_width,1u,1u) != 0;
+            }
+            if (ok) {
+                stage = "static fallback end";
+                ok = ds4_gpu_end_commands() != 0;
+            } else (void)ds4_gpu_synchronize();
+            if (ok) {
+                stage = "static fallback top-1 readback";
+                ok = ds4_gpu_tensor_read(h->t_top1,0,h->top1_host,
+                                         sizeof(uint32_t)) != 0;
+            }
+        }
+    }
     if (ok && !screened) {
         stage = "logit-0 readback";
         for (uint32_t t = 0; ok && t < out_rows; t++) {

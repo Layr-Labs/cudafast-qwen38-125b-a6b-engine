@@ -1587,6 +1587,10 @@ struct ds4_gpu_tensor {
     int is_view;
 };
 
+uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor) {
+    return tensor ? tensor->bytes : 0;
+}
+
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     ds4_gpu_tensor *t = calloc(1, sizeof(*t));
     if (!t) return NULL;
