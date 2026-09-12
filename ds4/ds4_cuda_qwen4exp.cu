@@ -4553,6 +4553,10 @@ static int qwen4exp_shared_mma_ok(const uint32_t *types, uint32_t n_types,
     } while (0)
 
 template <int RouterType = -1>
+/* How many elements of its strided walk a lane asks for before it uses any of
+ * them.  Scheduling only, like the norm's own step above. */
+#define QWEN4EXP_SHARED_GATE_STEPS 10u
+
 __global__ static void qwen4exp_shared_gate_kernel(
         float *gate_out,
         const char *router,
@@ -4564,8 +4568,36 @@ __global__ static void qwen4exp_shared_gate_kernel(
     const uint32_t token = blockIdx.x;
     if (token >= n_tokens) return;
     const float *token_x = x + (uint64_t)token * in_dim;
+    /* One block per token, so a decode row is a single block walking a few
+     * thousand elements -- and with a runtime trip count it walked them one
+     * memory round trip at a time.  QWEN4EXP_SHARED_GATE_STEPS of them are
+     * asked for before any is used.  The products are the same, consumed in
+     * the same ascending order into the same accumulator; only the loads
+     * moved. */
+    const uint32_t nth = blockDim.x;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t steps = (in_dim > tid) ? ((in_dim - tid + nth - 1u) / nth) : 0u;
     float acc = 0.0f;
-    for (uint32_t k = threadIdx.x; k < in_dim; k += blockDim.x) {
+    uint32_t s = 0;
+    for (; s + QWEN4EXP_SHARED_GATE_STEPS <= steps;
+           s += QWEN4EXP_SHARED_GATE_STEPS) {
+        float wv[QWEN4EXP_SHARED_GATE_STEPS];
+        float xv[QWEN4EXP_SHARED_GATE_STEPS];
+#pragma unroll
+        for (uint32_t u = 0; u < QWEN4EXP_SHARED_GATE_STEPS; u++) {
+            const uint32_t k = tid + (s + u) * nth;
+            wv[u] = dev_qwen4exp_weight_value(
+                    RouterType < 0 ? router_type : (uint32_t)RouterType,
+                    router, k);
+            xv[u] = token_x[k];
+        }
+#pragma unroll
+        for (uint32_t u = 0; u < QWEN4EXP_SHARED_GATE_STEPS; u++) {
+            acc += wv[u] * xv[u];
+        }
+    }
+    for (; s < steps; s++) {
+        const uint32_t k = tid + s * nth;
         acc += dev_qwen4exp_weight_value(
                 RouterType < 0 ? router_type : (uint32_t)RouterType,
                 router, k) * token_x[k];
@@ -5462,6 +5494,22 @@ __device__ __forceinline__ static float qwen4exp_block_sum_f32(
     return partial[0];
 }
 
+/* How many elements of its strided walk a thread asks for before it uses any
+ * of them.  Scheduling only: the values land in the same registers and are
+ * consumed in the same ascending order, into the same accumulator.
+ *
+ * It has to DIVIDE the walk to do anything: a group of 2560 over a block of
+ * 256 is ten steps, so a depth above ten would leave every element to the
+ * one-at-a-time tail and change nothing at all. */
+#define QWEN4EXP_RMS_STEPS 8u
+
+/* One block per (group, row), so a hyper-connection norm of four streams is
+ * four blocks -- and each of those blocks walked its 2560 elements one memory
+ * round trip at a time, because the trip count is a runtime value and nothing
+ * was unrolled.  Both walks below now ask for QWEN4EXP_RMS_STEPS elements
+ * before consuming any, which is the only change: `sum += v * v` is still the
+ * expression it always was, applied to the same elements in the same order,
+ * and the normalise-and-scale walk is elementwise. */
 __global__ static void qwen4exp_rms_norm_kernel(
         float *out, const float *x, const float *w,
         uint32_t n, uint32_t group, uint32_t rows,
@@ -5474,19 +5522,51 @@ __global__ static void qwen4exp_rms_norm_kernel(
     const float *xg = x + base;
     float *yg = out + base;
     const float *wg = w + (uint64_t)g * group;
+    const uint32_t nth = blockDim.x;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t steps = (group > tid) ? ((group - tid + nth - 1u) / nth) : 0u;
 
     float sum = 0.0f;
-    for (uint32_t i = threadIdx.x; i < group; i += blockDim.x) {
-        const float v = xg[i];
+    uint32_t s = 0;
+    for (; s + QWEN4EXP_RMS_STEPS <= steps; s += QWEN4EXP_RMS_STEPS) {
+        float xv[QWEN4EXP_RMS_STEPS];
+#pragma unroll
+        for (uint32_t u = 0; u < QWEN4EXP_RMS_STEPS; u++) {
+            xv[u] = xg[tid + (s + u) * nth];
+        }
+#pragma unroll
+        for (uint32_t u = 0; u < QWEN4EXP_RMS_STEPS; u++) sum += xv[u] * xv[u];
+    }
+    for (; s < steps; s++) {
+        const float v = xg[tid + s * nth];
         sum += v * v;
     }
+
     __shared__ float partial[256];
     const float total = qwen4exp_block_sum_f32(sum, partial);
     /* 1/sqrt rather than rsqrtf: the exactness the qwen4exp op tests assert
      * needs the correctly rounded reciprocal square root. */
     const float scale = 1.0f / sqrtf(total / (float)group + eps);
 
-    for (uint32_t i = threadIdx.x; i < group; i += blockDim.x) {
+    s = 0;
+    for (; s + QWEN4EXP_RMS_STEPS <= steps; s += QWEN4EXP_RMS_STEPS) {
+        float xv[QWEN4EXP_RMS_STEPS];
+        float wv[QWEN4EXP_RMS_STEPS];
+#pragma unroll
+        for (uint32_t u = 0; u < QWEN4EXP_RMS_STEPS; u++) {
+            const uint32_t i = tid + (s + u) * nth;
+            xv[u] = xg[i];
+            wv[u] = wg[i];
+        }
+#pragma unroll
+        for (uint32_t u = 0; u < QWEN4EXP_RMS_STEPS; u++) {
+            float normed = xv[u] * scale;
+            if (round_bf16) normed = qwen4exp_round_bf16(normed);
+            yg[tid + (s + u) * nth] = normed * (weight_bias + wv[u]);
+        }
+    }
+    for (; s < steps; s++) {
+        const uint32_t i = tid + s * nth;
         float normed = xg[i] * scale;
         if (round_bf16) normed = qwen4exp_round_bf16(normed);
         yg[i] = normed * (weight_bias + wg[i]);
