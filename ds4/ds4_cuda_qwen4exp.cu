@@ -181,6 +181,22 @@ __device__ static float dot4_f32(float4 a, float4 b) {
     return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
 }
 
+/* The two inner levels of warp_sum_all_f32's butterfly, on the four dot4s a
+ * lane holds instead of on four lanes.  Explicit round-to-nearest adds keep
+ * nvcc from contracting a dot product into the fold. */
+__device__ __forceinline__ static float qwen4exp_gdn_fold4(
+        float d0, float d1, float d2, float d3) {
+    return __fadd_rn(__fadd_rn(d0, d2), __fadd_rn(d1, d3));
+}
+
+/* The three outer levels stay inside an eight-lane value-row group. */
+__device__ __forceinline__ static float qwen4exp_gdn_group_sum_f32(float v) {
+    v += __shfl_xor_sync(0xffffffffu, v, 4);
+    v += __shfl_xor_sync(0xffffffffu, v, 2);
+    v += __shfl_xor_sync(0xffffffffu, v, 1);
+    return v;
+}
+
 /* =========================================================================
  * Qwen4-Exp gated delta net (GDN), the CUDA twin of metal/qwen4exp_gdn.metal.
  *
@@ -692,6 +708,100 @@ __global__ static void qwen4exp_gdn_value_reuse_kernel(
     }
 }
 
+/* Four value rows per warp, one per eight-lane group.  Each lane owns the
+ * columns of four lanes from the original warp-wide schedule, so fold4 plus
+ * the three-step group butterfly preserves the exact reduction tree while
+ * performing the four row reductions concurrently.  Prefill only. */
+__global__ static void qwen4exp_gdn_split_reduce_kernel(
+        float *__restrict__ out, float *__restrict__ state,
+        const float *__restrict__ qkv,
+        const float2 *__restrict__ gate_pairs, float *state_snapshot,
+        uint32_t n_key_head, uint32_t n_value_head, uint32_t n_rows,
+        uint32_t n_tokens, uint32_t head_layout, uint32_t n_snapshot_rows,
+        uint32_t snap_plain) {
+    const uint32_t head = blockIdx.x;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t grp = lane >> 3u;
+    const uint32_t col0 = 4u * (lane & 7u);
+    const uint32_t value =
+        (blockIdx.y * 4u + (threadIdx.x >> 5u)) * 4u + grp;
+    const uint32_t row = blockIdx.z;
+    if (head >= n_value_head || value >= QWEN4EXP_GDN_DIM || row >= n_rows) {
+        return;
+    }
+    const uint32_t key_dim = n_key_head * QWEN4EXP_GDN_DIM;
+    const uint32_t value_dim = n_value_head * QWEN4EXP_GDN_DIM;
+    const uint32_t conv_dim = 2u * key_dim + value_dim;
+    const uint32_t key_head = head_layout != 0u
+        ? head % n_key_head : head / (n_value_head / n_key_head);
+    const uint64_t state_base =
+        (((uint64_t)row * n_value_head + head) * QWEN4EXP_GDN_DIM + value) *
+        QWEN4EXP_GDN_DIM + col0;
+    float4 h[4];
+#pragma unroll
+    for (unsigned c = 0; c < 4u; c++) {
+        h[c] = *(const float4 *)(state + state_base + 32u * c);
+    }
+    for (uint32_t token = 0; token < n_tokens; token++) {
+        const uint64_t slot = (uint64_t)row * n_tokens + token;
+        const uint64_t base =
+            slot * conv_dim + key_head * QWEN4EXP_GDN_DIM + col0;
+        float4 q4[4], k4[4];
+#pragma unroll
+        for (unsigned c = 0; c < 4u; c++) {
+            q4[c] = *(const float4 *)(qkv + base + 32u * c);
+            k4[c] = *(const float4 *)(qkv + base + key_dim + 32u * c);
+        }
+        const float v_row = qkv[slot * conv_dim + 2u * (uint64_t)key_dim +
+            head * QWEN4EXP_GDN_DIM + value];
+        const float2 pair = gate_pairs[slot * n_value_head + head];
+        const float g = pair.x;
+        const float beta = pair.y;
+#pragma unroll
+        for (unsigned c = 0; c < 4u; c++) {
+            h[c].x *= g;
+            h[c].y *= g;
+            h[c].z *= g;
+            h[c].w *= g;
+        }
+        const float hk = qwen4exp_gdn_group_sum_f32(qwen4exp_gdn_fold4(
+            dot4_f32(h[0], k4[0]), dot4_f32(h[1], k4[1]),
+            dot4_f32(h[2], k4[2]), dot4_f32(h[3], k4[3])));
+        const float delta_v = (v_row - hk) * beta;
+#pragma unroll
+        for (unsigned c = 0; c < 4u; c++) {
+            h[c].x = fmaf(k4[c].x, delta_v, h[c].x);
+            h[c].y = fmaf(k4[c].y, delta_v, h[c].y);
+            h[c].z = fmaf(k4[c].z, delta_v, h[c].z);
+            h[c].w = fmaf(k4[c].w, delta_v, h[c].w);
+        }
+        const float result = qwen4exp_gdn_group_sum_f32(qwen4exp_gdn_fold4(
+            dot4_f32(h[0], q4[0]), dot4_f32(h[1], q4[1]),
+            dot4_f32(h[2], q4[2]), dot4_f32(h[3], q4[3])));
+        if (col0 == 0u) {
+            out[slot * value_dim + head * QWEN4EXP_GDN_DIM + value] = result;
+        }
+        if (token < n_snapshot_rows) {
+            const uint64_t stride = (uint64_t)n_rows * n_value_head *
+                QWEN4EXP_GDN_DIM * QWEN4EXP_GDN_DIM;
+            float4 *snap = (float4 *)(state_snapshot +
+                (uint64_t)token * stride + state_base);
+#pragma unroll
+            for (unsigned c = 0; c < 4u; c++) {
+                if (snap_plain) {
+                    snap[8u * c] = h[c];
+                } else {
+                    __stcs(snap + 8u * c, h[c]);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (unsigned c = 0; c < 4u; c++) {
+        *(float4 *)(state + state_base + 32u * c) = h[c];
+    }
+}
+
 /* Sigmoid-gated RMS output norm.  The weight is a plain scale, not an
  * offset-baked one, so it multiplies the normalised row directly. */
 __global__ static void qwen4exp_gdn_output_kernel(
@@ -943,7 +1053,18 @@ static int qwen4exp_cuda_gdn_run(
     const dim3 recurrence_grid(
         n_value_head, QWEN4EXP_GDN_DIM / 4u, n_rows);
     if (gate_pairs) {
-        if (n_key_head == 16u && n_value_head == 48u &&
+        if (getenv("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE") == NULL &&
+            getenv("DS4_QWEN4EXP_NO_GDN_SPLIT_REDUCE") == NULL) {
+            qwen4exp_gdn_split_reduce_kernel<<<
+                    dim3(n_value_head, QWEN4EXP_GDN_DIM / 16u, n_rows),
+                    QWEN4EXP_GDN_DIM, 0, stream>>>(
+                    (float *)out->ptr, (float *)recurrent_state->ptr, conv_out,
+                    gate_pairs,
+                    state_snapshot ? (float *)state_snapshot->ptr : NULL,
+                    n_key_head, n_value_head, n_rows, n_tokens, head_layout,
+                    n_snapshot_rows,
+                    getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
+        } else if (n_key_head == 16u && n_value_head == 48u &&
             getenv("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE") == NULL) {
             if (getenv("DS4_QWEN4EXP_NO_GDN_VALUE_VECTOR") == NULL) {
                 qwen4exp_gdn_value_reuse_kernel<4u, true><<<
