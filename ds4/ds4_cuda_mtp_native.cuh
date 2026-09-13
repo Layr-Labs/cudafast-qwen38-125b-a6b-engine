@@ -2,9 +2,38 @@
  * Uses the original Q8_0 mapping; no transformed weight storage. New kernels
  * use ordinary stream ordering, not PDL: refinement reads freshly sorted IDs. */
 /* Refinement shortlist. 276 tail rows plus id 0 hold mandatory slots, so this
- * leaves 1771 score-selected candidates: the top 1.8% of the coarse ranking.
- * Narrowing it is a proposal-policy change, not an exact one. */
-static constexpr uint32_t MTP_NATIVE_CAP = 2048u;
+ * leaves CAP-277 score-selected candidates out of the coarse ranking.
+ * Narrowing it is a proposal-policy change, not an exact one.
+ *
+ * 4096, up from 2048, because the coarse cut is measurably MARGINAL. Dropping
+ * the screen depth from 24 groups to 16 lost a draft -- spec_accepted_total
+ * 49/78 -> 48/79, one extra round -- which only happens if the true argmax
+ * sometimes sits close enough to the top-CAP boundary that a noisier coarse
+ * ranking pushes it out. Widening the boundary is the other side of that same
+ * observation, and unlike depth it cannot backfire on quality: the top-4096 set
+ * by coarse key is a strict SUPERSET of the top-2048, every row in it gets the
+ * same exact full-80-group dot, and the winner is the argmax over those exact
+ * scores. So the proposal moves monotonically closer to the full head's argmax;
+ * acceptance can rise or stay, never fall.
+ *
+ * The economics are the inverse of the depth trade, and that is the point.
+ * Rounds are the expensive unit here: 81 rounds against 79 for the same 128
+ * emitted tokens is 2.5% of decode, ~185 bips, so ONE recovered acceptance is
+ * worth ~94 bips. This costs only the refinement's own traffic, 2048 -> 4096
+ * rows at 80 groups x 34 B = 5.57 -> 11.14 MB, about -4 bips by the
+ * 0.007%-of-decode-per-MB calibration. Roughly 20:1 in favour, against 7:1
+ * against for cutting depth. The screen still reads 80.4 MB at 24 groups and is
+ * untouched; refinement is the small stage.
+ *
+ * Every buffer scales on its own: ds4_gpu_mtp_native_screen_init reports
+ * *capacity, the caller allocates t_native_ids from it and stores
+ * native_capacity, and a return above that capacity is rejected. The layout's
+ * id_tmp block and the second radix sort are sized from this constant too.
+ *
+ * Output-invariant by construction: the target verifies every draft before
+ * commit, so this only moves which rounds accept, never which tokens are
+ * emitted. */
+static constexpr uint32_t MTP_NATIVE_CAP = 4096u;
 static constexpr uint32_t MTP_NATIVE_DIM = 2560u;
 /* Coarse screen depth; full refinement still uses 80 groups. Pairs 24..31 sit
  * out, and the live_pairs mask already names a partial wave (40 groups left the
