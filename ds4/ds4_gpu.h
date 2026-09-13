@@ -595,7 +595,9 @@ int ds4_gpu_qwen4exp_qsa_split_qkv_tensor(
  * `attn_v` as their own tensors, so one matmul per tensor already lays k and v
  * out the way the attention kernel wants them.  The query row is head-major
  * with the gate interleaved per head, exactly as in the fused row above. */
-/* Fused Q-Prep: split doubled-query, per-head RMS norm, and partial RoPE. */
+/* Fused Q-Prep: split doubled-query, per-head RMS norm, and partial RoPE.
+ * `gate` may be NULL: Q RMS/RoPE still write, the interleaved gate half is
+ * left in `doubled` for `ds4_gpu_qwen4exp_qsa_output_gate_interleaved_tensor`. */
 /* Q, gate, K/V caches, optional K; doubled Q, raw K/V, Q/K norms, inv_freq. */
 int ds4_gpu_qwen4exp_qsa_prep_joint_dpos_tensor(
         ds4_gpu_tensor *const out[5], const ds4_gpu_tensor *const in[6],
@@ -831,11 +833,21 @@ int ds4_gpu_qwen4exp_qsa_attention_tensor(
         uint32_t              max_selected,
         float                 scale);
 
-/* `out *= sigmoid(gate)`, the gate carried by the doubled `q_proj`. */
+/* `out *= sigmoid(gate)`, the gate carried by the doubled `q_proj`.
+ * Packed: `gate` is [n_tokens, n_head, head_dim], one value per `out` lane. */
 int ds4_gpu_qwen4exp_qsa_output_gate_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *gate,
         uint32_t              n_values);
+
+/* Same sigmoid/multiply as the packed form.  `doubled` is the head-major
+ * interleaved q_proj row ([q | gate] per head); `n_values` is the packed
+ * width `n_tokens * n_head * head_dim`. */
+int ds4_gpu_qwen4exp_qsa_output_gate_interleaved_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *doubled,
+        uint32_t              n_values,
+        uint32_t              head_dim);
 
 int ds4_gpu_indexer_top1_value_tensor(
         ds4_gpu_tensor       *selected,

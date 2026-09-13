@@ -1531,6 +1531,19 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
         return false;
     }
 
+    /* Prefill (wider than a captured verify) reads the gate half from
+     * qsa_doubled and skips the packed qsa_gate store.  Decode/verify keep
+     * the materialized pointer the capture recorded.  The valve restores
+     * that store.  Derived from Metal no-concat/split-input (97010edf,
+     * PB-287); CUDA joint prep/PB-177 is the base. */
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    const int qsa_gate_view =
+        n_tokens > (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
+        getenv("DS4_QWEN4EXP_NO_QSA_GATE_VIEW") == NULL;
+#else
+    const int qsa_gate_view = 0;
+#endif
+
     /* Projections.  q is DOUBLED: half query, half output gate. */
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (n_tokens<=2u && getenv("DS4_QWEN4EXP_NO_QSA_Q8_TRIPLE")==NULL) {
@@ -1578,9 +1591,9 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
     {
         /* Fused Q-Prep: split doubled-query, per-head RMS norm, and RoPE in 1 launch */
         if (!ds4_gpu_qwen4exp_qsa_prep_q_fused_dpos_tensor(
-                s->qsa_q, s->qsa_gate, s->qsa_doubled, s->attn_q_norm[il],
-                s->inv_freq, n_tokens, DS4_N_HEAD, head_dim, DS4_N_ROT, pos0,
-                DS4_RMS_EPS, l->attn_q_norm_offset, s->d_pos)) {
+                s->qsa_q, qsa_gate_view ? NULL : s->qsa_gate, s->qsa_doubled,
+                s->attn_q_norm[il], s->inv_freq, n_tokens, DS4_N_HEAD, head_dim,
+                DS4_N_ROT, pos0, DS4_RMS_EPS, l->attn_q_norm_offset, s->d_pos)) {
             fprintf(stderr, "ds4: qwen4exp fused Q-prep failed at block %u\n", il);
             return false;
         }
@@ -1673,8 +1686,17 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
              * captured replays included (the island captures only there);
              * above it the selection caps the count. */
             indexed ? max_selected : (uint32_t)DS4_N_INDEXER_TOP_K) ||
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        !(qsa_gate_view
+              ? ds4_gpu_qwen4exp_qsa_output_gate_interleaved_tensor(
+                    s->qsa_out, s->qsa_doubled, n_tokens * q_width, head_dim)
+              : ds4_gpu_qwen4exp_qsa_output_gate_tensor(
+                    s->qsa_out, s->qsa_gate, n_tokens * q_width))
+#else
         !ds4_gpu_qwen4exp_qsa_output_gate_tensor(s->qsa_out, s->qsa_gate,
-                                                 n_tokens * q_width)) {
+                                                 n_tokens * q_width)
+#endif
+        ) {
         fprintf(stderr, "ds4: qwen4exp QSA attention failed at block %u\n", il);
         return false;
     }

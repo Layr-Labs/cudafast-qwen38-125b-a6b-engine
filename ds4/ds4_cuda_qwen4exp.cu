@@ -9392,8 +9392,10 @@ __global__ static void qwen4exp_rope_head_kernel(
  * Fused Q-Prep & KV-Prep Kernels for QSA Attention
  * ========================================================================= */
 
-/* Part 0/1: standalone Q/KV; Part 2: joint grid, same per-head arithmetic. */
-template<int Part, bool KVFirst=false>
+/* Part 0/1: standalone Q/KV; Part 2: joint grid, same per-head arithmetic.
+ * WriteGate is the packed qsa_gate store.  Prefill can skip it and let the
+ * output-gate kernel read the interleaved half from `doubled` instead. */
+template<int Part, bool KVFirst=false, bool WriteGate=true>
 __global__ static void qwen4exp_qsa_prep_joint_kernel(
         const float *doubled,const float *raw_k,const float *raw_v,
         const float *qw,const float *kw,const float *inv_freq,
@@ -9414,8 +9416,8 @@ __global__ static void qwen4exp_qsa_prep_joint_kernel(
     float raw=0.0f;
     if(tid<head_dim){
         raw=is_q?doubled[src]:raw_k[src];
-        if(is_q)gate_out[at]=doubled[src+head_dim];
-        else if(pos<cache_cap)v_cache[(uint64_t)pos*width+head*head_dim+tid]=raw_v[at];
+        if(WriteGate && is_q)gate_out[at]=doubled[src+head_dim];
+        else if(!is_q && pos<cache_cap)v_cache[(uint64_t)pos*width+head*head_dim+tid]=raw_v[at];
     }
     shared[tid]=tid<head_dim?raw*raw:0.0f;
     __syncthreads();
@@ -11231,6 +11233,20 @@ __global__ static void qwen4exp_qsa_output_gate_kernel(
     out[gid] = out[gid] * (1.0f / (1.0f + expf(-gate[gid])));
 }
 
+/* Prefill twin: `gate` is the doubled q_proj row, head-major [q | gate].
+ * Packed lane `gid` at remainder `d` reads doubled[2*gid - d + head_dim].
+ * The sigmoid/multiply matches the packed kernel one for one. */
+__global__ static void qwen4exp_qsa_output_gate_view_kernel(
+        const float *doubled,
+        float *out,
+        uint32_t n_values,
+        uint32_t head_dim) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= n_values) return;
+    const uint32_t d = (uint32_t)(gid % head_dim);
+    out[gid] = out[gid] * (1.0f / (1.0f + expf(-doubled[2ull * gid - d + head_dim])));
+}
+
 /* Largest power of two that is <= `value` and <= 1024, the CUDA block cap. */
 static uint32_t qwen4exp_cuda_threads(uint32_t value) {
     uint32_t nth = 1;
@@ -11442,7 +11458,7 @@ extern "C" int ds4_gpu_qwen4exp_qsa_prep_q_fused_dpos_tensor(
         rot_dim > head_dim || (rot_dim % 2u) != 0u) return 0;
     const uint64_t q_elems = (uint64_t)n_tokens * n_head * head_dim;
     if (!glm53_cuda_tensor_has(q, q_elems, sizeof(float)) ||
-        !glm53_cuda_tensor_has(gate, q_elems, sizeof(float)) ||
+        (gate && !glm53_cuda_tensor_has(gate, q_elems, sizeof(float))) ||
         !glm53_cuda_tensor_has(doubled, 2u * q_elems, sizeof(float)) ||
         !glm53_cuda_tensor_has(weight, head_dim, sizeof(float)) ||
         !glm53_cuda_tensor_has(inv_freq, rot_dim / 2u, sizeof(float))) {
@@ -11450,11 +11466,20 @@ extern "C" int ds4_gpu_qwen4exp_qsa_prep_q_fused_dpos_tensor(
     }
     const dim3 grid(n_head, n_tokens);
     const uint32_t nth = qwen4exp_cuda_threads(head_dim);
-    qwen4exp_qsa_prep_joint_kernel<0><<<grid,nth,nth*sizeof(float),cuda_decode_stream()>>>(
-            (const float*)doubled->ptr,NULL,NULL,(const float*)weight->ptr,NULL,
-            (const float*)inv_freq->ptr,(float*)q->ptr,(float*)gate->ptr,NULL,NULL,NULL,
-            n_tokens,n_head,0,head_dim,rot_dim,pos0,0,eps,weight_offset,0.0f,
-            d_pos?(const uint32_t*)d_pos->ptr:NULL);
+    const float *dptr = (const float *)doubled->ptr;
+    const float *wptr = (const float *)weight->ptr;
+    const float *fptr = (const float *)inv_freq->ptr;
+    float *qptr = (float *)q->ptr;
+    const uint32_t *pptr = d_pos ? (const uint32_t *)d_pos->ptr : NULL;
+    if (gate) {
+        qwen4exp_qsa_prep_joint_kernel<0><<<grid,nth,nth*sizeof(float),cuda_decode_stream()>>>(
+                dptr,NULL,NULL,wptr,NULL,fptr,qptr,(float*)gate->ptr,NULL,NULL,NULL,
+                n_tokens,n_head,0,head_dim,rot_dim,pos0,0,eps,weight_offset,0.0f,pptr);
+    } else {
+        qwen4exp_qsa_prep_joint_kernel<0,false,false><<<grid,nth,nth*sizeof(float),cuda_decode_stream()>>>(
+                dptr,NULL,NULL,wptr,NULL,fptr,qptr,NULL,NULL,NULL,NULL,
+                n_tokens,n_head,0,head_dim,rot_dim,pos0,0,eps,weight_offset,0.0f,pptr);
+    }
     return cuda_ok(cudaGetLastError(), "Qwen4-Exp fused Q-prep launch");
 }
 
@@ -12041,6 +12066,22 @@ extern "C" int ds4_gpu_qwen4exp_qsa_output_gate_tensor(
         (unsigned)((n_values + 255u) / 256u), 256u, 0, cuda_decode_stream()>>>(
             (const float *)gate->ptr, (float *)out->ptr, n_values);
     return cuda_ok(cudaGetLastError(), "Qwen4-Exp QSA output gate launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_qsa_output_gate_interleaved_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *doubled,
+        uint32_t              n_values,
+        uint32_t              head_dim) {
+    if (n_values == 0u || head_dim == 0u || (n_values % head_dim) != 0u ||
+        !glm53_cuda_tensor_has(out, n_values, sizeof(float)) ||
+        !glm53_cuda_tensor_has(doubled, 2ull * n_values, sizeof(float))) {
+        return 0;
+    }
+    qwen4exp_qsa_output_gate_view_kernel<<<
+        (unsigned)((n_values + 255u) / 256u), 256u, 0, cuda_decode_stream()>>>(
+            (const float *)doubled->ptr, (float *)out->ptr, n_values, head_dim);
+    return cuda_ok(cudaGetLastError(), "Qwen4-Exp QSA output gate view launch");
 }
 
 /* =========================================================================
