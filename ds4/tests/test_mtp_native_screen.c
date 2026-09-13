@@ -113,8 +113,25 @@ static void run_case(int adversarial, uint32_t offset) {
             for(unsigned i=1;i<CAP-TAIL;i++) need(found[i]==i,"coarse tie lowest ID");
         }
     }
-    /* Map original IDs, reject bad packed IDs, and preserve legacy NaN0. */
     uint32_t packed=CAP-1,mapped=0;
+    /* The device policy may now fold the packed-to-original lookup into its
+     * top-2 reduction.  Exercise both the ordinary winner and conservative
+     * runner-up paths before checking the legacy standalone mapper. */
+    for(unsigned i=0;i<CAP;i++) selected[i]=-INFINITY;
+    selected[7]=20.0f;selected[9]=19.9f;
+    need(ds4_gpu_tensor_write(out,0,selected,sizeof selected),"policy logits");
+    need(ds4_gpu_mtp_top2_policy_tensor(winner,out,ids,CAP,1,0,VOCAB,0.0f,18.75f)&&
+         ds4_gpu_tensor_read(winner,0,&mapped,4)&&mapped==found[7],"fused winner map");
+    need(ds4_gpu_mtp_top2_policy_tensor(winner,out,ids,CAP,1,0,VOCAB,0.15f,18.75f)&&
+         ds4_gpu_tensor_read(winner,0,&mapped,4)&&mapped==found[9],"fused runner-up map");
+    selected[0]=NAN;
+    need(ds4_gpu_tensor_write(out,0,selected,sizeof selected)&&
+         ds4_gpu_mtp_top2_policy_tensor(winner,out,ids,CAP,1,0,VOCAB,0.15f,18.75f)&&
+         ds4_gpu_tensor_read(winner,0,&mapped,4)&&mapped==found[0],"fused NaN0 pin");
+    selected[0]=-INFINITY;
+    need(ds4_gpu_tensor_write(out,0,selected,sizeof selected),"restore policy logits");
+
+    /* Map original IDs, reject bad packed IDs, and preserve legacy NaN0. */
     need(ds4_gpu_tensor_write(winner,0,&packed,4)&&ds4_gpu_mtp_native_map(winner,out,ids,CAP,VOCAB)&&ds4_gpu_tensor_read(winner,0,&mapped,4),"winner map");
     need(mapped==VOCAB-1,"mapped tail ID");
     packed=CAP;

@@ -406,6 +406,12 @@ typedef struct {
     int (*draft_rows)(void *ctx, const int *next_tokens, const float *hc_rows,
                       uint32_t pos0, uint32_t n, int *draft_out,
                       float *multi_out);
+
+    /* Optional diagnostic confidence for the most recent draft callback.
+     * The production head reports its top-1 minus top-2 logit margin. */
+    int (*draft_confidence)(void *ctx, float *margin_out,
+                            float *top_logit_out, float *second_logit_out,
+                            int *second_id_out);
 } ds4_qwen4exp_mtp_model;
 
 /* ------------------------------------------------------------------------
@@ -472,6 +478,15 @@ typedef struct {
     /* The carried chain, pending[0] first.  pending[k] is the head's guess at
      * the token k + 1 places after `pending_parent`. */
     int      pending[DS4_QWEN4EXP_IMPLEMENTED_DEPTH];
+    float    pending_confidence[DS4_QWEN4EXP_IMPLEMENTED_DEPTH];
+    float    pending_top_logit[DS4_QWEN4EXP_IMPLEMENTED_DEPTH];
+    float    pending_second_logit[DS4_QWEN4EXP_IMPLEMENTED_DEPTH];
+    int      pending_second_id[DS4_QWEN4EXP_IMPLEMENTED_DEPTH];
+    bool     pending_confidence_valid[DS4_QWEN4EXP_IMPLEMENTED_DEPTH];
+    float    confidence_skip_threshold; /* 0 disables the research policy */
+    float    confidence_skip_top_threshold; /* upper top-logit guard */
+    float    second_margin_threshold; /* 0 disables second-choice drafting */
+    float    second_logit_threshold;  /* lower runner-up-logit guard */
     int      n_pending;      /* 0 when nothing is carried                   */
     int      pending_parent; /* the token the chain was drafted from        */
     /* Head cache rows the cycle has written: rows [0, head_rows).  The chain
@@ -783,7 +798,23 @@ typedef struct {
     ds4_gpu_tensor *t_logits_prefix;
     ds4_gpu_tensor *t_logits_tail;
     ds4_gpu_tensor *t_top1;
+    ds4_gpu_tensor *t_top_values;
     uint32_t       *top1_host;
+    float           top_values_host[2];
+    float           last_draft_margin;
+    int             last_draft_second_id;
+    bool            last_draft_margin_valid;
+    /* Depth-1 scored runs choose the guarded runner-up in the GPU reducer and
+     * read back one id. Diagnostic/deeper runs retain the richer CPU seam;
+     * DS4_MTP_NO_DEVICE_SECOND selects that exact seam for paired checks. */
+    bool            device_second_policy;
+    /* Native shortlist ids are normally mapped inside the policy reducer.
+     * DS4_MTP_NO_DEVICE_SECOND_MAP keeps the old tiny mapping launch as a
+     * same-binary performance control without changing the chosen proposal. */
+    bool            device_second_map;
+    bool            collect_draft_confidence;
+    float           second_margin_threshold;
+    float           second_logit_threshold;
 } ds4_qwen4exp_mtp_head;
 
 /*

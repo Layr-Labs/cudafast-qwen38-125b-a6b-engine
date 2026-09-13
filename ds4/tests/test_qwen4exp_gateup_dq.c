@@ -1,5 +1,5 @@
 /* A/B byte test for the q4_K slice-parity weight staging valve and the q5_1
- * word-direct down staging valve.
+ * word-direct down staging valve, with and without packed-word prefetch.
  *
  * DS4_QWEN4EXP_NO_GATEUP_DQ stands the q4_K-specialised
  * qwen4exp_moe_gateup_mma_kernel staging down and runs the per-group staging
@@ -33,6 +33,7 @@
 enum { D = 256, O = 256, CAP = 1024, GUARD = 64 };
 static const char *const valve = "DS4_QWEN4EXP_NO_GATEUP_DQ";
 static const char *const valve2 = "DS4_QWEN4EXP_NO_DOWN_DQ";
+static const char *const prefetch_valve = "DS4_QWEN4EXP_NO_DOWN_MMA_PREFETCH";
 static uint32_t rng = 0x6b13c7a5u;
 static unsigned comparisons;
 static uint32_t random_word(void) {
@@ -100,21 +101,22 @@ static void check_case(unsigned gt, unsigned dt, unsigned experts,
     &gate,&up,&down,k,D,O,routes,weights,experts,used,x,W,stride),"routed MoE")
 #define POISON() do { for(unsigned pj=0;pj<3;pj++) \
     require(ds4_gpu_tensor_write(out[pj],0,poison[pj],bytes[pj]),"output poison"); } while(0)
-/* GU/DN = 1 leaves that valve set (the staging the kernel has always had),
- * 0 clears it (the new staging).  Both legs leave both valves in a defined
- * state. */
-#define LEG(GU, DN) do { \
+/* GU/DN/PF = 1 disables that optimization. Each leg explicitly selects
+ * both decoders and the optional next-chunk packed-word register prefetch. */
+#define LEG(GU, DN, PF) do { \
     if ((GU)) require(setenv(valve, "1", 1) == 0, "valve dispatch"); \
     else require(unsetenv(valve) == 0, "valve dispatch"); \
     if ((DN)) require(setenv(valve2, "1", 1) == 0, "valve dispatch"); \
     else require(unsetenv(valve2) == 0, "valve dispatch"); \
+    if ((PF)) require(setenv(prefetch_valve, "1", 1) == 0, "prefetch dispatch"); \
+    else require(unsetenv(prefetch_valve) == 0, "prefetch dispatch"); \
     POISON(); INVOKE(width); \
 } while (0)
     const unsigned widths[] = {8, 63, 64, 65, 257, CAP};
     const float scale[] = {0.2f, 1e-30f, 1e6f, 0.0f};
     for (unsigned wi = 0; wi < sizeof(widths)/sizeof(widths[0]); wi++) {
         const unsigned width = widths[wi];
-        for (unsigned trial = 0; trial < 3; trial++) {
+        for (unsigned trial = 0; trial < 4; trial++) {
             memset(xh, 0xa6, xp_bytes); memset(rh, 0xb7, rb + GUARD); memset(wh, 0xc8, rb + GUARD);
             float *values = (float *)(xh + xp_offset), *w = (float *)wh;
             int32_t *ids = (int32_t *)rh;
@@ -131,14 +133,16 @@ static void check_case(unsigned gt, unsigned dt, unsigned experts,
             }
             require(ds4_gpu_tensor_write(xp,0,xh,xp_bytes) && ds4_gpu_tensor_write(routes,0,rh,rb+GUARD) &&
                     ds4_gpu_tensor_write(weights,0,wh,rb+GUARD), "input upload");
-            /* Both valves set first: both stagings as they were.  Then each
-             * new arm alone, and both together, against those bytes. */
-            LEG(1, 1);
+            /* Original staging is the oracle. Compare word-direct staging
+             * alone and with prefetch, including its unaligned fallback. */
+            LEG(1, 1, 1);
             for (unsigned j = 0; j < 3; j++)
                 require(ds4_gpu_tensor_read(out[j],0,expected[j],bytes[j]), "baseline arm output");
-            const unsigned legs[3][2] = {{0,1},{1,0},{0,0}};
-            for (unsigned li = 0; li < 3; li++) {
-                LEG(legs[li][0], legs[li][1]);
+            const unsigned legs[][3] = {
+                {0,1,1}, {1,0,1}, {0,0,1}, {1,0,0}, {0,0,0}
+            };
+            for (unsigned li = 0; li < sizeof(legs)/sizeof(legs[0]); li++) {
+                LEG(legs[li][0], legs[li][1], legs[li][2]);
                 for (unsigned j = 0; j < 3; j++) {
                     require(ds4_gpu_tensor_read(out[j],0,got[j],bytes[j]), "arm output");
                     if (memcmp(expected[j],got[j],bytes[j])) {
@@ -280,6 +284,6 @@ int main(void) {
     check_case(13, 8, 512, 0, 256);
     shared_case(256);
     shared_case(512);
-    printf("gate/up + down dq valve A/B: %u complete-buffer comparisons PASS\n",comparisons);
+    printf("gate/up + down dq/prefetch A/B: %u complete-buffer comparisons PASS\n",comparisons);
     return 0;
 }
