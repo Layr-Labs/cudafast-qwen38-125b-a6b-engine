@@ -1029,6 +1029,85 @@ typedef struct {
     int                           ok;
 } qw_ple_gather_seg;
 
+/* Ask the kernel to start every n-gram row read at once.
+ *
+ * The gather is 16 random 90-byte reads per token out of the 26.8 GiB
+ * SSD-mapped table, and the comment above this section already names what
+ * dominates a cold chunk: the fault latency, not the dequant.  Faulting the
+ * rows one at a time serializes that latency -- read n+1 does not start until
+ * read n has landed -- and the row ids for a whole call are known before the
+ * first of them is touched.  Naming them all up front lets the reads queue and
+ * overlap, so the gather that follows walks a warm page cache instead of
+ * stalling sixteen times per token.
+ *
+ * This moves no data into the model.  posix_madvise() changes WHEN a page
+ * arrives, never what it holds, so every dequant reads the same bytes and the
+ * forward stays bit-identical; the verify cannot drift from a serial decode
+ * because of it.  A failure is ignored on purpose -- the row is then simply
+ * faulted the old way, which is the behaviour before this call existed.
+ *
+ * The mapping is advised POSIX_MADV_RANDOM at bind so that one fault does not
+ * drag in a readahead cluster the step never uses.  Naming exact rows here is
+ * the complement of that and not a reversal: it still asks for nothing the
+ * step is not about to read. */
+static void qw_ple_prefetch_rows(const ds4_qwen4exp_ple_table *ple,
+                                 const uint64_t *ids, size_t count) {
+#if defined(POSIX_MADV_WILLNEED)
+    if (!ple || !ple->base || !ids || ple->row_bytes == 0u) return;
+    const long pagesz = sysconf(_SC_PAGESIZE);
+    if (pagesz <= 0) return;
+    const uintptr_t page = (uintptr_t)pagesz;
+    for (size_t i = 0; i < count; i++) {
+        const uint64_t row = ids[i];
+        if (row >= ple->rows) continue;
+        const uintptr_t p =
+            (uintptr_t)ple->base + (uintptr_t)(row * ple->row_bytes);
+        const uintptr_t a = p - (p % page);
+        size_t len = (size_t)(p - a) + (size_t)ple->row_bytes;
+        len = (len + (size_t)page - 1u) / (size_t)page * (size_t)page;
+        (void)posix_madvise((void *)a, len, POSIX_MADV_WILLNEED);
+    }
+#else
+    (void)ple;
+    (void)ids;
+    (void)count;
+#endif
+}
+
+/* The same thing for one prefill segment, which interleaves its ids with its
+ * gather and so cannot hand a finished id list to the helper above.
+ *
+ * This is a PRE-PASS and deliberately not a restructuring of the scan below.
+ * It runs on a COPY of the segment's entry history and throws its ids away,
+ * so the scan is left byte-for-byte as it was and the only observable effect
+ * is that its faults have already been started.  Recomputing the hashes costs
+ * a few hundred integer multiplies against a page fault each, which is the
+ * trade this whole function exists to make.
+ *
+ * Chunked so the scratch stays a fixed 4 KiB regardless of segment width; a
+ * one-thread call can carry the full prefill width, and that must not become a
+ * 128 KiB stack frame.  ds4_ple_row_ids' contract is that a run of calls names
+ * the same rows one long call would, so chunking names the same rows too. */
+static void qw_ple_prefetch_segment(const qw_ple_gather_seg *seg,
+                                    const ds4_ple_history *entry) {
+#if defined(POSIX_MADV_WILLNEED)
+    enum { QW_PLE_PREFETCH_CHUNK = 32u };
+    uint64_t ids[QW_PLE_PREFETCH_CHUNK * DS4_N_PLE_HEAD];
+    ds4_ple_history h = *entry;
+    for (uint32_t t = seg->t0; t < seg->t1; t += QW_PLE_PREFETCH_CHUNK) {
+        uint32_t n = seg->t1 - t;
+        if (n > (uint32_t)QW_PLE_PREFETCH_CHUNK) {
+            n = (uint32_t)QW_PLE_PREFETCH_CHUNK;
+        }
+        ds4_ple_row_ids(&seg->s->ple_constants, &h, seg->tokens + t, n, ids);
+        qw_ple_prefetch_rows(seg->ple, ids, (size_t)n * DS4_N_PLE_HEAD);
+    }
+#else
+    (void)seg;
+    (void)entry;
+#endif
+}
+
 static void *qw_ple_gather_worker(void *arg) {
     qw_ple_gather_seg *seg = (qw_ple_gather_seg *)arg;
     ds4_ple_history local;
@@ -1055,6 +1134,8 @@ static void *qw_ple_gather_worker(void *arg) {
         ds4_ple_history_reset(&seg->s->ple_constants, &local);
     }
     seg->ok = 1;
+    /* Start this segment's reads before the scan blocks on the first one. */
+    qw_ple_prefetch_segment(seg, &local);
     for (uint32_t t = seg->t0; t < seg->t1; t++) {
         ds4_ple_row_ids(&seg->s->ple_constants, &local, seg->tokens + t, 1u,
                         seg->s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD);
@@ -1222,6 +1303,13 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 s->ple_history_rows[t] = s->ple_history;
             }
         }
+        /* The speculative width is two rows, so this is 32 scattered reads and
+         * the loop above has already named all of them.  It is also the leg the
+         * composite weights at 0.75, and unlike the prefill scan it gets no
+         * worker pool -- two tokens are not worth a spawn -- so serialized
+         * fault latency is the whole cost here.  Start them together. */
+        qw_ple_prefetch_rows(&w->ple, s->ple_ids,
+                             (size_t)n_tokens * DS4_N_PLE_HEAD);
         for (uint32_t t = 0; t < n_tokens; t++) {
             for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
                 const uint64_t row =
@@ -1264,6 +1352,9 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
         if (nthreads == 1) {
             ds4_ple_row_ids(&s->ple_constants, &s->ple_history, tokens,
                             n_tokens, s->ple_ids);
+            /* One batched id call already produced the whole list. */
+            qw_ple_prefetch_rows(&w->ple, s->ple_ids,
+                                 (size_t)n_tokens * DS4_N_PLE_HEAD);
             for (uint32_t t = 0; t < n_tokens; t++) {
                 for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
                     const uint64_t row =
