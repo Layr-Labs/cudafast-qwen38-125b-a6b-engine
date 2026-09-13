@@ -4494,7 +4494,7 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
     }
 }
 
-template <int R, int DownType = -1, bool Vector = false>
+template <int R, int DownType = -1, bool Vector = false, bool Stage = false>
 __global__ static void qwen4exp_shared_down_q_kernel(
         float *out,
         const char *down,
@@ -4510,10 +4510,29 @@ __global__ static void qwen4exp_shared_down_q_kernel(
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t row = blockIdx.x * 8u + (threadIdx.x >> 5u);
     const uint32_t tok0 = blockIdx.y * (uint32_t)R;
+    /* (Stage) The block's eight rows are 8 * down_row_bytes CONSECUTIVE bytes
+     * of the one shared-expert slab, so stage them with coalesced 16-byte
+     * copies and decode out of shared.  Host selects this arm only when
+     * out_dim % 8 == 0 and (8 * row_bytes) % 16 == 0, so every lane reaches
+     * the barrier and the copy stays in bounds.  Static shared keeps the
+     * launch configuration unchanged; 340 uint4 = 5440 B covers the widest
+     * live row (680 B for q8_0). */
+    __shared__ __align__(16) uint4 sdpan[Stage ? 340u : 1u];
+    if (Stage) {
+        const uint4 *sd_src = (const uint4 *)(const void *)
+            (down + (uint64_t)blockIdx.x * 8u * down_row_bytes);
+        for (uint64_t i = threadIdx.x; i < (8u * down_row_bytes) / 16u;
+             i += blockDim.x)
+            sdpan[i] = sd_src[i];
+        __syncthreads();
+    }
     if (row >= out_dim || tok0 >= n_tokens) return;
     const uint32_t take = n_tokens - tok0 < (uint32_t)R ? n_tokens - tok0
                                                         : (uint32_t)R;
-    const char *down_row = down + (uint64_t)row * down_row_bytes;
+    const char *down_row = Stage
+        ? (const char *)(const void *)sdpan +
+          (uint64_t)(threadIdx.x >> 5u) * down_row_bytes
+        : down + (uint64_t)row * down_row_bytes;
 
     float acc[R];
 #pragma unroll
@@ -7364,32 +7383,44 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
  * triggers inside its grid bound at those widths, and the kernel's
  * weight-group prefetch rides that window (ds4_cuda_qwen4exp.cuh).  Verify
  * and prefill keep the plain launch. */
-#define QWEN4EXP_SH_DOWN_IMPL(R, DT, V) do { \
+#define QWEN4EXP_SH_DOWN_IMPL(S, R, DT, V) do { \
     if (n_tokens <= 2u) { \
         QWEN4EXP_LAUNCH_PDL( \
-                (qwen4exp_shared_down_q_kernel<R, DT, V>), \
+                (qwen4exp_shared_down_q_kernel<R, DT, V, S>), \
                 (dim3((out_dim + 7u) / 8u, tiles, 1)), \
                 threads, 0, stream, \
                 (float *)out->ptr, down, mq, ms, msum, \
                 (const float *)gate_scale->ptr, down_slab->row_bytes, \
                 down_slab->type, mgroups, out_dim, n_tokens); \
     } else { \
-        qwen4exp_shared_down_q_kernel<R, DT, V> \
+        qwen4exp_shared_down_q_kernel<R, DT, V, S> \
             <<<dim3((out_dim + 7u) / 8u, tiles, 1), threads, 0, stream>>>( \
                     (float *)out->ptr, down, mq, ms, msum, \
                     (const float *)gate_scale->ptr, down_slab->row_bytes, \
                     down_slab->type, mgroups, out_dim, n_tokens); \
     } \
 } while (0)
+    /* Same-binary A/B for the shared-expert down panel: eight consecutive
+     * rows of one slab staged through shared. */
+    const bool sh_down_panel =
+        getenv("DS4_QWEN4EXP_NO_SH_DOWN_PANEL") == NULL &&
+        (out_dim % 8u) == 0u &&
+        ((8u * down_slab->row_bytes) % 16u) == 0u &&
+        (8u * down_slab->row_bytes) <= 5440u &&
+        ((uintptr_t)down & 15u) == 0u &&
+        down_slab->type == (uint32_t)DS4_QWEN4EXP_TY_q8_0;
 #define QWEN4EXP_SH_DOWN(R) do { \
+    const bool sh_p = sh_down_panel && (R) == 2; \
     if (specialize_shared && down_slab->type == DS4_QWEN4EXP_TY_q8_0) { \
         if (vector_shared && (((uintptr_t)mq & 15u) == 0u)) { \
-            QWEN4EXP_SH_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q8_0, true); \
+            if (sh_p) { QWEN4EXP_SH_DOWN_IMPL(true, R, DS4_QWEN4EXP_TY_q8_0, true); } \
+            else { QWEN4EXP_SH_DOWN_IMPL(false, R, DS4_QWEN4EXP_TY_q8_0, true); } \
         } else { \
-            QWEN4EXP_SH_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q8_0, false); \
+            if (sh_p) { QWEN4EXP_SH_DOWN_IMPL(true, R, DS4_QWEN4EXP_TY_q8_0, false); } \
+            else { QWEN4EXP_SH_DOWN_IMPL(false, R, DS4_QWEN4EXP_TY_q8_0, false); } \
         } \
     } else { \
-        QWEN4EXP_SH_DOWN_IMPL(R, -1, false); \
+        QWEN4EXP_SH_DOWN_IMPL(false, R, -1, false); \
     } \
 } while (0)
     if (tile == 8) { QWEN4EXP_SH_DOWN(8); }
