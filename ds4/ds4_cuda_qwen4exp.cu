@@ -3693,7 +3693,20 @@ __device__ __forceinline__ static void qwen4exp_shared_vector_accumulate(
  * waits on the slowest of them, so narrowing the block narrows the latency
  * spread it absorbs. Inactive row warps still join barriers. */
 template <int R, int Type, bool Vector = false, unsigned OutputRows = 4>
-__global__ static void qwen4exp_moe_gateup_split_kernel(
+/* OCCUPANCY FLOOR, MEASURED DIRECTION.  With no bound at all nvcc must keep the
+ * kernel launchable at 1024 threads, so it budgets 65536/1024 = 64 registers per
+ * thread whatever the real launch is.  Releasing that cap (a bare
+ * __launch_bounds__(256), submission 1caa0930) cost 1.14% of the decode leg and
+ * 0.50% of prefill: letting the allocator spend above 64 registers dropped
+ * resident blocks from 4 to 3 per SM and the lost memory-level parallelism was
+ * worth more than the spills it avoided.  This kernel holds 64 bytes of shared
+ * memory, so residency here is purely register-limited and the slope runs the
+ * other way too.  (256,5) asks for 65536/(5*256) = 51 registers, i.e. five
+ * resident blocks instead of four -- 1280 of the 1536 threads an SM can hold,
+ * 83% instead of 67%.  The bound stays 256 because the four-row schedule really
+ * does launch 256 threads; the vector schedule decode takes launches 64 and
+ * becomes register-limited at 20 blocks, the same 1280 threads. */
+__global__ __launch_bounds__(256, 5) static void qwen4exp_moe_gateup_split_kernel(
         float *mid,
         const char *gate,
         const char *up,
@@ -3933,7 +3946,14 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
  * one picked its own expert for the slot.  What the tile buys is that the
  * activation groups are read once for R rows and the decode is per group. */
 template <int R, int DownType = -1, bool Vector = false>
-__global__ static void qwen4exp_moe_down_q_kernel(
+/* Same occupancy floor, same reasoning as the split kernel above.  This one holds
+ * no shared memory at all, so 65536/(5*256) = 51 registers is the whole story:
+ * five resident 256-thread blocks per SM instead of the four the implicit
+ * 64-register budget allowed.  This kernel has no barrier in its inner loop, so
+ * unlike the split kernel above nothing here trades against latency spread --
+ * every extra resident warp is straightforwardly another set of outstanding
+ * expert-row loads.  Every extra resident warp is another outstanding expert row. */
+__global__ __launch_bounds__(256, 5) static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
         const int32_t *selected,
