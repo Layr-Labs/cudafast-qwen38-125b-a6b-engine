@@ -128,8 +128,29 @@
  * `multi` row while writing its own, so they cannot be one buffer. */
 #define DS4_QWEN4EXP_MTP_HC_ROWS (DS4_QWEN4EXP_MTP_MAX_COMMIT + 2)
 
-/* Fixed input-workspace bound for native prompt-cache publication. */
-#define DS4_QWEN4EXP_MTP_CACHE_SEED_MAX_ROWS 128u
+/* Fixed input-workspace bound for native prompt-cache publication.
+ *
+ * This bounds the head's INPUT workspace only; logits and final-output scratch
+ * stay sized by max_tokens, and the session buffers the publication hook writes
+ * through (mixed, mixed_q8, qsa_kin/vin, idx_k) are already sized for the
+ * session's full n_batch, so the only cost of widening it is the head's own
+ * input rows: t_tokens, t_embed_rows, t_embed_out, t_e_normed, t_h_normed,
+ * t_ehx and t_hyper, about 195 KiB per row (t_ehx dominates at n_hc * 2 *
+ * n_embd floats).
+ *
+ * At 128 a 1024-token prompt seeds in eight passes, and each pass re-reads the
+ * head's whole input weight set -- eh_proj at 13.9 MiB plus hc_head_down/up,
+ * attn_k, attn_v and indexer_k_proj -- and pays its own eager launch train and
+ * host round trip, all inside the timed prefill window. The seeded cache is a
+ * DRAFT-side structure: the target verifies every drafted token exactly, so the
+ * emitted tokens do not depend on how the prompt is cut into seed passes, only
+ * the schedule does.
+ *
+ * 512 seeds a 1024-token prompt in two passes instead of eight for about 100
+ * MiB of head input workspace. 1024 would make it one pass, but the extra pass
+ * saved is worth ~0.13 ms against another ~100 MiB resident next to 114 GiB of
+ * weights, which is the wrong side of that trade on a 128 GiB box. */
+#define DS4_QWEN4EXP_MTP_CACHE_SEED_MAX_ROWS 512u
 
 /*
  * tools/serve-up.sh sets DS4_MTP_DRAFT_TOKENS = declared draft length + 1,
