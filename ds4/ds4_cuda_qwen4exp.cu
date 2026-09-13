@@ -2760,6 +2760,38 @@ __global__ static void qwen4exp_moe_zero_invalid_kernel(
 #define QW_DOWN_MMA_THREADS (QW_DOWN_MMA_WARPS * 32)
 #define QW_DOWN_MMA_NT (QW_MMA_BN / 8)
 
+/* THE DOWN TILE'S ROW STRIDE, AND WHY IT IS NOT QW_MMA_LD.
+ *
+ * A warp's fragment load reads sA[rr * LD + kk] with rr = warp*16 + (lane>>2)
+ * (+8), so eight distinct rows per warp, and kk = gg*32 + (lane&3)*4 (+16), so
+ * four distinct words per row.  The bank a lane lands on is
+ * ((LD/4) * rr + kk/4) mod 32.
+ *
+ *   LD 132: (LD/4) = 33, so the bank is (33*rr + k) mod 32 = (rr + k) mod 32
+ *           with rr in 0..7 and k in 0..3.  That is eleven distinct banks for
+ *           thirty-two lanes -- rr + k = 3 alone is hit by (0,3) (1,2) (2,1)
+ *           (3,0) -- so the innermost load of the kernel runs at a FOUR-WAY
+ *           bank conflict, and it runs QW_MMA_G times per K chunk per warp.
+ *   LD 144: (LD/4) = 36, so the bank is (36*rr + k) mod 32 = (4*rr + k) mod 32.
+ *           4*rr walks 0,4,...,28 and k fills each gap, so the thirty-two lanes
+ *           cover the thirty-two banks exactly once.  Conflict-free.
+ *
+ * This is the file's own rule, already asserted for the QSP tile as
+ * "ldmatrix rows on distinct banks": (LD/4) % 8 == 4.  144 satisfies it and is
+ * the stride the gate/up tile already uses (GU_LD 144); 132 does not.  The cost
+ * is 64*12 + 32*12 = 1152 more bytes of shared memory, taking this kernel from
+ * ~15.5 to ~16.7 KiB, well under QWEN4EXP_MMA_SMEM_CAP.
+ *
+ * Pure padding: every group slot keeps the same eight words in the same order,
+ * only further apart, so the MMA operands and the result are bit-identical. */
+#define QW_DOWN_MMA_LD 144
+static_assert((QW_DOWN_MMA_LD / 4) % 8 == 4,
+              "down tile fragment rows land on distinct banks");
+static_assert(QW_DOWN_MMA_LD >= QW_MMA_KC,
+              "down tile row holds a whole K chunk");
+static_assert(QW_DOWN_MMA_LD % 16 == 0,
+              "down tile group slots stay sixteen-byte aligned");
+
 /* The pipeline gives every thread exactly one slot of each tile per chunk,
  * which is what makes the one-chunk-deep register prefetch enough. */
 static_assert(QW_MMA_BM * QW_MMA_G == QW_MMA_THREADS,
@@ -3475,8 +3507,8 @@ qwen4exp_moe_down_mma_kernel(
         uint32_t groups,
         uint32_t out_dim,
         uint32_t dq_stage) {
-    __shared__ __align__(16) int8_t sA[QW_DOWN_MMA_BM * QW_MMA_LD];
-    __shared__ __align__(16) int8_t sB[QW_MMA_BN * QW_MMA_LD];
+    __shared__ __align__(16) int8_t sA[QW_DOWN_MMA_BM * QW_DOWN_MMA_LD];
+    __shared__ __align__(16) int8_t sB[QW_MMA_BN * QW_DOWN_MMA_LD];
     __shared__ float  sWA[QW_DOWN_MMA_BM * QW_MMA_G];
     __shared__ float  sWB[QW_DOWN_MMA_BM * QW_MMA_G];
     __shared__ float  sXS[QW_MMA_BN * QW_MMA_G], sXSUM[QW_MMA_BN * QW_MMA_G];
@@ -3540,16 +3572,16 @@ qwen4exp_moe_down_mma_kernel(
                         uint32_t raw[6];
                         dev_qwen4exp_group_decode_w(dtype, drow, g,
                                 qw_raw_load(dtype, drow, g, raw) ? raw : NULL,
-                                &sA[r * QW_MMA_LD + gg * 32], wa, wb);
+                                &sA[r * QW_DOWN_MMA_LD + gg * 32], wa, wb);
                     } else {
                         dev_qwen4exp_group_decode(dtype, drow, g,
                                 wq, wa, wb, &halves);
-                        qw_tile_store_group(&sA[r * QW_MMA_LD + gg * 32], wq);
+                        qw_tile_store_group(&sA[r * QW_DOWN_MMA_LD + gg * 32], wq);
                     }
                     sWA[r * QW_MMA_G + gg] = wa[0];
                     sWB[r * QW_MMA_G + gg] = wb[0];
                 } else {
-                    qw_tile_store_zero(&sA[r * QW_MMA_LD + gg * 32]);
+                    qw_tile_store_zero(&sA[r * QW_DOWN_MMA_LD + gg * 32]);
                     sWA[r * QW_MMA_G + gg] = 0.0f;
                     sWB[r * QW_MMA_G + gg] = 0.0f;
                 }
@@ -3562,12 +3594,12 @@ qwen4exp_moe_down_mma_kernel(
                 const uint32_t p = sPair[tk];
                 if (p != 0xffffffffu && g < groups) {
                     const uint64_t at = (uint64_t)p * groups + g;
-                    qw_tile_copy_group(&sB[tk * QW_MMA_LD + gg * 32],
+                    qw_tile_copy_group(&sB[tk * QW_DOWN_MMA_LD + gg * 32],
                                        mq + at * 32u);
                     sXS  [tk * QW_MMA_G + gg] = ms[at];
                     sXSUM[tk * QW_MMA_G + gg] = (float)msum[at];
                 } else {
-                    qw_tile_store_zero(&sB[tk * QW_MMA_LD + gg * 32]);
+                    qw_tile_store_zero(&sB[tk * QW_DOWN_MMA_LD + gg * 32]);
                     sXS[tk * QW_MMA_G + gg] = 0.0f;
                     sXSUM[tk * QW_MMA_G + gg] = 0.0f;
                 }
@@ -3584,7 +3616,7 @@ qwen4exp_moe_down_mma_kernel(
                 for (int r = 0; r < 4; r++) {
                     const uint32_t rr = ar + ((r & 1) ? 8u : 0u);
                     const uint32_t kk = gg * 32u + ak + ((r & 2) ? 16u : 0u);
-                    af[r] = qw_tile_word(&sA[rr * QW_MMA_LD + kk]);
+                    af[r] = qw_tile_word(&sA[rr * QW_DOWN_MMA_LD + kk]);
                 }
                 const uint32_t m0 = warp * 16u + (lane >> 2);
 #pragma unroll
@@ -3597,7 +3629,7 @@ qwen4exp_moe_down_mma_kernel(
                     const uint32_t bn = nt * 8u + (lane >> 2);
 #pragma unroll
                     for (int r = 0; r < 2; r++) {
-                        bf[r] = qw_tile_word(&sB[bn * QW_MMA_LD + gg * 32u +
+                        bf[r] = qw_tile_word(&sB[bn * QW_DOWN_MMA_LD + gg * 32u +
                                                  (lane & 3u) * 4u +
                                                  (r ? 16u : 0u)]);
                     }
