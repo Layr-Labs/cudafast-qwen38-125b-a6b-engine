@@ -3,6 +3,8 @@
  * Synthetic weights only. Build against the normal CUDA library:
  * cc -O2 -std=c11 -D_GNU_SOURCE -Ids4 ds4/tests/test_qwen4exp_moe_pair_tasks.c \
  *   -L.build/ds4 -lds4qwen -lm -o /tmp/test-moe-pair-tasks
+ * Optional --r3 tests the three-row R=4 dispatch against R=8 instead,
+ * including unchanged neighboring widths and actual graph replays.
  */
 #include "ds4_gpu.h"
 #include <stdint.h>
@@ -13,6 +15,7 @@
 
 enum { K = 256, D = 256, O = 256, CAP = 1024, GUARD = 64 };
 static const char *disable = "DS4_QWEN4EXP_NO_GU_PAIR_TASKS";
+static int r3_mode;
 static uint32_t rng = 0xa231e599u;
 static unsigned comparisons, graph_checks, actual_replays;
 static uint32_t random_word(void) {
@@ -78,9 +81,13 @@ static void check_case(unsigned gt, unsigned dt, unsigned experts, unsigned alig
     &gate,&up,&down,K,D,O,routes,weights,experts,used,x,W,stride),"routed MoE")
 #define POISON(M) do { for(unsigned pj=0;pj<3;pj++) \
     require(ds4_gpu_tensor_write(out[M][pj],0,poison[pj],bytes[pj]),"output poison"); } while(0)
-    const unsigned widths[] = {63, 64, 65, 257, CAP};
+    const unsigned task_widths[] = {63, 64, 65, 257, CAP};
+    const unsigned r3_widths[] = {1, 2, 3, 4, 7, 8};
+    const unsigned *widths = r3_mode ? r3_widths : task_widths;
+    const unsigned n_widths = r3_mode ? sizeof(r3_widths)/sizeof(r3_widths[0])
+                                    : sizeof(task_widths)/sizeof(task_widths[0]);
     const float scale[] = {0.2f, 1e-30f, 1e6f, 0.0f};
-    for (unsigned wi = 0; wi < sizeof(widths)/sizeof(widths[0]); wi++) {
+    for (unsigned wi = 0; wi < n_widths; wi++) {
         const unsigned width = widths[wi];
         ds4_decode_graph_key keys[2]; memset(keys, 0, sizeof(keys));
         for (unsigned m = 0; m < 2; m++) { keys[m].il = m; keys[m].cur_hc = x; keys[m].after_attn_hc = out[m][0]; }
@@ -143,7 +150,12 @@ static void check_case(unsigned gt, unsigned dt, unsigned experts, unsigned alig
     printf("MoE pair tasks gt=%u dt=%u experts=%u offset=%u PASS\n",gt,dt,experts,64+alignment); fflush(stdout);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    require(argc == 1 || (argc == 2 && !strcmp(argv[1], "--r3")), "arguments");
+    if (argc == 2) {
+        r3_mode = 1;
+        disable = "DS4_QWEN4EXP_NO_MOE_R3_TILE4";
+    }
     require(setenv("DS4_CUDA_COPY_MODEL","1",1) == 0 && setenv("DS4_CUDA_DECODE_GRAPHS","1",1) == 0, "test environment");
     const unsigned types[][2] = {{12,7},{13,8},{8,8},{12,14},{14,7}};
     for (unsigned t = 0; t < sizeof(types)/sizeof(types[0]); t++)

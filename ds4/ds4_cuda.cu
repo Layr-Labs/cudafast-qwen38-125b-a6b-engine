@@ -5758,7 +5758,7 @@ __global__ static void matmul_q8_0_preq_rows_exact_tile_kernel(
 /* Two adjacent lanes share a Q8 group. Their integer partials may be
  * combined freely; each even lane keeps its original float group chain.
  * Shared memory remaps the 32 finished chains onto one reduction warp. */
-template <int R, bool Streaming = true>
+template <int R, bool Streaming = true, bool Dependency = true>
 __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
         float *out, const unsigned char *w,
         const int8_t *xq, const float *xscale,
@@ -5812,7 +5812,7 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
             const float ws = Streaming
                 ? __half2float(__ushort_as_half(__ldcs((const uint16_t *)scale)))
                 : __half2float(*scale);
-            QWEN4EXP_PDL_SYNC();
+            if constexpr (Dependency) QWEN4EXP_PDL_SYNC();
 #pragma unroll
             for (int r = 0; r < R; r++) {
                 if ((uint32_t)r < take) {
@@ -15172,6 +15172,109 @@ __global__ static void indexer_top2_value_kernel(
     }
 }
 
+/* The scored MTP path needs the top two values only to choose one proposal.
+ * Reducing through warp shuffles and applying that choice here avoids sending
+ * two ids and two floats to the CPU, synchronising, and then sending the
+ * chosen id back through the rest of the device command stream. The 256-thread
+ * block leaves exactly eight warp leaders for the second reduction stage. */
+__global__ static void mtp_top2_policy_kernel(
+        uint32_t *selected,
+        const float *scores,
+        const uint32_t *native_ids,
+        uint32_t n_comp,
+        uint32_t n_tokens,
+        uint32_t index_offset,
+        uint32_t native_vocab,
+        float margin_threshold,
+        float second_logit_threshold) {
+    const uint32_t t = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (t >= n_tokens || tid >= 256u) return;
+
+    const float *row = scores + (uint64_t)t * n_comp;
+    float best0_v = -INFINITY;
+    float best1_v = -INFINITY;
+    uint32_t best0_i = UINT32_MAX;
+    uint32_t best1_i = UINT32_MAX;
+    for (uint32_t i = tid; i < n_comp; i += 256u) {
+        const uint32_t gi = index_offset + i;
+        top2_insert_candidate(row[i], gi,
+                              &best0_v, &best0_i,
+                              &best1_v, &best1_i);
+    }
+
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+#pragma unroll
+    for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+        const float other0_v = __shfl_down_sync(0xffffffffu, best0_v, offset);
+        const float other1_v = __shfl_down_sync(0xffffffffu, best1_v, offset);
+        const uint32_t other0_i = __shfl_down_sync(0xffffffffu, best0_i, offset);
+        const uint32_t other1_i = __shfl_down_sync(0xffffffffu, best1_i, offset);
+        if (lane + offset < 32u) {
+            top2_insert_candidate(other0_v, other0_i,
+                                  &best0_v, &best0_i,
+                                  &best1_v, &best1_i);
+            top2_insert_candidate(other1_v, other1_i,
+                                  &best0_v, &best0_i,
+                                  &best1_v, &best1_i);
+        }
+    }
+
+    __shared__ float warp_v0[8];
+    __shared__ float warp_v1[8];
+    __shared__ uint32_t warp_i0[8];
+    __shared__ uint32_t warp_i1[8];
+    if (lane == 0u) {
+        warp_v0[warp] = best0_v;
+        warp_v1[warp] = best1_v;
+        warp_i0[warp] = best0_i;
+        warp_i1[warp] = best1_i;
+    }
+    __syncthreads();
+
+    if (warp == 0u) {
+        best0_v = lane < 8u ? warp_v0[lane] : -INFINITY;
+        best1_v = lane < 8u ? warp_v1[lane] : -INFINITY;
+        best0_i = lane < 8u ? warp_i0[lane] : UINT32_MAX;
+        best1_i = lane < 8u ? warp_i1[lane] : UINT32_MAX;
+#pragma unroll
+        for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+            const float other0_v = __shfl_down_sync(0xffffffffu, best0_v, offset);
+            const float other1_v = __shfl_down_sync(0xffffffffu, best1_v, offset);
+            const uint32_t other0_i = __shfl_down_sync(0xffffffffu, best0_i, offset);
+            const uint32_t other1_i = __shfl_down_sync(0xffffffffu, best1_i, offset);
+            if (lane + offset < 32u) {
+                top2_insert_candidate(other0_v, other0_i,
+                                      &best0_v, &best0_i,
+                                      &best1_v, &best1_i);
+                top2_insert_candidate(other1_v, other1_i,
+                                      &best0_v, &best0_i,
+                                      &best1_v, &best1_i);
+            }
+        }
+        if (lane == 0u) {
+            const bool choose_second = margin_threshold > 0.0f &&
+                best0_v - best1_v <= margin_threshold &&
+                best1_v >= second_logit_threshold;
+            uint32_t winner = choose_second ? best1_i : best0_i;
+            if (native_ids) {
+                /* Preserve the native mapper's historical NaN-at-zero
+                 * fallback while folding its packed-to-vocabulary lookup
+                 * into this kernel.  Native screening always uses offset 0,
+                 * so winner is an index into native_ids. */
+                const uint32_t bits = __float_as_uint(row[0]);
+                const uint32_t packed =
+                    (bits & 0x7fffffffu) > 0x7f800000u ? 0u : winner;
+                const uint32_t original =
+                    packed < n_comp ? native_ids[packed] : UINT32_MAX;
+                winner = original < native_vocab ? original : UINT32_MAX;
+            }
+            selected[t] = winner;
+        }
+    }
+}
+
 __device__ __forceinline__ static uint32_t topk_float_ordered_key(float v) {
     const uint32_t u = __float_as_uint(v);
     return (u & 0x80000000u) ? ~u : (u ^ 0x80000000u);
@@ -16234,6 +16337,35 @@ extern "C" int ds4_gpu_indexer_top2_value_tensor(
                                                   n_tokens,
                                                   index_offset);
     return cuda_ok(cudaGetLastError(), "indexer top2 value launch");
+}
+
+extern "C" int ds4_gpu_mtp_top2_policy_tensor(
+        ds4_gpu_tensor       *selected,
+        const ds4_gpu_tensor *scores,
+        const ds4_gpu_tensor *native_ids,
+        uint32_t                n_comp,
+        uint32_t                n_tokens,
+        uint32_t                index_offset,
+        uint32_t                native_vocab,
+        float                   margin_threshold,
+        float                   second_logit_threshold) {
+    if (!selected || !scores || n_comp < 2u || n_tokens == 0 ||
+        !isfinite(margin_threshold) || margin_threshold < 0.0f ||
+        !isfinite(second_logit_threshold) ||
+        scores->bytes < (uint64_t)n_tokens * n_comp * sizeof(float) ||
+        selected->bytes < (uint64_t)n_tokens * sizeof(uint32_t) ||
+        (native_ids &&
+         (index_offset != 0u || native_vocab == 0u ||
+          native_ids->bytes < (uint64_t)n_comp * sizeof(uint32_t) ||
+          ds4_tensor_device_idx(native_ids) != ds4_tensor_device_idx(scores)))) {
+        return 0;
+    }
+    mtp_top2_policy_kernel<<<n_tokens, 256>>>(
+        (uint32_t *)selected->ptr, (const float *)scores->ptr,
+        native_ids ? (const uint32_t *)native_ids->ptr : NULL,
+        n_comp, n_tokens, index_offset, native_vocab,
+        margin_threshold, second_logit_threshold);
+    return cuda_ok(cudaGetLastError(), "MTP top2 policy launch");
 }
 
 extern "C" int ds4_gpu_dsv4_topk_mask_tensor(
@@ -17507,6 +17639,24 @@ static int cuda_matmul_q8_0_preq_rows_exact(
                 (float *)out->ptr, (const unsigned char *)wptr,
                 xq, xscale, n_rows);
         return cuda_ok(cudaGetLastError(), "q8 HC down pair launch");
+    }
+    /* Three-row verification otherwise traverses wide weights twice using
+     * a two-row tile plus its tail. Preserve each row's full group chains,
+     * but hold three accumulators while sharing the one weight traversal.
+     * Keep HC's short-K up and narrow-output down on their existing paths.
+     * No PDL: the three-row quantizer has no programmatic launch trigger. */
+    if (use_dp4a && n_rows == 3u && in_dim >= 1024u && out_dim > 512u &&
+        (in_dim & 31u) == 0u &&
+        getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
+        getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL &&
+        getenv("DS4_QWEN4EXP_NO_Q8_R3") == NULL &&
+        (((uintptr_t)wptr & 1u) == 0u)) {
+        matmul_q8_0_preq_pair_lanes_kernel<3, false, false><<<
+            dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u),
+            256, 0, cuda_decode_stream()>>>(
+                (float *)out->ptr, (const unsigned char *)wptr,
+                xq, xscale, out_dim, n_rows, blocks);
+        return cuda_ok(cudaGetLastError(), "q8 three-row pair lanes launch");
     }
     /* Two lanes read each full group at one/two-row decode widths. Integer
      * partials combine exactly, then the original 32 float chains and warp
@@ -18881,7 +19031,7 @@ struct qwen_gdn_projection_args {
     const int8_t *xq; const float *xscale; const float *x;
     uint64_t od[2]; uint32_t n_rows; uint64_t blocks;
 };
-template<int R>
+template<int R, bool Dependency = true>
 __global__ __launch_bounds__(256)
 static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
     constexpr unsigned B=256u;
@@ -18947,7 +19097,7 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
             const float ws = Streaming
                 ? __half2float(__ushort_as_half(__ldcs((const uint16_t *)scale)))
                 : __half2float(*scale);
-            QWEN4EXP_PDL_SYNC();
+            if constexpr (Dependency) QWEN4EXP_PDL_SYNC();
 #pragma unroll
             for (int r = 0; r < R; r++) {
                 if ((uint32_t)r < take) {
@@ -19046,7 +19196,7 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
             const unsigned at = C * t;
             float wv[C];
             qwen_f32_vector_read<C>(wv, w + col * 2560u + at);
-            QWEN4EXP_PDL_SYNC();
+            if constexpr (Dependency) QWEN4EXP_PDL_SYNC();
 #pragma unroll
             for (int r = 0; r < R; r++) {
                 float xv[C];
@@ -19306,7 +19456,8 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
     a.od[0]=qkv_dim;a.od[1]=gate_dim;a.blocks=blocks;a.n_rows=rows;
     a.xq=(const int8_t *)((const char *)q->ptr+qoff);
     a.xscale=(const float *)((const char *)q->ptr+soff);a.x=(const float *)x->ptr;
-    if (rows<=2u && in_dim==2560u && qkv_dim>512u && gate_dim>512u &&
+    if ((rows<=2u || (rows==3u && getenv("DS4_QWEN4EXP_NO_GDN_R3")==NULL)) &&
+        in_dim==2560u && qkv_dim>512u && gate_dim>512u &&
         cuda_q8_use_dp4a() && getenv("DS4_QWEN4EXP_NO_ROW_TILE")==NULL &&
         getenv("DS4_QWEN4EXP_PAIR_LANES_R2")==NULL &&
         getenv("DS4_F32_NO_VECTOR_DECODE")==NULL &&
@@ -19319,9 +19470,17 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
         if (rows==1u)
             QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1>),
                                 grid, 256, 0, cuda_decode_stream(), a);
-        else
+        else if (rows==2u)
             QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2>),
                                 grid, 256, 0, cuda_decode_stream(), a);
+        else {
+            /* Three-row verify: share each weight read across three intact
+             * row accumulators. The quant/norm producers trigger PDL only at
+             * <=2 rows, so this arm uses ordinary stream ordering and a
+             * kernel with no dependency fence. R1/R2 are unchanged. */
+            qwen_gdn_projection_kernel<3, false><<<
+                grid, 256, 0, cuda_decode_stream()>>>(a);
+        }
         return cuda_ok(cudaGetLastError(),"GDN four projections launch");
     }
     for (unsigned i=0;i<2;i++)

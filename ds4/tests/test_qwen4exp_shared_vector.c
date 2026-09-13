@@ -1,6 +1,8 @@
 /* Complete output/mid/gate-scale and guard comparisons for aligned shared
  * Q8 activation reads. Includes width/shape fallback, actual 0/2-byte device
- * weight residues, changing inputs and real graph replays. Normal library. */
+ * weight residues, changing inputs and real graph replays. Normal library.
+ * --r3 holds the shared-vector choice fixed and compares the three-row R=4
+ * dispatch against the original R=8 dispatch instead. */
 #include "ds4_gpu.h"
 #include <stdint.h>
 #include <stdio.h>
@@ -11,6 +13,7 @@
 enum { TYPE_F32=0, TYPE_Q8_0=8 };
 #define ALIGN64(x) (((uint64_t)(x)+63u)&~63ull)
 static uint32_t rng=0x193d8a7u;
+static const char *disable="DS4_QWEN4EXP_NO_SHARED_VECTOR";
 static uint32_t rng_u32(void){rng^=rng<<13;rng^=rng>>17;rng^=rng<<5;return rng;}
 static float rng_unit(void){return ((int)(rng_u32()%2049u)-1024)*(1.0f/1024.0f);}
 static void require_ok(int ok,const char *message){if(!ok){fprintf(stderr,"shared single: %s\n",message);exit(1);}}
@@ -56,7 +59,7 @@ static void shared_vector_case(unsigned rows, unsigned alignment, unsigned K) {
         for(unsigned m=0;m<M;m++){t[m][j]=ds4_gpu_tensor_alloc(sizes[j]);require_ok(t[m][j]!=NULL,"shared tile output");}
     }
 #define RESET(m) do {for(unsigned j=0;j<3;j++)require_ok(ds4_gpu_tensor_write(t[m][j],0,poison[j],sizes[j]),"shared tile poison");}while(0)
-#define PIN(m) require_ok(((m)?unsetenv("DS4_QWEN4EXP_NO_SHARED_VECTOR"):setenv("DS4_QWEN4EXP_NO_SHARED_VECTOR","1",1))==0,"shared single dispatch")
+#define PIN(m) require_ok(((m)?unsetenv(disable):setenv(disable,"1",1))==0,"shared single dispatch")
 #define RUN(m) require_ok(ds4_gpu_qwen4exp_shared_expert_tensor(t[m][0],t[m][1],t[m][2],&router,&gate,&up,&down,K,D,O,x,rows),"shared tile call")
 #define READ_COMPARE(m, counter) do {for(unsigned j=0;j<3;j++){require_ok(ds4_gpu_tensor_read(t[m][j],0,got[j],sizes[j]),"shared tile output read");if(memcmp(ref[j],got[j],sizes[j])){fprintf(stderr,"SHARED_VECTOR mismatch K=%u rows=%u offset=%u mode=%u buffer=%u\n",K,rows,alignment,m,j);exit(1);}counter++;}}while(0)
     ds4_decode_graph_key keys[M];memset(keys,0,sizeof(keys));
@@ -88,7 +91,9 @@ static void shared_vector_case(unsigned rows, unsigned alignment, unsigned K) {
 #undef RESET
 }
 
-int main(void){
+int main(int argc,char **argv){
+    require_ok(argc==1||(argc==2&&!strcmp(argv[1],"--r3")),"arguments");
+    if(argc==2)disable="DS4_QWEN4EXP_NO_MOE_R3_TILE4";
     require_ok(unsetenv("DS4_QWEN4EXP_MOE_R")==0,"clear forced row tile");
     require_ok(setenv("DS4_CUDA_COPY_MODEL","1",1)==0&&setenv("DS4_CUDA_DECODE_GRAPHS","1",1)==0,"shared tile environment");
     const unsigned widths[]={1,2,3,7,8,65};
@@ -98,5 +103,5 @@ int main(void){
         shared_vector_case(1,a*2,2592);
         shared_vector_case(2,a*2,2592);
     }
-    unsetenv("DS4_QWEN4EXP_NO_SHARED_VECTOR");return 0;
+    unsetenv(disable);return 0;
 }

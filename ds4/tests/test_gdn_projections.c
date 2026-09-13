@@ -1,4 +1,11 @@
-/* GDN projection fusion: independent mappings, complete outputs and changed graphs. */
+/* GDN projection fusion: independent mappings, complete outputs and changed graphs.
+ * Modes: individual one-row-order reference; fusion with R3 disabled; default
+ * fusion, including the new plain-stream R3 launch. All modes compare every
+ * output and unused tail byte, plus immutable activations/quantized scratch.
+ * cc -O2 -std=c11 -Ids4 ds4/tests/test_gdn_projections.c \
+ *    -L.build/ds4 -lds4qwen -lm -o /tmp/test-gdn-projections
+ * LD_LIBRARY_PATH=.build/ds4 /tmp/test-gdn-projections
+ */
 #define _GNU_SOURCE
 #include "ds4_gpu.h"
 #include <stdint.h>
@@ -7,7 +14,7 @@
 #include <string.h>
 #include <sys/mman.h>
 
-enum { SETS=4, CAP=8, MODES=2 };
+enum { SETS=4, CAP=8, MODES=3 };
 static uint32_t rng=0x771ba358u;
 static uint32_t word(void){rng^=rng<<13;rng^=rng>>17;rng^=rng<<5;return rng;}
 static void must(int ok,const char *s){if(!ok){fprintf(stderr,"GDN four projection: %s\n",s);exit(1);}}
@@ -39,6 +46,10 @@ static int four(ds4_gpu_tensor *const outs[4],unsigned i,unsigned rows) {
         in_dim,od[0],od[1],xt[i],qt[i],0,(uint64_t)rows*groups*32u,rows);
 }
 static void operate(unsigned mode,unsigned rows) {
+    if(!mode)setenv("DS4_QWEN4EXP_NO_ROW_TILE","1",1);
+    else unsetenv("DS4_QWEN4EXP_NO_ROW_TILE");
+    if(mode==1u)setenv("DS4_QWEN4EXP_NO_GDN_R3","1",1);
+    else unsetenv("DS4_QWEN4EXP_NO_GDN_R3");
     for(unsigned i=0;i<SETS;i++) {
         if(mode)must(four(yt[mode][i],i,rows),"four projections");
         else {
@@ -134,7 +145,7 @@ static void check_shape(unsigned in,unsigned out0,unsigned out1,unsigned offset)
     unsigned eager=0,captured=0,replayed=0;
     for(unsigned wi=0;wi<4;wi++) {
         unsigned rows=widths[wi];ds4_gpu_decode_graphs_invalidate();
-        ds4_decode_graph_key keys[MODES]={{.il=1},{.il=2}};
+        ds4_decode_graph_key keys[MODES]={{.il=1},{.il=2},{.il=3}};
         for(unsigned trial=0;trial<4;trial++) {
             inputs(rows,scales[trial]);
             for(unsigned m=0;m<MODES;m++){reset(m);operate(m,rows);eager+=compare(m);}
@@ -148,6 +159,8 @@ static void check_shape(unsigned in,unsigned out0,unsigned out1,unsigned offset)
     }
     printf("GDN_FOUR_CHECK in=%u out0=%u out1=%u offset=%u sets=4 eager_buffers=%u graph_buffers=%u changed_replays=%u PASS\n",in,out0,out1,offset,eager,captured,replayed);fflush(stdout);
     ds4_gpu_decode_graphs_invalidate();
+    unsetenv("DS4_QWEN4EXP_NO_ROW_TILE");
+    unsetenv("DS4_QWEN4EXP_NO_GDN_R3");
     for(unsigned i=0;i<SETS;i++) {
         ds4_gpu_tensor_free(xt[i]);ds4_gpu_tensor_free(qt[i]);free(xhost[i]);free(qref[i]);
         for(unsigned b=0;b<4;b++) {

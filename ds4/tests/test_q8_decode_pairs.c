@@ -54,33 +54,37 @@ static void check_shape(uint64_t in, uint64_t out, uint64_t offset) {
         const uint32_t n = widths[c];
         /* The existing override selects the original per-row kernel, even
          * when the normal path uses a two-lane pair or a wider row tile. */
-        for (int pass = 0; pass < 2; pass++) {
+        for (int pass = 0; pass < 3; pass++) {
             require((pass == 0
                 ? setenv("DS4_QWEN4EXP_NO_ROW_TILE", "1", 1)
                 : unsetenv("DS4_QWEN4EXP_NO_ROW_TILE")) == 0, "dispatch switch");
+            require((pass == 1
+                ? setenv("DS4_QWEN4EXP_NO_Q8_R3", "1", 1)
+                : unsetenv("DS4_QWEN4EXP_NO_Q8_R3")) == 0, "R3 control switch");
             require(ds4_gpu_tensor_write(yt, 0, poison, ybytes), "output reset");
             require(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
                 yt, model, bytes, offset, in, out, xt, n), "projection");
             require(ds4_gpu_tensor_read(yt, 0, pass == 0 ? reference : got, ybytes),
                     "output read");
-        }
-        /* Include unused token rows: they must retain the same canaries. */
-        for (size_t i = 0; i < yn; i++) {
-            if (!isfinite(reference[i]) || !isfinite(got[i]) ||
-                memcmp(reference + i, got + i, sizeof(float)) != 0) {
-                fprintf(stderr, "Q8 %llu->%llu offset %llu rows %u at %zu: "
-                                "reference %.9g, default %.9g\n",
-                        (unsigned long long)in, (unsigned long long)out,
-                        (unsigned long long)offset, n, i, reference[i], got[i]);
-                exit(1);
+            /* Compare the former R3 tile and new R3 pair independently with
+             * the original one-row-order kernel. Include unused canaries. */
+            if (pass) for (size_t i = 0; i < yn; i++) {
+                if (!isfinite(reference[i]) || !isfinite(got[i]) ||
+                    memcmp(reference + i, got + i, sizeof(float)) != 0) {
+                    fprintf(stderr, "Q8 %llu->%llu offset %llu rows %u at %zu: "
+                                    "reference %.9g, candidate/control %.9g\n",
+                            (unsigned long long)in, (unsigned long long)out,
+                            (unsigned long long)offset, n, i, reference[i], got[i]);
+                    exit(1);
+                }
             }
         }
     }
-    /* Captured paired reads must see changed inputs at both decode widths.
+    /* Captured paired reads must see changed inputs at all three decode widths.
      * Compare each replay with a fresh eager one-row-order reference. */
     const float magnitudes[] = {1.0f, 1e-30f, 1e-37f, 1e10f};
     ds4_gpu_decode_graphs_invalidate();
-    for (uint32_t n = 1u; n <= 2u; n++) {
+    for (uint32_t n = 1u; n <= 3u; n++) {
         ds4_decode_graph_key key = {.il = 1u, .island = n - 1u, .variant = n};
         require(ds4_gpu_decode_graph_begin(&key) == -1, "graph warmup");
         require(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
@@ -107,7 +111,7 @@ static void check_shape(uint64_t in, uint64_t out, uint64_t offset) {
         }
     }
     ds4_gpu_decode_graphs_invalidate();
-    printf("Q8 %llu->%llu offset %llu: 5 widths and 8 changed-input graph replays exact\n",
+    printf("Q8 %llu->%llu offset %llu: 5 widths, 10 eager comparisons and 12 changed-input graph replays exact\n",
            (unsigned long long)in, (unsigned long long)out,
            (unsigned long long)offset);
     ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(yt);
@@ -121,6 +125,9 @@ int main(void) {
     const char *old = getenv("DS4_QWEN4EXP_NO_ROW_TILE");
     char *saved = old ? strdup(old) : NULL;
     require(!old || saved, "environment copy");
+    const char *old_r3 = getenv("DS4_QWEN4EXP_NO_Q8_R3");
+    char *saved_r3 = old_r3 ? strdup(old_r3) : NULL;
+    require(!old_r3 || saved_r3, "R3 environment copy");
     const uint64_t shapes[][3] = {
         {33, 37, 64}, {63, 19, 66}, {96, 515, 64}, {1056, 519, 66},
         {320, 10240, 64}, {320, 10240, 66}, {10240, 320, 64}, {10240, 320, 66},
@@ -131,6 +138,8 @@ int main(void) {
         check_shape(shapes[i][0], shapes[i][1], shapes[i][2]);
     if (saved) { setenv("DS4_QWEN4EXP_NO_ROW_TILE", saved, 1); free(saved); }
     else unsetenv("DS4_QWEN4EXP_NO_ROW_TILE");
-    puts("Q8 decode pairs: all 60 eager cases and 96 graph replays passed");
+    if (saved_r3) { setenv("DS4_QWEN4EXP_NO_Q8_R3", saved_r3, 1); free(saved_r3); }
+    else unsetenv("DS4_QWEN4EXP_NO_Q8_R3");
+    puts("Q8 decode pairs: all 120 eager comparisons and 144 graph replays passed");
     return 0;
 }
