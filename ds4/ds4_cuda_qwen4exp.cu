@@ -1765,12 +1765,54 @@ __device__ __forceinline__ static bool qwen4exp_word_aligned(const void *p) {
  * without reverting the change. */
 #define DS4_QWEN4EXP_WIDE_PAYLOAD 1
 #endif
+
+/* STREAMING PAYLOAD LOADS.  A routed expert's weight row is walked once per
+ * pass and, by the router arithmetic, is essentially never walked again inside
+ * that pass: two verified rows draw twenty expert slots from five hundred and
+ * twelve per layer, so a given expert's payload is re-read by the sibling row
+ * about two percent of the time.  Those lines therefore occupy L1 and L2
+ * against the activations, route tables and scales that ARE re-read, and evict
+ * them.  `__ldcs` is the cache-streaming load: it returns the same bytes from
+ * the same address and only marks the line evict-first, so the arithmetic below
+ * it is bit-identical by construction -- there is no value to argue about, only
+ * a replacement-policy hint.  This is the read-side twin of the `__stcs` the
+ * snapshot writes in this file already use.
+ *
+ * It is applied ONLY to routed expert weight payloads, and deliberately not to:
+ *   - quantised activation bytes (`xq`), which every expert of a tile re-reads;
+ *   - the q4_K/q5_1 group headers, which eight lanes of a block share;
+ *   - the dense and shared-expert rows, whose reuse pattern is different.
+ * Hence the Stream template parameter rather than a change to the load helper:
+ * every existing caller keeps the caching default and only the two decode
+ * routed-expert kernels opt in. */
+#ifndef DS4_QWEN4EXP_STREAM_PAYLOAD
+/* 1, the shipped default, marks routed expert payload loads evict-first; 0
+ * restores the ordinary caching load, for bisecting without reverting.  Both
+ * settings load the same bytes, so this cannot change a result. */
+#define DS4_QWEN4EXP_STREAM_PAYLOAD 1
+#endif
+
+/* One load of *p, evict-first when Stream and the switch above are both on.
+ * Stream is a compile-time constant at every call site, so this folds to a
+ * single load instruction and adds no live state -- the distinction that
+ * matters on this device, where 48 warps/SM against 65,536 registers/SM leaves
+ * only ~42 registers/thread and a wider load costs occupancy. */
+template <bool Stream, typename T>
+__device__ __forceinline__ static T qw_payload_ld(const T *p) {
+#if DS4_QWEN4EXP_STREAM_PAYLOAD
+    if (Stream) return __ldcs(p);
+#endif
+    return *p;
+}
+
+template <bool Stream = false>
 __device__ __forceinline__ static void qw_load_words8(const uint32_t *qw,
                                                       uint32_t *w) {
 #if DS4_QWEN4EXP_WIDE_PAYLOAD
     if ((((uintptr_t)qw) & 15u) == 0u) {
-        const uint4 a = *(const uint4 *)(const void *)qw;
-        const uint4 b = *(const uint4 *)(const void *)(qw + 4);
+        const uint4 a = qw_payload_ld<Stream>((const uint4 *)(const void *)qw);
+        const uint4 b =
+                qw_payload_ld<Stream>((const uint4 *)(const void *)(qw + 4));
         w[0] = a.x; w[1] = a.y; w[2] = a.z; w[3] = a.w;
         w[4] = b.x; w[5] = b.y; w[6] = b.z; w[7] = b.w;
         return;
@@ -1779,7 +1821,7 @@ __device__ __forceinline__ static void qw_load_words8(const uint32_t *qw,
         const uint2 *q2 = (const uint2 *)(const void *)qw;
 #pragma unroll
         for (int i = 0; i < 4; i++) {
-            const uint2 v = q2[i];
+            const uint2 v = qw_payload_ld<Stream>(q2 + i);
             w[2 * i] = v.x;
             w[2 * i + 1] = v.y;
         }
@@ -1787,7 +1829,7 @@ __device__ __forceinline__ static void qw_load_words8(const uint32_t *qw,
     }
 #endif
 #pragma unroll
-    for (int i = 0; i < 8; i++) w[i] = qw[i];
+    for (int i = 0; i < 8; i++) w[i] = qw_payload_ld<Stream>(qw + i);
 }
 
 /* Decode one 32-element group of a quantised weight row into int8 quants and
@@ -2866,7 +2908,12 @@ __device__ __forceinline__ static void qw_q4k_parity_store16(
  * every other group's payload two bytes past a word boundary, and an aligned
  * window would read past the block the decode refuses to touch, so it stages
  * nothing and decodes from the row.  The alignment is a property of the
- * slab's strides, so the branch is uniform across the block. */
+ * slab's strides, so the branch is uniform across the block.
+ *
+ * Stream marks the payload evict-first (see qw_payload_ld); it defaults off so
+ * that only the two decode routed-expert kernels opt in, and it cannot change
+ * the words returned by any arm. */
+template <bool Stream = false>
 __device__ __forceinline__ static bool qw_raw_load(
         uint32_t type, const char *row, uint32_t g, uint32_t *w) {
     switch (type) {
@@ -2874,7 +2921,7 @@ __device__ __forceinline__ static bool qw_raw_load(
         const cuda_block_q4_K *xb = (const cuda_block_q4_K *)row + (g / 8u);
         const uint8_t *qs = xb->qs + ((g % 8u) >> 1u) * 32u;
         if (!qwen4exp_word_aligned(qs)) return false;
-        qw_load_words8((const uint32_t *)(const void *)qs, w);
+        qw_load_words8<Stream>((const uint32_t *)(const void *)qs, w);
         return true;
     }
     case (uint32_t)DS4_QWEN4EXP_TY_q5_1: {
@@ -2882,14 +2929,14 @@ __device__ __forceinline__ static bool qw_raw_load(
         if (!qwen4exp_word_aligned(xb)) return false;
         const uint32_t *qw = (const uint32_t *)(const void *)xb;
 #pragma unroll
-        for (int i = 0; i < 6; i++) w[i] = qw[i];
+        for (int i = 0; i < 6; i++) w[i] = qw_payload_ld<Stream>(qw + i);
         return true;
     }
     case (uint32_t)DS4_QWEN4EXP_TY_q5_K: {
         const cuda_block_q5_K *xb = (const cuda_block_q5_K *)row + (g / 8u);
         const uint8_t *qs = xb->qs + ((g % 8u) >> 1u) * 32u;
         if (!qwen4exp_word_aligned(qs)) return false;
-        qw_load_words8((const uint32_t *)(const void *)qs, w);
+        qw_load_words8<Stream>((const uint32_t *)(const void *)qs, w);
         return true;
     }
     default:
@@ -3539,7 +3586,8 @@ qwen4exp_moe_down_mma_kernel(
                     if (w_dq) {
                         uint32_t raw[6];
                         dev_qwen4exp_group_decode_w(dtype, drow, g,
-                                qw_raw_load(dtype, drow, g, raw) ? raw : NULL,
+                                qw_raw_load<true>(dtype, drow, g, raw) ? raw
+                                                                       : NULL,
                                 &sA[r * QW_MMA_LD + gg * 32], wa, wb);
                     } else {
                         dev_qwen4exp_group_decode(dtype, drow, g,
@@ -3786,16 +3834,19 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
                 uint32_t raw0[8];
                 uint32_t raw1[8];
                 const uint32_t *p0 =
-                    qw_raw_load((uint32_t)Type, weight_row, g, raw0) ? raw0 : NULL;
+                    qw_raw_load<true>((uint32_t)Type, weight_row, g, raw0)
+                        ? raw0 : NULL;
                 const uint32_t *p1 =
-                    qw_raw_load((uint32_t)Type, weight_row, g + 32u, raw1) ? raw1 : NULL;
+                    qw_raw_load<true>((uint32_t)Type, weight_row, g + 32u, raw1)
+                        ? raw1 : NULL;
                 QWEN4EXP_SPLIT_GROUP(g, p0);
                 QWEN4EXP_SPLIT_GROUP(g + 32u, p1);
             }
             for (; g < groups; g += 32u) {
                 uint32_t raw[8];
                 const uint32_t *rawp =
-                    qw_raw_load((uint32_t)Type, weight_row, g, raw) ? raw : NULL;
+                    qw_raw_load<true>((uint32_t)Type, weight_row, g, raw)
+                        ? raw : NULL;
                 QWEN4EXP_SPLIT_GROUP(g, rawp);
             }
 #undef QWEN4EXP_SPLIT_GROUP
