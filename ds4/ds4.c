@@ -16877,6 +16877,15 @@ typedef struct {
     ds4_gpu_tensor *mtp_state_hc;
     ds4_gpu_tensor *mtp_next_hc;
     ds4_gpu_tensor *mtp_raw_cache;
+    /*
+     * Device-side top-2 of the draft logits row: two ids and two values.  The
+     * MTP margin policy only needs (top0, top1, v0 - v1); reading the whole
+     * 248320-entry row back to the host to recover it costs ~1 MB of D2H plus a
+     * full host scan per draft.  Both tensors are optional -- when either is
+     * NULL the caller falls back to the historical host readback path.
+     */
+    ds4_gpu_tensor *mtp_top2_ids;
+    ds4_gpu_tensor *mtp_top2_vals;
     uint32_t mtp_n_raw;
     uint32_t prefill_cap;
     uint32_t raw_window;
@@ -17495,6 +17504,8 @@ static void metal_graph_free(ds4_gpu_graph *g) {
         ds4_gpu_tensor_free(g->logits_by_tier[t]);
         g->logits_by_tier[t] = NULL;
     }
+    ds4_gpu_tensor_free(g->mtp_top2_vals);
+    ds4_gpu_tensor_free(g->mtp_top2_ids);
     ds4_gpu_tensor_free(g->mtp_raw_cache);
     ds4_gpu_tensor_free(g->mtp_next_hc);
     ds4_gpu_tensor_free(g->mtp_state_hc);
@@ -19057,6 +19068,13 @@ static bool metal_graph_alloc_raw_cap(
         g->mtp_raw_cache = metal_graph_alloc_kv_cache_tensor(
                 managed_kv_cache,
                 (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
+        /*
+         * Optional: not part of the readiness check below, so a failure here
+         * degrades the margin policy to the host-readback path instead of
+         * failing graph construction.
+         */
+        g->mtp_top2_ids = ds4_gpu_tensor_alloc(2ull * sizeof(uint32_t));
+        g->mtp_top2_vals = ds4_gpu_tensor_alloc(2ull * sizeof(float));
         g->mtp_n_raw = 0;
     }
     if (enable_spec_logits) {
@@ -35782,8 +35800,18 @@ static bool metal_graph_eval_mtp_draft_from_hc(
         int                    token,
         uint32_t               pos,
         float                 *logits,
-        int                   *top_id) {
+        int                   *top_id,
+        int                   *top2_ids,
+        float                 *top2_vals) {
     if (!mtp || !mtp->block.attn_q_a || !g->mtp_raw_cache || !prev_hc || !out_hc) return false;
+    /*
+     * When the caller wants the top-2 (the MTP margin policy does) and the
+     * device scratch exists, reduce on the device and read back 16 bytes.  The
+     * top-1 falls out of the same reduction, so this also replaces the separate
+     * argmax pass rather than adding to it.
+     */
+    const bool want_top2 = top2_ids != NULL && top2_vals != NULL &&
+                           g->mtp_top2_ids != NULL && g->mtp_top2_vals != NULL;
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint32_t raw_row = pos % g->raw_cap;
@@ -35870,7 +35898,14 @@ static bool metal_graph_eval_mtp_draft_from_hc(
                                                     mtp_model,
                                                     mtp,
                                                     base_weights->output->dim[1]);
-    if (ok && top_id) {
+    if (ok && want_top2) {
+        ok = ds4_gpu_indexer_top2_value_tensor(g->mtp_top2_ids,
+                                               g->mtp_top2_vals,
+                                               metal_graph_logits(g),
+                                               DS4_N_VOCAB,
+                                               1u,
+                                               0u) != 0;
+    } else if (ok && top_id) {
         ok = ds4_gpu_argmax_tensor(metal_graph_comp_selected(g),
                                    metal_graph_logits(g),
                                    DS4_N_VOCAB) != 0;
@@ -35885,7 +35920,21 @@ static bool metal_graph_eval_mtp_draft_from_hc(
     if (ok && logits) {
         ok = ds4_gpu_tensor_read(metal_graph_logits(g), 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
-    if (ok && top_id) {
+    if (ok && want_top2) {
+        uint32_t ids[2] = { UINT32_MAX, UINT32_MAX };
+        float    vals[2] = { 0.0f, 0.0f };
+        ok = ds4_gpu_tensor_read(g->mtp_top2_ids, 0, ids, sizeof(ids)) != 0;
+        if (ok) ok = ds4_gpu_tensor_read(g->mtp_top2_vals, 0, vals, sizeof(vals)) != 0;
+        if (ok) {
+            /* Out-of-range ids can only come from an empty reduction; mapping
+             * them to -1 makes the caller's `>= 0` guard take the CPU path. */
+            top2_ids[0] = ids[0] < (uint32_t)DS4_N_VOCAB ? (int)ids[0] : -1;
+            top2_ids[1] = ids[1] < (uint32_t)DS4_N_VOCAB ? (int)ids[1] : -1;
+            top2_vals[0] = vals[0];
+            top2_vals[1] = vals[1];
+            if (top_id) *top_id = top2_ids[0];
+        }
+    } else if (ok && top_id) {
         ok = ds4_gpu_tensor_read(metal_graph_comp_selected(g), 0, top_id, sizeof(*top_id)) != 0;
     }
     if (ok && g->mtp_n_raw < g->raw_window) g->mtp_n_raw++;
@@ -35919,7 +35968,9 @@ static bool metal_graph_eval_mtp_draft(
                                               token,
                                               pos,
                                               logits,
-                                              top_id);
+                                              top_id,
+                                              NULL,
+                                              NULL);
 }
 
 /* =========================================================================
@@ -75396,9 +75447,19 @@ static int ds4_session_eval_speculative_argmax_impl(
     }
     const bool mtp_timing = getenv("DS4_MTP_TIMING") != NULL;
     const bool mtp_conf_log = getenv("DS4_MTP_CONF_LOG") != NULL;
+    const bool mtp_want_margin = !strict_mtp && mtp_margin_threshold > 0.0f;
+    /*
+     * The margin policy needs only (top0, top1, v0 - v1).  Recovering that from
+     * a host copy of the row costs a ~1 MB device-to-host transfer plus a scan
+     * of DS4_N_VOCAB floats on every draft; the device reduction that already
+     * runs for the argmax returns the same pair for 16 bytes.  Only fall back to
+     * the host row when something else actually wants the full logits.
+     */
+    const bool mtp_device_top2 = mtp_want_margin && !mtp_conf_log &&
+        s->graph.mtp_top2_ids != NULL && s->graph.mtp_top2_vals != NULL;
     const bool mtp_need_logits = mtp_conf_log ||
         getenv("DS4_MTP_FULL_LOGITS") != NULL ||
-        (!strict_mtp && mtp_margin_threshold > 0.0f);
+        (mtp_want_margin && !mtp_device_top2);
     const double mtp_t0 = mtp_timing ? now_sec() : 0.0;
     double mtp_t_after_draft = mtp_t0;
     float mtp_last_margin = 0.0f;
@@ -75434,6 +75495,8 @@ static int ds4_session_eval_speculative_argmax_impl(
         ds4_gpu_tensor *prev_hc = (draft_n & 1) ? s->graph.mtp_state_hc : s->graph.mtp_next_hc;
         ds4_gpu_tensor *out_hc = (draft_n & 1) ? s->graph.mtp_next_hc : s->graph.mtp_state_hc;
         int mtp_top = -1;
+        int mtp_top2_ids[2] = { -1, -1 };
+        float mtp_top2_vals[2] = { 0.0f, 0.0f };
         if (!metal_graph_eval_mtp_draft_from_hc(&s->graph,
                                                 &e->model,
                                                 &e->weights,
@@ -75444,9 +75507,19 @@ static int ds4_session_eval_speculative_argmax_impl(
                                                 drafts[draft_n - 1],
                                                 (uint32_t)(s->checkpoint.len + draft_n - 1),
                                                 mtp_need_logits ? s->mtp_logits : NULL,
-                                                &mtp_top))
+                                                &mtp_top,
+                                                mtp_device_top2 ? mtp_top2_ids : NULL,
+                                                mtp_device_top2 ? mtp_top2_vals : NULL))
         {
             return n_accept;
+        }
+        if (mtp_device_top2) {
+            /* Without a host copy of the row there is no argmax fallback, so an
+             * empty top-2 has to abandon speculation rather than guess. */
+            if (mtp_top2_ids[0] < 0) return n_accept;
+            mtp_last_top0 = mtp_top2_ids[0];
+            mtp_last_top1 = mtp_top2_ids[1];
+            mtp_last_margin = mtp_top2_vals[0] - mtp_top2_vals[1];
         }
         drafts[draft_n] = mtp_top >= 0 ? mtp_top : sample_argmax(s->mtp_logits, DS4_N_VOCAB);
         if (ignore_eos && ds4_token_is_stop_for_think_mode(
@@ -75466,29 +75539,34 @@ static int ds4_session_eval_speculative_argmax_impl(
     if (mtp_timing) mtp_t_after_draft = now_sec();
 
     if (!strict_mtp && draft_n == 2 && mtp_margin_threshold > 0.0f) {
-        if (!mtp_conf_log) {
+        /* mtp_device_top2 already filled mtp_last_* from the device reduction
+         * for the final draft, which is the row this gate is about. */
+        if (!mtp_conf_log && !mtp_device_top2) {
             float v0 = 0.0f, v1 = 0.0f;
             logits_top2(s->mtp_logits, DS4_N_VOCAB, &mtp_last_top0, &v0, &mtp_last_top1, &v1);
             mtp_last_margin = v0 - v1;
         }
         if (mtp_last_margin < mtp_margin_threshold) {
-            float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
             const int start = s->checkpoint.len;
             const double verify_t0 = mtp_timing ? now_sec() : 0.0;
+            /*
+             * The verifier only writes its output row, and the sole consumer of
+             * that row is s->logits.  A per-skip 1 MB scratch allocation plus a
+             * DS4_N_VOCAB copy is therefore pure overhead: on the failure path
+             * below the session is invalidated and s->logits is never read
+             * again, so a partial write cannot be observed.
+             */
             bool ok = metal_graph_eval_token_raw_swa(&s->graph,
                                                      &e->model,
                                                      &e->weights,
                                                      drafts[0],
                                                      (uint32_t)start,
-                                                     row_logits);
+                                                     s->logits);
             if (!ok) {
-                free(row_logits);
                 snprintf(err, errlen, "%s decode failed", ds4_backend_name(e->backend));
                 s->checkpoint_valid = false;
                 return -1;
             }
-            memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
-            free(row_logits);
             token_vec_push(&s->checkpoint, drafts[0]);
             accepted[n_accept++] = drafts[0];
             s->checkpoint_valid = true;
