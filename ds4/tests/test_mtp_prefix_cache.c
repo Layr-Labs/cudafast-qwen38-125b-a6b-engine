@@ -48,7 +48,200 @@ static void clear_calls(void) {
     memset(&g_log, 0, sizeof(g_log));
 }
 
+static unsigned prime_block_calls;
+static int prime_block_fail;
+static float prime_seen[HEAD_HC_DIM];
+
+/* The host block stands in for cache publication, as in the established
+ * wiring test. Actual K/V and indexer bytes require the GPU oracle. */
+static int prime_block(void *graph, void *cache, ds4_gpu_tensor *hyper,
+                       uint32_t il, uint32_t pos, uint32_t rows) {
+    prime_block_calls++;
+    CHECK(rows == 1u, "tail priming stays on the one-row native path");
+    memcpy(prime_seen, hyper->data, sizeof prime_seen);
+    if (prime_block_fail) return 0;
+    return stub_block(graph, cache, hyper, il, pos, rows);
+}
+
+static void prime_skip(ds4_qwen4exp_mtp_state *st, ds4_qwen4exp_mtp_head *h,
+        int token, uint32_t pos, int budget, int cap,
+        uint32_t ctx, uint32_t batch, const char *why) {
+    ds4_qwen4exp_mtp_state saved_st;
+    ds4_qwen4exp_mtp_head saved_h;
+    memcpy(&saved_st, st, sizeof saved_st);
+    memcpy(&saved_h, h, sizeof saved_h);
+    clear_calls();
+    prime_block_calls = 0;
+    CHECK(ds4_qwen4exp_mtp_prime_cache_tail(st, h, token, pos, budget, cap,
+                ctx, batch, g_err, sizeof(g_err)) == 0, "%s must fall back", why);
+    CHECK(!prime_block_calls && !seed_calls && !g_log.n_log,
+          "%s performs no head arithmetic", why);
+    CHECK(memcmp(&saved_st, st, sizeof saved_st) == 0 &&
+          memcmp(&saved_h, h, sizeof saved_h) == 0,
+          "%s preserves pending, frontier, cache policy and all counters", why);
+}
+
+static void test_tail_prime(ds4_qwen4exp_mtp_head *h,
+                           ds4_gpu_tensor *source, const float *inputs) {
+    refmodel target;
+    ds4_qwen4exp_mtp_model model;
+    ds4_qwen4exp_rollback_set rollback;
+    ds4_qwen4exp_mtp_state st;
+    ref_reset(&target, BREAK_NONE, 0);
+    CHECK(ref_build(&target, &model, &rollback) == 0, "build rollback contract");
+    CHECK(ds4_qwen4exp_mtp_state_init(&st, 1, &rollback, HEAD_HC_DIM,
+                HEAD_N_VOCAB, g_err, sizeof(g_err)) == 0, "init prime state");
+    const uint32_t pos = 55u;
+    const int actual = 7;
+    st.head_rows = pos - 1u;
+    memset(st.hc_scratch, 0xa5,
+           (size_t)DS4_QWEN4EXP_MTP_HC_ROWS * HEAD_HC_DIM * sizeof(float));
+    memset(st.logits_rows, 0,
+           (size_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * HEAD_N_VOCAB * sizeof(float));
+    st.logits_rows[2] = 1.0f;
+    CHECK(actual != ds4_qwen4exp_mtp_argmax(st.logits_rows, HEAD_N_VOCAB),
+          "actual input differs from the available target argmax");
+    float hc_before[DS4_QWEN4EXP_MTP_HC_ROWS * HEAD_HC_DIM];
+    float logits_before[DS4_QWEN4EXP_MTP_MAX_COMMIT * HEAD_N_VOCAB];
+    memcpy(hc_before, st.hc_scratch, sizeof hc_before);
+    memcpy(logits_before, st.logits_rows, sizeof logits_before);
+    CHECK(ds4_qwen4exp_mtp_head_retain_cache_tail(h, source, 3u, pos - 1u,
+                -1, g_err, sizeof(g_err)) == 0, "retain nonzero unknown tail");
+    h->hooks.block = prime_block;
+    prime_block_fail = 0;
+    CHECK(!h->cache_tail_prime_disabled, "default initialization enables priming");
+
+    prime_skip(&st, h, actual, pos, 1, 2, 128u, 2u, "budget one");
+    prime_skip(&st, h, actual, pos, 2, 1, 128u, 2u, "capacity one");
+    prime_skip(&st, h, actual, pos, 2, 2, pos + 1u, 2u, "context has one row");
+    prime_skip(&st, h, actual, pos, 2, 2, 128u, 1u, "batch has one row");
+    prime_skip(&st, h, actual, UINT32_MAX, 2, 2, UINT32_MAX, 2u, "context overflow");
+    prime_skip(&st, h, actual, 0u, 2, 2, 128u, 2u, "no previous token");
+    h->cache_tail_valid = false;
+    prime_skip(&st, h, actual, pos, 2, 2, 128u, 2u, "absent retained tail");
+    h->cache_tail_valid = true;
+    h->cache_seed_capacity = 0u;
+    prime_skip(&st, h, actual, pos, 2, 2, 128u, 2u, "cache disabled");
+    h->cache_seed_capacity = 5u;
+    h->cache_tail_next_token = actual;
+    prime_skip(&st, h, actual, pos, 2, 2, 128u, 2u, "already known tail");
+    h->cache_tail_next_token = -1;
+    st.head_rows--;
+    prime_skip(&st, h, actual, pos, 2, 2, 128u, 2u, "incomplete head prefix");
+    st.head_rows++;
+    h->cache_tail_pos--;
+    prime_skip(&st, h, actual, pos, 2, 2, 128u, 2u, "stale tail position");
+    h->cache_tail_pos++;
+    st.depth = 2;
+    prime_skip(&st, h, actual, pos, 2, 2, 128u, 2u, "deeper chain");
+    st.depth = 1;
+    st.pending[0] = 4; st.n_pending = 1; st.pending_parent = 3;
+    prime_skip(&st, h, actual, pos, 2, 2, 128u, 2u, "changed parent with carried chain");
+    ds4_qwen4exp_mtp_invalidate(&st);
+    CHECK(ds4_qwen4exp_mtp_prime_cache_tail(&st, h, -1, pos, 2, 2, 128u, 2u,
+                g_err, sizeof(g_err)) < 0, "invalid actual token refuses");
+
+    /* Separate ordinary full-head reference, with the same one-row inputs.
+     * The independent algebra additionally checks the input token and HC. */
+    ds4_qwen4exp_mtp_head reference;
+    CHECK(build_shortlist_head(&reference) == 0, "build full-head reference");
+    reference.hooks.block = prime_block;
+    int expected = -1;
+    clear_calls(); prime_block_calls = 0;
+    CHECK(ds4_qwen4exp_mtp_head_forward(&reference, &actual,
+                inputs + 3u * HEAD_HC_DIM, pos - 1u, 1u, &expected, NULL,
+                g_err, sizeof(g_err)) == 0, "run ordinary one-row reference");
+    float reference_eh[HEAD_HC_DIM], want[HEAD_HC_DIM], full_logits[HEAD_N_VOCAB];
+    memcpy(reference_eh, prime_seen, sizeof reference_eh);
+    expected_eh(actual, inputs + 3u * HEAD_HC_DIM, want);
+    oracle_logits(&actual, inputs + 3u * HEAD_HC_DIM, 0u, full_logits);
+    CHECK(memcmp(want, reference_eh, sizeof want) == 0 &&
+          expected == shortlist_argmax(full_logits, h->draft_vocab_prefix,
+                                       h->draft_vocab_tail),
+          "independent head algebra establishes the one-row reference");
+    ds4_qwen4exp_mtp_head_free(&reference);
+
+    const ds4_qwen4exp_mtp_counters before = st.counters;
+    clear_calls(); prime_block_calls = 0;
+    CHECK(ds4_qwen4exp_mtp_prime_cache_tail(&st, h, actual, pos, 2, 2,
+                pos + 2u, 2u, g_err, sizeof(g_err)) == 1,
+          "exact context boundary primes from the actual caller token");
+    CHECK(prime_block_calls == 1 && !seed_calls && g_log.block_pos0 == pos - 1u &&
+          g_log.block_tokens == 1u && g_log.mixer_rows == 1u,
+          "one complete head runs at P-1, with no duplicate cache-only call");
+    CHECK(st.pending[0] == expected && st.n_pending == 1 &&
+          st.pending_parent == actual && st.head_rows == pos &&
+          h->cache_tail_next_token == actual,
+          "proposal and parent/cache ownership publish only after the real head");
+    CHECK(memcmp(prime_seen, reference_eh, sizeof reference_eh) == 0 &&
+          memcmp(h->t_cache_tail->data, inputs + 3u * HEAD_HC_DIM, sizeof want) == 0,
+          "native one-row input/cache stub equals reference and retained target stays immutable");
+    CHECK(memcmp(hc_before, st.hc_scratch, sizeof hc_before) == 0 &&
+          memcmp(logits_before, st.logits_rows, sizeof logits_before) == 0,
+          "priming never uses or overwrites target HC/logit scratch");
+    ds4_qwen4exp_mtp_counters after = st.counters;
+    CHECK(after.draft_ns >= before.draft_ns, "head elapsed work is accounted");
+    after.draft_ns = before.draft_ns;
+    CHECK(memcmp(&after, &before, sizeof before) == 0,
+          "priming changes no rounds, drafts, hits, commits or other phase counters");
+    prime_skip(&st, h, actual, pos, 2, 2, 128u, 2u, "repeat cannot prime twice");
+    bool changed = true;
+    clear_calls();
+    CHECK(ds4_qwen4exp_mtp_head_feed_cache_tail(h, actual, pos, &changed,
+                g_err, sizeof(g_err)) == 0 && !changed && !seed_calls,
+          "ordinary tail feed preserves the primed row");
+
+    ds4_qwen4exp_mtp_invalidate(&st);
+    prime_skip(&st, h, 3, pos, 2, 2, 128u, 2u, "known tail with changed parent");
+    CHECK(ds4_qwen4exp_mtp_head_feed_cache_tail(h, 3, pos, &changed,
+                g_err, sizeof(g_err)) == 0 && changed,
+          "changed parent still takes the existing cache repair path");
+    expected_eh(3, inputs + 3u * HEAD_HC_DIM, want);
+    CHECK(memcmp(seed_seen, want, sizeof want) == 0,
+          "changed-parent repair uses the selected target tail");
+
+    ds4_qwen4exp_mtp_head_reset_cache(h);
+    st.head_rows = 0u;
+    prime_skip(&st, h, actual, 1u, 2, 2, 128u, 2u, "reset has no inherited tail");
+    CHECK(ds4_qwen4exp_mtp_head_retain_cache_tail(h, source, 4u, 0u, -1,
+                g_err, sizeof(g_err)) == 0, "retain a different request tail");
+    prime_block_fail = 1;
+    CHECK(ds4_qwen4exp_mtp_prime_cache_tail(&st, h, 3, 1u, 2, 2, 128u, 2u,
+                g_err, sizeof(g_err)) < 0, "full-head failure propagates");
+    CHECK(st.n_pending == 0 && st.pending_parent == -1 && st.head_rows == 0u &&
+          h->cache_tail_next_token == -1, "failure publishes no pending proposal");
+    prime_block_fail = 0;
+    ds4_qwen4exp_mtp_head_reset_cache(h);
+    CHECK(ds4_qwen4exp_mtp_head_retain_cache_tail(h, source, 4u, 0u, -1,
+                g_err, sizeof(g_err)) == 0, "reset and retain after failed request");
+    clear_calls();
+    CHECK(ds4_qwen4exp_mtp_prime_cache_tail(&st, h, 3, 1u, 2, 2, 128u, 2u,
+                g_err, sizeof(g_err)) == 1 && st.pending_parent == 3,
+          "new request primes from its own retained tail");
+
+    /* The diagnostic control is resolved at initialization, not per call. */
+    setenv("DS4_MTP_NO_TAIL_PRIME", "1", 1);
+    ds4_qwen4exp_mtp_head control;
+    CHECK(build_shortlist_head(&control) == 0, "build disabled control");
+    ds4_qwen4exp_mtp_head_free(&control);
+    control.cache_seed_capacity = 1u;
+    control.hooks.cache_seed = seed_mock;
+    CHECK(ds4_qwen4exp_mtp_head_init(&control, g_err, sizeof(g_err)) == 0,
+          "initialize disabled control cache");
+    CHECK(control.cache_tail_prime_disabled, "control flag captured at init");
+    unsetenv("DS4_MTP_NO_TAIL_PRIME");
+    ds4_qwen4exp_mtp_invalidate(&st); st.head_rows = 0u;
+    CHECK(ds4_qwen4exp_mtp_head_retain_cache_tail(&control, source, 0u, 0u, -1,
+                g_err, sizeof(g_err)) == 0, "retain disabled control tail");
+    prime_skip(&st, &control, 3, 1u, 2, 2, 128u, 2u, "latched diagnostic control");
+    ds4_qwen4exp_mtp_head_free(&control);
+    h->hooks.block = stub_block;
+    ds4_qwen4exp_mtp_head_reset_cache(h);
+    ds4_qwen4exp_mtp_state_free(&st);
+}
+
 int main(void) {
+    unsetenv("DS4_MTP_NO_TAIL_PRIME");
     setenv("DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX", "5", 1);
     setenv("DS4_QWEN4EXP_DRAFT_VOCAB_TAIL", "2", 1);
     ds4_qwen4exp_mtp_head h;
@@ -180,6 +373,7 @@ int main(void) {
     CHECK(ds4_qwen4exp_mtp_head_forward(&h, next, inputs, 0u, HEAD_ROWS + 1u,
                 draft, NULL, g_err, sizeof(g_err)) != 0,
           "wider input scratch does not widen ordinary output API");
+    test_tail_prime(&h, &source, inputs);
     ds4_qwen4exp_mtp_head_free(&h);
     CHECK(!h.cache_seed_capacity && !h.t_cache_tail && !h.cache_tail_valid,
           "free clears prefix ownership");

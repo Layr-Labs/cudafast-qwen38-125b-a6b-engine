@@ -76226,6 +76226,16 @@ static int ds4_session_qwen4exp_spec_cycle(ds4_session *s, int first_token,
     ds4_engine *e = s->engine;
     if (!ds4_session_qwen4exp_spec_init(s, err, errlen)) return -1;
     const uint32_t pos = ds4_qwen4exp_session_pos(e->qwen4exp_session);
+    const ds4_qwen4exp_session_plan *plan =
+        ds4_qwen4exp_session_plan_of(e->qwen4exp_session);
+    if (!accepted || !plan) {
+        snprintf(err, errlen, "qwen4exp MTP: missing output or session plan");
+        return -1;
+    }
+    const int primed = ds4_qwen4exp_mtp_prime_cache_tail(&s->qwen4exp_spec,
+        &s->qwen4exp_head, first_token, pos, max_tokens, accepted_cap,
+        plan->n_ctx, plan->n_batch, err, errlen);
+    if (primed < 0) return -1;
     if (ds4_session_qwen4exp_cache_feed_tail(s, first_token, pos, err, errlen) != 0)
         return -1;
     /* s->logits, not a scratch buffer.  The cycle leaves the distribution for
