@@ -5895,6 +5895,7 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
  * work while one 64-thread block owns each output. Retain all 32 original
  * float chains and their reduction tree; only the integer dot is split.
  * The two-token verifier benefits; one-token calls keep the original warp. */
+template <int R = 2>
 __global__ static void matmul_q8_hc_down_pair_kernel(
         float *out, const unsigned char *w, const int8_t *xq,
         const float *xs, uint32_t rows) {
@@ -5902,7 +5903,11 @@ __global__ static void matmul_q8_hc_down_pair_kernel(
     const unsigned group = threadIdx.x / L;
     const unsigned part = threadIdx.x % L;
     const uint64_t row = blockIdx.x;
-    float acc[2] = {0.0f, 0.0f};
+    /* R accumulators, one per verify row; `r < rows` keeps a shorter call
+     * on the rows it has.  Each row's chain is its own whatever R is. */
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) acc[r] = 0.0f;
     /* PDL: the first walk step (b = group, which every lane owns, group
      * being under 32 and the walk being 320 wide) with its WEIGHT loads
      * issued above the fence and held in registers, so they fly while the
@@ -5930,7 +5935,7 @@ __global__ static void matmul_q8_hc_down_pair_kernel(
         if (part == 0u) ws = __half2float(*(const __half *)blk);
         QWEN4EXP_PDL_SYNC();
 #pragma unroll
-        for (unsigned r = 0; r < 2u; r++) {
+        for (unsigned r = 0; r < (unsigned)R; r++) {
             if (r < rows) {
                 const unsigned at = r * 320u + group;
                 const int32_t *xw =
@@ -5964,7 +5969,7 @@ __global__ static void matmul_q8_hc_down_pair_kernel(
         float ws = 0.0f;
         if (part == 0u) ws = __half2float(*(const __half *)blk);
 #pragma unroll
-        for (unsigned r = 0; r < 2u; r++) {
+        for (unsigned r = 0; r < (unsigned)R; r++) {
             if (r < rows) {
                 const unsigned at = r * 320u + b;
                 const int32_t *xw = (const int32_t *)(xq + at * 32u + part * (32u/L));
@@ -5978,15 +5983,15 @@ __global__ static void matmul_q8_hc_down_pair_kernel(
             }
         }
     }
-    __shared__ float partial[2][32];
+    __shared__ float partial[R][32];
     if (part == 0u) {
-        partial[0][group] = acc[0];
-        partial[1][group] = acc[1];
+#pragma unroll
+        for (int r = 0; r < R; r++) partial[r][group] = acc[r];
     }
     __syncthreads();
     if (threadIdx.x < 32u) {
 #pragma unroll
-        for (unsigned r = 0; r < 2u; r++) {
+        for (unsigned r = 0; r < (unsigned)R; r++) {
             const float total = warp_sum_f32(partial[r][threadIdx.x]);
             if (threadIdx.x == 0u && r < rows) out[r * 320u + row] = total;
         }
@@ -17267,6 +17272,34 @@ int ds4_qwen4exp_pdl_enabled(void) {
     return enabled;
 }
 
+/* The three-row decode valve (see ds4_cuda_qwen4exp.cuh).  The decode fast
+ * paths -- pair-lane projections, the fused GDN/QSA projection launches, the
+ * f32 vector trees, the split routed-expert and vector shared-expert tiles
+ * and the PDL edges -- were gated at rows <= 2 (one-row decode, two-row
+ * depth-1 verify).  Every one of them is row-generic: a template row count R
+ * with per-row accumulators and per-row chains, so an R = 3 instantiation
+ * computes each row exactly as R = 1 and R = 2 do.  The valve widens those
+ * gates to the depth-2 verify width (three rows); DS4_QWEN4EXP_NO_ROW3 set to
+ * a non-zero value restores the rows <= 2 gates everywhere, so the two paths
+ * can be held side by side on one binary.  Resolved once; capture-safe for
+ * the same reason as the PDL valve. */
+int ds4_qwen4exp_row3_enabled(void) {
+    static int resolved = 0;
+    static int enabled = 1;
+    if (!resolved) {
+        const char *e = getenv("DS4_QWEN4EXP_NO_ROW3");
+        enabled = !(e && e[0] && e[0] != '0');
+        resolved = 1;
+    }
+    return enabled;
+}
+
+/* The decode-width ceiling the fast paths accept: three rows with the valve
+ * on, two without. */
+extern "C" uint32_t ds4_qwen4exp_decode_rows_max(void) {
+    return ds4_qwen4exp_row3_enabled() ? 3u : 2u;
+}
+
 /* The pipelined tile (matmul_q8_0_preq_rows_mma_pipe_kernel) serves the
  * prefill widths unless DS4_CUDA_NO_MMA_PIPE is set; the tile above is the
  * fallback and stays the oracle the test holds it against.  Read once; the
@@ -17495,23 +17528,37 @@ static int cuda_matmul_q8_0_preq_rows_exact(
 #undef DS4_Q8_DENSE_MMA_LAUNCH
 
     const int use_dp4a = cuda_q8_use_dp4a();
-    if (use_dp4a && n_rows == 2u && in_dim == 10240u && out_dim == 320u &&
+    /* The decode-width ceiling of the pair-lane family: two rows, or three
+     * with the row-3 valve (the depth-2 verify).  Every kernel below it is a
+     * row template with per-row accumulators, so R = 3 is the same per-row
+     * arithmetic as R = 2 with the weight read once for three rows instead
+     * of falling to the generic two-row tile, which reads it twice. */
+    const uint32_t decode_rows = ds4_qwen4exp_decode_rows_max();
+    if (use_dp4a && n_rows >= 2u && n_rows <= decode_rows &&
+        in_dim == 10240u && out_dim == 320u &&
         getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
         getenv("DS4_Q8_NO_HC_DOWN_PAIR") == NULL &&
         (((uintptr_t)wptr & 1u) == 0u)) {
         /* PDL consumer: the stream predecessor is qwen4exp_hc_norm_quant,
          * which triggers at its top, and the kernel's weight-word prefetch
          * rides the norm's window (ds4_cuda_qwen4exp.cuh). */
-        QWEN4EXP_LAUNCH_PDL(matmul_q8_hc_down_pair_kernel, 320, 64, 0,
-                            cuda_decode_stream(),
-                (float *)out->ptr, (const unsigned char *)wptr,
-                xq, xscale, n_rows);
+        if (n_rows == 2u) {
+            QWEN4EXP_LAUNCH_PDL((matmul_q8_hc_down_pair_kernel<2>), 320, 64, 0,
+                                cuda_decode_stream(),
+                    (float *)out->ptr, (const unsigned char *)wptr,
+                    xq, xscale, n_rows);
+        } else {
+            QWEN4EXP_LAUNCH_PDL((matmul_q8_hc_down_pair_kernel<3>), 320, 64, 0,
+                                cuda_decode_stream(),
+                    (float *)out->ptr, (const unsigned char *)wptr,
+                    xq, xscale, n_rows);
+        }
         return cuda_ok(cudaGetLastError(), "q8 HC down pair launch");
     }
     /* Two lanes read each full group at one/two-row decode widths. Integer
      * partials combine exactly, then the original 32 float chains and warp
      * tree are restored. Wider calls and partial groups keep their kernels. */
-    if (use_dp4a && n_rows <= 2u && out_dim > 512u && (in_dim & 31u) == 0u &&
+    if (use_dp4a && n_rows <= decode_rows && out_dim > 512u && (in_dim & 31u) == 0u &&
         getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
         (((uintptr_t)wptr & 1u) == 0u)) {
         /* Real-input first-use timing supports streaming for HC up. Larger
@@ -17522,18 +17569,34 @@ static int cuda_matmul_q8_0_preq_rows_exact(
                 /* PDL consumer: the stream predecessor is
                  * qwen4exp_hc_silu_quant, which triggers at its top
                  * (ds4_cuda_qwen4exp.cuh). */
-                QWEN4EXP_LAUNCH_PDL(
-                        (matmul_q8_hc_warp_pair_kernel<2>),
-                        (unsigned)((out_dim + 3u) / 4u), 128, 0,
-                        cuda_decode_stream(),
-                        (float *)out->ptr, (const unsigned char *)wptr,
-                        xq, xscale, out_dim, n_rows);
-            } else {
+                if (n_rows <= 2u) {
+                    QWEN4EXP_LAUNCH_PDL(
+                            (matmul_q8_hc_warp_pair_kernel<2>),
+                            (unsigned)((out_dim + 3u) / 4u), 128, 0,
+                            cuda_decode_stream(),
+                            (float *)out->ptr, (const unsigned char *)wptr,
+                            xq, xscale, out_dim, n_rows);
+                } else {
+                    QWEN4EXP_LAUNCH_PDL(
+                            (matmul_q8_hc_warp_pair_kernel<3>),
+                            (unsigned)((out_dim + 3u) / 4u), 128, 0,
+                            cuda_decode_stream(),
+                            (float *)out->ptr, (const unsigned char *)wptr,
+                            xq, xscale, out_dim, n_rows);
+                }
+            } else if (n_rows <= 2u) {
                 /* PDL consumer: the valve leg of the HC up edge; the stream
                  * predecessor qwen4exp_hc_silu_quant triggers at its top. */
                 QWEN4EXP_LAUNCH_PDL(
                         (matmul_q8_0_preq_pair_lanes_kernel<2>),
                         (dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u)),
+                        256, 0, cuda_decode_stream(),
+                        (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
+                        out_dim, n_rows, blocks);
+            } else {
+                QWEN4EXP_LAUNCH_PDL(
+                        (matmul_q8_0_preq_pair_lanes_kernel<3>),
+                        (dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 2u) / 3u, 1u)),
                         256, 0, cuda_decode_stream(),
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
                         out_dim, n_rows, blocks);
@@ -17551,10 +17614,20 @@ static int cuda_matmul_q8_0_preq_rows_exact(
                         256, 0, cuda_decode_stream(),
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
                         out_dim, n_rows, blocks);
-            } else {
+            } else if (n_rows <= 2u) {
                 QWEN4EXP_LAUNCH_PDL(
                         (matmul_q8_0_preq_pair_lanes_kernel<2, false>),
                         (dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u)),
+                        256, 0, cuda_decode_stream(),
+                        (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
+                        out_dim, n_rows, blocks);
+            } else {
+                /* Three rows (the depth-2 verify): one y-block of R = 3, so
+                 * the weight crosses the memory system once for the three
+                 * rows.  Same kernel, same per-row chain. */
+                QWEN4EXP_LAUNCH_PDL(
+                        (matmul_q8_0_preq_pair_lanes_kernel<3, false>),
+                        (dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 2u) / 3u, 1u)),
                         256, 0, cuda_decode_stream(),
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
                         out_dim, n_rows, blocks);
@@ -19135,8 +19208,8 @@ extern "C" int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
      * reduction leaves per thread; two-row routers use four without K-loop
      * unrolling. Actual device pointers must support the vector load. */
     if (in_dim == 2560u &&
-        ((out_dim == 48u && n_rows <= 2u) ||
-         (out_dim == 512u && n_rows <= 2u)) &&
+        ((out_dim == 48u && n_rows <= ds4_qwen4exp_decode_rows_max()) ||
+         (out_dim == 512u && n_rows <= ds4_qwen4exp_decode_rows_max())) &&
         (((uintptr_t)w | (uintptr_t)x->ptr) & 15u) == 0u &&
         getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
         getenv("DS4_F32_NO_VECTOR_DECODE") == NULL) {
@@ -19149,8 +19222,18 @@ extern "C" int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
                                 cuda_decode_stream(),
                                 (float *)out->ptr, (const float *)w,
                                 (const float *)x->ptr, out_dim);
-        } else if (out_dim == 48u) {
+        } else if (out_dim == 48u && n_rows == 2u) {
             QWEN4EXP_LAUNCH_PDL((qwen_f32_vector_tree_kernel<2, 2, 10>),
+                                (unsigned)out_dim, 128, 0,
+                                cuda_decode_stream(),
+                                (float *)out->ptr, (const float *)w,
+                                (const float *)x->ptr, out_dim);
+        } else if (out_dim == 48u) {
+            /* Three rows: the same tree with a third row of accumulators;
+             * each row's chain is untouched (the tree has no cross-row
+             * term), so this is the R = 2 launch's numbers for a third
+             * row. */
+            QWEN4EXP_LAUNCH_PDL((qwen_f32_vector_tree_kernel<3, 2, 10>),
                                 (unsigned)out_dim, 128, 0,
                                 cuda_decode_stream(),
                                 (float *)out->ptr, (const float *)w,
@@ -19172,8 +19255,14 @@ extern "C" int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
                                 cuda_decode_stream(),
                                 (float *)out->ptr, (const float *)w,
                                 (const float *)x->ptr, out_dim);
-        } else {
+        } else if (n_rows == 2u) {
             QWEN4EXP_LAUNCH_PDL((qwen_f32_vector_tree_kernel<2, 4, 1>),
+                                (unsigned)out_dim, 64, 0,
+                                cuda_decode_stream(),
+                                (float *)out->ptr, (const float *)w,
+                                (const float *)x->ptr, out_dim);
+        } else {
+            QWEN4EXP_LAUNCH_PDL((qwen_f32_vector_tree_kernel<3, 4, 1>),
                                 (unsigned)out_dim, 64, 0,
                                 cuda_decode_stream(),
                                 (float *)out->ptr, (const float *)w,
@@ -19306,7 +19395,7 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
     a.od[0]=qkv_dim;a.od[1]=gate_dim;a.blocks=blocks;a.n_rows=rows;
     a.xq=(const int8_t *)((const char *)q->ptr+qoff);
     a.xscale=(const float *)((const char *)q->ptr+soff);a.x=(const float *)x->ptr;
-    if (rows<=2u && in_dim==2560u && qkv_dim>512u && gate_dim>512u &&
+    if (rows<=ds4_qwen4exp_decode_rows_max() && in_dim==2560u && qkv_dim>512u && gate_dim>512u &&
         cuda_q8_use_dp4a() && getenv("DS4_QWEN4EXP_NO_ROW_TILE")==NULL &&
         getenv("DS4_QWEN4EXP_PAIR_LANES_R2")==NULL &&
         getenv("DS4_F32_NO_VECTOR_DECODE")==NULL &&
@@ -19319,8 +19408,11 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
         if (rows==1u)
             QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1>),
                                 grid, 256, 0, cuda_decode_stream(), a);
-        else
+        else if (rows==2u)
             QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2>),
+                                grid, 256, 0, cuda_decode_stream(), a);
+        else
+            QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<3>),
                                 grid, 256, 0, cuda_decode_stream(), a);
         return cuda_ok(cudaGetLastError(),"GDN four projections launch");
     }
@@ -19505,7 +19597,7 @@ extern "C" int ds4_gpu_matmul_q8_0_preq_triple_rows_exact_tensor(
     }
     const int8_t *xq=(const int8_t *)((const char *)q->ptr+qoff);
     const float *xs=(const float *)((const char *)q->ptr+soff);
-    if (rows<=2u && in_dim!=320u && cuda_q8_use_dp4a() &&
+    if (rows<=ds4_qwen4exp_decode_rows_max() && in_dim!=320u && cuda_q8_use_dp4a() &&
         getenv("DS4_QWEN4EXP_NO_ROW_TILE")==NULL &&
         getenv("DS4_QWEN4EXP_PAIR_LANES_R2")==NULL &&
         getenv("DS4_QWEN4EXP_Q8_WIDE_BLOCKS")==NULL &&
@@ -19520,8 +19612,14 @@ extern "C" int ds4_gpu_matmul_q8_0_preq_triple_rows_exact_tensor(
                 (float *)outs[0]->ptr,(float *)outs[1]->ptr,(float *)outs[2]->ptr,
                 (const unsigned char *)w[0],(const unsigned char *)w[1],
                 (const unsigned char *)w[2],xq,xs,od[0],od[1],od[2],rows,blocks);
-        else
+        else if (rows==2u)
             QWEN4EXP_LAUNCH_PDL((qwen_q8_projection_triple_kernel<2>),
+                                grid, 256, 0, cuda_decode_stream(),
+                (float *)outs[0]->ptr,(float *)outs[1]->ptr,(float *)outs[2]->ptr,
+                (const unsigned char *)w[0],(const unsigned char *)w[1],
+                (const unsigned char *)w[2],xq,xs,od[0],od[1],od[2],rows,blocks);
+        else
+            QWEN4EXP_LAUNCH_PDL((qwen_q8_projection_triple_kernel<3>),
                                 grid, 256, 0, cuda_decode_stream(),
                 (float *)outs[0]->ptr,(float *)outs[1]->ptr,(float *)outs[2]->ptr,
                 (const unsigned char *)w[0],(const unsigned char *)w[1],
@@ -30584,7 +30682,7 @@ extern "C" int ds4_gpu_glm53_matmul_bf16(
          * window (ds4_cuda_qwen4exp.cuh).  The idx_q projection shares the
          * entry and the gate; its own predecessor is multi-wave and never
          * triggers, so the attribute there is inert. */
-        if (n_rows <= 2u && in_dim == 2560u) {
+        if (n_rows <= ds4_qwen4exp_decode_rows_max() && in_dim == 2560u) {
             QWEN4EXP_LAUNCH_PDL(
                     glm53_matvec_bf16_f32_kernel,
                     grid, 256u, 0, cuda_decode_stream(),

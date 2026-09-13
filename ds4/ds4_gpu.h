@@ -2916,6 +2916,11 @@ typedef struct {
     uint64_t    row_bytes;
     uint32_t    type;
 } ds4_gpu_qwen4exp_slab;
+/* The widest row count the decode fast paths (fused projections, pair-lane
+ * tiles, PDL edges, split expert tiles) accept: 3 unless DS4_QWEN4EXP_NO_ROW3
+ * is set, then 2.  Host gates that choose the fused launches read it so the
+ * host choice and the backend's own gates agree (ds4_cuda_qwen4exp.cuh). */
+uint32_t ds4_qwen4exp_decode_rows_max(void);
 /* Four GDN projections in QKV, gate, alpha, beta order; independent mappings. */
 int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
         ds4_gpu_tensor *const outs[4], const void *const maps[4],

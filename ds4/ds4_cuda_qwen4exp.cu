@@ -2078,7 +2078,7 @@ __global__ static void qwen4exp_quantize_rows_kernel(
      * the bound and never triggers (the deadlock rule,
      * ds4_cuda_qwen4exp.cuh).  The gate reads the grid in the body, not a
      * convention at the launch sites, per the header's rule. */
-    if (gridDim.y <= 2u &&
+    if (gridDim.y <= 3u &&
         (uint64_t)gridDim.x * (uint64_t)gridDim.y <= 768u)
         QWEN4EXP_PDL_TRIGGER();
     const uint32_t g = blockIdx.x;
@@ -5952,7 +5952,7 @@ __global__ static void qwen4exp_shared_gate_kernel(
      * construction.  Row-gated to the same <= 2 the converted launch site
      * fires at: a prefill launch runs to a thousand blocks and never carries
      * a trigger (the deadlock rule, ds4_cuda_qwen4exp.cuh). */
-    if (n_tokens <= 2u) QWEN4EXP_PDL_TRIGGER();
+    if (n_tokens <= 3u) QWEN4EXP_PDL_TRIGGER();
     extern __shared__ float ds4_qwen4exp_smem[];
     const uint32_t token = blockIdx.x;
     if (token >= n_tokens) return;
@@ -6150,7 +6150,7 @@ static int qwen4exp_moe_tile(uint32_t n_rows) {
     const char *forced = getenv("DS4_QWEN4EXP_MOE_R");
     if (forced) {
         const int r = atoi(forced);
-        if (r == 1 || r == 2 || r == 4 || r == 8) return r;
+        if (r == 1 || r == 2 || r == 3 || r == 4 || r == 8) return r;
     }
     if (n_rows >= 8u) return 8;
     if (n_rows >= 4u) return 4;
@@ -6158,9 +6158,13 @@ static int qwen4exp_moe_tile(uint32_t n_rows) {
      * accumulators.  Keep their weight reuse while reducing the padded
      * register tile now that the format-specific kernels are available. */
     if (n_rows <= 2u) return 2;
-    /* A three-row call retains the previously measured eight-row tile.
-     * Its live per-row arithmetic agrees with the other tile widths. */
-    return 8;
+    /* A three-row call (the depth-2 verify) takes a three-row tile with the
+     * row-3 valve on: three live accumulators, the weight read once for the
+     * three rows, and the same format-specific split/vector kernels the
+     * two-row verify runs.  With the valve off it retains the previously
+     * measured eight-row tile.  Live per-row arithmetic agrees across every
+     * tile width. */
+    return ds4_qwen4exp_row3_enabled() ? 3 : 8;
 }
 
 extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
@@ -6259,10 +6263,12 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     const uint64_t task_bytes = pair_tasks ? (1u + 2u * task_capacity) * 4u : 0u;
 
     const int tile = qwen4exp_moe_tile(n_tokens);
-    const bool down_vector = tile == 2 && n_tokens <= 2u &&
+    /* The vector down kernel at the decode widths: R = 2 for one and two
+     * rows, R = 3 for the three-row verify (tile 3, row-3 valve on). */
+    const bool down_vector = (tile == 2 || tile == 3) && n_tokens <= 3u &&
         n_expert_used <= 32u &&
         (down_slab->type == DS4_QWEN4EXP_TY_q8_0 ||
-         (n_tokens == 2u && down_slab->type == DS4_QWEN4EXP_TY_q5_1)) &&
+         (n_tokens >= 2u && down_slab->type == DS4_QWEN4EXP_TY_q5_1)) &&
         getenv("DS4_QWEN4EXP_GENERIC_EXPERTS") == NULL &&
         getenv("DS4_QWEN4EXP_NO_DOWN_VECTOR") == NULL;
     uint64_t mq_offset = xq_bytes + idx_bytes + pair_bytes;
@@ -6465,15 +6471,19 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
      * neighboring warps applies the same register cut there. The diagnostic
      * pin retains the joint projection as a bit-exact oracle. Other widths
      * keep their prior kernel. */
-    else if (n_tokens <= 2u && tile == 2 && specialize &&
+    else if (n_tokens <= 3u && (tile == 2 || tile == 3) && specialize &&
              gate_slab->type == DS4_QWEN4EXP_TY_q4_K &&
              up_slab->type == DS4_QWEN4EXP_TY_q4_K &&
              getenv("DS4_QWEN4EXP_NO_SPLIT_GATEUP") == NULL) {
         /* Vector reads require alignment; the scalar schedule remains available. */
         const bool vector = ((uintptr_t)sc.xq & 15u) == 0u &&
             getenv("DS4_QWEN4EXP_NO_SPLIT_VECTOR") == NULL;
-#define QWEN4EXP_SPLIT_GATEUP(V, P) \
-        qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P><<< \
+        /* R follows the tile: two accumulators for the one/two-row widths,
+         * three for the three-row verify, where an expert all three rows
+         * chose decodes its group once for the three of them instead of
+         * twice (a pair and a remainder).  Per-row chains are unchanged. */
+#define QWEN4EXP_SPLIT_GATEUP_R(R, V, P) \
+        qwen4exp_moe_gateup_split_kernel<R, DS4_QWEN4EXP_TY_q4_K, V, P><<< \
             dim3((mid_dim + P - 1u) / P, gu_rows, 1), P * 64u, 0, stream>>>( \
             (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum, \
             sc.pairs, sc.counts, sc.offsets, gu_active, \
@@ -6493,12 +6503,18 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
          * is zero for both warps, so each still walks its own row in the
          * same group order through the same warp_sum_f32 tree and every dot
          * is bit-identical.  mid_dim 640 gives 640 blocks. */
+#define QWEN4EXP_SPLIT_GATEUP(V, P) do { \
+        if (tile == 3) { QWEN4EXP_SPLIT_GATEUP_R(3, V, P); } \
+        else { QWEN4EXP_SPLIT_GATEUP_R(2, V, P); } \
+    } while (0)
         if (vector) { QWEN4EXP_SPLIT_GATEUP(true, 1u); }
         else { QWEN4EXP_SPLIT_GATEUP(false, 4u); }
 #undef QWEN4EXP_SPLIT_GATEUP
+#undef QWEN4EXP_SPLIT_GATEUP_R
     }
     else if (tile == 8) { QWEN4EXP_GATEUP(8); }
     else if (tile == 4) { QWEN4EXP_GATEUP(4); }
+    else if (tile == 3) { QWEN4EXP_GATEUP(3); }
     else if (tile == 2) { QWEN4EXP_GATEUP(2); }
     else { QWEN4EXP_GATEUP(1); }
 #undef QWEN4EXP_GATEUP
@@ -6565,13 +6581,16 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     }
     if (down_vector && ((uintptr_t)sc.mq & 15u) == 0u) {
         if (down_slab->type == DS4_QWEN4EXP_TY_q8_0) {
-            QWEN4EXP_DOWN_IMPL(2, DS4_QWEN4EXP_TY_q8_0, true);
+            if (tile == 3) { QWEN4EXP_DOWN_IMPL(3, DS4_QWEN4EXP_TY_q8_0, true); }
+            else { QWEN4EXP_DOWN_IMPL(2, DS4_QWEN4EXP_TY_q8_0, true); }
         } else {
-            QWEN4EXP_DOWN_IMPL(2, DS4_QWEN4EXP_TY_q5_1, true);
+            if (tile == 3) { QWEN4EXP_DOWN_IMPL(3, DS4_QWEN4EXP_TY_q5_1, true); }
+            else { QWEN4EXP_DOWN_IMPL(2, DS4_QWEN4EXP_TY_q5_1, true); }
         }
     }
     else if (tile == 8) { QWEN4EXP_DOWN(8); }
     else if (tile == 4) { QWEN4EXP_DOWN(4); }
+    else if (tile == 3) { QWEN4EXP_DOWN(3); }
     else if (tile == 2) { QWEN4EXP_DOWN(2); }
     else { QWEN4EXP_DOWN(1); }
 #undef QWEN4EXP_DOWN
@@ -6696,7 +6715,8 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
      * as two int4 values. Keep the row tile, warp ownership, reduction and
      * Q8 decoder unchanged. The rotating-weight screen supports two-token
      * calls; single-token, wider and other-shape calls keep scalar reads. */
-    const bool vector_shared = n_tokens == 2u &&
+    const bool vector_shared = n_tokens >= 2u &&
+        n_tokens <= ds4_qwen4exp_decode_rows_max() &&
         in_dim == 2560u && mid_dim == 640u && out_dim == 2560u &&
         specialize_shared &&
         gate_slab->type == DS4_QWEN4EXP_TY_q8_0 &&
@@ -6808,13 +6828,14 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
                 gate_slab->row_bytes, up_slab->row_bytes,
                 gate_slab->type, up_slab->type, xgroups, mid_dim, n_tokens);
     } else {
-/* PDL consumer at the decode widths only (n_tokens <= 2): the stream
+/* PDL consumer at the decode widths only (n_tokens <= 2, or <= 3 with the
+ * row-3 valve -- the depth-2 verify): the stream
  * predecessor is qwen4exp_shared_gate_kernel -- or, when this entry
  * quantizes the input itself, that quantizer, which triggers too -- and the
  * kernel's weight-group prefetch rides that window
  * (ds4_cuda_qwen4exp.cuh).  Verify and prefill keep the plain launch. */
 #define QWEN4EXP_SH_GATEUP_IMPL(R, GT, UT, V) do { \
-    if (n_tokens <= 2u) { \
+    if (n_tokens <= ds4_qwen4exp_decode_rows_max()) { \
         QWEN4EXP_LAUNCH_PDL( \
                 (qwen4exp_shared_gateup_q_kernel<R, GT, UT, V>), \
                 (dim3((mid_dim + 7u) / 8u, tiles, 1)), \
@@ -6847,6 +6868,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
 } while (0)
     if (tile == 8) { QWEN4EXP_SH_GATEUP(8); }
     else if (tile == 4) { QWEN4EXP_SH_GATEUP(4); }
+    else if (tile == 3) { QWEN4EXP_SH_GATEUP(3); }
     else if (tile == 2) { QWEN4EXP_SH_GATEUP(2); }
     else { QWEN4EXP_SH_GATEUP(1); }
 #undef QWEN4EXP_SH_GATEUP
@@ -6906,7 +6928,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
  * weight-group prefetch rides that window (ds4_cuda_qwen4exp.cuh).  Verify
  * and prefill keep the plain launch. */
 #define QWEN4EXP_SH_DOWN_IMPL(R, DT, V) do { \
-    if (n_tokens <= 2u) { \
+    if (n_tokens <= ds4_qwen4exp_decode_rows_max()) { \
         QWEN4EXP_LAUNCH_PDL( \
                 (qwen4exp_shared_down_q_kernel<R, DT, V>), \
                 (dim3((out_dim + 7u) / 8u, tiles, 1)), \
@@ -6935,6 +6957,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
 } while (0)
     if (tile == 8) { QWEN4EXP_SH_DOWN(8); }
     else if (tile == 4) { QWEN4EXP_SH_DOWN(4); }
+    else if (tile == 3) { QWEN4EXP_SH_DOWN(3); }
     else if (tile == 2) { QWEN4EXP_SH_DOWN(2); }
     else { QWEN4EXP_SH_DOWN(1); }
 #undef QWEN4EXP_SH_DOWN
@@ -7137,7 +7160,7 @@ __global__ static void qwen4exp_hc_inject_kernel(
      * construction.  Row-gated to the same <= 2 the converted launch site
      * fires at: a verify or prefill launch never carries a trigger (the
      * deadlock rule, ds4_cuda_qwen4exp.cuh). */
-    if (n_tokens <= 2u) QWEN4EXP_PDL_TRIGGER();
+    if (n_tokens <= 3u) QWEN4EXP_PDL_TRIGGER();
     const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t h = blockIdx.y;
     const uint32_t t = blockIdx.z;
@@ -7454,7 +7477,7 @@ __global__ static void qwen4exp_hc_norm_quant_kernel(
      * construction.  A verify or prefill width never carries a trigger:
      * no PSS consumer follows one there, and its grid need not be one wave
      * (the deadlock rule, ds4_cuda_qwen4exp.cuh). */
-    if (rows <= 2u) QWEN4EXP_PDL_TRIGGER();
+    if (rows <= 3u) QWEN4EXP_PDL_TRIGGER();
     const uint32_t g = blockIdx.x;
     const uint32_t row = blockIdx.y;
     if (row >= rows) return;
@@ -7575,7 +7598,7 @@ __global__ static void qwen4exp_hc_mix_renorm_kernel(
      * 20 blocks is fewer than the device has SMs, so the launch is
      * single-wave by construction; a verify or prefill width never carries
      * a trigger (the deadlock rule, ds4_cuda_qwen4exp.cuh). */
-    if (n_tokens <= 2u) QWEN4EXP_PDL_TRIGGER();
+    if (n_tokens <= 3u) QWEN4EXP_PDL_TRIGGER();
     const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t t = blockIdx.y;
     if (d >= n_embd || t >= n_tokens) return;
@@ -7718,7 +7741,7 @@ __global__ static void qwen4exp_hc_mix_inject_dual_kernel(
      * sites fire at: 28 blocks is fewer than the device has SMs, so the
      * launch is single-wave by construction; a verify or prefill width never
      * carries a trigger (the deadlock rule, ds4_cuda_qwen4exp.cuh). */
-    if (rows <= 2u) QWEN4EXP_PDL_TRIGGER();
+    if (rows <= 3u) QWEN4EXP_PDL_TRIGGER();
     const uint32_t mix_blocks = (n_embd + 255u) / 256u;
     if (blockIdx.x < mix_blocks) {
         float *out = mixed;
@@ -7829,7 +7852,7 @@ __global__ static void qwen4exp_hc_mix_inject_renorm_kernel(
      * gate makes that structural rather than a caller convention: the
      * threshold's widths never fire the trigger at all (the deadlock rule,
      * ds4_cuda_qwen4exp.cuh). */
-    if (rows <= 2u) QWEN4EXP_PDL_TRIGGER();
+    if (rows <= 3u) QWEN4EXP_PDL_TRIGGER();
     extern __shared__ float smix[];
     const uint32_t t = blockIdx.x;
     if (t >= rows) return;
@@ -7985,7 +8008,7 @@ __global__ static void qwen4exp_hc_silu_quant_kernel(
      * three blocks is single-wave by construction.  A verify or prefill
      * width never carries a trigger (the deadlock rule,
      * ds4_cuda_qwen4exp.cuh). */
-    if (pairs <= 20u) QWEN4EXP_PDL_TRIGGER();
+    if (pairs <= 30u) QWEN4EXP_PDL_TRIGGER();
     const uint64_t pair = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
     if (pair >= pairs) return;
     const uint32_t lane = threadIdx.x & 31u;
@@ -8300,7 +8323,7 @@ __global__ static void qwen4exp_hc_norm_quant_inject_kernel(
      * The row gate makes that structural rather than a caller convention:
      * the threshold's widths never fire the trigger at all (the deadlock
      * rule, ds4_cuda_qwen4exp.cuh). */
-    if (rows <= 2u) QWEN4EXP_PDL_TRIGGER();
+    if (rows <= 3u) QWEN4EXP_PDL_TRIGGER();
     const uint32_t row = blockIdx.x;
     if (row >= rows) return;
 
@@ -9033,7 +9056,7 @@ static int qwen4exp_hc_mixer_fused_cuda(
          * which triggers at its top, and the kernel's normw prefetch rides
          * that window (ds4_cuda_qwen4exp.cuh).  Verify and prefill keep the
          * plain launch. */
-        if (rows <= 2u) {
+        if (rows <= ds4_qwen4exp_decode_rows_max()) {
             QWEN4EXP_LAUNCH_PDL(
                     (qwen4exp_hc_norm_quant_kernel<1>),
                     (dim3(n_hc, rows, 1u)), threads, 0,
@@ -11560,7 +11583,7 @@ extern "C" int ds4_gpu_qwen4exp_qsa_prep_joint_dpos_tensor(
         if ((i!=4 || out[i]) && !glm53_cuda_tensor_has(out[i],oe[i],4u)) return 0;
     for (unsigned i=0;i<6;i++) if (!glm53_cuda_tensor_has(in[i],ie[i],4u)) return 0;
     if (dp && !glm53_cuda_tensor_has(dp,1,4u)) return 0;
-    bool joint=rows<=2u && (dim&(dim-1u))==0u &&
+    bool joint=rows<=ds4_qwen4exp_decode_rows_max() && (dim&(dim-1u))==0u &&
                getenv("DS4_QWEN4EXP_NO_QSA_PREP_JOINT")==NULL;
     for (unsigned i=0;joint && i<5;i++) if (out[i]) {
         for (unsigned j=0;j<6;j++) joint &= qwen4exp_hc_ranges_disjoint(

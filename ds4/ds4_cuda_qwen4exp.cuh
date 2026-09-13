@@ -108,6 +108,15 @@ int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows);
  * same way. */
 int ds4_qwen4exp_pdl_enabled(void);
 
+/* The three-row decode valve (defined in ds4_cuda.cu next to the PDL valve):
+ * 1 unless DS4_QWEN4EXP_NO_ROW3 is set non-zero.  ds4_qwen4exp_decode_rows_max()
+ * is the width the decode fast paths accept -- 3 with the valve on, 2 off --
+ * and every former `rows <= 2u` gate on those paths reads it.  A three-row
+ * call is the depth-2 verify; the kernels behind the gates are row-generic
+ * templates whose per-row arithmetic does not depend on R. */
+int ds4_qwen4exp_row3_enabled(void);
+extern "C" uint32_t ds4_qwen4exp_decode_rows_max(void);
+
 #if CUDART_VERSION >= 12030
 /* One launch path for the converted consumers: cudaLaunchKernelEx, with the
  * programmatic stream serialization attribute when PDL is on and without it

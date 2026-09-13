@@ -54,7 +54,7 @@ enum {
     PROD_OUT_DIM = 2560,
     PROD_EXPERTS = 8,
     PROD_USED    = 4,
-    PROD_TOKENS  = 2,
+    PROD_TOKENS  = 3,   /* the depth-2 verify width; n = 2 and 1 are run below */
 };
 
 /* The routed expert quantisation of unsloth/Qwen3.8-Flash-Next-GGUF
@@ -1141,8 +1141,10 @@ static void run_row_invariance_case(const uint8_t *model,
         float *t1 = calloc((size_t)INV_TOKENS * OUT_DIM, sizeof(float));
         float *other = calloc((size_t)INV_TOKENS * OUT_DIM, sizeof(float));
         if (!t1 || !other) fail("tile comparison allocation");
-        const char *tiles[] = {"1", "2", "4", "8"};
-        for (int pass = 0; pass < 4; pass++) {
+        /* R = 3 is the depth-2 verify's tile (three live accumulators on
+         * the split gate/up, vector down and vector shared kernels). */
+        const char *tiles[] = {"1", "2", "3", "4", "8"};
+        for (int pass = 0; pass < 5; pass++) {
             setenv("DS4_QWEN4EXP_MOE_R", tiles[pass], 1);
             require_ok(ds4_gpu_qwen4exp_routed_moe_tensor(
                            out_t, mid_t, part_t, &gate_slab, &up_slab, &down_slab,
@@ -2091,7 +2093,68 @@ static void run_production_expert_cases(void) {
                        "split gate/up pin restore");
             free(saved);
             puts("split gate/up: complete out, mid and down partials bit-identical "
-                 "(verify n=2 and decode n=1)");
+                 "(verify n=3 and decode n=1)");
+        }
+
+        /* THE THREE-ROW TILE AGAINST THE EIGHT-ROW TILE IT REPLACES.  A
+         * three-row call used to take the R = 8 gate/up and down kernels
+         * (scalar reads, eight padded accumulators); with the row-3 valve it
+         * takes the split gate/up, the vector down and R = 3.  The two must
+         * agree on every intermediate bit for bit, for every production type
+         * pair -- and so must the two-row prefix of a three-row call against
+         * a two-row call, which is what the cycle's row-invariance stands on.
+         * DS4_QWEN4EXP_MOE_R=8 is the oracle pin (it is read per call). */
+        {
+            ds4_gpu_tensor *tensors[] = {out_t, mid_t, part_t};
+            const size_t sizes[] = {
+                (size_t)PROD_TOKENS * PROD_OUT_DIM * sizeof(float),
+                (size_t)PROD_TOKENS * PROD_USED * PROD_MID_DIM * sizeof(float),
+                (size_t)PROD_TOKENS * PROD_USED * PROD_OUT_DIM * sizeof(float)};
+            void *reference[3], *candidate[3];
+            require_ok(ds4_gpu_qwen4exp_routed_moe_tensor(
+                           out_t, mid_t, part_t, &gate_slab, &up_slab, &down_slab,
+                           PROD_IN_DIM, PROD_MID_DIM, PROD_OUT_DIM,
+                           selected_t, weights_t, PROD_EXPERTS, PROD_USED,
+                           x_t, 3u, PROD_USED * PROD_MID_DIM),
+                       "three-row tile candidate");
+            for (unsigned j = 0; j < 3; j++) {
+                reference[j] = malloc(sizes[j]); candidate[j] = malloc(sizes[j]);
+                require_ok(reference[j] && candidate[j], "three-row tile buffers");
+                require_ok(ds4_gpu_tensor_read(tensors[j], 0, candidate[j], sizes[j]),
+                           "three-row tile candidate read");
+            }
+            require_ok(setenv("DS4_QWEN4EXP_MOE_R", "8", 1) == 0, "eight-row tile pin");
+            require_ok(ds4_gpu_qwen4exp_routed_moe_tensor(
+                           out_t, mid_t, part_t, &gate_slab, &up_slab, &down_slab,
+                           PROD_IN_DIM, PROD_MID_DIM, PROD_OUT_DIM,
+                           selected_t, weights_t, PROD_EXPERTS, PROD_USED,
+                           x_t, 3u, PROD_USED * PROD_MID_DIM),
+                       "eight-row tile oracle");
+            require_ok(unsetenv("DS4_QWEN4EXP_MOE_R") == 0, "eight-row tile unpin");
+            for (unsigned j = 0; j < 3; j++) {
+                require_ok(ds4_gpu_tensor_read(tensors[j], 0, reference[j], sizes[j]),
+                           "eight-row tile read");
+                require_ok(memcmp(reference[j], candidate[j], sizes[j]) == 0,
+                           "three-row tile equals the eight-row tile bit for bit");
+            }
+            /* The two-row prefix: rows 0 and 1 of the three-row call are the
+             * two-row call's rows. */
+            require_ok(ds4_gpu_qwen4exp_routed_moe_tensor(
+                           out_t, mid_t, part_t, &gate_slab, &up_slab, &down_slab,
+                           PROD_IN_DIM, PROD_MID_DIM, PROD_OUT_DIM,
+                           selected_t, weights_t, PROD_EXPERTS, PROD_USED,
+                           x_t, 2u, PROD_USED * PROD_MID_DIM),
+                       "two-row call");
+            {
+                const size_t two = (size_t)2u * PROD_OUT_DIM * sizeof(float);
+                require_ok(ds4_gpu_tensor_read(out_t, 0, reference[0], two),
+                           "two-row read");
+                require_ok(memcmp(reference[0], candidate[0], two) == 0,
+                           "two-row call equals the three-row call's first two rows");
+            }
+            for (unsigned j = 0; j < 3; j++) { free(reference[j]); free(candidate[j]); }
+            puts("three-row tile: out, mid and down partials equal the eight-row "
+                 "tile bit for bit; two-row prefix equals the two-row call");
         }
 
         prod_reference(image + gate_off[gi], image + up_off[gi], image + down_off[dj],

@@ -582,6 +582,13 @@ test-qwen4exp-moe-mutants: $(QWEN4EXP_MOE_TEST)
 test-qwen4exp-cuda-moe: tests/test_qwen4exp_cuda_moe.c tests/qwen4exp_cuda_moe_parity.sh ds4_cuda_qwen4exp.cu
 	sh tests/qwen4exp_cuda_moe_parity.sh
 
+# The three-row (depth-2 verify) fast paths, mutated launch by launch: the
+# widened pair-lane, fused-projection, vector-tree, split gate/up, vector down
+# and vector shared kernels must fail their width-3 oracles when broken.
+.PHONY: test-qwen4exp-row3-mutants
+test-qwen4exp-row3-mutants: tests/qwen4exp_row3_mutants.sh ds4_cuda.cu ds4_cuda_qwen4exp.cu
+	sh tests/qwen4exp_row3_mutants.sh
+
 # The qwen4exp op tests assert exactness wherever the arithmetic is exact in
 # f32, so the reference side is built without -ffast-math (which would let the
 # host turn 1/sqrt into an approximation) and the GPU side runs against the
