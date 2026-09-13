@@ -3927,12 +3927,44 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
     }
 }
 
+/* The launch guard proves eight-byte alignment of every Q5_1 block.
+ * Preserve the direct decoder's bit expansion; only the loads change. */
+__device__ __forceinline__ static void qwen4exp_down_q5_aligned_decode(
+        const char *row, uint32_t g, int8_t *wq, float *wa, float *wb) {
+    static_assert(sizeof(cuda_block_q5_1) == 3u * sizeof(uint2),
+                  "Q5_1 must occupy exactly three eight-byte words");
+    const cuda_block_q5_1 *xb = (const cuda_block_q5_1 *)row + g;
+    const uint2 *words = (const uint2 *)(const void *)xb;
+    const uint2 a = words[0], b = words[1], c = words[2];
+    wa[0] = dev_f16_to_f32((uint16_t)(a.x & 0xffffu));
+    wb[0] = dev_f16_to_f32((uint16_t)(a.x >> 16u));
+    wa[1] = wb[1] = 0.0f;
+    const uint32_t qh = a.y;
+    const uint32_t qs[4] = {b.x, b.y, c.x, c.y};
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        const uint32_t v = qs[k];
+        const uint32_t h0 = (((qh >> (k * 4)) & 0x0fu) *
+                             0x02040810u) & 0x10101010u;
+        const uint32_t h1 = (((qh >> (16 + k * 4)) & 0x0fu) *
+                             0x02040810u) & 0x10101010u;
+        const uint32_t lo = (v & 0x0f0f0f0fu) | h0;
+        const uint32_t hi = ((v >> 4u) & 0x0f0f0f0fu) | h1;
+#pragma unroll
+        for (int b = 0; b < 4; b++) {
+            const int j = k * 4 + b;
+            wq[j] = (int8_t)((lo >> (b * 8)) & 0xffu);
+            wq[16 + j] = (int8_t)((hi >> (b * 8)) & 0xffu);
+        }
+    }
+}
+
 /* Grid (ceil(out_dim / 8), ceil(n_tokens / R)).  The slots of a token are
  * walked in ascending order into ONE accumulator, which is what the per-token
  * kernel did; the rows of the tile do not share a weight here, because each
  * one picked its own expert for the slot.  What the tile buys is that the
  * activation groups are read once for R rows and the decode is per group. */
-template <int R, int DownType = -1, bool Vector = false>
+template <int R, int DownType = -1, bool Vector = false, bool Aligned = false>
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
@@ -3955,6 +3987,9 @@ __global__ static void qwen4exp_moe_down_q_kernel(
     const uint32_t take = n_tokens - tok0 < (uint32_t)R ? n_tokens - tok0
                                                         : (uint32_t)R;
 
+    static_assert(!Aligned || (R == 2 && Vector &&
+                  DownType == DS4_QWEN4EXP_TY_q5_1),
+                  "Aligned down loads require the existing Q5_1 R2 vector path");
     /* Up to 32 IDs, freshly loaded on every call or graph replay. */
     int32_t route[R];
 #pragma unroll
@@ -3982,9 +4017,12 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                     int8_t wq[32];
                     float wa[2], wb[2];
                     int halves = 1;
-                    dev_qwen4exp_group_decode(
-                            DownType < 0 ? down_type : (uint32_t)DownType,
-                            drow, g, wq, wa, wb, &halves);
+                    if (Aligned)
+                        qwen4exp_down_q5_aligned_decode(drow, g, wq, wa, wb);
+                    else
+                        dev_qwen4exp_group_decode(
+                                DownType < 0 ? down_type : (uint32_t)DownType,
+                                drow, g, wq, wa, wb, &halves);
                     const uint64_t at_g = mrow * groups + g;
                     if (Vector && halves == 1)
                         qwen4exp_shared_vector_accumulate(&acc[r], wq, wa[0], wb[0],
@@ -6516,12 +6554,14 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
 
     const dim3 dn_grid((out_dim + 7u) / 8u,
                        (n_tokens + (uint32_t)tile - 1u) / (uint32_t)tile, 1);
-#define QWEN4EXP_DOWN_IMPL(R, DT, V) \
-    qwen4exp_moe_down_q_kernel<R, DT, V><<<dn_grid, threads, 0, stream>>>( \
+#define QWEN4EXP_DOWN_IMPL_ALIGNED(R, DT, V, A) \
+    qwen4exp_moe_down_q_kernel<R, DT, V, A><<<dn_grid, threads, 0, stream>>>( \
             (float *)out->ptr, down, (const int32_t *)selected->ptr, \
             sc.mq, sc.ms, sc.msum, \
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
             mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
+#define QWEN4EXP_DOWN_IMPL(R, DT, V) \
+    QWEN4EXP_DOWN_IMPL_ALIGNED(R, DT, V, false)
 #define QWEN4EXP_DOWN(R) do { \
     if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q5_1) { \
         QWEN4EXP_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q5_1, false); \
@@ -6566,6 +6606,12 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     if (down_vector && ((uintptr_t)sc.mq & 15u) == 0u) {
         if (down_slab->type == DS4_QWEN4EXP_TY_q8_0) {
             QWEN4EXP_DOWN_IMPL(2, DS4_QWEN4EXP_TY_q8_0, true);
+        } else if ((((uintptr_t)down | down_slab->row_bytes |
+                     down_slab->expert_bytes) & 7u) == 0u &&
+                   getenv("DS4_QWEN4EXP_NO_DOWN_ALIGNED8") == NULL) {
+            /* Aligned eight-byte Q5_1 loads are the compiled default;
+             * the env valve restores the oracle decoder for the control. */
+            QWEN4EXP_DOWN_IMPL_ALIGNED(2, DS4_QWEN4EXP_TY_q5_1, true, true);
         } else {
             QWEN4EXP_DOWN_IMPL(2, DS4_QWEN4EXP_TY_q5_1, true);
         }
@@ -6576,6 +6622,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     else { QWEN4EXP_DOWN(1); }
 #undef QWEN4EXP_DOWN
 #undef QWEN4EXP_DOWN_IMPL
+#undef QWEN4EXP_DOWN_IMPL_ALIGNED
     return cuda_ok(cudaGetLastError(), "qwen4exp MoE down launch");
 }
 
