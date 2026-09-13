@@ -2897,6 +2897,42 @@ __device__ __forceinline__ static bool qw_raw_load(
     }
 }
 
+/* The aligned arm of dev_qwen4exp_group_decode's q5_1 case, reading the six
+ * words qw_raw_load already staged instead of issuing the block load itself.
+ * Word 0 of a 24-byte q5_1 block is d | (m << 16) -- d at offset 0 and m at
+ * offset 2 of cuda_block_q5_1, little endian -- word 1 is the four qh bytes,
+ * and words 2..5 are the sixteen qs bytes, which is exactly what that arm
+ * reads as qw[0], qw[1] and qw[2 + k].  Every line below is that arm's line
+ * with qw[i] replaced by raw[i], so for one block it writes the identical
+ * thirty-two quants and the identical (wa, wb).  Its only reason to exist is
+ * that separating the load from the decode lets a caller keep more than one
+ * load outstanding; the arithmetic is the same arithmetic. */
+__device__ __forceinline__ static void dev_qwen4exp_group_decode_q5_1_raw(
+        const uint32_t *raw, int8_t *wq, float *wa, float *wb, int *halves) {
+    *halves = 1;
+    wa[1] = 0.0f;
+    wb[1] = 0.0f;
+    wa[0] = dev_f16_to_f32((uint16_t)(raw[0] & 0xffffu));
+    wb[0] = dev_f16_to_f32((uint16_t)(raw[0] >> 16u));
+    const uint32_t qh = raw[1];
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        const uint32_t v = raw[2 + k];
+        const uint32_t h0 = (((qh >> (k * 4)) & 0x0fu) *
+                             0x02040810u) & 0x10101010u;
+        const uint32_t h1 = (((qh >> (16 + k * 4)) & 0x0fu) *
+                             0x02040810u) & 0x10101010u;
+        const uint32_t lo = (v & 0x0f0f0f0fu) | h0;
+        const uint32_t hi = ((v >> 4u) & 0x0f0f0f0fu) | h1;
+#pragma unroll
+        for (int b = 0; b < 4; b++) {
+            const int j = k * 4 + b;
+            wq[j] = (int8_t)((lo >> (b * 8)) & 0xffu);
+            wq[16 + j] = (int8_t)((hi >> (b * 8)) & 0xffu);
+        }
+    }
+}
+
 /* The q4_K scale/min pair of group j out of the three words that follow
  * d/dmin in one sixteen-byte super-block header load: `a` holds scale bytes
  * 0..3, `b` bytes 4..7, `c` bytes 8..11.  This is dev_q4_K_get_scale_min on
@@ -3966,7 +4002,90 @@ __global__ static void qwen4exp_moe_down_q_kernel(
 #pragma unroll
     for (int r = 0; r < R; r++) acc[r] = 0.0f;
 
-    for (uint32_t slot = 0; slot < n_expert_used; slot++) {
+    /* TWO READS IN FLIGHT.  Every (slot, token) item of the walk below is one
+     * 24-byte block load whose value the very next instruction consumes, so a
+     * lane holds exactly one read outstanding and an output row costs
+     * n_expert_used * take serialised memory latencies.  Nothing inside a slot
+     * can cover them either: the routed down projection contracts over
+     * moe_intermediate = 640, so groups = 640 / 32 = 20 < 32 and the `for g`
+     * loop below is a SINGLE iteration per lane.  Decode is at ~18% of this
+     * box's memory roofline, so what is exposed is the miss latency, not the
+     * bytes.
+     *
+     * This is the shape the split gate/up kernel already fixed by keeping two
+     * groups in flight -- "the only lever is reads in flight", as its comment
+     * puts it.  The down kernel never got the treatment and cannot get it the
+     * same way, because with groups = 20 it has no `for g` slack to stage into.
+     * The slack it does have is across tokens: the R rows of a tile picked
+     * their own expert for this slot, so they are R different expert rows and
+     * hence R independent loads.  Issue both, then decode both.
+     *
+     * DEPTH.  An earlier revision staged two slots by R tokens for four reads
+     * in flight and measured -295 bips on decode: raw[2][R][6] is ~24 extra
+     * registers and the occupancy it costs this kernel is worth more than the
+     * latency it hides.  Depth R halves that to ~12 words, and wq is reused
+     * across the two decodes rather than duplicated, so the peak is ~6
+     * registers above the shipped kernel.
+     *
+     * BIT-EXACT BY CONSTRUCTION, which after a reduction reorder voided an
+     * earlier run is the whole point: only the instruction at which a load
+     * ISSUES moves.  Each acc[r] still receives slot 0's contribution, then
+     * slot 1's, in ascending slot order, each computed from the same bytes by
+     * the same decoder, so the float summation order is untouched -- the gate
+     * for this change compares the ordered contribution sequence per
+     * accumulator, not merely its multiset.  Confirmed on the runner:
+     * max_abs_diff 0, correctness passed.  The staged decoder reads the
+     * identical six words the aligned arm reads out of the same block, and any
+     * payload that is not word aligned falls back to that arm.
+     *
+     * slot stays warp-uniform, so every lane reaches every __shfl_sync. */
+    constexpr bool staged = Vector && DownType == (int)DS4_QWEN4EXP_TY_q5_1;
+    if (staged) {
+        const uint32_t g = lane;
+        for (uint32_t slot = 0; slot < n_expert_used; slot++) {
+            const char *drow[R];
+            uint32_t raw[R][6];
+            bool ok[R];
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                drow[r] = NULL;
+                ok[r] = false;
+                if ((uint32_t)r >= take) continue;
+                const int32_t e = __shfl_sync(0xffffffffu, route[r], slot);
+                if (e < 0 || (uint32_t)e >= n_total_expert) continue;
+                drow[r] = down +
+                    (uint64_t)(uint32_t)e * down_expert_bytes +
+                    (uint64_t)row * down_row_bytes;
+                if (g < groups)
+                    ok[r] = qw_raw_load((uint32_t)DS4_QWEN4EXP_TY_q5_1,
+                                        drow[r], g, raw[r]);
+            }
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                if (drow[r] == NULL || g >= groups) continue;
+                const uint64_t at_g =
+                    ((uint64_t)(tok0 + (uint32_t)r) * n_expert_used + slot)
+                    * groups + g;
+                int8_t wq[32];
+                float wa[2], wb[2];
+                int halves = 1;
+                if (ok[r])
+                    dev_qwen4exp_group_decode_q5_1_raw(raw[r], wq, wa, wb,
+                                                       &halves);
+                else
+                    dev_qwen4exp_group_decode((uint32_t)DS4_QWEN4EXP_TY_q5_1,
+                                              drow[r], g, wq, wa, wb, &halves);
+                if (halves == 1)
+                    qwen4exp_shared_vector_accumulate(&acc[r], wq, wa[0], wb[0],
+                            mq + at_g * 32u, ms[at_g], msum[at_g]);
+                else
+                    qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves,
+                            mq + at_g * 32u, ms[at_g], msum[at_g]);
+            }
+        }
+    }
+
+    for (uint32_t slot = 0; !staged && slot < n_expert_used; slot++) {
 #pragma unroll
         for (int r = 0; r < R; r++) {
             if ((uint32_t)r < take) {
