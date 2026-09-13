@@ -247,11 +247,15 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
     return cuda_ok(cudaGetLastError(),"native exact refinement") ? (int)MTP_NATIVE_CAP : -1;
 }
 __global__ static void mtp_native_map(uint32_t *winner, const float *logits,
-                                      const uint32_t *ids, uint32_t count, uint32_t vocab) {
+                                      const uint32_t *ids, uint32_t count,
+                                      uint32_t vocab, uint32_t n_winners) {
+    const uint32_t rank = threadIdx.x;
+    if (rank >= n_winners) return;
     const uint32_t bits = __float_as_uint(logits[0]);
-    const uint32_t packed = (bits & 0x7fffffffu) > 0x7f800000u ? 0u : winner[0];
+    const uint32_t packed = rank == 0u &&
+        (bits & 0x7fffffffu) > 0x7f800000u ? 0u : winner[rank];
     const uint32_t original = packed < count ? ids[packed] : UINT32_MAX;
-    winner[0] = original < vocab ? original : UINT32_MAX;
+    winner[rank] = original < vocab ? original : UINT32_MAX;
 }
 extern "C" int ds4_gpu_mtp_native_map(ds4_gpu_tensor *winner,
         const ds4_gpu_tensor *logits, const ds4_gpu_tensor *ids,
@@ -262,7 +266,9 @@ extern "C" int ds4_gpu_mtp_native_map(ds4_gpu_tensor *winner,
     if (tier<0 || tier>=g_n_gpus || ds4_tensor_device_idx(logits)!=tier ||
         ds4_tensor_device_idx(ids)!=tier || cudaGetDevice(&current)!=cudaSuccess ||
         current!=g_gpu[tier].device_id) return 0;
-    mtp_native_map<<<1,1,0,cuda_decode_stream()>>>((uint32_t *)winner->ptr,
-        (const float *)logits->ptr,(const uint32_t *)ids->ptr,count,vocab);
+    const uint32_t n_winners = winner->bytes >= 2u * sizeof(uint32_t) ? 2u : 1u;
+    mtp_native_map<<<1,n_winners,0,cuda_decode_stream()>>>(
+        (uint32_t *)winner->ptr, (const float *)logits->ptr,
+        (const uint32_t *)ids->ptr, count, vocab, n_winners);
     return cuda_ok(cudaGetLastError(),"native original winner map");
 }

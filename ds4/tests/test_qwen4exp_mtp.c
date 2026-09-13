@@ -1493,6 +1493,63 @@ static void test_budget(void) {
     ds4_qwen4exp_mtp_state_free(&st);
 }
 
+/* A runner-up proposal is still ordinary speculation: the target must verify
+ * it before the cycle commits it.  Seed a real reference-model chain, replace
+ * a wrong carried draft with the target's runner-up, and require the verified
+ * two-token commit. */
+static void test_second_choice_draft_is_verified(void) {
+    printf("confidence-selected runner-up is target-verified\n");
+    unsetenv("DS4_MTP_SECOND_MARGIN_THRESHOLD");
+    unsetenv("DS4_MTP_SECOND_LOGIT_THRESHOLD");
+    int exercised = 0;
+    for (int p = 0; p < N_PROMPTS && !exercised; p++) {
+        refmodel m;
+        ds4_qwen4exp_mtp_model model;
+        ds4_qwen4exp_rollback_set set;
+        ds4_qwen4exp_mtp_state st;
+        ref_reset(&m, BREAK_NONE, 0);
+        CHECK(ref_build(&m, &model, &set) == 0, "reference build failed");
+        CHECK(ds4_qwen4exp_mtp_state_init(&st, 1, &set, REF_HC_DIM,
+                                          REF_VOCAB, g_err,
+                                          sizeof(g_err)) == 0,
+              "state init failed: %s", g_err);
+        CHECK(st.second_margin_threshold == 0.15f &&
+                  st.second_logit_threshold == 18.75f,
+              "runner-up defaults are %.9g / %.9g",
+              st.second_margin_threshold, st.second_logit_threshold);
+
+        float logits[REF_VOCAB];
+        int committed[DS4_QWEN4EXP_MTP_MAX_COMMIT];
+        CHECK(ds4_qwen4exp_mtp_cycle(&st, &model, g_prompts[p], 0, 2,
+                                     committed, 2, logits, g_err,
+                                     sizeof(g_err)) == 1,
+              "seed cycle failed: %s", g_err);
+        const int fed = ds4_qwen4exp_mtp_argmax(logits, REF_VOCAB);
+        refmodel probe = m;
+        float probe_hc[REF_HC_DIM], probe_logits[REF_VOCAB];
+        CHECK(ref_decode_token(&probe, fed, 1u, probe_hc, probe_logits) == 0,
+              "look-ahead decode failed: %s", probe.fault);
+        const int target = ds4_qwen4exp_mtp_argmax(probe_logits, REF_VOCAB);
+        if (st.pending[0] != target) {
+            st.pending_confidence_valid[0] = true;
+            st.pending_confidence[0] = 0.10f;
+            st.pending_second_logit[0] = 19.0f;
+            st.pending_second_id[0] = target;
+            const int got = ds4_qwen4exp_mtp_cycle(
+                &st, &model, fed, 1u, 2, committed, 2, logits, g_err,
+                sizeof(g_err));
+            CHECK(got == 2, "verified runner-up committed %d tokens: %s",
+                  got, g_err);
+            CHECK(got == 2 && committed[1] == target,
+                  "runner-up commit is %d, target is %d",
+                  got == 2 ? committed[1] : -1, target);
+            exercised = 1;
+        }
+        ds4_qwen4exp_mtp_state_free(&st);
+    }
+    CHECK(exercised, "no reference prompt exercised a runner-up replacement");
+}
+
 /* A greedy compact caller needs only the reducer's exact token.  Verify that
  * opting into lazy materialization leaves the selected distribution on the
  * model seam while publishing enough metadata to fetch it later. */
@@ -1645,6 +1702,85 @@ int ds4_gpu_indexer_topk_tensor(ds4_gpu_tensor *selected,
         out[t] = best_i;
     }
     return 1;
+}
+int ds4_gpu_indexer_top2_value_tensor(ds4_gpu_tensor *selected,
+                                      ds4_gpu_tensor *values,
+                                      const ds4_gpu_tensor *scores,
+                                      uint32_t n_comp, uint32_t n_tokens,
+                                      uint32_t index_offset) {
+    if (!selected || !values || !scores || n_comp < 2u ||
+        scores->bytes < (uint64_t)n_comp * n_tokens * sizeof(float) ||
+        selected->bytes < (uint64_t)n_tokens * 2u * sizeof(uint32_t) ||
+        values->bytes < (uint64_t)n_tokens * 2u * sizeof(float)) {
+        return 0;
+    }
+    uint32_t *out = (uint32_t *)selected->data;
+    float *out_values = (float *)values->data;
+    const float *in = (const float *)scores->data;
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        uint32_t best[2] = { UINT32_MAX, UINT32_MAX };
+        float best_values[2] = { -INFINITY, -INFINITY };
+        const float *row = in + (size_t)t * n_comp;
+        for (uint32_t i = 0; i < n_comp; i++) {
+            const uint32_t gi = index_offset + i;
+            const float v = row[i];
+            for (uint32_t k = 0; k < 2u; k++) {
+                if (v > best_values[k] ||
+                    (v == best_values[k] && gi < best[k])) {
+                    if (k == 0u) {
+                        best_values[1] = best_values[0];
+                        best[1] = best[0];
+                    }
+                    best_values[k] = v;
+                    best[k] = gi;
+                    break;
+                }
+            }
+        }
+        for (uint32_t k = 0; k < 2u; k++) {
+            out[(uint64_t)t * 2u + k] = best[k];
+            out_values[(uint64_t)t * 2u + k] = best_values[k];
+        }
+    }
+    return 1;
+}
+int ds4_gpu_mtp_top2_policy_tensor(ds4_gpu_tensor *selected,
+                                   const ds4_gpu_tensor *scores,
+                                   uint32_t n_comp, uint32_t n_tokens,
+                                   uint32_t index_offset,
+                                   float margin_threshold,
+                                   float second_logit_threshold) {
+    if (!selected || selected->bytes < (uint64_t)n_tokens * sizeof(uint32_t)) return 0;
+    uint32_t *id_data = calloc((size_t)n_tokens * 2u, sizeof(uint32_t));
+    float *value_data = calloc((size_t)n_tokens * 2u, sizeof(float));
+    if (!id_data || !value_data) {
+        free(id_data);
+        free(value_data);
+        return 0;
+    }
+    ds4_gpu_tensor ids = {
+        .data = (unsigned char *)id_data,
+        .bytes = (uint64_t)n_tokens * 2u * sizeof(uint32_t),
+    };
+    ds4_gpu_tensor values = {
+        .data = (unsigned char *)value_data,
+        .bytes = (uint64_t)n_tokens * 2u * sizeof(float),
+    };
+    const int ok = ds4_gpu_indexer_top2_value_tensor(
+        &ids, &values, scores, n_comp, n_tokens, index_offset);
+    uint32_t *out = (uint32_t *)selected->data;
+    if (ok) {
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            const bool choose_second = margin_threshold > 0.0f &&
+                value_data[(uint64_t)t * 2u] -
+                    value_data[(uint64_t)t * 2u + 1u] <= margin_threshold &&
+                value_data[(uint64_t)t * 2u + 1u] >= second_logit_threshold;
+            out[t] = id_data[(uint64_t)t * 2u + (choose_second ? 1u : 0u)];
+        }
+    }
+    free(id_data);
+    free(value_data);
+    return ok;
 }
 int ds4_gpu_begin_commands(void) { return 1; }
 int ds4_gpu_end_commands(void) { return 1; }
@@ -2574,6 +2710,8 @@ int main(void) {
     test_rollback_contract();
     printf("\n");
     test_budget();
+    printf("\n");
+    test_second_choice_draft_is_verified();
     printf("\n");
     test_deferred_frontier_logits();
     printf("\n");
