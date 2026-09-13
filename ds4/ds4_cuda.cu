@@ -18881,12 +18881,69 @@ struct qwen_gdn_projection_args {
     const int8_t *xq; const float *xscale; const float *x;
     uint64_t od[2]; uint32_t n_rows; uint64_t blocks;
 };
-template<int R>
+/* COOPERATIVE 4-ROW WEIGHT PANEL (Stage).
+ *
+ * This kernel carries the two large GDN Q8_0 projections at decode width, and
+ * on the tower's geometry that is the single biggest weight stream in a decode
+ * step: attn_qkv is 2560x10240 and attn_gate 2560x6144, both Q8_0, on 36 of the
+ * 48 blocks -- about 44.5 MB per layer against the routed MoE's 41 MB, and a
+ * third of all weight bytes a verify forward touches.
+ *
+ * The shipped fetch map IS the compute map.  A lane owns one half of one
+ * 34-byte quant block (`group = lane >> 1`, `half = lane & 1`), so a single
+ * warp-wide load asks for thirty-two 4-byte pieces spread across sixteen
+ * blocks -- 128 useful bytes over a ~532-byte span, and the walk repeats that
+ * five times per group.  What one instruction requests is sparse even though
+ * the warp's aggregate footprint is dense; that distinction is the whole
+ * lesson of the routed gate/up and routed down wins that came before this one.
+ *
+ * The fix needs no new arithmetic, only a different path from DRAM.  A block
+ * owns output rows `block*4 .. block*4+3`, which are four CONSECUTIVE rows of
+ * one projection slab, so every byte the whole block will read is one
+ * contiguous `4 * blocks * 34` run -- 10,880 bytes at the live shape.  There is
+ * no routing here and no per-row index, so that run is block-uniform by
+ * construction: no uniformity argument is needed, unlike the routed down
+ * kernel where it had to be derived from `selected` not depending on the row.
+ * Fill the run into shared memory with a grid-stride uint4 copy, then let each
+ * lane decode its own half out of shared at the SAME relative offset.
+ *
+ * Bit-exact by construction, four ways:
+ *   - Every statement of both walk bodies is unchanged.  Only `wr` changes,
+ *     from a slab row pointer to a panel row pointer, and both point at the
+ *     same 2,720 bytes.
+ *   - The decode aligns its payload address down and funnel-shifts, so it only
+ *     cares about `address & 3`.  A slab row base is `w + row*blocks*34` and a
+ *     panel row base is `wpanel + local_row*blocks*34`; the host only selects
+ *     Stage when `blocks*34` is a multiple of four and `w` is four-byte
+ *     aligned, and dynamic shared memory is sixteen-byte aligned by contract,
+ *     so both bases are 0 mod 4 and every derived `shift` is identical.  Mod 4
+ *     is the whole requirement -- the decode masks the address with ~3 and
+ *     funnel-shifts by `address & 3`, so nothing above bit 1 can be observed.
+ *   - No float reassociation.  Lane `l` still owns groups `l`, `l+32`, ... and
+ *     folds through the same `upper[]` and `__shfl_down_sync` tree in the same
+ *     order, so each accumulator sees the same addends in the same sequence.
+ *   - No overrun.  The walk's highest read is group `blocks-1`, `half == 1`,
+ *     whose last halfword ends at exactly `blocks*34`, so the panel covers the
+ *     read extent exactly; and the host already proved the slab holds
+ *     `out_dim * blocks * 34` bytes, which whole 4-row panels tile exactly.
+ *
+ * The fill sits ABOVE QWEN4EXP_PDL_SYNC() because it touches weights only.
+ * That is not merely permitted, it is the point: the shipped kernel hoists the
+ * first walk step's weight loads above the fence so they fly while the
+ * predecessor quantizer drains, and staging promotes ALL of the row's weight
+ * traffic above the fence instead of two fifths of it.  One barrier pair for
+ * the whole block, and the host's `out_dim % 4 == 0` guard makes both the fill
+ * bound and that barrier block-uniform, so no block owns a partial panel. */
+template<int R, bool Stage = false>
 __global__ __launch_bounds__(256)
 static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
     constexpr unsigned B=256u;
     constexpr bool FloatFirst=true, Streaming=false;
     constexpr int C=2, U=10;
+    /* Dynamic shared memory is sixteen-byte aligned by contract, and it is
+     * requested only for the Stage instantiations; the others map nothing here
+     * and the fill that reads it compiles away. */
+    extern __shared__ uint4 qw_gdn_panel[];
     const uint32_t split=(uint32_t)((a.od[0]+B/64u-1u)/(B/64u));
     const uint32_t qblocks=split+(uint32_t)((a.od[1]+B/64u-1u)/(B/64u));
     const bool is_float=FloatFirst ? blockIdx.x<96u : blockIdx.x>=qblocks;
@@ -18909,8 +18966,58 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
 #pragma unroll
     for (int r = 0; r < R; r++) acc[r] = 0.0f;
 
+    const unsigned char *const wpanel = (const unsigned char *)qw_gdn_panel;
+    if (Stage) {
+        const uint64_t panel_bytes = (uint64_t)(B/64u) * blocks * 34u;
+        const unsigned char *const gp =
+            w + (uint64_t)block * (B/64u) * blocks * 34u;
+        /* The fill width follows the slab's alignment, not the panel's.  A
+         * block's offset into the slab is a multiple of the panel size, which
+         * the host guarantees is a multiple of sixteen, so `gp & 15` equals
+         * `w & 15` and this branch is block-uniform.  Sixteen-byte pieces are
+         * preferred, but the four-byte path is not a consolation prize: 256
+         * threads stepping by four bytes still make every warp's request one
+         * contiguous 128-byte run, which is the shape the win is about.  Both
+         * paths cover the panel exactly -- the host requires the panel to be a
+         * whole number of the wider piece -- so neither has a tail. */
+        if ((((uintptr_t)gp) & 15u) == 0u) {
+            const uint32_t vecs = (uint32_t)(panel_bytes / 16u);
+            for (uint32_t i = threadIdx.x; i < vecs; i += B)
+                qw_gdn_panel[i] =
+                    *(const uint4 *)(const void *)(gp + (uint64_t)i * 16u);
+        } else {
+            uint32_t *const dst = (uint32_t *)(void *)qw_gdn_panel;
+            const uint32_t *const src = (const uint32_t *)(const void *)gp;
+            const uint32_t words = (uint32_t)(panel_bytes / 4u);
+            for (uint32_t i = threadIdx.x; i < words; i += B) dst[i] = src[i];
+        }
+        /* ORDER IS THE WHOLE POINT, and getting it wrong is measurable: an
+         * earlier revision of this arm put the barrier here and left the
+         * shipped PDL wait where it was, deep in the first walk step.  That
+         * makes the block wait for the ENTIRE fill to land before it starts
+         * waiting for the predecessor, so the two latencies run in series --
+         * the opposite of the design this kernel already had, where the first
+         * step's weight loads are issued and then the predecessor drains while
+         * they fly.  It measured -39 bips of composite (-0.52% decode, paired,
+         * both pairs negative), which is the cost of serializing them.
+         *
+         * So wait on the predecessor FIRST, with the fill's loads already in
+         * flight: the drain absorbs the fill's latency for free, and the
+         * barrier that follows is nearly satisfied by the time it is reached.
+         * Both calls are at block scope here, where every thread reaches them,
+         * unlike the shipped site which sits inside `row < out_dim` and
+         * `group < blocks`; the Stage path takes this one and skips that one,
+         * so a thread performs exactly one grid dependency sync either way.
+         * Nothing arithmetic moves -- the activation reads that genuinely
+         * depend on the predecessor still all follow the sync. */
+        QWEN4EXP_PDL_SYNC();
+        __syncthreads();
+    }
+
     if (row < out_dim) {
-        const unsigned char *wr = w + row * blocks * 34u;
+        const unsigned char *wr = Stage
+            ? wpanel + (uint64_t)local_row * blocks * 34u
+            : w + row * blocks * 34u;
         /* PDL: the first walk step (b = group) with its WEIGHT loads issued
          * above the fence and held in registers, so they fly while the
          * quantizer drains.  The activation reads (xq/xscale, that kernel's
@@ -18947,7 +19054,11 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
             const float ws = Streaming
                 ? __half2float(__ushort_as_half(__ldcs((const uint16_t *)scale)))
                 : __half2float(*scale);
-            QWEN4EXP_PDL_SYNC();
+            /* The staged path already waited, at block scope above the
+             * fill's barrier, so one sync per thread either way.  The
+             * float branch below keeps its own unconditionally: it never
+             * touches the panel and never runs the hoisted wait. */
+            if (!Stage) QWEN4EXP_PDL_SYNC();
 #pragma unroll
             for (int r = 0; r < R; r++) {
                 if ((uint32_t)r < take) {
@@ -19314,14 +19425,51 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
         (((uintptr_t)a.weights[0]|(uintptr_t)a.weights[1])&1u)==0u &&
         (((uintptr_t)a.weights[2]|(uintptr_t)a.weights[3]|(uintptr_t)a.x)&15u)==0u) {
         const unsigned grid=(unsigned)((qkv_dim+3u)/4u+(gate_dim+3u)/4u+96u);
+        /* Weight-panel staging; see the kernel's header comment.  Every clause
+         * is something the kernel's exactness argument rests on rather than a
+         * preference, so an unexpected geometry takes the shipped path instead
+         * of a fill it cannot hold:
+         *   - whole 4-row panels, so no block owns a partial panel and both the
+         *     fill bound and its barrier stay block-uniform;
+         *   - a 4-byte row stride and 4-byte-aligned slab bases, so a panel row
+         *     base and a slab row base agree mod 4 and the shift the decode
+         *     derives from `address & 3` is unchanged.  Four bytes, not sixteen:
+         *     the alignment the EXACTNESS rests on is mod 4, and demanding
+         *     sixteen here would let a merely word-aligned slab silently take
+         *     the shipped path and make this whole arm a no-op.  The kernel
+         *     picks its fill width from the slab's own alignment instead;
+         *   - a panel that is a whole number of uint4, so whichever fill width
+         *     the kernel picks covers it exactly without a tail;
+         *   - a cap, so a wider projection falls back rather than fail to
+         *     launch.  The live shape wants 4 * 80 * 34 = 10,880 bytes.
+         * DS4_QWEN4EXP_NO_GDN_PANEL stands the whole arm down at run time and
+         * restores the shipped launch byte for byte. */
+        const uint64_t gdn_row=blocks*34ull, gdn_panel=4ull*gdn_row;
+        const int gdn_stage =
+            (qkv_dim%4u)==0u && (gate_dim%4u)==0u &&
+            (gdn_row%4u)==0u && (gdn_panel%16u)==0u &&
+            (((uintptr_t)a.weights[0]|(uintptr_t)a.weights[1])&3u)==0u &&
+            gdn_panel<=16384ull &&
+            getenv("DS4_QWEN4EXP_NO_GDN_PANEL")==NULL;
         /* PDL consumer: the stream predecessor is the mixed-input quantizer,
          * which triggers at its top at these decode widths. */
-        if (rows==1u)
-            QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1>),
-                                grid, 256, 0, cuda_decode_stream(), a);
-        else
-            QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2>),
-                                grid, 256, 0, cuda_decode_stream(), a);
+        if (rows==1u) {
+            if (gdn_stage)
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1,true>),
+                                    grid, 256, (size_t)gdn_panel,
+                                    cuda_decode_stream(), a);
+            else
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1>),
+                                    grid, 256, 0, cuda_decode_stream(), a);
+        } else {
+            if (gdn_stage)
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2,true>),
+                                    grid, 256, (size_t)gdn_panel,
+                                    cuda_decode_stream(), a);
+            else
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2>),
+                                    grid, 256, 0, cuda_decode_stream(), a);
+        }
         return cuda_ok(cudaGetLastError(),"GDN four projections launch");
     }
     for (unsigned i=0;i<2;i++)

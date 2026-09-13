@@ -4289,6 +4289,11 @@ __global__ static void qwen4exp_moe_down_q_kernel(
         uint32_t n_tokens,
         uint32_t n_total_expert,
         uint32_t n_expert_used) {
+    /* The staging path reads the expert index off the shuffled `route`, which
+     * only the Vector schedule fills.  The host has always guaranteed that
+     * pairing; say so here so a future caller cannot separate them. */
+    static_assert(!Stage || Vector,
+                  "down panel staging requires the Vector route schedule");
     /* Dynamic shared memory is 16-byte aligned by contract, and it is requested
      * only for the Stage instantiations; the others map nothing here. */
     extern __shared__ uint4 qw_down_panel[];
