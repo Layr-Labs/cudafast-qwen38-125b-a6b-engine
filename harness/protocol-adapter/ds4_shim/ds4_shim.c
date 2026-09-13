@@ -50,7 +50,22 @@ ds4s_handle *ds4s_open(const char *model_path, const char *mtp_head_path,
      * when a head is armed (ds4_qwen4exp_mtp_depth_from_draft_tokens), and a
      * clamp here would make that refusal unreachable. */
     opt.mtp_draft_tokens = mtp_draft_tokens;
-    opt.mtp_margin = 3.0f;
+    /*
+     * Margin-skip disabled (0.0f turns the gate off; see the
+     * `mtp_margin_threshold > 0.0f` test in ds4_session_eval_speculative_argmax_impl).
+     *
+     * At 3.0f, a draft whose top-2 logit margin is below the threshold commits one
+     * token and verifies a single row instead of two.  That trades ~28% of a round's
+     * expert weight traffic for the chance of a second token.  Working the exchange
+     * on this benchmark's own numbers -- 79 rounds, 78 drafted, 49 accepted -- gives
+     * a break-even low-margin acceptance of roughly 0.45-0.53, while the observed
+     * unconditional acceptance is 49/78 = 0.628.  Skipping therefore only pays if
+     * acceptance in the low-margin regime is far below the average, and nothing in
+     * the metrics establishes that: spec_drafted_total counts a skipped round's
+     * draft, so margin-skips and verify-rejections are indistinguishable from the
+     * outside.  DS4_MTP_MIN_MARGIN restores any threshold at runtime.
+     */
+    opt.mtp_margin = 0.0f;
     if (ds4_engine_open(&h->engine, &opt) != 0 || !h->engine) {
         char msg[512];
         snprintf(msg, sizeof(msg), "ds4_engine_open failed for %s", model_path);
