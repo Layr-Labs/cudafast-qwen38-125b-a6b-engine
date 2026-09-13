@@ -2881,6 +2881,28 @@ __device__ __forceinline__ static bool qw_raw_load(
         const cuda_block_q5_1 *xb = (const cuda_block_q5_1 *)row + g;
         if (!qwen4exp_word_aligned(xb)) return false;
         const uint32_t *qw = (const uint32_t *)(const void *)xb;
+#if DS4_QWEN4EXP_WIDE_PAYLOAD
+        /* The q4_K and q5_K arms above reach their payload through
+         * qw_load_words8, which takes a wide arm; this arm was the one dtype
+         * left reading its block as six separate scalar words.  A q5_1 block is
+         * 24 bytes, so its every stride is a multiple of eight and the test
+         * below depends only on the row base -- it is uniform across the warp,
+         * exactly like the tests in qw_load_words8.  Three eight-byte loads
+         * cover the same 24 bytes as six four-byte ones, and uint2 .x .y ARE
+         * words 0..1 of the eight bytes at the address in address order, which
+         * is the order the scalar loop assigns w[2i], w[2i+1].  So w[] receives
+         * the identical six values and only the instruction count moves. */
+        if ((((uintptr_t)qw) & 7u) == 0u) {
+            const uint2 *q2 = (const uint2 *)(const void *)qw;
+#pragma unroll
+            for (int i = 0; i < 3; i++) {
+                const uint2 v = q2[i];
+                w[2 * i] = v.x;
+                w[2 * i + 1] = v.y;
+            }
+            return true;
+        }
+#endif
 #pragma unroll
         for (int i = 0; i < 6; i++) w[i] = qw[i];
         return true;
