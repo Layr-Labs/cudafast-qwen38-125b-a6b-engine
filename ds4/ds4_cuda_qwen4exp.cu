@@ -3004,6 +3004,41 @@ __device__ __forceinline__ static void dev_qwen4exp_group_decode_w(
     qw_tile_store_group(dst, wq);
 }
 
+
+/* ============ asynchronous DMA staging of the ORIGINAL q4_K bytes ==========
+ * Every stored byte stays exactly where the loader put it.  What moves is the
+ * FETCH map: instead of each staging lane issuing two 16-byte global loads of
+ * its own 32-byte payload slice (two lanes per (row, matrix), 32 B apart, the
+ * pattern the address-stream diagnosis prices at ~134 GB/s), the CTA fills a
+ * small shared buffer with cp.async (LDGSTS) using a fetch map in which
+ * CONSECUTIVE lanes take CONSECUTIVE 16-byte pieces of ONE weight row.  The
+ * staging lane then reads the same eight words out of shared, so the dequant,
+ * the tile stores, the MMA sequence, the epilogue and the accumulation order
+ * are untouched and the arm is bit-exact by construction.
+ *
+ * Slot map: piece j of unit u (u = 2*row + matrix, 64 per tile) lands at slot
+ * j * QW_DMA_US + u.  The stride 66 is the point: a warp phase of eight lanes
+ * asks for units {4k..4k+3} x slices {0,1}, and 66 slots apart puts those
+ * eight 16-byte pieces on eight disjoint groups of four shared-memory banks,
+ * so the tile read is conflict-free. */
+#define QW_DMA_US 66u
+
+/* .ca, NOT .cg: .cg bypasses L1, and a super-block's 128-byte payload line is
+ * touched by two K chunks, so the L1 hit matters.  Measured bare-stream gap on
+ * the identical fetch map and occupancy: 133.8 GB/s (.cg) vs 161.5 (.ca). */
+__device__ __forceinline__ static void qw_cpasync16(uint32_t dst,
+                                                    const void *src) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
+                 :: "r"(dst), "l"(src));
+}
+__device__ __forceinline__ static void qw_cpasync_commit(void) {
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+__device__ __forceinline__ static void qw_cpasync_wait0(void) {
+    asm volatile("cp.async.wait_group 0;\n" ::);
+}
+/* ========================================================================= */
+
 __device__ __forceinline__ static void qw_mma_m16n8k32(
         int32_t *d, const uint32_t *a, const uint32_t *b) {
     asm volatile(
@@ -3019,8 +3054,15 @@ __device__ __forceinline__ static void qw_mma_m16n8k32(
  * disjoint pair rows. This bounds the work of a CTA when routing is uneven.
  * The ordinary expert list remains the fallback and the down projection's
  * input. No weight or activation representation changes. */
-template <int GateType = -1, int UpType = -1, bool PairTasks = false>
-__global__ __launch_bounds__(QW_MMA_THREADS) static void
+template <int GateType = -1, int UpType = -1, bool PairTasks = false,
+          int Dma = 0>
+/* The DMA arms need the occupancy pinned: without a minimum ptxas takes
+ * 167 registers (3 CTAs/SM) and throws away the whole point of the 64 B
+ * arm, which is that its staging buffer still fits four. */
+__global__ __launch_bounds__(QW_MMA_THREADS,
+                             Dma == 0 ? 0 : (Dma == 4 ? 2
+                                                      : ((Dma >= 2) ? 3 : 4)))
+static void
 qwen4exp_moe_gateup_mma_kernel(
         float *mid,
         int8_t *mq,
@@ -3061,6 +3103,22 @@ qwen4exp_moe_gateup_mma_kernel(
     __shared__ float  sXS [QW_MMA_BN * QW_MMA_G];
     __shared__ float  sXSUM[QW_MMA_BN * QW_MMA_G];
     __shared__ uint32_t sTok[QW_MMA_BN];
+    /* The DMA staging buffer.  Dma = 1 holds one K chunk's 64 payload bytes
+     * per (row, matrix); Dma = 2 holds a whole super-block's 128, consumed
+     * over the two chunks that share it. */
+    enum { QW_DMA_J = (Dma == 1) ? 4 : ((Dma == 4) ? 18 : 8),
+           QW_DMA_PER = (Dma == 1) ? 1 : ((Dma == 4) ? 4 : 2),
+           QW_DMA_ASYNC = (Dma >= 3) ? 1 : 0,
+           /* The slot stride 66 is conflict-free for the tile READ (which
+            * needs stride == 2 mod 4) but 2-way conflicting for the staging
+            * STORE (which needs an odd stride) -- no linear map serves both.
+            * XOR-ing the unit index with bit 2 of the piece index fixes the
+            * store and provably leaves the read conflict-free. */
+           QW_DMA_SWZ = (Dma == 5) ? 1 : 0,
+           QW_DMA_HDR = (Dma == 4) ? 1 : 0,
+           QW_DMA_NF = 64 * QW_DMA_J / (int)QW_MMA_THREADS,
+           QW_DMA_SLOTS = Dma ? ((QW_DMA_J - 1) * (int)QW_DMA_US + 64) : 1 };
+    __shared__ __align__(16) uint4 sRaw[QW_DMA_SLOTS];
 
     const uint32_t tid  = threadIdx.x;
     const uint32_t warp = tid >> 5;
@@ -3116,6 +3174,89 @@ qwen4exp_moe_gateup_mma_kernel(
     const bool w_fast = dq_stage != 0u &&
         GateType == DS4_QWEN4EXP_TY_q4_K && UpType == DS4_QWEN4EXP_TY_q4_K &&
         (((uintptr_t)w_row) & 15u) == 0u;
+    /* Block-uniform by construction (the expert bases and the row stride are
+     * the slab's, not the thread's), so the cooperative fill below is either
+     * taken by the whole CTA or by none of it.  It also implies w_fast for
+     * every thread, and it keeps the dq_stage diagnostic valve meaningful:
+     * with dq_stage == 0 the block takes the per-group staging and no DMA. */
+    const bool dma_on = Dma != 0 && dq_stage != 0u &&
+        GateType == DS4_QWEN4EXP_TY_q4_K && UpType == DS4_QWEN4EXP_TY_q4_K &&
+        ((((uintptr_t)gate_e) | ((uintptr_t)up_e) | (uintptr_t)gate_row_bytes |
+          (uintptr_t)up_row_bytes) & 15u) == 0u &&
+        /* A fill covers QW_DMA_PER/2 WHOLE super-blocks, so the K extent
+         * must be a whole number of them or the last fill would read past
+         * the row.  Production K is 2560 = 80 groups = 10 super-blocks; any
+         * other extent takes the shipped path. */
+        (QW_DMA_PER == 1 || (groups & (QW_DMA_PER == 4 ? 15u : 7u)) == 0u);
+    /* One fill: 64 units x QW_DMA_J sixteen-byte pieces, handed out so that
+     * QW_DMA_J consecutive lanes cover one unit's contiguous run.  The FETCH
+     * map is decoupled from the tile map; that is the whole mechanism. */
+    auto qw_dma_slot = [&](uint32_t j, uint32_t u) -> uint32_t {
+        return j * QW_DMA_US + (QW_DMA_SWZ ? (u ^ ((j >> 2) & 1u)) : u);
+    };
+    auto qw_dma_src = [&](uint32_t fi, uint32_t k, uint32_t *slot)
+            -> const char * {
+        const uint32_t off = (QW_DMA_PER == 4)
+            ? (fi * 288u)
+            : ((QW_DMA_PER == 2) ? (fi * 144u + 16u)
+                                 : ((fi >> 1) * 144u + 16u + 64u * (fi & 1u)));
+        const uint32_t i = tid + QW_MMA_THREADS * k;
+        const uint32_t u = i / (uint32_t)QW_DMA_J;
+        const uint32_t j = i - u * (uint32_t)QW_DMA_J;
+        const uint32_t mm = row0 + (u >> 1);
+        *slot = qw_dma_slot(j, u);
+        if (mm >= mid_dim) return NULL;
+        return ((u & 1u) ? up_e : gate_e)
+             + (uint64_t)mm * ((u & 1u) ? up_row_bytes : gate_row_bytes)
+             + off + 16u * j;
+    };
+    /* Asynchronous arm (Dma 3/4): LDGSTS straight into shared. */
+    auto qw_dma_issue = [&](uint32_t fi) {
+#pragma unroll
+        for (uint32_t k = 0; k < (uint32_t)QW_DMA_NF; k++) {
+            uint32_t slot; const char *gsrc = qw_dma_src(fi, k, &slot);
+            if (gsrc) qw_cpasync16(
+                (uint32_t)__cvta_generic_to_shared(&sRaw[slot]), gsrc);
+        }
+        qw_cpasync_commit();
+    };
+    /* Synchronous arm (Dma 1/2): the global load is issued at the TOP of the
+     * chunk, so it has that chunk's whole decode to land in -- the tip's own
+     * one-chunk depth -- and the shared store is taken after the chunk's
+     * pre-MMA barrier, by which point every thread has finished reading the
+     * buffer.  Neither step adds a barrier. */
+    auto qw_dma_fetch = [&](uint32_t fi, uint4 *f) {
+#pragma unroll
+        for (uint32_t k = 0; k < (uint32_t)QW_DMA_NF; k++) {
+            uint32_t slot; const char *gsrc = qw_dma_src(fi, k, &slot);
+            f[k] = gsrc ? *(const uint4 *)(const void *)gsrc
+                        : make_uint4(0u, 0u, 0u, 0u);
+        }
+    };
+    auto qw_dma_store = [&](uint32_t fi, const uint4 *f) {
+#pragma unroll
+        for (uint32_t k = 0; k < (uint32_t)QW_DMA_NF; k++) {
+            uint32_t slot; (void)qw_dma_src(fi, k, &slot);
+            sRaw[slot] = f[k];
+        }
+    };
+    /* The eight words qw_raw_load's q4_K arm returns for this lane's slice of
+     * chunk kc_, out of the staged buffer. */
+    auto qw_dma_hdr = [&](uint32_t kc_) -> uint4 {
+        const uint32_t sbi = (QW_DMA_PER == 4) ? ((kc_ >> 3) & 1u) : 0u;
+        return sRaw[qw_dma_slot(9u * sbi, 2u * dec_r + w_tile)];
+    };
+    auto qw_dma_read = [&](uint32_t kc_, uint32_t *w) {
+        const uint32_t sbi = (QW_DMA_PER == 4) ? ((kc_ >> 3) & 1u) : 0u;
+        const uint32_t pp = (QW_DMA_PER == 1) ? 0u : ((kc_ >> 2) & 1u);
+        const uint32_t j0 = (QW_DMA_HDR ? (9u * sbi + 1u) : 0u)
+                          + 2u * (2u * pp + w_slice);
+        const uint32_t uu = 2u * dec_r + w_tile;
+        const uint4 a = sRaw[qw_dma_slot(j0, uu)];
+        const uint4 b = sRaw[qw_dma_slot(j0 + 1u, uu)];
+        w[0] = a.x; w[1] = a.y; w[2] = a.z; w[3] = a.w;
+        w[4] = b.x; w[5] = b.y; w[6] = b.z; w[7] = b.w;
+    };
 
     const int32_t first_pair = PairTasks ? active[2u + 2u * blockIdx.y] : 0;
     const int32_t end_pair = PairTasks ? min(cnt, first_pair + QW_MMA_BN) : cnt;
@@ -3140,7 +3281,11 @@ qwen4exp_moe_gateup_mma_kernel(
          * groups 2*slice and 2*slice+1.  The row alignment w_fast checked
          * makes qw_raw_load take its widest arm, but the value it returns is
          * the same words any arm of it loads. */
-        if (w_fast && dec_mrow < mid_dim && 2u * w_slice < groups) {
+        uint4 dmaf[Dma ? QW_DMA_NF : 1];
+        if (dma_on) {
+            if (QW_DMA_ASYNC) { qw_dma_issue(0u); }
+            else { qw_dma_fetch(0u, dmaf); qw_dma_store(0u, dmaf); }
+        } else if (w_fast && dec_mrow < mid_dim && 2u * w_slice < groups) {
             qw_raw_load((uint32_t)DS4_QWEN4EXP_TY_q4_K, w_row, 2u * w_slice,
                         raww);
         }
@@ -3159,7 +3304,23 @@ qwen4exp_moe_gateup_mma_kernel(
         for (int i = 0; i < QW_MMA_NT * 4; i++) { accG[i] = 0.0f; accU[i] = 0.0f; }
 
         for (uint32_t kc = 0; kc < groups; kc += QW_MMA_G) {
+            /* The fill this chunk consumes was issued after the previous
+             * chunk's pre-MMA barrier, so it had that chunk's whole MMA to
+             * land in; the wait costs nothing when it already has.  It sits
+             * before the loop's existing barrier, which is what makes every
+             * thread's copies visible to every other -- no barrier is added. */
+            if (dma_on && QW_DMA_ASYNC) qw_cpasync_wait0();
             __syncthreads();
+            if (dma_on) {
+                qw_dma_read(kc, raww);
+                /* The synchronous arm issues the next fill's global loads
+                 * here, into registers, so they have this chunk's whole
+                 * decode to land in -- the tip's own one-chunk depth. */
+                if (!QW_DMA_ASYNC && kc + QW_MMA_G < groups &&
+                    ((kc >> 2) & (uint32_t)(QW_DMA_PER - 1)) ==
+                        (uint32_t)(QW_DMA_PER - 1))
+                    qw_dma_fetch((kc >> 2) / (uint32_t)QW_DMA_PER + 1u, dmaf);
+            }
             /* The next chunk's weight payload is issued the moment this
              * chunk's copy of the register is dead -- between the two
              * decodes -- rather than after both, so the load has the rest of
@@ -3248,7 +3409,8 @@ qwen4exp_moe_gateup_mma_kernel(
                     /* The next chunk's slice, issued once this chunk's raw
                      * words are consumed -- same one-chunk depth as the
                      * per-group prefetch, over the two groups it covers. */
-                    if (kc + QW_MMA_G < groups && dec_mrow < mid_dim) {
+                    if (!dma_on && kc + QW_MMA_G < groups &&
+                        dec_mrow < mid_dim) {
                         const uint32_t gn = kc + QW_MMA_G + 2u * w_slice;
                         if (gn < groups) {
                             qw_raw_load((uint32_t)DS4_QWEN4EXP_TY_q4_K, w_row,
@@ -3312,6 +3474,15 @@ qwen4exp_moe_gateup_mma_kernel(
                 }
             }
             __syncthreads();
+            /* Every thread has read the buffer above this barrier, so the
+             * next fill may overwrite it now and has the MMA below to land. */
+            if (dma_on && kc + QW_MMA_G < groups &&
+                ((kc >> 2) & (uint32_t)(QW_DMA_PER - 1)) ==
+                    (uint32_t)(QW_DMA_PER - 1)) {
+                const uint32_t fi = (kc >> 2) / (uint32_t)QW_DMA_PER + 1u;
+                if (QW_DMA_ASYNC) qw_dma_issue(fi);
+                else qw_dma_store(fi, dmaf);
+            }
 
 #pragma unroll
             for (int gg = 0; gg < QW_MMA_G; gg++) {
@@ -3692,7 +3863,58 @@ __device__ __forceinline__ static void qwen4exp_shared_vector_accumulate(
  * warp streams a different weight row and the barrier before the shared fold
  * waits on the slowest of them, so narrowing the block narrows the latency
  * spread it absorbs. Inactive row warps still join barriers. */
-template <int R, int Type, bool Vector = false, unsigned OutputRows = 4>
+
+/* ============== cooperative 8-row decode panel (kernel only) ==============
+ * The shipped decode GEMV gives one output row to a 64-thread block: two
+ * warps, one on the gate row and one on the up row, each lane walking its own
+ * groups with 32-byte reads that are 1440 B apart across the warp.  Nothing
+ * about the bytes is wrong -- the kernel is at the streaming roofline for what
+ * it asks for -- but the request stream is as scattered as the row stride.
+ *
+ * The cooperative arm changes only the BLOCK SHAPE.  One CTA owns eight
+ * consecutive output rows (512 threads, 16 warps), stages the two matrices'
+ * eight-row panels -- 2 x 8 x 1440 B of the SHIPPED bytes, in the SHIPPED
+ * order -- with a fully coalesced grid-stride uint4 copy, and then hands every
+ * lane exactly the sixteen-byte pieces it owns today, in the order it reads
+ * them today, out of shared memory.
+ *
+ * Nothing is re-quantised, re-represented, re-formatted, mirrored or permuted:
+ * the staged panel is a verbatim byte image of the rows the same CTA's warps
+ * would have read individually, and it lives only for the life of the CTA.
+ * Group ownership is unchanged (lane l still owns groups l, l+32, l+64), so
+ * each warp's partial sums enter warp_sum_f32 in the same order with the same
+ * values, and every emitted float is bit-identical.
+ *
+ * Instantiated only for the tower's q4_K gate/up shape: in_dim 2560, i.e.
+ * groups 80, ten 144-byte super-blocks = a 1440-byte row = 90 uint4.  The
+ * launcher checks that shape; every other shape keeps the shipped block. */
+// Ranked resubmission of the same kernel pair (fetch-path only; arithmetic unchanged).
+#ifndef DS4_GATEUP_COOP_BUILD
+#define DS4_GATEUP_COOP_BUILD 1
+#endif
+#define QW_GU_COOP_ROWS 8u
+#define QW_GU_COOP_ROW_U4 90u                /* 1440 B, ten q4_K super-blocks */
+#define QW_GU_COOP_GROUPS 80u                            /* in_dim 2560 / 32 */
+#define QW_GU_COOP_U4 (QW_GU_COOP_ROWS * QW_GU_COOP_ROW_U4)
+
+/* The eight payload words qw_raw_load's q4_K arm returns for (row, group),
+ * read out of the staged copy of the identical row bytes.  A q4_K row is 90
+ * uint4 and a super-block is 9 of them: one 16-byte header (d, dmin, twelve
+ * scale bytes) then four 32-byte payload slices, and group g takes slice
+ * (g % 8) >> 1 of super-block g / 8 -- the address qw_raw_load computes. */
+__device__ __forceinline__ static void qw_gu_coop_raw_load(
+        const uint4 *sh, uint32_t wrow, uint32_t g, uint32_t *w) {
+    const uint32_t b = wrow * QW_GU_COOP_ROW_U4 + (g >> 3) * 9u + 1u
+                     + ((g & 7u) >> 1) * 2u;
+    const uint4 lo = sh[b];
+    const uint4 hi = sh[b + 1u];
+    w[0] = lo.x; w[1] = lo.y; w[2] = lo.z; w[3] = lo.w;
+    w[4] = hi.x; w[5] = hi.y; w[6] = hi.z; w[7] = hi.w;
+}
+/* ======================================================================== */
+
+template <int R, int Type, bool Vector = false,
+          unsigned OutputRows = 4, bool Coop = false>
 __global__ static void qwen4exp_moe_gateup_split_kernel(
         float *mid,
         const char *gate,
@@ -3732,6 +3954,39 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
         (uint64_t)expert * (second ? up_expert_bytes : gate_expert_bytes) +
         (uint64_t)(live ? row : 0u) * (second ? up_row_bytes : gate_row_bytes);
     __shared__ float projected[R][OutputRows * 2u];
+    /* The staged panel.  Both early returns above are uniform over the block
+     * (blockIdx.y, the active list and counts[expert] are block-invariant), so
+     * every thread that reaches the barrier below reaches it together. */
+    __shared__ __align__(16) uint4 wcoop[Coop ? 2u * QW_GU_COOP_U4 : 1u];
+    const uint4 *wsh = NULL;
+    uint32_t wrow = 0u;
+    if (Coop) {
+        /* The panel is a fixed-size static allocation, so the instantiation is
+         * only answerable at the tower's q4_K gate/up row shape.  The launcher
+         * refuses every other shape; this is the belt to that brace, and it is
+         * uniform over the block, outside the group loop, and free. */
+        if (groups != QW_GU_COOP_GROUPS ||
+            gate_row_bytes != (uint64_t)QW_GU_COOP_ROW_U4 * 16u ||
+            up_row_bytes != (uint64_t)QW_GU_COOP_ROW_U4 * 16u) return;
+        const uint32_t row0 = blockIdx.x * OutputRows;
+        const uint32_t left = mid_dim > row0 ? mid_dim - row0 : 0u;
+        const uint32_t rows_here = left < OutputRows ? left : OutputRows;
+        const uint32_t words = rows_here * QW_GU_COOP_ROW_U4;
+        const char *const gb = gate +
+            (uint64_t)expert * gate_expert_bytes +
+            (uint64_t)row0 * gate_row_bytes;
+        const char *const ub = up +
+            (uint64_t)expert * up_expert_bytes +
+            (uint64_t)row0 * up_row_bytes;
+        for (uint32_t i = threadIdx.x; i < words; i += blockDim.x) {
+            wcoop[i] = *(const uint4 *)(const void *)(gb + (uint64_t)i * 16u);
+            wcoop[QW_GU_COOP_U4 + i] =
+                *(const uint4 *)(const void *)(ub + (uint64_t)i * 16u);
+        }
+        __syncthreads();
+        wsh = wcoop + (second ? QW_GU_COOP_U4 : 0u);
+        wrow = warp >> 1u;
+    }
     for (int32_t at = 0; at < cnt; at += R) {
         const int32_t take = (cnt - at) < R ? (cnt - at) : R;
         uint32_t tok[R];
@@ -3765,8 +4020,14 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
                 int8_t wq[32]; \
                 float wa[2] = {0.0f, 0.0f}; \
                 float wb[2] = {0.0f, 0.0f}; \
-                dev_qwen4exp_group_decode_w((uint32_t)Type, weight_row, g_, \
-                                            (RAWP), wq, wa, wb); \
+                if (Coop) \
+                    dev_qwen4exp_group_decode_w((uint32_t)Type, \
+                        (const char *)(const void *) \
+                            &wsh[wrow * QW_GU_COOP_ROW_U4], g_, \
+                        (RAWP), wq, wa, wb); \
+                else \
+                    dev_qwen4exp_group_decode_w((uint32_t)Type, weight_row, g_, \
+                                                (RAWP), wq, wa, wb); \
                 const int halves = 1; \
                 _Pragma("unroll") \
                 for (int r = 0; r < R; r++) { \
@@ -3785,17 +4046,30 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
             for (; g + 32u < groups; g += 64u) {
                 uint32_t raw0[8];
                 uint32_t raw1[8];
-                const uint32_t *p0 =
-                    qw_raw_load((uint32_t)Type, weight_row, g, raw0) ? raw0 : NULL;
-                const uint32_t *p1 =
-                    qw_raw_load((uint32_t)Type, weight_row, g + 32u, raw1) ? raw1 : NULL;
+                const uint32_t *p0, *p1;
+                if (Coop) {
+                    qw_gu_coop_raw_load(wsh, wrow, g, raw0);
+                    qw_gu_coop_raw_load(wsh, wrow, g + 32u, raw1);
+                    p0 = raw0; p1 = raw1;
+                } else {
+                    p0 = qw_raw_load((uint32_t)Type, weight_row, g, raw0)
+                       ? raw0 : NULL;
+                    p1 = qw_raw_load((uint32_t)Type, weight_row, g + 32u, raw1)
+                       ? raw1 : NULL;
+                }
                 QWEN4EXP_SPLIT_GROUP(g, p0);
                 QWEN4EXP_SPLIT_GROUP(g + 32u, p1);
             }
             for (; g < groups; g += 32u) {
                 uint32_t raw[8];
-                const uint32_t *rawp =
-                    qw_raw_load((uint32_t)Type, weight_row, g, raw) ? raw : NULL;
+                const uint32_t *rawp;
+                if (Coop) {
+                    qw_gu_coop_raw_load(wsh, wrow, g, raw);
+                    rawp = raw;
+                } else {
+                    rawp = qw_raw_load((uint32_t)Type, weight_row, g, raw)
+                         ? raw : NULL;
+                }
                 QWEN4EXP_SPLIT_GROUP(g, rawp);
             }
 #undef QWEN4EXP_SPLIT_GROUP
@@ -6402,6 +6676,20 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
      * lives.  This exposes fixed nibble decoding and a fixed one-half
      * accumulation to nvcc, without converting or copying any weight. */
     const bool specialize = getenv("DS4_QWEN4EXP_GENERIC_EXPERTS") == NULL;
+    /* ---- the DMA staging arm of the routed q4_K gate/up prefill tile ----
+     * Compile switch: -DDS4_GATEUP_DMA_BUILD=0 removes the arm entirely (the
+     * q4_K specialisation then instantiates Dma = 0, which is the shipped
+     * kernel).  Run-time switch: DS4_GATEUP_DMA=0 restores the shipped
+     * kernel from the same binary.  Both arms live in one build, so an A/B
+     * is two runs of one binary and not two builds. */
+#ifndef DS4_GATEUP_DMA_BUILD
+#define DS4_GATEUP_DMA_BUILD 1
+#endif
+#if DS4_GATEUP_DMA_BUILD
+#define QW_GATEUP_DMA_ARM 5
+#else
+#define QW_GATEUP_DMA_ARM 0
+#endif
 #define QWEN4EXP_GATEUP(R) do { \
     if (specialize && gate_slab->type == DS4_QWEN4EXP_TY_q4_K && \
                       up_slab->type == DS4_QWEN4EXP_TY_q4_K) { \
@@ -6428,8 +6716,8 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
                     gu_tasks, sc.counts, n_total_expert);
             if (!cuda_ok(cudaGetLastError(), "qwen4exp gate/up pair tasks")) return 0;
         }
-#define QWEN4EXP_GATEUP_MMA_IMPL(GT, UT, TASKS) \
-        qwen4exp_moe_gateup_mma_kernel<GT, UT, TASKS><<< \
+#define QWEN4EXP_GATEUP_MMA_IMPL(GT, UT, TASKS, DMA) \
+        qwen4exp_moe_gateup_mma_kernel<GT, UT, TASKS, DMA><<< \
                 dim3(mid_dim / QW_MMA_BM, TASKS ? (unsigned)task_capacity : gu_rows, 1), \
                 QW_MMA_THREADS, 0, stream>>>( \
                 (float *)mid->ptr, \
@@ -6443,13 +6731,38 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
                 up_slab->expert_bytes, up_slab->row_bytes, \
                 gate_slab->type, up_slab->type, xgroups, mid_dim, \
                 mid_token_stride, n_expert_used, gu_dq_stage)
-#define QWEN4EXP_GATEUP_MMA(GT, UT) do { \
-        if (pair_tasks) { QWEN4EXP_GATEUP_MMA_IMPL(GT, UT, true); } \
-        else { QWEN4EXP_GATEUP_MMA_IMPL(GT, UT, false); } \
+#define QWEN4EXP_GATEUP_MMA_D(GT, UT, DMA) do { \
+        if (pair_tasks) { QWEN4EXP_GATEUP_MMA_IMPL(GT, UT, true, DMA); } \
+        else { QWEN4EXP_GATEUP_MMA_IMPL(GT, UT, false, DMA); } \
     } while (0)
+#define QWEN4EXP_GATEUP_MMA(GT, UT) QWEN4EXP_GATEUP_MMA_D(GT, UT, 0)
         if (specialize && gate_slab->type == DS4_QWEN4EXP_TY_q4_K &&
                           up_slab->type == DS4_QWEN4EXP_TY_q4_K) {
-            QWEN4EXP_GATEUP_MMA(DS4_QWEN4EXP_TY_q4_K, DS4_QWEN4EXP_TY_q4_K);
+            /* The staging arm reads the ORIGINAL stored bytes -- it changes
+             * only the path from DRAM to the staging lane -- but the fill is
+             * a 128-byte run inside one q4_K super-block, so it needs the
+             * whole-super-block K extent and the sixteen-byte alignment the
+             * slab already has.  The host resolves the shape once, before
+             * any launch, so both task shapes see one answer; the kernel
+             * repeats the test itself (block-uniform, outside the K loop)
+             * and falls back rather than stage a fill it cannot hold. */
+            const char *gu_dma_env = getenv("DS4_GATEUP_DMA");
+            const bool gu_dma = QW_GATEUP_DMA_ARM != 0 && gu_dq_stage != 0u &&
+                (gu_dma_env == NULL || gu_dma_env[0] != '0') &&
+                (xgroups % 8u) == 0u &&
+                ((((uintptr_t)gate) | ((uintptr_t)up) |
+                  (uintptr_t)gate_slab->expert_bytes |
+                  (uintptr_t)up_slab->expert_bytes |
+                  (uintptr_t)gate_slab->row_bytes |
+                  (uintptr_t)up_slab->row_bytes) & 15u) == 0u;
+            if (gu_dma) {
+                QWEN4EXP_GATEUP_MMA_D(DS4_QWEN4EXP_TY_q4_K,
+                                      DS4_QWEN4EXP_TY_q4_K,
+                                      QW_GATEUP_DMA_ARM);
+            } else {
+                QWEN4EXP_GATEUP_MMA(DS4_QWEN4EXP_TY_q4_K,
+                                    DS4_QWEN4EXP_TY_q4_K);
+            }
         } else if (specialize && gate_slab->type == DS4_QWEN4EXP_TY_q8_0 &&
                                  up_slab->type == DS4_QWEN4EXP_TY_q8_0) {
             QWEN4EXP_GATEUP_MMA(DS4_QWEN4EXP_TY_q8_0, DS4_QWEN4EXP_TY_q8_0);
@@ -6457,6 +6770,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             QWEN4EXP_GATEUP_MMA(-1, -1);
         }
 #undef QWEN4EXP_GATEUP_MMA
+#undef QWEN4EXP_GATEUP_MMA_D
 #undef QWEN4EXP_GATEUP_MMA_IMPL
     }
     /* The measured Q4 path for the R=2 tile (one-row decode and two-row
@@ -6472,8 +6786,24 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         /* Vector reads require alignment; the scalar schedule remains available. */
         const bool vector = ((uintptr_t)sc.xq & 15u) == 0u &&
             getenv("DS4_QWEN4EXP_NO_SPLIT_VECTOR") == NULL;
-#define QWEN4EXP_SPLIT_GATEUP(V, P) \
-        qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P><<< \
+        /* COOPERATIVE 8-ROW PANEL.  Kernel-only: the shipped bytes, the
+         * shipped order, the same per-lane pieces, only the block shape and
+         * where the loads are served from change.  DS4_GATEUP_COOP=0 restores
+         * the shipped one-row block byte for byte; -DDS4_GATEUP_COOP_BUILD=0
+         * removes the arm at compile time.  The static shared panel is sized
+         * for the tower's q4_K gate/up row (groups 80, 1440-byte rows), so any
+         * other shape keeps the shipped block. */
+        const char *const coop_env = getenv("DS4_GATEUP_COOP");
+        const bool coop = (DS4_GATEUP_COOP_BUILD != 0) && vector &&
+            (coop_env == NULL || coop_env[0] != '0') &&
+            xgroups == QW_GU_COOP_GROUPS &&
+            gate_slab->row_bytes == (uint64_t)QW_GU_COOP_ROW_U4 * 16u &&
+            up_slab->row_bytes == (uint64_t)QW_GU_COOP_ROW_U4 * 16u &&
+            ((uintptr_t)gate & 15u) == 0u && ((uintptr_t)up & 15u) == 0u &&
+            (gate_slab->expert_bytes & 15ull) == 0ull &&
+            (up_slab->expert_bytes & 15ull) == 0ull;
+#define QWEN4EXP_SPLIT_GATEUP(V, P, C) \
+        qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P, C><<< \
             dim3((mid_dim + P - 1u) / P, gu_rows, 1), P * 64u, 0, stream>>>( \
             (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum, \
             sc.pairs, sc.counts, sc.offsets, gu_active, \
@@ -6493,8 +6823,9 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
          * is zero for both warps, so each still walks its own row in the
          * same group order through the same warp_sum_f32 tree and every dot
          * is bit-identical.  mid_dim 640 gives 640 blocks. */
-        if (vector) { QWEN4EXP_SPLIT_GATEUP(true, 1u); }
-        else { QWEN4EXP_SPLIT_GATEUP(false, 4u); }
+        if (coop) { QWEN4EXP_SPLIT_GATEUP(true, QW_GU_COOP_ROWS, true); }
+        else if (vector) { QWEN4EXP_SPLIT_GATEUP(true, 1u, false); }
+        else { QWEN4EXP_SPLIT_GATEUP(false, 4u, false); }
 #undef QWEN4EXP_SPLIT_GATEUP
     }
     else if (tile == 8) { QWEN4EXP_GATEUP(8); }
