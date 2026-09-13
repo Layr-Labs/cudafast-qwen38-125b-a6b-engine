@@ -76115,6 +76115,20 @@ static int qwen4exp_seam_draft_rows(void *ctx, const int *next_tokens,
     return 0;
 }
 
+static int qwen4exp_seam_draft_confidence(void *ctx, float *margin_out,
+                                          float *top_logit_out,
+                                          float *second_logit_out,
+                                          int *second_id_out) {
+    ds4_session *s = ctx;
+    if (!margin_out || !top_logit_out || !second_logit_out || !second_id_out ||
+        !s->qwen4exp_head.last_draft_margin_valid) return -1;
+    *margin_out = s->qwen4exp_head.last_draft_margin;
+    *top_logit_out = s->qwen4exp_head.top_values_host[0];
+    *second_logit_out = s->qwen4exp_head.top_values_host[1];
+    *second_id_out = s->qwen4exp_head.last_draft_second_id;
+    return 0;
+}
+
 /* Build the seam, the rollback set and the head, once per session.  Returns
  * false with a named message when anything refuses, and the caller returns -1:
  * a half-built cycle is a refusal, not a reason to speculate anyway. */
@@ -76201,7 +76215,6 @@ static bool ds4_session_qwen4exp_spec_init(ds4_session *s,
     s->qwen4exp_seam.head_logits  = qwen4exp_seam_head_logits;
     s->qwen4exp_seam.draft_step   = qwen4exp_seam_draft_step;
     s->qwen4exp_seam.draft_rows   = qwen4exp_seam_draft_rows;
-
     const int depth = ds4_qwen4exp_mtp_depth_from_draft_tokens(
             e->mtp_draft_tokens, err, errlen);
     if (depth < 0) return false;
@@ -76212,6 +76225,17 @@ static bool ds4_session_qwen4exp_spec_init(ds4_session *s,
                                     err, errlen) != 0) {
         return false;
     }
+    const char *confidence_log = getenv("DS4_MTP_CONFIDENCE_LOG");
+    const bool confidence_diagnostics = confidence_log && confidence_log[0] &&
+        strcmp(confidence_log, "0") != 0;
+    head->device_second_policy = depth == 1 && !confidence_diagnostics;
+    head->collect_draft_confidence = !head->device_second_policy;
+    head->second_margin_threshold =
+        s->qwen4exp_spec.second_margin_threshold;
+    head->second_logit_threshold =
+        s->qwen4exp_spec.second_logit_threshold;
+    s->qwen4exp_seam.draft_confidence = head->collect_draft_confidence
+        ? qwen4exp_seam_draft_confidence : NULL;
     s->qwen4exp_spec_failed = false;
     s->qwen4exp_spec_ready = true;
     return true;
