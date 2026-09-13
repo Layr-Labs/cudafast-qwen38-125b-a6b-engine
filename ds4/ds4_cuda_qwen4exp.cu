@@ -1765,6 +1765,36 @@ __device__ __forceinline__ static bool qwen4exp_word_aligned(const void *p) {
  * without reverting the change. */
 #define DS4_QWEN4EXP_WIDE_PAYLOAD 1
 #endif
+/* The six payload words of a q5_1 block, in address order.  qw_load_words8
+ * below covers the 32-byte q4_K/q5_K payload slice because 32 is a multiple of
+ * 16; a q5_1 block is 24 bytes, which is not, so the wide form was never
+ * spelled for it.  24 IS a multiple of 8, and so are down_row_bytes (480) and
+ * the per-expert stride (2560 * 480), so an 8-byte-aligned row makes every
+ * block 8-byte aligned and three uint2 loads replace six word loads.  The
+ * test is on the address, so a row that is only 4-byte aligned still takes the
+ * word loop and the bytes delivered are identical either way.
+ *
+ * MEASURED: +8.5 bips of prefill_speedup (f123581f 3.32976 -> e0a166f2
+ * 3.34111).  Real, but a third of what I first claimed -- the first reading
+ * compared raw candidate leg times across two runs, which the paired design
+ * makes meaningless.  Only control/candidate ratios compare. */
+__device__ __forceinline__ static void qw_load_words6(const uint32_t *qw,
+                                                      uint32_t *w) {
+#if DS4_QWEN4EXP_WIDE_PAYLOAD
+    if ((((uintptr_t)qw) & 7u) == 0u) {
+        const uint2 a = *(const uint2 *)(const void *)qw;
+        const uint2 b = *(const uint2 *)(const void *)(qw + 2);
+        const uint2 c = *(const uint2 *)(const void *)(qw + 4);
+        w[0] = a.x; w[1] = a.y;
+        w[2] = b.x; w[3] = b.y;
+        w[4] = c.x; w[5] = c.y;
+        return;
+    }
+#endif
+#pragma unroll
+    for (int i = 0; i < 6; i++) w[i] = qw[i];
+}
+
 __device__ __forceinline__ static void qw_load_words8(const uint32_t *qw,
                                                       uint32_t *w) {
 #if DS4_QWEN4EXP_WIDE_PAYLOAD
@@ -2880,9 +2910,7 @@ __device__ __forceinline__ static bool qw_raw_load(
     case (uint32_t)DS4_QWEN4EXP_TY_q5_1: {
         const cuda_block_q5_1 *xb = (const cuda_block_q5_1 *)row + g;
         if (!qwen4exp_word_aligned(xb)) return false;
-        const uint32_t *qw = (const uint32_t *)(const void *)xb;
-#pragma unroll
-        for (int i = 0; i < 6; i++) w[i] = qw[i];
+        qw_load_words6((const uint32_t *)(const void *)xb, w);
         return true;
     }
     case (uint32_t)DS4_QWEN4EXP_TY_q5_K: {
