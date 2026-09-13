@@ -2760,6 +2760,32 @@ __global__ static void qwen4exp_moe_zero_invalid_kernel(
 #define QW_DOWN_MMA_THREADS (QW_DOWN_MMA_WARPS * 32)
 #define QW_DOWN_MMA_NT (QW_MMA_BN / 8)
 
+/* OCCUPANCY FLOOR FOR THE TWO ROUTED MoE TILES.
+ *
+ * Both tiles carried __launch_bounds__ with only the thread count, which caps
+ * the block but says nothing about occupancy: it leaves the allocator free to
+ * spend up to the hardware maximum per thread and optimise a single resident
+ * block.  Every attention kernel in this file already states a second bound
+ * (256,2 / 256,1, and the GDN kernel names QWEN4EXP_GDN_OCTET_BLOCKS_PER_SM),
+ * so these two were the outliers rather than a considered choice.
+ *
+ * Both blocks are QW_MMA_WARPS = 4 warps, and each stages about 15.5 KiB
+ * (three 32x132 byte tiles for gate/up, a 64x132 and a 32x132 for down, plus
+ * the per-group scale rows), so shared memory alone allows several resident
+ * blocks and the residency that is actually achieved is set by the register
+ * file.  Asking for eight blocks is a register FLOOR, not a shared-memory
+ * request -- the second bound only constrains allocation, so it cannot make a
+ * launch fail, it can only make the allocator spill if it cannot meet the
+ * number.  Eight was chosen over twelve (which would force the ~42 registers
+ * that full four-warp residency implies) because spilling the MMA
+ * accumulators is a worse failure than stopping short of full occupancy, and
+ * over six because six barely constrains anything.
+ *
+ * This changes no arithmetic whatsoever: it is a hint to the register
+ * allocator and the staged values, their order and the epilogue are
+ * untouched, so the tiles remain bit-identical to the oracle paths. */
+#define QW_MMA_BLOCKS_PER_SM 8
+
 /* The pipeline gives every thread exactly one slot of each tile per chunk,
  * which is what makes the one-chunk-deep register prefetch enough. */
 static_assert(QW_MMA_BM * QW_MMA_G == QW_MMA_THREADS,
@@ -3020,7 +3046,7 @@ __device__ __forceinline__ static void qw_mma_m16n8k32(
  * The ordinary expert list remains the fallback and the down projection's
  * input. No weight or activation representation changes. */
 template <int GateType = -1, int UpType = -1, bool PairTasks = false>
-__global__ __launch_bounds__(QW_MMA_THREADS) static void
+__global__ __launch_bounds__(QW_MMA_THREADS, QW_MMA_BLOCKS_PER_SM) static void
 qwen4exp_moe_gateup_mma_kernel(
         float *mid,
         int8_t *mq,
@@ -3458,7 +3484,7 @@ qwen4exp_moe_gateup_mma_kernel(
  * so the pair index addresses it directly.
  */
 template <int DownType = -1>
-__global__ __launch_bounds__(QW_DOWN_MMA_THREADS) static void
+__global__ __launch_bounds__(QW_DOWN_MMA_THREADS, QW_MMA_BLOCKS_PER_SM) static void
 qwen4exp_moe_down_mma_kernel(
         float *partial,
         const char *down,
