@@ -3693,7 +3693,13 @@ __device__ __forceinline__ static void qwen4exp_shared_vector_accumulate(
  * waits on the slowest of them, so narrowing the block narrows the latency
  * spread it absorbs. Inactive row warps still join barriers. */
 template <int R, int Type, bool Vector = false, unsigned OutputRows = 4>
-__global__ static void qwen4exp_moe_gateup_split_kernel(
+/* The production 64-thread tile otherwise settles at 72 registers, which
+ * admits only fourteen blocks per GB10 SM.  Fifteen requested resident blocks
+ * make ptxas use 64 registers with no local stack, exposing two additional
+ * warps per SM while leaving the kernel body and arithmetic unchanged. */
+__global__ __launch_bounds__(OutputRows * 64u,
+                             OutputRows == 1u ? 15u : 1u)
+static void qwen4exp_moe_gateup_split_kernel(
         float *mid,
         const char *gate,
         const char *up,
