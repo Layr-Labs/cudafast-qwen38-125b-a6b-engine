@@ -1790,6 +1790,44 @@ __device__ __forceinline__ static void qw_load_words8(const uint32_t *qw,
     for (int i = 0; i < 8; i++) w[i] = qw[i];
 }
 
+/* THE SIX-WORD CASE, WHICH THE WIDE ARMS ABOVE NEVER COVERED.  A q5_1 group
+ * IS its own twenty-four byte block: one scale word, one qh word, four qs
+ * words.  Twenty-four is not a multiple of sixteen, so the uint4 arms above
+ * cannot spell it and the q5_1 payload kept the six-word form while q4_K and
+ * q5_K took the wide arms.  It is a multiple of eight, and so are every
+ * stride that can place a block -- sizeof is 24, down_row_bytes is 480, and
+ * an expert's slab is 2560 rows of 480 -- so whenever the slab base is
+ * eight-byte aligned every block in it is, and three uint2 loads spell the
+ * whole block.
+ *
+ * WHY THIS IS THE LOAD THAT MATTERS.  The threads of a warp sit on twenty-four
+ * byte centres, so a warp's six word loads are six uncoalesced instructions
+ * that each ask the L1 for the same scattered span of lines over again; three
+ * eight-byte loads ask half as often for the identical bytes.  It adds no
+ * register: the three pairs land in the six words the loop wrote.
+ *
+ * uint2 .x .y are words 0..1 of the eight bytes at the address, in address
+ * order -- the argument documented above qw_load_words8, unchanged -- so w[]
+ * receives the same six values and only the instruction count moves.  The
+ * test is on the block address, which is fixed by the slab's strides and not
+ * by the thread, so it is uniform across the warp and both arms are exact. */
+__device__ __forceinline__ static void qw_load_words6(const uint32_t *qw,
+                                                      uint32_t *w) {
+#if DS4_QWEN4EXP_WIDE_PAYLOAD
+    if ((((uintptr_t)qw) & 7u) == 0u) {
+        const uint2 a = *(const uint2 *)(const void *)qw;
+        const uint2 b = *(const uint2 *)(const void *)(qw + 2);
+        const uint2 c = *(const uint2 *)(const void *)(qw + 4);
+        w[0] = a.x; w[1] = a.y;
+        w[2] = b.x; w[3] = b.y;
+        w[4] = c.x; w[5] = c.y;
+        return;
+    }
+#endif
+#pragma unroll
+    for (int i = 0; i < 6; i++) w[i] = qw[i];
+}
+
 /* Decode one 32-element group of a quantised weight row into int8 quants and
  * the one or two (wa, wb) pairs that turn an integer dot into the row's
  * contribution.  Called once per group per output row, not once per element.
@@ -2004,6 +2042,140 @@ __device__ __forceinline__ static void qwen4exp_group_accumulate(
         const int32_t d1 = qwen4exp_dp4a<16>(wq + 16, xqg + 16);
         *acc += (wa[0] * xscale) * (float)d0;
         *acc += (wa[1] * xscale) * (float)d1;
+    }
+}
+
+/* THE halves==1 ARM, TAKING THE DECODED GROUP AS THE EIGHT WORDS IT ALREADY IS.
+ *
+ * qwen4exp_dp4a says of its weight operand "a is decoded register-local weight
+ * data and keeps the byte packer", and that byte packer is what this removes.
+ * Every decoder in this file computes a group as eight 32-bit words -- the
+ * (v & 0x0f0f0f0f) | spread words -- then scatters them into int8_t wq[32] one
+ * byte at a time, and qwen4exp_load_i8x4 immediately rebuilds each four-byte run
+ * into the word it came from.  Thirty-two byte inserts and eight three-shift/
+ * three-or reassemblies per group, per accumulated row, to hand dp4a the value
+ * the decoder held before it took the bytes apart.
+ *
+ * The eight dp4a calls are qwen4exp_dp4a<32>'s and qwen4exp_shared_vector_
+ * accumulate's alike -- those two are already the same eight operand pairs in
+ * the same ascending order on the same zero-initialised integer accumulator,
+ * followed by the same two float terms in the same order -- so this replaces
+ * both with a bit-identical result.  Only the byte round trip is gone.
+ *
+ * `w` is the caller's uint32_t[8]; `xqg` is a quantiser-scratch group.
+ *
+ * VectorX keeps the ACTIVATION load width each caller already had, because the
+ * two forms this replaces do not agree on it and load shape is a lever in its
+ * own right here: qwen4exp_shared_vector_accumulate reads the group as two
+ * int4s (its callers guarantee the 16-byte alignment), while qwen4exp_dp4a
+ * reads eight words.  Narrowing the int4 callers to word loads would be a
+ * separate, unrelated change riding along, so it is not made.  Only the weight
+ * side moves. */
+template <bool VectorX>
+__device__ __forceinline__ static void qwen4exp_group_accumulate_w(
+        float *acc, const uint32_t *w, float wa, float wb,
+        const int8_t *xqg, float xscale, int32_t xsum) {
+    /* MEASURED FLAT, AND KEPT OUT.  Splitting these eight __dp4a into two
+     * independent accumulators halves an eight-deep dependency chain for one
+     * register, and is bit-exact (int32 addition, |dot| <= 524288, no float
+     * touched).  It measured +0.096% -- flat -- in submission d7764045, which
+     * is what says this kernel family is bandwidth-bound rather than
+     * latency-bound.  The fused chain is restored here because it is the form
+     * the best-measured decode leg on the board was measured with, and a
+     * register saved is worth more than a chain shortened on a kernel that is
+     * waiting on memory. */
+    int32_t dot = 0;
+    if (VectorX) {
+        const int4 lo = *(const int4 *)(const void *)xqg;
+        const int4 hi = *(const int4 *)(const void *)(xqg + 16);
+        dot = __dp4a((int32_t)w[0], lo.x, dot);
+        dot = __dp4a((int32_t)w[1], lo.y, dot);
+        dot = __dp4a((int32_t)w[2], lo.z, dot);
+        dot = __dp4a((int32_t)w[3], lo.w, dot);
+        dot = __dp4a((int32_t)w[4], hi.x, dot);
+        dot = __dp4a((int32_t)w[5], hi.y, dot);
+        dot = __dp4a((int32_t)w[6], hi.z, dot);
+        dot = __dp4a((int32_t)w[7], hi.w, dot);
+    } else {
+        const int32_t *xw = (const int32_t *)(const void *)xqg;
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            dot = __dp4a((int32_t)w[i], xw[i], dot);
+        }
+    }
+    *acc += (wa * xscale) * (float)dot;
+    *acc += (wb * xscale) * (float)xsum;
+}
+
+/* q5_1 STRAIGHT FROM THE ROW TO EIGHT WORDS, WITH NO STAGING BUFFER.
+ *
+ * This is dev_qwen4exp_group_decode's q5_1 arm with its final byte scatter
+ * deleted: identical d/m halfwords, identical qh word, identical nibble masks
+ * and identical high-plane spread, ending at the `lo`/`hi` words that arm
+ * already computes and then takes apart.  Byte b of wq[4k+b] was byte b of
+ * `lo`, so load_i8x4(wq + 4k) == lo and load_i8x4(wq + 16 + 4k) == hi; w[k] and
+ * w[4+k] are those two words.  Verified on the host over 32,524,288 words
+ * against both the byte arm and the elementwise scalar oracle.
+ *
+ * It reads the row directly rather than a caller-staged raw[8], so live state
+ * is the eight output words alone -- the same eight registers int8_t wq[32]
+ * occupies packed.  That matters: the staged form of this change (submission
+ * cfd36096) held raw[8] AND the decoded group live at once, sixteen words, and
+ * lost 0.99% of decode paying for the extra eight.
+ *
+ * The unaligned arm assembles its words with shifts instead of byte stores so
+ * `w` never needs an address, keeping it out of local memory.  Its element
+ * values are 0..31, so the (int8_t) cast the oracle applies is the identity and
+ * the bytes it would have stored are these. */
+__device__ __forceinline__ static void dev_qwen4exp_group_decode_q5_1_w(
+        const char *row, uint32_t g, uint32_t *w, float *wa, float *wb) {
+    /* The word read below IS the block layout: qw[0] is d|m<<16, qw[1] is qh,
+     * qw[2..5] are qs.  Any padding would silently reindex all of it, and no
+     * local gate can compile this file, so assert the shape here -- a
+     * static_assert is the one check that runs on a blind build. */
+    static_assert(sizeof(cuda_block_q5_1) == 24,
+                  "q5_1 block is d,m,qh[4],qs[16] with no padding");
+    const cuda_block_q5_1 *xb = (const cuda_block_q5_1 *)row + g;
+    *wa = dev_f16_to_f32(xb->d);
+    *wb = dev_f16_to_f32(xb->m);
+    if (qwen4exp_word_aligned(xb)) {
+        /* MEASURED: the wide six-word load belongs on the prefill staging
+         * path, not here.  Staging it through a six-word array cost decode
+         * (submission 080b87fc, pair 2 +0.48% with a wild pair 1), while the
+         * same helper on qw_raw_load's q5_1 arm won 1.30% of prefill.  This
+         * decode loop keeps the word form: the words it reads feed the
+         * nibble split directly, with no array between them, which is the
+         * whole reason Part A was a win. */
+        const uint32_t *qw = (const uint32_t *)(const void *)xb;
+        const uint32_t qh = qw[1];
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            const uint32_t v = qw[2 + k];
+            const uint32_t h0 = (((qh >> (k * 4)) & 0x0fu) *
+                                 0x02040810u) & 0x10101010u;
+            const uint32_t h1 = (((qh >> (16 + k * 4)) & 0x0fu) *
+                                 0x02040810u) & 0x10101010u;
+            w[k] = (v & 0x0f0f0f0fu) | h0;
+            w[4 + k] = ((v >> 4u) & 0x0f0f0f0fu) | h1;
+        }
+        return;
+    }
+    const uint32_t qh = (uint32_t)xb->qh[0] | ((uint32_t)xb->qh[1] << 8u) |
+                        ((uint32_t)xb->qh[2] << 16u) |
+                        ((uint32_t)xb->qh[3] << 24u);
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        uint32_t lo = 0, hi = 0;
+#pragma unroll
+        for (int b = 0; b < 4; b++) {
+            const uint32_t j = (uint32_t)(k * 4 + b);
+            lo |= (((uint32_t)(xb->qs[j] & 0x0fu)) |
+                   (((qh >> j) & 1u) << 4u)) << (8u * (uint32_t)b);
+            hi |= (((uint32_t)(xb->qs[j] >> 4u)) |
+                   (((qh >> (j + 16u)) & 1u) << 4u)) << (8u * (uint32_t)b);
+        }
+        w[k] = lo;
+        w[4 + k] = hi;
     }
 }
 
@@ -2880,9 +3052,7 @@ __device__ __forceinline__ static bool qw_raw_load(
     case (uint32_t)DS4_QWEN4EXP_TY_q5_1: {
         const cuda_block_q5_1 *xb = (const cuda_block_q5_1 *)row + g;
         if (!qwen4exp_word_aligned(xb)) return false;
-        const uint32_t *qw = (const uint32_t *)(const void *)xb;
-#pragma unroll
-        for (int i = 0; i < 6; i++) w[i] = qw[i];
+        qw_load_words6((const uint32_t *)(const void *)xb, w);
         return true;
     }
     case (uint32_t)DS4_QWEN4EXP_TY_q5_K: {
@@ -2937,6 +3107,19 @@ __device__ __forceinline__ static void dev_qwen4exp_group_decode_w(
         const cuda_block_q4_K *xb = (const cuda_block_q4_K *)row + (g / 8u);
         const uint32_t grp = g % 8u;
         uint8_t sc = 0, m = 0;
+        /* MEASURED TWICE, LOSES BOTH TIMES.  Reading this block's first
+         * sixteen bytes as one uint4 and deriving d, dmin and the scale pair
+         * from it through qw_q4k_header_scale_min replaces five small loads
+         * with one, is bitwise identical (300,000-case host gate against the
+         * byte accessor), and is what the decode-side gate/up staging already
+         * does.  On this prefill staging arm it cost 1.11% of prefill
+         * (submission dba69a2c: prefill 0.000677082 against 0.000669635 for
+         * the identical tree without it), which erased the whole q5_1
+         * wide-load win.  An earlier uint4 header read cost 1.69% of decode
+         * (01852a67).  So the header is not the load to fold -- five small
+         * reads of sixteen already-resident bytes are apparently cheaper than
+         * one wide read that has to be extracted with shifts.  Do not retry
+         * it; the payload loads are where the wide form pays. */
         dev_q4_K_get_scale_min(grp, xb->scales, &sc, &m);
         wa[0] = dev_f16_to_f32(xb->d) * (float)sc;
         wb[0] = -dev_f16_to_f32(xb->dmin) * (float)m;
@@ -3122,6 +3305,16 @@ qwen4exp_moe_gateup_mma_kernel(
     for (int32_t nbase = first_pair; nbase < end_pair; nbase += QW_MMA_BN) {
         const int32_t take = (cnt - nbase) < QW_MMA_BN ? (cnt - nbase)
                                                        : QW_MMA_BN;
+        /* The same unread-column removal as the down tile.  Here the n loop
+         * is warp-quadranted -- it breaks at `wn + nt * 8 >= take` and reads
+         * `bn = wn + nt * 8 + (lane >> 2)` -- so the highest column any lane
+         * touches is again ((take - 1) & ~7) + 7, and the same `nn` indexes
+         * sXS/sXSUM.  Columns at or above nlive are staged and never read.
+         *
+         * The activation LOAD was already skipped for them (sTok is
+         * 0xffffffff past take, so haveb is zero and no global read issues);
+         * what is left to remove is the zero-fill of a tile nobody reads. */
+        const uint32_t nlive = (uint32_t)((take + 7) & ~7);
         for (uint32_t i = tid; i < QW_MMA_BN; i += QW_MMA_THREADS) {
             sTok[i] = (int32_t)i < take
                 ? (uint32_t)pairs[base + nbase + i] : 0xffffffffu;
@@ -3284,15 +3477,17 @@ qwen4exp_moe_gateup_mma_kernel(
             }
             /* Activation tile: a padded token row is zero, and zero contributes
              * nothing to an integer dot, so the pad is exact. */
-            if (haveb && kc + act_gg < groups) {
-                qw_tile_store_words(&sB[act_tk * GU_LD + act_gg * 32],
-                                    rawb);
-                sXS  [act_tk * QW_MMA_G + act_gg] = act_scale;
-                sXSUM[act_tk * QW_MMA_G + act_gg] = act_sum;
-            } else {
-                qw_tile_store_zero(&sB[act_tk * GU_LD + act_gg * 32]);
-                sXS  [act_tk * QW_MMA_G + act_gg] = 0.0f;
-                sXSUM[act_tk * QW_MMA_G + act_gg] = 0.0f;
+            if (act_tk < nlive) {
+                if (haveb && kc + act_gg < groups) {
+                    qw_tile_store_words(&sB[act_tk * GU_LD + act_gg * 32],
+                                        rawb);
+                    sXS  [act_tk * QW_MMA_G + act_gg] = act_scale;
+                    sXSUM[act_tk * QW_MMA_G + act_gg] = act_sum;
+                } else {
+                    qw_tile_store_zero(&sB[act_tk * GU_LD + act_gg * 32]);
+                    sXS  [act_tk * QW_MMA_G + act_gg] = 0.0f;
+                    sXSUM[act_tk * QW_MMA_G + act_gg] = 0.0f;
+                }
             }
             /* Chunk kc+G's activation bytes, issued now so they land while
              * the MMA below runs; the weight payload above went earlier. */
@@ -3512,6 +3707,27 @@ qwen4exp_moe_down_mma_kernel(
     for (int32_t nbase = 0; nbase < cnt; nbase += QW_MMA_BN) {
         const int32_t take = (cnt - nbase) < QW_MMA_BN ? (cnt - nbase)
                                                        : QW_MMA_BN;
+        /* THE COLUMNS NO MMA WILL READ ARE NOT STAGED.  The n loop below
+         * stops at the first whole empty MMA column (`nt * 8 >= take`), and
+         * inside a live one it reads sB at `bn = nt * 8 + (lane >> 2)` with
+         * `lane >> 2` in 0..7 -- so the highest column any lane touches is
+         * ((take - 1) & ~7) + 7, and sXS/sXSUM are indexed by the same `nn`.
+         * Every column at or above `nlive` is therefore written by the
+         * staging loop and read by nobody.
+         *
+         * A routed expert's pair count is what makes this worth removing: an
+         * expert averages 10240/512 = 20 pairs at this benchmark's 1024-token
+         * prefill, so take is typically 20, nlive is 24, and a QUARTER of the
+         * B tile was being zero-filled for no consumer on every k-chunk of
+         * every expert.  This is a removal, not a new structure -- the shape
+         * that has paid on this path and lost when inverted.
+         *
+         * Bit-exact by construction: the skipped slots are never read, so no
+         * value the MMA consumes changes, and take is block-uniform so the
+         * bound is warp-uniform and both syncthreads below stay collective. */
+        static_assert(QW_MMA_BN % 8 == 0,
+                      "the MMA column granularity is eight pairs");
+        const uint32_t nlive = (uint32_t)((take + 7) & ~7);
         for (uint32_t i = tid; i < QW_MMA_BN; i += QW_DOWN_MMA_THREADS) {
             sPair[i] = (int32_t)i < take
                 ? (uint32_t)pairs[base + nbase + i] : 0xffffffffu;
@@ -3554,7 +3770,7 @@ qwen4exp_moe_down_mma_kernel(
                     sWB[r * QW_MMA_G + gg] = 0.0f;
                 }
             }
-            for (uint32_t idx = tid; idx < QW_MMA_BN * QW_MMA_G;
+            for (uint32_t idx = tid; idx < nlive * QW_MMA_G;
                  idx += QW_DOWN_MMA_THREADS) {
                 const uint32_t tk = idx / QW_MMA_G;
                 const uint32_t gg = idx - tk * QW_MMA_G;
@@ -3762,22 +3978,30 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
              * lanes, same warp_sum_f32 tree, identical bits. */
 #define QWEN4EXP_SPLIT_GROUP(GG, RAWP) do { \
                 const uint32_t g_ = (GG); \
-                int8_t wq[32]; \
+                /* dev_qwen4exp_group_decode_w already WRITES this group as \
+                 * eight words -- every fast arm casts dst to uint32_t* and \
+                 * assigns w[0..7], and the break-out tail's \
+                 * qw_tile_store_group lays down the same eight words' bytes. \
+                 * Holding it as the uint32_t[8] it is (same eight registers, \
+                 * now 4-byte aligned) lets qwen4exp_group_accumulate_w read \
+                 * the words instead of regathering each one from four bytes -- \
+                 * eight reassemblies saved per row per group, and this kernel \
+                 * is only ever instantiated at R=2 (the one-row decode and \
+                 * two-row verify), so sixteen per group.  The decode itself \
+                 * is byte-for-byte unchanged. */ \
+                uint32_t wq[8]; \
                 float wa[2] = {0.0f, 0.0f}; \
                 float wb[2] = {0.0f, 0.0f}; \
                 dev_qwen4exp_group_decode_w((uint32_t)Type, weight_row, g_, \
-                                            (RAWP), wq, wa, wb); \
-                const int halves = 1; \
+                                            (RAWP), (int8_t *)(void *)wq, \
+                                            wa, wb); \
                 _Pragma("unroll") \
                 for (int r = 0; r < R; r++) { \
                     if (r < take) { \
                         const uint64_t at_g = (uint64_t)tok[r] * groups + g_; \
-                        if (Vector) \
-                            qwen4exp_shared_vector_accumulate(&acc[r], wq, wa[0], wb[0], \
-                                xq + at_g * 32u, xs[at_g], xsum[at_g]); \
-                        else \
-                            qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves, \
-                                xq + at_g * 32u, xs[at_g], xsum[at_g]); \
+                        qwen4exp_group_accumulate_w<Vector>(&acc[r], wq, \
+                            wa[0], wb[0], \
+                            xq + at_g * 32u, xs[at_g], xsum[at_g]); \
                     } \
                 } \
             } while (0)
@@ -3979,13 +4203,33 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                     (uint64_t)row * down_row_bytes;
                 const uint64_t mrow = (uint64_t)t * n_expert_used + slot;
                 for (uint32_t g = lane; g < groups; g += 32u) {
+                    const uint64_t at_g = mrow * groups + g;
+                    /* THE WORD PATH, for the one format the routed down
+                     * projection is instantiated with on the pinned
+                     * checkpoint (Q5_1, row_bytes 480).  DownType is a
+                     * template parameter compared against a literal, so this
+                     * is a compile-time branch: the -1 and q8_0
+                     * instantiations compile it away entirely and keep the
+                     * byte path below verbatim.  q5_1 always leaves halves at
+                     * 1, so the two-half arm cannot be reached from here.
+                     * VectorX is false because this kernel's every launch
+                     * passes Vector=false, so the byte form it would have
+                     * taken is qwen4exp_dp4a's word-load activation form. */
+                    if (DownType == (int)DS4_QWEN4EXP_TY_q5_1) {
+                        uint32_t w[8];
+                        float wa = 0.0f, wb = 0.0f;
+                        dev_qwen4exp_group_decode_q5_1_w(drow, g, w, &wa, &wb);
+                        qwen4exp_group_accumulate_w<false>(
+                                &acc[r], w, wa, wb, mq + at_g * 32u,
+                                ms[at_g], msum[at_g]);
+                        continue;
+                    }
                     int8_t wq[32];
                     float wa[2], wb[2];
                     int halves = 1;
                     dev_qwen4exp_group_decode(
                             DownType < 0 ? down_type : (uint32_t)DownType,
                             drow, g, wq, wa, wb, &halves);
-                    const uint64_t at_g = mrow * groups + g;
                     if (Vector && halves == 1)
                         qwen4exp_shared_vector_accumulate(&acc[r], wq, wa[0], wb[0],
                             mq + at_g * 32u, ms[at_g], msum[at_g]);
