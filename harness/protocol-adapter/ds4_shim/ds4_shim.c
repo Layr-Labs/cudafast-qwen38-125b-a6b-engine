@@ -50,6 +50,12 @@ ds4s_handle *ds4s_open(const char *model_path, const char *mtp_head_path,
      * when a head is armed (ds4_qwen4exp_mtp_depth_from_draft_tokens), and a
      * clamp here would make that refusal unreachable. */
     opt.mtp_draft_tokens = mtp_draft_tokens;
+    /*
+     * Left at the shipped 3.0f deliberately.  Submission 8680e92e tests 0.0f
+     * (margin-skip off) on its own; keeping this arm unchanged makes the present
+     * archive a clean additive test of two independently verified change sets
+     * rather than a three-way confound.
+     */
     opt.mtp_margin = 3.0f;
     if (ds4_engine_open(&h->engine, &opt) != 0 || !h->engine) {
         char msg[512];
