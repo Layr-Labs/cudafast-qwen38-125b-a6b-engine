@@ -1493,6 +1493,63 @@ static void test_budget(void) {
     ds4_qwen4exp_mtp_state_free(&st);
 }
 
+/* A runner-up proposal is still ordinary speculation: the target must verify
+ * it before the cycle commits it.  Seed a real reference-model chain, replace
+ * a wrong carried draft with the target's runner-up, and require the verified
+ * two-token commit. */
+static void test_second_choice_draft_is_verified(void) {
+    printf("confidence-selected runner-up is target-verified\n");
+    unsetenv("DS4_MTP_SECOND_MARGIN_THRESHOLD");
+    unsetenv("DS4_MTP_SECOND_LOGIT_THRESHOLD");
+    int exercised = 0;
+    for (int p = 0; p < N_PROMPTS && !exercised; p++) {
+        refmodel m;
+        ds4_qwen4exp_mtp_model model;
+        ds4_qwen4exp_rollback_set set;
+        ds4_qwen4exp_mtp_state st;
+        ref_reset(&m, BREAK_NONE, 0);
+        CHECK(ref_build(&m, &model, &set) == 0, "reference build failed");
+        CHECK(ds4_qwen4exp_mtp_state_init(&st, 1, &set, REF_HC_DIM,
+                                          REF_VOCAB, g_err,
+                                          sizeof(g_err)) == 0,
+              "state init failed: %s", g_err);
+        CHECK(st.second_margin_threshold == 0.15f &&
+                  st.second_logit_threshold == 18.75f,
+              "runner-up defaults are %.9g / %.9g",
+              st.second_margin_threshold, st.second_logit_threshold);
+
+        float logits[REF_VOCAB];
+        int committed[DS4_QWEN4EXP_MTP_MAX_COMMIT];
+        CHECK(ds4_qwen4exp_mtp_cycle(&st, &model, g_prompts[p], 0, 2,
+                                     committed, 2, logits, g_err,
+                                     sizeof(g_err)) == 1,
+              "seed cycle failed: %s", g_err);
+        const int fed = ds4_qwen4exp_mtp_argmax(logits, REF_VOCAB);
+        refmodel probe = m;
+        float probe_hc[REF_HC_DIM], probe_logits[REF_VOCAB];
+        CHECK(ref_decode_token(&probe, fed, 1u, probe_hc, probe_logits) == 0,
+              "look-ahead decode failed: %s", probe.fault);
+        const int target = ds4_qwen4exp_mtp_argmax(probe_logits, REF_VOCAB);
+        if (st.pending[0] != target) {
+            st.pending_confidence_valid[0] = true;
+            st.pending_confidence[0] = 0.10f;
+            st.pending_second_logit[0] = 19.0f;
+            st.pending_second_id[0] = target;
+            const int got = ds4_qwen4exp_mtp_cycle(
+                &st, &model, fed, 1u, 2, committed, 2, logits, g_err,
+                sizeof(g_err));
+            CHECK(got == 2, "verified runner-up committed %d tokens: %s",
+                  got, g_err);
+            CHECK(got == 2 && committed[1] == target,
+                  "runner-up commit is %d, target is %d",
+                  got == 2 ? committed[1] : -1, target);
+            exercised = 1;
+        }
+        ds4_qwen4exp_mtp_state_free(&st);
+    }
+    CHECK(exercised, "no reference prompt exercised a runner-up replacement");
+}
+
 /* A greedy compact caller needs only the reducer's exact token.  Verify that
  * opting into lazy materialization leaves the selected distribution on the
  * model seam while publishing enough metadata to fetch it later. */
@@ -1645,6 +1702,98 @@ int ds4_gpu_indexer_topk_tensor(ds4_gpu_tensor *selected,
         out[t] = best_i;
     }
     return 1;
+}
+int ds4_gpu_indexer_top2_value_tensor(ds4_gpu_tensor *selected,
+                                      ds4_gpu_tensor *values,
+                                      const ds4_gpu_tensor *scores,
+                                      uint32_t n_comp, uint32_t n_tokens,
+                                      uint32_t index_offset) {
+    if (!selected || !values || !scores || n_comp < 2u ||
+        scores->bytes < (uint64_t)n_comp * n_tokens * sizeof(float) ||
+        selected->bytes < (uint64_t)n_tokens * 2u * sizeof(uint32_t) ||
+        values->bytes < (uint64_t)n_tokens * 2u * sizeof(float)) {
+        return 0;
+    }
+    uint32_t *out = (uint32_t *)selected->data;
+    float *out_values = (float *)values->data;
+    const float *in = (const float *)scores->data;
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        uint32_t best[2] = { UINT32_MAX, UINT32_MAX };
+        float best_values[2] = { -INFINITY, -INFINITY };
+        const float *row = in + (size_t)t * n_comp;
+        for (uint32_t i = 0; i < n_comp; i++) {
+            const uint32_t gi = index_offset + i;
+            const float v = row[i];
+            for (uint32_t k = 0; k < 2u; k++) {
+                if (v > best_values[k] ||
+                    (v == best_values[k] && gi < best[k])) {
+                    if (k == 0u) {
+                        best_values[1] = best_values[0];
+                        best[1] = best[0];
+                    }
+                    best_values[k] = v;
+                    best[k] = gi;
+                    break;
+                }
+            }
+        }
+        for (uint32_t k = 0; k < 2u; k++) {
+            out[(uint64_t)t * 2u + k] = best[k];
+            out_values[(uint64_t)t * 2u + k] = best_values[k];
+        }
+    }
+    return 1;
+}
+int ds4_gpu_mtp_top2_policy_tensor(ds4_gpu_tensor *selected,
+                                   const ds4_gpu_tensor *scores,
+                                   const ds4_gpu_tensor *native_ids,
+                                   uint32_t n_comp, uint32_t n_tokens,
+                                   uint32_t index_offset,
+                                   uint32_t native_vocab,
+                                   float margin_threshold,
+                                   float second_logit_threshold) {
+    if (!selected || selected->bytes < (uint64_t)n_tokens * sizeof(uint32_t)) return 0;
+    uint32_t *id_data = calloc((size_t)n_tokens * 2u, sizeof(uint32_t));
+    float *value_data = calloc((size_t)n_tokens * 2u, sizeof(float));
+    if (!id_data || !value_data) {
+        free(id_data);
+        free(value_data);
+        return 0;
+    }
+    ds4_gpu_tensor ids = {
+        .data = (unsigned char *)id_data,
+        .bytes = (uint64_t)n_tokens * 2u * sizeof(uint32_t),
+    };
+    ds4_gpu_tensor values = {
+        .data = (unsigned char *)value_data,
+        .bytes = (uint64_t)n_tokens * 2u * sizeof(float),
+    };
+    const int ok = ds4_gpu_indexer_top2_value_tensor(
+        &ids, &values, scores, n_comp, n_tokens, index_offset);
+    uint32_t *out = (uint32_t *)selected->data;
+    if (ok) {
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            const bool choose_second = margin_threshold > 0.0f &&
+                value_data[(uint64_t)t * 2u] -
+                    value_data[(uint64_t)t * 2u + 1u] <= margin_threshold &&
+                value_data[(uint64_t)t * 2u + 1u] >= second_logit_threshold;
+            uint32_t winner =
+                id_data[(uint64_t)t * 2u + (choose_second ? 1u : 0u)];
+            if (native_ids) {
+                const float *row =
+                    (const float *)scores->data + (uint64_t)t * n_comp;
+                const uint32_t packed = isnan(row[0]) ? 0u : winner;
+                const uint32_t original = packed < n_comp
+                    ? ((const uint32_t *)native_ids->data)[packed]
+                    : UINT32_MAX;
+                winner = original < native_vocab ? original : UINT32_MAX;
+            }
+            out[t] = winner;
+        }
+    }
+    free(id_data);
+    free(value_data);
+    return ok;
 }
 int ds4_gpu_begin_commands(void) { return 1; }
 int ds4_gpu_end_commands(void) { return 1; }
@@ -2545,6 +2694,144 @@ static void test_draft_vocab_shortlist(void) {
     unsetenv("DS4_QWEN4EXP_DRAFT_VOCAB_TAIL");
 }
 
+/* Script the async completion without a GPU. The block stub covers the real
+ * head's QSA/MoE/cache island; counting it proves the rare fallback cannot
+ * mutate that state a second time. The LM stub independently checks both
+ * restored row-range widths and the packed-to-vocabulary mapping. */
+static int native_async_mode;
+static unsigned native_async_calls, native_sync_calls;
+static int stub_native_screen(ds4_gpu_tensor *out, ds4_gpu_tensor *ids,
+        ds4_gpu_tensor *scratch, const void *map, uint64_t bytes,
+        uint64_t offset, uint32_t dim, uint32_t vocab,
+        uint32_t prefix, uint32_t tail, const ds4_gpu_tensor *x) {
+    (void)scratch; (void)map; (void)bytes; (void)offset; (void)dim;
+    (void)vocab; (void)prefix; (void)tail; (void)x;
+    native_sync_calls++;
+    const float values[4] = { 0.0f, 3.0f, 2.0f, 14.0f };
+    const uint32_t selected_ids[4] = { 0u, 1u, 2u, 7u };
+    memcpy(out->data, values, sizeof(values));
+    memcpy(ids->data, selected_ids, sizeof(selected_ids));
+    return 4;
+}
+static int stub_native_map(ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *out, const ds4_gpu_tensor *ids,
+        uint32_t count, uint32_t vocab) {
+    uint32_t packed = *(uint32_t *)selected->data;
+    if (isnan(*(float *)out->data)) packed = 0;
+    const uint32_t original = packed < count
+        ? ((uint32_t *)ids->data)[packed] : UINT32_MAX;
+    *(uint32_t *)selected->data = original < vocab ? original : UINT32_MAX;
+    return 1;
+}
+static int stub_native_screen_policy(ds4_gpu_tensor *selected,
+        ds4_gpu_tensor *out, ds4_gpu_tensor *ids, ds4_gpu_tensor *scratch,
+        const void *map, uint64_t bytes, uint64_t offset,
+        uint32_t dim, uint32_t vocab, uint32_t prefix, uint32_t tail,
+        const ds4_gpu_tensor *x, float margin, float second) {
+    (void)out; (void)ids; (void)scratch; (void)map; (void)bytes;
+    (void)offset; (void)dim; (void)vocab; (void)prefix; (void)tail;
+    (void)x; (void)margin; (void)second;
+    native_async_calls++;
+    if (native_async_mode == 3) return 0;
+    if (native_async_mode == 4) return -1;
+    const uint32_t result = native_async_mode == 1
+        ? DS4_MTP_NATIVE_SCREEN_FALLBACK : native_async_mode == 2
+        ? UINT32_MAX : 7u;
+    memcpy(selected->data, &result, sizeof(result));
+    return 4;
+}
+static unsigned head_call_count(const char *name) {
+    unsigned count = 0;
+    for (int i = 0; i < g_log.n_log; i++)
+        count += strcmp(g_log.log[i], name) == 0;
+    return count;
+}
+static void test_native_async_head_fallback(void) {
+    puts("async native policy: one stateful head, stateless nonfinite fallback");
+    setenv("DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX", "4", 1);
+    setenv("DS4_QWEN4EXP_DRAFT_VOCAB_TAIL", "2", 1);
+    unsetenv("DS4_MTP_NO_ASYNC_NATIVE_POLICY");
+    ds4_qwen4exp_mtp_head h;
+    CHECK(build_shortlist_head(&h) == 0, "async head init: %s", g_err);
+    h.device_second_policy = h.device_second_map = true;
+    h.second_margin_threshold = 0.15f;
+    h.second_logit_threshold = 18.75f;
+    h.t_native_ids = ds4_gpu_tensor_alloc(4u * sizeof(uint32_t));
+    h.t_native_scratch = ds4_gpu_tensor_alloc(256u);
+    h.native_capacity = 4u;
+    h.hooks.native_screen = stub_native_screen;
+    h.hooks.native_map = stub_native_map;
+    h.hooks.native_screen_policy = stub_native_screen_policy;
+    const int next_tokens[HEAD_ROWS] = { 3, 5 };
+    float multi_in[HEAD_ROWS * HEAD_HC_DIM] = { 0 };
+    static const float cases[][HEAD_N_VOCAB] = {
+        { 0, 3, 2, 1, 9, 8, 15, 14 },
+        { NAN, 3, 2, 1, 9, 8, 15, 14 },
+        { -INFINITY, 3, 2, NAN, 9, 8, INFINITY, 14 },
+        { -0.0f, +0.0f, -INFINITY, 0, 9, 8, -0.0f, +0.0f },
+        /* Exercise the guarded runner-up after restoring the static width. */
+        { 0, 3, 2, 1, 9, 8, 20.0f, 19.9f },
+    };
+    for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        g_forced_lm_logits = cases[c];
+        g_forced_lm_rows = 1u;
+        int expected = -1;
+        float baseline_multi[HEAD_HC_DIM];
+        /* Independent full-static head result: normal pipeline, no native
+         * hook. It also supplies the exact preserved last hyper row. */
+        setenv("DS4_MTP_NO_NATIVE_SCREEN", "1", 1);
+        memset(&g_log, 0, sizeof(g_log));
+        CHECK(ds4_qwen4exp_mtp_head_forward_last(&h, next_tokens, multi_in,
+            12u, HEAD_ROWS, &expected, baseline_multi, g_err, sizeof(g_err)) == 0,
+            "static oracle failed: %s", g_err);
+        unsetenv("DS4_MTP_NO_NATIVE_SCREEN");
+        for (int mode = 0; mode < 7; mode++) {
+            native_async_mode = mode;
+            native_async_calls = native_sync_calls = 0;
+            h.hooks.native_screen_policy = mode == 5
+                ? NULL : stub_native_screen_policy;
+            if (mode == 6) setenv("DS4_MTP_NO_ASYNC_NATIVE_POLICY", "1", 1);
+            else unsetenv("DS4_MTP_NO_ASYNC_NATIVE_POLICY");
+            memset(&g_log, 0, sizeof(g_log));
+            int got = -1;
+            float got_multi[HEAD_HC_DIM];
+            const int rc = ds4_qwen4exp_mtp_head_forward_last(&h,
+                next_tokens, multi_in, 12u, HEAD_ROWS, &got, got_multi,
+                g_err, sizeof(g_err));
+            CHECK((mode == 2 || mode == 4) ? rc < 0 : rc == 0,
+                  "case %u mode %d unexpected status %d: %s", c, mode, rc, g_err);
+            CHECK(head_call_count("block") == 1u &&
+                  head_call_count("embed") == 1u &&
+                  head_call_count("hc_mixer") == 1u,
+                  "case %u mode %d replayed the head/cache block", c, mode);
+            const bool fallback = mode == 1 || mode == 3;
+            CHECK(g_log.n_mm == (fallback ? 3 : 1),
+                  "case %u mode %d ran %d matmuls", c, mode, g_log.n_mm);
+            CHECK(native_async_calls == (mode < 5 ? 1u : 0u) &&
+                  native_sync_calls == (mode >= 5 ? 1u : 0u),
+                  "case %u mode %d used wrong hook or retried it", c, mode);
+            if (rc == 0) {
+                CHECK(got == (fallback ? expected : 7),
+                      "case %u mode %d drafted %d, expected %d", c, mode,
+                      got, fallback ? expected : 7);
+                CHECK(!memcmp(got_multi, baseline_multi, sizeof(got_multi)),
+                      "case %u mode %d changed the retained hyper row", c, mode);
+            }
+            if (fallback) {
+                CHECK(g_log.mm_out[1] == 4u && g_log.mm_out[2] == 2u &&
+                      g_log.mm_ntok[1] == 1u && g_log.mm_ntok[2] == 1u,
+                      "case %u fallback failed to restore prefix+tail widths", c);
+            }
+        }
+    }
+    g_forced_lm_logits = NULL;
+    g_forced_lm_rows = 0;
+    ds4_qwen4exp_mtp_head_free(&h);
+    unsetenv("DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX");
+    unsetenv("DS4_QWEN4EXP_DRAFT_VOCAB_TAIL");
+    unsetenv("DS4_MTP_NO_ASYNC_NATIVE_POLICY");
+}
+
 int main(void) {
     printf("qwen4exp MTP tests\n\n");
     test_exactness();
@@ -2575,11 +2862,15 @@ int main(void) {
     printf("\n");
     test_budget();
     printf("\n");
+    test_second_choice_draft_is_verified();
+    printf("\n");
     test_deferred_frontier_logits();
     printf("\n");
     test_head_wiring();
     printf("\n");
     test_draft_vocab_shortlist();
+    printf("\n");
+    test_native_async_head_fallback();
     printf("\n");
     if (g_failures) {
         printf("FAILED: %d check(s)\n", g_failures);

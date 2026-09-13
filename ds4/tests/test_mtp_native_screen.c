@@ -21,8 +21,9 @@
 static void need(int ok,const char *s) {if(!ok){fprintf(stderr,"native screen: %s\n",s);exit(1);}}
 static uint32_t seed=1234567;
 static uint32_t rnd(void){seed^=seed<<13;seed^=seed>>17;seed^=seed<<5;return seed;}
-/* Compare actual old/fused implementations, including raw pre-sort keys.
- * Scratch scores are deliberately omitted by fusion and are not compared. */
+/* Compare both key producers with full-key and stable score-word sorts.
+ * Compare every sorted key, not only the retained shortlist. Scratch scores
+ * are deliberately omitted by fusion and are checked only as a witness. */
 static uint64_t aligned(uint64_t n){return (n+255u)&~255ull;}
 static int compare_key_paths(ds4_gpu_tensor *out,ds4_gpu_tensor *ids,
         ds4_gpu_tensor *scratch,const void *w,uint64_t bytes,uint64_t offset,
@@ -32,33 +33,71 @@ static int compare_key_paths(ds4_gpu_tensor *out,ds4_gpu_tensor *ids,
     uint64_t ko=aligned(ki+(uint64_t)WIDTH*8u);
     uint64_t it=aligned(ko+(uint64_t)WIDTH*8u);
     uint64_t flag_at=aligned(it+(uint64_t)CAP*4u);
-    uint64_t *keys[2]={malloc(WIDTH*8u),malloc(WIDTH*8u)};
-    uint32_t *selected_ids[2]={malloc(CAP*4u),malloc(CAP*4u)};
-    float *values[2]={malloc(CAP*4u),malloc(CAP*4u)};
+    uint64_t *keys[4], *sorted_keys[4];
+    uint32_t *selected_ids[4];
+    float *values[4];
     unsigned char *score_canary=malloc(WIDTH*4u),*score_after=malloc(WIDTH*4u);
     need(score_canary&&score_after,"score witness allocation");
     memset(score_canary,0xa5,WIDTH*4u);
-    float before[DIM],after[DIM];uint32_t flags[2];int status[2];
-    need(keys[0]&&keys[1]&&selected_ids[0]&&selected_ids[1]&&values[0]&&values[1],"AB host allocation");
+    float before[DIM],after[DIM];uint32_t flags[4];int status[4];
+    for (unsigned mode=0;mode<4;mode++) {
+        keys[mode]=malloc(WIDTH*8u);sorted_keys[mode]=malloc(WIDTH*8u);
+        selected_ids[mode]=malloc(CAP*4u);values[mode]=malloc(CAP*4u);
+        need(keys[mode]&&sorted_keys[mode]&&selected_ids[mode]&&values[mode],"AB host allocation");
+    }
     need(ds4_gpu_tensor_read(x,0,before,sizeof before),"AB input before");
-    for(unsigned mode=0;mode<2;mode++) {
-        if(mode==0)setenv("DS4_MTP_NO_FUSED_SCREEN_KEYS","1",1);
+    for(unsigned mode=0;mode<4;mode++) {
+        if(!(mode&1u))setenv("DS4_MTP_NO_FUSED_SCREEN_KEYS","1",1);
         else unsetenv("DS4_MTP_NO_FUSED_SCREEN_KEYS");
+        if(mode<2)setenv("DS4_MTP_FULL_KEY_SORT","1",1);
+        else unsetenv("DS4_MTP_FULL_KEY_SORT");
         memset(values[mode],0x5a,CAP*4u);memset(selected_ids[mode],0xa5,CAP*4u);
         need(ds4_gpu_tensor_write(out,0,values[mode],CAP*4u)&&ds4_gpu_tensor_write(ids,0,selected_ids[mode],CAP*4u),"AB canary init");
         need(ds4_gpu_tensor_write(scratch,scores_at,score_canary,WIDTH*4u),"score witness init");
         status[mode]=ds4_gpu_mtp_native_screen(out,ids,scratch,w,bytes,offset,DIM,VOCAB,PREFIX,TAIL,x);
         need(status[mode]>=0,"AB backend success");
         need(ds4_gpu_tensor_read(scratch,scores_at,score_after,WIDTH*4u),"score witness read");
-        need(mode ? !memcmp(score_canary,score_after,WIDTH*4u) : memcmp(score_canary,score_after,WIDTH*4u)!=0,"actual fused/old dispatch witness");
+        need((mode&1u) ? !memcmp(score_canary,score_after,WIDTH*4u) : memcmp(score_canary,score_after,WIDTH*4u)!=0,"actual fused/old dispatch witness");
         need(ds4_gpu_tensor_read(scratch,ki,keys[mode],WIDTH*8u)&&ds4_gpu_tensor_read(scratch,flag_at,&flags[mode],4),"AB keys/flag");
         need(ds4_gpu_tensor_read(out,0,values[mode],CAP*4u)&&ds4_gpu_tensor_read(ids,0,selected_ids[mode],CAP*4u),"AB outputs");
+        if(status[mode]>0) need(ds4_gpu_tensor_read(scratch,ko,sorted_keys[mode],WIDTH*8u),"AB sorted keys");
         need(ds4_gpu_tensor_read(x,0,after,sizeof after)&&!memcmp(before,after,sizeof before),"AB input unchanged");
     }
-    need(status[0]==status[1]&&flags[0]==flags[1],"AB status/flag parity");
-    need(!memcmp(keys[0],keys[1],WIDTH*8u),"AB raw key parity");
-    need(!memcmp(values[0],values[1],CAP*4u)&&!memcmp(selected_ids[0],selected_ids[1],CAP*4u),"AB IDs/refinement or fallback canary parity");
-    int result=status[1];for(unsigned i=0;i<2;i++){free(keys[i]);free(selected_ids[i]);free(values[i]);}
+    for(unsigned mode=1;mode<4;mode++) {
+        need(status[0]==status[mode]&&flags[0]==flags[mode],"AB status/flag parity");
+        need(!memcmp(keys[0],keys[mode],WIDTH*8u),"AB raw key parity");
+        if(status[mode]>0) need(!memcmp(sorted_keys[0],sorted_keys[mode],WIDTH*8u),"AB complete sorted-key parity");
+        need(!memcmp(values[0],values[mode],CAP*4u)&&!memcmp(selected_ids[0],selected_ids[mode],CAP*4u),"AB IDs/refinement or fallback canary parity");
+    }
+    /* The new async entry must produce precisely the same refined rows,
+     * identities and policy winner. A rejected nonfinite screen instead
+     * queues its own distinct fallback sentinel, never an invalid-ID error. */
+    ds4_gpu_tensor *winner=ds4_gpu_tensor_alloc(4);
+    need(winner!=NULL,"async winner allocation");
+    uint32_t expected=DS4_MTP_NATIVE_SCREEN_FALLBACK,actual=UINT32_MAX;
+    if(status[3]>0) {
+        need(ds4_gpu_mtp_top2_policy_tensor(winner,out,ids,CAP,1,0,VOCAB,0.15f,18.75f),"async reference policy");
+        need(ds4_gpu_tensor_read(winner,0,&expected,4),"async reference winner");
+    }
+    for(unsigned mode=0;mode<4;mode++) {
+        if(!(mode&1u))setenv("DS4_MTP_NO_FUSED_SCREEN_KEYS","1",1);
+        else unsetenv("DS4_MTP_NO_FUSED_SCREEN_KEYS");
+        if(mode<2)setenv("DS4_MTP_FULL_KEY_SORT","1",1);
+        else unsetenv("DS4_MTP_FULL_KEY_SORT");
+        need(ds4_gpu_mtp_native_screen_policy(winner,out,ids,scratch,w,bytes,
+            offset,DIM,VOCAB,PREFIX,TAIL,x,0.15f,18.75f)==CAP,"async entry queues result");
+        need(ds4_gpu_tensor_read(winner,0,&actual,4)&&actual==expected,"async policy or fallback parity");
+        if(status[mode]>0) {
+            float refined[CAP];uint32_t found[CAP];
+            need(ds4_gpu_tensor_read(out,0,refined,sizeof refined)&&
+                 ds4_gpu_tensor_read(ids,0,found,sizeof found),"async refine read");
+            need(!memcmp(refined,values[mode],sizeof refined)&&
+                 !memcmp(found,selected_ids[mode],sizeof found),"async exact ID and logit parity");
+        }
+        need(ds4_gpu_tensor_read(x,0,after,sizeof after)&&!memcmp(before,after,sizeof before),"async input unchanged");
+    }
+    ds4_gpu_tensor_free(winner);
+    int result=status[3];for(unsigned i=0;i<4;i++){free(keys[i]);free(sorted_keys[i]);free(selected_ids[i]);free(values[i]);}
     free(score_canary);free(score_after);return result;
 }
 static void run_case(int adversarial, uint32_t offset) {
@@ -113,8 +152,25 @@ static void run_case(int adversarial, uint32_t offset) {
             for(unsigned i=1;i<CAP-TAIL;i++) need(found[i]==i,"coarse tie lowest ID");
         }
     }
-    /* Map original IDs, reject bad packed IDs, and preserve legacy NaN0. */
     uint32_t packed=CAP-1,mapped=0;
+    /* The device policy may now fold the packed-to-original lookup into its
+     * top-2 reduction.  Exercise both the ordinary winner and conservative
+     * runner-up paths before checking the legacy standalone mapper. */
+    for(unsigned i=0;i<CAP;i++) selected[i]=-INFINITY;
+    selected[7]=20.0f;selected[9]=19.9f;
+    need(ds4_gpu_tensor_write(out,0,selected,sizeof selected),"policy logits");
+    need(ds4_gpu_mtp_top2_policy_tensor(winner,out,ids,CAP,1,0,VOCAB,0.0f,18.75f)&&
+         ds4_gpu_tensor_read(winner,0,&mapped,4)&&mapped==found[7],"fused winner map");
+    need(ds4_gpu_mtp_top2_policy_tensor(winner,out,ids,CAP,1,0,VOCAB,0.15f,18.75f)&&
+         ds4_gpu_tensor_read(winner,0,&mapped,4)&&mapped==found[9],"fused runner-up map");
+    selected[0]=NAN;
+    need(ds4_gpu_tensor_write(out,0,selected,sizeof selected)&&
+         ds4_gpu_mtp_top2_policy_tensor(winner,out,ids,CAP,1,0,VOCAB,0.15f,18.75f)&&
+         ds4_gpu_tensor_read(winner,0,&mapped,4)&&mapped==found[0],"fused NaN0 pin");
+    selected[0]=-INFINITY;
+    need(ds4_gpu_tensor_write(out,0,selected,sizeof selected),"restore policy logits");
+
+    /* Map original IDs, reject bad packed IDs, and preserve legacy NaN0. */
     need(ds4_gpu_tensor_write(winner,0,&packed,4)&&ds4_gpu_mtp_native_map(winner,out,ids,CAP,VOCAB)&&ds4_gpu_tensor_read(winner,0,&mapped,4),"winner map");
     need(mapped==VOCAB-1,"mapped tail ID");
     packed=CAP;
@@ -136,6 +192,31 @@ static void run_case(int adversarial, uint32_t offset) {
     need(ds4_gpu_mtp_native_screen(out,ids,scratch,w,bytes,offset,DIM,VOCAB,PREFIX,TAIL,x)==0,"capture declines screening");
     need(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(full,w,bytes,offset,DIM,PREFIX,x,1),"captured static fallback");
     need(ds4_gpu_decode_graph_end(&key)==0,"capture end");
+    ds4_gpu_decode_graphs_invalidate();
+    /* Async composition is capture-safe: its rare nonfinite case is a
+     * device value, never a host branch baked into the replay. Exercise
+     * finite -> nonfinite -> finite transitions on one captured graph. */
+    key._pad=0x4153594eu;
+    need(ds4_gpu_decode_graph_begin(&key)==-1,"async graph warmup");
+    need(ds4_gpu_mtp_native_screen_policy(winner,out,ids,scratch,w,bytes,
+        offset,DIM,VOCAB,PREFIX,TAIL,x,0.15f,18.75f)==CAP,"async graph warm encode");
+    uint32_t eager=UINT32_MAX,replayed=UINT32_MAX;
+    need(ds4_gpu_tensor_read(winner,0,&eager,4),"async graph warm read");
+    need(ds4_gpu_decode_graph_begin(&key)==0,"async graph capture start");
+    need(ds4_gpu_mtp_native_screen_policy(winner,out,ids,scratch,w,bytes,
+        offset,DIM,VOCAB,PREFIX,TAIL,x,0.15f,18.75f)==CAP,"async graph capture encode");
+    need(ds4_gpu_decode_graph_end(&key)==0,"async graph capture end");
+    need(ds4_gpu_tensor_read(winner,0,&replayed,4)&&replayed==eager,"async first graph result");
+    const float infinity=INFINITY;
+    need(ds4_gpu_tensor_write(x,0,&infinity,4),"async invalid activation");
+    need(ds4_gpu_mtp_native_screen_policy(winner,out,ids,scratch,w,bytes,
+        offset,DIM,VOCAB,PREFIX,TAIL,x,0.15f,18.75f)==CAP,"async invalid eager encode");
+    need(ds4_gpu_tensor_read(winner,0,&replayed,4)&&replayed==DS4_MTP_NATIVE_SCREEN_FALLBACK,"async invalid eager sentinel");
+    need(ds4_gpu_decode_graph_begin(&key)==1,"async invalid graph replay");
+    need(ds4_gpu_tensor_read(winner,0,&replayed,4)&&replayed==DS4_MTP_NATIVE_SCREEN_FALLBACK,"async invalid graph sentinel");
+    need(ds4_gpu_tensor_write(x,0,activation,sizeof activation),"async restore activation");
+    need(ds4_gpu_decode_graph_begin(&key)==1,"async finite graph replay");
+    need(ds4_gpu_tensor_read(winner,0,&replayed,4)&&replayed==eager,"async nonfinite flag reset on replay");
     ds4_gpu_decode_graphs_invalidate();
 cleanup:
     ds4_gpu_tensor_free(x);ds4_gpu_tensor_free(out);ds4_gpu_tensor_free(ids);ds4_gpu_tensor_free(scratch);

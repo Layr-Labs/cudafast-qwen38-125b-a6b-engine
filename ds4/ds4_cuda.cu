@@ -15172,6 +15172,116 @@ __global__ static void indexer_top2_value_kernel(
     }
 }
 
+/* The scored MTP path needs the top two values only to choose one proposal.
+ * Reducing through warp shuffles and applying that choice here avoids sending
+ * two ids and two floats to the CPU, synchronising, and then sending the
+ * chosen id back through the rest of the device command stream. The 256-thread
+ * block leaves exactly eight warp leaders for the second reduction stage. */
+template <bool CheckNativeInvalid = false>
+__global__ static void mtp_top2_policy_kernel(
+        uint32_t *selected,
+        const float *scores,
+        const uint32_t *native_ids,
+        uint32_t n_comp,
+        uint32_t n_tokens,
+        uint32_t index_offset,
+        uint32_t native_vocab,
+        float margin_threshold,
+        float second_logit_threshold,
+        const uint32_t *native_invalid = nullptr) {
+    const uint32_t t = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (t >= n_tokens || tid >= 256u) return;
+
+    const float *row = scores + (uint64_t)t * n_comp;
+    float best0_v = -INFINITY;
+    float best1_v = -INFINITY;
+    uint32_t best0_i = UINT32_MAX;
+    uint32_t best1_i = UINT32_MAX;
+    for (uint32_t i = tid; i < n_comp; i += 256u) {
+        const uint32_t gi = index_offset + i;
+        top2_insert_candidate(row[i], gi,
+                              &best0_v, &best0_i,
+                              &best1_v, &best1_i);
+    }
+
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+#pragma unroll
+    for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+        const float other0_v = __shfl_down_sync(0xffffffffu, best0_v, offset);
+        const float other1_v = __shfl_down_sync(0xffffffffu, best1_v, offset);
+        const uint32_t other0_i = __shfl_down_sync(0xffffffffu, best0_i, offset);
+        const uint32_t other1_i = __shfl_down_sync(0xffffffffu, best1_i, offset);
+        if (lane + offset < 32u) {
+            top2_insert_candidate(other0_v, other0_i,
+                                  &best0_v, &best0_i,
+                                  &best1_v, &best1_i);
+            top2_insert_candidate(other1_v, other1_i,
+                                  &best0_v, &best0_i,
+                                  &best1_v, &best1_i);
+        }
+    }
+
+    __shared__ float warp_v0[8];
+    __shared__ float warp_v1[8];
+    __shared__ uint32_t warp_i0[8];
+    __shared__ uint32_t warp_i1[8];
+    if (lane == 0u) {
+        warp_v0[warp] = best0_v;
+        warp_v1[warp] = best1_v;
+        warp_i0[warp] = best0_i;
+        warp_i1[warp] = best1_i;
+    }
+    __syncthreads();
+
+    if (warp == 0u) {
+        best0_v = lane < 8u ? warp_v0[lane] : -INFINITY;
+        best1_v = lane < 8u ? warp_v1[lane] : -INFINITY;
+        best0_i = lane < 8u ? warp_i0[lane] : UINT32_MAX;
+        best1_i = lane < 8u ? warp_i1[lane] : UINT32_MAX;
+#pragma unroll
+        for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+            const float other0_v = __shfl_down_sync(0xffffffffu, best0_v, offset);
+            const float other1_v = __shfl_down_sync(0xffffffffu, best1_v, offset);
+            const uint32_t other0_i = __shfl_down_sync(0xffffffffu, best0_i, offset);
+            const uint32_t other1_i = __shfl_down_sync(0xffffffffu, best1_i, offset);
+            if (lane + offset < 32u) {
+                top2_insert_candidate(other0_v, other0_i,
+                                      &best0_v, &best0_i,
+                                      &best1_v, &best1_i);
+                top2_insert_candidate(other1_v, other1_i,
+                                      &best0_v, &best0_i,
+                                      &best1_v, &best1_i);
+            }
+        }
+        if (lane == 0u) {
+            const bool choose_second = margin_threshold > 0.0f &&
+                best0_v - best1_v <= margin_threshold &&
+                best1_v >= second_logit_threshold;
+            uint32_t winner = choose_second ? best1_i : best0_i;
+            if (native_ids) {
+                /* Preserve the native mapper's historical NaN-at-zero
+                 * fallback while folding its packed-to-vocabulary lookup
+                 * into this kernel.  Native screening always uses offset 0,
+                 * so winner is an index into native_ids. */
+                const uint32_t bits = __float_as_uint(row[0]);
+                const uint32_t packed =
+                    (bits & 0x7fffffffu) > 0x7f800000u ? 0u : winner;
+                const uint32_t original =
+                    packed < n_comp ? native_ids[packed] : UINT32_MAX;
+                winner = original < native_vocab ? original : UINT32_MAX;
+            }
+            if constexpr (CheckNativeInvalid) {
+                /* A reserved fallback is distinct from UINT32_MAX, which
+                 * still means that an original-id lookup was invalid. */
+                if (*native_invalid) winner = UINT32_MAX - 1u;
+            }
+            selected[t] = winner;
+        }
+    }
+}
+
 __device__ __forceinline__ static uint32_t topk_float_ordered_key(float v) {
     const uint32_t u = __float_as_uint(v);
     return (u & 0x80000000u) ? ~u : (u ^ 0x80000000u);
@@ -16234,6 +16344,35 @@ extern "C" int ds4_gpu_indexer_top2_value_tensor(
                                                   n_tokens,
                                                   index_offset);
     return cuda_ok(cudaGetLastError(), "indexer top2 value launch");
+}
+
+extern "C" int ds4_gpu_mtp_top2_policy_tensor(
+        ds4_gpu_tensor       *selected,
+        const ds4_gpu_tensor *scores,
+        const ds4_gpu_tensor *native_ids,
+        uint32_t                n_comp,
+        uint32_t                n_tokens,
+        uint32_t                index_offset,
+        uint32_t                native_vocab,
+        float                   margin_threshold,
+        float                   second_logit_threshold) {
+    if (!selected || !scores || n_comp < 2u || n_tokens == 0 ||
+        !isfinite(margin_threshold) || margin_threshold < 0.0f ||
+        !isfinite(second_logit_threshold) ||
+        scores->bytes < (uint64_t)n_tokens * n_comp * sizeof(float) ||
+        selected->bytes < (uint64_t)n_tokens * sizeof(uint32_t) ||
+        (native_ids &&
+         (index_offset != 0u || native_vocab == 0u ||
+          native_ids->bytes < (uint64_t)n_comp * sizeof(uint32_t) ||
+          ds4_tensor_device_idx(native_ids) != ds4_tensor_device_idx(scores)))) {
+        return 0;
+    }
+    mtp_top2_policy_kernel<<<n_tokens, 256>>>(
+        (uint32_t *)selected->ptr, (const float *)scores->ptr,
+        native_ids ? (const uint32_t *)native_ids->ptr : NULL,
+        n_comp, n_tokens, index_offset, native_vocab,
+        margin_threshold, second_logit_threshold);
+    return cuda_ok(cudaGetLastError(), "MTP top2 policy launch");
 }
 
 extern "C" int ds4_gpu_dsv4_topk_mask_tensor(
