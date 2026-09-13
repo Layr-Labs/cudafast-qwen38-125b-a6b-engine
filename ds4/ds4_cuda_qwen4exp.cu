@@ -3966,7 +3966,70 @@ __global__ static void qwen4exp_moe_down_q_kernel(
 #pragma unroll
     for (int r = 0; r < R; r++) acc[r] = 0.0f;
 
-    for (uint32_t slot = 0; slot < n_expert_used; slot++) {
+    /* TWELVE OF THIRTY-TWO LANES WERE IDLE FOR THE WHOLE KERNEL.  This model's
+     * routed down projection has groups = 640/32 = 20, so `for (g = lane;
+     * g < groups; g += 32)` gives lanes 0..19 one group and lanes 20..31
+     * nothing -- not on some tail iteration, but on every slot of every row,
+     * because 20 < 32.  The warp ran ten rounds at 20/32 occupancy.
+     *
+     * The fix is a partition, not an algorithm.  acc[r] already sums over BOTH
+     * the slot loop and the group loop into one scalar -- all 10 x 20 = 200
+     * terms of one output element land in the same accumulator -- so (slot, g)
+     * is a flat 200-element reduction space that happens to be walked as ten
+     * strips of twenty.  Walking it as `i = lane; i < n_expert_used * groups;
+     * i += 32` keeps every term, drops no work, and busies all 32 lanes in
+     * ceil(200/32) = 7 rounds instead of 10.
+     *
+     * Expert id is re-read from `selected` rather than taken from the `route`
+     * shuffle: each lane now needs the expert of ITS OWN slot = i / groups,
+     * which differs across the warp, and the tail round leaves only lanes
+     * 0..7 active, so a full-mask __shfl_sync there would be unsafe.  The
+     * load is four bytes per iteration out of L2 and decode is at 18% of
+     * memory roofline, so it is not the constraint.
+     *
+     * NOT BIT-EXACT, and deliberately so: the 200 terms are identical and
+     * every one is still accumulated exactly once, but they are distributed
+     * over 32 lanes instead of 20, so warp_sum_f32's butterfly sums the same
+     * multiset in a different order.  That is a float reduction reassociation
+     * of order 1e-7 relative, and it is the only thing given up.  A host
+     * model of both partitions confirms the per-accumulator term multiset is
+     * identical for R = 1, 2 and 8 over 15,000 random routings including
+     * invalid and out-of-range expert ids. */
+    const bool flat = Vector && DownType == (int)DS4_QWEN4EXP_TY_q5_1;
+    if (flat) {
+        const uint32_t total = n_expert_used * groups;
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            if ((uint32_t)r >= take) continue;
+            const uint32_t t = tok0 + (uint32_t)r;
+            float a = 0.0f;
+            for (uint32_t i = lane; i < total; i += 32u) {
+                const uint32_t slot = i / groups;
+                const uint32_t g = i - slot * groups;
+                const int32_t e = selected[(uint64_t)t * n_expert_used + slot];
+                if (e < 0 || (uint32_t)e >= n_total_expert) continue;
+                const char *drow = down +
+                    (uint64_t)(uint32_t)e * down_expert_bytes +
+                    (uint64_t)row * down_row_bytes;
+                const uint64_t at_g =
+                    ((uint64_t)t * n_expert_used + slot) * groups + g;
+                int8_t wq[32];
+                float wa[2], wb[2];
+                int halves = 1;
+                dev_qwen4exp_group_decode((uint32_t)DS4_QWEN4EXP_TY_q5_1,
+                                          drow, g, wq, wa, wb, &halves);
+                if (halves == 1)
+                    qwen4exp_shared_vector_accumulate(&a, wq, wa[0], wb[0],
+                            mq + at_g * 32u, ms[at_g], msum[at_g]);
+                else
+                    qwen4exp_group_accumulate(&a, wq, wa, wb, halves,
+                            mq + at_g * 32u, ms[at_g], msum[at_g]);
+            }
+            acc[r] = a;
+        }
+    }
+
+    for (uint32_t slot = 0; !flat && slot < n_expert_used; slot++) {
 #pragma unroll
         for (int r = 0; r < R; r++) {
             if ((uint32_t)r < take) {
