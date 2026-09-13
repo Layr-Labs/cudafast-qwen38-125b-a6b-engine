@@ -3522,6 +3522,52 @@ qwen4exp_moe_down_mma_kernel(
 #pragma unroll
         for (int i = 0; i < QW_DOWN_MMA_NT * 4; i++) acc[i] = 0.0f;
 
+        /* ACTIVATION STAGE, PIPELINED ONE K CHUNK AHEAD.
+         *
+         * This is the gate/up tile's B-operand stage transplanted, and the
+         * asymmetry it removes is the reason: gate/up issues chunk kc+G's
+         * activation words while the current chunk's MMA runs, and this tile
+         * -- which reads the same scratch far more times, once per row block,
+         * out_dim/BM = 40 of them per expert against the weight row's once --
+         * loaded them inline, use immediately after load, no chunk of MMA
+         * between the address and the consumer.
+         *
+         * The mapping is loop-invariant, which is what makes the transplant
+         * exact rather than approximate: QW_MMA_BN * QW_MMA_G is 128 and so is
+         * QW_DOWN_MMA_THREADS, so the loop this replaces ran exactly ONE
+         * iteration per thread with tk = tid / G and gg = tid % G fixed for
+         * the whole kc walk.  Hoisting them and carrying the words in
+         * registers therefore changes when a load issues and nothing else:
+         * the same thread stages the same (pair, group) into the same tile
+         * slot from the same address in the same order, and the guard below is
+         * the same predicate the loop body tested.  haveb is set only when the
+         * prefetch that filled rawb succeeded for THIS chunk -- priming covers
+         * kc = 0, the tail of the previous iteration covers the rest -- so a
+         * pair past `take` or a group past `groups` still stages zero, and
+         * zero contributes nothing to an integer dot exactly as before.
+         *
+         * The words come through qw_load_words8, which is the helper gate/up
+         * uses in this same position; its own comment describes its operand as
+         * "loaded one K chunk ahead of the decode that stores them," which is
+         * this. */
+        const uint32_t act_tk = tid / QW_MMA_G;
+        const uint32_t act_gg = tid - act_tk * QW_MMA_G;
+        uint32_t rawb[8];
+        float act_scale = 0.0f, act_sum = 0.0f;
+        int haveb = 0;
+        {
+            const uint32_t p0 = sPair[act_tk];
+            if (p0 != 0xffffffffu && act_gg < groups) {
+                const uint64_t at0 = (uint64_t)p0 * groups + act_gg;
+                qw_load_words8(
+                        (const uint32_t *)(const void *)(mq + at0 * 32u),
+                        rawb);
+                act_scale = ms[at0];
+                act_sum = (float)msum[at0];
+                haveb = 1;
+            }
+        }
+
         for (uint32_t kc = 0; kc < groups; kc += QW_MMA_G) {
             __syncthreads();
             for (uint32_t idx = tid; idx < QW_DOWN_MMA_BM * QW_MMA_G;
@@ -3554,22 +3600,35 @@ qwen4exp_moe_down_mma_kernel(
                     sWB[r * QW_MMA_G + gg] = 0.0f;
                 }
             }
-            for (uint32_t idx = tid; idx < QW_MMA_BN * QW_MMA_G;
-                 idx += QW_DOWN_MMA_THREADS) {
-                const uint32_t tk = idx / QW_MMA_G;
-                const uint32_t gg = idx - tk * QW_MMA_G;
-                const uint32_t g = kc + gg;
-                const uint32_t p = sPair[tk];
-                if (p != 0xffffffffu && g < groups) {
-                    const uint64_t at = (uint64_t)p * groups + g;
-                    qw_tile_copy_group(&sB[tk * QW_MMA_LD + gg * 32],
-                                       mq + at * 32u);
-                    sXS  [tk * QW_MMA_G + gg] = ms[at];
-                    sXSUM[tk * QW_MMA_G + gg] = (float)msum[at];
+            if (haveb && kc + act_gg < groups) {
+                qw_tile_store_words(&sB[act_tk * QW_MMA_LD + act_gg * 32],
+                                    rawb);
+                sXS  [act_tk * QW_MMA_G + act_gg] = act_scale;
+                sXSUM[act_tk * QW_MMA_G + act_gg] = act_sum;
+            } else {
+                qw_tile_store_zero(&sB[act_tk * QW_MMA_LD + act_gg * 32]);
+                sXS  [act_tk * QW_MMA_G + act_gg] = 0.0f;
+                sXSUM[act_tk * QW_MMA_G + act_gg] = 0.0f;
+            }
+            /* Chunk kc+G's activation words, issued now so they land while the
+             * MMA below runs.  Reading mq here is safe against the tile the
+             * store above just filled: this is a global read of a buffer no
+             * kernel in this launch writes, and the shared tile it will
+             * eventually feed is not touched until the next iteration's store,
+             * which sits after that iteration's __syncthreads(). */
+            if (kc + QW_MMA_G < groups) {
+                const uint32_t ga = kc + QW_MMA_G + act_gg;
+                const uint32_t p = sPair[act_tk];
+                if (p != 0xffffffffu && ga < groups) {
+                    const uint64_t at_g = (uint64_t)p * groups + ga;
+                    qw_load_words8(
+                            (const uint32_t *)(const void *)(mq + at_g * 32u),
+                            rawb);
+                    act_scale = ms[at_g];
+                    act_sum = (float)msum[at_g];
+                    haveb = 1;
                 } else {
-                    qw_tile_store_zero(&sB[tk * QW_MMA_LD + gg * 32]);
-                    sXS[tk * QW_MMA_G + gg] = 0.0f;
-                    sXSUM[tk * QW_MMA_G + gg] = 0.0f;
+                    haveb = 0;
                 }
             }
             __syncthreads();
