@@ -1817,16 +1817,16 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
                                      uint32_t n_tokens) {
     /* Router: dense F32 logits, then a top-k with softmax over the SELECTED
      * logits alone.  No bias, no renormalisation, no scale. */
-    /* The router's logits take the decode-order route too.  THIS FIXTURE
-     * CANNOT SEE THE DIFFERENCE -- its routed expert slabs are holes, so the
-     * softmax weights this feeds scale zeros -- but on a real checkpoint they
-     * scale live experts, and the top-k selection they drive is discrete, so a
-     * row-count difference here can move which experts a row uses. */
+    /* Prefill (n_tokens >= 8) takes the in-tree F32 cuBLAS SGEMM on the
+     * frozen ffn_gate_inp slab (ds4_qwen4exp_matmul_f32_libgemm).  Decode
+     * widths stay on the exact warp-tile.  GDN alpha/beta stay on
+     * ds4_qwen4exp_matmul_f32.  DS4_QWEN4EXP_NO_F32_LIBGEMM restores exact
+     * logits.  A reassociated sum can flip a near-tie in top-10-of-512. */
     const int moe_timing = qw_hb_time_on() && n_tokens == 1u;
     const int moe_lane = qw_moe_in_head_block ? 1 : 0;
     uint64_t moe_mark = moe_timing ? qw_hb_now_ns() : 0;
 
-    if (!ds4_qwen4exp_matmul_f32(s->moe_logits, QW_MAP(m, l->ffn_gate_inp),
+    if (!ds4_qwen4exp_matmul_f32_libgemm(s->moe_logits, QW_MAP(m, l->ffn_gate_inp),
                                    QW_MAPSZ(m, l->ffn_gate_inp),
                                    QW_OFF(l->ffn_gate_inp),
                                    DS4_N_EMBD, DS4_N_EXPERT, s->mixed, n_tokens)) {

@@ -276,6 +276,20 @@ static void check(bool ok, const char *what) {
 }
 
 int main(int argc, char **argv) {
+    /* Exact oracles compare a batched F32 forward with a one-row decode.
+     * Prefill router library GEMM uses a different reduction, and prefill
+     * down_partial IEEE FP16 staging is also inexact.  Pin both disable
+     * valves so this binary stays on the decode-order / FP32-staging path.
+     * Production prefill leaves both unset.  MoE unit widths below 8 never
+     * reach down_mma, so they cannot A/B the FP16 valve. */
+    if (setenv("DS4_QWEN4EXP_NO_F32_LIBGEMM", "1", 1) != 0 ||
+        setenv("DS4_QWEN4EXP_NO_FP16_DOWN_PARTIAL", "1", 1) != 0) {
+        fprintf(stderr, "test_qwen4exp_graph: failed to pin "
+                        "DS4_QWEN4EXP_NO_F32_LIBGEMM and "
+                        "DS4_QWEN4EXP_NO_FP16_DOWN_PARTIAL\n");
+        return 1;
+    }
+
     /* Two phases, two processes.  Metal keeps every mapped model view resident
      * for the life of the process and never releases a closed model's, so
      * opening all three of these multi-GiB fixtures in one run exhausts GPU
@@ -1090,6 +1104,9 @@ int main(int argc, char **argv) {
          * the Q8_0 matmul and ds4_gpu_matmul_f32_tensor -- now go through
          * decode-order entries at any width (ds4_qwen4exp_matmul.h), so a
          * forward of n rows gives each row exactly what a one-row decode would.
+         * Prefill router library GEMM and FP16 down_partial staging are
+         * pinned off for this oracle (DS4_QWEN4EXP_NO_F32_LIBGEMM and
+         * DS4_QWEN4EXP_NO_FP16_DOWN_PARTIAL).  GDN alpha/beta stay exact.
          * Before that, widths of three and up moved row 0 by 2e-3 and the last
          * row by 3e-3, and in a recurrent tower that compounds. */
         check(widest == 0.0 && widest_hc == 0.0,

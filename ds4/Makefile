@@ -21,6 +21,7 @@ QWEN4EXP_GRAPH_TEST := tests/test_qwen4exp_graph
 QWEN4EXP_PLE_KERNEL_TEST := tests/test_qwen4exp_ple_kernels
 QWEN4EXP_MTP_TEST := tests/test_qwen4exp_mtp
 QWEN4EXP_MODEL_REGISTRATION_TEST := tests/test_qwen4exp_model_registration
+QWEN4EXP_F32_LIBGEMM_TEST := tests/test_qwen4exp_f32_libgemm
 QWEN4EXP_PARITY_TEST := tests/test_qwen4exp_parity
 
 DEBUG_FLAGS ?= -g
@@ -131,7 +132,7 @@ endif
 # memory, so it runs on every host alongside the tests that do need a device.
 GPU_KERNEL_TESTS += $(QWEN4EXP_MTP_TEST)
 
-.PHONY: all help clean test test-qwen4exp test-qwen4exp-ple test-qwen4exp-ple-kernels test-qwen4exp-ple-kernel-mutants test-qwen4exp-gdn test-qwen4exp-gdn-ref test-qwen4exp-gdn-rows test-qwen4exp-gdn-octet-mutants test-qwen4exp-quant-wide-mutants test-qwen4exp-qsa-group3-mutants test-qwen4exp-qsa-ref test-qwen4exp-moe test-qwen4exp-moe-mutants test-qwen4exp-cuda-moe test-qwen4exp-hc test-qwen4exp-hc-mutants test-qwen4exp-hc-fuse-mutants test-qwen4exp-mma-pipe-mutants test-qwen4exp-shared-pipe-mutants test-qwen4exp-hc-up-pipe-mutants test-qwen4exp-qsa test-qwen4exp-mtp test-qwen4exp-graph test-qwen4exp-parity test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm test-qwen4exp-gateup-dq
+.PHONY: all help clean test test-qwen4exp test-qwen4exp-ple test-qwen4exp-ple-kernels test-qwen4exp-ple-kernel-mutants test-qwen4exp-gdn test-qwen4exp-gdn-ref test-qwen4exp-gdn-rows test-qwen4exp-gdn-octet-mutants test-qwen4exp-quant-wide-mutants test-qwen4exp-qsa-group3-mutants test-qwen4exp-qsa-ref test-qwen4exp-moe test-qwen4exp-moe-mutants test-qwen4exp-cuda-moe test-qwen4exp-hc test-qwen4exp-hc-mutants test-qwen4exp-hc-fuse-mutants test-qwen4exp-mma-pipe-mutants test-qwen4exp-shared-pipe-mutants test-qwen4exp-hc-up-pipe-mutants test-qwen4exp-qsa test-qwen4exp-mtp test-qwen4exp-graph test-qwen4exp-parity test-qwen4exp-f32-libgemm test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm test-qwen4exp-gateup-dq
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
@@ -917,6 +918,15 @@ $(QWEN4EXP_MODEL_REGISTRATION_TEST): tests/test_qwen4exp_model_registration.o
 test-qwen4exp-model-registration: $(QWEN4EXP_MODEL_REGISTRATION_TEST)
 	./$(QWEN4EXP_MODEL_REGISTRATION_TEST)
 
+tests/test_qwen4exp_f32_libgemm.o: tests/test_qwen4exp_f32_libgemm.c ds4_qwen4exp_matmul.h ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+$(QWEN4EXP_F32_LIBGEMM_TEST): tests/test_qwen4exp_f32_libgemm.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+test-qwen4exp-f32-libgemm: $(QWEN4EXP_F32_LIBGEMM_TEST)
+	./$(QWEN4EXP_F32_LIBGEMM_TEST)
+
 test-cuda-spark-arch:
 	sh tests/test_cuda_spark_arch.sh
 
@@ -1007,7 +1017,8 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
 	tests/test_deepseek4_vision_image $(SAMPLING_TEST) $(GPU_KERNEL_TESTS) \
 	tests/test_qwen4exp_loader tests/test_qwen4exp_ple \
-	$(QWEN4EXP_MODEL_REGISTRATION_TEST) $(QWEN4EXP_PARITY_TEST) \
+	$(QWEN4EXP_MODEL_REGISTRATION_TEST) $(QWEN4EXP_F32_LIBGEMM_TEST) \
+	$(QWEN4EXP_PARITY_TEST) \
 	ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
@@ -1023,6 +1034,7 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test \
 	./$(QWEN4EXP_MTP_TEST)
 	./tests/test_qwen4exp_loader.sh
 	./$(QWEN4EXP_MODEL_REGISTRATION_TEST)
+	./$(QWEN4EXP_F32_LIBGEMM_TEST)
 	sh tests/test_cuda_spark_arch.sh
 	sh tests/qwen4exp_cuda_moe_parity.sh
 	$(GPU_KERNEL_TEST_RUN)
@@ -1061,4 +1073,4 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 	./tests/test_mxfp4_dot
 
 clean:
-	rm -f ds4_qwen4exp_mtp.o ds4_qwen4exp_mtp_hooks.o ds4_qwen4exp_mtp_cpu.o ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_qwen4exp_gdn tests/test_qwen4exp_moe tests/test_qwen4exp_gateup_dq tests/test_qwen4exp_hc_norm tests/test_qwen4exp_qsa tests/test_qwen4exp_graph tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_model_shard_fd tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_qwen4exp_loader tests/test_qwen4exp_model_registration tests/test_qwen4exp_ple tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4_qwen4exp_mtp.o ds4_qwen4exp_mtp_hooks.o ds4_qwen4exp_mtp_cpu.o ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_qwen4exp_gdn tests/test_qwen4exp_moe tests/test_qwen4exp_gateup_dq tests/test_qwen4exp_hc_norm tests/test_qwen4exp_qsa tests/test_qwen4exp_graph tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_model_shard_fd tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_qwen4exp_loader tests/test_qwen4exp_model_registration tests/test_qwen4exp_f32_libgemm tests/test_qwen4exp_ple tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

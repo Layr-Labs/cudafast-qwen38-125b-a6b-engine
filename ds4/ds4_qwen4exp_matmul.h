@@ -14,8 +14,10 @@
  * verify and a one-row decode of the same row.  Above that width the call is
  * prefill, which has no such requirement and wants the throughput.
  *
- * With this and the F32 rule below, the tower is bit-invariant across row count
- * on Metal and on CUDA; tests/test_qwen4exp_graph asserts exactly zero.
+ * With this and the F32 exact helper below, decode-width rows and GDN
+ * alpha/beta stay bit-invariant across row count on Metal and on CUDA;
+ * tests/test_qwen4exp_graph asserts exactly zero on that path.  Prefill
+ * router logits at n_rows >= 8 take ds4_qwen4exp_matmul_f32_libgemm.
  *
  * This lives in its own header because the three users are three translation
  * units: ds4_qwen4exp_graph.inc (compiled into ds4.c), and
@@ -73,15 +75,17 @@ static inline int ds4_qwen4exp_matmul_q8_0_preq(ds4_gpu_tensor       *out,
  * than the Q8_0 entry does: CUDA takes cuBLAS SGEMM above one row and a
  * hand-written kernel at one, while Metal has a matvec at one row, a
  * small-batch kernel to eight, and a general one above.  The qwen4exp tower
- * calls it for the gated delta net's alpha and beta projections, whose outputs
- * become the decay and beta gates and multiply into the recurrent state, and
- * for the MoE router's logits, whose top-k selection is discrete.
+ * calls this exact helper for the gated delta net's alpha and beta
+ * projections, whose outputs become the decay and beta gates and multiply
+ * into the recurrent state.  Decode-width MoE router logits stay here too.
  *
  * ds4_gpu_matmul_f32_decode_rows_exact_tensor gives every row the one-row
  * reduction order at ANY width -- one launch on CUDA, one encoder of per-row
  * dispatches on Metal -- so this needs no width condition at all.  It replaced
  * a host loop that allocated and freed two tensor views per row, which was
  * correct but could not be used at prefill widths.
+ *
+ * Prefill router logits (n_rows >= 8) use ds4_qwen4exp_matmul_f32_libgemm.
  */
 static inline int ds4_qwen4exp_matmul_f32(ds4_gpu_tensor       *out,
                                           const void           *map,
@@ -93,6 +97,42 @@ static inline int ds4_qwen4exp_matmul_f32(ds4_gpu_tensor       *out,
                                           uint32_t              rows) {
     return ds4_gpu_matmul_f32_decode_rows_exact_tensor(
             out, map, map_size, offset, in_dim, out_dim, x, rows);
+}
+
+/* Prefill MoE router logits through the in-tree F32 cuBLAS SGEMM.
+ *
+ * Idea: PD-08 / 1a-fast / PB-092 named cublasSgemm on the frozen F32
+ * ffn_gate_inp slab.  PB-090 (benbuschmann / i34-9) prices the 10% token
+ * gate that makes a non-exact reduction legal.  i34-9 PD-06 is the live
+ * exact warp-tile this replaces at n_rows >= 8.  0xpg: a reassociated
+ * sum can flip a near-tie in top-10-of-512.  Spark 1 (9a0f707) timed
+ * M=1024,K=2560,N=512: exact 656.35us, IEEE 251.65us, TF32 77.66us.
+ *
+ * Weights stay the mapped F32 slab.  No copy, no re-quant, no side
+ * image.  GDN alpha/beta stay on ds4_qwen4exp_matmul_f32.  Decode
+ * widths (n_rows < 8) stay exact.  Presence of DS4_QWEN4EXP_NO_F32_LIBGEMM
+ * restores the exact warp-tile.  DS4_CUDA_NO_TF32 selects IEEE math on
+ * the existing handle.  CUDA only; Metal and ROCm keep the exact helper.
+ */
+#define DS4_QWEN4EXP_F32_LIBGEMM_MIN_ROWS 8u
+
+static inline int ds4_qwen4exp_matmul_f32_libgemm(ds4_gpu_tensor       *out,
+                                                  const void           *map,
+                                                  uint64_t              map_size,
+                                                  uint64_t              offset,
+                                                  uint64_t              in_dim,
+                                                  uint64_t              out_dim,
+                                                  const ds4_gpu_tensor *x,
+                                                  uint32_t              rows) {
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (rows >= DS4_QWEN4EXP_F32_LIBGEMM_MIN_ROWS &&
+        getenv("DS4_QWEN4EXP_NO_F32_LIBGEMM") == NULL) {
+        return ds4_gpu_matmul_f32_tensor(out, map, map_size, offset,
+                                         in_dim, out_dim, x, (uint64_t)rows);
+    }
+#endif
+    return ds4_qwen4exp_matmul_f32(out, map, map_size, offset,
+                                   in_dim, out_dim, x, rows);
 }
 
 /* The indexer's BF16 projections.

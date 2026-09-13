@@ -18342,7 +18342,12 @@ extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_
     if (g_cublas_ready && n_tok > 1) {
         const float alpha = 1.0f;
         const float beta = 0.0f;
-        cublasStatus_t st = cublasSgemm(cuda_cublas_for_tier(logical_tier),
+        cublasHandle_t h = cuda_cublas_for_tier(logical_tier);
+        /* Bind this call to the current decode stream so a prefill SGEMM
+         * does not inherit a decode-graph capture stream. Prefill uses the
+         * default stream (cuda_decode_stream is NULL when not capturing). */
+        (void)cublasSetStream(h, cuda_decode_stream());
+        cublasStatus_t st = cublasSgemm(h,
                                         CUBLAS_OP_T,
                                         CUBLAS_OP_N,
                                         (int)out_dim,

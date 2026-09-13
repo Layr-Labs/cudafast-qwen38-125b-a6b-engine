@@ -69,6 +69,11 @@ mkdir -p "$DIR/head"
 "$PY" "$WRITER" --out "$DIR/head" --name qw4x --quiet --shards 1 --mtp-head \
     --dense-threshold 67108864 >/dev/null
 
+# Exact unit oracles: keep the F32 router on the decode-order path
+# and prefill down_partial on FP32 staging.  Production leaves both unset.
+export DS4_QWEN4EXP_NO_F32_LIBGEMM=1
+export DS4_QWEN4EXP_NO_FP16_DOWN_PARTIAL=1
+
 "$BIN" "$DIR/q4k" "$DIR/q4k1"
 "$BIN" --session "$DIR/q4k1" "$DIR/head"
 "$BIN" --mixed "$DIR/mixed"

@@ -3460,7 +3460,7 @@ qwen4exp_moe_gateup_mma_kernel(
 template <int DownType = -1>
 __global__ __launch_bounds__(QW_DOWN_MMA_THREADS) static void
 qwen4exp_moe_down_mma_kernel(
-        float *partial,
+        void *partial,
         const char *down,
         const int8_t *mq,
         const float *ms,
@@ -3474,7 +3474,8 @@ qwen4exp_moe_down_mma_kernel(
         uint32_t down_type,
         uint32_t groups,
         uint32_t out_dim,
-        uint32_t dq_stage) {
+        uint32_t dq_stage,
+        uint32_t partial_fp16) {
     __shared__ __align__(16) int8_t sA[QW_DOWN_MMA_BM * QW_MMA_LD];
     __shared__ __align__(16) int8_t sB[QW_MMA_BN * QW_MMA_LD];
     __shared__ float  sWA[QW_DOWN_MMA_BM * QW_MMA_G];
@@ -3629,7 +3630,11 @@ qwen4exp_moe_down_mma_kernel(
                 const uint32_t mr = m0 + ((r & 2) ? 8u : 0u);
                 const uint32_t orow = row0 + mr;
                 if (orow >= out_dim) continue;
-                partial[(uint64_t)sPair[nn] * out_dim + orow] = acc[nt * 4 + r];
+                const uint64_t oi=(uint64_t)sPair[nn]*out_dim+orow;
+                if (partial_fp16)
+                    ((__half *)partial)[oi]=__float2half(acc[nt*4+r]);
+                else
+                    ((float *)partial)[oi]=acc[nt*4+r];
             }
         }
         __syncthreads();
@@ -3641,12 +3646,13 @@ qwen4exp_moe_down_mma_kernel(
  * kernel did by skipping it, so its partial is never read. */
 __global__ static void qwen4exp_moe_down_combine_kernel(
         float *out,
-        const float *partial,
+        const void *partial,
         const int32_t *selected,
         uint32_t out_dim,
         uint32_t n_tokens,
         uint32_t n_expert_used,
-        uint32_t n_total_expert) {
+        uint32_t n_total_expert,
+        uint32_t partial_fp16) {
     const uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (uint64_t)n_tokens * out_dim) return;
     const uint32_t token = (uint32_t)(idx / out_dim);
@@ -3656,7 +3662,10 @@ __global__ static void qwen4exp_moe_down_combine_kernel(
         const uint64_t pair = (uint64_t)token * n_expert_used + slot;
         const int32_t e = selected[pair];
         if (e < 0 || (uint32_t)e >= n_total_expert) continue;
-        acc += partial[pair * out_dim + row];
+        const uint64_t pi=pair*out_dim+row;
+        acc += partial_fp16
+            ? __half2float(((const __half *)partial)[pi])
+            : ((const float *)partial)[pi];
     }
     out[idx] = acc;
 }
@@ -6537,14 +6546,23 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
          * always had, byte for byte.  Read once, before the launch. */
         const uint32_t dn_dq_stage =
             getenv("DS4_QWEN4EXP_NO_DOWN_DQ") == NULL ? 1u : 0u;
+        /* The expert-major tile emits one scalar per routed pair and output
+         * row, then the fixed-order combine reads all ten slots.  Prefill's
+         * 1024x10x2560 staging surface is about 100 MiB per layer.  Half
+         * storage halves both sides of that bandwidth-bound round trip;
+         * retain a one-variable oracle for numerical and performance gates.
+         * Implementation: hisxo (GPT 5.6 Sol / Codex), submission 60d4150.
+         * Bottleneck identification and sizing: 0xpg. */
+        const uint32_t partial_fp16 =
+            getenv("DS4_QWEN4EXP_NO_FP16_DOWN_PARTIAL") == NULL ? 1u : 0u;
 #define QWEN4EXP_DOWN_MMA(DT) \
         qwen4exp_moe_down_mma_kernel<DT><<< \
                 dim3(out_dim / QW_DOWN_MMA_BM, gu_rows, 1), \
                 QW_DOWN_MMA_THREADS, 0, stream>>>( \
-                (float *)down_partial->ptr, down, sc.mq, sc.ms, sc.msum, \
+                (void *)down_partial->ptr, down, sc.mq, sc.ms, sc.msum, \
                 sc.pairs, sc.counts, sc.offsets, gu_active, \
                 down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
-                mgroups, out_dim, dn_dq_stage)
+                mgroups, out_dim, dn_dq_stage, partial_fp16)
         if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q5_1) {
             QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q5_1);
         } else if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q8_0) {
@@ -6558,9 +6576,9 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         qwen4exp_moe_down_combine_kernel<<<
                 (unsigned)((combine_n + threads - 1u) / threads), threads, 0,
                 stream>>>(
-                (float *)out->ptr, (const float *)down_partial->ptr,
+                (float *)out->ptr, (const void *)down_partial->ptr,
                 (const int32_t *)selected->ptr, out_dim, n_tokens,
-                n_expert_used, n_total_expert);
+                n_expert_used, n_total_expert, partial_fp16);
         return cuda_ok(cudaGetLastError(), "qwen4exp MoE down combine launch");
     }
     if (down_vector && ((uintptr_t)sc.mq & 15u) == 0u) {
