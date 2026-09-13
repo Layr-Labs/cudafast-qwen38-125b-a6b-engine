@@ -2760,6 +2760,12 @@ __global__ static void qwen4exp_moe_zero_invalid_kernel(
 #define QW_DOWN_MMA_THREADS (QW_DOWN_MMA_WARPS * 32)
 #define QW_DOWN_MMA_NT (QW_MMA_BN / 8)
 
+/* Ceiling on the decode down kernel's staged row panels, R of them per block.
+ * The live shapes want 2 * 5,440 = 10,880 bytes (q8_0) or 2 * 3,840 = 7,680
+ * (q5_1); the cap exists so an unexpected slab geometry falls back to the
+ * direct path instead of failing to launch. */
+#define QW_DOWN_PANEL_MAX_BYTES 16384u
+
 /* The pipeline gives every thread exactly one slot of each tile per chunk,
  * which is what makes the one-chunk-deep register prefetch enough. */
 static_assert(QW_MMA_BM * QW_MMA_G == QW_MMA_THREADS,
@@ -4205,8 +4211,69 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
  * walked in ascending order into ONE accumulator, which is what the per-token
  * kernel did; the rows of the tile do not share a weight here, because each
  * one picked its own expert for the slot.  What the tile buys is that the
- * activation groups are read once for R rows and the decode is per group. */
-template <int R, int DownType = -1, bool Vector = false>
+ * activation groups are read once for R rows and the decode is per group.
+ *
+ * Stage: cooperative panel staging of the WEIGHT rows (decode widths only).
+ *
+ * The activation side of this kernel is already perfectly coalesced -- lane l
+ * reads mq[(mrow * groups + l) * 32], so a warp asks for 1024 consecutive
+ * bytes.  The weight side is not.  Lane l decodes group l, l+32, ... of its own
+ * row, and dev_qwen4exp_group_decode reads that group as several sub-word
+ * pieces, so ONE load instruction asks for up to 32 pieces of four bytes
+ * strided by the group size (34 bytes for q8_0, 24 for q5_1) across the whole
+ * row.  At the live decode shape groups == 20, so twenty lanes each fetch one
+ * group's worth of sub-words at 34-byte stride and twelve lanes fetch nothing:
+ * the warp's request is both strided and short.  Every byte is eventually used,
+ * but the stream is scattered where it could be dense, and a scattered stream of
+ * small pieces is the defect the routed gate/up decode arm in this tree was
+ * built to remove.  The block's eight rows are 8 * 680 = 5,440 CONSECUTIVE
+ * bytes, so the same bytes can be fetched as one dense burst instead.
+ *
+ * The block shape already fits a panel exactly, which is why this is cheap:
+ *   - a block is 256 threads = 8 warps and owns output rows row0 .. row0+7,
+ *     which are CONSECUTIVE rows of one expert slab;
+ *   - the expert index is selected[(tok0 + r) * n_expert_used + slot], which
+ *     depends on the token and the slot but NOT on the row, so it is
+ *     block-uniform: all 8 warps want 8 consecutive rows of the SAME expert.
+ * So once per slot the whole block copies the R panels it is about to need into
+ * shared memory with fully coalesced grid-stride uint4 copies -- 256 lanes x
+ * 16 B = 4 KiB per instruction -- and then every lane decodes the same group it
+ * decodes today out of shared instead of out of the slab.  The two tokens of a
+ * decode tile route to different experts, so the buffer holds R panels and both
+ * are published by ONE barrier pair per slot: 2 * n_expert_used barriers for
+ * the kernel, not 2 * R * n_expert_used.  At the live shape that is
+ * 2 * 5,440 = 10,880 bytes of shared per block and twenty barriers.
+ *
+ * Bit-exact by construction, and more strongly than usual:
+ *   - the panel is a verbatim byte image of the same span the block's own warps
+ *     would have read individually.  It is written by the block, read by the
+ *     block, and dies with the block.  Nothing is decoded, re-packed, widened,
+ *     narrowed, re-scaled or re-ordered on the way in.
+ *   - dev_qwen4exp_group_decode is called with the SAME (type, g) and a row
+ *     pointer at the same offset within the panel, so it is character-identical
+ *     source running on identical bytes.  This is why the arm needs no
+ *     per-quantisation-type work: the decoder is untouched and both q8_0 and
+ *     q5_1 ride it unchanged.
+ *   - that decoder is alignment-agnostic by construction: it aligns the payload
+ *     address down, derives `shift` from the low bits and funnel-shifts the
+ *     logical bytes back out, so a panel at a different address than the slab
+ *     yields the same values.  That matters here: at the live shape a q8_0 down
+ *     row is 20 * 34 = 680 bytes, so rows 1..7 of the panel start at addresses
+ *     that are 4-byte but not 16-byte aligned -- exactly as they already do
+ *     inside the slab, since the slab's rows are 680 bytes apart too.  The host
+ *     requires only that the PANEL base be 16-byte aligned, which follows from
+ *     the slab base, expert_bytes % 16 == 0 and row0 being a multiple of 8.
+ *   - no float is re-associated.  Lane l still owns groups l, l+32, ... and
+ *     still folds through the same warp_sum_f32 tree in the same order, so
+ *     every partial sum is the same float added in the same sequence.
+ *
+ * Barrier safety.  Both barriers are reached by every lane of the block: the
+ * kernel's only early return tests row >= out_dim and tok0 >= n_tokens, both of
+ * which are block-uniform once out_dim % 8 == 0, which the host requires before
+ * selecting this arm.  The `continue` for an out-of-range expert is
+ * block-uniform for the same reason the expert is.  The staged path is refused
+ * rather than truncated when it cannot hold the panel. */
+template <int R, int DownType = -1, bool Vector = false, bool Stage = false>
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
@@ -4222,12 +4289,19 @@ __global__ static void qwen4exp_moe_down_q_kernel(
         uint32_t n_tokens,
         uint32_t n_total_expert,
         uint32_t n_expert_used) {
+    /* Dynamic shared memory is 16-byte aligned by contract, and it is requested
+     * only for the Stage instantiations; the others map nothing here. */
+    extern __shared__ uint4 qw_down_panel[];
+    char *const spanel = (char *)qw_down_panel;
+
     const uint32_t lane = threadIdx.x & 31u;
-    const uint32_t row = blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t row0 = blockIdx.x * 8u;
+    const uint32_t row = row0 + (threadIdx.x >> 5u);
     const uint32_t tok0 = blockIdx.y * (uint32_t)R;
     if (row >= out_dim || tok0 >= n_tokens) return;
     const uint32_t take = n_tokens - tok0 < (uint32_t)R ? n_tokens - tok0
                                                         : (uint32_t)R;
+    const uint64_t panel_bytes = (uint64_t)8u * down_row_bytes;
 
     /* Up to 32 IDs, freshly loaded on every call or graph replay. */
     int32_t route[R];
@@ -4241,6 +4315,32 @@ __global__ static void qwen4exp_moe_down_q_kernel(
     for (int r = 0; r < R; r++) acc[r] = 0.0f;
 
     for (uint32_t slot = 0; slot < n_expert_used; slot++) {
+        if (Stage) {
+            /* One barrier pair for the whole slot, not one per (slot, token):
+             * the two tokens route to different experts, so both panels are
+             * filled back to back into disjoint halves of the buffer and
+             * published together.  The first barrier waits for the previous
+             * slot's readers before overwriting.  Both are reached by every
+             * lane of the block -- the early returns above and the `continue`
+             * below are all block-uniform under the host's guards. */
+            __syncthreads();
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                if ((uint32_t)r < take) {
+                    const int32_t e = __shfl_sync(0xffffffffu, route[r], slot);
+                    if (e < 0 || (uint32_t)e >= n_total_expert) continue;
+                    const char *const gp = down +
+                        (uint64_t)(uint32_t)e * down_expert_bytes +
+                        (uint64_t)row0 * down_row_bytes;
+                    char *const sp = spanel + (uint64_t)r * panel_bytes;
+                    for (uint64_t o = (uint64_t)threadIdx.x * 16u;
+                         o < panel_bytes; o += (uint64_t)blockDim.x * 16u) {
+                        *(uint4 *)(sp + o) = *(const uint4 *)(gp + o);
+                    }
+                }
+            }
+            __syncthreads();
+        }
 #pragma unroll
         for (int r = 0; r < R; r++) {
             if ((uint32_t)r < take) {
@@ -4248,9 +4348,11 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                 const int32_t e = Vector ? __shfl_sync(0xffffffffu, route[r], slot)
                     : selected[(uint64_t)t * n_expert_used + slot];
                 if (e < 0 || (uint32_t)e >= n_total_expert) continue;
-                const char *drow = down +
-                    (uint64_t)(uint32_t)e * down_expert_bytes +
-                    (uint64_t)row * down_row_bytes;
+                const char *const drow = Stage
+                    ? spanel + (uint64_t)r * panel_bytes +
+                      (uint64_t)(row - row0) * down_row_bytes
+                    : down + (uint64_t)(uint32_t)e * down_expert_bytes +
+                      (uint64_t)row * down_row_bytes;
                 const uint64_t mrow = (uint64_t)t * n_expert_used + slot;
                 for (uint32_t g = lane; g < groups; g += 32u) {
                     int8_t wq[32];
@@ -6847,12 +6949,13 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
 
     const dim3 dn_grid((out_dim + 7u) / 8u,
                        (n_tokens + (uint32_t)tile - 1u) / (uint32_t)tile, 1);
-#define QWEN4EXP_DOWN_IMPL(R, DT, V) \
-    qwen4exp_moe_down_q_kernel<R, DT, V><<<dn_grid, threads, 0, stream>>>( \
+#define QWEN4EXP_DOWN_IMPL_S(R, DT, V, S, SH) \
+    qwen4exp_moe_down_q_kernel<R, DT, V, S><<<dn_grid, threads, (SH), stream>>>( \
             (float *)out->ptr, down, (const int32_t *)selected->ptr, \
             sc.mq, sc.ms, sc.msum, \
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
             mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
+#define QWEN4EXP_DOWN_IMPL(R, DT, V) QWEN4EXP_DOWN_IMPL_S(R, DT, V, false, 0)
 #define QWEN4EXP_DOWN(R) do { \
     if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q5_1) { \
         QWEN4EXP_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q5_1, false); \
@@ -6895,10 +6998,34 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         return cuda_ok(cudaGetLastError(), "qwen4exp MoE down combine launch");
     }
     if (down_vector && ((uintptr_t)sc.mq & 15u) == 0u) {
+        /* Panel staging: the eight warps of a down block own eight consecutive
+         * rows of one expert, so one dense uint4 fill replaces sixteen hundred
+         * scattered sub-word requests.  Every condition the kernel's barriers
+         * and its uint4 copy rely on is checked here, once, before the launch;
+         * DS4_QWEN4EXP_NO_DOWN_PANEL stands the whole thing down. */
+        const uint64_t dn_panel = (uint64_t)8u * down_slab->row_bytes;
+        const uint64_t dn_shared = 2u * dn_panel;   /* R == 2 on this arm */
+        const int dn_stage =
+            (out_dim % 8u) == 0u &&
+            (dn_panel % 16u) == 0u &&
+            (down_slab->expert_bytes % 16u) == 0u &&
+            ((uintptr_t)down & 15u) == 0u &&
+            dn_shared <= QW_DOWN_PANEL_MAX_BYTES &&
+            getenv("DS4_QWEN4EXP_NO_DOWN_PANEL") == NULL;
         if (down_slab->type == DS4_QWEN4EXP_TY_q8_0) {
-            QWEN4EXP_DOWN_IMPL(2, DS4_QWEN4EXP_TY_q8_0, true);
+            if (dn_stage) {
+                QWEN4EXP_DOWN_IMPL_S(2, DS4_QWEN4EXP_TY_q8_0, true, true,
+                                     (size_t)dn_shared);
+            } else {
+                QWEN4EXP_DOWN_IMPL(2, DS4_QWEN4EXP_TY_q8_0, true);
+            }
         } else {
-            QWEN4EXP_DOWN_IMPL(2, DS4_QWEN4EXP_TY_q5_1, true);
+            if (dn_stage) {
+                QWEN4EXP_DOWN_IMPL_S(2, DS4_QWEN4EXP_TY_q5_1, true, true,
+                                     (size_t)dn_shared);
+            } else {
+                QWEN4EXP_DOWN_IMPL(2, DS4_QWEN4EXP_TY_q5_1, true);
+            }
         }
     }
     else if (tile == 8) { QWEN4EXP_DOWN(8); }
@@ -6907,6 +7034,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     else { QWEN4EXP_DOWN(1); }
 #undef QWEN4EXP_DOWN
 #undef QWEN4EXP_DOWN_IMPL
+#undef QWEN4EXP_DOWN_IMPL_S
     return cuda_ok(cudaGetLastError(), "qwen4exp MoE down launch");
 }
 
