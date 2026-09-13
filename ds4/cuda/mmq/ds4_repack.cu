@@ -478,14 +478,21 @@ bool ds4_repack_q2k_candidate(const ds4_repack_tensor &t) {
 }
 
 /* Aligned-SoA Q8_0 dense candidates (--repack-q8-aligned): every 2D Q8_0
- * tensor big enough to matter whose row length satisfies the decode kernel's
- * K % 1024 constraint.  token_embd is excluded: it is consumed by row-gather,
- * never by the dense GEMV.  Unlike the IQ2 expert repack these artifacts are
- * ADDITIVE (raw stays served). */
+ * tensor big enough to matter whose row length satisfies the generic decode
+ * kernel's K % 1024 constraint, plus the two K=2560 GDN inputs consumed by
+ * the dedicated bounds-safe aligned projection kernel.  token_embd is
+ * excluded: it is consumed by row-gather, never by a dense GEMV.  Unlike the
+ * IQ2 expert repack these artifacts are ADDITIVE (raw stays served). */
 bool ds4_repack_q8_candidate(const ds4_repack_tensor &t) {
     if (t.type != 8u || t.ndim != 2u) return false; /* GGML_TYPE_Q8_0 */
     if (t.dims[0] == 0 || t.dims[1] == 0) return false;
-    if (t.dims[0] % 1024u != 0) return false;
+    if (t.dims[0] % 1024u != 0) {
+        if (t.dims[0] != 2560u) return false;
+        const bool gdn_input =
+            t.name.find(".attn_qkv.weight") != std::string::npos ||
+            t.name.find(".attn_gate.weight") != std::string::npos;
+        if (!gdn_input) return false;
+    }
     /* 2 MiB floor: attn_kv (512 x 4096, 2.2 MiB) is an Inc4 pair-kernel
      * consumer; anything smaller isn't worth an artifact. */
     if (t.bytes < 2u * 1024u * 1024u || t.bytes % 34u != 0) return false;

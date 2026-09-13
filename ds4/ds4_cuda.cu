@@ -4730,7 +4730,12 @@ extern "C" int ds4_gpu_build_derived_artifacts(
         uint64_t model_size,
         const char *model_path) {
     if (!model_map || model_size == 0 || !model_path || !model_path[0]) return 0;
-    if (!g_derived_ranges.empty()) return (int)g_derived_ranges.size();
+    /* Split GGUFs call this once per independently mapped shard.  Refuse only
+     * a duplicate call for the same mapping; derived ranges from other shard
+     * mappings are additive. */
+    for (const cuda_derived_range &r : g_derived_ranges) {
+        if (r.host_base == model_map) return 0;
+    }
     if (getenv("DS4_CUDA_NO_DERIVED_WEIGHTS") != NULL) return 0;
     const char *build = getenv("DS4_CUDA_BUILD_ARTIFACTS");
     if (build && strcmp(build, "0") == 0) return 0;
@@ -4786,14 +4791,19 @@ extern "C" int ds4_gpu_build_derived_artifacts(
         ok = ds4_repack_build_q8_aligned(args, artifacts, &part_bytes);
         built_bytes += part_bytes;
     }
-    if (!ok || artifacts.empty()) {
+    if (!ok) {
         for (ds4_repack_artifact &artifact : artifacts) {
             if (artifact.dev) (void)cudaFree(artifact.dev);
         }
         fprintf(stderr, "ds4: aligned artifact build failed; using raw weights\n");
         return 0;
     }
+    /* A shard with no eligible tensors is normal.  In particular shard zero
+     * of the pinned Qwen split contains metadata and small tensors while the
+     * dense Q8 matrices live in later files. */
+    if (artifacts.empty()) return 0;
 
+    const bool first_catalog = g_derived_ranges.empty();
     for (const ds4_repack_artifact &artifact : artifacts) {
         g_derived_ranges.push_back({
             model_map,
@@ -4827,10 +4837,18 @@ extern "C" int ds4_gpu_build_derived_artifacts(
     }
     if (replace_candidates == 0) replaces_complete = 0;
 
-    g_derived_replace_map = model_map;
-    g_derived_replaces_complete = replaces_complete;
-    g_derived_artifact_bytes = built_bytes;
-    g_derived_artifact_build_secs = cuda_wall_sec() - t0;
+    /* The legacy raw-range replacement flag can describe only one mapping.
+     * Keep it conservative for a split set; Q8 artifacts are additive and do
+     * not depend on this flag. */
+    if (first_catalog) {
+        g_derived_replace_map = model_map;
+        g_derived_replaces_complete = replaces_complete;
+    } else {
+        g_derived_replace_map = NULL;
+        g_derived_replaces_complete = 0;
+    }
+    g_derived_artifact_bytes += built_bytes;
+    g_derived_artifact_build_secs += cuda_wall_sec() - t0;
     if (!g_aligned_q81_scratch) {
         const size_t scratch_bytes = 96u * 1024u * 1024u;
         cudaError_t scratch_err = cudaMalloc(&g_aligned_q81_scratch,
@@ -4851,7 +4869,7 @@ extern "C" int ds4_gpu_build_derived_artifacts(
             (unsigned long long)g_derived_ranges.size(),
             (double)g_derived_artifact_bytes / 1073741824.0,
             g_derived_artifact_build_secs,
-            replaces_complete ? "; expert raw residency replaced" : "");
+            g_derived_replaces_complete ? "; expert raw residency replaced" : "");
     return (int)g_derived_ranges.size();
 }
 
@@ -16323,30 +16341,33 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             (int)out_dim, 1, (int)in_dim, cuda_decode_stream());
         if (rc == 0) return 1;
     }
-    if (aligned && n_tok >= 512u && out_dim >= 2048u &&
+    /* The aligned artifact is primarily a decode layout.  Keep the D2R
+     * prefill consumer opt-in: activating it implicitly when split-shard
+     * artifacts become reachable changes the established Qwen prefill path,
+     * and GB10 end-to-end A/Bs show that trade is not consistently positive. */
+    const char *d2r = getenv("DS4_MMQ_DENSE_D2R");
+    if (aligned && d2r && strcmp(d2r, "0") != 0 &&
+        n_tok >= 512u && out_dim >= 2048u &&
         in_dim <= 4096u && cuda_use_mmq()) {
-        const char *d2r = getenv("DS4_MMQ_DENSE_D2R");
-        if (!d2r || strcmp(d2r, "0") != 0) {
-            const int rc = ds4_mmq_q8_0_dense_d2r(
-                aligned, (const float *)x->ptr, (float *)out->ptr,
-                (int)out_dim, (int)n_tok, (int)in_dim, (cudaStream_t)0);
-            if (rc == 0) {
-                static int logged = 0;
-                if (!logged) {
-                    logged = 1;
-                    fprintf(stderr,
-                            "ds4: dense Q8 prefill using aligned D2R\n");
-                }
-                return 1;
+        const int rc = ds4_mmq_q8_0_dense_d2r(
+            aligned, (const float *)x->ptr, (float *)out->ptr,
+            (int)out_dim, (int)n_tok, (int)in_dim, (cudaStream_t)0);
+        if (rc == 0) {
+            static int logged = 0;
+            if (!logged) {
+                logged = 1;
+                fprintf(stderr,
+                        "ds4: dense Q8 prefill using aligned D2R\n");
             }
-            fprintf(stderr,
-                    "ds4: aligned dense Q8 D2R returned %d "
-                    "(label='%s' M=%llu N=%llu K=%llu); falling back\n",
-                    rc, label ? label : "",
-                    (unsigned long long)out_dim,
-                    (unsigned long long)n_tok,
-                    (unsigned long long)in_dim);
+            return 1;
         }
+        fprintf(stderr,
+                "ds4: aligned dense Q8 D2R returned %d "
+                "(label='%s' M=%llu N=%llu K=%llu); falling back\n",
+                rc, label ? label : "",
+                (unsigned long long)out_dim,
+                (unsigned long long)n_tok,
+                (unsigned long long)in_dim);
     }
     const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset, weight_bytes, logical_tier, "q8_0");
     if (!wptr) return 0;
@@ -18878,26 +18899,109 @@ static void qwen_f32_vector_tree_kernel(float *out, const float *w,
  * Explicit scalar pointer selection avoids a per-thread argument-array copy. */
 struct qwen_gdn_projection_args {
     float *out[4]; const unsigned char *weights[4];
+    const unsigned char *aligned[2];
     const int8_t *xq; const float *xscale; const float *x;
     uint64_t od[2]; uint32_t n_rows; uint64_t blocks;
 };
-template<int R>
+template<int R, bool Aligned, bool FixedQwen38Shape = false>
 __global__ __launch_bounds__(256)
 static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
     constexpr unsigned B=256u;
     constexpr bool FloatFirst=true, Streaming=false;
     constexpr int C=2, U=10;
-    const uint32_t split=(uint32_t)((a.od[0]+B/64u-1u)/(B/64u));
-    const uint32_t qblocks=split+(uint32_t)((a.od[1]+B/64u-1u)/(B/64u));
+    constexpr uint32_t QRows=B/64u;
+    /* The fused path below is reached by Qwen 3.8 with exactly 80 input
+     * groups, 10,240 QKV outputs and 6,144 gate outputs.  Keep a generic
+     * instantiation for other accepted shapes, but make those three values
+     * compile-time constants on the production path.  In particular this
+     * turns every live pair's shuffle mask into 0xffffffff (80 = 32+32+16),
+     * removes runtime divides from grid decoding, and fully bounds the three
+     * group walks without changing a dot product or its reduction tree. */
+    const uint64_t od0 = FixedQwen38Shape ? 10240u : a.od[0];
+    const uint64_t od1 = FixedQwen38Shape ? 6144u : a.od[1];
+    const uint64_t fixed_blocks = FixedQwen38Shape ? 80u : a.blocks;
+    const uint32_t split=(uint32_t)((od0+QRows-1u)/QRows);
+    const uint32_t qblocks=split+(uint32_t)((od1+QRows-1u)/QRows);
     const bool is_float=FloatFirst ? blockIdx.x<96u : blockIdx.x>=qblocks;
     if (!is_float) {
         const uint32_t qb=FloatFirst ? blockIdx.x-96u : blockIdx.x;
         const bool second=qb>=split;
         const uint32_t block=second?qb-split:qb;
         float *out=second?a.out[1]:a.out[0]; const unsigned char *w=second?a.weights[1]:a.weights[0];
-        const uint64_t out_dim=second?a.od[1]:a.od[0],blocks=a.blocks;
+        const uint64_t out_dim=second?od1:od0,blocks=fixed_blocks;
         const uint32_t n_rows=a.n_rows;
         const int8_t *xq=a.xq; const float *xscale=a.xscale;
+    if constexpr (Aligned) {
+    const uint32_t local_row = threadIdx.x >> 6u;
+    const uint32_t local_lane = threadIdx.x & 63u;
+    const uint32_t group = local_lane >> 1u;
+    const uint32_t half = local_lane & 1u;
+    const uint64_t row = (uint64_t)block * QRows + local_row;
+    const uint32_t row0 = blockIdx.y * R;
+    const uint32_t take = n_rows - row0 < R ? n_rows - row0 : R;
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) acc[r] = 0.0f;
+
+    if (row < out_dim) {
+        const unsigned char *artifact=a.aligned[second ? 1 : 0];
+        const uint64_t nblk=out_dim*blocks;
+        const uint64_t dq_bytes=(nblk*2u+63u)&~63ull;
+        const __half *dq=(const __half *)artifact;
+        const int4 *qs=(const int4 *)(artifact+dq_bytes);
+        const uint64_t rbase=row*blocks;
+        /* Match the raw kernel's PDL edge: issue the first aligned weight
+         * loads before the quantizer fence, then consume its activation. */
+        if (group < blocks) {
+            const uint64_t b=group,wi=rbase+b;
+            const int4 wq=qs[wi*2u+half];
+            const float ws=__half2float(dq[wi]);
+            QWEN4EXP_PDL_SYNC();
+#pragma unroll
+            for (int r=0;r<R;r++) if ((uint32_t)r<take) {
+                const uint64_t at=((uint64_t)row0+r)*blocks+b;
+                const int32_t *xw=(const int32_t *)(xq+at*32u+half*16u);
+                int dot=0;
+                dot=__dp4a(wq.x,xw[0],dot);dot=__dp4a(wq.y,xw[1],dot);
+                dot=__dp4a(wq.z,xw[2],dot);dot=__dp4a(wq.w,xw[3],dot);
+                dot+=__shfl_xor_sync(0xffffffffu,dot,1);
+                if (half==0u) acc[r]+=ws*xscale[at]*(float)dot;
+            }
+        }
+        for (uint64_t b=group+32u;b<blocks;b+=32u) {
+            const uint64_t wi=rbase+b;
+            const int4 wq=qs[wi*2u+half];
+            const float ws=__half2float(dq[wi]);
+#pragma unroll
+            for (int r=0;r<R;r++) if ((uint32_t)r<take) {
+                const uint64_t at=((uint64_t)row0+r)*blocks+b;
+                const int32_t *xw=(const int32_t *)(xq+at*32u+half*16u);
+                int dot=0;
+                dot=__dp4a(wq.x,xw[0],dot);dot=__dp4a(wq.y,xw[1],dot);
+                dot=__dp4a(wq.z,xw[2],dot);dot=__dp4a(wq.w,xw[3],dot);
+                dot+=__shfl_xor_sync(0xffffffffu,dot,1);
+                if (half==0u) acc[r]+=ws*xscale[at]*(float)dot;
+            }
+        }
+    }
+    __shared__ float upper[R][B/64][16];
+    if (half==0u && local_lane>=32u) {
+#pragma unroll
+        for (int r=0;r<R;r++) upper[r][local_row][group-16u]=acc[r];
+    }
+    __syncthreads();
+    if (local_lane<32u && half==0u) {
+#pragma unroll
+        for (int r=0;r<R;r++) {
+            float total=acc[r]+upper[r][local_row][group];
+#pragma unroll
+            for (int d=16;d>=2;d>>=1)
+                total+=__shfl_down_sync(0x55555555u,total,d);
+            if (local_lane==0u && row<out_dim && (uint32_t)r<take)
+                out[((uint64_t)row0+r)*out_dim+row]=total;
+        }
+    }
+    } else {
     const uint32_t local_row = threadIdx.x >> 6u;
     const uint32_t local_lane = threadIdx.x & 63u;
     const uint32_t group = local_lane >> 1u;
@@ -19023,6 +19127,7 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
             if (local_lane == 0u && row < out_dim && (uint32_t)r < take)
                 out[((uint64_t)row0 + r) * out_dim + row] = total;
         }
+    }
     }
     } else {
         const uint32_t fp_index=FloatFirst?blockIdx.x:blockIdx.x-qblocks;
@@ -19306,6 +19411,17 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
     a.od[0]=qkv_dim;a.od[1]=gate_dim;a.blocks=blocks;a.n_rows=rows;
     a.xq=(const int8_t *)((const char *)q->ptr+qoff);
     a.xscale=(const float *)((const char *)q->ptr+soff);a.x=(const float *)x->ptr;
+    for (unsigned i=0;i<2;i++) {
+        const uint64_t wb=od[i]*blocks*34u;
+        const uint64_t nblk=od[i]*blocks;
+        const uint64_t ab=((nblk*2u+63u)&~63ull)+nblk*32u;
+        a.aligned[i]=(const unsigned char *)cuda_derived_weight_ptr(
+            maps[i],offsets[i],wb,CUDA_DERIVED_Q8_0_ALIGNED_DENSE,
+            in_dim,od[i],1u,ab);
+    }
+    const bool use_aligned=a.aligned[0] && a.aligned[1] &&
+        cuda_aligned_q8_enabled() &&
+        getenv("DS4_QWEN4EXP_NO_GDN_ALIGNED")==NULL;
     if (rows<=2u && in_dim==2560u && qkv_dim>512u && gate_dim>512u &&
         cuda_q8_use_dp4a() && getenv("DS4_QWEN4EXP_NO_ROW_TILE")==NULL &&
         getenv("DS4_QWEN4EXP_PAIR_LANES_R2")==NULL &&
@@ -19313,15 +19429,42 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
         getenv("DS4_QWEN4EXP_NO_GDN_PROJECTION_FUSION")==NULL &&
         (((uintptr_t)a.weights[0]|(uintptr_t)a.weights[1])&1u)==0u &&
         (((uintptr_t)a.weights[2]|(uintptr_t)a.weights[3]|(uintptr_t)a.x)&15u)==0u) {
-        const unsigned grid=(unsigned)((qkv_dim+3u)/4u+(gate_dim+3u)/4u+96u);
+        const uint64_t qr=4u;
+        const unsigned grid=(unsigned)((qkv_dim+qr-1u)/qr+
+                                       (gate_dim+qr-1u)/qr+96u);
+        const bool fixed_qwen38_shape =
+            qkv_dim == 10240u && gate_dim == 6144u && blocks == 80u;
         /* PDL consumer: the stream predecessor is the mixed-input quantizer,
          * which triggers at its top at these decode widths. */
-        if (rows==1u)
-            QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1>),
+        if (use_aligned) {
+            if (rows==1u) {
+                if (fixed_qwen38_shape)
+                    QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1,true,true>),
+                                        grid, 256, 0, cuda_decode_stream(), a);
+                else
+                    QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1,true,false>),
+                                        grid, 256, 0, cuda_decode_stream(), a);
+            } else if (fixed_qwen38_shape) {
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2,true,true>),
+                                    grid, 256, 0, cuda_decode_stream(), a);
+            } else {
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2,true,false>),
+                                    grid, 256, 0, cuda_decode_stream(), a);
+            }
+        } else if (rows==1u) {
+            if (fixed_qwen38_shape)
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1,false,true>),
+                                    grid, 256, 0, cuda_decode_stream(), a);
+            else
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1,false,false>),
+                                    grid, 256, 0, cuda_decode_stream(), a);
+        } else if (fixed_qwen38_shape) {
+            QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2,false,true>),
                                 grid, 256, 0, cuda_decode_stream(), a);
-        else
-            QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2>),
+        } else {
+            QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2,false,false>),
                                 grid, 256, 0, cuda_decode_stream(), a);
+        }
         return cuda_ok(cudaGetLastError(),"GDN four projections launch");
     }
     for (unsigned i=0;i<2;i++)

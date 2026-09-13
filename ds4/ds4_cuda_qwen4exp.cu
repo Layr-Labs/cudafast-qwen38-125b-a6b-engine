@@ -3061,6 +3061,7 @@ qwen4exp_moe_gateup_mma_kernel(
     __shared__ float  sXS [QW_MMA_BN * QW_MMA_G];
     __shared__ float  sXSUM[QW_MMA_BN * QW_MMA_G];
     __shared__ uint32_t sTok[QW_MMA_BN];
+    __shared__ uint64_t sXGroup0[QW_MMA_BN];
 
     const uint32_t tid  = threadIdx.x;
     const uint32_t warp = tid >> 5;
@@ -3123,10 +3124,19 @@ qwen4exp_moe_gateup_mma_kernel(
         const int32_t take = (cnt - nbase) < QW_MMA_BN ? (cnt - nbase)
                                                        : QW_MMA_BN;
         for (uint32_t i = tid; i < QW_MMA_BN; i += QW_MMA_THREADS) {
-            sTok[i] = (int32_t)i < take
+            const uint32_t p = (int32_t)i < take
                 ? (uint32_t)pairs[base + nbase + i] : 0xffffffffu;
+            sTok[i] = p;
+            /* Four activation-staging lanes share this pair and used to
+             * repeat its runtime divide in every K chunk.  Publish the
+             * token's first group once with the pair list instead. */
+            sXGroup0[i] = p != 0xffffffffu
+                ? (uint64_t)(p / n_expert_used) * groups : 0u;
         }
         __syncthreads();
+
+        const bool act_live = sTok[act_tk] != 0xffffffffu;
+        const uint64_t act_group0 = sXGroup0[act_tk];
 
         /* The raw bytes chunk zero decodes from. */
         uint32_t rawg[8], rawu[8], rawb[8], raww[8];
@@ -3144,9 +3154,8 @@ qwen4exp_moe_gateup_mma_kernel(
             qw_raw_load((uint32_t)DS4_QWEN4EXP_TY_q4_K, w_row, 2u * w_slice,
                         raww);
         }
-        if (sTok[act_tk] != 0xffffffffu && act_gg < groups) {
-            const uint32_t token = sTok[act_tk] / n_expert_used;
-            const uint64_t at_g = (uint64_t)token * groups + act_gg;
+        if (act_live && act_gg < groups) {
+            const uint64_t at_g = (uint64_t)act_group0 + act_gg;
             qw_load_words8((const uint32_t *)(const void *)(xq + at_g * 32u),
                            rawb);
             act_scale = xs[at_g];
@@ -3298,9 +3307,8 @@ qwen4exp_moe_gateup_mma_kernel(
              * the MMA below runs; the weight payload above went earlier. */
             if (kc + QW_MMA_G < groups) {
                 const uint32_t ga = kc + QW_MMA_G + act_gg;
-                if (sTok[act_tk] != 0xffffffffu && ga < groups) {
-                    const uint32_t token = sTok[act_tk] / n_expert_used;
-                    const uint64_t at_g = (uint64_t)token * groups + ga;
+                if (act_live && ga < groups) {
+                    const uint64_t at_g = (uint64_t)act_group0 + ga;
                     qw_load_words8(
                             (const uint32_t *)(const void *)(xq + at_g * 32u),
                             rawb);

@@ -64337,9 +64337,27 @@ static int ds4_engine_open_internal(ds4_engine **out,
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
         if (e->backend == DS4_BACKEND_CUDA &&
             !load_slice && !tp_shard && !e->ssd_streaming) {
-            (void)ds4_gpu_build_derived_artifacts(e->model.map,
-                                                  e->model.size,
-                                                  opt->model_path);
+            /* Every file in a split GGUF owns an independent tensor catalog.
+             * Building from shard zero alone silently misses dense Q8 tensors
+             * placed in later shards, so offer each mapped catalog to the
+             * additive derived-artifact builder. */
+            for (uint32_t si = 0; si < e->model.n_shards; si++) {
+                char shard_path[4096];
+                const char *path = opt->model_path;
+                if (si != 0) {
+                    if (!gguf_split_shard_path(opt->model_path, si,
+                                               e->model.n_shards,
+                                               shard_path,
+                                               sizeof(shard_path))) {
+                        break;
+                    }
+                    path = shard_path;
+                }
+                (void)ds4_gpu_build_derived_artifacts(
+                    e->model.shard[si].map,
+                    e->model.shard[si].size,
+                    path);
+            }
         }
 #endif
         int model_map_ok = 0;
