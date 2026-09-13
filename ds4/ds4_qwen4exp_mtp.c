@@ -437,7 +437,19 @@ static int mtp_draft_chain(ds4_qwen4exp_mtp_state *st,
         rows_tok[seeds] = next_fed;
         float *multi_out = (1 < st->depth) ? ping : NULL;
         int draft = -1;
-        if (model->draft_rows(model->ctx, rows_tok,
+        /* Device source: the slab is s->hyper rows k0..k0+seeds, the same
+         * rows the host slab was read from, so the copy route is the only
+         * difference.  Depth 2+ reads a chain-internal `multi` row that the
+         * device source does not carry, so it stays on the host path.
+         * Falls back whenever either side lacks the hook. */
+        if (st->depth == 1 && st->dev_hc && model->draft_rows_dev) {
+            if (model->draft_rows_dev(model->ctx, rows_tok, st->dev_hc, k0,
+                                      j0, seeds + 1u, &draft) != 0) {
+                return mtp_fail(err, errlen,
+                                "qwen4exp MTP: %u-row device head forward at "
+                                "position %u failed", seeds + 1u, j0);
+            }
+        } else if (model->draft_rows(model->ctx, rows_tok,
                               hc_rows + (size_t)k0 * st->hc_dim,
                               j0, seeds + 1u, &draft, multi_out) != 0) {
             return mtp_fail(err, errlen,
@@ -1336,6 +1348,29 @@ int ds4_qwen4exp_mtp_head_forward_last(ds4_qwen4exp_mtp_head *h,
                                        char *err, size_t errlen) {
     return mtp_head_forward_impl(h, next_tokens, multi_in, pos0, n_tokens,
                                  draft_out, multi_out, true, NULL, 0u, false, err, errlen);
+}
+
+int ds4_qwen4exp_mtp_head_forward_devsrc(ds4_qwen4exp_mtp_head *h,
+                                         const int *next_tokens,
+                                         const ds4_gpu_tensor *hyper_src,
+                                         uint32_t src_row,
+                                         uint32_t pos0, uint32_t n_tokens,
+                                         int *draft_out,
+                                         char *err, size_t errlen) {
+    if (!hyper_src) {
+        return mtp_fail(err, errlen,
+                        "qwen4exp MTP: device multi source is NULL");
+    }
+    return mtp_head_forward_impl(h, next_tokens, NULL, pos0, n_tokens,
+                                 draft_out, NULL, true, hyper_src, src_row,
+                                 false, err, errlen);
+}
+
+void ds4_qwen4exp_mtp_state_set_dev_hyper(ds4_qwen4exp_mtp_state *st,
+                                          const ds4_gpu_tensor *hyper) {
+    if (!st) return;
+    st->dev_hc = (hyper && getenv("DS4_MTP_NO_DEVICE_MULTI") == NULL)
+        ? hyper : NULL;
 }
 
 
