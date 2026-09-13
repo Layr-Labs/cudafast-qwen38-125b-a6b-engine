@@ -3692,8 +3692,35 @@ __device__ __forceinline__ static void qwen4exp_shared_vector_accumulate(
  * warp streams a different weight row and the barrier before the shared fold
  * waits on the slowest of them, so narrowing the block narrows the latency
  * spread it absorbs. Inactive row warps still join barriers. */
+/* DECLARE THE BLOCK SO THE ALLOCATOR IS NOT CAPPED AT 64 REGISTERS.
+ *
+ * With no __launch_bounds__ at all, nvcc must keep the kernel launchable at the
+ * hardware maximum block size, so it budgets 65536 / 1024 = 64 registers per
+ * thread whatever the launch actually is.  This kernel is launched at
+ * OutputRows * 64 threads -- SIXTY-FOUR on the vector schedule that decode
+ * takes -- so that cap is an artefact of silence, not a decision.
+ *
+ * The cost of that exact cap is measured, not guessed: forcing 64 registers on
+ * the two routed MoE MMA tiles (which do declare a thread count and so were
+ * not capped) took prefill from 3.3327 to 2.0462, -38.6%.  Kernels in this
+ * family want well above 64 registers, and this one is compiled under 64
+ * today.  Naming a block size releases the cap without asking for any
+ * particular residency, which is why there is no second argument here: the
+ * failure mode of a second argument is a spill, and we have just seen how
+ * expensive a spill is on these kernels.
+ *
+ * The bound is the WIDEST launch, 4 * 64, rather than OutputRows * 64.  A
+ * bound above the actual launch is always legal, and 65536 / 256 = 256 is
+ * already past the 255-register hardware maximum, so the narrow vector
+ * schedule gains exactly as much headroom from 256 as it would from its true
+ * 64 -- while a plain constant avoids a template-dependent bound expression
+ * that nothing local can compile-check.
+ *
+ * Zero arithmetic changes.  The group order, the warp_sum_f32 fold and the
+ * epilogue are untouched, so every dot stays bit-identical. */
 template <int R, int Type, bool Vector = false, unsigned OutputRows = 4>
-__global__ static void qwen4exp_moe_gateup_split_kernel(
+__global__ __launch_bounds__(256) static void
+qwen4exp_moe_gateup_split_kernel(
         float *mid,
         const char *gate,
         const char *up,
@@ -3932,8 +3959,12 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
  * kernel did; the rows of the tile do not share a weight here, because each
  * one picked its own expert for the slot.  What the tile buys is that the
  * activation groups are read once for R rows and the decode is per group. */
+/* Same release as the split gate/up kernel above: with no __launch_bounds__
+ * nvcc budgets for a 1024-thread block and so caps this at 64 registers per
+ * thread, while every launch site uses 256.  Declaring 256 raises the cap
+ * without requesting a residency. */
 template <int R, int DownType = -1, bool Vector = false>
-__global__ static void qwen4exp_moe_down_q_kernel(
+__global__ __launch_bounds__(256) static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
         const int32_t *selected,
