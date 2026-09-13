@@ -6,11 +6,60 @@
  * Narrowing it is a proposal-policy change, not an exact one. */
 static constexpr uint32_t MTP_NATIVE_CAP = 2048u;
 static constexpr uint32_t MTP_NATIVE_DIM = 2560u;
-/* Coarse screen depth; full refinement still uses 80 groups. Pairs 24..31 sit
- * out, and the live_pairs mask already names a partial wave (40 groups left the
- * second warp with 8). This changes the coarse proposal heuristic, not the
- * selected-row dots. */
-static constexpr uint32_t MTP_NATIVE_SCREEN_GROUPS = 24u;
+/* Coarse screen depth; full refinement still uses 80 groups. This changes the
+ * coarse proposal heuristic, not the selected-row dots.
+ *
+ * 16, down from 24, because the screen is measurably over-provisioned. Raising
+ * it to 32 (40% of each row instead of 30%) returned spec_rounds 79,
+ * spec_drafted_total 78, spec_accepted_total 49 -- bit-identical to 24, not one
+ * round's shape changed. Widening the row count instead, 98,584 -> 248,320,
+ * also returned 49/78 while costing 0.85% of decode. Two independent
+ * enlargements of this shortlist bought exactly zero acceptance, so the coarse
+ * ranking already retains the true argmax inside the 2048-row refinement as
+ * often as this head is ever going to, and the 30 rejected rounds are
+ * draft/target disagreement in the frozen MTP weights rather than anything the
+ * screen is losing.
+ *
+ * That makes depth a pure cost above whatever the real threshold is, and the
+ * cost is the dominant term in the whole draft: at 24 groups the screen reads
+ * 98,584 x 24 x 34 B = 80.4 MB of the draft's 86.0 MB. At 16 it reads 53.6 MB,
+ * -26.8 MB per draft, about +14 bips by the 0.007%-of-decode-per-MB
+ * calibration taken from the row-widening arm. Treat that as an upper bound:
+ * per-block cost (launch, the shared-memory reduction over all 32 groups) does
+ * not scale with depth, so the traffic curve flattens as depth falls and this
+ * run also measures where.
+ *
+ * The walk stays correct and stays one iteration per lane. A row's lanes are 32
+ * group-pairs (group = (threadIdx.x & 63) >> 1) and the walk is
+ * `for (b = group; b < work_blocks; b += 32)`, so at 16 only groups 0..15
+ * enter; they all compute warp_base 0, remaining 16, live_pairs 16 and active
+ * 0xffffffff, which names exactly the 32 lanes of the row's first warp -- every
+ * participant's own bit included, so the __shfl_xor_sync pairing is intact, and
+ * the mask is uniform rather than the partial 0xffff wave 24 produced in the
+ * second warp. Groups that never enter still write acc 0.0f into partial[], so
+ * the reduction is exact at any depth. Enumerated over 24/16/12/8/4: mask
+ * correct in all cases.
+ *
+ * Why 16 and not lower, even though lower saves more. The risk is the other
+ * side of the same coin: a shallower partial dot is a noisier proxy (variance
+ * ~1/depth), so it could drop the true argmax out of the top 1.8% the
+ * refinement keeps, and a lost draft costs a whole extra round. Rounds are the
+ * expensive unit -- 81 rounds vs 79 for the same 128 tokens is 2.5% of decode,
+ * ~185 bips -- so ONE lost acceptance costs ~94 bips against the 14 bips this
+ * reclaims. The asymmetry runs hard AGAINST cutting depth, which is why this
+ * takes the smallest step that still clears the 10-bip floor rather than the
+ * biggest step the traffic model allows. It is checkable exactly:
+ * spec_accepted_total / spec_rounds are integers and are immune to the ~46-bip
+ * leg-timing noise, so this arm reports its own mechanism whatever the score
+ * does. If acceptance holds at 49/78, bisect down (12, then 8); if it falls,
+ * 24 was the real threshold and this dial is closed in both directions.
+ *
+ * Output-invariant by construction: the target verifies every draft before
+ * commit, so the proposal only moves which rounds accept, never which tokens
+ * are emitted. There is deliberately no env valve: the value is folded into
+ * the walk as a compile-time bound, and passing it as a kernel argument would
+ * cost the unrolling this loop depends on. Edit the constant to sweep it. */
+static constexpr uint32_t MTP_NATIVE_SCREEN_GROUPS = 16u;
 static constexpr uint32_t MTP_NATIVE_MAX_WIDTH = 1u << 20;
 template <bool Screen, bool EmitKeys = false>
 __global__ static void mtp_native_projection_kernel(
