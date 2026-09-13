@@ -76014,9 +76014,15 @@ static int qwen4exp_seam_verify_rows(void *ctx, const int *tokens, uint32_t n,
     int32_t buf[DS4_QWEN4EXP_MTP_MAX_COMMIT];
     if (n > (uint32_t)(sizeof(buf) / sizeof(buf[0]))) return -1;
     for (uint32_t i = 0; i < n; i++) buf[i] = (int32_t)tokens[i];
+    /* Device-multi mode: same reasoning as verify_rows_top1 -- the one-row
+     * (commit/reject) path's hc row goes to the head from the session tensor
+     * too, so its host read is skipped. */
     return ds4_qwen4exp_graph_verify_rows(e->qwen4exp_session,
                                           e->qwen4exp_weights, &e->model,
-                                          buf, n, hc_rows, row_logits,
+                                          buf, n,
+                                          s->qwen4exp_spec.dev_hc ? NULL
+                                                                  : hc_rows,
+                                          row_logits,
                                           n) ? 0 : -1;
 }
 
@@ -76029,9 +76035,13 @@ static int qwen4exp_seam_verify_rows_top1(void *ctx, const int *tokens,
     if (at != pos0 || n > (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT) return -1;
     int32_t buf[DS4_QWEN4EXP_MTP_MAX_COMMIT];
     for (uint32_t i = 0; i < n; i++) buf[i] = (int32_t)tokens[i];
+    /* Device-multi mode: the draft chain takes the hyper rows straight from
+     * the session tensor, so the host read this buffer exists for is skipped
+     * entirely; nothing else consumes the buffer's contents. */
     return ds4_qwen4exp_graph_verify_top1_rows(
                e->qwen4exp_session, e->qwen4exp_weights, &e->model,
-               buf, n, hc_rows, row_top1) ? 0 : -1;
+               buf, n, s->qwen4exp_spec.dev_hc ? NULL : hc_rows,
+               row_top1) ? 0 : -1;
 }
 
 static int qwen4exp_seam_read_logit_row(void *ctx, uint32_t row,
@@ -76105,6 +76115,34 @@ static int qwen4exp_seam_draft_rows(void *ctx, const int *next_tokens,
 #ifdef DS4_TEST_HOOKS
     /* The last row sits at pos0 + n - 1 and drafts the token two past it, the
      * same rule the one-row seam applies. */
+    if (s->qwen4exp_forced_tokens) {
+        const uint32_t want = pos0 + n - 1u + 2u;
+        if (want < (uint32_t)s->qwen4exp_forced_len) {
+            *draft_out = s->qwen4exp_forced_tokens[want];
+        }
+    }
+#endif
+    return 0;
+}
+
+/* Device-source twin of draft_rows: the slab comes straight from the session
+ * hyper tensor via one device-to-device copy, so verify's host read of the
+ * hyper rows and the host upload of the slab are both gone.  Same rows, same
+ * order, same floats -- the transport is the only difference. */
+static int qwen4exp_seam_draft_rows_dev(void *ctx, const int *next_tokens,
+                                        const ds4_gpu_tensor *hyper_src,
+                                        uint32_t src_row, uint32_t pos0,
+                                        uint32_t n, int *draft_out) {
+    ds4_session *s = ctx;
+    char err[256];
+    if (ds4_qwen4exp_mtp_head_forward_devsrc(&s->qwen4exp_head, next_tokens,
+                                             hyper_src, src_row, pos0, n,
+                                             draft_out,
+                                             err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4: qwen4exp MTP seam: %s\n", err);
+        return -1;
+    }
+#ifdef DS4_TEST_HOOKS
     if (s->qwen4exp_forced_tokens) {
         const uint32_t want = pos0 + n - 1u + 2u;
         if (want < (uint32_t)s->qwen4exp_forced_len) {
@@ -76201,6 +76239,7 @@ static bool ds4_session_qwen4exp_spec_init(ds4_session *s,
     s->qwen4exp_seam.head_logits  = qwen4exp_seam_head_logits;
     s->qwen4exp_seam.draft_step   = qwen4exp_seam_draft_step;
     s->qwen4exp_seam.draft_rows   = qwen4exp_seam_draft_rows;
+    s->qwen4exp_seam.draft_rows_dev = qwen4exp_seam_draft_rows_dev;
 
     const int depth = ds4_qwen4exp_mtp_depth_from_draft_tokens(
             e->mtp_draft_tokens, err, errlen);
@@ -76212,6 +76251,9 @@ static bool ds4_session_qwen4exp_spec_init(ds4_session *s,
                                     err, errlen) != 0) {
         return false;
     }
+    ds4_qwen4exp_mtp_state_set_dev_hyper(&s->qwen4exp_spec,
+                                         ds4_qwen4exp_session_hyper(
+                                             e->qwen4exp_session));
     s->qwen4exp_spec_failed = false;
     s->qwen4exp_spec_ready = true;
     return true;

@@ -104,6 +104,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Opaque so the device-source declarations below parse in CPU builds too;
+ * ds4_gpu.h (its own guards) restates the same typedef. */
+typedef struct ds4_gpu_tensor ds4_gpu_tensor;
+
 /* ------------------------------------------------------------------------
  * Depth envelope
  * ------------------------------------------------------------------------ */
@@ -406,6 +410,19 @@ typedef struct {
     int (*draft_rows)(void *ctx, const int *next_tokens, const float *hc_rows,
                       uint32_t pos0, uint32_t n, int *draft_out,
                       float *multi_out);
+
+    /*
+     * OPTIONAL device-source twin of draft_rows: the hc rows come from
+     * `hyper_src` (the session hyper tensor) starting at row `src_row` via
+     * device-to-device copy, so the per-cycle host read of the verify's hyper
+     * rows and the upload of the slab back to the head both disappear.  Same
+     * rows, same order, same floats -- only the transport differs, so the
+     * chain stays bit-identical.  NULL (or a NULL state dev_hc) selects the
+     * host-buffer path above.
+     */
+    int (*draft_rows_dev)(void *ctx, const int *next_tokens,
+                          const ds4_gpu_tensor *hyper_src, uint32_t src_row,
+                          uint32_t pos0, uint32_t n, int *draft_out);
 } ds4_qwen4exp_mtp_model;
 
 /* ------------------------------------------------------------------------
@@ -491,6 +508,10 @@ typedef struct {
     uint32_t frontier_row;   /* row in the latest compact target forward    */
     bool     frontier_top1_valid;
     bool     frontier_logits_deferred;
+    /* Device hyper source for the draft chain, registered once by
+     * ds4_qwen4exp_mtp_state_set_dev_hyper(): the session hyper tensor the
+     * verify leaves its rows in.  NULL runs the host hc_rows path. */
+    const ds4_gpu_tensor *dev_hc;
     ds4_qwen4exp_mtp_counters counters;
 } ds4_qwen4exp_mtp_state;
 
@@ -506,6 +527,12 @@ void ds4_qwen4exp_mtp_state_free(ds4_qwen4exp_mtp_state *st);
 /* Drop the carried draft.  Call after a rewind, a prefix change or anything
  * else that makes the parent token no longer the frontier. */
 void ds4_qwen4exp_mtp_invalidate(ds4_qwen4exp_mtp_state *st);
+
+/* Register the session hyper tensor as the draft chain's device source.  The
+ * tensor must outlive the state; NULL unregisters.  Off by default and forced
+ * off by DS4_MTP_NO_DEVICE_MULTI. */
+void ds4_qwen4exp_mtp_state_set_dev_hyper(ds4_qwen4exp_mtp_state *st,
+                                          const ds4_gpu_tensor *hyper);
 
 /* The counters are self-consistent: sum over commit_hist equals rounds, the
  * weighted sum equals committed, drafted <= rounds, accepted <= drafted, and
@@ -875,6 +902,19 @@ int ds4_qwen4exp_mtp_head_forward_last(ds4_qwen4exp_mtp_head *h,
                                        uint32_t pos0, uint32_t n_tokens,
                                        int *draft_out, float *multi_out,
                                        char *err, size_t errlen);
+
+/* The forward_last twin whose multi_in rows come from `hyper_src` (the
+ * session hyper tensor) at row `src_row` -- a device-to-device copy instead
+ * of the host write, so the caller never materialises the slab on the host.
+ * `multi_out` is always NULL here (no depth-2 consumer), and every other
+ * stage, including the top-1 readback, behaves exactly like forward_last. */
+int ds4_qwen4exp_mtp_head_forward_devsrc(ds4_qwen4exp_mtp_head *h,
+                                         const int *next_tokens,
+                                         const ds4_gpu_tensor *hyper_src,
+                                         uint32_t src_row,
+                                         uint32_t pos0, uint32_t n_tokens,
+                                         int *draft_out,
+                                         char *err, size_t errlen);
 
 /* Greedy argmax with the canonical lowest-id tie-break the shim's ds4s_argmax
  * documents.  Shared so the head and the cycle cannot break ties apart. */
