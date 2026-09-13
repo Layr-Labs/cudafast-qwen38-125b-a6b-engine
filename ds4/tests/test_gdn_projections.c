@@ -45,8 +45,14 @@ static void operate(unsigned mode,unsigned rows) {
             for(unsigned b=0;b<2;b++)must(ds4_gpu_matmul_q8_0_preq_rows_exact_tensor(
                 yt[mode][i][b],maps[b],mb[b],offsets[b][i],in_dim,od[b],
                 qt[i],0,(uint64_t)rows*groups*32u,rows),"original Q8");
+            /* Pin the pre-vector-tree F32 kernels for the float reference so
+             * the merged kernel's float blocks are compared against the
+             * ORIGINAL shared-staged halving fold, old-vs-new, and not only
+             * against the (also converted) C==2 vector tree. */
+            must(setenv("DS4_F32_NO_VECTOR_DECODE","1",1)==0,"reference F32 pin");
             for(unsigned b=2;b<4;b++)must(ds4_gpu_matmul_f32_decode_rows_exact_tensor(
                 yt[mode][i][b],maps[b],mb[b],offsets[b][i],in_dim,od[b],xt[i],rows),"original F32");
+            must(unsetenv("DS4_F32_NO_VECTOR_DECODE")==0,"reference F32 unpin");
         }
     }
 }

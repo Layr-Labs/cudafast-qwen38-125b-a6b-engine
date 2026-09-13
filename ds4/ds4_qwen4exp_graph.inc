@@ -8,6 +8,7 @@
  * outside shard 0.
  */
 
+#include "ds4_qwen4exp_graph_chunks.h"
 #include "ds4_qwen4exp_model_registration.h"
 #include "ds4_qwen4exp_qsa_scratch.h"
 
@@ -2364,7 +2365,9 @@ static bool qwen4exp_graph_layers_encode(
 /* How many consecutive captures the target stack is cut into.  1 is the single
  * whole-stack capture, which is what this build did before; the default trades
  * one long launch against an idle GPU for one short one plus launches that
- * overlap the device work already queued. */
+ * overlap the device work already queued.  The default 4 over the 48 layers
+ * is the headstart shape [1,16,16,15] (qw_decode_graph_chunk_range); uniform
+ * 48/4 would be [12,12,12,12]. */
 #define QW_DECODE_GRAPH_MAX_CHUNKS 8u
 
 static uint32_t qw_decode_graph_chunks(void) {
@@ -2382,6 +2385,24 @@ static uint32_t qw_decode_graph_chunks(void) {
         }
     }
     return chunks;
+}
+
+/* Opt OUT of the headstart piece (qw_decode_graph_chunk_range): set to restore
+ * the uniform split.  The NO_ opt-out idiom of qwen4exp_hc_defer_off, not the
+ * opt-in form.  READ ONCE, and that is a correctness requirement rather than
+ * style: a chunk key records the chunk INDEX ('QWSC', key.il = chunk below)
+ * and not the layer range it was captured over, so the chunk->range schedule
+ * must be constant for the life of the process -- a mid-process flip would
+ * replay a stale range under a familiar key.  The whole-stack 'QWST' capture
+ * and the chunked 'QWSC' captures never coexist for the same reason: the
+ * piece count is read once too. */
+static int qw_decode_graph_no_headstart(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_CUDA_DECODE_GRAPH_NO_HEADSTART");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return cached;
 }
 
 #ifdef DS4_TEST_HOOKS
@@ -2416,7 +2437,10 @@ static bool qw_decode_graph_chunk(ds4_qwen4exp_session *s,
     ds4_decode_graph_key key;
     memset(&key, 0, sizeof(key));
     /* Chunk index as the layer slot: island three has no per-layer entry, so
-     * chunk c and the per-layer caches of layer c cannot collide. */
+     * chunk c and the per-layer caches of layer c cannot collide.  The key
+     * names the INDEX and never the layer range, so the chunk->range schedule
+     * (qw_decode_graph_chunk_range) must hold for the whole process life --
+     * the reason qw_decode_graph_no_headstart is read once. */
     key.il = chunk;
     key.island = 3u;
     key.variant = n_tokens | (s->spec_snapshot_rows << 8u);
@@ -2483,17 +2507,30 @@ static bool qwen4exp_graph_layers(
      * -- the forward clears it on entry and nothing in a decode-width layer
      * sets it.  Cutting the capture at a layer boundary therefore cannot move
      * an inject across it, and a forward that replays some chunks and encodes
-     * others is the same computation in the same order. */
+     * others is the same computation in the same order.  The argument is by
+     * WIDTH and not by position: every boundary of a decode-width forward is
+     * alike, so the headstart schedule's one-layer piece 0 crosses boundaries
+     * no differently than a uniform piece did. */
     if (capture_ok && qw_decode_graph_chunks() > 1u) {
         const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
         uint32_t chunks = qw_decode_graph_chunks();
         if (chunks > cfg->n_layer) chunks = cfg->n_layer;
-        const uint32_t per = (cfg->n_layer + chunks - 1u) / chunks;
+        /* WHY PIECE 0 IS ONE LAYER (the headstart schedule).  Only the FIRST
+         * cudaGraphLaunch of a round meets an idle GPU; every later one
+         * queues behind device work already running.  A one-layer piece 0
+         * (~31 nodes, ~20-30 us of host launch time) starts the device that
+         * much sooner than a uniform 48/4 piece 0 (~374 nodes, ~0.16-0.25
+         * ms), and piece 0's ~0.8 ms of device work hides the ~0.2-0.33 ms
+         * launch of the 16-layer piece behind it.  The pieces stay
+         * consecutive ranges on the same stream, so the kernel sequence is
+         * unchanged; the ranges are qw_decode_graph_chunk_range's. */
+        const bool hs = cfg->n_layer >= 2u && !qw_decode_graph_no_headstart();
         for (uint32_t c = 0; c < chunks; c++) {
-            const uint32_t il_first = c * per;
-            if (il_first >= cfg->n_layer) break;
-            uint32_t il_last = il_first + per;
-            if (il_last > cfg->n_layer) il_last = cfg->n_layer;
+            uint32_t il_first = 0u, il_last = 0u;
+            if (!qw_decode_graph_chunk_range(c, cfg->n_layer, chunks, hs,
+                                             &il_first, &il_last)) {
+                break;
+            }
             if (!qw_decode_graph_chunk(s, w, m, n_tokens, c, il_first, il_last)) {
                 return false;
             }

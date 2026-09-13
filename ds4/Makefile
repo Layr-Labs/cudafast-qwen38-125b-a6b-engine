@@ -131,7 +131,7 @@ endif
 # memory, so it runs on every host alongside the tests that do need a device.
 GPU_KERNEL_TESTS += $(QWEN4EXP_MTP_TEST)
 
-.PHONY: all help clean test test-qwen4exp test-qwen4exp-ple test-qwen4exp-ple-kernels test-qwen4exp-ple-kernel-mutants test-qwen4exp-gdn test-qwen4exp-gdn-ref test-qwen4exp-gdn-rows test-qwen4exp-gdn-octet-mutants test-qwen4exp-quant-wide-mutants test-qwen4exp-qsa-group3-mutants test-qwen4exp-qsa-ref test-qwen4exp-moe test-qwen4exp-moe-mutants test-qwen4exp-cuda-moe test-qwen4exp-hc test-qwen4exp-hc-mutants test-qwen4exp-hc-fuse-mutants test-qwen4exp-mma-pipe-mutants test-qwen4exp-shared-pipe-mutants test-qwen4exp-hc-up-pipe-mutants test-qwen4exp-qsa test-qwen4exp-mtp test-qwen4exp-graph test-qwen4exp-parity test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm test-qwen4exp-gateup-dq
+.PHONY: all help clean test test-qwen4exp test-qwen4exp-ple test-qwen4exp-ple-kernels test-qwen4exp-ple-kernel-mutants test-qwen4exp-gdn test-qwen4exp-gdn-ref test-qwen4exp-gdn-rows test-qwen4exp-gdn-octet-mutants test-qwen4exp-quant-wide-mutants test-qwen4exp-qsa-group3-mutants test-qwen4exp-qsa-ref test-qwen4exp-moe test-qwen4exp-moe-mutants test-qwen4exp-cuda-moe test-qwen4exp-hc test-qwen4exp-hc-mutants test-qwen4exp-hc-fuse-mutants test-qwen4exp-mma-pipe-mutants test-qwen4exp-shared-pipe-mutants test-qwen4exp-hc-up-pipe-mutants test-qwen4exp-qsa test-qwen4exp-mtp test-qwen4exp-graph test-qwen4exp-parity test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm test-qwen4exp-gateup-dq test-qwen4exp-graph-chunks
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
@@ -287,7 +287,8 @@ rocm: strix-halo
 # CUDA hosts.  Everything else mirrors `make test`.
 test-rocm:
 	$(MAKE) -B ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test \
-		tests/test_layer_pack tests/test_qwen4exp_ple \
+		tests/test_layer_pack tests/test_qwen4exp_graph_chunks \
+		tests/test_qwen4exp_ple \
 		tests/test_qwen4exp_ple_hash_ref \
 		$(QWEN4EXP_PARITY_TEST) \
 		tests/test_engine_mgpu_placement tests/test_gpu_args \
@@ -300,6 +301,7 @@ test-rocm:
 	./ds4_agent_test
 	./ds4_test
 	./tests/test_layer_pack
+	./tests/test_qwen4exp_graph_chunks
 	./tests/test_qwen4exp_ple
 	python3 tests/test_qwen4exp_ple.py
 	./$(QWEN4EXP_PARITY_TEST)
@@ -537,6 +539,30 @@ tests/test_qwen4exp_moe.o: tests/test_qwen4exp_moe.c ds4_gpu.h
 # ds4_image.o supplies ds4_deepseek4_attention_bounds, which the Metal and CUDA
 # backends reference from the mixed-batch mask helper.
 $(QWEN4EXP_MOE_TEST): tests/test_qwen4exp_moe.o $(GPU_TEST_OBJS)
+	$(GPU_TEST_LINK)
+
+tests/test_q8_decode_pairs.o: tests/test_q8_decode_pairs.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_q8_decode_pairs.c
+
+tests/test_q8_decode_pairs: tests/test_q8_decode_pairs.o $(GPU_TEST_OBJS)
+	$(GPU_TEST_LINK)
+
+tests/test_gdn_projections.o: tests/test_gdn_projections.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_gdn_projections.c
+
+tests/test_gdn_projections: tests/test_gdn_projections.o $(GPU_TEST_OBJS)
+	$(GPU_TEST_LINK)
+
+tests/test_mtp_native_screen.o: tests/test_mtp_native_screen.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_mtp_native_screen.c
+
+tests/test_mtp_native_screen: tests/test_mtp_native_screen.o $(GPU_TEST_OBJS)
+	$(GPU_TEST_LINK)
+
+tests/test_f32_vector_decode.o: tests/test_f32_vector_decode.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_f32_vector_decode.c
+
+tests/test_f32_vector_decode: tests/test_f32_vector_decode.o $(GPU_TEST_OBJS)
 	$(GPU_TEST_LINK)
 
 .PHONY: test-qwen4exp-moe
@@ -811,6 +837,16 @@ tests/test_layer_pack.o: tests/test_layer_pack.c ds4_layer_pack.h
 tests/test_layer_pack: tests/test_layer_pack.o ds4_layer_pack.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
+# The decode-round chunk schedule: pure host arithmetic, no GPU, no engine.
+tests/test_qwen4exp_graph_chunks.o: tests/test_qwen4exp_graph_chunks.c ds4_qwen4exp_graph_chunks.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_qwen4exp_graph_chunks: tests/test_qwen4exp_graph_chunks.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+test-qwen4exp-graph-chunks: tests/test_qwen4exp_graph_chunks
+	./tests/test_qwen4exp_graph_chunks
+
 tests/test_qwen4exp_ple.o: tests/test_qwen4exp_ple.c ds4_qwen4exp_ple.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
@@ -1004,7 +1040,8 @@ else
 endif
 
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test \
-	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
+	tests/test_layer_pack tests/test_qwen4exp_graph_chunks \
+	tests/test_engine_mgpu_placement tests/test_gpu_args \
 	tests/test_deepseek4_vision_image $(SAMPLING_TEST) $(GPU_KERNEL_TESTS) \
 	tests/test_qwen4exp_loader tests/test_qwen4exp_ple \
 	$(QWEN4EXP_MODEL_REGISTRATION_TEST) $(QWEN4EXP_PARITY_TEST) \
@@ -1013,6 +1050,7 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test \
 	./ds4_agent_test
 	./ds4_test
 	./tests/test_layer_pack
+	./tests/test_qwen4exp_graph_chunks
 	./tests/test_qwen4exp_ple
 	python3 tests/test_qwen4exp_ple.py
 	./tests/test_engine_mgpu_placement
@@ -1061,4 +1099,4 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 	./tests/test_mxfp4_dot
 
 clean:
-	rm -f ds4_qwen4exp_mtp.o ds4_qwen4exp_mtp_hooks.o ds4_qwen4exp_mtp_cpu.o ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_qwen4exp_gdn tests/test_qwen4exp_moe tests/test_qwen4exp_gateup_dq tests/test_qwen4exp_hc_norm tests/test_qwen4exp_qsa tests/test_qwen4exp_graph tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_model_shard_fd tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_qwen4exp_loader tests/test_qwen4exp_model_registration tests/test_qwen4exp_ple tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4_qwen4exp_mtp.o ds4_qwen4exp_mtp_hooks.o ds4_qwen4exp_mtp_cpu.o ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_qwen4exp_gdn tests/test_qwen4exp_moe tests/test_qwen4exp_gateup_dq tests/test_qwen4exp_hc_norm tests/test_qwen4exp_qsa tests/test_qwen4exp_graph tests/test_qwen4exp_graph_chunks tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_model_shard_fd tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_qwen4exp_loader tests/test_qwen4exp_model_registration tests/test_qwen4exp_ple tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
