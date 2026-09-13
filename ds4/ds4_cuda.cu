@@ -5758,7 +5758,21 @@ __global__ static void matmul_q8_0_preq_rows_exact_tile_kernel(
 /* Two adjacent lanes share a Q8 group. Their integer partials may be
  * combined freely; each even lane keeps its original float group chain.
  * Shared memory remaps the 32 finished chains onto one reduction warp. */
-template <int R, bool Streaming = true>
+/* XVec: the four activation words a lane consumes per group are sixteen
+ * CONTIGUOUS bytes -- `xq + at * 32 + half * 16` -- so they are one LDG.128
+ * where the shipped form issues four LDG.32.  The weight half of this kernel
+ * was already reduced to funnelshifted words; the activation half was not, and
+ * at R = 2 it is eight of the thirteen loads a lane issues per group.  Load
+ * shape only: `int4` delivers .x .y .z .w in ascending address order, which is
+ * exactly xw[0..3], and the same four __dp4a run on the same operand pairs in
+ * the same order into the same int32 accumulator.  An integer dot has no
+ * rounding and the float tail is untouched, so the value is bit-identical.
+ *
+ * The read needs each half group 16-byte aligned.  `at * 32` is a multiple of
+ * 32 and `half * 16` is 0 or 16, so that is exactly the condition that the
+ * quantizer's scratch base is 16-byte aligned -- which the launcher tests,
+ * keeping the scalar instantiation reachable otherwise and through the env pin. */
+template <int R, bool Streaming = true, bool XVec = false>
 __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
         float *out, const unsigned char *w,
         const int8_t *xq, const float *xscale,
@@ -5817,7 +5831,16 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
             for (int r = 0; r < R; r++) {
                 if ((uint32_t)r < take) {
                     const uint64_t at = ((uint64_t)row0 + r) * blocks + b;
-                    const int32_t *xw = (const int32_t *)(xq + at * 32u + half * 16u);
+                    const int8_t *xp = xq + at * 32u + half * 16u;
+                    int32_t xw[4];
+                    if (XVec) {
+                        const int4 xv = *(const int4 *)(const void *)xp;
+                        xw[0] = xv.x; xw[1] = xv.y; xw[2] = xv.z; xw[3] = xv.w;
+                    } else {
+                        const int32_t *xsw = (const int32_t *)(const void *)xp;
+#pragma unroll
+                        for (int j = 0; j < 4; j++) xw[j] = xsw[j];
+                    }
                     int dot = 0;
 #pragma unroll
                     for (int j = 0; j < 4; j++) dot = __dp4a(wq[j], xw[j], dot);
@@ -5858,7 +5881,16 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
             for (int r = 0; r < R; r++) {
                 if ((uint32_t)r < take) {
                     const uint64_t at = ((uint64_t)row0 + r) * blocks + b;
-                    const int32_t *xw = (const int32_t *)(xq + at * 32u + half * 16u);
+                    const int8_t *xp = xq + at * 32u + half * 16u;
+                    int32_t xw[4];
+                    if (XVec) {
+                        const int4 xv = *(const int4 *)(const void *)xp;
+                        xw[0] = xv.x; xw[1] = xv.y; xw[2] = xv.z; xw[3] = xv.w;
+                    } else {
+                        const int32_t *xsw = (const int32_t *)(const void *)xp;
+#pragma unroll
+                        for (int j = 0; j < 4; j++) xw[j] = xsw[j];
+                    }
                     int dot = 0;
 #pragma unroll
                     for (int j = 0; j < 4; j++) dot = __dp4a(wq[j], xw[j], dot);
@@ -17542,18 +17574,39 @@ static int cuda_matmul_q8_0_preq_rows_exact(
             /* Retain the promoted call-width specialization for the
              * general dense projections. The HC warp geometry above is
              * independent of this two-warp kernel's token-row bound. */
+            /* Every half group this kernel reads is a whole multiple of 16
+             * bytes into xq, so one test on the base decides the activation
+             * load width for the entire call (see XVec on the kernel). */
+            const bool xvec = ((uintptr_t)xq & 15u) == 0u &&
+                getenv("DS4_CUDA_NO_Q8_PAIR_XVEC") == NULL;
             if (n_rows == 1u && getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL) {
                 /* PDL consumer: the stream predecessor is the decode
                  * quantizer, which triggers at its top (decode widths). */
+                if (xvec) {
+                    QWEN4EXP_LAUNCH_PDL(
+                            (matmul_q8_0_preq_pair_lanes_kernel<1, false, true>),
+                            (dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u)),
+                            256, 0, cuda_decode_stream(),
+                            (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
+                            out_dim, n_rows, blocks);
+                } else {
+                    QWEN4EXP_LAUNCH_PDL(
+                            (matmul_q8_0_preq_pair_lanes_kernel<1, false, false>),
+                            (dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u)),
+                            256, 0, cuda_decode_stream(),
+                            (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
+                            out_dim, n_rows, blocks);
+                }
+            } else if (xvec) {
                 QWEN4EXP_LAUNCH_PDL(
-                        (matmul_q8_0_preq_pair_lanes_kernel<1, false>),
-                        (dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u)),
+                        (matmul_q8_0_preq_pair_lanes_kernel<2, false, true>),
+                        (dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u)),
                         256, 0, cuda_decode_stream(),
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
                         out_dim, n_rows, blocks);
             } else {
                 QWEN4EXP_LAUNCH_PDL(
-                        (matmul_q8_0_preq_pair_lanes_kernel<2, false>),
+                        (matmul_q8_0_preq_pair_lanes_kernel<2, false, false>),
                         (dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u)),
                         256, 0, cuda_decode_stream(),
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
