@@ -6514,8 +6514,37 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         return 0;
     }
 
+    /* ONE TOKEN PER BLOCK on the vector schedule.  This tile maps one warp to
+     * one output row, so at R = 2 the whole down stage is out_dim = 2560 warps
+     * however the block is shaped: 320 blocks of 256 threads against the 288
+     * that a 48-SM, 1536-thread-per-SM device holds resident.  That is 1.11
+     * waves -- one full wave plus a 32-block straggler occupying 11% of the
+     * device -- and no block shape removes it, because the warp count is
+     * pinned by out_dim (128 threads gives 640 blocks on 576 slots, 512 gives
+     * 160 on 144; both 1.11).  Splitting the *token* dimension into grid.y
+     * instead doubles the warps to 5120, so the same straggler amortises over
+     * 2.22 waves.  That is why lowering rows-per-block was measured a loss
+     * while this is not the same lever.
+     *
+     * R = 2 is not buying reuse to lose here: `drow` is recomputed from a
+     * per-r expert inside the slot loop, and an expert shared by both tokens
+     * lands on different slot indices for each, so the two rows never share a
+     * load.  The mq/ms/msum reads are per (token, slot, group) either way, so
+     * the split is byte-neutral.
+     *
+     * Bit-identical, structurally: acc[0] accumulates only the r == 0 terms,
+     * in ascending slot order, and is warp-reduced on its own, so running
+     * R = 1 with tok0 = blockIdx.y replays that chain term for term through
+     * the same 32-lane warp_sum_f32 to the same out[] address.  Vector stays
+     * true, so the inner accumulate stays qwen4exp_shared_vector_accumulate;
+     * forcing the tile down via DS4_QWEN4EXP_MOE_R would instead drop
+     * down_vector and change that function, which is not the same thing. */
+    const bool dn_vec = down_vector && ((uintptr_t)sc.mq & 15u) == 0u;
+    const bool dn_row_split = dn_vec && n_tokens == 2u &&
+        getenv("DS4_QWEN4EXP_NO_DOWN_ROW_SPLIT") == NULL;
+    const uint32_t dn_tile = dn_row_split ? 1u : (uint32_t)tile;
     const dim3 dn_grid((out_dim + 7u) / 8u,
-                       (n_tokens + (uint32_t)tile - 1u) / (uint32_t)tile, 1);
+                       (n_tokens + dn_tile - 1u) / dn_tile, 1);
 #define QWEN4EXP_DOWN_IMPL(R, DT, V) \
     qwen4exp_moe_down_q_kernel<R, DT, V><<<dn_grid, threads, 0, stream>>>( \
             (float *)out->ptr, down, (const int32_t *)selected->ptr, \
@@ -6563,8 +6592,17 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
                 n_expert_used, n_total_expert);
         return cuda_ok(cudaGetLastError(), "qwen4exp MoE down combine launch");
     }
-    if (down_vector && ((uintptr_t)sc.mq & 15u) == 0u) {
-        if (down_slab->type == DS4_QWEN4EXP_TY_q8_0) {
+    if (dn_vec) {
+        /* dn_tile and this R must agree: the kernel derives tok0 from
+         * blockIdx.y * R, so a grid built for one R and a launch of the other
+         * would skip or double tokens. */
+        if (dn_row_split) {
+            if (down_slab->type == DS4_QWEN4EXP_TY_q8_0) {
+                QWEN4EXP_DOWN_IMPL(1, DS4_QWEN4EXP_TY_q8_0, true);
+            } else {
+                QWEN4EXP_DOWN_IMPL(1, DS4_QWEN4EXP_TY_q5_1, true);
+            }
+        } else if (down_slab->type == DS4_QWEN4EXP_TY_q8_0) {
             QWEN4EXP_DOWN_IMPL(2, DS4_QWEN4EXP_TY_q8_0, true);
         } else {
             QWEN4EXP_DOWN_IMPL(2, DS4_QWEN4EXP_TY_q5_1, true);
