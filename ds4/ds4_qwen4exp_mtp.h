@@ -128,8 +128,50 @@
  * `multi` row while writing its own, so they cannot be one buffer. */
 #define DS4_QWEN4EXP_MTP_HC_ROWS (DS4_QWEN4EXP_MTP_MAX_COMMIT + 2)
 
-/* Fixed input-workspace bound for native prompt-cache publication. */
-#define DS4_QWEN4EXP_MTP_CACHE_SEED_MAX_ROWS 128u
+/* Fixed input-workspace bound for native prompt-cache publication.
+ *
+ * This bounds the head's INPUT workspace only; logits and final-output scratch
+ * stay sized by max_tokens, and the session buffers the publication hook writes
+ * through (mixed, mixed_q8, qsa_kin/vin, idx_k) are already sized for the
+ * session's full n_batch, so the only cost of widening it is the head's own
+ * input rows: t_tokens, t_embed_rows, t_embed_out, t_e_normed, t_h_normed,
+ * t_ehx and t_hyper, about 195 KiB per row (t_ehx dominates at n_hc * 2 *
+ * n_embd floats).
+ *
+ * At 128 a 1024-token prompt seeds in eight passes, and each pass re-reads the
+ * head's whole input weight set -- eh_proj at 13.9 MiB plus hc_head_down/up,
+ * attn_k, attn_v and indexer_k_proj -- and pays its own eager launch train and
+ * host round trip, all inside the timed prefill window. The seeded cache is a
+ * DRAFT-side structure: the target verifies every drafted token exactly, so the
+ * emitted tokens do not depend on how the prompt is cut into seed passes, only
+ * the schedule does.
+ *
+ * 512 seeds a 1024-token prompt in two passes instead of eight for about 100
+ * MiB of head input workspace. 1024 would make it one pass, but the extra pass
+ * saved is worth ~0.13 ms against another ~100 MiB resident next to 114 GiB of
+ * weights, which is the wrong side of that trade on a 128 GiB box.
+ *
+ * Size of the win, stated plainly so nobody re-derives it: six passes times
+ * ~25 MiB is ~150 MiB at ~273 GB/s, about 0.55 ms, plus six launch trains at a
+ * few us of host time, about 0.35 ms. Roughly 0.9 ms of a ~693 ms prefill leg,
+ * 0.13% of prefill, and with the composite's 0.25 prefill exponent about 0.03%
+ * of score. That is far below this benchmark's measurement dispersion, so the
+ * change is justified by the work it removes and not by any score it produces.
+ * Do not read a single run's number as evidence about this define in either
+ * direction: the run-to-run spread of the candidate decode leg alone is
+ * 0.8-1.0% within a single box.
+ *
+ * Measured twice on device, and the outcome is worth recording here because it
+ * says more about the scoring instrument than about this define. Both runs came
+ * back with acceptance metrics bit-identical to the base -- 79 rounds, 49
+ * accepted, 0 replay disagreements -- so neither altered a single unit of decode
+ * work, as intended. The second run produced a candidate decode leg of 0.029641
+ * s/tok and a candidate prefill leg of 0.000667 s/tok, both FASTER in absolute
+ * terms than the then-leading entry's 0.029664 and 0.000677, and still scored
+ * 0.62% below it: the score is control_leg / candidate_leg, the control leg is a
+ * separate serial reference build, and it happened to run 0.87% faster in that
+ * job. Absolute speed and score are not the same ordering here. */
+#define DS4_QWEN4EXP_MTP_CACHE_SEED_MAX_ROWS 512u
 
 /*
  * tools/serve-up.sh sets DS4_MTP_DRAFT_TOKENS = declared draft length + 1,
