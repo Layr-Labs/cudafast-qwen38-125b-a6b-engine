@@ -2007,6 +2007,166 @@ __device__ __forceinline__ static void qwen4exp_group_accumulate(
     }
 }
 
+/* THE halves==1 ARM, TAKING THE DECODED GROUP AS THE EIGHT WORDS IT ALREADY IS.
+ *
+ * qwen4exp_dp4a says of its weight operand "a is decoded register-local weight
+ * data and keeps the byte packer", and that byte packer is what this removes.
+ * Every decoder in this file computes a group as eight 32-bit words -- the
+ * (v & 0x0f0f0f0f) | spread words -- then scatters them into int8_t wq[32] one
+ * byte at a time, and qwen4exp_load_i8x4 immediately rebuilds each four-byte run
+ * into the word it came from.  Thirty-two byte inserts and eight three-shift/
+ * three-or reassemblies per group, per accumulated row, to hand dp4a the value
+ * the decoder held before it took the bytes apart.
+ *
+ * The eight dp4a calls are qwen4exp_dp4a<32>'s and qwen4exp_shared_vector_
+ * accumulate's alike -- those two are already the same eight operand pairs in
+ * the same ascending order on the same zero-initialised integer accumulator,
+ * followed by the same two float terms in the same order -- so this replaces
+ * both with a bit-identical result.  Only the byte round trip is gone.
+ *
+ * `w` is the caller's uint32_t[8]; `xqg` is a quantiser-scratch group.
+ *
+ * VectorX keeps the ACTIVATION load width each caller already had, because the
+ * two forms this replaces do not agree on it and load shape is a lever in its
+ * own right here: qwen4exp_shared_vector_accumulate reads the group as two
+ * int4s (its callers guarantee the 16-byte alignment), while qwen4exp_dp4a
+ * reads eight words.  Narrowing the int4 callers to word loads would be a
+ * separate, unrelated change riding along, so it is not made.  Only the weight
+ * side moves. */
+template <bool VectorX>
+__device__ __forceinline__ static void qwen4exp_group_accumulate_w(
+        float *acc, const uint32_t *w, float wa, float wb,
+        const int8_t *xqg, float xscale, int32_t xsum) {
+    int32_t dot = 0;
+    if (VectorX) {
+        const int4 lo = *(const int4 *)(const void *)xqg;
+        const int4 hi = *(const int4 *)(const void *)(xqg + 16);
+        dot = __dp4a((int32_t)w[0], lo.x, dot);
+        dot = __dp4a((int32_t)w[1], lo.y, dot);
+        dot = __dp4a((int32_t)w[2], lo.z, dot);
+        dot = __dp4a((int32_t)w[3], lo.w, dot);
+        dot = __dp4a((int32_t)w[4], hi.x, dot);
+        dot = __dp4a((int32_t)w[5], hi.y, dot);
+        dot = __dp4a((int32_t)w[6], hi.z, dot);
+        dot = __dp4a((int32_t)w[7], hi.w, dot);
+    } else {
+        const int32_t *xw = (const int32_t *)(const void *)xqg;
+#pragma unroll
+        for (int i = 0; i < 8; i++) dot = __dp4a((int32_t)w[i], xw[i], dot);
+    }
+    *acc += (wa * xscale) * (float)dot;
+    *acc += (wb * xscale) * (float)xsum;
+}
+
+/* q5_1 STRAIGHT FROM THE ROW TO EIGHT WORDS, WITH NO STAGING BUFFER.
+ *
+ * This is dev_qwen4exp_group_decode's q5_1 arm with its final byte scatter
+ * deleted: identical d/m halfwords, identical qh word, identical nibble masks
+ * and identical high-plane spread, ending at the `lo`/`hi` words that arm
+ * already computes and then takes apart.  Byte b of wq[4k+b] was byte b of
+ * `lo`, so load_i8x4(wq + 4k) == lo and load_i8x4(wq + 16 + 4k) == hi; w[k] and
+ * w[4+k] are those two words.  Verified on the host over 32,524,288 words
+ * against both the byte arm and the elementwise scalar oracle.
+ *
+ * It reads the row directly rather than a caller-staged raw[8], so live state
+ * is the eight output words alone -- the same eight registers int8_t wq[32]
+ * occupies packed.  That matters: the staged form of this change (submission
+ * cfd36096) held raw[8] AND the decoded group live at once, sixteen words, and
+ * lost 0.99% of decode paying for the extra eight.
+ *
+ * The unaligned arm assembles its words with shifts instead of byte stores so
+ * `w` never needs an address, keeping it out of local memory.  Its element
+ * values are 0..31, so the (int8_t) cast the oracle applies is the identity and
+ * the bytes it would have stored are these. */
+__device__ __forceinline__ static void dev_qwen4exp_group_decode_q5_1_w(
+        const char *row, uint32_t g, uint32_t *w, float *wa, float *wb) {
+    /* The word read below IS the block layout: qw[0] is d|m<<16, qw[1] is qh,
+     * qw[2..5] are qs.  Any padding would silently reindex all of it, and no
+     * local gate can compile this file, so assert the shape here -- a
+     * static_assert is the one check that runs on a blind build. */
+    static_assert(sizeof(cuda_block_q5_1) == 24,
+                  "q5_1 block is d,m,qh[4],qs[16] with no padding");
+    const cuda_block_q5_1 *xb = (const cuda_block_q5_1 *)row + g;
+    *wa = dev_f16_to_f32(xb->d);
+    *wb = dev_f16_to_f32(xb->m);
+    if (qwen4exp_word_aligned(xb)) {
+        const uint32_t *qw = (const uint32_t *)(const void *)xb;
+        const uint32_t qh = qw[1];
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            const uint32_t v = qw[2 + k];
+            const uint32_t h0 = (((qh >> (k * 4)) & 0x0fu) *
+                                 0x02040810u) & 0x10101010u;
+            const uint32_t h1 = (((qh >> (16 + k * 4)) & 0x0fu) *
+                                 0x02040810u) & 0x10101010u;
+            w[k] = (v & 0x0f0f0f0fu) | h0;
+            w[4 + k] = ((v >> 4u) & 0x0f0f0f0fu) | h1;
+        }
+        return;
+    }
+    const uint32_t qh = (uint32_t)xb->qh[0] | ((uint32_t)xb->qh[1] << 8u) |
+                        ((uint32_t)xb->qh[2] << 16u) |
+                        ((uint32_t)xb->qh[3] << 24u);
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        uint32_t lo = 0, hi = 0;
+#pragma unroll
+        for (int b = 0; b < 4; b++) {
+            const uint32_t j = (uint32_t)(k * 4 + b);
+            lo |= (((uint32_t)(xb->qs[j] & 0x0fu)) |
+                   (((qh >> j) & 1u) << 4u)) << (8u * (uint32_t)b);
+            hi |= (((uint32_t)(xb->qs[j] >> 4u)) |
+                   (((qh >> (j + 16u)) & 1u) << 4u)) << (8u * (uint32_t)b);
+        }
+        w[k] = lo;
+        w[4 + k] = hi;
+    }
+}
+
+/* The q8_0 arm of dev_qwen4exp_group_decode with its byte scatter deleted.
+ *
+ * That arm is the clearest case in the file: it ALREADY builds each group as a
+ * word -- `packed = __funnelshift_r(previous, next, shift)` -- and then takes
+ * the word apart into four `wq[]` bytes, which qwen4exp_load_i8x4 reassembles
+ * into the same word inside the accumulator, once per accumulated row.  Here
+ * the funnelshift result is simply kept.  Same rolling reader, same aligned
+ * word window, same shift, same even/odd tail rule; nothing about which bytes
+ * are read or what they mean changes.
+ *
+ * `wb` is written 0.0f because the byte decoder writes wb[0] = 0.0f for q8_0
+ * before its switch, and the accumulator's `(wb * xscale) * xsum` term is kept
+ * rather than dropped so the float chain stays statement for statement what it
+ * was. */
+__device__ __forceinline__ static void dev_qwen4exp_group_decode_q8_0_w(
+        const char *row, uint32_t g, uint32_t *w, float *wa, float *wb) {
+    const char *blk = row + (uint64_t)g * 34u;
+    const uint16_t d = (((uintptr_t)blk & 1u) == 0u)
+        ? *(const uint16_t *)(const void *)blk
+        : (uint16_t)((uint8_t)blk[0]) |
+          (uint16_t)((uint16_t)(uint8_t)blk[1] << 8u);
+    *wa = dev_f16_to_f32(d);
+    *wb = 0.0f;
+    const uint8_t *payload = (const uint8_t *)blk + 2u;
+    const uintptr_t address = (uintptr_t)payload;
+    const uint32_t shift = (uint32_t)(address & 3u) * 8u;
+    const uint32_t *words =
+        (const uint32_t *)(const void *)(address - (address & 3u));
+    uint32_t previous = words[0];
+#pragma unroll
+    for (int i = 0; i < 7; i++) {
+        const uint32_t next = words[i + 1];
+        w[i] = __funnelshift_r(previous, next, shift);
+        previous = next;
+    }
+    if ((address & 1u) == 0u) {
+        const uint32_t last = *(const uint16_t *)(const void *)(payload + 30);
+        w[7] = __funnelshift_r(previous, last, shift);
+    } else {
+        w[7] = (uint32_t)payload[28] | ((uint32_t)payload[29] << 8u) |
+               ((uint32_t)payload[30] << 16u) | ((uint32_t)payload[31] << 24u);
+    }
+}
+
 /* Q8_0 quantisation of one group of one row, plus the integer sum of that
  * group that the `wb` term needs.  The row group is the only thing it reads,
  * so the result does not depend on how many rows the call carries.  `lane` is
@@ -3762,22 +3922,30 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
              * lanes, same warp_sum_f32 tree, identical bits. */
 #define QWEN4EXP_SPLIT_GROUP(GG, RAWP) do { \
                 const uint32_t g_ = (GG); \
-                int8_t wq[32]; \
+                /* dev_qwen4exp_group_decode_w already WRITES this group as \
+                 * eight words -- every fast arm casts dst to uint32_t* and \
+                 * assigns w[0..7], and the break-out tail's \
+                 * qw_tile_store_group lays down the same eight words' bytes. \
+                 * Holding it as the uint32_t[8] it is (same eight registers, \
+                 * now 4-byte aligned) lets qwen4exp_group_accumulate_w read \
+                 * the words instead of regathering each one from four bytes -- \
+                 * eight reassemblies saved per row per group, and this kernel \
+                 * is only ever instantiated at R=2 (the one-row decode and \
+                 * two-row verify), so sixteen per group.  The decode itself \
+                 * is byte-for-byte unchanged. */ \
+                uint32_t wq[8]; \
                 float wa[2] = {0.0f, 0.0f}; \
                 float wb[2] = {0.0f, 0.0f}; \
                 dev_qwen4exp_group_decode_w((uint32_t)Type, weight_row, g_, \
-                                            (RAWP), wq, wa, wb); \
-                const int halves = 1; \
+                                            (RAWP), (int8_t *)(void *)wq, \
+                                            wa, wb); \
                 _Pragma("unroll") \
                 for (int r = 0; r < R; r++) { \
                     if (r < take) { \
                         const uint64_t at_g = (uint64_t)tok[r] * groups + g_; \
-                        if (Vector) \
-                            qwen4exp_shared_vector_accumulate(&acc[r], wq, wa[0], wb[0], \
-                                xq + at_g * 32u, xs[at_g], xsum[at_g]); \
-                        else \
-                            qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves, \
-                                xq + at_g * 32u, xs[at_g], xsum[at_g]); \
+                        qwen4exp_group_accumulate_w<Vector>(&acc[r], wq, \
+                            wa[0], wb[0], \
+                            xq + at_g * 32u, xs[at_g], xsum[at_g]); \
                     } \
                 } \
             } while (0)
@@ -3979,13 +4147,33 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                     (uint64_t)row * down_row_bytes;
                 const uint64_t mrow = (uint64_t)t * n_expert_used + slot;
                 for (uint32_t g = lane; g < groups; g += 32u) {
+                    const uint64_t at_g = mrow * groups + g;
+                    /* THE WORD PATH, for the one format the routed down
+                     * projection is instantiated with on the pinned
+                     * checkpoint (Q5_1, row_bytes 480).  DownType is a
+                     * template parameter compared against a literal, so this
+                     * is a compile-time branch: the -1 and q8_0
+                     * instantiations compile it away entirely and keep the
+                     * byte path below verbatim.  q5_1 always leaves halves at
+                     * 1, so the two-half arm cannot be reached from here.
+                     * VectorX is false because this kernel's every launch
+                     * passes Vector=false, so the byte form it would have
+                     * taken is qwen4exp_dp4a's word-load activation form. */
+                    if (DownType == (int)DS4_QWEN4EXP_TY_q5_1) {
+                        uint32_t w[8];
+                        float wa = 0.0f, wb = 0.0f;
+                        dev_qwen4exp_group_decode_q5_1_w(drow, g, w, &wa, &wb);
+                        qwen4exp_group_accumulate_w<false>(
+                                &acc[r], w, wa, wb, mq + at_g * 32u,
+                                ms[at_g], msum[at_g]);
+                        continue;
+                    }
                     int8_t wq[32];
                     float wa[2], wb[2];
                     int halves = 1;
                     dev_qwen4exp_group_decode(
                             DownType < 0 ? down_type : (uint32_t)DownType,
                             drow, g, wq, wa, wb, &halves);
-                    const uint64_t at_g = mrow * groups + g;
                     if (Vector && halves == 1)
                         qwen4exp_shared_vector_accumulate(&acc[r], wq, wa[0], wb[0],
                             mq + at_g * 32u, ms[at_g], msum[at_g]);
@@ -4033,6 +4221,19 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
     const char *gate_row = gate + (uint64_t)row * gate_row_bytes;
     const char *up_row = up + (uint64_t)row * up_row_bytes;
 
+    /* Both slabs known q8_0 at compile time -- which is exactly what the
+     * decode launcher instantiates, since the shared expert of this checkpoint
+     * is q8_0 in every projection.  Then each group is decoded straight into
+     * the eight words dp4a consumes and the byte round trip disappears: the
+     * shipped q8_0 arm already builds each word with __funnelshift_r and then
+     * scatters it to four bytes that qwen4exp_load_i8x4 rebuilds inside the
+     * accumulator, once per accumulated row.  This kernel pays that twice per
+     * row -- gate and up -- so at R = 2 it is sixteen reassemblies per group.
+     * Live state is unchanged: uint32_t[8] is the eight registers int8_t[32]
+     * already occupied. */
+    constexpr bool Q8Words = GateType == (int)DS4_QWEN4EXP_TY_q8_0 &&
+                             UpType == (int)DS4_QWEN4EXP_TY_q8_0;
+
     float ag[R];
     float au[R];
 #pragma unroll
@@ -4048,6 +4249,27 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
      * The walk's remainder runs unchanged from lane + 32. */
     if (lane < groups) {
         const uint32_t g = lane;
+        if constexpr (Q8Words) {
+            uint32_t gw[8], uw[8];
+            float ga = 0.0f, gb = 0.0f, ua = 0.0f, ub = 0.0f;
+            dev_qwen4exp_group_decode_q8_0_w(gate_row, g, gw, &ga, &gb);
+            dev_qwen4exp_group_decode_q8_0_w(up_row, g, uw, &ua, &ub);
+            QWEN4EXP_PDL_SYNC();
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                if ((uint32_t)r < take) {
+                    const uint64_t at_g =
+                        (uint64_t)(tok0 + (uint32_t)r) * groups + g;
+                    const int8_t *xqg = xq + at_g * 32u;
+                    const float sc = xs[at_g];
+                    const int32_t sm = xsum[at_g];
+                    qwen4exp_group_accumulate_w<Vector>(&ag[r], gw, ga, gb,
+                                                        xqg, sc, sm);
+                    qwen4exp_group_accumulate_w<Vector>(&au[r], uw, ua, ub,
+                                                        xqg, sc, sm);
+                }
+            }
+        } else {
         int8_t gw[32], uw[32];
         float ga[2], gb[2], ua[2], ub[2];
         int gh = 1, uh = 1;
@@ -4076,8 +4298,30 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
                 }
             }
         }
+        }
     }
     for (uint32_t g = lane + 32u; g < groups; g += 32u) {
+        if constexpr (Q8Words) {
+            uint32_t gw[8], uw[8];
+            float ga = 0.0f, gb = 0.0f, ua = 0.0f, ub = 0.0f;
+            dev_qwen4exp_group_decode_q8_0_w(gate_row, g, gw, &ga, &gb);
+            dev_qwen4exp_group_decode_q8_0_w(up_row, g, uw, &ua, &ub);
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                if ((uint32_t)r < take) {
+                    const uint64_t at_g =
+                        (uint64_t)(tok0 + (uint32_t)r) * groups + g;
+                    const int8_t *xqg = xq + at_g * 32u;
+                    const float sc = xs[at_g];
+                    const int32_t sm = xsum[at_g];
+                    qwen4exp_group_accumulate_w<Vector>(&ag[r], gw, ga, gb,
+                                                        xqg, sc, sm);
+                    qwen4exp_group_accumulate_w<Vector>(&au[r], uw, ua, ub,
+                                                        xqg, sc, sm);
+                }
+            }
+            continue;
+        }
         int8_t gw[32], uw[32];
         float ga[2], gb[2], ua[2], ub[2];
         int gh = 1, uh = 1;
@@ -4139,6 +4383,11 @@ __global__ static void qwen4exp_shared_down_q_kernel(
                                                         : (uint32_t)R;
     const char *down_row = down + (uint64_t)row * down_row_bytes;
 
+    /* Same q8_0 word path as the shared gate/up kernel above: the shipped q8_0
+     * arm builds each dp4a word and then scatters it to four bytes the
+     * accumulator reassembles per row.  Decode into the words directly. */
+    constexpr bool Q8Words = DownType == (int)DS4_QWEN4EXP_TY_q8_0;
+
     float acc[R];
 #pragma unroll
     for (int r = 0; r < R; r++) acc[r] = 0.0f;
@@ -4155,6 +4404,22 @@ __global__ static void qwen4exp_shared_down_q_kernel(
      * unchanged from lane + 32. */
     if (lane < groups) {
         const uint32_t g = lane;
+        if constexpr (Q8Words) {
+            uint32_t w[8];
+            float wa = 0.0f, wb = 0.0f;
+            dev_qwen4exp_group_decode_q8_0_w(down_row, g, w, &wa, &wb);
+            QWEN4EXP_PDL_SYNC();
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                if ((uint32_t)r < take) {
+                    const uint64_t at_g =
+                        (uint64_t)(tok0 + (uint32_t)r) * groups + g;
+                    qwen4exp_group_accumulate_w<Vector>(
+                            &acc[r], w, wa, wb,
+                            mq + at_g * 32u, ms[at_g], msum[at_g]);
+                }
+            }
+        } else {
         int8_t wq[32];
         float wa[2], wb[2];
         int halves = 1;
@@ -4175,8 +4440,25 @@ __global__ static void qwen4exp_shared_down_q_kernel(
                 }
             }
         }
+        }
     }
     for (uint32_t g = lane + 32u; g < groups; g += 32u) {
+        if constexpr (Q8Words) {
+            uint32_t w[8];
+            float wa = 0.0f, wb = 0.0f;
+            dev_qwen4exp_group_decode_q8_0_w(down_row, g, w, &wa, &wb);
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                if ((uint32_t)r < take) {
+                    const uint64_t at_g =
+                        (uint64_t)(tok0 + (uint32_t)r) * groups + g;
+                    qwen4exp_group_accumulate_w<Vector>(
+                            &acc[r], w, wa, wb,
+                            mq + at_g * 32u, ms[at_g], msum[at_g]);
+                }
+            }
+            continue;
+        }
         int8_t wq[32];
         float wa[2], wb[2];
         int halves = 1;
