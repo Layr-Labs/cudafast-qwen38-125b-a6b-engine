@@ -6,13 +6,27 @@
  * Narrowing it is a proposal-policy change, not an exact one. */
 static constexpr uint32_t MTP_NATIVE_CAP = 2048u;
 static constexpr uint32_t MTP_NATIVE_DIM = 2560u;
+/* The pinned Qwen 3.8 draft domain is the configured 98308-row lexical prefix
+ * plus its 276-token special tail.  A 16-group coarse pass retains 16384
+ * candidates, then those candidates receive the complete 80-group dot before
+ * an exact max.  Other shapes keep the established 24-group / 2048-row path
+ * below. */
+static constexpr uint32_t MTP_NATIVE_CASCADE_WIDTH = 98584u;
+static constexpr uint32_t MTP_NATIVE_CASCADE_PREFIX = 98308u;
+static constexpr uint32_t MTP_NATIVE_CASCADE_TAIL = 276u;
+static constexpr uint32_t MTP_NATIVE_CASCADE_VOCAB = 248320u;
+static constexpr uint32_t MTP_NATIVE_CASCADE_CAP = 16384u;
+static constexpr uint32_t MTP_NATIVE_CASCADE_SCREEN_GROUPS = 16u;
 /* Coarse screen depth; full refinement still uses 80 groups. Pairs 24..31 sit
  * out, and the live_pairs mask already names a partial wave (40 groups left the
  * second warp with 8). This changes the coarse proposal heuristic, not the
  * selected-row dots. */
 static constexpr uint32_t MTP_NATIVE_SCREEN_GROUPS = 24u;
 static constexpr uint32_t MTP_NATIVE_MAX_WIDTH = 1u << 20;
-template <bool Screen, bool EmitKeys = false>
+template <bool Screen, bool EmitKeys = false,
+          uint32_t ScreenGroups = MTP_NATIVE_SCREEN_GROUPS,
+          bool SelectedRows = false,
+          bool ReserveMandatory = true>
 __global__ static void mtp_native_projection_kernel(
         float *out, const unsigned char *w,
         const int8_t *xq, const float *xscale,
@@ -23,7 +37,7 @@ __global__ static void mtp_native_projection_kernel(
     constexpr uint64_t blocks = MTP_NATIVE_DIM / 32u;
     constexpr int R = 1;
     constexpr bool Streaming = false;
-    const uint64_t work_blocks = Screen ? MTP_NATIVE_SCREEN_GROUPS : blocks;
+    const uint64_t work_blocks = Screen ? ScreenGroups : blocks;
     const uint32_t local_row = threadIdx.x >> 6u;
     const uint32_t local_lane = threadIdx.x & 63u;
     const uint32_t group = local_lane >> 1u;
@@ -36,7 +50,8 @@ __global__ static void mtp_native_projection_kernel(
 #pragma unroll
     for (int r = 0; r < R; r++) acc[r] = 0.0f;
 
-    const uint32_t weight_row = row >= out_dim ? n_vocab : Screen
+    const uint32_t weight_row = row >= out_dim ? n_vocab : SelectedRows
+        ? ids[row] : Screen
         ? (row < prefix ? row : n_vocab - tail + (row - prefix)) : ids[row];
     const bool valid = row < out_dim && weight_row < n_vocab;
     if (valid) {
@@ -99,10 +114,12 @@ __global__ static void mtp_native_projection_kernel(
                 if (EmitKeys) {
                     /* Same f32 score and original key statements as the
                      * standalone key producer; preserve its FTZ comparison. */
-                    const uint32_t id = row < prefix ? (uint32_t)row
+                    const uint32_t id = SelectedRows ? ids[row]
+                        : row < prefix ? (uint32_t)row
                         : (uint32_t)(n_vocab - tail + (row - prefix));
                     if (!isfinite(value)) atomicOr(invalid, 1u);
-                    if (!id || row >= prefix) keys[row] = UINT64_MAX - id;
+                    if (ReserveMandatory && (!id || id >= n_vocab - tail))
+                        keys[row] = UINT64_MAX - id;
                     else keys[row] = q8_top1_pack_key(value == 0.0f ? 0.0f : value, id);
                 } else {
                     out[((uint64_t)row0 + r) * out_dim + row] = value;
@@ -116,13 +133,14 @@ struct mtp_native_layout {
     uint64_t scores, key_in, key_out, id_tmp, flag, temporary;
 };
 static uint64_t mtp_native_align(uint64_t n) { return (n + 255u) & ~255ull; }
-static mtp_native_layout mtp_native_offsets(uint32_t width) {
+static mtp_native_layout mtp_native_offsets(uint32_t width,
+                                             uint32_t id_capacity) {
     mtp_native_layout l;
     l.scores = mtp_native_align(MTP_NATIVE_DIM + (MTP_NATIVE_DIM / 32u) * 4u);
     l.key_in = mtp_native_align(l.scores + (uint64_t)width * 4u);
     l.key_out = mtp_native_align(l.key_in + (uint64_t)width * 8u);
     l.id_tmp = mtp_native_align(l.key_out + (uint64_t)width * 8u);
-    l.flag = mtp_native_align(l.id_tmp + (uint64_t)MTP_NATIVE_CAP * 4u);
+    l.flag = mtp_native_align(l.id_tmp + (uint64_t)id_capacity * 4u);
     l.temporary = mtp_native_align(l.flag + 4u);
     return l;
 }
@@ -130,16 +148,24 @@ extern "C" int ds4_gpu_mtp_native_screen_init(uint32_t width,
         uint64_t *bytes, uint32_t *capacity) {
     if (!bytes || !capacity) return -1;
     *bytes = 0; *capacity = 0;
-    if (width <= MTP_NATIVE_CAP || width > MTP_NATIVE_MAX_WIDTH) return 0;
+    const bool cascade = width == MTP_NATIVE_CASCADE_WIDTH;
+    const uint32_t id_capacity = cascade ? MTP_NATIVE_CASCADE_CAP : MTP_NATIVE_CAP;
+    if (width <= id_capacity || width > MTP_NATIVE_MAX_WIDTH) return 0;
     size_t a = 0, b = 0;
-    if (cub::DeviceRadixSort::SortKeysDescending(nullptr, a,
+    if (cub::DeviceRadixSort::SortKeysDescending(nullptr,a,
             (const uint64_t *)nullptr, (uint64_t *)nullptr, width, 0, 64,
-            cuda_decode_stream()) != cudaSuccess ||
-        cub::DeviceRadixSort::SortKeys(nullptr, b,
+            cuda_decode_stream()) != cudaSuccess) return -1;
+    if (cascade) {
+        if (cub::DeviceReduce::Max(nullptr,b,(const uint64_t *)nullptr,
+                (uint64_t *)nullptr,MTP_NATIVE_CASCADE_CAP,
+                cuda_decode_stream()) != cudaSuccess) return -1;
+    } else if (cub::DeviceRadixSort::SortKeys(nullptr,b,
             (const uint32_t *)nullptr, (uint32_t *)nullptr, MTP_NATIVE_CAP, 0, 32,
             cuda_decode_stream()) != cudaSuccess) return -1;
-    *bytes = mtp_native_offsets(width).temporary + std::max(a,b);
-    *capacity = MTP_NATIVE_CAP;
+    *bytes = mtp_native_offsets(width,id_capacity).temporary + std::max(a,b);
+    /* The cascade has already reduced its complete candidate logits to the
+     * winning original ID, so the ordinary top-1/map seam sees one row. */
+    *capacity = cascade ? 1u : MTP_NATIVE_CAP;
     return 1;
 }
 __global__ static void mtp_native_keys(uint64_t *keys, uint32_t *invalid,
@@ -155,9 +181,20 @@ __global__ static void mtp_native_keys(uint64_t *keys, uint32_t *invalid,
     if (!id || i >= prefix) keys[i] = UINT64_MAX - id;
     else keys[i] = q8_top1_pack_key(value == 0.0f ? 0.0f : value, id);
 }
-__global__ static void mtp_native_unpack_ids(uint32_t *ids, const uint64_t *keys) {
+__global__ static void mtp_native_unpack_ids(uint32_t *ids,
+                                             const uint64_t *keys,
+                                             uint32_t count) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < MTP_NATIVE_CAP) ids[i] = UINT32_MAX - (uint32_t)keys[i];
+    if (i < count) ids[i] = UINT32_MAX - (uint32_t)keys[i];
+}
+__global__ static void mtp_native_take_best(float *out, uint32_t *ids,
+                                            const uint64_t *keys) {
+    if (blockIdx.x || threadIdx.x) return;
+    ids[0] = UINT32_MAX - (uint32_t)keys[0];
+    /* native_map only checks finiteness when the packed width is one.  The ID
+     * above came from the complete 80-group reduction, so no score needs to
+     * be materialized and reduced a second time. */
+    out[0] = 0.0f;
 }
 /* Moving key writes into projection is equivalent only when scratch writes
  * cannot change another input/output view or a concurrently read weight. */
@@ -175,15 +212,20 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
         uint64_t map_bytes, uint64_t offset, uint32_t in_dim, uint32_t vocab,
         uint32_t prefix, uint32_t tail, const ds4_gpu_tensor *x) {
     const uint64_t wide = (uint64_t)prefix + tail;
-    if (in_dim != MTP_NATIVE_DIM || !prefix || !tail || tail >= MTP_NATIVE_CAP ||
-        prefix > vocab || tail > vocab - prefix || wide <= MTP_NATIVE_CAP ||
+    const bool cascade = vocab == MTP_NATIVE_CASCADE_VOCAB &&
+        prefix == MTP_NATIVE_CASCADE_PREFIX &&
+        tail == MTP_NATIVE_CASCADE_TAIL && wide == MTP_NATIVE_CASCADE_WIDTH;
+    const uint32_t id_capacity = cascade ? MTP_NATIVE_CASCADE_CAP : MTP_NATIVE_CAP;
+    const uint32_t out_capacity = cascade ? 1u : MTP_NATIVE_CAP;
+    if (in_dim != MTP_NATIVE_DIM || !prefix || !tail || tail >= id_capacity ||
+        prefix > vocab || tail > vocab - prefix || wide <= id_capacity ||
         wide > MTP_NATIVE_MAX_WIDTH || !cuda_q8_use_dp4a() ||
         getenv("DS4_QWEN4EXP_NO_ROW_TILE") != nullptr ||
         getenv("DS4_QWEN4EXP_PAIR_LANES_R2") != nullptr) return 0;
     const uint32_t width = (uint32_t)wide;
-    const mtp_native_layout l = mtp_native_offsets(width);
+    const mtp_native_layout l = mtp_native_offsets(width,id_capacity);
     if (!out || !ids || !scratch || !x || !map ||
-        out->bytes < MTP_NATIVE_CAP * 4ull || ids->bytes < MTP_NATIVE_CAP * 4ull ||
+        out->bytes < out_capacity * 4ull || ids->bytes < out_capacity * 4ull ||
         scratch->bytes <= l.temporary || x->bytes < in_dim * 4ull ||
         offset > map_bytes || (uint64_t)vocab > (map_bytes-offset) / (80u*34u)) return -1;
     const int tier = ds4_tensor_device_idx(out);
@@ -216,10 +258,23 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
         mtp_native_key_range_disjoint(scratch->ptr,scratch->bytes,x->ptr,x->bytes) &&
         mtp_native_key_range_disjoint(scratch->ptr,scratch->bytes,out->ptr,out->bytes) &&
         mtp_native_key_range_disjoint(scratch->ptr,scratch->bytes,ids->ptr,ids->bytes);
+    /* The cascade writes both candidate IDs and packed keys into disjoint
+     * regions of scratch.  A rare alias topology takes the existing exact
+     * full-vocabulary fallback rather than weakening that proof. */
+    if (cascade && !fuse_keys) return 0;
     if (fuse_keys) {
-        mtp_native_projection_kernel<true,true><<<(width+3u)/4u,256,0,cuda_decode_stream()>>>(
-            scores,(const unsigned char *)w,xq,xs,width,nullptr,vocab,prefix,tail,
-            key_in,flag);
+        if (cascade) {
+            mtp_native_projection_kernel<true,true,
+                MTP_NATIVE_CASCADE_SCREEN_GROUPS>
+                <<<(width+3u)/4u,256,0,cuda_decode_stream()>>>(
+                    scores,(const unsigned char *)w,xq,xs,width,nullptr,
+                    vocab,prefix,tail,key_in,flag);
+        } else {
+            mtp_native_projection_kernel<true,true>
+                <<<(width+3u)/4u,256,0,cuda_decode_stream()>>>(
+                    scores,(const unsigned char *)w,xq,xs,width,nullptr,
+                    vocab,prefix,tail,key_in,flag);
+        }
         if (!cuda_ok(cudaGetLastError(),"native fused screen keys")) return -1;
     } else {
         mtp_native_projection_kernel<true><<<(width+3u)/4u,256,0,cuda_decode_stream()>>>(
@@ -235,7 +290,35 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
     size_t temporary = (size_t)(scratch->bytes-l.temporary);
     if (!cuda_ok(cub::DeviceRadixSort::SortKeysDescending(base+l.temporary,temporary,
             key_in,key_out,width,0,64,cuda_decode_stream()),"native score sort")) return -1;
-    mtp_native_unpack_ids<<<(MTP_NATIVE_CAP+255u)/256u,256,0,cuda_decode_stream()>>>(id_tmp,key_out);
+    if (cascade) {
+        mtp_native_unpack_ids<<<
+            (MTP_NATIVE_CASCADE_CAP+255u)/256u,256,0,cuda_decode_stream()>>>(
+                id_tmp,key_out,MTP_NATIVE_CASCADE_CAP);
+        if (!cuda_ok(cudaGetLastError(),"native cascade candidate unpack")) return -1;
+        if (!cuda_ok(cudaMemsetAsync(flag,0,4,cuda_decode_stream()),
+                     "native cascade flag")) return -1;
+        /* Re-score only the coarse shortlist, now with every one of the 80
+         * Q8 blocks.  ReserveMandatory is false at this exact stage: zero and
+         * the special tail were guaranteed into the shortlist above, and the
+         * complete dot must choose solely by value/original-ID order. */
+        mtp_native_projection_kernel<true,true,80u,true,false>
+            <<<(MTP_NATIVE_CASCADE_CAP+3u)/4u,256,0,cuda_decode_stream()>>>(
+                scores,(const unsigned char *)w,xq,xs,MTP_NATIVE_CASCADE_CAP,
+                id_tmp,vocab,prefix,tail,key_in,flag);
+        if (!cuda_ok(cudaGetLastError(),"native cascade exact rows")) return -1;
+        invalid = 0;
+        if (!ds4_gpu_tensor_read(scratch,l.flag,&invalid,4)) return -1;
+        if (invalid) return 0;
+        temporary = (size_t)(scratch->bytes-l.temporary);
+        if (!cuda_ok(cub::DeviceReduce::Max(base+l.temporary,temporary,
+                key_in,key_out,MTP_NATIVE_CASCADE_CAP,cuda_decode_stream()),
+                "native cascade maximum")) return -1;
+        mtp_native_take_best<<<1,1,0,cuda_decode_stream()>>>(
+            (float *)out->ptr,(uint32_t *)ids->ptr,key_out);
+        return cuda_ok(cudaGetLastError(),"native cascade direct top1") ? 1 : -1;
+    }
+    mtp_native_unpack_ids<<<(MTP_NATIVE_CAP+255u)/256u,256,0,cuda_decode_stream()>>>(
+        id_tmp,key_out,MTP_NATIVE_CAP);
     if (!cuda_ok(cudaGetLastError(),"native candidate unpack")) return -1;
     temporary = (size_t)(scratch->bytes-l.temporary);
     if (!cuda_ok(cub::DeviceRadixSort::SortKeys(base+l.temporary,temporary,
@@ -256,7 +339,8 @@ __global__ static void mtp_native_map(uint32_t *winner, const float *logits,
 extern "C" int ds4_gpu_mtp_native_map(ds4_gpu_tensor *winner,
         const ds4_gpu_tensor *logits, const ds4_gpu_tensor *ids,
         uint32_t count, uint32_t vocab) {
-    if (!winner || !logits || !ids || count != MTP_NATIVE_CAP || !vocab ||
+    if (!winner || !logits || !ids ||
+        (count != 1u && count != MTP_NATIVE_CAP) || !vocab ||
         winner->bytes < 4 || logits->bytes < (uint64_t)count*4 || ids->bytes < (uint64_t)count*4) return 0;
     const int tier=ds4_tensor_device_idx(winner); int current=-1;
     if (tier<0 || tier>=g_n_gpus || ds4_tensor_device_idx(logits)!=tier ||

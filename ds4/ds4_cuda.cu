@@ -5,6 +5,7 @@
 #include <cublas_v2.h>
 #include <cub/block/block_radix_sort.cuh>
 #include <cub/device/device_radix_sort.cuh>
+#include <cub/device/device_reduce.cuh>
 
 #include <stdint.h>
 #include <errno.h>

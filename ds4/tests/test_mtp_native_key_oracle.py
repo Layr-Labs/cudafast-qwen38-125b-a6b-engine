@@ -14,11 +14,14 @@ old=block(s,'__global__ static void mtp_native_keys(')
 old=old[old.index('    if (i >= width)'):].replace('scores[i]','input').replace('keys[i]','result.key')
 fused=block(s,'if (EmitKeys)')
 fused=fused.replace('keys[row]','result.key')
+fused=fused.replace('SelectedRows','selected_rows').replace('ReserveMandatory','reserve_mandatory')
+fused=fused.replace('ids[row]','selected_id')
 for key in ['old','fused']:
  val=locals()[key].replace('value == 0.0f','probe_zero(value,ftz)').replace('!isfinite(value)','!probe_finite(value)')
  locals()[key]=val
 range_body=block(s,'static bool mtp_native_key_range_disjoint(')
-gate=s[s.index('    const bool fuse_keys ='):s.index('    if (fuse_keys)')].replace('getenv("DS4_MTP_NO_FUSED_SCREEN_KEYS")','(diagnostic ? "1" : nullptr)')
+gate=s[s.index('    const bool fuse_keys ='):s.index('    if (fuse_keys)')]
+gate=gate[:gate.index('    /* The cascade')].replace('getenv("DS4_MTP_NO_FUSED_SCREEN_KEYS")','(diagnostic ? "1" : nullptr)')
 floatkey=block(main,'static uint32_t q8_top1_float_ordered_key(')
 pack=block(main,'static uint64_t q8_top1_pack_key(')
 code=r'''
@@ -37,7 +40,7 @@ static void atomicOr(uint32_t*p,uint32_t v){*p|=v;}
 code+='static uint32_t q8_top1_float_ordered_key(float v){'+floatkey+'}\n'
 code+='static uint64_t q8_top1_pack_key(float v,uint32_t idx){'+pack+'}\n'
 code+='static Key original(uint32_t i,uint32_t width,uint32_t prefix,uint32_t tail,uint32_t vocab,float input,bool ftz){Key result;uint32_t*invalid=&result.flag;'+old.replace('return;','return result;')+'return result;}\n'
-code+='static Key candidate(uint64_t row,uint32_t prefix,uint32_t tail,uint64_t n_vocab,float value,bool ftz){Key result;uint32_t*invalid=&result.flag;'+fused+'return result;}\n'
+code+='static Key candidate(uint64_t row,uint32_t prefix,uint32_t tail,uint64_t n_vocab,float value,bool ftz,uint32_t selected_id=0,bool selected_rows=false,bool reserve_mandatory=true){Key result;uint32_t*invalid=&result.flag;'+fused+'return result;}\n'
 code+='static bool mtp_native_key_range_disjoint(const void*a,uint64_t an,const void*b,uint64_t bn){'+range_body+'}\n'
 code+='struct Buffer {void*ptr;uint64_t bytes;};\nstatic bool allow(Buffer*scratch,Buffer*x,Buffer*out,Buffer*ids,void*w,uint32_t vocab,bool diagnostic){'+gate+'return fuse_keys;}\n'
 code+=r'''
@@ -56,6 +59,9 @@ for(uint32_t vocab:{21000u,248320u,0xffffffffu})for(uint32_t prefix:{16384u,2000
   uint32_t rank=canonical>>31?UINT32_MAX-canonical:canonical+0x80000000u;
   uint64_t expected=(!id||row>=prefix)?UINT64_MAX-id:((uint64_t)rank<<32)+(UINT32_MAX-id);
   assert(a.key==expected&&b.key==expected&&a.flag==(mag>=0x7f800000u)&&b.flag==a.flag);++checks;
+  Key direct=candidate(row,prefix,tail,vocab,value(u),mode,id,true,false);
+  uint64_t direct_expected=((uint64_t)rank<<32)+(UINT32_MAX-id);
+  assert(direct.key==direct_expected&&direct.flag==a.flag);++checks;
  }
 }
 Buffer scratch{(void*)0x10000000,0x100000},x{(void*)0x20000000,4096},out{(void*)0x30000000,65536},ids{(void*)0x40000000,65536};void*w=(void*)0x50000000;
