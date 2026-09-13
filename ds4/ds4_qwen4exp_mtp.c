@@ -6,6 +6,7 @@
 #include "ds4_qwen4exp_mtp.h"
 
 #include <errno.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -236,6 +237,75 @@ int ds4_qwen4exp_mtp_state_init(ds4_qwen4exp_mtp_state *st, int depth,
     st->depth = depth;
     st->hc_dim = hc_dim;
     st->n_vocab = n_vocab;
+    st->confidence_skip_top_threshold = INFINITY;
+    /*
+     * A depth-1 draft is occasionally the wrong side of a near tie even when
+     * both logits are strong.  Across ten independent 128-token calibration
+     * streams, switching only this high-confidence region selected the target
+     * token five times and the original draft zero times.  The target still
+     * verifies every proposal, so this changes round count, never output.
+     * DS4_MTP_SECOND_MARGIN_THRESHOLD=0 is the diagnostic off switch.
+     */
+    st->second_margin_threshold = 0.15f;
+    st->second_logit_threshold = 18.75f;
+    const char *threshold_raw = getenv("DS4_MTP_CONFIDENCE_THRESHOLD");
+    if (threshold_raw && threshold_raw[0]) {
+        char *end = NULL;
+        errno = 0;
+        const float threshold = strtof(threshold_raw, &end);
+        if (errno != 0 || end == threshold_raw || *end != '\0' ||
+            !isfinite(threshold) || threshold < 0.0f) {
+            return mtp_fail(err, errlen,
+                            "qwen4exp MTP: DS4_MTP_CONFIDENCE_THRESHOLD=\"%s\" "
+                            "is not a non-negative finite float", threshold_raw);
+        }
+        st->confidence_skip_threshold = threshold;
+    }
+    const char *top_threshold_raw =
+        getenv("DS4_MTP_CONFIDENCE_TOP_THRESHOLD");
+    if (top_threshold_raw && top_threshold_raw[0]) {
+        char *end = NULL;
+        errno = 0;
+        const float threshold = strtof(top_threshold_raw, &end);
+        if (errno != 0 || end == top_threshold_raw || *end != '\0' ||
+            !isfinite(threshold)) {
+            return mtp_fail(
+                err, errlen,
+                "qwen4exp MTP: DS4_MTP_CONFIDENCE_TOP_THRESHOLD=\"%s\" "
+                "is not a finite float", top_threshold_raw);
+        }
+        st->confidence_skip_top_threshold = threshold;
+    }
+    const char *second_margin_raw =
+        getenv("DS4_MTP_SECOND_MARGIN_THRESHOLD");
+    if (second_margin_raw && second_margin_raw[0]) {
+        char *end = NULL;
+        errno = 0;
+        const float threshold = strtof(second_margin_raw, &end);
+        if (errno != 0 || end == second_margin_raw || *end != '\0' ||
+            !isfinite(threshold) || threshold < 0.0f) {
+            return mtp_fail(
+                err, errlen,
+                "qwen4exp MTP: DS4_MTP_SECOND_MARGIN_THRESHOLD=\"%s\" "
+                "is not a non-negative finite float", second_margin_raw);
+        }
+        st->second_margin_threshold = threshold;
+    }
+    const char *second_logit_raw =
+        getenv("DS4_MTP_SECOND_LOGIT_THRESHOLD");
+    if (second_logit_raw && second_logit_raw[0]) {
+        char *end = NULL;
+        errno = 0;
+        const float threshold = strtof(second_logit_raw, &end);
+        if (errno != 0 || end == second_logit_raw || *end != '\0' ||
+            !isfinite(threshold)) {
+            return mtp_fail(
+                err, errlen,
+                "qwen4exp MTP: DS4_MTP_SECOND_LOGIT_THRESHOLD=\"%s\" "
+                "is not a finite float", second_logit_raw);
+        }
+        st->second_logit_threshold = threshold;
+    }
     ds4_qwen4exp_mtp_invalidate(st);
     st->hc_scratch = malloc((size_t)DS4_QWEN4EXP_MTP_HC_ROWS * hc_dim *
                             sizeof(float));
@@ -257,7 +327,14 @@ void ds4_qwen4exp_mtp_state_free(ds4_qwen4exp_mtp_state *st) {
 }
 
 void ds4_qwen4exp_mtp_invalidate(ds4_qwen4exp_mtp_state *st) {
-    for (int k = 0; k < DS4_QWEN4EXP_IMPLEMENTED_DEPTH; k++) st->pending[k] = -1;
+    for (int k = 0; k < DS4_QWEN4EXP_IMPLEMENTED_DEPTH; k++) {
+        st->pending[k] = -1;
+        st->pending_confidence[k] = 0.0f;
+        st->pending_top_logit[k] = 0.0f;
+        st->pending_second_logit[k] = 0.0f;
+        st->pending_second_id[k] = -1;
+        st->pending_confidence_valid[k] = false;
+    }
     st->n_pending = 0;
     st->pending_parent = -1;
     st->frontier_top1_valid = false;
@@ -445,6 +522,14 @@ static int mtp_draft_chain(ds4_qwen4exp_mtp_state *st,
                             "failed", seeds + 1u, j0);
         }
         st->pending[0] = draft;
+        if (model->draft_confidence &&
+            model->draft_confidence(model->ctx,
+                                    &st->pending_confidence[0],
+                                    &st->pending_top_logit[0],
+                                    &st->pending_second_logit[0],
+                                    &st->pending_second_id[0]) == 0) {
+            st->pending_confidence_valid[0] = true;
+        }
         st->n_pending = 1;
         cur_tok = draft;
         cur_hc = multi_out;
@@ -478,6 +563,14 @@ static int mtp_draft_chain(ds4_qwen4exp_mtp_state *st,
                             "position %u failed", k, cur_tok, p);
         }
         st->pending[k] = draft;
+        if (model->draft_confidence &&
+            model->draft_confidence(model->ctx,
+                                    &st->pending_confidence[k],
+                                    &st->pending_top_logit[k],
+                                    &st->pending_second_logit[k],
+                                    &st->pending_second_id[k]) == 0) {
+            st->pending_confidence_valid[k] = true;
+        }
         st->n_pending = k + 1;
         cur_tok = draft;
         cur_hc = multi_out;
@@ -565,6 +658,24 @@ int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
     int n = st->n_pending;
     if (n > budget - 1) n = budget - 1;
     if (n > accepted_cap - 1) n = accepted_cap - 1;
+    if (n == 1 && st->confidence_skip_threshold > 0.0f &&
+        st->pending_confidence_valid[0] &&
+        st->pending_top_logit[0] < st->confidence_skip_top_threshold &&
+        st->pending_confidence[0] < st->confidence_skip_threshold) {
+        const char *confidence_log = getenv("DS4_MTP_CONFIDENCE_LOG");
+        if (confidence_log && confidence_log[0] &&
+            strcmp(confidence_log, "0") != 0) {
+            fprintf(stderr,
+                    "ds4: mtp-confidence-skip pos=%u draft=%d top=%.9g "
+                    "top-threshold=%.9g margin=%.9g threshold=%.9g\n",
+                    pos, st->pending[0], st->pending_top_logit[0],
+                    st->confidence_skip_top_threshold,
+                    st->pending_confidence[0],
+                    st->confidence_skip_threshold);
+        }
+        return mtp_commit_one(st, model, first_token, pos,
+                              accepted, logits, NULL, err, errlen);
+    }
     if (n < 1 || st->depth < 1) {
         return mtp_commit_one(st, model, first_token, pos,
                               accepted, logits, NULL, err, errlen);
@@ -577,6 +688,38 @@ int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
                    "the verify carries the fed token plus the whole chain");
     toks[0] = first_token;
     for (int k = 0; k < n; k++) toks[k + 1] = st->pending[k];
+    float draft_confidence[DS4_QWEN4EXP_IMPLEMENTED_DEPTH];
+    float draft_top_logit[DS4_QWEN4EXP_IMPLEMENTED_DEPTH];
+    float draft_second_logit[DS4_QWEN4EXP_IMPLEMENTED_DEPTH];
+    int draft_second_id[DS4_QWEN4EXP_IMPLEMENTED_DEPTH];
+    bool draft_confidence_valid[DS4_QWEN4EXP_IMPLEMENTED_DEPTH];
+    for (int k = 0; k < n; k++) {
+        draft_confidence[k] = st->pending_confidence[k];
+        draft_top_logit[k] = st->pending_top_logit[k];
+        draft_second_logit[k] = st->pending_second_logit[k];
+        draft_second_id[k] = st->pending_second_id[k];
+        draft_confidence_valid[k] = st->pending_confidence_valid[k];
+    }
+    if (n == 1 && st->second_margin_threshold > 0.0f &&
+        draft_confidence_valid[0] &&
+        draft_confidence[0] <= st->second_margin_threshold &&
+        draft_second_logit[0] >= st->second_logit_threshold &&
+        draft_second_id[0] >= 0 &&
+        (uint32_t)draft_second_id[0] < st->n_vocab &&
+        draft_second_id[0] != toks[1]) {
+        const int original_draft = toks[1];
+        toks[1] = draft_second_id[0];
+        const char *confidence_log = getenv("DS4_MTP_CONFIDENCE_LOG");
+        if (confidence_log && confidence_log[0] &&
+            strcmp(confidence_log, "0") != 0) {
+            fprintf(stderr,
+                    "ds4: mtp-confidence-second pos=%u original=%d second=%d "
+                    "runnerup=%.9g threshold=%.9g margin=%.9g threshold=%.9g\n",
+                    pos, original_draft, toks[1], draft_second_logit[0],
+                    st->second_logit_threshold, draft_confidence[0],
+                    st->second_margin_threshold);
+        }
+    }
     ds4_qwen4exp_mtp_invalidate(st);
 
     /* No round-start snapshot.  The verify forward itself leaves the state
@@ -625,6 +768,20 @@ int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
         a++;
     }
     st->counters.accepted += (uint64_t)a;
+    const char *confidence_log = getenv("DS4_MTP_CONFIDENCE_LOG");
+    if (confidence_log && confidence_log[0] &&
+        strcmp(confidence_log, "0") != 0) {
+        for (int k = 0; k < n; k++) {
+            fprintf(stderr,
+                    "ds4: mtp-confidence pos=%u step=%d parent=%d draft=%d "
+                    "second=%d top=%.9g runnerup=%.9g margin=%.9g valid=%d "
+                    "accepted=%d\n",
+                    pos, k, first_token, toks[k + 1], draft_second_id[k],
+                    draft_top_logit[k], draft_second_logit[k],
+                    draft_confidence[k],
+                    draft_confidence_valid[k] ? 1 : 0, k < a ? 1 : 0);
+        }
+    }
 
     /* The target head has already produced every row.  A greedy-only compact
      * seam can carry the exact GPU winner forward and leave the full selected
@@ -888,6 +1045,7 @@ int ds4_qwen4exp_mtp_head_init(ds4_qwen4exp_mtp_head *h,
     h->cache_tail_valid = false;
     h->cache_tail_next_token = -1;
     h->t_top1         = mtp_alloc(rows * sizeof(uint32_t), &ok);
+    h->t_top_values   = mtp_alloc(2u * sizeof(float), &ok);
     h->top1_host      = malloc((size_t)rows * sizeof(uint32_t));
     if (!ok || !h->top1_host) {
         ds4_qwen4exp_mtp_head_free(h);
@@ -904,7 +1062,8 @@ void ds4_qwen4exp_mtp_head_free(ds4_qwen4exp_mtp_head *h) {
         h->t_tokens, h->t_embed_rows, h->t_embed_out, h->t_e_normed,
         h->t_h_normed, h->t_ehx, h->t_hyper, h->t_mix_normed,
         h->t_mix_lowrank, h->t_mix_wide, h->t_sample, h->t_logits,
-        h->t_logits_prefix, h->t_logits_tail, h->t_top1, h->t_native_ids, h->t_native_scratch, h->t_cache_tail,
+        h->t_logits_prefix, h->t_logits_tail, h->t_top1, h->t_top_values,
+        h->t_native_ids, h->t_native_scratch, h->t_cache_tail,
     };
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
         ds4_gpu_tensor_free(all[i]);
@@ -913,7 +1072,7 @@ void ds4_qwen4exp_mtp_head_free(ds4_qwen4exp_mtp_head *h) {
     h->t_h_normed = h->t_ehx = h->t_hyper = h->t_mix_normed = NULL;
     h->t_mix_lowrank = h->t_mix_wide = h->t_sample = h->t_logits = NULL;
     h->t_logits_prefix = h->t_logits_tail = NULL;
-    h->t_top1 = NULL;
+    h->t_top1 = h->t_top_values = NULL;
     h->t_native_ids = h->t_native_scratch = NULL;
     h->t_cache_tail = NULL;
     h->cache_seed_capacity = 0;
@@ -1238,6 +1397,8 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
         }
     }
     MTP_HEAD_TICK(MTP_HEAD_T_LM_HEAD);
+    const bool measure_margin = logit_rows == 1u;
+    h->last_draft_margin_valid = false;
     if (ok) {
         stage = "gpu top-1";
         /* The head exposes only draft ids.  Keep the LM-head arithmetic intact,
@@ -1245,7 +1406,11 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
          * instead of the full vocabulary row for a host scan.  A shortlist
          * row is packed, so the id comes out in packed positions and is
          * rebased below. */
-        ok = ds4_gpu_indexer_topk_tensor(h->t_top1, h->t_logits,
+        ok = measure_margin
+            ? ds4_gpu_indexer_top2_value_tensor(h->t_top1, h->t_top_values,
+                                                h->t_logits, draft_width, 1u,
+                                                0u) != 0
+            : ds4_gpu_indexer_topk_tensor(h->t_top1, h->t_logits,
                                          draft_width, logit_rows, 1u) != 0;
     }
     if (ok && screened) {
@@ -1265,7 +1430,30 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
         ok = ds4_gpu_tensor_read(h->t_top1,
                                  (uint64_t)logit_first * sizeof(uint32_t),
                                  h->top1_host,
-                                 (uint64_t)out_rows * sizeof(uint32_t)) != 0;
+                                 (uint64_t)(measure_margin ? 2u : out_rows) *
+                                     sizeof(uint32_t)) != 0;
+    }
+    if (ok && measure_margin) {
+        stage = "top-2 value readback";
+        ok = ds4_gpu_tensor_read(h->t_top_values, 0, h->top_values_host,
+                                 2u * sizeof(float)) != 0;
+        if (ok) {
+            h->last_draft_margin =
+                h->top_values_host[0] - h->top_values_host[1];
+            uint32_t second_id = h->top1_host[1];
+            if (screened) {
+                if (second_id >= h->n_vocab) {
+                    ok = false;
+                }
+            } else if (draft_prefix && second_id >= draft_prefix) {
+                second_id = h->n_vocab - draft_tail +
+                            (second_id - draft_prefix);
+            }
+            if (ok) {
+                h->last_draft_second_id = (int)second_id;
+                h->last_draft_margin_valid = true;
+            }
+        }
     }
     MTP_HEAD_TICK(MTP_HEAD_T_TOP1_IN);
     if (ok && !screened) {
