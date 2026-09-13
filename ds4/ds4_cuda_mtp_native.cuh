@@ -112,6 +112,114 @@ __global__ static void mtp_native_projection_kernel(
     }
 }
 
+/* Exact refinement of the shortlisted rows against the UNQUANTIZED activations.
+ *
+ * Same thread map, same walk, same masks, same reduction as the generic kernel
+ * above -- that shape is measured and I am not touching it. The single change is
+ * what the dot is taken against. The generic path quantizes the head's fp32
+ * input to Q8 once (`quantize_q8_0_f32_rows_warp_kernel`) and then uses __dp4a,
+ * so the proposal's final ranking carries ACTIVATION quantization error on top
+ * of the frozen weight quantization. The weights are the contract and stay
+ * exactly as shipped, dequantized at use by their own group scale; the
+ * activation rounding is ours, and it is discarded here.
+ *
+ * Cost is close to nothing, which is why this is worth doing at all:
+ *   - traffic is IDENTICAL. The same 34-byte groups are read for the same 2048
+ *     rows. The fp32 activation vector is 2560 floats = 10 KiB, shared by every
+ *     row and every block, so it lands in L2 once.
+ *   - arithmetic goes from 2048 * 80 dp4a to 2048 * 2560 fp32 FMA, about 5.2M
+ *     FMA for the whole launch. On 48 SMs that is noise next to the 5.6 MB the
+ *     launch already streams, and this stage is the small one: the coarse screen
+ *     reads 80.4 MB against refinement's 5.6 MB.
+ *
+ * Why it can move acceptance. A round accepts when the head's argmax equals the
+ * target's. The head the model actually specifies takes its dot against real
+ * activations; ours takes it against activations rounded to int8 per 32-element
+ * group. Where two candidate logits sit closer together than that rounding, the
+ * shipped path can rank them in the wrong order and propose a token the head
+ * itself would not have. Removing the perturbation moves the proposal toward the
+ * head's own argmax, which is the quantity acceptance is measured against, so
+ * the expected direction is up.
+ *
+ * This is a different axis from the two that are already closed, and the
+ * distinction is the whole reason to run it. `MTP_NATIVE_CAP` 2048 -> 4096 tested
+ * the candidate SET (exact null: the top-2048 already contains the winner) and
+ * the screen depth tested how coarsely that set is chosen. Neither changed the
+ * VALUES the final argmax is taken over. This changes only those values, and
+ * leaves the set identical.
+ *
+ * Output-invariant as always: the target verifies every drafted token before
+ * commit, so a different proposal changes which rounds accept and never which
+ * tokens are emitted. */
+__global__ static void mtp_native_refine_kernel(
+        float *out, const unsigned char *w, const float *xf,
+        uint32_t out_dim, const uint32_t *ids, uint32_t n_vocab) {
+    constexpr uint64_t blocks = MTP_NATIVE_DIM / 32u;
+    const uint32_t local_row = threadIdx.x >> 6u;
+    const uint32_t local_lane = threadIdx.x & 63u;
+    const uint32_t group = local_lane >> 1u;
+    const uint32_t half = local_lane & 1u;
+    const uint32_t row = blockIdx.x * 4u + local_row;
+    float acc = 0.0f;
+
+    const uint32_t weight_row = row >= out_dim ? n_vocab : ids[row];
+    const bool valid = row < out_dim && weight_row < n_vocab;
+    if (valid) {
+        const unsigned char *wr = w + (uint64_t)weight_row * blocks * 34u;
+        for (uint64_t b = group; b < blocks; b += 32u) {
+            /* Name both lanes of every live pair even if independent
+             * scheduling has temporarily separated their execution. */
+            const uint64_t warp_base = b - (uint64_t)(group & 15u);
+            const uint64_t remaining = blocks - warp_base;
+            const uint32_t live_pairs = (uint32_t)(remaining < 16u ? remaining : 16u);
+            const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
+            const int8_t *payload = (const int8_t *)(wr + b * 34u + 2u) + half * 16u;
+            const uintptr_t address = (uintptr_t)payload;
+            const uint32_t shift = (uint32_t)(address & 3u) * 8u;
+            const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
+            uint32_t previous = words[0];
+            int32_t wq[4];
+#pragma unroll
+            for (int j = 0; j < 3; j++) {
+                const uint32_t next = words[j + 1];
+                wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
+                previous = next;
+            }
+            const uint16_t *lastp = (const uint16_t *)(const void *)(payload + 14);
+            wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)*lastp, shift);
+            const float ws = __half2float(*(const __half *)(wr + b * 34u));
+            /* wq[j] holds four consecutive int8 weights for the elements at
+             * b*32 + half*16 + 4j + 0..3, which is exactly how the Q8_0 group
+             * lays them out and how the dp4a path pairs them with xq. */
+            const float *xr = xf + b * 32u + half * 16u;
+            float part = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const uint32_t packed = (uint32_t)wq[j];
+#pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    /* Sign-extend without relying on a narrowing conversion of
+                     * an out-of-range value: dp4a reads these bytes as int8 in
+                     * little-endian order, so byte i is element 4j + i. */
+                    const int32_t byte = (int32_t)((packed >> (8u * (uint32_t)i)) & 0xffu);
+                    const int32_t wv = byte >= 128 ? byte - 256 : byte;
+                    part += (float)wv * xr[4 * j + i];
+                }
+            }
+            part += __shfl_xor_sync(active, part, 1);
+            if (half == 0u) acc += ws * part;
+        }
+    }
+
+    __shared__ float partial[4][32];
+    if (half == 0u) partial[local_row][group] = acc;
+    __syncthreads();
+    if (local_lane < 32u) {
+        const float total = warp_sum_f32(partial[local_row][local_lane]);
+        if (local_lane == 0u && row < out_dim) out[row] = valid ? total : -INFINITY;
+    }
+}
+
 struct mtp_native_layout {
     uint64_t scores, key_in, key_out, id_tmp, flag, temporary;
 };
@@ -241,9 +349,11 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
     if (!cuda_ok(cub::DeviceRadixSort::SortKeys(base+l.temporary,temporary,
             id_tmp,(uint32_t *)ids->ptr,MTP_NATIVE_CAP,0,32,cuda_decode_stream()),
             "native original-ID sort")) return -1;
-    mtp_native_projection_kernel<false><<<(MTP_NATIVE_CAP+3u)/4u,256,0,cuda_decode_stream()>>>(
-        (float *)out->ptr,(const unsigned char *)w,xq,xs,MTP_NATIVE_CAP,
-        (const uint32_t *)ids->ptr,vocab,prefix,tail);
+    /* Refinement takes its dots against the caller's fp32 activations rather
+     * than the Q8 copy the screen used; see mtp_native_refine_kernel. */
+    mtp_native_refine_kernel<<<(MTP_NATIVE_CAP+3u)/4u,256,0,cuda_decode_stream()>>>(
+        (float *)out->ptr,(const unsigned char *)w,(const float *)x->ptr,
+        MTP_NATIVE_CAP,(const uint32_t *)ids->ptr,vocab);
     return cuda_ok(cudaGetLastError(),"native exact refinement") ? (int)MTP_NATIVE_CAP : -1;
 }
 __global__ static void mtp_native_map(uint32_t *winner, const float *logits,
