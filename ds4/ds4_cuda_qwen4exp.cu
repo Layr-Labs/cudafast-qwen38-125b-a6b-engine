@@ -3980,11 +3980,30 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                 const uint64_t mrow = (uint64_t)t * n_expert_used + slot;
                 for (uint32_t g = lane; g < groups; g += 32u) {
                     int8_t wq[32];
-                    float wa[2], wb[2];
+                    float wa[2] = {0.0f, 0.0f};
+                    float wb[2] = {0.0f, 0.0f};
+                    /* WORD DECODE, the change the routed gate/up split kernel
+                     * already carries.  A type the raw loader stages (q4_K,
+                     * q5_1, q5_K on a word-aligned payload) derives the tile
+                     * words by shifting the group's own words instead of
+                     * rebuilding them byte by byte; q5_1 is this artifact's
+                     * production down type and reports one half, so `halves`
+                     * keeps the value the byte decoder would have returned.
+                     * Every other type (q8_0's odd stride, q6_K's two halves)
+                     * fails the probe and takes the byte decoder unchanged. */
+                    const uint32_t dt =
+                        DownType < 0 ? down_type : (uint32_t)DownType;
+                    uint32_t raw[8];
+                    const uint32_t *rawp =
+                        qw_raw_load(dt, drow, g, raw) ? raw : NULL;
                     int halves = 1;
-                    dev_qwen4exp_group_decode(
-                            DownType < 0 ? down_type : (uint32_t)DownType,
-                            drow, g, wq, wa, wb, &halves);
+                    if (rawp) {
+                        dev_qwen4exp_group_decode_w(dt, drow, g, rawp,
+                                                    wq, wa, wb);
+                    } else {
+                        dev_qwen4exp_group_decode(dt, drow, g, wq, wa, wb,
+                                                  &halves);
+                    }
                     const uint64_t at_g = mrow * groups + g;
                     if (Vector && halves == 1)
                         qwen4exp_shared_vector_accumulate(&acc[r], wq, wa[0], wb[0],
@@ -7098,6 +7117,13 @@ __global__ static void qwen4exp_hc_mix_kernel(
     out[(uint64_t)t * n_embd + d] = acc * (1.0f / (float)n_hc);
 }
 
+/* How many elements of the strided walk a thread asks for before it uses any
+ * of them.  Scheduling only, like the norm's own steps: the values land in
+ * the same registers and are consumed in the same ascending order into the
+ * same accumulator.  10240 over 256 threads is forty steps, so depth four is
+ * covered at every point of the walk. */
+#define QWEN4EXP_INJECT_STEPS 4u
+
 __global__ static void qwen4exp_hc_inject_weights_kernel(
         float *out, const float *normed, const char *w,
         uint32_t n_embd, uint32_t n_hc, uint32_t rows,
@@ -7111,7 +7137,26 @@ __global__ static void qwen4exp_hc_inject_weights_kernel(
     const char *wr = w + (uint64_t)h * weight_row_bytes;
 
     float sum = 0.0f;
-    for (uint32_t i = threadIdx.x; i < wide; i += blockDim.x) {
+    const uint32_t nth = blockDim.x;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t steps = (wide > tid) ? ((wide - tid + nth - 1u) / nth) : 0u;
+    uint32_t s = 0;
+    for (; s + QWEN4EXP_INJECT_STEPS <= steps; s += QWEN4EXP_INJECT_STEPS) {
+        float xv[QWEN4EXP_INJECT_STEPS];
+        float wv[QWEN4EXP_INJECT_STEPS];
+#pragma unroll
+        for (uint32_t u = 0; u < QWEN4EXP_INJECT_STEPS; u++) {
+            const uint32_t i = tid + (s + u) * nth;
+            xv[u] = xr[i];
+            wv[u] = dev_qwen4exp_inject_value(weight_type, wr, i);
+        }
+#pragma unroll
+        for (uint32_t u = 0; u < QWEN4EXP_INJECT_STEPS; u++) {
+            sum += xv[u] * wv[u];
+        }
+    }
+    for (; s < steps; s++) {
+        const uint32_t i = tid + s * nth;
         sum += xr[i] * dev_qwen4exp_inject_value(weight_type, wr, i);
     }
     __shared__ float partial[256];
