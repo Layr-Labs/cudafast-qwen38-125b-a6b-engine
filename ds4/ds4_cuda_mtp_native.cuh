@@ -6,11 +6,37 @@
  * Narrowing it is a proposal-policy change, not an exact one. */
 static constexpr uint32_t MTP_NATIVE_CAP = 2048u;
 static constexpr uint32_t MTP_NATIVE_DIM = 2560u;
-/* Coarse screen depth; full refinement still uses 80 groups. Pairs 24..31 sit
- * out, and the live_pairs mask already names a partial wave (40 groups left the
- * second warp with 8). This changes the coarse proposal heuristic, not the
- * selected-row dots. */
-static constexpr uint32_t MTP_NATIVE_SCREEN_GROUPS = 24u;
+/* Coarse screen depth; full refinement still uses 80 groups. This changes the
+ * coarse proposal heuristic, not the selected-row dots.
+ *
+ * 32, not 24, because 24 left a quarter of the warp idle. A row's lanes are 32
+ * group-pairs (group = (threadIdx.x & 63) >> 1) and the walk is
+ * `for (b = group; b < work_blocks; b += 32)`, so at work_blocks 24 the loop
+ * body never runs for groups 24..31: eight pairs sit out, every row, every
+ * draft round. At 32 the walk is still exactly one iteration per lane, and now
+ * every lane takes it.
+ *
+ * The live_pairs mask also comes out cleaner. At 24, groups 16..23 compute
+ * warp_base 16 and remaining 8, so the second warp runs a partial 0xffff
+ * wave; at 32 both halves see remaining 16, live_pairs 16 and a full
+ * 0xffffffff mask, which is the shape the surrounding comment describes as
+ * the intended one.
+ *
+ * It buys coarse-ranking depth for shortlist traffic: 98,584 rows x 34 B/group
+ * takes the screen from 80.4 MB to 107.3 MB (+26.8 MB/draft, about -0.19% of
+ * decode by the 2.52x row-widening calibration). That only pays if a deeper
+ * partial dot retains the true argmax in the 2048-row refinement more often --
+ * one point of acceptance is worth roughly 45 bips against the 14 bips of
+ * traffic, so the asymmetry favours depth. Acceptance is reported exactly
+ * (spec_accepted_total / spec_rounds) and is not subject to leg-timing noise,
+ * so this arm measures its own mechanism whatever the score does.
+ *
+ * Output-invariant by construction: the target verifies every draft before
+ * commit, so the proposal only moves which rounds accept, never which tokens
+ * are emitted. There is deliberately no env valve: the value is folded into
+ * the walk as a compile-time bound, and passing it as a kernel argument would
+ * cost the unrolling this loop depends on. Edit the constant to sweep it. */
+static constexpr uint32_t MTP_NATIVE_SCREEN_GROUPS = 32u;
 static constexpr uint32_t MTP_NATIVE_MAX_WIDTH = 1u << 20;
 template <bool Screen, bool EmitKeys = false>
 __global__ static void mtp_native_projection_kernel(
