@@ -3662,6 +3662,62 @@ __global__ static void qwen4exp_moe_down_combine_kernel(
 }
 
 
+/* The q5_1 group decode already holds its 32 weights as eight little-endian
+ * words: `lo` for k = 0..3 is wq bytes 4k..4k+3 and `hi` is wq bytes 16+4k..,
+ * which is byte for byte what qwen4exp_load_i8x4 rebuilds from those slots.
+ * The byte packer in between is a round trip -- 32 byte inserts to store them
+ * and 8 x 10 ops to reassemble them -- so this pair skips it and feeds __dp4a
+ * the words the decode produced.  The dp4a operands, their order, and the two
+ * float updates are identical, so the result is bit for bit the byte path's.
+ * The unaligned block keeps the byte path and is packed once at the end. */
+__device__ __forceinline__ static void dev_qwen4exp_q5_1_decode_words(
+        const char *row, uint32_t g, uint32_t *w, float *wa, float *wb) {
+    const cuda_block_q5_1 *xb = (const cuda_block_q5_1 *)row + g;
+    *wa = dev_f16_to_f32(xb->d);
+    *wb = dev_f16_to_f32(xb->m);
+    if (qwen4exp_word_aligned(xb)) {
+        const uint32_t *qw = (const uint32_t *)(const void *)xb;
+        const uint32_t qh = qw[1];
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            const uint32_t v = qw[2 + k];
+            const uint32_t h0 = (((qh >> (k * 4)) & 0x0fu) *
+                                 0x02040810u) & 0x10101010u;
+            const uint32_t h1 = (((qh >> (16 + k * 4)) & 0x0fu) *
+                                 0x02040810u) & 0x10101010u;
+            w[k] = (v & 0x0f0f0f0fu) | h0;
+            w[4 + k] = ((v >> 4u) & 0x0f0f0f0fu) | h1;
+        }
+        return;
+    }
+    int8_t wq[32];
+    float a[2], b[2];
+    int halves = 1;
+    dev_qwen4exp_group_decode((uint32_t)DS4_QWEN4EXP_TY_q5_1, row, g,
+                              wq, a, b, &halves);
+#pragma unroll
+    for (int k = 0; k < 8; k++)
+        w[k] = (uint32_t)qwen4exp_load_i8x4(wq + k * 4);
+}
+
+__device__ __forceinline__ static void qwen4exp_vector_accumulate_words(
+        float *acc, const uint32_t *w, float wa, float wb,
+        const int8_t *xq, float scale, int sum) {
+    const int4 lo = *(const int4 *)(const void *)xq;
+    const int4 hi = *(const int4 *)(const void *)(xq + 16);
+    int d = 0;
+    d = __dp4a((int32_t)w[0], lo.x, d);
+    d = __dp4a((int32_t)w[1], lo.y, d);
+    d = __dp4a((int32_t)w[2], lo.z, d);
+    d = __dp4a((int32_t)w[3], lo.w, d);
+    d = __dp4a((int32_t)w[4], hi.x, d);
+    d = __dp4a((int32_t)w[5], hi.y, d);
+    d = __dp4a((int32_t)w[6], hi.z, d);
+    d = __dp4a((int32_t)w[7], hi.w, d);
+    *acc += (wa * scale) * (float)d;
+    *acc += (wb * scale) * (float)sum;
+}
+
 /* Aligned activations; unchanged DP4A words and float accumulation order. */
 __device__ __forceinline__ static void qwen4exp_shared_vector_accumulate(
         float *acc, const int8_t *wq, float wa, float wb,
@@ -3978,6 +4034,20 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                     (uint64_t)(uint32_t)e * down_expert_bytes +
                     (uint64_t)row * down_row_bytes;
                 const uint64_t mrow = (uint64_t)t * n_expert_used + slot;
+                /* The q5_1 vector path is the speculative verify decode.  It
+                 * skips the byte packer between the group decode and __dp4a;
+                 * every other type and the scalar path are untouched. */
+                if (Vector && DownType == (int)DS4_QWEN4EXP_TY_q5_1) {
+                    for (uint32_t g = lane; g < groups; g += 32u) {
+                        uint32_t w[8];
+                        float wa, wb;
+                        dev_qwen4exp_q5_1_decode_words(drow, g, w, &wa, &wb);
+                        const uint64_t at_g = mrow * groups + g;
+                        qwen4exp_vector_accumulate_words(&acc[r], w, wa, wb,
+                                mq + at_g * 32u, ms[at_g], msum[at_g]);
+                    }
+                    continue;
+                }
                 for (uint32_t g = lane; g < groups; g += 32u) {
                     int8_t wq[32];
                     float wa[2], wb[2];
