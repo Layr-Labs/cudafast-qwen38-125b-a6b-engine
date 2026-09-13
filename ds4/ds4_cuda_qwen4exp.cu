@@ -3692,6 +3692,45 @@ __device__ __forceinline__ static void qwen4exp_shared_vector_accumulate(
  * warp streams a different weight row and the barrier before the shared fold
  * waits on the slowest of them, so narrowing the block narrows the latency
  * spread it absorbs. Inactive row warps still join barriers. */
+
+/* `qwen4exp_dp4a` over operands already packed into four-byte words.  Same
+ * number of __dp4a, same order, same accumulator chain; a word here is the
+ * little-endian packing `qwen4exp_load_i8x4` returns for the four bytes it
+ * replaces, so each __dp4a takes the identical pair of operands. */
+template <int N>
+__device__ __forceinline__ static int32_t qwen4exp_dp4a_w(const int32_t *a,
+                                                          const int32_t *b) {
+    int32_t d = 0;
+#pragma unroll
+    for (int i = 0; i < N / 4; i++) {
+        d = __dp4a(a[i], b[i], d);
+    }
+    return d;
+}
+
+/* `qwen4exp_group_accumulate` over word operands.  The two floating-point
+ * statements are the ones above, character for character, so the compiler
+ * builds the same expression tree and contracts it the same way; only the
+ * integer dot's operand form differs, and that form holds the same bits.
+ * The split gate/up kernel below decodes its groups to WORDS, so it takes
+ * this form: the byte accumulator would rebuild each of those eight words
+ * from four single bytes (the work qwen4exp_pack_group does once at staging)
+ * on every group of every row. */
+__device__ __forceinline__ static void qwen4exp_group_accumulate_w(
+        float *acc, const int32_t *wq, const float *wa, const float *wb,
+        int halves, const int32_t *xqg, float xscale, int32_t xsum) {
+    if (halves == 1) {
+        const int32_t dot = qwen4exp_dp4a_w<32>(wq, xqg);
+        *acc += (wa[0] * xscale) * (float)dot;
+        *acc += (wb[0] * xscale) * (float)xsum;
+    } else {
+        const int32_t d0 = qwen4exp_dp4a_w<16>(wq, xqg);
+        const int32_t d1 = qwen4exp_dp4a_w<16>(wq + 4, xqg + 4);
+        *acc += (wa[0] * xscale) * (float)d0;
+        *acc += (wa[1] * xscale) * (float)d1;
+    }
+}
+
 template <int R, int Type, bool Vector = false, unsigned OutputRows = 4>
 __global__ static void qwen4exp_moe_gateup_split_kernel(
         float *mid,
@@ -3776,8 +3815,10 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
                             qwen4exp_shared_vector_accumulate(&acc[r], wq, wa[0], wb[0], \
                                 xq + at_g * 32u, xs[at_g], xsum[at_g]); \
                         else \
-                            qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves, \
-                                xq + at_g * 32u, xs[at_g], xsum[at_g]); \
+                            qwen4exp_group_accumulate_w(&acc[r], \
+                                (const int32_t *)wq, wa, wb, halves, \
+                                (const int32_t *)(xq + at_g * 32u), \
+                                xs[at_g], xsum[at_g]); \
                     } \
                 } \
             } while (0)
@@ -4274,40 +4315,6 @@ enum {
      * Both paths return the same bits, so this is only ever a speed choice. */
     QWEN4EXP_STAGE_MIN_TOKENS = 16,
 };
-
-/* `qwen4exp_dp4a` over operands already packed into four-byte words.  Same
- * number of __dp4a, same order, same accumulator chain; a word here is the
- * little-endian packing `qwen4exp_load_i8x4` returns for the four bytes it
- * replaces, so each __dp4a takes the identical pair of operands. */
-template <int N>
-__device__ __forceinline__ static int32_t qwen4exp_dp4a_w(const int32_t *a,
-                                                          const int32_t *b) {
-    int32_t d = 0;
-#pragma unroll
-    for (int i = 0; i < N / 4; i++) {
-        d = __dp4a(a[i], b[i], d);
-    }
-    return d;
-}
-
-/* `qwen4exp_group_accumulate` over word operands.  The two floating-point
- * statements are the ones above, character for character, so the compiler
- * builds the same expression tree and contracts it the same way; only the
- * integer dot's operand form differs, and that form holds the same bits. */
-__device__ __forceinline__ static void qwen4exp_group_accumulate_w(
-        float *acc, const int32_t *wq, const float *wa, const float *wb,
-        int halves, const int32_t *xqg, float xscale, int32_t xsum) {
-    if (halves == 1) {
-        const int32_t dot = qwen4exp_dp4a_w<32>(wq, xqg);
-        *acc += (wa[0] * xscale) * (float)dot;
-        *acc += (wb[0] * xscale) * (float)xsum;
-    } else {
-        const int32_t d0 = qwen4exp_dp4a_w<16>(wq, xqg);
-        const int32_t d1 = qwen4exp_dp4a_w<16>(wq + 4, xqg + 4);
-        *acc += (wa[0] * xscale) * (float)d0;
-        *acc += (wa[1] * xscale) * (float)d1;
-    }
-}
 
 /* The thirty-two decoded bytes of one group as the eight words the dot wants.
  * This is `qwen4exp_load_i8x4` at the eight offsets the dot reads, run once at
