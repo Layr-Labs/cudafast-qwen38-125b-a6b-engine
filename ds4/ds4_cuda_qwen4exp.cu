@@ -2936,10 +2936,25 @@ __device__ __forceinline__ static void dev_qwen4exp_group_decode_w(
         if (!raw) break;
         const cuda_block_q4_K *xb = (const cuda_block_q4_K *)row + (g / 8u);
         const uint32_t grp = g % 8u;
-        uint8_t sc = 0, m = 0;
-        dev_q4_K_get_scale_min(grp, xb->scales, &sc, &m);
-        wa[0] = dev_f16_to_f32(xb->d) * (float)sc;
-        wb[0] = -dev_f16_to_f32(xb->dmin) * (float)m;
+        /* ONE SIXTEEN-BYTE HEADER LOAD where the byte accessor paid four or
+         * five.  d, dmin and all twelve scale bytes are the first uint4 of the
+         * super-block, and qw_q4k_header_scale_min returns exactly the pair
+         * dev_q4_K_get_scale_min returns from those same twelve bytes -- its
+         * comment above carries the derivation for both the j < 4 and j >= 4
+         * arms.  `scales` is a uint8_t[12] in global memory, so the oracle
+         * form issues a separate byte load per element, and the comment on the
+         * split gate/up group loop says the expert row has nothing to hit in
+         * cache -- so those were scattered reads, not L1 hits, and reads in
+         * flight is the lever that loop names.  The alignment is the one the
+         * staged tile path below already relies on: q4_K blocks are 144 bytes
+         * and rows are whole blocks, so every block sits on a sixteen-byte
+         * boundary.  Purely a load-shape change -- the scale, the min and
+         * every payload word below are bit-identical. */
+        const uint4 hdr = *(const uint4 *)(const void *)xb;
+        uint32_t sc = 0, m = 0;
+        qw_q4k_header_scale_min(grp, hdr.y, hdr.z, hdr.w, &sc, &m);
+        wa[0] = dev_f16_to_f32((uint16_t)(hdr.x & 0xffffu)) * (float)sc;
+        wb[0] = -dev_f16_to_f32((uint16_t)(hdr.x >> 16u)) * (float)m;
         const uint32_t shift = (grp & 1u) ? 4u : 0u;
         uint32_t *w = (uint32_t *)(void *)dst;
 #pragma unroll
