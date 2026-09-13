@@ -3929,9 +3929,25 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
 
 /* Grid (ceil(out_dim / 8), ceil(n_tokens / R)).  The slots of a token are
  * walked in ascending order into ONE accumulator, which is what the per-token
- * kernel did; the rows of the tile do not share a weight here, because each
- * one picked its own expert for the slot.  What the tile buys is that the
- * activation groups are read once for R rows and the decode is per group. */
+ * kernel did; the rows of the tile do not generally share a weight here,
+ * because each one picked its own expert for the slot.  What the tile buys is
+ * that the activation groups are read once for R rows and the decode is per
+ * group.
+ *
+ * They DO share a weight whenever two rows picked the SAME expert for the same
+ * slot, and then the loop below decoded the identical (drow, g) block once per
+ * row.  Folding those rows into one decode is the FOLD valve.  It is exact:
+ * a folded row still receives this slot's groups in ascending g, and the slots
+ * still arrive in ascending order, so every acc[] sums the identical terms in
+ * the identical order.  Only rows at the SAME slot are folded -- the same
+ * expert at two different slots would have to be summed out of slot order,
+ * which reassociates. */
+#ifndef DS4_QWEN4EXP_DOWN_EXPERT_FOLD
+/* 1, the shipped default, decodes a shared expert once for the rows that
+ * picked it; 0 restores the per-row decode this is argued equal to, for
+ * bisecting without reverting. */
+#define DS4_QWEN4EXP_DOWN_EXPERT_FOLD 1
+#endif
 template <int R, int DownType = -1, bool Vector = false>
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
@@ -3967,30 +3983,57 @@ __global__ static void qwen4exp_moe_down_q_kernel(
     for (int r = 0; r < R; r++) acc[r] = 0.0f;
 
     for (uint32_t slot = 0; slot < n_expert_used; slot++) {
+        /* The expert each row picked for this slot, read once so a shared pick
+         * can serve several rows from one decode.  -1 marks a row that has no
+         * valid pick here, which is the `continue` the per-row loop used to
+         * take.  take is warp-uniform, so the shuffle stays uniform. */
+        int32_t es[R];
 #pragma unroll
         for (int r = 0; r < R; r++) {
+            es[r] = -1;
             if ((uint32_t)r < take) {
-                const uint32_t t = tok0 + (uint32_t)r;
-                const int32_t e = Vector ? __shfl_sync(0xffffffffu, route[r], slot)
-                    : selected[(uint64_t)t * n_expert_used + slot];
-                if (e < 0 || (uint32_t)e >= n_total_expert) continue;
-                const char *drow = down +
-                    (uint64_t)(uint32_t)e * down_expert_bytes +
-                    (uint64_t)row * down_row_bytes;
-                const uint64_t mrow = (uint64_t)t * n_expert_used + slot;
-                for (uint32_t g = lane; g < groups; g += 32u) {
-                    int8_t wq[32];
-                    float wa[2], wb[2];
-                    int halves = 1;
-                    dev_qwen4exp_group_decode(
-                            DownType < 0 ? down_type : (uint32_t)DownType,
-                            drow, g, wq, wa, wb, &halves);
-                    const uint64_t at_g = mrow * groups + g;
+                const int32_t e = Vector
+                    ? __shfl_sync(0xffffffffu, route[r], slot)
+                    : selected[(uint64_t)(tok0 + (uint32_t)r) * n_expert_used +
+                               slot];
+                if (e >= 0 && (uint32_t)e < n_total_expert) es[r] = e;
+            }
+        }
+
+        uint32_t folded = 0u; /* rows already served by an earlier row's decode */
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            if (es[r] < 0 || (folded & (1u << r)) != 0u) continue;
+
+            uint32_t share = 0u; /* later rows that picked this same expert */
+#if DS4_QWEN4EXP_DOWN_EXPERT_FOLD
+#pragma unroll
+            for (int s = 0; s < R; s++)
+                if (s > r && es[s] == es[r]) share |= 1u << s;
+#endif
+            folded |= share;
+
+            const char *drow = down +
+                (uint64_t)(uint32_t)es[r] * down_expert_bytes +
+                (uint64_t)row * down_row_bytes;
+            for (uint32_t g = lane; g < groups; g += 32u) {
+                int8_t wq[32];
+                float wa[2], wb[2];
+                int halves = 1;
+                dev_qwen4exp_group_decode(
+                        DownType < 0 ? down_type : (uint32_t)DownType,
+                        drow, g, wq, wa, wb, &halves);
+#pragma unroll
+                for (int s = 0; s < R; s++) {
+                    if (s != r && (share & (1u << s)) == 0u) continue;
+                    const uint64_t at_g =
+                        ((uint64_t)(tok0 + (uint32_t)s) * n_expert_used + slot) *
+                            groups + g;
                     if (Vector && halves == 1)
-                        qwen4exp_shared_vector_accumulate(&acc[r], wq, wa[0], wb[0],
+                        qwen4exp_shared_vector_accumulate(&acc[s], wq, wa[0], wb[0],
                             mq + at_g * 32u, ms[at_g], msum[at_g]);
                     else
-                        qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves,
+                        qwen4exp_group_accumulate(&acc[s], wq, wa, wb, halves,
                                                   mq + at_g * 32u, ms[at_g],
                                                   msum[at_g]);
                 }
