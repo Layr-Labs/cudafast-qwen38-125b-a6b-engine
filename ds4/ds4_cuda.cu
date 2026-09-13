@@ -18961,44 +18961,68 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
                 }
             }
         }
-        for (uint64_t b = group + 32u; b < blocks; b += 32u) {
-            /* Name both lanes of every live pair even if independent
-             * scheduling has temporarily separated their execution. */
-            const uint64_t warp_base = b - (uint64_t)(group & 15u);
-            const uint64_t remaining = blocks - warp_base;
-            const uint32_t live_pairs = (uint32_t)(remaining < 16u ? remaining : 16u);
-            const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
-            const int8_t *payload = (const int8_t *)(wr + b * 34u + 2u) + half * 16u;
-            const uintptr_t address = (uintptr_t)payload;
-            const uint32_t shift = (uint32_t)(address & 3u) * 8u;
-            const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
-            /* Weights stream through each projection once. Mark their reads
-             * evict-first while leaving the reusable activation loads alone. */
-            uint32_t previous = Streaming ? __ldcs(words) : words[0];
-            int32_t wq[4];
+        { 
+            /* TWO GROUPS IN FLIGHT.  A lane walks b, b+32, b+64 and adds them
+             * to acc[r] in that order.  The rolled body consumed each group's
+             * payload before asking for the next, so a lane held one weight
+             * read outstanding and the short walk ran at memory latency.  Stage
+             * the next group's raw words before this group's product, so its
+             * read is on the wing while this one computes.  Same decode, same
+             * accumulation order, same acc[r] chain -- identical bits. */
+            uint32_t nw[4];
+            uint16_t nl = 0;
+            uint32_t nsh = 0;
+            uint64_t b = group + 32u;
+            if (b < blocks) {
+                const int8_t *pp = (const int8_t *)(wr + b * 34u + 2u) + half * 16u;
+                const uint32_t *ww = (const uint32_t *)((uintptr_t)pp & ~(uintptr_t)3u);
 #pragma unroll
-            for (int j = 0; j < 3; j++) {
-                const uint32_t next = Streaming ? __ldcs(words + j + 1) : words[j + 1];
-                wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
-                previous = next;
+                for (int t = 0; t < 4; t++) nw[t] = Streaming ? __ldcs(ww + t) : ww[t];
+                nl = Streaming ? __ldcs((const uint16_t *)(const void *)(pp + 14))
+                               : *(const uint16_t *)(const void *)(pp + 14);
+                nsh = (uint32_t)((uintptr_t)pp & 3u) * 8u;
             }
-            const uint16_t *lastp = (const uint16_t *)(const void *)(payload + 14);
-            const uint16_t last = Streaming ? __ldcs(lastp) : *lastp;
-            wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
-            const __half *scale = (const __half *)(wr + b * 34u);
-            const float ws = Streaming
-                ? __half2float(__ushort_as_half(__ldcs((const uint16_t *)scale)))
-                : __half2float(*scale);
+            for (; b < blocks; b += 32u) {
+                int32_t wq[4];
+                uint32_t previous = nw[0];
 #pragma unroll
-            for (int r = 0; r < R; r++) {
-                if ((uint32_t)r < take) {
-                    const uint64_t at = ((uint64_t)row0 + r) * blocks + b;
-                    const int32_t *xw = (const int32_t *)(xq + at * 32u + half * 16u);
-                    int dot = 0;
+                for (int j = 0; j < 3; j++) {
+                    wq[j] = (int32_t)__funnelshift_r(previous, nw[j + 1], nsh);
+                    previous = nw[j + 1];
+                }
+                wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)nl, nsh);
+                const __half *scale = (const __half *)(wr + b * 34u);
+                const float ws = Streaming
+                    ? __half2float(__ushort_as_half(__ldcs((const uint16_t *)scale)))
+                    : __half2float(*scale);
+                /* Issue the next group's raw-word reads before the product
+                 * below, so the load is in flight across it.  wq already holds
+                 * this group's words, so reusing the staging registers is safe. */
+                const uint64_t nb = b + 32u;
+                if (nb < blocks) {
+                    const int8_t *pp = (const int8_t *)(wr + nb * 34u + 2u) + half * 16u;
+                    const uint32_t *ww = (const uint32_t *)((uintptr_t)pp & ~(uintptr_t)3u);
 #pragma unroll
-                    for (int j = 0; j < 4; j++) dot = __dp4a(wq[j], xw[j], dot);
-                    dot += __shfl_xor_sync(active, dot, 1);
-                    if (half == 0u) acc[r] += ws * xscale[at] * (float)dot;
+                    for (int t = 0; t < 4; t++) nw[t] = Streaming ? __ldcs(ww + t) : ww[t];
+                    nl = Streaming ? __ldcs((const uint16_t *)(const void *)(pp + 14))
+                                   : *(const uint16_t *)(const void *)(pp + 14);
+                    nsh = (uint32_t)((uintptr_t)pp & 3u) * 8u;
+                }
+                const uint64_t warp_base = b - (uint64_t)(group & 15u);
+                const uint64_t remaining = blocks - warp_base;
+                const uint32_t live_pairs = (uint32_t)(remaining < 16u ? remaining : 16u);
+                const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
+#pragma unroll
+                for (int r = 0; r < R; r++) {
+                    if ((uint32_t)r < take) {
+                        const uint64_t at = ((uint64_t)row0 + r) * blocks + b;
+                        const int32_t *xw = (const int32_t *)(xq + at * 32u + half * 16u);
+                        int dot = 0;
+#pragma unroll
+                        for (int j = 0; j < 4; j++) dot = __dp4a(wq[j], xw[j], dot);
+                        dot += __shfl_xor_sync(active, dot, 1);
+                        if (half == 0u) acc[r] += ws * xscale[at] * (float)dot;
+                    }
                 }
             }
         }
