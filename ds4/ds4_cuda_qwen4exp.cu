@@ -1760,10 +1760,34 @@ __device__ __forceinline__ static bool qwen4exp_word_aligned(const void *p) {
  * is fixed by the slab's strides and the scratch cut, never by the thread, so
  * the test below is uniform across the warp and every arm is exact. */
 #ifndef DS4_QWEN4EXP_WIDE_PAYLOAD
-/* 1, the shipped default, takes the wide arms; 0 restores the word load the
- * wide arms are argued equal to, for bisecting a suspected decode fault
- * without reverting the change. */
-#define DS4_QWEN4EXP_WIDE_PAYLOAD 1
+/* 1 takes the wide arms; 0 restores the word load the wide arms are argued
+ * equal to.  The two forms are bit-identical by the argument below, so this
+ * switch is a pure performance A/B and either value is correct.
+ *
+ * SET TO 0 ON MEASUREMENT.  The wide arms arrived bundled with the payload
+ * STAGING work in the same diff and were never A/B'd on their own, so "wide
+ * loads help" was inherited as an assumption, not a measurement.  Two
+ * independent on-device runs say the opposite: adding a uint4 header load to
+ * the q4_K arm of dev_qwen4exp_group_decode_w cost 1.69% of composite, and
+ * adding a uint2 arm to the q5_1 block load cost 1.91%, both with
+ * max_abs_diff 0 and both moving decode and prefill together.  A wide load
+ * needs its destination in an aligned register tuple (four consecutive
+ * registers for uint4, two for uint2), and on this device 48 resident warps
+ * against 65,536 registers per SM leaves only about 42 registers per thread,
+ * so constraining the allocator that way trades against occupancy.  A fourth
+ * measurement -- marking these same payloads __ldcs -- lost 4.46% because the
+ * lanes of a warp share their cache lines, which says the routed gather is
+ * bound by latency and occupancy rather than by load-issue count.  If that is
+ * the binding constraint, then trading 4x the load instructions for a looser
+ * register allocation is the profitable direction, which is what 0 does.
+ *
+ * Reads-in-flight staging is a DIFFERENT lever and is untouched here: the
+ * slice-parity staging, the word-direct q5_1 staging and the gate/up
+ * activation prefetch all still run exactly as shipped.  Reads in flight,
+ * staging order, decode order, accumulation order and every tile layout are
+ * bit-for-bit what they were; only which arm fetches an already-staged
+ * payload's eight words changes. */
+#define DS4_QWEN4EXP_WIDE_PAYLOAD 0
 #endif
 __device__ __forceinline__ static void qw_load_words8(const uint32_t *qw,
                                                       uint32_t *w) {
