@@ -1790,6 +1790,33 @@ __device__ __forceinline__ static void qw_load_words8(const uint32_t *qw,
     for (int i = 0; i < 8; i++) w[i] = qw[i];
 }
 
+/* THE SIX-WORD CASE THE WIDE ARMS ABOVE NEVER COVERED (0xpg, e0a166f).  A q5_1
+ * group IS its own 24-byte block: one d|m word, one qh word, four qs words.
+ * Twenty-four is not a multiple of sixteen, so the uint4 arm cannot spell it,
+ * but it is a multiple of eight, and so is every stride that can place a block
+ * (sizeof 24, row 480, expert 2560 rows), so an eight-byte-aligned block
+ * admits three uint2 loads.  uint2 .x .y are words 0..1 of the eight bytes at
+ * the address, in address order, so w[] receives the same six values and only
+ * the instruction count moves.  The alignment is a property of the slab
+ * strides, not the thread, so the branch is warp uniform and both arms are
+ * exact. */
+__device__ __forceinline__ static void qw_load_words6(const uint32_t *qw,
+                                                      uint32_t *w) {
+#if DS4_QWEN4EXP_WIDE_PAYLOAD
+    if ((((uintptr_t)qw) & 7u) == 0u) {
+        const uint2 a = *(const uint2 *)(const void *)qw;
+        const uint2 b = *(const uint2 *)(const void *)(qw + 2);
+        const uint2 c = *(const uint2 *)(const void *)(qw + 4);
+        w[0] = a.x; w[1] = a.y;
+        w[2] = b.x; w[3] = b.y;
+        w[4] = c.x; w[5] = c.y;
+        return;
+    }
+#endif
+#pragma unroll
+    for (int i = 0; i < 6; i++) w[i] = qw[i];
+}
+
 /* Decode one 32-element group of a quantised weight row into int8 quants and
  * the one or two (wa, wb) pairs that turn an integer dot into the row's
  * contribution.  Called once per group per output row, not once per element.
@@ -2874,7 +2901,12 @@ __device__ __forceinline__ static void qw_q4k_parity_store16(
  * every other group's payload two bytes past a word boundary, and an aligned
  * window would read past the block the decode refuses to touch, so it stages
  * nothing and decodes from the row.  The alignment is a property of the
- * slab's strides, so the branch is uniform across the block. */
+ * slab's strides, so the branch is uniform across the block.
+ *
+ * Wide6 takes the q5_1 block through qw_load_words6.  Only the routed down
+ * prefill tile instantiates it (DS4_QWEN4EXP_NO_Q51_WIDE_LOAD stands it down);
+ * every other caller keeps the word loop, and no other caller reaches q5_1. */
+template <bool Wide6 = false>
 __device__ __forceinline__ static bool qw_raw_load(
         uint32_t type, const char *row, uint32_t g, uint32_t *w) {
     switch (type) {
@@ -2889,8 +2921,12 @@ __device__ __forceinline__ static bool qw_raw_load(
         const cuda_block_q5_1 *xb = (const cuda_block_q5_1 *)row + g;
         if (!qwen4exp_word_aligned(xb)) return false;
         const uint32_t *qw = (const uint32_t *)(const void *)xb;
+        if (Wide6) {
+            qw_load_words6(qw, w);
+        } else {
 #pragma unroll
-        for (int i = 0; i < 6; i++) w[i] = qw[i];
+            for (int i = 0; i < 6; i++) w[i] = qw[i];
+        }
         return true;
     }
     case (uint32_t)DS4_QWEN4EXP_TY_q5_K: {
@@ -3636,7 +3672,7 @@ qwen4exp_moe_gateup_mma_kernel(
  * The activation is the routed intermediate, quantised per (token, slot) pair,
  * so the pair index addresses it directly.
  */
-template <int DownType = -1>
+template <int DownType = -1, bool Wide6 = false>
 __global__ __launch_bounds__(QW_DOWN_MMA_THREADS) static void
 qwen4exp_moe_down_mma_kernel(
         float *partial,
@@ -3718,7 +3754,8 @@ qwen4exp_moe_down_mma_kernel(
                     if (w_dq) {
                         uint32_t raw[6];
                         dev_qwen4exp_group_decode_w(dtype, drow, g,
-                                qw_raw_load(dtype, drow, g, raw) ? raw : NULL,
+                                qw_raw_load<Wide6>(dtype, drow, g, raw)
+                                    ? raw : NULL,
                                 &sA[r * QW_MMA_LD + gg * 32], wa, wb);
                     } else {
                         dev_qwen4exp_group_decode(dtype, drow, g,
@@ -3838,6 +3875,36 @@ __global__ static void qwen4exp_moe_down_combine_kernel(
         acc += partial[pair * out_dim + row];
     }
     out[idx] = acc;
+}
+
+/* The same combine on a token grid.  blockIdx.y is the token and the row is
+ * the block-local index, so no thread divides its flat element index back into
+ * (token, row): the flat launch above pays a 64-bit division and a
+ * multiply-subtract per element beside the ten loads and ten adds it guards --
+ * the cost qwen4exp_hc_mix_kernel's grid already removed.  The slot walk, the
+ * validity test and the ascending float accumulation are the flat kernel's
+ * statements, so every out[token][row] is the same ten numbers added in the
+ * same order.  DS4_QWEN4EXP_NO_COMBINE_GRID restores the flat launch. */
+__global__ static void qwen4exp_moe_down_combine_grid_kernel(
+        float *out,
+        const float *partial,
+        const int32_t *selected,
+        uint32_t out_dim,
+        uint32_t n_tokens,
+        uint32_t n_expert_used,
+        uint32_t n_total_expert) {
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t token = blockIdx.y;
+    if (row >= out_dim || token >= n_tokens) return;
+    const uint64_t pair0 = (uint64_t)token * n_expert_used;
+    float acc = 0.0f;
+    for (uint32_t slot = 0; slot < n_expert_used; slot++) {
+        const uint64_t pair = pair0 + slot;
+        const int32_t e = selected[pair];
+        if (e < 0 || (uint32_t)e >= n_total_expert) continue;
+        acc += partial[pair * out_dim + row];
+    }
+    out[(uint64_t)token * out_dim + row] = acc;
 }
 
 
@@ -7078,8 +7145,12 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
          * always had, byte for byte.  Read once, before the launch. */
         const uint32_t dn_dq_stage =
             getenv("DS4_QWEN4EXP_NO_DOWN_DQ") == NULL ? 1u : 0u;
-#define QWEN4EXP_DOWN_MMA(DT) \
-        qwen4exp_moe_down_mma_kernel<DT><<< \
+        /* The q5_1 staging reads its six block words as three eight-byte
+         * loads; DS4_QWEN4EXP_NO_Q51_WIDE_LOAD restores the word loop. */
+        const bool dn_wide6 =
+            getenv("DS4_QWEN4EXP_NO_Q51_WIDE_LOAD") == NULL;
+#define QWEN4EXP_DOWN_MMA(DT, W6) \
+        qwen4exp_moe_down_mma_kernel<DT, W6><<< \
                 dim3(out_dim / QW_DOWN_MMA_BM, gu_rows, 1), \
                 QW_DOWN_MMA_THREADS, 0, stream>>>( \
                 (float *)down_partial->ptr, down, sc.mq, sc.ms, sc.msum, \
@@ -7087,21 +7158,34 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
                 down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
                 mgroups, out_dim, dn_dq_stage)
         if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q5_1) {
-            QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q5_1);
+            if (dn_wide6) {
+                QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q5_1, true);
+            } else {
+                QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q5_1, false);
+            }
         } else if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q8_0) {
-            QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q8_0);
+            QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q8_0, false);
         } else {
-            QWEN4EXP_DOWN_MMA(-1);
+            QWEN4EXP_DOWN_MMA(-1, false);
         }
 #undef QWEN4EXP_DOWN_MMA
         if (!cuda_ok(cudaGetLastError(), "qwen4exp MoE down tile launch")) return 0;
-        const uint64_t combine_n = (uint64_t)n_tokens * out_dim;
-        qwen4exp_moe_down_combine_kernel<<<
-                (unsigned)((combine_n + threads - 1u) / threads), threads, 0,
-                stream>>>(
-                (float *)out->ptr, (const float *)down_partial->ptr,
-                (const int32_t *)selected->ptr, out_dim, n_tokens,
-                n_expert_used, n_total_expert);
+        if (getenv("DS4_QWEN4EXP_NO_COMBINE_GRID") == NULL) {
+            qwen4exp_moe_down_combine_grid_kernel<<<
+                    dim3((out_dim + threads - 1u) / threads, n_tokens, 1),
+                    threads, 0, stream>>>(
+                    (float *)out->ptr, (const float *)down_partial->ptr,
+                    (const int32_t *)selected->ptr, out_dim, n_tokens,
+                    n_expert_used, n_total_expert);
+        } else {
+            const uint64_t combine_n = (uint64_t)n_tokens * out_dim;
+            qwen4exp_moe_down_combine_kernel<<<
+                    (unsigned)((combine_n + threads - 1u) / threads), threads, 0,
+                    stream>>>(
+                    (float *)out->ptr, (const float *)down_partial->ptr,
+                    (const int32_t *)selected->ptr, out_dim, n_tokens,
+                    n_expert_used, n_total_expert);
+        }
         return cuda_ok(cudaGetLastError(), "qwen4exp MoE down combine launch");
     }
     if (down_vector && ((uintptr_t)sc.mq & 15u) == 0u) {
