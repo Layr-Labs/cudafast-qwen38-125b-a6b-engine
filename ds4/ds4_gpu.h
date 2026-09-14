@@ -837,44 +837,6 @@ int ds4_gpu_qwen4exp_qsa_output_gate_tensor(
         const ds4_gpu_tensor *gate,
         uint32_t              n_values);
 
-/* The same gated values written as the Q8_0 bytes (at `q_offset`) and per-block
- * scales (at `s_offset`) of `q8` that the preq projections read, instead of in
- * place; `out` is left unchanged.  `n_values` must be a multiple of 256. */
-int ds4_gpu_qwen4exp_qsa_output_gate_q8_tensor(
-        ds4_gpu_tensor       *q8,
-        uint64_t              q_offset,
-        uint64_t              s_offset,
-        const ds4_gpu_tensor *out,
-        const ds4_gpu_tensor *gate,
-        uint32_t              n_values);
-
-/* The same, reading the gate out of the doubled query projection (where the Q
- * prep would copy it from) instead of a gate buffer; head_dim must be 256. */
-int ds4_gpu_qwen4exp_qsa_output_gate_doubled_q8_tensor(
-        ds4_gpu_tensor       *q8,
-        uint64_t              q_offset,
-        uint64_t              s_offset,
-        const ds4_gpu_tensor *out,
-        const ds4_gpu_tensor *doubled,
-        uint32_t              n_values,
-        uint32_t              head_dim);
-
-/* ds4_gpu_qwen4exp_qsa_prep_q_fused_dpos_tensor without the gate copy, for a
- * caller that reads the gate out of `doubled` itself. */
-int ds4_gpu_qwen4exp_qsa_prep_q_nogate_dpos_tensor(
-        ds4_gpu_tensor       *q,
-        const ds4_gpu_tensor *doubled,
-        const ds4_gpu_tensor *weight,
-        const ds4_gpu_tensor *inv_freq,
-        uint32_t              n_tokens,
-        uint32_t              n_head,
-        uint32_t              head_dim,
-        uint32_t              rot_dim,
-        uint32_t              pos0,
-        float                 eps,
-        float                 weight_offset,
-        const ds4_gpu_tensor *d_pos);
-
 int ds4_gpu_indexer_top1_value_tensor(
         ds4_gpu_tensor       *selected,
         ds4_gpu_tensor       *values,
