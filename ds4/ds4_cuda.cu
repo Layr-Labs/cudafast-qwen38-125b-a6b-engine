@@ -991,12 +991,28 @@ static inline cudaStream_t cuda_decode_stream(void) {
  * instantiate-then-launch path this build used before. */
 static inline int cuda_decode_graph_upload_on(void) {
     static int init = 0;
-    static int on = 0;   /* opt-in until the A/B decides the default */
+    /* DEFAULT ON, ISOLATED. It was left opt-in "until the A/B decides the
+     * default", and while it is off the chunk-to-chunk prefetch built for it --
+     * ds4_gpu_decode_graph_prefetch, which the decode graph walk already calls
+     * to upload chunk c+1 while chunk c runs -- returns 0 immediately. The tree
+     * ships the mechanism and never runs it.
+     *
+     * This archive changes ONLY this, deliberately. It rode into a previous
+     * submission of ours alongside a register cap that turned out to be poison
+     * (that tree's prefill leg went 2.26% the wrong way, and the upload cannot
+     * touch prefill because prefill runs eager with no decode graphs), so its
+     * own effect was left unattributed. One line, one tree, one reading.
+     *
+     * Nothing about a graph's contents or its ordering depends on when its
+     * executable is uploaded. DS4_CUDA_GRAPH_UPLOAD=0 restores the previous
+     * behaviour in the same binary. */
+    static int on = 1;
     if (!init) {
         init = 1;
         const char *s = getenv("DS4_CUDA_GRAPH_UPLOAD");
-        on = (s && *s && s[0] != '0' && strcmp(s, "off") != 0 &&
-              strcmp(s, "no") != 0 && strcmp(s, "false") != 0) ? 1 : 0;
+        if (s && *s)
+            on = (s[0] != '0' && strcmp(s, "off") != 0 &&
+                  strcmp(s, "no") != 0 && strcmp(s, "false") != 0) ? 1 : 0;
     }
     return on;
 }
