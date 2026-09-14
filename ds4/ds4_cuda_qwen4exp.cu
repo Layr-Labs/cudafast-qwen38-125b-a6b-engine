@@ -287,7 +287,8 @@ __global__ static void qwen4exp_gdn_conv_kernel(
         uint32_t     n_rows,
         uint32_t     n_tokens,
         uint32_t     n_snapshot_rows,
-        float        qk_norm_eps) {
+        float        qk_norm_eps,
+        const uint32_t *adopt_row) {
     const uint32_t block = blockIdx.x;
     const uint32_t row = blockIdx.y;
     const uint32_t tid = threadIdx.x;
@@ -314,9 +315,19 @@ __global__ static void qwen4exp_gdn_conv_kernel(
 
     float *history = conv_state +
         (uint64_t)row * QWEN4EXP_GDN_HISTORY * conv_dim;
-    float h0 = history[channel];
-    float h1 = history[(uint64_t)conv_dim + channel];
-    float h2 = history[(uint64_t)2u * conv_dim + channel];
+    /* Lazy rollback: a nonzero *adopt_row is k + 1, and this forward continues
+     * from snapshot slot k -- the bits a rejected round's rollback would have
+     * copied into `history`.  The slot offset is the store's own below.  The
+     * load precedes every store in program order, the channel's elements are
+     * this thread's alone, and it comes before the first __syncthreads, so the
+     * one-token skew bound above is unchanged. */
+    const uint32_t adopt = adopt_row ? *adopt_row : 0u;
+    const float *const history_src = adopt
+        ? conv_snapshot + (uint64_t)(adopt - 1u) * QWEN4EXP_GDN_HISTORY * conv_dim
+        : history;
+    float h0 = history_src[channel];
+    float h1 = history_src[(uint64_t)conv_dim + channel];
+    float h2 = history_src[(uint64_t)2u * conv_dim + channel];
     const float w0 = conv_weight[(uint64_t)channel * 4u + 0u];
     const float w1 = conv_weight[(uint64_t)channel * 4u + 1u];
     const float w2 = conv_weight[(uint64_t)channel * 4u + 2u];
@@ -537,7 +548,8 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
         uint32_t     n_tokens,
         uint32_t     head_layout,
         uint32_t     n_snapshot_rows,
-        uint32_t     snap_plain) {
+        uint32_t     snap_plain,
+        const uint32_t *adopt_row) {
     const uint32_t head = blockIdx.x;
     const uint32_t value = blockIdx.y * 4u + (threadIdx.x >> 5u);
     const uint32_t row = blockIdx.z;
@@ -556,10 +568,21 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
         : head / (n_value_head / n_key_head);
     const uint32_t k0 = lane * 4u;
 
-    float4 *state_ptr = (float4 *)(state +
+    const uint64_t state_off =
         ((((uint64_t)row * n_value_head + head) * QWEN4EXP_GDN_DIM) + value) *
-        QWEN4EXP_GDN_DIM + k0);
-    float4 h = *state_ptr;
+        QWEN4EXP_GDN_DIM + k0;
+    float4 *state_ptr = (float4 *)(state + state_off);
+    /* Lazy rollback: a nonzero *adopt_row is k + 1, and the state this forward
+     * continues from is snapshot slot k, at the stride the store below uses.
+     * The same float4 is loaded once, before any store, and every element is
+     * this thread's alone; the stores are unchanged. */
+    const uint32_t adopt = adopt_row ? *adopt_row : 0u;
+    const float *const state_src = adopt
+        ? state_snapshot + (uint64_t)(adopt - 1u) *
+              ((uint64_t)n_rows * n_value_head * QWEN4EXP_GDN_DIM *
+               QWEN4EXP_GDN_DIM) + state_off
+        : state + state_off;
+    float4 h = *(const float4 *)state_src;
     /* ssm_a IS ALREADY -exp(A_log); see the note in metal/qwen4exp_gdn.metal.
      * Twin of that kernel -- keep the two expressions identical. */
     const float decay_coeff = a_log[head];
@@ -1188,8 +1211,22 @@ static float *qwen4exp_conv_scratch(int tier, uint64_t elements) {
     return (float *)next;
 }
 
+/* Snapshot slots a lazy-rollback flag may name: DS4_QWEN4EXP_IMPLEMENTED_DEPTH
+ * (ds4_qwen4exp_mtp.h, which this unit does not include), the count the graph
+ * allocates and the bound its select applies. */
+#define QWEN4EXP_GDN_ADOPT_SLOTS 6u
+
+/* Defined beside the Q8_0 quantize seam it shares with the HC mixer. */
+__global__ static void qwen4exp_gdn_output_quant_kernel(
+        int8_t *xq, float *xscale, const float *out, const float *output_gate,
+        const float *output_norm, uint32_t n_value_head, uint32_t n_tokens,
+        float norm_eps);
+
 /* The host half of qwen4exp_gpu_gdn_run in ds4_metal.m: the same validation,
- * the same four weight ranges, and the same three launches in stream order. */
+ * the same four weight ranges, and the same three launches in stream order.
+ * `out_q8`, when given (one row of prefill only), receives the output norm as
+ * the Q8_0 bytes and scales the ssm_out projection reads, at `q_offset` and
+ * `s_offset`, and no float output is written. */
 static int qwen4exp_cuda_gdn_run(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *conv_state,
@@ -1216,6 +1253,10 @@ static int qwen4exp_cuda_gdn_run(
         uint32_t              head_layout,
         float                 qk_norm_eps,
         float                 norm_eps,
+        ds4_gpu_tensor       *out_q8,
+        uint64_t              q_offset,
+        uint64_t              s_offset,
+        const ds4_gpu_tensor *adopt,
         const char           *label) {
     uint64_t key_dim = 0, value_dim = 0, conv_dim = 0, slots = 0;
     uint64_t qkv_elements = 0, out_elements = 0, gate_elements = 0;
@@ -1279,6 +1320,47 @@ static int qwen4exp_cuda_gdn_run(
         }
     }
 
+    /* The quantized output: one row of prefill, whole Q8_0 groups, and the
+     * 16-byte-aligned layout every preq kernel reads (pair = token * blocks
+     * + block, 32 bytes then one f32 scale each). */
+    if (out_q8) {
+        const uint64_t qblocks = value_dim / 32u;
+        const uint64_t qbytes = (uint64_t)n_tokens * qblocks * 32u;
+        const uint64_t sbytes = (uint64_t)n_tokens * qblocks * sizeof(float);
+        if (n_rows != 1u || (value_dim & 31u) != 0u || !out_q8->ptr ||
+            (q_offset & 15u) != 0u || (s_offset & 15u) != 0u ||
+            q_offset > out_q8->bytes || s_offset > out_q8->bytes ||
+            out_q8->bytes - q_offset < qbytes ||
+            out_q8->bytes - s_offset < sbytes ||
+            (q_offset < s_offset ? q_offset + qbytes > s_offset
+                                 : s_offset + sbytes > q_offset) ||
+            ds4_tensor_device_idx(out_q8) != ds4_tensor_device_idx(out)) {
+            fprintf(stderr, "ds4: qwen4exp GDN %s received an invalid Q8_0 "
+                    "output buffer\n", label);
+            return 0;
+        }
+    }
+
+    /* The adoption flag reads a snapshot slot the host bounds below
+     * QWEN4EXP_GDN_ADOPT_SLOTS, so both snapshot buffers must hold every such
+     * slot, and it describes one sequence row. */
+    if (adopt &&
+        (n_rows != 1u || !adopt->ptr || !conv_snapshot || !state_snapshot ||
+         !glm53_cuda_tensor_has(adopt, 1u, sizeof(uint32_t)) ||
+         !glm53_cuda_tensor_has(conv_snapshot,
+                                QWEN4EXP_GDN_ADOPT_SLOTS * conv_elements,
+                                sizeof(float)) ||
+         !glm53_cuda_tensor_has(state_snapshot,
+                                QWEN4EXP_GDN_ADOPT_SLOTS * state_elements,
+                                sizeof(float)) ||
+         ds4_tensor_device_idx(adopt) != ds4_tensor_device_idx(out))) {
+        fprintf(stderr, "ds4: qwen4exp GDN %s cannot adopt over %u rows "
+                "without snapshot buffers for every slot\n", label, n_rows);
+        return 0;
+    }
+    const uint32_t *const adopt_row =
+        adopt ? (const uint32_t *)adopt->ptr : NULL;
+
     const int logical_tier = ds4_tensor_device_idx(out);
     const float *conv_weight = qwen4exp_gdn_weight_f32(
         conv_weight_slab->map, conv_weight_slab->map_size,
@@ -1306,7 +1388,8 @@ static int qwen4exp_cuda_gdn_run(
      * the recurrence reads its qkv from where that kernel wrote. */
     float *conv_out = NULL;
     float2 *gate_pairs = NULL;
-    if (n_rows == 1u && n_tokens >= QWEN4EXP_GDN_CONV_PARALLEL_MIN_TOKENS &&
+    if (!adopt_row && n_rows == 1u &&
+        n_tokens >= QWEN4EXP_GDN_CONV_PARALLEL_MIN_TOKENS &&
         n_tokens <= 65535u) {
         uint64_t scratch_elements = 0;
         if (gate_elements <= (UINT64_MAX - qkv_elements) / 2u) {
@@ -1348,7 +1431,7 @@ static int qwen4exp_cuda_gdn_run(
                 (float *)qkv->ptr, (float *)conv_state->ptr, conv_weight,
                 conv_snapshot ? (float *)conv_snapshot->ptr : NULL,
                 n_key_head, n_value_head, n_rows, n_tokens, n_snapshot_rows,
-                qk_norm_eps);
+                qk_norm_eps, adopt_row);
     }
     if (!cuda_ok(cudaGetLastError(), "qwen4exp GDN convolution launch")) {
         return 0;
@@ -1419,7 +1502,8 @@ static int qwen4exp_cuda_gdn_run(
                     state_snapshot ? (float *)state_snapshot->ptr : NULL,
                     n_key_head, n_value_head, n_rows, n_tokens, head_layout,
                     n_snapshot_rows,
-                    getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
+                    getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u,
+                    NULL);
         }
     } else {
         qwen4exp_gdn_recurrence_kernel<false><<<
@@ -1432,12 +1516,23 @@ static int qwen4exp_cuda_gdn_run(
                 state_snapshot ? (float *)state_snapshot->ptr : NULL,
                 n_key_head, n_value_head, n_rows, n_tokens, head_layout,
                 n_snapshot_rows,
-                getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
+                getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u,
+                adopt_row);
     }
     if (!cuda_ok(cudaGetLastError(), "qwen4exp GDN recurrence launch")) {
         return 0;
     }
 
+    if (out_q8) {
+        qwen4exp_gdn_output_quant_kernel<<<dim3(n_tokens, n_value_head, 1u),
+                                           QWEN4EXP_GDN_DIM, 0, stream>>>(
+                (int8_t *)((char *)out_q8->ptr + q_offset),
+                (float *)((char *)out_q8->ptr + s_offset),
+                (const float *)out->ptr, (const float *)output_gate->ptr,
+                output_norm, n_value_head, n_tokens, norm_eps);
+        return cuda_ok(cudaGetLastError(),
+                       "qwen4exp GDN output norm quantize launch");
+    }
     qwen4exp_gdn_output_kernel<<<dim3(n_tokens, n_value_head, n_rows),
                                  QWEN4EXP_GDN_DIM, 0, stream>>>(
             (float *)out->ptr, (const float *)output_gate->ptr, output_norm,
@@ -1476,7 +1571,44 @@ extern "C" int ds4_gpu_qwen4exp_gdn_prefill(
         output_gate, conv_weight_slab, a_log_slab, dt_bias_slab,
         output_norm_slab,
         n_key_head, n_value_head, 1u, n_tokens, head_layout,
-        qk_norm_eps, norm_eps, "prefill");
+        qk_norm_eps, norm_eps, NULL, 0u, 0u, NULL, "prefill");
+}
+
+/* ds4_gpu_qwen4exp_gdn_prefill whose output norm lands as the Q8_0 bytes and
+ * scales of `out_q8` (at `q_offset` / `s_offset`) instead of float rows in
+ * `out`: the ssm_out projection's quantize folded into the norm's own launch.
+ * A NULL `out_q8` is exactly ds4_gpu_qwen4exp_gdn_prefill. */
+extern "C" int ds4_gpu_qwen4exp_gdn_prefill_q8(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *conv_snapshot,
+        ds4_gpu_tensor       *state_snapshot,
+        uint32_t              n_snapshot_rows,
+        ds4_gpu_tensor       *qkv,
+        const ds4_gpu_tensor *raw_alpha,
+        const ds4_gpu_tensor *raw_beta,
+        const ds4_gpu_tensor *output_gate,
+        const ds4_gpu_qwen4exp_slab *conv_weight_slab,
+        const ds4_gpu_qwen4exp_slab *a_log_slab,
+        const ds4_gpu_qwen4exp_slab *dt_bias_slab,
+        const ds4_gpu_qwen4exp_slab *output_norm_slab,
+        uint32_t              n_key_head,
+        uint32_t              n_value_head,
+        uint32_t              n_tokens,
+        uint32_t              head_layout,
+        float                 qk_norm_eps,
+        float                 norm_eps,
+        ds4_gpu_tensor       *out_q8,
+        uint64_t              q_offset,
+        uint64_t              s_offset) {
+    return qwen4exp_cuda_gdn_run(
+        out, conv_state, recurrent_state, conv_snapshot, state_snapshot,
+        n_snapshot_rows, qkv, raw_alpha, raw_beta,
+        output_gate, conv_weight_slab, a_log_slab, dt_bias_slab,
+        output_norm_slab,
+        n_key_head, n_value_head, 1u, n_tokens, head_layout,
+        qk_norm_eps, norm_eps, out_q8, q_offset, s_offset, NULL, "prefill");
 }
 
 extern "C" int ds4_gpu_qwen4exp_gdn_decode(
@@ -1509,7 +1641,47 @@ extern "C" int ds4_gpu_qwen4exp_gdn_decode(
         output_gate, conv_weight_slab, a_log_slab, dt_bias_slab,
         output_norm_slab,
         n_key_head, n_value_head, n_rows, 1u, head_layout,
-        qk_norm_eps, norm_eps, "decode");
+        qk_norm_eps, norm_eps, NULL, 0u, 0u, NULL, "decode");
+}
+
+/* The GDN block at a speculative width -- one row of n_tokens <= the commit
+ * width, decode's single token included -- with lazy rollback.  `adopt` is a
+ * device uint32: 0 continues from the live state, k + 1 continues from
+ * snapshot slot k, the state a rejected round's rollback would otherwise have
+ * copied over the live buffers.  The kernels dereference it at run time, so a
+ * captured graph bakes its address and never its value.  Both snapshot
+ * buffers are required, for reading, even when n_snapshot_rows is 0, and the
+ * token-parallel convolution is never taken. */
+extern "C" int ds4_gpu_qwen4exp_gdn_adopt(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *conv_snapshot,
+        ds4_gpu_tensor       *state_snapshot,
+        uint32_t              n_snapshot_rows,
+        const ds4_gpu_tensor *adopt,
+        ds4_gpu_tensor       *qkv,
+        const ds4_gpu_tensor *raw_alpha,
+        const ds4_gpu_tensor *raw_beta,
+        const ds4_gpu_tensor *output_gate,
+        const ds4_gpu_qwen4exp_slab *conv_weight_slab,
+        const ds4_gpu_qwen4exp_slab *a_log_slab,
+        const ds4_gpu_qwen4exp_slab *dt_bias_slab,
+        const ds4_gpu_qwen4exp_slab *output_norm_slab,
+        uint32_t              n_key_head,
+        uint32_t              n_value_head,
+        uint32_t              n_tokens,
+        uint32_t              head_layout,
+        float                 qk_norm_eps,
+        float                 norm_eps) {
+    if (!adopt) return 0;
+    return qwen4exp_cuda_gdn_run(
+        out, conv_state, recurrent_state, conv_snapshot, state_snapshot,
+        n_snapshot_rows, qkv, raw_alpha, raw_beta,
+        output_gate, conv_weight_slab, a_log_slab, dt_bias_slab,
+        output_norm_slab,
+        n_key_head, n_value_head, 1u, n_tokens, head_layout,
+        qk_norm_eps, norm_eps, NULL, 0u, 0u, adopt, "adopt");
 }
 
 /* ------------------------------------------------------------------
@@ -1788,6 +1960,33 @@ __device__ __forceinline__ static void qw_load_words8(const uint32_t *qw,
 #endif
 #pragma unroll
     for (int i = 0; i < 8; i++) w[i] = qw[i];
+}
+
+/* THE SIX-WORD CASE THE WIDE ARMS ABOVE NEVER COVERED (0xpg, e0a166f).  A q5_1
+ * group IS its own 24-byte block: one d|m word, one qh word, four qs words.
+ * Twenty-four is not a multiple of sixteen, so the uint4 arm cannot spell it,
+ * but it is a multiple of eight, and so is every stride that can place a block
+ * (sizeof 24, row 480, expert 2560 rows), so an eight-byte-aligned block
+ * admits three uint2 loads.  uint2 .x .y are words 0..1 of the eight bytes at
+ * the address, in address order, so w[] receives the same six values and only
+ * the instruction count moves.  The alignment is a property of the slab
+ * strides, not the thread, so the branch is warp uniform and both arms are
+ * exact. */
+__device__ __forceinline__ static void qw_load_words6(const uint32_t *qw,
+                                                      uint32_t *w) {
+#if DS4_QWEN4EXP_WIDE_PAYLOAD
+    if ((((uintptr_t)qw) & 7u) == 0u) {
+        const uint2 a = *(const uint2 *)(const void *)qw;
+        const uint2 b = *(const uint2 *)(const void *)(qw + 2);
+        const uint2 c = *(const uint2 *)(const void *)(qw + 4);
+        w[0] = a.x; w[1] = a.y;
+        w[2] = b.x; w[3] = b.y;
+        w[4] = c.x; w[5] = c.y;
+        return;
+    }
+#endif
+#pragma unroll
+    for (int i = 0; i < 6; i++) w[i] = qw[i];
 }
 
 /* Decode one 32-element group of a quantised weight row into int8 quants and
@@ -2874,7 +3073,14 @@ __device__ __forceinline__ static void qw_q4k_parity_store16(
  * every other group's payload two bytes past a word boundary, and an aligned
  * window would read past the block the decode refuses to touch, so it stages
  * nothing and decodes from the row.  The alignment is a property of the
- * slab's strides, so the branch is uniform across the block. */
+ * slab's strides, so the branch is uniform across the block.
+ *
+ * Wide6 takes the q5_1 block through qw_load_words6.  Only the routed down
+ * prefill tile instantiates it (DS4_QWEN4EXP_NO_Q51_WIDE_LOAD stands it down);
+ * every other caller keeps the word loop, and no other caller reaches q5_1.
+ * Same-binary valve legs on a GB10: warm 1024-row forward walls 668.6 ms with
+ * the arm against 674.9 ms without it (-0.94 %). */
+template <bool Wide6 = false>
 __device__ __forceinline__ static bool qw_raw_load(
         uint32_t type, const char *row, uint32_t g, uint32_t *w) {
     switch (type) {
@@ -2889,8 +3095,12 @@ __device__ __forceinline__ static bool qw_raw_load(
         const cuda_block_q5_1 *xb = (const cuda_block_q5_1 *)row + g;
         if (!qwen4exp_word_aligned(xb)) return false;
         const uint32_t *qw = (const uint32_t *)(const void *)xb;
+        if (Wide6) {
+            qw_load_words6(qw, w);
+        } else {
 #pragma unroll
-        for (int i = 0; i < 6; i++) w[i] = qw[i];
+            for (int i = 0; i < 6; i++) w[i] = qw[i];
+        }
         return true;
     }
     case (uint32_t)DS4_QWEN4EXP_TY_q5_K: {
@@ -3636,7 +3846,7 @@ qwen4exp_moe_gateup_mma_kernel(
  * The activation is the routed intermediate, quantised per (token, slot) pair,
  * so the pair index addresses it directly.
  */
-template <int DownType = -1>
+template <int DownType = -1, bool Wide6 = false>
 __global__ __launch_bounds__(QW_DOWN_MMA_THREADS) static void
 qwen4exp_moe_down_mma_kernel(
         float *partial,
@@ -3718,7 +3928,8 @@ qwen4exp_moe_down_mma_kernel(
                     if (w_dq) {
                         uint32_t raw[6];
                         dev_qwen4exp_group_decode_w(dtype, drow, g,
-                                qw_raw_load(dtype, drow, g, raw) ? raw : NULL,
+                                qw_raw_load<Wide6>(dtype, drow, g, raw)
+                                    ? raw : NULL,
                                 &sA[r * QW_MMA_LD + gg * 32], wa, wb);
                     } else {
                         dev_qwen4exp_group_decode(dtype, drow, g,
@@ -3838,6 +4049,36 @@ __global__ static void qwen4exp_moe_down_combine_kernel(
         acc += partial[pair * out_dim + row];
     }
     out[idx] = acc;
+}
+
+/* The same combine on a token grid.  blockIdx.y is the token and the row is
+ * the block-local index, so no thread divides its flat element index back into
+ * (token, row): the flat launch above pays a 64-bit division and a
+ * multiply-subtract per element beside the ten loads and ten adds it guards --
+ * the cost qwen4exp_hc_mix_kernel's grid already removed.  The slot walk, the
+ * validity test and the ascending float accumulation are the flat kernel's
+ * statements, so every out[token][row] is the same ten numbers added in the
+ * same order.  DS4_QWEN4EXP_NO_COMBINE_GRID restores the flat launch. */
+__global__ static void qwen4exp_moe_down_combine_grid_kernel(
+        float *out,
+        const float *partial,
+        const int32_t *selected,
+        uint32_t out_dim,
+        uint32_t n_tokens,
+        uint32_t n_expert_used,
+        uint32_t n_total_expert) {
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t token = blockIdx.y;
+    if (row >= out_dim || token >= n_tokens) return;
+    const uint64_t pair0 = (uint64_t)token * n_expert_used;
+    float acc = 0.0f;
+    for (uint32_t slot = 0; slot < n_expert_used; slot++) {
+        const uint64_t pair = pair0 + slot;
+        const int32_t e = selected[pair];
+        if (e < 0 || (uint32_t)e >= n_total_expert) continue;
+        acc += partial[pair * out_dim + row];
+    }
+    out[(uint64_t)token * out_dim + row] = acc;
 }
 
 
@@ -6636,13 +6877,19 @@ static int qwen4exp_moe_tile(uint32_t n_rows) {
         if (r == 1 || r == 2 || r == 4 || r == 8) return r;
     }
     if (n_rows >= 8u) return 8;
+    /* FOUR rows is the depth-3 verify: two R=2 tiles keep it on the same
+     * decode-width kernels as the three-row call below. */
+    if (n_rows == 4u && getenv("DS4_QWEN4EXP_NO_WIDE_VERIFY") == NULL) return 2;
     if (n_rows >= 4u) return 4;
     /* The usual one-row decode and two-row verify need at most two live
      * accumulators.  Keep their weight reuse while reducing the padded
      * register tile now that the format-specific kernels are available. */
     if (n_rows <= 2u) return 2;
-    /* A three-row call retains the previously measured eight-row tile.
-     * Its live per-row arithmetic agrees with the other tile widths. */
+    /* A THREE-ROW call is the depth-2 verify.  It takes the R=2 tile -- two
+     * tiles, the second with take 1 -- so it stays on the decode-width
+     * kernels; R changes work sharing, not the arithmetic of a live row.
+     * DS4_QWEN4EXP_NO_WIDE_VERIFY restores the eight-row tile. */
+    if (n_rows == 3u && getenv("DS4_QWEN4EXP_NO_WIDE_VERIFY") == NULL) return 2;
     return 8;
 }
 
@@ -6742,10 +6989,17 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     const uint64_t task_bytes = pair_tasks ? (1u + 2u * task_capacity) * 4u : 0u;
 
     const int tile = qwen4exp_moe_tile(n_tokens);
-    const bool down_vector = tile == 2 && n_tokens <= 2u &&
+    /* The depth-2 verify (three rows) keeps the two-row decode kernels: every
+     * one below walks token tiles (tok0 = blockIdx.y * R, take guarded), so a
+     * three-row call is two tiles.  DS4_QWEN4EXP_NO_WIDE_VERIFY restores the
+     * <= 2 gates. */
+    const bool wide_verify = (n_tokens == 3u || n_tokens == 4u) &&
+        getenv("DS4_QWEN4EXP_NO_WIDE_VERIFY") == NULL;
+    const bool down_vector = tile == 2 && (n_tokens <= 2u || wide_verify) &&
         n_expert_used <= 32u &&
         (down_slab->type == DS4_QWEN4EXP_TY_q8_0 ||
-         (n_tokens == 2u && down_slab->type == DS4_QWEN4EXP_TY_q5_1)) &&
+         ((n_tokens == 2u || wide_verify) &&
+          down_slab->type == DS4_QWEN4EXP_TY_q5_1)) &&
         getenv("DS4_QWEN4EXP_GENERIC_EXPERTS") == NULL &&
         getenv("DS4_QWEN4EXP_NO_DOWN_VECTOR") == NULL;
     uint64_t mq_offset = xq_bytes + idx_bytes + pair_bytes;
@@ -6988,7 +7242,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
      * neighboring warps applies the same register cut there. The diagnostic
      * pin retains the joint projection as a bit-exact oracle. Other widths
      * keep their prior kernel. */
-    else if (n_tokens <= 2u && tile == 2 && specialize &&
+    else if ((n_tokens <= 2u || wide_verify) && tile == 2 && specialize &&
              gate_slab->type == DS4_QWEN4EXP_TY_q4_K &&
              up_slab->type == DS4_QWEN4EXP_TY_q4_K &&
              getenv("DS4_QWEN4EXP_NO_SPLIT_GATEUP") == NULL) {
@@ -7078,8 +7332,12 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
          * always had, byte for byte.  Read once, before the launch. */
         const uint32_t dn_dq_stage =
             getenv("DS4_QWEN4EXP_NO_DOWN_DQ") == NULL ? 1u : 0u;
-#define QWEN4EXP_DOWN_MMA(DT) \
-        qwen4exp_moe_down_mma_kernel<DT><<< \
+        /* The q5_1 staging reads its six block words as three eight-byte
+         * loads; DS4_QWEN4EXP_NO_Q51_WIDE_LOAD restores the word loop. */
+        const bool dn_wide6 =
+            getenv("DS4_QWEN4EXP_NO_Q51_WIDE_LOAD") == NULL;
+#define QWEN4EXP_DOWN_MMA(DT, W6) \
+        qwen4exp_moe_down_mma_kernel<DT, W6><<< \
                 dim3(out_dim / QW_DOWN_MMA_BM, gu_rows, 1), \
                 QW_DOWN_MMA_THREADS, 0, stream>>>( \
                 (float *)down_partial->ptr, down, sc.mq, sc.ms, sc.msum, \
@@ -7087,21 +7345,34 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
                 down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
                 mgroups, out_dim, dn_dq_stage)
         if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q5_1) {
-            QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q5_1);
+            if (dn_wide6) {
+                QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q5_1, true);
+            } else {
+                QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q5_1, false);
+            }
         } else if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q8_0) {
-            QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q8_0);
+            QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q8_0, false);
         } else {
-            QWEN4EXP_DOWN_MMA(-1);
+            QWEN4EXP_DOWN_MMA(-1, false);
         }
 #undef QWEN4EXP_DOWN_MMA
         if (!cuda_ok(cudaGetLastError(), "qwen4exp MoE down tile launch")) return 0;
-        const uint64_t combine_n = (uint64_t)n_tokens * out_dim;
-        qwen4exp_moe_down_combine_kernel<<<
-                (unsigned)((combine_n + threads - 1u) / threads), threads, 0,
-                stream>>>(
-                (float *)out->ptr, (const float *)down_partial->ptr,
-                (const int32_t *)selected->ptr, out_dim, n_tokens,
-                n_expert_used, n_total_expert);
+        if (getenv("DS4_QWEN4EXP_NO_COMBINE_GRID") == NULL) {
+            qwen4exp_moe_down_combine_grid_kernel<<<
+                    dim3((out_dim + threads - 1u) / threads, n_tokens, 1),
+                    threads, 0, stream>>>(
+                    (float *)out->ptr, (const float *)down_partial->ptr,
+                    (const int32_t *)selected->ptr, out_dim, n_tokens,
+                    n_expert_used, n_total_expert);
+        } else {
+            const uint64_t combine_n = (uint64_t)n_tokens * out_dim;
+            qwen4exp_moe_down_combine_kernel<<<
+                    (unsigned)((combine_n + threads - 1u) / threads), threads, 0,
+                    stream>>>(
+                    (float *)out->ptr, (const float *)down_partial->ptr,
+                    (const int32_t *)selected->ptr, out_dim, n_tokens,
+                    n_expert_used, n_total_expert);
+        }
         return cuda_ok(cudaGetLastError(), "qwen4exp MoE down combine launch");
     }
     if (down_vector && ((uintptr_t)sc.mq & 15u) == 0u) {
@@ -7266,7 +7537,10 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
      * as two int4 values. Keep the row tile, warp ownership, reduction and
      * Q8 decoder unchanged. The rotating-weight screen supports two-token
      * calls; single-token, wider and other-shape calls keep scalar reads. */
-    const bool vector_shared = n_tokens == 2u &&
+    const bool vector_shared =
+        (n_tokens == 2u ||
+         ((n_tokens == 3u || n_tokens == 4u) &&
+          getenv("DS4_QWEN4EXP_NO_WIDE_VERIFY") == NULL)) &&
         in_dim == 2560u && mid_dim == 640u && out_dim == 2560u &&
         specialize_shared &&
         gate_slab->type == DS4_QWEN4EXP_TY_q8_0 &&
@@ -8002,6 +8276,65 @@ __device__ __forceinline__ static float qwen4exp_q8_rcp_approx(float d) {
     float r;
     asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(d));
     return r;
+}
+
+/* qwen4exp_gdn_output_kernel with its one reader's quantize folded in.
+ *
+ * The gated output norm has exactly one reader, the ssm_out projection, and
+ * that projection's first act is quantize_q8_0_f32_rows_warp_kernel over the
+ * 6144-wide rows the norm just stored.  Here the norm's own statements run on
+ * its own grid -- (token, value head) blocks of QWEN4EXP_GDN_DIM threads, the
+ * same partial sums, barrier and reduction -- and the value, instead of being
+ * stored and read back by a second launch, goes straight through the seam
+ * above: the same flushed fabs, the same fmaxf butterfly over the same 32
+ * lanes, and the five steps in the form --use_fast_math gave the standalone
+ * kernel.  QWEN4EXP_GDN_DIM is 128 = 4 x 32, so warp w of value head h is
+ * Q8_0 group 4h + w of the row, and pair = token * (value_dim / 32) + 4h + w
+ * is the standalone kernel's row * blocks + b.  Every group is full, so the
+ * standalone kernel's ragged-tail guard has nothing to guard.  One row of
+ * prefill only. */
+__global__ static void qwen4exp_gdn_output_quant_kernel(
+        int8_t      *xq,
+        float       *xscale,
+        const float *out,
+        const float *output_gate,
+        const float *output_norm,
+        uint32_t     n_value_head,
+        uint32_t     n_tokens,
+        float        norm_eps) {
+    const uint32_t token = blockIdx.x;
+    const uint32_t head = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    if (token >= n_tokens || head >= n_value_head) return;
+    __shared__ float partial[4];
+    const uint32_t value_dim = n_value_head * QWEN4EXP_GDN_DIM;
+    const uint64_t base = (uint64_t)token * value_dim +
+        head * QWEN4EXP_GDN_DIM;
+    const float raw = out[base + tid];
+    float total = warp_sum_f32(raw * raw);
+    if (lane == 0u) partial[warp] = total;
+    __syncthreads();
+    total = lane < 4u ? partial[lane] : 0.0f;
+    total = warp_sum_all_f32(total);
+    const float scale = rsqrtf(total / (float)QWEN4EXP_GDN_DIM + norm_eps);
+    const float v = raw * scale * output_norm[tid] *
+        qwen4exp_gdn_sigmoid(output_gate[base + tid]);
+    const float vz = qwen4exp_q8_ftz(v);
+    float a = qwen4exp_q8_ftz(fabsf(v));
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+    }
+    const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
+    const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
+    const uint64_t pair = (uint64_t)token * (value_dim / 32u) +
+        head * 4u + warp;
+    if (lane == 0u) xscale[pair] = d;
+    int q = (int)lrintf(qwen4exp_q8_ftz(vz * id));
+    q = q > 127 ? 127 : (q < -128 ? -128 : q);
+    xq[pair * 32u + lane] = (int8_t)q;
 }
 
 /* hcNorm, then the Q8_0 row quantize the down projection wants, in one pass.

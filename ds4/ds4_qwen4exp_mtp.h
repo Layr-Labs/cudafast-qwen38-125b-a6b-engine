@@ -406,6 +406,15 @@ typedef struct {
     int (*draft_rows)(void *ctx, const int *next_tokens, const float *hc_rows,
                       uint32_t pos0, uint32_t n, int *draft_out,
                       float *multi_out);
+
+    /*
+     * OPTIONAL: top-1 minus runner-up logit of the draft the latest draft_step
+     * or draft_rows call returned, or a negative value when that call did not
+     * measure one.  It can only shorten a chain (stop_margin / drop_margin in
+     * ds4_qwen4exp_mtp_state); it never changes a drafted or committed token.
+     * NULL: no margins, and no chain is ever gated.
+     */
+    float (*draft_margin)(void *ctx);
 } ds4_qwen4exp_mtp_model;
 
 /* ------------------------------------------------------------------------
@@ -474,6 +483,36 @@ typedef struct {
     int      pending[DS4_QWEN4EXP_IMPLEMENTED_DEPTH];
     int      n_pending;      /* 0 when nothing is carried                   */
     int      pending_parent; /* the token the chain was drafted from        */
+    /* draft_margin() for pending[k]; negative when unmeasured. */
+    float    pending_margin[DS4_QWEN4EXP_IMPLEMENTED_DEPTH];
+    /* The margin gate: upstream's DeepSeek MTP margin (DS4_MTP_MIN_MARGIN)
+     * carried to this cycle.  0 disarms either half.
+     *   stop_margin  the chain drafts nothing past a draft whose margin is
+     *                below it: every later link is conditioned on that token.
+     *   drop_margin  the verify leaves out trailing drafts whose margin is
+     *                below it; with none left the round is the one-row decode.
+     *   drop_keep    the verify half never drops below this many drafts
+     *                (DS4_QWEN4EXP_MTP_DROP_KEEP).
+     * Neither changes a committed token: the target verifies what is offered.
+     * DEFAULTS.  Off at depth 1: a one-draft chain has nothing to stop, a kept
+     * first draft has nothing to drop, and no margin is read back.  At depth
+     * >= 2, stop = drop = 2.0 and keep = 1: the first draft is always verified,
+     * and a second joins the verify only when both links cleared the margin.
+     * Any env value overrides, and 0 disarms.  Why, on a GB10: a verify row
+     * costs 4.6-6.9 ms and a head step 1.4 ms, so dropping a 40-60 %-likely
+     * FIRST draft always loses.  But a second draft that follows a sure first
+     * one pays for its row only when it is itself likely.  On the public
+     * passage with eight instruction variants (one ungated depth-3 margin log
+     * each), drafts under margin 1 were accepted about half the time and drafts
+     * over 4 nearly always.  The keep-one policy simulated 5-16 % faster per
+     * token than depth 1 on all eight.  On the lowest-acceptance variant, two
+     * traced legs each ran the free run 6.3-6.4 % faster than depth 1 (63 vs
+     * 74 rounds).  Ungated depth 2 runs every second draft, and lost on a
+     * prompt whose second drafts land 38 % of the time. */
+    float    stop_margin;
+    float    drop_margin;
+    int      drop_keep;
+    bool     margin_log;     /* one stderr line a round                     */
     /* Head cache rows the cycle has written: rows [0, head_rows).  The chain
      * writes one per step and a round keeps the ones its accepted drafts
      * produced, so this says whether the next chain's first row has everything
@@ -696,7 +735,10 @@ static inline uint64_t ds4_qwen4exp_q8_0_row_bytes(uint32_t in_dim) {
  * tokenizer stacks at the TOP of the id table, above the BPE ids. */
 #define DS4_QWEN4EXP_DRAFT_VOCAB_TAIL_DEFAULT 276u
 /* The default DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX: the lowest ids in BPE merge order
- * (the frequent tokens); 0 restores the whole-vocabulary draft argmax. */
+ * (the frequent tokens); 0 restores the whole-vocabulary draft argmax.  Measured
+ * on the ranked prompt both ways: 90112 and 81920 accept 47 of 80 drafts, 98308
+ * accepts 49 of 78, and 248044 (every BPE id) also accepts 49 of 78 while its
+ * wider screen costs about 0.7 ms a round -- so 98308 is where it belongs. */
 #define DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX_DEFAULT 98308u
 
 /*
@@ -784,6 +826,12 @@ typedef struct {
     ds4_gpu_tensor *t_logits_tail;
     ds4_gpu_tensor *t_top1;
     uint32_t       *top1_host;
+
+    /* Set by the owner when a margin gate or its log is armed.  A screened
+     * one-row draft then reads its refined candidate logits back and leaves
+     * top-1 minus runner-up in last_margin; otherwise last_margin is -1. */
+    bool  want_margin;
+    float last_margin;
 } ds4_qwen4exp_mtp_head;
 
 /*

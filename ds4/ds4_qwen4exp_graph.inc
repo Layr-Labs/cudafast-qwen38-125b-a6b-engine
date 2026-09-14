@@ -107,6 +107,12 @@ void ds4_qwen4exp_session_plan_compute(ds4_qwen4exp_session_plan *plan,
     const uint64_t q8_soff = (q8_qbytes + 15ull) & ~15ull;
     const uint64_t q8_sbytes = B * q8_blocks * sizeof(float);
     act += q8_soff + q8_sbytes;                    /* mixed_q8            */
+    {
+        const uint64_t gq_blocks = cfg->gdn_inner / 32ull;
+        const uint64_t gq_qbytes = B * gq_blocks * 32ull;
+        act += ((gq_qbytes + 15ull) & ~15ull) +
+               B * gq_blocks * sizeof(float);      /* gdn_out_q8          */
+    }
     act += B * cfg->qsa_q_dim * f;                 /* doubled query       */
     act += 3ull * B * q_width * f;                 /* q, gate, attn out   */
     act += 2ull * B * cfg->qsa_kv_dim * f;
@@ -347,6 +353,17 @@ struct ds4_qwen4exp_session {
 
     /* Shared, position-independent. */
     ds4_gpu_tensor *d_pos;
+    /* Lazy GDN rollback.  A reject records the snapshot row each GDN object
+     * must continue from (row + 1, 0 = none) instead of copying 108 MiB over
+     * the live buffers; the next forward reads it through `d_adopt`, a device
+     * uint32 published like d_pos (0 = live, k + 1 = slot k), or copies it in
+     * first when it cannot.  NULL, and every path the plain copy, when
+     * DS4_QWEN4EXP_NO_LAZY_ROLLBACK is set in the environment (any value) at
+     * session open -- once per engine, since the engine opens one session. */
+    ds4_gpu_tensor *d_adopt;
+    uint32_t        adopt_state;   /* recurrent state: row + 1, or 0 */
+    uint32_t        adopt_conv;    /* conv history: row + 1, or 0 */
+    uint32_t        adopt_device;  /* host mirror of *d_adopt */
     ds4_gpu_tensor *inv_freq;
 
     /* Activations.  All sized for n_batch tokens and reused every layer. */
@@ -367,6 +384,7 @@ struct ds4_qwen4exp_session {
     ds4_gpu_tensor *gdn_out;
 
     ds4_gpu_tensor *mixed_q8; /* shared by sequential GDN/QSA projections */
+    ds4_gpu_tensor *gdn_out_q8; /* prefill GDN output norm, as ssm_out's Q8_0 */
     ds4_gpu_tensor *qsa_doubled;
     ds4_gpu_tensor *qsa_q;
     ds4_gpu_tensor *qsa_gate;
@@ -725,6 +743,10 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
     }
 
     s->d_pos = qwen4exp_alloc_zeroed(sizeof(uint32_t), &ok);
+    if (getenv("DS4_QWEN4EXP_NO_LAZY_ROLLBACK") == NULL) {
+        /* Zeroed on the device, so flag, mirror and pending all start at live. */
+        s->d_adopt = qwen4exp_alloc_zeroed(sizeof(uint32_t), &ok);
+    }
     s->inv_freq = qwen4exp_alloc_zeroed((uint64_t)DS4_N_ROT / 2u * f, &ok);
     if (ok) {
         float freqs[DS4_MAX_KDA_HEAD_DIM];
@@ -754,6 +776,12 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
     const uint64_t q8_soff = (q8_qbytes + 15ull) & ~15ull;
     const uint64_t q8_sbytes = B * q8_blocks * sizeof(float);
     s->mixed_q8 = qwen4exp_alloc_zeroed(q8_soff + q8_sbytes, &ok);
+    {
+        const uint64_t gq_blocks = cfg->gdn_inner / 32ull;
+        const uint64_t gq_qbytes = B * gq_blocks * 32ull;
+        s->gdn_out_q8 = qwen4exp_alloc_zeroed(
+            ((gq_qbytes + 15ull) & ~15ull) + B * gq_blocks * sizeof(float), &ok);
+    }
     s->qsa_doubled = qwen4exp_alloc_zeroed(B * cfg->qsa_q_dim * f, &ok);
     s->qsa_q       = qwen4exp_alloc_zeroed(B * q_width * f, &ok);
     s->qsa_gate    = qwen4exp_alloc_zeroed(B * q_width * f, &ok);
@@ -824,6 +852,7 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     free(s->ple_ids);
     free(s->ple_rows_host);
     ds4_gpu_tensor_free(s->d_pos);
+    ds4_gpu_tensor_free(s->d_adopt);
     ds4_gpu_tensor_free(s->inv_freq);
     ds4_gpu_tensor_free(s->tokens);
     ds4_gpu_tensor_free(s->hyper);
@@ -840,6 +869,7 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->gdn_gate);
     ds4_gpu_tensor_free(s->gdn_out);
     ds4_gpu_tensor_free(s->mixed_q8);
+    ds4_gpu_tensor_free(s->gdn_out_q8);
     ds4_gpu_tensor_free(s->qsa_doubled);
     ds4_gpu_tensor_free(s->qsa_q);
     ds4_gpu_tensor_free(s->qsa_gate);
@@ -919,6 +949,10 @@ static void qwen4exp_zero_tensor(ds4_gpu_tensor *t) {
 void ds4_qwen4exp_session_reset(ds4_qwen4exp_session *s) {
     if (!s) return;
     s->head_cache_pos = 0;
+    /* A pending adoption names a slot of the state being discarded; the zeroed
+     * live buffers are what the next forward must read. */
+    s->adopt_state = 0u;
+    s->adopt_conv = 0u;
     if (!s->state_dirty) {
         /* Already at the reset state and nothing has written since, so every
          * store below would write the value the buffer already holds.  `pos`
@@ -1405,6 +1439,18 @@ static bool qwen4exp_graph_ple_block(ds4_qwen4exp_session *s,
     return true;
 }
 
+/* Prefill width at which the GDN output norm writes ssm_out's Q8_0 directly
+ * (ds4_gpu_qwen4exp_gdn_prefill_q8).  Decode and verify widths keep the float
+ * norm and their captured graphs.  DS4_QWEN4EXP_NO_GDN_OUT_QUANT=1 restores the
+ * float norm and the projection's own quantize at every width. */
+#define QW_GDN_OUT_Q8_MIN_TOKENS 64u
+
+static bool qw_gdn_out_q8_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("DS4_QWEN4EXP_NO_GDN_OUT_QUANT") == NULL;
+    return on != 0;
+}
+
 /* The GDN block.  head_layout is TILED for anything the loader bound: the
  * llama.cpp converter reorders the value heads into ggml's broadcast order and
  * the binder does not undo it, so value head j reads key head j % n_key_head. */
@@ -1476,15 +1522,38 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
     const ds4_gpu_qwen4exp_slab dt_bias_slab = QW_SLAB(m, l->ssm_dt_bias);
     const ds4_gpu_qwen4exp_slab ssm_norm_slab = QW_SLAB(m, l->ssm_norm);
 
-    const int rc = (n_tokens > 1u)
-        ? ds4_gpu_qwen4exp_gdn_prefill(
+    /* At prefill width the norm writes the Q8_0 the ssm_out projection reads,
+     * in the layout and at the scale offset the projection's own quantize
+     * would have used for these rows. */
+    const bool out_q8 = n_tokens >= QW_GDN_OUT_Q8_MIN_TOKENS && qw_gdn_out_q8_on();
+    const uint64_t out_q8_blocks = (uint64_t)cfg->gdn_inner / 32u;
+    const uint64_t out_q8_soff =
+        ((uint64_t)n_tokens * out_q8_blocks * 32u + 15u) & ~15ull;
+    /* At every speculative width the kernels take the adoption flag (the
+     * pointer at every such width, adoption pending or not, so a captured
+     * graph's arguments do not depend on it); graph_forward has already copied
+     * in any adoption a wider forward could not read. */
+    const bool adopt_width = s->d_adopt != NULL &&
+        n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT;
+    const int rc = adopt_width
+        ? ds4_gpu_qwen4exp_gdn_adopt(
+              s->gdn_out, s->gdn_conv[il], s->gdn_state[il],
+              s->gdn_conv_snapshot[il], s->gdn_state_snapshot[il],
+              s->spec_snapshot_rows, s->d_adopt, s->gdn_qkv,
+              s->gdn_alpha, s->gdn_beta, s->gdn_gate,
+              &conv_slab, &a_log_slab, &dt_bias_slab, &ssm_norm_slab,
+              DS4_N_GDN_KEY_HEAD, DS4_N_GDN_VALUE_HEAD, n_tokens,
+              DS4_QWEN4EXP_GDN_HEADS_TILED, DS4_RMS_EPS, DS4_RMS_EPS)
+        : (n_tokens > 1u)
+        ? ds4_gpu_qwen4exp_gdn_prefill_q8(
               s->gdn_out, s->gdn_conv[il], s->gdn_state[il],
               s->gdn_conv_snapshot[il], s->gdn_state_snapshot[il],
               s->spec_snapshot_rows, s->gdn_qkv,
               s->gdn_alpha, s->gdn_beta, s->gdn_gate,
               &conv_slab, &a_log_slab, &dt_bias_slab, &ssm_norm_slab,
               DS4_N_GDN_KEY_HEAD, DS4_N_GDN_VALUE_HEAD, n_tokens,
-              DS4_QWEN4EXP_GDN_HEADS_TILED, DS4_RMS_EPS, DS4_RMS_EPS)
+              DS4_QWEN4EXP_GDN_HEADS_TILED, DS4_RMS_EPS, DS4_RMS_EPS,
+              out_q8 ? s->gdn_out_q8 : NULL, 0u, out_q8_soff)
         : ds4_gpu_qwen4exp_gdn_decode(
               s->gdn_out, s->gdn_conv[il], s->gdn_state[il], s->gdn_qkv,
               s->gdn_alpha, s->gdn_beta, s->gdn_gate,
@@ -1496,10 +1565,16 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
         return false;
     }
 
-    if (!ds4_qwen4exp_matmul_q8_0(s->block_out, QW_MAP(m, l->ssm_out),
-                                    QW_MAPSZ(m, l->ssm_out), QW_OFF(l->ssm_out),
-                                    cfg->gdn_inner, DS4_N_EMBD,
-                                    s->gdn_out, n_tokens)) {
+    const int proj_ok = out_q8
+        ? ds4_qwen4exp_matmul_q8_0_preq(s->block_out, QW_MAP(m, l->ssm_out),
+                                        QW_MAPSZ(m, l->ssm_out), QW_OFF(l->ssm_out),
+                                        cfg->gdn_inner, DS4_N_EMBD,
+                                        s->gdn_out_q8, 0u, out_q8_soff, n_tokens)
+        : ds4_qwen4exp_matmul_q8_0(s->block_out, QW_MAP(m, l->ssm_out),
+                                   QW_MAPSZ(m, l->ssm_out), QW_OFF(l->ssm_out),
+                                   cfg->gdn_inner, DS4_N_EMBD,
+                                   s->gdn_out, n_tokens);
+    if (!proj_ok) {
         fprintf(stderr, "ds4: qwen4exp GDN output projection failed at block %u\n", il);
         return false;
     }
@@ -2553,6 +2628,12 @@ static bool qwen4exp_graph_layers(
     return qwen4exp_graph_layers_encode(s, w, m, n_tokens, true);
 }
 
+/* Today's GDN rollback copy; graph_forward runs it when a pending lazy
+ * adoption cannot be read through the flag. */
+static bool qwen4exp_session_copy_layers(ds4_qwen4exp_session *s,
+                                         uint32_t row,
+                                         bool recurrent, bool conv);
+
 bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
                                 const ds4_qwen4exp_weights *w,
                                 const ds4_model            *m,
@@ -2643,6 +2724,31 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
      * than taking its own command buffer, and the blits that append to the KV
      * caches only work inside a batch at all.  qwen4exp_forward_fail() ends the
      * batch on the way out so a refusal does not leave one open. */
+    /* Lazy GDN rollback.  The kernels can read one pending adoption row for
+     * both GDN objects at a speculative width; anything else -- a wider
+     * forward, or objects left at different rows -- gets today's copy first. */
+    if (s->adopt_state != 0u || s->adopt_conv != 0u) {
+        if (n_tokens > (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT ||
+            s->adopt_state != s->adopt_conv) {
+            const uint32_t rs = s->adopt_state, rc = s->adopt_conv;
+            s->adopt_state = 0u;
+            s->adopt_conv = 0u;
+            if ((rs != 0u && !qwen4exp_session_copy_layers(s, rs - 1u, true, false)) ||
+                (rc != 0u && !qwen4exp_session_copy_layers(s, rc - 1u, false, true))) {
+                fprintf(stderr, "ds4: qwen4exp GDN rollback could not settle "
+                        "before a %u-row forward\n", n_tokens);
+                return false;
+            }
+        }
+    }
+    if (s->d_adopt && s->adopt_device != s->adopt_state) {
+        if (!ds4_gpu_qwen4exp_update_dpos(s->d_adopt, s->adopt_state)) {
+            s->adopt_device = UINT32_MAX;
+            fprintf(stderr, "ds4: qwen4exp GDN rollback flag update failed\n");
+            return false;
+        }
+        s->adopt_device = s->adopt_state;
+    }
     if (s->d_pos && !ds4_gpu_qwen4exp_update_dpos(s->d_pos, s->pos)) {
         fprintf(stderr, "ds4: qwen4exp position update failed\n");
         return false;
@@ -2664,8 +2770,14 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     QW_TRACE(QW_SLICE_EMBED);
 
     if (!qwen4exp_graph_layers(s, w, m, n_tokens)) {
+        /* Layers that ran have already advanced the live state and rewritten
+         * slots, so the state is undefined until the next reset or sync, as
+         * it is on the copy path; `state_dirty` is set above. */
         return qwen4exp_forward_fail();
     }
+    /* Every GDN launch has read the flag; the live buffers are current again. */
+    s->adopt_state = 0u;
+    s->adopt_conv = 0u;
 
     /* The final mixer has no inject head: it collapses n_hc * n_embd to
      * n_embd and stands in for the model.norm this checkpoint does not have. */
@@ -2746,9 +2858,9 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
  * it is exact because the recurrence is token-serial, so the state the forward
  * left after row k is the state a (k + 1)-row feed would have left.
  */
-static bool qwen4exp_session_select_layers(ds4_qwen4exp_session *s,
-                                           uint32_t row,
-                                           bool recurrent, bool conv) {
+static bool qwen4exp_session_copy_layers(ds4_qwen4exp_session *s,
+                                         uint32_t row,
+                                         bool recurrent, bool conv) {
     const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
     if (s) s->state_dirty = true;   /* see `state_dirty` */
     if (row >= DS4_QWEN4EXP_IMPLEMENTED_DEPTH) return false;
@@ -2770,6 +2882,24 @@ static bool qwen4exp_session_select_layers(ds4_qwen4exp_session *s,
     }
     if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) return false;
     return ok;
+}
+
+/* The rollback's GDN select.  With lazy rollback armed it records the row each
+ * object continues from and returns: no device work.  A later select of the
+ * same object wins, as the copy it replaces would (no forward runs between
+ * them, so the slots are unchanged).  graph_forward reads the recorded rows
+ * through `d_adopt`, or copies them in first when it cannot. */
+static bool qwen4exp_session_select_layers(ds4_qwen4exp_session *s,
+                                           uint32_t row,
+                                           bool recurrent, bool conv) {
+    if (s && s->d_adopt) {
+        s->state_dirty = true;   /* see `state_dirty` */
+        if (row >= DS4_QWEN4EXP_IMPLEMENTED_DEPTH) return false;
+        if (recurrent) s->adopt_state = row + 1u;
+        if (conv) s->adopt_conv = row + 1u;
+        return true;
+    }
+    return qwen4exp_session_copy_layers(s, row, recurrent, conv);
 }
 
 /* ======================================================================
@@ -3339,15 +3469,15 @@ bool ds4_qwen4exp_graph_head_logits(ds4_qwen4exp_session       *s,
  *
  * The checksum is order sensitive on purpose: two states that hold the same
  * values in different rows are not the same state. */
-static double qwen4exp_state_checksum(const ds4_gpu_tensor *t) {
+static double qwen4exp_state_checksum_range(const ds4_gpu_tensor *t,
+                                            uint64_t offset, uint64_t bytes) {
     if (!t) return 0.0;
-    const uint64_t bytes = ds4_gpu_tensor_bytes(t);
     const uint64_t n = bytes / sizeof(float);
     if (n == 0) return 0.0;
     float *buf = malloc((size_t)bytes);
     if (!buf) return -1.0;
     double acc = 0.0;
-    if (ds4_gpu_tensor_read((ds4_gpu_tensor *)t, 0, buf, bytes)) {
+    if (ds4_gpu_tensor_read((ds4_gpu_tensor *)t, offset, buf, bytes)) {
         for (uint64_t i = 0; i < n; i++) {
             const double v = (double)buf[i];
             acc += v * (double)((i % 1021u) + 1u);
@@ -3357,6 +3487,27 @@ static double qwen4exp_state_checksum(const ds4_gpu_tensor *t) {
     }
     free(buf);
     return acc;
+}
+
+static double qwen4exp_state_checksum(const ds4_gpu_tensor *t) {
+    if (!t) return 0.0;
+    return qwen4exp_state_checksum_range(t, 0, ds4_gpu_tensor_bytes(t));
+}
+
+/* A GDN object with a pending lazy-rollback adoption holds, as far as the next
+ * forward is concerned, the snapshot slot it will continue from: read that
+ * slot, at the offset and length the rollback copy would have read it, so the
+ * checksum is the one the copy path reports. */
+static double qwen4exp_gdn_checksum(const ds4_qwen4exp_session *s, uint32_t il,
+                                    bool recurrent) {
+    const ds4_gpu_tensor *live = recurrent ? s->gdn_state[il] : s->gdn_conv[il];
+    const ds4_gpu_tensor *snap =
+        recurrent ? s->gdn_state_snapshot[il] : s->gdn_conv_snapshot[il];
+    const uint32_t pending = recurrent ? s->adopt_state : s->adopt_conv;
+    if (!live || !snap || pending == 0u) return qwen4exp_state_checksum(live);
+    const uint64_t bytes = ds4_gpu_tensor_bytes(live);
+    return qwen4exp_state_checksum_range(snap, (uint64_t)(pending - 1u) * bytes,
+                                         bytes);
 }
 
 /*
@@ -3407,7 +3558,11 @@ int ds4_qwen4exp_test_state_object(const ds4_qwen4exp_session *s, int index,
         }
         /* A slot the block type does not own is NULL and checksums to zero on
          * both sides, so it never reports a difference of its own. */
-        if (sum) *sum = qwen4exp_state_checksum(t);
+        if (sum) {
+            *sum = k == 0 ? qwen4exp_gdn_checksum(s, il, false)
+                 : k == 1 ? qwen4exp_gdn_checksum(s, il, true)
+                 : qwen4exp_state_checksum(t);
+        }
         return 1;
     }
     switch (index - layer_entries) {
@@ -3445,8 +3600,8 @@ void ds4_qwen4exp_test_state_checksums(const ds4_qwen4exp_session *s,
     if (!s || cap < 2) return;
     const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
     for (uint32_t il = 0; il < cfg->n_layer && (int)il + 2 <= cap; il++) {
-        out[il] = qwen4exp_state_checksum(s->gdn_conv[il]) +
-                  qwen4exp_state_checksum(s->gdn_state[il]) +
+        out[il] = qwen4exp_gdn_checksum(s, il, false) +
+                  qwen4exp_gdn_checksum(s, il, true) +
                   qwen4exp_state_checksum(s->qsa_k[il]) +
                   qwen4exp_state_checksum(s->qsa_v[il]) +
                   qwen4exp_state_checksum(s->idx_tape[il]) +

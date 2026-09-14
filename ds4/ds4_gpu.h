@@ -3696,6 +3696,36 @@ int ds4_gpu_qwen4exp_gdn_prefill(
         float                 qk_norm_eps,
         float                 norm_eps);
 
+/* ds4_gpu_qwen4exp_gdn_prefill whose output norm is written as the Q8_0 bytes
+ * (at `q_offset`) and per-block scales (at `s_offset`) of `out_q8`, in the
+ * layout the Q8_0 preq projections read, instead of float rows in `out`.  The
+ * values are the ones the float path's projection would have quantized.  A
+ * NULL `out_q8` is exactly ds4_gpu_qwen4exp_gdn_prefill. */
+int ds4_gpu_qwen4exp_gdn_prefill_q8(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *conv_snapshot,
+        ds4_gpu_tensor       *state_snapshot,
+        uint32_t              n_snapshot_rows,
+        ds4_gpu_tensor       *qkv,
+        const ds4_gpu_tensor *raw_alpha,
+        const ds4_gpu_tensor *raw_beta,
+        const ds4_gpu_tensor *output_gate,
+        const ds4_gpu_qwen4exp_slab *conv_weight,
+        const ds4_gpu_qwen4exp_slab *a_log,
+        const ds4_gpu_qwen4exp_slab *dt_bias,
+        const ds4_gpu_qwen4exp_slab *output_norm,
+        uint32_t              n_key_head,
+        uint32_t              n_value_head,
+        uint32_t              n_tokens,
+        uint32_t              head_layout,
+        float                 qk_norm_eps,
+        float                 norm_eps,
+        ds4_gpu_tensor       *out_q8,
+        uint64_t              q_offset,
+        uint64_t              s_offset);
+
 int ds4_gpu_qwen4exp_gdn_decode(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *conv_state,
@@ -3713,6 +3743,35 @@ int ds4_gpu_qwen4exp_gdn_decode(
         uint32_t              n_key_head,
         uint32_t              n_value_head,
         uint32_t              n_rows,
+        uint32_t              head_layout,
+        float                 qk_norm_eps,
+        float                 norm_eps);
+
+/* The GDN block at a speculative width (one row of n_tokens <= the commit width,
+ * decode's single token included) with lazy rollback.  `adopt` is a device
+ * uint32 the kernels dereference at run time -- 0 continues from the live state,
+ * k + 1 from snapshot slot k -- so a captured graph bakes its address, never its
+ * value.  Both snapshot buffers are required and must hold every slot the flag
+ * may name; the token-parallel convolution is never taken. */
+int ds4_gpu_qwen4exp_gdn_adopt(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *conv_snapshot,
+        ds4_gpu_tensor       *state_snapshot,
+        uint32_t              n_snapshot_rows,
+        const ds4_gpu_tensor *adopt,
+        ds4_gpu_tensor       *qkv,
+        const ds4_gpu_tensor *raw_alpha,
+        const ds4_gpu_tensor *raw_beta,
+        const ds4_gpu_tensor *output_gate,
+        const ds4_gpu_qwen4exp_slab *conv_weight,
+        const ds4_gpu_qwen4exp_slab *a_log,
+        const ds4_gpu_qwen4exp_slab *dt_bias,
+        const ds4_gpu_qwen4exp_slab *output_norm,
+        uint32_t              n_key_head,
+        uint32_t              n_value_head,
+        uint32_t              n_tokens,
         uint32_t              head_layout,
         float                 qk_norm_eps,
         float                 norm_eps);

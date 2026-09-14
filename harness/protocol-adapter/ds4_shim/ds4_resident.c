@@ -30,6 +30,11 @@
  *   top_logits {k}     -> ds4s_top_logits
  *   eval_speculative {first_token,budget}
  *                      -> ds4s_eval_speculative + ds4s_argmax
+ *   spec_run {first_token,count}
+ *                      -> ds4s_eval_speculative + ds4s_argmax, cycle after
+ *                         cycle until count tokens are committed, in ONE reply
+ *                         carrying every cycle's tokens and frontier argmax
+ *                         (offered in hello as "spec_run")
  *   spec_counters      -> ds4s_spec_counters
  *   bye                -> acknowledge, then close
  *
@@ -70,6 +75,8 @@
  *   DS4_RESIDENT_READY_FILE      touched once the model is open AND the socket
  *                                is listening; the serve script polls it
  *   DS4_RESIDENT_PHASE_TIMEOUT_S idle ceiling on one connection (default 1800)
+ *   DS4_RESIDENT_NO_SPEC_RUN     1 = do not offer spec_run, so clients drive one
+ *                                speculative cycle per request (A/B valve)
  */
 #include "ds4_shim.h"
 
@@ -89,6 +96,7 @@
 
 #define RESIDENT_MAX_TOP_K 64
 #define RESIDENT_MAX_SPEC 17
+#define RESIDENT_MAX_RUN 65536
 
 static volatile sig_atomic_t g_stop;
 static char g_socket_path[512];
@@ -302,6 +310,7 @@ typedef struct {
     int draft_tokens;
     int ctx_size;
     uint64_t load_epoch;
+    bool spec_run;
 } resident;
 
 /* Serve one request line. Returns 1 to keep the connection, 0 to close it,
@@ -319,10 +328,11 @@ static int serve_line(const resident *r, int fd, const char *line) {
     if (!strcmp(op, "hello")) {
         ok = buf_printf(&out,
                         "{\"ok\":true,\"vocab_size\":%d,\"eos_token\":%d,\"mtp_armed\":%s,"
-                        "\"draft_tokens\":%d,\"ctx_size\":%d,\"load_epoch\":%" PRIu64 ",",
+                        "\"draft_tokens\":%d,\"ctx_size\":%d,\"load_epoch\":%" PRIu64 ","
+                        "\"spec_run\":%s,",
                         ds4s_vocab_size(r->h), (int)ds4s_eos_token(r->h),
                         r->draft_tokens >= 2 ? "true" : "false", r->draft_tokens, r->ctx_size,
-                        r->load_epoch) &&
+                        r->load_epoch, r->spec_run ? "true" : "false") &&
              buf_puts(&out, "\"ident\":") && buf_json_string(&out, r->ident) &&
              buf_puts(&out, ",\"model_path\":") && buf_json_string(&out, r->model_path) &&
              buf_puts(&out, ",\"mtp_head_path\":") && buf_json_string(&out, r->mtp_head_path) &&
@@ -393,6 +403,55 @@ static int serve_line(const resident *r, int fd, const char *line) {
         for (int i = 0; ok && i < n; i++)
             ok = buf_printf(&out, "%s%d", i ? "," : "", (int)committed[i]);
         ok = ok && buf_printf(&out, "],\"token\":%d}", (int)ds4s_argmax(r->h));
+    } else if (!strcmp(op, "spec_run")) {
+        long long first = 0, count = 0;
+        if (!r->spec_run) {
+            free(out.data);
+            return send_error(fd, "spec_run is not offered (DS4_RESIDENT_NO_SPEC_RUN)") ? 1 : -1;
+        }
+        if (field_int(line, "first_token", &first) != 0 || field_int(line, "count", &count) != 0 ||
+            count <= 0 || count > RESIDENT_MAX_RUN) {
+            free(out.data);
+            return send_error(fd, "spec_run needs \"first_token\" and a \"count\" in 1..65536") ? 1
+                                                                                               : -1;
+        }
+        /* THE WHOLE FREE RUN IN ONE REQUEST. This is the client's per-cycle
+         * loop moved to this side of the socket: feed the pending token with
+         * the budget still wanted, record the committed tokens and the frontier
+         * argmax the cycle left, and feed that frontier next. Every cycle's
+         * tokens and frontier go back, so the client checks and assembles
+         * exactly what one request per cycle would have given it. What goes
+         * away is the socket round trip after each cycle, which the GPU waited
+         * through idle. A cycle the client refuses (nothing committed, or not
+         * starting with the fed token) ends the loop, so the refusal follows
+         * the same cycle it always did. */
+        buf frontiers = {0};
+        int32_t pending = (int32_t)first;
+        long long produced = 0;
+        ok = buf_puts(&out, "{\"ok\":true,\"rounds\":[");
+        for (int cycle = 0; ok && produced < count; cycle++) {
+            int32_t committed[RESIDENT_MAX_SPEC];
+            const int n = ds4s_eval_speculative(r->h, pending, (int)(count - produced), committed,
+                                                RESIDENT_MAX_SPEC);
+            if (n < 0) {
+                free(out.data);
+                free(frontiers.data);
+                return send_error(fd, ds4s_last_error(r->h)) ? 1 : -1;
+            }
+            const int32_t frontier = ds4s_argmax(r->h);
+            ok = buf_puts(&out, cycle ? ",[" : "[");
+            for (int i = 0; ok && i < n; i++)
+                ok = buf_printf(&out, "%s%d", i ? "," : "", (int)committed[i]);
+            ok = ok && buf_puts(&out, "]") &&
+                 buf_printf(&frontiers, "%s%d", cycle ? "," : "", (int)frontier);
+            if (n == 0 || committed[0] != pending) break;
+            produced += n;
+            pending = frontier;
+        }
+        ok = ok && buf_puts(&out, "],\"frontiers\":[") &&
+             (frontiers.len == 0 || buf_puts(&out, frontiers.data)) &&
+             buf_printf(&out, "],\"token\":%d}", (int)ds4s_argmax(r->h));
+        free(frontiers.data);
     } else if (!strcmp(op, "spec_counters")) {
         uint64_t drafts = 0, hits = 0, quenches = 0, disagreements = 0;
         ds4s_spec_counters(r->h, &drafts, &hits, &quenches, &disagreements);
@@ -501,6 +560,7 @@ int main(void) {
     const int ctx_size = env_int("DS4_CTX_SIZE", 8192);
     const int n_threads = env_int("DS4_THREADS", 0);
     const int timeout_s = env_int("DS4_RESIDENT_PHASE_TIMEOUT_S", 1800);
+    const int no_spec_run = env_int("DS4_RESIDENT_NO_SPEC_RUN", 0);
     const char *ident = env_or("DS4_ENGINE_IDENT", "ds4");
     const char *ready_file = env_or("DS4_RESIDENT_READY_FILE", NULL);
 
@@ -585,6 +645,8 @@ int main(void) {
         fclose(fp);
     }
     log_line("listening on %s; phases connect, the weights stay put", socket_path);
+    log_line("spec_run %s", no_spec_run ? "off (DS4_RESIDENT_NO_SPEC_RUN): one cycle per request"
+                                        : "on: a speculative free run is one request");
 
     const resident r = {
         .h = h,
@@ -594,6 +656,7 @@ int main(void) {
         .draft_tokens = draft_tokens,
         .ctx_size = ctx_size,
         .load_epoch = (uint64_t)getpid(),
+        .spec_run = no_spec_run == 0,
     };
 
     uint64_t phase = 0;

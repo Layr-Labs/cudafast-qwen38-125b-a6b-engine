@@ -210,6 +210,33 @@ static int rollback_truncate_all(const ds4_qwen4exp_rollback_set *set,
  * State and counters
  * ------------------------------------------------------------------------ */
 
+/* A non-negative float from the environment, or `fallback`. */
+static float mtp_env_margin(const char *name, float fallback) {
+    const char *v = getenv(name);
+    if (!v || !*v) return fallback;
+    char *end = NULL;
+    const float x = strtof(v, &end);
+    return (end != v && x >= 0.0f) ? x : fallback;
+}
+
+/* DS4_QWEN4EXP_MTP_MARGIN_LOG: what the round offered, verified and accepted,
+ * its verify and the following chain in ms, and the offered drafts' margins. */
+static void mtp_margin_log(const ds4_qwen4exp_mtp_state *st, int offered,
+                           int n, int a, const float *m,
+                           uint64_t verify0, uint64_t draft0) {
+    char buf[256];
+    int len = snprintf(buf, sizeof(buf),
+                       "qwen4exp-mtp-margin off=%d n=%d a=%d v=%.3f d=%.3f m=",
+                       offered, n, a,
+                       (double)(st->counters.verify_ns - verify0) / 1e6,
+                       (double)(st->counters.draft_ns - draft0) / 1e6);
+    for (int k = 0; k < offered && len > 0 && len < (int)sizeof(buf); k++) {
+        len += snprintf(buf + len, sizeof(buf) - (size_t)len,
+                        k ? ",%.3f" : "%.3f", (double)m[k]);
+    }
+    fprintf(stderr, "%s\n", buf);
+}
+
 int ds4_qwen4exp_mtp_state_init(ds4_qwen4exp_mtp_state *st, int depth,
                                 const ds4_qwen4exp_rollback_set *rollback,
                                 uint32_t hc_dim, uint32_t n_vocab,
@@ -236,6 +263,18 @@ int ds4_qwen4exp_mtp_state_init(ds4_qwen4exp_mtp_state *st, int depth,
     st->depth = depth;
     st->hc_dim = hc_dim;
     st->n_vocab = n_vocab;
+    /* Off at depth 1, where a kept first draft leaves nothing to stop or drop;
+     * the keep-one gate described in the header at depth >= 2. */
+    const bool gated = depth >= 2;
+    st->stop_margin = mtp_env_margin("DS4_QWEN4EXP_MTP_STOP_MARGIN", gated ? 2.0f : 0.0f);
+    st->drop_margin = mtp_env_margin("DS4_QWEN4EXP_MTP_DROP_MARGIN", gated ? 2.0f : 0.0f);
+    {
+        const char *keep = getenv("DS4_QWEN4EXP_MTP_DROP_KEEP");
+        st->drop_keep = (keep && keep[0]) ? atoi(keep) : (gated ? 1 : 0);
+        if (st->drop_keep < 0) st->drop_keep = 0;
+    }
+    const char *margin_log = getenv("DS4_QWEN4EXP_MTP_MARGIN_LOG");
+    st->margin_log = margin_log && *margin_log && strcmp(margin_log, "0") != 0;
     ds4_qwen4exp_mtp_invalidate(st);
     st->hc_scratch = malloc((size_t)DS4_QWEN4EXP_MTP_HC_ROWS * hc_dim *
                             sizeof(float));
@@ -257,7 +296,10 @@ void ds4_qwen4exp_mtp_state_free(ds4_qwen4exp_mtp_state *st) {
 }
 
 void ds4_qwen4exp_mtp_invalidate(ds4_qwen4exp_mtp_state *st) {
-    for (int k = 0; k < DS4_QWEN4EXP_IMPLEMENTED_DEPTH; k++) st->pending[k] = -1;
+    for (int k = 0; k < DS4_QWEN4EXP_IMPLEMENTED_DEPTH; k++) {
+        st->pending[k] = -1;
+        st->pending_margin[k] = -1.0f;
+    }
     st->n_pending = 0;
     st->pending_parent = -1;
     st->frontier_top1_valid = false;
@@ -445,6 +487,8 @@ static int mtp_draft_chain(ds4_qwen4exp_mtp_state *st,
                             "failed", seeds + 1u, j0);
         }
         st->pending[0] = draft;
+        st->pending_margin[0] = model->draft_margin
+            ? model->draft_margin(model->ctx) : -1.0f;
         st->n_pending = 1;
         cur_tok = draft;
         cur_hc = multi_out;
@@ -467,6 +511,12 @@ static int mtp_draft_chain(ds4_qwen4exp_mtp_state *st,
     }
 
     for (; k < st->depth; k++) {
+        /* The margin gate's chain half: nothing past an unsure link. */
+        if (k > 0 && st->stop_margin > 0.0f &&
+            st->pending_margin[k - 1] >= 0.0f &&
+            st->pending_margin[k - 1] < st->stop_margin) {
+            break;
+        }
         /* The last step's `multi` row would have no reader. */
         float *multi_out = (k + 1 < st->depth)
                          ? ping + (size_t)(k & 1) * st->hc_dim : NULL;
@@ -478,6 +528,8 @@ static int mtp_draft_chain(ds4_qwen4exp_mtp_state *st,
                             "position %u failed", k, cur_tok, p);
         }
         st->pending[k] = draft;
+        st->pending_margin[k] = model->draft_margin
+            ? model->draft_margin(model->ctx) : -1.0f;
         st->n_pending = k + 1;
         cur_tok = draft;
         cur_hc = multi_out;
@@ -565,9 +617,27 @@ int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
     int n = st->n_pending;
     if (n > budget - 1) n = budget - 1;
     if (n > accepted_cap - 1) n = accepted_cap - 1;
+    const int n_offered = n > 0 ? n : 0;
+    float offered_margin[DS4_QWEN4EXP_IMPLEMENTED_DEPTH];
+    for (int k = 0; k < n_offered; k++) offered_margin[k] = st->pending_margin[k];
+    const uint64_t log_verify0 = st->counters.verify_ns;
+    const uint64_t log_draft0 = st->counters.draft_ns;
+    /* The margin gate's verify half: leave out trailing drafts the head was
+     * unsure of.  With none left the round is the plain one-row decode. */
+    if (st->drop_margin > 0.0f) {
+        while (n > st->drop_keep && offered_margin[n - 1] >= 0.0f &&
+               offered_margin[n - 1] < st->drop_margin) {
+            n--;
+        }
+    }
     if (n < 1 || st->depth < 1) {
-        return mtp_commit_one(st, model, first_token, pos,
-                              accepted, logits, NULL, err, errlen);
+        const int rc = mtp_commit_one(st, model, first_token, pos,
+                                      accepted, logits, NULL, err, errlen);
+        if (rc > 0 && st->margin_log) {
+            mtp_margin_log(st, n_offered, 0, 0, offered_margin,
+                           log_verify0, log_draft0);
+        }
+        return rc;
     }
 
     const ds4_qwen4exp_rollback_set *rollback = st->rollback;
@@ -668,6 +738,10 @@ int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
                 (uint32_t)compact_frontier_top1 < st->n_vocab;
             st->frontier_logits_deferred = defer_frontier;
         }
+        if (st->margin_log) {
+            mtp_margin_log(st, n_offered, n, a, offered_margin,
+                           log_verify0, log_draft0);
+        }
         return n + 1;
     }
 
@@ -708,6 +782,10 @@ int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
         st->frontier_top1_valid = compact_frontier_top1 >= 0 &&
             (uint32_t)compact_frontier_top1 < st->n_vocab;
         st->frontier_logits_deferred = defer_frontier;
+    }
+    if (st->margin_log) {
+        mtp_margin_log(st, n_offered, n, a, offered_margin,
+                       log_verify0, log_draft0);
     }
     return a + 1;
 }
@@ -1268,6 +1346,34 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                                  (uint64_t)out_rows * sizeof(uint32_t)) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_TOP1_IN);
+    /* The margin gate's measurement: top-1 minus runner-up over the refined
+     * candidate logits the screen left in t_logits.  It reads after the top-1
+     * readback, so it adds no synchronisation and changes no token. */
+    h->last_margin = -1.0f;
+    enum { MTP_MARGIN_MAX_WIDTH = 4096 };
+    if (ok && h->want_margin && screened && out_rows == 1u &&
+        draft_width <= MTP_MARGIN_MAX_WIDTH) {
+        float row[MTP_MARGIN_MAX_WIDTH];
+        if (ds4_gpu_tensor_read(h->t_logits,
+                                (uint64_t)logit_first * draft_width * f, row,
+                                (uint64_t)draft_width * f) != 0) {
+            bool have0 = false, have1 = false;
+            float v0 = 0.0f, v1 = 0.0f;
+            for (uint32_t i = 0; i < draft_width; i++) {
+                const float v = row[i];
+                if (!(v == v) || v > 3.0e38f || v < -3.0e38f) continue;
+                if (!have0 || v > v0) {
+                    if (have0) { v1 = v0; have1 = true; }
+                    v0 = v;
+                    have0 = true;
+                } else if (!have1 || v > v1) {
+                    v1 = v;
+                    have1 = true;
+                }
+            }
+            if (have1) h->last_margin = v0 - v1;
+        }
+    }
     if (ok && !screened) {
         stage = "logit-0 readback";
         for (uint32_t t = 0; ok && t < out_rows; t++) {

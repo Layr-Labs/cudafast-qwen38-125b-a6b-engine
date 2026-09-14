@@ -1418,6 +1418,9 @@ mod ds4 {
         quench_at_cycle: Option<u64>,
         invalidated: u64,
         log: Vec<String>,
+        /// Offer `spec_run`: run the whole free run in one call, cycle by cycle
+        /// through this script's own `eval_speculative`, as the resident does.
+        batched_run: bool,
     }
 
     impl Scripted {
@@ -1486,6 +1489,28 @@ mod ds4 {
                 quenches: self.quenches,
                 verify_replay_disagreements: self.disagreements,
             }
+        }
+        fn spec_run(
+            &mut self,
+            first_token: i64,
+            count: i64,
+        ) -> Option<Result<Vec<crate::ds4_backend::SpecRound>, String>> {
+            if !self.batched_run {
+                return None;
+            }
+            self.log.push(format!("spec_run({first_token},{count})"));
+            let (mut rounds, mut pending, mut produced) = (Vec::new(), first_token, 0i64);
+            while produced < count {
+                let committed = match self.eval_speculative(pending, count - produced) {
+                    Ok(committed) => committed,
+                    Err(err) => return Some(Err(err)),
+                };
+                let frontier = self.frontier();
+                produced += committed.len() as i64;
+                pending = frontier;
+                rounds.push(crate::ds4_backend::SpecRound { committed, frontier });
+            }
+            Some(Ok(rounds))
         }
         fn invalidate(&mut self) {
             self.invalidated += 1;
@@ -1663,6 +1688,55 @@ mod ds4 {
         m.free_decode_begin(&[7, 8], Route::Mtp, None).unwrap();
         let mtp_tokens = m.free_decode_run(7).unwrap().tokens;
         assert_eq!(serial_tokens, mtp_tokens);
+    }
+
+    #[test]
+    fn a_batched_mtp_run_commits_what_the_per_cycle_run_commits() {
+        // THE SAME RUN, TWO DRIVES. A session that takes the whole free run in
+        // one call must leave the adapter with exactly the tokens, acceptance
+        // lengths and counters the one-cycle-per-call drive produces, and must
+        // be asked once.
+        let script = || Scripted {
+            mtp_armed: true,
+            reject_cycles: vec![2, 5],
+            disagree_cycles: vec![5],
+            ..Default::default()
+        };
+        let per_cycle = Arc::new(Mutex::new(script()));
+        let mut a = engine(&per_cycle);
+        a.free_decode_begin(&[1, 2, 3], Route::Mtp, Some(1)).unwrap();
+        let ra = a.free_decode_run(9).unwrap();
+
+        let batched = Arc::new(Mutex::new(Scripted {
+            batched_run: true,
+            ..script()
+        }));
+        let mut b = engine(&batched);
+        b.free_decode_begin(&[1, 2, 3], Route::Mtp, Some(1)).unwrap();
+        let rb = b.free_decode_run(9).unwrap();
+
+        assert_eq!(ra.tokens, rb.tokens);
+        assert_eq!(ra.acceptance_lengths, rb.acceptance_lengths);
+        assert_eq!(
+            (
+                ra.committed_total,
+                ra.drafted_total,
+                ra.accepted_total,
+                ra.verify_replay_disagreements
+            ),
+            (
+                rb.committed_total,
+                rb.drafted_total,
+                rb.accepted_total,
+                rb.verify_replay_disagreements
+            )
+        );
+        let log = batched.lock().unwrap().log.clone();
+        assert_eq!(
+            log.iter().filter(|l| l.starts_with("spec_run(")).count(),
+            1,
+            "{log:?}"
+        );
     }
 
     #[test]
@@ -1943,7 +2017,7 @@ mod resident {
 
     use serde_json::{json, Value};
 
-    use crate::ds4_backend::{Ds4Session, SpecCounters};
+    use crate::ds4_backend::{Ds4Session, SpecCounters, SpecRound};
     use crate::resident::ResidentSession;
 
     /// A scripted resident: answers every request from `replies` keyed by op,
@@ -2124,6 +2198,88 @@ mod resident {
         assert_eq!(seen[3]["k"], 8);
         assert_eq!(seen[4]["first_token"], 40);
         assert_eq!(seen[4]["budget"], 4);
+    }
+
+    /// A resident that offers `spec_run` in its hello takes the whole free run
+    /// in ONE request, and every round, frontier and the final frontier cross
+    /// the socket.
+    #[test]
+    fn a_resident_that_offers_spec_run_takes_the_run_in_one_request() {
+        fn batched(request: &Value) -> Value {
+            match request["op"].as_str().unwrap_or("") {
+                "hello" => {
+                    let mut hello = scripted(request);
+                    hello["spec_run"] = json!(true);
+                    hello
+                }
+                "spec_run" => json!({
+                    "ok": true, "rounds": [[40], [41, 42]], "frontiers": [41, 43], "token": 43
+                }),
+                _ => scripted(request),
+            }
+        }
+        let server = Server::start(batched);
+        let mut session = server.connect();
+        assert!(session.hello().spec_run);
+        let rounds = session
+            .spec_run(40, 3)
+            .expect("the resident offered spec_run")
+            .unwrap();
+        assert_eq!(
+            rounds,
+            vec![
+                SpecRound {
+                    committed: vec![40],
+                    frontier: 41
+                },
+                SpecRound {
+                    committed: vec![41, 42],
+                    frontier: 43
+                },
+            ]
+        );
+        assert_eq!(session.argmax(), 43, "the run's frontier comes back with it");
+        drop(session);
+        let seen = server.finish();
+        let ops: Vec<&str> = seen.iter().map(|r| r["op"].as_str().unwrap()).collect();
+        assert_eq!(ops, vec!["hello", "spec_run", "bye"]);
+        assert_eq!(seen[1]["first_token"], 40);
+        assert_eq!(seen[1]["count"], 3);
+    }
+
+    /// A resident whose hello says nothing about `spec_run` is driven one cycle
+    /// per request, exactly as before.
+    #[test]
+    fn a_resident_that_does_not_offer_spec_run_is_driven_per_cycle() {
+        let server = Server::start(scripted);
+        let mut session = server.connect();
+        assert!(!session.hello().spec_run);
+        assert!(session.spec_run(40, 3).is_none());
+        drop(session);
+        assert_eq!(server.finish().len(), 2, "hello and bye only");
+    }
+
+    /// A reply whose last round's frontier is not the frontier it hands back is
+    /// refused rather than assembled.
+    #[test]
+    fn a_spec_run_reply_with_a_mismatched_frontier_is_refused() {
+        fn broken(request: &Value) -> Value {
+            match request["op"].as_str().unwrap_or("") {
+                "hello" => {
+                    let mut hello = scripted(request);
+                    hello["spec_run"] = json!(true);
+                    hello
+                }
+                "spec_run" => json!({"ok": true, "rounds": [[40]], "frontiers": [41], "token": 44}),
+                _ => scripted(request),
+            }
+        }
+        let server = Server::start(broken);
+        let mut session = server.connect();
+        let err = session.spec_run(40, 1).unwrap().unwrap_err();
+        assert!(err.contains("frontier"), "{err}");
+        drop(session);
+        server.finish();
     }
 
     /// ONE ROUND TRIP PER DECODED TOKEN. `free_decode_run`'s serial loop is
