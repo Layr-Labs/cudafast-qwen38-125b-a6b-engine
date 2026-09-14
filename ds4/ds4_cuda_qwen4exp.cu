@@ -2764,8 +2764,9 @@ __global__ static void qwen4exp_moe_zero_invalid_kernel(
  * The live shapes want 2 * 5,440 = 10,880 bytes (q8_0) or 2 * 3,840 = 7,680
  * (q5_1); the cap exists so an unexpected slab geometry falls back to the
  * direct path instead of failing to launch. */
-/* Four eight-row panels: two slot buffers (double buffering) x R == 2 tokens. */
-#define QW_DOWN_PANEL_MAX_BYTES 32768u
+/* Two eight-row panels: the (slot, token) step sequence is double buffered at
+ * token-panel granularity, so two live buffers suffice. */
+#define QW_DOWN_PANEL_MAX_BYTES 16384u
 
 /* The pipeline gives every thread exactly one slot of each tile per chunk,
  * which is what makes the one-chunk-deep register prefetch enough. */
@@ -3920,6 +3921,51 @@ __device__ __forceinline__ static void qw_gu_coop_raw_load(
 }
 /* ======================================================================== */
 
+/* NO __launch_bounds__ here, and that is a measured decision.
+ *
+ * A probe shipped in `ec7bb97f` published `gu[reg=40 smem=23168 lmem=0
+ * maxt=1024]` for the production Coop instantiation through
+ * officialMetrics.engine_backend.  Forty registers at 512 threads is 20,480 per
+ * block, so a 65,536-register file admits 3 blocks: 48 of the 64 warps an SM
+ * can hold.  (My earlier claim that this kernel ran at 64 warps/SM was derived
+ * from the shared-memory number alone and is wrong -- 23,168 B against a
+ * 101,376 B opt-in would allow four blocks; registers are what bind.)
+ *
+ * `fd1cafd2` then asked for the fourth block with
+ * __launch_bounds__(OutputRows * 64u, Coop ? 4 : 1), 32 registers being the
+ * exact threshold (4 x 16 warps x 32 lanes x 32 = 65,536).  ptxas did the
+ * OPPOSITE: it reported `gu[reg=60 smem=23168 lmem=0 maxt=512]`.  Lowering
+ * maxThreadsPerBlock from the default 1024 to 512 doubled the per-thread
+ * register ceiling, ptxas took 60 without spilling, and the
+ * minBlocksPerMultiprocessor request was silently not honoured -- 60 x 512 =
+ * 30,720, i.e. 2 blocks and 32 warps, DOWN from 48.
+ *
+ * The number that came back with it is the useful part: losing a third of the
+ * residency cost only 1.13% of the decode leg (0.029984 s/token on spark-8
+ * against 0.029556 on spark-4, normalised by each box's calibration mean).  A
+ * kernel that barely notices 48 -> 32 warps is not occupancy-bound.
+ *
+ * The group loop's WIDTH is then closed on both sides, measured:
+ *   - `ec7bb97f` took the Coop path from 2 chains in flight to 1: -11% decode.
+ *   - `2fc5a06d` took it from 2 to 3 (a third raw[8], `gu[reg=56 lmem=0]`,
+ *     2 blocks/SM): -0.76% decode.  Net of the ~1.1% residency that third
+ *     buffer costs, the extra chain is worth only about +0.4%.
+ * So two chains is the optimum: the 1 -> 2 step is worth an order of magnitude
+ * more than 2 -> 3, and neither wider nor narrower pays.  Do not revisit.
+ *
+ * The remaining 48 -> 64 warps here would need 32 registers, which is exactly
+ * the eight `raw1[8]` holds, and `ec7bb97f` already measured that trade at
+ * -11%.  The down kernel was register-capped at 40 warps too, and `7daa6e85`
+ * measured its 5 -> 4 blocks at -0.04%: a wash.  Routed-MoE occupancy is
+ * closed on both kernels.
+ *
+ * CAVEAT on every number in this comment: `7daa6e85` changed nothing in this
+ * kernel and still reported `gu[reg=47]`, against 40 for byte-identical source
+ * in `ec7bb97f`.  ptxas re-allocates a kernel's registers when an unrelated
+ * kernel in the same translation unit changes, so a register count is only
+ * meaningful within one compilation and no sub-1% score delta in this file is
+ * cleanly attributable.  The -11% result is the only one large enough to
+ * survive that; treat the rest as bounding the class at about +/-1%. */
 template <int R, int Type, bool Vector = false,
           unsigned OutputRows = 4, bool Coop = false>
 __global__ static void qwen4exp_moe_gateup_split_kernel(
@@ -4268,12 +4314,36 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
  *     still folds through the same warp_sum_f32 tree in the same order, so
  *     every partial sum is the same float added in the same sequence.
  *
- * Barrier safety.  Both barriers are reached by every lane of the block: the
- * kernel's only early return tests row >= out_dim and tok0 >= n_tokens, both of
- * which are block-uniform once out_dim % 8 == 0, which the host requires before
- * selecting this arm.  The `continue` for an out-of-range expert is
- * block-uniform for the same reason the expert is.  The staged path is refused
- * rather than truncated when it cannot hold the panel. */
+ * Barrier safety.  The one barrier per (slot, token) step is reached by every
+ * lane of the block: the kernel's only early return tests row >= out_dim and
+ * tok0 >= n_tokens, both of which are block-uniform once out_dim % 8 == 0,
+ * which the host requires before selecting this arm, and `take` is
+ * block-uniform for the same reason, so the step count is too.  The `continue`
+ * for an out-of-range expert is block-uniform for the same reason the expert
+ * is, and it sits below the barrier.  Both panel bases stay 16-byte aligned:
+ * the second buffer is at spanel + panel_bytes, and panel_bytes is 8 *
+ * down_row_bytes, which the host checks is a multiple of 16.  The staged path
+ * is refused rather than truncated when it cannot hold the panels. */
+/* NO __launch_bounds__ here, and that is measured too.
+ *
+ * The probe at the end of this file published `dn[reg=48 smem=0 lmem=0
+ * maxt=1024]` in `ec7bb97f`.  (`smem=0` is not a bug: the panel is *dynamic*
+ * shared memory, which cudaFuncGetAttributes does not count.)  Forty-eight
+ * registers at the 256 threads this kernel is always launched with is 12,288
+ * per block, so a 65,536-register file holds only 5 blocks: 40 of the 64 warps
+ * an SM can carry, while the 10,880 B panel would allow nine.  Registers, not
+ * shared memory, bind this kernel -- so the shared-memory arithmetic it has
+ * been tuned by was reading the wrong constraint.
+ *
+ * `7daa6e85` tried to cap it at 32 registers with __launch_bounds__(1024, 2),
+ * the spelling that does NOT relax the ceiling (65,536/(1024 x 2) = 32, and
+ * 1024 is the default maxThreadsPerBlock as well as >= the 256 launched).
+ * ptxas went the other way again: `dn[reg=56 lmem=0 maxt=1024]`, 4 blocks/SM
+ * instead of 5.  minBlocksPerMultiprocessor is advisory even when nothing is
+ * relaxed.  Decode moved -0.04%: a wash, which also says 4 blocks vs 5 is worth
+ * almost nothing here and that residency is not this kernel's constraint
+ * either.  If registers ever need to come down, it has to be by removing live
+ * state at source. */
 template <int R, int DownType = -1, bool Vector = false, bool Stage = false>
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
@@ -4315,54 +4385,78 @@ __global__ static void qwen4exp_moe_down_q_kernel(
 #pragma unroll
     for (int r = 0; r < R; r++) acc[r] = 0.0f;
 
-    /* Double-buffered staging.  The base tree pays one barrier pair per slot:
-     * one to wait out the previous slot's readers, one to publish its own
-     * fill.  With two slot buffers the fill for slot+1 goes into the buffer
-     * that slot-1's compute was using, and slot-1's readers are provably done
-     * because every lane passed the barrier at the top of this iteration.
-     * That leaves exactly one barrier per slot, halving the count, and the
-     * fill now overlaps the current slot's dp4a instead of preceding it.
-     * Barrier cost is the same on every box, so this is not a request-shape
-     * bet: it is a strict reduction in synchronisation for the same bytes.
-     * Reached by every lane -- the early return above is block-uniform under
-     * the host's guards, and `Stage` is a compile-time constant. */
-    const uint64_t slot_bytes = (uint64_t)R * panel_bytes;
-    auto qw_fill_slot = [&](uint32_t s, char *const dst) {
+    /* Double buffering at TOKEN-PANEL granularity rather than slot
+     * granularity.  The two tokens route to different experts, so a slot's
+     * two panels are two independent fills that two independent stretches of
+     * compute consume; nothing requires them to be resident at the same time.
+     * Treating (slot, token) as one flat step sequence therefore buys the
+     * property that matters -- a fill that is in flight across the preceding
+     * step's dp4a rather than serialised in front of it -- while keeping only
+     * TWO panels live instead of four.
+     *
+     * Be precise about the barrier count: this is one barrier per step and
+     * twenty steps, so twenty per block per layer, exactly what the two-per-
+     * slot schedule cost.  The saving claimed here is NOT synchronisation
+     * count.  It is that each barrier now separates a fill from the PRECEDING
+     * step's compute instead of bracketing a fill that nothing overlaps, so
+     * the copy latency is hidden rather than exposed.
+     *
+     * The footprint is the other half.  Four panels is 21,760 B, which caps
+     * this kernel at floor(100 KB / 21,760) = 4 blocks of 8 warps = 32
+     * warps/SM.  Two panels is 10,880 B, where the 64-warp ceiling binds
+     * first and the kernel runs 8 blocks = 64 warps/SM, twice the latency
+     * hiding, and it is the same shared-memory map the pre-double-buffer tree
+     * used: buffer 0 is token 0's panel, buffer 1 is token 1's, because at
+     * take == 2 the step parity reduces to r.
+     *
+     * Hazard: buffer (step+1) & 1 is the buffer step-1 read, and every lane
+     * passed the barrier at the top of this step, which is after step-1's
+     * last read.  The prologue fill needs no barrier: it is the block's first
+     * touch of its own dynamic shared memory.
+     *
+     * Accumulation order is untouched.  `step` is computed from slot and r
+     * rather than incremented, so an out-of-range expert cannot desynchronise
+     * the parity from the fill sequence, and acc[r] still absorbs slots 0..
+     * n_expert_used-1 in ascending order for each token. */
+    auto qw_fill_step = [&](uint32_t slot, uint32_t rr, char *const dst) {
 #pragma unroll
         for (int r = 0; r < R; r++) {
-            if ((uint32_t)r < take) {
-                const int32_t e = __shfl_sync(0xffffffffu, route[r], s);
-                if (e < 0 || (uint32_t)e >= n_total_expert) continue;
+            if ((uint32_t)r == rr) {
+                const int32_t e = __shfl_sync(0xffffffffu, route[r], slot);
+                if (e < 0 || (uint32_t)e >= n_total_expert) return;
                 const char *const gp = down +
                     (uint64_t)(uint32_t)e * down_expert_bytes +
                     (uint64_t)row0 * down_row_bytes;
-                char *const sp = dst + (uint64_t)r * panel_bytes;
                 for (uint64_t o = (uint64_t)threadIdx.x * 16u;
                      o < panel_bytes; o += (uint64_t)blockDim.x * 16u) {
-                    *(uint4 *)(sp + o) = *(const uint4 *)(gp + o);
+                    *(uint4 *)(dst + o) = *(const uint4 *)(gp + o);
                 }
             }
         }
     };
-    if (Stage) qw_fill_slot(0u, spanel);
+    if (Stage) qw_fill_step(0u, 0u, spanel);
     for (uint32_t slot = 0; slot < n_expert_used; slot++) {
-        if (Stage) {
-            __syncthreads();
-            if (slot + 1u < n_expert_used) {
-                qw_fill_slot(slot + 1u,
-                             spanel + (uint64_t)((slot + 1u) & 1u) * slot_bytes);
-            }
-        }
 #pragma unroll
         for (int r = 0; r < R; r++) {
             if ((uint32_t)r < take) {
+                const uint32_t step = slot * take + (uint32_t)r;
+                if (Stage) {
+                    __syncthreads();
+                    const uint32_t nr =
+                        (uint32_t)r + 1u < take ? (uint32_t)r + 1u : 0u;
+                    const uint32_t nslot =
+                        (uint32_t)r + 1u < take ? slot : slot + 1u;
+                    if (nslot < n_expert_used) {
+                        qw_fill_step(nslot, nr, spanel +
+                                     (uint64_t)((step + 1u) & 1u) * panel_bytes);
+                    }
+                }
                 const uint32_t t = tok0 + (uint32_t)r;
                 const int32_t e = Vector ? __shfl_sync(0xffffffffu, route[r], slot)
                     : selected[(uint64_t)t * n_expert_used + slot];
                 if (e < 0 || (uint32_t)e >= n_total_expert) continue;
                 const char *const drow = Stage
-                    ? spanel + (uint64_t)(slot & 1u) * slot_bytes +
-                      (uint64_t)r * panel_bytes +
+                    ? spanel + (uint64_t)(step & 1u) * panel_bytes +
                       (uint64_t)(row - row0) * down_row_bytes
                     : down + (uint64_t)(uint32_t)e * down_expert_bytes +
                       (uint64_t)row * down_row_bytes;
@@ -7017,10 +7111,11 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
          * and its uint4 copy rely on is checked here, once, before the launch;
          * DS4_QWEN4EXP_NO_DOWN_PANEL stands the whole thing down. */
         const uint64_t dn_panel = (uint64_t)8u * down_slab->row_bytes;
-        /* Two slot buffers in flight, each R == 2 token panels wide, so the
-         * per-slot barrier no longer has to wait for the previous slot's
-         * readers before the next fill starts. */
-        const uint64_t dn_shared = 4u * dn_panel;
+        /* Two single-token panels: the flat (slot, token) step sequence needs
+         * exactly two live buffers to overlap a fill with the preceding
+         * step's compute, which is half what slot-level double buffering
+         * needed and keeps the kernel at 64 warps/SM. */
+        const uint64_t dn_shared = 2u * dn_panel;
         const int dn_stage =
             (out_dim % 8u) == 0u &&
             (dn_panel % 16u) == 0u &&
@@ -12730,4 +12825,91 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_tensor(
     return ds4_gpu_qwen4exp_shared_expert_preq_tensor(
             out, mid, gate_scale, router_slab, gate_slab, up_slab, down_slab,
             in_dim, mid_dim, out_dim, x, n_tokens, 0);
+}
+
+/* Occupancy introspection for the two routed-MoE decode kernels.
+ *
+ * Every Qwen4-Exp kernel is `static` in this translation unit, so its address
+ * cannot be taken from ds4_cuda.cu; this reports from inside.  The result is
+ * appended to ds4_gpu_hw_limits() and reaches officialMetrics.engine_backend,
+ * which is published whether or not the submission is accepted.
+ *
+ * Three runs of this probe so far:
+ *   ec7bb97f  gu[reg=40 smem=23168 lmem=0 maxt=1024] dn[reg=48 smem=0 lmem=0 maxt=1024]
+ *   fd1cafd2  gu[reg=60 smem=23168 lmem=0 maxt=512]  dn[reg=48 smem=0 lmem=0 maxt=1024]
+ *   2fc5a06d  gu[reg=56 smem=23168 lmem=0 maxt=1024] dn[reg=48 smem=0 lmem=0 maxt=1024]
+ * fd1cafd2 carried __launch_bounds__(512, 4) on gate/up and is why no bound
+ * sits there now: ptxas read the lowered maxThreadsPerBlock as licence to
+ * allocate MORE registers (60, no spill) and treated the block request as
+ * advisory, moving the kernel from 3 blocks/SM to 2.  2fc5a06d carried a third
+ * group in flight, which cost 16 registers for +0.4% of chain throughput
+ * against -1.1% of residency.  Neither would have been interpretable without
+ * `reg` being read back here.
+ *
+ *   7daa6e85  gu[reg=47 smem=23168 lmem=0 maxt=1024] dn[reg=56 smem=0 lmem=0 maxt=1024]
+ * The fourth is the most useful of the four, for a reason that has nothing to do
+ * with its diff.  It capped the DOWN kernel at 32 registers with
+ * __launch_bounds__(1024, 2) -- the spelling that relaxes nothing -- and ptxas
+ * again went the other way, to 56.  But `gu[reg]` moved to 47 with the gate/up
+ * source byte-identical to `3054d84b`, so **ptxas re-allocates a kernel's
+ * registers when an unrelated kernel in the same translation unit changes.**
+ * Across four runs the same unchanged gate/up source reported 40, 60, 56, 47.
+ *
+ * That is what the probe is really for now: a register count is only meaningful
+ * within one compilation, so no occupancy conclusion in this file can be drawn
+ * from a sub-1% score delta.  This run carries no functional change at all --
+ * it re-reads the baseline pair so the drift itself has a clean sample. */
+ *
+ * `dn[smem=0]` is not a bug: the down kernel's panel is *dynamic* shared
+ * memory, which cudaFuncAttributes does not count.  Its 48 registers at 256
+ * threads is 12,288 per block, so registers cap it at 5 blocks/SM = 40 warps --
+ * below the 8 blocks its 10,880 B dynamic footprint would permit, which is a
+ * second thing worth knowing and was not knowable before.
+ *
+ * Only cudaFuncGetAttributes is used -- it already appears in ds4_cuda.cu --
+ * and only long-stable fields of cudaFuncAttributes are read.  Every failure is
+ * swallowed and reported as -1; the function never touches device state and is
+ * called once, off the timed path. */
+extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
+    static char buf[192];
+    static int built = 0;
+    if (built) return buf;
+    built = 1;
+    buf[0] = '\0';
+
+    int gu_regs = -1, gu_smem = -1, gu_lmem = -1, gu_maxt = -1;
+    int dn_regs = -1, dn_smem = -1, dn_lmem = -1, dn_maxt = -1;
+
+    cudaFuncAttributes a;
+    if (cudaFuncGetAttributes(
+            &a,
+            qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, true,
+                                             QW_GU_COOP_ROWS, true>) ==
+        cudaSuccess) {
+        gu_regs = a.numRegs;
+        gu_smem = (int)a.sharedSizeBytes;
+        gu_lmem = (int)a.localSizeBytes;
+        gu_maxt = a.maxThreadsPerBlock;
+    } else {
+        (void)cudaGetLastError();
+    }
+
+    if (cudaFuncGetAttributes(
+            &a,
+            qwen4exp_moe_down_q_kernel<2, DS4_QWEN4EXP_TY_q8_0, true, true>) ==
+        cudaSuccess) {
+        dn_regs = a.numRegs;
+        dn_smem = (int)a.sharedSizeBytes;
+        dn_lmem = (int)a.localSizeBytes;
+        dn_maxt = a.maxThreadsPerBlock;
+    } else {
+        (void)cudaGetLastError();
+    }
+
+    snprintf(buf, sizeof(buf),
+             "gu[reg=%d smem=%d lmem=%d maxt=%d] dn[reg=%d smem=%d lmem=%d "
+             "maxt=%d]",
+             gu_regs, gu_smem, gu_lmem, gu_maxt,
+             dn_regs, dn_smem, dn_lmem, dn_maxt);
+    return buf;
 }

@@ -634,4 +634,18 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
                                    uint32_t layer_start, uint32_t layer_end,
                                    char *err, size_t errlen);
 
+/* A one-line, allocation-free description of the CUDA device's OCCUPANCY and
+ * BANDWIDTH limits, built once on first call and cached.  Never NULL; returns
+ * the empty string when there is no CUDA device (including a -DDS4_NO_GPU
+ * build), so a caller can append it unconditionally.
+ *
+ * This exists because the scored path publishes the engine identity into the
+ * run's public metrics blob, and the two numbers that decide whether a decode
+ * kernel is shared-memory-capped or bandwidth-capped -- shared memory per SM
+ * and peak DRAM bandwidth -- are otherwise unobservable from a box with no
+ * profiler.  It reads device properties only: no kernel launch, no
+ * allocation, and it is called once before the resident binds its socket, so
+ * it is outside every timed phase and cannot perturb a measurement. */
+const char *ds4_gpu_hw_limits(void);
+
 #endif
