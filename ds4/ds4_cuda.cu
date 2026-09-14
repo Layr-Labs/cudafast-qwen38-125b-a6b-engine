@@ -17334,7 +17334,7 @@ extern "C" const char *ds4_gpu_hw_limits(void) {
      * ds4_resident drops the WHOLE limits string rather than truncating it if it
      * does not fit its own ident buffer, so a tight fit here loses the
      * measurement silently. */
-    static char buf[448];
+    static char buf[896];
     static int built = 0;
     if (built) return buf;
     built = 1;
@@ -17344,16 +17344,36 @@ extern "C" const char *ds4_gpu_hw_limits(void) {
         (void)cudaGetLastError();
         return buf;
     }
-    const cudaDeviceAttr want[6] = {
+    /* The last three are new and they decide whether the routed gate/up
+     * occupancy axis is open at all.  `__maxnreg__(32)` capped that kernel to 32
+     * registers with ZERO spill and occupancy STILL reported 3 blocks/SM, even
+     * though 4 x 32 x 512 = 65,536 is exactly the register file.  Two candidate
+     * explanations, and they have opposite consequences:
+     *
+     *   - threads/SM is 1536, so 1536 / 512 = 3 blocks is a HARD ceiling and no
+     *     register cap can ever buy a fourth.  The axis is closed by arithmetic,
+     *     and the +0.775% of decode that 40 -> 32 delivered came from register
+     *     pressure alone at constant residency.
+     *   - threads/SM is 2048 and the exact-fit 65,536 simply failed because the
+     *     SM does not hand out 100% of its register file.  Then a fourth block
+     *     is still reachable below 32.
+     *
+     * regs/SM is read for the same reason: every occupancy figure in this file
+     * has assumed 65,536, and that assumption has never once been checked
+     * against the device. */
+    const cudaDeviceAttr want[9] = {
         cudaDevAttrMaxSharedMemoryPerBlockOptin,
         cudaDevAttrMultiProcessorCount,
         cudaDevAttrComputeCapabilityMajor,
         cudaDevAttrComputeCapabilityMinor,
         cudaDevAttrIntegrated,
         cudaDevAttrCooperativeLaunch,
+        cudaDevAttrMaxThreadsPerMultiProcessor,
+        cudaDevAttrMaxBlocksPerMultiprocessor,
+        cudaDevAttrMaxRegistersPerMultiprocessor,
     };
-    int got[6];
-    for (int i = 0; i < 6; i++) {
+    int got[9];
+    for (int i = 0; i < 9; i++) {
         got[i] = -1;
         if (cudaDeviceGetAttribute(&got[i], want[i], dev) != cudaSuccess) {
             (void)cudaGetLastError();
@@ -17361,15 +17381,100 @@ extern "C" const char *ds4_gpu_hw_limits(void) {
         }
     }
     int n = snprintf(buf, sizeof(buf),
-                     "smem/blk_optin=%d sm=%d cc=%d.%d integrated=%d coop=%d",
-                     got[0], got[1], got[2], got[3], got[4], got[5]);
+                     "smem/blk_optin=%d sm=%d cc=%d.%d integrated=%d coop=%d "
+                     "thr/sm=%d blk/sm=%d reg/sm=%d",
+                     got[0], got[1], got[2], got[3], got[4], got[5],
+                     got[6], got[7], got[8]);
     if (n < 0) { buf[0] = '\0'; return buf; }
     /* The register/shared footprint of the two routed-MoE decode kernels, from
      * the translation unit that owns them.  Truncation is harmless: the string
      * is diagnostic only and snprintf keeps it terminated. */
     const char *kl = ds4_gpu_qwen4exp_kernel_limits();
     if (kl && kl[0] && (size_t)n + 2u < sizeof(buf)) {
-        snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", kl);
+        n += snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", kl);
+        if (n < 0 || (size_t)n >= sizeof(buf)) return buf;
+    }
+
+    /* ---- THE DENSE PROJECTIONS, read here for the FIRST TIME ----
+     *
+     * Every kernel measured so far -- routed gate/up, routed down, GDN octet,
+     * both prefill MoE tiles -- belongs to the routed MoE or to attention.  The
+     * decode traffic map puts the dense projections at ~1,700 MB of a ~6.58 GB
+     * round, **~26%**, and no note on this board has ever measured them.  They
+     * are the largest unprofiled term left on the leg that carries 0.75 of the
+     * composite.
+     *
+     * Why a probe rather than an arm, and why now.  The register/occupancy class
+     * that produced the current #1 is exhausted in both directions: routed
+     * gate/up has a measured optimum at 32 with residency hard-capped at 3 by
+     * thr/sm=1536; routed down loses 10.2% to REMATERIALIZATION at 40 even with
+     * lmem=0 and 100% thread occupancy; the GDN octet kernel already carries a
+     * deliberately tuned __launch_bounds__(128, 4) whose 128-register ceiling is
+     * exactly what ptxas honours at 126; and both prefill tiles sit at their
+     * ceilings.  So there is no arm left to guess at here, and a tree that only
+     * reverts a regression performs identically to the accepted #1 and can never
+     * clear its own bar.  That makes this draw free to spend on measurement.
+     *
+     * Liveness first, because most q8_0 kernels in this TU are NOT reachable --
+     * three obvious tok2/tok4/tok8 variants sit behind a unit-test-only flag.
+     * The two probed here are reached from live decode dispatch:
+     * `matmul_q8_0_preq_warp8_kernel` is launched at 256 threads from the decode
+     * stream, and `matmul_q8_0_preq_pair_lanes_kernel<2, false>` is the shape
+     * this campaign's own prior arms repeatedly targeted (widening it, uint4
+     * loads, deeper pipelines -- all measured negative), which is itself the
+     * evidence that it is on the hot path.
+     *
+     * Occupancy is reported only for warp8, whose 256-thread launch is read
+     * straight from its dispatch site.  pair_lanes gets attributes only: its
+     * block size varies with R across call sites and a GUESSED block size
+     * returns a confidently wrong occupancy.  Query, do not derive -- three
+     * hand-computed occupancy figures for this engine have already been wrong,
+     * two of them corrected by this very probe.
+     *
+     * What the numbers will decide.  If either kernel is register-bound well
+     * short of thr/sm=1536 threads, its concurrency is limited by allocation
+     * rather than by the algorithm, and it is a candidate for the ONE register
+     * lever that has actually paid (pressure on an instruction-bound kernel with
+     * two independent chains, as on gate/up).  If they are already at or near
+     * the thread ceiling, the dense half is closed on this axis too and the next
+     * lever has to come from load shape instead. */
+    struct cudaFuncAttributes fa;
+    int w8_occ = -1;
+    if (cudaFuncGetAttributes(&fa, matmul_q8_0_preq_warp8_kernel) ==
+        cudaSuccess) {
+        int occ = 0;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &occ, matmul_q8_0_preq_warp8_kernel, 256, 0) == cudaSuccess) {
+            w8_occ = occ;
+        } else {
+            (void)cudaGetLastError();
+        }
+        n += snprintf(buf + n, sizeof(buf) - (size_t)n,
+                      " w8[reg=%d smem=%d lmem=%d maxt=%d occ=%d]",
+                      fa.numRegs, (int)fa.sharedSizeBytes,
+                      (int)fa.localSizeBytes, fa.maxThreadsPerBlock, w8_occ);
+        if (n < 0 || (size_t)n >= sizeof(buf)) return buf;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaFuncGetAttributes(
+            &fa, matmul_q8_0_preq_pair_lanes_kernel<2, false>) == cudaSuccess) {
+        n += snprintf(buf + n, sizeof(buf) - (size_t)n,
+                      " pl2[reg=%d smem=%d lmem=%d maxt=%d]",
+                      fa.numRegs, (int)fa.sharedSizeBytes,
+                      (int)fa.localSizeBytes, fa.maxThreadsPerBlock);
+        if (n < 0 || (size_t)n >= sizeof(buf)) return buf;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaFuncGetAttributes(
+            &fa, matmul_q8_0_preq_pair_lanes_kernel<4, false>) == cudaSuccess) {
+        snprintf(buf + n, sizeof(buf) - (size_t)n,
+                 " pl4[reg=%d smem=%d lmem=%d maxt=%d]",
+                 fa.numRegs, (int)fa.sharedSizeBytes,
+                 (int)fa.localSizeBytes, fa.maxThreadsPerBlock);
+    } else {
+        (void)cudaGetLastError();
     }
     return buf;
 }
