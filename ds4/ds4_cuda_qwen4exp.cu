@@ -12003,8 +12003,56 @@ __device__ __forceinline__ static int32_t qwen4exp_qsa_tile_key(
  * on distinct banks within each quarter warp. */
 #define QWEN4EXP_QSA_SPLIT_KPITCH (QWEN4EXP_QSA_SPLIT_KSTEP * 4u + 4u)
 
+/* A HARD REGISTER CAP on the live decode attention kernel, and the wave
+ * arithmetic that says it should pay.
+ *
+ * WHICH INSTANTIATION IS SCORED. qwen4exp_qsa_split_width returns 2 at one row
+ * and 4 at two or more, so the TWO-ROW VERIFY -- the shape the timed decode
+ * window actually runs, twelve times per forward, once per full-attention
+ * layer -- takes GROUP == 4. Its grid is (n_head / GROUP, max_tiles, n_tokens)
+ * = (24/4, 8, 2) = 96 blocks.
+ *
+ * THE CLIFF. That instantiation ships at 138 registers, and the launch is 256
+ * threads: 138 rounds to 144 at the 8-register granularity, 144 * 256 = 36,864
+ * per block, and a 65,536-register file therefore holds ONE block per SM. With
+ * 48 SMs that is 48 resident blocks against a 96-block grid -- TWO WAVES, the
+ * second of which is exactly as long as the first and does exactly half the
+ * work of a full machine.
+ *
+ *   128 regs * 256 thr = 32,768 -> 65,536 / 32,768 = 2 blocks/SM
+ *   2 * 48 = 96 resident, against a 96-block grid -> ONE WAVE.
+ *
+ * The one-row instantiation (GROUP == 2, 104 registers) is already one wave and
+ * is not what this cap is for; it is unaffected because 104 < 128.
+ *
+ * WHY 138 AND NOT MORE. The only large live state here is the unrolled shared
+ * memory q-vector prefetch (`ld[8]` of float4 = 32 registers). A cap should
+ * shorten that prefetch depth rather than spill, which is the readout below.
+ *
+ * __maxnreg__, not __launch_bounds__. The second argument of __launch_bounds__
+ * is advisory -- this tree has measured it twice taking a kernel's register
+ * count UP rather than down -- and the two attributes may not be combined, so
+ * the cap replaces the bound. Dropping maxThreadsPerBlock is harmless: the
+ * launch is `nth = qwen4exp_cuda_threads(head_dim)` = 256 either way and
+ * residency is pinned by the cap rather than by the hint.
+ *
+ * Exactness: a register cap is an allocation decision. This translation unit is
+ * compiled without --use_fast_math and with -ftz=false -prec-div=true
+ * -prec-sqrt=true, so no contraction or reassociation can follow from it; the
+ * same operations execute in the same order on the same values.
+ *
+ * READOUT, PRE-COMMITTED: if the built library reports LOCAL != 0 for the
+ * GROUP == 4 instantiation, the cap spilled and this is reverted regardless of
+ * the composite. Spilling trades registers for local-memory traffic on the
+ * kernel this is trying to unblock, and LOCAL:0 is the only reading that makes
+ * the wave argument valid. */
+#if defined(__CUDACC__) && CUDART_VERSION >= 12040
+#define QW_QSA_SCORES_ATTR __maxnreg__(128)
+#else
+#define QW_QSA_SCORES_ATTR __launch_bounds__(256, 1)
+#endif
 template <uint32_t GROUP>
-__global__ static void __launch_bounds__(256, 1)
+__global__ static void QW_QSA_SCORES_ATTR
 qwen4exp_qsa_split_scores_kernel(
         const float *q,
         const float *k_cache,
