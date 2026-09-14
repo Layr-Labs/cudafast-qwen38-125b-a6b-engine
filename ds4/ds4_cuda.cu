@@ -5541,6 +5541,20 @@ __global__ static void quantize_q8_0_f32_rows_warp_kernel(int8_t *xq,
     if (n_rows <= DS4_Q8_QUANT_PDL_MAX_ROWS &&
         (n_rows * blocks + 7u) / 8u <= DS4_Q8_QUANT_PDL_MAX_BLOCKS)
         QWEN4EXP_PDL_TRIGGER();
+    /* PDL consumer as well, on the one edge
+     * ds4_gpu_quantize_q8_0_decode_rows_exact_tensor launches PSS (behind the
+     * second valve, ds4_cuda_qwen4exp.cuh): the qwen4exp graph's GDN and QSA
+     * pre-quantize of the mixer's output, whose stream predecessor is the
+     * mixer's closing kernel qwen4exp_hc_mix_inject_dual_kernel, which
+     * triggers at its top.  This kernel stages no weights -- everything it
+     * reads is `x`, the mixer's output -- so the fence sits at the very top,
+     * behind the trigger only (the both-ways rule: the projection's window
+     * opens while this kernel waits), and every load and store below it is
+     * ordered after the mixer's completion.  `x` carries no __restrict__
+     * (the .nc rule).  A no-op in this kernel's plain launches: the dense
+     * entry's own quantize, every other model family, every width past two
+     * rows. */
+    QWEN4EXP_PDL_SYNC();
     const uint64_t pair =
         (uint64_t)blockIdx.x * (blockDim.x >> 5u) + (threadIdx.x >> 5u);
     if (pair >= (uint64_t)n_rows * blocks) return;
@@ -17267,6 +17281,25 @@ int ds4_qwen4exp_pdl_enabled(void) {
     return enabled;
 }
 
+/* The second valve (ds4_cuda_qwen4exp.cuh): the valve above's answer,
+ * additionally off when DS4_QWEN4EXP_NO_PDL_EXTRA is set to a non-zero
+ * value.  The environment is read once, like every other valve here; the
+ * base valve is consulted on every call rather than copied, so its device
+ * check and its retry-on-failed-query rule are inherited.  Unset, both are
+ * on: the ranked box clears the environment.  Capture-safe for the same
+ * reason the base valve is: the answer cannot change after the first read
+ * and a captured graph replays the launches it recorded. */
+int ds4_qwen4exp_pdl_extra_enabled(void) {
+    static int resolved = 0;
+    static int extra = 0;
+    if (!resolved) {
+        const char *e = getenv("DS4_QWEN4EXP_NO_PDL_EXTRA");
+        extra = !(e && e[0] && e[0] != '0');
+        resolved = 1;
+    }
+    return extra && ds4_qwen4exp_pdl_enabled();
+}
+
 /* The pipelined tile (matmul_q8_0_preq_rows_mma_pipe_kernel) serves the
  * prefill widths unless DS4_CUDA_NO_MMA_PIPE is set; the tile above is the
  * fallback and stays the oracle the test holds it against.  Read once; the
@@ -17809,8 +17842,29 @@ extern "C" int ds4_gpu_quantize_q8_0_decode_rows_exact_tensor(
     float *xscale = (float *)((char *)q->ptr + s_offset);
     const uint64_t qpairs = (uint64_t)n_rows * blocks;
     const unsigned qgrid = (unsigned)((qpairs + 7u) / 8u);
-    quantize_q8_0_f32_rows_warp_kernel<<<qgrid, 256, 0, cuda_decode_stream()>>>(
-            xq, xscale, (const float *)x->ptr, in_dim, blocks, n_rows);
+    /* PDL consumer at the decode widths only (n_rows <= 2), behind the second
+     * valve.  This entry is reached from the qwen4exp graph alone
+     * (ds4_qwen4exp_matmul.h: the GDN and QSA pre-quantize of the mixer's
+     * output), where the stream predecessor is the mixer's closing kernel
+     * qwen4exp_hc_mix_inject_dual_kernel -- (mix_blocks + n_hc, rows) =
+     * 14 x 2 blocks at the two-row decode, single-wave -- which triggers at
+     * its top; the kernel's fence sits at its own top
+     * (ds4_cuda_qwen4exp.cuh).  The dense entry
+     * ds4_gpu_matmul_q8_0_decode_rows_exact_tensor above launches this same
+     * kernel and MUST keep its plain launch: that entry is shared with the
+     * PLE key/value projections and with the other model families, whose
+     * predecessors do not trigger, and a PSS consumer behind a producer
+     * that does not trigger measured slower than the plain edge.  Verify
+     * and prefill keep the plain launch. */
+    if (n_rows <= 2u) {
+        QWEN4EXP_LAUNCH_PDL_EXTRA(
+                quantize_q8_0_f32_rows_warp_kernel, qgrid, 256, 0,
+                cuda_decode_stream(),
+                xq, xscale, (const float *)x->ptr, in_dim, blocks, n_rows);
+    } else {
+        quantize_q8_0_f32_rows_warp_kernel<<<qgrid, 256, 0, cuda_decode_stream()>>>(
+                xq, xscale, (const float *)x->ptr, in_dim, blocks, n_rows);
+    }
     return cuda_ok(cudaGetLastError(), "q8_0 decode rows quantize launch");
 }
 
@@ -30641,11 +30695,14 @@ extern "C" int ds4_gpu_glm53_matmul_bf16(
          * and the two decode rows), so the GLM-5.3 callers, the prefill
          * widths and every other shape keep the plain launch below byte for
          * byte.  On that edge the stream predecessor is
-         * qwen4exp_qsa_prep_kv_append_fused_kernel, which triggers at its
-         * top, and the kernel's first K-step weight prefetch rides the
+         * qwen4exp_qsa_prep_joint_kernel (ds4_cuda_qwen4exp.cu: the joint
+         * Part 2 at the decode widths, or Part 1 of the split fallback when
+         * the joint entry declines -- one body, one row-gated trigger at its
+         * top), and the kernel's first K-step weight prefetch rides the
          * window (ds4_cuda_qwen4exp.cuh).  The idx_q projection shares the
-         * entry and the gate; its own predecessor is multi-wave and never
-         * triggers, so the attribute there is inert. */
+         * entry and the gate; its own predecessor is this same matvec on
+         * idx_k, which never triggers, so the attribute there is a plain
+         * edge in disguise. */
         if (n_rows <= 2u && in_dim == 2560u) {
             QWEN4EXP_LAUNCH_PDL(
                     glm53_matvec_bf16_f32_kernel,
