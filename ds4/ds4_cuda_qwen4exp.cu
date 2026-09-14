@@ -2846,8 +2846,10 @@ __device__ __forceinline__ static void qw_q4k_parity_store(
 }
 
 /* The same eight words as two sixteen-byte stores, for the tiles whose row
- * stride keeps every group slot sixteen-byte aligned (GU_LD 144; the
- * 132-byte tile keeps the word form).  uint4 .x .y .z .w are words 0..3 at
+ * stride keeps every group slot sixteen-byte aligned (the gate/up tiles at a
+ * 144-byte row, and the down tiles only when QW_MMA_LD drops to a multiple of
+ * four bytes; the 132-byte tile keeps the word form).  uint4 .x .y .z .w are
+ * words 0..3 at
  * dst in address order -- the argument documented above qw_load_words8 --
  * so the pair writes the same words to the same addresses as the loop form
  * beside it. */
@@ -3045,6 +3047,105 @@ __device__ __forceinline__ static void qw_cpasync_commit(void) {
 __device__ __forceinline__ static void qw_cpasync_wait0(void) {
     asm volatile("cp.async.wait_group 0;\n" ::);
 }
+/* The promoted gate/up staging drains EVERYTHING it has in flight (the form
+ * above); the down tile's staging drains to a depth instead, so the same
+ * instruction needs the count as a literal.  Both are templates because an
+ * `n` constraint has to bind a compile-time constant that no caller can pass
+ * to a plain function. */
+template <int KEEP>
+__device__ __forceinline__ static void qw_cpasync_wait(void) {
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(KEEP));
+}
+/* ========================================================================= */
+
+/* ============ the same DMA staging on the down tile's q5_1 rows ===========
+ * The geometry below is derived from the ACTUAL stored layout, not from the
+ * gate/up numbers.  A q5_1 block is d, m (the two f16 header words) and
+ * qh[4], qs[16] -- 4 + 4 + 4 + 16 = 24 bytes, one 32-element group, with no
+ * super-block structure over it.  So the unit this staging moves is ONE WHOLE
+ * q5_1 block: the decode's scale words AND its payload words come out of the
+ * same contiguous 24-byte object, and a chunk of QW_MMA_G = 4 groups is a
+ * contiguous 96-byte run.  96 = 6 x 16, so exactly six cp.async.ca 16-byte
+ * pieces carry one row-chunk and no piece ever straddles a block or a row --
+ * the run length the brief asks to be chosen is R = 96 bytes = 4 groups.
+ *
+ * What R = 96 buys, and what it does not.  The chunk's four 24-byte blocks
+ * land on piece boundaries at EVEN group numbers only: block gg starts at byte
+ * 24 * gg, and 24 * gg % 16 is 0 for gg = 0, 2 and 8 for gg = 1, 3.  So the
+ * ring carries six whole 16-byte pieces per row, but a block is not a piece --
+ * an odd gg's block is the back half of one piece and the front half of the
+ * next.  Staging stays verbatim (the DMA arm copies bytes and knows nothing of
+ * blocks); the READ side is what has to account for it, and it does so as six
+ * word loads off the block's own base address, which is what qw_raw_load's
+ * q5_1 arm already does against global memory.  A reader that instead assumed
+ * one block per slot would fetch words from the wrong address for half the
+ * groups and hand the decoder the wrong six words.
+ *
+ * R = 96, not 48 and not 68/136:
+ *   * 48 (two groups) still needs a 16-byte-aligned slab base, because a
+ *     48-byte run only starts on 16 | 48*k when the row's base does; 96 does it
+ *     off any 4-byte-aligned base, because 96 = 6 x 16.  The guard is the one
+ *     the shipped word-direct path already asks (qwen4exp_word_aligned), so it
+ *     excludes nothing the shipped path serves.
+ *   * 68/136 come from a 20-byte "group" that no q5_1 layout has: 68 is not a
+ *     whole number of 24-byte blocks (68 = 2 x 24 + 20), so a 68-byte run splits
+ *     a block and, being an odd word count, puts the NEXT run on a 4-byte
+ *     offset.  The only reading that makes 68 and 136 come out right is 68 =
+ *     17 words = 2 header + 15 payload for a 16-group block, i.e. a 16 x 32 =
+ *     512-element block of stride 20 bytes/element -- the q4_K/q5_K 256-element
+ *     family's arithmetic at a 512-element block, which is not q5_1 and which
+ *     no down row here is (ds4:12089 prints the live down row as groups x 24).
+ *     A run that splits a block is only legal at a 16-byte-aligned base, so
+ *     68/136 would need the guard the shipped path does not have, for bytes
+ *     this layout never stores.
+ *   * 8 blocks (192 B) would be the next rung and buys nothing: 192 pieces per
+ *     CTA is 1.5 per lane against 0.75, and it costs the buffer 7,680 B.
+ *
+ * The buffer is a QW_DOWN_DMA_D ring of D CHUNK slots, and a chunk slot holds
+ * the QW_DOWN_DMA_LD = 6 16-byte pieces of each of the QW_DOWN_MMA_BM = 64
+ * rows: LD * BM = 384 uint4 = 6,144 B per chunk, and D * 6,144 = 12,288 B for
+ * the whole ring with D = QW_DOWN_DMA_KEEP + 1 = 2.  The piece j = i % 6 of
+ * the row r = i / 6 of the chunk in ring position seq % D lives at slot
+ * (seq % D) * (LD * BM) + r * LD + j.  That is the plain row-major map, and it
+ * is also the only one that is correct: with LD = 6 pieces per row a shared
+ * index is the triple (chunk, row, piece), and a map that collapses any two of
+ * the three onto one slot stages 384 pieces into fewer than 384 distinct
+ * slots and so overwrites bytes it has not read yet.  The map is injective on
+ * (seq % D, r, j), which is exactly the set of bytes the DMA arm ever touches.
+ *
+ * A promoted bank argument belongs here only if it survives the real numbers,
+ * and it does not.  The 12-word claim beside the old constant was a residue
+ * period, not a row size -- 96 B is 6 whole uint4 -- and the 2-way READ
+ * conflict it derived came from the shared-memory LOAD of a stride-66 slot
+ * array, whose eight lanes per phase are a property of QW_DMA_US = 66.  That
+ * shape does not travel to this array, where the 128-issue-lane phase is
+ * 16 slots and each slot is 4 banks.  The cp.async store is four such phases
+ * at the stride the map above fixes, and nothing about it is free to choose:
+ * a permutation would break the (chunk, row, piece) injectivity that makes the
+ * staging legal at all.  So there is no swizzle to carry, no residue map to
+ * match, and the shipped-quality default is the direct map. */
+#define QW_DOWN_DMA_WPC 6u             /* cp.async pieces per row-chunk (96 B) */
+/* LD is WPC by definition, not by coincidence: the staged row-chunk is a
+ * 96-byte run and cp.async moves it in whole 16-byte pieces, so the number
+ * of pieces per row IS the row-chunk's uint4 count.  Saying it that way round
+ * is what keeps the assertion below from going stale if either number ever
+ * moves. */
+#define QW_DOWN_DMA_LD QW_DOWN_DMA_WPC   /* uint4 slots per staged row-chunk */
+#define QW_DOWN_DMA_RPI (QW_DOWN_MMA_BM * QW_DOWN_DMA_WPC)   /* 384 / issue */
+#define QW_DOWN_DMA_NF (QW_DOWN_DMA_RPI / QW_DOWN_MMA_THREADS)  /* 3 per lane */
+#define QW_DOWN_DMA_LANES \
+    (QW_DOWN_DMA_RPI / QW_DOWN_DMA_NF / QW_DOWN_DMA_WPC)    /* 128 issue lanes */
+#define QW_DOWN_DMA_KEEP 1u             /* ring depth = KEEP + 1 chunk slots */
+static_assert(QW_DOWN_DMA_RPI % QW_DOWN_MMA_THREADS == 0u,
+              "down DMA fill must divide the block");
+static_assert(QW_DOWN_DMA_LANES <= QW_DOWN_MMA_THREADS,
+              "down DMA fill needs one lane per piece");
+/* The one number the whole staging rests on: QW_MMA_G q5_1 blocks are
+ * G * 24 = 96 payload bytes, and those bytes are exactly LD * 16 = 96 of
+ * whole 16-byte cp.async pieces.  If this ever stops holding, a piece would
+ * straddle a row and the verbatim-image argument below would go with it. */
+static_assert((QW_MMA_G * 24u) == QW_DOWN_DMA_LD * 16u,
+              "a down q5_1 chunk is QW_DOWN_DMA_LD whole words");
 /* ========================================================================= */
 
 __device__ __forceinline__ static void qw_mma_m16n8k32(
@@ -3636,7 +3737,11 @@ qwen4exp_moe_gateup_mma_kernel(
  * The activation is the routed intermediate, quantised per (token, slot) pair,
  * so the pair index addresses it directly.
  */
-template <int DownType = -1>
+/* DownType is the pinned weight type of the down slab; Dma is the q5_1
+ * weight FETCH arm: 0 is the shipped loader, 1 is the cp.async ring whose
+ * geometry and bank argument are above with the QW_DOWN_DMA_* constants and
+ * in ds4/docs/down-mma-dma-exactness.md. */
+template <int DownType = -1, int Dma = 0>
 __global__ __launch_bounds__(QW_DOWN_MMA_THREADS) static void
 qwen4exp_moe_down_mma_kernel(
         float *partial,
@@ -3660,6 +3765,17 @@ qwen4exp_moe_down_mma_kernel(
     __shared__ float  sWB[QW_DOWN_MMA_BM * QW_MMA_G];
     __shared__ float  sXS[QW_MMA_BN * QW_MMA_G], sXSUM[QW_MMA_BN * QW_MMA_G];
     __shared__ uint32_t sPair[QW_MMA_BN];
+    /* The ORIGINAL q5_1 bytes, sixteen at a time, D chunk slots deep.  A
+     * chunk slot is LD * BM = 6 * 64 = 384 uint4 = 6,144 B (one 96-byte run
+     * per staged row), so a CTA holds D * 6,144 = 12,288 B with
+     * D = QW_DOWN_DMA_KEEP + 1 = 2. */
+    enum { QW_DOWN_DMA_D = (int)QW_DOWN_DMA_KEEP + 1 };
+    /* The array DECLARATION is not a constant expression nvcc may size it
+     * with, which is why the promoted gate/up staging pre-computes its slot
+     * count into an enum. */
+    enum { QW_DOWN_DMA_SLOTS = Dma ? QW_DOWN_DMA_D * QW_DOWN_DMA_LD *
+                                     QW_DOWN_MMA_BM : 1 };
+    __shared__ __align__(16) uint4 sDownRaw[QW_DOWN_DMA_SLOTS];
 
     const uint32_t tid  = threadIdx.x;
     const uint32_t warp = tid >> 5;
@@ -3687,6 +3803,80 @@ qwen4exp_moe_down_mma_kernel(
     const uint32_t dtype = DownType < 0 ? down_type : (uint32_t)DownType;
     const bool w_dq = dq_stage != 0u &&
                       dtype == (uint32_t)DS4_QWEN4EXP_TY_q5_1;
+    /* Whether this CTA may take the cp.async ring at all.  A q5_1 block is
+     * 24 bytes, so a 4-byte-aligned row base puts EVERY block of the row on a
+     * 4-byte boundary, which is what qw_raw_load's q5_1 arm and the oracle's
+     * word-read arm both require; the ring's 16-byte pieces are simply the
+     * same 24-byte objects carried by six whole pieces, and they need no
+     * further alignment because a chunk is 96 = 6 x 16 bytes.  So this guard
+     * asks no more than the shipped word-direct path already asks -- the
+     * expert base and the row stride are the slab's, so a block that fails
+     * any term of it stages nothing and decodes from the global row exactly
+     * as the non-DMA arm does, which keeps the branch block-uniform and adds
+     * no barrier.  The rest is the ring's own bookkeeping: a whole number of
+     * chunk slots in flight, and a whole number of chunks per row.  An
+     * out-of-range group is never staged and never read (the fill clamps on
+     * the row bound and the decode loop breaks at g >= groups), so no read of
+     * an unwritten slot is possible. */
+    const bool dma_on = Dma != 0 && w_dq &&
+        ((((uintptr_t)down_e) | (uintptr_t)down_row_bytes |
+          (((uintptr_t)down_e) + (uint64_t)(QW_DOWN_MMA_BM - 1u) *
+                                 down_row_bytes)) & 3ull) == 0ull &&
+        (groups % QW_MMA_G) == 0u &&
+        (groups / QW_MMA_G) >= (uint32_t)(QW_DOWN_DMA_KEEP + 1);
+    /* The chunk count of one row, and the last chunk the ring ever carries.
+     * Both are the same number the guard below compares against, and the
+     * ring's wrap-safety rests on that: no chunk beyond it is issued. */
+    const uint32_t qw_down_dma_nchunk = groups / QW_MMA_G;
+    /* Piece i of the fill for chunk `seq`.  One issue covers every staged row
+     * of ONE K chunk -- the K extent is what seq walks, never the row -- so
+     * the row a piece belongs to is the piece's full stop within the fill:
+     * r = i / WPC, with the WPC pieces of that row at i % WPC.  Grouping the
+     * piece index with a K term, or taking it as a row, is the same mistake in
+     * both directions: it asks for rows outside the tile and reads other
+     * rows' bytes.  The global byte offset is the chunk's group base plus the
+     * piece inside the run: chunk seq starts at group seq * QW_MMA_G, whose
+     * block is at 24 bytes a group, and piece p continues that 96-byte run to
+     * p * 16. */
+    auto qw_down_dma_src = [&](uint32_t seq, uint32_t i) -> const char * {
+        const uint32_t r = i / QW_DOWN_DMA_WPC;
+        const uint32_t p = i - r * QW_DOWN_DMA_WPC;
+        const uint32_t orow = row0 + r;
+        if (orow >= out_dim) return NULL;
+        return down_e + (uint64_t)orow * down_row_bytes +
+               (uint64_t)seq * ((uint32_t)QW_MMA_G * 24u) +
+               (uint64_t)p * 16u;
+    };
+    /* The ring slot that holds piece i of chunk seq: the chunk's slot block,
+     * then the row inside it, then the piece inside the row.  The two maps are
+     * the same triple (seq % D, r, p) read two ways, so the reader below finds
+     * the bytes at the address the issuer put them at.  No modulo on the row:
+     * a row is LD whole slots wide, and LD * p never leaves it. */
+    auto qw_down_dma_slot = [&](uint32_t seq, uint32_t i) -> uint32_t {
+        const uint32_t r = i / QW_DOWN_DMA_WPC;
+        const uint32_t p = i - r * QW_DOWN_DMA_WPC;
+        return (seq % (uint32_t)QW_DOWN_DMA_D) *
+                   ((uint32_t)QW_DOWN_DMA_LD * QW_DOWN_MMA_BM) +
+               r * (uint32_t)QW_DOWN_DMA_LD + p;
+    };
+    /* One whole K chunk: 64 rows x 96 B = 384 pieces, three to each of the
+     * first 128 lanes.  The tail lanes have nothing to carry and issue
+     * nothing. */
+    auto qw_down_dma_issue = [&](uint32_t seq) {
+#pragma unroll
+        for (uint32_t k = 0; k < (uint32_t)QW_DOWN_DMA_NF; k++) {
+            const uint32_t i = tid + k * (uint32_t)QW_DOWN_MMA_THREADS;
+            if (i < (uint32_t)QW_DOWN_DMA_RPI) {
+                const char *const gsrc = qw_down_dma_src(seq, i);
+                if (gsrc) {
+                    qw_cpasync16((uint32_t)__cvta_generic_to_shared(
+                                     &sDownRaw[qw_down_dma_slot(seq, i)]),
+                                 gsrc);
+                }
+            }
+        }
+        qw_cpasync_commit();
+    };
 
     for (int32_t nbase = 0; nbase < cnt; nbase += QW_MMA_BN) {
         const int32_t take = (cnt - nbase) < QW_MMA_BN ? (cnt - nbase)
@@ -3701,7 +3891,37 @@ qwen4exp_moe_down_mma_kernel(
 #pragma unroll
         for (int i = 0; i < QW_DOWN_MMA_NT * 4; i++) acc[i] = 0.0f;
 
+        /* Seed the ring: chunk 0 is what the first chunk reads, and chunk 1
+         * is already in flight when that read happens. */
+        if (dma_on) {
+            qw_down_dma_issue(0u);
+            qw_down_dma_issue(1u);
+        }
         for (uint32_t kc = 0; kc < groups; kc += QW_MMA_G) {
+            /* The chunk this iteration decodes from landed KEEP groups back,
+             * so this usually no-ops; what it buys is that it can never be
+             * the last read of a row's bytes.  It sits BEFORE the loop's own
+             * barrier, exactly as the promoted gate/up staging's does, and it
+             * is a cp.async.wait_group, not a barrier: no barrier is added,
+             * and the wait's completion test is done by the issuing thread
+             * itself, so the lanes that issue no piece agree to it too. */
+            if (dma_on) {
+                /* wait<1> drains the OLDEST outstanding fill, which mid-stream
+                 * is exactly the chunk being decoded (one newer fill is still
+                 * in flight behind it).  At the TAIL no newer fill will ever
+                 * be issued -- the nseq guard has stopped issuing -- so the
+                 * chunk being decoded is the NEWEST outstanding group and
+                 * wait<1> would return with it still landing: the decode
+                 * would race its own staging.  From the last issueable
+                 * iteration on, drain fully. */
+                if (QW_DOWN_DMA_KEEP == 0 ||
+                    (kc / QW_MMA_G) + QW_DOWN_DMA_KEEP + 1u >=
+                        qw_down_dma_nchunk) {
+                    qw_cpasync_wait<0>();
+                } else {
+                    qw_cpasync_wait<1>();
+                }
+            }
             __syncthreads();
             for (uint32_t idx = tid; idx < QW_DOWN_MMA_BM * QW_MMA_G;
                  idx += QW_DOWN_MMA_THREADS) {
@@ -3715,7 +3935,56 @@ qwen4exp_moe_down_mma_kernel(
                 if (orow < out_dim && g < groups) {
                     const char *const drow =
                         down_e + (uint64_t)orow * down_row_bytes;
-                    if (w_dq) {
+                    if (dma_on) {
+                        /* The same six words qw_raw_load's q5_1 arm returns
+                         * for this block, read OUT OF THE RING as a byte
+                         * image.  The block at group g = kc + gg is the
+                         * 24-byte object at byte 24 * gg of the row, and the
+                         * row's chunk run starts at byte (kc / QW_MMA_G) * 96
+                         * of the chunk -- so the block's first byte is at
+                         * 24 * gg inside the row's LD-piece slot band, which
+                         * for ODD gg sits 8 bytes into piece 3*gg/2 (24 * gg
+                         * % 16 == 8) and therefore STRADDLES two pieces.  A
+                         * slot-numbered read cannot name that address, and
+                         * neither can a word index taken inside one uint4.
+                         * The only form that is right at both parities is the
+                         * one qw_raw_load's own word arm uses: six word loads
+                         * off the block's base address, the arm that takes a
+                         * 4-byte-aligned block and returns its six words.  Here
+                         * that base is the generic shared pointer to the block,
+                         * so the read is the same six word loads of the same
+                         * six addresses and hands the decoder the identical
+                         * words the shipped global read hands it.  The issuer
+                         * names its addresses from (i, seq) and this reader
+                         * names them from (r, gg); both unfold to the same plain
+                         * row-major band, so a byte read is a byte written.  The chunk term
+                         * wraps at D to match the issue-side slot map. */
+                        const char *const sband =
+                            (const char *)(const void *)sDownRaw;
+                        /* The chunk term MUST wrap at D: kc runs over every
+                         * group, so kc/G reaches nchunk-1 while the ring holds
+                         * only KEEP+1 slots, and the slot this read names has
+                         * to be the slot the fill for kc/G wrote, which is
+                         * (kc/G) % D by the issue-side map.  An unwrapped term
+                         * walks off the buffer at the third chunk (the fault
+                         * compute-sanitizer named: shared read at 0x7800 in a
+                         * 29 KB buffer). */
+                        const uint32_t img =
+                            ((kc / QW_MMA_G) %
+                             (uint32_t)QW_DOWN_DMA_D) *
+                                ((uint32_t)QW_DOWN_DMA_LD * QW_DOWN_MMA_BM *
+                                 16u) +
+                            r * ((uint32_t)QW_MMA_G * 24u) +
+                            gg * 24u;
+                        const uint32_t *const qw =
+                            (const uint32_t *)(const void *)
+                                (sband + img);
+                        uint32_t raw[6];
+#pragma unroll
+                        for (int i = 0; i < 6; i++) raw[i] = qw[i];
+                        dev_qwen4exp_group_decode_w(dtype, drow, g, raw,
+                                &sA[r * QW_MMA_LD + gg * 32], wa, wb);
+                    } else if (w_dq) {
                         uint32_t raw[6];
                         dev_qwen4exp_group_decode_w(dtype, drow, g,
                                 qw_raw_load(dtype, drow, g, raw) ? raw : NULL,
@@ -3752,6 +4021,29 @@ qwen4exp_moe_down_mma_kernel(
                 }
             }
             __syncthreads();
+            /* The fill for chunk kc + KEEP + 1 goes out here: below this
+             * barrier every lane has finished reading the ring slot that fill
+             * overwrites, so the write is legal, and the MMA below is what it
+             * has to land in.  No barrier is added -- this is the same place
+             * the promoted gate/up staging issues from, and the ring depth is
+             * what makes the reuse safe without an extra one.
+             *
+             * The bound is the whole of the ring's wrap-safety, and it is a
+             * bound on the ISSUE, not on the address: nseq < nchunk means the
+             * fill writes only slots whose chunk exists, and with the slot
+             * map's (nseq % D) term it means the slot written here is the one
+             * belonging to chunk nseq, which no later read asks for -- the
+             * read for chunk c happens at iteration c, and the fill that
+             * clobbers c's slot is the one for c + D, whose iteration is D
+             * later.  That gap is exactly KEEP + 1 = D, so a read is always
+             * at least one full iteration ahead of the fill that reuses its
+             * slot, and the barrier directly above this line is what orders
+             * the two.  Nothing is ever issued past the last chunk, so the
+             * ring neither wraps past the end nor reads an unwritten slot. */
+            if (dma_on) {
+                const uint32_t nseq = (kc / QW_MMA_G) + QW_DOWN_DMA_KEEP + 1u;
+                if (nseq < qw_down_dma_nchunk) qw_down_dma_issue(nseq);
+            }
 
 #pragma unroll
             for (int gg = 0; gg < QW_MMA_G; gg++) {
@@ -7078,14 +7370,43 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
          * always had, byte for byte.  Read once, before the launch. */
         const uint32_t dn_dq_stage =
             getenv("DS4_QWEN4EXP_NO_DOWN_DQ") == NULL ? 1u : 0u;
-#define QWEN4EXP_DOWN_MMA(DT) \
-        qwen4exp_moe_down_mma_kernel<DT><<< \
+        /* DS4_QWEN4EXP_NO_DOWN_MMA_DMA is the presence-disable valve for the
+         * q5_1 weight ring the down tile ports over from the promoted gate/up
+         * staging: ABSENT runs the DMA arm, PRESENT (any value) runs the
+         * shipped fetch, byte for byte, at the same grid, block and static
+         * shared footprint the shipped build launches.  Read once here,
+         * before any launch, so every instantiation of this call sees one
+         * answer.  The kernel repeats the shape test itself, block-uniform
+         * and outside the K loop, and falls back rather than stage a run it
+         * cannot hold -- which is why the q8_0 and generic instantiations can
+         * be handed the arm and stay the shipped loader either way. */
+        const int dn_dma_arm =
+            getenv("DS4_QWEN4EXP_NO_DOWN_MMA_DMA") == NULL ? 1 : 0;
+/* Dma is a template parameter, so the runtime valve picks between two
+ * compile-time instantiations here rather than feeding dn_dma_arm itself
+ * to the template.  Only the q5_1 instantiation carries a staging ring
+ * (the kernel's own shape test stands the other types down to the
+ * shipped loader in either arm), so the branch is the ordinary type
+ * dispatch with the arm chosen inside it. */
+#define QWEN4EXP_DOWN_MMA(DT) do { \
+    if (dn_dma_arm != 0) { \
+        qwen4exp_moe_down_mma_kernel<DT, 1><<< \
                 dim3(out_dim / QW_DOWN_MMA_BM, gu_rows, 1), \
                 QW_DOWN_MMA_THREADS, 0, stream>>>( \
                 (float *)down_partial->ptr, down, sc.mq, sc.ms, sc.msum, \
                 sc.pairs, sc.counts, sc.offsets, gu_active, \
-                down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
-                mgroups, out_dim, dn_dq_stage)
+                down_slab->expert_bytes, down_slab->row_bytes, \
+                down_slab->type, mgroups, out_dim, dn_dq_stage); \
+    } else { \
+        qwen4exp_moe_down_mma_kernel<DT, 0><<< \
+                dim3(out_dim / QW_DOWN_MMA_BM, gu_rows, 1), \
+                QW_DOWN_MMA_THREADS, 0, stream>>>( \
+                (float *)down_partial->ptr, down, sc.mq, sc.ms, sc.msum, \
+                sc.pairs, sc.counts, sc.offsets, gu_active, \
+                down_slab->expert_bytes, down_slab->row_bytes, \
+                down_slab->type, mgroups, out_dim, dn_dq_stage); \
+    } \
+} while (0)
         if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q5_1) {
             QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q5_1);
         } else if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q8_0) {
