@@ -256,6 +256,25 @@ mutant nqi_pending_no_fma caught \
 mutant nqi_pending_no_writeback caught \
     's|                    xo\[d\] = xv\[s\];|                    if (d == 0u) xo[d] = xv[s];|'
 
+# ---- the per-stream norm pass with the owed inject (the decode band) -------
+
+# The owed inject applied as a rounded product and an add instead of the
+# standalone kernel'"'"'s one FFMA, in the per-(token, stream) pass the decode
+# widths take.  Anchored by its own indentation: the one-block-per-token arm
+# above carries the same statement four columns deeper.
+mutant nq_pending_no_fma caught \
+    's|^                xv\[s\] = __fmaf_rn(pb\[d\], pi, xv\[s\]);|                xv[s] = __fadd_rn(xv[s], __fmul_rn(pb[d], pi));|'
+
+# The folded residual computed but not written back from that pass: the
+# up+mix tile and the inject head would read the stale stream.
+mutant nq_pending_no_writeback caught \
+    's|^                xo\[d\] = xv\[s\];|                if (d == 0u) xo[d] = xv[s];|'
+
+# The statistic taken off the residual as loaded instead of as folded: the
+# norm would see the stream before the inject it owes.
+mutant nq_pending_stale_stat caught \
+    's|        ? qwen4exp_hc_norm_scale_regs(xv, group, eps, partial)|        ? qwen4exp_hc_norm_scale_staged(xg, group, eps, partial)|'
+
 # The staged inject value taken one stream over: the dot'"'"'s operands move.
 mutant nqi_staged_inject_stream caught \
     's|                                iw + (uint64_t)ho \* weight_row_bytes, group, g, k),|                                iw + (uint64_t)ho * weight_row_bytes, group, (g + 1u) % n_hc, k),|'

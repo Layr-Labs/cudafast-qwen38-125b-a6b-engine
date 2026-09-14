@@ -903,13 +903,18 @@ static void check_mixer_equivalence(uint8_t *model, const char *up_path) {
  * calls it (the same session slot holds last block's head and this block's),
  * so the read-before-write inside the kernel is exercised, not assumed.
  *
- * Widths: below the fold threshold (the pair runs verbatim), at it, a full
- * chunk, and a ragged one (1017: the last token block is no different, but a
- * width that is not a multiple of anything is the one a stride error shows
- * on).  Inject encodings f32 and Q8_0, both flags, and the final mixer
- * (inject head absent, the pending apply still owed). */
+ * Widths: the decode band (1, the scored two-row decode, and 7, the widest
+ * commit; on CUDA the per-stream norm pass folds the apply there, under the
+ * PDL launch at the first two), the band between it and the fold threshold
+ * (47: the same per-stream fold on CUDA, the standalone kernel elsewhere),
+ * the threshold itself, a full chunk, and a ragged one (1017: the last token
+ * block is no different, but a width that is not a multiple of anything is
+ * the one a stride error shows on).  Inject encodings f32 and Q8_0, both
+ * flags, and the final mixer (inject head absent, the pending apply still
+ * owed). */
 static void check_mixer_pending(uint8_t *model, const char *up_path) {
-    static const uint32_t row_set[] = { 1u, 7u, 47u, 48u, 64u, 1017u, ROWS_LONG };
+    static const uint32_t row_set[] =
+        { 1u, 2u, 7u, 47u, 48u, 64u, 1017u, ROWS_LONG };
     const ds4_gpu_qwen4exp_slab norm_slab =
         hc_slab(model, MODEL_BYTES, NORM_WIDE_OFF);
     const ds4_gpu_qwen4exp_slab down_slab =

@@ -392,12 +392,15 @@ struct ds4_qwen4exp_session {
     ds4_gpu_tensor *logits;
     ds4_gpu_tensor *spec_top1;
 
-    /* PREFILL ONLY.  True while `hyper` still owes the last block's inject:
-     * the value the model means is hyper + block_out * inject, and the next
-     * mixer applies it on its first read of the residual instead of a
-     * separate 42 MB read-write pass (see qwen4exp_hc_defer_ok).  Every
-     * other reader of `hyper` flushes first.  Never set inside a captured
-     * decode island: the widths that capture are below the threshold. */
+    /* True while `hyper` still owes the last block's inject: the value the
+     * model means is hyper + block_out * inject, and the next mixer applies
+     * it on its first read of the residual instead of a separate read-write
+     * pass (see qwen4exp_hc_defer_ok).  Every other reader of `hyper`
+     * flushes first.  At the widths that capture decode graphs the flag is a
+     * pure function of where the forward stands
+     * (qwen4exp_hc_pending_after_island): a replayed island runs no host
+     * call site, so the replay paths set it from that rule, and a capture
+     * attempt that fails restores what it found. */
     bool hc_pending;
 
 #ifdef DS4_TEST_HOOKS
@@ -1991,14 +1994,21 @@ static void qwen4exp_trace_report(uint32_t n_tokens) {
 #endif
 
 
-/* The residual inject deferral (prefill only; see ds4_qwen4exp_session::
- * hc_pending).  The hc_inject kernel is a 42 MB read plus a 42 MB write that
- * the very next mixer reads straight back; folding the apply into that
- * mixer's first pass saves the read.  The values are the same FFMA on the
- * same operands, so the residual, the mixer outputs and everything after are
- * bit for bit the separate kernel's.  Gated to widths the fused mixer takes
- * one block per token at (its inject-in-norm threshold) and, with that, clear
- * of every captured decode island. */
+/* The residual inject deferral (see ds4_qwen4exp_session::hc_pending).  The
+ * hc_inject kernel is a read plus a write of the whole stream that the very
+ * next mixer reads straight back; folding the apply into that mixer's first
+ * pass saves the read at prefill and, at the decode widths, the launch.  The
+ * values are the same FFMA on the same operands, so the residual, the mixer
+ * outputs and everything after are bit for bit the separate kernel's.
+ *
+ * Two bands take it.  At and above DS4_QWEN4EXP_HC_DEFER_MIN_ROWS the fused
+ * mixer runs one block per token and folds the apply into its norm+inject
+ * pass.  At and below DS4_QWEN4EXP_MTP_MAX_COMMIT -- every width the decode
+ * graphs capture -- the per-stream norm pass folds it instead
+ * (qwen4exp_hc_norm_quant_kernel's Pending arm).  The widths between keep
+ * the standalone kernel.  The decode band has its own valve,
+ * DS4_QWEN4EXP_NO_HC_PENDING_DECODE, which the CUDA backend reads too; the
+ * harness clears the environment on a ranked run, so unset is the fold. */
 #define DS4_QWEN4EXP_HC_DEFER_MIN_ROWS 48u
 
 static int qwen4exp_hc_defer_off(void) {
@@ -2010,8 +2020,33 @@ static int qwen4exp_hc_defer_off(void) {
     return cached;
 }
 
+static int qwen4exp_hc_pending_decode_off(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_QWEN4EXP_NO_HC_PENDING_DECODE");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
 static bool qwen4exp_hc_defer_ok(uint32_t n_tokens) {
-    return n_tokens >= DS4_QWEN4EXP_HC_DEFER_MIN_ROWS && !qwen4exp_hc_defer_off();
+    if (qwen4exp_hc_defer_off()) return false;
+    if (n_tokens >= DS4_QWEN4EXP_HC_DEFER_MIN_ROWS) return true;
+    return n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
+           !qwen4exp_hc_pending_decode_off();
+}
+
+/* What s->hc_pending holds once a layer island has been ENCODED at this
+ * width.  Island 0 begins with the attention mixer consuming whatever was
+ * owed and nothing after it defers, so it leaves false; island 1 ends with
+ * the FFN inject, applied or owed.  A captured island runs no host call site
+ * on replay, so every replay path sets the flag from this rule, and
+ * qwen4exp_graph_layer_island_encode checks itself against it, so the two
+ * cannot drift apart silently.  The value depends on nothing but the width
+ * and the process-wide valves, which is what lets a forward that replays
+ * some islands and encodes others be the same computation. */
+static bool qwen4exp_hc_pending_after_island(uint32_t n_tokens, uint32_t island) {
+    return island == 1u && qwen4exp_hc_defer_ok(n_tokens);
 }
 
 /* Settle an owed inject with the standalone kernel.  Used where the next
@@ -2094,9 +2129,9 @@ static bool qwen4exp_graph_layer_island_encode(
             QW_TRACE(QW_SLICE_GDN);
         }
     } else {
-        /* At prefill widths the inject is owed to the next mixer rather than
-         * applied here (qwen4exp_hc_defer_ok); the slice trace keeps its
-         * order either way, it records what the model computed. */
+        /* Where qwen4exp_hc_defer_ok says so the inject is owed to the next
+         * mixer rather than applied here; the slice trace keeps its order
+         * either way, it records what the model computed. */
         const bool defer = qwen4exp_hc_defer_ok(n_tokens);
         if (defer) {
             s->hc_pending = true;
@@ -2129,6 +2164,12 @@ static bool qwen4exp_graph_layer_island_encode(
             return false;
         }
         QW_TRACE(QW_SLICE_FFN_INJECT);
+    }
+    if (s->hc_pending != qwen4exp_hc_pending_after_island(n_tokens, island)) {
+        fprintf(stderr,
+                "ds4: qwen4exp block %u island %u left the inject deferral "
+                "where a replay would not\n", il, island);
+        return false;
     }
     return true;
 }
@@ -2168,6 +2209,9 @@ static bool qwen4exp_graph_layer_island(
                 QW_TRACE(QW_SLICE_MOE);
                 QW_TRACE(QW_SLICE_FFN_INJECT);
             }
+            /* The replayed island consumed and deferred exactly what the
+             * encode did; the host flag follows the same rule. */
+            s->hc_pending = qwen4exp_hc_pending_after_island(n_tokens, island);
             return true;
         }
         if (state == 0) {
@@ -2175,12 +2219,17 @@ static bool qwen4exp_graph_layer_island(
             const uint32_t trace_len = g_qwen4exp_trace_len;
             const bool trace_overflow = g_qwen4exp_trace_overflow;
 #endif
+            /* The attempt below consumes and defers on the host as it
+             * encodes; a capture that fails executed none of it, so the
+             * inject it found owed is still owed. */
+            const bool pending_before = s->hc_pending;
             if (qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens,
                                                    island)) {
                 if (ds4_gpu_decode_graph_end(&key) == 0) return true;
             } else {
                 ds4_gpu_decode_graph_abort(&key);
             }
+            s->hc_pending = pending_before;
 #ifdef DS4_TEST_HOOKS
             g_qwen4exp_trace_len = trace_len;
             g_qwen4exp_trace_overflow = trace_overflow;
@@ -2438,6 +2487,9 @@ static bool qw_decode_graph_chunk(ds4_qwen4exp_session *s,
             next.il = chunk + 1u;
             (void)ds4_gpu_decode_graph_prefetch(&next);
         }
+        /* The chunk ends on its last layer's FFN island, whose deferral the
+         * captured kernels carry exactly as the encode did. */
+        s->hc_pending = qwen4exp_hc_pending_after_island(n_tokens, 1u);
         return true;
     }
     if (state == 0) {
@@ -2445,6 +2497,7 @@ static bool qw_decode_graph_chunk(ds4_qwen4exp_session *s,
         const uint32_t trace_len = g_qwen4exp_trace_len;
         const bool trace_overflow = g_qwen4exp_trace_overflow;
 #endif
+        const bool pending_before = s->hc_pending;
         if (qwen4exp_graph_layers_encode_range(s, w, m, n_tokens, false,
                                                il_first, il_last)) {
             if (ds4_gpu_decode_graph_end(&key) == 0) return true;
@@ -2452,11 +2505,13 @@ static bool qw_decode_graph_chunk(ds4_qwen4exp_session *s,
             ds4_gpu_decode_graph_abort(&key);
             return false;
         }
+        /* A failed capture executed no kernels: the inject the attempt found
+         * owed is still owed.  Fall through and encode. */
+        s->hc_pending = pending_before;
 #ifdef DS4_TEST_HOOKS
         g_qwen4exp_trace_len = trace_len;
         g_qwen4exp_trace_overflow = trace_overflow;
 #endif
-        /* A failed capture executed no kernels; fall through and encode. */
     }
     return qwen4exp_graph_layers_encode_range(s, w, m, n_tokens, true,
                                               il_first, il_last);
@@ -2474,16 +2529,20 @@ static bool qwen4exp_graph_layers(
     /* Layer dumps synchronize and must execute every host call site. */
     capture_ok = capture_ok && !qwen4exp_layer_dump_on();
 #endif
-    /* WHY A CHUNK BOUNDARY CARRIES NO STATE.  The only host state that flows
-     * between layers of this stack is the deferred residual inject
-     * (s->hc_pending), and the deferral is prefill-only: qwen4exp_hc_defer_ok
-     * requires n_tokens >= DS4_QWEN4EXP_HC_DEFER_MIN_ROWS (48), while
-     * capture_ok requires n_tokens <= DS4_QWEN4EXP_MTP_MAX_COMMIT.  So at
-     * every width that captures, hc_pending is false at every layer boundary
-     * -- the forward clears it on entry and nothing in a decode-width layer
-     * sets it.  Cutting the capture at a layer boundary therefore cannot move
-     * an inject across it, and a forward that replays some chunks and encodes
-     * others is the same computation in the same order. */
+    /* WHAT A CHUNK BOUNDARY CARRIES.  The only host state that flows between
+     * layers of this stack is the deferred residual inject (s->hc_pending),
+     * and at the widths that capture it is carried EXPLICITLY rather than
+     * absent: the flag is a pure function of the width and the island the
+     * forward last finished (qwen4exp_hc_pending_after_island), so a chunk
+     * enters with the value its predecessor's encode left -- false at layer
+     * zero, where the forward cleared it, and the rule's value after every
+     * FFN island -- whether that predecessor was encoded or replayed, and the
+     * kernels captured under that value are the kernels the eager encode
+     * would launch under it.  A forward that replays some chunks and encodes
+     * others is therefore the same computation in the same order.  The
+     * captured stack's LAST owed inject is consumed by the final mixer, which
+     * is encoded eagerly after the stack and reads the flag the replay set;
+     * the PLE block's flush at layer one is captured inside chunk zero. */
     if (capture_ok && qw_decode_graph_chunks() > 1u) {
         const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
         uint32_t chunks = qw_decode_graph_chunks();
@@ -2529,6 +2588,8 @@ static bool qwen4exp_graph_layers(
                 QW_TRACE(QW_SLICE_FFN_INJECT);
             }
 #endif
+            /* The stack ends on the last layer's FFN island. */
+            s->hc_pending = qwen4exp_hc_pending_after_island(n_tokens, 1u);
             return true;
         }
         if (state == 0) {
@@ -2536,12 +2597,16 @@ static bool qwen4exp_graph_layers(
             const uint32_t trace_len = g_qwen4exp_trace_len;
             const bool trace_overflow = g_qwen4exp_trace_overflow;
 #endif
+            const bool pending_before = s->hc_pending;
             /* Encode primitives directly, without nested per-layer captures. */
             if (qwen4exp_graph_layers_encode(s, w, m, n_tokens, false)) {
                 if (ds4_gpu_decode_graph_end(&key) == 0) return true;
             } else {
                 ds4_gpu_decode_graph_abort(&key);
             }
+            /* A failed capture executed no kernels: what the attempt found
+             * owed is still owed. */
+            s->hc_pending = pending_before;
 #ifdef DS4_TEST_HOOKS
             g_qwen4exp_trace_len = trace_len;
             g_qwen4exp_trace_overflow = trace_overflow;
@@ -3035,10 +3100,19 @@ static bool qwen4exp_graph_head_block_encode(
     if (ok) { stage = "QSA"; ok = qwen4exp_graph_qsa_block(s, l, m, il, n_tokens); }
     QW_HB_TICK(QW_HB_T_QSA);
     if (ok) {
+        /* Owed to the FFN mixer two calls down where qwen4exp_hc_defer_ok
+         * says so, as in the target's layers.  The FFN inject below is never
+         * deferred: the head's stream goes back to the caller after it, and
+         * the flag refers to the session's own stream. */
         stage = "attention inject";
-        ok = ds4_gpu_qwen4exp_hc_inject_tensor(s->hyper, s->hyper, s->block_out,
-                                               s->inject, DS4_N_EMBD, DS4_N_HC,
-                                               n_tokens) != 0;
+        if (qwen4exp_hc_defer_ok(n_tokens)) {
+            s->hc_pending = true;
+        } else {
+            ok = ds4_gpu_qwen4exp_hc_inject_tensor(s->hyper, s->hyper,
+                                                   s->block_out, s->inject,
+                                                   DS4_N_EMBD, DS4_N_HC,
+                                                   n_tokens) != 0;
+        }
     }
     QW_HB_TICK(QW_HB_T_ATTN_INJECT);
     if (ok) {
@@ -3100,11 +3174,18 @@ int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
 
     ds4_gpu_tensor *saved_hyper = s->hyper;
     const uint32_t saved_pos = s->pos;
+    /* The deferral flag refers to the SESSION's stream (a refused target
+     * forward can leave one owed); the head's stream owes nothing on entry
+     * and, with its FFN inject always applied, nothing on exit.  Lend the
+     * flag the way the stream and the position are lent. */
+    const bool saved_pending = s->hc_pending;
     s->hyper = hyper;
     s->pos = pos0;
+    s->hc_pending = false;
     if (s->d_pos && !ds4_gpu_qwen4exp_update_dpos(s->d_pos, s->pos)) {
         s->hyper = saved_hyper;
         s->pos = saved_pos;
+        s->hc_pending = saved_pending;
         fprintf(stderr, "ds4: qwen4exp head position update failed\n");
         return 0;
     }
@@ -3140,7 +3221,10 @@ int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
             } else {
                 if (!ok) ds4_gpu_decode_graph_abort(&key);
                 /* A failed capture executed no kernels.  Re-encode the block
-                 * eagerly once so this proposal still advances its caches. */
+                 * eagerly once so this proposal still advances its caches;
+                 * a failed attempt may have left its attention inject owed
+                 * on the host, and the head's stream owes nothing. */
+                s->hc_pending = false;
                 ok = qwen4exp_graph_head_block_encode(
                         s, c->l, c->m, il, n_tokens, &stage);
             }
@@ -3149,6 +3233,7 @@ int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
 
     s->hyper = saved_hyper;
     s->pos = saved_pos;
+    s->hc_pending = saved_pending;
     if (s->d_pos && !ds4_gpu_qwen4exp_update_dpos(s->d_pos, s->pos)) {
         stage = "position restore";
         ok = false;
@@ -3303,6 +3388,9 @@ bool ds4_qwen4exp_graph_head_logits(ds4_qwen4exp_session       *s,
         fprintf(stderr, "ds4: qwen4exp head row upload failed\n");
         return false;
     }
+    /* The stream was just re-seeded, so an inject a refused forward left
+     * owed is void, as at the forward's own entry. */
+    s->hc_pending = false;
     if (!ds4_gpu_begin_commands()) {
         fprintf(stderr, "ds4: qwen4exp could not open a command batch\n");
         return false;

@@ -7947,6 +7947,24 @@ __device__ __forceinline__ static float qwen4exp_hc_norm_scale_staged(
     return 1.0f / sqrtf(total / (float)group + eps);
 }
 
+/* qwen4exp_hc_norm_scale's consume half, on values already in registers.
+ * Same ascending chain of the same FFMAs, same qwen4exp_block_sum_f32 tree,
+ * and the return line is qwen4exp_hc_norm_scale's own, character for
+ * character, so the mutant script's anchor bites here too. */
+__device__ __forceinline__ static float qwen4exp_hc_norm_scale_regs(
+        const float xv[QWEN4EXP_HC_STAGED_STEPS], uint32_t group, float eps,
+        float *partial) {
+    float sum = 0.0f;
+#pragma unroll
+    for (uint32_t c = 0; c < QWEN4EXP_HC_STAGED_STEPS; c++) {
+        const float v = xv[c];
+        sum += v * v;
+    }
+    const float total = qwen4exp_block_sum_f32(sum, partial);
+    /* 1/sqrt rather than rsqrtf, for the same reason as the unfused kernel. */
+    return 1.0f / sqrtf(total / (float)group + eps);
+}
+
 /* The three lines qwen4exp_rms_norm_kernel stores, as a value. */
 __device__ __forceinline__ static float qwen4exp_hc_normed_value(
         float x, float scale, float w, float weight_bias, int round_bf16) {
@@ -8010,13 +8028,35 @@ __device__ __forceinline__ static float qwen4exp_q8_rcp_approx(float d) {
  * stream), the shape qwen4exp_rms_norm_kernel launches, so the reduction is
  * the same one.  `group` (= n_embd) must be a multiple of blockDim.x, so loop
  * step k of thread t covers flat index g*group + k*blockDim.x + t and warp w
- * of that step covers exactly one 32-value Q8_0 block, in lane order. */
-template <int Staged = 0>
+ * of that step covers exactly one 32-value Q8_0 block, in lane order.
+ *
+ * Pending = 1 applies the PREVIOUS block's inject on the way in, the way the
+ * one-block-per-token qwen4exp_hc_norm_quant_inject_kernel does above the row
+ * threshold: the residual this pass normalizes is hyper + block_out * inject,
+ * exactly what qwen4exp_hc_inject_kernel would have stored (its SASS is one
+ * FFMA, block * inject + residual, and __fmaf_rn below is that instruction;
+ * the product's operand order does not enter an FMA's rounding), and the
+ * updated value is written back to `xw` (the residual, in place) so every
+ * later reader -- the up+mix tile, the inject head, the next inject -- sees
+ * what the standalone kernel would have left there.  The staged arm takes the
+ * statistic off the folded registers through qwen4exp_hc_norm_scale_regs,
+ * which is the load-and-sum walk's own ascending chain and tree; the rolled
+ * arm writes the fold in place, barriers, and runs its walk untouched over
+ * the updated stream.  Storing the FFMA's result and loading it back is the
+ * identity, so the statistic and the quantize see the bytes the separate
+ * kernel pair would have left them.  A block reads and writes only its own
+ * (token, stream) slab, so `x` and `xw` may be the same tensor, and `pinject`
+ * may alias the mixer's own inject output: its four pending values are read
+ * here, several kernels ahead of the head that overwrites them.  Without a
+ * pending inject the three trailing pointers are unused and the arms are the
+ * statements they always were, in the order they always had. */
+template <int Staged = 0, int Pending = 0>
 __global__ static void qwen4exp_hc_norm_quant_kernel(
         int8_t *xq, float *xscale, float *nscale,
         const float *x, const float *w,
         uint32_t n, uint32_t group, uint32_t rows,
-        float eps, float weight_bias, int round_bf16) {
+        float eps, float weight_bias, int round_bf16,
+        float *xw, const float *pblock, const float *pinject) {
     /* PDL producer for the down projection that follows on the stream.
      * Triggered at the two-row decode only, row-gated to the same <= 2 the
      * converted launch sites fire at: grid is (n_hc, rows), 4*2 blocks --
@@ -8045,7 +8085,9 @@ __global__ static void qwen4exp_hc_norm_quant_kernel(
      * at the top of this kernel while it waits (the both-ways rule,
      * ds4_cuda_qwen4exp.cuh).  The rolled <0> arm stages nothing: its
      * geometry is not fixed to STEPS * QWEN4EXP_HC_THREADS, so its walk is
-     * untouched and the array below is one dead float. */
+     * untouched and the array below is one dead float.  The pending operands
+     * (pblock, pinject) are the predecessor's outputs, so they too stay
+     * below the fence with the hyper reads. */
     float wv[Staged ? QWEN4EXP_HC_STAGED_STEPS : 1u];
     if (Staged) {
 #pragma unroll
@@ -8056,9 +8098,40 @@ __global__ static void qwen4exp_hc_norm_quant_kernel(
     QWEN4EXP_PDL_SYNC();
 
     __shared__ float partial[QWEN4EXP_HC_THREADS];
-    const float scale = Staged
-        ? qwen4exp_hc_norm_scale_staged(xg, group, eps, partial)
-        : qwen4exp_hc_norm_scale(xg, group, eps, partial);
+    /* The staged arm's ten residual values.  Without a pending inject they
+     * are loaded where they always were, after the statistic; with one they
+     * are loaded, folded and written back here, and the statistic is taken
+     * off them.  One dead float in the rolled arm, like wv. */
+    float xv[Staged ? QWEN4EXP_HC_STAGED_STEPS : 1u];
+    if (Pending) {
+        const float pi = pinject[(uint64_t)row * (n / group) + g];
+        const float *pb = pblock + (uint64_t)row * group;
+        float *xo = xw + base;
+        if (Staged) {
+#pragma unroll
+            for (uint32_t s = 0; s < QWEN4EXP_HC_STAGED_STEPS; s++) {
+                xv[s] = xg[s * QWEN4EXP_HC_THREADS + threadIdx.x];
+            }
+            /* qwen4exp_hc_inject_kernel's FFMA: residual + block * inject. */
+#pragma unroll
+            for (uint32_t s = 0; s < QWEN4EXP_HC_STAGED_STEPS; s++) {
+                const uint32_t d = s * QWEN4EXP_HC_THREADS + threadIdx.x;
+                xv[s] = __fmaf_rn(pb[d], pi, xv[s]);
+                xo[d] = xv[s];
+            }
+        } else {
+            /* The same FFMA, in place; the barrier publishes it to the walk
+             * below, which then reads the updated stream from `xg`. */
+            for (uint32_t i = threadIdx.x; i < group; i += blockDim.x) {
+                xo[i] = __fmaf_rn(pb[i], pi, xg[i]);
+            }
+            __syncthreads();
+        }
+    }
+    const float scale = (Staged && Pending)
+        ? qwen4exp_hc_norm_scale_regs(xv, group, eps, partial)
+        : Staged ? qwen4exp_hc_norm_scale_staged(xg, group, eps, partial)
+                 : qwen4exp_hc_norm_scale(xg, group, eps, partial);
     if (threadIdx.x == 0u) nscale[(uint64_t)row * (n / group) + g] = scale;
 
     const uint32_t lane = threadIdx.x & 31u;
@@ -8071,11 +8144,13 @@ __global__ static void qwen4exp_hc_norm_quant_kernel(
         /* The quantize walk's ten values staged in registers, then the seam
          * below on them: lane k of step s owns flat index
          * s*blockDim.x + warp*32 + lane, exactly the rolled walk's step s,
-         * so the butterfly's lanes and the store's pairs are unchanged. */
-        float xv[QWEN4EXP_HC_STAGED_STEPS];
+         * so the butterfly's lanes and the store's pairs are unchanged.  The
+         * Pending arm already holds them, folded, from above. */
+        if (!Pending) {
 #pragma unroll
-        for (uint32_t s = 0; s < QWEN4EXP_HC_STAGED_STEPS; s++) {
-            xv[s] = xg[s * QWEN4EXP_HC_THREADS + threadIdx.x];
+            for (uint32_t s = 0; s < QWEN4EXP_HC_STAGED_STEPS; s++) {
+                xv[s] = xg[s * QWEN4EXP_HC_THREADS + threadIdx.x];
+            }
         }
 #pragma unroll
         for (uint32_t k = 0; k < QWEN4EXP_HC_STAGED_STEPS; k++) {
@@ -8812,24 +8887,6 @@ qwen4exp_hc_up_mix_mma_kernel(
     }
 }
 
-/* qwen4exp_hc_norm_scale's consume half, on values already in registers.
- * Same ascending chain of the same FFMAs, same qwen4exp_block_sum_f32 tree,
- * and the return line is qwen4exp_hc_norm_scale's own, character for
- * character, so the mutant script's anchor bites here too. */
-__device__ __forceinline__ static float qwen4exp_hc_norm_scale_regs(
-        const float xv[QWEN4EXP_HC_STAGED_STEPS], uint32_t group, float eps,
-        float *partial) {
-    float sum = 0.0f;
-#pragma unroll
-    for (uint32_t c = 0; c < QWEN4EXP_HC_STAGED_STEPS; c++) {
-        const float v = xv[c];
-        sum += v * v;
-    }
-    const float total = qwen4exp_block_sum_f32(sum, partial);
-    /* 1/sqrt rather than rsqrtf, for the same reason as the unfused kernel. */
-    return 1.0f / sqrtf(total / (float)group + eps);
-}
-
 /* qwen4exp_hc_norm_quant_kernel with the inject head folded in.  Grid (rows),
  * one block per token; the streams run in sequence, each with the reduction
  * and the quantize of the per-stream kernel, and the inject accumulators ride
@@ -9007,6 +9064,22 @@ __global__ static void qwen4exp_hc_norm_quant_inject_kernel(
             }
         }
     }
+}
+
+/* Below the row threshold an owed inject is folded into the per-stream norm
+ * pass (the Pending arm of qwen4exp_hc_norm_quant_kernel) by default; this is
+ * that fold's valve, read once like the others.  ds4_qwen4exp_graph.inc reads
+ * the SAME variable in qwen4exp_hc_defer_ok, so setting it restores the
+ * standalone kernel at both ends: the layer encode launches it where it did
+ * before, and this entry, handed a pending block regardless, runs it ahead of
+ * the norm pass. */
+static int ds4_qwen4exp_hc_pending_decode_off(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_QWEN4EXP_NO_HC_PENDING_DECODE");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return cached;
 }
 
 /* The staged norm+quant+inject arms are the default at the production shape;
@@ -9576,8 +9649,14 @@ static int qwen4exp_hc_mixer_fused_cuda(
     }
     const int inject_in_norm =
         upw && inject && rows >= QWEN4EXP_HC_FUSE_MIX_MIN_ROWS;
+    /* Below that threshold the owed inject rides the per-stream norm pass
+     * instead (the Pending arm of qwen4exp_hc_norm_quant_kernel), at every
+     * width that pass runs at; the standalone kernel is the valve's leg. */
+    const int pending_in_norm =
+        pending_block && !inject_in_norm &&
+        !ds4_qwen4exp_hc_pending_decode_off();
 
-    if (pending_block && !inject_in_norm) {
+    if (pending_block && !inject_in_norm && !pending_in_norm) {
         /* No pass here folds the apply in: run the standalone kernel, so the
          * residual every leg below reads is the updated one. */
         qwen4exp_hc_inject_kernel<<<dim3((n_embd + 255u) / 256u, n_hc, rows),
@@ -9597,32 +9676,73 @@ static int qwen4exp_hc_mixer_fused_cuda(
                 (float *)hyper->ptr,
                 pending_block ? (const float *)pending_block->ptr : NULL,
                 pending_block ? (const float *)pending_inject->ptr : NULL);
-    } else if (staged) {
-        /* PDL consumer at the decode widths only (rows <= 2): the stream
-         * predecessor is the attention inject qwen4exp_hc_inject_kernel,
-         * which triggers at its top, and the kernel's normw prefetch rides
-         * that window (ds4_cuda_qwen4exp.cuh).  Verify and prefill keep the
-         * plain launch. */
-        if (rows <= 2u) {
-            QWEN4EXP_LAUNCH_PDL(
-                    (qwen4exp_hc_norm_quant_kernel<1>),
-                    (dim3(n_hc, rows, 1u)), threads, 0,
-                    cuda_decode_stream(),
-                    xq, xscale, nscale, (const float *)hyper->ptr, normw,
-                    (uint32_t)wide, n_embd, rows, eps, weight_bias,
-                    round_bf16);
-        } else {
-            qwen4exp_hc_norm_quant_kernel<1><<<dim3(n_hc, rows, 1u), threads, 0,
-                                            cuda_decode_stream()>>>(
-                    xq, xscale, nscale, (const float *)hyper->ptr, normw,
-                    (uint32_t)wide, n_embd, rows, eps, weight_bias,
-                    round_bf16);
-        }
     } else {
-        qwen4exp_hc_norm_quant_kernel<0><<<dim3(n_hc, rows, 1u), threads, 0,
-                                        cuda_decode_stream()>>>(
-                xq, xscale, nscale, (const float *)hyper->ptr, normw,
-                (uint32_t)wide, n_embd, rows, eps, weight_bias, round_bf16);
+        /* The three trailing arguments are the Pending arm's: the residual
+         * as a writable pointer, and the owed block output and head.  NULL
+         * on the plain arms, which never touch them. */
+        float *hyper_w = pending_in_norm ? (float *)hyper->ptr : NULL;
+        const float *pblk =
+            pending_in_norm ? (const float *)pending_block->ptr : NULL;
+        const float *pinj =
+            pending_in_norm ? (const float *)pending_inject->ptr : NULL;
+#define QWEN4EXP_HC_NQ_ARGS                                                    \
+        xq, xscale, nscale, (const float *)hyper->ptr, normw, (uint32_t)wide, \
+        n_embd, rows, eps, weight_bias, round_bf16, hyper_w, pblk, pinj
+        if (staged && rows <= 2u) {
+            /* PDL consumer at the decode widths only (rows <= 2): the
+             * kernel's normw prefetch rides the window its stream
+             * predecessor opens (ds4_cuda_qwen4exp.cuh).  With the standalone
+             * inject that predecessor is qwen4exp_hc_inject_kernel, which
+             * triggers at its top; with the inject folded in it is the
+             * block's last kernel, and a predecessor that carries no trigger
+             * opens the window at its completion, which is the plain
+             * dependency.  The hyper and pending reads sit below the fence
+             * either way.  Verify and prefill keep the plain launch. */
+            if (pending_in_norm) {
+                /* PLAIN LAUNCH, deliberately, and this is measured rather
+                 * than argued.  Before the fold the producer of this kernel
+                 * was qwen4exp_hc_inject_kernel, which is single-wave and
+                 * carries a trigger.  The fold removes it, so the producer
+                 * becomes the previous block's last kernel -- the shared
+                 * expert down projection or a GDN/QSA out-projection, each of
+                 * which runs more blocks than the device holds and therefore
+                 * may never carry a trigger (THE DEADLOCK RULE above).  A
+                 * PSS-attributed consumer behind a trigger-less multi-wave
+                 * producer measured 1.0% SLOWER on decode than the same tree
+                 * with the fold off, while the fold itself measured 0.9%
+                 * FASTER once the attribute was out of the picture.  Taking
+                 * the attribute off this one launch keeps every other PDL
+                 * edge in the layer intact.  The kernel body is unchanged:
+                 * its fence is a no-op in a plainly launched kernel. */
+                qwen4exp_hc_norm_quant_kernel<1, 1>
+                    <<<dim3(n_hc, rows, 1u), threads, 0,
+                       cuda_decode_stream()>>>(QWEN4EXP_HC_NQ_ARGS);
+            } else {
+                QWEN4EXP_LAUNCH_PDL(
+                        (qwen4exp_hc_norm_quant_kernel<1, 0>),
+                        (dim3(n_hc, rows, 1u)), threads, 0,
+                        cuda_decode_stream(), QWEN4EXP_HC_NQ_ARGS);
+            }
+        } else if (staged) {
+            if (pending_in_norm) {
+                qwen4exp_hc_norm_quant_kernel<1, 1>
+                    <<<dim3(n_hc, rows, 1u), threads, 0, cuda_decode_stream()>>>(
+                        QWEN4EXP_HC_NQ_ARGS);
+            } else {
+                qwen4exp_hc_norm_quant_kernel<1, 0>
+                    <<<dim3(n_hc, rows, 1u), threads, 0, cuda_decode_stream()>>>(
+                        QWEN4EXP_HC_NQ_ARGS);
+            }
+        } else if (pending_in_norm) {
+            qwen4exp_hc_norm_quant_kernel<0, 1>
+                <<<dim3(n_hc, rows, 1u), threads, 0, cuda_decode_stream()>>>(
+                    QWEN4EXP_HC_NQ_ARGS);
+        } else {
+            qwen4exp_hc_norm_quant_kernel<0, 0>
+                <<<dim3(n_hc, rows, 1u), threads, 0, cuda_decode_stream()>>>(
+                    QWEN4EXP_HC_NQ_ARGS);
+        }
+#undef QWEN4EXP_HC_NQ_ARGS
     }
     if (!cuda_ok(cudaGetLastError(), "qwen4exp_hc_norm_quant launch")) return 0;
 
