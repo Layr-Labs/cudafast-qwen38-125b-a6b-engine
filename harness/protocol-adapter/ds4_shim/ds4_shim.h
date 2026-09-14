@@ -48,6 +48,13 @@ const char *ds4s_open_error(void);
 /* The last failure text for this handle (never NULL). */
 const char *ds4s_last_error(const ds4s_handle *h);
 
+/* The CUDA device's occupancy and bandwidth limits as one compact line, or
+ * the empty string when there is no device.  Never NULL.  Reads device
+ * properties only and caches the result; safe to call once after open.
+ * The resident appends it to the identity so the limits reach the run's
+ * metrics, where a box with no profiler can still read them. */
+const char *ds4s_hw_limits(void);
+
 /* Vocabulary size of the loaded model. */
 int ds4s_vocab_size(const ds4s_handle *h);
 

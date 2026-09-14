@@ -4102,8 +4102,22 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
                 }
             }
         }
-        /* Readers finish before a fast projection warp reuses this tile. */
-        __syncthreads();
+        /* Readers finish before a fast projection warp reuses this tile --
+         * but ONLY a later iteration can reuse it, and at decode width there
+         * is no later iteration.  `cnt` is counts[expert], the number of
+         * (token, slot) pairs that routed to this block's expert; with two
+         * verified rows and ten slots drawn from 512 experts a decode expert
+         * collects one or two pairs, and R is 2, so `take == cnt` and the
+         * loop body runs exactly once.  The barrier then guards a write that
+         * never happens, and it is the most expensive place to put one: it
+         * sits immediately before the block exits, so every warp waits on the
+         * slowest before the SM releases the block's slot, which delays the
+         * next block in a grid of 80 x n_active blocks.  `cnt` is
+         * counts[expert] and `at` is loop-uniform, so the guard is uniform
+         * over the block and the remaining barriers are still met by every
+         * thread together.  Prefill, where cnt does exceed R, keeps the
+         * barrier and is byte-for-byte unaffected. */
+        if (at + R < cnt) __syncthreads();
     }
 }
 
