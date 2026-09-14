@@ -5758,8 +5758,59 @@ __global__ static void matmul_q8_0_preq_rows_exact_tile_kernel(
 /* Two adjacent lanes share a Q8 group. Their integer partials may be
  * combined freely; each even lane keeps its original float group chain.
  * Shared memory remaps the 32 finished chains onto one reduction warp. */
+
+/* MEASURED, and the only surviving register cap besides gate/up's: this is the
+ * LIVE dense decode kernel and it was running at 67% of threads.
+ *
+ * Liveness first, because the obvious kernel is the wrong one.
+ * matmul_q8_0_preq_warp8_kernel is guarded on n_tok == 1 and on n_rows == 1u,
+ * and decode runs TWO rows (draft_tokens=2), so it is cold. This kernel's
+ * decode-width launch is guarded on
+ *   use_dp4a && (n_rows <= 2u || wide_verify3) && out_dim > 512u &&
+ *   (in_dim & 31u) == 0u
+ * at 256 threads, and the dense projections are ~1,700 MB of a ~6.58 GB decode
+ * round (~26%) -- the largest term that had never been profiled on this board.
+ *
+ * Occupancy on device constants (thr/sm=1536 reg/sm=65536), not assumption:
+ *
+ *   natural 51 regs -> 56 at grain 8:  56 x 256 = 14,336  =>  4 blocks (67%)
+ *   __maxnreg__(48):                   5 x 48 x 256 = 61,440 <= 65,536 => 5 (83%)
+ *   __maxnreg__(40):                   6 blocks (100%) but SPILLS, lmem=8
+ *
+ * The ladder, all measured, and grain 8 leaves no point between 40 and 48:
+ *
+ *   | regs | blk/SM | threads | spill  | result                              |
+ *   |------|--------|---------|--------|-------------------------------------|
+ *   |  56  |   4    |   67%   |   no   | natural                             |
+ *   |  48  |   5    |   83%   |   no   | +0.094% decode, paired same-box  <- |
+ *   |  40  |   6    |  100%   | lmem=8 | spilled, reverted (e49cd007)        |
+ *
+ * +0.094% reads like a wash against the 10-bip floor, and it is NOT: draw
+ * 6510b5a1 carried this cap on the previous tip and measured comp@cal 2.4516,
+ * the highest merit on the board, +39 bips over that tip's own 2.4477. It
+ * scored 2.4771 only because the draw was +1.04%, below p25 of 418 runs.
+ *
+ * WHY IT PAYS HERE AND COST -10.2% ON ROUTED DOWN: regime. The identical
+ * intervention -- one grain-step cut on a 256-thread block buying one resident
+ * block -- lost 10.2% on routed down (88500cf1) with lmem=0, because to hit the
+ * cap without spilling ptxas REMATERIALIZES and routed decode is
+ * instruction-bound, so those instructions compete with real work.  Dense runs
+ * at ~58-60% of roofline, bandwidth-bound, so rematerialized instructions hide
+ * behind memory instead. Rematerialization appears NOWHERE in localSizeBytes:
+ * lmem=0 does not mean a cap was free.
+ *
+ * DO NOT re-sweep. 40 spills, grain 8 forecloses 41-47, and pl4 is already
+ * 46 -> 48 allocated so this cap binds only on <2, false>. Bit-exact: a cap
+ * changes ALLOCATION only; ptxas may spill or rematerialize but cannot
+ * reassociate, and this TU is built without --use_fast_math. */
+#if defined(__CUDACC__) && CUDART_VERSION >= 12040
+#define QW_PL_MAXNREG __maxnreg__(48)
+#else
+#define QW_PL_MAXNREG
+#endif
+
 template <int R, bool Streaming = true>
-__global__ static void matmul_q8_0_preq_pair_lanes_kernel(
+__global__ static void QW_PL_MAXNREG matmul_q8_0_preq_pair_lanes_kernel(
         float *out, const unsigned char *w,
         const int8_t *xq, const float *xscale,
         uint64_t out_dim, uint32_t n_rows, uint64_t blocks) {
@@ -17328,13 +17379,18 @@ extern "C" void ds4_gpu_set_q8_mma_pipe_wide(int mode) {
  * per-SM shared memory size, so 101376 means a 100 KiB SM and 227328 means a
  * 228 KiB SM -- which is exactly the fork every occupancy argument about the
  * staged decode kernels turns on. */
+/* Defined below, next to the kernel it reads: a template's attributes can only
+ * be queried after the template is defined, and this function is 1,800 lines
+ * above it. */
+static const char *ds4_gpu_qwen_gdn_proj_limits(void);
+
 extern "C" const char *ds4_gpu_hw_limits(void) {
     /* Sized for the device attributes plus the routed-MoE kernel-limits string,
      * which now carries the two prefill tiles as well.  Oversized on purpose:
      * ds4_resident drops the WHOLE limits string rather than truncating it if it
      * does not fit its own ident buffer, so a tight fit here loses the
      * measurement silently. */
-    static char buf[448];
+    static char buf[896];
     static int built = 0;
     if (built) return buf;
     built = 1;
@@ -17369,7 +17425,76 @@ extern "C" const char *ds4_gpu_hw_limits(void) {
      * is diagnostic only and snprintf keeps it terminated. */
     const char *kl = ds4_gpu_qwen4exp_kernel_limits();
     if (kl && kl[0] && (size_t)n + 2u < sizeof(buf)) {
-        snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", kl);
+        n += snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", kl);
+        if (n < 0 || (size_t)n >= sizeof(buf)) return buf;
+    }
+    /* The live DENSE decode kernel's footprint, so a box can confirm whether
+     * this TU's register cap actually took.  matmul_q8_0_preq_pair_lanes_kernel
+     * <2, false> is the shape decode runs (two draft rows, out_dim > 512); the
+     * warp8 kernel is guarded on n_tok == 1 and is cold, and pl4 is reported
+     * only to show the cap does not bind on it (46 -> 48 allocated anyway).
+     *
+     * QUERY, DO NOT DERIVE: occupancy comes from the runtime rather than from
+     * my own arithmetic, because the whole point is to catch the case where the
+     * arithmetic is wrong.  Both calls are host-side property reads that launch
+     * nothing, and this function has exactly ONE caller, at startup before
+     * bind(), so it cannot touch a timed leg. */
+    {
+        struct cudaFuncAttributes fa;
+        if (cudaFuncGetAttributes(
+                &fa, matmul_q8_0_preq_pair_lanes_kernel<2, false>) == cudaSuccess) {
+            int occ = -1;
+            if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &occ, matmul_q8_0_preq_pair_lanes_kernel<2, false>, 256, 0) !=
+                cudaSuccess) {
+                (void)cudaGetLastError();
+                occ = -1;
+            }
+            n += snprintf(buf + n, sizeof(buf) - (size_t)n,
+                          " pl2[reg=%d smem=%d lmem=%d maxt=%d occ=%d]",
+                          fa.numRegs, (int)fa.sharedSizeBytes,
+                          (int)fa.localSizeBytes, fa.maxThreadsPerBlock, occ);
+            if (n < 0 || (size_t)n >= sizeof(buf)) return buf;
+        } else {
+            (void)cudaGetLastError();
+        }
+        if (cudaFuncGetAttributes(
+                &fa, matmul_q8_0_preq_pair_lanes_kernel<4, false>) == cudaSuccess) {
+            n += snprintf(buf + n, sizeof(buf) - (size_t)n,
+                          " pl4[reg=%d smem=%d lmem=%d maxt=%d]",
+                          fa.numRegs, (int)fa.sharedSizeBytes,
+                          (int)fa.localSizeBytes, fa.maxThreadsPerBlock);
+            if (n < 0 || (size_t)n >= sizeof(buf)) return buf;
+        } else {
+            (void)cudaGetLastError();
+        }
+    }
+    /* The GDN PROJECTION kernel's footprint, reported here for the first time.
+     * `17e2e465` promoted __maxnreg__(40) on qwen_gdn_projection_kernel on the
+     * strength of a HOST-side cuobjdump -res-usage reading (REG:40 STACK:0
+     * LOCAL:0).  cuobjdump reports what ptxas allocated for the compiled
+     * object; it does NOT report what the runtime will actually schedule on
+     * THIS driver, and it cannot report occupancy under the kernel's real
+     * dynamic shared request.  Those are the two numbers the argument for the
+     * cap turns on, and neither has ever been measured on a scored box.
+     *
+     * This matters in both directions.  A register cap on this engine has
+     * failed twice with lmem=0 (rematerialization, -10.2% on routed down) and
+     * once with lmem=8 (a spill on the dense tile at 40).  If the promoted
+     * cap reads lmem != 0 here, the frontier is carrying a spilled kernel and
+     * removing the cap is a real gain nobody has looked for.  If it reads
+     * lmem=0 with occ=6 the cap is sound and this closes the question.
+     *
+     * The occupancy query passes the kernel's REAL dynamic request, computed
+     * the same way the launch computes it (4 rows * blocks * 34 + 16 with
+     * blocks = in_dim/32 = 80 at this width), because occupancy under 0 bytes
+     * would answer a question no launch ever asks. */
+    {
+        const char *gl = ds4_gpu_qwen_gdn_proj_limits();
+        if (gl && gl[0] && (size_t)n + 2u < sizeof(buf)) {
+            n += snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", gl);
+            if (n < 0 || (size_t)n >= sizeof(buf)) return buf;
+        }
     }
     return buf;
 }
@@ -19366,6 +19491,64 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
         }
     }
     }
+}
+
+/* Declared 1,800 lines above, called from ds4_gpu_hw_limits(). Reports the two
+ * instantiations decode actually reaches: <2,true> is the staged two-draft-row
+ * shape, <2,false> the unstaged fallback when the slab is not word-aligned or
+ * DS4_QWEN4EXP_NO_GDN_PANEL is set. Both are host-side property reads that
+ * launch nothing; the sole caller runs once at startup before bind(), so this
+ * cannot touch a timed leg.
+ *
+ * 10896 = 4 rows * 80 blocks * 34 bytes + 16, the launch's own expression at
+ * in_dim = 2560. Passing it is the point: 40 regs * 256 threads * 6 = 61,440
+ * of 65,536 clears the register file, but 6 blocks also want 65,376 bytes of
+ * dynamic shared plus static, and only the runtime knows whether the carveout
+ * it picked leaves room. Arithmetic that stops at the register file is exactly
+ * the arithmetic that has been wrong three times on this engine. */
+static const char *ds4_gpu_qwen_gdn_proj_limits(void) {
+    static char gbuf[224];
+    static int gbuilt = 0;
+    if (gbuilt) return gbuf;
+    gbuilt = 1;
+    gbuf[0] = '\0';
+    int n = 0;
+    struct cudaFuncAttributes fa;
+    if (cudaFuncGetAttributes(&fa, qwen_gdn_projection_kernel<2, true>) ==
+        cudaSuccess) {
+        int occ = -1;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &occ, qwen_gdn_projection_kernel<2, true>, 256, 10896) !=
+            cudaSuccess) {
+            (void)cudaGetLastError();
+            occ = -1;
+        }
+        n += snprintf(gbuf + n, sizeof(gbuf) - (size_t)n,
+                      "gp2s[reg=%d smem=%d lmem=%d maxt=%d occ=%d]",
+                      fa.numRegs, (int)fa.sharedSizeBytes,
+                      (int)fa.localSizeBytes, fa.maxThreadsPerBlock, occ);
+        if (n < 0 || (size_t)n >= sizeof(gbuf)) return gbuf;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaFuncGetAttributes(&fa, qwen_gdn_projection_kernel<2, false>) ==
+        cudaSuccess) {
+        int occ = -1;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &occ, qwen_gdn_projection_kernel<2, false>, 256, 0) !=
+            cudaSuccess) {
+            (void)cudaGetLastError();
+            occ = -1;
+        }
+        n += snprintf(gbuf + n, sizeof(gbuf) - (size_t)n,
+                      " gp2[reg=%d smem=%d lmem=%d occ=%d]",
+                      fa.numRegs, (int)fa.sharedSizeBytes,
+                      (int)fa.localSizeBytes, occ);
+        if (n < 0 || (size_t)n >= sizeof(gbuf)) return gbuf;
+    } else {
+        (void)cudaGetLastError();
+    }
+    return gbuf;
 }
 
 extern "C" int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
