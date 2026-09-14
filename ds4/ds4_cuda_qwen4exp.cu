@@ -2889,6 +2889,35 @@ __device__ __forceinline__ static bool qw_raw_load(
         const cuda_block_q5_1 *xb = (const cuda_block_q5_1 *)row + g;
         if (!qwen4exp_word_aligned(xb)) return false;
         const uint32_t *qw = (const uint32_t *)(const void *)xb;
+        /* Three eight-byte loads instead of six four-byte ones.
+         *
+         * CREDIT: the mechanism and its first measurement are 0xpg's
+         * (`e0a166f`, two-site measurement in `080b87fc`, -1.30% prefill in
+         * both official pairs); the port and its GB10 re-measurement are
+         * newjordan's (`076310c`).  Neither tree reached main, so at this tip
+         * the q5_1 arm still reads its block as six word loads.
+         *
+         * The staging lanes of a warp sit on 24-byte centres of DIFFERENT
+         * rows, so each of the six word loads is its own uncoalesced request.
+         * 24 is not a multiple of 16 -- which is why the uint4 wide arms never
+         * covered q5_1 -- but it is a multiple of 8, and so is every stride
+         * that can place a q5_1 block (block 24, row 480, expert 2560 rows).
+         * An eight-byte-aligned block is therefore exactly three uint2.
+         *
+         * Bit-identical: uint2 .x .y are words 0..1 of the eight bytes at the
+         * address, in address order, so w[] receives the same six values the
+         * loop would have written.  An unaligned block takes the loop.  The
+         * test is on the block address, fixed by the slab strides, so it is
+         * warp-uniform. */
+        if (((uintptr_t)(const void *)xb & 7u) == 0u) {
+            const uint2 q0 = *(const uint2 *)(const void *)(qw + 0);
+            const uint2 q1 = *(const uint2 *)(const void *)(qw + 2);
+            const uint2 q2 = *(const uint2 *)(const void *)(qw + 4);
+            w[0] = q0.x; w[1] = q0.y;
+            w[2] = q1.x; w[3] = q1.y;
+            w[4] = q2.x; w[5] = q2.y;
+            return true;
+        }
 #pragma unroll
         for (int i = 0; i < 6; i++) w[i] = qw[i];
         return true;
@@ -3826,18 +3855,29 @@ __global__ static void qwen4exp_moe_down_combine_kernel(
         uint32_t n_tokens,
         uint32_t n_expert_used,
         uint32_t n_total_expert) {
-    const uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= (uint64_t)n_tokens * out_dim) return;
-    const uint32_t token = (uint32_t)(idx / out_dim);
-    const uint32_t row = (uint32_t)(idx - (uint64_t)token * out_dim);
+    /* A (row, token) grid, so no thread divides a flat index back into
+     * (token, row).  CREDIT: newjordan (`076310c`); it is the same cost
+     * qwen4exp_hc_mix_kernel's grid already removed for the mixer.  The flat
+     * launch paid a 64-bit division and a multiply-subtract on every one of
+     * the 2.6M elements, beside the ten loads and ten adds it guarded.
+     *
+     * The slot walk, the expert-id validity test and the float accumulation
+     * are the flat kernel's statements verbatim.  There is no multiply in the
+     * sum, so no contraction can differ, and the order is ascending slot
+     * either way: every out[token][row] is the same ten numbers added in the
+     * same order. */
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= out_dim) return;
+    const uint32_t token = blockIdx.y;
+    const uint64_t pair0 = (uint64_t)token * n_expert_used;
     float acc = 0.0f;
     for (uint32_t slot = 0; slot < n_expert_used; slot++) {
-        const uint64_t pair = (uint64_t)token * n_expert_used + slot;
+        const uint64_t pair = pair0 + slot;
         const int32_t e = selected[pair];
         if (e < 0 || (uint32_t)e >= n_total_expert) continue;
         acc += partial[pair * out_dim + row];
     }
-    out[idx] = acc;
+    out[(uint64_t)token * out_dim + row] = acc;
 }
 
 
@@ -4148,8 +4188,22 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
                 }
             }
         }
-        /* Readers finish before a fast projection warp reuses this tile. */
-        __syncthreads();
+        /* Readers finish before a fast projection warp reuses this tile --
+         * a hazard only a SECOND iteration of this loop can create, so the
+         * barrier is dead whenever there is no second iteration.
+         *
+         * CREDIT: 0xpg (`37816fd`).  At the decode width the body runs exactly
+         * once: `cnt` is counts[expert], the number of (token, slot) pairs
+         * that routed to this block's expert, and a decode round verifies two
+         * rows each selecting ten of 512 experts, so any one expert collects
+         * one or two of the twenty pairs.  R is 2 for every instantiation the
+         * launcher builds, so cnt <= R and `at + R >= cnt` on the first pass.
+         *
+         * The predicate is BLOCK-UNIFORM and therefore cannot deadlock: cnt is
+         * counts[expert] with expert block-invariant, and `at` is loop-uniform.
+         * Prefill, where cnt genuinely exceeds R, takes the barrier exactly as
+         * before, byte for byte. */
+        if (at + R < cnt) __syncthreads();
     }
 }
 
@@ -7095,9 +7149,18 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         }
 #undef QWEN4EXP_DOWN_MMA
         if (!cuda_ok(cudaGetLastError(), "qwen4exp MoE down tile launch")) return 0;
-        const uint64_t combine_n = (uint64_t)n_tokens * out_dim;
+        /* grid.y carries the token, so the kernel needs no division.  65535
+         * is the hardware ceiling on grid.y; the tower's widest forward is
+         * 1024 rows, and a shape that ever exceeded it would simply be
+         * refused here rather than silently truncated. */
+        if ((uint64_t)n_tokens > 65535u) {
+            (void)cuda_ok(cudaErrorInvalidConfiguration,
+                          "qwen4exp MoE down combine: n_tokens exceeds grid.y");
+            return 0;
+        }
+        const dim3 cb_grid((out_dim + threads - 1u) / threads, n_tokens, 1);
         qwen4exp_moe_down_combine_kernel<<<
-                (unsigned)((combine_n + threads - 1u) / threads), threads, 0,
+                cb_grid, threads, 0,
                 stream>>>(
                 (float *)out->ptr, (const float *)down_partial->ptr,
                 (const int32_t *)selected->ptr, out_dim, n_tokens,
