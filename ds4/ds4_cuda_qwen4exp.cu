@@ -10306,7 +10306,9 @@ __global__ static void qwen4exp_qsa_prep_joint_kernel(
         float eps,float q_offset,float k_offset,const uint32_t *d_pos){
     extern __shared__ float shared[];
     const uint32_t token=blockIdx.y,tid=threadIdx.x,nth=blockDim.x;
-    const bool is_q=Part==0||(Part==2&&(KVFirst?blockIdx.x>=n_head_kv:blockIdx.x<n_head));
+    /* Part 3 is Part 0 without the gate store, for a caller that reads the
+     * gate straight out of `doubled`. */
+    const bool is_q=Part==0||Part==3||(Part==2&&(KVFirst?blockIdx.x>=n_head_kv:blockIdx.x<n_head));
     const uint32_t head=blockIdx.x-(Part==2?(is_q?(KVFirst?n_head_kv:0u):(KVFirst?0u:n_head)):0u);
     const uint32_t heads=is_q?n_head:n_head_kv;
     if(head>=heads||token>=n_tokens)return;
@@ -10317,7 +10319,7 @@ __global__ static void qwen4exp_qsa_prep_joint_kernel(
     float raw=0.0f;
     if(tid<head_dim){
         raw=is_q?doubled[src]:raw_k[src];
-        if(is_q)gate_out[at]=doubled[src+head_dim];
+        if(is_q&&Part!=3)gate_out[at]=doubled[src+head_dim];
         else if(pos<cache_cap)v_cache[(uint64_t)pos*width+head*head_dim+tid]=raw_v[at];
     }
     shared[tid]=tid<head_dim?raw*raw:0.0f;
@@ -12134,6 +12136,78 @@ __global__ static void qwen4exp_qsa_output_gate_kernel(
     out[gid] = out[gid] * (1.0f / (1.0f + expf(-gate[gid])));
 }
 
+/* qwen4exp_qsa_output_gate_kernel with its one reader's quantize folded in.
+ *
+ * The gated attention output has one reader, the attn_output projection, whose
+ * first act was quantize_q8_0_f32_rows_warp_kernel over the rows the gate just
+ * stored.  Here the gate's own statement makes the value, and instead of being
+ * stored and read back by a second launch it goes through the Q8_0 seam: the
+ * same flushed fabs, the same fmaxf butterfly over the same 32 lanes, and the
+ * five steps in the form --use_fast_math gave the standalone kernel.  The launch
+ * geometry IS the standalone kernel's -- 256-thread blocks of 8 warps over the
+ * flat value index -- and a q_width row is a whole number of blocks (the entry
+ * refuses a count that is not), so block b's warp w is Q8_0 pair 8b + w, the
+ * standalone kernel's row * blocks + group. */
+__global__ static void qwen4exp_qsa_output_gate_quant_kernel(
+        int8_t      *xq,
+        float       *xscale,
+        const float *gate,
+        const float *out,
+        uint32_t     n_values) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const float v = gid < n_values
+        ? out[gid] * (1.0f / (1.0f + expf(-gate[gid])))
+        : 0.0f;
+    const float vz = qwen4exp_q8_ftz(v);
+    float a = qwen4exp_q8_ftz(fabsf(v));
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+    }
+    const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
+    const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
+    const uint64_t pair = (uint64_t)blockIdx.x * 8u + warp;
+    if (lane == 0u) xscale[pair] = d;
+    int q = (int)lrintf(qwen4exp_q8_ftz(vz * id));
+    q = q > 127 ? 127 : (q < -128 ? -128 : q);
+    xq[pair * 32u + lane] = (int8_t)q;
+}
+
+/* qwen4exp_qsa_output_gate_quant_kernel reading the gate where the Q prep would
+ * have copied it from: doubled[src + head_dim], src = token*2*width +
+ * head*2*head_dim + tid.  With head_dim equal to the 256-thread block (the
+ * entry refuses otherwise), gid % head_dim is threadIdx.x, so that index is
+ * 2*gid - tid + head_dim.  The loaded bits are the bits the copy stored. */
+__global__ static void qwen4exp_qsa_output_gate_doubled_quant_kernel(
+        int8_t      *xq,
+        float       *xscale,
+        const float *doubled,
+        const float *out,
+        uint32_t     n_values) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const float v = gid < n_values
+        ? out[gid] * (1.0f / (1.0f + expf(-doubled[2u * gid - threadIdx.x +
+                                                   blockDim.x])))
+        : 0.0f;
+    const float vz = qwen4exp_q8_ftz(v);
+    float a = qwen4exp_q8_ftz(fabsf(v));
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+    }
+    const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
+    const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
+    const uint64_t pair = (uint64_t)blockIdx.x * 8u + warp;
+    if (lane == 0u) xscale[pair] = d;
+    int q = (int)lrintf(qwen4exp_q8_ftz(vz * id));
+    q = q > 127 ? 127 : (q < -128 ? -128 : q);
+    xq[pair * 32u + lane] = (int8_t)q;
+}
+
 /* Largest power of two that is <= `value` and <= 1024, the CUDA block cap. */
 static uint32_t qwen4exp_cuda_threads(uint32_t value) {
     uint32_t nth = 1;
@@ -12359,6 +12433,41 @@ extern "C" int ds4_gpu_qwen4exp_qsa_prep_q_fused_dpos_tensor(
             n_tokens,n_head,0,head_dim,rot_dim,pos0,0,eps,weight_offset,0.0f,
             d_pos?(const uint32_t*)d_pos->ptr:NULL);
     return cuda_ok(cudaGetLastError(), "Qwen4-Exp fused Q-prep launch");
+}
+
+/* ds4_gpu_qwen4exp_qsa_prep_q_fused_dpos_tensor without the gate copy: the
+ * caller reads the gate straight out of `doubled`, which nothing writes between
+ * this prep and the output gate. */
+extern "C" int ds4_gpu_qwen4exp_qsa_prep_q_nogate_dpos_tensor(
+        ds4_gpu_tensor       *q,
+        const ds4_gpu_tensor *doubled,
+        const ds4_gpu_tensor *weight,
+        const ds4_gpu_tensor *inv_freq,
+        uint32_t              n_tokens,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        uint32_t              rot_dim,
+        uint32_t              pos0,
+        float                 eps,
+        float                 weight_offset,
+        const ds4_gpu_tensor *d_pos) {
+    if (n_tokens == 0u || n_head == 0u || head_dim == 0u || rot_dim == 0u ||
+        rot_dim > head_dim || (rot_dim % 2u) != 0u) return 0;
+    const uint64_t q_elems = (uint64_t)n_tokens * n_head * head_dim;
+    if (!glm53_cuda_tensor_has(q, q_elems, sizeof(float)) ||
+        !glm53_cuda_tensor_has(doubled, 2u * q_elems, sizeof(float)) ||
+        !glm53_cuda_tensor_has(weight, head_dim, sizeof(float)) ||
+        !glm53_cuda_tensor_has(inv_freq, rot_dim / 2u, sizeof(float))) {
+        return 0;
+    }
+    const dim3 grid(n_head, n_tokens);
+    const uint32_t nth = qwen4exp_cuda_threads(head_dim);
+    qwen4exp_qsa_prep_joint_kernel<3><<<grid,nth,nth*sizeof(float),cuda_decode_stream()>>>(
+            (const float*)doubled->ptr,NULL,NULL,(const float*)weight->ptr,NULL,
+            (const float*)inv_freq->ptr,(float*)q->ptr,NULL,NULL,NULL,NULL,
+            n_tokens,n_head,0,head_dim,rot_dim,pos0,0,eps,weight_offset,0.0f,
+            d_pos?(const uint32_t*)d_pos->ptr:NULL);
+    return cuda_ok(cudaGetLastError(), "Qwen4-Exp fused Q-prep (no gate copy) launch");
 }
 
 extern "C" int ds4_gpu_qwen4exp_qsa_prep_q_fused_tensor(
@@ -12944,6 +13053,73 @@ extern "C" int ds4_gpu_qwen4exp_qsa_output_gate_tensor(
         (unsigned)((n_values + 255u) / 256u), 256u, 0, cuda_decode_stream()>>>(
             (const float *)gate->ptr, (float *)out->ptr, n_values);
     return cuda_ok(cudaGetLastError(), "Qwen4-Exp QSA output gate launch");
+}
+
+/* `out *= sigmoid(gate)` written as the Q8_0 bytes (at `q_offset`) and per-block
+ * scales (at `s_offset`) of `q8`, in the layout the preq projections read,
+ * instead of in place: the attn_output projection's quantize folded into the
+ * gate.  `out` is left as the attention wrote it.  Whole 256-value blocks only. */
+extern "C" int ds4_gpu_qwen4exp_qsa_output_gate_q8_tensor(
+        ds4_gpu_tensor       *q8,
+        uint64_t              q_offset,
+        uint64_t              s_offset,
+        const ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *gate,
+        uint32_t              n_values) {
+    const uint64_t qbytes = n_values;
+    const uint64_t sbytes = (uint64_t)(n_values / 32u) * sizeof(float);
+    if (n_values == 0u || (n_values & 255u) != 0u || !q8 || !q8->ptr ||
+        !glm53_cuda_tensor_has(out, n_values, sizeof(float)) ||
+        !glm53_cuda_tensor_has(gate, n_values, sizeof(float)) ||
+        (q_offset & 15u) != 0u || (s_offset & 15u) != 0u ||
+        q_offset > q8->bytes || s_offset > q8->bytes ||
+        q8->bytes - q_offset < qbytes || q8->bytes - s_offset < sbytes ||
+        (q_offset < s_offset ? q_offset + qbytes > s_offset
+                             : s_offset + sbytes > q_offset) ||
+        ds4_tensor_device_idx(q8) != ds4_tensor_device_idx(out)) {
+        return 0;
+    }
+    qwen4exp_qsa_output_gate_quant_kernel<<<
+        (unsigned)(n_values / 256u), 256u, 0, cuda_decode_stream()>>>(
+            (int8_t *)((char *)q8->ptr + q_offset),
+            (float *)((char *)q8->ptr + s_offset),
+            (const float *)gate->ptr, (const float *)out->ptr, n_values);
+    return cuda_ok(cudaGetLastError(), "Qwen4-Exp QSA output gate quantize launch");
+}
+
+/* ds4_gpu_qwen4exp_qsa_output_gate_q8_tensor with the gate read out of the
+ * doubled query projection (2 * n_values floats, gate in the upper half of
+ * every 2 * head_dim span) instead of a copied gate buffer.  head_dim must be
+ * 256, the launch block. */
+extern "C" int ds4_gpu_qwen4exp_qsa_output_gate_doubled_q8_tensor(
+        ds4_gpu_tensor       *q8,
+        uint64_t              q_offset,
+        uint64_t              s_offset,
+        const ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *doubled,
+        uint32_t              n_values,
+        uint32_t              head_dim) {
+    const uint64_t qbytes = n_values;
+    const uint64_t sbytes = (uint64_t)(n_values / 32u) * sizeof(float);
+    if (n_values == 0u || head_dim != 256u || (n_values & 255u) != 0u ||
+        !q8 || !q8->ptr ||
+        !glm53_cuda_tensor_has(out, n_values, sizeof(float)) ||
+        !glm53_cuda_tensor_has(doubled, 2u * (uint64_t)n_values, sizeof(float)) ||
+        (q_offset & 15u) != 0u || (s_offset & 15u) != 0u ||
+        q_offset > q8->bytes || s_offset > q8->bytes ||
+        q8->bytes - q_offset < qbytes || q8->bytes - s_offset < sbytes ||
+        (q_offset < s_offset ? q_offset + qbytes > s_offset
+                             : s_offset + sbytes > q_offset) ||
+        ds4_tensor_device_idx(q8) != ds4_tensor_device_idx(out)) {
+        return 0;
+    }
+    qwen4exp_qsa_output_gate_doubled_quant_kernel<<<
+        (unsigned)(n_values / 256u), 256u, 0, cuda_decode_stream()>>>(
+            (int8_t *)((char *)q8->ptr + q_offset),
+            (float *)((char *)q8->ptr + s_offset),
+            (const float *)doubled->ptr, (const float *)out->ptr, n_values);
+    return cuda_ok(cudaGetLastError(),
+                   "Qwen4-Exp QSA output gate (doubled) quantize launch");
 }
 
 /* =========================================================================
