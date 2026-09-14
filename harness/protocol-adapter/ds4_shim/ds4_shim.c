@@ -112,6 +112,11 @@ const char *ds4s_last_error(const ds4s_handle *h) {
     return h && h->err[0] ? h->err : "";
 }
 
+const char *ds4s_hw_limits(void) {
+    const char *s = ds4_gpu_hw_limits();
+    return s ? s : "";
+}
+
 int ds4s_vocab_size(const ds4s_handle *h) {
     return h && h->engine ? ds4_engine_vocab_size(h->engine) : 0;
 }

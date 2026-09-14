@@ -17307,6 +17307,39 @@ extern "C" void ds4_gpu_set_q8_mma_pipe_wide(int mode) {
     g_q8_mma_pipe_wide = mode;
 }
 
+/* The device's occupancy and bandwidth limits, as a compact string the caller
+ * can append to an identity that reaches the run's metrics.  See ds4.h for why
+ * this is worth publishing.  Device properties only; built once. */
+extern "C" const char *ds4_gpu_hw_limits(void) {
+    static char buf[320];
+    static int built = 0;
+    if (built) return buf;
+    built = 1;
+    buf[0] = '\0';
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return buf;
+    cudaDeviceProp p;
+    if (cudaGetDeviceProperties(&p, dev) != cudaSuccess) return buf;
+    /* memoryClockRate is in kHz and the bus width in bits; DDR moves two words
+     * per cycle, so peak = clock * 2 * width / 8.  Reported in GB/s (1e9). */
+    const double peak_gbs =
+        (double)p.memoryClockRate * 1e3 * 2.0 * (double)p.memoryBusWidth / 8.0 / 1e9;
+    snprintf(buf, sizeof(buf),
+             "smem/sm=%d smem/blk=%d smem/blk_optin=%d regs/sm=%d thr/sm=%d "
+             "blk/sm=%d sm=%d l2=%d buswidth=%d memclk_khz=%d peak_gb_s=%.1f",
+             (int)p.sharedMemPerMultiprocessor, (int)p.sharedMemPerBlock,
+             (int)p.sharedMemPerBlockOptin, (int)p.regsPerMultiprocessor,
+             (int)p.maxThreadsPerMultiProcessor,
+#if CUDART_VERSION >= 11000
+             (int)p.maxBlocksPerMultiProcessor,
+#else
+             0,
+#endif
+             (int)p.multiProcessorCount, (int)p.l2CacheSize,
+             (int)p.memoryBusWidth, (int)p.memoryClockRate, peak_gbs);
+    return buf;
+}
+
 /* The BN of the last launch the pipe took (0 until one does), so a box can
  * tell which rung a valve setting actually routed through -- a refused
  * shared-memory opt-in falls back silently, and bytes alone cannot show it. */
