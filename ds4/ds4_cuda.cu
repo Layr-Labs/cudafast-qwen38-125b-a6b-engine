@@ -5774,11 +5774,134 @@ __global__ static void matmul_q8_0_preq_rows_exact_tile_kernel(
 /* Two adjacent lanes share a Q8 group. Their integer partials may be
  * combined freely; each even lane keeps its original float group chain.
  * Shared memory remaps the 32 finished chains onto one reduction warp. */
-template <int R, bool Streaming = true>
-__global__ static void matmul_q8_0_preq_pair_lanes_kernel(
+
+/* MEASURED, and the only surviving register cap besides gate/up's: this is the
+ * LIVE dense decode kernel and it was running at 67% of threads.
+ *
+ * Liveness first, because the obvious kernel is the wrong one.
+ * matmul_q8_0_preq_warp8_kernel is guarded on n_tok == 1 and on n_rows == 1u,
+ * and decode runs TWO rows (draft_tokens=2), so it is cold. This kernel's
+ * decode-width launch is guarded on
+ *   use_dp4a && (n_rows <= 2u || wide_verify3) && out_dim > 512u &&
+ *   (in_dim & 31u) == 0u
+ * at 256 threads, and the dense projections are ~1,700 MB of a ~6.58 GB decode
+ * round (~26%) -- the largest term that had never been profiled on this board.
+ *
+ * Occupancy on device constants (thr/sm=1536 reg/sm=65536), not assumption:
+ *
+ *   natural 51 regs -> 56 at grain 8:  56 x 256 = 14,336  =>  4 blocks (67%)
+ *   __maxnreg__(48):                   5 x 48 x 256 = 61,440 <= 65,536 => 5 (83%)
+ *   __maxnreg__(40):                   6 blocks (100%) but SPILLS, lmem=8
+ *
+ * The ladder, all measured, and grain 8 leaves no point between 40 and 48:
+ *
+ *   | regs | blk/SM | threads | spill  | result                              |
+ *   |------|--------|---------|--------|-------------------------------------|
+ *   |  56  |   4    |   67%   |   no   | natural                             |
+ *   |  48  |   5    |   83%   |   no   | +0.094% decode, paired same-box  <- |
+ *   |  40  |   6    |  100%   | lmem=8 | spilled, reverted (e49cd007)        |
+ *
+ * +0.094% reads like a wash against the 10-bip floor, and it is NOT: draw
+ * 6510b5a1 carried this cap on the previous tip and measured comp@cal 2.4516,
+ * the highest merit on the board, +39 bips over that tip's own 2.4477. It
+ * scored 2.4771 only because the draw was +1.04%, below p25 of 418 runs.
+ *
+ * WHY IT PAYS HERE AND COST -10.2% ON ROUTED DOWN: regime. The identical
+ * intervention -- one grain-step cut on a 256-thread block buying one resident
+ * block -- lost 10.2% on routed down (88500cf1) with lmem=0, because to hit the
+ * cap without spilling ptxas REMATERIALIZES and routed decode is
+ * instruction-bound, so those instructions compete with real work.  Dense runs
+ * at ~58-60% of roofline, bandwidth-bound, so rematerialized instructions hide
+ * behind memory instead. Rematerialization appears NOWHERE in localSizeBytes:
+ * lmem=0 does not mean a cap was free.
+ *
+ * DO NOT re-sweep. 40 spills, grain 8 forecloses 41-47, and pl4 is already
+ * 46 -> 48 allocated so this cap binds only on <2, false>. Bit-exact: a cap
+ * changes ALLOCATION only; ptxas may spill or rematerialize but cannot
+ * reassociate, and this TU is built without --use_fast_math. */
+#if defined(__CUDACC__) && CUDART_VERSION >= 12040
+#define QW_PL_MAXNREG __maxnreg__(48)
+#else
+#define QW_PL_MAXNREG
+#endif
+
+/* Stage: the panel mechanism, ported to the last kernel on this engine that has
+ * the shape it was invented for.
+ *
+ * This kernel's weight read is byte-for-byte the same funnel-shift decoder as
+ * qwen_gdn_projection_kernel's q8_0 arm: a lane pair straddles one 34-byte
+ * q8_0 block, and each lane issues FOUR 4-byte word loads plus a 2-byte tail
+ * plus a 2-byte scale to assemble 16 payload bytes. Six transactions per lane
+ * per block. The bytes themselves are nearly perfectly used -- a warp's 16
+ * groups span 544 consecutive bytes and consume 512 of them -- which is exactly
+ * why a byte-count cost model says there is nothing here. The cost is
+ * TRANSACTION and LSU-issue count, and it is invisible in bytes.
+ *
+ * The panel is available because a block's four rows are CONSECUTIVE rows of
+ * one slab: row = blockIdx.x * 4 + local_row and wr = w + row * blocks * 34,
+ * so the block's whole working set is the single dense run
+ * [4 * blockIdx.x * blocks * 34, +4 * blocks * 34). Copy that run once with
+ * 16-byte loads, then let the decoder run against shared memory unchanged.
+ * Same bytes, same order, same funnel shifts, same dp4a operand stream --
+ * bit-exact by construction, which matters because the correctness gate here
+ * is an exact golden-token match and not a tolerance.
+ *
+ * This mechanism has been promoted twice on this board by two other solvers,
+ * on the GDN projection weight panel (0xpg, b13998e) and on the shared expert
+ * down projection (DJLougen, ae36577). Neither applied it here.
+ *
+ * THE FENCE ORDER IS LOAD-BEARING and it is where 0xpg's first attempt lost 39
+ * bips: the fill goes ABOVE the grid-dependency sync so it flies while the
+ * predecessor drains, and the barrier goes BELOW it. A barrier above the fence
+ * serializes the two and destroys an overlap this kernel already had. The fill
+ * is therefore its own drain, and the barrier is nearly satisfied by the time
+ * it is reached.
+ *
+ * Streaming is refused under Stage: __ldcs is a global-memory hint and the
+ * staged decoder reads shared memory. The static_assert makes that a compile
+ * error rather than a silent miscompile if a future launch site gets it wrong. */
+template <int R, bool Streaming = true, bool Stage = false>
+__global__ static void QW_PL_MAXNREG matmul_q8_0_preq_pair_lanes_kernel(
         float *out, const unsigned char *w,
         const int8_t *xq, const float *xscale,
         uint64_t out_dim, uint32_t n_rows, uint64_t blocks) {
+    static_assert(!(Stage && Streaming),
+                  "the staged decoder reads shared memory; __ldcs is a global hint");
+    extern __shared__ uint4 qw_pl_panel[];
+    char *const ppanel = (char *)qw_pl_panel;
+    if (Stage) {
+        /* One dense run of four consecutive rows, grid-strided by the whole
+         * block. The launch gates blocks % 8 == 0, which makes every row base
+         * (local_row * blocks * 34) 16-byte aligned inside the panel -- needed
+         * because the decoder's first word load rounds its address DOWN to a
+         * 4-byte boundary, and a 2-byte-aligned row 0 would read below the
+         * allocation. The launch also gates out_dim % 4 == 0, so the last
+         * block's run ends exactly at the slab end and the fill never reads
+         * past it; no slop byte is required. */
+        const uint64_t panel_bytes = 4ull * blocks * 34u;
+        const char *const gp = (const char *)w + (uint64_t)blockIdx.x * panel_bytes;
+        if (((uintptr_t)gp & 15u) == 0u) {
+            for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
+                 i += 256ull * 16u) {
+                if (i + 16u <= panel_bytes)
+                    *(uint4 *)(ppanel + i) = *(const uint4 *)(const void *)(gp + i);
+                else
+                    for (uint64_t j = i; j < panel_bytes; j++) ppanel[j] = gp[j];
+            }
+        } else {
+            for (uint64_t i = (uint64_t)threadIdx.x * 4u; i < panel_bytes;
+                 i += 256ull * 4u) {
+                if (i + 4u <= panel_bytes)
+                    *(uint32_t *)(ppanel + i) =
+                        *(const uint32_t *)(const void *)(gp + i);
+                else
+                    for (uint64_t j = i; j < panel_bytes; j++) ppanel[j] = gp[j];
+            }
+        }
+        /* The drain absorbs the fill. Order matters -- see the header. */
+        QWEN4EXP_PDL_SYNC();
+        __syncthreads();
+    }
     const uint32_t local_row = threadIdx.x >> 6u;
     const uint32_t local_lane = threadIdx.x & 63u;
     const uint32_t group = local_lane >> 1u;
@@ -5791,7 +5914,9 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
     for (int r = 0; r < R; r++) acc[r] = 0.0f;
 
     if (row < out_dim) {
-        const unsigned char *wr = w + row * blocks * 34u;
+        const unsigned char *wr = Stage
+            ? (const unsigned char *)(ppanel + (uint64_t)local_row * blocks * 34u)
+            : (w + row * blocks * 34u);
         /* PDL: the first walk step (b = group) with its WEIGHT loads issued
          * above the fence and held in registers, so they fly while the
          * quantizer drains.  The activation reads (xq/xscale, that kernel's
@@ -5828,7 +5953,9 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
             const float ws = Streaming
                 ? __half2float(__ushort_as_half(__ldcs((const uint16_t *)scale)))
                 : __half2float(*scale);
-            QWEN4EXP_PDL_SYNC();
+            /* The staged arm already waited, at block scope, above.  Exactly
+             * one grid dependency sync per thread either way. */
+            if (!Stage) QWEN4EXP_PDL_SYNC();
 #pragma unroll
             for (int r = 0; r < R; r++) {
                 if ((uint32_t)r < take) {
@@ -17344,13 +17471,18 @@ extern "C" void ds4_gpu_set_q8_mma_pipe_wide(int mode) {
  * per-SM shared memory size, so 101376 means a 100 KiB SM and 227328 means a
  * 228 KiB SM -- which is exactly the fork every occupancy argument about the
  * staged decode kernels turns on. */
+/* Defined below, next to the kernel it reads: a template's attributes can only
+ * be queried after the template is defined, and this function is 1,800 lines
+ * above it. */
+static const char *ds4_gpu_qwen_gdn_proj_limits(void);
+
 extern "C" const char *ds4_gpu_hw_limits(void) {
     /* Sized for the device attributes plus the routed-MoE kernel-limits string,
      * which now carries the two prefill tiles as well.  Oversized on purpose:
      * ds4_resident drops the WHOLE limits string rather than truncating it if it
      * does not fit its own ident buffer, so a tight fit here loses the
      * measurement silently. */
-    static char buf[448];
+    static char buf[1536];
     static int built = 0;
     if (built) return buf;
     built = 1;
@@ -17360,16 +17492,40 @@ extern "C" const char *ds4_gpu_hw_limits(void) {
         (void)cudaGetLastError();
         return buf;
     }
-    const cudaDeviceAttr want[6] = {
+    /* The last six are the ones this campaign has been guessing at.
+     *
+     * Every roofline figure ever published for this engine -- mine and other
+     * solvers' -- was computed against an ASSUMED peak bandwidth, and the
+     * conclusions drawn from those figures decided which kernels people
+     * optimized.  bus_bits and mem_khz give the real number:
+     * peak = 2 * mem_khz * 1000 * bus_bits / 8 bytes/s for GDDR/LPDDR.  A
+     * "58% of roofline" claim is worth nothing until that denominator is
+     * measured, and it costs one host-side attribute read to measure it.
+     *
+     * l2, l2_persist and apw_max decide whether L2 residency control is even
+     * available here.  The engine uses none of it: there is no
+     * cudaAccessPolicyWindow, no cudaAccessPropertyPersisting and no
+     * cudaLimitPersistingL2CacheSize anywhere in the tree.  Before arming any
+     * of that I want to know the carve-out ceiling, because if l2_persist is 0
+     * the whole class is unavailable and nobody should spend a draw finding
+     * out, and if it is large it is the first genuinely untouched mechanism
+     * class left on this benchmark. */
+    const cudaDeviceAttr want[12] = {
         cudaDevAttrMaxSharedMemoryPerBlockOptin,
         cudaDevAttrMultiProcessorCount,
         cudaDevAttrComputeCapabilityMajor,
         cudaDevAttrComputeCapabilityMinor,
         cudaDevAttrIntegrated,
         cudaDevAttrCooperativeLaunch,
+        cudaDevAttrL2CacheSize,
+        cudaDevAttrMaxPersistingL2CacheSize,
+        cudaDevAttrMaxAccessPolicyWindowSize,
+        cudaDevAttrGlobalMemoryBusWidth,
+        cudaDevAttrMemoryClockRate,
+        cudaDevAttrClockRate,
     };
-    int got[6];
-    for (int i = 0; i < 6; i++) {
+    int got[12];
+    for (int i = 0; i < 12; i++) {
         got[i] = -1;
         if (cudaDeviceGetAttribute(&got[i], want[i], dev) != cudaSuccess) {
             (void)cudaGetLastError();
@@ -17377,15 +17533,113 @@ extern "C" const char *ds4_gpu_hw_limits(void) {
         }
     }
     int n = snprintf(buf, sizeof(buf),
-                     "smem/blk_optin=%d sm=%d cc=%d.%d integrated=%d coop=%d",
-                     got[0], got[1], got[2], got[3], got[4], got[5]);
-    if (n < 0) { buf[0] = '\0'; return buf; }
+                     "smem/blk_optin=%d sm=%d cc=%d.%d integrated=%d coop=%d "
+                     "l2=%d l2_persist=%d apw_max=%d bus_bits=%d mem_khz=%d "
+                     "sm_khz=%d",
+                     got[0], got[1], got[2], got[3], got[4], got[5],
+                     got[6], got[7], got[8], got[9], got[10], got[11]);
+    if (n < 0 || (size_t)n >= sizeof(buf)) { buf[0] = '\0'; return buf; }
     /* The register/shared footprint of the two routed-MoE decode kernels, from
      * the translation unit that owns them.  Truncation is harmless: the string
      * is diagnostic only and snprintf keeps it terminated. */
     const char *kl = ds4_gpu_qwen4exp_kernel_limits();
     if (kl && kl[0] && (size_t)n + 2u < sizeof(buf)) {
-        snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", kl);
+        n += snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", kl);
+        if (n < 0 || (size_t)n >= sizeof(buf)) return buf;
+    }
+    /* The live DENSE decode kernel's footprint, so a box can confirm whether
+     * this TU's register cap actually took.  matmul_q8_0_preq_pair_lanes_kernel
+     * <2, false> is the shape decode runs (two draft rows, out_dim > 512); the
+     * warp8 kernel is guarded on n_tok == 1 and is cold, and pl4 is reported
+     * only to show the cap does not bind on it (46 -> 48 allocated anyway).
+     *
+     * QUERY, DO NOT DERIVE: occupancy comes from the runtime rather than from
+     * my own arithmetic, because the whole point is to catch the case where the
+     * arithmetic is wrong.  Both calls are host-side property reads that launch
+     * nothing, and this function has exactly ONE caller, at startup before
+     * bind(), so it cannot touch a timed leg. */
+    {
+        struct cudaFuncAttributes fa;
+        if (cudaFuncGetAttributes(
+                &fa, matmul_q8_0_preq_pair_lanes_kernel<2, false>) == cudaSuccess) {
+            int occ = -1;
+            if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &occ, matmul_q8_0_preq_pair_lanes_kernel<2, false>, 256, 0) !=
+                cudaSuccess) {
+                (void)cudaGetLastError();
+                occ = -1;
+            }
+            n += snprintf(buf + n, sizeof(buf) - (size_t)n,
+                          " pl2[reg=%d smem=%d lmem=%d maxt=%d occ=%d]",
+                          fa.numRegs, (int)fa.sharedSizeBytes,
+                          (int)fa.localSizeBytes, fa.maxThreadsPerBlock, occ);
+            if (n < 0 || (size_t)n >= sizeof(buf)) return buf;
+        } else {
+            (void)cudaGetLastError();
+        }
+        /* The STAGED dense instantiation. Two things can go wrong invisibly and
+         * this is how they are caught: the panel's address arithmetic can push
+         * the kernel back over the 48-register cap into a spill, and 5 resident
+         * blocks * 10880 dynamic bytes can fail to fit whatever carveout the
+         * runtime picked -- in which case the fetch shape was bought with the
+         * residency the cap was added to get, and the arm is a net loss that
+         * the composite alone could not explain. Occupancy is queried with the
+         * launch's own byte count for the width decode runs. */
+        if (cudaFuncGetAttributes(
+                &fa, matmul_q8_0_preq_pair_lanes_kernel<2, false, true>) ==
+            cudaSuccess) {
+            int occ = -1;
+            if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &occ, matmul_q8_0_preq_pair_lanes_kernel<2, false, true>, 256,
+                    10880) != cudaSuccess) {
+                (void)cudaGetLastError();
+                occ = -1;
+            }
+            n += snprintf(buf + n, sizeof(buf) - (size_t)n,
+                          " pl2s[reg=%d smem=%d lmem=%d occ=%d]",
+                          fa.numRegs, (int)fa.sharedSizeBytes,
+                          (int)fa.localSizeBytes, occ);
+            if (n < 0 || (size_t)n >= sizeof(buf)) return buf;
+        } else {
+            (void)cudaGetLastError();
+        }
+        if (cudaFuncGetAttributes(
+                &fa, matmul_q8_0_preq_pair_lanes_kernel<4, false>) == cudaSuccess) {
+            n += snprintf(buf + n, sizeof(buf) - (size_t)n,
+                          " pl4[reg=%d smem=%d lmem=%d maxt=%d]",
+                          fa.numRegs, (int)fa.sharedSizeBytes,
+                          (int)fa.localSizeBytes, fa.maxThreadsPerBlock);
+            if (n < 0 || (size_t)n >= sizeof(buf)) return buf;
+        } else {
+            (void)cudaGetLastError();
+        }
+    }
+    /* The GDN PROJECTION kernel's footprint, reported here for the first time.
+     * `17e2e465` promoted __maxnreg__(40) on qwen_gdn_projection_kernel on the
+     * strength of a HOST-side cuobjdump -res-usage reading (REG:40 STACK:0
+     * LOCAL:0).  cuobjdump reports what ptxas allocated for the compiled
+     * object; it does NOT report what the runtime will actually schedule on
+     * THIS driver, and it cannot report occupancy under the kernel's real
+     * dynamic shared request.  Those are the two numbers the argument for the
+     * cap turns on, and neither has ever been measured on a scored box.
+     *
+     * This matters in both directions.  A register cap on this engine has
+     * failed twice with lmem=0 (rematerialization, -10.2% on routed down) and
+     * once with lmem=8 (a spill on the dense tile at 40).  If the promoted
+     * cap reads lmem != 0 here, the frontier is carrying a spilled kernel and
+     * removing the cap is a real gain nobody has looked for.  If it reads
+     * lmem=0 with occ=6 the cap is sound and this closes the question.
+     *
+     * The occupancy query passes the kernel's REAL dynamic request, computed
+     * the same way the launch computes it (4 rows * blocks * 34 + 16 with
+     * blocks = in_dim/32 = 80 at this width), because occupancy under 0 bytes
+     * would answer a question no launch ever asks. */
+    {
+        const char *gl = ds4_gpu_qwen_gdn_proj_limits();
+        if (gl && gl[0] && (size_t)n + 2u < sizeof(buf)) {
+            n += snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", gl);
+            if (n < 0 || (size_t)n >= sizeof(buf)) return buf;
+        }
     }
     return buf;
 }
@@ -17708,12 +17962,75 @@ static int cuda_matmul_q8_0_preq_rows_exact(
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
                         out_dim, n_rows, blocks);
             } else {
-                QWEN4EXP_LAUNCH_PDL(
-                        (matmul_q8_0_preq_pair_lanes_kernel<2, false>),
-                        (dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u)),
-                        256, 0, cuda_decode_stream(),
-                        (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
-                        out_dim, n_rows, blocks);
+                /* The live decode shape: two draft rows, grid.y = 1. Stage the
+                 * block's four-row weight run into shared memory when the run
+                 * is exactly in bounds and exactly aligned.
+                 *
+                 * out_dim % 4 == 0 keeps the last block's run inside the slab.
+                 * blocks % 8 == 0 makes blocks * 34 a multiple of 16, so every
+                 * row base inside the panel is 16-byte aligned and the
+                 * decoder's round-down-to-4 cannot reach below the allocation.
+                 * A 16-byte aligned slab base then makes every block's global
+                 * run 16-byte aligned as well; the kernel re-checks and falls
+                 * back to a 4-byte fill rather than trusting this.
+                 *
+                 * The 20224-byte ceiling is an OCCUPANCY gate, not a hardware
+                 * one: this kernel is capped at 48 registers to hold 5 blocks
+                 * per SM, and 5 * 20224 = 101120 fits the 101376-byte SM.
+                 * Anything wider would buy a fetch shape by giving back the
+                 * residency the register cap was added to get, so it stands
+                 * down instead. It is also under 48 KiB, so no dynamic shared
+                 * opt-in is needed and there is no silent-refusal path.
+                 *
+                 * At the width decode actually runs (in_dim 2560, blocks 80)
+                 * the panel is 4 * 80 * 34 = 10880 bytes.
+                 *
+                 * MEASURED -4.1% DECODE AND THEREFORE OFF BY DEFAULT. `2e9b4071`
+                 * on spark-8 posted decode_speedup 2.11499 where the identical
+                 * tree without the panel posted 2.205971 on the SAME box
+                 * (`6510b5a1`) -- about 4.8 sigma against a 0.86% leg SD, so
+                 * this is not a draw artifact. The probe was clean:
+                 * pl2s[reg=48 smem=512 lmem=0 occ=5], no spill, residency held,
+                 * so the mechanism deployed exactly as designed and still lost.
+                 *
+                 * WHY, because the reason is the transferable part: I justified
+                 * this by transaction count and that was the wrong reading. A
+                 * warp's 16 groups here span 544 consecutive bytes and consume
+                 * 512 of them -- 94%. The two promoted panels this was ported
+                 * from were fixing spans that were genuinely wasteful (0xpg's
+                 * GDN arm used ~128 of ~544 bytes per lane group; DJLougen's
+                 * shared-down fetched sub-word pieces on 34-byte strides with 20
+                 * of 32 lanes live). THIS kernel had nothing to coalesce, so the
+                 * fill bought a shared-memory round trip and a block barrier for
+                 * zero reduction in global traffic, on a path that is
+                 * bandwidth-bound rather than issue-bound.
+                 *
+                 * The panel class pays on WASTED SPAN, not on transaction count,
+                 * and "same decoder" is not the precondition -- I checked the
+                 * decoder and not the span it actually consumes. Retained behind
+                 * an opt-in knob so the negative is reproducible; DS4_DENSE_PL_
+                 * PANEL=1 arms it. Do not re-arm it by default without a
+                 * mechanism that explains this measurement. */
+                const uint64_t pl_panel = 4ull * blocks * 34u;
+                const int pl_stage =
+                        (out_dim % 4u) == 0u && (blocks % 8u) == 0u &&
+                        pl_panel <= 20224ull &&
+                        (((uintptr_t)wptr & 15u) == 0u) &&
+                        getenv("DS4_DENSE_PL_PANEL") != NULL;
+                if (pl_stage)
+                    QWEN4EXP_LAUNCH_PDL(
+                            (matmul_q8_0_preq_pair_lanes_kernel<2, false, true>),
+                            (dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u)),
+                            256, (unsigned)pl_panel, cuda_decode_stream(),
+                            (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
+                            out_dim, n_rows, blocks);
+                else
+                    QWEN4EXP_LAUNCH_PDL(
+                            (matmul_q8_0_preq_pair_lanes_kernel<2, false>),
+                            (dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u)),
+                            256, 0, cuda_decode_stream(),
+                            (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
+                            out_dim, n_rows, blocks);
             }
         }
         return cuda_ok(cudaGetLastError(), "q8 pair lanes launch");
@@ -19382,6 +19699,64 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
         }
     }
     }
+}
+
+/* Declared 1,800 lines above, called from ds4_gpu_hw_limits(). Reports the two
+ * instantiations decode actually reaches: <2,true> is the staged two-draft-row
+ * shape, <2,false> the unstaged fallback when the slab is not word-aligned or
+ * DS4_QWEN4EXP_NO_GDN_PANEL is set. Both are host-side property reads that
+ * launch nothing; the sole caller runs once at startup before bind(), so this
+ * cannot touch a timed leg.
+ *
+ * 10896 = 4 rows * 80 blocks * 34 bytes + 16, the launch's own expression at
+ * in_dim = 2560. Passing it is the point: 40 regs * 256 threads * 6 = 61,440
+ * of 65,536 clears the register file, but 6 blocks also want 65,376 bytes of
+ * dynamic shared plus static, and only the runtime knows whether the carveout
+ * it picked leaves room. Arithmetic that stops at the register file is exactly
+ * the arithmetic that has been wrong three times on this engine. */
+static const char *ds4_gpu_qwen_gdn_proj_limits(void) {
+    static char gbuf[224];
+    static int gbuilt = 0;
+    if (gbuilt) return gbuf;
+    gbuilt = 1;
+    gbuf[0] = '\0';
+    int n = 0;
+    struct cudaFuncAttributes fa;
+    if (cudaFuncGetAttributes(&fa, qwen_gdn_projection_kernel<2, true>) ==
+        cudaSuccess) {
+        int occ = -1;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &occ, qwen_gdn_projection_kernel<2, true>, 256, 10896) !=
+            cudaSuccess) {
+            (void)cudaGetLastError();
+            occ = -1;
+        }
+        n += snprintf(gbuf + n, sizeof(gbuf) - (size_t)n,
+                      "gp2s[reg=%d smem=%d lmem=%d maxt=%d occ=%d]",
+                      fa.numRegs, (int)fa.sharedSizeBytes,
+                      (int)fa.localSizeBytes, fa.maxThreadsPerBlock, occ);
+        if (n < 0 || (size_t)n >= sizeof(gbuf)) return gbuf;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaFuncGetAttributes(&fa, qwen_gdn_projection_kernel<2, false>) ==
+        cudaSuccess) {
+        int occ = -1;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &occ, qwen_gdn_projection_kernel<2, false>, 256, 0) !=
+            cudaSuccess) {
+            (void)cudaGetLastError();
+            occ = -1;
+        }
+        n += snprintf(gbuf + n, sizeof(gbuf) - (size_t)n,
+                      " gp2[reg=%d smem=%d lmem=%d occ=%d]",
+                      fa.numRegs, (int)fa.sharedSizeBytes,
+                      (int)fa.localSizeBytes, occ);
+        if (n < 0 || (size_t)n >= sizeof(gbuf)) return gbuf;
+    } else {
+        (void)cudaGetLastError();
+    }
+    return gbuf;
 }
 
 extern "C" int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
