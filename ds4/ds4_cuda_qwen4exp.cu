@@ -4226,7 +4226,29 @@ __device__ __forceinline__ static void qw_gu_coop_raw_load(
  * admits 3 blocks/SM at 512 threads (3 x 40 x 512 = 61,440 <= 65,536), and it
  * won +0.545% of decode as `ebc0169b`.
  *
- * NOW 32, for the 4th block: 4 x 32 x 512 = 65,536 is the ENTIRE register file,
+ * 32 WAS TRIED AND IT PAID, BUT NOT THROUGH OCCUPANCY.  Accepted as `a0cfbcbf`
+ * at 2.48274596, #1: gu[reg=32 smem=23168 lmem=0 maxt=1024 occ=3].  The cap took
+ * 40 -> 32 with ZERO spill, the decode leg reached q_dec 2.20656 -- the highest
+ * ever recorded on this board, +0.775% over the 40-register tree -- and yet
+ * occupancy STAYED AT 3.  So the gain came from register pressure at CONSTANT
+ * residency, which is a different mechanism from the one that won `ebc0169b`,
+ * and it says the productive knob here is the register count itself.
+ *
+ * NOW 24.  Two questions in one point, and 24 is the only remaining one that can
+ * ask them: the allocation grain is 8 registers, so 25..31 all round up to 32 and
+ * would re-measure a known answer.  (a) Does the pressure trend continue below
+ * 32?  (b) Does a fourth block appear once the fit is no longer exact --
+ * 4 x 24 x 512 = 49,152 leaves 16,384 registers of slack where 32 left none, so
+ * if the exact fit is what failed, 24 reveals it.  The device attributes added to
+ * ds4_gpu_hw_limits this run answer (b) independently: if thr/sm is 1536 then
+ * 1536 / 512 = 3 blocks is a HARD ceiling, no register cap can ever buy a fourth,
+ * and the occupancy axis on this kernel is closed by arithmetic.
+ *
+ * 24 is 49% under the kernel's natural want of 47, so spill is the live risk and
+ * this is the most aggressive cap attempted here.  A spill at 24 also bounds the
+ * axis usefully: it would make 32 the floor.
+ *
+ * The 32-register history, for the record: 4 x 32 x 512 = 65,536 is the ENTIRE register file,
  * exactly, with zero slack, and the 23,168 B static panel allows four
  * (92,672 <= 101,376).  This is a genuinely two-sided bet and the downside is
  * not spill alone.  The natural want here is 47; 32 is 32% under it, and this
@@ -4235,11 +4257,34 @@ __device__ __forceinline__ static void qw_gu_coop_raw_load(
  * registers cannot hold both accumulator chains in flight, the cap buys a
  * fourth block and pays for it out of the exact resource that matters most.
  *
- * READOUT, pre-committed: gu[lmem] != 0 => spilled, revert to 40 regardless of
- * composite.  gu[reg]=32 with gu[occ]=4 and lmem=0 => the cap took cleanly and
- * the decode leg is then the answer.  gu[occ]=3 => 32 is unreachable and 40 is
- * the measured floor, at which point gate/up occupancy is CLOSED for a real
- * reason rather than a mis-read one. */
+ * READOUT, pre-committed: gu[lmem] != 0 => spilled at 24, revert to 32
+ * regardless of composite.  gu[reg]=24 lmem=0 occ=4 => the exact fit was what
+ * blocked the fourth block and residency is open again.  gu[reg]=24 lmem=0 occ=3
+ * with thr/sm=1536 => the occupancy axis is CLOSED by arithmetic and the decode
+ * leg alone says whether register pressure keeps paying below 32.
+ *
+ * ANSWERED, and BOTH pre-registered branches fired at once.  `d07f8b1f`:
+ * `thr/sm=1536 blk/sm=24 reg/sm=65536`, `gu[reg=24 smem=23168 lmem=72 occ=3]`,
+ * rejected at 2.28620477581018.
+ *
+ *   - `lmem=72`: it SPILLED at 24.  Decode leg 0.032606 against 0.029018 at 32
+ *     on the same box (spark-2) -- **-12.4%**, by far the largest regression of
+ *     this campaign, so the spill is expensive and unambiguous.  The revert
+ *     below is the pre-committed one, not a judgement made after the fact.
+ *   - `thr/sm=1536`: routed gate/up launches 512 threads, so 1536/512 = 3
+ *     blocks is a HARD hardware ceiling.  `occ=3` at an exactly-fitting 32
+ *     registers was never a near-miss -- no register cap could ever have bought
+ *     a fourth block, and the OCCUPANCY axis on this kernel is closed by
+ *     arithmetic.  It also retroactively proves the whole 40 -> 32 gain
+ *     (+0.775%) was register PRESSURE at constant residency.  `reg/sm=65536`
+ *     confirms from the device the constant every occupancy figure in this file
+ *     had merely assumed.
+ *
+ * The register axis here is therefore bounded on BOTH sides and 32 is the
+ * measured optimum: 47 (natural) -> 2 blocks; 40 -> 3 blocks, +0.545%; 32 -> 3
+ * blocks, +0.775%, #1 at 2.4827459586612; 24 -> spill, -12.4%.  The allocation
+ * grain is 8, so 25-31 all round back up to 32 and there is no untested point
+ * left between the optimum and the spill.  DO NOT re-sweep this kernel. */
 #if defined(__CUDACC__) && CUDART_VERSION >= 12040
 #define QW_GU_MAXNREG __maxnreg__(32)
 #else
@@ -4708,8 +4753,87 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
  * almost nothing here and that residency is not this kernel's constraint
  * either.  If registers ever need to come down, it has to be by removing live
  * state at source. */
+
+/* THIS RUN'S ARM: __maxnreg__(40) here, and the paragraph above is exactly why
+ * it took three campaigns to become sayable.
+ *
+ * That paragraph concluded "residency is not this kernel's constraint either"
+ * from `7daa6e85`, where 5 blocks -> 4 moved decode -0.04%.  That inference is
+ * still sound about RESIDENCY and it is no longer the whole question, because
+ * `a0cfbcbf` proved a second, independent lever on this file: 40 -> 32 on routed
+ * gate/up gained +0.775% of decode at CONSTANT occupancy (occ stayed 3, and
+ * `thr/sm=1536` now proves it could not have moved).  Register PRESSURE pays
+ * here even when residency does not.  The down kernel has never been tested on
+ * that axis -- `7daa6e85` tried `__launch_bounds__(1024,2)`, which is the
+ * spelling that does not bind, and ptxas answered by going UP to 56.
+ *
+ * Why 40 is the single right point, from device constants rather than assumption
+ * (`thr/sm=1536 blk/sm=24 reg/sm=65536`, read on `d07f8b1f`):
+ *
+ *   this kernel always launches 256 threads, and dn[reg=48] measured
+ *   48 x 256 = 12,288/block  =>  65,536/12,288 = 5 blocks   (matches dn[occ=5])
+ *   40 x 256 = 10,240/block  =>  6 x 10,240 = 61,440 <= 65,536  =>  6 blocks
+ *   and 1536/256 = 6 is this kernel's HARD thread ceiling, so 40 is the cap
+ *   that reaches 100% thread occupancy exactly.
+ *
+ * Dynamic shared does not bind at 6 either: the panel is 2 x 8 x 680 = 10,880 B
+ * and 6 x 10,880 = 65,280 <= 101,376.  So one cap tests both levers at once, at
+ * the maximum-residency point, and 48 -> 40 is the same 17% cut that took with
+ * zero spill as 47 -> 40 on gate/up.  Below 40 the grain-8 ladder offers 32 and
+ * 24; gate/up spilled at 24 with strictly fewer live values per thread, so 40 is
+ * the right first step rather than a jump to the floor.
+ *
+ * Bit-exactness: a register cap changes ALLOCATION only.  ptxas may spill or
+ * rematerialize, it cannot reassociate, and this TU is built without
+ * --use_fast_math -- so the `warp_sum_f32` tree still folds the same floats in
+ * the same order.  Three accepted register caps have passed the exact
+ * golden-token gate.
+ *
+ * READOUT, pre-committed:
+ *   - dn[lmem] != 0  => spilled at 40.  Revert to no cap, regardless of the
+ *     composite.  This is the condition that fired at 24 on gate/up and it is
+ *     binding here for the same reason: a spill in a per-token kernel cost
+ *     -12.4% there.
+ *   - dn[reg]=40 lmem=0 occ=6 => the cap took and bought the sixth block.  The
+ *     decode leg then separates pressure from residency, since residency alone
+ *     is known to be worth ~0.04%: anything materially above that is pressure.
+ *   - dn[reg]=40 lmem=0 occ=5 => the cap took but something other than
+ *     registers pins residency at 5, and the register arithmetic above is
+ *     incomplete.  Read blk/sm and the dynamic panel again before any further
+ *     down-kernel occupancy claim.
+ *
+ * ANSWERED, and it is a NEGATIVE that closes the generalization. `88500cf1`:
+ * `dn[reg=40 smem=0 lmem=0 maxt=1024 occ=6]`, rejected at 2.28084285937247 on
+ * spark-3 (cal 0.0634948), decode leg 0.03202677159375 => q_dec 1.98255 against
+ * 2.20656 on the #1 tree: **-10.2%**.
+ *
+ * The arithmetic above was exactly right -- the cap took, it bought the sixth
+ * block, occupancy reached 100% of threads -- and the kernel got 10% SLOWER with
+ * `lmem=0`. That combination is the finding, and my pre-registered readout had a
+ * blind spot for it:
+ *
+ *   **`lmem=0` does NOT mean a register cap was free.**
+ *
+ * To reach 40 without spilling, ptxas REMATERIALIZES: it recomputes values
+ * rather than keeping them live. That shows up nowhere in `localSizeBytes`, and
+ * it adds instructions. On a kernel that is instruction-bound rather than
+ * latency-bound -- which routed decode is -- that trade is straight loss, and
+ * the sixth block cannot repay it because residency was never this kernel's
+ * constraint, exactly as the 5 -> 4 wash in `7daa6e85` already said.
+ *
+ * So the pressure lever does NOT generalize off gate/up. It was specific to that
+ * kernel's two dp4a chains, where fewer live values let ptxas interleave them.
+ * Reverted to no cap here: 48 is what ptxas wants and 48 is what it gets.
+ * DO NOT re-cap this kernel at 32 or 24 -- the failure at 40 was not a spill,
+ * so a deeper cap makes the remat worse, not better.
+ *
+ * Corollary for future register work anywhere in this file: a cap is only
+ * arguable where the kernel is LATENCY-bound and short of resident warps, never
+ * where it is instruction-bound. Check which one you have before capping. */
+#define QW_DN_MAXNREG
+
 template <int R, int DownType = -1, bool Vector = false, bool Stage = false>
-__global__ static void qwen4exp_moe_down_q_kernel(
+__global__ static void QW_DN_MAXNREG qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
         const int32_t *selected,
@@ -4965,42 +5089,7 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
     }
 }
 
-/* Stage: the block's eight-row weight panel, copied once into shared memory
- * with coalesced 16-byte loads, then decoded out of shared.
- *
- * CREDIT: DJLougen (`ae36577`).  It is the same defect and the same remedy the
- * ROUTED down tile in this tree already carries, applied to the shared expert's
- * down projection, which that arm does not cover.
- *
- * The defect.  groups == 20 at the checkpoint's shape (in 640, out 2560, Q8_0),
- * so the walk is one step: `lane < groups` covers the whole row and the
- * `lane + 32` remainder never runs.  Each working lane fetches its own group's
- * payload as several sub-word pieces strided by the 34-byte group size, so one
- * load instruction asks for up to twenty scattered four-byte pieces while
- * twelve lanes sit idle.  Every byte is eventually consumed, but the request is
- * both strided and under-filled.  The eight rows a block owns are
- * 8 * down_row_bytes CONSECUTIVE bytes of the single shared-expert slab
- * (5,440 at q8_0, 3,840 at q5_1), so the same bytes can be fetched as one
- * dense burst.
- *
- * Bit-exactness.  The panel is a verbatim byte image of the span the block's
- * own warps would have read individually; it is written by the block, read by
- * the block, and dies with the block.  dev_qwen4exp_group_decode is called with
- * the SAME (type, g) and a row pointer at the same offset within the panel, so
- * it is character-identical source running on identical bytes, and the decoder
- * is alignment-agnostic by construction -- it aligns the payload address down,
- * derives `shift` from the low bits and funnel-shifts the logical bytes back
- * out.  Accumulation order, the lane-to-group map and the reduction tree are
- * untouched.
- *
- * Fence order.  The fill issues weight loads that do not depend on the mid
- * quantizer, so it goes ABOVE the grid dependency sync and the barrier BELOW
- * it; the drain then absorbs the fill instead of running after it.  Both
- * hoisted calls sit at block scope after the kernel's only early return, which
- * is block-uniform once out_dim % 8 == 0 -- required at the launch before this
- * arm is selected -- and the staged arm skips the deep call inside the walk, so
- * a thread performs exactly one grid dependency sync either way. */
-template <int R, int DownType = -1, bool Vector = false, bool Stage = false>
+template <int R, int DownType = -1, bool Vector = false>
 __global__ static void qwen4exp_shared_down_q_kernel(
         float *out,
         const char *down,
@@ -5019,24 +5108,7 @@ __global__ static void qwen4exp_shared_down_q_kernel(
     if (row >= out_dim || tok0 >= n_tokens) return;
     const uint32_t take = n_tokens - tok0 < (uint32_t)R ? n_tokens - tok0
                                                         : (uint32_t)R;
-    extern __shared__ uint4 qw_shdown_panel[];
-    char *const spanel = (char *)qw_shdown_panel;
-    if (Stage) {
-        const uint64_t panel_bytes = (uint64_t)8u * down_row_bytes;
-        const char *const gp = down + (uint64_t)(blockIdx.x * 8u) * down_row_bytes;
-        for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
-             i += (uint64_t)blockDim.x * 16u) {
-            if (i + 16u <= panel_bytes)
-                *(uint4 *)(spanel + i) = *(const uint4 *)(const void *)(gp + i);
-            else
-                for (uint64_t j = i; j < panel_bytes; j++) spanel[j] = gp[j];
-        }
-        QWEN4EXP_PDL_SYNC();
-        __syncthreads();
-    }
-    const char *down_row = Stage
-        ? (spanel + (uint64_t)(threadIdx.x >> 5u) * down_row_bytes)
-        : (down + (uint64_t)row * down_row_bytes);
+    const char *down_row = down + (uint64_t)row * down_row_bytes;
 
     float acc[R];
 #pragma unroll
@@ -5060,8 +5132,7 @@ __global__ static void qwen4exp_shared_down_q_kernel(
         dev_qwen4exp_group_decode(
                 DownType < 0 ? down_type : (uint32_t)DownType,
                 down_row, g, wq, wa, wb, &halves);
-        /* The staged arm already waited, at block scope, above. */
-        if (!Stage) QWEN4EXP_PDL_SYNC();
+        QWEN4EXP_PDL_SYNC();
 #pragma unroll
         for (int r = 0; r < R; r++) {
             if ((uint32_t)r < take) {
@@ -7925,44 +7996,15 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
  * triggers inside its grid bound at those widths, and the kernel's
  * weight-group prefetch rides that window (ds4_cuda_qwen4exp.cuh).  Verify
  * and prefill keep the plain launch. */
-/* The eight-row weight panel.  out_dim % 8 keeps the kernel's only early
- * return block-uniform, which the staged arm's barrier needs; the slab base
- * being 16-byte aligned makes every panel base 16-byte aligned too, because a
- * panel is 8 * row_bytes and both q8_0 (5,440) and q5_1 (3,840) widths are
- * multiples of 16.  DS4_QWEN4EXP_NO_SHARED_DOWN_PANEL stands it down. */
-    const uint64_t sd_panel = (uint64_t)8u * down_slab->row_bytes;
-    const int sd_stage =
-        (out_dim % 8u) == 0u &&
-        (sd_panel % 16u) == 0u &&
-        ((uintptr_t)down & 15u) == 0u &&
-        sd_panel <= QW_DOWN_PANEL_MAX_BYTES &&
-        getenv("DS4_QWEN4EXP_NO_SHARED_DOWN_PANEL") == NULL;
 #define QWEN4EXP_SH_DOWN_IMPL(R, DT, V) do { \
     if (n_tokens <= 2u) { \
-        if (sd_stage) { \
-            QWEN4EXP_LAUNCH_PDL( \
-                    (qwen4exp_shared_down_q_kernel<R, DT, V, true>), \
-                    (dim3((out_dim + 7u) / 8u, tiles, 1)), \
-                    threads, (size_t)sd_panel, stream, \
-                    (float *)out->ptr, down, mq, ms, msum, \
-                    (const float *)gate_scale->ptr, down_slab->row_bytes, \
-                    down_slab->type, mgroups, out_dim, n_tokens); \
-        } else { \
-            QWEN4EXP_LAUNCH_PDL( \
-                    (qwen4exp_shared_down_q_kernel<R, DT, V>), \
-                    (dim3((out_dim + 7u) / 8u, tiles, 1)), \
-                    threads, 0, stream, \
-                    (float *)out->ptr, down, mq, ms, msum, \
-                    (const float *)gate_scale->ptr, down_slab->row_bytes, \
-                    down_slab->type, mgroups, out_dim, n_tokens); \
-        } \
-    } else if (sd_stage) { \
-        qwen4exp_shared_down_q_kernel<R, DT, V, true> \
-            <<<dim3((out_dim + 7u) / 8u, tiles, 1), threads, \
-               (size_t)sd_panel, stream>>>( \
-                    (float *)out->ptr, down, mq, ms, msum, \
-                    (const float *)gate_scale->ptr, down_slab->row_bytes, \
-                    down_slab->type, mgroups, out_dim, n_tokens); \
+        QWEN4EXP_LAUNCH_PDL( \
+                (qwen4exp_shared_down_q_kernel<R, DT, V>), \
+                (dim3((out_dim + 7u) / 8u, tiles, 1)), \
+                threads, 0, stream, \
+                (float *)out->ptr, down, mq, ms, msum, \
+                (const float *)gate_scale->ptr, down_slab->row_bytes, \
+                down_slab->type, mgroups, out_dim, n_tokens); \
     } else { \
         qwen4exp_shared_down_q_kernel<R, DT, V> \
             <<<dim3((out_dim + 7u) / 8u, tiles, 1), threads, 0, stream>>>( \
