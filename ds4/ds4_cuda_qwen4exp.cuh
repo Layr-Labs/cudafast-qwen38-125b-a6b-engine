@@ -108,6 +108,33 @@ int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows);
  * same way. */
 int ds4_qwen4exp_pdl_enabled(void);
 
+/* The second valve, over the edges converted AFTER the set above had been
+ * measured (+1.39% of decode on this box): the mixer's closing kernel -> the
+ * GDN/QSA pre-quantizer, the routed input quantizer -> gate/up, the routed
+ * mid quantizer -> down, and the GDN convolution -> recurrence.  Implied by
+ * ds4_qwen4exp_pdl_enabled() -- off wherever that one is off -- and
+ * additionally off when DS4_QWEN4EXP_NO_PDL_EXTRA is set to a non-zero
+ * value, so the two sets can be A/B'd apart on one binary.  BOTH valves are
+ * on when unset: the ranked box clears the environment.  Every consumer
+ * behind this valve carries a fence that is a no-op under a plain launch and
+ * every producer's trigger is a no-op with no dependent launch, so
+ * DS4_QWEN4EXP_NO_PDL_EXTRA=1 restores those edges' pre-conversion behaviour
+ * exactly (ds4/QWEN4EXP-PARITY.md: none of them moves arithmetic).
+ *
+ * The same valve also covers the launch-gap tier -- edges whose consumer
+ * stages nothing and fences at its very top, so the only thing the
+ * attribute buys is the consumer's blocks being resident when the producer
+ * finishes: the hyper-connection down -> silu-quant chain, the router logits
+ * -> select -> group -> input-quantize chain, the shared gate -> quantize ->
+ * gate/up -> mid-quantize chain, and the QSA indexer projections -> pool
+ * update -> split scores -> (probs) -> fold -> output gate tail.  Each
+ * producer's trigger there is gated on the grid the kernel was launched
+ * with, at half the one-wave block count for its block width and register
+ * count (the numbers sit at each trigger), and the one multi-wave kernel in
+ * those chains, the split scores kernel, carries none, so the probs launch
+ * behind it stays plain. */
+int ds4_qwen4exp_pdl_extra_enabled(void);
+
 /* Occupancy attributes of the two production routed-MoE decode kernels, which
  * are static to ds4_cuda_qwen4exp.cu and so can only report from inside it.
  * Defined there, consumed by ds4_gpu_hw_limits() in ds4_cuda.cu.  Returns a
@@ -135,10 +162,34 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void);
         qw_cfg.numAttrs = qw_pdl ? 1 : 0;                                  \
         (void)cudaLaunchKernelEx(&qw_cfg, KERNEL, __VA_ARGS__);            \
     } while (0)
+/* The same launch path behind the second valve, for the edges listed at
+ * ds4_qwen4exp_pdl_extra_enabled(): identical but for which valve decides
+ * whether the attribute is attached. */
+#define QWEN4EXP_LAUNCH_PDL_EXTRA(KERNEL, GRID, BLOCK, SMEM, STREAM, ...)  \
+    do {                                                                   \
+        cudaLaunchAttribute qw_attr[1];                                    \
+        qw_attr[0].id =                                                    \
+            cudaLaunchAttributeProgrammaticStreamSerialization;            \
+        qw_attr[0].val.programmaticStreamSerializationAllowed = 1;          \
+        const int qw_pdl = ds4_qwen4exp_pdl_extra_enabled();               \
+        cudaLaunchConfig_t qw_cfg;                                         \
+        qw_cfg.gridDim = (GRID);                                           \
+        qw_cfg.blockDim = (BLOCK);                                         \
+        qw_cfg.dynamicSmemBytes = (SMEM);                                  \
+        qw_cfg.stream = (STREAM);                                          \
+        qw_cfg.attrs = qw_pdl ? qw_attr : NULL;                            \
+        qw_cfg.numAttrs = qw_pdl ? 1 : 0;                                  \
+        (void)cudaLaunchKernelEx(&qw_cfg, KERNEL, __VA_ARGS__);            \
+    } while (0)
 #else
 #define QWEN4EXP_LAUNCH_PDL(KERNEL, GRID, BLOCK, SMEM, STREAM, ...)        \
     do {                                                                   \
         (void)ds4_qwen4exp_pdl_enabled();                                  \
+        KERNEL<<<(GRID), (BLOCK), (SMEM), (STREAM)>>>(__VA_ARGS__);        \
+    } while (0)
+#define QWEN4EXP_LAUNCH_PDL_EXTRA(KERNEL, GRID, BLOCK, SMEM, STREAM, ...)  \
+    do {                                                                   \
+        (void)ds4_qwen4exp_pdl_extra_enabled();                            \
         KERNEL<<<(GRID), (BLOCK), (SMEM), (STREAM)>>>(__VA_ARGS__);        \
     } while (0)
 #endif
