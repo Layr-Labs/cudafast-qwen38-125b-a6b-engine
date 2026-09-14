@@ -108,6 +108,12 @@ int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows);
  * same way. */
 int ds4_qwen4exp_pdl_enabled(void);
 
+/* Occupancy attributes of the two production routed-MoE decode kernels, which
+ * are static to ds4_cuda_qwen4exp.cu and so can only report from inside it.
+ * Defined there, consumed by ds4_gpu_hw_limits() in ds4_cuda.cu.  Returns a
+ * static string, never NULL, and is safe to call more than once. */
+extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void);
+
 #if CUDART_VERSION >= 12030
 /* One launch path for the converted consumers: cudaLaunchKernelEx, with the
  * programmatic stream serialization attribute when PDL is on and without it

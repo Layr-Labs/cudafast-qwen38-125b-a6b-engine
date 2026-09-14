@@ -17307,6 +17307,68 @@ extern "C" void ds4_gpu_set_q8_mma_pipe_wide(int mode) {
     g_q8_mma_pipe_wide = mode;
 }
 
+/* The device's occupancy limits, as a compact string the caller can append to
+ * an identity that reaches the run's metrics.  See ds4.h for why this is worth
+ * publishing.
+ *
+ * Two deliberate restrictions, both about not failing the build on a box I
+ * cannot compile on:
+ *
+ *   1. cudaDeviceGetAttribute(), never the matching cudaDeviceProp fields.
+ *      Several of those are deprecated and some are removed in recent CUDA
+ *      runtimes, and this tree only ever reads prop.major/minor/name, so it
+ *      carries no evidence that the rest still compile here.
+ *   2. ONLY attribute enums this tree already uses elsewhere, so every name is
+ *      known to compile against the pinned toolkit.  That is why peak DRAM
+ *      bandwidth is absent: it needs cudaDevAttrGlobalMemoryBusWidth and
+ *      cudaDevAttrMemoryClockRate, neither of which appears anywhere else here.
+ *
+ * MaxSharedMemoryPerBlockOptin is the load-bearing one and it is enough on its
+ * own: the per-block opt-in ceiling sits one 1 KiB reservation below the
+ * per-SM shared memory size, so 101376 means a 100 KiB SM and 227328 means a
+ * 228 KiB SM -- which is exactly the fork every occupancy argument about the
+ * staged decode kernels turns on. */
+extern "C" const char *ds4_gpu_hw_limits(void) {
+    static char buf[256];
+    static int built = 0;
+    if (built) return buf;
+    built = 1;
+    buf[0] = '\0';
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return buf;
+    }
+    const cudaDeviceAttr want[6] = {
+        cudaDevAttrMaxSharedMemoryPerBlockOptin,
+        cudaDevAttrMultiProcessorCount,
+        cudaDevAttrComputeCapabilityMajor,
+        cudaDevAttrComputeCapabilityMinor,
+        cudaDevAttrIntegrated,
+        cudaDevAttrCooperativeLaunch,
+    };
+    int got[6];
+    for (int i = 0; i < 6; i++) {
+        got[i] = -1;
+        if (cudaDeviceGetAttribute(&got[i], want[i], dev) != cudaSuccess) {
+            (void)cudaGetLastError();
+            got[i] = -1;
+        }
+    }
+    int n = snprintf(buf, sizeof(buf),
+                     "smem/blk_optin=%d sm=%d cc=%d.%d integrated=%d coop=%d",
+                     got[0], got[1], got[2], got[3], got[4], got[5]);
+    if (n < 0) { buf[0] = '\0'; return buf; }
+    /* The register/shared footprint of the two routed-MoE decode kernels, from
+     * the translation unit that owns them.  Truncation is harmless: the string
+     * is diagnostic only and snprintf keeps it terminated. */
+    const char *kl = ds4_gpu_qwen4exp_kernel_limits();
+    if (kl && kl[0] && (size_t)n + 2u < sizeof(buf)) {
+        snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", kl);
+    }
+    return buf;
+}
+
 /* The BN of the last launch the pipe took (0 until one does), so a box can
  * tell which rung a valve setting actually routed through -- a refused
  * shared-memory opt-in falls back silently, and bytes alone cannot show it. */
