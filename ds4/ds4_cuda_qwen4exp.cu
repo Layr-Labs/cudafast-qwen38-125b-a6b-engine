@@ -3044,6 +3044,13 @@ __device__ __forceinline__ static void qw_cpasync_commit(void) {
 __device__ __forceinline__ static void qw_cpasync_wait0(void) {
     asm volatile("cp.async.wait_group 0;\n" ::);
 }
+/* Leave the most recently committed group in flight.  Used where the next
+ * slot's fill has just been committed and only the current slot's data is
+ * needed now: waiting for all groups would serialise the fill behind the
+ * compute it is supposed to overlap. */
+__device__ __forceinline__ static void qw_cpasync_wait1(void) {
+    asm volatile("cp.async.wait_group 1;\n" ::);
+}
 /* ========================================================================= */
 
 __device__ __forceinline__ static void qw_mma_m16n8k32(
@@ -4274,7 +4281,8 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
  * selecting this arm.  The `continue` for an out-of-range expert is
  * block-uniform for the same reason the expert is.  The staged path is refused
  * rather than truncated when it cannot hold the panel. */
-template <int R, int DownType = -1, bool Vector = false, bool Stage = false>
+template <int R, int DownType = -1, bool Vector = false, bool Stage = false,
+          bool Async = false>
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
@@ -4344,9 +4352,64 @@ __global__ static void qwen4exp_moe_down_q_kernel(
             }
         }
     };
-    if (Stage) qw_fill_slot(0u, spanel);
+    /* ASYNCHRONOUS PANEL FILL.  The staged path costs what the *fill* costs, not
+     * what the barrier costs (measured: removing the barrier entirely made the
+     * panel twice as expensive).  `cp.async` moves the same 16 bytes per request
+     * with one instruction instead of an LDG/STS pair and no register staging,
+     * which is the same mechanism the tree already ships for the gate/up prefill
+     * arm.  It is not a drop-in, for two reasons:
+     *
+     *  1. cp.async completes asynchronously, so the consumer needs
+     *     `cp.async.wait_group` *and* a barrier to see another lane's bytes.
+     *  2. Two buffers cannot hide the fill at the top of the iteration: the
+     *     buffer being written is the one slot-1 is still reading, and no barrier
+     *     has passed since.  A third buffer fixes that -- the target was last read
+     *     two slots ago, and every lane has passed two block barriers since -- so
+     *     the fill can be issued before the barrier and overlap the previous
+     *     slot's dp4a instead of serialising in front of it.
+     *
+     * `cp.async.ca` and not `.cg`, following the tree's own measurement on an
+     * identical fetch map: 161.5 GB/s vs 133.8, because a payload line is touched
+     * twice and the L1 hit matters.  Sources stay 16-byte aligned for the same
+     * reason the uint4 fill did: `row0` is a multiple of 8 rows, so the expert
+     * base is a multiple of 8 * row_bytes, which the host requires to be 16-byte
+     * aligned along with the expert stride and the slab base. */
+    auto qw_fill_async = [&](uint32_t s, char *const dst) {
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            if ((uint32_t)r < take) {
+                const int32_t e = __shfl_sync(0xffffffffu, route[r], s);
+                if (e < 0 || (uint32_t)e >= n_total_expert) continue;
+                const char *const gp = down +
+                    (uint64_t)(uint32_t)e * down_expert_bytes +
+                    (uint64_t)row0 * down_row_bytes;
+                char *const sp = dst + (uint64_t)r * panel_bytes;
+                for (uint64_t o = (uint64_t)threadIdx.x * 16u; o < panel_bytes;
+                     o += (uint64_t)blockDim.x * 16u) {
+                    qw_cpasync16((uint32_t)__cvta_generic_to_shared(sp + o),
+                                 gp + o);
+                }
+            }
+        }
+    };
+    if (Async) {
+        qw_fill_async(0u, spanel);
+        qw_cpasync_commit();
+    } else if (Stage) {
+        qw_fill_slot(0u, spanel);
+    }
     for (uint32_t slot = 0; slot < n_expert_used; slot++) {
-        if (Stage) {
+        if (Async) {
+            if (slot + 1u < n_expert_used) {
+                qw_fill_async(slot + 1u,
+                    spanel + (uint64_t)((slot + 1u) % 3u) * slot_bytes);
+                qw_cpasync_commit();
+                qw_cpasync_wait1();
+            } else {
+                qw_cpasync_wait0();
+            }
+            __syncthreads();
+        } else if (Stage) {
             __syncthreads();
             if (slot + 1u < n_expert_used) {
                 qw_fill_slot(slot + 1u,
@@ -4360,7 +4423,11 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                 const int32_t e = Vector ? __shfl_sync(0xffffffffu, route[r], slot)
                     : selected[(uint64_t)t * n_expert_used + slot];
                 if (e < 0 || (uint32_t)e >= n_total_expert) continue;
-                const char *const drow = Stage
+                const char *const drow = Async
+                    ? spanel + (uint64_t)(slot % 3u) * slot_bytes +
+                      (uint64_t)r * panel_bytes +
+                      (uint64_t)(row - row0) * down_row_bytes
+                    : Stage
                     ? spanel + (uint64_t)(slot & 1u) * slot_bytes +
                       (uint64_t)r * panel_bytes +
                       (uint64_t)(row - row0) * down_row_bytes
@@ -6968,6 +7035,12 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             sc.mq, sc.ms, sc.msum, \
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
             mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
+#define QWEN4EXP_DOWN_IMPL_A(R, DT, V, SH) \
+    qwen4exp_moe_down_q_kernel<R, DT, V, true, true><<<dn_grid, threads, (SH), stream>>>( \
+            (float *)out->ptr, down, (const int32_t *)selected->ptr, \
+            sc.mq, sc.ms, sc.msum, \
+            down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
+            mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
 #define QWEN4EXP_DOWN_IMPL(R, DT, V) QWEN4EXP_DOWN_IMPL_S(R, DT, V, false, 0)
 #define QWEN4EXP_DOWN(R) do { \
     if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q5_1) { \
@@ -7028,15 +7101,30 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             ((uintptr_t)down & 15u) == 0u &&
             dn_shared <= QW_DOWN_PANEL_MAX_BYTES &&
             getenv("DS4_QWEN4EXP_NO_DOWN_PANEL") == NULL;
+        /* cp.async arm: three slot buffers instead of two, so the fill can be
+         * issued before the barrier without racing slot-1's readers. */
+        /* Shipped default.  DS4_QWEN4EXP_DOWN_ASYNC_PANEL=0 restores the
+         * synchronous two-buffer fill for measurement. */
+        const char *const async_env = getenv("DS4_QWEN4EXP_DOWN_ASYNC_PANEL");
+        const uint64_t dn_shared_a = 6u * dn_panel;
+        const bool dn_async = dn_stage &&
+            (async_env == NULL || async_env[0] != '0') &&
+            dn_shared_a <= QW_DOWN_PANEL_MAX_BYTES;
         if (down_slab->type == DS4_QWEN4EXP_TY_q8_0) {
-            if (dn_stage) {
+            if (dn_async) {
+                QWEN4EXP_DOWN_IMPL_A(2, DS4_QWEN4EXP_TY_q8_0, true,
+                                     (size_t)dn_shared_a);
+            } else if (dn_stage) {
                 QWEN4EXP_DOWN_IMPL_S(2, DS4_QWEN4EXP_TY_q8_0, true, true,
                                      (size_t)dn_shared);
             } else {
                 QWEN4EXP_DOWN_IMPL(2, DS4_QWEN4EXP_TY_q8_0, true);
             }
         } else {
-            if (dn_stage) {
+            if (dn_async) {
+                QWEN4EXP_DOWN_IMPL_A(2, DS4_QWEN4EXP_TY_q5_1, true,
+                                     (size_t)dn_shared_a);
+            } else if (dn_stage) {
                 QWEN4EXP_DOWN_IMPL_S(2, DS4_QWEN4EXP_TY_q5_1, true, true,
                                      (size_t)dn_shared);
             } else {
