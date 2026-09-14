@@ -19021,9 +19021,49 @@ struct qwen_gdn_projection_args {
     const int8_t *xq; const float *xscale; const float *x;
     uint64_t od[2]; uint32_t n_rows; uint64_t blocks;
 };
-template<int R>
+/* Stage: the q8 half of this kernel copies the four consecutive weight rows
+ * its block owns into dynamic shared memory as one contiguous run, then every
+ * lane decodes its own half out of shared at the same relative offset.
+ *
+ * CREDIT: 0xpg (`b13998e`, and the diagnosis of their own `c005cdfa`, which
+ * lost 39 bips by getting the fence ORDER wrong).
+ *
+ * Why here.  This kernel carries attn_qkv + attn_gate at the decode width,
+ * about a third of all decode weight traffic.  Its walk reads a 34-byte block
+ * through a funnel-shift decoder that issues FOUR separate four-byte loads per
+ * lane, and a warp's thirty-two lanes sit on 34-byte centres, so each of those
+ * loads is a scattered request: ~128 useful bytes over a ~544-byte span.  The
+ * block's four rows are 4 * blocks * 34 bytes of CONSECUTIVE slab, so the same
+ * bytes can be fetched as one dense run.
+ *
+ * Bit-exactness.  The panel is a verbatim byte image of the span the block's
+ * own lanes would have read individually; nothing is decoded, re-packed,
+ * widened, narrowed, re-scaled or re-ordered on the way in.  The decoder is
+ * alignment-agnostic -- it masks the address with ~3 and funnel-shifts by
+ * address & 3 -- so only the offset MOD 4 is observable; the panel base in
+ * shared is 16-byte aligned, the slab panel base is 4-byte aligned (gated at
+ * the launch) and a row stride is blocks * 34, a multiple of 4.  Every lane
+ * therefore sees the same `address & 3`, the same word pair and the same
+ * scale, and the reduction tree is untouched.
+ *
+ * Fence order, which is the part that went wrong the first time.  The fill
+ * issues weight loads that do not depend on the predecessor, so it goes ABOVE
+ * the grid dependency sync and the barrier goes BELOW it:
+ *     fill  ->  QWEN4EXP_PDL_SYNC()  ->  __syncthreads()  ->  walk
+ * The drain then absorbs the fill's latency instead of running after it.
+ * Putting the barrier above the sync serialises the two latencies and destroys
+ * an overlap the kernel already had.
+ *
+ * Sync accounting.  Both hoisted calls sit at block scope inside the q8
+ * branch, whose predicate blockIdx.x < 96u is block-uniform, and the staged
+ * arm skips the deep call the shipped walk makes, so a q8 thread performs
+ * EXACTLY ONE grid dependency sync either way.  The f32 branch is untouched
+ * and keeps its own. */
+template<int R, bool Stage=false>
 __global__ __launch_bounds__(256)
 static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
+    extern __shared__ uint4 qw_gdn_panel[];
+    char *const gpanel = (char *)qw_gdn_panel;
     constexpr unsigned B=256u;
     constexpr bool FloatFirst=true, Streaming=false;
     constexpr int C=2, U=10;
@@ -19038,6 +19078,39 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
         const uint64_t out_dim=second?a.od[1]:a.od[0],blocks=a.blocks;
         const uint32_t n_rows=a.n_rows;
         const int8_t *xq=a.xq; const float *xscale=a.xscale;
+    if (Stage) {
+        /* Four consecutive rows of one slab: one dense run, grid-strided by
+         * the whole block.  The width comes from the run's own alignment, so
+         * a merely word-aligned slab still takes this path instead of silently
+         * falling back and making the arm a no-op.  Up to three bytes of slop
+         * past the end are read by the last block's unaligned word pair and
+         * then discarded by the funnel shift; the launch adds 16 bytes to the
+         * request so that read stays inside the allocation. */
+        const uint64_t panel_bytes = (uint64_t)(B/64u) * blocks * 34u;
+        const char *const gp = (const char *)w + (uint64_t)block * panel_bytes;
+        if (((uintptr_t)gp & 15u) == 0u) {
+            for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
+                 i += (uint64_t)B * 16u) {
+                if (i + 16u <= panel_bytes)
+                    *(uint4 *)(gpanel + i) = *(const uint4 *)(const void *)(gp + i);
+                else
+                    for (uint64_t j = i; j < panel_bytes; j++) gpanel[j] = gp[j];
+            }
+        } else {
+            for (uint64_t i = (uint64_t)threadIdx.x * 4u; i < panel_bytes;
+                 i += (uint64_t)B * 4u) {
+                if (i + 4u <= panel_bytes)
+                    *(uint32_t *)(gpanel + i) =
+                        *(const uint32_t *)(const void *)(gp + i);
+                else
+                    for (uint64_t j = i; j < panel_bytes; j++) gpanel[j] = gp[j];
+            }
+        }
+        /* The drain absorbs the fill; the barrier is nearly satisfied by the
+         * time it is reached.  Order matters -- see the header. */
+        QWEN4EXP_PDL_SYNC();
+        __syncthreads();
+    }
     const uint32_t local_row = threadIdx.x >> 6u;
     const uint32_t local_lane = threadIdx.x & 63u;
     const uint32_t group = local_lane >> 1u;
@@ -19050,7 +19123,9 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
     for (int r = 0; r < R; r++) acc[r] = 0.0f;
 
     if (row < out_dim) {
-        const unsigned char *wr = w + row * blocks * 34u;
+        const unsigned char *wr = Stage
+            ? (const unsigned char *)(gpanel + (uint64_t)local_row * blocks * 34u)
+            : (w + row * blocks * 34u);
         /* PDL: the first walk step (b = group) with its WEIGHT loads issued
          * above the fence and held in registers, so they fly while the
          * quantizer drains.  The activation reads (xq/xscale, that kernel's
@@ -19087,7 +19162,9 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
             const float ws = Streaming
                 ? __half2float(__ushort_as_half(__ldcs((const uint16_t *)scale)))
                 : __half2float(*scale);
-            QWEN4EXP_PDL_SYNC();
+            /* The staged arm already waited, at block scope, above.  Exactly
+             * one grid dependency sync per thread either way. */
+            if (!Stage) QWEN4EXP_PDL_SYNC();
 #pragma unroll
             for (int r = 0; r < R; r++) {
                 if ((uint32_t)r < take) {
@@ -19498,14 +19575,34 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
         (((uintptr_t)a.weights[0]|(uintptr_t)a.weights[1])&1u)==0u &&
         (((uintptr_t)a.weights[2]|(uintptr_t)a.weights[3]|(uintptr_t)a.x)&15u)==0u) {
         const unsigned grid=(unsigned)((qkv_dim+3u)/4u+(gate_dim+3u)/4u+96u);
+        /* The weight panel: four consecutive rows of one slab, plus sixteen
+         * bytes so the last block's unaligned word pair cannot read past the
+         * allocation.  The gate asks only for FOUR-byte alignment, because
+         * four is all the funnel-shift decoder can observe; demanding sixteen
+         * would let a merely word-aligned slab fall back silently and make the
+         * arm a no-op.  DS4_QWEN4EXP_NO_GDN_PANEL stands it down. */
+        const size_t gdn_panel=(size_t)(256u/64u)*(size_t)blocks*34u+16u;
+        const int gdn_stage =
+            ((((uintptr_t)a.weights[0]|(uintptr_t)a.weights[1])&3u)==0u) &&
+            gdn_panel<=49152u &&
+            getenv("DS4_QWEN4EXP_NO_GDN_PANEL")==NULL;
         /* PDL consumer: the stream predecessor is the mixed-input quantizer,
          * which triggers at its top at these decode widths. */
-        if (rows==1u)
-            QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1>),
-                                grid, 256, 0, cuda_decode_stream(), a);
-        else
-            QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2>),
-                                grid, 256, 0, cuda_decode_stream(), a);
+        if (rows==1u) {
+            if (gdn_stage)
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1,true>),
+                                    grid, 256, gdn_panel, cuda_decode_stream(), a);
+            else
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1>),
+                                    grid, 256, 0, cuda_decode_stream(), a);
+        } else {
+            if (gdn_stage)
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2,true>),
+                                    grid, 256, gdn_panel, cuda_decode_stream(), a);
+            else
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2>),
+                                    grid, 256, 0, cuda_decode_stream(), a);
+        }
         return cuda_ok(cudaGetLastError(),"GDN four projections launch");
     }
     for (unsigned i=0;i<2;i++)
