@@ -17329,7 +17329,12 @@ extern "C" void ds4_gpu_set_q8_mma_pipe_wide(int mode) {
  * 228 KiB SM -- which is exactly the fork every occupancy argument about the
  * staged decode kernels turns on. */
 extern "C" const char *ds4_gpu_hw_limits(void) {
-    static char buf[256];
+    /* Sized for the device attributes plus the routed-MoE kernel-limits string,
+     * which now carries the two prefill tiles as well.  Oversized on purpose:
+     * ds4_resident drops the WHOLE limits string rather than truncating it if it
+     * does not fit its own ident buffer, so a tight fit here loses the
+     * measurement silently. */
+    static char buf[448];
     static int built = 0;
     if (built) return buf;
     built = 1;

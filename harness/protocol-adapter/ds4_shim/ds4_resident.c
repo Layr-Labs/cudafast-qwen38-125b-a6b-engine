@@ -592,7 +592,7 @@ int main(void) {
      * can see it.  On failure the string is empty and the identity is exactly
      * what it was, which keeps the `ds4-resident load_epoch=` prefix and the
      * ident that benchd seals unchanged for a non-CUDA build. */
-    char ident_buf[512];
+    char ident_buf[768];
     const char *limits = ds4s_hw_limits();
     if (limits && limits[0]) {
         const int n = snprintf(ident_buf, sizeof(ident_buf), "%s %s", ident, limits);
