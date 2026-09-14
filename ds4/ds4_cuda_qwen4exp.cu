@@ -2764,7 +2764,8 @@ __global__ static void qwen4exp_moe_zero_invalid_kernel(
  * The live shapes want 2 * 5,440 = 10,880 bytes (q8_0) or 2 * 3,840 = 7,680
  * (q5_1); the cap exists so an unexpected slab geometry falls back to the
  * direct path instead of failing to launch. */
-#define QW_DOWN_PANEL_MAX_BYTES 16384u
+/* Four eight-row panels: two slot buffers (double buffering) x R == 2 tokens. */
+#define QW_DOWN_PANEL_MAX_BYTES 32768u
 
 /* The pipeline gives every thread exactly one slot of each tile per chunk,
  * which is what makes the one-chunk-deep register prefetch enough. */
@@ -4314,32 +4315,43 @@ __global__ static void qwen4exp_moe_down_q_kernel(
 #pragma unroll
     for (int r = 0; r < R; r++) acc[r] = 0.0f;
 
-    for (uint32_t slot = 0; slot < n_expert_used; slot++) {
-        if (Stage) {
-            /* One barrier pair for the whole slot, not one per (slot, token):
-             * the two tokens route to different experts, so both panels are
-             * filled back to back into disjoint halves of the buffer and
-             * published together.  The first barrier waits for the previous
-             * slot's readers before overwriting.  Both are reached by every
-             * lane of the block -- the early returns above and the `continue`
-             * below are all block-uniform under the host's guards. */
-            __syncthreads();
+    /* Double-buffered staging.  The base tree pays one barrier pair per slot:
+     * one to wait out the previous slot's readers, one to publish its own
+     * fill.  With two slot buffers the fill for slot+1 goes into the buffer
+     * that slot-1's compute was using, and slot-1's readers are provably done
+     * because every lane passed the barrier at the top of this iteration.
+     * That leaves exactly one barrier per slot, halving the count, and the
+     * fill now overlaps the current slot's dp4a instead of preceding it.
+     * Barrier cost is the same on every box, so this is not a request-shape
+     * bet: it is a strict reduction in synchronisation for the same bytes.
+     * Reached by every lane -- the early return above is block-uniform under
+     * the host's guards, and `Stage` is a compile-time constant. */
+    const uint64_t slot_bytes = (uint64_t)R * panel_bytes;
+    auto qw_fill_slot = [&](uint32_t s, char *const dst) {
 #pragma unroll
-            for (int r = 0; r < R; r++) {
-                if ((uint32_t)r < take) {
-                    const int32_t e = __shfl_sync(0xffffffffu, route[r], slot);
-                    if (e < 0 || (uint32_t)e >= n_total_expert) continue;
-                    const char *const gp = down +
-                        (uint64_t)(uint32_t)e * down_expert_bytes +
-                        (uint64_t)row0 * down_row_bytes;
-                    char *const sp = spanel + (uint64_t)r * panel_bytes;
-                    for (uint64_t o = (uint64_t)threadIdx.x * 16u;
-                         o < panel_bytes; o += (uint64_t)blockDim.x * 16u) {
-                        *(uint4 *)(sp + o) = *(const uint4 *)(gp + o);
-                    }
+        for (int r = 0; r < R; r++) {
+            if ((uint32_t)r < take) {
+                const int32_t e = __shfl_sync(0xffffffffu, route[r], s);
+                if (e < 0 || (uint32_t)e >= n_total_expert) continue;
+                const char *const gp = down +
+                    (uint64_t)(uint32_t)e * down_expert_bytes +
+                    (uint64_t)row0 * down_row_bytes;
+                char *const sp = dst + (uint64_t)r * panel_bytes;
+                for (uint64_t o = (uint64_t)threadIdx.x * 16u;
+                     o < panel_bytes; o += (uint64_t)blockDim.x * 16u) {
+                    *(uint4 *)(sp + o) = *(const uint4 *)(gp + o);
                 }
             }
+        }
+    };
+    if (Stage) qw_fill_slot(0u, spanel);
+    for (uint32_t slot = 0; slot < n_expert_used; slot++) {
+        if (Stage) {
             __syncthreads();
+            if (slot + 1u < n_expert_used) {
+                qw_fill_slot(slot + 1u,
+                             spanel + (uint64_t)((slot + 1u) & 1u) * slot_bytes);
+            }
         }
 #pragma unroll
         for (int r = 0; r < R; r++) {
@@ -4349,7 +4361,8 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                     : selected[(uint64_t)t * n_expert_used + slot];
                 if (e < 0 || (uint32_t)e >= n_total_expert) continue;
                 const char *const drow = Stage
-                    ? spanel + (uint64_t)r * panel_bytes +
+                    ? spanel + (uint64_t)(slot & 1u) * slot_bytes +
+                      (uint64_t)r * panel_bytes +
                       (uint64_t)(row - row0) * down_row_bytes
                     : down + (uint64_t)(uint32_t)e * down_expert_bytes +
                       (uint64_t)row * down_row_bytes;
@@ -7004,7 +7017,10 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
          * and its uint4 copy rely on is checked here, once, before the launch;
          * DS4_QWEN4EXP_NO_DOWN_PANEL stands the whole thing down. */
         const uint64_t dn_panel = (uint64_t)8u * down_slab->row_bytes;
-        const uint64_t dn_shared = 2u * dn_panel;   /* R == 2 on this arm */
+        /* Two slot buffers in flight, each R == 2 token panels wide, so the
+         * per-slot barrier no longer has to wait for the previous slot's
+         * readers before the next fill starts. */
+        const uint64_t dn_shared = 4u * dn_panel;
         const int dn_stage =
             (out_dim % 8u) == 0u &&
             (dn_panel % 16u) == 0u &&
