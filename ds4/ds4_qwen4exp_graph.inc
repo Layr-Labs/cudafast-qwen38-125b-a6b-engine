@@ -2444,7 +2444,38 @@ static bool qwen4exp_graph_layers_encode(
 
 static uint32_t qw_decode_graph_chunks(void) {
     static int init = 0;
-    static uint32_t chunks = 4u;   /* the A/B's pick; 1 restores the single capture */
+    /* TWO, and it is swept rather than assumed.
+     *
+     * The comment this replaces said "the A/B's pick", and that A/B was ONE vs
+     * FOUR. Two, three, six and eight were never tried, and a rival shipped
+     * eight on the strength of the same untested reasoning -- finer chunks mean
+     * shorter launches that overlap work already queued.
+     *
+     * That reasoning has a missing premise, and this tree is the first place it
+     * holds: the overlap it depends on is ds4_gpu_decode_graph_prefetch, which
+     * uploads chunk c+1 while chunk c runs, and which returned 0 on its first
+     * line for as long as DS4_CUDA_GRAPH_UPLOAD defaulted off. This tree turns
+     * that default on, so the prefetch is live, and only now is a chunk sweep
+     * measuring the thing the argument is about.
+     *
+     * Swept on one binary, the valve being a getenv so no rebuild intervenes,
+     * full local runs on the public fixture, correctness passed and the
+     * speculative accounting identical (67 rounds, 61 accepted) on every arm:
+     *
+     *   chunks  decode s/tok   prefill s/tok
+     *     4     0.047980904    0.001583237     (the previous default)
+     *     8     0.047967304    0.001580059     -0.03% decode, -0.20% prefill
+     *     2     0.047890684    0.001572407     -0.19% decode, -0.68% prefill
+     *
+     * TWO is best on BOTH legs, and it is the opposite direction from where the
+     * board went. The margins are inside a single local run's resolution and we
+     * claim no speed from them -- what the sweep establishes is the ORDERING on
+     * this box and that every arm is exact. Graphs replay their captured
+     * kernels byte for byte and a chunk boundary carries no state, so the
+     * partition cannot change a number.
+     *
+     * DS4_CUDA_DECODE_GRAPH_CHUNKS overrides; 1 restores the single capture. */
+    static uint32_t chunks = 2u;
     if (!init) {
         init = 1;
         const char *s = getenv("DS4_CUDA_DECODE_GRAPH_CHUNKS");
