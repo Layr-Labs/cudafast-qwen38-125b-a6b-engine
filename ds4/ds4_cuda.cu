@@ -17344,16 +17344,36 @@ extern "C" const char *ds4_gpu_hw_limits(void) {
         (void)cudaGetLastError();
         return buf;
     }
-    const cudaDeviceAttr want[6] = {
+    /* The last three are new and they decide whether the routed gate/up
+     * occupancy axis is open at all.  `__maxnreg__(32)` capped that kernel to 32
+     * registers with ZERO spill and occupancy STILL reported 3 blocks/SM, even
+     * though 4 x 32 x 512 = 65,536 is exactly the register file.  Two candidate
+     * explanations, and they have opposite consequences:
+     *
+     *   - threads/SM is 1536, so 1536 / 512 = 3 blocks is a HARD ceiling and no
+     *     register cap can ever buy a fourth.  The axis is closed by arithmetic,
+     *     and the +0.775% of decode that 40 -> 32 delivered came from register
+     *     pressure alone at constant residency.
+     *   - threads/SM is 2048 and the exact-fit 65,536 simply failed because the
+     *     SM does not hand out 100% of its register file.  Then a fourth block
+     *     is still reachable below 32.
+     *
+     * regs/SM is read for the same reason: every occupancy figure in this file
+     * has assumed 65,536, and that assumption has never once been checked
+     * against the device. */
+    const cudaDeviceAttr want[9] = {
         cudaDevAttrMaxSharedMemoryPerBlockOptin,
         cudaDevAttrMultiProcessorCount,
         cudaDevAttrComputeCapabilityMajor,
         cudaDevAttrComputeCapabilityMinor,
         cudaDevAttrIntegrated,
         cudaDevAttrCooperativeLaunch,
+        cudaDevAttrMaxThreadsPerMultiProcessor,
+        cudaDevAttrMaxBlocksPerMultiprocessor,
+        cudaDevAttrMaxRegistersPerMultiprocessor,
     };
-    int got[6];
-    for (int i = 0; i < 6; i++) {
+    int got[9];
+    for (int i = 0; i < 9; i++) {
         got[i] = -1;
         if (cudaDeviceGetAttribute(&got[i], want[i], dev) != cudaSuccess) {
             (void)cudaGetLastError();
@@ -17361,8 +17381,10 @@ extern "C" const char *ds4_gpu_hw_limits(void) {
         }
     }
     int n = snprintf(buf, sizeof(buf),
-                     "smem/blk_optin=%d sm=%d cc=%d.%d integrated=%d coop=%d",
-                     got[0], got[1], got[2], got[3], got[4], got[5]);
+                     "smem/blk_optin=%d sm=%d cc=%d.%d integrated=%d coop=%d "
+                     "thr/sm=%d blk/sm=%d reg/sm=%d",
+                     got[0], got[1], got[2], got[3], got[4], got[5],
+                     got[6], got[7], got[8]);
     if (n < 0) { buf[0] = '\0'; return buf; }
     /* The register/shared footprint of the two routed-MoE decode kernels, from
      * the translation unit that owns them.  Truncation is harmless: the string

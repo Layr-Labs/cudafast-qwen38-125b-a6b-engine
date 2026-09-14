@@ -4226,7 +4226,29 @@ __device__ __forceinline__ static void qw_gu_coop_raw_load(
  * admits 3 blocks/SM at 512 threads (3 x 40 x 512 = 61,440 <= 65,536), and it
  * won +0.545% of decode as `ebc0169b`.
  *
- * NOW 32, for the 4th block: 4 x 32 x 512 = 65,536 is the ENTIRE register file,
+ * 32 WAS TRIED AND IT PAID, BUT NOT THROUGH OCCUPANCY.  Accepted as `a0cfbcbf`
+ * at 2.48274596, #1: gu[reg=32 smem=23168 lmem=0 maxt=1024 occ=3].  The cap took
+ * 40 -> 32 with ZERO spill, the decode leg reached q_dec 2.20656 -- the highest
+ * ever recorded on this board, +0.775% over the 40-register tree -- and yet
+ * occupancy STAYED AT 3.  So the gain came from register pressure at CONSTANT
+ * residency, which is a different mechanism from the one that won `ebc0169b`,
+ * and it says the productive knob here is the register count itself.
+ *
+ * NOW 24.  Two questions in one point, and 24 is the only remaining one that can
+ * ask them: the allocation grain is 8 registers, so 25..31 all round up to 32 and
+ * would re-measure a known answer.  (a) Does the pressure trend continue below
+ * 32?  (b) Does a fourth block appear once the fit is no longer exact --
+ * 4 x 24 x 512 = 49,152 leaves 16,384 registers of slack where 32 left none, so
+ * if the exact fit is what failed, 24 reveals it.  The device attributes added to
+ * ds4_gpu_hw_limits this run answer (b) independently: if thr/sm is 1536 then
+ * 1536 / 512 = 3 blocks is a HARD ceiling, no register cap can ever buy a fourth,
+ * and the occupancy axis on this kernel is closed by arithmetic.
+ *
+ * 24 is 49% under the kernel's natural want of 47, so spill is the live risk and
+ * this is the most aggressive cap attempted here.  A spill at 24 also bounds the
+ * axis usefully: it would make 32 the floor.
+ *
+ * The 32-register history, for the record: 4 x 32 x 512 = 65,536 is the ENTIRE register file,
  * exactly, with zero slack, and the 23,168 B static panel allows four
  * (92,672 <= 101,376).  This is a genuinely two-sided bet and the downside is
  * not spill alone.  The natural want here is 47; 32 is 32% under it, and this
@@ -4235,13 +4257,13 @@ __device__ __forceinline__ static void qw_gu_coop_raw_load(
  * registers cannot hold both accumulator chains in flight, the cap buys a
  * fourth block and pays for it out of the exact resource that matters most.
  *
- * READOUT, pre-committed: gu[lmem] != 0 => spilled, revert to 40 regardless of
- * composite.  gu[reg]=32 with gu[occ]=4 and lmem=0 => the cap took cleanly and
- * the decode leg is then the answer.  gu[occ]=3 => 32 is unreachable and 40 is
- * the measured floor, at which point gate/up occupancy is CLOSED for a real
- * reason rather than a mis-read one. */
+ * READOUT, pre-committed: gu[lmem] != 0 => spilled at 24, revert to 32
+ * regardless of composite.  gu[reg]=24 lmem=0 occ=4 => the exact fit was what
+ * blocked the fourth block and residency is open again.  gu[reg]=24 lmem=0 occ=3
+ * with thr/sm=1536 => the occupancy axis is CLOSED by arithmetic and the decode
+ * leg alone says whether register pressure keeps paying below 32. */
 #if defined(__CUDACC__) && CUDART_VERSION >= 12040
-#define QW_GU_MAXNREG __maxnreg__(32)
+#define QW_GU_MAXNREG __maxnreg__(24)
 #else
 #define QW_GU_MAXNREG
 #endif
