@@ -592,7 +592,13 @@ int main(void) {
      * can see it.  On failure the string is empty and the identity is exactly
      * what it was, which keeps the `ds4-resident load_epoch=` prefix and the
      * ident that benchd seals unchanged for a non-CUDA build. */
-    char ident_buf[768];
+    /* 1280, not 768: the limits string now carries the device attributes, the
+     * routed-MoE kernels, both prefill tiles AND the dense projections.  On
+     * overflow the branch below drops the ENTIRE limits string rather than
+     * truncating it, so a tight buffer here loses the whole measurement
+     * silently -- keep this comfortably ahead of ds4_gpu_hw_limits()'s own
+     * buffer. */
+    char ident_buf[1280];
     const char *limits = ds4s_hw_limits();
     if (limits && limits[0]) {
         const int n = snprintf(ident_buf, sizeof(ident_buf), "%s %s", ident, limits);

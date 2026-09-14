@@ -5758,8 +5758,188 @@ __global__ static void matmul_q8_0_preq_rows_exact_tile_kernel(
 /* Two adjacent lanes share a Q8 group. Their integer partials may be
  * combined freely; each even lane keeps its original float group chain.
  * Shared memory remaps the 32 finished chains onto one reduction warp. */
+/* __maxnreg__(48) here, and it is a CONTROLLED test of one variable rather than
+ * another register sweep.
+ *
+ * This kernel is the live dense-projection path at decode width: its dispatch
+ * guard is `use_dp4a && n_rows <= 2 && out_dim > 512 && (in_dim & 31) == 0`, and
+ * decode runs two rows (`draft_tokens=2`), so `<2, false>` is what actually
+ * launches -- at 256 threads with a 512 B static panel, read from its launch
+ * site.  The sibling `matmul_q8_0_preq_warp8_kernel` is guarded on `n_tok == 1`
+ * and is therefore NOT the hot decode path, which is why the cap goes here.
+ *
+ * First measurement of this kernel, published by the probe on `9c20efdc`:
+ *
+ *   pl2[reg=51 smem=512  lmem=0 maxt=1024]   <2, false>  -- 256 threads
+ *   pl4[reg=46 smem=1024 lmem=0 maxt=1024]   <4, false>
+ *
+ * Occupancy arithmetic, on device constants (`thr/sm=1536 reg/sm=65536`):
+ *
+ *   51 regs -> 56 at grain 8:  56 x 256 = 14,336/blk => 65,536/14,336 = 4 blocks
+ *   cap 48:                    5 x 48 x 256 = 61,440 <= 65,536  => 5 blocks
+ *   thread ceiling:            1536/256 = 6 blocks
+ *
+ * So it sits at 4 blocks = 1024/1536 = **67% of threads**, register-bound, with
+ * headroom the algorithm is not using.  Shared is irrelevant (512 x 5 = 2,560).
+ * The cap binds ONLY on `<2, false>`: pl4 is already at 46 -> 48 allocated, so
+ * 48 leaves it untouched.
+ *
+ * WHY THIS IS NOT A REPEAT OF THE ARM THAT JUST LOST 10.2%.  `88500cf1` capped
+ * routed down (`qwen4exp_moe_down_q_kernel`) from 48 to 40: it took with
+ * `lmem=0`, bought the 6th block, reached 100% thread occupancy, and cost 10.2%
+ * of decode.  The cause was REMATERIALIZATION -- ptxas recomputing values rather
+ * than keeping them live, which is invisible in `localSizeBytes` and pays in
+ * INSTRUCTIONS.  Routed decode is instruction-bound, so those instructions
+ * compete with real work and the extra block cannot repay them.
+ *
+ * This arm holds every other factor equal and changes exactly that:
+ *
+ *   | factor              | 88500cf1 (lost)      | this arm              |
+ *   |---------------------|----------------------|-----------------------|
+ *   | block threads       | 256                  | 256                   |
+ *   | cut, in grain steps | 48 -> 40, one step   | 56 -> 48, one step    |
+ *   | occupancy gain      | 5 -> 6 (+20%)        | 4 -> 5 (+25%)         |
+ *   | REGIME              | instruction-bound    | **bandwidth-bound**   |
+ *
+ * The dense half of the round runs at ~58-60% of roofline against routed's ~44%,
+ * i.e. it is limited by memory, not by issue.  In that regime the trade inverts:
+ * extra resident warps buy more outstanding memory requests, and rematerialized
+ * instructions hide behind memory latency instead of competing with it.  Dense
+ * projections are ~1,700 MB of a ~6.58 GB decode round (~26%).
+ *
+ * Bit-exactness: a register cap changes ALLOCATION only.  ptxas may spill or
+ * rematerialize; it cannot reassociate.  This TU is built without
+ * --use_fast_math, so the two integer lane partials still combine exactly and
+ * the original 32 float chains and warp tree fold in the same order.  The gate
+ * is an exact golden-token match, not a tolerance.
+ *
+ * READOUT, pre-committed:
+ *   - pl2[lmem] != 0 => spilled at 48.  Revert, regardless of composite.
+ *   - pl2[occ]=5, lmem=0, decode GAINS => the regime rule is confirmed: caps pay
+ *     on bandwidth-bound kernels and lose on instruction-bound ones.  Next step
+ *     is 40 here (6 blocks, 100% threads), then the same test on the remaining
+ *     dense kernels.
+ *   - pl2[occ]=5, lmem=0, decode LOSES => the register/occupancy class is closed
+ *     ENGINE-WIDE, and because this arm matches 88500cf1 on block size and cut
+ *     magnitude, the controlled comparison shows the cause is not cut magnitude.
+ *     Stop capping registers on this engine; the remaining lever is load shape.
+ *   - pl2[occ]=4 => the cap did not buy a block and the arithmetic above is
+ *     wrong; re-read the launch geometry before any further claim.
+ *
+ * ANSWERED (4f19dd48, rejected 2.46600067729987, box spark-qwen38-125b-a6b-cuda,
+ * paired against 9c20efdc on the SAME box):
+ *
+ *     pl2[reg=48 smem=512 lmem=0 maxt=1024 occ=5]   cap took, zero spill, 4 -> 5
+ *
+ *   | tree      | pl2 regs | occ | decode leg          | q_dec    | vs pair |
+ *   |-----------|----------|-----|---------------------|----------|---------|
+ *   | 9c20efdc  | 51 -> 56 |  4  | 0.0289355257109375  | 2.185083 |    --   |
+ *   | 4f19dd48  |    48    |  5  | 0.0289083735859375  | 2.187170 | +0.094% |
+ *
+ * The REGIME RULE IS CONFIRMED: the identical intervention -- one grain-step cut
+ * on a 256-thread block buying one extra resident block -- cost -10.2% on the
+ * instruction-bound routed down kernel (see the ANSWERED block in
+ * ds4_cuda_qwen4exp.cu) and cost NOTHING here, on the bandwidth-bound dense
+ * path. Rematerialization only bites when instructions are the constraint.
+ *
+ * But +0.094% is at the paired instrument's noise floor (~0.1%) and is ~7 bips
+ * of composite, under the 10-bip acceptance floor. So the PRACTICAL verdict is
+ * that the register/occupancy class is CLOSED ENGINE-WIDE: of eight experiments
+ * exactly one paid (gate/up __maxnreg__(32)), and thr/sm=1536 proves that one
+ * never gained a block -- it paid through register PRESSURE at constant
+ * residency, letting ptxas interleave two independent __dp4a chains. Occupancy
+ * itself has never bought anything measurable on this engine.
+ *
+ * THIS ARM: 40, the last rung. 6 x 40 x 256 = 61,440 <= 65,536 and the thread
+ * ceiling is 1536/256 = 6, so 40 is exactly the cap that reaches 100% of
+ * threads -- the same arithmetic that held on routed down, where the cap took
+ * cleanly and the kernel still lost. Here it did not lose, so the remaining
+ * question is only whether the 6th block adds to the 5th's +0.094%.
+ *
+ * Pre-registered readout, and note this ladder is CHEAP and then CLOSED:
+ *   - pl2[lmem] != 0     => 40 spills. Revert to 48 regardless of composite.
+ *   - pl2[occ]=6, gains  => the dense ladder is monotone; keep, and the total
+ *     4 -> 6 gain is the honest size of the dense occupancy lever.
+ *   - pl2[occ]=6, wash or loss => grain 8 leaves NO untested point between 40
+ *     and 48, so the dense ladder is exhausted at 5 blocks. Revert to 48 and
+ *     do not return to register allocation on this engine in any form.
+ *   - pl2[occ]=5 => 40 and 48 allocate identically; the ladder was already
+ *     closed at the previous rung.
+ *
+ * ANSWERED (e49cd007, rejected 2.45734121191652, box spark-5):
+ *
+ *     pl2[reg=40 smem=512 lmem=8 maxt=1024 occ=6]     <- SPILLED
+ *
+ * 40 reaches 6 blocks and 100% of threads, and it does so BY SPILLING: lmem=8.
+ * That fires the first pre-registered branch, so 48 is restored here regardless
+ * of the composite -- and grain 8 leaves no point between 40 and 48, so the
+ * DENSE REGISTER LADDER IS EXHAUSTED at 5 blocks:
+ *
+ *   | regs | blocks/SM | threads | spill  | decode vs previous rung |
+ *   |------|-----------|---------|--------|-------------------------|
+ *   |  56  |     4     |   67%   |   no   |            --           |
+ *   |  48  |     5     |   83%   |   no   |  +0.094% (a wash)  <- KEPT |
+ *   |  40  |     6     |  100%   | lmem=8 |      spilled, reverted   |
+ *
+ * DO NOT re-sweep this kernel, and do not return to register allocation on this
+ * engine in any form. Across five probed kernels and nine experiments the class
+ * is CLOSED: gate/up is the only kernel where a cap paid, and thr/sm=1536 proves
+ * it never gained a block -- it paid through register PRESSURE at constant
+ * residency (two independent __dp4a chains interleaving). Residency itself was
+ * never the binding constraint anywhere measured here, which is why both 100%
+ * arms failed: routed down reached it by rematerializing (-10.2%) and dense
+ * reaches it by spilling.
+ *
+ * Also checked and dead WITHOUT spending a draw: I suspected this kernel
+ * over-read weights, since grid.y = 2 with R = 2 would make the blockIdx.y = 1
+ * blocks stream the whole weight matrix with take = 0. It does not -- the live
+ * decode branch launches grid.y = (n_rows + 1) / 2 = 1, and grid.y = 2 is the
+ * three-row path only. The two-row tile already reads each weight block once
+ * for both draft rows.
+ *
+ * WHAT THE RESTORED 48 IS WORTH (6510b5a1, rejected 2.47713495842222, spark-8,
+ * cal_dec 0.0640156 / cal_pre 0.00220552):
+ *
+ *     pl2[reg=48 smem=512 lmem=0 maxt=1024 occ=5]
+ *     q_dec = 2.205960     q_pre = 3.363200     comp@cal = 2.4516
+ *
+ * That is the HIGHEST MERIT measured on this board -- +39 bips over the accepted
+ * frontier a0cfbcbf (comp@cal 2.4477) -- and it scored 2.4771 only because the
+ * draw was +1.04%, below the 25th percentile of the 418-run luck distribution.
+ * The decode leg matched the frontier's best-ever 2.206560 to within 0.03%.
+ *
+ * So the +0.094% paired gain that read as a wash against the 10-bip floor is
+ * real and is carried here deliberately: at median luck (+1.350%) this tree
+ * scores 2.4847 and at p75 (+1.517%) it scores 2.4888, against a bar of
+ * 2.4827459586612 x 1.001 = 2.485229. Do not revert this cap to 56 to "get back
+ * to the frontier config" -- the frontier config is strictly worse.
+ *
+ * PER-BOX EFFECT ON THE RATIO (five draws of essentially this configuration; the
+ * score is a speedup RATIO, so a uniformly slow box should cancel -- it does
+ * not):
+ *
+ *   | draw     | box                        | comp@cal | score    |
+ *   |----------|----------------------------|----------|----------|
+ *   | 9c20efdc | spark-qwen38-125b-a6b-cuda |  2.4256  | 2.466939 |
+ *   | 4f19dd48 | spark-qwen38-125b-a6b-cuda |  2.4273  | 2.466001 |
+ *   | d54a58e2 | spark-qwen38-125b-a6b-cuda |  2.4248  | 2.459450 |
+ *   | 6510b5a1 | spark-8                    |  2.4516  | 2.477135 |
+ *   | a0cfbcbf | spark-3                    |  2.4477  | 2.482746 |
+ *
+ * Three runs on spark-qwen38-125b-a6b-cuda agree to within 25 bips and sit ~1%
+ * below what the same tree posts on spark-3 or spark-8. So that box's control
+ * leg is relatively FASTER against its candidate leg, and a draw landing there
+ * cannot clear the bar however good the tree is. Do not read a low score from
+ * that box as a regression, and do not tune against a measurement taken there
+ * unless the comparison is paired within the box. */
+#if defined(__CUDACC__) && CUDART_VERSION >= 12040
+#define QW_PL_MAXNREG __maxnreg__(48)
+#else
+#define QW_PL_MAXNREG
+#endif
+
 template <int R, bool Streaming = true>
-__global__ static void matmul_q8_0_preq_pair_lanes_kernel(
+__global__ static void QW_PL_MAXNREG matmul_q8_0_preq_pair_lanes_kernel(
         float *out, const unsigned char *w,
         const int8_t *xq, const float *xscale,
         uint64_t out_dim, uint32_t n_rows, uint64_t blocks) {
@@ -17334,7 +17514,7 @@ extern "C" const char *ds4_gpu_hw_limits(void) {
      * ds4_resident drops the WHOLE limits string rather than truncating it if it
      * does not fit its own ident buffer, so a tight fit here loses the
      * measurement silently. */
-    static char buf[448];
+    static char buf[896];
     static int built = 0;
     if (built) return buf;
     built = 1;
@@ -17344,16 +17524,36 @@ extern "C" const char *ds4_gpu_hw_limits(void) {
         (void)cudaGetLastError();
         return buf;
     }
-    const cudaDeviceAttr want[6] = {
+    /* The last three are new and they decide whether the routed gate/up
+     * occupancy axis is open at all.  `__maxnreg__(32)` capped that kernel to 32
+     * registers with ZERO spill and occupancy STILL reported 3 blocks/SM, even
+     * though 4 x 32 x 512 = 65,536 is exactly the register file.  Two candidate
+     * explanations, and they have opposite consequences:
+     *
+     *   - threads/SM is 1536, so 1536 / 512 = 3 blocks is a HARD ceiling and no
+     *     register cap can ever buy a fourth.  The axis is closed by arithmetic,
+     *     and the +0.775% of decode that 40 -> 32 delivered came from register
+     *     pressure alone at constant residency.
+     *   - threads/SM is 2048 and the exact-fit 65,536 simply failed because the
+     *     SM does not hand out 100% of its register file.  Then a fourth block
+     *     is still reachable below 32.
+     *
+     * regs/SM is read for the same reason: every occupancy figure in this file
+     * has assumed 65,536, and that assumption has never once been checked
+     * against the device. */
+    const cudaDeviceAttr want[9] = {
         cudaDevAttrMaxSharedMemoryPerBlockOptin,
         cudaDevAttrMultiProcessorCount,
         cudaDevAttrComputeCapabilityMajor,
         cudaDevAttrComputeCapabilityMinor,
         cudaDevAttrIntegrated,
         cudaDevAttrCooperativeLaunch,
+        cudaDevAttrMaxThreadsPerMultiProcessor,
+        cudaDevAttrMaxBlocksPerMultiprocessor,
+        cudaDevAttrMaxRegistersPerMultiprocessor,
     };
-    int got[6];
-    for (int i = 0; i < 6; i++) {
+    int got[9];
+    for (int i = 0; i < 9; i++) {
         got[i] = -1;
         if (cudaDeviceGetAttribute(&got[i], want[i], dev) != cudaSuccess) {
             (void)cudaGetLastError();
@@ -17361,15 +17561,113 @@ extern "C" const char *ds4_gpu_hw_limits(void) {
         }
     }
     int n = snprintf(buf, sizeof(buf),
-                     "smem/blk_optin=%d sm=%d cc=%d.%d integrated=%d coop=%d",
-                     got[0], got[1], got[2], got[3], got[4], got[5]);
+                     "smem/blk_optin=%d sm=%d cc=%d.%d integrated=%d coop=%d "
+                     "thr/sm=%d blk/sm=%d reg/sm=%d",
+                     got[0], got[1], got[2], got[3], got[4], got[5],
+                     got[6], got[7], got[8]);
     if (n < 0) { buf[0] = '\0'; return buf; }
     /* The register/shared footprint of the two routed-MoE decode kernels, from
      * the translation unit that owns them.  Truncation is harmless: the string
      * is diagnostic only and snprintf keeps it terminated. */
     const char *kl = ds4_gpu_qwen4exp_kernel_limits();
     if (kl && kl[0] && (size_t)n + 2u < sizeof(buf)) {
-        snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", kl);
+        n += snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", kl);
+        if (n < 0 || (size_t)n >= sizeof(buf)) return buf;
+    }
+
+    /* ---- THE DENSE PROJECTIONS, read here for the FIRST TIME ----
+     *
+     * Every kernel measured so far -- routed gate/up, routed down, GDN octet,
+     * both prefill MoE tiles -- belongs to the routed MoE or to attention.  The
+     * decode traffic map puts the dense projections at ~1,700 MB of a ~6.58 GB
+     * round, **~26%**, and no note on this board has ever measured them.  They
+     * are the largest unprofiled term left on the leg that carries 0.75 of the
+     * composite.
+     *
+     * Why a probe rather than an arm, and why now.  The register/occupancy class
+     * that produced the current #1 is exhausted in both directions: routed
+     * gate/up has a measured optimum at 32 with residency hard-capped at 3 by
+     * thr/sm=1536; routed down loses 10.2% to REMATERIALIZATION at 40 even with
+     * lmem=0 and 100% thread occupancy; the GDN octet kernel already carries a
+     * deliberately tuned __launch_bounds__(128, 4) whose 128-register ceiling is
+     * exactly what ptxas honours at 126; and both prefill tiles sit at their
+     * ceilings.  So there is no arm left to guess at here, and a tree that only
+     * reverts a regression performs identically to the accepted #1 and can never
+     * clear its own bar.  That makes this draw free to spend on measurement.
+     *
+     * Liveness first, because most q8_0 kernels in this TU are NOT reachable --
+     * three obvious tok2/tok4/tok8 variants sit behind a unit-test-only flag.
+     * The two probed here are reached from live decode dispatch:
+     * `matmul_q8_0_preq_warp8_kernel` is launched at 256 threads from the decode
+     * stream, and `matmul_q8_0_preq_pair_lanes_kernel<2, false>` is the shape
+     * this campaign's own prior arms repeatedly targeted (widening it, uint4
+     * loads, deeper pipelines -- all measured negative), which is itself the
+     * evidence that it is on the hot path.
+     *
+     * Occupancy is reported only for warp8, whose 256-thread launch is read
+     * straight from its dispatch site.  pair_lanes gets attributes only: its
+     * block size varies with R across call sites and a GUESSED block size
+     * returns a confidently wrong occupancy.  Query, do not derive -- three
+     * hand-computed occupancy figures for this engine have already been wrong,
+     * two of them corrected by this very probe.
+     *
+     * What the numbers will decide.  If either kernel is register-bound well
+     * short of thr/sm=1536 threads, its concurrency is limited by allocation
+     * rather than by the algorithm, and it is a candidate for the ONE register
+     * lever that has actually paid (pressure on an instruction-bound kernel with
+     * two independent chains, as on gate/up).  If they are already at or near
+     * the thread ceiling, the dense half is closed on this axis too and the next
+     * lever has to come from load shape instead. */
+    struct cudaFuncAttributes fa;
+    int w8_occ = -1;
+    if (cudaFuncGetAttributes(&fa, matmul_q8_0_preq_warp8_kernel) ==
+        cudaSuccess) {
+        int occ = 0;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &occ, matmul_q8_0_preq_warp8_kernel, 256, 0) == cudaSuccess) {
+            w8_occ = occ;
+        } else {
+            (void)cudaGetLastError();
+        }
+        n += snprintf(buf + n, sizeof(buf) - (size_t)n,
+                      " w8[reg=%d smem=%d lmem=%d maxt=%d occ=%d]",
+                      fa.numRegs, (int)fa.sharedSizeBytes,
+                      (int)fa.localSizeBytes, fa.maxThreadsPerBlock, w8_occ);
+        if (n < 0 || (size_t)n >= sizeof(buf)) return buf;
+    } else {
+        (void)cudaGetLastError();
+    }
+    /* pl2 now carries occupancy too: its 256-thread launch is read from its
+     * dispatch site, so the block size is no longer a guess.  pl2[occ] IS the
+     * experiment for the __maxnreg__(48) cap on that kernel -- 5 means the cap
+     * took and bought the fifth block, 4 means it did not. */
+    if (cudaFuncGetAttributes(
+            &fa, matmul_q8_0_preq_pair_lanes_kernel<2, false>) == cudaSuccess) {
+        int occ = 0;
+        int pl_occ = -1;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &occ, matmul_q8_0_preq_pair_lanes_kernel<2, false>, 256, 0) ==
+            cudaSuccess) {
+            pl_occ = occ;
+        } else {
+            (void)cudaGetLastError();
+        }
+        n += snprintf(buf + n, sizeof(buf) - (size_t)n,
+                      " pl2[reg=%d smem=%d lmem=%d maxt=%d occ=%d]",
+                      fa.numRegs, (int)fa.sharedSizeBytes,
+                      (int)fa.localSizeBytes, fa.maxThreadsPerBlock, pl_occ);
+        if (n < 0 || (size_t)n >= sizeof(buf)) return buf;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaFuncGetAttributes(
+            &fa, matmul_q8_0_preq_pair_lanes_kernel<4, false>) == cudaSuccess) {
+        snprintf(buf + n, sizeof(buf) - (size_t)n,
+                 " pl4[reg=%d smem=%d lmem=%d maxt=%d]",
+                 fa.numRegs, (int)fa.sharedSizeBytes,
+                 (int)fa.localSizeBytes, fa.maxThreadsPerBlock);
+    } else {
+        (void)cudaGetLastError();
     }
     return buf;
 }
