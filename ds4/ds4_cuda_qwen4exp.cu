@@ -3276,11 +3276,68 @@ template <int GateType = -1, int UpType = -1, bool PairTasks = false,
           int Dma = 0>
 /* The DMA arms need the occupancy pinned: without a minimum ptxas takes
  * 167 registers (3 CTAs/SM) and throws away the whole point of the 64 B
- * arm, which is that its staging buffer still fits four. */
-__global__ __launch_bounds__(QW_MMA_THREADS,
-                             Dma == 0 ? 0 : (Dma == 4 ? 2
-                                                      : ((Dma >= 2) ? 3 : 4)))
-static void
+ * arm, which is that its staging buffer still fits four.
+ *
+ * MEASURED, and the __launch_bounds__ below does not do that job.  The probe
+ * (ds4_gpu_qwen4exp_kernel_limits) read this kernel for the first time in
+ * submission `20812211` and reported, for the shipped arm
+ * QW_GATEUP_DMA_ARM = 5, `mm[reg=167 smem=24288 lmem=0 occ=3]`.  The register
+ * figure is exactly the 167 above, so the comment was right about that -- but
+ * Dma >= 2 resolves the bound to (128, 3), whose implied ceiling is
+ * 65,536 / (128 * 3) = 170, and 167 <= 170.  THE BOUND IS A NO-OP HERE: ptxas
+ * takes 167 either way, and `minBlocksPerMultiprocessor` is advisory on this
+ * toolchain regardless (measured twice on the decode kernels: (512,4) pushed
+ * gate/up 47 -> 60 and (1024,2) pushed down 48 -> 56, both the wrong way).
+ *
+ * Which of the two resources actually binds is now answered, and it is not the
+ * one I guessed.  Registers: 167 rounds to 168 at the 8-register allocation
+ * grain, 168 * 128 = 21,504 per CTA, so three fit in the 65,536-register file
+ * (64,512) and four cannot (86,016).  Shared: 24,288 B per CTA, so four fit in
+ * the 101,376 B opt-in (97,152) with 4,224 B to spare.  SHARED ALLOWS FOUR AND
+ * REGISTERS ALLOW THREE.  I had hand-computed 25,440 B and feared this sat
+ * within ~160 bytes of the shared threshold; it does not, and the arithmetic
+ * that mattered was the register side all along.
+ *
+ * So the fourth CTA is purely a register cap, at 4 * 128 * 128 = 65,536
+ * exactly -- no slack, the same knife-edge as the decode kernel's 3 * 40 * 512.
+ * __maxnreg__ is a HARD per-thread cap (CUDA 12.4+; this box is nvcc 13.0.88)
+ * and it is the mechanism that moved the decode kernel 47 -> 40 and 2 -> 3
+ * blocks with zero spill, accepted as `ebc0169b` for +0.545% of decode.  This
+ * asks the same question of the prefill tile, where it is worth 25 bips per 1%
+ * (docs/participant-contract.md 5.1.1: the prefill window is one 1024-row seed
+ * forward and nothing else).
+ *
+ * Bit-exactness: a register cap changes ALLOCATION only.  ptxas may spill or
+ * rematerialize; it cannot reassociate, and this TU compiles without
+ * --use_fast_math, so the emitted MMA sequence, the tile stores and the
+ * accumulation order are untouched.
+ *
+ * THE READOUT: `mm[lmem]`.  Non-zero means the cap spilled -- 167 -> 128 is a
+ * 23% squeeze on a kernel that stages through cp.async and holds
+ * QW_MMA_NT * 4 accumulators per matrix -- and the arm must be reverted
+ * regardless of the composite, because a spilled four-CTA tile is not the
+ * experiment.  `mm[occ]` says whether the cap took at all: 4 means it did,
+ * 3 means __maxnreg__ is advisory here too and there is no mechanism left.
+ *
+ * ONE MORE THING, and it is why the __launch_bounds__ below is REPLACED rather
+ * than stacked: CUDA documents that __maxnreg__ and __launch_bounds__ may not
+ * both be applied to the same kernel.  I cannot compile here to check, and the
+ * cost of being wrong is asymmetric -- a build break comes back `failed` and
+ * publishes NO metrics at all, whereas a bad score still publishes the probe
+ * (two draws already went that way on one stray comment terminator).  So the
+ * >= 12.4 path carries the cap ALONE, which is sound precisely because the
+ * bound is a measured no-op on the shipped arm, and the pre-12.4 path keeps the
+ * original bound verbatim.  Dropping maxThreadsPerBlock is harmless under a
+ * hard cap: the launch is 128 threads either way and residency is pinned by
+ * the cap, not by the hint. */
+#if defined(__CUDACC__) && CUDART_VERSION >= 12040
+#define QW_MMA_OCC_ATTR __maxnreg__(128)
+#else
+#define QW_MMA_OCC_ATTR                                                        \
+    __launch_bounds__(QW_MMA_THREADS,                                          \
+                      Dma == 0 ? 0 : (Dma == 4 ? 2 : ((Dma >= 2) ? 3 : 4)))
+#endif
+__global__ QW_MMA_OCC_ATTR static void
 qwen4exp_moe_gateup_mma_kernel(
         float *mid,
         int8_t *mq,
@@ -13254,7 +13311,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_tensor(
  * swallowed and reported as -1; the function never touches device state and is
  * called once, off the timed path. */
 extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
-    static char buf[256];
+    static char buf[384];
     static int built = 0;
     if (built) return buf;
     built = 1;
@@ -13263,6 +13320,9 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
     int gu_regs = -1, gu_smem = -1, gu_lmem = -1, gu_maxt = -1;
     int gu_occ = -1, dn_occ = -1;
     int dn_regs = -1, dn_smem = -1, dn_lmem = -1, dn_maxt = -1;
+    /* The two PREFILL tile kernels, read here for the first time. */
+    int mg_regs = -1, mg_smem = -1, mg_lmem = -1, mg_occ = -1;
+    int md_regs = -1, md_smem = -1, md_lmem = -1, md_occ = -1;
     /* The drift control: a kernel nobody in this line of work has touched. */
     int gd_regs = -1, gd_lmem = -1;
 
@@ -13344,11 +13404,91 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
         (void)cudaGetLastError();
     }
 
+    /* ---- THE PREFILL TILE KERNELS, read here for the first time ----
+     * Everything above, and every arm this line of work has submitted, is a
+     * DECODE-width kernel.  But `docs/participant-contract.md` 5.1.1 is explicit
+     * that benchd splits its parent clock at the verb boundary: the prefill
+     * window is `free_decode_begin` sent -> validated seed_token back, and that
+     * verb "runs the FULL seed prefill -- the golden's decode_seed_tokens, all
+     * 1024 of them".  So the prefill leg is ONE 1024-row forward and nothing
+     * else, it carries weight 0.25 (25 bips per 1%), and these two tiles are the
+     * routed MoE inside it.  Neither has ever been measured.
+     *
+     * The specific question.  The gate/up tile carries, in its own words, "the
+     * DMA arms need the occupancy pinned: without a minimum ptxas takes 167
+     * registers (3 CTAs/SM) and throws away the whole point of the 64 B arm,
+     * which is that its staging buffer still fits four."  The shipped arm is
+     * QW_GATEUP_DMA_ARM = 5, which resolves that kernel's
+     * __launch_bounds__(QW_MMA_THREADS, Dma >= 2 ? 3 : ...) to (128, 3) -- an
+     * implied register ceiling of 65,536 / (128 * 3) = 170.  167 <= 170, so THE
+     * BOUND IS A NO-OP on the shipped arm: ptxas would take 167 either way, and
+     * the author's own target of four CTAs needs <= 128 registers, which nothing
+     * in the source asks for.  __launch_bounds__ could not deliver it anyway --
+     * minBlocksPerMultiprocessor is advisory here, measured twice, and it took
+     * __maxnreg__ to move the decode kernel above.
+     *
+     * I am deliberately NOT capping these yet.  My hand-computed shared-memory
+     * total for the Dma=5 arm is 25,440 B (three 32x144 int8 tiles, six 32x4
+     * float tables, sTok, and sRaw[526] uint4 at stride 66), which lands within
+     * ~160 bytes of the four-CTA threshold -- far too close to trust to my own
+     * arithmetic, which has now been wrong twice on exactly this question.  So
+     * ask the runtime instead and let the next arm be chosen by mm[occ] and
+     * mm[reg]: if mm[occ] is 3 and mm[smem] leaves room, the 4th CTA is a
+     * register problem with a known mechanism; if mm[smem] is what binds, the
+     * cap is pointless and the target is those 160 bytes. */
+    if (cudaFuncGetAttributes(
+            &a, qwen4exp_moe_gateup_mma_kernel<DS4_QWEN4EXP_TY_q4_K,
+                                               DS4_QWEN4EXP_TY_q4_K, false,
+                                               QW_GATEUP_DMA_ARM>) ==
+        cudaSuccess) {
+        mg_regs = a.numRegs;
+        mg_smem = (int)a.sharedSizeBytes;
+        mg_lmem = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ,
+            qwen4exp_moe_gateup_mma_kernel<DS4_QWEN4EXP_TY_q4_K,
+                                           DS4_QWEN4EXP_TY_q4_K, false,
+                                           QW_GATEUP_DMA_ARM>,
+            (int)QW_MMA_THREADS, 0) == cudaSuccess) {
+        mg_occ = occ;
+    } else {
+        (void)cudaGetLastError();
+    }
+
+    /* The prefill down tile.  q8_0 is the ranked slab's down type and Wide6 is
+     * the shipped state of DS4_QWEN4EXP_NO_Q51_WIDE_LOAD (unset => true).  If
+     * this instantiation is not the one launched, md[] still reports a real
+     * compilation of this template and the reg/smem shape is the template's, not
+     * a guess -- but read it as indicative rather than as the launched kernel. */
+    if (cudaFuncGetAttributes(
+            &a, qwen4exp_moe_down_mma_kernel<DS4_QWEN4EXP_TY_q8_0, true>) ==
+        cudaSuccess) {
+        md_regs = a.numRegs;
+        md_smem = (int)a.sharedSizeBytes;
+        md_lmem = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ, qwen4exp_moe_down_mma_kernel<DS4_QWEN4EXP_TY_q8_0, true>,
+            (int)QW_DOWN_MMA_THREADS, 0) == cudaSuccess) {
+        md_occ = occ;
+    } else {
+        (void)cudaGetLastError();
+    }
+
     snprintf(buf, sizeof(buf),
              "gu[reg=%d smem=%d lmem=%d maxt=%d occ=%d] dn[reg=%d smem=%d "
-             "lmem=%d maxt=%d occ=%d] gdn[reg=%d lmem=%d]",
+             "lmem=%d maxt=%d occ=%d] gdn[reg=%d lmem=%d] "
+             "mm[reg=%d smem=%d lmem=%d occ=%d] "
+             "md[reg=%d smem=%d lmem=%d occ=%d]",
              gu_regs, gu_smem, gu_lmem, gu_maxt, gu_occ,
              dn_regs, dn_smem, dn_lmem, dn_maxt, dn_occ,
-             gd_regs, gd_lmem);
+             gd_regs, gd_lmem,
+             mg_regs, mg_smem, mg_lmem, mg_occ,
+             md_regs, md_smem, md_lmem, md_occ);
     return buf;
 }
