@@ -13254,7 +13254,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_tensor(
  * swallowed and reported as -1; the function never touches device state and is
  * called once, off the timed path. */
 extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
-    static char buf[256];
+    static char buf[384];
     static int built = 0;
     if (built) return buf;
     built = 1;
@@ -13263,6 +13263,9 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
     int gu_regs = -1, gu_smem = -1, gu_lmem = -1, gu_maxt = -1;
     int gu_occ = -1, dn_occ = -1;
     int dn_regs = -1, dn_smem = -1, dn_lmem = -1, dn_maxt = -1;
+    /* The two PREFILL tile kernels, read here for the first time. */
+    int mg_regs = -1, mg_smem = -1, mg_lmem = -1, mg_occ = -1;
+    int md_regs = -1, md_smem = -1, md_lmem = -1, md_occ = -1;
     /* The drift control: a kernel nobody in this line of work has touched. */
     int gd_regs = -1, gd_lmem = -1;
 
@@ -13344,11 +13347,91 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
         (void)cudaGetLastError();
     }
 
+    /* ---- THE PREFILL TILE KERNELS, read here for the first time ----
+     * Everything above, and every arm this line of work has submitted, is a
+     * DECODE-width kernel.  But `docs/participant-contract.md` 5.1.1 is explicit
+     * that benchd splits its parent clock at the verb boundary: the prefill
+     * window is `free_decode_begin` sent -> validated seed_token back, and that
+     * verb "runs the FULL seed prefill -- the golden's decode_seed_tokens, all
+     * 1024 of them".  So the prefill leg is ONE 1024-row forward and nothing
+     * else, it carries weight 0.25 (25 bips per 1%), and these two tiles are the
+     * routed MoE inside it.  Neither has ever been measured.
+     *
+     * The specific question.  The gate/up tile carries, in its own words, "the
+     * DMA arms need the occupancy pinned: without a minimum ptxas takes 167
+     * registers (3 CTAs/SM) and throws away the whole point of the 64 B arm,
+     * which is that its staging buffer still fits four."  The shipped arm is
+     * QW_GATEUP_DMA_ARM = 5, which resolves that kernel's
+     * __launch_bounds__(QW_MMA_THREADS, Dma >= 2 ? 3 : ...) to (128, 3) -- an
+     * implied register ceiling of 65,536 / (128 * 3) = 170.  167 <= 170, so THE
+     * BOUND IS A NO-OP on the shipped arm: ptxas would take 167 either way, and
+     * the author's own target of four CTAs needs <= 128 registers, which nothing
+     * in the source asks for.  __launch_bounds__ could not deliver it anyway --
+     * minBlocksPerMultiprocessor is advisory here, measured twice, and it took
+     * __maxnreg__ to move the decode kernel above.
+     *
+     * I am deliberately NOT capping these yet.  My hand-computed shared-memory
+     * total for the Dma=5 arm is 25,440 B (three 32x144 int8 tiles, six 32x4
+     * float tables, sTok, and sRaw[526] uint4 at stride 66), which lands within
+     * ~160 bytes of the four-CTA threshold -- far too close to trust to my own
+     * arithmetic, which has now been wrong twice on exactly this question.  So
+     * ask the runtime instead and let the next arm be chosen by mm[occ] and
+     * mm[reg]: if mm[occ] is 3 and mm[smem] leaves room, the 4th CTA is a
+     * register problem with a known mechanism; if mm[smem] is what binds, the
+     * cap is pointless and the target is those 160 bytes. */
+    if (cudaFuncGetAttributes(
+            &a, qwen4exp_moe_gateup_mma_kernel<DS4_QWEN4EXP_TY_q4_K,
+                                               DS4_QWEN4EXP_TY_q4_K, false,
+                                               QW_GATEUP_DMA_ARM>) ==
+        cudaSuccess) {
+        mg_regs = a.numRegs;
+        mg_smem = (int)a.sharedSizeBytes;
+        mg_lmem = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ,
+            qwen4exp_moe_gateup_mma_kernel<DS4_QWEN4EXP_TY_q4_K,
+                                           DS4_QWEN4EXP_TY_q4_K, false,
+                                           QW_GATEUP_DMA_ARM>,
+            (int)QW_MMA_THREADS, 0) == cudaSuccess) {
+        mg_occ = occ;
+    } else {
+        (void)cudaGetLastError();
+    }
+
+    /* The prefill down tile.  q8_0 is the ranked slab's down type and Wide6 is
+     * the shipped state of DS4_QWEN4EXP_NO_Q51_WIDE_LOAD (unset => true).  If
+     * this instantiation is not the one launched, md[] still reports a real
+     * compilation of this template and the reg/smem shape is the template's, not
+     * a guess -- but read it as indicative rather than as the launched kernel. */
+    if (cudaFuncGetAttributes(
+            &a, qwen4exp_moe_down_mma_kernel<DS4_QWEN4EXP_TY_q8_0, true>) ==
+        cudaSuccess) {
+        md_regs = a.numRegs;
+        md_smem = (int)a.sharedSizeBytes;
+        md_lmem = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ, qwen4exp_moe_down_mma_kernel<DS4_QWEN4EXP_TY_q8_0, true>,
+            (int)QW_DOWN_MMA_THREADS, 0) == cudaSuccess) {
+        md_occ = occ;
+    } else {
+        (void)cudaGetLastError();
+    }
+
     snprintf(buf, sizeof(buf),
              "gu[reg=%d smem=%d lmem=%d maxt=%d occ=%d] dn[reg=%d smem=%d "
-             "lmem=%d maxt=%d occ=%d] gdn[reg=%d lmem=%d]",
+             "lmem=%d maxt=%d occ=%d] gdn[reg=%d lmem=%d] "
+             "mm[reg=%d smem=%d lmem=%d occ=%d] "
+             "md[reg=%d smem=%d lmem=%d occ=%d]",
              gu_regs, gu_smem, gu_lmem, gu_maxt, gu_occ,
              dn_regs, dn_smem, dn_lmem, dn_maxt, dn_occ,
-             gd_regs, gd_lmem);
+             gd_regs, gd_lmem,
+             mg_regs, mg_smem, mg_lmem, mg_occ,
+             md_regs, md_smem, md_lmem, md_occ);
     return buf;
 }
