@@ -132,8 +132,10 @@ extern "C" int ds4_gpu_mtp_native_screen_init(uint32_t width,
     *bytes = 0; *capacity = 0;
     if (width <= MTP_NATIVE_CAP || width > MTP_NATIVE_MAX_WIDTH) return 0;
     size_t a = 0, b = 0;
+    /* The scratch-size query uses the same bit range as the executed sort
+     * below (see the argument there). */
     if (cub::DeviceRadixSort::SortKeysDescending(nullptr, a,
-            (const uint64_t *)nullptr, (uint64_t *)nullptr, width, 0, 64,
+            (const uint64_t *)nullptr, (uint64_t *)nullptr, width, 32, 64,
             cuda_decode_stream()) != cudaSuccess ||
         cub::DeviceRadixSort::SortKeys(nullptr, b,
             (const uint32_t *)nullptr, (uint32_t *)nullptr, MTP_NATIVE_CAP, 0, 32,
@@ -233,8 +235,24 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
     if (!ds4_gpu_tensor_read(scratch,l.flag,&invalid,4)) return -1;
     if (invalid) return 0;
     size_t temporary = (size_t)(scratch->bytes-l.temporary);
+    /* Rank the SCORE WORD only: four radix passes instead of eight, with the
+     * same shortlist in the same order.
+     *
+     * CREDIT: idea and first implementation hisxo, carried by tgerighty
+     * (`7b17d97`) and by newjordan (`076310c`); neither tree reached main.
+     *
+     * q8_top1_pack_key is (ordered_score << 32) | (0xffffffff - id), and the
+     * mandatory zero/tail keys are UINT64_MAX - id, whose low word is the
+     * same 0xffffffff - id.  Keys are written AT INDEX i by both producers
+     * (mtp_native_keys and the EmitKeys arm of the projection), and id is
+     * strictly ascending in i, so the low word strictly DESCENDS in array
+     * order.  CUB's radix sort is stable, so sorting bits [32,64) leaves
+     * every tie in input order -- which within a tie is exactly the
+     * descending-low-word order a full [0,64) descending sort would have
+     * produced.  Score ties, the canonicalised zero and the mandatory
+     * zero/tail keys are all covered by that one argument. */
     if (!cuda_ok(cub::DeviceRadixSort::SortKeysDescending(base+l.temporary,temporary,
-            key_in,key_out,width,0,64,cuda_decode_stream()),"native score sort")) return -1;
+            key_in,key_out,width,32,64,cuda_decode_stream()),"native score sort")) return -1;
     mtp_native_unpack_ids<<<(MTP_NATIVE_CAP+255u)/256u,256,0,cuda_decode_stream()>>>(id_tmp,key_out);
     if (!cuda_ok(cudaGetLastError(),"native candidate unpack")) return -1;
     temporary = (size_t)(scratch->bytes-l.temporary);
