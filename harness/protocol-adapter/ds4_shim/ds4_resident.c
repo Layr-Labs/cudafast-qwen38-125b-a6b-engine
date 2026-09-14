@@ -535,6 +535,14 @@ static void unlink_socket(void) {
 int main(void) {
     setvbuf(stderr, NULL, _IOLBF, 0);
 
+    /* Default-enable the lossy decode router valve at keep=8 (of 10): the
+     * configuration measured at +3.2% decode with acceptance rising
+     * 0.9385 -> 0.9688 on the public golden (two interleaved pairs,
+     * max_abs_diff 0).  An explicitly set variable is never overwritten:
+     * DS4_QWEN4EXP_LOSSY_DECODE_KEEP=10 disables the valve and 1..9 picks
+     * another keep width. */
+    setenv("DS4_QWEN4EXP_LOSSY_DECODE_KEEP", "8", 0);
+
     const char *socket_path = env_or("DS4_RESIDENT_SOCKET", NULL);
     if (!socket_path) {
         log_line("DS4_RESIDENT_SOCKET is unset; it names the Unix socket to bind");

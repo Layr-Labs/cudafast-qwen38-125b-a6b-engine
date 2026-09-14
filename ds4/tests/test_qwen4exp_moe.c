@@ -2467,6 +2467,167 @@ static void run_router_native_cases(void) {
 }
 #endif
 
+/* The CUDA-only lossy valve is deliberately tested against the exact router
+ * output captured before each case.  Every case clears both variables on exit
+ * so a refused setting cannot leak into the rest of this process. */
+static void run_router_lossy_decode_cases(
+        ds4_gpu_tensor *logits_t,
+        ds4_gpu_tensor *selected_t,
+        ds4_gpu_tensor *weights_t,
+        const int32_t *control_selected,
+        const float *control_weights,
+        unsigned n_experts,
+        unsigned n_expert_used,
+        unsigned n_tokens) {
+    int32_t got_selected[ROUTER_TOKENS * N_EXPERT_USED];
+    float got_weights[ROUTER_TOKENS * N_EXPERT_USED];
+    const size_t two_selected_bytes =
+        2u * n_expert_used * sizeof(got_selected[0]);
+    const size_t two_weight_bytes =
+        2u * n_expert_used * sizeof(got_weights[0]);
+    const size_t all_selected_bytes =
+        n_tokens * n_expert_used * sizeof(got_selected[0]);
+    const size_t all_weight_bytes =
+        n_tokens * n_expert_used * sizeof(got_weights[0]);
+
+    unsetenv("DS4_QWEN4EXP_LOSSY_DECODE_KEEP");
+    unsetenv("DS4_QWEN4EXP_LOSSY_DECODE_RENORM");
+    require_ok(ds4_gpu_qwen4exp_router_select_tensor(
+                   selected_t, weights_t, logits_t,
+                   n_experts, n_expert_used, 2u),
+               "lossy router default-off operation");
+    require_ok(ds4_gpu_tensor_read(selected_t, 0, got_selected,
+                                   two_selected_bytes) &&
+               ds4_gpu_tensor_read(weights_t, 0, got_weights,
+                                   two_weight_bytes),
+               "lossy router default-off read");
+    require_ok(memcmp(got_selected, control_selected, two_selected_bytes) == 0 &&
+               memcmp(got_weights, control_weights, two_weight_bytes) == 0,
+               "lossy router default-off changed control output");
+    unsetenv("DS4_QWEN4EXP_LOSSY_DECODE_KEEP");
+    unsetenv("DS4_QWEN4EXP_LOSSY_DECODE_RENORM");
+
+    require_ok(setenv("DS4_QWEN4EXP_LOSSY_DECODE_KEEP", "9", 1) == 0,
+               "lossy router KEEP=9 environment");
+    require_ok(ds4_gpu_qwen4exp_router_select_tensor(
+                   selected_t, weights_t, logits_t,
+                   n_experts, n_expert_used, 2u),
+               "lossy router KEEP=9 operation");
+    require_ok(ds4_gpu_tensor_read(selected_t, 0, got_selected,
+                                   two_selected_bytes) &&
+               ds4_gpu_tensor_read(weights_t, 0, got_weights,
+                                   two_weight_bytes),
+               "lossy router KEEP=9 read");
+    for (unsigned token = 0; token < 2u; token++) {
+        for (unsigned slot = 0; slot < 9u; slot++) {
+            const size_t at = (size_t)token * n_expert_used + slot;
+            require_ok(got_selected[at] == control_selected[at] &&
+                       memcmp(&got_weights[at], &control_weights[at],
+                              sizeof(float)) == 0,
+                       "lossy router KEEP=9 changed retained output");
+        }
+        const size_t tail = (size_t)token * n_expert_used + 9u;
+        require_ok(got_selected[tail] == -1 && got_weights[tail] == 0.0f,
+                   "lossy router KEEP=9 did not invalidate tail");
+    }
+    unsetenv("DS4_QWEN4EXP_LOSSY_DECODE_KEEP");
+    unsetenv("DS4_QWEN4EXP_LOSSY_DECODE_RENORM");
+
+    require_ok(setenv("DS4_QWEN4EXP_LOSSY_DECODE_KEEP", "9", 1) == 0 &&
+               setenv("DS4_QWEN4EXP_LOSSY_DECODE_RENORM", "1", 1) == 0,
+               "lossy router KEEP=9 RENORM=1 environment");
+    require_ok(ds4_gpu_qwen4exp_router_select_tensor(
+                   selected_t, weights_t, logits_t,
+                   n_experts, n_expert_used, 2u),
+               "lossy router KEEP=9 RENORM=1 operation");
+    require_ok(ds4_gpu_tensor_read(selected_t, 0, got_selected,
+                                   two_selected_bytes) &&
+               ds4_gpu_tensor_read(weights_t, 0, got_weights,
+                                   two_weight_bytes),
+               "lossy router KEEP=9 RENORM=1 read");
+    for (unsigned token = 0; token < 2u; token++) {
+        float sum = 0.0f;
+        for (unsigned slot = 0; slot < 9u; slot++) {
+            const size_t at = (size_t)token * n_expert_used + slot;
+            require_ok(got_selected[at] == control_selected[at],
+                       "lossy router renorm changed retained ids");
+            sum += got_weights[at];
+        }
+        require_ok(fabsf(sum - 1.0f) <= 1e-6f,
+                   "lossy router retained weights do not sum to one");
+        const size_t tail = (size_t)token * n_expert_used + 9u;
+        require_ok(got_selected[tail] == -1 && got_weights[tail] == 0.0f,
+                   "lossy router renorm did not invalidate tail");
+    }
+    unsetenv("DS4_QWEN4EXP_LOSSY_DECODE_KEEP");
+    unsetenv("DS4_QWEN4EXP_LOSSY_DECODE_RENORM");
+
+    require_ok(setenv("DS4_QWEN4EXP_LOSSY_DECODE_KEEP", "9", 1) == 0 &&
+               setenv("DS4_QWEN4EXP_LOSSY_DECODE_RENORM", "1", 1) == 0,
+               "lossy router prefill environment");
+    require_ok(ds4_gpu_qwen4exp_router_select_tensor(
+                   selected_t, weights_t, logits_t,
+                   n_experts, n_expert_used, n_tokens),
+               "lossy router prefill operation");
+    require_ok(ds4_gpu_tensor_read(selected_t, 0, got_selected,
+                                   all_selected_bytes) &&
+               ds4_gpu_tensor_read(weights_t, 0, got_weights,
+                                   all_weight_bytes),
+               "lossy router prefill read");
+    require_ok(memcmp(got_selected, control_selected, all_selected_bytes) == 0 &&
+               memcmp(got_weights, control_weights, all_weight_bytes) == 0,
+               "lossy router changed n_tokens>2 output");
+    unsetenv("DS4_QWEN4EXP_LOSSY_DECODE_KEEP");
+    unsetenv("DS4_QWEN4EXP_LOSSY_DECODE_RENORM");
+
+    require_ok(setenv("DS4_QWEN4EXP_LOSSY_DECODE_KEEP", "bad", 1) == 0,
+               "lossy router malformed environment");
+    require_ok(!ds4_gpu_qwen4exp_router_select_tensor(
+                   selected_t, weights_t, logits_t,
+                   n_experts, n_expert_used, 1u),
+               "lossy router accepted malformed KEEP");
+    unsetenv("DS4_QWEN4EXP_LOSSY_DECODE_KEEP");
+    unsetenv("DS4_QWEN4EXP_LOSSY_DECODE_RENORM");
+
+    require_ok(setenv("DS4_QWEN4EXP_LOSSY_DECODE_KEEP", "0", 1) == 0,
+               "lossy router zero KEEP environment");
+    require_ok(!ds4_gpu_qwen4exp_router_select_tensor(
+                   selected_t, weights_t, logits_t,
+                   n_experts, n_expert_used, 1u),
+               "lossy router accepted zero KEEP");
+    unsetenv("DS4_QWEN4EXP_LOSSY_DECODE_KEEP");
+    unsetenv("DS4_QWEN4EXP_LOSSY_DECODE_RENORM");
+
+    require_ok(setenv("DS4_QWEN4EXP_LOSSY_DECODE_KEEP", "10", 1) == 0,
+               "lossy router KEEP=n_expert_used environment");
+    require_ok(ds4_gpu_qwen4exp_router_select_tensor(
+                   selected_t, weights_t, logits_t,
+                   n_experts, n_expert_used, 2u),
+               "lossy router KEEP=n_expert_used operation");
+    require_ok(ds4_gpu_tensor_read(selected_t, 0, got_selected,
+                                   two_selected_bytes) &&
+               ds4_gpu_tensor_read(weights_t, 0, got_weights,
+                                   two_weight_bytes),
+               "lossy router KEEP=n_expert_used read");
+    require_ok(memcmp(got_selected, control_selected, two_selected_bytes) == 0 &&
+               memcmp(got_weights, control_weights, two_weight_bytes) == 0,
+               "lossy router KEEP=n_expert_used changed output");
+    unsetenv("DS4_QWEN4EXP_LOSSY_DECODE_KEEP");
+    unsetenv("DS4_QWEN4EXP_LOSSY_DECODE_RENORM");
+
+    require_ok(setenv("DS4_QWEN4EXP_LOSSY_DECODE_KEEP", "9", 1) == 0 &&
+               setenv("DS4_QWEN4EXP_LOSSY_DECODE_RENORM", "2", 1) == 0,
+               "lossy router malformed RENORM environment");
+    require_ok(!ds4_gpu_qwen4exp_router_select_tensor(
+                   selected_t, weights_t, logits_t,
+                   n_experts, n_expert_used, 1u),
+               "lossy router accepted malformed RENORM");
+    unsetenv("DS4_QWEN4EXP_LOSSY_DECODE_KEEP");
+    unsetenv("DS4_QWEN4EXP_LOSSY_DECODE_RENORM");
+
+    puts("ROUTER_LOSSY_DECODE valve cases pass");
+}
+
 int main(int argc, char **argv) {
     /* Fast mode for tests/qwen4exp_router_f32_mutants.sh: just the F32 router
      * projection's exactness sweep, so a mutant run costs one rebuild and a
@@ -2665,6 +2826,8 @@ int main(int argc, char **argv) {
     require_ok(ds4_gpu_tensor_write(logits_t, 0, logits,
                                     (uint64_t)ROUTER_TOKENS * N_EXPERT * sizeof(float)),
                "router logit write");
+    unsetenv("DS4_QWEN4EXP_LOSSY_DECODE_KEEP");
+    unsetenv("DS4_QWEN4EXP_LOSSY_DECODE_RENORM");
     require_ok(ds4_gpu_qwen4exp_router_select_tensor(selected_t, weights_t, logits_t,
                                                      N_EXPERT, N_EXPERT_USED, ROUTER_TOKENS),
                "router select");
@@ -2701,6 +2864,9 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 10; i++) {
         if (gpu_selected[8 * N_EXPERT_USED + i] != tied[i]) fail("tie rule must take the lowest indices");
     }
+    run_router_lossy_decode_cases(logits_t, selected_t, weights_t,
+                                  gpu_selected, gpu_weights,
+                                  N_EXPERT, N_EXPERT_USED, ROUTER_TOKENS);
 
     /* ---------------- Routed experts + shared expert ---------------- */
     float *x = calloc((size_t)MOE_TOKENS * IN_DIM, sizeof(float));
