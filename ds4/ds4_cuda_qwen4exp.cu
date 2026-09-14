@@ -4050,6 +4050,33 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
                 } \
             } while (0)
             uint32_t g = lane;
+            /* Two groups in flight is a DRAM-latency structure, and the Coop
+             * path has no DRAM in this loop.  The pair loop exists because on
+             * the direct path `qw_raw_load` reaches into the weight slab, so a
+             * lane wants a second 32-byte read outstanding while it decodes
+             * the first.  Under `Coop` the panel was already staged into
+             * `wcoop` above the barrier and `qw_gu_coop_raw_load` reads
+             * __shared__, tens of cycles with no queue to fill, so `raw1[8]`
+             * buys nothing and costs eight registers of live range at a point
+             * where registers decide blocks/SM: 512 threads x 4 blocks is
+             * 2048 threads/SM, which needs <= 32 registers per thread.
+             * `Coop` is a template bool, so the direct path below keeps the
+             * pair loop byte for byte.
+             *
+             * Bit-exactness: a lane visits the same groups in the same order
+             * either way.  With groups == 80 a lane < 48 does g, g+32 in the
+             * pair loop and g+64 in the tail (lanes 16..47 stop at g+32 since
+             * g+64 >= 80); a lane >= 48 does only g, in the tail.  The single
+             * loop walks lane, lane+32, lane+64 -- the same sequence -- so the
+             * accumulators are fed in the same order and reduce through the
+             * same warp_sum_f32 tree. */
+            if (Coop) {
+                for (; g < groups; g += 32u) {
+                    uint32_t raw[8];
+                    qw_gu_coop_raw_load(wsh, wrow, g, raw);
+                    QWEN4EXP_SPLIT_GROUP(g, raw);
+                }
+            } else
             for (; g + 32u < groups; g += 64u) {
                 uint32_t raw0[8];
                 uint32_t raw1[8];
@@ -4102,8 +4129,22 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
                 }
             }
         }
-        /* Readers finish before a fast projection warp reuses this tile. */
-        __syncthreads();
+        /* Readers finish before a fast projection warp reuses this tile --
+         * but ONLY a later iteration can reuse it, and at decode width there
+         * is no later iteration.  `cnt` is counts[expert], the number of
+         * (token, slot) pairs that routed to this block's expert; with two
+         * verified rows and ten slots drawn from 512 experts a decode expert
+         * collects one or two pairs, and R is 2, so `take == cnt` and the
+         * loop body runs exactly once.  The barrier then guards a write that
+         * never happens, and it is the most expensive place to put one: it
+         * sits immediately before the block exits, so every warp waits on the
+         * slowest before the SM releases the block's slot, which delays the
+         * next block in a grid of 80 x n_active blocks.  `cnt` is
+         * counts[expert] and `at` is loop-uniform, so the guard is uniform
+         * over the block and the remaining barriers are still met by every
+         * thread together.  Prefill, where cnt does exceed R, keeps the
+         * barrier and is byte-for-byte unaffected. */
+        if (at + R < cnt) __syncthreads();
     }
 }
 
@@ -12730,4 +12771,69 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_tensor(
     return ds4_gpu_qwen4exp_shared_expert_preq_tensor(
             out, mid, gate_scale, router_slab, gate_slab, up_slab, down_slab,
             in_dim, mid_dim, out_dim, x, n_tokens, 0);
+}
+
+/* Occupancy introspection for the two routed-MoE decode kernels.
+ *
+ * Every Qwen4-Exp kernel is `static` in this translation unit, so its address
+ * cannot be taken from ds4_cuda.cu; this reports from inside.  The result is
+ * appended to ds4_gpu_hw_limits() and reaches officialMetrics.engine_backend,
+ * where it is readable whether or not the submission is accepted.
+ *
+ * What it settles: my own note recorded the gate/up Coop instantiation as "64
+ * warps/SM, 100% occupancy" on the strength of its shared-memory footprint
+ * alone (23,168 B against 101,376 B optin -> four 512-thread blocks).  Four
+ * blocks of 512 threads is 2048 threads/SM, which on a 65,536-register file
+ * needs <= 32 registers per thread.  Nothing in the tree has ever checked
+ * that, so the occupancy figure several arms were priced against may be off by
+ * 4x.  numRegs and sharedSizeBytes give the answer directly, and the same two
+ * numbers for the staged down kernel confirm or correct the 4-blocks/SM,
+ * 21,760 B row of the same table.
+ *
+ * Only cudaFuncGetAttributes is used -- it already appears in ds4_cuda.cu --
+ * and only long-stable fields of cudaFuncAttributes are read.  Every failure
+ * is swallowed and reported as -1; the function never touches device state and
+ * is called once, off the timed path. */
+extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
+    static char buf[192];
+    static int built = 0;
+    if (built) return buf;
+    built = 1;
+    buf[0] = '\0';
+
+    int gu_regs = -1, gu_smem = -1, gu_lmem = -1, gu_maxt = -1;
+    int dn_regs = -1, dn_smem = -1, dn_lmem = -1, dn_maxt = -1;
+
+    cudaFuncAttributes a;
+    if (cudaFuncGetAttributes(
+            &a,
+            qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, true,
+                                             QW_GU_COOP_ROWS, true>) ==
+        cudaSuccess) {
+        gu_regs = a.numRegs;
+        gu_smem = (int)a.sharedSizeBytes;
+        gu_lmem = (int)a.localSizeBytes;
+        gu_maxt = a.maxThreadsPerBlock;
+    } else {
+        (void)cudaGetLastError();
+    }
+
+    if (cudaFuncGetAttributes(
+            &a,
+            qwen4exp_moe_down_q_kernel<2, DS4_QWEN4EXP_TY_q8_0, true, true>) ==
+        cudaSuccess) {
+        dn_regs = a.numRegs;
+        dn_smem = (int)a.sharedSizeBytes;
+        dn_lmem = (int)a.localSizeBytes;
+        dn_maxt = a.maxThreadsPerBlock;
+    } else {
+        (void)cudaGetLastError();
+    }
+
+    snprintf(buf, sizeof(buf),
+             "gu[reg=%d smem=%d lmem=%d maxt=%d] dn[reg=%d smem=%d lmem=%d "
+             "maxt=%d]",
+             gu_regs, gu_smem, gu_lmem, gu_maxt,
+             dn_regs, dn_smem, dn_lmem, dn_maxt);
+    return buf;
 }
