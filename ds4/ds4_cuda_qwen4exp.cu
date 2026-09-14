@@ -4148,8 +4148,22 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
                 }
             }
         }
-        /* Readers finish before a fast projection warp reuses this tile. */
-        __syncthreads();
+        /* Readers finish before a fast projection warp reuses this tile --
+         * a hazard only a SECOND iteration of this loop can create, so the
+         * barrier is dead whenever there is no second iteration.
+         *
+         * CREDIT: 0xpg (`37816fd`).  At the decode width the body runs exactly
+         * once: `cnt` is counts[expert], the number of (token, slot) pairs
+         * that routed to this block's expert, and a decode round verifies two
+         * rows each selecting ten of 512 experts, so any one expert collects
+         * one or two of the twenty pairs.  R is 2 for every instantiation the
+         * launcher builds, so cnt <= R and `at + R >= cnt` on the first pass.
+         *
+         * The predicate is BLOCK-UNIFORM and therefore cannot deadlock: cnt is
+         * counts[expert] with expert block-invariant, and `at` is loop-uniform.
+         * Prefill, where cnt genuinely exceeds R, takes the barrier exactly as
+         * before, byte for byte. */
+        if (at + R < cnt) __syncthreads();
     }
 }
 
