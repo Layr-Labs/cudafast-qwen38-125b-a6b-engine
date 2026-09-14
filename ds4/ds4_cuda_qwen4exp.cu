@@ -4096,6 +4096,51 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
                 } \
             } while (0)
             uint32_t g = lane;
+            /* THREE chains in flight ahead of the pair body.
+             *
+             * CREDIT: 0xpg (`2fc5a06`), on the strength of two of their own
+             * measured runs: narrowing this loop from two chains to one cost
+             * 11% of the decode leg (`ec7bb97f`), while losing a third of the
+             * kernel's residency cost 1.13% (`fd1cafd2`).  The loop is
+             * INSTRUCTION-LEVEL-PARALLELISM bound and only weakly
+             * occupancy-sensitive, so registers are the cheap currency here
+             * and chains in flight are the expensive one.
+             *
+             * A gate/up row is n_embd / 32 = 80 groups and a lane strides by
+             * 32, so a lane visits at most g, g+32, g+64.  The pair body plus
+             * single tail covers that as 2 chains then 1; this body makes it
+             * 3 interleaved and drops the loop-carried edge between the pair
+             * iteration and the tail.  At groups == 80, lanes 0-15 take this
+             * body once and finish; lanes 16-31 skip it and take the pair body
+             * exactly as before, byte for byte.  The strides compose for any
+             * `groups`, so the direct and prefill instantiations stay correct
+             * with no special case.
+             *
+             * Nothing is reassociated: each chain is the same QWEN4EXP_SPLIT_
+             * GROUP expansion on the same g, in ascending g, into the same
+             * acc[r]. */
+            for (; g + 64u < groups; g += 96u) {
+                uint32_t raw0[8];
+                uint32_t raw1[8];
+                uint32_t raw2[8];
+                const uint32_t *p0, *p1, *p2;
+                if (Coop) {
+                    qw_gu_coop_raw_load(wsh, wrow, g, raw0);
+                    qw_gu_coop_raw_load(wsh, wrow, g + 32u, raw1);
+                    qw_gu_coop_raw_load(wsh, wrow, g + 64u, raw2);
+                    p0 = raw0; p1 = raw1; p2 = raw2;
+                } else {
+                    p0 = qw_raw_load((uint32_t)Type, weight_row, g, raw0)
+                       ? raw0 : NULL;
+                    p1 = qw_raw_load((uint32_t)Type, weight_row, g + 32u, raw1)
+                       ? raw1 : NULL;
+                    p2 = qw_raw_load((uint32_t)Type, weight_row, g + 64u, raw2)
+                       ? raw2 : NULL;
+                }
+                QWEN4EXP_SPLIT_GROUP(g, p0);
+                QWEN4EXP_SPLIT_GROUP(g + 32u, p1);
+                QWEN4EXP_SPLIT_GROUP(g + 64u, p2);
+            }
             for (; g + 32u < groups; g += 64u) {
                 uint32_t raw0[8];
                 uint32_t raw1[8];
@@ -4601,7 +4646,42 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
     }
 }
 
-template <int R, int DownType = -1, bool Vector = false>
+/* Stage: the block's eight-row weight panel, copied once into shared memory
+ * with coalesced 16-byte loads, then decoded out of shared.
+ *
+ * CREDIT: DJLougen (`ae36577`).  It is the same defect and the same remedy the
+ * ROUTED down tile in this tree already carries, applied to the shared expert's
+ * down projection, which that arm does not cover.
+ *
+ * The defect.  groups == 20 at the checkpoint's shape (in 640, out 2560, Q8_0),
+ * so the walk is one step: `lane < groups` covers the whole row and the
+ * `lane + 32` remainder never runs.  Each working lane fetches its own group's
+ * payload as several sub-word pieces strided by the 34-byte group size, so one
+ * load instruction asks for up to twenty scattered four-byte pieces while
+ * twelve lanes sit idle.  Every byte is eventually consumed, but the request is
+ * both strided and under-filled.  The eight rows a block owns are
+ * 8 * down_row_bytes CONSECUTIVE bytes of the single shared-expert slab
+ * (5,440 at q8_0, 3,840 at q5_1), so the same bytes can be fetched as one
+ * dense burst.
+ *
+ * Bit-exactness.  The panel is a verbatim byte image of the span the block's
+ * own warps would have read individually; it is written by the block, read by
+ * the block, and dies with the block.  dev_qwen4exp_group_decode is called with
+ * the SAME (type, g) and a row pointer at the same offset within the panel, so
+ * it is character-identical source running on identical bytes, and the decoder
+ * is alignment-agnostic by construction -- it aligns the payload address down,
+ * derives `shift` from the low bits and funnel-shifts the logical bytes back
+ * out.  Accumulation order, the lane-to-group map and the reduction tree are
+ * untouched.
+ *
+ * Fence order.  The fill issues weight loads that do not depend on the mid
+ * quantizer, so it goes ABOVE the grid dependency sync and the barrier BELOW
+ * it; the drain then absorbs the fill instead of running after it.  Both
+ * hoisted calls sit at block scope after the kernel's only early return, which
+ * is block-uniform once out_dim % 8 == 0 -- required at the launch before this
+ * arm is selected -- and the staged arm skips the deep call inside the walk, so
+ * a thread performs exactly one grid dependency sync either way. */
+template <int R, int DownType = -1, bool Vector = false, bool Stage = false>
 __global__ static void qwen4exp_shared_down_q_kernel(
         float *out,
         const char *down,
@@ -4620,7 +4700,24 @@ __global__ static void qwen4exp_shared_down_q_kernel(
     if (row >= out_dim || tok0 >= n_tokens) return;
     const uint32_t take = n_tokens - tok0 < (uint32_t)R ? n_tokens - tok0
                                                         : (uint32_t)R;
-    const char *down_row = down + (uint64_t)row * down_row_bytes;
+    extern __shared__ uint4 qw_shdown_panel[];
+    char *const spanel = (char *)qw_shdown_panel;
+    if (Stage) {
+        const uint64_t panel_bytes = (uint64_t)8u * down_row_bytes;
+        const char *const gp = down + (uint64_t)(blockIdx.x * 8u) * down_row_bytes;
+        for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
+             i += (uint64_t)blockDim.x * 16u) {
+            if (i + 16u <= panel_bytes)
+                *(uint4 *)(spanel + i) = *(const uint4 *)(const void *)(gp + i);
+            else
+                for (uint64_t j = i; j < panel_bytes; j++) spanel[j] = gp[j];
+        }
+        QWEN4EXP_PDL_SYNC();
+        __syncthreads();
+    }
+    const char *down_row = Stage
+        ? (spanel + (uint64_t)(threadIdx.x >> 5u) * down_row_bytes)
+        : (down + (uint64_t)row * down_row_bytes);
 
     float acc[R];
 #pragma unroll
@@ -4644,7 +4741,8 @@ __global__ static void qwen4exp_shared_down_q_kernel(
         dev_qwen4exp_group_decode(
                 DownType < 0 ? down_type : (uint32_t)DownType,
                 down_row, g, wq, wa, wb, &halves);
-        QWEN4EXP_PDL_SYNC();
+        /* The staged arm already waited, at block scope, above. */
+        if (!Stage) QWEN4EXP_PDL_SYNC();
 #pragma unroll
         for (int r = 0; r < R; r++) {
             if ((uint32_t)r < take) {
@@ -7475,15 +7573,44 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
  * triggers inside its grid bound at those widths, and the kernel's
  * weight-group prefetch rides that window (ds4_cuda_qwen4exp.cuh).  Verify
  * and prefill keep the plain launch. */
+/* The eight-row weight panel.  out_dim % 8 keeps the kernel's only early
+ * return block-uniform, which the staged arm's barrier needs; the slab base
+ * being 16-byte aligned makes every panel base 16-byte aligned too, because a
+ * panel is 8 * row_bytes and both q8_0 (5,440) and q5_1 (3,840) widths are
+ * multiples of 16.  DS4_QWEN4EXP_NO_SHARED_DOWN_PANEL stands it down. */
+    const uint64_t sd_panel = (uint64_t)8u * down_slab->row_bytes;
+    const int sd_stage =
+        (out_dim % 8u) == 0u &&
+        (sd_panel % 16u) == 0u &&
+        ((uintptr_t)down & 15u) == 0u &&
+        sd_panel <= QW_DOWN_PANEL_MAX_BYTES &&
+        getenv("DS4_QWEN4EXP_NO_SHARED_DOWN_PANEL") == NULL;
 #define QWEN4EXP_SH_DOWN_IMPL(R, DT, V) do { \
     if (n_tokens <= 2u) { \
-        QWEN4EXP_LAUNCH_PDL( \
-                (qwen4exp_shared_down_q_kernel<R, DT, V>), \
-                (dim3((out_dim + 7u) / 8u, tiles, 1)), \
-                threads, 0, stream, \
-                (float *)out->ptr, down, mq, ms, msum, \
-                (const float *)gate_scale->ptr, down_slab->row_bytes, \
-                down_slab->type, mgroups, out_dim, n_tokens); \
+        if (sd_stage) { \
+            QWEN4EXP_LAUNCH_PDL( \
+                    (qwen4exp_shared_down_q_kernel<R, DT, V, true>), \
+                    (dim3((out_dim + 7u) / 8u, tiles, 1)), \
+                    threads, (size_t)sd_panel, stream, \
+                    (float *)out->ptr, down, mq, ms, msum, \
+                    (const float *)gate_scale->ptr, down_slab->row_bytes, \
+                    down_slab->type, mgroups, out_dim, n_tokens); \
+        } else { \
+            QWEN4EXP_LAUNCH_PDL( \
+                    (qwen4exp_shared_down_q_kernel<R, DT, V>), \
+                    (dim3((out_dim + 7u) / 8u, tiles, 1)), \
+                    threads, 0, stream, \
+                    (float *)out->ptr, down, mq, ms, msum, \
+                    (const float *)gate_scale->ptr, down_slab->row_bytes, \
+                    down_slab->type, mgroups, out_dim, n_tokens); \
+        } \
+    } else if (sd_stage) { \
+        qwen4exp_shared_down_q_kernel<R, DT, V, true> \
+            <<<dim3((out_dim + 7u) / 8u, tiles, 1), threads, \
+               (size_t)sd_panel, stream>>>( \
+                    (float *)out->ptr, down, mq, ms, msum, \
+                    (const float *)gate_scale->ptr, down_slab->row_bytes, \
+                    down_slab->type, mgroups, out_dim, n_tokens); \
     } else { \
         qwen4exp_shared_down_q_kernel<R, DT, V> \
             <<<dim3((out_dim + 7u) / 8u, tiles, 1), threads, 0, stream>>>( \
