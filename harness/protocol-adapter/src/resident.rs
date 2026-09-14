@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::ds4_backend::{Ds4Session, SpecCounters};
+use crate::ds4_backend::{Ds4Session, SpecCounters, SpecRound};
 use crate::protocol::CorrectnessTraceLogit;
 
 /// The environment variable `tools/serve-up.sh` exports with the resident
@@ -74,6 +74,10 @@ pub struct ResidentHello {
     pub ident: String,
     pub model_path: String,
     pub mtp_head_path: String,
+    /// Whether the resident runs a whole speculative free run in one request
+    /// (`spec_run`). A resident that does not say so is driven one cycle per
+    /// request.
+    pub spec_run: bool,
 }
 
 impl ResidentHello {
@@ -144,6 +148,7 @@ impl ResidentSession {
                 ident: String::new(),
                 model_path: String::new(),
                 mtp_head_path: String::new(),
+                spec_run: false,
             },
             frontier: None,
             poison: None,
@@ -165,6 +170,10 @@ impl ResidentSession {
             ident: string_field(&reply, "ident")?,
             model_path: string_field(&reply, "model_path")?,
             mtp_head_path: string_field(&reply, "mtp_head_path")?,
+            spec_run: reply
+                .get("spec_run")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         };
         session.connect = started.elapsed();
         Ok(session)
@@ -228,6 +237,55 @@ impl ResidentSession {
     /// Record a failure an infallible verb cannot return.
     fn poison_with(&mut self, err: String) {
         self.poison.get_or_insert(err);
+    }
+
+    /// `spec_run`: the resident loops the speculative cycles itself and replies
+    /// once, with each cycle's committed tokens and the frontier argmax that
+    /// cycle left. One request for the whole run instead of one per cycle: the
+    /// GPU otherwise idles through a socket round trip after every cycle.
+    fn spec_run_call(&mut self, first_token: i64, count: i64) -> Result<Vec<SpecRound>, String> {
+        let reply = self.call(json!({"op": "spec_run", "first_token": first_token, "count": count}))?;
+        self.take_frontier(&reply)?;
+        let ints = |v: &Value, what: &str| -> Result<Vec<i64>, String> {
+            v.as_array()
+                .ok_or_else(|| format!("the resident engine's spec_run reply carries a non-array {what}"))?
+                .iter()
+                .map(|t| {
+                    t.as_i64()
+                        .ok_or_else(|| format!("the resident engine's spec_run {what} holds a non-integer"))
+                })
+                .collect()
+        };
+        let rounds = reply
+            .get("rounds")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "the resident engine's spec_run reply carries no \"rounds\" array".to_string())?;
+        let frontiers = ints(
+            reply
+                .get("frontiers")
+                .ok_or_else(|| "the resident engine's spec_run reply carries no \"frontiers\" array".to_string())?,
+            "frontiers",
+        )?;
+        if rounds.len() != frontiers.len() {
+            return Err(format!(
+                "the resident engine's spec_run reply carries {} rounds but {} frontiers",
+                rounds.len(),
+                frontiers.len()
+            ));
+        }
+        if frontiers.last().copied() != self.frontier {
+            return Err("the resident engine's spec_run frontier disagrees with its last round".to_string());
+        }
+        rounds
+            .iter()
+            .zip(frontiers)
+            .map(|(round, frontier)| {
+                Ok(SpecRound {
+                    committed: ints(round, "round")?,
+                    frontier,
+                })
+            })
+            .collect()
     }
 }
 
@@ -348,6 +406,13 @@ impl Ds4Session for ResidentSession {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(committed)
+    }
+
+    fn spec_run(&mut self, first_token: i64, count: i64) -> Option<Result<Vec<SpecRound>, String>> {
+        if !self.hello.spec_run {
+            return None;
+        }
+        Some(self.spec_run_call(first_token, count))
     }
 
     fn spec_counters(&mut self) -> SpecCounters {

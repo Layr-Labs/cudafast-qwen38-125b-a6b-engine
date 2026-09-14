@@ -76115,6 +76115,12 @@ static int qwen4exp_seam_draft_rows(void *ctx, const int *next_tokens,
     return 0;
 }
 
+/* The margin of the draft the latest head call returned; -1 when unmeasured. */
+static float qwen4exp_seam_draft_margin(void *ctx) {
+    ds4_session *s = ctx;
+    return s->qwen4exp_head.last_margin;
+}
+
 /* Build the seam, the rollback set and the head, once per session.  Returns
  * false with a named message when anything refuses, and the caller returns -1:
  * a half-built cycle is a refusal, not a reason to speculate anyway. */
@@ -76201,6 +76207,7 @@ static bool ds4_session_qwen4exp_spec_init(ds4_session *s,
     s->qwen4exp_seam.head_logits  = qwen4exp_seam_head_logits;
     s->qwen4exp_seam.draft_step   = qwen4exp_seam_draft_step;
     s->qwen4exp_seam.draft_rows   = qwen4exp_seam_draft_rows;
+    s->qwen4exp_seam.draft_margin = qwen4exp_seam_draft_margin;
 
     const int depth = ds4_qwen4exp_mtp_depth_from_draft_tokens(
             e->mtp_draft_tokens, err, errlen);
@@ -76212,6 +76219,10 @@ static bool ds4_session_qwen4exp_spec_init(ds4_session *s,
                                     err, errlen) != 0) {
         return false;
     }
+    head->want_margin = s->qwen4exp_spec.stop_margin > 0.0f ||
+                        s->qwen4exp_spec.drop_margin > 0.0f ||
+                        s->qwen4exp_spec.margin_log;
+    head->last_margin = -1.0f;
     s->qwen4exp_spec_failed = false;
     s->qwen4exp_spec_ready = true;
     return true;

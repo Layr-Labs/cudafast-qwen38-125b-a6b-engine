@@ -64,6 +64,15 @@ pub struct SpecCounters {
     pub verify_replay_disagreements: u64,
 }
 
+/// One cycle of a batched speculative run ([`Ds4Session::spec_run`]): the
+/// tokens the cycle committed, the fed token first, and the frontier argmax it
+/// left, which is the token the next cycle is fed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpecRound {
+    pub committed: Vec<i64>,
+    pub frontier: i64,
+}
+
 /// The session seam. [`FfiSession`] is the real engine; tests inject a scripted
 /// one, so the verb translation and the counter accounting are proven with no
 /// GPU. It is the ONLY thing that touches the engine.
@@ -81,6 +90,14 @@ pub trait Ds4Session: Send {
     /// One speculative cycle on `first_token` with `budget` tokens still wanted.
     /// Returns the committed tokens (`[first_token]` or `[first_token, draft]`).
     fn eval_speculative(&mut self, first_token: i64, budget: i64) -> Result<Vec<i64>, String>;
+    /// A whole speculative free run of `count` tokens in one engine call, when
+    /// the session can run the cycles without a round trip per cycle: each
+    /// cycle's committed tokens and the frontier argmax it left, in order. It
+    /// must equal driving [`Ds4Session::eval_speculative`] cycle by cycle, each
+    /// with the budget still wanted. `None` means drive the cycles one by one.
+    fn spec_run(&mut self, _first_token: i64, _count: i64) -> Option<Result<Vec<SpecRound>, String>> {
+        None
+    }
     /// The speculative cycle's counters. `&mut` because a session that reaches
     /// the engine over a socket has to send a request to read them.
     fn spec_counters(&mut self) -> SpecCounters;
@@ -312,9 +329,32 @@ impl Engine for Ds4Engine {
                 }
                 Route::Mtp => {
                     let before = s.spec_counters();
+                    // ONE REQUEST FOR THE WHOLE RUN when the session offers it
+                    // (the resident does): the engine loops the cycles itself
+                    // and hands back each cycle's committed tokens with the
+                    // frontier argmax it left. The checks and the assembly
+                    // below are the per-cycle loop's own, applied to those
+                    // rounds, so both drives commit the same tokens and
+                    // acceptance lengths. What goes away is the socket round
+                    // trip after every cycle, which the GPU waits through idle.
+                    let mut batched = match s.spec_run(pending, count) {
+                        Some(rounds) => Some(Self::fault(rounds)?.into_iter()),
+                        None => None,
+                    };
                     while (tokens.len() as i64) < count {
                         let budget = count - tokens.len() as i64;
-                        let committed = Self::fault(s.eval_speculative(pending, budget))?;
+                        let (committed, frontier) = match batched.as_mut() {
+                            Some(rounds) => {
+                                let round = rounds.next().ok_or_else(|| {
+                                    EngineError::Fault(format!(
+                                        "ds4 speculative run ended after {} of {count} tokens",
+                                        tokens.len()
+                                    ))
+                                })?;
+                                (round.committed, Some(round.frontier))
+                            }
+                            None => (Self::fault(s.eval_speculative(pending, budget))?, None),
+                        };
                         if committed.first() != Some(&pending) {
                             return Err(EngineError::Fault(format!(
                                 "ds4 speculative cycle committed {committed:?}, expected it to \
@@ -336,9 +376,17 @@ impl Engine for Ds4Engine {
                             )));
                         }
                         tokens.extend_from_slice(&committed[1..]);
-                        pending = s.argmax();
+                        pending = match frontier {
+                            Some(frontier) => frontier,
+                            None => s.argmax(),
+                        };
                         tokens.push(pending);
                         acceptance_lengths.push(produced_len as i64);
+                    }
+                    if batched.is_some_and(|mut rounds| rounds.next().is_some()) {
+                        return Err(EngineError::Fault(format!(
+                            "ds4 speculative run ran more cycles than the {count} tokens wanted"
+                        )));
                     }
                     let after = s.spec_counters();
                     let drafted = after.drafts.saturating_sub(before.drafts) as i64;
