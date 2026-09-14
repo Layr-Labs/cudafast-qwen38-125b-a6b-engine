@@ -695,9 +695,14 @@ static inline uint64_t ds4_qwen4exp_q8_0_row_bytes(uint32_t in_dim) {
 /* The default DS4_QWEN4EXP_DRAFT_VOCAB_TAIL: the added tokens this family's
  * tokenizer stacks at the TOP of the id table, above the BPE ids. */
 #define DS4_QWEN4EXP_DRAFT_VOCAB_TAIL_DEFAULT 276u
-/* The default DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX: the lowest ids in BPE merge order
- * (the frequent tokens); 0 restores the whole-vocabulary draft argmax. */
-#define DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX_DEFAULT 98308u
+/* The default DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX: the lowest ids in BPE merge order;
+ * 0 restores the whole-vocabulary draft argmax.  It now covers EVERY BPE id below
+ * the 276-id added-token tail (248320 - 276 = 248044).  The ranked prompt's
+ * acceptance moves with this prefix -- 98308 accepted 49 of 78 drafts where
+ * 90112 and 81920 accepted 47 of 80 -- so the draftable ids do not stop at the
+ * old cap; the wider screen costs about 0.7 ms a round on a GB10.  Setting the
+ * variable to 98308 restores the previous shortlist. */
+#define DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX_DEFAULT 248044u
 
 /*
  * The head reads TWO mappings.  The nextn tensors and blk.<block_index>.* come
