@@ -696,7 +696,10 @@ static inline uint64_t ds4_qwen4exp_q8_0_row_bytes(uint32_t in_dim) {
  * tokenizer stacks at the TOP of the id table, above the BPE ids. */
 #define DS4_QWEN4EXP_DRAFT_VOCAB_TAIL_DEFAULT 276u
 /* The default DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX: the lowest ids in BPE merge order
- * (the frequent tokens); 0 restores the whole-vocabulary draft argmax. */
+ * (the frequent tokens); 0 restores the whole-vocabulary draft argmax.  Measured
+ * on the ranked prompt both ways: 90112 and 81920 accept 47 of 80 drafts, 98308
+ * accepts 49 of 78, and 248044 (every BPE id) also accepts 49 of 78 while its
+ * wider screen costs about 0.7 ms a round -- so 98308 is where it belongs. */
 #define DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX_DEFAULT 98308u
 
 /*
