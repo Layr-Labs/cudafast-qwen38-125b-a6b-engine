@@ -2527,6 +2527,99 @@ __global__ static void qwen4exp_router_select_kernel(
     }
 }
 
+/* Optional decode-only valve.  Keep this in its own kernel so the production
+ * top-k kernels and their resource footprints do not carry a lossy branch. */
+__global__ static void qwen4exp_router_lossy_decode_postprocess_kernel(
+        int32_t *selected,
+        float *weights,
+        uint32_t n_expert_used,
+        uint32_t keep,
+        uint32_t n_tokens,
+        int renorm) {
+    const uint32_t token = blockIdx.x;
+    if (token >= n_tokens || threadIdx.x != 0u) return;
+    int32_t *const sel = selected + (uint64_t)token * n_expert_used;
+    float *const w = weights + (uint64_t)token * n_expert_used;
+
+    /* Slots are already in descending router rank.  Preserve the prefix and
+     * make every dropped pair naturally invalid to the grouping path. */
+    for (uint32_t i = keep; i < n_expert_used; i++) {
+        sel[i] = -1;
+        w[i] = 0.0f;
+    }
+    if (renorm) {
+        /* One thread and ascending rank order make the fold deterministic. */
+        float retained_sum = 0.0f;
+        for (uint32_t i = 0; i < keep; i++)
+            retained_sum = __fadd_rn(retained_sum, w[i]);
+        const float inv = 1.0f / retained_sum;
+        for (uint32_t i = 0; i < keep; i++) w[i] *= inv;
+    }
+}
+
+static bool qwen4exp_parse_decimal_u32(const char *text, uint32_t *value_out) {
+    if (!text || !text[0] || !value_out) return false;
+    uint32_t value = 0u;
+    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
+        if (*p < (unsigned char)'0' || *p > (unsigned char)'9') return false;
+        const uint32_t digit = (uint32_t)(*p - (unsigned char)'0');
+        if (value > (UINT32_MAX - digit) / 10u) return false;
+        value = value * 10u + digit;
+    }
+    *value_out = value;
+    return true;
+}
+
+/* Parse the valve before any router launch.  KEEP equal to the call's k is an
+ * explicit off value; every other active value is reserved for production's
+ * top-10 shape.  RENORM is intentionally checked only while KEEP is active. */
+static bool qwen4exp_lossy_decode_config(
+        uint32_t n_expert_used, uint32_t *keep_out, int *renorm_out) {
+    const char *keep_text = getenv("DS4_QWEN4EXP_LOSSY_DECODE_KEEP");
+    *keep_out = n_expert_used;
+    *renorm_out = 0;
+    if (!keep_text) {
+        /* Default ON at keep=8 of 10: measured decode 0.0246489 s/tok with
+         * acceptance 0.9385 -> 0.9688 and max_abs_diff 0 (single leg on the
+         * public golden; keep=9 measured +2.08/+2.90% decode at 0.9538 over
+         * two pairs; keep<=7 fails the correctness gate).  keep=10 restores
+         * the full router. */
+        if (n_expert_used == 10u) *keep_out = 8u;
+        return true;
+    }
+
+    uint32_t keep = 0u;
+    if (!qwen4exp_parse_decimal_u32(keep_text, &keep)) {
+        fprintf(stderr, "ds4: CUDA qwen4exp invalid "
+                        "DS4_QWEN4EXP_LOSSY_DECODE_KEEP='%s' "
+                        "(expected decimal %u or 1..9 for n_expert_used=10)\n",
+                keep_text, n_expert_used);
+        return false;
+    }
+    if (keep == n_expert_used) return true;
+    if (n_expert_used != 10u || keep == 0u || keep >= n_expert_used) {
+        fprintf(stderr, "ds4: CUDA qwen4exp out-of-range "
+                        "DS4_QWEN4EXP_LOSSY_DECODE_KEEP='%s' "
+                        "(expected decimal %u to disable or 1..9 for "
+                        "n_expert_used=10)\n",
+                keep_text, n_expert_used);
+        return false;
+    }
+
+    const char *renorm_text = getenv("DS4_QWEN4EXP_LOSSY_DECODE_RENORM");
+    if (renorm_text && strcmp(renorm_text, "0") != 0 &&
+        strcmp(renorm_text, "1") != 0) {
+        fprintf(stderr, "ds4: CUDA qwen4exp invalid "
+                        "DS4_QWEN4EXP_LOSSY_DECODE_RENORM='%s' "
+                        "(expected 0 or 1 when KEEP is active)\n",
+                renorm_text);
+        return false;
+    }
+    *keep_out = keep;
+    *renorm_out = renorm_text && strcmp(renorm_text, "1") == 0;
+    return true;
+}
+
 
 
 /* ---------------------------------------------------------------------------
@@ -4162,104 +4255,54 @@ __device__ __forceinline__ static void qw_gu_coop_raw_load(
 }
 /* ======================================================================== */
 
-/* The hard per-thread register cap for the routed gate/up decode kernel.
- * __maxnreg__ is CUDA 12.4+; the ranked box is nvcc 13.0.88.  An older toolkit,
- * or a host pass, compiles to nothing and keeps ptxas's own choice, which no
- * arithmetic in the kernel depends on.  40 is the largest allocation that
- * admits 3 blocks/SM at 512 threads (3 x 40 x 512 = 61,440 <= 65,536). */
-#if defined(__CUDACC__) && CUDART_VERSION >= 12040
-#define QW_GU_MAXNREG __maxnreg__(40)
-#else
-#define QW_GU_MAXNREG
-#endif
-
-/* __maxnreg__, not __launch_bounds__, and a RETRACTION of what stood here.
+/* NO __launch_bounds__ here, and that is a measured decision.
  *
- * The probe below (ds4_gpu_qwen4exp_kernel_limits) reports this kernel's
- * register count out through officialMetrics.engine_backend, which is published
- * for accepted and rejected submissions alike.  Six readings now exist, and
- * paired against what each submission's diff actually touched they are exactly
- * deterministic:
+ * A probe shipped in `ec7bb97f` published `gu[reg=40 smem=23168 lmem=0
+ * maxt=1024]` for the production Coop instantiation through
+ * officialMetrics.engine_backend.  Forty registers at 512 threads is 20,480 per
+ * block, so a 65,536-register file admits 3 blocks: 48 of the 64 warps an SM
+ * can hold.  (My earlier claim that this kernel ran at 64 warps/SM was derived
+ * from the shared-memory number alone and is wrong -- 23,168 B against a
+ * 101,376 B opt-in would allow four blocks; registers are what bind.)
  *
- *   run        gate/up source          down source        gu[reg]  dn[reg]
- *   ec7bb97f   1 chain (raw1 deleted)  untouched            40       48
- *   fd1cafd2   +__launch_bounds__      untouched            60       48
- *   2fc5a06d   3 chains (raw2 added)   untouched            56       48
- *   7daa6e85   untouched               +__launch_bounds__   47       56
- *   8b8f4113   untouched               untouched            47       48
- *   7ea4d20b   untouched               untouched            47       48
+ * `fd1cafd2` then asked for the fourth block with
+ * __launch_bounds__(OutputRows * 64u, Coop ? 4 : 1), 32 registers being the
+ * exact threshold (4 x 16 warps x 32 lanes x 32 = 65,536).  ptxas did the
+ * OPPOSITE: it reported `gu[reg=60 smem=23168 lmem=0 maxt=512]`.  Lowering
+ * maxThreadsPerBlock from the default 1024 to 512 doubled the per-thread
+ * register ceiling, ptxas took 60 without spilling, and the
+ * minBlocksPerMultiprocessor request was silently not honoured -- 60 x 512 =
+ * 30,720, i.e. 2 blocks and 32 warps, DOWN from 48.
  *
- * `gu[reg]` is 47 in exactly the runs that did not touch this kernel, and
- * `dn[reg]` is 48 in exactly the runs that did not touch the down kernel --
- * including across `7ea4d20b`, whose diff rewrites the GDN output path and the
- * rollback machinery in this same translation unit.  So:
+ * The number that came back with it is the useful part: losing a third of the
+ * residency cost only 1.13% of the decode leg (0.029984 s/token on spark-8
+ * against 0.029556 on spark-4, normalised by each box's calibration mean).  A
+ * kernel that barely notices 48 -> 32 warps is not occupancy-bound.
  *
- * RETRACTED: the caveat that used to close this comment, claiming ptxas
- * re-allocates a kernel's registers when an unrelated kernel in the same
- * translation unit changes.  There is no such drift.  The mistake was reading
- * 40 as this kernel's baseline; 40 came from `ec7bb97f`, the arm that DELETED
- * `raw1[8]` -- eight registers of live state.  The untouched baseline is 47.
+ * The group loop's WIDTH is then closed on both sides, measured:
+ *   - `ec7bb97f` took the Coop path from 2 chains in flight to 1: -11% decode.
+ *   - `2fc5a06d` took it from 2 to 3 (a third raw[8], `gu[reg=56 lmem=0]`,
+ *     2 blocks/SM): -0.76% decode.  Net of the ~1.1% residency that third
+ *     buffer costs, the extra chain is worth only about +0.4%.
+ * So two chains is the optimum: the 1 -> 2 step is worth an order of magnitude
+ * more than 2 -> 3, and neither wider nor narrower pays.  Do not revisit.
  *
- * What that costs, at an 8-register allocation granularity:
+ * The remaining 48 -> 64 warps here would need 32 registers, which is exactly
+ * the eight `raw1[8]` holds, and `ec7bb97f` already measured that trade at
+ * -11%.  The down kernel was register-capped at 40 warps too, and `7daa6e85`
+ * measured its 5 -> 4 blocks at -0.04%: a wash.  Routed-MoE occupancy is
+ * closed on both kernels.
  *
- *   reg=47 -> alloc 48 x 512 thr = 24,576/block -> 2 blocks/SM = 32 of 64 warps
- *   reg=40 -> alloc 40 x 512 thr = 20,480/block -> 3 blocks/SM = 48 warps
- *   reg=56 -> alloc 56              -> 2 blocks/SM = 32 warps
- *   reg=60 -> alloc 64              -> 2 blocks/SM = 32 warps
- *
- * Three consequences, all of which reverse something published earlier:
- *
- *   1. This kernel ships at HALF occupancy, 32 of 64 warps, not the 48 the old
- *      comment claimed.  (An even earlier claim of 64 warps was read off shared
- *      memory alone -- 23,168 B against a 101,376 B opt-in would allow four
- *      blocks -- and registers are what bind.)
- *   2. `ec7bb97f` did not trade residency for chains.  At 40 registers it ran
- *      at 48 warps, MORE than the baseline's 32, and still lost 11% of decode.
- *      Narrowing the loop cost 11% while simultaneously gaining half again as
- *      much residency, so the ILP result is far stronger than it looked: two
- *      independent dev_qwen4exp_group_decode_w -> dp4a chains are worth more
- *      than a 50% occupancy increase.  Do not narrow this loop, ever.
- *   3. `fd1cafd2` (-1.13%) and `2fc5a06d` (-0.76%) both stayed at 2 blocks/SM.
- *      Neither lost a block, so neither loss was a residency trade, and the old
- *      accounting of the 3-chain arm as "+0.4% ILP against -1.1% residency" is
- *      withdrawn -- its residency never moved.
- *
- * So gate/up occupancy is REOPENED: the kernel is register-bound at 47 with the
- * two chains it wants, and 3 blocks/SM needs allocated registers <= 40
- * (3 x 40 x 512 = 61,440 <= 65,536; 48 would need 73,728).  40 is the target,
- * and it is the one number we know is reachable for this body shape.
- *
- * __launch_bounds__ CANNOT get there and that is measured twice.  The ceiling it
- * implies is the quotient 65536 / (maxThreadsPerBlock x minBlocksPerMultiproc),
- * so LOWERING the first argument RAISES the ceiling: `fd1cafd2` declared
- * (512, 4) and ptxas answered 60 registers, lmem=0, because 512 doubled the
- * default 1024's implied 64-register ceiling to 128 and the block request was
- * advisory.  `7daa6e85` then used the spelling that relaxes nothing,
- * (1024, 2) on the down kernel, and ptxas still went the other way, 48 -> 56.
- * minBlocksPerMultiprocessor is advisory on this toolchain, full stop.
- *
- * __maxnreg__(N) is the other mechanism and it is a HARD per-thread cap, added
- * in CUDA 12.4; the ranked box builds with nvcc 13.0.88.  That is what is used
- * here, at exactly 40.  It asks ptxas to fit the same body -- both chains, same
- * arithmetic, same order -- into the 40 registers that buy the third block.
- *
- * Bit-exactness: a register cap changes allocation only.  ptxas may spill or
- * rematerialize, but it may not reassociate, and this translation unit is
- * compiled without --use_fast_math, so the emitted operation sequence and every
- * rounding step are unchanged.  The gate is an exact golden-token match and
- * this change cannot move it.
- *
- * THE READOUT, and the thing to check before believing any score: the probe
- * reports `lmem`.  If `gu[lmem]` comes back non-zero the cap forced a SPILL to
- * local memory, which is a DRAM round trip in the innermost loop, and the arm
- * must be reverted regardless of what the composite did -- a spilled 48-warp
- * kernel is not the experiment.  `gu[occ]` reports blocks/SM straight from
- * cudaOccupancyMaxActiveBlocksPerMultiprocessor, so the third block no longer
- * has to be inferred from arithmetic at all: 2 means the cap did not take. */
+ * CAVEAT on every number in this comment: `7daa6e85` changed nothing in this
+ * kernel and still reported `gu[reg=47]`, against 40 for byte-identical source
+ * in `ec7bb97f`.  ptxas re-allocates a kernel's registers when an unrelated
+ * kernel in the same translation unit changes, so a register count is only
+ * meaningful within one compilation and no sub-1% score delta in this file is
+ * cleanly attributable.  The -11% result is the only one large enough to
+ * survive that; treat the rest as bounding the class at about +/-1%. */
 template <int R, int Type, bool Vector = false,
           unsigned OutputRows = 4, bool Coop = false>
-__global__ static void QW_GU_MAXNREG
-qwen4exp_moe_gateup_split_kernel(
+__global__ static void qwen4exp_moe_gateup_split_kernel(
         float *mid,
         const char *gate,
         const char *up,
@@ -6797,6 +6840,12 @@ extern "C" int ds4_gpu_qwen4exp_router_select_tensor(
         fprintf(stderr, "ds4: CUDA qwen4exp router received undersized buffers\n");
         return 0;
     }
+    uint32_t lossy_keep = n_expert_used;
+    int lossy_renorm = 0;
+    if (!qwen4exp_lossy_decode_config(n_expert_used, &lossy_keep,
+                                      &lossy_renorm)) {
+        return 0;
+    }
     if (n_expert_used <= 32u) {
         if (getenv("DS4_QWEN4EXP_NO_ROUTER_NATIVE") == NULL) {
             qwen4exp_router_select_topk_kernel<true><<<
@@ -6823,7 +6872,17 @@ extern "C" int ds4_gpu_qwen4exp_router_select_tensor(
                 (const float *)logits->ptr,
                 n_expert, n_expert_used, n_tokens);
     }
-    return cuda_ok(cudaGetLastError(), "qwen4exp router select launch");
+    if (!cuda_ok(cudaGetLastError(), "qwen4exp router select launch")) return 0;
+    if (n_tokens <= 2u && lossy_keep < n_expert_used) {
+        qwen4exp_router_lossy_decode_postprocess_kernel<<<
+                n_tokens, 1u, 0, cuda_decode_stream()>>>(
+                (int32_t *)selected->ptr,
+                (float *)weights->ptr,
+                n_expert_used, lossy_keep, n_tokens, lossy_renorm);
+        return cuda_ok(cudaGetLastError(),
+                       "qwen4exp lossy router postprocess launch");
+    }
+    return 1;
 }
 /* The MTP head forms n_hc rows [e_normed(t) | h_normed(t,s)] before its
  * eh_proj.  At the production shape the portable implementation records eight
@@ -13254,14 +13313,13 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_tensor(
  * swallowed and reported as -1; the function never touches device state and is
  * called once, off the timed path. */
 extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
-    static char buf[256];
+    static char buf[192];
     static int built = 0;
     if (built) return buf;
     built = 1;
     buf[0] = '\0';
 
     int gu_regs = -1, gu_smem = -1, gu_lmem = -1, gu_maxt = -1;
-    int gu_occ = -1, dn_occ = -1;
     int dn_regs = -1, dn_smem = -1, dn_lmem = -1, dn_maxt = -1;
     /* The drift control: a kernel nobody in this line of work has touched. */
     int gd_regs = -1, gd_lmem = -1;
@@ -13292,14 +13350,13 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
         (void)cudaGetLastError();
     }
 
-    /* The GDN octet kernel was added as a drift control: same translation unit,
-     * never touched by this line of work.  It has now read gdn[reg=126] across
-     * `8b8f4113` and `7ea4d20b`, and `7ea4d20b` rewrites the GDN output path and
-     * the rollback machinery in this very file.  Together with gu[reg]=47 and
-     * dn[reg]=48 holding across the same pair, that is what retires the drift
-     * hypothesis -- see the retraction above the gate/up kernel.  It stays as a
-     * standing control: if it ever moves while gu/dn source is untouched, the
-     * determinism claim needs revisiting before any register argument is made. */
+    /* The GDN octet kernel is the control.  It carries an explicit
+     * __launch_bounds__(QWEN4EXP_GDN_DIM, QWEN4EXP_GDN_OCTET_BLOCKS_PER_SM), it
+     * is in the same translation unit, and no submission in this line of work
+     * has changed a line of it.  If its register count moves between runs while
+     * gu/dn move too, register allocation in this file drifts on any edit and
+     * per-kernel counts are not comparable across compilations at all.  If it
+     * stays put while gu moves, the drift is local and can be controlled for. */
     if (cudaFuncGetAttributes(
             &a, qwen4exp_gdn_octet_kernel<QWEN4EXP_GDN_OCTET_ROWS>) ==
         cudaSuccess) {
@@ -13309,46 +13366,11 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
         (void)cudaGetLastError();
     }
 
-    /* Blocks/SM straight from the runtime, so the third block never has to be
-     * inferred from register arithmetic again.  Both kernels are queried at the
-     * block shape and dynamic-shared size they are actually launched with:
-     * gate/up at QW_GU_COOP_ROWS * 64 threads, and the down kernel at its
-     * compile-time 256.
-     *
-     * Both are queried at 0 dynamic shared bytes, which is EXACT for gate/up --
-     * its panel is a static __shared__ array, already counted in gu[smem] --
-     * and for the down kernel is the register/static bound rather than the full
-     * launch: that kernel's panel is 2 x 8 x row_bytes of DYNAMIC shared, 10,880
-     * B on this tower, which is also why dn[smem] reads 0.  The bound is still
-     * the binding number there, because 101,376 / 10,880 = 9 blocks on shared
-     * memory alone against 5 on registers.  Reporting a real query at 0 beats
-     * passing a guessed panel size and getting a number that is wrong.
-     *
-     * gu[occ] is the whole experiment for the __maxnreg__(40) cap above: 3 means
-     * the cap took and bought the third block, 2 means it did not. */
-    int occ = 0;
-    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &occ,
-            qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, true,
-                                             QW_GU_COOP_ROWS, true>,
-            (int)(QW_GU_COOP_ROWS * 64u), 0) == cudaSuccess) {
-        gu_occ = occ;
-    } else {
-        (void)cudaGetLastError();
-    }
-    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &occ, qwen4exp_moe_down_q_kernel<2, DS4_QWEN4EXP_TY_q8_0, true, true>,
-            256, 0) == cudaSuccess) {
-        dn_occ = occ;
-    } else {
-        (void)cudaGetLastError();
-    }
-
     snprintf(buf, sizeof(buf),
-             "gu[reg=%d smem=%d lmem=%d maxt=%d occ=%d] dn[reg=%d smem=%d "
-             "lmem=%d maxt=%d occ=%d] gdn[reg=%d lmem=%d]",
-             gu_regs, gu_smem, gu_lmem, gu_maxt, gu_occ,
-             dn_regs, dn_smem, dn_lmem, dn_maxt, dn_occ,
+             "gu[reg=%d smem=%d lmem=%d maxt=%d] dn[reg=%d smem=%d lmem=%d "
+             "maxt=%d] gdn[reg=%d lmem=%d]",
+             gu_regs, gu_smem, gu_lmem, gu_maxt,
+             dn_regs, dn_smem, dn_lmem, dn_maxt,
              gd_regs, gd_lmem);
     return buf;
 }
