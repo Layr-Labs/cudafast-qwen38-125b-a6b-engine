@@ -523,6 +523,23 @@ int main(void) {
     log_line("model loaded once for this window (vocab=%d eos=%d)", ds4s_vocab_size(h),
              (int)ds4s_eos_token(h));
 
+    /* Append the device's occupancy and bandwidth limits to the identity the
+     * hello echoes, so they reach the run's metrics.  Shared memory per SM and
+     * peak DRAM bandwidth decide whether a decode kernel is occupancy-capped
+     * or bandwidth-capped, and neither is observable on a box whose profiler
+     * refuses to attach.  This is a pure read of device properties, done once
+     * HERE -- after the one load, before the socket binds -- so no timed phase
+     * can see it.  On failure the string is empty and the identity is exactly
+     * what it was, which keeps the `ds4-resident load_epoch=` prefix and the
+     * ident that benchd seals unchanged for a non-CUDA build. */
+    char ident_buf[512];
+    const char *limits = ds4s_hw_limits();
+    if (limits && limits[0]) {
+        const int n = snprintf(ident_buf, sizeof(ident_buf), "%s %s", ident, limits);
+        if (n > 0 && (size_t)n < sizeof(ident_buf)) ident = ident_buf;
+        log_line("device limits: %s", limits);
+    }
+
     /* Bind only after the load, so a connect that succeeds means the weights
      * are already resident and a phase never waits on the loader. */
     const int listener = socket(AF_UNIX, SOCK_STREAM, 0);
