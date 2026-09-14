@@ -845,6 +845,26 @@ int ds4_gpu_indexer_top1_value_tensor(
         uint32_t              n_tokens,
         uint32_t              index_offset);
 
+int ds4_gpu_indexer_top2_value_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *values,
+        const ds4_gpu_tensor *scores,
+        uint32_t              n_comp,
+        uint32_t              n_tokens,
+        uint32_t              index_offset);
+
+/* Exact top-2 reduction followed by the conservative MTP runner-up policy,
+ * entirely on device.  Only the selected id is exposed: the target model
+ * still verifies that proposal before it can be committed. */
+int ds4_gpu_mtp_top2_policy_tensor(
+        ds4_gpu_tensor       *selected,
+        const ds4_gpu_tensor *scores,
+        uint32_t              n_comp,
+        uint32_t              n_tokens,
+        uint32_t              index_offset,
+        float                 margin_threshold,
+        float                 second_logit_threshold);
+
 /* Native-head screening: init 1/0/-1 = ready/unsupported/error;
  * screen positive/0/-1 = refined candidate count/fallback/backend error. */
 int ds4_gpu_mtp_native_screen_init(uint32_t width, uint64_t *bytes, uint32_t *capacity);
@@ -2931,6 +2951,18 @@ int ds4_gpu_qwen4exp_router_select_tensor(
         uint32_t              n_expert,
         uint32_t              n_expert_used,
         uint32_t              n_tokens);
+
+/* Speculative-head variant: compute the same top-k and normalized weights,
+ * then replace tail ids whose normalized weight is small with -1. */
+int ds4_gpu_qwen4exp_router_select_pruned_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        const ds4_gpu_tensor *logits,
+        uint32_t              n_expert,
+        uint32_t              n_expert_used,
+        uint32_t              n_tokens,
+        uint32_t              min_keep,
+        float                 prune_weight);
 
 int ds4_gpu_qwen4exp_routed_moe_tensor(
         ds4_gpu_tensor              *out,

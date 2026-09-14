@@ -2142,14 +2142,16 @@ __device__ __forceinline__ static float dev_qwen4exp_block_sum(
 /* The checkpoint asks for ten of at most 512 experts.  One warp can read that
  * envelope as sixteen coalesced rows, keep them in registers, and select the
  * small top-k without sorting the 502 entries the model will discard. */
-template<bool Native>
+template<bool Native, bool Prune>
 __global__ static void qwen4exp_router_select_topk_kernel(
         int32_t *selected,
         float *weights_out,
         const float *logits,
         uint32_t n_expert,
         uint32_t n_expert_used,
-        uint32_t n_tokens) {
+        uint32_t n_tokens,
+        uint32_t min_keep,
+        float prune_weight) {
     const uint32_t tok = blockIdx.x;
     if (tok >= n_tokens) return;
     const uint32_t lane = threadIdx.x;
@@ -2235,7 +2237,13 @@ __global__ static void qwen4exp_router_select_topk_kernel(
         float inv = 0.0f;
         if (lane == 0u) inv = 1.0f / sum;
         inv = __shfl_sync(0xffffffffu, inv, 0u);
-        if (lane < n_expert_used) w[lane] = e * inv;
+        if (lane < n_expert_used) {
+            const float weight = e * inv;
+            w[lane] = weight;
+            if (Prune && lane >= min_keep && weight <= prune_weight) {
+                sel[lane] = -1;
+            }
+        }
     } else {
         /* Same serial softmax and the same selected-logit order as the full-sort
          * path below. */
@@ -2253,6 +2261,11 @@ __global__ static void qwen4exp_router_select_topk_kernel(
             }
             const float inv = 1.0f / sum;
             for (uint32_t i = 0; i < n_expert_used; i++) w[i] *= inv;
+            if (Prune) {
+                for (uint32_t i = min_keep; i < n_expert_used; i++) {
+                    if (w[i] <= prune_weight) sel[i] = -1;
+                }
+            }
         }
     }
 }
@@ -6508,19 +6521,19 @@ extern "C" int ds4_gpu_qwen4exp_router_select_tensor(
     }
     if (n_expert_used <= 32u) {
         if (getenv("DS4_QWEN4EXP_NO_ROUTER_NATIVE") == NULL) {
-            qwen4exp_router_select_topk_kernel<true><<<
+            qwen4exp_router_select_topk_kernel<true, false><<<
                 n_tokens, 32u, 0, cuda_decode_stream()>>>(
                 (int32_t *)selected->ptr,
                 (float *)weights->ptr,
                 (const float *)logits->ptr,
-                n_expert, n_expert_used, n_tokens);
+                n_expert, n_expert_used, n_tokens, n_expert_used, 0.0f);
         } else {
-            qwen4exp_router_select_topk_kernel<false><<<
+            qwen4exp_router_select_topk_kernel<false, false><<<
                 n_tokens, 32u, 0, cuda_decode_stream()>>>(
                 (int32_t *)selected->ptr,
                 (float *)weights->ptr,
                 (const float *)logits->ptr,
-                n_expert, n_expert_used, n_tokens);
+                n_expert, n_expert_used, n_tokens, n_expert_used, 0.0f);
         }
 
     } else {
@@ -6533,6 +6546,48 @@ extern "C" int ds4_gpu_qwen4exp_router_select_tensor(
                 n_expert, n_expert_used, n_tokens);
     }
     return cuda_ok(cudaGetLastError(), "qwen4exp router select launch");
+}
+
+/* Approximate only the speculative MTP head: retain the exact top-k and its
+ * exact softmax weights, then turn sufficiently weak tail routes into the
+ * invalid-id sentinel the routed MoE already defines as a zero contribution.
+ * Fusing this into selection avoids adding a graph node to every draft. */
+extern "C" int ds4_gpu_qwen4exp_router_select_pruned_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        const ds4_gpu_tensor *logits,
+        uint32_t              n_expert,
+        uint32_t              n_expert_used,
+        uint32_t              n_tokens,
+        uint32_t              min_keep,
+        float                 prune_weight) {
+    if (!selected || !weights || !logits || n_tokens == 0 ||
+        n_expert == 0 || n_expert > 512u || n_expert_used == 0 ||
+        n_expert_used > n_expert || n_expert_used > 32u ||
+        min_keep == 0 || min_keep >= n_expert_used ||
+        !(prune_weight >= 0.0f && prune_weight <= 1.0f)) {
+        return 0;
+    }
+    if (logits->bytes < (uint64_t)n_tokens * n_expert * sizeof(float) ||
+        selected->bytes < (uint64_t)n_tokens * n_expert_used * sizeof(int32_t) ||
+        weights->bytes < (uint64_t)n_tokens * n_expert_used * sizeof(float)) {
+        fprintf(stderr, "ds4: CUDA qwen4exp pruned router received undersized buffers\n");
+        return 0;
+    }
+    if (getenv("DS4_QWEN4EXP_NO_ROUTER_NATIVE") == NULL) {
+        qwen4exp_router_select_topk_kernel<true, true><<<
+            n_tokens, 32u, 0, cuda_decode_stream()>>>(
+            (int32_t *)selected->ptr, (float *)weights->ptr,
+            (const float *)logits->ptr, n_expert, n_expert_used, n_tokens,
+            min_keep, prune_weight);
+    } else {
+        qwen4exp_router_select_topk_kernel<false, true><<<
+            n_tokens, 32u, 0, cuda_decode_stream()>>>(
+            (int32_t *)selected->ptr, (float *)weights->ptr,
+            (const float *)logits->ptr, n_expert, n_expert_used, n_tokens,
+            min_keep, prune_weight);
+    }
+    return cuda_ok(cudaGetLastError(), "qwen4exp pruned router select launch");
 }
 /* The MTP head forms n_hc rows [e_normed(t) | h_normed(t,s)] before its
  * eh_proj.  At the production shape the portable implementation records eight

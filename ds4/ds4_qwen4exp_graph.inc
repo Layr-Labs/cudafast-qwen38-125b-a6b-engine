@@ -1781,6 +1781,50 @@ static uint64_t qw_moe_stage_ns[2][QW_MOE_T_N];
 static uint64_t qw_moe_stage_calls[2];
 static int      qw_moe_in_head_block = 0;
 
+/* Research knob for the approximate draft block only.  The target tower keeps
+ * all ten routed experts.  Every resulting draft is still checked by that
+ * exact target before commit, so this can change acceptance but not output. */
+static uint32_t qwen4exp_mtp_head_expert_count(void) {
+    const char *raw = getenv("DS4_MTP_HEAD_EXPERTS");
+    if (!raw || !raw[0]) return DS4_N_EXPERT_USED;
+    char *end = NULL;
+    errno = 0;
+    const unsigned long count = strtoul(raw, &end, 10);
+    if (errno != 0 || end == raw || *end != '\0' || count < 1u ||
+        count > DS4_N_EXPERT_USED) {
+        return DS4_N_EXPERT_USED;
+    }
+    return (uint32_t)count;
+}
+
+static float qwen4exp_mtp_head_prune_weight(void) {
+    const float fallback = 0.06f;
+    const char *raw = getenv("DS4_MTP_HEAD_PRUNE_WEIGHT");
+    if (!raw || !raw[0]) return fallback;
+    char *end = NULL;
+    errno = 0;
+    const float weight = strtof(raw, &end);
+    if (errno != 0 || end == raw || *end != '\0' ||
+        !(weight >= 0.0f && weight <= 1.0f)) {
+        return fallback;
+    }
+    return weight;
+}
+
+static uint32_t qwen4exp_mtp_head_prune_min_keep(uint32_t n_expert_used) {
+    const uint32_t fallback = n_expert_used > 1u ? n_expert_used - 1u : 1u;
+    const char *raw = getenv("DS4_MTP_HEAD_PRUNE_MIN_KEEP");
+    if (!raw || !raw[0]) return fallback;
+    char *end = NULL;
+    errno = 0;
+    const unsigned long count = strtoul(raw, &end, 10);
+    if (errno != 0 || end == raw || *end != '\0' || count < 1u ||
+        count >= n_expert_used) {
+        return fallback;
+    }
+    return (uint32_t)count;
+}
+
 static void qw_moe_time_dump(void) {
     for (int lane = 0; lane < 2; lane++) {
         if (qw_moe_stage_calls[lane] == 0) continue;
@@ -1824,6 +1868,10 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
      * row-count difference here can move which experts a row uses. */
     const int moe_timing = qw_hb_time_on() && n_tokens == 1u;
     const int moe_lane = qw_moe_in_head_block ? 1 : 0;
+    const uint32_t n_expert_used = qw_moe_in_head_block
+        ? qwen4exp_mtp_head_expert_count() : DS4_N_EXPERT_USED;
+    const float prune_weight = qw_moe_in_head_block
+        ? qwen4exp_mtp_head_prune_weight() : 0.0f;
     uint64_t moe_mark = moe_timing ? qw_hb_now_ns() : 0;
 
     if (!ds4_qwen4exp_matmul_f32(s->moe_logits, QW_MAP(m, l->ffn_gate_inp),
@@ -1834,9 +1882,15 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
         return false;
     }
     QW_MOE_TICK(QW_MOE_T_ROUTER);
-    if (!ds4_gpu_qwen4exp_router_select_tensor(s->moe_selected, s->moe_weights,
-                                               s->moe_logits, DS4_N_EXPERT,
-                                               DS4_N_EXPERT_USED, n_tokens)) {
+    const int select_ok = prune_weight > 0.0f
+        ? ds4_gpu_qwen4exp_router_select_pruned_tensor(
+              s->moe_selected, s->moe_weights, s->moe_logits, DS4_N_EXPERT,
+              n_expert_used, n_tokens,
+              qwen4exp_mtp_head_prune_min_keep(n_expert_used), prune_weight)
+        : ds4_gpu_qwen4exp_router_select_tensor(
+              s->moe_selected, s->moe_weights, s->moe_logits, DS4_N_EXPERT,
+              n_expert_used, n_tokens);
+    if (!select_ok) {
         fprintf(stderr, "ds4: qwen4exp router select failed at block %u\n", il);
         return false;
     }
@@ -1858,8 +1912,8 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
             s->block_out, s->moe_mid, s->moe_down_partial,
             &gate_slab, &up_slab, &down_slab,
             DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD,
-            s->moe_selected, s->moe_weights, DS4_N_EXPERT, DS4_N_EXPERT_USED,
-            s->mixed, n_tokens, DS4_N_EXPERT_USED * DS4_N_FF_EXP)) {
+            s->moe_selected, s->moe_weights, DS4_N_EXPERT, n_expert_used,
+            s->mixed, n_tokens, n_expert_used * DS4_N_FF_EXP)) {
         fprintf(stderr, "ds4: qwen4exp routed experts failed at block %u\n", il);
         return false;
     }
