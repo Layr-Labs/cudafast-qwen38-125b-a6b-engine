@@ -1451,6 +1451,27 @@ static bool qw_gdn_out_q8_on(void) {
     return on != 0;
 }
 
+/* The QSA output gate at prefill width writes attn_output's Q8_0 directly
+ * (DS4_QWEN4EXP_NO_QSA_GATE_QUANT=1 restores the in-place gate).  When it does,
+ * it also reads the gate straight out of the doubled query projection, so the
+ * Q prep stores no gate copy (DS4_QWEN4EXP_NO_QSA_GATE_INPLACE=1 restores the
+ * copy).  The prep site and the gate site both ask these, so they agree. */
+static bool qw_qsa_gate_q8(uint32_t n_tokens, uint32_t q_width) {
+    static int on = -1;
+    if (on < 0) on = getenv("DS4_QWEN4EXP_NO_QSA_GATE_QUANT") == NULL ? 1 : 0;
+    return n_tokens >= QW_GDN_OUT_Q8_MIN_TOKENS &&
+           (uint64_t)q_width == g_ds4_qwen4exp.gdn_inner &&
+           (on != 0);
+}
+
+static bool qw_qsa_gate_from_doubled(uint32_t n_tokens, uint32_t q_width,
+                                     uint32_t head_dim) {
+    static int inplace_off = -1;
+    if (inplace_off < 0) inplace_off = getenv("DS4_QWEN4EXP_NO_QSA_GATE_INPLACE") == NULL ? 1 : 0;
+    return qw_qsa_gate_q8(n_tokens, q_width) && head_dim == 256u &&
+           (inplace_off != 0);
+}
+
 /* The GDN block.  head_layout is TILED for anything the loader bound: the
  * llama.cpp converter reorders the value heads into ggml's broadcast order and
  * the binder does not undo it, so value head j reads key head j % n_key_head. */
@@ -1651,11 +1672,17 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
     } else
 #endif
     {
-        /* Fused Q-Prep: split doubled-query, per-head RMS norm, and RoPE in 1 launch */
-        if (!ds4_gpu_qwen4exp_qsa_prep_q_fused_dpos_tensor(
-                s->qsa_q, s->qsa_gate, s->qsa_doubled, s->attn_q_norm[il],
-                s->inv_freq, n_tokens, DS4_N_HEAD, head_dim, DS4_N_ROT, pos0,
-                DS4_RMS_EPS, l->attn_q_norm_offset, s->d_pos)) {
+        /* Fused Q-Prep: split doubled-query, per-head RMS norm, and RoPE in 1 launch.
+         * The gate copy is skipped when the output gate reads it from doubled. */
+        if (!(qw_qsa_gate_from_doubled(n_tokens, DS4_N_HEAD * head_dim, head_dim)
+              ? ds4_gpu_qwen4exp_qsa_prep_q_nogate_dpos_tensor(
+                    s->qsa_q, s->qsa_doubled, s->attn_q_norm[il],
+                    s->inv_freq, n_tokens, DS4_N_HEAD, head_dim, DS4_N_ROT, pos0,
+                    DS4_RMS_EPS, l->attn_q_norm_offset, s->d_pos)
+              : ds4_gpu_qwen4exp_qsa_prep_q_fused_dpos_tensor(
+                    s->qsa_q, s->qsa_gate, s->qsa_doubled, s->attn_q_norm[il],
+                    s->inv_freq, n_tokens, DS4_N_HEAD, head_dim, DS4_N_ROT, pos0,
+                    DS4_RMS_EPS, l->attn_q_norm_offset, s->d_pos))) {
             fprintf(stderr, "ds4: qwen4exp fused Q-prep failed at block %u\n", il);
             return false;
         }
@@ -1747,17 +1774,46 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
             /* Below the budget every row's count is pos + 1 <= the budget,
              * captured replays included (the island captures only there);
              * above it the selection caps the count. */
-            indexed ? max_selected : (uint32_t)DS4_N_INDEXER_TOP_K) ||
-        !ds4_gpu_qwen4exp_qsa_output_gate_tensor(s->qsa_out, s->qsa_gate,
-                                                 n_tokens * q_width)) {
+            indexed ? max_selected : (uint32_t)DS4_N_INDEXER_TOP_K)) {
         fprintf(stderr, "ds4: qwen4exp QSA attention failed at block %u\n", il);
         return false;
     }
 
-    if (!ds4_qwen4exp_matmul_q8_0(s->block_out, QW_MAP(m, l->attn_output),
-                                    QW_MAPSZ(m, l->attn_output),
-                                    QW_OFF(l->attn_output),
-                                    q_width, DS4_N_EMBD, s->qsa_out, n_tokens)) {
+    /* At prefill width the gate writes the Q8_0 the attn_output projection
+     * reads (into the session's 6144-wide scratch, which the GDN output also
+     * uses; the two blocks run one after the other), instead of float rows
+     * the projection would quantize.  DS4_QWEN4EXP_NO_QSA_GATE_QUANT=1
+     * restores the in-place gate. */
+    const bool gate_q8 = qw_qsa_gate_q8(n_tokens, q_width);
+    const bool gate_from_doubled =
+        qw_qsa_gate_from_doubled(n_tokens, q_width, head_dim);
+    (void)cfg;
+    const uint64_t gate_q8_soff =
+        ((uint64_t)n_tokens * ((uint64_t)q_width / 32u) * 32u + 15u) & ~15ull;
+    if (!(gate_from_doubled
+          ? ds4_gpu_qwen4exp_qsa_output_gate_doubled_q8_tensor(
+                s->gdn_out_q8, 0u, gate_q8_soff, s->qsa_out, s->qsa_doubled,
+                n_tokens * q_width, head_dim)
+          : gate_q8
+          ? ds4_gpu_qwen4exp_qsa_output_gate_q8_tensor(s->gdn_out_q8, 0u, gate_q8_soff,
+                                                       s->qsa_out, s->qsa_gate,
+                                                       n_tokens * q_width)
+          : ds4_gpu_qwen4exp_qsa_output_gate_tensor(s->qsa_out, s->qsa_gate,
+                                                    n_tokens * q_width))) {
+        fprintf(stderr, "ds4: qwen4exp QSA output gate failed at block %u\n", il);
+        return false;
+    }
+
+    if (!(gate_q8
+          ? ds4_qwen4exp_matmul_q8_0_preq(s->block_out, QW_MAP(m, l->attn_output),
+                                          QW_MAPSZ(m, l->attn_output),
+                                          QW_OFF(l->attn_output),
+                                          q_width, DS4_N_EMBD,
+                                          s->gdn_out_q8, 0u, gate_q8_soff, n_tokens)
+          : ds4_qwen4exp_matmul_q8_0(s->block_out, QW_MAP(m, l->attn_output),
+                                     QW_MAPSZ(m, l->attn_output),
+                                     QW_OFF(l->attn_output),
+                                     q_width, DS4_N_EMBD, s->qsa_out, n_tokens))) {
         fprintf(stderr, "ds4: qwen4exp QSA output projection failed at block %u\n", il);
         return false;
     }
