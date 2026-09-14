@@ -4096,6 +4096,51 @@ __global__ static void qwen4exp_moe_gateup_split_kernel(
                 } \
             } while (0)
             uint32_t g = lane;
+            /* THREE chains in flight ahead of the pair body.
+             *
+             * CREDIT: 0xpg (`2fc5a06`), on the strength of two of their own
+             * measured runs: narrowing this loop from two chains to one cost
+             * 11% of the decode leg (`ec7bb97f`), while losing a third of the
+             * kernel's residency cost 1.13% (`fd1cafd2`).  The loop is
+             * INSTRUCTION-LEVEL-PARALLELISM bound and only weakly
+             * occupancy-sensitive, so registers are the cheap currency here
+             * and chains in flight are the expensive one.
+             *
+             * A gate/up row is n_embd / 32 = 80 groups and a lane strides by
+             * 32, so a lane visits at most g, g+32, g+64.  The pair body plus
+             * single tail covers that as 2 chains then 1; this body makes it
+             * 3 interleaved and drops the loop-carried edge between the pair
+             * iteration and the tail.  At groups == 80, lanes 0-15 take this
+             * body once and finish; lanes 16-31 skip it and take the pair body
+             * exactly as before, byte for byte.  The strides compose for any
+             * `groups`, so the direct and prefill instantiations stay correct
+             * with no special case.
+             *
+             * Nothing is reassociated: each chain is the same QWEN4EXP_SPLIT_
+             * GROUP expansion on the same g, in ascending g, into the same
+             * acc[r]. */
+            for (; g + 64u < groups; g += 96u) {
+                uint32_t raw0[8];
+                uint32_t raw1[8];
+                uint32_t raw2[8];
+                const uint32_t *p0, *p1, *p2;
+                if (Coop) {
+                    qw_gu_coop_raw_load(wsh, wrow, g, raw0);
+                    qw_gu_coop_raw_load(wsh, wrow, g + 32u, raw1);
+                    qw_gu_coop_raw_load(wsh, wrow, g + 64u, raw2);
+                    p0 = raw0; p1 = raw1; p2 = raw2;
+                } else {
+                    p0 = qw_raw_load((uint32_t)Type, weight_row, g, raw0)
+                       ? raw0 : NULL;
+                    p1 = qw_raw_load((uint32_t)Type, weight_row, g + 32u, raw1)
+                       ? raw1 : NULL;
+                    p2 = qw_raw_load((uint32_t)Type, weight_row, g + 64u, raw2)
+                       ? raw2 : NULL;
+                }
+                QWEN4EXP_SPLIT_GROUP(g, p0);
+                QWEN4EXP_SPLIT_GROUP(g + 32u, p1);
+                QWEN4EXP_SPLIT_GROUP(g + 64u, p2);
+            }
             for (; g + 32u < groups; g += 64u) {
                 uint32_t raw0[8];
                 uint32_t raw1[8];
