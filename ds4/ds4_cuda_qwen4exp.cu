@@ -8818,7 +8818,8 @@ __global__ static void qwen4exp_hc_mix_inject_dual_kernel(
         const float *normw, const float *gate_values, const char *w,
         uint32_t n_embd, uint32_t n_hc, uint32_t rows,
         float weight_bias, int round_bf16,
-        uint32_t weight_type, uint32_t weight_row_bytes) {
+        uint32_t weight_type, uint32_t weight_row_bytes,
+        int8_t *xq, float *xscale) {
     /* PDL producer: the decode arm of the mix that closes the mixer, so the
      * router GEMV behind it launches at its top.  Grid is (mix_blocks +
      * n_hc, rows) -- 14*2 blocks at the two-row decode.  Triggered at the
@@ -8849,7 +8850,45 @@ __global__ static void qwen4exp_hc_mix_inject_dual_kernel(
                     normw[(uint64_t)h * n_embd + d], weight_bias, round_bf16);
             acc += qwen4exp_sigmoid(gate_values[idx]) * normed;
         }
-        out[(uint64_t)t * n_embd + d] = acc * (1.0f / (float)n_hc);
+        const float v = acc * (1.0f / (float)n_hc);
+        out[(uint64_t)t * n_embd + d] = v;
+        /* The mix's one reader is a Q8_0 projection whose first act is
+         * quantize_q8_0_f32_rows_warp_kernel over the row this block just
+         * stored, so that quantize runs here instead of in a second launch.
+         *
+         * The mapping is the standalone kernel's own.  This leg is launched
+         * with blockDim.x == 256 and the caller only folds at
+         * n_embd % 256 == 0, so `d < n_embd` and `t < rows` hold for every
+         * thread of every block of this leg -- no lane has returned above and
+         * the butterfly below sees a full warp.  Warp w of block bx owns the
+         * 32 consecutive channels 32*(8*bx + w) .. +31, which IS Q8_0 group
+         * 8*bx + w of the row, so pair = t*(n_embd/32) + 8*bx + w is the
+         * standalone kernel's row*blocks + b and every group is full (its
+         * ragged-tail guard has nothing to guard).
+         *
+         * `v` is quantized as STORED, not re-derived from the expression: the
+         * five arithmetic steps are the forms --use_fast_math gave the
+         * standalone kernel, taken from the seam above -- the flushed fabs,
+         * the fmaxf butterfly over the same 32 lanes, the exact bit pattern of
+         * rcp(127) and MUFU.RCP itself.  Same bytes, one less round trip. */
+        if (xq) {
+            const uint32_t lane = threadIdx.x & 31u;
+            const float vz = qwen4exp_q8_ftz(v);
+            float a = qwen4exp_q8_ftz(fabsf(v));
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+            }
+            const float qd = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
+            const float qid = qd != 0.0f ? qwen4exp_q8_rcp_approx(qd) : 0.0f;
+            const uint64_t pair = (uint64_t)t * (n_embd / 32u) +
+                (uint64_t)(blockIdx.x * (blockDim.x >> 5u) +
+                           (threadIdx.x >> 5u));
+            if (lane == 0u) xscale[pair] = qd;
+            int q = (int)lrintf(qwen4exp_q8_ftz(vz * qid));
+            q = q > 127 ? 127 : (q < -128 ? -128 : q);
+            xq[pair * 32u + lane] = (int8_t)q;
+        }
     } else {
         float *out = inject;
         const uint32_t h = blockIdx.x - mix_blocks;
@@ -10024,8 +10063,16 @@ static int qwen4exp_hc_mixer_fused_cuda(
         float                 weight_bias,
         int                   round_bf16,
         const ds4_gpu_tensor *pending_block,
-        const ds4_gpu_tensor *pending_inject) {
+        const ds4_gpu_tensor *pending_inject,
+        /* Where the mix's Q8_0 reader wants its input, when the caller has
+         * one and this dispatch takes an arm that can fold the quantize in.
+         * NULL is the unfolded behaviour, unchanged.  `*mix_quantized` is 1
+         * only when the bytes were actually written here, so a caller that
+         * asked can still tell it must run the separate quantize. */
+        int8_t *mix_q = NULL, float *mix_scale = NULL,
+        int *mix_quantized = NULL) {
     const uint32_t threads = QWEN4EXP_HC_THREADS;
+    if (mix_quantized) *mix_quantized = 0;
     if (n_embd % threads != 0u || n_hc > QWEN4EXP_HC_MAX_STREAMS) return -1;
     if (pending_block &&
         (!pending_inject ||
@@ -10249,14 +10296,24 @@ static int qwen4exp_hc_mixer_fused_cuda(
             qwen4exp_hc_ranges_disjoint(inject->ptr, inj_bytes, wide_scratch->ptr, hc_bytes);
         if (disjoint) {
             const unsigned mix_blocks = (n_embd + threads - 1u) / threads;
+            /* threads is 256 and n_embd % threads == 0 was required above, so
+             * every mix block of this launch is full and the folded quantize's
+             * warp-to-group mapping holds exactly. */
+            const int fold = mix_q && mix_scale &&
+                             threads == 256u && n_embd % 256u == 0u;
             QWEN4EXP_HC_DUAL_LAUNCH(
                     dim3(mix_blocks + n_hc, rows, 1u),
                     (float *)mixed->ptr, (float *)inject->ptr,
                     (const float *)hyper->ptr, nscale, normw,
                     (const float *)wide_scratch->ptr, iw,
                     n_embd, n_hc, rows, weight_bias, round_bf16,
-                    inject_weight->type, (uint32_t)iw_row_bytes);
-            return cuda_ok(cudaGetLastError(), "qwen4exp_hc_mix_inject_dual launch");
+                    inject_weight->type, (uint32_t)iw_row_bytes,
+                    fold ? mix_q : (int8_t *)NULL,
+                    fold ? mix_scale : (float *)NULL);
+            const int launched =
+                cuda_ok(cudaGetLastError(), "qwen4exp_hc_mix_inject_dual launch");
+            if (launched && fold && mix_quantized) *mix_quantized = 1;
+            return launched;
         }
     }
 
@@ -10280,6 +10337,90 @@ static int qwen4exp_hc_mixer_fused_cuda(
 
 #define DS4_QWEN4EXP_HC_HAVE_FUSED 1
 #define DS4_QWEN4EXP_HC_HAVE_PENDING 1
+
+/* The mixer, plus the Q8_0 row quantize of `mixed` its reader wants.
+ *
+ * `mixed` has exactly one consumer shape in the tower: a Q8_0 projection,
+ * whose first act is quantize_q8_0_f32_rows_warp_kernel over the rows the
+ * mixer just stored.  The graph runs that quantize as a separate launch of
+ * (rows*n_embd/32 + 7)/8 blocks -- ten blocks on a 48-SM device at the decode
+ * width, so its cost is launch and drain, not work -- twice per layer.
+ *
+ * This entry offers the mixer the quantize's destination.  When the dispatch
+ * lands on an arm that closes the mix with a kernel whose thread map already
+ * matches the quantize's group map, the bytes are written there and
+ * `*quantized` comes back 1; the caller then skips the separate launch.  On
+ * every other arm, and on any shape or alignment this refuses, `*quantized`
+ * stays 0 and the caller must quantize as before.  A negative return means
+ * this did NOTHING at all and the caller should fall back to the ordinary
+ * mixer entry -- it is not an error.
+ *
+ * `mixed` is still stored as f32 exactly as before: the GDN alpha/beta
+ * projections, the router and the shared-expert arms all read it as float.
+ * The Q8_0 bytes are written in ADDITION, which is what makes this a
+ * scheduling change and not a numerical one. */
+int ds4_gpu_qwen4exp_hc_mixer_pending_quant_tensor(
+        ds4_gpu_tensor       *mixed,
+        ds4_gpu_tensor       *inject,
+        ds4_gpu_tensor       *normed_scratch,
+        ds4_gpu_tensor       *lowrank_scratch,
+        ds4_gpu_tensor       *wide_scratch,
+        ds4_gpu_tensor       *hyper,
+        const ds4_gpu_qwen4exp_slab *norm_weight,
+        const ds4_gpu_qwen4exp_slab *down_weight,
+        const ds4_gpu_qwen4exp_slab *up_weight,
+        const ds4_gpu_qwen4exp_slab *inject_weight,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              n_lowrank,
+        uint32_t              rows,
+        float                 eps,
+        float                 weight_bias,
+        int                   round_bf16,
+        const ds4_gpu_tensor *pending_block,
+        const ds4_gpu_tensor *pending_inject,
+        ds4_gpu_tensor       *mixed_q8,
+        uint64_t              q_offset,
+        uint64_t              s_offset,
+        int                  *quantized) {
+    if (quantized) *quantized = 0;
+    /* Everything DS4_QWEN4EXP_HC_MIXER_GUARD checks, but declining (-1) where
+     * the guard would refuse (0): a shape this entry cannot serve is the
+     * ordinary mixer's business, not a failure. */
+    if (!mixed || !normed_scratch || !lowrank_scratch || !wide_scratch ||
+        !hyper || !norm_weight || !down_weight || !up_weight ||
+        n_embd == 0u || n_hc == 0u || n_lowrank == 0u || rows == 0u) {
+        return -1;
+    }
+    if (pending_block && !pending_inject) return -1;
+    if (ds4_qwen4exp_hc_fuse_off()) return -1;
+    if (!quantized || !mixed_q8 || !mixed_q8->ptr || !mixed->ptr) return -1;
+    if ((n_embd % 256u) != 0u) return -1;
+
+    /* The same window the standalone quantize entry validates: 16-byte
+     * alignment on both offsets, and both ranges inside the tensor. */
+    const uint64_t blocks = (uint64_t)n_embd / 32u;
+    const uint64_t qbytes = (uint64_t)rows * blocks * 32u;
+    const uint64_t sbytes = (uint64_t)rows * blocks * sizeof(float);
+    if ((q_offset & 15ull) != 0ull || (s_offset & 15ull) != 0ull) return -1;
+    if (q_offset > mixed_q8->bytes || mixed_q8->bytes - q_offset < qbytes) {
+        return -1;
+    }
+    if (s_offset > mixed_q8->bytes || mixed_q8->bytes - s_offset < sbytes) {
+        return -1;
+    }
+    if (ds4_tensor_device_idx(mixed_q8) != ds4_tensor_device_idx(mixed)) {
+        return -1;
+    }
+
+    int8_t *mix_q = (int8_t *)((char *)mixed_q8->ptr + q_offset);
+    float  *mix_scale = (float *)((char *)mixed_q8->ptr + s_offset);
+    return qwen4exp_hc_mixer_fused_cuda(
+            mixed, inject, normed_scratch, lowrank_scratch, wide_scratch,
+            hyper, norm_weight, down_weight, up_weight, inject_weight,
+            n_embd, n_hc, n_lowrank, rows, eps, weight_bias, round_bf16,
+            pending_block, pending_inject, mix_q, mix_scale, quantized);
+}
 
 /* =========================================================================
  * Qwen4-Exp QSA block, the CUDA twin of metal/qwen4exp_qsa.metal.

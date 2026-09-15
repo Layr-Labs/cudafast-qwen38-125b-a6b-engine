@@ -418,6 +418,16 @@ struct ds4_qwen4exp_session {
      * decode island: the widths that capture are below the threshold. */
     bool hc_pending;
 
+    /* Rows of `mixed_q8` the mixer has already filled, or 0.
+     *
+     * `mixed` has exactly one writer -- qwen4exp_graph_residual -- and
+     * `mixed_q8` is only ever the Q8_0 form of the current `mixed`, so this is
+     * simply "the last mixer folded its reader's quantize in".  Set on every
+     * exit of that function, to n_tokens or to 0, which is why no other site
+     * has to invalidate it.  Host-side and capture-safe: it decides which
+     * launches get RECORDED, and a replay reruns the launches it recorded. */
+    uint32_t hc_mixed_q8_rows;
+
 #ifdef DS4_TEST_HOOKS
     /* A copy of the stream taken INSIDE the batch, immediately before the final
      * mixer reads it.  Comparing it with what the public accessor hands back
@@ -1488,8 +1498,13 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
     /* GDN and QSA run sequentially on the same stream. Reuse the existing
      * session scratch: both GDN Q8 projections read the same mixed input.
      * The F32 alpha/beta projections still read the original float values.
-     * Width-specific graph islands capture a stable scratch and scale offset. */
-    if (!ds4_qwen4exp_quantize_q8_0(s->mixed_q8, 0, q8_soff, s->mixed,
+     * Width-specific graph islands capture a stable scratch and scale offset.
+     *
+     * Skipped when the mixer that wrote s->mixed already wrote these bytes in
+     * the same pass (hc_mixed_q8_rows), which is the same launch with one less
+     * round trip through memory. */
+    if (s->hc_mixed_q8_rows != n_tokens &&
+        !ds4_qwen4exp_quantize_q8_0(s->mixed_q8, 0, q8_soff, s->mixed,
                                     DS4_N_EMBD, n_tokens)) {
         fprintf(stderr, "ds4: qwen4exp GDN pre-quantize failed at block %u\n", il);
         return false;
@@ -1621,7 +1636,8 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
     const uint64_t q8_qbytes = (uint64_t)n_tokens * q8_blocks * 32u;
     const uint64_t q8_soff = (q8_qbytes + 15u) & ~15ull;
 
-    if (!ds4_qwen4exp_quantize_q8_0(s->mixed_q8, 0, q8_soff, s->mixed,
+    if (s->hc_mixed_q8_rows != n_tokens &&
+        !ds4_qwen4exp_quantize_q8_0(s->mixed_q8, 0, q8_soff, s->mixed,
                                     DS4_N_EMBD, n_tokens)) {
         fprintf(stderr, "ds4: qwen4exp QSA pre-quantize failed at block %u\n", il);
         return false;
@@ -2187,6 +2203,37 @@ static bool qwen4exp_graph_residual(ds4_qwen4exp_session *s,
     const ds4_gpu_qwen4exp_slab inject_slab =
         inject ? QW_SLAB(m, inject) : (ds4_gpu_qwen4exp_slab){0};
 
+    /* `mixed`'s reader is a Q8_0 projection and its first act is the row
+     * quantize at the top of the GDN and QSA blocks below.  Offer the mixer
+     * that destination: on the decode arm its closing kernel already walks the
+     * row in the quantize's own group order and writes the bytes in the same
+     * pass, which removes a launch of ten blocks -- pure launch and drain on a
+     * 48-SM device -- twice per layer.  A negative return means the backend
+     * did nothing and the unchanged pair below runs; hc_mixed_q8_rows records
+     * whether the bytes are already there.  Offsets are the ones both reader
+     * sites compute, from the same n_tokens. */
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (getenv("DS4_QWEN4EXP_NO_HC_MIX_QUANT") == NULL) {
+        const uint64_t mq_blocks = (uint64_t)DS4_N_EMBD / 32u;
+        const uint64_t mq_qbytes = (uint64_t)n_tokens * mq_blocks * 32u;
+        const uint64_t mq_soff = (mq_qbytes + 15u) & ~15ull;
+        int folded = 0;
+        const int r = ds4_gpu_qwen4exp_hc_mixer_pending_quant_tensor(
+            s->mixed, inject ? s->inject : NULL, s->normed, s->lowrank, s->wide,
+            s->hyper, &norm_slab, &down_slab, &up_slab,
+            inject ? &inject_slab : NULL,
+            DS4_N_EMBD, DS4_N_HC, DS4_N_HC_LOWRANK, n_tokens,
+            DS4_HC_EPS, norm_weight_offset, 1,
+            pending ? s->block_out : NULL, pending ? s->inject : NULL,
+            s->mixed_q8, 0, mq_soff, &folded);
+        if (r >= 0) {
+            s->hc_mixed_q8_rows = (r != 0 && folded) ? n_tokens : 0u;
+            return r != 0;
+        }
+    }
+#endif
+    s->hc_mixed_q8_rows = 0u;
+
     if (pending) {
         return ds4_gpu_qwen4exp_hc_mixer_pending_tensor(
             s->mixed, inject ? s->inject : NULL, s->normed, s->lowrank, s->wide,
@@ -2732,6 +2779,9 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     /* A refused forward may have left an owed inject behind; the stream is
      * re-seeded below, so it is void. */
     s->hc_pending = false;
+    /* Same reasoning for the folded Q8_0 form of `mixed`: nothing in this
+     * forward has run a mixer yet, so no reader may assume those bytes. */
+    s->hc_mixed_q8_rows = 0u;
 
 #ifdef DS4_TEST_HOOKS
     g_qwen4exp_trace_len = 0;

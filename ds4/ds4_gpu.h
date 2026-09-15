@@ -3983,6 +3983,43 @@ int ds4_gpu_qwen4exp_hc_mixer_pending_tensor(
         const ds4_gpu_tensor *pending_block,
         const ds4_gpu_tensor *pending_inject);
 
+/* The entry above, offered the destination of the Q8_0 row quantize that
+ * `mixed`'s reader performs first.
+ *
+ * A backend whose closing mix kernel already walks the row in the quantize's
+ * group order may write those bytes in the same pass and report
+ * `*quantized = 1`; the caller then skips its own quantize.  `*quantized = 0`
+ * with a positive return means the mixer ran and the caller must still
+ * quantize.  A NEGATIVE return means nothing was done at all: fall back to
+ * ds4_gpu_qwen4exp_hc_mixer_pending_tensor followed by the quantize, which is
+ * the definition of what this computes.  `mixed` is written as f32 either way.
+ *
+ * CUDA only; declared unconditionally so callers can guard at the call site. */
+int ds4_gpu_qwen4exp_hc_mixer_pending_quant_tensor(
+        ds4_gpu_tensor       *mixed,
+        ds4_gpu_tensor       *inject,
+        ds4_gpu_tensor       *normed_scratch,
+        ds4_gpu_tensor       *lowrank_scratch,
+        ds4_gpu_tensor       *wide_scratch,
+        ds4_gpu_tensor       *hyper,
+        const ds4_gpu_qwen4exp_slab *norm_weight,
+        const ds4_gpu_qwen4exp_slab *down_weight,
+        const ds4_gpu_qwen4exp_slab *up_weight,
+        const ds4_gpu_qwen4exp_slab *inject_weight,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              n_lowrank,
+        uint32_t              rows,
+        float                 eps,
+        float                 weight_bias,
+        int                   round_bf16,
+        const ds4_gpu_tensor *pending_block,
+        const ds4_gpu_tensor *pending_inject,
+        ds4_gpu_tensor       *mixed_q8,
+        uint64_t              q_offset,
+        uint64_t              s_offset,
+        int                  *quantized);
+
 /* The same mixer, built ONLY out of the per-op wrappers -- no backend fusion.
  *
  * Nothing in the engine calls it.  It exists so a test can require the entry
