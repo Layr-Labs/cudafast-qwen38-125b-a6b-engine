@@ -19122,7 +19122,12 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
     extern __shared__ uint4 qw_gdn_panel[];
     char *const gpanel = (char *)qw_gdn_panel;
     constexpr unsigned B=256u;
-    constexpr bool FloatFirst=true, Streaming=false;
+    /* EVICT-FIRST.  Every weight byte this kernel reads is read once per pass
+     * and cannot be reused from any cache on this part, so defending its lines
+     * in L2 only displaces the activations and routing metadata that ARE reused
+     * a few kernels later in the same round.  __ldcs is a residency hint on a
+     * load: it changes neither the address, nor the width, nor the value. */
+    constexpr bool FloatFirst=true, Streaming=true;
     constexpr int C=2, U=10;
     const uint32_t split=(uint32_t)((a.od[0]+B/64u-1u)/(B/64u));
     const uint32_t qblocks=split+(uint32_t)((a.od[1]+B/64u-1u)/(B/64u));
@@ -19679,7 +19684,12 @@ __global__ static void qwen_q8_projection_triple_kernel(
         const unsigned char *w0, const unsigned char *w1, const unsigned char *w2,
         const int8_t *xq, const float *xscale, uint64_t od0, uint64_t od1,
         uint64_t od2, uint32_t n_rows, uint64_t blocks) {
-    constexpr bool SmallFirst=true, Streaming=false;
+    /* EVICT-FIRST.  Every weight byte this kernel reads is read once per pass
+     * and cannot be reused from any cache on this part, so defending its lines
+     * in L2 only displaces the activations and routing metadata that ARE reused
+     * a few kernels later in the same round.  __ldcs is a residency hint on a
+     * load: it changes neither the address, nor the width, nor the value. */
+    constexpr bool SmallFirst=true, Streaming=true;
     const uint32_t nb0=(uint32_t)((od0+3u)/4u), nb1=(uint32_t)((od1+3u)/4u), nb2=(uint32_t)((od2+3u)/4u);
     const uint32_t flat=SmallFirst ? (blockIdx.x<nb1+nb2 ? blockIdx.x+nb0 : blockIdx.x-nb1-nb2) : blockIdx.x;
     const unsigned which=flat<nb0 ? 0u : (flat<nb0+nb1 ? 1u : 2u);
