@@ -4198,7 +4198,7 @@ __device__ __forceinline__ static void qwen4exp_shared_vector_accumulate(
 #ifndef DS4_GATEUP_COOP_BUILD
 #define DS4_GATEUP_COOP_BUILD 1
 #endif
-#define QW_GU_COOP_ROWS 8u
+#define QW_GU_COOP_ROWS 4u
 #define QW_GU_COOP_ROW_U4 90u                /* 1440 B, ten q4_K super-blocks */
 #define QW_GU_COOP_GROUPS 80u                            /* in_dim 2560 / 32 */
 #define QW_GU_COOP_U4 (QW_GU_COOP_ROWS * QW_GU_COOP_ROW_U4)
