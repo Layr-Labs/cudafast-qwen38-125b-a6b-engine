@@ -4280,27 +4280,6 @@ __device__ __forceinline__ static void qwen4exp_shared_vector_accumulate(
 #ifndef DS4_GATEUP_COOP_BUILD
 #define DS4_GATEUP_COOP_BUILD 1
 #endif
-/* FOUR OUTPUT ROWS PER COOPERATIVE BLOCK, NOT EIGHT.
- *
- * This constant is both the block's output-row count and, through
- * `P * 64u`, its thread count and its staged-panel size.  The engine's own
- * kernel-limits probe reports the consequence on this part, and the two
- * readings are from two builds of this same tree:
- *     eight rows: gu[reg=32 smem=23168 lmem=0 maxt=1024 occ=3]
- *     four  rows: gu[reg=32 smem=11584 lmem=0 maxt=1024 occ=6]
- * At eight rows the block is 512 threads and the 1536-thread SM ceiling pins
- * it to THREE blocks; halving the rows halves the threads and the panel and
- * lands SIX.  Registers (32 * 256 = 8,192) and shared memory
- * (101,376 / 11,584 = 8) are both slack at four; the thread ceiling is the
- * whole binding constraint and it is the one this halves.
- *
- * The grid grows to match -- (mid_dim + P - 1) / P is 160 blocks at four
- * instead of 80 at eight -- so the same warps do the same work, packed into
- * narrower blocks that the scheduler can actually co-resident.
- *
- * Purely a packing change.  Each output row still walks its own weight row in
- * the same group order through the same warp_sum_f32 tree, and every dot is
- * bit-identical. */
 #define QW_GU_COOP_ROWS 4u
 #define QW_GU_COOP_ROW_U4 90u                /* 1440 B, ten q4_K super-blocks */
 #define QW_GU_COOP_GROUPS 80u                            /* in_dim 2560 / 32 */
@@ -4457,6 +4436,11 @@ qwen4exp_moe_gateup_split_kernel(
         uint32_t mid_dim,
         uint32_t mid_token_stride,
         uint32_t n_expert_used) {
+    /* PDL consumer of the routed input quantizer, which is the previous launch
+     * on the stream and triggers at decode widths (gridDim.y <= 2).
+     * Residency win: this kernel's blocks are already scheduled when the quantizer
+     * finishes rather than paying a launch behind it. */
+    QWEN4EXP_PDL_SYNC();
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
     const uint32_t row = blockIdx.x * OutputRows + (warp >> 1u);
@@ -7607,16 +7591,31 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             ((uintptr_t)gate & 15u) == 0u && ((uintptr_t)up & 15u) == 0u &&
             (gate_slab->expert_bytes & 15ull) == 0ull &&
             (up_slab->expert_bytes & 15ull) == 0ull;
-#define QWEN4EXP_SPLIT_GATEUP(V, P, C) \
-        qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P, C><<< \
-            dim3((mid_dim + P - 1u) / P, gu_rows, 1), P * 64u, 0, stream>>>( \
+#define QWEN4EXP_SPLIT_GATEUP(V, P, C) do { \
+    const dim3 gu_split_grid((mid_dim + P - 1u) / P, gu_rows, 1); \
+    if (n_tokens <= 2u) { \
+        QWEN4EXP_LAUNCH_PDL( \
+            (qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P, C>), \
+            gu_split_grid, P * 64u, 0, stream, \
             (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum, \
             sc.pairs, sc.counts, sc.offsets, gu_active, \
             (const float *)weights->ptr, \
             gate_slab->expert_bytes, gate_slab->row_bytes, \
             up_slab->expert_bytes, up_slab->row_bytes, \
             gate_slab->type, up_slab->type, xgroups, mid_dim, \
-            mid_token_stride, n_expert_used)
+            mid_token_stride, n_expert_used); \
+    } else { \
+        qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P, C><<< \
+            gu_split_grid, P * 64u, 0, stream>>>( \
+            (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum, \
+            sc.pairs, sc.counts, sc.offsets, gu_active, \
+            (const float *)weights->ptr, \
+            gate_slab->expert_bytes, gate_slab->row_bytes, \
+            up_slab->expert_bytes, up_slab->row_bytes, \
+            gate_slab->type, up_slab->type, xgroups, mid_dim, \
+            mid_token_stride, n_expert_used); \
+    } \
+} while (0)
         /* ONE OUTPUT ROW PER BLOCK on the vector schedule.  Four rows per
          * block was measured a full percent slower than two, so the barrier
          * is what costs: every warp in the block reads a different weight
@@ -8685,6 +8684,11 @@ __global__ static void qwen4exp_gdn_output_quant_kernel(
         uint32_t     n_value_head,
         uint32_t     n_tokens,
         float        norm_eps) {
+    /* PDL producer for matmul_q8_0_preq_pair_lanes_kernel, which is launched
+     * with QWEN4EXP_LAUNCH_PDL at decode widths (n_rows <= 2).
+     * Single-wave bound: 48 or 96 blocks << 1,536 resident SM slots. */
+    if (n_tokens <= 2u && (uint64_t)gridDim.x * (uint64_t)gridDim.y <= 96u)
+        QWEN4EXP_PDL_TRIGGER();
     const uint32_t token = blockIdx.x;
     const uint32_t head = blockIdx.y;
     const uint32_t tid = threadIdx.x;
@@ -12569,6 +12573,11 @@ __global__ static void qwen4exp_qsa_output_gate_doubled_quant_kernel(
         const float *doubled,
         const float *out,
         uint32_t     n_values) {
+    /* PDL producer for matmul_q8_0_preq_pair_lanes_kernel, which is launched
+     * with QWEN4EXP_LAUNCH_PDL at decode widths.
+     * Single-wave bound: 24 or 48 blocks << 1,536 resident SM slots. */
+    if ((uint64_t)gridDim.x <= 48u)
+        QWEN4EXP_PDL_TRIGGER();
     const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
@@ -13944,7 +13953,3 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
              md_regs, md_smem, md_lmem, md_occ);
     return buf;
 }
-
-/* ticket 26: this archive is the measured stack. The only difference from
- * its siblings is the decode-graph variant table width, which the capture
- * census shows produces a byte-identical capture log. */
