@@ -4770,7 +4770,7 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
  * either.  If registers ever need to come down, it has to be by removing live
  * state at source. */
 template <int R, int DownType = -1, bool Vector = false, bool Stage = false,
-          bool Async = false>
+          bool Async = false, bool WideQ5 = false>
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
@@ -4856,8 +4856,9 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                 for (uint64_t o = (uint64_t)threadIdx.x * 16u;
                      o < panel_bytes; o += (uint64_t)blockDim.x * 16u) {
                     if (Async) {
-                        qw_cpasync16((uint32_t)__cvta_generic_to_shared(dst + o),
-                                     gp + o);
+                        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+                            :: "r"((uint32_t)__cvta_generic_to_shared(dst + o)),
+                               "l"(gp + o));
                     } else {
                         *(uint4 *)(dst + o) = *(const uint4 *)(gp + o);
                     }
@@ -4907,9 +4908,20 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                     int8_t wq[32];
                     float wa[2], wb[2];
                     int halves = 1;
-                    dev_qwen4exp_group_decode(
+                    if (WideQ5 && DownType == DS4_QWEN4EXP_TY_q5_1) {
+                        /* The existing word decoder returns the same quants
+                         * and scales. Aligned 64-bit reads stage the six
+                         * packed Q5_1 words with fewer shared load requests. */
+                        uint32_t raw[8];
+                        const uint32_t *p = qw_raw_load<true>(
+                            (uint32_t)DownType, drow, g, raw) ? raw : NULL;
+                        dev_qwen4exp_group_decode_w((uint32_t)DownType,
+                                                   drow, g, p, wq, wa, wb);
+                    } else {
+                        dev_qwen4exp_group_decode(
                             DownType < 0 ? down_type : (uint32_t)DownType,
                             drow, g, wq, wa, wb, &halves);
+                    }
                     const uint64_t at_g = mrow * groups + g;
                     if (Vector && halves == 1)
                         qwen4exp_shared_vector_accumulate(&acc[r], wq, wa[0], wb[0],
@@ -7571,8 +7583,8 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
             mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
 #define QWEN4EXP_DOWN_IMPL(R, DT, V) QWEN4EXP_DOWN_IMPL_S(R, DT, V, false, 0)
-#define QWEN4EXP_DOWN_ASYNC(DT) \
-    qwen4exp_moe_down_q_kernel<2, DT, true, true, true><<< \
+#define QWEN4EXP_DOWN_ASYNC(DT, W) \
+    qwen4exp_moe_down_q_kernel<2, DT, true, true, true, W><<< \
             dn_grid, threads, (size_t)dn_shared, stream>>>( \
             (float *)out->ptr, down, (const int32_t *)selected->ptr, \
             sc.mq, sc.ms, sc.msum, \
@@ -7657,7 +7669,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             getenv("DS4_QWEN4EXP_NO_DOWN_PANEL") == NULL;
         if (down_slab->type == DS4_QWEN4EXP_TY_q8_0) {
             if (dn_stage && getenv("DS4_QWEN4EXP_NO_DOWN_ASYNC") == NULL) {
-                QWEN4EXP_DOWN_ASYNC(DS4_QWEN4EXP_TY_q8_0);
+                QWEN4EXP_DOWN_ASYNC(DS4_QWEN4EXP_TY_q8_0, false);
             } else if (dn_stage) {
                 QWEN4EXP_DOWN_IMPL_S(2, DS4_QWEN4EXP_TY_q8_0, true, true,
                                      (size_t)dn_shared);
@@ -7666,7 +7678,11 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             }
         } else {
             if (dn_stage && getenv("DS4_QWEN4EXP_NO_DOWN_ASYNC") == NULL) {
-                QWEN4EXP_DOWN_ASYNC(DS4_QWEN4EXP_TY_q5_1);
+                if (getenv("DS4_QWEN4EXP_NO_DOWN_WIDE") == NULL) {
+                    QWEN4EXP_DOWN_ASYNC(DS4_QWEN4EXP_TY_q5_1, true);
+                } else {
+                    QWEN4EXP_DOWN_ASYNC(DS4_QWEN4EXP_TY_q5_1, false);
+                }
             } else if (dn_stage) {
                 QWEN4EXP_DOWN_IMPL_S(2, DS4_QWEN4EXP_TY_q5_1, true, true,
                                      (size_t)dn_shared);
