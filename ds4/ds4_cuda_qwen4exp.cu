@@ -7207,7 +7207,32 @@ static int qwen4exp_moe_tile(uint32_t n_rows) {
     /* A THREE-ROW call is the depth-2 verify.  It takes the R=2 tile -- two
      * tiles, the second with take 1 -- so it stays on the decode-width
      * kernels; R changes work sharing, not the arithmetic of a live row.
-     * DS4_QWEN4EXP_NO_WIDE_VERIFY restores the eight-row tile. */
+     * DS4_QWEN4EXP_NO_WIDE_VERIFY restores the eight-row tile.
+     *
+     * DO NOT `fix' this to 4 to make the three-row verify a single tile.  I
+     * spent two days on that arm on the premise that one tile would leave the
+     * expert panels resident for rows 0-1 and make the third row nearly free.
+     * It buys nothing, and the count is four multiplications: the staged down
+     * kernel fills one panel per (slot, token) step and the fill sits INSIDE
+     * the `r < take' guard, so a block does exactly n_expert_used * take
+     * fills.  Two tiles is 8*2 + 8*1 = 24; one tile is 8*3 = 24.  Identical,
+     * because token 2 routes to a DIFFERENT eight experts -- there is no
+     * resident panel for it to reuse.  route[] and the warp_sum_f32 epilogue
+     * are take-guarded too, so those tie at 3 and 3 as well.  The one real
+     * difference is block count, 640 -> 320 per layer against 48 SMs * 8
+     * blocks = 384 resident slots, which under-fills the machine.  Predicted
+     * sign of the arm: negative.
+     *
+     * The general form, which closes the whole acceptance axis on this engine:
+     * routed-DOWN traffic is proportional to verify ROWS at every tile, while
+     * gate/up compacts to one block row per distinct active expert and the
+     * dense and GDN legs are per round.  So an extra acceptance costs a full
+     * extra pass of the routed expert set (52% of the round) for that row, and
+     * flat depth 2 measures -4.8% decode for exactly that reason.  The only
+     * structure that breaks the proportionality is deduplicating overlapping
+     * experts across tokens inside the down kernel, which is -176 bips
+     * measured: the branch that finds the overlap costs more than the
+     * redundant work it removes. */
     if (n_rows == 3u && getenv("DS4_QWEN4EXP_NO_WIDE_VERIFY") == NULL) return 2;
     return 8;
 }
@@ -13088,92 +13113,6 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_pool_update_tensor(
             cache_cap, head_dim, pool_size, rot_dim, eps, weight_offset, NULL);
 }
 
-/* Tiled indexer scores for prefill widths.
- *
- * The per-pair kernel above launches one block per (indexer block, token):
- * at a 4096-row prefill over a 20480-token context that is 21 million
- * blocks of 128 threads, each doing four 128-wide dots and four block-wide
- * reductions.  The scores stage measured 69 ms per layer at 16k tokens for
- * about 21 GFLOP of work.  This kernel tiles the pairs instead: one block
- * takes QWEN4EXP_IDX_TILE_T tokens by QWEN4EXP_IDX_TILE_B indexer blocks,
- * stages the pool rows and the query rows in shared memory once, and each
- * thread owns one (token, block) pair.
- *
- * THE ARITHMETIC IS THE PER-PAIR KERNEL'S, BIT FOR BIT.  With head_dim 128
- * the per-pair kernel runs 128 threads, one product per lane, and reduces
- * with qwen4exp_blk_sum: lanes i and i+64 add, then i and i+32, then a warp
- * shuffle tree at 16, 8, 4, 2, 1.  The thread below forms the same 64 pair
- * sums, then the same halving tree, through __fmul_rn / __fadd_rn so the
- * compiler cannot contract a product into an add.  The relu, the head sum
- * order and the division are the same expressions.  The host wrapper only
- * takes this path at head_dim 128, four heads, and eight rows or more; the
- * decode and verify widths keep the per-pair kernel and their captured
- * graphs unchanged. */
-#define QWEN4EXP_IDX_TILE_T 8u
-#define QWEN4EXP_IDX_TILE_B 32u
-#define QWEN4EXP_IDX_KPAD   129u
-#define QWEN4EXP_IDX_THREADS 256u
-
-template <uint32_t HEAD_DIM, uint32_t N_HEAD>
-__global__ static void __launch_bounds__(QWEN4EXP_IDX_THREADS)
-qwen4exp_qsa_indexer_scores_tiled_kernel(
-        const float *q,
-        const float *pool,
-        float *scores,
-        uint32_t n_tokens,
-        uint32_t n_blocks,
-        uint32_t pos0,
-        uint32_t pool_size,
-        float norm_divisor) {
-    __shared__ float ks[QWEN4EXP_IDX_TILE_B * QWEN4EXP_IDX_KPAD];
-    __shared__ float qs[QWEN4EXP_IDX_TILE_T * N_HEAD * HEAD_DIM];
-    const uint32_t b0 = blockIdx.x * QWEN4EXP_IDX_TILE_B;
-    const uint32_t t0 = blockIdx.y * QWEN4EXP_IDX_TILE_T;
-    const uint32_t tid = threadIdx.x;
-    if (b0 >= n_blocks || t0 >= n_tokens) return;
-    const uint32_t nb = min(QWEN4EXP_IDX_TILE_B, n_blocks - b0);
-    const uint32_t nt = min(QWEN4EXP_IDX_TILE_T, n_tokens - t0);
-    for (uint32_t i = tid; i < nb * HEAD_DIM; i += QWEN4EXP_IDX_THREADS) {
-        const uint32_t bb = i / HEAD_DIM, d = i - bb * HEAD_DIM;
-        ks[bb * QWEN4EXP_IDX_KPAD + d] = pool[(uint64_t)(b0 + bb) * HEAD_DIM + d];
-    }
-    for (uint32_t i = tid; i < nt * N_HEAD * HEAD_DIM; i += QWEN4EXP_IDX_THREADS) {
-        qs[i] = q[(uint64_t)t0 * N_HEAD * HEAD_DIM + i];
-    }
-    __syncthreads();
-    for (uint32_t p = tid; p < nt * QWEN4EXP_IDX_TILE_B; p += QWEN4EXP_IDX_THREADS) {
-        const uint32_t tt = p / QWEN4EXP_IDX_TILE_B;
-        const uint32_t bb = p - tt * QWEN4EXP_IDX_TILE_B;
-        const uint32_t block = b0 + bb;
-        const uint32_t token = t0 + tt;
-        if (block >= n_blocks) continue;
-        float *dst = scores + (uint64_t)token * n_blocks + block;
-        uint32_t visible = (pos0 + token + 1u) / pool_size;
-        if (visible > n_blocks) visible = n_blocks;
-        if (block >= visible) { *dst = QWEN4EXP_QSA_MASKED_SCORE; continue; }
-        const float *k = ks + bb * QWEN4EXP_IDX_KPAD;
-        float total = 0.0f;
-#pragma unroll
-        for (uint32_t h = 0; h < N_HEAD; h++) {
-            const float *qh = qs + (tt * N_HEAD + h) * HEAD_DIM;
-            float a[HEAD_DIM / 2u];
-#pragma unroll
-            for (uint32_t i = 0; i < HEAD_DIM / 2u; i++) {
-                a[i] = __fadd_rn(__fmul_rn(qh[i], k[i]),
-                                 __fmul_rn(qh[i + HEAD_DIM / 2u], k[i + HEAD_DIM / 2u]));
-            }
-#pragma unroll
-            for (uint32_t step = HEAD_DIM / 4u; step > 0u; step >>= 1) {
-#pragma unroll
-                for (uint32_t i = 0; i < step; i++) a[i] = __fadd_rn(a[i], a[i + step]);
-            }
-            const float dot = a[0];
-            total += fmaxf(dot, 0.0f);
-        }
-        *dst = total / norm_divisor;
-    }
-}
-
 extern "C" int ds4_gpu_qwen4exp_qsa_indexer_scores_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
@@ -13190,17 +13129,6 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_scores_tensor(
         !glm53_cuda_tensor_has(q, (uint64_t)n_tokens * n_head * head_dim, sizeof(float)) ||
         !glm53_cuda_tensor_has(pool, (uint64_t)n_blocks * head_dim, sizeof(float))) {
         return 0;
-    }
-    if (n_tokens >= 8u && head_dim == 128u && n_head == 4u &&
-        getenv("DS4_QWEN4EXP_NO_IDX_TILE") == NULL) {
-        const dim3 grid((n_blocks + QWEN4EXP_IDX_TILE_B - 1u) / QWEN4EXP_IDX_TILE_B,
-                        (n_tokens + QWEN4EXP_IDX_TILE_T - 1u) / QWEN4EXP_IDX_TILE_T);
-        qwen4exp_qsa_indexer_scores_tiled_kernel<128u, 4u><<<grid, QWEN4EXP_IDX_THREADS, 0,
-            cuda_decode_stream()>>>(
-                (const float *)q->ptr, (const float *)pool->ptr,
-                (float *)scores->ptr, n_tokens, n_blocks, pos0, pool_size,
-                sqrtf((float)head_dim));
-        return cuda_ok(cudaGetLastError(), "Qwen4-Exp indexer scores tiled launch");
     }
     const uint32_t nth = qwen4exp_cuda_threads(head_dim);
     qwen4exp_qsa_indexer_scores_kernel<<<dim3(n_blocks, n_tokens), nth,
@@ -13860,15 +13788,112 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_tensor(
  * swallowed and reported as -1; the function never touches device state and is
  * called once, off the timed path. */
 extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
-    static char buf[384];
+    static char buf[512];
     static int built = 0;
     if (built) return buf;
     built = 1;
     buf[0] = '\0';
 
+    /* MAX-SHARED CARVEOUT ON THE COOP GATE/UP KERNEL, and the reason it is set
+     * HERE of all places.
+     *
+     * The bet: gu[] is a 256-thread block at reg=32 with 11,584 B of static
+     * shared, and both registers (65536/(32*256) = 8) and the 101,376 B opt-in
+     * ceiling (8.75) permit eight blocks, yet the occupancy API returns SIX.
+     * If the cause is a driver default carveout near 72 KiB then asking for the
+     * maximum takes it 6 -> 8 blocks on the kernel carrying ~26% of the decode
+     * round, and prior measurement on this same kernel puts a third of its
+     * residency at ~1.1% of decode.  If instead the SM caps at 1536 threads,
+     * six IS eight blocks' worth and this call cannot help; it then costs some
+     * L1, which is why thr/sm is published in the same submission -- the
+     * diagnostic that interprets the arm ships with the arm.  gu_occ below is
+     * queried AFTER this call, so the string reports the occupancy that the
+     * decode round will actually get rather than the default one.
+     *
+     * Placement is the load-bearing part.  cudaFuncSetAttribute is not a
+     * capture-legal operation, and the decode round is replayed from captured
+     * CUDA graphs, so calling it from the launch path risks poisoning a capture
+     * instead of merely being ineffective.  This function is called once from
+     * ds4_gpu_hw_limits, which ds4_resident invokes to build its hello ident
+     * BEFORE the socket binds -- no stream is capturing, and the attribute is
+     * persistent per function, so one call at startup covers every later
+     * launch.  It is also purely a scheduling hint: no operand, no order, no
+     * emitted byte changes, so bit-exactness is untouched by construction.
+     * The call form matches the two cudaFuncSetAttribute sites this file
+     * already has (:6882, :10159) exactly -- the kernel passed directly, not
+     * cast to const void *, so the same template overload resolves -- and the
+     * carveout value is a plain integer percentage rather than
+     * cudaSharedmemCarveoutMaxShared, so the ONLY new name the build sees is
+     * cudaFuncAttributePreferredSharedMemoryCarveout itself, a CUDA 9 enumerator
+     * that is not deprecated in 13.0.
+     * Failure is ignored on purpose: a driver that refuses simply keeps the
+     * default, which is the shipped behaviour. */
+    if (getenv("DS4_QWEN4EXP_NO_GU_CARVEOUT") == NULL) {
+        if (cudaFuncSetAttribute(
+                qwen4exp_moe_gateup_split_kernel<
+                    2, DS4_QWEN4EXP_TY_q4_K, true, QW_GU_COOP_ROWS, true>,
+                cudaFuncAttributePreferredSharedMemoryCarveout,
+                100) != cudaSuccess) {
+            (void)cudaGetLastError();
+        }
+    }
+
     int gu_regs = -1, gu_smem = -1, gu_lmem = -1, gu_maxt = -1;
     int gu_occ = -1, dn_occ = -1;
+    /* THE DISCRIMINATOR, and the reason it is worth two more fields.
+     *
+     * gu[] returns occ=6 at 256 threads where registers permit 8 and the
+     * 101,376 B opt-in ceiling permits 8.  Exactly two mechanisms produce 6, and
+     * NONE of the other twelve probes can tell them apart, because every one of
+     * them is register-bound and therefore consistent with either: dn 65536/
+     * (48*256) = 5.33, mm 65536/(128*128) = 4.0, md 65536/(77*128) = 6.6, pl2
+     * 65536/(51*320) = 4.01, gp 65536/(40*256) = 6.4.  gu is the only kernel
+     * whose registers are slack enough for the ceiling to show through.
+     *
+     * The two mechanisms separate on THREAD COUNT, which is the whole trick
+     * here.  Static shared memory is charged per BLOCK, so an occupancy capped
+     * by a shared-memory carveout does not move when the block shrinks -- 6
+     * blocks of 11,584 B is 6 whether each block has 256 threads or 64.  An
+     * occupancy capped by threads/SM scales as 1/threads: 1536/128 = 12 and
+     * 1536/64 = 24.  So query the SAME kernel at 128 and 64 threads and read:
+     *
+     *   occ128 == 6  and occ64 == 6   =>  shared memory binds (carveout ~72 KiB)
+     *   occ128 == 12 and occ64 >= 16  =>  threads/SM binds, and 6 IS the ceiling
+     *
+     * This is a strictly stronger instrument than thr/sm alone, because it also
+     * reports whether the carveout request above was actually honoured: if
+     * thr/sm says 2048 while gu_occ is still 6 and occ128 is 6, then shared
+     * memory binds AND the driver refused the request, which thr/sm cannot say.
+     * The kernel is never launched at these widths -- this is an occupancy query
+     * against a compiled function, so it costs one API call and no emitted byte. */
+    int gu_occ128 = -1, gu_occ64 = -1;
     int dn_regs = -1, dn_smem = -1, dn_lmem = -1, dn_maxt = -1;
+    /* The instantiation the decode round ACTUALLY launches.  Everything above
+     * reads <2, q8_0, Vector, Stage> -- but QWEN4EXP_DOWN_ASYNC launches
+     * <2, q8_0, true, true, TRUE>, a fifth template argument that turns on the
+     * cp.async panel fill.  A different template argument is a different
+     * compilation: dn[reg=48 occ=5] was never a reading of the running kernel,
+     * and every residency argument made about the down kernel -- 52% of the
+     * decode round's bytes -- rests on that reading.  occD is the same query at
+     * the real 10,880-byte dynamic panel rather than at 0. */
+    int dna_regs = -1, dna_lmem = -1, dna_occ = -1, dna_occd = -1;
+    /* THE R=4 STAGED DOWN KERNEL, and a correction to my own published note.
+     * I read the comment above this kernel as saying an R=4 staged variant needs
+     * FOUR live panels (21,760 B) and is therefore capped at 4 blocks instead of
+     * 8.  It says the opposite: the flat (slot, token) step sequence keeps only
+     * TWO panels live, and `four panels' describes the slot-granular design that
+     * was REJECTED.  The buffers are `spanel + ((step) & 1) * panel_bytes' and
+     * `((step + 1) & 1)' -- two, for any R -- and dn_shared is 2 * dn_panel
+     * regardless of tile.  So an R=4 staged kernel has the SAME 10,880-byte
+     * footprint, and the only thing that can cost it a block is register
+     * pressure from route[4]/acc[4] instead of route[2]/acc[2].  That is exactly
+     * what dn4 measures.  It matters because a single down tile for a three-row
+     * verify is the one arm on this engine still worth hundreds of bips:
+     * qwen4exp_moe_tile(3) returns 2, so dn_grid.y = 2 and the routed-MoE expert
+     * set -- 52% of the decode round -- streams TWICE to compute one extra row.
+     * dn4g is the R=4 generic path that is already instantiated, for contrast. */
+    int dn4_regs = -1, dn4_lmem = -1, dn4_occ = -1, dn4_occd = -1;
+    int dn4g_regs = -1, dn4g_lmem = -1, dn4g_occ = -1;
     /* The two PREFILL tile kernels, read here for the first time. */
     int mg_regs = -1, mg_smem = -1, mg_lmem = -1, mg_occ = -1;
     int md_regs = -1, md_smem = -1, md_lmem = -1, md_occ = -1;
@@ -13889,6 +13914,28 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
         (void)cudaGetLastError();
     }
 
+    {
+        int o = 0;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &o,
+                qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, true,
+                                                 QW_GU_COOP_ROWS, true>,
+                128, 0) == cudaSuccess) {
+            gu_occ128 = o;
+        } else {
+            (void)cudaGetLastError();
+        }
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &o,
+                qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, true,
+                                                 QW_GU_COOP_ROWS, true>,
+                64, 0) == cudaSuccess) {
+            gu_occ64 = o;
+        } else {
+            (void)cudaGetLastError();
+        }
+    }
+
     if (cudaFuncGetAttributes(
             &a,
             qwen4exp_moe_down_q_kernel<2, DS4_QWEN4EXP_TY_q8_0, true, true>) ==
@@ -13897,6 +13944,91 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
         dn_smem = (int)a.sharedSizeBytes;
         dn_lmem = (int)a.localSizeBytes;
         dn_maxt = a.maxThreadsPerBlock;
+    } else {
+        (void)cudaGetLastError();
+    }
+
+    /* The launched async down kernel, read for the first time.  Its own `occa`
+     * rather than the shared `occ` below, which is declared after this point. */
+    int occa = 0;
+    if (cudaFuncGetAttributes(
+            &a,
+            qwen4exp_moe_down_q_kernel<2, DS4_QWEN4EXP_TY_q8_0, true, true,
+                                       true>) == cudaSuccess) {
+        dna_regs = a.numRegs;
+        dna_lmem = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occa,
+            qwen4exp_moe_down_q_kernel<2, DS4_QWEN4EXP_TY_q8_0, true, true,
+                                       true>,
+            256, 0) == cudaSuccess) {
+        dna_occ = occa;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occa,
+            qwen4exp_moe_down_q_kernel<2, DS4_QWEN4EXP_TY_q8_0, true, true,
+                                       true>,
+            256, (size_t)10880u) == cudaSuccess) {
+        dna_occd = occa;
+    } else {
+        (void)cudaGetLastError();
+    }
+
+    /* R=4, staged, async: the instantiation the single-tile three-row verify
+     * would launch.  A new instantiation of an existing template -- the body is
+     * generic in R (route[R], acc[R], `for r < R' under #pragma unroll, and the
+     * panel index is (step & 1) with step = slot * take + r), with no
+     * static_assert and no R == 2 assumption anywhere -- so this compiles the
+     * same code with a different constant.  If dn4_occ matches dna_occ the
+     * footprint argument against a wide verify is gone entirely. */
+    if (cudaFuncGetAttributes(
+            &a,
+            qwen4exp_moe_down_q_kernel<4, DS4_QWEN4EXP_TY_q8_0, true, true,
+                                       true>) == cudaSuccess) {
+        dn4_regs = a.numRegs;
+        dn4_lmem = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occa,
+            qwen4exp_moe_down_q_kernel<4, DS4_QWEN4EXP_TY_q8_0, true, true,
+                                       true>,
+            256, 0) == cudaSuccess) {
+        dn4_occ = occa;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occa,
+            qwen4exp_moe_down_q_kernel<4, DS4_QWEN4EXP_TY_q8_0, true, true,
+                                       true>,
+            256, (size_t)10880u) == cudaSuccess) {
+        dn4_occd = occa;
+    } else {
+        (void)cudaGetLastError();
+    }
+    /* The R=4 path that ALREADY exists: QWEN4EXP_DOWN(4) at the tile == 4 arm,
+     * instantiated only as the generic <4, DT, false, false, false>.  It loses
+     * both the down-vector specialization and the panel staging, which is why
+     * simply making qwen4exp_moe_tile(3) return 4 is not the fix. */
+    if (cudaFuncGetAttributes(
+            &a, qwen4exp_moe_down_q_kernel<4, DS4_QWEN4EXP_TY_q8_0>) ==
+        cudaSuccess) {
+        dn4g_regs = a.numRegs;
+        dn4g_lmem = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occa, qwen4exp_moe_down_q_kernel<4, DS4_QWEN4EXP_TY_q8_0>, 256,
+            0) == cudaSuccess) {
+        dn4g_occ = occa;
     } else {
         (void)cudaGetLastError();
     }
@@ -14033,12 +14165,20 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
              "gu[reg=%d smem=%d lmem=%d maxt=%d occ=%d] dn[reg=%d smem=%d "
              "lmem=%d maxt=%d occ=%d] gdn[reg=%d lmem=%d] "
              "mm[reg=%d smem=%d lmem=%d occ=%d] "
-             "md[reg=%d smem=%d lmem=%d occ=%d]",
+             "md[reg=%d smem=%d lmem=%d occ=%d] "
+             "dna[reg=%d lmem=%d occ=%d occD=%d] "
+             "dn4[reg=%d lmem=%d occ=%d occD=%d] "
+             "dn4g[reg=%d lmem=%d occ=%d] "
+             "guT[occ128=%d occ64=%d]",
              gu_regs, gu_smem, gu_lmem, gu_maxt, gu_occ,
              dn_regs, dn_smem, dn_lmem, dn_maxt, dn_occ,
              gd_regs, gd_lmem,
              mg_regs, mg_smem, mg_lmem, mg_occ,
-             md_regs, md_smem, md_lmem, md_occ);
+             md_regs, md_smem, md_lmem, md_occ,
+             dna_regs, dna_lmem, dna_occ, dna_occd,
+             dn4_regs, dn4_lmem, dn4_occ, dn4_occd,
+             dn4g_regs, dn4g_lmem, dn4g_occ,
+             gu_occ128, gu_occ64);
     return buf;
 }
 
