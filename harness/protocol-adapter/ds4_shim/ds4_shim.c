@@ -142,7 +142,20 @@ ds4s_handle *ds4s_open(const char *model_path, const char *mtp_head_path,
      */
     if (getenv("DS4_SHIM_NO_WARMUP") == NULL) {
         const int vocab = ds4s_vocab_size(h);
-        enum { WARM_PROMPT = 1024, WARM_ROUNDS = 4, WARM_CAP = 8 };
+        /* WIDER THAN THE ONE THAT SHIPPED.  The decode graph cache needs each
+         * key visited TWICE before it replays (state 0 -> 1 eager, 1 -> 2
+         * capture), and a rejected draft round walks a different sequence from
+         * an accepted one; four rounds can see only one of them.  Counted with
+         * DS4_CUDA_DECODE_GRAPH_LOG on this tree, a phase captures five graphs
+         * -- four chunk islands plus block 48 -- and the warm-up's five are not
+         * reused, because the cache key carries the session pointer and the
+         * scored phase opens its own session.  So the graphs are not what this
+         * buys; the allocators, the cuBLAS workspaces and the module loads are.
+         * Ten rounds at 2048 tokens reach both the accepting and the rejecting
+         * path several times and put the KV and recurrent state at a length
+         * closer to the scored seed.  Still at boot, still before the socket
+         * binds, still discarded by the same invalidate. */
+        enum { WARM_PROMPT = 2048, WARM_ROUNDS = 10, WARM_CAP = 8 };
         if (vocab > 16) {
             int32_t *ids = (int32_t *)malloc((size_t)WARM_PROMPT * sizeof(*ids));
             if (ids) {
