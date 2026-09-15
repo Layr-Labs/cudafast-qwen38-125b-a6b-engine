@@ -19673,12 +19673,12 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
          * allocation.  The gate asks only for FOUR-byte alignment, because
          * four is all the funnel-shift decoder can observe; demanding sixteen
          * would let a merely word-aligned slab fall back silently and make the
-         * arm a no-op.  DS4_QWEN4EXP_NO_GDN_PANEL stands it down. */
+         * arm a no-op.  The panel is opt-in: DS4_QWEN4EXP_GDN_PANEL stands it up. */
         const size_t gdn_panel=(size_t)(256u/64u)*(size_t)blocks*34u+16u;
         const int gdn_stage =
             ((((uintptr_t)a.weights[0]|(uintptr_t)a.weights[1])&3u)==0u) &&
             gdn_panel<=49152u &&
-            getenv("DS4_QWEN4EXP_NO_GDN_PANEL")==NULL;
+            getenv("DS4_QWEN4EXP_GDN_PANEL")!=NULL;
         /* PDL consumer: the stream predecessor is the mixed-input quantizer,
          * which triggers at its top at these decode widths. */
         if (rows==1u) {
