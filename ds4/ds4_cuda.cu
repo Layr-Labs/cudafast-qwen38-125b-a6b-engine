@@ -17603,6 +17603,43 @@ static int cuda_matmul_q8_0_preq_rows_exact(
             } else {
                 DS4_Q8_DENSE_MMA_LAUNCH(2, 2, 2, 4, 8);
             }
+        } else if (n_rows <= 16u &&
+                   getenv("DS4_QWEN4EXP_NO_EH_TILE") == NULL) {
+            /* A DECODE-WIDTH TILE FOR A DECODE-WIDTH CALL.
+             *
+             * The arm below picks bm = WM * MT * 16 = 64 rows. The call this
+             * branch actually serves at the scored width is the MTP head's
+             * eh_proj, which is `n_tokens * n_hc` = 8 rows on every accepting
+             * round -- about 62% of rounds at the recorded 49 accepts of 78
+             * drafts. Eight rows into a 64-row tile is 56 of 64 M-rows of zero
+             * padding, and the grid is ceil(8/64) * ceil(5120/64) = 80 blocks
+             * on a 48-SM part: one wave, one block wide, almost all of it
+             * padding.
+             *
+             * bm cannot go below 16 (it is WM * MT * 16), but 16 halves the
+             * padding, and shrinking bn lengthens the grid instead of wasting
+             * it: WM=WN=MT=NT=1 gives bm 16, bn 8 and a grid of
+             * ceil(5120/8) = 640 one-warp blocks. The same bytes are read; they
+             * are read by eight times as many blocks.
+             *
+             * EXACTNESS is the file's own argument, stated a few lines above
+             * this branch: "The tile SHAPE does not enter the tile's
+             * arithmetic, so it is chosen for occupancy alone." Every output
+             * element is an independent accumulation over the same groups in
+             * the same ascending order; WM/WN/MT/NT decide only which elements
+             * a warp owns. This branch is the same template, the same G, the
+             * same kernel -- only the ownership map moves. That is why the
+             * dispatch above it ALREADY varies the shape with n_rows and
+             * out_dim.
+             *
+             * What is NOT exact, and is deliberately not done here: splitting
+             * the call into two four-row calls on the pair-lanes path. That is
+             * a different kernel with a different accumulation, and it has been
+             * measured to change the head's proposals.
+             *
+             * DS4_QWEN4EXP_NO_EH_TILE restores the 64-row tile in the same
+             * binary. */
+            DS4_Q8_DENSE_MMA_LAUNCH(1, 1, 1, 1, 4);
         } else if (n_rows <= 64u) {
             DS4_Q8_DENSE_MMA_LAUNCH(2, 2, 2, 4, 4);
         } else {
