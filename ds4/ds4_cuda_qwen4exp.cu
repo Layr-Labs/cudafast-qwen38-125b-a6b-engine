@@ -2410,6 +2410,16 @@ __global__ static void qwen4exp_router_select_topk_kernel(
         uint32_t n_expert,
         uint32_t n_expert_used,
         uint32_t n_tokens) {
+    /* PDL producer for the MoE grouping kernel, which is the next launch on
+     * the stream and whose first act is to read the `selected` list written
+     * here.  That grouping kernel is one block; this one is n_tokens blocks
+     * of one warp, so the deadlock rule (ds4_cuda_qwen4exp.cuh) is satisfied
+     * with room to spare at every width the grouping kernel's own gate
+     * (n_tokens < 8) admits -- and the gate below reads the grid in the body,
+     * not a convention at the launch site, so a prefill launch at a thousand
+     * rows never carries a live trigger.  A width with no PSS consumer behind
+     * it triggers into nothing. */
+    if (gridDim.x <= 7u) QWEN4EXP_PDL_TRIGGER();
     const uint32_t tok = blockIdx.x;
     if (tok >= n_tokens) return;
     const uint32_t lane = threadIdx.x;
@@ -2811,6 +2821,17 @@ __global__ static void qwen4exp_moe_group_small_kernel(
         uint32_t mid_token_stride) {
     __shared__ int32_t warp_count_prefix[QWEN4EXP_MOE_SCAN_THREADS / 32];
     __shared__ int32_t warp_live_prefix[QWEN4EXP_MOE_SCAN_THREADS / 32];
+    /* PDL consumer of the router's top-k, which triggers at its top.  This
+     * kernel is one 512-thread block and its very first global read is
+     * `selected`, the router's output, so there is no weight load to hoist
+     * above the fence and nothing moves: the fence sits at the top and the
+     * whole win is that this block is already resident when the router's
+     * warps retire, instead of costing a launch afterwards.  Every read below
+     * it is an activation read, per the header's rule, and none of this
+     * kernel's pointers carries __restrict__, so the .nc hazard does not
+     * apply.  Plainly launched -- at the prefill widths where the caller
+     * takes the wide grouping path instead -- the fence is a no-op. */
+    QWEN4EXP_PDL_SYNC();
     const uint32_t e = threadIdx.x;
     const uint32_t lane = e & 31u;
     const uint32_t warp = e >> 5u;
@@ -4606,6 +4627,29 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
         uint32_t mid_dim,
         uint32_t mid_token_stride,
         uint32_t n_expert_used) {
+    /* PDL consumer of the routed input quantizer, which is the previous launch
+     * on the stream and already triggers at decode widths -- its own comment
+     * says the trigger "fires into nothing" on the routed path because this
+     * kernel was launched plainly.  This closes that edge.
+     *
+     * The fence is the FIRST statement and nothing is hoisted above it.  That
+     * is deliberate: this kernel's weight addresses are themselves data
+     * dependent (`expert` comes from active[], and gate_row/up_row are built
+     * from it), so there is no weight load that COULD be issued above a fence
+     * here, and the whole gain is residency -- the blocks are already up and
+     * scheduled when the quantizer's last group retires, rather than paying a
+     * launch behind it.  Nothing this kernel already overlapped is displaced.
+     *
+     * None of the pointers above carries __restrict__, so the .nc rule
+     * (ds4_cuda_qwen4exp.cuh) needs no change here: no activation load can be
+     * hoisted above the fence as ld.global.nc.
+     *
+     * The deadlock rule constrains the PRODUCER, and the quantizer's own gate
+     * already bounds itself to one wave before it will trigger, so this
+     * grid -- which may be many waves -- is a safe dependent.  Launched
+     * plainly (verify at three rows and every prefill width, where the
+     * quantizer's gate declines to trigger) the fence is a no-op. */
+    QWEN4EXP_PDL_SYNC();
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t row = blockIdx.x * 8u + (threadIdx.x >> 5u);
     /* active[0] is how many experts this call actually chose; the launch
@@ -7293,8 +7337,13 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         n_tokens < 8u && n_total_expert <= QWEN4EXP_MOE_SCAN_THREADS &&
         getenv("DS4_QWEN4EXP_SERIAL_GROUP_SCAN") == NULL;
     if (small_group) {
-        qwen4exp_moe_group_small_kernel<<<
-                1, QWEN4EXP_MOE_SCAN_THREADS, 0, stream>>>(
+        /* PSS: the router's top-k is the stream predecessor and triggers at
+         * these widths (its gate is the same n_tokens < 8 this branch is), so
+         * this one block comes up while the router's warps are still retiring.
+         * The fence in the body carries the data edge. */
+        QWEN4EXP_LAUNCH_PDL(
+                qwen4exp_moe_group_small_kernel,
+                dim3(1u, 1u, 1u), QWEN4EXP_MOE_SCAN_THREADS, 0, stream,
                 sc.counts, sc.offsets, sc.cursor, sc.active, sc.pairs,
                 (float *)mid->ptr, (const int32_t *)selected->ptr,
                 n_total_expert, n_pairs, n_expert_used, mid_dim,
@@ -7380,15 +7429,33 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         : (n_pairs < n_total_expert ? n_pairs : n_total_expert);
     const int32_t *gu_active = compact ? sc.active : NULL;
     const dim3 gu_grid((mid_dim + 7u) / 8u, gu_rows, 1);
-#define QWEN4EXP_GATEUP_IMPL(R, GT, UT) \
-    qwen4exp_moe_gateup_q_kernel<R, GT, UT><<<gu_grid, threads, 0, stream>>>( \
-            (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum, \
-            sc.pairs, sc.counts, sc.offsets, gu_active, \
-            (const float *)weights->ptr, \
-            gate_slab->expert_bytes, gate_slab->row_bytes, \
-            up_slab->expert_bytes, up_slab->row_bytes, \
-            gate_slab->type, up_slab->type, xgroups, mid_dim, \
-            mid_token_stride, n_expert_used)
+/* PSS at the decode widths only, which is exactly where the routed input
+ * quantizer's own gate (gridDim.y <= 2) leaves a live trigger for this kernel
+ * to consume; verify at three rows and every prefill width keep the plain
+ * launch and the body's fence is a no-op there. */
+#define QWEN4EXP_GATEUP_IMPL(R, GT, UT) do { \
+    if (n_tokens <= 2u) { \
+        QWEN4EXP_LAUNCH_PDL( \
+                (qwen4exp_moe_gateup_q_kernel<R, GT, UT>), \
+                gu_grid, threads, 0, stream, \
+                (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum, \
+                sc.pairs, sc.counts, sc.offsets, gu_active, \
+                (const float *)weights->ptr, \
+                gate_slab->expert_bytes, gate_slab->row_bytes, \
+                up_slab->expert_bytes, up_slab->row_bytes, \
+                gate_slab->type, up_slab->type, xgroups, mid_dim, \
+                mid_token_stride, n_expert_used); \
+    } else { \
+        qwen4exp_moe_gateup_q_kernel<R, GT, UT><<<gu_grid, threads, 0, stream>>>( \
+                (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum, \
+                sc.pairs, sc.counts, sc.offsets, gu_active, \
+                (const float *)weights->ptr, \
+                gate_slab->expert_bytes, gate_slab->row_bytes, \
+                up_slab->expert_bytes, up_slab->row_bytes, \
+                gate_slab->type, up_slab->type, xgroups, mid_dim, \
+                mid_token_stride, n_expert_used); \
+    } \
+} while (0)
     /* Resolve the format once on the host, where tensor metadata already
      * lives.  This exposes fixed nibble decoding and a fixed one-half
      * accumulation to nvcc, without converting or copying any weight. */
