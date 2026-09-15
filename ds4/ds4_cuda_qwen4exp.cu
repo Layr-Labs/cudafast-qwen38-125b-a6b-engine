@@ -4708,7 +4708,8 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
  * almost nothing here and that residency is not this kernel's constraint
  * either.  If registers ever need to come down, it has to be by removing live
  * state at source. */
-template <int R, int DownType = -1, bool Vector = false, bool Stage = false>
+template <int R, int DownType = -1, bool Vector = false, bool Stage = false,
+          bool Async = false>
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
@@ -4793,18 +4794,34 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                     (uint64_t)row0 * down_row_bytes;
                 for (uint64_t o = (uint64_t)threadIdx.x * 16u;
                      o < panel_bytes; o += (uint64_t)blockDim.x * 16u) {
-                    *(uint4 *)(dst + o) = *(const uint4 *)(gp + o);
+                    if (Async) {
+                        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+                            :: "r"((uint32_t)__cvta_generic_to_shared(dst + o)),
+                               "l"(gp + o));
+                    } else {
+                        *(uint4 *)(dst + o) = *(const uint4 *)(gp + o);
+                    }
                 }
             }
         }
     };
-    if (Stage) qw_fill_step(0u, 0u, spanel);
+    if (Stage) {
+        qw_fill_step(0u, 0u, spanel);
+        if (Async) qw_cpasync_commit();
+    }
     for (uint32_t slot = 0; slot < n_expert_used; slot++) {
 #pragma unroll
         for (int r = 0; r < R; r++) {
             if ((uint32_t)r < take) {
                 const uint32_t step = slot * take + (uint32_t)r;
                 if (Stage) {
+                    /* Each lane waits for its own copies, then the block
+                     * publishes the complete panel. The other buffer's next
+                     * fill runs concurrently with this step's arithmetic.
+                     * The barrier also retires its previous readers before
+                     * that buffer is reused. Invalid routes commit an empty
+                     * group and still reach both fences. */
+                    if (Async) qw_cpasync_wait0();
                     __syncthreads();
                     const uint32_t nr =
                         (uint32_t)r + 1u < take ? (uint32_t)r + 1u : 0u;
@@ -4813,6 +4830,7 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                     if (nslot < n_expert_used) {
                         qw_fill_step(nslot, nr, spanel +
                                      (uint64_t)((step + 1u) & 1u) * panel_bytes);
+                        if (Async) qw_cpasync_commit();
                     }
                 }
                 const uint32_t t = tok0 + (uint32_t)r;
@@ -7493,6 +7511,13 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
             mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
 #define QWEN4EXP_DOWN_IMPL(R, DT, V) QWEN4EXP_DOWN_IMPL_S(R, DT, V, false, 0)
+#define QWEN4EXP_DOWN_ASYNC(DT) \
+    qwen4exp_moe_down_q_kernel<2, DT, true, true, true><<< \
+            dn_grid, threads, (size_t)dn_shared, stream>>>( \
+            (float *)out->ptr, down, (const int32_t *)selected->ptr, \
+            sc.mq, sc.ms, sc.msum, \
+            down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
+            mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
 #define QWEN4EXP_DOWN(R) do { \
     if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q5_1) { \
         QWEN4EXP_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q5_1, false); \
@@ -7571,14 +7596,18 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             dn_shared <= QW_DOWN_PANEL_MAX_BYTES &&
             getenv("DS4_QWEN4EXP_NO_DOWN_PANEL") == NULL;
         if (down_slab->type == DS4_QWEN4EXP_TY_q8_0) {
-            if (dn_stage) {
+            if (dn_stage && getenv("DS4_QWEN4EXP_NO_DOWN_ASYNC") == NULL) {
+                QWEN4EXP_DOWN_ASYNC(DS4_QWEN4EXP_TY_q8_0);
+            } else if (dn_stage) {
                 QWEN4EXP_DOWN_IMPL_S(2, DS4_QWEN4EXP_TY_q8_0, true, true,
                                      (size_t)dn_shared);
             } else {
                 QWEN4EXP_DOWN_IMPL(2, DS4_QWEN4EXP_TY_q8_0, true);
             }
         } else {
-            if (dn_stage) {
+            if (dn_stage && getenv("DS4_QWEN4EXP_NO_DOWN_ASYNC") == NULL) {
+                QWEN4EXP_DOWN_ASYNC(DS4_QWEN4EXP_TY_q5_1);
+            } else if (dn_stage) {
                 QWEN4EXP_DOWN_IMPL_S(2, DS4_QWEN4EXP_TY_q5_1, true, true,
                                      (size_t)dn_shared);
             } else {
@@ -7593,6 +7622,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
 #undef QWEN4EXP_DOWN
 #undef QWEN4EXP_DOWN_IMPL
 #undef QWEN4EXP_DOWN_IMPL_S
+#undef QWEN4EXP_DOWN_ASYNC
     return cuda_ok(cudaGetLastError(), "qwen4exp MoE down launch");
 }
 
