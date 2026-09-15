@@ -4280,7 +4280,28 @@ __device__ __forceinline__ static void qwen4exp_shared_vector_accumulate(
 #ifndef DS4_GATEUP_COOP_BUILD
 #define DS4_GATEUP_COOP_BUILD 1
 #endif
-#define QW_GU_COOP_ROWS 8u
+/* FOUR OUTPUT ROWS PER COOPERATIVE BLOCK, NOT EIGHT.
+ *
+ * This constant is both the block's output-row count and, through
+ * `P * 64u`, its thread count and its staged-panel size.  The engine's own
+ * kernel-limits probe reports the consequence on this part, and the two
+ * readings are from two builds of this same tree:
+ *     eight rows: gu[reg=32 smem=23168 lmem=0 maxt=1024 occ=3]
+ *     four  rows: gu[reg=32 smem=11584 lmem=0 maxt=1024 occ=6]
+ * At eight rows the block is 512 threads and the 1536-thread SM ceiling pins
+ * it to THREE blocks; halving the rows halves the threads and the panel and
+ * lands SIX.  Registers (32 * 256 = 8,192) and shared memory
+ * (101,376 / 11,584 = 8) are both slack at four; the thread ceiling is the
+ * whole binding constraint and it is the one this halves.
+ *
+ * The grid grows to match -- (mid_dim + P - 1) / P is 160 blocks at four
+ * instead of 80 at eight -- so the same warps do the same work, packed into
+ * narrower blocks that the scheduler can actually co-resident.
+ *
+ * Purely a packing change.  Each output row still walks its own weight row in
+ * the same group order through the same warp_sum_f32 tree, and every dot is
+ * bit-identical. */
+#define QW_GU_COOP_ROWS 2u
 #define QW_GU_COOP_ROW_U4 90u                /* 1440 B, ten q4_K super-blocks */
 #define QW_GU_COOP_GROUPS 80u                            /* in_dim 2560 / 32 */
 #define QW_GU_COOP_U4 (QW_GU_COOP_ROWS * QW_GU_COOP_ROW_U4)
