@@ -19122,7 +19122,22 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
     extern __shared__ uint4 qw_gdn_panel[];
     char *const gpanel = (char *)qw_gdn_panel;
     constexpr unsigned B=256u;
-    constexpr bool FloatFirst=true, Streaming=false;
+    /* STREAMING WEIGHT LOADS, now that the panel makes them worth marking.
+     *
+     * Every weight byte this kernel reads is read ONCE and never reused: the
+     * projection walks attn_qkv and attn_gate straight through, and the staged
+     * panel is written by the block, read by the block, and dies with it. Loads
+     * like that are exactly what __ldcs is for -- evict-first, so they do not
+     * displace the activations and the routing metadata that ARE reused.
+     *
+     * The flag has been here since before the panel, defaulted off. With the
+     * panel in place the case is stronger, not weaker: the fill pulls 10,880
+     * contiguous bytes per block that have no second reader anywhere.
+     *
+     * Exact: __ldcs is a cache-residency hint on the load, not a change of
+     * address, width or value. The same bytes arrive in the same registers in
+     * the same order. */
+    constexpr bool FloatFirst=true, Streaming=true;
     constexpr int C=2, U=10;
     const uint32_t split=(uint32_t)((a.od[0]+B/64u-1u)/(B/64u));
     const uint32_t qblocks=split+(uint32_t)((a.od[1]+B/64u-1u)/(B/64u));
