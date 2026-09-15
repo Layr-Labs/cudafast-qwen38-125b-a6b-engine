@@ -5783,6 +5783,19 @@ __global__ static void matmul_q8_0_preq_rows_exact_tile_kernel(
 /* Two adjacent lanes share a Q8 group. Their integer partials may be
  * combined freely; each even lane keeps its original float group chain.
  * Shared memory remaps the 32 finished chains onto one reduction warp. */
+
+/* MEASURED AND REVERTED, `bbf88254`. The cap took exactly as designed and
+ * bought nothing:
+ *
+ *   pl2[reg=48 smem=512 lmem=0 occ=5] pl1[reg=48 lmem=0 occ=5]
+ *   pls[reg=48 lmem=0 occ=5] pl4[reg=48 lmem=0 occ=5]
+ *
+ * 51 -> 48 registers, occupancy 4 -> 5 (+25% residency), zero spill on all four
+ * instantiations, on the kernel carrying 26% of the decode round's bytes -- and
+ * box-adjusted decode came back 2.247326 against 2.259112, i.e. -0.522%, which
+ * is at the bottom of the null-arm spread rather than above it. Residency is
+ * not this kernel's constraint either. Do not re-spend a draw here: 40 spills
+ * (`e49cd007`), 48 is a measured null, and granularity 8 leaves no other rung. */
 template <int R, bool Streaming = true>
 __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
         float *out, const unsigned char *w,
@@ -17380,13 +17393,103 @@ extern "C" void ds4_gpu_set_q8_mma_pipe_wide(int mode) {
  * per-SM shared memory size, so 101376 means a 100 KiB SM and 227328 means a
  * 228 KiB SM -- which is exactly the fork every occupancy argument about the
  * staged decode kernels turns on. */
+
+/* Defined below, next to the kernel it reads: qwen_gdn_projection_kernel is
+ * declared further down this unit, so the probe cannot sit inline here. */
+static const char *qw_gdn_proj_limits(void);
+static const char *qw_dense_proj_limits(void);
+
+/* READ-ONLY BANDWIDTH, AND THE COST OF READING IT OUT OF ORDER.
+ *
+ * Every note I have published on the achieved-bandwidth measurement has ended by
+ * asking someone with a GB10 and a profiler for read-only streaming bandwidth,
+ * because a cudaMemcpy moves read and write in equal parts and cannot give it.
+ * That was the wrong conclusion: the probe runs at startup, and nothing stops a
+ * startup path from launching a kernel of its own.  So measure it here.
+ *
+ * ONE kernel serves both readings, and the ONLY thing that differs between them
+ * is `perm'.  The buffer is walked in 2048-byte segments -- 128 threads x one
+ * uint4 each, so every segment is a single fully coalesced burst -- and segment
+ * `k' of the walk maps to physical segment (k * perm) & nseg_mask:
+ *
+ *   perm = 1      identity.  Block b takes segments b, b+gridDim, b+2*gridDim...
+ *                 so the gridDim blocks in flight are covering gridDim
+ *                 CONSECUTIVE segments: a clean streaming read.
+ *   perm = 40503  odd, so it is a bijection modulo a power-of-two nseg -- exactly
+ *                 the same segments, each exactly once, the same total bytes, the
+ *                 same coalescing inside each burst, but the segments in flight
+ *                 are scattered across the whole buffer instead of adjacent.
+ *
+ * Same bytes, same grid, same block, same instruction stream, one multiply
+ * different.  That isolates ACCESS ORDER from byte count, which matters because
+ * every byte-count argument on this benchmark is closed and the open question is
+ * whether the ~40% gap between decode's 141 GB/s and the measured ceiling is a
+ * shape cost.  Routed-MoE decode reads eight expert panels chosen per token: the
+ * reads inside a panel are contiguous, but the panels themselves land wherever
+ * routing sends them.  If a scattered walk over identical bytes costs nothing,
+ * that shape is free and the gap is arithmetic or latency; if it costs a lot, the
+ * gap is the gather itself and the arm is to restructure the routed read.
+ *
+ * `acc' is only stored under a value the buffer cannot contain (it is memset to
+ * zero), so the compiler must keep every load live -- it cannot know the
+ * contents -- while the kernel emits no write traffic to pollute a read
+ * measurement. */
+__global__ void ds4_hwprobe_read_kernel(const uint4 *__restrict__ src,
+                                        unsigned nseg,
+                                        unsigned nseg_mask,
+                                        unsigned perm,
+                                        unsigned *out) {
+    unsigned acc = 0u;
+    for (unsigned k = blockIdx.x; k < nseg; k += gridDim.x) {
+        const unsigned seg = (k * perm) & nseg_mask;
+        const uint4 v = src[(size_t)seg * 128u + threadIdx.x];
+        acc += v.x + v.y + v.z + v.w;
+    }
+    if (acc == 0xdeadbeefu) out[blockIdx.x] = acc;
+}
+
+/* The launch lives in its own function so that ds4_gpu_hw_limits' body contains
+ * no `<<<' and stays host-compilable by the gate rig, which is the only layer
+ * that resolves names and actually RUNS this logic.  384 blocks x 128 threads is
+ * 8 blocks per SM on a 48-SM part; the exact figure does not matter as long as
+ * both readings use the same one, which they do by construction. */
+static void ds4_hwprobe_read_launch(const void *src, unsigned nseg,
+                                    unsigned nseg_mask, unsigned perm,
+                                    void *out) {
+    ds4_hwprobe_read_kernel<<<384, 128>>>((const uint4 *)src, nseg, nseg_mask,
+                                          perm, (unsigned *)out);
+}
+
 extern "C" const char *ds4_gpu_hw_limits(void) {
     /* Sized for the device attributes plus the routed-MoE kernel-limits string,
      * which now carries the two prefill tiles as well.  Oversized on purpose:
      * ds4_resident drops the WHOLE limits string rather than truncating it if it
      * does not fit its own ident buffer, so a tight fit here loses the
      * measurement silently. */
-    static char buf[448];
+    /* 768, not 448: the qwen4exp string carries dna[], dn4[] and dn4g[], and
+     * this function now carries the four SM ceilings as well.  A truncated
+     * append is silently dropped by ds4_resident rather than shortened, so the
+     * whole limits string would vanish instead of losing its last field, which
+     * is why this is oversized rather than merely sufficient.  The real ceiling
+     * is not this buffer, it is ds4_resident's char ident_buf[768] built as
+     * "%s %s".  Measured on `a1e8fd52', not estimated: the full ident was 619
+     * bytes, a 129-byte prefix plus a 490-byte limits string, and `9f0f8c34'
+     * measured the full ident at 691 with the four SM ceilings and guT[] present.
+     * This submission REMOVES both (about 70 bytes) and adds l2= and d2d= (about
+     * 22), so the ident lands near 643 of 768.  Retiring an answered field to pay
+     * for a new one is the discipline this budget needs; the alternative is a
+     * silent drop of everything.
+     *
+     * That headroom is now the real budget for this whole diagnostic channel,
+     * and it is thinner than it looks.  The host-compiled L4 gate re-runs this
+     * function with EVERY field padded to its widest plausible width (six-digit
+     * byte counts, three-digit register counts, two-digit occupancies) and gets
+     * 772 of 768 -- an OVERFLOW, which ds4_resident answers by dropping the
+     * entire limits string rather than a field.  Real values are two and three
+     * digits wide so the shipped string is nowhere near that, but the next
+     * person to append here should shorten an existing field rather than assume
+     * the slack is free. */
+    static char buf[768];
     static int built = 0;
     if (built) return buf;
     built = 1;
@@ -17396,6 +17499,39 @@ extern "C" const char *ds4_gpu_hw_limits(void) {
         (void)cudaGetLastError();
         return buf;
     }
+    /* THE FOUR SM CEILINGS ARE ANSWERED, so they are no longer read here.
+     * `9f0f8c34' published them and they are permanent facts about this box:
+     *
+     *     thr/sm=1536  smem/sm=102400  reg/sm=65536  blk/sm=24
+     *
+     * The headline is that thr/sm is 1536, i.e. **48 warps/SM, not 64**.  Every
+     * occupancy argument in this tree assumed 2048 threads/SM -- "8 blocks of 256
+     * = 64 warps" is written into the staged down kernel's own design comment in
+     * as many words -- and it is wrong by 25%.  Worse, the register file is a
+     * TIGHTER ceiling still: 65536/48 = 1365 threads/SM, below the 1536 thread
+     * cap, so on this box registers usually bind before either.
+     *
+     * That closes the residency axis on hardware rather than on argument.  On the
+     * decode path gu[] is 6*256 = 1536 = 100% of the thread cap, gp[] is 6*256 =
+     * 1536, and dn[] is 5*256 = 1280, which is 94% of its own register-feasible
+     * 1365.  Narrowing dn's block cannot help: the register budget is 1365
+     * threads at ANY width (128 threads -> 10 blocks -> 1280 again), and reaching
+     * six blocks needs regs <= 42, where __maxnreg__(40) already measured -10.2%
+     * by rematerialization.  There is nothing left on this axis, and the four
+     * fields have done their job; they are dropped to buy ident budget for the
+     * measurement below, which is the one that is still open.
+     *
+     * l2= IS ALSO RETIRED NOW, and this one needs justifying because it was the
+     * number that decided whether the bandwidth figure below measures DRAM or L2.
+     * It read l2=25165824 -- 24 MiB -- on every box that has reported, and the
+     * 128 MiB probe buffer is 5.3x that, so the question it existed to answer is
+     * answered and recorded.  It is retired for the same reason d2dl2 and wr are:
+     * two new fields have to be PAID for out of a 768-byte ident that drops the
+     * entire limits string on overflow rather than truncating it, and an answered
+     * field cannot keep charging rent.  sm= and cc= stay, and they are the guard
+     * that makes this safe -- if the fleet ever put a different part under this
+     * benchmark those two would change, and the retired constants would have to be
+     * re-measured rather than assumed. */
     const cudaDeviceAttr want[6] = {
         cudaDevAttrMaxSharedMemoryPerBlockOptin,
         cudaDevAttrMultiProcessorCount,
@@ -17412,16 +17548,202 @@ extern "C" const char *ds4_gpu_hw_limits(void) {
             got[i] = -1;
         }
     }
+
+    /* ACHIEVED DEVICE MEMORY BANDWIDTH -- measured, 241 GB/s on `3eead664'.
+     *
+     * Every roofline claim in my notes had been retracted or corrected, three
+     * times, for one reason -- the denominator was ASSUMED (~273 GB/s from a
+     * public spec sheet) and never measured.  The decode round moves 6.58 GB in
+     * 46.51 ms = 141 GB/s, and that has been published as 18%, then 37%, then
+     * 47% of roofline as the assumed peak moved.  Those three numbers imply three
+     * completely different strategies: at 18% the engine is instruction-bound and
+     * load SHAPE is the lever; near the ceiling it is byte-bound and only byte
+     * REMOVAL pays.  I have spent draws on both premises.
+     *
+     * So measure it instead, with the two things that make this safe:
+     *
+     * (1) No new enum names.  I deliberately did NOT use
+     *     cudaDevAttrGlobalMemoryBusWidth / cudaDevAttrMemoryClockRate, which
+     *     would give a COMPUTED peak: clock-rate attributes have deprecation
+     *     history, and under a -Werror build the run fails and publishes nothing
+     *     at all.  A measurement you cannot retrieve is worth less than one you
+     *     can.  cudaMalloc/cudaMemcpy/cudaEvent* carry no such risk.  An achieved
+     *     figure is also the better number here: this is an INTEGRATED part
+     *     (integrated=1), where LPDDR peak and achievable differ substantially
+     *     and the spec-sheet figure is for the whole SoC, not this client.
+     *
+     * (2) It cannot touch a timed phase.  ds4_gpu_hw_limits is called once from
+     *     ds4_resident while it builds its hello ident, after the single model
+     *     load and BEFORE the socket binds, so no phase and no graph capture can
+     *     observe it.  The buffers are freed immediately.
+     *
+     * Sizing: 128 MiB per side, chosen against the L2 size published in the same
+     * string (l2=) rather than guessed -- a copy that fits in L2 measures L2, not
+     * DRAM, which is the classic way this microbenchmark lies.  Read+write both
+     * cross the bus, so the moved figure is 2x the buffer.  Five iterations, take
+     * the MINIMUM time (the maximum rate): a slow iteration means interference,
+     * and interference can only ever depress a bandwidth reading.
+     *
+     * Every failure path leaves the reading at -1 and changes nothing else.
+     *
+     * THE COPY-ENGINE CONTROL IS ANSWERED, so its field is retired here.
+     * `170bb1a9' shipped d2dl2, the same copy at 4 MiB per side -- 8 MiB of
+     * working set, inside 24 MiB of L2, so it never reaches DRAM after the warm
+     * copy.  The two hypotheses predicted different things and I wrote both
+     * branches down before reading the number: d2dl2 >> d2d means the 128 MiB
+     * copy really was DRAM-limited, d2dl2 ~= d2d means both are pinned by the DMA
+     * path and the memory ceiling is unknown and higher.  It read
+     * d2dl2=874 against d2d=242 -- 3.6x -- so the copy engine is NOT the limiter
+     * and 242 GB/s is the memory ceiling.  d2d also reproduced across boxes to
+     * 0.4% (241 on spark-1, 242 on spark-6).  Field retired; the answer is a
+     * permanent fact and the ident budget is better spent on the next question.
+     *
+     * THE DIRECTION CONTROL IS ALSO ANSWERED, so wr= is retired here too.
+     * `b118dd48' shipped wr=, a cudaMemset over the same 128 MiB: write-only, so
+     * one byte on the bus per buffer byte instead of two.  It read wr=204 against
+     * d2d=244 on the same box.  Work that through, because it says more than the
+     * three branches I pre-registered for it did.  A copy at 244 GB/s of bus
+     * traffic is 122 GB/s of reads AND 122 GB/s of writes.  Writes alone reach
+     * 204.  So inside the copy the write stream was running at 122 of its own 204
+     * ceiling -- NEITHER direction was individually saturated -- which means the
+     * 244 is a SHARED total, not a per-direction limit.  A read-only stream should
+     * therefore have the whole ~244 available to it, so 141/244 = 58% is roughly
+     * the real fraction and not the loose upper bound I had been warning about.
+     * d2d itself now reads 241 / 242 / 244 on spark-1 / spark-6 / spark-7: three
+     * boxes, 1.2% spread, which is what a hardware constant looks like.
+     *
+     * WHAT IS STILL OPEN, and what rd= and rdg= measure.  The above is an
+     * INFERENCE about read-only bandwidth, not a measurement of it, and every
+     * roofline number in this campaign that was inferred rather than measured has
+     * been retracted.  rd= measures it directly.  rdg= then asks the question that
+     * actually matters for finding an arm: the same bytes read out of ORDER.
+     *
+     *   rd ~= 244    =>  the shared-total reading is confirmed, read-only is not a
+     *                    privileged direction, and 58% is the fraction.  Together
+     *                    with the closed occupancy and byte-count axes this fixes
+     *                    the remaining headroom at ~42% and says it is spent
+     *                    inside the kernels, not on the bus.
+     *   rd >> 244    =>  reads ARE privileged, the true ceiling is higher, decode
+     *                    sits BELOW 58%, and the d2d denominator every note of
+     *                    mine has published is too small.  Retract the 58%.
+     *   rd << 244    =>  a hand-written streaming kernel cannot reach what the
+     *                    copy engine reaches; then 244 is not achievable by kernel
+     *                    code at all and the useful denominator for judging decode
+     *                    is rd, not d2d.  This would be the most consequential
+     *                    reading of the three, because every fraction I have
+     *                    published would be measured against the wrong ceiling.
+     *
+     *   rdg ~= rd    =>  DRAM does not care about order at 2 KiB granularity.  The
+     *                    routed gather's shape is FREE, and the ~42% gap is
+     *                    arithmetic or dependent-load latency inside the kernels.
+     *                    That kills the whole remaining "restructure the gather"
+     *                    family before I spend a draw on it.
+     *   rdg << rd    =>  page locality is worth real bandwidth, the routed gather
+     *                    is paying it, and restructuring the routed read is the
+     *                    first arm this campaign has had that is supported by a
+     *                    measurement rather than by a byte count.
+     *
+     * Both fields are written before the readings, as with d2dl2 and wr. */
+    int d2d_gbs = -1;
+    int rd_gbs = -1;
+    int rdg_gbs = -1;
+    {
+        const size_t bw_bytes = (size_t)128u * 1024u * 1024u;
+        /* 2048-byte segments; 128 MiB / 2048 = 65536, a power of two, which is
+         * what makes an odd multiplier a bijection over the segment index. */
+        const unsigned bw_nseg = (unsigned)(bw_bytes / 2048u);
+        /* op 0 = memcpy: 2 bytes on the bus per buffer byte (read + write).
+         * op 1 = read kernel, segments in order:      1 byte per buffer byte.
+         * op 2 = read kernel, segments permuted:      1 byte per buffer byte. */
+        const double bw_mult[3] = { 2.0, 1.0, 1.0 };
+        int *const bw_out[3] = { &d2d_gbs, &rd_gbs, &rdg_gbs };
+        for (int op = 0; op < 3; op++) {
+            void *da = NULL;
+            void *db = NULL;
+            if (cudaMalloc(&da, bw_bytes) == cudaSuccess &&
+                cudaMalloc(&db, bw_bytes) == cudaSuccess) {
+                cudaEvent_t e0;
+                cudaEvent_t e1;
+                if (cudaEventCreate(&e0) == cudaSuccess &&
+                    cudaEventCreate(&e1) == cudaSuccess) {
+                    double best_gbs = 0.0;
+                    /* Zero the source: the read kernel's store is guarded on a
+                     * value a zeroed buffer cannot produce, so this is what keeps
+                     * the read probe write-free. */
+                    (void)cudaMemset(da, 0, bw_bytes);
+                    (void)cudaDeviceSynchronize();
+                    /* it == -1 is an untimed warm pass of THIS op, so first-touch
+                     * page cost, lazy mapping and any kernel setup land outside the
+                     * measured iterations.  Running the op itself rather than a
+                     * stand-in memcpy is the point: a memcpy cannot warm a kernel. */
+                    for (int it = -1; it < 5; it++) {
+                        const int timed = (it >= 0);
+                        if (timed && cudaEventRecord(e0, 0) != cudaSuccess) break;
+                        if (op == 0) {
+                            if (cudaMemcpy(db, da, bw_bytes,
+                                           cudaMemcpyDeviceToDevice) != cudaSuccess) break;
+                        } else {
+                            ds4_hwprobe_read_launch(da, bw_nseg, bw_nseg - 1u,
+                                                    (op == 1) ? 1u : 40503u, db);
+                            if (cudaGetLastError() != cudaSuccess) break;
+                        }
+                        if (!timed) {
+                            if (cudaDeviceSynchronize() != cudaSuccess) break;
+                            continue;
+                        }
+                        if (cudaEventRecord(e1, 0) != cudaSuccess) break;
+                        if (cudaEventSynchronize(e1) != cudaSuccess) break;
+                        float ms = 0.0f;
+                        if (cudaEventElapsedTime(&ms, e0, e1) == cudaSuccess &&
+                            ms > 0.0f) {
+                            /* GB/s = (mult*bytes / 1e9) / (ms / 1e3)
+                             *      = mult*bytes/(1e6*ms) */
+                            const double gbs = bw_mult[op] * (double)bw_bytes /
+                                               (1.0e6 * (double)ms);
+                            if (gbs > best_gbs) best_gbs = gbs;
+                        }
+                    }
+                    if (best_gbs > 0.0) *bw_out[op] = (int)(best_gbs + 0.5);
+                    (void)cudaEventDestroy(e0);
+                    (void)cudaEventDestroy(e1);
+                }
+            }
+            if (da) (void)cudaFree(da);
+            if (db) (void)cudaFree(db);
+            (void)cudaGetLastError();
+        }
+    }
     int n = snprintf(buf, sizeof(buf),
-                     "smem/blk_optin=%d sm=%d cc=%d.%d integrated=%d coop=%d",
-                     got[0], got[1], got[2], got[3], got[4], got[5]);
+                     "smem/blk_optin=%d sm=%d cc=%d.%d integrated=%d coop=%d "
+                     "d2d=%d rd=%d rdg=%d",
+                     got[0], got[1], got[2], got[3], got[4], got[5],
+                     d2d_gbs, rd_gbs, rdg_gbs);
     if (n < 0) { buf[0] = '\0'; return buf; }
     /* The register/shared footprint of the two routed-MoE decode kernels, from
      * the translation unit that owns them.  Truncation is harmless: the string
      * is diagnostic only and snprintf keeps it terminated. */
     const char *kl = ds4_gpu_qwen4exp_kernel_limits();
     if (kl && kl[0] && (size_t)n + 2u < sizeof(buf)) {
-        snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", kl);
+        const int m = snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", kl);
+        if (m > 0 && (size_t)n + (size_t)m < sizeof(buf)) n += m;
+    }
+    /* The fused GDN projection kernel, which lives in THIS unit rather than the
+     * routed-MoE one and so was missing from the string entirely.  Same
+     * truncation reasoning as above; ~59 more characters against 448 here and
+     * 768 in ds4_resident's ident_buf, which currently carries ~361. */
+    const char *gp = qw_gdn_proj_limits();
+    if (gp && gp[0] && (size_t)n + 2u < sizeof(buf)) {
+        const int m = snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", gp);
+        if (m > 0 && (size_t)n + (size_t)m < sizeof(buf)) n += m;
+    }
+    /* And the dense Q8_0 projection workhorse, which carries the q/k/v/output and
+     * ssm_out projections -- ~26% of the decode round's bytes -- and is the last
+     * large decode kernel whose register footprint the string does not publish.
+     * `ee210c44` measured this string at 420 of ds4_resident's 768-byte ident_buf
+     * and 294 of the 448 here; this adds ~70 more to both. */
+    const char *dp = qw_dense_proj_limits();
+    if (dp && dp[0] && (size_t)n + 2u < sizeof(buf)) {
+        snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", dp);
     }
     return buf;
 }
@@ -19705,6 +20027,211 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
         if (!ds4_gpu_matmul_f32_decode_rows_exact_tensor(outs[i],maps[i],
                 sizes[i],offsets[i],in_dim,48u,x,rows)) return 0;
     return 1;
+}
+
+/* THE PRE-COMMITTED READOUT FOR QW_GDN_PROJ_ATTR, FINALLY WIRED UP.
+ *
+ * `b09acd9` ships `QW_GDN_PROJ_ATTR = __maxnreg__(40)` on
+ * qwen_gdn_projection_kernel -- the fused four-projection kernel, and therefore
+ * ~25% of the decode round's bytes.  The comment above that #define states a
+ * revert condition in advance, in its own words: "if the built library reports
+ * lmem != 0 for either R=2 instantiation, the cap spilled and this is reverted
+ * regardless of what the composite says."
+ *
+ * That condition was never testable.  engine_backend's `gdn[reg=... lmem=...]`
+ * is qwen4exp_gdn_octet_kernel -- a deliberate drift control, a DIFFERENT kernel
+ * in the OTHER translation unit -- and this kernel appears nowhere in the
+ * string.  ds4_gpu_hw_limits() sits ~1,700 lines above the template, and the
+ * routed-MoE probe that owns the reporting cannot see a static in this unit, so
+ * the check had no home.  The cap has been riding the frontier unverified.  This
+ * gives it one.
+ *
+ * Both R=2 instantiations are reported because the host chooses between them at
+ * run time on a weight-alignment and panel-size test (`gdn_stage`), so either
+ * one can be the launched kernel, and a spill in either fires the condition.
+ *
+ * occ for the staged arm is queried at the dynamic panel the decode launch
+ * actually requests -- (256/64) * blocks * 34 + 16 with blocks = in_dim/32 =
+ * 2560/32 = 80, so 10,896 B -- because querying it at 0, as the routed-MoE dn
+ * probe documents doing, would report a residency this arm never gets.  The
+ * plain arm requests no dynamic shared and is queried at 0.
+ *
+ * Diagnostic only, and off every timed path: ds4_gpu_hw_limits() is built once
+ * in ds4_resident before the socket binds, and its result travels in the hello
+ * identity.  No kernel, launch, or emitted value changes. */
+static const char *qw_gdn_proj_limits(void) {
+    static char out[96];
+    static int done = 0;
+    if (done) return out;
+    done = 1;
+    out[0] = '\0';
+    const size_t panel = (size_t)(256u / 64u) * (size_t)80u * (size_t)34u + 16u;
+    cudaFuncAttributes a;
+    int sreg = -1, ssmem = -1, slmem = -1, socc = -1;
+    int preg = -1, plmem = -1, pocc = -1;
+    if (cudaFuncGetAttributes(&a, qwen_gdn_projection_kernel<2, true>) ==
+        cudaSuccess) {
+        sreg = a.numRegs;
+        ssmem = (int)a.sharedSizeBytes;
+        slmem = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaFuncGetAttributes(&a, qwen_gdn_projection_kernel<2, false>) ==
+        cudaSuccess) {
+        preg = a.numRegs;
+        plmem = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    int o = 0;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &o, qwen_gdn_projection_kernel<2, true>, 256, panel) ==
+        cudaSuccess) {
+        socc = o;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &o, qwen_gdn_projection_kernel<2, false>, 256, 0) == cudaSuccess) {
+        pocc = o;
+    } else {
+        (void)cudaGetLastError();
+    }
+    snprintf(out, sizeof(out),
+             "gp[reg=%d smem=%d lmem=%d occ=%d] gpp[reg=%d lmem=%d occ=%d]",
+             sreg, ssmem, slmem, socc, preg, plmem, pocc);
+    return out;
+}
+
+/* THE DENSE Q8_0 PROJECTION WORKHORSE, WHICH NOTHING HAS EVER MEASURED.
+ *
+ * matmul_q8_0_preq_pair_lanes_kernel is what every dense projection in the
+ * decode round actually lands on: cuda_matmul_q8_0_preq_rows_exact routes
+ * n_rows <= 2 with out_dim > 512 here, which is ssm_out on all 36 GDN layers
+ * plus q, k, v and attn_output on all 12 QSA layers.  That is ~1.7 GB of the
+ * 6.58 GB round -- about 26%, second only to the routed MoE's 52%.
+ *
+ * It carries NO register attribute at all: no __maxnreg__, no
+ * __launch_bounds__.  Every other large decode kernel on this tip has had its
+ * footprint either published (`gu`, `dn`, `mm`, `md`, and `gp` as of
+ * `ee210c44`) or measured on real hardware by another solver.  This one has
+ * neither, so whether it is register-limited below the 1,536-thread ceiling is
+ * simply unknown -- and that is the one question that decides whether the
+ * __maxnreg__ lever, which is the only occupancy lever that has ever won on
+ * this engine, has anything left to win here.
+ *
+ * Three instantiations, all already present in the binary, so taking their
+ * addresses adds no code:
+ *   pl2 = <2,false>  the main decode path, 256 threads, no dynamic shared
+ *   pl1 = <1,false>  the one-row path (draft position 0 alone)
+ *   pls = <2,true>   the Streaming arm, taken by the HC up valve leg
+ *
+ * All three are queried at 256 threads and 0 dynamic shared, which is what
+ * their launches request; the kernel's reduction remap is static __shared__,
+ * so it is already inside sharedSizeBytes.
+ *
+ * How to read it, stated before the numbers exist so it cannot be
+ * rationalised afterwards.  At 256 threads the SM's 1,536-thread ceiling caps
+ * residency at 6 blocks, and 6 blocks needs reg <= 65536/(256*6) = 42, i.e.
+ * <= 40 at the granularity of 8 this engine allocates on:
+ *   - pl2[occ] = 6 already: no residency lever exists here.  Closed, and the
+ *     class is then closed engine-wide with this kernel included rather than
+ *     assumed.
+ *   - pl2[occ] < 6 with pl2[reg] > 40: a cap to 40 buys the missing blocks,
+ *     which is exactly the arm that won twice on the gate/up panel (47->40,
+ *     then 40->32) and is already shipped on the GDN projection kernel.  It
+ *     then has to be weighed against the spill risk, which pl2[lmem] and a
+ *     re-probe after capping would settle.
+ *   - pl2[occ] < 6 with pl2[reg] <= 40: shared memory binds, not registers,
+ *     and a register cap is the wrong tool.
+ *
+ * Diagnostic only, off every timed path, same as qw_gdn_proj_limits above:
+ * built once in ds4_resident before the socket binds, travelling in the hello
+ * identity.  No kernel, launch or emitted value changes. */
+static const char *qw_dense_proj_limits(void) {
+    static char out[192];
+    static int done = 0;
+    if (done) return out;
+    done = 1;
+    out[0] = '\0';
+    cudaFuncAttributes a;
+    int reg2 = -1, smem2 = -1, lmem2 = -1, occ2 = -1;
+    int reg1 = -1, lmem1 = -1, occ1 = -1;
+    int regs = -1, lmems = -1, occs = -1;
+    int reg4 = -1, lmem4 = -1, occ4 = -1;
+    int o = 0;
+    if (cudaFuncGetAttributes(
+                &a, matmul_q8_0_preq_pair_lanes_kernel<2, false>) ==
+        cudaSuccess) {
+        reg2 = a.numRegs;
+        smem2 = (int)a.sharedSizeBytes;
+        lmem2 = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &o, matmul_q8_0_preq_pair_lanes_kernel<2, false>, 256, 0) ==
+        cudaSuccess) {
+        occ2 = o;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaFuncGetAttributes(
+                &a, matmul_q8_0_preq_pair_lanes_kernel<1, false>) ==
+        cudaSuccess) {
+        reg1 = a.numRegs;
+        lmem1 = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &o, matmul_q8_0_preq_pair_lanes_kernel<1, false>, 256, 0) ==
+        cudaSuccess) {
+        occ1 = o;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaFuncGetAttributes(
+                &a, matmul_q8_0_preq_pair_lanes_kernel<2, true>) ==
+        cudaSuccess) {
+        regs = a.numRegs;
+        lmems = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &o, matmul_q8_0_preq_pair_lanes_kernel<2, true>, 256, 0) ==
+        cudaSuccess) {
+        occs = o;
+    } else {
+        (void)cudaGetLastError();
+    }
+    /* R=4 carries the three- and four-row verify tile.  It is reported because
+     * the cap is template-wide: a prior reading had it at reg=48 lmem=0 already,
+     * so a 48 cap should not bind it at all, and this proves that rather than
+     * trusting the stale number. */
+    if (cudaFuncGetAttributes(
+                &a, matmul_q8_0_preq_pair_lanes_kernel<4, false>) ==
+        cudaSuccess) {
+        reg4 = a.numRegs;
+        lmem4 = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &o, matmul_q8_0_preq_pair_lanes_kernel<4, false>, 256, 0) ==
+        cudaSuccess) {
+        occ4 = o;
+    } else {
+        (void)cudaGetLastError();
+    }
+    snprintf(out, sizeof(out),
+             "pl2[reg=%d smem=%d lmem=%d occ=%d] pl1[reg=%d lmem=%d occ=%d] "
+             "pls[reg=%d lmem=%d occ=%d] pl4[reg=%d lmem=%d occ=%d]",
+             reg2, smem2, lmem2, occ2, reg1, lmem1, occ1, regs, lmems, occs,
+             reg4, lmem4, occ4);
+    return out;
 }
 
 /* K/V blocks precede the large Q grid. Each output retains its original
