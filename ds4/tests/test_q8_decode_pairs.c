@@ -124,13 +124,14 @@ int main(void) {
     const uint64_t shapes[][3] = {
         {33, 37, 64}, {63, 19, 66}, {96, 515, 64}, {1056, 519, 66},
         {320, 10240, 64}, {320, 10240, 66}, {10240, 320, 64}, {10240, 320, 66},
-        {2560, 6144, 64},
-        {2560, 10240, 66}, {6144, 2560, 64}, {2560, 248320, 64},
+        {6144, 1024, 64}, {6144, 2560, 64}, {6144, 6144, 64},
+        {6144, 2560, 66}, {6144, 6145, 64},
+        {2560, 10240, 66}, {2560, 6144, 64}, {2560, 248320, 64},
     };
     for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++)
         check_shape(shapes[i][0], shapes[i][1], shapes[i][2]);
     if (saved) { setenv("DS4_QWEN4EXP_NO_ROW_TILE", saved, 1); free(saved); }
     else unsetenv("DS4_QWEN4EXP_NO_ROW_TILE");
-    puts("Q8 decode pairs: all 60 eager cases and 96 graph replays passed");
+    puts("Q8 decode pairs: all 80 eager cases and 128 graph replays passed");
     return 0;
 }

@@ -5907,6 +5907,107 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
     }
 }
 
+/* One output row per block, with two raw Q8_0 panels of 32 groups.
+ * The caller requires 192 groups and 16-byte aligned weight rows. Each panel
+ * keeps the shipped 34-byte group layout; no quantized value is changed.
+ * The two warps retain the original 32 float chains and reduction tree. */
+template <int R>
+__global__ static void matmul_q8_0_preq_panel_kernel(
+        float *out, const unsigned char *w,
+        const int8_t *xq, const float *xscale,
+        uint64_t out_dim, uint32_t n_rows, uint64_t blocks) {
+    (void)blocks;
+    constexpr uint32_t groups_total = 192u;
+    constexpr uint32_t panel_row_bytes = 32u * 34u;
+    constexpr uint32_t panel_bytes = panel_row_bytes;
+    extern __shared__ uint4 packed_panels[];
+    char *const panel = (char *)packed_panels;
+    const uint32_t local_lane = threadIdx.x & 63u;
+    const uint32_t group = local_lane >> 1u;
+    const uint32_t half = local_lane & 1u;
+    const uint64_t row = (uint64_t)blockIdx.x;
+    const uint32_t row0 = blockIdx.y * R;
+    const uint32_t take = n_rows - row0 < R ? n_rows - row0 : R;
+    const unsigned char *const wr = w + row * groups_total * 34u;
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) acc[r] = 0.0f;
+    auto fill = [&](uint32_t base, char *dst) {
+        const uint32_t count = groups_total - base < 32u
+            ? groups_total - base : 32u;
+        for (uint32_t i = local_lane; i < count * 34u / 16u; i += 64u) {
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+                :: "r"((uint32_t)__cvta_generic_to_shared(
+                    dst + i * 16u)),
+                   "l"(wr + base * 34u + i * 16u));
+        }
+        asm volatile("cp.async.commit_group;\n" ::);
+    };
+    fill(0u, panel);
+    /* Only immutable weight copies precede the producer dependency fence. */
+    QWEN4EXP_PDL_SYNC();
+#pragma unroll
+    for (uint32_t base = 0u; base < groups_total; base += 32u) {
+        asm volatile("cp.async.wait_group 0;\n" ::);
+        __syncthreads();
+        const uint32_t step = base / 32u;
+        if (base + 32u < groups_total)
+            fill(base + 32u, panel + ((step + 1u) & 1u) * panel_bytes);
+        const uint32_t b = base + group;
+        if (b < groups_total) {
+            const uint32_t remaining = groups_total - base - (group & 16u);
+            const uint32_t live_pairs = remaining < 16u ? remaining : 16u;
+            const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
+            const char *const blk = panel + (step & 1u) * panel_bytes +
+                group * 34u;
+            const int8_t *payload = (const int8_t *)(blk + 2u) + half * 16u;
+            const uintptr_t address = (uintptr_t)payload;
+            const uint32_t shift = (uint32_t)(address & 3u) * 8u;
+            const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
+            uint32_t previous = words[0];
+            int32_t wq[4];
+#pragma unroll
+            for (int j = 0; j < 3; j++) {
+                const uint32_t next = words[j + 1];
+                wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
+                previous = next;
+            }
+            const uint16_t last = *(const uint16_t *)(const void *)(payload + 14);
+            wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
+            const float ws = __half2float(*(const __half *)(const void *)blk);
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                if ((uint32_t)r < take) {
+                    const uint64_t at = ((uint64_t)row0 + r) * groups_total + b;
+                    const int32_t *xw = (const int32_t *)(xq + at * 32u + half * 16u);
+                    int dot = 0;
+#pragma unroll
+                    for (int j = 0; j < 4; j++) dot = __dp4a(wq[j], xw[j], dot);
+                    dot += __shfl_xor_sync(active, dot, 1);
+                    if (half == 0u) acc[r] += ws * xscale[at] * (float)dot;
+                }
+            }
+        }
+    }
+    __shared__ float upper[R][16];
+    if (half == 0u && local_lane >= 32u) {
+#pragma unroll
+        for (int r = 0; r < R; r++) upper[r][group - 16u] = acc[r];
+    }
+    __syncthreads();
+    if (local_lane < 32u && half == 0u) {
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            float total = acc[r] + upper[r][group];
+#pragma unroll
+            for (int d = 16; d >= 2; d >>= 1)
+                total += __shfl_down_sync(0x55555555u, total, d);
+            if (local_lane == 0u && row < out_dim && (uint32_t)r < take)
+                out[((uint64_t)row0 + r) * out_dim + row] = total;
+        }
+    }
+}
+
 /* HC down has only 320 outputs. Two lanes per group expose more integer
  * work while one 64-thread block owns each output. Retain all 32 original
  * float chains and their reduction tree; only the integer dot is split.
@@ -17678,6 +17779,24 @@ static int cuda_matmul_q8_0_preq_rows_exact(
                         out_dim, n_rows, blocks);
             }
         } else {
+            if (n_rows <= 2u && in_dim == 6144u && out_dim <= 6144u &&
+                (((uintptr_t)wptr & 15u) == 0u) &&
+                getenv("DS4_Q8_NO_DECODE_PANEL") == NULL) {
+                if (n_rows == 1u && getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL) {
+                    QWEN4EXP_LAUNCH_PDL((matmul_q8_0_preq_panel_kernel<1>),
+                        (dim3((unsigned)(out_dim), 1u, 1u)),
+                        64, 2176, cuda_decode_stream(),
+                        (float *)out->ptr, (const unsigned char *)wptr,
+                        xq, xscale, out_dim, n_rows, blocks);
+                } else {
+                    QWEN4EXP_LAUNCH_PDL((matmul_q8_0_preq_panel_kernel<2>),
+                        (dim3((unsigned)(out_dim), 1u, 1u)),
+                        64, 2176, cuda_decode_stream(),
+                        (float *)out->ptr, (const unsigned char *)wptr,
+                        xq, xscale, out_dim, n_rows, blocks);
+                }
+                return cuda_ok(cudaGetLastError(), "q8 decode panel launch");
+            }
             /* Retain the promoted call-width specialization for the
              * general dense projections. The HC warp geometry above is
              * independent of this two-warp kernel's token-row bound. */
