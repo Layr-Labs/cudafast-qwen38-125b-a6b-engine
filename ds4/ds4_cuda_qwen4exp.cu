@@ -4280,7 +4280,28 @@ __device__ __forceinline__ static void qwen4exp_shared_vector_accumulate(
 #ifndef DS4_GATEUP_COOP_BUILD
 #define DS4_GATEUP_COOP_BUILD 1
 #endif
-#define QW_GU_COOP_ROWS 8u
+/* FOUR OUTPUT ROWS PER COOPERATIVE BLOCK, NOT EIGHT.
+ *
+ * This constant is both the block's output-row count and, through
+ * `P * 64u`, its thread count and its staged-panel size.  The engine's own
+ * kernel-limits probe reports the consequence on this part, and the two
+ * readings are from two builds of this same tree:
+ *     eight rows: gu[reg=32 smem=23168 lmem=0 maxt=1024 occ=3]
+ *     four  rows: gu[reg=32 smem=11584 lmem=0 maxt=1024 occ=6]
+ * At eight rows the block is 512 threads and the 1536-thread SM ceiling pins
+ * it to THREE blocks; halving the rows halves the threads and the panel and
+ * lands SIX.  Registers (32 * 256 = 8,192) and shared memory
+ * (101,376 / 11,584 = 8) are both slack at four; the thread ceiling is the
+ * whole binding constraint and it is the one this halves.
+ *
+ * The grid grows to match -- (mid_dim + P - 1) / P is 160 blocks at four
+ * instead of 80 at eight -- so the same warps do the same work, packed into
+ * narrower blocks that the scheduler can actually co-resident.
+ *
+ * Purely a packing change.  Each output row still walks its own weight row in
+ * the same group order through the same warp_sum_f32 tree, and every dot is
+ * bit-identical. */
+#define QW_GU_COOP_ROWS 4u
 #define QW_GU_COOP_ROW_U4 90u                /* 1440 B, ten q4_K super-blocks */
 #define QW_GU_COOP_GROUPS 80u                            /* in_dim 2560 / 32 */
 #define QW_GU_COOP_U4 (QW_GU_COOP_ROWS * QW_GU_COOP_ROW_U4)
@@ -4477,11 +4498,25 @@ qwen4exp_moe_gateup_split_kernel(
         const char *const ub = up +
             (uint64_t)expert * up_expert_bytes +
             (uint64_t)row0 * up_row_bytes;
+        /* PARITY WITH THE REST OF THIS FILE'S STAGING.  The routed DOWN panel
+         * and the MMA tile both fill their shared staging with cp.async
+         * (LDGSTS, qw_cpasync16).  This panel did not: a global uint4 load into
+         * a register followed by a shared store, so every byte round-trips
+         * through the register file before the block's barrier can release.
+         *
+         * Same bytes, same source addresses, same destination slots, same
+         * order; only the transfer instruction changes.  .ca, not .cg, matching
+         * the policy the comment above this file's cp.async helper measured for
+         * the q4_K fetch map. */
         for (uint32_t i = threadIdx.x; i < words; i += blockDim.x) {
-            wcoop[i] = *(const uint4 *)(const void *)(gb + (uint64_t)i * 16u);
-            wcoop[QW_GU_COOP_U4 + i] =
-                *(const uint4 *)(const void *)(ub + (uint64_t)i * 16u);
+            qw_cpasync16((uint32_t)__cvta_generic_to_shared(&wcoop[i]),
+                         (const void *)(gb + (uint64_t)i * 16u));
+            qw_cpasync16((uint32_t)__cvta_generic_to_shared(
+                             &wcoop[QW_GU_COOP_U4 + i]),
+                         (const void *)(ub + (uint64_t)i * 16u));
         }
+        qw_cpasync_commit();
+        qw_cpasync_wait0();
         __syncthreads();
         wsh = wcoop + (second ? QW_GU_COOP_U4 : 0u);
         wrow = warp >> 1u;

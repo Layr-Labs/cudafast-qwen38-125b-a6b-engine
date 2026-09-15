@@ -922,7 +922,16 @@ static inline cublasHandle_t cuda_cublas_for_tier(int logical_tier) {
  * DS4_CUDA_DECODE_GRAPHS=0 (or off/no/false) disables everything. */
 #define CUDA_DECODE_GRAPH_LAYERS   64u
 #define CUDA_DECODE_GRAPH_ISLANDS   4u
-#define CUDA_DECODE_GRAPH_VARIANTS  4u
+/* EIGHT SLOTS, NOT FOUR.  The key is n_tokens | (spec_snapshot_rows << 8) and
+ * cuda_decode_graph_find() has NO eviction: when every slot of a
+ * (layer, island) row holds another key it returns NULL, begin() returns -1,
+ * and that island encodes EAGERLY FOR THE REST OF THE PROCESS -- permanently,
+ * per island, and silently. A speculative cycle reaches at least three values
+ * of that key, so four slots leaves one spare. Same keys, same graphs, same
+ * kernels in the same order; the cost is a memcmp over at most eight 48-byte
+ * keys off the device, and one more executable graph per row only if the run
+ * actually has a fifth shape -- which is the case this is for. */
+#define CUDA_DECODE_GRAPH_VARIANTS  8u
 
 /* Mirrors the public `struct ds4_decode_graph_key` decl in ds4_gpu.h
  * byte-for-byte (ds4_cuda.cu does not include that header; it carries
@@ -5914,7 +5923,34 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
 __global__ static void matmul_q8_hc_down_pair_kernel(
         float *out, const unsigned char *w, const int8_t *xq,
         const float *xs, uint32_t rows) {
-    constexpr unsigned L = 2u;
+    /* ONE LANE PER GROUP, NOT TWO.
+     *
+     * L splits one 32-element Q8 group's INTEGER dot across L lanes and
+     * combines the partials with __shfl_xor_sync.  At L = 1 there are no
+     * partials to combine: each lane owns a whole group, issues eight __dp4a
+     * and no shuffles, and the block is 32 threads -- ONE warp, so the
+     * __syncthreads() before the shared partial[] fold costs nothing because
+     * there is nothing to wait for.
+     *
+     * MEASURED, not argued.  The engine's own slice profiler at the two-row
+     * verify width, n=59 per arm, each arm normalised by the sum of the eight
+     * slices the change cannot touch (drift between the two runs was +0.06%,
+     * so this comparison needed almost none):
+     *     attn_mix  5.354 -> 5.190 ms   -3.12%
+     *     ffn_mix   5.547 -> 5.538 ms   -0.22%
+     * We went the OTHER way first and the same rig refused it: at L = 4, four
+     * warps a block, attn_mix +2.66% and ffn_mix +4.63% with `moe` and `head`
+     * flat as controls.  The barrier is what costs, exactly as this engine's
+     * own comment on the vector gate/up schedule says, and the direction that
+     * wins is FEWER warps behind it -- not more resident ones.
+     *
+     * NOTHING ARITHMETIC MOVES.  Integer addition is associative, so lane 0's
+     * int32 dot is the same at any L; only part == 0 touches the float chain
+     * and it walks b = group, group+32, ... in the same order; the cross-group
+     * reduction writes the same 32 partial[] values and folds them with the
+     * same warp tree, which never mentions L; and each lane reads
+     * payload + part * (32 / L), which at L = 1 is the payload itself. */
+    constexpr unsigned L = 1u;
     const unsigned group = threadIdx.x / L;
     const unsigned part = threadIdx.x % L;
     const uint64_t row = blockIdx.x;
@@ -17604,10 +17640,10 @@ static int cuda_matmul_q8_0_preq_rows_exact(
             /* Rows 0..1 as one pair call, row 2 as a one-row call on shifted
              * views.  The kernel's per-row arithmetic does not depend on
              * `rows`, so each row is the value a two-row call gives it. */
-            matmul_q8_hc_down_pair_kernel<<<320, 64, 0, cuda_decode_stream()>>>(
+            matmul_q8_hc_down_pair_kernel<<<320, 32, 0, cuda_decode_stream()>>>(
                     (float *)out->ptr, (const unsigned char *)wptr,
                     xq, xscale, 2u);
-            matmul_q8_hc_down_pair_kernel<<<320, 64, 0, cuda_decode_stream()>>>(
+            matmul_q8_hc_down_pair_kernel<<<320, 32, 0, cuda_decode_stream()>>>(
                     (float *)out->ptr + 2u * out_dim, (const unsigned char *)wptr,
                     xq + 2u * blocks * 32u, xscale + 2u * blocks, 1u);
             return cuda_ok(cudaGetLastError(), "q8 HC down pair launch (3 rows)");
@@ -17615,7 +17651,7 @@ static int cuda_matmul_q8_0_preq_rows_exact(
         /* PDL consumer: the stream predecessor is qwen4exp_hc_norm_quant,
          * which triggers at its top, and the kernel's weight-word prefetch
          * rides the norm's window (ds4_cuda_qwen4exp.cuh). */
-        QWEN4EXP_LAUNCH_PDL(matmul_q8_hc_down_pair_kernel, 320, 64, 0,
+        QWEN4EXP_LAUNCH_PDL(matmul_q8_hc_down_pair_kernel, 320, 32, 0,
                             cuda_decode_stream(),
                 (float *)out->ptr, (const unsigned char *)wptr,
                 xq, xscale, n_rows);
