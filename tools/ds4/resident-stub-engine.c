@@ -69,6 +69,11 @@ const char *ds4s_open_error(void) { return "stub-engine refused the open"; }
 
 const char *ds4s_last_error(const ds4s_handle *h) { return h && h->err[0] ? h->err : ""; }
 
+/* The real shim reports the device limits it read at open; a non-CUDA build
+ * reports none and the resident keeps its identity unchanged (ds4_resident.c).
+ * The stub is that non-CUDA build. */
+const char *ds4s_hw_limits(void) { return ""; }
+
 int ds4s_vocab_size(const ds4s_handle *h) { return h ? STUB_VOCAB : 0; }
 
 int32_t ds4s_eos_token(const ds4s_handle *h) { return h ? STUB_EOS : -1; }
