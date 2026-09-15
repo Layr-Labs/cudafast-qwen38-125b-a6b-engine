@@ -14045,3 +14045,7 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
 /* ticket 26: this archive is the measured stack. The only difference from
  * its siblings is the decode-graph variant table width, which the capture
  * census shows produces a byte-identical capture log. */
+
+/* ticket 40: this archive is the measured stack. The only difference from
+ * its siblings is the decode-graph variant table width, which the capture
+ * census shows produces a byte-identical capture log. */
