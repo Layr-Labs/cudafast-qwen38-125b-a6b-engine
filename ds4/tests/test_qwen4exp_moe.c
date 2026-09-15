@@ -2012,6 +2012,61 @@ static void run_production_expert_cases(void) {
                                        (uint64_t)PROD_TOKENS * PROD_OUT_DIM * sizeof(float)),
                    "production output read");
 
+        /* The asynchronous panel must match the synchronous panel byte for
+         * byte at both decode widths, including changed and invalid routes.
+         * Reusing the buffers catches stale-panel reads between calls. */
+        if (down_type == TYPE_Q8_0 || down_type == TYPE_Q5_1) {
+            const char *pin = getenv("DS4_QWEN4EXP_NO_DOWN_ASYNC");
+            char *saved = pin ? strdup(pin) : NULL;
+            require_ok(!pin || saved, "async panel environment save");
+            const size_t bytes = (size_t)PROD_TOKENS * PROD_OUT_DIM * sizeof(float);
+            float *panel_ref = malloc(bytes), *panel_got = malloc(bytes);
+            require_ok(panel_ref && panel_got, "async panel buffers");
+            for (unsigned mode = 0; mode < 3; mode++) {
+                int32_t routes[PROD_TOKENS * PROD_USED];
+                for (unsigned j = 0; j < PROD_TOKENS * PROD_USED; j++)
+                    routes[j] = mode == 0 ? selected[j]
+                        : selected[PROD_TOKENS * PROD_USED - 1u - j];
+                if (mode == 2) { routes[0] = -1; routes[PROD_USED] = PROD_EXPERTS; }
+                require_ok(ds4_gpu_tensor_write(selected_t, 0, routes, sizeof(routes)),
+                           "async panel route write");
+                for (unsigned width = 1; width <= 2; width++) {
+                    for (unsigned pass = 0; pass < 2; pass++) {
+                        require_ok((pass == 0
+                            ? setenv("DS4_QWEN4EXP_NO_DOWN_ASYNC", "1", 1)
+                            : unsetenv("DS4_QWEN4EXP_NO_DOWN_ASYNC")) == 0,
+                            "async panel dispatch switch");
+                        memset(panel_got, 0xab, bytes);
+                        require_ok(ds4_gpu_tensor_write(out_t, 0, panel_got, bytes),
+                                   "async panel output poison");
+                        require_ok(ds4_gpu_qwen4exp_routed_moe_tensor(
+                            out_t, mid_t, part_t, &gate_slab, &up_slab, &down_slab,
+                            PROD_IN_DIM, PROD_MID_DIM, PROD_OUT_DIM,
+                            selected_t, weights_t, PROD_EXPERTS, PROD_USED,
+                            x_t, width, PROD_USED * PROD_MID_DIM), "async panel MoE");
+                        require_ok(ds4_gpu_tensor_read(out_t, 0,
+                            pass == 0 ? panel_ref : panel_got, bytes), "async panel read");
+                    }
+                    require_ok(memcmp(panel_ref, panel_got, bytes) == 0,
+                               "async panel exact output and untouched tail");
+                }
+            }
+            require_ok(ds4_gpu_tensor_write(selected_t, 0, selected, sizeof(selected)),
+                       "async panel route restore");
+            require_ok((saved ? setenv("DS4_QWEN4EXP_NO_DOWN_ASYNC", saved, 1)
+                              : unsetenv("DS4_QWEN4EXP_NO_DOWN_ASYNC")) == 0,
+                       "async panel environment restore");
+            free(saved); free(panel_ref); free(panel_got);
+            printf("asynchronous down panel type %u: exact at widths 1/2, three route patterns\n",
+                   down_type);
+            /* Restore the live production output for the checks below. */
+            require_ok(ds4_gpu_qwen4exp_routed_moe_tensor(
+                out_t, mid_t, part_t, &gate_slab, &up_slab, &down_slab,
+                PROD_IN_DIM, PROD_MID_DIM, PROD_OUT_DIM,
+                selected_t, weights_t, PROD_EXPERTS, PROD_USED,
+                x_t, PROD_TOKENS, PROD_USED * PROD_MID_DIM), "async panel restore");
+        }
+
         /* Compare every intermediate and output against the former joint
          * gate/up projection, including the Q8 and Q5_1 down consumers.
          * Covers both the two-token verify path and, below, the one-token
