@@ -4564,21 +4564,60 @@ qwen4exp_moe_gateup_split_kernel(
             } while (0)
             uint32_t g = lane;
             for (; g + 32u < groups; g += 64u) {
-                uint32_t raw0[8];
-                uint32_t raw1[8];
-                const uint32_t *p0, *p1;
+                /* ONE GROUP IN FLIGHT WHEN THE SOURCE IS SHARED MEMORY.
+                 *
+                 * The two-in-flight pipeline below exists to hide GLOBAL load
+                 * latency: a routed expert row is read exactly once per call,
+                 * so on the !Coop path there is nothing to hit in cache and
+                 * reads-in-flight is the only lever.  The Coop path does not
+                 * have that problem.  Its weights were already staged into
+                 * `wcoop` by the whole block, so qw_gu_coop_raw_load is two
+                 * uint4 LDS reads -- tens of cycles, not hundreds -- and there
+                 * is no latency for a second group to cover.
+                 *
+                 * What the staging DOES cost on that path is registers, and
+                 * this kernel has none to spare: QW_GU_MAXNREG is a HARD
+                 * __maxnreg__(32) chosen to put four blocks on an SM with
+                 * literally zero slack in the register file.  raw0[8] plus
+                 * raw1[8] is 16 words, HALF the entire per-thread budget, and
+                 * raw1 stays live across the whole of the first group's
+                 * decode (wq[32] + wa/wb) and accumulate.  Under a hard cap
+                 * the compiler cannot pay that in registers, so it pays in
+                 * rematerialization, which lmem=0 does not show.
+                 *
+                 * The sensitivity is measured, not assumed: submission
+                 * 819034f7 added a single PDL fence at the top of this kernel
+                 * -- one fence's worth of live state -- and cost 0.436% of
+                 * box-adjusted decode (isolated against 75a7955c, which
+                 * carried the other edge of that draw and nothing here).  A
+                 * kernel that loses 0.436% to one fence is on a register
+                 * cliff, and cliffs are worth walking back up.
+                 *
+                 * Bit-exact by construction: the same two groups are decoded
+                 * in the same order, from the same shared words, into the same
+                 * acc[r] via the same accumulate and the same warp_sum_f32
+                 * tree.  Only the ISSUE POINT of the second LDS pair moves.
+                 * `raw` is reused only after the first group is fully
+                 * consumed.  The !Coop arm is unchanged byte for byte, and
+                 * `Coop` is a template parameter, so the arm not taken is
+                 * eliminated at compile time rather than branched on. */
                 if (Coop) {
-                    qw_gu_coop_raw_load(wsh, wrow, g, raw0);
-                    qw_gu_coop_raw_load(wsh, wrow, g + 32u, raw1);
-                    p0 = raw0; p1 = raw1;
+                    uint32_t raw[8];
+                    qw_gu_coop_raw_load(wsh, wrow, g, raw);
+                    QWEN4EXP_SPLIT_GROUP(g, raw);
+                    qw_gu_coop_raw_load(wsh, wrow, g + 32u, raw);
+                    QWEN4EXP_SPLIT_GROUP(g + 32u, raw);
                 } else {
+                    uint32_t raw0[8];
+                    uint32_t raw1[8];
+                    const uint32_t *p0, *p1;
                     p0 = qw_raw_load((uint32_t)Type, weight_row, g, raw0)
                        ? raw0 : NULL;
                     p1 = qw_raw_load((uint32_t)Type, weight_row, g + 32u, raw1)
                        ? raw1 : NULL;
+                    QWEN4EXP_SPLIT_GROUP(g, p0);
+                    QWEN4EXP_SPLIT_GROUP(g + 32u, p1);
                 }
-                QWEN4EXP_SPLIT_GROUP(g, p0);
-                QWEN4EXP_SPLIT_GROUP(g + 32u, p1);
             }
             for (; g < groups; g += 32u) {
                 uint32_t raw[8];
@@ -13088,92 +13127,6 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_pool_update_tensor(
             cache_cap, head_dim, pool_size, rot_dim, eps, weight_offset, NULL);
 }
 
-/* Tiled indexer scores for prefill widths.
- *
- * The per-pair kernel above launches one block per (indexer block, token):
- * at a 4096-row prefill over a 20480-token context that is 21 million
- * blocks of 128 threads, each doing four 128-wide dots and four block-wide
- * reductions.  The scores stage measured 69 ms per layer at 16k tokens for
- * about 21 GFLOP of work.  This kernel tiles the pairs instead: one block
- * takes QWEN4EXP_IDX_TILE_T tokens by QWEN4EXP_IDX_TILE_B indexer blocks,
- * stages the pool rows and the query rows in shared memory once, and each
- * thread owns one (token, block) pair.
- *
- * THE ARITHMETIC IS THE PER-PAIR KERNEL'S, BIT FOR BIT.  With head_dim 128
- * the per-pair kernel runs 128 threads, one product per lane, and reduces
- * with qwen4exp_blk_sum: lanes i and i+64 add, then i and i+32, then a warp
- * shuffle tree at 16, 8, 4, 2, 1.  The thread below forms the same 64 pair
- * sums, then the same halving tree, through __fmul_rn / __fadd_rn so the
- * compiler cannot contract a product into an add.  The relu, the head sum
- * order and the division are the same expressions.  The host wrapper only
- * takes this path at head_dim 128, four heads, and eight rows or more; the
- * decode and verify widths keep the per-pair kernel and their captured
- * graphs unchanged. */
-#define QWEN4EXP_IDX_TILE_T 8u
-#define QWEN4EXP_IDX_TILE_B 32u
-#define QWEN4EXP_IDX_KPAD   129u
-#define QWEN4EXP_IDX_THREADS 256u
-
-template <uint32_t HEAD_DIM, uint32_t N_HEAD>
-__global__ static void __launch_bounds__(QWEN4EXP_IDX_THREADS)
-qwen4exp_qsa_indexer_scores_tiled_kernel(
-        const float *q,
-        const float *pool,
-        float *scores,
-        uint32_t n_tokens,
-        uint32_t n_blocks,
-        uint32_t pos0,
-        uint32_t pool_size,
-        float norm_divisor) {
-    __shared__ float ks[QWEN4EXP_IDX_TILE_B * QWEN4EXP_IDX_KPAD];
-    __shared__ float qs[QWEN4EXP_IDX_TILE_T * N_HEAD * HEAD_DIM];
-    const uint32_t b0 = blockIdx.x * QWEN4EXP_IDX_TILE_B;
-    const uint32_t t0 = blockIdx.y * QWEN4EXP_IDX_TILE_T;
-    const uint32_t tid = threadIdx.x;
-    if (b0 >= n_blocks || t0 >= n_tokens) return;
-    const uint32_t nb = min(QWEN4EXP_IDX_TILE_B, n_blocks - b0);
-    const uint32_t nt = min(QWEN4EXP_IDX_TILE_T, n_tokens - t0);
-    for (uint32_t i = tid; i < nb * HEAD_DIM; i += QWEN4EXP_IDX_THREADS) {
-        const uint32_t bb = i / HEAD_DIM, d = i - bb * HEAD_DIM;
-        ks[bb * QWEN4EXP_IDX_KPAD + d] = pool[(uint64_t)(b0 + bb) * HEAD_DIM + d];
-    }
-    for (uint32_t i = tid; i < nt * N_HEAD * HEAD_DIM; i += QWEN4EXP_IDX_THREADS) {
-        qs[i] = q[(uint64_t)t0 * N_HEAD * HEAD_DIM + i];
-    }
-    __syncthreads();
-    for (uint32_t p = tid; p < nt * QWEN4EXP_IDX_TILE_B; p += QWEN4EXP_IDX_THREADS) {
-        const uint32_t tt = p / QWEN4EXP_IDX_TILE_B;
-        const uint32_t bb = p - tt * QWEN4EXP_IDX_TILE_B;
-        const uint32_t block = b0 + bb;
-        const uint32_t token = t0 + tt;
-        if (block >= n_blocks) continue;
-        float *dst = scores + (uint64_t)token * n_blocks + block;
-        uint32_t visible = (pos0 + token + 1u) / pool_size;
-        if (visible > n_blocks) visible = n_blocks;
-        if (block >= visible) { *dst = QWEN4EXP_QSA_MASKED_SCORE; continue; }
-        const float *k = ks + bb * QWEN4EXP_IDX_KPAD;
-        float total = 0.0f;
-#pragma unroll
-        for (uint32_t h = 0; h < N_HEAD; h++) {
-            const float *qh = qs + (tt * N_HEAD + h) * HEAD_DIM;
-            float a[HEAD_DIM / 2u];
-#pragma unroll
-            for (uint32_t i = 0; i < HEAD_DIM / 2u; i++) {
-                a[i] = __fadd_rn(__fmul_rn(qh[i], k[i]),
-                                 __fmul_rn(qh[i + HEAD_DIM / 2u], k[i + HEAD_DIM / 2u]));
-            }
-#pragma unroll
-            for (uint32_t step = HEAD_DIM / 4u; step > 0u; step >>= 1) {
-#pragma unroll
-                for (uint32_t i = 0; i < step; i++) a[i] = __fadd_rn(a[i], a[i + step]);
-            }
-            const float dot = a[0];
-            total += fmaxf(dot, 0.0f);
-        }
-        *dst = total / norm_divisor;
-    }
-}
-
 extern "C" int ds4_gpu_qwen4exp_qsa_indexer_scores_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
@@ -13190,17 +13143,6 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_scores_tensor(
         !glm53_cuda_tensor_has(q, (uint64_t)n_tokens * n_head * head_dim, sizeof(float)) ||
         !glm53_cuda_tensor_has(pool, (uint64_t)n_blocks * head_dim, sizeof(float))) {
         return 0;
-    }
-    if (n_tokens >= 8u && head_dim == 128u && n_head == 4u &&
-        getenv("DS4_QWEN4EXP_NO_IDX_TILE") == NULL) {
-        const dim3 grid((n_blocks + QWEN4EXP_IDX_TILE_B - 1u) / QWEN4EXP_IDX_TILE_B,
-                        (n_tokens + QWEN4EXP_IDX_TILE_T - 1u) / QWEN4EXP_IDX_TILE_T);
-        qwen4exp_qsa_indexer_scores_tiled_kernel<128u, 4u><<<grid, QWEN4EXP_IDX_THREADS, 0,
-            cuda_decode_stream()>>>(
-                (const float *)q->ptr, (const float *)pool->ptr,
-                (float *)scores->ptr, n_tokens, n_blocks, pos0, pool_size,
-                sqrtf((float)head_dim));
-        return cuda_ok(cudaGetLastError(), "Qwen4-Exp indexer scores tiled launch");
     }
     const uint32_t nth = qwen4exp_cuda_threads(head_dim);
     qwen4exp_qsa_indexer_scores_kernel<<<dim3(n_blocks, n_tokens), nth,
