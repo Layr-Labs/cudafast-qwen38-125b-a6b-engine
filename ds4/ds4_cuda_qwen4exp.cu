@@ -7394,20 +7394,6 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
                 sc.pairs, sc.cursor, (const int32_t *)selected->ptr,
                 n_total_expert, n_pairs);
     }
-    if (!small_group) {
-        qwen4exp_moe_zero_invalid_kernel<<<n_pairs, threads, 0, stream>>>(
-                (float *)mid->ptr, (const int32_t *)selected->ptr,
-                n_total_expert, n_expert_used, mid_dim, mid_token_stride,
-                n_pairs);
-    }
-    if (!cuda_ok(cudaGetLastError(), "qwen4exp MoE pair list")) return 0;
-
-    if (!qwen4exp_quantize_rows(sc.xq, sc.xs, sc.xsum, (const float *)x->ptr,
-                                n_tokens, in_dim, xgroups, in_dim, 0, 1,
-                                stream)) {
-        return 0;
-    }
-
     /* The tensor-core tile takes the gate and up projections when the shapes
      * divide it and neither type is Q6_K, whose scale changes inside a group.
      * DS4_QWEN4EXP_NO_MMA keeps the dp4a kernel for the comparison. */
@@ -7441,6 +7427,20 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
                          down_slab->type != (uint32_t)DS4_QWEN4EXP_TY_q6_K;
     const int moe_epilogue = down_mma &&
         getenv("DS4_QWEN4EXP_NO_MOE_EPILOGUE") == NULL;
+
+    if (!small_group && !moe_epilogue) {
+        qwen4exp_moe_zero_invalid_kernel<<<n_pairs, threads, 0, stream>>>(
+                (float *)mid->ptr, (const int32_t *)selected->ptr,
+                n_total_expert, n_expert_used, mid_dim, mid_token_stride,
+                n_pairs);
+    }
+    if (!cuda_ok(cudaGetLastError(), "qwen4exp MoE pair list")) return 0;
+
+    if (!qwen4exp_quantize_rows(sc.xq, sc.xs, sc.xsum, (const float *)x->ptr,
+                                n_tokens, in_dim, xgroups, in_dim, 0, 1,
+                                stream)) {
+        return 0;
+    }
 
     /* One block row per expert the call CHOSE, not per expert that exists.
      * n_pairs bounds the number of distinct experts, and the kernel exits the
