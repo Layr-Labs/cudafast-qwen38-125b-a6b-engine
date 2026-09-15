@@ -5914,7 +5914,38 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
 __global__ static void matmul_q8_hc_down_pair_kernel(
         float *out, const unsigned char *w, const int8_t *xq,
         const float *xs, uint32_t rows) {
-    constexpr unsigned L = 2u;
+    /* FOUR LANES PER GROUP, NOT TWO.
+     *
+     * This projection is 10240 -> 320 and the launch is one block per output
+     * row, so the grid is fixed at 320 blocks whatever we do.  At L = 2 that
+     * is 64 threads a block: 320 * 64 = 20,480 threads against a part that
+     * wants 73,728, and 320 / 48 = 6.67 blocks an SM at two warps each, so
+     * about thirteen of the forty-eight warp slots an SM can hold.  The slice
+     * profiler says what that costs: `attn_mix` and `ffn_mix` together are
+     * 10.4 ms of a 59 ms one-row forward -- 17.7%, more than the LM head --
+     * while moving 0.34 GB, which is 12% of this part's roofline.  The kernel
+     * is latency-bound with nothing queued behind it.
+     *
+     * L is already the knob for this: it splits one 32-element Q8 group's
+     * INTEGER dot across L lanes and combines the partials with
+     * __shfl_xor_sync.  Integer addition is associative, so those partials
+     * combine exactly; each group's float chain -- ws * xs[at] * (float)dot,
+     * accumulated over b = group, group+32, ... -- is untouched, and so is the
+     * cross-group reduction, which writes 32 `partial[group]` values and folds
+     * them with the same warp tree regardless of L.
+     *
+     * L = 4 is 128 threads a block: the same 320 blocks, four warps each,
+     * about 27 warp slots an SM instead of 13.  Each lane then decodes eight
+     * payload bytes instead of sixteen and issues two __dp4a and two shuffles
+     * instead of four and one -- more instructions, on a kernel whose problem
+     * is that it has nothing to overlap.
+     *
+     * L = 8 would fill the SM outright but triples the instruction count per
+     * group and reads six bytes per four useful ones at the aligned-word
+     * overlap.  Four is the balanced step and the one measured here.
+     *
+     * NOTHING ARITHMETIC MOVES: same addresses, same values, same float order. */
+    constexpr unsigned L = 4u;
     const unsigned group = threadIdx.x / L;
     const unsigned part = threadIdx.x % L;
     const uint64_t row = blockIdx.x;
@@ -17604,10 +17635,10 @@ static int cuda_matmul_q8_0_preq_rows_exact(
             /* Rows 0..1 as one pair call, row 2 as a one-row call on shifted
              * views.  The kernel's per-row arithmetic does not depend on
              * `rows`, so each row is the value a two-row call gives it. */
-            matmul_q8_hc_down_pair_kernel<<<320, 64, 0, cuda_decode_stream()>>>(
+            matmul_q8_hc_down_pair_kernel<<<320, 128, 0, cuda_decode_stream()>>>(
                     (float *)out->ptr, (const unsigned char *)wptr,
                     xq, xscale, 2u);
-            matmul_q8_hc_down_pair_kernel<<<320, 64, 0, cuda_decode_stream()>>>(
+            matmul_q8_hc_down_pair_kernel<<<320, 128, 0, cuda_decode_stream()>>>(
                     (float *)out->ptr + 2u * out_dim, (const unsigned char *)wptr,
                     xq + 2u * blocks * 32u, xscale + 2u * blocks, 1u);
             return cuda_ok(cudaGetLastError(), "q8 HC down pair launch (3 rows)");
@@ -17615,7 +17646,7 @@ static int cuda_matmul_q8_0_preq_rows_exact(
         /* PDL consumer: the stream predecessor is qwen4exp_hc_norm_quant,
          * which triggers at its top, and the kernel's weight-word prefetch
          * rides the norm's window (ds4_cuda_qwen4exp.cuh). */
-        QWEN4EXP_LAUNCH_PDL(matmul_q8_hc_down_pair_kernel, 320, 64, 0,
+        QWEN4EXP_LAUNCH_PDL(matmul_q8_hc_down_pair_kernel, 320, 128, 0,
                             cuda_decode_stream(),
                 (float *)out->ptr, (const unsigned char *)wptr,
                 xq, xscale, n_rows);
