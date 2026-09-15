@@ -1457,10 +1457,10 @@ static bool qw_gdn_out_q8_on(void) {
  * Q prep stores no gate copy (DS4_QWEN4EXP_NO_QSA_GATE_INPLACE=1 restores the
  * copy).  The prep site and the gate site both ask these, so they agree. */
 static bool qw_qsa_gate_q8(uint32_t n_tokens, uint32_t q_width) {
+    (void)n_tokens;
     static int on = -1;
     if (on < 0) on = getenv("DS4_QWEN4EXP_NO_QSA_GATE_QUANT") == NULL ? 1 : 0;
-    return n_tokens >= QW_GDN_OUT_Q8_MIN_TOKENS &&
-           (uint64_t)q_width == g_ds4_qwen4exp.gdn_inner &&
+    return (uint64_t)q_width == g_ds4_qwen4exp.gdn_inner &&
            (on != 0);
 }
 
@@ -1543,10 +1543,9 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
     const ds4_gpu_qwen4exp_slab dt_bias_slab = QW_SLAB(m, l->ssm_dt_bias);
     const ds4_gpu_qwen4exp_slab ssm_norm_slab = QW_SLAB(m, l->ssm_norm);
 
-    /* At prefill width the norm writes the Q8_0 the ssm_out projection reads,
-     * in the layout and at the scale offset the projection's own quantize
-     * would have used for these rows. */
-    const bool out_q8 = n_tokens >= QW_GDN_OUT_Q8_MIN_TOKENS && qw_gdn_out_q8_on();
+    /* The norm writes the Q8_0 the ssm_out projection reads, in the layout
+     * and at the scale offset the projection's own quantize would have used. */
+    const bool out_q8 = qw_gdn_out_q8_on();
     const uint64_t out_q8_blocks = (uint64_t)cfg->gdn_inner / 32u;
     const uint64_t out_q8_soff =
         ((uint64_t)n_tokens * out_q8_blocks * 32u + 15u) & ~15ull;
@@ -1557,14 +1556,15 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
     const bool adopt_width = s->d_adopt != NULL &&
         n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT;
     const int rc = adopt_width
-        ? ds4_gpu_qwen4exp_gdn_adopt(
+        ? ds4_gpu_qwen4exp_gdn_adopt_q8(
               s->gdn_out, s->gdn_conv[il], s->gdn_state[il],
               s->gdn_conv_snapshot[il], s->gdn_state_snapshot[il],
               s->spec_snapshot_rows, s->d_adopt, s->gdn_qkv,
               s->gdn_alpha, s->gdn_beta, s->gdn_gate,
               &conv_slab, &a_log_slab, &dt_bias_slab, &ssm_norm_slab,
               DS4_N_GDN_KEY_HEAD, DS4_N_GDN_VALUE_HEAD, n_tokens,
-              DS4_QWEN4EXP_GDN_HEADS_TILED, DS4_RMS_EPS, DS4_RMS_EPS)
+              DS4_QWEN4EXP_GDN_HEADS_TILED, DS4_RMS_EPS, DS4_RMS_EPS,
+              out_q8 ? s->gdn_out_q8 : NULL, 0u, out_q8_soff)
         : (n_tokens > 1u)
         ? ds4_gpu_qwen4exp_gdn_prefill_q8(
               s->gdn_out, s->gdn_conv[il], s->gdn_state[il],
@@ -1575,12 +1575,13 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
               DS4_N_GDN_KEY_HEAD, DS4_N_GDN_VALUE_HEAD, n_tokens,
               DS4_QWEN4EXP_GDN_HEADS_TILED, DS4_RMS_EPS, DS4_RMS_EPS,
               out_q8 ? s->gdn_out_q8 : NULL, 0u, out_q8_soff)
-        : ds4_gpu_qwen4exp_gdn_decode(
+        : ds4_gpu_qwen4exp_gdn_decode_q8(
               s->gdn_out, s->gdn_conv[il], s->gdn_state[il], s->gdn_qkv,
               s->gdn_alpha, s->gdn_beta, s->gdn_gate,
               &conv_slab, &a_log_slab, &dt_bias_slab, &ssm_norm_slab,
               DS4_N_GDN_KEY_HEAD, DS4_N_GDN_VALUE_HEAD, 1u,
-              DS4_QWEN4EXP_GDN_HEADS_TILED, DS4_RMS_EPS, DS4_RMS_EPS);
+              DS4_QWEN4EXP_GDN_HEADS_TILED, DS4_RMS_EPS, DS4_RMS_EPS,
+              out_q8 ? s->gdn_out_q8 : NULL, 0u, out_q8_soff);
     if (!rc) {
         fprintf(stderr, "ds4: qwen4exp GDN block %u refused\n", il);
         return false;
