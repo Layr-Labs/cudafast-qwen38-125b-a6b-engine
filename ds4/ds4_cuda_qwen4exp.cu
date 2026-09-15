@@ -1455,7 +1455,10 @@ static int qwen4exp_cuda_gdn_run(
                     state_snapshot ? (float *)state_snapshot->ptr : NULL,
                     n_key_head, n_value_head, n_rows, n_tokens, head_layout,
                     n_snapshot_rows,
-                    getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
+                    /* plain stores: the rollback snapshot is read only on a rejected
+                     * draft and is overwritten at the same address next round, so an
+                     * evict-first store buys cache hygiene with guaranteed DRAM
+                     * traffic. */ 1u);
         } else if (getenv("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE") == NULL &&
             getenv("DS4_QWEN4EXP_NO_GDN_SPLIT_REDUCE") == NULL) {
             qwen4exp_gdn_split_reduce_kernel<<<
@@ -1466,7 +1469,10 @@ static int qwen4exp_cuda_gdn_run(
                     state_snapshot ? (float *)state_snapshot->ptr : NULL,
                     n_key_head, n_value_head, n_rows, n_tokens, head_layout,
                     n_snapshot_rows,
-                    getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
+                    /* plain stores: the rollback snapshot is read only on a rejected
+                     * draft and is overwritten at the same address next round, so an
+                     * evict-first store buys cache hygiene with guaranteed DRAM
+                     * traffic. */ 1u);
         } else if (n_key_head == 16u && n_value_head == 48u &&
             getenv("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE") == NULL) {
             if (getenv("DS4_QWEN4EXP_NO_GDN_VALUE_VECTOR") == NULL) {
@@ -1479,7 +1485,10 @@ static int qwen4exp_cuda_gdn_run(
                         state_snapshot ? (float *)state_snapshot->ptr : NULL,
                         n_key_head, n_value_head, n_rows, n_tokens, head_layout,
                         n_snapshot_rows,
-                        getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
+                        /* plain stores: the rollback snapshot is read only on a rejected
+                     * draft and is overwritten at the same address next round, so an
+                     * evict-first store buys cache hygiene with guaranteed DRAM
+                     * traffic. */ 1u);
             } else {
                 qwen4exp_gdn_value_reuse_kernel<4u><<<
                         dim3(n_value_head, QWEN4EXP_GDN_DIM / 16u, n_rows), QWEN4EXP_GDN_DIM, 0, stream>>>(
@@ -1490,7 +1499,10 @@ static int qwen4exp_cuda_gdn_run(
                         state_snapshot ? (float *)state_snapshot->ptr : NULL,
                         n_key_head, n_value_head, n_rows, n_tokens, head_layout,
                         n_snapshot_rows,
-                        getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
+                        /* plain stores: the rollback snapshot is read only on a rejected
+                     * draft and is overwritten at the same address next round, so an
+                     * evict-first store buys cache hygiene with guaranteed DRAM
+                     * traffic. */ 1u);
             }
         } else {
             qwen4exp_gdn_recurrence_kernel<true><<<
@@ -4280,7 +4292,28 @@ __device__ __forceinline__ static void qwen4exp_shared_vector_accumulate(
 #ifndef DS4_GATEUP_COOP_BUILD
 #define DS4_GATEUP_COOP_BUILD 1
 #endif
-#define QW_GU_COOP_ROWS 8u
+/* FOUR OUTPUT ROWS PER COOPERATIVE BLOCK, NOT EIGHT.
+ *
+ * This constant is both the block's output-row count and, through
+ * `P * 64u`, its thread count and its staged-panel size.  The engine's own
+ * kernel-limits probe reports the consequence on this part, and the two
+ * readings are from two builds of this same tree:
+ *     eight rows: gu[reg=32 smem=23168 lmem=0 maxt=1024 occ=3]
+ *     four  rows: gu[reg=32 smem=11584 lmem=0 maxt=1024 occ=6]
+ * At eight rows the block is 512 threads and the 1536-thread SM ceiling pins
+ * it to THREE blocks; halving the rows halves the threads and the panel and
+ * lands SIX.  Registers (32 * 256 = 8,192) and shared memory
+ * (101,376 / 11,584 = 8) are both slack at four; the thread ceiling is the
+ * whole binding constraint and it is the one this halves.
+ *
+ * The grid grows to match -- (mid_dim + P - 1) / P is 160 blocks at four
+ * instead of 80 at eight -- so the same warps do the same work, packed into
+ * narrower blocks that the scheduler can actually co-resident.
+ *
+ * Purely a packing change.  Each output row still walks its own weight row in
+ * the same group order through the same warp_sum_f32 tree, and every dot is
+ * bit-identical. */
+#define QW_GU_COOP_ROWS 4u
 #define QW_GU_COOP_ROW_U4 90u                /* 1440 B, ten q4_K super-blocks */
 #define QW_GU_COOP_GROUPS 80u                            /* in_dim 2560 / 32 */
 #define QW_GU_COOP_U4 (QW_GU_COOP_ROWS * QW_GU_COOP_ROW_U4)

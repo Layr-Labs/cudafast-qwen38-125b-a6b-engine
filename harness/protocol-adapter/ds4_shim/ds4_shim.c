@@ -142,7 +142,7 @@ ds4s_handle *ds4s_open(const char *model_path, const char *mtp_head_path,
      */
     if (getenv("DS4_SHIM_NO_WARMUP") == NULL) {
         const int vocab = ds4s_vocab_size(h);
-        enum { WARM_PROMPT = 1024, WARM_ROUNDS = 4, WARM_CAP = 8 };
+        enum { WARM_PROMPT = 1024, WARM_ROUNDS = 6, WARM_CAP = 8 };
         if (vocab > 16) {
             int32_t *ids = (int32_t *)malloc((size_t)WARM_PROMPT * sizeof(*ids));
             if (ids) {
