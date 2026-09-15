@@ -17380,6 +17380,11 @@ extern "C" void ds4_gpu_set_q8_mma_pipe_wide(int mode) {
  * per-SM shared memory size, so 101376 means a 100 KiB SM and 227328 means a
  * 228 KiB SM -- which is exactly the fork every occupancy argument about the
  * staged decode kernels turns on. */
+
+/* Defined below, next to the kernel it reads: qwen_gdn_projection_kernel is
+ * declared further down this unit, so the probe cannot sit inline here. */
+static const char *qw_gdn_proj_limits(void);
+
 extern "C" const char *ds4_gpu_hw_limits(void) {
     /* Sized for the device attributes plus the routed-MoE kernel-limits string,
      * which now carries the two prefill tiles as well.  Oversized on purpose:
@@ -17421,7 +17426,16 @@ extern "C" const char *ds4_gpu_hw_limits(void) {
      * is diagnostic only and snprintf keeps it terminated. */
     const char *kl = ds4_gpu_qwen4exp_kernel_limits();
     if (kl && kl[0] && (size_t)n + 2u < sizeof(buf)) {
-        snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", kl);
+        const int m = snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", kl);
+        if (m > 0 && (size_t)n + (size_t)m < sizeof(buf)) n += m;
+    }
+    /* The fused GDN projection kernel, which lives in THIS unit rather than the
+     * routed-MoE one and so was missing from the string entirely.  Same
+     * truncation reasoning as above; ~59 more characters against 448 here and
+     * 768 in ds4_resident's ident_buf, which currently carries ~361. */
+    const char *gp = qw_gdn_proj_limits();
+    if (gp && gp[0] && (size_t)n + 2u < sizeof(buf)) {
+        snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", gp);
     }
     return buf;
 }
@@ -19705,6 +19719,81 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
         if (!ds4_gpu_matmul_f32_decode_rows_exact_tensor(outs[i],maps[i],
                 sizes[i],offsets[i],in_dim,48u,x,rows)) return 0;
     return 1;
+}
+
+/* THE PRE-COMMITTED READOUT FOR QW_GDN_PROJ_ATTR, FINALLY WIRED UP.
+ *
+ * `b09acd9` ships `QW_GDN_PROJ_ATTR = __maxnreg__(40)` on
+ * qwen_gdn_projection_kernel -- the fused four-projection kernel, and therefore
+ * ~25% of the decode round's bytes.  The comment above that #define states a
+ * revert condition in advance, in its own words: "if the built library reports
+ * lmem != 0 for either R=2 instantiation, the cap spilled and this is reverted
+ * regardless of what the composite says."
+ *
+ * That condition was never testable.  engine_backend's `gdn[reg=... lmem=...]`
+ * is qwen4exp_gdn_octet_kernel -- a deliberate drift control, a DIFFERENT kernel
+ * in the OTHER translation unit -- and this kernel appears nowhere in the
+ * string.  ds4_gpu_hw_limits() sits ~1,700 lines above the template, and the
+ * routed-MoE probe that owns the reporting cannot see a static in this unit, so
+ * the check had no home.  The cap has been riding the frontier unverified.  This
+ * gives it one.
+ *
+ * Both R=2 instantiations are reported because the host chooses between them at
+ * run time on a weight-alignment and panel-size test (`gdn_stage`), so either
+ * one can be the launched kernel, and a spill in either fires the condition.
+ *
+ * occ for the staged arm is queried at the dynamic panel the decode launch
+ * actually requests -- (256/64) * blocks * 34 + 16 with blocks = in_dim/32 =
+ * 2560/32 = 80, so 10,896 B -- because querying it at 0, as the routed-MoE dn
+ * probe documents doing, would report a residency this arm never gets.  The
+ * plain arm requests no dynamic shared and is queried at 0.
+ *
+ * Diagnostic only, and off every timed path: ds4_gpu_hw_limits() is built once
+ * in ds4_resident before the socket binds, and its result travels in the hello
+ * identity.  No kernel, launch, or emitted value changes. */
+static const char *qw_gdn_proj_limits(void) {
+    static char out[96];
+    static int done = 0;
+    if (done) return out;
+    done = 1;
+    out[0] = '\0';
+    const size_t panel = (size_t)(256u / 64u) * (size_t)80u * (size_t)34u + 16u;
+    cudaFuncAttributes a;
+    int sreg = -1, ssmem = -1, slmem = -1, socc = -1;
+    int preg = -1, plmem = -1, pocc = -1;
+    if (cudaFuncGetAttributes(&a, qwen_gdn_projection_kernel<2, true>) ==
+        cudaSuccess) {
+        sreg = a.numRegs;
+        ssmem = (int)a.sharedSizeBytes;
+        slmem = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaFuncGetAttributes(&a, qwen_gdn_projection_kernel<2, false>) ==
+        cudaSuccess) {
+        preg = a.numRegs;
+        plmem = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    int o = 0;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &o, qwen_gdn_projection_kernel<2, true>, 256, panel) ==
+        cudaSuccess) {
+        socc = o;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &o, qwen_gdn_projection_kernel<2, false>, 256, 0) == cudaSuccess) {
+        pocc = o;
+    } else {
+        (void)cudaGetLastError();
+    }
+    snprintf(out, sizeof(out),
+             "gp[reg=%d smem=%d lmem=%d occ=%d] gpp[reg=%d lmem=%d occ=%d]",
+             sreg, ssmem, slmem, socc, preg, plmem, pocc);
+    return out;
 }
 
 /* K/V blocks precede the large Q grid. Each output retains its original
