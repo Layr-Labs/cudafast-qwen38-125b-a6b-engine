@@ -95,7 +95,11 @@ pub trait Ds4Session: Send {
     /// cycle's committed tokens and the frontier argmax it left, in order. It
     /// must equal driving [`Ds4Session::eval_speculative`] cycle by cycle, each
     /// with the budget still wanted. `None` means drive the cycles one by one.
-    fn spec_run(&mut self, _first_token: i64, _count: i64) -> Option<Result<Vec<SpecRound>, String>> {
+    fn spec_run(
+        &mut self,
+        _first_token: i64,
+        _count: i64,
+    ) -> Option<Result<Vec<SpecRound>, String>> {
         None
     }
     /// The speculative cycle's counters. `&mut` because a session that reaches
