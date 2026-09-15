@@ -3331,6 +3331,17 @@ __device__ __forceinline__ static void qw_cpasync16(uint32_t dst,
     asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
                  :: "r"(dst), "l"(src));
 }
+/* The same copy, L1-bypassing, for the routed down panel only.  The comment
+ * above prices .cg against .ca on the q4_K gate/up FETCH MAP, where a
+ * super-block's 128-byte payload line is touched by two K chunks.  The routed
+ * down panel has a different fetch map, so the two sites carry different
+ * policies and the gate/up site keeps .ca unchanged.
+ * The down-panel policy here follows work published by SSHdotCodes. */
+__device__ __forceinline__ static void qw_cpasync16_cg(uint32_t dst,
+                                                       const void *src) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+                 :: "r"(dst), "l"(src));
+}
 __device__ __forceinline__ static void qw_cpasync_commit(void) {
     asm volatile("cp.async.commit_group;\n" ::);
 }
@@ -4280,7 +4291,28 @@ __device__ __forceinline__ static void qwen4exp_shared_vector_accumulate(
 #ifndef DS4_GATEUP_COOP_BUILD
 #define DS4_GATEUP_COOP_BUILD 1
 #endif
-#define QW_GU_COOP_ROWS 8u
+/* FOUR OUTPUT ROWS PER COOPERATIVE BLOCK, NOT EIGHT.
+ *
+ * This constant is both the block's output-row count and, through
+ * `P * 64u`, its thread count and its staged-panel size.  The engine's own
+ * kernel-limits probe reports the consequence on this part, and the two
+ * readings are from two builds of this same tree:
+ *     eight rows: gu[reg=32 smem=23168 lmem=0 maxt=1024 occ=3]
+ *     four  rows: gu[reg=32 smem=11584 lmem=0 maxt=1024 occ=6]
+ * At eight rows the block is 512 threads and the 1536-thread SM ceiling pins
+ * it to THREE blocks; halving the rows halves the threads and the panel and
+ * lands SIX.  Registers (32 * 256 = 8,192) and shared memory
+ * (101,376 / 11,584 = 8) are both slack at four; the thread ceiling is the
+ * whole binding constraint and it is the one this halves.
+ *
+ * The grid grows to match -- (mid_dim + P - 1) / P is 160 blocks at four
+ * instead of 80 at eight -- so the same warps do the same work, packed into
+ * narrower blocks that the scheduler can actually co-resident.
+ *
+ * Purely a packing change.  Each output row still walks its own weight row in
+ * the same group order through the same warp_sum_f32 tree, and every dot is
+ * bit-identical. */
+#define QW_GU_COOP_ROWS 4u
 #define QW_GU_COOP_ROW_U4 90u                /* 1440 B, ten q4_K super-blocks */
 #define QW_GU_COOP_GROUPS 80u                            /* in_dim 2560 / 32 */
 #define QW_GU_COOP_U4 (QW_GU_COOP_ROWS * QW_GU_COOP_ROW_U4)
@@ -4900,7 +4932,7 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                 for (uint64_t o = (uint64_t)threadIdx.x * 16u;
                      o < panel_bytes; o += (uint64_t)blockDim.x * 16u) {
                     if (Async) {
-                        qw_cpasync16((uint32_t)__cvta_generic_to_shared(dst + o),
+                        qw_cpasync16_cg((uint32_t)__cvta_generic_to_shared(dst + o),
                                      gp + o);
                     } else {
                         *(uint4 *)(dst + o) = *(const uint4 *)(gp + o);
