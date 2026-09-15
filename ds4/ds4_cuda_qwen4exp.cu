@@ -4436,6 +4436,11 @@ qwen4exp_moe_gateup_split_kernel(
         uint32_t mid_dim,
         uint32_t mid_token_stride,
         uint32_t n_expert_used) {
+    /* PDL consumer of the routed input quantizer, which is the previous launch
+     * on the stream and triggers at decode widths (gridDim.y <= 2).
+     * Residency win: this kernel's blocks are already scheduled when the quantizer
+     * finishes rather than paying a launch behind it. */
+    QWEN4EXP_PDL_SYNC();
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
     const uint32_t row = blockIdx.x * OutputRows + (warp >> 1u);
@@ -7586,16 +7591,31 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             ((uintptr_t)gate & 15u) == 0u && ((uintptr_t)up & 15u) == 0u &&
             (gate_slab->expert_bytes & 15ull) == 0ull &&
             (up_slab->expert_bytes & 15ull) == 0ull;
-#define QWEN4EXP_SPLIT_GATEUP(V, P, C) \
-        qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P, C><<< \
-            dim3((mid_dim + P - 1u) / P, gu_rows, 1), P * 64u, 0, stream>>>( \
+#define QWEN4EXP_SPLIT_GATEUP(V, P, C) do { \
+    const dim3 gu_split_grid((mid_dim + P - 1u) / P, gu_rows, 1); \
+    if (n_tokens <= 2u) { \
+        QWEN4EXP_LAUNCH_PDL( \
+            (qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P, C>), \
+            gu_split_grid, P * 64u, 0, stream, \
             (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum, \
             sc.pairs, sc.counts, sc.offsets, gu_active, \
             (const float *)weights->ptr, \
             gate_slab->expert_bytes, gate_slab->row_bytes, \
             up_slab->expert_bytes, up_slab->row_bytes, \
             gate_slab->type, up_slab->type, xgroups, mid_dim, \
-            mid_token_stride, n_expert_used)
+            mid_token_stride, n_expert_used); \
+    } else { \
+        qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P, C><<< \
+            gu_split_grid, P * 64u, 0, stream>>>( \
+            (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum, \
+            sc.pairs, sc.counts, sc.offsets, gu_active, \
+            (const float *)weights->ptr, \
+            gate_slab->expert_bytes, gate_slab->row_bytes, \
+            up_slab->expert_bytes, up_slab->row_bytes, \
+            gate_slab->type, up_slab->type, xgroups, mid_dim, \
+            mid_token_stride, n_expert_used); \
+    } \
+} while (0)
         /* ONE OUTPUT ROW PER BLOCK on the vector schedule.  Four rows per
          * block was measured a full percent slower than two, so the barrier
          * is what costs: every warp in the block reads a different weight
