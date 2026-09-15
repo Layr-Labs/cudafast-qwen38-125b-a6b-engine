@@ -1,5 +1,10 @@
-/* GDN projection fusion: independent mappings, complete outputs and changed graphs. */
+/* GDN projection fusion: independent mappings, complete outputs and changed graphs.
+ * --bench additionally reports CUDA-event timings on synthetic weights. These
+ * isolate projection dispatch; they are not full-model or ranked timings. */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
+#include <cuda_runtime_api.h>
 #include "ds4_gpu.h"
 #include <stdint.h>
 #include <stdio.h>
@@ -8,6 +13,8 @@
 #include <sys/mman.h>
 
 enum { SETS=4, CAP=8, MODES=2 };
+static int benchmark;
+static int device_weights;
 static uint32_t rng=0x771ba358u;
 static uint32_t word(void){rng^=rng<<13;rng^=rng>>17;rng^=rng<<5;return rng;}
 static void must(int ok,const char *s){if(!ok){fprintf(stderr,"GDN four projection: %s\n",s);exit(1);}}
@@ -73,6 +80,55 @@ static int graph(unsigned mode,unsigned rows,ds4_decode_graph_key *key) {
     if(!s){operate(mode,rows);must(ds4_gpu_decode_graph_end(key)==0,"graph end");}
     return s;
 }
+static int ascending(const void *a,const void *b) {
+    float x=*(const float *)a,y=*(const float *)b;return (x>y)-(x<y);
+}
+static void timing(unsigned rows) {
+    enum { SAMPLES=7, REPEATS=20 };
+    cudaEvent_t start,stop;
+    must(cudaEventCreate(&start)==cudaSuccess,"start event");
+    must(cudaEventCreate(&stop)==cudaSuccess,"stop event");
+    for(unsigned captured=0;captured<2;captured++) {
+        ds4_gpu_decode_graphs_invalidate();
+        ds4_decode_graph_key keys[MODES]={{.il=1},{.il=2}};
+        for(unsigned mode=0;mode<MODES;mode++) {
+            operate(mode,rows);
+            if(captured) {
+                must(ds4_gpu_decode_graph_begin(&keys[mode])==-1,"timing warmup");
+                operate(mode,rows);
+                must(graph(mode,rows,&keys[mode])==0,"timing capture");
+            }
+        }
+        must(ds4_gpu_synchronize(),"timing warmup sync");
+        float us[MODES][SAMPLES];
+        for(unsigned sample=0;sample<SAMPLES;sample++) {
+            /* Alternate execution order to limit clock/temperature bias. */
+            for(unsigned arm=0;arm<MODES;arm++) {
+                unsigned mode=arm^(sample&1u);
+                must(cudaEventRecord(start,0)==cudaSuccess,"record start");
+                for(unsigned repeat=0;repeat<REPEATS;repeat++) {
+                    if(captured)must(graph(mode,rows,&keys[mode])==1,"timing replay");
+                    else operate(mode,rows);
+                }
+                /* The backend's capture stream is a blocking stream, so the
+                 * legacy default-stream event follows all graph replays. */
+                must(cudaEventRecord(stop,0)==cudaSuccess,"record stop");
+                must(cudaEventSynchronize(stop)==cudaSuccess,"wait stop");
+                float ms;
+                must(cudaEventElapsedTime(&ms,start,stop)==cudaSuccess,"elapsed time");
+                us[mode][sample]=ms*1000.0f/(REPEATS*SETS);
+            }
+        }
+        for(unsigned mode=0;mode<MODES;mode++)qsort(us[mode],SAMPLES,sizeof(float),ascending);
+        printf("GDN_FOUR_BENCH rows=%u execution=%s weights=%s separate_us=%.3f fused_us=%.3f speedup=%.4f samples=%u\n",
+               rows,captured?"graph":"eager",device_weights?"device":"mapped-primary",
+               us[0][SAMPLES/2],us[1][SAMPLES/2],
+               us[0][SAMPLES/2]/us[1][SAMPLES/2],SAMPLES);
+        fflush(stdout);
+    }
+    must(cudaEventDestroy(start)==cudaSuccess,"destroy start");
+    must(cudaEventDestroy(stop)==cudaSuccess,"destroy stop");
+}
 static void check_shape(unsigned in,unsigned out0,unsigned out1,unsigned offset) {
     in_dim=in;od[0]=out0;od[1]=out1;od[2]=od[3]=48;groups=in/32;
     xb=CAP*in*4u+64;qb=CAP*groups*36u+64;
@@ -130,9 +186,9 @@ static void check_shape(unsigned in,unsigned out0,unsigned out1,unsigned offset)
         must(memcmp(got+pos,refs[0][b],od[b]*4u)==0,"adjacent exact");pos+=od[b]*4u;ds4_gpu_tensor_free(outs[b]);
     }
     must(memcmp(got+sum,poison,64)==0,"adjacent tail intact");free(got);ds4_gpu_tensor_free(adj);
-    const unsigned widths[]={1,2,3,7};const float scales[]={.2f,1e-20f,8.0f,0.0f};
+    const unsigned widths[]={1,2,3,4,7};const float scales[]={.2f,1e-20f,8.0f,0.0f};
     unsigned eager=0,captured=0,replayed=0;
-    for(unsigned wi=0;wi<4;wi++) {
+    for(unsigned wi=0;wi<sizeof(widths)/sizeof(widths[0]);wi++) {
         unsigned rows=widths[wi];ds4_gpu_decode_graphs_invalidate();
         ds4_decode_graph_key keys[MODES]={{.il=1},{.il=2}};
         for(unsigned trial=0;trial<4;trial++) {
@@ -147,6 +203,9 @@ static void check_shape(unsigned in,unsigned out0,unsigned out1,unsigned offset)
         }
     }
     printf("GDN_FOUR_CHECK in=%u out0=%u out1=%u offset=%u sets=4 eager_buffers=%u graph_buffers=%u changed_replays=%u PASS\n",in,out0,out1,offset,eager,captured,replayed);fflush(stdout);
+    if(benchmark && in==2560 && out0==10240 && out1==6144 && offset==64) {
+        for(unsigned rows=1;rows<=4;rows++){inputs(rows,.2f);timing(rows);}
+    }
     ds4_gpu_decode_graphs_invalidate();
     for(unsigned i=0;i<SETS;i++) {
         ds4_gpu_tensor_free(xt[i]);ds4_gpu_tensor_free(qt[i]);free(xhost[i]);free(qref[i]);
@@ -156,10 +215,26 @@ static void check_shape(unsigned in,unsigned out0,unsigned out1,unsigned offset)
     }
     ds4_gpu_cleanup();for(unsigned b=0;b<2;b++)munmap(maps[b],mb[b]);free(poison);
 }
-int main(void) {
+int main(int argc,char **argv) {
+    for(int i=1;i<argc;i++) {
+        if(strcmp(argv[i],"--bench")==0)benchmark=1;
+        else if(strcmp(argv[i],"--device")==0)device_weights=1;
+        else {
+            fprintf(stderr,"usage: %s [--bench] [--device]\n",argv[0]);return 2;
+        }
+    }
+    /* Test data only: avoid measuring PCIe bandwidth when investigating the
+     * kernel on a discrete GPU. No model checkpoint is opened by this test.
+     * cache_model_range alone can retain the already registered host pointer. */
+    if(device_weights) {
+        setenv("DS4_CUDA_COPY_MODEL","1",1);
+        setenv("DS4_CUDA_AUX_FORCE_COPY","1",1);
+    } else unsetenv("DS4_CUDA_COPY_MODEL");
     setenv("DS4_CUDA_DECODE_GRAPHS","1",1);
     check_shape(2560,10240,6144,64);
     check_shape(2560,10240,6144,66);
+    check_shape(2560,10240,6144,68);
     check_shape(2560,10243,6147,64);
+    check_shape(512,520,516,64);
     puts("GDN_FOUR_ALL PASS");return 0;
 }

@@ -479,6 +479,17 @@ $(QWEN4EXP_GDN_TEST): tests/test_qwen4exp_gdn.o $(GPU_TEST_OBJS)
 test-qwen4exp-gdn: $(QWEN4EXP_GDN_TEST)
 	./$(QWEN4EXP_GDN_TEST)
 
+# Synthetic CUDA projection test; no checkpoint required.
+tests/test_gdn_projections.o: tests/test_gdn_projections.c ds4_gpu.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_gdn_projections: tests/test_gdn_projections.o $(GPU_TEST_OBJS)
+	$(GPU_TEST_LINK)
+
+.PHONY: test-gdn-projections
+test-gdn-projections: tests/test_gdn_projections
+	./tests/test_gdn_projections
+
 # The row-batching exactness pair: the prefill recurrence against the retained
 # one-row kernel over eleven widths, three head layouts and four input
 # patterns, eager and graph-captured, comparing nine buffers byte for byte.

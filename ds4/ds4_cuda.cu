@@ -19660,7 +19660,9 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
     a.od[0]=qkv_dim;a.od[1]=gate_dim;a.blocks=blocks;a.n_rows=rows;
     a.xq=(const int8_t *)((const char *)q->ptr+qoff);
     a.xscale=(const float *)((const char *)q->ptr+soff);a.x=(const float *)x->ptr;
-    if (rows<=2u && in_dim==2560u && qkv_dim>512u && gate_dim>512u &&
+    const bool wide_verify = (rows==3u || rows==4u) &&
+        getenv("DS4_QWEN4EXP_NO_WIDE_VERIFY")==NULL;
+    if ((rows<=2u || wide_verify) && in_dim==2560u && qkv_dim>512u && gate_dim>512u &&
         cuda_q8_use_dp4a() && getenv("DS4_QWEN4EXP_NO_ROW_TILE")==NULL &&
         getenv("DS4_QWEN4EXP_PAIR_LANES_R2")==NULL &&
         getenv("DS4_F32_NO_VECTOR_DECODE")==NULL &&
@@ -19677,8 +19679,27 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
         const size_t gdn_panel=(size_t)(256u/64u)*(size_t)blocks*34u+16u;
         const int gdn_stage =
             ((((uintptr_t)a.weights[0]|(uintptr_t)a.weights[1])&3u)==0u) &&
+            (qkv_dim%4u)==0u && (gate_dim%4u)==0u &&
             gdn_panel<=49152u &&
             getenv("DS4_QWEN4EXP_NO_GDN_PANEL")==NULL;
+        if (wide_verify) {
+            /* One tile reads each weight once for the whole verify call.
+             * R changes only the number of independent accumulators: each
+             * row keeps the original dot and floating-point reduction tree.
+             * Plain launch, as on the separate wide-verify projections. */
+            if (rows==3u) {
+                if (gdn_stage)
+                    qwen_gdn_projection_kernel<3,true><<<grid,256,gdn_panel,cuda_decode_stream()>>>(a);
+                else
+                    qwen_gdn_projection_kernel<3><<<grid,256,0,cuda_decode_stream()>>>(a);
+            } else {
+                if (gdn_stage)
+                    qwen_gdn_projection_kernel<4,true><<<grid,256,gdn_panel,cuda_decode_stream()>>>(a);
+                else
+                    qwen_gdn_projection_kernel<4><<<grid,256,0,cuda_decode_stream()>>>(a);
+            }
+            return cuda_ok(cudaGetLastError(),"GDN four projections wide launch");
+        }
         /* PDL consumer: the stream predecessor is the mixed-input quantizer,
          * which triggers at its top at these decode widths. */
         if (rows==1u) {
