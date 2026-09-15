@@ -5783,6 +5783,19 @@ __global__ static void matmul_q8_0_preq_rows_exact_tile_kernel(
 /* Two adjacent lanes share a Q8 group. Their integer partials may be
  * combined freely; each even lane keeps its original float group chain.
  * Shared memory remaps the 32 finished chains onto one reduction warp. */
+
+/* MEASURED AND REVERTED, `bbf88254`. The cap took exactly as designed and
+ * bought nothing:
+ *
+ *   pl2[reg=48 smem=512 lmem=0 occ=5] pl1[reg=48 lmem=0 occ=5]
+ *   pls[reg=48 lmem=0 occ=5] pl4[reg=48 lmem=0 occ=5]
+ *
+ * 51 -> 48 registers, occupancy 4 -> 5 (+25% residency), zero spill on all four
+ * instantiations, on the kernel carrying 26% of the decode round's bytes -- and
+ * box-adjusted decode came back 2.247326 against 2.259112, i.e. -0.522%, which
+ * is at the bottom of the null-arm spread rather than above it. Residency is
+ * not this kernel's constraint either. Do not re-spend a draw here: 40 spills
+ * (`e49cd007`), 48 is a measured null, and granularity 8 leaves no other rung. */
 template <int R, bool Streaming = true>
 __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
         float *out, const unsigned char *w,
@@ -17380,13 +17393,24 @@ extern "C" void ds4_gpu_set_q8_mma_pipe_wide(int mode) {
  * per-SM shared memory size, so 101376 means a 100 KiB SM and 227328 means a
  * 228 KiB SM -- which is exactly the fork every occupancy argument about the
  * staged decode kernels turns on. */
+
+/* Defined below, next to the kernel it reads: qwen_gdn_projection_kernel is
+ * declared further down this unit, so the probe cannot sit inline here. */
+static const char *qw_gdn_proj_limits(void);
+static const char *qw_dense_proj_limits(void);
+
 extern "C" const char *ds4_gpu_hw_limits(void) {
     /* Sized for the device attributes plus the routed-MoE kernel-limits string,
      * which now carries the two prefill tiles as well.  Oversized on purpose:
      * ds4_resident drops the WHOLE limits string rather than truncating it if it
      * does not fit its own ident buffer, so a tight fit here loses the
      * measurement silently. */
-    static char buf[448];
+    /* 640, not 448: the qwen4exp string now carries dna[], dn4[] and dn4g[] as
+     * well, and the combined line measured 400 of 448 before them.  A truncated
+     * append is silently dropped by ds4_resident rather than shortened, so the
+     * whole limits string would vanish instead of losing its last field, which
+     * is why this is oversized rather than merely sufficient. */
+    static char buf[640];
     static int built = 0;
     if (built) return buf;
     built = 1;
@@ -17421,7 +17445,26 @@ extern "C" const char *ds4_gpu_hw_limits(void) {
      * is diagnostic only and snprintf keeps it terminated. */
     const char *kl = ds4_gpu_qwen4exp_kernel_limits();
     if (kl && kl[0] && (size_t)n + 2u < sizeof(buf)) {
-        snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", kl);
+        const int m = snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", kl);
+        if (m > 0 && (size_t)n + (size_t)m < sizeof(buf)) n += m;
+    }
+    /* The fused GDN projection kernel, which lives in THIS unit rather than the
+     * routed-MoE one and so was missing from the string entirely.  Same
+     * truncation reasoning as above; ~59 more characters against 448 here and
+     * 768 in ds4_resident's ident_buf, which currently carries ~361. */
+    const char *gp = qw_gdn_proj_limits();
+    if (gp && gp[0] && (size_t)n + 2u < sizeof(buf)) {
+        const int m = snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", gp);
+        if (m > 0 && (size_t)n + (size_t)m < sizeof(buf)) n += m;
+    }
+    /* And the dense Q8_0 projection workhorse, which carries the q/k/v/output and
+     * ssm_out projections -- ~26% of the decode round's bytes -- and is the last
+     * large decode kernel whose register footprint the string does not publish.
+     * `ee210c44` measured this string at 420 of ds4_resident's 768-byte ident_buf
+     * and 294 of the 448 here; this adds ~70 more to both. */
+    const char *dp = qw_dense_proj_limits();
+    if (dp && dp[0] && (size_t)n + 2u < sizeof(buf)) {
+        snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", dp);
     }
     return buf;
 }
@@ -19705,6 +19748,211 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
         if (!ds4_gpu_matmul_f32_decode_rows_exact_tensor(outs[i],maps[i],
                 sizes[i],offsets[i],in_dim,48u,x,rows)) return 0;
     return 1;
+}
+
+/* THE PRE-COMMITTED READOUT FOR QW_GDN_PROJ_ATTR, FINALLY WIRED UP.
+ *
+ * `b09acd9` ships `QW_GDN_PROJ_ATTR = __maxnreg__(40)` on
+ * qwen_gdn_projection_kernel -- the fused four-projection kernel, and therefore
+ * ~25% of the decode round's bytes.  The comment above that #define states a
+ * revert condition in advance, in its own words: "if the built library reports
+ * lmem != 0 for either R=2 instantiation, the cap spilled and this is reverted
+ * regardless of what the composite says."
+ *
+ * That condition was never testable.  engine_backend's `gdn[reg=... lmem=...]`
+ * is qwen4exp_gdn_octet_kernel -- a deliberate drift control, a DIFFERENT kernel
+ * in the OTHER translation unit -- and this kernel appears nowhere in the
+ * string.  ds4_gpu_hw_limits() sits ~1,700 lines above the template, and the
+ * routed-MoE probe that owns the reporting cannot see a static in this unit, so
+ * the check had no home.  The cap has been riding the frontier unverified.  This
+ * gives it one.
+ *
+ * Both R=2 instantiations are reported because the host chooses between them at
+ * run time on a weight-alignment and panel-size test (`gdn_stage`), so either
+ * one can be the launched kernel, and a spill in either fires the condition.
+ *
+ * occ for the staged arm is queried at the dynamic panel the decode launch
+ * actually requests -- (256/64) * blocks * 34 + 16 with blocks = in_dim/32 =
+ * 2560/32 = 80, so 10,896 B -- because querying it at 0, as the routed-MoE dn
+ * probe documents doing, would report a residency this arm never gets.  The
+ * plain arm requests no dynamic shared and is queried at 0.
+ *
+ * Diagnostic only, and off every timed path: ds4_gpu_hw_limits() is built once
+ * in ds4_resident before the socket binds, and its result travels in the hello
+ * identity.  No kernel, launch, or emitted value changes. */
+static const char *qw_gdn_proj_limits(void) {
+    static char out[96];
+    static int done = 0;
+    if (done) return out;
+    done = 1;
+    out[0] = '\0';
+    const size_t panel = (size_t)(256u / 64u) * (size_t)80u * (size_t)34u + 16u;
+    cudaFuncAttributes a;
+    int sreg = -1, ssmem = -1, slmem = -1, socc = -1;
+    int preg = -1, plmem = -1, pocc = -1;
+    if (cudaFuncGetAttributes(&a, qwen_gdn_projection_kernel<2, true>) ==
+        cudaSuccess) {
+        sreg = a.numRegs;
+        ssmem = (int)a.sharedSizeBytes;
+        slmem = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaFuncGetAttributes(&a, qwen_gdn_projection_kernel<2, false>) ==
+        cudaSuccess) {
+        preg = a.numRegs;
+        plmem = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    int o = 0;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &o, qwen_gdn_projection_kernel<2, true>, 256, panel) ==
+        cudaSuccess) {
+        socc = o;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &o, qwen_gdn_projection_kernel<2, false>, 256, 0) == cudaSuccess) {
+        pocc = o;
+    } else {
+        (void)cudaGetLastError();
+    }
+    snprintf(out, sizeof(out),
+             "gp[reg=%d smem=%d lmem=%d occ=%d] gpp[reg=%d lmem=%d occ=%d]",
+             sreg, ssmem, slmem, socc, preg, plmem, pocc);
+    return out;
+}
+
+/* THE DENSE Q8_0 PROJECTION WORKHORSE, WHICH NOTHING HAS EVER MEASURED.
+ *
+ * matmul_q8_0_preq_pair_lanes_kernel is what every dense projection in the
+ * decode round actually lands on: cuda_matmul_q8_0_preq_rows_exact routes
+ * n_rows <= 2 with out_dim > 512 here, which is ssm_out on all 36 GDN layers
+ * plus q, k, v and attn_output on all 12 QSA layers.  That is ~1.7 GB of the
+ * 6.58 GB round -- about 26%, second only to the routed MoE's 52%.
+ *
+ * It carries NO register attribute at all: no __maxnreg__, no
+ * __launch_bounds__.  Every other large decode kernel on this tip has had its
+ * footprint either published (`gu`, `dn`, `mm`, `md`, and `gp` as of
+ * `ee210c44`) or measured on real hardware by another solver.  This one has
+ * neither, so whether it is register-limited below the 1,536-thread ceiling is
+ * simply unknown -- and that is the one question that decides whether the
+ * __maxnreg__ lever, which is the only occupancy lever that has ever won on
+ * this engine, has anything left to win here.
+ *
+ * Three instantiations, all already present in the binary, so taking their
+ * addresses adds no code:
+ *   pl2 = <2,false>  the main decode path, 256 threads, no dynamic shared
+ *   pl1 = <1,false>  the one-row path (draft position 0 alone)
+ *   pls = <2,true>   the Streaming arm, taken by the HC up valve leg
+ *
+ * All three are queried at 256 threads and 0 dynamic shared, which is what
+ * their launches request; the kernel's reduction remap is static __shared__,
+ * so it is already inside sharedSizeBytes.
+ *
+ * How to read it, stated before the numbers exist so it cannot be
+ * rationalised afterwards.  At 256 threads the SM's 1,536-thread ceiling caps
+ * residency at 6 blocks, and 6 blocks needs reg <= 65536/(256*6) = 42, i.e.
+ * <= 40 at the granularity of 8 this engine allocates on:
+ *   - pl2[occ] = 6 already: no residency lever exists here.  Closed, and the
+ *     class is then closed engine-wide with this kernel included rather than
+ *     assumed.
+ *   - pl2[occ] < 6 with pl2[reg] > 40: a cap to 40 buys the missing blocks,
+ *     which is exactly the arm that won twice on the gate/up panel (47->40,
+ *     then 40->32) and is already shipped on the GDN projection kernel.  It
+ *     then has to be weighed against the spill risk, which pl2[lmem] and a
+ *     re-probe after capping would settle.
+ *   - pl2[occ] < 6 with pl2[reg] <= 40: shared memory binds, not registers,
+ *     and a register cap is the wrong tool.
+ *
+ * Diagnostic only, off every timed path, same as qw_gdn_proj_limits above:
+ * built once in ds4_resident before the socket binds, travelling in the hello
+ * identity.  No kernel, launch or emitted value changes. */
+static const char *qw_dense_proj_limits(void) {
+    static char out[192];
+    static int done = 0;
+    if (done) return out;
+    done = 1;
+    out[0] = '\0';
+    cudaFuncAttributes a;
+    int reg2 = -1, smem2 = -1, lmem2 = -1, occ2 = -1;
+    int reg1 = -1, lmem1 = -1, occ1 = -1;
+    int regs = -1, lmems = -1, occs = -1;
+    int reg4 = -1, lmem4 = -1, occ4 = -1;
+    int o = 0;
+    if (cudaFuncGetAttributes(
+                &a, matmul_q8_0_preq_pair_lanes_kernel<2, false>) ==
+        cudaSuccess) {
+        reg2 = a.numRegs;
+        smem2 = (int)a.sharedSizeBytes;
+        lmem2 = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &o, matmul_q8_0_preq_pair_lanes_kernel<2, false>, 256, 0) ==
+        cudaSuccess) {
+        occ2 = o;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaFuncGetAttributes(
+                &a, matmul_q8_0_preq_pair_lanes_kernel<1, false>) ==
+        cudaSuccess) {
+        reg1 = a.numRegs;
+        lmem1 = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &o, matmul_q8_0_preq_pair_lanes_kernel<1, false>, 256, 0) ==
+        cudaSuccess) {
+        occ1 = o;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaFuncGetAttributes(
+                &a, matmul_q8_0_preq_pair_lanes_kernel<2, true>) ==
+        cudaSuccess) {
+        regs = a.numRegs;
+        lmems = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &o, matmul_q8_0_preq_pair_lanes_kernel<2, true>, 256, 0) ==
+        cudaSuccess) {
+        occs = o;
+    } else {
+        (void)cudaGetLastError();
+    }
+    /* R=4 carries the three- and four-row verify tile.  It is reported because
+     * the cap is template-wide: a prior reading had it at reg=48 lmem=0 already,
+     * so a 48 cap should not bind it at all, and this proves that rather than
+     * trusting the stale number. */
+    if (cudaFuncGetAttributes(
+                &a, matmul_q8_0_preq_pair_lanes_kernel<4, false>) ==
+        cudaSuccess) {
+        reg4 = a.numRegs;
+        lmem4 = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &o, matmul_q8_0_preq_pair_lanes_kernel<4, false>, 256, 0) ==
+        cudaSuccess) {
+        occ4 = o;
+    } else {
+        (void)cudaGetLastError();
+    }
+    snprintf(out, sizeof(out),
+             "pl2[reg=%d smem=%d lmem=%d occ=%d] pl1[reg=%d lmem=%d occ=%d] "
+             "pls[reg=%d lmem=%d occ=%d] pl4[reg=%d lmem=%d occ=%d]",
+             reg2, smem2, lmem2, occ2, reg1, lmem1, occ1, regs, lmems, occs,
+             reg4, lmem4, occ4);
+    return out;
 }
 
 /* K/V blocks precede the large Q grid. Each output retains its original
