@@ -17584,7 +17584,7 @@ static int cuda_matmul_q8_0_preq_rows_exact(
      * DS4_QWEN4EXP_NO_WIDE_VERIFY restores the <= 2 gates. */
     const bool wide_verify3 = (n_rows == 3u || n_rows == 4u) &&
         getenv("DS4_QWEN4EXP_NO_WIDE_VERIFY") == NULL;
-    if (use_dp4a && (n_rows == 2u || wide_verify3) &&
+    if (use_dp4a && (n_rows <= 2u || wide_verify3) &&
         in_dim == 10240u && out_dim == 320u &&
         getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
         getenv("DS4_Q8_NO_HC_DOWN_PAIR") == NULL &&
