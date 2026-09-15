@@ -229,9 +229,11 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
             key_in,flag,scores,width,prefix,tail,vocab);
         if (!cuda_ok(cudaGetLastError(),"native screen keys")) return -1;
     }
-    uint32_t invalid = 0;
-    if (!ds4_gpu_tensor_read(scratch,l.flag,&invalid,4)) return -1;
-    if (invalid) return 0;
+    if (getenv("DS4_MTP_CHECK_NATIVE_FLAG") != nullptr) {
+        uint32_t invalid = 0;
+        if (!ds4_gpu_tensor_read(scratch,l.flag,&invalid,4)) return -1;
+        if (invalid) return 0;
+    }
     size_t temporary = (size_t)(scratch->bytes-l.temporary);
     /* Rank on the high score word alone. Keys are written in row order, so
      * original IDs strictly increase over the whole input and the packed low

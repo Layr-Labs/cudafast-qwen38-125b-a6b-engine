@@ -2338,7 +2338,7 @@ __global__ static void qwen4exp_quantize_rows_kernel(
      * the bound and never triggers (the deadlock rule,
      * ds4_cuda_qwen4exp.cuh).  The gate reads the grid in the body, not a
      * convention at the launch sites, per the header's rule. */
-    if (gridDim.y <= 2u &&
+    if (gridDim.y <= 20u &&
         (uint64_t)gridDim.x * (uint64_t)gridDim.y <= 768u)
         QWEN4EXP_PDL_TRIGGER();
     const uint32_t g = blockIdx.x;
@@ -4436,6 +4436,11 @@ qwen4exp_moe_gateup_split_kernel(
         uint32_t mid_dim,
         uint32_t mid_token_stride,
         uint32_t n_expert_used) {
+    /* PDL consumer of the routed input quantizer, which is the previous launch
+     * on the stream and triggers at decode widths (gridDim.y <= 2).
+     * Residency win: this kernel's blocks are already scheduled when the quantizer
+     * finishes rather than paying a launch behind it. */
+    QWEN4EXP_PDL_SYNC();
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
     const uint32_t row = blockIdx.x * OutputRows + (warp >> 1u);
@@ -4834,6 +4839,9 @@ __global__ static void qwen4exp_moe_down_q_kernel(
      * only for the Stage instantiations; the others map nothing here. */
     extern __shared__ uint4 qw_down_panel[];
     char *const spanel = (char *)qw_down_panel;
+    /* PDL consumer of the routed mid quantizer, which is the previous launch
+     * on the stream and triggers at decode widths (gridDim.y <= 20). */
+    QWEN4EXP_PDL_SYNC();
 
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t row0 = blockIdx.x * 8u;
@@ -7586,16 +7594,31 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             ((uintptr_t)gate & 15u) == 0u && ((uintptr_t)up & 15u) == 0u &&
             (gate_slab->expert_bytes & 15ull) == 0ull &&
             (up_slab->expert_bytes & 15ull) == 0ull;
-#define QWEN4EXP_SPLIT_GATEUP(V, P, C) \
-        qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P, C><<< \
-            dim3((mid_dim + P - 1u) / P, gu_rows, 1), P * 64u, 0, stream>>>( \
+#define QWEN4EXP_SPLIT_GATEUP(V, P, C) do { \
+    const dim3 gu_split_grid((mid_dim + P - 1u) / P, gu_rows, 1); \
+    if (n_tokens <= 2u) { \
+        QWEN4EXP_LAUNCH_PDL( \
+            (qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P, C>), \
+            gu_split_grid, P * 64u, 0, stream, \
             (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum, \
             sc.pairs, sc.counts, sc.offsets, gu_active, \
             (const float *)weights->ptr, \
             gate_slab->expert_bytes, gate_slab->row_bytes, \
             up_slab->expert_bytes, up_slab->row_bytes, \
             gate_slab->type, up_slab->type, xgroups, mid_dim, \
-            mid_token_stride, n_expert_used)
+            mid_token_stride, n_expert_used); \
+    } else { \
+        qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P, C><<< \
+            gu_split_grid, P * 64u, 0, stream>>>( \
+            (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum, \
+            sc.pairs, sc.counts, sc.offsets, gu_active, \
+            (const float *)weights->ptr, \
+            gate_slab->expert_bytes, gate_slab->row_bytes, \
+            up_slab->expert_bytes, up_slab->row_bytes, \
+            gate_slab->type, up_slab->type, xgroups, mid_dim, \
+            mid_token_stride, n_expert_used); \
+    } \
+} while (0)
         /* ONE OUTPUT ROW PER BLOCK on the vector schedule.  Four rows per
          * block was measured a full percent slower than two, so the barrier
          * is what costs: every warp in the block reads a different weight
@@ -7631,20 +7654,42 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
 
     const dim3 dn_grid((out_dim + 7u) / 8u,
                        (n_tokens + (uint32_t)tile - 1u) / (uint32_t)tile, 1);
-#define QWEN4EXP_DOWN_IMPL_S(R, DT, V, S, SH) \
-    qwen4exp_moe_down_q_kernel<R, DT, V, S><<<dn_grid, threads, (SH), stream>>>( \
+#define QWEN4EXP_DOWN_IMPL_S(R, DT, V, S, SH) do { \
+    if (n_tokens <= 2u) { \
+        QWEN4EXP_LAUNCH_PDL( \
+            (qwen4exp_moe_down_q_kernel<R, DT, V, S>), \
+            dn_grid, threads, (SH), stream, \
             (float *)out->ptr, down, (const int32_t *)selected->ptr, \
             sc.mq, sc.ms, sc.msum, \
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
-            mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
+            mgroups, out_dim, n_tokens, n_total_expert, n_expert_used); \
+    } else { \
+        qwen4exp_moe_down_q_kernel<R, DT, V, S><<<dn_grid, threads, (SH), stream>>>( \
+            (float *)out->ptr, down, (const int32_t *)selected->ptr, \
+            sc.mq, sc.ms, sc.msum, \
+            down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
+            mgroups, out_dim, n_tokens, n_total_expert, n_expert_used); \
+    } \
+} while (0)
 #define QWEN4EXP_DOWN_IMPL(R, DT, V) QWEN4EXP_DOWN_IMPL_S(R, DT, V, false, 0)
-#define QWEN4EXP_DOWN_ASYNC(DT) \
-    qwen4exp_moe_down_q_kernel<2, DT, true, true, true><<< \
+#define QWEN4EXP_DOWN_ASYNC(DT) do { \
+    if (n_tokens <= 2u) { \
+        QWEN4EXP_LAUNCH_PDL( \
+            (qwen4exp_moe_down_q_kernel<2, DT, true, true, true>), \
+            dn_grid, threads, (size_t)dn_shared, stream, \
+            (float *)out->ptr, down, (const int32_t *)selected->ptr, \
+            sc.mq, sc.ms, sc.msum, \
+            down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
+            mgroups, out_dim, n_tokens, n_total_expert, n_expert_used); \
+    } else { \
+        qwen4exp_moe_down_q_kernel<2, DT, true, true, true><<< \
             dn_grid, threads, (size_t)dn_shared, stream>>>( \
             (float *)out->ptr, down, (const int32_t *)selected->ptr, \
             sc.mq, sc.ms, sc.msum, \
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
-            mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
+            mgroups, out_dim, n_tokens, n_total_expert, n_expert_used); \
+    } \
+} while (0)
 #define QWEN4EXP_DOWN(R) do { \
     if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q5_1) { \
         QWEN4EXP_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q5_1, false); \
