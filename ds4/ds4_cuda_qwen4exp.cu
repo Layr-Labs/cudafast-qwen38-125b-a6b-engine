@@ -4464,6 +4464,22 @@ qwen4exp_moe_gateup_split_kernel(
     const bool second = (warp & 1u) != 0u;
     uint32_t expert = blockIdx.y;
     if (active) {
+    /* The routed gate/up edge, opened on the kernel the COOP decode path runs.
+     *
+     * The dependent launch already exists in this file on
+     * qwen4exp_moe_gateup_q_kernel, and its comment states the mechanism: the
+     * blocks are already up and scheduled when the quantizer's last group
+     * retires, instead of paying a launch behind it. The coop schedule does not
+     * use that kernel -- it uses this one, and this one was launched plainly.
+     *
+     * .nc rule: no pointer in this signature carries __restrict__, so no
+     * activation load can be hoisted above the fence as ld.global.nc.
+     * Deadlock rule: it constrains the PRODUCER, and the quantizer bounds
+     * itself to one wave before it triggers, so a multi-wave dependent is safe.
+     * Launched plainly -- three rows, every prefill width -- the fence is a
+     * no-op, exactly as it is for the kernel beside it. */
+    QWEN4EXP_PDL_SYNC();
+
         if ((int32_t)blockIdx.y >= active[0]) return;
         expert = (uint32_t)active[1 + blockIdx.y];
     }
@@ -4851,6 +4867,14 @@ __global__ static void qwen4exp_moe_down_q_kernel(
         uint32_t n_tokens,
         uint32_t n_total_expert,
         uint32_t n_expert_used) {
+    /* The routed DOWN edge, on the same argument as the gate/up edge beside it:
+     * the blocks are up and scheduled when the producer's last warps retire,
+     * instead of paying a launch behind them.  No pointer in this signature
+     * carries __restrict__, so the .nc rule needs nothing here, and the
+     * producer is the gate/up kernel this file already treats as a safe
+     * trigger.  Launched plainly the fence is a no-op. */
+    QWEN4EXP_PDL_SYNC();
+
     /* Dynamic shared memory is 16-byte aligned by contract, and it is requested
      * only for the Stage instantiations; the others map nothing here. */
     extern __shared__ uint4 qw_down_panel[];
@@ -7608,8 +7632,9 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             (gate_slab->expert_bytes & 15ull) == 0ull &&
             (up_slab->expert_bytes & 15ull) == 0ull;
 #define QWEN4EXP_SPLIT_GATEUP(V, P, C) \
-        qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P, C><<< \
-            dim3((mid_dim + P - 1u) / P, gu_rows, 1), P * 64u, 0, stream>>>( \
+        QWEN4EXP_LAUNCH_PDL( \
+            (qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P, C>), \
+            (dim3((mid_dim + P - 1u) / P, gu_rows, 1)), P * 64u, 0, stream, \
             (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum, \
             sc.pairs, sc.counts, sc.offsets, gu_active, \
             (const float *)weights->ptr, \
@@ -7660,8 +7685,9 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
 #define QWEN4EXP_DOWN_IMPL(R, DT, V) QWEN4EXP_DOWN_IMPL_S(R, DT, V, false, 0)
 #define QWEN4EXP_DOWN_ASYNC(DT) \
-    qwen4exp_moe_down_q_kernel<2, DT, true, true, true><<< \
-            dn_grid, threads, (size_t)dn_shared, stream>>>( \
+    QWEN4EXP_LAUNCH_PDL( \
+            (qwen4exp_moe_down_q_kernel<2, DT, true, true, true>), \
+            dn_grid, threads, (size_t)dn_shared, stream, \
             (float *)out->ptr, down, (const int32_t *)selected->ptr, \
             sc.mq, sc.ms, sc.msum, \
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
@@ -13191,7 +13217,13 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_scores_tensor(
         !glm53_cuda_tensor_has(pool, (uint64_t)n_blocks * head_dim, sizeof(float))) {
         return 0;
     }
-    if (n_tokens >= 8u && head_dim == 128u && n_head == 4u &&
+    /* The tile is admitted at any width whose grid still covers the device:
+     * one block per SM is the floor, so a narrow call takes the tile only when
+     * the pool is long enough to supply the blocks the per-pair kernel would
+     * otherwise supply through its own wider grid. */
+    if (head_dim == 128u && n_head == 4u &&
+        (uint64_t)((n_blocks + QWEN4EXP_IDX_TILE_B - 1u) / QWEN4EXP_IDX_TILE_B) *
+            (uint64_t)((n_tokens + QWEN4EXP_IDX_TILE_T - 1u) / QWEN4EXP_IDX_TILE_T) >= 48u &&
         getenv("DS4_QWEN4EXP_NO_IDX_TILE") == NULL) {
         const dim3 grid((n_blocks + QWEN4EXP_IDX_TILE_B - 1u) / QWEN4EXP_IDX_TILE_B,
                         (n_tokens + QWEN4EXP_IDX_TILE_T - 1u) / QWEN4EXP_IDX_TILE_T);
