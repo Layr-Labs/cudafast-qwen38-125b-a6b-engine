@@ -631,7 +631,22 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
             out[slot * value_dim + head * QWEN4EXP_GDN_DIM + value] = result;
         }
 
-        /* Post-token rollback state; SNAP_PLAIN restores the original cache hint. */
+        /* Post-token rollback state, now stored PLAIN rather than evict-first.
+         *
+         * The snapshot is the GDN state written once per drafted row and read
+         * back only when a draft is REJECTED -- about 29 of 78 drafts at this
+         * board's recorded acceptance, and never on the accepting path. It was
+         * stored with __stcs on the reasoning that a write nobody usually reads
+         * should not hold cache.
+         *
+         * Evict-first is not free on a WRITE. It forces the line out to memory
+         * instead of letting it age out, so roughly 3 MB per layer goes to DRAM
+         * every round whether or not anything reads it. A plain store lets the
+         * lines sit in L2 and be overwritten next round at the same address,
+         * which is what usually happens.
+         *
+         * Exact: a cache hint on a store changes neither the address nor the
+         * bytes it writes. */
         if (token < n_snapshot_rows) {
             const uint64_t stride = (uint64_t)n_rows * n_value_head *
                 QWEN4EXP_GDN_DIM * QWEN4EXP_GDN_DIM;
@@ -1455,7 +1470,7 @@ static int qwen4exp_cuda_gdn_run(
                     state_snapshot ? (float *)state_snapshot->ptr : NULL,
                     n_key_head, n_value_head, n_rows, n_tokens, head_layout,
                     n_snapshot_rows,
-                    getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
+                    /* plain, see the note above the snapshot kernel */ 1u);
         } else if (getenv("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE") == NULL &&
             getenv("DS4_QWEN4EXP_NO_GDN_SPLIT_REDUCE") == NULL) {
             qwen4exp_gdn_split_reduce_kernel<<<
@@ -1466,7 +1481,7 @@ static int qwen4exp_cuda_gdn_run(
                     state_snapshot ? (float *)state_snapshot->ptr : NULL,
                     n_key_head, n_value_head, n_rows, n_tokens, head_layout,
                     n_snapshot_rows,
-                    getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
+                    /* plain, see the note above the snapshot kernel */ 1u);
         } else if (n_key_head == 16u && n_value_head == 48u &&
             getenv("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE") == NULL) {
             if (getenv("DS4_QWEN4EXP_NO_GDN_VALUE_VECTOR") == NULL) {
@@ -1479,7 +1494,7 @@ static int qwen4exp_cuda_gdn_run(
                         state_snapshot ? (float *)state_snapshot->ptr : NULL,
                         n_key_head, n_value_head, n_rows, n_tokens, head_layout,
                         n_snapshot_rows,
-                        getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
+                        /* plain, see the note above the snapshot kernel */ 1u);
             } else {
                 qwen4exp_gdn_value_reuse_kernel<4u><<<
                         dim3(n_value_head, QWEN4EXP_GDN_DIM / 16u, n_rows), QWEN4EXP_GDN_DIM, 0, stream>>>(
@@ -1490,7 +1505,7 @@ static int qwen4exp_cuda_gdn_run(
                         state_snapshot ? (float *)state_snapshot->ptr : NULL,
                         n_key_head, n_value_head, n_rows, n_tokens, head_layout,
                         n_snapshot_rows,
-                        getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
+                        /* plain, see the note above the snapshot kernel */ 1u);
             }
         } else {
             qwen4exp_gdn_recurrence_kernel<true><<<
@@ -1611,38 +1626,6 @@ extern "C" int ds4_gpu_qwen4exp_gdn_prefill_q8(
         qk_norm_eps, norm_eps, out_q8, q_offset, s_offset, NULL, "prefill");
 }
 
-extern "C" int ds4_gpu_qwen4exp_gdn_decode_q8(
-        ds4_gpu_tensor       *out,
-        ds4_gpu_tensor       *conv_state,
-        ds4_gpu_tensor       *recurrent_state,
-        ds4_gpu_tensor       *qkv,
-        const ds4_gpu_tensor *raw_alpha,
-        const ds4_gpu_tensor *raw_beta,
-        const ds4_gpu_tensor *output_gate,
-        const ds4_gpu_qwen4exp_slab *conv_weight_slab,
-        const ds4_gpu_qwen4exp_slab *a_log_slab,
-        const ds4_gpu_qwen4exp_slab *dt_bias_slab,
-        const ds4_gpu_qwen4exp_slab *output_norm_slab,
-        uint32_t              n_key_head,
-        uint32_t              n_value_head,
-        uint32_t              n_rows,
-        uint32_t              head_layout,
-        float                 qk_norm_eps,
-        float                 norm_eps,
-        ds4_gpu_tensor       *out_q8,
-        uint64_t              q_offset,
-        uint64_t              s_offset) {
-    /* A one-token forward has no row to roll back to but its own start, which
-     * is what the round-start path already keeps. */
-    return qwen4exp_cuda_gdn_run(
-        out, conv_state, recurrent_state, NULL, NULL, 0u,
-        qkv, raw_alpha, raw_beta,
-        output_gate, conv_weight_slab, a_log_slab, dt_bias_slab,
-        output_norm_slab,
-        n_key_head, n_value_head, n_rows, 1u, head_layout,
-        qk_norm_eps, norm_eps, out_q8, q_offset, s_offset, NULL, "decode");
-}
-
 extern "C" int ds4_gpu_qwen4exp_gdn_decode(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *conv_state,
@@ -1665,11 +1648,15 @@ extern "C" int ds4_gpu_qwen4exp_gdn_decode(
         uint32_t              head_layout,
         float                 qk_norm_eps,
         float                 norm_eps) {
-    return ds4_gpu_qwen4exp_gdn_decode_q8(
-        out, conv_state, recurrent_state, qkv, raw_alpha, raw_beta,
+    /* A one-token forward has no row to roll back to but its own start, which
+     * is what the round-start path already keeps. */
+    return qwen4exp_cuda_gdn_run(
+        out, conv_state, recurrent_state, NULL, NULL, 0u,
+        qkv, raw_alpha, raw_beta,
         output_gate, conv_weight_slab, a_log_slab, dt_bias_slab,
-        output_norm_slab, n_key_head, n_value_head, n_rows, head_layout,
-        qk_norm_eps, norm_eps, NULL, 0u, 0u);
+        output_norm_slab,
+        n_key_head, n_value_head, n_rows, 1u, head_layout,
+        qk_norm_eps, norm_eps, NULL, 0u, 0u, NULL, "decode");
 }
 
 /* The GDN block at a speculative width -- one row of n_tokens <= the commit
@@ -1680,41 +1667,6 @@ extern "C" int ds4_gpu_qwen4exp_gdn_decode(
  * captured graph bakes its address and never its value.  Both snapshot
  * buffers are required, for reading, even when n_snapshot_rows is 0, and the
  * token-parallel convolution is never taken. */
-extern "C" int ds4_gpu_qwen4exp_gdn_adopt_q8(
-        ds4_gpu_tensor       *out,
-        ds4_gpu_tensor       *conv_state,
-        ds4_gpu_tensor       *recurrent_state,
-        ds4_gpu_tensor       *conv_snapshot,
-        ds4_gpu_tensor       *state_snapshot,
-        uint32_t              n_snapshot_rows,
-        const ds4_gpu_tensor *adopt,
-        ds4_gpu_tensor       *qkv,
-        const ds4_gpu_tensor *raw_alpha,
-        const ds4_gpu_tensor *raw_beta,
-        const ds4_gpu_tensor *output_gate,
-        const ds4_gpu_qwen4exp_slab *conv_weight_slab,
-        const ds4_gpu_qwen4exp_slab *a_log_slab,
-        const ds4_gpu_qwen4exp_slab *dt_bias_slab,
-        const ds4_gpu_qwen4exp_slab *output_norm_slab,
-        uint32_t              n_key_head,
-        uint32_t              n_value_head,
-        uint32_t              n_tokens,
-        uint32_t              head_layout,
-        float                 qk_norm_eps,
-        float                 norm_eps,
-        ds4_gpu_tensor       *out_q8,
-        uint64_t              q_offset,
-        uint64_t              s_offset) {
-    if (!adopt) return 0;
-    return qwen4exp_cuda_gdn_run(
-        out, conv_state, recurrent_state, conv_snapshot, state_snapshot,
-        n_snapshot_rows, qkv, raw_alpha, raw_beta,
-        output_gate, conv_weight_slab, a_log_slab, dt_bias_slab,
-        output_norm_slab,
-        n_key_head, n_value_head, 1u, n_tokens, head_layout,
-        qk_norm_eps, norm_eps, out_q8, q_offset, s_offset, adopt, "adopt");
-}
-
 extern "C" int ds4_gpu_qwen4exp_gdn_adopt(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *conv_state,
@@ -1737,12 +1689,14 @@ extern "C" int ds4_gpu_qwen4exp_gdn_adopt(
         uint32_t              head_layout,
         float                 qk_norm_eps,
         float                 norm_eps) {
-    return ds4_gpu_qwen4exp_gdn_adopt_q8(
+    if (!adopt) return 0;
+    return qwen4exp_cuda_gdn_run(
         out, conv_state, recurrent_state, conv_snapshot, state_snapshot,
-        n_snapshot_rows, adopt, qkv, raw_alpha, raw_beta,
+        n_snapshot_rows, qkv, raw_alpha, raw_beta,
         output_gate, conv_weight_slab, a_log_slab, dt_bias_slab,
-        output_norm_slab, n_key_head, n_value_head, n_tokens, head_layout,
-        qk_norm_eps, norm_eps, NULL, 0u, 0u);
+        output_norm_slab,
+        n_key_head, n_value_head, 1u, n_tokens, head_layout,
+        qk_norm_eps, norm_eps, NULL, 0u, 0u, adopt, "adopt");
 }
 
 /* ------------------------------------------------------------------
@@ -4259,7 +4213,7 @@ __device__ __forceinline__ static void qwen4exp_shared_vector_accumulate(
 #ifndef DS4_GATEUP_COOP_BUILD
 #define DS4_GATEUP_COOP_BUILD 1
 #endif
-#define QW_GU_COOP_ROWS 8u
+#define QW_GU_COOP_ROWS 4u
 #define QW_GU_COOP_ROW_U4 90u                /* 1440 B, ten q4_K super-blocks */
 #define QW_GU_COOP_GROUPS 80u                            /* in_dim 2560 / 32 */
 #define QW_GU_COOP_U4 (QW_GU_COOP_ROWS * QW_GU_COOP_ROW_U4)
@@ -4769,8 +4723,7 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
  * almost nothing here and that residency is not this kernel's constraint
  * either.  If registers ever need to come down, it has to be by removing live
  * state at source. */
-template <int R, int DownType = -1, bool Vector = false, bool Stage = false,
-          bool Async = false>
+template <int R, int DownType = -1, bool Vector = false, bool Stage = false>
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
@@ -4855,33 +4808,18 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                     (uint64_t)row0 * down_row_bytes;
                 for (uint64_t o = (uint64_t)threadIdx.x * 16u;
                      o < panel_bytes; o += (uint64_t)blockDim.x * 16u) {
-                    if (Async) {
-                        qw_cpasync16((uint32_t)__cvta_generic_to_shared(dst + o),
-                                     gp + o);
-                    } else {
-                        *(uint4 *)(dst + o) = *(const uint4 *)(gp + o);
-                    }
+                    *(uint4 *)(dst + o) = *(const uint4 *)(gp + o);
                 }
             }
         }
     };
-    if (Stage) {
-        qw_fill_step(0u, 0u, spanel);
-        if (Async) qw_cpasync_commit();
-    }
+    if (Stage) qw_fill_step(0u, 0u, spanel);
     for (uint32_t slot = 0; slot < n_expert_used; slot++) {
 #pragma unroll
         for (int r = 0; r < R; r++) {
             if ((uint32_t)r < take) {
                 const uint32_t step = slot * take + (uint32_t)r;
                 if (Stage) {
-                    /* Each lane waits for its own copies, then the block
-                     * publishes the complete panel. The other buffer's next
-                     * fill runs concurrently with this step's arithmetic.
-                     * The barrier also retires its previous readers before
-                     * that buffer is reused. Invalid routes commit an empty
-                     * group and still reach both fences. */
-                    if (Async) qw_cpasync_wait0();
                     __syncthreads();
                     const uint32_t nr =
                         (uint32_t)r + 1u < take ? (uint32_t)r + 1u : 0u;
@@ -4890,7 +4828,6 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                     if (nslot < n_expert_used) {
                         qw_fill_step(nslot, nr, spanel +
                                      (uint64_t)((step + 1u) & 1u) * panel_bytes);
-                        if (Async) qw_cpasync_commit();
                     }
                 }
                 const uint32_t t = tok0 + (uint32_t)r;
@@ -7571,13 +7508,6 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
             mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
 #define QWEN4EXP_DOWN_IMPL(R, DT, V) QWEN4EXP_DOWN_IMPL_S(R, DT, V, false, 0)
-#define QWEN4EXP_DOWN_ASYNC(DT) \
-    qwen4exp_moe_down_q_kernel<2, DT, true, true, true><<< \
-            dn_grid, threads, (size_t)dn_shared, stream>>>( \
-            (float *)out->ptr, down, (const int32_t *)selected->ptr, \
-            sc.mq, sc.ms, sc.msum, \
-            down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
-            mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
 #define QWEN4EXP_DOWN(R) do { \
     if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q5_1) { \
         QWEN4EXP_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q5_1, false); \
@@ -7656,18 +7586,14 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             dn_shared <= QW_DOWN_PANEL_MAX_BYTES &&
             getenv("DS4_QWEN4EXP_NO_DOWN_PANEL") == NULL;
         if (down_slab->type == DS4_QWEN4EXP_TY_q8_0) {
-            if (dn_stage && getenv("DS4_QWEN4EXP_NO_DOWN_ASYNC") == NULL) {
-                QWEN4EXP_DOWN_ASYNC(DS4_QWEN4EXP_TY_q8_0);
-            } else if (dn_stage) {
+            if (dn_stage) {
                 QWEN4EXP_DOWN_IMPL_S(2, DS4_QWEN4EXP_TY_q8_0, true, true,
                                      (size_t)dn_shared);
             } else {
                 QWEN4EXP_DOWN_IMPL(2, DS4_QWEN4EXP_TY_q8_0, true);
             }
         } else {
-            if (dn_stage && getenv("DS4_QWEN4EXP_NO_DOWN_ASYNC") == NULL) {
-                QWEN4EXP_DOWN_ASYNC(DS4_QWEN4EXP_TY_q5_1);
-            } else if (dn_stage) {
+            if (dn_stage) {
                 QWEN4EXP_DOWN_IMPL_S(2, DS4_QWEN4EXP_TY_q5_1, true, true,
                                      (size_t)dn_shared);
             } else {
@@ -7682,7 +7608,6 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
 #undef QWEN4EXP_DOWN
 #undef QWEN4EXP_DOWN_IMPL
 #undef QWEN4EXP_DOWN_IMPL_S
-#undef QWEN4EXP_DOWN_ASYNC
     return cuda_ok(cudaGetLastError(), "qwen4exp MoE down launch");
 }
 
