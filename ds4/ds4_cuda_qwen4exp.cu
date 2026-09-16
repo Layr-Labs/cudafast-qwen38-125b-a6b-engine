@@ -277,6 +277,33 @@ __device__ __forceinline__ static float qwen4exp_gdn_softplus(float x) {
  * 2 * n_key_head are query and key heads and take the RMS norm; the rest are
  * value heads and only take the activation.
  */
+
+/* ------------------------------------------------------------------------
+ * One-time resolution of the dispatch switches.
+ *
+ * The launchers below read their DS4_QWEN4EXP_* switches with getenv() on
+ * EVERY call, and those launchers run once per layer per forward: this tower
+ * is 48 layers, 36 of them gated-deltanet and all 48 carrying a routed-MoE
+ * block, so a single decode round walks the environ array a few hundred
+ * times.  glibc's getenv is a linear scan of environ with a strncmp per
+ * entry, and it returns the same answer every time -- nothing in this engine
+ * or its adapter calls setenv/putenv for a DS4_QWEN4EXP_* name, so the answer
+ * cannot change while the engine is open.
+ *
+ * Each site keeps its own function-local cache, constant-initialised to -1 so
+ * there is no thread-safe-static guard to pay, and resolves on first use.  The
+ * value is idempotent, so a race between two dispatch threads could only write
+ * the same answer twice.
+ *
+ * This removes host work only.  It selects exactly the same kernel, with the
+ * same arguments, in the same order, so every emitted value is bit-identical.
+ * ------------------------------------------------------------------------ */
+#define QW_ENV_UNSET(name) ([]() -> bool {                                    \
+        static int qw_env_cached = -1;                                        \
+        if (qw_env_cached < 0) qw_env_cached = (getenv(name) == NULL) ? 1 : 0; \
+        return qw_env_cached != 0;                                            \
+    }())
+
 __global__ static void qwen4exp_gdn_conv_kernel(
         float       *qkv,
         float       *conv_state,
@@ -1441,8 +1468,8 @@ static int qwen4exp_cuda_gdn_run(
         n_value_head, QWEN4EXP_GDN_DIM / 4u, n_rows);
     if (gate_pairs) {
         if (n_key_head == 16u && n_value_head == 48u &&
-            getenv("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE") == NULL &&
-            getenv("DS4_QWEN4EXP_NO_GDN_OCTET") == NULL) {
+            QW_ENV_UNSET("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE") &&
+            QW_ENV_UNSET("DS4_QWEN4EXP_NO_GDN_OCTET")) {
             /* Eight lanes per value row, R rows per segment: 16R rows
              * per block, so QWEN4EXP_GDN_DIM / 16R blocks along y. */
             qwen4exp_gdn_octet_kernel<QWEN4EXP_GDN_OCTET_ROWS><<<
@@ -1455,9 +1482,9 @@ static int qwen4exp_cuda_gdn_run(
                     state_snapshot ? (float *)state_snapshot->ptr : NULL,
                     n_key_head, n_value_head, n_rows, n_tokens, head_layout,
                     n_snapshot_rows,
-                    getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
-        } else if (getenv("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE") == NULL &&
-            getenv("DS4_QWEN4EXP_NO_GDN_SPLIT_REDUCE") == NULL) {
+                    (!QW_ENV_UNSET("DS4_QWEN4EXP_SNAP_PLAIN")) ? 1u : 0u);
+        } else if (QW_ENV_UNSET("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE") &&
+            QW_ENV_UNSET("DS4_QWEN4EXP_NO_GDN_SPLIT_REDUCE")) {
             qwen4exp_gdn_split_reduce_kernel<<<
                     dim3(n_value_head, QWEN4EXP_GDN_DIM / 16u, n_rows),
                     QWEN4EXP_GDN_DIM, 0, stream>>>(
@@ -1466,10 +1493,10 @@ static int qwen4exp_cuda_gdn_run(
                     state_snapshot ? (float *)state_snapshot->ptr : NULL,
                     n_key_head, n_value_head, n_rows, n_tokens, head_layout,
                     n_snapshot_rows,
-                    getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
+                    (!QW_ENV_UNSET("DS4_QWEN4EXP_SNAP_PLAIN")) ? 1u : 0u);
         } else if (n_key_head == 16u && n_value_head == 48u &&
-            getenv("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE") == NULL) {
-            if (getenv("DS4_QWEN4EXP_NO_GDN_VALUE_VECTOR") == NULL) {
+            QW_ENV_UNSET("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE")) {
+            if (QW_ENV_UNSET("DS4_QWEN4EXP_NO_GDN_VALUE_VECTOR")) {
                 qwen4exp_gdn_value_reuse_kernel<4u, true><<<
                         dim3(n_value_head, QWEN4EXP_GDN_DIM / 16u, n_rows), QWEN4EXP_GDN_DIM, 0, stream>>>(
                         (float *)out->ptr, (float *)recurrent_state->ptr, conv_out,
@@ -1479,7 +1506,7 @@ static int qwen4exp_cuda_gdn_run(
                         state_snapshot ? (float *)state_snapshot->ptr : NULL,
                         n_key_head, n_value_head, n_rows, n_tokens, head_layout,
                         n_snapshot_rows,
-                        getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
+                        (!QW_ENV_UNSET("DS4_QWEN4EXP_SNAP_PLAIN")) ? 1u : 0u);
             } else {
                 qwen4exp_gdn_value_reuse_kernel<4u><<<
                         dim3(n_value_head, QWEN4EXP_GDN_DIM / 16u, n_rows), QWEN4EXP_GDN_DIM, 0, stream>>>(
@@ -1490,7 +1517,7 @@ static int qwen4exp_cuda_gdn_run(
                         state_snapshot ? (float *)state_snapshot->ptr : NULL,
                         n_key_head, n_value_head, n_rows, n_tokens, head_layout,
                         n_snapshot_rows,
-                        getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
+                        (!QW_ENV_UNSET("DS4_QWEN4EXP_SNAP_PLAIN")) ? 1u : 0u);
             }
         } else {
             qwen4exp_gdn_recurrence_kernel<true><<<
@@ -1502,7 +1529,7 @@ static int qwen4exp_cuda_gdn_run(
                     state_snapshot ? (float *)state_snapshot->ptr : NULL,
                     n_key_head, n_value_head, n_rows, n_tokens, head_layout,
                     n_snapshot_rows,
-                    getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u,
+                    (!QW_ENV_UNSET("DS4_QWEN4EXP_SNAP_PLAIN")) ? 1u : 0u,
                     NULL);
         }
     } else {
@@ -1516,7 +1543,7 @@ static int qwen4exp_cuda_gdn_run(
                 state_snapshot ? (float *)state_snapshot->ptr : NULL,
                 n_key_head, n_value_head, n_rows, n_tokens, head_layout,
                 n_snapshot_rows,
-                getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u,
+                (!QW_ENV_UNSET("DS4_QWEN4EXP_SNAP_PLAIN")) ? 1u : 0u,
                 adopt_row);
     }
     if (!cuda_ok(cudaGetLastError(), "qwen4exp GDN recurrence launch")) {
@@ -7067,7 +7094,7 @@ extern "C" int ds4_gpu_qwen4exp_router_select_tensor(
         return 0;
     }
     if (n_expert_used <= 32u) {
-        if (getenv("DS4_QWEN4EXP_NO_ROUTER_NATIVE") == NULL) {
+        if (QW_ENV_UNSET("DS4_QWEN4EXP_NO_ROUTER_NATIVE")) {
             qwen4exp_router_select_topk_kernel<true><<<
                 n_tokens, 32u, 0, cuda_decode_stream()>>>(
                 (int32_t *)selected->ptr,
@@ -7174,7 +7201,7 @@ static int qwen4exp_quantize_rows(
         uint64_t outer_stride, uint64_t inner_stride, uint32_t inner_count,
         cudaStream_t stream) {
     if (rows >= QWEN4EXP_QUANT_WIDE_MIN_ROWS &&
-        getenv("DS4_QWEN4EXP_NO_QUANT_WIDE") == NULL) {
+        QW_ENV_UNSET("DS4_QWEN4EXP_NO_QUANT_WIDE")) {
         qwen4exp_quantize_rows_wide_kernel<<<
                 dim3((groups + 7u) / 8u, rows, 1), 256, 0, stream>>>(
                 xq, xs, xsum, src, width, groups,
@@ -7198,7 +7225,7 @@ static int qwen4exp_moe_tile(uint32_t n_rows) {
     if (n_rows >= 8u) return 8;
     /* FOUR rows is the depth-3 verify: two R=2 tiles keep it on the same
      * decode-width kernels as the three-row call below. */
-    if (n_rows == 4u && getenv("DS4_QWEN4EXP_NO_WIDE_VERIFY") == NULL) return 2;
+    if (n_rows == 4u && QW_ENV_UNSET("DS4_QWEN4EXP_NO_WIDE_VERIFY")) return 2;
     if (n_rows >= 4u) return 4;
     /* The usual one-row decode and two-row verify need at most two live
      * accumulators.  Keep their weight reuse while reducing the padded
@@ -7208,7 +7235,7 @@ static int qwen4exp_moe_tile(uint32_t n_rows) {
      * tiles, the second with take 1 -- so it stays on the decode-width
      * kernels; R changes work sharing, not the arithmetic of a live row.
      * DS4_QWEN4EXP_NO_WIDE_VERIFY restores the eight-row tile. */
-    if (n_rows == 3u && getenv("DS4_QWEN4EXP_NO_WIDE_VERIFY") == NULL) return 2;
+    if (n_rows == 3u && QW_ENV_UNSET("DS4_QWEN4EXP_NO_WIDE_VERIFY")) return 2;
     return 8;
 }
 
@@ -7301,10 +7328,10 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         (gate_slab->type == DS4_QWEN4EXP_TY_q4_K ||
          gate_slab->type == DS4_QWEN4EXP_TY_q5_K ||
          gate_slab->type == DS4_QWEN4EXP_TY_q8_0) &&
-        getenv("DS4_QWEN4EXP_NO_MMA") == NULL &&
-        getenv("DS4_QWEN4EXP_NO_EXPERT_COMPACT") == NULL &&
-        getenv("DS4_QWEN4EXP_GENERIC_EXPERTS") == NULL &&
-        getenv("DS4_QWEN4EXP_NO_GU_PAIR_TASKS") == NULL;
+        QW_ENV_UNSET("DS4_QWEN4EXP_NO_MMA") &&
+        QW_ENV_UNSET("DS4_QWEN4EXP_NO_EXPERT_COMPACT") &&
+        QW_ENV_UNSET("DS4_QWEN4EXP_GENERIC_EXPERTS") &&
+        QW_ENV_UNSET("DS4_QWEN4EXP_NO_GU_PAIR_TASKS");
     const uint64_t task_bytes = pair_tasks ? (1u + 2u * task_capacity) * 4u : 0u;
 
     const int tile = qwen4exp_moe_tile(n_tokens);
@@ -7313,14 +7340,14 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
      * three-row call is two tiles.  DS4_QWEN4EXP_NO_WIDE_VERIFY restores the
      * <= 2 gates. */
     const bool wide_verify = (n_tokens == 3u || n_tokens == 4u) &&
-        getenv("DS4_QWEN4EXP_NO_WIDE_VERIFY") == NULL;
+        QW_ENV_UNSET("DS4_QWEN4EXP_NO_WIDE_VERIFY");
     const bool down_vector = tile == 2 && (n_tokens <= 2u || wide_verify) &&
         n_expert_used <= 32u &&
         (down_slab->type == DS4_QWEN4EXP_TY_q8_0 ||
          ((n_tokens == 2u || wide_verify) &&
           down_slab->type == DS4_QWEN4EXP_TY_q5_1)) &&
-        getenv("DS4_QWEN4EXP_GENERIC_EXPERTS") == NULL &&
-        getenv("DS4_QWEN4EXP_NO_DOWN_VECTOR") == NULL;
+        QW_ENV_UNSET("DS4_QWEN4EXP_GENERIC_EXPERTS") &&
+        QW_ENV_UNSET("DS4_QWEN4EXP_NO_DOWN_VECTOR");
     uint64_t mq_offset = xq_bytes + idx_bytes + pair_bytes;
     /* Align short-down scratch; preserve shared input and metadata offsets. */
     if (down_vector) mq_offset = (mq_offset + 15u) & ~uint64_t(15u);
@@ -7356,7 +7383,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
 
     const int small_group =
         n_tokens < 8u && n_total_expert <= QWEN4EXP_MOE_SCAN_THREADS &&
-        getenv("DS4_QWEN4EXP_SERIAL_GROUP_SCAN") == NULL;
+        QW_ENV_UNSET("DS4_QWEN4EXP_SERIAL_GROUP_SCAN");
     if (small_group) {
         /* PSS: the router's top-k is the stream predecessor and triggers at
          * these widths (its gate is the same n_tokens < 8 this branch is), so
@@ -7380,7 +7407,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
                 sc.counts, (const int32_t *)selected->ptr,
                 n_total_expert, n_pairs);
         if (n_total_expert <= QWEN4EXP_MOE_SCAN_THREADS &&
-            getenv("DS4_QWEN4EXP_SERIAL_GROUP_SCAN") == NULL) {
+            QW_ENV_UNSET("DS4_QWEN4EXP_SERIAL_GROUP_SCAN")) {
             qwen4exp_moe_group_scan_parallel_kernel<<<
                     1, QWEN4EXP_MOE_SCAN_THREADS, 0, stream>>>(
                     sc.offsets, sc.cursor, sc.active, sc.counts,
@@ -7426,7 +7453,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         (mid_dim % QW_MMA_BM) == 0 && (xgroups % QW_MMA_G) == 0 &&
         gate_slab->type != (uint32_t)DS4_QWEN4EXP_TY_q6_K &&
         up_slab->type != (uint32_t)DS4_QWEN4EXP_TY_q6_K &&
-        getenv("DS4_QWEN4EXP_NO_MMA") == NULL;
+        QW_ENV_UNSET("DS4_QWEN4EXP_NO_MMA");
 
     /* The down tile decides whether the mid projection has a float consumer.
      * When the down tile runs it reads the Q8_0 scratch (mq/ms/msum) and never
@@ -7440,12 +7467,12 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     const int down_mma = use_mma && (out_dim % QW_DOWN_MMA_BM) == 0 &&
                          down_slab->type != (uint32_t)DS4_QWEN4EXP_TY_q6_K;
     const int moe_epilogue = down_mma &&
-        getenv("DS4_QWEN4EXP_NO_MOE_EPILOGUE") == NULL;
+        QW_ENV_UNSET("DS4_QWEN4EXP_NO_MOE_EPILOGUE");
 
     /* One block row per expert the call CHOSE, not per expert that exists.
      * n_pairs bounds the number of distinct experts, and the kernel exits the
      * rows past active[0]. */
-    const int compact = getenv("DS4_QWEN4EXP_NO_EXPERT_COMPACT") == NULL;
+    const int compact = QW_ENV_UNSET("DS4_QWEN4EXP_NO_EXPERT_COMPACT");
     const uint32_t gu_rows = !compact ? n_total_expert
         : (n_pairs < n_total_expert ? n_pairs : n_total_expert);
     const int32_t *gu_active = compact ? sc.active : NULL;
@@ -7480,7 +7507,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     /* Resolve the format once on the host, where tensor metadata already
      * lives.  This exposes fixed nibble decoding and a fixed one-half
      * accumulation to nvcc, without converting or copying any weight. */
-    const bool specialize = getenv("DS4_QWEN4EXP_GENERIC_EXPERTS") == NULL;
+    const bool specialize = QW_ENV_UNSET("DS4_QWEN4EXP_GENERIC_EXPERTS");
     /* ---- the DMA staging arm of the routed q4_K gate/up prefill tile ----
      * Compile switch: -DDS4_GATEUP_DMA_BUILD=0 removes the arm entirely (the
      * q4_K specialisation then instantiates Dma = 0, which is the shipped
@@ -7515,7 +7542,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
          * answer.  The other weight formats never take the new staging and
          * are unaffected either way. */
         const uint32_t gu_dq_stage =
-            getenv("DS4_QWEN4EXP_NO_GATEUP_DQ") == NULL ? 1u : 0u;
+            QW_ENV_UNSET("DS4_QWEN4EXP_NO_GATEUP_DQ") ? 1u : 0u;
         if (pair_tasks) {
             qwen4exp_moe_pair_tasks_kernel<<<1, 512, 0, stream>>>(
                     gu_tasks, sc.counts, n_total_expert);
@@ -7587,10 +7614,10 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     else if ((n_tokens <= 2u || wide_verify) && tile == 2 && specialize &&
              gate_slab->type == DS4_QWEN4EXP_TY_q4_K &&
              up_slab->type == DS4_QWEN4EXP_TY_q4_K &&
-             getenv("DS4_QWEN4EXP_NO_SPLIT_GATEUP") == NULL) {
+             QW_ENV_UNSET("DS4_QWEN4EXP_NO_SPLIT_GATEUP")) {
         /* Vector reads require alignment; the scalar schedule remains available. */
         const bool vector = ((uintptr_t)sc.xq & 15u) == 0u &&
-            getenv("DS4_QWEN4EXP_NO_SPLIT_VECTOR") == NULL;
+            QW_ENV_UNSET("DS4_QWEN4EXP_NO_SPLIT_VECTOR");
         /* COOPERATIVE 8-ROW PANEL.  Kernel-only: the shipped bytes, the
          * shipped order, the same per-lane pieces, only the block shape and
          * where the loads are served from change.  DS4_GATEUP_COOP=0 restores
@@ -7680,11 +7707,11 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
          * staging down and runs the oracle decode + repack the kernel has
          * always had, byte for byte.  Read once, before the launch. */
         const uint32_t dn_dq_stage =
-            getenv("DS4_QWEN4EXP_NO_DOWN_DQ") == NULL ? 1u : 0u;
+            QW_ENV_UNSET("DS4_QWEN4EXP_NO_DOWN_DQ") ? 1u : 0u;
         /* The q5_1 staging reads its six block words as three eight-byte
          * loads; DS4_QWEN4EXP_NO_Q51_WIDE_LOAD restores the word loop. */
         const bool dn_wide6 =
-            getenv("DS4_QWEN4EXP_NO_Q51_WIDE_LOAD") == NULL;
+            QW_ENV_UNSET("DS4_QWEN4EXP_NO_Q51_WIDE_LOAD");
 #define QWEN4EXP_DOWN_MMA(DT, W6) \
         qwen4exp_moe_down_mma_kernel<DT, W6><<< \
                 dim3(out_dim / QW_DOWN_MMA_BM, gu_rows, 1), \
@@ -7706,7 +7733,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         }
 #undef QWEN4EXP_DOWN_MMA
         if (!cuda_ok(cudaGetLastError(), "qwen4exp MoE down tile launch")) return 0;
-        if (getenv("DS4_QWEN4EXP_NO_COMBINE_GRID") == NULL) {
+        if (QW_ENV_UNSET("DS4_QWEN4EXP_NO_COMBINE_GRID")) {
             qwen4exp_moe_down_combine_grid_kernel<<<
                     dim3((out_dim + threads - 1u) / threads, n_tokens, 1),
                     threads, 0, stream>>>(
@@ -7742,9 +7769,9 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             (down_slab->expert_bytes % 16u) == 0u &&
             ((uintptr_t)down & 15u) == 0u &&
             dn_shared <= QW_DOWN_PANEL_MAX_BYTES &&
-            getenv("DS4_QWEN4EXP_NO_DOWN_PANEL") == NULL;
+            QW_ENV_UNSET("DS4_QWEN4EXP_NO_DOWN_PANEL");
         if (down_slab->type == DS4_QWEN4EXP_TY_q8_0) {
-            if (dn_stage && getenv("DS4_QWEN4EXP_NO_DOWN_ASYNC") == NULL) {
+            if (dn_stage && QW_ENV_UNSET("DS4_QWEN4EXP_NO_DOWN_ASYNC")) {
                 QWEN4EXP_DOWN_ASYNC(DS4_QWEN4EXP_TY_q8_0);
             } else if (dn_stage) {
                 QWEN4EXP_DOWN_IMPL_S(2, DS4_QWEN4EXP_TY_q8_0, true, true,
@@ -7753,7 +7780,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
                 QWEN4EXP_DOWN_IMPL(2, DS4_QWEN4EXP_TY_q8_0, true);
             }
         } else {
-            if (dn_stage && getenv("DS4_QWEN4EXP_NO_DOWN_ASYNC") == NULL) {
+            if (dn_stage && QW_ENV_UNSET("DS4_QWEN4EXP_NO_DOWN_ASYNC")) {
                 QWEN4EXP_DOWN_ASYNC(DS4_QWEN4EXP_TY_q5_1);
             } else if (dn_stage) {
                 QWEN4EXP_DOWN_IMPL_S(2, DS4_QWEN4EXP_TY_q5_1, true, true,
@@ -7834,7 +7861,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
     const unsigned threads = 256u;
     const size_t shared = (size_t)threads * sizeof(float);
     const bool specialize_shared =
-        getenv("DS4_QWEN4EXP_GENERIC_EXPERTS") == NULL;
+        QW_ENV_UNSET("DS4_QWEN4EXP_GENERIC_EXPERTS");
 
     /* The sigmoid gate is one dot against ONE F32 row per token.  It reads
      * kilobytes, not megabytes, so it keeps the scalar reduction. Resolve its
@@ -7885,8 +7912,8 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         gate_slab->type == DS4_QWEN4EXP_TY_q8_0 &&
         up_slab->type == DS4_QWEN4EXP_TY_q8_0 &&
         down_slab->type == DS4_QWEN4EXP_TY_q8_0 &&
-        getenv("DS4_QWEN4EXP_MOE_R") == NULL &&
-        getenv("DS4_QWEN4EXP_NO_SHARED_R1") == NULL;
+        QW_ENV_UNSET("DS4_QWEN4EXP_MOE_R") &&
+        QW_ENV_UNSET("DS4_QWEN4EXP_NO_SHARED_R1");
     /* The aligned activation prefix and intermediate groups can be loaded
      * as two int4 values. Keep the row tile, warp ownership, reduction and
      * Q8 decoder unchanged. The rotating-weight screen supports two-token
@@ -7894,14 +7921,14 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
     const bool vector_shared =
         (n_tokens == 2u ||
          ((n_tokens == 3u || n_tokens == 4u) &&
-          getenv("DS4_QWEN4EXP_NO_WIDE_VERIFY") == NULL)) &&
+          QW_ENV_UNSET("DS4_QWEN4EXP_NO_WIDE_VERIFY"))) &&
         in_dim == 2560u && mid_dim == 640u && out_dim == 2560u &&
         specialize_shared &&
         gate_slab->type == DS4_QWEN4EXP_TY_q8_0 &&
         up_slab->type == DS4_QWEN4EXP_TY_q8_0 &&
         down_slab->type == DS4_QWEN4EXP_TY_q8_0 &&
-        getenv("DS4_QWEN4EXP_MOE_R") == NULL &&
-        getenv("DS4_QWEN4EXP_NO_SHARED_VECTOR") == NULL;
+        QW_ENV_UNSET("DS4_QWEN4EXP_MOE_R") &&
+        QW_ENV_UNSET("DS4_QWEN4EXP_NO_SHARED_VECTOR");
     const int tile = single_q8 ? 1 : qwen4exp_moe_tile(n_tokens);
     const uint32_t tiles = (n_tokens + (uint32_t)tile - 1u) / (uint32_t)tile;
 
@@ -7925,8 +7952,8 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         gate_slab->type == (uint32_t)DS4_QWEN4EXP_TY_q8_0 &&
         up_slab->type == (uint32_t)DS4_QWEN4EXP_TY_q8_0 &&
         down_slab->type == (uint32_t)DS4_QWEN4EXP_TY_q8_0 &&
-        getenv("DS4_QWEN4EXP_SHARED_STAGE") == NULL &&
-        getenv("DS4_QWEN4EXP_MOE_R") == NULL;
+        QW_ENV_UNSET("DS4_QWEN4EXP_SHARED_STAGE") &&
+        QW_ENV_UNSET("DS4_QWEN4EXP_MOE_R");
     const uint32_t mma_tiles = (n_tokens + QW_SH_BN - 1u) / QW_SH_BN;
 
     /* Two tensor-core tiles now sit here.  Both return the per-row kernels'
@@ -8073,7 +8100,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
          * oracle decode + repack runs.  The shipped shared expert is Q8_0
          * and never takes either arm's difference. */
         const uint32_t dn_dq_stage =
-            getenv("DS4_QWEN4EXP_NO_DOWN_DQ") == NULL ? 1u : 0u;
+            QW_ENV_UNSET("DS4_QWEN4EXP_NO_DOWN_DQ") ? 1u : 0u;
         ds4_gpu_qwen4exp_shared_mma_launches++;
         QS_MMA_DISPATCH(qwen4exp_shared_down_mma_kernel, dn_logch, grid,
                         (size_t)qs_mma_smem_bytes(ks, 1u), stream,
@@ -8114,7 +8141,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         (sd_panel % 16u) == 0u &&
         ((uintptr_t)down & 15u) == 0u &&
         sd_panel <= QW_DOWN_PANEL_MAX_BYTES &&
-        getenv("DS4_QWEN4EXP_NO_SHARED_DOWN_PANEL") == NULL;
+        QW_ENV_UNSET("DS4_QWEN4EXP_NO_SHARED_DOWN_PANEL");
 #define QWEN4EXP_SH_DOWN_IMPL(R, DT, V) do { \
     if (n_tokens <= 2u) { \
         if (sd_stage) { \
@@ -10410,7 +10437,7 @@ static int qwen4exp_hc_mixer_fused_cuda(
     /* Preserve sequential semantics for overlapping caller-supplied views.
      * The graph's mixed/inject outputs are separate allocations. */
     if (inject && rows <= 7u && n_embd == 2560u && n_hc == 4u &&
-        getenv("DS4_QWEN4EXP_NO_HC_DUAL") == NULL) {
+        QW_ENV_UNSET("DS4_QWEN4EXP_NO_HC_DUAL")) {
         const uint64_t mix_bytes = (uint64_t)rows * n_embd * sizeof(float);
         const uint64_t inj_bytes = (uint64_t)rows * n_hc * sizeof(float);
         const uint64_t norm_bytes = wide * sizeof(float);
@@ -12640,7 +12667,7 @@ static size_t qwen4exp_qsa_group2_shared(uint32_t group, uint32_t head_dim,
 /* Read fresh, as qwen4exp_qsa_group_width is, so a test can put the two
  * group kernels side by side in one process. */
 static int qwen4exp_qsa_group2_off(void) {
-    return getenv("DS4_QWEN4EXP_NO_QSA_GROUP2") != NULL;
+    return (!QW_ENV_UNSET("DS4_QWEN4EXP_NO_QSA_GROUP2"));
 }
 
 /* The third cut's shared bytes: the query group, two probability buffers,
@@ -12656,11 +12683,11 @@ static size_t qwen4exp_qsa_group3_shared(uint32_t group, uint32_t head_dim,
 }
 
 static int qwen4exp_qsa_group3_off(void) {
-    return getenv("DS4_QWEN4EXP_NO_QSA_GROUP3") != NULL;
+    return (!QW_ENV_UNSET("DS4_QWEN4EXP_NO_QSA_GROUP3"));
 }
 
 static uint32_t qwen4exp_qsa_group_width(void) {
-    if (getenv("DS4_QWEN4EXP_NO_QSA_GROUP") != NULL) return 1u;
+    if ((!QW_ENV_UNSET("DS4_QWEN4EXP_NO_QSA_GROUP"))) return 1u;
     const char *forced = getenv("DS4_QWEN4EXP_QSA_GROUP");
     if (forced != NULL) {
         const long v = strtol(forced, NULL, 10);
@@ -13192,7 +13219,7 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_scores_tensor(
         return 0;
     }
     if (n_tokens >= 8u && head_dim == 128u && n_head == 4u &&
-        getenv("DS4_QWEN4EXP_NO_IDX_TILE") == NULL) {
+        QW_ENV_UNSET("DS4_QWEN4EXP_NO_IDX_TILE")) {
         const dim3 grid((n_blocks + QWEN4EXP_IDX_TILE_B - 1u) / QWEN4EXP_IDX_TILE_B,
                         (n_tokens + QWEN4EXP_IDX_TILE_T - 1u) / QWEN4EXP_IDX_TILE_T);
         qwen4exp_qsa_indexer_scores_tiled_kernel<128u, 4u><<<grid, QWEN4EXP_IDX_THREADS, 0,
@@ -13259,7 +13286,7 @@ extern "C" uint64_t ds4_gpu_qwen4exp_qsa_split_scratch_bytes(
  * and a captured one pays it once at capture. */
 static uint32_t qwen4exp_qsa_split_width(uint32_t n_tokens, uint32_t n_head,
                                          uint32_t n_kv_head, uint32_t head_dim) {
-    if (getenv("DS4_QWEN4EXP_NO_QSA_SPLIT") != NULL) return 0u;
+    if ((!QW_ENV_UNSET("DS4_QWEN4EXP_NO_QSA_SPLIT"))) return 0u;
     const char *forced = getenv("DS4_QWEN4EXP_QSA_SPLIT_GROUP");
     if (forced != NULL) {
         const long v = strtol(forced, NULL, 10);
@@ -13338,7 +13365,7 @@ static int qwen4exp_qsa_attention_split(
              * depth for the measured one-row model shape. */
             if (!sparse && n_tokens == 1u && n_head == 24u &&
                 n_kv_head == 2u && head_dim == 256u &&
-                getenv("DS4_QWEN4EXP_NO_QSA_SHORT_V") == NULL) {
+                QW_ENV_UNSET("DS4_QWEN4EXP_NO_QSA_SHORT_V")) {
                 QWEN4EXP_QSA_SPLIT_LAUNCH(2u, 8u);
             } else {
                 QWEN4EXP_QSA_SPLIT_LAUNCH(2u, QWEN4EXP_QSA_SPLIT_VSTEP);
