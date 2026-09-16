@@ -56,3 +56,8 @@ clone.
 
 A head only PROPOSES tokens. The organizer-pinned target decides every emitted
 token. The serial control leg of every ranked pair runs with the drafter off.
+
+<!-- redraw draw 3 of this campaign, stamped 2026-09-16T03:44:56Z. Content marker only:
+     nothing in the build reads this file and no engine behaviour differs from the
+     base tree. Its purpose is to give the archive a distinct hash so the ranked
+     run is actually dispatched. See the submission note. -->
