@@ -4677,9 +4677,41 @@ qwen4exp_moe_gateup_split_kernel(
             wcoop[QW_GU_COOP_U4 + i] =
                 *(const uint4 *)(const void *)(ub + (uint64_t)i * 16u);
         }
+        /* THE FENCE SITS BELOW THE FILL AND ABOVE THE BARRIER, and the order
+         * is the whole point.  The routed-x quantizer ahead of this kernel on
+         * the stream arms a launch-completion trigger at decode width (its
+         * grid is 80 blocks by one or two rows, inside the gate's
+         * `gridDim.y <= 2 && gridDim.x * gridDim.y <= 768`), and that trigger
+         * retired into nothing while this launch was plain.  Taking the edge
+         * only for residency would leave the 11,520-byte panel behind the
+         * quantizer; hoisting the fill above the fence overlaps that DRAM
+         * traffic with the quantizer's tail on all forty-seven q4_K blocks.
+         *
+         * WHAT MAY BE READ ABOVE THE FENCE, and why each one is safe.  The
+         * fill reads `gate` and `up`, which are launch-time constants, at an
+         * offset built from `expert`; `expert`, `cnt` and `base` come from
+         * active[], counts[] and offsets[], all written by the group kernels.
+         * Those kernels are not this launch's programmatic predecessor -- the
+         * quantizer is -- and the quantizer is launched plainly, so it is
+         * stream-ordered after the group kernels and they have retired before
+         * this grid can start.  xq, xs and xsum ARE the quantizer's output and
+         * every read of them sits in the group loop below, under the fence.
+         *
+         * The barrier goes BELOW the fence, not above it: a __syncthreads()
+         * placed above a grid-dependency sync measured -39 bips on this tree,
+         * because it makes every warp wait on the slowest one before any of
+         * them may reach the fence.  None of the pointers carries __restrict__,
+         * so the .nc rule (ds4_cuda_qwen4exp.cuh) needs no change, and nothing
+         * here reorders an accumulation: every dot stays bit-identical. */
+        QWEN4EXP_PDL_SYNC();
         __syncthreads();
         wsh = wcoop + (second ? QW_GU_COOP_U4 : 0u);
         wrow = warp >> 1u;
+    } else {
+        /* The non-coop schedules stage no panel, so there is nothing to hoist
+         * and the fence simply guards the xq/xs/xsum reads below.  A plain
+         * launch leaves it a no-op. */
+        QWEN4EXP_PDL_SYNC();
     }
     for (int32_t at = 0; at < cnt; at += R) {
         const int32_t take = (cnt - at) < R ? (cnt - at) : R;
@@ -7781,7 +7813,19 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             ((uintptr_t)gate & 15u) == 0u && ((uintptr_t)up & 15u) == 0u &&
             (gate_slab->expert_bytes & 15ull) == 0ull &&
             (up_slab->expert_bytes & 15ull) == 0ull;
-#define QWEN4EXP_SPLIT_GATEUP(V, P, C) \
+#define QWEN4EXP_SPLIT_GATEUP(V, P, C) do { \
+    if (n_tokens <= 2u) { \
+        QWEN4EXP_LAUNCH_PDL( \
+            (qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P, C>), \
+            dim3((mid_dim + P - 1u) / P, gu_rows, 1), P * 64u, 0, stream, \
+            (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum, \
+            sc.pairs, sc.counts, sc.offsets, gu_active, \
+            (const float *)weights->ptr, \
+            gate_slab->expert_bytes, gate_slab->row_bytes, \
+            up_slab->expert_bytes, up_slab->row_bytes, \
+            gate_slab->type, up_slab->type, xgroups, mid_dim, \
+            mid_token_stride, n_expert_used); \
+    } else { \
         qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P, C><<< \
             dim3((mid_dim + P - 1u) / P, gu_rows, 1), P * 64u, 0, stream>>>( \
             (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum, \
@@ -7790,7 +7834,9 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             gate_slab->expert_bytes, gate_slab->row_bytes, \
             up_slab->expert_bytes, up_slab->row_bytes, \
             gate_slab->type, up_slab->type, xgroups, mid_dim, \
-            mid_token_stride, n_expert_used)
+            mid_token_stride, n_expert_used); \
+    } \
+} while (0)
         /* ONE OUTPUT ROW PER BLOCK on the vector schedule.  Four rows per
          * block was measured a full percent slower than two, so the barrier
          * is what costs: every warp in the block reads a different weight
