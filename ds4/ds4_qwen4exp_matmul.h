@@ -158,4 +158,18 @@ static inline int ds4_qwen4exp_matmul_bf16(ds4_gpu_tensor       *out,
     return 1;
 }
 
+
+/* Keep every other width on the Qwen exact BF16 policy above. */
+static inline int ds4_qwen4exp_indexer_k_bf16(
+        ds4_gpu_tensor *out, const void *map, uint64_t map_size,
+        uint64_t offset, uint32_t in_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *x, uint32_t rows) {
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (rows == 2u && in_dim == 2560u && out_dim == 128u)
+        return ds4_gpu_qwen4exp_indexer_k_bf16_r2(out, map, map_size, offset, x);
+#endif
+    return ds4_qwen4exp_matmul_bf16(out, map, map_size, offset,
+                                   in_dim, out_dim, x, rows);
+}
+
 #endif /* DS4_QWEN4EXP_MATMUL_H */

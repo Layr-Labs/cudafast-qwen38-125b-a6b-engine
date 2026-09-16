@@ -30768,6 +30768,34 @@ __global__ static void glm53_matvec_bf16_f32_kernel(
     }
 }
 
+/* Exact Qwen indexer-K two-row twin. Four output warps preserve the old
+ * 32-CTA production grid while sharing each BF16 weight across both rows.
+ * Total warps halve from 256 to 128; equal CTA count is not equal latency hiding.
+ * Each lane retains its ascending i and independent fmaf chain. */
+__global__ static void qwen4exp_indexer_k_bf16_r2_kernel(
+        float *out, const uint16_t *weights, const float *x) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t col = blockIdx.x * 4u + (threadIdx.x >> 5u);
+    const uint16_t *wrow = weights + (uint64_t)col * 2560u;
+    float sum0 = 0.0f, sum1 = 0.0f;
+    /* Only immutable weights may be read before the producer dependency. */
+    const float w0 = __uint_as_float((uint32_t)wrow[lane] << 16);
+    QWEN4EXP_PDL_SYNC();
+    sum0 = fmaf(w0, x[lane], sum0);
+    sum1 = fmaf(w0, x[2560u + lane], sum1);
+    for (uint32_t i = lane + 32u; i < 2560u; i += 32u) {
+        const float w = __uint_as_float((uint32_t)wrow[i] << 16);
+        sum0 = fmaf(w, x[i], sum0);
+        sum1 = fmaf(w, x[2560u + i], sum1);
+    }
+    sum0 = warp_sum_f32(sum0);
+    sum1 = warp_sum_f32(sum1);
+    if (lane == 0u) {
+        out[col] = sum0;
+        out[128u + col] = sum1;
+    }
+}
+
 /* glm53_matvec_bf16_f32_kernel as a register tile, for the prefill widths.
  *
  * The one-output warp above walks lane + 32m for m ascending in one fmaf
@@ -30998,6 +31026,39 @@ extern "C" int ds4_gpu_glm53_matmul_bf16(
             CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
     return cublas_ok(status, "GLM-5.3 BF16 matmul");
 }
+
+/* Called only by the Qwen indexer-K exact-shape helper. Other Qwen rows
+ * keep their existing exact matvec/grid wrapper, never the wide GLM GEMM. */
+extern "C" int ds4_gpu_qwen4exp_indexer_k_bf16_r2(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, const ds4_gpu_tensor *x) {
+    constexpr uint64_t weight_bytes = 128ull * 2560u * sizeof(uint16_t);
+    if (!out || !x || !out->ptr || !x->ptr || !model_map || !g_cublas_ready ||
+        weight_offset > model_size || weight_bytes > model_size - weight_offset ||
+        x->bytes < 2ull * 2560u * sizeof(float) ||
+        out->bytes < 2ull * 128u * sizeof(float)) return 0;
+    const int tier = ds4_tensor_device_idx(out);
+    const char *weights = cuda_resolve_weight_ptr(model_map, weight_offset,
+        weight_bytes, tier, "Qwen indexer-K BF16 two-row matrix");
+    if (!weights) return 0;
+    /* Preserve the original dispatch for caller views that overlap reads. */
+    const uintptr_t op = (uintptr_t)out->ptr, xp = (uintptr_t)x->ptr;
+    const uintptr_t wp = (uintptr_t)weights;
+    const uint64_t ob = out->bytes, xb = x->bytes;
+    const bool disjoint = ob <= UINTPTR_MAX - op && xb <= UINTPTR_MAX - xp &&
+        weight_bytes <= UINTPTR_MAX - wp &&
+        (op + ob <= xp || xp + xb <= op) &&
+        (op + ob <= wp || wp + weight_bytes <= op);
+    if (!disjoint || getenv("DS4_QWEN4EXP_NO_INDEXER_K_R2") != NULL)
+        return ds4_gpu_glm53_matmul_bf16(out, model_map, model_size,
+                                        weight_offset, 2560u, 128u, x, 2u);
+    QWEN4EXP_LAUNCH_PDL(qwen4exp_indexer_k_bf16_r2_kernel,
+        dim3(32u, 1u, 1u), 128u, 0, cuda_decode_stream(),
+        (float *)out->ptr, (const uint16_t *)weights, (const float *)x->ptr);
+    return cuda_ok(cudaGetLastError(), "Qwen indexer-K BF16 two-row launch");
+}
+
+
 
 enum {
     GLM53_CUDA_KDA_DIM = 128,

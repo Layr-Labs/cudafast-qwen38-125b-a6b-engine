@@ -1786,7 +1786,7 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
      * computation whose output no reader observes; it does not change one. */
     const bool indexed = (uint64_t)pos0 + n_tokens > DS4_N_INDEXER_TOP_K;
 
-    if (!ds4_qwen4exp_matmul_bf16(s->idx_k, QW_MAP(m, l->indexer_k_proj),
+    if (!ds4_qwen4exp_indexer_k_bf16(s->idx_k, QW_MAP(m, l->indexer_k_proj),
                                   QW_MAPSZ(m, l->indexer_k_proj),
                                   QW_OFF(l->indexer_k_proj),
                                   DS4_N_EMBD, cfg->indexer_k_dim,

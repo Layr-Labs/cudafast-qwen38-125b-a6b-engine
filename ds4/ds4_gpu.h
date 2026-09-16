@@ -3495,6 +3495,11 @@ int ds4_gpu_glm53_embedding_bf16(
 int ds4_gpu_qwen4exp_bf16_prefill_exact_tensor(
         ds4_gpu_tensor *out, const void *map, uint64_t size, uint64_t off,
         uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x, uint32_t rows);
+/* CUDA-only exact Qwen indexer-K shape: 2560 input, 128 output, two rows. */
+int ds4_gpu_qwen4exp_indexer_k_bf16_r2(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, const ds4_gpu_tensor *x);
+
 int ds4_gpu_glm53_matmul_bf16(
         ds4_gpu_tensor       *out,
         const void           *model_map,
