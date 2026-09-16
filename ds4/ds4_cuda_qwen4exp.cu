@@ -7603,6 +7603,25 @@ static int qwen4exp_shared_mma_ok(const uint32_t *types, uint32_t n_types,
 template <int RouterType = -1>
 /* How many elements of its strided walk a lane asks for before it uses any of
  * them.  Scheduling only, like the norm's own step above. */
+/* And ten is not a free choice: ten IS the walk.  The constant only moves the
+ * boundary between the staged batch and the one-at-a-time tail below -- both
+ * loops visit k = tid + s * nth ascending into the same `acc`.  The shared
+ * gate reads in_dim 2560 with a 256-thread block, so `steps` is ten for every
+ * lane: ten takes the whole walk in the batch, any smaller depth pushes the
+ * remainder into the serial tail the batch exists to avoid, and any depth
+ * above ten fails `s + QWEN4EXP_SHARED_GATE_STEPS <= steps` on the first test
+ * and leaves the ENTIRE walk there.  That is the same has-to-divide-the-walk
+ * property QWEN4EXP_RMS_STEPS carries further down.
+ *
+ * TREAT IT AS CORRECTNESS-RELEVANT ANYWAY.  The ascending-chain reading that
+ * makes a depth change look free here is the same reading written over
+ * QWEN4EXP_RMS_STEPS, and a submission at half THAT depth -- five, the only
+ * other value dividing its walk exactly -- failed the ranked correctness gate.
+ * Whatever the cause, that is the measurement, and what it says is that the
+ * static neutrality argument is not on its own enough to clear a change to a
+ * staging depth feeding a floating-point accumulation.  This constant is in
+ * that family.  It is not a free tuning dial: a change here has to come back
+ * through the gate before it can be believed. */
 #define QWEN4EXP_SHARED_GATE_STEPS 10u
 
 __global__ static void qwen4exp_shared_gate_kernel(
