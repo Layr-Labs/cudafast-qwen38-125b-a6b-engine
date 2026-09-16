@@ -93,6 +93,12 @@ int ds4s_top_logits(const ds4s_handle *h, int k, int32_t *ids, float *logits);
  * The port routes this to ds4_qwen4exp_mtp_cycle, which commits the target's
  * own GREEDY argmax and so emits the serial leg's token stream exactly; at
  * depth 1 it commits 1 or 2 tokens per round. */
+/* the budget this takes is the number of tokens the cycle may commit, and
+ * the boot warm-up passes a literal two, which is the depth-one shape,
+ * while the armed draft-token count sits in scope beside it. A warm-up at a
+ * declared depth above one therefore warms neither the wider verify nor the
+ * longer draft chain.
+ */
 int ds4s_eval_speculative(ds4s_handle *h, int32_t first_token, int budget, int32_t *out,
                           int cap);
 
