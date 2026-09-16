@@ -4104,6 +4104,15 @@ int ds4_gpu_qwen4exp_hc_mixer_unfused_tensor(
         float                 weight_bias,
         int                   round_bf16);
 
+/* CUDA-only target seed for 1/2 rows, 2560 dimensions and four HC streams.
+ * IDs are copied by value and published into tokens by the kernel. Returns
+ * zero on validation/resolution/launch failure; never retries the old path. */
+int ds4_gpu_qwen4exp_embed_short_tensor(
+        ds4_gpu_tensor *hyper, ds4_gpu_tensor *rows, ds4_gpu_tensor *tokens,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t weight_type, uint32_t n_vocab, uint32_t n_tokens,
+        int32_t token0, int32_t token1);
+
 /* Token embedding gather tiled into the hyper-connection streams: the
  * layer-0 seed.  `rows_scratch` holds the gathered [n_tokens][n_embd] rows. */
 int ds4_gpu_qwen4exp_embed_tokens_hc_tensor(

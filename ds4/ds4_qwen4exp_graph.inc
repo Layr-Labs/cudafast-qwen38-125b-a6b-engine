@@ -2864,7 +2864,14 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         return false;
     }
 
-    if (!ds4_gpu_tensor_write(s->tokens, 0, tokens,
+    bool short_embed = false;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    short_embed = n_tokens >= 1u && n_tokens <= 2u &&
+        DS4_N_EMBD == 2560u && DS4_N_HC == 4u &&
+        w->token_embd->type == DS4_TENSOR_Q8_0 &&
+        getenv("DS4_QWEN4EXP_NO_SHORT_EMBED") == NULL;
+#endif
+    if (!short_embed && !ds4_gpu_tensor_write(s->tokens, 0, tokens,
                               (uint64_t)n_tokens * sizeof(int32_t))) {
         fprintf(stderr, "ds4: qwen4exp token upload failed\n");
         return false;
@@ -2941,11 +2948,24 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     }
 
     /* Layer-0 seed: gather the embedding row and tile it into every stream. */
-    if (!ds4_gpu_qwen4exp_embed_tokens_hc_tensor(
+    int embed_ok;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (short_embed) {
+        embed_ok = ds4_gpu_qwen4exp_embed_short_tensor(
             s->hyper, s->embed_rows, s->tokens,
             QW_MAP(m, w->token_embd), QW_MAPSZ(m, w->token_embd),
             QW_OFF(w->token_embd), w->token_embd->type, cfg->n_vocab,
-            n_tokens, DS4_N_EMBD, DS4_N_HC)) {
+            n_tokens, tokens[0], n_tokens == 2u ? tokens[1] : 0);
+    } else
+#endif
+    {
+        embed_ok = ds4_gpu_qwen4exp_embed_tokens_hc_tensor(
+            s->hyper, s->embed_rows, s->tokens,
+            QW_MAP(m, w->token_embd), QW_MAPSZ(m, w->token_embd),
+            QW_OFF(w->token_embd), w->token_embd->type, cfg->n_vocab,
+            n_tokens, DS4_N_EMBD, DS4_N_HC);
+    }
+    if (!embed_ok) {
         fprintf(stderr, "ds4: qwen4exp embedding gather failed\n");
         return qwen4exp_forward_fail();
     }

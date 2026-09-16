@@ -30699,6 +30699,70 @@ extern "C" int ds4_gpu_embed_tokens_quant_tensor(
     return cuda_ok(cudaGetLastError(), "glm embed tokens launch");
 }
 
+/* Short target seed: same rounded Q8 value as gather, retained row store,
+ * then four pure copies. IDs are launch values; no CTA reads published IDs. */
+__global__ static void qwen4exp_embed_short_kernel(
+        float *hyper, float *rows, int32_t *tokens, const unsigned char *w,
+        int32_t token0, int32_t token1, uint32_t n_tokens) {
+    const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= n_tokens * 2560u) return;
+    const uint32_t t = gid / 2560u, d = gid % 2560u;
+    const int32_t tok = t == 0u ? token0 : token1;
+    const unsigned char *blk = w + ((uint64_t)tok * 80u + (d >> 5u)) * 34u;
+    const float scale = __half2float(*(const __half *)blk);
+    const float v = scale * (float)((const int8_t *)(blk + 2))[d & 31u];
+    rows[gid] = v;
+#pragma unroll
+    for (uint32_t h = 0; h < 4u; h++)
+        hyper[((uint64_t)t * 4u + h) * 2560u + d] = v;
+    if (d == 0u) tokens[t] = tok;
+}
+
+static bool qwen4exp_embed_disjoint(const void *a, uint64_t an,
+                                      const void *b, uint64_t bn) {
+    const uintptr_t ap = (uintptr_t)a, bp = (uintptr_t)b;
+    return a && b && an <= UINTPTR_MAX - ap && bn <= UINTPTR_MAX - bp &&
+        (ap + an <= bp || bp + bn <= ap);
+}
+
+extern "C" int ds4_gpu_qwen4exp_embed_short_tensor(
+        ds4_gpu_tensor *hyper, ds4_gpu_tensor *rows, ds4_gpu_tensor *tokens,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t weight_type, uint32_t n_vocab, uint32_t n_tokens,
+        int32_t token0, int32_t token1) {
+    if (!hyper || !rows || !tokens || !model_map || weight_type != 8u ||
+        n_tokens < 1u || n_tokens > 2u || token0 < 0 ||
+        (uint32_t)token0 >= n_vocab || (n_tokens == 2u &&
+        (token1 < 0 || (uint32_t)token1 >= n_vocab))) return 0;
+    const uint64_t row_bytes = (uint64_t)n_tokens * 2560u * sizeof(float);
+    const uint64_t weight_bytes = (uint64_t)n_vocab * 2720u;
+    const int tier = ds4_tensor_device_idx(hyper);
+    int physical = -1;
+    if (tier < 0 || tier >= g_n_gpus ||
+        !cuda_ok(cudaGetDevice(&physical), "qwen4exp short embedding device") ||
+        physical != g_gpu[tier].device_id) return 0;
+    if (!hyper->ptr || !rows->ptr || !tokens->ptr ||
+        ((uintptr_t)hyper->ptr & 3u) || ((uintptr_t)rows->ptr & 3u) ||
+        ((uintptr_t)tokens->ptr & 3u) || hyper->bytes < row_bytes * 4u ||
+        rows->bytes < row_bytes || tokens->bytes < n_tokens * sizeof(int32_t) ||
+        ds4_tensor_device_idx(hyper) != tier || ds4_tensor_device_idx(rows) != tier ||
+        ds4_tensor_device_idx(tokens) != tier || weight_offset > model_size ||
+        weight_bytes > model_size - weight_offset ||
+        !qwen4exp_embed_disjoint(hyper->ptr, hyper->bytes, rows->ptr, rows->bytes) ||
+        !qwen4exp_embed_disjoint(hyper->ptr, hyper->bytes, tokens->ptr, tokens->bytes) ||
+        !qwen4exp_embed_disjoint(rows->ptr, rows->bytes, tokens->ptr, tokens->bytes)) return 0;
+    const unsigned char *w = (const unsigned char *)cuda_resolve_weight_ptr(
+        model_map, weight_offset, weight_bytes, tier, "glm_token_embd");
+    if (!w || ((uintptr_t)w & 1u) ||
+        !qwen4exp_embed_disjoint(hyper->ptr, hyper->bytes, w, weight_bytes) ||
+        !qwen4exp_embed_disjoint(rows->ptr, rows->bytes, w, weight_bytes) ||
+        !qwen4exp_embed_disjoint(tokens->ptr, tokens->bytes, w, weight_bytes)) return 0;
+    qwen4exp_embed_short_kernel<<<n_tokens * 10u, 256>>>(
+        (float *)hyper->ptr, (float *)rows->ptr, (int32_t *)tokens->ptr,
+        w, token0, token1, n_tokens);
+    return cuda_ok(cudaGetLastError(), "qwen4exp short embedding launch");
+}
+
 __global__ static void glm53_embedding_bf16_kernel(
         float *out,
         const uint16_t *weights,
