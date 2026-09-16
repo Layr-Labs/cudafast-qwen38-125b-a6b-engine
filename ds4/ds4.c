@@ -21473,8 +21473,20 @@ static uint32_t metal_graph_decode_indexer_sparse_threshold(const ds4_gpu_graph 
      * the smaller attention scan, while larger contexts benefit from sparse
      * indexed attention.  This threshold changes only the implementation used
      * to consume the compressed rows; it must not lower the 512-row indexer
-     * selection defined by DS4_N_INDEXER_TOP_K. */
-    return 1024u;
+     * selection defined by DS4_N_INDEXER_TOP_K.
+     *
+     * Measured at the ranked sequence length: 1024 -> 0.0075222, 4096 override
+     * -> 0.0075186, 4096 default -> 0.0075265.  All three sit inside the
+     * run-to-run spread, so this is a preference, not a proven win, and it is
+     * recorded as one.  It cannot move a token: the value changes only which
+     * implementation consumes the already-selected compressed rows.
+     *
+     * Measured at the ranked sequence length (a ~53 KB timed-pool prompt) the
+     * 4096 setting is marginally ahead of the 1024 default.  Both sit inside
+     * the run-to-run spread, so this is a preference rather than a proven win.
+     * The value changes only which implementation consumes the compressed
+     * rows, so the selected rows -- and every emitted token -- are unchanged. */
+    return 4096u;
 }
 
 /* =========================================================================

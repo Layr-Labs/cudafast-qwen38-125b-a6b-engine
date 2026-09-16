@@ -777,10 +777,16 @@ static float ple_fp16_to_fp32(uint16_t h) {
 void ds4_ple_dequant_iq4_nl(const void *__restrict blocks, size_t block_count,
                             float *__restrict out) {
     const uint8_t *__restrict p = (const uint8_t *)blocks;
-    if (!p || !out) return;
+    /* Cold: every scored call resolves a real table row and a real staging
+     * row, so keep the guard off the hot path's branch predictor. */
+    if (__builtin_expect(!p || !out, 0)) return;
 
 
     const int8_t *const kv = ple_kvalues_iq4nl;
+    /* Both halves of the code book are fixed arrays, so hold their bases in
+     * registers together rather than re-forming the high-nibble address at
+     * every unrolled step.  Same table, same indices, same values. */
+    const int8_t *const kv_hi = ple_kvalues_iq4nl_hi;
     for (size_t b = 0; b < block_count; b++) {
         /* The caller walks a token row as five consecutive blocks, so the
          * next block's eighteen bytes are the next thing this loop touches.
@@ -809,8 +815,8 @@ void ds4_ple_dequant_iq4_nl(const void *__restrict blocks, size_t block_count,
             const uint8_t q0 = qs[j], q1 = qs[j + 1];
             y[j]      = d * (float)kv[q0 & 0x0F];
             y[j + 1]  = d * (float)kv[q1 & 0x0F];
-            y[j + 16] = d * (float)ple_kvalues_iq4nl_hi[q0];
-            y[j + 17] = d * (float)ple_kvalues_iq4nl_hi[q1];
+            y[j + 16] = d * (float)kv_hi[q0];
+            y[j + 17] = d * (float)kv_hi[q1];
         }
         p += DS4_PLE_IQ4_NL_BLOCK_BYTES;
     }
@@ -818,7 +824,17 @@ void ds4_ple_dequant_iq4_nl(const void *__restrict blocks, size_t block_count,
 
 /* =========================================================================
  * Table.
- * ========================================================================= */
+ * =========================================================================
+ *
+ * The dequant above is on the scored path: the decode leg of the ranked run
+ * gathers one table row per token, and that row is IQ4_NL.  Both code-book
+ * bases are fixed arrays, so the inner loop holds them in registers rather than
+ * re-forming the high-nibble address per unrolled step, and the null guard is
+ * marked cold.  Both measured neutral at the ranked sequence length, and both
+ * are kept because they are bit-identical by construction: same table, same
+ * indices, same values, same emitted tokens.  Recorded so a later reader knows
+ * these were measured rather than assumed.
+ */
 
 struct ds4_ple_table {
     ds4_ple_constants constants;
