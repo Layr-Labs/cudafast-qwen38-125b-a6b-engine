@@ -742,6 +742,107 @@ __global__ static void qwen4exp_gdn_replay_kernel(
     *(float4 *)(state + state_off) = h;
 }
 
+/* Two independent value rows share current/replayed K and gates. Each row
+ * retains the scalar replay kernel's dot4/XOR/FMA chain and checkpoint point.
+ * Only the current width-two target path uses this variant; materialization
+ * retains the original kernel. Tape append remains beyond every prefix read. */
+__global__ static void qwen4exp_gdn_replay_r2_kernel(
+        float *out, float *state, float *checkpoint, float *tape,
+        const float *qkv, const float *raw_alpha, const float *raw_beta,
+        const float *a_log, const float *dt_bias,
+        uint32_t n_key_head, uint32_t n_value_head, uint32_t n_tokens,
+        uint32_t head_layout, const uint32_t *control, uint32_t replay_rows) {
+    const uint32_t head = blockIdx.x;
+    const uint32_t value0 = (blockIdx.y * 4u + (threadIdx.x >> 5u)) * 2u;
+    const uint32_t lane = threadIdx.x & 31u;
+    if (head >= n_value_head || value0 + 1u >= QWEN4EXP_GDN_DIM) return;
+    const uint32_t prefix = control ? *control : replay_rows;
+    if (prefix > DS4_QWEN4EXP_GDN_REPLAY_ROWS) return;
+    const uint32_t key_dim = n_key_head * QWEN4EXP_GDN_DIM;
+    const uint32_t value_dim = n_value_head * QWEN4EXP_GDN_DIM;
+    const uint32_t conv_dim = 2u * key_dim + value_dim;
+    const uint32_t tape_stride = (key_dim + value_dim + 2u * n_value_head + 3u) & ~3u;
+    const uint32_t repeats = n_value_head / n_key_head;
+    const uint32_t key_head = head_layout != 0u ? head % n_key_head : head / repeats;
+    const uint32_t key_writer = head_layout != 0u ? key_head : key_head * repeats;
+    const uint32_t k0 = lane * 4u;
+    uint64_t state_off[2];
+    float4 h[2];
+#pragma unroll
+    for (unsigned r = 0; r < 2u; r++) {
+        state_off[r] = ((uint64_t)head * QWEN4EXP_GDN_DIM + value0 + r) *
+                       QWEN4EXP_GDN_DIM + k0;
+        h[r] = *(const float4 *)(checkpoint + state_off[r]);
+    }
+    const float decay_coeff = n_tokens ? a_log[head] : 0.0f;
+    const float bias = n_tokens ? dt_bias[head] : 0.0f;
+    for (uint32_t step = 0; step < prefix + n_tokens; step++) {
+        const bool replay = step < prefix;
+        const uint32_t token = replay ? 0u : step - prefix;
+        const float *const saved = tape + (uint64_t)(replay ? step : 0u) * tape_stride;
+        const uint64_t base = (uint64_t)token * conv_dim + key_head * QWEN4EXP_GDN_DIM;
+        const float4 k4 = *(const float4 *)(replay
+            ? saved + key_head * QWEN4EXP_GDN_DIM + k0
+            : qkv + base + key_dim + k0);
+        float g = 0.0f, beta = 0.0f;
+        if (replay) {
+            const float2 pair = ((const float2 *)(saved + key_dim + value_dim))[head];
+            g = pair.x; beta = pair.y;
+        } else {
+            const uint64_t gate = (uint64_t)token * n_value_head + head;
+            if (lane == 0u) {
+                g = expf(decay_coeff * qwen4exp_gdn_softplus(raw_alpha[gate] + bias));
+                beta = qwen4exp_gdn_sigmoid(raw_beta[gate]);
+            }
+            g = __shfl_sync(0xffffffffu, g, 0);
+            beta = __shfl_sync(0xffffffffu, beta, 0);
+            if (token == 0u && prefix < DS4_QWEN4EXP_GDN_REPLAY_ROWS) {
+                float *const record = tape + (uint64_t)prefix * tape_stride;
+                if (value0 == 0u && head == key_writer)
+                    *(float4 *)(record + key_head * QWEN4EXP_GDN_DIM + k0) = k4;
+                if (lane == 0u && value0 == 0u)
+                    ((float2 *)(record + key_dim + value_dim))[head] = make_float2(g, beta);
+            }
+        }
+#pragma unroll
+        for (unsigned r = 0; r < 2u; r++) {
+            const uint32_t value = value0 + r;
+            const float v_row = replay
+                ? saved[key_dim + head * QWEN4EXP_GDN_DIM + value]
+                : qkv[(uint64_t)token * conv_dim + 2u * key_dim +
+                      head * QWEN4EXP_GDN_DIM + value];
+            if (!replay && token == 0u && prefix < DS4_QWEN4EXP_GDN_REPLAY_ROWS && lane == 0u)
+                tape[(uint64_t)prefix * tape_stride + key_dim +
+                     head * QWEN4EXP_GDN_DIM + value] = v_row;
+            h[r].x *= g;
+            h[r].y *= g;
+            h[r].z *= g;
+            h[r].w *= g;
+            const float hk = warp_sum_all_f32(dot4_f32(h[r], k4));
+            const float delta_v = (v_row - hk) * beta;
+            h[r].x = fmaf(k4.x, delta_v, h[r].x);
+            h[r].y = fmaf(k4.y, delta_v, h[r].y);
+            h[r].z = fmaf(k4.z, delta_v, h[r].z);
+            h[r].w = fmaf(k4.w, delta_v, h[r].w);
+        }
+        if (!replay) {
+            const float4 q4 = *(const float4 *)(qkv + base + k0);
+#pragma unroll
+            for (unsigned r = 0; r < 2u; r++) {
+                const uint32_t value = value0 + r;
+                const float result = warp_sum_all_f32(dot4_f32(h[r], q4));
+                if (lane == 0u)
+                    out[(uint64_t)token * value_dim + head * QWEN4EXP_GDN_DIM + value] = result;
+                if (token == 0u && prefix == DS4_QWEN4EXP_GDN_REPLAY_ROWS)
+                    *(float4 *)(checkpoint + state_off[r]) = h[r];
+            }
+        }
+    }
+#pragma unroll
+    for (unsigned r = 0; r < 2u; r++)
+        *(float4 *)(state + state_off[r]) = h[r];
+}
+
 /* Long chunks reuse one Q/K vector and gate pair across four independent
  * value rows in a warp. Each row retains its four adjacent key columns per
  * lane, ordered dot4/FMA operations, and original XOR reductions. No state
@@ -1544,13 +1645,26 @@ static int qwen4exp_cuda_gdn_run(
     const dim3 recurrence_grid(
         n_value_head, QWEN4EXP_GDN_DIM / 4u, n_rows);
     if (replay) {
-        qwen4exp_gdn_replay_kernel<<<recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
-            (float *)out->ptr, (float *)recurrent_state->ptr,
-            (float *)replay->checkpoint->ptr, (float *)replay->tape->ptr,
-            (const float *)qkv->ptr, (const float *)raw_alpha->ptr,
-            (const float *)raw_beta->ptr, a_log, dt_bias,
-            n_key_head, n_value_head, n_tokens, head_layout,
-            (const uint32_t *)replay->control->ptr, 0u);
+        if (n_key_head == 16u && n_value_head == 48u && n_tokens == 2u &&
+            getenv("DS4_QWEN4EXP_NO_GDN_REPLAY_R2") == NULL) {
+            qwen4exp_gdn_replay_r2_kernel<<<
+                    dim3(n_value_head, QWEN4EXP_GDN_DIM / 8u, n_rows),
+                    QWEN4EXP_GDN_DIM, 0, stream>>>(
+                (float *)out->ptr, (float *)recurrent_state->ptr,
+                (float *)replay->checkpoint->ptr, (float *)replay->tape->ptr,
+                (const float *)qkv->ptr, (const float *)raw_alpha->ptr,
+                (const float *)raw_beta->ptr, a_log, dt_bias,
+                n_key_head, n_value_head, n_tokens, head_layout,
+                (const uint32_t *)replay->control->ptr, 0u);
+        } else {
+            qwen4exp_gdn_replay_kernel<<<recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
+                (float *)out->ptr, (float *)recurrent_state->ptr,
+                (float *)replay->checkpoint->ptr, (float *)replay->tape->ptr,
+                (const float *)qkv->ptr, (const float *)raw_alpha->ptr,
+                (const float *)raw_beta->ptr, a_log, dt_bias,
+                n_key_head, n_value_head, n_tokens, head_layout,
+                (const uint32_t *)replay->control->ptr, 0u);
+        }
     } else if (gate_pairs) {
         if (n_key_head == 16u && n_value_head == 48u &&
             getenv("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE") == NULL &&
