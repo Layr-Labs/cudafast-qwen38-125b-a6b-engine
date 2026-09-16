@@ -244,32 +244,26 @@ impl ResidentSession {
     /// cycle left. One request for the whole run instead of one per cycle: the
     /// GPU otherwise idles through a socket round trip after every cycle.
     fn spec_run_call(&mut self, first_token: i64, count: i64) -> Result<Vec<SpecRound>, String> {
-        let reply =
-            self.call(json!({"op": "spec_run", "first_token": first_token, "count": count}))?;
+        let reply = self.call(json!({"op": "spec_run", "first_token": first_token, "count": count}))?;
         self.take_frontier(&reply)?;
         let ints = |v: &Value, what: &str| -> Result<Vec<i64>, String> {
             v.as_array()
-                .ok_or_else(|| {
-                    format!("the resident engine's spec_run reply carries a non-array {what}")
-                })?
+                .ok_or_else(|| format!("the resident engine's spec_run reply carries a non-array {what}"))?
                 .iter()
                 .map(|t| {
-                    t.as_i64().ok_or_else(|| {
-                        format!("the resident engine's spec_run {what} holds a non-integer")
-                    })
+                    t.as_i64()
+                        .ok_or_else(|| format!("the resident engine's spec_run {what} holds a non-integer"))
                 })
                 .collect()
         };
         let rounds = reply
             .get("rounds")
             .and_then(Value::as_array)
-            .ok_or_else(|| {
-                "the resident engine's spec_run reply carries no \"rounds\" array".to_string()
-            })?;
+            .ok_or_else(|| "the resident engine's spec_run reply carries no \"rounds\" array".to_string())?;
         let frontiers = ints(
-            reply.get("frontiers").ok_or_else(|| {
-                "the resident engine's spec_run reply carries no \"frontiers\" array".to_string()
-            })?,
+            reply
+                .get("frontiers")
+                .ok_or_else(|| "the resident engine's spec_run reply carries no \"frontiers\" array".to_string())?,
             "frontiers",
         )?;
         if rounds.len() != frontiers.len() {
@@ -280,9 +274,7 @@ impl ResidentSession {
             ));
         }
         if frontiers.last().copied() != self.frontier {
-            return Err(
-                "the resident engine's spec_run frontier disagrees with its last round".to_string(),
-            );
+            return Err("the resident engine's spec_run frontier disagrees with its last round".to_string());
         }
         rounds
             .iter()

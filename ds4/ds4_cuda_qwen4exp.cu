@@ -7207,7 +7207,32 @@ static int qwen4exp_moe_tile(uint32_t n_rows) {
     /* A THREE-ROW call is the depth-2 verify.  It takes the R=2 tile -- two
      * tiles, the second with take 1 -- so it stays on the decode-width
      * kernels; R changes work sharing, not the arithmetic of a live row.
-     * DS4_QWEN4EXP_NO_WIDE_VERIFY restores the eight-row tile. */
+     * DS4_QWEN4EXP_NO_WIDE_VERIFY restores the eight-row tile.
+     *
+     * DO NOT `fix' this to 4 to make the three-row verify a single tile.  I
+     * spent two days on that arm on the premise that one tile would leave the
+     * expert panels resident for rows 0-1 and make the third row nearly free.
+     * It buys nothing, and the count is four multiplications: the staged down
+     * kernel fills one panel per (slot, token) step and the fill sits INSIDE
+     * the `r < take' guard, so a block does exactly n_expert_used * take
+     * fills.  Two tiles is 8*2 + 8*1 = 24; one tile is 8*3 = 24.  Identical,
+     * because token 2 routes to a DIFFERENT eight experts -- there is no
+     * resident panel for it to reuse.  route[] and the warp_sum_f32 epilogue
+     * are take-guarded too, so those tie at 3 and 3 as well.  The one real
+     * difference is block count, 640 -> 320 per layer against 48 SMs * 8
+     * blocks = 384 resident slots, which under-fills the machine.  Predicted
+     * sign of the arm: negative.
+     *
+     * The general form, which closes the whole acceptance axis on this engine:
+     * routed-DOWN traffic is proportional to verify ROWS at every tile, while
+     * gate/up compacts to one block row per distinct active expert and the
+     * dense and GDN legs are per round.  So an extra acceptance costs a full
+     * extra pass of the routed expert set (52% of the round) for that row, and
+     * flat depth 2 measures -4.8% decode for exactly that reason.  The only
+     * structure that breaks the proportionality is deduplicating overlapping
+     * experts across tokens inside the down kernel, which is -176 bips
+     * measured: the branch that finds the overlap costs more than the
+     * redundant work it removes. */
     if (n_rows == 3u && getenv("DS4_QWEN4EXP_NO_WIDE_VERIFY") == NULL) return 2;
     return 8;
 }
@@ -12183,7 +12208,70 @@ __device__ __forceinline__ static int32_t qwen4exp_qsa_tile_key(
  * on distinct banks within each quarter warp. */
 #define QWEN4EXP_QSA_SPLIT_KPITCH (QWEN4EXP_QSA_SPLIT_KSTEP * 4u + 4u)
 
+/* Ticket for the split path's fused fold.  The scores kernel's first block
+ * zeroes it; every probs block increments it as it finishes, and the block
+ * that takes the last ticket folds the tiles into `out` in-kernel, which
+ * retires the standalone fold launch.  Stream order between the two paired
+ * launches is the reset guarantee: the split path only ever runs on
+ * cuda_decode_stream, so a call's scores launch completes before its probs
+ * launch begins. */
+__device__ static uint32_t qwen4exp_qsa_split_done;
+
+/* The fold the standalone kernel ran, driven by the last probs block.  Every
+ * probs block calls this exactly once on a block-uniform path -- including
+ * the ones whose tile holds no keys -- so the ticket counts the whole grid.
+ * The threadfence before the atomicAdd publishes each block's ct/tsum writes;
+ * the one after the winning ticket orders this block's reads behind them.
+ * The element loop is the fold kernel's own math, one output element per
+ * thread step. */
+__device__ static void qwen4exp_qsa_split_fold_epilogue(
+        const float *tmax, const float *tsum, const float *ct,
+        const int32_t *counts, float *out,
+        uint32_t n_tokens, uint32_t n_head, uint32_t head_dim,
+        uint32_t pos0, uint32_t sparse, uint32_t max_tiles,
+        const uint32_t *d_pos, uint32_t p0) {
+    __shared__ uint32_t is_last;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t nth = blockDim.x;
+    __threadfence();
+    __syncthreads();
+    if (tid == 0u) {
+        is_last = (atomicAdd(&qwen4exp_qsa_split_done, 1u) + 1u ==
+                   gridDim.x * gridDim.y * gridDim.z) ? 1u : 0u;
+    }
+    __syncthreads();
+    if (is_last == 0u) return;
+    __threadfence();
+    const uint64_t total_e = (uint64_t)n_tokens * n_head * head_dim;
+    for (uint64_t e = tid; e < total_e; e += nth) {
+        const uint32_t d = (uint32_t)(e % head_dim);
+        const uint32_t head = (uint32_t)((e / head_dim) % n_head);
+        const uint32_t token = (uint32_t)(e / ((uint64_t)n_head * head_dim));
+        const uint32_t count =
+            sparse ? (uint32_t)counts[token] : p0 + token + 1u;
+        float *dst = out + ((uint64_t)token * n_head + head) * head_dim;
+        if (count == 0u) {
+            dst[d] = 0.0f;
+            continue;
+        }
+        const uint32_t n_tiles = (count + nth - 1u) / nth;
+        const uint64_t row = ((uint64_t)token * n_head + head) * max_tiles;
+        float run_max = QWEN4EXP_QSA_MASKED_SCORE;
+        float run_sum = 0.0f;
+        float acc = 0.0f;
+        for (uint32_t t = 0; t < n_tiles; t++) {
+            const float new_max = fmaxf(run_max, tmax[row + t]);
+            const float rescale = (run_max > QWEN4EXP_QSA_MASKED_LIMIT)
+                ? expf(run_max - new_max) : 0.0f;
+            run_sum = __fmaf_rn(run_sum, rescale, tsum[row + t]);
+            acc = __fmaf_rn(acc, rescale, ct[(row + t) * head_dim + d]);
+            run_max = new_max;
+        }
+        dst[d] = (run_sum > 0.0f) ? acc / run_sum : 0.0f;
+    }
+}
 template <uint32_t GROUP>
+
 __global__ static void __launch_bounds__(256, 1)
 qwen4exp_qsa_split_scores_kernel(
         const float *q,
@@ -12213,6 +12301,11 @@ qwen4exp_qsa_split_scores_kernel(
     const uint32_t warp = tid >> 5u;
     const uint32_t head0 = group * GROUP;
     if (head0 + GROUP > n_head || token >= n_tokens) return;
+
+    /* First block of the pair's first launch resets the fold ticket; every
+     * later block of this kernel passes this point only after it. */
+    if (tid == 0u && group == 0u && tile == 0u && token == 0u)
+        qwen4exp_qsa_split_done = 0u;
 
     const uint32_t p0 = d_pos ? *d_pos : pos0;
     const uint32_t count = sparse ? (uint32_t)counts[token] : p0 + token + 1u;
@@ -12349,7 +12442,8 @@ qwen4exp_qsa_split_probs_kernel(
         uint32_t max_selected,
         uint32_t sparse,
         uint32_t max_tiles,
-        const uint32_t *d_pos) {
+        const uint32_t *d_pos,
+        float *out) {
     extern __shared__ __align__(16) float qwen4exp_attn_pr_shared[];
     const uint32_t group = blockIdx.x;
     const uint32_t tile = blockIdx.y;
@@ -12357,16 +12451,15 @@ qwen4exp_qsa_split_probs_kernel(
     const uint32_t tid = threadIdx.x;
     const uint32_t nth = blockDim.x;
     const uint32_t head0 = group * GROUP;
-    if (head0 + GROUP > n_head || token >= n_tokens) return;
-
     const uint32_t p0 = d_pos ? *d_pos : pos0;
     const uint32_t count = sparse ? (uint32_t)counts[token] : p0 + token + 1u;
     const uint32_t base = tile * nth;
-    if (base >= count) return;
+    /* A block whose tile holds no keys still takes the ticket below, so the
+     * last block of the grid -- not the last busy one -- runs the fold. */
+    if (head0 + GROUP <= n_head && token < n_tokens && base < count) {
     const uint32_t n_in_tile = min(nth, count - base);
     const uint32_t kv_head = head0 / (n_head / n_kv_head);
     const uint32_t kv_stride = n_kv_head * head_dim;
-
     float *trow = qwen4exp_attn_pr_shared;           /* GROUP * nth      */
     float *probs = trow + GROUP * nth;               /* GROUP * nth      */
     int32_t *keys = (int32_t *)(probs + GROUP * nth);/* nth              */
@@ -12467,48 +12560,15 @@ qwen4exp_qsa_split_probs_kernel(
             ct[(row + h * max_tiles) * head_dim + tid] = contrib[h];
         }
     }
+    }
+    qwen4exp_qsa_split_fold_epilogue(tmax, tsum, ct, counts, out, n_tokens,
+                                   n_head, head_dim, pos0, sparse, max_tiles,
+                                   d_pos, p0);
 }
 
-__global__ static void qwen4exp_qsa_split_fold_kernel(
-        const float *tmax,
-        const float *tsum,
-        const float *ct,
-        const int32_t *counts,
-        float *out,
-        uint32_t n_tokens,
-        uint32_t n_head,
-        uint32_t head_dim,
-        uint32_t pos0,
-        uint32_t sparse,
-        uint32_t max_tiles,
-        uint32_t tile_width,
-        const uint32_t *d_pos) {
-    const uint32_t head = blockIdx.x;
-    const uint32_t token = blockIdx.y;
-    const uint32_t tid = threadIdx.x;
-    if (head >= n_head || token >= n_tokens || tid >= head_dim) return;
-    const uint32_t p0 = d_pos ? *d_pos : pos0;
-    const uint32_t count = sparse ? (uint32_t)counts[token] : p0 + token + 1u;
-    float *dst = out + ((uint64_t)token * n_head + head) * head_dim;
-    if (count == 0u) {
-        dst[tid] = 0.0f;
-        return;
-    }
-    const uint32_t n_tiles = (count + tile_width - 1u) / tile_width;
-    const uint64_t row = ((uint64_t)token * n_head + head) * max_tiles;
-    float run_max = QWEN4EXP_QSA_MASKED_SCORE;
-    float run_sum = 0.0f;
-    float acc = 0.0f;
-    for (uint32_t t = 0; t < n_tiles; t++) {
-        const float new_max = fmaxf(run_max, tmax[row + t]);
-        const float rescale = (run_max > QWEN4EXP_QSA_MASKED_LIMIT)
-            ? expf(run_max - new_max) : 0.0f;
-        run_sum = __fmaf_rn(run_sum, rescale, tsum[row + t]);
-        acc = __fmaf_rn(acc, rescale, ct[(row + t) * head_dim + tid]);
-        run_max = new_max;
-    }
-    dst[tid] = (run_sum > 0.0f) ? acc / run_sum : 0.0f;
-}
+/* The standalone fold kernel is retired: the probs kernel's last block runs
+ * qwen4exp_qsa_split_fold_epilogue, which is this math elementwise over the
+ * whole output instead of one (head, token) block at a time. */
 
 __global__ static void qwen4exp_qsa_output_gate_kernel(
         const float *gate,
@@ -13088,92 +13148,6 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_pool_update_tensor(
             cache_cap, head_dim, pool_size, rot_dim, eps, weight_offset, NULL);
 }
 
-/* Tiled indexer scores for prefill widths.
- *
- * The per-pair kernel above launches one block per (indexer block, token):
- * at a 4096-row prefill over a 20480-token context that is 21 million
- * blocks of 128 threads, each doing four 128-wide dots and four block-wide
- * reductions.  The scores stage measured 69 ms per layer at 16k tokens for
- * about 21 GFLOP of work.  This kernel tiles the pairs instead: one block
- * takes QWEN4EXP_IDX_TILE_T tokens by QWEN4EXP_IDX_TILE_B indexer blocks,
- * stages the pool rows and the query rows in shared memory once, and each
- * thread owns one (token, block) pair.
- *
- * THE ARITHMETIC IS THE PER-PAIR KERNEL'S, BIT FOR BIT.  With head_dim 128
- * the per-pair kernel runs 128 threads, one product per lane, and reduces
- * with qwen4exp_blk_sum: lanes i and i+64 add, then i and i+32, then a warp
- * shuffle tree at 16, 8, 4, 2, 1.  The thread below forms the same 64 pair
- * sums, then the same halving tree, through __fmul_rn / __fadd_rn so the
- * compiler cannot contract a product into an add.  The relu, the head sum
- * order and the division are the same expressions.  The host wrapper only
- * takes this path at head_dim 128, four heads, and eight rows or more; the
- * decode and verify widths keep the per-pair kernel and their captured
- * graphs unchanged. */
-#define QWEN4EXP_IDX_TILE_T 8u
-#define QWEN4EXP_IDX_TILE_B 32u
-#define QWEN4EXP_IDX_KPAD   129u
-#define QWEN4EXP_IDX_THREADS 256u
-
-template <uint32_t HEAD_DIM, uint32_t N_HEAD>
-__global__ static void __launch_bounds__(QWEN4EXP_IDX_THREADS)
-qwen4exp_qsa_indexer_scores_tiled_kernel(
-        const float *q,
-        const float *pool,
-        float *scores,
-        uint32_t n_tokens,
-        uint32_t n_blocks,
-        uint32_t pos0,
-        uint32_t pool_size,
-        float norm_divisor) {
-    __shared__ float ks[QWEN4EXP_IDX_TILE_B * QWEN4EXP_IDX_KPAD];
-    __shared__ float qs[QWEN4EXP_IDX_TILE_T * N_HEAD * HEAD_DIM];
-    const uint32_t b0 = blockIdx.x * QWEN4EXP_IDX_TILE_B;
-    const uint32_t t0 = blockIdx.y * QWEN4EXP_IDX_TILE_T;
-    const uint32_t tid = threadIdx.x;
-    if (b0 >= n_blocks || t0 >= n_tokens) return;
-    const uint32_t nb = min(QWEN4EXP_IDX_TILE_B, n_blocks - b0);
-    const uint32_t nt = min(QWEN4EXP_IDX_TILE_T, n_tokens - t0);
-    for (uint32_t i = tid; i < nb * HEAD_DIM; i += QWEN4EXP_IDX_THREADS) {
-        const uint32_t bb = i / HEAD_DIM, d = i - bb * HEAD_DIM;
-        ks[bb * QWEN4EXP_IDX_KPAD + d] = pool[(uint64_t)(b0 + bb) * HEAD_DIM + d];
-    }
-    for (uint32_t i = tid; i < nt * N_HEAD * HEAD_DIM; i += QWEN4EXP_IDX_THREADS) {
-        qs[i] = q[(uint64_t)t0 * N_HEAD * HEAD_DIM + i];
-    }
-    __syncthreads();
-    for (uint32_t p = tid; p < nt * QWEN4EXP_IDX_TILE_B; p += QWEN4EXP_IDX_THREADS) {
-        const uint32_t tt = p / QWEN4EXP_IDX_TILE_B;
-        const uint32_t bb = p - tt * QWEN4EXP_IDX_TILE_B;
-        const uint32_t block = b0 + bb;
-        const uint32_t token = t0 + tt;
-        if (block >= n_blocks) continue;
-        float *dst = scores + (uint64_t)token * n_blocks + block;
-        uint32_t visible = (pos0 + token + 1u) / pool_size;
-        if (visible > n_blocks) visible = n_blocks;
-        if (block >= visible) { *dst = QWEN4EXP_QSA_MASKED_SCORE; continue; }
-        const float *k = ks + bb * QWEN4EXP_IDX_KPAD;
-        float total = 0.0f;
-#pragma unroll
-        for (uint32_t h = 0; h < N_HEAD; h++) {
-            const float *qh = qs + (tt * N_HEAD + h) * HEAD_DIM;
-            float a[HEAD_DIM / 2u];
-#pragma unroll
-            for (uint32_t i = 0; i < HEAD_DIM / 2u; i++) {
-                a[i] = __fadd_rn(__fmul_rn(qh[i], k[i]),
-                                 __fmul_rn(qh[i + HEAD_DIM / 2u], k[i + HEAD_DIM / 2u]));
-            }
-#pragma unroll
-            for (uint32_t step = HEAD_DIM / 4u; step > 0u; step >>= 1) {
-#pragma unroll
-                for (uint32_t i = 0; i < step; i++) a[i] = __fadd_rn(a[i], a[i + step]);
-            }
-            const float dot = a[0];
-            total += fmaxf(dot, 0.0f);
-        }
-        *dst = total / norm_divisor;
-    }
-}
-
 extern "C" int ds4_gpu_qwen4exp_qsa_indexer_scores_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
@@ -13190,17 +13164,6 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_scores_tensor(
         !glm53_cuda_tensor_has(q, (uint64_t)n_tokens * n_head * head_dim, sizeof(float)) ||
         !glm53_cuda_tensor_has(pool, (uint64_t)n_blocks * head_dim, sizeof(float))) {
         return 0;
-    }
-    if (n_tokens >= 8u && head_dim == 128u && n_head == 4u &&
-        getenv("DS4_QWEN4EXP_NO_IDX_TILE") == NULL) {
-        const dim3 grid((n_blocks + QWEN4EXP_IDX_TILE_B - 1u) / QWEN4EXP_IDX_TILE_B,
-                        (n_tokens + QWEN4EXP_IDX_TILE_T - 1u) / QWEN4EXP_IDX_TILE_T);
-        qwen4exp_qsa_indexer_scores_tiled_kernel<128u, 4u><<<grid, QWEN4EXP_IDX_THREADS, 0,
-            cuda_decode_stream()>>>(
-                (const float *)q->ptr, (const float *)pool->ptr,
-                (float *)scores->ptr, n_tokens, n_blocks, pos0, pool_size,
-                sqrtf((float)head_dim));
-        return cuda_ok(cudaGetLastError(), "Qwen4-Exp indexer scores tiled launch");
     }
     const uint32_t nth = qwen4exp_cuda_threads(head_dim);
     qwen4exp_qsa_indexer_scores_kernel<<<dim3(n_blocks, n_tokens), nth,
@@ -13327,7 +13290,8 @@ static int qwen4exp_qsa_attention_split(
         cuda_decode_stream()>>>(                                              \
             (const float *)v_cache->ptr, sel, cnt, sc, tmax, ct, tsum,        \
             n_tokens, n_head, n_kv_head, head_dim, pos0, cache_cap,           \
-            max_selected, sparse ? 1u : 0u, max_tiles, d_pos)
+            max_selected, sparse ? 1u : 0u, max_tiles, d_pos,                 \
+            (float *)out->ptr)
     switch (g) {
         case 12u: QWEN4EXP_QSA_SPLIT_LAUNCH(12u, QWEN4EXP_QSA_SPLIT_VSTEP); break;
         case 6u:  QWEN4EXP_QSA_SPLIT_LAUNCH(6u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
@@ -13348,10 +13312,9 @@ static int qwen4exp_qsa_attention_split(
         default:  return 0;
     }
 #undef QWEN4EXP_QSA_SPLIT_LAUNCH
-    qwen4exp_qsa_split_fold_kernel<<<dim3(n_head, n_tokens), head_dim, 0,
-        cuda_decode_stream()>>>(
-            tmax, tsum, ct, cnt, (float *)out->ptr, n_tokens, n_head,
-            head_dim, pos0, sparse ? 1u : 0u, max_tiles, nth, d_pos);
+    /* The fold runs inside the probs kernel: its last block to take the
+     * ticket applies qwen4exp_qsa_split_fold_epilogue, so there is no third
+     * launch. */
     return cuda_ok(cudaGetLastError(), "Qwen4-Exp QSA split attention launch")
         ? 1 : -1;
 }
@@ -13860,15 +13823,70 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_tensor(
  * swallowed and reported as -1; the function never touches device state and is
  * called once, off the timed path. */
 extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
-    static char buf[384];
+    static char buf[512];
     static int built = 0;
     if (built) return buf;
     built = 1;
     buf[0] = '\0';
 
+    /* NO CARVEOUT CALL HERE, and this is the record of why -- it was tried and
+     * it is a MEASURED NULL.
+     *
+     * `9f0f8c34' shipped cudaFuncSetAttribute(gu_kernel,
+     * cudaFuncAttributePreferredSharedMemoryCarveout, 100) on the bet that
+     * gu[occ=6] was a driver carveout near 72 KiB holding back a kernel whose
+     * registers (65536/(32*256) = 8) and 101,376 B opt-in ceiling (8.75) both
+     * permit eight blocks.  The same submission published the discriminator that
+     * killed it.  Static shared memory is charged per BLOCK, so a shared bind is
+     * invariant in block width while a thread bind scales as 1/threads; querying
+     * the same kernel at 128 and 64 threads returned guT[occ128=8 occ64=8] --
+     * eight, invariant, which is 102400/11584 = 8.84 -> 8, i.e. the FULL
+     * 102,400 B per SM is already available and 6 was never a carveout artifact.
+     * With thr/sm=1536 also published, 1536/256 = 6 is simply the thread ceiling.
+     * gu[] is at 100% thread occupancy as shipped and the carveout cannot move a
+     * constraint that is not binding, so it is removed rather than left in as
+     * inert code that costs L1. */
+
     int gu_regs = -1, gu_smem = -1, gu_lmem = -1, gu_maxt = -1;
     int gu_occ = -1, dn_occ = -1;
+    /* The two-block-width discriminator that `9f0f8c34' carried is REMOVED
+     * because it answered its question permanently: guT[occ128=8 occ64=8] --
+     * eight and invariant in block width -- proved gu[] is shared-bound at 8
+     * blocks on the full 102,400 B/SM at narrow widths, and thread-bound at 6 at
+     * its shipped 256.  The technique is worth remembering even though the field
+     * is gone: static shared is charged per BLOCK, so a shared bind does not move
+     * with block width while a thread bind scales as 1/threads.  Querying one
+     * compiled kernel at two widths identifies the binder for one API call and no
+     * emitted byte, and it is the only thing that could separate the two
+     * mechanisms here -- all eleven other probes are register-bound and therefore
+     * consistent with either (dn 5.33, mm 4.00, md 6.65, pl2 4.01, gp 6.40). */
     int dn_regs = -1, dn_smem = -1, dn_lmem = -1, dn_maxt = -1;
+    /* The instantiation the decode round ACTUALLY launches.  Everything above
+     * reads <2, q8_0, Vector, Stage> -- but QWEN4EXP_DOWN_ASYNC launches
+     * <2, q8_0, true, true, TRUE>, a fifth template argument that turns on the
+     * cp.async panel fill.  A different template argument is a different
+     * compilation: dn[reg=48 occ=5] was never a reading of the running kernel,
+     * and every residency argument made about the down kernel -- 52% of the
+     * decode round's bytes -- rests on that reading.  occD is the same query at
+     * the real 10,880-byte dynamic panel rather than at 0. */
+    int dna_regs = -1, dna_lmem = -1, dna_occ = -1, dna_occd = -1;
+    /* THE R=4 STAGED DOWN KERNEL, and a correction to my own published note.
+     * I read the comment above this kernel as saying an R=4 staged variant needs
+     * FOUR live panels (21,760 B) and is therefore capped at 4 blocks instead of
+     * 8.  It says the opposite: the flat (slot, token) step sequence keeps only
+     * TWO panels live, and `four panels' describes the slot-granular design that
+     * was REJECTED.  The buffers are `spanel + ((step) & 1) * panel_bytes' and
+     * `((step + 1) & 1)' -- two, for any R -- and dn_shared is 2 * dn_panel
+     * regardless of tile.  So an R=4 staged kernel has the SAME 10,880-byte
+     * footprint, and the only thing that can cost it a block is register
+     * pressure from route[4]/acc[4] instead of route[2]/acc[2].  That is exactly
+     * what dn4 measures.  It matters because a single down tile for a three-row
+     * verify is the one arm on this engine still worth hundreds of bips:
+     * qwen4exp_moe_tile(3) returns 2, so dn_grid.y = 2 and the routed-MoE expert
+     * set -- 52% of the decode round -- streams TWICE to compute one extra row.
+     * dn4g is the R=4 generic path that is already instantiated, for contrast. */
+    int dn4_regs = -1, dn4_lmem = -1, dn4_occ = -1, dn4_occd = -1;
+    int dn4g_regs = -1, dn4g_lmem = -1, dn4g_occ = -1;
     /* The two PREFILL tile kernels, read here for the first time. */
     int mg_regs = -1, mg_smem = -1, mg_lmem = -1, mg_occ = -1;
     int md_regs = -1, md_smem = -1, md_lmem = -1, md_occ = -1;
@@ -13897,6 +13915,91 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
         dn_smem = (int)a.sharedSizeBytes;
         dn_lmem = (int)a.localSizeBytes;
         dn_maxt = a.maxThreadsPerBlock;
+    } else {
+        (void)cudaGetLastError();
+    }
+
+    /* The launched async down kernel, read for the first time.  Its own `occa`
+     * rather than the shared `occ` below, which is declared after this point. */
+    int occa = 0;
+    if (cudaFuncGetAttributes(
+            &a,
+            qwen4exp_moe_down_q_kernel<2, DS4_QWEN4EXP_TY_q8_0, true, true,
+                                       true>) == cudaSuccess) {
+        dna_regs = a.numRegs;
+        dna_lmem = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occa,
+            qwen4exp_moe_down_q_kernel<2, DS4_QWEN4EXP_TY_q8_0, true, true,
+                                       true>,
+            256, 0) == cudaSuccess) {
+        dna_occ = occa;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occa,
+            qwen4exp_moe_down_q_kernel<2, DS4_QWEN4EXP_TY_q8_0, true, true,
+                                       true>,
+            256, (size_t)10880u) == cudaSuccess) {
+        dna_occd = occa;
+    } else {
+        (void)cudaGetLastError();
+    }
+
+    /* R=4, staged, async: the instantiation the single-tile three-row verify
+     * would launch.  A new instantiation of an existing template -- the body is
+     * generic in R (route[R], acc[R], `for r < R' under #pragma unroll, and the
+     * panel index is (step & 1) with step = slot * take + r), with no
+     * static_assert and no R == 2 assumption anywhere -- so this compiles the
+     * same code with a different constant.  If dn4_occ matches dna_occ the
+     * footprint argument against a wide verify is gone entirely. */
+    if (cudaFuncGetAttributes(
+            &a,
+            qwen4exp_moe_down_q_kernel<4, DS4_QWEN4EXP_TY_q8_0, true, true,
+                                       true>) == cudaSuccess) {
+        dn4_regs = a.numRegs;
+        dn4_lmem = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occa,
+            qwen4exp_moe_down_q_kernel<4, DS4_QWEN4EXP_TY_q8_0, true, true,
+                                       true>,
+            256, 0) == cudaSuccess) {
+        dn4_occ = occa;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occa,
+            qwen4exp_moe_down_q_kernel<4, DS4_QWEN4EXP_TY_q8_0, true, true,
+                                       true>,
+            256, (size_t)10880u) == cudaSuccess) {
+        dn4_occd = occa;
+    } else {
+        (void)cudaGetLastError();
+    }
+    /* The R=4 path that ALREADY exists: QWEN4EXP_DOWN(4) at the tile == 4 arm,
+     * instantiated only as the generic <4, DT, false, false, false>.  It loses
+     * both the down-vector specialization and the panel staging, which is why
+     * simply making qwen4exp_moe_tile(3) return 4 is not the fix. */
+    if (cudaFuncGetAttributes(
+            &a, qwen4exp_moe_down_q_kernel<4, DS4_QWEN4EXP_TY_q8_0>) ==
+        cudaSuccess) {
+        dn4g_regs = a.numRegs;
+        dn4g_lmem = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occa, qwen4exp_moe_down_q_kernel<4, DS4_QWEN4EXP_TY_q8_0>, 256,
+            0) == cudaSuccess) {
+        dn4g_occ = occa;
     } else {
         (void)cudaGetLastError();
     }
@@ -14033,12 +14136,18 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
              "gu[reg=%d smem=%d lmem=%d maxt=%d occ=%d] dn[reg=%d smem=%d "
              "lmem=%d maxt=%d occ=%d] gdn[reg=%d lmem=%d] "
              "mm[reg=%d smem=%d lmem=%d occ=%d] "
-             "md[reg=%d smem=%d lmem=%d occ=%d]",
+             "md[reg=%d smem=%d lmem=%d occ=%d] "
+             "dna[reg=%d lmem=%d occ=%d occD=%d] "
+             "dn4[reg=%d lmem=%d occ=%d occD=%d] "
+             "dn4g[reg=%d lmem=%d occ=%d]",
              gu_regs, gu_smem, gu_lmem, gu_maxt, gu_occ,
              dn_regs, dn_smem, dn_lmem, dn_maxt, dn_occ,
              gd_regs, gd_lmem,
              mg_regs, mg_smem, mg_lmem, mg_occ,
-             md_regs, md_smem, md_lmem, md_occ);
+             md_regs, md_smem, md_lmem, md_occ,
+             dna_regs, dna_lmem, dna_occ, dna_occd,
+             dn4_regs, dn4_lmem, dn4_occ, dn4_occd,
+             dn4g_regs, dn4g_lmem, dn4g_occ);
     return buf;
 }
 
