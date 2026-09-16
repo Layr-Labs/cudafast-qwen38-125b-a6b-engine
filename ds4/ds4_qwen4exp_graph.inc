@@ -1234,6 +1234,43 @@ static void qw_ple_pool_init(void) {
     pthread_mutex_unlock(&g_qw_ple_pool.mutex);
 }
 
+/* Ask the kernel to start reading the pages that hold `count` hashed table
+ * rows.  Each row is a ninety-byte IQ4_NL run at a hashed offset, so the
+ * pages are scattered across the shard mapping; one WILLNEED per row turns
+ * what would be a serial fault-and-wait per row into parallel readahead the
+ * gather then consumes.  The table is twenty-six GiB the page cache cannot
+ * hold beside the resident model, so on a ranked box a meaningful share of
+ * these rows is cold every round.  A no-op where POSIX_MADV_WILLNEED is
+ * absent. */
+static void qw_ple_madvise_rows(const ds4_qwen4exp_ple_table *ple,
+                                const uint64_t *ids, uint64_t count) {
+#if defined(POSIX_MADV_WILLNEED)
+    if (!ple || !ple->base || !ids || count == 0) return;
+    static long qw_ple_page = 0;
+    if (qw_ple_page <= 0) {
+        const long p = sysconf(_SC_PAGESIZE);
+        if (p > 0) qw_ple_page = p;
+    }
+    if (qw_ple_page <= 0) return;
+    const uint64_t page = (uint64_t)qw_ple_page;
+    const uintptr_t mask = (uintptr_t)(page - 1u);
+    uintptr_t last = 0;
+    for (uint64_t i = 0; i < count; i++) {
+        const uint64_t row = ids[i];
+        if (row >= ple->rows) continue;
+        const uintptr_t a = (uintptr_t)(ple->base + row * ple->row_bytes);
+        const uintptr_t a0 = a & ~mask;
+        if (a0 == last) continue;
+        last = a0;
+        const uintptr_t a1 = (a + ple->row_bytes + mask) & ~mask;
+        (void)posix_madvise((void *)a0, (size_t)(a1 - a0),
+                            POSIX_MADV_WILLNEED);
+    }
+#else
+    (void)ple; (void)ids; (void)count;
+#endif
+}
+
 static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                                       const ds4_qwen4exp_weights *w,
                                       const int32_t *tokens,
@@ -1293,6 +1330,11 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 s->ple_history_rows[t] = s->ple_history;
             }
         }
+        /* Every row this round touches is now named.  Start their reads
+         * before the dequant loop so a cold page is already in flight when
+         * its row is reached instead of faulting one at a time. */
+        qw_ple_madvise_rows(&w->ple, s->ple_ids,
+                            (uint64_t)n_tokens * DS4_N_PLE_HEAD);
         for (uint32_t t = 0; t < n_tokens; t++) {
             /* The head's destination strides are constants of the shape, so
              * the token base is hoisted out of the head loop and the head
@@ -1302,10 +1344,14 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
             float *dst = s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD;
             for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
                 const uint64_t row = ids[h];
-                /* Every head of this token except the last is followed by
-                 * another table row, so ask for the next id early.  Hint. */
-                if (h + 1u < DS4_N_PLE_HEAD)
-                    __builtin_prefetch(ids + h + 1u, 0, 1);
+                /* Ask for the next head's row data early: reading its id to
+                 * form the pointer already subsumes the old id prefetch, and
+                 * the row is what the dequant stalls on.  Hint only. */
+                if (h + 1u < DS4_N_PLE_HEAD) {
+                    const uint8_t *nq =
+                        ds4_qwen4exp_ple_row(&w->ple, ids[h + 1u]);
+                    if (nq) __builtin_prefetch(nq, 0, 1);
+                }
                 const uint8_t *quant = ds4_qwen4exp_ple_row(&w->ple, row);
                 /* Cold: a hashed row past the table is a hard refusal that has
                  * never fired in a scored run, so keep it out of the hot path. */
@@ -1356,6 +1402,10 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
         if (nthreads == 1) {
             ds4_ple_row_ids(&s->ple_constants, &s->ple_history, tokens,
                             n_tokens, s->ple_ids);
+            /* Same readahead as the armed path: the ids are all named, so
+             * start their pages before the serial dequant reaches them. */
+            qw_ple_madvise_rows(&w->ple, s->ple_ids,
+                                (uint64_t)n_tokens * DS4_N_PLE_HEAD);
             for (uint32_t t = 0; t < n_tokens; t++) {
                 for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
                     const uint64_t row =
