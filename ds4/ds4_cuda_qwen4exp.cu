@@ -8913,7 +8913,19 @@ __device__ __forceinline__ static float qwen4exp_block_sum_f32(
     __syncthreads();
     for (uint32_t stride = blockDim.x >> 1; stride >= 32u; stride >>= 1) {
         if (tid < stride) partial[tid] += partial[tid + stride];
-        __syncthreads();
+        /* The barrier publishes partial[tid] to the thread that reads
+         * partial[tid + stride] on the NEXT iteration.  On the last iteration
+         * -- stride == 32, the loop's own bound -- there is no next iteration,
+         * and the next reader is the warp fold below, where thread tid < 32
+         * reads partial[tid]: the slot it wrote itself, one line up.  The fold
+         * is a pure __shfl_xor_sync butterfly with no shared access, and the
+         * threads with tid >= 32 touch no shared memory between the add above
+         * and the barrier that follows the fold.  So the stride == 32 pass
+         * guards nothing and is the one iteration that can skip it.  The
+         * predicate is the loop induction variable, identical in every thread
+         * of the block and evaluated outside any divergent region, so the
+         * barrier stays collective and cannot deadlock. */
+        if (stride > 32u) __syncthreads();
     }
     if (tid < 32u) {
         const float total = warp_sum_all_f32(partial[tid]);
