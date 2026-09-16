@@ -1560,7 +1560,10 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
     }
 
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    if (n_tokens<=2u && getenv("DS4_QWEN4EXP_NO_GDN_PROJECTION_FUSION")==NULL) {
+    static int gdn_fuse_cached = -1;
+    if (gdn_fuse_cached < 0)
+        gdn_fuse_cached = getenv("DS4_QWEN4EXP_NO_GDN_PROJECTION_FUSION")==NULL;
+    if (n_tokens<=2u && gdn_fuse_cached) {
         ds4_gpu_tensor *outs[4]={s->gdn_qkv,s->gdn_gate,s->gdn_alpha,s->gdn_beta};
         const void *maps[4]={QW_MAP(m,l->attn_qkv),QW_MAP(m,l->attn_gate),
                             QW_MAP(m,l->ssm_alpha),QW_MAP(m,l->ssm_beta)};
@@ -1711,7 +1714,10 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
 
     /* Projections.  q is DOUBLED: half query, half output gate. */
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    if (n_tokens<=2u && getenv("DS4_QWEN4EXP_NO_QSA_Q8_TRIPLE")==NULL) {
+    static int qsa_triple_cached = -1;
+    if (qsa_triple_cached < 0)
+        qsa_triple_cached = getenv("DS4_QWEN4EXP_NO_QSA_Q8_TRIPLE")==NULL;
+    if (n_tokens<=2u && qsa_triple_cached) {
         ds4_gpu_tensor *outs[3]={s->qsa_doubled,s->qsa_kin,s->qsa_vin};
         const void *maps[3]={QW_MAP(m,l->attn_q),QW_MAP(m,l->attn_k),QW_MAP(m,l->attn_v)};
         const uint64_t sizes[3]={QW_MAPSZ(m,l->attn_q),QW_MAPSZ(m,l->attn_k),QW_MAPSZ(m,l->attn_v)};
@@ -2086,7 +2092,14 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
     /* Routed and shared experts read the same mixed activation in this
      * stream. Routed scratch retains its quantization through this call;
      * Metal's prequantized entry point keeps its ordinary implementation. */
-    const int reuse_quant = getenv("DS4_QWEN4EXP_NO_MOE_QUANT_REUSE") == NULL;
+    /* Resolved once per process, in the idiom the neighbouring switches in
+     * this file already use.  This sits inside the per-layer body, so the
+     * environment walk ran once per layer per forward to return a value that
+     * cannot change while the engine is open. */
+    static int reuse_quant_cached = -1;
+    if (reuse_quant_cached < 0)
+        reuse_quant_cached = getenv("DS4_QWEN4EXP_NO_MOE_QUANT_REUSE") == NULL;
+    const int reuse_quant = reuse_quant_cached;
     if (!ds4_gpu_qwen4exp_shared_expert_preq_tensor(
             s->block_out, s->shexp_mid, s->shexp_gate,
             &sh_router_slab, &sh_gate_slab, &sh_up_slab, &sh_down_slab,

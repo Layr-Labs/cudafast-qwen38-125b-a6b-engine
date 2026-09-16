@@ -315,6 +315,8 @@ typedef struct {
 
 /* Serve one request line. Returns 1 to keep the connection, 0 to close it,
  * -1 on a write failure. */
+static unsigned long g_ph_sync, g_ph_eval, g_ph_spec, g_ph_specrun;
+
 static int serve_line(const resident *r, int fd, const char *line) {
     char op[32];
     if (field_string(line, "op", op, sizeof(op)) != 0) {
@@ -341,6 +343,7 @@ static int serve_line(const resident *r, int fd, const char *line) {
         ds4s_invalidate(r->h);
         ok = buf_puts(&out, "{\"ok\":true}");
     } else if (!strcmp(op, "sync")) {
+        g_ph_sync++;
         int32_t *tokens = NULL;
         const long n = field_int_array(line, "tokens", &tokens);
         if (n < 0) {
@@ -356,6 +359,7 @@ static int serve_line(const resident *r, int fd, const char *line) {
         }
         ok = buf_printf(&out, "{\"ok\":true,\"token\":%d}", (int)ds4s_argmax(r->h));
     } else if (!strcmp(op, "eval")) {
+        g_ph_eval++;
         long long token = 0;
         if (field_int(line, "token", &token) != 0) {
             free(out.data);
@@ -386,6 +390,7 @@ static int serve_line(const resident *r, int fd, const char *line) {
             ok = buf_printf(&out, "%s%.9g", i ? "," : "", (double)logits[i]);
         ok = ok && buf_puts(&out, "]}");
     } else if (!strcmp(op, "eval_speculative")) {
+        g_ph_spec++;
         long long first = 0, budget = 0;
         if (field_int(line, "first_token", &first) != 0 ||
             field_int(line, "budget", &budget) != 0) {
@@ -404,6 +409,7 @@ static int serve_line(const resident *r, int fd, const char *line) {
             ok = buf_printf(&out, "%s%d", i ? "," : "", (int)committed[i]);
         ok = ok && buf_printf(&out, "],\"token\":%d}", (int)ds4s_argmax(r->h));
     } else if (!strcmp(op, "spec_run")) {
+        g_ph_specrun++;
         long long first = 0, count = 0;
         if (!r->spec_run) {
             free(out.data);
@@ -668,10 +674,14 @@ int main(void) {
             break;
         }
         phase++;
+        g_ph_sync = g_ph_eval = g_ph_spec = g_ph_specrun = 0;
         log_line("phase %" PRIu64 " connected", phase);
         serve_connection(&r, fd, timeout_s);
         close(fd);
-        log_line("phase %" PRIu64 " closed", phase);
+        log_line("phase %" PRIu64 " closed; %llu decode graph(s) captured so far"
+                 " [sync=%lu eval=%lu spec=%lu spec_run=%lu]",
+                 phase, (unsigned long long)ds4s_decode_graph_captures(),
+                 g_ph_sync, g_ph_eval, g_ph_spec, g_ph_specrun);
     }
 
     log_line("shutting down after %" PRIu64 " phase(s) on one load", phase);
