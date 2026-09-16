@@ -716,6 +716,14 @@ typedef struct {
                          uint32_t, uint32_t, const ds4_gpu_tensor *);
     int (*native_map)(ds4_gpu_tensor *, const ds4_gpu_tensor *,
                       const ds4_gpu_tensor *, uint32_t, uint32_t);
+    /* Optional pair. Nonfinite coarse scores become DS4_MTP_NATIVE_RETRY_ID
+     * at winner readback; the caller reruns only the stateless LM head. */
+    int (*native_screen_deferred)(ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *,
+                         const void *, uint64_t, uint64_t, uint32_t, uint32_t,
+                         uint32_t, uint32_t, const ds4_gpu_tensor *);
+    int (*native_map_deferred)(ds4_gpu_tensor *, const ds4_gpu_tensor *,
+                      const ds4_gpu_tensor *, const ds4_gpu_tensor *,
+                      uint32_t, uint32_t, uint32_t);
     ds4_qwen4exp_block_forward_fn block;
     ds4_qwen4exp_block_forward_fn cache_seed; /* optional cache-only hook */
 } ds4_qwen4exp_mtp_gpu_hooks;
