@@ -427,6 +427,12 @@ struct ds4_qwen4exp_session {
 
     ds4_gpu_tensor *logits;
     ds4_gpu_tensor *spec_top1;
+    /* Deferred-frontier top-k scratch: the serial path leaves logits on the
+     * device, so a top_logits call runs the fused top-k/logsumexp kernel
+     * here and reads back ids, values and two doubles instead of the row. */
+    ds4_gpu_tensor *spec_topk;
+    ds4_gpu_tensor *spec_topk_vals;
+    ds4_gpu_tensor *spec_lse;
 
     /* PREFILL ONLY.  True while `hyper` still owes the last block's inject:
      * the value the model means is hyper + block_out * inject, and the next
@@ -849,6 +855,11 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
             (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * cfg->n_vocab * f, &ok);
     s->spec_top1     = qwen4exp_alloc_zeroed(
             (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * sizeof(int32_t), &ok);
+    s->spec_topk     = qwen4exp_alloc_zeroed(
+            (uint64_t)DS4_QWEN4EXP_TOPK_MAX * sizeof(uint32_t), &ok);
+    s->spec_topk_vals = qwen4exp_alloc_zeroed(
+            (uint64_t)DS4_QWEN4EXP_TOPK_MAX * sizeof(float), &ok);
+    s->spec_lse      = qwen4exp_alloc_zeroed(2u * sizeof(double), &ok);
 #ifdef DS4_TEST_HOOKS
     s->final_mixer_snapshot = qwen4exp_alloc_zeroed(B * H * E * f, &ok);
 #endif
@@ -932,6 +943,9 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->shexp_gate);
     ds4_gpu_tensor_free(s->logits);
     ds4_gpu_tensor_free(s->spec_top1);
+    ds4_gpu_tensor_free(s->spec_topk);
+    ds4_gpu_tensor_free(s->spec_topk_vals);
+    ds4_gpu_tensor_free(s->spec_lse);
 #ifdef DS4_TEST_HOOKS
     ds4_gpu_tensor_free(s->final_mixer_snapshot);
 #endif
@@ -2121,6 +2135,9 @@ typedef enum {
     QW_SLICE_FINAL_MIX,
     QW_SLICE_HEAD,
 } qwen4exp_slice;
+
+/* DS4_QWEN4EXP_TOPK_MAX lives in ds4_qwen4exp_graph.h: session_open above
+ * and ds4.c's top_logprobs path both use it before this point. */
 
 #define DS4_QWEN4EXP_MAX_TRACE 1024
 static uint8_t  g_qwen4exp_trace[DS4_QWEN4EXP_MAX_TRACE];
@@ -3608,6 +3625,49 @@ bool ds4_qwen4exp_graph_verify_top1_rows(ds4_qwen4exp_session       *s,
     }
     return ds4_gpu_tensor_read(s->spec_top1, 0, row_top1,
                                (uint64_t)n_tokens * sizeof(int32_t)) != 0;
+}
+
+bool ds4_qwen4exp_graph_topk_row(ds4_qwen4exp_session *s,
+                                 uint32_t row,
+                                 uint32_t k,
+                                 int32_t *ids,
+                                 float *logits,
+                                 double *logsumexp) {
+    const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
+    if (!s || !ids || !logits || !logsumexp || k == 0u ||
+        k > DS4_QWEN4EXP_TOPK_MAX ||
+        row >= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT) {
+        return false;
+    }
+    /* A row view of the retained logits: same tensor, offset pointer. */
+    ds4_gpu_tensor row_view = *s->logits;
+    row_view.ptr = (char *)s->logits->ptr +
+                   (uint64_t)row * cfg->n_vocab * sizeof(float);
+    row_view.bytes = (uint64_t)cfg->n_vocab * sizeof(float);
+    /* One fused launch: k block-argmax rounds under the host comparator plus
+     * the double exp sum, then three small readbacks. */
+    if (!ds4_gpu_topk_logsumexp_tensor(s->spec_topk, s->spec_topk_vals,
+                                     s->spec_lse, &row_view,
+                                     cfg->n_vocab, k)) {
+        return false;
+    }
+    uint32_t raw_ids[DS4_QWEN4EXP_TOPK_MAX];
+    double aux[2];
+    if (ds4_gpu_tensor_read(s->spec_topk, 0, raw_ids,
+                            (uint64_t)k * sizeof(uint32_t)) == 0 ||
+        ds4_gpu_tensor_read(s->spec_topk_vals, 0, logits,
+                            (uint64_t)k * sizeof(float)) == 0 ||
+        ds4_gpu_tensor_read(s->spec_lse, 0, aux, sizeof(aux)) == 0) {
+        return false;
+    }
+    for (uint32_t i = 0; i < k; i++) {
+        ids[i] = raw_ids[i] == 0xffffffffu ? -1 : (int32_t)raw_ids[i];
+    }
+    /* aux[1] is the largest finite logit; a row with none mirrors the host
+     * scan's early return by refusing, so the caller falls back. */
+    if (!isfinite((float)aux[1])) return false;
+    *logsumexp = aux[1] + log(aux[0]);
+    return true;
 }
 
 bool ds4_qwen4exp_graph_read_logit_row(ds4_qwen4exp_session *s,
