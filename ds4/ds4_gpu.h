@@ -3943,6 +3943,10 @@ int  ds4_gpu_qwen4exp_update_dpos(
         uint32_t        pos);
 
 int  ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key);
+/* How many decode-island graphs this process has captured so far.  The boot
+ * warm-up reads it between rounds so it can stop as soon as a round captures
+ * nothing new, instead of guessing a fixed round count. */
+uint64_t ds4_gpu_decode_graph_capture_count(void);
 void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graphs_invalidate(void);
 

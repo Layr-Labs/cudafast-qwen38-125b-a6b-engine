@@ -1157,6 +1157,10 @@ extern "C" int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) {
     return 0;
 }
 
+extern "C" uint64_t ds4_gpu_decode_graph_capture_count(void) {
+    return g_decode_graph_captures;
+}
+
 extern "C" int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) {
     if (!key || !g_decode_graph_capturing) return -1;
     g_decode_graph_capturing = 0;
