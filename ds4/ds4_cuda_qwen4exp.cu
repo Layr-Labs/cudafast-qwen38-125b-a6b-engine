@@ -13314,6 +13314,21 @@ static uint32_t qwen4exp_cuda_threads(uint32_t value) {
  * Both bounds are scheduling bounds.  The kernel's arithmetic does not depend
  * on GROUP at all (see its note), so moving these numbers cannot move a
  * single output bit. */
+/* AND AT DECODE WIDTH IT IS UNREACHABLE TWICE OVER, SO IT IS NOT A DECODE
+ * DIAL.  The first reason is the arithmetic one: a decode call is one or two
+ * rows and this is sixty-four, so `n_tokens >= QWEN4EXP_QSA_GROUP_MIN_ROWS`
+ * is false and `want` comes out 1.  That reason would yield to lowering the
+ * number.  The second would not.  The caller runs the split path FIRST and
+ * returns on it -- `if (split != 0) return split > 0;` -- and at one and two
+ * rows the split path takes the shape: qwen4exp_qsa_split_width answers 2 for
+ * the one-row model shape and 4 otherwise, and the only things that can turn
+ * it away are a missing or undersized session scratch or
+ * DS4_QWEN4EXP_NO_QSA_SPLIT, neither of which holds in the shipped
+ * configuration.  Control never reaches this test at all.
+ *
+ * So no value of this constant can move a decode schedule, let alone a decode
+ * bit.  It governs prefill, and prefill is where any measurement of it has to
+ * be taken. */
 #define QWEN4EXP_QSA_GROUP_MIN_ROWS   64u
 #define QWEN4EXP_QSA_GROUP_SHARED_CAP (48u * 1024u)
 
