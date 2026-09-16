@@ -1093,18 +1093,38 @@ static cuda_decode_graph_entry *cuda_decode_graph_find(
     if (key->il >= CUDA_DECODE_GRAPH_LAYERS ||
         key->island >= CUDA_DECODE_GRAPH_ISLANDS) return NULL;
     cuda_decode_graph_entry *slot = NULL;
+    cuda_decode_graph_entry *dead = NULL;
     for (uint32_t v = 0; v < CUDA_DECODE_GRAPH_VARIANTS; v++) {
         cuda_decode_graph_entry *e = &g_decode_graphs[key->il][key->island][v];
         if (e->state != 0 &&
             memcmp(&e->key, key, sizeof(*key)) == 0) return e;
         if (e->state == 0 && !slot) slot = e;
+        /* A killed entry (state 3) holds no exec -- entry_kill destroyed and
+         * NULLed it -- so its slot is pure bookkeeping, yet the scan above
+         * never offered it to anyone.  One capture failure therefore retired
+         * one of the row's variants for the life of the process.  Track the
+         * least-replayed such slot as a fallback; `hits` was already
+         * maintained here and had no reader. */
+        if (e->state == 3 && (!dead || e->hits < dead->hits)) dead = e;
     }
+    /* Empty slots win, so a row with any room behaves exactly as before: this
+     * only engages in the state the variant-count comment above warns about,
+     * where the row is otherwise full and the island would drop onto the eager
+     * path permanently and silently.
+     *
+     * The match test is deliberately untouched, and that is what keeps the
+     * reclaim safe: a dead entry is still returned for its OWN key, so a
+     * capture that failed is still not retried for the key that failed it.
+     * Only a DIFFERENT key may take the slot, and only when nothing is free.
+     * Reclaiming destroys nothing and issues no CUDA call. */
+    if (!slot) slot = dead;
     if (slot) {
         memcpy(&slot->key, key, sizeof(*key));
+        slot->hits  = 0;   /* the old key's replay count is not this key's */
         slot->state = 0;   /* caller advances the state machine */
         return slot;
     }
-    return NULL;           /* all variants busy with other keys: stay eager */
+    return NULL;           /* every variant holds a live key: stay eager */
 }
 
 /* Upload a ready exec now rather than at its next launch.  Costs the caller
