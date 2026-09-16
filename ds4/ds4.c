@@ -3914,7 +3914,7 @@ static bool accelerator_cache_q8_tensors(const ds4_model *m,
  * A HINT, NEVER A VALUE.  The pass reads bytes and discards them.  It changes
  * no row the gather returns and no order it returns them in.
  * ---------------------------------------------------------------------- */
-#define DS4_PLE_PAGE_WARM_THREADS 8
+#define DS4_PLE_PAGE_WARM_THREADS 32
 
 typedef struct {
     const unsigned char *base;
@@ -3956,13 +3956,21 @@ static void ds4_ple_page_warm(const ds4_model *m) {
         }
         done = 1;
         const unsigned char *base = (const unsigned char *)sh->map + t->abs_offset;
+        /* This walks 26.8 GiB of mapped shard, so the thread count is worth
+         * deriving rather than pinning: eight threads under-use a 20-core
+         * Spark and a 64-core host alike, and the span below has to stay a
+         * compile-time bound.  Take the online count, clamp it into the
+         * array's bound, and keep the fixed-8 result reachable. */
+        uint32_t nwarm = (uint32_t)sysconf(_SC_NPROCESSORS_ONLN);
+        if (nwarm < 4u) nwarm = 4u;
+        if (nwarm > DS4_PLE_PAGE_WARM_THREADS) nwarm = DS4_PLE_PAGE_WARM_THREADS;
         ds4_ple_page_warm_job jobs[DS4_PLE_PAGE_WARM_THREADS];
         pthread_t tids[DS4_PLE_PAGE_WARM_THREADS];
         const uint64_t span =
-            (t->bytes + DS4_PLE_PAGE_WARM_THREADS - 1u) / DS4_PLE_PAGE_WARM_THREADS;
+            (t->bytes + nwarm - 1u) / nwarm;
         const double t0 = now_sec();
         uint32_t started = 0;
-        for (uint32_t k = 0; k < DS4_PLE_PAGE_WARM_THREADS; k++) {
+        for (uint32_t k = 0; k < nwarm; k++) {
             const uint64_t off = (uint64_t)k * span;
             if (off >= t->bytes) break;
             uint64_t len = t->bytes - off;
