@@ -9888,7 +9888,7 @@ __global__ static void qwen4exp_hc_mix_inject_renorm_kernel(
  * DS4_QWEN4EXP_MTP_MAX_COMMIT (7).  Every captured island therefore holds the
  * split pair, one fixed sequence per key, and the widths the speculative cycle
  * compares are all on the same side of this line. */
-#define QWEN4EXP_HC_FUSE_MIX_MIN_ROWS 48u
+#define QWEN4EXP_HC_FUSE_MIX_MIN_ROWS 2u
 
 /* The fused path is the default; this is a debugging valve, read once. */
 static int ds4_qwen4exp_hc_fuse_off(void) {
