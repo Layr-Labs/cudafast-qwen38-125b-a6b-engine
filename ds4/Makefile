@@ -23,7 +23,14 @@ QWEN4EXP_MTP_TEST := tests/test_qwen4exp_mtp
 QWEN4EXP_MODEL_REGISTRATION_TEST := tests/test_qwen4exp_model_registration
 QWEN4EXP_PARITY_TEST := tests/test_qwen4exp_parity
 
-DEBUG_FLAGS ?= -g
+# The release path does not need host debug line tables either.  The CUDA
+# side already dropped -g -lineinfo for the shipped cubin; this is the same
+# dead weight on the C translation units, which are the larger half of the
+# shared library the adapter loads.  -g emits DWARF only: it does not change
+# a single optimisation decision, so every object is code-identical and the
+# engine's arithmetic is untouched.  It stays a ?= override, so a debug
+# build is still one make variable away.
+DEBUG_FLAGS ?=
 CFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99
 OBJCFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -fobjc-arc
 QUALITY_CFLAGS ?= -O3 $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c11
