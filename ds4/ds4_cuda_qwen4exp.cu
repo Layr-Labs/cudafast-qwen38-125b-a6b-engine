@@ -8133,6 +8133,30 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
      * kernel).  Run-time switch: DS4_GATEUP_DMA=0 restores the shipped
      * kernel from the same binary.  Both arms live in one build, so an A/B
      * is two runs of one binary and not two builds. */
+    /* NOT A DIAL: THIS SELECTS A LAYOUT, AND 4 IS A DIFFERENT KERNEL.
+     *
+     * Written as a bare 5 it invites being tried at 4 or 6, as though it were
+     * a depth.  It is not that kind of constant.  It reaches the kernel as the
+     * `Dma` template argument and the kernel's first act is to reduce it to a
+     * staging width,
+     *
+     *     QW_DMA_PER = (Dma == 1) ? 1 : ((Dma == 4) ? 4 : 2),
+     *
+     * so every value except 1 and 4 means the same two-super-block staging the
+     * shipped arm already uses -- 5 is just one spelling of "2", and 6 would be
+     * another.  There is no neighbouring setting to explore.
+     *
+     * Four is not a deeper version of the same thing either; QW_DMA_PER == 4
+     * re-derives three separate pieces of addressing.  The fill offset becomes
+     * `fi * 288u` instead of `fi * 144u + 16u`, each fetch starts reading a
+     * super-block index `sbi = (kc_ >> 3) & 1u` that is pinned to zero at every
+     * other width, and the K-extent guard tightens from `groups & 7u` to
+     * `groups & 15u`, i.e. from whole 8-group super-blocks to pairs of them.
+     *
+     * MEASURED: submitted as 4 on the ranked path it did not score at all --
+     * it failed the correctness gate.  So moving this constant off 5 either
+     * changes nothing at all or selects an arm that does not currently produce
+     * the right bytes at this shape.  Neither outcome is a tuning result. */
 #ifndef DS4_GATEUP_DMA_BUILD
 #define DS4_GATEUP_DMA_BUILD 1
 #endif
