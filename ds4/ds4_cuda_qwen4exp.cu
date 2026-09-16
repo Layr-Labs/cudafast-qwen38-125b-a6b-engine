@@ -8937,6 +8937,12 @@ __device__ __forceinline__ static float qwen4exp_block_sum_f32(
  * before consuming any, which is the only change: `sum += v * v` is still the
  * expression it always was, applied to the same elements in the same order,
  * and the normalise-and-scale walk is elementwise. */
+/* a staging depth that feeds an accumulation is not a tuning knob. Halving
+ * the normalisation staging depth builds and launches cleanly and then
+ * fails the correctness gate, because the depth also sets the order of the
+ * sum of squares and a reordered sum rounds differently, which is enough to
+ * move a near-tie argmax.
+ */
 __global__ static void qwen4exp_rms_norm_kernel(
         float *out, const float *x, const float *w,
         uint32_t n, uint32_t group, uint32_t rows,
