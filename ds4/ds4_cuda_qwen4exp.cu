@@ -4301,7 +4301,37 @@ __device__ __forceinline__ static void qwen4exp_shared_vector_accumulate(
  * Purely a packing change.  Each output row still walks its own weight row in
  * the same group order through the same warp_sum_f32 tree, and every dot is
  * bit-identical. */
-#define QW_GU_COOP_ROWS 4u
+/* TWO OUTPUT ROWS PER COOPERATIVE BLOCK, NOT FOUR.
+ *
+ * The four-row change that shipped before this one halved the block from 512
+ * threads to 256 and lifted residency from three blocks per SM to six, and it
+ * was worth about half a percent.  It stopped there, and the probe shows why
+ * it should not have: at four rows this kernel reports
+ * gu[reg=32 smem=11584 lmem=0 maxt=1024 occ=6], and SIX is the 1536-thread
+ * ceiling divided by the 256-thread block.  Registers admit 65,536/(32*256)=8
+ * blocks and shared memory admits 101,376/12,608=8; both are slack, and the
+ * thread ceiling alone is binding -- exactly the state the four-row comment
+ * describes and then leaves in place.
+ *
+ * Two rows halves the block again to 128 threads, so the ceiling admits
+ * TWELVE.  The staged panel halves with it (QW_GU_COOP_U4 is ROWS*90), so
+ * shared memory stays slack at roughly 6.3 KiB, and registers are untouched.
+ *
+ * The weight traffic does not change.  mid_dim is 640 either way: four rows
+ * gives 160 blocks of four, two rows gives 320 blocks of two, and each output
+ * row still walks its own weight row.  No row shares a weight row with
+ * another, so halving the rows per block removes no reuse -- it only narrows
+ * the block, which is the whole point.
+ *
+ * Purely a packing change, as the four-row change was.  Each row walks the
+ * same group order through the same warp_sum_f32 tree, so every dot product
+ * is bit-identical.
+ *
+ * An interposed launch profile of the SCORED configuration (MTP depth 1
+ * through the resident, not serial decode) puts this kernel first at 14.75
+ * percent of device time over 6,439 launches, which is why it is the one
+ * worth narrowing. */
+#define QW_GU_COOP_ROWS 2u
 #define QW_GU_COOP_ROW_U4 90u                /* 1440 B, ten q4_K super-blocks */
 #define QW_GU_COOP_GROUPS 80u                            /* in_dim 2560 / 32 */
 #define QW_GU_COOP_U4 (QW_GU_COOP_ROWS * QW_GU_COOP_ROW_U4)
