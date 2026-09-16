@@ -4003,6 +4003,34 @@ int ds4_gpu_qwen4exp_hc_mixer_tensor(
         float                 weight_bias,
         int                   round_bf16);
 
+/* CUDA: the mixer followed by row-exact Q8_0 activation quantization.
+ * Both float outputs and the Q8 bytes/scales are ready on success. Decode
+ * may fuse the quantizer into the mix; other dispatches run both operations.
+ * mixed_q8 must be separate from all mixer inputs, outputs and scratch. */
+int ds4_gpu_qwen4exp_hc_mixer_q8_tensor(
+        ds4_gpu_tensor       *mixed,
+        ds4_gpu_tensor       *inject,
+        ds4_gpu_tensor       *normed_scratch,
+        ds4_gpu_tensor       *lowrank_scratch,
+        ds4_gpu_tensor       *wide_scratch,
+        const ds4_gpu_tensor *hyper,
+        /* One slab per tensor: a shard boundary can fall between any two of a
+         * mixer's four weights. */
+        const ds4_gpu_qwen4exp_slab *norm_weight,
+        const ds4_gpu_qwen4exp_slab *down_weight,
+        const ds4_gpu_qwen4exp_slab *up_weight,
+        const ds4_gpu_qwen4exp_slab *inject_weight,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              n_lowrank,
+        uint32_t              rows,
+        float                 eps,
+        float                 weight_bias,
+        int                   round_bf16,
+        ds4_gpu_tensor       *mixed_q8,
+        uint64_t              q_offset,
+        uint64_t              s_offset);
+
 /* ds4_gpu_qwen4exp_hc_inject_tensor(hyper, hyper, pending_block, pending_inject)
  * followed by ds4_gpu_qwen4exp_hc_mixer_tensor, as one call: the residual is
  * updated in place and the mixer runs on the updated values.  A backend may

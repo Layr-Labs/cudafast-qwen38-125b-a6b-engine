@@ -410,12 +410,13 @@ struct ds4_qwen4exp_session {
     ds4_gpu_tensor *logits;
     ds4_gpu_tensor *spec_top1;
 
-    /* PREFILL ONLY.  True while `hyper` still owes the last block's inject:
+    /* True while `hyper` still owes the last block's inject:
      * the value the model means is hyper + block_out * inject, and the next
      * mixer applies it on its first read of the residual instead of a
      * separate 42 MB read-write pass (see qwen4exp_hc_defer_ok).  Every
-     * other reader of `hyper` flushes first.  Never set inside a captured
-     * decode island: the widths that capture are below the threshold. */
+     * other reader of `hyper` flushes first. At decode widths, only the
+     * attention inject is deferred and its FFN mixer consumes it inside the
+     * same island. It is false at every decode island/layer boundary. */
     bool hc_pending;
 
 #ifdef DS4_TEST_HOOKS
@@ -1475,6 +1476,17 @@ static bool qw_qsa_gate_from_doubled(uint32_t n_tokens, uint32_t q_width,
 /* The GDN block.  head_layout is TILED for anything the loader bound: the
  * llama.cpp converter reorders the value heads into ggml's broadcast order and
  * the binder does not undo it, so value head j reads key head j % n_key_head. */
+/* A shape decision shared by capture and replay; no host-side validity bit
+ * can become stale when one island replays while another is encoded. */
+static bool qwen4exp_attention_mix_q8(uint32_t rows) {
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    return rows >= 1u && rows <= 3u;
+#else
+    (void)rows;
+    return false;
+#endif
+}
+
 static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
                                      const ds4_qwen4exp_layer_weights *l,
                                      const ds4_model *m,
@@ -1489,7 +1501,8 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
      * session scratch: both GDN Q8 projections read the same mixed input.
      * The F32 alpha/beta projections still read the original float values.
      * Width-specific graph islands capture a stable scratch and scale offset. */
-    if (!ds4_qwen4exp_quantize_q8_0(s->mixed_q8, 0, q8_soff, s->mixed,
+    if (!qwen4exp_attention_mix_q8(n_tokens) &&
+        !ds4_qwen4exp_quantize_q8_0(s->mixed_q8, 0, q8_soff, s->mixed,
                                     DS4_N_EMBD, n_tokens)) {
         fprintf(stderr, "ds4: qwen4exp GDN pre-quantize failed at block %u\n", il);
         return false;
@@ -1622,7 +1635,8 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
     const uint64_t q8_qbytes = (uint64_t)n_tokens * q8_blocks * 32u;
     const uint64_t q8_soff = (q8_qbytes + 15u) & ~15ull;
 
-    if (!ds4_qwen4exp_quantize_q8_0(s->mixed_q8, 0, q8_soff, s->mixed,
+    if (!qwen4exp_attention_mix_q8(n_tokens) &&
+        !ds4_qwen4exp_quantize_q8_0(s->mixed_q8, 0, q8_soff, s->mixed,
                                     DS4_N_EMBD, n_tokens)) {
         fprintf(stderr, "ds4: qwen4exp QSA pre-quantize failed at block %u\n", il);
         return false;
@@ -2163,7 +2177,7 @@ static bool qwen4exp_graph_residual(ds4_qwen4exp_session *s,
                                     const ds4_tensor *up,
                                     const ds4_tensor *inject,
                                     float norm_weight_offset,
-                                    uint32_t n_tokens) {
+                                    uint32_t n_tokens, bool attention) {
     /* An owed inject is applied by the mixer itself, inside its first read
      * of the residual; the pair (inject kernel, mixer) is what it computes. */
     const bool pending = s->hc_pending;
@@ -2187,6 +2201,24 @@ static bool qwen4exp_graph_residual(ds4_qwen4exp_session *s,
     const ds4_gpu_qwen4exp_slab up_slab = QW_SLAB(m, up);
     const ds4_gpu_qwen4exp_slab inject_slab =
         inject ? QW_SLAB(m, inject) : (ds4_gpu_qwen4exp_slab){0};
+
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (attention && qwen4exp_attention_mix_q8(n_tokens)) {
+        if (pending && !ds4_gpu_qwen4exp_hc_inject_tensor(
+                s->hyper, s->hyper, s->block_out, s->inject,
+                DS4_N_EMBD, DS4_N_HC, n_tokens)) return false;
+        const uint64_t qbytes = (uint64_t)n_tokens * DS4_N_EMBD;
+        const uint64_t soff = (qbytes + 15u) & ~15ull;
+        return ds4_gpu_qwen4exp_hc_mixer_q8_tensor(
+                s->mixed, inject ? s->inject : NULL, s->normed, s->lowrank,
+                s->wide, s->hyper, &norm_slab, &down_slab, &up_slab,
+                inject ? &inject_slab : NULL,
+                DS4_N_EMBD, DS4_N_HC, DS4_N_HC_LOWRANK, n_tokens,
+                DS4_HC_EPS, norm_weight_offset, 1, s->mixed_q8, 0, soff) != 0;
+    }
+#else
+    (void)attention;
+#endif
 
     if (pending) {
         return ds4_gpu_qwen4exp_hc_mixer_pending_tensor(
@@ -2216,7 +2248,7 @@ static bool qwen4exp_graph_layer_island_encode(
         /* --- attention side ------------------------------------------- */
         if (!qwen4exp_graph_residual(s, m, l->hc_attn_norm, l->hc_attn_down,
                                      l->hc_attn_up, l->hc_attn_inject,
-                                     l->hc_attn_norm_offset, n_tokens)) {
+                                     l->hc_attn_norm_offset, n_tokens, true)) {
             fprintf(stderr, "ds4: qwen4exp attention mixer failed at block %u\n", il);
             return false;
         }
@@ -2230,7 +2262,10 @@ static bool qwen4exp_graph_layer_island_encode(
          * applied here (qwen4exp_hc_defer_ok); the slice trace keeps its
          * order either way, it records what the model computed. */
         const bool defer = qwen4exp_hc_defer_ok(n_tokens);
-        if (defer) {
+        /* Decode defers only this inject: the FFN mixer consumes it within
+         * this same graph island. The final FFN inject remains explicit, so
+         * no pending host state crosses a replay boundary. */
+        if (defer || qwen4exp_attention_mix_q8(n_tokens)) {
             s->hc_pending = true;
         } else if (!ds4_gpu_qwen4exp_hc_inject_tensor(s->hyper, s->hyper, s->block_out,
                                                s->inject, DS4_N_EMBD, DS4_N_HC,
@@ -2243,7 +2278,7 @@ static bool qwen4exp_graph_layer_island_encode(
         /* --- feed-forward side ---------------------------------------- */
         if (!qwen4exp_graph_residual(s, m, l->hc_ffn_norm, l->hc_ffn_down,
                                      l->hc_ffn_up, l->hc_ffn_inject,
-                                     l->hc_ffn_norm_offset, n_tokens)) {
+                                     l->hc_ffn_norm_offset, n_tokens, false)) {
             fprintf(stderr, "ds4: qwen4exp FFN mixer failed at block %u\n", il);
             return false;
         }
@@ -2606,16 +2641,11 @@ static bool qwen4exp_graph_layers(
     /* Layer dumps synchronize and must execute every host call site. */
     capture_ok = capture_ok && !qwen4exp_layer_dump_on();
 #endif
-    /* WHY A CHUNK BOUNDARY CARRIES NO STATE.  The only host state that flows
-     * between layers of this stack is the deferred residual inject
-     * (s->hc_pending), and the deferral is prefill-only: qwen4exp_hc_defer_ok
-     * requires n_tokens >= DS4_QWEN4EXP_HC_DEFER_MIN_ROWS (48), while
-     * capture_ok requires n_tokens <= DS4_QWEN4EXP_MTP_MAX_COMMIT.  So at
-     * every width that captures, hc_pending is false at every layer boundary
-     * -- the forward clears it on entry and nothing in a decode-width layer
-     * sets it.  Cutting the capture at a layer boundary therefore cannot move
-     * an inject across it, and a forward that replays some chunks and encodes
-     * others is the same computation in the same order. */
+    /* The cross-layer inject deferral remains prefill-only. Decode may defer
+     * an attention inject to its FFN mixer within one island, which consumes
+     * it before that island ends; the FFN's final inject stays explicit.
+     * Thus hc_pending is false at every captured island/layer boundary, and
+     * mixing chunk replay with eager encoding preserves the operation order. */
     if (capture_ok && qw_decode_graph_chunks() > 1u) {
         const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
         uint32_t chunks = qw_decode_graph_chunks();
@@ -2840,7 +2870,7 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
      * n_embd and stands in for the model.norm this checkpoint does not have. */
     if (!qwen4exp_graph_residual(s, m, w->output_hc_norm, w->output_hc_down,
                                  w->output_hc_up, NULL,
-                                 w->output_hc_norm_offset, n_tokens)) {
+                                 w->output_hc_norm_offset, n_tokens, false)) {
         fprintf(stderr, "ds4: qwen4exp final mixer failed\n");
         return qwen4exp_forward_fail();
     }
@@ -3151,13 +3181,14 @@ static bool qwen4exp_graph_head_cache_encode(ds4_qwen4exp_session *s,
         uint32_t il, uint32_t n_tokens) {
     const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
     if (!qwen4exp_graph_residual(s, m, l->hc_attn_norm, l->hc_attn_down,
-            l->hc_attn_up, l->hc_attn_inject, l->hc_attn_norm_offset, n_tokens))
+            l->hc_attn_up, l->hc_attn_inject, l->hc_attn_norm_offset, n_tokens, true))
         return false;
     const uint64_t blocks = (uint64_t)DS4_N_EMBD / 32u;
     const uint64_t qbytes = (uint64_t)n_tokens * blocks * 32u;
     const uint64_t soff = (qbytes + 15u) & ~15ull;
-    if (!ds4_qwen4exp_quantize_q8_0(s->mixed_q8, 0, soff, s->mixed,
-                                   DS4_N_EMBD, n_tokens) ||
+    if ((!qwen4exp_attention_mix_q8(n_tokens) &&
+         !ds4_qwen4exp_quantize_q8_0(s->mixed_q8, 0, soff, s->mixed,
+                                    DS4_N_EMBD, n_tokens)) ||
         !ds4_qwen4exp_matmul_q8_0_preq(s->qsa_kin, QW_MAP(m, l->attn_k),
             QW_MAPSZ(m, l->attn_k), QW_OFF(l->attn_k), DS4_N_EMBD,
             cfg->qsa_kv_dim, s->mixed_q8, 0, soff, n_tokens) ||
@@ -3217,22 +3248,26 @@ static bool qwen4exp_graph_head_block_encode(
     const char *stage = "attention mixer";
     bool ok = qwen4exp_graph_residual(s, m, l->hc_attn_norm, l->hc_attn_down,
                                       l->hc_attn_up, l->hc_attn_inject,
-                                      l->hc_attn_norm_offset, n_tokens);
+                                      l->hc_attn_norm_offset, n_tokens, true);
     QW_HB_TICK(QW_HB_T_ATTN_MIX);
     if (ok) { stage = "QSA"; ok = qwen4exp_graph_qsa_block(s, l, m, il, n_tokens); }
     QW_HB_TICK(QW_HB_T_QSA);
     if (ok) {
         stage = "attention inject";
-        ok = ds4_gpu_qwen4exp_hc_inject_tensor(s->hyper, s->hyper, s->block_out,
-                                               s->inject, DS4_N_EMBD, DS4_N_HC,
-                                               n_tokens) != 0;
+        if (qwen4exp_attention_mix_q8(n_tokens)) {
+            s->hc_pending = true;
+        } else {
+            ok = ds4_gpu_qwen4exp_hc_inject_tensor(s->hyper, s->hyper, s->block_out,
+                                                   s->inject, DS4_N_EMBD, DS4_N_HC,
+                                                   n_tokens) != 0;
+        }
     }
     QW_HB_TICK(QW_HB_T_ATTN_INJECT);
     if (ok) {
         stage = "FFN mixer";
         ok = qwen4exp_graph_residual(s, m, l->hc_ffn_norm, l->hc_ffn_down,
                                      l->hc_ffn_up, l->hc_ffn_inject,
-                                     l->hc_ffn_norm_offset, n_tokens);
+                                     l->hc_ffn_norm_offset, n_tokens, false);
     }
     QW_HB_TICK(QW_HB_T_FFN_MIX);
     if (ok) {
@@ -3496,7 +3531,7 @@ bool ds4_qwen4exp_graph_head_logits(ds4_qwen4exp_session       *s,
     }
     if (!qwen4exp_graph_residual(s, m, w->output_hc_norm, w->output_hc_down,
                                  w->output_hc_up, NULL,
-                                 w->output_hc_norm_offset, 1u)) {
+                                 w->output_hc_norm_offset, 1u, false)) {
         fprintf(stderr, "ds4: qwen4exp final mixer failed on the head row\n");
         return qwen4exp_forward_fail();
     }

@@ -753,6 +753,19 @@ static void check_mixer_equivalence(uint8_t *model, const char *up_path) {
         float *inject_got = alloc_floats(inj_slots);
         float *hyper_after = alloc_floats(hc_count);
 
+#if !defined(__APPLE__) && !defined(__HIP_PLATFORM_AMD__)
+        const uint64_t qoff = 16u;
+        const uint64_t soff = qoff + embd_count + 16u;
+        const uint64_t qsize = soff + embd_count / 32u * sizeof(float) + 16u;
+        ds4_gpu_tensor *qref_t = ds4_gpu_tensor_alloc(qsize);
+        ds4_gpu_tensor *qgot_t = ds4_gpu_tensor_alloc(qsize);
+        unsigned char *qref = malloc(qsize), *qgot = malloc(qsize);
+        require_ok(qref_t && qgot_t && qref && qgot, "HC Q8 buffers");
+        memset(qref, 0xa5, qsize);
+        require_ok(ds4_gpu_tensor_write(qref_t, 0, qref, qsize) &&
+                   ds4_gpu_tensor_write(qgot_t, 0, qref, qsize), "HC Q8 canaries");
+#endif
+
         for (int head = 0; head < 3; head++) {
             const ds4_gpu_qwen4exp_slab *iw =
                 head == 0 ? &inject_f32 : (head == 1 ? &inject_q8 : NULL);
@@ -808,6 +821,28 @@ static void check_mixer_equivalence(uint8_t *model, const char *up_path) {
                                       hc_count * sizeof(float));
                     cases++;
 #if !defined(__APPLE__) && !defined(__HIP_PLATFORM_AMD__)
+                    require_ok(ds4_gpu_quantize_q8_0_decode_rows_exact_tensor(
+                                   qref_t, qoff, soff, mixed_a, N_EMBD, rows),
+                               "HC standalone Q8 reference");
+                    require_ok(ds4_gpu_qwen4exp_hc_mixer_q8_tensor(
+                                   mixed_b, ib, normed_t, lowrank_t, wide_t,
+                                   hyper_t, &norm_slab, &down_slab, &up_slab,
+                                   iw, N_EMBD, N_HC, N_LOWRANK, rows, 1e-6f,
+                                   weight_bias, bf16, qgot_t, qoff, soff),
+                               "HC mixer with Q8 output");
+                    require_ok(ds4_gpu_tensor_read(qref_t, 0, qref, qsize) &&
+                               ds4_gpu_tensor_read(qgot_t, 0, qgot, qsize),
+                               "HC Q8 readback");
+                    require_identical("HC fused Q8 bytes, scales and canaries",
+                                      qgot, qref, qsize);
+                    download(mixed_b, mixed_got, mix_slots);
+                    require_identical("HC quantized mixer float output",
+                                      mixed_got, mixed_ref, mix_slots * sizeof(float));
+                    if (ib) {
+                        download(inject_b, inject_got, inj_slots);
+                        require_identical("HC quantized mixer inject output",
+                                          inject_got, inject_ref, inj_slots * sizeof(float));
+                    }
                     if (rows <= 7u) {
                         const ds4_decode_graph_key key = {
                             .il = 1u, .island = 0u, .variant = rows
@@ -815,18 +850,18 @@ static void check_mixer_equivalence(uint8_t *model, const char *up_path) {
                         ds4_gpu_decode_graphs_invalidate();
                         require_ok(ds4_gpu_decode_graph_begin(&key) == -1,
                                    "HC graph warm state");
-                        require_ok(ds4_gpu_qwen4exp_hc_mixer_tensor(
+                        require_ok(ds4_gpu_qwen4exp_hc_mixer_q8_tensor(
                                        mixed_b, ib, normed_t, lowrank_t, wide_t,
                                        hyper_t, &norm_slab, &down_slab, &up_slab,
                                        iw, N_EMBD, N_HC, N_LOWRANK, rows, 1e-6f,
-                                       weight_bias, bf16), "HC graph warm operation");
+                                       weight_bias, bf16, qgot_t, qoff, soff), "HC graph warm operation");
                         require_ok(ds4_gpu_decode_graph_begin(&key) == 0,
                                    "HC graph capture state");
-                        require_ok(ds4_gpu_qwen4exp_hc_mixer_tensor(
+                        require_ok(ds4_gpu_qwen4exp_hc_mixer_q8_tensor(
                                        mixed_b, ib, normed_t, lowrank_t, wide_t,
                                        hyper_t, &norm_slab, &down_slab, &up_slab,
                                        iw, N_EMBD, N_HC, N_LOWRANK, rows, 1e-6f,
-                                       weight_bias, bf16), "HC graph capture operation");
+                                       weight_bias, bf16, qgot_t, qoff, soff), "HC graph capture operation");
                         require_ok(ds4_gpu_decode_graph_end(&key) == 0,
                                    "HC graph capture complete");
                         const float magnitudes[] = {1.0f, 1e-30f, 1e10f};
@@ -855,6 +890,14 @@ static void check_mixer_equivalence(uint8_t *model, const char *up_path) {
                             download(hyper_t, hyper_after, hc_count);
                             require_identical("HC replay input immutability",
                                               hyper_after, hyper, hc_count * sizeof(float));
+                            require_ok(ds4_gpu_quantize_q8_0_decode_rows_exact_tensor(
+                                           qref_t, qoff, soff, mixed_a, N_EMBD, rows),
+                                       "HC replay Q8 reference");
+                            require_ok(ds4_gpu_tensor_read(qref_t, 0, qref, qsize) &&
+                                       ds4_gpu_tensor_read(qgot_t, 0, qgot, qsize),
+                                       "HC replay Q8 readback");
+                            require_identical("HC replay Q8 bytes, scales and canaries",
+                                              qgot, qref, qsize);
                             graph_cases++;
                         }
                         ds4_gpu_decode_graphs_invalidate();
@@ -864,6 +907,12 @@ static void check_mixer_equivalence(uint8_t *model, const char *up_path) {
             }
         }
 
+#if !defined(__APPLE__) && !defined(__HIP_PLATFORM_AMD__)
+        free(qgot);
+        free(qref);
+        ds4_gpu_tensor_free(qgot_t);
+        ds4_gpu_tensor_free(qref_t);
+#endif
         free(hyper_after);
         free(inject_got);
         free(inject_ref);
@@ -909,7 +958,7 @@ static void check_mixer_equivalence(uint8_t *model, const char *up_path) {
  * on).  Inject encodings f32 and Q8_0, both flags, and the final mixer
  * (inject head absent, the pending apply still owed). */
 static void check_mixer_pending(uint8_t *model, const char *up_path) {
-    static const uint32_t row_set[] = { 1u, 7u, 47u, 48u, 64u, 1017u, ROWS_LONG };
+    static const uint32_t row_set[] = { 1u, 2u, 3u, 4u, 7u, 47u, 48u, 64u, 1017u, ROWS_LONG };
     const ds4_gpu_qwen4exp_slab norm_slab =
         hc_slab(model, MODEL_BYTES, NORM_WIDE_OFF);
     const ds4_gpu_qwen4exp_slab down_slab =

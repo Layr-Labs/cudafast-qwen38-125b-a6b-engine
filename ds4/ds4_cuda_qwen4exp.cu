@@ -8727,12 +8727,14 @@ __global__ static void qwen4exp_gdn_output_quant_kernel(
  * the same one.  `group` (= n_embd) must be a multiple of blockDim.x, so loop
  * step k of thread t covers flat index g*group + k*blockDim.x + t and warp w
  * of that step covers exactly one 32-value Q8_0 block, in lane order. */
-template <int Staged = 0>
+template <int Staged = 0, bool Pending = false>
 __global__ static void qwen4exp_hc_norm_quant_kernel(
         int8_t *xq, float *xscale, float *nscale,
         const float *x, const float *w,
         uint32_t n, uint32_t group, uint32_t rows,
-        float eps, float weight_bias, int round_bf16) {
+        float eps, float weight_bias, int round_bf16,
+        float *updated, const float *pending_block, const float *pending_inject) {
+    static_assert(!Pending || Staged, "pending inject needs the staged geometry");
     /* PDL producer for the down projection that follows on the stream.
      * Triggered at the two-row decode only, row-gated to the same <= 2 the
      * converted launch sites fire at: grid is (n_hc, rows), 4*2 blocks --
@@ -8772,9 +8774,31 @@ __global__ static void qwen4exp_hc_norm_quant_kernel(
     QWEN4EXP_PDL_SYNC();
 
     __shared__ float partial[QWEN4EXP_HC_THREADS];
-    const float scale = Staged
-        ? qwen4exp_hc_norm_scale_staged(xg, group, eps, partial)
-        : qwen4exp_hc_norm_scale(xg, group, eps, partial);
+    float injected[Pending ? QWEN4EXP_HC_STAGED_STEPS : 1u];
+    float scale;
+    if (Pending) {
+        /* Each CTA owns one complete residual stream. Apply exactly the
+         * standalone inject's FFMA, then reuse those values for norm and Q8.
+         * No other CTA reads this stream until this kernel finishes. */
+        const float pi = pending_inject[(uint64_t)row * (n / group) + g];
+        const float *pb = pending_block + (uint64_t)row * group;
+#pragma unroll
+        for (uint32_t k = 0; k < QWEN4EXP_HC_STAGED_STEPS; k++) {
+            const uint32_t d = k * QWEN4EXP_HC_THREADS + threadIdx.x;
+            injected[k] = __fmaf_rn(pb[d], pi, xg[d]);
+            updated[base + d] = injected[k];
+        }
+        float sum = 0.0f;
+#pragma unroll
+        for (uint32_t k = 0; k < QWEN4EXP_HC_STAGED_STEPS; k++)
+            sum += injected[k] * injected[k];
+        const float total = qwen4exp_block_sum_f32(sum, partial);
+        scale = 1.0f / sqrtf(total / (float)group + eps);
+    } else {
+        scale = Staged
+            ? qwen4exp_hc_norm_scale_staged(xg, group, eps, partial)
+            : qwen4exp_hc_norm_scale(xg, group, eps, partial);
+    }
     if (threadIdx.x == 0u) nscale[(uint64_t)row * (n / group) + g] = scale;
 
     const uint32_t lane = threadIdx.x & 31u;
@@ -8791,7 +8815,8 @@ __global__ static void qwen4exp_hc_norm_quant_kernel(
         float xv[QWEN4EXP_HC_STAGED_STEPS];
 #pragma unroll
         for (uint32_t s = 0; s < QWEN4EXP_HC_STAGED_STEPS; s++) {
-            xv[s] = xg[s * QWEN4EXP_HC_THREADS + threadIdx.x];
+            xv[s] = Pending ? injected[s]
+                            : xg[s * QWEN4EXP_HC_THREADS + threadIdx.x];
         }
 #pragma unroll
         for (uint32_t k = 0; k < QWEN4EXP_HC_STAGED_STEPS; k++) {
@@ -8990,13 +9015,14 @@ __global__ static void qwen4exp_hc_inject_weights_renorm_kernel(
  * kernel above: InjectType < 0 is the rolled walk verbatim, a typed arm
  * stages the walk's elements in registers first.  The mix leg is the same
  * in every instantiation, including its `#pragma unroll 1`. */
-template <int InjectType = -1>
+template <int InjectType = -1, bool Quantize = false>
 __global__ static void qwen4exp_hc_mix_inject_dual_kernel(
         float *mixed, float *inject, const float *hyper, const float *nscale,
         const float *normw, const float *gate_values, const char *w,
         uint32_t n_embd, uint32_t n_hc, uint32_t rows,
         float weight_bias, int round_bf16,
-        uint32_t weight_type, uint32_t weight_row_bytes) {
+        uint32_t weight_type, uint32_t weight_row_bytes,
+        int8_t *mix_q, float *mix_scale) {
     /* PDL producer: the decode arm of the mix that closes the mixer, so the
      * router GEMV behind it launches at its top.  Grid is (mix_blocks +
      * n_hc, rows) -- 14*2 blocks at the two-row decode.  Triggered at the
@@ -9027,7 +9053,25 @@ __global__ static void qwen4exp_hc_mix_inject_dual_kernel(
                     normw[(uint64_t)h * n_embd + d], weight_bias, round_bf16);
             acc += qwen4exp_sigmoid(gate_values[idx]) * normed;
         }
-        out[(uint64_t)t * n_embd + d] = acc * (1.0f / (float)n_hc);
+        const float value = acc * (1.0f / (float)n_hc);
+        out[(uint64_t)t * n_embd + d] = value;
+        if (Quantize) {
+            /* Each complete warp owns one Q8 group. Reproduce the standalone
+             * fast-math quantizer, including its FTZ and approximate reciprocal.
+             * Only the decode specialization instantiates this epilogue. */
+            const uint32_t lane = threadIdx.x & 31u;
+            float a = qwen4exp_q8_ftz(fabsf(value));
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+            const float scale = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
+            const float inv = scale != 0.0f ? qwen4exp_q8_rcp_approx(scale) : 0.0f;
+            const uint64_t group = (uint64_t)t * (n_embd / 32u) + d / 32u;
+            if (lane == 0u) mix_scale[group] = scale;
+            int q = (int)lrintf(qwen4exp_q8_ftz(qwen4exp_q8_ftz(value) * inv));
+            q = q > 127 ? 127 : (q < -128 ? -128 : q);
+            mix_q[group * 32u + lane] = (int8_t)q;
+        }
     } else {
         float *out = inject;
         const uint32_t h = blockIdx.x - mix_blocks;
@@ -9239,18 +9283,18 @@ static int qwen4exp_hc_staged_ok(uint32_t n_embd, uint32_t n_hc) {
         }                                                                    \
     } while (0)
 
-#define QWEN4EXP_HC_DUAL_LAUNCH(GRID, ...) do {                              \
+#define QWEN4EXP_HC_DUAL_LAUNCH(QUANT, GRID, ...) do {                       \
         if (staged && inject_weight->type == (uint32_t)DS4_QWEN4EXP_TY_f32) {\
             qwen4exp_hc_mix_inject_dual_kernel<                              \
-                DS4_QWEN4EXP_TY_f32><<<GRID, threads, 0,                     \
+                DS4_QWEN4EXP_TY_f32, QUANT><<<GRID, threads, 0,              \
                 cuda_decode_stream()>>>(__VA_ARGS__);                        \
         } else if (staged &&                                                 \
                    inject_weight->type == (uint32_t)DS4_QWEN4EXP_TY_q8_0) {  \
             qwen4exp_hc_mix_inject_dual_kernel<                              \
-                DS4_QWEN4EXP_TY_q8_0><<<GRID, threads, 0,                    \
+                DS4_QWEN4EXP_TY_q8_0, QUANT><<<GRID, threads, 0,             \
                 cuda_decode_stream()>>>(__VA_ARGS__);                        \
         } else {                                                             \
-            qwen4exp_hc_mix_inject_dual_kernel<-1>                           \
+            qwen4exp_hc_mix_inject_dual_kernel<-1, QUANT>                    \
                 <<<GRID, threads, 0, cuda_decode_stream()>>>(__VA_ARGS__);   \
         }                                                                    \
     } while (0)
@@ -10202,8 +10246,11 @@ static int qwen4exp_hc_mixer_fused_cuda(
         float                 weight_bias,
         int                   round_bf16,
         const ds4_gpu_tensor *pending_block,
-        const ds4_gpu_tensor *pending_inject) {
+        const ds4_gpu_tensor *pending_inject,
+        int8_t *mix_q = NULL, float *mix_scale = NULL,
+        int *mix_quantized = NULL) {
     const uint32_t threads = QWEN4EXP_HC_THREADS;
+    if (mix_quantized) *mix_quantized = 0;
     if (n_embd % threads != 0u || n_hc > QWEN4EXP_HC_MAX_STREAMS) return -1;
     if (pending_block &&
         (!pending_inject ||
@@ -10293,7 +10340,8 @@ static int qwen4exp_hc_mixer_fused_cuda(
     const int inject_in_norm =
         upw && inject && rows >= QWEN4EXP_HC_FUSE_MIX_MIN_ROWS;
 
-    if (pending_block && !inject_in_norm) {
+    const int inject_in_decode_norm = pending_block && staged && rows <= 3u;
+    if (pending_block && !inject_in_norm && !inject_in_decode_norm) {
         /* No pass here folds the apply in: run the standalone kernel, so the
          * residual every leg below reads is the updated one. */
         qwen4exp_hc_inject_kernel<<<dim3((n_embd + 255u) / 256u, n_hc, rows),
@@ -10313,6 +10361,13 @@ static int qwen4exp_hc_mixer_fused_cuda(
                 (float *)hyper->ptr,
                 pending_block ? (const float *)pending_block->ptr : NULL,
                 pending_block ? (const float *)pending_inject->ptr : NULL);
+    } else if (inject_in_decode_norm) {
+        qwen4exp_hc_norm_quant_kernel<1, true>
+            <<<dim3(n_hc, rows, 1u), threads, 0, cuda_decode_stream()>>>(
+                xq, xscale, nscale, (const float *)hyper->ptr, normw,
+                (uint32_t)wide, n_embd, rows, eps, weight_bias, round_bf16,
+                (float *)hyper->ptr, (const float *)pending_block->ptr,
+                (const float *)pending_inject->ptr);
     } else if (staged) {
         /* PDL consumer at the decode widths only (rows <= 2): the stream
          * predecessor is the attention inject qwen4exp_hc_inject_kernel,
@@ -10326,19 +10381,22 @@ static int qwen4exp_hc_mixer_fused_cuda(
                     cuda_decode_stream(),
                     xq, xscale, nscale, (const float *)hyper->ptr, normw,
                     (uint32_t)wide, n_embd, rows, eps, weight_bias,
-                    round_bf16);
+                    round_bf16, (float *)NULL, (const float *)NULL,
+                    (const float *)NULL);
         } else {
             qwen4exp_hc_norm_quant_kernel<1><<<dim3(n_hc, rows, 1u), threads, 0,
                                             cuda_decode_stream()>>>(
                     xq, xscale, nscale, (const float *)hyper->ptr, normw,
                     (uint32_t)wide, n_embd, rows, eps, weight_bias,
-                    round_bf16);
+                    round_bf16, (float *)NULL, (const float *)NULL,
+                    (const float *)NULL);
         }
     } else {
         qwen4exp_hc_norm_quant_kernel<0><<<dim3(n_hc, rows, 1u), threads, 0,
                                         cuda_decode_stream()>>>(
                 xq, xscale, nscale, (const float *)hyper->ptr, normw,
-                (uint32_t)wide, n_embd, rows, eps, weight_bias, round_bf16);
+                (uint32_t)wide, n_embd, rows, eps, weight_bias, round_bf16,
+                (float *)NULL, (const float *)NULL, (const float *)NULL);
     }
     if (!cuda_ok(cudaGetLastError(), "qwen4exp_hc_norm_quant launch")) return 0;
 
@@ -10427,13 +10485,28 @@ static int qwen4exp_hc_mixer_fused_cuda(
             qwen4exp_hc_ranges_disjoint(inject->ptr, inj_bytes, wide_scratch->ptr, hc_bytes);
         if (disjoint) {
             const unsigned mix_blocks = (n_embd + threads - 1u) / threads;
+            if (rows <= 3u && mix_q && mix_scale) {
+                QWEN4EXP_HC_DUAL_LAUNCH(true,
+                        dim3(mix_blocks + n_hc, rows, 1u),
+                        (float *)mixed->ptr, (float *)inject->ptr,
+                        (const float *)hyper->ptr, nscale, normw,
+                        (const float *)wide_scratch->ptr, iw,
+                        n_embd, n_hc, rows, weight_bias, round_bf16,
+                        inject_weight->type, (uint32_t)iw_row_bytes,
+                        mix_q, mix_scale);
+                const int ok = cuda_ok(cudaGetLastError(),
+                                       "qwen4exp_hc_mix_inject_quant launch");
+                if (ok && mix_quantized) *mix_quantized = 1;
+                return ok;
+            }
             QWEN4EXP_HC_DUAL_LAUNCH(
-                    dim3(mix_blocks + n_hc, rows, 1u),
+                    false, dim3(mix_blocks + n_hc, rows, 1u),
                     (float *)mixed->ptr, (float *)inject->ptr,
                     (const float *)hyper->ptr, nscale, normw,
                     (const float *)wide_scratch->ptr, iw,
                     n_embd, n_hc, rows, weight_bias, round_bf16,
-                    inject_weight->type, (uint32_t)iw_row_bytes);
+                    inject_weight->type, (uint32_t)iw_row_bytes,
+                    (int8_t *)NULL, (float *)NULL);
             return cuda_ok(cudaGetLastError(), "qwen4exp_hc_mix_inject_dual launch");
         }
     }
@@ -13796,6 +13869,65 @@ extern "C" int ds4_gpu_qwen4exp_ple_conv_tensor(
 }
 
 #include "ds4_qwen4exp_hc_host.inc"
+
+extern "C" int ds4_gpu_qwen4exp_hc_mixer_q8_tensor(
+        ds4_gpu_tensor       *mixed,
+        ds4_gpu_tensor       *inject,
+        ds4_gpu_tensor       *normed_scratch,
+        ds4_gpu_tensor       *lowrank_scratch,
+        ds4_gpu_tensor       *wide_scratch,
+        const ds4_gpu_tensor *hyper,
+        /* One slab per tensor: a shard boundary can fall between any two of a
+         * mixer's four weights. */
+        const ds4_gpu_qwen4exp_slab *norm_weight,
+        const ds4_gpu_qwen4exp_slab *down_weight,
+        const ds4_gpu_qwen4exp_slab *up_weight,
+        const ds4_gpu_qwen4exp_slab *inject_weight,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              n_lowrank,
+        uint32_t              rows,
+        float                 eps,
+        float                 weight_bias,
+        int                   round_bf16,
+        ds4_gpu_tensor       *mixed_q8,
+        uint64_t              q_offset,
+        uint64_t              s_offset) {
+
+    DS4_QWEN4EXP_HC_MIXER_GUARD
+    if (!mixed_q8 || !mixed_q8->ptr || (q_offset & 15u) || (s_offset & 15u))
+        return 0;
+    const uint64_t groups = ((uint64_t)n_embd + 31u) / 32u;
+    const uint64_t qbytes = (uint64_t)rows * groups * 32u;
+    const uint64_t sbytes = (uint64_t)rows * groups * sizeof(float);
+    if (q_offset > mixed_q8->bytes || qbytes > mixed_q8->bytes - q_offset ||
+        s_offset > mixed_q8->bytes || sbytes > mixed_q8->bytes - s_offset ||
+        ds4_tensor_device_idx(mixed_q8) != ds4_tensor_device_idx(mixed)) return 0;
+    int8_t *q = (int8_t *)((char *)mixed_q8->ptr + q_offset);
+    float *scale = (float *)((char *)mixed_q8->ptr + s_offset);
+    if (!qwen4exp_hc_ranges_disjoint(q, qbytes, scale, sbytes)) return 0;
+    const ds4_gpu_tensor *views[] = {
+        mixed, inject, normed_scratch, lowrank_scratch, wide_scratch, hyper
+    };
+    for (unsigned i = 0; i < sizeof(views) / sizeof(views[0]); i++) {
+        if (views[i] &&
+            (!qwen4exp_hc_ranges_disjoint(q, qbytes, views[i]->ptr, views[i]->bytes) ||
+             !qwen4exp_hc_ranges_disjoint(scale, sbytes, views[i]->ptr, views[i]->bytes)))
+            return 0;
+    }
+    int folded = 0;
+    int result = -1;
+    if (rows <= 3u && !ds4_qwen4exp_hc_fuse_off()) {
+        result = qwen4exp_hc_mixer_fused_cuda(
+                DS4_QWEN4EXP_HC_MIXER_ARGS, NULL, NULL, q, scale, &folded);
+    }
+    if (result < 0)
+        result = ds4_gpu_qwen4exp_hc_mixer_tensor(DS4_QWEN4EXP_HC_MIXER_ARGS);
+    if (!result) return 0;
+    return folded || ds4_qwen4exp_quantize_q8_0(
+            mixed_q8, q_offset, s_offset, mixed, n_embd, rows);
+}
+
 #include "ds4_qwen4exp_ple_host.inc"
 
 extern "C" int ds4_gpu_qwen4exp_shared_expert_tensor(
