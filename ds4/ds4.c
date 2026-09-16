@@ -54827,6 +54827,12 @@ struct ds4_session {
     ds4_qwen4exp_head_block_ctx qwen4exp_head_ctx;
     bool                       qwen4exp_spec_ready;
     bool                       qwen4exp_spec_failed;
+    /* The position and row count of the LAST verify the seam ran.  The
+     * verify's pre-final-mixer rows stay resident in the session's hyper
+     * slab, so the draft seeding can read them device-to-device instead of
+     * re-uploading the host copy -- but only while this window names them. */
+    uint32_t                   qwen4exp_verify_pos0;
+    uint32_t                   qwen4exp_verify_rows_n;
 #ifdef DS4_TEST_HOOKS
     /* TEST ONLY.  The synthetic head is random weights, so it drafts the right
      * token about once in n_vocab tries and the ACCEPTING half of the cycle is
@@ -76022,6 +76028,11 @@ static int qwen4exp_seam_verify_rows(void *ctx, const int *tokens, uint32_t n,
     int32_t buf[DS4_QWEN4EXP_MTP_MAX_COMMIT];
     if (n > (uint32_t)(sizeof(buf) / sizeof(buf[0]))) return -1;
     for (uint32_t i = 0; i < n; i++) buf[i] = (int32_t)tokens[i];
+    /* Record the window BEFORE the forward: the verify's pre-final-mixer rows
+     * stay resident in the session hyper slab and the draft seeding reads
+     * them back device-to-device. */
+    s->qwen4exp_verify_pos0 = pos0;
+    s->qwen4exp_verify_rows_n = n;
     return ds4_qwen4exp_graph_verify_rows(e->qwen4exp_session,
                                           e->qwen4exp_weights, &e->model,
                                           buf, n, hc_rows, row_logits,
@@ -76037,6 +76048,10 @@ static int qwen4exp_seam_verify_rows_top1(void *ctx, const int *tokens,
     if (at != pos0 || n > (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT) return -1;
     int32_t buf[DS4_QWEN4EXP_MTP_MAX_COMMIT];
     for (uint32_t i = 0; i < n; i++) buf[i] = (int32_t)tokens[i];
+    /* Same window record as the wide verify: the draft seeding reads these
+     * rows out of the session hyper slab device-to-device. */
+    s->qwen4exp_verify_pos0 = pos0;
+    s->qwen4exp_verify_rows_n = n;
     return ds4_qwen4exp_graph_verify_top1_rows(
                e->qwen4exp_session, e->qwen4exp_weights, &e->model,
                buf, n, hc_rows, row_top1) ? 0 : -1;
@@ -76104,9 +76119,28 @@ static int qwen4exp_seam_draft_rows(void *ctx, const int *next_tokens,
                                     float *multi_out) {
     ds4_session *s = ctx;
     char err[256];
-    if (ds4_qwen4exp_mtp_head_forward_last(&s->qwen4exp_head, next_tokens,
-                                           hc_rows, pos0, n, draft_out,
-                                           multi_out, err, sizeof(err)) != 0) {
+    /* The verify the cycle just ran left its pre-final-mixer rows resident in
+     * the session's hyper slab, rows [pos0 - verify_pos0, +n).  When the
+     * requested seed window sits inside that recorded window the head reads
+     * them device-to-device and the host copy the caller holds is never
+     * re-uploaded; anything else -- a stale window, a decode_token seed, an
+     * out-of-range request -- keeps the host path. */
+    ds4_gpu_tensor *hyper =
+        ds4_qwen4exp_session_hyper(s->engine->qwen4exp_session);
+    const uint32_t first = pos0 - s->qwen4exp_verify_pos0;
+    const bool device_rows =
+        hyper != NULL &&
+        pos0 >= s->qwen4exp_verify_pos0 &&
+        (uint64_t)pos0 + n <=
+            (uint64_t)s->qwen4exp_verify_pos0 + s->qwen4exp_verify_rows_n;
+    const int rc = device_rows
+        ? ds4_qwen4exp_mtp_head_forward_last_device(
+              &s->qwen4exp_head, next_tokens, hyper, first,
+              pos0, n, draft_out, multi_out, err, sizeof(err))
+        : ds4_qwen4exp_mtp_head_forward_last(&s->qwen4exp_head, next_tokens,
+                                             hc_rows, pos0, n, draft_out,
+                                             multi_out, err, sizeof(err));
+    if (rc != 0) {
         fprintf(stderr, "ds4: qwen4exp MTP seam: %s\n", err);
         return -1;
     }
