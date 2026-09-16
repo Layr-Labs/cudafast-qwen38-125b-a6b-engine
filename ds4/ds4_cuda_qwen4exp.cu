@@ -2326,20 +2326,28 @@ __global__ static void qwen4exp_quantize_rows_kernel(
         int8_t *xq, float *xscale, int32_t *xsum,
         const float *x, uint32_t width, uint32_t groups,
         uint64_t outer_stride, uint64_t inner_stride, uint32_t inner_count) {
-    /* PDL producer for the shared down projection that follows the mid
-     * quantization on the stream (and, on the routed path, for whatever PSS
-     * consumer ever follows one of this kernel's other launches -- today
-     * none does, and the trigger fires into nothing there).  The grid is
-     * (groups, rows) 32-thread blocks, so the gate bounds BOTH the rows and
-     * the block count the device holds at once: 1536 is one wave of
-     * 32-thread blocks on the 48-SM GB10 (48 SMs x 32 block slots).  The
-     * worst in-model grid inside the gate is the routed mid quantizer's 320
-     * blocks; a prefill launch, or a public caller at a wider input, exceeds
-     * the bound and never triggers (the deadlock rule,
-     * ds4_cuda_qwen4exp.cuh).  The gate reads the grid in the body, not a
-     * convention at the launch sites, per the header's rule. */
-    if (gridDim.y <= 2u &&
-        (uint64_t)gridDim.x * (uint64_t)gridDim.y <= 768u)
+    /* PDL producer for the down projection that follows a mid quantization on
+     * the stream, and for the gate/up projection that follows an activation
+     * quantization.  The grid is (groups, rows) 32-thread blocks and the ONLY
+     * thing the deadlock rule needs of a trigger host is that the grid fit on
+     * the device at once: 1536 is one wave of 32-thread blocks on the 48-SM
+     * GB10 (48 SMs x 32 block slots), and the bound below keeps a 2x margin
+     * under it.  A prefill launch takes the wide kernel above
+     * (QWEN4EXP_QUANT_WIDE_MIN_ROWS rows), and a public caller at a wider
+     * input exceeds the bound and never triggers.
+     *
+     * The bound used to carry a `gridDim.y <= 2u` clause as well.  That clause
+     * was redundant for safety -- residency is a block COUNT property, and
+     * these blocks are one warp each whatever the row count is -- and it was
+     * excluding the one launch in the model with the most to gain: the routed
+     * mid quantizer, whose grid is (mgroups, n_pairs) = 20 x 20 = 400 blocks
+     * at decode, well inside one wave, but whose 20 rows failed the row
+     * clause.  Its consumer is the routed down projection, the heaviest
+     * kernel of the decode round.  Dropping the clause admits it and leaves
+     * every other in-model launch's behaviour unchanged, because they already
+     * satisfied it.  The gate reads the grid in the body, not a convention at
+     * the launch sites, per the header's rule. */
+    if ((uint64_t)gridDim.x * (uint64_t)gridDim.y <= 768u)
         QWEN4EXP_PDL_TRIGGER();
     const uint32_t g = blockIdx.x;
     const uint32_t r = blockIdx.y;
@@ -4457,6 +4465,32 @@ qwen4exp_moe_gateup_split_kernel(
         uint32_t mid_dim,
         uint32_t mid_token_stride,
         uint32_t n_expert_used) {
+    /* DELIBERATELY NOT A PDL CONSUMER, and this is a measured result rather
+     * than an omission.  The activation quantizer IS this kernel's immediate
+     * stream predecessor at the decode widths the split schedule takes, and it
+     * does trigger programmatic launch completion there, so the edge is open
+     * and a fence here looks free.  Submission 819034f7 put QWEN4EXP_PDL_SYNC()
+     * as the first statement of this kernel together with the mid-quantizer ->
+     * down edge and lost 0.609% of box-adjusted decode (raw 2.245297 on
+     * spark-2 against b09acd9's 2.267403 on spark-4; the prefill leg was
+     * FAVOURABLE by 0.477%, so the loss is entirely decode).
+     *
+     * Two properties of THIS kernel, neither shared by the routed down kernel,
+     * explain it and both are reasons not to retry:
+     *
+     *   1. QW_GU_MAXNREG is __maxnreg__(32), a HARD per-thread ceiling.  A
+     *      fence at the top adds live state across the whole body, and under a
+     *      hard cap the compiler pays for that in rematerialization rather
+     *      than in registers -- invisible in lmem=0, and separately measured at
+     *      -10.2% on another no-spill cap on this engine.
+     *   2. The decode grid is (mid_dim/4, gu_rows) = 3200 blocks of 256
+     *      threads at 3 blocks/SM, i.e. ~22 waves on 48 SMs.  PSS dispatches
+     *      the first 144 blocks early and they all spin at the fence while the
+     *      producer is still resident, so the early dispatch buys nothing and
+     *      the spin contends with the producer it is waiting for.
+     *
+     * PDL on this engine pays on SMALL, near-single-wave, uncapped consumers.
+     * It does not pay here.  Leave this launch plain. */
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
     const uint32_t row = blockIdx.x * OutputRows + (warp >> 1u);
@@ -4851,6 +4885,16 @@ __global__ static void qwen4exp_moe_down_q_kernel(
         uint32_t n_tokens,
         uint32_t n_total_expert,
         uint32_t n_expert_used) {
+    /* PDL consumer.  The mid quantizer is this kernel's immediate stream
+     * predecessor whenever the fused gate/up epilogue is not running -- which
+     * is every decode and verify width, since the epilogue rides the MMA tile
+     * and that needs eight rows.  The fence is the first statement, so the
+     * route IDs, the quantised mid scratch (mq/ms/msum) and every weight row
+     * are all read after the producer has completed and flushed.  No pointer
+     * in the signature is __restrict__-qualified, so nothing here lowers to an
+     * ld.global.nc the fence cannot order (the .nc rule in the header).  It is
+     * a no-op in a plainly-launched instantiation. */
+    QWEN4EXP_PDL_SYNC();
     /* Dynamic shared memory is 16-byte aligned by contract, and it is requested
      * only for the Stage instantiations; the others map nothing here. */
     extern __shared__ uint4 qw_down_panel[];
@@ -7607,6 +7651,15 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             ((uintptr_t)gate & 15u) == 0u && ((uintptr_t)up & 15u) == 0u &&
             (gate_slab->expert_bytes & 15ull) == 0ull &&
             (up_slab->expert_bytes & 15ull) == 0ull;
+        /* NO PDL ON THIS LAUNCH.  The activation quantizer is the immediate
+         * stream predecessor here and it does trigger programmatic launch
+         * completion at these widths, so the edge is open and relaxing it
+         * looks free -- but submission 819034f7 measured a PSS launch here at
+         * -0.609% of box-adjusted decode.  The kernel body carries the full
+         * argument: __maxnreg__(32) turns the fence's live state into
+         * rematerialization, and a 3200-block ~22-wave grid gains nothing from
+         * early dispatch because the early blocks only spin.  Left plain
+         * deliberately; do not re-add. */
 #define QWEN4EXP_SPLIT_GATEUP(V, P, C) \
         qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P, C><<< \
             dim3((mid_dim + P - 1u) / P, gu_rows, 1), P * 64u, 0, stream>>>( \
@@ -7659,13 +7712,44 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
             mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
 #define QWEN4EXP_DOWN_IMPL(R, DT, V) QWEN4EXP_DOWN_IMPL_S(R, DT, V, false, 0)
-#define QWEN4EXP_DOWN_ASYNC(DT) \
-    qwen4exp_moe_down_q_kernel<2, DT, true, true, true><<< \
-            dn_grid, threads, (size_t)dn_shared, stream>>>( \
-            (float *)out->ptr, down, (const int32_t *)selected->ptr, \
-            sc.mq, sc.ms, sc.msum, \
-            down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
-            mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
+    /* PDL.  Whenever the fused gate/up epilogue is not running -- every decode
+     * and verify width, since the epilogue rides the MMA tile and that needs
+     * eight rows -- the standalone mid quantizer is the immediate stream
+     * predecessor of the down launch, and it triggers programmatic launch
+     * completion when its grid is one wave.  That grid is (mgroups, n_pairs)
+     * one-warp blocks: 20 x 20 = 400 at decode, inside the bound in the
+     * quantizer's body.  Relaxing this edge is the largest one available on
+     * the decode stream, because the consumer is the heaviest kernel of the
+     * round: it reads a full down row per (token, slot) pair, and those reads
+     * currently cannot start until the quantizer's last warp has retired.
+     *
+     * Gated on exactly the producer's predicate, so a width where the trigger
+     * does not fire -- a three or four row verify puts the grid at 800 blocks,
+     * over the bound -- keeps the plain launch byte for byte.  A PSS launch
+     * behind a producer that does not trigger is still correct (the edge
+     * degrades to the ordinary completion dependency and the fence waits on
+     * nothing), but there is no reason to pay for the attribute there. */
+    const bool dn_pdl = !moe_epilogue &&
+        n_pairs < (uint32_t)QWEN4EXP_QUANT_WIDE_MIN_ROWS &&
+        (uint64_t)mgroups * (uint64_t)n_pairs <= 768u;
+#define QWEN4EXP_DOWN_ASYNC(DT) do { \
+    if (dn_pdl) { \
+        QWEN4EXP_LAUNCH_PDL( \
+                (qwen4exp_moe_down_q_kernel<2, DT, true, true, true>), \
+                dn_grid, threads, (size_t)dn_shared, stream, \
+                (float *)out->ptr, down, (const int32_t *)selected->ptr, \
+                sc.mq, sc.ms, sc.msum, \
+                down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
+                mgroups, out_dim, n_tokens, n_total_expert, n_expert_used); \
+    } else { \
+        qwen4exp_moe_down_q_kernel<2, DT, true, true, true><<< \
+                dn_grid, threads, (size_t)dn_shared, stream>>>( \
+                (float *)out->ptr, down, (const int32_t *)selected->ptr, \
+                sc.mq, sc.ms, sc.msum, \
+                down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
+                mgroups, out_dim, n_tokens, n_total_expert, n_expert_used); \
+    } \
+} while (0)
 #define QWEN4EXP_DOWN(R) do { \
     if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q5_1) { \
         QWEN4EXP_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q5_1, false); \
@@ -13088,92 +13172,6 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_pool_update_tensor(
             cache_cap, head_dim, pool_size, rot_dim, eps, weight_offset, NULL);
 }
 
-/* Tiled indexer scores for prefill widths.
- *
- * The per-pair kernel above launches one block per (indexer block, token):
- * at a 4096-row prefill over a 20480-token context that is 21 million
- * blocks of 128 threads, each doing four 128-wide dots and four block-wide
- * reductions.  The scores stage measured 69 ms per layer at 16k tokens for
- * about 21 GFLOP of work.  This kernel tiles the pairs instead: one block
- * takes QWEN4EXP_IDX_TILE_T tokens by QWEN4EXP_IDX_TILE_B indexer blocks,
- * stages the pool rows and the query rows in shared memory once, and each
- * thread owns one (token, block) pair.
- *
- * THE ARITHMETIC IS THE PER-PAIR KERNEL'S, BIT FOR BIT.  With head_dim 128
- * the per-pair kernel runs 128 threads, one product per lane, and reduces
- * with qwen4exp_blk_sum: lanes i and i+64 add, then i and i+32, then a warp
- * shuffle tree at 16, 8, 4, 2, 1.  The thread below forms the same 64 pair
- * sums, then the same halving tree, through __fmul_rn / __fadd_rn so the
- * compiler cannot contract a product into an add.  The relu, the head sum
- * order and the division are the same expressions.  The host wrapper only
- * takes this path at head_dim 128, four heads, and eight rows or more; the
- * decode and verify widths keep the per-pair kernel and their captured
- * graphs unchanged. */
-#define QWEN4EXP_IDX_TILE_T 8u
-#define QWEN4EXP_IDX_TILE_B 32u
-#define QWEN4EXP_IDX_KPAD   129u
-#define QWEN4EXP_IDX_THREADS 256u
-
-template <uint32_t HEAD_DIM, uint32_t N_HEAD>
-__global__ static void __launch_bounds__(QWEN4EXP_IDX_THREADS)
-qwen4exp_qsa_indexer_scores_tiled_kernel(
-        const float *q,
-        const float *pool,
-        float *scores,
-        uint32_t n_tokens,
-        uint32_t n_blocks,
-        uint32_t pos0,
-        uint32_t pool_size,
-        float norm_divisor) {
-    __shared__ float ks[QWEN4EXP_IDX_TILE_B * QWEN4EXP_IDX_KPAD];
-    __shared__ float qs[QWEN4EXP_IDX_TILE_T * N_HEAD * HEAD_DIM];
-    const uint32_t b0 = blockIdx.x * QWEN4EXP_IDX_TILE_B;
-    const uint32_t t0 = blockIdx.y * QWEN4EXP_IDX_TILE_T;
-    const uint32_t tid = threadIdx.x;
-    if (b0 >= n_blocks || t0 >= n_tokens) return;
-    const uint32_t nb = min(QWEN4EXP_IDX_TILE_B, n_blocks - b0);
-    const uint32_t nt = min(QWEN4EXP_IDX_TILE_T, n_tokens - t0);
-    for (uint32_t i = tid; i < nb * HEAD_DIM; i += QWEN4EXP_IDX_THREADS) {
-        const uint32_t bb = i / HEAD_DIM, d = i - bb * HEAD_DIM;
-        ks[bb * QWEN4EXP_IDX_KPAD + d] = pool[(uint64_t)(b0 + bb) * HEAD_DIM + d];
-    }
-    for (uint32_t i = tid; i < nt * N_HEAD * HEAD_DIM; i += QWEN4EXP_IDX_THREADS) {
-        qs[i] = q[(uint64_t)t0 * N_HEAD * HEAD_DIM + i];
-    }
-    __syncthreads();
-    for (uint32_t p = tid; p < nt * QWEN4EXP_IDX_TILE_B; p += QWEN4EXP_IDX_THREADS) {
-        const uint32_t tt = p / QWEN4EXP_IDX_TILE_B;
-        const uint32_t bb = p - tt * QWEN4EXP_IDX_TILE_B;
-        const uint32_t block = b0 + bb;
-        const uint32_t token = t0 + tt;
-        if (block >= n_blocks) continue;
-        float *dst = scores + (uint64_t)token * n_blocks + block;
-        uint32_t visible = (pos0 + token + 1u) / pool_size;
-        if (visible > n_blocks) visible = n_blocks;
-        if (block >= visible) { *dst = QWEN4EXP_QSA_MASKED_SCORE; continue; }
-        const float *k = ks + bb * QWEN4EXP_IDX_KPAD;
-        float total = 0.0f;
-#pragma unroll
-        for (uint32_t h = 0; h < N_HEAD; h++) {
-            const float *qh = qs + (tt * N_HEAD + h) * HEAD_DIM;
-            float a[HEAD_DIM / 2u];
-#pragma unroll
-            for (uint32_t i = 0; i < HEAD_DIM / 2u; i++) {
-                a[i] = __fadd_rn(__fmul_rn(qh[i], k[i]),
-                                 __fmul_rn(qh[i + HEAD_DIM / 2u], k[i + HEAD_DIM / 2u]));
-            }
-#pragma unroll
-            for (uint32_t step = HEAD_DIM / 4u; step > 0u; step >>= 1) {
-#pragma unroll
-                for (uint32_t i = 0; i < step; i++) a[i] = __fadd_rn(a[i], a[i + step]);
-            }
-            const float dot = a[0];
-            total += fmaxf(dot, 0.0f);
-        }
-        *dst = total / norm_divisor;
-    }
-}
-
 extern "C" int ds4_gpu_qwen4exp_qsa_indexer_scores_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
@@ -13190,17 +13188,6 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_scores_tensor(
         !glm53_cuda_tensor_has(q, (uint64_t)n_tokens * n_head * head_dim, sizeof(float)) ||
         !glm53_cuda_tensor_has(pool, (uint64_t)n_blocks * head_dim, sizeof(float))) {
         return 0;
-    }
-    if (n_tokens >= 8u && head_dim == 128u && n_head == 4u &&
-        getenv("DS4_QWEN4EXP_NO_IDX_TILE") == NULL) {
-        const dim3 grid((n_blocks + QWEN4EXP_IDX_TILE_B - 1u) / QWEN4EXP_IDX_TILE_B,
-                        (n_tokens + QWEN4EXP_IDX_TILE_T - 1u) / QWEN4EXP_IDX_TILE_T);
-        qwen4exp_qsa_indexer_scores_tiled_kernel<128u, 4u><<<grid, QWEN4EXP_IDX_THREADS, 0,
-            cuda_decode_stream()>>>(
-                (const float *)q->ptr, (const float *)pool->ptr,
-                (float *)scores->ptr, n_tokens, n_blocks, pos0, pool_size,
-                sqrtf((float)head_dim));
-        return cuda_ok(cudaGetLastError(), "Qwen4-Exp indexer scores tiled launch");
     }
     const uint32_t nth = qwen4exp_cuda_threads(head_dim);
     qwen4exp_qsa_indexer_scores_kernel<<<dim3(n_blocks, n_tokens), nth,
