@@ -17322,6 +17322,15 @@ int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows) {
  * change after the first call and a captured graph replays the launches it
  * recorded, so the choice is capture-safe.  Defined here so both translation
  * units share one cached read of the environment. */
+/* a dependent-launch edge is not free money. The routed down projection's
+ * own producer documents that its launch-completion trigger fires into
+ * nothing on the routed path, and converting that consumer to take the
+ * edge, with the fence ahead of every producer read and the deadlock and
+ * non-coherent-load rules observed, measured worse on the ranked path
+ * rather than better. Either the producer is too small to hide anything
+ * behind, or the fused-epilogue path where that producer does not run at
+ * all is the common one at decode.
+ */
 int ds4_qwen4exp_pdl_enabled(void) {
     static int resolved = 0;
     static int enabled = 0;
