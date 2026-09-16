@@ -17716,7 +17716,20 @@ static int cuda_matmul_q8_0_preq_rows_exact(
         } else {
             /* Retain the promoted call-width specialization for the
              * general dense projections. The HC warp geometry above is
-             * independent of this two-warp kernel's token-row bound. */
+             * independent of this two-warp kernel's token-row bound.
+             *
+             * EVICT-FIRST WEIGHT LOADS HERE TOO.  This branch is where the
+             * LARGE dense projections land -- ssm_out, attn_q, attn_output,
+             * the shared-expert projections and output.weight -- and the
+             * comment on the HC branch above says larger projections "retain
+             * their ordinary cache policy".  They should not.  A per-layer
+             * ssm_out slab is ~16 MB and output.weight is 676 MB; every one of
+             * them is read straight through ONCE per pass and cannot be reused
+             * from any cache on this part, so defending their lines in L2
+             * only displaces the activations and routing metadata that ARE
+             * reused.  Streaming=true marks those loads __ldcs, which is a
+             * residency hint on a load: it changes neither the address, nor
+             * the width, nor the value. */
             if (n_rows == 1u && getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL) {
                 /* PDL consumer: the stream predecessor is the decode
                  * quantizer, which triggers at its top (decode widths). */
@@ -17738,14 +17751,14 @@ static int cuda_matmul_q8_0_preq_rows_exact(
             } else if (n_rows == 3u) {
                 /* The same two-row tile kernel over two tiles, launched
                  * plainly (no producer triggers at three rows). */
-                matmul_q8_0_preq_pair_lanes_kernel<2, false><<<
+                matmul_q8_0_preq_pair_lanes_kernel<2, true><<<
                         dim3((unsigned)((out_dim + 3u) / 4u), 2u, 1u),
                         256, 0, cuda_decode_stream()>>>(
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
                         out_dim, n_rows, blocks);
             } else {
                 QWEN4EXP_LAUNCH_PDL(
-                        (matmul_q8_0_preq_pair_lanes_kernel<2, false>),
+                        (matmul_q8_0_preq_pair_lanes_kernel<2, true>),
                         (dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u)),
                         256, 0, cuda_decode_stream(),
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
