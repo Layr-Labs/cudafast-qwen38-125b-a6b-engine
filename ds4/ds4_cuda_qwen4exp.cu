@@ -9266,6 +9266,19 @@ extern "C" int ds4_gpu_qwen4exp_hc_inject_tensor(
  * walk would leave exactly that).  The dispatch takes those arms only at
  * n_embd == STEPS*QWEN4EXP_HC_THREADS; every other shape keeps the rolled
  * kernels below. */
+/* WHICH MAKES IT A GATE TOO, THE SAME SHAPE AS QWEN4EXP_HC_UP_MIX_NT BELOW:
+ * the depth does not merely say how deep to stage, it decides whether the
+ * staged arms run at all.  qwen4exp_hc_staged_ok() requires
+ * `n_embd == QWEN4EXP_HC_STAGED_STEPS * QWEN4EXP_HC_THREADS`, and n_embd is
+ * the model's 2560.  Ten * 256 is 2560 and passes.  Eight * 256 is 2048 and
+ * does not -- so lowering the depth to eight does not stage eight elements per
+ * stream, it takes every HC kernel here back to the generic rolled walk that
+ * this whole section exists to replace.  Twelve * 256 is 3072 and misses from
+ * the other side.
+ *
+ * There is exactly one value of this constant that leaves the staged arms
+ * armed at the production shape, and it is the one below.  Any measurement
+ * taken at another value is a measurement of the rolled kernels. */
 #define QWEN4EXP_HC_STAGED_STEPS 10u
 
 /* The scale qwen4exp_rms_norm_kernel computes, factored out unchanged. */
