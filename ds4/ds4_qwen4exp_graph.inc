@@ -328,6 +328,15 @@ struct ds4_qwen4exp_session {
     bool              ple_ready;      /* the hash constants were readable */
     uint64_t         *ple_ids;        /* host [n_batch][head_count]       */
     float            *ple_rows_host;  /* host [n_batch][ple_embd]         */
+    /* Draft-time readahead shadow.  The MTP seam feeds each drafted token
+     * here while the head's own forward is still on the device, so the
+     * verify's row pages are already in flight when the gather asks for
+     * them.  `ple_shadow_pos` is the position of the next token the shadow
+     * would consume; it reseeds from `ple_history` whenever the committed
+     * stream and the shadow disagree, which is also how a rejected round
+     * falls out of it.  Hint only -- nothing reads the shadow's ids. */
+    ds4_ple_history   ple_shadow;
+    uint32_t          ple_shadow_pos;
     ds4_gpu_tensor   *ple_conv_state; /* [state_rows][n_hc * n_embd]      */
     ds4_gpu_tensor   *ple_rows;       /* [n_batch][ple_embd]              */
     ds4_gpu_tensor   *ple_key;        /* key projection, then the gate    */
@@ -1095,6 +1104,47 @@ void ds4_qwen4exp_session_reset(ds4_qwen4exp_session *s) {
  * knob); a positive value pins the thread count.  Unset, the gather takes
  * the online CPUs capped at 16 -- enough to keep the SSD queue deep without
  * starving the decode path's own helpers. */
+
+/* Page-in readahead for one token's row set.
+ *
+ * The table is 26.8 GiB on the SSD and the box's free page cache cannot hold
+ * it next to the resident model, so a hashed row is a genuine page fault
+ * whenever the n-gram lands somewhere not recently read.  The gather loop
+ * below touches the sixteen rows of a token one at a time and stalls on each
+ * fault in turn; advising the whole set first lets the kernel overlap the
+ * reads, which is the only parallelism a one-token decode step has on this
+ * path.  On a resident page the advise is a no-op syscall, so the warm case
+ * pays a bounded per-token cost and the cold case stops serializing.
+ *
+ * Hint only: it changes no value the gather writes. */
+static void qw_ple_advise_rows(const ds4_qwen4exp_ple_table *ple,
+                               const uint64_t *ids, uint32_t count) {
+#if defined(POSIX_MADV_WILLNEED)
+    if (!ple || !ple->base || !ids || count == 0u) return;
+    /* Resolved once per process: the page size cannot change while the
+     * engine is open, and sysconf walks libc state on every call. */
+    static uint64_t ple_advise_page = 0;
+    if (ple_advise_page == 0) {
+        const long p = sysconf(_SC_PAGESIZE);
+        ple_advise_page = p > 0 ? (uint64_t)p : 4096u;
+    }
+    const uint64_t page = ple_advise_page;
+    for (uint32_t i = 0; i < count; i++) {
+        const uint64_t row = ids[i];
+        if (row >= ple->rows) continue;
+        const uint64_t start = row * ple->row_bytes;
+        uint64_t end = start + ple->row_bytes;
+        const uint64_t a0 = start - start % page;
+        uint64_t a1 = (end + page - 1u) / page * page;
+        if (a1 > ple->bytes) a1 = ple->bytes;
+        if (a1 <= a0) continue;
+        (void)posix_madvise((void *)(ple->base + a0), (size_t)(a1 - a0),
+                            POSIX_MADV_WILLNEED);
+    }
+#else
+    (void)ple; (void)ids; (void)count;
+#endif
+}
 typedef struct {
     const ds4_qwen4exp_ple_table *ple;
     const ds4_qwen4exp_session   *s;
@@ -1135,9 +1185,18 @@ static void *qw_ple_gather_worker(void *arg) {
     for (uint32_t t = seg->t0; t < seg->t1; t++) {
         ds4_ple_row_ids(&seg->s->ple_constants, &local, seg->tokens + t, 1u,
                         seg->s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD);
+        const uint64_t *ids = seg->s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD;
+        /* Advise the token's whole row set before touching the first row, so
+         * the kernel overlaps the page-ins instead of the loop stalling on
+         * each of the sixteen faults in turn.  Hint only. */
+        qw_ple_advise_rows(seg->ple, ids, DS4_N_PLE_HEAD);
         for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
-            const uint64_t row =
-                seg->s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h];
+            const uint64_t row = ids[h];
+            /* The next head's row is the next thing this loop reads; ask for
+             * it while the current row dequantizes.  Hint only. */
+            if (h + 1u < DS4_N_PLE_HEAD)
+                __builtin_prefetch(ds4_qwen4exp_ple_row(seg->ple, ids[h + 1u]),
+                                   0, 1);
             const uint8_t *quant = ds4_qwen4exp_ple_row(seg->ple, row);
             if (!quant) { seg->ok = 0; return NULL; }
             ds4_ple_dequant_iq4_nl(
@@ -1299,6 +1358,12 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 s->ple_history_rows[t] = s->ple_history;
             }
         }
+        /* Every row id this call will read is now known, so advise the whole
+         * set before the first dequant: the kernel overlaps the page-ins of
+         * the rows the loop is about to touch instead of stalling on each
+         * fault in turn.  Hint only; the ids and values are unchanged. */
+        qw_ple_advise_rows(&w->ple, s->ple_ids,
+                           n_tokens * (uint32_t)DS4_N_PLE_HEAD);
         for (uint32_t t = 0; t < n_tokens; t++) {
             /* The head's destination strides are constants of the shape, so
              * the token base is hoisted out of the head loop and the head
@@ -1309,9 +1374,11 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
             for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
                 const uint64_t row = ids[h];
                 /* Every head of this token except the last is followed by
-                 * another table row, so ask for the next id early.  Hint. */
+                 * another table row, so ask for that row's bytes while the
+                 * current one dequantizes.  Hint only. */
                 if (h + 1u < DS4_N_PLE_HEAD)
-                    __builtin_prefetch(ids + h + 1u, 0, 1);
+                    __builtin_prefetch(
+                        ds4_qwen4exp_ple_row(&w->ple, ids[h + 1u]), 0, 1);
                 const uint8_t *quant = ds4_qwen4exp_ple_row(&w->ple, row);
                 /* Cold: a hashed row past the table is a hard refusal that has
                  * never fired in a scored run, so keep it out of the hot path. */
@@ -1363,9 +1430,19 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
             ds4_ple_row_ids(&s->ple_constants, &s->ple_history, tokens,
                             n_tokens, s->ple_ids);
             for (uint32_t t = 0; t < n_tokens; t++) {
+                const uint64_t *ids =
+                    s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD;
+                /* Advise the token's row set before the first touch so the
+                 * kernel overlaps the page-ins; the next token's advise then
+                 * issues while this token's rows dequantize.  Hint only. */
+                qw_ple_advise_rows(&w->ple, ids, DS4_N_PLE_HEAD);
                 for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
-                    const uint64_t row =
-                        s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h];
+                    const uint64_t row = ids[h];
+                    /* The next head's row is the next read; ask for it while
+                     * the current one dequantizes.  Hint only. */
+                    if (h + 1u < DS4_N_PLE_HEAD)
+                        __builtin_prefetch(
+                            ds4_qwen4exp_ple_row(&w->ple, ids[h + 1u]), 0, 1);
                     const uint8_t *quant = ds4_qwen4exp_ple_row(&w->ple, row);
                     if (!quant) {
                         fprintf(stderr,

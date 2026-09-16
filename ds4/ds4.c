@@ -76066,17 +76066,61 @@ static int qwen4exp_seam_head_logits(void *ctx, const float *hc_row,
                                           hc_row, logits) ? 0 : -1;
 }
 
+/* Draft-time PLE readahead.  The seam hands each drafted token here while the
+ * head's own forward is still on the device, so the row pages the verify's
+ * gather is about to touch are already in flight when it asks for them.
+ *
+ * `toks[i]` is the token at position `pos0 + i`.  The shadow history walks
+ * the same stream `ple_history` walks, keyed by position: a token the
+ * committed stream already covers is skipped, a gap stops the walk, and any
+ * drift between the shadow and the session position reseeds the shadow from
+ * `ple_history` -- which is also how a rejected round's tokens fall out of
+ * it, since the rollback restores `ple_history` and the position with it.
+ * The ids the shadow computes are only ever advised, never read back, so a
+ * wrong guess costs a readahead and nothing else. */
+static void qwen4exp_seam_ple_advise(ds4_session *s, const int *toks,
+                                   uint32_t n, uint32_t pos0) {
+    ds4_engine *e = s->engine;
+    ds4_qwen4exp_session *qs = e->qwen4exp_session;
+    const ds4_qwen4exp_weights *w = e->qwen4exp_weights;
+    if (!qs || !w || !qs->ple_ready || !toks || n == 0u) return;
+    const uint32_t at = ds4_qwen4exp_session_pos(qs);
+    if (qs->ple_shadow_pos != at) {
+        qs->ple_shadow = qs->ple_history;
+        qs->ple_shadow_pos = at;
+    }
+    int32_t adv[DS4_QWEN4EXP_MTP_MAX_COMMIT];
+    if (n > (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT)
+        n = (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint32_t p = pos0 + i;
+        if (p < qs->ple_shadow_pos) continue;
+        if (p > qs->ple_shadow_pos) break;
+        adv[i] = (int32_t)toks[i];
+        uint64_t ids[DS4_PLE_MAX_HEADS];
+        ds4_ple_row_ids(&qs->ple_constants, &qs->ple_shadow, adv + i, 1u, ids);
+        qw_ple_advise_rows(&w->ple, ids, DS4_N_PLE_HEAD);
+        qs->ple_shadow_pos++;
+    }
+}
+
 static int qwen4exp_seam_draft_step(void *ctx, int next_token,
                                     const float *hc_row, uint32_t pos,
                                     int *draft_out, float *multi_out) {
     ds4_session *s = ctx;
     char err[256];
+    /* `next_token` lands at pos + 1; advise its row set now so the page-ins
+     * overlap the head forward this call is about to launch. */
+    qwen4exp_seam_ple_advise(s, &next_token, 1u, pos + 1u);
     if (ds4_qwen4exp_mtp_head_forward(&s->qwen4exp_head, &next_token, hc_row,
                                       pos, 1u, draft_out, multi_out,
                                       err, sizeof(err)) != 0) {
         fprintf(stderr, "ds4: qwen4exp MTP seam: %s\n", err);
         return -1;
     }
+    /* The drafted token lands at pos + 2; advise it while the rest of the
+     * chain is still drafting. */
+    qwen4exp_seam_ple_advise(s, draft_out, 1u, pos + 2u);
 #ifdef DS4_TEST_HOOKS
     /* `next_token` lands at pos + 1, so the draft is the token at pos + 2.
      *
@@ -76104,12 +76148,19 @@ static int qwen4exp_seam_draft_rows(void *ctx, const int *next_tokens,
                                     float *multi_out) {
     ds4_session *s = ctx;
     char err[256];
+    /* Row t consumes next_tokens[t] at position pos0 + t + 1; advise the
+     * whole set now so the page-ins overlap the head forward this call is
+     * about to launch. */
+    qwen4exp_seam_ple_advise(s, next_tokens, n, pos0 + 1u);
     if (ds4_qwen4exp_mtp_head_forward_last(&s->qwen4exp_head, next_tokens,
                                            hc_rows, pos0, n, draft_out,
                                            multi_out, err, sizeof(err)) != 0) {
         fprintf(stderr, "ds4: qwen4exp MTP seam: %s\n", err);
         return -1;
     }
+    /* The last row drafts the token at pos0 + n + 1; advise it while the
+     * rest of the chain is still drafting. */
+    qwen4exp_seam_ple_advise(s, draft_out, 1u, pos0 + n + 1u);
 #ifdef DS4_TEST_HOOKS
     /* The last row sits at pos0 + n - 1 and drafts the token two past it, the
      * same rule the one-row seam applies. */
