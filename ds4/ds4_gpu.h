@@ -790,6 +790,22 @@ int ds4_gpu_qwen4exp_qsa_indexer_scores_tensor(
         uint32_t              pos0,
         uint32_t              pool_size);
 
+/* Device-positioned variant: when `d_pos` is non-NULL the kernels read the
+ * first position from device memory instead of the frozen `pos0` parameter,
+ * which is what lets a CUDA graph replay the indexed path at a position the
+ * capture never saw. */
+int ds4_gpu_qwen4exp_qsa_indexer_scores_dpos_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *pool,
+        uint32_t              n_tokens,
+        uint32_t              n_blocks,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        uint32_t              pos0,
+        uint32_t              pool_size,
+        const ds4_gpu_tensor *d_pos);
+
 /* Expand the block top-k into an ASCENDING token id list per query: the
  * selected blocks' tokens followed by the tail of the query's own incomplete
  * block ("keep OR own").  `selected` is [n_tokens, max_selected] int32 padded
@@ -811,6 +827,21 @@ int ds4_gpu_qwen4exp_qsa_indexer_select_tensor(
         uint32_t              pos0,
         uint32_t              pool_size,
         uint32_t              max_selected);
+
+/* Device-positioned variant of the selection above; `d_pos` overrides `pos0`
+ * from device memory so a captured graph replays at the live position. */
+int ds4_gpu_qwen4exp_qsa_indexer_select_dpos_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *counts,
+        const ds4_gpu_tensor *scores,
+        const ds4_gpu_tensor *topk,
+        uint32_t              n_tokens,
+        uint32_t              n_blocks,
+        uint32_t              top_k,
+        uint32_t              pos0,
+        uint32_t              pool_size,
+        uint32_t              max_selected,
+        const ds4_gpu_tensor *d_pos);
 
 /* Attention over the selected set with an f32 softmax.  `selected == NULL`
  * runs the dense causal set.  Caches are [cache_cap, n_kv_head, head_dim];

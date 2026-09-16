@@ -1761,17 +1761,19 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
                 s->idx_q, s->idx_q, s->idx_q_norm[il],
                 n_tokens * DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM,
                 DS4_RMS_EPS, l->indexer_q_norm_offset) ||
-            !ds4_gpu_qwen4exp_rope_head_tensor(s->idx_q, s->inv_freq, n_tokens,
+            !ds4_gpu_qwen4exp_rope_head_dpos_tensor(s->idx_q, s->inv_freq, n_tokens,
                                                DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM,
-                                               DS4_N_ROT, pos0) ||
-            !ds4_gpu_qwen4exp_qsa_indexer_scores_tensor(
+                                               DS4_N_ROT, pos0, s->d_pos) ||
+            !ds4_gpu_qwen4exp_qsa_indexer_scores_dpos_tensor(
                 s->idx_scores, s->idx_q, s->idx_pool[il], n_tokens, n_blocks,
-                DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM, pos0, ratio) ||
+                DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM, pos0, ratio,
+                s->d_pos) ||
             !ds4_gpu_indexer_topk_tensor(s->idx_topk, s->idx_scores, n_blocks,
                                          n_tokens, top_k) ||
-            !ds4_gpu_qwen4exp_qsa_indexer_select_tensor(
+            !ds4_gpu_qwen4exp_qsa_indexer_select_dpos_tensor(
                 s->idx_selected, s->idx_counts, s->idx_scores, s->idx_topk,
-                n_tokens, n_blocks, top_k, pos0, ratio, max_selected)) {
+                n_tokens, n_blocks, top_k, pos0, ratio, max_selected,
+                s->d_pos)) {
             fprintf(stderr, "ds4: qwen4exp indexer selection failed at block %u\n", il);
             return false;
         }
@@ -1784,9 +1786,10 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
             s->qsa_out, s->qsa_q, s->qsa_k[il], s->qsa_v[il], sel, counts,
             n_tokens, DS4_N_HEAD, DS4_N_HEAD_KV, head_dim, pos0,
             s->plan.n_ctx, max_selected, scale, s->d_pos, s->qsa_split,
-            /* Below the budget every row's count is pos + 1 <= the budget,
-             * captured replays included (the island captures only there);
-             * above it the selection caps the count. */
+            /* Both regimes capture now: the island keys on `indexed`, and
+             * every position read inside it goes through d_pos.  Below the
+             * budget every row's count is pos + 1 <= the budget; above it
+             * the selection caps the count. */
             indexed ? max_selected : (uint32_t)DS4_N_INDEXER_TOP_K)) {
         fprintf(stderr, "ds4: qwen4exp QSA attention failed at block %u\n", il);
         return false;
@@ -2339,9 +2342,11 @@ static bool qwen4exp_graph_layer_island(
 static bool qwen4exp_graph_qsa_island(
         ds4_qwen4exp_session *s, const ds4_qwen4exp_layer_weights *l,
         const ds4_model *m, uint32_t il, uint32_t n_tokens) {
+    const bool qsa_indexed =
+        (uint64_t)s->pos + n_tokens > DS4_N_INDEXER_TOP_K;
     const bool qsa_capture_ok =
         n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
-        (uint64_t)s->pos + n_tokens <= DS4_N_INDEXER_TOP_K &&
+        s->d_pos != NULL &&
         !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
         ds4_gpu_decode_graphs_supported();
     if (qsa_capture_ok) {
@@ -2349,7 +2354,8 @@ static bool qwen4exp_graph_qsa_island(
         memset(&key, 0, sizeof(key));
         key.il = il;
         key.island = 2u;
-        key.variant = n_tokens | (s->spec_snapshot_rows << 8u);
+        key.variant = n_tokens | (s->spec_snapshot_rows << 8u) |
+                      (qsa_indexed ? 0x10000u : 0u);
         key._pad = 0x5157454eu;
         key.cur_hc = s->hyper;
         key.after_attn_hc = s;
@@ -2563,7 +2569,9 @@ static bool qw_decode_graph_chunk(ds4_qwen4exp_session *s,
      * chunk c and the per-layer caches of layer c cannot collide. */
     key.il = chunk;
     key.island = 3u;
-    key.variant = n_tokens | (s->spec_snapshot_rows << 8u);
+    key.variant = n_tokens | (s->spec_snapshot_rows << 8u) |
+                  (((uint64_t)s->pos + n_tokens > DS4_N_INDEXER_TOP_K)
+                       ? 0x10000u : 0u);
     key._pad = 0x51575343u; /* QWSC: one chunk of the target layer stack */
     key.cur_hc = s->hyper;
     key.after_attn_hc = s;
@@ -2609,9 +2617,11 @@ static bool qw_decode_graph_chunk(ds4_qwen4exp_session *s,
 static bool qwen4exp_graph_layers(
         ds4_qwen4exp_session *s, const ds4_qwen4exp_weights *w,
         const ds4_model *m, uint32_t n_tokens) {
+    const bool stack_indexed =
+        (uint64_t)s->pos + n_tokens > DS4_N_INDEXER_TOP_K;
     bool capture_ok =
         n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
-        (uint64_t)s->pos + n_tokens <= DS4_N_INDEXER_TOP_K &&
+        s->d_pos != NULL &&
         !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
         ds4_gpu_decode_graphs_supported();
 #ifdef DS4_TEST_HOOKS
@@ -2651,7 +2661,8 @@ static bool qwen4exp_graph_layers(
          * uses island three at its own layer index, so the caches are disjoint. */
         key.il = 0u;
         key.island = 3u;
-        key.variant = n_tokens | (s->spec_snapshot_rows << 8u);
+        key.variant = n_tokens | (s->spec_snapshot_rows << 8u) |
+                      (stack_indexed ? 0x10000u : 0u);
         key._pad = 0x51575354u; /* QWST: the complete target layer stack */
         key.cur_hc = s->hyper;
         key.after_attn_hc = s;
@@ -3308,9 +3319,11 @@ int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
         return 0;
     }
 
+    const bool head_indexed =
+        (uint64_t)s->pos + n_tokens > DS4_N_INDEXER_TOP_K;
     const bool capture_ok =
         n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
-        (uint64_t)s->pos + n_tokens <= DS4_N_INDEXER_TOP_K &&
+        s->d_pos != NULL &&
         !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
         ds4_gpu_decode_graphs_supported();
     ds4_decode_graph_key key;
@@ -3319,7 +3332,8 @@ int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
         memset(&key, 0, sizeof(key));
         key.il = il;
         key.island = 3u;
-        key.variant = n_tokens | (s->spec_snapshot_rows << 8u);
+        key.variant = n_tokens | (s->spec_snapshot_rows << 8u) |
+                      (head_indexed ? 0x10000u : 0u);
         key._pad = 0x4d545048u;
         key.cur_hc = hyper;
         key.after_attn_hc = s;
