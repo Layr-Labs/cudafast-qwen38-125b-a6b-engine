@@ -11,8 +11,8 @@
 # zero), finite specials and the mandatory zero/tail rows. Refined outputs are
 # an exact per-row function of the selected IDs (test_mtp_native_screen.c pins
 # them row-by-row against ordinary rows), so selected-ID parity is
-# refined-output parity. Non-finite scores never reach the sort: they raise
-# the invalid flag and the screen falls back first.
+# refined-output parity. The generic screen falls back before sorting nonfinite scores. Async calls
+# may sort them before rejecting through the flag; all IDs must remain bounded.
 from pathlib import Path
 import random, re, struct
 
@@ -31,7 +31,7 @@ def radix_calls(text):
     return calls
 
 def trailing(args):
-    m = re.search(r',(\w+),(\d+),(\d+),cuda_decode_stream\(\)$', args)
+    m = re.search(r',(\w+),(\d+),(\w+),cuda_decode_stream\(\)$', args)
     assert m, 'radix call tail shape changed: ' + args
     return m.groups()
 
@@ -42,7 +42,7 @@ def one(pattern, what):
     return hits[0]
 
 # Wiring: the score sort and its scratch-size query must both sort the high
-# word only, and the selected-ID sort must stay the full ascending 32-bit one.
+# word only; generic selected IDs retain the promoted vocabulary-bounded radix range.
 score_name, _, score_args = one(r'key_in\s*,\s*key_out', 'score sort')
 init_name, _, init_args = one(r'\(\s*const\s+uint64_t\s*\*\s*\)\s*nullptr', 'score sort scratch query')
 id_name, _, id_args = one(r'\bid_tmp\b', 'selected-ID sort')
@@ -54,7 +54,8 @@ assert score_name == 'SortKeysDescending' and score_n == 'width' \
 assert init_name == 'SortKeysDescending' and init_n == 'width' \
     and (init_lo, init_hi) == ('32', '64'), 'scratch query bits must match the sort'
 assert id_name == 'SortKeys' and id_n == 'MTP_NATIVE_CAP' \
-    and (id_lo, id_hi) == ('0', '32'), 'selected-ID sort bits drifted'
+    and (id_lo, id_hi) == ('0', 'id_bits'), 'selected-ID sort bits drifted'
+assert 'while (id_bits < 32 && ((uint32_t)1u << id_bits) < vocab) id_bits++;' in cuh
 
 # Key layout, extracted from the producers rather than restated.
 fk = re.search(r'q8_top1_float_ordered_key\(float v\)\s*\{\s*const uint32_t u = '
@@ -106,6 +107,10 @@ def check(prefix, tail, vocab, score_bits):
     word = sorted(keys, key=lambda k: k >> shift, reverse=True)  # stable, high word
     assert full == word, 'score-word order diverged from full-key order'
     assert selected(full) == selected(word), 'selected IDs diverged'
+    selected_ids=[m32-(k&m32) for k in word[:cap]]
+    assert len(set(selected_ids))==cap and all(0<=i<vocab for i in selected_ids)
+    id_bits=max(1,(vocab-1).bit_length())
+    assert sorted(selected_ids,key=lambda i:i&((1<<id_bits)-1))==sorted(selected_ids)
     return len(keys)
 
 def finite_bits(r):
@@ -115,6 +120,7 @@ specials = [0x00000000, 0x80000000, 0x00000001, 0x80000001, 0x007fffff,
             0x807fffff, 0x00800000, 0x80800000, 0x3f800000, 0xbf800000,
             0x7f7fffff, 0xff7fffff]
 def pattern(name, width, rng):
+    if name == 'nonfinite': return [[0x7fc00000,0xffc00000,0x7f800000,0xff800000,0][i%5] for i in range(width)]
     if name == 'all-zero': return [0] * width
     if name == 'signed-zero': return [rng.choice((0, 0x80000000)) for _ in range(width)]
     if name == 'specials': return [specials[i % len(specials)] for i in range(width)]
@@ -128,9 +134,9 @@ cases = compared = 0
 # The GPU screen shape, the minimal width past CAP, a CAP filled entirely by
 # mandatory rows, and the maximal 2^20 width with the tail at the vocabulary end.
 for prefix, tail, vocab in [(20000, 276, 21000), (2049, 1, 21000),
-                            (2, 2047, 21000), ((1 << 20) - 276, 276, 1 << 20)]:
+                            (2, 2047, 21000), (20000,276,0xffffffff), ((1 << 20) - 276, 276, 1 << 20)]:
     width = prefix + tail
-    for name in (['all-zero', 'signed-zero', 'specials', 'pool', 'random']
+    for name in (['all-zero', 'signed-zero', 'specials', 'pool', 'random', 'nonfinite']
                  if width < 100000 else ['all-zero', 'pool']):
         compared += check(prefix, tail, vocab, pattern(name, width, rng))
         cases += 1

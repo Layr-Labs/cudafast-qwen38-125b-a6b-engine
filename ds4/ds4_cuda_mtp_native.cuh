@@ -168,12 +168,50 @@ static bool mtp_native_key_range_disjoint(const void *a, uint64_t an,
            (ap+an <= bp || bp+bn <= ap);
 }
 
-/* -1: backend error, 0: ordinary full-static fallback, positive: exact number
- * of sorted candidates whose FULL refined logits now occupy out. */
-extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
+/* Our original-ID reducer follows the n19 ordering proof. Both API arms
+ * retain ascending IDs; full-score ties choose the lowest original ID.
+ * The immutable flag is uniform: reject before assuming token zero is first. */
+__global__ static void mtp_native_reduce_pending(uint32_t *winner,
+        const float *logits, const uint32_t *ids, uint32_t count,
+        uint32_t vocab, const uint32_t *invalid) {
+    const uint32_t tid = threadIdx.x;
+    if (*invalid) { if (!tid) winner[0] = UINT32_MAX; return; }
+    float best = -INFINITY; uint32_t id = 0;
+    for (uint32_t i=tid; i<count; i+=1024u) {
+        const float value = logits[i]; const uint32_t original = ids[i];
+        if (topk_score_better(value,original,best,id)) { best=value; id=original; }
+    }
+    __shared__ float values[1024];
+    __shared__ uint32_t indices[1024];
+    values[tid]=best; indices[tid]=id;
+    __syncthreads();
+    for (uint32_t stride=512u; stride; stride>>=1u) {
+        if (tid<stride && topk_score_better(values[tid+stride],indices[tid+stride],values[tid],indices[tid])) {
+            values[tid]=values[tid+stride]; indices[tid]=indices[tid+stride];
+        }
+        __syncthreads();
+    }
+    if (!tid) {
+        /* With a clear coarse flag, the unchanged descending key sort puts
+         * mandatory original ID zero in slot zero. Preserve its NaN pin. */
+        const uint32_t bits=__float_as_uint(logits[0]);
+        const uint32_t original=(bits&0x7fffffffu)>0x7f800000u ? 0u : indices[0];
+        winner[0]=original<vocab ? original : UINT32_MAX;
+    }
+}
+
+/* -1: backend error, 0: ordinary full-static fallback. Positive returns the
+ * selected count: both outputs retain ascending IDs; generic results are valid while
+ * Async winner/flag interpretation remains pending. */
+template <bool Async>
+static int mtp_native_screen_impl(ds4_gpu_tensor *out,
         ds4_gpu_tensor *ids, ds4_gpu_tensor *scratch, const void *map,
         uint64_t map_bytes, uint64_t offset, uint32_t in_dim, uint32_t vocab,
-        uint32_t prefix, uint32_t tail, const ds4_gpu_tensor *x) {
+        uint32_t prefix, uint32_t tail, const ds4_gpu_tensor *x,
+        ds4_gpu_tensor *winner, uint64_t *flag_offset) {
+    /* The diagnostic serial top-one has its own NaN semantics. Keep its old
+     * API path rather than silently substituting this parallel reducer. */
+    if (Async && g_cuda_no_top1) return 0;
     const uint64_t wide = (uint64_t)prefix + tail;
     if (in_dim != MTP_NATIVE_DIM || !prefix || !tail || tail >= MTP_NATIVE_CAP ||
         prefix > vocab || tail > vocab - prefix || wide <= MTP_NATIVE_CAP ||
@@ -198,6 +236,28 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
                                           tier, "native MTP output");
     if (!w) return -1;
     if ((uintptr_t)w & 1u) return 0;
+    if (Async) {
+        if (!winner || !flag_offset || winner->bytes < 4u) return -1;
+        if (ds4_tensor_device_idx(winner) != tier) return 0;
+        /* Discarded invalid-case writes must not corrupt the eventual static
+         * fallback's activation, weight data, flag, or candidate IDs. */
+        const ds4_gpu_tensor *buffers[] = {out, ids, scratch, winner, x};
+        const auto disjoint = [](const void *a, uint64_t an,
+                                 const void *b, uint64_t bn) {
+            const uintptr_t ap = (uintptr_t)a, bp = (uintptr_t)b;
+            return a && b && an <= UINTPTR_MAX-ap && bn <= UINTPTR_MAX-bp &&
+                   (ap+an <= bp || bp+bn <= ap);
+        };
+        for (unsigned i=0; i<5u; ++i) {
+            if (!buffers[i]->ptr || ((uintptr_t)buffers[i]->ptr & 3u)) return 0;
+            for (unsigned j=0; j<i; ++j)
+                if (!disjoint(buffers[i]->ptr,buffers[i]->bytes,
+                              buffers[j]->ptr,buffers[j]->bytes)) return 0;
+            if (i<4u && !disjoint(buffers[i]->ptr,buffers[i]->bytes,
+                                  w,(uint64_t)vocab*80u*34u)) return 0;
+        }
+        if ((uintptr_t)scratch->ptr & 255u) return 0;
+    }
     char *base = (char *)scratch->ptr;
     int8_t *xq = (int8_t *)base;
     float *xs = (float *)(base + MTP_NATIVE_DIM);
@@ -229,9 +289,11 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
             key_in,flag,scores,width,prefix,tail,vocab);
         if (!cuda_ok(cudaGetLastError(),"native screen keys")) return -1;
     }
-    uint32_t invalid = 0;
-    if (!ds4_gpu_tensor_read(scratch,l.flag,&invalid,4)) return -1;
-    if (invalid) return 0;
+    if (!Async) {
+        uint32_t invalid = 0;
+        if (!ds4_gpu_tensor_read(scratch,l.flag,&invalid,4)) return -1;
+        if (invalid) return 0;
+    }
     size_t temporary = (size_t)(scratch->bytes-l.temporary);
     /* Rank on the high score word alone. Keys are written in row order, so
      * original IDs strictly increase over the whole input and the packed low
@@ -247,6 +309,7 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
             key_in,key_out,width,32,64,cuda_decode_stream()),"native score sort")) return -1;
     mtp_native_unpack_ids<<<(MTP_NATIVE_CAP+255u)/256u,256,0,cuda_decode_stream()>>>(id_tmp,key_out);
     if (!cuda_ok(cudaGetLastError(),"native candidate unpack")) return -1;
+    /* Preserve ascending refinement locality for both API arms. */
     temporary = (size_t)(scratch->bytes-l.temporary);
     /* RANK ONLY THE BITS A TOKEN ID CAN OCCUPY.
      *
@@ -277,7 +340,40 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
     mtp_native_projection_kernel<false><<<(MTP_NATIVE_CAP+3u)/4u,256,0,cuda_decode_stream()>>>(
         (float *)out->ptr,(const unsigned char *)w,xq,xs,MTP_NATIVE_CAP,
         (const uint32_t *)ids->ptr,vocab,prefix,tail);
-    return cuda_ok(cudaGetLastError(),"native exact refinement") ? (int)MTP_NATIVE_CAP : -1;
+    if (!cuda_ok(cudaGetLastError(),"native exact refinement")) return -1;
+    if (Async) {
+        mtp_native_reduce_pending<<<1,1024,0,cuda_decode_stream()>>>(
+                (uint32_t *)winner->ptr,(const float *)out->ptr,
+                (const uint32_t *)ids->ptr,MTP_NATIVE_CAP,vocab,flag);
+        if (!cuda_ok(cudaGetLastError(),"native pending original-ID reduction")) return -1;
+        *flag_offset = l.flag;
+    }
+    return (int)MTP_NATIVE_CAP;
+}
+
+/* The old public API still resolves validity before sorting/refinement. */
+extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
+        ds4_gpu_tensor *ids, ds4_gpu_tensor *scratch, const void *map,
+        uint64_t map_bytes, uint64_t offset, uint32_t in_dim, uint32_t vocab,
+        uint32_t prefix, uint32_t tail, const ds4_gpu_tensor *x) {
+    return mtp_native_screen_impl<false>(out,ids,scratch,map,map_bytes,offset,
+                                        in_dim,vocab,prefix,tail,x,nullptr,nullptr);
+}
+
+/* -1 error, 0 decline without data writes, positive QUEUED candidate count.
+ * Validity is pending until winner is read. UINT32_MAX requests a cold flag
+ * read: nonzero means static fallback, zero retains invalid-winner failure.
+ * The caller owns all buffers until that read and any cold reason read finish.
+ * Every valid ID is below vocab, even when vocab itself is UINT32_MAX. */
+extern "C" int ds4_gpu_mtp_native_propose_async(ds4_gpu_tensor *winner,
+        ds4_gpu_tensor *out, ds4_gpu_tensor *ids, ds4_gpu_tensor *scratch,
+        const void *map, uint64_t map_bytes, uint64_t offset, uint32_t in_dim,
+        uint32_t vocab, uint32_t prefix, uint32_t tail, const ds4_gpu_tensor *x,
+        uint64_t *flag_offset) {
+    if (!flag_offset) return -1;
+    *flag_offset = 0;
+    return mtp_native_screen_impl<true>(out,ids,scratch,map,map_bytes,offset,
+                                       in_dim,vocab,prefix,tail,x,winner,flag_offset);
 }
 __global__ static void mtp_native_map(uint32_t *winner, const float *logits,
                                       const uint32_t *ids, uint32_t count, uint32_t vocab) {
