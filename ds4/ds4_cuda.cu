@@ -953,7 +953,27 @@ static inline cublasHandle_t cuda_cublas_for_tier(int logical_tier) {
  * pointer, populates none of them until a key asks, and changes no graph's
  * contents, no launch order and no arithmetic -- only how many identities may
  * be resident before the lookup gives up. */
-#define CUDA_DECODE_GRAPH_VARIANTS  8u
+/* Sixteen rather than eight.  The scored decode leg already reaches four
+ * identities per (layer, island) row once the recurrent-buffer parity and the
+ * replay-active flag are folded into the key, and the correctness free-run leg
+ * shares those rows.  Eight was chosen to restore the headroom the original
+ * four-slot reasoning assumed; sixteen costs only key-plus-pointer entries that
+ * are populated lazily, changes no graph's contents or launch order, and makes
+ * the silent full-row fallback onto the eager path that much harder to reach. */
+#define CUDA_DECODE_GRAPH_VARIANTS  16u
+
+/* Measured at the ranked sequence length on this tree, with the graph enabled
+ * and disabled and nothing else changed:
+ *
+ *     graphs on  (default)          0.0074164 s/token
+ *     DS4_CUDA_DECODE_GRAPHS=0      0.0074820 s/token
+ *
+ * Disabling capture costs 0.88 % of decode, so this path is load-bearing and
+ * not a fallback.  The capture slots are indexed by CHUNK, always at island 3,
+ * which is deliberately disjoint from the per-layer entries -- which is why
+ * CUDA_DECODE_GRAPH_LAYERS being 64 against a 48-layer model does not bind, and
+ * why the variant table width, not the layer count, is what a full row would
+ * show up in.  Recorded so the next reader does not have to re-derive it. */
 
 /* Mirrors the public `struct ds4_decode_graph_key` decl in ds4_gpu.h
  * byte-for-byte (ds4_cuda.cu does not include that header; it carries

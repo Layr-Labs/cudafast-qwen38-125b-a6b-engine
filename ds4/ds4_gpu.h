@@ -3917,6 +3917,16 @@ int ds4_gpu_qwen4exp_gdn_adopt(
  * island: layer, island index, and the activation buffers whose addresses
  * the captured kernels bake in.  ds4_cuda.cu mirrors this struct
  * byte-for-byte (it does not include this header); keep both in sync. */
+/* Two distinct uses of `il`, worth knowing before reading a capture log:
+ *   - the per-layer path passes the layer index and island 0/1/2;
+ *   - the chunked path passes the CHUNK index with island 3, which is why
+ *     island 3 is documented below as a complete block.  Since the chunk index
+ *     and a layer index can be the same number, that island split is what keeps
+ *     the two families of entries from colliding.
+ * `variant` folds in the recurrent-buffer parity and the replay-active flag, so
+ * the number of live identities per (il, island) row is a small multiple of the
+ * shape count -- the reason the variant table width, not the layer count, is
+ * what a full row shows up in. */
 typedef struct ds4_decode_graph_key {
     uint32_t il;
     uint32_t island;    /* 0/1: layer halves; 2: QSA; 3: complete MTP block */
