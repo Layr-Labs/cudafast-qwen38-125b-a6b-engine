@@ -159,6 +159,26 @@ __global__ static void mtp_native_unpack_ids(uint32_t *ids, const uint64_t *keys
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < MTP_NATIVE_CAP) ids[i] = UINT32_MAX - (uint32_t)keys[i];
 }
+/* Exactly the same chosen IDs, ascending, in one CTA. DeviceRadixSort already
+ * selects a single-tile kernel for 2048 IDs, but its generic uint32 tile has
+ * 19 items/thread. This exact-size tile has eight, and folds the separate key
+ * unpack into its loads. Six radix bits retain the parent's digit width. */
+__global__ static void mtp_native_unpack_sort_ids(uint32_t *ids,
+                                                 const uint64_t *keys,
+                                                 int id_bits) {
+    static_assert(MTP_NATIVE_CAP == 256u * 8u, "exact native candidate tile");
+    using Sort = cub::BlockRadixSort<uint32_t, 256, 8, cub::NullType, 6>;
+    __shared__ typename Sort::TempStorage storage;
+    uint32_t items[8];
+#pragma unroll
+    for (unsigned i = 0; i < 8u; i++)
+        items[i] = UINT32_MAX - (uint32_t)keys[threadIdx.x + i * 256u];
+    Sort(storage).SortBlockedToStriped(items, 0, id_bits);
+#pragma unroll
+    for (unsigned i = 0; i < 8u; i++) ids[threadIdx.x + i * 256u] = items[i];
+}
+#include "ds4_cuda_mtp_id_tune.cuh"
+
 /* Moving key writes into projection is equivalent only when scratch writes
  * cannot change another input/output view or a concurrently read weight. */
 static bool mtp_native_key_range_disjoint(const void *a, uint64_t an,
@@ -245,9 +265,6 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
      * 78 drafts accepted). */
     if (!cuda_ok(cub::DeviceRadixSort::SortKeysDescending(base+l.temporary,temporary,
             key_in,key_out,width,32,64,cuda_decode_stream()),"native score sort")) return -1;
-    mtp_native_unpack_ids<<<(MTP_NATIVE_CAP+255u)/256u,256,0,cuda_decode_stream()>>>(id_tmp,key_out);
-    if (!cuda_ok(cudaGetLastError(),"native candidate unpack")) return -1;
-    temporary = (size_t)(scratch->bytes-l.temporary);
     /* RANK ONLY THE BITS A TOKEN ID CAN OCCUPY.
      *
      * The array this sorts is the unpacked ORIGINAL IDS, not the packed keys:
@@ -270,10 +287,24 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
     int id_bits = 1;
     while (id_bits < 32 && ((uint32_t)1u << id_bits) < vocab) id_bits++;
     if (id_bits > 32) id_bits = 32;
-    if (!cuda_ok(cub::DeviceRadixSort::SortKeys(base+l.temporary,temporary,
-            id_tmp,(uint32_t *)ids->ptr,MTP_NATIVE_CAP,0,id_bits,
-            cuda_decode_stream()),
-            "native original-ID sort")) return -1;
+    const bool block_ids = getenv("DS4_MTP_NO_BLOCK_ID_SORT") == nullptr &&
+        (getenv("DS4_MTP_FORCE_BLOCK_ID_SORT") != nullptr ||
+         (id_bits == 18 && current == mtp_id_tuned_device && mtp_id_prefer_block18)) &&
+        mtp_native_key_range_disjoint(ids->ptr, MTP_NATIVE_CAP * 4ull,
+                                     key_out, MTP_NATIVE_CAP * 8ull);
+    if (block_ids) {
+        mtp_native_unpack_sort_ids<<<1,256,0,cuda_decode_stream()>>>(
+            (uint32_t *)ids->ptr, key_out, id_bits);
+        if (!cuda_ok(cudaGetLastError(), "native fused candidate ID sort")) return -1;
+    } else {
+        mtp_native_unpack_ids<<<(MTP_NATIVE_CAP+255u)/256u,256,0,cuda_decode_stream()>>>(id_tmp,key_out);
+        if (!cuda_ok(cudaGetLastError(),"native candidate unpack")) return -1;
+        temporary = (size_t)(scratch->bytes-l.temporary);
+        if (!cuda_ok(cub::DeviceRadixSort::SortKeys(base+l.temporary,temporary,
+                id_tmp,(uint32_t *)ids->ptr,MTP_NATIVE_CAP,0,id_bits,
+                cuda_decode_stream()),
+                "native original-ID sort")) return -1;
+    }
     mtp_native_projection_kernel<false><<<(MTP_NATIVE_CAP+3u)/4u,256,0,cuda_decode_stream()>>>(
         (float *)out->ptr,(const unsigned char *)w,xq,xs,MTP_NATIVE_CAP,
         (const uint32_t *)ids->ptr,vocab,prefix,tail);
