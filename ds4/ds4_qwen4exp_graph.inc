@@ -3416,19 +3416,55 @@ static bool qwen4exp_graph_head_block_encode(
 }
 
 /*
- * ds4_qwen4exp_block_forward_fn.  `graph` is the head's weight context and
- * `cache` is the session that owns the slot; `hyper` is the head's own stream,
- * rewritten in place.  Returns NONZERO on success -- the ds4_gpu convention,
- * not ds4.c's.
+ * ds4_qwen4exp_block_forward_fn, with the leading rows the caller does not
+ * read named.  `graph` is the head's weight context and `cache` is the session
+ * that owns the slot; `hyper` is the head's own stream, rewritten in place.
+ * Returns NONZERO on success -- the ds4_gpu convention, not ds4.c's.
  *
  * Device-positioned QSA makes the complete head block position-independent.
  * Capturing it as island 3 removes the attention, mixer and MoE launch train
  * from every MTP draft round.  The session's hyper pointer and position are
  * lent to the head for the call and restored afterwards.
+ *
+ * `seed_rows` is a leading run whose BLOCK OUTPUT HAS NO READER: the caller
+ * wants those rows' key/value append and their indexer tape and nothing else.
+ * They take qwen4exp_graph_head_cache_encode -- the same attention mixer, the
+ * same K and V projections, the same fused prep-and-append and the same pool
+ * update, with the query, the attention, the output projection, the FFN mixer
+ * and the MoE left out because nothing would read what they produced -- and
+ * the rows behind them take the complete block in a second call, at the
+ * position they already had.
+ *
+ * Splitting the call does not move a number.  A head block's rows reach each
+ * other ONLY through the key/value caches and the indexer tape, which the two
+ * halves write in the same order to the same positions; the tail row's
+ * attention then reads the cache the seed rows just appended to, which is the
+ * cache the single call appended to before its own attention read it.  Within
+ * a row, every kernel here runs one block per token, and every op that tiers
+ * by row count is either routed through a rows-exact entry (see
+ * ds4_qwen4exp_matmul.h) or a scheduling choice its own launcher states as
+ * order-preserving: the QSA split path's head-group width, the joint Q/KV
+ * prep and the triple projection all change shape at two rows and none of
+ * them change the arithmetic.  Those are exactly the choices the cycle's
+ * verify-against-decode equality already exercises at widths one and two, and
+ * tests/test_qwen4exp_graph asserts that equality at exactly zero.  The pool
+ * update recomputes a block from the tape and publishes it only once the
+ * block is complete, so splitting a span across two calls leaves the same
+ * pool rows written from the same tape bytes.
+ *
+ * The seed half runs EAGERLY, and that is deliberate.  A (layer, island) row
+ * of the decode-graph table holds eight keys and evicts none: the first key
+ * that finds the row full drops that island onto the eager path for the rest
+ * of the process, silently.  The head block's row already carries both draft
+ * widths across the GDN replay parity and its active flag, which is eight.
+ * Splitting RELABELS those eight -- one width, two seed counts -- instead of
+ * adding to them, while capturing the seed half as well would ask for twelve
+ * and cost the tail row its graph permanently.
  */
-int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
-                                  ds4_gpu_tensor *hyper, uint32_t il,
-                                  uint32_t pos0, uint32_t n_tokens) {
+static int qwen4exp_graph_head_block_rows(void *graph, void *cache,
+                                          ds4_gpu_tensor *hyper, uint32_t il,
+                                          uint32_t pos0, uint32_t n_tokens,
+                                          uint32_t seed_rows) {
     const ds4_qwen4exp_head_block_ctx *c = graph;
     ds4_qwen4exp_session *s = cache;
     if (!c || !s || !c->l || !c->m || !hyper || n_tokens == 0) return 0;
@@ -3441,8 +3477,32 @@ int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
     }
     if (!c->l->is_full_attention) return 0;
 
+    /* Decided BEFORE anything is enqueued, so a shape the split cannot serve
+     * is the one-call block this has always been rather than a failure.  The
+     * hyper stream is the only buffer that needs an offset: everything else
+     * the two halves touch is session scratch they each fill from row zero.
+     * The view is this call's alone -- the key below names the base tensor,
+     * not the view, so freeing it cannot retire a captured graph. */
+    const uint64_t hc_row_bytes =
+        (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    ds4_gpu_tensor *tail = NULL;
+    if (seed_rows) {
+        if (seed_rows >= n_tokens ||
+            (uint64_t)pos0 + n_tokens > s->plan.n_ctx ||
+            hyper->bytes < (uint64_t)n_tokens * hc_row_bytes) {
+            seed_rows = 0u;
+        } else {
+            tail = ds4_gpu_tensor_view(
+                    hyper, (uint64_t)seed_rows * hc_row_bytes,
+                    (uint64_t)(n_tokens - seed_rows) * hc_row_bytes);
+            if (!tail) seed_rows = 0u;
+        }
+    }
+    const uint32_t block_rows = n_tokens - seed_rows;
+
     /* The head's QSA block appends to the slot's key/value caches and its
-     * indexer tape; see `state_dirty`. */
+     * indexer tape; see `state_dirty`.  The cache-only half appends to the
+     * same two, which is the whole reason it runs. */
     s->state_dirty = true;
 
     ds4_gpu_tensor *saved_hyper = s->hyper;
@@ -3452,13 +3512,32 @@ int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
     if (s->d_pos && !ds4_gpu_qwen4exp_update_dpos(s->d_pos, s->pos)) {
         s->hyper = saved_hyper;
         s->pos = saved_pos;
+        ds4_gpu_tensor_free(tail);
         fprintf(stderr, "ds4: qwen4exp head position update failed\n");
         return 0;
     }
 
-    const bool capture_ok =
-        n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
-        (uint64_t)s->pos + n_tokens <= DS4_N_INDEXER_TOP_K &&
+    const char *stage = "attention mixer";
+    bool ok = true;
+    if (seed_rows) {
+        stage = "head cache seed";
+        ok = qwen4exp_graph_head_cache_encode(s, c->l, c->m, il, seed_rows);
+        if (ok) {
+            /* The tail rows keep the positions they would have had inside the
+             * single call, so the block below is the same arithmetic on the
+             * same inputs -- only its first row has moved to row zero. */
+            s->hyper = tail;
+            s->pos = pos0 + seed_rows;
+            if (s->d_pos && !ds4_gpu_qwen4exp_update_dpos(s->d_pos, s->pos)) {
+                stage = "head cache seed position advance";
+                ok = false;
+            }
+        }
+    }
+
+    const bool capture_ok = ok &&
+        block_rows <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
+        (uint64_t)s->pos + block_rows <= DS4_N_INDEXER_TOP_K &&
         !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
         ds4_gpu_decode_graphs_supported();
     ds4_decode_graph_key key;
@@ -3468,9 +3547,15 @@ int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
         key.il = il;
         key.island = 3u;
         key.variant = ds4_qwen4exp_gdn_graph_variant(
-            n_tokens, s->spec_snapshot_rows, s->gdn_replay_phase,
+            block_rows, s->spec_snapshot_rows, s->gdn_replay_phase,
             s->gdn_replay_active);
-        key._pad = 0x4d545048u;
+        /* The row the block starts at IS part of the island's identity.  A
+         * block encoded over hyper row k bakes row k's addresses into the
+         * captured kernels while presenting the width `variant` carries and
+         * the base tensor `cur_hc` carries -- exactly what an encode over row
+         * zero presents -- so without the seed count folded in here, a graph
+         * captured for the head of the slab would replay over the wrong row. */
+        key._pad = 0x4d545048u + seed_rows;
         key.cur_hc = hyper;
         key.after_attn_hc = s;
         key.after_ffn_hc = (void *)c->l;
@@ -3478,26 +3563,27 @@ int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
         graph_state = ds4_gpu_decode_graph_begin(&key);
     }
 
-    const char *stage = "attention mixer";
-    bool ok = graph_state == 1;
-    if (graph_state != 1) {
+    if (ok && graph_state != 1) {
         ok = qwen4exp_graph_head_block_encode(
-                s, c->l, c->m, il, n_tokens, &stage);
+                s, c->l, c->m, il, block_rows, &stage);
         if (graph_state == 0) {
             if (ok && ds4_gpu_decode_graph_end(&key) == 0) {
                 ok = true;
             } else {
                 if (!ok) ds4_gpu_decode_graph_abort(&key);
                 /* A failed capture executed no kernels.  Re-encode the block
-                 * eagerly once so this proposal still advances its caches. */
+                 * eagerly once so this proposal still advances its caches.
+                 * Only the captured rows: the seed half ran eagerly above and
+                 * has already appended its key/value rows and its tape. */
                 ok = qwen4exp_graph_head_block_encode(
-                        s, c->l, c->m, il, n_tokens, &stage);
+                        s, c->l, c->m, il, block_rows, &stage);
             }
         }
     }
 
     s->hyper = saved_hyper;
     s->pos = saved_pos;
+    ds4_gpu_tensor_free(tail);
     if (s->d_pos && !ds4_gpu_qwen4exp_update_dpos(s->d_pos, s->pos)) {
         stage = "position restore";
         ok = false;
@@ -3507,6 +3593,27 @@ int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
                 il, stage);
     }
     return ok ? 1 : 0;
+}
+
+/* Every row's output is wanted: no row is a seed and this is the block exactly
+ * as it was before the split existed. */
+int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
+                                  ds4_gpu_tensor *hyper, uint32_t il,
+                                  uint32_t pos0, uint32_t n_tokens) {
+    return qwen4exp_graph_head_block_rows(graph, cache, hyper, il, pos0,
+                                          n_tokens, 0u);
+}
+
+/* The same block for a caller that reads ONLY the last row's output, which is
+ * what a draft round's fused seed-and-step forward is: the rows below the last
+ * are owed to the head's cache and to nothing else.  At one row there is
+ * nothing to leave out and this is ds4_qwen4exp_graph_head_block. */
+int ds4_qwen4exp_graph_head_block_last(void *graph, void *cache,
+                                       ds4_gpu_tensor *hyper, uint32_t il,
+                                       uint32_t pos0, uint32_t n_tokens) {
+    return qwen4exp_graph_head_block_rows(
+            graph, cache, hyper, il, pos0, n_tokens,
+            n_tokens > 1u ? n_tokens - 1u : 0u);
 }
 
 /* ======================================================================

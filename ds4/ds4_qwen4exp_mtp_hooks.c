@@ -95,6 +95,7 @@ void ds4_qwen4exp_mtp_default_hooks(ds4_qwen4exp_mtp_gpu_hooks *hooks) {
     hooks->matmul_q8_0 = mtp_matmul_q8_0_decode_rows;
     hooks->block       = ds4_qwen4exp_graph_head_block;
     hooks->cache_seed  = ds4_qwen4exp_graph_head_cache;
+    hooks->block_last  = ds4_qwen4exp_graph_head_block_last;
 }
 
 #endif /* DS4_NO_GPU */
