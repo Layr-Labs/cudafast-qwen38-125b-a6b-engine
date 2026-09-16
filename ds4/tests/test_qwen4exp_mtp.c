@@ -2273,6 +2273,185 @@ static int build_shortlist_head(ds4_qwen4exp_mtp_head *h) {
     return ds4_qwen4exp_mtp_head_init(h, g_err, sizeof(g_err));
 }
 
+/* A stateful head-block oracle. K/V publication precedes the row's output,
+ * and the output depends on both earlier keys and four-position pools. The
+ * seed hook shares only publication; it never computes a block output. */
+typedef struct {
+    float kv[32][HEAD_HC_DIM];
+    float pool[8][HEAD_HC_DIM];
+    uint32_t base, next;
+    uint32_t seed_calls, block_calls, seed_rows, block_rows;
+    bool fail_seed, fail_block;
+} seed_cache_fixture;
+
+static int seed_publish(seed_cache_fixture *c, const float *row, uint32_t pos) {
+    if (pos != c->next || pos < c->base || pos - c->base >= 32u) return 0;
+    const uint32_t slot = pos - c->base;
+    const uint32_t pool = slot / 4u;
+    memcpy(c->kv[slot], row, HEAD_HC_DIM * sizeof(float));
+    for (uint32_t d = 0; d < HEAD_HC_DIM; d++) c->pool[pool][d] += row[d];
+    c->next++;
+    return 1;
+}
+
+static seed_cache_fixture seed_initial_cache(uint32_t pos) {
+    seed_cache_fixture c = {0};
+    c.base = pos > 4u ? (pos - 4u) & ~3u : 0u;
+    c.next = c.base;
+    while (c.next < pos) {
+        float row[HEAD_HC_DIM];
+        for (uint32_t d = 0; d < HEAD_HC_DIM; d++)
+            row[d] = (float)((int)((c.next + d) % 13u) - 6) * 0.0625f;
+        CHECK(seed_publish(&c, row, c.next), "initial cache publication failed");
+    }
+    return c;
+}
+
+static int stub_seed_cache(void *graph, void *cache, ds4_gpu_tensor *hyper,
+                            uint32_t il, uint32_t pos0, uint32_t rows) {
+    (void)graph;
+    seed_cache_fixture *c = cache;
+    log_call("seed_cache");
+    c->seed_calls++;
+    c->seed_rows += rows;
+    if (il != HEAD_BLOCK_IL || hyper->bytes < rows * HEAD_HC_DIM * sizeof(float))
+        return 0;
+    for (uint32_t t = 0; t < rows; t++) {
+        if (!seed_publish(c, (const float *)hyper->data + t * HEAD_HC_DIM,
+                          pos0 + t)) return 0;
+        if (c->fail_seed) return 0; /* partial publication must not retry */
+    }
+    return 1;
+}
+
+static int stub_seed_block(void *graph, void *cache, ds4_gpu_tensor *hyper,
+                            uint32_t il, uint32_t pos0, uint32_t rows) {
+    (void)graph;
+    seed_cache_fixture *c = cache;
+    log_call("seed_block");
+    c->block_calls++;
+    c->block_rows += rows;
+    if (il != HEAD_BLOCK_IL || hyper->bytes < rows * HEAD_HC_DIM * sizeof(float))
+        return 0;
+    for (uint32_t t = 0; t < rows; t++) {
+        float *row = (float *)hyper->data + t * HEAD_HC_DIM;
+        if (!seed_publish(c, row, pos0 + t)) return 0;
+        if (c->fail_block) return 0;
+        for (uint32_t d = 0; d < HEAD_HC_DIM; d++) {
+            float context = 0.0f;
+            for (uint32_t k = 0; k < c->next - c->base; k++)
+                context += c->kv[k][d] * 0.125f;
+            for (uint32_t p = 0; p < 8u; p++) context += c->pool[p][d] * 0.25f;
+            row[d] = (row[d] + context) * 0.5f + 1.0f;
+        }
+    }
+    return 1;
+}
+
+static void test_head_seed_only_rows(void) {
+    printf("head seed rows: cache state and proposal agree with full block\n");
+    enum { ROWS = DS4_QWEN4EXP_MTP_MAX_COMMIT + 1 };
+    ds4_qwen4exp_mtp_head h;
+    CHECK(build_shortlist_head(&h) == 0, "seed head initial init: %s", g_err);
+    ds4_qwen4exp_mtp_head_free(&h);
+    h.max_tokens = ROWS;
+    h.cache_seed_capacity = ROWS;
+    h.hooks.cache_seed = stub_seed_cache;
+    h.hooks.block = stub_seed_block;
+    CHECK(ds4_qwen4exp_mtp_head_init(&h, g_err, sizeof(g_err)) == 0,
+          "seed head init: %s", g_err);
+    int tokens[ROWS], all_drafts[ROWS];
+    float input[ROWS * HEAD_HC_DIM], all_multi[ROWS * HEAD_HC_DIM];
+    for (uint32_t t = 0; t < ROWS; t++) tokens[t] = (int)((t * 3u + 1u) % HEAD_N_VOCAB);
+    for (uint32_t i = 0; i < ROWS * HEAD_HC_DIM; i++)
+        input[i] = (float)((int)(mix64(i + 777u) % 31u) - 15) * 0.125f;
+    const uint32_t positions[] = {0u, 3u, 4u, 2047u, 2048u};
+    for (uint32_t rows = 1u; rows <= ROWS; rows++) {
+        for (size_t p = 0; p < sizeof(positions) / sizeof(positions[0]); p++) {
+            const uint32_t pos = positions[p];
+            seed_cache_fixture ref = seed_initial_cache(pos);
+            h.cache = &ref;
+            memset(&g_log, 0, sizeof(g_log));
+            CHECK(ds4_qwen4exp_mtp_head_forward(&h, tokens, input, pos, rows,
+                      all_drafts, all_multi, g_err, sizeof(g_err)) == 0,
+                  "full seed oracle rows %u pos %u: %s", rows, pos, g_err);
+            CHECK(ref.seed_calls == 0u && ref.block_rows == rows,
+                  "all-output call discarded seed outputs");
+            seed_cache_fixture got = seed_initial_cache(pos);
+            h.cache = &got;
+            memset(&g_log, 0, sizeof(g_log));
+            int draft = -1;
+            float multi[HEAD_HC_DIM + 1u];
+            multi[HEAD_HC_DIM] = 12345.0f;
+            CHECK(ds4_qwen4exp_mtp_head_forward_last(&h, tokens, input, pos, rows,
+                      &draft, multi, g_err, sizeof(g_err)) == 0,
+                  "last seed rows %u pos %u: %s", rows, pos, g_err);
+            CHECK(draft == all_drafts[rows - 1u] &&
+                  memcmp(multi, all_multi + (rows - 1u) * HEAD_HC_DIM,
+                         HEAD_HC_DIM * sizeof(float)) == 0,
+                  "seed rows %u pos %u changed proposal or block output", rows, pos);
+            CHECK(multi[HEAD_HC_DIM] == 12345.0f, "last-only output overran its row");
+            CHECK(got.next == ref.next && memcmp(got.kv, ref.kv, sizeof(got.kv)) == 0 &&
+                  memcmp(got.pool, ref.pool, sizeof(got.pool)) == 0,
+                  "seed rows %u pos %u changed K/V or indexer pools", rows, pos);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+            const bool split = rows > 1u && rows <= DS4_QWEN4EXP_MTP_MAX_COMMIT;
+#else
+            const bool split = false;
+#endif
+            CHECK(got.seed_calls == (split ? 1u : 0u) &&
+                  got.seed_rows == (split ? rows - 1u : 0u) &&
+                  got.block_calls == 1u && got.block_rows == (split ? 1u : rows),
+                  "seed rows %u took the wrong block path", rows);
+            CHECK(g_log.mm_ntok[0] == (uint64_t)rows * HEAD_N_HC,
+                  "seed split changed eh_proj batch width");
+        }
+    }
+
+    /* Prompt cache publication must stay entirely cache-only, including
+     * when its input arrives at a nonzero offset in a device tensor. */
+    ds4_gpu_tensor *device = ds4_gpu_tensor_alloc(sizeof(input) + HEAD_HC_DIM * sizeof(float));
+    CHECK(device && ds4_gpu_tensor_write(device, HEAD_HC_DIM * sizeof(float),
+                                        input, sizeof(input)), "device fixture upload");
+    seed_cache_fixture ref = seed_initial_cache(3u);
+    h.cache = &ref;
+    CHECK(ds4_qwen4exp_mtp_head_forward(&h, tokens, input, 3u, 2u,
+              all_drafts, all_multi, g_err, sizeof(g_err)) == 0, "cache oracle: %s", g_err);
+    seed_cache_fixture got = seed_initial_cache(3u);
+    h.cache = &got;
+    CHECK(ds4_qwen4exp_mtp_head_seed_cache(&h, tokens, device, 1u, 3u, 2u,
+              g_err, sizeof(g_err)) == 0, "cache-only forward: %s", g_err);
+    CHECK(got.seed_rows == 2u && got.block_calls == 0u && got.next == ref.next &&
+          memcmp(got.kv, ref.kv, sizeof(got.kv)) == 0 &&
+          memcmp(got.pool, ref.pool, sizeof(got.pool)) == 0,
+          "cache-only publication ran output work or changed state");
+    ds4_gpu_tensor_free(device);
+
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    for (int fail_seed = 0; fail_seed <= 1; fail_seed++) {
+        got = seed_initial_cache(3u);
+        got.fail_seed = fail_seed != 0;
+        got.fail_block = fail_seed == 0;
+        h.cache = &got;
+        int draft = -123;
+        float multi[HEAD_HC_DIM];
+        for (uint32_t d = 0; d < HEAD_HC_DIM; d++) multi[d] = -456.0f;
+        CHECK(ds4_qwen4exp_mtp_head_forward_last(&h, tokens, input, 3u, 2u,
+                  &draft, multi, g_err, sizeof(g_err)) < 0,
+              "partial %s failure was ignored", fail_seed ? "seed" : "block");
+        CHECK(got.seed_calls == 1u && got.block_calls == (fail_seed ? 0u : 1u),
+              "partial cache mutation was retried or advanced after failure");
+        CHECK(strstr(g_err, fail_seed ? "seed rows" : "last head block") != NULL,
+              "failure did not name its stage: %s", g_err);
+        CHECK(draft == -123, "failed head published a proposal");
+        for (uint32_t d = 0; d < HEAD_HC_DIM; d++)
+            CHECK(multi[d] == -456.0f, "failed head published a block output");
+    }
+#endif
+    ds4_qwen4exp_mtp_head_free(&h);
+    printf("  %u widths x 5 positions, cache-only input and partial failures agree\n", ROWS);
+}
+
 /* The composition oracle: the FULL-vocabulary logits the head's own algebra
  * produces for one row over the stub tables -- the same walk
  * test_head_wiring checks the wide forward against. */
@@ -2580,6 +2759,8 @@ int main(void) {
     test_head_wiring();
     printf("\n");
     test_draft_vocab_shortlist();
+    printf("\n");
+    test_head_seed_only_rows();
     printf("\n");
     if (g_failures) {
         printf("FAILED: %d check(s)\n", g_failures);
