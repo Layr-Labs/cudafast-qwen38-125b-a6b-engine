@@ -4835,7 +4835,7 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
  * either.  If registers ever need to come down, it has to be by removing live
  * state at source. */
 template <int R, int DownType = -1, bool Vector = false, bool Stage = false,
-          bool Async = false>
+          bool Async = false, bool WordDecode = false>
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
@@ -4972,9 +4972,23 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                     int8_t wq[32];
                     float wa[2], wb[2];
                     int halves = 1;
-                    dev_qwen4exp_group_decode(
-                            DownType < 0 ? down_type : (uint32_t)DownType,
-                            drow, g, wq, wa, wb, &halves);
+                    /* Q5_1 words go straight from the original block to
+                     * DP4A operands through the existing prefill decoder.
+                     * Padded rows without word alignment keep the byte path.
+                     * Group ownership, slot order and float updates are the
+                     * original full-warp schedule in both instantiations. */
+                    if (WordDecode && DownType == DS4_QWEN4EXP_TY_q5_1 &&
+                        qwen4exp_word_aligned(drow)) {
+                        uint32_t raw[6];
+                        qw_load_words6((const uint32_t *)(const void *)
+                                       (drow + (uint64_t)g * 24u), raw);
+                        dev_qwen4exp_group_decode_w((uint32_t)DownType,
+                                                    drow, g, raw, wq, wa, wb);
+                    } else {
+                        dev_qwen4exp_group_decode(
+                                DownType < 0 ? down_type : (uint32_t)DownType,
+                                drow, g, wq, wa, wb, &halves);
+                    }
                     const uint64_t at_g = mrow * groups + g;
                     if (Vector && halves == 1)
                         qwen4exp_shared_vector_accumulate(&acc[r], wq, wa[0], wb[0],
@@ -7659,13 +7673,21 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
             mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
 #define QWEN4EXP_DOWN_IMPL(R, DT, V) QWEN4EXP_DOWN_IMPL_S(R, DT, V, false, 0)
-#define QWEN4EXP_DOWN_ASYNC(DT) \
-    qwen4exp_moe_down_q_kernel<2, DT, true, true, true><<< \
+#define QWEN4EXP_DOWN_ASYNC_IMPL(DT, WORDS) \
+    qwen4exp_moe_down_q_kernel<2, DT, true, true, true, WORDS><<< \
             dn_grid, threads, (size_t)dn_shared, stream>>>( \
             (float *)out->ptr, down, (const int32_t *)selected->ptr, \
             sc.mq, sc.ms, sc.msum, \
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
             mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
+#define QWEN4EXP_DOWN_ASYNC(DT) do { \
+    if ((DT) == DS4_QWEN4EXP_TY_q5_1 && \
+        getenv("DS4_QWEN4EXP_NO_DOWN_WORD_DECODE") == NULL) { \
+        QWEN4EXP_DOWN_ASYNC_IMPL(DT, true); \
+    } else { \
+        QWEN4EXP_DOWN_ASYNC_IMPL(DT, false); \
+    } \
+} while (0)
 #define QWEN4EXP_DOWN(R) do { \
     if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q5_1) { \
         QWEN4EXP_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q5_1, false); \
@@ -7771,6 +7793,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
 #undef QWEN4EXP_DOWN_IMPL
 #undef QWEN4EXP_DOWN_IMPL_S
 #undef QWEN4EXP_DOWN_ASYNC
+#undef QWEN4EXP_DOWN_ASYNC_IMPL
     return cuda_ok(cudaGetLastError(), "qwen4exp MoE down launch");
 }
 
