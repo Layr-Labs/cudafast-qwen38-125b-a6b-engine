@@ -4002,6 +4002,14 @@ extern "C" int ds4_gpu_end_commands(void) {
 }
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
 
+/* Complete an engine command batch with one global completion boundary.
+ * Default end_commands already waits globally; the cached stream diagnostic
+ * only waits stream0 and still requires the following global completion. */
+extern "C" int ds4_gpu_complete_commands(void) {
+    if (!ds4_gpu_end_commands()) return 0;
+    return !g_cuda_end_stream_sync || ds4_gpu_synchronize();
+}
+
 /* See ds4_gpu.h.  The owner of the mapping tells us it is going away, because
  * once it is unmapped its address proves nothing: the next GGUF can be handed
  * the same base and the same size, and the (base, size) short-circuit below

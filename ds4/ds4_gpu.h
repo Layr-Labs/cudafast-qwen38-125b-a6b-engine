@@ -109,6 +109,10 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
 #endif
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+/* CUDA command-batch completion, including the stream-sync diagnostic. */
+int ds4_gpu_complete_commands(void);
+#endif
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 
