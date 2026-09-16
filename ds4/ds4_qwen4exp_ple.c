@@ -641,26 +641,42 @@ void ds4_ple_history_reset(const ds4_ple_constants *c, ds4_ple_history *h) {
     for (int i = 0; i < DS4_PLE_MAX_NGRAM; i++) h->previous[i] = c->eos_token_id;
 }
 
-void ds4_ple_row_ids(const ds4_ple_constants *c, ds4_ple_history *h,
-                     const int32_t *tokens, size_t count, uint64_t *out) {
+/* `out` and `tokens` are disjoint from `c` and from each other: `c` is a
+ * const view of the shape, `tokens` the caller's input row and `out` a
+ * caller-owned id buffer.  Without the qualifiers the compiler has to assume
+ * the stores through `out` may overwrite `c`, so it reloads
+ * `c->multipliers[n-1]`, `c->head_vocab_sizes[head]` and
+ * `c->head_offsets[head]` out of memory on every iteration of both loops.
+ * Saying they do not alias lets those become loop-invariant. */
+void ds4_ple_row_ids(const ds4_ple_constants *__restrict c, ds4_ple_history *h,
+                     const int32_t *__restrict tokens, size_t count,
+                     uint64_t *__restrict out) {
     if (!c || !h || (count != 0 && (!tokens || !out))) return;
 
     const uint32_t ngram = c->ngram_size;
     const uint32_t hpn   = c->heads_per_ngram;
     const int32_t  eos   = c->eos_token_id;
+    const uint64_t *__restrict mult = c->multipliers;
+    const uint64_t *__restrict voc  = c->head_vocab_sizes;
+    const uint64_t *__restrict off  = c->head_offsets;
+
+    /* `head_count` is loop-invariant and the row block for token t is exactly
+     * head_count uint64s after the previous one, so the destination is carried
+     * as a pointer step rather than re-multiplied per token. */
+    const size_t head_count = c->head_count;
+    uint64_t *row = out;
 
     for (size_t t = 0; t < count; t++) {
         const int32_t cur = tokens[t];
 
-        uint64_t mixed = (uint64_t)(uint32_t)cur * c->multipliers[0];
-        uint64_t *row  = out + t * c->head_count;
+        uint64_t mixed = (uint64_t)(uint32_t)cur * mult[0];
 
         for (uint32_t n = 2; n <= ngram; n++) {
-            mixed ^= (uint64_t)(uint32_t)h->previous[n - 1] * c->multipliers[n - 1];
+            mixed ^= (uint64_t)(uint32_t)h->previous[n - 1] * mult[n - 1];
             const uint32_t low = (n - 2) * hpn;
             for (uint32_t k = 0; k < hpn; k++) {
                 const uint32_t head = low + k;
-                row[head] = mixed % c->head_vocab_sizes[head] + c->head_offsets[head];
+                row[head] = mixed % voc[head] + off[head];
             }
         }
 
@@ -671,6 +687,7 @@ void ds4_ple_row_ids(const ds4_ple_constants *c, ds4_ple_history *h,
             h->previous[p] = (cur == eos) ? eos : h->previous[p - 1];
         }
         if (ngram >= 2) h->previous[1] = cur;
+        row += head_count;
     }
 }
 
@@ -776,9 +793,15 @@ void ds4_ple_dequant_iq4_nl(const void *__restrict blocks, size_t block_count,
         if (b + 1u < block_count)
             __builtin_prefetch(y + DS4_PLE_IQ4_NL_BLOCK_ELEMS, 1, 3);
 
-        for (int j = 0; j < DS4_PLE_IQ4_NL_BLOCK_ELEMS / 2; j++) {
-            y[j]      = d * (float)kv[qs[j] & 0x0F];
-            y[j + 16] = d * (float)ple_kvalues_iq4nl_hi[qs[j]];
+        /* Unrolled by two: the block is a fixed sixteen nibble bytes, so the
+         * trip count is a compile-time constant and half the loop-carried
+         * bookkeeping disappears.  Same reads, same order, same values. */
+        for (int j = 0; j < DS4_PLE_IQ4_NL_BLOCK_ELEMS / 2; j += 2) {
+            const uint8_t q0 = qs[j], q1 = qs[j + 1];
+            y[j]      = d * (float)kv[q0 & 0x0F];
+            y[j + 1]  = d * (float)kv[q1 & 0x0F];
+            y[j + 16] = d * (float)ple_kvalues_iq4nl_hi[q0];
+            y[j + 17] = d * (float)ple_kvalues_iq4nl_hi[q1];
         }
         p += DS4_PLE_IQ4_NL_BLOCK_BYTES;
     }
