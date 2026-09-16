@@ -657,6 +657,13 @@ int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
 int ds4_qwen4exp_graph_head_cache(void *graph, void *cache,
                                   ds4_gpu_tensor *hyper, uint32_t il,
                                   uint32_t pos0, uint32_t n_tokens);
+/* The block for a forward whose caller reads only the LAST row.  The rows
+ * below it take the cache-only encode above and the last row takes the
+ * complete block; every cache row and every tape row lands exactly where the
+ * undivided block would have left it. */
+int ds4_qwen4exp_graph_head_block_last(void *graph, void *cache,
+                                       ds4_gpu_tensor *hyper, uint32_t il,
+                                       uint32_t pos0, uint32_t n_tokens);
 
 /*
  * The shared primitives the head composes, typed from the declarations the
@@ -673,6 +680,7 @@ int ds4_qwen4exp_graph_head_cache(void *graph, void *cache,
  *   embed        ds4_gpu_qwen4exp_embed_tokens_hc_tensor     (L5b)
  *   matmul_q8_0  the decode-order entry, ds4_qwen4exp_matmul.h
  *   block        L7's qwen4exp block forward
+ *   block_last   the same forward with the unread leading rows left out
  */
 typedef struct {
     int (*rms_norm)(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
@@ -718,6 +726,13 @@ typedef struct {
                       const ds4_gpu_tensor *, uint32_t, uint32_t);
     ds4_qwen4exp_block_forward_fn block;
     ds4_qwen4exp_block_forward_fn cache_seed; /* optional cache-only hook */
+    /* Optional.  The block for a forward that reads only its LAST row: the
+     * rows under it get their key/value append and their indexer tape and
+     * nothing else, because nothing else they would produce has a reader.
+     * NULL means the head runs `block` over the whole batch, which is what it
+     * did before this hook existed and what a caller with its own graph or a
+     * test with its own stub keeps doing. */
+    ds4_qwen4exp_block_forward_fn block_last;
 } ds4_qwen4exp_mtp_gpu_hooks;
 
 /* One output row of a Q8_0 weight as it lies in the mapping: ceil(in_dim / 32)

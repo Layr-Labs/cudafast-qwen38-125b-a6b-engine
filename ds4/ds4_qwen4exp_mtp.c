@@ -1212,8 +1212,21 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
     MTP_HEAD_TICK(MTP_HEAD_T_EH_PROJ);
     if (ok) {
         stage = "block";
-        ds4_qwen4exp_block_forward_fn block = cache_only
-            ? h->hooks.cache_seed : h->hooks.block;
+        /* `last_only` says the caller reads exactly ONE head row: `first_row`
+         * is the last row, `out_rows` is one, and every reader below -- the
+         * narrowed logit copy, the top-1 readback and the multi readback --
+         * addresses that row alone.  The rows under it are the seeds this
+         * round owes the head's cache; their block output has no reader at
+         * all, whatever `multi_out` is, so the attention, the FFN and the MoE
+         * the block would run for them produce nothing anyone observes.
+         * `block_last` is the same block with that half left out for those
+         * rows only.  An unbound hook, or a single row with nothing under it,
+         * keeps the plain block and the behaviour it has always had. */
+        ds4_qwen4exp_block_forward_fn block =
+            cache_only ? h->hooks.cache_seed
+          : (last_only && n_tokens > 1u && h->hooks.block_last)
+                       ? h->hooks.block_last
+                       : h->hooks.block;
         ok = block && block(h->graph, h->cache, h->t_hyper, h->block_index,
                             pos0, n_tokens) != 0;
     }
