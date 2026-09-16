@@ -95,6 +95,46 @@ static inline int ds4_qwen4exp_matmul_f32(ds4_gpu_tensor       *out,
             out, map, map_size, offset, in_dim, out_dim, x, rows);
 }
 
+/* The router's logits, and why they get a width condition after all.
+ *
+ * The rule above gives every F32 projection the one-row reduction order at any
+ * width, and for the gated delta net's alpha and beta that is what is wanted:
+ * their outputs become gates that multiply into CARRIED recurrent state, so a
+ * row-count difference there does not stay local to the row it happened on.
+ *
+ * The router's logits are not carried.  They are consumed in the same block
+ * that produces them, by a top-k over the experts of that row alone, and the
+ * reason the exact order is required for them is the one the Q8_0 rule states
+ * at the top of this header: inside the speculative cycle's width a batched
+ * verify must agree with a one-row decode of the same row, or the two disagree
+ * about which experts the row used and the verify stops matching the serial
+ * leg.  Above that width there is no speculation to agree with -- the call is
+ * prefill -- and the Q8_0 rule already draws exactly this line and says why:
+ * "Above that width the call is prefill, which has no such requirement and
+ * wants the throughput."
+ *
+ * So this entry applies the Q8_0 rule's own width condition to the router:
+ * the exact per-row order at and below the speculative commit width, the
+ * tiered throughput entry above it.  At and below that width the call is
+ * byte-for-byte the call the previous form made, so the speculative cycle,
+ * the serial control leg, and every decode-width path are unchanged.
+ */
+static inline int ds4_qwen4exp_matmul_f32_router(ds4_gpu_tensor       *out,
+                                                 const void           *map,
+                                                 uint64_t              map_size,
+                                                 uint64_t              offset,
+                                                 uint64_t              in_dim,
+                                                 uint64_t              out_dim,
+                                                 const ds4_gpu_tensor *x,
+                                                 uint32_t              rows) {
+    if (rows <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT) {
+        return ds4_gpu_matmul_f32_decode_rows_exact_tensor(
+                out, map, map_size, offset, in_dim, out_dim, x, rows);
+    }
+    return ds4_gpu_matmul_f32_tensor(
+            out, map, map_size, offset, in_dim, out_dim, x, rows);
+}
+
 /* The indexer's BF16 projections.
  *
  * ds4_gpu_glm53_matmul_bf16 tiers by row count at EIGHT, and on BOTH backends
