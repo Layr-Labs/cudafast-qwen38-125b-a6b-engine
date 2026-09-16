@@ -1066,6 +1066,44 @@ extern "C" int ds4_gpu_qwen4exp_update_dpos(
     return cuda_ok(cudaGetLastError(), "qwen4exp position update launch");
 }
 
+/* Publish independent session metadata without coupling their ownership. */
+__global__ static void qwen4exp_publish_metadata_kernel(
+        uint32_t *ple, uint32_t ple_value,
+        uint32_t *adopt, uint32_t adopt_value,
+        uint32_t *pos, uint32_t pos_value) {
+    if (ple) *ple = ple_value;
+    if (adopt) *adopt = adopt_value;
+    if (pos) *pos = pos_value;
+}
+
+extern "C" int ds4_gpu_qwen4exp_publish_metadata(
+        ds4_gpu_tensor *ple, uint32_t ple_value,
+        ds4_gpu_tensor *adopt, uint32_t adopt_value,
+        ds4_gpu_tensor *pos, uint32_t pos_value) {
+    const ds4_gpu_tensor *fields[3] = {ple, adopt, pos};
+    int tier = -1;
+    for (int i = 0; i < 3; ++i) {
+        const ds4_gpu_tensor *t = fields[i];
+        if (!t) continue;
+        if (!t->ptr || t->bytes < sizeof(uint32_t) ||
+            ((uintptr_t)t->ptr & (alignof(uint32_t) - 1u))) return 0;
+        const int d = ds4_tensor_device_idx(t);
+        if (d >= g_n_gpus || (tier >= 0 && d != tier)) return 0;
+        tier = d;
+        for (int j = 0; j < i; ++j)
+            if (fields[j] && fields[j]->ptr == t->ptr) return 0;
+    }
+    if (tier < 0) return 1;
+    int current = -1;
+    if (cudaGetDevice(&current) != cudaSuccess ||
+        current != g_gpu[tier].device_id) return 0;
+    qwen4exp_publish_metadata_kernel<<<1, 1, 0, cuda_decode_stream()>>>(
+            ple ? (uint32_t *)ple->ptr : NULL, ple_value,
+            adopt ? (uint32_t *)adopt->ptr : NULL, adopt_value,
+            pos ? (uint32_t *)pos->ptr : NULL, pos_value);
+    return cuda_ok(cudaGetLastError(), "qwen4exp metadata publication launch");
+}
+
 static cuda_decode_graph_entry *cuda_decode_graph_find(
         const ds4_decode_graph_key *key) {
     if (key->il >= CUDA_DECODE_GRAPH_LAYERS ||

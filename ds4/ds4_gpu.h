@@ -3893,6 +3893,15 @@ int  ds4_gpu_qwen4exp_update_dpos(
         ds4_gpu_tensor *d_pos,
         uint32_t        pos);
 
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+/* NULL fields are not written; values are passed by value on the decode
+ * stream. Supplied fields must be distinct uint32 tensors on the current GPU. */
+int ds4_gpu_qwen4exp_publish_metadata(
+        ds4_gpu_tensor *ple, uint32_t ple_value,
+        ds4_gpu_tensor *adopt, uint32_t adopt_value,
+        ds4_gpu_tensor *pos, uint32_t pos_value);
+#endif
+
 int  ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graphs_invalidate(void);

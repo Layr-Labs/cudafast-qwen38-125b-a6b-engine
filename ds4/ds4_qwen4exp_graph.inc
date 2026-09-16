@@ -2712,6 +2712,30 @@ static bool qwen4exp_session_copy_layers(ds4_qwen4exp_session *s,
                                          uint32_t row,
                                          bool recurrent, bool conv);
 
+/* Publish the independent GDN rollback flag and position before graph use. */
+static bool qwen4exp_publish_metadata(ds4_qwen4exp_session *s) {
+    ds4_gpu_tensor *adopt = s->d_adopt &&
+            s->adopt_device != s->adopt_state ? s->d_adopt : NULL;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (!ds4_gpu_qwen4exp_publish_metadata(NULL, 0u,
+            adopt, s->adopt_state, s->d_pos, s->pos)) {
+        if (adopt) s->adopt_device = UINT32_MAX;
+        return false;
+    }
+    if (adopt) s->adopt_device = s->adopt_state;
+#else
+    if (adopt) {
+        if (!ds4_gpu_qwen4exp_update_dpos(adopt, s->adopt_state)) {
+            s->adopt_device = UINT32_MAX;
+            return false;
+        }
+        s->adopt_device = s->adopt_state;
+    }
+    if (s->d_pos && !ds4_gpu_qwen4exp_update_dpos(s->d_pos, s->pos)) return false;
+#endif
+    return true;
+}
+
 bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
                                 const ds4_qwen4exp_weights *w,
                                 const ds4_model            *m,
@@ -2819,16 +2843,8 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
             }
         }
     }
-    if (s->d_adopt && s->adopt_device != s->adopt_state) {
-        if (!ds4_gpu_qwen4exp_update_dpos(s->d_adopt, s->adopt_state)) {
-            s->adopt_device = UINT32_MAX;
-            fprintf(stderr, "ds4: qwen4exp GDN rollback flag update failed\n");
-            return false;
-        }
-        s->adopt_device = s->adopt_state;
-    }
-    if (s->d_pos && !ds4_gpu_qwen4exp_update_dpos(s->d_pos, s->pos)) {
-        fprintf(stderr, "ds4: qwen4exp position update failed\n");
+    if (!qwen4exp_publish_metadata(s)) {
+        fprintf(stderr, "ds4: qwen4exp metadata publication failed\n");
         return false;
     }
     if (!ds4_gpu_begin_commands()) {
