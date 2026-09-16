@@ -1197,6 +1197,35 @@ static void qw_ple_pool_init(void) {
     pthread_mutex_unlock(&g_qw_ple_pool.mutex);
 }
 
+/* Dispatch overrides are process-lifetime constants: nothing mutates the
+ * environment between the first forward and the last, so each helper reads
+ * its variable once and every later call reuses the latched value.  The
+ * gather runs on EVERY forward -- prefill chunk and decode step alike -- so
+ * an uncached getenv here is a per-step environ walk for a flag that cannot
+ * change. */
+static int qw_ple_gather_time_on(void) {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("DS4_QWEN4EXP_PLE_GATHER_TIME") != NULL;
+    return cached;
+}
+
+static long qw_ple_gather_threads(void) {
+    static long cached = -1;
+    if (cached < 0) {
+        const char * const thr_env = getenv("DS4_QWEN4EXP_PLE_GATHER_THREADS");
+        if (thr_env && thr_env[0]) {
+            char *end = NULL;
+            const long v = strtol(thr_env, &end, 10);
+            cached = (end != thr_env && v >= 0) ? v : 1;
+        } else {
+            cached = sysconf(_SC_NPROCESSORS_ONLN);
+            if (cached > 16) cached = 16;
+            if (cached < 1) cached = 1;
+        }
+    }
+    return cached;
+}
+
 static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                                       const ds4_qwen4exp_weights *w,
                                       const int32_t *tokens,
@@ -1238,8 +1267,7 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
      * one, so a prefill chunk and the decode steps after it name the same
      * rows a single long call would. */
 
-    const double gather_t0 =
-        getenv("DS4_QWEN4EXP_PLE_GATHER_TIME") ? now_sec() : 0.0;
+    const double gather_t0 = qw_ple_gather_time_on() ? now_sec() : 0.0;
     const uint32_t block_elems = DS4_PLE_IQ4_NL_BLOCK_ELEMS;
     const uint32_t blocks_per_row = DS4_N_PLE_ROW_DIM / block_elems;
 
@@ -1281,18 +1309,7 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
          * disjoint token range; the tail thread's local history -- the state
          * a sequential scan would have ended with -- is copied back after
          * the join, so the session still carries the same history forward. */
-        long nthreads = 1;
-        const char * const thr_env =
-            getenv("DS4_QWEN4EXP_PLE_GATHER_THREADS");
-        if (thr_env && thr_env[0]) {
-            char *end = NULL;
-            long v = strtol(thr_env, &end, 10);
-            if (end != thr_env && v >= 0) nthreads = v;
-        } else {
-            nthreads = sysconf(_SC_NPROCESSORS_ONLN);
-            if (nthreads > 16) nthreads = 16;
-            if (nthreads < 1) nthreads = 1;
-        }
+        long nthreads = qw_ple_gather_threads();
         if (nthreads <= 1 || n_tokens < 64u) nthreads = 1;
 
         if (nthreads == 1) {
@@ -2021,6 +2038,16 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
 
 /* One gated residual step: mix down to the block input, run the block, inject
  * the block output back into every hyper-connection stream. */
+/* The slice-timing switch is a process-lifetime constant, but the capture
+ * gates below ask for it on every island and the forward asks again at its
+ * head -- a per-step environ walk for a flag that cannot change.  Latch it.
+ * It lives OUTSIDE the test-hook ifdef: the capture gates read it in the
+ * ranked build too. */
+static int qw_time_slices_on(void) {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("DS4_QWEN4EXP_TIME_SLICES") != NULL;
+    return cached;
+}
 #ifdef DS4_TEST_HOOKS
 /* The slice sequence one forward actually ran, recorded at each slice's own
  * call site.  A test asserts the whole sequence, so a slice that is dropped,
@@ -2061,6 +2088,8 @@ static bool     g_qwen4exp_trace_overflow = false;
  * unless the variable is set.
  *
  * The table prints at the end of the forward that fills it. */
+
+
 static const char *const g_qwen4exp_slice_name[] = {
     "?", "embed", "ple", "attn_mix", "gdn", "qsa", "attn_inject",
     "ffn_mix", "moe", "ffn_inject", "final_mix", "head",
@@ -2081,7 +2110,7 @@ static void qwen4exp_trace(qwen4exp_slice slice) {
     }
 
     if (g_qwen4exp_time_slices < 0) {
-        g_qwen4exp_time_slices = getenv("DS4_QWEN4EXP_TIME_SLICES") != NULL;
+        g_qwen4exp_time_slices = qw_time_slices_on();
     }
     if (!g_qwen4exp_time_slices) return;
     if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize() ||
@@ -2121,6 +2150,7 @@ static void qwen4exp_trace_report(uint32_t n_tokens) {
 #define QW_TRACE(slice) ((void)0)
 #define QW_TRACE_REPORT(n) ((void)0)
 #endif
+
 
 
 /* The residual inject deferral (prefill only; see ds4_qwen4exp_session::
@@ -2272,7 +2302,7 @@ static bool qwen4exp_graph_layer_island(
      * capture.  They must also execute the individual call sites on replay. */
     const bool capture_ok =
         n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
-        !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
+        !qw_hb_time_on() && !qw_time_slices_on() &&
         ds4_gpu_decode_graphs_supported();
     if (capture_ok) {
         ds4_decode_graph_key key;
@@ -2330,7 +2360,7 @@ static bool qwen4exp_graph_qsa_island(
     const bool qsa_capture_ok =
         n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
         (uint64_t)s->pos + n_tokens <= DS4_N_INDEXER_TOP_K &&
-        !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
+        !qw_hb_time_on() && !qw_time_slices_on() &&
         ds4_gpu_decode_graphs_supported();
     if (qsa_capture_ok) {
         ds4_decode_graph_key key;
@@ -2600,7 +2630,7 @@ static bool qwen4exp_graph_layers(
     bool capture_ok =
         n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
         (uint64_t)s->pos + n_tokens <= DS4_N_INDEXER_TOP_K &&
-        !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
+        !qw_hb_time_on() && !qw_time_slices_on() &&
         ds4_gpu_decode_graphs_supported();
 #ifdef DS4_TEST_HOOKS
     /* Layer dumps synchronize and must execute every host call site. */
@@ -2699,7 +2729,7 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
                                 float                      *logits_out) {
     const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
     const double wall_t0 =
-        getenv("DS4_QWEN4EXP_TIME_SLICES") != NULL ? now_sec() : 0.0;
+        qw_time_slices_on() ? now_sec() : 0.0;
 
     /* NO SILENT FALSE.  Every refusal below this line names itself, and so
      * does this one: an argument that is missing is a wiring fault in the
@@ -3299,7 +3329,7 @@ int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
     const bool capture_ok =
         n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
         (uint64_t)s->pos + n_tokens <= DS4_N_INDEXER_TOP_K &&
-        !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
+        !qw_hb_time_on() && !qw_time_slices_on() &&
         ds4_gpu_decode_graphs_supported();
     ds4_decode_graph_key key;
     int graph_state = -1;

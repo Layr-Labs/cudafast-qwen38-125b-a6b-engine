@@ -167,6 +167,26 @@ static bool mtp_native_key_range_disjoint(const void *a, uint64_t an,
     return a && b && an <= UINTPTR_MAX-ap && bn <= UINTPTR_MAX-bp &&
            (ap+an <= bp || bp+bn <= ap);
 }
+/* Dispatch overrides are process-lifetime constants: nothing mutates the
+ * environment between draft rounds, so each name resolves once and caches
+ * rather than walking the environ list on every cycle's screen call.  The
+ * table is pointer-keyed because every caller passes a string literal. */
+static int mtp_native_env_off(const char *name) {
+    static const char *names[8];
+    static int         vals[8];
+    static int         n_names = 0;
+    for (int i = 0; i < n_names; i++) {
+        if (names[i] == name) return vals[i];
+    }
+    const int v = getenv(name) != nullptr;
+    if (n_names < 8) {
+        names[n_names] = name;
+        vals[n_names] = v;
+        n_names++;
+    }
+    return v;
+}
+
 
 /* -1: backend error, 0: ordinary full-static fallback, positive: exact number
  * of sorted candidates whose FULL refined logits now occupy out. */
@@ -178,8 +198,8 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
     if (in_dim != MTP_NATIVE_DIM || !prefix || !tail || tail >= MTP_NATIVE_CAP ||
         prefix > vocab || tail > vocab - prefix || wide <= MTP_NATIVE_CAP ||
         wide > MTP_NATIVE_MAX_WIDTH || !cuda_q8_use_dp4a() ||
-        getenv("DS4_QWEN4EXP_NO_ROW_TILE") != nullptr ||
-        getenv("DS4_QWEN4EXP_PAIR_LANES_R2") != nullptr) return 0;
+        mtp_native_env_off("DS4_QWEN4EXP_NO_ROW_TILE") ||
+        mtp_native_env_off("DS4_QWEN4EXP_PAIR_LANES_R2")) return 0;
     const uint32_t width = (uint32_t)wide;
     const mtp_native_layout l = mtp_native_offsets(width);
     if (!out || !ids || !scratch || !x || !map ||
@@ -210,7 +230,7 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
     quantize_q8_0_f32_rows_warp_kernel<<<10,256,0,cuda_decode_stream()>>>(
         xq,xs,(const float *)x->ptr,in_dim,80,1);
     if (!cuda_ok(cudaGetLastError(),"native screen quantize")) return -1;
-    const bool fuse_keys = getenv("DS4_MTP_NO_FUSED_SCREEN_KEYS") == nullptr &&
+    const bool fuse_keys = !mtp_native_env_off("DS4_MTP_NO_FUSED_SCREEN_KEYS") &&
         mtp_native_key_range_disjoint(scratch->ptr,scratch->bytes,
                                      w,(uint64_t)vocab*80u*34u) &&
         mtp_native_key_range_disjoint(scratch->ptr,scratch->bytes,x->ptr,x->bytes) &&

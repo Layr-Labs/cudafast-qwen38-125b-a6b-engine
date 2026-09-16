@@ -1069,6 +1069,15 @@ static int mtp_head_time_on(void) {
     return mtp_head_timing;
 }
 
+/* The native-screen opt-out is a process-lifetime constant read on every
+ * draft round; resolve it once, the way mtp_head_time_on() caches its own
+ * variable, instead of walking the environ list per cycle. */
+static int mtp_no_native_screen(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_MTP_NO_NATIVE_SCREEN") != NULL;
+    return v;
+}
+
 #define MTP_HEAD_TICK(slot)                                                   \
     do {                                                                      \
         if (timing) {                                                         \
@@ -1262,7 +1271,7 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
     bool screened = false;
     if (ok && logit_rows == 1u && h->t_native_scratch && h->t_native_ids &&
         h->hooks.native_screen && h->hooks.native_map &&
-        getenv("DS4_MTP_NO_NATIVE_SCREEN") == NULL) {
+        !mtp_no_native_screen()) {
         stage = "native head screen and refinement";
         const int rc = h->hooks.native_screen(h->t_logits, h->t_native_ids,
                 h->t_native_scratch, h->target_map, h->target_size,
