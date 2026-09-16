@@ -777,7 +777,8 @@ static float ple_fp16_to_fp32(uint16_t h) {
 void ds4_ple_dequant_iq4_nl(const void *__restrict blocks, size_t block_count,
                             float *__restrict out) {
     const uint8_t *__restrict p = (const uint8_t *)blocks;
-    if (!p || !out) return;
+    /* Cold: the gather always passes a resolved table row and a staging row. */
+    if (__builtin_expect(!p || !out, 0)) return;
 
 
     const int8_t *const kv = ple_kvalues_iq4nl;
