@@ -5780,18 +5780,20 @@ __global__ static void matmul_q8_0_preq_rows_exact_tile_kernel(
 }
 
 
-/* Two adjacent lanes share a Q8 group. Their integer partials may be
- * combined freely; each even lane keeps its original float group chain.
- * Shared memory remaps the 32 finished chains onto one reduction warp. */
-template <int R, bool Streaming = true>
+/* L adjacent lanes share each Q8 integer dot; lane zero of each group keeps
+ * the original float accumulation chain. At L=2, shared memory joins two
+ * warps for the 32-leaf reduction. At L=1, the same tree stays in one warp. */
+template <int R, bool Streaming = true, unsigned L = 2u>
 __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
         float *out, const unsigned char *w,
         const int8_t *xq, const float *xscale,
         uint64_t out_dim, uint32_t n_rows, uint64_t blocks) {
-    const uint32_t local_row = threadIdx.x >> 6u;
-    const uint32_t local_lane = threadIdx.x & 63u;
-    const uint32_t group = local_lane >> 1u;
-    const uint32_t half = local_lane & 1u;
+    static_assert(L == 1u || L == 2u, "one or two lanes per Q8 group");
+    constexpr unsigned Words = 8u / L;
+    const uint32_t local_row = threadIdx.x / (32u * L);
+    const uint32_t local_lane = threadIdx.x % (32u * L);
+    const uint32_t group = local_lane / L;
+    const uint32_t half = local_lane % L;
     const uint64_t row = (uint64_t)blockIdx.x * 4u + local_row;
     const uint32_t row0 = blockIdx.y * R;
     const uint32_t take = n_rows - row0 < R ? n_rows - row0 : R;
@@ -5812,27 +5814,27 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
             const uint64_t b = group;
             /* Name both lanes of every live pair even if independent
              * scheduling has temporarily separated their execution. */
-            const uint64_t warp_base = b - (uint64_t)(group & 15u);
+            const uint64_t warp_base = b - (uint64_t)(group % (32u / L));
             const uint64_t remaining = blocks - warp_base;
-            const uint32_t live_pairs = (uint32_t)(remaining < 16u ? remaining : 16u);
-            const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
-            const int8_t *payload = (const int8_t *)(wr + b * 34u + 2u) + half * 16u;
+            const uint32_t live_pairs = (uint32_t)(remaining < 32u / L ? remaining : 32u / L);
+            const unsigned active = 0xffffffffu >> (32u - L * live_pairs);
+            const int8_t *payload = (const int8_t *)(wr + b * 34u + 2u) + half * (32u / L);
             const uintptr_t address = (uintptr_t)payload;
             const uint32_t shift = (uint32_t)(address & 3u) * 8u;
             const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
             /* Weights stream through each projection once. Mark their reads
              * evict-first while leaving the reusable activation loads alone. */
             uint32_t previous = Streaming ? __ldcs(words) : words[0];
-            int32_t wq[4];
+            int32_t wq[Words];
 #pragma unroll
-            for (int j = 0; j < 3; j++) {
+            for (int j = 0; j < (int)Words - 1; j++) {
                 const uint32_t next = Streaming ? __ldcs(words + j + 1) : words[j + 1];
                 wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
                 previous = next;
             }
-            const uint16_t *lastp = (const uint16_t *)(const void *)(payload + 14);
+            const uint16_t *lastp = (const uint16_t *)(const void *)(payload + 32u / L - 2u);
             const uint16_t last = Streaming ? __ldcs(lastp) : *lastp;
-            wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
+            wq[Words - 1u] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
             const __half *scale = (const __half *)(wr + b * 34u);
             const float ws = Streaming
                 ? __half2float(__ushort_as_half(__ldcs((const uint16_t *)scale)))
@@ -5842,11 +5844,11 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
             for (int r = 0; r < R; r++) {
                 if ((uint32_t)r < take) {
                     const uint64_t at = ((uint64_t)row0 + r) * blocks + b;
-                    const int32_t *xw = (const int32_t *)(xq + at * 32u + half * 16u);
+                    const int32_t *xw = (const int32_t *)(xq + at * 32u + half * (32u / L));
                     int dot = 0;
 #pragma unroll
-                    for (int j = 0; j < 4; j++) dot = __dp4a(wq[j], xw[j], dot);
-                    dot += __shfl_xor_sync(active, dot, 1);
+                    for (int j = 0; j < (int)Words; j++) dot = __dp4a(wq[j], xw[j], dot);
+                    if (L == 2u) dot += __shfl_xor_sync(active, dot, 1);
                     if (half == 0u) acc[r] += ws * xscale[at] * (float)dot;
                 }
             }
@@ -5854,27 +5856,27 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
         for (uint64_t b = group + 32u; b < blocks; b += 32u) {
             /* Name both lanes of every live pair even if independent
              * scheduling has temporarily separated their execution. */
-            const uint64_t warp_base = b - (uint64_t)(group & 15u);
+            const uint64_t warp_base = b - (uint64_t)(group % (32u / L));
             const uint64_t remaining = blocks - warp_base;
-            const uint32_t live_pairs = (uint32_t)(remaining < 16u ? remaining : 16u);
-            const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
-            const int8_t *payload = (const int8_t *)(wr + b * 34u + 2u) + half * 16u;
+            const uint32_t live_pairs = (uint32_t)(remaining < 32u / L ? remaining : 32u / L);
+            const unsigned active = 0xffffffffu >> (32u - L * live_pairs);
+            const int8_t *payload = (const int8_t *)(wr + b * 34u + 2u) + half * (32u / L);
             const uintptr_t address = (uintptr_t)payload;
             const uint32_t shift = (uint32_t)(address & 3u) * 8u;
             const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
             /* Weights stream through each projection once. Mark their reads
              * evict-first while leaving the reusable activation loads alone. */
             uint32_t previous = Streaming ? __ldcs(words) : words[0];
-            int32_t wq[4];
+            int32_t wq[Words];
 #pragma unroll
-            for (int j = 0; j < 3; j++) {
+            for (int j = 0; j < (int)Words - 1; j++) {
                 const uint32_t next = Streaming ? __ldcs(words + j + 1) : words[j + 1];
                 wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
                 previous = next;
             }
-            const uint16_t *lastp = (const uint16_t *)(const void *)(payload + 14);
+            const uint16_t *lastp = (const uint16_t *)(const void *)(payload + 32u / L - 2u);
             const uint16_t last = Streaming ? __ldcs(lastp) : *lastp;
-            wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
+            wq[Words - 1u] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
             const __half *scale = (const __half *)(wr + b * 34u);
             const float ws = Streaming
                 ? __half2float(__ushort_as_half(__ldcs((const uint16_t *)scale)))
@@ -5883,15 +5885,28 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
             for (int r = 0; r < R; r++) {
                 if ((uint32_t)r < take) {
                     const uint64_t at = ((uint64_t)row0 + r) * blocks + b;
-                    const int32_t *xw = (const int32_t *)(xq + at * 32u + half * 16u);
+                    const int32_t *xw = (const int32_t *)(xq + at * 32u + half * (32u / L));
                     int dot = 0;
 #pragma unroll
-                    for (int j = 0; j < 4; j++) dot = __dp4a(wq[j], xw[j], dot);
-                    dot += __shfl_xor_sync(active, dot, 1);
+                    for (int j = 0; j < (int)Words; j++) dot = __dp4a(wq[j], xw[j], dot);
+                    if (L == 2u) dot += __shfl_xor_sync(active, dot, 1);
                     if (half == 0u) acc[r] += ws * xscale[at] * (float)dot;
                 }
             }
         }
+    }
+
+    if (L == 1u) {
+        /* Every lane owns one complete integer dot and the original float
+         * group chain. The original 32-leaf tree now fits in one warp, so
+         * it needs neither the inter-warp handoff nor a block barrier. */
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            const float total = warp_sum_f32(acc[r]);
+            if (local_lane == 0u && row < out_dim && (uint32_t)r < take)
+                out[((uint64_t)row0 + r) * out_dim + row] = total;
+        }
+        return;
     }
 
     /* Pair logical groups g and g + 16 before the remaining four levels
@@ -17716,14 +17731,14 @@ static int cuda_matmul_q8_0_preq_rows_exact(
         } else {
             /* Retain the promoted call-width specialization for the
              * general dense projections. The HC warp geometry above is
-             * independent of this two-warp kernel's token-row bound. */
+             * independent of this kernel's token-row bound. */
             if (n_rows == 1u && getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL) {
                 /* PDL consumer: the stream predecessor is the decode
                  * quantizer, which triggers at its top (decode widths). */
                 QWEN4EXP_LAUNCH_PDL(
-                        (matmul_q8_0_preq_pair_lanes_kernel<1, false>),
+                        (matmul_q8_0_preq_pair_lanes_kernel<1, false, 1u>),
                         (dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u)),
-                        256, 0, cuda_decode_stream(),
+                        128, 0, cuda_decode_stream(),
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
                         out_dim, n_rows, blocks);
             } else if (n_rows == 4u ||
@@ -17745,9 +17760,9 @@ static int cuda_matmul_q8_0_preq_rows_exact(
                         out_dim, n_rows, blocks);
             } else {
                 QWEN4EXP_LAUNCH_PDL(
-                        (matmul_q8_0_preq_pair_lanes_kernel<2, false>),
+                        (matmul_q8_0_preq_pair_lanes_kernel<2, false, 1u>),
                         (dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u)),
-                        256, 0, cuda_decode_stream(),
+                        128, 0, cuda_decode_stream(),
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
                         out_dim, n_rows, blocks);
             }
@@ -19708,13 +19723,16 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
 }
 
 /* K/V blocks precede the large Q grid. Each output retains its original
- * 32 float chains; paired integer partials combine exactly before scaling. */
-template<int R>
+ * 32 float chains. L=1 owns a complete integer dot per lane; L=2 combines
+ * the paired integer partials exactly before scaling. */
+template<int R, unsigned L = 2u>
 __global__ static void qwen_q8_projection_triple_kernel(
         float *out0, float *out1, float *out2,
         const unsigned char *w0, const unsigned char *w1, const unsigned char *w2,
         const int8_t *xq, const float *xscale, uint64_t od0, uint64_t od1,
         uint64_t od2, uint32_t n_rows, uint64_t blocks) {
+    static_assert(L == 1u || L == 2u, "one or two lanes per Q8 group");
+    constexpr unsigned Words = 8u / L;
     constexpr bool SmallFirst=true, Streaming=false;
     const uint32_t nb0=(uint32_t)((od0+3u)/4u), nb1=(uint32_t)((od1+3u)/4u), nb2=(uint32_t)((od2+3u)/4u);
     const uint32_t flat=SmallFirst ? (blockIdx.x<nb1+nb2 ? blockIdx.x+nb0 : blockIdx.x-nb1-nb2) : blockIdx.x;
@@ -19723,10 +19741,10 @@ __global__ static void qwen_q8_projection_triple_kernel(
     float *out=which==0u ? out0 : (which==1u ? out1 : out2);
     const unsigned char *w=which==0u ? w0 : (which==1u ? w1 : w2);
     const uint64_t out_dim=which==0u ? od0 : (which==1u ? od1 : od2);
-    const uint32_t local_row = threadIdx.x >> 6u;
-    const uint32_t local_lane = threadIdx.x & 63u;
-    const uint32_t group = local_lane >> 1u;
-    const uint32_t half = local_lane & 1u;
+    const uint32_t local_row = threadIdx.x / (32u * L);
+    const uint32_t local_lane = threadIdx.x % (32u * L);
+    const uint32_t group = local_lane / L;
+    const uint32_t half = local_lane % L;
     const uint64_t row = (uint64_t)block * 4u + local_row;
     const uint32_t row0 = blockIdx.y * R;
     const uint32_t take = n_rows - row0 < R ? n_rows - row0 : R;
@@ -19738,36 +19756,36 @@ __global__ static void qwen_q8_projection_triple_kernel(
         const unsigned char *wr = w + row * blocks * 34u;
         /* PDL: the first walk step (b = group) with its WEIGHT loads issued
          * above the fence and held in registers, so they fly while the
-         * QSA pre-quantizer drains.  The activation reads (xq/xscale, that
-         * kernel's output) stay below it; every statement is the loop's
-         * own, b ascends exactly as the rolled walk did, and the guard is
-         * the loop's own bounds check for a walk shorter than a warp's
-         * groups.  The walk's remainder runs unchanged from group + 32. */
+         * quantizer drains.  The activation reads (xq/xscale, that kernel's
+         * output) stay below it; every statement is the loop's own, b
+         * ascends exactly as the rolled walk did, and the guard is the
+         * loop's own bounds check for a walk shorter than a warp's groups.
+         * The walk's remainder runs unchanged from group + 32. */
         if (group < blocks) {
             const uint64_t b = group;
             /* Name both lanes of every live pair even if independent
              * scheduling has temporarily separated their execution. */
-            const uint64_t warp_base = b - (uint64_t)(group & 15u);
+            const uint64_t warp_base = b - (uint64_t)(group % (32u / L));
             const uint64_t remaining = blocks - warp_base;
-            const uint32_t live_pairs = (uint32_t)(remaining < 16u ? remaining : 16u);
-            const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
-            const int8_t *payload = (const int8_t *)(wr + b * 34u + 2u) + half * 16u;
+            const uint32_t live_pairs = (uint32_t)(remaining < 32u / L ? remaining : 32u / L);
+            const unsigned active = 0xffffffffu >> (32u - L * live_pairs);
+            const int8_t *payload = (const int8_t *)(wr + b * 34u + 2u) + half * (32u / L);
             const uintptr_t address = (uintptr_t)payload;
             const uint32_t shift = (uint32_t)(address & 3u) * 8u;
             const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
             /* Weights stream through each projection once. Mark their reads
              * evict-first while leaving the reusable activation loads alone. */
             uint32_t previous = Streaming ? __ldcs(words) : words[0];
-            int32_t wq[4];
+            int32_t wq[Words];
 #pragma unroll
-            for (int j = 0; j < 3; j++) {
+            for (int j = 0; j < (int)Words - 1; j++) {
                 const uint32_t next = Streaming ? __ldcs(words + j + 1) : words[j + 1];
                 wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
                 previous = next;
             }
-            const uint16_t *lastp = (const uint16_t *)(const void *)(payload + 14);
+            const uint16_t *lastp = (const uint16_t *)(const void *)(payload + 32u / L - 2u);
             const uint16_t last = Streaming ? __ldcs(lastp) : *lastp;
-            wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
+            wq[Words - 1u] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
             const __half *scale = (const __half *)(wr + b * 34u);
             const float ws = Streaming
                 ? __half2float(__ushort_as_half(__ldcs((const uint16_t *)scale)))
@@ -19777,11 +19795,11 @@ __global__ static void qwen_q8_projection_triple_kernel(
             for (int r = 0; r < R; r++) {
                 if ((uint32_t)r < take) {
                     const uint64_t at = ((uint64_t)row0 + r) * blocks + b;
-                    const int32_t *xw = (const int32_t *)(xq + at * 32u + half * 16u);
+                    const int32_t *xw = (const int32_t *)(xq + at * 32u + half * (32u / L));
                     int dot = 0;
 #pragma unroll
-                    for (int j = 0; j < 4; j++) dot = __dp4a(wq[j], xw[j], dot);
-                    dot += __shfl_xor_sync(active, dot, 1);
+                    for (int j = 0; j < (int)Words; j++) dot = __dp4a(wq[j], xw[j], dot);
+                    if (L == 2u) dot += __shfl_xor_sync(active, dot, 1);
                     if (half == 0u) acc[r] += ws * xscale[at] * (float)dot;
                 }
             }
@@ -19789,27 +19807,27 @@ __global__ static void qwen_q8_projection_triple_kernel(
         for (uint64_t b = group + 32u; b < blocks; b += 32u) {
             /* Name both lanes of every live pair even if independent
              * scheduling has temporarily separated their execution. */
-            const uint64_t warp_base = b - (uint64_t)(group & 15u);
+            const uint64_t warp_base = b - (uint64_t)(group % (32u / L));
             const uint64_t remaining = blocks - warp_base;
-            const uint32_t live_pairs = (uint32_t)(remaining < 16u ? remaining : 16u);
-            const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
-            const int8_t *payload = (const int8_t *)(wr + b * 34u + 2u) + half * 16u;
+            const uint32_t live_pairs = (uint32_t)(remaining < 32u / L ? remaining : 32u / L);
+            const unsigned active = 0xffffffffu >> (32u - L * live_pairs);
+            const int8_t *payload = (const int8_t *)(wr + b * 34u + 2u) + half * (32u / L);
             const uintptr_t address = (uintptr_t)payload;
             const uint32_t shift = (uint32_t)(address & 3u) * 8u;
             const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
             /* Weights stream through each projection once. Mark their reads
              * evict-first while leaving the reusable activation loads alone. */
             uint32_t previous = Streaming ? __ldcs(words) : words[0];
-            int32_t wq[4];
+            int32_t wq[Words];
 #pragma unroll
-            for (int j = 0; j < 3; j++) {
+            for (int j = 0; j < (int)Words - 1; j++) {
                 const uint32_t next = Streaming ? __ldcs(words + j + 1) : words[j + 1];
                 wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
                 previous = next;
             }
-            const uint16_t *lastp = (const uint16_t *)(const void *)(payload + 14);
+            const uint16_t *lastp = (const uint16_t *)(const void *)(payload + 32u / L - 2u);
             const uint16_t last = Streaming ? __ldcs(lastp) : *lastp;
-            wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
+            wq[Words - 1u] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
             const __half *scale = (const __half *)(wr + b * 34u);
             const float ws = Streaming
                 ? __half2float(__ushort_as_half(__ldcs((const uint16_t *)scale)))
@@ -19818,15 +19836,28 @@ __global__ static void qwen_q8_projection_triple_kernel(
             for (int r = 0; r < R; r++) {
                 if ((uint32_t)r < take) {
                     const uint64_t at = ((uint64_t)row0 + r) * blocks + b;
-                    const int32_t *xw = (const int32_t *)(xq + at * 32u + half * 16u);
+                    const int32_t *xw = (const int32_t *)(xq + at * 32u + half * (32u / L));
                     int dot = 0;
 #pragma unroll
-                    for (int j = 0; j < 4; j++) dot = __dp4a(wq[j], xw[j], dot);
-                    dot += __shfl_xor_sync(active, dot, 1);
+                    for (int j = 0; j < (int)Words; j++) dot = __dp4a(wq[j], xw[j], dot);
+                    if (L == 2u) dot += __shfl_xor_sync(active, dot, 1);
                     if (half == 0u) acc[r] += ws * xscale[at] * (float)dot;
                 }
             }
         }
+    }
+
+    if (L == 1u) {
+        /* Every lane owns one complete integer dot and the original float
+         * group chain. The original 32-leaf tree now fits in one warp, so
+         * it needs neither the inter-warp handoff nor a block barrier. */
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            const float total = warp_sum_f32(acc[r]);
+            if (local_lane == 0u && row < out_dim && (uint32_t)r < take)
+                out[((uint64_t)row0 + r) * out_dim + row] = total;
+        }
+        return;
     }
 
     /* Pair logical groups g and g + 16 before the remaining four levels
@@ -19889,14 +19920,14 @@ extern "C" int ds4_gpu_matmul_q8_0_preq_triple_rows_exact_tensor(
         /* PDL consumer: the stream predecessor is the QSA pre-quantizer,
          * which triggers at its top at these decode widths. */
         if (rows==1u)
-            QWEN4EXP_LAUNCH_PDL((qwen_q8_projection_triple_kernel<1>),
-                                grid, 256, 0, cuda_decode_stream(),
+            QWEN4EXP_LAUNCH_PDL((qwen_q8_projection_triple_kernel<1, 1u>),
+                                grid, 128, 0, cuda_decode_stream(),
                 (float *)outs[0]->ptr,(float *)outs[1]->ptr,(float *)outs[2]->ptr,
                 (const unsigned char *)w[0],(const unsigned char *)w[1],
                 (const unsigned char *)w[2],xq,xs,od[0],od[1],od[2],rows,blocks);
         else
-            QWEN4EXP_LAUNCH_PDL((qwen_q8_projection_triple_kernel<2>),
-                                grid, 256, 0, cuda_decode_stream(),
+            QWEN4EXP_LAUNCH_PDL((qwen_q8_projection_triple_kernel<2, 1u>),
+                                grid, 128, 0, cuda_decode_stream(),
                 (float *)outs[0]->ptr,(float *)outs[1]->ptr,(float *)outs[2]->ptr,
                 (const unsigned char *)w[0],(const unsigned char *)w[1],
                 (const unsigned char *)w[2],xq,xs,od[0],od[1],od[2],rows,blocks);
