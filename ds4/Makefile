@@ -543,6 +543,10 @@ $(QWEN4EXP_MOE_TEST): tests/test_qwen4exp_moe.o $(GPU_TEST_OBJS)
 test-qwen4exp-moe: $(QWEN4EXP_MOE_TEST)
 	./$(QWEN4EXP_MOE_TEST)
 
+.PHONY: test-qwen4exp-moe-prelude-host
+test-qwen4exp-moe-prelude-host:
+	python3 tests/qwen4exp_moe_prelude_host.py
+
 # The gate/up MMA tile's q4_K staging valve, A/B: DS4_QWEN4EXP_NO_GATEUP_DQ
 # set and unset must produce identical bytes through the complete routed MoE,
 # across the specialised tile's both task shapes (144- and 132-byte rows),

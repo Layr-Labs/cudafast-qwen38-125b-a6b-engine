@@ -1848,6 +1848,154 @@ static void run_moe_input_reuse_case(
     free(x); free(rw); free(ids); free(got);
 }
 
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(__HIP_PLATFORM_AMD__)
+/* Actual routed+shared chain, with changed inputs on captured replays. Each
+ * comparison includes unused tails, inter-row padding and allocation canaries.
+ * Call with --moe-prelude to run the production-shape suite on a CUDA GPU. */
+typedef struct {
+    ds4_gpu_tensor *t[9];
+    ds4_gpu_qwen4exp_slab routed[3], shared[4];
+    uint32_t rows, stride;
+} moe_prelude_case;
+
+static int prelude_call(moe_prelude_case *c) {
+    return ds4_gpu_qwen4exp_moe_prelude_tensor(
+            c->t[0], c->t[1], c->t[2], c->t[3], c->t[4], c->t[5], c->t[6],
+            c->t[7], c->t[8], c->routed, c->shared,
+            PROD_IN_DIM, PROD_MID_DIM, PROD_OUT_DIM, PROD_EXPERTS, PROD_USED,
+            c->rows, c->stride);
+}
+
+static void prelude_reference(moe_prelude_case *c) {
+    require_ok(ds4_gpu_qwen4exp_router_select_tensor(c->t[5], c->t[6], c->t[7],
+                PROD_EXPERTS, PROD_USED, c->rows), "prelude reference router");
+    require_ok(ds4_gpu_qwen4exp_routed_moe_tensor(c->t[0], c->t[1], c->t[2],
+                &c->routed[0], &c->routed[1], &c->routed[2],
+                PROD_IN_DIM, PROD_MID_DIM, PROD_OUT_DIM, c->t[5], c->t[6],
+                PROD_EXPERTS, PROD_USED, c->t[8], c->rows, c->stride),
+               "prelude reference routed");
+    require_ok(ds4_gpu_qwen4exp_shared_expert_preq_tensor(c->t[0], c->t[3], c->t[4],
+                &c->shared[0], &c->shared[1], &c->shared[2], &c->shared[3],
+                PROD_IN_DIM, PROD_MID_DIM, PROD_OUT_DIM, c->t[8], c->rows, 1),
+               "prelude reference shared");
+}
+
+static void run_moe_prelude_case(const ds4_gpu_qwen4exp_slab *router,
+                                const ds4_gpu_qwen4exp_slab *gate,
+                                const ds4_gpu_qwen4exp_slab *up,
+                                const ds4_gpu_qwen4exp_slab *down) {
+    enum { MAX_ROWS = 8, GUARD = 64 };
+    moe_prelude_case c = {.routed = {*gate, *up, *down},
+                         .shared = {*router, *gate, *up, *down},
+                         .stride = PROD_USED * PROD_MID_DIM + 32u};
+    c.routed[0].expert_bytes = (uint64_t)PROD_MID_DIM * gate->row_bytes;
+    c.routed[1].expert_bytes = (uint64_t)PROD_MID_DIM * up->row_bytes;
+    c.routed[2].expert_bytes = (uint64_t)PROD_OUT_DIM * down->row_bytes;
+    const size_t sizes[9] = {
+        MAX_ROWS * PROD_OUT_DIM * 4u + GUARD, MAX_ROWS * c.stride * 4u + GUARD,
+        MAX_ROWS * PROD_USED * PROD_OUT_DIM * 4u + GUARD,
+        MAX_ROWS * PROD_MID_DIM * 4u + GUARD, MAX_ROWS * 4u + GUARD,
+        MAX_ROWS * PROD_USED * 4u + GUARD, MAX_ROWS * PROD_USED * 4u + GUARD,
+        MAX_ROWS * PROD_EXPERTS * 4u + GUARD, MAX_ROWS * PROD_IN_DIM * 4u + GUARD
+    };
+    size_t largest = 0;
+    unsigned char *ref[9];
+    for (unsigned j = 0; j < 9u; j++) {
+        c.t[j] = ds4_gpu_tensor_alloc(sizes[j]);
+        ref[j] = malloc(sizes[j]);
+        require_ok(c.t[j] && ref[j], "prelude allocation");
+        if (sizes[j] > largest) largest = sizes[j];
+    }
+    unsigned char *buf = malloc(largest), *poison = malloc(largest);
+    require_ok(buf && poison, "prelude comparison allocation");
+    memset(poison, 0x3c, largest);
+    const uint32_t widths[] = {1,2,3,4,7,8,2};
+    unsigned cases = 0;
+    require_ok(setenv("DS4_CUDA_DECODE_GRAPHS", "1", 1) == 0, "prelude graphs");
+    for (unsigned native = 0; native < 2u; native++) {
+        if (native) unsetenv("DS4_QWEN4EXP_NO_ROUTER_NATIVE");
+        else setenv("DS4_QWEN4EXP_NO_ROUTER_NATIVE", "1", 1);
+        for (unsigned wi = 0; wi < sizeof(widths)/sizeof(widths[0]); wi++) {
+            c.rows = widths[wi];
+            ds4_gpu_decode_graphs_invalidate();
+            const ds4_decode_graph_key key = {.il = 2u, .island = 1u};
+            for (unsigned pattern = 0; pattern < 3u; pattern++) {
+                for (unsigned j = 7; j < 9u; j++) {
+                    float *v = (float *)buf;
+                    for (size_t k = 0; k < sizes[j]/4u; k++)
+                        v[k] = j == 7u && pattern == 1u ? (float)(k % 3u)
+                            : rng_unit() * (pattern == 2u ? 1e-20f : .5f);
+                    require_ok(ds4_gpu_tensor_write(c.t[j], 0, v, sizes[j]),
+                               "prelude changed input");
+                    memcpy(ref[j], v, sizes[j]);
+                }
+                for (unsigned mode = 0; mode < 3u; mode++) {
+                    for (unsigned j = 0; j < 7u; j++)
+                        require_ok(ds4_gpu_tensor_write(c.t[j], 0, poison, sizes[j]),
+                                   "prelude reset output and canary");
+                    if (mode == 0u) prelude_reference(&c);
+                    else if (c.rows == 8u) {
+                        require_ok(prelude_call(&c) == -1, "prelude width fallback");
+                        for (unsigned j = 0; j < 7u; j++) {
+                            require_ok(ds4_gpu_tensor_read(c.t[j], 0, buf, sizes[j]),
+                                       "fallback output read");
+                            require_ok(memcmp(poison, buf, sizes[j]) == 0,
+                                       "fallback before any write");
+                        }
+                        prelude_reference(&c);
+                    } else if (mode == 1u) {
+                        require_ok(prelude_call(&c) == 1, "prelude eager");
+                    } else {
+                        if (pattern == 0u) {
+                            require_ok(ds4_gpu_decode_graph_begin(&key) == -1,
+                                       "prelude graph warm marker");
+                            require_ok(prelude_call(&c) == 1, "prelude graph warm");
+                            require_ok(ds4_gpu_decode_graph_begin(&key) == 0,
+                                       "prelude graph capture");
+                            require_ok(prelude_call(&c) == 1, "prelude capture encode");
+                            require_ok(ds4_gpu_decode_graph_end(&key) == 0,
+                                       "prelude capture finish");
+                        }
+                        require_ok(ds4_gpu_decode_graph_begin(&key) == 1,
+                                   "prelude changed-input graph replay");
+                    }
+                    for (unsigned j = 0; j < 9u; j++) {
+                        require_ok(ds4_gpu_tensor_read(c.t[j], 0, buf, sizes[j]),
+                                   "prelude output read");
+                        if (!mode && j < 7u) memcpy(ref[j], buf, sizes[j]);
+                        else require_ok(memcmp(ref[j], buf, sizes[j]) == 0,
+                                        "prelude entire tensor byte equality");
+                    }
+                }
+                cases++;
+            }
+        }
+    }
+    unsetenv("DS4_QWEN4EXP_NO_ROUTER_NATIVE");
+    ds4_gpu_decode_graphs_invalidate();
+    c.rows = 2u;
+    const char *valves[] = {"DS4_QWEN4EXP_NO_MOE_PRELUDE",
+        "DS4_QWEN4EXP_NO_MOE_QUANT_REUSE", "DS4_QWEN4EXP_SERIAL_GROUP_SCAN",
+        "DS4_QWEN4EXP_GENERIC_EXPERTS"};
+    for (unsigned j = 0; j < sizeof(valves)/sizeof(valves[0]); j++) {
+        setenv(valves[j], "1", 1);
+        require_ok(prelude_call(&c) == -1, "prelude diagnostic fallback");
+        unsetenv(valves[j]);
+    }
+    ds4_gpu_tensor *old = c.t[5];
+    c.t[5] = c.t[6];
+    require_ok(prelude_call(&c) == 0, "prelude refuses alias");
+    c.t[5] = ds4_gpu_tensor_alloc(4u);
+    require_ok(c.t[5] && prelude_call(&c) == 0, "prelude refuses short selection");
+    ds4_gpu_tensor_free(c.t[5]);
+    c.t[5] = old;
+    printf("MoE prelude types %u/%u: %u cases, eager/replay/fallback exact\n",
+           gate->type, down->type, cases);
+    free(buf); free(poison);
+    for (unsigned j=0; j<9u; j++) { free(ref[j]); ds4_gpu_tensor_free(c.t[j]); }
+}
+#endif
+
 static void run_production_expert_cases(void) {
     const uint32_t n_gate_up = (uint32_t)(sizeof(PROD_GATE_UP_TYPES) /
                                           sizeof(PROD_GATE_UP_TYPES[0]));
@@ -2244,6 +2392,9 @@ static void run_production_expert_cases(void) {
             const ds4_gpu_qwen4exp_slab d_slab = {
                 image, image_bytes, down_off[dj], 0, drow, dt };
             run_moe_input_reuse_case(&router, &g_slab, &u_slab, &d_slab);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(__HIP_PLATFORM_AMD__)
+            run_moe_prelude_case(&router, &g_slab, &u_slab, &d_slab);
+#endif
             char label[64];
             snprintf(label, sizeof(label), "%s gate/up, %s down",
                      type_name(gt), type_name(dt));
@@ -2523,6 +2674,14 @@ static void run_router_native_cases(void) {
 #endif
 
 int main(int argc, char **argv) {
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(__HIP_PLATFORM_AMD__)
+    if (argc == 2 && strcmp(argv[1], "--moe-prelude") == 0) {
+        require_ok(ds4_gpu_init(), "GPU init");
+        run_production_expert_cases();
+        ds4_gpu_cleanup();
+        return 0;
+    }
+#endif
     /* Fast mode for tests/qwen4exp_router_f32_mutants.sh: just the F32 router
      * projection's exactness sweep, so a mutant run costs one rebuild and a
      * few seconds instead of the whole MoE suite. */
