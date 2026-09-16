@@ -953,6 +953,14 @@ static inline cublasHandle_t cuda_cublas_for_tier(int logical_tier) {
  * pointer, populates none of them until a key asks, and changes no graph's
  * contents, no launch order and no arithmetic -- only how many identities may
  * be resident before the lookup gives up. */
+/* MEASURED, now that eight has shipped: raising this from four was submitted
+ * stacked with the one-batch GDN settle and the pair promoted at +0.49%, from
+ * 2.54758 against a frontier of 2.54211.  Submitted ALONE the same change drew
+ * 2.50588, inside this solver's noise band -- which is the argument for reading
+ * the slot count as a guard against a rare, permanent failure rather than as a
+ * steady-state speed-up: an island whose row fills drops onto the eager path
+ * for the rest of the process, so the cost is paid only in the runs where the
+ * crowding actually happens. */
 #define CUDA_DECODE_GRAPH_VARIANTS  8u
 
 /* Mirrors the public `struct ds4_decode_graph_key` decl in ds4_gpu.h
