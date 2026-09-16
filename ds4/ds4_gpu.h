@@ -547,6 +547,14 @@ int ds4_gpu_indexer_topk_tensor(
         uint32_t                n_tokens,
         uint32_t                top_k);
 
+/* Optional CUDA large-vocabulary reduction. Scratch is caller-owned workspace
+ * that remains dead until this operation completes; other backends may leave
+ * this symbol unbound and use indexer_topk_tensor. */
+int ds4_gpu_indexer_top1_scratch_tensor(
+        ds4_gpu_tensor *selected, const ds4_gpu_tensor *scores,
+        ds4_gpu_tensor *scratch, uint32_t n_comp, uint32_t n_tokens);
+
+
 /* =========================================================================
  * Qwen4-Exp (Qwen 3.8 Flash-Next) QSA block.
  *

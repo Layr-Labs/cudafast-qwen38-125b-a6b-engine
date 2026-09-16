@@ -191,6 +191,24 @@ void ds4_qwen4exp_session_plan_print(const ds4_qwen4exp_session_plan *plan) {
 
 #ifndef DS4_NO_GPU
 
+#if !defined(__APPLE__) && (defined(__GNUC__) || defined(__clang__))
+extern int ds4_gpu_indexer_top1_scratch_tensor(
+        ds4_gpu_tensor *, const ds4_gpu_tensor *, ds4_gpu_tensor *,
+        uint32_t, uint32_t) __attribute__((weak));
+#endif
+
+static int qwen4exp_compact_top1(ds4_gpu_tensor *out, const ds4_gpu_tensor *logits,
+        ds4_gpu_tensor *scratch, uint32_t vocab, uint32_t rows) {
+#if !defined(__APPLE__) && (defined(__GNUC__) || defined(__clang__))
+    if (ds4_gpu_indexer_top1_scratch_tensor)
+        return ds4_gpu_indexer_top1_scratch_tensor(out, logits, scratch, vocab, rows);
+#else
+    (void)scratch;
+#endif
+    return ds4_gpu_indexer_topk_tensor(out, logits, vocab, rows, 1u);
+}
+
+
 #define QW_MAP(m, t)   ((const void *)(m)->shard[(t)->map_index].map)
 #define QW_MAPSZ(m, t) ((m)->shard[(t)->map_index].size)
 #define QW_OFF(t)      ((t)->abs_offset)
@@ -3004,8 +3022,10 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     }
     if (s->spec_top1_rows != 0u &&
         (s->spec_top1_rows != logit_rows ||
-         !ds4_gpu_indexer_topk_tensor(s->spec_top1, s->logits,
-                                      cfg->n_vocab, logit_rows, 1u))) {
+         /* All MoE down users have finished; this tensor is workspace again.
+          * The optional CUDA reducer writes only its small partial array. */
+         !qwen4exp_compact_top1(s->spec_top1, s->logits, s->moe_down_partial,
+                                cfg->n_vocab, logit_rows))) {
         fprintf(stderr, "ds4: qwen4exp compact verify top-1 failed\n");
         return qwen4exp_forward_fail();
     }

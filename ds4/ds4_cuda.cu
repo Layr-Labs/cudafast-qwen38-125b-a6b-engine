@@ -15121,6 +15121,77 @@ __global__ static void indexer_top1_kernel(
     if (tid == 0u) selected[t] = idxs[0];
 }
 
+/* Large-vocabulary top-1: distribute independent chunks over the GPU, then
+ * reduce their exact (score,index) maxima. Only comparisons move; there is no
+ * reassociation of a model sum. NaN/all-minus-infinity and signed-zero ties
+ * retain the original sentinel and lowest-index policy. */
+struct indexer_top1_pair { float value; uint32_t index; };
+
+__device__ __forceinline__ static indexer_top1_pair indexer_top1_warp_reduce(
+        indexer_top1_pair best) {
+#pragma unroll
+    for (uint32_t d = 16u; d; d >>= 1u) {
+        const float v = __shfl_down_sync(0xffffffffu, best.value, d);
+        const uint32_t i = __shfl_down_sync(0xffffffffu, best.index, d);
+        if (topk_score_better(v, i, best.value, best.index)) best = {v, i};
+    }
+    return best;
+}
+
+__device__ __forceinline__ static indexer_top1_pair indexer_top1_block_reduce(
+        indexer_top1_pair best, indexer_top1_pair *warp_best) {
+    best = indexer_top1_warp_reduce(best);
+    if ((threadIdx.x & 31u) == 0u) warp_best[threadIdx.x >> 5u] = best;
+    __syncthreads();
+    if (threadIdx.x < 32u) {
+        best = threadIdx.x < 8u ? warp_best[threadIdx.x]
+                                : indexer_top1_pair{-INFINITY, 0u};
+        best = indexer_top1_warp_reduce(best);
+    }
+    return best;
+}
+
+__global__ static void indexer_top1_chunks_kernel(
+        indexer_top1_pair *partials, const float *scores,
+        uint32_t n_comp, uint32_t chunks) {
+    const uint32_t token = blockIdx.x, chunk = blockIdx.y;
+    const uint32_t first = chunk * 4096u;
+    const uint32_t end = n_comp - first < 4096u ? n_comp : first + 4096u;
+    const float *row = scores + (uint64_t)token * n_comp;
+    indexer_top1_pair best = {-INFINITY, 0u};
+    for (uint32_t i = first + threadIdx.x; i < end; i += 256u) {
+        const float v = row[i];
+        if (topk_score_better(v, i, best.value, best.index)) best = {v, i};
+    }
+    __shared__ indexer_top1_pair warp_best[8];
+    best = indexer_top1_block_reduce(best, warp_best);
+    if (threadIdx.x == 0u) partials[(uint64_t)token * chunks + chunk] = best;
+}
+
+__global__ static void indexer_top1_finish_kernel(
+        uint32_t *selected, const indexer_top1_pair *partials, uint32_t chunks) {
+    const uint32_t token = blockIdx.x;
+    indexer_top1_pair best = threadIdx.x < chunks
+        ? partials[(uint64_t)token * chunks + threadIdx.x]
+        : indexer_top1_pair{-INFINITY, 0u};
+    __shared__ indexer_top1_pair warp_best[8];
+    best = indexer_top1_block_reduce(best, warp_best);
+    if (threadIdx.x == 0u) selected[token] = best.index;
+}
+
+static bool indexer_top1_wide_shape(uint32_t n_comp, uint32_t n_tokens,
+                                    uint64_t scratch_bytes) {
+    return n_comp >= 65536u && n_comp <= 1048576u &&
+        n_tokens >= 1u && n_tokens <= 7u &&
+        scratch_bytes >= (uint64_t)n_tokens * ((n_comp + 4095u) / 4096u) *
+                         sizeof(indexer_top1_pair);
+}
+
+static bool indexer_top1_ranges_overlap(uintptr_t a, uint64_t as,
+                                         uintptr_t b, uint64_t bs) {
+    return a <= b ? (uint64_t)(b - a) < as : (uint64_t)(a - b) < bs;
+}
+
 __global__ static void indexer_top1_value_kernel(
         uint32_t *selected,
         float *values,
@@ -16242,6 +16313,38 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                          (const float *)scores->ptr,
                                          n_comp, n_tokens, top_k);
     return cuda_ok(cudaGetLastError(), "indexer topk launch");
+}
+
+/* Scratch belongs to the caller and must be dead until this reduction
+ * finishes. Qwen's compact verify supplies the completed MoE-down partial
+ * tensor, avoiding new allocation and global scratch/graph lifetime changes.
+ * Other layouts/backends keep the ordinary entry point. */
+extern "C" int ds4_gpu_indexer_top1_scratch_tensor(
+        ds4_gpu_tensor *selected, const ds4_gpu_tensor *scores,
+        ds4_gpu_tensor *scratch, uint32_t n_comp, uint32_t n_tokens) {
+    if (!selected || !scores || n_comp == 0u || n_tokens == 0u ||
+        scores->bytes < (uint64_t)n_tokens * n_comp * sizeof(float) ||
+        selected->bytes < (uint64_t)n_tokens * sizeof(uint32_t)) return 0;
+    if (!scratch || !scratch->ptr || g_cuda_no_top1 ||
+        getenv("DS4_CUDA_NO_TOP1_WIDE") != NULL ||
+        !indexer_top1_wide_shape(n_comp, n_tokens, scratch->bytes) ||
+        ((uintptr_t)scratch->ptr & 7u) != 0u ||
+        ds4_tensor_device_idx(scratch) != ds4_tensor_device_idx(selected) ||
+        ds4_tensor_device_idx(scores) != ds4_tensor_device_idx(selected) ||
+        indexer_top1_ranges_overlap((uintptr_t)scratch->ptr, scratch->bytes,
+                                    (uintptr_t)scores->ptr, scores->bytes) ||
+        indexer_top1_ranges_overlap((uintptr_t)scratch->ptr, scratch->bytes,
+                                    (uintptr_t)selected->ptr, selected->bytes)) {
+        return ds4_gpu_indexer_topk_tensor(selected, scores, n_comp, n_tokens, 1u);
+    }
+    const uint32_t chunks = (n_comp + 4095u) / 4096u;
+    indexer_top1_chunks_kernel<<<dim3(n_tokens, chunks, 1), 256>>>(
+        (indexer_top1_pair *)scratch->ptr, (const float *)scores->ptr,
+        n_comp, chunks);
+    if (!cuda_ok(cudaGetLastError(), "indexer top1 chunks launch")) return 0;
+    indexer_top1_finish_kernel<<<n_tokens, 256>>>(
+        (uint32_t *)selected->ptr, (const indexer_top1_pair *)scratch->ptr, chunks);
+    return cuda_ok(cudaGetLastError(), "indexer top1 finish launch");
 }
 
 extern "C" int ds4_gpu_indexer_top1_value_tensor(
