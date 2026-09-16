@@ -3026,6 +3026,26 @@ int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         uint32_t                     n_tokens,
         int                          pre_quantized);
 
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+/* CUDA small-row MoE: select, group, quantize and compute the shared gate in
+ * one preparation grid, then use the ordinary routed and shared GEMMs.
+ * Slabs are gate/up/down and router/gate/up/down, respectively. All tensors
+ * must be disjoint on the current device. Returns -1 BEFORE any launch when
+ * the shape or diagnostic switches require the ordinary path; 0 is an error
+ * and must not be retried after partial work. Intermediate widths are equal.
+ * No prepared state escapes this call or crosses a graph replay boundary. */
+int ds4_gpu_qwen4exp_moe_prelude_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *mid, ds4_gpu_tensor *down_partial,
+        ds4_gpu_tensor *shared_mid, ds4_gpu_tensor *shared_gate,
+        ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *logits, const ds4_gpu_tensor *x,
+        const ds4_gpu_qwen4exp_slab routed[3],
+        const ds4_gpu_qwen4exp_slab shared[4],
+        uint32_t in_dim, uint32_t mid_dim, uint32_t out_dim,
+        uint32_t n_expert, uint32_t n_used, uint32_t rows,
+        uint32_t mid_stride);
+#endif
+
 int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *mid,
