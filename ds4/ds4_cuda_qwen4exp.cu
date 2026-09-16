@@ -52,6 +52,101 @@
 #include "ds4_qwen4exp_hc_types.h"
 #include "ds4_qwen4exp_qsa_scratch.h"
 
+/* ATS capability is cached for the actual current physical device. The
+ * engine serializes dispatch; switching devices refreshes this tiny cache. */
+static int qwen4exp_ple_direct_capability(int device) {
+    static int cached_device = -1, cached_result = 0;
+    static int disabled = -1;
+    if (disabled < 0) disabled = getenv("DS4_QWEN4EXP_NO_DIRECT_PLE") != NULL;
+    if (disabled) return 0;
+    if (cached_device == device) return cached_result;
+    int pageable = 0, host_tables = 0, concurrent = 0;
+    if (cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccess, device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&host_tables, cudaDevAttrPageableMemoryAccessUsesHostPageTables, device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&concurrent, cudaDevAttrConcurrentManagedAccess, device) != cudaSuccess) return -1;
+    cached_device = device;
+    cached_result = pageable && host_tables && concurrent;
+    return cached_result;
+}
+
+extern "C" int ds4_gpu_qwen4exp_ple_direct_prepare(
+        ds4_qwen4exp_ple_direct_rows *prepared, const ds4_gpu_tensor *out,
+        const uint8_t *table, uint64_t table_bytes, uint64_t table_rows,
+        uint64_t row_bytes, const uint64_t *ids, uint32_t row_count) {
+    if (!prepared) return -1;
+    prepared->row_count = 0;
+    if (!out || !out->ptr || !table || !ids ||
+        (row_count != 16u && row_count != 32u) || row_bytes != 90u ||
+        !table_rows || table_rows > table_bytes / row_bytes ||
+        out->bytes < (uint64_t)row_count * 160u * sizeof(float) ||
+        ((uintptr_t)out->ptr & (alignof(float) - 1u)) ||
+        table_bytes > UINTPTR_MAX - (uintptr_t)table) return -1;
+    const uint64_t output_bytes = (uint64_t)row_count * 160u * sizeof(float);
+    const uintptr_t output = (uintptr_t)out->ptr, base = (uintptr_t)table;
+    if (output_bytes > UINTPTR_MAX - output ||
+        (output < base + table_bytes && base < output + output_bytes)) return -1;
+    /* No resolver, registration, migration, allocation or weight cache. */
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess) return -1;
+    const int capable = qwen4exp_ple_direct_capability(device);
+    if (capable <= 0) return capable;
+    if (!ds4_gpu_decode_graphs_supported()) return 0; /* single-device policy */
+    cudaPointerAttributes attrs;
+    if (cudaPointerGetAttributes(&attrs, out->ptr) != cudaSuccess ||
+        attrs.type != cudaMemoryTypeDevice || attrs.device != device) return -1;
+    bool finite = true;
+    for (uint32_t r = 0; r < row_count; ++r) {
+        if (ids[r] >= table_rows) return -1;
+        const uint8_t *p = table + ids[r] * row_bytes;
+        prepared->rows[r] = p;
+        for (uint32_t b = 0; b < 5; ++b) {
+            uint16_t h;
+            memcpy(&h, p + b * 18u, sizeof(h));
+            finite &= (h & 0x7c00u) != 0x7c00u;
+        }
+    }
+    if (!finite) return 0; /* Preserve CPU NaN/Inf payload behavior. */
+    prepared->output = out->ptr;
+    prepared->physical_device = device;
+    prepared->row_count = row_count;
+    return 1;
+}
+
+__global__ static void qwen4exp_ple_direct_kernel(float *out,
+        ds4_qwen4exp_ple_direct_rows prepared) {
+    const uint32_t r = blockIdx.x;
+    const uint32_t lane = threadIdx.x;
+    const uint8_t *p = prepared.rows[r];
+    if (lane < 160u) {
+        const uint32_t b = lane / 32u, j = lane % 32u;
+        const uint8_t *block = p + b * 18u;
+        const uint16_t half = (uint16_t)block[0] | ((uint16_t)block[1] << 8);
+        const float scale = __half2float(__ushort_as_half(half));
+        const uint8_t q = block[2u + (j & 15u)];
+        const int index = j < 16u ? q & 15u : q >> 4;
+        /* Four immediate words encode the unchanged signed IQ4 codebook,
+         * avoiding a per-thread local array for a data-dependent lookup. */
+        const uint32_t word = index < 4 ? 0xbfad9881u : index < 8 ? 0xf6eaddcfu :
+                              index < 12 ? 0x26190d01u : 0x71594535u;
+        const int value = (int)(int8_t)(word >> ((index & 3) * 8));
+        out[(uint64_t)r * 160u + lane] = __fmul_rn(scale, (float)value);
+    }
+}
+
+extern "C" int ds4_gpu_qwen4exp_ple_direct_gather(ds4_gpu_tensor *out,
+        const ds4_qwen4exp_ple_direct_rows *prepared) {
+    if (!out || !out->ptr || !prepared || out->ptr != prepared->output ||
+        (prepared->row_count != 16u && prepared->row_count != 32u) ||
+        out->bytes < (uint64_t)prepared->row_count * 160u * sizeof(float)) return 0;
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess || device != prepared->physical_device) return 0;
+    /* Pointer parameters are copied into the launch, never read from a
+     * caller's stack asynchronously. This operation stays outside captures. */
+    qwen4exp_ple_direct_kernel<<<prepared->row_count, 160, 0,
+            ds4_cuda_qwen4exp_decode_stream()>>>((float *)out->ptr, *prepared);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 #define CUDA_QK_K 256
 
 /* ------------------------------------------------------------------

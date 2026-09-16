@@ -3893,6 +3893,27 @@ int  ds4_gpu_qwen4exp_update_dpos(
         ds4_gpu_tensor *d_pos,
         uint32_t        pos);
 
+/* A short PLE gather owns no weight storage: original mapped row pointers
+ * are copied by value into the kernel launch after command-batch creation. */
+typedef struct {
+    const uint8_t *rows[32];
+    void *output;
+    uint32_t row_count;
+    int physical_device;
+} ds4_qwen4exp_ple_direct_rows;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+/* 1 prepared, 0 use CPU (unsupported/nonfinite), -1 invalid/error. */
+int ds4_gpu_qwen4exp_ple_direct_prepare(
+        ds4_qwen4exp_ple_direct_rows *prepared, const ds4_gpu_tensor *out,
+        const uint8_t *table, uint64_t table_bytes, uint64_t table_rows,
+        uint64_t row_bytes, const uint64_t *ids, uint32_t row_count);
+/* Consume only an unmodified successful preparation with its original output.
+ * Prepared rows and their original mappings must remain valid through the
+ * surrounding command batch. No fallback after a failed launch. */
+int ds4_gpu_qwen4exp_ple_direct_gather(ds4_gpu_tensor *out,
+        const ds4_qwen4exp_ple_direct_rows *prepared);
+#endif
+
 int  ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graphs_invalidate(void);

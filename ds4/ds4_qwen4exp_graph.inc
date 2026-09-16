@@ -1201,7 +1201,9 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                                       const ds4_qwen4exp_weights *w,
                                       const int32_t *tokens,
                                       uint32_t n_tokens,
-                                      uint32_t il) {
+                                      uint32_t il,
+                                      ds4_qwen4exp_ple_direct_rows *prepared) {
+    prepared->row_count = 0;
     if (!s->ple_ready) {
         fprintf(stderr,
                 "ds4: qwen4exp block %u carries the per-layer n-gram embedding "
@@ -1242,6 +1244,34 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
         getenv("DS4_QWEN4EXP_PLE_GATHER_TIME") ? now_sec() : 0.0;
     const uint32_t block_elems = DS4_PLE_IQ4_NL_BLOCK_ELEMS;
     const uint32_t blocks_per_row = DS4_N_PLE_ROW_DIM / block_elems;
+
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (gather_t0 == 0.0 && n_tokens <= 2u && DS4_N_PLE_HEAD == 16u && DS4_N_PLE_ROW_DIM == 160u) {
+        /* Hash once, preserving every speculative history snapshot. If the
+         * direct path declines, decode these same IDs on the CPU. */
+        if (s->spec_snapshot_rows > 0) {
+            for (uint32_t t = 0; t < n_tokens; ++t) {
+                ds4_ple_row_ids(&s->ple_constants, &s->ple_history, tokens + t, 1u,
+                        s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD);
+                if (t < s->spec_snapshot_rows) s->ple_history_rows[t] = s->ple_history;
+            }
+        } else {
+            ds4_ple_row_ids(&s->ple_constants, &s->ple_history, tokens, n_tokens, s->ple_ids);
+        }
+        const int direct = ds4_gpu_qwen4exp_ple_direct_prepare(prepared, s->ple_rows,
+                w->ple.base, w->ple.bytes, w->ple.rows, w->ple.row_bytes,
+                s->ple_ids, n_tokens * DS4_N_PLE_HEAD);
+        if (direct < 0) return false;
+        if (direct > 0) return true; /* No GPU work until begin_commands. */
+        for (uint32_t r = 0; r < n_tokens * DS4_N_PLE_HEAD; ++r) {
+            const uint8_t *quant = ds4_qwen4exp_ple_row(&w->ple, s->ple_ids[r]);
+            if (!quant) return false;
+            ds4_ple_dequant_iq4_nl(quant, blocks_per_row,
+                    s->ple_rows_host + (uint64_t)r * DS4_N_PLE_ROW_DIM);
+        }
+        goto ple_upload;
+    }
+#endif
 
     /* When slots are armed the ids are produced ONE ROW AT A TIME so the
      * n-gram history after each row can be kept beside them.  The contract on
@@ -1411,6 +1441,7 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
             }
         }
     }
+ple_upload:
     if (gather_t0 != 0.0) {
         fprintf(stderr,
                 "ds4: qwen4exp PLE gather %u rows took %.3f ms\n",
@@ -2787,10 +2818,11 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
      * memcpy into a shared buffer, and a memcpy between an encode and a commit
      * would land ahead of work already encoded.  Nothing here touches the
      * device beyond that one write. */
+    ds4_qwen4exp_ple_direct_rows ple_prepared = {0};
     {
         const ds4_qwen4exp_layer_weights *ple = &w->layer[cfg->ple_layer];
         if (ple->has_ple &&
-            !qwen4exp_graph_ple_gather(s, w, tokens, n_tokens, cfg->ple_layer)) {
+            !qwen4exp_graph_ple_gather(s, w, tokens, n_tokens, cfg->ple_layer, &ple_prepared)) {
             fprintf(stderr,
                     "ds4: qwen4exp n-gram row gather failed for block %u\n",
                     cfg->ple_layer);
@@ -2835,6 +2867,14 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         fprintf(stderr, "ds4: qwen4exp could not open a command batch\n");
         return false;
     }
+
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (ple_prepared.row_count &&
+        !ds4_gpu_qwen4exp_ple_direct_gather(s->ple_rows, &ple_prepared)) {
+        fprintf(stderr, "ds4: qwen4exp direct n-gram gather failed\n");
+        return qwen4exp_forward_fail();
+    }
+#endif
 
     /* Layer-0 seed: gather the embedding row and tile it into every stream. */
     if (!ds4_gpu_qwen4exp_embed_tokens_hc_tensor(
