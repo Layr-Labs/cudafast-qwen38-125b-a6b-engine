@@ -7661,6 +7661,78 @@ __global__ static void qwen4exp_shared_gate_kernel(
     if (threadIdx.x == 0u) gate_out[token] = 1.0f / (1.0f + expf(-total));
 }
 
+/* Additive short F32 twin; original generic kernel remains the oracle. */
+__global__ static void qwen4exp_shared_gate_short_kernel(
+        float *gate_out,
+        const char *router,
+        const float *x,
+        uint32_t router_type,
+        uint32_t in_dim,
+        uint32_t n_tokens) {
+    /* PDL producer for the shared gate/up projection that follows on the
+     * stream.  Grid is n_tokens blocks -- one or two at the decode widths,
+     * fewer blocks than the device has SMs, so the launch is single-wave by
+     * construction.  Row-gated to the same <= 2 the converted launch site
+     * fires at: a prefill launch runs to a thousand blocks and never carries
+     * a trigger (the deadlock rule, ds4_cuda_qwen4exp.cuh). */
+    if (n_tokens <= 2u) QWEN4EXP_PDL_TRIGGER();
+    extern __shared__ float ds4_qwen4exp_smem[];
+    const uint32_t token = blockIdx.x;
+    if (token >= n_tokens) return;
+    const float *token_x = x + (uint64_t)token * in_dim;
+    /* One block per token, so a decode row is a single block walking a few
+     * thousand elements -- and with a runtime trip count it walked them one
+     * memory round trip at a time.  QWEN4EXP_SHARED_GATE_STEPS of them are
+     * asked for before any is used.  The products are the same, consumed in
+     * the same ascending order into the same accumulator; only the loads
+     * moved. */
+    const uint32_t nth = blockDim.x;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t steps = (in_dim > tid) ? ((in_dim - tid + nth - 1u) / nth) : 0u;
+    float acc = 0.0f;
+    uint32_t s = 0;
+    for (; s + QWEN4EXP_SHARED_GATE_STEPS <= steps;
+           s += QWEN4EXP_SHARED_GATE_STEPS) {
+        float wv[QWEN4EXP_SHARED_GATE_STEPS];
+        float xv[QWEN4EXP_SHARED_GATE_STEPS];
+#pragma unroll
+        for (uint32_t u = 0; u < QWEN4EXP_SHARED_GATE_STEPS; u++) {
+            const uint32_t k = tid + (s + u) * nth;
+            wv[u] = dev_qwen4exp_weight_value(
+                    (uint32_t)DS4_QWEN4EXP_TY_f32,
+                    router, k);
+            xv[u] = token_x[k];
+        }
+#pragma unroll
+        for (uint32_t u = 0; u < QWEN4EXP_SHARED_GATE_STEPS; u++) {
+            acc += wv[u] * xv[u];
+        }
+    }
+    for (; s < steps; s++) {
+        const uint32_t k = tid + s * nth;
+        acc += dev_qwen4exp_weight_value(
+                (uint32_t)DS4_QWEN4EXP_TY_f32,
+                router, k) * token_x[k];
+    }
+    /* Same 256-lane tree through stride32. Only thread0 consumes the final
+     * sum, so warp0 can retire strides16..1 without five CTA barriers. */
+    ds4_qwen4exp_smem[tid] = acc;
+    __syncthreads();
+    for (uint32_t stride = 128u; stride >= 32u; stride >>= 1u) {
+        if (tid < stride) ds4_qwen4exp_smem[tid] += ds4_qwen4exp_smem[tid + stride];
+        __syncthreads();
+    }
+    float total = 0.0f;
+    if (tid < 32u) {
+        total = ds4_qwen4exp_smem[tid];
+        for (uint32_t stride = 16u; stride > 0u; stride >>= 1u) {
+            const float other = __shfl_down_sync(0xffffffffu, total, stride);
+            if (tid < stride) total += other;
+        }
+    }
+    if (threadIdx.x == 0u) gate_out[token] = 1.0f / (1.0f + expf(-total));
+}
+
 
 
 /* Twin of ds4_gpu_qwen4exp_moe_type_supported in ds4_metal.m. */
@@ -8542,7 +8614,13 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
      * kilobytes, not megabytes, so it keeps the scalar reduction. Resolve its
      * checkpoint-wide F32 type at launch just as the Q8 projections below do;
      * other supported layouts retain the generic decoder. */
-    if (specialize_shared &&
+    if (specialize_shared && n_tokens >= 1u && n_tokens <= 2u &&
+        in_dim == 2560u && router_slab->type == (uint32_t)DS4_QWEN4EXP_TY_f32 &&
+        getenv("DS4_QWEN4EXP_NO_SHARED_GATE_WARP_TAIL") == NULL) {
+        qwen4exp_shared_gate_short_kernel<<<n_tokens, threads, shared, side>>>(
+            (float *)gate_scale->ptr, router, (const float *)x->ptr,
+            router_slab->type, in_dim, n_tokens);
+    } else if (specialize_shared &&
         router_slab->type == (uint32_t)DS4_QWEN4EXP_TY_f32) {
         qwen4exp_shared_gate_kernel<DS4_QWEN4EXP_TY_f32>
             <<<n_tokens, threads, shared, side>>>(
