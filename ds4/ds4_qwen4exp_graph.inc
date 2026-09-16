@@ -1987,6 +1987,29 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
         return false;
     }
     QW_MOE_TICK(QW_MOE_T_ROUTER);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    /* The graph captures this complete operation, including both expert
+     * paths. The local return code carries no device state across replays.
+     * Keep the separate calls for stage timing and unsupported shapes. */
+    if (!moe_timing && DS4_N_FF_EXP == DS4_N_FF_SHEXP) {
+        const ds4_gpu_qwen4exp_slab routed[3] = {
+            QW_SLAB(m, l->ffn_gate_exps), QW_SLAB(m, l->ffn_up_exps),
+            QW_SLAB(m, l->ffn_down_exps)
+        };
+        const ds4_gpu_qwen4exp_slab shared[4] = {
+            QW_SLAB(m, l->ffn_gate_inp_shexp), QW_SLAB(m, l->ffn_gate_shexp),
+            QW_SLAB(m, l->ffn_up_shexp), QW_SLAB(m, l->ffn_down_shexp)
+        };
+        const int rc = ds4_gpu_qwen4exp_moe_prelude_tensor(
+                s->block_out, s->moe_mid, s->moe_down_partial,
+                s->shexp_mid, s->shexp_gate, s->moe_selected, s->moe_weights,
+                s->moe_logits, s->mixed, routed, shared,
+                DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD,
+                DS4_N_EXPERT, DS4_N_EXPERT_USED, n_tokens,
+                DS4_N_EXPERT_USED * DS4_N_FF_EXP);
+        if (rc >= 0) return rc != 0;
+    }
+#endif
     if (!ds4_gpu_qwen4exp_router_select_tensor(s->moe_selected, s->moe_weights,
                                                s->moe_logits, DS4_N_EXPERT,
                                                DS4_N_EXPERT_USED, n_tokens)) {
