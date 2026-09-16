@@ -5243,6 +5243,9 @@ qwen4exp_moe_gateup_split_kernel(
     }
 }
 
+#include "ds4_cuda_gateup_async.cuh"
+#include "ds4_cuda_gateup_copy_tune.cuh"
+
 /* Grid (ceil(mid_dim / 8), n_expert).  The block owns one expert; the pair
  * list gives it the (token, slot) pairs that chose it, so a decoded group
  * serves R of them. */
@@ -8253,9 +8256,9 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             ((uintptr_t)gate & 15u) == 0u && ((uintptr_t)up & 15u) == 0u &&
             (gate_slab->expert_bytes & 15ull) == 0ull &&
             (up_slab->expert_bytes & 15ull) == 0ull;
-#define QWEN4EXP_SPLIT_GATEUP(V, P, C) \
+#define QWEN4EXP_SPLIT_GATEUP_K(K, V, P, C) \
         QWEN4EXP_LAUNCH_PDL( \
-            (qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P, C>), \
+            (K<2, DS4_QWEN4EXP_TY_q4_K, V, P, C>), \
             (dim3((mid_dim + P - 1u) / P, gu_rows, 1)), P * 64u, 0, stream, \
             (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum, \
             sc.pairs, sc.counts, sc.offsets, gu_active, \
@@ -8264,6 +8267,8 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             up_slab->expert_bytes, up_slab->row_bytes, \
             gate_slab->type, up_slab->type, xgroups, mid_dim, \
             mid_token_stride, n_expert_used)
+#define QWEN4EXP_SPLIT_GATEUP(V, P, C) \
+        QWEN4EXP_SPLIT_GATEUP_K(qwen4exp_moe_gateup_split_kernel, V, P, C)
         /* ONE OUTPUT ROW PER BLOCK on the vector schedule.  Four rows per
          * block was measured a full percent slower than two, so the barrier
          * is what costs: every warp in the block reads a different weight
@@ -8275,10 +8280,21 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
          * is zero for both warps, so each still walks its own row in the
          * same group order through the same warp_sum_f32 tree and every dot
          * is bit-identical.  mid_dim 640 gives 640 blocks. */
-        if (coop) { QWEN4EXP_SPLIT_GATEUP(true, QW_GU_COOP_ROWS, true); }
+        const bool measured_shape = n_tokens <= 2u && mid_dim == 640u &&
+            n_expert_used == 10u && n_total_expert == 512u &&
+            gate_slab->expert_bytes == 921600u && up_slab->expert_bytes == 921600u &&
+            logical_tier == 0 && g_n_gpus == 1 &&
+            qwen4exp_gateup_copy_device == g_gpu[0].device_id;
+        const bool async_copy = getenv("DS4_QWEN4EXP_NO_GATEUP_ASYNC_COPY") == NULL &&
+            ((measured_shape && qwen4exp_gateup_copy_prefer) ||
+             getenv("DS4_QWEN4EXP_FORCE_GATEUP_ASYNC_COPY") != NULL);
+        if (coop && async_copy) {
+            QWEN4EXP_SPLIT_GATEUP_K(qwen4exp_moe_gateup_async_kernel, true, QW_GU_COOP_ROWS, true);
+        } else if (coop) { QWEN4EXP_SPLIT_GATEUP(true, QW_GU_COOP_ROWS, true); }
         else if (vector) { QWEN4EXP_SPLIT_GATEUP(true, 1u, false); }
         else { QWEN4EXP_SPLIT_GATEUP(false, 4u, false); }
 #undef QWEN4EXP_SPLIT_GATEUP
+#undef QWEN4EXP_SPLIT_GATEUP_K
     }
     else if (tile == 8) { QWEN4EXP_GATEUP(8); }
     else if (tile == 4) { QWEN4EXP_GATEUP(4); }
