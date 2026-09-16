@@ -2879,7 +2879,7 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
             return qwen4exp_forward_fail();
         }
     }
-    if (!ds4_qwen4exp_matmul_q8_0(s->logits, QW_MAP(m, w->output),
+    if (!ds4_qwen4exp_matmul_q8_0_target(s->logits, QW_MAP(m, w->output),
                                     QW_MAPSZ(m, w->output), QW_OFF(w->output),
                                     DS4_N_EMBD, cfg->n_vocab,
                                     logit_rows == 1u ? s->embed_rows : s->mixed,
@@ -3514,7 +3514,7 @@ bool ds4_qwen4exp_graph_head_logits(ds4_qwen4exp_session       *s,
     }
     if (!ds4_gpu_tensor_copy(s->embed_rows, 0, s->mixed, 0,
                              (uint64_t)DS4_N_EMBD * sizeof(float)) ||
-        !ds4_qwen4exp_matmul_q8_0(s->logits, QW_MAP(m, w->output),
+        !ds4_qwen4exp_matmul_q8_0_target(s->logits, QW_MAP(m, w->output),
                                     QW_MAPSZ(m, w->output), QW_OFF(w->output),
                                     DS4_N_EMBD, cfg->n_vocab, s->embed_rows, 1u)) {
         fprintf(stderr, "ds4: qwen4exp LM head failed on the head row\n");
