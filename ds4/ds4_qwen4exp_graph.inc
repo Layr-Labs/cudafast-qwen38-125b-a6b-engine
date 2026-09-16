@@ -1106,7 +1106,10 @@ static void *qw_ple_gather_worker(void *arg) {
     return NULL;
 }
 
-#define QW_PLE_MAX_THREADS 16
+/* Sized like the page-warm pool: the gather's thread count is derived from the
+ * online CPU count below, and pinning the bound at 16 left a 20-core host using
+ * 16 of its cores for a 10.5 MB dequant that runs with the GPU idle. */
+#define QW_PLE_MAX_THREADS 32
 
 typedef struct {
     pthread_mutex_t   mutex;
@@ -1308,7 +1311,7 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
             }
             if (v <= 0) {
                 v = sysconf(_SC_NPROCESSORS_ONLN);
-                if (v > 16) v = 16;
+                if (v > QW_PLE_MAX_THREADS) v = QW_PLE_MAX_THREADS;
                 if (v < 1) v = 1;
             }
             ple_gather_threads_cached = v;
