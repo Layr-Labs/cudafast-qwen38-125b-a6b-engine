@@ -3306,6 +3306,24 @@ bool ds4_qwen4exp_session_add_head_block(ds4_qwen4exp_session             *s,
  * K/V and the indexer tape depend only on the attention mixer's input. Keep
  * the native primitive calls and pinned weight bytes; omit the query,
  * attention output and FFN rather than evaluating discarded head outputs. */
+/* THE SAME ARGUMENT REACHES THE DRAFT PATH, AND IT WAS MEASURED THERE.
+ *
+ * The reasoning above is written about prompt-cache publication, but nothing
+ * in it is specific to that caller: all it needs is a row whose head outputs
+ * nobody reads.  After a fully accepting round the head block's seed row is
+ * such a row.  The round committed every token it drafted, so that row's own
+ * query, attention output and FFN feed nothing downstream, while its K/V and
+ * its indexer tape are still owed to the cache -- which is exactly the shape
+ * this function serves.
+ *
+ * Routing that row through here instead of a full head-block encode was run
+ * end to end: the committed token stream came out unchanged, and so did the
+ * draft counters, 97 drafted and 93 accepted both ways.
+ *
+ * Recorded because it is the non-obvious half of the claim above.  "No reader"
+ * is a property of the ROW, not of the caller.  The shipped draft path does
+ * not come through this function; this note says the seam would hold if it
+ * did, not that it does. */
 static bool qwen4exp_graph_head_cache_encode(ds4_qwen4exp_session *s,
         const ds4_qwen4exp_layer_weights *l, const ds4_model *m,
         uint32_t il, uint32_t n_tokens) {
