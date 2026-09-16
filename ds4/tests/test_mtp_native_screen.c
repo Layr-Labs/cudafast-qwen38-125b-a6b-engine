@@ -32,18 +32,20 @@ static int compare_key_paths(ds4_gpu_tensor *out,ds4_gpu_tensor *ids,
     uint64_t ko=aligned(ki+(uint64_t)WIDTH*8u);
     uint64_t it=aligned(ko+(uint64_t)WIDTH*8u);
     uint64_t flag_at=aligned(it+(uint64_t)CAP*4u);
-    uint64_t *keys[2]={malloc(WIDTH*8u),malloc(WIDTH*8u)};
-    uint32_t *selected_ids[2]={malloc(CAP*4u),malloc(CAP*4u)};
-    float *values[2]={malloc(CAP*4u),malloc(CAP*4u)};
+    uint64_t *keys[3]={malloc(WIDTH*8u),malloc(WIDTH*8u),malloc(WIDTH*8u)};
+    uint32_t *selected_ids[3]={malloc(CAP*4u),malloc(CAP*4u),malloc(CAP*4u)};
+    float *values[3]={malloc(CAP*4u),malloc(CAP*4u),malloc(CAP*4u)};
     unsigned char *score_canary=malloc(WIDTH*4u),*score_after=malloc(WIDTH*4u);
     need(score_canary&&score_after,"score witness allocation");
     memset(score_canary,0xa5,WIDTH*4u);
-    float before[DIM],after[DIM];uint32_t flags[2];int status[2];
-    need(keys[0]&&keys[1]&&selected_ids[0]&&selected_ids[1]&&values[0]&&values[1],"AB host allocation");
+    float before[DIM],after[DIM];uint32_t flags[3];int status[3];
+    need(keys[0]&&keys[1]&&selected_ids[0]&&selected_ids[1]&&values[0]&&values[1]&&keys[2]&&selected_ids[2]&&values[2],"AB host allocation");
     need(ds4_gpu_tensor_read(x,0,before,sizeof before),"AB input before");
-    for(unsigned mode=0;mode<2;mode++) {
+    for(unsigned mode=0;mode<3;mode++) {
         if(mode==0)setenv("DS4_MTP_NO_FUSED_SCREEN_KEYS","1",1);
         else unsetenv("DS4_MTP_NO_FUSED_SCREEN_KEYS");
+        if(mode==1)setenv("DS4_MTP_NO_WARP_SCREEN","1",1);
+        else unsetenv("DS4_MTP_NO_WARP_SCREEN");
         memset(values[mode],0x5a,CAP*4u);memset(selected_ids[mode],0xa5,CAP*4u);
         need(ds4_gpu_tensor_write(out,0,values[mode],CAP*4u)&&ds4_gpu_tensor_write(ids,0,selected_ids[mode],CAP*4u),"AB canary init");
         need(ds4_gpu_tensor_write(scratch,scores_at,score_canary,WIDTH*4u),"score witness init");
@@ -55,10 +57,12 @@ static int compare_key_paths(ds4_gpu_tensor *out,ds4_gpu_tensor *ids,
         need(ds4_gpu_tensor_read(out,0,values[mode],CAP*4u)&&ds4_gpu_tensor_read(ids,0,selected_ids[mode],CAP*4u),"AB outputs");
         need(ds4_gpu_tensor_read(x,0,after,sizeof after)&&!memcmp(before,after,sizeof before),"AB input unchanged");
     }
-    need(status[0]==status[1]&&flags[0]==flags[1],"AB status/flag parity");
-    need(!memcmp(keys[0],keys[1],WIDTH*8u),"AB raw key parity");
-    need(!memcmp(values[0],values[1],CAP*4u)&&!memcmp(selected_ids[0],selected_ids[1],CAP*4u),"AB IDs/refinement or fallback canary parity");
-    int result=status[1];for(unsigned i=0;i<2;i++){free(keys[i]);free(selected_ids[i]);free(values[i]);}
+    for(unsigned compare=1;compare<3;compare++) {
+    need(status[0]==status[compare]&&flags[0]==flags[compare],"AB status/flag parity");
+    need(!memcmp(keys[0],keys[compare],WIDTH*8u),"AB raw key parity");
+    need(!memcmp(values[0],values[compare],CAP*4u)&&!memcmp(selected_ids[0],selected_ids[compare],CAP*4u),"AB IDs/refinement or fallback canary parity");
+    }
+    int result=status[2];for(unsigned i=0;i<3;i++){free(keys[i]);free(selected_ids[i]);free(values[i]);}
     free(score_canary);free(score_after);return result;
 }
 static void run_case(int adversarial, uint32_t offset) {
