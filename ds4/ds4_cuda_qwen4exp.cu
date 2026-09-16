@@ -2512,7 +2512,7 @@ __global__ static void qwen4exp_quantize_rows_kernel(
      * the bound and never triggers (the deadlock rule,
      * ds4_cuda_qwen4exp.cuh).  The gate reads the grid in the body, not a
      * convention at the launch sites, per the header's rule. */
-    if (gridDim.y <= 2u &&
+    if (gridDim.y <= 32u &&
         (uint64_t)gridDim.x * (uint64_t)gridDim.y <= 768u)
         QWEN4EXP_PDL_TRIGGER();
     const uint32_t g = blockIdx.x;
@@ -5108,6 +5108,13 @@ __global__ static void qwen4exp_moe_down_q_kernel(
         qw_fill_step(0u, 0u, spanel);
         if (Async) qw_cpasync_commit();
     }
+    /* Everything above reads weights and routing only.  The down slab is
+     * addressed from `selected`/`route`, which the router wrote several
+     * launches back and which is therefore complete; the first panel's copies
+     * are in flight by the time control reaches here.  `mq`, `ms` and `msum`
+     * are the immediate predecessor's output and every read of them is below
+     * this fence, in the slot loop.  Nothing above the fence touches them. */
+    QWEN4EXP_PDL_SYNC();
     for (uint32_t slot = 0; slot < n_expert_used; slot++) {
 #pragma unroll
         for (int r = 0; r < R; r++) {
@@ -7827,15 +7834,18 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     const dim3 dn_grid((out_dim + 7u) / 8u,
                        (n_tokens + (uint32_t)tile - 1u) / (uint32_t)tile, 1);
 #define QWEN4EXP_DOWN_IMPL_S(R, DT, V, S, SH) \
-    qwen4exp_moe_down_q_kernel<R, DT, V, S><<<dn_grid, threads, (SH), stream>>>( \
+    QWEN4EXP_LAUNCH_PDL( \
+            (qwen4exp_moe_down_q_kernel<R, DT, V, S>), \
+            dn_grid, threads, (SH), stream, \
             (float *)out->ptr, down, (const int32_t *)selected->ptr, \
             sc.mq, sc.ms, sc.msum, \
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
             mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
 #define QWEN4EXP_DOWN_IMPL(R, DT, V) QWEN4EXP_DOWN_IMPL_S(R, DT, V, false, 0)
 #define QWEN4EXP_DOWN_ASYNC(DT) \
-    qwen4exp_moe_down_q_kernel<2, DT, true, true, true><<< \
-            dn_grid, threads, (size_t)dn_shared, stream>>>( \
+    QWEN4EXP_LAUNCH_PDL( \
+            (qwen4exp_moe_down_q_kernel<2, DT, true, true, true>), \
+            dn_grid, threads, (size_t)dn_shared, stream, \
             (float *)out->ptr, down, (const int32_t *)selected->ptr, \
             sc.mq, sc.ms, sc.msum, \
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
