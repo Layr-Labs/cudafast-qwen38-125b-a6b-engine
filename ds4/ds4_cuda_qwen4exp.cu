@@ -10850,6 +10850,16 @@ static int qwen4exp_hc_up_mix_pipe_launch(
 }
 
 /* The stream count the up+mix tile is instantiated for. */
+/* Which makes it a GATE, not a width.  The launcher does not build a tile of
+ * QWEN4EXP_HC_UP_MIX_NT streams out of whatever this says; it asks
+ * `n_hc == QWEN4EXP_HC_UP_MIX_NT` and resolves `upw` -- the up weights the
+ * tile reads -- only when the answer is yes.  n_hc is the model's four
+ * hyper-connection streams and does not move, so any other value here makes
+ * that test false, leaves `upw` NULL, and takes the unfused chain instead.
+ *
+ * Changing this number is therefore not a way to tune the up+mix tile.  It is
+ * the way to switch the tile off, and the arm it was meant to tune is the
+ * first thing that stops running. */
 #define QWEN4EXP_HC_UP_MIX_NT 4
 
 /* A/B valve for the two kernels above; the fused chain without them is the
