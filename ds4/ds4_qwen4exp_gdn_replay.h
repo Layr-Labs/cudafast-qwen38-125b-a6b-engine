@@ -7,7 +7,16 @@
 #define DS4_QWEN4EXP_GDN_REPLAY_ROWS 2u
 
 /* Host transition policy, independent of CUDA. A replay verify leaves a
- * virtual row-zero snapshot: checkpoint + its bounded transition log. */
+ * virtual row-zero snapshot: checkpoint + its bounded transition log.
+ *
+ * Why this exists, recorded because it took this campaign twenty-five rounds to
+ * find: the scored decode leg of the ranked run is the only leg that reaches
+ * `width == 2u` with `snapshots == 1u`, so it is the only leg this replay
+ * applies to. Upstream merged that work as one of five accepted submissions,
+ * and an engine frozen on an earlier commit cannot discover it by reading --
+ * only by fetching. The policy returns to the eager path with `active == false`
+ * wherever the shapes do not match; nothing here is a heuristic. */
+
 typedef struct {
     bool active;
     bool settle;
