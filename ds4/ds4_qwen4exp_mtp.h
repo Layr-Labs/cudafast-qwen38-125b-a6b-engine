@@ -718,6 +718,16 @@ typedef struct {
                       const ds4_gpu_tensor *, uint32_t, uint32_t);
     ds4_qwen4exp_block_forward_fn block;
     ds4_qwen4exp_block_forward_fn cache_seed; /* optional cache-only hook */
+    /* Optional backend fusion: two independent, ungrouped norms. */
+    int (*rms_norm_pair)(ds4_gpu_tensor *, const ds4_gpu_tensor *,
+                         ds4_gpu_tensor *, const ds4_gpu_tensor *,
+                         const void *, uint64_t, uint64_t, uint64_t,
+                         uint32_t, uint32_t, uint32_t, float, float, int);
+    /* Optional fixed-geometry producer of the final eh_proj input layout. */
+    int (*norm_ehx_pack)(ds4_gpu_tensor *, const ds4_gpu_tensor *,
+                         const ds4_gpu_tensor *, const void *, uint64_t,
+                         uint64_t, uint64_t, uint32_t, uint32_t, uint32_t,
+                         float, float, int);
 } ds4_qwen4exp_mtp_gpu_hooks;
 
 /* One output row of a Q8_0 weight as it lies in the mapping: ceil(in_dim / 32)

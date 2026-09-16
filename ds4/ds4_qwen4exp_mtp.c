@@ -1160,7 +1160,25 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                             h->n_vocab, n_tokens, n_embd, 1u) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_EMBED);
-    if (ok) {
+    const bool packed_norm = h->hooks.norm_ehx_pack != NULL && !timing &&
+                             n_embd == 2560u && n_hc == 4u && n_tokens <= 2u;
+    const bool paired_norm = !packed_norm && h->hooks.rms_norm_pair != NULL && !timing;
+    if (ok && packed_norm) {
+        stage = "direct norm/eh_proj layout";
+        ok = h->hooks.norm_ehx_pack(
+                h->t_ehx, h->t_embed_out, h->t_hyper,
+                h->head_map, h->head_size, h->enorm_offset, h->hnorm_offset,
+                n_embd, n_hc, n_tokens, h->rms_eps, h->weight_bias, h->round_bf16) != 0;
+    }
+    if (ok && paired_norm) {
+        stage = "paired enorm/hnorm";
+        ok = h->hooks.rms_norm_pair(
+                h->t_e_normed, h->t_embed_out, h->t_h_normed, h->t_hyper,
+                h->head_map, h->head_size, h->enorm_offset, h->hnorm_offset,
+                n_embd, (uint32_t)hc_dim, n_tokens,
+                h->rms_eps, h->weight_bias, h->round_bf16) != 0;
+    }
+    if (ok && !paired_norm && !packed_norm) {
         stage = "enorm";
         ok = h->hooks.rms_norm(h->t_e_normed, h->t_embed_out,
                                h->head_map, h->head_size, h->enorm_offset,
@@ -1170,7 +1188,7 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
     MTP_HEAD_TICK(MTP_HEAD_T_ENORM);
     /* h = fc_hidden(hnorm(multi)).  hnorm is UNGROUPED: one statistic over the
      * whole n_hc * n_embd row, unlike every hyper-connection norm. */
-    if (ok) {
+    if (ok && !paired_norm && !packed_norm) {
         stage = "hnorm";
         ok = h->hooks.rms_norm(h->t_h_normed, h->t_hyper,
                                h->head_map, h->head_size, h->hnorm_offset,
@@ -1181,7 +1199,7 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
     /* One matmul does the broadcast-and-add: eh_proj is [fc_embedding;
      * fc_hidden] stacked, so row (t, s) = [e_normed(t) | h_normed(t, s)]
      * against it yields fc_embedding(e) + fc_hidden(h_s) for every stream. */
-    if (ok) {
+    if (ok && !packed_norm) {
         stage = "eh_proj rows";
         if (h->hooks.ehx_pack) {
             ok = h->hooks.ehx_pack(h->t_ehx, h->t_e_normed, h->t_h_normed,
@@ -1227,7 +1245,7 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
             stage, pos0, n_tokens);
         return 0;
     }
-    /* t_h_normed's previous contents were consumed by eh_proj.  Reuse it for
+    /* t_h_normed's old contents are consumed or bypassed by eh_proj. Reuse it for
      * the final hyper row so the stateless tail needs neither tensor views
      * nor an extra allocation.  Keep t_hyper intact for multi_out. */
     if (ok && narrow_logits) {
