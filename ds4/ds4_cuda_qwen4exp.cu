@@ -531,7 +531,7 @@ __global__ static void qwen4exp_gdn_conv_parallel_kernel(
  * reference: one block owns one (row, value head, four value rows), one warp
  * owns one value row, and each lane owns four adjacent key columns.
  */
-template <bool PRECOMPUTED_GATES>
+template <bool PRECOMPUTED_GATES, bool SHARE_BLOCK_GATE = false>
 __global__ static void qwen4exp_gdn_recurrence_kernel(
         float       *__restrict__ out,
         float       *__restrict__ state,
@@ -587,6 +587,7 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
      * Twin of that kernel -- keep the two expressions identical. */
     const float decay_coeff = a_log[head];
     const float bias = dt_bias[head];
+    __shared__ float2 block_gate;
 
     for (uint32_t token = 0; token < n_tokens; token++) {
         const uint64_t slot = (uint64_t)row * n_tokens + token;
@@ -598,7 +599,21 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
         const uint64_t gate = slot * n_value_head + head;
         float g = 0.0f;
         float beta = 0.0f;
-        if (PRECOMPUTED_GATES) {
+        if (SHARE_BLOCK_GATE) {
+            /* Decode has four value-row warps per head block.  They all use
+             * the same token/head pair; publish it once at CTA scope.  This
+             * specialization is only dispatched for the target 16/48,
+             * one-token shape, so every thread reaches this barrier. */
+            if (threadIdx.x == 0u) {
+                block_gate = make_float2(
+                    expf(decay_coeff *
+                        qwen4exp_gdn_softplus(raw_alpha[gate] + bias)),
+                    qwen4exp_gdn_sigmoid(raw_beta[gate]));
+            }
+            __syncthreads();
+            g = block_gate.x;
+            beta = block_gate.y;
+        } else if (PRECOMPUTED_GATES) {
             const float2 pair = gate_pairs[gate];
             g = pair.x;
             beta = pair.y;
@@ -1617,6 +1632,25 @@ static int qwen4exp_cuda_gdn_run(
                     getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u,
                     NULL);
         }
+    } else if (n_key_head == 16u && n_value_head == 48u &&
+               n_rows == 1u && n_tokens == 1u && n_snapshot_rows == 0u &&
+               adopt_row == NULL &&
+               getenv("DS4_QWEN4EXP_NO_GDN_BLOCK_GATE_SHARE") == NULL) {
+        /* Ordinary target decode: one CTA owns four value rows, so share the
+         * identical alpha/beta pair across its four warps.  Replay, prefill,
+         * snapshots, adoption, and non-target shapes retain the old kernel. */
+        qwen4exp_gdn_recurrence_kernel<false, true><<<
+                recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
+                (float *)out->ptr, (float *)recurrent_state->ptr,
+                (const float *)qkv->ptr,
+                (const float *)raw_alpha->ptr,
+                (const float *)raw_beta->ptr, a_log, dt_bias,
+                NULL,
+                state_snapshot ? (float *)state_snapshot->ptr : NULL,
+                n_key_head, n_value_head, n_rows, n_tokens, head_layout,
+                n_snapshot_rows,
+                getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u,
+                adopt_row);
     } else {
         qwen4exp_gdn_recurrence_kernel<false><<<
                 recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
