@@ -587,9 +587,11 @@ int main(void) {
      * hello echoes, so they reach the run's metrics.  Shared memory per SM and
      * peak DRAM bandwidth decide whether a decode kernel is occupancy-capped
      * or bandwidth-capped, and neither is observable on a box whose profiler
-     * refuses to attach.  This is a pure read of device properties, done once
-     * HERE -- after the one load, before the socket binds -- so no timed phase
-     * can see it.  On failure the string is empty and the identity is exactly
+     * refuses to attach. CUDA also performs bounded synthetic integer-sort
+     * autotuning here, after the one load and before the socket binds. No
+     * request or model forward participates in that startup selection. Its
+     * paired timings and choice accompany the hardware limits. On a backend
+     * with no limits string the identity is exactly
      * what it was, which keeps the `ds4-resident load_epoch=` prefix and the
      * ident that benchd seals unchanged for a non-CUDA build. */
     char ident_buf[768];

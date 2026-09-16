@@ -17402,13 +17402,14 @@ extern "C" void ds4_gpu_set_q8_mma_pipe_wide(int mode) {
  * per-SM shared memory size, so 101376 means a 100 KiB SM and 227328 means a
  * 228 KiB SM -- which is exactly the fork every occupancy argument about the
  * staged decode kernels turns on. */
+static const char *mtp_native_id_sort_tune(void);
 extern "C" const char *ds4_gpu_hw_limits(void) {
     /* Sized for the device attributes plus the routed-MoE kernel-limits string,
      * which now carries the two prefill tiles as well.  Oversized on purpose:
      * ds4_resident drops the WHOLE limits string rather than truncating it if it
      * does not fit its own ident buffer, so a tight fit here loses the
      * measurement silently. */
-    static char buf[448];
+    static char buf[512];
     static int built = 0;
     if (built) return buf;
     built = 1;
@@ -17438,12 +17439,18 @@ extern "C" const char *ds4_gpu_hw_limits(void) {
                      "smem/blk_optin=%d sm=%d cc=%d.%d integrated=%d coop=%d",
                      got[0], got[1], got[2], got[3], got[4], got[5]);
     if (n < 0) { buf[0] = '\0'; return buf; }
+    /* Keep the decision intact even if unusually wide diagnostic fields
+     * force the trailing kernel-limit text to truncate. */
+    const char *tune = mtp_native_id_sort_tune();
+    if (tune && tune[0] && (size_t)n + 2u < sizeof(buf))
+        snprintf(buf+n,sizeof(buf)-(size_t)n," %s",tune);
     /* The register/shared footprint of the two routed-MoE decode kernels, from
      * the translation unit that owns them.  Truncation is harmless: the string
      * is diagnostic only and snprintf keeps it terminated. */
     const char *kl = ds4_gpu_qwen4exp_kernel_limits();
-    if (kl && kl[0] && (size_t)n + 2u < sizeof(buf)) {
-        snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", kl);
+    const size_t used = strlen(buf);
+    if (kl && kl[0] && used + 2u < sizeof(buf)) {
+        snprintf(buf+used,sizeof(buf)-used," %s",kl);
     }
     return buf;
 }
