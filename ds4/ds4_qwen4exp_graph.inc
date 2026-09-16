@@ -1257,21 +1257,30 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
             }
         }
         for (uint32_t t = 0; t < n_tokens; t++) {
+            /* The head's destination strides are constants of the shape, so
+             * the token base is hoisted out of the head loop and the head
+             * offset is carried as a pointer step instead of a multiply per
+             * head.  Same addresses, same values. */
+            const uint64_t *ids = s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD;
+            float *dst = s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD;
             for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
-                const uint64_t row =
-                    s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h];
+                const uint64_t row = ids[h];
+                /* Every head of this token except the last is followed by
+                 * another table row, so ask for the next id early.  Hint. */
+                if (h + 1u < DS4_N_PLE_HEAD)
+                    __builtin_prefetch(ids + h + 1u, 0, 1);
                 const uint8_t *quant = ds4_qwen4exp_ple_row(&w->ple, row);
-                if (!quant) {
+                /* Cold: a hashed row past the table is a hard refusal that has
+                 * never fired in a scored run, so keep it out of the hot path. */
+                if (__builtin_expect(!quant, 0)) {
                     fprintf(stderr,
                             "ds4: qwen4exp block %u hashed token %u head %u to row "
                             "%" PRIu64 ", past the %" PRIu64 " the table holds\n",
                             il, t, h, row, w->ple.rows);
                     return false;
                 }
-                ds4_ple_dequant_iq4_nl(
-                    quant, blocks_per_row,
-                    s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD +
-                        (uint64_t)h * DS4_N_PLE_ROW_DIM);
+                ds4_ple_dequant_iq4_nl(quant, blocks_per_row, dst);
+                dst += DS4_N_PLE_ROW_DIM;
             }
         }
     } else {
