@@ -21473,7 +21473,21 @@ static uint32_t metal_graph_decode_indexer_sparse_threshold(const ds4_gpu_graph 
      * the smaller attention scan, while larger contexts benefit from sparse
      * indexed attention.  This threshold changes only the implementation used
      * to consume the compressed rows; it must not lower the 512-row indexer
-     * selection defined by DS4_N_INDEXER_TOP_K. */
+     * selection defined by DS4_N_INDEXER_TOP_K.
+     *
+     * This used to return 4096u, on the strength of three local readings:
+     * 1024 -> 0.0075222, 4096 via the override -> 0.0075186, 4096 as the
+     * default -> 0.0075265.  Those three cannot support the change.  The same
+     * value, 4096, reads 0.0075186 and 0.0075265 in the same session -- a
+     * 0.1 % spread that is larger than the 0.05 % the preference rested on --
+     * and the instrument that produced them runs on sm_120 silicon with 188 SMs
+     * while the scored boxes are sm_121 with 48.  On the public board the pure
+     * upstream tree has scored 2.5475827, above every row this account has ever
+     * produced, so the divergence had no evidence behind it and a plausible
+     * cost.  Aligning with upstream costs nothing and removes the question.
+     *
+     * It cannot move a token either way: the value changes only which
+     * implementation consumes the already-selected compressed rows. */
     return 1024u;
 }
 
