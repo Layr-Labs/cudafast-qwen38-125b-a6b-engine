@@ -3395,7 +3395,7 @@ __global__ static void qwen4exp_moe_pair_tasks_kernel(
  * expert thread scans the short pair list, the block performs the same integer
  * prefix scans as the wide path, and each expert writes its pairs in ascending
  * pair order. */
-__global__ static void qwen4exp_moe_group_small_kernel(
+__device__ __forceinline__ static void qwen4exp_moe_group_small_block(
         int32_t *counts,
         int32_t *offsets,
         int32_t *cursor,
@@ -3504,6 +3504,87 @@ __global__ static void qwen4exp_moe_group_small_kernel(
             for (uint32_t row = 0; row < mid_dim; row++) dst[row] = 0.0f;
         }
     }
+}
+
+/* Build one within-call replacement plan for all routed-down output blocks.
+ * Lane p holds the expert of flat (slot, token) step p. Panel lanes own the
+ * resident tags; their next-use position chooses the furthest future victim.
+ * A miss may never overwrite the preceding step's panel: its compute overlaps
+ * our async fill. Invalid ids leave that protected panel unchanged.
+ * All 32 lanes execute every warp intrinsic with the same full mask. */
+#define QW_DOWN_REUSE_PANELS 6u
+template <unsigned Panels>
+__device__ __forceinline__ static void qwen4exp_down_reuse_plan(
+        int32_t *plan, const int32_t *selected, uint32_t n_expert) {
+    static_assert(Panels >= 2u && Panels <= 6u, "bounded panel plan");
+    const uint32_t lane = threadIdx.x & 31u;
+    const int32_t route = lane < 20u
+        ? selected[(lane & 1u) * 10u + (lane >> 1u)] : -1;
+    const uint32_t matches = __match_any_sync(0xffffffffu, route) & 0xfffffu;
+    int32_t tag = -1;
+    uint32_t next_use = 20u, previous_panel = Panels;
+    for (uint32_t step = 0; step < 20u; step++) {
+        const int32_t expert = __shfl_sync(0xffffffffu, route, step);
+        const uint32_t mask = __shfl_sync(0xffffffffu, matches, step);
+        const uint32_t future = mask & (0xfffffu << (step + 1u));
+        const uint32_t use = future ? (uint32_t)(__ffs(future) - 1) : 20u;
+        const bool valid = expert >= 0 && (uint32_t)expert < n_expert;
+        const uint32_t hits = __ballot_sync(0xffffffffu,
+            lane < Panels && valid && tag == expert);
+        /* A dead or empty panel has next_use=20 and wins over every live
+         * panel. Tie-breaking is deterministic; the current panel scores 0. */
+        const uint32_t priority = lane < Panels && lane != previous_panel
+            ? (next_use * 8u + lane + 1u) : 0u;
+        const uint32_t victim = (__reduce_max_sync(0xffffffffu, priority) - 1u)
+            & 7u;
+        const uint32_t panel = hits ? (uint32_t)(__ffs(hits) - 1) : victim;
+        if (valid && lane == panel) { tag = expert; next_use = use; }
+        if (lane == 0u) {
+            plan[2u * step] = expert;
+            plan[2u * step + 1u] = valid
+                ? (int32_t)(panel | 16u | (hits ? 0u : 8u)) : 0;
+        }
+        if (valid) previous_panel = panel;
+    }
+}
+
+__global__ static void qwen4exp_moe_group_small_kernel(
+        int32_t *counts,
+        int32_t *offsets,
+        int32_t *cursor,
+        int32_t *active,
+        int32_t *pairs,
+        float *mid,
+        const int32_t *selected,
+        uint32_t n_expert,
+        uint32_t n_pairs,
+        uint32_t n_expert_used,
+        uint32_t mid_dim,
+        uint32_t mid_token_stride) {
+    qwen4exp_moe_group_small_block(counts, offsets, cursor, active, pairs, mid, selected, n_expert,
+        n_pairs, n_expert_used, mid_dim, mid_token_stride);
+}
+
+__global__ static void qwen4exp_moe_group_plan_kernel(
+        int32_t *counts,
+        int32_t *offsets,
+        int32_t *cursor,
+        int32_t *active,
+        int32_t *pairs,
+        float *mid,
+        const int32_t *selected,
+        uint32_t n_expert,
+        uint32_t n_pairs,
+        uint32_t n_expert_used,
+        uint32_t mid_dim,
+        uint32_t mid_token_stride) {
+    qwen4exp_moe_group_small_block(counts, offsets, cursor, active, pairs, mid, selected, n_expert,
+        n_pairs, n_expert_used, mid_dim, mid_token_stride);
+    /* The small path has finished writing cursor. It is not consumed by the
+     * gate/up kernels: counts, offsets, active and pairs retain their values.
+     * The launcher requires n_expert>=40, making this reused span in bounds. */
+    __syncthreads();
+    if (threadIdx.x < 32u) qwen4exp_down_reuse_plan<QW_DOWN_REUSE_PANELS>(cursor, selected, n_expert);
 }
 
 __global__ static void qwen4exp_moe_group_scatter_kernel(
@@ -5617,6 +5698,107 @@ __global__ static void qwen4exp_moe_down_q_kernel(
         if (lane == 0u && (uint32_t)r < take) {
             out[(uint64_t)(tok0 + (uint32_t)r) * out_dim + row] = tot;
         }
+    }
+}
+
+/* Full-shape validation supplements the existing vector/async/alignment gates. */
+static bool qwen4exp_down_panel_reuse(uint32_t groups, uint32_t out_dim,
+        uint32_t n_tokens, uint32_t used, uint32_t type,
+        uint64_t row_bytes, uint64_t expert_bytes) {
+    return groups == 20u && out_dim == 2560u && n_tokens == 2u && used == 10u &&
+        type == DS4_QWEN4EXP_TY_q5_1 && row_bytes == 480u &&
+        expert_bytes == 1228800u &&
+        getenv("DS4_QWEN4EXP_NO_DOWN_PANEL_REUSE") == NULL;
+}
+
+/* The producer reuses exactly forty cursor words. Keep that capacity and the
+ * producer/consumer eligibility together; either valve restores both kernels. */
+static bool qwen4exp_down_plan_enabled(bool small_group, bool vector,
+        uint32_t n_expert, uintptr_t mq, uintptr_t down, uint32_t groups,
+        uint32_t out_dim, uint32_t n_tokens, uint32_t used, uint32_t type,
+        uint64_t row_bytes, uint64_t expert_bytes) {
+    return small_group && vector && n_expert >= 40u && n_expert <= 512u &&
+        ((mq | down) & 15u) == 0u &&
+        qwen4exp_down_panel_reuse(groups, out_dim, n_tokens, used,
+                                  type, row_bytes, expert_bytes) &&
+        getenv("DS4_QWEN4EXP_NO_DOWN_PANEL") == NULL &&
+        getenv("DS4_QWEN4EXP_NO_DOWN_ASYNC") == NULL;
+}
+
+/* Six panels are the largest whole Q5 eight-row panel set that fits four
+ * blocks on GB10: 6*3840+1024=24064 bytes/block, 96256 bytes/four blocks.
+ * The 56-register/256-thread consumer is already limited to four blocks by
+ * registers. A seventh panel would lower shared-memory residency to three.
+ * No weight survives the invocation or changes representation.
+ *
+ * Execute the immutable per-call plan. The same eight warps consume verbatim
+ * panels in original slot/token order. No tag lookup or victim search remains
+ * in the weight/dot loop. Plan production is ordered by the ordinary stream
+ * edge, and capture re-executes the producer on each invocation. */
+template <unsigned Panels>
+__global__ static void qwen4exp_moe_down_reuse_kernel(
+        float *out, const char *down, const int32_t *plan,
+        const int8_t *mq, const float *ms, const int32_t *msum) {
+    static_assert(Panels >= 2u && Panels <= 6u, "bounded shared panel set");
+    extern __shared__ uint4 qw_down_panel[];
+    char *const spanel = (char *)qw_down_panel;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t row0 = blockIdx.x * 8u;
+    const uint32_t row = row0 + (threadIdx.x >> 5u);
+    if (row >= 2560u) return;
+    constexpr uint32_t groups = 20u, row_bytes = 480u, panel_bytes = 3840u;
+    constexpr uint64_t expert_bytes = 2560ull * row_bytes;
+    auto fill = [&](int32_t e, uint32_t panel) {
+        const uint32_t o = threadIdx.x * 16u;
+        if (o < panel_bytes) {
+            const char *const src = down + (uint64_t)(uint32_t)e * expert_bytes +
+                                    (uint64_t)row0 * row_bytes + o;
+            qw_cpasync16((uint32_t)__cvta_generic_to_shared(
+                spanel + panel * panel_bytes + o), src);
+        }
+    };
+    /* Each warp loads the twenty entries once, coalesced. Registers carry
+     * the immutable schedule; the dot loop only broadcasts the next entry. */
+    const int32_t route = lane < 20u ? plan[2u * lane] : -1;
+    const uint32_t meta = lane < 20u ? (uint32_t)plan[2u * lane + 1u] : 0u;
+    uint32_t current_meta = __shfl_sync(0xffffffffu, meta, 0);
+    int32_t current_expert = __shfl_sync(0xffffffffu, route, 0);
+    if (current_meta & 8u) fill(current_expert, current_meta & 7u);
+    qw_cpasync_commit();
+    float acc[2] = {0.0f, 0.0f};
+    for (uint32_t slot = 0; slot < 10u; slot++) {
+#pragma unroll
+        for (unsigned r = 0; r < 2u; r++) {
+            qw_cpasync_wait0();
+            __syncthreads();
+            const uint32_t next = slot * 2u + r + 1u;
+            uint32_t next_meta = 0u;
+            int32_t next_expert = -1;
+            if (next < 20u) {
+                next_expert = __shfl_sync(0xffffffffu, route, next);
+                next_meta = __shfl_sync(0xffffffffu, meta, next);
+                if (next_meta & 8u) fill(next_expert, next_meta & 7u);
+                /* A hit/invalid step commits an empty group. */
+                qw_cpasync_commit();
+            }
+            if ((current_meta & 16u) && lane < groups) {
+                const char *const drow = spanel + (current_meta & 7u) * panel_bytes +
+                                       (row - row0) * row_bytes;
+                int8_t wq[32]; float wa[2], wb[2]; int halves = 1;
+                dev_qwen4exp_group_decode(DS4_QWEN4EXP_TY_q5_1,
+                                          drow, lane, wq, wa, wb, &halves);
+                const uint64_t at_g = ((uint64_t)r * 10u + slot) * groups + lane;
+                qwen4exp_shared_vector_accumulate(&acc[r], wq, wa[0], wb[0],
+                    mq + at_g * 32u, ms[at_g], msum[at_g]);
+            }
+            current_meta = next_meta;
+
+        }
+    }
+#pragma unroll
+    for (unsigned r = 0; r < 2u; r++) {
+        const float tot = warp_sum_f32(acc[r]);
+        if (lane == 0u) out[(uint64_t)r * 2560u + row] = tot;
     }
 }
 
@@ -7980,7 +8162,19 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     const int small_group =
         n_tokens < 8u && n_total_expert <= QWEN4EXP_MOE_SCAN_THREADS &&
         getenv("DS4_QWEN4EXP_SERIAL_GROUP_SCAN") == NULL;
-    if (small_group) {
+    const bool down_plan = qwen4exp_down_plan_enabled(small_group, down_vector,
+        n_total_expert, (uintptr_t)sc.mq, (uintptr_t)down, mgroups, out_dim,
+        n_tokens, n_expert_used, down_slab->type, down_slab->row_bytes,
+        down_slab->expert_bytes);
+    if (down_plan) {
+        QWEN4EXP_LAUNCH_PDL(
+                qwen4exp_moe_group_plan_kernel,
+                dim3(1u, 1u, 1u), QWEN4EXP_MOE_SCAN_THREADS, 0, stream,
+                sc.counts, sc.offsets, sc.cursor, sc.active, sc.pairs,
+                (float *)mid->ptr, (const int32_t *)selected->ptr,
+                n_total_expert, n_pairs, n_expert_used, mid_dim,
+                mid_token_stride);
+    } else if (small_group) {
         /* PSS: the router's top-k is the stream predecessor and triggers at
          * these widths (its gate is the same n_tokens < 8 this branch is), so
          * this one block comes up while the router's warps are still retiring.
@@ -8306,13 +8500,21 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
             mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
 #define QWEN4EXP_DOWN_IMPL(R, DT, V) QWEN4EXP_DOWN_IMPL_S(R, DT, V, false, 0)
-#define QWEN4EXP_DOWN_ASYNC(DT) \
+#define QWEN4EXP_DOWN_ASYNC_ORIGINAL(DT) \
     qwen4exp_moe_down_q_kernel<2, DT, true, true, true><<< \
             dn_grid, threads, (size_t)dn_shared, stream>>>( \
             (float *)out->ptr, down, (const int32_t *)selected->ptr, \
             sc.mq, sc.ms, sc.msum, \
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
             mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
+#define QWEN4EXP_DOWN_ASYNC(DT) do { \
+    if (down_plan && DT == DS4_QWEN4EXP_TY_q5_1) { \
+        qwen4exp_moe_down_reuse_kernel<QW_DOWN_REUSE_PANELS><<< \
+            dn_grid, threads, (size_t)QW_DOWN_REUSE_PANELS * 3840u, stream>>>( \
+            (float *)out->ptr, down, sc.cursor, \
+            sc.mq, sc.ms, sc.msum); \
+    } else { QWEN4EXP_DOWN_ASYNC_ORIGINAL(DT); } \
+} while (0)
 #define QWEN4EXP_DOWN(R) do { \
     if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q5_1) { \
         QWEN4EXP_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q5_1, false); \
@@ -8418,6 +8620,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
 #undef QWEN4EXP_DOWN_IMPL
 #undef QWEN4EXP_DOWN_IMPL_S
 #undef QWEN4EXP_DOWN_ASYNC
+#undef QWEN4EXP_DOWN_ASYNC_ORIGINAL
     return cuda_ok(cudaGetLastError(), "qwen4exp MoE down launch");
 }
 
