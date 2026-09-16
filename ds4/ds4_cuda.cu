@@ -931,7 +931,7 @@ static inline cublasHandle_t cuda_cublas_for_tier(int logical_tier) {
  * kernels in the same order; the cost is a memcmp over at most eight 48-byte
  * keys off the device, and one more executable graph per row only if the run
  * actually has a fifth shape -- which is the case this is for. */
-#define CUDA_DECODE_GRAPH_VARIANTS  4u
+#define CUDA_DECODE_GRAPH_VARIANTS  40u
 
 /* Mirrors the public `struct ds4_decode_graph_key` decl in ds4_gpu.h
  * byte-for-byte (ds4_cuda.cu does not include that header; it carries
