@@ -4631,6 +4631,27 @@ qwen4exp_moe_gateup_split_kernel(
         uint32_t mid_dim,
         uint32_t mid_token_stride,
         uint32_t n_expert_used) {
+    /* PROGRAMMATIC DEPENDENT LAUNCH, the same edge the routed q4_K gate/up
+     * kernel already takes (QWEN4EXP_GATEUP_IMPL above).  That one runs on the
+     * single q5_K block; THIS one runs on the other forty-seven, and the
+     * routed-x quantizer ahead of it on the stream already arms a trigger at
+     * decode width -- its grid is 80 blocks by one or two rows, well inside
+     * the gate's `gridDim.y <= 2 && gridDim.x * gridDim.y <= 768` -- a trigger
+     * that until now retired into nothing, because this launch was plain.  The
+     * gain is residency: the blocks are up and scheduled when the quantizer's
+     * last group retires, instead of paying a launch behind it.
+     *
+     * The fence is the FIRST statement and nothing is hoisted above it.  The
+     * active/counts/offsets reads of the uniform early returns, the staged
+     * panel fill and every xq/xs/xsum read all sit below it, so this kernel
+     * sees exactly the memory it sees today and every dot stays bit-identical.
+     * None of the pointers carries __restrict__, so the .nc rule
+     * (ds4_cuda_qwen4exp.cuh) needs no change here.
+     *
+     * The deadlock rule constrains the PRODUCER, and the quantizer's own gate
+     * is what leaves the trigger live; the three-row wide verify and every
+     * prefill width keep the plain launch below, where this fence is a no-op. */
+    QWEN4EXP_PDL_SYNC();
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
     const uint32_t row = blockIdx.x * OutputRows + (warp >> 1u);
@@ -7781,7 +7802,19 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             ((uintptr_t)gate & 15u) == 0u && ((uintptr_t)up & 15u) == 0u &&
             (gate_slab->expert_bytes & 15ull) == 0ull &&
             (up_slab->expert_bytes & 15ull) == 0ull;
-#define QWEN4EXP_SPLIT_GATEUP(V, P, C) \
+#define QWEN4EXP_SPLIT_GATEUP(V, P, C) do { \
+    if (n_tokens <= 2u) { \
+        QWEN4EXP_LAUNCH_PDL( \
+            (qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P, C>), \
+            dim3((mid_dim + P - 1u) / P, gu_rows, 1), P * 64u, 0, stream, \
+            (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum, \
+            sc.pairs, sc.counts, sc.offsets, gu_active, \
+            (const float *)weights->ptr, \
+            gate_slab->expert_bytes, gate_slab->row_bytes, \
+            up_slab->expert_bytes, up_slab->row_bytes, \
+            gate_slab->type, up_slab->type, xgroups, mid_dim, \
+            mid_token_stride, n_expert_used); \
+    } else { \
         qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P, C><<< \
             dim3((mid_dim + P - 1u) / P, gu_rows, 1), P * 64u, 0, stream>>>( \
             (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum, \
@@ -7790,7 +7823,9 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             gate_slab->expert_bytes, gate_slab->row_bytes, \
             up_slab->expert_bytes, up_slab->row_bytes, \
             gate_slab->type, up_slab->type, xgroups, mid_dim, \
-            mid_token_stride, n_expert_used)
+            mid_token_stride, n_expert_used); \
+    } \
+} while (0)
         /* ONE OUTPUT ROW PER BLOCK on the vector schedule.  Four rows per
          * block was measured a full percent slower than two, so the barrier
          * is what costs: every warp in the block reads a different weight
