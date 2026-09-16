@@ -2601,6 +2601,8 @@ __global__ static void qwen4exp_router_select_topk_kernel(
     int32_t *sel = selected + (uint64_t)tok * n_expert_used;
     float *w = weights_out + (uint64_t)tok * n_expert_used;
 
+    // Keep each selected logit in its output lane, as in the MLX register route.
+    float selected_logit = 0.0f;
     float scores[16];
     uint32_t live = 0u;
 #pragma unroll
@@ -2651,6 +2653,12 @@ __global__ static void qwen4exp_router_select_topk_kernel(
         }
         const int32_t chosen =
             __shfl_sync(0xffffffffu, best_i, 0u);
+        if (Native) {
+            // Fetch the original score (including signed zero) from its owner.
+            const float value = __shfl_sync(0xffffffffu,
+                    scores[(uint32_t)chosen >> 5u], (uint32_t)chosen & 31u);
+            if (lane == rank) selected_logit = value;
+        }
         if (lane == 0u) sel[rank] = chosen;
         if (((uint32_t)chosen & 31u) == lane) {
             live &= ~(1u << ((uint32_t)chosen >> 5u));
@@ -2659,18 +2667,14 @@ __global__ static void qwen4exp_router_select_topk_kernel(
 
     if (Native) {
         float m = -FLT_MAX;
-        if (lane == 0u) {
-            for (uint32_t i = 0; i < n_expert_used; i++) {
-                const float v = lg[(uint32_t)sel[i]];
-                if (v > m) m = v;
-            }
+        // Preserve the original ascending-rank max and sum association.
+        for (uint32_t i = 0; i < n_expert_used; i++) {
+            const float v = __shfl_sync(0xffffffffu, selected_logit, i);
+            if (lane == 0u && v > m) m = v;
         }
         m = __shfl_sync(0xffffffffu, m, 0u);
-        /* Selected ids were stored by lane zero above. Publish them before
-         * other lanes read; no block-wide barrier is needed in one warp. */
-        __syncwarp();
         const float e = lane < n_expert_used
-                ? expf(lg[(uint32_t)sel[lane]] - m) : 0.0f;
+                ? expf(selected_logit - m) : 0.0f;
         float sum = 0.0f;
         for (uint32_t i = 0; i < n_expert_used; i++) {
             const float term = __shfl_sync(0xffffffffu, e, i);
@@ -8470,6 +8474,76 @@ __global__ static void qwen4exp_rms_norm_kernel(
     }
 }
 
+// Two independent norm rows share a launch, never a statistic or reduction.
+__global__ static void qwen4exp_rms_norm_pair_kernel(
+        float *out0, const float *x0, const float *w0, uint32_t n0,
+        float *out1, const float *x1, const float *w1, uint32_t n1,
+        uint32_t rows, float eps, float weight_bias, int round_bf16) {
+    const bool second = blockIdx.z != 0u;
+    float *out = second ? out1 : out0;
+    const float *x = second ? x1 : x0;
+    const float *w = second ? w1 : w0;
+    const uint32_t n = second ? n1 : n0;
+    const uint32_t group = n;
+    const uint32_t g = blockIdx.x;
+    const uint32_t row = blockIdx.y;
+    if (row >= rows) return;
+
+    const uint64_t base = (uint64_t)row * n + (uint64_t)g * group;
+    const float *xg = x + base;
+    float *yg = out + base;
+    const float *wg = w + (uint64_t)g * group;
+    const uint32_t nth = blockDim.x;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t steps = (group > tid) ? ((group - tid + nth - 1u) / nth) : 0u;
+
+    float sum = 0.0f;
+    uint32_t s = 0;
+    for (; s + QWEN4EXP_RMS_STEPS <= steps; s += QWEN4EXP_RMS_STEPS) {
+        float xv[QWEN4EXP_RMS_STEPS];
+#pragma unroll
+        for (uint32_t u = 0; u < QWEN4EXP_RMS_STEPS; u++) {
+            xv[u] = xg[tid + (s + u) * nth];
+        }
+#pragma unroll
+        for (uint32_t u = 0; u < QWEN4EXP_RMS_STEPS; u++) sum += xv[u] * xv[u];
+    }
+    for (; s < steps; s++) {
+        const float v = xg[tid + s * nth];
+        sum += v * v;
+    }
+
+    __shared__ float partial[256];
+    const float total = qwen4exp_block_sum_f32(sum, partial);
+    /* 1/sqrt rather than rsqrtf: the exactness the qwen4exp op tests assert
+     * needs the correctly rounded reciprocal square root. */
+    const float scale = 1.0f / sqrtf(total / (float)group + eps);
+
+    s = 0;
+    for (; s + QWEN4EXP_RMS_STEPS <= steps; s += QWEN4EXP_RMS_STEPS) {
+        float xv[QWEN4EXP_RMS_STEPS];
+        float wv[QWEN4EXP_RMS_STEPS];
+#pragma unroll
+        for (uint32_t u = 0; u < QWEN4EXP_RMS_STEPS; u++) {
+            const uint32_t i = tid + (s + u) * nth;
+            xv[u] = xg[i];
+            wv[u] = wg[i];
+        }
+#pragma unroll
+        for (uint32_t u = 0; u < QWEN4EXP_RMS_STEPS; u++) {
+            float normed = xv[u] * scale;
+            if (round_bf16) normed = qwen4exp_round_bf16(normed);
+            yg[tid + (s + u) * nth] = normed * (weight_bias + wv[u]);
+        }
+    }
+    for (; s < steps; s++) {
+        const uint32_t i = tid + s * nth;
+        float normed = xg[i] * scale;
+        if (round_bf16) normed = qwen4exp_round_bf16(normed);
+        yg[i] = normed * (weight_bias + wg[i]);
+    }
+}
+
 __global__ static void qwen4exp_scale_silu_kernel(
         float *x, uint32_t n, float scale) {
     const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -8579,6 +8653,35 @@ extern "C" int ds4_gpu_qwen4exp_rms_norm_tensor(
             (float *)out->ptr, (const float *)x->ptr, w,
             n, group, rows, eps, weight_bias, round_bf16);
     return cuda_ok(cudaGetLastError(), "qwen4exp_rms_norm launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_rms_norm_pair_tensor(
+        ds4_gpu_tensor *out0, const ds4_gpu_tensor *x0,
+        ds4_gpu_tensor *out1, const ds4_gpu_tensor *x1,
+        const void *model_map, uint64_t model_size,
+        uint64_t off0, uint64_t off1, uint32_t n0, uint32_t n1,
+        uint32_t rows, float eps, float weight_bias, int round_bf16) {
+    if (!out0 || !x0 || !out1 || !x1 || !model_map || !n0 || !n1 || !rows ||
+        off0 > model_size || off1 > model_size ||
+        model_size - off0 < (uint64_t)n0 * sizeof(float) ||
+        model_size - off1 < (uint64_t)n1 * sizeof(float) ||
+        out0->bytes < (uint64_t)n0 * rows * sizeof(float) ||
+        x0->bytes < (uint64_t)n0 * rows * sizeof(float) ||
+        out1->bytes < (uint64_t)n1 * rows * sizeof(float) ||
+        x1->bytes < (uint64_t)n1 * rows * sizeof(float)) return 0;
+    const int tier = ds4_tensor_device_idx(out0);
+    if (ds4_tensor_device_idx(out1) != tier ||
+        ds4_tensor_device_idx(x0) != tier || ds4_tensor_device_idx(x1) != tier) return 0;
+    const float *w0 = (const float *)cuda_resolve_weight_ptr(
+            model_map, off0, (uint64_t)n0 * sizeof(float), tier, "qwen4exp_pair_norm0");
+    const float *w1 = (const float *)cuda_resolve_weight_ptr(
+            model_map, off1, (uint64_t)n1 * sizeof(float), tier, "qwen4exp_pair_norm1");
+    if (!w0 || !w1) return 0;
+    qwen4exp_rms_norm_pair_kernel<<<dim3(1u, rows, 2u), 256, 0, cuda_decode_stream()>>>(
+            (float *)out0->ptr, (const float *)x0->ptr, w0, n0,
+            (float *)out1->ptr, (const float *)x1->ptr, w1, n1,
+            rows, eps, weight_bias, round_bf16);
+    return cuda_ok(cudaGetLastError(), "qwen4exp paired RMS launch");
 }
 
 extern "C" int ds4_gpu_qwen4exp_scale_silu_tensor(
