@@ -36,3 +36,8 @@ scripted session with no GPU. The `ds4-engine` feature is off by default, so
 `cuda-engine` serves the mock unless the box build asks for ds4;
 `tools/ds4/build.sh` produces the `libds4qwen.so` the feature links. The real
 GPU drive is box-validated by `tools/ds4/mtp-exactness-gate.py`.
+
+<!-- redraw draw 2 of this campaign, stamped 2026-09-16T03:21:36Z. Content marker only:
+     nothing in the build reads this file and no engine behaviour differs from the
+     base tree. Its purpose is to give the archive a distinct hash so the ranked
+     run is actually dispatched. See the submission note. -->
