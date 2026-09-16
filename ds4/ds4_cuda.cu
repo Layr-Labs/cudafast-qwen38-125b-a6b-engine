@@ -1095,7 +1095,7 @@ static cuda_decode_graph_entry *cuda_decode_graph_find(
     cuda_decode_graph_entry *slot = NULL;
     for (uint32_t v = 0; v < CUDA_DECODE_GRAPH_VARIANTS; v++) {
         cuda_decode_graph_entry *e = &g_decode_graphs[key->il][key->island][v];
-        if (e->state != 0 &&
+        if (e->state != 0 && e->key.variant == key->variant &&
             memcmp(&e->key, key, sizeof(*key)) == 0) return e;
         if (e->state == 0 && !slot) slot = e;
     }
@@ -1122,7 +1122,8 @@ extern "C" int ds4_gpu_decode_graph_prefetch(const ds4_decode_graph_key *key) {
     for (uint32_t v = 0; v < CUDA_DECODE_GRAPH_VARIANTS; v++) {
         cuda_decode_graph_entry *e = &g_decode_graphs[key->il][key->island][v];
         if (e->state != 2 || !e->exec) continue;
-        if (memcmp(&e->key, key, sizeof(*key)) != 0) continue;
+        if (e->key.variant != key->variant ||
+            memcmp(&e->key, key, sizeof(*key)) != 0) continue;
         if (cudaGraphUpload(e->exec, g_decode_graph_stream) != cudaSuccess) {
             (void)cudaGetLastError();
             return 0;
