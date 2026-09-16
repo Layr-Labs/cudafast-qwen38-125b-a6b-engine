@@ -742,6 +742,101 @@ __global__ static void qwen4exp_gdn_replay_kernel(
     *(float4 *)(state + state_off) = h;
 }
 
+/* Both the final state and row-zero snapshot remain virtual after a two-row
+ * verify. The checkpoint plus a four-slot ring of exact K/V/gate inputs is
+ * sufficient to recover either. With a nonempty prefix, publish a checkpoint after
+ * row zero (which is always committed), and record only row one's input.
+ * Otherwise append both inputs. All appended slots are disjoint from the
+ * prefix EVERY CTA may still read; no grid barrier or cross-CTA ordering is
+ * assumed. No full final-state store is issued on the verify path.
+ * n_tokens == 0 materializes an explicitly requested state for a fallback or
+ * inspection. Arithmetic and XOR reduction order match the ordinary kernel. */
+__global__ static void qwen4exp_gdn_deferred_kernel(
+        float *out, float *state, float *checkpoint, float *tape,
+        const float *qkv, const float *raw_alpha, const float *raw_beta,
+        const float *a_log, const float *dt_bias,
+        uint32_t n_key_head, uint32_t n_value_head, uint32_t n_tokens,
+        uint32_t head_layout, const uint32_t *control, uint32_t descriptor) {
+    const uint32_t head = blockIdx.x;
+    const uint32_t value = blockIdx.y * 4u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (head >= n_value_head || value >= QWEN4EXP_GDN_DIM) return;
+    const uint32_t code = control ? *control : descriptor;
+    if (code >= 16u) return;
+    const uint32_t prefix = code & 3u, start = code >> 2u;
+    const bool flush = prefix >= DS4_QWEN4EXP_GDN_DEFER_FLUSH_ROWS;
+    const uint32_t key_dim = n_key_head * QWEN4EXP_GDN_DIM;
+    const uint32_t value_dim = n_value_head * QWEN4EXP_GDN_DIM;
+    const uint32_t conv_dim = 2u * key_dim + value_dim;
+    const uint32_t tape_stride = (key_dim + value_dim + 2u * n_value_head + 3u) & ~3u;
+    const uint32_t repeats = n_value_head / n_key_head;
+    const uint32_t key_head = head_layout != 0u ? head % n_key_head : head / repeats;
+    const uint32_t key_writer = head_layout != 0u ? key_head : key_head * repeats;
+    const uint32_t k0 = lane * 4u;
+    const uint64_t state_off = ((uint64_t)head * QWEN4EXP_GDN_DIM + value) *
+                               QWEN4EXP_GDN_DIM + k0;
+    float4 h = *(const float4 *)(checkpoint + state_off);
+    const float decay_coeff = n_tokens ? a_log[head] : 0.0f;
+    const float bias = n_tokens ? dt_bias[head] : 0.0f;
+    for (uint32_t step = 0; step < prefix + n_tokens; step++) {
+        const bool replay = step < prefix;
+        const uint32_t token = replay ? 0u : step - prefix;
+        const uint32_t slot = (start + step) & 3u;
+        const float *const saved = tape + (uint64_t)slot * tape_stride;
+        const uint64_t base = (uint64_t)token * conv_dim + key_head * QWEN4EXP_GDN_DIM;
+        const float4 k4 = *(const float4 *)(replay
+            ? saved + key_head * QWEN4EXP_GDN_DIM + k0
+            : qkv + base + key_dim + k0);
+        const float v_row = replay
+            ? saved[key_dim + head * QWEN4EXP_GDN_DIM + value]
+            : qkv[(uint64_t)token * conv_dim + 2u * key_dim +
+                  head * QWEN4EXP_GDN_DIM + value];
+        float g = 0.0f, beta = 0.0f;
+        if (replay) {
+            const float2 pair = ((const float2 *)(saved + key_dim + value_dim))[head];
+            g = pair.x; beta = pair.y;
+        } else {
+            const uint64_t gate = (uint64_t)token * n_value_head + head;
+            if (lane == 0u) {
+                g = expf(decay_coeff * qwen4exp_gdn_softplus(raw_alpha[gate] + bias));
+                beta = qwen4exp_gdn_sigmoid(raw_beta[gate]);
+            }
+            g = __shfl_sync(0xffffffffu, g, 0);
+            beta = __shfl_sync(0xffffffffu, beta, 0);
+            if (!flush || token == 1u) {
+                const uint32_t append = (start + prefix + (flush ? 0u : token)) & 3u;
+                float *const record = tape + (uint64_t)append * tape_stride;
+                if (value == 0u && head == key_writer)
+                    *(float4 *)(record + key_head * QWEN4EXP_GDN_DIM + k0) = k4;
+                if (lane == 0u) {
+                    record[key_dim + head * QWEN4EXP_GDN_DIM + value] = v_row;
+                    if (value == 0u)
+                        ((float2 *)(record + key_dim + value_dim))[head] = make_float2(g, beta);
+                }
+            }
+        }
+        h.x *= g;
+        h.y *= g;
+        h.z *= g;
+        h.w *= g;
+        const float hk = warp_sum_all_f32(dot4_f32(h, k4));
+        const float delta_v = (v_row - hk) * beta;
+        h.x = fmaf(k4.x, delta_v, h.x);
+        h.y = fmaf(k4.y, delta_v, h.y);
+        h.z = fmaf(k4.z, delta_v, h.z);
+        h.w = fmaf(k4.w, delta_v, h.w);
+        if (!replay) {
+            const float4 q4 = *(const float4 *)(qkv + base + k0);
+            const float result = warp_sum_all_f32(dot4_f32(h, q4));
+            if (lane == 0u)
+                out[(uint64_t)token * value_dim + head * QWEN4EXP_GDN_DIM + value] = result;
+            if (token == 0u && flush)
+                *(float4 *)(checkpoint + state_off) = h;
+        }
+    }
+    if (n_tokens == 0u) *(float4 *)(state + state_off) = h;
+}
+
 /* Long chunks reuse one Q/K vector and gate pair across four independent
  * value rows in a warp. Each row retains its four adjacent key columns per
  * lane, ordered dot4/FMA operations, and original XOR reductions. No state
@@ -1459,7 +1554,8 @@ static int qwen4exp_cuda_gdn_run(
     if (replay && (n_rows != 1u || n_tokens != 2u || n_snapshot_rows != 1u ||
         conv_dim > UINT32_MAX || key_dim + value_dim + 2ull * n_value_head > UINT32_MAX - 3u ||
         !adopt || !glm53_cuda_tensor_has(replay->checkpoint, state_elements, sizeof(float)) ||
-        !glm53_cuda_tensor_has(replay->tape, DS4_QWEN4EXP_GDN_REPLAY_ROWS *
+        !glm53_cuda_tensor_has(replay->tape, (replay->deferred
+            ? DS4_QWEN4EXP_GDN_DEFER_TAPE_ROWS : DS4_QWEN4EXP_GDN_REPLAY_ROWS) *
             ((key_dim + value_dim + 2ull * n_value_head + 3ull) & ~3ull), sizeof(float)) ||
         !glm53_cuda_tensor_has(replay->control, 1u, sizeof(uint32_t)) ||
         replay->checkpoint->ptr == recurrent_state->ptr ||
@@ -1543,7 +1639,15 @@ static int qwen4exp_cuda_gdn_run(
 
     const dim3 recurrence_grid(
         n_value_head, QWEN4EXP_GDN_DIM / 4u, n_rows);
-    if (replay) {
+    if (replay && replay->deferred) {
+        qwen4exp_gdn_deferred_kernel<<<recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
+            (float *)out->ptr, NULL,
+            (float *)replay->checkpoint->ptr, (float *)replay->tape->ptr,
+            (const float *)qkv->ptr, (const float *)raw_alpha->ptr,
+            (const float *)raw_beta->ptr, a_log, dt_bias,
+            n_key_head, n_value_head, n_tokens, head_layout,
+            (const uint32_t *)replay->control->ptr, 0u);
+    } else if (replay) {
         qwen4exp_gdn_replay_kernel<<<recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
             (float *)out->ptr, (float *)recurrent_state->ptr,
             (float *)replay->checkpoint->ptr, (float *)replay->tape->ptr,
@@ -1808,6 +1912,27 @@ extern "C" int ds4_gpu_qwen4exp_gdn_replay_materialize(
         NULL, (float *)state->ptr, (float *)checkpoint->ptr, (float *)tape->ptr,
         NULL, NULL, NULL, NULL, NULL, nk, nv, 0u, layout, NULL, rows);
     return cuda_ok(cudaGetLastError(), "qwen4exp GDN replay materialize");
+}
+
+extern "C" int ds4_gpu_qwen4exp_gdn_deferred_materialize(
+        ds4_gpu_tensor *state, ds4_gpu_tensor *checkpoint, ds4_gpu_tensor *tape,
+        uint32_t descriptor, uint32_t nk, uint32_t nv, uint32_t layout) {
+    const uint64_t state_elements = (uint64_t)nv * QWEN4EXP_GDN_DIM * QWEN4EXP_GDN_DIM;
+    const uint64_t stride = ((((uint64_t)nk + nv) * QWEN4EXP_GDN_DIM + 2ull * nv + 3ull) & ~3ull);
+    if (!nk || !nv || nv % nk || layout > DS4_QWEN4EXP_GDN_HEADS_TILED ||
+        stride > UINT32_MAX || nv > UINT32_MAX / QWEN4EXP_GDN_DIM || descriptor >= 16u ||
+        !glm53_cuda_tensor_has(state, state_elements, sizeof(float)) ||
+        !glm53_cuda_tensor_has(checkpoint, state_elements, sizeof(float)) ||
+        !glm53_cuda_tensor_has(tape, stride * DS4_QWEN4EXP_GDN_DEFER_TAPE_ROWS, sizeof(float)) ||
+        state->ptr == checkpoint->ptr || state->ptr == tape->ptr ||
+        checkpoint->ptr == tape->ptr ||
+        ds4_tensor_device_idx(state) != ds4_tensor_device_idx(checkpoint) ||
+        ds4_tensor_device_idx(state) != ds4_tensor_device_idx(tape)) return 0;
+    qwen4exp_gdn_deferred_kernel<<<dim3(nv, QWEN4EXP_GDN_DIM / 4u, 1u),
+                                   QWEN4EXP_GDN_DIM, 0, cuda_decode_stream()>>>(
+        NULL, (float *)state->ptr, (float *)checkpoint->ptr, (float *)tape->ptr,
+        NULL, NULL, NULL, NULL, NULL, nk, nv, 0u, layout, NULL, descriptor);
+    return cuda_ok(cudaGetLastError(), "qwen4exp GDN deferred materialize");
 }
 
 extern "C" int ds4_gpu_qwen4exp_gdn_replay_q8(
@@ -14048,6 +14173,7 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
     int md_regs = -1, md_smem = -1, md_lmem = -1, md_occ = -1;
     /* The drift control: a kernel nobody in this line of work has touched. */
     int gd_regs = -1, gd_lmem = -1;
+    int dr_regs = -1, dr_lmem = -1, dr_occ = -1;
 
     cudaFuncAttributes a;
     if (cudaFuncGetAttributes(
@@ -14123,6 +14249,21 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
             &occ, qwen4exp_moe_down_q_kernel<2, DS4_QWEN4EXP_TY_q8_0, true, true>,
             256, 0) == cudaSuccess) {
         dn_occ = occ;
+    } else {
+        (void)cudaGetLastError();
+    }
+
+    /* Deferred recurrent state: report the actual two-row kernel separately
+     * from gdn[], which describes the prefill octet. Startup-only diagnostics. */
+    if (cudaFuncGetAttributes(&a, qwen4exp_gdn_deferred_kernel) == cudaSuccess) {
+        dr_regs = a.numRegs;
+        dr_lmem = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ, qwen4exp_gdn_deferred_kernel, 128, 0) == cudaSuccess) {
+        dr_occ = occ;
     } else {
         (void)cudaGetLastError();
     }
@@ -14207,12 +14348,13 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
              "gu[reg=%d smem=%d lmem=%d maxt=%d occ=%d] dn[reg=%d smem=%d "
              "lmem=%d maxt=%d occ=%d] gdn[reg=%d lmem=%d] "
              "mm[reg=%d smem=%d lmem=%d occ=%d] "
-             "md[reg=%d smem=%d lmem=%d occ=%d]",
+             "md[reg=%d smem=%d lmem=%d occ=%d] dr[reg=%d lmem=%d occ=%d]",
              gu_regs, gu_smem, gu_lmem, gu_maxt, gu_occ,
              dn_regs, dn_smem, dn_lmem, dn_maxt, dn_occ,
              gd_regs, gd_lmem,
              mg_regs, mg_smem, mg_lmem, mg_occ,
-             md_regs, md_smem, md_lmem, md_occ);
+             md_regs, md_smem, md_lmem, md_occ,
+             dr_regs, dr_lmem, dr_occ);
     return buf;
 }
 

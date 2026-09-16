@@ -3807,7 +3807,8 @@ int ds4_gpu_qwen4exp_gdn_decode(
         float                 qk_norm_eps,
         float                 norm_eps);
 
-/* CUDA depth-one checkpoint/replay. Control is a device uint32 in [0, ROWS].
+/* CUDA depth-one checkpoint/replay. Control is a device uint32 in [0, ROWS],
+ * or (ring_start << 2) | prefix_length in [0, 15] when deferred is true.
  * Checkpoint and state are separate equally-sized recurrent buffers. Tape
  * stores only post-convolution K/V and computed (decay,beta) pairs. */
 #include "ds4_qwen4exp_gdn_replay.h"
@@ -3815,11 +3816,16 @@ typedef struct {
     ds4_gpu_tensor *checkpoint;
     ds4_gpu_tensor *tape;
     const ds4_gpu_tensor *control;
+    bool deferred; /* packed ring descriptor; final state materializes lazily */
 } ds4_gpu_qwen4exp_gdn_replay;
 int ds4_gpu_qwen4exp_gdn_replay_supported(void);
 int ds4_gpu_qwen4exp_gdn_replay_materialize(
         ds4_gpu_tensor *state, ds4_gpu_tensor *checkpoint, ds4_gpu_tensor *tape,
         uint32_t replay_rows, uint32_t n_key_head, uint32_t n_value_head,
+        uint32_t head_layout);
+int ds4_gpu_qwen4exp_gdn_deferred_materialize(
+        ds4_gpu_tensor *state, ds4_gpu_tensor *checkpoint, ds4_gpu_tensor *tape,
+        uint32_t descriptor, uint32_t n_key_head, uint32_t n_value_head,
         uint32_t head_layout);
 int ds4_gpu_qwen4exp_gdn_replay_q8(
         ds4_gpu_tensor       *out,

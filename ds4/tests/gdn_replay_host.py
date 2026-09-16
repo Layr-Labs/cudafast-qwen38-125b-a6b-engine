@@ -31,6 +31,7 @@ code = ''.join(definition(src, n) for n in (
     'warp_sum_all_f32', 'dot4_f32', 'qwen4exp_gdn_sigmoid', 'qwen4exp_gdn_softplus'))
 code += definition(src, 'qwen4exp_gdn_recurrence_kernel', True)
 code += definition(src, 'qwen4exp_gdn_replay_kernel')
+code += definition(src, 'qwen4exp_gdn_deferred_kernel')
 with tempfile.TemporaryDirectory(prefix='gdn-replay-host-') as tmp:
     tmp = Path(tmp)
     (tmp / 'gdn_replay_bodies.inc').write_text(code)
@@ -45,7 +46,9 @@ with tempfile.TemporaryDirectory(prefix='gdn-replay-host-') as tmp:
         # copy_layers also has a forward declaration; take its definition.
         first = graph.index('static bool qwen4exp_session_copy_layers(')
         body = graph.index('static bool qwen4exp_session_copy_layers(', first + 1)
-        ctl = definition(graph, 'qwen4exp_gdn_replay_snapshot') + definition(
+        ctl = ''.join(definition(graph,n) for n in (
+            'qwen4exp_gdn_deferred_current', 'qwen4exp_gdn_deferred_settle',
+            'qwen4exp_gdn_replay_snapshot')) + definition(
             graph[body:], 'qwen4exp_session_copy_layers') + ''.join(
             definition(graph, n) for n in (
                 'qwen4exp_session_select_layers', 'ds4_qwen4exp_session_reset'))

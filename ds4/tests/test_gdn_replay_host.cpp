@@ -136,11 +136,12 @@ static void same(float a,float b,const char *what) {
         std::fprintf(stderr,"%s: %.9g != %.9g\n",what,a,b); fail(what);
     }
 }
-static void trial(unsigned nk,unsigned nv,unsigned layout,unsigned rounds,bool sample_rows) {
+static void trial(unsigned nk,unsigned nv,unsigned layout,unsigned rounds,bool sample_rows,
+                  bool deferred=false) {
     const unsigned kd=nk*128, vd=nv*128, cd=2*kd+vd;
     const unsigned stride=(kd+vd+2*nv+3)&~3u;
     guarded old_state(vd*128), old_snap(vd*128), b0(vd*128), b1(vd*128);
-    guarded tape(stride*DS4_QWEN4EXP_GDN_REPLAY_ROWS), materialized(vd*128);
+    guarded tape(stride*(deferred?DS4_QWEN4EXP_GDN_DEFER_TAPE_ROWS:DS4_QWEN4EXP_GDN_REPLAY_ROWS)), materialized(vd*128);
     guarded out(2*vd), ref(2*vd), qkv(2*cd), alpha(2*nv), beta(2*nv);
     std::vector<float> decay(nv),bias(nv);
     for(unsigned i=0;i<vd*128;i++) old_state.data()[i]=b0.data()[i]=random_float(.03f);
@@ -152,16 +153,20 @@ static void trial(unsigned nk,unsigned nv,unsigned layout,unsigned rounds,bool s
     for(unsigned h=0;h<nv;h++) for(unsigned y=0;y<32;y++)
         if(!sample_rows || y==0 || y==11 || y==31) cells.push_back(h*32+y);
     bool previous=false;
-    unsigned prefix=0, pending=0, flushes=0;
+    unsigned prefix=0, start=0, pending=0, flushes=0, descriptors=0;
     // Includes long rejection chains, full acceptance at capacity, and restart.
-    const char *pattern="RRRAARRRRRARARAAA";
+    const char *pattern=deferred?"RRRRRRRRARAARARA":"RRRAARRRRRARARAAA";
     for(unsigned r=0;r<rounds;r++) {
-        auto p=ds4_qwen4exp_gdn_replay_plan(true,previous,prefix,2,2,1,7,pending,pending);
+        auto p=deferred
+            ?ds4_qwen4exp_gdn_deferred_plan(true,previous,prefix,start,2,1,7,pending,pending)
+            :ds4_qwen4exp_gdn_replay_plan(true,previous,prefix,2,2,1,7,pending,pending);
         need(!p.settle && p.active,"two-row replay continuation");
         if(p.swap) std::swap(live,base);
-        prefix=p.prefix;
-        need(prefix<=2,"bounded prefix");
-        flushes += prefix==2;
+        prefix=p.prefix;start=p.start;
+        need(prefix<=2u,"bounded prefix");
+        flushes += deferred?prefix!=0:prefix>=2;
+        unsigned control=deferred?ds4_qwen4exp_gdn_deferred_control(start,prefix):prefix;
+        descriptors|=1u<<control;
         for(unsigned i=0;i<2*cd;i++) qkv.data()[i]=random_float(.08f);
         for(unsigned i=0;i<2*nv;i++) {
             alpha.data()[i]=random_float(2.f);beta.data()[i]=random_float(2.f);
@@ -175,27 +180,50 @@ static void trial(unsigned nk,unsigned nv,unsigned layout,unsigned rounds,bool s
                 nk,nv,1,2,layout,1,0,&pending);});
         }
         const auto tape_before=tape.a;
+        const auto live_before=live->a, base_before=base->a;
         for(unsigned c:cells) {
             blockIdx={c/32,c%32,0};
-            cta(128,[&]{qwen4exp_gdn_replay_kernel(
+            if(deferred) cta(128,[&]{qwen4exp_gdn_deferred_kernel(
+                out.data(),live->data(),base->data(),tape.data(),qkv.data(),
+                alpha.data(),beta.data(),decay.data(),bias.data(),nk,nv,2,
+                layout,&control,0);});
+            else cta(128,[&]{qwen4exp_gdn_replay_kernel(
                 out.data(),live->data(),base->data(),tape.data(),qkv.data(),
                 alpha.data(),beta.data(),decay.data(),bias.data(),nk,nv,2,
                 layout,&prefix,0);});
         }
-        if(prefix==2) need(tape.a==tape_before,"flush must not overwrite a tape reader");
+        if(deferred) {
+            need(live->a==live_before,"verify must not write canonical final state");
+            if(prefix==0)need(base->a==base_before,"non-flush checkpoint immutable");
+            for(unsigned i=0;i<prefix;i++)for(unsigned j=0;j<stride;j++) {
+                unsigned at=((start+i)&3)*stride+j;
+                same(tape.data()[at],tape_before[at+4],"immutable ring prefix");
+            }
+            unsigned final_code=ds4_qwen4exp_gdn_deferred_after(start,prefix,2);
+            for(unsigned c:cells) {
+                blockIdx={c/32,c%32,0};
+                cta(128,[&]{qwen4exp_gdn_deferred_kernel(
+                    nullptr,materialized.data(),base->data(),tape.data(),nullptr,
+                    nullptr,nullptr,nullptr,nullptr,nk,nv,0,layout,nullptr,final_code);});
+            }
+        } else if(prefix==2) need(tape.a==tape_before,"flush must not overwrite a tape reader");
         else for(unsigned i=0;i<prefix*stride;i++)
             same(tape.data()[i],tape_before[i+4],"unmodified replay prefix");
         for(unsigned c:cells) for(unsigned v=0;v<4;v++) {
             unsigned index=(c/32)*128+(c%32)*4+v;
             for(unsigned t=0;t<2;t++) same(out.data()[t*vd+index],ref.data()[t*vd+index],"output bits");
             for(unsigned k=0;k<128;k++)
-                same(live->data()[index*128+k],old_state.data()[index*128+k],"final state bits");
+                same((deferred?materialized.data():live->data())[index*128+k],
+                     old_state.data()[index*128+k],"final state bits");
         }
         const auto final_before=live->a;
-        unsigned rows=prefix==2?0:prefix+1;
+        unsigned rows=deferred?ds4_qwen4exp_gdn_deferred_after(start,prefix,1):prefix==2?0:prefix+1;
         for(unsigned c:cells) {
             blockIdx={c/32,c%32,0};
-            cta(128,[&]{qwen4exp_gdn_replay_kernel(
+            if(deferred) cta(128,[&]{qwen4exp_gdn_deferred_kernel(
+                nullptr,materialized.data(),base->data(),tape.data(),nullptr,
+                nullptr,nullptr,nullptr,nullptr,nk,nv,0,layout,nullptr,rows);});
+            else cta(128,[&]{qwen4exp_gdn_replay_kernel(
                 nullptr,materialized.data(),base->data(),tape.data(),nullptr,
                 nullptr,nullptr,nullptr,nullptr,nk,nv,0,layout,nullptr,rows);});
         }
@@ -206,17 +234,23 @@ static void trial(unsigned nk,unsigned nv,unsigned layout,unsigned rounds,bool s
         }
         need(live->a==final_before,"inspection preserves canonical state");
         for(auto g:{&old_state,&old_snap,&b0,&b1,&tape,&materialized,&out,&ref,&qkv,&alpha,&beta}) g->check();
-        pending=pattern[r%16]=='R'?1:0;
+        pending=pattern[r%std::strlen(pattern)]=='R'?1:0;
         previous=true;
     }
     if(rounds>=4) need(flushes!=0,"flush exercised");
-    std::printf("PASS kernel nk=%u nv=%u layout=%u rounds=%u value_blocks=%zu flushes=%u\n",
-                nk,nv,layout,rounds,cells.size(),flushes);
+    if(deferred && rounds>=17) need(descriptors==0x7777u,"all reachable ring descriptors exercised");
+    std::printf("PASS kernel deferred=%u nk=%u nv=%u layout=%u rounds=%u value_blocks=%zu flushes=%u descriptors=%04x\n",
+                deferred,nk,nv,layout,rounds,cells.size(),flushes,descriptors);
 }
 int main() {
     trial(1,1,0,16,false);
     trial(2,4,0,7,false);
     trial(2,4,1,7,false);
     trial(16,48,1,4,true);
+    trial(1,1,0,32,false,true);
+    trial(1,3,0,16,false,true);
+    trial(2,4,0,16,false,true);
+    trial(2,4,1,16,false,true);
+    trial(16,48,1,7,true,true);
     std::puts("PASS actual recurrence output, final state, snapshot, bounded log, canaries");
 }
