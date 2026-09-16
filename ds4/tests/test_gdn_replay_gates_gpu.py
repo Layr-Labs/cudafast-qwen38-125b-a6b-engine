@@ -58,7 +58,7 @@ int main(){std::mt19937 r(650031);unsigned eager=0,replays=0;cudaStream_t st;CK(
   for(B*b:{&q0,&q1})copy(*b,input);for(B*b:{&h0,&h1})copy(*b,hist);for(B*b:{&ss0,&ss1})copy(*b,snap);for(B*b:{&s0,&s1,&c0,&c1})copy(*b,base);for(B*b:{&t0,&t1})copy(*b,tapeseed);
   // Real runtime validation queries also execute while the stream is captured.
   int dev;cudaPointerAttributes at={};CK(cudaGetDevice(&dev));CK(cudaPointerGetAttributes(&at,pairs.d()));if(at.device!=dev||at.type!=cudaMemoryTypeDevice)exit(5);
-  qwen4exp_gdn_conv_kernel<<<dim3(2*nk+nv,1),128,0,st>>>(q0.d(),h0.d(),cw.d(),ss0.d(),nk,nv,1,2,1,1e-6f,adopt);
+  qwen4exp_gdn_conv_kernel<<<dim3(2*nk+nv,1),128,0,st>>>(q0.d(),h0.d(),cw.d(),ss0.d(),nk,nv,1,2,1,1e-6f,adopt,0);
   qwen4exp_gdn_conv_replay_gates_kernel<<<dim3(2*nk+nv,1),128,0,st>>>(q1.d(),h1.d(),cw.d(),ss1.d(),nk,nv,1,2,1,1e-6f,adopt,(float2*)pairs.d(),alpha.d(),beta.d(),coeff.d(),bias.d());
   qwen4exp_gdn_replay_kernel<<<dim3(nv,32),128,0,st>>>(o0.d(),s0.d(),c0.d(),t0.d(),q0.d(),alpha.d(),beta.d(),coeff.d(),bias.d(),nk,nv,2,layout,control,0);
   qwen4exp_gdn_replay_gates_kernel<<<dim3(nv,32),128,0,st>>>(o1.d(),s1.d(),c1.d(),t1.d(),q1.d(),alpha.d(),beta.d(),(float2*)pairs.d(),nk,nv,2,layout,control,0);

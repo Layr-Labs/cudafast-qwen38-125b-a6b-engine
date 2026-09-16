@@ -423,7 +423,8 @@ __global__ static void qwen4exp_gdn_conv_kernel(
         uint32_t     n_tokens,
         uint32_t     n_snapshot_rows,
         float        qk_norm_eps,
-        const uint32_t *adopt_row) {
+        const uint32_t *adopt_row,
+        int            vector_weights) {
     const uint32_t block = blockIdx.x;
     const uint32_t row = blockIdx.y;
     const uint32_t tid = threadIdx.x;
@@ -463,10 +464,19 @@ __global__ static void qwen4exp_gdn_conv_kernel(
     float h0 = history_src[channel];
     float h1 = history_src[(uint64_t)conv_dim + channel];
     float h2 = history_src[(uint64_t)2u * conv_dim + channel];
-    const float w0 = conv_weight[(uint64_t)channel * 4u + 0u];
-    const float w1 = conv_weight[(uint64_t)channel * 4u + 1u];
-    const float w2 = conv_weight[(uint64_t)channel * 4u + 2u];
-    const float w3 = conv_weight[(uint64_t)channel * 4u + 3u];
+    float w0, w1, w2, w3;
+    if (vector_weights) {
+        const float4 w = ((const float4 *)conv_weight)[channel];
+        w0 = w.x;
+        w1 = w.y;
+        w2 = w.z;
+        w3 = w.w;
+    } else {
+        w0 = conv_weight[(uint64_t)channel * 4u + 0u];
+        w1 = conv_weight[(uint64_t)channel * 4u + 1u];
+        w2 = conv_weight[(uint64_t)channel * 4u + 2u];
+        w3 = conv_weight[(uint64_t)channel * 4u + 3u];
+    }
 
     float raw = qkv[(uint64_t)row * n_tokens * conv_dim + channel];
     for (uint32_t token = 0; token < n_tokens; token++) {
@@ -1937,12 +1947,15 @@ static int qwen4exp_cuda_gdn_run(
                 (const float *)raw_alpha->ptr, (const float *)raw_beta->ptr,
                 a_log, dt_bias);
     } else {
+        const int conv_vec4 =
+            ((uintptr_t)conv_weight & (alignof(float4) - 1u)) == 0u &&
+            getenv("DS4_QWEN4EXP_NO_GDN_CONV_VEC4") == NULL;
         qwen4exp_gdn_conv_kernel<<<dim3(blocks, n_rows, 1u),
                                    QWEN4EXP_GDN_DIM, 0, stream>>>(
                 (float *)qkv->ptr, (float *)conv_state->ptr, conv_weight,
                 conv_snapshot ? (float *)conv_snapshot->ptr : NULL,
                 n_key_head, n_value_head, n_rows, n_tokens, n_snapshot_rows,
-                qk_norm_eps, adopt_row);
+                qk_norm_eps, adopt_row, conv_vec4);
     }
     if (!cuda_ok(cudaGetLastError(), "qwen4exp GDN convolution launch")) {
         return 0;
