@@ -953,7 +953,7 @@ static inline cublasHandle_t cuda_cublas_for_tier(int logical_tier) {
  * pointer, populates none of them until a key asks, and changes no graph's
  * contents, no launch order and no arithmetic -- only how many identities may
  * be resident before the lookup gives up. */
-#define CUDA_DECODE_GRAPH_VARIANTS  8u
+#define CUDA_DECODE_GRAPH_VARIANTS 4u
 
 /* Mirrors the public `struct ds4_decode_graph_key` decl in ds4_gpu.h
  * byte-for-byte (ds4_cuda.cu does not include that header; it carries
