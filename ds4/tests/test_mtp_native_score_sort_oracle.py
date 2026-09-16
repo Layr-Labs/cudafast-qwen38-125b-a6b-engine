@@ -31,7 +31,7 @@ def radix_calls(text):
     return calls
 
 def trailing(args):
-    m = re.search(r',(\w+),(\d+),(\d+),cuda_decode_stream\(\)$', args)
+    m = re.search(r',(\w+),(\d+),(\w+),cuda_decode_stream\(\)$', args)
     assert m, 'radix call tail shape changed: ' + args
     return m.groups()
 
@@ -42,7 +42,8 @@ def one(pattern, what):
     return hits[0]
 
 # Wiring: the score sort and its scratch-size query must both sort the high
-# word only, and the selected-ID sort must stay the full ascending 32-bit one.
+# word only. The ID sort uses ceil(log2(vocab)), already the production policy
+# before the energy screen. Verify that policy instead of requiring stale 32.
 score_name, _, score_args = one(r'key_in\s*,\s*key_out', 'score sort')
 init_name, _, init_args = one(r'\(\s*const\s+uint64_t\s*\*\s*\)\s*nullptr', 'score sort scratch query')
 id_name, _, id_args = one(r'\bid_tmp\b', 'selected-ID sort')
@@ -54,7 +55,10 @@ assert score_name == 'SortKeysDescending' and score_n == 'width' \
 assert init_name == 'SortKeysDescending' and init_n == 'width' \
     and (init_lo, init_hi) == ('32', '64'), 'scratch query bits must match the sort'
 assert id_name == 'SortKeys' and id_n == 'MTP_NATIVE_CAP' \
-    and (id_lo, id_hi) == ('0', '32'), 'selected-ID sort bits drifted'
+    and (id_lo, id_hi) == ('0', 'id_bits'), 'selected-ID sort bits drifted'
+assert re.search(r'int id_bits = 1;\s*while \(id_bits < 32 && '
+                 r'\(\(uint32_t\)1u << id_bits\) < vocab\) id_bits\+\+;', cuh), \
+    'selected-ID bit bound changed'
 
 # Key layout, extracted from the producers rather than restated.
 fk = re.search(r'q8_top1_float_ordered_key\(float v\)\s*\{\s*const uint32_t u = '
@@ -106,6 +110,10 @@ def check(prefix, tail, vocab, score_bits):
     word = sorted(keys, key=lambda k: k >> shift, reverse=True)  # stable, high word
     assert full == word, 'score-word order diverged from full-key order'
     assert selected(full) == selected(word), 'selected IDs diverged'
+    id_bits = max(1, (vocab - 1).bit_length())
+    unpacked = [m32 - (k & m32) for k in word[:cap]]
+    assert sorted(unpacked, key=lambda i: i & ((1 << id_bits) - 1)) == sorted(unpacked), \
+        'bounded ID-bit sort differs from full ID sort'
     return len(keys)
 
 def finite_bits(r):

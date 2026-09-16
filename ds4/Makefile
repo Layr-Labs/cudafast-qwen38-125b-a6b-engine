@@ -96,10 +96,7 @@ else
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 endif
-# The release path does not need debug line tables: -lineinfo exists for
-# profiler attribution, and nothing in the scored path consumes it.  Dropping
-# -g -lineinfo keeps the shipped cubin lean without changing code generation.
-NVCCFLAGS ?= -O3 --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
+NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 # The Qwen4-Exp kernels are their own translation unit so they can drop fast
 # math: --use_fast_math would substitute __cosf/__sinf in the QSA rope, whose
 # angle reaches the position index itself, and flush the GDN decays and the
@@ -732,7 +729,7 @@ $(GLM53_KDA_ROCM_TEST): tests/test_glm53_kda_rocm.o ds4_rocm.o
 test-glm53-kda-rocm: $(GLM53_KDA_ROCM_TEST)
 	./$(GLM53_KDA_ROCM_TEST)
 
-ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_cuda_qwen4exp.cuh ds4_gpu_mgpu.h ds4_glm53_vision_gpu.cuh ds4_deepseek4_vision_gpu.cuh ds4_image.h ds4_iq2_tables_cuda.inc cuda/mmq/ds4_mmq.h
+ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_cuda_qwen4exp.cuh ds4_cuda_mtp_native.cuh ds4_gpu_mgpu.h ds4_glm53_vision_gpu.cuh ds4_deepseek4_vision_gpu.cuh ds4_image.h ds4_iq2_tables_cuda.inc cuda/mmq/ds4_mmq.h
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
 
 # Every Qwen4-Exp CUDA kernel, built without fast math (QWEN4EXP_NVCCFLAGS).
@@ -910,6 +907,19 @@ $(QWEN4EXP_MTP_TEST): tests/test_qwen4exp_mtp.o ds4_qwen4exp_mtp.o
 test-qwen4exp-mtp: $(QWEN4EXP_MTP_TEST)
 	./$(QWEN4EXP_MTP_TEST)
 
+.PHONY: test-mtp-energy-host test-mtp-native-screen
+test-mtp-energy-host:
+	python3 tests/mtp_energy_host.py
+
+tests/test_mtp_native_screen.o: tests/test_mtp_native_screen.c ds4_gpu.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -c -o $@ $<
+
+tests/test_mtp_native_screen: tests/test_mtp_native_screen.o $(GPU_TEST_OBJS)
+	$(GPU_TEST_LINK_SAFE)
+
+test-mtp-native-screen: tests/test_mtp_native_screen
+	./tests/test_mtp_native_screen
+
 tests/test_qwen4exp_model_registration.o: tests/test_qwen4exp_model_registration.c ds4_qwen4exp_model_registration.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
@@ -1064,4 +1074,5 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 	./tests/test_mxfp4_dot
 
 clean:
+	rm -f tests/test_mtp_native_screen $(QWEN4EXP_MTP_TEST)
 	rm -f ds4_qwen4exp_mtp.o ds4_qwen4exp_mtp_hooks.o ds4_qwen4exp_mtp_cpu.o ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_qwen4exp_gdn tests/test_qwen4exp_moe tests/test_qwen4exp_gateup_dq tests/test_qwen4exp_hc_norm tests/test_qwen4exp_qsa tests/test_qwen4exp_graph tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_model_shard_fd tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_qwen4exp_loader tests/test_qwen4exp_model_registration tests/test_qwen4exp_ple tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

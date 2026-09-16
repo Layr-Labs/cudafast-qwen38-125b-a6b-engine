@@ -24,6 +24,29 @@ static uint32_t rnd(void){seed^=seed<<13;seed^=seed>>17;seed^=seed<<5;return see
 /* Compare actual old/fused implementations, including raw pre-sort keys.
  * Scratch scores are deliberately omitted by fusion and are not compared. */
 static uint64_t aligned(uint64_t n){return (n+255u)&~255ull;}
+/* Independent scalar ranking of the actual quantized activation. Read the
+ * chosen indices from the otherwise-unused alignment gap before scores. */
+static void check_energy_groups(ds4_gpu_tensor *scratch) {
+    int8_t q[DIM];float scale[80],energy[80];uint32_t got[24],order[80];
+    need(ds4_gpu_tensor_read(scratch,0,q,sizeof q)&&
+         ds4_gpu_tensor_read(scratch,DIM,scale,sizeof scale)&&
+         ds4_gpu_tensor_read(scratch,DIM+sizeof scale,got,sizeof got),"energy group read");
+    for(unsigned g=0;g<80;g++) {
+        int square=0;for(unsigned j=0;j<32;j++)square+=(int)q[g*32+j]*(int)q[g*32+j];
+        energy[g]=scale[g]*(scale[g]*(float)square);order[g]=g;
+    }
+    for(unsigned i=1;i<80;i++) {
+        uint32_t id=order[i];unsigned j=i;
+        while(j&&energy[id]>energy[order[j-1]]){order[j]=order[j-1];j--;}
+        order[j]=id;
+    }
+    for(unsigned i=1;i<24;i++) {
+        uint32_t id=order[i];unsigned j=i;
+        while(j&&id<order[j-1]){order[j]=order[j-1];j--;}
+        order[j]=id;
+    }
+    need(!memcmp(got,order,sizeof got),"energy group scalar oracle");
+}
 static int compare_key_paths(ds4_gpu_tensor *out,ds4_gpu_tensor *ids,
         ds4_gpu_tensor *scratch,const void *w,uint64_t bytes,uint64_t offset,
         ds4_gpu_tensor *x) {
@@ -49,6 +72,7 @@ static int compare_key_paths(ds4_gpu_tensor *out,ds4_gpu_tensor *ids,
         need(ds4_gpu_tensor_write(scratch,scores_at,score_canary,WIDTH*4u),"score witness init");
         status[mode]=ds4_gpu_mtp_native_screen(out,ids,scratch,w,bytes,offset,DIM,VOCAB,PREFIX,TAIL,x);
         need(status[mode]>=0,"AB backend success");
+        if(status[mode]>0)check_energy_groups(scratch);
         need(ds4_gpu_tensor_read(scratch,scores_at,score_after,WIDTH*4u),"score witness read");
         need(mode ? !memcmp(score_canary,score_after,WIDTH*4u) : memcmp(score_canary,score_after,WIDTH*4u)!=0,"actual fused/old dispatch witness");
         need(ds4_gpu_tensor_read(scratch,ki,keys[mode],WIDTH*8u)&&ds4_gpu_tensor_read(scratch,flag_at,&flags[mode],4),"AB keys/flag");
@@ -76,6 +100,7 @@ static void run_case(int adversarial, uint32_t offset) {
          * 32-group screen positive. Both complete dots are positive, so
          * requiring exclusion witnesses the 24-group policy itself. */
         if(adversarial==3 && row==PREFIX-1) memset(p+2,b<24?255:b<32?8:2,32);
+        if(adversarial==4 && row==PREFIX-1) memset(p+2,b>=56?2:0,32);
     }
     need(ds4_gpu_init(),"GPU init");need(ds4_gpu_set_model_map(w,bytes),"register weights");
     uint64_t scratch_bytes=0;uint32_t cap=0;
@@ -87,11 +112,18 @@ static void run_case(int adversarial, uint32_t offset) {
     need(x&&out&&ids&&scratch&&full&&tail&&winner,"GPU allocations");
     float activation[DIM],selected[CAP],reference[PREFIX],tail_ref[TAIL];uint32_t found[CAP];
     for(unsigned replay=0;replay<(adversarial?1u:3u);replay++) {
-        for(unsigned i=0;i<DIM;i++) activation[i]=adversarial?1.0f:(int)(rnd()%201)*0.01f-1.0f;
+        for(unsigned i=0;i<DIM;i++) activation[i]=adversarial==4?(i>=56*32?1.0f:0.0f):adversarial?1.0f:(int)(rnd()%201)*0.01f-1.0f;
         need(ds4_gpu_tensor_write(x,0,activation,sizeof activation),"current activation");
         if(adversarial==2) {
             need(compare_key_paths(out,ids,scratch,w,bytes,offset,x)==0,"nonfinite score fallback");
             goto cleanup;
+        }
+        if(adversarial==4) {
+            setenv("DS4_MTP_SCREEN_PREFIX_GROUPS","1",1);
+            need(ds4_gpu_mtp_native_screen(out,ids,scratch,w,bytes,offset,DIM,VOCAB,PREFIX,TAIL,x)==CAP,"prefix control");
+            need(ds4_gpu_tensor_read(ids,0,found,sizeof found),"prefix IDs");
+            for(unsigned i=0;i<CAP;i++)need(found[i]!=PREFIX-1,"prefix control misses late-energy winner");
+            unsetenv("DS4_MTP_SCREEN_PREFIX_GROUPS");
         }
         need(compare_key_paths(out,ids,scratch,w,bytes,offset,x)==CAP,"screen active");
         need(ds4_gpu_tensor_read(ids,0,found,sizeof found),"IDs read");
@@ -107,7 +139,11 @@ static void run_case(int adversarial, uint32_t offset) {
             need(!memcmp(&exact,&selected[i],4),"full refinement differs from ordinary row");
         }
         for(unsigned i=0;i<TAIL;i++) need(found[CAP-TAIL+i]==VOCAB-TAIL+i,"mandatory tail");
-        if(adversarial) {
+        if(adversarial==4) {
+            unsigned included=0;
+            for(unsigned i=0;i<CAP;i++)if(found[i]==PREFIX-1)included++;
+            need(reference[PREFIX-1]>0&&included==1,"adaptive screen recovers late-energy winner");
+        } else if(adversarial) {
             need(reference[PREFIX-1]>0,"adversarial full winner");
             for(unsigned i=0;i<CAP;i++) need(found[i]!=PREFIX-1 && selected[i]==0,"screen is approximate");
             for(unsigned i=1;i<CAP-TAIL;i++) need(found[i]==i,"coarse tie lowest ID");
@@ -142,4 +178,4 @@ cleanup:
     ds4_gpu_tensor_free(full);ds4_gpu_tensor_free(tail);ds4_gpu_tensor_free(winner);
     ds4_gpu_cleanup();munmap(w,bytes);
 }
-int main(void){setenv("DS4_CUDA_DECODE_GRAPHS","1",1);run_case(0,0);run_case(0,2);run_case(1,0);run_case(2,0);run_case(3,0);run_case(3,2);puts("native screen contracts pass (selection deliberately approximate)");return 0;}
+int main(void){setenv("DS4_CUDA_DECODE_GRAPHS","1",1);unsetenv("DS4_MTP_SCREEN_PREFIX_GROUPS");run_case(0,0);run_case(0,2);run_case(1,0);run_case(2,0);run_case(3,0);run_case(3,2);run_case(4,0);run_case(4,2);puts("native screen contracts pass (selection deliberately approximate)");return 0;}
