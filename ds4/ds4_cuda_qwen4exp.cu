@@ -543,6 +543,11 @@ __global__ static void qwen4exp_gdn_conv_replay_gates_kernel(
         const uint32_t *adopt_row, float2 *gate_pairs,
         const float *raw_alpha, const float *raw_beta,
         const float *a_log, const float *dt_bias) {
+    /* Decode rows only: the launch is one wave there, so the dependent
+     * replay-gates kernel may run its prologue alongside this one (the
+     * deadlock rule, ds4_cuda_qwen4exp.cuh).  A verify or prefill width
+     * never carries a trigger. */
+    if (n_rows <= 2u) QWEN4EXP_PDL_TRIGGER();
     const uint32_t block = blockIdx.x;
     const uint32_t row = blockIdx.y;
     const uint32_t tid = threadIdx.x;
@@ -1032,6 +1037,10 @@ __global__ static void qwen4exp_gdn_replay_gates_kernel(
     const uint64_t state_off = ((uint64_t)head * QWEN4EXP_GDN_DIM + value) *
                                QWEN4EXP_GDN_DIM + k0;
     float4 h = *(const float4 *)(checkpoint + state_off);
+    /* The checkpoint row above is this kernel's own earlier output, not
+     * the conv replay's, so the fence may sit below it.  Everything the
+     * loop reads -- qkv, gate_pairs -- is producer data. */
+    QWEN4EXP_PDL_SYNC();
     for (uint32_t step = 0; step < prefix + n_tokens; step++) {
         const bool replay = step < prefix;
         const uint32_t token = replay ? 0u : step - prefix;
@@ -1951,13 +1960,15 @@ static int qwen4exp_cuda_gdn_run(
     const dim3 recurrence_grid(
         n_value_head, QWEN4EXP_GDN_DIM / 4u, n_rows);
     if (replay_gates) {
-        qwen4exp_gdn_replay_gates_kernel<<<recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
-            (float *)out->ptr, (float *)recurrent_state->ptr,
-            (float *)replay->checkpoint->ptr, (float *)replay->tape->ptr,
-            (const float *)qkv->ptr, (const float *)raw_alpha->ptr,
-            (const float *)raw_beta->ptr, replay_gates,
-            n_key_head, n_value_head, n_tokens, head_layout,
-            (const uint32_t *)replay->control->ptr, 0u);
+        QWEN4EXP_LAUNCH_PDL(
+                qwen4exp_gdn_replay_gates_kernel,
+                recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream,
+                (float *)out->ptr, (float *)recurrent_state->ptr,
+                (float *)replay->checkpoint->ptr, (float *)replay->tape->ptr,
+                (const float *)qkv->ptr, (const float *)raw_alpha->ptr,
+                (const float *)raw_beta->ptr, replay_gates,
+                n_key_head, n_value_head, n_tokens, head_layout,
+                (const uint32_t *)replay->control->ptr, 0u);
     } else if (replay) {
         qwen4exp_gdn_replay_kernel<<<recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
             (float *)out->ptr, (float *)recurrent_state->ptr,
