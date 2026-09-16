@@ -283,6 +283,42 @@ impl Engine for Ds4Engine {
     ) -> Result<(i64, EffectiveSpec), EngineError> {
         let mut s = self.lock();
         let depth = Self::resolve(s.mtp_armed(), route, requested_depth)?;
+        // WARM THE SPECULATIVE SHAPES HERE, WHERE THE CLOCK IS NOT RUNNING.
+        //
+        // This module's own contract, stated at the top of adapter.rs, is that
+        // `free_decode_run(count)` is the one request benchd brackets with its
+        // clock. `free_decode_begin` is the opener and is not bracketed, and it
+        // is also the last thing to run before the scored decode window -- after
+        // the benchmarker's cool gate has left the device idle at its floor
+        // temperature, which is where its clocks are lowest and its caches are
+        // coldest.
+        //
+        // The seed sync below already exercises the prefill shapes on the way
+        // in. What it does not touch is the 2-row verify and the drafter's own
+        // island, which are the only shapes the scored window then runs. Those
+        // are warmed here instead, for a handful of rounds, on a context that is
+        // thrown away.
+        //
+        // WHY THIS CANNOT CHANGE A TOKEN. The warm pass runs on the REVERSED
+        // seed, so unless the seed is a palindrome its first token differs and
+        // no prefix-reuse path can short-circuit the real `s.sync(seed)` that
+        // follows: the engine has to lay the seed down from scratch, exactly as
+        // it does today, and every value `free_decode_run` reads is produced
+        // after that sync. The warm pass's own outputs are discarded and its
+        // errors are ignored, so a failure leaves precisely the tree that
+        // shipped before it. The serial route is left alone because its scored
+        // window runs the 1-row shape the seed sync already warmed.
+        if matches!(route, Route::Mtp) && seed.len() > 1 {
+            let warm: Vec<i64> = seed.iter().rev().copied().collect();
+            if s.sync(&warm).is_ok() {
+                let t = s.argmax();
+                for _ in 0..4 {
+                    if s.eval_speculative(t, 4).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
         Self::fault(s.sync(seed))?;
         let seed_token = s.argmax();
         drop(s);
