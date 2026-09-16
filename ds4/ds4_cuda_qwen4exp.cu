@@ -4606,6 +4606,24 @@ __device__ __forceinline__ static void qw_gu_coop_raw_load(
  * kernel is not the experiment.  `gu[occ]` reports blocks/SM straight from
  * cudaOccupancyMaxActiveBlocksPerMultiprocessor, so the third block no longer
  * has to be inferred from arithmetic at all: 2 means the cap did not take. */
+/* MEASURED PROFILE OF THE THREE SHIPPED INSTANTIATIONS, from
+ * `nvcc -Xptxas -v` on this translation unit at sm_121a.  The register cap
+ * above is a blunt instrument and the probe at the bottom of this file reports
+ * `lmem` for exactly this reason, so the numbers are recorded here where the
+ * cap is declared rather than left to be rediscovered:
+ *
+ *   <2, q4_K, true,  4, true >  32 regs,   8 B spill,  11584 B smem   <- coop
+ *   <2, q4_K, true,  1, false>  32 regs, 792 B spill,     16 B smem
+ *   <2, q4_K, false, 4, false>  32 regs, 624 B spill,     64 B smem
+ *
+ * Only the first of the three is reachable at the tower's q4_K gate/up shape:
+ * the launcher takes the coop schedule whenever the row bytes and the alignment
+ * match, which they do on every q4_K block, and the other two are the fallbacks
+ * for shapes this checkpoint does not contain.  That is what makes the cap
+ * affordable -- the instantiation that runs spills eight bytes, while the two
+ * that spill six hundred and seven hundred do not run here.  Anyone widening
+ * the cap to chase the coop arm's eight bytes should check all three again,
+ * because the cap is shared and the fallbacks are already near the edge. */
 template <int R, int Type, bool Vector = false,
           unsigned OutputRows = 4, bool Coop = false>
 __global__ static void QW_GU_MAXNREG
