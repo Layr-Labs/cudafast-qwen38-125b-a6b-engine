@@ -125,6 +125,141 @@ static void *qwen4exp_group_scratch(int tier, uint64_t bytes) {
     return next;
 }
 
+/* ------------------------------------------------------------------------
+ * The shared-expert fork.
+ *
+ * One MoE block is ds4_gpu_qwen4exp_routed_moe_tensor followed by
+ * ds4_gpu_qwen4exp_shared_expert_preq_tensor, in stream order.  The routed
+ * path is the memory-bound stream of the layer (it reads on the order of a
+ * gigabyte of expert weights per row); the shared expert's sigmoid gate,
+ * gate/up projection and mid quantizer are small latency-bound kernels that
+ * need only the quantized activation the routed path produces in its first
+ * microseconds.  Only the shared DOWN kernel touches `out`, which the routed
+ * path writes last.
+ *
+ * So the shared gate, gate/up and mid quantizer go on a side stream that
+ * waits on an event recorded right after the routed quantizer, and the main
+ * stream waits on an event recorded after the mid quantizer before it
+ * launches the shared down.  Same kernels, same launch parameters, same
+ * operands, same reduction orders: no number changes, only which stream
+ * three launches sit on and hence what they overlap.
+ *
+ * SCRATCH.  The sequential path places the shared mid's Q8_0 scratch at
+ * group-pool offset xq_bytes, which is where the routed path keeps its
+ * expert pair list (counts/offsets/cursor/active/pairs) -- fine in stream
+ * order, a race under the fork, since the routed gate/up reads that list
+ * while the side stream would be writing the shared mid.  The forked path
+ * therefore quantizes the shared mid into its own pool below.  The group
+ * pool is only READ by the side stream (xq/xs/xsum, the prefix), and every
+ * routed kernel after the quantizer only reads that prefix too.
+ *
+ * CAPTURE.  Inside a decode-island capture the side stream joins the
+ * capture through the cudaStreamWaitEvent on the first event and rejoins
+ * the origin stream through the cudaStreamWaitEvent on the second, in the
+ * same call, so a capture always ends joined.  Event record and wait add no
+ * nodes; the captured graph is the sequential one with the shared branch
+ * hung off the quantizer node instead of the routed tail.
+ *
+ * PDL.  The shared gate kernel moves with its consumer, so the gate ->
+ * gate/up programmatic pair and the mid-quantizer -> down pair are the
+ * pairs they were (ds4_cuda_qwen4exp.cuh).  The down launch gains the
+ * routed tail as a second predecessor; those kernels carry no trigger, so
+ * their implicit trigger is completion, and the down kernel's fence orders
+ * every activation read after it either way.
+ *
+ * THE VALVE.  DS4_QWEN4EXP_NO_SHARED_FORK set to anything takes the
+ * sequential path, exactly as before; a cleared environment (the ranked
+ * harness) forks.  Every CUDA call the fork adds is checked: a failure
+ * BEFORE any side-stream launch falls back to the sequential path in that
+ * call with nothing issued, a failure after one is a launch failure like
+ * any other.
+ * ------------------------------------------------------------------------ */
+static int qwen4exp_shared_fork_on(void) {
+    return getenv("DS4_QWEN4EXP_NO_SHARED_FORK") == NULL;
+}
+
+static cudaStream_t g_qwen4exp_fork_stream[16];
+static cudaEvent_t  g_qwen4exp_fork_xq_ready[16];
+static cudaEvent_t  g_qwen4exp_fork_mid_ready[16];
+static int          g_qwen4exp_fork_state[16];   /* 0 unset, 1 ready, -1 refused */
+
+/* The side stream and its two events for one device, created on first use.
+ * Non-blocking, so in eager mode it does not serialize against the legacy
+ * stream the main path rides there; every ordering it needs is an event. */
+static int qwen4exp_fork_ready(int tier, cudaStream_t stream) {
+    if (tier < 0 || tier >= 16) return 0;
+    if (g_qwen4exp_fork_state[tier] > 0) return 1;
+    if (g_qwen4exp_fork_state[tier] < 0) return 0;
+    /* The first routed call of a process is an eager warm pass, so this
+     * never runs under capture in the engine; refuse rather than create
+     * objects while a capture is open, and try again on a later call. */
+    cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &st) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (st != cudaStreamCaptureStatusNone) return 0;
+    cudaStream_t s = NULL;
+    cudaEvent_t a = NULL, b = NULL;
+    if (cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) == cudaSuccess &&
+        cudaEventCreateWithFlags(&a, cudaEventDisableTiming) == cudaSuccess &&
+        cudaEventCreateWithFlags(&b, cudaEventDisableTiming) == cudaSuccess) {
+        g_qwen4exp_fork_stream[tier] = s;
+        g_qwen4exp_fork_xq_ready[tier] = a;
+        g_qwen4exp_fork_mid_ready[tier] = b;
+        g_qwen4exp_fork_state[tier] = 1;
+        return 1;
+    }
+    fprintf(stderr, "ds4: qwen4exp shared-expert fork unavailable on device %d "
+                    "(%s); the shared expert stays in stream order\n",
+            tier, cudaGetErrorString(cudaGetLastError()));
+    if (b) (void)cudaEventDestroy(b);
+    if (a) (void)cudaEventDestroy(a);
+    if (s) (void)cudaStreamDestroy(s);
+    (void)cudaGetLastError();
+    g_qwen4exp_fork_state[tier] = -1;
+    return 0;
+}
+
+/* Q8_0 scratch for the forked shared mid: kept and grown like the group
+ * scratch above, retiring decode graphs the same way when it moves. */
+static void *g_qwen4exp_shexp_scratch[16];
+static uint64_t g_qwen4exp_shexp_bytes[16];
+
+static void *qwen4exp_shexp_scratch(int tier, uint64_t bytes) {
+    if (tier < 0 || tier >= 16) return NULL;
+    if (g_qwen4exp_shexp_scratch[tier] && g_qwen4exp_shexp_bytes[tier] >= bytes) {
+        return g_qwen4exp_shexp_scratch[tier];
+    }
+    void *next = NULL;
+    if (!cuda_ok(cudaMalloc(&next, (size_t)bytes),
+                 "qwen4exp shared expert fork scratch")) {
+        return NULL;
+    }
+    if (g_qwen4exp_shexp_scratch[tier]) {
+        ds4_gpu_decode_graphs_invalidate();
+        cudaFree(g_qwen4exp_shexp_scratch[tier]);
+    }
+    g_qwen4exp_shexp_scratch[tier] = next;
+    g_qwen4exp_shexp_bytes[tier] = bytes;
+    return next;
+}
+
+/* What the routed call recorded the first event against, per device.  The
+ * shared call forks only when its own view of the input matches field for
+ * field, and the record is consumed by that one call: a routed call whose
+ * shared call never came, or a shared call without a routed call before it,
+ * cannot pair with a stale event. */
+typedef struct {
+    int          armed;
+    cudaStream_t stream;
+    const void  *x;
+    const void  *xq;
+    uint32_t     n_tokens;
+    uint32_t     xgroups;
+} qwen4exp_fork_arm;
+static qwen4exp_fork_arm g_qwen4exp_fork_arm[16];
+
 static bool glm53_cuda_mul_u64(uint64_t a, uint64_t b, uint64_t *out) {
     if (!out || (a != 0u && b > UINT64_MAX / a)) return false;
     *out = a * b;
@@ -4638,6 +4773,22 @@ qwen4exp_moe_gateup_split_kernel(
     const bool second = (warp & 1u) != 0u;
     uint32_t expert = blockIdx.y;
     if (active) {
+    /* The routed gate/up edge, opened on the kernel the COOP decode path runs.
+     *
+     * The dependent launch already exists in this file on
+     * qwen4exp_moe_gateup_q_kernel, and its comment states the mechanism: the
+     * blocks are already up and scheduled when the quantizer's last group
+     * retires, instead of paying a launch behind it. The coop schedule does not
+     * use that kernel -- it uses this one, and this one was launched plainly.
+     *
+     * .nc rule: no pointer in this signature carries __restrict__, so no
+     * activation load can be hoisted above the fence as ld.global.nc.
+     * Deadlock rule: it constrains the PRODUCER, and the quantizer bounds
+     * itself to one wave before it triggers, so a multi-wave dependent is safe.
+     * Launched plainly -- three rows, every prefill width -- the fence is a
+     * no-op, exactly as it is for the kernel beside it. */
+    QWEN4EXP_PDL_SYNC();
+
         if ((int32_t)blockIdx.y >= active[0]) return;
         expert = (uint32_t)active[1 + blockIdx.y];
     }
@@ -7582,6 +7733,29 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         return 0;
     }
 
+    /* The shared-expert fork's first event: the quantized activation the
+     * shared gate/up needs is complete here, and nothing below writes the
+     * prefix it lives in.  A failed record leaves the shared call in stream
+     * order (qwen4exp_fork_ready, above the routed entry). */
+    if (logical_tier >= 0 && logical_tier < 16) {
+        qwen4exp_fork_arm *arm = &g_qwen4exp_fork_arm[logical_tier];
+        arm->armed = 0;
+        if (qwen4exp_shared_fork_on() &&
+            qwen4exp_fork_ready(logical_tier, stream)) {
+            if (cudaEventRecord(g_qwen4exp_fork_xq_ready[logical_tier],
+                                stream) == cudaSuccess) {
+                arm->armed = 1;
+                arm->stream = stream;
+                arm->x = (const void *)x->ptr;
+                arm->xq = (const void *)sc.xq;
+                arm->n_tokens = n_tokens;
+                arm->xgroups = xgroups;
+            } else {
+                (void)cudaGetLastError();
+            }
+        }
+    }
+
     /* The tensor-core tile takes the gate and up projections when the shapes
      * divide it and neither type is Q6_K, whose scale changes inside a group.
      * DS4_QWEN4EXP_NO_MMA keeps the dp4a kernel for the comparison. */
@@ -7782,8 +7956,9 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             (gate_slab->expert_bytes & 15ull) == 0ull &&
             (up_slab->expert_bytes & 15ull) == 0ull;
 #define QWEN4EXP_SPLIT_GATEUP(V, P, C) \
-        qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P, C><<< \
-            dim3((mid_dim + P - 1u) / P, gu_rows, 1), P * 64u, 0, stream>>>( \
+        QWEN4EXP_LAUNCH_PDL( \
+            (qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P, C>), \
+            (dim3((mid_dim + P - 1u) / P, gu_rows, 1)), P * 64u, 0, stream, \
             (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum, \
             sc.pairs, sc.counts, sc.offsets, gu_active, \
             (const float *)weights->ptr, \
@@ -8010,24 +8185,6 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
     const bool specialize_shared =
         getenv("DS4_QWEN4EXP_GENERIC_EXPERTS") == NULL;
 
-    /* The sigmoid gate is one dot against ONE F32 row per token.  It reads
-     * kilobytes, not megabytes, so it keeps the scalar reduction. Resolve its
-     * checkpoint-wide F32 type at launch just as the Q8 projections below do;
-     * other supported layouts retain the generic decoder. */
-    if (specialize_shared &&
-        router_slab->type == (uint32_t)DS4_QWEN4EXP_TY_f32) {
-        qwen4exp_shared_gate_kernel<DS4_QWEN4EXP_TY_f32>
-            <<<n_tokens, threads, shared, stream>>>(
-                (float *)gate_scale->ptr, router, (const float *)x->ptr,
-                router_slab->type, in_dim, n_tokens);
-    } else {
-        qwen4exp_shared_gate_kernel<-1>
-            <<<n_tokens, threads, shared, stream>>>(
-                (float *)gate_scale->ptr, router, (const float *)x->ptr,
-                router_slab->type, in_dim, n_tokens);
-    }
-    if (!cuda_ok(cudaGetLastError(), "qwen4exp shared gate launch")) return 0;
-
     const uint32_t xgroups = in_dim / 32u;
     const uint32_t mgroups = mid_dim / 32u;
     const uint64_t xq_bytes = qwen4exp_quant_bytes(n_tokens, xgroups);
@@ -8043,10 +8200,68 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
     float *ms = (float *)(at + (uint64_t)n_tokens * mgroups * 32u);
     int32_t *msum = (int32_t *)(ms + (uint64_t)n_tokens * mgroups);
 
+    /* THE FORK (the design note above the routed entry).  Taken when the
+     * routed call that just ran recorded its event against exactly this
+     * input, on this stream and device, and its quantized prefix is the one
+     * this call reads.  The shared mid then quantizes into the fork's own
+     * pool -- offset xq_bytes of the group pool is the routed pair list,
+     * live on the main stream until the routed gate/up has read it -- and
+     * the side stream waits on the routed quantizer before anything is
+     * launched on it.  Every decline lands on the sequential path with
+     * nothing issued. */
+    int fork = 0;
+    if (pre_quantized && logical_tier >= 0 && logical_tier < 16 &&
+        qwen4exp_shared_fork_on() && g_qwen4exp_fork_state[logical_tier] > 0) {
+        qwen4exp_fork_arm *arm = &g_qwen4exp_fork_arm[logical_tier];
+        const int match = arm->armed && arm->stream == stream &&
+            arm->x == (const void *)x->ptr && arm->xq == (const void *)xq &&
+            arm->n_tokens == n_tokens && arm->xgroups == xgroups;
+        arm->armed = 0;
+        if (match) {
+            char *fork_at = (char *)qwen4exp_shexp_scratch(logical_tier, mq_bytes);
+            if (!fork_at) {
+                (void)cudaGetLastError();
+            } else if (cudaStreamWaitEvent(g_qwen4exp_fork_stream[logical_tier],
+                                           g_qwen4exp_fork_xq_ready[logical_tier],
+                                           0) != cudaSuccess) {
+                fprintf(stderr, "ds4: qwen4exp shared-expert fork wait failed "
+                                "(%s); this call stays in stream order\n",
+                        cudaGetErrorString(cudaGetLastError()));
+            } else {
+                fork = 1;
+                mq = (int8_t *)fork_at;
+                ms = (float *)(fork_at + (uint64_t)n_tokens * mgroups * 32u);
+                msum = (int32_t *)(ms + (uint64_t)n_tokens * mgroups);
+            }
+        }
+    }
+    /* The gate, the gate/up projection and the mid quantizer ride `side`:
+     * the fork's stream when forked, `stream` itself when not.  The down
+     * projection always rides `stream`. */
+    cudaStream_t side = fork ? g_qwen4exp_fork_stream[logical_tier] : stream;
+
+    /* The sigmoid gate is one dot against ONE F32 row per token.  It reads
+     * kilobytes, not megabytes, so it keeps the scalar reduction. Resolve its
+     * checkpoint-wide F32 type at launch just as the Q8 projections below do;
+     * other supported layouts retain the generic decoder. */
+    if (specialize_shared &&
+        router_slab->type == (uint32_t)DS4_QWEN4EXP_TY_f32) {
+        qwen4exp_shared_gate_kernel<DS4_QWEN4EXP_TY_f32>
+            <<<n_tokens, threads, shared, side>>>(
+                (float *)gate_scale->ptr, router, (const float *)x->ptr,
+                router_slab->type, in_dim, n_tokens);
+    } else {
+        qwen4exp_shared_gate_kernel<-1>
+            <<<n_tokens, threads, shared, side>>>(
+                (float *)gate_scale->ptr, router, (const float *)x->ptr,
+                router_slab->type, in_dim, n_tokens);
+    }
+    if (!cuda_ok(cudaGetLastError(), "qwen4exp shared gate launch")) return 0;
+
     if (!pre_quantized) {
         if (!qwen4exp_quantize_rows(xq, xs, xsum, (const float *)x->ptr,
                                     n_tokens, in_dim, xgroups, in_dim, 0, 1,
-                                    stream)) {
+                                    side)) {
             return 0;
         }
     }
@@ -8126,12 +8341,14 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
      * and both tiles are gated at sixty-four, so neither can ever be a node
      * in a captured graph: at a capture width the shared expert takes the
      * per-row and staged dp4a kernels it took before either tile existed.
-     * And every launch here -- both tiles, both dp4a pairs, the router and
-     * the two quantise passes -- goes on `stream`, which is
-     * cuda_decode_stream(), so it is the capture stream whenever one is
-     * active.  Nothing on this path allocates or frees, so the scratch
-     * growth above and its ds4_gpu_decode_graphs_invalidate() are untouched
-     * by anything below it. */
+     * And every launch here goes on `stream`, which is cuda_decode_stream()
+     * and so the capture stream whenever one is active, or on `side`, which
+     * is that same stream unless the fork above was taken -- and then it is
+     * the fork's stream, joined to the capture by the event wait the fork
+     * issued and rejoined below, before the down launch, by the second.
+     * Nothing on this path allocates or frees, so the scratch growth above
+     * and its ds4_gpu_decode_graphs_invalidate() are untouched by anything
+     * below it. */
     const uint32_t gu_types[2] = { gate_slab->type, up_slab->type };
     const uint32_t dn_types[1] = { down_slab->type };
     int gu_logch = 0, dn_logch = 0;
@@ -8149,7 +8366,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
     if (pipe_gateup &&
         qwen4exp_shared_pipe_dispatch<2>(gu_pk, gu_pl, (float *)mid->ptr, gate, up, xq, xs,
                                          NULL, gate_slab->row_bytes, up_slab->row_bytes,
-                                         xgroups, mid_dim, n_tokens, stream)) {
+                                         xgroups, mid_dim, n_tokens, side)) {
         ds4_gpu_qwen4exp_shared_mma_launches++;
     } else if (mma_gateup) {
         const uint32_t ks = ((xgroups + 31u) / 32u) << gu_logch;
@@ -8158,7 +8375,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
                         1);
         ds4_gpu_qwen4exp_shared_mma_launches++;
         QS_MMA_DISPATCH(qwen4exp_shared_gateup_mma_kernel, gu_logch, grid,
-                        (size_t)qs_mma_smem_bytes(ks, 2u), stream,
+                        (size_t)qs_mma_smem_bytes(ks, 2u), side,
                         (float *)mid->ptr, gate, up, xq, xs, xsum,
                         gate_slab->row_bytes, up_slab->row_bytes,
                         gate_slab->type, up_slab->type,
@@ -8168,14 +8385,14 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
     } else if (use_mma) {
         qwen4exp_shared_q8_mma_kernel<true><<<
                 dim3((mid_dim + QW_SH_BM - 1u) / QW_SH_BM, mma_tiles, 1),
-                QW_SH_THREADS, 0, stream>>>(
+                QW_SH_THREADS, 0, side>>>(
                 (float *)mid->ptr, gate, up, xq, xs, xsum, NULL,
                 gate_slab->row_bytes, up_slab->row_bytes,
                 xgroups, mid_dim, n_tokens, 0.0f);
     } else if (stage_gateup) {
         qwen4exp_shared_gateup_stage_kernel<QWEN4EXP_STAGE_R>
             <<<dim3(mid_dim, stage_tiles, 1), QWEN4EXP_STAGE_THREADS,
-               (size_t)qwen4exp_stage_bytes(xgroups, 2), stream>>>(
+               (size_t)qwen4exp_stage_bytes(xgroups, 2), side>>>(
                 (float *)mid->ptr, gate, up, xq, xs, xsum,
                 gate_slab->row_bytes, up_slab->row_bytes,
                 gate_slab->type, up_slab->type, xgroups, mid_dim, n_tokens);
@@ -8190,13 +8407,13 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         QWEN4EXP_LAUNCH_PDL( \
                 (qwen4exp_shared_gateup_q_kernel<R, GT, UT, V>), \
                 (dim3((mid_dim + 7u) / 8u, tiles, 1)), \
-                threads, 0, stream, \
+                threads, 0, side, \
                 (float *)mid->ptr, gate, up, xq, xs, xsum, \
                 gate_slab->row_bytes, up_slab->row_bytes, \
                 gate_slab->type, up_slab->type, xgroups, mid_dim, n_tokens); \
     } else { \
         qwen4exp_shared_gateup_q_kernel<R, GT, UT, V> \
-            <<<dim3((mid_dim + 7u) / 8u, tiles, 1), threads, 0, stream>>>( \
+            <<<dim3((mid_dim + 7u) / 8u, tiles, 1), threads, 0, side>>>( \
                     (float *)mid->ptr, gate, up, xq, xs, xsum, \
                     gate_slab->row_bytes, up_slab->row_bytes, \
                     gate_slab->type, up_slab->type, xgroups, mid_dim, n_tokens); \
@@ -8228,8 +8445,23 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
 
     if (!qwen4exp_quantize_rows(mq, ms, msum, (const float *)mid->ptr,
                                 n_tokens, mid_dim, mgroups, mid_dim, 0, 1,
-                                stream)) {
+                                side)) {
         return 0;
+    }
+
+    if (fork) {
+        /* Rejoin: the main stream, and so the down projection below, waits
+         * on the mid quantizer.  Inside a capture this is also what joins
+         * the side stream back to the origin before the capture ends. */
+        if (!cuda_ok(cudaEventRecord(g_qwen4exp_fork_mid_ready[logical_tier],
+                                     side),
+                     "qwen4exp shared fork mid record") ||
+            !cuda_ok(cudaStreamWaitEvent(stream,
+                                         g_qwen4exp_fork_mid_ready[logical_tier],
+                                         0),
+                     "qwen4exp shared fork join")) {
+            return 0;
+        }
     }
 
     if (pipe_down &&

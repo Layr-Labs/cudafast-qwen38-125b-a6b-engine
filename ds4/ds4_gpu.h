@@ -3010,7 +3010,10 @@ int ds4_gpu_qwen4exp_shared_expert_tensor(
 /* With pre_quantized set, CUDA requires the same unchanged input, width,
  * token count and device as the immediately preceding routed MoE call, and
  * enough routed scratch for this shared intermediate. The tower's equal
- * intermediate widths satisfy this. Other backends may quantize normally. */
+ * intermediate widths satisfy this. Other backends may quantize normally.
+ * CUDA also overlaps this call's gate/up with the routed call's tail on a
+ * side stream when those conditions hold (DS4_QWEN4EXP_NO_SHARED_FORK keeps
+ * it in stream order); the bytes are the same either way. */
 int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         ds4_gpu_tensor              *out,
         ds4_gpu_tensor              *mid,
