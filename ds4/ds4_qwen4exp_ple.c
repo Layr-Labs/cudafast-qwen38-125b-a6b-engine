@@ -641,42 +641,26 @@ void ds4_ple_history_reset(const ds4_ple_constants *c, ds4_ple_history *h) {
     for (int i = 0; i < DS4_PLE_MAX_NGRAM; i++) h->previous[i] = c->eos_token_id;
 }
 
-/* `out` and `tokens` are disjoint from `c` and from each other: `c` is a
- * const view of the shape, `tokens` the caller's input row and `out` a
- * caller-owned id buffer.  Without the qualifiers the compiler has to assume
- * the stores through `out` may overwrite `c`, so it reloads
- * `c->multipliers[n-1]`, `c->head_vocab_sizes[head]` and
- * `c->head_offsets[head]` out of memory on every iteration of both loops.
- * Saying they do not alias lets those become loop-invariant. */
-void ds4_ple_row_ids(const ds4_ple_constants *__restrict c, ds4_ple_history *h,
-                     const int32_t *__restrict tokens, size_t count,
-                     uint64_t *__restrict out) {
+void ds4_ple_row_ids(const ds4_ple_constants *c, ds4_ple_history *h,
+                     const int32_t *tokens, size_t count, uint64_t *out) {
     if (!c || !h || (count != 0 && (!tokens || !out))) return;
 
     const uint32_t ngram = c->ngram_size;
     const uint32_t hpn   = c->heads_per_ngram;
     const int32_t  eos   = c->eos_token_id;
-    const uint64_t *__restrict mult = c->multipliers;
-    const uint64_t *__restrict voc  = c->head_vocab_sizes;
-    const uint64_t *__restrict off  = c->head_offsets;
-
-    /* `head_count` is loop-invariant and the row block for token t is exactly
-     * head_count uint64s after the previous one, so the destination is carried
-     * as a pointer step rather than re-multiplied per token. */
-    const size_t head_count = c->head_count;
-    uint64_t *row = out;
 
     for (size_t t = 0; t < count; t++) {
         const int32_t cur = tokens[t];
 
-        uint64_t mixed = (uint64_t)(uint32_t)cur * mult[0];
+        uint64_t mixed = (uint64_t)(uint32_t)cur * c->multipliers[0];
+        uint64_t *row  = out + t * c->head_count;
 
         for (uint32_t n = 2; n <= ngram; n++) {
-            mixed ^= (uint64_t)(uint32_t)h->previous[n - 1] * mult[n - 1];
+            mixed ^= (uint64_t)(uint32_t)h->previous[n - 1] * c->multipliers[n - 1];
             const uint32_t low = (n - 2) * hpn;
             for (uint32_t k = 0; k < hpn; k++) {
                 const uint32_t head = low + k;
-                row[head] = mixed % voc[head] + off[head];
+                row[head] = mixed % c->head_vocab_sizes[head] + c->head_offsets[head];
             }
         }
 
@@ -687,7 +671,6 @@ void ds4_ple_row_ids(const ds4_ple_constants *__restrict c, ds4_ple_history *h,
             h->previous[p] = (cur == eos) ? eos : h->previous[p - 1];
         }
         if (ngram >= 2) h->previous[1] = cur;
-        row += head_count;
     }
 }
 
@@ -706,57 +689,21 @@ static const int8_t ple_kvalues_iq4nl[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
 };
 
-/* The high-nibble half of the table, materialised at compile time so the
- * hot loop carries no lazy-init branch.  Generated as kv_hi[b] ==
- * ple_kvalues_iq4nl[b >> 4] for all 256 byte values. */
-static const int8_t ple_kvalues_iq4nl_hi[256] = {
-    -127, -127, -127, -127, -127, -127, -127, -127, -127, -127, -127, -127, -127, -127, -127, -127,
-    -104, -104, -104, -104, -104, -104, -104, -104, -104, -104, -104, -104, -104, -104, -104, -104,
-     -83,  -83,  -83,  -83,  -83,  -83,  -83,  -83,  -83,  -83,  -83,  -83,  -83,  -83,  -83,  -83,
-     -65,  -65,  -65,  -65,  -65,  -65,  -65,  -65,  -65,  -65,  -65,  -65,  -65,  -65,  -65,  -65,
-     -49,  -49,  -49,  -49,  -49,  -49,  -49,  -49,  -49,  -49,  -49,  -49,  -49,  -49,  -49,  -49,
-     -35,  -35,  -35,  -35,  -35,  -35,  -35,  -35,  -35,  -35,  -35,  -35,  -35,  -35,  -35,  -35,
-     -22,  -22,  -22,  -22,  -22,  -22,  -22,  -22,  -22,  -22,  -22,  -22,  -22,  -22,  -22,  -22,
-     -10,  -10,  -10,  -10,  -10,  -10,  -10,  -10,  -10,  -10,  -10,  -10,  -10,  -10,  -10,  -10,
-       1,    1,    1,    1,    1,    1,    1,    1,    1,    1,    1,    1,    1,    1,    1,    1,
-      13,   13,   13,   13,   13,   13,   13,   13,   13,   13,   13,   13,   13,   13,   13,   13,
-      25,   25,   25,   25,   25,   25,   25,   25,   25,   25,   25,   25,   25,   25,   25,   25,
-      38,   38,   38,   38,   38,   38,   38,   38,   38,   38,   38,   38,   38,   38,   38,   38,
-      53,   53,   53,   53,   53,   53,   53,   53,   53,   53,   53,   53,   53,   53,   53,   53,
-      69,   69,   69,   69,   69,   69,   69,   69,   69,   69,   69,   69,   69,   69,   69,   69,
-      89,   89,   89,   89,   89,   89,   89,   89,   89,   89,   89,   89,   89,   89,   89,   89,
-     113,  113,  113,  113,  113,  113,  113,  113,  113,  113,  113,  113,  113,  113,  113,  113,
-};
-
-/* FP16 -> FP32 with no data-dependent loop.
- *
- * The shipped converter normalised a subnormal mantissa with
- * `while ((m & 0x400u) == 0) { m <<= 1; e++; }`.  For the block scales this
- * table actually carries the loop never runs, so its cost is the branch, not
- * the shift -- and it is an unpredictable one on the rare subnormal.  A
- * subnormal has at most ten significant mantissa bits, so the normalising
- * shift is exactly `__builtin_clz` of the mantissa over a 16-bit field, and
- * the whole conversion becomes a select plus a shift.
- *
- * Bit-identical to the loop for every one of the 65536 possible halves: the
- * shift amount is the same, the exponent adjustment is the same, and the
- * mantissa mask is the same.  Verified against the original over the full
- * 16-bit domain. */
 static float ple_fp16_to_fp32(uint16_t h) {
     const uint32_t sign     = (uint32_t)(h & 0x8000u) << 16;
     const uint32_t exponent = (h >> 10) & 0x1Fu;
     const uint32_t mantissa = h & 0x3FFu;
     uint32_t bits;
 
-    if (exponent == 0u) {
-        if (mantissa == 0u) {
+    if (exponent == 0) {
+        if (mantissa == 0) {
             bits = sign;
         } else {
-            /* A ten-bit mantissa needs (10 - k) shifts to bring bit 10 up,
-             * where k is its highest set bit, and clz(m) = 31 - k, so the
-             * shift count is clz(m) - 21. */
-            const uint32_t e = (uint32_t)__builtin_clz(mantissa) - 21u;
-            const uint32_t m = (mantissa << e) & 0x3FFu;
+            /* Subnormal: normalize it into a float32 exponent. */
+            uint32_t e = 0;
+            uint32_t m = mantissa;
+            while ((m & 0x400u) == 0) { m <<= 1; e++; }
+            m &= 0x3FFu;
             bits = sign | ((127u - 15u - e + 1u) << 23) | (m << 13);
         }
     } else if (exponent == 0x1Fu) {
@@ -770,47 +717,20 @@ static float ple_fp16_to_fp32(uint16_t h) {
     return f;
 }
 
-/* `blocks` and `out` never alias: the caller passes a const view of the
- * memory-mapped shard and a disjoint host staging buffer.  Saying so lets
- * the compiler keep the scale and the nibble byte live across the stores
- * instead of assuming a store may have overwritten the source. */
-void ds4_ple_dequant_iq4_nl(const void *__restrict blocks, size_t block_count,
-                            float *__restrict out) {
-    const uint8_t *__restrict p = (const uint8_t *)blocks;
+void ds4_ple_dequant_iq4_nl(const void *blocks, size_t block_count, float *out) {
+    const uint8_t *p = (const uint8_t *)blocks;
     if (!p || !out) return;
 
-
-    const int8_t *const kv = ple_kvalues_iq4nl;
     for (size_t b = 0; b < block_count; b++) {
-        /* The caller walks a token row as five consecutive blocks, so the
-         * next block's eighteen bytes are the next thing this loop touches.
-         * Asking for them one iteration early costs one hint and hides the
-         * latency of the scale load and the nibble fetch behind the current
-         * block's dequant.  Pure hint: the values produced are unchanged. */
-        if (b + 1u < block_count)
-            __builtin_prefetch(p + DS4_PLE_IQ4_NL_BLOCK_BYTES, 0, 1);
         uint16_t half;
         memcpy(&half, p, sizeof(half));
         const float d = ple_fp16_to_fp32(half);
         const uint8_t *qs = p + 2;
         float *y = out + b * DS4_PLE_IQ4_NL_BLOCK_ELEMS;
 
-        /* Store-bound loop: five blocks of output for every block of input, so
-         * the allocating write into the staging row is what stalls.  Ask for
-         * the destination line one block early, with the write-intent bit set,
-         * so the fill overlaps the current block's dequant.  Hint only. */
-        if (b + 1u < block_count)
-            __builtin_prefetch(y + DS4_PLE_IQ4_NL_BLOCK_ELEMS, 1, 3);
-
-        /* Unrolled by two: the block is a fixed sixteen nibble bytes, so the
-         * trip count is a compile-time constant and half the loop-carried
-         * bookkeeping disappears.  Same reads, same order, same values. */
-        for (int j = 0; j < DS4_PLE_IQ4_NL_BLOCK_ELEMS / 2; j += 2) {
-            const uint8_t q0 = qs[j], q1 = qs[j + 1];
-            y[j]      = d * (float)kv[q0 & 0x0F];
-            y[j + 1]  = d * (float)kv[q1 & 0x0F];
-            y[j + 16] = d * (float)ple_kvalues_iq4nl_hi[q0];
-            y[j + 17] = d * (float)ple_kvalues_iq4nl_hi[q1];
+        for (int j = 0; j < DS4_PLE_IQ4_NL_BLOCK_ELEMS / 2; j++) {
+            y[j]      = d * (float)ple_kvalues_iq4nl[qs[j] & 0x0F];
+            y[j + 16] = d * (float)ple_kvalues_iq4nl[qs[j] >> 4];
         }
         p += DS4_PLE_IQ4_NL_BLOCK_BYTES;
     }

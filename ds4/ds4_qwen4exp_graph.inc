@@ -1257,30 +1257,21 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
             }
         }
         for (uint32_t t = 0; t < n_tokens; t++) {
-            /* The head's destination strides are constants of the shape, so
-             * the token base is hoisted out of the head loop and the head
-             * offset is carried as a pointer step instead of a multiply per
-             * head.  Same addresses, same values. */
-            const uint64_t *ids = s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD;
-            float *dst = s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD;
             for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
-                const uint64_t row = ids[h];
-                /* Every head of this token except the last is followed by
-                 * another table row, so ask for the next id early.  Hint. */
-                if (h + 1u < DS4_N_PLE_HEAD)
-                    __builtin_prefetch(ids + h + 1u, 0, 1);
+                const uint64_t row =
+                    s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h];
                 const uint8_t *quant = ds4_qwen4exp_ple_row(&w->ple, row);
-                /* Cold: a hashed row past the table is a hard refusal that has
-                 * never fired in a scored run, so keep it out of the hot path. */
-                if (__builtin_expect(!quant, 0)) {
+                if (!quant) {
                     fprintf(stderr,
                             "ds4: qwen4exp block %u hashed token %u head %u to row "
                             "%" PRIu64 ", past the %" PRIu64 " the table holds\n",
                             il, t, h, row, w->ple.rows);
                     return false;
                 }
-                ds4_ple_dequant_iq4_nl(quant, blocks_per_row, dst);
-                dst += DS4_N_PLE_ROW_DIM;
+                ds4_ple_dequant_iq4_nl(
+                    quant, blocks_per_row,
+                    s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD +
+                        (uint64_t)h * DS4_N_PLE_ROW_DIM);
             }
         }
     } else {
@@ -1291,29 +1282,17 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
          * a sequential scan would have ended with -- is copied back after
          * the join, so the session still carries the same history forward. */
         long nthreads = 1;
-        /* Resolved once per process.  This runs on every prefill round, and
-         * both getenv and sysconf(_SC_NPROCESSORS_ONLN) are libc calls that
-         * walk external state -- the environ array and the online-CPU map --
-         * to return a value that cannot change while the engine is open.
-         * Caching it removes two of those walks from the round. */
-        static long ple_gather_threads_cached = -1;
-        if (ple_gather_threads_cached < 0) {
-            const char * const thr_env =
-                getenv("DS4_QWEN4EXP_PLE_GATHER_THREADS");
-            long v = 0;
-            if (thr_env && thr_env[0]) {
-                char *end = NULL;
-                v = strtol(thr_env, &end, 10);
-                if (end == thr_env || v < 0) v = 0;
-            }
-            if (v <= 0) {
-                v = sysconf(_SC_NPROCESSORS_ONLN);
-                if (v > 16) v = 16;
-                if (v < 1) v = 1;
-            }
-            ple_gather_threads_cached = v;
+        const char * const thr_env =
+            getenv("DS4_QWEN4EXP_PLE_GATHER_THREADS");
+        if (thr_env && thr_env[0]) {
+            char *end = NULL;
+            long v = strtol(thr_env, &end, 10);
+            if (end != thr_env && v >= 0) nthreads = v;
+        } else {
+            nthreads = sysconf(_SC_NPROCESSORS_ONLN);
+            if (nthreads > 16) nthreads = 16;
+            if (nthreads < 1) nthreads = 1;
         }
-        nthreads = ple_gather_threads_cached;
         if (nthreads <= 1 || n_tokens < 64u) nthreads = 1;
 
         if (nthreads == 1) {
