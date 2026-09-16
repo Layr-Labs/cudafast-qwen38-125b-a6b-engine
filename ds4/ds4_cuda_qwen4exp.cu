@@ -4159,7 +4159,34 @@ qwen4exp_moe_gateup_mma_kernel(
  * The activation is the routed intermediate, quantised per (token, slot) pair,
  * so the pair index addresses it directly.
  */
-template <int DownType = -1, bool Wide6 = false>
+/* Conflict-free word layout for an 8-row x 4-group down scratch slab.
+ * At a staging store, lane = 4*row + group and word is fixed. At an MMA
+ * fragment load, lane = 4*row + word_low and group is fixed. The low five
+ * address bits are 4*row + (word_low XOR group): both maps visit every bank
+ * once. The remaining bits retain group and word_high, so the map is bijective.
+ * This permutes transient decoded CTA scratch only; source weights stay in
+ * their original representation and order. */
+__device__ __forceinline__ static uint32_t qw_down_mma_word(
+        uint32_t row, uint32_t group, uint32_t word) {
+    return (row >> 3u) * 256u + (group * 2u + (word >> 2u)) * 32u +
+           (row & 7u) * 4u + ((word & 3u) ^ group);
+}
+
+/* Q8_0 has no additive weight coefficient. Its previous second FMA adds
+ * signed zero for finite activation scales. The preceding FMA accumulates a
+ * rounded float coefficient times an exact integer dot into a float, starting
+ * at +0. Every finite exact result is an integer multiple of 2^-149: a nonzero
+ * result cannot underflow to -0, and exact cancellation rounds to +0. Thus the
+ * accumulator never becomes -0, and the zero FMA cannot change its bits.
+ *
+ * Normalize nonfinite activation scales to NaN during staging, with x + 0*x:
+ * the old zero-bias FMA also forces NaN for those scales. Finite scales retain
+ * their bits, including -0. This removes the zero weight-coefficient tile,
+ * activation-sum tile and second FMA. Integer MMAs, group order and the first
+ * FMA remain unchanged. Only activation scratch changes; weights stay frozen.
+ */
+template <int DownType = -1, bool Wide6 = false, bool Q8Bias = false,
+          bool Swizzle = false>
 __global__ __launch_bounds__(QW_DOWN_MMA_THREADS) static void
 qwen4exp_moe_down_mma_kernel(
         float *partial,
@@ -4177,11 +4204,17 @@ qwen4exp_moe_down_mma_kernel(
         uint32_t groups,
         uint32_t out_dim,
         uint32_t dq_stage) {
-    __shared__ __align__(16) int8_t sA[QW_DOWN_MMA_BM * QW_MMA_LD];
-    __shared__ __align__(16) int8_t sB[QW_MMA_BN * QW_MMA_LD];
+    static_assert(!Swizzle || DownType == DS4_QWEN4EXP_TY_q8_0 ||
+                  DownType == DS4_QWEN4EXP_TY_q5_1,
+                  "down swizzle supports Q8_0 and Q5_1");
+    static_assert(!Q8Bias || DownType == DS4_QWEN4EXP_TY_q8_0,
+                  "zero bias specialization requires Q8_0");
+    __shared__ __align__(16) int8_t sA[QW_DOWN_MMA_BM * (Swizzle ? QW_MMA_KC : QW_MMA_LD)];
+    __shared__ __align__(16) int8_t sB[QW_MMA_BN * (Swizzle ? QW_MMA_KC : QW_MMA_LD)];
     __shared__ float  sWA[QW_DOWN_MMA_BM * QW_MMA_G];
-    __shared__ float  sWB[QW_DOWN_MMA_BM * QW_MMA_G];
-    __shared__ float  sXS[QW_MMA_BN * QW_MMA_G], sXSUM[QW_MMA_BN * QW_MMA_G];
+    __shared__ float  sWB[Q8Bias ? 1 : QW_DOWN_MMA_BM * QW_MMA_G];
+    __shared__ float sXS[QW_MMA_BN * QW_MMA_G];
+    __shared__ float sXSUM[Q8Bias ? 1 : QW_MMA_BN * QW_MMA_G];
     __shared__ uint32_t sPair[QW_MMA_BN];
 
     const uint32_t tid  = threadIdx.x;
@@ -4240,21 +4273,45 @@ qwen4exp_moe_down_mma_kernel(
                         down_e + (uint64_t)orow * down_row_bytes;
                     if (w_dq) {
                         uint32_t raw[6];
-                        dev_qwen4exp_group_decode_w(dtype, drow, g,
-                                qw_raw_load<Wide6>(dtype, drow, g, raw)
-                                    ? raw : NULL,
-                                &sA[r * QW_MMA_LD + gg * 32], wa, wb);
+                        if (Swizzle) {
+                            __align__(4) int8_t decoded[32];
+                            dev_qwen4exp_group_decode_w(dtype, drow, g,
+                                    qw_raw_load<Wide6>(dtype, drow, g, raw)
+                                        ? raw : NULL, decoded, wa, wb);
+#pragma unroll
+                            for (uint32_t j = 0; j < 8u; j++)
+                                ((uint32_t *)(void *)sA)[qw_down_mma_word(r, gg, j)] =
+                                    qw_pack4(decoded + 4u * j);
+                        } else {
+                            dev_qwen4exp_group_decode_w(dtype, drow, g,
+                                    qw_raw_load<Wide6>(dtype, drow, g, raw)
+                                        ? raw : NULL,
+                                    &sA[r * QW_MMA_LD + gg * 32], wa, wb);
+                        }
                     } else {
                         dev_qwen4exp_group_decode(dtype, drow, g,
                                 wq, wa, wb, &halves);
-                        qw_tile_store_group(&sA[r * QW_MMA_LD + gg * 32], wq);
+                        if (Swizzle) {
+#pragma unroll
+                            for (uint32_t j = 0; j < 8u; j++)
+                                ((uint32_t *)(void *)sA)[qw_down_mma_word(r, gg, j)] =
+                                    qw_pack4(wq + 4u * j);
+                        } else {
+                            qw_tile_store_group(&sA[r * QW_MMA_LD + gg * 32], wq);
+                        }
                     }
                     sWA[r * QW_MMA_G + gg] = wa[0];
-                    sWB[r * QW_MMA_G + gg] = wb[0];
+                    if (!Q8Bias) sWB[r * QW_MMA_G + gg] = wb[0];
                 } else {
-                    qw_tile_store_zero(&sA[r * QW_MMA_LD + gg * 32]);
+                    if (Swizzle) {
+#pragma unroll
+                        for (uint32_t j = 0; j < 8u; j++)
+                            ((uint32_t *)(void *)sA)[qw_down_mma_word(r, gg, j)] = 0u;
+                    } else {
+                        qw_tile_store_zero(&sA[r * QW_MMA_LD + gg * 32]);
+                    }
                     sWA[r * QW_MMA_G + gg] = 0.0f;
-                    sWB[r * QW_MMA_G + gg] = 0.0f;
+                    if (!Q8Bias) sWB[r * QW_MMA_G + gg] = 0.0f;
                 }
             }
             for (uint32_t idx = tid; idx < QW_MMA_BN * QW_MMA_G;
@@ -4265,14 +4322,28 @@ qwen4exp_moe_down_mma_kernel(
                 const uint32_t p = sPair[tk];
                 if (p != 0xffffffffu && g < groups) {
                     const uint64_t at = (uint64_t)p * groups + g;
-                    qw_tile_copy_group(&sB[tk * QW_MMA_LD + gg * 32],
-                                       mq + at * 32u);
-                    sXS  [tk * QW_MMA_G + gg] = ms[at];
-                    sXSUM[tk * QW_MMA_G + gg] = (float)msum[at];
+                    if (Swizzle) {
+#pragma unroll
+                        for (uint32_t j = 0; j < 8u; j++)
+                            ((uint32_t *)(void *)sB)[qw_down_mma_word(tk, gg, j)] =
+                                ((const uint32_t *)(const void *)(mq + at * 32u))[j];
+                    } else {
+                        qw_tile_copy_group(&sB[tk * QW_MMA_LD + gg * 32],
+                                           mq + at * 32u);
+                    }
+                    const float sc = ms[at];
+                    sXS[tk * QW_MMA_G + gg] = Q8Bias ? sc + 0.0f * sc : sc;
+                    if (!Q8Bias) sXSUM[tk * QW_MMA_G + gg] = (float)msum[at];
                 } else {
-                    qw_tile_store_zero(&sB[tk * QW_MMA_LD + gg * 32]);
+                    if (Swizzle) {
+#pragma unroll
+                        for (uint32_t j = 0; j < 8u; j++)
+                            ((uint32_t *)(void *)sB)[qw_down_mma_word(tk, gg, j)] = 0u;
+                    } else {
+                        qw_tile_store_zero(&sB[tk * QW_MMA_LD + gg * 32]);
+                    }
                     sXS[tk * QW_MMA_G + gg] = 0.0f;
-                    sXSUM[tk * QW_MMA_G + gg] = 0.0f;
+                    if (!Q8Bias) sXSUM[tk * QW_MMA_G + gg] = 0.0f;
                 }
             }
             __syncthreads();
@@ -4287,7 +4358,10 @@ qwen4exp_moe_down_mma_kernel(
                 for (int r = 0; r < 4; r++) {
                     const uint32_t rr = ar + ((r & 1) ? 8u : 0u);
                     const uint32_t kk = gg * 32u + ak + ((r & 2) ? 16u : 0u);
-                    af[r] = qw_tile_word(&sA[rr * QW_MMA_LD + kk]);
+                    af[r] = Swizzle
+                        ? ((const uint32_t *)(const void *)sA)[
+                              qw_down_mma_word(rr, (uint32_t)gg, (kk & 31u) >> 2u)]
+                        : qw_tile_word(&sA[rr * QW_MMA_LD + kk]);
                 }
                 const uint32_t m0 = warp * 16u + (lane >> 2);
 #pragma unroll
@@ -4300,9 +4374,12 @@ qwen4exp_moe_down_mma_kernel(
                     const uint32_t bn = nt * 8u + (lane >> 2);
 #pragma unroll
                     for (int r = 0; r < 2; r++) {
-                        bf[r] = qw_tile_word(&sB[bn * QW_MMA_LD + gg * 32u +
-                                                 (lane & 3u) * 4u +
-                                                 (r ? 16u : 0u)]);
+                        bf[r] = Swizzle
+                            ? ((const uint32_t *)(const void *)sB)[
+                                  qw_down_mma_word(bn, (uint32_t)gg,
+                                                 (lane & 3u) + (r ? 4u : 0u))]
+                            : qw_tile_word(&sB[bn * QW_MMA_LD + gg * 32u +
+                                              (lane & 3u) * 4u + (r ? 16u : 0u)]);
                     }
                     int32_t d[4] = {0, 0, 0, 0};
                     qw_mma_m16n8k32(d, af, bf);
@@ -4315,8 +4392,10 @@ qwen4exp_moe_down_mma_kernel(
                         const int at = nt * 4 + r;
                         acc[at] = fmaf(sWA[mr * QW_MMA_G + gg] * sc,
                                        (float)d[r], acc[at]);
-                        acc[at] = fmaf(sWB[mr * QW_MMA_G + gg] * sc,
-                                       sXSUM[nn * QW_MMA_G + gg], acc[at]);
+                        if (!Q8Bias) {
+                            acc[at] = fmaf(sWB[mr * QW_MMA_G + gg] * sc,
+                                           sXSUM[nn * QW_MMA_G + gg], acc[at]);
+                        }
                     }
                 }
             }
@@ -7859,8 +7938,8 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
          * loads; DS4_QWEN4EXP_NO_Q51_WIDE_LOAD restores the word loop. */
         const bool dn_wide6 =
             getenv("DS4_QWEN4EXP_NO_Q51_WIDE_LOAD") == NULL;
-#define QWEN4EXP_DOWN_MMA(DT, W6) \
-        qwen4exp_moe_down_mma_kernel<DT, W6><<< \
+#define QWEN4EXP_DOWN_MMA(DT, W6, QB, SW) \
+        qwen4exp_moe_down_mma_kernel<DT, W6, QB, SW><<< \
                 dim3(out_dim / QW_DOWN_MMA_BM, gu_rows, 1), \
                 QW_DOWN_MMA_THREADS, 0, stream>>>( \
                 (float *)down_partial->ptr, down, sc.mq, sc.ms, sc.msum, \
@@ -7869,14 +7948,30 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
                 mgroups, out_dim, dn_dq_stage)
         if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q5_1) {
             if (dn_wide6) {
-                QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q5_1, true);
+                if (getenv("DS4_QWEN4EXP_NO_DOWN_MMA_SWIZZLE") == NULL) {
+                    QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q5_1, true, false, true);
+                } else {
+                    QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q5_1, true, false, false);
+                }
             } else {
-                QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q5_1, false);
+                if (getenv("DS4_QWEN4EXP_NO_DOWN_MMA_SWIZZLE") == NULL) {
+                    QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q5_1, false, false, true);
+                } else {
+                    QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q5_1, false, false, false);
+                }
             }
         } else if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q8_0) {
-            QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q8_0, false);
+            if (getenv("DS4_QWEN4EXP_NO_DOWN_Q8_BIAS") == NULL) {
+                if (getenv("DS4_QWEN4EXP_NO_DOWN_MMA_SWIZZLE") == NULL) {
+                    QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q8_0, false, true, true);
+                } else {
+                    QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q8_0, false, true, false);
+                }
+            } else {
+                QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q8_0, false, false, false);
+            }
         } else {
-            QWEN4EXP_DOWN_MMA(-1, false);
+            QWEN4EXP_DOWN_MMA(-1, false, false, false);
         }
 #undef QWEN4EXP_DOWN_MMA
         if (!cuda_ok(cudaGetLastError(), "qwen4exp MoE down tile launch")) return 0;
@@ -14181,13 +14276,10 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
         (void)cudaGetLastError();
     }
 
-    /* The prefill down tile.  q8_0 is the ranked slab's down type and Wide6 is
-     * the shipped state of DS4_QWEN4EXP_NO_Q51_WIDE_LOAD (unset => true).  If
-     * this instantiation is not the one launched, md[] still reports a real
-     * compilation of this template and the reg/smem shape is the template's, not
-     * a guess -- but read it as indicative rather than as the launched kernel. */
+    /* The default Q8_0 prefill down tile. The NO_DOWN_Q8_BIAS valve and
+     * other quantization types use their separate retained instantiations. */
     if (cudaFuncGetAttributes(
-            &a, qwen4exp_moe_down_mma_kernel<DS4_QWEN4EXP_TY_q8_0, true>) ==
+            &a, qwen4exp_moe_down_mma_kernel<DS4_QWEN4EXP_TY_q8_0, false, true, true>) ==
         cudaSuccess) {
         md_regs = a.numRegs;
         md_smem = (int)a.sharedSizeBytes;
@@ -14196,7 +14288,7 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
         (void)cudaGetLastError();
     }
     if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &occ, qwen4exp_moe_down_mma_kernel<DS4_QWEN4EXP_TY_q8_0, true>,
+            &occ, qwen4exp_moe_down_mma_kernel<DS4_QWEN4EXP_TY_q8_0, false, true, true>,
             (int)QW_DOWN_MMA_THREADS, 0) == cudaSuccess) {
         md_occ = occ;
     } else {
@@ -14213,6 +14305,30 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
              gd_regs, gd_lmem,
              mg_regs, mg_smem, mg_lmem, mg_occ,
              md_regs, md_smem, md_lmem, md_occ);
+    /* The header census has 43 Q5_1 and five Q8_0 target down slabs, so
+     * report the default Q5_1 specialization as well as the Q8 md field. */
+    int md5_regs = -1, md5_smem = -1, md5_lmem = -1, md5_occ = -1;
+    if (cudaFuncGetAttributes(
+            &a, qwen4exp_moe_down_mma_kernel<DS4_QWEN4EXP_TY_q5_1,
+                                             true, false, true>) == cudaSuccess) {
+        md5_regs = a.numRegs;
+        md5_smem = (int)a.sharedSizeBytes;
+        md5_lmem = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ, qwen4exp_moe_down_mma_kernel<DS4_QWEN4EXP_TY_q5_1,
+                                               true, false, true>,
+            (int)QW_DOWN_MMA_THREADS, 0) == cudaSuccess) {
+        md5_occ = occ;
+    } else {
+        (void)cudaGetLastError();
+    }
+    const size_t used = strlen(buf);
+    snprintf(buf + used, sizeof(buf) - used,
+             " md5[reg=%d smem=%d lmem=%d occ=%d]",
+             md5_regs, md5_smem, md5_lmem, md5_occ);
     return buf;
 }
 
