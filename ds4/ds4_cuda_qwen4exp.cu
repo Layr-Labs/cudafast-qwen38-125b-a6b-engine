@@ -10021,6 +10021,158 @@ __device__ __forceinline__ static float qwen4exp_fma_ftz(float a, float b,
     return r;
 }
 
+/* Short HC up/mix epilogue, selected only by the guarded helper below.
+ * 1280 projection CTAs each own two columns x four stream warps, preserving
+ * all 10240 projection warps. Optional tagged CTAs retain the old 256-thread
+ * injection-head reduction. No early trigger: this grid is multiwave.
+ * Preconditions for any future caller: rows 1/2, 2560x4, lowrank320, 256threads,
+ * valid disjoint tensor/weight views and exact current default up routing. */
+__device__ __forceinline__ static float qwen4exp_hc_add_ftz(float a, float b) {
+    float r;
+    asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+    return r;
+}
+
+template <int InjectType, bool WithInject>
+__global__ void qwen4exp_hc_up_mix_short_probe_kernel(
+        float *mixed, float *inject, const unsigned char *upw,
+        const int8_t *xq, const float *xs,
+        const float *hyper, const float *nscale, const float *normw,
+        const char *w, uint32_t rows, float weight_bias, int round_bf16,
+        uint32_t weight_type, uint32_t weight_row_bytes) {
+    constexpr uint32_t n_embd = 2560u, n_hc = 4u, mix_blocks = 1280u;
+    if (blockIdx.x >= mix_blocks) {
+        if constexpr (WithInject) {
+            QWEN4EXP_PDL_SYNC();
+        float *out = inject;
+        const uint32_t h = (blockIdx.x - mix_blocks) % n_hc;
+        const uint32_t t = (blockIdx.x - mix_blocks) / n_hc;
+        if (t >= rows || h >= n_hc) return;
+
+        const uint32_t wide = n_hc * n_embd;
+        const float *xr = hyper + (uint64_t)t * wide;
+        const char *wr = w + (uint64_t)h * weight_row_bytes;
+
+        float sum = 0.0f;
+        for (uint32_t hs = 0; hs < n_hc; hs++) {
+            const float sc = nscale[(uint64_t)t * n_hc + hs];
+            if (InjectType < 0) {
+                for (uint32_t k = 0; k < n_embd; k += blockDim.x) {
+                    const uint32_t i = hs * n_embd + k + threadIdx.x;
+                    const float normed = qwen4exp_hc_normed_value(
+                            xr[i], sc, normw[i], weight_bias, round_bf16);
+                    sum += normed * dev_qwen4exp_inject_value(weight_type, wr, i);
+                }
+            } else {
+                float xs[QWEN4EXP_HC_STAGED_STEPS];
+                float ws[QWEN4EXP_HC_STAGED_STEPS];
+                float vs[QWEN4EXP_HC_STAGED_STEPS];
+#pragma unroll
+                for (uint32_t s = 0; s < QWEN4EXP_HC_STAGED_STEPS; s++) {
+                    const uint32_t k = s * QWEN4EXP_HC_THREADS;
+                    const uint32_t i = hs * n_embd + k + threadIdx.x;
+                    xs[s] = xr[i];
+                    ws[s] = normw[i];
+                    vs[s] = qwen4exp_hc_inject_value_staged<InjectType>(
+                            wr, n_embd, hs, s);
+                }
+#pragma unroll
+                for (uint32_t c = 0; c < QWEN4EXP_HC_STAGED_STEPS; c++) {
+                    const float normed = qwen4exp_hc_normed_value(
+                            xs[c], sc, ws[c], weight_bias, round_bf16);
+                    sum += normed * vs[c];
+                }
+            }
+        }
+        __shared__ float partial[QWEN4EXP_HC_THREADS];
+        const float total = qwen4exp_block_sum_f32(sum, partial);
+        if (threadIdx.x == 0) {
+            out[(uint64_t)t * n_hc + h] =
+                2.0f * qwen4exp_sigmoid(total * (1.0f / (float)n_hc));
+        }
+
+        }
+        return;
+    }
+    __shared__ float completed[16];
+
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned group = lane >> 1u, half = lane & 1u;
+    const unsigned warp = threadIdx.x >> 5u;
+    const unsigned column = blockIdx.x * 2u + warp / 4u;
+    const uint64_t row = (uint64_t)(warp % 4u) * n_embd + column;
+
+    constexpr int R = 2;
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) acc[r] = 0.0f;
+    if (group < 10u) {
+        const unsigned char *blk = upw + row * 340u + group * 34u;
+        const unsigned char *payload = blk + 2u + half * 16u;
+        const uintptr_t address = (uintptr_t)payload;
+        const unsigned shift = (address & 3u) * 8u;
+        const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
+        uint32_t previous = __ldcs(words);
+        int32_t wq[4];
+#pragma unroll
+        for (int j = 0; j < 3; j++) {
+            const uint32_t next = __ldcs(words + j + 1);
+            wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
+            previous = next;
+        }
+        const uint16_t last = __ldcs((const uint16_t *)(payload + 14u));
+        wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
+        const float ws = __half2float(__ushort_as_half(__ldcs((const uint16_t *)blk)));
+        /* PDL: every weight word this lane owns is in registers -- this
+         * kernel reads the whole weight group before the first activation
+         * word -- so the fence goes here and holds the activation reads
+         * (xq/xs, the silu kernel's output) until it releases.  Nothing
+         * else moves. */
+        QWEN4EXP_PDL_SYNC();
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            if ((unsigned)r < rows) {
+                const unsigned at = (unsigned)r * 10u + group;
+                const int32_t *xw = (const int32_t *)(xq + at * 32u + half * 16u);
+                int dot = 0;
+#pragma unroll
+                for (int j = 0; j < 4; j++) dot = __dp4a(wq[j], xw[j], dot);
+                dot += __shfl_xor_sync(0x000fffffu, dot, 1);
+                if (!half) acc[r] = qwen4exp_fma_ftz(qwen4exp_fmul_ftz(ws, xs[at]), (float)dot, acc[r]);
+            }
+        }
+    }
+    /* Original chains 16..31 are zero. Chains 0..15 now occupy the even
+     * lanes; original strides 8,4,2,1 become physical strides 16,8,4,2. */
+#pragma unroll
+    for (int r = 0; r < R; r++) {
+        acc[r] = qwen4exp_hc_add_ftz(acc[r], 0.0f);
+#pragma unroll
+        for (int d = 16; d >= 2; d >>= 1)
+            acc[r] = qwen4exp_hc_add_ftz(acc[r], __shfl_down_sync(0xffffffffu, acc[r], d));
+        if (lane == 0u && (unsigned)r < rows)
+            completed[r * 8u + warp] = acc[r];
+    }
+
+    __syncthreads();
+    if (threadIdx.x < rows * 2u) {
+        const unsigned t = threadIdx.x / 2u;
+        const unsigned c = threadIdx.x % 2u;
+        const uint64_t row = (uint64_t)t * n_hc * n_embd + blockIdx.x * 2u + c;
+        float mix = 0.0f;
+#pragma unroll 1
+        for (uint32_t h = 0; h < n_hc; h++) {
+            const uint64_t idx = row + (uint64_t)h * n_embd;
+            const float normed = qwen4exp_hc_normed_value(
+                    hyper[idx], nscale[(uint64_t)t * n_hc + h],
+                    normw[(uint64_t)h * n_embd + blockIdx.x * 2u + c],
+                    weight_bias, round_bf16);
+            mix += qwen4exp_sigmoid(completed[t * 8u + c * 4u + h]) * normed;
+        }
+        mixed[(uint64_t)t * n_embd + blockIdx.x * 2u + c] = mix * (1.0f / (float)n_hc);
+    }
+}
+
 /* q8_0_block_quant_words of ds4_cuda.cu: the 32 quants of a Q8_0 block, which
  * begin two bytes into its 34, as eight words funnel-shifted off the aligned
  * words that cover them.  Nothing outside the block is read. */
@@ -10841,6 +10993,87 @@ static int ds4_qwen4exp_hc_wide_off(void) {
     } while (0)
 
 
+/* Private tail replacement: -1 declines to the old up+mix tail within this
+ * invocation; 0 is a real error; 1 completes mixed and optional inject.
+ * Earlier norm/down/SiLU work must never be retried after this decision. */
+static int qwen4exp_hc_up_mix_short_try(
+        ds4_gpu_tensor *mixed, ds4_gpu_tensor *inject,
+        const ds4_gpu_tensor *normed, const ds4_gpu_tensor *lowrank,
+        const ds4_gpu_tensor *wide_scratch, const ds4_gpu_tensor *hyper,
+        const ds4_gpu_qwen4exp_slab *up_weight,
+        const ds4_gpu_qwen4exp_slab *inject_weight,
+        const float *normw, const float *nscale, const char *iw,
+        uint64_t iw_row_bytes, uint64_t s_off,
+        uint32_t n_embd, uint32_t n_hc, uint32_t n_lowrank, uint32_t rows,
+        int staged, float weight_bias, int round_bf16) {
+    if (rows == 0u || rows > 2u || n_embd != 2560u || n_hc != 4u ||
+        n_lowrank != 320u || !staged ||
+        getenv("DS4_QWEN4EXP_NO_HC_UP_MIX_SHORT") != NULL ||
+        getenv("DS4_QWEN4EXP_NO_HC_DUAL") != NULL ||
+        (inject && (!inject_weight ||
+                    (inject_weight->type != DS4_QWEN4EXP_TY_f32 &&
+                     inject_weight->type != DS4_QWEN4EXP_TY_q8_0)))) return -1;
+    if (inject && (iw_row_bytes > UINT32_MAX ||
+        iw_row_bytes < (inject_weight->type == DS4_QWEN4EXP_TY_f32 ?
+                        10240ull * sizeof(float) : 320ull * 34u))) return -1;
+    if (!up_weight || !up_weight->map ||
+        up_weight->offset > up_weight->map_size ||
+        up_weight->map_size - up_weight->offset < 10240ull * 340u) return 0;
+    const int tier = ds4_tensor_device_idx(mixed);
+    const char *upw = cuda_resolve_weight_ptr(up_weight->map, up_weight->offset,
+            10240ull * 340u, tier, "q8_0 preq rows exact");
+    if (!upw) return 0;
+    if (!ds4_cuda_qwen4exp_hc_up_warp_active(upw, rows)) return -1;
+    const ds4_gpu_tensor *views[] = {mixed, normed, lowrank, wide_scratch, hyper, inject};
+    for (const ds4_gpu_tensor *t : views) {
+        if (t && (!t->ptr || ((uintptr_t)t->ptr & 3u) ||
+                  ds4_tensor_device_idx(t) != tier)) return -1;
+    }
+    if (((uintptr_t)normed->ptr & 15u) || (s_off & 15u) ||
+        s_off > normed->bytes || normed->bytes - s_off < rows * 10u * sizeof(float) ||
+        normed->bytes < rows * 320u) return -1;
+    const auto disjoint = [](const void *a, uint64_t an, const void *b, uint64_t bn) {
+        const uintptr_t ap = (uintptr_t)a, bp = (uintptr_t)b;
+        return a && b && an <= UINTPTR_MAX - ap && bn <= UINTPTR_MAX - bp &&
+            (ap + an <= bp || bp + bn <= ap);
+    };
+    const ds4_gpu_tensor *sources[] = {normed, lowrank, hyper};
+    const ds4_gpu_tensor *outputs[] = {mixed, inject};
+    for (const ds4_gpu_tensor *out : outputs) {
+        if (!out) continue;
+        for (const ds4_gpu_tensor *src : sources)
+            if (!disjoint(out->ptr, out->bytes, src->ptr, src->bytes)) return -1;
+        if (!disjoint(out->ptr, out->bytes, upw, 10240ull * 340u) ||
+            !disjoint(out->ptr, out->bytes, normw, 10240ull * sizeof(float)) ||
+            (inject && !disjoint(out->ptr, out->bytes, iw, 4u * iw_row_bytes))) return -1;
+    }
+    if (inject && !disjoint(mixed->ptr, mixed->bytes, inject->ptr, inject->bytes)) return -1;
+    /* Omitting wide writes must not remove a write that would have changed
+     * a later source or caller-visible output in an aliased old invocation. */
+    for (const ds4_gpu_tensor *v : views) {
+        if (v && v != wide_scratch &&
+            !disjoint(wide_scratch->ptr, wide_scratch->bytes, v->ptr, v->bytes)) return -1;
+    }
+    if (!disjoint(wide_scratch->ptr, wide_scratch->bytes, upw, 10240ull * 340u) ||
+        !disjoint(wide_scratch->ptr, wide_scratch->bytes, normw, 10240ull * sizeof(float)) ||
+        (inject && !disjoint(wide_scratch->ptr, wide_scratch->bytes, iw, 4u * iw_row_bytes))) return -1;
+    const unsigned blocks = 1280u + (inject ? rows * 4u : 0u);
+#define QW_HC_UP_SHORT_LAUNCH(T, I) \
+    QWEN4EXP_LAUNCH_PDL((qwen4exp_hc_up_mix_short_probe_kernel<T, I>), \
+        blocks, 256, 0, cuda_decode_stream(), \
+        (float *)mixed->ptr, inject ? (float *)inject->ptr : NULL, \
+        (const unsigned char *)upw, (const int8_t *)normed->ptr, \
+        (const float *)((const char *)normed->ptr + s_off), \
+        (const float *)hyper->ptr, nscale, normw, iw, rows, weight_bias, \
+        round_bf16, inject ? inject_weight->type : 0u, (uint32_t)iw_row_bytes)
+    if (!inject) { QW_HC_UP_SHORT_LAUNCH(-1, false); }
+    else if (inject_weight->type == DS4_QWEN4EXP_TY_f32) {
+        QW_HC_UP_SHORT_LAUNCH(DS4_QWEN4EXP_TY_f32, true);
+    } else { QW_HC_UP_SHORT_LAUNCH(DS4_QWEN4EXP_TY_q8_0, true); }
+#undef QW_HC_UP_SHORT_LAUNCH
+    return cuda_ok(cudaGetLastError(), "qwen4exp short up mix launch");
+}
+
 /* Returns 1 on success, 0 on a hard failure, -1 when this shape is not one the
  * fused kernels above can serve and the caller should run the unfused chain. */
 /* `pending_block` / `pending_inject`, when given, are the previous block's
@@ -11050,6 +11283,11 @@ static int qwen4exp_hc_mixer_fused_cuda(
             return cuda_ok(cudaGetLastError(),
                            "qwen4exp_hc_inject_weights_renorm launch");
         }
+        const int short_tail = qwen4exp_hc_up_mix_short_try(
+                mixed, inject, normed_scratch, lowrank_scratch, wide_scratch,
+                hyper, up_weight, inject_weight, normw, nscale, iw, iw_row_bytes,
+                s_off, n_embd, n_hc, n_lowrank, rows, staged, weight_bias, round_bf16);
+        if (short_tail >= 0) return short_tail;
         if (!ds4_gpu_matmul_q8_0_preq_rows_exact_tensor(
                     wide_scratch, up_weight->map, up_weight->map_size,
                     up_weight->offset, n_lowrank, wide, normed_scratch,
