@@ -587,12 +587,12 @@ int main(void) {
      * hello echoes, so they reach the run's metrics.  Shared memory per SM and
      * peak DRAM bandwidth decide whether a decode kernel is occupancy-capped
      * or bandwidth-capped, and neither is observable on a box whose profiler
-     * refuses to attach.  This is a pure read of device properties, done once
+     * refuses to attach.  This includes bounded startup tuning on private synthetic data, done once
      * HERE -- after the one load, before the socket binds -- so no timed phase
      * can see it.  On failure the string is empty and the identity is exactly
      * what it was, which keeps the `ds4-resident load_epoch=` prefix and the
      * ident that benchd seals unchanged for a non-CUDA build. */
-    char ident_buf[768];
+    char ident_buf[1280];
     const char *limits = ds4s_hw_limits();
     if (limits && limits[0]) {
         const int n = snprintf(ident_buf, sizeof(ident_buf), "%s %s", ident, limits);

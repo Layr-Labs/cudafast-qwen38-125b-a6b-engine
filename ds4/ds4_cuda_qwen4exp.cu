@@ -4754,6 +4754,10 @@ qwen4exp_moe_down_mma_kernel(
     }
 }
 
+#include "ds4_cuda_down_raw_pipe.cuh"
+#include "ds4_cuda_down_raw64.cuh"
+#include "ds4_cuda_down_prefill_tune.cuh"
+
 /* out[token][row] is the token's slots in ASCENDING order.  A slot whose
  * expert id is out of range contributes nothing, which is what the per-token
  * kernel did by skipping it, so its partial is never read. */
@@ -8341,7 +8345,36 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
                 down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
                 mgroups, out_dim, dn_dq_stage)
         if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q5_1) {
-            if (dn_wide6) {
+            const bool raw_pipe = dn_wide6 && dn_dq_stage != 0u &&
+                (mgroups & 3u) == 0u &&
+                ((((uintptr_t)down) | (uintptr_t)down_slab->row_bytes |
+                  (uintptr_t)down_slab->expert_bytes) & 15u) == 0u &&
+                getenv("DS4_QWEN4EXP_NO_DOWN_RAW_PIPE") == NULL;
+            const char *force_raw = getenv("DS4_QWEN4EXP_FORCE_DOWN_RAW_PIPE");
+            const bool measured_shape = mgroups == 20u && out_dim == 2560u &&
+                down_slab->row_bytes == 480u && down_slab->expert_bytes == 1228800u &&
+                logical_tier == 0 && g_n_gpus == 1 &&
+                qwen4exp_down_prefill_device == g_gpu[0].device_id;
+            const int raw_choice = force_raw && !strcmp(force_raw, "32") ? 32 :
+                force_raw && !strcmp(force_raw, "64") ? 64 :
+                measured_shape ? qwen4exp_down_prefill_choice : 0;
+            if (raw_pipe && raw_choice == 64) {
+                qwen4exp_moe_down_raw64_kernel<DS4_QWEN4EXP_TY_q5_1, true><<<
+                    dim3(out_dim / QW_DOWN_MMA_BM, gu_rows, 1),
+                    QW_DOWN_MMA_THREADS, 0, stream>>>(
+                    (float *)down_partial->ptr, down, sc.mq, sc.ms, sc.msum,
+                    sc.pairs, sc.counts, sc.offsets, gu_active,
+                    down_slab->expert_bytes, down_slab->row_bytes,
+                    down_slab->type, mgroups, out_dim, dn_dq_stage);
+            } else if (raw_pipe && raw_choice == 32) {
+                qwen4exp_moe_down_raw_pipe_kernel<DS4_QWEN4EXP_TY_q5_1, true><<<
+                    dim3(out_dim / QW_DOWN_RAW_BM, gu_rows, 1),
+                    QW_DOWN_MMA_THREADS, 0, stream>>>(
+                    (float *)down_partial->ptr, down, sc.mq, sc.ms, sc.msum,
+                    sc.pairs, sc.counts, sc.offsets, gu_active,
+                    down_slab->expert_bytes, down_slab->row_bytes,
+                    down_slab->type, mgroups, out_dim, dn_dq_stage);
+            } else if (dn_wide6) {
                 QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q5_1, true);
             } else {
                 QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q5_1, false);
@@ -14576,6 +14609,7 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
     /* The two PREFILL tile kernels, read here for the first time. */
     int mg_regs = -1, mg_smem = -1, mg_lmem = -1, mg_occ = -1;
     int md_regs = -1, md_smem = -1, md_lmem = -1, md_occ = -1;
+    int rp_regs = -1, rp_smem = -1, rp_lmem = -1, rp_occ = -1;
     /* The drift control: a kernel nobody in this line of work has touched. */
     int gd_regs = -1, gd_lmem = -1;
 
@@ -14711,11 +14745,7 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
         (void)cudaGetLastError();
     }
 
-    /* The prefill down tile.  q8_0 is the ranked slab's down type and Wide6 is
-     * the shipped state of DS4_QWEN4EXP_NO_Q51_WIDE_LOAD (unset => true).  If
-     * this instantiation is not the one launched, md[] still reports a real
-     * compilation of this template and the reg/smem shape is the template's, not
-     * a guess -- but read it as indicative rather than as the launched kernel. */
+    /* Retain the inherited Q8_0 tile resource reading. */
     if (cudaFuncGetAttributes(
             &a, qwen4exp_moe_down_mma_kernel<DS4_QWEN4EXP_TY_q8_0, true>) ==
         cudaSuccess) {
@@ -14733,16 +14763,37 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
         (void)cudaGetLastError();
     }
 
+    /* rp[] reports the raw Q5_1 pipeline, the default down path in
+     * 43 target layers. The other five Q8_0 layers retain their old tile. */
+    if (cudaFuncGetAttributes(
+            &a, qwen4exp_moe_down_raw_pipe_kernel<DS4_QWEN4EXP_TY_q5_1, true>) ==
+        cudaSuccess) {
+        rp_regs = a.numRegs;
+        rp_smem = (int)a.sharedSizeBytes;
+        rp_lmem = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ, qwen4exp_moe_down_raw_pipe_kernel<DS4_QWEN4EXP_TY_q5_1, true>,
+            (int)QW_DOWN_MMA_THREADS, 0) == cudaSuccess) {
+        rp_occ = occ;
+    } else {
+        (void)cudaGetLastError();
+    }
+
     snprintf(buf, sizeof(buf),
              "gu[reg=%d smem=%d lmem=%d maxt=%d occ=%d] dn[reg=%d smem=%d "
              "lmem=%d maxt=%d occ=%d] gdn[reg=%d lmem=%d] "
              "mm[reg=%d smem=%d lmem=%d occ=%d] "
-             "md[reg=%d smem=%d lmem=%d occ=%d]",
+             "md[reg=%d smem=%d lmem=%d occ=%d] "
+             "rp[reg=%d smem=%d lmem=%d occ=%d]",
              gu_regs, gu_smem, gu_lmem, gu_maxt, gu_occ,
              dn_regs, dn_smem, dn_lmem, dn_maxt, dn_occ,
              gd_regs, gd_lmem,
              mg_regs, mg_smem, mg_lmem, mg_occ,
-             md_regs, md_smem, md_lmem, md_occ);
+             md_regs, md_smem, md_lmem, md_occ,
+             rp_regs, rp_smem, rp_lmem, rp_occ);
     return buf;
 }
 
