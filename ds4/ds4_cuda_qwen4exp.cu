@@ -5021,8 +5021,16 @@ __device__ __forceinline__ static void qw_gu_coop_raw_load(
  * kernel is not the experiment.  `gu[occ]` reports blocks/SM straight from
  * cudaOccupancyMaxActiveBlocksPerMultiprocessor, so the third block no longer
  * has to be inferred from arithmetic at all: 2 means the cap did not take. */
+/* The cooperative caller already checked Q4 row shape/alignment. */
+static bool qwen4exp_gateup_decode_shape(bool coop, uint32_t mid_dim,
+        uint32_t stride, uint32_t used, uint64_t gate_bytes, uint64_t up_bytes) {
+    return coop && mid_dim == 640u && stride == 6400u && used == 10u &&
+        gate_bytes == 921600u && up_bytes == 921600u &&
+        getenv("DS4_QWEN4EXP_NO_GATEUP_DECODE_SHAPE") == NULL;
+}
+
 template <int R, int Type, bool Vector = false,
-          unsigned OutputRows = 4, bool Coop = false>
+          unsigned OutputRows = 4, bool Coop = false, bool FixedShape = false>
 __global__ static void QW_GU_MAXNREG
 qwen4exp_moe_gateup_split_kernel(
         float *mid,
@@ -5036,42 +5044,33 @@ qwen4exp_moe_gateup_split_kernel(
         const int32_t *offsets,
         const int32_t *active,
         const float *weights,
-        uint64_t gate_expert_bytes,
-        uint64_t gate_row_bytes,
-        uint64_t up_expert_bytes,
-        uint64_t up_row_bytes,
+        uint64_t gate_expert_bytes_arg,
+        uint64_t gate_row_bytes_arg,
+        uint64_t up_expert_bytes_arg,
+        uint64_t up_row_bytes_arg,
         uint32_t gate_type,
         uint32_t up_type,
-        uint32_t groups,
-        uint32_t mid_dim,
-        uint32_t mid_token_stride,
-        uint32_t n_expert_used) {
+        uint32_t groups_arg,
+        uint32_t mid_dim_arg,
+        uint32_t mid_token_stride_arg,
+        uint32_t n_expert_used_arg) {
+    static_assert(!FixedShape || (R == 2 && Type == DS4_QWEN4EXP_TY_q4_K &&
+                  Vector && OutputRows == QW_GU_COOP_ROWS && Coop),
+                  "fixed cooperative Q4 decode shape");
+    const uint64_t gate_expert_bytes = FixedShape ? 921600u : gate_expert_bytes_arg;
+    const uint64_t up_expert_bytes = FixedShape ? 921600u : up_expert_bytes_arg;
+    const uint64_t gate_row_bytes = FixedShape ? 1440u : gate_row_bytes_arg;
+    const uint64_t up_row_bytes = FixedShape ? 1440u : up_row_bytes_arg;
+    const uint32_t groups = FixedShape ? 80u : groups_arg;
+    const uint32_t mid_dim = FixedShape ? 640u : mid_dim_arg;
+    const uint32_t mid_token_stride = FixedShape ? 6400u : mid_token_stride_arg;
+    const uint32_t n_expert_used = FixedShape ? 10u : n_expert_used_arg;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
     const uint32_t row = blockIdx.x * OutputRows + (warp >> 1u);
     const bool live = row < mid_dim;
     const bool second = (warp & 1u) != 0u;
     uint32_t expert = blockIdx.y;
-    /* The routed gate/up edge, opened on the kernel the COOP decode path runs.
-     *
-     * The dependent launch already exists in this file on
-     * qwen4exp_moe_gateup_q_kernel, and its comment states the mechanism: the
-     * blocks are already up and scheduled when the quantizer's last group
-     * retires, instead of paying a launch behind it.  The coop schedule does
-     * not use that kernel -- it uses this one, and this one was launched
-     * plainly.
-     *
-     * The fence sits ahead of EVERY producer read -- the active list, the
-     * counts/offsets/pairs tables, the quantized activation and the router
-     * weights are all written by the routed quantizer -- so it is placed
-     * unconditionally, not inside the `active` branch: `counts` is read even
-     * when `active` is NULL.  .nc rule: no pointer in this signature carries
-     * __restrict__, so no activation load can be hoisted above the fence as
-     * ld.global.nc.  Deadlock rule: it constrains the PRODUCER, and the
-     * quantizer bounds itself to one wave before it triggers, so a multi-wave
-     * dependent is safe.  Launched plainly -- three rows, every prefill width
-     * -- the fence is a no-op, exactly as it is for the kernel beside it. */
-    QWEN4EXP_PDL_SYNC();
     if (active) {
         if ((int32_t)blockIdx.y >= active[0]) return;
         expert = (uint32_t)active[1 + blockIdx.y];
@@ -5094,9 +5093,9 @@ qwen4exp_moe_gateup_split_kernel(
          * only answerable at the tower's q4_K gate/up row shape.  The launcher
          * refuses every other shape; this is the belt to that brace, and it is
          * uniform over the block, outside the group loop, and free. */
-        if (groups != QW_GU_COOP_GROUPS ||
-            gate_row_bytes != (uint64_t)QW_GU_COOP_ROW_U4 * 16u ||
-            up_row_bytes != (uint64_t)QW_GU_COOP_ROW_U4 * 16u) return;
+        if (groups_arg != QW_GU_COOP_GROUPS ||
+            gate_row_bytes_arg != (uint64_t)QW_GU_COOP_ROW_U4 * 16u ||
+            up_row_bytes_arg != (uint64_t)QW_GU_COOP_ROW_U4 * 16u) return;
         const uint32_t row0 = blockIdx.x * OutputRows;
         const uint32_t left = mid_dim > row0 ? mid_dim - row0 : 0u;
         const uint32_t rows_here = left < OutputRows ? left : OutputRows;
@@ -5224,22 +5223,8 @@ qwen4exp_moe_gateup_split_kernel(
                 }
             }
         }
-        /* Readers finish before a fast projection warp reuses this tile --
-         * a hazard only a SECOND iteration of this loop can create, so the
-         * barrier is dead whenever there is no second iteration.
-         *
-         * CREDIT: 0xpg (`37816fd`).  At the decode width the body runs exactly
-         * once: `cnt` is counts[expert], the number of (token, slot) pairs
-         * that routed to this block's expert, and a decode round verifies two
-         * rows each selecting ten of 512 experts, so any one expert collects
-         * one or two of the twenty pairs.  R is 2 for every instantiation the
-         * launcher builds, so cnt <= R and `at + R >= cnt` on the first pass.
-         *
-         * The predicate is BLOCK-UNIFORM and therefore cannot deadlock: cnt is
-         * counts[expert] with expert block-invariant, and `at` is loop-uniform.
-         * Prefill, where cnt genuinely exceeds R, takes the barrier exactly as
-         * before, byte for byte. */
-        if (at + R < cnt) __syncthreads();
+        /* Readers finish before a fast projection warp reuses this tile. */
+        __syncthreads();
     }
 }
 
@@ -5457,8 +5442,23 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
  * almost nothing here and that residency is not this kernel's constraint
  * either.  If registers ever need to come down, it has to be by removing live
  * state at source. */
+/* Host validation for exact decode constants. Alignment, async staging and
+ * vector support are additionally checked by the existing caller. */
+static uint32_t qwen4exp_down_decode_rows(
+        uint32_t groups, uint32_t out_dim, uint32_t n_tokens,
+        uint32_t used, uint32_t type, uint64_t row_bytes, uint64_t expert_bytes) {
+    if (groups != 20u || out_dim != 2560u || used != 10u ||
+        (n_tokens != 1u && n_tokens != 2u) ||
+        (type != DS4_QWEN4EXP_TY_q5_1 && type != DS4_QWEN4EXP_TY_q8_0) ||
+        (type == DS4_QWEN4EXP_TY_q5_1 && n_tokens != 2u) ||
+        row_bytes != 20u * (type == DS4_QWEN4EXP_TY_q5_1 ? 24u : 34u) ||
+        expert_bytes != 2560u * row_bytes ||
+        getenv("DS4_QWEN4EXP_NO_DOWN_DECODE_SHAPE") != NULL) return 0u;
+    return n_tokens;
+}
+
 template <int R, int DownType = -1, bool Vector = false, bool Stage = false,
-          bool Async = false>
+          bool Async = false, unsigned DecodeRows = 0>
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
@@ -5466,14 +5466,29 @@ __global__ static void qwen4exp_moe_down_q_kernel(
         const int8_t *mq,
         const float *ms,
         const int32_t *msum,
-        uint64_t down_expert_bytes,
-        uint64_t down_row_bytes,
+        uint64_t down_expert_bytes_arg,
+        uint64_t down_row_bytes_arg,
         uint32_t down_type,
-        uint32_t groups,
-        uint32_t out_dim,
-        uint32_t n_tokens,
+        uint32_t groups_arg,
+        uint32_t out_dim_arg,
+        uint32_t n_tokens_arg,
         uint32_t n_total_expert,
-        uint32_t n_expert_used) {
+        uint32_t n_expert_used_arg) {
+    /* Exact model-shape specialization of the existing panel pipeline.
+     * Only host-validated one/two-row calls use it. Keep the slot/group
+     * arithmetic and warp reduction order; make bounds and strides constant. */
+    static_assert(DecodeRows <= 2, "decode row specialization");
+    static_assert(DecodeRows == 0 || (R == 2 && Vector && Stage && Async),
+                  "shape specialization needs the two-row async pipeline");
+    const uint64_t down_row_bytes = DecodeRows
+        ? 20u * (DownType == DS4_QWEN4EXP_TY_q5_1 ? 24u : 34u)
+        : down_row_bytes_arg;
+    const uint64_t down_expert_bytes = DecodeRows
+        ? 2560u * down_row_bytes : down_expert_bytes_arg;
+    const uint32_t groups = DecodeRows ? 20u : groups_arg;
+    const uint32_t out_dim = DecodeRows ? 2560u : out_dim_arg;
+    const uint32_t n_tokens = DecodeRows ? DecodeRows : n_tokens_arg;
+    const uint32_t n_expert_used = DecodeRows ? 10u : n_expert_used_arg;
     /* Dynamic shared memory is 16-byte aligned by contract, and it is requested
      * only for the Stage instantiations; the others map nothing here. */
     extern __shared__ uint4 qw_down_panel[];
@@ -5484,8 +5499,8 @@ __global__ static void qwen4exp_moe_down_q_kernel(
     const uint32_t row = row0 + (threadIdx.x >> 5u);
     const uint32_t tok0 = blockIdx.y * (uint32_t)R;
     if (row >= out_dim || tok0 >= n_tokens) return;
-    const uint32_t take = n_tokens - tok0 < (uint32_t)R ? n_tokens - tok0
-                                                        : (uint32_t)R;
+    const uint32_t take = DecodeRows ? DecodeRows :
+        (n_tokens - tok0 < (uint32_t)R ? n_tokens - tok0 : (uint32_t)R);
     const uint64_t panel_bytes = (uint64_t)8u * down_row_bytes;
 
     /* Up to 32 IDs, freshly loaded on every call or graph replay. */
@@ -5542,7 +5557,7 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                     (uint64_t)(uint32_t)e * down_expert_bytes +
                     (uint64_t)row0 * down_row_bytes;
                 for (uint64_t o = (uint64_t)threadIdx.x * 16u;
-                     o < panel_bytes; o += (uint64_t)blockDim.x * 16u) {
+                     o < panel_bytes; o += (DecodeRows ? 256u : (uint64_t)blockDim.x) * 16u) {
                     if (Async) {
                         qw_cpasync16((uint32_t)__cvta_generic_to_shared(dst + o),
                                      gp + o);
@@ -8253,10 +8268,9 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             ((uintptr_t)gate & 15u) == 0u && ((uintptr_t)up & 15u) == 0u &&
             (gate_slab->expert_bytes & 15ull) == 0ull &&
             (up_slab->expert_bytes & 15ull) == 0ull;
-#define QWEN4EXP_SPLIT_GATEUP(V, P, C) \
-        QWEN4EXP_LAUNCH_PDL( \
-            (qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P, C>), \
-            (dim3((mid_dim + P - 1u) / P, gu_rows, 1)), P * 64u, 0, stream, \
+#define QWEN4EXP_SPLIT_GATEUP_SHAPE(V, P, C, F) \
+        qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P, C, F><<< \
+            dim3((mid_dim + P - 1u) / P, gu_rows, 1), P * 64u, 0, stream>>>( \
             (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum, \
             sc.pairs, sc.counts, sc.offsets, gu_active, \
             (const float *)weights->ptr, \
@@ -8264,6 +8278,10 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             up_slab->expert_bytes, up_slab->row_bytes, \
             gate_slab->type, up_slab->type, xgroups, mid_dim, \
             mid_token_stride, n_expert_used)
+#define QWEN4EXP_SPLIT_GATEUP(V, P, C) QWEN4EXP_SPLIT_GATEUP_SHAPE(V, P, C, false)
+        const bool fixed_gu = qwen4exp_gateup_decode_shape(coop, mid_dim,
+            mid_token_stride, n_expert_used, gate_slab->expert_bytes,
+            up_slab->expert_bytes);
         /* ONE OUTPUT ROW PER BLOCK on the vector schedule.  Four rows per
          * block was measured a full percent slower than two, so the barrier
          * is what costs: every warp in the block reads a different weight
@@ -8275,10 +8293,12 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
          * is zero for both warps, so each still walks its own row in the
          * same group order through the same warp_sum_f32 tree and every dot
          * is bit-identical.  mid_dim 640 gives 640 blocks. */
-        if (coop) { QWEN4EXP_SPLIT_GATEUP(true, QW_GU_COOP_ROWS, true); }
+        if (fixed_gu) { QWEN4EXP_SPLIT_GATEUP_SHAPE(true, QW_GU_COOP_ROWS, true, true); }
+        else if (coop) { QWEN4EXP_SPLIT_GATEUP(true, QW_GU_COOP_ROWS, true); }
         else if (vector) { QWEN4EXP_SPLIT_GATEUP(true, 1u, false); }
         else { QWEN4EXP_SPLIT_GATEUP(false, 4u, false); }
 #undef QWEN4EXP_SPLIT_GATEUP
+#undef QWEN4EXP_SPLIT_GATEUP_SHAPE
     }
     else if (tile == 8) { QWEN4EXP_GATEUP(8); }
     else if (tile == 4) { QWEN4EXP_GATEUP(4); }
@@ -8306,13 +8326,18 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
             mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
 #define QWEN4EXP_DOWN_IMPL(R, DT, V) QWEN4EXP_DOWN_IMPL_S(R, DT, V, false, 0)
-#define QWEN4EXP_DOWN_ASYNC(DT) \
-    qwen4exp_moe_down_q_kernel<2, DT, true, true, true><<< \
+#define QWEN4EXP_DOWN_ASYNC_ROWS(DT, NR) \
+    qwen4exp_moe_down_q_kernel<2, DT, true, true, true, NR><<< \
             dn_grid, threads, (size_t)dn_shared, stream>>>( \
             (float *)out->ptr, down, (const int32_t *)selected->ptr, \
             sc.mq, sc.ms, sc.msum, \
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
             mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
+#define QWEN4EXP_DOWN_ASYNC(DT) do { \
+    if (dn_shape == 1u) { QWEN4EXP_DOWN_ASYNC_ROWS(DT, 1u); } \
+    else if (dn_shape == 2u) { QWEN4EXP_DOWN_ASYNC_ROWS(DT, 2u); } \
+    else { QWEN4EXP_DOWN_ASYNC_ROWS(DT, 0u); } \
+} while (0)
 #define QWEN4EXP_DOWN(R) do { \
     if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q5_1) { \
         QWEN4EXP_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q5_1, false); \
@@ -8390,6 +8415,9 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             ((uintptr_t)down & 15u) == 0u &&
             dn_shared <= QW_DOWN_PANEL_MAX_BYTES &&
             getenv("DS4_QWEN4EXP_NO_DOWN_PANEL") == NULL;
+        const uint32_t dn_shape = qwen4exp_down_decode_rows(
+            mgroups, out_dim, n_tokens, n_expert_used, down_slab->type,
+            down_slab->row_bytes, down_slab->expert_bytes);
         if (down_slab->type == DS4_QWEN4EXP_TY_q8_0) {
             if (dn_stage && getenv("DS4_QWEN4EXP_NO_DOWN_ASYNC") == NULL) {
                 QWEN4EXP_DOWN_ASYNC(DS4_QWEN4EXP_TY_q8_0);
@@ -8418,6 +8446,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
 #undef QWEN4EXP_DOWN_IMPL
 #undef QWEN4EXP_DOWN_IMPL_S
 #undef QWEN4EXP_DOWN_ASYNC
+#undef QWEN4EXP_DOWN_ASYNC_ROWS
     return cuda_ok(cudaGetLastError(), "qwen4exp MoE down launch");
 }
 
