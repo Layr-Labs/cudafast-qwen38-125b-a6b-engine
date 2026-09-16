@@ -13173,6 +13173,159 @@ qwen4exp_qsa_split_probs_kernel(
     }
 }
 
+/* The same probabilities/contributions, with the fold's exact per-tile
+ * rescale saved once per head. Scores are private head/tile rows; their first
+ * word is dead after tid 0 loads its p. The following kernel boundary orders
+ * that scratch write before the fold reads it. */
+template <uint32_t GROUP, uint32_t VSTEP>
+__global__ static void __launch_bounds__(256, 1)
+qwen4exp_qsa_split_probs_rescale_kernel(
+        const float *v_cache,
+        const int32_t *selected,
+        const int32_t *counts,
+        float *sc,
+        const float *tmax,
+        float *ct,
+        float *tsum,
+        uint32_t n_tokens,
+        uint32_t n_head,
+        uint32_t n_kv_head,
+        uint32_t head_dim,
+        uint32_t pos0,
+        uint32_t cache_cap,
+        uint32_t max_selected,
+        uint32_t sparse,
+        uint32_t max_tiles,
+        const uint32_t *d_pos) {
+    extern __shared__ __align__(16) float qwen4exp_attn_pr_shared[];
+    const uint32_t group = blockIdx.x;
+    const uint32_t tile = blockIdx.y;
+    const uint32_t token = blockIdx.z;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t nth = blockDim.x;
+    const uint32_t head0 = group * GROUP;
+    if (head0 + GROUP > n_head || token >= n_tokens) return;
+
+    const uint32_t p0 = d_pos ? *d_pos : pos0;
+    const uint32_t count = sparse ? (uint32_t)counts[token] : p0 + token + 1u;
+    const uint32_t base = tile * nth;
+    if (base >= count) return;
+    const uint32_t n_in_tile = min(nth, count - base);
+    const uint32_t kv_head = head0 / (n_head / n_kv_head);
+    const uint32_t kv_stride = n_kv_head * head_dim;
+
+    float *trow = qwen4exp_attn_pr_shared;           /* GROUP * nth      */
+    float *probs = trow + GROUP * nth;               /* GROUP * nth      */
+    int32_t *keys = (int32_t *)(probs + GROUP * nth);/* nth              */
+
+    const int32_t key = qwen4exp_qsa_tile_key(selected, token, max_selected,
+                                              base, tid, n_in_tile, cache_cap,
+                                              sparse);
+    keys[tid] = key;
+    const uint64_t row = ((uint64_t)token * n_head + head0) * max_tiles + tile;
+
+    /* The running maximum through this tile, per head: the per-head
+     * kernel's fmaxf chain over the tile maxima so far, from MASKED.  All
+     * GROUP heads' loads are asked for together, ahead of the barriers. */
+    float m[GROUP];
+    float p[GROUP];
+#pragma unroll
+    for (uint32_t h = 0; h < GROUP; h++) {
+        m[h] = QWEN4EXP_QSA_MASKED_SCORE;
+        p[h] = sc[(row + h * max_tiles) * nth + tid];
+    }
+    for (uint32_t t = 0; t < tile; t++) {
+#pragma unroll
+        for (uint32_t h = 0; h < GROUP; h++) {
+            m[h] = fmaxf(m[h], tmax[row + h * max_tiles - tile + t]);
+        }
+    }
+#pragma unroll
+    for (uint32_t h = 0; h < GROUP; h++) {
+        const float prior = m[h];
+        m[h] = fmaxf(prior, tmax[row + h * max_tiles]);
+        /* Only tid 0 read this score element, into p[h] above. No other
+         * block reads this head/tile's scores. Reuse its dead first word
+         * after that read, without touching any other thread's score. */
+        if (tid == 0u) sc[(row + h * max_tiles) * nth] =
+            (prior > QWEN4EXP_QSA_MASKED_LIMIT) ? expf(prior - m[h]) : 0.0f;
+    }
+#pragma unroll
+    for (uint32_t h = 0; h < GROUP; h++) {
+        p[h] = (key >= 0) ? expf(p[h] - m[h]) : 0.0f;
+        probs[h * nth + tid] = p[h];
+        trow[h * nth + tid] = p[h];
+    }
+    /* qwen4exp_blk_sum's tree over each head's row -- the same
+     * sdata[tid] += sdata[tid + step] per step, the same shuffle tail --
+     * with the GROUP rows sharing each barrier instead of paying it apiece. */
+    for (uint32_t step = nth >> 1; step >= 32u; step >>= 1) {
+        __syncthreads();
+        if (tid < step) {
+#pragma unroll
+            for (uint32_t h = 0; h < GROUP; h++) {
+                trow[h * nth + tid] += trow[h * nth + tid + step];
+            }
+        }
+    }
+    __syncthreads();
+    if (tid < 32u) {
+#pragma unroll
+        for (uint32_t h = 0; h < GROUP; h++) {
+            float v = trow[h * nth + tid];
+#pragma unroll
+            for (uint32_t step = 16u; step > 0u; step >>= 1) {
+                v += __shfl_down_sync(0xffffffffu, v, step);
+            }
+            if (tid == 0u) tsum[row + h * max_tiles] = v;
+        }
+    }
+    __syncthreads();
+
+    if (tid < head_dim) {
+        float contrib[GROUP];
+#pragma unroll
+        for (uint32_t h = 0; h < GROUP; h++) contrib[h] = 0.0f;
+        const float *vh = v_cache + (uint64_t)kv_head * head_dim + tid;
+        uint32_t j = 0;
+        /* VSTEP value rows in flight on the dense path,
+         * where no key in the tile is masked (the per-head kernel's own
+         * batch and its own argument); the products still land j ascending. */
+        if (!sparse) {
+            for (; j + VSTEP <= n_in_tile;
+                   j += VSTEP) {
+                float a[VSTEP];
+#pragma unroll
+                for (uint32_t i = 0; i < VSTEP; i++) {
+                    a[i] = vh[(uint64_t)keys[j + i] * kv_stride];
+                }
+                asm volatile("" ::: "memory");   /* as in the scores kernel */
+#pragma unroll
+                for (uint32_t i = 0; i < VSTEP; i++) {
+#pragma unroll
+                    for (uint32_t h = 0; h < GROUP; h++) {
+                        contrib[h] = __fmaf_rn(probs[h * nth + j + i], a[i],
+                                               contrib[h]);
+                    }
+                }
+            }
+        }
+        for (; j < n_in_tile; j++) {
+            const int32_t kj = keys[j];
+            if (kj < 0) continue;
+            const float vvj = vh[(uint64_t)kj * kv_stride];
+#pragma unroll
+            for (uint32_t h = 0; h < GROUP; h++) {
+                contrib[h] = __fmaf_rn(probs[h * nth + j], vvj, contrib[h]);
+            }
+        }
+#pragma unroll
+        for (uint32_t h = 0; h < GROUP; h++) {
+            ct[(row + h * max_tiles) * head_dim + tid] = contrib[h];
+        }
+    }
+}
+
 __global__ static void qwen4exp_qsa_split_fold_kernel(
         const float *tmax,
         const float *tsum,
@@ -13212,6 +13365,121 @@ __global__ static void qwen4exp_qsa_split_fold_kernel(
         run_max = new_max;
     }
     dst[tid] = (run_sum > 0.0f) ? acc / run_sum : 0.0f;
+}
+
+/* Split attention's unchanged ordered fold followed by its existing doubled
+ * gate and Q8 activation seam, in one launch. Head width is exactly 256, so
+ * a fold CTA owns the same eight Q8 groups as the separate gate CTA. The
+ * float attention result is still written for the original API semantics.
+ * Count zero executes the zero-tile fold and still emits the zero Q8 row. */
+__global__ static void qwen4exp_qsa_split_fold_quant_kernel(
+        const float *tmax,
+        const float *tsum,
+        const float *ct,
+        const int32_t *counts,
+        float *out,
+        uint32_t n_tokens,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t pos0,
+        uint32_t sparse,
+        uint32_t max_tiles,
+        uint32_t tile_width,
+        const uint32_t *d_pos,
+        int8_t *xq, float *xscale, const float *doubled) {
+    const uint32_t head = blockIdx.x;
+    const uint32_t token = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    if (head >= n_head || token >= n_tokens || tid >= head_dim) return;
+    const uint32_t p0 = d_pos ? *d_pos : pos0;
+    const uint32_t count = sparse ? (uint32_t)counts[token] : p0 + token + 1u;
+    float *dst = out + ((uint64_t)token * n_head + head) * head_dim;
+    const uint32_t n_tiles = (count + tile_width - 1u) / tile_width;
+    const uint64_t row = ((uint64_t)token * n_head + head) * max_tiles;
+    float run_max = QWEN4EXP_QSA_MASKED_SCORE;
+    float run_sum = 0.0f;
+    float acc = 0.0f;
+    for (uint32_t t = 0; t < n_tiles; t++) {
+        const float new_max = fmaxf(run_max, tmax[row + t]);
+        const float rescale = (run_max > QWEN4EXP_QSA_MASKED_LIMIT)
+            ? expf(run_max - new_max) : 0.0f;
+        run_sum = __fmaf_rn(run_sum, rescale, tsum[row + t]);
+        acc = __fmaf_rn(acc, rescale, ct[(row + t) * head_dim + tid]);
+        run_max = new_max;
+    }
+    dst[tid] = (run_sum > 0.0f) ? acc / run_sum : 0.0f;
+    const uint64_t gid = ((uint64_t)token * n_head + head) * head_dim + tid;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const float v = dst[tid] * (1.0f / (1.0f + expf(-doubled[2u * gid - threadIdx.x +
+                                                   blockDim.x])));
+    const float vz = qwen4exp_q8_ftz(v);
+    float a = qwen4exp_q8_ftz(fabsf(v));
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+    }
+    const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
+    const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
+    const uint64_t pair = ((uint64_t)token * n_head + head) * 8u + warp;
+    if (lane == 0u) xscale[pair] = d;
+    int q = (int)lrintf(qwen4exp_q8_ftz(vz * id));
+    q = q > 127 ? 127 : (q < -128 ? -128 : q);
+    xq[pair * 32u + lane] = (int8_t)q;
+}
+
+/* Consume the identical rescale computed at the existing probability stage.
+ * The sum and per-channel contribution FMAs remain in ascending tile order. */
+__global__ static void qwen4exp_qsa_split_fold_rescale_quant_kernel(
+        const float *rescale_rows,
+        const float *tsum,
+        const float *ct,
+        const int32_t *counts,
+        float *out,
+        uint32_t n_tokens,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t pos0,
+        uint32_t sparse,
+        uint32_t max_tiles,
+        uint32_t tile_width,
+        const uint32_t *d_pos,
+        int8_t *xq, float *xscale, const float *doubled) {
+    const uint32_t head = blockIdx.x;
+    const uint32_t token = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    if (head >= n_head || token >= n_tokens || tid >= head_dim) return;
+    const uint32_t p0 = d_pos ? *d_pos : pos0;
+    const uint32_t count = sparse ? (uint32_t)counts[token] : p0 + token + 1u;
+    float *dst = out + ((uint64_t)token * n_head + head) * head_dim;
+    const uint32_t n_tiles = (count + tile_width - 1u) / tile_width;
+    const uint64_t row = ((uint64_t)token * n_head + head) * max_tiles;
+    float run_sum = 0.0f;
+    float acc = 0.0f;
+    for (uint32_t t = 0; t < n_tiles; t++) {
+        const float rescale = rescale_rows[(row + t) * tile_width];
+        run_sum = __fmaf_rn(run_sum, rescale, tsum[row + t]);
+        acc = __fmaf_rn(acc, rescale, ct[(row + t) * head_dim + tid]);
+    }
+    dst[tid] = (run_sum > 0.0f) ? acc / run_sum : 0.0f;
+    const uint64_t gid = ((uint64_t)token * n_head + head) * head_dim + tid;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const float v = dst[tid] * (1.0f / (1.0f + expf(-doubled[2u * gid - threadIdx.x +
+                                                   blockDim.x])));
+    const float vz = qwen4exp_q8_ftz(v);
+    float a = qwen4exp_q8_ftz(fabsf(v));
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+    }
+    const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
+    const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
+    const uint64_t pair = ((uint64_t)token * n_head + head) * 8u + warp;
+    if (lane == 0u) xscale[pair] = d;
+    int q = (int)lrintf(qwen4exp_q8_ftz(vz * id));
+    q = q > 127 ? 127 : (q < -128 ? -128 : q);
+    xq[pair * 32u + lane] = (int8_t)q;
 }
 
 __global__ static void qwen4exp_qsa_output_gate_kernel(
@@ -13985,7 +14253,9 @@ static int qwen4exp_qsa_attention_split(
         uint32_t n_tokens, uint32_t n_head, uint32_t n_kv_head,
         uint32_t head_dim, uint32_t pos0, uint32_t cache_cap,
         uint32_t max_selected, float scale, const uint32_t *d_pos,
-        const ds4_gpu_tensor *scratch, uint32_t max_count) {
+        const ds4_gpu_tensor *scratch, uint32_t max_count,
+        ds4_gpu_tensor *gate_q8 = NULL, uint64_t q_offset = 0,
+        uint64_t s_offset = 0, const ds4_gpu_tensor *doubled = NULL) {
     const bool sparse = selected != NULL;
     const uint32_t nth = qwen4exp_cuda_threads(head_dim);
     const uint64_t need = ds4_gpu_qwen4exp_qsa_split_scratch_bytes(
@@ -14021,17 +14291,49 @@ static int qwen4exp_qsa_attention_split(
         pr_shared > QWEN4EXP_QSA_GROUP_SHARED_CAP) {
         return 0;
     }
+    bool rescale_fold = gate_q8 &&
+        getenv("DS4_QWEN4EXP_NO_QSA_RESCALE") == NULL &&
+        (g == 2u || g == 4u);
+    /* Reusing a dead score must not overwrite a live aliased input/output.
+     * The ordinary fold does not read scores, so an output view into sc was
+     * harmless there. Keep that old path for all such caller-supplied views. */
+    if (rescale_fold) {
+        const ds4_gpu_tensor *live[] = {out, q, k_cache, v_cache, selected,
+                                       counts, doubled};
+        for (const ds4_gpu_tensor *t : live) if (t &&
+            !qwen4exp_hc_ranges_disjoint(scratch->ptr, scratch->bytes,
+                                        t->ptr, t->bytes)) rescale_fold = false;
+        if (d_pos && !qwen4exp_hc_ranges_disjoint(scratch->ptr, scratch->bytes,
+                                                d_pos, sizeof(uint32_t)))
+            rescale_fold = false;
+    }
 #define QWEN4EXP_QSA_SPLIT_LAUNCH(G, V)                                          \
     qwen4exp_qsa_split_scores_kernel<G><<<grid, nth, sc_shared,               \
         cuda_decode_stream()>>>(                                              \
             (const float *)q->ptr, (const float *)k_cache->ptr, sel, cnt,     \
             sc, tmax, n_tokens, n_head, n_kv_head, head_dim, pos0, cache_cap, \
             max_selected, sparse ? 1u : 0u, max_tiles, scale, d_pos);         \
+    if constexpr (G == 2u || G == 4u) {             \
+        if (rescale_fold) {                                                  \
+            qwen4exp_qsa_split_probs_rescale_kernel<G,V><<<grid,nth,pr_shared, \
+                cuda_decode_stream()>>>(                                     \
+                    (const float *)v_cache->ptr,sel,cnt,sc,tmax,ct,tsum,     \
+                    n_tokens,n_head,n_kv_head,head_dim,pos0,cache_cap,       \
+                    max_selected,sparse?1u:0u,max_tiles,d_pos);              \
+        } else {                                                            \
     qwen4exp_qsa_split_probs_kernel<G, V><<<grid, nth, pr_shared,                \
         cuda_decode_stream()>>>(                                              \
             (const float *)v_cache->ptr, sel, cnt, sc, tmax, ct, tsum,        \
             n_tokens, n_head, n_kv_head, head_dim, pos0, cache_cap,           \
-            max_selected, sparse ? 1u : 0u, max_tiles, d_pos)
+            max_selected, sparse ? 1u : 0u, max_tiles, d_pos); \
+        }                                                                   \
+    } else {                                                                \
+    qwen4exp_qsa_split_probs_kernel<G, V><<<grid, nth, pr_shared,                \
+        cuda_decode_stream()>>>(                                              \
+            (const float *)v_cache->ptr, sel, cnt, sc, tmax, ct, tsum,        \
+            n_tokens, n_head, n_kv_head, head_dim, pos0, cache_cap,           \
+            max_selected, sparse ? 1u : 0u, max_tiles, d_pos); \
+    }
     switch (g) {
         case 12u: QWEN4EXP_QSA_SPLIT_LAUNCH(12u, QWEN4EXP_QSA_SPLIT_VSTEP); break;
         case 6u:  QWEN4EXP_QSA_SPLIT_LAUNCH(6u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
@@ -14052,12 +14354,94 @@ static int qwen4exp_qsa_attention_split(
         default:  return 0;
     }
 #undef QWEN4EXP_QSA_SPLIT_LAUNCH
-    qwen4exp_qsa_split_fold_kernel<<<dim3(n_head, n_tokens), head_dim, 0,
-        cuda_decode_stream()>>>(
-            tmax, tsum, ct, cnt, (float *)out->ptr, n_tokens, n_head,
-            head_dim, pos0, sparse ? 1u : 0u, max_tiles, nth, d_pos);
+    if (rescale_fold) {
+        qwen4exp_qsa_split_fold_rescale_quant_kernel<<<dim3(n_head,n_tokens),head_dim,0,
+            cuda_decode_stream()>>>(
+                sc,tsum,ct,cnt,(float *)out->ptr,n_tokens,n_head,head_dim,pos0,
+                sparse?1u:0u,max_tiles,nth,d_pos,
+                (int8_t *)((char *)gate_q8->ptr+q_offset),
+                (float *)((char *)gate_q8->ptr+s_offset),(const float *)doubled->ptr);
+    } else if (gate_q8) {
+        qwen4exp_qsa_split_fold_quant_kernel<<<dim3(n_head, n_tokens), head_dim, 0,
+            cuda_decode_stream()>>>(
+                tmax, tsum, ct, cnt, (float *)out->ptr, n_tokens, n_head,
+                head_dim, pos0, sparse ? 1u : 0u, max_tiles, nth, d_pos,
+                (int8_t *)((char *)gate_q8->ptr + q_offset),
+                (float *)((char *)gate_q8->ptr + s_offset),
+                (const float *)doubled->ptr);
+    } else {
+        qwen4exp_qsa_split_fold_kernel<<<dim3(n_head, n_tokens), head_dim, 0,
+            cuda_decode_stream()>>>(
+                tmax, tsum, ct, cnt, (float *)out->ptr, n_tokens, n_head,
+                head_dim, pos0, sparse ? 1u : 0u, max_tiles, nth, d_pos);
+    }
     return cuda_ok(cudaGetLastError(), "Qwen4-Exp QSA split attention launch")
         ? 1 : -1;
+}
+
+extern "C" int ds4_gpu_qwen4exp_qsa_attention_fold_q8_dpos_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k_cache,
+        const ds4_gpu_tensor *v_cache,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *counts,
+        uint32_t              n_tokens,
+        uint32_t              n_head,
+        uint32_t              n_kv_head,
+        uint32_t              head_dim,
+        uint32_t              pos0,
+        uint32_t              cache_cap,
+        uint32_t              max_selected,
+        float                 scale,
+        const ds4_gpu_tensor *d_pos,
+        const ds4_gpu_tensor *scratch,
+        uint32_t              max_count,
+        ds4_gpu_tensor       *gate_q8,
+        uint64_t              q_offset,
+        uint64_t              s_offset,
+        const ds4_gpu_tensor *doubled) {
+    if (getenv("DS4_QWEN4EXP_NO_QSA_FOLD_QUANT") != NULL ||
+        n_tokens == 0u || n_tokens > 3u || n_head != 24u || n_kv_head != 2u ||
+        head_dim != 256u ||
+        (!d_pos && (uint64_t)pos0 + n_tokens > cache_cap)) return 0;
+    const bool sparse = selected != NULL;
+    if (sparse && (!counts || max_selected == 0u)) return 0;
+    const uint64_t q_elems = (uint64_t)n_tokens * n_head * head_dim;
+    const uint64_t cache_elems = (uint64_t)cache_cap * n_kv_head * head_dim;
+    const uint64_t scale_bytes = (q_elems / 32u) * sizeof(float);
+    if (!glm53_cuda_tensor_has(out, q_elems, sizeof(float)) ||
+        !glm53_cuda_tensor_has(q, q_elems, sizeof(float)) ||
+        !glm53_cuda_tensor_has(k_cache, cache_elems, sizeof(float)) ||
+        !glm53_cuda_tensor_has(v_cache, cache_elems, sizeof(float)) ||
+        !glm53_cuda_tensor_has(doubled, 2u * q_elems, sizeof(float)) ||
+        (d_pos && !glm53_cuda_tensor_has(d_pos, 1u, sizeof(uint32_t))) ||
+        (sparse &&
+         (!glm53_cuda_tensor_has(selected, (uint64_t)n_tokens * max_selected,
+                                 sizeof(int32_t)) ||
+          !glm53_cuda_tensor_has(counts, n_tokens, sizeof(int32_t)))) ||
+        !gate_q8 || !gate_q8->ptr || !scratch || !scratch->ptr ||
+        (q_offset & 15u) || (s_offset & 15u) ||
+        q_offset > gate_q8->bytes || s_offset > gate_q8->bytes ||
+        gate_q8->bytes - q_offset < q_elems ||
+        gate_q8->bytes - s_offset < scale_bytes ||
+        (q_offset < s_offset ? q_offset + q_elems > s_offset
+                              : s_offset + scale_bytes > q_offset)) return 0;
+    const ds4_gpu_tensor *others[] = {out, q, k_cache, v_cache, selected,
+                                     counts, doubled, d_pos, scratch};
+    const int device = ds4_tensor_device_idx(gate_q8);
+    for (const ds4_gpu_tensor *t : others) if (t) {
+        if (ds4_tensor_device_idx(t) != device ||
+            !qwen4exp_hc_ranges_disjoint(gate_q8->ptr, gate_q8->bytes,
+                                         t->ptr, t->bytes)) return 0;
+    }
+    if (!qwen4exp_hc_ranges_disjoint(out->ptr, out->bytes,
+                                    doubled->ptr, doubled->bytes)) return 0;
+    return qwen4exp_qsa_attention_split(
+        out, q, k_cache, v_cache, selected, counts, n_tokens, n_head, n_kv_head,
+        head_dim, pos0, cache_cap, max_selected, scale,
+        d_pos ? (const uint32_t *)d_pos->ptr : NULL, scratch, max_count,
+        gate_q8, q_offset, s_offset, doubled);
 }
 
 extern "C" int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(

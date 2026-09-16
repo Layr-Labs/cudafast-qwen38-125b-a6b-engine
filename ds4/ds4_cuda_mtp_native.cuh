@@ -12,6 +12,7 @@ static constexpr uint32_t MTP_NATIVE_DIM = 2560u;
  * selected-row dots. */
 static constexpr uint32_t MTP_NATIVE_SCREEN_GROUPS = 24u;
 static constexpr uint32_t MTP_NATIVE_MAX_WIDTH = 1u << 20;
+#include "ds4_cuda_mtp_partial.cuh"
 template <bool Screen, bool EmitKeys = false>
 __global__ static void mtp_native_projection_kernel(
         float *out, const unsigned char *w,
@@ -140,6 +141,7 @@ extern "C" int ds4_gpu_mtp_native_screen_init(uint32_t width,
             cuda_decode_stream()) != cudaSuccess) return -1;
     *bytes = mtp_native_offsets(width).temporary + std::max(a,b);
     *capacity = MTP_NATIVE_CAP;
+    mtp_partial_registered_width = width;
     return 1;
 }
 __global__ static void mtp_native_keys(uint64_t *keys, uint32_t *invalid,
@@ -159,6 +161,7 @@ __global__ static void mtp_native_unpack_ids(uint32_t *ids, const uint64_t *keys
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < MTP_NATIVE_CAP) ids[i] = UINT32_MAX - (uint32_t)keys[i];
 }
+#include "ds4_cuda_mtp_partial_tune.cuh"
 /* Moving key writes into projection is equivalent only when scratch writes
  * cannot change another input/output view or a concurrently read weight. */
 static bool mtp_native_key_range_disjoint(const void *a, uint64_t an,
@@ -206,16 +209,22 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
     uint64_t *key_out = (uint64_t *)(base + l.key_out);
     uint32_t *id_tmp = (uint32_t *)(base + l.id_tmp);
     uint32_t *flag = (uint32_t *)(base + l.flag);
-    if (!cuda_ok(cudaMemsetAsync(flag,0,4,cuda_decode_stream()),"native screen flag")) return -1;
-    quantize_q8_0_f32_rows_warp_kernel<<<10,256,0,cuda_decode_stream()>>>(
-        xq,xs,(const float *)x->ptr,in_dim,80,1);
-    if (!cuda_ok(cudaGetLastError(),"native screen quantize")) return -1;
     const bool fuse_keys = getenv("DS4_MTP_NO_FUSED_SCREEN_KEYS") == nullptr &&
         mtp_native_key_range_disjoint(scratch->ptr,scratch->bytes,
                                      w,(uint64_t)vocab*80u*34u) &&
         mtp_native_key_range_disjoint(scratch->ptr,scratch->bytes,x->ptr,x->bytes) &&
         mtp_native_key_range_disjoint(scratch->ptr,scratch->bytes,out->ptr,out->bytes) &&
         mtp_native_key_range_disjoint(scratch->ptr,scratch->bytes,ids->ptr,ids->bytes);
+    int id_bits = 1;
+    while (id_bits < 32 && ((uint32_t)1u << id_bits) < vocab) id_bits++;
+    const bool partial = mtp_partial_eligible(fuse_keys,width,current,id_bits);
+    /* The existing 256-byte-aligned flag slot has room for a count and pivot
+     * before temporary scratch. No layout or allocation size changes. */
+    uint64_t *pivot = (uint64_t *)(base + l.flag + 8u);
+    if (!cuda_ok(cudaMemsetAsync(flag,0,partial?8u:4u,cuda_decode_stream()),"native screen flag")) return -1;
+    quantize_q8_0_f32_rows_warp_kernel<<<10,256,0,cuda_decode_stream()>>>(
+        xq,xs,(const float *)x->ptr,in_dim,80,1);
+    if (!cuda_ok(cudaGetLastError(),"native screen quantize")) return -1;
     if (fuse_keys) {
         mtp_native_projection_kernel<true,true><<<(width+3u)/4u,256,0,cuda_decode_stream()>>>(
             scores,(const unsigned char *)w,xq,xs,width,nullptr,vocab,prefix,tail,
@@ -229,9 +238,21 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
             key_in,flag,scores,width,prefix,tail,vocab);
         if (!cuda_ok(cudaGetLastError(),"native screen keys")) return -1;
     }
-    uint32_t invalid = 0;
-    if (!ds4_gpu_tensor_read(scratch,l.flag,&invalid,4)) return -1;
-    if (invalid) return 0;
+    if (partial) {
+        mtp_partial_pivot<<<1,256,0,cuda_decode_stream()>>>(pivot,key_in,width);
+        if (!cuda_ok(cudaGetLastError(),"native sample pivot")) return -1;
+        mtp_partial_filter<<<(width+255u)/256u,256,0,cuda_decode_stream()>>>(
+            key_out,flag+1u,key_in,pivot,width);
+        if (!cuda_ok(cudaGetLastError(),"native partial filter")) return -1;
+    }
+    uint32_t status[2] = {};
+    if (!ds4_gpu_tensor_read(scratch,l.flag,status,partial?8u:4u)) return -1;
+    if (status[0]) return 0;
+    if (partial && mtp_partial_count_fits(status[1])) {
+        mtp_partial_sort_ids<<<1,256,0,cuda_decode_stream()>>>(
+            (uint32_t *)ids->ptr,key_out,status[1],id_bits);
+        if (!cuda_ok(cudaGetLastError(),"native partial keys and IDs")) return -1;
+    } else {
     size_t temporary = (size_t)(scratch->bytes-l.temporary);
     /* Rank on the high score word alone. Keys are written in row order, so
      * original IDs strictly increase over the whole input and the packed low
@@ -267,13 +288,11 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
      * checkpoint with a wider vocabulary widens the range instead of silently
      * truncating it, and it is clamped to 32 so the worst case is exactly the
      * behaviour this replaces. */
-    int id_bits = 1;
-    while (id_bits < 32 && ((uint32_t)1u << id_bits) < vocab) id_bits++;
-    if (id_bits > 32) id_bits = 32;
     if (!cuda_ok(cub::DeviceRadixSort::SortKeys(base+l.temporary,temporary,
             id_tmp,(uint32_t *)ids->ptr,MTP_NATIVE_CAP,0,id_bits,
             cuda_decode_stream()),
             "native original-ID sort")) return -1;
+    }
     mtp_native_projection_kernel<false><<<(MTP_NATIVE_CAP+3u)/4u,256,0,cuda_decode_stream()>>>(
         (float *)out->ptr,(const unsigned char *)w,xq,xs,MTP_NATIVE_CAP,
         (const uint32_t *)ids->ptr,vocab,prefix,tail);
