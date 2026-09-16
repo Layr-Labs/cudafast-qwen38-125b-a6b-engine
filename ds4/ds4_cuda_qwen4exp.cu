@@ -8685,6 +8685,12 @@ __global__ static void qwen4exp_gdn_output_quant_kernel(
         uint32_t     n_value_head,
         uint32_t     n_tokens,
         float        norm_eps) {
+    /* PDL producer for the ssm_out projection that follows on the stream.
+     * Grid is n_tokens * n_value_head blocks -- single-wave at the decode
+     * widths.  Row-gated to the same <= 2 the converted launch site fires
+     * at: a prefill launch never carries a trigger (the deadlock rule,
+     * ds4_cuda_qwen4exp.cuh). */
+    if (n_tokens <= 2u) QWEN4EXP_PDL_TRIGGER();
     const uint32_t token = blockIdx.x;
     const uint32_t head = blockIdx.y;
     const uint32_t tid = threadIdx.x;
@@ -12537,6 +12543,13 @@ __global__ static void qwen4exp_qsa_output_gate_quant_kernel(
         const float *gate,
         const float *out,
         uint32_t     n_values) {
+    /* PDL producer for the attn_output projection that follows on the
+     * stream.  The grid is n_values / 256 = n_tokens * n_head blocks --
+     * single-wave at the decode widths.  The bound is the device residency
+     * ceiling for 256-thread blocks (48 SMs x 6); a prefill launch exceeds
+     * it and never carries a trigger (the deadlock rule,
+     * ds4_cuda_qwen4exp.cuh). */
+    if (gridDim.x <= 288u) QWEN4EXP_PDL_TRIGGER();
     const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
@@ -12569,6 +12582,13 @@ __global__ static void qwen4exp_qsa_output_gate_doubled_quant_kernel(
         const float *doubled,
         const float *out,
         uint32_t     n_values) {
+    /* PDL producer for the attn_output projection that follows on the
+     * stream.  The grid is n_values / 256 = n_tokens * n_head blocks --
+     * single-wave at the decode widths.  The bound is the device residency
+     * ceiling for 256-thread blocks (48 SMs x 6); a prefill launch exceeds
+     * it and never carries a trigger (the deadlock rule,
+     * ds4_cuda_qwen4exp.cuh). */
+    if (gridDim.x <= 288u) QWEN4EXP_PDL_TRIGGER();
     const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
