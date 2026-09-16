@@ -930,30 +930,8 @@ static inline cublasHandle_t cuda_cublas_for_tier(int logical_tier) {
  * of that key, so four slots leaves one spare. Same keys, same graphs, same
  * kernels in the same order; the cost is a memcmp over at most eight 48-byte
  * keys off the device, and one more executable graph per row only if the run
- * actually has a fifth shape -- which is the case this is for.
- *
- * THE KEY GREW AND THIS DID NOT, so the spare the paragraph above counts on is
- * gone.  When it was written the variant was `n_tokens | (spec_snapshot_rows
- * << 8)`.  ds4_qwen4exp_gdn_graph_variant() now folds two more fields into it,
- * the recurrent-buffer parity and the replay-active flag:
- *
- *     width | (snapshots << 8) | (phase << 16) | (active << 17)
- *
- * The GDN replay added both AFTER four was chosen.  At the scored width the
- * parity alternates on every accepting round and the active flag is set, so the
- * decode leg alone reaches four identities per (layer, island) row -- exactly
- * the slot count, with nothing left for the correctness free-run leg's own
- * width, which shares those rows.  The first key that finds the row full does
- * not evict anything: it drops that island onto the eager path permanently and
- * silently, for the rest of the process, which is the failure this comment
- * already warns about.
- *
- * Eight restores the headroom the original reasoning assumed.  It adds
- * CUDA_DECODE_GRAPH_LAYERS * CUDA_DECODE_GRAPH_ISLANDS * 4 entries of key plus
- * pointer, populates none of them until a key asks, and changes no graph's
- * contents, no launch order and no arithmetic -- only how many identities may
- * be resident before the lookup gives up. */
-#define CUDA_DECODE_GRAPH_VARIANTS  8u
+ * actually has a fifth shape -- which is the case this is for. */
+#define CUDA_DECODE_GRAPH_VARIANTS  4u
 
 /* Mirrors the public `struct ds4_decode_graph_key` decl in ds4_gpu.h
  * byte-for-byte (ds4_cuda.cu does not include that header; it carries
@@ -2954,6 +2932,18 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
         c->scratch      = NULL;
         c->scratch_bytes = 0;
     }
+    /* Small-transfer pinned stage for tensor_read/tensor_write.  Allocated
+     * once here so the hot path never races a lazy init; a failure leaves
+     * the stage NULL and both functions keep their pageable path. */
+    if (!g_xfer_stage) {
+        void *stage = NULL;
+        if (cudaHostAlloc(&stage, DS4_XFER_STAGE_BYTES,
+                          cudaHostAllocPortable) == cudaSuccess) {
+            g_xfer_stage = stage;
+        } else {
+            (void)cudaGetLastError();
+        }
+    }
 
     /* NxN peer-access matrix.
      *
@@ -2983,6 +2973,7 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
                            e == cudaErrorPeerAccessAlreadyEnabled);
             (void)cudaGetLastError();
             if (!enabled) { g_gpu_peer_ok[i][j] = 0; continue; }
+
 
             /* Runtime validation: peer copies on RTX 6000 Ada under recent
              * NVIDIA drivers silently corrupt at realistic sizes even though
@@ -3155,6 +3146,10 @@ extern "C" void ds4_gpu_cleanup(void) {
                 g_xdev_bounce_bytes[i][j] = 0;
             }
         }
+    }
+    if (g_xfer_stage) {
+        (void)cudaFreeHost(g_xfer_stage);
+        g_xfer_stage = NULL;
     }
     cuda_stream_selected_cache_release();
     cuda_stream_selected_stage_release();
@@ -3452,14 +3447,43 @@ extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint
     return ok;
 }
 
+/* Small-transfer pinned stage.
+ *
+ * cudaMemcpy on a pageable host buffer takes the driver's staging path: an
+ * internal copy into a pinned bounce buffer plus the DMA, which costs
+ * several microseconds of fixed latency on every call.  The decode path
+ * issues small reads and writes per step -- top-1 readbacks, flag words,
+ * token and n-gram row uploads -- so the fixed cost is paid on the
+ * critical path of every forward.  A persistent pinned stage removes the
+ * driver's copy: the DMA runs straight into (or out of) pinned memory and
+ * the only host work left is one memcpy of the payload itself.
+ *
+ * Allocated once at init, freed at cleanup.  Transfers above the cap keep
+ * the original pageable path, and a failed allocation simply leaves the
+ * stage NULL, which is the same fallback.  The buffer is host memory, so
+ * it is device-agnostic; the portable flag keeps it usable from every
+ * context on a multi-device box. */
+#define DS4_XFER_STAGE_BYTES (256u * 1024u)
+static void *g_xfer_stage = NULL;
+
 extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     int d = ds4_tensor_device_idx(tensor);
     int ok = 0;
     WITH_DEVICE(g_gpu[d].device_id) {
-        ok = cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, data, (size_t)bytes,
-                                cudaMemcpyHostToDevice),
-                     "tensor write");
+        if (g_xfer_stage && bytes > 0 && bytes <= DS4_XFER_STAGE_BYTES) {
+            /* Pinned stage: the DMA reads pinned memory directly instead of
+             * the driver's pageable bounce path.  Same synchronous copy,
+             * same ordering, fewer microseconds of fixed latency. */
+            memcpy(g_xfer_stage, data, (size_t)bytes);
+            ok = cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, g_xfer_stage,
+                                    (size_t)bytes, cudaMemcpyHostToDevice),
+                         "tensor write");
+        } else {
+            ok = cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, data,
+                                    (size_t)bytes, cudaMemcpyHostToDevice),
+                         "tensor write");
+        }
     }
     return ok;
 }
@@ -3469,9 +3493,19 @@ extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset
     int d = ds4_tensor_device_idx(tensor);
     int ok = 0;
     WITH_DEVICE(g_gpu[d].device_id) {
-        ok = cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes,
-                                cudaMemcpyDeviceToHost),
-                     "tensor read");
+        if (g_xfer_stage && bytes > 0 && bytes <= DS4_XFER_STAGE_BYTES) {
+            /* Pinned stage: the DMA lands in pinned memory at full speed and
+             * the only pageable touch is the final memcpy into the caller's
+             * buffer.  Same synchronous copy, same ordering. */
+            ok = cuda_ok(cudaMemcpy(g_xfer_stage, (const char *)tensor->ptr + offset,
+                                    (size_t)bytes, cudaMemcpyDeviceToHost),
+                         "tensor read");
+            if (ok) memcpy(data, g_xfer_stage, (size_t)bytes);
+        } else {
+            ok = cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes,
+                                    cudaMemcpyDeviceToHost),
+                         "tensor read");
+        }
     }
     return ok;
 }
