@@ -227,6 +227,12 @@ void ds4_ple_table_prefetch(ds4_ple_table *t, const uint64_t *ids, size_t count)
 
 void ds4_ple_table_stats_get(const ds4_ple_table *t, ds4_ple_table_stats *out);
 
+/* The table above is read on the scored decode path: one gathered row per
+ * token, IQ4_NL, dequantized in ds4_qwen4exp_ple.c.  Everything that was
+ * measured about that path lives there rather than here, because the layout in
+ * this header is fixed by the on-disk constants file and is not a tuning
+ * surface.  Recorded so the next reader does not go looking for knobs here. */
+
 #ifdef __cplusplus
 }
 #endif
