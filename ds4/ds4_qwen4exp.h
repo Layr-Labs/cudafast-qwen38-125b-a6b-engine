@@ -57,7 +57,7 @@
  * verify width, which is two.  Sizing the batch from the cycle instead is what
  * made a 1024-token prompt prefill in 512 forwards of two rows and run at
  * decode speed. */
-#define DS4_QWEN4EXP_MAX_PREFILL_ROWS 4096u
+#define DS4_QWEN4EXP_MAX_PREFILL_ROWS 1024u
 
 /* Memory plan buckets.  Every bound tensor is charged to exactly one. */
 typedef enum {
