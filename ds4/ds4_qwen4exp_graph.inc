@@ -10,7 +10,6 @@
 
 #include "ds4_qwen4exp_model_registration.h"
 #include "ds4_qwen4exp_qsa_scratch.h"
-#include "ds4_qwen4exp_gdn_replay.h"
 
 /* ======================================================================
  * Sizing.
@@ -92,13 +91,6 @@ void ds4_qwen4exp_session_plan_compute(ds4_qwen4exp_session_plan *plan,
     const uint64_t q_width = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
 
     uint64_t act = 0;
-    /* Reserve the bounded replay checkpoint/log on every platform so a serve
-     * plan remains a conservative bound regardless of the runtime valve. */
-    act += gdn_state_one * plan->n_gdn_layer;
-    act += (uint64_t)DS4_QWEN4EXP_GDN_REPLAY_ROWS * plan->n_gdn_layer *
-        (((uint64_t)DS4_N_GDN_KEY_HEAD + DS4_N_GDN_VALUE_HEAD) *
-         DS4_N_GDN_HEAD_DIM + 2ull * DS4_N_GDN_VALUE_HEAD) * f;
-    act += sizeof(uint32_t);                      /* replay prefix       */
     act += B * sizeof(int32_t);                    /* tokens              */
     act += 3ull * B * H * E * f;                   /* hyper, normed, wide */
     act += 2ull * B * H * E * f;                   /* PLE key/gated, query/conv */
@@ -302,8 +294,6 @@ struct ds4_qwen4exp_session {
     /* Per-layer state.  Only the slots the layer type uses are non-NULL. */
     ds4_gpu_tensor *gdn_conv[DS4_MAX_LAYER];
     ds4_gpu_tensor *gdn_state[DS4_MAX_LAYER];
-    ds4_gpu_tensor *gdn_checkpoint[DS4_MAX_LAYER];
-    ds4_gpu_tensor *gdn_replay_tape[DS4_MAX_LAYER];
     ds4_gpu_tensor *qsa_k[DS4_MAX_LAYER];
     ds4_gpu_tensor *qsa_v[DS4_MAX_LAYER];
     ds4_gpu_tensor *idx_tape[DS4_MAX_LAYER];
@@ -374,12 +364,6 @@ struct ds4_qwen4exp_session {
     uint32_t        adopt_state;   /* recurrent state: row + 1, or 0 */
     uint32_t        adopt_conv;    /* conv history: row + 1, or 0 */
     uint32_t        adopt_device;  /* host mirror of *d_adopt */
-    ds4_gpu_tensor *d_gdn_replay;
-    bool gdn_replay_enabled;
-    bool gdn_replay_active;
-    bool gdn_replay_previous;
-    uint32_t gdn_replay_prefix;
-    uint32_t gdn_replay_phase; /* physical buffer parity, preserved on reset */
     ds4_gpu_tensor *inv_freq;
 
     /* Activations.  All sized for n_batch tokens and reused every layer. */
@@ -589,12 +573,6 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
         return NULL;
     }
     s->plan = plan;
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    s->gdn_replay_enabled = n_batch >= 2u &&
-        getenv("DS4_QWEN4EXP_NO_GDN_REPLAY") == NULL &&
-        getenv("DS4_QWEN4EXP_NO_LAZY_ROLLBACK") == NULL &&
-        ds4_gpu_qwen4exp_gdn_replay_supported();
-#endif
 
     const uint64_t E = DS4_N_EMBD;
     const uint64_t H = DS4_N_HC;
@@ -729,13 +707,6 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
                 DS4_N_GDN_STATE * f;
             s->gdn_conv[il] = qwen4exp_alloc_zeroed(conv_bytes, &ok);
             s->gdn_state[il] = qwen4exp_alloc_zeroed(state_bytes, &ok);
-            if (s->gdn_replay_enabled) {
-                s->gdn_checkpoint[il] = qwen4exp_alloc_zeroed(state_bytes, &ok);
-                const uint64_t tape_bytes = DS4_QWEN4EXP_GDN_REPLAY_ROWS *
-                    (((uint64_t)DS4_N_GDN_KEY_HEAD + DS4_N_GDN_VALUE_HEAD) *
-                     DS4_N_GDN_HEAD_DIM + 2ull * DS4_N_GDN_VALUE_HEAD) * f;
-                s->gdn_replay_tape[il] = qwen4exp_alloc_zeroed(tape_bytes, &ok);
-            }
             /* The rollback slots.  Both states are overwritten in place every
              * token, so a partially accepting round can only reach the length
              * it accepted from a copy the forward itself left behind. */
@@ -772,8 +743,6 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
     }
 
     s->d_pos = qwen4exp_alloc_zeroed(sizeof(uint32_t), &ok);
-    if (s->gdn_replay_enabled)
-        s->d_gdn_replay = qwen4exp_alloc_zeroed(sizeof(uint32_t), &ok);
     if (getenv("DS4_QWEN4EXP_NO_LAZY_ROLLBACK") == NULL) {
         /* Zeroed on the device, so flag, mirror and pending all start at live. */
         s->d_adopt = qwen4exp_alloc_zeroed(sizeof(uint32_t), &ok);
@@ -863,8 +832,6 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
         ds4_gpu_tensor_free(s->gdn_conv[il]);
         ds4_gpu_tensor_free(s->gdn_state[il]);
-        ds4_gpu_tensor_free(s->gdn_checkpoint[il]);
-        ds4_gpu_tensor_free(s->gdn_replay_tape[il]);
         ds4_gpu_tensor_free(s->gdn_conv_snapshot[il]);
         ds4_gpu_tensor_free(s->gdn_state_snapshot[il]);
         ds4_gpu_tensor_free(s->qsa_k[il]);
@@ -886,7 +853,6 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     free(s->ple_rows_host);
     ds4_gpu_tensor_free(s->d_pos);
     ds4_gpu_tensor_free(s->d_adopt);
-    ds4_gpu_tensor_free(s->d_gdn_replay);
     ds4_gpu_tensor_free(s->inv_freq);
     ds4_gpu_tensor_free(s->tokens);
     ds4_gpu_tensor_free(s->hyper);
@@ -987,9 +953,6 @@ void ds4_qwen4exp_session_reset(ds4_qwen4exp_session *s) {
      * live buffers are what the next forward must read. */
     s->adopt_state = 0u;
     s->adopt_conv = 0u;
-    s->gdn_replay_active = false;
-    s->gdn_replay_previous = false;
-    s->gdn_replay_prefix = 0u;
     if (!s->state_dirty) {
         /* Already at the reset state and nothing has written since, so every
          * store below would write the value the buffer already holds.  `pos`
@@ -1613,23 +1576,7 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
      * in any adoption a wider forward could not read. */
     const bool adopt_width = s->d_adopt != NULL &&
         n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT;
-    int rc;
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    if (s->gdn_replay_active) {
-        const ds4_gpu_qwen4exp_gdn_replay replay = {
-            s->gdn_checkpoint[il], s->gdn_replay_tape[il], s->d_gdn_replay};
-        rc = ds4_gpu_qwen4exp_gdn_replay_q8(
-            s->gdn_out, s->gdn_conv[il], s->gdn_state[il],
-            s->gdn_conv_snapshot[il], s->gdn_state_snapshot[il],
-            s->spec_snapshot_rows, s->d_adopt, s->gdn_qkv,
-            s->gdn_alpha, s->gdn_beta, s->gdn_gate,
-            &conv_slab, &a_log_slab, &dt_bias_slab, &ssm_norm_slab,
-            DS4_N_GDN_KEY_HEAD, DS4_N_GDN_VALUE_HEAD, n_tokens,
-            DS4_QWEN4EXP_GDN_HEADS_TILED, DS4_RMS_EPS, DS4_RMS_EPS,
-            out_q8 ? s->gdn_out_q8 : NULL, 0u, out_q8_soff, &replay);
-    } else
-#endif
-    rc = adopt_width
+    const int rc = adopt_width
         ? ds4_gpu_qwen4exp_gdn_adopt_q8(
               s->gdn_out, s->gdn_conv[il], s->gdn_state[il],
               s->gdn_conv_snapshot[il], s->gdn_state_snapshot[il],
@@ -2355,9 +2302,7 @@ static bool qwen4exp_graph_layer_island(
         key.island = island;
         /* Snapshot writes are part of GDN: an ordinary two-row feed and a
          * two-row verify must not share an executable with different writes. */
-        key.variant = ds4_qwen4exp_gdn_graph_variant(
-            n_tokens, s->spec_snapshot_rows, s->gdn_replay_phase,
-            s->gdn_replay_active);
+        key.variant = n_tokens | (s->spec_snapshot_rows << 8u);
         key._pad = 0x5157454eu;  /* QWEN: separate from other model families */
         key.cur_hc = s->hyper;
         key.after_attn_hc = s;
@@ -2413,9 +2358,7 @@ static bool qwen4exp_graph_qsa_island(
         memset(&key, 0, sizeof(key));
         key.il = il;
         key.island = 2u;
-        key.variant = ds4_qwen4exp_gdn_graph_variant(
-            n_tokens, s->spec_snapshot_rows, s->gdn_replay_phase,
-            s->gdn_replay_active);
+        key.variant = n_tokens | (s->spec_snapshot_rows << 8u);
         key._pad = 0x5157454eu;
         key.cur_hc = s->hyper;
         key.after_attn_hc = s;
@@ -2579,7 +2522,7 @@ static bool qwen4exp_graph_layers_encode(
 
 static uint32_t qw_decode_graph_chunks(void) {
     static int init = 0;
-    static uint32_t chunks = 4u;   /* the A/B's pick; 1 restores the single capture */
+    static uint32_t chunks = 6u;   /* the A/B's pick; 1 restores the single capture */
     if (!init) {
         init = 1;
         const char *s = getenv("DS4_CUDA_DECODE_GRAPH_CHUNKS");
@@ -2629,9 +2572,7 @@ static bool qw_decode_graph_chunk(ds4_qwen4exp_session *s,
      * chunk c and the per-layer caches of layer c cannot collide. */
     key.il = chunk;
     key.island = 3u;
-    key.variant = ds4_qwen4exp_gdn_graph_variant(
-            n_tokens, s->spec_snapshot_rows, s->gdn_replay_phase,
-            s->gdn_replay_active);
+    key.variant = n_tokens | (s->spec_snapshot_rows << 8u);
     key._pad = 0x51575343u; /* QWSC: one chunk of the target layer stack */
     key.cur_hc = s->hyper;
     key.after_attn_hc = s;
@@ -2719,9 +2660,7 @@ static bool qwen4exp_graph_layers(
          * uses island three at its own layer index, so the caches are disjoint. */
         key.il = 0u;
         key.island = 3u;
-        key.variant = ds4_qwen4exp_gdn_graph_variant(
-            n_tokens, s->spec_snapshot_rows, s->gdn_replay_phase,
-            s->gdn_replay_active);
+        key.variant = n_tokens | (s->spec_snapshot_rows << 8u);
         key._pad = 0x51575354u; /* QWST: the complete target layer stack */
         key.cur_hc = s->hyper;
         key.after_attn_hc = s;
@@ -2765,25 +2704,6 @@ static bool qwen4exp_graph_layers(
         }
     }
     return qwen4exp_graph_layers_encode(s, w, m, n_tokens, true);
-}
-
-/* Diagnostic/fallback bridge: publish the virtual row-zero snapshot into
- * its original slot without changing either the canonical final state or
- * the replay controller. Repeated selections therefore remain well defined. */
-static bool qwen4exp_gdn_replay_snapshot(const ds4_qwen4exp_session *s,
-                                          uint32_t il, uint32_t row) {
-    if (!s->gdn_replay_previous) return true;
-    if (row != 0u) return false;
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    const uint32_t rows = s->gdn_replay_prefix == DS4_QWEN4EXP_GDN_REPLAY_ROWS
-        ? 0u : s->gdn_replay_prefix + 1u;
-    return ds4_gpu_qwen4exp_gdn_replay_materialize(
-        s->gdn_state_snapshot[il], s->gdn_checkpoint[il], s->gdn_replay_tape[il],
-        rows, DS4_N_GDN_KEY_HEAD, DS4_N_GDN_VALUE_HEAD,
-        DS4_QWEN4EXP_GDN_HEADS_TILED) != 0;
-#else
-    return false;
-#endif
 }
 
 /* Today's GDN rollback copy; graph_forward runs it when a pending lazy
@@ -2882,38 +2802,21 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
      * than taking its own command buffer, and the blits that append to the KV
      * caches only work inside a batch at all.  qwen4exp_forward_fail() ends the
      * batch on the way out so a refusal does not leave one open. */
-    /* Plan before changing any pointers. A rejecting replay round continues
-     * from the same checkpoint plus its committed row-zero transition. Other
-     * adoptions first become ordinary materialized state when necessary. */
-    const ds4_qwen4exp_gdn_replay_step replay_step = ds4_qwen4exp_gdn_replay_plan(
-        s->gdn_replay_enabled, s->gdn_replay_previous, s->gdn_replay_prefix,
-        DS4_QWEN4EXP_GDN_REPLAY_ROWS, n_tokens, s->spec_snapshot_rows,
-        DS4_QWEN4EXP_MTP_MAX_COMMIT, s->adopt_state, s->adopt_conv);
-    if (replay_step.settle) {
-        const uint32_t rs = s->adopt_state, rc = s->adopt_conv;
-        if ((rs != 0u && !qwen4exp_session_copy_layers(s, rs - 1u, true, false)) ||
-            (rc != 0u && !qwen4exp_session_copy_layers(s, rc - 1u, false, true))) {
-            fprintf(stderr, "ds4: qwen4exp GDN rollback could not settle\n");
-            return false;
-        }
-        s->adopt_state = 0u;
-        s->adopt_conv = 0u;
-    }
-    s->gdn_replay_active = replay_step.active;
-    if (replay_step.swap) {
-        for (uint32_t il = 0; il < cfg->n_layer; il++) {
-            if (!s->gdn_state[il]) continue;
-            ds4_gpu_tensor *const old = s->gdn_state[il];
-            s->gdn_state[il] = s->gdn_checkpoint[il];
-            s->gdn_checkpoint[il] = old;
-        }
-        s->gdn_replay_phase ^= 1u;
-    }
-    if (replay_step.active) {
-        s->gdn_replay_prefix = replay_step.prefix;
-        if (!ds4_gpu_qwen4exp_update_dpos(s->d_gdn_replay, replay_step.prefix)) {
-            fprintf(stderr, "ds4: qwen4exp GDN replay prefix update failed\n");
-            return false;
+    /* Lazy GDN rollback.  The kernels can read one pending adoption row for
+     * both GDN objects at a speculative width; anything else -- a wider
+     * forward, or objects left at different rows -- gets today's copy first. */
+    if (s->adopt_state != 0u || s->adopt_conv != 0u) {
+        if (n_tokens > (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT ||
+            s->adopt_state != s->adopt_conv) {
+            const uint32_t rs = s->adopt_state, rc = s->adopt_conv;
+            s->adopt_state = 0u;
+            s->adopt_conv = 0u;
+            if ((rs != 0u && !qwen4exp_session_copy_layers(s, rs - 1u, true, false)) ||
+                (rc != 0u && !qwen4exp_session_copy_layers(s, rc - 1u, false, true))) {
+                fprintf(stderr, "ds4: qwen4exp GDN rollback could not settle "
+                        "before a %u-row forward\n", n_tokens);
+                return false;
+            }
         }
     }
     if (s->d_adopt && s->adopt_device != s->adopt_state) {
@@ -2950,9 +2853,7 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
          * it is on the copy path; `state_dirty` is set above. */
         return qwen4exp_forward_fail();
     }
-    /* Every GDN launch has read the flag; the live buffers are current again.
-     * A replay row-zero snapshot remains virtual until adopted or inspected. */
-    s->gdn_replay_previous = s->gdn_replay_active;
+    /* Every GDN launch has read the flag; the live buffers are current again. */
     s->adopt_state = 0u;
     s->adopt_conv = 0u;
 
@@ -3046,8 +2947,7 @@ static bool qwen4exp_session_copy_layers(ds4_qwen4exp_session *s,
     for (uint32_t il = 0; il < cfg->n_layer && ok; il++) {
         if (recurrent && s->gdn_state[il]) {
             const uint64_t bytes = ds4_gpu_tensor_bytes(s->gdn_state[il]);
-            ok = qwen4exp_gdn_replay_snapshot(s, il, row);
-            if (ok) ok = ds4_gpu_tensor_copy(s->gdn_state[il], 0,
+            ok = ds4_gpu_tensor_copy(s->gdn_state[il], 0,
                                      s->gdn_state_snapshot[il],
                                      (uint64_t)row * bytes, bytes) != 0;
         }
@@ -3059,7 +2959,6 @@ static bool qwen4exp_session_copy_layers(ds4_qwen4exp_session *s,
         }
     }
     if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) return false;
-    if (ok && recurrent) s->gdn_replay_previous = false;
     return ok;
 }
 
@@ -3073,8 +2972,7 @@ static bool qwen4exp_session_select_layers(ds4_qwen4exp_session *s,
                                            bool recurrent, bool conv) {
     if (s && s->d_adopt) {
         s->state_dirty = true;   /* see `state_dirty` */
-        if (row >= DS4_QWEN4EXP_IMPLEMENTED_DEPTH ||
-            (recurrent && s->gdn_replay_previous && row != 0u)) return false;
+        if (row >= DS4_QWEN4EXP_IMPLEMENTED_DEPTH) return false;
         if (recurrent) s->adopt_state = row + 1u;
         if (conv) s->adopt_conv = row + 1u;
         return true;
@@ -3430,9 +3328,7 @@ int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
         memset(&key, 0, sizeof(key));
         key.il = il;
         key.island = 3u;
-        key.variant = ds4_qwen4exp_gdn_graph_variant(
-            n_tokens, s->spec_snapshot_rows, s->gdn_replay_phase,
-            s->gdn_replay_active);
+        key.variant = n_tokens | (s->spec_snapshot_rows << 8u);
         key._pad = 0x4d545048u;
         key.cur_hc = hyper;
         key.after_attn_hc = s;
@@ -3687,7 +3583,6 @@ static double qwen4exp_gdn_checksum(const ds4_qwen4exp_session *s, uint32_t il,
         recurrent ? s->gdn_state_snapshot[il] : s->gdn_conv_snapshot[il];
     const uint32_t pending = recurrent ? s->adopt_state : s->adopt_conv;
     if (!live || !snap || pending == 0u) return qwen4exp_state_checksum(live);
-    if (recurrent && !qwen4exp_gdn_replay_snapshot(s, il, pending - 1u)) return -2.0;
     const uint64_t bytes = ds4_gpu_tensor_bytes(live);
     return qwen4exp_state_checksum_range(snap, (uint64_t)(pending - 1u) * bytes,
                                          bytes);

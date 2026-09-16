@@ -3807,47 +3807,6 @@ int ds4_gpu_qwen4exp_gdn_decode(
         float                 qk_norm_eps,
         float                 norm_eps);
 
-/* CUDA depth-one checkpoint/replay. Control is a device uint32 in [0, ROWS].
- * Checkpoint and state are separate equally-sized recurrent buffers. Tape
- * stores only post-convolution K/V and computed (decay,beta) pairs. */
-#include "ds4_qwen4exp_gdn_replay.h"
-typedef struct {
-    ds4_gpu_tensor *checkpoint;
-    ds4_gpu_tensor *tape;
-    const ds4_gpu_tensor *control;
-} ds4_gpu_qwen4exp_gdn_replay;
-int ds4_gpu_qwen4exp_gdn_replay_supported(void);
-int ds4_gpu_qwen4exp_gdn_replay_materialize(
-        ds4_gpu_tensor *state, ds4_gpu_tensor *checkpoint, ds4_gpu_tensor *tape,
-        uint32_t replay_rows, uint32_t n_key_head, uint32_t n_value_head,
-        uint32_t head_layout);
-int ds4_gpu_qwen4exp_gdn_replay_q8(
-        ds4_gpu_tensor       *out,
-        ds4_gpu_tensor       *conv_state,
-        ds4_gpu_tensor       *recurrent_state,
-        ds4_gpu_tensor       *conv_snapshot,
-        ds4_gpu_tensor       *state_snapshot,
-        uint32_t              n_snapshot_rows,
-        const ds4_gpu_tensor *adopt,
-        ds4_gpu_tensor       *qkv,
-        const ds4_gpu_tensor *raw_alpha,
-        const ds4_gpu_tensor *raw_beta,
-        const ds4_gpu_tensor *output_gate,
-        const ds4_gpu_qwen4exp_slab *conv_weight,
-        const ds4_gpu_qwen4exp_slab *a_log,
-        const ds4_gpu_qwen4exp_slab *dt_bias,
-        const ds4_gpu_qwen4exp_slab *output_norm,
-        uint32_t              n_key_head,
-        uint32_t              n_value_head,
-        uint32_t              n_tokens,
-        uint32_t              head_layout,
-        float                 qk_norm_eps,
-        float                 norm_eps,
-        ds4_gpu_tensor       *out_q8,
-        uint64_t              q_offset,
-        uint64_t              s_offset,
-        const ds4_gpu_qwen4exp_gdn_replay *replay);
-
 /* The GDN block at a speculative width (one row of n_tokens <= the commit width,
  * decode's single token included) with lazy rollback.  `adopt` is a device
  * uint32 the kernels dereference at run time -- 0 continues from the live state,
