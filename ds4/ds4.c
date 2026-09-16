@@ -23589,6 +23589,25 @@ static bool metal_graph_ported_m5_decode_feature_enabled(
 #endif
 }
 
+/* A warm-up experiment against the decode-island captures this function
+ * performs, with its result, so that it is not run a second time.  The
+ * question was whether captures that happen during a run cost measurable time
+ * in the scored decode window.  The intervention was a boot-time warm-up
+ * covering twice as many graph identities before any client connects: the 5
+ * identities covered at boot became 10.
+ *
+ * It did what it was built to do.  The number of captures observed during the
+ * second run of a residency fell from 6 to 1.  It changed nothing that is
+ * scored: decode_seconds_per_token stayed at 0.0254, against an instrument
+ * spread of 0.64 percent over repeated measurement, so the difference was not
+ * resolvable.
+ *
+ * The reason is that the captures it removed were already outside the timed
+ * window, in the untimed correctness phase that precedes it.  Warming more
+ * identities is therefore a correct change with no payoff.  If you revisit
+ * this, first establish that a capture actually lands inside a timed phase;
+ * without that, a warm-up only moves work that was never being counted.
+ */
 static bool metal_graph_encode_decode_layer_phase(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
