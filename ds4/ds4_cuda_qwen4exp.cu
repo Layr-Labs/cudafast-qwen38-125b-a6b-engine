@@ -4997,6 +4997,108 @@ __global__ static void qwen4exp_moe_down_q_kernel(
     }
 }
 
+/* The 640-wide down projection has twenty groups. Keep its thirty-two
+ * logical partial sums, but assign logical lanes l and l+16 to one physical
+ * lane. Two adjacent rows then share a warp. In particular, do NOT add the
+ * two group contributions before the slot loop: that would change rounding.
+ * Each chain absorbs slots in the original order; combining the chains at
+ * the end is the original shuffle-by-16, followed by shuffles 8,4,2,1.
+ *
+ * The CTA still owns eight rows and the same two verbatim weight panels.
+ * Only the thread count changes, from 256 to 128. Dispatch requires at most
+ * 32 groups, aligned complete panels, and at most two tokens. All other
+ * shapes retain the original kernel. */
+template <int DownType>
+__global__ static void qwen4exp_moe_down_halfwarp_kernel(
+        float *out, const char *down, const int32_t *selected,
+        const int8_t *mq, const float *ms, const int32_t *msum,
+        uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        uint32_t groups, uint32_t out_dim, uint32_t n_tokens,
+        uint32_t n_total_expert, uint32_t n_expert_used) {
+    extern __shared__ uint4 qw_down_panel[];
+    char *const spanel = (char *)qw_down_panel;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t sublane = lane & 15u;
+    const uint32_t row0 = blockIdx.x * 8u;
+    const uint32_t row = row0 + (threadIdx.x >> 4u);
+    const uint32_t tok0 = blockIdx.y * 2u;
+    if (row >= out_dim || tok0 >= n_tokens) return;
+    const uint32_t take = n_tokens - tok0 < 2u ? n_tokens - tok0 : 2u;
+    const uint64_t panel_bytes = (uint64_t)8u * down_row_bytes;
+    int32_t route[2];
+#pragma unroll
+    for (int r = 0; r < 2; r++)
+        route[r] = (uint32_t)r < take && lane < n_expert_used
+            ? selected[(uint64_t)(tok0 + r) * n_expert_used + lane] : -1;
+    float acc[2][2] = {{0.0f, 0.0f}, {0.0f, 0.0f}};
+
+    auto fill_step = [&](uint32_t slot, uint32_t rr, char *const dst) {
+#pragma unroll
+        for (int r = 0; r < 2; r++) {
+            if ((uint32_t)r == rr) {
+                const int32_t e = __shfl_sync(0xffffffffu, route[r], slot);
+                if (e < 0 || (uint32_t)e >= n_total_expert) return;
+                const char *const gp = down +
+                    (uint64_t)(uint32_t)e * down_expert_bytes +
+                    (uint64_t)row0 * down_row_bytes;
+                for (uint64_t o = (uint64_t)threadIdx.x * 16u;
+                     o < panel_bytes; o += (uint64_t)blockDim.x * 16u)
+                    qw_cpasync16((uint32_t)__cvta_generic_to_shared(dst + o),
+                                 gp + o);
+            }
+        }
+    };
+    fill_step(0u, 0u, spanel);
+    qw_cpasync_commit();
+    for (uint32_t slot = 0; slot < n_expert_used; slot++) {
+#pragma unroll
+        for (int r = 0; r < 2; r++) {
+            if ((uint32_t)r < take) {
+                const uint32_t step = slot * take + (uint32_t)r;
+                qw_cpasync_wait0();
+                __syncthreads();
+                const uint32_t nr = (uint32_t)r + 1u < take ? r + 1u : 0u;
+                const uint32_t ns = (uint32_t)r + 1u < take ? slot : slot + 1u;
+                if (ns < n_expert_used) {
+                    fill_step(ns, nr, spanel +
+                              (uint64_t)((step + 1u) & 1u) * panel_bytes);
+                    qw_cpasync_commit();
+                }
+                const int32_t e = __shfl_sync(0xffffffffu, route[r], slot);
+                if (e < 0 || (uint32_t)e >= n_total_expert) continue;
+                const char *const drow = spanel +
+                    (uint64_t)(step & 1u) * panel_bytes +
+                    (uint64_t)(row - row0) * down_row_bytes;
+                const uint64_t mrow = (uint64_t)(tok0 + r) * n_expert_used + slot;
+#pragma unroll
+                for (int half = 0; half < 2; half++) {
+                    const uint32_t g = sublane + (uint32_t)half * 16u;
+                    if (g < groups) {
+                        int8_t wq[32];
+                        float wa[2], wb[2];
+                        int halves = 1;
+                        dev_qwen4exp_group_decode((uint32_t)DownType, drow, g,
+                                                  wq, wa, wb, &halves);
+                        const uint64_t at_g = mrow * groups + g;
+                        qwen4exp_shared_vector_accumulate(&acc[r][half],
+                            wq, wa[0], wb[0], mq + at_g * 32u,
+                            ms[at_g], msum[at_g]);
+                    }
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < 2; r++) {
+        float total = acc[r][0] + acc[r][1];
+#pragma unroll
+        for (int offset = 8; offset > 0; offset >>= 1)
+            total += __shfl_down_sync(0xffffffffu, total, offset, 16);
+        if (sublane == 0u && (uint32_t)r < take)
+            out[(uint64_t)(tok0 + r) * out_dim + row] = total;
+    }
+}
+
 /* The shared expert: no routing, so the tile is consecutive tokens and the
  * decoded group serves all of them. */
 template <int R, int GateType = -1, int UpType = -1, bool Vector = false>
@@ -7666,6 +7768,13 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             sc.mq, sc.ms, sc.msum, \
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
             mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
+#define QWEN4EXP_DOWN_HALFWARP(DT) \
+    qwen4exp_moe_down_halfwarp_kernel<DT><<< \
+            dn_grid, 128, (size_t)dn_shared, stream>>>( \
+            (float *)out->ptr, down, (const int32_t *)selected->ptr, \
+            sc.mq, sc.ms, sc.msum, \
+            down_slab->expert_bytes, down_slab->row_bytes, \
+            mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
 #define QWEN4EXP_DOWN(R) do { \
     if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q5_1) { \
         QWEN4EXP_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q5_1, false); \
@@ -7743,8 +7852,14 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             ((uintptr_t)down & 15u) == 0u &&
             dn_shared <= QW_DOWN_PANEL_MAX_BYTES &&
             getenv("DS4_QWEN4EXP_NO_DOWN_PANEL") == NULL;
+        const bool halfwarp = dn_stage && n_tokens <= 2u &&
+            mgroups > 16u && mgroups <= 32u &&
+            getenv("DS4_QWEN4EXP_NO_DOWN_ASYNC") == NULL &&
+            getenv("DS4_QWEN4EXP_NO_DOWN_SUBWARP") == NULL;
         if (down_slab->type == DS4_QWEN4EXP_TY_q8_0) {
-            if (dn_stage && getenv("DS4_QWEN4EXP_NO_DOWN_ASYNC") == NULL) {
+            if (halfwarp) {
+                QWEN4EXP_DOWN_HALFWARP(DS4_QWEN4EXP_TY_q8_0);
+            } else if (dn_stage && getenv("DS4_QWEN4EXP_NO_DOWN_ASYNC") == NULL) {
                 QWEN4EXP_DOWN_ASYNC(DS4_QWEN4EXP_TY_q8_0);
             } else if (dn_stage) {
                 QWEN4EXP_DOWN_IMPL_S(2, DS4_QWEN4EXP_TY_q8_0, true, true,
@@ -7753,7 +7868,9 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
                 QWEN4EXP_DOWN_IMPL(2, DS4_QWEN4EXP_TY_q8_0, true);
             }
         } else {
-            if (dn_stage && getenv("DS4_QWEN4EXP_NO_DOWN_ASYNC") == NULL) {
+            if (halfwarp) {
+                QWEN4EXP_DOWN_HALFWARP(DS4_QWEN4EXP_TY_q5_1);
+            } else if (dn_stage && getenv("DS4_QWEN4EXP_NO_DOWN_ASYNC") == NULL) {
                 QWEN4EXP_DOWN_ASYNC(DS4_QWEN4EXP_TY_q5_1);
             } else if (dn_stage) {
                 QWEN4EXP_DOWN_IMPL_S(2, DS4_QWEN4EXP_TY_q5_1, true, true,
@@ -7771,6 +7888,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
 #undef QWEN4EXP_DOWN_IMPL
 #undef QWEN4EXP_DOWN_IMPL_S
 #undef QWEN4EXP_DOWN_ASYNC
+#undef QWEN4EXP_DOWN_HALFWARP
     return cuda_ok(cudaGetLastError(), "qwen4exp MoE down launch");
 }
 
