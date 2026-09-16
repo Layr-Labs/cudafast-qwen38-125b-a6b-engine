@@ -19660,7 +19660,10 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
     a.od[0]=qkv_dim;a.od[1]=gate_dim;a.blocks=blocks;a.n_rows=rows;
     a.xq=(const int8_t *)((const char *)q->ptr+qoff);
     a.xscale=(const float *)((const char *)q->ptr+soff);a.x=(const float *)x->ptr;
-    if (rows<=2u && in_dim==2560u && qkv_dim>512u && gate_dim>512u &&
+    if ((rows<=2u || (rows==3u &&
+            getenv("DS4_QWEN4EXP_NO_WIDE_VERIFY")==NULL &&
+            getenv("DS4_QWEN4EXP_WIDE_VERIFY_R2")==NULL)) &&
+        in_dim==2560u && qkv_dim>512u && gate_dim>512u &&
         cuda_q8_use_dp4a() && getenv("DS4_QWEN4EXP_NO_ROW_TILE")==NULL &&
         getenv("DS4_QWEN4EXP_PAIR_LANES_R2")==NULL &&
         getenv("DS4_F32_NO_VECTOR_DECODE")==NULL &&
@@ -19676,6 +19679,8 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
          * arm a no-op.  DS4_QWEN4EXP_NO_GDN_PANEL stands it down. */
         const size_t gdn_panel=(size_t)(256u/64u)*(size_t)blocks*34u+16u;
         const int gdn_stage =
+            /* The R=3 extension must not stage beyond an exact-sized slab. */
+            (rows!=3u || ((qkv_dim|gate_dim)&3u)==0u) &&
             ((((uintptr_t)a.weights[0]|(uintptr_t)a.weights[1])&3u)==0u) &&
             gdn_panel<=49152u &&
             getenv("DS4_QWEN4EXP_NO_GDN_PANEL")==NULL;
@@ -19688,13 +19693,22 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
             else
                 QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1>),
                                     grid, 256, 0, cuda_decode_stream(), a);
-        } else {
+        } else if (rows==2u) {
             if (gdn_stage)
                 QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2,true>),
                                     grid, 256, gdn_panel, cuda_decode_stream(), a);
             else
                 QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2>),
                                     grid, 256, 0, cuda_decode_stream(), a);
+        } else {
+            /* Width three has no PDL producer. R=3 keeps the F32 arm within
+             * its exact three-row buffers; it has no partial-row guard. */
+            if (gdn_stage)
+                qwen_gdn_projection_kernel<3,true><<<grid, 256, gdn_panel,
+                        cuda_decode_stream()>>>(a);
+            else
+                qwen_gdn_projection_kernel<3><<<grid, 256, 0,
+                        cuda_decode_stream()>>>(a);
         }
         return cuda_ok(cudaGetLastError(),"GDN four projections launch");
     }
