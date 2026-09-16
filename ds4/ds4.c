@@ -23506,6 +23506,44 @@ static bool metal_graph_borrow_tensor_view(
     return true;
 }
 
+/* Stack-storage counterpart of metal_graph_attn_comp_row_view().
+ *
+ * The decode emit path builds one of these per layer per emitted compressor row
+ * and frees it on the next line; the descriptor never outlives the call, so
+ * there is no reason for it to be a heap allocation.  Two pieces of in-tree
+ * precedent say the same thing: metal_graph_borrow_tensor_view() above is the
+ * dominant idiom in this file with 119 call sites against 3 for the heap form,
+ * and the sibling *indexer* compressor row view already borrows on exactly this
+ * path -- see the `#else' branch of the __APPLE__ split further down, where the
+ * non-Apple build takes a stack view while only Apple heap-allocates.  The
+ * attention compressor row never got that treatment, so it heap-allocates on
+ * every build.  This closes the asymmetry.
+ *
+ * Field-for-field identical to the heap form: same base tensor, same offset,
+ * same byte count, same owner (0, so nothing downstream ever frees the payload)
+ * and the same inherited device_id.  calloc() in ds4_gpu_tensor_view() and the
+ * memset() in the borrow helper both zero the descriptor, so every kernel
+ * argument reaching ds4_gpu_dsv4_fp8_kv_quantize_tensor() is bit-identical and
+ * only the storage duration of a host-side struct changes. */
+static bool metal_graph_borrow_attn_comp_row_view(
+        ds4_gpu_tensor *view,
+        ds4_gpu_graph  *g,
+        uint32_t        il,
+        uint32_t        row) {
+    if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+        return metal_graph_borrow_tensor_view(
+                view,
+                metal_graph_attn_comp_stage(g),
+                0,
+                (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+    }
+    return metal_graph_borrow_tensor_view(
+            view,
+            g->layer_attn_comp_cache[il],
+            (uint64_t)row * DS4_N_HEAD_DIM * sizeof(float),
+            (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+}
+
 static bool metal_graph_cuda_tp_ep_finish_reduce(
         ds4_gpu_graph *g,
         int            home_tier,
@@ -24501,16 +24539,15 @@ static bool metal_graph_encode_decode_layer_phase(
                                                         comp_finalize_fuse) != 0;
         DS4_METAL_PROFILE_DECODE_STAGE("compressor_update");
         if (ok && emit && !comp_finalize_fuse) {
-            ds4_gpu_tensor *comp_row_view = metal_graph_attn_comp_row_view(g, il, comp_row);
-            if (!comp_row_view) {
+            ds4_gpu_tensor comp_row_view;
+            if (!metal_graph_borrow_attn_comp_row_view(&comp_row_view, g, il, comp_row)) {
                 ok = false;
             } else {
-                ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_row_view, 1, DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
+                ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(&comp_row_view, 1, DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
                 if (ok) {
-                    metal_graph_debug_dump_tensor("KVcompress", comp_row_view, DS4_N_HEAD_DIM, il, pos);
+                    metal_graph_debug_dump_tensor("KVcompress", &comp_row_view, DS4_N_HEAD_DIM, il, pos);
                 }
             }
-            ds4_gpu_tensor_free(comp_row_view);
             DS4_METAL_PROFILE_DECODE_STAGE("compressor_quantize");
             if (ok) ok = metal_graph_commit_attn_comp_stage(g, il, comp_row, 1);
             DS4_METAL_PROFILE_DECODE_STAGE("compressor_commit");
