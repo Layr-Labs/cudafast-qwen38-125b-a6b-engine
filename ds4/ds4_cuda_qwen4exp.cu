@@ -10893,6 +10893,11 @@ __global__ static void qwen4exp_qsa_indexer_select_kernel(
     const uint32_t token = blockIdx.x;
     const uint32_t tid = threadIdx.x;
     const uint32_t nth = blockDim.x;
+    /* Decode and verify widths only: the split-scores kernel that consumes
+     * selected/counts is launched with the PSS attribute, and a producer
+     * whose grid is not single-wave may never trigger (the deadlock rule,
+     * ds4_cuda_qwen4exp.cuh).  This grid is n_tokens blocks. */
+    if (n_tokens <= 8u) QWEN4EXP_PDL_TRIGGER();
     if (token >= n_tokens) return;
 
     int32_t *ids = qwen4exp_select_shared;
@@ -12212,7 +12217,22 @@ qwen4exp_qsa_split_scores_kernel(
     const uint32_t lane = tid & 31u;
     const uint32_t warp = tid >> 5u;
     const uint32_t head0 = group * GROUP;
+    /* Single-wave grids only: the split-probs consumer rides this trigger,
+     * so the grid must fit one wave at every width that can carry it (the
+     * deadlock rule, ds4_cuda_qwen4exp.cuh).  Decode launches
+     * (n_head/GROUP, max_tiles, 1); verify scales the z axis only. */
+    if (gridDim.x * gridDim.y * gridDim.z <= 256u)
+        QWEN4EXP_PDL_TRIGGER();
     if (head0 + GROUP > n_head || token >= n_tokens) return;
+
+    /* PSS consumer of the select kernel: the q row is the previous
+     * projection's output, complete before the producer launched, so it
+     * loads ahead of the fence.  Everything below the fence is producer
+     * output (counts, selected) or derived from it. */
+    const float *qsrc = q + ((uint64_t)token * n_head + head0) * head_dim;
+    for (uint32_t d = tid; d < GROUP * head_dim; d += nth)
+        qwen4exp_attn_sc_shared[d] = qsrc[d];
+    QWEN4EXP_PDL_SYNC();
 
     const uint32_t p0 = d_pos ? *d_pos : pos0;
     const uint32_t count = sparse ? (uint32_t)counts[token] : p0 + token + 1u;
@@ -12227,9 +12247,6 @@ qwen4exp_qsa_split_scores_kernel(
     float *wmax = qvec + GROUP * head_dim;           /* GROUP * nwarp    */
     float *stage = wmax + ((GROUP * nwarp + 3u) & ~3u) + /* 16-byte aligned, */
                    warp * 32u * QWEN4EXP_QSA_SPLIT_KPITCH; /* 32 rows a warp */
-
-    const float *qsrc = q + ((uint64_t)token * n_head + head0) * head_dim;
-    for (uint32_t d = tid; d < GROUP * head_dim; d += nth) qvec[d] = qsrc[d];
     __syncthreads();
 
     const int32_t key = qwen4exp_qsa_tile_key(selected, token, max_selected,
@@ -12351,12 +12368,20 @@ qwen4exp_qsa_split_probs_kernel(
         uint32_t max_tiles,
         const uint32_t *d_pos) {
     extern __shared__ __align__(16) float qwen4exp_attn_pr_shared[];
+    /* Single-wave grids only: the split-fold consumer rides this trigger
+     * (the deadlock rule, ds4_cuda_qwen4exp.cuh). */
+    if (gridDim.x * gridDim.y * gridDim.z <= 256u)
+        QWEN4EXP_PDL_TRIGGER();
     const uint32_t group = blockIdx.x;
     const uint32_t tile = blockIdx.y;
     const uint32_t token = blockIdx.z;
     const uint32_t tid = threadIdx.x;
     const uint32_t nth = blockDim.x;
     const uint32_t head0 = group * GROUP;
+    /* PSS consumer of the split-scores kernel: nothing above this fence
+     * reads producer output; counts, selected, sc and tmax all stay below
+     * it. */
+    QWEN4EXP_PDL_SYNC();
     if (head0 + GROUP > n_head || token >= n_tokens) return;
 
     const uint32_t p0 = d_pos ? *d_pos : pos0;
@@ -12488,6 +12513,9 @@ __global__ static void qwen4exp_qsa_split_fold_kernel(
     const uint32_t tid = threadIdx.x;
     if (head >= n_head || token >= n_tokens || tid >= head_dim) return;
     const uint32_t p0 = d_pos ? *d_pos : pos0;
+    /* PSS consumer of the split-probs kernel: tmax, tsum, ct and counts
+     * are all producer output and stay below the fence. */
+    QWEN4EXP_PDL_SYNC();
     const uint32_t count = sparse ? (uint32_t)counts[token] : p0 + token + 1u;
     float *dst = out + ((uint64_t)token * n_head + head) * head_dim;
     if (count == 0u) {
@@ -13318,16 +13346,18 @@ static int qwen4exp_qsa_attention_split(
         return 0;
     }
 #define QWEN4EXP_QSA_SPLIT_LAUNCH(G, V)                                          \
-    qwen4exp_qsa_split_scores_kernel<G><<<grid, nth, sc_shared,               \
-        cuda_decode_stream()>>>(                                              \
-            (const float *)q->ptr, (const float *)k_cache->ptr, sel, cnt,     \
-            sc, tmax, n_tokens, n_head, n_kv_head, head_dim, pos0, cache_cap, \
-            max_selected, sparse ? 1u : 0u, max_tiles, scale, d_pos);         \
-    qwen4exp_qsa_split_probs_kernel<G, V><<<grid, nth, pr_shared,                \
-        cuda_decode_stream()>>>(                                              \
-            (const float *)v_cache->ptr, sel, cnt, sc, tmax, ct, tsum,        \
-            n_tokens, n_head, n_kv_head, head_dim, pos0, cache_cap,           \
-            max_selected, sparse ? 1u : 0u, max_tiles, d_pos)
+    QWEN4EXP_LAUNCH_PDL(                                                        \
+        (qwen4exp_qsa_split_scores_kernel<G>), grid, nth, sc_shared,            \
+        cuda_decode_stream(),                                                 \
+        (const float *)q->ptr, (const float *)k_cache->ptr, sel, cnt,         \
+        sc, tmax, n_tokens, n_head, n_kv_head, head_dim, pos0, cache_cap,     \
+        max_selected, sparse ? 1u : 0u, max_tiles, scale, d_pos);             \
+    QWEN4EXP_LAUNCH_PDL(                                                        \
+        (qwen4exp_qsa_split_probs_kernel<G, V>), grid, nth, pr_shared,          \
+        cuda_decode_stream(),                                                 \
+        (const float *)v_cache->ptr, sel, cnt, sc, tmax, ct, tsum,            \
+        n_tokens, n_head, n_kv_head, head_dim, pos0, cache_cap,               \
+        max_selected, sparse ? 1u : 0u, max_tiles, d_pos)
     switch (g) {
         case 12u: QWEN4EXP_QSA_SPLIT_LAUNCH(12u, QWEN4EXP_QSA_SPLIT_VSTEP); break;
         case 6u:  QWEN4EXP_QSA_SPLIT_LAUNCH(6u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
@@ -13348,8 +13378,9 @@ static int qwen4exp_qsa_attention_split(
         default:  return 0;
     }
 #undef QWEN4EXP_QSA_SPLIT_LAUNCH
-    qwen4exp_qsa_split_fold_kernel<<<dim3(n_head, n_tokens), head_dim, 0,
-        cuda_decode_stream()>>>(
+    QWEN4EXP_LAUNCH_PDL(
+        qwen4exp_qsa_split_fold_kernel, dim3(n_head, n_tokens), head_dim, 0,
+        cuda_decode_stream(),
             tmax, tsum, ct, cnt, (float *)out->ptr, n_tokens, n_head,
             head_dim, pos0, sparse ? 1u : 0u, max_tiles, nth, d_pos);
     return cuda_ok(cudaGetLastError(), "Qwen4-Exp QSA split attention launch")
