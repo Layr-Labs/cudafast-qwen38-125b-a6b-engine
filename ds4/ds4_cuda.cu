@@ -17408,7 +17408,7 @@ extern "C" const char *ds4_gpu_hw_limits(void) {
      * ds4_resident drops the WHOLE limits string rather than truncating it if it
      * does not fit its own ident buffer, so a tight fit here loses the
      * measurement silently. */
-    static char buf[448];
+    static char buf[512];
     static int built = 0;
     if (built) return buf;
     built = 1;
@@ -17441,6 +17441,21 @@ extern "C" const char *ds4_gpu_hw_limits(void) {
     /* The register/shared footprint of the two routed-MoE decode kernels, from
      * the translation unit that owns them.  Truncation is harmless: the string
      * is diagnostic only and snprintf keeps it terminated. */
+    unsigned pg_ready = 0, pg_dead = 0;
+    unsigned long long pg_replays = 0;
+    for (uint32_t il = 56u; il < CUDA_DECODE_GRAPH_LAYERS; il++) {
+        for (uint32_t v = 0; v < CUDA_DECODE_GRAPH_VARIANTS; v++) {
+            const cuda_decode_graph_entry *e = &g_decode_graphs[il][3u][v];
+            if (e->key._pad != 0x51575043u) continue;
+            pg_ready += e->state == 2;
+            pg_dead += e->state == 3;
+            pg_replays += (unsigned long long)e->hits;
+        }
+    }
+    const int pg_n = snprintf(buf + n, sizeof(buf) - (size_t)n,
+        " pfGraph[c=%u r=%llu d=%u]", pg_ready, pg_replays, pg_dead);
+    if (pg_n < 0 || (size_t)pg_n >= sizeof(buf) - (size_t)n) return buf;
+    n += pg_n;
     const char *kl = ds4_gpu_qwen4exp_kernel_limits();
     if (kl && kl[0] && (size_t)n + 2u < sizeof(buf)) {
         snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", kl);

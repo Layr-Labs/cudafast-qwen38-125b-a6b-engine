@@ -164,6 +164,28 @@ ds4s_handle *ds4s_open(const char *model_path, const char *mtp_head_path,
                             t = out[n - 1];
                         }
                     }
+                    /* Warm/record prefill only after decode/head scratch is
+                     * stable. A first speculative verify after reset changes
+                     * physical GDN-buffer parity, so cover both parities when
+                     * a head is enabled. Every pass starts from a full reset. */
+                    if (getenv("DS4_QWEN4EXP_NO_PREFILL_GRAPHS") == NULL) {
+                        const int phases = mtp_draft_tokens >= 1 ? 2 : 1;
+                        for (int phase = 0; phase < phases; phase++) {
+                            int prefill_ok = 1;
+                            for (int pass = 0; pass < 2; pass++) {
+                                ds4s_invalidate(h);
+                                if (ds4s_sync(h, ids, (size_t)WARM_PROMPT) != 0) {
+                                    prefill_ok = 0; break;
+                                }
+                            }
+                            if (!prefill_ok) break;
+                            if (phase + 1 < phases) {
+                                int32_t out[WARM_CAP];
+                                if (ds4s_eval_speculative(h, ds4s_argmax(h), 2,
+                                                         out, WARM_CAP) <= 0) break;
+                            }
+                        }
+                    }
                 }
                 free(ids);
             }

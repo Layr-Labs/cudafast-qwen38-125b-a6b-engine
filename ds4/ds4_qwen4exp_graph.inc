@@ -2681,6 +2681,97 @@ static bool qw_decode_graph_chunk(ds4_qwen4exp_session *s,
                                               il_first, il_last);
 }
 
+/* Prefill uses its own cache rows, leaving every decode/head entry available.
+ * The target and its head must fit below row 56; CUDA has 64 graph rows and
+ * this controller uses at most eight chunks. Width and physical state parity
+ * are data-independent identities; pending records the host-side inject owed
+ * on entry. No input token, prompt, position or output is cached here. */
+#define QW_PREFILL_GRAPH_FIRST_SLOT 56u
+#define QW_PREFILL_GRAPH_TAG 0x51575043u /* QWPC */
+
+static bool qw_prefill_graph_ok(const ds4_qwen4exp_session *s, uint32_t width) {
+    return width > (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT && width <= 65535u &&
+        g_ds4_qwen4exp.n_layer > 0u &&
+        g_ds4_qwen4exp.n_layer < QW_PREFILL_GRAPH_FIRST_SLOT &&
+        s->d_pos != NULL && s->spec_snapshot_rows == 0u && !s->gdn_replay_active &&
+        (uint64_t)s->pos + width <= DS4_N_INDEXER_TOP_K &&
+        getenv("DS4_QWEN4EXP_NO_PREFILL_GRAPHS") == NULL &&
+        !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
+        ds4_gpu_decode_graphs_supported();
+}
+
+static bool qw_prefill_graph_chunk(ds4_qwen4exp_session *s,
+                                    const ds4_qwen4exp_weights *w,
+                                    const ds4_model *m, uint32_t n_tokens,
+                                    uint32_t chunk, uint32_t first, uint32_t last) {
+    const bool entry_pending = s->hc_pending;
+    ds4_decode_graph_key key;
+    memset(&key, 0, sizeof(key));
+    key.il = QW_PREFILL_GRAPH_FIRST_SLOT + chunk;
+    key.island = 3u;
+    key.variant = n_tokens | (s->gdn_replay_phase << 16u) |
+                  ((uint32_t)entry_pending << 31u);
+    key._pad = QW_PREFILL_GRAPH_TAG;
+    key.cur_hc = s->hyper;
+    key.after_attn_hc = s;
+    key.after_ffn_hc = (void *)w;
+    key.attn_norm = (void *)m;
+    const int state = ds4_gpu_decode_graph_begin(&key);
+    if (state == 1) {
+        /* Every nonempty chunk ends in an FFN inject: at a deferred width it
+         * leaves that inject owed to the next mixer. Replaying device work
+         * must reproduce this host transition too. */
+        s->hc_pending = qwen4exp_hc_defer_ok(n_tokens);
+#ifdef DS4_TEST_HOOKS
+        qw_decode_graph_trace_range(w, first, last);
+#endif
+        if (last < g_ds4_qwen4exp.n_layer) {
+            ds4_decode_graph_key next = key;
+            next.il++;
+            next.variant = n_tokens | (s->gdn_replay_phase << 16u) |
+                           ((uint32_t)s->hc_pending << 31u);
+            (void)ds4_gpu_decode_graph_prefetch(&next);
+        }
+        return true;
+    }
+    if (state == 0) {
+#ifdef DS4_TEST_HOOKS
+        const uint32_t trace_len = g_qwen4exp_trace_len;
+        const bool trace_overflow = g_qwen4exp_trace_overflow;
+#endif
+        if (!qwen4exp_graph_layers_encode_range(s, w, m, n_tokens, false, first, last)) {
+            ds4_gpu_decode_graph_abort(&key);
+            s->hc_pending = entry_pending;
+            return false;
+        }
+        if (ds4_gpu_decode_graph_end(&key) == 0) return true;
+        /* A failed capture/instantiate/first launch executed no device work.
+         * Encoding did mutate the host flag, so restore it before fallback. */
+        s->hc_pending = entry_pending;
+#ifdef DS4_TEST_HOOKS
+        g_qwen4exp_trace_len = trace_len;
+        g_qwen4exp_trace_overflow = trace_overflow;
+#endif
+    }
+    return qwen4exp_graph_layers_encode_range(s, w, m, n_tokens, false, first, last);
+}
+
+static bool qw_prefill_graph_layers(ds4_qwen4exp_session *s,
+                                     const ds4_qwen4exp_weights *w,
+                                     const ds4_model *m, uint32_t n_tokens) {
+    uint32_t chunks = qw_decode_graph_chunks();
+    if (chunks > g_ds4_qwen4exp.n_layer) chunks = g_ds4_qwen4exp.n_layer;
+    const uint32_t per = (g_ds4_qwen4exp.n_layer + chunks - 1u) / chunks;
+    for (uint32_t c = 0; c < chunks; c++) {
+        const uint32_t first = c * per;
+        if (first >= g_ds4_qwen4exp.n_layer) break;
+        uint32_t last = first + per;
+        if (last > g_ds4_qwen4exp.n_layer) last = g_ds4_qwen4exp.n_layer;
+        if (!qw_prefill_graph_chunk(s, w, m, n_tokens, c, first, last)) return false;
+    }
+    return true;
+}
+
 static bool qwen4exp_graph_layers(
         ds4_qwen4exp_session *s, const ds4_qwen4exp_weights *w,
         const ds4_model *m, uint32_t n_tokens) {
@@ -2693,6 +2784,11 @@ static bool qwen4exp_graph_layers(
     /* Layer dumps synchronize and must execute every host call site. */
     capture_ok = capture_ok && !qwen4exp_layer_dump_on();
 #endif
+    bool prefill_ok = qw_prefill_graph_ok(s, n_tokens);
+#ifdef DS4_TEST_HOOKS
+    prefill_ok = prefill_ok && !qwen4exp_layer_dump_on();
+#endif
+    if (prefill_ok) return qw_prefill_graph_layers(s, w, m, n_tokens);
     /* WHY A CHUNK BOUNDARY CARRIES NO STATE.  The only host state that flows
      * between layers of this stack is the deferred residual inject
      * (s->hc_pending), and the deferral is prefill-only: qwen4exp_hc_defer_ok

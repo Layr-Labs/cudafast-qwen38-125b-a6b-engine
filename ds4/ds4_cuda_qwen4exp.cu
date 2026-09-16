@@ -1644,6 +1644,8 @@ static float *qwen4exp_conv_scratch(int tier, uint64_t elements) {
         return NULL;
     }
     if (g_qwen4exp_conv_scratch[tier]) {
+        /* Prefill graphs may retain this widest-seen convolution workspace. */
+        ds4_gpu_decode_graphs_invalidate();
         cudaFree(g_qwen4exp_conv_scratch[tier]);
     }
     g_qwen4exp_conv_scratch[tier] = next;
