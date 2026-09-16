@@ -126,6 +126,23 @@ static mtp_native_layout mtp_native_offsets(uint32_t width) {
     l.temporary = mtp_native_align(l.flag + 4u);
     return l;
 }
+/* The local draft-depth win did not transfer to the ranked path, and the size
+ * of the gap is worth writing down.  A free-run sweep on a development box put
+ * depth 3 well ahead of depth 1.  Declaring depth 3 and submitting it scored
+ * 2.46792 on the ranked path, which is 7.15 percent worse than the declared
+ * depth it replaced.  Nothing in the engine differed between the two
+ * measurements; the drafting path, this screen included, ran the same code.
+ *
+ * The difference is the prompt, not the kernel.  Deeper drafting pays in
+ * proportion to how often drafted tokens are accepted, so the depth that wins
+ * on a highly predictable continuation loses on natural text, where a rejected
+ * draft costs a wasted verify round.  Anything sized in this file that only
+ * changes the cost of one draft round, such as the group count, the key layout
+ * or the sort, can be judged from a local measurement.  Anything that changes
+ * HOW MANY tokens are drafted per round cannot, because the acceptance rate
+ * that decides its payoff is a property of the scored prompt, and the scored
+ * prompt is not on this box.
+ */
 extern "C" int ds4_gpu_mtp_native_screen_init(uint32_t width,
         uint64_t *bytes, uint32_t *capacity) {
     if (!bytes || !capacity) return -1;
