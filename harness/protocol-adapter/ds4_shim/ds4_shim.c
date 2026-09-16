@@ -142,32 +142,77 @@ ds4s_handle *ds4s_open(const char *model_path, const char *mtp_head_path,
      */
     if (getenv("DS4_SHIM_NO_WARMUP") == NULL) {
         const int vocab = ds4s_vocab_size(h);
-        enum { WARM_PROMPT = 1024, WARM_ROUNDS = 4, WARM_CAP = 8 };
+        enum { WARM_PROMPT = 1024, WARM_CAP = 8, WARM_STYLES = 4,
+               WARM_SWEEPS = 2, WARM_MAX_ROUNDS = 24, WARM_QUIET = 4,
+               WARM_TEACHER = 4, WARM_ROUND_BUDGET = 140 };
+        uint64_t captured = ds4_decode_graph_captures();
+        int total_rounds = 0;
         if (vocab > 16) {
             int32_t *ids = (int32_t *)malloc((size_t)WARM_PROMPT * sizeof(*ids));
             if (ids) {
                 const int32_t span = (int32_t)(vocab - 8);
-                for (int i = 0; i < WARM_PROMPT; i++)
-                    ids[i] = (int32_t)(1 + (i % span));
-                if (ds4s_sync(h, ids, (size_t)WARM_PROMPT) == 0) {
-                    /* the 1-row teacher-forced shape */
-                    (void)ds4s_eval(h, ids[WARM_PROMPT - 1]);
-                    /* the speculative shapes: the 2-row verify and the head's
-                     * own island, which only a speculative cycle reaches */
-                    if (mtp_draft_tokens >= 1) {
+                for (int sweep = 0; sweep < WARM_SWEEPS; sweep++) {
+                    const uint64_t sweep_start = ds4_decode_graph_captures();
+                    for (int style = 0; style < WARM_STYLES; style++) {
+                        /* The graph key carries the GDN replay phase and
+                         * whether a snapshot is live, and those follow the
+                         * accept/reject pattern of the cycle.  A prefix the
+                         * head predicts well reaches one pattern; one it
+                         * predicts badly reaches the others.  These four run
+                         * from a tight repeat to a scrambled walk so both
+                         * ends are covered, and none of them is any prompt
+                         * this engine will ever be asked for. */
+                        uint64_t lcg = 0x9E3779B97F4A7C15ull ^ (uint64_t)(sweep * 31 + style);
+                        for (int i = 0; i < WARM_PROMPT; i++) {
+                            int64_t v;
+                            switch (style) {
+                            case 0:  v = 1 + (i % 7); break;
+                            case 1:  v = 1 + ((int64_t)i * 3 + 11) % span; break;
+                            case 2:  v = 1 + ((int64_t)(i / 8) * 101) % span; break;
+                            default:
+                                lcg = lcg * 6364136223846793005ull + 1442695040888963407ull;
+                                v = 1 + (int64_t)((lcg >> 33) % (uint64_t)span);
+                                break;
+                            }
+                            ids[i] = (int32_t)(v % span ? v % span : 1);
+                        }
+                        ds4s_invalidate(h);
+                        if (ds4s_sync(h, ids, (size_t)WARM_PROMPT) != 0) break;
+                        /* the 1-row teacher-forced shape, the one a
+                         * correctness pass walks step after step */
+                        for (int e = 0; e < WARM_TEACHER; e++)
+                            (void)ds4s_eval(h, ids[WARM_PROMPT - 1 - e]);
+                        /* the speculative shapes: the two-row verify and the
+                         * head's own island, which only a cycle reaches */
+                        if (mtp_draft_tokens < 1) break;
                         int32_t out[WARM_CAP];
                         int32_t t = ds4s_argmax(h);
-                        for (int r = 0; r < WARM_ROUNDS; r++) {
+                        int quiet = 0;
+                        for (int r = 0; r < WARM_MAX_ROUNDS && quiet < WARM_QUIET
+                                        && total_rounds < WARM_ROUND_BUDGET; r++) {
                             const int n = ds4s_eval_speculative(h, t, 2, out,
                                                                 WARM_CAP);
+                            total_rounds++;
                             if (n <= 0) break;
                             t = out[n - 1];
+                            const uint64_t now = ds4_decode_graph_captures();
+                            quiet = (now == captured) ? quiet + 1 : 0;
+                            captured = now;
                         }
                     }
+                    /* A whole sweep that discovered no new shape means the
+                     * earlier one already covered every shape these prefixes
+                     * can reach; stop paying for more. */
+                    if (ds4_decode_graph_captures() == sweep_start) break;
+                    if (total_rounds >= WARM_ROUND_BUDGET) break;
                 }
                 free(ids);
             }
         }
+        fprintf(stderr,
+                "ds4_shim: warm-up settled after %d speculative round(s); "
+                "%llu decode graph(s) captured before the socket binds\n",
+                total_rounds, (unsigned long long)captured);
         ds4s_invalidate(h);
     }
     return h;
@@ -280,6 +325,10 @@ int ds4s_eval_speculative(ds4s_handle *h, int32_t first_token, int budget, int32
     const int written = n < cap ? n : cap;
     for (int i = 0; i < written; i++) out[i] = (int32_t)accepted[i];
     return written;
+}
+
+uint64_t ds4s_decode_graph_captures(void) {
+    return ds4_decode_graph_captures();
 }
 
 void ds4s_spec_counters(const ds4s_handle *h, uint64_t *drafts, uint64_t *hits,
