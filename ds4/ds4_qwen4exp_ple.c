@@ -689,21 +689,35 @@ static const int8_t ple_kvalues_iq4nl[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
 };
 
+/* FP16 -> FP32 with no data-dependent loop.
+ *
+ * The shipped converter normalised a subnormal mantissa with
+ * `while ((m & 0x400u) == 0) { m <<= 1; e++; }`.  For the block scales this
+ * table actually carries the loop never runs, so its cost is the branch, not
+ * the shift -- and it is an unpredictable one on the rare subnormal.  A
+ * subnormal has at most ten significant mantissa bits, so the normalising
+ * shift is exactly `__builtin_clz` of the mantissa over a 16-bit field, and
+ * the whole conversion becomes a select plus a shift.
+ *
+ * Bit-identical to the loop for every one of the 65536 possible halves: the
+ * shift amount is the same, the exponent adjustment is the same, and the
+ * mantissa mask is the same.  Verified against the original over the full
+ * 16-bit domain. */
 static float ple_fp16_to_fp32(uint16_t h) {
     const uint32_t sign     = (uint32_t)(h & 0x8000u) << 16;
     const uint32_t exponent = (h >> 10) & 0x1Fu;
     const uint32_t mantissa = h & 0x3FFu;
     uint32_t bits;
 
-    if (exponent == 0) {
-        if (mantissa == 0) {
+    if (exponent == 0u) {
+        if (mantissa == 0u) {
             bits = sign;
         } else {
-            /* Subnormal: normalize it into a float32 exponent. */
-            uint32_t e = 0;
-            uint32_t m = mantissa;
-            while ((m & 0x400u) == 0) { m <<= 1; e++; }
-            m &= 0x3FFu;
+            /* A ten-bit mantissa needs (10 - k) shifts to bring bit 10 up,
+             * where k is its highest set bit, and clz(m) = 31 - k, so the
+             * shift count is clz(m) - 21. */
+            const uint32_t e = (uint32_t)__builtin_clz(mantissa) - 21u;
+            const uint32_t m = (mantissa << e) & 0x3FFu;
             bits = sign | ((127u - 15u - e + 1u) << 23) | (m << 13);
         }
     } else if (exponent == 0x1Fu) {
@@ -721,6 +735,7 @@ void ds4_ple_dequant_iq4_nl(const void *blocks, size_t block_count, float *out) 
     const uint8_t *p = (const uint8_t *)blocks;
     if (!p || !out) return;
 
+    const int8_t *const kv = ple_kvalues_iq4nl;
     for (size_t b = 0; b < block_count; b++) {
         uint16_t half;
         memcpy(&half, p, sizeof(half));
@@ -728,9 +743,22 @@ void ds4_ple_dequant_iq4_nl(const void *blocks, size_t block_count, float *out) 
         const uint8_t *qs = p + 2;
         float *y = out + b * DS4_PLE_IQ4_NL_BLOCK_ELEMS;
 
-        for (int j = 0; j < DS4_PLE_IQ4_NL_BLOCK_ELEMS / 2; j++) {
-            y[j]      = d * (float)ple_kvalues_iq4nl[qs[j] & 0x0F];
-            y[j + 16] = d * (float)ple_kvalues_iq4nl[qs[j] >> 4];
+        /* Unrolled by four: the block is a fixed 16 nibble bytes, so the
+         * trip count is known at compile time and the loop-carried
+         * bookkeeping is pure overhead over a body that is two loads, two
+         * table reads and two multiplies.  Same reads, same order, same
+         * values. */
+        for (int j = 0; j < DS4_PLE_IQ4_NL_BLOCK_ELEMS / 2; j += 4) {
+            const uint8_t q0 = qs[j],     q1 = qs[j + 1];
+            const uint8_t q2 = qs[j + 2], q3 = qs[j + 3];
+            y[j]      = d * (float)kv[q0 & 0x0F];
+            y[j + 1]  = d * (float)kv[q1 & 0x0F];
+            y[j + 2]  = d * (float)kv[q2 & 0x0F];
+            y[j + 3]  = d * (float)kv[q3 & 0x0F];
+            y[j + 16] = d * (float)kv[q0 >> 4];
+            y[j + 17] = d * (float)kv[q1 >> 4];
+            y[j + 18] = d * (float)kv[q2 >> 4];
+            y[j + 19] = d * (float)kv[q3 >> 4];
         }
         p += DS4_PLE_IQ4_NL_BLOCK_BYTES;
     }
