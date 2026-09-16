@@ -9021,6 +9021,91 @@ __global__ static void qwen4exp_hc_norm_quant_kernel(
     }
 }
 
+/* Exact short pending apply followed by the original staged norm/quant walk. */
+__global__ static void qwen4exp_hc_norm_quant_pending_short_kernel(
+        int8_t *xq, float *xscale, float *nscale,
+        float *x, const float *w,
+        const float *pending_block, const float *pending_inject,
+        uint32_t n, uint32_t group, uint32_t rows,
+        float eps, float weight_bias, int round_bf16) {
+    /* Producer for the existing down-projection consumer. Both one-row
+     * decode and two-row verification trigger; their four/eight-CTA grids
+     * remain single-wave. This private kernel is never launched wider. */
+    if (rows <= 2u) QWEN4EXP_PDL_TRIGGER();
+    const uint32_t g = blockIdx.x;
+    const uint32_t row = blockIdx.y;
+    if (row >= rows) return;
+
+    const uint64_t base = (uint64_t)row * n + (uint64_t)g * group;
+    const float *xg = x + base;
+    const float *wg = w + (uint64_t)g * group;
+
+    /* Plain launch: the former inject producer is folded into this kernel.
+     * Its ordinary stream dependency orders all pending inputs. The trigger
+     * above still opens the existing down-projection consumer window. */
+    float wv[QWEN4EXP_HC_STAGED_STEPS];
+#pragma unroll
+    for (uint32_t s = 0; s < QWEN4EXP_HC_STAGED_STEPS; s++) {
+        wv[s] = wg[s * QWEN4EXP_HC_THREADS + threadIdx.x];
+    }
+
+    __shared__ float partial[QWEN4EXP_HC_THREADS];
+    float xv[QWEN4EXP_HC_STAGED_STEPS];
+    const float inject = pending_inject[(uint64_t)row * (n / group) + g];
+#pragma unroll
+    for (uint32_t c = 0; c < QWEN4EXP_HC_STAGED_STEPS; ++c) {
+        const uint32_t i = c * QWEN4EXP_HC_THREADS + threadIdx.x;
+        const float v = xg[i] + pending_block[(uint64_t)row * group + i] * inject;
+        x[base + i] = v;
+        xv[c] = v;
+    }
+    float sum = 0.0f;
+#pragma unroll
+    for (uint32_t c = 0; c < QWEN4EXP_HC_STAGED_STEPS; ++c) {
+        const float v = xv[c];
+        sum += v * v;
+    }
+    const float total = qwen4exp_block_sum_f32(sum, partial);
+    const float scale = 1.0f / sqrtf(total / (float)group + eps);
+    if (threadIdx.x == 0u) nscale[(uint64_t)row * (n / group) + g] = scale;
+
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t warps = blockDim.x >> 5u;
+    const uint64_t row_blocks = n / 32u;
+    const uint64_t blk0 = (uint64_t)row * row_blocks + (uint64_t)g * (group / 32u);
+
+    /* The quantize walk's ten values staged in registers, then the seam
+     * below on them: lane k of step s owns flat index
+     * s*blockDim.x + warp*32 + lane, exactly the rolled walk's step s,
+     * so the butterfly's lanes and the store's pairs are unchanged. */
+#pragma unroll
+    for (uint32_t k = 0; k < QWEN4EXP_HC_STAGED_STEPS; k++) {
+        const float v = qwen4exp_hc_normed_value(xv[k], scale, wv[k],
+                                                 weight_bias, round_bf16);
+        /* quantize_q8_0_f32_rows_warp_kernel, on the value in hand: the
+         * same butterfly over the same 32 values in the same lanes, and
+         * the same five arithmetic steps in the form --use_fast_math gave
+         * them.  The block is full by construction, so the `bn` guard the
+         * standalone kernel carries for a ragged tail cannot fire. */
+        const float vz = qwen4exp_q8_ftz(v);
+        float a = qwen4exp_q8_ftz(fabsf(v));
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            /* fmaxf, not the .FTZ one: both operands are already flushed
+             * and non-negative, so the two instructions cannot disagree. */
+            a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+        }
+        const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
+        const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
+        const uint64_t pair = blk0 + (uint64_t)(k * warps + warp);
+        if (lane == 0u) xscale[pair] = d;
+        int q = (int)lrintf(qwen4exp_q8_ftz(vz * id));
+        q = q > 127 ? 127 : (q < -128 ? -128 : q);
+        xq[pair * 32u + lane] = (int8_t)q;
+    }
+}
+
 /* qwen4exp_hc_mix_kernel with `normed` rebuilt from the residual.  Same grid,
  * same per-channel accumulation over the streams low to high. */
 __global__ static void qwen4exp_hc_mix_renorm_kernel(
@@ -10467,7 +10552,38 @@ static int qwen4exp_hc_mixer_fused_cuda(
     const int inject_in_norm =
         upw && inject && rows >= QWEN4EXP_HC_FUSE_MIX_MIN_ROWS;
 
-    if (pending_block && !inject_in_norm) {
+    static int short_pending_off = -1;
+    if (short_pending_off < 0)
+        short_pending_off = getenv("DS4_QWEN4EXP_NO_HC_SHORT_PENDING") != NULL;
+    bool short_pending = pending_block && staged && n_embd == 2560u &&
+        n_hc == 4u && rows >= 1u && rows <= 2u && !short_pending_off;
+    if (short_pending) {
+        /* New hyper writes must not alter any early source or quant output.
+         * The old pending head may equal the FUTURE inject output: its next
+         * writer is a later kernel, after every pending read has completed. */
+        const ds4_gpu_tensor *reads[] = {pending_block, pending_inject};
+        const auto valid_range = [](const void *p, uint64_t bytes) {
+            return p && bytes <= UINTPTR_MAX - (uintptr_t)p;
+        };
+        short_pending = valid_range(hyper->ptr, hyper->bytes) &&
+            valid_range(normed_scratch->ptr, normed_scratch->bytes) &&
+            valid_range(pending_block->ptr, pending_block->bytes) &&
+            valid_range(pending_inject->ptr, pending_inject->bytes) &&
+            valid_range(normw, wide * sizeof(float)) &&
+            qwen4exp_hc_ranges_disjoint(hyper->ptr, hyper->bytes,
+                                        normw, wide * sizeof(float)) &&
+            qwen4exp_hc_ranges_disjoint(hyper->ptr, hyper->bytes,
+                                        normed_scratch->ptr, normed_scratch->bytes) &&
+            qwen4exp_hc_ranges_disjoint(normed_scratch->ptr, normed_scratch->bytes,
+                                        normw, wide * sizeof(float));
+        for (const ds4_gpu_tensor *t : reads)
+            short_pending = short_pending &&
+                qwen4exp_hc_ranges_disjoint(hyper->ptr, hyper->bytes, t->ptr, t->bytes) &&
+                qwen4exp_hc_ranges_disjoint(normed_scratch->ptr, normed_scratch->bytes,
+                                            t->ptr, t->bytes);
+    }
+
+    if (pending_block && !inject_in_norm && !short_pending) {
         /* No pass here folds the apply in: run the standalone kernel, so the
          * residual every leg below reads is the updated one. */
         qwen4exp_hc_inject_kernel<<<dim3((n_embd + 255u) / 256u, n_hc, rows),
@@ -10478,7 +10594,13 @@ static int qwen4exp_hc_mixer_fused_cuda(
         if (!cuda_ok(cudaGetLastError(), "qwen4exp_hc_inject launch")) return 0;
     }
 
-    if (inject_in_norm) {
+    if (short_pending) {
+        qwen4exp_hc_norm_quant_pending_short_kernel<<<dim3(n_hc, rows, 1u),
+                threads, 0, cuda_decode_stream()>>>(
+                xq, xscale, nscale, (float *)hyper->ptr, normw,
+                (const float *)pending_block->ptr, (const float *)pending_inject->ptr,
+                (uint32_t)wide, n_embd, rows, eps, weight_bias, round_bf16);
+    } else if (inject_in_norm) {
         qwen4exp_hc_norm_quant_inject_launch(
                 xq, xscale, nscale, (float *)inject->ptr,
                 (const float *)hyper->ptr, normw, iw, n_embd, n_hc, rows,
