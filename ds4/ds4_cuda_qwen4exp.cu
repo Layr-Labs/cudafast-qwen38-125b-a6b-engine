@@ -10847,7 +10847,8 @@ __global__ static void qwen4exp_qsa_indexer_scores_kernel(
         uint32_t head_dim,
         uint32_t pos0,
         uint32_t pool_size,
-        float norm_divisor) {
+        float norm_divisor,
+        const uint32_t *d_pos) {
     extern __shared__ float qwen4exp_score_shared[];
     const uint32_t block = blockIdx.x;
     const uint32_t token = blockIdx.y;
@@ -10856,7 +10857,8 @@ __global__ static void qwen4exp_qsa_indexer_scores_kernel(
     if (block >= n_blocks || token >= n_tokens) return;
 
     float *dst = scores + (uint64_t)token * n_blocks + block;
-    uint32_t visible = (pos0 + token + 1u) / pool_size;
+    const uint32_t p0 = d_pos ? *d_pos : pos0;
+    uint32_t visible = (p0 + token + 1u) / pool_size;
     if (visible > n_blocks) visible = n_blocks;
     if (block >= visible) {
         if (tid == 0u) *dst = QWEN4EXP_QSA_MASKED_SCORE;
@@ -10887,7 +10889,8 @@ __global__ static void qwen4exp_qsa_indexer_select_kernel(
         uint32_t sort_width,
         uint32_t pos0,
         uint32_t pool_size,
-        uint32_t max_selected) {
+        uint32_t max_selected,
+        const uint32_t *d_pos) {
     extern __shared__ int32_t qwen4exp_select_shared[];
     __shared__ uint32_t n_valid;
     const uint32_t token = blockIdx.x;
@@ -10938,7 +10941,7 @@ __global__ static void qwen4exp_qsa_indexer_select_kernel(
 
     const uint32_t m = n_valid;
     const uint32_t block_tokens = m * pool_size;
-    const uint32_t pos = pos0 + token;
+    const uint32_t pos = (d_pos ? *d_pos : pos0) + token;
     const uint32_t complete = (pos + 1u) / pool_size;
     const uint32_t own_start = complete * pool_size;
     const uint32_t own_count = pos + 1u - own_start;
@@ -13174,7 +13177,7 @@ qwen4exp_qsa_indexer_scores_tiled_kernel(
     }
 }
 
-extern "C" int ds4_gpu_qwen4exp_qsa_indexer_scores_tensor(
+extern "C" int ds4_gpu_qwen4exp_qsa_indexer_scores_dpos_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *pool,
@@ -13183,7 +13186,8 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_scores_tensor(
         uint32_t              n_head,
         uint32_t              head_dim,
         uint32_t              pos0,
-        uint32_t              pool_size) {
+        uint32_t              pool_size,
+        const ds4_gpu_tensor *d_pos) {
     if (n_tokens == 0u || n_blocks == 0u || n_head == 0u || head_dim == 0u ||
         pool_size == 0u ||
         !glm53_cuda_tensor_has(scores, (uint64_t)n_tokens * n_blocks, sizeof(float)) ||
@@ -13191,7 +13195,9 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_scores_tensor(
         !glm53_cuda_tensor_has(pool, (uint64_t)n_blocks * head_dim, sizeof(float))) {
         return 0;
     }
-    if (n_tokens >= 8u && head_dim == 128u && n_head == 4u &&
+    /* The tiled kernel bakes pos0; a caller that publishes the position on
+     * device (graph capture) keeps the per-pair kernel, which reads it. */
+    if (!d_pos && n_tokens >= 8u && head_dim == 128u && n_head == 4u &&
         getenv("DS4_QWEN4EXP_NO_IDX_TILE") == NULL) {
         const dim3 grid((n_blocks + QWEN4EXP_IDX_TILE_B - 1u) / QWEN4EXP_IDX_TILE_B,
                         (n_tokens + QWEN4EXP_IDX_TILE_T - 1u) / QWEN4EXP_IDX_TILE_T);
@@ -13207,11 +13213,27 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_scores_tensor(
         nth * sizeof(float), cuda_decode_stream()>>>(
             (const float *)q->ptr, (const float *)pool->ptr,
             (float *)scores->ptr, n_tokens, n_blocks, n_head, head_dim, pos0,
-            pool_size, sqrtf((float)head_dim));
+            pool_size, sqrtf((float)head_dim),
+            d_pos ? (const uint32_t *)d_pos->ptr : NULL);
     return cuda_ok(cudaGetLastError(), "Qwen4-Exp indexer scores launch");
 }
 
-extern "C" int ds4_gpu_qwen4exp_qsa_indexer_select_tensor(
+extern "C" int ds4_gpu_qwen4exp_qsa_indexer_scores_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *pool,
+        uint32_t              n_tokens,
+        uint32_t              n_blocks,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        uint32_t              pos0,
+        uint32_t              pool_size) {
+    return ds4_gpu_qwen4exp_qsa_indexer_scores_dpos_tensor(
+            scores, q, pool, n_tokens, n_blocks, n_head, head_dim, pos0,
+            pool_size, NULL);
+}
+
+extern "C" int ds4_gpu_qwen4exp_qsa_indexer_select_dpos_tensor(
         ds4_gpu_tensor       *selected,
         ds4_gpu_tensor       *counts,
         const ds4_gpu_tensor *scores,
@@ -13221,7 +13243,8 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_select_tensor(
         uint32_t              top_k,
         uint32_t              pos0,
         uint32_t              pool_size,
-        uint32_t              max_selected) {
+        uint32_t              max_selected,
+        const ds4_gpu_tensor *d_pos) {
     if (n_tokens == 0u || n_blocks == 0u || top_k == 0u || top_k > n_blocks ||
         pool_size == 0u ||
         max_selected < (uint64_t)top_k * pool_size + pool_size - 1u ||
@@ -13239,8 +13262,25 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_select_tensor(
         (size_t)sort_width * sizeof(int32_t), cuda_decode_stream()>>>(
             (const float *)scores->ptr, (const int32_t *)topk->ptr,
             (int32_t *)selected->ptr, (int32_t *)counts->ptr, n_tokens,
-            n_blocks, top_k, sort_width, pos0, pool_size, max_selected);
+            n_blocks, top_k, sort_width, pos0, pool_size, max_selected,
+            d_pos ? (const uint32_t *)d_pos->ptr : NULL);
     return cuda_ok(cudaGetLastError(), "Qwen4-Exp indexer selection launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_qsa_indexer_select_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *counts,
+        const ds4_gpu_tensor *scores,
+        const ds4_gpu_tensor *topk,
+        uint32_t              n_tokens,
+        uint32_t              n_blocks,
+        uint32_t              top_k,
+        uint32_t              pos0,
+        uint32_t              pool_size,
+        uint32_t              max_selected) {
+    return ds4_gpu_qwen4exp_qsa_indexer_select_dpos_tensor(
+            selected, counts, scores, topk, n_tokens, n_blocks, top_k, pos0,
+            pool_size, max_selected, NULL);
 }
 
 /* Scratch the split path needs for `n_tokens` rows whose key count is bounded
