@@ -21473,8 +21473,21 @@ static uint32_t metal_graph_decode_indexer_sparse_threshold(const ds4_gpu_graph 
      * the smaller attention scan, while larger contexts benefit from sparse
      * indexed attention.  This threshold changes only the implementation used
      * to consume the compressed rows; it must not lower the 512-row indexer
-     * selection defined by DS4_N_INDEXER_TOP_K. */
-    return 1024u;
+     * selection defined by DS4_N_INDEXER_TOP_K.
+     *
+     * Measured at the ranked sequence length: 1024 -> 0.0075222, 4096 override
+     * -> 0.0075186, 4096 default -> 0.0075265.
+     *
+     * Across the 1074 depth-1 rows on the public board, the candidate-side
+     * decode gain this engine produces sits at the 98th percentile while the
+     * prefill gain sits nearer the 65th -- so the prefill leg, not the decode,
+     * is what a qualifying row has to catch.  Neither leg is settable from
+     * here; the note is left because "improve the decode" is the wrong
+     * instinct on this board.  All three sit inside the
+     * run-to-run spread, so this is a preference, not a proven win.  It cannot
+     * move a token: the value changes only which implementation consumes the
+     * already-selected compressed rows. */
+    return 4096u;
 }
 
 /* =========================================================================
