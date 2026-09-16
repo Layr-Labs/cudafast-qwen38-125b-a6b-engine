@@ -5620,6 +5620,110 @@ __global__ static void qwen4exp_moe_down_q_kernel(
     }
 }
 
+/* Full-shape validation supplements the existing vector/async/alignment gates. */
+static bool qwen4exp_down_panel_reuse(uint32_t groups, uint32_t out_dim,
+        uint32_t n_tokens, uint32_t used, uint32_t type,
+        uint64_t row_bytes, uint64_t expert_bytes) {
+    return groups == 20u && out_dim == 2560u && n_tokens == 2u && used == 10u &&
+        type == DS4_QWEN4EXP_TY_q5_1 && row_bytes == 480u &&
+        expert_bytes == 1228800u &&
+        getenv("DS4_QWEN4EXP_NO_DOWN_PANEL_REUSE") == NULL;
+}
+
+/* Four invocation-local panels retain recently consumed expert rows.
+ * A hit reuses the shipped bytes already in shared memory. The current panel
+ * is never a miss victim until all warps have finished reading it. */
+#define QW_DOWN_REUSE_PANELS 4u
+template <unsigned Panels>
+__global__ static void qwen4exp_moe_down_reuse_kernel(
+        float *out, const char *down, const int32_t *selected,
+        const int8_t *mq, const float *ms, const int32_t *msum,
+        uint32_t n_total_expert) {
+    static_assert(Panels >= 2u && Panels <= 4u, "bounded shared panel set");
+    extern __shared__ uint4 qw_down_panel[];
+    char *const spanel = (char *)qw_down_panel;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t row0 = blockIdx.x * 8u;
+    const uint32_t row = row0 + (threadIdx.x >> 5u);
+    if (row >= 2560u) return;
+    constexpr uint32_t groups = 20u, row_bytes = 480u, panel_bytes = 3840u;
+    constexpr uint64_t expert_bytes = 2560ull * row_bytes;
+    const int32_t route0 = lane < 10u ? selected[lane] : -1;
+    const int32_t route1 = lane < 10u ? selected[10u + lane] : -1;
+    int32_t tags[Panels];
+#pragma unroll
+    for (unsigned j = 0; j < Panels; j++) tags[j] = -1;
+    auto fill = [&](int32_t e, uint32_t panel) {
+        const uint32_t o = threadIdx.x * 16u;
+        if (o < panel_bytes) {
+            const char *const src = down + (uint64_t)(uint32_t)e * expert_bytes +
+                                    (uint64_t)row0 * row_bytes + o;
+            qw_cpasync16((uint32_t)__cvta_generic_to_shared(
+                spanel + panel * panel_bytes + o), src);
+        }
+    };
+    uint32_t current_panel = 0u, victim = 1u;
+    int32_t current_expert = __shfl_sync(0xffffffffu, route0, 0);
+    if (current_expert >= 0 && (uint32_t)current_expert < n_total_expert) {
+        fill(current_expert, 0u); tags[0] = current_expert;
+    }
+    qw_cpasync_commit();
+    float acc[2] = {0.0f, 0.0f};
+    for (uint32_t slot = 0; slot < 10u; slot++) {
+#pragma unroll
+        for (unsigned r = 0; r < 2u; r++) {
+            qw_cpasync_wait0();
+            __syncthreads();
+            const uint32_t nslot = r == 0u ? slot : slot + 1u;
+            uint32_t next_panel = current_panel;
+            int32_t next_expert = -1;
+            if (nslot < 10u) {
+                next_expert = r == 0u ? __shfl_sync(0xffffffffu, route1, slot)
+                                     : __shfl_sync(0xffffffffu, route0, nslot);
+                if (next_expert >= 0 && (uint32_t)next_expert < n_total_expert) {
+                    int found = -1;
+#pragma unroll
+                    for (unsigned j = 0; j < Panels; j++)
+                        if (tags[j] == next_expert) found = (int)j;
+                    if (found >= 0) {
+                        next_panel = (uint32_t)found;
+                    } else {
+                        next_panel = victim;
+                        if (next_panel == current_panel)
+                            next_panel = next_panel + 1u == Panels ? 0u : next_panel + 1u;
+                        victim = next_panel + 1u == Panels ? 0u : next_panel + 1u;
+                        fill(next_expert, next_panel);
+#pragma unroll
+                        for (unsigned j = 0; j < Panels; j++)
+                            if (j == next_panel) tags[j] = next_expert;
+                    }
+                }
+                /* A cache hit commits an empty group. The existing one
+                 * wait/barrier per consumed panel remains unconditional. */
+                qw_cpasync_commit();
+            }
+            if (current_expert >= 0 && (uint32_t)current_expert < n_total_expert &&
+                lane < groups) {
+                const char *const drow = spanel + current_panel * panel_bytes +
+                                       (row - row0) * row_bytes;
+                int8_t wq[32]; float wa[2], wb[2]; int halves = 1;
+                dev_qwen4exp_group_decode(DS4_QWEN4EXP_TY_q5_1,
+                                          drow, lane, wq, wa, wb, &halves);
+                const uint64_t at_g = ((uint64_t)r * 10u + slot) * groups + lane;
+                qwen4exp_shared_vector_accumulate(&acc[r], wq, wa[0], wb[0],
+                    mq + at_g * 32u, ms[at_g], msum[at_g]);
+            }
+            current_panel = next_panel;
+            current_expert = next_expert;
+        }
+    }
+#pragma unroll
+    for (unsigned r = 0; r < 2u; r++) {
+        const float tot = warp_sum_f32(acc[r]);
+        if (lane == 0u) out[(uint64_t)r * 2560u + row] = tot;
+    }
+}
+
 /* The shared expert: no routing, so the tile is consecutive tokens and the
  * decoded group serves all of them. */
 template <int R, int GateType = -1, int UpType = -1, bool Vector = false>
@@ -8306,13 +8410,21 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
             mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
 #define QWEN4EXP_DOWN_IMPL(R, DT, V) QWEN4EXP_DOWN_IMPL_S(R, DT, V, false, 0)
-#define QWEN4EXP_DOWN_ASYNC(DT) \
+#define QWEN4EXP_DOWN_ASYNC_ORIGINAL(DT) \
     qwen4exp_moe_down_q_kernel<2, DT, true, true, true><<< \
             dn_grid, threads, (size_t)dn_shared, stream>>>( \
             (float *)out->ptr, down, (const int32_t *)selected->ptr, \
             sc.mq, sc.ms, sc.msum, \
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
             mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
+#define QWEN4EXP_DOWN_ASYNC(DT) do { \
+    if (dn_reuse && DT == DS4_QWEN4EXP_TY_q5_1) { \
+        qwen4exp_moe_down_reuse_kernel<QW_DOWN_REUSE_PANELS><<< \
+            dn_grid, threads, (size_t)QW_DOWN_REUSE_PANELS * 3840u, stream>>>( \
+            (float *)out->ptr, down, (const int32_t *)selected->ptr, \
+            sc.mq, sc.ms, sc.msum, n_total_expert); \
+    } else { QWEN4EXP_DOWN_ASYNC_ORIGINAL(DT); } \
+} while (0)
 #define QWEN4EXP_DOWN(R) do { \
     if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q5_1) { \
         QWEN4EXP_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q5_1, false); \
@@ -8390,6 +8502,9 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             ((uintptr_t)down & 15u) == 0u &&
             dn_shared <= QW_DOWN_PANEL_MAX_BYTES &&
             getenv("DS4_QWEN4EXP_NO_DOWN_PANEL") == NULL;
+        const bool dn_reuse = qwen4exp_down_panel_reuse(mgroups, out_dim,
+            n_tokens, n_expert_used, down_slab->type, down_slab->row_bytes,
+            down_slab->expert_bytes);
         if (down_slab->type == DS4_QWEN4EXP_TY_q8_0) {
             if (dn_stage && getenv("DS4_QWEN4EXP_NO_DOWN_ASYNC") == NULL) {
                 QWEN4EXP_DOWN_ASYNC(DS4_QWEN4EXP_TY_q8_0);
@@ -8418,6 +8533,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
 #undef QWEN4EXP_DOWN_IMPL
 #undef QWEN4EXP_DOWN_IMPL_S
 #undef QWEN4EXP_DOWN_ASYNC
+#undef QWEN4EXP_DOWN_ASYNC_ORIGINAL
     return cuda_ok(cudaGetLastError(), "qwen4exp MoE down launch");
 }
 
