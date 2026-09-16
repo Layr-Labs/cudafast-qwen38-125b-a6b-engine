@@ -115,6 +115,11 @@ int ds4s_eval_speculative(ds4s_handle *h, int32_t first_token, int budget, int32
  *
  * Every out-pointer may be NULL. A handle whose session has no counters --
  * a non-qwen4exp session, or a CPU build -- reports zeros. */
+/* Decode-island graphs captured in this process so far, 0 on a backend that
+ * captures none.  The resident logs it per phase, so a run's own log says
+ * whether a timed window paid for a capture. */
+uint64_t ds4s_decode_graph_captures(void);
+
 void ds4s_spec_counters(const ds4s_handle *h, uint64_t *drafts, uint64_t *hits,
                         uint64_t *quenches, uint64_t *disagreements);
 

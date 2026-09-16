@@ -154,6 +154,7 @@ int ds4_gpu_decode_graphs_supported(void) { return 0; }
 int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) { (void)key; return -1; }
 int ds4_gpu_decode_graph_prefetch(const ds4_decode_graph_key *key) { (void)key; return 0; }
 int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) { (void)key; return -1; }
+uint64_t ds4_gpu_decode_graph_capture_count(void) { return 0; }
 void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key) { (void)key; }
 void ds4_gpu_decode_graphs_invalidate(void) {}
 int ds4_gpu_set_current_device(int logical_tier) { (void)logical_tier; return -1; }
@@ -17240,6 +17241,7 @@ static inline int ds4_gpu_decode_graphs_supported(void) { return 0; }
 static inline int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) { (void)key; return -1; }
 static inline int ds4_gpu_decode_graph_prefetch(const ds4_decode_graph_key *key) { (void)key; return 0; }
 static inline int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) { (void)key; return -1; }
+static inline uint64_t ds4_gpu_decode_graph_capture_count(void) { return 0; }
 static inline void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key) { (void)key; }
 static inline void ds4_gpu_decode_graphs_invalidate(void) {}
 static inline int ds4_gpu_set_current_device(int tier) { (void)tier; return 0; }
@@ -78248,4 +78250,12 @@ int ds4_session_ctx(ds4_session *s) {
 
 int ds4_session_prefill_cap(ds4_session *s) {
     return s ? (int)s->prefill_cap : 0;
+}
+
+/* Decode-island graphs captured so far in this process, 0 on a backend that
+ * has no decode-graph capture.  The boot warm-up in the shim drives itself
+ * with this: it keeps running synthetic speculative rounds until a round
+ * captures nothing new, so the first timed window never pays a capture. */
+uint64_t ds4_decode_graph_captures(void) {
+    return ds4_gpu_decode_graph_capture_count();
 }

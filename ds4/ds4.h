@@ -622,6 +622,11 @@ int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *
 int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen);
 void ds4_session_snapshot_free(ds4_session_snapshot *snap);
 
+/* Decode-island graphs captured so far in this process; 0 where the backend
+ * captures none.  Read between warm-up rounds so the warm-up can stop as soon
+ * as it stops discovering new graph shapes. */
+uint64_t ds4_decode_graph_captures(void);
+
 uint64_t ds4_session_layer_payload_bytes(ds4_session *s,
                                          uint32_t layer_start,
                                          uint32_t layer_end);
