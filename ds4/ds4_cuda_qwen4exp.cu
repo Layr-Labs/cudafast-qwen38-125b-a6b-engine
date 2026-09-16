@@ -3636,6 +3636,20 @@ __global__ static void qwen4exp_moe_zero_invalid_kernel(
  * direct path instead of failing to launch. */
 /* Two eight-row panels: the (slot, token) step sequence is double buffered at
  * token-panel granularity, so two live buffers suffice. */
+/* AND IT IS NOT SLACK TO BE SPENT, MEASURED.  The number reads like headroom
+ * -- the live shapes want 10,880 bytes of the 16,384 -- so 32 KiB looks like
+ * the same guard with more room in it.  It is not.  The only thing this
+ * constant does is gate `dn_shared <= QW_DOWN_PANEL_MAX_BYTES` at the launch
+ * site, and that test decides which panel geometries are ADMITTED, not how
+ * much dynamic shared memory the device will grant.  Neither down launch
+ * raises the per-block allowance with cudaFuncSetAttribute, so an admitted
+ * panel is spending the default one.
+ *
+ * Raised to 32 KiB, the gate starts admitting `dn_shared` values the driver
+ * then refuses, and the launch fails exactly where the fallback to the direct
+ * path used to catch it -- the failure this cap was written to prevent.
+ * Submitted at 32 KiB on the ranked path it came back with no score.  Read it
+ * as a bound on what the fallback still catches, not as spare capacity. */
 #define QW_DOWN_PANEL_MAX_BYTES 16384u
 
 /* The pipeline gives every thread exactly one slot of each tile per chunk,
