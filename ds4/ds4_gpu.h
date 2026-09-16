@@ -1044,6 +1044,19 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         uint64_t              out_dim,
         const ds4_gpu_tensor *x,
         uint32_t              n_rows);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+/* Target LM head only; unsupported shapes retain generic exact dispatch. */
+int ds4_gpu_matmul_q8_0_target_rows_exact_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows);
+#endif
+
 /* The same projection over an input the CALLER has already quantized, in the
  * exact layout the internal quantize writes: `q_offset` bytes into `q` are
  * n_rows * (in_dim/32) Q8_0 blocks of 32 int8, and `s_offset` bytes in are the

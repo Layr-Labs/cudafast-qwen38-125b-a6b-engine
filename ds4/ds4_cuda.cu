@@ -5916,6 +5916,146 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
     }
 }
 
+/* Target LM head: fixed 2560 input (80 groups), exactly R=1 or R=2
+ * activation rows, one grid.y tile. Dispatch bounds output rows to uint32;
+ * weight/output byte addressing remains wide. Keep every float operation
+ * and the first-group PDL prefetch/fence from the generic paired kernel. */
+template <int R>
+__global__ static void matmul_q8_target_fixed_kernel(
+        float *out, const unsigned char *w,
+        const int8_t *xq, const float *xscale,
+        uint32_t out_dim) {
+    constexpr uint64_t blocks = 80u;
+    constexpr bool Streaming = false;
+    const uint32_t local_row = threadIdx.x >> 6u;
+    const uint32_t local_lane = threadIdx.x & 63u;
+    const uint32_t group = local_lane >> 1u;
+    const uint32_t half = local_lane & 1u;
+    const uint32_t row = blockIdx.x * 4u + local_row;
+    constexpr uint32_t row0 = 0u;
+    constexpr uint32_t take = R;
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) acc[r] = 0.0f;
+
+    if (row < out_dim) {
+        const unsigned char *wr = w + (uint64_t)row * blocks * 34u;
+        /* PDL: the first walk step (b = group) with its WEIGHT loads issued
+         * above the fence and held in registers, so they fly while the
+         * quantizer drains.  The activation reads (xq/xscale, that kernel's
+         * output) stay below it; every statement is the loop's own, b
+         * ascends exactly as the rolled walk did, and the guard is the
+         * loop's own bounds check for a walk shorter than a warp's groups.
+         * The walk's remainder runs unchanged from group + 32. */
+        if (group < blocks) {
+            const uint64_t b = group;
+            /* Name both lanes of every live pair even if independent
+             * scheduling has temporarily separated their execution. */
+            const uint64_t warp_base = b - (uint64_t)(group & 15u);
+            const uint64_t remaining = blocks - warp_base;
+            const uint32_t live_pairs = (uint32_t)(remaining < 16u ? remaining : 16u);
+            const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
+            const int8_t *payload = (const int8_t *)(wr + b * 34u + 2u) + half * 16u;
+            const uintptr_t address = (uintptr_t)payload;
+            const uint32_t shift = (uint32_t)(address & 3u) * 8u;
+            const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
+            /* Weights stream through each projection once. Mark their reads
+             * evict-first while leaving the reusable activation loads alone. */
+            uint32_t previous = Streaming ? __ldcs(words) : words[0];
+            int32_t wq[4];
+#pragma unroll
+            for (int j = 0; j < 3; j++) {
+                const uint32_t next = Streaming ? __ldcs(words + j + 1) : words[j + 1];
+                wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
+                previous = next;
+            }
+            const uint16_t *lastp = (const uint16_t *)(const void *)(payload + 14);
+            const uint16_t last = Streaming ? __ldcs(lastp) : *lastp;
+            wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
+            const __half *scale = (const __half *)(wr + b * 34u);
+            const float ws = Streaming
+                ? __half2float(__ushort_as_half(__ldcs((const uint16_t *)scale)))
+                : __half2float(*scale);
+            QWEN4EXP_PDL_SYNC();
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                if ((uint32_t)r < take) {
+                    const uint64_t at = ((uint64_t)row0 + r) * blocks + b;
+                    const int32_t *xw = (const int32_t *)(xq + at * 32u + half * 16u);
+                    int dot = 0;
+#pragma unroll
+                    for (int j = 0; j < 4; j++) dot = __dp4a(wq[j], xw[j], dot);
+                    dot += __shfl_xor_sync(active, dot, 1);
+                    if (half == 0u) acc[r] += ws * xscale[at] * (float)dot;
+                }
+            }
+        }
+        for (uint64_t b = group + 32u; b < blocks; b += 32u) {
+            /* Name both lanes of every live pair even if independent
+             * scheduling has temporarily separated their execution. */
+            const uint64_t warp_base = b - (uint64_t)(group & 15u);
+            const uint64_t remaining = blocks - warp_base;
+            const uint32_t live_pairs = (uint32_t)(remaining < 16u ? remaining : 16u);
+            const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
+            const int8_t *payload = (const int8_t *)(wr + b * 34u + 2u) + half * 16u;
+            const uintptr_t address = (uintptr_t)payload;
+            const uint32_t shift = (uint32_t)(address & 3u) * 8u;
+            const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
+            /* Weights stream through each projection once. Mark their reads
+             * evict-first while leaving the reusable activation loads alone. */
+            uint32_t previous = Streaming ? __ldcs(words) : words[0];
+            int32_t wq[4];
+#pragma unroll
+            for (int j = 0; j < 3; j++) {
+                const uint32_t next = Streaming ? __ldcs(words + j + 1) : words[j + 1];
+                wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
+                previous = next;
+            }
+            const uint16_t *lastp = (const uint16_t *)(const void *)(payload + 14);
+            const uint16_t last = Streaming ? __ldcs(lastp) : *lastp;
+            wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
+            const __half *scale = (const __half *)(wr + b * 34u);
+            const float ws = Streaming
+                ? __half2float(__ushort_as_half(__ldcs((const uint16_t *)scale)))
+                : __half2float(*scale);
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                if ((uint32_t)r < take) {
+                    const uint64_t at = ((uint64_t)row0 + r) * blocks + b;
+                    const int32_t *xw = (const int32_t *)(xq + at * 32u + half * 16u);
+                    int dot = 0;
+#pragma unroll
+                    for (int j = 0; j < 4; j++) dot = __dp4a(wq[j], xw[j], dot);
+                    dot += __shfl_xor_sync(active, dot, 1);
+                    if (half == 0u) acc[r] += ws * xscale[at] * (float)dot;
+                }
+            }
+        }
+    }
+
+    /* Pair logical groups g and g + 16 before the remaining four levels
+     * of the original 32-leaf reduction tree.  Physical even lanes are
+     * logical lanes 0..15, so distances 16,8,4,2 preserve operand order. */
+    __shared__ float upper[R][4][16];
+    if (half == 0u && local_lane >= 32u) {
+#pragma unroll
+        for (int r = 0; r < R; r++) upper[r][local_row][group - 16u] = acc[r];
+    }
+    __syncthreads();
+    if (local_lane < 32u && half == 0u) {
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            float total = acc[r] + upper[r][local_row][group];
+#pragma unroll
+            for (int d = 16; d >= 2; d >>= 1)
+                total += __shfl_down_sync(0x55555555u, total, d);
+            if (local_lane == 0u && row < out_dim && (uint32_t)r < take)
+                out[((uint64_t)row0 + r) * out_dim + row] = total;
+        }
+    }
+}
+
+
 /* HC down has only 320 outputs. Two lanes per group expose more integer
  * work while one 64-thread block owns each output. Retain all 32 original
  * float chains and their reduction tree; only the integer dot is split.
@@ -17557,7 +17697,8 @@ static int cuda_matmul_q8_0_preq_rows_exact(
         uint64_t        in_dim,
         uint64_t        out_dim,
         uint32_t        n_rows,
-        uint64_t        blocks) {
+        uint64_t        blocks,
+        bool            target_head = false) {
     /* The int8 MMA GEMM, at PREFILL widths only.
      *
      * The tile is the right kernel when there are rows to share a weight read
@@ -17717,7 +17858,31 @@ static int cuda_matmul_q8_0_preq_rows_exact(
             /* Retain the promoted call-width specialization for the
              * general dense projections. The HC warp geometry above is
              * independent of this two-warp kernel's token-row bound. */
-            if (n_rows == 1u && getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL) {
+            /* Target-only fixed-K specialization. The containing pair arm
+             * already enforces DP4A, complete groups, row-tile diagnostics
+             * and even weight alignment. Keep the R2 diagnostic on its old
+             * path even at one row, where the fixed-R2 kernel is ineligible. */
+            if (target_head && in_dim == 2560u && out_dim <= UINT32_MAX &&
+                (n_rows == 1u || n_rows == 2u) &&
+                getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL &&
+                getenv("DS4_Q8_NO_TARGET_FIXED") == NULL) {
+                const uint32_t target_out = (uint32_t)out_dim;
+                if (n_rows == 1u) {
+                    QWEN4EXP_LAUNCH_PDL(
+                            (matmul_q8_target_fixed_kernel<1>),
+                            (dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u)),
+                            256, 0, cuda_decode_stream(),
+                            (float *)out->ptr, (const unsigned char *)wptr,
+                            xq, xscale, target_out);
+                } else {
+                    QWEN4EXP_LAUNCH_PDL(
+                            (matmul_q8_target_fixed_kernel<2>),
+                            (dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u)),
+                            256, 0, cuda_decode_stream(),
+                            (float *)out->ptr, (const unsigned char *)wptr,
+                            xq, xscale, target_out);
+                }
+            } else if (n_rows == 1u && getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL) {
                 /* PDL consumer: the stream predecessor is the decode
                  * quantizer, which triggers at its top (decode widths). */
                 QWEN4EXP_LAUNCH_PDL(
@@ -17806,7 +17971,7 @@ static int cuda_matmul_q8_0_preq_rows_exact(
                    "q8_0 decode rows exact tile launch");
 }
 
-extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+static int cuda_matmul_q8_0_decode_rows_exact_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
@@ -17814,7 +17979,8 @@ extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         uint64_t                in_dim,
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
-        uint32_t                n_rows) {
+        uint32_t                n_rows,
+        bool                    target_head) {
     if (!out || !x || !model_map || in_dim == 0u || out_dim == 0u ||
         n_rows == 0u ||
         x->bytes < (uint64_t)n_rows * in_dim * sizeof(float) ||
@@ -17856,7 +18022,35 @@ extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         return 0;
     }
     return cuda_matmul_q8_0_preq_rows_exact(out, wptr, xq, xscale, in_dim,
-                                            out_dim, n_rows, blocks);
+                                            out_dim, n_rows, blocks, target_head);
+}
+
+extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t                n_rows) {
+    return cuda_matmul_q8_0_decode_rows_exact_tensor(
+            out, model_map, model_size, weight_offset, in_dim, out_dim,
+            x, n_rows, false);
+}
+
+extern "C" int ds4_gpu_matmul_q8_0_target_rows_exact_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t                n_rows) {
+    return cuda_matmul_q8_0_decode_rows_exact_tensor(
+            out, model_map, model_size, weight_offset, in_dim, out_dim,
+            x, n_rows, true);
 }
 
 /* The same matmul over an input the caller has ALREADY quantized into `q`:
