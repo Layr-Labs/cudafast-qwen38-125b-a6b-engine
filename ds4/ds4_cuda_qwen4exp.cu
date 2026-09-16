@@ -5425,6 +5425,136 @@ __global__ static void qwen4exp_shared_down_q_kernel(
     }
 }
 
+/* Complete output tiles only; preserve shared-down arithmetic, coalesce HC stores. */
+template <int R, bool Vector>
+__global__ static void qwen4exp_shared_down_hc_kernel(
+        float *out, float *hyper, const float *inject,
+        const char *down,
+        const int8_t *mq,
+        const float *ms,
+        const int32_t *msum,
+        const float *gate_scale,
+        uint64_t down_row_bytes,
+        uint32_t down_type,
+        uint32_t groups,
+        uint32_t out_dim,
+        uint32_t n_tokens) {
+    constexpr int DownType = DS4_QWEN4EXP_TY_q8_0;
+    constexpr bool Stage = true;
+    __shared__ float completed[8 * R];
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t row = blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t tok0 = blockIdx.y * (uint32_t)R;
+    if (row >= out_dim || tok0 >= n_tokens) return;
+    const uint32_t take = n_tokens - tok0 < (uint32_t)R ? n_tokens - tok0
+                                                        : (uint32_t)R;
+    extern __shared__ uint4 qw_shdown_panel[];
+    char *const spanel = (char *)qw_shdown_panel;
+    if (Stage) {
+        const uint64_t panel_bytes = (uint64_t)8u * down_row_bytes;
+        const char *const gp = down + (uint64_t)(blockIdx.x * 8u) * down_row_bytes;
+        for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
+             i += (uint64_t)blockDim.x * 16u) {
+            if (i + 16u <= panel_bytes)
+                *(uint4 *)(spanel + i) = *(const uint4 *)(const void *)(gp + i);
+            else
+                for (uint64_t j = i; j < panel_bytes; j++) spanel[j] = gp[j];
+        }
+        QWEN4EXP_PDL_SYNC();
+        __syncthreads();
+    }
+    const char *down_row = Stage
+        ? (spanel + (uint64_t)(threadIdx.x >> 5u) * down_row_bytes)
+        : (down + (uint64_t)row * down_row_bytes);
+
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) acc[r] = 0.0f;
+
+    /* PDL: the first walk step (g = lane) with its WEIGHT loads -- the group
+     * decode reads only the down row, a fixed single-expert slab addressed
+     * by launch math, no expert indirection in this kernel -- issued above
+     * the fence and held in registers, so they fly while the mid quantizer
+     * drains.  The activation reads (mq/ms/msum, that kernel's output) and
+     * the accumulation stay below it; every statement is the loop's own, g
+     * ascends exactly as the rolled walk did, and the guard is the loop's
+     * own bounds check -- load-bearing here, the shared mid being twenty
+     * groups wide against a thirty-two lane warp.  The walk's remainder runs
+     * unchanged from lane + 32. */
+    if (lane < groups) {
+        const uint32_t g = lane;
+        int8_t wq[32];
+        float wa[2], wb[2];
+        int halves = 1;
+        dev_qwen4exp_group_decode(
+                DownType < 0 ? down_type : (uint32_t)DownType,
+                down_row, g, wq, wa, wb, &halves);
+        /* The staged arm already waited, at block scope, above. */
+        if (!Stage) QWEN4EXP_PDL_SYNC();
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            if ((uint32_t)r < take) {
+                const uint64_t at_g = (uint64_t)(tok0 + (uint32_t)r) * groups + g;
+                if constexpr (Vector) {
+                    qwen4exp_shared_vector_accumulate(&acc[r], wq, wa[0], wb[0],
+                                                      mq + at_g * 32u, ms[at_g], msum[at_g]);
+                } else {
+                    qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves,
+                                              mq + at_g * 32u, ms[at_g], msum[at_g]);
+                }
+            }
+        }
+    }
+    for (uint32_t g = lane + 32u; g < groups; g += 32u) {
+        int8_t wq[32];
+        float wa[2], wb[2];
+        int halves = 1;
+        dev_qwen4exp_group_decode(
+                DownType < 0 ? down_type : (uint32_t)DownType,
+                down_row, g, wq, wa, wb, &halves);
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            if ((uint32_t)r < take) {
+                const uint64_t at_g = (uint64_t)(tok0 + (uint32_t)r) * groups + g;
+                if constexpr (Vector) {
+                    qwen4exp_shared_vector_accumulate(&acc[r], wq, wa[0], wb[0],
+                                                      mq + at_g * 32u, ms[at_g], msum[at_g]);
+                } else {
+                    qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves,
+                                              mq + at_g * 32u, ms[at_g], msum[at_g]);
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < R; r++) {
+        const float tot = warp_sum_f32(acc[r]);
+        if (lane == 0u && (uint32_t)r < take) {
+            const uint64_t off = (uint64_t)(tok0 + (uint32_t)r) * out_dim + row;
+            /* Preserve the rounded block value and its observable store. */
+            const float block = out[off] + gate_scale[tok0 + (uint32_t)r] * tot;
+            out[off] = block;
+            completed[r * 8 + (threadIdx.x >> 5u)] = block;
+        }
+    }
+    /* No early PDL producer trigger: this grid is multi-wave. The next
+     * dependent gets implicit completion after every shared-down CTA exits.
+     * The output tile is distinct from the still-live dynamic weight panel. */
+    __syncthreads();
+    const uint32_t tid = threadIdx.x;
+    if (tid < take * 32u) {
+        const uint32_t r = tid / 32u;
+        const uint32_t h = (tid / 8u) & 3u;
+        const uint32_t d = tid & 7u;
+        const uint32_t token = tok0 + r;
+        const uint64_t at = ((uint64_t)token * 4u + h) * out_dim +
+                            (uint64_t)blockIdx.x * 8u + d;
+        const float block = completed[r * 8u + d];
+        hyper[at] = hyper[at] + block * inject[(uint64_t)token * 4u + h];
+    }
+}
+
 /* =========================================================================
  * The shared expert, with the decoded row staged in shared memory.
  * =========================================================================
@@ -7948,7 +8078,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     return cuda_ok(cudaGetLastError(), "qwen4exp MoE down launch");
 }
 
-extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
+static int qwen4exp_shared_expert_impl(
         ds4_gpu_tensor              *out,
         ds4_gpu_tensor              *mid,
         ds4_gpu_tensor              *gate_scale,
@@ -7961,7 +8091,8 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         uint32_t                     out_dim,
         const ds4_gpu_tensor        *x,
         uint32_t                     n_tokens,
-        int                          pre_quantized) {
+        int                          pre_quantized,
+        ds4_gpu_tensor *terminal_hyper, const ds4_gpu_tensor *terminal_inject) {
     if (!out || !mid || !gate_scale || !x ||
         !router_slab || !gate_slab || !up_slab || !down_slab ||
         !router_slab->map || !gate_slab->map || !up_slab->map || !down_slab->map ||
@@ -7989,7 +8120,25 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         return 0;
     }
 
-    const int logical_tier = cuda_current_tier();
+    if (terminal_hyper) {
+        const uint64_t elems = (uint64_t)n_tokens * out_dim;
+        if (!terminal_inject || !terminal_hyper->ptr || !terminal_inject->ptr ||
+            ((uintptr_t)terminal_hyper->ptr & 3u) ||
+            ((uintptr_t)terminal_inject->ptr & 3u) ||
+            elems > UINT64_MAX / (4u * sizeof(float)) ||
+            terminal_hyper->bytes < elems * 4u * sizeof(float) ||
+            terminal_inject->bytes < (uint64_t)n_tokens * 4u * sizeof(float) ||
+            ds4_tensor_device_idx(terminal_hyper) != ds4_tensor_device_idx(out) ||
+            ds4_tensor_device_idx(terminal_inject) != ds4_tensor_device_idx(out)) return 0;
+    }
+    int logical_tier = 0;
+    if (terminal_hyper) {
+        if (!cuda_ok(cudaGetDevice(&logical_tier), "shared HC current device") ||
+            ds4_tensor_device_idx(terminal_hyper) != logical_tier ||
+            ds4_tensor_device_idx(terminal_inject) != logical_tier) return 0;
+    } else {
+        logical_tier = cuda_current_tier();
+    }
     const char *router = cuda_resolve_weight_ptr(router_slab->map,
             router_slab->offset, (uint64_t)in_dim * sizeof(float), logical_tier,
             "qwen4exp_ffn_gate_inp_shexp");
@@ -8289,6 +8438,50 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         ((uintptr_t)down & 15u) == 0u &&
         sd_panel <= QW_DOWN_PANEL_MAX_BYTES &&
         getenv("DS4_QWEN4EXP_NO_SHARED_DOWN_PANEL") == NULL;
+    bool terminal_ok = terminal_hyper && sd_stage &&
+        ((single_q8 && tile == 1) || (vector_shared && n_tokens == 2u && tile == 2)) &&
+        (((uintptr_t)mq & 15u) == 0u) &&
+        getenv("DS4_QWEN4EXP_NO_SHARED_HC_INJECT") == NULL;
+    if (terminal_ok) {
+        const auto disjoint = [](const void *a, uint64_t an, const void *b, uint64_t bn) {
+            const uintptr_t ap = (uintptr_t)a, bp = (uintptr_t)b;
+            return a && b && an <= UINTPTR_MAX - ap && bn <= UINTPTR_MAX - bp &&
+                (ap + an <= bp || bp + bn <= ap);
+        };
+        const ds4_gpu_tensor *inputs[] = {out, mid, gate_scale, x, terminal_inject};
+        for (const ds4_gpu_tensor *t : inputs)
+            terminal_ok = terminal_ok && disjoint(terminal_hyper->ptr, terminal_hyper->bytes,
+                                                   t->ptr, t->bytes);
+        const ds4_gpu_tensor *mutable_inputs[] = {out, mid, gate_scale};
+        for (const ds4_gpu_tensor *t : mutable_inputs)
+            terminal_ok = terminal_ok && disjoint(terminal_inject->ptr, terminal_inject->bytes,
+                                                   t->ptr, t->bytes);
+        terminal_ok = terminal_ok &&
+            disjoint(terminal_hyper->ptr, terminal_hyper->bytes, base, xq_bytes + mq_bytes) &&
+            disjoint(terminal_inject->ptr, terminal_inject->bytes, base, xq_bytes + mq_bytes) &&
+            disjoint(terminal_hyper->ptr, terminal_hyper->bytes, router, (uint64_t)in_dim * sizeof(float)) &&
+            disjoint(terminal_hyper->ptr, terminal_hyper->bytes, gate, (uint64_t)mid_dim * gate_slab->row_bytes) &&
+            disjoint(terminal_hyper->ptr, terminal_hyper->bytes, up, (uint64_t)mid_dim * up_slab->row_bytes) &&
+            disjoint(terminal_hyper->ptr, terminal_hyper->bytes, down, (uint64_t)out_dim * down_slab->row_bytes);
+    }
+    if (terminal_ok) {
+        if (n_tokens == 1u) {
+            QWEN4EXP_LAUNCH_PDL((qwen4exp_shared_down_hc_kernel<1, false>),
+                (dim3(out_dim / 8u, 1u, 1u)), threads, (size_t)sd_panel, stream,
+                (float *)out->ptr, (float *)terminal_hyper->ptr,
+                (const float *)terminal_inject->ptr, down, mq, ms, msum,
+                (const float *)gate_scale->ptr, down_slab->row_bytes,
+                down_slab->type, mgroups, out_dim, n_tokens);
+        } else {
+            QWEN4EXP_LAUNCH_PDL((qwen4exp_shared_down_hc_kernel<2, true>),
+                (dim3(out_dim / 8u, 1u, 1u)), threads, (size_t)sd_panel, stream,
+                (float *)out->ptr, (float *)terminal_hyper->ptr,
+                (const float *)terminal_inject->ptr, down, mq, ms, msum,
+                (const float *)gate_scale->ptr, down_slab->row_bytes,
+                down_slab->type, mgroups, out_dim, n_tokens);
+        }
+        return cuda_ok(cudaGetLastError(), "qwen4exp shared down HC launch") ? 2 : 0;
+    }
 #define QWEN4EXP_SH_DOWN_IMPL(R, DT, V) do { \
     if (n_tokens <= 2u) { \
         if (sd_stage) { \
@@ -8342,6 +8535,44 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
 #undef QWEN4EXP_SH_DOWN_IMPL
     }
     return cuda_ok(cudaGetLastError(), "qwen4exp shared down launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
+        ds4_gpu_tensor              *out,
+        ds4_gpu_tensor              *mid,
+        ds4_gpu_tensor              *gate_scale,
+        const ds4_gpu_qwen4exp_slab *router_slab,
+        const ds4_gpu_qwen4exp_slab *gate_slab,
+        const ds4_gpu_qwen4exp_slab *up_slab,
+        const ds4_gpu_qwen4exp_slab *down_slab,
+        uint32_t                     in_dim,
+        uint32_t                     mid_dim,
+        uint32_t                     out_dim,
+        const ds4_gpu_tensor        *x,
+        uint32_t                     n_tokens,
+        int                          pre_quantized) {
+    return qwen4exp_shared_expert_impl(out, mid, gate_scale, router_slab, gate_slab, up_slab, down_slab,
+        in_dim, mid_dim, out_dim, x, n_tokens, pre_quantized, NULL, NULL);
+}
+
+extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_hc_tensor(
+        ds4_gpu_tensor              *out,
+        ds4_gpu_tensor              *mid,
+        ds4_gpu_tensor              *gate_scale,
+        const ds4_gpu_qwen4exp_slab *router_slab,
+        const ds4_gpu_qwen4exp_slab *gate_slab,
+        const ds4_gpu_qwen4exp_slab *up_slab,
+        const ds4_gpu_qwen4exp_slab *down_slab,
+        uint32_t                     in_dim,
+        uint32_t                     mid_dim,
+        uint32_t                     out_dim,
+        const ds4_gpu_tensor        *x,
+        uint32_t                     n_tokens,
+        int                          pre_quantized,
+        ds4_gpu_tensor *terminal_hyper, const ds4_gpu_tensor *terminal_inject) {
+    if (!terminal_hyper || !terminal_inject) return 0;
+    return qwen4exp_shared_expert_impl(out, mid, gate_scale, router_slab, gate_slab, up_slab, down_slab,
+        in_dim, mid_dim, out_dim, x, n_tokens, pre_quantized, terminal_hyper, terminal_inject);
 }
 
 #include "ds4_qwen4exp_hc_ref.h"

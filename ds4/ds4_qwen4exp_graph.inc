@@ -2016,11 +2016,12 @@ static void qw_moe_time_dump(void) {
         }                                                                     \
     } while (0)
 
-static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
+static bool qwen4exp_graph_moe_block_impl(ds4_qwen4exp_session *s,
                                      const ds4_qwen4exp_layer_weights *l,
                                      const ds4_model *m,
                                      uint32_t il,
-                                     uint32_t n_tokens) {
+                                     uint32_t n_tokens, bool *terminal_injected) {
+    if (terminal_injected) *terminal_injected = false;
     /* Router: dense F32 logits, then a top-k with softmax over the SELECTED
      * logits alone.  No bias, no renormalisation, no scale. */
     /* The router's logits take the decode-order route too.  THIS FIXTURE
@@ -2080,17 +2081,42 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
      * stream. Routed scratch retains its quantization through this call;
      * Metal's prequantized entry point keeps its ordinary implementation. */
     const int reuse_quant = getenv("DS4_QWEN4EXP_NO_MOE_QUANT_REUSE") == NULL;
-    if (!ds4_gpu_qwen4exp_shared_expert_preq_tensor(
+    int shared_status = 0;
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    const bool terminal_ok = terminal_injected && n_tokens >= 1u && n_tokens <= 2u &&
+        !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
+        getenv("DS4_QWEN4EXP_NO_SHARED_HC_INJECT") == NULL;
+    if (terminal_ok) {
+        shared_status = ds4_gpu_qwen4exp_shared_expert_preq_hc_tensor(
             s->block_out, s->shexp_mid, s->shexp_gate,
             &sh_router_slab, &sh_gate_slab, &sh_up_slab, &sh_down_slab,
             DS4_N_EMBD, DS4_N_FF_SHEXP, DS4_N_EMBD, s->mixed, n_tokens,
-            reuse_quant)) {
+            reuse_quant, s->hyper, s->inject);
+    } else
+#endif
+    {
+        shared_status = ds4_gpu_qwen4exp_shared_expert_preq_tensor(
+            s->block_out, s->shexp_mid, s->shexp_gate,
+            &sh_router_slab, &sh_gate_slab, &sh_up_slab, &sh_down_slab,
+            DS4_N_EMBD, DS4_N_FF_SHEXP, DS4_N_EMBD, s->mixed, n_tokens,
+            reuse_quant);
+    }
+    if (!shared_status) {
         fprintf(stderr, "ds4: qwen4exp shared expert failed at block %u\n", il);
         return false;
     }
+    if (terminal_injected) *terminal_injected = shared_status == 2;
     QW_MOE_TICK(QW_MOE_T_SHARED);
     if (moe_timing) qw_moe_stage_calls[moe_lane]++;
     return true;
+}
+
+static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
+                                     const ds4_qwen4exp_layer_weights *l,
+                                     const ds4_model *m,
+                                     uint32_t il,
+                                     uint32_t n_tokens) {
+    return qwen4exp_graph_moe_block_impl(s, l, m, il, n_tokens, NULL);
 }
 
 /* One gated residual step: mix down to the block input, run the block, inject
@@ -2322,11 +2348,14 @@ static bool qwen4exp_graph_layer_island_encode(
             return false;
         }
         QW_TRACE(QW_SLICE_FFN_MIX);
-        if (!qwen4exp_graph_moe_block(s, l, m, il, n_tokens)) {
+        bool terminal_injected = false;
+        if (!qwen4exp_graph_moe_block_impl(s, l, m, il, n_tokens, &terminal_injected)) {
             return false;
         }
         QW_TRACE(QW_SLICE_MOE);
-        if (defer) {
+        if (terminal_injected) {
+            /* Shared down already materialized all four hyper streams. */
+        } else if (defer) {
             s->hc_pending = true;
         } else if (!ds4_gpu_qwen4exp_hc_inject_tensor(s->hyper, s->hyper, s->block_out,
                                                s->inject, DS4_N_EMBD, DS4_N_HC,
