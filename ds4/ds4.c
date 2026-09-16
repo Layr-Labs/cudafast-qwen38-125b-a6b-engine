@@ -67620,11 +67620,37 @@ static int ds4_session_qwen4exp_rows(ds4_session *s, const int *tokens,
     const uint32_t pos0 = ds4_qwen4exp_session_pos(e->qwen4exp_session);
     if (ds4_session_qwen4exp_cache_feed_tail(s, tokens[0], pos0, err, errlen) != 0)
         return 1;
-    if (!ds4_qwen4exp_graph_verify_rows(e->qwen4exp_session,
-                                        e->qwen4exp_weights, &e->model,
-                                        buf, n, NULL, s->logits, 1u)) {
-        snprintf(err, errlen, "qwen4exp: the forward refused");
-        return 1;
+    /* Compact return: the forward's wide head already computes every row's
+     * logits on the device, so a chunk inside the commit envelope asks for
+     * each row's greedy winner only and leaves the distribution resident.
+     * The frontier row materializes on demand through read_logit_row; the
+     * scored step consumes top1 and the device top-k without the vocab-wide
+     * readback.  A wider chunk -- or a session whose spec seam was never
+     * wired -- keeps the eager logits path. */
+    if (n <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
+        s->qwen4exp_seam.read_logit_row) {
+        int row_top1[DS4_QWEN4EXP_MTP_MAX_COMMIT];
+        if (!ds4_qwen4exp_graph_verify_top1_rows(e->qwen4exp_session,
+                                               e->qwen4exp_weights, &e->model,
+                                               buf, n, NULL, row_top1)) {
+            snprintf(err, errlen, "qwen4exp: the forward refused");
+            return 1;
+        }
+        s->qwen4exp_spec.frontier_row = n - 1u;
+        s->qwen4exp_spec.frontier_top1 = row_top1[n - 1u];
+        s->qwen4exp_spec.frontier_top1_valid =
+            row_top1[n - 1u] >= 0 &&
+            (uint32_t)row_top1[n - 1u] < DS4_N_VOCAB;
+        s->qwen4exp_spec.frontier_logits_deferred = true;
+    } else {
+        s->qwen4exp_spec.frontier_top1_valid = false;
+        s->qwen4exp_spec.frontier_logits_deferred = false;
+        if (!ds4_qwen4exp_graph_verify_rows(e->qwen4exp_session,
+                                          e->qwen4exp_weights, &e->model,
+                                          buf, n, NULL, s->logits, 1u)) {
+            snprintf(err, errlen, "qwen4exp: the forward refused");
+            return 1;
+        }
     }
     if (ds4_session_qwen4exp_cache_rows(s, tokens, n, pos0, err, errlen) != 0)
         return 1;
@@ -68824,13 +68850,41 @@ int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p
 
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
     if (!s || !out || k <= 0) return 0;
-    if (!ds4_session_materialize_qwen4exp_frontier(s)) return 0;
     if (k > (int)DS4_N_VOCAB) k = (int)DS4_N_VOCAB;
     for (int i = 0; i < k; i++) {
         out[i].id = -1;
         out[i].logit = DS4_NEG_INF;
         out[i].logprob = DS4_NEG_INF;
     }
+#ifndef DS4_NO_GPU
+    /* Deferred frontier: the logits never left the device, so the top-k and
+     * the logsumexp run there and only ids, values and one double cross.
+     * The device comparator is (logit desc, id asc) -- the same order the
+     * host scan below produces -- and a non-finite entry ends the list just
+     * as the host's isfinite skip does. */
+    if (s->qwen4exp && s->qwen4exp_spec.frontier_logits_deferred &&
+        k <= (int)DS4_QWEN4EXP_TOPK_MAX) {
+        int32_t ids[DS4_QWEN4EXP_TOPK_MAX];
+        float vals[DS4_QWEN4EXP_TOPK_MAX];
+        double logsum = 0.0;
+        if (ds4_qwen4exp_graph_topk_row(s->engine->qwen4exp_session,
+                                        s->qwen4exp_spec.frontier_row,
+                                        (uint32_t)k, ids, vals,
+                                        &logsum)) {
+            int n = 0;
+            for (int i = 0; i < k; i++) {
+                if (ids[i] < 0 || !isfinite(vals[i])) break;
+                out[i].id = ids[i];
+                out[i].logit = vals[i];
+                out[i].logprob = (float)((double)vals[i] - logsum);
+                n++;
+            }
+            return n;
+        }
+        /* A device failure falls through to the materialized host path. */
+    }
+#endif
+    if (!ds4_session_materialize_qwen4exp_frontier(s)) return 0;
 
     float max_logit = DS4_NEG_INF;
     for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
@@ -68862,6 +68916,7 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
 
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
     if (!s || !out || token < 0 || token >= (int)DS4_N_VOCAB) return 0;
+    if (!ds4_session_materialize_qwen4exp_frontier(s)) return 0;
 
     float max_logit = DS4_NEG_INF;
     for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
@@ -68884,6 +68939,7 @@ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
 
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
     if (!s || !out || cap < (int)DS4_N_VOCAB) return 0;
+    if (!ds4_session_materialize_qwen4exp_frontier(s)) return 0;
     memcpy(out, s->logits, (size_t)DS4_N_VOCAB * sizeof(out[0]));
     return (int)DS4_N_VOCAB;
 }
@@ -68894,6 +68950,12 @@ int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
 #endif
     if (!s || !logits || n != (int)DS4_N_VOCAB) return 1;
     memcpy(s->logits, logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+    /* The caller's row replaces the frontier: the deferred device row and
+     * its top-1 no longer describe s->logits. */
+#ifndef DS4_NO_GPU
+    s->qwen4exp_spec.frontier_top1_valid = false;
+    s->qwen4exp_spec.frontier_logits_deferred = false;
+#endif
     return 0;
 }
 

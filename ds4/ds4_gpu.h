@@ -547,6 +547,16 @@ int ds4_gpu_indexer_topk_tensor(
         uint32_t                n_tokens,
         uint32_t                top_k);
 
+/* Sum of exp(x - maxv) over one row of `scores`, accumulated in double on
+ * the device.  The host adds maxv + log(sum) to finish the logsumexp; the
+ * split keeps the kernel to one launch and one double write.  Non-finite
+ * entries contribute nothing, matching the host scan. */
+int ds4_gpu_logsumexp_tensor(
+        ds4_gpu_tensor       *sum_out,
+        const ds4_gpu_tensor *scores,
+        uint32_t                n_comp,
+        float                   maxv);
+
 /* =========================================================================
  * Qwen4-Exp (Qwen 3.8 Flash-Next) QSA block.
  *

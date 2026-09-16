@@ -16266,6 +16266,51 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
     return cuda_ok(cudaGetLastError(), "indexer topk launch");
 }
 
+/* One-block logsumexp over a vocab row: per-thread expf into a double
+ * accumulator, warp shuffles, then a shared reduce across warps.  The host
+ * finishes with maxv + log(sum).  Non-finite entries are skipped, matching
+ * the host scan in ds4_session_top_logprobs. */
+__global__ static void logsumexp_row_kernel(double *sum_out,
+                                            const float *scores,
+                                            uint32_t n_comp,
+                                            float maxv) {
+    double acc = 0.0;
+    for (uint32_t i = threadIdx.x; i < n_comp; i += blockDim.x) {
+        const float v = scores[i];
+        if (isfinite(v)) acc += (double)expf(v - maxv);
+    }
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    __shared__ double warp_sums[32];
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5;
+    if (lane == 0) warp_sums[warp] = acc;
+    __syncthreads();
+    if (warp == 0) {
+        const uint32_t n_warps = blockDim.x >> 5;
+        double w = lane < n_warps ? warp_sums[lane] : 0.0;
+        for (int off = 16; off > 0; off >>= 1)
+            w += __shfl_down_sync(0xffffffffu, w, off);
+        if (lane == 0) *sum_out = w;
+    }
+}
+
+extern "C" int ds4_gpu_logsumexp_tensor(
+        ds4_gpu_tensor       *sum_out,
+        const ds4_gpu_tensor *scores,
+        uint32_t                n_comp,
+        float                   maxv) {
+    if (!sum_out || !scores || n_comp == 0 ||
+        scores->bytes < (uint64_t)n_comp * sizeof(float) ||
+        sum_out->bytes < sizeof(double)) {
+        return 0;
+    }
+    logsumexp_row_kernel<<<1, 1024>>>((double *)sum_out->ptr,
+                                      (const float *)scores->ptr,
+                                      n_comp, maxv);
+    return cuda_ok(cudaGetLastError(), "logsumexp row launch");
+}
+
 extern "C" int ds4_gpu_indexer_top1_value_tensor(
         ds4_gpu_tensor       *selected,
         ds4_gpu_tensor       *values,

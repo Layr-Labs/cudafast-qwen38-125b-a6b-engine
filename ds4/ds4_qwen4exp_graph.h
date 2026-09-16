@@ -217,6 +217,18 @@ bool ds4_qwen4exp_graph_read_logit_row(ds4_qwen4exp_session *s,
                                        uint32_t row,
                                        float *logits);
 
+/* Deferred-frontier top-k: after a verify_top1_rows forward left the logits
+ * on the device, run indexer_topk + logsumexp over `row` and read back the
+ * k ids, their logits, and the row's logsumexp.  Ordering is (logit desc,
+ * id asc) — the same comparator the host scan uses.  `k` is bounded by
+ * DS4_QWEN4EXP_TOPK_MAX. */
+bool ds4_qwen4exp_graph_topk_row(ds4_qwen4exp_session *s,
+                                 uint32_t row,
+                                 uint32_t k,
+                                 int32_t *ids,
+                                 float *logits,
+                                 double *logsumexp);
+
 /* The target's LM head over ONE supplied pre-final-mixer row.  Runs the final
  * mixer and the head, the same two ops the forward ends with, so a row that
  * came out of a verify yields exactly the logits that verify would have. */
