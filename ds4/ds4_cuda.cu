@@ -15092,11 +15092,34 @@ __global__ static void indexer_top1_kernel(
     const float *row = scores + (uint64_t)t * n_comp;
     float best_v = -INFINITY;
     uint32_t best_i = 0;
-    for (uint32_t i = tid; i < n_comp; i += 1024u) {
-        const float v = row[i];
-        if (topk_score_better(v, i, best_v, best_i)) {
-            best_v = v;
-            best_i = i;
+    if ((n_comp & 3u) == 0u) {
+        /* Four lanes per load: the row is n_comp*4 bytes and n_comp%4==0 keeps
+         * every row 16-byte aligned, so the float4 read is exact.  The
+         * predicate is a total order (value, then lowest index), so folding
+         * four candidates per iteration picks the same winner the scalar
+         * stride did. */
+        for (uint32_t i = tid * 4u; i < n_comp; i += 4096u) {
+            const float4 v4 = *(const float4 *)(row + i);
+            if (topk_score_better(v4.x, i + 0u, best_v, best_i)) {
+                best_v = v4.x; best_i = i + 0u;
+            }
+            if (topk_score_better(v4.y, i + 1u, best_v, best_i)) {
+                best_v = v4.y; best_i = i + 1u;
+            }
+            if (topk_score_better(v4.z, i + 2u, best_v, best_i)) {
+                best_v = v4.z; best_i = i + 2u;
+            }
+            if (topk_score_better(v4.w, i + 3u, best_v, best_i)) {
+                best_v = v4.w; best_i = i + 3u;
+            }
+        }
+    } else {
+        for (uint32_t i = tid; i < n_comp; i += 1024u) {
+            const float v = row[i];
+            if (topk_score_better(v, i, best_v, best_i)) {
+                best_v = v;
+                best_i = i;
+            }
         }
     }
 
