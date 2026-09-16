@@ -1444,6 +1444,24 @@ int ds4_qwen4exp_mtp_head_forward_last(ds4_qwen4exp_mtp_head *h,
                                  draft_out, multi_out, true, NULL, 0u, false, err, errlen);
 }
 
+int ds4_qwen4exp_mtp_head_forward_last_device(
+                                  ds4_qwen4exp_mtp_head *h,
+                                  const int *next_tokens,
+                                  const ds4_gpu_tensor *multi_device,
+                                  uint32_t first_device_row,
+                                  uint32_t pos0, uint32_t n_tokens,
+                                  int *draft_out, float *multi_out,
+                                  char *err, size_t errlen) {
+    if (!multi_device) {
+        return mtp_fail(err, errlen,
+                        "qwen4exp MTP head: device-source forward given no "
+                        "source tensor");
+    }
+    return mtp_head_forward_impl(h, next_tokens, NULL, pos0, n_tokens,
+                                 draft_out, multi_out, true, multi_device,
+                                 first_device_row, false, err, errlen);
+}
+
 
 void ds4_qwen4exp_mtp_head_reset_cache(ds4_qwen4exp_mtp_head *h) {
     if (!h) return;

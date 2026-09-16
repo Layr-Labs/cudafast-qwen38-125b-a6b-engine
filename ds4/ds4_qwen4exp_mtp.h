@@ -924,6 +924,22 @@ int ds4_qwen4exp_mtp_head_forward_last(ds4_qwen4exp_mtp_head *h,
                                        int *draft_out, float *multi_out,
                                        char *err, size_t errlen);
 
+/* The same forward as ds4_qwen4exp_mtp_head_forward_last(), but the
+ * pre-final-mixer rows come from a DEVICE tensor instead of a host slab:
+ * `multi_device` is the source and `first_device_row` the row index of the
+ * first of the `n_tokens` consecutive rows inside it.  The copy into the
+ * head's own staging tensor is device-to-device, so a caller whose rows are
+ * already resident -- the verify's own hyper slab -- never round-trips them
+ * through the host.  Same head, same cache rows, same drafts. */
+int ds4_qwen4exp_mtp_head_forward_last_device(
+                                  ds4_qwen4exp_mtp_head *h,
+                                  const int *next_tokens,
+                                  const ds4_gpu_tensor *multi_device,
+                                  uint32_t first_device_row,
+                                  uint32_t pos0, uint32_t n_tokens,
+                                  int *draft_out, float *multi_out,
+                                  char *err, size_t errlen);
+
 /* Greedy argmax with the canonical lowest-id tie-break the shim's ds4s_argmax
  * documents.  Shared so the head and the cycle cannot break ties apart. */
 #endif /* DS4_NO_GPU */
