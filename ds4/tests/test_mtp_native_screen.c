@@ -90,7 +90,12 @@ static void run_case(int adversarial, uint32_t offset) {
         for(unsigned i=0;i<DIM;i++) activation[i]=adversarial?1.0f:(int)(rnd()%201)*0.01f-1.0f;
         need(ds4_gpu_tensor_write(x,0,activation,sizeof activation),"current activation");
         if(adversarial==2) {
-            need(compare_key_paths(out,ids,scratch,w,bytes,offset,x)==0,"nonfinite score fallback");
+            /* The flag is deferred: the screen queues its refinement and
+             * reports the candidate count; the nonfinite score shows up in
+             * the flag word the drain publishes, which is what the head
+             * samples before trusting the shortlist. */
+            need(compare_key_paths(out,ids,scratch,w,bytes,offset,x)==CAP &&
+                 ds4_gpu_mtp_native_flag()!=0,"nonfinite score flagged");
             goto cleanup;
         }
         need(compare_key_paths(out,ids,scratch,w,bytes,offset,x)==CAP,"screen active");

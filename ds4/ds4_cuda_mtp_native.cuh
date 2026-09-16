@@ -126,6 +126,22 @@ static mtp_native_layout mtp_native_offsets(uint32_t width) {
     l.temporary = mtp_native_align(l.flag + 4u);
     return l;
 }
+/* Pinned host landing pad for the screen's validity flag.  The flag used to
+ * come back through a synchronous device-to-host copy in the middle of the
+ * head forward, which drained every queued kernel before the sort and the
+ * refinement were even launched.  It now rides an asynchronous copy into this
+ * page-locked word and is only sampled after the caller's own end-of-forward
+ * drain, so the flag check costs the head nothing on the critical path. */
+static uint32_t *g_mtp_native_flag_host = NULL;
+
+/* The flag the last screen queued, read after the caller's drain.  -1 when no
+ * landing pad exists (the screen then keeps its old synchronous read and
+ * reports invalid scores inline). */
+extern "C" int ds4_gpu_mtp_native_flag(void) {
+    if (!g_mtp_native_flag_host) return -1;
+    return (int)*g_mtp_native_flag_host;
+}
+
 extern "C" int ds4_gpu_mtp_native_screen_init(uint32_t width,
         uint64_t *bytes, uint32_t *capacity) {
     if (!bytes || !capacity) return -1;
@@ -229,9 +245,27 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
             key_in,flag,scores,width,prefix,tail,vocab);
         if (!cuda_ok(cudaGetLastError(),"native screen keys")) return -1;
     }
-    uint32_t invalid = 0;
-    if (!ds4_gpu_tensor_read(scratch,l.flag,&invalid,4)) return -1;
-    if (invalid) return 0;
+    /* The flag no longer blocks the head: it copies to the pinned word on the
+     * same stream, and the caller samples it after its own end-of-forward
+     * drain.  When no landing pad exists the screen keeps the old synchronous
+     * read and reports invalid scores inline, so a host-alloc failure degrades
+     * to the previous behaviour rather than to an unchecked flag. */
+    if (!g_mtp_native_flag_host) {
+        if (cudaHostAlloc((void **)&g_mtp_native_flag_host, sizeof(uint32_t),
+                          cudaHostAllocDefault) != cudaSuccess) {
+            g_mtp_native_flag_host = NULL;
+        }
+    }
+    if (g_mtp_native_flag_host) {
+        if (!cuda_ok(cudaMemcpyAsync(g_mtp_native_flag_host, base + l.flag, 4,
+                                   cudaMemcpyDeviceToHost,
+                                   cuda_decode_stream()),
+                     "native screen flag copy")) return -1;
+    } else {
+        uint32_t invalid = 0;
+        if (!ds4_gpu_tensor_read(scratch, l.flag, &invalid, 4)) return -1;
+        if (invalid) return 0;
+    }
     size_t temporary = (size_t)(scratch->bytes-l.temporary);
     /* Rank on the high score word alone. Keys are written in row order, so
      * original IDs strictly increase over the whole input and the packed low

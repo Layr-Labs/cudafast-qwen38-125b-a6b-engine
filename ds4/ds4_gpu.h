@@ -892,6 +892,10 @@ int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out, ds4_gpu_tensor *ids,
     const ds4_gpu_tensor *x);
 int ds4_gpu_mtp_native_map(ds4_gpu_tensor *winner, const ds4_gpu_tensor *logits,
     const ds4_gpu_tensor *ids, uint32_t count, uint32_t vocab);
+/* The screen's validity flag, sampled after the caller's end-of-forward drain:
+ * 0 = the queued refinement is valid, nonzero = fall back to the static
+ * shortlist, -1 = no deferred flag was queued (the screen reported inline). */
+int ds4_gpu_mtp_native_flag(void);
 
 int ds4_gpu_matmul_q8_0_top1_tensor(
         ds4_gpu_tensor       *selected,
