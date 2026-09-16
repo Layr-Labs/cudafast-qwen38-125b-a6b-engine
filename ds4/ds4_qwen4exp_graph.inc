@@ -279,6 +279,52 @@ static bool qwen4exp_ple_read_constants(const ds4_model            *m,
     return true;
 }
 
+/* Draft-time PLE readahead, off the critical path.  The MTP seam hands the
+ * host each drafted token while the head's own forward is still on the
+ * device; a token's row ids are a pure function of the stream behind it, so
+ * the row set the verify's gather is about to read is knowable the moment
+ * the draft exists.  Computing those ids and advising them inline on the
+ * draft thread is a measured regression -- the chain is serial host work
+ * and every microsecond the seam adds is decode latency.  The advise has
+ * to run on a thread the chain does not wait on.
+ *
+ * This is that thread.  The draft hooks post one message per call: a
+ * snapshot of the committed n-gram history, the position it covers, and
+ * the position-tagged tokens the call produced.  The worker keeps a shadow
+ * history keyed by position: a message whose `at` disagrees with the
+ * shadow's position reseeds the shadow from the message's snapshot, which
+ * is also how a rejected round's tokens fall out of it -- the rollback
+ * restores the committed history and position, and the next post carries
+ * them.  Tokens the shadow already covers are skipped; a gap stops the
+ * walk.  The ids the worker computes are only ever advised, never read
+ * back, so a wrong guess costs one speculative readahead and nothing else.
+ * A full ring drops the post: the gather's own advise still covers every
+ * row it reads, so a dropped hint costs lead time and nothing else. */
+#define QW_PLE_PF_RING 8u
+
+typedef struct {
+    ds4_ple_history hist;    /* committed history snapshot at post time   */
+    uint32_t        at;      /* position `hist` covers                    */
+    uint32_t        pos0;    /* position of toks[0]                       */
+    uint32_t        n;       /* tokens in toks[]                          */
+    int32_t         toks[DS4_QWEN4EXP_MTP_MAX_COMMIT];
+} qw_ple_pf_msg;
+
+typedef struct {
+    pthread_mutex_t  mu;
+    pthread_cond_t   cv;
+    int              sync_ok;    /* mu/cv initialized */
+    int              started;    /* worker thread spawned */
+    int              quit;
+    uint32_t         head, tail; /* ring cursors, head == tail means empty */
+    qw_ple_pf_msg    ring[QW_PLE_PF_RING];
+    pthread_t        thr;
+    const ds4_qwen4exp_ple_table *ple;   /* rows to advise */
+    const ds4_ple_constants      *cons;  /* id function's constants */
+    ds4_ple_history  shadow;
+    uint32_t         shadow_pos;
+} qw_ple_pf;
+
 struct ds4_qwen4exp_session {
     ds4_qwen4exp_session_plan plan;
     uint32_t pos;
@@ -328,6 +374,7 @@ struct ds4_qwen4exp_session {
     bool              ple_ready;      /* the hash constants were readable */
     uint64_t         *ple_ids;        /* host [n_batch][head_count]       */
     float            *ple_rows_host;  /* host [n_batch][ple_embd]         */
+    qw_ple_pf         ple_pf;         /* draft-time readahead worker        */
     ds4_gpu_tensor   *ple_conv_state; /* [state_rows][n_hc * n_embd]      */
     ds4_gpu_tensor   *ple_rows;       /* [n_batch][ple_embd]              */
     ds4_gpu_tensor   *ple_key;        /* key projection, then the gate    */
@@ -444,7 +491,10 @@ struct ds4_qwen4exp_session {
      * catches neither. */
     ds4_gpu_tensor *final_mixer_snapshot;
 #endif
+
 };
+
+static void qw_ple_pf_close(ds4_qwen4exp_session *s);
 
 /* ======================================================================
  * Open, reset, close.
@@ -770,6 +820,11 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
         if (ok) {
             s->ple_ready = qwen4exp_ple_read_constants(m, w, &s->ple_constants);
             ds4_ple_history_reset(&s->ple_constants, &s->ple_history);
+            if (s->ple_ready) {
+                s->ple_pf.sync_ok =
+                    pthread_mutex_init(&s->ple_pf.mu, NULL) == 0 &&
+                    pthread_cond_init(&s->ple_pf.cv, NULL) == 0;
+            }
         }
     }
 
@@ -863,6 +918,9 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
 
 void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     if (!s) return;
+    /* The prefetch worker holds pointers into this session; it joins before
+     * any field it can touch goes away. */
+    qw_ple_pf_close(s);
     /* Graph nodes retain session buffer addresses, even across resets. */
     ds4_gpu_decode_graphs_invalidate();
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
@@ -1095,6 +1153,129 @@ void ds4_qwen4exp_session_reset(ds4_qwen4exp_session *s) {
  * knob); a positive value pins the thread count.  Unset, the gather takes
  * the online CPUs capped at 16 -- enough to keep the SSD queue deep without
  * starving the decode path's own helpers. */
+
+/* Page-in readahead for one token's row set.
+ *
+ * The table is 26.8 GiB on the SSD and the box's free page cache cannot hold
+ * it next to the resident model, so a hashed row is a genuine page fault
+ * whenever the n-gram lands somewhere not recently read.  The gather loop
+ * below touches the sixteen rows of a token one at a time and stalls on each
+ * fault in turn; advising the whole set first lets the kernel overlap the
+ * reads, which is the only parallelism a one-token decode step has on this
+ * path.  On a resident page the advise is a no-op syscall, so the warm case
+ * pays a bounded per-token cost and the cold case stops serializing.
+ *
+ * Hint only: it changes no value the gather writes. */
+static void qw_ple_advise_rows(const ds4_qwen4exp_ple_table *ple,
+                               const uint64_t *ids, uint32_t count) {
+#if defined(POSIX_MADV_WILLNEED)
+    if (!ple || !ple->base || !ids || count == 0u) return;
+    /* Resolved once per process: the page size cannot change while the
+     * engine is open, and sysconf walks libc state on every call. */
+    static uint64_t ple_advise_page = 0;
+    if (ple_advise_page == 0) {
+        const long p = sysconf(_SC_PAGESIZE);
+        ple_advise_page = p > 0 ? (uint64_t)p : 4096u;
+    }
+    const uint64_t page = ple_advise_page;
+    for (uint32_t i = 0; i < count; i++) {
+        const uint64_t row = ids[i];
+        if (row >= ple->rows) continue;
+        const uint64_t start = row * ple->row_bytes;
+        uint64_t end = start + ple->row_bytes;
+        const uint64_t a0 = start - start % page;
+        uint64_t a1 = (end + page - 1u) / page * page;
+        if (a1 > ple->bytes) a1 = ple->bytes;
+        if (a1 <= a0) continue;
+        (void)posix_madvise((void *)(ple->base + a0), (size_t)(a1 - a0),
+                            POSIX_MADV_WILLNEED);
+    }
+#else
+    (void)ple; (void)ids; (void)count;
+#endif
+}
+
+/* The prefetch worker: drains the ring, reseeds its shadow history whenever
+ * a message's committed position disagrees with the shadow's, and advises
+ * the row set of every token it consumes.  Runs only on the draft chain's
+ * idle window; the gather's own advise covers anything it misses. */
+static void *qw_ple_pf_worker(void *arg) {
+    qw_ple_pf *pf = (qw_ple_pf *)arg;
+    for (;;) {
+        pthread_mutex_lock(&pf->mu);
+        while (!pf->quit && pf->head == pf->tail)
+            pthread_cond_wait(&pf->cv, &pf->mu);
+        if (pf->quit && pf->head == pf->tail) {
+            pthread_mutex_unlock(&pf->mu);
+            return NULL;
+        }
+        qw_ple_pf_msg m = pf->ring[pf->head % QW_PLE_PF_RING];
+        pf->head++;
+        pthread_mutex_unlock(&pf->mu);
+
+        if (pf->shadow_pos != m.at) {
+            pf->shadow = m.hist;
+            pf->shadow_pos = m.at;
+        }
+        for (uint32_t i = 0; i < m.n; i++) {
+            const uint32_t p = m.pos0 + i;
+            if (p < pf->shadow_pos) continue;
+            if (p > pf->shadow_pos) break;
+            uint64_t ids[DS4_PLE_MAX_HEADS];
+            ds4_ple_row_ids(pf->cons, &pf->shadow, m.toks + i, 1u, ids);
+            qw_ple_advise_rows(pf->ple, ids, DS4_N_PLE_HEAD);
+            pf->shadow_pos++;
+        }
+    }
+}
+
+/* Post one position-tagged token list to the prefetch worker.  The only
+ * work on the caller's critical path is the message fill and one mutex
+ * round-trip; the id walk and the madvise calls all run on the worker.
+ * Spawns the worker lazily on the first post so a session that never
+ * speculates never pays for the thread. */
+static void qw_ple_pf_post(ds4_qwen4exp_session *s,
+                           const ds4_qwen4exp_weights *w,
+                           const int32_t *toks, uint32_t n, uint32_t pos0) {
+    qw_ple_pf *pf = &s->ple_pf;
+    if (!pf->sync_ok || !s->ple_ready || !toks || n == 0u) return;
+    if (n > (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT)
+        n = (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT;
+    pthread_mutex_lock(&pf->mu);
+    if (!pf->started) {
+        pf->ple = &w->ple;
+        pf->cons = &s->ple_constants;
+        pf->shadow_pos = ~0u;   /* forces a reseed on the first message */
+        if (pthread_create(&pf->thr, NULL, qw_ple_pf_worker, pf) == 0)
+            pf->started = 1;
+    }
+    if (pf->started && pf->tail - pf->head < QW_PLE_PF_RING) {
+        qw_ple_pf_msg *m = &pf->ring[pf->tail % QW_PLE_PF_RING];
+            m->hist = s->ple_history;
+            m->at = ds4_qwen4exp_session_pos(s);
+            m->pos0 = pos0;
+            m->n = n;
+            memcpy(m->toks, toks, n * sizeof(int32_t));
+            pf->tail++;
+            pthread_cond_signal(&pf->cv);
+        }
+    pthread_mutex_unlock(&pf->mu);
+}
+
+/* Stop and join the prefetch worker; safe on a session that never posted. */
+static void qw_ple_pf_close(ds4_qwen4exp_session *s) {
+    qw_ple_pf *pf = &s->ple_pf;
+    if (!pf->sync_ok) return;
+    pthread_mutex_lock(&pf->mu);
+    pf->quit = 1;
+    pthread_cond_signal(&pf->cv);
+    pthread_mutex_unlock(&pf->mu);
+    if (pf->started) pthread_join(pf->thr, NULL);
+    pf->started = 0;
+    pthread_mutex_destroy(&pf->mu);
+    pthread_cond_destroy(&pf->cv);
+    pf->sync_ok = 0;
+}
 typedef struct {
     const ds4_qwen4exp_ple_table *ple;
     const ds4_qwen4exp_session   *s;
@@ -1135,9 +1316,18 @@ static void *qw_ple_gather_worker(void *arg) {
     for (uint32_t t = seg->t0; t < seg->t1; t++) {
         ds4_ple_row_ids(&seg->s->ple_constants, &local, seg->tokens + t, 1u,
                         seg->s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD);
+        const uint64_t *ids = seg->s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD;
+        /* Advise the token's whole row set before touching the first row, so
+         * the kernel overlaps the page-ins instead of the loop stalling on
+         * each of the sixteen faults in turn.  Hint only. */
+        qw_ple_advise_rows(seg->ple, ids, DS4_N_PLE_HEAD);
         for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
-            const uint64_t row =
-                seg->s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h];
+            const uint64_t row = ids[h];
+            /* The next head's row is the next thing this loop reads; ask for
+             * it while the current row dequantizes.  Hint only. */
+            if (h + 1u < DS4_N_PLE_HEAD)
+                __builtin_prefetch(ds4_qwen4exp_ple_row(seg->ple, ids[h + 1u]),
+                                   0, 1);
             const uint8_t *quant = ds4_qwen4exp_ple_row(seg->ple, row);
             if (!quant) { seg->ok = 0; return NULL; }
             ds4_ple_dequant_iq4_nl(
@@ -1299,6 +1489,12 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 s->ple_history_rows[t] = s->ple_history;
             }
         }
+        /* Every row id this call will read is now known, so advise the whole
+         * set before the first dequant: the kernel overlaps the page-ins of
+         * the rows the loop is about to touch instead of stalling on each
+         * fault in turn.  Hint only; the ids and values are unchanged. */
+        qw_ple_advise_rows(&w->ple, s->ple_ids,
+                           n_tokens * (uint32_t)DS4_N_PLE_HEAD);
         for (uint32_t t = 0; t < n_tokens; t++) {
             /* The head's destination strides are constants of the shape, so
              * the token base is hoisted out of the head loop and the head
@@ -1309,9 +1505,11 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
             for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
                 const uint64_t row = ids[h];
                 /* Every head of this token except the last is followed by
-                 * another table row, so ask for the next id early.  Hint. */
+                 * another table row, so ask for that row's bytes while the
+                 * current one dequantizes.  Hint only. */
                 if (h + 1u < DS4_N_PLE_HEAD)
-                    __builtin_prefetch(ids + h + 1u, 0, 1);
+                    __builtin_prefetch(
+                        ds4_qwen4exp_ple_row(&w->ple, ids[h + 1u]), 0, 1);
                 const uint8_t *quant = ds4_qwen4exp_ple_row(&w->ple, row);
                 /* Cold: a hashed row past the table is a hard refusal that has
                  * never fired in a scored run, so keep it out of the hot path. */
@@ -1363,9 +1561,19 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
             ds4_ple_row_ids(&s->ple_constants, &s->ple_history, tokens,
                             n_tokens, s->ple_ids);
             for (uint32_t t = 0; t < n_tokens; t++) {
+                const uint64_t *ids =
+                    s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD;
+                /* Advise the token's row set before the first touch so the
+                 * kernel overlaps the page-ins; the next token's advise then
+                 * issues while this token's rows dequantize.  Hint only. */
+                qw_ple_advise_rows(&w->ple, ids, DS4_N_PLE_HEAD);
                 for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
-                    const uint64_t row =
-                        s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h];
+                    const uint64_t row = ids[h];
+                    /* The next head's row is the next read; ask for it while
+                     * the current one dequantizes.  Hint only. */
+                    if (h + 1u < DS4_N_PLE_HEAD)
+                        __builtin_prefetch(
+                            ds4_qwen4exp_ple_row(&w->ple, ids[h + 1u]), 0, 1);
                     const uint8_t *quant = ds4_qwen4exp_ple_row(&w->ple, row);
                     if (!quant) {
                         fprintf(stderr,
