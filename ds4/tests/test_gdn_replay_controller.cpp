@@ -26,8 +26,10 @@ struct ds4_qwen4exp_session {
     ds4_gpu_tensor *qsa_k[3]{}, *qsa_v[3]{}, *idx_tape[3]{}, *idx_pool[3]{};
     ds4_gpu_tensor *d_adopt=nullptr,*d_gdn_replay=nullptr,*ple_conv_state=nullptr;
     bool gdn_replay_enabled=true,gdn_replay_active=false,gdn_replay_previous=false;
+    bool gdn_defer_enabled=true;
     bool state_dirty=false;
     uint32_t gdn_replay_prefix=0,gdn_replay_phase=0;
+    uint32_t gdn_replay_start=0;
     uint32_t adopt_state=0,adopt_conv=0,adopt_device=0,spec_snapshot_rows=0;
     uint32_t head_cache_pos=0,pos=0;
     int ple_constants=0,ple_history=0;
@@ -65,6 +67,13 @@ static int ds4_gpu_qwen4exp_gdn_replay_materialize(ds4_gpu_tensor *out,
     for(unsigned i=0;i<rows;i++) h=transition(h,tape->v[i]);
     out->v[0]=h;materializations++;return 1;
 }
+static int ds4_gpu_qwen4exp_gdn_deferred_materialize(ds4_gpu_tensor *out,
+        ds4_gpu_tensor *base,ds4_gpu_tensor *tape,unsigned code,unsigned,unsigned,unsigned) {
+    need(code<16,"deferred materialization descriptor");
+    uint64_t h=base->v[0];
+    for(unsigned i=0;i<(code&3);i++) h=transition(h,tape->v[((code>>2)+i)&3]);
+    out->v[0]=h;materializations++;return 1;
+}
 #include "gdn_replay_controller.inc"
 
 struct fixture {
@@ -74,13 +83,14 @@ struct fixture {
     std::array<std::array<uint64_t,6>,3> snap{},conv_snap{};
     std::map<uint32_t,std::pair<ds4_gpu_tensor*,bool>> graphs;
     uint64_t token=1;
-    explicit fixture(bool enabled=true,bool lazy=true) {
+    explicit fixture(bool enabled=true,bool lazy=true,bool deferred=true) {
         s.gdn_replay_enabled=enabled&&lazy;
+        s.gdn_defer_enabled=s.gdn_replay_enabled&&deferred;
         if(lazy) s.d_adopt=alloc(1);
         if(enabled&&lazy) s.d_gdn_replay=alloc(1);
         for(unsigned il:{0u,2u}) {
             s.gdn_state[il]=alloc(1);s.gdn_checkpoint[il]=alloc(1);
-            s.gdn_conv[il]=alloc(1);s.gdn_replay_tape[il]=alloc(2);
+            s.gdn_conv[il]=alloc(1);s.gdn_replay_tape[il]=alloc(deferred?4:2);
             s.gdn_state_snapshot[il]=alloc(6);s.gdn_conv_snapshot[il]=alloc(6);
         }
     }
@@ -104,6 +114,7 @@ struct fixture {
         }
     }
     void inspect() {
+        need(qwen4exp_gdn_deferred_current(&s,1),"empty layer inspection");
         for(unsigned il:{0u,2u}) {
             uint64_t live=s.gdn_state[il]->v[0];
             unsigned prefix=s.gdn_replay_prefix;
@@ -111,13 +122,22 @@ struct fixture {
                 need(qwen4exp_gdn_replay_snapshot(&s,il,0),"virtual snapshot refused");
                 need(s.gdn_state_snapshot[il]->v[0]==snap[il][0],"virtual snapshot mismatch");
                 need(s.gdn_state[il]->v[0]==live && s.gdn_replay_prefix==prefix,"inspection mutated state");
+                if(s.gdn_defer_enabled) {
+                    need(qwen4exp_gdn_deferred_current(&s,il),"final state inspection refused");
+                    // Inspection reports the final forward state even after
+                    // a pending selection; the selection is a separate slot.
+                    uint64_t h=s.gdn_checkpoint[il]->v[0];
+                    unsigned code=ds4_qwen4exp_gdn_deferred_after(s.gdn_replay_start,prefix,2);
+                    for(unsigned i=0;i<(code&3);i++)h=transition(h,s.gdn_replay_tape[il]->v[((code>>2)+i)&3]);
+                    need(s.gdn_state[il]->v[0]==h,"final state inspection mismatch");
+                }
             }
         }
     }
     void forward(unsigned width,unsigned snapshots,bool inspection=false) {
         s.spec_snapshot_rows=snapshots;s.state_dirty=true;
         need(prepare(&s,width),"prepare refused");
-        unsigned key=ds4_qwen4exp_gdn_graph_variant(width,snapshots,s.gdn_replay_phase,s.gdn_replay_active);
+        unsigned key=ds4_qwen4exp_gdn_graph_variant(width,snapshots,s.gdn_replay_phase,s.gdn_replay_active,s.gdn_defer_enabled);
         const auto identity=std::make_pair(s.gdn_state[0],s.gdn_replay_active);
         if(graphs.count(key)) need(graphs[key]==identity,"graph reused a different buffer or kernel");
         graphs[key]=identity;
@@ -126,10 +146,13 @@ struct fixture {
             uint64_t c=s.gdn_conv[il]->v[0];
             unsigned adopt=s.d_adopt?(unsigned)s.d_adopt->v[0]:0;
             unsigned prefix=s.d_gdn_replay?(unsigned)s.d_gdn_replay->v[0]:0;
+            unsigned start=0;
+            if(s.gdn_defer_enabled) {start=prefix>>2;prefix&=3;}
             if(adopt) c=s.gdn_conv_snapshot[il]->v.at(adopt-1);
             if(s.gdn_replay_active) {
                 h=s.gdn_checkpoint[il]->v[0];
-                for(unsigned i=0;i<prefix;i++) h=transition(h,s.gdn_replay_tape[il]->v.at(i));
+                for(unsigned i=0;i<prefix;i++) h=transition(h,s.gdn_replay_tape[il]->v.at(
+                    s.gdn_defer_enabled?(start+i)&3:i));
             } else if(adopt) h=s.gdn_state_snapshot[il]->v.at(adopt-1);
             need(h==state[il] && c==conv[il],"forward did not adopt selected state");
             for(unsigned t=0;t<width;t++) {
@@ -140,12 +163,19 @@ struct fixture {
                 need(h==state[il] && c==conv[il],"row output mismatch");
                 if(t<snapshots) {snap[il][t]=state[il];conv_snap[il][t]=conv[il];}
                 if(t<snapshots) s.gdn_conv_snapshot[il]->v[t]=c;
-                if(s.gdn_replay_active && t==0) {
+                if(s.gdn_replay_active && s.gdn_defer_enabled) {
+                    // Independent model of the physical checkpoint/ring.
+                    if(prefix>=2) {
+                        if(t==0)s.gdn_checkpoint[il]->v[0]=h;
+                        else s.gdn_replay_tape[il]->v.at((start+prefix)&3)=input;
+                    } else s.gdn_replay_tape[il]->v.at((start+prefix+t)&3)=input;
+                } else if(s.gdn_replay_active && t==0) {
                     if(prefix==2) s.gdn_checkpoint[il]->v[0]=h;
                     else s.gdn_replay_tape[il]->v.at(prefix)=input;
                 } else if(!s.gdn_replay_active && t<snapshots) s.gdn_state_snapshot[il]->v[t]=h;
             }
-            s.gdn_state[il]->v[0]=h;s.gdn_conv[il]->v[0]=c;
+            if(!s.gdn_replay_active || !s.gdn_defer_enabled) s.gdn_state[il]->v[0]=h;
+            s.gdn_conv[il]->v[0]=c;
         }
         s.gdn_replay_previous=s.gdn_replay_active;s.adopt_state=0;s.adopt_conv=0;
         token+=width;s.pos+=width;forwards++;
@@ -155,8 +185,9 @@ struct fixture {
 static uint32_t rng=1;
 static uint32_t random_word() {rng=rng*1664525u+1013904223u;return rng;}
 int main() {
+    for(unsigned deferred=0;deferred<2;deferred++)
     for(unsigned mask=0;mask<4096;mask++) for(unsigned style=0;style<3;style++) {
-        fixture f;
+        fixture f(true,true,deferred);
         f.forward(1,0);
         for(unsigned r=0;r<12;r++) {
             f.forward(2,1,style!=0);
@@ -169,8 +200,8 @@ int main() {
         f.reset();f.reset();f.forward(2,1,true);cases++;
     }
     // Changes of width, partial selections and no-lazy/no-replay valves.
-    for(unsigned mode=0;mode<3;mode++) for(unsigned run=0;run<128;run++) {
-        fixture f(mode!=1,mode!=2);
+    for(unsigned mode=0;mode<4;mode++) for(unsigned run=0;run<128;run++) {
+        fixture f(mode!=1,mode!=2,mode!=3);
         for(unsigned r=0;r<80;r++) {
             unsigned width=1+random_word()%7;
             unsigned snapshots=width-1;
@@ -194,6 +225,9 @@ int main() {
         f.forward(2,1); // full acceptance forces swap
         fail_update=true;
         need(!prepare(&f.s,2),"post-swap update failure ignored");
+        f.reset();f.forward(2,1,true);cases++;
+        f.reset();f.s.spec_snapshot_rows=1;f.s.state_dirty=true;fail_update=true;
+        need(!prepare(&f.s,2),"entry-swap update failure ignored");
         f.reset();f.forward(2,1,true);cases++;
     }
     need(!batch,"command batch leaked");
