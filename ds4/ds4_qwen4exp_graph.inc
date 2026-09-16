@@ -10,6 +10,27 @@
 
 #include "ds4_qwen4exp_model_registration.h"
 #include "ds4_qwen4exp_qsa_scratch.h"
+/* Dispatch overrides are process-lifetime constants: nothing mutates the
+ * environment between forwards, so each name resolves once and caches the
+ * way qwen4exp_hc_defer_off() and qw_hb_time_on() already do, instead of
+ * walking the environ list on every layer of every forward.  The table is
+ * tiny and the names are fixed at compile time. */
+static int qw_env_off(const char *name) {
+    static const char *names[16];
+    static int         vals[16];
+    static int         n_names = 0;
+    for (int i = 0; i < n_names; i++) {
+        if (names[i] == name) return vals[i];
+    }
+    const int v = getenv(name) != NULL;
+    if (n_names < 16) {
+        names[n_names] = name;
+        vals[n_names] = v;
+        n_names++;
+    }
+    return v;
+}
+
 
 /* ======================================================================
  * Sizing.
@@ -1239,7 +1260,7 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
      * rows a single long call would. */
 
     const double gather_t0 =
-        getenv("DS4_QWEN4EXP_PLE_GATHER_TIME") ? now_sec() : 0.0;
+        qw_env_off("DS4_QWEN4EXP_PLE_GATHER_TIME") ? now_sec() : 0.0;
     const uint32_t block_elems = DS4_PLE_IQ4_NL_BLOCK_ELEMS;
     const uint32_t blocks_per_row = DS4_N_PLE_ROW_DIM / block_elems;
 
@@ -1496,7 +1517,7 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
     }
 
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    if (n_tokens<=2u && getenv("DS4_QWEN4EXP_NO_GDN_PROJECTION_FUSION")==NULL) {
+    if (n_tokens<=2u && !qw_env_off("DS4_QWEN4EXP_NO_GDN_PROJECTION_FUSION")) {
         ds4_gpu_tensor *outs[4]={s->gdn_qkv,s->gdn_gate,s->gdn_alpha,s->gdn_beta};
         const void *maps[4]={QW_MAP(m,l->attn_qkv),QW_MAP(m,l->attn_gate),
                             QW_MAP(m,l->ssm_alpha),QW_MAP(m,l->ssm_beta)};
@@ -1630,7 +1651,7 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
 
     /* Projections.  q is DOUBLED: half query, half output gate. */
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    if (n_tokens<=2u && getenv("DS4_QWEN4EXP_NO_QSA_Q8_TRIPLE")==NULL) {
+    if (n_tokens<=2u && !qw_env_off("DS4_QWEN4EXP_NO_QSA_Q8_TRIPLE")) {
         ds4_gpu_tensor *outs[3]={s->qsa_doubled,s->qsa_kin,s->qsa_vin};
         const void *maps[3]={QW_MAP(m,l->attn_q),QW_MAP(m,l->attn_k),QW_MAP(m,l->attn_v)};
         const uint64_t sizes[3]={QW_MAPSZ(m,l->attn_q),QW_MAPSZ(m,l->attn_k),QW_MAPSZ(m,l->attn_v)};
@@ -2005,7 +2026,7 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
     /* Routed and shared experts read the same mixed activation in this
      * stream. Routed scratch retains its quantization through this call;
      * Metal's prequantized entry point keeps its ordinary implementation. */
-    const int reuse_quant = getenv("DS4_QWEN4EXP_NO_MOE_QUANT_REUSE") == NULL;
+    const int reuse_quant = !qw_env_off("DS4_QWEN4EXP_NO_MOE_QUANT_REUSE");
     if (!ds4_gpu_qwen4exp_shared_expert_preq_tensor(
             s->block_out, s->shexp_mid, s->shexp_gate,
             &sh_router_slab, &sh_gate_slab, &sh_up_slab, &sh_down_slab,
@@ -2272,7 +2293,7 @@ static bool qwen4exp_graph_layer_island(
      * capture.  They must also execute the individual call sites on replay. */
     const bool capture_ok =
         n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
-        !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
+        !qw_hb_time_on() && !qw_env_off("DS4_QWEN4EXP_TIME_SLICES") &&
         ds4_gpu_decode_graphs_supported();
     if (capture_ok) {
         ds4_decode_graph_key key;
@@ -2330,7 +2351,7 @@ static bool qwen4exp_graph_qsa_island(
     const bool qsa_capture_ok =
         n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
         (uint64_t)s->pos + n_tokens <= DS4_N_INDEXER_TOP_K &&
-        !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
+        !qw_hb_time_on() && !qw_env_off("DS4_QWEN4EXP_TIME_SLICES") &&
         ds4_gpu_decode_graphs_supported();
     if (qsa_capture_ok) {
         ds4_decode_graph_key key;
@@ -2600,7 +2621,7 @@ static bool qwen4exp_graph_layers(
     bool capture_ok =
         n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
         (uint64_t)s->pos + n_tokens <= DS4_N_INDEXER_TOP_K &&
-        !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
+        !qw_hb_time_on() && !qw_env_off("DS4_QWEN4EXP_TIME_SLICES") &&
         ds4_gpu_decode_graphs_supported();
 #ifdef DS4_TEST_HOOKS
     /* Layer dumps synchronize and must execute every host call site. */
@@ -2699,7 +2720,7 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
                                 float                      *logits_out) {
     const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
     const double wall_t0 =
-        getenv("DS4_QWEN4EXP_TIME_SLICES") != NULL ? now_sec() : 0.0;
+        qw_env_off("DS4_QWEN4EXP_TIME_SLICES") ? now_sec() : 0.0;
 
     /* NO SILENT FALSE.  Every refusal below this line names itself, and so
      * does this one: an argument that is missing is a wiring fault in the
@@ -3299,7 +3320,7 @@ int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
     const bool capture_ok =
         n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
         (uint64_t)s->pos + n_tokens <= DS4_N_INDEXER_TOP_K &&
-        !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
+        !qw_hb_time_on() && !qw_env_off("DS4_QWEN4EXP_TIME_SLICES") &&
         ds4_gpu_decode_graphs_supported();
     ds4_decode_graph_key key;
     int graph_state = -1;

@@ -1508,10 +1508,7 @@ mod ds4 {
                 let frontier = self.frontier();
                 produced += committed.len() as i64;
                 pending = frontier;
-                rounds.push(crate::ds4_backend::SpecRound {
-                    committed,
-                    frontier,
-                });
+                rounds.push(crate::ds4_backend::SpecRound { committed, frontier });
             }
             Some(Ok(rounds))
         }
@@ -1707,8 +1704,7 @@ mod ds4 {
         };
         let per_cycle = Arc::new(Mutex::new(script()));
         let mut a = engine(&per_cycle);
-        a.free_decode_begin(&[1, 2, 3], Route::Mtp, Some(1))
-            .unwrap();
+        a.free_decode_begin(&[1, 2, 3], Route::Mtp, Some(1)).unwrap();
         let ra = a.free_decode_run(9).unwrap();
 
         let batched = Arc::new(Mutex::new(Scripted {
@@ -1716,8 +1712,7 @@ mod ds4 {
             ..script()
         }));
         let mut b = engine(&batched);
-        b.free_decode_begin(&[1, 2, 3], Route::Mtp, Some(1))
-            .unwrap();
+        b.free_decode_begin(&[1, 2, 3], Route::Mtp, Some(1)).unwrap();
         let rb = b.free_decode_run(9).unwrap();
 
         assert_eq!(ra.tokens, rb.tokens);
@@ -2243,11 +2238,7 @@ mod resident {
                 },
             ]
         );
-        assert_eq!(
-            session.argmax(),
-            43,
-            "the run's frontier comes back with it"
-        );
+        assert_eq!(session.argmax(), 43, "the run's frontier comes back with it");
         drop(session);
         let seen = server.finish();
         let ops: Vec<&str> = seen.iter().map(|r| r["op"].as_str().unwrap()).collect();
