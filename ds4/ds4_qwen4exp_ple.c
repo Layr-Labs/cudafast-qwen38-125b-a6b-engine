@@ -18,6 +18,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 /* =========================================================================
  * Errors.
  * ========================================================================= */
@@ -776,10 +780,45 @@ void ds4_ple_dequant_iq4_nl(const void *__restrict blocks, size_t block_count,
         if (b + 1u < block_count)
             __builtin_prefetch(y + DS4_PLE_IQ4_NL_BLOCK_ELEMS, 1, 3);
 
+#if defined(__aarch64__)
+        /* The IQ4_NL code book is exactly sixteen int8 entries, which is the
+         * operand shape vqtbl1q_s8 takes, so a whole block's nibbles resolve
+         * in two table instructions instead of thirty-two dependent byte
+         * loads, and the thirty-two scalar stores become eight vector stores
+         * on the loop the comment above calls store-bound.
+         *
+         * Bit-identical to the scalar form below, by construction and by
+         * exhaustive check: the table lookup returns the same code book entry
+         * for every one of the 256 possible nibble bytes in every lane, the
+         * int8 -> int16 -> int32 -> float32 widening is exact for every int8,
+         * and each element is still the single-precision product of the same
+         * two values. No element is combined with any other, so there is no
+         * summation order to change. */
+        {
+            const int8x16_t kvv = vld1q_s8(kv);
+            const uint8x16_t qv = vld1q_u8(qs);
+            const int8x16_t lo =
+                vqtbl1q_s8(kvv, vandq_u8(qv, vdupq_n_u8(0x0Fu)));
+            const int8x16_t hi = vqtbl1q_s8(kvv, vshrq_n_u8(qv, 4));
+            const int16x8_t l0 = vmovl_s8(vget_low_s8(lo));
+            const int16x8_t l1 = vmovl_high_s8(lo);
+            const int16x8_t h0 = vmovl_s8(vget_low_s8(hi));
+            const int16x8_t h1 = vmovl_high_s8(hi);
+            vst1q_f32(y +  0, vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(l0))), d));
+            vst1q_f32(y +  4, vmulq_n_f32(vcvtq_f32_s32(vmovl_high_s16(l0)), d));
+            vst1q_f32(y +  8, vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(l1))), d));
+            vst1q_f32(y + 12, vmulq_n_f32(vcvtq_f32_s32(vmovl_high_s16(l1)), d));
+            vst1q_f32(y + 16, vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(h0))), d));
+            vst1q_f32(y + 20, vmulq_n_f32(vcvtq_f32_s32(vmovl_high_s16(h0)), d));
+            vst1q_f32(y + 24, vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(h1))), d));
+            vst1q_f32(y + 28, vmulq_n_f32(vcvtq_f32_s32(vmovl_high_s16(h1)), d));
+        }
+#else
         for (int j = 0; j < DS4_PLE_IQ4_NL_BLOCK_ELEMS / 2; j++) {
             y[j]      = d * (float)kv[qs[j] & 0x0F];
             y[j + 16] = d * (float)ple_kvalues_iq4nl_hi[qs[j]];
         }
+#endif
         p += DS4_PLE_IQ4_NL_BLOCK_BYTES;
     }
 }
