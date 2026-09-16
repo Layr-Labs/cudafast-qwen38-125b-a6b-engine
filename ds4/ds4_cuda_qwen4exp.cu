@@ -10864,6 +10864,62 @@ __global__ static void qwen4exp_qsa_indexer_scores_kernel(
     }
 
     const float *k = pool + (uint64_t)block * head_dim;
+
+    /* Warp-per-head fast path for the decode and verify widths.
+     *
+     * At head_dim 128 the block is 128 threads -- four warps -- and the loop
+     * below runs n_head serial iterations that each pay a full block-wide
+     * reduction: two shared-memory halving steps under __syncthreads, a warp
+     * shuffle tree, and two more barriers, about four __syncthreads per head.
+     * The heads are independent dots over the SAME pool row, so the block can
+     * instead give each warp one head and hold the whole reduction in
+     * registers.
+     *
+     * THE ARITHMETIC IS THE SERIAL PATH'S, BIT FOR BIT.  With nth == head_dim
+     * the serial loop gives thread `l` exactly one product, q[l]*k[l], and
+     * qwen4exp_blk_sum then pairs sdata[l] with sdata[l+64], the result with
+     * sdata[l+32]'s pair, and finishes with the shuffle tree at 16..1.  Lane
+     * `l` of a warp loads k[l + 32*j] into kr[j] and forms r[j] =
+     * q[l + 32*j] * k[l + 32*j], so sdata[l]'s tree is (r0 + r2) + (r1 + r3)
+     * followed by the identical __shfl_down_sync tail.  __fmul_rn/__fadd_rn
+     * keep the compiler from contracting a product into an add, matching the
+     * serial path's separate multiply and shared-memory adds.  Lane 0 of each
+     * warp writes the head's dot to shared[h]; after one barrier every thread
+     * re-forms `total` in ascending head order with the same fmaxf and the
+     * same division, exactly as the serial epilogue does on all threads.
+     *
+     * Sixteen barriers become one, and the four dependent block reductions
+     * become four independent warp reductions that run concurrently.  The
+     * pool row is read once per warp instead of once per head-pass; the extra
+     * reads hit L1.  n_head <= nth is the only shape requirement beyond the
+     * width, since shared[] is nth floats. */
+    if (head_dim == 128u && nth == 128u && n_head <= nth) {
+        const uint32_t lane = tid & 31u;
+        const uint32_t w = tid >> 5;
+        float kr[4];
+#pragma unroll
+        for (uint32_t j = 0; j < 4u; j++) kr[j] = k[lane + 32u * j];
+        for (uint32_t h = w; h < n_head; h += 4u) {
+            const float *qh = q + ((uint64_t)token * n_head + h) * head_dim;
+            float r[4];
+#pragma unroll
+            for (uint32_t j = 0; j < 4u; j++)
+                r[j] = __fmul_rn(qh[lane + 32u * j], kr[j]);
+            float v = __fadd_rn(__fadd_rn(r[0], r[2]),
+                                __fadd_rn(r[1], r[3]));
+#pragma unroll
+            for (uint32_t step = 16u; step > 0u; step >>= 1)
+                v = __fadd_rn(v, __shfl_down_sync(0xffffffffu, v, step));
+            if (lane == 0u) qwen4exp_score_shared[h] = v;
+        }
+        __syncthreads();
+        float total = 0.0f;
+        for (uint32_t h = 0; h < n_head; h++)
+            total += fmaxf(qwen4exp_score_shared[h], 0.0f);
+        if (tid == 0u) *dst = total / norm_divisor;
+        return;
+    }
+
     float total = 0.0f;
     for (uint32_t h = 0; h < n_head; h++) {
         const float *qh = q + ((uint64_t)token * n_head + h) * head_dim;
