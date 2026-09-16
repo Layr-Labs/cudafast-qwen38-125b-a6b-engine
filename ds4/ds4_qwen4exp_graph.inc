@@ -1299,6 +1299,29 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 s->ple_history_rows[t] = s->ple_history;
             }
         }
+        /* Resolve original table views ahead of the ordered decoder.  This
+         * hint path owns no state and never reports an error early: a bad row
+         * still refuses only after preceding output rows have been written. */
+        const uint8_t *prefetched_rows[32];
+        const bool prefetch_rows = n_tokens >= 1u && n_tokens <= 2u &&
+            DS4_N_PLE_HEAD == 16u && DS4_N_PLE_ROW_DIM == 160u &&
+            w->ple.row_bytes == 90u && w->ple.base &&
+            w->ple.rows <= UINT64_MAX / 90u &&
+            w->ple.bytes >= w->ple.rows * 90u &&
+            w->ple.bytes <= UINTPTR_MAX - (uintptr_t)w->ple.base &&
+            !getenv("DS4_QWEN4EXP_NO_PLE_ROW_PREFETCH");
+        if (prefetch_rows) {
+            memset(prefetched_rows, 0, sizeof(prefetched_rows));
+            for (uint32_t i = 0; i < n_tokens * 16u; i++) {
+                const uint8_t *q = ds4_qwen4exp_ple_row(&w->ple, s->ple_ids[i]);
+                if (!q) break;
+                prefetched_rows[i] = q;
+                /* All addresses stay inside the original 90-byte row. */
+                __builtin_prefetch(q, 0, 1);
+                __builtin_prefetch(q + 64u, 0, 1);
+                __builtin_prefetch(q + 89u, 0, 1);
+            }
+        }
         for (uint32_t t = 0; t < n_tokens; t++) {
             /* The head's destination strides are constants of the shape, so
              * the token base is hoisted out of the head loop and the head
@@ -1312,7 +1335,9 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                  * another table row, so ask for the next id early.  Hint. */
                 if (h + 1u < DS4_N_PLE_HEAD)
                     __builtin_prefetch(ids + h + 1u, 0, 1);
-                const uint8_t *quant = ds4_qwen4exp_ple_row(&w->ple, row);
+                const uint8_t *quant = prefetch_rows
+                    ? prefetched_rows[t * 16u + h]
+                    : ds4_qwen4exp_ple_row(&w->ple, row);
                 /* Cold: a hashed row past the table is a hard refusal that has
                  * never fired in a scored run, so keep it out of the hot path. */
                 if (__builtin_expect(!quant, 0)) {
