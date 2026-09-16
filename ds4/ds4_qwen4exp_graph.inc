@@ -3467,9 +3467,30 @@ int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
         memset(&key, 0, sizeof(key));
         key.il = il;
         key.island = 3u;
+        /* THE HEAD'S IDENTITY IS ITS WIDTH, AND NOTHING ELSE.
+         *
+         * The variant word folds the width, the snapshot count, the recurrent
+         * buffer parity and the replay-active flag.  The last two belong to the
+         * TOWER: `gdn_replay_active` is read only inside the gated-deltanet
+         * encode, and the parity exists because the settle swaps the state and
+         * checkpoint pointers, so a tower graph really does bake a different
+         * buffer per parity.  The head block reads neither.  It refuses any
+         * layer that is not full attention, so it never touches a recurrent
+         * buffer at all, and its encode is the residual mixer, the query-scaled
+         * attention, the inject, the feed-forward mixer and the routed experts
+         * -- none of which see the replay state.
+         *
+         * So the captures for (width, parity 0, active) and (width, parity 1,
+         * active) are byte-identical graphs filed under different keys, and
+         * carrying the two tower fields multiplies this row's identity space by
+         * four for nothing: eight identities where two, one per draft width,
+         * are the whole space.  The lookup is a linear scan with no eviction,
+         * so a row that fills drops its island onto the eager path for the rest
+         * of the process, and every identity first seen inside the timed window
+         * pays a capture there.  Passing the tower fields as zero is the same
+         * set of graphs, keyed by what actually distinguishes them. */
         key.variant = ds4_qwen4exp_gdn_graph_variant(
-            n_tokens, s->spec_snapshot_rows, s->gdn_replay_phase,
-            s->gdn_replay_active);
+            n_tokens, s->spec_snapshot_rows, 0u, false);
         key._pad = 0x4d545048u;
         key.cur_hc = hyper;
         key.after_attn_hc = s;
