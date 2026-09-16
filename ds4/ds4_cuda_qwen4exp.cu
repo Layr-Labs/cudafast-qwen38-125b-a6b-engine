@@ -1654,6 +1654,29 @@ static float *qwen4exp_conv_scratch(int tier, uint64_t elements) {
 /* Snapshot slots a lazy-rollback flag may name: DS4_QWEN4EXP_IMPLEMENTED_DEPTH
  * (ds4_qwen4exp_mtp.h, which this unit does not include), the count the graph
  * allocates and the bound its select applies. */
+/* WHICH MAKES IT A MIRROR, AND MIRRORS HAVE TO MOVE TOGETHER.  Six is not this
+ * unit's own choice of depth; it is a hand copy of a number that lives in a
+ * header this unit does not include, and nothing in the build checks the copy.
+ * The two halves fail differently, and neither failure is loud:
+ *
+ *   this constant alone   the validation below sizes the caller's snapshot
+ *                         buffers as QWEN4EXP_GDN_ADOPT_SLOTS * conv_elements
+ *                         and * state_elements, but the session allocated them
+ *                         as conv_bytes and state_bytes times
+ *                         DS4_QWEN4EXP_IMPLEMENTED_DEPTH
+ *                         (ds4_qwen4exp_graph.inc).  The buffers are then too
+ *                         small for the bound, glm53_cuda_tensor_has fails,
+ *                         the run prints "cannot adopt over %u rows without
+ *                         snapshot buffers for every slot" and returns 0 --
+ *                         the adopt path is simply gone.
+ *
+ *   the depth alone       the check passes, because the buffers only grew, and
+ *                         this constant silently becomes a stale bound sitting
+ *                         below the slots a rollback flag may now name.
+ *
+ * MEASURED on the first of the two.  Treat a change to either number as a
+ * change to both; this is a seam between two translation units, not a pair of
+ * independent tunables. */
 #define QWEN4EXP_GDN_ADOPT_SLOTS 6u
 
 /* Defined beside the Q8_0 quantize seam it shares with the HC mixer. */
