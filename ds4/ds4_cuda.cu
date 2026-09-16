@@ -1088,6 +1088,23 @@ extern "C" int ds4_gpu_qwen4exp_update_dpos(
     return cuda_ok(cudaGetLastError(), "qwen4exp position update launch");
 }
 
+/* The lookup -- and the reason the slot count above is a trade rather than a
+ * free win.  This is a linear scan.  Every call walks the (layer, island) row
+ * from v = 0 and runs a 48-byte memcmp against each occupied slot before it
+ * can conclude anything, so the row's WIDTH is host work paid on every hit and
+ * every miss, by every layer and island, on every decoded token; a hit on the
+ * last slot costs the whole row.  There is no hash and no move-to-front, and
+ * the first empty slot is only remembered on the way past, to be claimed if
+ * nothing matched.
+ *
+ * That is what stops the no-eviction failure described above -- an island
+ * dropping onto the eager path permanently and silently -- from being bought
+ * off by simply widening the row.  Widening does remove the failure, which is
+ * why eight is worth four, but each extra slot is another 48-byte comparison
+ * in the hot path, so the remedy does not scale: past the point where the row
+ * actually holds the identities a run reaches, further slots buy nothing and
+ * are still scanned.  Size this to the identities the run reaches, not to a
+ * comfortable margin. */
 static cuda_decode_graph_entry *cuda_decode_graph_find(
         const ds4_decode_graph_key *key) {
     if (key->il >= CUDA_DECODE_GRAPH_LAYERS ||
