@@ -16266,6 +16266,118 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
     return cuda_ok(cudaGetLastError(), "indexer topk launch");
 }
 
+/* One-block fused frontier top-k + logsumexp over a vocab row.
+ *
+ * Phase 1 runs `top_k` rounds of a block-wide argmax: every thread scans a
+ * strided slice keeping the best (value, id) under the host comparator
+ * (value desc, id asc), warp shuffles fold the slice, warp leaders publish
+ * to shared memory and warp 0 folds those.  A candidate already selected in
+ * an earlier round is skipped, so round r emits the row's r-th element in
+ * exactly the order the host insertion scan produces.  Non-finite entries
+ * never compete, matching the host's isfinite skip; a round that finds no
+ * finite candidate leaves the slot at UINT32_MAX, which the host maps to
+ * its default -1/-inf entry.
+ *
+ * Phase 2 reuses the same strided scan to accumulate expf(v - maxv) in
+ * double, where maxv is the largest FINITE logit -- the same max the host
+ * scan computes, so a +inf logit cannot poison the sum.  The host finishes
+ * with maxv + log(sum).
+ *
+ * aux_out[0] = sum, aux_out[1] = (double)maxv.  One launch, and the host
+ * reads ids, values and aux in three small copies instead of the vocab row. */
+__global__ static void frontier_topk_lse_kernel(
+        uint32_t     *ids_out,
+        float        *vals_out,
+        double       *aux_out,
+        const float  *scores,
+        uint32_t      n_comp,
+        uint32_t      top_k) {
+    __shared__ float    sel_vals[8];
+    __shared__ uint32_t sel_ids[8];
+    __shared__ float    warp_vals[32];
+    __shared__ uint32_t warp_ids[32];
+    __shared__ double   warp_sums[32];
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5;
+
+    for (uint32_t r = 0; r < top_k && r < 8u; r++) {
+        float    bv = -INFINITY;
+        uint32_t bi = 0xffffffffu;
+        for (uint32_t i = threadIdx.x; i < n_comp; i += blockDim.x) {
+            const float v = scores[i];
+            if (!isfinite(v)) continue;
+            bool taken = false;
+            for (uint32_t j = 0; j < r; j++) taken |= (sel_ids[j] == i);
+            if (taken) continue;
+            if (v > bv || (v == bv && i < bi)) { bv = v; bi = i; }
+        }
+        for (int off = 16; off > 0; off >>= 1) {
+            const float    ov = __shfl_down_sync(0xffffffffu, bv, off);
+            const uint32_t oi = __shfl_down_sync(0xffffffffu, bi, off);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        if (lane == 0) { warp_vals[warp] = bv; warp_ids[warp] = bi; }
+        __syncthreads();
+        if (warp == 0) {
+            const uint32_t n_warps = blockDim.x >> 5;
+            float    wv = lane < n_warps ? warp_vals[lane] : -INFINITY;
+            uint32_t wi = lane < n_warps ? warp_ids[lane] : 0xffffffffu;
+            for (int off = 16; off > 0; off >>= 1) {
+                const float    ov = __shfl_down_sync(0xffffffffu, wv, off);
+                const uint32_t oi = __shfl_down_sync(0xffffffffu, wi, off);
+                if (ov > wv || (ov == wv && oi < wi)) { wv = ov; wi = oi; }
+            }
+            if (lane == 0) { sel_vals[r] = wv; sel_ids[r] = wi; }
+        }
+        __syncthreads();
+    }
+
+    const float maxv = sel_vals[0];
+    double acc = 0.0;
+    for (uint32_t i = threadIdx.x; i < n_comp; i += blockDim.x) {
+        const float v = scores[i];
+        if (isfinite(v)) acc += (double)expf(v - maxv);
+    }
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    if (lane == 0) warp_sums[warp] = acc;
+    __syncthreads();
+    if (warp == 0) {
+        const uint32_t n_warps = blockDim.x >> 5;
+        double w = lane < n_warps ? warp_sums[lane] : 0.0;
+        for (int off = 16; off > 0; off >>= 1)
+            w += __shfl_down_sync(0xffffffffu, w, off);
+        if (lane == 0) { aux_out[0] = w; aux_out[1] = (double)maxv; }
+    }
+    if (threadIdx.x < top_k && threadIdx.x < 8u) {
+        ids_out[threadIdx.x]  = sel_ids[threadIdx.x];
+        vals_out[threadIdx.x] = sel_vals[threadIdx.x];
+    }
+}
+
+extern "C" int ds4_gpu_topk_logsumexp_tensor(
+        ds4_gpu_tensor       *ids_out,
+        ds4_gpu_tensor       *vals_out,
+        ds4_gpu_tensor       *aux_out,
+        const ds4_gpu_tensor *scores,
+        uint32_t                n_comp,
+        uint32_t                top_k) {
+    if (!ids_out || !vals_out || !aux_out || !scores || n_comp == 0 ||
+        top_k == 0 || top_k > 8u ||
+        scores->bytes  < (uint64_t)n_comp * sizeof(float) ||
+        ids_out->bytes  < (uint64_t)top_k * sizeof(uint32_t) ||
+        vals_out->bytes < (uint64_t)top_k * sizeof(float) ||
+        aux_out->bytes  < 2u * sizeof(double)) {
+        return 0;
+    }
+    frontier_topk_lse_kernel<<<1, 1024>>>((uint32_t *)ids_out->ptr,
+                                        (float *)vals_out->ptr,
+                                        (double *)aux_out->ptr,
+                                        (const float *)scores->ptr,
+                                        n_comp, top_k);
+    return cuda_ok(cudaGetLastError(), "frontier topk logsumexp launch");
+}
+
 extern "C" int ds4_gpu_indexer_top1_value_tensor(
         ds4_gpu_tensor       *selected,
         ds4_gpu_tensor       *values,

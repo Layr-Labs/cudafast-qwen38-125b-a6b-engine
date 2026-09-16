@@ -547,6 +547,21 @@ int ds4_gpu_indexer_topk_tensor(
         uint32_t                n_tokens,
         uint32_t                top_k);
 
+/* Fused frontier top-k + logsumexp over one row of `scores`.  `ids_out` and
+ * `vals_out` receive the top_k (id, logit) pairs in (logit desc, id asc)
+ * order -- the host scan's comparator -- with unfilled slots left at
+ * UINT32_MAX/-inf.  `aux_out` receives the double sum of exp(v - maxv) over
+ * the finite entries and the finite max itself; the host adds
+ * maxv + log(sum) to finish the logsumexp.  One launch, three small
+ * readbacks, no vocab-wide copy. */
+int ds4_gpu_topk_logsumexp_tensor(
+        ds4_gpu_tensor       *ids_out,
+        ds4_gpu_tensor       *vals_out,
+        ds4_gpu_tensor       *aux_out,
+        const ds4_gpu_tensor *scores,
+        uint32_t                n_comp,
+        uint32_t                top_k);
+
 /* =========================================================================
  * Qwen4-Exp (Qwen 3.8 Flash-Next) QSA block.
  *
