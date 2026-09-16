@@ -8928,6 +8928,14 @@ __device__ __forceinline__ static float qwen4exp_block_sum_f32(
  * accumulator.  It has to DIVIDE the walk: 2560 over a block of 256 is ten
  * steps, so a depth above ten leaves everything to the one-at-a-time tail.
  * Ten IS the walk; eight left two serial trips behind the batch. */
+/* NOT A FREE KNOB, and the reason is numerical rather than structural. The
+ * depth sets how many elements a thread stages before it consumes them, and the
+ * consumption is a SUM OF SQUARES -- so the depth also sets the order of that
+ * summation. Halving it to five (the only other depth that divides the walk
+ * exactly) builds clean, launches clean, and fails the ranked correctness gate,
+ * because a reordered sum rounds differently and a near-tie argmax moves. Any
+ * constant that sets the depth, width or order of a floating-point accumulation
+ * belongs in that category, not in the tile-tuning one. */
 #define QWEN4EXP_RMS_STEPS 10u
 
 /* One block per (group, row), so a hyper-connection norm of four streams is
