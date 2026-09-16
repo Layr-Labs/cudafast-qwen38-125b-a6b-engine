@@ -4,6 +4,7 @@
 #include <mma.h>
 #include <cublas_v2.h>
 #include <cub/block/block_radix_sort.cuh>
+#include <cub/block/block_scan.cuh>
 #include <cub/device/device_radix_sort.cuh>
 
 #include <stdint.h>
@@ -17402,13 +17403,14 @@ extern "C" void ds4_gpu_set_q8_mma_pipe_wide(int mode) {
  * per-SM shared memory size, so 101376 means a 100 KiB SM and 227328 means a
  * 228 KiB SM -- which is exactly the fork every occupancy argument about the
  * staged decode kernels turns on. */
+static const char *mtp_partial_tune(void);
 extern "C" const char *ds4_gpu_hw_limits(void) {
     /* Sized for the device attributes plus the routed-MoE kernel-limits string,
      * which now carries the two prefill tiles as well.  Oversized on purpose:
      * ds4_resident drops the WHOLE limits string rather than truncating it if it
      * does not fit its own ident buffer, so a tight fit here loses the
      * measurement silently. */
-    static char buf[448];
+    static char buf[576];
     static int built = 0;
     if (built) return buf;
     built = 1;
@@ -17441,6 +17443,10 @@ extern "C" const char *ds4_gpu_hw_limits(void) {
     /* The register/shared footprint of the two routed-MoE decode kernels, from
      * the translation unit that owns them.  Truncation is harmless: the string
      * is diagnostic only and snprintf keeps it terminated. */
+    const char *tune = mtp_partial_tune();
+    if (tune && tune[0] && (size_t)n + 2u < sizeof(buf))
+        snprintf(buf+n,sizeof(buf)-(size_t)n," %s",tune);
+    n=(int)strlen(buf);
     const char *kl = ds4_gpu_qwen4exp_kernel_limits();
     if (kl && kl[0] && (size_t)n + 2u < sizeof(buf)) {
         snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", kl);
