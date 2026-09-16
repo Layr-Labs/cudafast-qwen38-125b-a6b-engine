@@ -254,38 +254,65 @@ static inline int ds4_tensor_device_idx(const ds4_gpu_tensor *t) {
     return d;
 }
 
+/* ------------------------------------------------------------------------
+ * One-time resolution of the CUDA dispatch switches.
+ *
+ * These switches are read with getenv() inside per-call dispatch, not only at
+ * init.  An interposed counter over one 1024-token prefill plus 64 decode
+ * tokens recorded 16,312 getenv calls across 263 distinct names, and the
+ * hottest live here: DS4_CUDA_WEIGHT_CACHE_VERBOSE at 1,638 calls,
+ * DS4_CUDA_KEEP_MODEL_PAGES at 1,292, DS4_CUDA_NO_Q8_DP4A at 773.  glibc's
+ * getenv is a linear scan of environ with a comparison per entry and it
+ * returns the same answer every time: nothing in this engine or its adapter
+ * calls setenv/putenv for a DS4_CUDA_* name, so the answer cannot change
+ * while the engine is open.
+ *
+ * Each site keeps its own function-local cache, constant-initialised to -1 so
+ * there is no thread-safe-static guard to pay.  The value is idempotent, so a
+ * race between two threads could only write the same answer twice.
+ *
+ * Host work only: the same kernel is selected with the same arguments in the
+ * same order, so every emitted value is bit-identical.
+ * ------------------------------------------------------------------------ */
+#define DS4C_ENV_UNSET(name) ([]() -> bool {                                   \
+        static int ds4c_env_cached = -1;                                       \
+        if (ds4c_env_cached < 0) ds4c_env_cached = (getenv(name) == NULL) ? 1 : 0; \
+        return ds4c_env_cached != 0;                                           \
+    }())
+
+
 /* Debug/override flags are read once per CUDA init. The hot decode path calls
  * the xdev helpers many times per token, so they must not re-enter getenv(). */
 static void cuda_xdev_env_refresh(void) {
-    g_xdev_sync_debug = getenv("DS4_CUDA_SYNC_XDEV") != NULL;
-    g_xdev_force_cuda_peer = getenv("DS4_FORCE_CUDA_PEER") != NULL;
-    g_xdev_force_host_bounce = getenv("DS4_FORCE_HOST_BOUNCE") != NULL;
+    g_xdev_sync_debug = (!DS4C_ENV_UNSET("DS4_CUDA_SYNC_XDEV"));
+    g_xdev_force_cuda_peer = (!DS4C_ENV_UNSET("DS4_FORCE_CUDA_PEER"));
+    g_xdev_force_host_bounce = (!DS4C_ENV_UNSET("DS4_FORCE_HOST_BOUNCE"));
 }
 
 static void cuda_decode_dispatch_env_refresh(void) {
-    g_cuda_disable_qkv_rms_fused = getenv("DS4_CUDA_DISABLE_QKV_RMS_FUSED") != NULL;
-    g_cuda_no_window_attention = getenv("DS4_CUDA_NO_WINDOW_ATTENTION") != NULL;
-    g_cuda_decode_heads8_online = getenv("DS4_CUDA_DECODE_HEADS8_ONLINE") != NULL;
-    g_cuda_decode_score4 = getenv("DS4_CUDA_DECODE_SCORE4") != NULL;
-    g_cuda_decode_score8 = getenv("DS4_CUDA_DECODE_SCORE8") != NULL;
-    g_cuda_no_decode_value512 = getenv("DS4_CUDA_NO_DECODE_VALUE512") != NULL;
-    g_cuda_no_top1 = getenv("DS4_CUDA_NO_TOP1") != NULL;
-    g_cuda_end_stream_sync = getenv("DS4_CUDA_END_STREAM_SYNC") != NULL;
-    g_cuda_no_setdevice_cache = getenv("DS4_CUDA_NO_SETDEVICE_CACHE") != NULL;
+    g_cuda_disable_qkv_rms_fused = (!DS4C_ENV_UNSET("DS4_CUDA_DISABLE_QKV_RMS_FUSED"));
+    g_cuda_no_window_attention = (!DS4C_ENV_UNSET("DS4_CUDA_NO_WINDOW_ATTENTION"));
+    g_cuda_decode_heads8_online = (!DS4C_ENV_UNSET("DS4_CUDA_DECODE_HEADS8_ONLINE"));
+    g_cuda_decode_score4 = (!DS4C_ENV_UNSET("DS4_CUDA_DECODE_SCORE4"));
+    g_cuda_decode_score8 = (!DS4C_ENV_UNSET("DS4_CUDA_DECODE_SCORE8"));
+    g_cuda_no_decode_value512 = (!DS4C_ENV_UNSET("DS4_CUDA_NO_DECODE_VALUE512"));
+    g_cuda_no_top1 = (!DS4C_ENV_UNSET("DS4_CUDA_NO_TOP1"));
+    g_cuda_end_stream_sync = (!DS4C_ENV_UNSET("DS4_CUDA_END_STREAM_SYNC"));
+    g_cuda_no_setdevice_cache = (!DS4C_ENV_UNSET("DS4_CUDA_NO_SETDEVICE_CACHE"));
     g_cuda_exact_score_split_graph =
-        getenv("DS4_CUDA_EXACT_SCORE_SPLIT_GRAPH") != NULL;
+        (!DS4C_ENV_UNSET("DS4_CUDA_EXACT_SCORE_SPLIT_GRAPH"));
     g_cuda_exact_score_split_ldg =
-        getenv("DS4_CUDA_EXACT_SCORE_SPLIT_LDG") != NULL;
+        (!DS4C_ENV_UNSET("DS4_CUDA_EXACT_SCORE_SPLIT_LDG"));
     g_cuda_exact_score_split_vec4 =
-        getenv("DS4_CUDA_EXACT_SCORE_SPLIT_VEC4") != NULL;
+        (!DS4C_ENV_UNSET("DS4_CUDA_EXACT_SCORE_SPLIT_VEC4"));
     g_cuda_exact_score_split_vec4_plain =
-        getenv("DS4_CUDA_EXACT_SCORE_SPLIT_VEC4_PLAIN") != NULL;
+        (!DS4C_ENV_UNSET("DS4_CUDA_EXACT_SCORE_SPLIT_VEC4_PLAIN"));
     g_cuda_exact_score_split_dim2 =
-        getenv("DS4_CUDA_EXACT_SCORE_SPLIT_DIM2") != NULL &&
-        getenv("DS4_CUDA_NO_EXACT_SCORE_SPLIT_DIM2") == NULL;
+        (!DS4C_ENV_UNSET("DS4_CUDA_EXACT_SCORE_SPLIT_DIM2")) &&
+        DS4C_ENV_UNSET("DS4_CUDA_NO_EXACT_SCORE_SPLIT_DIM2");
     g_cuda_exact_score_split_fuse_inv_rope =
-        getenv("DS4_CUDA_EXACT_SCORE_SPLIT_FUSE_INV_ROPE") != NULL;
-    g_cuda_moe_decode_graph = getenv("DS4_CUDA_MOE_DECODE_GRAPH") != NULL;
+        (!DS4C_ENV_UNSET("DS4_CUDA_EXACT_SCORE_SPLIT_FUSE_INV_ROPE"));
+    g_cuda_moe_decode_graph = (!DS4C_ENV_UNSET("DS4_CUDA_MOE_DECODE_GRAPH"));
 }
 
 /* WITH_DEVICE(d) { ... } scope macro.
@@ -511,7 +538,7 @@ static const char *cuda_derived_weight_ptr(
         uint64_t out_dim,
         uint32_t group_count,
         uint64_t bytes) {
-    if (getenv("DS4_CUDA_NO_DERIVED_WEIGHTS") != NULL) return NULL;
+    if ((!DS4C_ENV_UNSET("DS4_CUDA_NO_DERIVED_WEIGHTS"))) return NULL;
     for (const cuda_derived_range &r : g_derived_ranges) {
         if (r.host_base == model_map &&
             r.source_offset == source_offset &&
@@ -776,8 +803,8 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
         return cuda_model_ptr(model_map, offset);
     }
     if (model_map == g_model_host_base && g_model_hmm_direct &&
-        getenv("DS4_CUDA_WEIGHT_CACHE") == NULL &&
-        getenv("DS4_CUDA_WEIGHT_PRELOAD") == NULL) {
+        DS4C_ENV_UNSET("DS4_CUDA_WEIGHT_CACHE") &&
+        DS4C_ENV_UNSET("DS4_CUDA_WEIGHT_PRELOAD")) {
         return cuda_model_ptr(model_map, offset);
     }
     const char *direct_env = getenv("DS4_CUDA_DIRECT_MODEL");
@@ -785,7 +812,7 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
         return cuda_model_ptr(model_map, offset);
     }
 
-    if (getenv("DS4_CUDA_NO_FD_CACHE") == NULL) {
+    if (DS4C_ENV_UNSET("DS4_CUDA_NO_FD_CACHE")) {
         const char *fd_ptr = cuda_model_range_ptr_from_fd(model_map, offset, bytes, what);
         if (fd_ptr) {
             cuda_range_trace(what, offset, "FD cache (device allocation)");
@@ -1207,7 +1234,7 @@ extern "C" int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) {
         (void)cudaGraphUpload(exec, g_decode_graph_stream);
         (void)cudaGetLastError();
     }
-    if (getenv("DS4_CUDA_DECODE_GRAPH_LOG") != NULL) {
+    if ((!DS4C_ENV_UNSET("DS4_CUDA_DECODE_GRAPH_LOG"))) {
         fprintf(stderr, "ds4: decode graph captured il=%u island=%u (total %llu)\n",
                 key->il, key->island,
                 (unsigned long long)g_decode_graph_captures);
@@ -1275,7 +1302,7 @@ static int cuda_use_mxfp4_mmq(void) {
             fprintf(stderr,
                     "ds4: DS4_CUDA_MMQ=0 - MXFP4 MMQ disabled\n");
         } else if (g_n_gpus > 1 &&
-                   getenv("DS4_CUDA_MMQ_Q81_PERSISTENT") != NULL) {
+                   (!DS4C_ENV_UNSET("DS4_CUDA_MMQ_Q81_PERSISTENT"))) {
             fprintf(stderr,
                     "ds4: persistent MMQ Q8_1 scratch is unavailable with multi-GPU MXFP4\n");
         } else {
@@ -1610,7 +1637,7 @@ static void cuda_q8_f16_cache_budget_notice(
         uint64_t total_bytes,
         uint64_t reserve_bytes,
         uint64_t limit_bytes) {
-    if (g_q8_f16_budget_notice_printed && getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE") == NULL) return;
+    if (g_q8_f16_budget_notice_printed && DS4C_ENV_UNSET("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) return;
     g_q8_f16_budget_notice_printed = 1;
     if (limit_bytes != UINT64_MAX && free_bytes == 0 && total_bytes == 0 && reserve_bytes == 0) {
         fprintf(stderr,
@@ -1697,18 +1724,18 @@ static int cuda_q8_f16_cache_allowed(const char *label, uint64_t in_dim, uint64_
     if (g_quality_mode) return 0;
     if (g_q8_cache_suppressed) return 0;
     if (g_q8_f16_disabled_after_oom) return 0;
-    if (getenv("DS4_CUDA_NO_Q8_F16_CACHE") != NULL) return 0;
+    if ((!DS4C_ENV_UNSET("DS4_CUDA_NO_Q8_F16_CACHE"))) return 0;
     if (cuda_q8_f16_cache_limit_bytes() == 0) return 0;
-    if (getenv("DS4_CUDA_Q8_F16_ALL") != NULL) return 1;
+    if ((!DS4C_ENV_UNSET("DS4_CUDA_Q8_F16_ALL"))) return 1;
     if (!label) return 0;
     if (strstr(label, "attn_output_a") != NULL ||
         strstr(label, "attn_output_b") != NULL ||
         strstr(label, "attention_output_a") != NULL ||
         strstr(label, "attention_output_b") != NULL) {
-        return getenv("DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE") == NULL;
+        return DS4C_ENV_UNSET("DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE");
     }
     if (strstr(label, "attn_q_b") != NULL) {
-        return getenv("DS4_CUDA_NO_ATTN_Q_B_F16_CACHE") == NULL;
+        return DS4C_ENV_UNSET("DS4_CUDA_NO_ATTN_Q_B_F16_CACHE");
     }
     if (strstr(label, "ffn_gate_shexp") != NULL ||
         strstr(label, "ffn_up_shexp") != NULL ||
@@ -1719,7 +1746,7 @@ static int cuda_q8_f16_cache_allowed(const char *label, uint64_t in_dim, uint64_
            (in_dim == 2048u && out_dim == 4096u) ||
            (in_dim == 4096u && out_dim == 1024u) ||
            (in_dim == 4096u && out_dim == 512u) ||
-           (getenv("DS4_CUDA_NO_ATTN_Q_B_F16_CACHE") == NULL &&
+           (DS4C_ENV_UNSET("DS4_CUDA_NO_ATTN_Q_B_F16_CACHE") &&
             in_dim == 1024u && out_dim == 32768u);
 }
 
@@ -1734,7 +1761,7 @@ static int cuda_q8_label_is_attention_output(const char *label) {
 static int g_q8_dense_mma_enabled = 0;
 
 static int cuda_q8_use_dp4a(void) {
-    return getenv("DS4_CUDA_NO_Q8_DP4A") == NULL;
+    return DS4C_ENV_UNSET("DS4_CUDA_NO_Q8_DP4A");
 }
 
 static unsigned cuda_q8_exact_threads(uint64_t blocks) {
@@ -1745,8 +1772,8 @@ static unsigned cuda_q8_exact_threads(uint64_t blocks) {
 
 static int cuda_q8_f16_preload_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
     if (cuda_q8_label_is_attention_output(label) &&
-        getenv("DS4_CUDA_ATTENTION_OUTPUT_PRELOAD") == NULL &&
-        getenv("DS4_CUDA_Q8_F16_ALL") == NULL) {
+        DS4C_ENV_UNSET("DS4_CUDA_ATTENTION_OUTPUT_PRELOAD") &&
+        DS4C_ENV_UNSET("DS4_CUDA_Q8_F16_ALL")) {
         return 0;
     }
     return cuda_q8_f16_cache_allowed(label, in_dim, out_dim);
@@ -1754,12 +1781,12 @@ static int cuda_q8_f16_preload_allowed(const char *label, uint64_t in_dim, uint6
 
 static int cuda_q8_f32_cache_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
     if (g_q8_cache_suppressed) return 0;
-    if (getenv("DS4_CUDA_NO_Q8_F32_CACHE") != NULL) return 0;
-    if (getenv("DS4_CUDA_Q8_F32_ALL") != NULL) return 1;
+    if ((!DS4C_ENV_UNSET("DS4_CUDA_NO_Q8_F32_CACHE"))) return 0;
+    if ((!DS4C_ENV_UNSET("DS4_CUDA_Q8_F32_ALL"))) return 1;
     if (label && strstr(label, "attn_q_b") != NULL) {
-        return getenv("DS4_CUDA_ATTN_Q_B_F32_CACHE") != NULL;
+        return (!DS4C_ENV_UNSET("DS4_CUDA_ATTN_Q_B_F32_CACHE"));
     }
-    return getenv("DS4_CUDA_Q8_F32_LARGE") != NULL &&
+    return (!DS4C_ENV_UNSET("DS4_CUDA_Q8_F32_LARGE")) &&
            in_dim == 1024u && out_dim == 32768u;
 }
 
@@ -2009,7 +2036,7 @@ static double cuda_wall_sec(void) {
 }
 
 static int cuda_model_load_progress_enabled(void) {
-    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE") != NULL) return 0;
+    if ((!DS4C_ENV_UNSET("DS4_CUDA_WEIGHT_CACHE_VERBOSE"))) return 0;
     return 1;
 }
 
@@ -2060,10 +2087,10 @@ static void cuda_model_load_progress_note(uint64_t cached_bytes) {
 
 static int cuda_model_prefetch_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
     if (!model_map || map_size == 0 || map_offset > model_size || map_size > model_size - map_offset) return 0;
-    if (getenv("DS4_CUDA_NO_MODEL_PREFETCH") != NULL ||
-        getenv("DS4_CUDA_COPY_MODEL") != NULL ||
-        getenv("DS4_CUDA_WEIGHT_CACHE") != NULL ||
-        getenv("DS4_CUDA_WEIGHT_PRELOAD") != NULL) {
+    if ((!DS4C_ENV_UNSET("DS4_CUDA_NO_MODEL_PREFETCH")) ||
+        (!DS4C_ENV_UNSET("DS4_CUDA_COPY_MODEL")) ||
+        (!DS4C_ENV_UNSET("DS4_CUDA_WEIGHT_CACHE")) ||
+        (!DS4C_ENV_UNSET("DS4_CUDA_WEIGHT_PRELOAD"))) {
         return 0;
     }
 
@@ -2129,7 +2156,7 @@ static int cuda_model_prefetch_range(const void *model_map, uint64_t model_size,
         (void)cudaGetLastError();
         return 0;
     }
-    if (getenv("DS4_CUDA_MODEL_PREFETCH_SYNC") != NULL) {
+    if ((!DS4C_ENV_UNSET("DS4_CUDA_MODEL_PREFETCH_SYNC"))) {
         err = cudaStreamSynchronize(g_model_prefetch_stream);
         if (err != cudaSuccess) {
             fprintf(stderr, "ds4: CUDA model prefetch sync failed: %s\n", cudaGetErrorString(err));
@@ -2161,7 +2188,7 @@ static uint64_t cuda_model_copy_chunk_bytes(void) {
 
 static void cuda_model_discard_source_pages(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes) {
 #if defined(POSIX_MADV_DONTNEED)
-    if (getenv("DS4_CUDA_KEEP_MODEL_PAGES") != NULL || !model_map || bytes == 0 || offset > model_size) return;
+    if ((!DS4C_ENV_UNSET("DS4_CUDA_KEEP_MODEL_PAGES")) || !model_map || bytes == 0 || offset > model_size) return;
     if (bytes > model_size - offset) bytes = model_size - offset;
     const long page_sz_l = sysconf(_SC_PAGESIZE);
     const uint64_t page_sz = page_sz_l > 0 ? (uint64_t)page_sz_l : 4096u;
@@ -2182,7 +2209,7 @@ static void cuda_model_discard_source_pages(const void *model_map, uint64_t mode
  * split set has one fd per shard, so the fd is the caller's to name. */
 static void cuda_model_drop_file_pages(int fd, uint64_t offset, uint64_t bytes) {
 #if defined(POSIX_FADV_DONTNEED)
-    if (fd < 0 || getenv("DS4_CUDA_KEEP_MODEL_PAGES") != NULL || bytes == 0) return;
+    if (fd < 0 || (!DS4C_ENV_UNSET("DS4_CUDA_KEEP_MODEL_PAGES")) || bytes == 0) return;
     (void)posix_fadvise(fd, (off_t)offset, (off_t)bytes, POSIX_FADV_DONTNEED);
 #else
     (void)fd;
@@ -2260,7 +2287,7 @@ static int cuda_model_stage_pool_alloc(uint64_t bytes) {
  * O_DIRECT, and it is slower on a cold file and no faster on a warm one. */
 static int cuda_model_direct_fd_open(int fd, uint64_t *align_io) {
 #if defined(__linux__) && defined(O_DIRECT)
-    if (getenv("DS4_CUDA_NO_DIRECT_IO") != NULL) return -1;
+    if ((!DS4C_ENV_UNSET("DS4_CUDA_NO_DIRECT_IO"))) return -1;
     char proc_path[64];
     snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", fd);
     const int direct_fd = open(proc_path, O_RDONLY | O_DIRECT);
@@ -2677,7 +2704,7 @@ static const char *cuda_model_range_ptr_from_fd(
     int own_block = 0;
     char *dev = cuda_model_arena_alloc(bytes, what, &own_block);
     if (!dev) {
-        if (getenv("DS4_CUDA_STRICT_WEIGHT_CACHE") != NULL) return NULL;
+        if ((!DS4C_ENV_UNSET("DS4_CUDA_STRICT_WEIGHT_CACHE"))) return NULL;
         return cuda_model_ptr(model_map, offset);
     }
     cudaError_t err = cudaSuccess;
@@ -2756,10 +2783,10 @@ static const char *cuda_model_range_ptr_from_fd(
 
 static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
     if (!model_map || model_size == 0 || map_offset > model_size || map_size > model_size - map_offset) return 0;
-    if (getenv("DS4_CUDA_NO_MODEL_COPY") != NULL ||
-        getenv("DS4_CUDA_DIRECT_MODEL") != NULL ||
-        getenv("DS4_CUDA_WEIGHT_CACHE") != NULL ||
-        getenv("DS4_CUDA_WEIGHT_PRELOAD") != NULL) {
+    if ((!DS4C_ENV_UNSET("DS4_CUDA_NO_MODEL_COPY")) ||
+        (!DS4C_ENV_UNSET("DS4_CUDA_DIRECT_MODEL")) ||
+        (!DS4C_ENV_UNSET("DS4_CUDA_WEIGHT_CACHE")) ||
+        (!DS4C_ENV_UNSET("DS4_CUDA_WEIGHT_PRELOAD"))) {
         return 0;
     }
     if (g_model_device_owned || g_model_registered) return 1;
@@ -2821,7 +2848,7 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
         cuda_model_discard_source_pages(model_map, model_size, off, n);
         copied += n;
         const double now = cuda_wall_sec();
-        if (getenv("DS4_CUDA_MODEL_COPY_VERBOSE") != NULL && now - last_report >= 2.0) {
+        if ((!DS4C_ENV_UNSET("DS4_CUDA_MODEL_COPY_VERBOSE")) && now - last_report >= 2.0) {
             fprintf(stderr, "ds4: CUDA model chunk copy %.2f/%.2f GiB\n",
                     (double)copied / 1073741824.0,
                     (double)map_size / 1073741824.0);
@@ -2922,7 +2949,7 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
         if (!cublas_ok(cublasCreate(&h), "init cublas")) return 0;
         c->cublas = (void *)h;
         const cublasMath_t math_mode =
-            (g_quality_mode || getenv("DS4_CUDA_NO_TF32") != NULL)
+            (g_quality_mode || (!DS4C_ENV_UNSET("DS4_CUDA_NO_TF32")))
                 ? CUBLAS_DEFAULT_MATH
                 : CUBLAS_TF32_TENSOR_OP_MATH;
         (void)cublasSetMathMode(h, math_mode);
@@ -4135,7 +4162,7 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
 extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes) {
     (void)max_tensor_bytes;
     if (!ds4_gpu_register_model_map_no_copy(model_map, model_size)) return 0;
-    if (getenv("DS4_CUDA_COPY_MODEL_CHUNKED") != NULL &&
+    if ((!DS4C_ENV_UNSET("DS4_CUDA_COPY_MODEL_CHUNKED")) &&
         !cuda_model_copy_chunked(model_map, model_size, map_offset, map_size)) {
         (void)cuda_model_prefetch_range(model_map, model_size, map_offset, map_size);
     }
@@ -4156,7 +4183,7 @@ extern "C" int ds4_gpu_set_aux_model_map_range(
     int current_device = 0;
     int integrated = 0;
     int pageable = 0;
-    if (getenv("DS4_CUDA_AUX_FORCE_COPY") == NULL &&
+    if (DS4C_ENV_UNSET("DS4_CUDA_AUX_FORCE_COPY") &&
         cudaGetDevice(&current_device) == cudaSuccess &&
         cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated,
                                current_device) ==
@@ -4594,7 +4621,7 @@ extern "C" int ds4_gpu_device_cache_support_tensors(int device_id,
                       return a.source_offset < b.source_offset;
                   return a.device_id < b.device_id;
               });
-    if (getenv("DS4_DSPARK_VERIFY_CACHE") != NULL) {
+    if ((!DS4C_ENV_UNSET("DS4_DSPARK_VERIFY_CACHE"))) {
         /* Read back every installed range and compare with the host copy. */
         int bad = 0;
         write_off = 0;
@@ -4756,7 +4783,7 @@ extern "C" int ds4_gpu_build_derived_artifacts(
         const char *model_path) {
     if (!model_map || model_size == 0 || !model_path || !model_path[0]) return 0;
     if (!g_derived_ranges.empty()) return (int)g_derived_ranges.size();
-    if (getenv("DS4_CUDA_NO_DERIVED_WEIGHTS") != NULL) return 0;
+    if ((!DS4C_ENV_UNSET("DS4_CUDA_NO_DERIVED_WEIGHTS"))) return 0;
     const char *build = getenv("DS4_CUDA_BUILD_ARTIFACTS");
     if (build && strcmp(build, "0") == 0) return 0;
 
@@ -4935,7 +4962,7 @@ extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_
      * are device-0 by construction; multi-tier callers in kernel wrappers will
      * miss the linear scan (device_id filter) and allocate fresh per-device
      * copies the first time they're consulted. */
-    if (getenv("DS4_CUDA_Q8_F32_PRELOAD") != NULL &&
+    if ((!DS4C_ENV_UNSET("DS4_CUDA_Q8_F32_PRELOAD")) &&
         cuda_q8_f32_cache_allowed(cache_label, in_dim, out_dim)) {
         if (cuda_q8_f32_ptr(model_map, offset, bytes, in_dim, out_dim, 0, cache_label)) return 1;
         optional_q8_preload_disabled = 1;
@@ -4957,7 +4984,7 @@ extern "C" void ds4_gpu_print_memory_report(const char *label) {
 extern "C" void ds4_gpu_set_quality(bool quality) {
     g_quality_mode = quality ? 1 : 0;
     const cublasMath_t math_mode =
-        (g_quality_mode || getenv("DS4_CUDA_NO_TF32") != NULL)
+        (g_quality_mode || (!DS4C_ENV_UNSET("DS4_CUDA_NO_TF32")))
             ? CUBLAS_DEFAULT_MATH
             : CUBLAS_TF32_TENSOR_OP_MATH;
     /* Walk every initialized per-tier handle. Single-tier (g_n_gpus == 1)
@@ -7873,7 +7900,7 @@ static int cuda_q4_mma_ok(void) {
     /* All tiers on this host use the same cubin/PTX and GPU model. */
     static int cached = -1;
     if (cached < 0) {
-        if (getenv("DS4_CUDA_MOE_NO_Q4_MMA") != NULL) {
+        if ((!DS4C_ENV_UNSET("DS4_CUDA_MOE_NO_Q4_MMA"))) {
             cached = 0;
         } else {
             int dev = 0, major = 0, minor = 0;
@@ -7903,7 +7930,7 @@ static int cuda_q8_mma_try_launch(
         uint64_t out_stride,
         uint32_t T) {
     static int disabled = -1;
-    if (disabled < 0) disabled = getenv("DS4_CUDA_NO_Q8_MMA") != NULL ? 1 : 0;
+    if (disabled < 0) disabled = (!DS4C_ENV_UNSET("DS4_CUDA_NO_Q8_MMA")) ? 1 : 0;
     if (disabled || !cuda_q4_mma_ok()) return 0;
     if ((in_dim & 31u) != 0u || blocks > 256u || n_tok < 8u) return 0;
     if (((uintptr_t)w & 1u) || ((uintptr_t)xq & 3u) || ((uintptr_t)xscale & 3u)) return 0;
@@ -10918,7 +10945,7 @@ static int attention_decode_score_split_launch(
     if (graph_inv_rope) return 0;
     static int score_tile_disabled = -1;
     if (score_tile_disabled < 0) {
-        score_tile_disabled = getenv("DS4_CUDA_NO_SCORE_TILE") != NULL ? 1 : 0;
+        score_tile_disabled = (!DS4C_ENV_UNSET("DS4_CUDA_NO_SCORE_TILE")) ? 1 : 0;
     }
     if (!score_tile_disabled &&
         head_dim == 512u &&
@@ -14912,7 +14939,7 @@ static int indexer_scores_mxf4_try(
     (void)head_dim; (void)ratio; (void)scale;
     return 0;
 #else
-    if (g_quality_mode || getenv("DS4_CUDA_NO_INDEXER_MXF4") != NULL ||
+    if (g_quality_mode || (!DS4C_ENV_UNSET("DS4_CUDA_NO_INDEXER_MXF4")) ||
         g_n_gpus != 1 || ds4_tensor_device_idx(scores) != 0 ||
         n_head != DS4_MXF4_INDEXER_HEADS ||
         head_dim != DS4_MXF4_INDEXER_DIM || ratio != 4u ||
@@ -15843,7 +15870,7 @@ static int indexer_scores_launch(
         n_head, head_dim, ratio, scale);
     if (mxf4 != 0) return mxf4 > 0;
     if (n_tokens == 1u && head_dim == 128u && n_head == 64u &&
-        getenv("DS4_CUDA_NO_INDEXER_DIRECT_ONE") == NULL) {
+        DS4C_ENV_UNSET("DS4_CUDA_NO_INDEXER_DIRECT_ONE")) {
         indexer_score_one_direct_kernel<<<n_comp, 128>>>((float *)scores->ptr,
                                                          (const float *)q->ptr,
                                                          (const float *)weights->ptr,
@@ -15853,8 +15880,8 @@ static int indexer_scores_launch(
         return cuda_ok(cudaGetLastError(), "indexer score one direct launch");
     }
     if (!g_quality_mode && head_dim == 128u && n_head == 64u &&
-        getenv("DS4_CUDA_NO_INDEXER_WMMA") == NULL) {
-        if (getenv("DS4_CUDA_NO_INDEXER_WMMA128") == NULL) {
+        DS4C_ENV_UNSET("DS4_CUDA_NO_INDEXER_WMMA")) {
+        if (DS4C_ENV_UNSET("DS4_CUDA_NO_INDEXER_WMMA128")) {
             dim3 grid((n_comp + 127u) / 128u, (n_tokens + 31u) / 32u, 1);
             indexer_scores_wmma128_kernel<<<grid, 256>>>((float *)scores->ptr,
                                                          (const float *)q->ptr,
@@ -15863,7 +15890,7 @@ static int indexer_scores_launch(
                                                          n_comp, n_tokens, pos0, n_head,
                                                          head_dim, ratio, scale, causal ? 1 : 0);
             return cuda_ok(cudaGetLastError(), "indexer scores wmma128 launch");
-        } else if (getenv("DS4_CUDA_NO_INDEXER_WMMA64") == NULL) {
+        } else if (DS4C_ENV_UNSET("DS4_CUDA_NO_INDEXER_WMMA64")) {
             dim3 grid((n_comp + 63u) / 64u, (n_tokens + 15u) / 16u, 1);
             indexer_scores_wmma64_kernel<<<grid, 128>>>((float *)scores->ptr,
                                                         (const float *)q->ptr,
@@ -15872,7 +15899,7 @@ static int indexer_scores_launch(
                                                         n_comp, n_tokens, pos0, n_head,
                                                         head_dim, ratio, scale, causal ? 1 : 0);
             return cuda_ok(cudaGetLastError(), "indexer scores wmma64 launch");
-        } else if (getenv("DS4_CUDA_NO_INDEXER_WMMA32") == NULL) {
+        } else if (DS4C_ENV_UNSET("DS4_CUDA_NO_INDEXER_WMMA32")) {
             dim3 grid((n_comp + 31u) / 32u, (n_tokens + 15u) / 16u, 1);
             indexer_scores_wmma32_kernel<<<grid, 64>>>((float *)scores->ptr,
                                                        (const float *)q->ptr,
@@ -16016,7 +16043,7 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         return cuda_ok(cudaGetLastError(), "indexer top1 launch");
     }
     if (top_k == 2048u && n_comp <= 4096u &&
-        getenv("DS4_CUDA_NO_TOPK2048_WIDE") == NULL) {
+        DS4C_ENV_UNSET("DS4_CUDA_NO_TOPK2048_WIDE")) {
         indexer_topk_pow2_kernel<4096><<<n_tokens, 1024>>>(
                 (uint32_t *)selected->ptr,
                 (const float *)scores->ptr,
@@ -16024,7 +16051,7 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         return cuda_ok(cudaGetLastError(), "indexer topk 2048-wide launch");
     }
     if (top_k == 2048u && n_comp > 4096u &&
-        getenv("DS4_CUDA_NO_TOPK2048_WIDE") == NULL) {
+        DS4C_ENV_UNSET("DS4_CUDA_NO_TOPK2048_WIDE")) {
         const uint32_t chunk_n = 4096u;
         const uint32_t merge_group = 2u;
         const uint32_t n_chunks = (n_comp + chunk_n - 1u) / chunk_n;
@@ -16094,21 +16121,21 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                        "indexer topk 2048-wide final launch");
     }
     if (top_k == 512u && n_comp <= 1024u &&
-        getenv("DS4_CUDA_NO_TOPK1024") == NULL) {
+        DS4C_ENV_UNSET("DS4_CUDA_NO_TOPK1024")) {
         indexer_topk_1024_kernel<<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
                                                      (const float *)scores->ptr,
                                                      n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 1024 launch");
     }
     if (top_k == 512u && n_comp <= 2048u &&
-        getenv("DS4_CUDA_NO_TOPK2048") == NULL) {
+        DS4C_ENV_UNSET("DS4_CUDA_NO_TOPK2048")) {
         indexer_topk_pow2_kernel<2048><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
                                                            (const float *)scores->ptr,
                                                            n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 2048 launch");
     }
     if (top_k == 512u && n_comp <= 4096u &&
-        getenv("DS4_CUDA_NO_TOPK2048") == NULL) {
+        DS4C_ENV_UNSET("DS4_CUDA_NO_TOPK2048")) {
         if (n_comp == 4096u) {
             using TopkCubSort = cub::BlockRadixSort<uint64_t, 512, 16>;
             const int smem = (int)sizeof(typename TopkCubSort::TempStorage);
@@ -16138,8 +16165,8 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         return cuda_ok(cudaGetLastError(), "indexer topk 4096 launch");
     }
     if (top_k == 512u && n_comp <= 8192u &&
-        getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
-        getenv("DS4_CUDA_NO_TOPK8192") == NULL) {
+        DS4C_ENV_UNSET("DS4_CUDA_NO_TOPK2048") &&
+        DS4C_ENV_UNSET("DS4_CUDA_NO_TOPK8192")) {
         if (n_comp > 4096u) {
             using TopkCubSort = cub::BlockRadixSort<uint64_t, 512, 16>;
             const int smem = (int)sizeof(typename TopkCubSort::TempStorage);
@@ -16169,16 +16196,16 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         return cuda_ok(cudaGetLastError(), "indexer topk 8192 launch");
     }
     if (top_k == 512u && n_tokens >= 32u &&
-        getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
-        getenv("DS4_CUDA_NO_TOPK_STREAM") == NULL) {
+        DS4C_ENV_UNSET("DS4_CUDA_NO_TOPK2048") &&
+        DS4C_ENV_UNSET("DS4_CUDA_NO_TOPK_STREAM")) {
         indexer_topk_stream512_kernel<<<n_tokens, 512>>>(
                 (uint32_t *)selected->ptr,
                 (const float *)scores->ptr,
                 n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk stream launch");
     }
-    if (top_k == 512u && getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
-        getenv("DS4_CUDA_NO_TOPK_CHUNKED") == NULL) {
+    if (top_k == 512u && DS4C_ENV_UNSET("DS4_CUDA_NO_TOPK2048") &&
+        DS4C_ENV_UNSET("DS4_CUDA_NO_TOPK_CHUNKED")) {
         const uint32_t chunk_n = 4096u;
         const uint32_t n_chunks = (n_comp + chunk_n - 1u) / chunk_n;
         const uint32_t candidate_stride = n_chunks * top_k;
@@ -16521,7 +16548,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             f32_to_f16_kernel<<<(xh_count + 255) / 256, 256, 0, cuda_decode_stream()>>>(
                     xh, (const float *)x->ptr, xh_count);
             if (cuda_ok(cudaGetLastError(), "q8 dequant gemm staging")) {
-                const int gemm_trace = getenv("DS4_GLM_GEMM_TRACE") != NULL;
+                const int gemm_trace = (!DS4C_ENV_UNSET("DS4_GLM_GEMM_TRACE"));
                 cudaEvent_t ev0, ev1, ev2;
                 if (gemm_trace) {
                     cudaEventCreate(&ev0); cudaEventCreate(&ev1); cudaEventCreate(&ev2);
@@ -16602,8 +16629,8 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 xq, xscale, in_dim, out_dim, n_tok, blocks, blocks, out_dim, mma_T);
         if (mma_rc) return mma_rc > 0;
     }
-    if (getenv("DS4_CUDA_NO_Q8_BATCH_WARP") == NULL &&
-        getenv("DS4_CUDA_NO_Q8_BATCH_TOK8") == NULL &&
+    if (DS4C_ENV_UNSET("DS4_CUDA_NO_Q8_BATCH_WARP") &&
+        DS4C_ENV_UNSET("DS4_CUDA_NO_Q8_BATCH_TOK8") &&
         blocks <= 32u &&
         n_tok >= 8u) {
         dim3 bgrid(((unsigned)out_dim + 7u) / 8u, ((unsigned)n_tok + 7u) / 8u, 1);
@@ -16619,8 +16646,8 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 use_dp4a);
         return cuda_ok(cudaGetLastError(), "matmul_q8_0 batch tok8 warp launch");
     }
-    if (getenv("DS4_CUDA_NO_Q8_BATCH_WARP") == NULL &&
-        getenv("DS4_CUDA_NO_Q8_BATCH_TOK4") == NULL &&
+    if (DS4C_ENV_UNSET("DS4_CUDA_NO_Q8_BATCH_WARP") &&
+        DS4C_ENV_UNSET("DS4_CUDA_NO_Q8_BATCH_TOK4") &&
         blocks <= 32u &&
         n_tok >= 4u) {
         dim3 bgrid(((unsigned)out_dim + 7u) / 8u, ((unsigned)n_tok + 3u) / 4u, 1);
@@ -16636,10 +16663,10 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 use_dp4a);
         return cuda_ok(cudaGetLastError(), "matmul_q8_0 batch tok4 warp launch");
     }
-    if (getenv("DS4_CUDA_NO_Q8_BATCH_WARP") == NULL &&
+    if (DS4C_ENV_UNSET("DS4_CUDA_NO_Q8_BATCH_WARP") &&
         (blocks <= 32u || force_decode_warp)) {
         if (force_decode_warp &&
-            getenv("DS4_CUDA_GLM_VERIFY_NO_Q8_TOK2") == NULL) {
+            DS4C_ENV_UNSET("DS4_CUDA_GLM_VERIFY_NO_Q8_TOK2")) {
             matmul_q8_0_preq_batch_warp8_tok2_kernel
                     <<<((unsigned)out_dim + 7u) / 8u, 256, 0, cuda_decode_stream()>>>(
                     (float *)out->ptr,
@@ -16667,7 +16694,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
         return cuda_ok(cudaGetLastError(), "matmul_q8_0 batch warp launch");
     }
     const unsigned exact_threads = cuda_q8_exact_threads(blocks);
-    if (getenv("DS4_CUDA_NO_Q8_BATCH_EXACT_TOK2") == NULL &&
+    if (DS4C_ENV_UNSET("DS4_CUDA_NO_Q8_BATCH_EXACT_TOK2") &&
         n_tok >= 2u) {
         dim3 bgrid((unsigned)out_dim, ((unsigned)n_tok + 1u) / 2u, 1);
         matmul_q8_0_preq_batch_tok2_exact_kernel<<<bgrid, exact_threads, 0, cuda_decode_stream()>>>(
@@ -16933,7 +16960,7 @@ static int cuda_matmul_q8_0_aligned_pair_try(
         out0_dim == 0u || out1_dim == 0u ||
         (in_dim % 1024u) != 0 || (out0_dim % 128u) != 0 ||
         (out1_dim % 128u) != 0 || !cuda_aligned_q8_enabled() ||
-        getenv("DS4_CUDA_NO_FUSED_ALIGNED_Q8_PAIR") != NULL) {
+        (!DS4C_ENV_UNSET("DS4_CUDA_NO_FUSED_ALIGNED_Q8_PAIR"))) {
         return 0;
     }
     const uint64_t blocks = in_dim / 32u;
@@ -17055,7 +17082,7 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     const bool force_decode_warp =
         n_tok == 2u && g_glm_mtp_verify_mode;
     if (n_tok != 1 && !force_decode_warp && !g_q8_cache_suppressed &&
-        getenv("DS4_CUDA_Q8_PAIR_BATCH") == NULL) {
+        DS4C_ENV_UNSET("DS4_CUDA_Q8_PAIR_BATCH")) {
         return cuda_matmul_q8_0_tensor_labeled(out0, model_map, model_size, weight0_offset,
                                                in_dim, out0_dim, x, n_tok, "q8_0_pair0") &&
                cuda_matmul_q8_0_tensor_labeled(out1, model_map, model_size, weight1_offset,
@@ -17075,7 +17102,7 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 pair quantize launch")) return 0;
     if (n_tok != 1) {
         if (force_decode_warp &&
-            getenv("DS4_CUDA_GLM_VERIFY_NO_Q8_TOK2") == NULL) {
+            DS4C_ENV_UNSET("DS4_CUDA_GLM_VERIFY_NO_Q8_TOK2")) {
             matmul_q8_0_preq_batch_warp8_tok2_kernel
                     <<<((unsigned)out0_dim + 7u) / 8u, 256, 0, cuda_decode_stream()>>>(
                     (float *)out0->ptr,
@@ -17105,8 +17132,8 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
             if (mma_rc > 0) return 1;
             return 0;
         }
-        if (getenv("DS4_CUDA_NO_Q8_BATCH_WARP") == NULL &&
-            getenv("DS4_CUDA_NO_Q8_BATCH_TOK8") == NULL &&
+        if (DS4C_ENV_UNSET("DS4_CUDA_NO_Q8_BATCH_WARP") &&
+            DS4C_ENV_UNSET("DS4_CUDA_NO_Q8_BATCH_TOK8") &&
             blocks <= 32u &&
             n_tok >= 8u) {
             dim3 grid0(((unsigned)out0_dim + 7u) / 8u, ((unsigned)n_tok + 7u) / 8u, 1);
@@ -17134,8 +17161,8 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
                     use_dp4a);
             return cuda_ok(cudaGetLastError(), "matmul_q8_0 pair1 batch tok8 launch");
         }
-        if (getenv("DS4_CUDA_NO_Q8_BATCH_WARP") == NULL &&
-            getenv("DS4_CUDA_NO_Q8_BATCH_TOK4") == NULL &&
+        if (DS4C_ENV_UNSET("DS4_CUDA_NO_Q8_BATCH_WARP") &&
+            DS4C_ENV_UNSET("DS4_CUDA_NO_Q8_BATCH_TOK4") &&
             blocks <= 32u &&
             n_tok >= 4u) {
             dim3 grid0(((unsigned)out0_dim + 7u) / 8u, ((unsigned)n_tok + 3u) / 4u, 1);
@@ -17163,7 +17190,7 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
                     use_dp4a);
             return cuda_ok(cudaGetLastError(), "matmul_q8_0 pair1 batch tok4 launch");
         }
-        if (getenv("DS4_CUDA_NO_Q8_BATCH_WARP") == NULL &&
+        if (DS4C_ENV_UNSET("DS4_CUDA_NO_Q8_BATCH_WARP") &&
             blocks <= 32u) {
             dim3 grid0(((unsigned)out0_dim + 7u) / 8u, (unsigned)n_tok, 1);
             matmul_q8_0_preq_batch_warp8_kernel<<<grid0, 256, 0, cuda_decode_stream()>>>(
@@ -17190,10 +17217,10 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
                     use_dp4a);
             return cuda_ok(cudaGetLastError(), "matmul_q8_0 pair1 batch warp launch");
         }
-        if (getenv("DS4_CUDA_NO_Q8_PAIR_BATCH_EXACT") == NULL) {
+        if (DS4C_ENV_UNSET("DS4_CUDA_NO_Q8_PAIR_BATCH_EXACT")) {
             const uint64_t max_out_dim = out0_dim > out1_dim ? out0_dim : out1_dim;
             const unsigned exact_threads = cuda_q8_exact_threads(blocks);
-            if (getenv("DS4_CUDA_NO_Q8_PAIR_BATCH_EXACT_TOK2") == NULL &&
+            if (DS4C_ENV_UNSET("DS4_CUDA_NO_Q8_PAIR_BATCH_EXACT_TOK2") &&
                 n_tok >= 2u) {
                 dim3 grid((unsigned)max_out_dim, ((unsigned)n_tok + 1u) / 2u, 1);
                 matmul_q8_0_pair_preq_batch_tok2_exact_kernel<<<grid, exact_threads, 0, cuda_decode_stream()>>>(
@@ -17269,7 +17296,7 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
 static int cuda_q8_mma_available(void) {
     static int cached = -1;
     if (cached >= 0) return cached;
-    if (getenv("DS4_CUDA_NO_Q8_MMA") != NULL) {
+    if ((!DS4C_ENV_UNSET("DS4_CUDA_NO_Q8_MMA"))) {
         cached = 0;
         return cached;
     }
@@ -17291,7 +17318,7 @@ static int cuda_q8_mma_available(void) {
  * path exactly when the unfused chain would be. */
 int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows) {
     return g_q8_dense_mma_enabled && cuda_q8_mma_available() &&
-           n_rows >= 8u && getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL;
+           n_rows >= 8u && DS4C_ENV_UNSET("DS4_QWEN4EXP_NO_ROW_TILE");
 }
 
 /* The PDL valve (see ds4_cuda_qwen4exp.cuh).  Off when
@@ -17325,7 +17352,7 @@ int ds4_qwen4exp_pdl_enabled(void) {
  * test flips it through ds4_gpu_set_q8_mma_pipe. */
 static int g_q8_mma_pipe = -1;
 static int cuda_q8_mma_pipe_enabled(void) {
-    if (g_q8_mma_pipe < 0) g_q8_mma_pipe = getenv("DS4_CUDA_NO_MMA_PIPE") == NULL ? 1 : 0;
+    if (g_q8_mma_pipe < 0) g_q8_mma_pipe = DS4C_ENV_UNSET("DS4_CUDA_NO_MMA_PIPE") ? 1 : 0;
     return g_q8_mma_pipe;
 }
 /* 0: off, 1: prefill widths (production), 2: every width the MMA tier takes
@@ -17585,7 +17612,7 @@ static int cuda_matmul_q8_0_preq_rows_exact(
      * and a projection as narrow as the hyper-connection down (out_dim 320)
      * would leave most of the device idle on the widest tile. */
     if (g_q8_dense_mma_enabled && cuda_q8_mma_available() && n_rows >= 8u &&
-        getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL) {
+        DS4C_ENV_UNSET("DS4_QWEN4EXP_NO_ROW_TILE")) {
         if (cuda_q8_mma_pipe_try((float *)out->ptr,
                                  reinterpret_cast<const unsigned char *>(wptr),
                                  xq, xscale, out_dim, n_rows, blocks)) {
@@ -17619,14 +17646,14 @@ static int cuda_matmul_q8_0_preq_rows_exact(
      * three-row consumer is launched plainly and its fence is a no-op.
      * DS4_QWEN4EXP_NO_WIDE_VERIFY restores the <= 2 gates. */
     const bool wide_verify3 = (n_rows == 3u || n_rows == 4u) &&
-        getenv("DS4_QWEN4EXP_NO_WIDE_VERIFY") == NULL;
+        DS4C_ENV_UNSET("DS4_QWEN4EXP_NO_WIDE_VERIFY");
     if (use_dp4a && (n_rows == 2u || wide_verify3) &&
         in_dim == 10240u && out_dim == 320u &&
-        getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
-        getenv("DS4_Q8_NO_HC_DOWN_PAIR") == NULL &&
+        DS4C_ENV_UNSET("DS4_QWEN4EXP_NO_ROW_TILE") &&
+        DS4C_ENV_UNSET("DS4_Q8_NO_HC_DOWN_PAIR") &&
         (((uintptr_t)wptr & 1u) == 0u)) {
         if (n_rows == 4u ||
-            (n_rows == 3u && getenv("DS4_QWEN4EXP_WIDE_VERIFY_R2") == NULL)) {
+            (n_rows == 3u && DS4C_ENV_UNSET("DS4_QWEN4EXP_WIDE_VERIFY_R2"))) {
             /* One four-row tile: the weight block is read once for all three
              * rows (the split below reads it twice).  Same per-row chains. */
             matmul_q8_0_preq_pair_lanes_kernel<4, false><<<
@@ -17662,14 +17689,14 @@ static int cuda_matmul_q8_0_preq_rows_exact(
      * tree are restored. Wider calls and partial groups keep their kernels. */
     if (use_dp4a && (n_rows <= 2u || wide_verify3) && out_dim > 512u &&
         (in_dim & 31u) == 0u &&
-        getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
+        DS4C_ENV_UNSET("DS4_QWEN4EXP_NO_ROW_TILE") &&
         (((uintptr_t)wptr & 1u) == 0u)) {
         /* Real-input first-use timing supports streaming for HC up. Larger
          * projections retain their ordinary cache policy. */
         if (in_dim == 320u && out_dim == 10240u &&
-            getenv("DS4_Q8_NO_STREAM_LOADS") == NULL) {
+            DS4C_ENV_UNSET("DS4_Q8_NO_STREAM_LOADS")) {
             if (n_rows == 4u ||
-                (n_rows == 3u && getenv("DS4_QWEN4EXP_WIDE_VERIFY_R2") == NULL)) {
+                (n_rows == 3u && DS4C_ENV_UNSET("DS4_QWEN4EXP_WIDE_VERIFY_R2"))) {
                 /* One four-row tile, weight read once (streaming loads, as
                  * the HC up valve leg).  Same per-row chains. */
                 matmul_q8_0_preq_pair_lanes_kernel<4><<<
@@ -17677,7 +17704,7 @@ static int cuda_matmul_q8_0_preq_rows_exact(
                         256, 0, cuda_decode_stream()>>>(
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
                         out_dim, n_rows, blocks);
-            } else if (n_rows == 3u && getenv("DS4_Q8_NO_HC_WARP_PAIR") == NULL) {
+            } else if (n_rows == 3u && DS4C_ENV_UNSET("DS4_Q8_NO_HC_WARP_PAIR")) {
                 /* Rows 0..1 as one warp-pair call, row 2 as a one-row call
                  * on shifted views; per-row arithmetic is independent of
                  * `rows`.  Plain launches (no trigger at three rows). */
@@ -17693,7 +17720,7 @@ static int cuda_matmul_q8_0_preq_rows_exact(
                         (const unsigned char *)wptr,
                         xq + 2u * blocks * 32u, xscale + 2u * blocks,
                         out_dim, 1u);
-            } else if (getenv("DS4_Q8_NO_HC_WARP_PAIR") == NULL) {
+            } else if (DS4C_ENV_UNSET("DS4_Q8_NO_HC_WARP_PAIR")) {
                 /* PDL consumer: the stream predecessor is
                  * qwen4exp_hc_silu_quant, which triggers at its top
                  * (ds4_cuda_qwen4exp.cuh). */
@@ -17717,7 +17744,7 @@ static int cuda_matmul_q8_0_preq_rows_exact(
             /* Retain the promoted call-width specialization for the
              * general dense projections. The HC warp geometry above is
              * independent of this two-warp kernel's token-row bound. */
-            if (n_rows == 1u && getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL) {
+            if (n_rows == 1u && DS4C_ENV_UNSET("DS4_QWEN4EXP_PAIR_LANES_R2")) {
                 /* PDL consumer: the stream predecessor is the decode
                  * quantizer, which triggers at its top (decode widths). */
                 QWEN4EXP_LAUNCH_PDL(
@@ -17728,7 +17755,7 @@ static int cuda_matmul_q8_0_preq_rows_exact(
                         out_dim, n_rows, blocks);
             } else if (n_rows == 4u ||
                        (n_rows == 3u &&
-                        getenv("DS4_QWEN4EXP_WIDE_VERIFY_R2") == NULL)) {
+                        DS4C_ENV_UNSET("DS4_QWEN4EXP_WIDE_VERIFY_R2"))) {
                 /* One four-row tile: the weight read once for three rows. */
                 matmul_q8_0_preq_pair_lanes_kernel<4, false><<<
                         dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u),
@@ -17762,7 +17789,7 @@ static int cuda_matmul_q8_0_preq_rows_exact(
      * extra synchronization is involved.  Wide/prefill calls keep their old
      * block geometry.  The override permits a same-binary geometry check. */
     const unsigned warps = n_rows < 8u && out_dim <= 512u &&
-        getenv("DS4_QWEN4EXP_Q8_WIDE_BLOCKS") == NULL ? 1u : 8u;
+        DS4C_ENV_UNSET("DS4_QWEN4EXP_Q8_WIDE_BLOCKS") ? 1u : 8u;
     const unsigned wthreads = warps * 32u;
     const unsigned wgrid = ((unsigned)out_dim + warps - 1u) / warps;
 
@@ -17771,7 +17798,7 @@ static int cuda_matmul_q8_0_preq_rows_exact(
      * kernels stand: one row is the decode call and takes the per-row kernel,
      * and above that the eight-row tile reads each weight block once for up to
      * eight rows with the SAME per-row arithmetic. */
-    if (n_rows == 1u || getenv("DS4_QWEN4EXP_NO_ROW_TILE") != NULL) {
+    if (n_rows == 1u || (!DS4C_ENV_UNSET("DS4_QWEN4EXP_NO_ROW_TILE"))) {
         dim3 grid(wgrid, n_rows, 1u);
         matmul_q8_0_preq_warp8_kernel<<<grid, wthreads, 0, cuda_decode_stream()>>>(
                 (float *)out->ptr,
@@ -18115,17 +18142,17 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset, weight_bytes, logical_tier, "f16");
     if (!wptr) return 0;
     const __half *w = (const __half *)wptr;
-    const int serial_f16 = getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL;
+    const int serial_f16 = (!DS4C_ENV_UNSET("DS4_CUDA_SERIAL_F16_MATMUL"));
     const int router_shape = in_dim == 4096u && out_dim == 256u && n_tok == 1u;
     const int serial_router =
         !serial_f16 &&
         router_shape &&
-        getenv("DS4_CUDA_SERIAL_ROUTER") != NULL;
+        (!DS4C_ENV_UNSET("DS4_CUDA_SERIAL_ROUTER"));
     const int ordered_router =
         !serial_f16 &&
         !serial_router &&
         n_tok == 1u &&
-        getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") == NULL;
+        DS4C_ENV_UNSET("DS4_CUDA_NO_ORDERED_F16_MATMUL");
     const int small_out_one_token =
         !serial_f16 &&
         !serial_router &&
@@ -18133,9 +18160,9 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         n_tok == 1u &&
         out_dim <= 32u &&
         in_dim >= 8192u &&
-        getenv("DS4_CUDA_F16_SMALL_OUT") != NULL &&
-        getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") == NULL &&
-        getenv("DS4_CUDA_NO_F16_SMALL_OUT") == NULL;
+        (!DS4C_ENV_UNSET("DS4_CUDA_F16_SMALL_OUT")) &&
+        DS4C_ENV_UNSET("DS4_CUDA_NO_ORDERED_F16_MATMUL") &&
+        DS4C_ENV_UNSET("DS4_CUDA_NO_F16_SMALL_OUT");
     if (small_out_one_token) {
         matmul_f16_small_out_hx_ordered_chunks_kernel<<<(unsigned)out_dim, 32, 0, cuda_decode_stream()>>>(
                 (float *)out->ptr,
@@ -18151,8 +18178,8 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         n_tok > 1u &&
         out_dim <= 32u &&
         in_dim >= 4096u &&
-        (g_quality_mode || getenv("DS4_CUDA_F16_SMALL_BATCH") != NULL) &&
-        getenv("DS4_CUDA_NO_F16_SMALL_BATCH") == NULL;
+        (g_quality_mode || (!DS4C_ENV_UNSET("DS4_CUDA_F16_SMALL_BATCH"))) &&
+        DS4C_ENV_UNSET("DS4_CUDA_NO_F16_SMALL_BATCH");
     if (small_out_batch) {
         matmul_f16_small_out_batch_kernel<<<(unsigned)n_tok, 256, 0, cuda_decode_stream()>>>(
                 (float *)out->ptr,
@@ -18165,10 +18192,10 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     }
     const int cublas_one_token =
         n_tok == 1u &&
-        getenv("DS4_CUDA_NO_F16_CUBLAS_ONE") == NULL &&
-        (!g_quality_mode || getenv("DS4_CUDA_F16_CUBLAS_ONE") != NULL);
+        DS4C_ENV_UNSET("DS4_CUDA_NO_F16_CUBLAS_ONE") &&
+        (!g_quality_mode || (!DS4C_ENV_UNSET("DS4_CUDA_F16_CUBLAS_ONE")));
     const int cublas_batch =
-        n_tok > 1u && getenv("DS4_CUDA_NO_F16_CUBLAS_BATCH") == NULL;
+        n_tok > 1u && DS4C_ENV_UNSET("DS4_CUDA_NO_F16_CUBLAS_BATCH");
     if (!serial_f16 && g_cublas_ready && (cublas_batch || cublas_one_token)) {
         const uint64_t xh_count = n_tok * in_dim;
         __half *xh = (__half *)cuda_tmp_alloc_on(logical_tier, xh_count * sizeof(__half), "f16 gemm activations");
@@ -18223,8 +18250,8 @@ extern "C" int ds4_gpu_matmul_f16_rms_fold_tensor(
         float norm_eps) {
     if (!out || !x || !model_map || !g_cublas_ready || n_tok <= 1u ||
         (in_dim & 2047u) != 0u || in_dim > UINT32_MAX ||
-        n_tok > UINT32_MAX || getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL ||
-        getenv("DS4_CUDA_NO_F16_CUBLAS_BATCH") != NULL ||
+        n_tok > UINT32_MAX || (!DS4C_ENV_UNSET("DS4_CUDA_SERIAL_F16_MATMUL")) ||
+        (!DS4C_ENV_UNSET("DS4_CUDA_NO_F16_CUBLAS_BATCH")) ||
         weight_offset > model_size || out_dim > UINT64_MAX / in_dim) {
         return 0;
     }
@@ -18372,10 +18399,10 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     if (!out0 || !out1 || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0) {
         return 0;
     }
-    if (getenv("DS4_CUDA_NO_F16_PAIR_MATMUL") != NULL ||
-        getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL ||
-        getenv("DS4_CUDA_SERIAL_ROUTER") != NULL ||
-        getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") != NULL) {
+    if ((!DS4C_ENV_UNSET("DS4_CUDA_NO_F16_PAIR_MATMUL")) ||
+        (!DS4C_ENV_UNSET("DS4_CUDA_SERIAL_F16_MATMUL")) ||
+        (!DS4C_ENV_UNSET("DS4_CUDA_SERIAL_ROUTER")) ||
+        (!DS4C_ENV_UNSET("DS4_CUDA_NO_ORDERED_F16_MATMUL"))) {
         return ds4_gpu_matmul_f16_tensor(out0, model_map, model_size, weight0_offset,
                                            in_dim, out_dim, x, n_tok) &&
                ds4_gpu_matmul_f16_tensor(out1, model_map, model_size, weight1_offset,
@@ -18411,11 +18438,11 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
         const bool small_out_batch_requested =
             out_dim <= 32u &&
             in_dim >= 4096u &&
-            (g_quality_mode || getenv("DS4_CUDA_F16_SMALL_BATCH") != NULL) &&
-            getenv("DS4_CUDA_NO_F16_SMALL_BATCH") == NULL;
+            (g_quality_mode || (!DS4C_ENV_UNSET("DS4_CUDA_F16_SMALL_BATCH"))) &&
+            DS4C_ENV_UNSET("DS4_CUDA_NO_F16_SMALL_BATCH");
         if (!small_out_batch_requested &&
             g_cublas_ready &&
-            getenv("DS4_CUDA_NO_F16_CUBLAS_BATCH") == NULL) {
+            DS4C_ENV_UNSET("DS4_CUDA_NO_F16_CUBLAS_BATCH")) {
             const uint64_t xh_count = n_tok * in_dim;
             __half *xh = (__half *)cuda_tmp_alloc_on(logical_tier,
                                                      xh_count * sizeof(__half),
@@ -18926,7 +18953,7 @@ static void matmul_f32_warp_tile8_kernel(
 
 static inline int matmul_f32_warp_tile8_off(void) {
     static int cached = -1;
-    if (cached < 0) cached = getenv("DS4_F32_NO_WARP_TILE8") != NULL ? 1 : 0;
+    if (cached < 0) cached = (!DS4C_ENV_UNSET("DS4_F32_NO_WARP_TILE8")) ? 1 : 0;
     return cached;
 }
 
@@ -19448,10 +19475,10 @@ extern "C" int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
      * three rows.  DS4_QWEN4EXP_NO_WIDE_VERIFY restores the fallback. */
     if (in_dim == 2560u && (n_rows == 3u || n_rows == 4u) &&
         (out_dim == 48u || out_dim == 512u) &&
-        getenv("DS4_QWEN4EXP_NO_WIDE_VERIFY") == NULL &&
+        DS4C_ENV_UNSET("DS4_QWEN4EXP_NO_WIDE_VERIFY") &&
         (((uintptr_t)w | (uintptr_t)x->ptr) & 15u) == 0u &&
-        getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
-        getenv("DS4_F32_NO_VECTOR_DECODE") == NULL) {
+        DS4C_ENV_UNSET("DS4_QWEN4EXP_NO_ROW_TILE") &&
+        DS4C_ENV_UNSET("DS4_F32_NO_VECTOR_DECODE")) {
         const float *x2 = (const float *)x->ptr + 2u * in_dim;
         const float *o2 = (float *)out->ptr + 2u * out_dim;
         if (out_dim == 48u) {
@@ -19492,8 +19519,8 @@ extern "C" int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
         ((out_dim == 48u && n_rows <= 2u) ||
          (out_dim == 512u && n_rows <= 2u)) &&
         (((uintptr_t)w | (uintptr_t)x->ptr) & 15u) == 0u &&
-        getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
-        getenv("DS4_F32_NO_VECTOR_DECODE") == NULL) {
+        DS4C_ENV_UNSET("DS4_QWEN4EXP_NO_ROW_TILE") &&
+        DS4C_ENV_UNSET("DS4_F32_NO_VECTOR_DECODE")) {
         if (out_dim == 48u && n_rows == 1u) {
             /* PDL consumer: on the router edge the stream predecessor is the
              * mixer's closing kernel, which triggers at its top; the
@@ -19535,7 +19562,7 @@ extern "C" int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
         }
         return cuda_ok(cudaGetLastError(), "matmul_f32 vector decode launch");
     }
-    if (n_rows == 1u || getenv("DS4_QWEN4EXP_NO_ROW_TILE") != NULL) {
+    if (n_rows == 1u || (!DS4C_ENV_UNSET("DS4_QWEN4EXP_NO_ROW_TILE"))) {
         dim3 grid((unsigned)out_dim, (unsigned)n_rows, 1);
         matmul_f32_kernel<<<grid, 256, 0, cuda_decode_stream()>>>(
                 (float *)out->ptr, (const float *)w, (const float *)x->ptr,
@@ -19549,7 +19576,7 @@ extern "C" int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
      * so this is a speed split, not a numeric one -- DS4_F32_NO_WARP_TILE
      * falls back to the shipping kernel if one is ever needed. */
     if (matmul_f32_warp_tile_ok(in_dim, out_dim, n_rows) &&
-        getenv("DS4_F32_NO_WARP_TILE") == NULL) {
+        DS4C_ENV_UNSET("DS4_F32_NO_WARP_TILE")) {
         const unsigned ntn =
             (unsigned)(out_dim / (uint64_t)DS4_F32_WARP_TILE_TN);
         dim3 grid((ntn + DS4_F32_WARP_TILE_WPB - 1u) / DS4_F32_WARP_TILE_WPB,
@@ -20030,7 +20057,7 @@ extern "C" int ds4_gpu_attention_noncausal_raw_batch_heads_tensor(
     if (!cuda_ok(cudaGetLastError(), "attention noncausal raw batch heads launch")) return 0;
     static int verify_left = -1;
     if (verify_left < 0) {
-        verify_left = getenv("DS4_DSPARK_VERIFY_NONCAUSAL") != NULL ? 3 : 0;
+        verify_left = (!DS4C_ENV_UNSET("DS4_DSPARK_VERIFY_NONCAUSAL")) ? 3 : 0;
     }
     if (verify_left > 0) {
         verify_left--;
@@ -21212,12 +21239,12 @@ extern "C" int ds4_gpu_attention_decode_rows_rope_tensor(
         g_cuda_exact_score_split_vec4_plain ||
         g_cuda_exact_score_split_dim2 ||
         g_cuda_exact_score_split_fuse_inv_rope ||
-        getenv("DS4_CUDA_NO_SCORE_TILE") != NULL ||
-        getenv("DS4_CUDA_EXACT_SCORE_SPLIT_MIN_SCORE") != NULL ||
-        getenv("DS4_CUDA_EXACT_SCORE_SPLIT_CHUNK") != NULL ||
-        getenv("DS4_CUDA_EXACT_SCORE_SPLIT_S_FLOOR") != NULL ||
-        getenv("DS4_CUDA_EXACT_SCORE_SPLIT_S_MAX") != NULL ||
-        getenv("DS4_CUDA_EXACT_SCORE_SPLIT_S") != NULL) {
+        (!DS4C_ENV_UNSET("DS4_CUDA_NO_SCORE_TILE")) ||
+        (!DS4C_ENV_UNSET("DS4_CUDA_EXACT_SCORE_SPLIT_MIN_SCORE")) ||
+        (!DS4C_ENV_UNSET("DS4_CUDA_EXACT_SCORE_SPLIT_CHUNK")) ||
+        (!DS4C_ENV_UNSET("DS4_CUDA_EXACT_SCORE_SPLIT_S_FLOOR")) ||
+        (!DS4C_ENV_UNSET("DS4_CUDA_EXACT_SCORE_SPLIT_S_MAX")) ||
+        (!DS4C_ENV_UNSET("DS4_CUDA_EXACT_SCORE_SPLIT_S"))) {
         return 0;
     }
 
@@ -21344,8 +21371,8 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), logical_tier, "attn_sinks");
     if (!sinks) return 0;
     if (n_tokens > 1 && head_dim == 512 &&
-        getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL &&
-        (getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL || (!g_quality_mode && n_tokens >= 128u))) {
+        DS4C_ENV_UNSET("DS4_CUDA_NO_WINDOW_ATTENTION") &&
+        ((!DS4C_ENV_UNSET("DS4_CUDA_WINDOW_ATTENTION")) || (!g_quality_mode && n_tokens >= 128u))) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
         attention_static_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
                                                                    sinks,
@@ -21361,7 +21388,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
         return cuda_ok(cudaGetLastError(), "attention raw window launch");
     }
     if (g_cublas_ready && n_tokens > 1 && head_dim == 512 &&
-        getenv("DS4_CUDA_NO_CUBLAS_ATTENTION") == NULL) {
+        DS4C_ENV_UNSET("DS4_CUDA_NO_CUBLAS_ATTENTION")) {
         const uint32_t n_keys = n_tokens;
         const uint64_t score_count = (uint64_t)n_head * n_tokens * n_keys;
         const uint64_t out_count = (uint64_t)n_head * n_tokens * head_dim;
@@ -21589,7 +21616,7 @@ static int attention_decode_batch_launch(
     }
     if (!use_comp_mask && n_tokens > 1 && head_dim == 512 &&
         !g_cuda_no_window_attention &&
-        (getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL || (!g_quality_mode && n_tokens >= 128u))) {
+        ((!DS4C_ENV_UNSET("DS4_CUDA_WINDOW_ATTENTION")) || (!g_quality_mode && n_tokens >= 128u))) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
         attention_decode_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
                                                                    sinks,
@@ -21871,7 +21898,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         }
     }
     if (n_tokens > 1u && top_k == 512u &&
-        getenv("DS4_CUDA_NO_INDEXED_TOPK_SORT") == NULL) {
+        DS4C_ENV_UNSET("DS4_CUDA_NO_INDEXED_TOPK_SORT")) {
         const uint64_t sort_bytes = (uint64_t)n_tokens * top_k * sizeof(int32_t);
         int32_t *sorted = (int32_t *)cuda_tmp_alloc_on(logical_tier, sort_bytes, "indexed attention topk sort");
         if (!sorted) return 0;
@@ -21880,8 +21907,8 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         topk_ptr = sorted;
     }
     if (n_tokens > 1 && head_dim == 512 && top_k <= 512u &&
-        getenv("DS4_CUDA_NO_INDEXED_HEADS8") == NULL) {
-        if (getenv("DS4_CUDA_INDEXED_TWOPASS") == NULL) {
+        DS4C_ENV_UNSET("DS4_CUDA_NO_INDEXED_HEADS8")) {
+        if (DS4C_ENV_UNSET("DS4_CUDA_INDEXED_TWOPASS")) {
             dim3 grid(n_tokens, (n_head + 15u) / 16u, 1);
             attention_indexed_mixed_heads8_online_kernel<8, 16><<<grid, 512>>>((float *)heads->ptr,
                                                                                sinks,
@@ -21989,8 +22016,8 @@ static int attention_prefill_mixed_launch(
         (void)cudaGetLastError();
     }
     if (!use_comp_mask && n_tokens > 1 && head_dim == 512 &&
-        getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL &&
-        (getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL || (!g_quality_mode && n_tokens >= 128u))) {
+        DS4C_ENV_UNSET("DS4_CUDA_NO_WINDOW_ATTENTION") &&
+        ((!DS4C_ENV_UNSET("DS4_CUDA_WINDOW_ATTENTION")) || (!g_quality_mode && n_tokens >= 128u))) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
         attention_static_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
                                                                    sinks,
@@ -22006,7 +22033,7 @@ static int attention_prefill_mixed_launch(
         return cuda_ok(cudaGetLastError(), "attention mixed window launch");
     }
     if (g_cublas_ready && n_tokens > 1 && head_dim == 512 &&
-        getenv("DS4_CUDA_NO_CUBLAS_ATTENTION") == NULL) {
+        DS4C_ENV_UNSET("DS4_CUDA_NO_CUBLAS_ATTENTION")) {
         const uint32_t n_keys = n_tokens + n_comp;
         const uint64_t kv_count = (uint64_t)n_keys * head_dim;
         const uint64_t score_count = (uint64_t)n_head * n_tokens * n_keys;
@@ -22318,7 +22345,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
             cuda_resolve_weight_ptr(model_map, out_b_offset, out_b_bytes, logical_tier, "attn_out_b"));
     if (!out_a || !out_b) return 0;
 
-    const uint32_t profile = getenv("DS4_CUDA_ATTN_OUTPUT_PROFILE") != NULL;
+    const uint32_t profile = (!DS4C_ENV_UNSET("DS4_CUDA_ATTN_OUTPUT_PROFILE"));
     cudaEvent_t prof_ev[3] = {NULL, NULL, NULL};
     if (profile) {
         for (uint32_t i = 0; i < 3u; i++) {
@@ -22342,7 +22369,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
     if (!g_quality_mode &&
         g_cublas_ready &&
         n_tokens >= out_a_cublas_min_tokens &&
-        getenv("DS4_CUDA_NO_CUBLAS_ATTENTION_OUTPUT_A") == NULL) {
+        DS4C_ENV_UNSET("DS4_CUDA_NO_CUBLAS_ATTENTION_OUTPUT_A")) {
         out_a_f16 = cuda_q8_f16_ptr(model_map, out_a_offset, out_a_bytes, group_dim, low_dim, physical_device, "attn_output_a");
     }
     if (out_a_f16) {
@@ -22432,7 +22459,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         }
         if (grouped_mma_done) {
             /* handled */
-        } else if (getenv("DS4_CUDA_NO_ATTN_A_TOK2") == NULL && n_tokens >= 2u) {
+        } else if (DS4C_ENV_UNSET("DS4_CUDA_NO_ATTN_A_TOK2") && n_tokens >= 2u) {
             dim3 grid_a(((unsigned)low_dim + 7u) / 8u, ((unsigned)n_tokens + 1u) / 2u, 1);
             grouped_q8_0_a_preq_warp8_tok2_kernel<<<grid_a, 512, 0, cuda_decode_stream()>>>((float *)low->ptr,
                                                                    out_a,
@@ -22658,7 +22685,7 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         float                   clamp) {
-    if (getenv("DS4_CUDA_DISABLE_SHARED_GATE_UP_PAIR") == NULL) {
+    if (DS4C_ENV_UNSET("DS4_CUDA_DISABLE_SHARED_GATE_UP_PAIR")) {
         return ds4_gpu_matmul_q8_0_pair_tensor(gate, up,
                                                  model_map, model_size,
                                                  gate_offset, up_offset,
@@ -22855,13 +22882,13 @@ extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_te
         if (!hash) ok = 0;
     }
     if (ok) {
-        if (getenv("DS4_CUDA_NO_WARP_ROUTER_SELECT") == NULL &&
-            getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
+        if (DS4C_ENV_UNSET("DS4_CUDA_NO_WARP_ROUTER_SELECT") &&
+            DS4C_ENV_UNSET("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT")) {
             dim3 block(32, 4, 1);
             router_select_warp_topk_kernel<<<1, block, 0, cuda_decode_stream()>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
                                                          bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
                                                          has_bias && !hash_mode, hash_mode);
-        } else if (getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
+        } else if (DS4C_ENV_UNSET("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT")) {
             router_select_parallel_kernel<<<1, 256, 0, cuda_decode_stream()>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
                                                       bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
                                                       has_bias && !hash_mode, hash_mode);
@@ -22898,8 +22925,8 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
         hash = (const int32_t *)cuda_resolve_weight_ptr(model_map, hash_offset, hash_bytes, logical_tier, "router_hash");
         if (!hash) return 0;
     }
-    if (getenv("DS4_CUDA_NO_WARP_ROUTER_SELECT") == NULL &&
-        getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
+    if (DS4C_ENV_UNSET("DS4_CUDA_NO_WARP_ROUTER_SELECT") &&
+        DS4C_ENV_UNSET("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT")) {
         dim3 block(32, 4, 1);
         router_select_warp_topk_kernel<<<(n_tokens + 3u) / 4u, block>>>((int32_t *)selected->ptr,
                                                                         (float *)weights->ptr,
@@ -22913,7 +22940,7 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
                                                                         n_tokens,
                                                                         has_bias && !hash_mode,
                                                                         hash_mode);
-    } else if (getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
+    } else if (DS4C_ENV_UNSET("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT")) {
         router_select_parallel_kernel<<<n_tokens, 256>>>((int32_t *)selected->ptr,
                                                          (float *)weights->ptr,
                                                          (float *)probs->ptr,
@@ -28188,7 +28215,7 @@ static int routed_moe_launch(
     if (down->bytes >= xq_bytes && gate->bytes >= midq_bytes) {
         cuda_block_q8_K *xq = (cuda_block_q8_K *)down->ptr;
         cuda_block_q8_K *midq = (cuda_block_q8_K *)gate->ptr;
-        const uint32_t profile_moe = getenv("DS4_CUDA_MOE_PROFILE") != NULL;
+        const uint32_t profile_moe = (!DS4C_ENV_UNSET("DS4_CUDA_MOE_PROFILE"));
         cudaEvent_t prof_ev[7] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL};
         if (profile_moe) {
             for (uint32_t i = 0; i < 7u; i++) {
@@ -28204,15 +28231,15 @@ static int routed_moe_launch(
         const uint32_t use_q4_sorted_pairs =
             q4k_path && n_tokens > 1u &&
             (owned_filtered ||
-             (getenv("DS4_CUDA_MOE_NO_Q4_SORTED") == NULL &&
-              getenv("DS4_CUDA_MOE_NO_EXPERT_TILES") == NULL &&
-              getenv("DS4_CUDA_MOE_TILE4") == NULL));
+             (DS4C_ENV_UNSET("DS4_CUDA_MOE_NO_Q4_SORTED") &&
+              DS4C_ENV_UNSET("DS4_CUDA_MOE_NO_EXPERT_TILES") &&
+              DS4C_ENV_UNSET("DS4_CUDA_MOE_TILE4")));
         const uint32_t use_sorted_pairs =
             n_tokens > 1u &&
             (owned_filtered || !q4k_path || use_q4_sorted_pairs);
         const uint32_t use_expert_tiles =
             use_sorted_pairs &&
-            (owned_filtered || getenv("DS4_CUDA_MOE_NO_EXPERT_TILES") == NULL);
+            (owned_filtered || DS4C_ENV_UNSET("DS4_CUDA_MOE_NO_EXPERT_TILES"));
         const uint32_t q4_owned_batch =
             owned_filtered && q4k_path && n_tokens >= 4u && n_tokens <= 16u;
         /* Small batches (DSpark stage chain / verify, n<=8) leave most of an
@@ -28224,96 +28251,96 @@ static int routed_moe_launch(
             getenv("DS4_CUDA_MOE_TILE4") ? 4u :
             (getenv("DS4_CUDA_MOE_TILE8") ? 8u :
              (q4_owned_batch || n_tokens > 8u ? 8u : 4u));
-        const uint32_t write_gate_up = getenv("DS4_CUDA_MOE_WRITE_GATE_UP") != NULL;
+        const uint32_t write_gate_up = (!DS4C_ENV_UNSET("DS4_CUDA_MOE_WRITE_GATE_UP"));
         const uint32_t use_p2_sorted =
             use_sorted_pairs && !owned_filtered &&
-            getenv("DS4_CUDA_MOE_NO_P2") == NULL;
+            DS4C_ENV_UNSET("DS4_CUDA_MOE_NO_P2");
         const uint32_t use_atomic_down = !q4k_path && use_expert_tiles &&
-            (getenv("DS4_CUDA_MOE_ATOMIC_DOWN") != NULL ||
-             (n_tokens >= 128u && getenv("DS4_CUDA_MOE_NO_ATOMIC_DOWN") == NULL));
+            ((!DS4C_ENV_UNSET("DS4_CUDA_MOE_ATOMIC_DOWN")) ||
+             (n_tokens >= 128u && DS4C_ENV_UNSET("DS4_CUDA_MOE_NO_ATOMIC_DOWN")));
         const uint32_t use_owned_sparse_buffers = owned_filtered &&
-            getenv("DS4_CUDA_MOE_NO_OWNED_SPARSE_BUFFERS") == NULL;
+            DS4C_ENV_UNSET("DS4_CUDA_MOE_NO_OWNED_SPARSE_BUFFERS");
         const uint32_t use_gate_row2048 = use_expert_tiles && expert_tile_m == 8u &&
-            (getenv("DS4_CUDA_MOE_GATE_ROW2048") != NULL ||
-             getenv("DS4_CUDA_MOE_GATE_ROW256") != NULL ||
-             getenv("DS4_CUDA_MOE_GATE_ROW128") != NULL ||
+            ((!DS4C_ENV_UNSET("DS4_CUDA_MOE_GATE_ROW2048")) ||
+             (!DS4C_ENV_UNSET("DS4_CUDA_MOE_GATE_ROW256")) ||
+             (!DS4C_ENV_UNSET("DS4_CUDA_MOE_GATE_ROW128")) ||
              ((q4_owned_batch || n_tokens >= 128u) &&
-              getenv("DS4_CUDA_MOE_NO_GATE_ROW2048") == NULL &&
-              getenv("DS4_CUDA_MOE_NO_GATE_ROW256") == NULL &&
-              getenv("DS4_CUDA_MOE_NO_GATE_ROW128") == NULL));
+              DS4C_ENV_UNSET("DS4_CUDA_MOE_NO_GATE_ROW2048") &&
+              DS4C_ENV_UNSET("DS4_CUDA_MOE_NO_GATE_ROW256") &&
+              DS4C_ENV_UNSET("DS4_CUDA_MOE_NO_GATE_ROW128")));
         const uint32_t use_q4_mma_tiles16 = q4k_path && use_expert_tiles &&
             expert_tile_m == 8u && cuda_q4_mma_ok() &&
-            getenv("DS4_CUDA_MOE_NO_Q4_MMA_TILE16") == NULL;
+            DS4C_ENV_UNSET("DS4_CUDA_MOE_NO_Q4_MMA_TILE16");
         const uint32_t use_down_tile16 = !q4k_path && use_atomic_down && expert_tile_m == 8u &&
-            n_tokens >= 128u && getenv("DS4_CUDA_MOE_NO_DOWN_TILE16") == NULL;
+            n_tokens >= 128u && DS4C_ENV_UNSET("DS4_CUDA_MOE_NO_DOWN_TILE16");
         const uint32_t use_small_sorted_prep =
             owned_filtered && q4k_path && n_tokens <= 16u && pair_count <= 96u &&
             n_total_expert <= 128u && use_sorted_pairs && use_expert_tiles &&
-            getenv("DS4_CUDA_MOE_NO_SMALL_SORTED_PREP") == NULL;
+            DS4C_ENV_UNSET("DS4_CUDA_MOE_NO_SMALL_SORTED_PREP");
         const uint32_t force_q4_down_rowspan =
-            getenv("DS4_CUDA_MOE_DOWN_ROW512") != NULL ||
-            getenv("DS4_CUDA_MOE_DOWN_ROW1024") != NULL ||
-            getenv("DS4_CUDA_MOE_DOWN_ROW2048") != NULL;
+            (!DS4C_ENV_UNSET("DS4_CUDA_MOE_DOWN_ROW512")) ||
+            (!DS4C_ENV_UNSET("DS4_CUDA_MOE_DOWN_ROW1024")) ||
+            (!DS4C_ENV_UNSET("DS4_CUDA_MOE_DOWN_ROW2048"));
         const uint32_t use_q4_down_rowspan =
             q4k_path && use_expert_tiles && expert_tile_m == 8u &&
             (q4_owned_batch || n_tokens >= 128u || force_q4_down_rowspan) &&
-            getenv("DS4_CUDA_MOE_NO_Q4_DOWN_ROWSPAN") == NULL;
+            DS4C_ENV_UNSET("DS4_CUDA_MOE_NO_Q4_DOWN_ROWSPAN");
         const uint32_t use_decode_lut_gate =
             n_tokens == 1u && xq_blocks <= 16u &&
-            getenv("DS4_CUDA_MOE_NO_DECODE_LUT_GATE") == NULL;
+            DS4C_ENV_UNSET("DS4_CUDA_MOE_NO_DECODE_LUT_GATE");
         const uint32_t gate_row_span =
-            getenv("DS4_CUDA_MOE_GATE_ROW2048") != NULL ? 2048u :
-            getenv("DS4_CUDA_MOE_GATE_ROW1024") != NULL ? 1024u : 512u;
+            (!DS4C_ENV_UNSET("DS4_CUDA_MOE_GATE_ROW2048")) ? 2048u :
+            (!DS4C_ENV_UNSET("DS4_CUDA_MOE_GATE_ROW1024")) ? 1024u : 512u;
         const uint32_t down_row_span =
-            getenv("DS4_CUDA_MOE_DOWN_ROW512") != NULL ? 512u :
-            getenv("DS4_CUDA_MOE_DOWN_ROW2048") != NULL ? 2048u :
-            getenv("DS4_CUDA_MOE_DOWN_ROW1024") != NULL ? 1024u : 512u;
+            (!DS4C_ENV_UNSET("DS4_CUDA_MOE_DOWN_ROW512")) ? 512u :
+            (!DS4C_ENV_UNSET("DS4_CUDA_MOE_DOWN_ROW2048")) ? 2048u :
+            (!DS4C_ENV_UNSET("DS4_CUDA_MOE_DOWN_ROW1024")) ? 1024u : 512u;
         const uint32_t use_down_row2048 = !q4k_path && use_atomic_down && expert_tile_m == 8u &&
-            (getenv("DS4_CUDA_MOE_DOWN_ROW2048") != NULL ||
-             getenv("DS4_CUDA_MOE_DOWN_ROW256") != NULL ||
-             getenv("DS4_CUDA_MOE_DOWN_ROW128") != NULL ||
-             getenv("DS4_CUDA_MOE_DOWN_ROW64") != NULL ||
+            ((!DS4C_ENV_UNSET("DS4_CUDA_MOE_DOWN_ROW2048")) ||
+             (!DS4C_ENV_UNSET("DS4_CUDA_MOE_DOWN_ROW256")) ||
+             (!DS4C_ENV_UNSET("DS4_CUDA_MOE_DOWN_ROW128")) ||
+             (!DS4C_ENV_UNSET("DS4_CUDA_MOE_DOWN_ROW64")) ||
              (use_down_tile16 &&
-              getenv("DS4_CUDA_MOE_NO_DOWN_ROW2048") == NULL &&
-              getenv("DS4_CUDA_MOE_NO_DOWN_ROW256") == NULL &&
-              getenv("DS4_CUDA_MOE_NO_DOWN_ROW128") == NULL &&
-              getenv("DS4_CUDA_MOE_NO_DOWN_ROW64") == NULL));
+              DS4C_ENV_UNSET("DS4_CUDA_MOE_NO_DOWN_ROW2048") &&
+              DS4C_ENV_UNSET("DS4_CUDA_MOE_NO_DOWN_ROW256") &&
+              DS4C_ENV_UNSET("DS4_CUDA_MOE_NO_DOWN_ROW128") &&
+              DS4C_ENV_UNSET("DS4_CUDA_MOE_NO_DOWN_ROW64")));
         const uint32_t use_direct_down_sum =
             n_tokens == 1u && (n_expert == 6u || n_expert == 3u) &&
-            getenv("DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6") == NULL;
+            DS4C_ENV_UNSET("DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6");
         const uint32_t use_direct_midq =
             q4k_path && use_direct_down_sum && !write_gate_up &&
-            getenv("DS4_CUDA_MOE_DIRECT_MIDQ") != NULL &&
-            getenv("DS4_CUDA_MOE_NO_DIRECT_MIDQ") == NULL;
+            (!DS4C_ENV_UNSET("DS4_CUDA_MOE_DIRECT_MIDQ")) &&
+            DS4C_ENV_UNSET("DS4_CUDA_MOE_NO_DIRECT_MIDQ");
         const uint32_t use_q4_gate_h16r8 =
             q4k_path && !use_direct_midq &&
-            getenv("DS4_CUDA_MOE_Q4_GATE_H16R8") != NULL &&
-            getenv("DS4_CUDA_MOE_NO_Q4_GATE_H16R8") == NULL;
+            (!DS4C_ENV_UNSET("DS4_CUDA_MOE_Q4_GATE_H16R8")) &&
+            DS4C_ENV_UNSET("DS4_CUDA_MOE_NO_Q4_GATE_H16R8");
         const uint32_t use_q4_gate_h16 =
             q4k_path && !use_direct_midq && !use_q4_gate_h16r8 &&
-            getenv("DS4_CUDA_MOE_Q4_GATE_H16") != NULL &&
-            getenv("DS4_CUDA_MOE_NO_Q4_GATE_H16") == NULL;
+            (!DS4C_ENV_UNSET("DS4_CUDA_MOE_Q4_GATE_H16")) &&
+            DS4C_ENV_UNSET("DS4_CUDA_MOE_NO_Q4_GATE_H16");
         const uint32_t use_q4_gate_w32r16 =
             q4k_path && !use_direct_midq && !use_q4_gate_h16r8 && !use_q4_gate_h16 &&
-            getenv("DS4_CUDA_MOE_Q4_GATE_W32R16") != NULL &&
-            getenv("DS4_CUDA_MOE_NO_Q4_GATE_W32R16") == NULL;
+            (!DS4C_ENV_UNSET("DS4_CUDA_MOE_Q4_GATE_W32R16")) &&
+            DS4C_ENV_UNSET("DS4_CUDA_MOE_NO_Q4_GATE_W32R16");
         const uint32_t use_q4_gate_w32 =
             q4k_path && !use_direct_midq && !use_q4_gate_h16r8 && !use_q4_gate_h16 &&
             !use_q4_gate_w32r16 &&
-            getenv("DS4_CUDA_MOE_NO_Q4_GATE_W32") == NULL;
+            DS4C_ENV_UNSET("DS4_CUDA_MOE_NO_Q4_GATE_W32");
         const uint32_t use_q4_gate_w32_noaux =
             use_q4_gate_w32 && !write_gate_up &&
-            getenv("DS4_CUDA_MOE_NO_Q4_GATE_W32_NOAUX") == NULL;
+            DS4C_ENV_UNSET("DS4_CUDA_MOE_NO_Q4_GATE_W32_NOAUX");
         const uint32_t use_q4_down_slot3 =
             q4k_path && use_direct_down_sum && n_expert == 3u &&
-            getenv("DS4_CUDA_MOE_Q4_DOWN_SLOT3") != NULL &&
-            getenv("DS4_CUDA_MOE_NO_Q4_DOWN_SLOT3") == NULL;
+            (!DS4C_ENV_UNSET("DS4_CUDA_MOE_Q4_DOWN_SLOT3")) &&
+            DS4C_ENV_UNSET("DS4_CUDA_MOE_NO_Q4_DOWN_SLOT3");
         const uint32_t use_q4_midq_sidecar =
             q4k_path && use_direct_down_sum && use_q4_gate_w32_noaux &&
             !use_direct_midq && !write_gate_up &&
             (expert_mid_dim % CUDA_QK_K) == 0u &&
-            getenv("DS4_CUDA_MOE_MIDQ_SIDECAR") != NULL &&
-            getenv("DS4_CUDA_MOE_NO_MIDQ_SIDECAR") == NULL;
+            (!DS4C_ENV_UNSET("DS4_CUDA_MOE_MIDQ_SIDECAR")) &&
+            DS4C_ENV_UNSET("DS4_CUDA_MOE_NO_MIDQ_SIDECAR");
         float *midq_sidecar = use_q4_midq_sidecar ? (float *)up->ptr : NULL;
         if (g_cuda_moe_decode_graph &&
             !owned_filtered &&
@@ -29278,18 +29305,18 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
         (gate_type != 16u || down_type != 10u)) {
         return 0;
     }
-    if (q4k_path && getenv("DS4_CUDA_MOE_WRITE_GATE_UP") != NULL) {
+    if (q4k_path && (!DS4C_ENV_UNSET("DS4_CUDA_MOE_WRITE_GATE_UP"))) {
         fprintf(stderr, "ds4: CUDA owned Q4 decode does not support gate/up auxiliary output\n");
         return 0;
     }
     if (!q4k_path && !mxfp4_path &&
-        getenv("DS4_CUDA_MOE_NO_DECODE_LUT_GATE") != NULL) {
+        (!DS4C_ENV_UNSET("DS4_CUDA_MOE_NO_DECODE_LUT_GATE"))) {
         fprintf(stderr, "ds4: CUDA owned IQ2 decode requires the LUT gate path\n");
         return 0;
     }
     const bool write_aux =
         !q4k_path && !mxfp4_path &&
-        getenv("DS4_CUDA_MOE_WRITE_GATE_UP") != NULL;
+        (!DS4C_ENV_UNSET("DS4_CUDA_MOE_WRITE_GATE_UP"));
 
     if (resident_expert_base > UINT64_MAX / gate_expert_bytes ||
         resident_expert_count > UINT64_MAX / gate_expert_bytes ||
@@ -29829,7 +29856,7 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
         uint32_t                sinkhorn_iters,
         float                   eps,
         float                   norm_eps) {
-    if (getenv("DS4_CUDA_DISABLE_HC_SPLIT_NORM_FUSED") == NULL) {
+    if (DS4C_ENV_UNSET("DS4_CUDA_DISABLE_HC_SPLIT_NORM_FUSED")) {
         if (!out || !norm_out || !split || !mix || !residual_hc || !model_map ||
             n_embd == 0 || n_hc != 4) {
             return 0;
@@ -30021,7 +30048,7 @@ extern "C" int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc) {
-    if (getenv("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED") == NULL) {
+    if (DS4C_ENV_UNSET("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED")) {
         return cuda_matmul_q8_0_hc_expand_tensor_labeled(out_hc, shared_out,
                                                         model_map, model_size,
                                                         weight_offset,
@@ -30057,7 +30084,7 @@ extern "C" int ds4_gpu_shared_down_hc_expand_add_q8_0_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc) {
-    if (getenv("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED") == NULL) {
+    if (DS4C_ENV_UNSET("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED")) {
         return cuda_matmul_q8_0_hc_expand_tensor_labeled(out_hc, shared_out,
                                                         model_map, model_size,
                                                         weight_offset,
@@ -30096,7 +30123,7 @@ extern "C" int ds4_gpu_shared_down_hc_expand_owned_q8_0_tensor(
         const ds4_gpu_tensor *split,
         uint32_t n_embd,
         uint32_t n_hc) {
-    if (getenv("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED") != NULL) return 0;
+    if ((!DS4C_ENV_UNSET("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED"))) return 0;
     return cuda_matmul_q8_0_hc_expand_tensor_labeled(
             out_hc,
             shared_out,
@@ -30132,7 +30159,7 @@ extern "C" int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc) {
-    if (getenv("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED") == NULL) {
+    if (DS4C_ENV_UNSET("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED")) {
         return cuda_matmul_q8_0_hc_expand_tensor_labeled(out_hc, block_out,
                                                         model_map, model_size,
                                                         weight_offset,
@@ -30865,7 +30892,7 @@ extern "C" int ds4_gpu_qwen4exp_bf16_prefill_exact_tensor(
     if (!weights || ((uintptr_t)weights&1u)) return 0;
     /* The register tile at eight rows and up (the decode widths never reach
      * this entry); DS4_QWEN4EXP_NO_BF16_TILE keeps the one-output warp. */
-    if (rows >= 8u && getenv("DS4_QWEN4EXP_NO_BF16_TILE") == NULL) {
+    if (rows >= 8u && DS4C_ENV_UNSET("DS4_QWEN4EXP_NO_BF16_TILE")) {
         const unsigned ctiles = (out_dim + DS4_BF16_TILE_TN - 1u) / DS4_BF16_TILE_TN;
         const dim3 tgrid((ctiles + 7u) / 8u, (rows + DS4_BF16_TILE_TM - 1u) / DS4_BF16_TILE_TM, 1u);
         glm53_matvec_bf16_f32_tile_kernel<DS4_BF16_TILE_TM, DS4_BF16_TILE_TN>
@@ -32868,10 +32895,10 @@ extern "C" int ds4_gpu_glm_attention_indexed_decode_typed_tensor(
             value_weight_bytes, logical_tier, "glm_v_b_decode");
     if (!vw) return 0;
     const float scale = 1.0f / sqrtf((float)qk_dim);
-    const bool score_vec2 = getenv("DS4_GLM_ATTN_NO_SCORE_VEC2") == NULL;
+    const bool score_vec2 = DS4C_ENV_UNSET("DS4_GLM_ATTN_NO_SCORE_VEC2");
     const bool range_tok2 =
         g_glm_mtp_verify_mode &&
-        getenv("DS4_GLM_MTP_NO_ATTN_TOK2") == NULL &&
+        DS4C_ENV_UNSET("DS4_GLM_MTP_NO_ATTN_TOK2") &&
         n_selected < cache_cap &&
         heads->bytes >= 2u * (uint64_t)n_head * value_dim * sizeof(float) &&
         q->bytes >= 2u * (uint64_t)n_head * qk_dim * sizeof(float) &&
@@ -32879,7 +32906,7 @@ extern "C" int ds4_gpu_glm_attention_indexed_decode_typed_tensor(
             2u * (uint64_t)n_head * kv_lora_dim * sizeof(float);
     if (range_tok2 && n_selected < 512u) {
         const bool lora_vec2 =
-            getenv("DS4_GLM_ATTN_NO_LORA_VEC2") == NULL;
+            DS4C_ENV_UNSET("DS4_GLM_ATTN_NO_LORA_VEC2");
         const uint32_t shmem =
             (256u + n_selected + 1u + kv_lora_dim) *
             (uint32_t)sizeof(float);
@@ -32917,7 +32944,7 @@ extern "C" int ds4_gpu_glm_attention_indexed_decode_typed_tensor(
                        "glm indexed decode attention tok2 range");
     }
     if (n_selected >= 512u &&
-        getenv("DS4_GLM_ATTN_NO_STAGED_DECODE") == NULL) {
+        DS4C_ENV_UNSET("DS4_GLM_ATTN_NO_STAGED_DECODE")) {
         const uint32_t token_count = range_tok2 ? 2u : 1u;
         const uint32_t score_stride = n_selected + (range_tok2 ? 1u : 0u);
         const uint64_t head_count = (uint64_t)token_count * n_head;
@@ -33049,7 +33076,7 @@ extern "C" int ds4_gpu_glm_attention_indexed_decode_typed_tensor(
         return cuda_ok(cudaGetLastError(),
                        "glm staged decode value launch");
     }
-    const bool lora_vec2 = getenv("DS4_GLM_ATTN_NO_LORA_VEC2") == NULL;
+    const bool lora_vec2 = DS4C_ENV_UNSET("DS4_GLM_ATTN_NO_LORA_VEC2");
     const uint32_t shmem =
         (256u + n_selected + kv_lora_dim) * (uint32_t)sizeof(float);
     if (cache_f16) {
@@ -35272,7 +35299,7 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
                         (cuda_block_q8_K *)midq_scratch[dev]->ptr,
                         mid_work,
                         expert_mid_dim, n_tokens * n_expert);
-                if (getenv("DS4_GLM_MOE_NO_DOWN_TILE8_EXACT") == NULL) {
+                if (DS4C_ENV_UNSET("DS4_GLM_MOE_NO_DOWN_TILE8_EXACT")) {
                     const uint32_t max_chunk_tokens = 512u;
                     const uint32_t scratch_tokens =
                         n_tokens < max_chunk_tokens ? n_tokens : max_chunk_tokens;
@@ -35384,7 +35411,7 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
     }
     if (n_tokens == 2u &&
         g_glm_mtp_verify_mode &&
-        getenv("DS4_GLM_MTP_NO_MOE_TOK2") == NULL) {
+        DS4C_ENV_UNSET("DS4_GLM_MTP_NO_MOE_TOK2")) {
         const uint32_t warps = 8u;
         dim3 g1((expert_mid_dim + warps - 1u) / warps,
                 2u * n_expert, 1u);
@@ -36083,7 +36110,7 @@ extern "C" int ds4_gpu_glm_value_project_typed_batch_heads_tensor(
     const char *w = (const char *)cuda_resolve_weight_ptr(
             model_map, weight_offset, wbytes, logical_tier, "glm_v_b");
     if (!w) return 0;
-    if (n_tokens >= 16u && getenv("DS4_GLM_VALUE_NO_TILE16") == NULL) {
+    if (n_tokens >= 16u && DS4C_ENV_UNSET("DS4_GLM_VALUE_NO_TILE16")) {
         dim3 grid(n_head, (n_tokens + 15u) / 16u, 1);
         const size_t shmem = 16ull * kv_lora_dim * sizeof(float);
         glm_value_project_q8_0_batch_heads_tiled_kernel<16><<<grid, 128, shmem>>>(
@@ -36281,7 +36308,7 @@ extern "C" int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model
         }
     }
     if (!ds4_gpu_set_model_map(model_map, model_size)) return 0;
-    if (getenv("DS4_CUDA_COPY_MODEL_CHUNKED") != NULL) {
+    if ((!DS4C_ENV_UNSET("DS4_CUDA_COPY_MODEL_CHUNKED"))) {
         for (uint32_t i = 0; i < count; i++) {
             (void)cuda_model_prefetch_range(model_map, model_size,
                                             offsets[i], sizes[i]);
@@ -36481,7 +36508,7 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
     if (!gate || !up || !mid || !x || n_tok == 0) return 0;
     if (n_tok == 2 && (in_dim & 31u) == 0u &&
         g_glm_mtp_verify_mode &&
-        getenv("DS4_GLM_MTP_NO_SHARED_TOK2") == NULL &&
+        DS4C_ENV_UNSET("DS4_GLM_MTP_NO_SHARED_TOK2") &&
         mid->bytes >= 2u * out_dim * sizeof(float) &&
         x->bytes >= 2u * in_dim * sizeof(float)) {
         const uint64_t row_bytes = (in_dim / 32u) * 34u;
