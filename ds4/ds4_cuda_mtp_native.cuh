@@ -10,7 +10,7 @@ static constexpr uint32_t MTP_NATIVE_DIM = 2560u;
  * out, and the live_pairs mask already names a partial wave (40 groups left the
  * second warp with 8). This changes the coarse proposal heuristic, not the
  * selected-row dots. */
-static constexpr uint32_t MTP_NATIVE_SCREEN_GROUPS = 24u;
+static constexpr uint32_t MTP_NATIVE_SCREEN_GROUPS = 16u;
 static constexpr uint32_t MTP_NATIVE_MAX_WIDTH = 1u << 20;
 template <bool Screen, bool EmitKeys = false>
 __global__ static void mtp_native_projection_kernel(
