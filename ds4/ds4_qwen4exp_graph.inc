@@ -99,7 +99,6 @@ void ds4_qwen4exp_session_plan_compute(ds4_qwen4exp_session_plan *plan,
         (((uint64_t)DS4_N_GDN_KEY_HEAD + DS4_N_GDN_VALUE_HEAD) *
          DS4_N_GDN_HEAD_DIM + 2ull * DS4_N_GDN_VALUE_HEAD) * f;
     act += sizeof(uint32_t);                      /* replay prefix       */
-    act += 2ull * DS4_N_GDN_VALUE_HEAD * 2u * f;   /* replay gate pairs   */
     act += B * sizeof(int32_t);                    /* tokens              */
     act += 3ull * B * H * E * f;                   /* hyper, normed, wide */
     act += 2ull * B * H * E * f;                   /* PLE key/gated, query/conv */
@@ -376,7 +375,6 @@ struct ds4_qwen4exp_session {
     uint32_t        adopt_conv;    /* conv history: row + 1, or 0 */
     uint32_t        adopt_device;  /* host mirror of *d_adopt */
     ds4_gpu_tensor *d_gdn_replay;
-    ds4_gpu_tensor *gdn_replay_gates;
     bool gdn_replay_enabled;
     bool gdn_replay_active;
     bool gdn_replay_previous;
@@ -774,11 +772,8 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
     }
 
     s->d_pos = qwen4exp_alloc_zeroed(sizeof(uint32_t), &ok);
-    if (s->gdn_replay_enabled) {
+    if (s->gdn_replay_enabled)
         s->d_gdn_replay = qwen4exp_alloc_zeroed(sizeof(uint32_t), &ok);
-        s->gdn_replay_gates = qwen4exp_alloc_zeroed(
-            2ull * DS4_N_GDN_VALUE_HEAD * 2u * sizeof(float), &ok);
-    }
     if (getenv("DS4_QWEN4EXP_NO_LAZY_ROLLBACK") == NULL) {
         /* Zeroed on the device, so flag, mirror and pending all start at live. */
         s->d_adopt = qwen4exp_alloc_zeroed(sizeof(uint32_t), &ok);
@@ -892,7 +887,6 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->d_pos);
     ds4_gpu_tensor_free(s->d_adopt);
     ds4_gpu_tensor_free(s->d_gdn_replay);
-    ds4_gpu_tensor_free(s->gdn_replay_gates);
     ds4_gpu_tensor_free(s->inv_freq);
     ds4_gpu_tensor_free(s->tokens);
     ds4_gpu_tensor_free(s->hyper);
@@ -1308,10 +1302,6 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
             float *dst = s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD;
             for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
                 const uint64_t row = ids[h];
-                /* Every head of this token except the last is followed by
-                 * another table row, so ask for the next id early.  Hint. */
-                if (h + 1u < DS4_N_PLE_HEAD)
-                    __builtin_prefetch(ids + h + 1u, 0, 1);
                 const uint8_t *quant = ds4_qwen4exp_ple_row(&w->ple, row);
                 /* Cold: a hashed row past the table is a hard refusal that has
                  * never fired in a scored run, so keep it out of the hot path. */
@@ -1623,8 +1613,7 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (s->gdn_replay_active) {
         const ds4_gpu_qwen4exp_gdn_replay replay = {
-            s->gdn_checkpoint[il], s->gdn_replay_tape[il], s->d_gdn_replay,
-            s->gdn_replay_gates};
+            s->gdn_checkpoint[il], s->gdn_replay_tape[il], s->d_gdn_replay};
         rc = ds4_gpu_qwen4exp_gdn_replay_q8(
             s->gdn_out, s->gdn_conv[il], s->gdn_state[il],
             s->gdn_conv_snapshot[il], s->gdn_state_snapshot[il],
