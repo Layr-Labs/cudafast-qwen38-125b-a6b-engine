@@ -1849,7 +1849,34 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
     }
 
     const float scale = 1.0f / sqrtf((float)head_dim);
-    if (!ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
+    /* The gate writes the Q8_0 the attn_output projection
+     * reads (into the session's 6144-wide scratch, which the GDN output also
+     * uses; the two blocks run one after the other), instead of float rows
+     * the projection would quantize.  DS4_QWEN4EXP_NO_QSA_GATE_QUANT=1
+     * restores the in-place gate. */
+    const bool gate_q8 = qw_qsa_gate_q8(n_tokens, q_width);
+    const bool gate_from_doubled =
+        qw_qsa_gate_from_doubled(n_tokens, q_width, head_dim);
+    (void)cfg;
+    const uint64_t gate_q8_soff =
+        ((uint64_t)n_tokens * ((uint64_t)q_width / 32u) * 32u + 15u) & ~15ull;
+    bool fold_q8 = false;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (gate_from_doubled) {
+        const int fused = ds4_gpu_qwen4exp_qsa_attention_fold_q8_dpos_tensor(
+            s->qsa_out, s->qsa_q, s->qsa_k[il], s->qsa_v[il], sel, counts,
+            n_tokens, DS4_N_HEAD, DS4_N_HEAD_KV, head_dim, pos0,
+            s->plan.n_ctx, max_selected, scale, s->d_pos, s->qsa_split,
+            indexed ? max_selected : (uint32_t)DS4_N_INDEXER_TOP_K,
+            s->gdn_out_q8, 0u, gate_q8_soff, s->qsa_doubled);
+        if (fused < 0) {
+            fprintf(stderr, "ds4: qwen4exp QSA fold/quant failed at block %u\n", il);
+            return false;
+        }
+        fold_q8 = fused > 0;
+    }
+#endif
+    if (!fold_q8 && !ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
             s->qsa_out, s->qsa_q, s->qsa_k[il], s->qsa_v[il], sel, counts,
             n_tokens, DS4_N_HEAD, DS4_N_HEAD_KV, head_dim, pos0,
             s->plan.n_ctx, max_selected, scale, s->d_pos, s->qsa_split,
@@ -1861,18 +1888,7 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
         return false;
     }
 
-    /* At prefill width the gate writes the Q8_0 the attn_output projection
-     * reads (into the session's 6144-wide scratch, which the GDN output also
-     * uses; the two blocks run one after the other), instead of float rows
-     * the projection would quantize.  DS4_QWEN4EXP_NO_QSA_GATE_QUANT=1
-     * restores the in-place gate. */
-    const bool gate_q8 = qw_qsa_gate_q8(n_tokens, q_width);
-    const bool gate_from_doubled =
-        qw_qsa_gate_from_doubled(n_tokens, q_width, head_dim);
-    (void)cfg;
-    const uint64_t gate_q8_soff =
-        ((uint64_t)n_tokens * ((uint64_t)q_width / 32u) * 32u + 15u) & ~15ull;
-    if (!(gate_from_doubled
+    if (!fold_q8 && !(gate_from_doubled
           ? ds4_gpu_qwen4exp_qsa_output_gate_doubled_q8_tensor(
                 s->gdn_out_q8, 0u, gate_q8_soff, s->qsa_out, s->qsa_doubled,
                 n_tokens * q_width, head_dim)

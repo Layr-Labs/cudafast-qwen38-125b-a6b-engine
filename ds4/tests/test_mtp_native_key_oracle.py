@@ -18,7 +18,8 @@ for key in ['old','fused']:
  val=locals()[key].replace('value == 0.0f','probe_zero(value,ftz)').replace('!isfinite(value)','!probe_finite(value)')
  locals()[key]=val
 range_body=block(s,'static bool mtp_native_key_range_disjoint(')
-gate=s[s.index('    const bool fuse_keys ='):s.index('    if (fuse_keys)')].replace('getenv("DS4_MTP_NO_FUSED_SCREEN_KEYS")','(diagnostic ? "1" : nullptr)')
+gate_start=s.index('    const bool fuse_keys =')
+gate=s[gate_start:s.index(';',gate_start)+1].replace('getenv("DS4_MTP_NO_FUSED_SCREEN_KEYS")','(diagnostic ? "1" : nullptr)')
 floatkey=block(main,'static uint32_t q8_top1_float_ordered_key(')
 pack=block(main,'static uint64_t q8_top1_pack_key(')
 code=r'''
