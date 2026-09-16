@@ -528,137 +528,6 @@ __global__ static void qwen4exp_gdn_conv_kernel(
     history[(uint64_t)2u * conv_dim + channel] = h2;
 }
 
-/* Replay-only twin: original serial convolution followed by gate publication. */
-__global__ static void qwen4exp_gdn_conv_replay_gates_kernel(
-        float       *qkv,
-        float       *conv_state,
-        const float *conv_weight,
-        float       *conv_snapshot,
-        uint32_t     n_key_head,
-        uint32_t     n_value_head,
-        uint32_t     n_rows,
-        uint32_t     n_tokens,
-        uint32_t     n_snapshot_rows,
-        float        qk_norm_eps,
-        const uint32_t *adopt_row, float2 *gate_pairs,
-        const float *raw_alpha, const float *raw_beta,
-        const float *a_log, const float *dt_bias) {
-    const uint32_t block = blockIdx.x;
-    const uint32_t row = blockIdx.y;
-    const uint32_t tid = threadIdx.x;
-    const uint32_t lane = tid & 31u;
-    const uint32_t warp = tid >> 5u;
-    const uint32_t key_blocks = 2u * n_key_head;
-    const uint32_t blocks = key_blocks + n_value_head;
-    if (block >= blocks || row >= n_rows) return;
-
-    /* Two reduction slots, alternating by token.  One barrier a token then
-     * bounds the skew between warps at one token, and the warp that has run
-     * ahead writes the slot the warp behind is not reading. */
-    __shared__ float reduce[2][4];
-    const uint32_t conv_dim = blocks * QWEN4EXP_GDN_DIM;
-    const uint32_t channel = block * QWEN4EXP_GDN_DIM + tid;
-    const bool is_key = block < key_blocks;
-    /* The reference l2-normalises the row -- `x * rsqrt(sum(x^2) + eps)`, the
-     * epsilon on the SUM -- and then scales the query by `head_dim ** -0.5`.
-     * So the key takes no post scale at all and the query takes 2^-3.5.
-     * Twin of the Metal kernel; keep the two expressions identical. */
-    const float post_scale = block < n_key_head
-        ? 0x1.6a09e6p-4f
-        : 1.0f;
-
-    float *history = conv_state +
-        (uint64_t)row * QWEN4EXP_GDN_HISTORY * conv_dim;
-    /* Lazy rollback: a nonzero *adopt_row is k + 1, and this forward continues
-     * from snapshot slot k -- the bits a rejected round's rollback would have
-     * copied into `history`.  The slot offset is the store's own below.  The
-     * load precedes every store in program order, the channel's elements are
-     * this thread's alone, and it comes before the first __syncthreads, so the
-     * one-token skew bound above is unchanged. */
-    const uint32_t adopt = adopt_row ? *adopt_row : 0u;
-    const float *const history_src = adopt
-        ? conv_snapshot + (uint64_t)(adopt - 1u) * QWEN4EXP_GDN_HISTORY * conv_dim
-        : history;
-    float h0 = history_src[channel];
-    float h1 = history_src[(uint64_t)conv_dim + channel];
-    float h2 = history_src[(uint64_t)2u * conv_dim + channel];
-    const float w0 = conv_weight[(uint64_t)channel * 4u + 0u];
-    const float w1 = conv_weight[(uint64_t)channel * 4u + 1u];
-    const float w2 = conv_weight[(uint64_t)channel * 4u + 2u];
-    const float w3 = conv_weight[(uint64_t)channel * 4u + 3u];
-
-    float raw = qkv[(uint64_t)row * n_tokens * conv_dim + channel];
-    for (uint32_t token = 0; token < n_tokens; token++) {
-        const uint64_t index =
-            ((uint64_t)row * n_tokens + token) * conv_dim + channel;
-        float acc = 0.0f;
-        acc = fmaf(h0, w0, acc);
-        acc = fmaf(h1, w1, acc);
-        acc = fmaf(h2, w2, acc);
-        acc = fmaf(raw, w3, acc);
-        h0 = h1;
-        h1 = h2;
-        h2 = raw;
-
-        /* The NEXT token's input, read before this token's output is stored.
-         * A thread only ever reads and writes its own channel, so the two are
-         * different elements -- but they travel through one pointer, so the
-         * read has to come first in program order to be issued first, and the
-         * memory latency then hides behind the reduction below.  The last
-         * token re-reads its own element, which is still the raw value at
-         * this point and is thrown away. */
-        const uint64_t ahead =
-            index + (token + 1u < n_tokens ? conv_dim : 0u);
-        const float raw_next = qkv[ahead];
-
-        /* The window as it stands AFTER this token, which is what a rollback
-         * to length token + 1 needs.  Written before the key/value branch
-         * because that branch closes the iteration with `continue` for a
-         * value-head block, so a store placed after it would never run for
-         * the value channels. */
-        if (token < n_snapshot_rows) {
-            float *slot = conv_snapshot +
-                (uint64_t)token * QWEN4EXP_GDN_HISTORY * conv_dim;
-            /* Evict-first: same bits, cache hint only (see the float4 twin). */
-            __stcs(&slot[channel], h0);
-            __stcs(&slot[(uint64_t)conv_dim + channel], h1);
-            __stcs(&slot[(uint64_t)2u * conv_dim + channel], h2);
-        }
-
-        const float activated = qwen4exp_gdn_silu(acc);
-        raw = raw_next;
-        if (!is_key) {
-            qkv[index] = activated;
-            continue;
-        }
-
-        float *red = reduce[token & 1u];
-        const float sumsq = warp_sum_f32(activated * activated);
-        if (lane == 0u) red[warp] = sumsq;
-        __syncthreads();
-        float total = lane < 4u ? red[lane] : 0.0f;
-        total = warp_sum_all_f32(total);
-        qkv[index] = activated *
-            rsqrtf(total + qk_norm_eps) * post_scale;
-    }
-
-    history[channel] = h0;
-    history[(uint64_t)conv_dim + channel] = h1;
-    history[(uint64_t)2u * conv_dim + channel] = h2;
-    /* One publisher per head/token. Stream completion orders these pairs
-     * before replay; history and raw gate inputs are disjoint allocations. */
-    if (block == 0u && tid < n_value_head) {
-        const float coeff = a_log[tid];
-        const float bias = dt_bias[tid];
-        for (uint32_t token = 0; token < n_tokens; ++token) {
-            const uint64_t gate = (uint64_t)token * n_value_head + tid;
-            const float g = expf(coeff * qwen4exp_gdn_softplus(raw_alpha[gate] + bias));
-            const float beta = qwen4exp_gdn_sigmoid(raw_beta[gate]);
-            gate_pairs[gate] = make_float2(g, beta);
-        }
-    }
-}
-
 /*
  * Prefill-width twin of the kernel above, and a CUDA-only widening of it:
  * the same depthwise 4-tap convolution, SiLU and query/key RMS norm on the
@@ -972,87 +841,6 @@ __global__ static void qwen4exp_gdn_replay_kernel(
             if (lane == 0u) {
                 g = expf(decay_coeff * qwen4exp_gdn_softplus(raw_alpha[gate] + bias));
                 beta = qwen4exp_gdn_sigmoid(raw_beta[gate]);
-            }
-            g = __shfl_sync(0xffffffffu, g, 0);
-            beta = __shfl_sync(0xffffffffu, beta, 0);
-            if (token == 0u && prefix < DS4_QWEN4EXP_GDN_REPLAY_ROWS) {
-                float *const record = tape + (uint64_t)prefix * tape_stride;
-                if (value == 0u && head == key_writer)
-                    *(float4 *)(record + key_head * QWEN4EXP_GDN_DIM + k0) = k4;
-                if (lane == 0u) {
-                    record[key_dim + head * QWEN4EXP_GDN_DIM + value] = v_row;
-                    if (value == 0u)
-                        ((float2 *)(record + key_dim + value_dim))[head] = make_float2(g, beta);
-                }
-            }
-        }
-        h.x *= g;
-        h.y *= g;
-        h.z *= g;
-        h.w *= g;
-        const float hk = warp_sum_all_f32(dot4_f32(h, k4));
-        const float delta_v = (v_row - hk) * beta;
-        h.x = fmaf(k4.x, delta_v, h.x);
-        h.y = fmaf(k4.y, delta_v, h.y);
-        h.z = fmaf(k4.z, delta_v, h.z);
-        h.w = fmaf(k4.w, delta_v, h.w);
-        if (!replay) {
-            const float4 q4 = *(const float4 *)(qkv + base + k0);
-            const float result = warp_sum_all_f32(dot4_f32(h, q4));
-            if (lane == 0u)
-                out[(uint64_t)token * value_dim + head * QWEN4EXP_GDN_DIM + value] = result;
-            if (token == 0u && prefix == DS4_QWEN4EXP_GDN_REPLAY_ROWS)
-                *(float4 *)(checkpoint + state_off) = h;
-        }
-    }
-    *(float4 *)(state + state_off) = h;
-}
-
-/* Same scalar replay geometry and recurrence, with current gates published by conv. */
-__global__ static void qwen4exp_gdn_replay_gates_kernel(
-        float *out, float *state, float *checkpoint, float *tape,
-        const float *qkv, const float *raw_alpha, const float *raw_beta,
-        const float2 *gate_pairs,
-        uint32_t n_key_head, uint32_t n_value_head, uint32_t n_tokens,
-        uint32_t head_layout, const uint32_t *control, uint32_t replay_rows) {
-    const uint32_t head = blockIdx.x;
-    const uint32_t value = blockIdx.y * 4u + (threadIdx.x >> 5u);
-    const uint32_t lane = threadIdx.x & 31u;
-    if (head >= n_value_head || value >= QWEN4EXP_GDN_DIM) return;
-    const uint32_t prefix = control ? *control : replay_rows;
-    if (prefix > DS4_QWEN4EXP_GDN_REPLAY_ROWS) return;
-    const uint32_t key_dim = n_key_head * QWEN4EXP_GDN_DIM;
-    const uint32_t value_dim = n_value_head * QWEN4EXP_GDN_DIM;
-    const uint32_t conv_dim = 2u * key_dim + value_dim;
-    const uint32_t tape_stride = (key_dim + value_dim + 2u * n_value_head + 3u) & ~3u;
-    const uint32_t repeats = n_value_head / n_key_head;
-    const uint32_t key_head = head_layout != 0u ? head % n_key_head : head / repeats;
-    const uint32_t key_writer = head_layout != 0u ? key_head : key_head * repeats;
-    const uint32_t k0 = lane * 4u;
-    const uint64_t state_off = ((uint64_t)head * QWEN4EXP_GDN_DIM + value) *
-                               QWEN4EXP_GDN_DIM + k0;
-    float4 h = *(const float4 *)(checkpoint + state_off);
-    for (uint32_t step = 0; step < prefix + n_tokens; step++) {
-        const bool replay = step < prefix;
-        const uint32_t token = replay ? 0u : step - prefix;
-        const float *const saved = tape + (uint64_t)(replay ? step : 0u) * tape_stride;
-        const uint64_t base = (uint64_t)token * conv_dim + key_head * QWEN4EXP_GDN_DIM;
-        const float4 k4 = *(const float4 *)(replay
-            ? saved + key_head * QWEN4EXP_GDN_DIM + k0
-            : qkv + base + key_dim + k0);
-        const float v_row = replay
-            ? saved[key_dim + head * QWEN4EXP_GDN_DIM + value]
-            : qkv[(uint64_t)token * conv_dim + 2u * key_dim +
-                  head * QWEN4EXP_GDN_DIM + value];
-        float g = 0.0f, beta = 0.0f;
-        if (replay) {
-            const float2 pair = ((const float2 *)(saved + key_dim + value_dim))[head];
-            g = pair.x; beta = pair.y;
-        } else {
-            const uint64_t gate = (uint64_t)token * n_value_head + head;
-            if (lane == 0u) {
-                const float2 pair = gate_pairs[gate];
-                g = pair.x; beta = pair.y;
             }
             g = __shfl_sync(0xffffffffu, g, 0);
             beta = __shfl_sync(0xffffffffu, beta, 0);
@@ -1667,13 +1455,6 @@ __global__ static void qwen4exp_gdn_output_quant_kernel(
  * `out_q8`, when given (one row of prefill only), receives the output norm as
  * the Q8_0 bytes and scales the ssm_out projection reads, at `q_offset` and
  * `s_offset`, and no float output is written. */
-static int qwen4exp_replay_gate_disjoint(const void *a, uint64_t an,
-                                            const void *b, uint64_t bn) {
-    const uintptr_t ap = (uintptr_t)a, bp = (uintptr_t)b;
-    if (!a || !b || an > UINTPTR_MAX - ap || bn > UINTPTR_MAX - bp) return 0;
-    return ap + an <= bp || bp + bn <= ap;
-}
-
 static int qwen4exp_cuda_gdn_run(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *conv_state,
@@ -1836,51 +1617,6 @@ static int qwen4exp_cuda_gdn_run(
         logical_tier, "GDN output norm");
     if (!conv_weight || !a_log || !dt_bias || !output_norm) return 0;
 
-    float2 *replay_gates = NULL;
-    if (replay && replay->gate_scratch) {
-        const ds4_gpu_tensor *scratch = replay->gate_scratch;
-        if (!glm53_cuda_tensor_has(scratch, gate_elements, sizeof(float2)) ||
-            ((uintptr_t)scratch->ptr & (alignof(float2) - 1u)) ||
-            ds4_tensor_device_idx(scratch) != logical_tier) return 0;
-        const ds4_gpu_tensor *live[] = {out, conv_state, recurrent_state,
-            conv_snapshot, state_snapshot, qkv, raw_alpha, raw_beta, output_gate,
-            out_q8, adopt, replay->checkpoint, replay->tape, replay->control};
-        for (const ds4_gpu_tensor *t : live)
-            if (t && !qwen4exp_replay_gate_disjoint(scratch->ptr, scratch->bytes,
-                                                   t->ptr, t->bytes)) return 0;
-        if (!qwen4exp_replay_gate_disjoint(scratch->ptr, scratch->bytes,
-                                           conv_weight, conv_dim * 4u * sizeof(float)) ||
-            !qwen4exp_replay_gate_disjoint(scratch->ptr, scratch->bytes,
-                                           a_log, n_value_head * sizeof(float)) ||
-            !qwen4exp_replay_gate_disjoint(scratch->ptr, scratch->bytes,
-                                           dt_bias, n_value_head * sizeof(float)) ||
-            !qwen4exp_replay_gate_disjoint(scratch->ptr, scratch->bytes,
-                                           output_norm, QWEN4EXP_GDN_DIM * sizeof(float))) return 0;
-        int device = -1;
-        cudaPointerAttributes attr = {};
-        if (!cuda_ok(cudaGetDevice(&device), "GDN gate scratch device") ||
-            !cuda_ok(cudaPointerGetAttributes(&attr, scratch->ptr),
-                     "GDN gate scratch attributes")) return 0;
-        if ((attr.type != cudaMemoryTypeDevice && attr.type != cudaMemoryTypeManaged) ||
-            attr.device != device) return 0;
-        /* Moving gate reads into convolution is safe only when its writes
-         * cannot change those inputs. Overlapping legacy views retain their
-         * original convolution-then-raw-gate evaluation order. */
-        const void *gate_sources[] = {raw_alpha->ptr, raw_beta->ptr, a_log, dt_bias};
-        const uint64_t gate_bytes[] = {raw_alpha->bytes, raw_beta->bytes,
-            n_value_head * sizeof(float), n_value_head * sizeof(float)};
-        const ds4_gpu_tensor *conv_writes[] = {qkv, conv_state, conv_snapshot};
-        bool early_reads_safe = true;
-        for (unsigned i = 0; i < 4u; ++i)
-            for (const ds4_gpu_tensor *t : conv_writes)
-                if (t && !qwen4exp_replay_gate_disjoint(gate_sources[i], gate_bytes[i],
-                                                       t->ptr, t->bytes))
-                    early_reads_safe = false;
-        if (early_reads_safe && n_key_head == 16u && n_value_head == 48u &&
-            getenv("DS4_QWEN4EXP_NO_GDN_REPLAY_GATES") == NULL)
-            replay_gates = (float2 *)scratch->ptr;
-    }
-
     cudaStream_t stream = cuda_decode_stream();
     const uint32_t blocks = 2u * n_key_head + n_value_head;
 
@@ -1928,14 +1664,6 @@ static int qwen4exp_cuda_gdn_run(
                      "qwen4exp GDN conv history carry")) {
             return 0;
         }
-    } else if (replay_gates) {
-        qwen4exp_gdn_conv_replay_gates_kernel<<<dim3(blocks, n_rows, 1u),
-                QWEN4EXP_GDN_DIM, 0, stream>>>(
-                (float *)qkv->ptr, (float *)conv_state->ptr, conv_weight,
-                (float *)conv_snapshot->ptr, n_key_head, n_value_head, n_rows,
-                n_tokens, n_snapshot_rows, qk_norm_eps, adopt_row, replay_gates,
-                (const float *)raw_alpha->ptr, (const float *)raw_beta->ptr,
-                a_log, dt_bias);
     } else {
         qwen4exp_gdn_conv_kernel<<<dim3(blocks, n_rows, 1u),
                                    QWEN4EXP_GDN_DIM, 0, stream>>>(
@@ -1950,15 +1678,7 @@ static int qwen4exp_cuda_gdn_run(
 
     const dim3 recurrence_grid(
         n_value_head, QWEN4EXP_GDN_DIM / 4u, n_rows);
-    if (replay_gates) {
-        qwen4exp_gdn_replay_gates_kernel<<<recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
-            (float *)out->ptr, (float *)recurrent_state->ptr,
-            (float *)replay->checkpoint->ptr, (float *)replay->tape->ptr,
-            (const float *)qkv->ptr, (const float *)raw_alpha->ptr,
-            (const float *)raw_beta->ptr, replay_gates,
-            n_key_head, n_value_head, n_tokens, head_layout,
-            (const uint32_t *)replay->control->ptr, 0u);
-    } else if (replay) {
+    if (replay) {
         qwen4exp_gdn_replay_kernel<<<recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
             (float *)out->ptr, (float *)recurrent_state->ptr,
             (float *)replay->checkpoint->ptr, (float *)replay->tape->ptr,
@@ -5052,26 +4772,6 @@ qwen4exp_moe_gateup_split_kernel(
     const bool live = row < mid_dim;
     const bool second = (warp & 1u) != 0u;
     uint32_t expert = blockIdx.y;
-    /* The routed gate/up edge, opened on the kernel the COOP decode path runs.
-     *
-     * The dependent launch already exists in this file on
-     * qwen4exp_moe_gateup_q_kernel, and its comment states the mechanism: the
-     * blocks are already up and scheduled when the quantizer's last group
-     * retires, instead of paying a launch behind it.  The coop schedule does
-     * not use that kernel -- it uses this one, and this one was launched
-     * plainly.
-     *
-     * The fence sits ahead of EVERY producer read -- the active list, the
-     * counts/offsets/pairs tables, the quantized activation and the router
-     * weights are all written by the routed quantizer -- so it is placed
-     * unconditionally, not inside the `active` branch: `counts` is read even
-     * when `active` is NULL.  .nc rule: no pointer in this signature carries
-     * __restrict__, so no activation load can be hoisted above the fence as
-     * ld.global.nc.  Deadlock rule: it constrains the PRODUCER, and the
-     * quantizer bounds itself to one wave before it triggers, so a multi-wave
-     * dependent is safe.  Launched plainly -- three rows, every prefill width
-     * -- the fence is a no-op, exactly as it is for the kernel beside it. */
-    QWEN4EXP_PDL_SYNC();
     if (active) {
         if ((int32_t)blockIdx.y >= active[0]) return;
         expert = (uint32_t)active[1 + blockIdx.y];
@@ -5112,9 +4812,41 @@ qwen4exp_moe_gateup_split_kernel(
             wcoop[QW_GU_COOP_U4 + i] =
                 *(const uint4 *)(const void *)(ub + (uint64_t)i * 16u);
         }
+        /* THE FENCE SITS BELOW THE FILL AND ABOVE THE BARRIER, and the order
+         * is the whole point.  The routed-x quantizer ahead of this kernel on
+         * the stream arms a launch-completion trigger at decode width (its
+         * grid is 80 blocks by one or two rows, inside the gate's
+         * `gridDim.y <= 2 && gridDim.x * gridDim.y <= 768`), and that trigger
+         * retired into nothing while this launch was plain.  Taking the edge
+         * only for residency would leave the 11,520-byte panel behind the
+         * quantizer; hoisting the fill above the fence overlaps that DRAM
+         * traffic with the quantizer's tail on all forty-seven q4_K blocks.
+         *
+         * WHAT MAY BE READ ABOVE THE FENCE, and why each one is safe.  The
+         * fill reads `gate` and `up`, which are launch-time constants, at an
+         * offset built from `expert`; `expert`, `cnt` and `base` come from
+         * active[], counts[] and offsets[], all written by the group kernels.
+         * Those kernels are not this launch's programmatic predecessor -- the
+         * quantizer is -- and the quantizer is launched plainly, so it is
+         * stream-ordered after the group kernels and they have retired before
+         * this grid can start.  xq, xs and xsum ARE the quantizer's output and
+         * every read of them sits in the group loop below, under the fence.
+         *
+         * The barrier goes BELOW the fence, not above it: a __syncthreads()
+         * placed above a grid-dependency sync measured -39 bips on this tree,
+         * because it makes every warp wait on the slowest one before any of
+         * them may reach the fence.  None of the pointers carries __restrict__,
+         * so the .nc rule (ds4_cuda_qwen4exp.cuh) needs no change, and nothing
+         * here reorders an accumulation: every dot stays bit-identical. */
+        QWEN4EXP_PDL_SYNC();
         __syncthreads();
         wsh = wcoop + (second ? QW_GU_COOP_U4 : 0u);
         wrow = warp >> 1u;
+    } else {
+        /* The non-coop schedules stage no panel, so there is nothing to hoist
+         * and the fence simply guards the xq/xs/xsum reads below.  A plain
+         * launch leaves it a no-op. */
+        QWEN4EXP_PDL_SYNC();
     }
     for (int32_t at = 0; at < cnt; at += R) {
         const int32_t take = (cnt - at) < R ? (cnt - at) : R;
@@ -5224,21 +4956,7 @@ qwen4exp_moe_gateup_split_kernel(
                 }
             }
         }
-        /* Readers finish before a fast projection warp reuses this tile --
-         * a hazard only a SECOND iteration of this loop can create, so the
-         * barrier is dead whenever there is no second iteration.
-         *
-         * CREDIT: 0xpg (`37816fd`).  At the decode width the body runs exactly
-         * once: `cnt` is counts[expert], the number of (token, slot) pairs
-         * that routed to this block's expert, and a decode round verifies two
-         * rows each selecting ten of 512 experts, so any one expert collects
-         * one or two of the twenty pairs.  R is 2 for every instantiation the
-         * launcher builds, so cnt <= R and `at + R >= cnt` on the first pass.
-         *
-         * The predicate is BLOCK-UNIFORM and therefore cannot deadlock: cnt is
-         * counts[expert] with expert block-invariant, and `at` is loop-uniform.
-         * Prefill, where cnt genuinely exceeds R, takes the barrier exactly as
-         * before, byte for byte. */
+        /* Readers finish before a fast projection warp reuses this tile. */
         if (at + R < cnt) __syncthreads();
     }
 }
