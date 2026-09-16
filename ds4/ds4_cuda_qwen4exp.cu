@@ -7735,6 +7735,28 @@ __global__ static void qwen4exp_ehx_pack_kernel(
     }
 }
 
+/* The MTP head's production width is divisible by four and its three tensor
+ * bases are 16-byte aligned.  Copy two contiguous halves per pair as vector
+ * transactions in that case.  The scalar kernel above remains the exact
+ * fallback for views, unusual widths, and alignment-sensitive callers. */
+__global__ static void qwen4exp_ehx_pack_vec4_kernel(
+        float *out, const float *embedding, const float *hidden,
+        uint32_t n_hc, uint32_t n_embd) {
+    const uint64_t pair = blockIdx.x;
+    const uint32_t t = (uint32_t)(pair / n_hc);
+    const uint64_t dst = pair * 2ull * n_embd;
+    const uint64_t e_src = (uint64_t)t * n_embd;
+    const uint64_t h_src = pair * n_embd;
+    const uint32_t n_vec = n_embd >> 2u;
+    float4 *out4 = (float4 *)out + (dst >> 2u);
+    const float4 *embedding4 = (const float4 *)embedding + (e_src >> 2u);
+    const float4 *hidden4 = (const float4 *)hidden + (h_src >> 2u);
+    for (uint32_t k = threadIdx.x; k < n_vec; k += blockDim.x) {
+        out4[k] = embedding4[k];
+        out4[n_vec + k] = hidden4[k];
+    }
+}
+
 extern "C" int ds4_gpu_qwen4exp_ehx_pack_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *embedding,
@@ -7755,11 +7777,24 @@ extern "C" int ds4_gpu_qwen4exp_ehx_pack_tensor(
         return 0;
     }
     const unsigned threads = 256u;
-    qwen4exp_ehx_pack_kernel<<<
-            (unsigned)pairs, threads, 0,
-            cuda_decode_stream()>>>(
-            (float *)out->ptr, (const float *)embedding->ptr,
-            (const float *)hidden->ptr, n_hc, n_embd);
+    const bool vec4 = (n_embd % 4u) == 0u &&
+        ((uintptr_t)out->ptr & (alignof(float4) - 1u)) == 0u &&
+        ((uintptr_t)embedding->ptr & (alignof(float4) - 1u)) == 0u &&
+        ((uintptr_t)hidden->ptr & (alignof(float4) - 1u)) == 0u &&
+        getenv("DS4_QWEN4EXP_NO_EHX_VEC4") == NULL;
+    if (vec4) {
+        qwen4exp_ehx_pack_vec4_kernel<<<
+                (unsigned)pairs, threads, 0,
+                cuda_decode_stream()>>>(
+                (float *)out->ptr, (const float *)embedding->ptr,
+                (const float *)hidden->ptr, n_hc, n_embd);
+    } else {
+        qwen4exp_ehx_pack_kernel<<<
+                (unsigned)pairs, threads, 0,
+                cuda_decode_stream()>>>(
+                (float *)out->ptr, (const float *)embedding->ptr,
+                (const float *)hidden->ptr, n_hc, n_embd);
+    }
     return cuda_ok(cudaGetLastError(), "qwen4exp ehx pack launch");
 }
 /* Scratch for one expert call: the Q8_0 activation prefix, then the pair
