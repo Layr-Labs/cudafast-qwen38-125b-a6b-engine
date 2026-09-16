@@ -4038,8 +4038,21 @@ qwen4exp_moe_gateup_mma_kernel(
     /* The bounded Q4_K/Q5_K tasks benefit from distinct banks on MMA
      * fragment reads. Padding only these temporary rows trades staging-store
      * conflicts for cheaper repeated fragment loads. The Q8 task and the
-     * ordinary expert loop keep their measured 132-byte layout. */
-    enum { GU_LD = PairTasks && GateType != DS4_QWEN4EXP_TY_q8_0
+     * ordinary expert loop keep their measured 132-byte layout.
+     *
+     * EXCEPT on the DMA arms, which take the 132-byte layout too.  The
+     * launched instance (q4_K, pair tasks, QW_GATEUP_DMA_ARM 5) read
+     * reg=128 smem=25440 occ=3 at 144: the three 144-byte tiles put it 96 B
+     * over the four-CTA shared line, so the __maxnreg__(128) squeeze below
+     * bought nothing.  At 132 it reads reg=128 smem=24288 lmem=0 occ=4 (nvcc
+     * 13.0.88, GB10).  Measured on toymaker (one binary, env-selected
+     * instance, fresh resident per boot, 12 timed 1024-row forwards per
+     * boot): 660.3 vs 671.9 ms mean of per-boot medians, n=3 boots per arm,
+     * every 132 boot below every 144 boot.  A layout-only change: the
+     * parity store takes its word form, which writes the same eight words to
+     * the same tile addresses, and every MMA operand and accumulation order
+     * is untouched (frontier golden 18/18 byte-identical). */
+    enum { GU_LD = PairTasks && GateType != DS4_QWEN4EXP_TY_q8_0 && Dma == 0
                        ? 144 : QW_MMA_LD };
     __shared__ __align__(16) int8_t sAg[QW_MMA_BM * GU_LD];
     __shared__ __align__(16) int8_t sAu[QW_MMA_BM * GU_LD];
@@ -14691,7 +14704,7 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
      * cap is pointless and the target is those 160 bytes. */
     if (cudaFuncGetAttributes(
             &a, qwen4exp_moe_gateup_mma_kernel<DS4_QWEN4EXP_TY_q4_K,
-                                               DS4_QWEN4EXP_TY_q4_K, false,
+                                               DS4_QWEN4EXP_TY_q4_K, true,
                                                QW_GATEUP_DMA_ARM>) ==
         cudaSuccess) {
         mg_regs = a.numRegs;
@@ -14703,7 +14716,7 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
     if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
             &occ,
             qwen4exp_moe_gateup_mma_kernel<DS4_QWEN4EXP_TY_q4_K,
-                                           DS4_QWEN4EXP_TY_q4_K, false,
+                                           DS4_QWEN4EXP_TY_q4_K, true,
                                            QW_GATEUP_DMA_ARM>,
             (int)QW_MMA_THREADS, 0) == cudaSuccess) {
         mg_occ = occ;
