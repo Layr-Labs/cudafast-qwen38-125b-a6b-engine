@@ -1475,6 +1475,17 @@ static bool qw_qsa_gate_from_doubled(uint32_t n_tokens, uint32_t q_width,
 /* The GDN block.  head_layout is TILED for anything the loader bound: the
  * llama.cpp converter reorders the value heads into ggml's broadcast order and
  * the binder does not undo it, so value head j reads key head j % n_key_head. */
+/* A shape decision shared by capture and replay; no host-side validity bit
+ * can become stale when one island replays while another is encoded. */
+static bool qwen4exp_attention_mix_q8(uint32_t rows) {
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    return rows >= 1u && rows <= 3u;
+#else
+    (void)rows;
+    return false;
+#endif
+}
+
 static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
                                      const ds4_qwen4exp_layer_weights *l,
                                      const ds4_model *m,
@@ -1489,7 +1500,8 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
      * session scratch: both GDN Q8 projections read the same mixed input.
      * The F32 alpha/beta projections still read the original float values.
      * Width-specific graph islands capture a stable scratch and scale offset. */
-    if (!ds4_qwen4exp_quantize_q8_0(s->mixed_q8, 0, q8_soff, s->mixed,
+    if (!qwen4exp_attention_mix_q8(n_tokens) &&
+        !ds4_qwen4exp_quantize_q8_0(s->mixed_q8, 0, q8_soff, s->mixed,
                                     DS4_N_EMBD, n_tokens)) {
         fprintf(stderr, "ds4: qwen4exp GDN pre-quantize failed at block %u\n", il);
         return false;
@@ -1622,7 +1634,8 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
     const uint64_t q8_qbytes = (uint64_t)n_tokens * q8_blocks * 32u;
     const uint64_t q8_soff = (q8_qbytes + 15u) & ~15ull;
 
-    if (!ds4_qwen4exp_quantize_q8_0(s->mixed_q8, 0, q8_soff, s->mixed,
+    if (!qwen4exp_attention_mix_q8(n_tokens) &&
+        !ds4_qwen4exp_quantize_q8_0(s->mixed_q8, 0, q8_soff, s->mixed,
                                     DS4_N_EMBD, n_tokens)) {
         fprintf(stderr, "ds4: qwen4exp QSA pre-quantize failed at block %u\n", il);
         return false;
@@ -2163,7 +2176,7 @@ static bool qwen4exp_graph_residual(ds4_qwen4exp_session *s,
                                     const ds4_tensor *up,
                                     const ds4_tensor *inject,
                                     float norm_weight_offset,
-                                    uint32_t n_tokens) {
+                                    uint32_t n_tokens, bool attention) {
     /* An owed inject is applied by the mixer itself, inside its first read
      * of the residual; the pair (inject kernel, mixer) is what it computes. */
     const bool pending = s->hc_pending;
@@ -2187,6 +2200,24 @@ static bool qwen4exp_graph_residual(ds4_qwen4exp_session *s,
     const ds4_gpu_qwen4exp_slab up_slab = QW_SLAB(m, up);
     const ds4_gpu_qwen4exp_slab inject_slab =
         inject ? QW_SLAB(m, inject) : (ds4_gpu_qwen4exp_slab){0};
+
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (attention && qwen4exp_attention_mix_q8(n_tokens)) {
+        if (pending && !ds4_gpu_qwen4exp_hc_inject_tensor(
+                s->hyper, s->hyper, s->block_out, s->inject,
+                DS4_N_EMBD, DS4_N_HC, n_tokens)) return false;
+        const uint64_t qbytes = (uint64_t)n_tokens * DS4_N_EMBD;
+        const uint64_t soff = (qbytes + 15u) & ~15ull;
+        return ds4_gpu_qwen4exp_hc_mixer_q8_tensor(
+                s->mixed, inject ? s->inject : NULL, s->normed, s->lowrank,
+                s->wide, s->hyper, &norm_slab, &down_slab, &up_slab,
+                inject ? &inject_slab : NULL,
+                DS4_N_EMBD, DS4_N_HC, DS4_N_HC_LOWRANK, n_tokens,
+                DS4_HC_EPS, norm_weight_offset, 1, s->mixed_q8, 0, soff) != 0;
+    }
+#else
+    (void)attention;
+#endif
 
     if (pending) {
         return ds4_gpu_qwen4exp_hc_mixer_pending_tensor(
@@ -2216,7 +2247,7 @@ static bool qwen4exp_graph_layer_island_encode(
         /* --- attention side ------------------------------------------- */
         if (!qwen4exp_graph_residual(s, m, l->hc_attn_norm, l->hc_attn_down,
                                      l->hc_attn_up, l->hc_attn_inject,
-                                     l->hc_attn_norm_offset, n_tokens)) {
+                                     l->hc_attn_norm_offset, n_tokens, true)) {
             fprintf(stderr, "ds4: qwen4exp attention mixer failed at block %u\n", il);
             return false;
         }
@@ -2243,7 +2274,7 @@ static bool qwen4exp_graph_layer_island_encode(
         /* --- feed-forward side ---------------------------------------- */
         if (!qwen4exp_graph_residual(s, m, l->hc_ffn_norm, l->hc_ffn_down,
                                      l->hc_ffn_up, l->hc_ffn_inject,
-                                     l->hc_ffn_norm_offset, n_tokens)) {
+                                     l->hc_ffn_norm_offset, n_tokens, false)) {
             fprintf(stderr, "ds4: qwen4exp FFN mixer failed at block %u\n", il);
             return false;
         }
@@ -2840,7 +2871,7 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
      * n_embd and stands in for the model.norm this checkpoint does not have. */
     if (!qwen4exp_graph_residual(s, m, w->output_hc_norm, w->output_hc_down,
                                  w->output_hc_up, NULL,
-                                 w->output_hc_norm_offset, n_tokens)) {
+                                 w->output_hc_norm_offset, n_tokens, false)) {
         fprintf(stderr, "ds4: qwen4exp final mixer failed\n");
         return qwen4exp_forward_fail();
     }
@@ -3151,13 +3182,14 @@ static bool qwen4exp_graph_head_cache_encode(ds4_qwen4exp_session *s,
         uint32_t il, uint32_t n_tokens) {
     const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
     if (!qwen4exp_graph_residual(s, m, l->hc_attn_norm, l->hc_attn_down,
-            l->hc_attn_up, l->hc_attn_inject, l->hc_attn_norm_offset, n_tokens))
+            l->hc_attn_up, l->hc_attn_inject, l->hc_attn_norm_offset, n_tokens, true))
         return false;
     const uint64_t blocks = (uint64_t)DS4_N_EMBD / 32u;
     const uint64_t qbytes = (uint64_t)n_tokens * blocks * 32u;
     const uint64_t soff = (qbytes + 15u) & ~15ull;
-    if (!ds4_qwen4exp_quantize_q8_0(s->mixed_q8, 0, soff, s->mixed,
-                                   DS4_N_EMBD, n_tokens) ||
+    if ((!qwen4exp_attention_mix_q8(n_tokens) &&
+         !ds4_qwen4exp_quantize_q8_0(s->mixed_q8, 0, soff, s->mixed,
+                                    DS4_N_EMBD, n_tokens)) ||
         !ds4_qwen4exp_matmul_q8_0_preq(s->qsa_kin, QW_MAP(m, l->attn_k),
             QW_MAPSZ(m, l->attn_k), QW_OFF(l->attn_k), DS4_N_EMBD,
             cfg->qsa_kv_dim, s->mixed_q8, 0, soff, n_tokens) ||
@@ -3217,7 +3249,7 @@ static bool qwen4exp_graph_head_block_encode(
     const char *stage = "attention mixer";
     bool ok = qwen4exp_graph_residual(s, m, l->hc_attn_norm, l->hc_attn_down,
                                       l->hc_attn_up, l->hc_attn_inject,
-                                      l->hc_attn_norm_offset, n_tokens);
+                                      l->hc_attn_norm_offset, n_tokens, true);
     QW_HB_TICK(QW_HB_T_ATTN_MIX);
     if (ok) { stage = "QSA"; ok = qwen4exp_graph_qsa_block(s, l, m, il, n_tokens); }
     QW_HB_TICK(QW_HB_T_QSA);
@@ -3232,7 +3264,7 @@ static bool qwen4exp_graph_head_block_encode(
         stage = "FFN mixer";
         ok = qwen4exp_graph_residual(s, m, l->hc_ffn_norm, l->hc_ffn_down,
                                      l->hc_ffn_up, l->hc_ffn_inject,
-                                     l->hc_ffn_norm_offset, n_tokens);
+                                     l->hc_ffn_norm_offset, n_tokens, false);
     }
     QW_HB_TICK(QW_HB_T_FFN_MIX);
     if (ok) {
@@ -3496,7 +3528,7 @@ bool ds4_qwen4exp_graph_head_logits(ds4_qwen4exp_session       *s,
     }
     if (!qwen4exp_graph_residual(s, m, w->output_hc_norm, w->output_hc_down,
                                  w->output_hc_up, NULL,
-                                 w->output_hc_norm_offset, 1u)) {
+                                 w->output_hc_norm_offset, 1u, false)) {
         fprintf(stderr, "ds4: qwen4exp final mixer failed on the head row\n");
         return qwen4exp_forward_fail();
     }
