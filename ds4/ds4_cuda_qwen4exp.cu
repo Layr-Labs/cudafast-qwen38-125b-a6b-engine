@@ -10897,6 +10897,108 @@ __global__ static void qwen4exp_qsa_indexer_select_kernel(
 
     int32_t *ids = qwen4exp_select_shared;
     const int32_t sentinel = 0x7fffffff;
+
+    /* Bitmap selection instead of the bitonic sort, when the pool fits the
+     * shared budget.  The sort below exists only to emit the valid candidate
+     * blocks in ASCENDING block order: every output element is
+     * ids[i/pool_size]*pool_size + i%pool_size, so the order the dst writes
+     * see is the order of the block ids themselves.  A set bit per block id
+     * carries exactly that order for free: bit b of word w is block
+     * 32w + b, and scanning words low to high, bits low to high, visits the
+     * valid blocks in the same ascending sequence the sort produced.
+     *
+     * THE OUTPUT IS THE SORT'S, ELEMENT FOR ELEMENT.  topk holds each
+     * candidate position at most once (it is a top-k over distinct pool
+     * indices), so a bitmap loses nothing to deduplication; the same
+     * candidate/score predicate sets the bit that the sort kept as a
+     * non-sentinel entry; n_valid is the popcount total, which is the
+     * sentinel scan's count; and rank r maps to the r-th set bit, which is
+     * the r-th smallest valid block id -- ids[r] after the sort.  The
+     * block_tokens/own_count/total arithmetic and the dst writes below are
+     * unchanged.
+     *
+     * The budget: the launch gives this block sort_width int32 of shared.
+     * The bitmap needs ceil(n_blocks/32) words plus one word_base each, so
+     * the path requires n_blocks <= 16*sort_width (8192 pool blocks at the
+     * model's 512-wide sort, i.e. a 32768-token context).  nth >= 32 keeps
+     * the warp scan legal.  Anything wider keeps the bitonic sort. */
+    const uint32_t n_words = (n_blocks + 31u) >> 5;
+    if (n_words * 2u <= sort_width && nth >= 32u) {
+        uint32_t *bits = (uint32_t *)qwen4exp_select_shared;
+        uint32_t *wbase = bits + n_words;
+        for (uint32_t i = tid; i < n_words; i += nth) bits[i] = 0u;
+        __syncthreads();
+        for (uint32_t i = tid; i < top_k; i += nth) {
+            const int32_t candidate = topk[(uint64_t)token * top_k + i];
+            if (candidate >= 0 && (uint32_t)candidate < n_blocks) {
+                const float score =
+                    scores[(uint64_t)token * n_blocks + (uint32_t)candidate];
+                if (score > QWEN4EXP_QSA_MASKED_LIMIT) {
+                    atomicOr(&bits[(uint32_t)candidate >> 5],
+                             1u << ((uint32_t)candidate & 31u));
+                }
+            }
+        }
+        __syncthreads();
+
+        /* Exclusive prefix over the per-word popcounts, one warp: lane l
+         * sums words l, l+32, ..., warp-scans the lane sums, then walks its
+         * own word run again writing each word's base.  n_words <=
+         * sort_width/2 <= 256 here, so the scan is exact. */
+        if (tid < 32u) {
+            uint32_t s = 0u;
+            for (uint32_t w = tid; w < n_words; w += 32u)
+                s += (uint32_t)__popc(bits[w]);
+            uint32_t incl = s;
+#pragma unroll
+            for (uint32_t off = 1u; off < 32u; off <<= 1u) {
+                const uint32_t t =
+                    __shfl_up_sync(0xffffffffu, incl, off);
+                if (tid >= off) incl += t;
+            }
+            uint32_t run = incl - s;
+            for (uint32_t w = tid; w < n_words; w += 32u) {
+                wbase[w] = run;
+                run += (uint32_t)__popc(bits[w]);
+            }
+            if (tid == 31u) n_valid = incl;
+        }
+        __syncthreads();
+
+        const uint32_t m = n_valid;
+        const uint32_t block_tokens = m * pool_size;
+        const uint32_t pos = pos0 + token;
+        const uint32_t complete = (pos + 1u) / pool_size;
+        const uint32_t own_start = complete * pool_size;
+        const uint32_t own_count = pos + 1u - own_start;
+        const uint32_t total = block_tokens + own_count;
+
+        int32_t *dst = selected + (uint64_t)token * max_selected;
+        for (uint32_t i = tid; i < max_selected; i += nth) {
+            if (i < block_tokens) {
+                /* rank -> block: the word whose base is the largest <= rank,
+                 * then the (rank - base)-th set bit inside it. */
+                const uint32_t rank = i / pool_size;
+                uint32_t lo = 0u, hi = n_words;
+                while (hi - lo > 1u) {
+                    const uint32_t mid = (lo + hi) >> 1u;
+                    if (wbase[mid] <= rank) lo = mid; else hi = mid;
+                }
+                uint32_t word = bits[lo];
+                for (uint32_t b = rank - wbase[lo]; b > 0u; b--)
+                    word &= word - 1u;
+                const uint32_t blk = lo * 32u + (uint32_t)(__ffs(word) - 1);
+                dst[i] = (int32_t)(blk * pool_size + (i % pool_size));
+            } else if (i < total) {
+                dst[i] = (int32_t)(own_start + (i - block_tokens));
+            } else {
+                dst[i] = -1;
+            }
+        }
+        if (tid == 0u) counts[token] = (int32_t)total;
+        return;
+    }
+
     for (uint32_t i = tid; i < sort_width; i += nth) {
         int32_t block = sentinel;
         if (i < top_k) {
