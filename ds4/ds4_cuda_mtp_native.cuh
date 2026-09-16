@@ -10,6 +10,19 @@ static constexpr uint32_t MTP_NATIVE_DIM = 2560u;
  * out, and the live_pairs mask already names a partial wave (40 groups left the
  * second warp with 8). This changes the coarse proposal heuristic, not the
  * selected-row dots. */
+/* MEASURED AT SIXTEEN, AND IT MOVED NOTHING.  The paragraph above argues that
+ * narrowing this is a proposal-policy change rather than an exact one; sixteen
+ * groups was run to test the argument, and both the committed token stream and
+ * the draft counters came back identical to twenty-four's.
+ *
+ * Identical is not guaranteed -- a narrower screen may hand the refinement a
+ * different shortlist, and a different shortlist may propose a different
+ * draft.  What IS guaranteed is that it cannot be wrong: the refinement
+ * re-scores the shortlist exactly over the full 80 groups, and the target
+ * verifies every token the draft emits, so this constant sits entirely
+ * upstream of correctness and can only ever cost acceptances.  At sixteen it
+ * cost none.  This number is a proposal budget; the exactness lives in the
+ * refinement. */
 static constexpr uint32_t MTP_NATIVE_SCREEN_GROUPS = 24u;
 static constexpr uint32_t MTP_NATIVE_MAX_WIDTH = 1u << 20;
 template <bool Screen, bool EmitKeys = false>
