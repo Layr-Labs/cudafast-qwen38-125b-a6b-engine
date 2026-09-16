@@ -18583,6 +18583,160 @@ extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_
     return cuda_ok(cudaGetLastError(), "matmul_f32 launch");
 }
 
+/* A shared-memory tiled F32 projection for PREFILL widths.
+ *
+ * The warp-tile kernel above keeps every operand in registers and reads both
+ * matrices straight from global memory.  That costs 255 registers for its
+ * accumulators alone, which holds the device to two blocks per multiprocessor,
+ * and it re-reads each weight column once per row group and each activation
+ * row once per column group.  The geometry itself was swept (TM and TN) and is
+ * the best that arrangement allows; what it cannot do is share an operand
+ * between warps.
+ *
+ * This kernel does.  One block stages a 64-row by 16-deep slab of the
+ * activations and a 64-column by 16-deep slab of the weights into shared
+ * memory, and every thread reads its operands from there: each staged value is
+ * used by eight threads instead of being fetched eight times.  Thirty-two
+ * accumulators per thread instead of a hundred and ninety-two registers of
+ * them leaves room for several blocks per multiprocessor.
+ *
+ * It does NOT reproduce the warp-tile kernel's accumulation order -- it walks k
+ * in slabs of sixteen rather than in the 256-strided butterfly that kernel uses
+ * to match the one-row path.  That is why it is reachable only above the
+ * speculative commit width, where the caller has already established that the
+ * one-row order is not required; at and below that width the exact kernel is
+ * still what runs.
+ *
+ * Both matrices are row-major with k contiguous (x is [row][k] and w is
+ * [col][k]), so each staging load is a float4 and each store is four shared
+ * words.  in_dim must be a multiple of the k slab and out_dim a multiple of the
+ * column tile; the caller checks both and falls back when they do not hold. */
+#define DS4_F32_SMEM_BM 64
+#define DS4_F32_SMEM_BN 64
+#define DS4_F32_SMEM_BK 16
+#define DS4_F32_SMEM_TM 8
+#define DS4_F32_SMEM_TN 4
+#define DS4_F32_SMEM_THREADS 128
+
+__global__ __launch_bounds__(DS4_F32_SMEM_THREADS)
+static void matmul_f32_smem_tile_kernel(
+        float *__restrict__ out,
+        const float *__restrict__ w,
+        const float *__restrict__ x,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint32_t n_rows) {
+    __shared__ float As[DS4_F32_SMEM_BK][DS4_F32_SMEM_BM];
+    __shared__ float Bs[DS4_F32_SMEM_BK][DS4_F32_SMEM_BN];
+
+    const uint32_t tid  = threadIdx.x;
+    const uint32_t row0 = blockIdx.y * (uint32_t)DS4_F32_SMEM_BM;
+    const uint32_t col0 = blockIdx.x * (uint32_t)DS4_F32_SMEM_BN;
+
+    /* Thread grid: eight rows of sixteen.  Each thread owns TM rows and TN
+     * columns of the block tile. */
+    const uint32_t ty = tid >> 4;          /* 0..7   */
+    const uint32_t tx = tid & 15u;         /* 0..15  */
+    const uint32_t r_base = ty * (uint32_t)DS4_F32_SMEM_TM;
+    const uint32_t c_base = tx * (uint32_t)DS4_F32_SMEM_TN;
+
+    /* Staging: 64 x 16 floats per matrix, as float4, by 128 threads -> two
+     * float4 each.  Lane picks a (line, quad) pair; the quad is the k offset. */
+    const uint32_t ld_row = tid >> 2;      /* 0..31 : which of 64, first half */
+    const uint32_t ld_k4  = (tid & 3u) * 4u;
+
+    float acc[DS4_F32_SMEM_TM][DS4_F32_SMEM_TN];
+#pragma unroll
+    for (int t = 0; t < DS4_F32_SMEM_TM; t++)
+#pragma unroll
+        for (int c = 0; c < DS4_F32_SMEM_TN; c++) acc[t][c] = 0.0f;
+
+    for (uint64_t k0 = 0; k0 < in_dim; k0 += (uint64_t)DS4_F32_SMEM_BK) {
+#pragma unroll
+        for (int half = 0; half < 2; half++) {
+            const uint32_t sr = ld_row + (uint32_t)half * 32u;
+            const uint32_t gr = row0 + sr;
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (gr < n_rows) {
+                v = *(const float4 *)(x + (uint64_t)gr * in_dim + k0 + ld_k4);
+            }
+            As[ld_k4 + 0][sr] = v.x;
+            As[ld_k4 + 1][sr] = v.y;
+            As[ld_k4 + 2][sr] = v.z;
+            As[ld_k4 + 3][sr] = v.w;
+
+            const uint32_t gc = col0 + sr;
+            const float4 u =
+                *(const float4 *)(w + (uint64_t)gc * in_dim + k0 + ld_k4);
+            Bs[ld_k4 + 0][sr] = u.x;
+            Bs[ld_k4 + 1][sr] = u.y;
+            Bs[ld_k4 + 2][sr] = u.z;
+            Bs[ld_k4 + 3][sr] = u.w;
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int kk = 0; kk < DS4_F32_SMEM_BK; kk++) {
+            float av[DS4_F32_SMEM_TM], bv[DS4_F32_SMEM_TN];
+#pragma unroll
+            for (int t = 0; t < DS4_F32_SMEM_TM; t++) av[t] = As[kk][r_base + t];
+#pragma unroll
+            for (int c = 0; c < DS4_F32_SMEM_TN; c++) bv[c] = Bs[kk][c_base + c];
+#pragma unroll
+            for (int t = 0; t < DS4_F32_SMEM_TM; t++)
+#pragma unroll
+                for (int c = 0; c < DS4_F32_SMEM_TN; c++)
+                    acc[t][c] = __fmaf_rn(av[t], bv[c], acc[t][c]);
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int t = 0; t < DS4_F32_SMEM_TM; t++) {
+        const uint32_t gr = row0 + r_base + (uint32_t)t;
+        if (gr >= n_rows) continue;
+#pragma unroll
+        for (int c = 0; c < DS4_F32_SMEM_TN; c++) {
+            out[(uint64_t)gr * out_dim + (uint64_t)(col0 + c_base + c)] =
+                acc[t][c];
+        }
+    }
+}
+
+extern "C" int ds4_gpu_matmul_f32_prefill_tile_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint32_t n_rows) {
+    if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_rows == 0) return 0;
+    if ((in_dim % (uint64_t)DS4_F32_SMEM_BK) != 0u) return 0;
+    if ((out_dim % (uint64_t)DS4_F32_SMEM_BN) != 0u) return 0;
+    if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
+    const uint64_t weight_elems = in_dim * out_dim;
+    if (weight_elems > UINT64_MAX / sizeof(float)) return 0;
+    const uint64_t weight_bytes = weight_elems * sizeof(float);
+    if (weight_bytes > model_size - weight_offset) return 0;
+    if (x->bytes < (uint64_t)n_rows * in_dim * sizeof(float) ||
+        out->bytes < (uint64_t)n_rows * out_dim * sizeof(float)) return 0;
+
+    const int tier = ds4_tensor_device_idx(out);
+    const char *w = cuda_resolve_weight_ptr(model_map, weight_offset,
+                                            weight_bytes, tier,
+                                            "f32 prefill tile");
+    if (!w) return 0;
+    /* The float4 staging loads need both bases sixteen-byte aligned. */
+    if ((((uintptr_t)w | (uintptr_t)x->ptr) & 15u) != 0u) return 0;
+
+    dim3 grid((unsigned)(out_dim / (uint64_t)DS4_F32_SMEM_BN),
+              (n_rows + (uint32_t)DS4_F32_SMEM_BM - 1u) / (uint32_t)DS4_F32_SMEM_BM,
+              1);
+    matmul_f32_smem_tile_kernel<<<grid, DS4_F32_SMEM_THREADS, 0,
+                                  cuda_decode_stream()>>>(
+            (float *)out->ptr, (const float *)w, (const float *)x->ptr,
+            in_dim, out_dim, n_rows);
+    return cuda_ok(cudaGetLastError(), "matmul_f32 smem tile launch");
+}
+
+
 /* matmul_f32_kernel's arithmetic, with the weight row read ONCE for a tile of
  * R activation rows.
  *
