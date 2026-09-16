@@ -17615,8 +17615,11 @@ static int cuda_matmul_q8_0_preq_rows_exact(
 
     const int use_dp4a = cuda_q8_use_dp4a();
     /* The depth-2 verify (three rows) stays on the decode-width kernels
-     * below.  At three rows no producer carries a PDL trigger, so every
-     * three-row consumer is launched plainly and its fence is a no-op.
+     * below.  The decode quantizer carries a PDL trigger at these widths
+     * (n_rows <= 7, single-wave grid), so the general-dense three- and
+     * four-row consumers below are launched through QWEN4EXP_LAUNCH_PDL and
+     * their weight prefetch rides the quantizer's window; the HC producers
+     * do not trigger past two rows, so the HC verify launches stay plain.
      * DS4_QWEN4EXP_NO_WIDE_VERIFY restores the <= 2 gates. */
     const bool wide_verify3 = (n_rows == 3u || n_rows == 4u) &&
         getenv("DS4_QWEN4EXP_NO_WIDE_VERIFY") == NULL;
@@ -17729,18 +17732,24 @@ static int cuda_matmul_q8_0_preq_rows_exact(
             } else if (n_rows == 4u ||
                        (n_rows == 3u &&
                         getenv("DS4_QWEN4EXP_WIDE_VERIFY_R2") == NULL)) {
-                /* One four-row tile: the weight read once for three rows. */
-                matmul_q8_0_preq_pair_lanes_kernel<4, false><<<
-                        dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u),
-                        256, 0, cuda_decode_stream()>>>(
+                /* One four-row tile: the weight read once for three rows.
+                 * PDL consumer: the stream predecessor is the decode
+                 * quantizer, which triggers at its top at these widths
+                 * (n_rows <= 7 and a single-wave grid). */
+                QWEN4EXP_LAUNCH_PDL(
+                        (matmul_q8_0_preq_pair_lanes_kernel<4, false>),
+                        (dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u)),
+                        256, 0, cuda_decode_stream(),
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
                         out_dim, n_rows, blocks);
             } else if (n_rows == 3u) {
-                /* The same two-row tile kernel over two tiles, launched
-                 * plainly (no producer triggers at three rows). */
-                matmul_q8_0_preq_pair_lanes_kernel<2, false><<<
-                        dim3((unsigned)((out_dim + 3u) / 4u), 2u, 1u),
-                        256, 0, cuda_decode_stream()>>>(
+                /* The same two-row tile kernel over two tiles.  PDL
+                 * consumer: the stream predecessor is the decode quantizer,
+                 * which triggers at its top at this width. */
+                QWEN4EXP_LAUNCH_PDL(
+                        (matmul_q8_0_preq_pair_lanes_kernel<2, false>),
+                        (dim3((unsigned)((out_dim + 3u) / 4u), 2u, 1u)),
+                        256, 0, cuda_decode_stream(),
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
                         out_dim, n_rows, blocks);
             } else {
