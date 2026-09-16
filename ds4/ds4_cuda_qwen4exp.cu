@@ -4620,6 +4620,132 @@ qwen4exp_moe_gateup_split_kernel(
     }
 }
 
+/* Two output rows, four quantization groups per integer MMA. Matrix A's
+ * sixteen rows interleave the four (gate/up, output-row) rows and two low
+ * group bits. B's eight columns are four groups for each of two tokens.
+ * Cross-group integer products are discarded. The selected diagonal places
+ * ONE useful result in every lane, so float scaling does not pay for the
+ * six padded token columns of a conventional narrow m16n8 tile.
+ *
+ * A lane keeps one ORIGINAL group residue modulo 32 and walks g,g+32,g+64.
+ * Publishing those 32 partials then calling the original warp_sum_f32
+ * preserves every float accumulation and reduction operand. Only the exact
+ * 32-element signed integer dot moves from DP4A to MMA. The shared panel is
+ * a verbatim copy of the original q4_K bytes, with the same block lifetime.
+ * Other widths/formats/alignment paths retain the original kernels. */
+__global__ static void qwen4exp_moe_gateup_diagonal_mma_kernel(
+        float *mid, const char *gate, const char *up,
+        const int8_t *xq, const float *xs, const int32_t *xsum,
+        const int32_t *pairs, const int32_t *counts, const int32_t *offsets,
+        const int32_t *active, const float *weights,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
+        uint64_t up_expert_bytes, uint64_t up_row_bytes,
+        uint32_t gate_type, uint32_t up_type, uint32_t groups,
+        uint32_t mid_dim, uint32_t mid_token_stride, uint32_t n_expert_used) {
+    if (groups != 80u || gate_row_bytes != 1440u || up_row_bytes != 1440u ||
+        gate_type != DS4_QWEN4EXP_TY_q4_K || up_type != DS4_QWEN4EXP_TY_q4_K)
+        return;
+    uint32_t expert = blockIdx.y;
+    if (active) {
+        if ((int32_t)blockIdx.y >= active[0]) return;
+        expert = (uint32_t)active[1u + blockIdx.y];
+    }
+    const int32_t cnt = counts[expert];
+    if (cnt <= 0) return;
+    const uint32_t row0 = blockIdx.x * 2u;
+    if (row0 >= mid_dim) return;
+    const uint32_t rows_here = mid_dim - row0 < 2u ? mid_dim - row0 : 2u;
+    const int32_t base = offsets[expert];
+    const uint32_t lane = threadIdx.x & 31u, warp = threadIdx.x >> 5u;
+    const uint32_t quad = lane & 3u, lane_group = lane >> 2u;
+    const uint32_t matrix_row = lane_group >> 1u; /* gate0,up0,gate1,up1 */
+    const uint32_t panel_row = (matrix_row & 1u) * 180u + (matrix_row >> 1u) * 90u;
+    const bool live = (matrix_row >> 1u) < rows_here;
+    const uint32_t residue = warp * 4u + (lane_group & 1u) + (quad & 1u) * 2u;
+    const uint32_t token_col = quad >> 1u;
+    __shared__ __align__(16) uint4 panel[360];
+    /* Four padding floats make this lane permutation's stores hit distinct
+     * banks: bank = 8*matrix_row + 4*token_col + residue (mod 32).
+     * Reads still take 32 consecutive floats for the original reduction. */
+    __shared__ float partial[4][2][36];
+    __shared__ float projected[4][2];
+    const char *gb = gate + (uint64_t)expert * gate_expert_bytes +
+                           (uint64_t)row0 * gate_row_bytes;
+    const char *ub = up + (uint64_t)expert * up_expert_bytes +
+                         (uint64_t)row0 * up_row_bytes;
+    for (uint32_t i = threadIdx.x; i < rows_here * 90u; i += blockDim.x) {
+        panel[i] = *(const uint4 *)(const void *)(gb + (uint64_t)i * 16u);
+        panel[180u + i] = *(const uint4 *)(const void *)(ub + (uint64_t)i * 16u);
+    }
+    __syncthreads();
+    for (int32_t at = 0; at < cnt; at += 2) {
+        const uint32_t take = (cnt - at) < 2 ? (uint32_t)(cnt - at) : 2u;
+        const uint32_t tok0 = (uint32_t)pairs[base + at] / n_expert_used;
+        const uint32_t tok1 = (uint32_t)pairs[base + at + (take > 1u)] / n_expert_used;
+        float acc = 0.0f;
+        for (uint32_t chunk = warp * 4u; chunk < groups; chunk += 32u) {
+            uint32_t a[4] = {0u, 0u, 0u, 0u};
+            const uint32_t ga = chunk + (lane_group & 1u);
+            if (live) {
+#pragma unroll
+                for (int half = 0; half < 2; half++) {
+                    const uint32_t g = ga + (uint32_t)half * 2u;
+                    const uint32_t at_word = (panel_row + (g >> 3u) * 9u +
+                        1u + ((g & 7u) >> 1u) * 2u) * 4u + quad;
+                    const uint32_t *raw = (const uint32_t *)(const void *)panel;
+                    const uint32_t shift = (g & 1u) * 4u;
+                    a[half] = (raw[at_word] >> shift) & 0x0f0f0f0fu;
+                    a[half + 2] = (raw[at_word + 4u] >> shift) & 0x0f0f0f0fu;
+                }
+            }
+            uint32_t b[2] = {0u, 0u};
+            const uint32_t bt = lane_group >> 2u;
+            if (bt < take) {
+                const uint32_t bg = chunk + (lane_group & 3u);
+                const uint32_t token = bt ? tok1 : tok0;
+                const int8_t *xp = xq + ((uint64_t)token * groups + bg) * 32u + quad * 4u;
+                b[0] = qw_tile_word(xp);
+                b[1] = qw_tile_word(xp + 16u);
+            }
+            int32_t dot[4] = {0, 0, 0, 0};
+            qw_mma_m16n8k32(dot, a, b);
+            if (live && token_col < take) {
+                const uint32_t g = chunk + (lane_group & 1u) + (quad & 1u) * 2u;
+                const int32_t d = (quad & 1u)
+                    ? ((lane_group & 1u) ? dot[3] : dot[2])
+                    : ((lane_group & 1u) ? dot[1] : dot[0]);
+                const cuda_block_q4_K *xb =
+                    (const cuda_block_q4_K *)(const void *)(panel + panel_row) + (g >> 3u);
+                uint8_t sc, mn;
+                dev_q4_K_get_scale_min(g & 7u, xb->scales, &sc, &mn);
+                const float wa = dev_f16_to_f32(xb->d) * (float)sc;
+                const float wb = -dev_f16_to_f32(xb->dmin) * (float)mn;
+                const uint32_t token = token_col ? tok1 : tok0;
+                const uint64_t ag = (uint64_t)token * groups + g;
+                acc += (wa * xs[ag]) * (float)d;
+                acc += (wb * xs[ag]) * (float)xsum[ag];
+            }
+        }
+        partial[matrix_row][token_col][residue] = acc;
+        __syncthreads();
+        const float value = warp_sum_f32(partial[warp >> 1u][warp & 1u][lane]);
+        if (lane == 0u) projected[warp >> 1u][warp & 1u] = value;
+        __syncthreads();
+        if (threadIdx.x < rows_here * 2u) {
+            const uint32_t row = threadIdx.x >> 1u, r = threadIdx.x & 1u;
+            if (r < take) {
+                const uint32_t p = (uint32_t)pairs[base + at + r];
+                const uint32_t t = p / n_expert_used, slot = p - t * n_expert_used;
+                const float g = projected[row * 2u][r];
+                const float u = projected[row * 2u + 1u][r];
+                mid[(uint64_t)t * mid_token_stride + (uint64_t)slot * mid_dim + row0 + row] =
+                    (g / (1.0f + expf(-g))) * u * weights[p];
+            }
+        }
+        __syncthreads();
+    }
+}
+
 /* Grid (ceil(mid_dim / 8), n_expert).  The block owns one expert; the pair
  * list gives it the (token, slot) pairs that chose it, so a decoded group
  * serves R of them. */
@@ -7628,7 +7754,18 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
          * is zero for both warps, so each still walks its own row in the
          * same group order through the same warp_sum_f32 tree and every dot
          * is bit-identical.  mid_dim 640 gives 640 blocks. */
-        if (coop) { QWEN4EXP_SPLIT_GATEUP(true, QW_GU_COOP_ROWS, true); }
+        if (coop && n_tokens == 2u &&
+            getenv("DS4_QWEN4EXP_NO_GATEUP_DIAGONAL_MMA") == NULL) {
+            qwen4exp_moe_gateup_diagonal_mma_kernel<<<
+                dim3((mid_dim + 1u) / 2u, gu_rows, 1), 256, 0, stream>>>(
+                (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum,
+                sc.pairs, sc.counts, sc.offsets, gu_active, (const float *)weights->ptr,
+                gate_slab->expert_bytes, gate_slab->row_bytes,
+                up_slab->expert_bytes, up_slab->row_bytes,
+                gate_slab->type, up_slab->type, xgroups, mid_dim,
+                mid_token_stride, n_expert_used);
+        }
+        else if (coop) { QWEN4EXP_SPLIT_GATEUP(true, QW_GU_COOP_ROWS, true); }
         else if (vector) { QWEN4EXP_SPLIT_GATEUP(true, 1u, false); }
         else { QWEN4EXP_SPLIT_GATEUP(false, 4u, false); }
 #undef QWEN4EXP_SPLIT_GATEUP
@@ -14029,16 +14166,31 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
         (void)cudaGetLastError();
     }
 
+    int gm_regs = -1, gm_smem = -1, gm_lmem = -1, gm_occ = -1;
+    if (cudaFuncGetAttributes(&a, qwen4exp_moe_gateup_diagonal_mma_kernel) == cudaSuccess) {
+        gm_regs = a.numRegs; gm_smem = (int)a.sharedSizeBytes; gm_lmem = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ, qwen4exp_moe_gateup_diagonal_mma_kernel, 256, 0) == cudaSuccess) {
+        gm_occ = occ;
+    } else {
+        (void)cudaGetLastError();
+    }
+
     snprintf(buf, sizeof(buf),
              "gu[reg=%d smem=%d lmem=%d maxt=%d occ=%d] dn[reg=%d smem=%d "
              "lmem=%d maxt=%d occ=%d] gdn[reg=%d lmem=%d] "
              "mm[reg=%d smem=%d lmem=%d occ=%d] "
-             "md[reg=%d smem=%d lmem=%d occ=%d]",
+             "md[reg=%d smem=%d lmem=%d occ=%d] "
+             "gm[reg=%d smem=%d lmem=%d occ=%d]",
              gu_regs, gu_smem, gu_lmem, gu_maxt, gu_occ,
              dn_regs, dn_smem, dn_lmem, dn_maxt, dn_occ,
              gd_regs, gd_lmem,
              mg_regs, mg_smem, mg_lmem, mg_occ,
-             md_regs, md_smem, md_lmem, md_occ);
+             md_regs, md_smem, md_lmem, md_occ,
+             gm_regs, gm_smem, gm_lmem, gm_occ);
     return buf;
 }
 
