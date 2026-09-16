@@ -922,16 +922,18 @@ static inline cublasHandle_t cuda_cublas_for_tier(int logical_tier) {
  * DS4_CUDA_DECODE_GRAPHS=0 (or off/no/false) disables everything. */
 #define CUDA_DECODE_GRAPH_LAYERS   64u
 #define CUDA_DECODE_GRAPH_ISLANDS   4u
-/* EIGHT SLOTS, NOT FOUR.  The key is n_tokens | (spec_snapshot_rows << 8) and
- * cuda_decode_graph_find() has NO eviction: when every slot of a
+/* ELEVEN SLOTS, NOT FOUR.  The key is n_tokens | (spec_snapshot_rows << 8)
+ * and cuda_decode_graph_find() has NO eviction: when every slot of a
  * (layer, island) row holds another key it returns NULL, begin() returns -1,
  * and that island encodes EAGERLY FOR THE REST OF THE PROCESS -- permanently,
  * per island, and silently. A speculative cycle reaches at least three values
- * of that key, so four slots leaves one spare. Same keys, same graphs, same
- * kernels in the same order; the cost is a memcmp over at most eight 48-byte
- * keys off the device, and one more executable graph per row only if the run
- * actually has a fifth shape -- which is the case this is for. */
-#define CUDA_DECODE_GRAPH_VARIANTS  4u
+ * of that key, and the verify widths plus the HC valve legs push the live set
+ * past eight; eleven covers it with spares. Same keys, same graphs, same
+ * kernels in the same order; the cost is a memcmp over at most eleven
+ * 48-byte keys off the device, and one more executable graph per row only
+ * if the run actually has that many shapes -- which is the case this is
+ * for. */
+#define CUDA_DECODE_GRAPH_VARIANTS  11u
 
 /* Mirrors the public `struct ds4_decode_graph_key` decl in ds4_gpu.h
  * byte-for-byte (ds4_cuda.cu does not include that header; it carries
