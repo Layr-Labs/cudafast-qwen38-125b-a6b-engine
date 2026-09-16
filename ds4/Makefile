@@ -136,6 +136,10 @@ GPU_KERNEL_TESTS += $(QWEN4EXP_MTP_TEST)
 
 .PHONY: all help clean test test-qwen4exp test-qwen4exp-ple test-qwen4exp-ple-kernels test-qwen4exp-ple-kernel-mutants test-qwen4exp-gdn test-qwen4exp-gdn-ref test-qwen4exp-gdn-rows test-qwen4exp-gdn-octet-mutants test-qwen4exp-quant-wide-mutants test-qwen4exp-qsa-group3-mutants test-qwen4exp-qsa-ref test-qwen4exp-moe test-qwen4exp-moe-mutants test-qwen4exp-cuda-moe test-qwen4exp-hc test-qwen4exp-hc-mutants test-qwen4exp-hc-fuse-mutants test-qwen4exp-mma-pipe-mutants test-qwen4exp-shared-pipe-mutants test-qwen4exp-hc-up-pipe-mutants test-qwen4exp-qsa test-qwen4exp-mtp test-qwen4exp-graph test-qwen4exp-parity test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm test-qwen4exp-gateup-dq
 
+.PHONY: test-qwen4exp-moe-prelude-host
+test-qwen4exp-moe-prelude-host:
+	python3 tests/qwen4exp_moe_prelude_host.py
+
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
 
