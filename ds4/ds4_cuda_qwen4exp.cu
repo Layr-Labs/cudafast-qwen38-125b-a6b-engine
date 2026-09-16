@@ -55,6 +55,75 @@
 #define CUDA_QK_K 256
 
 /* ------------------------------------------------------------------
+ * Memoized environment lookup for the per-layer dispatch paths.
+ *
+ * The MoE and GDN dispatch entry points below read their feature flags with
+ * getenv on every call, and each of those calls is a full scan of environ doing
+ * a strncmp per entry.  ds4_gpu_qwen4exp_routed_moe_tensor alone reads 24 of
+ * them before it launches anything, ds4_gpu_qwen4exp_shared_expert_preq_tensor
+ * 10 and qwen4exp_cuda_gdn_run 12, and all three run once per layer per round.
+ *
+ * Where that cost actually lands is worth stating precisely, because it is easy
+ * to get wrong and I did at first.  Steady-state decode does NOT pay it: the
+ * layer island checks n_tokens <= DS4_QWEN4EXP_MTP_MAX_COMMIT and, on a graph-key
+ * hit, replays the captured graph and skips the host encode entirely, so these
+ * functions are not even entered.  The scans are paid on the paths that cannot be
+ * captured -- prefill, whose 1024-row batch fails that n_tokens gate and so runs
+ * a full eager encode every round -- plus once per distinct decode graph key at
+ * capture.  This is therefore a prefill-side host-work removal, not a decode one.
+ *
+ * Measured on a host rig extracted from this helper: one getenv against a ~90-var
+ * environ costs 106-134 ns, the memoized lookup 8.7 ns.  At 47 substituted call
+ * sites over 48 layers that is a few hundred microseconds per prefill round --
+ * real, but small against a 0.65 ms/token leg.  I am not claiming more than that.
+ *
+ * These names are process constants: nothing in the engine calls setenv or
+ * putenv, so a value read once is the value for the life of the process.
+ * Caching it therefore returns exactly what getenv would have returned, and that
+ * is the whole argument for bit-exactness here -- this removes host work and
+ * touches no arithmetic, no launch geometry and no emitted value.
+ *
+ * The table is keyed on the ADDRESS of the name rather than its text, because
+ * every caller passes a string literal and a pointer compare is the point; two
+ * literals the compiler chose not to merge simply take two slots, and an
+ * overflowing table falls back to getenv, so the result is correct either way.
+ * It is thread_local because this unit is compiled -pthread and the PLE gather
+ * runs worker threads: per-thread tables cannot race, at the cost of one
+ * register-relative offset against the environ scan it replaces.  thread_local
+ * rather than __thread to match the spelling the other .cu units in this engine
+ * already use (ds4_cuda.cu, ds4_rocm.cu, cuda/mmq/ds4_ggml_stubs.cu), which is
+ * standing proof that nvcc accepts it here.
+ *
+ * DS4_QWEN4EXP_NO_ENV_MEMO restores the uncached reads.
+ * ------------------------------------------------------------------ */
+
+#define QW_ENV_MEMO_SLOTS 64u
+
+static thread_local const char *qw_env_keys[QW_ENV_MEMO_SLOTS];
+static thread_local const char *qw_env_vals[QW_ENV_MEMO_SLOTS];
+static thread_local unsigned    qw_env_n = 0u;
+static thread_local int         qw_env_off = -1;
+
+static const char *qw_env(const char *name) {
+    if (qw_env_off < 0) {
+        qw_env_off = (getenv("DS4_QWEN4EXP_NO_ENV_MEMO") != NULL) ? 1 : 0;
+    }
+    if (qw_env_off) return getenv(name);
+
+    for (unsigned i = 0u; i < qw_env_n; i++) {
+        if (qw_env_keys[i] == name) return qw_env_vals[i];
+    }
+    const char *const v = getenv(name);
+    if (qw_env_n < QW_ENV_MEMO_SLOTS) {
+        qw_env_keys[qw_env_n] = name;
+        qw_env_vals[qw_env_n] = v;
+        qw_env_n++;
+    }
+    return v;
+}
+
+
+/* ------------------------------------------------------------------
  * Leaf helpers, duplicated from ds4_cuda.cu.  Same names and same bodies:
  * the kernels below were written against them and read the same either way.
  * ------------------------------------------------------------------ */
@@ -124,141 +193,6 @@ static void *qwen4exp_group_scratch(int tier, uint64_t bytes) {
     g_qwen4exp_group_bytes[tier] = bytes;
     return next;
 }
-
-/* ------------------------------------------------------------------------
- * The shared-expert fork.
- *
- * One MoE block is ds4_gpu_qwen4exp_routed_moe_tensor followed by
- * ds4_gpu_qwen4exp_shared_expert_preq_tensor, in stream order.  The routed
- * path is the memory-bound stream of the layer (it reads on the order of a
- * gigabyte of expert weights per row); the shared expert's sigmoid gate,
- * gate/up projection and mid quantizer are small latency-bound kernels that
- * need only the quantized activation the routed path produces in its first
- * microseconds.  Only the shared DOWN kernel touches `out`, which the routed
- * path writes last.
- *
- * So the shared gate, gate/up and mid quantizer go on a side stream that
- * waits on an event recorded right after the routed quantizer, and the main
- * stream waits on an event recorded after the mid quantizer before it
- * launches the shared down.  Same kernels, same launch parameters, same
- * operands, same reduction orders: no number changes, only which stream
- * three launches sit on and hence what they overlap.
- *
- * SCRATCH.  The sequential path places the shared mid's Q8_0 scratch at
- * group-pool offset xq_bytes, which is where the routed path keeps its
- * expert pair list (counts/offsets/cursor/active/pairs) -- fine in stream
- * order, a race under the fork, since the routed gate/up reads that list
- * while the side stream would be writing the shared mid.  The forked path
- * therefore quantizes the shared mid into its own pool below.  The group
- * pool is only READ by the side stream (xq/xs/xsum, the prefix), and every
- * routed kernel after the quantizer only reads that prefix too.
- *
- * CAPTURE.  Inside a decode-island capture the side stream joins the
- * capture through the cudaStreamWaitEvent on the first event and rejoins
- * the origin stream through the cudaStreamWaitEvent on the second, in the
- * same call, so a capture always ends joined.  Event record and wait add no
- * nodes; the captured graph is the sequential one with the shared branch
- * hung off the quantizer node instead of the routed tail.
- *
- * PDL.  The shared gate kernel moves with its consumer, so the gate ->
- * gate/up programmatic pair and the mid-quantizer -> down pair are the
- * pairs they were (ds4_cuda_qwen4exp.cuh).  The down launch gains the
- * routed tail as a second predecessor; those kernels carry no trigger, so
- * their implicit trigger is completion, and the down kernel's fence orders
- * every activation read after it either way.
- *
- * THE VALVE.  DS4_QWEN4EXP_NO_SHARED_FORK set to anything takes the
- * sequential path, exactly as before; a cleared environment (the ranked
- * harness) forks.  Every CUDA call the fork adds is checked: a failure
- * BEFORE any side-stream launch falls back to the sequential path in that
- * call with nothing issued, a failure after one is a launch failure like
- * any other.
- * ------------------------------------------------------------------------ */
-static int qwen4exp_shared_fork_on(void) {
-    return getenv("DS4_QWEN4EXP_NO_SHARED_FORK") == NULL;
-}
-
-static cudaStream_t g_qwen4exp_fork_stream[16];
-static cudaEvent_t  g_qwen4exp_fork_xq_ready[16];
-static cudaEvent_t  g_qwen4exp_fork_mid_ready[16];
-static int          g_qwen4exp_fork_state[16];   /* 0 unset, 1 ready, -1 refused */
-
-/* The side stream and its two events for one device, created on first use.
- * Non-blocking, so in eager mode it does not serialize against the legacy
- * stream the main path rides there; every ordering it needs is an event. */
-static int qwen4exp_fork_ready(int tier, cudaStream_t stream) {
-    if (tier < 0 || tier >= 16) return 0;
-    if (g_qwen4exp_fork_state[tier] > 0) return 1;
-    if (g_qwen4exp_fork_state[tier] < 0) return 0;
-    /* The first routed call of a process is an eager warm pass, so this
-     * never runs under capture in the engine; refuse rather than create
-     * objects while a capture is open, and try again on a later call. */
-    cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
-    if (cudaStreamIsCapturing(stream, &st) != cudaSuccess) {
-        (void)cudaGetLastError();
-        return 0;
-    }
-    if (st != cudaStreamCaptureStatusNone) return 0;
-    cudaStream_t s = NULL;
-    cudaEvent_t a = NULL, b = NULL;
-    if (cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) == cudaSuccess &&
-        cudaEventCreateWithFlags(&a, cudaEventDisableTiming) == cudaSuccess &&
-        cudaEventCreateWithFlags(&b, cudaEventDisableTiming) == cudaSuccess) {
-        g_qwen4exp_fork_stream[tier] = s;
-        g_qwen4exp_fork_xq_ready[tier] = a;
-        g_qwen4exp_fork_mid_ready[tier] = b;
-        g_qwen4exp_fork_state[tier] = 1;
-        return 1;
-    }
-    fprintf(stderr, "ds4: qwen4exp shared-expert fork unavailable on device %d "
-                    "(%s); the shared expert stays in stream order\n",
-            tier, cudaGetErrorString(cudaGetLastError()));
-    if (b) (void)cudaEventDestroy(b);
-    if (a) (void)cudaEventDestroy(a);
-    if (s) (void)cudaStreamDestroy(s);
-    (void)cudaGetLastError();
-    g_qwen4exp_fork_state[tier] = -1;
-    return 0;
-}
-
-/* Q8_0 scratch for the forked shared mid: kept and grown like the group
- * scratch above, retiring decode graphs the same way when it moves. */
-static void *g_qwen4exp_shexp_scratch[16];
-static uint64_t g_qwen4exp_shexp_bytes[16];
-
-static void *qwen4exp_shexp_scratch(int tier, uint64_t bytes) {
-    if (tier < 0 || tier >= 16) return NULL;
-    if (g_qwen4exp_shexp_scratch[tier] && g_qwen4exp_shexp_bytes[tier] >= bytes) {
-        return g_qwen4exp_shexp_scratch[tier];
-    }
-    void *next = NULL;
-    if (!cuda_ok(cudaMalloc(&next, (size_t)bytes),
-                 "qwen4exp shared expert fork scratch")) {
-        return NULL;
-    }
-    if (g_qwen4exp_shexp_scratch[tier]) {
-        ds4_gpu_decode_graphs_invalidate();
-        cudaFree(g_qwen4exp_shexp_scratch[tier]);
-    }
-    g_qwen4exp_shexp_scratch[tier] = next;
-    g_qwen4exp_shexp_bytes[tier] = bytes;
-    return next;
-}
-
-/* What the routed call recorded the first event against, per device.  The
- * shared call forks only when its own view of the input matches field for
- * field, and the record is consumed by that one call: a routed call whose
- * shared call never came, or a shared call without a routed call before it,
- * cannot pair with a stale event. */
-typedef struct {
-    int          armed;
-    cudaStream_t stream;
-    const void  *x;
-    const void  *xq;
-    uint32_t     n_tokens;
-    uint32_t     xgroups;
-} qwen4exp_fork_arm;
-static qwen4exp_fork_arm g_qwen4exp_fork_arm[16];
 
 static bool glm53_cuda_mul_u64(uint64_t a, uint64_t b, uint64_t *out) {
     if (!out || (a != 0u && b > UINT64_MAX / a)) return false;
@@ -528,137 +462,6 @@ __global__ static void qwen4exp_gdn_conv_kernel(
     history[(uint64_t)2u * conv_dim + channel] = h2;
 }
 
-/* Replay-only twin: original serial convolution followed by gate publication. */
-__global__ static void qwen4exp_gdn_conv_replay_gates_kernel(
-        float       *qkv,
-        float       *conv_state,
-        const float *conv_weight,
-        float       *conv_snapshot,
-        uint32_t     n_key_head,
-        uint32_t     n_value_head,
-        uint32_t     n_rows,
-        uint32_t     n_tokens,
-        uint32_t     n_snapshot_rows,
-        float        qk_norm_eps,
-        const uint32_t *adopt_row, float2 *gate_pairs,
-        const float *raw_alpha, const float *raw_beta,
-        const float *a_log, const float *dt_bias) {
-    const uint32_t block = blockIdx.x;
-    const uint32_t row = blockIdx.y;
-    const uint32_t tid = threadIdx.x;
-    const uint32_t lane = tid & 31u;
-    const uint32_t warp = tid >> 5u;
-    const uint32_t key_blocks = 2u * n_key_head;
-    const uint32_t blocks = key_blocks + n_value_head;
-    if (block >= blocks || row >= n_rows) return;
-
-    /* Two reduction slots, alternating by token.  One barrier a token then
-     * bounds the skew between warps at one token, and the warp that has run
-     * ahead writes the slot the warp behind is not reading. */
-    __shared__ float reduce[2][4];
-    const uint32_t conv_dim = blocks * QWEN4EXP_GDN_DIM;
-    const uint32_t channel = block * QWEN4EXP_GDN_DIM + tid;
-    const bool is_key = block < key_blocks;
-    /* The reference l2-normalises the row -- `x * rsqrt(sum(x^2) + eps)`, the
-     * epsilon on the SUM -- and then scales the query by `head_dim ** -0.5`.
-     * So the key takes no post scale at all and the query takes 2^-3.5.
-     * Twin of the Metal kernel; keep the two expressions identical. */
-    const float post_scale = block < n_key_head
-        ? 0x1.6a09e6p-4f
-        : 1.0f;
-
-    float *history = conv_state +
-        (uint64_t)row * QWEN4EXP_GDN_HISTORY * conv_dim;
-    /* Lazy rollback: a nonzero *adopt_row is k + 1, and this forward continues
-     * from snapshot slot k -- the bits a rejected round's rollback would have
-     * copied into `history`.  The slot offset is the store's own below.  The
-     * load precedes every store in program order, the channel's elements are
-     * this thread's alone, and it comes before the first __syncthreads, so the
-     * one-token skew bound above is unchanged. */
-    const uint32_t adopt = adopt_row ? *adopt_row : 0u;
-    const float *const history_src = adopt
-        ? conv_snapshot + (uint64_t)(adopt - 1u) * QWEN4EXP_GDN_HISTORY * conv_dim
-        : history;
-    float h0 = history_src[channel];
-    float h1 = history_src[(uint64_t)conv_dim + channel];
-    float h2 = history_src[(uint64_t)2u * conv_dim + channel];
-    const float w0 = conv_weight[(uint64_t)channel * 4u + 0u];
-    const float w1 = conv_weight[(uint64_t)channel * 4u + 1u];
-    const float w2 = conv_weight[(uint64_t)channel * 4u + 2u];
-    const float w3 = conv_weight[(uint64_t)channel * 4u + 3u];
-
-    float raw = qkv[(uint64_t)row * n_tokens * conv_dim + channel];
-    for (uint32_t token = 0; token < n_tokens; token++) {
-        const uint64_t index =
-            ((uint64_t)row * n_tokens + token) * conv_dim + channel;
-        float acc = 0.0f;
-        acc = fmaf(h0, w0, acc);
-        acc = fmaf(h1, w1, acc);
-        acc = fmaf(h2, w2, acc);
-        acc = fmaf(raw, w3, acc);
-        h0 = h1;
-        h1 = h2;
-        h2 = raw;
-
-        /* The NEXT token's input, read before this token's output is stored.
-         * A thread only ever reads and writes its own channel, so the two are
-         * different elements -- but they travel through one pointer, so the
-         * read has to come first in program order to be issued first, and the
-         * memory latency then hides behind the reduction below.  The last
-         * token re-reads its own element, which is still the raw value at
-         * this point and is thrown away. */
-        const uint64_t ahead =
-            index + (token + 1u < n_tokens ? conv_dim : 0u);
-        const float raw_next = qkv[ahead];
-
-        /* The window as it stands AFTER this token, which is what a rollback
-         * to length token + 1 needs.  Written before the key/value branch
-         * because that branch closes the iteration with `continue` for a
-         * value-head block, so a store placed after it would never run for
-         * the value channels. */
-        if (token < n_snapshot_rows) {
-            float *slot = conv_snapshot +
-                (uint64_t)token * QWEN4EXP_GDN_HISTORY * conv_dim;
-            /* Evict-first: same bits, cache hint only (see the float4 twin). */
-            __stcs(&slot[channel], h0);
-            __stcs(&slot[(uint64_t)conv_dim + channel], h1);
-            __stcs(&slot[(uint64_t)2u * conv_dim + channel], h2);
-        }
-
-        const float activated = qwen4exp_gdn_silu(acc);
-        raw = raw_next;
-        if (!is_key) {
-            qkv[index] = activated;
-            continue;
-        }
-
-        float *red = reduce[token & 1u];
-        const float sumsq = warp_sum_f32(activated * activated);
-        if (lane == 0u) red[warp] = sumsq;
-        __syncthreads();
-        float total = lane < 4u ? red[lane] : 0.0f;
-        total = warp_sum_all_f32(total);
-        qkv[index] = activated *
-            rsqrtf(total + qk_norm_eps) * post_scale;
-    }
-
-    history[channel] = h0;
-    history[(uint64_t)conv_dim + channel] = h1;
-    history[(uint64_t)2u * conv_dim + channel] = h2;
-    /* One publisher per head/token. Stream completion orders these pairs
-     * before replay; history and raw gate inputs are disjoint allocations. */
-    if (block == 0u && tid < n_value_head) {
-        const float coeff = a_log[tid];
-        const float bias = dt_bias[tid];
-        for (uint32_t token = 0; token < n_tokens; ++token) {
-            const uint64_t gate = (uint64_t)token * n_value_head + tid;
-            const float g = expf(coeff * qwen4exp_gdn_softplus(raw_alpha[gate] + bias));
-            const float beta = qwen4exp_gdn_sigmoid(raw_beta[gate]);
-            gate_pairs[gate] = make_float2(g, beta);
-        }
-    }
-}
-
 /*
  * Prefill-width twin of the kernel above, and a CUDA-only widening of it:
  * the same depthwise 4-tap convolution, SiLU and query/key RMS norm on the
@@ -913,180 +716,6 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
         }
     }
     *state_ptr = h;
-}
-
-/* Bounded input replay for a two-row verify. The base state stays intact
- * across rejection; accepted transitions are replayed in their original
- * order before the current inputs. Only K, V and the already-computed gate
- * pair are retained. All state arithmetic below is the ordinary recurrence's
- * dot4/XOR/FMA sequence. Replayed rows have no output reader.
- *
- * A full log publishes a new checkpoint AFTER current row zero, which is
- * always committed. No log slot is overwritten on that flush: another CTA
- * could still be reading it. Otherwise row zero appends to slot `prefix`,
- * disjoint from the prefix all CTAs read. State cells have unique owners, so
- * the flush can overwrite each owner's base cell after that owner loaded it. */
-__global__ static void qwen4exp_gdn_replay_kernel(
-        float *out, float *state, float *checkpoint, float *tape,
-        const float *qkv, const float *raw_alpha, const float *raw_beta,
-        const float *a_log, const float *dt_bias,
-        uint32_t n_key_head, uint32_t n_value_head, uint32_t n_tokens,
-        uint32_t head_layout, const uint32_t *control, uint32_t replay_rows) {
-    const uint32_t head = blockIdx.x;
-    const uint32_t value = blockIdx.y * 4u + (threadIdx.x >> 5u);
-    const uint32_t lane = threadIdx.x & 31u;
-    if (head >= n_value_head || value >= QWEN4EXP_GDN_DIM) return;
-    const uint32_t prefix = control ? *control : replay_rows;
-    if (prefix > DS4_QWEN4EXP_GDN_REPLAY_ROWS) return;
-    const uint32_t key_dim = n_key_head * QWEN4EXP_GDN_DIM;
-    const uint32_t value_dim = n_value_head * QWEN4EXP_GDN_DIM;
-    const uint32_t conv_dim = 2u * key_dim + value_dim;
-    const uint32_t tape_stride = (key_dim + value_dim + 2u * n_value_head + 3u) & ~3u;
-    const uint32_t repeats = n_value_head / n_key_head;
-    const uint32_t key_head = head_layout != 0u ? head % n_key_head : head / repeats;
-    const uint32_t key_writer = head_layout != 0u ? key_head : key_head * repeats;
-    const uint32_t k0 = lane * 4u;
-    const uint64_t state_off = ((uint64_t)head * QWEN4EXP_GDN_DIM + value) *
-                               QWEN4EXP_GDN_DIM + k0;
-    float4 h = *(const float4 *)(checkpoint + state_off);
-    const float decay_coeff = n_tokens ? a_log[head] : 0.0f;
-    const float bias = n_tokens ? dt_bias[head] : 0.0f;
-    for (uint32_t step = 0; step < prefix + n_tokens; step++) {
-        const bool replay = step < prefix;
-        const uint32_t token = replay ? 0u : step - prefix;
-        const float *const saved = tape + (uint64_t)(replay ? step : 0u) * tape_stride;
-        const uint64_t base = (uint64_t)token * conv_dim + key_head * QWEN4EXP_GDN_DIM;
-        const float4 k4 = *(const float4 *)(replay
-            ? saved + key_head * QWEN4EXP_GDN_DIM + k0
-            : qkv + base + key_dim + k0);
-        const float v_row = replay
-            ? saved[key_dim + head * QWEN4EXP_GDN_DIM + value]
-            : qkv[(uint64_t)token * conv_dim + 2u * key_dim +
-                  head * QWEN4EXP_GDN_DIM + value];
-        float g = 0.0f, beta = 0.0f;
-        if (replay) {
-            const float2 pair = ((const float2 *)(saved + key_dim + value_dim))[head];
-            g = pair.x; beta = pair.y;
-        } else {
-            const uint64_t gate = (uint64_t)token * n_value_head + head;
-            if (lane == 0u) {
-                g = expf(decay_coeff * qwen4exp_gdn_softplus(raw_alpha[gate] + bias));
-                beta = qwen4exp_gdn_sigmoid(raw_beta[gate]);
-            }
-            g = __shfl_sync(0xffffffffu, g, 0);
-            beta = __shfl_sync(0xffffffffu, beta, 0);
-            if (token == 0u && prefix < DS4_QWEN4EXP_GDN_REPLAY_ROWS) {
-                float *const record = tape + (uint64_t)prefix * tape_stride;
-                if (value == 0u && head == key_writer)
-                    *(float4 *)(record + key_head * QWEN4EXP_GDN_DIM + k0) = k4;
-                if (lane == 0u) {
-                    record[key_dim + head * QWEN4EXP_GDN_DIM + value] = v_row;
-                    if (value == 0u)
-                        ((float2 *)(record + key_dim + value_dim))[head] = make_float2(g, beta);
-                }
-            }
-        }
-        h.x *= g;
-        h.y *= g;
-        h.z *= g;
-        h.w *= g;
-        const float hk = warp_sum_all_f32(dot4_f32(h, k4));
-        const float delta_v = (v_row - hk) * beta;
-        h.x = fmaf(k4.x, delta_v, h.x);
-        h.y = fmaf(k4.y, delta_v, h.y);
-        h.z = fmaf(k4.z, delta_v, h.z);
-        h.w = fmaf(k4.w, delta_v, h.w);
-        if (!replay) {
-            const float4 q4 = *(const float4 *)(qkv + base + k0);
-            const float result = warp_sum_all_f32(dot4_f32(h, q4));
-            if (lane == 0u)
-                out[(uint64_t)token * value_dim + head * QWEN4EXP_GDN_DIM + value] = result;
-            if (token == 0u && prefix == DS4_QWEN4EXP_GDN_REPLAY_ROWS)
-                *(float4 *)(checkpoint + state_off) = h;
-        }
-    }
-    *(float4 *)(state + state_off) = h;
-}
-
-/* Same scalar replay geometry and recurrence, with current gates published by conv. */
-__global__ static void qwen4exp_gdn_replay_gates_kernel(
-        float *out, float *state, float *checkpoint, float *tape,
-        const float *qkv, const float *raw_alpha, const float *raw_beta,
-        const float2 *gate_pairs,
-        uint32_t n_key_head, uint32_t n_value_head, uint32_t n_tokens,
-        uint32_t head_layout, const uint32_t *control, uint32_t replay_rows) {
-    const uint32_t head = blockIdx.x;
-    const uint32_t value = blockIdx.y * 4u + (threadIdx.x >> 5u);
-    const uint32_t lane = threadIdx.x & 31u;
-    if (head >= n_value_head || value >= QWEN4EXP_GDN_DIM) return;
-    const uint32_t prefix = control ? *control : replay_rows;
-    if (prefix > DS4_QWEN4EXP_GDN_REPLAY_ROWS) return;
-    const uint32_t key_dim = n_key_head * QWEN4EXP_GDN_DIM;
-    const uint32_t value_dim = n_value_head * QWEN4EXP_GDN_DIM;
-    const uint32_t conv_dim = 2u * key_dim + value_dim;
-    const uint32_t tape_stride = (key_dim + value_dim + 2u * n_value_head + 3u) & ~3u;
-    const uint32_t repeats = n_value_head / n_key_head;
-    const uint32_t key_head = head_layout != 0u ? head % n_key_head : head / repeats;
-    const uint32_t key_writer = head_layout != 0u ? key_head : key_head * repeats;
-    const uint32_t k0 = lane * 4u;
-    const uint64_t state_off = ((uint64_t)head * QWEN4EXP_GDN_DIM + value) *
-                               QWEN4EXP_GDN_DIM + k0;
-    float4 h = *(const float4 *)(checkpoint + state_off);
-    for (uint32_t step = 0; step < prefix + n_tokens; step++) {
-        const bool replay = step < prefix;
-        const uint32_t token = replay ? 0u : step - prefix;
-        const float *const saved = tape + (uint64_t)(replay ? step : 0u) * tape_stride;
-        const uint64_t base = (uint64_t)token * conv_dim + key_head * QWEN4EXP_GDN_DIM;
-        const float4 k4 = *(const float4 *)(replay
-            ? saved + key_head * QWEN4EXP_GDN_DIM + k0
-            : qkv + base + key_dim + k0);
-        const float v_row = replay
-            ? saved[key_dim + head * QWEN4EXP_GDN_DIM + value]
-            : qkv[(uint64_t)token * conv_dim + 2u * key_dim +
-                  head * QWEN4EXP_GDN_DIM + value];
-        float g = 0.0f, beta = 0.0f;
-        if (replay) {
-            const float2 pair = ((const float2 *)(saved + key_dim + value_dim))[head];
-            g = pair.x; beta = pair.y;
-        } else {
-            const uint64_t gate = (uint64_t)token * n_value_head + head;
-            if (lane == 0u) {
-                const float2 pair = gate_pairs[gate];
-                g = pair.x; beta = pair.y;
-            }
-            g = __shfl_sync(0xffffffffu, g, 0);
-            beta = __shfl_sync(0xffffffffu, beta, 0);
-            if (token == 0u && prefix < DS4_QWEN4EXP_GDN_REPLAY_ROWS) {
-                float *const record = tape + (uint64_t)prefix * tape_stride;
-                if (value == 0u && head == key_writer)
-                    *(float4 *)(record + key_head * QWEN4EXP_GDN_DIM + k0) = k4;
-                if (lane == 0u) {
-                    record[key_dim + head * QWEN4EXP_GDN_DIM + value] = v_row;
-                    if (value == 0u)
-                        ((float2 *)(record + key_dim + value_dim))[head] = make_float2(g, beta);
-                }
-            }
-        }
-        h.x *= g;
-        h.y *= g;
-        h.z *= g;
-        h.w *= g;
-        const float hk = warp_sum_all_f32(dot4_f32(h, k4));
-        const float delta_v = (v_row - hk) * beta;
-        h.x = fmaf(k4.x, delta_v, h.x);
-        h.y = fmaf(k4.y, delta_v, h.y);
-        h.z = fmaf(k4.z, delta_v, h.z);
-        h.w = fmaf(k4.w, delta_v, h.w);
-        if (!replay) {
-            const float4 q4 = *(const float4 *)(qkv + base + k0);
-            const float result = warp_sum_all_f32(dot4_f32(h, q4));
-            if (lane == 0u)
-                out[(uint64_t)token * value_dim + head * QWEN4EXP_GDN_DIM + value] = result;
-            if (token == 0u && prefix == DS4_QWEN4EXP_GDN_REPLAY_ROWS)
-                *(float4 *)(checkpoint + state_off) = h;
-        }
-    }
-    *(float4 *)(state + state_off) = h;
 }
 
 /* Long chunks reuse one Q/K vector and gate pair across four independent
@@ -1667,13 +1296,6 @@ __global__ static void qwen4exp_gdn_output_quant_kernel(
  * `out_q8`, when given (one row of prefill only), receives the output norm as
  * the Q8_0 bytes and scales the ssm_out projection reads, at `q_offset` and
  * `s_offset`, and no float output is written. */
-static int qwen4exp_replay_gate_disjoint(const void *a, uint64_t an,
-                                            const void *b, uint64_t bn) {
-    const uintptr_t ap = (uintptr_t)a, bp = (uintptr_t)b;
-    if (!a || !b || an > UINTPTR_MAX - ap || bn > UINTPTR_MAX - bp) return 0;
-    return ap + an <= bp || bp + bn <= ap;
-}
-
 static int qwen4exp_cuda_gdn_run(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *conv_state,
@@ -1704,8 +1326,7 @@ static int qwen4exp_cuda_gdn_run(
         uint64_t              q_offset,
         uint64_t              s_offset,
         const ds4_gpu_tensor *adopt,
-        const char           *label,
-        const ds4_gpu_qwen4exp_gdn_replay *replay = NULL) {
+        const char           *label) {
     uint64_t key_dim = 0, value_dim = 0, conv_dim = 0, slots = 0;
     uint64_t qkv_elements = 0, out_elements = 0, gate_elements = 0;
     uint64_t conv_elements = 0, state_elements = 0, state_rows = 0;
@@ -1810,16 +1431,6 @@ static int qwen4exp_cuda_gdn_run(
         adopt ? (const uint32_t *)adopt->ptr : NULL;
 
     const int logical_tier = ds4_tensor_device_idx(out);
-    if (replay && (n_rows != 1u || n_tokens != 2u || n_snapshot_rows != 1u ||
-        conv_dim > UINT32_MAX || key_dim + value_dim + 2ull * n_value_head > UINT32_MAX - 3u ||
-        !adopt || !glm53_cuda_tensor_has(replay->checkpoint, state_elements, sizeof(float)) ||
-        !glm53_cuda_tensor_has(replay->tape, DS4_QWEN4EXP_GDN_REPLAY_ROWS *
-            ((key_dim + value_dim + 2ull * n_value_head + 3ull) & ~3ull), sizeof(float)) ||
-        !glm53_cuda_tensor_has(replay->control, 1u, sizeof(uint32_t)) ||
-        replay->checkpoint->ptr == recurrent_state->ptr ||
-        ds4_tensor_device_idx(replay->checkpoint) != logical_tier ||
-        ds4_tensor_device_idx(replay->tape) != logical_tier ||
-        ds4_tensor_device_idx(replay->control) != logical_tier)) return 0;
     const float *conv_weight = qwen4exp_gdn_weight_f32(
         conv_weight_slab->map, conv_weight_slab->map_size,
         conv_weight_slab->offset, conv_dim * 4u,
@@ -1835,51 +1446,6 @@ static int qwen4exp_cuda_gdn_run(
         output_norm_slab->offset, QWEN4EXP_GDN_DIM,
         logical_tier, "GDN output norm");
     if (!conv_weight || !a_log || !dt_bias || !output_norm) return 0;
-
-    float2 *replay_gates = NULL;
-    if (replay && replay->gate_scratch) {
-        const ds4_gpu_tensor *scratch = replay->gate_scratch;
-        if (!glm53_cuda_tensor_has(scratch, gate_elements, sizeof(float2)) ||
-            ((uintptr_t)scratch->ptr & (alignof(float2) - 1u)) ||
-            ds4_tensor_device_idx(scratch) != logical_tier) return 0;
-        const ds4_gpu_tensor *live[] = {out, conv_state, recurrent_state,
-            conv_snapshot, state_snapshot, qkv, raw_alpha, raw_beta, output_gate,
-            out_q8, adopt, replay->checkpoint, replay->tape, replay->control};
-        for (const ds4_gpu_tensor *t : live)
-            if (t && !qwen4exp_replay_gate_disjoint(scratch->ptr, scratch->bytes,
-                                                   t->ptr, t->bytes)) return 0;
-        if (!qwen4exp_replay_gate_disjoint(scratch->ptr, scratch->bytes,
-                                           conv_weight, conv_dim * 4u * sizeof(float)) ||
-            !qwen4exp_replay_gate_disjoint(scratch->ptr, scratch->bytes,
-                                           a_log, n_value_head * sizeof(float)) ||
-            !qwen4exp_replay_gate_disjoint(scratch->ptr, scratch->bytes,
-                                           dt_bias, n_value_head * sizeof(float)) ||
-            !qwen4exp_replay_gate_disjoint(scratch->ptr, scratch->bytes,
-                                           output_norm, QWEN4EXP_GDN_DIM * sizeof(float))) return 0;
-        int device = -1;
-        cudaPointerAttributes attr = {};
-        if (!cuda_ok(cudaGetDevice(&device), "GDN gate scratch device") ||
-            !cuda_ok(cudaPointerGetAttributes(&attr, scratch->ptr),
-                     "GDN gate scratch attributes")) return 0;
-        if ((attr.type != cudaMemoryTypeDevice && attr.type != cudaMemoryTypeManaged) ||
-            attr.device != device) return 0;
-        /* Moving gate reads into convolution is safe only when its writes
-         * cannot change those inputs. Overlapping legacy views retain their
-         * original convolution-then-raw-gate evaluation order. */
-        const void *gate_sources[] = {raw_alpha->ptr, raw_beta->ptr, a_log, dt_bias};
-        const uint64_t gate_bytes[] = {raw_alpha->bytes, raw_beta->bytes,
-            n_value_head * sizeof(float), n_value_head * sizeof(float)};
-        const ds4_gpu_tensor *conv_writes[] = {qkv, conv_state, conv_snapshot};
-        bool early_reads_safe = true;
-        for (unsigned i = 0; i < 4u; ++i)
-            for (const ds4_gpu_tensor *t : conv_writes)
-                if (t && !qwen4exp_replay_gate_disjoint(gate_sources[i], gate_bytes[i],
-                                                       t->ptr, t->bytes))
-                    early_reads_safe = false;
-        if (early_reads_safe && n_key_head == 16u && n_value_head == 48u &&
-            getenv("DS4_QWEN4EXP_NO_GDN_REPLAY_GATES") == NULL)
-            replay_gates = (float2 *)scratch->ptr;
-    }
 
     cudaStream_t stream = cuda_decode_stream();
     const uint32_t blocks = 2u * n_key_head + n_value_head;
@@ -1928,14 +1494,6 @@ static int qwen4exp_cuda_gdn_run(
                      "qwen4exp GDN conv history carry")) {
             return 0;
         }
-    } else if (replay_gates) {
-        qwen4exp_gdn_conv_replay_gates_kernel<<<dim3(blocks, n_rows, 1u),
-                QWEN4EXP_GDN_DIM, 0, stream>>>(
-                (float *)qkv->ptr, (float *)conv_state->ptr, conv_weight,
-                (float *)conv_snapshot->ptr, n_key_head, n_value_head, n_rows,
-                n_tokens, n_snapshot_rows, qk_norm_eps, adopt_row, replay_gates,
-                (const float *)raw_alpha->ptr, (const float *)raw_beta->ptr,
-                a_log, dt_bias);
     } else {
         qwen4exp_gdn_conv_kernel<<<dim3(blocks, n_rows, 1u),
                                    QWEN4EXP_GDN_DIM, 0, stream>>>(
@@ -1950,26 +1508,10 @@ static int qwen4exp_cuda_gdn_run(
 
     const dim3 recurrence_grid(
         n_value_head, QWEN4EXP_GDN_DIM / 4u, n_rows);
-    if (replay_gates) {
-        qwen4exp_gdn_replay_gates_kernel<<<recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
-            (float *)out->ptr, (float *)recurrent_state->ptr,
-            (float *)replay->checkpoint->ptr, (float *)replay->tape->ptr,
-            (const float *)qkv->ptr, (const float *)raw_alpha->ptr,
-            (const float *)raw_beta->ptr, replay_gates,
-            n_key_head, n_value_head, n_tokens, head_layout,
-            (const uint32_t *)replay->control->ptr, 0u);
-    } else if (replay) {
-        qwen4exp_gdn_replay_kernel<<<recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
-            (float *)out->ptr, (float *)recurrent_state->ptr,
-            (float *)replay->checkpoint->ptr, (float *)replay->tape->ptr,
-            (const float *)qkv->ptr, (const float *)raw_alpha->ptr,
-            (const float *)raw_beta->ptr, a_log, dt_bias,
-            n_key_head, n_value_head, n_tokens, head_layout,
-            (const uint32_t *)replay->control->ptr, 0u);
-    } else if (gate_pairs) {
+    if (gate_pairs) {
         if (n_key_head == 16u && n_value_head == 48u &&
-            getenv("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE") == NULL &&
-            getenv("DS4_QWEN4EXP_NO_GDN_OCTET") == NULL) {
+            qw_env("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE") == NULL &&
+            qw_env("DS4_QWEN4EXP_NO_GDN_OCTET") == NULL) {
             /* Eight lanes per value row, R rows per segment: 16R rows
              * per block, so QWEN4EXP_GDN_DIM / 16R blocks along y. */
             qwen4exp_gdn_octet_kernel<QWEN4EXP_GDN_OCTET_ROWS><<<
@@ -1982,9 +1524,9 @@ static int qwen4exp_cuda_gdn_run(
                     state_snapshot ? (float *)state_snapshot->ptr : NULL,
                     n_key_head, n_value_head, n_rows, n_tokens, head_layout,
                     n_snapshot_rows,
-                    getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
-        } else if (getenv("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE") == NULL &&
-            getenv("DS4_QWEN4EXP_NO_GDN_SPLIT_REDUCE") == NULL) {
+                    qw_env("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
+        } else if (qw_env("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE") == NULL &&
+            qw_env("DS4_QWEN4EXP_NO_GDN_SPLIT_REDUCE") == NULL) {
             qwen4exp_gdn_split_reduce_kernel<<<
                     dim3(n_value_head, QWEN4EXP_GDN_DIM / 16u, n_rows),
                     QWEN4EXP_GDN_DIM, 0, stream>>>(
@@ -1993,10 +1535,10 @@ static int qwen4exp_cuda_gdn_run(
                     state_snapshot ? (float *)state_snapshot->ptr : NULL,
                     n_key_head, n_value_head, n_rows, n_tokens, head_layout,
                     n_snapshot_rows,
-                    getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
+                    qw_env("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
         } else if (n_key_head == 16u && n_value_head == 48u &&
-            getenv("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE") == NULL) {
-            if (getenv("DS4_QWEN4EXP_NO_GDN_VALUE_VECTOR") == NULL) {
+            qw_env("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE") == NULL) {
+            if (qw_env("DS4_QWEN4EXP_NO_GDN_VALUE_VECTOR") == NULL) {
                 qwen4exp_gdn_value_reuse_kernel<4u, true><<<
                         dim3(n_value_head, QWEN4EXP_GDN_DIM / 16u, n_rows), QWEN4EXP_GDN_DIM, 0, stream>>>(
                         (float *)out->ptr, (float *)recurrent_state->ptr, conv_out,
@@ -2006,7 +1548,7 @@ static int qwen4exp_cuda_gdn_run(
                         state_snapshot ? (float *)state_snapshot->ptr : NULL,
                         n_key_head, n_value_head, n_rows, n_tokens, head_layout,
                         n_snapshot_rows,
-                        getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
+                        qw_env("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
             } else {
                 qwen4exp_gdn_value_reuse_kernel<4u><<<
                         dim3(n_value_head, QWEN4EXP_GDN_DIM / 16u, n_rows), QWEN4EXP_GDN_DIM, 0, stream>>>(
@@ -2017,7 +1559,7 @@ static int qwen4exp_cuda_gdn_run(
                         state_snapshot ? (float *)state_snapshot->ptr : NULL,
                         n_key_head, n_value_head, n_rows, n_tokens, head_layout,
                         n_snapshot_rows,
-                        getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
+                        qw_env("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
             }
         } else {
             qwen4exp_gdn_recurrence_kernel<true><<<
@@ -2029,7 +1571,7 @@ static int qwen4exp_cuda_gdn_run(
                     state_snapshot ? (float *)state_snapshot->ptr : NULL,
                     n_key_head, n_value_head, n_rows, n_tokens, head_layout,
                     n_snapshot_rows,
-                    getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u,
+                    qw_env("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u,
                     NULL);
         }
     } else {
@@ -2043,7 +1585,7 @@ static int qwen4exp_cuda_gdn_run(
                 state_snapshot ? (float *)state_snapshot->ptr : NULL,
                 n_key_head, n_value_head, n_rows, n_tokens, head_layout,
                 n_snapshot_rows,
-                getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u,
+                qw_env("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u,
                 adopt_row);
     }
     if (!cuda_ok(cudaGetLastError(), "qwen4exp GDN recurrence launch")) {
@@ -2197,68 +1739,6 @@ extern "C" int ds4_gpu_qwen4exp_gdn_decode(
         output_gate, conv_weight_slab, a_log_slab, dt_bias_slab,
         output_norm_slab, n_key_head, n_value_head, n_rows, head_layout,
         qk_norm_eps, norm_eps, NULL, 0u, 0u);
-}
-
-extern "C" int ds4_gpu_qwen4exp_gdn_replay_supported(void) {
-    return g_n_gpus == 1;
-}
-
-extern "C" int ds4_gpu_qwen4exp_gdn_replay_materialize(
-        ds4_gpu_tensor *state, ds4_gpu_tensor *checkpoint, ds4_gpu_tensor *tape,
-        uint32_t rows, uint32_t nk, uint32_t nv, uint32_t layout) {
-    const uint64_t state_elements = (uint64_t)nv * QWEN4EXP_GDN_DIM * QWEN4EXP_GDN_DIM;
-    const uint64_t stride = ((((uint64_t)nk + nv) * QWEN4EXP_GDN_DIM + 2ull * nv + 3ull) & ~3ull);
-    if (!nk || !nv || nv % nk || layout > DS4_QWEN4EXP_GDN_HEADS_TILED ||
-        stride > UINT32_MAX || nv > UINT32_MAX / QWEN4EXP_GDN_DIM ||
-        rows > DS4_QWEN4EXP_GDN_REPLAY_ROWS ||
-        !glm53_cuda_tensor_has(state, state_elements, sizeof(float)) ||
-        !glm53_cuda_tensor_has(checkpoint, state_elements, sizeof(float)) ||
-        !glm53_cuda_tensor_has(tape, stride * DS4_QWEN4EXP_GDN_REPLAY_ROWS, sizeof(float)) ||
-        state->ptr == checkpoint->ptr || state->ptr == tape->ptr ||
-        checkpoint->ptr == tape->ptr ||
-        ds4_tensor_device_idx(state) != ds4_tensor_device_idx(checkpoint) ||
-        ds4_tensor_device_idx(state) != ds4_tensor_device_idx(tape)) return 0;
-    qwen4exp_gdn_replay_kernel<<<dim3(nv, QWEN4EXP_GDN_DIM / 4u, 1u),
-                                 QWEN4EXP_GDN_DIM, 0, cuda_decode_stream()>>>(
-        NULL, (float *)state->ptr, (float *)checkpoint->ptr, (float *)tape->ptr,
-        NULL, NULL, NULL, NULL, NULL, nk, nv, 0u, layout, NULL, rows);
-    return cuda_ok(cudaGetLastError(), "qwen4exp GDN replay materialize");
-}
-
-extern "C" int ds4_gpu_qwen4exp_gdn_replay_q8(
-        ds4_gpu_tensor       *out,
-        ds4_gpu_tensor       *conv_state,
-        ds4_gpu_tensor       *recurrent_state,
-        ds4_gpu_tensor       *conv_snapshot,
-        ds4_gpu_tensor       *state_snapshot,
-        uint32_t              n_snapshot_rows,
-        const ds4_gpu_tensor *adopt,
-        ds4_gpu_tensor       *qkv,
-        const ds4_gpu_tensor *raw_alpha,
-        const ds4_gpu_tensor *raw_beta,
-        const ds4_gpu_tensor *output_gate,
-        const ds4_gpu_qwen4exp_slab *conv_weight_slab,
-        const ds4_gpu_qwen4exp_slab *a_log_slab,
-        const ds4_gpu_qwen4exp_slab *dt_bias_slab,
-        const ds4_gpu_qwen4exp_slab *output_norm_slab,
-        uint32_t              n_key_head,
-        uint32_t              n_value_head,
-        uint32_t              n_tokens,
-        uint32_t              head_layout,
-        float                 qk_norm_eps,
-        float                 norm_eps,
-        ds4_gpu_tensor       *out_q8,
-        uint64_t              q_offset,
-        uint64_t              s_offset,
-        const ds4_gpu_qwen4exp_gdn_replay *replay) {
-    if (!adopt || !replay) return 0;
-    return qwen4exp_cuda_gdn_run(
-        out, conv_state, recurrent_state, conv_snapshot, state_snapshot,
-        n_snapshot_rows, qkv, raw_alpha, raw_beta,
-        output_gate, conv_weight_slab, a_log_slab, dt_bias_slab,
-        output_norm_slab,
-        n_key_head, n_value_head, 1u, n_tokens, head_layout,
-        qk_norm_eps, norm_eps, out_q8, q_offset, s_offset, adopt, "replay", replay);
 }
 
 /* The GDN block at a speculative width -- one row of n_tokens <= the commit
@@ -5052,26 +4532,6 @@ qwen4exp_moe_gateup_split_kernel(
     const bool live = row < mid_dim;
     const bool second = (warp & 1u) != 0u;
     uint32_t expert = blockIdx.y;
-    /* The routed gate/up edge, opened on the kernel the COOP decode path runs.
-     *
-     * The dependent launch already exists in this file on
-     * qwen4exp_moe_gateup_q_kernel, and its comment states the mechanism: the
-     * blocks are already up and scheduled when the quantizer's last group
-     * retires, instead of paying a launch behind it.  The coop schedule does
-     * not use that kernel -- it uses this one, and this one was launched
-     * plainly.
-     *
-     * The fence sits ahead of EVERY producer read -- the active list, the
-     * counts/offsets/pairs tables, the quantized activation and the router
-     * weights are all written by the routed quantizer -- so it is placed
-     * unconditionally, not inside the `active` branch: `counts` is read even
-     * when `active` is NULL.  .nc rule: no pointer in this signature carries
-     * __restrict__, so no activation load can be hoisted above the fence as
-     * ld.global.nc.  Deadlock rule: it constrains the PRODUCER, and the
-     * quantizer bounds itself to one wave before it triggers, so a multi-wave
-     * dependent is safe.  Launched plainly -- three rows, every prefill width
-     * -- the fence is a no-op, exactly as it is for the kernel beside it. */
-    QWEN4EXP_PDL_SYNC();
     if (active) {
         if ((int32_t)blockIdx.y >= active[0]) return;
         expert = (uint32_t)active[1 + blockIdx.y];
@@ -5224,22 +4684,8 @@ qwen4exp_moe_gateup_split_kernel(
                 }
             }
         }
-        /* Readers finish before a fast projection warp reuses this tile --
-         * a hazard only a SECOND iteration of this loop can create, so the
-         * barrier is dead whenever there is no second iteration.
-         *
-         * CREDIT: 0xpg (`37816fd`).  At the decode width the body runs exactly
-         * once: `cnt` is counts[expert], the number of (token, slot) pairs
-         * that routed to this block's expert, and a decode round verifies two
-         * rows each selecting ten of 512 experts, so any one expert collects
-         * one or two of the twenty pairs.  R is 2 for every instantiation the
-         * launcher builds, so cnt <= R and `at + R >= cnt` on the first pass.
-         *
-         * The predicate is BLOCK-UNIFORM and therefore cannot deadlock: cnt is
-         * counts[expert] with expert block-invariant, and `at` is loop-uniform.
-         * Prefill, where cnt genuinely exceeds R, takes the barrier exactly as
-         * before, byte for byte. */
-        if (at + R < cnt) __syncthreads();
+        /* Readers finish before a fast projection warp reuses this tile. */
+        __syncthreads();
     }
 }
 
@@ -7924,10 +7370,10 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         (gate_slab->type == DS4_QWEN4EXP_TY_q4_K ||
          gate_slab->type == DS4_QWEN4EXP_TY_q5_K ||
          gate_slab->type == DS4_QWEN4EXP_TY_q8_0) &&
-        getenv("DS4_QWEN4EXP_NO_MMA") == NULL &&
-        getenv("DS4_QWEN4EXP_NO_EXPERT_COMPACT") == NULL &&
-        getenv("DS4_QWEN4EXP_GENERIC_EXPERTS") == NULL &&
-        getenv("DS4_QWEN4EXP_NO_GU_PAIR_TASKS") == NULL;
+        qw_env("DS4_QWEN4EXP_NO_MMA") == NULL &&
+        qw_env("DS4_QWEN4EXP_NO_EXPERT_COMPACT") == NULL &&
+        qw_env("DS4_QWEN4EXP_GENERIC_EXPERTS") == NULL &&
+        qw_env("DS4_QWEN4EXP_NO_GU_PAIR_TASKS") == NULL;
     const uint64_t task_bytes = pair_tasks ? (1u + 2u * task_capacity) * 4u : 0u;
 
     const int tile = qwen4exp_moe_tile(n_tokens);
@@ -7936,14 +7382,14 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
      * three-row call is two tiles.  DS4_QWEN4EXP_NO_WIDE_VERIFY restores the
      * <= 2 gates. */
     const bool wide_verify = (n_tokens == 3u || n_tokens == 4u) &&
-        getenv("DS4_QWEN4EXP_NO_WIDE_VERIFY") == NULL;
+        qw_env("DS4_QWEN4EXP_NO_WIDE_VERIFY") == NULL;
     const bool down_vector = tile == 2 && (n_tokens <= 2u || wide_verify) &&
         n_expert_used <= 32u &&
         (down_slab->type == DS4_QWEN4EXP_TY_q8_0 ||
          ((n_tokens == 2u || wide_verify) &&
           down_slab->type == DS4_QWEN4EXP_TY_q5_1)) &&
-        getenv("DS4_QWEN4EXP_GENERIC_EXPERTS") == NULL &&
-        getenv("DS4_QWEN4EXP_NO_DOWN_VECTOR") == NULL;
+        qw_env("DS4_QWEN4EXP_GENERIC_EXPERTS") == NULL &&
+        qw_env("DS4_QWEN4EXP_NO_DOWN_VECTOR") == NULL;
     uint64_t mq_offset = xq_bytes + idx_bytes + pair_bytes;
     /* Align short-down scratch; preserve shared input and metadata offsets. */
     if (down_vector) mq_offset = (mq_offset + 15u) & ~uint64_t(15u);
@@ -7979,7 +7425,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
 
     const int small_group =
         n_tokens < 8u && n_total_expert <= QWEN4EXP_MOE_SCAN_THREADS &&
-        getenv("DS4_QWEN4EXP_SERIAL_GROUP_SCAN") == NULL;
+        qw_env("DS4_QWEN4EXP_SERIAL_GROUP_SCAN") == NULL;
     if (small_group) {
         /* PSS: the router's top-k is the stream predecessor and triggers at
          * these widths (its gate is the same n_tokens < 8 this branch is), so
@@ -8003,7 +7449,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
                 sc.counts, (const int32_t *)selected->ptr,
                 n_total_expert, n_pairs);
         if (n_total_expert <= QWEN4EXP_MOE_SCAN_THREADS &&
-            getenv("DS4_QWEN4EXP_SERIAL_GROUP_SCAN") == NULL) {
+            qw_env("DS4_QWEN4EXP_SERIAL_GROUP_SCAN") == NULL) {
             qwen4exp_moe_group_scan_parallel_kernel<<<
                     1, QWEN4EXP_MOE_SCAN_THREADS, 0, stream>>>(
                     sc.offsets, sc.cursor, sc.active, sc.counts,
@@ -8031,29 +7477,6 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         return 0;
     }
 
-    /* The shared-expert fork's first event: the quantized activation the
-     * shared gate/up needs is complete here, and nothing below writes the
-     * prefix it lives in.  A failed record leaves the shared call in stream
-     * order (qwen4exp_fork_ready, above the routed entry). */
-    if (logical_tier >= 0 && logical_tier < 16) {
-        qwen4exp_fork_arm *arm = &g_qwen4exp_fork_arm[logical_tier];
-        arm->armed = 0;
-        if (qwen4exp_shared_fork_on() &&
-            qwen4exp_fork_ready(logical_tier, stream)) {
-            if (cudaEventRecord(g_qwen4exp_fork_xq_ready[logical_tier],
-                                stream) == cudaSuccess) {
-                arm->armed = 1;
-                arm->stream = stream;
-                arm->x = (const void *)x->ptr;
-                arm->xq = (const void *)sc.xq;
-                arm->n_tokens = n_tokens;
-                arm->xgroups = xgroups;
-            } else {
-                (void)cudaGetLastError();
-            }
-        }
-    }
-
     /* The tensor-core tile takes the gate and up projections when the shapes
      * divide it and neither type is Q6_K, whose scale changes inside a group.
      * DS4_QWEN4EXP_NO_MMA keeps the dp4a kernel for the comparison. */
@@ -8072,7 +7495,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         (mid_dim % QW_MMA_BM) == 0 && (xgroups % QW_MMA_G) == 0 &&
         gate_slab->type != (uint32_t)DS4_QWEN4EXP_TY_q6_K &&
         up_slab->type != (uint32_t)DS4_QWEN4EXP_TY_q6_K &&
-        getenv("DS4_QWEN4EXP_NO_MMA") == NULL;
+        qw_env("DS4_QWEN4EXP_NO_MMA") == NULL;
 
     /* The down tile decides whether the mid projection has a float consumer.
      * When the down tile runs it reads the Q8_0 scratch (mq/ms/msum) and never
@@ -8086,12 +7509,12 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     const int down_mma = use_mma && (out_dim % QW_DOWN_MMA_BM) == 0 &&
                          down_slab->type != (uint32_t)DS4_QWEN4EXP_TY_q6_K;
     const int moe_epilogue = down_mma &&
-        getenv("DS4_QWEN4EXP_NO_MOE_EPILOGUE") == NULL;
+        qw_env("DS4_QWEN4EXP_NO_MOE_EPILOGUE") == NULL;
 
     /* One block row per expert the call CHOSE, not per expert that exists.
      * n_pairs bounds the number of distinct experts, and the kernel exits the
      * rows past active[0]. */
-    const int compact = getenv("DS4_QWEN4EXP_NO_EXPERT_COMPACT") == NULL;
+    const int compact = qw_env("DS4_QWEN4EXP_NO_EXPERT_COMPACT") == NULL;
     const uint32_t gu_rows = !compact ? n_total_expert
         : (n_pairs < n_total_expert ? n_pairs : n_total_expert);
     const int32_t *gu_active = compact ? sc.active : NULL;
@@ -8126,7 +7549,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     /* Resolve the format once on the host, where tensor metadata already
      * lives.  This exposes fixed nibble decoding and a fixed one-half
      * accumulation to nvcc, without converting or copying any weight. */
-    const bool specialize = getenv("DS4_QWEN4EXP_GENERIC_EXPERTS") == NULL;
+    const bool specialize = qw_env("DS4_QWEN4EXP_GENERIC_EXPERTS") == NULL;
     /* ---- the DMA staging arm of the routed q4_K gate/up prefill tile ----
      * Compile switch: -DDS4_GATEUP_DMA_BUILD=0 removes the arm entirely (the
      * q4_K specialisation then instantiates Dma = 0, which is the shipped
@@ -8161,7 +7584,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
          * answer.  The other weight formats never take the new staging and
          * are unaffected either way. */
         const uint32_t gu_dq_stage =
-            getenv("DS4_QWEN4EXP_NO_GATEUP_DQ") == NULL ? 1u : 0u;
+            qw_env("DS4_QWEN4EXP_NO_GATEUP_DQ") == NULL ? 1u : 0u;
         if (pair_tasks) {
             qwen4exp_moe_pair_tasks_kernel<<<1, 512, 0, stream>>>(
                     gu_tasks, sc.counts, n_total_expert);
@@ -8197,7 +7620,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
              * any launch, so both task shapes see one answer; the kernel
              * repeats the test itself (block-uniform, outside the K loop)
              * and falls back rather than stage a fill it cannot hold. */
-            const char *gu_dma_env = getenv("DS4_GATEUP_DMA");
+            const char *gu_dma_env = qw_env("DS4_GATEUP_DMA");
             const bool gu_dma = QW_GATEUP_DMA_ARM != 0 && gu_dq_stage != 0u &&
                 (gu_dma_env == NULL || gu_dma_env[0] != '0') &&
                 (xgroups % 8u) == 0u &&
@@ -8233,10 +7656,10 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     else if ((n_tokens <= 2u || wide_verify) && tile == 2 && specialize &&
              gate_slab->type == DS4_QWEN4EXP_TY_q4_K &&
              up_slab->type == DS4_QWEN4EXP_TY_q4_K &&
-             getenv("DS4_QWEN4EXP_NO_SPLIT_GATEUP") == NULL) {
+             qw_env("DS4_QWEN4EXP_NO_SPLIT_GATEUP") == NULL) {
         /* Vector reads require alignment; the scalar schedule remains available. */
         const bool vector = ((uintptr_t)sc.xq & 15u) == 0u &&
-            getenv("DS4_QWEN4EXP_NO_SPLIT_VECTOR") == NULL;
+            qw_env("DS4_QWEN4EXP_NO_SPLIT_VECTOR") == NULL;
         /* COOPERATIVE 8-ROW PANEL.  Kernel-only: the shipped bytes, the
          * shipped order, the same per-lane pieces, only the block shape and
          * where the loads are served from change.  DS4_GATEUP_COOP=0 restores
@@ -8244,7 +7667,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
          * removes the arm at compile time.  The static shared panel is sized
          * for the tower's q4_K gate/up row (groups 80, 1440-byte rows), so any
          * other shape keeps the shipped block. */
-        const char *const coop_env = getenv("DS4_GATEUP_COOP");
+        const char *const coop_env = qw_env("DS4_GATEUP_COOP");
         const bool coop = (DS4_GATEUP_COOP_BUILD != 0) && vector &&
             (coop_env == NULL || coop_env[0] != '0') &&
             xgroups == QW_GU_COOP_GROUPS &&
@@ -8254,9 +7677,8 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             (gate_slab->expert_bytes & 15ull) == 0ull &&
             (up_slab->expert_bytes & 15ull) == 0ull;
 #define QWEN4EXP_SPLIT_GATEUP(V, P, C) \
-        QWEN4EXP_LAUNCH_PDL( \
-            (qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P, C>), \
-            (dim3((mid_dim + P - 1u) / P, gu_rows, 1)), P * 64u, 0, stream, \
+        qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P, C><<< \
+            dim3((mid_dim + P - 1u) / P, gu_rows, 1), P * 64u, 0, stream>>>( \
             (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum, \
             sc.pairs, sc.counts, sc.offsets, gu_active, \
             (const float *)weights->ptr, \
@@ -8327,11 +7749,11 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
          * staging down and runs the oracle decode + repack the kernel has
          * always had, byte for byte.  Read once, before the launch. */
         const uint32_t dn_dq_stage =
-            getenv("DS4_QWEN4EXP_NO_DOWN_DQ") == NULL ? 1u : 0u;
+            qw_env("DS4_QWEN4EXP_NO_DOWN_DQ") == NULL ? 1u : 0u;
         /* The q5_1 staging reads its six block words as three eight-byte
          * loads; DS4_QWEN4EXP_NO_Q51_WIDE_LOAD restores the word loop. */
         const bool dn_wide6 =
-            getenv("DS4_QWEN4EXP_NO_Q51_WIDE_LOAD") == NULL;
+            qw_env("DS4_QWEN4EXP_NO_Q51_WIDE_LOAD") == NULL;
 #define QWEN4EXP_DOWN_MMA(DT, W6) \
         qwen4exp_moe_down_mma_kernel<DT, W6><<< \
                 dim3(out_dim / QW_DOWN_MMA_BM, gu_rows, 1), \
@@ -8353,7 +7775,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         }
 #undef QWEN4EXP_DOWN_MMA
         if (!cuda_ok(cudaGetLastError(), "qwen4exp MoE down tile launch")) return 0;
-        if (getenv("DS4_QWEN4EXP_NO_COMBINE_GRID") == NULL) {
+        if (qw_env("DS4_QWEN4EXP_NO_COMBINE_GRID") == NULL) {
             qwen4exp_moe_down_combine_grid_kernel<<<
                     dim3((out_dim + threads - 1u) / threads, n_tokens, 1),
                     threads, 0, stream>>>(
@@ -8389,9 +7811,9 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             (down_slab->expert_bytes % 16u) == 0u &&
             ((uintptr_t)down & 15u) == 0u &&
             dn_shared <= QW_DOWN_PANEL_MAX_BYTES &&
-            getenv("DS4_QWEN4EXP_NO_DOWN_PANEL") == NULL;
+            qw_env("DS4_QWEN4EXP_NO_DOWN_PANEL") == NULL;
         if (down_slab->type == DS4_QWEN4EXP_TY_q8_0) {
-            if (dn_stage && getenv("DS4_QWEN4EXP_NO_DOWN_ASYNC") == NULL) {
+            if (dn_stage && qw_env("DS4_QWEN4EXP_NO_DOWN_ASYNC") == NULL) {
                 QWEN4EXP_DOWN_ASYNC(DS4_QWEN4EXP_TY_q8_0);
             } else if (dn_stage) {
                 QWEN4EXP_DOWN_IMPL_S(2, DS4_QWEN4EXP_TY_q8_0, true, true,
@@ -8400,7 +7822,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
                 QWEN4EXP_DOWN_IMPL(2, DS4_QWEN4EXP_TY_q8_0, true);
             }
         } else {
-            if (dn_stage && getenv("DS4_QWEN4EXP_NO_DOWN_ASYNC") == NULL) {
+            if (dn_stage && qw_env("DS4_QWEN4EXP_NO_DOWN_ASYNC") == NULL) {
                 QWEN4EXP_DOWN_ASYNC(DS4_QWEN4EXP_TY_q5_1);
             } else if (dn_stage) {
                 QWEN4EXP_DOWN_IMPL_S(2, DS4_QWEN4EXP_TY_q5_1, true, true,
@@ -8481,7 +7903,25 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
     const unsigned threads = 256u;
     const size_t shared = (size_t)threads * sizeof(float);
     const bool specialize_shared =
-        getenv("DS4_QWEN4EXP_GENERIC_EXPERTS") == NULL;
+        qw_env("DS4_QWEN4EXP_GENERIC_EXPERTS") == NULL;
+
+    /* The sigmoid gate is one dot against ONE F32 row per token.  It reads
+     * kilobytes, not megabytes, so it keeps the scalar reduction. Resolve its
+     * checkpoint-wide F32 type at launch just as the Q8 projections below do;
+     * other supported layouts retain the generic decoder. */
+    if (specialize_shared &&
+        router_slab->type == (uint32_t)DS4_QWEN4EXP_TY_f32) {
+        qwen4exp_shared_gate_kernel<DS4_QWEN4EXP_TY_f32>
+            <<<n_tokens, threads, shared, stream>>>(
+                (float *)gate_scale->ptr, router, (const float *)x->ptr,
+                router_slab->type, in_dim, n_tokens);
+    } else {
+        qwen4exp_shared_gate_kernel<-1>
+            <<<n_tokens, threads, shared, stream>>>(
+                (float *)gate_scale->ptr, router, (const float *)x->ptr,
+                router_slab->type, in_dim, n_tokens);
+    }
+    if (!cuda_ok(cudaGetLastError(), "qwen4exp shared gate launch")) return 0;
 
     const uint32_t xgroups = in_dim / 32u;
     const uint32_t mgroups = mid_dim / 32u;
@@ -8498,68 +7938,10 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
     float *ms = (float *)(at + (uint64_t)n_tokens * mgroups * 32u);
     int32_t *msum = (int32_t *)(ms + (uint64_t)n_tokens * mgroups);
 
-    /* THE FORK (the design note above the routed entry).  Taken when the
-     * routed call that just ran recorded its event against exactly this
-     * input, on this stream and device, and its quantized prefix is the one
-     * this call reads.  The shared mid then quantizes into the fork's own
-     * pool -- offset xq_bytes of the group pool is the routed pair list,
-     * live on the main stream until the routed gate/up has read it -- and
-     * the side stream waits on the routed quantizer before anything is
-     * launched on it.  Every decline lands on the sequential path with
-     * nothing issued. */
-    int fork = 0;
-    if (pre_quantized && logical_tier >= 0 && logical_tier < 16 &&
-        qwen4exp_shared_fork_on() && g_qwen4exp_fork_state[logical_tier] > 0) {
-        qwen4exp_fork_arm *arm = &g_qwen4exp_fork_arm[logical_tier];
-        const int match = arm->armed && arm->stream == stream &&
-            arm->x == (const void *)x->ptr && arm->xq == (const void *)xq &&
-            arm->n_tokens == n_tokens && arm->xgroups == xgroups;
-        arm->armed = 0;
-        if (match) {
-            char *fork_at = (char *)qwen4exp_shexp_scratch(logical_tier, mq_bytes);
-            if (!fork_at) {
-                (void)cudaGetLastError();
-            } else if (cudaStreamWaitEvent(g_qwen4exp_fork_stream[logical_tier],
-                                           g_qwen4exp_fork_xq_ready[logical_tier],
-                                           0) != cudaSuccess) {
-                fprintf(stderr, "ds4: qwen4exp shared-expert fork wait failed "
-                                "(%s); this call stays in stream order\n",
-                        cudaGetErrorString(cudaGetLastError()));
-            } else {
-                fork = 1;
-                mq = (int8_t *)fork_at;
-                ms = (float *)(fork_at + (uint64_t)n_tokens * mgroups * 32u);
-                msum = (int32_t *)(ms + (uint64_t)n_tokens * mgroups);
-            }
-        }
-    }
-    /* The gate, the gate/up projection and the mid quantizer ride `side`:
-     * the fork's stream when forked, `stream` itself when not.  The down
-     * projection always rides `stream`. */
-    cudaStream_t side = fork ? g_qwen4exp_fork_stream[logical_tier] : stream;
-
-    /* The sigmoid gate is one dot against ONE F32 row per token.  It reads
-     * kilobytes, not megabytes, so it keeps the scalar reduction. Resolve its
-     * checkpoint-wide F32 type at launch just as the Q8 projections below do;
-     * other supported layouts retain the generic decoder. */
-    if (specialize_shared &&
-        router_slab->type == (uint32_t)DS4_QWEN4EXP_TY_f32) {
-        qwen4exp_shared_gate_kernel<DS4_QWEN4EXP_TY_f32>
-            <<<n_tokens, threads, shared, side>>>(
-                (float *)gate_scale->ptr, router, (const float *)x->ptr,
-                router_slab->type, in_dim, n_tokens);
-    } else {
-        qwen4exp_shared_gate_kernel<-1>
-            <<<n_tokens, threads, shared, side>>>(
-                (float *)gate_scale->ptr, router, (const float *)x->ptr,
-                router_slab->type, in_dim, n_tokens);
-    }
-    if (!cuda_ok(cudaGetLastError(), "qwen4exp shared gate launch")) return 0;
-
     if (!pre_quantized) {
         if (!qwen4exp_quantize_rows(xq, xs, xsum, (const float *)x->ptr,
                                     n_tokens, in_dim, xgroups, in_dim, 0, 1,
-                                    side)) {
+                                    stream)) {
             return 0;
         }
     }
@@ -8572,8 +7954,8 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         gate_slab->type == DS4_QWEN4EXP_TY_q8_0 &&
         up_slab->type == DS4_QWEN4EXP_TY_q8_0 &&
         down_slab->type == DS4_QWEN4EXP_TY_q8_0 &&
-        getenv("DS4_QWEN4EXP_MOE_R") == NULL &&
-        getenv("DS4_QWEN4EXP_NO_SHARED_R1") == NULL;
+        qw_env("DS4_QWEN4EXP_MOE_R") == NULL &&
+        qw_env("DS4_QWEN4EXP_NO_SHARED_R1") == NULL;
     /* The aligned activation prefix and intermediate groups can be loaded
      * as two int4 values. Keep the row tile, warp ownership, reduction and
      * Q8 decoder unchanged. The rotating-weight screen supports two-token
@@ -8581,14 +7963,14 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
     const bool vector_shared =
         (n_tokens == 2u ||
          ((n_tokens == 3u || n_tokens == 4u) &&
-          getenv("DS4_QWEN4EXP_NO_WIDE_VERIFY") == NULL)) &&
+          qw_env("DS4_QWEN4EXP_NO_WIDE_VERIFY") == NULL)) &&
         in_dim == 2560u && mid_dim == 640u && out_dim == 2560u &&
         specialize_shared &&
         gate_slab->type == DS4_QWEN4EXP_TY_q8_0 &&
         up_slab->type == DS4_QWEN4EXP_TY_q8_0 &&
         down_slab->type == DS4_QWEN4EXP_TY_q8_0 &&
-        getenv("DS4_QWEN4EXP_MOE_R") == NULL &&
-        getenv("DS4_QWEN4EXP_NO_SHARED_VECTOR") == NULL;
+        qw_env("DS4_QWEN4EXP_MOE_R") == NULL &&
+        qw_env("DS4_QWEN4EXP_NO_SHARED_VECTOR") == NULL;
     const int tile = single_q8 ? 1 : qwen4exp_moe_tile(n_tokens);
     const uint32_t tiles = (n_tokens + (uint32_t)tile - 1u) / (uint32_t)tile;
 
@@ -8612,8 +7994,8 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         gate_slab->type == (uint32_t)DS4_QWEN4EXP_TY_q8_0 &&
         up_slab->type == (uint32_t)DS4_QWEN4EXP_TY_q8_0 &&
         down_slab->type == (uint32_t)DS4_QWEN4EXP_TY_q8_0 &&
-        getenv("DS4_QWEN4EXP_SHARED_STAGE") == NULL &&
-        getenv("DS4_QWEN4EXP_MOE_R") == NULL;
+        qw_env("DS4_QWEN4EXP_SHARED_STAGE") == NULL &&
+        qw_env("DS4_QWEN4EXP_MOE_R") == NULL;
     const uint32_t mma_tiles = (n_tokens + QW_SH_BN - 1u) / QW_SH_BN;
 
     /* Two tensor-core tiles now sit here.  Both return the per-row kernels'
@@ -8639,14 +8021,12 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
      * and both tiles are gated at sixty-four, so neither can ever be a node
      * in a captured graph: at a capture width the shared expert takes the
      * per-row and staged dp4a kernels it took before either tile existed.
-     * And every launch here goes on `stream`, which is cuda_decode_stream()
-     * and so the capture stream whenever one is active, or on `side`, which
-     * is that same stream unless the fork above was taken -- and then it is
-     * the fork's stream, joined to the capture by the event wait the fork
-     * issued and rejoined below, before the down launch, by the second.
-     * Nothing on this path allocates or frees, so the scratch growth above
-     * and its ds4_gpu_decode_graphs_invalidate() are untouched by anything
-     * below it. */
+     * And every launch here -- both tiles, both dp4a pairs, the router and
+     * the two quantise passes -- goes on `stream`, which is
+     * cuda_decode_stream(), so it is the capture stream whenever one is
+     * active.  Nothing on this path allocates or frees, so the scratch
+     * growth above and its ds4_gpu_decode_graphs_invalidate() are untouched
+     * by anything below it. */
     const uint32_t gu_types[2] = { gate_slab->type, up_slab->type };
     const uint32_t dn_types[1] = { down_slab->type };
     int gu_logch = 0, dn_logch = 0;
@@ -8664,7 +8044,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
     if (pipe_gateup &&
         qwen4exp_shared_pipe_dispatch<2>(gu_pk, gu_pl, (float *)mid->ptr, gate, up, xq, xs,
                                          NULL, gate_slab->row_bytes, up_slab->row_bytes,
-                                         xgroups, mid_dim, n_tokens, side)) {
+                                         xgroups, mid_dim, n_tokens, stream)) {
         ds4_gpu_qwen4exp_shared_mma_launches++;
     } else if (mma_gateup) {
         const uint32_t ks = ((xgroups + 31u) / 32u) << gu_logch;
@@ -8673,7 +8053,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
                         1);
         ds4_gpu_qwen4exp_shared_mma_launches++;
         QS_MMA_DISPATCH(qwen4exp_shared_gateup_mma_kernel, gu_logch, grid,
-                        (size_t)qs_mma_smem_bytes(ks, 2u), side,
+                        (size_t)qs_mma_smem_bytes(ks, 2u), stream,
                         (float *)mid->ptr, gate, up, xq, xs, xsum,
                         gate_slab->row_bytes, up_slab->row_bytes,
                         gate_slab->type, up_slab->type,
@@ -8683,14 +8063,14 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
     } else if (use_mma) {
         qwen4exp_shared_q8_mma_kernel<true><<<
                 dim3((mid_dim + QW_SH_BM - 1u) / QW_SH_BM, mma_tiles, 1),
-                QW_SH_THREADS, 0, side>>>(
+                QW_SH_THREADS, 0, stream>>>(
                 (float *)mid->ptr, gate, up, xq, xs, xsum, NULL,
                 gate_slab->row_bytes, up_slab->row_bytes,
                 xgroups, mid_dim, n_tokens, 0.0f);
     } else if (stage_gateup) {
         qwen4exp_shared_gateup_stage_kernel<QWEN4EXP_STAGE_R>
             <<<dim3(mid_dim, stage_tiles, 1), QWEN4EXP_STAGE_THREADS,
-               (size_t)qwen4exp_stage_bytes(xgroups, 2), side>>>(
+               (size_t)qwen4exp_stage_bytes(xgroups, 2), stream>>>(
                 (float *)mid->ptr, gate, up, xq, xs, xsum,
                 gate_slab->row_bytes, up_slab->row_bytes,
                 gate_slab->type, up_slab->type, xgroups, mid_dim, n_tokens);
@@ -8705,13 +8085,13 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         QWEN4EXP_LAUNCH_PDL( \
                 (qwen4exp_shared_gateup_q_kernel<R, GT, UT, V>), \
                 (dim3((mid_dim + 7u) / 8u, tiles, 1)), \
-                threads, 0, side, \
+                threads, 0, stream, \
                 (float *)mid->ptr, gate, up, xq, xs, xsum, \
                 gate_slab->row_bytes, up_slab->row_bytes, \
                 gate_slab->type, up_slab->type, xgroups, mid_dim, n_tokens); \
     } else { \
         qwen4exp_shared_gateup_q_kernel<R, GT, UT, V> \
-            <<<dim3((mid_dim + 7u) / 8u, tiles, 1), threads, 0, side>>>( \
+            <<<dim3((mid_dim + 7u) / 8u, tiles, 1), threads, 0, stream>>>( \
                     (float *)mid->ptr, gate, up, xq, xs, xsum, \
                     gate_slab->row_bytes, up_slab->row_bytes, \
                     gate_slab->type, up_slab->type, xgroups, mid_dim, n_tokens); \
@@ -8743,23 +8123,8 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
 
     if (!qwen4exp_quantize_rows(mq, ms, msum, (const float *)mid->ptr,
                                 n_tokens, mid_dim, mgroups, mid_dim, 0, 1,
-                                side)) {
+                                stream)) {
         return 0;
-    }
-
-    if (fork) {
-        /* Rejoin: the main stream, and so the down projection below, waits
-         * on the mid quantizer.  Inside a capture this is also what joins
-         * the side stream back to the origin before the capture ends. */
-        if (!cuda_ok(cudaEventRecord(g_qwen4exp_fork_mid_ready[logical_tier],
-                                     side),
-                     "qwen4exp shared fork mid record") ||
-            !cuda_ok(cudaStreamWaitEvent(stream,
-                                         g_qwen4exp_fork_mid_ready[logical_tier],
-                                         0),
-                     "qwen4exp shared fork join")) {
-            return 0;
-        }
     }
 
     if (pipe_down &&
@@ -8777,7 +8142,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
          * oracle decode + repack runs.  The shipped shared expert is Q8_0
          * and never takes either arm's difference. */
         const uint32_t dn_dq_stage =
-            getenv("DS4_QWEN4EXP_NO_DOWN_DQ") == NULL ? 1u : 0u;
+            qw_env("DS4_QWEN4EXP_NO_DOWN_DQ") == NULL ? 1u : 0u;
         ds4_gpu_qwen4exp_shared_mma_launches++;
         QS_MMA_DISPATCH(qwen4exp_shared_down_mma_kernel, dn_logch, grid,
                         (size_t)qs_mma_smem_bytes(ks, 1u), stream,
@@ -8818,7 +8183,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         (sd_panel % 16u) == 0u &&
         ((uintptr_t)down & 15u) == 0u &&
         sd_panel <= QW_DOWN_PANEL_MAX_BYTES &&
-        getenv("DS4_QWEN4EXP_NO_SHARED_DOWN_PANEL") == NULL;
+        qw_env("DS4_QWEN4EXP_NO_SHARED_DOWN_PANEL") == NULL;
 #define QWEN4EXP_SH_DOWN_IMPL(R, DT, V) do { \
     if (n_tokens <= 2u) { \
         if (sd_stage) { \
@@ -14042,7 +13407,7 @@ static int qwen4exp_qsa_attention_split(
              * depth for the measured one-row model shape. */
             if (!sparse && n_tokens == 1u && n_head == 24u &&
                 n_kv_head == 2u && head_dim == 256u &&
-                getenv("DS4_QWEN4EXP_NO_QSA_SHORT_V") == NULL) {
+                qw_env("DS4_QWEN4EXP_NO_QSA_SHORT_V") == NULL) {
                 QWEN4EXP_QSA_SPLIT_LAUNCH(2u, 8u);
             } else {
                 QWEN4EXP_QSA_SPLIT_LAUNCH(2u, QWEN4EXP_QSA_SPLIT_VSTEP);
