@@ -955,6 +955,7 @@ struct cuda_decode_graph_entry {
     ds4_decode_graph_key key;
     cudaGraphExec_t      exec;
     int                  state;   /* 0 empty, 1 warmed, 2 ready, 3 dead */
+    bool                 upload_enqueued; /* explicit upload accepted, not residency */
     uint64_t             hits;
 };
 
@@ -1031,6 +1032,7 @@ static void cuda_decode_graph_entry_kill(cuda_decode_graph_entry *e) {
         (void)cudaGraphExecDestroy(e->exec);
         e->exec = NULL;
     }
+    e->upload_enqueued = false;
     e->state = 3;
 }
 
@@ -1044,6 +1046,7 @@ extern "C" void ds4_gpu_decode_graphs_invalidate(void) {
                     e->exec = NULL;
                 }
                 e->state = 0;
+                e->upload_enqueued = false;
                 e->hits = 0;
                 memset(&e->key, 0, sizeof(e->key));
             }
@@ -1085,12 +1088,9 @@ static cuda_decode_graph_entry *cuda_decode_graph_find(
     return NULL;           /* all variants busy with other keys: stay eager */
 }
 
-/* Upload a ready exec now rather than at its next launch.  Costs the caller
- * the upload's host time at a moment of the caller's choosing -- the point is
- * to spend it while the GPU still has work queued, so the launch that follows
- * finds the graph resident and returns immediately.  A miss (no entry, not
- * ready, uploads disabled) is a no-op and returns 0; nothing about the graph's
- * contents or ordering depends on it. */
+/* Enqueue one optional upload per immutable exec. Successful enqueue does
+ * not promise completion or permanent residency; launch ordering is unchanged.
+ * Failed uploads remain retryable at a later prefetch. */
 extern "C" int ds4_gpu_decode_graph_prefetch(const ds4_decode_graph_key *key) {
     if (!key || !cuda_decode_graph_upload_on()) return 0;
     if (!ds4_gpu_decode_graphs_supported()) return 0;
@@ -1101,10 +1101,12 @@ extern "C" int ds4_gpu_decode_graph_prefetch(const ds4_decode_graph_key *key) {
         cuda_decode_graph_entry *e = &g_decode_graphs[key->il][key->island][v];
         if (e->state != 2 || !e->exec) continue;
         if (memcmp(&e->key, key, sizeof(*key)) != 0) continue;
+        if (e->upload_enqueued) return 1;
         if (cudaGraphUpload(e->exec, g_decode_graph_stream) != cudaSuccess) {
             (void)cudaGetLastError();
             return 0;
         }
+        e->upload_enqueued = true;
         return 1;
     }
     return 0;
@@ -1198,13 +1200,13 @@ extern "C" int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) {
         return -1;
     }
     e->exec = exec;
+    e->upload_enqueued = false;
     e->state = 2;
     g_decode_graph_captures++;
-    /* The upload the first replay would otherwise do, done here instead. A
-     * failure is not fatal: the launch does the upload itself, which is the
-     * behaviour without this call. */
+    /* Retain optional preparation after the required first launch. A failed
+     * upload is nonfatal and leaves prefetch eligible to retry it. */
     if (cuda_decode_graph_upload_on()) {
-        (void)cudaGraphUpload(exec, g_decode_graph_stream);
+        e->upload_enqueued = cudaGraphUpload(exec, g_decode_graph_stream) == cudaSuccess;
         (void)cudaGetLastError();
     }
     if (getenv("DS4_CUDA_DECODE_GRAPH_LOG") != NULL) {

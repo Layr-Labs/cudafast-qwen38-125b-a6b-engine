@@ -3883,8 +3883,9 @@ int  ds4_gpu_decode_graphs_supported(void);
 /* 1: replayed (island already executed; skip encoding it)
  * 0: capturing (encode the island, then call _end)
  * -1: run eagerly */
-/* Upload a ready decode-graph exec now, so its next launch does not.
- * Returns 1 when an upload was issued, 0 otherwise (never an error). */
+/* Prepare a ready decode-graph exec with one explicit upload per lifetime.
+ * Returns 1 when already enqueued or accepted now, 0 otherwise (nonfatal).
+ * Success does not mean upload completion or permanent residency. */
 int  ds4_gpu_decode_graph_prefetch(const ds4_decode_graph_key *key);
 int  ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key);
 /* 0: capture committed and launched; -1: capture failed (entry retired;
