@@ -14417,6 +14417,42 @@ __global__ static void qwen4exp_ple_conv_kernel(
     }
 }
 
+/* Fixed serial decode shape for PLE: one row, no speculative snapshots,
+ * four taps, dilation three and therefore nine state rows.  The arithmetic
+ * and ascending state-write order match qwen4exp_ple_conv_kernel exactly;
+ * only the invariant addresses are exposed so loop/index overhead can be
+ * removed from this latency-bound decode island.  The environment escape is
+ * read at dispatch time for a reversible A/B kill switch. */
+__global__ static void qwen4exp_ple_conv_decode_kernel(
+        float *hyper, float *state, const float *gated, const float *conv_in,
+        const float *weight, uint32_t channels) {
+    const uint32_t c = (uint32_t)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (c >= channels) return;
+
+    const uint32_t C = channels;
+    float acc = 0.0f;
+    acc = fmaf(state[c], weight[(uint64_t)c * 4u + 0u], acc);
+    acc = fmaf(state[(uint64_t)3u * C + c],
+               weight[(uint64_t)c * 4u + 1u], acc);
+    acc = fmaf(state[(uint64_t)6u * C + c],
+               weight[(uint64_t)c * 4u + 2u], acc);
+    acc = fmaf(conv_in[c], weight[(uint64_t)c * 4u + 3u], acc);
+
+    hyper[c] += gated[c] + acc * qwen4exp_sigmoid(acc);
+
+    /* state_len=(4-1)*3=9 and n_tokens=1: advance eight slots, then append
+     * the current input row. */
+    state[c] = state[C + c];
+    state[(uint64_t)C + c] = state[(uint64_t)2u * C + c];
+    state[(uint64_t)2u * C + c] = state[(uint64_t)3u * C + c];
+    state[(uint64_t)3u * C + c] = state[(uint64_t)4u * C + c];
+    state[(uint64_t)4u * C + c] = state[(uint64_t)5u * C + c];
+    state[(uint64_t)5u * C + c] = state[(uint64_t)6u * C + c];
+    state[(uint64_t)6u * C + c] = state[(uint64_t)7u * C + c];
+    state[(uint64_t)7u * C + c] = state[(uint64_t)8u * C + c];
+    state[(uint64_t)8u * C + c] = conv_in[c];
+}
+
 extern "C" int ds4_gpu_qwen4exp_ple_gate_tensor(
         ds4_gpu_tensor       *out_hc,
         const ds4_gpu_tensor *key_hc,
@@ -14489,6 +14525,18 @@ extern "C" int ds4_gpu_qwen4exp_ple_conv_tensor(
             model_map, weight_offset, weight_bytes, logical_tier,
             "qwen4exp_ple_conv_weight");
     if (!w) return 0;
+    if (rows == 1u && n_snapshot_rows == 0u && conv_kernel == 4u &&
+        dilation == 3u && state_len == 9u &&
+        getenv("DS4_QWEN4EXP_NO_PLE_DECODE_UNROLL") == NULL) {
+        qwen4exp_ple_conv_decode_kernel<<<
+                (unsigned)((channels + 255u) / 256u), 256, 0,
+                cuda_decode_stream()>>>(
+                (float *)hyper->ptr, (float *)conv_state->ptr,
+                (const float *)gated->ptr, (const float *)conv_in->ptr, w,
+                channels);
+        return cuda_ok(cudaGetLastError(),
+                       "qwen4exp_ple_conv decode unroll launch");
+    }
     qwen4exp_ple_conv_kernel<<<
         (unsigned)((channels + 255u) / 256u), 256, 0, cuda_decode_stream()>>>(
             (float *)hyper->ptr, (float *)conv_state->ptr,
