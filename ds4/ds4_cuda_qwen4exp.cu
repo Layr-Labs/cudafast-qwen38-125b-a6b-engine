@@ -1654,7 +1654,7 @@ static float *qwen4exp_conv_scratch(int tier, uint64_t elements) {
 /* Snapshot slots a lazy-rollback flag may name: DS4_QWEN4EXP_IMPLEMENTED_DEPTH
  * (ds4_qwen4exp_mtp.h, which this unit does not include), the count the graph
  * allocates and the bound its select applies. */
-#define QWEN4EXP_GDN_ADOPT_SLOTS 6u
+#define QWEN4EXP_GDN_ADOPT_SLOTS 8u
 
 /* Defined beside the Q8_0 quantize seam it shares with the HC mixer. */
 __global__ static void qwen4exp_gdn_output_quant_kernel(
