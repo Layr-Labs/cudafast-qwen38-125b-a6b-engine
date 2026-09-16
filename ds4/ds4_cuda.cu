@@ -33694,6 +33694,63 @@ __global__ static void glm_indexer_scores_f32_kernel(
     }
 }
 
+/* One-token quality-path indexer reduction for the target's four indexer
+ * heads.  The legacy kernel above performs a 128-element shared-memory tree
+ * for every head (seven CTA barriers per head).  Decode has exactly one token
+ * and head_dim 128, so each warp can reduce its contiguous 32 products with
+ * shuffles; four warp leaders publish one partial per head and lane zero
+ * combines them.  The arithmetic association is intentionally different
+ * from the legacy tree, so this path is narrow, opt-out, and must be checked
+ * against the score/top-k correctness oracle on the target device.
+ */
+template <typename CT>
+__global__ static void glm_indexer_scores_decode_warp_kernel(
+        float *scores,
+        const float *q,
+        const float *weights,
+        const CT *indexer_key_cache,
+        uint32_t n_rows,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t row_group_size,
+        float scale,
+        bool causal) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t token = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    if (row >= n_rows || token >= n_tokens || tid >= 128u) return;
+    const uint32_t visible = (pos0 + token + 1u) / row_group_size;
+    if (causal && row >= min(n_rows, visible)) {
+        if (tid == 0u) scores[(uint64_t)token * n_rows + row] = -INFINITY;
+        return;
+    }
+
+    __shared__ float warp_partial[4];
+    float total = 0.0f;
+    const CT *krow = indexer_key_cache + (uint64_t)row * head_dim;
+    for (uint32_t h = 0; h < n_head; h++) {
+        const float *qh = q +
+            ((uint64_t)token * n_head + h) * head_dim;
+        float dot = qh[tid] * (float)krow[tid];
+        dot = warp_sum_f32(dot);
+        if (lane == 0u) warp_partial[warp] = dot;
+        __syncthreads();
+        if (tid == 0u) {
+            total += fmaxf(warp_partial[0] + warp_partial[1] +
+                               warp_partial[2] + warp_partial[3], 0.0f) *
+                weights[(uint64_t)token * n_head + h];
+        }
+        __syncthreads();
+    }
+    if (tid == 0u) {
+        scores[(uint64_t)token * n_rows + row] = total * scale;
+    }
+}
+
 /* 16-token x 128-row indexer tile. Q and cached K are staged as fp16,
  * matching the model's compact-cache precision; each head's MMA result and
  * the weighted head reduction remain fp32. */
@@ -33839,6 +33896,27 @@ static int glm_indexer_scores_launch(
         indexer_key_cache->bytes < (uint64_t)n_rows * head_dim * cache_elem ||
         scores->bytes < (uint64_t)n_tokens * n_rows * sizeof(float)) {
         return 0;
+    }
+    if (g_quality_mode && n_tokens == 1u && n_head == 4u &&
+        getenv("DS4_CUDA_NO_INDEXER_WARP_REDUCE") == NULL) {
+        dim3 grid(n_rows, n_tokens, 1);
+        if (cache_f16) {
+            glm_indexer_scores_decode_warp_kernel<__half><<<grid, 128>>>(
+                    (float *)scores->ptr, (const float *)q->ptr,
+                    (const float *)weights->ptr,
+                    (const __half *)indexer_key_cache->ptr,
+                    n_rows, n_tokens, pos0, n_head, head_dim, row_group_size,
+                    scale, causal);
+        } else {
+            glm_indexer_scores_decode_warp_kernel<float><<<grid, 128>>>(
+                    (float *)scores->ptr, (const float *)q->ptr,
+                    (const float *)weights->ptr,
+                    (const float *)indexer_key_cache->ptr,
+                    n_rows, n_tokens, pos0, n_head, head_dim, row_group_size,
+                    scale, causal);
+        }
+        return cuda_ok(cudaGetLastError(),
+                       "glm indexer scores decode warp launch");
     }
     if (!g_quality_mode) {
         dim3 grid((n_rows + 127u) / 128u,
