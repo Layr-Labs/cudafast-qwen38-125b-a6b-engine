@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-int ds4_gpu_qwen4exp_ple_block_tensor(
+static int qwen4exp_ple_block_impl(
         ds4_gpu_tensor              *hyper,
         ds4_gpu_tensor              *conv_state,
         ds4_gpu_tensor              *conv_snapshot,
@@ -40,7 +40,8 @@ int ds4_gpu_qwen4exp_ple_block_tensor(
         float                 norm_key_bias,
         float                 norm_query_bias,
         float                 norm_conv_bias,
-        int                   round_bf16) {
+        int                   round_bf16,
+        const ds4_gpu_tensor *adopt, uint32_t snapshot_slots) {
     if (!hyper || !conv_state || !key_scratch || !aux_scratch ||
         !value_scratch || !ngram_rows || !key_weight || !value_weight ||
         !norm_key || !norm_query || !norm_conv || !conv_weight ||
@@ -106,6 +107,15 @@ int ds4_gpu_qwen4exp_ple_block_tensor(
     }
 
     /* hyper += gated + silu(conv1d(normConv(gated))), and roll the window. */
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (adopt) return ds4_gpu_qwen4exp_ple_conv_adopt_tensor(
+            hyper, conv_state, conv_snapshot, n_snapshot_rows, key_scratch,
+            aux_scratch, conv_weight->map, conv_weight->map_size,
+            conv_weight->offset, wide, conv_kernel, dilation, rows,
+            adopt, snapshot_slots);
+#else
+    (void)adopt; (void)snapshot_slots;
+#endif
     return ds4_gpu_qwen4exp_ple_conv_tensor(hyper, conv_state, conv_snapshot,
                                             n_snapshot_rows, key_scratch,
                                             aux_scratch, conv_weight->map,
@@ -113,6 +123,75 @@ int ds4_gpu_qwen4exp_ple_block_tensor(
                                             conv_weight->offset, wide,
                                             conv_kernel, dilation, rows);
 }
+
+int ds4_gpu_qwen4exp_ple_block_tensor(
+        ds4_gpu_tensor              *hyper,
+        ds4_gpu_tensor              *conv_state,
+        ds4_gpu_tensor              *conv_snapshot,
+        uint32_t                     n_snapshot_rows,
+        ds4_gpu_tensor              *key_scratch,
+        ds4_gpu_tensor              *aux_scratch,
+        ds4_gpu_tensor              *value_scratch,
+        const ds4_gpu_tensor        *ngram_rows,
+        const ds4_gpu_qwen4exp_slab *key_weight,
+        const ds4_gpu_qwen4exp_slab *value_weight,
+        const ds4_gpu_qwen4exp_slab *norm_key,
+        const ds4_gpu_qwen4exp_slab *norm_query,
+        const ds4_gpu_qwen4exp_slab *norm_conv,
+        const ds4_gpu_qwen4exp_slab *conv_weight,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              ple_embd,
+        uint32_t              conv_kernel,
+        uint32_t              dilation,
+        uint32_t              rows,
+        float                 eps,
+        float                 norm_key_bias,
+        float                 norm_query_bias,
+        float                 norm_conv_bias,
+        int                   round_bf16) {
+    return qwen4exp_ple_block_impl(hyper, conv_state, conv_snapshot, n_snapshot_rows,
+            key_scratch, aux_scratch, value_scratch, ngram_rows,
+            key_weight, value_weight, norm_key, norm_query, norm_conv,
+            conv_weight, n_embd, n_hc, ple_embd, conv_kernel, dilation, rows,
+            eps, norm_key_bias, norm_query_bias, norm_conv_bias, round_bf16, NULL, 0u);
+}
+
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+int ds4_gpu_qwen4exp_ple_block_adopt_tensor(
+        ds4_gpu_tensor              *hyper,
+        ds4_gpu_tensor              *conv_state,
+        ds4_gpu_tensor              *conv_snapshot,
+        uint32_t                     n_snapshot_rows,
+        ds4_gpu_tensor              *key_scratch,
+        ds4_gpu_tensor              *aux_scratch,
+        ds4_gpu_tensor              *value_scratch,
+        const ds4_gpu_tensor        *ngram_rows,
+        const ds4_gpu_qwen4exp_slab *key_weight,
+        const ds4_gpu_qwen4exp_slab *value_weight,
+        const ds4_gpu_qwen4exp_slab *norm_key,
+        const ds4_gpu_qwen4exp_slab *norm_query,
+        const ds4_gpu_qwen4exp_slab *norm_conv,
+        const ds4_gpu_qwen4exp_slab *conv_weight,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              ple_embd,
+        uint32_t              conv_kernel,
+        uint32_t              dilation,
+        uint32_t              rows,
+        float                 eps,
+        float                 norm_key_bias,
+        float                 norm_query_bias,
+        float                 norm_conv_bias,
+        int                   round_bf16,
+        const ds4_gpu_tensor *adopt, uint32_t snapshot_slots) {
+    return qwen4exp_ple_block_impl(hyper, conv_state, conv_snapshot, n_snapshot_rows,
+            key_scratch, aux_scratch, value_scratch, ngram_rows,
+            key_weight, value_weight, norm_key, norm_query, norm_conv,
+            conv_weight, n_embd, n_hc, ple_embd, conv_kernel, dilation, rows,
+            eps, norm_key_bias, norm_query_bias, norm_conv_bias, round_bf16, adopt, snapshot_slots);
+}
+#endif
 
 #ifdef __cplusplus
 }

@@ -4140,6 +4140,28 @@ int ds4_gpu_qwen4exp_ple_conv_tensor(
         uint32_t              conv_kernel,
         uint32_t              dilation,
         uint32_t              rows);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+/* Fixed9-state, rows1/2: adopt stores0/live or one-based allocated slot. */
+int ds4_gpu_qwen4exp_ple_conv_adopt_tensor(
+        ds4_gpu_tensor       *hyper,
+        ds4_gpu_tensor       *conv_state,
+        /* `n_snapshot_rows` slots of [S][channels], slot k the window as it
+         * stands after token k.  See the note on ds4_gpu_qwen4exp_gdn_prefill;
+         * 0 asks for none. */
+        ds4_gpu_tensor       *conv_snapshot,
+        uint32_t              n_snapshot_rows,
+        const ds4_gpu_tensor *gated,
+        const ds4_gpu_tensor *conv_in,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              channels,
+        uint32_t              conv_kernel,
+        uint32_t              dilation,
+        uint32_t              rows,
+        const ds4_gpu_tensor *adopt, uint32_t snapshot_slots);
+#endif
+
 
 /* The whole PLE block over already-gathered n-gram rows, composed out of the
  * two kernels above, the grouped RMS norm and the Q8_0 matmul.  This is the
@@ -4183,6 +4205,37 @@ int ds4_gpu_qwen4exp_ple_block_tensor(
         float                 norm_query_bias,
         float                 norm_conv_bias,
         int                   round_bf16);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+/* Fixed9-state, rows1/2: adopt stores0/live or one-based allocated slot. */
+int ds4_gpu_qwen4exp_ple_block_adopt_tensor(
+        ds4_gpu_tensor              *hyper,
+        ds4_gpu_tensor              *conv_state,
+        ds4_gpu_tensor              *conv_snapshot,
+        uint32_t                     n_snapshot_rows,
+        ds4_gpu_tensor              *key_scratch,
+        ds4_gpu_tensor              *aux_scratch,
+        ds4_gpu_tensor              *value_scratch,
+        const ds4_gpu_tensor        *ngram_rows,
+        const ds4_gpu_qwen4exp_slab *key_weight,
+        const ds4_gpu_qwen4exp_slab *value_weight,
+        const ds4_gpu_qwen4exp_slab *norm_key,
+        const ds4_gpu_qwen4exp_slab *norm_query,
+        const ds4_gpu_qwen4exp_slab *norm_conv,
+        const ds4_gpu_qwen4exp_slab *conv_weight,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              ple_embd,
+        uint32_t              conv_kernel,
+        uint32_t              dilation,
+        uint32_t              rows,
+        float                 eps,
+        float                 norm_key_bias,
+        float                 norm_query_bias,
+        float                 norm_conv_bias,
+        int                   round_bf16,
+        const ds4_gpu_tensor *adopt, uint32_t snapshot_slots);
+#endif
+
 
 #ifdef __cplusplus
 }

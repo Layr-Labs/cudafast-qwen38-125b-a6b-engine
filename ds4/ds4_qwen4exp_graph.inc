@@ -138,6 +138,9 @@ void ds4_qwen4exp_session_plan_compute(ds4_qwen4exp_session_plan *plan,
      * every compared row's distribution out of one forward, so the LM head
      * runs once over the whole chain instead of once per row afterwards. */
     act += (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * cfg->n_vocab * f;
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    act += sizeof(uint32_t); /* optional PLE adoption flag, conservatively charged */
+#endif
     plan->activation_bytes = act;
     act += ds4_qwen4exp_qsa_split_bytes(
         (uint32_t)qwen4exp_qsa_split_rows(B), DS4_N_HEAD, DS4_N_HEAD_DIM,
@@ -361,6 +364,10 @@ struct ds4_qwen4exp_session {
      * DS4_QWEN4EXP_NO_LAZY_ROLLBACK is set in the environment (any value) at
      * session open -- once per engine, since the engine opens one session. */
     ds4_gpu_tensor *d_adopt;
+    /* Independent lazy PLE window ownership;0 live, k+1 snapshot k. */
+    ds4_gpu_tensor *d_ple_adopt;
+    uint32_t ple_adopt_state;
+    uint32_t ple_adopt_device;
     uint32_t        adopt_state;   /* recurrent state: row + 1, or 0 */
     uint32_t        adopt_conv;    /* conv history: row + 1, or 0 */
     uint32_t        adopt_device;  /* host mirror of *d_adopt */
@@ -747,6 +754,12 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
         /* Zeroed on the device, so flag, mirror and pending all start at live. */
         s->d_adopt = qwen4exp_alloc_zeroed(sizeof(uint32_t), &ok);
     }
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (DS4_N_PLE_CONV == 4u && DS4_N_NGRAM == 3u &&
+        getenv("DS4_QWEN4EXP_NO_LAZY_PLE") == NULL) {
+        s->d_ple_adopt = qwen4exp_alloc_zeroed(sizeof(uint32_t), &ok);
+    }
+#endif
     s->inv_freq = qwen4exp_alloc_zeroed((uint64_t)DS4_N_ROT / 2u * f, &ok);
     if (ok) {
         float freqs[DS4_MAX_KDA_HEAD_DIM];
@@ -853,6 +866,7 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     free(s->ple_rows_host);
     ds4_gpu_tensor_free(s->d_pos);
     ds4_gpu_tensor_free(s->d_adopt);
+    ds4_gpu_tensor_free(s->d_ple_adopt);
     ds4_gpu_tensor_free(s->inv_freq);
     ds4_gpu_tensor_free(s->tokens);
     ds4_gpu_tensor_free(s->hyper);
@@ -953,6 +967,7 @@ void ds4_qwen4exp_session_reset(ds4_qwen4exp_session *s) {
      * live buffers are what the next forward must read. */
     s->adopt_state = 0u;
     s->adopt_conv = 0u;
+    s->ple_adopt_state = 0u;
     if (!s->state_dirty) {
         /* Already at the reset state and nothing has written since, so every
          * store below would write the value the buffer already holds.  `pos`
@@ -1435,7 +1450,11 @@ static bool qwen4exp_graph_ple_block(ds4_qwen4exp_session *s,
     const ds4_gpu_qwen4exp_slab norm_conv_slab = QW_SLAB(m, l->ple_norm_conv);
     const ds4_gpu_qwen4exp_slab conv_slab = QW_SLAB(m, l->ple_conv1d);
 
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (!ds4_gpu_qwen4exp_ple_block_adopt_tensor(
+#else
     if (!ds4_gpu_qwen4exp_ple_block_tensor(
+#endif
             s->hyper, s->ple_conv_state, s->ple_conv_snapshot,
             s->spec_snapshot_rows,
             s->ple_key, s->ple_aux, s->ple_value,
@@ -1444,7 +1463,12 @@ static bool qwen4exp_graph_ple_block(ds4_qwen4exp_session *s,
             DS4_N_EMBD, DS4_N_HC, DS4_N_PLE_EMBD,
             DS4_N_PLE_CONV, DS4_N_NGRAM, n_tokens, DS4_RMS_EPS,
             l->ple_norm_key_offset, l->ple_norm_query_offset,
-            l->ple_norm_conv_offset, 1)) {
+            l->ple_norm_conv_offset, 1
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+            , n_tokens <= 2u ? s->d_ple_adopt : NULL,
+            DS4_QWEN4EXP_IMPLEMENTED_DEPTH
+#endif
+            )) {
         fprintf(stderr, "ds4: qwen4exp PLE block %u refused\n", il);
         return false;
     }
@@ -2703,6 +2727,32 @@ static bool qwen4exp_session_copy_layers(ds4_qwen4exp_session *s,
                                          uint32_t row,
                                          bool recurrent, bool conv);
 
+/* Restore physical PLE state only when a caller cannot consume its lazy
+ * slot. Keep pending on every failure; logical inspection still names it. */
+static bool qwen4exp_ple_materialize(ds4_qwen4exp_session *s) {
+    if (s->ple_adopt_state == 0u) return true;
+    const uint64_t bytes = ds4_gpu_tensor_bytes(s->ple_conv_state);
+    if (!ds4_gpu_begin_commands()) return false;
+    const bool ok = ds4_gpu_tensor_copy(s->ple_conv_state, 0,
+            s->ple_conv_snapshot, (uint64_t)(s->ple_adopt_state - 1u) * bytes,
+            bytes) != 0;
+    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize() || !ok) return false;
+    s->ple_adopt_state = 0u;
+    return true;
+}
+
+static bool qwen4exp_ple_prepare(ds4_qwen4exp_session *s, uint32_t n_tokens) {
+    if (n_tokens > 2u && !qwen4exp_ple_materialize(s)) return false;
+    if (s->d_ple_adopt && s->ple_adopt_device != s->ple_adopt_state) {
+        if (!ds4_gpu_qwen4exp_update_dpos(s->d_ple_adopt, s->ple_adopt_state)) {
+            s->ple_adopt_device = UINT32_MAX;
+            return false;
+        }
+        s->ple_adopt_device = s->ple_adopt_state;
+    }
+    return true;
+}
+
 bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
                                 const ds4_qwen4exp_weights *w,
                                 const ds4_model            *m,
@@ -2810,6 +2860,10 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
             }
         }
     }
+    if (!qwen4exp_ple_prepare(s, n_tokens)) {
+        fprintf(stderr, "ds4: qwen4exp PLE rollback preparation failed\n");
+        return false;
+    }
     if (s->d_adopt && s->adopt_device != s->adopt_state) {
         if (!ds4_gpu_qwen4exp_update_dpos(s->d_adopt, s->adopt_state)) {
             s->adopt_device = UINT32_MAX;
@@ -2844,9 +2898,10 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
          * it is on the copy path; `state_dirty` is set above. */
         return qwen4exp_forward_fail();
     }
-    /* Every GDN launch has read the flag; the live buffers are current again. */
+    /* Every GDN/PLE launch has read its flag; live buffers are current again. */
     s->adopt_state = 0u;
     s->adopt_conv = 0u;
+    s->ple_adopt_state = 0u;
 
     /* The final mixer has no inject head: it collapses n_hc * n_embd to
      * n_embd and stands in for the model.norm this checkpoint does not have. */
@@ -3579,6 +3634,14 @@ static double qwen4exp_gdn_checksum(const ds4_qwen4exp_session *s, uint32_t il,
                                          bytes);
 }
 
+static double qwen4exp_ple_checksum(const ds4_qwen4exp_session *s) {
+    const uint64_t bytes = ds4_gpu_tensor_bytes(s->ple_conv_state);
+    return s->ple_adopt_state
+        ? qwen4exp_state_checksum_range(s->ple_conv_snapshot,
+              (uint64_t)(s->ple_adopt_state - 1u) * bytes, bytes)
+        : qwen4exp_state_checksum(s->ple_conv_state);
+}
+
 /*
  * The same carried state, ONE OBJECT PER ENTRY rather than one sum per layer.
  *
@@ -3637,7 +3700,7 @@ int ds4_qwen4exp_test_state_object(const ds4_qwen4exp_session *s, int index,
     switch (index - layer_entries) {
     case 0:
         if (name && name_len) snprintf(name, name_len, "ple_conv_state");
-        if (sum) *sum = qwen4exp_state_checksum(s->ple_conv_state);
+        if (sum) *sum = qwen4exp_ple_checksum(s);
         return 1;
     case 1: {
         if (name && name_len) snprintf(name, name_len, "ple_history");
@@ -3677,7 +3740,7 @@ void ds4_qwen4exp_test_state_checksums(const ds4_qwen4exp_session *s,
                   qwen4exp_state_checksum(s->idx_pool[il]);
     }
     if ((int)cfg->n_layer + 1 < cap) {
-        out[cfg->n_layer] = qwen4exp_state_checksum(s->ple_conv_state);
+        out[cfg->n_layer] = qwen4exp_ple_checksum(s);
         double h = 0.0;
         for (uint32_t i = 0; i < DS4_PLE_MAX_NGRAM; i++) {
             h += (double)s->ple_history.previous[i] * (double)(i + 1u);
@@ -3711,15 +3774,12 @@ static int qwen4exp_rb_ple_hist_select(void *ctx, uint32_t row) {
 static int qwen4exp_rb_ple_conv_select(void *ctx, uint32_t row) {
     ds4_qwen4exp_session *s = ctx;
     if (row >= DS4_QWEN4EXP_IMPLEMENTED_DEPTH) return -1;
-    s->state_dirty = true;   /* see `state_dirty` */
-    const uint64_t bytes = ds4_gpu_tensor_bytes(s->ple_conv_state);
-    if (!ds4_gpu_begin_commands()) return -1;
-    const bool ok = ds4_gpu_tensor_copy(s->ple_conv_state, 0,
-                                        s->ple_conv_snapshot,
-                                        (uint64_t)row * bytes, bytes) != 0;
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) return -1;
-    return ok ? 0 : -1;
+    s->state_dirty = true;
+    s->ple_adopt_state = row + 1u;
+    if (s->d_ple_adopt) return 0;
+    return qwen4exp_ple_materialize(s) ? 0 : -1;
 }
+
 static int qwen4exp_rb_qsa_kv_truncate(void *ctx, uint32_t pos) {
     ds4_qwen4exp_session *s = ctx;
     /* The caches are addressed by position and only appended to, so dropping

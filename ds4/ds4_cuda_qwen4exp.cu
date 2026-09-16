@@ -13713,6 +13713,72 @@ __global__ static void qwen4exp_ple_conv_kernel(
     }
 }
 
+template <uint32_t R>
+__global__ static void qwen4exp_ple_conv_adopt_kernel(
+        float *hyper, float *state, const float *gated, const float *conv_in,
+        const float *weight, float *snapshot, uint32_t channels,
+        const uint32_t *adopt_row, uint32_t snapshot_slots,
+        uint32_t n_snapshot_rows) {
+    const uint32_t c = (uint32_t)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (c >= channels) return;
+
+    const uint32_t C = channels;
+    constexpr uint32_t S = 9u;
+    constexpr uint32_t conv_kernel = 4u, dilation = 3u, n_tokens = R;
+    const uint32_t adopt = *adopt_row;
+    const float *source = adopt && adopt <= snapshot_slots
+        ? snapshot + (uint64_t)(adopt - 1u) * S * C : state;
+    float previous[S];
+#pragma unroll
+    for (uint32_t j = 0; j < S; j++) previous[j] = source[(uint64_t)j * C + c];
+
+#pragma unroll
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        float acc = 0.0f;
+    #pragma unroll
+        for (uint32_t k = 0; k < conv_kernel; k++) {
+            const uint32_t i = t + dilation * k;
+            const float v = (i < S) ? previous[i]
+                                    : conv_in[(uint64_t)(i - S) * C + c];
+            acc = fmaf(v, weight[(uint64_t)c * conv_kernel + k], acc);
+        }
+        const uint64_t index = (uint64_t)t * C + c;
+        hyper[index] += gated[index] + acc * qwen4exp_sigmoid(acc);
+    }
+
+    /* All old window values are in registers before snapshot writes, even
+     * when adopted snapshot0 is also the destination of this verify. */
+    /* The rolling window as it stands after each of the first
+     * `n_snapshot_rows` tokens.  This runs BEFORE the state write below,
+     * because `full()` reads the incoming state and the write below clobbers
+     * it -- the same read-before-write ordering the state write itself
+     * depends on, one step earlier.  Per-row state snapshots for the
+     * speculative cycle; see the note above the GDN kernels.  Zero on every
+     * serial forward, where the loop runs no iterations. */
+#pragma unroll
+    for (uint32_t t = 0; t + 1u < R; t++) {
+        if (t >= n_snapshot_rows) continue;
+        float *slot = snapshot + (uint64_t)t * S * C;
+    #pragma unroll
+        for (uint32_t j = 0; j < S; j++) {
+            const uint32_t i = t + 1u + j;
+            slot[(uint64_t)j * C + c] =
+                (i < S) ? previous[i]
+                        : conv_in[(uint64_t)(i - S) * C + c];
+        }
+    }
+
+    /* Ascending, and the read index is n_tokens ahead of the write index, so
+     * no slot is read after it has been overwritten. */
+#pragma unroll
+    for (uint32_t j = 0; j < S; j++) {
+        const uint32_t i = n_tokens + j;
+        state[(uint64_t)j * C + c] = (i < S) ? previous[i]
+                                             : conv_in[(uint64_t)(i - S) * C + c];
+    }
+}
+
+
 extern "C" int ds4_gpu_qwen4exp_ple_gate_tensor(
         ds4_gpu_tensor       *out_hc,
         const ds4_gpu_tensor *key_hc,
@@ -13739,7 +13805,7 @@ extern "C" int ds4_gpu_qwen4exp_ple_gate_tensor(
     return cuda_ok(cudaGetLastError(), "qwen4exp_ple_gate launch");
 }
 
-extern "C" int ds4_gpu_qwen4exp_ple_conv_tensor(
+static int qwen4exp_ple_conv_impl(
         ds4_gpu_tensor       *hyper,
         ds4_gpu_tensor       *conv_state,
         ds4_gpu_tensor       *conv_snapshot,
@@ -13752,7 +13818,9 @@ extern "C" int ds4_gpu_qwen4exp_ple_conv_tensor(
         uint32_t              channels,
         uint32_t              conv_kernel,
         uint32_t              dilation,
-        uint32_t              rows) {
+        uint32_t              rows,
+        const ds4_gpu_tensor *adopt,
+        uint32_t snapshot_slots) {
     if (!hyper || !conv_state || !gated || !conv_in || !model_map ||
         channels == 0 || conv_kernel < 2u || dilation == 0 || rows == 0) {
         return 0;
@@ -13785,6 +13853,61 @@ extern "C" int ds4_gpu_qwen4exp_ple_conv_tensor(
             model_map, weight_offset, weight_bytes, logical_tier,
             "qwen4exp_ple_conv_weight");
     if (!w) return 0;
+    if (adopt) {
+        /* Additive fixed-shape API: caller publishes0 or a one-based slot.
+         * Capacity describes allocated source slots, not current writes. */
+        if (conv_kernel != 4u || dilation != 3u || rows > 2u ||
+            !conv_snapshot || snapshot_slots == 0u ||
+            snapshot_slots > conv_snapshot->bytes / (row_bytes * 9u) ||
+            !adopt->ptr || adopt->bytes < sizeof(uint32_t) ||
+            ((uintptr_t)adopt->ptr & 3u) ||
+            ds4_tensor_device_idx(adopt) != logical_tier ||
+            ds4_tensor_device_idx(conv_state) != logical_tier ||
+            ds4_tensor_device_idx(conv_snapshot) != logical_tier ||
+            ds4_tensor_device_idx(gated) != logical_tier ||
+            ds4_tensor_device_idx(conv_in) != logical_tier) return 0;
+        int current_device = -1;
+        cudaPointerAttributes attr;
+        if (!cuda_ok(cudaGetDevice(&current_device), "PLE adopt device") ||
+            !cuda_ok(cudaPointerGetAttributes(&attr, adopt->ptr), "PLE adopt pointer")) return 0;
+        if (attr.type != cudaMemoryTypeDevice || attr.device != current_device) return 0;
+        /* All stores are independent except the intentionally reused snapshot
+         * input/output. Refuse cross-buffer overlap on this new API. */
+        const void *writes[] = {hyper->ptr, conv_state->ptr, conv_snapshot->ptr};
+        const uint64_t wb[] = {stream_bytes, row_bytes * 9u,
+                              row_bytes * 9u * snapshot_slots};
+        const void *reads[] = {gated->ptr, conv_in->ptr, w, adopt->ptr};
+        const uint64_t rb[] = {stream_bytes, stream_bytes, weight_bytes, 4u};
+        for (unsigned i = 0; i < 3u; i++) {
+            if (!writes[i] || ((uintptr_t)writes[i] & 3u) || wb[i] > UINTPTR_MAX - (uintptr_t)writes[i]) return 0;
+            for (unsigned j = i + 1u; j < 3u; j++) {
+                if (!writes[j] || wb[j] > UINTPTR_MAX - (uintptr_t)writes[j] ||
+                    ((uintptr_t)writes[i] < (uintptr_t)writes[j] + wb[j] &&
+                     (uintptr_t)writes[j] < (uintptr_t)writes[i] + wb[i])) return 0;
+            }
+            for (unsigned j = 0; j < 4u; j++) {
+                if (!reads[j] || ((uintptr_t)reads[j] & 3u) || rb[j] > UINTPTR_MAX - (uintptr_t)reads[j] ||
+                    ((uintptr_t)writes[i] < (uintptr_t)reads[j] + rb[j] &&
+                     (uintptr_t)reads[j] < (uintptr_t)writes[i] + wb[i])) return 0;
+            }
+        }
+        if (rows == 1u) {
+            qwen4exp_ple_conv_adopt_kernel<1><<<
+                (unsigned)(((uint64_t)channels + 255u) / 256u), 256, 0, cuda_decode_stream()>>>(
+                (float *)hyper->ptr, (float *)conv_state->ptr,
+                (const float *)gated->ptr, (const float *)conv_in->ptr, w,
+                (float *)conv_snapshot->ptr, channels,
+                (const uint32_t *)adopt->ptr, snapshot_slots, n_snapshot_rows);
+        } else {
+            qwen4exp_ple_conv_adopt_kernel<2><<<
+                (unsigned)(((uint64_t)channels + 255u) / 256u), 256, 0, cuda_decode_stream()>>>(
+                (float *)hyper->ptr, (float *)conv_state->ptr,
+                (const float *)gated->ptr, (const float *)conv_in->ptr, w,
+                (float *)conv_snapshot->ptr, channels,
+                (const uint32_t *)adopt->ptr, snapshot_slots, n_snapshot_rows);
+        }
+        return cuda_ok(cudaGetLastError(), "qwen4exp_ple_conv_adopt launch");
+    }
     qwen4exp_ple_conv_kernel<<<
         (unsigned)((channels + 255u) / 256u), 256, 0, cuda_decode_stream()>>>(
             (float *)hyper->ptr, (float *)conv_state->ptr,
@@ -13793,6 +13916,46 @@ extern "C" int ds4_gpu_qwen4exp_ple_conv_tensor(
             channels, conv_kernel, dilation, state_len, rows,
             n_snapshot_rows);
     return cuda_ok(cudaGetLastError(), "qwen4exp_ple_conv launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_ple_conv_tensor(
+        ds4_gpu_tensor       *hyper,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *conv_snapshot,
+        uint32_t              n_snapshot_rows,
+        const ds4_gpu_tensor *gated,
+        const ds4_gpu_tensor *conv_in,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              channels,
+        uint32_t              conv_kernel,
+        uint32_t              dilation,
+        uint32_t              rows) {
+    return qwen4exp_ple_conv_impl(hyper, conv_state, conv_snapshot, n_snapshot_rows, gated,
+            conv_in, model_map, model_size, weight_offset, channels,
+            conv_kernel, dilation, rows, NULL, 0u);
+}
+
+extern "C" int ds4_gpu_qwen4exp_ple_conv_adopt_tensor(
+        ds4_gpu_tensor       *hyper,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *conv_snapshot,
+        uint32_t              n_snapshot_rows,
+        const ds4_gpu_tensor *gated,
+        const ds4_gpu_tensor *conv_in,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              channels,
+        uint32_t              conv_kernel,
+        uint32_t              dilation,
+        uint32_t              rows,
+        const ds4_gpu_tensor *adopt, uint32_t snapshot_slots) {
+    if (!adopt) return 0;
+    return qwen4exp_ple_conv_impl(hyper, conv_state, conv_snapshot, n_snapshot_rows, gated,
+            conv_in, model_map, model_size, weight_offset, channels,
+            conv_kernel, dilation, rows, adopt, snapshot_slots);
 }
 
 #include "ds4_qwen4exp_hc_host.inc"
