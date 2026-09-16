@@ -12862,6 +12862,32 @@ __global__ static void __launch_bounds__(256, 2) qwen4exp_qsa3_attention_group_k
  * any, and value rows a lane of the split probs kernel keeps in flight.
  * Scheduling numbers, as QWEN4EXP_QSA_KSTEP is: they change how many loads
  * are outstanding, not which products land in which accumulator. */
+/* TRUE OF THE ARITHMETIC, BUT NOT OF THE SCHEDULE: THIS ONE ALSO SIZES THE
+ * SHARED REQUEST, AND DOUBLING IT TURNS THE WHOLE PATH OFF.
+ *
+ * QWEN4EXP_QSA_SPLIT_KSTEP is not only a prefetch depth.  It feeds
+ * QWEN4EXP_QSA_SPLIT_KPITCH (KSTEP * 4 + 4), the per-warp K staging pitch, and
+ * the dispatcher bills `nth * KPITCH` floats of the split scores kernel's
+ * dynamic shared memory before testing the total against
+ * QWEN4EXP_QSA_GROUP_SHARED_CAP.  At the production shape (head_dim 256,
+ * nth 256) that term alone is 9,216 bytes at eight, and the totals are:
+ *
+ *     group 2 (one row):    38,976 B at KSTEP 8  ->  71,744 B at 16
+ *     group 4 (two rows):   41,088 B at KSTEP 8  ->  73,856 B at 16
+ *     QWEN4EXP_QSA_GROUP_SHARED_CAP:  49,152 B
+ *
+ * Doubling it puts both decode widths over the cap, `sc_shared >
+ * QWEN4EXP_QSA_GROUP_SHARED_CAP` returns 0, and the split path declines the
+ * shape.  Nothing reports that: the caller falls through to the per-head
+ * kernel and every one of the model's twelve full-attention blocks (3, 7,
+ * ... 47 of 48) quietly runs a different schedule than the one under
+ * measurement.  The output stays correct, because the per-head kernel is the
+ * reference the split path was written against -- which is precisely what
+ * makes the change invisible.
+ *
+ * So the note above is right that KSTEP cannot move an output bit, and that is
+ * the reason a change here is dangerous rather than safe: the only thing it
+ * can move is which kernel runs, and it can move that all the way to off. */
 #ifndef QWEN4EXP_QSA_SPLIT_KSTEP
 #define QWEN4EXP_QSA_SPLIT_KSTEP 8u
 #endif
