@@ -8690,6 +8690,14 @@ __global__ static void qwen4exp_gdn_output_quant_kernel(
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u;
     const uint32_t warp = tid >> 5u;
+    /* PDL producer for the ssm_out projection that follows on the stream.
+     * Triggered at decode and verify widths only, row-gated to the same
+     * <= 2 the converted pair_lanes launch sites fire at: grid is
+     * (n_tokens, n_value_head), at most 96 blocks of GDN_DIM threads --
+     * single-wave by construction.  A prefill width never carries a
+     * trigger: no PSS consumer follows one there (the deadlock rule,
+     * ds4_cuda_qwen4exp.cuh). */
+    if (n_tokens <= 2u) QWEN4EXP_PDL_TRIGGER();
     if (token >= n_tokens || head >= n_value_head) return;
     __shared__ float partial[4];
     const uint32_t value_dim = n_value_head * QWEN4EXP_GDN_DIM;
