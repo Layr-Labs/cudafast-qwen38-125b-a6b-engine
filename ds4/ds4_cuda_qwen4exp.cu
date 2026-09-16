@@ -10897,44 +10897,113 @@ __global__ static void qwen4exp_qsa_indexer_select_kernel(
 
     int32_t *ids = qwen4exp_select_shared;
     const int32_t sentinel = 0x7fffffff;
-    for (uint32_t i = tid; i < sort_width; i += nth) {
-        int32_t block = sentinel;
-        if (i < top_k) {
+    /* The top-k list is a SET of distinct block indices -- every producer
+     * (pow2, cub, chunked-tree, insertion) emits each score position at most
+     * once -- so ascending order is a bitmap scan, not a sort.  The bitonic
+     * network below paid 45 block-wide barriers at the 512-wide decode
+     * shape; the bitmap pays four, and its shared traffic is one pass over
+     * n_blocks bits instead of 90 passes over sort_width ints.  The bitmap
+     * lives in dynamic shared after the id array; past bm_cap words the
+     * original network runs instead, so an unbounded context cannot outgrow
+     * the launch's shared budget. */
+    uint32_t *bm = (uint32_t *)(ids + sort_width);
+    const uint32_t bm_words = (n_blocks + 31u) >> 5;
+    if (bm_words <= 2048u) {
+        for (uint32_t i = tid; i < bm_words; i += nth) bm[i] = 0u;
+        __syncthreads();
+        for (uint32_t i = tid; i < top_k; i += nth) {
             const int32_t candidate = topk[(uint64_t)token * top_k + i];
             if (candidate >= 0 && (uint32_t)candidate < n_blocks) {
                 const float score =
                     scores[(uint64_t)token * n_blocks + (uint32_t)candidate];
-                if (score > QWEN4EXP_QSA_MASKED_LIMIT) block = candidate;
-            }
-        }
-        ids[i] = block;
-    }
-    __syncthreads();
-
-    for (uint32_t k = 2u; k <= sort_width; k <<= 1) {
-        for (uint32_t j = k >> 1; j > 0u; j >>= 1) {
-            for (uint32_t i = tid; i < sort_width; i += nth) {
-                const uint32_t ixj = i ^ j;
-                if (ixj > i) {
-                    const bool ascending = (i & k) == 0u;
-                    if ((ascending && ids[i] > ids[ixj]) ||
-                        (!ascending && ids[i] < ids[ixj])) {
-                        const int32_t tmp = ids[i];
-                        ids[i] = ids[ixj];
-                        ids[ixj] = tmp;
-                    }
+                if (score > QWEN4EXP_QSA_MASKED_LIMIT) {
+                    atomicOr(&bm[(uint32_t)candidate >> 5],
+                             1u << ((uint32_t)candidate & 31u));
                 }
             }
-            __syncthreads();
         }
-    }
+        __syncthreads();
+        /* Each thread owns a contiguous run of bitmap words; the exclusive
+         * prefix over per-thread popcounts is where its first set bit lands
+         * in the sorted id array.  One warp scan plus one pass over the
+         * per-warp sums. */
+        const uint32_t words_each = (bm_words + nth - 1u) / nth;
+        const uint32_t w0 = tid * words_each;
+        const uint32_t w1 = (w0 + words_each < bm_words)
+                                ? w0 + words_each : bm_words;
+        uint32_t mine = 0;
+        for (uint32_t w = w0; w < w1; w++) mine += (uint32_t)__popc(bm[w]);
+        uint32_t scan = mine;
+        const unsigned wmask = nth >= 32u ? 0xffffffffu
+                                          : ((1u << nth) - 1u);
+        for (uint32_t d = 1u; d < 32u; d <<= 1) {
+            const uint32_t v = __shfl_up_sync(wmask, scan, d);
+            if ((tid & 31u) >= d) scan += v;
+        }
+        __shared__ uint32_t warp_sums[33];
+        if ((tid & 31u) == 31u || tid == nth - 1u)
+            warp_sums[tid >> 5] = scan;
+        __syncthreads();
+        if (tid == 0u) {
+            uint32_t run = 0;
+            for (uint32_t w = 0; w < ((nth + 31u) >> 5); w++) {
+                const uint32_t s = warp_sums[w];
+                warp_sums[w] = run;
+                run += s;
+            }
+            n_valid = run;
+        }
+        __syncthreads();
+        uint32_t rank = warp_sums[tid >> 5] + scan - mine;
+        for (uint32_t w = w0; w < w1; w++) {
+            uint32_t bits = bm[w];
+            while (bits) {
+                const uint32_t b = (uint32_t)__ffs((int)bits) - 1u;
+                bits &= bits - 1u;
+                ids[rank++] = (int32_t)((w << 5) + b);
+            }
+        }
+        __syncthreads();
+    } else {
+        for (uint32_t i = tid; i < sort_width; i += nth) {
+            int32_t block = sentinel;
+            if (i < top_k) {
+                const int32_t candidate = topk[(uint64_t)token * top_k + i];
+                if (candidate >= 0 && (uint32_t)candidate < n_blocks) {
+                    const float score =
+                        scores[(uint64_t)token * n_blocks + (uint32_t)candidate];
+                    if (score > QWEN4EXP_QSA_MASKED_LIMIT) block = candidate;
+                }
+            }
+            ids[i] = block;
+        }
+        __syncthreads();
 
-    if (tid == 0u) {
-        uint32_t valid = 0;
-        while (valid < top_k && ids[valid] != sentinel) valid++;
-        n_valid = valid;
+        for (uint32_t k = 2u; k <= sort_width; k <<= 1) {
+            for (uint32_t j = k >> 1; j > 0u; j >>= 1) {
+                for (uint32_t i = tid; i < sort_width; i += nth) {
+                    const uint32_t ixj = i ^ j;
+                    if (ixj > i) {
+                        const bool ascending = (i & k) == 0u;
+                        if ((ascending && ids[i] > ids[ixj]) ||
+                            (!ascending && ids[i] < ids[ixj])) {
+                            const int32_t tmp = ids[i];
+                            ids[i] = ids[ixj];
+                            ids[ixj] = tmp;
+                        }
+                    }
+                }
+                __syncthreads();
+            }
+        }
+
+        if (tid == 0u) {
+            uint32_t valid = 0;
+            while (valid < top_k && ids[valid] != sentinel) valid++;
+            n_valid = valid;
+        }
+        __syncthreads();
     }
-    __syncthreads();
 
     const uint32_t m = n_valid;
     const uint32_t block_tokens = m * pool_size;
@@ -13235,13 +13304,16 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_select_tensor(
     uint32_t sort_width = 1;
     while (sort_width < top_k) sort_width *= 2;
     const uint32_t nth = qwen4exp_cuda_threads(sort_width);
+    /* Dynamic shared is the id array plus the bitmap the kernel scans
+     * instead of sorting: 2048 words covers n_blocks up to 65536, and past
+     * that the kernel falls back to its bitonic network on the id array
+     * alone. */
     qwen4exp_qsa_indexer_select_kernel<<<n_tokens, nth,
-        (size_t)sort_width * sizeof(int32_t), cuda_decode_stream()>>>(
+        (size_t)sort_width * sizeof(int32_t) + 2048u * sizeof(uint32_t),
+        cuda_decode_stream()>>>(
             (const float *)scores->ptr, (const int32_t *)topk->ptr,
             (int32_t *)selected->ptr, (int32_t *)counts->ptr, n_tokens,
             n_blocks, top_k, sort_width, pos0, pool_size, max_selected);
-    return cuda_ok(cudaGetLastError(), "Qwen4-Exp indexer selection launch");
-}
 
 /* Scratch the split path needs for `n_tokens` rows whose key count is bounded
  * by `max_count`: scores and contributions, one tile row of nth floats each,
