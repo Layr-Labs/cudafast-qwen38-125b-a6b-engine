@@ -953,7 +953,15 @@ static inline cublasHandle_t cuda_cublas_for_tier(int logical_tier) {
  * pointer, populates none of them until a key asks, and changes no graph's
  * contents, no launch order and no arithmetic -- only how many identities may
  * be resident before the lookup gives up. */
-#define CUDA_DECODE_GRAPH_VARIANTS  8u
+/* Sixteen, not eight.  Upstream widened this from four to eight because the GDN
+ * replay folded the recurrent-buffer parity and the replay-active flag into the
+ * key, so the scored decode leg alone reaches four identities per (layer,
+ * island) row with nothing left for the correctness free-run leg.  The failure
+ * mode when a row fills is silent and permanent -- the island drops to the
+ * eager path for the rest of the process -- and sixteen costs only
+ * key-plus-pointer entries that are populated lazily.  Given that the failure is
+ * silent and the cost is entries, the asymmetry favours headroom. */
+#define CUDA_DECODE_GRAPH_VARIANTS  16u
 
 /* Mirrors the public `struct ds4_decode_graph_key` decl in ds4_gpu.h
  * byte-for-byte (ds4_cuda.cu does not include that header; it carries
