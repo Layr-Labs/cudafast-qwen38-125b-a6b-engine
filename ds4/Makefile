@@ -23,7 +23,7 @@ QWEN4EXP_MTP_TEST := tests/test_qwen4exp_mtp
 QWEN4EXP_MODEL_REGISTRATION_TEST := tests/test_qwen4exp_model_registration
 QWEN4EXP_PARITY_TEST := tests/test_qwen4exp_parity
 
-DEBUG_FLAGS ?= -g
+DEBUG_FLAGS ?=
 CFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99
 OBJCFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -fobjc-arc
 QUALITY_CFLAGS ?= -O3 $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c11
