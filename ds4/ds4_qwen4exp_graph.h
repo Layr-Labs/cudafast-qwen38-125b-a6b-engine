@@ -262,6 +262,16 @@ int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
                                   ds4_gpu_tensor *hyper, uint32_t il,
                                   uint32_t pos0, uint32_t n_tokens);
 
+/* The same signature and the same caches, for a caller that reads ONLY the
+ * last row's output.  The rows below it publish their key/value append and
+ * their indexer tape through the cache-only encode and skip the attention,
+ * the output projection and the MoE whose results that caller discards; the
+ * last row runs the complete block at the position it already had.  Every row
+ * lands where ds4_qwen4exp_graph_head_block would have left it. */
+int ds4_qwen4exp_graph_head_block_last(void *graph, void *cache,
+                                       ds4_gpu_tensor *hyper, uint32_t il,
+                                       uint32_t pos0, uint32_t n_tokens);
+
 #endif /* DS4_QWEN4EXP_GRAPH_H */
 
 #ifdef DS4_TEST_HOOKS
