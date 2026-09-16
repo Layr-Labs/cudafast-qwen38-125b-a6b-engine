@@ -5484,6 +5484,33 @@ __global__ static void qwen4exp_moe_down_q_kernel(
     const uint32_t row = row0 + (threadIdx.x >> 5u);
     const uint32_t tok0 = blockIdx.y * (uint32_t)R;
     if (row >= out_dim || tok0 >= n_tokens) return;
+    /* The routed down edge, opened on the consumer the mid quantizer was
+     * already triggering for.
+     *
+     * The quantizer that writes mq/ms/msum states in its own comment that it
+     * is the launch-completion producer "for the shared down projection that
+     * follows the mid quantization on the stream (and, on the routed path,
+     * for whatever PSS consumer ever follows one of this kernel's other
+     * launches -- today none does, and the trigger fires into nothing
+     * there)".  This kernel is that consumer, and it was launched plainly, so
+     * the trigger retired into nothing on the routed path while the shared
+     * down beside it has taken the same edge since it was written.
+     *
+     * The fence sits ahead of EVERY producer read: `selected` is the router's
+     * output and mq/ms/msum are the quantizer's, and the first of them is the
+     * route load immediately below.  Only the block-uniform bounds check above
+     * it, which reads kernel arguments and no producer memory, comes first.
+     *
+     * .nc rule: no pointer in this signature carries __restrict__, so no load
+     * can be hoisted above the fence as ld.global.nc.  Deadlock rule: the
+     * trigger constrains the PRODUCER and is gated there on its own grid
+     * (gridDim.y <= 2 and at most 768 blocks, one wave), so a multi-wave
+     * dependent is safe.  On the fused-epilogue path the quantizer does not
+     * run and the routed gate/up ahead of this kernel never triggers, so the
+     * fence simply waits for that predecessor to complete -- exactly what the
+     * plain launch did.  Prefill is the same: the trigger's grid gate excludes
+     * it, so the fence is a no-op there. */
+    QWEN4EXP_PDL_SYNC();
     const uint32_t take = n_tokens - tok0 < (uint32_t)R ? n_tokens - tok0
                                                         : (uint32_t)R;
     const uint64_t panel_bytes = (uint64_t)8u * down_row_bytes;
@@ -8300,15 +8327,18 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     const dim3 dn_grid((out_dim + 7u) / 8u,
                        (n_tokens + (uint32_t)tile - 1u) / (uint32_t)tile, 1);
 #define QWEN4EXP_DOWN_IMPL_S(R, DT, V, S, SH) \
-    qwen4exp_moe_down_q_kernel<R, DT, V, S><<<dn_grid, threads, (SH), stream>>>( \
+    QWEN4EXP_LAUNCH_PDL( \
+            (qwen4exp_moe_down_q_kernel<R, DT, V, S>), \
+            (dn_grid), threads, (SH), stream, \
             (float *)out->ptr, down, (const int32_t *)selected->ptr, \
             sc.mq, sc.ms, sc.msum, \
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
             mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
 #define QWEN4EXP_DOWN_IMPL(R, DT, V) QWEN4EXP_DOWN_IMPL_S(R, DT, V, false, 0)
 #define QWEN4EXP_DOWN_ASYNC(DT) \
-    qwen4exp_moe_down_q_kernel<2, DT, true, true, true><<< \
-            dn_grid, threads, (size_t)dn_shared, stream>>>( \
+    QWEN4EXP_LAUNCH_PDL( \
+            (qwen4exp_moe_down_q_kernel<2, DT, true, true, true>), \
+            (dn_grid), threads, (size_t)dn_shared, stream, \
             (float *)out->ptr, down, (const int32_t *)selected->ptr, \
             sc.mq, sc.ms, sc.msum, \
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
