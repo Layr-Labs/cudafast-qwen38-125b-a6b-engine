@@ -931,7 +931,7 @@ static inline cublasHandle_t cuda_cublas_for_tier(int logical_tier) {
  * kernels in the same order; the cost is a memcmp over at most eight 48-byte
  * keys off the device, and one more executable graph per row only if the run
  * actually has a fifth shape -- which is the case this is for. */
-#define CUDA_DECODE_GRAPH_VARIANTS  4u
+#define CUDA_DECODE_GRAPH_VARIANTS  40u
 
 /* Mirrors the public `struct ds4_decode_graph_key` decl in ds4_gpu.h
  * byte-for-byte (ds4_cuda.cu does not include that header; it carries
@@ -5783,8 +5783,60 @@ __global__ static void matmul_q8_0_preq_rows_exact_tile_kernel(
 /* Two adjacent lanes share a Q8 group. Their integer partials may be
  * combined freely; each even lane keeps its original float group chain.
  * Shared memory remaps the 32 finished chains onto one reduction warp. */
-template <int R, bool Streaming = true>
-__global__ static void matmul_q8_0_preq_pair_lanes_kernel(
+/* THE REGISTER CEILING ON THE KERNEL THAT READS THE MOST BYTES.
+ *
+ * This kernel is the dense Q8_0 decode projection.  Counted off the
+ * checkpoint's own tensor table, the tensors that reach it -- ssm_out,
+ * attn_q, attn_output, the shared-expert projections, the hyper-connection
+ * up/down pairs and output.weight, which a speculative round reads TWICE (the
+ * target's verify and the head's borrowed LM head) -- come to about 2.6 GB of
+ * the ~6.2 GB a decode round moves.  It is the single biggest weight consumer
+ * in the tower, ahead of the routed experts (~1.4 GB) and ahead of the GDN
+ * projection (~1.5 GB).
+ *
+ * Measured on this build, at 256 threads:
+ *   <1,false>  REG:45  SHARED:1280   the draft width
+ *   <2,true>   REG:48  SHARED:1536   the verify width
+ *   <2,false>  REG:51  SHARED:1536
+ *   <4,*>      REG:46  SHARED:2048
+ * Registers bind every one of them to FIVE blocks per SM: at 48 registers
+ * 48*256 = 12,288 and 65,536/12,288 = 5.33.  The thread ceiling allows six
+ * (1536/256) and shared memory allows sixty-six (101,376/1536).  Nothing else
+ * is close; the registers are the whole ceiling.
+ *
+ * The allocation granularity is 8, so 42 -- the arithmetic threshold -- rounds
+ * back up to 48 and buys nothing.  40 is the first value that actually lands
+ * six blocks: 40*256 = 10,240 and 65,536/10,240 = 6.4.
+ *
+ * `__maxnreg__` and NOT `__launch_bounds__`: the second argument of
+ * `__launch_bounds__` is advisory and its first argument RELAXES a ceiling
+ * rather than imposing one.  We measured that twice on this tree and both
+ * times the register count went UP.  `__maxnreg__` is a hard per-thread cap
+ * (CUDA 12.4+), which is what the occupancy argument needs.
+ *
+ * NOTHING ARITHMETIC MOVES.  A register ceiling changes allocation, not the
+ * instruction stream's semantics: the same __dp4a operands accumulate into the
+ * same int32 in the same order, and the float tail that consumes them is
+ * untouched.
+ *
+ * READOUT, PRE-COMMITTED so it cannot be rationalised afterwards: if the built
+ * library reports STACK or LOCAL non-zero for ANY of the four instantiations
+ * above, the cap spilled and this is reverted whatever the composite says.  A
+ * spill trades registers for local traffic on the kernel we are trying to
+ * unblock, and lmem=0 is the only reading under which the occupancy argument
+ * holds at all. */
+#if defined(__CUDACC__) && CUDART_VERSION >= 12040
+#define QW_Q8_PAIR_LANES_ATTR __maxnreg__(40)
+#else
+#define QW_Q8_PAIR_LANES_ATTR
+#endif
+/* The body lives in one __device__ function so that the register ceiling can be
+ * carried by SOME instantiations and not others.  `__maxnreg__` cannot depend on
+ * a template parameter, and the R=4 instantiation does not meet 40 without
+ * spilling, so R=4 is launched through the bare wrapper below and keeps exactly
+ * the allocation it had before this change. */
+template <int R, bool Streaming>
+__device__ __forceinline__ void qw_q8_pair_lanes_body(
         float *out, const unsigned char *w,
         const int8_t *xq, const float *xscale,
         uint64_t out_dim, uint32_t n_rows, uint64_t blocks) {
@@ -5915,6 +5967,26 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
         }
     }
 }
+
+template <int R, bool Streaming = true>
+__global__ QW_Q8_PAIR_LANES_ATTR
+static void matmul_q8_0_preq_pair_lanes_kernel(
+        float *out, const unsigned char *w,
+        const int8_t *xq, const float *xscale,
+        uint64_t out_dim, uint32_t n_rows, uint64_t blocks) {
+    qw_q8_pair_lanes_body<R, Streaming>(out, w, xq, xscale, out_dim, n_rows, blocks);
+}
+
+/* The same body with no ceiling, for the widths the ceiling cannot hold. */
+template <int R, bool Streaming = true>
+__global__
+static void matmul_q8_0_preq_pair_lanes_wide_kernel(
+        float *out, const unsigned char *w,
+        const int8_t *xq, const float *xscale,
+        uint64_t out_dim, uint32_t n_rows, uint64_t blocks) {
+    qw_q8_pair_lanes_body<R, Streaming>(out, w, xq, xscale, out_dim, n_rows, blocks);
+}
+
 
 /* HC down has only 320 outputs. Two lanes per group expose more integer
  * work while one 64-thread block owns each output. Retain all 32 original
@@ -17629,7 +17701,7 @@ static int cuda_matmul_q8_0_preq_rows_exact(
             (n_rows == 3u && getenv("DS4_QWEN4EXP_WIDE_VERIFY_R2") == NULL)) {
             /* One four-row tile: the weight block is read once for all three
              * rows (the split below reads it twice).  Same per-row chains. */
-            matmul_q8_0_preq_pair_lanes_kernel<4, false><<<
+            matmul_q8_0_preq_pair_lanes_wide_kernel<4, false><<<
                     dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u),
                     256, 0, cuda_decode_stream()>>>(
                     (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
@@ -17672,7 +17744,7 @@ static int cuda_matmul_q8_0_preq_rows_exact(
                 (n_rows == 3u && getenv("DS4_QWEN4EXP_WIDE_VERIFY_R2") == NULL)) {
                 /* One four-row tile, weight read once (streaming loads, as
                  * the HC up valve leg).  Same per-row chains. */
-                matmul_q8_0_preq_pair_lanes_kernel<4><<<
+                matmul_q8_0_preq_pair_lanes_wide_kernel<4><<<
                         dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u),
                         256, 0, cuda_decode_stream()>>>(
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
@@ -17716,7 +17788,20 @@ static int cuda_matmul_q8_0_preq_rows_exact(
         } else {
             /* Retain the promoted call-width specialization for the
              * general dense projections. The HC warp geometry above is
-             * independent of this two-warp kernel's token-row bound. */
+             * independent of this two-warp kernel's token-row bound.
+             *
+             * EVICT-FIRST WEIGHT LOADS HERE TOO.  This branch is where the
+             * LARGE dense projections land -- ssm_out, attn_q, attn_output,
+             * the shared-expert projections and output.weight -- and the
+             * comment on the HC branch above says larger projections "retain
+             * their ordinary cache policy".  They should not.  A per-layer
+             * ssm_out slab is ~16 MB and output.weight is 676 MB; every one of
+             * them is read straight through ONCE per pass and cannot be reused
+             * from any cache on this part, so defending their lines in L2
+             * only displaces the activations and routing metadata that ARE
+             * reused.  Streaming=true marks those loads __ldcs, which is a
+             * residency hint on a load: it changes neither the address, nor
+             * the width, nor the value. */
             if (n_rows == 1u && getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL) {
                 /* PDL consumer: the stream predecessor is the decode
                  * quantizer, which triggers at its top (decode widths). */
@@ -17730,7 +17815,7 @@ static int cuda_matmul_q8_0_preq_rows_exact(
                        (n_rows == 3u &&
                         getenv("DS4_QWEN4EXP_WIDE_VERIFY_R2") == NULL)) {
                 /* One four-row tile: the weight read once for three rows. */
-                matmul_q8_0_preq_pair_lanes_kernel<4, false><<<
+                matmul_q8_0_preq_pair_lanes_wide_kernel<4, false><<<
                         dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u),
                         256, 0, cuda_decode_stream()>>>(
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
@@ -17738,14 +17823,14 @@ static int cuda_matmul_q8_0_preq_rows_exact(
             } else if (n_rows == 3u) {
                 /* The same two-row tile kernel over two tiles, launched
                  * plainly (no producer triggers at three rows). */
-                matmul_q8_0_preq_pair_lanes_kernel<2, false><<<
+                matmul_q8_0_preq_pair_lanes_kernel<2, true><<<
                         dim3((unsigned)((out_dim + 3u) / 4u), 2u, 1u),
                         256, 0, cuda_decode_stream()>>>(
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
                         out_dim, n_rows, blocks);
             } else {
                 QWEN4EXP_LAUNCH_PDL(
-                        (matmul_q8_0_preq_pair_lanes_kernel<2, false>),
+                        (matmul_q8_0_preq_pair_lanes_kernel<2, true>),
                         (dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u)),
                         256, 0, cuda_decode_stream(),
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
