@@ -28,6 +28,8 @@ const char *ds4_cuda_qwen4exp_weight_ptr(
 
 /* 1 when the Q8_0 row-exact matmul takes the int8 MMA tile at this width. */
 int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows);
+/* Current default 320->10240 short HC up arm, including backend diagnostics. */
+int ds4_cuda_qwen4exp_hc_up_warp_active(const void *weights, uint32_t rows);
 
 /* ------------------------------------------------------------------------
  * Programmatic Dependent Launch (PDL) for the decode-round norm ->

@@ -17294,6 +17294,17 @@ int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows) {
            n_rows >= 8u && getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL;
 }
 
+/* Exact short HC-up arm predicate, shared with the precise epilogue unit.
+ * The wider MMA and HC-down branches cannot match this fixed shape/width. */
+int ds4_cuda_qwen4exp_hc_up_warp_active(const void *weights,
+                                      uint32_t rows) {
+    return rows >= 1u && rows <= 2u && weights &&
+        (((uintptr_t)weights & 1u) == 0u) && cuda_q8_use_dp4a() &&
+        getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
+        getenv("DS4_Q8_NO_STREAM_LOADS") == NULL &&
+        getenv("DS4_Q8_NO_HC_WARP_PAIR") == NULL;
+}
+
 /* The PDL valve (see ds4_cuda_qwen4exp.cuh).  Off when
  * DS4_QWEN4EXP_NO_PDL_PREFETCH is set to a non-zero value, and on any device
  * too old to have compiled the fence in.  Resolved once; the value cannot
