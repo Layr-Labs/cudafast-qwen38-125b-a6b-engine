@@ -92,6 +92,24 @@ typedef struct {
     const char *answer;
 } eval_case;
 
+/* A note on what local grading can and cannot settle, because getting this
+ * wrong has already cost a submission.  ds4-eval grades answers; it does not
+ * measure the scored path, and neither does the only golden that ships for a
+ * development box.  That golden is a copy gate: see
+ * correctness_prompts/public-longcopy-gate-english-1024.golden.json and the
+ * prompt file beside it, in which the continuation largely repeats material
+ * already present in the context.
+ *
+ * Speculative acceptance on that prompt is inflated.  It was measured at 93.8
+ * percent with a draft depth of one.  A drafter that is right nine times in
+ * ten makes deeper drafting look nearly free, because almost every drafted
+ * token is committed and almost no verify round is thrown away; on natural
+ * text the same depth wastes work.  A draft depth chosen against the copy
+ * gate, or against any of the cases below, is therefore chosen against an
+ * acceptance rate the ranked prompt does not have.  Use this harness for
+ * correctness, and for changes whose cost is the same whatever the model
+ * predicts next.  Do not use it to pick a draft depth.
+ */
 static const eval_case eval_cases[] = {
     {
         .source = "GPQA Diamond",
