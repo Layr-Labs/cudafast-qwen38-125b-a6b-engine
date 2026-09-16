@@ -706,28 +706,6 @@ static const int8_t ple_kvalues_iq4nl[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
 };
 
-/* The high-nibble half of the table, materialised at compile time so the
- * hot loop carries no lazy-init branch.  Generated as kv_hi[b] ==
- * ple_kvalues_iq4nl[b >> 4] for all 256 byte values. */
-static const int8_t ple_kvalues_iq4nl_hi[256] = {
-    -127, -127, -127, -127, -127, -127, -127, -127, -127, -127, -127, -127, -127, -127, -127, -127,
-    -104, -104, -104, -104, -104, -104, -104, -104, -104, -104, -104, -104, -104, -104, -104, -104,
-     -83,  -83,  -83,  -83,  -83,  -83,  -83,  -83,  -83,  -83,  -83,  -83,  -83,  -83,  -83,  -83,
-     -65,  -65,  -65,  -65,  -65,  -65,  -65,  -65,  -65,  -65,  -65,  -65,  -65,  -65,  -65,  -65,
-     -49,  -49,  -49,  -49,  -49,  -49,  -49,  -49,  -49,  -49,  -49,  -49,  -49,  -49,  -49,  -49,
-     -35,  -35,  -35,  -35,  -35,  -35,  -35,  -35,  -35,  -35,  -35,  -35,  -35,  -35,  -35,  -35,
-     -22,  -22,  -22,  -22,  -22,  -22,  -22,  -22,  -22,  -22,  -22,  -22,  -22,  -22,  -22,  -22,
-     -10,  -10,  -10,  -10,  -10,  -10,  -10,  -10,  -10,  -10,  -10,  -10,  -10,  -10,  -10,  -10,
-       1,    1,    1,    1,    1,    1,    1,    1,    1,    1,    1,    1,    1,    1,    1,    1,
-      13,   13,   13,   13,   13,   13,   13,   13,   13,   13,   13,   13,   13,   13,   13,   13,
-      25,   25,   25,   25,   25,   25,   25,   25,   25,   25,   25,   25,   25,   25,   25,   25,
-      38,   38,   38,   38,   38,   38,   38,   38,   38,   38,   38,   38,   38,   38,   38,   38,
-      53,   53,   53,   53,   53,   53,   53,   53,   53,   53,   53,   53,   53,   53,   53,   53,
-      69,   69,   69,   69,   69,   69,   69,   69,   69,   69,   69,   69,   69,   69,   69,   69,
-      89,   89,   89,   89,   89,   89,   89,   89,   89,   89,   89,   89,   89,   89,   89,   89,
-     113,  113,  113,  113,  113,  113,  113,  113,  113,  113,  113,  113,  113,  113,  113,  113,
-};
-
 /* FP16 -> FP32 with no data-dependent loop.
  *
  * The shipped converter normalised a subnormal mantissa with
@@ -782,25 +760,11 @@ void ds4_ple_dequant_iq4_nl(const void *__restrict blocks, size_t block_count,
 
     const int8_t *const kv = ple_kvalues_iq4nl;
     for (size_t b = 0; b < block_count; b++) {
-        /* The caller walks a token row as five consecutive blocks, so the
-         * next block's eighteen bytes are the next thing this loop touches.
-         * Asking for them one iteration early costs one hint and hides the
-         * latency of the scale load and the nibble fetch behind the current
-         * block's dequant.  Pure hint: the values produced are unchanged. */
-        if (b + 1u < block_count)
-            __builtin_prefetch(p + DS4_PLE_IQ4_NL_BLOCK_BYTES, 0, 1);
         uint16_t half;
         memcpy(&half, p, sizeof(half));
         const float d = ple_fp16_to_fp32(half);
         const uint8_t *qs = p + 2;
         float *y = out + b * DS4_PLE_IQ4_NL_BLOCK_ELEMS;
-
-        /* Store-bound loop: five blocks of output for every block of input, so
-         * the allocating write into the staging row is what stalls.  Ask for
-         * the destination line one block early, with the write-intent bit set,
-         * so the fill overlaps the current block's dequant.  Hint only. */
-        if (b + 1u < block_count)
-            __builtin_prefetch(y + DS4_PLE_IQ4_NL_BLOCK_ELEMS, 1, 3);
 
         /* Unrolled by two: the block is a fixed sixteen nibble bytes, so the
          * trip count is a compile-time constant and half the loop-carried
@@ -809,8 +773,8 @@ void ds4_ple_dequant_iq4_nl(const void *__restrict blocks, size_t block_count,
             const uint8_t q0 = qs[j], q1 = qs[j + 1];
             y[j]      = d * (float)kv[q0 & 0x0F];
             y[j + 1]  = d * (float)kv[q1 & 0x0F];
-            y[j + 16] = d * (float)ple_kvalues_iq4nl_hi[q0];
-            y[j + 17] = d * (float)ple_kvalues_iq4nl_hi[q1];
+            y[j + 16] = d * (float)kv[q0 >> 4];
+            y[j + 17] = d * (float)kv[q1 >> 4];
         }
         p += DS4_PLE_IQ4_NL_BLOCK_BYTES;
     }
