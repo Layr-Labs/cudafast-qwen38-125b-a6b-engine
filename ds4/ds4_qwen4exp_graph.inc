@@ -2230,17 +2230,17 @@ static bool qwen4exp_hc_flush_pending(ds4_qwen4exp_session *s, uint32_t n_tokens
                                              n_tokens) != 0;
 }
 
-static bool qwen4exp_graph_residual(ds4_qwen4exp_session *s,
+static bool qwen4exp_graph_residual_impl(ds4_qwen4exp_session *s,
                                     const ds4_model *m,
                                     const ds4_tensor *norm,
                                     const ds4_tensor *down,
                                     const ds4_tensor *up,
                                     const ds4_tensor *inject,
                                     float norm_weight_offset,
-                                    uint32_t n_tokens) {
+                                    uint32_t n_tokens, bool local_pending) {
     /* An owed inject is applied by the mixer itself, inside its first read
      * of the residual; the pair (inject kernel, mixer) is what it computes. */
-    const bool pending = s->hc_pending;
+    const bool pending = s->hc_pending || local_pending;
     s->hc_pending = false;
 #ifdef DS4_TEST_HOOKS
     /* The tower's final mixer is the only call with no inject head.  Copy what
@@ -2278,6 +2278,18 @@ static bool qwen4exp_graph_residual(ds4_qwen4exp_session *s,
         DS4_HC_EPS, norm_weight_offset, 1) != 0;
 }
 
+static bool qwen4exp_graph_residual(ds4_qwen4exp_session *s,
+                                    const ds4_model *m,
+                                    const ds4_tensor *norm,
+                                    const ds4_tensor *down,
+                                    const ds4_tensor *up,
+                                    const ds4_tensor *inject,
+                                    float norm_weight_offset,
+                                    uint32_t n_tokens) {
+    return qwen4exp_graph_residual_impl(s, m, norm, down, up, inject,
+                                        norm_weight_offset, n_tokens, false);
+}
+
 /* Two fixed launch sequences per layer.  The GDN reads and updates tensor
  * state in place and takes no position argument; QSA, PLE and token uploads
  * stay outside capture.  Every replay still computes on the current inputs.
@@ -2304,9 +2316,20 @@ static bool qwen4exp_graph_layer_island_encode(
          * applied here (qwen4exp_hc_defer_ok); the slice trace keeps its
          * order either way, it records what the model computed. */
         const bool defer = qwen4exp_hc_defer_ok(n_tokens);
+        bool local_pending = false;
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        static int short_pending_off = -1;
+        if (short_pending_off < 0)
+            short_pending_off = getenv("DS4_QWEN4EXP_NO_HC_SHORT_PENDING") != NULL;
+        local_pending = n_tokens >= 1u && n_tokens <= 2u && !short_pending_off &&
+            !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL;
+#endif
+        /* Local to this island only: the FFN mixer materializes hyper before
+         * returning. The terminal FFN inject below remains eager at short rows. */
         if (defer) {
             s->hc_pending = true;
-        } else if (!ds4_gpu_qwen4exp_hc_inject_tensor(s->hyper, s->hyper, s->block_out,
+        } else if (!local_pending &&
+                   !ds4_gpu_qwen4exp_hc_inject_tensor(s->hyper, s->hyper, s->block_out,
                                                s->inject, DS4_N_EMBD, DS4_N_HC,
                                                n_tokens)) {
             fprintf(stderr, "ds4: qwen4exp attention inject failed at block %u\n", il);
@@ -2315,9 +2338,9 @@ static bool qwen4exp_graph_layer_island_encode(
         QW_TRACE(QW_SLICE_ATTN_INJECT);
 
         /* --- feed-forward side ---------------------------------------- */
-        if (!qwen4exp_graph_residual(s, m, l->hc_ffn_norm, l->hc_ffn_down,
+        if (!qwen4exp_graph_residual_impl(s, m, l->hc_ffn_norm, l->hc_ffn_down,
                                      l->hc_ffn_up, l->hc_ffn_inject,
-                                     l->hc_ffn_norm_offset, n_tokens)) {
+                                     l->hc_ffn_norm_offset, n_tokens, local_pending)) {
             fprintf(stderr, "ds4: qwen4exp FFN mixer failed at block %u\n", il);
             return false;
         }
