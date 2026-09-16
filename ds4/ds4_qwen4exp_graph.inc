@@ -1197,6 +1197,43 @@ static void qw_ple_pool_init(void) {
     pthread_mutex_unlock(&g_qw_ple_pool.mutex);
 }
 
+/* Per-process resolution for the environment flags the forward reads on
+ * every call.  Each getenv walks the environ array, and none of these values
+ * can change while the engine is open, so the first read is the only read.
+ * The capture gates ask TIME_SLICES once per forward on the replay path and
+ * once per layer on the eager one; the PLE gather asks its own flag once per
+ * forward.  qw_hb_time_on and the *_on helpers below already do exactly this
+ * for their own flags. */
+static int qw_time_slices_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("DS4_QWEN4EXP_TIME_SLICES") != NULL;
+    return on;
+}
+
+static int qw_ple_gather_time_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("DS4_QWEN4EXP_PLE_GATHER_TIME") != NULL;
+    return on;
+}
+
+static int qw_gdn_proj_fusion_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("DS4_QWEN4EXP_NO_GDN_PROJECTION_FUSION") == NULL;
+    return on;
+}
+
+static int qw_qsa_q8_triple_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("DS4_QWEN4EXP_NO_QSA_Q8_TRIPLE") == NULL;
+    return on;
+}
+
+static int qw_moe_quant_reuse_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("DS4_QWEN4EXP_NO_MOE_QUANT_REUSE") == NULL;
+    return on;
+}
+
 static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                                       const ds4_qwen4exp_weights *w,
                                       const int32_t *tokens,
@@ -1239,7 +1276,7 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
      * rows a single long call would. */
 
     const double gather_t0 =
-        getenv("DS4_QWEN4EXP_PLE_GATHER_TIME") ? now_sec() : 0.0;
+        qw_ple_gather_time_on() ? now_sec() : 0.0;
     const uint32_t block_elems = DS4_PLE_IQ4_NL_BLOCK_ELEMS;
     const uint32_t blocks_per_row = DS4_N_PLE_ROW_DIM / block_elems;
 
@@ -1508,7 +1545,7 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
     }
 
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    if (n_tokens<=2u && getenv("DS4_QWEN4EXP_NO_GDN_PROJECTION_FUSION")==NULL) {
+    if (n_tokens<=2u && qw_gdn_proj_fusion_on()) {
         ds4_gpu_tensor *outs[4]={s->gdn_qkv,s->gdn_gate,s->gdn_alpha,s->gdn_beta};
         const void *maps[4]={QW_MAP(m,l->attn_qkv),QW_MAP(m,l->attn_gate),
                             QW_MAP(m,l->ssm_alpha),QW_MAP(m,l->ssm_beta)};
@@ -1642,7 +1679,7 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
 
     /* Projections.  q is DOUBLED: half query, half output gate. */
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    if (n_tokens<=2u && getenv("DS4_QWEN4EXP_NO_QSA_Q8_TRIPLE")==NULL) {
+    if (n_tokens<=2u && qw_qsa_q8_triple_on()) {
         ds4_gpu_tensor *outs[3]={s->qsa_doubled,s->qsa_kin,s->qsa_vin};
         const void *maps[3]={QW_MAP(m,l->attn_q),QW_MAP(m,l->attn_k),QW_MAP(m,l->attn_v)};
         const uint64_t sizes[3]={QW_MAPSZ(m,l->attn_q),QW_MAPSZ(m,l->attn_k),QW_MAPSZ(m,l->attn_v)};
@@ -2017,7 +2054,7 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
     /* Routed and shared experts read the same mixed activation in this
      * stream. Routed scratch retains its quantization through this call;
      * Metal's prequantized entry point keeps its ordinary implementation. */
-    const int reuse_quant = getenv("DS4_QWEN4EXP_NO_MOE_QUANT_REUSE") == NULL;
+    const int reuse_quant = qw_moe_quant_reuse_on();
     if (!ds4_gpu_qwen4exp_shared_expert_preq_tensor(
             s->block_out, s->shexp_mid, s->shexp_gate,
             &sh_router_slab, &sh_gate_slab, &sh_up_slab, &sh_down_slab,
@@ -2093,7 +2130,7 @@ static void qwen4exp_trace(qwen4exp_slice slice) {
     }
 
     if (g_qwen4exp_time_slices < 0) {
-        g_qwen4exp_time_slices = getenv("DS4_QWEN4EXP_TIME_SLICES") != NULL;
+        g_qwen4exp_time_slices = qw_time_slices_on();
     }
     if (!g_qwen4exp_time_slices) return;
     if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize() ||
@@ -2284,7 +2321,7 @@ static bool qwen4exp_graph_layer_island(
      * capture.  They must also execute the individual call sites on replay. */
     const bool capture_ok =
         n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
-        !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
+        !qw_hb_time_on() && !qw_time_slices_on() &&
         ds4_gpu_decode_graphs_supported();
     if (capture_ok) {
         ds4_decode_graph_key key;
@@ -2342,7 +2379,7 @@ static bool qwen4exp_graph_qsa_island(
     const bool qsa_capture_ok =
         n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
         (uint64_t)s->pos + n_tokens <= DS4_N_INDEXER_TOP_K &&
-        !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
+        !qw_hb_time_on() && !qw_time_slices_on() &&
         ds4_gpu_decode_graphs_supported();
     if (qsa_capture_ok) {
         ds4_decode_graph_key key;
@@ -2612,7 +2649,7 @@ static bool qwen4exp_graph_layers(
     bool capture_ok =
         n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
         (uint64_t)s->pos + n_tokens <= DS4_N_INDEXER_TOP_K &&
-        !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
+        !qw_hb_time_on() && !qw_time_slices_on() &&
         ds4_gpu_decode_graphs_supported();
 #ifdef DS4_TEST_HOOKS
     /* Layer dumps synchronize and must execute every host call site. */
@@ -2711,7 +2748,7 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
                                 float                      *logits_out) {
     const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
     const double wall_t0 =
-        getenv("DS4_QWEN4EXP_TIME_SLICES") != NULL ? now_sec() : 0.0;
+        qw_time_slices_on() ? now_sec() : 0.0;
 
     /* NO SILENT FALSE.  Every refusal below this line names itself, and so
      * does this one: an argument that is missing is a wiring fault in the
@@ -3311,7 +3348,7 @@ int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
     const bool capture_ok =
         n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
         (uint64_t)s->pos + n_tokens <= DS4_N_INDEXER_TOP_K &&
-        !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
+        !qw_hb_time_on() && !qw_time_slices_on() &&
         ds4_gpu_decode_graphs_supported();
     ds4_decode_graph_key key;
     int graph_state = -1;
