@@ -19148,7 +19148,7 @@ struct qwen_gdn_projection_args {
  * registers for local memory traffic on the kernel we are trying to unblock,
  * and `lmem=0` is the only reading that makes the occupancy argument valid. */
 #if defined(__CUDACC__) && CUDART_VERSION >= 12040
-#define QW_GDN_PROJ_ATTR __maxnreg__(40)
+#define QW_GDN_PROJ_ATTR __maxnreg__(48)
 #else
 #define QW_GDN_PROJ_ATTR __launch_bounds__(256)
 #endif
@@ -19673,12 +19673,12 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
          * allocation.  The gate asks only for FOUR-byte alignment, because
          * four is all the funnel-shift decoder can observe; demanding sixteen
          * would let a merely word-aligned slab fall back silently and make the
-         * arm a no-op.  DS4_QWEN4EXP_NO_GDN_PANEL stands it down. */
+         * arm a no-op.  The panel is opt-in: DS4_QWEN4EXP_GDN_PANEL stands it up. */
         const size_t gdn_panel=(size_t)(256u/64u)*(size_t)blocks*34u+16u;
         const int gdn_stage =
             ((((uintptr_t)a.weights[0]|(uintptr_t)a.weights[1])&3u)==0u) &&
             gdn_panel<=49152u &&
-            getenv("DS4_QWEN4EXP_NO_GDN_PANEL")==NULL;
+            getenv("DS4_QWEN4EXP_GDN_PANEL")!=NULL;
         /* PDL consumer: the stream predecessor is the mixed-input quantizer,
          * which triggers at its top at these decode widths. */
         if (rows==1u) {
