@@ -4344,7 +4344,13 @@ __device__ __forceinline__ static void qw_gu_coop_raw_load(
  * the measured floor, at which point gate/up occupancy is CLOSED for a real
  * reason rather than a mis-read one. */
 #if defined(__CUDACC__) && CUDART_VERSION >= 12040
-#define QW_GU_MAXNREG __maxnreg__(32)
+/* The four-row cooperative CTA now has 256 threads. On GB10, six such
+ * CTAs reach the 1536-thread ceiling; 40 registers still fit all six
+ * (6 * 256 * 40 = 61440 <= 65536). The old 32-register cap bought no
+ * residency at this shape and forced additional rematerialization. Keep
+ * that original cap on the other schedules. This changes allocation only;
+ * the kernel arithmetic and the launch geometry below are unchanged. */
+#define QW_GU_MAXNREG __maxnreg__((Coop && OutputRows == 4u) ? 40 : 32)
 #else
 #define QW_GU_MAXNREG
 #endif
