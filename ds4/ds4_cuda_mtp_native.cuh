@@ -126,6 +126,56 @@ static mtp_native_layout mtp_native_offsets(uint32_t width) {
     l.temporary = mtp_native_align(l.flag + 4u);
     return l;
 }
+/* Native-only copy of the promoted quantizer; arithmetic stays verbatim.
+ * An ordinary same-stream screen launch waits for this flag store and all
+ * quantization writes, regardless of the inherited early PDL trigger. */
+__global__ static void mtp_native_quantize_reset_kernel(int8_t *xq,
+                                                          float *xscale,
+                                                          const float *x,
+                                                          uint64_t in_dim,
+                                                          uint64_t blocks,
+                                                          uint32_t n_rows, uint32_t *invalid) {
+    if (blockIdx.x == 0u && threadIdx.x == 0u) *invalid = 0u;
+    /* PDL producer for the projections that read this quantization on the
+     * decode stream (the GDN in-projection and the QSA Q/K/V launches).
+     * Gated to the decode widths AND to a grid the device can hold at once:
+     * at the in-model widths the grid is rows * blocks / 8 = seventy
+     * 256-thread blocks on the 48-SM GB10, single-wave with margin under
+     * the 288-block ceiling above; a prefill launch, or a public caller at
+     * the API's full input width, exceeds it and never triggers -- the
+     * deadlock rule at the trigger macro (ds4_cuda_qwen4exp.cuh) -- not that
+     * any PSS consumer follows one at those widths. */
+    if (n_rows <= DS4_Q8_QUANT_PDL_MAX_ROWS &&
+        (n_rows * blocks + 7u) / 8u <= DS4_Q8_QUANT_PDL_MAX_BLOCKS)
+        QWEN4EXP_PDL_TRIGGER();
+    const uint64_t pair =
+        (uint64_t)blockIdx.x * (blockDim.x >> 5u) + (threadIdx.x >> 5u);
+    if (pair >= (uint64_t)n_rows * blocks) return;
+    const uint64_t row = pair / blocks;
+    const uint64_t b = pair - row * blocks;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint64_t i0 = b * 32u;
+    const uint64_t bn = in_dim - i0 < 32u ? in_dim - i0 : 32u;
+    const float *xr = x + row * in_dim + i0;
+
+    float a = (uint64_t)lane < bn ? fabsf(xr[lane]) : 0.0f;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+    }
+    const float d = a / 127.0f;
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    if (lane == 0u) xscale[pair] = d;
+    int8_t *dst = xq + pair * 32u;
+    if ((uint64_t)lane < bn) {
+        int v = (int)lrintf(xr[lane] * id);
+        v = v > 127 ? 127 : (v < -128 ? -128 : v);
+        dst[lane] = (int8_t)v;
+    } else {
+        dst[lane] = 0;
+    }
+}
+
 extern "C" int ds4_gpu_mtp_native_screen_init(uint32_t width,
         uint64_t *bytes, uint32_t *capacity) {
     if (!bytes || !capacity) return -1;
@@ -206,16 +256,25 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
     uint64_t *key_out = (uint64_t *)(base + l.key_out);
     uint32_t *id_tmp = (uint32_t *)(base + l.id_tmp);
     uint32_t *flag = (uint32_t *)(base + l.flag);
-    if (!cuda_ok(cudaMemsetAsync(flag,0,4,cuda_decode_stream()),"native screen flag")) return -1;
-    quantize_q8_0_f32_rows_warp_kernel<<<10,256,0,cuda_decode_stream()>>>(
-        xq,xs,(const float *)x->ptr,in_dim,80,1);
-    if (!cuda_ok(cudaGetLastError(),"native screen quantize")) return -1;
-    const bool fuse_keys = getenv("DS4_MTP_NO_FUSED_SCREEN_KEYS") == nullptr &&
+    const bool scratch_disjoint =
         mtp_native_key_range_disjoint(scratch->ptr,scratch->bytes,
                                      w,(uint64_t)vocab*80u*34u) &&
         mtp_native_key_range_disjoint(scratch->ptr,scratch->bytes,x->ptr,x->bytes) &&
         mtp_native_key_range_disjoint(scratch->ptr,scratch->bytes,out->ptr,out->bytes) &&
         mtp_native_key_range_disjoint(scratch->ptr,scratch->bytes,ids->ptr,ids->bytes);
+    const bool reset_in_quantizer = scratch_disjoint &&
+        getenv("DS4_MTP_NO_QUANT_FLAG_FUSION") == nullptr;
+    if (reset_in_quantizer) {
+        mtp_native_quantize_reset_kernel<<<10,256,0,cuda_decode_stream()>>>(
+            xq,xs,(const float *)x->ptr,in_dim,80,1,flag);
+    } else {
+        if (!cuda_ok(cudaMemsetAsync(flag,0,4,cuda_decode_stream()),"native screen flag")) return -1;
+        quantize_q8_0_f32_rows_warp_kernel<<<10,256,0,cuda_decode_stream()>>>(
+            xq,xs,(const float *)x->ptr,in_dim,80,1);
+    }
+    if (!cuda_ok(cudaGetLastError(),"native screen quantize")) return -1;
+    const bool fuse_keys = scratch_disjoint &&
+        getenv("DS4_MTP_NO_FUSED_SCREEN_KEYS") == nullptr;
     if (fuse_keys) {
         mtp_native_projection_kernel<true,true><<<(width+3u)/4u,256,0,cuda_decode_stream()>>>(
             scores,(const unsigned char *)w,xq,xs,width,nullptr,vocab,prefix,tail,
