@@ -674,6 +674,8 @@ int ds4_qwen4exp_graph_head_cache(void *graph, void *cache,
  *   matmul_q8_0  the decode-order entry, ds4_qwen4exp_matmul.h
  *   block        L7's qwen4exp block forward
  */
+typedef struct ds4_qwen4exp_mtp_head ds4_qwen4exp_mtp_head;
+
 typedef struct {
     int (*rms_norm)(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
                     const void *model_map, uint64_t model_size,
@@ -716,6 +718,10 @@ typedef struct {
                          uint32_t, uint32_t, const ds4_gpu_tensor *);
     int (*native_map)(ds4_gpu_tensor *, const ds4_gpu_tensor *,
                       const ds4_gpu_tensor *, uint32_t, uint32_t);
+    /* Optional combined native attempt: negative error, zero decline to old
+     * hooks, positive queued count. UINT32_MAX in the final ID requires the
+     * cold scratch flag read at the returned offset before fallback. */
+    int (*native_propose_async)(ds4_qwen4exp_mtp_head *, uint64_t *flag_offset);
     ds4_qwen4exp_block_forward_fn block;
     ds4_qwen4exp_block_forward_fn cache_seed; /* optional cache-only hook */
 } ds4_qwen4exp_mtp_gpu_hooks;
@@ -749,7 +755,7 @@ static inline uint64_t ds4_qwen4exp_q8_0_row_bytes(uint32_t in_dim) {
  * from the TARGET's mapping.  Nothing here assumes the two mappings share an
  * owner, and neither pointer is written.
  */
-typedef struct {
+struct ds4_qwen4exp_mtp_head {
     const void *head_map;
     uint64_t    head_size;
     const void *target_map;
@@ -832,7 +838,7 @@ typedef struct {
      * top-1 minus runner-up in last_margin; otherwise last_margin is -1. */
     bool  want_margin;
     float last_margin;
-} ds4_qwen4exp_mtp_head;
+};
 
 /*
  * The eh_proj row order: EMBEDDING HALF FIRST.

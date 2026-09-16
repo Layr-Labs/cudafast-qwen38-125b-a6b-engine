@@ -890,6 +890,20 @@ int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out, ds4_gpu_tensor *ids,
     ds4_gpu_tensor *scratch, const void *map, uint64_t bytes, uint64_t offset,
     uint32_t dim, uint32_t vocab, uint32_t prefix, uint32_t tail,
     const ds4_gpu_tensor *x);
+/* Optional CUDA combined proposal. Positive means queued, with validity
+ * deferred to winner. UINT32_MAX requires reading the returned scratch flag
+ * offset: nonzero requests static fallback; zero is an invalid-winner error.
+ * Zero declines before tensor writes; negative propagates backend failure. Inputs
+ * and outputs must remain owned until winner and any cold reason are read.
+ * This combined entry retains selected IDs in coarse-score order (unique;
+ * token zero first when the coarse flag is clear), with matching refined
+ * logits. Only the old screen API promises ascending IDs; do not pass these
+ * score-ordered outputs to the old compact-index mapper. */
+int ds4_gpu_mtp_native_propose_async(ds4_gpu_tensor *winner,
+        ds4_gpu_tensor *out, ds4_gpu_tensor *ids, ds4_gpu_tensor *scratch,
+        const void *map, uint64_t map_bytes, uint64_t offset, uint32_t in_dim,
+        uint32_t vocab, uint32_t prefix, uint32_t tail, const ds4_gpu_tensor *x,
+        uint64_t *flag_offset);
 int ds4_gpu_mtp_native_map(ds4_gpu_tensor *winner, const ds4_gpu_tensor *logits,
     const ds4_gpu_tensor *ids, uint32_t count, uint32_t vocab);
 

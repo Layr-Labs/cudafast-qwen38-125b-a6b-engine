@@ -55,6 +55,21 @@ extern int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu
     const ds4_gpu_tensor *) __attribute__((weak));
 extern int ds4_gpu_mtp_native_map(ds4_gpu_tensor *, const ds4_gpu_tensor *,
     const ds4_gpu_tensor *, uint32_t, uint32_t) __attribute__((weak));
+extern int ds4_gpu_mtp_native_propose_async(ds4_gpu_tensor *, ds4_gpu_tensor *,
+    ds4_gpu_tensor *, ds4_gpu_tensor *, const void *, uint64_t, uint64_t,
+    uint32_t, uint32_t, uint32_t, uint32_t, const ds4_gpu_tensor *, uint64_t *)
+    __attribute__((weak));
+/* Do not bypass customized old native hooks with the optional default path. */
+static int mtp_native_propose_async(ds4_qwen4exp_mtp_head *h, uint64_t *offset) {
+    if (!ds4_gpu_mtp_native_propose_async ||
+        h->hooks.native_init != ds4_gpu_mtp_native_screen_init ||
+        h->hooks.native_screen != ds4_gpu_mtp_native_screen ||
+        h->hooks.native_map != ds4_gpu_mtp_native_map) return 0;
+    return ds4_gpu_mtp_native_propose_async(h->t_top1,h->t_logits,
+            h->t_native_ids,h->t_native_scratch,h->target_map,h->target_size,
+            h->output_offset,h->n_embd,h->n_vocab,h->draft_vocab_prefix,
+            h->draft_vocab_tail,h->t_sample,offset);
+}
 extern int ds4_gpu_qwen4exp_ehx_pack_tensor(
         ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *,
         uint32_t, uint32_t, uint32_t) __attribute__((weak));
@@ -86,11 +101,13 @@ void ds4_qwen4exp_mtp_default_hooks(ds4_qwen4exp_mtp_gpu_hooks *hooks) {
     hooks->native_init = ds4_gpu_mtp_native_screen_init;
     hooks->native_screen = ds4_gpu_mtp_native_screen;
     hooks->native_map = ds4_gpu_mtp_native_map;
+    hooks->native_propose_async = mtp_native_propose_async;
 #else
     hooks->ehx_pack    = NULL;
     hooks->native_init = NULL;
     hooks->native_screen = NULL;
     hooks->native_map = NULL;
+    hooks->native_propose_async = NULL;
 #endif
     hooks->matmul_q8_0 = mtp_matmul_q8_0_decode_rows;
     hooks->block       = ds4_qwen4exp_graph_head_block;
