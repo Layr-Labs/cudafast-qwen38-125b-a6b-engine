@@ -1148,6 +1148,26 @@ static void weights_bind_qwen4exp_ple_table(ds4_qwen4exp_ple_table *ple,
     ple->bytes = t->bytes;
     ple->type = t->type;
 
+#if defined(POSIX_MADV_RANDOM)
+    /* A gather step faults sixteen small scattered rows out of this span.
+     * Under the default advice every first touch pulls a readahead cluster
+     * the step never reads; marking the table random keeps each fault to
+     * the page the row actually needs.  The rest of the shard keeps its
+     * advice: the kernel splits the VMA at these boundaries. */
+    if (ple->base && ple->bytes > 0) {
+        const long page = getpagesize();
+        if (page > 0) {
+            const uintptr_t p0 = (uintptr_t)ple->base & ~(uintptr_t)(page - 1);
+            uintptr_t p1 = ((uintptr_t)ple->base + ple->bytes +
+                            (uintptr_t)(page - 1)) & ~(uintptr_t)(page - 1);
+            if (p1 > p0) {
+                (void)posix_madvise((void *)p0, (size_t)(p1 - p0),
+                                    POSIX_MADV_RANDOM);
+            }
+        }
+    }
+#endif
+
     qwen4exp_validate_ple_heads(m, ple->rows, ple);
     qwen4exp_read_ple_hash_constants(m, ple);
     qwen4exp_plan_charge(plan, DS4_QWEN4EXP_MEM_PLE, t);

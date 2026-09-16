@@ -1240,6 +1240,65 @@ static void qw_ple_pool_init(void) {
     pthread_mutex_unlock(&g_qw_ple_pool.mutex);
 }
 
+/* Ask the kernel to start reading the pages the listed rows will fault in.
+ *
+ * A gather step reads sixteen 90-byte rows scattered over the SSD-resident
+ * table per token; cold, each is a page fault taken serially while the
+ * device waits.  The row ids are all known before the dequant loop runs,
+ * so advising every page at once lets the kernel overlap the reads instead
+ * of discovering them one fault at a time.  Page starts are sorted and
+ * deduplicated so a page two rows share is advised once and the requests
+ * reach the device in address order.  A hint only: it changes no value the
+ * gather returns, and a row past the fixed cap simply faults as it would
+ * have without the hint. */
+#define QW_PLE_PREFETCH_MAX 1024
+
+static void qw_ple_prefetch_rows(const ds4_qwen4exp_ple_table *ple,
+                                 const uint64_t *ids, size_t count) {
+#if defined(POSIX_MADV_WILLNEED)
+    if (!ple || !ple->base || !ids || count == 0) return;
+    const long page = getpagesize();
+    if (page <= 0) return;
+    const uintptr_t base = (uintptr_t)ple->base;
+    const uintptr_t pend = base + ple->bytes;
+    uint64_t pg[QW_PLE_PREFETCH_MAX];
+    size_t n_pg = 0;
+    for (size_t i = 0; i < count && n_pg + 2u <= QW_PLE_PREFETCH_MAX; i++) {
+        const uint64_t row = ids[i];
+        if (row >= ple->rows) continue;
+        const uintptr_t lo = base + row * ple->row_bytes;
+        const uintptr_t hi = lo + ple->row_bytes - 1u;
+        const uint64_t ends[2] = {
+            (uint64_t)(lo & ~(uintptr_t)(page - 1)),
+            (uint64_t)(hi & ~(uintptr_t)(page - 1)),
+        };
+        for (int e = 0; e < 2; e++) {
+            if (e == 1 && ends[1] == ends[0]) break;
+            size_t a = 0, b = n_pg;
+            while (a < b) {
+                const size_t mid = a + (b - a) / 2;
+                if (pg[mid] < ends[e]) a = mid + 1; else b = mid;
+            }
+            if (a < n_pg && pg[a] == ends[e]) continue;
+            memmove(pg + a + 1, pg + a, (n_pg - a) * sizeof(*pg));
+            pg[a] = ends[e];
+            n_pg++;
+        }
+    }
+    for (size_t i = 0; i < n_pg; i++) {
+        uintptr_t p1 = (uintptr_t)pg[i] + (uintptr_t)page;
+        if (p1 > pend) p1 = pend;
+        if (p1 > (uintptr_t)pg[i]) {
+            (void)posix_madvise((void *)(uintptr_t)pg[i],
+                                (size_t)(p1 - (uintptr_t)pg[i]),
+                                POSIX_MADV_WILLNEED);
+        }
+    }
+#else
+    (void)ple; (void)ids; (void)count;
+#endif
+}
+
 static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                                       const ds4_qwen4exp_weights *w,
                                       const int32_t *tokens,
@@ -1299,6 +1358,10 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 s->ple_history_rows[t] = s->ple_history;
             }
         }
+        /* Every row id this call will fault on is now known; start the
+         * page-ins before the dequant loop walks them. */
+        qw_ple_prefetch_rows(&w->ple, s->ple_ids,
+                             (size_t)n_tokens * DS4_N_PLE_HEAD);
         for (uint32_t t = 0; t < n_tokens; t++) {
             /* The head's destination strides are constants of the shape, so
              * the token base is hoisted out of the head loop and the head
@@ -1362,6 +1425,8 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
         if (nthreads == 1) {
             ds4_ple_row_ids(&s->ple_constants, &s->ple_history, tokens,
                             n_tokens, s->ple_ids);
+            qw_ple_prefetch_rows(&w->ple, s->ple_ids,
+                                 (size_t)n_tokens * DS4_N_PLE_HEAD);
             for (uint32_t t = 0; t < n_tokens; t++) {
                 for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
                     const uint64_t row =
@@ -2898,36 +2963,6 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         DS4_QWEN4EXP_MTP_MAX_COMMIT, s->adopt_state, s->adopt_conv);
     if (replay_step.settle) {
         const uint32_t rs = s->adopt_state, rc = s->adopt_conv;
-        /* ONE BATCH, ONE SYNCHRONIZE, when both halves settle the same row.
-         *
-         * qwen4exp_session_copy_layers() opens its own command batch and ends
-         * it with ds4_gpu_end_commands() + ds4_gpu_synchronize(), so calling it
-         * twice -- once for the recurrent state and once for the convolution --
-         * drains the stream TWICE for one rollback.  The two passes copy
-         * disjoint buffers (gdn_state[il] from the state snapshot,
-         * gdn_conv[il] from the conv snapshot) and neither reads what the other
-         * writes, so nothing orders one before the other and the split buys
-         * nothing.
-         *
-         * The common case is exactly the mergeable one: the plan forces a
-         * settle whenever `recurrent != conv`, so on the path that survives to
-         * here with both non-zero they are equal, and one call with both flags
-         * does the same work per layer in one batch behind one drain.
-         *
-         * BIT-IDENTICAL: the same rows are copied out of the same snapshots
-         * into the same destinations, and the per-layer loop inside
-         * copy_layers already handles both flags together -- the only thing
-         * that changes is that the conv copies join the batch the state copies
-         * were already in.  The unequal and single-sided cases keep the
-         * original two-call form below. */
-        if (rs != 0u && rs == rc) {
-            if (!qwen4exp_session_copy_layers(s, rs - 1u, true, true)) {
-                fprintf(stderr, "ds4: qwen4exp GDN rollback could not settle\n");
-                return false;
-            }
-            s->adopt_state = 0u;
-            s->adopt_conv = 0u;
-        } else
         if ((rs != 0u && !qwen4exp_session_copy_layers(s, rs - 1u, true, false)) ||
             (rc != 0u && !qwen4exp_session_copy_layers(s, rc - 1u, false, true))) {
             fprintf(stderr, "ds4: qwen4exp GDN rollback could not settle\n");
