@@ -2927,7 +2927,7 @@ __global__ static void qwen4exp_quantize_rows_kernel(
      * the bound and never triggers (the deadlock rule,
      * ds4_cuda_qwen4exp.cuh).  The gate reads the grid in the body, not a
      * convention at the launch sites, per the header's rule. */
-    if (gridDim.y <= 2u &&
+    if (gridDim.y <= 32u &&
         (uint64_t)gridDim.x * (uint64_t)gridDim.y <= 768u)
         QWEN4EXP_PDL_TRIGGER();
     const uint32_t g = blockIdx.x;
@@ -3910,7 +3910,7 @@ __device__ __forceinline__ static void dev_qwen4exp_group_decode_w(
  * asks for units {4k..4k+3} x slices {0,1}, and 66 slots apart puts those
  * eight 16-byte pieces on eight disjoint groups of four shared-memory banks,
  * so the tile read is conflict-free. */
-#define QW_DMA_US 66u
+#define QW_DMA_US 68u
 
 /* .ca, NOT .cg: .cg bypasses L1, and a super-block's 128-byte payload line is
  * touched by two K chunks, so the L1 hit matters.  Measured bare-stream gap on
@@ -5073,6 +5073,22 @@ qwen4exp_moe_gateup_split_kernel(
      * -- the fence is a no-op, exactly as it is for the kernel beside it. */
     QWEN4EXP_PDL_SYNC();
     if (active) {
+    /* The routed gate/up edge, opened on the kernel the COOP decode path runs.
+     *
+     * The dependent launch already exists in this file on
+     * qwen4exp_moe_gateup_q_kernel, and its comment states the mechanism: the
+     * blocks are already up and scheduled when the quantizer's last group
+     * retires, instead of paying a launch behind it. The coop schedule does not
+     * use that kernel -- it uses this one, and this one was launched plainly.
+     *
+     * .nc rule: no pointer in this signature carries __restrict__, so no
+     * activation load can be hoisted above the fence as ld.global.nc.
+     * Deadlock rule: it constrains the PRODUCER, and the quantizer bounds
+     * itself to one wave before it triggers, so a multi-wave dependent is safe.
+     * Launched plainly -- three rows, every prefill width -- the fence is a
+     * no-op, exactly as it is for the kernel beside it. */
+    QWEN4EXP_PDL_SYNC();
+
         if ((int32_t)blockIdx.y >= active[0]) return;
         expert = (uint32_t)active[1 + blockIdx.y];
     }
@@ -5557,6 +5573,13 @@ __global__ static void qwen4exp_moe_down_q_kernel(
         qw_fill_step(0u, 0u, spanel);
         if (Async) qw_cpasync_commit();
     }
+    /* Everything above reads weights and routing only.  The down slab is
+     * addressed from `selected`/`route`, which the router wrote several
+     * launches back and which is therefore complete; the first panel's copies
+     * are in flight by the time control reaches here.  `mq`, `ms` and `msum`
+     * are the immediate predecessor's output and every read of them is below
+     * this fence, in the slot loop.  Nothing above the fence touches them. */
+    QWEN4EXP_PDL_SYNC();
     for (uint32_t slot = 0; slot < n_expert_used; slot++) {
 #pragma unroll
         for (int r = 0; r < R; r++) {
@@ -8300,15 +8323,18 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     const dim3 dn_grid((out_dim + 7u) / 8u,
                        (n_tokens + (uint32_t)tile - 1u) / (uint32_t)tile, 1);
 #define QWEN4EXP_DOWN_IMPL_S(R, DT, V, S, SH) \
-    qwen4exp_moe_down_q_kernel<R, DT, V, S><<<dn_grid, threads, (SH), stream>>>( \
+    QWEN4EXP_LAUNCH_PDL( \
+            (qwen4exp_moe_down_q_kernel<R, DT, V, S>), \
+            dn_grid, threads, (SH), stream, \
             (float *)out->ptr, down, (const int32_t *)selected->ptr, \
             sc.mq, sc.ms, sc.msum, \
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
             mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
 #define QWEN4EXP_DOWN_IMPL(R, DT, V) QWEN4EXP_DOWN_IMPL_S(R, DT, V, false, 0)
 #define QWEN4EXP_DOWN_ASYNC(DT) \
-    qwen4exp_moe_down_q_kernel<2, DT, true, true, true><<< \
-            dn_grid, threads, (size_t)dn_shared, stream>>>( \
+    QWEN4EXP_LAUNCH_PDL( \
+            (qwen4exp_moe_down_q_kernel<2, DT, true, true, true>), \
+            dn_grid, threads, (size_t)dn_shared, stream, \
             (float *)out->ptr, down, (const int32_t *)selected->ptr, \
             sc.mq, sc.ms, sc.msum, \
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
