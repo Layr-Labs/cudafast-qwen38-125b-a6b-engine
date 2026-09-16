@@ -551,6 +551,22 @@ __global__ static void qwen4exp_gdn_conv_replay_gates_kernel(
     const uint32_t key_blocks = 2u * n_key_head;
     const uint32_t blocks = key_blocks + n_value_head;
     if (block >= blocks || row >= n_rows) return;
+    /* The dependent-launch edge into the replay recurrence.
+     *
+     * The consumer, qwen4exp_gdn_replay_gates_kernel, is launched with the
+     * programmatic stream serialization attribute and reads this kernel's
+     * qkv and gate_pairs behind a cudaGridDependencySynchronize fence.  This
+     * trigger lets its blocks come up and be scheduled while this kernel is
+     * still draining, instead of paying a launch behind it.
+     *
+     * Deadlock rule: the trigger fires only when this grid is single-wave.
+     * The grid is dim3(2*n_key_head + n_value_head, n_rows, 1) = 80 blocks
+     * wide along x, so it is single-wave exactly when n_rows is small -- the
+     * decode and verify widths.  At prefill n_rows is large, the grid is
+     * multi-wave, and the trigger stays off so a dependent can never hold the
+     * SM slots this kernel's own later waves still need.  With no dependent
+     * launch the trigger is a no-op. */
+    if (n_rows <= 2u) QWEN4EXP_PDL_TRIGGER();
 
     /* Two reduction slots, alternating by token.  One barrier a token then
      * bounds the skew between warps at one token, and the warp that has run
@@ -1029,9 +1045,21 @@ __global__ static void qwen4exp_gdn_replay_gates_kernel(
     const uint32_t key_head = head_layout != 0u ? head % n_key_head : head / repeats;
     const uint32_t key_writer = head_layout != 0u ? key_head : key_head * repeats;
     const uint32_t k0 = lane * 4u;
-    const uint64_t state_off = ((uint64_t)head * QWEN4EXP_GDN_DIM + value) *
-                               QWEN4EXP_GDN_DIM + k0;
     float4 h = *(const float4 *)(checkpoint + state_off);
+    /* The fence for the dependent launch off the conv producer.
+     *
+     * checkpoint, tape, control and the replay rows are this kernel's own
+     * replay buffers, not the producer's output, so the checkpoint load above
+     * rides the launch window.  Everything the loop below reads from the
+     * producer -- the conv output in qkv and the per-head gates in gate_pairs
+     * -- is written by qwen4exp_gdn_conv_replay_gates_kernel, so the fence
+     * goes here, ahead of the first of those reads.
+     *
+     * .nc rule: neither qkv nor gate_pairs carries __restrict__ in this
+     * signature, so no producer load can be hoisted above the fence as
+     * ld.global.nc.  Launched plainly -- every prefill width -- the fence is
+     * a no-op. */
+    QWEN4EXP_PDL_SYNC();
     for (uint32_t step = 0; step < prefix + n_tokens; step++) {
         const bool replay = step < prefix;
         const uint32_t token = replay ? 0u : step - prefix;
@@ -1951,7 +1979,9 @@ static int qwen4exp_cuda_gdn_run(
     const dim3 recurrence_grid(
         n_value_head, QWEN4EXP_GDN_DIM / 4u, n_rows);
     if (replay_gates) {
-        qwen4exp_gdn_replay_gates_kernel<<<recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
+        QWEN4EXP_LAUNCH_PDL(
+            (qwen4exp_gdn_replay_gates_kernel),
+            recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream,
             (float *)out->ptr, (float *)recurrent_state->ptr,
             (float *)replay->checkpoint->ptr, (float *)replay->tape->ptr,
             (const float *)qkv->ptr, (const float *)raw_alpha->ptr,
@@ -5052,26 +5082,6 @@ qwen4exp_moe_gateup_split_kernel(
     const bool live = row < mid_dim;
     const bool second = (warp & 1u) != 0u;
     uint32_t expert = blockIdx.y;
-    /* The routed gate/up edge, opened on the kernel the COOP decode path runs.
-     *
-     * The dependent launch already exists in this file on
-     * qwen4exp_moe_gateup_q_kernel, and its comment states the mechanism: the
-     * blocks are already up and scheduled when the quantizer's last group
-     * retires, instead of paying a launch behind it.  The coop schedule does
-     * not use that kernel -- it uses this one, and this one was launched
-     * plainly.
-     *
-     * The fence sits ahead of EVERY producer read -- the active list, the
-     * counts/offsets/pairs tables, the quantized activation and the router
-     * weights are all written by the routed quantizer -- so it is placed
-     * unconditionally, not inside the `active` branch: `counts` is read even
-     * when `active` is NULL.  .nc rule: no pointer in this signature carries
-     * __restrict__, so no activation load can be hoisted above the fence as
-     * ld.global.nc.  Deadlock rule: it constrains the PRODUCER, and the
-     * quantizer bounds itself to one wave before it triggers, so a multi-wave
-     * dependent is safe.  Launched plainly -- three rows, every prefill width
-     * -- the fence is a no-op, exactly as it is for the kernel beside it. */
-    QWEN4EXP_PDL_SYNC();
     if (active) {
         if ((int32_t)blockIdx.y >= active[0]) return;
         expert = (uint32_t)active[1 + blockIdx.y];
@@ -5224,22 +5234,8 @@ qwen4exp_moe_gateup_split_kernel(
                 }
             }
         }
-        /* Readers finish before a fast projection warp reuses this tile --
-         * a hazard only a SECOND iteration of this loop can create, so the
-         * barrier is dead whenever there is no second iteration.
-         *
-         * CREDIT: 0xpg (`37816fd`).  At the decode width the body runs exactly
-         * once: `cnt` is counts[expert], the number of (token, slot) pairs
-         * that routed to this block's expert, and a decode round verifies two
-         * rows each selecting ten of 512 experts, so any one expert collects
-         * one or two of the twenty pairs.  R is 2 for every instantiation the
-         * launcher builds, so cnt <= R and `at + R >= cnt` on the first pass.
-         *
-         * The predicate is BLOCK-UNIFORM and therefore cannot deadlock: cnt is
-         * counts[expert] with expert block-invariant, and `at` is loop-uniform.
-         * Prefill, where cnt genuinely exceeds R, takes the barrier exactly as
-         * before, byte for byte. */
-        if (at + R < cnt) __syncthreads();
+        /* Readers finish before a fast projection warp reuses this tile. */
+        __syncthreads();
     }
 }
 
@@ -8254,9 +8250,8 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             (gate_slab->expert_bytes & 15ull) == 0ull &&
             (up_slab->expert_bytes & 15ull) == 0ull;
 #define QWEN4EXP_SPLIT_GATEUP(V, P, C) \
-        QWEN4EXP_LAUNCH_PDL( \
-            (qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P, C>), \
-            (dim3((mid_dim + P - 1u) / P, gu_rows, 1)), P * 64u, 0, stream, \
+        qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P, C><<< \
+            dim3((mid_dim + P - 1u) / P, gu_rows, 1), P * 64u, 0, stream>>>( \
             (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum, \
             sc.pairs, sc.counts, sc.offsets, gu_active, \
             (const float *)weights->ptr, \
