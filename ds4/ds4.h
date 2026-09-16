@@ -479,6 +479,11 @@ int ds4_test_argmax_excluding_logits(const float *logits, uint32_t n_vocab,
                                      int excluded_id);
 uint64_t ds4_test_mixed_native_count(void);
 #endif
+/* Ranked (id, logit) only; `logprob` is left at DS4_NEG_INF.  Callers that do
+ * not read `logprob` should prefer this: it skips a full-vocabulary
+ * double-precision exp() sweep.  `id`/`logit` match ds4_session_top_logprobs
+ * bit-for-bit. */
+int ds4_session_top_logits(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap);
