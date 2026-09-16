@@ -5459,6 +5459,14 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
  * state at source. */
 template <int R, int DownType = -1, bool Vector = false, bool Stage = false,
           bool Async = false>
+/* the barrier in this kernel's staging loop is NOT the dead-at-decode shape
+ * that the gate/up kernel's was. The fill strides across the whole
+ * eight-row panel while each warp reads only its own row, so every step
+ * carries a cross-warp read-after-write plus the write-after-read on the
+ * buffer being reused, and the loop runs twenty steps at the decode width
+ * rather than one. There is no dead iteration here, including the first and
+ * the last.
+ */
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
