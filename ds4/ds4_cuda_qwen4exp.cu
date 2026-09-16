@@ -3636,7 +3636,7 @@ __global__ static void qwen4exp_moe_zero_invalid_kernel(
  * direct path instead of failing to launch. */
 /* Two eight-row panels: the (slot, token) step sequence is double buffered at
  * token-panel granularity, so two live buffers suffice. */
-#define QW_DOWN_PANEL_MAX_BYTES 16384u
+#define QW_DOWN_PANEL_MAX_BYTES 8192u
 
 /* The pipeline gives every thread exactly one slot of each tile per chunk,
  * which is what makes the one-chunk-deep register prefetch enough. */
@@ -8389,7 +8389,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             (down_slab->expert_bytes % 16u) == 0u &&
             ((uintptr_t)down & 15u) == 0u &&
             dn_shared <= QW_DOWN_PANEL_MAX_BYTES &&
-            getenv("DS4_QWEN4EXP_NO_DOWN_PANEL") == NULL;
+            getenv("DS4_QWEN4EXP_DOWN_PANEL") != NULL;
         if (down_slab->type == DS4_QWEN4EXP_TY_q8_0) {
             if (dn_stage && getenv("DS4_QWEN4EXP_NO_DOWN_ASYNC") == NULL) {
                 QWEN4EXP_DOWN_ASYNC(DS4_QWEN4EXP_TY_q8_0);
