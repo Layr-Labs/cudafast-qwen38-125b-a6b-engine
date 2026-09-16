@@ -7207,7 +7207,32 @@ static int qwen4exp_moe_tile(uint32_t n_rows) {
     /* A THREE-ROW call is the depth-2 verify.  It takes the R=2 tile -- two
      * tiles, the second with take 1 -- so it stays on the decode-width
      * kernels; R changes work sharing, not the arithmetic of a live row.
-     * DS4_QWEN4EXP_NO_WIDE_VERIFY restores the eight-row tile. */
+     * DS4_QWEN4EXP_NO_WIDE_VERIFY restores the eight-row tile.
+     *
+     * DO NOT `fix' this to 4 to make the three-row verify a single tile.  I
+     * spent two days on that arm on the premise that one tile would leave the
+     * expert panels resident for rows 0-1 and make the third row nearly free.
+     * It buys nothing, and the count is four multiplications: the staged down
+     * kernel fills one panel per (slot, token) step and the fill sits INSIDE
+     * the `r < take' guard, so a block does exactly n_expert_used * take
+     * fills.  Two tiles is 8*2 + 8*1 = 24; one tile is 8*3 = 24.  Identical,
+     * because token 2 routes to a DIFFERENT eight experts -- there is no
+     * resident panel for it to reuse.  route[] and the warp_sum_f32 epilogue
+     * are take-guarded too, so those tie at 3 and 3 as well.  The one real
+     * difference is block count, 640 -> 320 per layer against 48 SMs * 8
+     * blocks = 384 resident slots, which under-fills the machine.  Predicted
+     * sign of the arm: negative.
+     *
+     * The general form, which closes the whole acceptance axis on this engine:
+     * routed-DOWN traffic is proportional to verify ROWS at every tile, while
+     * gate/up compacts to one block row per distinct active expert and the
+     * dense and GDN legs are per round.  So an extra acceptance costs a full
+     * extra pass of the routed expert set (52% of the round) for that row, and
+     * flat depth 2 measures -4.8% decode for exactly that reason.  The only
+     * structure that breaks the proportionality is deduplicating overlapping
+     * experts across tokens inside the down kernel, which is -176 bips
+     * measured: the branch that finds the overlap costs more than the
+     * redundant work it removes. */
     if (n_rows == 3u && getenv("DS4_QWEN4EXP_NO_WIDE_VERIFY") == NULL) return 2;
     return 8;
 }
@@ -13860,15 +13885,70 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_tensor(
  * swallowed and reported as -1; the function never touches device state and is
  * called once, off the timed path. */
 extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
-    static char buf[384];
+    static char buf[512];
     static int built = 0;
     if (built) return buf;
     built = 1;
     buf[0] = '\0';
 
+    /* NO CARVEOUT CALL HERE, and this is the record of why -- it was tried and
+     * it is a MEASURED NULL.
+     *
+     * `9f0f8c34' shipped cudaFuncSetAttribute(gu_kernel,
+     * cudaFuncAttributePreferredSharedMemoryCarveout, 100) on the bet that
+     * gu[occ=6] was a driver carveout near 72 KiB holding back a kernel whose
+     * registers (65536/(32*256) = 8) and 101,376 B opt-in ceiling (8.75) both
+     * permit eight blocks.  The same submission published the discriminator that
+     * killed it.  Static shared memory is charged per BLOCK, so a shared bind is
+     * invariant in block width while a thread bind scales as 1/threads; querying
+     * the same kernel at 128 and 64 threads returned guT[occ128=8 occ64=8] --
+     * eight, invariant, which is 102400/11584 = 8.84 -> 8, i.e. the FULL
+     * 102,400 B per SM is already available and 6 was never a carveout artifact.
+     * With thr/sm=1536 also published, 1536/256 = 6 is simply the thread ceiling.
+     * gu[] is at 100% thread occupancy as shipped and the carveout cannot move a
+     * constraint that is not binding, so it is removed rather than left in as
+     * inert code that costs L1. */
+
     int gu_regs = -1, gu_smem = -1, gu_lmem = -1, gu_maxt = -1;
     int gu_occ = -1, dn_occ = -1;
+    /* The two-block-width discriminator that `9f0f8c34' carried is REMOVED
+     * because it answered its question permanently: guT[occ128=8 occ64=8] --
+     * eight and invariant in block width -- proved gu[] is shared-bound at 8
+     * blocks on the full 102,400 B/SM at narrow widths, and thread-bound at 6 at
+     * its shipped 256.  The technique is worth remembering even though the field
+     * is gone: static shared is charged per BLOCK, so a shared bind does not move
+     * with block width while a thread bind scales as 1/threads.  Querying one
+     * compiled kernel at two widths identifies the binder for one API call and no
+     * emitted byte, and it is the only thing that could separate the two
+     * mechanisms here -- all eleven other probes are register-bound and therefore
+     * consistent with either (dn 5.33, mm 4.00, md 6.65, pl2 4.01, gp 6.40). */
     int dn_regs = -1, dn_smem = -1, dn_lmem = -1, dn_maxt = -1;
+    /* The instantiation the decode round ACTUALLY launches.  Everything above
+     * reads <2, q8_0, Vector, Stage> -- but QWEN4EXP_DOWN_ASYNC launches
+     * <2, q8_0, true, true, TRUE>, a fifth template argument that turns on the
+     * cp.async panel fill.  A different template argument is a different
+     * compilation: dn[reg=48 occ=5] was never a reading of the running kernel,
+     * and every residency argument made about the down kernel -- 52% of the
+     * decode round's bytes -- rests on that reading.  occD is the same query at
+     * the real 10,880-byte dynamic panel rather than at 0. */
+    int dna_regs = -1, dna_lmem = -1, dna_occ = -1, dna_occd = -1;
+    /* THE R=4 STAGED DOWN KERNEL, and a correction to my own published note.
+     * I read the comment above this kernel as saying an R=4 staged variant needs
+     * FOUR live panels (21,760 B) and is therefore capped at 4 blocks instead of
+     * 8.  It says the opposite: the flat (slot, token) step sequence keeps only
+     * TWO panels live, and `four panels' describes the slot-granular design that
+     * was REJECTED.  The buffers are `spanel + ((step) & 1) * panel_bytes' and
+     * `((step + 1) & 1)' -- two, for any R -- and dn_shared is 2 * dn_panel
+     * regardless of tile.  So an R=4 staged kernel has the SAME 10,880-byte
+     * footprint, and the only thing that can cost it a block is register
+     * pressure from route[4]/acc[4] instead of route[2]/acc[2].  That is exactly
+     * what dn4 measures.  It matters because a single down tile for a three-row
+     * verify is the one arm on this engine still worth hundreds of bips:
+     * qwen4exp_moe_tile(3) returns 2, so dn_grid.y = 2 and the routed-MoE expert
+     * set -- 52% of the decode round -- streams TWICE to compute one extra row.
+     * dn4g is the R=4 generic path that is already instantiated, for contrast. */
+    int dn4_regs = -1, dn4_lmem = -1, dn4_occ = -1, dn4_occd = -1;
+    int dn4g_regs = -1, dn4g_lmem = -1, dn4g_occ = -1;
     /* The two PREFILL tile kernels, read here for the first time. */
     int mg_regs = -1, mg_smem = -1, mg_lmem = -1, mg_occ = -1;
     int md_regs = -1, md_smem = -1, md_lmem = -1, md_occ = -1;
@@ -13897,6 +13977,91 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
         dn_smem = (int)a.sharedSizeBytes;
         dn_lmem = (int)a.localSizeBytes;
         dn_maxt = a.maxThreadsPerBlock;
+    } else {
+        (void)cudaGetLastError();
+    }
+
+    /* The launched async down kernel, read for the first time.  Its own `occa`
+     * rather than the shared `occ` below, which is declared after this point. */
+    int occa = 0;
+    if (cudaFuncGetAttributes(
+            &a,
+            qwen4exp_moe_down_q_kernel<2, DS4_QWEN4EXP_TY_q8_0, true, true,
+                                       true>) == cudaSuccess) {
+        dna_regs = a.numRegs;
+        dna_lmem = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occa,
+            qwen4exp_moe_down_q_kernel<2, DS4_QWEN4EXP_TY_q8_0, true, true,
+                                       true>,
+            256, 0) == cudaSuccess) {
+        dna_occ = occa;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occa,
+            qwen4exp_moe_down_q_kernel<2, DS4_QWEN4EXP_TY_q8_0, true, true,
+                                       true>,
+            256, (size_t)10880u) == cudaSuccess) {
+        dna_occd = occa;
+    } else {
+        (void)cudaGetLastError();
+    }
+
+    /* R=4, staged, async: the instantiation the single-tile three-row verify
+     * would launch.  A new instantiation of an existing template -- the body is
+     * generic in R (route[R], acc[R], `for r < R' under #pragma unroll, and the
+     * panel index is (step & 1) with step = slot * take + r), with no
+     * static_assert and no R == 2 assumption anywhere -- so this compiles the
+     * same code with a different constant.  If dn4_occ matches dna_occ the
+     * footprint argument against a wide verify is gone entirely. */
+    if (cudaFuncGetAttributes(
+            &a,
+            qwen4exp_moe_down_q_kernel<4, DS4_QWEN4EXP_TY_q8_0, true, true,
+                                       true>) == cudaSuccess) {
+        dn4_regs = a.numRegs;
+        dn4_lmem = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occa,
+            qwen4exp_moe_down_q_kernel<4, DS4_QWEN4EXP_TY_q8_0, true, true,
+                                       true>,
+            256, 0) == cudaSuccess) {
+        dn4_occ = occa;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occa,
+            qwen4exp_moe_down_q_kernel<4, DS4_QWEN4EXP_TY_q8_0, true, true,
+                                       true>,
+            256, (size_t)10880u) == cudaSuccess) {
+        dn4_occd = occa;
+    } else {
+        (void)cudaGetLastError();
+    }
+    /* The R=4 path that ALREADY exists: QWEN4EXP_DOWN(4) at the tile == 4 arm,
+     * instantiated only as the generic <4, DT, false, false, false>.  It loses
+     * both the down-vector specialization and the panel staging, which is why
+     * simply making qwen4exp_moe_tile(3) return 4 is not the fix. */
+    if (cudaFuncGetAttributes(
+            &a, qwen4exp_moe_down_q_kernel<4, DS4_QWEN4EXP_TY_q8_0>) ==
+        cudaSuccess) {
+        dn4g_regs = a.numRegs;
+        dn4g_lmem = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occa, qwen4exp_moe_down_q_kernel<4, DS4_QWEN4EXP_TY_q8_0>, 256,
+            0) == cudaSuccess) {
+        dn4g_occ = occa;
     } else {
         (void)cudaGetLastError();
     }
@@ -14033,12 +14198,18 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
              "gu[reg=%d smem=%d lmem=%d maxt=%d occ=%d] dn[reg=%d smem=%d "
              "lmem=%d maxt=%d occ=%d] gdn[reg=%d lmem=%d] "
              "mm[reg=%d smem=%d lmem=%d occ=%d] "
-             "md[reg=%d smem=%d lmem=%d occ=%d]",
+             "md[reg=%d smem=%d lmem=%d occ=%d] "
+             "dna[reg=%d lmem=%d occ=%d occD=%d] "
+             "dn4[reg=%d lmem=%d occ=%d occD=%d] "
+             "dn4g[reg=%d lmem=%d occ=%d]",
              gu_regs, gu_smem, gu_lmem, gu_maxt, gu_occ,
              dn_regs, dn_smem, dn_lmem, dn_maxt, dn_occ,
              gd_regs, gd_lmem,
              mg_regs, mg_smem, mg_lmem, mg_occ,
-             md_regs, md_smem, md_lmem, md_occ);
+             md_regs, md_smem, md_lmem, md_occ,
+             dna_regs, dna_lmem, dna_occ, dna_occd,
+             dn4_regs, dn4_lmem, dn4_occ, dn4_occd,
+             dn4g_regs, dn4g_lmem, dn4g_occ);
     return buf;
 }
 
