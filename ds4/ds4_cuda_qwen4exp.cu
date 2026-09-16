@@ -4320,6 +4320,24 @@ __device__ __forceinline__ static void qw_gu_coop_raw_load(
     w[0] = lo.x; w[1] = lo.y; w[2] = lo.z; w[3] = lo.w;
     w[4] = hi.x; w[5] = hi.y; w[6] = hi.z; w[7] = hi.w;
 }
+
+/* A cooperative row is an aligned, verbatim q4_K byte panel. Read its
+ * sixteen-byte header as one uint4, just as the prefill slice decoder does,
+ * instead of issuing separate byte reads for this group's scale/min bits.
+ * The existing header accessor returns the same two six-bit integers and
+ * parity_store produces the same eight DP4A words. The half conversions,
+ * sign, float products and the caller's accumulation order are unchanged.
+ * This helper is only used with the shape-checked cooperative q4_K panel. */
+__device__ __forceinline__ static void qw_gu_coop_decode(
+        const uint4 *sh, uint32_t wrow, uint32_t g, const uint32_t *raw,
+        int8_t *dst, float *wa, float *wb) {
+    const uint4 hdr = sh[wrow * QW_GU_COOP_ROW_U4 + (g >> 3u) * 9u];
+    uint32_t sc, mn;
+    qw_q4k_header_scale_min(g & 7u, hdr.y, hdr.z, hdr.w, &sc, &mn);
+    wa[0] = dev_f16_to_f32((uint16_t)(hdr.x & 0xffffu)) * (float)sc;
+    wb[0] = -dev_f16_to_f32((uint16_t)(hdr.x >> 16u)) * (float)mn;
+    qw_q4k_parity_store(dst, raw, (g & 1u) * 4u);
+}
 /* ======================================================================== */
 
 /* The hard per-thread register cap for the routed gate/up decode kernel.
@@ -4344,7 +4362,11 @@ __device__ __forceinline__ static void qw_gu_coop_raw_load(
  * the measured floor, at which point gate/up occupancy is CLOSED for a real
  * reason rather than a mis-read one. */
 #if defined(__CUDACC__) && CUDART_VERSION >= 12040
-#define QW_GU_MAXNREG __maxnreg__(32)
+/* The four-row cooperative block is 256 threads. Forty registers keep all
+ * six resident blocks within GB10's 65536-register/1536-thread limits and
+ * let its word header decode keep both payload chains without spilling.
+ * Other schedules retain the original cap. */
+#define QW_GU_MAXNREG __maxnreg__((Coop && OutputRows == 4u) ? 40 : 32)
 #else
 #define QW_GU_MAXNREG
 #endif
@@ -4541,10 +4563,7 @@ qwen4exp_moe_gateup_split_kernel(
                 float wa[2] = {0.0f, 0.0f}; \
                 float wb[2] = {0.0f, 0.0f}; \
                 if (Coop) \
-                    dev_qwen4exp_group_decode_w((uint32_t)Type, \
-                        (const char *)(const void *) \
-                            &wsh[wrow * QW_GU_COOP_ROW_U4], g_, \
-                        (RAWP), wq, wa, wb); \
+                    qw_gu_coop_decode(wsh, wrow, g_, (RAWP), wq, wa, wb); \
                 else \
                     dev_qwen4exp_group_decode_w((uint32_t)Type, weight_row, g_, \
                                                 (RAWP), wq, wa, wb); \
