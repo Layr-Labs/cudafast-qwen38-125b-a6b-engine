@@ -32,34 +32,50 @@ static int compare_key_paths(ds4_gpu_tensor *out,ds4_gpu_tensor *ids,
     uint64_t ko=aligned(ki+(uint64_t)WIDTH*8u);
     uint64_t it=aligned(ko+(uint64_t)WIDTH*8u);
     uint64_t flag_at=aligned(it+(uint64_t)CAP*4u);
-    uint64_t *keys[2]={malloc(WIDTH*8u),malloc(WIDTH*8u)};
-    uint32_t *selected_ids[2]={malloc(CAP*4u),malloc(CAP*4u)};
-    float *values[2]={malloc(CAP*4u),malloc(CAP*4u)};
+    uint64_t *keys[4];for(unsigned i=0;i<4;i++)keys[i]=malloc(WIDTH*8u);
+    uint32_t *selected_ids[4];for(unsigned i=0;i<4;i++)selected_ids[i]=malloc(CAP*4u);
+    float *values[4];for(unsigned i=0;i<4;i++)values[i]=malloc(CAP*4u);
     unsigned char *score_canary=malloc(WIDTH*4u),*score_after=malloc(WIDTH*4u);
     need(score_canary&&score_after,"score witness allocation");
     memset(score_canary,0xa5,WIDTH*4u);
-    float before[DIM],after[DIM];uint32_t flags[2];int status[2];
-    need(keys[0]&&keys[1]&&selected_ids[0]&&selected_ids[1]&&values[0]&&values[1],"AB host allocation");
+    float before[DIM],after[DIM];uint32_t flags[4],winners[4];int status[4];
+    ds4_gpu_tensor *winner=ds4_gpu_tensor_alloc(4);need(winner!=NULL,"map test winner");
+    for(unsigned i=0;i<4;i++)need(keys[i]&&selected_ids[i]&&values[i],"AB host allocation");
     need(ds4_gpu_tensor_read(x,0,before,sizeof before),"AB input before");
-    for(unsigned mode=0;mode<2;mode++) {
-        if(mode==0)setenv("DS4_MTP_NO_FUSED_SCREEN_KEYS","1",1);
+    for(unsigned mode=0;mode<4;mode++) {
+        if(!(mode&1))setenv("DS4_MTP_NO_FUSED_SCREEN_KEYS","1",1);
         else unsetenv("DS4_MTP_NO_FUSED_SCREEN_KEYS");
         memset(values[mode],0x5a,CAP*4u);memset(selected_ids[mode],0xa5,CAP*4u);
         need(ds4_gpu_tensor_write(out,0,values[mode],CAP*4u)&&ds4_gpu_tensor_write(ids,0,selected_ids[mode],CAP*4u),"AB canary init");
         need(ds4_gpu_tensor_write(scratch,scores_at,score_canary,WIDTH*4u),"score witness init");
-        status[mode]=ds4_gpu_mtp_native_screen(out,ids,scratch,w,bytes,offset,DIM,VOCAB,PREFIX,TAIL,x);
+        status[mode]=(mode&2?ds4_gpu_mtp_native_screen_deferred:ds4_gpu_mtp_native_screen)(out,ids,scratch,w,bytes,offset,DIM,VOCAB,PREFIX,TAIL,x);
         need(status[mode]>=0,"AB backend success");
         need(ds4_gpu_tensor_read(scratch,scores_at,score_after,WIDTH*4u),"score witness read");
-        need(mode ? !memcmp(score_canary,score_after,WIDTH*4u) : memcmp(score_canary,score_after,WIDTH*4u)!=0,"actual fused/old dispatch witness");
+        need((mode&1) ? !memcmp(score_canary,score_after,WIDTH*4u) : memcmp(score_canary,score_after,WIDTH*4u)!=0,"actual fused/old dispatch witness");
         need(ds4_gpu_tensor_read(scratch,ki,keys[mode],WIDTH*8u)&&ds4_gpu_tensor_read(scratch,flag_at,&flags[mode],4),"AB keys/flag");
         need(ds4_gpu_tensor_read(out,0,values[mode],CAP*4u)&&ds4_gpu_tensor_read(ids,0,selected_ids[mode],CAP*4u),"AB outputs");
         need(ds4_gpu_tensor_read(x,0,after,sizeof after)&&!memcmp(before,after,sizeof before),"AB input unchanged");
+        winners[mode]=UINT32_MAX;
+        if(status[mode]>0) {
+            need(ds4_gpu_indexer_topk_tensor(winner,out,CAP,1,1),"AB top1");
+            need(mode&2 ? ds4_gpu_mtp_native_map_deferred(winner,out,ids,scratch,WIDTH,CAP,VOCAB)
+                : ds4_gpu_mtp_native_map(winner,out,ids,CAP,VOCAB),"AB map");
+            need(ds4_gpu_tensor_read(winner,0,&winners[mode],4),"AB winner read");
+        }
     }
-    need(status[0]==status[1]&&flags[0]==flags[1],"AB status/flag parity");
-    need(!memcmp(keys[0],keys[1],WIDTH*8u),"AB raw key parity");
-    need(!memcmp(values[0],values[1],CAP*4u)&&!memcmp(selected_ids[0],selected_ids[1],CAP*4u),"AB IDs/refinement or fallback canary parity");
-    int result=status[1];for(unsigned i=0;i<2;i++){free(keys[i]);free(selected_ids[i]);free(values[i]);}
-    free(score_canary);free(score_after);return result;
+    for(unsigned i=1;i<4;i++) {
+        need(flags[0]==flags[i]&&!memcmp(keys[0],keys[i],WIDTH*8u),"AB flag/raw key parity");
+        if(!flags[0] || i==1) {
+            need(status[0]==status[i],"AB status parity");
+            need(!memcmp(values[0],values[i],CAP*4u)&&!memcmp(selected_ids[0],selected_ids[i],CAP*4u),"AB IDs/refinement or synchronous canary parity");
+            need(winners[0]==winners[i],"AB mapped winner parity");
+        } else {
+            need(status[i]==CAP&&winners[i]==DS4_MTP_NATIVE_RETRY_ID,"deferred nonfinite marker");
+            for(unsigned j=0;j<CAP;j++)need(selected_ids[i][j]<VOCAB,"nonfinite keys still address valid rows");
+        }
+    }
+    int result=status[0];for(unsigned i=0;i<4;i++){free(keys[i]);free(selected_ids[i]);free(values[i]);}
+    ds4_gpu_tensor_free(winner);free(score_canary);free(score_after);return result;
 }
 static void run_case(int adversarial, uint32_t offset) {
     const uint64_t bytes=offset+(uint64_t)VOCAB*ROW;
@@ -134,6 +150,7 @@ static void run_case(int adversarial, uint32_t offset) {
     need(ds4_gpu_decode_graph_begin(&key)==-1,"graph warmup");
     need(ds4_gpu_decode_graph_begin(&key)==0,"capture start");
     need(ds4_gpu_mtp_native_screen(out,ids,scratch,w,bytes,offset,DIM,VOCAB,PREFIX,TAIL,x)==0,"capture declines screening");
+    need(ds4_gpu_mtp_native_screen_deferred(out,ids,scratch,w,bytes,offset,DIM,VOCAB,PREFIX,TAIL,x)==0,"capture declines deferred screening");
     need(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(full,w,bytes,offset,DIM,PREFIX,x,1),"captured static fallback");
     need(ds4_gpu_decode_graph_end(&key)==0,"capture end");
     ds4_gpu_decode_graphs_invalidate();

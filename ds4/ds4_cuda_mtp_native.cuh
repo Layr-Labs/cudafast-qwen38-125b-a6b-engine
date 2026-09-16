@@ -1,6 +1,7 @@
 /* Current native-head partial screening, then independent exact row dots.
  * Uses the original Q8_0 mapping; no transformed weight storage. New kernels
  * use ordinary stream ordering, not PDL: refinement reads freshly sorted IDs. */
+#include "ds4_mtp_native_contract.h"
 /* Refinement shortlist. 276 tail rows plus id 0 hold mandatory slots, so this
  * leaves 1771 score-selected candidates: the top 1.8% of the coarse ranking.
  * Narrowing it is a proposal-policy change, not an exact one. */
@@ -170,16 +171,18 @@ static bool mtp_native_key_range_disjoint(const void *a, uint64_t an,
 
 /* -1: backend error, 0: ordinary full-static fallback, positive: exact number
  * of sorted candidates whose FULL refined logits now occupy out. */
-extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
+static int mtp_native_screen_impl(ds4_gpu_tensor *out,
         ds4_gpu_tensor *ids, ds4_gpu_tensor *scratch, const void *map,
         uint64_t map_bytes, uint64_t offset, uint32_t in_dim, uint32_t vocab,
-        uint32_t prefix, uint32_t tail, const ds4_gpu_tensor *x) {
+        uint32_t prefix, uint32_t tail, const ds4_gpu_tensor *x,
+        bool defer_invalid) {
     const uint64_t wide = (uint64_t)prefix + tail;
     if (in_dim != MTP_NATIVE_DIM || !prefix || !tail || tail >= MTP_NATIVE_CAP ||
         prefix > vocab || tail > vocab - prefix || wide <= MTP_NATIVE_CAP ||
         wide > MTP_NATIVE_MAX_WIDTH || !cuda_q8_use_dp4a() ||
         getenv("DS4_QWEN4EXP_NO_ROW_TILE") != nullptr ||
-        getenv("DS4_QWEN4EXP_PAIR_LANES_R2") != nullptr) return 0;
+        getenv("DS4_QWEN4EXP_PAIR_LANES_R2") != nullptr ||
+        (defer_invalid && vocab > DS4_MTP_NATIVE_RETRY_ID)) return 0;
     const uint32_t width = (uint32_t)wide;
     const mtp_native_layout l = mtp_native_offsets(width);
     if (!out || !ids || !scratch || !x || !map ||
@@ -198,6 +201,13 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
                                           tier, "native MTP output");
     if (!w) return -1;
     if ((uintptr_t)w & 1u) return 0;
+    /* The flag must survive sorting/refinement until winner mapping. Keep
+     * the whole existing scratch allocation private on the deferred path. */
+    if (defer_invalid &&
+        (!mtp_native_key_range_disjoint(scratch->ptr,scratch->bytes,w,(uint64_t)vocab*80u*34u) ||
+         !mtp_native_key_range_disjoint(scratch->ptr,scratch->bytes,x->ptr,x->bytes) ||
+         !mtp_native_key_range_disjoint(scratch->ptr,scratch->bytes,out->ptr,out->bytes) ||
+         !mtp_native_key_range_disjoint(scratch->ptr,scratch->bytes,ids->ptr,ids->bytes))) return 0;
     char *base = (char *)scratch->ptr;
     int8_t *xq = (int8_t *)base;
     float *xs = (float *)(base + MTP_NATIVE_DIM);
@@ -229,9 +239,14 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
             key_in,flag,scores,width,prefix,tail,vocab);
         if (!cuda_ok(cudaGetLastError(),"native screen keys")) return -1;
     }
-    uint32_t invalid = 0;
-    if (!ds4_gpu_tensor_read(scratch,l.flag,&invalid,4)) return -1;
-    if (invalid) return 0;
+    if (!defer_invalid) {
+        uint32_t invalid = 0;
+        if (!ds4_gpu_tensor_read(scratch,l.flag,&invalid,4)) return -1;
+        if (invalid) return 0;
+    }
+    /* Even a nonfinite score packs a valid original ID. Sorting/refining
+     * that set is memory-safe; deferred mapping discards its winner and
+     * requests the unchanged full-static fallback when the flag is set. */
     size_t temporary = (size_t)(scratch->bytes-l.temporary);
     /* Rank on the high score word alone. Keys are written in row order, so
      * original IDs strictly increase over the whole input and the packed low
@@ -279,6 +294,20 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
         (const uint32_t *)ids->ptr,vocab,prefix,tail);
     return cuda_ok(cudaGetLastError(),"native exact refinement") ? (int)MTP_NATIVE_CAP : -1;
 }
+extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
+        ds4_gpu_tensor *ids, ds4_gpu_tensor *scratch, const void *map,
+        uint64_t map_bytes, uint64_t offset, uint32_t in_dim, uint32_t vocab,
+        uint32_t prefix, uint32_t tail, const ds4_gpu_tensor *x) {
+    return mtp_native_screen_impl(out,ids,scratch,map,map_bytes,offset,in_dim,
+                                  vocab,prefix,tail,x,false);
+}
+extern "C" int ds4_gpu_mtp_native_screen_deferred(ds4_gpu_tensor *out,
+        ds4_gpu_tensor *ids, ds4_gpu_tensor *scratch, const void *map,
+        uint64_t map_bytes, uint64_t offset, uint32_t in_dim, uint32_t vocab,
+        uint32_t prefix, uint32_t tail, const ds4_gpu_tensor *x) {
+    return mtp_native_screen_impl(out,ids,scratch,map,map_bytes,offset,in_dim,
+                                  vocab,prefix,tail,x,true);
+}
 __global__ static void mtp_native_map(uint32_t *winner, const float *logits,
                                       const uint32_t *ids, uint32_t count, uint32_t vocab) {
     const uint32_t bits = __float_as_uint(logits[0]);
@@ -298,4 +327,39 @@ extern "C" int ds4_gpu_mtp_native_map(ds4_gpu_tensor *winner,
     mtp_native_map<<<1,1,0,cuda_decode_stream()>>>((uint32_t *)winner->ptr,
         (const float *)logits->ptr,(const uint32_t *)ids->ptr,count,vocab);
     return cuda_ok(cudaGetLastError(),"native original winner map");
+}
+__global__ static void mtp_native_map_deferred(uint32_t *winner,
+        const float *logits, const uint32_t *ids, const uint32_t *invalid,
+        uint32_t count, uint32_t vocab) {
+    if (*invalid) {
+        winner[0] = DS4_MTP_NATIVE_RETRY_ID;
+        return;
+    }
+    const uint32_t bits = __float_as_uint(logits[0]);
+    const uint32_t packed = (bits & 0x7fffffffu) > 0x7f800000u ? 0u : winner[0];
+    const uint32_t original = packed < count ? ids[packed] : UINT32_MAX;
+    winner[0] = original < vocab ? original : UINT32_MAX;
+}
+extern "C" int ds4_gpu_mtp_native_map_deferred(ds4_gpu_tensor *winner,
+        const ds4_gpu_tensor *logits, const ds4_gpu_tensor *ids,
+        const ds4_gpu_tensor *scratch, uint32_t width,
+        uint32_t count, uint32_t vocab) {
+    if (!winner || !logits || !ids || !scratch || count != MTP_NATIVE_CAP ||
+        !vocab || vocab > DS4_MTP_NATIVE_RETRY_ID ||
+        width <= MTP_NATIVE_CAP || width > MTP_NATIVE_MAX_WIDTH ||
+        winner->bytes < 4 || logits->bytes < (uint64_t)count*4 ||
+        ids->bytes < (uint64_t)count*4) return 0;
+    const mtp_native_layout l = mtp_native_offsets(width);
+    if (scratch->bytes <= l.temporary ||
+        !mtp_native_key_range_disjoint(scratch->ptr,scratch->bytes,winner->ptr,winner->bytes) ||
+        !mtp_native_key_range_disjoint(scratch->ptr,scratch->bytes,logits->ptr,logits->bytes) ||
+        !mtp_native_key_range_disjoint(scratch->ptr,scratch->bytes,ids->ptr,ids->bytes)) return 0;
+    const int tier=ds4_tensor_device_idx(winner); int current=-1;
+    if (tier<0 || tier>=g_n_gpus || ds4_tensor_device_idx(logits)!=tier ||
+        ds4_tensor_device_idx(ids)!=tier || ds4_tensor_device_idx(scratch)!=tier ||
+        cudaGetDevice(&current)!=cudaSuccess || current!=g_gpu[tier].device_id) return 0;
+    mtp_native_map_deferred<<<1,1,0,cuda_decode_stream()>>>((uint32_t *)winner->ptr,
+        (const float *)logits->ptr,(const uint32_t *)ids->ptr,
+        (const uint32_t *)((const char *)scratch->ptr+l.flag),count,vocab);
+    return cuda_ok(cudaGetLastError(),"native deferred original winner map");
 }
