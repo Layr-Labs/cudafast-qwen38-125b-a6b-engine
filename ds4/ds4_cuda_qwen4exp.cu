@@ -4672,11 +4672,41 @@ qwen4exp_moe_gateup_split_kernel(
         const char *const ub = up +
             (uint64_t)expert * up_expert_bytes +
             (uint64_t)row0 * up_row_bytes;
+        /* THE PANEL ARRIVES BY cp.async, NOT THROUGH THE REGISTER FILE.
+         *
+         * The fill above was a global -> register -> shared round trip: each
+         * thread materialised two uint4 in registers only to store them
+         * straight back out.  This kernel carries QW_GU_MAXNREG, a hard
+         * __maxnreg__(32) cap, so those eight staging registers are the most
+         * expensive eight in the block -- and the cap already forces a small
+         * local-memory spill.  cp.async moves the sixteen bytes from global to
+         * shared without ever naming a register.
+         *
+         * The .ca helper, not .cg: this tree measured this exact fetch map at
+         * 161.5 GB/s cached against 133.8 streaming, and the panel is read by
+         * every warp in the block, so it wants the L1.
+         *
+         * Alignment is already a precondition of this instantiation, not a new
+         * assumption.  The launcher refuses the coop schedule unless `gate` and
+         * `up` are 16-byte aligned, `expert_bytes` is a multiple of sixteen and
+         * `row_bytes` is exactly QW_GU_COOP_ROW_U4 * 16, and the belt-to-that-
+         * brace test at the top of this block re-checks all three; `wcoop` is
+         * declared __align__(16).  So every address this issues is 16-byte
+         * aligned, which is what the 16-byte form requires.
+         *
+         * BIT-IDENTICAL: the same bytes from the same addresses land in the
+         * same shared words before the same barrier.  cp.async is data
+         * movement and decodes nothing, so no dot product sees a different
+         * operand and nothing is reassociated. */
         for (uint32_t i = threadIdx.x; i < words; i += blockDim.x) {
-            wcoop[i] = *(const uint4 *)(const void *)(gb + (uint64_t)i * 16u);
-            wcoop[QW_GU_COOP_U4 + i] =
-                *(const uint4 *)(const void *)(ub + (uint64_t)i * 16u);
+            qw_cpasync16((uint32_t)__cvta_generic_to_shared(&wcoop[i]),
+                         gb + (uint64_t)i * 16u);
+            qw_cpasync16(
+                (uint32_t)__cvta_generic_to_shared(&wcoop[QW_GU_COOP_U4 + i]),
+                ub + (uint64_t)i * 16u);
         }
+        qw_cpasync_commit();
+        qw_cpasync_wait0();
         __syncthreads();
         wsh = wcoop + (second ? QW_GU_COOP_U4 : 0u);
         wrow = warp >> 1u;
