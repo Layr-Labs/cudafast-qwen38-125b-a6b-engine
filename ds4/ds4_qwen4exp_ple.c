@@ -689,21 +689,46 @@ static const int8_t ple_kvalues_iq4nl[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
 };
 
+/* The same table pre-expanded so the high nibble is a direct byte index
+ * instead of a shift.  kv_hi[b] == ple_kvalues_iq4nl[b >> 4] for all 256
+ * byte values; it is built at load and never written again.  The dequant
+ * emits 640 bytes of floats for every 90 bytes it reads, so it is store-bound
+ * and this is a small win at best -- but it removes a shift per element from
+ * the hot loop without changing a single output value. */
+static int8_t ple_kvalues_iq4nl_hi[256];
+static void ple_kvalues_iq4nl_hi_init(void) {
+    for (int i = 0; i < 256; i++) ple_kvalues_iq4nl_hi[i] = ple_kvalues_iq4nl[i >> 4];
+}
+
+/* FP16 -> FP32 with no data-dependent loop.
+ *
+ * The shipped converter normalised a subnormal mantissa with
+ * `while ((m & 0x400u) == 0) { m <<= 1; e++; }`.  For the block scales this
+ * table actually carries the loop never runs, so its cost is the branch, not
+ * the shift -- and it is an unpredictable one on the rare subnormal.  A
+ * subnormal has at most ten significant mantissa bits, so the normalising
+ * shift is exactly `__builtin_clz` of the mantissa over a 16-bit field, and
+ * the whole conversion becomes a select plus a shift.
+ *
+ * Bit-identical to the loop for every one of the 65536 possible halves: the
+ * shift amount is the same, the exponent adjustment is the same, and the
+ * mantissa mask is the same.  Verified against the original over the full
+ * 16-bit domain. */
 static float ple_fp16_to_fp32(uint16_t h) {
     const uint32_t sign     = (uint32_t)(h & 0x8000u) << 16;
     const uint32_t exponent = (h >> 10) & 0x1Fu;
     const uint32_t mantissa = h & 0x3FFu;
     uint32_t bits;
 
-    if (exponent == 0) {
-        if (mantissa == 0) {
+    if (exponent == 0u) {
+        if (mantissa == 0u) {
             bits = sign;
         } else {
-            /* Subnormal: normalize it into a float32 exponent. */
-            uint32_t e = 0;
-            uint32_t m = mantissa;
-            while ((m & 0x400u) == 0) { m <<= 1; e++; }
-            m &= 0x3FFu;
+            /* A ten-bit mantissa needs (10 - k) shifts to bring bit 10 up,
+             * where k is its highest set bit, and clz(m) = 31 - k, so the
+             * shift count is clz(m) - 21. */
+            const uint32_t e = (uint32_t)__builtin_clz(mantissa) - 21u;
+            const uint32_t m = (mantissa << e) & 0x3FFu;
             bits = sign | ((127u - 15u - e + 1u) << 23) | (m << 13);
         }
     } else if (exponent == 0x1Fu) {
@@ -717,11 +742,27 @@ static float ple_fp16_to_fp32(uint16_t h) {
     return f;
 }
 
-void ds4_ple_dequant_iq4_nl(const void *blocks, size_t block_count, float *out) {
-    const uint8_t *p = (const uint8_t *)blocks;
+/* `blocks` and `out` never alias: the caller passes a const view of the
+ * memory-mapped shard and a disjoint host staging buffer.  Saying so lets
+ * the compiler keep the scale and the nibble byte live across the stores
+ * instead of assuming a store may have overwritten the source. */
+void ds4_ple_dequant_iq4_nl(const void *__restrict blocks, size_t block_count,
+                            float *__restrict out) {
+    const uint8_t *__restrict p = (const uint8_t *)blocks;
     if (!p || !out) return;
 
+    static int hi_ready = 0;
+    if (!hi_ready) { ple_kvalues_iq4nl_hi_init(); hi_ready = 1; }
+
+    const int8_t *const kv = ple_kvalues_iq4nl;
     for (size_t b = 0; b < block_count; b++) {
+        /* The caller walks a token row as five consecutive blocks, so the
+         * next block's eighteen bytes are the next thing this loop touches.
+         * Asking for them one iteration early costs one hint and hides the
+         * latency of the scale load and the nibble fetch behind the current
+         * block's dequant.  Pure hint: the values produced are unchanged. */
+        if (b + 1u < block_count)
+            __builtin_prefetch(p + DS4_PLE_IQ4_NL_BLOCK_BYTES, 0, 1);
         uint16_t half;
         memcpy(&half, p, sizeof(half));
         const float d = ple_fp16_to_fp32(half);
@@ -729,8 +770,8 @@ void ds4_ple_dequant_iq4_nl(const void *blocks, size_t block_count, float *out) 
         float *y = out + b * DS4_PLE_IQ4_NL_BLOCK_ELEMS;
 
         for (int j = 0; j < DS4_PLE_IQ4_NL_BLOCK_ELEMS / 2; j++) {
-            y[j]      = d * (float)ple_kvalues_iq4nl[qs[j] & 0x0F];
-            y[j + 16] = d * (float)ple_kvalues_iq4nl[qs[j] >> 4];
+            y[j]      = d * (float)kv[qs[j] & 0x0F];
+            y[j + 16] = d * (float)ple_kvalues_iq4nl_hi[qs[j]];
         }
         p += DS4_PLE_IQ4_NL_BLOCK_BYTES;
     }
