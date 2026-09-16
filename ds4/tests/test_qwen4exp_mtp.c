@@ -2273,6 +2273,134 @@ static int build_shortlist_head(ds4_qwen4exp_mtp_head *h) {
     return ds4_qwen4exp_mtp_head_init(h, g_err, sizeof(g_err));
 }
 
+/* Last-only hook wiring has a nontrivial block: attention publishes every
+ * row and couples later outputs to their prefix, while the FFN is row-local.
+ * The production encoder itself is covered by test_qwen4exp_head_block_host. */
+static struct {
+    float cache[8 * HEAD_HC_DIM];
+    unsigned full_calls, last_calls, cache_calls, attn_rows, ffn_rows;
+    uint32_t pos;
+    bool fail_last;
+} tail_probe;
+static void tail_attention(ds4_gpu_tensor *hyper,uint32_t pos,uint32_t rows) {
+    float *x=(float *)hyper->data;
+    tail_probe.attn_rows=rows;tail_probe.pos=pos;
+    memcpy(tail_probe.cache,x,(size_t)rows*HEAD_HC_DIM*sizeof(float));
+    float prefix=0;
+    for (uint32_t t=0;t<rows;t++) {
+        prefix+=x[t*HEAD_HC_DIM];
+        for (uint32_t d=0;d<HEAD_HC_DIM;d++)
+            x[t*HEAD_HC_DIM+d]+=prefix*0.125f+(float)(pos+t)*0.03125f;
+    }
+}
+static void tail_ffn(ds4_gpu_tensor *hyper,uint32_t rows) {
+    float *x=(float *)hyper->data;tail_probe.ffn_rows=rows;
+    for (uint32_t t=0;t<rows;t++) for (uint32_t d=0;d<HEAD_HC_DIM;d++)
+        x[t*HEAD_HC_DIM+d]=x[t*HEAD_HC_DIM+d]*0.5f+(float)(d+1)*0.25f;
+}
+static int tail_full(void *graph,void *cache,ds4_gpu_tensor *hyper,
+                     uint32_t il,uint32_t pos,uint32_t rows) {
+    (void)graph;(void)cache;CHECK(il==HEAD_BLOCK_IL,"full head layer");
+    tail_probe.full_calls++;tail_attention(hyper,pos,rows);tail_ffn(hyper,rows);
+    return 1;
+}
+static int tail_last(void *graph,void *cache,ds4_gpu_tensor *hyper,
+        ds4_gpu_tensor *last,uint32_t il,uint32_t pos,uint32_t rows) {
+    (void)graph;(void)cache;CHECK(il==HEAD_BLOCK_IL,"last head layer");
+    tail_probe.last_calls++;tail_attention(hyper,pos,rows);
+    if (tail_probe.fail_last) return 0;
+    if (!ds4_gpu_tensor_copy(last,0,hyper,(uint64_t)(rows-1)*HEAD_HC_DIM*sizeof(float),
+                             HEAD_HC_DIM*sizeof(float))) return 0;
+    tail_ffn(last,1);return 1;
+}
+static int tail_cache(void *graph,void *cache,ds4_gpu_tensor *hyper,
+                      uint32_t il,uint32_t pos,uint32_t rows) {
+    (void)graph;(void)cache;(void)il;tail_probe.cache_calls++;
+    tail_attention(hyper,pos,rows);return 1;
+}
+static void test_head_last_ffn(void) {
+    printf("last-only block: batched input/attention and final-row outputs\n");
+    CHECK(unsetenv("DS4_QWEN4EXP_NO_MTP_FFN_TAIL")==0,"clear FFN-tail valve");
+    enum { N=8 };
+    const uint32_t positions[]={0,3,4,2047,2048};
+    int tokens[N],full_draft[N],last_draft[2];
+    float input[N*HEAD_HC_DIM],full[N*HEAD_HC_DIM],last[HEAD_HC_DIM+4];
+    for (unsigned t=0;t<N;t++) tokens[t]=(int)(t%HEAD_N_VOCAB);
+    for (unsigned i=0;i<N*HEAD_HC_DIM;i++) input[i]=(float)((int)(i%17)-8)*0.125f;
+    ds4_qwen4exp_mtp_head h;
+    CHECK(build_shortlist_head(&h)==0,"initial head: %s",g_err);
+    ds4_qwen4exp_mtp_head_free(&h);
+    h.max_tokens=N;h.cache_seed_capacity=N;
+    h.hooks.block=tail_full;h.hooks.block_last=tail_last;h.hooks.cache_seed=tail_cache;
+    CHECK(ds4_qwen4exp_mtp_head_init(&h,g_err,sizeof(g_err))==0,"wide head: %s",g_err);
+    for (unsigned rows=1;rows<=N;rows++) for (unsigned p=0;p<5;p++) {
+        memset(&tail_probe,0,sizeof(tail_probe));memset(&g_log,0,sizeof(g_log));
+        CHECK(ds4_qwen4exp_mtp_head_forward(&h,tokens,input,positions[p],rows,
+                full_draft,full,g_err,sizeof(g_err))==0,"full forward: %s",g_err);
+        CHECK(tail_probe.full_calls==1 && !tail_probe.last_calls,"all-output fallback");
+        float saved_cache[N*HEAD_HC_DIM];memcpy(saved_cache,tail_probe.cache,sizeof(saved_cache));
+        memset(&tail_probe,0,sizeof(tail_probe));memset(&g_log,0,sizeof(g_log));
+        for (unsigned i=0;i<HEAD_HC_DIM+4;i++) last[i]=12345.0f;
+        last_draft[0]=-1;last_draft[1]=12345;
+        CHECK(ds4_qwen4exp_mtp_head_forward_last(&h,tokens,input,positions[p],rows,
+                last_draft,last,g_err,sizeof(g_err))==0,"last forward: %s",g_err);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        const bool narrow=rows>1 && rows<=DS4_QWEN4EXP_MTP_MAX_COMMIT;
+#else
+        const bool narrow=false;
+#endif
+        CHECK(tail_probe.last_calls==(narrow?1u:0u) && tail_probe.full_calls==(narrow?0u:1u),
+              "wrong last-only hook dispatch for width %u",rows);
+        CHECK(tail_probe.attn_rows==rows && tail_probe.ffn_rows==(narrow?1u:rows) &&
+              tail_probe.pos==positions[p],"attention batch or tail shape changed");
+        CHECK(g_log.mm_ntok[0]==(uint64_t)rows*HEAD_N_HC,"EH projection batch changed");
+        CHECK(!memcmp(saved_cache,tail_probe.cache,sizeof(saved_cache)),"seed cache changed");
+        CHECK(last_draft[0]==full_draft[rows-1],"last proposal differs");
+        CHECK(!memcmp(last,full+(rows-1)*HEAD_HC_DIM,HEAD_HC_DIM*sizeof(float)),
+              "multi_out did not read the completed final row");
+        CHECK(last_draft[1]==12345,"draft output overrun");
+        for (unsigned i=HEAD_HC_DIM;i<HEAD_HC_DIM+4;i++) CHECK(last[i]==12345.0f,"multi output overrun");
+        /* Same-binary ablation must restore all FFN rows while preserving
+         * the full attention/cache updates and the final-row output. */
+        CHECK(setenv("DS4_QWEN4EXP_NO_MTP_FFN_TAIL","1",1)==0,"set FFN-tail valve");
+        memset(&tail_probe,0,sizeof(tail_probe));memset(&g_log,0,sizeof(g_log));
+        CHECK(ds4_qwen4exp_mtp_head_forward_last(&h,tokens,input,positions[p],rows,
+                last_draft,last,g_err,sizeof(g_err))==0,"disabled tail: %s",g_err);
+        CHECK(tail_probe.full_calls==1 && !tail_probe.last_calls &&
+              tail_probe.attn_rows==rows && tail_probe.ffn_rows==rows,
+              "disabled tail did not restore full batch");
+        CHECK(!memcmp(saved_cache,tail_probe.cache,sizeof(saved_cache)),"disabled seed cache changed");
+        CHECK(last_draft[0]==full_draft[rows-1] && last_draft[1]==12345,
+              "disabled draft/guard differs");
+        CHECK(!memcmp(last,full+(rows-1)*HEAD_HC_DIM,HEAD_HC_DIM*sizeof(float)),
+              "disabled final row differs");
+        for (unsigned i=HEAD_HC_DIM;i<HEAD_HC_DIM+4;i++) CHECK(last[i]==12345.0f,"disabled output guard");
+        CHECK(unsetenv("DS4_QWEN4EXP_NO_MTP_FFN_TAIL")==0,"restore FFN-tail valve");
+    }
+    memset(&tail_probe,0,sizeof(tail_probe));memset(&g_log,0,sizeof(g_log));
+    h.hooks.block_last=NULL;
+    CHECK(ds4_qwen4exp_mtp_head_forward_last(&h,tokens,input,3,2,last_draft,last,g_err,sizeof(g_err))==0,
+          "optional-hook fallback: %s",g_err);
+    CHECK(tail_probe.full_calls==1 && !tail_probe.last_calls,"missing-hook dispatch");
+    h.hooks.block_last=tail_last;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    memset(&tail_probe,0,sizeof(tail_probe));memset(&g_log,0,sizeof(g_log));
+    tail_probe.fail_last=true;
+    CHECK(ds4_qwen4exp_mtp_head_forward_last(&h,tokens,input,3,2,last_draft,last,g_err,sizeof(g_err))<0,
+          "partial block failure was swallowed");
+    CHECK(tail_probe.last_calls==1 && !tail_probe.full_calls && tail_probe.attn_rows==2,
+          "partially advanced block must not be retried");
+#endif
+    memset(&tail_probe,0,sizeof(tail_probe));memset(&g_log,0,sizeof(g_log));
+    ds4_gpu_tensor device={sizeof(input),(unsigned char *)input,1};
+    CHECK(ds4_qwen4exp_mtp_head_seed_cache(&h,tokens,&device,0,3,2,g_err,sizeof(g_err))==0,
+          "cache-only forward: %s",g_err);
+    CHECK(tail_probe.cache_calls==1 && !tail_probe.last_calls && !tail_probe.full_calls,
+          "cache-only call reached an output block");
+    ds4_qwen4exp_mtp_head_free(&h);
+    printf("  8 widths x 5 positions, cache-only and partial-failure contracts pass\n");
+}
+
 /* The composition oracle: the FULL-vocabulary logits the head's own algebra
  * produces for one row over the stub tables -- the same walk
  * test_head_wiring checks the wide forward against. */
@@ -2578,6 +2706,7 @@ int main(void) {
     test_deferred_frontier_logits();
     printf("\n");
     test_head_wiring();
+    test_head_last_ffn();
     printf("\n");
     test_draft_vocab_shortlist();
     printf("\n");

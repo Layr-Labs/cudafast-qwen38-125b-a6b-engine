@@ -1107,6 +1107,12 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
     const uint32_t out_rows = n_tokens - first_row;
     const bool narrow_logits = last_only && n_tokens > 1u &&
         n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    const bool narrow_ffn = !cache_only && narrow_logits && h->hooks.block_last &&
+        getenv("DS4_QWEN4EXP_NO_MTP_FFN_TAIL") == NULL;
+#else
+    const bool narrow_ffn = false;
+#endif
     const uint32_t logit_rows = narrow_logits ? 1u : n_tokens;
     const uint32_t logit_first = narrow_logits ? 0u : first_row;
     /* The draft shortlist, fixed at init.  Zero keeps the whole vocabulary;
@@ -1210,7 +1216,14 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                                   h->t_ehx, (uint64_t)n_tokens * n_hc) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_EH_PROJ);
-    if (ok) {
+    if (ok && narrow_ffn) {
+        /* EH and attention retain their full batch. The block moves the
+         * existing last-row copy to just before its stateless FFN tail. */
+        stage = "last-only block";
+        ok = h->hooks.block_last(h->graph, h->cache, h->t_hyper,
+                                  h->t_h_normed, h->block_index,
+                                  pos0, n_tokens) != 0;
+    } else if (ok) {
         stage = "block";
         ds4_qwen4exp_block_forward_fn block = cache_only
             ? h->hooks.cache_seed : h->hooks.block;
@@ -1229,8 +1242,9 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
     }
     /* t_h_normed's previous contents were consumed by eh_proj.  Reuse it for
      * the final hyper row so the stateless tail needs neither tensor views
-     * nor an extra allocation.  Keep t_hyper intact for multi_out. */
-    if (ok && narrow_logits) {
+     * nor an extra allocation. The last-only block already wrote its final
+     * row there; multi_out must read that same completed row. */
+    if (ok && narrow_logits && !narrow_ffn) {
         stage = "last head row";
         ok = ds4_gpu_tensor_copy(h->t_h_normed, 0, h->t_hyper,
                                   (uint64_t)first_row * hc_dim * f,
@@ -1398,8 +1412,8 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
     MTP_HEAD_TICK(MTP_HEAD_T_LOGIT0_IN);
     if (ok && multi_out) {
         stage = "multi readback";
-        ok = ds4_gpu_tensor_read(h->t_hyper,
-                                 (uint64_t)first_row * hc_dim * f, multi_out,
+        ok = ds4_gpu_tensor_read(narrow_ffn ? h->t_h_normed : h->t_hyper,
+                                 narrow_ffn ? 0u : (uint64_t)first_row * hc_dim * f, multi_out,
                                  (uint64_t)out_rows * hc_dim * f) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_MULTI_OUT);
