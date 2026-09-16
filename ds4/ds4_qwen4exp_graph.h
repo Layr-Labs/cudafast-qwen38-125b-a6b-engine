@@ -261,6 +261,11 @@ bool ds4_qwen4exp_session_add_head_block(ds4_qwen4exp_session             *s,
 int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
                                   ds4_gpu_tensor *hyper, uint32_t il,
                                   uint32_t pos0, uint32_t n_tokens);
+/* Last-only FFN entry. The weight context is immutable for its session's
+ * graph lifetime; input and last-output tensor identities enter the key. */
+int ds4_qwen4exp_graph_head_block_last(void *graph, void *cache,
+        ds4_gpu_tensor *hyper, ds4_gpu_tensor *last_hyper, uint32_t il,
+        uint32_t pos0, uint32_t n_tokens);
 
 #endif /* DS4_QWEN4EXP_GRAPH_H */
 
