@@ -12492,7 +12492,7 @@ __global__ static void __launch_bounds__(256, 2) qwen4exp_qsa2_attention_group_k
 #define QWEN4EXP_QSA3_KEYS_PER_THREAD 2u
 #endif
 #ifndef QWEN4EXP_QSA3_KSTEP
-#define QWEN4EXP_QSA3_KSTEP 4u
+#define QWEN4EXP_QSA3_KSTEP 8u
 #endif
 #ifndef QWEN4EXP_QSA3_VSTEP
 #define QWEN4EXP_QSA3_VSTEP 8u
