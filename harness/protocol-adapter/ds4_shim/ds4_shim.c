@@ -142,7 +142,7 @@ ds4s_handle *ds4s_open(const char *model_path, const char *mtp_head_path,
      */
     if (getenv("DS4_SHIM_NO_WARMUP") == NULL) {
         const int vocab = ds4s_vocab_size(h);
-        enum { WARM_PROMPT = 1024, WARM_ROUNDS = 4, WARM_CAP = 8 };
+        enum { WARM_PROMPT = 1024, WARM_ROUNDS = 24, WARM_CAP = 8 };
         if (vocab > 16) {
             int32_t *ids = (int32_t *)malloc((size_t)WARM_PROMPT * sizeof(*ids));
             if (ids) {
@@ -157,11 +157,39 @@ ds4s_handle *ds4s_open(const char *model_path, const char *mtp_head_path,
                     if (mtp_draft_tokens >= 1) {
                         int32_t out[WARM_CAP];
                         int32_t t = ds4s_argmax(h);
+                        /* WARM BOTH OUTCOMES, NOT JUST THE ACCEPTING ONE.
+                         *
+                         * The captured-graph cache is keyed per layer and
+                         * island on a variant word that folds the batch width,
+                         * the snapshot count and the recurrent replay state,
+                         * and the lookup has no eviction: an identity that is
+                         * seen for the first time inside the timed window pays
+                         * a full eager pass plus an end-capture and an
+                         * instantiate THERE, where it is measured.
+                         *
+                         * Following the chain with `t = out[n - 1]` feeds the
+                         * drafter its own accepted token every round, so the
+                         * warm-up only ever takes the ACCEPTING branch and
+                         * reaches one generation of head-block identities. The
+                         * rejecting branch carries a different snapshot count
+                         * and the other recurrent parity, and those identities
+                         * were therefore still being captured during the
+                         * measured decode. Alternating between following the
+                         * chain and breaking it with an unrelated id walks both
+                         * branches here, before the socket is bound, which is
+                         * the whole point of having a warm-up at all.
+                         *
+                         * Still input-independent: the break token comes from
+                         * the same fixed arithmetic sequence as the prompt, not
+                         * from any request. Still best-effort, and the
+                         * invalidate below resets the session either way, so
+                         * this cannot reach the scored stream. */
                         for (int r = 0; r < WARM_ROUNDS; r++) {
                             const int n = ds4s_eval_speculative(h, t, 2, out,
                                                                 WARM_CAP);
                             if (n <= 0) break;
-                            t = out[n - 1];
+                            t = (r & 1) ? out[n - 1]
+                                        : ids[(r * 37 + 11) % WARM_PROMPT];
                         }
                     }
                 }

@@ -1332,8 +1332,12 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                                   draft_width, h->n_vocab) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_TOP1);
-    if (ok) ok = ds4_gpu_end_commands() != 0;
-    else (void)ds4_gpu_synchronize();
+    /* The top-1 read below is a synchronous host copy on the legacy stream,
+     * and the head-block replay it depends on runs on a blocking stream, so
+     * the copy already observes finished results.  Committing first only adds
+     * a wait the copy would have performed itself.  The failure path keeps its
+     * synchronise, because there the copy is skipped. */
+    if (!ok) (void)ds4_gpu_synchronize();
     MTP_HEAD_TICK(MTP_HEAD_T_END);
 
     /* A narrowed projection writes its sole result at logit row zero;

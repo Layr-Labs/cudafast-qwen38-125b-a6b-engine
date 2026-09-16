@@ -3041,8 +3041,15 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     }
     QW_TRACE(QW_SLICE_HEAD);
     QW_TRACE_REPORT(n_tokens);
-    /* Commit and wait: the logits are read on the host from here on. */
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
+    /* Commit and wait: the logits are read on the host from here on.
+     *
+     * One wait, not two.  `ds4_gpu_end_commands` IS a device synchronise
+     * unless the end-stream-sync valve is armed, and that valve is read from
+     * an environment name this tree sets nowhere.  The short circuit means
+     * the second call could only run after the first had already returned,
+     * with no work enqueued in between, so it waits on an idle device and
+     * observes nothing.  Every read below is a synchronous host copy anyway. */
+    if (!ds4_gpu_end_commands()) {
         fprintf(stderr, "ds4: qwen4exp command batch did not complete\n");
         return false;
     }
@@ -3359,7 +3366,7 @@ int ds4_qwen4exp_graph_head_cache(void *graph, void *cache,
     if (ok) ok = qwen4exp_graph_head_cache_encode(s, c->l, c->m, il, n_tokens);
     s->hyper = saved_hyper;
     s->pos = saved_pos;
-    if (s->d_pos && !ds4_gpu_qwen4exp_update_dpos(s->d_pos, s->pos)) ok = false;
+    /* Dead store: see the note on the head block's position restore. */
     if (ok) s->head_cache_pos = pos0 + n_tokens;
     if (!ok) fprintf(stderr, "ds4: qwen4exp native head cache publication failed\n");
     return ok ? 1 : 0;
@@ -3467,9 +3474,30 @@ int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
         memset(&key, 0, sizeof(key));
         key.il = il;
         key.island = 3u;
+        /* THE HEAD'S IDENTITY IS ITS WIDTH, AND NOTHING ELSE.
+         *
+         * The variant word folds the width, the snapshot count, the recurrent
+         * buffer parity and the replay-active flag.  The last two belong to the
+         * TOWER: `gdn_replay_active` is read only inside the gated-deltanet
+         * encode, and the parity exists because the settle swaps the state and
+         * checkpoint pointers, so a tower graph really does bake a different
+         * buffer per parity.  The head block reads neither.  It refuses any
+         * layer that is not full attention, so it never touches a recurrent
+         * buffer at all, and its encode is the residual mixer, the query-scaled
+         * attention, the inject, the feed-forward mixer and the routed experts
+         * -- none of which see the replay state.
+         *
+         * So the captures for (width, parity 0, active) and (width, parity 1,
+         * active) are byte-identical graphs filed under different keys, and
+         * carrying the two tower fields multiplies this row's identity space by
+         * four for nothing: eight identities where two, one per draft width,
+         * are the whole space.  The lookup is a linear scan with no eviction,
+         * so a row that fills drops its island onto the eager path for the rest
+         * of the process, and every identity first seen inside the timed window
+         * pays a capture there.  Passing the tower fields as zero is the same
+         * set of graphs, keyed by what actually distinguishes them. */
         key.variant = ds4_qwen4exp_gdn_graph_variant(
-            n_tokens, s->spec_snapshot_rows, s->gdn_replay_phase,
-            s->gdn_replay_active);
+            n_tokens, s->spec_snapshot_rows, 0u, false);
         key._pad = 0x4d545048u;
         key.cur_hc = hyper;
         key.after_attn_hc = s;
@@ -3498,10 +3526,14 @@ int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
 
     s->hyper = saved_hyper;
     s->pos = saved_pos;
-    if (s->d_pos && !ds4_gpu_qwen4exp_update_dpos(s->d_pos, s->pos)) {
-        stage = "position restore";
-        ok = false;
-    }
+    /* The device position is written by every entry point BEFORE any kernel
+     * that reads it: the forward writes it ahead of the layer loop, the head
+     * cache ahead of its encode and the head block ahead of its own.  The
+     * readers are the query-scaled attention block and the head cache encode,
+     * and nothing else dereferences it.  So the value this restore leaves is
+     * overwritten before it can be observed, and the restore is a dead store:
+     * a one-thread launch per head-block call whose result no reader sees.
+     * The host-side `s->pos` restore above is live and stays. */
     if (!ok) {
         fprintf(stderr, "ds4: qwen4exp head block %u failed at the %s\n",
                 il, stage);
@@ -3868,7 +3900,8 @@ static int qwen4exp_rb_ple_conv_select(void *ctx, uint32_t row) {
     const bool ok = ds4_gpu_tensor_copy(s->ple_conv_state, 0,
                                         s->ple_conv_snapshot,
                                         (uint64_t)row * bytes, bytes) != 0;
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) return -1;
+    /* One wait, not two: see the note on the verify commit above. */
+    if (!ds4_gpu_end_commands()) return -1;
     return ok ? 0 : -1;
 }
 static int qwen4exp_rb_qsa_kv_truncate(void *ctx, uint32_t pos) {
