@@ -4159,7 +4159,12 @@ qwen4exp_moe_gateup_mma_kernel(
  * The activation is the routed intermediate, quantised per (token, slot) pair,
  * so the pair index addresses it directly.
  */
-template <int DownType = -1, bool Wide6 = false>
+/* Bound each down CTA to one 32-pair window, reusing the task list already
+ * built for gate/up. This changes scheduling only: the same expert weights,
+ * pair indices, K walk and partial addresses are retained. Each (pair,row)
+ * still has one writer. Heavy experts can occupy multiple SMs in the token
+ * direction instead of extending a few CTAs through an arbitrary count. */
+template <int DownType = -1, bool Wide6 = false, bool PairTasks = false>
 __global__ __launch_bounds__(QW_DOWN_MMA_THREADS) static void
 qwen4exp_moe_down_mma_kernel(
         float *partial,
@@ -4190,8 +4195,8 @@ qwen4exp_moe_down_mma_kernel(
     const uint32_t row0 = blockIdx.x * QW_DOWN_MMA_BM;
     if (row0 >= out_dim) return;
     if (active && (int32_t)blockIdx.y >= active[0]) return;
-    const uint32_t expert = active ? (uint32_t)active[1 + blockIdx.y]
-                                   : blockIdx.y;
+    const uint32_t expert = active
+        ? (uint32_t)active[1 + (PairTasks ? 2u : 1u) * blockIdx.y] : blockIdx.y;
     const int32_t cnt = counts[expert];
     if (cnt <= 0) return;
     const int32_t base = offsets[expert];
@@ -4211,7 +4216,9 @@ qwen4exp_moe_down_mma_kernel(
     const bool w_dq = dq_stage != 0u &&
                       dtype == (uint32_t)DS4_QWEN4EXP_TY_q5_1;
 
-    for (int32_t nbase = 0; nbase < cnt; nbase += QW_MMA_BN) {
+    const int32_t first_pair = PairTasks ? active[2u + 2u * blockIdx.y] : 0;
+    const int32_t end_pair = PairTasks ? min(cnt, first_pair + QW_MMA_BN) : cnt;
+    for (int32_t nbase = first_pair; nbase < end_pair; nbase += QW_MMA_BN) {
         const int32_t take = (cnt - nbase) < QW_MMA_BN ? (cnt - nbase)
                                                        : QW_MMA_BN;
         for (uint32_t i = tid; i < QW_MMA_BN; i += QW_DOWN_MMA_THREADS) {
@@ -7859,14 +7866,22 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
          * loads; DS4_QWEN4EXP_NO_Q51_WIDE_LOAD restores the word loop. */
         const bool dn_wide6 =
             getenv("DS4_QWEN4EXP_NO_Q51_WIDE_LOAD") == NULL;
-#define QWEN4EXP_DOWN_MMA(DT, W6) \
-        qwen4exp_moe_down_mma_kernel<DT, W6><<< \
-                dim3(out_dim / QW_DOWN_MMA_BM, gu_rows, 1), \
+        /* use_mma guarantees the existing producer issued gu_tasks above;
+         * the same stream orders that publication before this consumer. */
+        const bool down_pair_tasks = use_mma && pair_tasks &&
+            getenv("DS4_QWEN4EXP_NO_DOWN_PAIR_TASKS") == NULL;
+#define QWEN4EXP_DOWN_MMA_IMPL(DT, W6, TASKS) \
+        qwen4exp_moe_down_mma_kernel<DT, W6, TASKS><<< \
+                dim3(out_dim / QW_DOWN_MMA_BM, TASKS ? (unsigned)task_capacity : gu_rows, 1), \
                 QW_DOWN_MMA_THREADS, 0, stream>>>( \
                 (float *)down_partial->ptr, down, sc.mq, sc.ms, sc.msum, \
-                sc.pairs, sc.counts, sc.offsets, gu_active, \
+                sc.pairs, sc.counts, sc.offsets, TASKS ? gu_tasks : gu_active, \
                 down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
                 mgroups, out_dim, dn_dq_stage)
+#define QWEN4EXP_DOWN_MMA(DT, W6) do { \
+    if (down_pair_tasks) { QWEN4EXP_DOWN_MMA_IMPL(DT, W6, true); } \
+    else { QWEN4EXP_DOWN_MMA_IMPL(DT, W6, false); } \
+} while (0)
         if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q5_1) {
             if (dn_wide6) {
                 QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q5_1, true);
@@ -7879,6 +7894,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             QWEN4EXP_DOWN_MMA(-1, false);
         }
 #undef QWEN4EXP_DOWN_MMA
+#undef QWEN4EXP_DOWN_MMA_IMPL
         if (!cuda_ok(cudaGetLastError(), "qwen4exp MoE down tile launch")) return 0;
         if (getenv("DS4_QWEN4EXP_NO_COMBINE_GRID") == NULL) {
             qwen4exp_moe_down_combine_grid_kernel<<<
@@ -14187,7 +14203,7 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
      * compilation of this template and the reg/smem shape is the template's, not
      * a guess -- but read it as indicative rather than as the launched kernel. */
     if (cudaFuncGetAttributes(
-            &a, qwen4exp_moe_down_mma_kernel<DS4_QWEN4EXP_TY_q8_0, true>) ==
+            &a, qwen4exp_moe_down_mma_kernel<DS4_QWEN4EXP_TY_q8_0, false, true>) ==
         cudaSuccess) {
         md_regs = a.numRegs;
         md_smem = (int)a.sharedSizeBytes;
@@ -14196,7 +14212,7 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
         (void)cudaGetLastError();
     }
     if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &occ, qwen4exp_moe_down_mma_kernel<DS4_QWEN4EXP_TY_q8_0, true>,
+            &occ, qwen4exp_moe_down_mma_kernel<DS4_QWEN4EXP_TY_q8_0, false, true>,
             (int)QW_DOWN_MMA_THREADS, 0) == cudaSuccess) {
         md_occ = occ;
     } else {
