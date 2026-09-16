@@ -4809,6 +4809,38 @@ __global__ static void qwen4exp_moe_down_combine_grid_kernel(
     out[(uint64_t)token * out_dim + row] = acc;
 }
 
+/* The routed down-MMA epilogue has the same ascending slot walk for every
+ * output column.  At the production output width, four adjacent columns can
+ * share the route validity load and the loop while using one vector load from
+ * each partial row.  The scalar grid kernel remains the fallback for views,
+ * odd widths, and the diagnostic control. */
+__global__ static void qwen4exp_moe_down_combine_vec4_kernel(
+        float *out,
+        const float *partial,
+        const int32_t *selected,
+        uint32_t out_dim,
+        uint32_t n_tokens,
+        uint32_t n_expert_used,
+        uint32_t n_total_expert) {
+    const uint32_t row4 = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t token = blockIdx.y;
+    const uint32_t n_vec = out_dim >> 2u;
+    if (row4 >= n_vec || token >= n_tokens) return;
+    const uint64_t pair0 = (uint64_t)token * n_expert_used;
+    float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (uint32_t slot = 0; slot < n_expert_used; slot++) {
+        const uint64_t pair = pair0 + slot;
+        const int32_t e = selected[pair];
+        if (e < 0 || (uint32_t)e >= n_total_expert) continue;
+        const float4 v = *(const float4 *)(partial + pair * out_dim + row4 * 4u);
+        acc.x += v.x;
+        acc.y += v.y;
+        acc.z += v.z;
+        acc.w += v.w;
+    }
+    *(float4 *)(out + (uint64_t)token * out_dim + row4 * 4u) = acc;
+}
+
 
 /* Aligned activations; unchanged DP4A words and float accumulation order. */
 __device__ __forceinline__ static void qwen4exp_shared_vector_accumulate(
@@ -8353,7 +8385,18 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         }
 #undef QWEN4EXP_DOWN_MMA
         if (!cuda_ok(cudaGetLastError(), "qwen4exp MoE down tile launch")) return 0;
-        if (getenv("DS4_QWEN4EXP_NO_COMBINE_GRID") == NULL) {
+        const bool combine_vec4 = (out_dim % 4u) == 0u &&
+            ((uintptr_t)out->ptr & (alignof(float4) - 1u)) == 0u &&
+            ((uintptr_t)down_partial->ptr & (alignof(float4) - 1u)) == 0u &&
+            getenv("DS4_QWEN4EXP_NO_COMBINE_VEC4") == NULL;
+        if (combine_vec4) {
+            qwen4exp_moe_down_combine_vec4_kernel<<<
+                    dim3((out_dim / 4u + threads - 1u) / threads,
+                         n_tokens, 1), threads, 0, stream>>>(
+                    (float *)out->ptr, (const float *)down_partial->ptr,
+                    (const int32_t *)selected->ptr, out_dim, n_tokens,
+                    n_expert_used, n_total_expert);
+        } else if (getenv("DS4_QWEN4EXP_NO_COMBINE_GRID") == NULL) {
             qwen4exp_moe_down_combine_grid_kernel<<<
                     dim3((out_dim + threads - 1u) / threads, n_tokens, 1),
                     threads, 0, stream>>>(
