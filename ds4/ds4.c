@@ -68822,7 +68822,35 @@ int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p
                               top_p, min_p, rng, s->sample_probs);
 }
 
-int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
+/* The ranked top-k scan on its own, without the softmax normalisation that only
+ * the `logprob` field needs.
+ *
+ * `ds4s_top_logits` -- the resident's only consumer of the ranked list, and the
+ * one BOTH `decode_step` and `correctness_step` reach through the adapter's
+ * shared `step_at_frontier` -- copies `id` and `logit` into the reply and drops
+ * `logprob` on the floor.  The wire never carries it: a `decode_step` reply is
+ * token-only, and the correctness anchor gate reads `top_logits[8]` as
+ * (id, logit) pairs.  So on the resident path the normalisation pass below
+ * computes a value that nothing reads, and it is not cheap: it is a second full
+ * sweep of the vocabulary with one DOUBLE-PRECISION exp() per entry, and this
+ * shape's `n_vocab` is 248320 (DS4_SHAPE_QWEN4EXP, "Qwen3.8 Flash Next
+ * 125B-A6B") -- a quarter of a million libm exponentiations per timed step,
+ * running on the host between one forward and the next.
+ *
+ * Two things this split deliberately does NOT do:
+ *
+ *  - It does not make the timed decode path cheaper than the correctness path.
+ *    `step_at_frontier` is shared and its own comment says do NOT split it;
+ *    both verbs call through here and both skip exactly the same dead pass, so
+ *    the two verbs still do identical work.
+ *  - It does not change the ranking.  `id` and `logit` are produced by the same
+ *    scan as before and are bit-identical, so the anchor gate sees the eight
+ *    pairs it always saw, and the emitted token stream is untouched (argmax
+ *    reads s->logits independently).
+ *
+ * Every other caller keeps its old behaviour by going through
+ * ds4_session_top_logprobs, which still fills `logprob`. */
+int ds4_session_top_logits(ds4_session *s, ds4_token_score *out, int k) {
     if (!s || !out || k <= 0) return 0;
     if (!ds4_session_materialize_qwen4exp_frontier(s)) return 0;
     if (k > (int)DS4_N_VOCAB) k = (int)DS4_N_VOCAB;
@@ -68847,17 +68875,28 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
         }
     }
     if (!isfinite(max_logit)) return 0;
+    return k;
+}
 
+int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
+    const int n = ds4_session_top_logits(s, out, k);
+    if (n <= 0) return 0;
+
+    /* The ranking pass already found the maximum finite logit: the insertion
+     * sort puts the largest finite value it saw at out[0], which is by
+     * construction the same float the old `max_logit` held, so reuse it instead
+     * of sweeping for it a second time.  `n > 0` guarantees out[0] is finite. */
+    const double max_logit = (double)out[0].logit;
     double sum = 0.0;
     for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
         const float v = s->logits[i];
-        if (isfinite(v)) sum += exp((double)v - (double)max_logit);
+        if (isfinite(v)) sum += exp((double)v - max_logit);
     }
-    const double logsum = (double)max_logit + log(sum);
-    for (int i = 0; i < k && out[i].id >= 0; i++) {
+    const double logsum = max_logit + log(sum);
+    for (int i = 0; i < n && out[i].id >= 0; i++) {
         out[i].logprob = isfinite(out[i].logit) ? (float)((double)out[i].logit - logsum) : DS4_NEG_INF;
     }
-    return k;
+    return n;
 }
 
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
