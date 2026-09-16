@@ -739,7 +739,7 @@ static inline uint64_t ds4_qwen4exp_q8_0_row_bytes(uint32_t in_dim) {
  * on the ranked prompt both ways: 90112 and 81920 accept 47 of 80 drafts, 98308
  * accepts 49 of 78, and 248044 (every BPE id) also accepts 49 of 78 while its
  * wider screen costs about 0.7 ms a round -- so 98308 is where it belongs. */
-#define DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX_DEFAULT 98308u
+#define DS4_QWEN4EXP_DRAFT_VOCAB_PREFIX_DEFAULT 49156u
 
 /*
  * The head reads TWO mappings.  The nextn tensors and blk.<block_index>.* come
