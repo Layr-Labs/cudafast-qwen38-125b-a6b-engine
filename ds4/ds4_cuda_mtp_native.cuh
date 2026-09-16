@@ -112,6 +112,19 @@ __global__ static void mtp_native_projection_kernel(
     }
 }
 
+static uint32_t mtp_screen_registered_width = 0, mtp_screen_tuned_width = 0;
+static int mtp_screen_tuned_device = -1;
+static bool mtp_screen_prefer_mma = false;
+#include "ds4_cuda_mtp_screen_mma.cuh"
+#include "ds4_cuda_mtp_screen_mma_tune.cuh"
+
+static bool mtp_screen_mma_use(uint32_t width, int device) {
+    return MTP_NATIVE_SCREEN_GROUPS == 24u && MTP_NATIVE_DIM == 2560u &&
+        cuda_q8_mma_available() && getenv("DS4_MTP_NO_SCREEN_MMA") == nullptr &&
+        (getenv("DS4_MTP_FORCE_SCREEN_MMA") != nullptr ||
+         (mtp_screen_prefer_mma && width == mtp_screen_tuned_width && device == mtp_screen_tuned_device));
+}
+
 struct mtp_native_layout {
     uint64_t scores, key_in, key_out, id_tmp, flag, temporary;
 };
@@ -140,6 +153,7 @@ extern "C" int ds4_gpu_mtp_native_screen_init(uint32_t width,
             cuda_decode_stream()) != cudaSuccess) return -1;
     *bytes = mtp_native_offsets(width).temporary + std::max(a,b);
     *capacity = MTP_NATIVE_CAP;
+    mtp_screen_registered_width = width;
     return 1;
 }
 __global__ static void mtp_native_keys(uint64_t *keys, uint32_t *invalid,
@@ -217,9 +231,14 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
         mtp_native_key_range_disjoint(scratch->ptr,scratch->bytes,out->ptr,out->bytes) &&
         mtp_native_key_range_disjoint(scratch->ptr,scratch->bytes,ids->ptr,ids->bytes);
     if (fuse_keys) {
+        if (mtp_screen_mma_use(width, current)) {
+            mtp_native_screen_mma_kernel<<<(width+15u)/16u,32,0,cuda_decode_stream()>>>(
+                key_in,flag,(const unsigned char *)w,xq,xs,width,vocab,prefix,tail);
+        } else {
         mtp_native_projection_kernel<true,true><<<(width+3u)/4u,256,0,cuda_decode_stream()>>>(
             scores,(const unsigned char *)w,xq,xs,width,nullptr,vocab,prefix,tail,
             key_in,flag);
+        }
         if (!cuda_ok(cudaGetLastError(),"native fused screen keys")) return -1;
     } else {
         mtp_native_projection_kernel<true><<<(width+3u)/4u,256,0,cuda_decode_stream()>>>(
