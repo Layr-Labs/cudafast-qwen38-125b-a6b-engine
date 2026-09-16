@@ -19700,7 +19700,7 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
         const int gdn_stage =
             ((((uintptr_t)a.weights[0]|(uintptr_t)a.weights[1])&3u)==0u) &&
             gdn_panel<=49152u &&
-            getenv("DS4_QWEN4EXP_NO_GDN_PANEL")==NULL;
+            getenv("DS4_QWEN4EXP_GDN_PANEL")!=NULL;
         /* PDL consumer: the stream predecessor is the mixed-input quantizer,
          * which triggers at its top at these decode widths. */
         if (rows==1u) {
