@@ -76071,12 +76071,22 @@ static int qwen4exp_seam_draft_step(void *ctx, int next_token,
                                     int *draft_out, float *multi_out) {
     ds4_session *s = ctx;
     char err[256];
+    /* `next_token` lands at pos + 1; post it to the PLE prefetch worker so
+     * its row set is already in flight while the head forward below runs.
+     * The post is a ring write under a mutex -- the id walk and the madvise
+     * calls stay off this thread. */
+    qw_ple_pf_post(s->engine->qwen4exp_session, s->engine->qwen4exp_weights,
+                   &next_token, 1u, pos + 1u);
     if (ds4_qwen4exp_mtp_head_forward(&s->qwen4exp_head, &next_token, hc_row,
                                       pos, 1u, draft_out, multi_out,
                                       err, sizeof(err)) != 0) {
         fprintf(stderr, "ds4: qwen4exp MTP seam: %s\n", err);
         return -1;
     }
+    /* The drafted token lands at pos + 2; post it while the rest of the
+     * chain is still drafting. */
+    qw_ple_pf_post(s->engine->qwen4exp_session, s->engine->qwen4exp_weights,
+                   draft_out, 1u, pos + 2u);
 #ifdef DS4_TEST_HOOKS
     /* `next_token` lands at pos + 1, so the draft is the token at pos + 2.
      *
@@ -76104,12 +76114,20 @@ static int qwen4exp_seam_draft_rows(void *ctx, const int *next_tokens,
                                     float *multi_out) {
     ds4_session *s = ctx;
     char err[256];
+    /* Row t consumes next_tokens[t] at position pos0 + t + 1; post the whole
+     * set so the row page-ins overlap the head forward this call launches. */
+    qw_ple_pf_post(s->engine->qwen4exp_session, s->engine->qwen4exp_weights,
+                   next_tokens, n, pos0 + 1u);
     if (ds4_qwen4exp_mtp_head_forward_last(&s->qwen4exp_head, next_tokens,
                                            hc_rows, pos0, n, draft_out,
                                            multi_out, err, sizeof(err)) != 0) {
         fprintf(stderr, "ds4: qwen4exp MTP seam: %s\n", err);
         return -1;
     }
+    /* The last row drafts the token at pos0 + n + 1; post it while the rest
+     * of the chain is still drafting. */
+    qw_ple_pf_post(s->engine->qwen4exp_session, s->engine->qwen4exp_weights,
+                   draft_out, 1u, pos0 + n + 1u);
 #ifdef DS4_TEST_HOOKS
     /* The last row sits at pos0 + n - 1 and drafts the token two past it, the
      * same rule the one-row seam applies. */
