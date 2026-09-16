@@ -17737,15 +17737,20 @@ static int cuda_matmul_q8_0_preq_rows_exact(
                         out_dim, n_rows, blocks);
             } else if (n_rows == 3u) {
                 /* The same two-row tile kernel over two tiles, launched
-                 * plainly (no producer triggers at three rows). */
-                matmul_q8_0_preq_pair_lanes_kernel<2, false><<<
+                 * plainly (no producer triggers at three rows).  Streaming
+                 * loads: the weight slab is read straight through once per
+                 * pass and cannot be reused, so evict-first keeps it from
+                 * displacing the activations and routing metadata that ARE
+                 * reused.  __ldcs changes neither address, width, nor
+                 * value. */
+                matmul_q8_0_preq_pair_lanes_kernel<2, true><<<
                         dim3((unsigned)((out_dim + 3u) / 4u), 2u, 1u),
                         256, 0, cuda_decode_stream()>>>(
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
                         out_dim, n_rows, blocks);
             } else {
                 QWEN4EXP_LAUNCH_PDL(
-                        (matmul_q8_0_preq_pair_lanes_kernel<2, false>),
+                        (matmul_q8_0_preq_pair_lanes_kernel<2, true>),
                         (dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u)),
                         256, 0, cuda_decode_stream(),
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
