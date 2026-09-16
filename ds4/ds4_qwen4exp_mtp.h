@@ -408,6 +408,21 @@ typedef struct {
                       float *multi_out);
 
     /*
+     * OPTIONAL: draft_rows with the hyper rows taken straight from the
+     * target's device-resident stream.  `first_hyper_row` names the row of the
+     * verify batch the slab starts at (the same index the host slab
+     * `hc_rows + first_hyper_row * hc_dim` would carry), so the head's input
+     * is a device-to-device copy and the verify owes the host no hyper
+     * read-back at all.  Same rows, same inputs, same drafts as draft_rows;
+     * only the 80 KB D2H + H2D bounce and its two synchronising copies per
+     * round are gone.  When set, the cycle passes a NULL `hc_rows` to
+     * verify_rows / verify_rows_top1 and never reads the host slab.
+     */
+    int (*draft_rows_device)(void *ctx, const int *next_tokens,
+                             uint32_t first_hyper_row, uint32_t pos0,
+                             uint32_t n, int *draft_out, float *multi_out);
+
+    /*
      * OPTIONAL: top-1 minus runner-up logit of the draft the latest draft_step
      * or draft_rows call returned, or a negative value when that call did not
      * measure one.  It can only shorten a chain (stop_margin / drop_margin in
@@ -923,6 +938,18 @@ int ds4_qwen4exp_mtp_head_forward_last(ds4_qwen4exp_mtp_head *h,
                                        uint32_t pos0, uint32_t n_tokens,
                                        int *draft_out, float *multi_out,
                                        char *err, size_t errlen);
+
+/* ds4_qwen4exp_mtp_head_forward_last with the `n_tokens` hyper rows copied
+ * device-to-device from `target_hyper` starting at row `first_row`, instead of
+ * uploaded from a host slab.  Same forward, same outputs; this is the entry
+ * the seam's draft_rows_device binds to. */
+int ds4_qwen4exp_mtp_head_forward_last_device(ds4_qwen4exp_mtp_head *h,
+                                              const int *next_tokens,
+                                              const ds4_gpu_tensor *target_hyper,
+                                              uint32_t first_row,
+                                              uint32_t pos0, uint32_t n_tokens,
+                                              int *draft_out, float *multi_out,
+                                              char *err, size_t errlen);
 
 /* Greedy argmax with the canonical lowest-id tie-break the shim's ds4s_argmax
  * documents.  Shared so the head and the cycle cannot break ties apart. */
