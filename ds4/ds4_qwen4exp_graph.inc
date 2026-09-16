@@ -1517,7 +1517,10 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
     }
 
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    if (n_tokens<=2u && getenv("DS4_QWEN4EXP_NO_GDN_PROJECTION_FUSION")==NULL) {
+    if ((n_tokens<=2u || (n_tokens==3u &&
+            getenv("DS4_QWEN4EXP_NO_WIDE_VERIFY")==NULL &&
+            getenv("DS4_QWEN4EXP_WIDE_VERIFY_R2")==NULL)) &&
+        getenv("DS4_QWEN4EXP_NO_GDN_PROJECTION_FUSION")==NULL) {
         ds4_gpu_tensor *outs[4]={s->gdn_qkv,s->gdn_gate,s->gdn_alpha,s->gdn_beta};
         const void *maps[4]={QW_MAP(m,l->attn_qkv),QW_MAP(m,l->attn_gate),
                             QW_MAP(m,l->ssm_alpha),QW_MAP(m,l->ssm_beta)};
@@ -1651,7 +1654,10 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
 
     /* Projections.  q is DOUBLED: half query, half output gate. */
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    if (n_tokens<=2u && getenv("DS4_QWEN4EXP_NO_QSA_Q8_TRIPLE")==NULL) {
+    if ((n_tokens<=2u || (n_tokens==3u &&
+            getenv("DS4_QWEN4EXP_NO_WIDE_VERIFY")==NULL &&
+            getenv("DS4_QWEN4EXP_WIDE_VERIFY_R2")==NULL)) &&
+        getenv("DS4_QWEN4EXP_NO_QSA_Q8_TRIPLE")==NULL) {
         ds4_gpu_tensor *outs[3]={s->qsa_doubled,s->qsa_kin,s->qsa_vin};
         const void *maps[3]={QW_MAP(m,l->attn_q),QW_MAP(m,l->attn_k),QW_MAP(m,l->attn_v)};
         const uint64_t sizes[3]={QW_MAPSZ(m,l->attn_q),QW_MAPSZ(m,l->attn_k),QW_MAPSZ(m,l->attn_v)};
