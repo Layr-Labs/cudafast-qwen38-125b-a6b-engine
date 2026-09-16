@@ -479,13 +479,16 @@ bool ds4_repack_q2k_candidate(const ds4_repack_tensor &t) {
 
 /* Aligned-SoA Q8_0 dense candidates (--repack-q8-aligned): every 2D Q8_0
  * tensor big enough to matter whose row length satisfies the decode kernel's
- * K % 1024 constraint.  token_embd is excluded: it is consumed by row-gather,
+ * K % 32 block constraint.  token_embd is excluded: it is consumed by row-gather,
  * never by the dense GEMV.  Unlike the IQ2 expert repack these artifacts are
  * ADDITIVE (raw stays served). */
 bool ds4_repack_q8_candidate(const ds4_repack_tensor &t) {
     if (t.type != 8u || t.ndim != 2u) return false; /* GGML_TYPE_Q8_0 */
     if (t.dims[0] == 0 || t.dims[1] == 0) return false;
-    if (t.dims[0] % 1024u != 0) return false;
+    /* nb = K/32 blocks per row; the aligned vec kernels step that loop 32
+     * lanes at a time and now carry a tail guard, so a whole number of
+     * 32-element blocks per row is all the decode kernel requires. */
+    if (t.dims[0] % 32u != 0) return false;
     /* 2 MiB floor: attn_kv (512 x 4096, 2.2 MiB) is an Inc4 pair-kernel
      * consumer; anything smaller isn't worth an artifact. */
     if (t.bytes < 2u * 1024u * 1024u || t.bytes % 34u != 0) return false;

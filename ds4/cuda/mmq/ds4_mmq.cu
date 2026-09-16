@@ -3964,6 +3964,7 @@ __global__ void q8_0_aligned_dense_vec_kernel(
     float acc = 0.0f;
     for (int b0 = 0; b0 < nb; b0 += 32) {
         const int b = b0 + lane;
+        if (b >= nb) continue;   /* tail: nb need not be a multiple of 32 */
         const int4 w0 = qs[(rbase + b) * 2 + 0];   // aligned 16B loads
         const int4 w1 = qs[(rbase + b) * 2 + 1];
         const int *u = (const int *)x8[b].qs;
@@ -4010,6 +4011,7 @@ __global__ void q8_0_aligned_dense_vec_nc_kernel(
 
     for (int b0 = 0; b0 < nb; b0 += 32) {
         const int b = b0 + lane;
+        if (b >= nb) continue;   /* tail: nb need not be a multiple of 32 */
         const int4 w0 = qs[(rbase + b) * 2 + 0];   // aligned 16B, read once
         const int4 w1 = qs[(rbase + b) * 2 + 1];
         const float dw = __half2float(dq[rbase + b]);
@@ -4082,6 +4084,7 @@ __global__ void q8_0_aligned_dense_vec_pair_kernel(
     float acc = 0.0f;
     for (int b0 = 0; b0 < nb; b0 += 32) {
         const int b = b0 + lane;
+        if (b >= nb) continue;   /* tail: nb need not be a multiple of 32 */
         const int4 w0 = qs[(rbase + b) * 2 + 0];
         const int4 w1 = qs[(rbase + b) * 2 + 1];
         const int *u = (const int *)x8[b].qs;

@@ -64345,9 +64345,33 @@ static int ds4_engine_open_internal(ds4_engine **out,
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
         if (e->backend == DS4_BACKEND_CUDA &&
             !load_slice && !tp_shard && !e->ssd_streaming) {
-            (void)ds4_gpu_build_derived_artifacts(e->model.map,
-                                                  e->model.size,
-                                                  opt->model_path);
+            /* EVERY SHARD that carries tensor bytes, not just the one
+             * opt->model_path names.  On the production artifact shard 0 is
+             * metadata only (n_tensors == 0), so passing it alone hands the
+             * repack catalog a GGUF with nothing in it and every aligned
+             * family reports "found no candidate tensors".  This mirrors what
+             * the fd and map registrations below already do for the same
+             * reason; see the STARTUP THROUGHPUT note above. */
+            if (e->model.n_shards > 1) {
+                for (uint32_t si = 0; si < e->model.n_shards; si++) {
+                    const ds4_model_shard *sh = &e->model.shard[si];
+                    if (!sh->map || sh->size == 0 || sh->n_tensors == 0) continue;
+                    char shard_path[4096];
+                    if (si == 0) {
+                        snprintf(shard_path, sizeof(shard_path), "%s", opt->model_path);
+                    } else if (!gguf_split_shard_path(opt->model_path, si,
+                                                      e->model.n_shards,
+                                                      shard_path,
+                                                      sizeof(shard_path))) {
+                        continue;
+                    }
+                    (void)ds4_gpu_build_derived_artifacts(sh->map, sh->size, shard_path);
+                }
+            } else {
+                (void)ds4_gpu_build_derived_artifacts(e->model.map,
+                                                      e->model.size,
+                                                      opt->model_path);
+            }
         }
 #endif
         int model_map_ok = 0;
