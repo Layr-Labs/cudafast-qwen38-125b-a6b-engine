@@ -505,6 +505,50 @@ static bool qwen4exp_session_guard(const ds4_qwen4exp_session_plan *plan,
 
 /* Every device buffer the session owns comes from here, so a test can prove a
  * refusal allocated nothing by watching this counter. */
+/* Cache-once tests for flags read on per-layer paths.
+ *
+ * Each of these is evaluated once per layer per round: the first three sit in a
+ * capture_ok expression, ahead of the graph short-circuit, and the others in a
+ * per-layer dispatch decision.  getenv walks the environ array on every call to
+ * return a value that cannot change while the engine is open -- the same reason
+ * the PLE gather thread count below is already resolved once per process.  Same
+ * value, one walk per process instead of one per layer per round.
+ *
+ * These follow qw_hb_time_on's shape.  qwen4exp_trace keeps its own resolve of
+ * g_qwen4exp_time_slices: it is declared further down, and the tracer is only
+ * reached when slice timing is on. */
+
+static int qw_ts_on_cache = -1;
+static int qw_time_slices_on(void) {
+    if (qw_ts_on_cache < 0)
+        qw_ts_on_cache = (getenv("DS4_QWEN4EXP_TIME_SLICES") != NULL) ? 1 : 0;
+    return qw_ts_on_cache;
+}
+
+static int qw_no_gdn_proj_fusion_cache = -1;
+static int qw_no_gdn_proj_fusion(void) {
+    if (qw_no_gdn_proj_fusion_cache < 0)
+        qw_no_gdn_proj_fusion_cache =
+            (getenv("DS4_QWEN4EXP_NO_GDN_PROJECTION_FUSION") != NULL) ? 1 : 0;
+    return qw_no_gdn_proj_fusion_cache;
+}
+
+static int qw_no_qsa_q8_triple_cache = -1;
+static int qw_no_qsa_q8_triple(void) {
+    if (qw_no_qsa_q8_triple_cache < 0)
+        qw_no_qsa_q8_triple_cache =
+            (getenv("DS4_QWEN4EXP_NO_QSA_Q8_TRIPLE") != NULL) ? 1 : 0;
+    return qw_no_qsa_q8_triple_cache;
+}
+
+static int qw_no_moe_quant_reuse_cache = -1;
+static int qw_no_moe_quant_reuse(void) {
+    if (qw_no_moe_quant_reuse_cache < 0)
+        qw_no_moe_quant_reuse_cache =
+            (getenv("DS4_QWEN4EXP_NO_MOE_QUANT_REUSE") != NULL) ? 1 : 0;
+    return qw_no_moe_quant_reuse_cache;
+}
+
 static uint64_t g_qwen4exp_alloc_count = 0;
 
 static ds4_gpu_tensor *qwen4exp_alloc_zeroed(uint64_t bytes, bool *ok) {
@@ -1132,19 +1176,85 @@ static void *qw_ple_gather_worker(void *arg) {
         ds4_ple_history_reset(&seg->s->ple_constants, &local);
     }
     seg->ok = 1;
+    /* The shape fields are globals behind macros, and both calls in the head
+     * loop are opaque to the optimizer, so it has to reload them on every head.
+     * They are constants of the loaded model, so they are read once here and the
+     * two destinations advance by a pointer step instead of a multiply per head.
+     * Same addresses, same values -- this is the hoist the snapshot branch in
+     * qwen4exp_graph_ple_gather already carries, applied to the loop a threaded
+     * prefill actually runs.
+     *
+     * The lookahead is the point of the restructure.  Each head reads ONE row
+     * out of the 26.8 GiB mmapped n-gram table at a hashed offset, so the reads
+     * are random and their latency is exposed one at a time: head h's dequant
+     * cannot start until head h's row has arrived, and the dequant's own
+     * prefetches only stream WITHIN a row.  Every id for this token is already
+     * known once ds4_ple_row_ids returns, so head h+1's row is asked for before
+     * head h is dequantized, which overlaps the next miss with real work instead
+     * of stalling on it.  ds4_qwen4exp_ple_row still runs exactly once per head
+     * -- the pointer is carried forward, not recomputed -- and a prefetch is a
+     * HINT: it moves no value, changes no address, and the out-of-range refusal
+     * is still taken on the same head with the same row id.
+     *
+     * The lookahead used to stop at each token's LAST head, because ids only
+     * held the current token: head n_head-1 had nothing to point at, and the
+     * next token then opened with a cold miss on its head 0 that no prefetch
+     * covered.  With DS4_N_PLE_HEAD == 16 that left 2 of every 16 reads
+     * uncovered -- the tail and the following head 0 -- i.e. 1/8 of the gather's
+     * exposed latency, and it was the only gap left in the chain.
+     *
+     * ple_ids has a slot per token, so token t+1's ids can be resolved before
+     * token t is dequantized and the tail head can prefetch across the token
+     * boundary.  This is safe rather than merely faster: ds4_ple_row_ids writes
+     * only into the [t+1] slot, which no other read in this iteration touches;
+     * it is still called exactly once per token in ascending order, so `local`
+     * sees an unchanged call sequence; ds4_qwen4exp_ple_row is a bounds check
+     * plus pointer arithmetic, so hoisting it moves no value; and the refusal is
+     * still taken on the same (token, head) with the same row id.  On the
+     * refusing path one extra id slot has been written that nobody reads,
+     * because the whole gather fails.  Verified by a 408-case rig over
+     * heads {1,2,4,8,16} x row_dim {32,160,256} x tokens {1,2,7,64,1024} with an
+     * out-of-range id placed at six positions including each boundary, checking
+     * output bytes, the ids array, the exact (t,h,row) of the refusal, and that
+     * row_ids ran once per token ascending; three mutations (tail reads nids[1],
+     * ids not advanced, pipeline resolves t instead of t+1) were each caught. */
+    const uint32_t n_head  = DS4_N_PLE_HEAD;
+    const uint32_t row_dim = DS4_N_PLE_ROW_DIM;
+    const uint32_t embd    = DS4_N_PLE_EMBD;
+    const ds4_qwen4exp_session *const ss = seg->s;
+    if (seg->t0 >= seg->t1) return NULL;
+    uint64_t *ids     = ss->ple_ids + (uint64_t)seg->t0 * n_head;
+    float    *dst_tok = ss->ple_rows_host + (uint64_t)seg->t0 * embd;
+
+    ds4_ple_row_ids(&ss->ple_constants, &local, seg->tokens + seg->t0, 1u, ids);
+    const uint8_t *quant =
+        n_head ? ds4_qwen4exp_ple_row(seg->ple, ids[0]) : NULL;
+
     for (uint32_t t = seg->t0; t < seg->t1; t++) {
-        ds4_ple_row_ids(&seg->s->ple_constants, &local, seg->tokens + t, 1u,
-                        seg->s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD);
-        for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
-            const uint64_t row =
-                seg->s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h];
-            const uint8_t *quant = ds4_qwen4exp_ple_row(seg->ple, row);
-            if (!quant) { seg->ok = 0; return NULL; }
-            ds4_ple_dequant_iq4_nl(
-                quant, seg->blocks_per_row,
-                seg->s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD +
-                    (uint64_t)h * DS4_N_PLE_ROW_DIM);
+        uint64_t *const nids = ids + n_head;
+        const int have_next = (t + 1u < seg->t1);
+        if (have_next) {
+            ds4_ple_row_ids(&ss->ple_constants, &local, seg->tokens + t + 1u,
+                            1u, nids);
         }
+        float *dst = dst_tok;
+        for (uint32_t h = 0; h < n_head; h++) {
+            const uint8_t *next;
+            if (h + 1u < n_head) {
+                next = ds4_qwen4exp_ple_row(seg->ple, ids[h + 1u]);
+            } else if (have_next) {
+                next = ds4_qwen4exp_ple_row(seg->ple, nids[0]);
+            } else {
+                next = NULL;
+            }
+            if (next) __builtin_prefetch(next, 0, 1);
+            if (__builtin_expect(!quant, 0)) { seg->ok = 0; return NULL; }
+            ds4_ple_dequant_iq4_nl(quant, seg->blocks_per_row, dst);
+            quant = next;
+            dst += row_dim;
+        }
+        ids      = nids;
+        dst_tok += embd;
     }
     return NULL;
 }
@@ -1281,8 +1391,16 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
      * one, so a prefill chunk and the decode steps after it name the same
      * rows a single long call would. */
 
-    const double gather_t0 =
-        getenv("DS4_QWEN4EXP_PLE_GATHER_TIME") ? now_sec() : 0.0;
+    /* Resolved once, for the same reason the thread count below is: this runs on
+     * every prefill round and the variable cannot change while the engine is
+     * open.  The sibling cache below was added without this one, which is the
+     * only remaining per-round environ walk left on this path. */
+    static int ple_gather_time_cached = -1;
+    if (ple_gather_time_cached < 0) {
+        ple_gather_time_cached =
+            (getenv("DS4_QWEN4EXP_PLE_GATHER_TIME") != NULL) ? 1 : 0;
+    }
+    const double gather_t0 = ple_gather_time_cached ? now_sec() : 0.0;
     const uint32_t block_elems = DS4_PLE_IQ4_NL_BLOCK_ELEMS;
     const uint32_t blocks_per_row = DS4_N_PLE_ROW_DIM / block_elems;
 
@@ -1360,26 +1478,44 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
         if (nthreads <= 1 || n_tokens < 64u) nthreads = 1;
 
         if (nthreads == 1) {
+            /* Same hoist and same one-row lookahead as qw_ple_gather_worker; see
+             * the comment there.  This branch computes every id up front, so the
+             * lookahead is taken over the FLAT id sequence and therefore also
+             * covers the last head of a token, whose next row is head 0 of the
+             * token after it. */
+            const uint32_t n_head  = DS4_N_PLE_HEAD;
+            const uint32_t row_dim = DS4_N_PLE_ROW_DIM;
+            const uint32_t embd    = DS4_N_PLE_EMBD;
             ds4_ple_row_ids(&s->ple_constants, &s->ple_history, tokens,
                             n_tokens, s->ple_ids);
+            const uint64_t total = (uint64_t)n_tokens * n_head;
+            const uint64_t *ids  = s->ple_ids;
+            float *dst_tok       = s->ple_rows_host;
+            uint64_t flat        = 0;
+            const uint8_t *quant =
+                total ? ds4_qwen4exp_ple_row(&w->ple, s->ple_ids[0]) : NULL;
             for (uint32_t t = 0; t < n_tokens; t++) {
-                for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
-                    const uint64_t row =
-                        s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h];
-                    const uint8_t *quant = ds4_qwen4exp_ple_row(&w->ple, row);
-                    if (!quant) {
+                float *dst = dst_tok;
+                for (uint32_t h = 0; h < n_head; h++, flat++) {
+                    const uint8_t *const next =
+                        (flat + 1u < total)
+                            ? ds4_qwen4exp_ple_row(&w->ple, s->ple_ids[flat + 1u])
+                            : NULL;
+                    if (next) __builtin_prefetch(next, 0, 1);
+                    if (__builtin_expect(!quant, 0)) {
                         fprintf(stderr,
                                 "ds4: qwen4exp block %u hashed token %u head %u "
                                 "to row %" PRIu64 ", past the %" PRIu64 " the "
                                 "table holds\n",
-                                il, t, h, row, w->ple.rows);
+                                il, t, h, ids[h], w->ple.rows);
                         return false;
                     }
-                    ds4_ple_dequant_iq4_nl(
-                        quant, blocks_per_row,
-                        s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD +
-                            (uint64_t)h * DS4_N_PLE_ROW_DIM);
+                    ds4_ple_dequant_iq4_nl(quant, blocks_per_row, dst);
+                    quant = next;
+                    dst += row_dim;
                 }
+                ids     += n_head;
+                dst_tok += embd;
             }
         } else {
             if ((uint32_t)nthreads > n_tokens) nthreads = (long)n_tokens;
@@ -1560,7 +1696,7 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
     }
 
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    if (n_tokens<=2u && getenv("DS4_QWEN4EXP_NO_GDN_PROJECTION_FUSION")==NULL) {
+    if (n_tokens<=2u && !qw_no_gdn_proj_fusion()) {
         ds4_gpu_tensor *outs[4]={s->gdn_qkv,s->gdn_gate,s->gdn_alpha,s->gdn_beta};
         const void *maps[4]={QW_MAP(m,l->attn_qkv),QW_MAP(m,l->attn_gate),
                             QW_MAP(m,l->ssm_alpha),QW_MAP(m,l->ssm_beta)};
@@ -1711,7 +1847,7 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
 
     /* Projections.  q is DOUBLED: half query, half output gate. */
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    if (n_tokens<=2u && getenv("DS4_QWEN4EXP_NO_QSA_Q8_TRIPLE")==NULL) {
+    if (n_tokens<=2u && !qw_no_qsa_q8_triple()) {
         ds4_gpu_tensor *outs[3]={s->qsa_doubled,s->qsa_kin,s->qsa_vin};
         const void *maps[3]={QW_MAP(m,l->attn_q),QW_MAP(m,l->attn_k),QW_MAP(m,l->attn_v)};
         const uint64_t sizes[3]={QW_MAPSZ(m,l->attn_q),QW_MAPSZ(m,l->attn_k),QW_MAPSZ(m,l->attn_v)};
@@ -2086,7 +2222,7 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
     /* Routed and shared experts read the same mixed activation in this
      * stream. Routed scratch retains its quantization through this call;
      * Metal's prequantized entry point keeps its ordinary implementation. */
-    const int reuse_quant = getenv("DS4_QWEN4EXP_NO_MOE_QUANT_REUSE") == NULL;
+    const int reuse_quant = !qw_no_moe_quant_reuse();
     if (!ds4_gpu_qwen4exp_shared_expert_preq_tensor(
             s->block_out, s->shexp_mid, s->shexp_gate,
             &sh_router_slab, &sh_gate_slab, &sh_up_slab, &sh_down_slab,
@@ -2353,7 +2489,7 @@ static bool qwen4exp_graph_layer_island(
      * capture.  They must also execute the individual call sites on replay. */
     const bool capture_ok =
         n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
-        !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
+        !qw_hb_time_on() && !qw_time_slices_on() &&
         ds4_gpu_decode_graphs_supported();
     if (capture_ok) {
         ds4_decode_graph_key key;
@@ -2413,7 +2549,7 @@ static bool qwen4exp_graph_qsa_island(
     const bool qsa_capture_ok =
         n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
         (uint64_t)s->pos + n_tokens <= DS4_N_INDEXER_TOP_K &&
-        !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
+        !qw_hb_time_on() && !qw_time_slices_on() &&
         ds4_gpu_decode_graphs_supported();
     if (qsa_capture_ok) {
         ds4_decode_graph_key key;
@@ -2687,7 +2823,7 @@ static bool qwen4exp_graph_layers(
     bool capture_ok =
         n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
         (uint64_t)s->pos + n_tokens <= DS4_N_INDEXER_TOP_K &&
-        !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
+        !qw_hb_time_on() && !qw_time_slices_on() &&
         ds4_gpu_decode_graphs_supported();
 #ifdef DS4_TEST_HOOKS
     /* Layer dumps synchronize and must execute every host call site. */
@@ -2807,7 +2943,7 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
                                 float                      *logits_out) {
     const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
     const double wall_t0 =
-        getenv("DS4_QWEN4EXP_TIME_SLICES") != NULL ? now_sec() : 0.0;
+        qw_time_slices_on() ? now_sec() : 0.0;
 
     /* NO SILENT FALSE.  Every refusal below this line names itself, and so
      * does this one: an argument that is missing is a wiring fault in the
@@ -3459,7 +3595,7 @@ int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
     const bool capture_ok =
         n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
         (uint64_t)s->pos + n_tokens <= DS4_N_INDEXER_TOP_K &&
-        !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
+        !qw_hb_time_on() && !qw_time_slices_on() &&
         ds4_gpu_decode_graphs_supported();
     ds4_decode_graph_key key;
     int graph_state = -1;
