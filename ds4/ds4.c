@@ -161,6 +161,12 @@ int ds4_gpu_set_current_device_fenced(int logical_tier) { (void)logical_tier; re
 void ds4_gpu_enable_q8_dequant_gemm(void) {}
 void ds4_gpu_enable_q8_dense_mma(void) {}
 int ds4_gpu_tensor_copy_async(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint64_t bytes) { (void)dst; (void)src; (void)bytes; return 0; }
+int ds4_gpu_tensor_copy_async_at(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                                   const ds4_gpu_tensor *src, uint64_t src_offset,
+                                   uint64_t bytes) {
+    (void)dst_offset; (void)src_offset;
+    return ds4_gpu_tensor_copy(dst, 0, src, 0, bytes);
+}
 int ds4_gpu_tensor_copy_xdev_default(ds4_gpu_tensor *dst,
                                      const ds4_gpu_tensor *src,
                                      uint64_t bytes) {
@@ -76123,6 +76129,36 @@ static int qwen4exp_seam_draft_rows(void *ctx, const int *next_tokens,
     return 0;
 }
 
+/* draft_rows with the hyper rows still on the device: the verify just wrote
+ * them into the session hyper tensor, so the head reads them there and the
+ * host readback plus re-upload both disappear. */
+static int qwen4exp_seam_draft_rows_device(void *ctx, const int *next_tokens,
+                                    uint32_t first_row, uint32_t pos0,
+                                    uint32_t n, int *draft_out,
+                                    float *multi_out) {
+    ds4_session *s = ctx;
+    char err[256];
+    if (ds4_qwen4exp_mtp_head_forward_last_device(&s->qwen4exp_head,
+            next_tokens,
+            ds4_qwen4exp_session_hyper(s->engine->qwen4exp_session),
+            first_row, pos0, n, draft_out, multi_out,
+            err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4: qwen4exp MTP seam: %s\n", err);
+        return -1;
+    }
+#ifdef DS4_TEST_HOOKS
+    /* Same override as the host-row seam: the last row sits at pos0 + n - 1
+     * and drafts the token two past it. */
+    if (s->qwen4exp_forced_tokens) {
+        const uint32_t want = pos0 + n - 1u + 2u;
+        if (want < (uint32_t)s->qwen4exp_forced_len) {
+            *draft_out = s->qwen4exp_forced_tokens[want];
+        }
+    }
+#endif
+    return 0;
+}
+
 /* The margin of the draft the latest head call returned; -1 when unmeasured. */
 static float qwen4exp_seam_draft_margin(void *ctx) {
     ds4_session *s = ctx;
@@ -76215,6 +76251,7 @@ static bool ds4_session_qwen4exp_spec_init(ds4_session *s,
     s->qwen4exp_seam.head_logits  = qwen4exp_seam_head_logits;
     s->qwen4exp_seam.draft_step   = qwen4exp_seam_draft_step;
     s->qwen4exp_seam.draft_rows   = qwen4exp_seam_draft_rows;
+    s->qwen4exp_seam.draft_rows_device = qwen4exp_seam_draft_rows_device;
     s->qwen4exp_seam.draft_margin = qwen4exp_seam_draft_margin;
 
     const int depth = ds4_qwen4exp_mtp_depth_from_draft_tokens(

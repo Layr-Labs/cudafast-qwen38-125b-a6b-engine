@@ -440,6 +440,14 @@ static int mtp_draft_chain(ds4_qwen4exp_mtp_state *st,
                            const float *hc_rows, const int *toks,
                            int n, uint32_t pos, int next_fed,
                            char *err, size_t errlen) {
+    /* hc_rows == NULL means the verify left the rows on the device and the
+     * model's draft_rows_device hook reads them there; that hook must be
+     * bound for the call to be legal. */
+    if (!hc_rows && !model->draft_rows_device) {
+        return mtp_fail(err, errlen,
+                        "qwen4exp MTP: the chain was given no hyper rows and "
+                        "the model has no device-row draft path");
+    }
     const uint64_t t0 = mtp_now_ns();
     ds4_qwen4exp_mtp_invalidate(st);
     /* The chain's first row: the head has to hold every row below it. */
@@ -456,12 +464,43 @@ static int mtp_draft_chain(ds4_qwen4exp_mtp_state *st,
     const uint32_t j0 = st->head_rows < pos ? pos : st->head_rows;
     float *const ping = st->hc_scratch +
                         (size_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * st->hc_dim;
-    const float *cur_hc = hc_rows + (size_t)n * st->hc_dim;
+    const float *cur_hc = hc_rows ? hc_rows + (size_t)n * st->hc_dim : NULL;
     int cur_tok = next_fed;
     uint32_t p = pos + (uint32_t)n;
     int k = 0;
 
-    if (model->draft_rows) {
+    if (!hc_rows) {
+        /*
+         * The device half of the batched path: the same seed rows and chain
+         * step 0 in one head forward, but the head reads the hyper slab out
+         * of the session's own tensor -- rows j0 - pos .. n are the rows the
+         * verify just wrote -- so nothing crosses PCIe in either direction.
+         * Same rows, same order, same drafts as the host path below.
+         */
+        const uint32_t k0 = j0 - pos;
+        const uint32_t seeds = start - j0;
+        int rows_tok[DS4_QWEN4EXP_MTP_MAX_COMMIT];
+        for (uint32_t i = 0; i < seeds; i++) rows_tok[i] = toks[k0 + i + 1u];
+        rows_tok[seeds] = next_fed;
+        float *multi_out = (1 < st->depth) ? ping : NULL;
+        int draft = -1;
+        if (model->draft_rows_device(model->ctx, rows_tok, k0,
+                                     j0, seeds + 1u, &draft,
+                                     multi_out) != 0) {
+            return mtp_fail(err, errlen,
+                            "qwen4exp MTP: %u-row device head forward at "
+                            "position %u failed", seeds + 1u, j0);
+        }
+        st->pending[0] = draft;
+        st->pending_margin[0] = model->draft_margin
+            ? model->draft_margin(model->ctx) : -1.0f;
+        st->n_pending = 1;
+        cur_tok = draft;
+        cur_hc = multi_out;
+        p = start + 1u;
+        st->head_rows = p;
+        k = 1;
+    } else if (model->draft_rows) {
         /*
          * The seed rows and chain step 0 in ONE head forward.  Rows j0 .. start
          * take the tokens toks[j0 - pos + 1 .. n] and then next_fed, over the
@@ -549,7 +588,10 @@ static int mtp_commit_one(ds4_qwen4exp_mtp_state *st,
                           int first_token, uint32_t pos,
                           int *accepted, float *logits,
                           int *next_out, char *err, size_t errlen) {
-    float *hc0 = st->hc_scratch;
+    /* With the device draft path armed the one decoded row stays on the
+     * device too: decode_token tolerates a NULL hc_row and skips its
+     * readback, and the chain reads the row the forward left behind. */
+    float *const hc0 = model->draft_rows_device ? NULL : st->hc_scratch;
     const uint64_t t0 = mtp_now_ns();
     const int drc = model->decode_token(model->ctx, first_token, pos, hc0,
                                         logits);
@@ -652,7 +694,10 @@ int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
     /* No round-start snapshot.  The verify forward itself leaves the state
      * after each drafted row in a slot, so there is nothing to copy first and
      * nothing to rewind to afterwards. */
-    float *const hc = st->hc_scratch;
+    /* When the model can draft straight off the device hyper tensor the
+     * verify leaves the rows there: hc stays NULL, the readback is skipped,
+     * and the chain's device hook consumes the rows in place. */
+    float *const hc = model->draft_rows_device ? NULL : st->hc_scratch;
     float *const row_logits = st->logits_rows;
     int row_top1[DS4_QWEN4EXP_MTP_MAX_COMMIT];
     const bool compact_logits =
@@ -1141,7 +1186,7 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
     if (ok) {
         stage = "multi-stream upload";
         ok = multi_device
-            ? ds4_gpu_tensor_copy(h->t_hyper, 0, multi_device,
+            ? ds4_gpu_tensor_copy_async_at(h->t_hyper, 0, multi_device,
                                   (uint64_t)first_device_row * hc_dim * f,
                                   (uint64_t)n_tokens * hc_dim * f) != 0
             : ds4_gpu_tensor_write(h->t_hyper, 0, multi_in,
@@ -1444,6 +1489,23 @@ int ds4_qwen4exp_mtp_head_forward_last(ds4_qwen4exp_mtp_head *h,
                                  draft_out, multi_out, true, NULL, 0u, false, err, errlen);
 }
 
+int ds4_qwen4exp_mtp_head_forward_last_device(ds4_qwen4exp_mtp_head *h,
+                                       const int *next_tokens,
+                                       const ds4_gpu_tensor *multi_device,
+                                       uint32_t first_device_row,
+                                       uint32_t pos0, uint32_t n_tokens,
+                                       int *draft_out, float *multi_out,
+                                       char *err, size_t errlen) {
+    if (!multi_device) {
+        return mtp_fail(err, errlen,
+                        "qwen4exp MTP head: device-row forward needs the "
+                        "target hyper tensor");
+    }
+    return mtp_head_forward_impl(h, next_tokens, NULL, pos0, n_tokens,
+                                 draft_out, multi_out, true, multi_device,
+                                 first_device_row, false, err, errlen);
+}
+
 
 void ds4_qwen4exp_mtp_head_reset_cache(ds4_qwen4exp_mtp_head *h) {
     if (!h) return;
@@ -1490,7 +1552,9 @@ int ds4_qwen4exp_mtp_head_retain_cache_tail(ds4_qwen4exp_mtp_head *h,
     }
     const uint64_t bytes = (uint64_t)h->n_hc * h->n_embd * sizeof(float);
     h->cache_tail_valid = false;
-    if (!ds4_gpu_tensor_copy(h->t_cache_tail, 0, target_hyper,
+    /* Async on the decode stream: the only consumer is the next round's
+     * cache seed, which runs on the same stream, so the host never waits. */
+    if (!ds4_gpu_tensor_copy_async_at(h->t_cache_tail, 0, target_hyper,
                             (uint64_t)first_hyper_row * bytes, bytes)) {
         return mtp_fail(err, errlen, "qwen4exp MTP: cache-tail copy failed");
     }

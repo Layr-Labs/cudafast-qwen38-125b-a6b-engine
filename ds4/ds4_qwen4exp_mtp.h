@@ -408,6 +408,22 @@ typedef struct {
                       float *multi_out);
 
     /*
+     * OPTIONAL: the same batched head forward as draft_rows, but the hyper
+     * rows never leave the device.  The implementation reads rows
+     * first_row .. first_row + n - 1 of the target session's own hyper tensor
+     * -- the rows the matching verify_rows / verify_rows_top1 call just
+     * wrote -- and uploads them device-to-device.  When this hook is bound
+     * the cycle passes hc_rows == NULL to the verify (skipping the host
+     * readback entirely) and to the chain, and calls this hook instead of
+     * draft_rows.  NULL means the chain needs host rows and the verify must
+     * read them back.  draft_rows stays required either way: it is the
+     * fallback for callers that still hold host rows.
+     */
+    int (*draft_rows_device)(void *ctx, const int *next_tokens,
+                             uint32_t first_row, uint32_t pos0, uint32_t n,
+                             int *draft_out, float *multi_out);
+
+    /*
      * OPTIONAL: top-1 minus runner-up logit of the draft the latest draft_step
      * or draft_rows call returned, or a negative value when that call did not
      * measure one.  It can only shorten a chain (stop_margin / drop_margin in
@@ -920,6 +936,19 @@ int ds4_qwen4exp_mtp_head_forward(ds4_qwen4exp_mtp_head *h,
 int ds4_qwen4exp_mtp_head_forward_last(ds4_qwen4exp_mtp_head *h,
                                        const int *next_tokens,
                                        const float *multi_in,
+                                       uint32_t pos0, uint32_t n_tokens,
+                                       int *draft_out, float *multi_out,
+                                       char *err, size_t errlen);
+
+/* forward_last with the hyper rows already on the device: `multi_device`
+ * is the target session's hyper tensor and `first_device_row` the row the
+ * first of `n_tokens` consecutive inputs starts at.  This is the entry the
+ * seam's draft_rows_device binds to; it saves the verify's host readback
+ * and the upload that follows it. */
+int ds4_qwen4exp_mtp_head_forward_last_device(ds4_qwen4exp_mtp_head *h,
+                                       const int *next_tokens,
+                                       const ds4_gpu_tensor *multi_device,
+                                       uint32_t first_device_row,
                                        uint32_t pos0, uint32_t n_tokens,
                                        int *draft_out, float *multi_out,
                                        char *err, size_t errlen);

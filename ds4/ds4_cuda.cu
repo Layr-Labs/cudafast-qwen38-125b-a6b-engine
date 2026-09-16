@@ -3486,6 +3486,32 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
     return ok;
 }
 
+extern "C" int ds4_gpu_tensor_copy_async_at(ds4_gpu_tensor *dst,
+                                     uint64_t dst_offset,
+                                     const ds4_gpu_tensor *src,
+                                     uint64_t src_offset,
+                                     uint64_t bytes) {
+    if (!dst || !src || dst_offset > dst->bytes || src_offset > src->bytes ||
+        bytes > dst->bytes - dst_offset || bytes > src->bytes - src_offset) {
+        return 0;
+    }
+    if (bytes == 0) return 1;
+    int d = ds4_tensor_device_idx(dst);
+    int ok = 0;
+    WITH_DEVICE(g_gpu[d].device_id) {
+        /* cuda_decode_stream() is the legacy stream in eager mode, so this
+         * orders against every kernel and copy queued there; under capture it
+         * lands on the capture stream the way tensor_copy's fast path does. */
+        ok = cuda_ok(cudaMemcpyAsync((char *)dst->ptr + dst_offset,
+                                     (const char *)src->ptr + src_offset,
+                                     (size_t)bytes,
+                                     cudaMemcpyDeviceToDevice,
+                                     cuda_decode_stream()),
+                     "tensor copy async at");
+    }
+    return ok;
+}
+
 __global__ static void moe_handoff_pack_kernel(
         unsigned char *packed,
         const float *ffn_norm,

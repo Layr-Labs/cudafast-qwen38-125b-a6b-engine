@@ -1620,6 +1620,11 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_off,
     memmove(dst->data + dst_off, src->data + src_off, (size_t)bytes);
     return 1;
 }
+int ds4_gpu_tensor_copy_async_at(ds4_gpu_tensor *dst, uint64_t dst_off,
+                        const ds4_gpu_tensor *src, uint64_t src_off,
+                        uint64_t bytes) {
+    return ds4_gpu_tensor_copy(dst, dst_off, src, src_off, bytes);
+}
 int ds4_gpu_indexer_topk_tensor(ds4_gpu_tensor *selected,
                                 const ds4_gpu_tensor *scores,
                                 uint32_t n_comp, uint32_t n_tokens,
