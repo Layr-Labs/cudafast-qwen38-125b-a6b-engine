@@ -43,6 +43,22 @@ static inline int ds4_qwen4exp_matmul_q8_0(ds4_gpu_tensor       *out,
             out, map, map_size, offset, in_dim, out_dim, x, rows);
 }
 
+static inline int ds4_qwen4exp_matmul_q8_0_target(ds4_gpu_tensor       *out,
+                                           const void           *map,
+                                           uint64_t              map_size,
+                                           uint64_t              offset,
+                                           uint64_t              in_dim,
+                                           uint64_t              out_dim,
+                                           const ds4_gpu_tensor *x,
+                                           uint32_t              rows) {
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    return ds4_gpu_matmul_q8_0_target_rows_exact_tensor(
+#else
+    return ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+#endif
+            out, map, map_size, offset, in_dim, out_dim, x, rows);
+}
+
 static inline int ds4_qwen4exp_quantize_q8_0(ds4_gpu_tensor       *q,
                                              uint64_t              q_offset,
                                              uint64_t              s_offset,

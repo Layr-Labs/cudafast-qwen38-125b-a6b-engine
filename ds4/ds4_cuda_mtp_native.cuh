@@ -112,6 +112,51 @@ __global__ static void mtp_native_projection_kernel(
     }
 }
 
+/* Coarse-only single-wave geometry: one lane owns one complete Q8 group.
+ * Integer products fit int32; retaining the 32-lane float tree preserves the
+ * paired kernel's group order. Full refinement keeps its original kernel. */
+__global__ static void mtp_native_warp_screen_kernel(
+        const unsigned char *w,const int8_t *xq,const float *xscale,
+        uint32_t out_dim,uint32_t n_vocab,uint32_t prefix,uint32_t tail,
+        uint64_t *keys,uint32_t *invalid) {
+    static_assert(MTP_NATIVE_SCREEN_GROUPS <= 32u,"one group wave only");
+    const uint32_t lane=threadIdx.x&31u;
+    const uint32_t row=blockIdx.x*4u+(threadIdx.x>>5u);
+    const uint32_t weight_row=row>=out_dim?n_vocab:
+        (row<prefix?row:n_vocab-tail+(row-prefix));
+    const bool valid=row<out_dim&&weight_row<n_vocab;
+    float acc=0.0f;
+    if(valid && lane<MTP_NATIVE_SCREEN_GROUPS) {
+        const unsigned char *group=w+(uint64_t)weight_row*80u*34u+lane*34u;
+        const int8_t *payload=(const int8_t *)(group+2u);
+        const uintptr_t address=(uintptr_t)payload;
+        const uint32_t shift=(uint32_t)(address&3u)*8u;
+        const uint32_t *words=(const uint32_t *)(address&~(uintptr_t)3u);
+        const int32_t *xw=(const int32_t *)(xq+(uint64_t)lane*32u);
+        uint32_t previous=words[0];
+        int dot=0;
+#pragma unroll
+        for(int j=0;j<7;j++) {
+            const uint32_t next=words[j+1];
+            const int32_t packed=(int32_t)__funnelshift_r(previous,next,shift);
+            dot=__dp4a(packed,xw[j],dot);previous=next;
+        }
+        const uint16_t last=*(const uint16_t *)(const void *)(payload+30);
+        const int32_t packed=(int32_t)__funnelshift_r(previous,(uint32_t)last,shift);
+        dot=__dp4a(packed,xw[7],dot);
+        const float ws=__half2float(*(const __half *)group);
+        acc += ws*xscale[lane]*(float)dot;
+    }
+    const float total=warp_sum_f32(acc);
+    if(!lane&&row<out_dim) {
+        const float value=valid?total:-INFINITY;
+        const uint32_t id=row<prefix?row:n_vocab-tail+(row-prefix);
+        if(!isfinite(value))atomicOr(invalid,1u);
+        if(!id||row>=prefix)keys[row]=UINT64_MAX-id;
+        else keys[row]=q8_top1_pack_key(value==0.0f?0.0f:value,id);
+    }
+}
+
 struct mtp_native_layout {
     uint64_t scores, key_in, key_out, id_tmp, flag, temporary;
 };
@@ -217,9 +262,14 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
         mtp_native_key_range_disjoint(scratch->ptr,scratch->bytes,out->ptr,out->bytes) &&
         mtp_native_key_range_disjoint(scratch->ptr,scratch->bytes,ids->ptr,ids->bytes);
     if (fuse_keys) {
+        if (getenv("DS4_MTP_NO_WARP_SCREEN") == nullptr) {
+            mtp_native_warp_screen_kernel<<<(width+3u)/4u,128,0,cuda_decode_stream()>>>(
+                (const unsigned char *)w,xq,xs,width,vocab,prefix,tail,key_in,flag);
+        } else {
         mtp_native_projection_kernel<true,true><<<(width+3u)/4u,256,0,cuda_decode_stream()>>>(
             scores,(const unsigned char *)w,xq,xs,width,nullptr,vocab,prefix,tail,
             key_in,flag);
+        }
         if (!cuda_ok(cudaGetLastError(),"native fused screen keys")) return -1;
     } else {
         mtp_native_projection_kernel<true><<<(width+3u)/4u,256,0,cuda_decode_stream()>>>(
