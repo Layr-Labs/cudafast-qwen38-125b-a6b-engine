@@ -15444,6 +15444,13 @@ __global__ static void indexer_topk_chunk_pow2_kernel(
     uint32_t tid = threadIdx.x;
     if (t >= n_tokens) return;
 
+    /* Single-wave grids only: a dependent launch rides this trigger, and a
+     * producer whose unlaunched blocks would starve behind the consumer's
+     * fence may never carry one (the deadlock rule, ds4_cuda_qwen4exp.cuh).
+     * Decode and verify launch (n_tokens, n_chunks) = a handful of 1024-
+     * thread blocks; prefill widths exceed the gate and never trigger. */
+    if (gridDim.x * gridDim.y <= 32u) QWEN4EXP_PDL_TRIGGER();
+
     const uint32_t chunk_start = chunk * SORT_N;
     if (chunk_start >= n_comp) return;
     const uint32_t chunk_n = n_comp - chunk_start < SORT_N ? n_comp - chunk_start : SORT_N;
@@ -15506,6 +15513,10 @@ __global__ static void indexer_topk_merge_pow2_kernel(
     uint32_t t = blockIdx.x;
     uint32_t tid = threadIdx.x;
     if (t >= n_tokens) return;
+    /* PSS consumer of the chunk stage: every read below is either the
+     * producer's candidate list or a scores row that was complete before
+     * the producer launched, so the fence sits at the top. */
+    QWEN4EXP_PDL_SYNC();
     __shared__ float vals[SORT_N];
     __shared__ uint32_t idxs[SORT_N];
 
@@ -16086,7 +16097,11 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
             cur_stride = next_stride;
         }
 
-        indexer_topk_merge_pow2_kernel<4096><<<n_tokens, 1024>>>(
+        /* The chunk stage above carries a gated trigger; at decode and
+         * verify widths this merge rides its launch window instead of
+         * waiting on full completion. */
+        QWEN4EXP_LAUNCH_PDL(
+                (indexer_topk_merge_pow2_kernel<4096>), n_tokens, 1024, 0, 0,
                 (uint32_t *)selected->ptr,
                 cur, (const float *)scores->ptr,
                 n_comp, n_tokens, top_k, n_sets * top_k, cur_stride);
@@ -16227,15 +16242,13 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
             n_sets = next_sets;
             cur_stride = next_stride;
         }
-
-        indexer_topk_merge_pow2_kernel<4096><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
-                                                                 cur,
-                                                                 (const float *)scores->ptr,
-                                                                 n_comp,
-                                                                 n_tokens,
-                                                                 top_k,
-                                                                 n_sets * top_k,
-                                                                 cur_stride);
+        /* Same gated trigger as the 2048-wide path above: the merge rides
+         * the chunk stage's launch window at decode and verify widths. */
+        QWEN4EXP_LAUNCH_PDL(
+                (indexer_topk_merge_pow2_kernel<4096>), n_tokens, 1024, 0, 0,
+                (uint32_t *)selected->ptr,
+                cur, (const float *)scores->ptr,
+                n_comp, n_tokens, top_k, n_sets * top_k, cur_stride);
         return cuda_ok(cudaGetLastError(), "indexer topk tree final launch");
     }
     indexer_topk_kernel<<<n_tokens, 1>>>((uint32_t *)selected->ptr,
