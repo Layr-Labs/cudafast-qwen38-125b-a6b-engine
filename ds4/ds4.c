@@ -3914,6 +3914,7 @@ static bool accelerator_cache_q8_tensors(const ds4_model *m,
  * A HINT, NEVER A VALUE.  The pass reads bytes and discards them.  It changes
  * no row the gather returns and no order it returns them in.
  * ---------------------------------------------------------------------- */
+/* Fill-only source identity marker; intentionally no execution change. */
 #define DS4_PLE_PAGE_WARM_THREADS 32
 
 typedef struct {
