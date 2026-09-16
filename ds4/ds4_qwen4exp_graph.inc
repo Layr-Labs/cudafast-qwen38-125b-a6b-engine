@@ -590,10 +590,37 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
     }
     s->plan = plan;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    s->gdn_replay_enabled = n_batch >= 2u &&
-        getenv("DS4_QWEN4EXP_NO_GDN_REPLAY") == NULL &&
-        getenv("DS4_QWEN4EXP_NO_LAZY_ROLLBACK") == NULL &&
-        ds4_gpu_qwen4exp_gdn_replay_supported();
+    /* THE REPLAY ARM STANDS DOWN, and the reason is arithmetic, not taste.
+     *
+     * The bounded replay saves a rollback on a REJECTING verify round: the
+     * plan's `reuse` requires `recurrent == 1 && conv == 1`, which is the
+     * round that adopts row zero.  An ACCEPTING round adopts row one, so
+     * `reuse` is false and the plan's own `p.active && !reuse` clause forces a
+     * settle -- `qwen4exp_session_copy_layers`, which walks every GDN layer
+     * copying the whole recurrent state and then takes a full device
+     * synchronize.  Acceptance is the commoner outcome on ranked prompts, so
+     * the arm pays on the majority of rounds to save on the minority.
+     *
+     * What it costs: the recurrent state is [value_head][head_dim][state] fp32
+     * = 48 * 128 * 128 * 4 = 3 MiB per GDN layer, and this checkpoint has
+     * thirty-six of them, so one settle moves about 113 MiB and stalls the
+     * stream on a synchronize that the forward otherwise never takes.
+     *
+     * What standing it down restores: with the arm off, `p.active` is false
+     * and `gdn_replay_previous` never becomes true, so at a two-row verify the
+     * settle predicate collapses to `width > max_adopt_width ||
+     * recurrent != conv`.  Width two against a max_adopt_width of
+     * DS4_QWEN4EXP_MTP_MAX_COMMIT is false, and the two adopt counts always
+     * move together on this path, so NO settle fires and the lazy
+     * `qwen4exp_session_select_layers` rollback carries every round recording
+     * a row and doing no device work -- which is exactly what this tree did
+     * before the replay arm was added.
+     *
+     * The emitted tokens are unchanged: both paths adopt the same state, and
+     * the two environment valves below already selected this path, so it is a
+     * configuration the tree ships and tests rather than a new one. */
+    s->gdn_replay_enabled = false;
+    (void)ds4_gpu_qwen4exp_gdn_replay_supported;
 #endif
 
     const uint64_t E = DS4_N_EMBD;
