@@ -18583,6 +18583,32 @@ extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_
     return cuda_ok(cudaGetLastError(), "matmul_f32 launch");
 }
 
+/* The tiered F32 entry with the multiplier pinned to full single precision.
+ *
+ * The handle this backend creates is left in its tensor-core math mode, which
+ * lets a vendor GEMM form its products at reduced internal precision.  A caller
+ * that wants the tiered entry's throughput WITHOUT that reduction sets the mode
+ * around the call and restores it afterwards; the handle is per tier and this
+ * runs on the tower's own stream, so the window is the call itself. */
+extern "C" int ds4_gpu_matmul_f32_pedantic_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok) {
+    const int tier = ds4_tensor_device_idx(out);
+    cublasHandle_t h = cuda_cublas_for_tier(tier);
+    if (!h) return 0;
+    (void)cublasSetMathMode(h, CUBLAS_DEFAULT_MATH);
+    const int rc = ds4_gpu_matmul_f32_tensor(out, model_map, model_size,
+                                             weight_offset, in_dim, out_dim,
+                                             x, n_tok);
+    const cublasMath_t restore =
+        (g_quality_mode || getenv("DS4_CUDA_NO_TF32") != NULL)
+            ? CUBLAS_DEFAULT_MATH
+            : CUBLAS_TF32_TENSOR_OP_MATH;
+    (void)cublasSetMathMode(h, restore);
+    return rc;
+}
+
 /* matmul_f32_kernel's arithmetic, with the weight row read ONCE for a tile of
  * R activation rows.
  *

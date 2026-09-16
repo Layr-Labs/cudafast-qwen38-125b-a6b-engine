@@ -2039,10 +2039,10 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
     const int moe_lane = qw_moe_in_head_block ? 1 : 0;
     uint64_t moe_mark = moe_timing ? qw_hb_now_ns() : 0;
 
-    if (!ds4_qwen4exp_matmul_f32(s->moe_logits, QW_MAP(m, l->ffn_gate_inp),
-                                   QW_MAPSZ(m, l->ffn_gate_inp),
-                                   QW_OFF(l->ffn_gate_inp),
-                                   DS4_N_EMBD, DS4_N_EXPERT, s->mixed, n_tokens)) {
+    if (!ds4_qwen4exp_matmul_f32_router(s->moe_logits, QW_MAP(m, l->ffn_gate_inp),
+                                          QW_MAPSZ(m, l->ffn_gate_inp),
+                                          QW_OFF(l->ffn_gate_inp),
+                                          DS4_N_EMBD, DS4_N_EXPERT, s->mixed, n_tokens)) {
         fprintf(stderr, "ds4: qwen4exp router failed at block %u\n", il);
         return false;
     }
