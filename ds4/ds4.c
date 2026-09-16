@@ -76022,10 +76022,14 @@ static int qwen4exp_seam_verify_rows(void *ctx, const int *tokens, uint32_t n,
     int32_t buf[DS4_QWEN4EXP_MTP_MAX_COMMIT];
     if (n > (uint32_t)(sizeof(buf) / sizeof(buf[0]))) return -1;
     for (uint32_t i = 0; i < n; i++) buf[i] = (int32_t)tokens[i];
-    return ds4_qwen4exp_graph_verify_rows(e->qwen4exp_session,
-                                          e->qwen4exp_weights, &e->model,
-                                          buf, n, hc_rows, row_logits,
-                                          n) ? 0 : -1;
+    const int rc = ds4_qwen4exp_graph_verify_rows(e->qwen4exp_session,
+                                                e->qwen4exp_weights, &e->model,
+                                                buf, n, hc_rows, row_logits,
+                                                n) ? 0 : -1;
+    /* The verify just committed; the draft chain that follows opens the next
+     * round, so the pre-gather worker reseeds on the first draft call. */
+    e->qwen4exp_session->ple_pg_reseed = 1;
+    return rc;
 }
 
 static int qwen4exp_seam_verify_rows_top1(void *ctx, const int *tokens,
@@ -76037,9 +76041,11 @@ static int qwen4exp_seam_verify_rows_top1(void *ctx, const int *tokens,
     if (at != pos0 || n > (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT) return -1;
     int32_t buf[DS4_QWEN4EXP_MTP_MAX_COMMIT];
     for (uint32_t i = 0; i < n; i++) buf[i] = (int32_t)tokens[i];
-    return ds4_qwen4exp_graph_verify_top1_rows(
+    const int rc = ds4_qwen4exp_graph_verify_top1_rows(
                e->qwen4exp_session, e->qwen4exp_weights, &e->model,
                buf, n, hc_rows, row_top1) ? 0 : -1;
+    e->qwen4exp_session->ple_pg_reseed = 1;
+    return rc;
 }
 
 static int qwen4exp_seam_read_logit_row(void *ctx, uint32_t row,
@@ -76070,7 +76076,13 @@ static int qwen4exp_seam_draft_step(void *ctx, int next_token,
                                     const float *hc_row, uint32_t pos,
                                     int *draft_out, float *multi_out) {
     ds4_session *s = ctx;
+    ds4_qwen4exp_session *gs = s->engine->qwen4exp_session;
     char err[256];
+    /* A chain step (not a seed row): the token this step drafts is a token
+     * the next round's verify gathers, so post it to the pre-gather worker
+     * while the head forward holds the host in a synchronize.  The chain
+     * opens on the first draft call after a verify. */
+    const int chain_open = gs->ple_pg_started && !gs->ple_pg_reseed;
     if (ds4_qwen4exp_mtp_head_forward(&s->qwen4exp_head, &next_token, hc_row,
                                       pos, 1u, draft_out, multi_out,
                                       err, sizeof(err)) != 0) {
@@ -76092,6 +76104,7 @@ static int qwen4exp_seam_draft_step(void *ctx, int next_token,
         }
     }
 #endif
+    if (chain_open) qw_ple_pg_post(gs, *draft_out);
     return 0;
 }
 
@@ -76103,7 +76116,15 @@ static int qwen4exp_seam_draft_rows(void *ctx, const int *next_tokens,
                                     uint32_t n, int *draft_out,
                                     float *multi_out) {
     ds4_session *s = ctx;
+    ds4_qwen4exp_session *gs = s->engine->qwen4exp_session;
     char err[256];
+    /* A draft_rows call opens the chain: reseed the pre-gather worker's
+     * shadow history from the just-committed ple_history, then post the fed
+     * token (the last row's input) so its rows stage during this forward. */
+    if (gs->ple_pg_reseed) {
+        gs->ple_pg_reseed = 0;
+        qw_ple_pg_reseed(gs, &s->engine->qwen4exp_weights->ple);
+    }
     if (ds4_qwen4exp_mtp_head_forward_last(&s->qwen4exp_head, next_tokens,
                                            hc_rows, pos0, n, draft_out,
                                            multi_out, err, sizeof(err)) != 0) {
@@ -76120,6 +76141,12 @@ static int qwen4exp_seam_draft_rows(void *ctx, const int *next_tokens,
         }
     }
 #endif
+    /* The fed token and the first draft are the next round's first two
+     * verify rows; post both so the worker stages them during the chain. */
+    if (gs->ple_pg_started) {
+        qw_ple_pg_post(gs, next_tokens[n - 1u]);
+        qw_ple_pg_post(gs, *draft_out);
+    }
     return 0;
 }
 
