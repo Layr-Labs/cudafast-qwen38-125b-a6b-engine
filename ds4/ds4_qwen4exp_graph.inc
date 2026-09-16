@@ -1256,6 +1256,9 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 s->ple_history_rows[t] = s->ple_history;
             }
         }
+        /* The table base does not depend on the token, so resolve it once
+         * rather than re-deriving it on every accessor call.  Same pointer. */
+        const ds4_qwen4exp_ple_table *const ple_tab = &w->ple;
         for (uint32_t t = 0; t < n_tokens; t++) {
             /* The head's destination strides are constants of the shape, so
              * the token base is hoisted out of the head loop and the head
@@ -1269,7 +1272,7 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                  * another table row, so ask for the next id early.  Hint. */
                 if (h + 1u < DS4_N_PLE_HEAD)
                     __builtin_prefetch(ids + h + 1u, 0, 1);
-                const uint8_t *quant = ds4_qwen4exp_ple_row(&w->ple, row);
+                const uint8_t *quant = ds4_qwen4exp_ple_row(ple_tab, row);
                 /* Cold: a hashed row past the table is a hard refusal that has
                  * never fired in a scored run, so keep it out of the hot path. */
                 if (__builtin_expect(!quant, 0)) {
