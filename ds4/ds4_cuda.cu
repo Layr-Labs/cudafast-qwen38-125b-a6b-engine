@@ -5674,7 +5674,35 @@ __global__ static void matmul_q8_0_preq_kernel(
     if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
 }
 
+/* FORTY REGISTERS: the thread ceiling admits six blocks, the register file
+ * was only admitting five.
+ *
+ * An interposed launch profile of the decode path (CUDA_LAUNCH_BLOCKING=1,
+ * decode graphs off, 1024-token prefill plus 96 decode tokens) puts this
+ * kernel third by total device time at 10.06 percent over 9,312 launches --
+ * roughly two per layer per step, the dense Q8_0 projection at decode width.
+ * It carried no launch attribute at all, and ptxas settled on 48 registers.
+ *
+ * At its 256-thread launch that is the whole constraint: 65,536 / (48 * 256)
+ * = 5.33, so five blocks per SM, while the 1536-thread ceiling would admit
+ * SIX.  Forty registers gives 65,536 / (40 * 256) = 6.4 and lands six, and
+ * shared memory (1,024 B) and stack (0) were never the binding term.
+ *
+ * The same arithmetic on the same shape -- 48 registers at 256 threads, five
+ * blocks to six -- is what qwen_gdn_projection_kernel's __maxnreg__(40) did
+ * when it was promoted.  __maxnreg__ rather than __launch_bounds__ because
+ * this tree records twice that minBlocksPerMultiprocessor is advisory on this
+ * toolchain and moved registers the wrong way.
+ *
+ * Purely a register-budget change: the same dot products run in the same order
+ * over the same operands, so every emitted value is bit-identical.  The
+ * readout to check is that the kernel reports reg=40 with lmem still 0; a
+ * spill would show as lmem > 0 and would mean the cap was set too low. */
+#if defined(__CUDACC__) && CUDART_VERSION >= 12040
+__global__ static void __maxnreg__(40) matmul_q8_0_preq_warp8_kernel(
+#else
 __global__ static void matmul_q8_0_preq_warp8_kernel(
+#endif
         float *out,
         const unsigned char *w,
         const int8_t *xq,
