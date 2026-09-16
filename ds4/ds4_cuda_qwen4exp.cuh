@@ -113,6 +113,8 @@ int ds4_qwen4exp_pdl_enabled(void);
  * Defined there, consumed by ds4_gpu_hw_limits() in ds4_cuda.cu.  Returns a
  * static string, never NULL, and is safe to call more than once. */
 extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void);
+/* Bounded startup comparison on synthetic buffers, before serving requests. */
+extern "C" const char *ds4_gpu_qwen4exp_down_tune(void);
 
 #if CUDART_VERSION >= 12030
 /* One launch path for the converted consumers: cudaLaunchKernelEx, with the
