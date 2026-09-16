@@ -3818,11 +3818,6 @@ typedef struct {
     ds4_gpu_tensor *checkpoint;
     ds4_gpu_tensor *tape;
     const ds4_gpu_tensor *control;
-    /* Optional exclusive, aligned device scratch: n_tokens*n_value_head float2
-     * pairs. Must be disjoint from all inputs, outputs, snapshots and weights.
-     * NULL preserves raw-gate replay. Invalid supplied scratch fails before
-     * any kernel launch, including when the diagnostic disables publication. */
-    ds4_gpu_tensor *gate_scratch;
 } ds4_gpu_qwen4exp_gdn_replay;
 int ds4_gpu_qwen4exp_gdn_replay_supported(void);
 int ds4_gpu_qwen4exp_gdn_replay_materialize(
