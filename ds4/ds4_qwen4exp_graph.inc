@@ -333,6 +333,34 @@ struct ds4_qwen4exp_session {
     ds4_gpu_tensor   *ple_key;        /* key projection, then the gate    */
     ds4_gpu_tensor   *ple_aux;        /* query, then the convolution input */
     ds4_gpu_tensor   *ple_value;      /* value projection, [n_batch][embd] */
+    /* Draft-window pre-gather.  The MTP chain's head forwards hold the host
+     * in a synchronize while the device runs; during that window this worker
+     * hashes and dequantizes the rows the NEXT round's gather will read --
+     * the committed token's row set first, then each draft's as the chain
+     * produces it.  The gather then waits on a ready slot instead of
+     * faulting sixteen table pages in line.  The worker runs the same
+     * ds4_ple_row_ids + ds4_ple_dequant_iq4_nl the gather would, over a
+     * shadow history reseeded from ple_history at every chain open, and the
+     * gather re-checks the worker's row ids against its own before taking a
+     * slot -- so a stashed row is byte-identical or refused. */
+    pthread_t        ple_pg_thread;
+    pthread_mutex_t  ple_pg_mu;
+    pthread_cond_t   ple_pg_cv_in;   /* a job was posted            */
+    pthread_cond_t   ple_pg_cv_out;  /* a job finished              */
+    int              ple_pg_started;
+    int              ple_pg_stop;
+    int              ple_pg_reseed;  /* verify ran; next draft opens a chain */
+    int              ple_pg_poison;  /* a consumed token/id mismatched       */
+    uint64_t         ple_pg_gen;     /* bumped on every reseed      */
+    uint64_t         ple_pg_in;      /* jobs posted                 */
+    uint64_t         ple_pg_done;    /* jobs the worker completed   */
+    uint64_t         ple_pg_out;     /* slots the gather consumed   */
+    ds4_ple_history  ple_pg_hist;    /* shadow history, worker-owned */
+    const ds4_qwen4exp_ple_table *ple_pg_ple;
+    int32_t          ple_pg_tok[DS4_QWEN4EXP_MTP_MAX_COMMIT + 1];
+    uint64_t         ple_pg_slot_gen[DS4_QWEN4EXP_MTP_MAX_COMMIT + 1];
+    uint64_t         ple_pg_ids[DS4_QWEN4EXP_MTP_MAX_COMMIT + 1][DS4_PLE_MAX_HEADS];
+    float           *ple_pg_rows;    /* [ring][DS4_N_PLE_EMBD] staging */
 
     /* Rollback bookkeeping.  A rejecting round has written state for a token
      * that is not committed; these are the snapshots and cursors that undo it.
@@ -779,6 +807,17 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
         s->gdn_replay_gates = qwen4exp_alloc_zeroed(
             2ull * DS4_N_GDN_VALUE_HEAD * 2u * sizeof(float), &ok);
     }
+    if (ok) {
+        s->ple_pg_rows = calloc(
+            (size_t)(DS4_QWEN4EXP_MTP_MAX_COMMIT + 1) * DS4_N_PLE_EMBD,
+            sizeof(float));
+        ok = s->ple_pg_rows != NULL;
+        if (ok) {
+            pthread_mutex_init(&s->ple_pg_mu, NULL);
+            pthread_cond_init(&s->ple_pg_cv_in, NULL);
+            pthread_cond_init(&s->ple_pg_cv_out, NULL);
+        }
+    }
     if (getenv("DS4_QWEN4EXP_NO_LAZY_ROLLBACK") == NULL) {
         /* Zeroed on the device, so flag, mirror and pending all start at live. */
         s->d_adopt = qwen4exp_alloc_zeroed(sizeof(uint32_t), &ok);
@@ -932,6 +971,19 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->shexp_gate);
     ds4_gpu_tensor_free(s->logits);
     ds4_gpu_tensor_free(s->spec_top1);
+    /* Stop the pre-gather worker before its inputs (the ple table pointer,
+     * the constants, the staging rows) go away. */
+    if (s->ple_pg_started) {
+        pthread_mutex_lock(&s->ple_pg_mu);
+        s->ple_pg_stop = 1;
+        pthread_cond_signal(&s->ple_pg_cv_in);
+        pthread_mutex_unlock(&s->ple_pg_mu);
+        pthread_join(s->ple_pg_thread, NULL);
+        pthread_mutex_destroy(&s->ple_pg_mu);
+        pthread_cond_destroy(&s->ple_pg_cv_in);
+        pthread_cond_destroy(&s->ple_pg_cv_out);
+    }
+    free(s->ple_pg_rows);
 #ifdef DS4_TEST_HOOKS
     ds4_gpu_tensor_free(s->final_mixer_snapshot);
 #endif
@@ -1014,6 +1066,15 @@ void ds4_qwen4exp_session_reset(ds4_qwen4exp_session *s) {
     }
     qwen4exp_zero_tensor(s->ple_conv_state);
     ds4_ple_history_reset(&s->ple_constants, &s->ple_history);
+    /* A reset rewinds the n-gram history, so any staged rows describe a
+     * sequence that no longer exists. */
+    if (s->ple_pg_started) {
+        pthread_mutex_lock(&s->ple_pg_mu);
+        s->ple_pg_poison = 1;
+        s->ple_pg_gen++;
+        s->ple_pg_in = s->ple_pg_done = s->ple_pg_out = 0;
+        pthread_mutex_unlock(&s->ple_pg_mu);
+    }
     s->pos = 0;
     s->state_dirty = false;
 }
@@ -1240,6 +1301,164 @@ static void qw_ple_pool_init(void) {
     pthread_mutex_unlock(&g_qw_ple_pool.mutex);
 }
 
+/* ------------------------------------------------------------------ *
+ *  Draft-window pre-gather.
+ *
+ *  The MTP chain's head forwards hold the host inside a synchronize while
+ *  the device runs the head.  Every token the chain produces is a token the
+ *  NEXT round's verify will gather: the committed token first, then each
+ *  draft in order.  This worker hashes and dequantizes those tokens' row
+ *  sets during the head forwards, so the gather's sixteen page faults and
+ *  dequants per token are already done when it runs.
+ *
+ *  CORRECTNESS.  The worker runs the same ds4_ple_row_ids and
+ *  ds4_ple_dequant_iq4_nl the gather would, over a shadow history reseeded
+ *  from the session's ple_history at every chain open -- the state the
+ *  gather's own history holds when the next round starts.  The gather
+ *  re-checks the worker's row ids against the ids it computed itself before
+ *  taking a slot, so a stashed row is either byte-identical to the inline
+ *  read or refused, and a refusal falls back to the inline read.  A token
+ *  or id mismatch poisons the rest of the stash: the posted sequence is a
+ *  prefix of the next round's tokens or it is not the same sequence at
+ *  all.  Nothing the worker writes reaches the device except through the
+ *  gather's own upload.
+ * ------------------------------------------------------------------ */
+
+#define QW_PLE_PG_RING (DS4_QWEN4EXP_MTP_MAX_COMMIT + 1u)
+
+static void *qw_ple_pg_worker(void *arg) {
+    ds4_qwen4exp_session *s = (ds4_qwen4exp_session *)arg;
+    const uint32_t blocks_per_row =
+        DS4_N_PLE_ROW_DIM / DS4_PLE_IQ4_NL_BLOCK_ELEMS;
+    for (;;) {
+        pthread_mutex_lock(&s->ple_pg_mu);
+        while (!s->ple_pg_stop && s->ple_pg_done == s->ple_pg_in) {
+            pthread_cond_wait(&s->ple_pg_cv_in, &s->ple_pg_mu);
+        }
+        if (s->ple_pg_stop) {
+            pthread_mutex_unlock(&s->ple_pg_mu);
+            return NULL;
+        }
+        const uint64_t idx = s->ple_pg_done;
+        const uint64_t slot = idx % QW_PLE_PG_RING;
+        const int32_t tok = s->ple_pg_tok[slot];
+        const uint64_t gen = s->ple_pg_slot_gen[slot];
+        /* A reseed that landed while this job waited bumped the generation
+         * and reset the cursors; the job is stale, so leave the shadow
+         * history and the slot alone and look for live work. */
+        if (gen != s->ple_pg_gen) {
+            pthread_mutex_unlock(&s->ple_pg_mu);
+            continue;
+        }
+        /* The shadow history is shared state: advance it under the lock so
+         * a reseed that lands while this job dequantizes cannot be read as
+         * half-old.  The generation is checked again before the slot is
+         * published. */
+        ds4_ple_row_ids(&s->ple_constants, &s->ple_pg_hist, &tok, 1u,
+                        s->ple_pg_ids[slot]);
+        const ds4_qwen4exp_ple_table *ple = s->ple_pg_ple;
+        pthread_mutex_unlock(&s->ple_pg_mu);
+
+        float *dst = s->ple_pg_rows +
+                     (size_t)slot * (size_t)DS4_N_PLE_EMBD;
+        int ok = 1;
+        for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
+            const uint8_t *quant =
+                ds4_qwen4exp_ple_row(ple, s->ple_pg_ids[slot][h]);
+            if (!quant) { ok = 0; break; }
+            ds4_ple_dequant_iq4_nl(quant, blocks_per_row,
+                                   dst + (uint64_t)h * DS4_N_PLE_ROW_DIM);
+        }
+
+        pthread_mutex_lock(&s->ple_pg_mu);
+        if (ok && gen == s->ple_pg_gen) {
+            s->ple_pg_done = idx + 1u;
+        }
+        pthread_cond_broadcast(&s->ple_pg_cv_out);
+        pthread_mutex_unlock(&s->ple_pg_mu);
+    }
+}
+
+/* Open a chain: reseed the shadow history from the session's ple_history --
+ * the state the next round's gather starts from -- and start the worker on
+ * first use.  Called once per draft chain from the seam. */
+static void qw_ple_pg_reseed(ds4_qwen4exp_session *s,
+                             const ds4_qwen4exp_ple_table *ple) {
+    if (!s->ple_pg_rows || !s->ple_ready) return;
+    if (!s->ple_pg_started) {
+        s->ple_pg_ple = ple;
+        if (pthread_create(&s->ple_pg_thread, NULL, qw_ple_pg_worker, s) != 0) {
+            return;
+        }
+        s->ple_pg_started = 1;
+    }
+    pthread_mutex_lock(&s->ple_pg_mu);
+    s->ple_pg_hist = s->ple_history;
+    s->ple_pg_gen++;
+    s->ple_pg_in = s->ple_pg_done = s->ple_pg_out = 0;
+    s->ple_pg_poison = 0;
+    pthread_mutex_unlock(&s->ple_pg_mu);
+}
+
+/* Post one token of the next round's verify to the worker.  Order is the
+ * round's order: the committed token first, then each draft as the chain
+ * produces it. */
+static void qw_ple_pg_post(ds4_qwen4exp_session *s, int32_t tok) {
+    if (!s->ple_pg_started || tok < 0) return;
+    pthread_mutex_lock(&s->ple_pg_mu);
+    if (!s->ple_pg_stop &&
+        s->ple_pg_in - s->ple_pg_out < QW_PLE_PG_RING) {
+        const uint64_t slot = s->ple_pg_in % QW_PLE_PG_RING;
+        s->ple_pg_tok[slot] = tok;
+        s->ple_pg_slot_gen[slot] = s->ple_pg_gen;
+        s->ple_pg_in++;
+        pthread_cond_signal(&s->ple_pg_cv_in);
+    }
+    pthread_mutex_unlock(&s->ple_pg_mu);
+}
+
+/* Take the staged row block for `tok`, whose own row ids the caller just
+ * computed.  Returns 1 with `dst` filled when the worker's ids match the
+ * caller's exactly; on any mismatch the stash is poisoned and the caller
+ * falls back to the inline read.  A not-yet-finished matching slot is
+ * waited on: the worker is already faulting its pages, so waiting is never
+ * slower than starting the same faults inline. */
+static int qw_ple_pg_take(ds4_qwen4exp_session *s, int32_t tok,
+                          const uint64_t *ids, float *dst) {
+    if (!s->ple_pg_started) return 0;
+    int ok = 0;
+    pthread_mutex_lock(&s->ple_pg_mu);
+    for (;;) {
+        if (s->ple_pg_stop || s->ple_pg_poison ||
+            s->ple_pg_out >= s->ple_pg_in) {
+            break;
+        }
+        const uint64_t slot = s->ple_pg_out % QW_PLE_PG_RING;
+        if (s->ple_pg_tok[slot] != tok ||
+            s->ple_pg_slot_gen[slot] != s->ple_pg_gen) {
+            s->ple_pg_poison = 1;
+            break;
+        }
+        if (s->ple_pg_out >= s->ple_pg_done) {
+            pthread_cond_wait(&s->ple_pg_cv_out, &s->ple_pg_mu);
+            continue;
+        }
+        if (memcmp(s->ple_pg_ids[slot], ids,
+                   (size_t)DS4_N_PLE_HEAD * sizeof(uint64_t)) != 0) {
+            s->ple_pg_poison = 1;
+            break;
+        }
+        memcpy(dst,
+               s->ple_pg_rows + (size_t)slot * (size_t)DS4_N_PLE_EMBD,
+               (size_t)DS4_N_PLE_EMBD * sizeof(float));
+        s->ple_pg_out++;
+        ok = 1;
+        break;
+    }
+    pthread_mutex_unlock(&s->ple_pg_mu);
+    return ok;
+}
+
 static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                                       const ds4_qwen4exp_weights *w,
                                       const int32_t *tokens,
@@ -1306,6 +1525,10 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
              * head.  Same addresses, same values. */
             const uint64_t *ids = s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD;
             float *dst = s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD;
+            /* The draft-window worker may already hold this token's rows:
+             * take them only when its ids match the ones just computed, so
+             * a stashed block is byte-identical to the inline read. */
+            if (qw_ple_pg_take(s, tokens[t], ids, dst)) continue;
             for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
                 const uint64_t row = ids[h];
                 /* Every head of this token except the last is followed by
@@ -1363,9 +1586,14 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
             ds4_ple_row_ids(&s->ple_constants, &s->ple_history, tokens,
                             n_tokens, s->ple_ids);
             for (uint32_t t = 0; t < n_tokens; t++) {
+                const uint64_t *ids =
+                    s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD;
+                float *dst = s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD;
+                /* Same stash contract as the armed path: take only on an
+                 * exact id match, else read inline. */
+                if (qw_ple_pg_take(s, tokens[t], ids, dst)) continue;
                 for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
-                    const uint64_t row =
-                        s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h];
+                    const uint64_t row = ids[h];
                     const uint8_t *quant = ds4_qwen4exp_ple_row(&w->ple, row);
                     if (!quant) {
                         fprintf(stderr,
@@ -1377,8 +1605,7 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                     }
                     ds4_ple_dequant_iq4_nl(
                         quant, blocks_per_row,
-                        s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD +
-                            (uint64_t)h * DS4_N_PLE_ROW_DIM);
+                        dst + (uint64_t)h * DS4_N_PLE_ROW_DIM);
                 }
             }
         } else {
