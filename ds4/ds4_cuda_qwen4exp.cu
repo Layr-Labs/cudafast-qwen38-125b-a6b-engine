@@ -412,6 +412,13 @@ __device__ __forceinline__ static float qwen4exp_gdn_softplus(float x) {
  * 2 * n_key_head are query and key heads and take the RMS norm; the rest are
  * value heads and only take the activation.
  */
+/* the gated-deltanet recurrence kernels beside this one carry no block
+ * barriers at all; they are warp-shuffle only. The only block barriers in
+ * this family are this convolution fold and its decode twin, and the output
+ * kernels, and all of them are genuine cross-warp reductions over four
+ * warps. There is no dead barrier to remove in the gated-deltanet path,
+ * which is twenty-seven percent of decode.
+ */
 __global__ static void qwen4exp_gdn_conv_kernel(
         float       *qkv,
         float       *conv_state,
