@@ -49,6 +49,9 @@
 #include "ds4_gpu.h"
 #include "ds4_cuda_qwen4exp.cuh"
 #include "ds4_qwen4exp_moe_types.h"
+
+/* MOE_PRELUDE_SAME_MECHANISM_REDRAW_20260916: comment-only identity marker;
+ * compiled behavior and the small-row MoE prelude mechanism are unchanged. */
 #include "ds4_qwen4exp_hc_types.h"
 #include "ds4_qwen4exp_qsa_scratch.h"
 
@@ -647,99 +650,6 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
         }
     }
     *state_ptr = h;
-}
-
-/* Bounded input replay for a two-row verify. The base state stays intact
- * across rejection; accepted transitions are replayed in their original
- * order before the current inputs. Only K, V and the already-computed gate
- * pair are retained. All state arithmetic below is the ordinary recurrence's
- * dot4/XOR/FMA sequence. Replayed rows have no output reader.
- *
- * A full log publishes a new checkpoint AFTER current row zero, which is
- * always committed. No log slot is overwritten on that flush: another CTA
- * could still be reading it. Otherwise row zero appends to slot `prefix`,
- * disjoint from the prefix all CTAs read. State cells have unique owners, so
- * the flush can overwrite each owner's base cell after that owner loaded it. */
-__global__ static void qwen4exp_gdn_replay_kernel(
-        float *out, float *state, float *checkpoint, float *tape,
-        const float *qkv, const float *raw_alpha, const float *raw_beta,
-        const float *a_log, const float *dt_bias,
-        uint32_t n_key_head, uint32_t n_value_head, uint32_t n_tokens,
-        uint32_t head_layout, const uint32_t *control, uint32_t replay_rows) {
-    const uint32_t head = blockIdx.x;
-    const uint32_t value = blockIdx.y * 4u + (threadIdx.x >> 5u);
-    const uint32_t lane = threadIdx.x & 31u;
-    if (head >= n_value_head || value >= QWEN4EXP_GDN_DIM) return;
-    const uint32_t prefix = control ? *control : replay_rows;
-    if (prefix > DS4_QWEN4EXP_GDN_REPLAY_ROWS) return;
-    const uint32_t key_dim = n_key_head * QWEN4EXP_GDN_DIM;
-    const uint32_t value_dim = n_value_head * QWEN4EXP_GDN_DIM;
-    const uint32_t conv_dim = 2u * key_dim + value_dim;
-    const uint32_t tape_stride = (key_dim + value_dim + 2u * n_value_head + 3u) & ~3u;
-    const uint32_t repeats = n_value_head / n_key_head;
-    const uint32_t key_head = head_layout != 0u ? head % n_key_head : head / repeats;
-    const uint32_t key_writer = head_layout != 0u ? key_head : key_head * repeats;
-    const uint32_t k0 = lane * 4u;
-    const uint64_t state_off = ((uint64_t)head * QWEN4EXP_GDN_DIM + value) *
-                               QWEN4EXP_GDN_DIM + k0;
-    float4 h = *(const float4 *)(checkpoint + state_off);
-    const float decay_coeff = n_tokens ? a_log[head] : 0.0f;
-    const float bias = n_tokens ? dt_bias[head] : 0.0f;
-    for (uint32_t step = 0; step < prefix + n_tokens; step++) {
-        const bool replay = step < prefix;
-        const uint32_t token = replay ? 0u : step - prefix;
-        const float *const saved = tape + (uint64_t)(replay ? step : 0u) * tape_stride;
-        const uint64_t base = (uint64_t)token * conv_dim + key_head * QWEN4EXP_GDN_DIM;
-        const float4 k4 = *(const float4 *)(replay
-            ? saved + key_head * QWEN4EXP_GDN_DIM + k0
-            : qkv + base + key_dim + k0);
-        const float v_row = replay
-            ? saved[key_dim + head * QWEN4EXP_GDN_DIM + value]
-            : qkv[(uint64_t)token * conv_dim + 2u * key_dim +
-                  head * QWEN4EXP_GDN_DIM + value];
-        float g = 0.0f, beta = 0.0f;
-        if (replay) {
-            const float2 pair = ((const float2 *)(saved + key_dim + value_dim))[head];
-            g = pair.x; beta = pair.y;
-        } else {
-            const uint64_t gate = (uint64_t)token * n_value_head + head;
-            if (lane == 0u) {
-                g = expf(decay_coeff * qwen4exp_gdn_softplus(raw_alpha[gate] + bias));
-                beta = qwen4exp_gdn_sigmoid(raw_beta[gate]);
-            }
-            g = __shfl_sync(0xffffffffu, g, 0);
-            beta = __shfl_sync(0xffffffffu, beta, 0);
-            if (token == 0u && prefix < DS4_QWEN4EXP_GDN_REPLAY_ROWS) {
-                float *const record = tape + (uint64_t)prefix * tape_stride;
-                if (value == 0u && head == key_writer)
-                    *(float4 *)(record + key_head * QWEN4EXP_GDN_DIM + k0) = k4;
-                if (lane == 0u) {
-                    record[key_dim + head * QWEN4EXP_GDN_DIM + value] = v_row;
-                    if (value == 0u)
-                        ((float2 *)(record + key_dim + value_dim))[head] = make_float2(g, beta);
-                }
-            }
-        }
-        h.x *= g;
-        h.y *= g;
-        h.z *= g;
-        h.w *= g;
-        const float hk = warp_sum_all_f32(dot4_f32(h, k4));
-        const float delta_v = (v_row - hk) * beta;
-        h.x = fmaf(k4.x, delta_v, h.x);
-        h.y = fmaf(k4.y, delta_v, h.y);
-        h.z = fmaf(k4.z, delta_v, h.z);
-        h.w = fmaf(k4.w, delta_v, h.w);
-        if (!replay) {
-            const float4 q4 = *(const float4 *)(qkv + base + k0);
-            const float result = warp_sum_all_f32(dot4_f32(h, q4));
-            if (lane == 0u)
-                out[(uint64_t)token * value_dim + head * QWEN4EXP_GDN_DIM + value] = result;
-            if (token == 0u && prefix == DS4_QWEN4EXP_GDN_REPLAY_ROWS)
-                *(float4 *)(checkpoint + state_off) = h;
-        }
-    }
-    *(float4 *)(state + state_off) = h;
 }
 
 /* Long chunks reuse one Q/K vector and gate pair across four independent
@@ -1350,8 +1260,7 @@ static int qwen4exp_cuda_gdn_run(
         uint64_t              q_offset,
         uint64_t              s_offset,
         const ds4_gpu_tensor *adopt,
-        const char           *label,
-        const ds4_gpu_qwen4exp_gdn_replay *replay = NULL) {
+        const char           *label) {
     uint64_t key_dim = 0, value_dim = 0, conv_dim = 0, slots = 0;
     uint64_t qkv_elements = 0, out_elements = 0, gate_elements = 0;
     uint64_t conv_elements = 0, state_elements = 0, state_rows = 0;
@@ -1456,16 +1365,6 @@ static int qwen4exp_cuda_gdn_run(
         adopt ? (const uint32_t *)adopt->ptr : NULL;
 
     const int logical_tier = ds4_tensor_device_idx(out);
-    if (replay && (n_rows != 1u || n_tokens != 2u || n_snapshot_rows != 1u ||
-        conv_dim > UINT32_MAX || key_dim + value_dim + 2ull * n_value_head > UINT32_MAX - 3u ||
-        !adopt || !glm53_cuda_tensor_has(replay->checkpoint, state_elements, sizeof(float)) ||
-        !glm53_cuda_tensor_has(replay->tape, DS4_QWEN4EXP_GDN_REPLAY_ROWS *
-            ((key_dim + value_dim + 2ull * n_value_head + 3ull) & ~3ull), sizeof(float)) ||
-        !glm53_cuda_tensor_has(replay->control, 1u, sizeof(uint32_t)) ||
-        replay->checkpoint->ptr == recurrent_state->ptr ||
-        ds4_tensor_device_idx(replay->checkpoint) != logical_tier ||
-        ds4_tensor_device_idx(replay->tape) != logical_tier ||
-        ds4_tensor_device_idx(replay->control) != logical_tier)) return 0;
     const float *conv_weight = qwen4exp_gdn_weight_f32(
         conv_weight_slab->map, conv_weight_slab->map_size,
         conv_weight_slab->offset, conv_dim * 4u,
@@ -1543,15 +1442,7 @@ static int qwen4exp_cuda_gdn_run(
 
     const dim3 recurrence_grid(
         n_value_head, QWEN4EXP_GDN_DIM / 4u, n_rows);
-    if (replay) {
-        qwen4exp_gdn_replay_kernel<<<recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
-            (float *)out->ptr, (float *)recurrent_state->ptr,
-            (float *)replay->checkpoint->ptr, (float *)replay->tape->ptr,
-            (const float *)qkv->ptr, (const float *)raw_alpha->ptr,
-            (const float *)raw_beta->ptr, a_log, dt_bias,
-            n_key_head, n_value_head, n_tokens, head_layout,
-            (const uint32_t *)replay->control->ptr, 0u);
-    } else if (gate_pairs) {
+    if (gate_pairs) {
         if (n_key_head == 16u && n_value_head == 48u &&
             getenv("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE") == NULL &&
             getenv("DS4_QWEN4EXP_NO_GDN_OCTET") == NULL) {
@@ -1782,68 +1673,6 @@ extern "C" int ds4_gpu_qwen4exp_gdn_decode(
         output_gate, conv_weight_slab, a_log_slab, dt_bias_slab,
         output_norm_slab, n_key_head, n_value_head, n_rows, head_layout,
         qk_norm_eps, norm_eps, NULL, 0u, 0u);
-}
-
-extern "C" int ds4_gpu_qwen4exp_gdn_replay_supported(void) {
-    return g_n_gpus == 1;
-}
-
-extern "C" int ds4_gpu_qwen4exp_gdn_replay_materialize(
-        ds4_gpu_tensor *state, ds4_gpu_tensor *checkpoint, ds4_gpu_tensor *tape,
-        uint32_t rows, uint32_t nk, uint32_t nv, uint32_t layout) {
-    const uint64_t state_elements = (uint64_t)nv * QWEN4EXP_GDN_DIM * QWEN4EXP_GDN_DIM;
-    const uint64_t stride = ((((uint64_t)nk + nv) * QWEN4EXP_GDN_DIM + 2ull * nv + 3ull) & ~3ull);
-    if (!nk || !nv || nv % nk || layout > DS4_QWEN4EXP_GDN_HEADS_TILED ||
-        stride > UINT32_MAX || nv > UINT32_MAX / QWEN4EXP_GDN_DIM ||
-        rows > DS4_QWEN4EXP_GDN_REPLAY_ROWS ||
-        !glm53_cuda_tensor_has(state, state_elements, sizeof(float)) ||
-        !glm53_cuda_tensor_has(checkpoint, state_elements, sizeof(float)) ||
-        !glm53_cuda_tensor_has(tape, stride * DS4_QWEN4EXP_GDN_REPLAY_ROWS, sizeof(float)) ||
-        state->ptr == checkpoint->ptr || state->ptr == tape->ptr ||
-        checkpoint->ptr == tape->ptr ||
-        ds4_tensor_device_idx(state) != ds4_tensor_device_idx(checkpoint) ||
-        ds4_tensor_device_idx(state) != ds4_tensor_device_idx(tape)) return 0;
-    qwen4exp_gdn_replay_kernel<<<dim3(nv, QWEN4EXP_GDN_DIM / 4u, 1u),
-                                 QWEN4EXP_GDN_DIM, 0, cuda_decode_stream()>>>(
-        NULL, (float *)state->ptr, (float *)checkpoint->ptr, (float *)tape->ptr,
-        NULL, NULL, NULL, NULL, NULL, nk, nv, 0u, layout, NULL, rows);
-    return cuda_ok(cudaGetLastError(), "qwen4exp GDN replay materialize");
-}
-
-extern "C" int ds4_gpu_qwen4exp_gdn_replay_q8(
-        ds4_gpu_tensor       *out,
-        ds4_gpu_tensor       *conv_state,
-        ds4_gpu_tensor       *recurrent_state,
-        ds4_gpu_tensor       *conv_snapshot,
-        ds4_gpu_tensor       *state_snapshot,
-        uint32_t              n_snapshot_rows,
-        const ds4_gpu_tensor *adopt,
-        ds4_gpu_tensor       *qkv,
-        const ds4_gpu_tensor *raw_alpha,
-        const ds4_gpu_tensor *raw_beta,
-        const ds4_gpu_tensor *output_gate,
-        const ds4_gpu_qwen4exp_slab *conv_weight_slab,
-        const ds4_gpu_qwen4exp_slab *a_log_slab,
-        const ds4_gpu_qwen4exp_slab *dt_bias_slab,
-        const ds4_gpu_qwen4exp_slab *output_norm_slab,
-        uint32_t              n_key_head,
-        uint32_t              n_value_head,
-        uint32_t              n_tokens,
-        uint32_t              head_layout,
-        float                 qk_norm_eps,
-        float                 norm_eps,
-        ds4_gpu_tensor       *out_q8,
-        uint64_t              q_offset,
-        uint64_t              s_offset,
-        const ds4_gpu_qwen4exp_gdn_replay *replay) {
-    if (!adopt || !replay) return 0;
-    return qwen4exp_cuda_gdn_run(
-        out, conv_state, recurrent_state, conv_snapshot, state_snapshot,
-        n_snapshot_rows, qkv, raw_alpha, raw_beta,
-        output_gate, conv_weight_slab, a_log_slab, dt_bias_slab,
-        output_norm_slab,
-        n_key_head, n_value_head, 1u, n_tokens, head_layout,
-        qk_norm_eps, norm_eps, out_q8, q_offset, s_offset, adopt, "replay", replay);
 }
 
 /* The GDN block at a speculative width -- one row of n_tokens <= the commit
@@ -2577,26 +2406,10 @@ __device__ __forceinline__ static float dev_qwen4exp_block_sum(
  * envelope as sixteen coalesced rows, keep them in registers, and select the
  * small top-k without sorting the 502 entries the model will discard. */
 template<bool Native>
-__global__ static void qwen4exp_router_select_topk_kernel(
-        int32_t *selected,
-        float *weights_out,
-        const float *logits,
-        uint32_t n_expert,
-        uint32_t n_expert_used,
-        uint32_t n_tokens) {
-    /* PDL producer for the MoE grouping kernel, which is the next launch on
-     * the stream and whose first act is to read the `selected` list written
-     * here.  That grouping kernel is one block; this one is n_tokens blocks
-     * of one warp, so the deadlock rule (ds4_cuda_qwen4exp.cuh) is satisfied
-     * with room to spare at every width the grouping kernel's own gate
-     * (n_tokens < 8) admits -- and the gate below reads the grid in the body,
-     * not a convention at the launch site, so a prefill launch at a thousand
-     * rows never carries a live trigger.  A width with no PSS consumer behind
-     * it triggers into nothing. */
-    if (gridDim.x <= 7u) QWEN4EXP_PDL_TRIGGER();
-    const uint32_t tok = blockIdx.x;
-    if (tok >= n_tokens) return;
-    const uint32_t lane = threadIdx.x;
+__device__ __forceinline__ static void qwen4exp_router_select_topk_warp(
+        int32_t *selected, float *weights_out, const float *logits,
+        uint32_t n_expert, uint32_t n_expert_used,
+        uint32_t tok, uint32_t lane) {
     const float *lg = logits + (uint64_t)tok * n_expert;
     int32_t *sel = selected + (uint64_t)tok * n_expert_used;
     float *w = weights_out + (uint64_t)tok * n_expert_used;
@@ -2699,6 +2512,31 @@ __global__ static void qwen4exp_router_select_topk_kernel(
             for (uint32_t i = 0; i < n_expert_used; i++) w[i] *= inv;
         }
     }
+}
+
+template<bool Native>
+__global__ static void qwen4exp_router_select_topk_kernel(
+        int32_t *selected,
+        float *weights_out,
+        const float *logits,
+        uint32_t n_expert,
+        uint32_t n_expert_used,
+        uint32_t n_tokens) {
+    /* PDL producer for the MoE grouping kernel, which is the next launch on
+     * the stream and whose first act is to read the `selected` list written
+     * here.  That grouping kernel is one block; this one is n_tokens blocks
+     * of one warp, so the deadlock rule (ds4_cuda_qwen4exp.cuh) is satisfied
+     * with room to spare at every width the grouping kernel's own gate
+     * (n_tokens < 8) admits -- and the gate below reads the grid in the body,
+     * not a convention at the launch site, so a prefill launch at a thousand
+     * rows never carries a live trigger.  A width with no PSS consumer behind
+     * it triggers into nothing. */
+    if (gridDim.x <= 7u) QWEN4EXP_PDL_TRIGGER();
+    const uint32_t tok = blockIdx.x;
+    if (tok >= n_tokens) return;
+    const uint32_t lane = threadIdx.x;
+    qwen4exp_router_select_topk_warp<Native>(selected, weights_out, logits,
+            n_expert, n_expert_used, tok, lane);
 }
 
 /* One block per token.  Bitonic sort over the raw logits with ties going to
@@ -2980,7 +2818,7 @@ __global__ static void qwen4exp_moe_pair_tasks_kernel(
  * expert thread scans the short pair list, the block performs the same integer
  * prefix scans as the wide path, and each expert writes its pairs in ascending
  * pair order. */
-__global__ static void qwen4exp_moe_group_small_kernel(
+__device__ __forceinline__ static void qwen4exp_moe_group_small_block(
         int32_t *counts,
         int32_t *offsets,
         int32_t *cursor,
@@ -2995,17 +2833,6 @@ __global__ static void qwen4exp_moe_group_small_kernel(
         uint32_t mid_token_stride) {
     __shared__ int32_t warp_count_prefix[QWEN4EXP_MOE_SCAN_THREADS / 32];
     __shared__ int32_t warp_live_prefix[QWEN4EXP_MOE_SCAN_THREADS / 32];
-    /* PDL consumer of the router's top-k, which triggers at its top.  This
-     * kernel is one 512-thread block and its very first global read is
-     * `selected`, the router's output, so there is no weight load to hoist
-     * above the fence and nothing moves: the fence sits at the top and the
-     * whole win is that this block is already resident when the router's
-     * warps retire, instead of costing a launch afterwards.  Every read below
-     * it is an activation read, per the header's rule, and none of this
-     * kernel's pointers carries __restrict__, so the .nc hazard does not
-     * apply.  Plainly launched -- at the prefill widths where the caller
-     * takes the wide grouping path instead -- the fence is a no-op. */
-    QWEN4EXP_PDL_SYNC();
     const uint32_t e = threadIdx.x;
     const uint32_t lane = e & 31u;
     const uint32_t warp = e >> 5u;
@@ -3089,6 +2916,25 @@ __global__ static void qwen4exp_moe_group_small_kernel(
             for (uint32_t row = 0; row < mid_dim; row++) dst[row] = 0.0f;
         }
     }
+}
+
+__global__ static void qwen4exp_moe_group_small_kernel(
+        int32_t *counts,
+        int32_t *offsets,
+        int32_t *cursor,
+        int32_t *active,
+        int32_t *pairs,
+        float *mid,
+        const int32_t *selected,
+        uint32_t n_expert,
+        uint32_t n_pairs,
+        uint32_t n_expert_used,
+        uint32_t mid_dim,
+        uint32_t mid_token_stride) {
+    QWEN4EXP_PDL_SYNC();
+    qwen4exp_moe_group_small_block(counts, offsets, cursor, active, pairs,
+            mid, selected, n_expert, n_pairs, n_expert_used, mid_dim,
+            mid_token_stride);
 }
 
 __global__ static void qwen4exp_moe_group_scatter_kernel(
@@ -7214,6 +7060,86 @@ __global__ static void qwen4exp_shared_gate_kernel(
 
 
 
+/* A 256-leaf shared gate inside a 512-thread CTA. All threads reach the
+ * barriers, but only the original 256 leaves take part in the reduction. */
+__device__ __forceinline__ static void qwen4exp_shared_gate_f32_block(
+        float *gate_out, const float *router, const float *x,
+        uint32_t in_dim, uint32_t token, float *scratch) {
+    const uint32_t tid = threadIdx.x;
+    float acc = 0.0f;
+    if (tid < 256u) {
+        const float *xr = x + (uint64_t)token * in_dim;
+        const uint32_t steps = in_dim > tid ? (in_dim - tid + 255u) / 256u : 0u;
+        uint32_t s = 0u;
+        for (; s + QWEN4EXP_SHARED_GATE_STEPS <= steps;
+               s += QWEN4EXP_SHARED_GATE_STEPS) {
+            float wv[QWEN4EXP_SHARED_GATE_STEPS];
+            float xv[QWEN4EXP_SHARED_GATE_STEPS];
+#pragma unroll
+            for (uint32_t u = 0; u < QWEN4EXP_SHARED_GATE_STEPS; u++) {
+                const uint32_t k = tid + (s + u) * 256u;
+                wv[u] = router[k];
+                xv[u] = xr[k];
+            }
+#pragma unroll
+            for (uint32_t u = 0; u < QWEN4EXP_SHARED_GATE_STEPS; u++)
+                acc += wv[u] * xv[u];
+        }
+        for (; s < steps; s++) acc += router[tid + s * 256u] * xr[tid + s * 256u];
+        scratch[tid] = acc;
+    }
+    __syncthreads();
+    for (uint32_t stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) scratch[tid] += scratch[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0u) gate_out[token] = 1.0f / (1.0f + expf(-scratch[0]));
+}
+
+/* Four small preparation launches become one grid. CTA zero selects each
+ * row in its own warp, publishes those ids, and builds the usual metadata.
+ * The next CTAs compute the shared sigmoid gates; the rest quantize input
+ * groups with the existing warp helper. These three jobs are independent.
+ * No cross-CTA barrier, atomics, new scratch or weight representation.
+ * The unchanged expert GEMMs consume the grid after ordinary stream order. */
+template<bool Native>
+__global__ static void qwen4exp_moe_prelude_kernel(
+        int32_t *selected, float *weights, const float *logits,
+        int32_t *counts, int32_t *offsets, int32_t *cursor, int32_t *active,
+        int32_t *pairs, float *mid,
+        int8_t *xq, float *xs, int32_t *xsum, const float *x,
+        float *shared_gate, const float *shared_router,
+        uint32_t n_expert, uint32_t n_used, uint32_t rows,
+        uint32_t in_dim, uint32_t mid_dim, uint32_t mid_stride) {
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    if (blockIdx.x == 0u) {
+        if (warp < rows)
+            qwen4exp_router_select_topk_warp<Native>(
+                    selected, weights, logits, n_expert, n_used, warp, lane);
+        __syncthreads();
+        qwen4exp_moe_group_small_block(counts, offsets, cursor, active, pairs,
+                mid, selected, n_expert, rows * n_used, n_used, mid_dim,
+                mid_stride);
+    } else if (blockIdx.x <= rows) {
+        __shared__ float gate_scratch[256];
+        qwen4exp_shared_gate_f32_block(shared_gate, shared_router, x,
+                in_dim, blockIdx.x - 1u, gate_scratch);
+    } else {
+        const uint32_t group = (blockIdx.x - rows - 1u) * 16u + warp;
+        const uint32_t groups = in_dim / 32u;
+        if (group < rows * groups)
+            dev_qwen4exp_quantize_group(xq, xs, xsum,
+                    x + (uint64_t)group * 32u, lane, 32u, group);
+    }
+}
+
+struct qwen4exp_moe_prelude {
+    const ds4_gpu_tensor *logits;
+    ds4_gpu_tensor *shared_gate;
+    const char *shared_router;
+};
+
 /* Twin of ds4_gpu_qwen4exp_moe_type_supported in ds4_metal.m. */
 static bool cuda_qwen4exp_moe_type_supported(uint32_t type) {
 #define DS4_QWEN4EXP_TYPE_MATCH(name, id) if (type == (uint32_t)(id)) return true;
@@ -7386,7 +7312,7 @@ static int qwen4exp_moe_tile(uint32_t n_rows) {
     return 8;
 }
 
-extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
+static int qwen4exp_routed_moe_cuda(
         ds4_gpu_tensor              *out,
         ds4_gpu_tensor              *mid,
         ds4_gpu_tensor              *down_partial,
@@ -7402,7 +7328,8 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         uint32_t                     n_expert_used,
         const ds4_gpu_tensor        *x,
         uint32_t                     n_tokens,
-        uint32_t                     mid_token_stride) {
+        uint32_t                     mid_token_stride,
+        const qwen4exp_moe_prelude *prelude) {
     if (!out || !mid || !gate_slab || !up_slab || !down_slab ||
         !gate_slab->map || !up_slab->map || !down_slab->map ||
         !selected || !weights || !x ||
@@ -7531,7 +7458,21 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     const int small_group =
         n_tokens < 8u && n_total_expert <= QWEN4EXP_MOE_SCAN_THREADS &&
         getenv("DS4_QWEN4EXP_SERIAL_GROUP_SCAN") == NULL;
-    if (small_group) {
+    if (prelude) {
+        const unsigned blocks = 1u + n_tokens + (n_tokens * xgroups + 15u) / 16u;
+#define QW_PRELUDE(NATIVE) \
+        qwen4exp_moe_prelude_kernel<NATIVE><<<blocks, 512u, 0, stream>>>( \
+                (int32_t *)selected->ptr, (float *)weights->ptr, \
+                (const float *)prelude->logits->ptr, \
+                sc.counts, sc.offsets, sc.cursor, sc.active, sc.pairs, \
+                (float *)mid->ptr, sc.xq, sc.xs, sc.xsum, \
+                (const float *)x->ptr, (float *)prelude->shared_gate->ptr, \
+                (const float *)prelude->shared_router, n_total_expert, \
+                n_expert_used, n_tokens, in_dim, mid_dim, mid_token_stride)
+        if (getenv("DS4_QWEN4EXP_NO_ROUTER_NATIVE") == NULL) { QW_PRELUDE(true); }
+        else { QW_PRELUDE(false); }
+#undef QW_PRELUDE
+    } else if (small_group) {
         /* PSS: the router's top-k is the stream predecessor and triggers at
          * these widths (its gate is the same n_tokens < 8 this branch is), so
          * this one block comes up while the router's warps are still retiring.
@@ -7576,7 +7517,8 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     }
     if (!cuda_ok(cudaGetLastError(), "qwen4exp MoE pair list")) return 0;
 
-    if (!qwen4exp_quantize_rows(sc.xq, sc.xs, sc.xsum, (const float *)x->ptr,
+    if (!prelude &&
+        !qwen4exp_quantize_rows(sc.xq, sc.xs, sc.xsum, (const float *)x->ptr,
                                 n_tokens, in_dim, xgroups, in_dim, 0, 1,
                                 stream)) {
         return 0;
@@ -7948,7 +7890,29 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     return cuda_ok(cudaGetLastError(), "qwen4exp MoE down launch");
 }
 
-extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
+extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
+        ds4_gpu_tensor              *out,
+        ds4_gpu_tensor              *mid,
+        ds4_gpu_tensor              *down_partial,
+        const ds4_gpu_qwen4exp_slab *gate_slab,
+        const ds4_gpu_qwen4exp_slab *up_slab,
+        const ds4_gpu_qwen4exp_slab *down_slab,
+        uint32_t                     in_dim,
+        uint32_t                     mid_dim,
+        uint32_t                     out_dim,
+        const ds4_gpu_tensor        *selected,
+        const ds4_gpu_tensor        *weights,
+        uint32_t                     n_total_expert,
+        uint32_t                     n_expert_used,
+        const ds4_gpu_tensor        *x,
+        uint32_t                     n_tokens,
+        uint32_t                     mid_token_stride) {
+    return qwen4exp_routed_moe_cuda(out, mid, down_partial, gate_slab,
+            up_slab, down_slab, in_dim, mid_dim, out_dim, selected, weights,
+            n_total_expert, n_expert_used, x, n_tokens, mid_token_stride, NULL);
+}
+
+static int qwen4exp_shared_expert_cuda(
         ds4_gpu_tensor              *out,
         ds4_gpu_tensor              *mid,
         ds4_gpu_tensor              *gate_scale,
@@ -7961,7 +7925,8 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         uint32_t                     out_dim,
         const ds4_gpu_tensor        *x,
         uint32_t                     n_tokens,
-        int                          pre_quantized) {
+        int                          pre_quantized,
+        int                          pre_gated) {
     if (!out || !mid || !gate_scale || !x ||
         !router_slab || !gate_slab || !up_slab || !down_slab ||
         !router_slab->map || !gate_slab->map || !up_slab->map || !down_slab->map ||
@@ -8010,6 +7975,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
     const bool specialize_shared =
         getenv("DS4_QWEN4EXP_GENERIC_EXPERTS") == NULL;
 
+    if (!pre_gated) {
     /* The sigmoid gate is one dot against ONE F32 row per token.  It reads
      * kilobytes, not megabytes, so it keeps the scalar reduction. Resolve its
      * checkpoint-wide F32 type at launch just as the Q8 projections below do;
@@ -8027,6 +7993,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
                 router_slab->type, in_dim, n_tokens);
     }
     if (!cuda_ok(cudaGetLastError(), "qwen4exp shared gate launch")) return 0;
+    }
 
     const uint32_t xgroups = in_dim / 32u;
     const uint32_t mgroups = mid_dim / 32u;
@@ -8342,6 +8309,91 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
 #undef QWEN4EXP_SH_DOWN_IMPL
     }
     return cuda_ok(cudaGetLastError(), "qwen4exp shared down launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
+        ds4_gpu_tensor              *out,
+        ds4_gpu_tensor              *mid,
+        ds4_gpu_tensor              *gate_scale,
+        const ds4_gpu_qwen4exp_slab *router_slab,
+        const ds4_gpu_qwen4exp_slab *gate_slab,
+        const ds4_gpu_qwen4exp_slab *up_slab,
+        const ds4_gpu_qwen4exp_slab *down_slab,
+        uint32_t                     in_dim,
+        uint32_t                     mid_dim,
+        uint32_t                     out_dim,
+        const ds4_gpu_tensor        *x,
+        uint32_t                     n_tokens,
+        int                          pre_quantized) {
+    return qwen4exp_shared_expert_cuda(out, mid, gate_scale, router_slab,
+            gate_slab, up_slab, down_slab, in_dim, mid_dim, out_dim,
+            x, n_tokens, pre_quantized, 0);
+}
+
+extern "C" int ds4_gpu_qwen4exp_moe_prelude_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *mid, ds4_gpu_tensor *down_partial,
+        ds4_gpu_tensor *shared_mid, ds4_gpu_tensor *shared_gate,
+        ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *logits, const ds4_gpu_tensor *x,
+        const ds4_gpu_qwen4exp_slab routed[3],
+        const ds4_gpu_qwen4exp_slab shared[4],
+        uint32_t in_dim, uint32_t mid_dim, uint32_t out_dim,
+        uint32_t n_expert, uint32_t n_used, uint32_t rows,
+        uint32_t mid_stride) {
+    if (!routed || !shared || !rows || !in_dim || !mid_dim || !out_dim ||
+        !n_expert || !n_used || n_used > n_expert ||
+        (uint64_t)mid_stride < (uint64_t)n_used * mid_dim) return 0;
+    /* Bounded grid; expert formats and every GEMM dispatch remain unchanged.
+     * These valves must still describe the operations actually run. */
+    if (rows > 7u || n_expert > 512u || n_used > 32u ||
+        (in_dim & 31u) || (mid_dim & 31u) ||
+        shared[0].type != DS4_QWEN4EXP_TY_f32 ||
+        1u + rows + ((uint64_t)rows * (in_dim / 32u) + 15u) / 16u > 48u ||
+        getenv("DS4_QWEN4EXP_NO_MOE_PRELUDE") != NULL ||
+        getenv("DS4_QWEN4EXP_SERIAL_GROUP_SCAN") != NULL ||
+        getenv("DS4_QWEN4EXP_NO_MOE_QUANT_REUSE") != NULL ||
+        getenv("DS4_QWEN4EXP_GENERIC_EXPERTS") != NULL) return -1;
+
+    const ds4_gpu_tensor *t[] = {out, mid, down_partial, shared_mid,
+                                shared_gate, selected, weights, logits, x};
+    const uint64_t need[] = {
+        (uint64_t)rows * out_dim * 4u, (uint64_t)rows * mid_stride * 4u,
+        (uint64_t)rows * n_used * out_dim * 4u,
+        (uint64_t)rows * mid_dim * 4u, (uint64_t)rows * 4u,
+        (uint64_t)rows * n_used * 4u, (uint64_t)rows * n_used * 4u,
+        (uint64_t)rows * n_expert * 4u, (uint64_t)rows * in_dim * 4u
+    };
+    const int tier = cuda_current_tier();
+    for (unsigned i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
+        if (!t[i] || !t[i]->ptr || t[i]->bytes < need[i] ||
+            ds4_tensor_device_idx(t[i]) != tier) return 0;
+        for (unsigned j = 0; j < i; j++) {
+            const uintptr_t a = (uintptr_t)t[i]->ptr;
+            const uintptr_t b = (uintptr_t)t[j]->ptr;
+            if (a <= b ? (uint64_t)(b - a) < need[i]
+                       : (uint64_t)(a - b) < need[j]) return 0;
+        }
+    }
+    for (unsigned i = 0; i < 4u; i++) {
+        const ds4_gpu_qwen4exp_slab *sl = &shared[i];
+        const uint64_t bytes = i == 0u ? (uint64_t)in_dim * 4u
+                : (uint64_t)(i == 3u ? out_dim : mid_dim) * sl->row_bytes;
+        if (!sl->map || !cuda_qwen4exp_moe_type_supported(sl->type) ||
+            sl->offset > sl->map_size || bytes > sl->map_size - sl->offset)
+            return 0;
+    }
+    const char *router = cuda_resolve_weight_ptr(shared[0].map,
+            shared[0].offset, (uint64_t)in_dim * 4u, tier,
+            "qwen4exp MoE prelude shared router");
+    if (!router) return 0;
+    const qwen4exp_moe_prelude prelude = {logits, shared_gate, router};
+    if (!qwen4exp_routed_moe_cuda(out, mid, down_partial,
+                &routed[0], &routed[1], &routed[2], in_dim, mid_dim, out_dim,
+                selected, weights, n_expert, n_used, x, rows, mid_stride,
+                &prelude)) return 0;
+    return qwen4exp_shared_expert_cuda(out, shared_mid, shared_gate,
+            &shared[0], &shared[1], &shared[2], &shared[3],
+            in_dim, mid_dim, out_dim, x, rows, 1, 1);
 }
 
 #include "ds4_qwen4exp_hc_ref.h"

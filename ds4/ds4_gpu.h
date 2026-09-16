@@ -3026,6 +3026,26 @@ int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         uint32_t                     n_tokens,
         int                          pre_quantized);
 
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+/* CUDA small-row MoE: select, group, quantize and compute the shared gate in
+ * one preparation grid, then use the ordinary routed and shared GEMMs.
+ * Slabs are gate/up/down and router/gate/up/down, respectively. All tensors
+ * must be disjoint on the current device. Returns -1 BEFORE any launch when
+ * the shape or diagnostic switches require the ordinary path; 0 is an error
+ * and must not be retried after partial work. Intermediate widths are equal.
+ * No prepared state escapes this call or crosses a graph replay boundary. */
+int ds4_gpu_qwen4exp_moe_prelude_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *mid, ds4_gpu_tensor *down_partial,
+        ds4_gpu_tensor *shared_mid, ds4_gpu_tensor *shared_gate,
+        ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *logits, const ds4_gpu_tensor *x,
+        const ds4_gpu_qwen4exp_slab routed[3],
+        const ds4_gpu_qwen4exp_slab shared[4],
+        uint32_t in_dim, uint32_t mid_dim, uint32_t out_dim,
+        uint32_t n_expert, uint32_t n_used, uint32_t rows,
+        uint32_t mid_stride);
+#endif
+
 int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *mid,
@@ -3806,47 +3826,6 @@ int ds4_gpu_qwen4exp_gdn_decode(
         uint32_t              head_layout,
         float                 qk_norm_eps,
         float                 norm_eps);
-
-/* CUDA depth-one checkpoint/replay. Control is a device uint32 in [0, ROWS].
- * Checkpoint and state are separate equally-sized recurrent buffers. Tape
- * stores only post-convolution K/V and computed (decay,beta) pairs. */
-#include "ds4_qwen4exp_gdn_replay.h"
-typedef struct {
-    ds4_gpu_tensor *checkpoint;
-    ds4_gpu_tensor *tape;
-    const ds4_gpu_tensor *control;
-} ds4_gpu_qwen4exp_gdn_replay;
-int ds4_gpu_qwen4exp_gdn_replay_supported(void);
-int ds4_gpu_qwen4exp_gdn_replay_materialize(
-        ds4_gpu_tensor *state, ds4_gpu_tensor *checkpoint, ds4_gpu_tensor *tape,
-        uint32_t replay_rows, uint32_t n_key_head, uint32_t n_value_head,
-        uint32_t head_layout);
-int ds4_gpu_qwen4exp_gdn_replay_q8(
-        ds4_gpu_tensor       *out,
-        ds4_gpu_tensor       *conv_state,
-        ds4_gpu_tensor       *recurrent_state,
-        ds4_gpu_tensor       *conv_snapshot,
-        ds4_gpu_tensor       *state_snapshot,
-        uint32_t              n_snapshot_rows,
-        const ds4_gpu_tensor *adopt,
-        ds4_gpu_tensor       *qkv,
-        const ds4_gpu_tensor *raw_alpha,
-        const ds4_gpu_tensor *raw_beta,
-        const ds4_gpu_tensor *output_gate,
-        const ds4_gpu_qwen4exp_slab *conv_weight,
-        const ds4_gpu_qwen4exp_slab *a_log,
-        const ds4_gpu_qwen4exp_slab *dt_bias,
-        const ds4_gpu_qwen4exp_slab *output_norm,
-        uint32_t              n_key_head,
-        uint32_t              n_value_head,
-        uint32_t              n_tokens,
-        uint32_t              head_layout,
-        float                 qk_norm_eps,
-        float                 norm_eps,
-        ds4_gpu_tensor       *out_q8,
-        uint64_t              q_offset,
-        uint64_t              s_offset,
-        const ds4_gpu_qwen4exp_gdn_replay *replay);
 
 /* The GDN block at a speculative width (one row of n_tokens <= the commit width,
  * decode's single token included) with lazy rollback.  `adopt` is a device
