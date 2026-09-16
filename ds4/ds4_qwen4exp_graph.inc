@@ -1293,6 +1293,22 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 s->ple_history_rows[t] = s->ple_history;
             }
         }
+        /* The gather's cost is the scattered reach into the n-gram table,
+         * not the dequant: each head names a row anywhere in a mapping too
+         * large to be resident, so every row is a cache-and-TLB miss that
+         * would otherwise serialize behind the previous one.  Every token's
+         * ids are already named before this loop, so the next token's rows
+         * can be asked for while this token's dequantize -- the misses run
+         * under the work instead of ahead of it.  A 90-byte row touches at
+         * most three lines, so three touches cover it.  Prime the first
+         * token before the loop; each iteration then primes the next. */
+        for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
+            const uint8_t *r = w->ple.base +
+                               s->ple_ids[h] * w->ple.row_bytes;
+            __builtin_prefetch(r, 0, 1);
+            __builtin_prefetch(r + 64, 0, 1);
+            __builtin_prefetch(r + 128, 0, 1);
+        }
         for (uint32_t t = 0; t < n_tokens; t++) {
             /* The head's destination strides are constants of the shape, so
              * the token base is hoisted out of the head loop and the head
@@ -1300,12 +1316,18 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
              * head.  Same addresses, same values. */
             const uint64_t *ids = s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD;
             float *dst = s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD;
+            if (t + 1u < n_tokens) {
+                const uint64_t *nids = ids + DS4_N_PLE_HEAD;
+                for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
+                    const uint8_t *r = w->ple.base +
+                                       nids[h] * w->ple.row_bytes;
+                    __builtin_prefetch(r, 0, 1);
+                    __builtin_prefetch(r + 64, 0, 1);
+                    __builtin_prefetch(r + 128, 0, 1);
+                }
+            }
             for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
                 const uint64_t row = ids[h];
-                /* Every head of this token except the last is followed by
-                 * another table row, so ask for the next id early.  Hint. */
-                if (h + 1u < DS4_N_PLE_HEAD)
-                    __builtin_prefetch(ids + h + 1u, 0, 1);
                 const uint8_t *quant = ds4_qwen4exp_ple_row(&w->ple, row);
                 /* Cold: a hashed row past the table is a hard refusal that has
                  * never fired in a scored run, so keep it out of the hot path. */
@@ -1356,7 +1378,28 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
         if (nthreads == 1) {
             ds4_ple_row_ids(&s->ple_constants, &s->ple_history, tokens,
                             n_tokens, s->ple_ids);
+            /* Same scattered-table reach as the armed path above: prime the
+             * first token's rows, then ask for the next token's rows while
+             * this token's dequantize runs, so the misses overlap the work. */
+            for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
+                const uint8_t *r = w->ple.base +
+                                   s->ple_ids[h] * w->ple.row_bytes;
+                __builtin_prefetch(r, 0, 1);
+                __builtin_prefetch(r + 64, 0, 1);
+                __builtin_prefetch(r + 128, 0, 1);
+            }
             for (uint32_t t = 0; t < n_tokens; t++) {
+                if (t + 1u < n_tokens) {
+                    const uint64_t *nids =
+                        s->ple_ids + (uint64_t)(t + 1u) * DS4_N_PLE_HEAD;
+                    for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
+                        const uint8_t *r = w->ple.base +
+                                           nids[h] * w->ple.row_bytes;
+                        __builtin_prefetch(r, 0, 1);
+                        __builtin_prefetch(r + 64, 0, 1);
+                        __builtin_prefetch(r + 128, 0, 1);
+                    }
+                }
                 for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
                     const uint64_t row =
                         s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h];
