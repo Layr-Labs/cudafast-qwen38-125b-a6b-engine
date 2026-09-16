@@ -95,6 +95,12 @@ ds4s_handle *ds4s_open(const char *model_path, const char *mtp_head_path,
         }
     }
 
+    /* Select exact CUDA implementations after scratch/width registration but
+     * before warm-up captures decode graphs. A later selection cannot replace
+     * the kernel nodes already saved in those graphs. The resident reads the
+     * same cached description after open; no probe runs in a request. */
+    (void)ds4s_hw_limits();
+
     /* WARM THE SCORED SHAPES HERE, NOT ON THE FIRST TIMED TOKEN.
      *
      * The block above arms the drafter at open for exactly this reason. It
