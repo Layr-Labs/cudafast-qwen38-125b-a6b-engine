@@ -1507,7 +1507,7 @@ static bool qwen4exp_graph_ple_block(ds4_qwen4exp_session *s,
  * (ds4_gpu_qwen4exp_gdn_prefill_q8).  Decode and verify widths keep the float
  * norm and their captured graphs.  DS4_QWEN4EXP_NO_GDN_OUT_QUANT=1 restores the
  * float norm and the projection's own quantize at every width. */
-#define QW_GDN_OUT_Q8_MIN_TOKENS 64u
+#define QW_GDN_OUT_Q8_MIN_TOKENS 1u
 
 static bool qw_gdn_out_q8_on(void) {
     static int on = -1;
@@ -2212,7 +2212,7 @@ static void qwen4exp_trace_report(uint32_t n_tokens) {
  * bit for bit the separate kernel's.  Gated to widths the fused mixer takes
  * one block per token at (its inject-in-norm threshold) and, with that, clear
  * of every captured decode island. */
-#define DS4_QWEN4EXP_HC_DEFER_MIN_ROWS 48u
+#define DS4_QWEN4EXP_HC_DEFER_MIN_ROWS 24u
 
 static int qwen4exp_hc_defer_off(void) {
     static int cached = -1;
