@@ -6188,6 +6188,9 @@ __device__ __forceinline__ static void mma_m16n8k32_s8_q8(int32_t d[4],
 #endif
 }
 
+#include "ds4_cuda_hc_up_exact.cuh"
+#include "ds4_cuda_hc_up_tune.cuh"
+
 /* The 32 quants of a Q8_0 block begin two bytes into its 34, so they are only
  * 2-byte aligned in the file and cannot be read as uint32 where they lie.
  * These read the aligned words that cover them and funnel-shift -- nine loads
@@ -17402,13 +17405,15 @@ extern "C" void ds4_gpu_set_q8_mma_pipe_wide(int mode) {
  * per-SM shared memory size, so 101376 means a 100 KiB SM and 227328 means a
  * 228 KiB SM -- which is exactly the fork every occupancy argument about the
  * staged decode kernels turns on. */
+static const char *mtp_screen_mma_tune(void);
+
 extern "C" const char *ds4_gpu_hw_limits(void) {
     /* Sized for the device attributes plus the routed-MoE kernel-limits string,
      * which now carries the two prefill tiles as well.  Oversized on purpose:
      * ds4_resident drops the WHOLE limits string rather than truncating it if it
      * does not fit its own ident buffer, so a tight fit here loses the
      * measurement silently. */
-    static char buf[448];
+    static char buf[1024];
     static int built = 0;
     if (built) return buf;
     built = 1;
@@ -17438,6 +17443,16 @@ extern "C" const char *ds4_gpu_hw_limits(void) {
                      "smem/blk_optin=%d sm=%d cc=%d.%d integrated=%d coop=%d",
                      got[0], got[1], got[2], got[3], got[4], got[5]);
     if (n < 0) { buf[0] = '\0'; return buf; }
+    const char *hc = hc_up_exact_tune();
+    if (hc && hc[0] && (size_t)n + 2u < sizeof(buf)) {
+        int added = snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", hc);
+        if (added > 0 && (size_t)added < sizeof(buf) - (size_t)n) n += added;
+    }
+    const char *screen = mtp_screen_mma_tune();
+    if (screen && screen[0] && (size_t)n + 2u < sizeof(buf)) {
+        int added = snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", screen);
+        if (added > 0 && (size_t)added < sizeof(buf) - (size_t)n) n += added;
+    }
     /* The register/shared footprint of the two routed-MoE decode kernels, from
      * the translation unit that owns them.  Truncation is harmless: the string
      * is diagnostic only and snprintf keeps it terminated. */
@@ -17690,6 +17705,16 @@ static int cuda_matmul_q8_0_preq_rows_exact(
          * projections retain their ordinary cache policy. */
         if (in_dim == 320u && out_dim == 10240u &&
             getenv("DS4_Q8_NO_STREAM_LOADS") == NULL) {
+            /* Same ten group dots and original 32-chain tree. The startup
+             * probe must win at both widths and both cache regimes. */
+            if (n_rows <= 2u && cuda_q8_mma_available() &&
+                hc_up_exact_use(ds4_tensor_device_idx(out), n_rows)) {
+                QWEN4EXP_LAUNCH_PDL(matmul_q8_hc_up_exact_mma_kernel,
+                        (unsigned)(out_dim / 32u), 128, 0, cuda_decode_stream(),
+                        (float *)out->ptr, (const unsigned char *)wptr,
+                        xq, xscale, n_rows, (uint32_t)out_dim);
+                return cuda_ok(cudaGetLastError(), "q8 HC up exact MMA launch");
+            }
             if (n_rows == 4u ||
                 (n_rows == 3u && getenv("DS4_QWEN4EXP_WIDE_VERIFY_R2") == NULL)) {
                 /* One four-row tile, weight read once (streaming loads, as
