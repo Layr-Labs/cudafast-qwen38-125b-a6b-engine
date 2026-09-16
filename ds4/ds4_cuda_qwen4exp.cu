@@ -7603,7 +7603,7 @@ static int qwen4exp_shared_mma_ok(const uint32_t *types, uint32_t n_types,
 template <int RouterType = -1>
 /* How many elements of its strided walk a lane asks for before it uses any of
  * them.  Scheduling only, like the norm's own step above. */
-#define QWEN4EXP_SHARED_GATE_STEPS 10u
+#define QWEN4EXP_SHARED_GATE_STEPS 5u
 
 __global__ static void qwen4exp_shared_gate_kernel(
         float *gate_out,
@@ -8928,7 +8928,7 @@ __device__ __forceinline__ static float qwen4exp_block_sum_f32(
  * accumulator.  It has to DIVIDE the walk: 2560 over a block of 256 is ten
  * steps, so a depth above ten leaves everything to the one-at-a-time tail.
  * Ten IS the walk; eight left two serial trips behind the batch. */
-#define QWEN4EXP_RMS_STEPS 10u
+#define QWEN4EXP_RMS_STEPS 5u
 
 /* One block per (group, row), so a hyper-connection norm of four streams is
  * four blocks -- and each of those blocks walked its 2560 elements one memory
@@ -12866,7 +12866,7 @@ __global__ static void __launch_bounds__(256, 2) qwen4exp_qsa3_attention_group_k
 #define QWEN4EXP_QSA_SPLIT_KSTEP 8u
 #endif
 #ifndef QWEN4EXP_QSA_SPLIT_VSTEP
-#define QWEN4EXP_QSA_SPLIT_VSTEP 16u
+#define QWEN4EXP_QSA_SPLIT_VSTEP 32u
 #endif
 
 /* The key a lane owns at `base + tid`, as the per-head kernel derives it:
