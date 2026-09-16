@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>   /* memcpy, for the inline fp16 -> fp32 conversion */
 
 /* Host side of the Qwen4-Exp per-layer embedding (PLE) n-gram table.
  *
@@ -179,7 +180,143 @@ void ds4_ple_row_ids(const ds4_ple_constants *c,
  * `kvalues_iq4nl` table of ggml/src/ggml-common.h.  Block layout: one f16
  * scale then 16 packed bytes; the low nibbles fill the first 16 values of the
  * block and the high nibbles the last 16. */
-void ds4_ple_dequant_iq4_nl(const void *blocks, size_t block_count, float *out);
+/* -------------------------------------------------------------------------
+ * IQ4_NL dequantization, inline.
+ *
+ * This is the hot half of the n-gram gather: it runs once per (token, head),
+ * so sixteen times per token, and the gather is a measurable share of prefill.
+ * It used to live in ds4_qwen4exp_ple.c, which is its OWN object file, while
+ * every caller lives in ds4.c -- so the call was cross-translation-unit and
+ * could never be inlined.  Defined here as `static inline` the compiler can
+ * fold it into the gather loop, keep the code book in registers across the
+ * whole row, and see the block count where it is a constant.
+ *
+ * The out-of-line entry point `ds4_ple_dequant_iq4_nl` keeps its old name and
+ * signature and simply forwards, so existing callers and the table path are
+ * unchanged.
+ * ------------------------------------------------------------------------- */
+/* The IQ4_NL code book, ggml's kvalues_iq4nl. */
+static const int8_t ds4_ple_kv_iq4nl[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+};
+
+/* The high-nibble half of the table, materialised at compile time so the
+ * hot loop carries no lazy-init branch.  Generated as kv_hi[b] ==
+ * ds4_ple_kv_iq4nl[b >> 4] for all 256 byte values. */
+static const int8_t ds4_ple_kv_iq4nl_hi[256] = {
+    -127, -127, -127, -127, -127, -127, -127, -127, -127, -127, -127, -127, -127, -127, -127, -127,
+    -104, -104, -104, -104, -104, -104, -104, -104, -104, -104, -104, -104, -104, -104, -104, -104,
+     -83,  -83,  -83,  -83,  -83,  -83,  -83,  -83,  -83,  -83,  -83,  -83,  -83,  -83,  -83,  -83,
+     -65,  -65,  -65,  -65,  -65,  -65,  -65,  -65,  -65,  -65,  -65,  -65,  -65,  -65,  -65,  -65,
+     -49,  -49,  -49,  -49,  -49,  -49,  -49,  -49,  -49,  -49,  -49,  -49,  -49,  -49,  -49,  -49,
+     -35,  -35,  -35,  -35,  -35,  -35,  -35,  -35,  -35,  -35,  -35,  -35,  -35,  -35,  -35,  -35,
+     -22,  -22,  -22,  -22,  -22,  -22,  -22,  -22,  -22,  -22,  -22,  -22,  -22,  -22,  -22,  -22,
+     -10,  -10,  -10,  -10,  -10,  -10,  -10,  -10,  -10,  -10,  -10,  -10,  -10,  -10,  -10,  -10,
+       1,    1,    1,    1,    1,    1,    1,    1,    1,    1,    1,    1,    1,    1,    1,    1,
+      13,   13,   13,   13,   13,   13,   13,   13,   13,   13,   13,   13,   13,   13,   13,   13,
+      25,   25,   25,   25,   25,   25,   25,   25,   25,   25,   25,   25,   25,   25,   25,   25,
+      38,   38,   38,   38,   38,   38,   38,   38,   38,   38,   38,   38,   38,   38,   38,   38,
+      53,   53,   53,   53,   53,   53,   53,   53,   53,   53,   53,   53,   53,   53,   53,   53,
+      69,   69,   69,   69,   69,   69,   69,   69,   69,   69,   69,   69,   69,   69,   69,   69,
+      89,   89,   89,   89,   89,   89,   89,   89,   89,   89,   89,   89,   89,   89,   89,   89,
+     113,  113,  113,  113,  113,  113,  113,  113,  113,  113,  113,  113,  113,  113,  113,  113,
+};
+
+/* FP16 -> FP32 with no data-dependent loop.
+ *
+ * The shipped converter normalised a subnormal mantissa with
+ * `while ((m & 0x400u) == 0) { m <<= 1; e++; }`.  For the block scales this
+ * table actually carries the loop never runs, so its cost is the branch, not
+ * the shift -- and it is an unpredictable one on the rare subnormal.  A
+ * subnormal has at most ten significant mantissa bits, so the normalising
+ * shift is exactly `__builtin_clz` of the mantissa over a 16-bit field, and
+ * the whole conversion becomes a select plus a shift.
+ *
+ * Bit-identical to the loop for every one of the 65536 possible halves: the
+ * shift amount is the same, the exponent adjustment is the same, and the
+ * mantissa mask is the same.  Verified against the original over the full
+ * 16-bit domain. */
+static inline float ds4_ple_fp16_to_fp32(uint16_t h) {
+    const uint32_t sign     = (uint32_t)(h & 0x8000u) << 16;
+    const uint32_t exponent = (h >> 10) & 0x1Fu;
+    const uint32_t mantissa = h & 0x3FFu;
+    uint32_t bits;
+
+    if (exponent == 0u) {
+        if (mantissa == 0u) {
+            bits = sign;
+        } else {
+            /* A ten-bit mantissa needs (10 - k) shifts to bring bit 10 up,
+             * where k is its highest set bit, and clz(m) = 31 - k, so the
+             * shift count is clz(m) - 21. */
+            const uint32_t e = (uint32_t)__builtin_clz(mantissa) - 21u;
+            const uint32_t m = (mantissa << e) & 0x3FFu;
+            bits = sign | ((127u - 15u - e + 1u) << 23) | (m << 13);
+        }
+    } else if (exponent == 0x1Fu) {
+        bits = sign | 0x7F800000u | (mantissa << 13);
+    } else {
+        bits = sign | ((exponent + 127u - 15u) << 23) | (mantissa << 13);
+    }
+
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+/* `blocks` and `out` never alias: the caller passes a const view of the
+ * memory-mapped shard and a disjoint host staging buffer.  Saying so lets
+ * the compiler keep the scale and the nibble byte live across the stores
+ * instead of assuming a store may have overwritten the source. */
+static inline void ds4_ple_dequant_iq4_nl_impl(const void *__restrict blocks, size_t block_count,
+                            float *__restrict out) {
+    const uint8_t *__restrict p = (const uint8_t *)blocks;
+    /* Cold: the gather always passes a resolved table row and a staging row. */
+    if (__builtin_expect(!p || !out, 0)) return;
+
+
+    const int8_t *const kv = ds4_ple_kv_iq4nl;
+    for (size_t b = 0; b < block_count; b++) {
+        /* The caller walks a token row as five consecutive blocks, so the
+         * next block's eighteen bytes are the next thing this loop touches.
+         * Asking for them one iteration early costs one hint and hides the
+         * latency of the scale load and the nibble fetch behind the current
+         * block's dequant.  Pure hint: the values produced are unchanged. */
+        if (b + 1u < block_count)
+            __builtin_prefetch(p + DS4_PLE_IQ4_NL_BLOCK_BYTES, 0, 1);
+        uint16_t half;
+        memcpy(&half, p, sizeof(half));
+        const float d = ds4_ple_fp16_to_fp32(half);
+        const uint8_t *qs = p + 2;
+        float *y = out + b * DS4_PLE_IQ4_NL_BLOCK_ELEMS;
+
+        /* Store-bound loop: five blocks of output for every block of input, so
+         * the allocating write into the staging row is what stalls.  Ask for
+         * the destination line one block early, with the write-intent bit set,
+         * so the fill overlaps the current block's dequant.  Hint only. */
+        if (b + 1u < block_count)
+            __builtin_prefetch(y + DS4_PLE_IQ4_NL_BLOCK_ELEMS, 1, 3);
+
+        /* Unrolled by two: the block is a fixed sixteen nibble bytes, so the
+         * trip count is a compile-time constant and half the loop-carried
+         * bookkeeping disappears.  Same reads, same order, same values. */
+        for (int j = 0; j < DS4_PLE_IQ4_NL_BLOCK_ELEMS / 2; j += 2) {
+            const uint8_t q0 = qs[j], q1 = qs[j + 1];
+            y[j]      = d * (float)kv[q0 & 0x0F];
+            y[j + 1]  = d * (float)kv[q1 & 0x0F];
+            y[j + 16] = d * (float)ds4_ple_kv_iq4nl_hi[q0];
+            y[j + 17] = d * (float)ds4_ple_kv_iq4nl_hi[q1];
+        }
+        p += DS4_PLE_IQ4_NL_BLOCK_BYTES;
+    }
+}
+
+
+static inline void ds4_ple_dequant_iq4_nl(const void *__restrict blocks,
+                                         size_t block_count,
+                                         float *__restrict out) {
+    ds4_ple_dequant_iq4_nl_impl(blocks, block_count, out);
+}
 
 /* --------------------------------------------------------------- table */
 
