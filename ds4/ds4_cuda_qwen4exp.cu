@@ -4890,6 +4890,22 @@ __device__ __forceinline__ static void qwen4exp_shared_vector_accumulate(
  * Purely a packing change.  Each output row still walks its own weight row in
  * the same group order through the same warp_sum_f32 tree, and every dot is
  * bit-identical. */
+/* AND FOUR IS THE FLOOR: ONE ROW MEASURED -1.62%.
+ *
+ * The paragraphs above take this constant from eight to four because the
+ * 1,536-thread SM ceiling was the binding constraint and halving the rows
+ * halved the block.  The obvious next step is to halve it again, and it was
+ * taken.  At one row the block is 64 threads staging a single 1,440-byte row
+ * and the grid is 640 blocks where four gives 160; submitted on the ranked
+ * path it came back -1.62% against the same tree at four.
+ *
+ * That is a measurement, not a model.  The note above already establishes
+ * that this constant is arithmetically neutral at every P -- the same warps
+ * walk the same group order through the same warp_sum_f32 tree whatever the
+ * packing -- so the only way to choose it is to run it, and the run says
+ * four.  Four is now bracketed by a loss on each side: eight by the thread
+ * ceiling the two readings above show, one by the ranked result here.  The
+ * block-width lever is closed; the next win is not on this dial. */
 #define QW_GU_COOP_ROWS 4u
 #define QW_GU_COOP_ROW_U4 90u                /* 1440 B, ten q4_K super-blocks */
 #define QW_GU_COOP_GROUPS 80u                            /* in_dim 2560 / 32 */
