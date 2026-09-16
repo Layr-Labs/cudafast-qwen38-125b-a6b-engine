@@ -3193,29 +3193,7 @@ static bool qwen4exp_graph_head_cache_encode(ds4_qwen4exp_session *s,
     return true;
 }
 
-int ds4_qwen4exp_graph_head_cache(void *graph, void *cache,
-        ds4_gpu_tensor *hyper, uint32_t il, uint32_t pos0, uint32_t n_tokens) {
-    const ds4_qwen4exp_head_block_ctx *c = graph;
-    ds4_qwen4exp_session *s = cache;
-    if (!c || !s || !c->l || !c->m || !hyper || !n_tokens ||
-        n_tokens > s->plan.n_batch || il >= DS4_MAX_LAYER ||
-        il < g_ds4_qwen4exp.n_layer || !s->qsa_k[il] ||
-        !c->l->is_full_attention || s->hc_pending ||
-        (uint64_t)pos0 + n_tokens > s->plan.n_ctx) return 0;
-    ds4_gpu_tensor *saved_hyper = s->hyper;
-    const uint32_t saved_pos = s->pos;
-    s->state_dirty = true;
-    s->hyper = hyper;
-    s->pos = pos0;
-    bool ok = !s->d_pos || ds4_gpu_qwen4exp_update_dpos(s->d_pos, s->pos);
-    if (ok) ok = qwen4exp_graph_head_cache_encode(s, c->l, c->m, il, n_tokens);
-    s->hyper = saved_hyper;
-    s->pos = saved_pos;
-    if (s->d_pos && !ds4_gpu_qwen4exp_update_dpos(s->d_pos, s->pos)) ok = false;
-    if (ok) s->head_cache_pos = pos0 + n_tokens;
-    if (!ok) fprintf(stderr, "ds4: qwen4exp native head cache publication failed\n");
-    return ok ? 1 : 0;
-}
+#include "ds4_qwen4exp_head_cache.inc"
 
 /* Encode the MTP block once, either eagerly or into the decode graph stream.
  * All arguments that become kernel parameters are already stable here. */

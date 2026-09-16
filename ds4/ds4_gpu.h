@@ -3870,7 +3870,7 @@ int ds4_gpu_qwen4exp_gdn_adopt(
  * byte-for-byte (it does not include this header); keep both in sync. */
 typedef struct ds4_decode_graph_key {
     uint32_t il;
-    uint32_t island;    /* 0/1: layer halves; 2: QSA; 3: complete MTP block */
+    uint32_t island;    /* 0/1: layer halves; 2: QSA or head cache; 3: MTP block */
     uint32_t variant;
     uint32_t _pad;
     void    *cur_hc;

@@ -46,6 +46,7 @@
 /tests/test_deepseek4_vision_image
 /tests/test_qwen4exp_loader
 /tests/test_qwen4exp_mtp
+/tests/test_qwen4exp_head_cache_host
 *.o
 *.o.tmp
 *.dSYM/

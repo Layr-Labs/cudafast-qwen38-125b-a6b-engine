@@ -1107,6 +1107,15 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
     const uint32_t out_rows = n_tokens - first_row;
     const bool narrow_logits = last_only && n_tokens > 1u &&
         n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    /* Keep eh_proj batched: n_tokens * n_hc can cross its MMA threshold.
+     * Only the block is row-exact throughout the small decode envelope.
+     * Historical rows publish K/V and indexer state; their block outputs
+     * have no reader when the caller asks for the last proposal alone. */
+    const bool seed_only_rows = !cache_only && narrow_logits && h->hooks.cache_seed;
+#else
+    const bool seed_only_rows = false;
+#endif
     const uint32_t logit_rows = narrow_logits ? 1u : n_tokens;
     const uint32_t logit_first = narrow_logits ? 0u : first_row;
     /* The draft shortlist, fixed at init.  Zero keeps the whole vocabulary;
@@ -1210,7 +1219,26 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                                   h->t_ehx, (uint64_t)n_tokens * n_hc) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_EH_PROJ);
-    if (ok) {
+    if (ok && seed_only_rows) {
+        /* The hnorm input was consumed by eh_proj. Reuse its stable tensor
+         * for the proposal block, including as a CUDA graph identity. This
+         * moves the existing last-row copy before the block, with no view
+         * allocation or extra copy. The cache hook receives only the prefix. */
+        stage = "last head input";
+        ok = ds4_gpu_tensor_copy(h->t_h_normed, 0, h->t_hyper,
+                                  (uint64_t)first_row * hc_dim * f,
+                                  hc_dim * f) != 0;
+        if (ok) {
+            stage = "seed rows";
+            ok = h->hooks.cache_seed(h->graph, h->cache, h->t_hyper,
+                                      h->block_index, pos0, first_row) != 0;
+        }
+        if (ok) {
+            stage = "last head block";
+            ok = h->hooks.block(h->graph, h->cache, h->t_h_normed,
+                                 h->block_index, pos0 + first_row, 1u) != 0;
+        }
+    } else if (ok) {
         stage = "block";
         ds4_qwen4exp_block_forward_fn block = cache_only
             ? h->hooks.cache_seed : h->hooks.block;
@@ -1229,8 +1257,9 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
     }
     /* t_h_normed's previous contents were consumed by eh_proj.  Reuse it for
      * the final hyper row so the stateless tail needs neither tensor views
-     * nor an extra allocation.  Keep t_hyper intact for multi_out. */
-    if (ok && narrow_logits) {
+     * nor an extra allocation. The seed-only path already produced the
+     * proposal's block output there; multi_out reads the same tensor. */
+    if (ok && narrow_logits && !seed_only_rows) {
         stage = "last head row";
         ok = ds4_gpu_tensor_copy(h->t_h_normed, 0, h->t_hyper,
                                   (uint64_t)first_row * hc_dim * f,
@@ -1336,8 +1365,7 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
     else (void)ds4_gpu_synchronize();
     MTP_HEAD_TICK(MTP_HEAD_T_END);
 
-    /* A narrowed projection writes its sole result at logit row zero;
-     * multi_out still reads the original last hyper row. */
+    /* A narrowed projection writes its sole result at logit row zero. */
     if (ok) {
         stage = "top-1 readback";
         ok = ds4_gpu_tensor_read(h->t_top1,
@@ -1398,8 +1426,9 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
     MTP_HEAD_TICK(MTP_HEAD_T_LOGIT0_IN);
     if (ok && multi_out) {
         stage = "multi readback";
-        ok = ds4_gpu_tensor_read(h->t_hyper,
-                                 (uint64_t)first_row * hc_dim * f, multi_out,
+        ok = ds4_gpu_tensor_read(seed_only_rows ? h->t_h_normed : h->t_hyper,
+                                 seed_only_rows ? 0u : (uint64_t)first_row * hc_dim * f,
+                                 multi_out,
                                  (uint64_t)out_rows * hc_dim * f) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_MULTI_OUT);
