@@ -1032,6 +1032,85 @@ static void check_mixer_pending(uint8_t *model, const char *up_path) {
            (unsigned long long)cases, up_path);
 }
 
+/* Last-logit prefills can retain eight rows of the final mixer. Eight must
+ * stay eight: one row would cross the CUDA MMA/decode arithmetic boundary.
+ * Compare the ENTIRE retained tail byte for byte, with a misaligned starting
+ * row, tile/pipe boundaries, changed magnitudes, and output canaries. This
+ * test needs a GPU; the host-only companion checks the graph's state contract. */
+static void check_mixer_tail(uint8_t *model, const char *up_path) {
+#if !defined(__APPLE__) && !defined(__HIP_PLATFORM_AMD__)
+    const uint32_t row_set[] = {9u, 17u, 47u, 48u, 65u, 513u, 1024u, 4096u};
+    enum { TAIL = 8u, GUARD = 16u };
+    const ds4_gpu_qwen4exp_slab norm = hc_slab(model, MODEL_BYTES, NORM_WIDE_OFF);
+    const ds4_gpu_qwen4exp_slab down = hc_slab(model, MODEL_BYTES, DOWN_OFF);
+    const ds4_gpu_qwen4exp_slab up = hc_slab(model, MODEL_BYTES, UP_OFF);
+    unsigned cases = 0;
+    for (unsigned ri = 0; ri < sizeof(row_set) / sizeof(row_set[0]); ri++) {
+        const uint32_t rows = row_set[ri];
+        const uint64_t count = (uint64_t)rows * WIDE;
+        const uint64_t out_count = (uint64_t)rows * N_EMBD;
+        const uint64_t tail_count = (uint64_t)TAIL * N_EMBD;
+        float *host = alloc_floats(count);
+        float *after = alloc_floats(count);
+        float *ref = alloc_floats(out_count);
+        float *got = alloc_floats(tail_count + GUARD);
+        const float magnitudes[] = {1.0f, 1e-30f, 1e10f};
+        for (uint64_t i = 0; i < count; i++)
+            host[i] = next_unit() * magnitudes[(i / WIDE) % 3u];
+        ds4_gpu_tensor *hyper = upload(host, count);
+        ds4_gpu_tensor *tail = ds4_gpu_tensor_view(hyper,
+            (uint64_t)(rows - TAIL) * WIDE * sizeof(float),
+            (uint64_t)TAIL * WIDE * sizeof(float));
+        ds4_gpu_tensor *normed = ds4_gpu_tensor_alloc(count * sizeof(float));
+        ds4_gpu_tensor *lowrank = ds4_gpu_tensor_alloc((uint64_t)rows * N_LOWRANK * sizeof(float));
+        ds4_gpu_tensor *wide = ds4_gpu_tensor_alloc(count * sizeof(float));
+        ds4_gpu_tensor *full_out = ds4_gpu_tensor_alloc(out_count * sizeof(float));
+        ds4_gpu_tensor *tail_out = ds4_gpu_tensor_alloc((tail_count + GUARD) * sizeof(float));
+        require_ok(hyper && tail && normed && lowrank && wide && full_out && tail_out,
+                   "final mixer tail allocation");
+        for (int bias = 0; bias < 2; bias++) {
+            for (int bf16 = 0; bf16 < 2; bf16++) {
+                float guard[GUARD];
+                memset(guard, 0xa5, sizeof(guard));
+                memset(got, 0xa5, (size_t)(tail_count + GUARD) * sizeof(float));
+                require_ok(ds4_gpu_tensor_write(tail_out, 0, got,
+                    (tail_count + GUARD) * sizeof(float)), "tail output canaries");
+                require_ok(ds4_gpu_qwen4exp_hc_mixer_tensor(full_out, NULL,
+                    normed, lowrank, wide, hyper, &norm, &down, &up, NULL,
+                    N_EMBD, N_HC, N_LOWRANK, rows, 1e-6f, (float)bias, bf16),
+                    "full final mixer reference");
+                download(full_out, ref, out_count);
+                require_ok(ds4_gpu_qwen4exp_hc_mixer_tensor(tail_out, NULL,
+                    normed, lowrank, wide, tail, &norm, &down, &up, NULL,
+                    N_EMBD, N_HC, N_LOWRANK, TAIL, 1e-6f, (float)bias, bf16),
+                    "last-eight final mixer");
+                download(tail_out, got, tail_count + GUARD);
+                require_identical("last-eight mixer preserves every retained row",
+                    got, ref + (uint64_t)(rows - TAIL) * N_EMBD,
+                    tail_count * sizeof(float));
+                require_identical("last-eight mixer output canaries", got + tail_count,
+                    guard, sizeof(guard));
+                download(hyper, after, count);
+                require_identical("last-eight mixer preserves all HC rows for MTP",
+                    after, host, count * sizeof(float));
+                cases++;
+            }
+        }
+        ds4_gpu_tensor_free(tail_out);
+        ds4_gpu_tensor_free(full_out);
+        ds4_gpu_tensor_free(wide);
+        ds4_gpu_tensor_free(lowrank);
+        ds4_gpu_tensor_free(normed);
+        ds4_gpu_tensor_free(tail);
+        ds4_gpu_tensor_free(hyper);
+        free(got); free(ref); free(after); free(host);
+    }
+    printf("final mixer last-eight: %u exact cases (%s)\n", cases, up_path);
+#else
+    (void)model; (void)up_path;
+#endif
+}
+
 int main(void) {
     uint8_t *model = mmap(NULL, MODEL_BYTES, PROT_READ | PROT_WRITE,
                           MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -1468,6 +1547,7 @@ int main(void) {
 
     check_mixer_equivalence(model, "eight-row tile");
     check_mixer_pending(model, "eight-row tile");
+    check_mixer_tail(model, "eight-row tile");
 
     /* The qwen4exp tower switches the dense Q8_0 projections onto the int8
      * MMA tile (ds4_qwen4exp.inc, qwen4exp_finish_derived), and the fused
@@ -1480,6 +1560,7 @@ int main(void) {
     check_q8_mma_pipe_wide();
     check_mixer_equivalence(model, "MMA tile");
     check_mixer_pending(model, "MMA tile");
+    check_mixer_tail(model, "MMA tile");
 
     munmap(model, MODEL_BYTES);
     printf("test_qwen4exp_hc_norm: ok\n");

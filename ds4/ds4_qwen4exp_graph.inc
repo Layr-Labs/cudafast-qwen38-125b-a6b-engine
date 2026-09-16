@@ -2278,6 +2278,8 @@ static bool qwen4exp_graph_residual(ds4_qwen4exp_session *s,
         DS4_HC_EPS, norm_weight_offset, 1) != 0;
 }
 
+#include "ds4_qwen4exp_final_mixer.inc"
+
 /* Two fixed launch sequences per layer.  The GDN reads and updates tensor
  * state in place and takes no position argument; QSA, PLE and token uploads
  * stay outside capture.  Every replay still computes on the current inputs.
@@ -2958,9 +2960,8 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
 
     /* The final mixer has no inject head: it collapses n_hc * n_embd to
      * n_embd and stands in for the model.norm this checkpoint does not have. */
-    if (!qwen4exp_graph_residual(s, m, w->output_hc_norm, w->output_hc_down,
-                                 w->output_hc_up, NULL,
-                                 w->output_hc_norm_offset, n_tokens)) {
+    const uint32_t mixed_rows = qwen4exp_graph_final_mixer(s, w, m, n_tokens);
+    if (mixed_rows == 0u) {
         fprintf(stderr, "ds4: qwen4exp final mixer failed\n");
         return qwen4exp_forward_fail();
     }
@@ -2980,7 +2981,7 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
      */
     const uint32_t logit_rows = s->spec_logit_rows ? n_tokens : 1u;
     if (logit_rows == 1u) {
-        const uint64_t last = (uint64_t)(n_tokens - 1u) * DS4_N_EMBD * sizeof(float);
+        const uint64_t last = (uint64_t)(mixed_rows - 1u) * DS4_N_EMBD * sizeof(float);
         if (!ds4_gpu_tensor_copy(s->embed_rows, 0, s->mixed, last,
                                        (uint64_t)DS4_N_EMBD * sizeof(float))) {
             fprintf(stderr, "ds4: qwen4exp head row copy failed\n");
