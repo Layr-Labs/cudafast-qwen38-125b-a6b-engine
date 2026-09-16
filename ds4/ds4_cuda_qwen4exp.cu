@@ -3221,7 +3221,7 @@ __global__ static void qwen4exp_moe_zero_invalid_kernel(
  * direct path instead of failing to launch. */
 /* Two eight-row panels: the (slot, token) step sequence is double buffered at
  * token-panel granularity, so two live buffers suffice. */
-#define QW_DOWN_PANEL_MAX_BYTES 16384u
+#define QW_DOWN_PANEL_MAX_BYTES 32768u
 
 /* The pipeline gives every thread exactly one slot of each tile per chunk,
  * which is what makes the one-chunk-deep register prefetch enough. */
