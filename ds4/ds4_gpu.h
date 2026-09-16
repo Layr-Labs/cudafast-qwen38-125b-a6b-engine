@@ -3010,7 +3010,10 @@ int ds4_gpu_qwen4exp_shared_expert_tensor(
 /* With pre_quantized set, CUDA requires the same unchanged input, width,
  * token count and device as the immediately preceding routed MoE call, and
  * enough routed scratch for this shared intermediate. The tower's equal
- * intermediate widths satisfy this. Other backends may quantize normally. */
+ * intermediate widths satisfy this. Other backends may quantize normally.
+ * CUDA also overlaps this call's gate/up with the routed call's tail on a
+ * side stream when those conditions hold (DS4_QWEN4EXP_NO_SHARED_FORK keeps
+ * it in stream order); the bytes are the same either way. */
 int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         ds4_gpu_tensor              *out,
         ds4_gpu_tensor              *mid,
@@ -3815,6 +3818,11 @@ typedef struct {
     ds4_gpu_tensor *checkpoint;
     ds4_gpu_tensor *tape;
     const ds4_gpu_tensor *control;
+    /* Optional exclusive, aligned device scratch: n_tokens*n_value_head float2
+     * pairs. Must be disjoint from all inputs, outputs, snapshots and weights.
+     * NULL preserves raw-gate replay. Invalid supplied scratch fails before
+     * any kernel launch, including when the diagnostic disables publication. */
+    ds4_gpu_tensor *gate_scratch;
 } ds4_gpu_qwen4exp_gdn_replay;
 int ds4_gpu_qwen4exp_gdn_replay_supported(void);
 int ds4_gpu_qwen4exp_gdn_replay_materialize(
