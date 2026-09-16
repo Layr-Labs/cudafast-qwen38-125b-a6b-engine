@@ -2212,7 +2212,7 @@ static void qwen4exp_trace_report(uint32_t n_tokens) {
  * bit for bit the separate kernel's.  Gated to widths the fused mixer takes
  * one block per token at (its inject-in-norm threshold) and, with that, clear
  * of every captured decode island. */
-#define DS4_QWEN4EXP_HC_DEFER_MIN_ROWS 48u
+#define DS4_QWEN4EXP_HC_DEFER_MIN_ROWS 32u
 
 static int qwen4exp_hc_defer_off(void) {
     static int cached = -1;
