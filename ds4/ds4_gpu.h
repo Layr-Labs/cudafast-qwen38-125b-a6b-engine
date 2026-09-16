@@ -681,6 +681,32 @@ int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
         const ds4_gpu_tensor *scratch,
         uint32_t              max_count);
 
+/* Fused split fold/doubled gate/Q8 activation at rows 1..3, 24/2 heads, head_dim 256.
+ * Returns 1 on success, 0 on unsupported shape/alias before any launch, and
+ * -1 on a CUDA failure. The float attention output remains available. */
+int ds4_gpu_qwen4exp_qsa_attention_fold_q8_dpos_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k_cache,
+        const ds4_gpu_tensor *v_cache,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *counts,
+        uint32_t              n_tokens,
+        uint32_t              n_head,
+        uint32_t              n_kv_head,
+        uint32_t              head_dim,
+        uint32_t              pos0,
+        uint32_t              cache_cap,
+        uint32_t              max_selected,
+        float                 scale,
+        const ds4_gpu_tensor *d_pos,
+        const ds4_gpu_tensor *scratch,
+        uint32_t              max_count,
+        ds4_gpu_tensor       *gate_q8,
+        uint64_t              q_offset,
+        uint64_t              s_offset,
+        const ds4_gpu_tensor *doubled) ;
+
 /* Bytes of `scratch` the attention call above wants to take its split path
  * for `n_tokens` rows of at most `max_count` keys each; 0 for a shape the
  * split path does not serve.  Passing NULL scratch keeps the per-head kernel. */
