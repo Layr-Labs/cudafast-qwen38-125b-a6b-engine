@@ -17408,7 +17408,7 @@ extern "C" const char *ds4_gpu_hw_limits(void) {
      * ds4_resident drops the WHOLE limits string rather than truncating it if it
      * does not fit its own ident buffer, so a tight fit here loses the
      * measurement silently. */
-    static char buf[448];
+    static char buf[896];
     static int built = 0;
     if (built) return buf;
     built = 1;
@@ -17441,6 +17441,12 @@ extern "C" const char *ds4_gpu_hw_limits(void) {
     /* The register/shared footprint of the two routed-MoE decode kernels, from
      * the translation unit that owns them.  Truncation is harmless: the string
      * is diagnostic only and snprintf keeps it terminated. */
+    const char *gt = ds4_gpu_qwen4exp_gateup_copy_tune();
+    if (gt && gt[0] && (size_t)n + 2u < sizeof(buf)) {
+        const int added = snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", gt);
+        if (added < 0 || (size_t)added >= sizeof(buf) - (size_t)n) return buf;
+        n += added;
+    }
     const char *kl = ds4_gpu_qwen4exp_kernel_limits();
     if (kl && kl[0] && (size_t)n + 2u < sizeof(buf)) {
         snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", kl);
