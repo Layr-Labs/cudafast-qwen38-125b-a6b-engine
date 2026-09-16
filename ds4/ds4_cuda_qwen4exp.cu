@@ -4224,25 +4224,78 @@ qwen4exp_moe_down_mma_kernel(
 #pragma unroll
         for (int i = 0; i < QW_DOWN_MMA_NT * 4; i++) acc[i] = 0.0f;
 
+        /* ADDRESS HOIST AND A ONE-CHUNK WEIGHT PREFETCH, from one observation.
+         *
+         * QW_DOWN_MMA_BM * QW_MMA_G is exactly twice QW_DOWN_MMA_THREADS, so
+         * the staging loop gives every thread exactly two items and gives it
+         * the SAME two on every K chunk: `r` and `gg` are functions of the
+         * item index alone.  The row address down_e + orow * down_row_bytes
+         * therefore does not depend on `kc` at all, yet the divide, the
+         * 64-bit multiply and the row bound test were being redone on each of
+         * the groups / QW_MMA_G chunks.  They are computed once below.
+         *
+         * With the address already in hand, the next chunk's payload can be
+         * issued while this chunk is still being decoded and multiplied.
+         * That is the one staging arm this tile does not have and the gate/up
+         * tile has five of; its own `gnext` prefetch states the rule -- the
+         * load is issued "the moment this chunk's copy of the register is
+         * dead ... so the load has the rest of the decode as well as the MMA
+         * below to land in".  The down tile streams the larger half of the
+         * routed weight bytes, five serialized load rounds deep per tile,
+         * with that latency fully exposed.
+         *
+         * BIT-IDENTICAL.  Same rows, same groups, the same six words through
+         * the same decoder into the same tile stores in the same order; only
+         * the issue point of a global load moves, which is the argument the
+         * gate/up DMA arm makes verbatim.  No accumulation is touched.
+         *
+         * The prefetch rides the q5_1 word-staging arm only, the arm that
+         * already reads through registers.  The oracle path decodes straight
+         * from the row, has no register payload to carry, and is untouched. */
+        enum { QW_DOWN_MMA_SLOTS =
+                   (QW_DOWN_MMA_BM * QW_MMA_G) / QW_DOWN_MMA_THREADS };
+        uint32_t    st_r[QW_DOWN_MMA_SLOTS], st_gg[QW_DOWN_MMA_SLOTS];
+        const char *st_drow[QW_DOWN_MMA_SLOTS];
+        bool        st_live[QW_DOWN_MMA_SLOTS];
+#pragma unroll
+        for (uint32_t s = 0; s < QW_DOWN_MMA_SLOTS; s++) {
+            const uint32_t idx  = tid + s * QW_DOWN_MMA_THREADS;
+            const uint32_t r    = idx / QW_MMA_G;
+            const uint32_t orow = row0 + r;
+            st_r[s]    = r;
+            st_gg[s]   = idx - r * QW_MMA_G;
+            st_live[s] = orow < out_dim;
+            st_drow[s] = st_live[s]
+                ? down_e + (uint64_t)orow * down_row_bytes : NULL;
+        }
+        uint32_t pre[QW_DOWN_MMA_SLOTS][6];
+        bool     pre_ok[QW_DOWN_MMA_SLOTS];
+        bool     pre_live = false;
+
         for (uint32_t kc = 0; kc < groups; kc += QW_MMA_G) {
             __syncthreads();
-            for (uint32_t idx = tid; idx < QW_DOWN_MMA_BM * QW_MMA_G;
-                 idx += QW_DOWN_MMA_THREADS) {
-                const uint32_t r = idx / QW_MMA_G;
-                const uint32_t gg = idx - r * QW_MMA_G;
-                const uint32_t g = kc + gg;
-                const uint32_t orow = row0 + r;
+#pragma unroll
+            for (uint32_t s = 0; s < QW_DOWN_MMA_SLOTS; s++) {
+                const uint32_t r  = st_r[s];
+                const uint32_t gg = st_gg[s];
+                const uint32_t g  = kc + gg;
                 int8_t wq[32];
                 float wa[2], wb[2];
                 int halves = 1;
-                if (orow < out_dim && g < groups) {
-                    const char *const drow =
-                        down_e + (uint64_t)orow * down_row_bytes;
+                if (st_live[s] && g < groups) {
+                    const char *const drow = st_drow[s];
                     if (w_dq) {
                         uint32_t raw[6];
+                        bool ok;
+                        if (pre_live) {
+#pragma unroll
+                            for (int q = 0; q < 6; q++) raw[q] = pre[s][q];
+                            ok = pre_ok[s];
+                        } else {
+                            ok = qw_raw_load<Wide6>(dtype, drow, g, raw);
+                        }
                         dev_qwen4exp_group_decode_w(dtype, drow, g,
-                                qw_raw_load<Wide6>(dtype, drow, g, raw)
-                                    ? raw : NULL,
+                                ok ? raw : NULL,
                                 &sA[r * QW_MMA_LD + gg * 32], wa, wb);
                     } else {
                         dev_qwen4exp_group_decode(dtype, drow, g,
@@ -4255,6 +4308,21 @@ qwen4exp_moe_down_mma_kernel(
                     qw_tile_store_zero(&sA[r * QW_MMA_LD + gg * 32]);
                     sWA[r * QW_MMA_G + gg] = 0.0f;
                     sWB[r * QW_MMA_G + gg] = 0.0f;
+                }
+            }
+            /* This chunk's payload is dead here, and the activation copy, the
+             * barrier and the whole MMA stand between this issue and its use. */
+            if (w_dq) {
+                const uint32_t kn = kc + QW_MMA_G;
+                pre_live = kn < groups;
+                if (pre_live) {
+#pragma unroll
+                    for (uint32_t s = 0; s < QW_DOWN_MMA_SLOTS; s++) {
+                        const uint32_t gn = kn + st_gg[s];
+                        pre_ok[s] = (st_live[s] && gn < groups)
+                            ? qw_raw_load<Wide6>(dtype, st_drow[s], gn, pre[s])
+                            : false;
+                    }
                 }
             }
             for (uint32_t idx = tid; idx < QW_MMA_BN * QW_MMA_G;
