@@ -891,7 +891,20 @@ int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out, ds4_gpu_tensor *ids,
     uint32_t dim, uint32_t vocab, uint32_t prefix, uint32_t tail,
     const ds4_gpu_tensor *x);
 int ds4_gpu_mtp_native_map(ds4_gpu_tensor *winner, const ds4_gpu_tensor *logits,
-    const ds4_gpu_tensor *ids, uint32_t count, uint32_t vocab);
+                         const ds4_gpu_tensor *ids, uint32_t count, uint32_t vocab);
+/* Optional paired entries: defer the coarse nonfinite check to the existing
+ * winner readback. The marker requests only a stateless LM-head retry; it is
+ * outside every vocabulary accepted by these entries. Ordinary APIs retain
+ * their synchronous fallback contract. */
+#include "ds4_mtp_native_contract.h"
+int ds4_gpu_mtp_native_screen_deferred(ds4_gpu_tensor *out, ds4_gpu_tensor *ids,
+        ds4_gpu_tensor *scratch, const void *map, uint64_t map_bytes,
+        uint64_t offset, uint32_t in_dim, uint32_t vocab,
+        uint32_t prefix, uint32_t tail, const ds4_gpu_tensor *x);
+int ds4_gpu_mtp_native_map_deferred(ds4_gpu_tensor *winner,
+        const ds4_gpu_tensor *logits, const ds4_gpu_tensor *ids,
+        const ds4_gpu_tensor *scratch, uint32_t width,
+        uint32_t count, uint32_t vocab);
 
 int ds4_gpu_matmul_q8_0_top1_tensor(
         ds4_gpu_tensor       *selected,

@@ -1260,18 +1260,25 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
     }
     MTP_HEAD_TICK(MTP_HEAD_T_MIXER);
     bool screened = false;
+    bool deferred_screen = false;
     if (ok && logit_rows == 1u && h->t_native_scratch && h->t_native_ids &&
         h->hooks.native_screen && h->hooks.native_map &&
         getenv("DS4_MTP_NO_NATIVE_SCREEN") == NULL) {
         stage = "native head screen and refinement";
-        const int rc = h->hooks.native_screen(h->t_logits, h->t_native_ids,
+        deferred_screen = h->hooks.native_screen_deferred &&
+            h->hooks.native_map_deferred && h->n_vocab <= DS4_MTP_NATIVE_RETRY_ID &&
+            getenv("DS4_MTP_NO_DEFERRED_SCREEN") == NULL;
+        const int rc = (deferred_screen ? h->hooks.native_screen_deferred
+                                        : h->hooks.native_screen)(h->t_logits, h->t_native_ids,
                 h->t_native_scratch, h->target_map, h->target_size,
                 h->output_offset, n_embd, h->n_vocab, draft_prefix, draft_tail,
                 h->t_sample);
         if (rc < 0 || (uint32_t)rc > h->native_capacity) ok = false;
         else if (rc > 0) { screened = true; draft_width = (uint32_t)rc; }
+        else deferred_screen = false;
     }
 
+retry_static_lm_head:
     /* The borrowed LM head, in the target's mapping.  The shortlist runs the
      * SAME kernel over two row ranges of output.weight: Q8_0 rows are
      * ds4_qwen4exp_q8_0_row_bytes() apart in the mapping, so a range is the
@@ -1328,7 +1335,11 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
     }
     if (ok && screened) {
         stage = "native original winner mapping";
-        ok = h->hooks.native_map(h->t_top1, h->t_logits, h->t_native_ids,
+        ok = deferred_screen
+            ? h->hooks.native_map_deferred(h->t_top1, h->t_logits, h->t_native_ids,
+                    h->t_native_scratch, draft_prefix + draft_tail,
+                    draft_width, h->n_vocab) != 0
+            : h->hooks.native_map(h->t_top1, h->t_logits, h->t_native_ids,
                                   draft_width, h->n_vocab) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_TOP1);
@@ -1346,6 +1357,19 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                                  (uint64_t)out_rows * sizeof(uint32_t)) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_TOP1_IN);
+    if (ok && screened && deferred_screen &&
+        h->top1_host[0] == DS4_MTP_NATIVE_RETRY_ID) {
+        /* The GPU saw a nonfinite coarse score. Retry exactly the original
+         * stateless projection/pack/top-1 path from the same mixer output.
+         * The block and its caches must not run twice. This edge runs once:
+         * clearing both booleans prevents re-entering screen or retry. */
+        screened = false;
+        deferred_screen = false;
+        draft_width = draft_prefix ? draft_prefix + draft_tail : h->n_vocab;
+        stage = "native fallback commands";
+        ok = ds4_gpu_begin_commands() != 0;
+        goto retry_static_lm_head;
+    }
     /* The margin gate's measurement: top-1 minus runner-up over the refined
      * candidate logits the screen left in t_logits.  It reads after the top-1
      * readback, so it adds no synchronisation and changes no token. */
