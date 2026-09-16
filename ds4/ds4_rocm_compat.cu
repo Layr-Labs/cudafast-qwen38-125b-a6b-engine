@@ -31,6 +31,7 @@ extern "C" int ds4_gpu_decode_graphs_supported(void) { return 0; }
 extern "C" int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) { (void)key; return -1; }
 extern "C" int ds4_gpu_decode_graph_prefetch(const ds4_decode_graph_key *key) { (void)key; return 0; }
 extern "C" int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) { (void)key; return -1; }
+extern "C" uint64_t ds4_gpu_decode_graph_capture_count(void) { return 0; }
 extern "C" void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key) { (void)key; }
 extern "C" void ds4_gpu_decode_graphs_invalidate(void) {}
 
