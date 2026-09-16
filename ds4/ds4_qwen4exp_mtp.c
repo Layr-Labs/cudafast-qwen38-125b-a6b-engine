@@ -1160,7 +1160,16 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                             h->n_vocab, n_tokens, n_embd, 1u) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_EMBED);
-    if (ok) {
+    const bool paired_norm = h->hooks.rms_norm_pair != NULL && !timing;
+    if (ok && paired_norm) {
+        stage = "paired enorm/hnorm";
+        ok = h->hooks.rms_norm_pair(
+                h->t_e_normed, h->t_embed_out, h->t_h_normed, h->t_hyper,
+                h->head_map, h->head_size, h->enorm_offset, h->hnorm_offset,
+                n_embd, (uint32_t)hc_dim, n_tokens,
+                h->rms_eps, h->weight_bias, h->round_bf16) != 0;
+    }
+    if (ok && !paired_norm) {
         stage = "enorm";
         ok = h->hooks.rms_norm(h->t_e_normed, h->t_embed_out,
                                h->head_map, h->head_size, h->enorm_offset,
@@ -1170,7 +1179,7 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
     MTP_HEAD_TICK(MTP_HEAD_T_ENORM);
     /* h = fc_hidden(hnorm(multi)).  hnorm is UNGROUPED: one statistic over the
      * whole n_hc * n_embd row, unlike every hyper-connection norm. */
-    if (ok) {
+    if (ok && !paired_norm) {
         stage = "hnorm";
         ok = h->hooks.rms_norm(h->t_h_normed, h->t_hyper,
                                h->head_map, h->head_size, h->hnorm_offset,
