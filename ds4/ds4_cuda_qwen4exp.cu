@@ -13088,92 +13088,6 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_pool_update_tensor(
             cache_cap, head_dim, pool_size, rot_dim, eps, weight_offset, NULL);
 }
 
-/* Tiled indexer scores for prefill widths.
- *
- * The per-pair kernel above launches one block per (indexer block, token):
- * at a 4096-row prefill over a 20480-token context that is 21 million
- * blocks of 128 threads, each doing four 128-wide dots and four block-wide
- * reductions.  The scores stage measured 69 ms per layer at 16k tokens for
- * about 21 GFLOP of work.  This kernel tiles the pairs instead: one block
- * takes QWEN4EXP_IDX_TILE_T tokens by QWEN4EXP_IDX_TILE_B indexer blocks,
- * stages the pool rows and the query rows in shared memory once, and each
- * thread owns one (token, block) pair.
- *
- * THE ARITHMETIC IS THE PER-PAIR KERNEL'S, BIT FOR BIT.  With head_dim 128
- * the per-pair kernel runs 128 threads, one product per lane, and reduces
- * with qwen4exp_blk_sum: lanes i and i+64 add, then i and i+32, then a warp
- * shuffle tree at 16, 8, 4, 2, 1.  The thread below forms the same 64 pair
- * sums, then the same halving tree, through __fmul_rn / __fadd_rn so the
- * compiler cannot contract a product into an add.  The relu, the head sum
- * order and the division are the same expressions.  The host wrapper only
- * takes this path at head_dim 128, four heads, and eight rows or more; the
- * decode and verify widths keep the per-pair kernel and their captured
- * graphs unchanged. */
-#define QWEN4EXP_IDX_TILE_T 8u
-#define QWEN4EXP_IDX_TILE_B 32u
-#define QWEN4EXP_IDX_KPAD   129u
-#define QWEN4EXP_IDX_THREADS 256u
-
-template <uint32_t HEAD_DIM, uint32_t N_HEAD>
-__global__ static void __launch_bounds__(QWEN4EXP_IDX_THREADS)
-qwen4exp_qsa_indexer_scores_tiled_kernel(
-        const float *q,
-        const float *pool,
-        float *scores,
-        uint32_t n_tokens,
-        uint32_t n_blocks,
-        uint32_t pos0,
-        uint32_t pool_size,
-        float norm_divisor) {
-    __shared__ float ks[QWEN4EXP_IDX_TILE_B * QWEN4EXP_IDX_KPAD];
-    __shared__ float qs[QWEN4EXP_IDX_TILE_T * N_HEAD * HEAD_DIM];
-    const uint32_t b0 = blockIdx.x * QWEN4EXP_IDX_TILE_B;
-    const uint32_t t0 = blockIdx.y * QWEN4EXP_IDX_TILE_T;
-    const uint32_t tid = threadIdx.x;
-    if (b0 >= n_blocks || t0 >= n_tokens) return;
-    const uint32_t nb = min(QWEN4EXP_IDX_TILE_B, n_blocks - b0);
-    const uint32_t nt = min(QWEN4EXP_IDX_TILE_T, n_tokens - t0);
-    for (uint32_t i = tid; i < nb * HEAD_DIM; i += QWEN4EXP_IDX_THREADS) {
-        const uint32_t bb = i / HEAD_DIM, d = i - bb * HEAD_DIM;
-        ks[bb * QWEN4EXP_IDX_KPAD + d] = pool[(uint64_t)(b0 + bb) * HEAD_DIM + d];
-    }
-    for (uint32_t i = tid; i < nt * N_HEAD * HEAD_DIM; i += QWEN4EXP_IDX_THREADS) {
-        qs[i] = q[(uint64_t)t0 * N_HEAD * HEAD_DIM + i];
-    }
-    __syncthreads();
-    for (uint32_t p = tid; p < nt * QWEN4EXP_IDX_TILE_B; p += QWEN4EXP_IDX_THREADS) {
-        const uint32_t tt = p / QWEN4EXP_IDX_TILE_B;
-        const uint32_t bb = p - tt * QWEN4EXP_IDX_TILE_B;
-        const uint32_t block = b0 + bb;
-        const uint32_t token = t0 + tt;
-        if (block >= n_blocks) continue;
-        float *dst = scores + (uint64_t)token * n_blocks + block;
-        uint32_t visible = (pos0 + token + 1u) / pool_size;
-        if (visible > n_blocks) visible = n_blocks;
-        if (block >= visible) { *dst = QWEN4EXP_QSA_MASKED_SCORE; continue; }
-        const float *k = ks + bb * QWEN4EXP_IDX_KPAD;
-        float total = 0.0f;
-#pragma unroll
-        for (uint32_t h = 0; h < N_HEAD; h++) {
-            const float *qh = qs + (tt * N_HEAD + h) * HEAD_DIM;
-            float a[HEAD_DIM / 2u];
-#pragma unroll
-            for (uint32_t i = 0; i < HEAD_DIM / 2u; i++) {
-                a[i] = __fadd_rn(__fmul_rn(qh[i], k[i]),
-                                 __fmul_rn(qh[i + HEAD_DIM / 2u], k[i + HEAD_DIM / 2u]));
-            }
-#pragma unroll
-            for (uint32_t step = HEAD_DIM / 4u; step > 0u; step >>= 1) {
-#pragma unroll
-                for (uint32_t i = 0; i < step; i++) a[i] = __fadd_rn(a[i], a[i + step]);
-            }
-            const float dot = a[0];
-            total += fmaxf(dot, 0.0f);
-        }
-        *dst = total / norm_divisor;
-    }
-}
-
 extern "C" int ds4_gpu_qwen4exp_qsa_indexer_scores_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
@@ -13190,17 +13104,6 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_scores_tensor(
         !glm53_cuda_tensor_has(q, (uint64_t)n_tokens * n_head * head_dim, sizeof(float)) ||
         !glm53_cuda_tensor_has(pool, (uint64_t)n_blocks * head_dim, sizeof(float))) {
         return 0;
-    }
-    if (n_tokens >= 8u && head_dim == 128u && n_head == 4u &&
-        getenv("DS4_QWEN4EXP_NO_IDX_TILE") == NULL) {
-        const dim3 grid((n_blocks + QWEN4EXP_IDX_TILE_B - 1u) / QWEN4EXP_IDX_TILE_B,
-                        (n_tokens + QWEN4EXP_IDX_TILE_T - 1u) / QWEN4EXP_IDX_TILE_T);
-        qwen4exp_qsa_indexer_scores_tiled_kernel<128u, 4u><<<grid, QWEN4EXP_IDX_THREADS, 0,
-            cuda_decode_stream()>>>(
-                (const float *)q->ptr, (const float *)pool->ptr,
-                (float *)scores->ptr, n_tokens, n_blocks, pos0, pool_size,
-                sqrtf((float)head_dim));
-        return cuda_ok(cudaGetLastError(), "Qwen4-Exp indexer scores tiled launch");
     }
     const uint32_t nth = qwen4exp_cuda_threads(head_dim);
     qwen4exp_qsa_indexer_scores_kernel<<<dim3(n_blocks, n_tokens), nth,
@@ -14041,7 +13944,3 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
              md_regs, md_smem, md_lmem, md_occ);
     return buf;
 }
-
-/* ticket 26: this archive is the measured stack. The only difference from
- * its siblings is the decode-graph variant table width, which the capture
- * census shows produces a byte-identical capture log. */
