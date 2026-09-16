@@ -5423,8 +5423,23 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
  * almost nothing here and that residency is not this kernel's constraint
  * either.  If registers ever need to come down, it has to be by removing live
  * state at source. */
+/* Host validation for exact decode constants. Alignment, async staging and
+ * vector support are additionally checked by the existing caller. */
+static uint32_t qwen4exp_down_decode_rows(
+        uint32_t groups, uint32_t out_dim, uint32_t n_tokens,
+        uint32_t used, uint32_t type, uint64_t row_bytes, uint64_t expert_bytes) {
+    if (groups != 20u || out_dim != 2560u || used != 10u ||
+        (n_tokens != 1u && n_tokens != 2u) ||
+        (type != DS4_QWEN4EXP_TY_q5_1 && type != DS4_QWEN4EXP_TY_q8_0) ||
+        (type == DS4_QWEN4EXP_TY_q5_1 && n_tokens != 2u) ||
+        row_bytes != 20u * (type == DS4_QWEN4EXP_TY_q5_1 ? 24u : 34u) ||
+        expert_bytes != 2560u * row_bytes ||
+        getenv("DS4_QWEN4EXP_NO_DOWN_DECODE_SHAPE") != NULL) return 0u;
+    return n_tokens;
+}
+
 template <int R, int DownType = -1, bool Vector = false, bool Stage = false,
-          bool Async = false>
+          bool Async = false, unsigned DecodeRows = 0>
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
@@ -5432,14 +5447,29 @@ __global__ static void qwen4exp_moe_down_q_kernel(
         const int8_t *mq,
         const float *ms,
         const int32_t *msum,
-        uint64_t down_expert_bytes,
-        uint64_t down_row_bytes,
+        uint64_t down_expert_bytes_arg,
+        uint64_t down_row_bytes_arg,
         uint32_t down_type,
-        uint32_t groups,
-        uint32_t out_dim,
-        uint32_t n_tokens,
+        uint32_t groups_arg,
+        uint32_t out_dim_arg,
+        uint32_t n_tokens_arg,
         uint32_t n_total_expert,
-        uint32_t n_expert_used) {
+        uint32_t n_expert_used_arg) {
+    /* Exact model-shape specialization of the existing panel pipeline.
+     * Only host-validated one/two-row calls use it. Keep the slot/group
+     * arithmetic and warp reduction order; make bounds and strides constant. */
+    static_assert(DecodeRows <= 2, "decode row specialization");
+    static_assert(DecodeRows == 0 || (R == 2 && Vector && Stage && Async),
+                  "shape specialization needs the two-row async pipeline");
+    const uint64_t down_row_bytes = DecodeRows
+        ? 20u * (DownType == DS4_QWEN4EXP_TY_q5_1 ? 24u : 34u)
+        : down_row_bytes_arg;
+    const uint64_t down_expert_bytes = DecodeRows
+        ? 2560u * down_row_bytes : down_expert_bytes_arg;
+    const uint32_t groups = DecodeRows ? 20u : groups_arg;
+    const uint32_t out_dim = DecodeRows ? 2560u : out_dim_arg;
+    const uint32_t n_tokens = DecodeRows ? DecodeRows : n_tokens_arg;
+    const uint32_t n_expert_used = DecodeRows ? 10u : n_expert_used_arg;
     /* Dynamic shared memory is 16-byte aligned by contract, and it is requested
      * only for the Stage instantiations; the others map nothing here. */
     extern __shared__ uint4 qw_down_panel[];
@@ -5450,8 +5480,8 @@ __global__ static void qwen4exp_moe_down_q_kernel(
     const uint32_t row = row0 + (threadIdx.x >> 5u);
     const uint32_t tok0 = blockIdx.y * (uint32_t)R;
     if (row >= out_dim || tok0 >= n_tokens) return;
-    const uint32_t take = n_tokens - tok0 < (uint32_t)R ? n_tokens - tok0
-                                                        : (uint32_t)R;
+    const uint32_t take = DecodeRows ? DecodeRows :
+        (n_tokens - tok0 < (uint32_t)R ? n_tokens - tok0 : (uint32_t)R);
     const uint64_t panel_bytes = (uint64_t)8u * down_row_bytes;
 
     /* Up to 32 IDs, freshly loaded on every call or graph replay. */
@@ -5508,7 +5538,7 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                     (uint64_t)(uint32_t)e * down_expert_bytes +
                     (uint64_t)row0 * down_row_bytes;
                 for (uint64_t o = (uint64_t)threadIdx.x * 16u;
-                     o < panel_bytes; o += (uint64_t)blockDim.x * 16u) {
+                     o < panel_bytes; o += (DecodeRows ? 256u : (uint64_t)blockDim.x) * 16u) {
                     if (Async) {
                         qw_cpasync16((uint32_t)__cvta_generic_to_shared(dst + o),
                                      gp + o);
@@ -8271,13 +8301,18 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
             mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
 #define QWEN4EXP_DOWN_IMPL(R, DT, V) QWEN4EXP_DOWN_IMPL_S(R, DT, V, false, 0)
-#define QWEN4EXP_DOWN_ASYNC(DT) \
-    qwen4exp_moe_down_q_kernel<2, DT, true, true, true><<< \
+#define QWEN4EXP_DOWN_ASYNC_ROWS(DT, NR) \
+    qwen4exp_moe_down_q_kernel<2, DT, true, true, true, NR><<< \
             dn_grid, threads, (size_t)dn_shared, stream>>>( \
             (float *)out->ptr, down, (const int32_t *)selected->ptr, \
             sc.mq, sc.ms, sc.msum, \
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
             mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
+#define QWEN4EXP_DOWN_ASYNC(DT) do { \
+    if (dn_shape == 1u) { QWEN4EXP_DOWN_ASYNC_ROWS(DT, 1u); } \
+    else if (dn_shape == 2u) { QWEN4EXP_DOWN_ASYNC_ROWS(DT, 2u); } \
+    else { QWEN4EXP_DOWN_ASYNC_ROWS(DT, 0u); } \
+} while (0)
 #define QWEN4EXP_DOWN(R) do { \
     if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q5_1) { \
         QWEN4EXP_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q5_1, false); \
@@ -8355,6 +8390,9 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             ((uintptr_t)down & 15u) == 0u &&
             dn_shared <= QW_DOWN_PANEL_MAX_BYTES &&
             getenv("DS4_QWEN4EXP_NO_DOWN_PANEL") == NULL;
+        const uint32_t dn_shape = qwen4exp_down_decode_rows(
+            mgroups, out_dim, n_tokens, n_expert_used, down_slab->type,
+            down_slab->row_bytes, down_slab->expert_bytes);
         if (down_slab->type == DS4_QWEN4EXP_TY_q8_0) {
             if (dn_stage && getenv("DS4_QWEN4EXP_NO_DOWN_ASYNC") == NULL) {
                 QWEN4EXP_DOWN_ASYNC(DS4_QWEN4EXP_TY_q8_0);
@@ -8383,6 +8421,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
 #undef QWEN4EXP_DOWN_IMPL
 #undef QWEN4EXP_DOWN_IMPL_S
 #undef QWEN4EXP_DOWN_ASYNC
+#undef QWEN4EXP_DOWN_ASYNC_ROWS
     return cuda_ok(cudaGetLastError(), "qwen4exp MoE down launch");
 }
 
