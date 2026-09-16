@@ -11410,7 +11410,15 @@ __global__ static void qwen4exp_qsa_prep_joint_kernel(
         else if(pos<cache_cap)v_cache[(uint64_t)pos*width+head*head_dim+tid]=raw_v[at];
     }
     shared[tid]=tid<head_dim?raw*raw:0.0f;
-    __syncthreads();
+    /* No barrier here: qwen4exp_blk_sum opens with one on every path it can
+     * take.  At nth >= 64 the reduction loop runs and its FIRST statement is
+     * __syncthreads(); at nth == 32 the loop's bound rejects the first step and
+     * control falls straight to the post-loop __syncthreads(); at nth < 32 the
+     * small-block loop's first statement is __syncthreads() as well, and if
+     * even that loop is empty the barrier after it is still the next statement.
+     * The helper is __forceinline__, so nothing can be scheduled between this
+     * point and that barrier, and there is no memory access of any kind in
+     * between either.  Two __syncthreads() back to back are exactly one. */
     const float sum=qwen4exp_blk_sum(shared,tid,nth);
     const float inv=rsqrtf(sum/(float)head_dim+eps);
     __syncthreads();
