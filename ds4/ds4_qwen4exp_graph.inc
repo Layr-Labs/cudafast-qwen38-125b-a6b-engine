@@ -2645,7 +2645,10 @@ static bool qw_decode_graph_chunk(ds4_qwen4exp_session *s,
     key.after_ffn_hc = (void *)w;
     key.attn_norm = (void *)m;
     const int state = ds4_gpu_decode_graph_begin(&key);
-    if (state == 1) {
+    /* Replay is the steady state; capture happens once per (chunk, variant) and
+     * a miss falls back to the eager path.  Keep the replay arm on the
+     * predicted path.  Same branches, same work, same graphs. */
+    if (__builtin_expect(state == 1, 1)) {
 #ifdef DS4_TEST_HOOKS
         qw_decode_graph_trace_range(w, il_first, il_last);
 #endif
