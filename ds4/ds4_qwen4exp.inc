@@ -1152,6 +1152,31 @@ static void weights_bind_qwen4exp_ple_table(ds4_qwen4exp_ple_table *ple,
     qwen4exp_read_ple_hash_constants(m, ple);
     qwen4exp_plan_charge(plan, DS4_QWEN4EXP_MEM_PLE, t);
     g_ds4_qwen4exp.ple_rows = ple->rows;
+
+    /* The gather reads this table by hashed row id, so its page faults are
+     * uniformly random across the whole mapping.  Left unhinted the kernel's
+     * mmap read-around pulls a cluster of neighbouring pages on every fault
+     * -- pages a random pattern will never touch -- which is pure wasted I/O
+     * against a table the page cache cannot hold anyway.  RANDOM confines
+     * each fault to the page that was asked for.  One call at bind; the
+     * values read are unchanged. */
+#if defined(POSIX_MADV_RANDOM)
+    if (ple->base && ple->bytes) {
+        static long qw_ple_bind_page = 0;
+        if (qw_ple_bind_page <= 0) {
+            const long p = sysconf(_SC_PAGESIZE);
+            if (p > 0) qw_ple_bind_page = p;
+        }
+        if (qw_ple_bind_page > 0) {
+            const uintptr_t mask = (uintptr_t)qw_ple_bind_page - 1u;
+            const uintptr_t a0 = (uintptr_t)ple->base & ~mask;
+            const uintptr_t a1 =
+                ((uintptr_t)ple->base + ple->bytes + mask) & ~mask;
+            (void)posix_madvise((void *)a0, (size_t)(a1 - a0),
+                                POSIX_MADV_RANDOM);
+        }
+    }
+#endif
 }
 
 static const char *qwen4exp_family_name(ds4_qwen4exp_mem_family f) {
