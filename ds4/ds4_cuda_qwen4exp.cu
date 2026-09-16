@@ -10678,7 +10678,7 @@ __global__ static void qwen4exp_rope_head_kernel(
  * Fused Q-Prep & KV-Prep Kernels for QSA Attention
  * ========================================================================= */
 
-/* Part 0/1: standalone Q/KV; Part 2: joint grid, same per-head arithmetic. */
+/* Part 0/1: standalone Q/KV; Part 2: joint; Part 4: joint without gate copy. */
 template<int Part, bool KVFirst=false>
 __global__ static void qwen4exp_qsa_prep_joint_kernel(
         const float *doubled,const float *raw_k,const float *raw_v,
@@ -10691,8 +10691,8 @@ __global__ static void qwen4exp_qsa_prep_joint_kernel(
     const uint32_t token=blockIdx.y,tid=threadIdx.x,nth=blockDim.x;
     /* Part 3 is Part 0 without the gate store, for a caller that reads the
      * gate straight out of `doubled`. */
-    const bool is_q=Part==0||Part==3||(Part==2&&(KVFirst?blockIdx.x>=n_head_kv:blockIdx.x<n_head));
-    const uint32_t head=blockIdx.x-(Part==2?(is_q?(KVFirst?n_head_kv:0u):(KVFirst?0u:n_head)):0u);
+    const bool is_q=Part==0||Part==3||((Part==2||Part==4)&&(KVFirst?blockIdx.x>=n_head_kv:blockIdx.x<n_head));
+    const uint32_t head=blockIdx.x-((Part==2||Part==4)?(is_q?(KVFirst?n_head_kv:0u):(KVFirst?0u:n_head)):0u);
     const uint32_t heads=is_q?n_head:n_head_kv;
     if(head>=heads||token>=n_tokens)return;
     const uint32_t width=heads*head_dim;
@@ -10702,7 +10702,9 @@ __global__ static void qwen4exp_qsa_prep_joint_kernel(
     float raw=0.0f;
     if(tid<head_dim){
         raw=is_q?doubled[src]:raw_k[src];
-        if(is_q&&Part!=3)gate_out[at]=doubled[src+head_dim];
+        if(is_q&&Part!=3){
+            if constexpr(Part!=4)gate_out[at]=doubled[src+head_dim];
+        }
         else if(pos<cache_cap)v_cache[(uint64_t)pos*width+head*head_dim+tid]=raw_v[at];
     }
     shared[tid]=tid<head_dim?raw*raw:0.0f;
@@ -12976,6 +12978,45 @@ extern "C" int ds4_gpu_qwen4exp_qsa_prep_joint_dpos_tensor(
         out[4]?(float*)out[4]->ptr:NULL,rows,qh,kh,dim,rot,pos,cap,eps,qo,ko,
         dp?(const uint32_t*)dp->ptr:NULL);
     return cuda_ok(cudaGetLastError(),"Qwen4-Exp joint Q/KV preparation launch");
+}
+
+/* out[1] is ignored: the caller consumes gates directly from doubled Q. */
+extern "C" int ds4_gpu_qwen4exp_qsa_prep_joint_nogate_dpos_tensor(
+        ds4_gpu_tensor *const out[5], const ds4_gpu_tensor *const in[6],
+        uint32_t rows, uint32_t qh, uint32_t kh, uint32_t dim, uint32_t rot,
+        uint32_t pos, uint32_t cap, float eps, float qo, float ko,
+        const ds4_gpu_tensor *dp) {
+    if (!out || !in || !rows || rows>65535u || !qh || !kh || qh>256u || kh>256u ||
+        !dim || dim>1024u || !rot || rot>dim || rot%2u ||
+        (!dp && (uint64_t)pos+rows>cap)) return 0;
+    const uint64_t qe=(uint64_t)rows*qh*dim, ke=(uint64_t)rows*kh*dim;
+    const uint64_t ce=(uint64_t)cap*kh*dim;
+    const uint64_t oe[5]={qe,qe,ce,ce,ke}, ie[6]={2u*qe,ke,ke,dim,dim,rot/2u};
+    for (unsigned i=0;i<5;i++)
+        if (i!=1 && (i!=4 || out[i]) && !glm53_cuda_tensor_has(out[i],oe[i],4u)) return 0;
+    for (unsigned i=0;i<6;i++) if (!glm53_cuda_tensor_has(in[i],ie[i],4u)) return 0;
+    if (dp && !glm53_cuda_tensor_has(dp,1,4u)) return 0;
+    bool joint=rows<=2u && (dim&(dim-1u))==0u &&
+               getenv("DS4_QWEN4EXP_NO_QSA_PREP_JOINT")==NULL;
+    for (unsigned i=0;joint && i<5;i++) if (i!=1 && out[i]) {
+        for (unsigned j=0;j<6;j++) joint &= qwen4exp_hc_ranges_disjoint(
+                out[i]->ptr,oe[i]*4u,in[j]->ptr,ie[j]*4u);
+        for (unsigned j=0;j<i;j++) if (j!=1 && out[j]) joint &= qwen4exp_hc_ranges_disjoint(
+                out[i]->ptr,oe[i]*4u,out[j]->ptr,oe[j]*4u);
+        if (dp) joint &= qwen4exp_hc_ranges_disjoint(out[i]->ptr,oe[i]*4u,dp->ptr,4u);
+    }
+    if (!joint) return ds4_gpu_qwen4exp_qsa_prep_q_nogate_dpos_tensor(
+            out[0],in[0],in[3],in[5],rows,qh,dim,rot,pos,eps,qo,dp) &&
+        ds4_gpu_qwen4exp_qsa_prep_kv_append_fused_dpos_tensor(
+            out[2],out[3],out[4],in[1],in[2],in[4],in[5],pos,rows,kh,dim,rot,cap,eps,ko,dp);
+    const unsigned nth=qwen4exp_cuda_threads(dim);
+    qwen4exp_qsa_prep_joint_kernel<4><<<dim3(qh+kh,rows),nth,nth*4u,cuda_decode_stream()>>>(
+        (const float*)in[0]->ptr,(const float*)in[1]->ptr,(const float*)in[2]->ptr,
+        (const float*)in[3]->ptr,(const float*)in[4]->ptr,(const float*)in[5]->ptr,
+        (float*)out[0]->ptr,NULL,(float*)out[2]->ptr,(float*)out[3]->ptr,
+        out[4]?(float*)out[4]->ptr:NULL,rows,qh,kh,dim,rot,pos,cap,eps,qo,ko,
+        dp?(const uint32_t*)dp->ptr:NULL);
+    return cuda_ok(cudaGetLastError(),"Qwen4-Exp joint Q/KV preparation without gate launch");
 }
 
 extern "C" int ds4_gpu_qwen4exp_qsa_indexer_pool_update_dpos_tensor(

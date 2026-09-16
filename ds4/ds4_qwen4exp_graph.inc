@@ -1685,7 +1685,9 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
         ds4_gpu_tensor *outs[5]={s->qsa_q,s->qsa_gate,s->qsa_k[il],s->qsa_v[il],NULL};
         const ds4_gpu_tensor *ins[6]={s->qsa_doubled,s->qsa_kin,s->qsa_vin,
                                     s->attn_q_norm[il],s->attn_k_norm[il],s->inv_freq};
-        if (!ds4_gpu_qwen4exp_qsa_prep_joint_dpos_tensor(outs,ins,n_tokens,
+        if (!(qw_qsa_gate_from_doubled(n_tokens, DS4_N_HEAD * head_dim, head_dim)
+              ? ds4_gpu_qwen4exp_qsa_prep_joint_nogate_dpos_tensor
+              : ds4_gpu_qwen4exp_qsa_prep_joint_dpos_tensor)(outs,ins,n_tokens,
                 DS4_N_HEAD,DS4_N_HEAD_KV,head_dim,DS4_N_ROT,pos0,s->plan.n_ctx,
                 DS4_RMS_EPS,l->attn_q_norm_offset,l->attn_k_norm_offset,s->d_pos)) {
             fprintf(stderr,"ds4: qwen4exp joint Q/KV prep failed at block %u\n",il);

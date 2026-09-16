@@ -603,6 +603,13 @@ int ds4_gpu_qwen4exp_qsa_prep_joint_dpos_tensor(
         uint32_t pos, uint32_t cap, float eps, float qo, float ko,
         const ds4_gpu_tensor *dp);
 
+/* Same outputs except out[1] is ignored and may be NULL; no gate copy. */
+int ds4_gpu_qwen4exp_qsa_prep_joint_nogate_dpos_tensor(
+        ds4_gpu_tensor *const out[5], const ds4_gpu_tensor *const in[6],
+        uint32_t rows, uint32_t qh, uint32_t kh, uint32_t dim, uint32_t rot,
+        uint32_t pos, uint32_t cap, float eps, float qo, float ko,
+        const ds4_gpu_tensor *dp);
+
 int ds4_gpu_qwen4exp_qsa_prep_q_fused_dpos_tensor(
         ds4_gpu_tensor       *q,
         ds4_gpu_tensor       *gate,
