@@ -296,6 +296,12 @@ __global__ static void qwen4exp_gdn_conv_kernel(
     const uint32_t warp = tid >> 5u;
     const uint32_t key_blocks = 2u * n_key_head;
     const uint32_t blocks = key_blocks + n_value_head;
+    /* Decode and verify widths only: the recurrence that consumes qkv is
+     * launched with the PSS attribute, and a producer whose grid is not
+     * single-wave may never trigger (the deadlock rule,
+     * ds4_cuda_qwen4exp.cuh).  At n_rows <= 2 this grid is at most
+     * 2 * (2 * n_key_head + n_value_head) blocks of GDN_DIM threads. */
+    if (n_rows <= 2u) QWEN4EXP_PDL_TRIGGER();
     if (block >= blocks || row >= n_rows) return;
 
     /* Two reduction slots, alternating by token.  One barrier a token then
@@ -535,7 +541,7 @@ template <bool PRECOMPUTED_GATES>
 __global__ static void qwen4exp_gdn_recurrence_kernel(
         float       *__restrict__ out,
         float       *__restrict__ state,
-        const float *__restrict__ qkv,
+        const float *qkv,
         const float *__restrict__ raw_alpha,
         const float *__restrict__ raw_beta,
         const float *__restrict__ a_log,
@@ -588,6 +594,12 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
     const float decay_coeff = a_log[head];
     const float bias = dt_bias[head];
 
+
+    /* PSS consumer of the conv kernel: every load above this fence is
+     * state, snapshot or weight data that was complete before the producer
+     * launched.  The token loop's qkv reads are the producer's output and
+     * stay below it. */
+    QWEN4EXP_PDL_SYNC();
     for (uint32_t token = 0; token < n_tokens; token++) {
         const uint64_t slot = (uint64_t)row * n_tokens + token;
         const uint64_t base = slot * conv_dim + key_head * QWEN4EXP_GDN_DIM;
@@ -1506,13 +1518,17 @@ static int qwen4exp_cuda_gdn_run(
                     NULL);
         }
     } else {
-        qwen4exp_gdn_recurrence_kernel<false><<<
-                recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
+        /* The serial conv kernel above carries a row-gated trigger; at
+         * decode and verify widths this recurrence rides its launch window
+         * and hoists its state and weight loads ahead of the fence. */
+        QWEN4EXP_LAUNCH_PDL(
+                (qwen4exp_gdn_recurrence_kernel<false>),
+                recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream,
                 (float *)out->ptr, (float *)recurrent_state->ptr,
                 (const float *)qkv->ptr,
                 (const float *)raw_alpha->ptr,
                 (const float *)raw_beta->ptr, a_log, dt_bias,
-                NULL,
+                (const float2 *)NULL,
                 state_snapshot ? (float *)state_snapshot->ptr : NULL,
                 n_key_head, n_value_head, n_rows, n_tokens, head_layout,
                 n_snapshot_rows,
