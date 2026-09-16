@@ -691,14 +691,33 @@ static const int8_t ple_kvalues_iq4nl[16] = {
 
 /* The same table pre-expanded so the high nibble is a direct byte index
  * instead of a shift.  kv_hi[b] == ple_kvalues_iq4nl[b >> 4] for all 256
- * byte values; it is built at load and never written again.  The dequant
- * emits 640 bytes of floats for every 90 bytes it reads, so it is store-bound
- * and this is a small win at best -- but it removes a shift per element from
- * the hot loop without changing a single output value. */
-static int8_t ple_kvalues_iq4nl_hi[256];
-static void ple_kvalues_iq4nl_hi_init(void) {
-    for (int i = 0; i < 256; i++) ple_kvalues_iq4nl_hi[i] = ple_kvalues_iq4nl[i >> 4];
-}
+ * byte values.  Keep it as a read-only static initializer rather than a
+ * mutable lazy table: every row/head call then avoids the once-per-call
+ * readiness branch, and concurrent first use cannot race the initialization.
+ * The dequant emits 640 bytes of floats for every 90 bytes it reads, so it is
+ * store-bound and this is a small win at best -- but it removes a shift per
+ * element from the hot loop without changing a single output value. */
+#define DS4_PLE_IQ4_NL_HI16(v) \
+    v, v, v, v, v, v, v, v, v, v, v, v, v, v, v, v
+static const int8_t ple_kvalues_iq4nl_hi[256] = {
+    DS4_PLE_IQ4_NL_HI16(-127),
+    DS4_PLE_IQ4_NL_HI16(-104),
+    DS4_PLE_IQ4_NL_HI16(-83),
+    DS4_PLE_IQ4_NL_HI16(-65),
+    DS4_PLE_IQ4_NL_HI16(-49),
+    DS4_PLE_IQ4_NL_HI16(-35),
+    DS4_PLE_IQ4_NL_HI16(-22),
+    DS4_PLE_IQ4_NL_HI16(-10),
+    DS4_PLE_IQ4_NL_HI16(1),
+    DS4_PLE_IQ4_NL_HI16(13),
+    DS4_PLE_IQ4_NL_HI16(25),
+    DS4_PLE_IQ4_NL_HI16(38),
+    DS4_PLE_IQ4_NL_HI16(53),
+    DS4_PLE_IQ4_NL_HI16(69),
+    DS4_PLE_IQ4_NL_HI16(89),
+    DS4_PLE_IQ4_NL_HI16(113),
+};
+#undef DS4_PLE_IQ4_NL_HI16
 
 /* FP16 -> FP32 with no data-dependent loop.
  *
@@ -750,9 +769,6 @@ void ds4_ple_dequant_iq4_nl(const void *__restrict blocks, size_t block_count,
                             float *__restrict out) {
     const uint8_t *__restrict p = (const uint8_t *)blocks;
     if (!p || !out) return;
-
-    static int hi_ready = 0;
-    if (!hi_ready) { ple_kvalues_iq4nl_hi_init(); hi_ready = 1; }
 
     const int8_t *const kv = ple_kvalues_iq4nl;
     for (size_t b = 0; b < block_count; b++) {
