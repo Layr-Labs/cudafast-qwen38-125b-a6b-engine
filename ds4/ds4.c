@@ -18322,7 +18322,12 @@ static bool metal_graph_cuda_greedy_splitkv_requested(void) {
 #else
     const char *no = getenv("DS4_CUDA_NO_GREEDY_SPLITKV");
     if (no && no[0] && strcmp(no, "0") != 0) return false;
-    return metal_graph_tp_env_flag("DS4_CUDA_GREEDY_SPLITKV", false);
+    /* Default ON. The split-KV decode path and its combine kernel ship
+     * complete; only this flag kept them out of a run that sets no DS4_*
+     * environment. The margin threshold below (0.25) still routes every
+     * near-tie back to the unsplit kernel, and DS4_CUDA_NO_GREEDY_SPLITKV
+     * remains the escape hatch. */
+    return metal_graph_tp_env_flag("DS4_CUDA_GREEDY_SPLITKV", true);
 #endif
 }
 
