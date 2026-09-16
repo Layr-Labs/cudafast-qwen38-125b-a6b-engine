@@ -644,6 +644,16 @@ typedef int (*ds4_qwen4exp_block_forward_fn)(
         uint32_t        pos0,
         uint32_t        n_tokens);
 
+/* Optional last-only block: publish attention/cache state for every input row,
+ * but run the FFN only for the final row and write its complete hyper output
+ * to distinct, stable `last_hyper` storage. Earlier hyper outputs are unused.
+ * Neither tensor may be resized or rebound during a captured graph's lifetime.
+ * A failure may have changed cache state; callers must not retry the block. */
+typedef int (*ds4_qwen4exp_block_last_fn)(
+        void *graph, void *cache, ds4_gpu_tensor *hyper,
+        ds4_gpu_tensor *last_hyper, uint32_t il, uint32_t pos0,
+        uint32_t n_tokens);
+
 /* The graph's implementation of the above, defined in ds4_qwen4exp_graph.inc.
  * Declared HERE rather than only in ds4_qwen4exp_graph.h because that header
  * names ds4.c's internal ds4_tensor/ds4_model types and cannot be included
@@ -652,6 +662,9 @@ typedef int (*ds4_qwen4exp_block_forward_fn)(
 int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
                                   ds4_gpu_tensor *hyper, uint32_t il,
                                   uint32_t pos0, uint32_t n_tokens);
+int ds4_qwen4exp_graph_head_block_last(void *graph, void *cache,
+        ds4_gpu_tensor *hyper, ds4_gpu_tensor *last_hyper, uint32_t il,
+        uint32_t pos0, uint32_t n_tokens);
 /* Publish only the head's K/V and indexer state from EH-projected rows.
  * No query, attention output, FFN or vocabulary output is requested. */
 int ds4_qwen4exp_graph_head_cache(void *graph, void *cache,
@@ -718,6 +731,7 @@ typedef struct {
                       const ds4_gpu_tensor *, uint32_t, uint32_t);
     ds4_qwen4exp_block_forward_fn block;
     ds4_qwen4exp_block_forward_fn cache_seed; /* optional cache-only hook */
+    ds4_qwen4exp_block_last_fn block_last;   /* optional last-only FFN tail */
 } ds4_qwen4exp_mtp_gpu_hooks;
 
 /* One output row of a Q8_0 weight as it lies in the mapping: ceil(in_dim / 32)
