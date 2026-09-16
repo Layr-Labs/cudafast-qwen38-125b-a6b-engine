@@ -53,6 +53,44 @@ void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
+/* The per-round host<->device copies, issued without a host block.
+ *
+ * ds4_gpu_tensor_write/read are synchronous cudaMemcpy calls: the host waits
+ * for the copy to land before the call returns, and a pageable source or
+ * destination is staged through the driver's own bounce buffer first.  On the
+ * decode round-trip that is six separate round-trips the host sits in -- the
+ * token and n-gram-row uploads ahead of the forward, the hyper-row and
+ * top-1 readbacks behind it, and the head's token and hyper uploads after
+ * that -- each of which costs the call's latency plus the driver's staging
+ * pass, and none of which the host needs to have finished before it goes on
+ * to encode the next launch.
+ *
+ * The async pair issues the same copy on the decode stream and returns
+ * immediately.  Ordering against the kernels that produce or consume the
+ * bytes is the stream's own ordering, which is exactly what the synchronous
+ * call relied on.  What the caller owes in exchange is the host buffer's
+ * lifetime: the buffer must not be written or freed until the copy has
+ * completed, which ds4_gpu_copy_mark/copy_wait below track, and the buffer
+ * should be pinned (ds4_gpu_host_pin) or the driver stages the copy and the
+ * call blocks anyway.  A read's destination is likewise not valid until a
+ * copy_wait or a stream/device synchronize has run. */
+int ds4_gpu_tensor_write_async(ds4_gpu_tensor *tensor, uint64_t offset,
+                               const void *data, uint64_t bytes);
+int ds4_gpu_tensor_read_async(const ds4_gpu_tensor *tensor, uint64_t offset,
+                              void *data, uint64_t bytes);
+/* Pin or unpin a host buffer for the async copies.  Pinning is a hint about
+ * residency: it changes no byte the buffer holds, and a buffer that cannot
+ * be pinned still works through the driver's staging path -- the copy just
+ * blocks like the synchronous call did.  Returns nonzero on success. */
+int ds4_gpu_host_pin(void *data, uint64_t bytes);
+void ds4_gpu_host_unpin(void *data, uint64_t bytes);
+/* One event per session marks the most recent async copy out of a reusable
+ * host buffer.  copy_mark records it on the decode stream after the copy;
+ * copy_wait blocks the host until the recorded point -- and so the copy --
+ * has completed, which is what a gather about to rewrite the staging buffer
+ * needs.  With no mark outstanding, copy_wait returns at once. */
+int ds4_gpu_copy_mark(void);
+int ds4_gpu_copy_wait(void);
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);

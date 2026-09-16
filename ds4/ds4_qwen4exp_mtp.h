@@ -826,6 +826,10 @@ typedef struct {
     ds4_gpu_tensor *t_logits_tail;
     ds4_gpu_tensor *t_top1;
     uint32_t       *top1_host;
+    /* Pinned staging for the per-round token upload: the ids land here and
+     * the copy rides the decode stream instead of blocking the host in a
+     * synchronous memcpy. */
+    int32_t        *tokens_stage;
 
     /* Set by the owner when a margin gate or its log is armed.  A screened
      * one-row draft then reads its refined candidate logits back and leaves

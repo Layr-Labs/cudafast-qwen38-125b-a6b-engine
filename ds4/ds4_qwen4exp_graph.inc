@@ -316,7 +316,9 @@ struct ds4_qwen4exp_session {
     ds4_ple_constants ple_constants;
     bool              ple_ready;      /* the hash constants were readable */
     uint64_t         *ple_ids;        /* host [n_batch][head_count]       */
-    float            *ple_rows_host;  /* host [n_batch][ple_embd]         */
+    float            *ple_rows_host;  /* host [n_batch][ple_embd], pinned */
+    int32_t          *tokens_stage;   /* pinned [n_batch] upload staging  */
+    int32_t          *spec_top1_host; /* pinned [MAX_COMMIT] top-1 stage  */
     ds4_gpu_tensor   *ple_conv_state; /* [state_rows][n_hc * n_embd]      */
     ds4_gpu_tensor   *ple_rows;       /* [n_batch][ple_embd]              */
     ds4_gpu_tensor   *ple_key;        /* key projection, then the gate    */
@@ -734,7 +736,25 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
         if (ok) {
             s->ple_ids = calloc((size_t)B * DS4_N_PLE_HEAD, sizeof(uint64_t));
             s->ple_rows_host = calloc((size_t)B * DS4_N_PLE_EMBD, sizeof(float));
-            ok = s->ple_ids != NULL && s->ple_rows_host != NULL;
+            s->tokens_stage = calloc((size_t)B, sizeof(int32_t));
+            s->spec_top1_host = calloc(
+                (size_t)DS4_QWEN4EXP_MTP_MAX_COMMIT, sizeof(int32_t));
+            ok = s->ple_ids != NULL && s->ple_rows_host != NULL &&
+                 s->tokens_stage != NULL && s->spec_top1_host != NULL;
+            /* Pin the three buffers the per-round copies stage through.  A
+             * pin failure is not fatal: the async copy falls back to the
+             * driver's own staging and behaves like the synchronous call
+             * did, so the buffers stay usable either way. */
+            if (ok) {
+                (void)ds4_gpu_host_pin(
+                    s->ple_rows_host,
+                    (uint64_t)B * DS4_N_PLE_EMBD * sizeof(float));
+                (void)ds4_gpu_host_pin(s->tokens_stage,
+                                       (uint64_t)B * sizeof(int32_t));
+                (void)ds4_gpu_host_pin(
+                    s->spec_top1_host,
+                    (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * sizeof(int32_t));
+            }
         }
         if (ok) {
             s->ple_ready = qwen4exp_ple_read_constants(m, w, &s->ple_constants);
@@ -829,6 +849,21 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     if (!s) return;
     /* Graph nodes retain session buffer addresses, even across resets. */
     ds4_gpu_decode_graphs_invalidate();
+    free(s->ple_ids);
+    /* The async copies may still be in flight against the staging buffers;
+     * wait them out before the free, then unpin. */
+    (void)ds4_gpu_copy_wait();
+    ds4_gpu_host_unpin(s->ple_rows_host,
+                       (uint64_t)s->plan.n_batch * DS4_N_PLE_EMBD *
+                           sizeof(float));
+    ds4_gpu_host_unpin(s->tokens_stage,
+                       (uint64_t)s->plan.n_batch * sizeof(int32_t));
+    ds4_gpu_host_unpin(s->spec_top1_host,
+                       (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT *
+                           sizeof(int32_t));
+    free(s->ple_rows_host);
+    free(s->tokens_stage);
+    free(s->spec_top1_host);
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
         ds4_gpu_tensor_free(s->gdn_conv[il]);
         ds4_gpu_tensor_free(s->gdn_state[il]);
@@ -849,8 +884,6 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->ple_key);
     ds4_gpu_tensor_free(s->ple_aux);
     ds4_gpu_tensor_free(s->ple_value);
-    free(s->ple_ids);
-    free(s->ple_rows_host);
     ds4_gpu_tensor_free(s->d_pos);
     ds4_gpu_tensor_free(s->d_adopt);
     ds4_gpu_tensor_free(s->inv_freq);
@@ -1416,11 +1449,17 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 "ds4: qwen4exp PLE gather %u rows took %.3f ms\n",
                 n_tokens, (now_sec() - gather_t0) * 1000.0);
     }
-    if (!ds4_gpu_tensor_write(s->ple_rows, 0, s->ple_rows_host,
+    /* The row upload rides the decode stream from the pinned staging slab:
+     * the host does not sit in a synchronous memcpy, and the copy lands ahead
+     * of the PLE kernels in stream order.  copy_mark records the point the
+     * staging slab is free to be rewritten, which the next forward's
+     * copy_wait observes before it gathers into it again. */
+    if (!ds4_gpu_tensor_write_async(s->ple_rows, 0, s->ple_rows_host,
                               (uint64_t)n_tokens * DS4_N_PLE_EMBD * sizeof(float))) {
         fprintf(stderr, "ds4: qwen4exp n-gram row upload failed at block %u\n", il);
         return false;
     }
+    (void)ds4_gpu_copy_mark();
     return true;
 }
 
@@ -2753,7 +2792,6 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     s->state_dirty = true;
     /* A refused forward may have left an owed inject behind; the stream is
      * re-seeded below, so it is void. */
-    s->hc_pending = false;
 
 #ifdef DS4_TEST_HOOKS
     g_qwen4exp_trace_len = 0;
@@ -2777,11 +2815,26 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         return false;
     }
 
-    if (!ds4_gpu_tensor_write(s->tokens, 0, tokens,
-                              (uint64_t)n_tokens * sizeof(int32_t))) {
+    /* The staging buffers below may still be read by the previous forward's
+     * async uploads; wait that mark out before the host writes them again.
+     * In practice the copies finished while the last round's verify drained
+     * the stream, so this is a no-op wait, not a stall. */
+    if (!ds4_gpu_copy_wait()) {
+        fprintf(stderr, "ds4: qwen4exp staging copy wait failed\n");
+        return false;
+    }
+
+    /* The token upload goes through the pinned stage and rides the decode
+     * stream: the host does not sit in a synchronous memcpy here, and the
+     * copy lands ahead of the embed kernel in stream order, which is the
+     * ordering the synchronous write relied on. */
+    for (uint32_t i = 0; i < n_tokens; i++) s->tokens_stage[i] = tokens[i];
+    if (!ds4_gpu_tensor_write_async(s->tokens, 0, s->tokens_stage,
+                                    (uint64_t)n_tokens * sizeof(int32_t))) {
         fprintf(stderr, "ds4: qwen4exp token upload failed\n");
         return false;
     }
+
 
     /* The PLE host half runs BEFORE the batch opens: the row upload is a
      * memcpy into a shared buffer, and a memcpy between an encode and a commit
@@ -3461,12 +3514,30 @@ bool ds4_qwen4exp_graph_verify_top1_rows(ds4_qwen4exp_session       *s,
     s->spec_logit_rows = 0u;
     s->spec_top1_rows = 0u;
     if (!forward_ok) return false;
+    /* The top-1 read is issued FIRST, into the pinned stage, so its copy
+     * queues behind the forward on the decode stream and completes inside
+     * the pipeline drain the hyper read below already pays for.  Two
+     * synchronous reads would each block the host on their own round-trip;
+     * this way the second copy is free. */
+    if (!ds4_gpu_tensor_read_async(s->spec_top1, 0, s->spec_top1_host,
+                                   (uint64_t)n_tokens * sizeof(int32_t))) {
+        fprintf(stderr, "ds4: qwen4exp compact verify top-1 read failed\n");
+        return false;
+    }
+    (void)ds4_gpu_copy_mark();
     if (hc_rows && !ds4_qwen4exp_session_read_hyper(s, 0, n_tokens, hc_rows)) {
         fprintf(stderr, "ds4: qwen4exp compact verify hyper read failed\n");
         return false;
     }
-    return ds4_gpu_tensor_read(s->spec_top1, 0, row_top1,
-                               (uint64_t)n_tokens * sizeof(int32_t)) != 0;
+    /* The hyper read's synchronize covered the top-1 copy queued ahead of
+     * it; with no hyper read the mark wait does the same.  Either way the
+     * stage holds the row winners now. */
+    if (!hc_rows && !ds4_gpu_copy_wait()) {
+        fprintf(stderr, "ds4: qwen4exp compact verify top-1 wait failed\n");
+        return false;
+    }
+    memcpy(row_top1, s->spec_top1_host, n_tokens * sizeof(int32_t));
+    return true;
 }
 
 bool ds4_qwen4exp_graph_read_logit_row(ds4_qwen4exp_session *s,

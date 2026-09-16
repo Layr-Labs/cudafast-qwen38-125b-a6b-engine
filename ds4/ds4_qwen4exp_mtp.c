@@ -284,11 +284,25 @@ int ds4_qwen4exp_mtp_state_init(ds4_qwen4exp_mtp_state *st, int depth,
         ds4_qwen4exp_mtp_state_free(st);
         return mtp_fail(err, errlen, "qwen4exp MTP: out of memory");
     }
+    /* The verify's hyper readback lands here and the head's multi-stream
+     * upload reads it straight back out, so the slab is on the async copy
+     * path in both directions.  Pinning it keeps both copies off the
+     * driver's staging path; a pin failure is not fatal, the copies just
+     * behave like the synchronous calls they replace. */
+#ifndef DS4_NO_GPU
+    (void)ds4_gpu_host_pin(st->hc_scratch,
+                           (uint64_t)DS4_QWEN4EXP_MTP_HC_ROWS * hc_dim *
+                               sizeof(float));
+#endif
     return 0;
 }
-
 void ds4_qwen4exp_mtp_state_free(ds4_qwen4exp_mtp_state *st) {
     if (!st) return;
+    /* The head's async upload may still be reading the scratch slab. */
+#ifndef DS4_NO_GPU
+    (void)ds4_gpu_copy_wait();
+    ds4_gpu_host_unpin(st->hc_scratch, 0);
+#endif
     free(st->hc_scratch);
     free(st->logits_rows);
     st->hc_scratch = NULL;
@@ -967,12 +981,20 @@ int ds4_qwen4exp_mtp_head_init(ds4_qwen4exp_mtp_head *h,
     h->cache_tail_next_token = -1;
     h->t_top1         = mtp_alloc(rows * sizeof(uint32_t), &ok);
     h->top1_host      = malloc((size_t)rows * sizeof(uint32_t));
-    if (!ok || !h->top1_host) {
+    h->tokens_stage   = malloc((size_t)input_rows * sizeof(int32_t));
+    if (!ok || !h->top1_host || !h->tokens_stage) {
         ds4_qwen4exp_mtp_head_free(h);
         return mtp_fail(err, errlen,
                         "qwen4exp MTP head: scratch allocation failed for %u "
                         "rows", h->max_tokens);
     }
+    /* Pin the two host buffers the per-round copies stage through.  A pin
+     * failure is not fatal: the async copy falls back to the driver's own
+     * staging and behaves like the synchronous call did. */
+    (void)ds4_gpu_host_pin(h->tokens_stage,
+                           (uint64_t)input_rows * sizeof(int32_t));
+    (void)ds4_gpu_host_pin(h->top1_host,
+                           (uint64_t)rows * sizeof(uint32_t));
     return 0;
 }
 
@@ -997,8 +1019,13 @@ void ds4_qwen4exp_mtp_head_free(ds4_qwen4exp_mtp_head *h) {
     h->cache_seed_capacity = 0;
     ds4_qwen4exp_mtp_head_reset_cache(h);
     h->native_capacity = 0;
+    (void)ds4_gpu_copy_wait();
+    ds4_gpu_host_unpin(h->top1_host, 0);
+    ds4_gpu_host_unpin(h->tokens_stage, 0);
     free(h->top1_host);
+    free(h->tokens_stage);
     h->top1_host = NULL;
+    h->tokens_stage = NULL;
 }
 
 /*
@@ -1124,29 +1151,39 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
     uint64_t tmark = timing ? mtp_now_ns() : 0;
 
     /* The ids the embedding gather reads.  int is the caller's type; the
-     * kernel takes int32, and the two agree on every target this builds for. */
-    int32_t ids_stack[DS4_QWEN4EXP_MTP_CACHE_SEED_MAX_ROWS];
-    int32_t *ids = ids_stack;
-    if (n_tokens > sizeof(ids_stack) / sizeof(ids_stack[0])) {
-        ids = malloc((size_t)n_tokens * sizeof(int32_t));
-        if (!ids) return mtp_fail(err, errlen, "qwen4exp MTP head: out of memory");
+     * kernel takes int32, and the two agree on every target this builds for.
+     * They land in the head's pinned stage and the upload rides the decode
+     * stream: the host does not sit in a synchronous memcpy, and the copy
+     * lands ahead of the embedding gather in stream order, which is the
+     * ordering the synchronous write relied on.  The stage may still be read
+     * by the previous call's upload, so the copy mark is waited out first --
+     * in practice that copy finished while the last readback drained the
+     * stream, so the wait is a no-op. */
+    if (!ds4_gpu_copy_wait()) {
+        return mtp_fail(err, errlen,
+                        "qwen4exp MTP head: staging copy wait failed");
     }
-    for (uint32_t t = 0; t < n_tokens; t++) ids[t] = (int32_t)next_tokens[t];
+    for (uint32_t t = 0; t < n_tokens; t++)
+        h->tokens_stage[t] = (int32_t)next_tokens[t];
 
     const char *stage = "token upload";
-    bool ok = ds4_gpu_tensor_write(h->t_tokens, 0, ids,
+    bool ok = ds4_gpu_tensor_write_async(h->t_tokens, 0, h->tokens_stage,
                                    (uint64_t)n_tokens * sizeof(int32_t)) != 0;
-    if (ids != ids_stack) free(ids);
     MTP_HEAD_TICK(MTP_HEAD_T_TOKEN);
     if (ok) {
         stage = "multi-stream upload";
+        /* The hyper rows come from the caller's pinned scratch; the async
+         * write queues behind the token upload and the host goes on to
+         * encode the head's launches while the bytes move. */
         ok = multi_device
             ? ds4_gpu_tensor_copy(h->t_hyper, 0, multi_device,
                                   (uint64_t)first_device_row * hc_dim * f,
                                   (uint64_t)n_tokens * hc_dim * f) != 0
-            : ds4_gpu_tensor_write(h->t_hyper, 0, multi_in,
+            : ds4_gpu_tensor_write_async(h->t_hyper, 0, multi_in,
                                   (uint64_t)n_tokens * hc_dim * f) != 0;
     }
+    /* The token stage is free to rewrite once the uploads complete. */
+    if (ok) (void)ds4_gpu_copy_mark();
     MTP_HEAD_TICK(MTP_HEAD_T_MULTI_IN);
     if (ok) ok = ds4_gpu_begin_commands() != 0;
 

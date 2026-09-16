@@ -3454,6 +3454,89 @@ extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset
     return ok;
 }
 
+extern "C" int ds4_gpu_tensor_write_async(ds4_gpu_tensor *tensor, uint64_t offset,
+                                          const void *data, uint64_t bytes) {
+    if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
+    int d = ds4_tensor_device_idx(tensor);
+    int ok = 0;
+    WITH_DEVICE(g_gpu[d].device_id) {
+        /* Same copy, issued on the decode stream and not waited on.  The
+         * stream's own ordering is what the synchronous call relied on for
+         * ordering against the kernels around it; what changes is that the
+         * host is free to encode the next launch while the bytes move.  The
+         * caller owns the source buffer's lifetime until copy_wait. */
+        ok = cuda_ok(cudaMemcpyAsync((char *)tensor->ptr + offset, data,
+                                     (size_t)bytes, cudaMemcpyHostToDevice,
+                                     cuda_decode_stream()),
+                     "tensor write async");
+    }
+    return ok;
+}
+
+extern "C" int ds4_gpu_tensor_read_async(const ds4_gpu_tensor *tensor, uint64_t offset,
+                                         void *data, uint64_t bytes) {
+    if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
+    int d = ds4_tensor_device_idx(tensor);
+    int ok = 0;
+    WITH_DEVICE(g_gpu[d].device_id) {
+        ok = cuda_ok(cudaMemcpyAsync(data, (const char *)tensor->ptr + offset,
+                                     (size_t)bytes, cudaMemcpyDeviceToHost,
+                                     cuda_decode_stream()),
+                     "tensor read async");
+    }
+    return ok;
+}
+
+extern "C" int ds4_gpu_host_pin(void *data, uint64_t bytes) {
+    if (!data || bytes == 0) return 0;
+    /* cudaHostRegisterPortable is not needed: one GPU, one process.  The
+     * default flag pins the existing pages in place; a failure leaves the
+     * buffer usable through the driver's staging path. */
+    return cuda_ok(cudaHostRegister(data, (size_t)bytes, cudaHostRegisterDefault),
+                   "host pin");
+}
+
+extern "C" void ds4_gpu_host_unpin(void *data, uint64_t bytes) {
+    (void)bytes;
+    if (!data) return;
+    (void)cudaHostUnregister(data);
+}
+
+/* One event tracks the newest async copy out of a reusable host staging
+ * buffer.  Recorded on the decode stream right after the copy, so a wait on
+ * it is a wait on exactly the copies that could still be reading the buffer
+ * -- never on unrelated later work. */
+static cudaEvent_t g_copy_mark_event = NULL;
+static int g_copy_mark_pending = 0;
+
+extern "C" int ds4_gpu_copy_mark(void) {
+    if (!g_copy_mark_event) {
+        if (!cuda_ok(cudaEventCreateWithFlags(&g_copy_mark_event,
+                                              cudaEventDisableTiming),
+                     "copy mark event create")) {
+            /* No event, no mark: fall back to draining the stream so the
+             * staging buffers are still safe to rewrite. */
+            return cuda_ok(cudaStreamSynchronize(cuda_decode_stream()),
+                           "copy mark fallback sync");
+        }
+    }
+    if (!cuda_ok(cudaEventRecord(g_copy_mark_event, cuda_decode_stream()),
+                 "copy mark record")) {
+        return cuda_ok(cudaStreamSynchronize(cuda_decode_stream()),
+                       "copy mark fallback sync");
+    }
+    g_copy_mark_pending = 1;
+    return 1;
+}
+extern "C" int ds4_gpu_copy_wait(void) {
+    if (!g_copy_mark_pending) return 1;
+    if (!cuda_ok(cudaEventSynchronize(g_copy_mark_event), "copy mark wait")) {
+        return 0;
+    }
+    g_copy_mark_pending = 0;
+    return 1;
+}
+
 extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                      const ds4_gpu_tensor *src, uint64_t src_offset,
                                      uint64_t bytes) {
