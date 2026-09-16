@@ -138,6 +138,9 @@ void ds4_qwen4exp_session_plan_compute(ds4_qwen4exp_session_plan *plan,
      * every compared row's distribution out of one forward, so the LM head
      * runs once over the whole chain instead of once per row afterwards. */
     act += (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * cfg->n_vocab * f;
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    act += 128u; /* Two rows of eight target top-one pairs. */
+#endif
     plan->activation_bytes = act;
     act += ds4_qwen4exp_qsa_split_bytes(
         (uint32_t)qwen4exp_qsa_split_rows(B), DS4_N_HEAD, DS4_N_HEAD_DIM,
@@ -409,6 +412,7 @@ struct ds4_qwen4exp_session {
 
     ds4_gpu_tensor *logits;
     ds4_gpu_tensor *spec_top1;
+    ds4_gpu_tensor *spec_top1_partial;
 
     /* PREFILL ONLY.  True while `hyper` still owes the last block's inject:
      * the value the model means is hyper + block_out * inject, and the next
@@ -813,6 +817,9 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
             (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * cfg->n_vocab * f, &ok);
     s->spec_top1     = qwen4exp_alloc_zeroed(
             (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * sizeof(int32_t), &ok);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    s->spec_top1_partial = qwen4exp_alloc_zeroed(128u, &ok);
+#endif
 #ifdef DS4_TEST_HOOKS
     s->final_mixer_snapshot = qwen4exp_alloc_zeroed(B * H * E * f, &ok);
 #endif
@@ -892,6 +899,7 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->shexp_gate);
     ds4_gpu_tensor_free(s->logits);
     ds4_gpu_tensor_free(s->spec_top1);
+    ds4_gpu_tensor_free(s->spec_top1_partial);
 #ifdef DS4_TEST_HOOKS
     ds4_gpu_tensor_free(s->final_mixer_snapshot);
 #endif
@@ -2889,8 +2897,13 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     }
     if (s->spec_top1_rows != 0u &&
         (s->spec_top1_rows != logit_rows ||
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+         !ds4_gpu_target_top1_tensor(s->spec_top1, s->logits,
+                                      s->spec_top1_partial, cfg->n_vocab, logit_rows))) {
+#else
          !ds4_gpu_indexer_topk_tensor(s->spec_top1, s->logits,
                                       cfg->n_vocab, logit_rows, 1u))) {
+#endif
         fprintf(stderr, "ds4: qwen4exp compact verify top-1 failed\n");
         return qwen4exp_forward_fail();
     }

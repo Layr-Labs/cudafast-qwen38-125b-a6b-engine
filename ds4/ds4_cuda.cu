@@ -15121,6 +15121,64 @@ __global__ static void indexer_top1_kernel(
     if (tid == 0u) selected[t] = idxs[0];
 }
 
+/* Target-only hierarchical top-one; retain the original comparison domain. */
+struct target_top1_pair { float value; uint32_t id; };
+static_assert(sizeof(target_top1_pair) == 8, "target partial layout");
+__global__ static void target_top1_partition_kernel(
+        target_top1_pair *partial,
+        const float *scores,
+        uint32_t n_comp,
+        uint32_t n_tokens) {
+    const uint32_t t = blockIdx.y;
+    const uint32_t part = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (t >= n_tokens || tid >= 1024u) return;
+
+    const float *row = scores + (uint64_t)t * n_comp;
+    float best_v = -INFINITY;
+    uint32_t best_i = 0;
+    for (uint64_t i = (uint64_t)part * 1024u + tid; i < n_comp; i += 8192u) {
+        const float v = row[i];
+        if (topk_score_better(v, i, best_v, best_i)) {
+            best_v = v;
+            best_i = i;
+        }
+    }
+
+    __shared__ float vals[1024];
+    __shared__ uint32_t idxs[1024];
+    vals[tid] = best_v;
+    idxs[tid] = best_i;
+    __syncthreads();
+
+    for (uint32_t stride = 512u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            const float ov = vals[tid + stride];
+            const uint32_t oi = idxs[tid + stride];
+            if (topk_score_better(ov, oi, vals[tid], idxs[tid])) {
+                vals[tid] = ov;
+                idxs[tid] = oi;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0u) partial[t * 8u + part] = {vals[0], idxs[0]};
+}
+
+__global__ static void target_top1_finish_kernel(uint32_t *selected,
+        const target_top1_pair *partial) {
+    const uint32_t lane = threadIdx.x;
+    float value = -INFINITY; uint32_t id = 0;
+    if (lane < 8u) { const target_top1_pair p = partial[blockIdx.x * 8u + lane]; value=p.value; id=p.id; }
+    for (unsigned offset=16u; offset; offset>>=1u) {
+        const float other=__shfl_down_sync(0xffffffffu,value,offset);
+        const uint32_t other_id=__shfl_down_sync(0xffffffffu,id,offset);
+        if (lane+offset<32u && topk_score_better(other,other_id,value,id)) {value=other;id=other_id;}
+    }
+    if (!lane) selected[blockIdx.x]=id;
+}
+
 __global__ static void indexer_top1_value_kernel(
         uint32_t *selected,
         float *values,
@@ -15994,6 +16052,45 @@ extern "C" int ds4_gpu_dspark_markov_argmax_tensor(
     }
     if (logical_tier != dev_save) (void)cudaSetDevice(dev_save);
     return rc;
+}
+
+extern "C" int ds4_gpu_indexer_topk_tensor(ds4_gpu_tensor *,
+        const ds4_gpu_tensor *, uint32_t, uint32_t, uint32_t);
+
+static bool target_top1_disjoint(const void *a,uint64_t an,const void *b,uint64_t bn) {
+    const uintptr_t ap=(uintptr_t)a,bp=(uintptr_t)b;
+    return a && b && an<=UINTPTR_MAX-ap && bn<=UINTPTR_MAX-bp &&
+           (ap+an<=bp || bp+bn<=ap);
+}
+
+extern "C" int ds4_gpu_target_top1_tensor(ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *scores, ds4_gpu_tensor *scratch,
+        uint32_t n_comp,uint32_t n_tokens) {
+    if (!scratch || n_comp<65536u || n_tokens<1u || n_tokens>2u ||
+        g_cuda_no_top1 || getenv("DS4_NO_HIERARCHICAL_TARGET_TOP1"))
+        return ds4_gpu_indexer_topk_tensor(selected,scores,n_comp,n_tokens,1u);
+    if (!selected || !scores || !selected->ptr || !scores->ptr || !scratch->ptr ||
+        scores->bytes<(uint64_t)n_tokens*n_comp*4u || selected->bytes<(uint64_t)n_tokens*4u ||
+        scratch->bytes<(uint64_t)n_tokens*8u*sizeof(target_top1_pair) ||
+        ((uintptr_t)scores->ptr % alignof(float)) ||
+        ((uintptr_t)selected->ptr % alignof(uint32_t)) ||
+        ((uintptr_t)scratch->ptr % alignof(target_top1_pair))) return 0;
+    if (!target_top1_disjoint(scratch->ptr,scratch->bytes,scores->ptr,scores->bytes) ||
+        !target_top1_disjoint(scratch->ptr,scratch->bytes,selected->ptr,selected->bytes) ||
+        !target_top1_disjoint(selected->ptr,selected->bytes,scores->ptr,scores->bytes))
+        return ds4_gpu_indexer_topk_tensor(selected,scores,n_comp,n_tokens,1u);
+    const int tier=ds4_tensor_device_idx(scores);
+    if (tier<0 || tier>=g_n_gpus || ds4_tensor_device_idx(selected)!=tier ||
+        ds4_tensor_device_idx(scratch)!=tier) return 0;
+    int current=-1;
+    if (!cuda_ok(cudaGetDevice(&current),"target top1 device")) return 0;
+    if (current!=g_gpu[tier].device_id) return 0;
+    target_top1_partition_kernel<<<dim3(8,n_tokens),1024,0,cuda_decode_stream()>>>(
+        (target_top1_pair *)scratch->ptr,(const float *)scores->ptr,n_comp,n_tokens);
+    if (!cuda_ok(cudaGetLastError(),"target top1 partitions")) return 0;
+    target_top1_finish_kernel<<<n_tokens,32,0,cuda_decode_stream()>>>(
+        (uint32_t *)selected->ptr,(const target_top1_pair *)scratch->ptr);
+    return cuda_ok(cudaGetLastError(),"target top1 finish");
 }
 
 extern "C" int ds4_gpu_indexer_topk_tensor(
