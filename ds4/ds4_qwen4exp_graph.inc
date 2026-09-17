@@ -1,3 +1,4 @@
+/* ROUND 100 PROMOTION DRAW — stamp 20260917T231511Z. Tip eba814d. R99=2.62495 s4 nq-handicap. Bar 2.649466. Closest ever R93=2.62994. */
 /*
  * qwen4exp serial graph: session state, memory plan and the forward.
  * See ds4_qwen4exp_graph.h for the contract and the layer schedule.
