@@ -14041,9 +14041,12 @@ static uint32_t qwen4exp_qsa_split_width(uint32_t n_tokens, uint32_t n_head,
         return (v > 0 && v <= 32) ? (uint32_t)v : 0u;
     }
     /* One model-shaped row benefits from twice as many independent head
-     * groups. Multi-row calls retain four heads and their K/V reuse. */
+     * groups.  A multi-row call takes six: the widest group whose scores
+     * staging still fits the 48 KiB cap at the model shape (twelve heads
+     * would need 49536 B), so each K and V row is fetched four times per
+     * tile instead of six. */
     return n_tokens == 1u && n_head == 24u && n_kv_head == 2u && head_dim == 256u
-        ? 2u : 4u;
+        ? 2u : 6u;
 }
 
 /* The split path.  Returns 1 when it launched, 0 when the shape or the
