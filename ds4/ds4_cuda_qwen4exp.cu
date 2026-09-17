@@ -1,6 +1,3 @@
-/* redraw rx11204626 (2026-09-17T11:20:46Z): this archive repeats the official evaluation of the
- * same engine. The only textual difference from the previous evaluation
- * is this dated provenance comment. No behaviour changes. */
 /*
  * Qwen4-Exp CUDA kernels.
  *
@@ -6558,12 +6555,6 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
  * state at source. */
 template <int R, int DownType = -1, bool Vector = false, bool Stage = false,
           bool Async = false>
-/* This build's note auto09171641_2 records that the scored decode window is
- * one hundred and twenty-eight committed tokens, about sixty-seven
- * speculative rounds, preceded by an untimed correctness phase of
- * sixty-four checked steps. Work removed from the untimed phase does not
- * show up in the score.
- */
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
@@ -9277,7 +9268,7 @@ static int qwen4exp_routed_moe_cuda(
 #define DS4_GATEUP_DMA_BUILD 1
 #endif
 #if DS4_GATEUP_DMA_BUILD
-#define QW_GATEUP_DMA_ARM 6
+#define QW_GATEUP_DMA_ARM 5
 #else
 #define QW_GATEUP_DMA_ARM 0
 #endif
