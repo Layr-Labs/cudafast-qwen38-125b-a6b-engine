@@ -1245,6 +1245,46 @@ static void qw_ple_pool_init(void) {
     pthread_mutex_unlock(&g_qw_ple_pool.mutex);
 }
 
+/* Ask the kernel to bring every row this call will read in before the
+ * dequant loop touches the first one.  The gather is 16 random 90-byte
+ * reads per token out of the SSD-mapped table; taken one fault at a time
+ * they serialise on the disk, while WILLNEED over the whole set keeps
+ * every read in flight at once and the loop then walks pages that are
+ * already arriving.  A hint only: it changes no value the gather writes,
+ * and a row past the table stays the dequant loop's refusal, not this
+ * one's. */
+static void qw_ple_madvise_rows(const ds4_qwen4exp_ple_table *ple,
+                                const uint64_t *ids, size_t count) {
+#if defined(POSIX_MADV_WILLNEED)
+    if (!ple || !ple->base || !ids) return;
+    /* Resolved once per process; the page size cannot change while the
+     * engine is open. */
+    static long ple_page_cached = 0;
+    if (ple_page_cached == 0) {
+        const long v = sysconf(_SC_PAGESIZE);
+        ple_page_cached = v > 0 ? v : 4096;
+    }
+    const uint64_t page = (uint64_t)ple_page_cached;
+    uint64_t last_start = UINT64_MAX, last_end = 0;
+    for (size_t i = 0; i < count; i++) {
+        const uint64_t row = ids[i];
+        if (row >= ple->rows) continue;
+        uint64_t start = row * ple->row_bytes;
+        uint64_t end = start + ple->row_bytes;
+        start -= start % page;
+        end = (end + page - 1u) / page * page;
+        if (end > ple->bytes) end = ple->bytes;
+        if (start == last_start && end == last_end) continue;
+        last_start = start;
+        last_end = end;
+        (void)posix_madvise((void *)(uintptr_t)(ple->base + start),
+                            (size_t)(end - start), POSIX_MADV_WILLNEED);
+    }
+#else
+    (void)ple; (void)ids; (void)count;
+#endif
+}
+
 static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                                       const ds4_qwen4exp_weights *w,
                                       const int32_t *tokens,
@@ -1304,6 +1344,11 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 s->ple_history_rows[t] = s->ple_history;
             }
         }
+        /* Every id this call will read is known now; bring the pages in
+         * together so the dequant loop below walks arriving pages instead
+         * of serialising one fault per head. */
+        qw_ple_madvise_rows(&w->ple, s->ple_ids,
+                            (size_t)n_tokens * DS4_N_PLE_HEAD);
         for (uint32_t t = 0; t < n_tokens; t++) {
             /* The head's destination strides are constants of the shape, so
              * the token base is hoisted out of the head loop and the head
@@ -1367,6 +1412,8 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
         if (nthreads == 1) {
             ds4_ple_row_ids(&s->ple_constants, &s->ple_history, tokens,
                             n_tokens, s->ple_ids);
+            qw_ple_madvise_rows(&w->ple, s->ple_ids,
+                                (size_t)n_tokens * DS4_N_PLE_HEAD);
             for (uint32_t t = 0; t < n_tokens; t++) {
                 for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
                     const uint64_t row =
