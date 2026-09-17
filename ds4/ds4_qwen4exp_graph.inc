@@ -1103,6 +1103,11 @@ typedef struct {
     uint32_t                      t0;
     uint32_t                      t1;
     uint32_t                      blocks_per_row;
+    /* When set, t0/t1 bound a flat (token, head) pair range over an id block
+     * the caller already computed, and only the row fetch and dequant run.
+     * `fail` names the pair a refused row was read for. */
+    int                           rows_only;
+    uint32_t                      fail;
     int                           ok;
 } qw_ple_gather_seg;
 
@@ -1149,6 +1154,44 @@ static void *qw_ple_gather_worker(void *arg) {
     return NULL;
 }
 
+/* Row fetch over an id block the caller already computed.  The pair index IS
+ * the layout: s->ple_ids is [token][head] contiguous and s->ple_rows_host is
+ * [token][head * row_dim], so pair p reads ple_ids[p] and writes the p-th
+ * row_dim slice of ple_rows_host.  Disjoint pair ranges are disjoint writes,
+ * which is what makes the split safe.  Only the table read and the dequant
+ * run here -- the n-gram history is the caller's, which is what lets the
+ * verify path keep its per-row history snapshots serial while the page-ins
+ * overlap. */
+static void *qw_ple_rows_worker(void *arg) {
+    qw_ple_gather_seg *seg = (qw_ple_gather_seg *)arg;
+    const ds4_qwen4exp_session *s = seg->s;
+    seg->ok = 1;
+    for (uint32_t p = seg->t0; p < seg->t1; p++) {
+        const uint64_t row = s->ple_ids[p];
+        /* The next pair's id is the next thing this loop reads.  Hint. */
+        if (p + 1u < seg->t1)
+            __builtin_prefetch(s->ple_ids + p + 1u, 0, 1);
+        const uint8_t *quant = ds4_qwen4exp_ple_row(seg->ple, row);
+        if (__builtin_expect(!quant, 0)) {
+            seg->fail = p;
+            seg->ok = 0;
+            return NULL;
+        }
+        ds4_ple_dequant_iq4_nl(
+            quant, seg->blocks_per_row,
+            s->ple_rows_host + (uint64_t)p * DS4_N_PLE_ROW_DIM);
+    }
+    return NULL;
+}
+
+static void qw_ple_seg_run(qw_ple_gather_seg *seg) {
+    if (seg->rows_only) {
+        (void)qw_ple_rows_worker(seg);
+    } else {
+        (void)qw_ple_gather_worker(seg);
+    }
+}
+
 #define QW_PLE_MAX_THREADS 16
 
 typedef struct {
@@ -1189,7 +1232,7 @@ static void *qw_ple_pool_worker_thread(void *arg) {
         pthread_mutex_unlock(&g_qw_ple_pool.mutex);
 
         if (has_work) {
-            qw_ple_gather_worker(&g_qw_ple_pool.segs[idx]);
+            qw_ple_seg_run(&g_qw_ple_pool.segs[idx]);
 
             pthread_mutex_lock(&g_qw_ple_pool.mutex);
             g_qw_ple_pool.completed_workers++;
@@ -1240,6 +1283,108 @@ static void qw_ple_pool_init(void) {
     pthread_mutex_unlock(&g_qw_ple_pool.mutex);
 }
 
+/* Split a computed id block's row fetch across the pool.  The ids are already
+ * in s->ple_ids and the history is already settled, so this is the pure half
+ * of the gather: n_tokens * head_count independent 90-byte reads out of the
+ * SSD-resident table plus their dequants.  At the verify width (2 to 7
+ * tokens, 32 to 112 rows) the serial loop pays one page fault per row while
+ * the device waits on the upload; splitting the flat pair range across the
+ * pool puts the faults in flight together.  A single pair or a dead pool
+ * runs in place. */
+static int qw_ple_rows_dispatch(ds4_qwen4exp_session *s,
+                                const ds4_qwen4exp_ple_table *ple,
+                                uint32_t n_tokens,
+                                uint32_t blocks_per_row,
+                                long nthreads,
+                                uint32_t il) {
+    const uint64_t pairs = (uint64_t)n_tokens * DS4_N_PLE_HEAD;
+    if (nthreads > (long)pairs) nthreads = (long)pairs;
+    if (nthreads > QW_PLE_MAX_THREADS) nthreads = QW_PLE_MAX_THREADS;
+
+    uint32_t actual_threads = 0;
+    if (nthreads > 1) {
+        qw_ple_pool_init();
+        if (g_qw_ple_pool.initialized &&
+            (long)g_qw_ple_pool.n_threads < nthreads) {
+            nthreads = (long)g_qw_ple_pool.n_threads;
+        }
+        const uint64_t per = (pairs + (uint64_t)nthreads - 1u) /
+                             (uint64_t)nthreads;
+        for (long i = 0; i < nthreads; i++) {
+            const uint64_t p0 = (uint64_t)i * per;
+            if (p0 >= pairs) break;
+            actual_threads++;
+            uint64_t p1 = p0 + per;
+            if (p1 > pairs) p1 = pairs;
+            g_qw_ple_pool.segs[i].ple = ple;
+            g_qw_ple_pool.segs[i].s = s;
+            g_qw_ple_pool.segs[i].tokens = NULL;
+            g_qw_ple_pool.segs[i].n_tokens = n_tokens;
+            g_qw_ple_pool.segs[i].t0 = (uint32_t)p0;
+            g_qw_ple_pool.segs[i].t1 = (uint32_t)p1;
+            g_qw_ple_pool.segs[i].blocks_per_row = blocks_per_row;
+            g_qw_ple_pool.segs[i].rows_only = 1;
+            g_qw_ple_pool.segs[i].fail = 0;
+            g_qw_ple_pool.segs[i].ok = 0;
+        }
+    }
+
+    if (actual_threads > 1 && g_qw_ple_pool.initialized) {
+        pthread_mutex_lock(&g_qw_ple_pool.mutex);
+        g_qw_ple_pool.active_workers = actual_threads - 1u;
+        g_qw_ple_pool.completed_workers = 0;
+        g_qw_ple_pool.generation++;
+        pthread_cond_broadcast(&g_qw_ple_pool.work_cond);
+        pthread_mutex_unlock(&g_qw_ple_pool.mutex);
+
+        /* Master thread runs pair range 0 concurrently with workers. */
+        qw_ple_seg_run(&g_qw_ple_pool.segs[0]);
+
+        pthread_mutex_lock(&g_qw_ple_pool.mutex);
+        while (g_qw_ple_pool.completed_workers < g_qw_ple_pool.active_workers) {
+            pthread_cond_wait(&g_qw_ple_pool.done_cond, &g_qw_ple_pool.mutex);
+        }
+        pthread_mutex_unlock(&g_qw_ple_pool.mutex);
+    } else {
+        qw_ple_gather_seg seg;
+        memset(&seg, 0, sizeof(seg));
+        seg.ple = ple;
+        seg.s = s;
+        seg.n_tokens = n_tokens;
+        seg.t0 = 0;
+        seg.t1 = (uint32_t)pairs;
+        seg.blocks_per_row = blocks_per_row;
+        seg.rows_only = 1;
+        qw_ple_seg_run(&seg);
+        if (seg.ok != 1) {
+            const uint32_t p = seg.fail;
+            fprintf(stderr,
+                    "ds4: qwen4exp block %u hashed token %u head %u to row "
+                    "%" PRIu64 ", past the %" PRIu64 " the table holds\n",
+                    il, p / DS4_N_PLE_HEAD, p % DS4_N_PLE_HEAD,
+                    s->ple_ids[p], ple->rows);
+            return 0;
+        }
+        return 1;
+    }
+
+
+    for (uint32_t i = 0; i < actual_threads && g_qw_ple_pool.initialized; i++) {
+        if (g_qw_ple_pool.segs[i].ok != 1) {
+            const uint32_t p = g_qw_ple_pool.segs[i].fail;
+            const uint32_t t = p / DS4_N_PLE_HEAD;
+            const uint32_t h = p % DS4_N_PLE_HEAD;
+            fprintf(stderr,
+                    "ds4: qwen4exp block %u hashed token %u head %u to row "
+                    "%" PRIu64 ", past the %" PRIu64 " the table holds\n",
+                    il, t, h, s->ple_ids[p],
+                    ple->rows);
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                                       const ds4_qwen4exp_weights *w,
                                       const int32_t *tokens,
@@ -1286,11 +1431,41 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
     const uint32_t block_elems = DS4_PLE_IQ4_NL_BLOCK_ELEMS;
     const uint32_t blocks_per_row = DS4_N_PLE_ROW_DIM / block_elems;
 
+    /* The gather's thread count.  Resolved once per process: both getenv and
+     * sysconf(_SC_NPROCESSORS_ONLN) are libc calls that walk external state --
+     * the environ array and the online-CPU map -- to return a value that
+     * cannot change while the engine is open.  Caching it removes two of
+     * those walks from every round. */
+    static long ple_gather_threads_cached = -1;
+    if (ple_gather_threads_cached < 0) {
+        const char * const thr_env =
+            getenv("DS4_QWEN4EXP_PLE_GATHER_THREADS");
+        long v = 0;
+        if (thr_env && thr_env[0]) {
+            char *end = NULL;
+            v = strtol(thr_env, &end, 10);
+            if (end == thr_env || v < 0) v = 0;
+        }
+        if (v <= 0) {
+            v = sysconf(_SC_NPROCESSORS_ONLN);
+            if (v > 16) v = 16;
+            if (v < 1) v = 1;
+        }
+        ple_gather_threads_cached = v;
+    }
+    const long nthreads = ple_gather_threads_cached;
+
     /* When slots are armed the ids are produced ONE ROW AT A TIME so the
      * n-gram history after each row can be kept beside them.  The contract on
      * ds4_ple_row_ids is that a run of single-token calls names the same rows
      * a single long call would, so this is the same ids either way; splitting
-     * it is how the per-row history is observed, not a different computation. */
+     * it is how the per-row history is observed, not a different computation.
+     *
+     * The row fetch that follows is the pure half: it reads the ids and
+     * writes disjoint slices of ple_rows_host, so it splits across the pool
+     * at any width.  That is what the verify round needs -- 2 to 7 tokens is
+     * 32 to 112 random reads out of the SSD-resident table, and serial page
+     * faults there are the stall the device waits on. */
     if (s->spec_snapshot_rows > 0) {
         for (uint32_t t = 0; t < n_tokens; t++) {
             ds4_ple_row_ids(&s->ple_constants, &s->ple_history, tokens + t, 1u,
@@ -1299,32 +1474,16 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 s->ple_history_rows[t] = s->ple_history;
             }
         }
-        for (uint32_t t = 0; t < n_tokens; t++) {
-            /* The head's destination strides are constants of the shape, so
-             * the token base is hoisted out of the head loop and the head
-             * offset is carried as a pointer step instead of a multiply per
-             * head.  Same addresses, same values. */
-            const uint64_t *ids = s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD;
-            float *dst = s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD;
-            for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
-                const uint64_t row = ids[h];
-                /* Every head of this token except the last is followed by
-                 * another table row, so ask for the next id early.  Hint. */
-                if (h + 1u < DS4_N_PLE_HEAD)
-                    __builtin_prefetch(ids + h + 1u, 0, 1);
-                const uint8_t *quant = ds4_qwen4exp_ple_row(&w->ple, row);
-                /* Cold: a hashed row past the table is a hard refusal that has
-                 * never fired in a scored run, so keep it out of the hot path. */
-                if (__builtin_expect(!quant, 0)) {
-                    fprintf(stderr,
-                            "ds4: qwen4exp block %u hashed token %u head %u to row "
-                            "%" PRIu64 ", past the %" PRIu64 " the table holds\n",
-                            il, t, h, row, w->ple.rows);
-                    return false;
-                }
-                ds4_ple_dequant_iq4_nl(quant, blocks_per_row, dst);
-                dst += DS4_N_PLE_ROW_DIM;
-            }
+        if (!qw_ple_rows_dispatch(s, &w->ple, n_tokens, blocks_per_row,
+                                  nthreads, il)) {
+            return false;
+        }
+    } else if (nthreads <= 1 || n_tokens < 64u) {
+        ds4_ple_row_ids(&s->ple_constants, &s->ple_history, tokens,
+                        n_tokens, s->ple_ids);
+        if (!qw_ple_rows_dispatch(s, &w->ple, n_tokens, blocks_per_row,
+                                  nthreads, il)) {
+            return false;
         }
     } else {
         /* The prefill width: split the scan across worker threads when the
@@ -1333,127 +1492,80 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
          * disjoint token range; the tail thread's local history -- the state
          * a sequential scan would have ended with -- is copied back after
          * the join, so the session still carries the same history forward. */
-        long nthreads = 1;
-        /* Resolved once per process.  This runs on every prefill round, and
-         * both getenv and sysconf(_SC_NPROCESSORS_ONLN) are libc calls that
-         * walk external state -- the environ array and the online-CPU map --
-         * to return a value that cannot change while the engine is open.
-         * Caching it removes two of those walks from the round. */
-        static long ple_gather_threads_cached = -1;
-        if (ple_gather_threads_cached < 0) {
-            const char * const thr_env =
-                getenv("DS4_QWEN4EXP_PLE_GATHER_THREADS");
-            long v = 0;
-            if (thr_env && thr_env[0]) {
-                char *end = NULL;
-                v = strtol(thr_env, &end, 10);
-                if (end == thr_env || v < 0) v = 0;
-            }
-            if (v <= 0) {
-                v = sysconf(_SC_NPROCESSORS_ONLN);
-                if (v > 16) v = 16;
-                if (v < 1) v = 1;
-            }
-            ple_gather_threads_cached = v;
+        long seg_threads = nthreads;
+        if ((uint32_t)seg_threads > n_tokens) seg_threads = (long)n_tokens;
+        if (seg_threads > QW_PLE_MAX_THREADS) seg_threads = QW_PLE_MAX_THREADS;
+
+        qw_ple_pool_init();
+        if (g_qw_ple_pool.initialized && (long)g_qw_ple_pool.n_threads < seg_threads) {
+            seg_threads = (long)g_qw_ple_pool.n_threads;
         }
-        nthreads = ple_gather_threads_cached;
-        if (nthreads <= 1 || n_tokens < 64u) nthreads = 1;
 
-        if (nthreads == 1) {
-            ds4_ple_row_ids(&s->ple_constants, &s->ple_history, tokens,
-                            n_tokens, s->ple_ids);
-            for (uint32_t t = 0; t < n_tokens; t++) {
-                for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
-                    const uint64_t row =
-                        s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h];
-                    const uint8_t *quant = ds4_qwen4exp_ple_row(&w->ple, row);
-                    if (!quant) {
-                        fprintf(stderr,
-                                "ds4: qwen4exp block %u hashed token %u head %u "
-                                "to row %" PRIu64 ", past the %" PRIu64 " the "
-                                "table holds\n",
-                                il, t, h, row, w->ple.rows);
-                        return false;
-                    }
-                    ds4_ple_dequant_iq4_nl(
-                        quant, blocks_per_row,
-                        s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD +
-                            (uint64_t)h * DS4_N_PLE_ROW_DIM);
-                }
+        const uint32_t per = (n_tokens + (uint32_t)seg_threads - 1u) /
+                             (uint32_t)seg_threads;
+        uint32_t actual_threads = 0;
+        for (long i = 0; i < seg_threads; i++) {
+            const uint32_t t0 = (uint32_t)i * per;
+            if (t0 >= n_tokens) break;
+            actual_threads++;
+            uint32_t t1 = t0 + per;
+            if (t1 > n_tokens) t1 = n_tokens;
+            g_qw_ple_pool.segs[i].ple = &w->ple;
+            g_qw_ple_pool.segs[i].s = s;
+            g_qw_ple_pool.segs[i].tokens = tokens;
+            g_qw_ple_pool.segs[i].n_tokens = n_tokens;
+            g_qw_ple_pool.segs[i].t0 = t0;
+            g_qw_ple_pool.segs[i].t1 = t1;
+            g_qw_ple_pool.segs[i].blocks_per_row = blocks_per_row;
+            g_qw_ple_pool.segs[i].rows_only = 0;
+            g_qw_ple_pool.segs[i].ok = 0;
+        }
+
+        if (actual_threads > 1 && g_qw_ple_pool.initialized) {
+            pthread_mutex_lock(&g_qw_ple_pool.mutex);
+            g_qw_ple_pool.active_workers = actual_threads - 1u;
+            g_qw_ple_pool.completed_workers = 0;
+            g_qw_ple_pool.generation++;
+            pthread_cond_broadcast(&g_qw_ple_pool.work_cond);
+            pthread_mutex_unlock(&g_qw_ple_pool.mutex);
+
+            /* Master thread runs segment 0 concurrently with workers */
+            qw_ple_seg_run(&g_qw_ple_pool.segs[0]);
+
+            pthread_mutex_lock(&g_qw_ple_pool.mutex);
+            while (g_qw_ple_pool.completed_workers < g_qw_ple_pool.active_workers) {
+                pthread_cond_wait(&g_qw_ple_pool.done_cond, &g_qw_ple_pool.mutex);
             }
+            pthread_mutex_unlock(&g_qw_ple_pool.mutex);
         } else {
-            if ((uint32_t)nthreads > n_tokens) nthreads = (long)n_tokens;
-            if (nthreads > QW_PLE_MAX_THREADS) nthreads = QW_PLE_MAX_THREADS;
-
-            qw_ple_pool_init();
-            if (g_qw_ple_pool.initialized && (long)g_qw_ple_pool.n_threads < nthreads) {
-                nthreads = (long)g_qw_ple_pool.n_threads;
-            }
-
-            const uint32_t per = (n_tokens + (uint32_t)nthreads - 1u) /
-                                 (uint32_t)nthreads;
-            uint32_t actual_threads = 0;
-            for (long i = 0; i < nthreads; i++) {
-                const uint32_t t0 = (uint32_t)i * per;
-                if (t0 >= n_tokens) break;
-                actual_threads++;
-                uint32_t t1 = t0 + per;
-                if (t1 > n_tokens) t1 = n_tokens;
-                g_qw_ple_pool.segs[i].ple = &w->ple;
-                g_qw_ple_pool.segs[i].s = s;
-                g_qw_ple_pool.segs[i].tokens = tokens;
-                g_qw_ple_pool.segs[i].n_tokens = n_tokens;
-                g_qw_ple_pool.segs[i].t0 = t0;
-                g_qw_ple_pool.segs[i].t1 = t1;
-                g_qw_ple_pool.segs[i].blocks_per_row = blocks_per_row;
-                g_qw_ple_pool.segs[i].ok = 0;
-            }
-
-            if (actual_threads > 1 && g_qw_ple_pool.initialized) {
-                pthread_mutex_lock(&g_qw_ple_pool.mutex);
-                g_qw_ple_pool.active_workers = actual_threads - 1u;
-                g_qw_ple_pool.completed_workers = 0;
-                g_qw_ple_pool.generation++;
-                pthread_cond_broadcast(&g_qw_ple_pool.work_cond);
-                pthread_mutex_unlock(&g_qw_ple_pool.mutex);
-
-                /* Master thread runs segment 0 concurrently with workers */
-                qw_ple_gather_worker(&g_qw_ple_pool.segs[0]);
-
-                pthread_mutex_lock(&g_qw_ple_pool.mutex);
-                while (g_qw_ple_pool.completed_workers < g_qw_ple_pool.active_workers) {
-                    pthread_cond_wait(&g_qw_ple_pool.done_cond, &g_qw_ple_pool.mutex);
-                }
-                pthread_mutex_unlock(&g_qw_ple_pool.mutex);
-            } else {
-                for (uint32_t i = 0; i < actual_threads; i++) {
-                    qw_ple_gather_worker(&g_qw_ple_pool.segs[i]);
-                }
-            }
-
             for (uint32_t i = 0; i < actual_threads; i++) {
-                if (g_qw_ple_pool.segs[i].ok != 1) {
-                    fprintf(stderr,
-                            "ds4: qwen4exp block %u gather segment %u hashed "
-                            "past the %" PRIu64 " rows the table holds\n",
-                            il, i, w->ple.rows);
-                    return false;
-                }
+                qw_ple_seg_run(&g_qw_ple_pool.segs[i]);
             }
-            /* The carried history is the state after the LAST token; re-warm
-             * a fresh history over the final (ngram - 1) tokens and leave it
-             * in the session -- exactly what the sequential scan leaves. */
-            ds4_ple_history_reset(&s->ple_constants, &s->ple_history);
-            const uint32_t tail =
-                s->ple_constants.ngram_size - 1u;
-            if (tail > 0u && n_tokens > tail) {
-                uint64_t scratch[DS4_PLE_MAX_NGRAM * DS4_PLE_MAX_HEADS];
-                (void)ds4_ple_row_ids(&s->ple_constants, &s->ple_history,
-                                      tokens + (n_tokens - tail), tail,
-                                      scratch);
+        }
+
+        for (uint32_t i = 0; i < actual_threads; i++) {
+            if (g_qw_ple_pool.segs[i].ok != 1) {
+                fprintf(stderr,
+                        "ds4: qwen4exp block %u gather segment %u hashed "
+                        "past the %" PRIu64 " rows the table holds\n",
+                        il, i, w->ple.rows);
+                return false;
             }
+        }
+        /* The carried history is the state after the LAST token; re-warm
+         * a fresh history over the final (ngram - 1) tokens and leave it
+         * in the session -- exactly what the sequential scan leaves. */
+        ds4_ple_history_reset(&s->ple_constants, &s->ple_history);
+        const uint32_t tail =
+            s->ple_constants.ngram_size - 1u;
+        if (tail > 0u && n_tokens > tail) {
+            uint64_t scratch[DS4_PLE_MAX_NGRAM * DS4_PLE_MAX_HEADS];
+            (void)ds4_ple_row_ids(&s->ple_constants, &s->ple_history,
+                                  tokens + (n_tokens - tail), tail,
+                                  scratch);
         }
     }
+
     if (gather_t0 != 0.0) {
         fprintf(stderr,
                 "ds4: qwen4exp PLE gather %u rows took %.3f ms\n",
