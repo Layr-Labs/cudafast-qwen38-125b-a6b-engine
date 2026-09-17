@@ -3991,6 +3991,15 @@ int  ds4_gpu_qwen4exp_update_dpos(
         ds4_gpu_tensor *d_pos,
         uint32_t        pos);
 
+/* One launch for the up-to-three scalar position writes a forward preamble
+ * can owe (replay prefix, adoption flag, position).  A NULL tensor marks a
+ * slot the round does not owe; a non-NULL tensor with no storage fails the
+ * call the way ds4_gpu_qwen4exp_update_dpos would. */
+int  ds4_gpu_qwen4exp_update_dpos3(
+        ds4_gpu_tensor *d0, uint32_t v0,
+        ds4_gpu_tensor *d1, uint32_t v1,
+        ds4_gpu_tensor *d2, uint32_t v2);
+
 int  ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graphs_invalidate(void);

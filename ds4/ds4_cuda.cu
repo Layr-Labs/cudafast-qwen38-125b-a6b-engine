@@ -1126,6 +1126,39 @@ extern "C" int ds4_gpu_qwen4exp_update_dpos(
     return cuda_ok(cudaGetLastError(), "qwen4exp position update launch");
 }
 
+__global__ static void qwen4exp_update_dpos3_kernel(uint32_t *o0, uint32_t v0,
+                                                    uint32_t *o1, uint32_t v1,
+                                                    uint32_t *o2, uint32_t v2) {
+    if (o0) *o0 = v0;
+    if (o1) *o1 = v1;
+    if (o2) *o2 = v2;
+}
+
+/* The forward preamble can owe up to three of these scalar writes in one
+ * pass -- the replay prefix, the adoption flag and the position -- and each
+ * ds4_gpu_qwen4exp_update_dpos call is its own one-thread launch on the
+ * decode stream.  The writes are independent words, so one launch carrying
+ * all three is the same stream-ordered result with two fewer launches; a
+ * NULL pointer marks a slot this round does not owe. */
+extern "C" int ds4_gpu_qwen4exp_update_dpos3(
+        ds4_gpu_tensor *d0, uint32_t v0,
+        ds4_gpu_tensor *d1, uint32_t v1,
+        ds4_gpu_tensor *d2, uint32_t v2) {
+    uint32_t *p0 = (d0 && d0->ptr && d0->bytes >= sizeof(uint32_t))
+                   ? (uint32_t *)d0->ptr : NULL;
+    uint32_t *p1 = (d1 && d1->ptr && d1->bytes >= sizeof(uint32_t))
+                   ? (uint32_t *)d1->ptr : NULL;
+    uint32_t *p2 = (d2 && d2->ptr && d2->bytes >= sizeof(uint32_t))
+                   ? (uint32_t *)d2->ptr : NULL;
+    /* A slot the caller named but that has no storage fails the way the
+     * single-write form does; a NULL tensor is a slot this round skips. */
+    if ((d0 && !p0) || (d1 && !p1) || (d2 && !p2)) return 0;
+    if (!p0 && !p1 && !p2) return 1;
+    qwen4exp_update_dpos3_kernel<<<1, 1, 0, cuda_decode_stream()>>>(
+            p0, v0, p1, v1, p2, v2);
+    return cuda_ok(cudaGetLastError(), "qwen4exp position update3 launch");
+}
+
 static cuda_decode_graph_entry *cuda_decode_graph_find(
         const ds4_decode_graph_key *key) {
     if (key->il >= CUDA_DECODE_GRAPH_LAYERS ||

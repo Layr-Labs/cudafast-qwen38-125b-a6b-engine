@@ -1298,12 +1298,10 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
             if (t < s->spec_snapshot_rows) {
                 s->ple_history_rows[t] = s->ple_history;
             }
-        }
-        for (uint32_t t = 0; t < n_tokens; t++) {
-            /* The head's destination strides are constants of the shape, so
-             * the token base is hoisted out of the head loop and the head
-             * offset is carried as a pointer step instead of a multiply per
-             * head.  Same addresses, same values. */
+            /* The row ids for this token are still in registers and L1 when
+             * the dequant reads them, so the gather walks the token once
+             * instead of twice: same ids, same rows, same history snapshots
+             * as the two-pass form. */
             const uint64_t *ids = s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD;
             float *dst = s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD;
             for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
@@ -2982,22 +2980,34 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     }
     if (replay_step.active) {
         s->gdn_replay_prefix = replay_step.prefix;
-        if (!ds4_gpu_qwen4exp_update_dpos(s->d_gdn_replay, replay_step.prefix)) {
+    }
+    /* The three scalar writes the preamble can owe -- the replay prefix, the
+     * adoption flag and the position -- are independent words on the decode
+     * stream, so one launch carries whichever of them this round owes instead
+     * of a one-thread launch apiece.  The failure contract is the three
+     * separate calls': a refused launch means none of the writes ran, so an
+     * owed adoption flag is marked unknown again. */
+    {
+        const bool owe_replay = replay_step.active;
+        if (owe_replay && !s->d_gdn_replay) {
             fprintf(stderr, "ds4: qwen4exp GDN replay prefix update failed\n");
             return false;
         }
-    }
-    if (s->d_adopt && s->adopt_device != s->adopt_state) {
-        if (!ds4_gpu_qwen4exp_update_dpos(s->d_adopt, s->adopt_state)) {
-            s->adopt_device = UINT32_MAX;
-            fprintf(stderr, "ds4: qwen4exp GDN rollback flag update failed\n");
-            return false;
+        const bool owe_adopt =
+            s->d_adopt && s->adopt_device != s->adopt_state;
+        const bool owe_pos = s->d_pos != NULL;
+        if (owe_replay || owe_adopt || owe_pos) {
+            if (!ds4_gpu_qwen4exp_update_dpos3(
+                    owe_replay ? s->d_gdn_replay : NULL, replay_step.prefix,
+                    owe_adopt ? s->d_adopt : NULL, s->adopt_state,
+                    owe_pos ? s->d_pos : NULL, s->pos)) {
+                if (owe_adopt) s->adopt_device = UINT32_MAX;
+                fprintf(stderr,
+                        "ds4: qwen4exp preamble position update failed\n");
+                return false;
+            }
+            if (owe_adopt) s->adopt_device = s->adopt_state;
         }
-        s->adopt_device = s->adopt_state;
-    }
-    if (s->d_pos && !ds4_gpu_qwen4exp_update_dpos(s->d_pos, s->pos)) {
-        fprintf(stderr, "ds4: qwen4exp position update failed\n");
-        return false;
     }
     if (!ds4_gpu_begin_commands()) {
         fprintf(stderr, "ds4: qwen4exp could not open a command batch\n");
