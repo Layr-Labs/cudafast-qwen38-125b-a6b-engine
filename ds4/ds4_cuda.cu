@@ -3495,8 +3495,16 @@ extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, con
     int d = ds4_tensor_device_idx(tensor);
     int ok = 0;
     WITH_DEVICE(g_gpu[d].device_id) {
-        ok = cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, data, (size_t)bytes,
-                                cudaMemcpyHostToDevice),
+        /* Stream-ordered upload: the decode stream is the legacy NULL stream
+         * in eager mode, which orders against every blocking stream exactly
+         * like the synchronous copy did, and the capture stream while a
+         * decode-graph capture is open.  Pageable sources are staged by the
+         * driver before this call returns, so callers may free or rewrite
+         * the source immediately; the host just no longer drains the device
+         * at every upload. */
+        ok = cuda_ok(cudaMemcpyAsync((char *)tensor->ptr + offset, data, (size_t)bytes,
+                                     cudaMemcpyHostToDevice,
+                                     cuda_decode_stream()),
                      "tensor write");
     }
     return ok;
@@ -3528,20 +3536,20 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
     int d = ds4_tensor_device_idx(dst);
     int ok = 0;
     WITH_DEVICE(g_gpu[d].device_id) {
-        if (g_decode_graph_capturing) {
-            ok = cuda_ok(cudaMemcpyAsync((char *)dst->ptr + dst_offset,
-                                         (const char *)src->ptr + src_offset,
-                                         (size_t)bytes,
-                                         cudaMemcpyDeviceToDevice,
-                                         cuda_decode_stream()),
-                         "tensor copy");
-        } else {
-            ok = cuda_ok(cudaMemcpy((char *)dst->ptr + dst_offset,
-                                    (const char *)src->ptr + src_offset,
-                                    (size_t)bytes,
-                                    cudaMemcpyDeviceToDevice),
-                         "tensor copy");
-        }
+        /* One stream-ordered path for both modes: eager mode rides the
+         * legacy NULL stream (same implicit ordering against the blocking
+         * per-device streams the synchronous copy relied on), and a capture
+         * rides the capture stream.  The synchronous cudaMemcpy forced the
+         * host to wait for the whole device at every mid-forward copy --
+         * the per-step last-row copy ahead of the LM head, the MTP draft
+         * staging copies, the GDN replay snapshots -- which idled the GPU
+         * between the copy and the next launch. */
+        ok = cuda_ok(cudaMemcpyAsync((char *)dst->ptr + dst_offset,
+                                     (const char *)src->ptr + src_offset,
+                                     (size_t)bytes,
+                                     cudaMemcpyDeviceToDevice,
+                                     cuda_decode_stream()),
+                     "tensor copy");
     }
     return ok;
 }
