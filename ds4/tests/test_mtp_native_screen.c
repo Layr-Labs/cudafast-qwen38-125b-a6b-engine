@@ -30,8 +30,7 @@ static int compare_key_paths(ds4_gpu_tensor *out,ds4_gpu_tensor *ids,
     uint64_t scores_at=aligned(DIM+80u*4u);
     uint64_t ki=aligned(scores_at+(uint64_t)WIDTH*4u);
     uint64_t ko=aligned(ki+(uint64_t)WIDTH*8u);
-    uint64_t it=aligned(ko+(uint64_t)WIDTH*8u);
-    uint64_t flag_at=aligned(it+(uint64_t)CAP*4u);
+    uint64_t flag_at=aligned(ko+(uint64_t)WIDTH*8u);
     uint64_t *keys[2]={malloc(WIDTH*8u),malloc(WIDTH*8u)};
     uint32_t *selected_ids[2]={malloc(CAP*4u),malloc(CAP*4u)};
     float *values[2]={malloc(CAP*4u),malloc(CAP*4u)};

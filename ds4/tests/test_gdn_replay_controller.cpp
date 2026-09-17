@@ -28,6 +28,7 @@ struct ds4_qwen4exp_session {
     bool gdn_replay_enabled=true,gdn_replay_active=false,gdn_replay_previous=false;
     bool state_dirty=false;
     uint32_t gdn_replay_prefix=0,gdn_replay_phase=0;
+    uint32_t gdn_replay_device=0;
     uint32_t adopt_state=0,adopt_conv=0,adopt_device=0,spec_snapshot_rows=0;
     uint32_t head_cache_pos=0,pos=0;
     int ple_constants=0,ple_history=0;
@@ -43,6 +44,7 @@ static uint64_t transition(uint64_t state,uint64_t token) {
 }
 static uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *t) { return t?t->v.size()*8:0; }
 static bool batch=false, fail_update=false;
+static std::map<ds4_gpu_tensor*,unsigned> updates;
 static int ds4_gpu_begin_commands() { need(!batch,"nested command batch");batch=true;return 1; }
 static int ds4_gpu_end_commands() { need(batch,"missing command batch");batch=false;return 1; }
 static int ds4_gpu_synchronize() { return 1; }
@@ -51,6 +53,7 @@ static int ds4_gpu_tensor_copy(ds4_gpu_tensor *d,uint64_t off,const ds4_gpu_tens
     std::memcpy((char*)d->v.data()+off,(const char*)s->v.data()+from,n);return 1;
 }
 static int ds4_gpu_qwen4exp_update_dpos(ds4_gpu_tensor *d,uint32_t v) {
+    ++updates[d];
     if(fail_update) {fail_update=false;return 0;}
     need(d!=nullptr,"missing device control"); d->v[0]=v;return 1;
 }
@@ -78,6 +81,7 @@ struct fixture {
         s.gdn_replay_enabled=enabled&&lazy;
         if(lazy) s.d_adopt=alloc(1);
         if(enabled&&lazy) s.d_gdn_replay=alloc(1);
+        updates[s.d_gdn_replay]=0;
         for(unsigned il:{0u,2u}) {
             s.gdn_state[il]=alloc(1);s.gdn_checkpoint[il]=alloc(1);
             s.gdn_conv[il]=alloc(1);s.gdn_replay_tape[il]=alloc(2);
@@ -155,6 +159,18 @@ struct fixture {
 static uint32_t rng=1;
 static uint32_t random_word() {rng=rng*1664525u+1013904223u;return rng;}
 int main() {
+    {
+        fixture f;
+        f.forward(2,1);f.forward(2,1);
+        need(updates[f.s.d_gdn_replay]==0,"redundant initial prefix uploads");
+        f.select(0);f.forward(2,1);
+        need(updates[f.s.d_gdn_replay]==1,"changed prefix was not uploaded once");
+        f.reset();f.forward(2,1,true);
+        need(updates[f.s.d_gdn_replay]==2,"reset reused stale device prefix");
+        f.forward(2,1);
+        need(updates[f.s.d_gdn_replay]==2,"unchanged prefix was uploaded again");
+        cases++;
+    }
     for(unsigned mask=0;mask<4096;mask++) for(unsigned style=0;style<3;style++) {
         fixture f;
         f.forward(1,0);
@@ -190,8 +206,9 @@ int main() {
         fixture f;f.forward(2,1);f.select(0);
         f.s.spec_snapshot_rows=1;f.s.state_dirty=true;fail_update=true;
         need(!prepare(&f.s,2),"injected prefix failure ignored");
+        need(f.s.gdn_replay_device==UINT32_MAX,"failed prefix update stayed valid");
         f.reset();f.forward(2,1,true);
-        f.forward(2,1); // full acceptance forces swap
+        f.select(0);f.forward(2,1); // upload a nonzero prefix before the swap
         fail_update=true;
         need(!prepare(&f.s,2),"post-swap update failure ignored");
         f.reset();f.forward(2,1,true);cases++;
