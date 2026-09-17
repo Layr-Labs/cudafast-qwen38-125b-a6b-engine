@@ -577,6 +577,14 @@ static int mtp_commit_one(ds4_qwen4exp_mtp_state *st,
  * than better. The gap in the comment is real; exploiting it is not
  * obviously a win.
  */
+/* This build's note auto09172312_3 records that a kernel launched with the
+ * programmatic stream serialization attribute parks at its fence, and the
+ * profiler counts that parked time as the kernel's duration, so any
+ * opportunity sized from durations double counts work that is already
+ * overlapped. Size a gap as the consumer's start minus the predecessor's
+ * end; a negative value means the work is already hidden and there is
+ * nothing to win.
+ */
 int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
                            const ds4_qwen4exp_mtp_model *model,
                            int first_token,
