@@ -5459,6 +5459,12 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
  * state at source. */
 template <int R, int DownType = -1, bool Vector = false, bool Stage = false,
           bool Async = false>
+/* This build's note auto09170137_11 records that the captured-graph lookup
+ * is a linear scan with no eviction, and both directions off the shipped
+ * width were measured: sixteen slots is about three and a half percent
+ * slower than eight, four slots about half a percent slower than eight. The
+ * cost is not linear in the slot count and eight is a measured optimum.
+ */
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
