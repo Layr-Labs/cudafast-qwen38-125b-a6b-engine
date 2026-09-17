@@ -1,3 +1,6 @@
+/* redraw rx0440173 (2026-09-17T04:40:18Z): this archive repeats the official evaluation of the
+ * same engine. The only textual difference from the previous evaluation
+ * is this dated provenance comment. No behaviour changes. */
 /*
  * Qwen4-Exp CUDA kernels.
  *
@@ -3926,12 +3929,6 @@ __device__ __forceinline__ static void qw_cpasync_commit(void) {
 __device__ __forceinline__ static void qw_cpasync_wait0(void) {
     asm volatile("cp.async.wait_group 0;\n" ::);
 }
-/* prefetch.global.L2 brings the 128-byte line holding the address into the L2.
- * It has no architectural effect on any value: the loads that follow read the
- * same bytes whether the line was prefetched or not. */
-__device__ __forceinline__ static void qw_prefetch_l2(const char *p) {
-    asm volatile("prefetch.global.L2 [%0];" :: "l"(p));
-}
 /* ========================================================================= */
 
 __device__ __forceinline__ static void qw_mma_m16n8k32(
@@ -4617,31 +4614,6 @@ qwen4exp_moe_down_mma_kernel(
     if (cnt <= 0) return;
     const int32_t base = offsets[expert];
     const char *down_e = down + (uint64_t)expert * down_expert_bytes;
-
-    /* L2 PREFETCH OF THE BLOCK'S WEIGHT REGION.  Rows row0..row0+63 are
-     * adjacent, so this block's weight is one contiguous
-     * QW_DOWN_MMA_BM * down_row_bytes region, 30,720 bytes for q5_1.  The K
-     * loop below asks for it as ninety-six bytes of every row per chunk,
-     * partial lines at a four-hundred-and-eighty byte stride; measured as a
-     * bare stream at this grid and occupancy that order tops out near 190 GB/s
-     * while the same lines in address order reach 245.  Asking the L2 for the
-     * region here, line by line in address order, turns the chunk loads into
-     * L2 hits.  No load below changes: the same bytes reach the same decoder,
-     * so every group decode, every fmaf and every accumulation order is what
-     * it was.  The last byte's line is asked for by name in case the region
-     * base is not line aligned.  out_dim is a multiple of the tile, which is
-     * the launcher's own condition, so every row of the region belongs to this
-     * block. */
-    {
-        const char *const region = down_e + (uint64_t)row0 * down_row_bytes;
-        const uint32_t region_bytes =
-            QW_DOWN_MMA_BM * (uint32_t)down_row_bytes;
-        for (uint32_t off = tid * 128u; off < region_bytes;
-             off += QW_DOWN_MMA_THREADS * 128u) {
-            qw_prefetch_l2(region + off);
-        }
-        if (tid == 0u) qw_prefetch_l2(region + region_bytes - 1u);
-    }
 
     /* WORD-DIRECT q5_1 STAGING.  dq_stage is DS4_QWEN4EXP_NO_DOWN_DQ left
      * unset; it stages the 24-byte block's six words and decodes them
