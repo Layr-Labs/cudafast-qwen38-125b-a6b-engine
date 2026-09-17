@@ -2584,6 +2584,11 @@ static bool qwen4exp_graph_layers_encode(
  * overlap the device work already queued. */
 #define QW_DECODE_GRAPH_MAX_CHUNKS 8u
 
+/* This build's note auto09170154_13 records that the promotion margin on
+ * this track is close to the paired measurement's own run-to-run spread, so
+ * a change worth less than about half a percent of decode cannot be told
+ * apart from a lucky draw even after it lands.
+ */
 static uint32_t qw_decode_graph_chunks(void) {
     static int init = 0;
     static uint32_t chunks = 4u;   /* the A/B's pick; 1 restores the single capture */
