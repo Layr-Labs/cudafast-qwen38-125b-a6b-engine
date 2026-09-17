@@ -666,6 +666,34 @@ void ds4_ple_row_ids(const ds4_ple_constants *__restrict c, ds4_ple_history *h,
     const size_t head_count = c->head_count;
     uint64_t *row = out;
 
+    /* The production shape: two n-gram orders of eight heads each.  With the
+     * trip counts known at compile time the sixteen row divides are
+     * independent straight-line code the scheduler can pipeline, instead of
+     * a runtime-bound inner loop that serialises them behind its
+     * bookkeeping.  Same reads, same order, same values; any other shape
+     * falls through to the generic scan below. */
+    if (ngram == 3u && hpn == 8u && head_count == 16u) {
+        for (size_t t = 0; t < count; t++) {
+            const int32_t cur = tokens[t];
+
+            const uint64_t bi =
+                (uint64_t)(uint32_t)cur * mult[0] ^
+                (uint64_t)(uint32_t)h->previous[1] * mult[1];
+            const uint64_t tri =
+                bi ^ (uint64_t)(uint32_t)h->previous[2] * mult[2];
+
+            for (uint32_t k = 0; k < 8u; k++)
+                row[k]     = bi  % voc[k]     + off[k];
+            for (uint32_t k = 0; k < 8u; k++)
+                row[8u + k] = tri % voc[8u + k] + off[8u + k];
+
+            h->previous[2] = (cur == eos) ? eos : h->previous[1];
+            h->previous[1] = cur;
+            row += 16u;
+        }
+        return;
+    }
+
     for (size_t t = 0; t < count; t++) {
         const int32_t cur = tokens[t];
 
