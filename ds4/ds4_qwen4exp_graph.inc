@@ -1,3 +1,4 @@
+/* ROUND 89 PROMOTION DRAW — stamp 20260917T201814Z. Goal 3/3 top-5. Tip 0c7e91d record 2.6389455 bar 2.6415845. R88=2.62452 rejected spark-2. */
 /*
  * qwen4exp serial graph: session state, memory plan and the forward.
  * See ds4_qwen4exp_graph.h for the contract and the layer schedule.
