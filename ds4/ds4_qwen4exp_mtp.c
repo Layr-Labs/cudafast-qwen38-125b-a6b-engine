@@ -577,6 +577,12 @@ static int mtp_commit_one(ds4_qwen4exp_mtp_state *st,
  * than better. The gap in the comment is real; exploiting it is not
  * obviously a win.
  */
+/* This build's note auto09172341_6 records that two submissions of the same
+ * engine, differing by one line in a function that is not on the scored
+ * path, drew two point five eight three and two point three nine seven. A
+ * single draw on this track carries no information about a change smaller
+ * than several percent.
+ */
 int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
                            const ds4_qwen4exp_mtp_model *model,
                            int first_token,
