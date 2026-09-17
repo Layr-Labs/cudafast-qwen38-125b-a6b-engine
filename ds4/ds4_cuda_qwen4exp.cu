@@ -3826,19 +3826,40 @@ __global__ static void qwen4exp_router_select_topk_kernel(
     }
 
     if (Native) {
-        float m = -FLT_MAX;
-        if (lane == 0u) {
-            for (uint32_t i = 0; i < n_expert_used; i++) {
-                const float v = lg[(uint32_t)sel[i]];
-                if (v > m) m = v;
-            }
-        }
-        m = __shfl_sync(0xffffffffu, m, 0u);
         /* Selected ids were stored by lane zero above. Publish them before
          * other lanes read; no block-wide barrier is needed in one warp. */
         __syncwarp();
-        const float e = lane < n_expert_used
-                ? expf(lg[(uint32_t)sel[lane]] - m) : 0.0f;
+        /* One load per lane, all ten in parallel, and the max is taken over
+         * those same registers.  The serial form this replaces had lane zero
+         * walk sel[0..n_expert_used) and lg[sel[i]] one dependent load at a
+         * time purely to find `m`, then every lane reloaded the identical
+         * value a few lines later -- twenty dependent global loads with
+         * thirty-one lanes idle, on the serial critical path of all
+         * forty-eight layers (this kernel launches <<<n_tokens, 32>>>, so at
+         * decode it is one warp on one SM and nothing else is in flight).
+         *
+         * Bit-exact by construction rather than by tolerance: `m` feeds only
+         * the subtraction below, max over a fixed multiset of finite floats
+         * is order-independent, and equal floats are bit-identical, so the
+         * butterfly yields the very value the serial `if (v > m)` walk did.
+         * The -FLT_MAX padding cannot win -- every selected logit is a finite
+         * router output -- and it is what the serial walk seeded `m` with.
+         * Signed zero is not observable here either: expf(0 - (+/-0)) and
+         * expf(-0 - (+/-0)) are all exactly 1.0f.
+         *
+         * The visibility rule is unchanged, not weakened: the parallel read of
+         * sel[lane] is the one the shipped code already performed after this
+         * same __syncwarp(), only now the max reads those registers instead of
+         * re-walking memory ahead of it. */
+        const float mine = lane < n_expert_used
+                ? lg[(uint32_t)sel[lane]] : -FLT_MAX;
+        float m = mine;
+#pragma unroll
+        for (uint32_t off = 16u; off > 0u; off >>= 1u) {
+            const float other = __shfl_xor_sync(0xffffffffu, m, off);
+            if (other > m) m = other;
+        }
+        const float e = lane < n_expert_used ? expf(mine - m) : 0.0f;
         float sum = 0.0f;
         for (uint32_t i = 0; i < n_expert_used; i++) {
             const float term = __shfl_sync(0xffffffffu, e, i);
@@ -4381,19 +4402,50 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
     }
 
     if (Native) {
-        float m = -FLT_MAX;
-        if (lane == 0u) {
-            for (uint32_t i = 0; i < n_expert_used; i++) {
-                const float v = lg[(uint32_t)sel[i]];
-                if (v > m) m = v;
-            }
-        }
-        m = __shfl_sync(0xffffffffu, m, 0u);
-        /* Selected ids were stored by lane zero above. Publish them before
-         * other lanes read; no block-wide barrier is needed in one warp. */
+        /* The max over the selected logits, one load per lane instead of a
+         * serial walk by lane zero.
+         *
+         * The form this replaces had lane zero read sel[i] and then the
+         * dependent lg[sel[i]] for each of n_expert_used ranks -- twenty
+         * dependent global loads with thirty-one lanes idle -- to produce a
+         * value it then broadcast.  Five lines below, every lane loads
+         * lg[sel[lane]] anyway for its own expf.  So the serial walk bought
+         * nothing the parallel load does not already have, and it cost the
+         * whole block: this is the fused kernel, so every one of its 512
+         * threads waits at the __syncthreads below for warp zero to finish
+         * that chain before the grouping half may read `selected`.
+         *
+         * Bit-exact by construction, not by tolerance.  `m` feeds only the
+         * subtraction below; the max over a fixed multiset of finite floats
+         * does not depend on the order it is taken in, and equal floats here
+         * are bit-identical.  Lanes at or above n_expert_used carry -FLT_MAX,
+         * which cannot win and is exactly what the serial walk seeded `m`
+         * with.  Every lane of a participating warp reaches the butterfly:
+         * warps at or above n_tokens skip this half by branching, never by
+         * returning, so a warp that is here is here in full and the
+         * full-mask intrinsic is valid -- the same invariant the surrounding
+         * top-k already depends on.
+         *
+         * One subtlety the host parity gate surfaced rather than assumed: the
+         * butterfly is uniform in VALUE but need not be uniform in BIT
+         * PATTERN, because max(+0,-0) keeps whichever operand the `>` test
+         * left.  That is unobservable here -- expf(±0 - ±0) is exactly 1.0f
+         * for all four sign combinations -- and the gate exercised the case
+         * rather than arguing it.
+         *
+         * The __syncwarp is kept where it was and means what it did: lane
+         * zero stored the selected ids above and every lane reads them here.
+         * The visibility rule is unchanged, not weakened. */
         __syncwarp();
-        const float e = lane < n_expert_used
-                ? expf(lg[(uint32_t)sel[lane]] - m) : 0.0f;
+        const float mine = lane < n_expert_used
+                ? lg[(uint32_t)sel[lane]] : -FLT_MAX;
+        float m = mine;
+#pragma unroll
+        for (uint32_t off = 16u; off > 0u; off >>= 1u) {
+            const float other = __shfl_xor_sync(0xffffffffu, m, off);
+            if (other > m) m = other;
+        }
+        const float e = lane < n_expert_used ? expf(mine - m) : 0.0f;
         float sum = 0.0f;
         for (uint32_t i = 0; i < n_expert_used; i++) {
             const float term = __shfl_sync(0xffffffffu, e, i);
