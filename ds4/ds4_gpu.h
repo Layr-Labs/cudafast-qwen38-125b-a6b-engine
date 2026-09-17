@@ -53,6 +53,19 @@ void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
+/* Pinned host memory: the only host allocation a device copy can DMA
+ * directly.  Pageable copies stage through a driver bounce buffer; pinned
+ * ones do not, and only pinned destinations make an async copy overlap. */
+void *ds4_gpu_host_alloc(uint64_t bytes);
+void ds4_gpu_host_free(void *p);
+/* Stream-ordered copies on the decode stream: they join the work already
+ * submitted and are covered by the caller's synchronize.  Both refuse while
+ * a decode graph is capturing -- a recorded copy would bake the host
+ * pointer into the graph. */
+int ds4_gpu_tensor_write_async(ds4_gpu_tensor *tensor, uint64_t offset,
+                               const void *data, uint64_t bytes);
+int ds4_gpu_tensor_read_async(const ds4_gpu_tensor *tensor, uint64_t offset,
+                              void *data, uint64_t bytes);
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
@@ -108,6 +121,11 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
                                              const char *label);
 #endif
 int ds4_gpu_end_commands(void);
+/* Commit the open batch and wait for the device in one call.  On CUDA the
+ * pair `end_commands(); synchronize();` runs cudaDeviceSynchronize twice;
+ * this is the same wait once.  Semantics are the pair's: the device is
+ * quiescent when it returns nonzero. */
+int ds4_gpu_end_commands_sync(void);
 int ds4_gpu_synchronize(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);

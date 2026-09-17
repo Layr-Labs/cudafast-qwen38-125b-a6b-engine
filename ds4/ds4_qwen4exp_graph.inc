@@ -428,6 +428,31 @@ struct ds4_qwen4exp_session {
     ds4_gpu_tensor *logits;
     ds4_gpu_tensor *spec_top1;
 
+    /* Pinned stage for the verify round's readbacks.  When an entry point
+     * arms `verify_stage_want`, the forward enqueues the hyper rows and the
+     * top-1 ids as async copies into these buffers INSIDE the command batch,
+     * so the DMA overlaps the final mixer and the LM head and the batch's
+     * own synchronize covers it.  `verify_stage_pos`/`_rows` record which
+     * positions the stage holds so the seam's draft can upload straight from
+     * it -- the rows never land in a pageable buffer at all. */
+    float    *verify_stage;
+    int      *verify_stage_top1;
+    uint32_t  verify_stage_pos;
+    uint32_t  verify_stage_rows;
+    bool      verify_stage_top1_ok;
+    bool      verify_stage_want;
+    /* Pinned staging for the per-forward uploads: the token row and the
+     * dequantized n-gram rows go out as DMA instead of a staged pageable
+     * copy. */
+    int32_t  *token_stage;
+    /* What `hyper` currently holds: rows [hyper_pos, hyper_pos+hyper_rows)
+     * of the stream, stamped by the verify entry points after a successful
+     * forward and cleared at the top of every forward so a stale stamp can
+     * never outlive the buffer it describes. */
+    uint32_t  hyper_pos;
+    uint32_t  hyper_rows;
+    bool      ple_rows_host_pinned;
+
     /* PREFILL ONLY.  True while `hyper` still owes the last block's inject:
      * the value the model means is hyper + block_out * inject, and the next
      * mixer applies it on its first read of the residual instead of a
@@ -768,6 +793,25 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
             ok = s->ple_ids != NULL && s->ple_rows_host != NULL;
         }
         if (ok) {
+            /* Pinned so the verify readback and the row uploads are real
+             * DMA.  A failed pin falls back to pageable: the paths that
+             * consume these check for NULL and take the old route. */
+            s->verify_stage = (float *)ds4_gpu_host_alloc(
+                (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * DS4_N_HC *
+                DS4_N_EMBD * sizeof(float));
+            s->verify_stage_top1 = (int *)ds4_gpu_host_alloc(
+                (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * sizeof(int32_t));
+            s->token_stage = (int32_t *)ds4_gpu_host_alloc(
+                (uint64_t)B * sizeof(int32_t));
+            float *pinned_rows = (float *)ds4_gpu_host_alloc(
+                (uint64_t)B * DS4_N_PLE_EMBD * sizeof(float));
+            if (pinned_rows) {
+                free(s->ple_rows_host);
+                s->ple_rows_host = pinned_rows;
+                s->ple_rows_host_pinned = true;
+            }
+        }
+        if (ok) {
             s->ple_ready = qwen4exp_ple_read_constants(m, w, &s->ple_constants);
             ds4_ple_history_reset(&s->ple_constants, &s->ple_history);
         }
@@ -888,7 +932,11 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->ple_aux);
     ds4_gpu_tensor_free(s->ple_value);
     free(s->ple_ids);
-    free(s->ple_rows_host);
+    if (s->ple_rows_host_pinned) ds4_gpu_host_free(s->ple_rows_host);
+    else                        free(s->ple_rows_host);
+    ds4_gpu_host_free(s->verify_stage);
+    ds4_gpu_host_free(s->verify_stage_top1);
+    ds4_gpu_host_free(s->token_stage);
     ds4_gpu_tensor_free(s->d_pos);
     ds4_gpu_tensor_free(s->d_adopt);
     ds4_gpu_tensor_free(s->d_gdn_replay);
@@ -1459,8 +1507,14 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 "ds4: qwen4exp PLE gather %u rows took %.3f ms\n",
                 n_tokens, (now_sec() - gather_t0) * 1000.0);
     }
-    if (!ds4_gpu_tensor_write(s->ple_rows, 0, s->ple_rows_host,
-                              (uint64_t)n_tokens * DS4_N_PLE_EMBD * sizeof(float))) {
+    /* Pinned source: the upload is a real DMA that joins the stream ahead
+     * of the batch instead of a staged pageable copy that blocks the host. */
+    const bool ple_up = s->ple_rows_host_pinned
+        ? ds4_gpu_tensor_write_async(s->ple_rows, 0, s->ple_rows_host,
+                (uint64_t)n_tokens * DS4_N_PLE_EMBD * sizeof(float)) != 0
+        : ds4_gpu_tensor_write(s->ple_rows, 0, s->ple_rows_host,
+                (uint64_t)n_tokens * DS4_N_PLE_EMBD * sizeof(float)) != 0;
+    if (!ple_up) {
         fprintf(stderr, "ds4: qwen4exp n-gram row upload failed at block %u\n", il);
         return false;
     }
@@ -2881,6 +2935,10 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     g_qwen4exp_trace_overflow = false;
 #endif
 
+    /* This forward overwrites `hyper`; any stamp from an earlier verify is
+     * stale from here on. */
+    s->hyper_rows = 0u;
+
     /* REFUSE AN ID THE EMBEDDING TABLE DOES NOT HOLD, here, where the ids are
      * still on the host and the check is free.
      *
@@ -2898,7 +2956,20 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         return false;
     }
 
-    if (!ds4_gpu_tensor_write(s->tokens, 0, tokens,
+
+    /* The token row goes out as DMA from the pinned stage when one exists;
+     * the copy joins the stream ahead of the batch and the batch's own
+     * synchronize covers it.  Pageable fallback keeps the old blocking
+     * write. */
+    if (s->token_stage) {
+        memcpy(s->token_stage, tokens,
+               (size_t)n_tokens * sizeof(int32_t));
+        if (!ds4_gpu_tensor_write_async(s->tokens, 0, s->token_stage,
+                                        (uint64_t)n_tokens * sizeof(int32_t))) {
+            fprintf(stderr, "ds4: qwen4exp token upload failed\n");
+            return false;
+        }
+    } else if (!ds4_gpu_tensor_write(s->tokens, 0, tokens,
                               (uint64_t)n_tokens * sizeof(int32_t))) {
         fprintf(stderr, "ds4: qwen4exp token upload failed\n");
         return false;
@@ -3073,10 +3144,29 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         fprintf(stderr, "ds4: qwen4exp compact verify top-1 failed\n");
         return qwen4exp_forward_fail();
     }
+    /* The top-1 ids ride the same batch into the pinned stage. */
+    if (s->verify_stage_want && s->verify_stage_top1 &&
+        s->spec_top1_rows != 0u &&
+        ds4_gpu_tensor_read_async(s->spec_top1, 0, s->verify_stage_top1,
+                                  (uint64_t)logit_rows * sizeof(int32_t))) {
+        s->verify_stage_top1_ok = true;
+    }
     QW_TRACE(QW_SLICE_HEAD);
     QW_TRACE_REPORT(n_tokens);
+    /* The hyper rows ride the same batch into the pinned stage: enqueued
+     * after the head so the copy never delays the mixer, and the batch's
+     * synchronize covers it.  A failed enqueue leaves the stage unstamped
+     * and the entry point reads the old blocking way. */
+    if (s->verify_stage_want && s->verify_stage &&
+        n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
+        ds4_gpu_tensor_read_async(s->hyper, 0, s->verify_stage,
+                                  (uint64_t)n_tokens * DS4_N_HC *
+                                  DS4_N_EMBD * sizeof(float))) {
+        s->verify_stage_pos = s->pos;
+        s->verify_stage_rows = n_tokens;
+    }
     /* Commit and wait: the logits are read on the host from here on. */
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
+    if (!ds4_gpu_end_commands_sync()) {
         fprintf(stderr, "ds4: qwen4exp command batch did not complete\n");
         return false;
     }
@@ -3129,7 +3219,7 @@ static bool qwen4exp_session_copy_layers(ds4_qwen4exp_session *s,
                                      (uint64_t)row * bytes, bytes) != 0;
         }
     }
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) return false;
+    if (!ds4_gpu_end_commands_sync()) return false;
     if (ok && recurrent) s->gdn_replay_previous = false;
     return ok;
 }
@@ -3602,16 +3692,34 @@ bool ds4_qwen4exp_graph_verify_rows(ds4_qwen4exp_session       *s,
         (n_tokens > 1u && n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT)
             ? n_tokens - 1u : 0u;
     s->spec_logit_rows = logit_rows > 1u ? logit_rows : 0u;
+    /* Arm the pinned stage: the forward enqueues the hyper rows inside the
+     * batch, so the DMA overlaps the LM head.  The stage is stamped only on
+     * a successful enqueue; a miss below reads the old blocking way. */
+    s->verify_stage_want = true;
+    s->verify_stage_rows = 0u;
     const bool forward_ok =
         ds4_qwen4exp_graph_forward(s, w, m, tokens, n_tokens, logits);
     s->spec_snapshot_rows = 0u;
     s->spec_logit_rows = 0u;
+    s->verify_stage_want = false;
     if (!forward_ok) return false;
-    if (hc_rows && !ds4_qwen4exp_session_read_hyper(s, 0, n_tokens, hc_rows)) {
-        fprintf(stderr,
-                "ds4: qwen4exp could not read %u pre-final-mixer rows back "
-                "(session batch %u)\n", n_tokens, s->plan.n_batch);
-        return false;
+    /* Stamp what `hyper` holds so the seam's draft can read it back through
+     * the stage or straight from the buffer. */
+    s->hyper_pos = s->pos - n_tokens;
+    s->hyper_rows = n_tokens;
+    if (hc_rows) {
+        const uint64_t row_bytes =
+            (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+        if (s->verify_stage_rows >= n_tokens &&
+            s->verify_stage_pos + n_tokens == s->pos) {
+            memcpy(hc_rows, s->verify_stage,
+                   (size_t)n_tokens * (size_t)row_bytes);
+        } else if (!ds4_qwen4exp_session_read_hyper(s, 0, n_tokens, hc_rows)) {
+            fprintf(stderr,
+                    "ds4: qwen4exp could not read %u pre-final-mixer rows back "
+                    "(session batch %u)\n", n_tokens, s->plan.n_batch);
+            return false;
+        }
     }
     return true;
 }
@@ -3630,15 +3738,37 @@ bool ds4_qwen4exp_graph_verify_top1_rows(ds4_qwen4exp_session       *s,
     s->spec_snapshot_rows = n_tokens > 1u ? n_tokens - 1u : 0u;
     s->spec_logit_rows = n_tokens > 1u ? n_tokens : 0u;
     s->spec_top1_rows = n_tokens;
+    /* Arm the pinned stage: the hyper rows and the top-1 ids go out inside
+     * the batch the forward closes, so this round pays no blocking read at
+     * all when the enqueues land. */
+    s->verify_stage_want = true;
+    s->verify_stage_rows = 0u;
+    s->verify_stage_top1_ok = false;
     const bool forward_ok =
         ds4_qwen4exp_graph_forward(s, w, m, tokens, n_tokens, NULL);
     s->spec_snapshot_rows = 0u;
     s->spec_logit_rows = 0u;
     s->spec_top1_rows = 0u;
+    s->verify_stage_want = false;
     if (!forward_ok) return false;
-    if (hc_rows && !ds4_qwen4exp_session_read_hyper(s, 0, n_tokens, hc_rows)) {
-        fprintf(stderr, "ds4: qwen4exp compact verify hyper read failed\n");
-        return false;
+    s->hyper_pos = s->pos - n_tokens;
+    s->hyper_rows = n_tokens;
+    if (hc_rows) {
+        const uint64_t row_bytes =
+            (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+        if (s->verify_stage_rows >= n_tokens &&
+            s->verify_stage_pos + n_tokens == s->pos) {
+            memcpy(hc_rows, s->verify_stage,
+                   (size_t)n_tokens * (size_t)row_bytes);
+        } else if (!ds4_qwen4exp_session_read_hyper(s, 0, n_tokens, hc_rows)) {
+            fprintf(stderr, "ds4: qwen4exp compact verify hyper read failed\n");
+            return false;
+        }
+    }
+    if (s->verify_stage_top1_ok) {
+        memcpy(row_top1, s->verify_stage_top1,
+               (size_t)n_tokens * sizeof(int32_t));
+        return true;
     }
     return ds4_gpu_tensor_read(s->spec_top1, 0, row_top1,
                                (uint64_t)n_tokens * sizeof(int32_t)) != 0;
@@ -3682,6 +3812,8 @@ bool ds4_qwen4exp_graph_head_logits(ds4_qwen4exp_session       *s,
 
     const uint64_t row_bytes =
         (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    /* This call overwrites `hyper` row 0; the verify's stamp is stale. */
+    s->hyper_rows = 0u;
     if (!ds4_gpu_tensor_write(s->hyper, 0, hc_row, row_bytes)) {
         fprintf(stderr, "ds4: qwen4exp head row upload failed\n");
         return false;
@@ -3704,7 +3836,7 @@ bool ds4_qwen4exp_graph_head_logits(ds4_qwen4exp_session       *s,
         fprintf(stderr, "ds4: qwen4exp LM head failed on the head row\n");
         return qwen4exp_forward_fail();
     }
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
+    if (!ds4_gpu_end_commands_sync()) {
         fprintf(stderr, "ds4: qwen4exp command batch did not complete\n");
         return false;
     }
@@ -3902,7 +4034,7 @@ static int qwen4exp_rb_ple_conv_select(void *ctx, uint32_t row) {
     const bool ok = ds4_gpu_tensor_copy(s->ple_conv_state, 0,
                                         s->ple_conv_snapshot,
                                         (uint64_t)row * bytes, bytes) != 0;
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) return -1;
+    if (!ds4_gpu_end_commands_sync()) return -1;
     return ok ? 0 : -1;
 }
 static int qwen4exp_rb_qsa_kv_truncate(void *ctx, uint32_t pos) {
@@ -4048,7 +4180,7 @@ int ds4_qwen4exp_test_head_block_run(const char *target_path,
             ds4_gpu_begin_commands()) {
             ok1 = ds4_qwen4exp_graph_head_block(&ctx, s, hyper,
                                                 head_w.block_index, 0u, n_tokens);
-            if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) ok1 = 0;
+            if (!ds4_gpu_end_commands_sync()) ok1 = 0;
         }
         if (ok1) (void)ds4_gpu_tensor_read(hyper, 0, a, bytes);
 
@@ -4056,7 +4188,7 @@ int ds4_qwen4exp_test_head_block_run(const char *target_path,
             ds4_gpu_begin_commands()) {
             ok2 = ds4_qwen4exp_graph_head_block(&ctx, s, hyper,
                                                 head_w.block_index, 0u, n_tokens);
-            if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) ok2 = 0;
+            if (!ds4_gpu_end_commands_sync()) ok2 = 0;
         }
         if (ok2) (void)ds4_gpu_tensor_read(hyper, 0, b, bytes);
 

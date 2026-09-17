@@ -6073,6 +6073,35 @@ extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset
     return cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes, cudaMemcpyDeviceToHost), "tensor read");
 }
 
+extern "C" void *ds4_gpu_host_alloc(uint64_t bytes) {
+    if (!bytes) return NULL;
+    void *p = NULL;
+    if (cuda_ok(cudaMallocHost(&p, (size_t)bytes), "pinned host alloc") == 0) {
+        p = NULL;
+    }
+    return p;
+}
+
+extern "C" void ds4_gpu_host_free(void *p) {
+    if (p) (void)cudaFreeHost(p);
+}
+
+extern "C" int ds4_gpu_tensor_write_async(ds4_gpu_tensor *tensor, uint64_t offset,
+                                          const void *data, uint64_t bytes) {
+    if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
+    return cuda_ok(cudaMemcpyAsync((char *)tensor->ptr + offset, data,
+                                   (size_t)bytes, cudaMemcpyHostToDevice, 0),
+                   "tensor write async");
+}
+
+extern "C" int ds4_gpu_tensor_read_async(const ds4_gpu_tensor *tensor, uint64_t offset,
+                                         void *data, uint64_t bytes) {
+    if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
+    return cuda_ok(cudaMemcpyAsync(data, (const char *)tensor->ptr + offset,
+                                   (size_t)bytes, cudaMemcpyDeviceToHost, 0),
+                   "tensor read async");
+}
+
 extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                      const ds4_gpu_tensor *src, uint64_t src_offset,
                                      uint64_t bytes) {
@@ -6131,6 +6160,9 @@ extern "C" int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const 
 }
 extern "C" int ds4_gpu_end_commands(void) {
     return cuda_ok(cudaDeviceSynchronize(), "end commands");
+}
+extern "C" int ds4_gpu_end_commands_sync(void) {
+    return cuda_ok(cudaDeviceSynchronize(), "end commands sync");
 }
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
 
