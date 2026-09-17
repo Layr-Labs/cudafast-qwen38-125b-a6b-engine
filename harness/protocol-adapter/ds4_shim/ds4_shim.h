@@ -93,6 +93,13 @@ int ds4s_top_logits(const ds4s_handle *h, int k, int32_t *ids, float *logits);
  * The port routes this to ds4_qwen4exp_mtp_cycle, which commits the target's
  * own GREEDY argmax and so emits the serial leg's token stream exactly; at
  * depth 1 it commits 1 or 2 tokens per round. */
+/* This build's note auto09170407_5 records that declaring draft depth three
+ * measured twenty-one percent faster than depth one on a local free-run
+ * path and seven percent worse on the ranked path. The difference is the
+ * prompt: a copy-gate golden inflates speculative acceptance, and deeper
+ * drafting is exactly what wins at high acceptance and loses on natural
+ * text.
+ */
 int ds4s_eval_speculative(ds4s_handle *h, int32_t first_token, int budget, int32_t *out,
                           int cap);
 

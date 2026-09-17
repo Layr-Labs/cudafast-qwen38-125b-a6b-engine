@@ -952,46 +952,8 @@ static inline cublasHandle_t cuda_cublas_for_tier(int logical_tier) {
  * CUDA_DECODE_GRAPH_LAYERS * CUDA_DECODE_GRAPH_ISLANDS * 4 entries of key plus
  * pointer, populates none of them until a key asks, and changes no graph's
  * contents, no launch order and no arithmetic -- only how many identities may
- * be resident before the lookup gives up.
- *
- * SIXTEEN, BECAUSE EIGHT IS THE COUNT WITH NO SPARE -- AND THE COUNT ABOVE IS
- * BOTH UNDERSTATED AND ATTRIBUTED TO THE WRONG ROUND.
- *
- * The paragraph above says the parity "alternates on every accepting round".
- * It is the other way round: p.swap = p.active && !reuse, and `reuse` is
- * exactly what an accepting round establishes, so an accepting round does NOT
- * swap.  The parity flips on the rounds that REFUSE reuse -- about 37 percent
- * of them at spec_acceptance_rate 0.6282.  A run that only ever accepts cycles
- * two identities, which is why four ever looked sufficient; a run with
- * refusals in it walks the whole space.
- *
- * Enumerated rather than argued.  Driving the shipped
- * ds4_qwen4exp_gdn_replay_plan() over the reachable (previous, prefix, phase)
- * product to a fixpoint -- eight controller states at the shipped replay depth,
- * since prefix is bounded by DS4_QWEN4EXP_GDN_REPLAY_ROWS -- and collecting every
- * ds4_qwen4exp_gdn_graph_variant() a reachable step can present yields
- * SIXTEEN distinct identities, not four:
- *
- *     width in {1,2} x snapshots in {0,1} x phase in {0,1} x active in {0,1}
- *
- * Sixteen is therefore not headroom, it is the closed bound: with a slot per
- * reachable identity the row CANNOT fill, so the silent permanent fallback
- * this comment has warned about twice becomes unreachable rather than merely
- * less likely.  At the declared depth-2 envelope snapshots is pinned to
- * width - 1 (graph.inc:3567), so the live subset is eight -- exactly the
- * current slot count, with zero spare for the free-run leg's own keys and zero
- * spare for a dead entry.  Dead entries matter: cuda_decode_graph_entry_kill()
- * sets state 3 and the free-slot scan only accepts state 0, so one transient
- * capture failure retires a slot for the life of the process.
- *
- * Free on the hit path, by construction.  cuda_decode_graph_find() returns at
- * the matching slot, and keys are claimed in first-sight order, so the added
- * slots are only ever walked on a miss -- the case that is already paying a
- * permanent eager fallback.  The cost is CUDA_DECODE_GRAPH_LAYERS *
- * CUDA_DECODE_GRAPH_ISLANDS * 8 more entries of static storage, populated
- * only when a key asks, and no change to any graph's contents, launch order or
- * arithmetic. */
-#define CUDA_DECODE_GRAPH_VARIANTS  16u
+ * be resident before the lookup gives up. */
+#define CUDA_DECODE_GRAPH_VARIANTS  8u
 
 /* Mirrors the public `struct ds4_decode_graph_key` decl in ds4_gpu.h
  * byte-for-byte (ds4_cuda.cu does not include that header; it carries
