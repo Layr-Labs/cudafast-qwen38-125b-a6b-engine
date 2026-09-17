@@ -1,3 +1,4 @@
+/* ROUND 95 PROMOTION DRAW — stamp 20260917T220242Z. Goal 3/3 top-5. Tip eba814d record 2.6468193 bar 2.6494661. R94=2.61677 s6 under old tip. */
 /*
  * qwen4exp serial graph: session state, memory plan and the forward.
  * See ds4_qwen4exp_graph.h for the contract and the layer schedule.
