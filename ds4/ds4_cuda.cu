@@ -21,6 +21,7 @@
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
+#include <mutex>
 
 #include "cuda/mmq/ds4_mmq.h"
 #include "cuda/mmq/ds4_repack.h"
@@ -244,6 +245,20 @@ int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
  * destinations cannot race for staging memory. */
 static void   *g_xdev_bounce[DS4_MAX_GPUS][DS4_MAX_GPUS];
 static size_t  g_xdev_bounce_bytes[DS4_MAX_GPUS][DS4_MAX_GPUS];
+
+/* Per-device pinned staging for synchronous host copies.  A cudaMemcpy to or
+ * from pageable memory makes the driver bounce through its own staging at a
+ * fraction of link bandwidth; the same call on a pinned destination takes the
+ * DMA path.  The decode step reads back its top-1 row ids, hyper rows and the
+ * selected logit row through ds4_gpu_tensor_read every token, so the stage is
+ * grown lazily to the largest copy seen and capped: bulk readbacks past the
+ * cap keep the direct pageable route rather than pinning megabytes for a
+ * one-off dump.  The mutex serializes staged copies on one device because the
+ * buffer is shared. */
+#define DS4_HSTAGE_MAX ((uint64_t)16u * 1024u * 1024u)
+static void       *g_hstage[DS4_MAX_GPUS];
+static size_t      g_hstage_bytes[DS4_MAX_GPUS];
+static std::mutex  g_hstage_mtx[DS4_MAX_GPUS];
 
 /* Internal helper: resolve a tensor's device index. -1 (untagged) is
  * treated as device 0 for legacy callers. */
@@ -3194,6 +3209,13 @@ extern "C" void ds4_gpu_cleanup(void) {
             }
         }
     }
+    for (int i = 0; i < DS4_MAX_GPUS; i++) {
+        if (g_hstage[i]) {
+            (void)cudaFreeHost(g_hstage[i]);
+            g_hstage[i] = NULL;
+            g_hstage_bytes[i] = 0;
+        }
+    }
     cuda_stream_selected_cache_release();
     cuda_stream_selected_stage_release();
     g_n_gpus = 0;
@@ -3490,14 +3512,44 @@ extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint
     return ok;
 }
 
+/* Grow the per-device pinned stage to `bytes`.  Returns the stage pointer or
+ * NULL when the copy should take the direct pageable route instead.  Callers
+ * hold g_hstage_mtx[d]. */
+static void *cuda_hstage_ensure(int d, uint64_t bytes) {
+    if (bytes == 0 || bytes > DS4_HSTAGE_MAX) return NULL;
+    if (g_hstage_bytes[d] >= bytes) return g_hstage[d];
+    void *stage = NULL;
+    if (cudaMallocHost(&stage, (size_t)bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    if (g_hstage[d]) (void)cudaFreeHost(g_hstage[d]);
+    g_hstage[d] = stage;
+    g_hstage_bytes[d] = (size_t)bytes;
+    return stage;
+}
+
 extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     int d = ds4_tensor_device_idx(tensor);
     int ok = 0;
     WITH_DEVICE(g_gpu[d].device_id) {
-        ok = cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, data, (size_t)bytes,
-                                cudaMemcpyHostToDevice),
-                     "tensor write");
+        void *stage = NULL;
+        {
+            std::lock_guard<std::mutex> lock(g_hstage_mtx[d]);
+            stage = cuda_hstage_ensure(d, bytes);
+            if (stage) {
+                memcpy(stage, data, (size_t)bytes);
+                ok = cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, stage,
+                                        (size_t)bytes, cudaMemcpyHostToDevice),
+                             "tensor write");
+            }
+        }
+        if (!stage) {
+            ok = cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, data,
+                                    (size_t)bytes, cudaMemcpyHostToDevice),
+                         "tensor write");
+        }
     }
     return ok;
 }
@@ -3507,9 +3559,23 @@ extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset
     int d = ds4_tensor_device_idx(tensor);
     int ok = 0;
     WITH_DEVICE(g_gpu[d].device_id) {
-        ok = cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes,
-                                cudaMemcpyDeviceToHost),
-                     "tensor read");
+        void *stage = NULL;
+        {
+            std::lock_guard<std::mutex> lock(g_hstage_mtx[d]);
+            stage = cuda_hstage_ensure(d, bytes);
+            if (stage) {
+                ok = cuda_ok(cudaMemcpy(stage,
+                                        (const char *)tensor->ptr + offset,
+                                        (size_t)bytes, cudaMemcpyDeviceToHost),
+                             "tensor read");
+                if (ok) memcpy(data, stage, (size_t)bytes);
+            }
+        }
+        if (!stage) {
+            ok = cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset,
+                                    (size_t)bytes, cudaMemcpyDeviceToHost),
+                         "tensor read");
+        }
     }
     return ok;
 }
