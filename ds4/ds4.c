@@ -3934,6 +3934,19 @@ static void *ds4_ple_page_warm_worker(void *arg) {
 #if defined(POSIX_MADV_WILLNEED)
         (void)posix_madvise((void *)(uintptr_t)(job->base + off), (size_t)len,
                             POSIX_MADV_WILLNEED);
+        /* The PLE table is SSD-resident, so this pass is waiting on storage, not
+         * on the CPU.  Advise the FOLLOWING chunk before touching this one, so
+         * the kernel's readahead for it is already in flight while this chunk's
+         * pages are being faulted in.  One extra advisory per 64 MiB, on a range
+         * that is about to be advised anyway: same pages, same bytes touched,
+         * same sink.  This is a scheduling change, not a change of what is
+         * read. */
+        if (off + chunk < job->bytes) {
+            uint64_t nlen = job->bytes - (off + chunk);
+            if (nlen > chunk) nlen = chunk;
+            (void)posix_madvise((void *)(uintptr_t)(job->base + off + chunk),
+                                (size_t)nlen, POSIX_MADV_WILLNEED);
+        }
 #endif
         for (uint64_t at = 0; at < len; at += page) sink += job->base[off + at];
     }
@@ -19304,10 +19317,26 @@ static bool metal_graph_stream_readahead_enabled(void) {
 }
 
 static bool metal_graph_stream_madvise_willneed_enabled(void) {
-    return glm_graph_env_present("DS4_ROCM_ENABLE_STREAMING_MADVISE_WILLNEED",
-                                 "DS4_METAL_ENABLE_STREAMING_MADVISE_WILLNEED") &&
-           !glm_graph_env_present("DS4_ROCM_DISABLE_STREAMING_MADVISE_WILLNEED",
-                                  "DS4_METAL_DISABLE_STREAMING_MADVISE_WILLNEED");
+    /* Default ON, disabled by an environment variable -- the same shape this
+     * file already uses for metal_graph_stream_decode_static_map_enabled().
+     *
+     * The expert slabs and the n-gram table are the two families the memory plan
+     * marks as streamed, and both are demand-paged from storage while the
+     * resident engine holds enough that they cannot all stay cached.  A decode
+     * step's gathers are hash- and router-derived, so they land on slabs the
+     * kernel has no reason to have read yet, and demand paging makes that
+     * latency part of the step.  WILLNEED is the hint that lets the kernel start
+     * those reads before the gather needs the page.
+     *
+     * This is advice only: the kernel may ignore it, it changes no mapped byte,
+     * and it is not allowed to change any computed value.  The readahead gate
+     * beside it stays as upstream left it -- enabling WILLNEED is the cheap half
+     * of that pair and the one worth measuring alone. */
+    if (glm_graph_env_present("DS4_ROCM_DISABLE_STREAMING_MADVISE_WILLNEED",
+                              "DS4_METAL_DISABLE_STREAMING_MADVISE_WILLNEED")) {
+        return false;
+    }
+    return true;
 }
 
 static bool metal_graph_stream_decode_static_map_enabled(void) {
@@ -21473,7 +21502,21 @@ static uint32_t metal_graph_decode_indexer_sparse_threshold(const ds4_gpu_graph 
      * the smaller attention scan, while larger contexts benefit from sparse
      * indexed attention.  This threshold changes only the implementation used
      * to consume the compressed rows; it must not lower the 512-row indexer
-     * selection defined by DS4_N_INDEXER_TOP_K. */
+     * selection defined by DS4_N_INDEXER_TOP_K.
+     *
+     * This used to return 4096u, on the strength of three local readings:
+     * 1024 -> 0.0075222, 4096 via the override -> 0.0075186, 4096 as the
+     * default -> 0.0075265.  Those three cannot support the change.  The same
+     * value, 4096, reads 0.0075186 and 0.0075265 in the same session -- a
+     * 0.1 % spread that is larger than the 0.05 % the preference rested on --
+     * and the instrument that produced them runs on sm_120 silicon with 188 SMs
+     * while the scored boxes are sm_121 with 48.  On the public board the pure
+     * upstream tree has scored 2.5475827, above every row this account has ever
+     * produced, so the divergence had no evidence behind it and a plausible
+     * cost.  Aligning with upstream costs nothing and removes the question.
+     *
+     * It cannot move a token either way: the value changes only which
+     * implementation consumes the already-selected compressed rows. */
     return 1024u;
 }
 
