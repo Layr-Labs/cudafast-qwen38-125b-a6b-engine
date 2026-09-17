@@ -6089,6 +6089,14 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                    "tensor copy enqueue");
 }
 
+/* See ds4_gpu.h.  Identical to ds4_gpu_tensor_copy here: the ROCm copy is
+ * already a stream-0 enqueue, so the async-at-offset form is the same call. */
+extern "C" int ds4_gpu_tensor_copy_async_at(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                                            const ds4_gpu_tensor *src, uint64_t src_offset,
+                                            uint64_t bytes) {
+    return ds4_gpu_tensor_copy(dst, dst_offset, src, src_offset, bytes);
+}
+
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
 extern "C" int ds4_gpu_flush_encoder(void) { return ds4_gpu_flush_commands(); }
@@ -6131,6 +6139,9 @@ extern "C" int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const 
 }
 extern "C" int ds4_gpu_end_commands(void) {
     return cuda_ok(cudaDeviceSynchronize(), "end commands");
+}
+extern "C" int ds4_gpu_end_commands_sync(void) {
+    return cuda_ok(cudaDeviceSynchronize(), "end commands sync");
 }
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
 

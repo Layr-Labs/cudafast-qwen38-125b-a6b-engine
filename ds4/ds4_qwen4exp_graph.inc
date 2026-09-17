@@ -375,6 +375,7 @@ struct ds4_qwen4exp_session {
     uint32_t        adopt_state;   /* recurrent state: row + 1, or 0 */
     uint32_t        adopt_conv;    /* conv history: row + 1, or 0 */
     uint32_t        adopt_device;  /* host mirror of *d_adopt */
+    uint32_t        adopt_ple_conv; /* PLE conv state: row + 1, or 0 */
     ds4_gpu_tensor *d_gdn_replay;
     ds4_gpu_tensor *gdn_replay_gates;
     bool gdn_replay_enabled;
@@ -993,6 +994,7 @@ void ds4_qwen4exp_session_reset(ds4_qwen4exp_session *s) {
      * live buffers are what the next forward must read. */
     s->adopt_state = 0u;
     s->adopt_conv = 0u;
+    s->adopt_ple_conv = 0u;
     s->gdn_replay_active = false;
     s->gdn_replay_previous = false;
     s->gdn_replay_prefix = 0u;
@@ -2833,6 +2835,45 @@ static bool qwen4exp_session_copy_layers(ds4_qwen4exp_session *s,
                                          uint32_t row,
                                          bool recurrent, bool conv);
 
+/* The settle half of the lazy rollback: every pending adoption copy enqueued
+ * on the forward's stream ahead of the kernels that read the live buffers.
+ * Rows arrive in the adopt fields' row + 1 encoding; 0 skips the object.
+ * The copies are stream-ordered enqueues, not waits: the forward's own
+ * commit is the only synchronize the round pays. */
+static bool qwen4exp_session_settle_layers(ds4_qwen4exp_session *s,
+                                           uint32_t state_row,
+                                           uint32_t conv_row,
+                                           uint32_t ple_conv_row) {
+    const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
+    bool ok = true;
+    for (uint32_t il = 0; il < cfg->n_layer && ok; il++) {
+        if (state_row != 0u && s->gdn_state[il]) {
+            const uint64_t bytes = ds4_gpu_tensor_bytes(s->gdn_state[il]);
+            ok = qwen4exp_gdn_replay_snapshot(s, il, state_row - 1u);
+            if (ok) ok = ds4_gpu_tensor_copy_async_at(
+                             s->gdn_state[il], 0,
+                             s->gdn_state_snapshot[il],
+                             (uint64_t)(state_row - 1u) * bytes, bytes) != 0;
+        }
+        if (ok && conv_row != 0u && s->gdn_conv[il]) {
+            const uint64_t bytes = ds4_gpu_tensor_bytes(s->gdn_conv[il]);
+            ok = ds4_gpu_tensor_copy_async_at(
+                     s->gdn_conv[il], 0,
+                     s->gdn_conv_snapshot[il],
+                     (uint64_t)(conv_row - 1u) * bytes, bytes) != 0;
+        }
+    }
+    if (ok && ple_conv_row != 0u && s->ple_conv_state) {
+        const uint64_t bytes = ds4_gpu_tensor_bytes(s->ple_conv_state);
+        ok = ds4_gpu_tensor_copy_async_at(
+                 s->ple_conv_state, 0,
+                 s->ple_conv_snapshot,
+                 (uint64_t)(ple_conv_row - 1u) * bytes, bytes) != 0;
+    }
+    if (ok && state_row != 0u) s->gdn_replay_previous = false;
+    return ok;
+}
+
 bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
                                 const ds4_qwen4exp_weights *w,
                                 const ds4_model            *m,
@@ -2930,45 +2971,33 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         s->gdn_replay_enabled, s->gdn_replay_previous, s->gdn_replay_prefix,
         DS4_QWEN4EXP_GDN_REPLAY_ROWS, n_tokens, s->spec_snapshot_rows,
         DS4_QWEN4EXP_MTP_MAX_COMMIT, s->adopt_state, s->adopt_conv);
-    if (replay_step.settle) {
-        const uint32_t rs = s->adopt_state, rc = s->adopt_conv;
-        /* ONE BATCH, ONE SYNCHRONIZE, when both halves settle the same row.
+    if (replay_step.settle || s->adopt_ple_conv != 0u) {
+        /* ONE STREAM, NO DRAIN, for every pending adoption.
          *
-         * qwen4exp_session_copy_layers() opens its own command batch and ends
-         * it with ds4_gpu_end_commands() + ds4_gpu_synchronize(), so calling it
-         * twice -- once for the recurrent state and once for the convolution --
-         * drains the stream TWICE for one rollback.  The two passes copy
-         * disjoint buffers (gdn_state[il] from the state snapshot,
-         * gdn_conv[il] from the conv snapshot) and neither reads what the other
-         * writes, so nothing orders one before the other and the split buys
-         * nothing.
+         * The rollback copies used to run in their own command batch behind
+         * their own device synchronize: each ds4_gpu_tensor_copy was a
+         * synchronous cudaMemcpy the host waited on, and the batch close
+         * drained the stream again before the forward could open.  On this
+         * backend the forward's kernels ride the same stream the copies
+         * would, so enqueueing the copies here -- ahead of the embed and the
+         * layer stack -- orders them before every consumer for free.  The
+         * host pays one enqueue per layer instead of one wait per layer, and
+         * the only synchronize left on the round is the forward's own.
          *
-         * The common case is exactly the mergeable one: the plan forces a
-         * settle whenever `recurrent != conv`, so on the path that survives to
-         * here with both non-zero they are equal, and one call with both flags
-         * does the same work per layer in one batch behind one drain.
+         * The PLE convolution state joins the same batch: its rollback used
+         * to be the one eager select left, a batch and a drain of its own
+         * per rejecting round, while the GDN pair had already gone lazy.
          *
          * BIT-IDENTICAL: the same rows are copied out of the same snapshots
-         * into the same destinations, and the per-layer loop inside
-         * copy_layers already handles both flags together -- the only thing
-         * that changes is that the conv copies join the batch the state copies
-         * were already in.  The unequal and single-sided cases keep the
-         * original two-call form below. */
-        if (rs != 0u && rs == rc) {
-            if (!qwen4exp_session_copy_layers(s, rs - 1u, true, true)) {
-                fprintf(stderr, "ds4: qwen4exp GDN rollback could not settle\n");
-                return false;
-            }
-            s->adopt_state = 0u;
-            s->adopt_conv = 0u;
-        } else
-        if ((rs != 0u && !qwen4exp_session_copy_layers(s, rs - 1u, true, false)) ||
-            (rc != 0u && !qwen4exp_session_copy_layers(s, rc - 1u, false, true))) {
-            fprintf(stderr, "ds4: qwen4exp GDN rollback could not settle\n");
+         * into the same destinations; only the host-side waits are gone. */
+        if (!qwen4exp_session_settle_layers(s, s->adopt_state, s->adopt_conv,
+                                            s->adopt_ple_conv)) {
+            fprintf(stderr, "ds4: qwen4exp rollback could not settle\n");
             return false;
         }
         s->adopt_state = 0u;
         s->adopt_conv = 0u;
+        s->adopt_ple_conv = 0u;
     }
     s->gdn_replay_active = replay_step.active;
     if (replay_step.swap) {
@@ -3026,6 +3055,7 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     s->gdn_replay_previous = s->gdn_replay_active;
     s->adopt_state = 0u;
     s->adopt_conv = 0u;
+    s->adopt_ple_conv = 0u;
 
     /* The final mixer has no inject head: it collapses n_hc * n_embd to
      * n_embd and stands in for the model.norm this checkpoint does not have. */
@@ -3076,7 +3106,7 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     QW_TRACE(QW_SLICE_HEAD);
     QW_TRACE_REPORT(n_tokens);
     /* Commit and wait: the logits are read on the host from here on. */
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
+    if (!ds4_gpu_end_commands_sync()) {
         fprintf(stderr, "ds4: qwen4exp command batch did not complete\n");
         return false;
     }
@@ -3129,7 +3159,7 @@ static bool qwen4exp_session_copy_layers(ds4_qwen4exp_session *s,
                                      (uint64_t)row * bytes, bytes) != 0;
         }
     }
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) return false;
+    if (!ds4_gpu_end_commands_sync()) return false;
     if (ok && recurrent) s->gdn_replay_previous = false;
     return ok;
 }
@@ -3152,7 +3182,6 @@ static bool qwen4exp_session_select_layers(ds4_qwen4exp_session *s,
     }
     return qwen4exp_session_copy_layers(s, row, recurrent, conv);
 }
-
 /* ======================================================================
  * The MTP head's 49th block.
  *
@@ -3704,7 +3733,7 @@ bool ds4_qwen4exp_graph_head_logits(ds4_qwen4exp_session       *s,
         fprintf(stderr, "ds4: qwen4exp LM head failed on the head row\n");
         return qwen4exp_forward_fail();
     }
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
+    if (!ds4_gpu_end_commands_sync()) {
         fprintf(stderr, "ds4: qwen4exp command batch did not complete\n");
         return false;
     }
@@ -3897,12 +3926,22 @@ static int qwen4exp_rb_ple_conv_select(void *ctx, uint32_t row) {
     ds4_qwen4exp_session *s = ctx;
     if (row >= DS4_QWEN4EXP_IMPLEMENTED_DEPTH) return -1;
     s->state_dirty = true;   /* see `state_dirty` */
+    /* Lazy like the GDN pair: with the rollback armed the copy is deferred
+     * to the next forward's settle, where it joins the adoption batch on the
+     * forward's own stream.  A select used to pay a command batch and a
+     * device drain of its own here; now it is a host-side record, and a
+     * later select of the same object wins exactly as the copy it replaces
+     * would have. */
+    if (s->d_adopt) {
+        s->adopt_ple_conv = row + 1u;
+        return 0;
+    }
     const uint64_t bytes = ds4_gpu_tensor_bytes(s->ple_conv_state);
     if (!ds4_gpu_begin_commands()) return -1;
     const bool ok = ds4_gpu_tensor_copy(s->ple_conv_state, 0,
                                         s->ple_conv_snapshot,
                                         (uint64_t)row * bytes, bytes) != 0;
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) return -1;
+    if (!ds4_gpu_end_commands_sync()) return -1;
     return ok ? 0 : -1;
 }
 static int qwen4exp_rb_qsa_kv_truncate(void *ctx, uint32_t pos) {
@@ -4048,7 +4087,7 @@ int ds4_qwen4exp_test_head_block_run(const char *target_path,
             ds4_gpu_begin_commands()) {
             ok1 = ds4_qwen4exp_graph_head_block(&ctx, s, hyper,
                                                 head_w.block_index, 0u, n_tokens);
-            if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) ok1 = 0;
+            if (!ds4_gpu_end_commands_sync()) ok1 = 0;
         }
         if (ok1) (void)ds4_gpu_tensor_read(hyper, 0, a, bytes);
 
@@ -4056,7 +4095,7 @@ int ds4_qwen4exp_test_head_block_run(const char *target_path,
             ds4_gpu_begin_commands()) {
             ok2 = ds4_qwen4exp_graph_head_block(&ctx, s, hyper,
                                                 head_w.block_index, 0u, n_tokens);
-            if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) ok2 = 0;
+            if (!ds4_gpu_end_commands_sync()) ok2 = 0;
         }
         if (ok2) (void)ds4_gpu_tensor_read(hyper, 0, b, bytes);
 

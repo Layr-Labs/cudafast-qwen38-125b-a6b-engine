@@ -96,6 +96,21 @@ extern "C" int ds4_gpu_tensor_copy_async(ds4_gpu_tensor *dst,
                           hipMemcpyDeviceToDevice, 0) == hipSuccess;
 }
 
+extern "C" int ds4_gpu_tensor_copy_async_at(ds4_gpu_tensor *dst,
+                                            uint64_t dst_offset,
+                                            const ds4_gpu_tensor *src,
+                                            uint64_t src_offset,
+                                            uint64_t bytes) {
+    if (!dst || !src || dst_offset > dst->bytes || src_offset > src->bytes ||
+        bytes > dst->bytes - dst_offset || bytes > src->bytes - src_offset) {
+        return 0;
+    }
+    if (bytes == 0) return 1;
+    return hipMemcpyAsync((char *)dst->ptr + dst_offset,
+                          (const char *)src->ptr + src_offset, (size_t)bytes,
+                          hipMemcpyDeviceToDevice, 0) == hipSuccess;
+}
+
 extern "C" int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst,
                                           const ds4_gpu_tensor *src,
                                           uint64_t bytes) {

@@ -48,7 +48,8 @@ with tempfile.TemporaryDirectory(prefix='gdn-replay-host-') as tmp:
         ctl = definition(graph, 'qwen4exp_gdn_replay_snapshot') + definition(
             graph[body:], 'qwen4exp_session_copy_layers') + ''.join(
             definition(graph, n) for n in (
-                'qwen4exp_session_select_layers', 'ds4_qwen4exp_session_reset'))
+                'qwen4exp_session_select_layers', 'qwen4exp_session_settle_layers',
+                'ds4_qwen4exp_session_reset'))
         start = graph.index('    const ds4_qwen4exp_gdn_replay_step replay_step =')
         end = graph.index('    if (s->d_pos &&', start)
         ctl += ('static bool prepare(ds4_qwen4exp_session *s, uint32_t n_tokens) {\n'

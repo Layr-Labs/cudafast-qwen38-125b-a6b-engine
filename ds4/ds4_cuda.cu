@@ -3546,6 +3546,31 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
     return ok;
 }
 
+/* See ds4_gpu.h.  The settle path enqueues a rollback's snapshot copies and
+ * lets the forward's own stream order carry them; a synchronous cudaMemcpy
+ * per layer would pay a host wait per copy for an ordering the stream
+ * already guarantees. */
+extern "C" int ds4_gpu_tensor_copy_async_at(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                                            const ds4_gpu_tensor *src, uint64_t src_offset,
+                                            uint64_t bytes) {
+    if (!dst || !src || dst_offset > dst->bytes || src_offset > src->bytes ||
+        bytes > dst->bytes - dst_offset || bytes > src->bytes - src_offset) {
+        return 0;
+    }
+    if (bytes == 0) return 1;
+    int d = ds4_tensor_device_idx(dst);
+    int ok = 0;
+    WITH_DEVICE(g_gpu[d].device_id) {
+        ok = cuda_ok(cudaMemcpyAsync((char *)dst->ptr + dst_offset,
+                                    (const char *)src->ptr + src_offset,
+                                    (size_t)bytes,
+                                    cudaMemcpyDeviceToDevice,
+                                    (cudaStream_t)0),
+                     "tensor copy async at");
+    }
+    return ok;
+}
+
 __global__ static void moe_handoff_pack_kernel(
         unsigned char *packed,
         const float *ffn_norm,
@@ -4059,6 +4084,14 @@ extern "C" int ds4_gpu_end_commands(void) {
         return cuda_ok(cudaStreamSynchronize(0), "end commands stream");
     }
     return cuda_ok(cudaDeviceSynchronize(), "end commands");
+}
+/* The pair end_commands + synchronize is two device synchronises back to
+ * back; the second can only ever observe the first one's quiescence, so one
+ * cudaDeviceSynchronize is the whole contract, with or without
+ * DS4_CUDA_END_STREAM_SYNC (stream-0 copies never waited on the non-blocking
+ * streams either way). */
+extern "C" int ds4_gpu_end_commands_sync(void) {
+    return cuda_ok(cudaDeviceSynchronize(), "end commands sync");
 }
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
 

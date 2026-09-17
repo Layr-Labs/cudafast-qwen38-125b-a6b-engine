@@ -56,6 +56,14 @@ int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *dat
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
+/* Stream-ordered device-to-device copy at byte offsets: enqueued on the
+ * destination's stream 0 and returns without waiting, so a batch of them
+ * costs the caller one enqueue each instead of one drain each.  The
+ * consumer's ordering is the stream's, exactly as ds4_gpu_tensor_copy's
+ * synchronous copy provides. */
+int ds4_gpu_tensor_copy_async_at(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                                 const ds4_gpu_tensor *src, uint64_t src_offset,
+                                 uint64_t bytes);
 int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                    const ds4_gpu_tensor *src, uint64_t src_offset,
                                    uint64_t count);
@@ -108,6 +116,11 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
                                              const char *label);
 #endif
 int ds4_gpu_end_commands(void);
+/* Commit the open batch and wait for the device in one call.  On CUDA the
+ * pair `end_commands(); synchronize();` runs cudaDeviceSynchronize twice;
+ * this is the same wait once.  Semantics are the pair's: the device is
+ * quiescent when it returns nonzero. */
+int ds4_gpu_end_commands_sync(void);
 int ds4_gpu_synchronize(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);

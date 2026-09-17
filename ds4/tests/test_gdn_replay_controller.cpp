@@ -28,7 +28,8 @@ struct ds4_qwen4exp_session {
     bool gdn_replay_enabled=true,gdn_replay_active=false,gdn_replay_previous=false;
     bool state_dirty=false;
     uint32_t gdn_replay_prefix=0,gdn_replay_phase=0;
-    uint32_t adopt_state=0,adopt_conv=0,adopt_device=0,spec_snapshot_rows=0;
+    uint32_t adopt_state=0,adopt_conv=0,adopt_device=0,adopt_ple_conv=0,spec_snapshot_rows=0;
+    ds4_gpu_tensor *ple_conv_state=nullptr,*ple_conv_snapshot=nullptr;
     uint32_t head_cache_pos=0,pos=0;
     int ple_constants=0,ple_history=0;
 };
@@ -46,9 +47,13 @@ static bool batch=false, fail_update=false;
 static int ds4_gpu_begin_commands() { need(!batch,"nested command batch");batch=true;return 1; }
 static int ds4_gpu_end_commands() { need(batch,"missing command batch");batch=false;return 1; }
 static int ds4_gpu_synchronize() { return 1; }
+static int ds4_gpu_end_commands_sync() { need(batch,"missing command batch");batch=false;return 1; }
 static int ds4_gpu_tensor_copy(ds4_gpu_tensor *d,uint64_t off,const ds4_gpu_tensor *s,uint64_t from,uint64_t n) {
     need(d && s && off+n<=ds4_gpu_tensor_bytes(d) && from+n<=ds4_gpu_tensor_bytes(s),"copy bounds");
     std::memcpy((char*)d->v.data()+off,(const char*)s->v.data()+from,n);return 1;
+}
+static int ds4_gpu_tensor_copy_async_at(ds4_gpu_tensor *d,uint64_t off,const ds4_gpu_tensor *s,uint64_t from,uint64_t n) {
+    return ds4_gpu_tensor_copy(d,off,s,from,n);
 }
 static int ds4_gpu_qwen4exp_update_dpos(ds4_gpu_tensor *d,uint32_t v) {
     if(fail_update) {fail_update=false;return 0;}

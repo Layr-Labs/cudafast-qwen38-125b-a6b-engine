@@ -161,6 +161,12 @@ int ds4_gpu_set_current_device_fenced(int logical_tier) { (void)logical_tier; re
 void ds4_gpu_enable_q8_dequant_gemm(void) {}
 void ds4_gpu_enable_q8_dense_mma(void) {}
 int ds4_gpu_tensor_copy_async(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint64_t bytes) { (void)dst; (void)src; (void)bytes; return 0; }
+int ds4_gpu_tensor_copy_async_at(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                                 const ds4_gpu_tensor *src, uint64_t src_offset,
+                                 uint64_t bytes) {
+    /* No device queue on this build: the synchronous copy is the ordering. */
+    return ds4_gpu_tensor_copy(dst, dst_offset, src, src_offset, bytes);
+}
 int ds4_gpu_tensor_copy_xdev_default(ds4_gpu_tensor *dst,
                                      const ds4_gpu_tensor *src,
                                      uint64_t bytes) {
