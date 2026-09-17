@@ -1154,7 +1154,7 @@ void ds4_ple_table_prefetch(ds4_ple_table *t, const uint64_t *ids, size_t count)
     if (!t || !ids) return;
 #if defined(POSIX_MADV_WILLNEED)
     const size_t page = (size_t)sysconf(_SC_PAGESIZE);
-    if (page == 0) return;
+    if (page == 0 || (page & (page - 1)) != 0) return;
     for (size_t i = 0; i < count; i++) {
         const uint64_t row = ids[i];
         if (row >= t->constants.table_rows) continue;
@@ -1162,8 +1162,10 @@ void ds4_ple_table_prefetch(ds4_ple_table *t, const uint64_t *ids, size_t count)
 
         uint64_t start = t->tensor_offset + row * t->quant_row_bytes;
         uint64_t end   = start + t->quant_row_bytes;
-        start -= start % page;
-        end = (end + page - 1) / page * page;
+        /* `page` is a power of two on every host this runs on, so the range
+         * rounds with masks rather than a divide per row. */
+        start &= ~((uint64_t)page - 1u);
+        end = (end + page - 1) & ~((uint64_t)page - 1u);
         if (end > t->mapping.size) end = t->mapping.size;
         (void)posix_madvise((void *)(t->mapping.map + start), (size_t)(end - start),
                             POSIX_MADV_WILLNEED);

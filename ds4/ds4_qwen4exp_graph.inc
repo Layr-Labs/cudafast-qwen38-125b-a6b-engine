@@ -1100,6 +1100,49 @@ void ds4_qwen4exp_session_reset(ds4_qwen4exp_session *s) {
  * knob); a positive value pins the thread count.  Unset, the gather takes
  * the online CPUs capped at 16 -- enough to keep the SSD queue deep without
  * starving the decode path's own helpers. */
+/* Ask the kernel to bring the row pages in before the gather touches them.
+ * A page fault on a cold row waits on the disk; a WILLNEED issued for every
+ * row of the batch puts all of those reads in flight together, so the
+ * gather's serial dequant walks pages that are already arriving rather than
+ * stalling one fault at a time.  Hint only: it changes no value the gather
+ * reads, and a row past the table is skipped here and refused by the gather
+ * itself. */
+static void qw_ple_hint_rows(const ds4_qwen4exp_ple_table *ple,
+                             const uint64_t *ids, uint64_t count) {
+#if defined(POSIX_MADV_WILLNEED)
+    if (!ple || !ple->base || !ids || count == 0) return;
+    /* Resolved once per process; sysconf walks external state for a value
+     * that cannot change while the engine is open. */
+    static long ple_hint_page = 0;
+    if (ple_hint_page == 0) {
+        const long p = sysconf(_SC_PAGESIZE);
+        ple_hint_page = (p > 0 && (p & (p - 1)) == 0) ? p : -1;
+    }
+    if (ple_hint_page <= 0) return;
+    const uint64_t page = (uint64_t)ple_hint_page;
+    /* `ple->base` is a GGUF-aligned tensor offset inside the shard mapping,
+     * not a page boundary; madvise needs the page that contains it. */
+    const uintptr_t base_addr = (uintptr_t)ple->base;
+    const uintptr_t map_base  = base_addr & ~(uintptr_t)(page - 1u);
+    const uint64_t  delta     = (uint64_t)(base_addr - map_base);
+    uint64_t prev_start = UINT64_MAX;
+    for (uint64_t i = 0; i < count; i++) {
+        const uint64_t row = ids[i];
+        if (row >= ple->rows) continue;
+        const uint64_t off   = delta + row * ple->row_bytes;
+        const uint64_t start = off & ~(page - 1u);
+        if (start == prev_start) continue; /* page already in flight */
+        prev_start = start;
+        uint64_t end   = (off + ple->row_bytes + page - 1u) & ~(page - 1u);
+        if (end > delta + ple->bytes) end = delta + ple->bytes;
+        (void)posix_madvise((void *)(map_base + start), (size_t)(end - start),
+                            POSIX_MADV_WILLNEED);
+    }
+#else
+    (void)ple; (void)ids; (void)count;
+#endif
+}
+
 typedef struct {
     const ds4_qwen4exp_ple_table *ple;
     const ds4_qwen4exp_session   *s;
@@ -1137,9 +1180,17 @@ static void *qw_ple_gather_worker(void *arg) {
         ds4_ple_history_reset(&seg->s->ple_constants, &local);
     }
     seg->ok = 1;
+    /* The segment's ids are known only after its own scan, so the hint runs
+     * between the two passes: every row page is in flight before the first
+     * dequant touches one. */
     for (uint32_t t = seg->t0; t < seg->t1; t++) {
         ds4_ple_row_ids(&seg->s->ple_constants, &local, seg->tokens + t, 1u,
                         seg->s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD);
+    }
+    qw_ple_hint_rows(seg->ple,
+                     seg->s->ple_ids + (uint64_t)seg->t0 * DS4_N_PLE_HEAD,
+                     (uint64_t)(seg->t1 - seg->t0) * DS4_N_PLE_HEAD);
+    for (uint32_t t = seg->t0; t < seg->t1; t++) {
         for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
             const uint64_t row =
                 seg->s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h];
@@ -1304,6 +1355,10 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 s->ple_history_rows[t] = s->ple_history;
             }
         }
+        /* Every id of the batch is known now; put all of the row pages in
+         * flight before the serial dequant touches the first cold one. */
+        qw_ple_hint_rows(&w->ple, s->ple_ids,
+                         (uint64_t)n_tokens * DS4_N_PLE_HEAD);
         for (uint32_t t = 0; t < n_tokens; t++) {
             /* The head's destination strides are constants of the shape, so
              * the token base is hoisted out of the head loop and the head
@@ -1367,6 +1422,8 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
         if (nthreads == 1) {
             ds4_ple_row_ids(&s->ple_constants, &s->ple_history, tokens,
                             n_tokens, s->ple_ids);
+            qw_ple_hint_rows(&w->ple, s->ple_ids,
+                             (uint64_t)n_tokens * DS4_N_PLE_HEAD);
             for (uint32_t t = 0; t < n_tokens; t++) {
                 for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
                     const uint64_t row =
