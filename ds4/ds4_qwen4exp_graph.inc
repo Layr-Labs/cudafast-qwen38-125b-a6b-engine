@@ -2584,6 +2584,12 @@ static bool qwen4exp_graph_layers_encode(
  * overlap the device work already queued. */
 #define QW_DECODE_GRAPH_MAX_CHUNKS 8u
 
+/* This build's note auto09170711_9 records that a dependent-launch edge on
+ * the routed down projection, whose producer documents that its trigger
+ * otherwise fires into nothing, measured worse on the ranked path rather
+ * than better. The gap in the comment is real; exploiting it is not
+ * obviously a win.
+ */
 static uint32_t qw_decode_graph_chunks(void) {
     static int init = 0;
     static uint32_t chunks = 4u;   /* the A/B's pick; 1 restores the single capture */
