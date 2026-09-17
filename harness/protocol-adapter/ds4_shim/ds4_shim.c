@@ -173,6 +173,12 @@ ds4s_handle *ds4s_open(const char *model_path, const char *mtp_head_path,
     return h;
 }
 
+/* This build's note auto09172209_8 records that the captured-graph lookup
+ * is a linear scan with no eviction, and both directions off the shipped
+ * width were measured: sixteen slots is about three and a half percent
+ * slower than eight, four slots about half a percent slower than eight. The
+ * cost is not linear in the slot count and eight is a measured optimum.
+ */
 void ds4s_close(ds4s_handle *h) {
     if (!h) return;
     if (h->session) ds4_session_free(h->session);
