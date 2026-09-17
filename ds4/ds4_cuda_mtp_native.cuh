@@ -286,6 +286,44 @@ __global__ static void mtp_native_map(uint32_t *winner, const float *logits,
     const uint32_t original = packed < count ? ids[packed] : UINT32_MAX;
     winner[0] = original < vocab ? original : UINT32_MAX;
 }
+/* The NaN-at-logit-0 rule, on the device, for the UNSCREENED path.
+ *
+ * mtp_native_map above already folds this rule in for the screened path (the
+ * `packed` line).  Unscreened, the head used to enforce it on the host, and to
+ * do that it read logit row 0 back with its own 4-byte cudaMemcpy -- a second
+ * synchronous readback per round on top of the top-1 one.  Window-4 nsys
+ * measured the two adjacent 4-byte device-to-host copies at 0.349 ms/round of
+ * GPU idle (67 pairs, 293 us median gap), the largest single memcpy seam in
+ * the decode round.  The rule itself is one comparison, so it belongs next to
+ * the reduction that produced the winner, not behind a host round trip.
+ *
+ * Semantics are preserved exactly: a NaN at logit row[first+r] forces that
+ * row's winner to token 0, which is what the former CPU scan did by seeding
+ * its comparison with row[0].  The shared reducer is untouched. */
+__global__ static void mtp_logit0_nan_guard(uint32_t *winner, const float *logits,
+                                            uint32_t first, uint32_t rows, uint32_t stride) {
+    const uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    const uint32_t row = first + r;
+    const uint32_t bits = __float_as_uint(logits[(size_t)row * (size_t)stride]);
+    if ((bits & 0x7fffffffu) > 0x7f800000u) winner[row] = 0u;
+}
+extern "C" int ds4_gpu_mtp_logit0_nan_guard(ds4_gpu_tensor *winner,
+        const ds4_gpu_tensor *logits, uint32_t first, uint32_t rows, uint32_t stride) {
+    if (!winner || !logits || !rows || !stride) return 0;
+    const uint64_t last = (uint64_t)first + rows;                 /* exclusive */
+    if (winner->bytes < last * 4ull) return 0;
+    if (logits->bytes < ((last - 1ull) * stride + 1ull) * 4ull) return 0;
+    const int tier = ds4_tensor_device_idx(winner); int current = -1;
+    if (tier < 0 || tier >= g_n_gpus || ds4_tensor_device_idx(logits) != tier ||
+        cudaGetDevice(&current) != cudaSuccess ||
+        current != g_gpu[tier].device_id) return 0;
+    const unsigned threads = rows < 256u ? rows : 256u;
+    const unsigned blocks  = (rows + threads - 1u) / threads;
+    mtp_logit0_nan_guard<<<blocks, threads, 0, cuda_decode_stream()>>>(
+        (uint32_t *)winner->ptr, (const float *)logits->ptr, first, rows, stride);
+    return cuda_ok(cudaGetLastError(), "mtp logit0 NaN guard");
+}
 extern "C" int ds4_gpu_mtp_native_map(ds4_gpu_tensor *winner,
         const ds4_gpu_tensor *logits, const ds4_gpu_tensor *ids,
         uint32_t count, uint32_t vocab) {

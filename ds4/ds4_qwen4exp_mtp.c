@@ -802,6 +802,27 @@ static ds4_gpu_tensor *mtp_alloc(uint64_t bytes, bool *ok) {
     return t;
 }
 
+/* DS4_MTP_DEVICE_NAN_GUARD: enforce the NaN-at-logit-0 rule on the device
+ * rather than behind a second 4-byte readback per round.  Default ON; set it
+ * to 0/off/no/false to restore the host logit-0 readback.  Both behaviours
+ * live in one binary so the pair can be A/B'd without a rebuild.
+ *
+ * This lives INSIDE the DS4_NO_GPU guard on purpose: its only caller is the
+ * device path, and the CPU check builds with -Wall -Wextra -Werror, where a
+ * defined-but-unused static is a build failure. */
+static int mtp_device_nan_guard_on(void) {
+    static int init = 0;
+    static int on = 1;
+    if (!init) {
+        init = 1;
+        const char *s = getenv("DS4_MTP_DEVICE_NAN_GUARD");
+        if (s && *s)
+            on = (s[0] != '0' && strcmp(s, "off") != 0 &&
+                  strcmp(s, "no") != 0 && strcmp(s, "false") != 0) ? 1 : 0;
+    }
+    return on;
+}
+
 /* One unsigned decimal environment variable.  Unset or empty keeps the
  * fallback; anything that is not exactly a decimal count in uint32 range is a
  * named refusal, because a truncated parse would silently arm the wrong
@@ -1331,6 +1352,17 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
         ok = h->hooks.native_map(h->t_top1, h->t_logits, h->t_native_ids,
                                   draft_width, h->n_vocab) != 0;
     }
+    /* Unscreened, the NaN-at-logit-0 rule can ride along with the reduction
+     * that produced the winner instead of costing a second synchronous 4-byte
+     * readback per round (see the logit-0 block below, and the kernel comment
+     * in ds4_cuda_mtp_native.cuh).  A backend that declines leaves
+     * device_nan_guard false and the host path below still runs, so this is an
+     * acceleration, never a behaviour switch. */
+    bool device_nan_guard = false;
+    if (ok && !screened && mtp_device_nan_guard_on()) {
+        device_nan_guard = ds4_gpu_mtp_logit0_nan_guard(
+                h->t_top1, h->t_logits, logit_first, out_rows, draft_width) != 0;
+    }
     MTP_HEAD_TICK(MTP_HEAD_T_TOP1);
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
@@ -1374,7 +1406,7 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
             if (have1) h->last_margin = v0 - v1;
         }
     }
-    if (ok && !screened) {
+    if (ok && !screened && !device_nan_guard) {
         stage = "logit-0 readback";
         for (uint32_t t = 0; ok && t < out_rows; t++) {
             float logit0;
