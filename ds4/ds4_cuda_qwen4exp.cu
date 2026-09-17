@@ -14041,8 +14041,36 @@ static uint32_t qwen4exp_qsa_split_width(uint32_t n_tokens, uint32_t n_head,
         return (v > 0 && v <= 32) ? (uint32_t)v : 0u;
     }
     /* One model-shaped row benefits from twice as many independent head
-     * groups. Multi-row calls retain four heads and their K/V reuse. */
-    return n_tokens == 1u && n_head == 24u && n_kv_head == 2u && head_dim == 256u
+     * groups.  The two-row verify forward benefits MORE, not less, so it takes
+     * the same width; wider calls retain four heads and their K/V reuse.
+     *
+     * The grid is (n_head/g, max_tiles, n_tokens) and a block's work is
+     * proportional to g, so g trades block count against work per block at
+     * constant total work.  At this shape only the first ceil(count/256) tile
+     * rows survive the `base >= count` guard, which is 5 at the benchmark's
+     * context, so the blocks that actually run are 5 * n_tokens * 24/g:
+     *
+     *     one row,  g=4 -> 30 blocks of 4 units;  makespan 4 units on 48 SMs
+     *     one row,  g=2 -> 60 blocks of 2 units;  makespan 4 units
+     *     two rows, g=4 -> 60 blocks of 4 units;  makespan 8 units
+     *     two rows, g=2 -> 120 blocks of 2 units; makespan 6 units
+     *
+     * At one row the quantization is a wash (4 against 4) and the measured win
+     * came from elsewhere -- occupancy, or simply more requests in flight.  At
+     * two rows the quantization is NOT a wash: 60/48 rounds up to two waves
+     * and wastes 37% of the device, while 120/48 rounds up to three half-waves
+     * and wastes 17%.  Both effects point the same way here.
+     *
+     * Halving g also halves this path's shared footprint (the probs kernel
+     * goes 9216 -> 5120 bytes, the scores kernel 41088 -> 38976), so residency
+     * cannot get worse.  Scratch is sized from (n_tokens, n_head, max_tiles)
+     * and does not mention g, so no width can overflow it.
+     *
+     * The K rows a block reads are shared by every group with the same
+     * kv_head, so halving g doubles how many blocks ask for the same lines --
+     * but at two rows the token axis already duplicates those reads, and the
+     * unique K per layer is ~2.5 MB, which L2 holds. */
+    return n_tokens <= 2u && n_head == 24u && n_kv_head == 2u && head_dim == 256u
         ? 2u : 4u;
 }
 
