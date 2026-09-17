@@ -1459,8 +1459,8 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 "ds4: qwen4exp PLE gather %u rows took %.3f ms\n",
                 n_tokens, (now_sec() - gather_t0) * 1000.0);
     }
-    if (!ds4_gpu_tensor_write(s->ple_rows, 0, s->ple_rows_host,
-                              (uint64_t)n_tokens * DS4_N_PLE_EMBD * sizeof(float))) {
+    if (!ds4_gpu_tensor_write_async(s->ple_rows, 0, s->ple_rows_host,
+                                    (uint64_t)n_tokens * DS4_N_PLE_EMBD * sizeof(float))) {
         fprintf(stderr, "ds4: qwen4exp n-gram row upload failed at block %u\n", il);
         return false;
     }
@@ -2199,7 +2199,7 @@ static void qwen4exp_trace(qwen4exp_slice slice) {
         g_qwen4exp_time_slices = getenv("DS4_QWEN4EXP_TIME_SLICES") != NULL;
     }
     if (!g_qwen4exp_time_slices) return;
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize() ||
+    if (!ds4_gpu_end_commands_sync() ||
         !ds4_gpu_begin_commands()) {
         return;
     }
@@ -2524,7 +2524,7 @@ static void qwen4exp_layer_dump(ds4_qwen4exp_session *s, uint32_t il,
         return;
     }
     if (!qwen4exp_hc_flush_pending(s, n_tokens)) return;
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) return;
+    if (!ds4_gpu_end_commands_sync()) return;
     const uint64_t hc = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t n = (uint64_t)n_tokens * hc;
     float *buf = malloc((size_t)n * sizeof(float));
@@ -2898,8 +2898,8 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         return false;
     }
 
-    if (!ds4_gpu_tensor_write(s->tokens, 0, tokens,
-                              (uint64_t)n_tokens * sizeof(int32_t))) {
+    if (!ds4_gpu_tensor_write_async(s->tokens, 0, tokens,
+                                    (uint64_t)n_tokens * sizeof(int32_t))) {
         fprintf(stderr, "ds4: qwen4exp token upload failed\n");
         return false;
     }
@@ -3076,7 +3076,7 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     QW_TRACE(QW_SLICE_HEAD);
     QW_TRACE_REPORT(n_tokens);
     /* Commit and wait: the logits are read on the host from here on. */
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
+    if (!ds4_gpu_end_commands_sync()) {
         fprintf(stderr, "ds4: qwen4exp command batch did not complete\n");
         return false;
     }
@@ -3129,7 +3129,7 @@ static bool qwen4exp_session_copy_layers(ds4_qwen4exp_session *s,
                                      (uint64_t)row * bytes, bytes) != 0;
         }
     }
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) return false;
+    if (!ds4_gpu_end_commands_sync()) return false;
     if (ok && recurrent) s->gdn_replay_previous = false;
     return ok;
 }
@@ -3682,7 +3682,7 @@ bool ds4_qwen4exp_graph_head_logits(ds4_qwen4exp_session       *s,
 
     const uint64_t row_bytes =
         (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
-    if (!ds4_gpu_tensor_write(s->hyper, 0, hc_row, row_bytes)) {
+    if (!ds4_gpu_tensor_write_async(s->hyper, 0, hc_row, row_bytes)) {
         fprintf(stderr, "ds4: qwen4exp head row upload failed\n");
         return false;
     }
@@ -3704,7 +3704,7 @@ bool ds4_qwen4exp_graph_head_logits(ds4_qwen4exp_session       *s,
         fprintf(stderr, "ds4: qwen4exp LM head failed on the head row\n");
         return qwen4exp_forward_fail();
     }
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
+    if (!ds4_gpu_end_commands_sync()) {
         fprintf(stderr, "ds4: qwen4exp command batch did not complete\n");
         return false;
     }
@@ -3902,7 +3902,7 @@ static int qwen4exp_rb_ple_conv_select(void *ctx, uint32_t row) {
     const bool ok = ds4_gpu_tensor_copy(s->ple_conv_state, 0,
                                         s->ple_conv_snapshot,
                                         (uint64_t)row * bytes, bytes) != 0;
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) return -1;
+    if (!ds4_gpu_end_commands_sync()) return -1;
     return ok ? 0 : -1;
 }
 static int qwen4exp_rb_qsa_kv_truncate(void *ctx, uint32_t pos) {
@@ -4048,7 +4048,7 @@ int ds4_qwen4exp_test_head_block_run(const char *target_path,
             ds4_gpu_begin_commands()) {
             ok1 = ds4_qwen4exp_graph_head_block(&ctx, s, hyper,
                                                 head_w.block_index, 0u, n_tokens);
-            if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) ok1 = 0;
+            if (!ds4_gpu_end_commands_sync()) ok1 = 0;
         }
         if (ok1) (void)ds4_gpu_tensor_read(hyper, 0, a, bytes);
 
@@ -4056,7 +4056,7 @@ int ds4_qwen4exp_test_head_block_run(const char *target_path,
             ds4_gpu_begin_commands()) {
             ok2 = ds4_qwen4exp_graph_head_block(&ctx, s, hyper,
                                                 head_w.block_index, 0u, n_tokens);
-            if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) ok2 = 0;
+            if (!ds4_gpu_end_commands_sync()) ok2 = 0;
         }
         if (ok2) (void)ds4_gpu_tensor_read(hyper, 0, b, bytes);
 

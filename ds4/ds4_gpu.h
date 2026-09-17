@@ -108,6 +108,18 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
                                              const char *label);
 #endif
 int ds4_gpu_end_commands(void);
+/* Commit the open batch and wait for the device in one call.  On CUDA the
+ * pair `end_commands(); synchronize();` runs cudaDeviceSynchronize twice;
+ * this is the same wait once.  Semantics are the pair's: the device is
+ * quiescent when it returns nonzero. */
+int ds4_gpu_end_commands_sync(void);
+/* Enqueue a host-to-device copy on the legacy stream and return once the
+ * driver has staged the source, without waiting for the DMA to drain.
+ * Stream ordering makes the bytes visible to every later kernel exactly as
+ * the blocking write did; the source may be pageable because the driver
+ * copies it into its own staging buffer before returning. */
+int ds4_gpu_tensor_write_async(ds4_gpu_tensor *tensor, uint64_t offset,
+                               const void *data, uint64_t bytes);
 int ds4_gpu_synchronize(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
