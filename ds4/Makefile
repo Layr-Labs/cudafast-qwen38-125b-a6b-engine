@@ -99,7 +99,7 @@ endif
 # The release path does not need debug line tables: -lineinfo exists for
 # profiler attribution, and nothing in the scored path consumes it.  Dropping
 # -g -lineinfo keeps the shipped cubin lean without changing code generation.
-NVCCFLAGS ?= -O3 --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
+NVCCFLAGS ?= -O3 --use_fast_math --extra-device-vectorization $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 # The Qwen4-Exp kernels are their own translation unit so they can drop fast
 # math: --use_fast_math would substitute __cosf/__sinf in the QSA rope, whose
 # angle reaches the position index itself, and flush the GDN decays and the
