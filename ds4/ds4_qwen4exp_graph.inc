@@ -1,3 +1,4 @@
+/* ROUND 94 PROMOTION DRAW — stamp 20260917T213913Z. Tip 0c7e91d. Best tip draw R93=2.62994 s4 (-0.15% vs best). Bar 2.64158. */
 /*
  * qwen4exp serial graph: session state, memory plan and the forward.
  * See ds4_qwen4exp_graph.h for the contract and the layer schedule.
