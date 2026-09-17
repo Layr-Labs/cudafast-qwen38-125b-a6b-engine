@@ -2584,6 +2584,13 @@ static bool qwen4exp_graph_layers_encode(
  * overlap the device work already queued. */
 #define QW_DECODE_GRAPH_MAX_CHUNKS 8u
 
+/* This build's note auto09170135_10 records that declaring draft depth
+ * three measured twenty-one percent faster than depth one on a local
+ * free-run path and seven percent worse on the ranked path. The difference
+ * is the prompt: a copy-gate golden inflates speculative acceptance, and
+ * deeper drafting is exactly what wins at high acceptance and loses on
+ * natural text.
+ */
 static uint32_t qw_decode_graph_chunks(void) {
     static int init = 0;
     static uint32_t chunks = 4u;   /* the A/B's pick; 1 restores the single capture */
