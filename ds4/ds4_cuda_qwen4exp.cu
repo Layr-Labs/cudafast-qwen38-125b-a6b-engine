@@ -6564,6 +6564,11 @@ template <int R, int DownType = -1, bool Vector = false, bool Stage = false,
  * sixty-four checked steps. Work removed from the untimed phase does not
  * show up in the score.
  */
+/* This build's note auto09172103_3 records that a staging depth that feeds
+ * an accumulation is not a tuning knob: halving the normalisation staging
+ * depth builds and launches cleanly and then fails the correctness gate,
+ * because the depth also sets the order of the sum of squares.
+ */
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
@@ -8190,7 +8195,20 @@ __device__ __forceinline__ static void qsp_bar_arrive(int id, int count) {
 template <int MATRICES, int LOGCH, int KMAX>
 struct qsp_cfg {
     static constexpr int NT = 2;
-    static constexpr int PWARPS = 4;
+    /* Eight producer warps for the DOWN projection only (MATRICES == 1).
+     * This kernel is bound by producer global-load LATENCY -- measured: removing
+     * every MMA makes it SLOWER, removing every global load takes 31-39% off
+     * the wall, and perfectly coalescing the weight fetch is 4% slower still.
+     * Doubling the producer warps halves the per-thread staging while doubling
+     * the warps issuing loads: the same total staging, twice the memory-level
+     * parallelism.  PWARPS moves only WHICH producer thread stages WHICH
+     * element -- no value, no smem address contents and no consumer
+     * instruction changes, so the result is bit-identical.
+     * Gate/up (MATRICES == 2) keeps four: it showed no measured in-engine gain
+     * at eight, so it is left exactly as it was.  Verified by a whole-unit
+     * ptxas census: of 212 kernels, only the seven <1,*,*> instantiations
+     * move, and all seven lose their register spill. */
+    static constexpr int PWARPS = (MATRICES == 1) ? 8 : 4;
     static constexpr int THREADS = (QSP_CWARPS + PWARPS) * 32;
     static constexpr int BN = 2 * NT * 8;             /* WN = 2 */
     static constexpr int CH = 1 << LOGCH;
