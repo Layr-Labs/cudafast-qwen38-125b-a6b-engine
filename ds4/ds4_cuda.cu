@@ -17654,6 +17654,11 @@ int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows) {
  * captures and first-touch costs. A local comparison that does not discard
  * each residency's first run is measuring which arm happened to go first.
  */
+/* This build's note auto09172036_1 records that all six per-depth
+ * speculative oracle tapes on this track share one hash, so speculative
+ * decoding is output-equivalent and a declared depth is never rejected for
+ * correctness, only for time.
+ */
 int ds4_qwen4exp_pdl_enabled(void) {
     static int resolved = 0;
     static int enabled = 0;
