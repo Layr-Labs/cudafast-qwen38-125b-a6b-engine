@@ -1,3 +1,4 @@
+/* ROUND 98 PROMOTION DRAW — stamp 20260917T225142Z. Tip eba814d. R96/R97 both spark-5 nonqual. Bar 2.649466. */
 /*
  * qwen4exp serial graph: session state, memory plan and the forward.
  * See ds4_qwen4exp_graph.h for the contract and the layer schedule.
