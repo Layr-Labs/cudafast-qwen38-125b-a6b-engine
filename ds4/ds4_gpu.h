@@ -108,6 +108,11 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
                                              const char *label);
 #endif
 int ds4_gpu_end_commands(void);
+/* Commit the open batch and wait for the device in one call.  On CUDA the
+ * pair `end_commands(); synchronize();` runs cudaDeviceSynchronize twice;
+ * this is the same wait once.  Semantics are the pair's: the device is
+ * quiescent when it returns nonzero. */
+int ds4_gpu_end_commands_sync(void);
 int ds4_gpu_synchronize(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
@@ -3990,6 +3995,21 @@ int  ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key);
 int  ds4_gpu_qwen4exp_update_dpos(
         ds4_gpu_tensor *d_pos,
         uint32_t        pos);
+
+/* Stream-ordered host transfers for the qwen4exp round path.  Unlike
+ * ds4_gpu_tensor_write/read these enqueue the copy on the decode stream and
+ * return without waiting for the device: an upload is ordered before every
+ * kernel the same stream runs next, and a read is ordered after the work that
+ * produced the data, so the caller pays one ds4_gpu_synchronize() for a whole
+ * group of transfers instead of one blocking cudaMemcpy round-trip each.
+ * During decode-graph capture they fall back to the synchronous form. */
+int  ds4_gpu_tensor_write_stream(ds4_gpu_tensor *tensor, uint64_t offset,
+                                 const void *data, uint64_t bytes);
+int  ds4_gpu_tensor_read_stream(const ds4_gpu_tensor *tensor, uint64_t offset,
+                                void *data, uint64_t bytes);
+int  ds4_gpu_tensor_copy_stream(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                                const ds4_gpu_tensor *src, uint64_t src_offset,
+                                uint64_t bytes);
 
 int  ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key);

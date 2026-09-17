@@ -3546,6 +3546,72 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
     return ok;
 }
 
+/* See ds4_gpu.h.  The decode path's kernels all ride cuda_decode_stream(),
+ * which is the legacy default stream outside graph capture, so a copy
+ * enqueued on it is ordered exactly where the synchronous cudaMemcpy's
+ * implicit serialization already put it: after the work that produced the
+ * source and before the kernels that consume the destination.  What changes
+ * is the host: cudaMemcpy blocks the caller until the bytes have moved, so a
+ * loop of them (the GDN rollback's per-layer copies) or a transfer ahead of a
+ * batch (the token and PLE row uploads) pays one host round-trip apiece and
+ * serializes the copies against each other.  The async forms enqueue and
+ * return; the batch's own end_commands_sync -- or the caller's one
+ * ds4_gpu_synchronize() -- is the single wait that covers them all.
+ *
+ * During decode-graph capture the synchronous form is what the old code ran
+ * and it fails the capture the same way, so these keep that behaviour rather
+ * than silently recording a copy whose host pointer may not survive replay. */
+extern "C" int ds4_gpu_tensor_write_stream(ds4_gpu_tensor *tensor, uint64_t offset,
+                                           const void *data, uint64_t bytes) {
+    if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
+    if (g_decode_graph_capturing) return ds4_gpu_tensor_write(tensor, offset, data, bytes);
+    int d = ds4_tensor_device_idx(tensor);
+    int ok = 0;
+    WITH_DEVICE(g_gpu[d].device_id) {
+        ok = cuda_ok(cudaMemcpyAsync((char *)tensor->ptr + offset, data,
+                                   (size_t)bytes, cudaMemcpyHostToDevice,
+                                   cuda_decode_stream()),
+                     "tensor write stream");
+    }
+    return ok;
+}
+
+extern "C" int ds4_gpu_tensor_read_stream(const ds4_gpu_tensor *tensor, uint64_t offset,
+                                          void *data, uint64_t bytes) {
+    if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
+    if (g_decode_graph_capturing) return ds4_gpu_tensor_read(tensor, offset, data, bytes);
+    int d = ds4_tensor_device_idx(tensor);
+    int ok = 0;
+    WITH_DEVICE(g_gpu[d].device_id) {
+        ok = cuda_ok(cudaMemcpyAsync(data, (const char *)tensor->ptr + offset,
+                                   (size_t)bytes, cudaMemcpyDeviceToHost,
+                                   cuda_decode_stream()),
+                     "tensor read stream");
+    }
+    return ok;
+}
+
+extern "C" int ds4_gpu_tensor_copy_stream(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                                          const ds4_gpu_tensor *src, uint64_t src_offset,
+                                          uint64_t bytes) {
+    if (!dst || !src || dst_offset > dst->bytes || src_offset > src->bytes ||
+        bytes > dst->bytes - dst_offset || bytes > src->bytes - src_offset) {
+        return 0;
+    }
+    if (bytes == 0) return 1;
+    int d = ds4_tensor_device_idx(dst);
+    int ok = 0;
+    WITH_DEVICE(g_gpu[d].device_id) {
+        ok = cuda_ok(cudaMemcpyAsync((char *)dst->ptr + dst_offset,
+                                   (const char *)src->ptr + src_offset,
+                                   (size_t)bytes,
+                                   cudaMemcpyDeviceToDevice,
+                                   cuda_decode_stream()),
+                     "tensor copy stream");
+    }
+    return ok;
+}
+
 __global__ static void moe_handoff_pack_kernel(
         unsigned char *packed,
         const float *ffn_norm,
@@ -4059,6 +4125,14 @@ extern "C" int ds4_gpu_end_commands(void) {
         return cuda_ok(cudaStreamSynchronize(0), "end commands stream");
     }
     return cuda_ok(cudaDeviceSynchronize(), "end commands");
+}
+/* The pair end_commands + synchronize is two device synchronises back to
+ * back; the second can only ever observe the first one's quiescence, so one
+ * cudaDeviceSynchronize is the whole contract, with or without
+ * DS4_CUDA_END_STREAM_SYNC (stream-0 copies never waited on the non-blocking
+ * streams either way). */
+extern "C" int ds4_gpu_end_commands_sync(void) {
+    return cuda_ok(cudaDeviceSynchronize(), "end commands sync");
 }
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
 

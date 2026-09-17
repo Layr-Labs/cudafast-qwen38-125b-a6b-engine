@@ -6089,6 +6089,32 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                    "tensor copy enqueue");
 }
 
+/* Stream-ordered forms mirroring the CUDA backend: on ROCm the synchronous
+ * tensor_copy already enqueues on stream 0, so these are the same calls the
+ * blocking names make, kept as separate entry points so the graph code can
+ * name the intent on both backends. */
+extern "C" int ds4_gpu_tensor_write_stream(ds4_gpu_tensor *tensor, uint64_t offset,
+                                           const void *data, uint64_t bytes) {
+    if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
+    return cuda_ok(cudaMemcpyAsync((char *)tensor->ptr + offset, data,
+                                   (size_t)bytes, cudaMemcpyHostToDevice, 0),
+                   "tensor write stream");
+}
+
+extern "C" int ds4_gpu_tensor_read_stream(const ds4_gpu_tensor *tensor, uint64_t offset,
+                                          void *data, uint64_t bytes) {
+    if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
+    return cuda_ok(cudaMemcpyAsync(data, (const char *)tensor->ptr + offset,
+                                   (size_t)bytes, cudaMemcpyDeviceToHost, 0),
+                   "tensor read stream");
+}
+
+extern "C" int ds4_gpu_tensor_copy_stream(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                                          const ds4_gpu_tensor *src, uint64_t src_offset,
+                                          uint64_t bytes) {
+    return ds4_gpu_tensor_copy(dst, dst_offset, src, src_offset, bytes);
+}
+
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
 extern "C" int ds4_gpu_flush_encoder(void) { return ds4_gpu_flush_commands(); }
@@ -6131,6 +6157,9 @@ extern "C" int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const 
 }
 extern "C" int ds4_gpu_end_commands(void) {
     return cuda_ok(cudaDeviceSynchronize(), "end commands");
+}
+extern "C" int ds4_gpu_end_commands_sync(void) {
+    return cuda_ok(cudaDeviceSynchronize(), "end commands sync");
 }
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
 
