@@ -327,8 +327,9 @@ struct ds4_qwen4exp_session {
     ds4_ple_constants ple_constants;
     bool              ple_ready;      /* the hash constants were readable */
     uint64_t         *ple_ids;        /* host [n_batch][head_count]       */
-    float            *ple_rows_host;  /* host [n_batch][ple_embd]         */
+    uint8_t          *ple_quant_host; /* host [n_batch][head][row_bytes]  */
     ds4_gpu_tensor   *ple_conv_state; /* [state_rows][n_hc * n_embd]      */
+    ds4_gpu_tensor   *ple_quant;      /* packed gathered rows             */
     ds4_gpu_tensor   *ple_rows;       /* [n_batch][ple_embd]              */
     ds4_gpu_tensor   *ple_key;        /* key projection, then the gate    */
     ds4_gpu_tensor   *ple_aux;        /* query, then the convolution input */
@@ -755,6 +756,8 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
     {
         s->ple_conv_state = qwen4exp_alloc_zeroed(
             (uint64_t)DS4_QWEN4EXP_PLE_STATE_ROWS * H * E * f, &ok);
+        s->ple_quant = qwen4exp_alloc_zeroed(
+            (uint64_t)B * DS4_N_PLE_HEAD * w->ple.row_bytes, &ok);
         s->ple_rows  = qwen4exp_alloc_zeroed(B * DS4_N_PLE_EMBD * f, &ok);
         s->ple_conv_snapshot = qwen4exp_alloc_zeroed(
             ds4_gpu_tensor_bytes(s->ple_conv_state) *
@@ -763,9 +766,9 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
         s->ple_aux   = qwen4exp_alloc_zeroed(B * H * E * f, &ok);
         s->ple_value = qwen4exp_alloc_zeroed(B * E * f, &ok);
         if (ok) {
-            s->ple_ids = calloc((size_t)B * DS4_N_PLE_HEAD, sizeof(uint64_t));
-            s->ple_rows_host = calloc((size_t)B * DS4_N_PLE_EMBD, sizeof(float));
-            ok = s->ple_ids != NULL && s->ple_rows_host != NULL;
+            s->ple_quant_host = malloc(
+                (size_t)B * DS4_N_PLE_HEAD * w->ple.row_bytes);
+            ok = s->ple_ids != NULL && s->ple_quant_host != NULL;
         }
         if (ok) {
             s->ple_ready = qwen4exp_ple_read_constants(m, w, &s->ple_constants);
@@ -887,8 +890,9 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->ple_key);
     ds4_gpu_tensor_free(s->ple_aux);
     ds4_gpu_tensor_free(s->ple_value);
+    ds4_gpu_tensor_free(s->ple_quant);
     free(s->ple_ids);
-    free(s->ple_rows_host);
+    free(s->ple_quant_host);
     ds4_gpu_tensor_free(s->d_pos);
     ds4_gpu_tensor_free(s->d_adopt);
     ds4_gpu_tensor_free(s->d_gdn_replay);
@@ -1082,8 +1086,8 @@ void ds4_qwen4exp_session_reset(ds4_qwen4exp_session *s) {
  * token itself and the (ngram - 1) tokens before it, so a segment's entry
  * history is reproduced exactly by warming a fresh history over the tokens
  * that precede the segment (a reset history is all EOS, which is what the
- * sequential scan starts from too).  Each thread then reads and dequantizes
- * into its own disjoint slice of ple_rows_host, byte for byte what the serial
+ * sequential scan starts from too).  Each thread then reads and packs rows
+ * into its own disjoint slice of ple_quant_host, byte for byte what the serial
  * loop would have written.  The tail segment's history becomes the session's
  * carried history, which is the state the sequential scan would have ended
  * with.  No number the device sees changes; only the wall time does.
@@ -1135,15 +1139,16 @@ static void *qw_ple_gather_worker(void *arg) {
     for (uint32_t t = seg->t0; t < seg->t1; t++) {
         ds4_ple_row_ids(&seg->s->ple_constants, &local, seg->tokens + t, 1u,
                         seg->s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD);
+        const size_t row_bytes = (size_t)seg->ple->row_bytes;
         for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
             const uint64_t row =
                 seg->s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h];
             const uint8_t *quant = ds4_qwen4exp_ple_row(seg->ple, row);
             if (!quant) { seg->ok = 0; return NULL; }
-            ds4_ple_dequant_iq4_nl(
-                quant, seg->blocks_per_row,
-                seg->s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD +
-                    (uint64_t)h * DS4_N_PLE_ROW_DIM);
+            memcpy(seg->s->ple_quant_host +
+                       (size_t)t * DS4_N_PLE_HEAD * row_bytes +
+                       (size_t)h * row_bytes,
+                   quant, row_bytes);
         }
     }
     return NULL;
@@ -1299,13 +1304,15 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 s->ple_history_rows[t] = s->ple_history;
             }
         }
+        const size_t row_bytes = (size_t)w->ple.row_bytes;
         for (uint32_t t = 0; t < n_tokens; t++) {
             /* The head's destination strides are constants of the shape, so
              * the token base is hoisted out of the head loop and the head
              * offset is carried as a pointer step instead of a multiply per
              * head.  Same addresses, same values. */
             const uint64_t *ids = s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD;
-            float *dst = s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD;
+            uint8_t *dst = s->ple_quant_host +
+                           (size_t)t * DS4_N_PLE_HEAD * row_bytes;
             for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
                 const uint64_t row = ids[h];
                 /* Every head of this token except the last is followed by
@@ -1322,8 +1329,8 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                             il, t, h, row, w->ple.rows);
                     return false;
                 }
-                ds4_ple_dequant_iq4_nl(quant, blocks_per_row, dst);
-                dst += DS4_N_PLE_ROW_DIM;
+                memcpy(dst, quant, row_bytes);
+                dst += row_bytes;
             }
         }
     } else {
@@ -1362,6 +1369,7 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
         if (nthreads == 1) {
             ds4_ple_row_ids(&s->ple_constants, &s->ple_history, tokens,
                             n_tokens, s->ple_ids);
+            const size_t row_bytes = (size_t)w->ple.row_bytes;
             for (uint32_t t = 0; t < n_tokens; t++) {
                 for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
                     const uint64_t row =
@@ -1375,10 +1383,10 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                                 il, t, h, row, w->ple.rows);
                         return false;
                     }
-                    ds4_ple_dequant_iq4_nl(
-                        quant, blocks_per_row,
-                        s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD +
-                            (uint64_t)h * DS4_N_PLE_ROW_DIM);
+                    memcpy(s->ple_quant_host +
+                               (size_t)t * DS4_N_PLE_HEAD * row_bytes +
+                               (size_t)h * row_bytes,
+                           quant, row_bytes);
                 }
             }
         } else {
@@ -1459,8 +1467,21 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 "ds4: qwen4exp PLE gather %u rows took %.3f ms\n",
                 n_tokens, (now_sec() - gather_t0) * 1000.0);
     }
-    if (!ds4_gpu_tensor_write(s->ple_rows, 0, s->ple_rows_host,
-                              (uint64_t)n_tokens * DS4_N_PLE_EMBD * sizeof(float))) {
+    /* The packed rows cross the bus at a seventh of the float block's size;
+     * the device dequant writes the same bits the host loop used to stage. */
+    const uint64_t quant_bytes =
+        (uint64_t)n_tokens * DS4_N_PLE_HEAD * w->ple.row_bytes;
+    if (quant_bytes % DS4_PLE_IQ4_NL_BLOCK_BYTES != 0u) {
+        fprintf(stderr,
+                "ds4: qwen4exp n-gram row of %" PRIu64 " bytes is not whole "
+                "IQ4_NL blocks at block %u\n",
+                (uint64_t)w->ple.row_bytes, il);
+        return false;
+    }
+    if (!ds4_gpu_tensor_write(s->ple_quant, 0, s->ple_quant_host, quant_bytes) ||
+        !ds4_gpu_qwen4exp_ple_dequant_tensor(
+            s->ple_rows, s->ple_quant,
+            (uint32_t)(quant_bytes / DS4_PLE_IQ4_NL_BLOCK_BYTES))) {
         fprintf(stderr, "ds4: qwen4exp n-gram row upload failed at block %u\n", il);
         return false;
     }

@@ -4238,6 +4238,14 @@ int ds4_gpu_qwen4exp_ple_conv_tensor(
         uint32_t              conv_kernel,
         uint32_t              dilation,
         uint32_t              rows);
+/* Dequantize `n_blocks` consecutive 18-byte IQ4_NL blocks into 32 floats
+ * each -- the device half of the n-gram row gather, bit-identical to
+ * ds4_ple_dequant_iq4_nl.  `blocks` is the packed upload; `out` is the
+ * [rows][ple_embd] float block the PLE kernels consume. */
+int ds4_gpu_qwen4exp_ple_dequant_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *blocks,
+        uint32_t              n_blocks);
 
 /* The whole PLE block over already-gathered n-gram rows, composed out of the
  * two kernels above, the grouped RMS norm and the Q8_0 matmul.  This is the
