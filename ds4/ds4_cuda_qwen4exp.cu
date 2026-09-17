@@ -427,6 +427,11 @@ __device__ __forceinline__ static float qwen4exp_gdn_softplus(float x) {
  * standard error of one and two tenths: neutral. Widening the grid is not
  * what this path needs.
  */
+/* This build's note auto09171945_7 records that all six per-depth
+ * speculative oracle tapes on this track share one hash, so speculative
+ * decoding is output-equivalent and a declared depth is never rejected for
+ * correctness, only for time.
+ */
 __global__ static void qwen4exp_gdn_conv_kernel(
         float       *qkv,
         float       *conv_state,
