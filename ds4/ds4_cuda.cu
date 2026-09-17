@@ -245,6 +245,19 @@ int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
 static void   *g_xdev_bounce[DS4_MAX_GPUS][DS4_MAX_GPUS];
 static size_t  g_xdev_bounce_bytes[DS4_MAX_GPUS][DS4_MAX_GPUS];
 
+/* Per-device pinned staging for synchronous host copies in
+ * ds4_gpu_tensor_read / ds4_gpu_tensor_write.  A pageable cudaMemcpy is
+ * staged through the driver's own bounce buffers in ~64 KiB chunks with a
+ * host sync per chunk; one pinned buffer turns the same call into a single
+ * DMA burst plus one host memcpy.  Lazily grown to the largest copy seen,
+ * same lifetime and single-caller discipline as the xdev bounce scheme. */
+static void   *g_copy_stage[DS4_MAX_GPUS];
+static size_t  g_copy_stage_bytes[DS4_MAX_GPUS];
+
+/* Below this size a pageable copy is one driver chunk anyway, so the extra
+ * host memcpy would be pure overhead. */
+#define DS4_COPY_STAGE_MIN 65536u
+
 /* Internal helper: resolve a tensor's device index. -1 (untagged) is
  * treated as device 0 for legacy callers. */
 static inline int ds4_tensor_device_idx(const ds4_gpu_tensor *t) {
@@ -461,6 +474,18 @@ static uint64_t g_stream_selected_stage_bytes;
 static cudaStream_t g_stream_selected_upload_stream;
 
 static int cuda_ok(cudaError_t err, const char *what);
+static void *cuda_copy_stage(int d, uint64_t bytes) {
+    if (bytes > (uint64_t)g_copy_stage_bytes[d]) {
+        void *p = NULL;
+        if (!cuda_ok(cudaMallocHost(&p, (size_t)bytes), "copy stage alloc")) {
+            return NULL;
+        }
+        if (g_copy_stage[d]) (void)cudaFreeHost(g_copy_stage[d]);
+        g_copy_stage[d] = p;
+        g_copy_stage_bytes[d] = (size_t)bytes;
+    }
+    return g_copy_stage[d];
+}
 extern "C" void ds4_gpu_decode_graphs_invalidate(void);
 static const char *cuda_model_range_ptr_from_fd(
         const void *model_map,
@@ -3495,9 +3520,18 @@ extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, con
     int d = ds4_tensor_device_idx(tensor);
     int ok = 0;
     WITH_DEVICE(g_gpu[d].device_id) {
-        ok = cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, data, (size_t)bytes,
-                                cudaMemcpyHostToDevice),
-                     "tensor write");
+        void *stage = bytes >= DS4_COPY_STAGE_MIN ? cuda_copy_stage(d, bytes) : NULL;
+        if (stage) {
+            memcpy(stage, data, (size_t)bytes);
+            ok = cuda_ok(cudaMemcpyAsync((char *)tensor->ptr + offset, stage,
+                                       (size_t)bytes, cudaMemcpyHostToDevice, 0),
+                         "tensor write staged");
+            if (ok) ok = cuda_ok(cudaStreamSynchronize(0), "tensor write sync");
+        } else {
+            ok = cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, data, (size_t)bytes,
+                                    cudaMemcpyHostToDevice),
+                         "tensor write");
+        }
     }
     return ok;
 }
@@ -3507,9 +3541,18 @@ extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset
     int d = ds4_tensor_device_idx(tensor);
     int ok = 0;
     WITH_DEVICE(g_gpu[d].device_id) {
-        ok = cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes,
-                                cudaMemcpyDeviceToHost),
-                     "tensor read");
+        void *stage = bytes >= DS4_COPY_STAGE_MIN ? cuda_copy_stage(d, bytes) : NULL;
+        if (stage) {
+            ok = cuda_ok(cudaMemcpyAsync(stage, (const char *)tensor->ptr + offset,
+                                         (size_t)bytes, cudaMemcpyDeviceToHost, 0),
+                         "tensor read staged");
+            if (ok) ok = cuda_ok(cudaStreamSynchronize(0), "tensor read sync");
+            if (ok) memcpy(data, stage, (size_t)bytes);
+        } else {
+            ok = cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes,
+                                    cudaMemcpyDeviceToHost),
+                         "tensor read");
+        }
     }
     return ok;
 }
