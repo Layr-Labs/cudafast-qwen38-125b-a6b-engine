@@ -154,78 +154,11 @@ int ds4_gpu_qwen4exp_hc_mixer_tensor(
 #ifdef DS4_QWEN4EXP_HC_HAVE_FUSED
     if (!ds4_qwen4exp_hc_fuse_off()) {
         const int fused =
-            qwen4exp_hc_mixer_fused_cuda(DS4_QWEN4EXP_HC_MIXER_ARGS, NULL, NULL,
-                                         NULL, NULL, NULL);
+            qwen4exp_hc_mixer_fused_cuda(DS4_QWEN4EXP_HC_MIXER_ARGS, NULL, NULL);
         if (fused >= 0) return fused;
     }
 #endif
     return qwen4exp_hc_mixer_chain(DS4_QWEN4EXP_HC_MIXER_ARGS);
-}
-
-/* ds4_gpu_qwen4exp_hc_mixer_tensor, and the Q8_0 row quantize of `mixed` that
- * every projection behind it reads, as ONE call.
- *
- * ds4_gpu_qwen4exp_hc_mixer_tensor(...) followed by
- * ds4_gpu_quantize_q8_0_decode_rows_exact_tensor(q8, q_offset, s_offset,
- * mixed, n_embd, rows) computes exactly what this does, and that pair IS the
- * definition: a backend may fold the quantize into the mixer's own pass over
- * the row it is already storing, but `mixed` must hold the same floats on
- * return and the Q8_0 bytes and block scales must be the pair's bit for bit.
- *
- * `*folded` reports whether the quantize was taken -- 1 means the caller must
- * NOT run it, 0 means this behaved as the plain mixer and the caller still
- * owes the quantize.  A backend with no fold, a shape the fold does not serve
- * and a Q8_0 buffer that overlaps an input all report 0, so the caller's
- * fallback is the unchanged pair rather than a refusal. */
-int ds4_gpu_qwen4exp_hc_mixer_q8_tensor(
-        ds4_gpu_tensor       *mixed,
-        ds4_gpu_tensor       *inject,
-        ds4_gpu_tensor       *normed_scratch,
-        ds4_gpu_tensor       *lowrank_scratch,
-        ds4_gpu_tensor       *wide_scratch,
-        const ds4_gpu_tensor *hyper,
-        const ds4_gpu_qwen4exp_slab *norm_weight,
-        const ds4_gpu_qwen4exp_slab *down_weight,
-        const ds4_gpu_qwen4exp_slab *up_weight,
-        const ds4_gpu_qwen4exp_slab *inject_weight,
-        uint32_t              n_embd,
-        uint32_t              n_hc,
-        uint32_t              n_lowrank,
-        uint32_t              rows,
-        float                 eps,
-        float                 weight_bias,
-        int                   round_bf16,
-        ds4_gpu_tensor       *q8,
-        uint64_t              q_offset,
-        uint64_t              s_offset,
-        int                  *folded) {
-    if (folded) *folded = 0;
-    DS4_QWEN4EXP_HC_MIXER_GUARD
-#ifdef DS4_QWEN4EXP_HC_HAVE_FUSED
-    if (!ds4_qwen4exp_hc_fuse_off() && !ds4_qwen4exp_hc_mix_quant_off() &&
-        folded && q8 && q8->ptr && (n_embd % 32u) == 0u) {
-        const uint64_t blocks  = (uint64_t)n_embd / 32u;
-        const uint64_t qbytes  = (uint64_t)rows * blocks * 32u;
-        const uint64_t sbytes  = (uint64_t)rows * blocks * sizeof(float);
-        if ((q_offset & 15u) == 0u && (s_offset & 15u) == 0u &&
-            q_offset <= q8->bytes && s_offset <= q8->bytes &&
-            q8->bytes - q_offset >= qbytes && q8->bytes - s_offset >= sbytes &&
-            (q_offset < s_offset ? q_offset + qbytes <= s_offset
-                                 : s_offset + sbytes <= q_offset) &&
-            ds4_tensor_device_idx(q8) == ds4_tensor_device_idx(mixed)) {
-            int done = 0;
-            const int fused = qwen4exp_hc_mixer_fused_cuda(
-                    DS4_QWEN4EXP_HC_MIXER_ARGS, NULL, NULL,
-                    (int8_t *)((char *)q8->ptr + q_offset),
-                    (float *)((char *)q8->ptr + s_offset), &done);
-            if (fused >= 0) {
-                *folded = done;
-                return fused;
-            }
-        }
-    }
-#endif
-    return ds4_gpu_qwen4exp_hc_mixer_tensor(DS4_QWEN4EXP_HC_MIXER_ARGS);
 }
 
 /* The mixer with the PREVIOUS block's inject still owed to the residual.
@@ -262,8 +195,7 @@ int ds4_gpu_qwen4exp_hc_mixer_pending_tensor(
 #ifdef DS4_QWEN4EXP_HC_HAVE_PENDING
     if (!ds4_qwen4exp_hc_fuse_off()) {
         const int fused = qwen4exp_hc_mixer_fused_cuda(
-                DS4_QWEN4EXP_HC_MIXER_ARGS, pending_block, pending_inject,
-                NULL, NULL, NULL);
+                DS4_QWEN4EXP_HC_MIXER_ARGS, pending_block, pending_inject);
         if (fused >= 0) return fused;
     }
 #endif
