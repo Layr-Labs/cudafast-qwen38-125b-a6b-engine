@@ -435,6 +435,44 @@ static int mtp_head_cache_truncate(const ds4_qwen4exp_rollback_set *set,
  * target row it does not have.  Those rows land above the frontier and are
  * exactly what the next round's truncate removes.
  */
+/*
+ * The valve for the device-resident hyper hand-off.  Set
+ * DS4_MTP_HYPER_DEVICE_OFF to put the pre-final-mixer rows back through host
+ * memory, so both behaviours live in one binary and an A/B needs no rebuild.
+ */
+static int mtp_hyper_device_off_flag = -1;
+
+static int mtp_hyper_device_off(void) {
+    if (mtp_hyper_device_off_flag < 0) {
+        const char *v = getenv("DS4_MTP_HYPER_DEVICE_OFF");
+        mtp_hyper_device_off_flag =
+            (v && *v && strcmp(v, "0") != 0 && strcmp(v, "off") != 0 &&
+             strcmp(v, "no") != 0 && strcmp(v, "false") != 0) ? 1 : 0;
+    }
+    return mtp_hyper_device_off_flag;
+}
+
+/*
+ * Whether this round can leave the hyper rows on the device.  Every condition
+ * is a real requirement, not a guard against an unlikely case:
+ *
+ *  - `draft_rows_device` is the binding's opt-in; without it there is no
+ *    device-source entry to call.
+ *  - `draft_rows` must also exist, because mtp_draft_chain only reaches the
+ *    one-forward seed path through it; the row-by-row `draft_step` fallback
+ *    still addresses a host slab.
+ *  - depth 1 only.  At depth 2 and up the chain's later steps read `multi_out`,
+ *    a HOST buffer the head writes, so the rows genuinely have to come back.
+ *  - the compact verify seam only: that is the one that takes an optional
+ *    `hc_rows` and will skip the readback when it is NULL.
+ */
+static bool mtp_hyper_on_device(const ds4_qwen4exp_mtp_state *st,
+                                const ds4_qwen4exp_mtp_model *model) {
+    return st && model && model->draft_rows_device && model->draft_rows &&
+           model->verify_rows_top1 && model->read_logit_row &&
+           st->depth == 1 && !mtp_hyper_device_off();
+}
+
 static int mtp_draft_chain(ds4_qwen4exp_mtp_state *st,
                            const ds4_qwen4exp_mtp_model *model,
                            const float *hc_rows, const int *toks,
@@ -456,7 +494,11 @@ static int mtp_draft_chain(ds4_qwen4exp_mtp_state *st,
     const uint32_t j0 = st->head_rows < pos ? pos : st->head_rows;
     float *const ping = st->hc_scratch +
                         (size_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * st->hc_dim;
-    const float *cur_hc = hc_rows + (size_t)n * st->hc_dim;
+    /* `hc_rows` is NULL exactly when the rows stayed on the device, which is
+     * depth 1, where the seed path below reassigns cur_hc before anything
+     * reads it and the per-row loop never runs.  Do not offset a null slab. */
+    const float *cur_hc =
+        hc_rows ? hc_rows + (size_t)n * st->hc_dim : NULL;
     int cur_tok = next_fed;
     uint32_t p = pos + (uint32_t)n;
     int k = 0;
@@ -479,9 +521,17 @@ static int mtp_draft_chain(ds4_qwen4exp_mtp_state *st,
         rows_tok[seeds] = next_fed;
         float *multi_out = (1 < st->depth) ? ping : NULL;
         int draft = -1;
-        if (model->draft_rows(model->ctx, rows_tok,
-                              hc_rows + (size_t)k0 * st->hc_dim,
-                              j0, seeds + 1u, &draft, multi_out) != 0) {
+        /* Same rows, same order, same head; only the source differs.  When the
+         * verify left them on the GPU, hc_rows is NULL and row k0 is named by
+         * index into the session's own hyper tensor instead of by host
+         * address, so the slab never crosses the bus in either direction. */
+        const int rows_rc =
+            hc_rows ? model->draft_rows(model->ctx, rows_tok,
+                                        hc_rows + (size_t)k0 * st->hc_dim,
+                                        j0, seeds + 1u, &draft, multi_out)
+                    : model->draft_rows_device(model->ctx, rows_tok, k0, j0,
+                                               seeds + 1u, &draft, multi_out);
+        if (rows_rc != 0) {
             return mtp_fail(err, errlen,
                             "qwen4exp MTP: %u-row head forward at position %u "
                             "failed", seeds + 1u, j0);
@@ -652,11 +702,19 @@ int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
     /* No round-start snapshot.  The verify forward itself leaves the state
      * after each drafted row in a slot, so there is nothing to copy first and
      * nothing to rewind to afterwards. */
-    float *const hc = st->hc_scratch;
     float *const row_logits = st->logits_rows;
     int row_top1[DS4_QWEN4EXP_MTP_MAX_COMMIT];
     const bool compact_logits =
         model->verify_rows_top1 != NULL && model->read_logit_row != NULL;
+    /*
+     * Asking for the pre-final-mixer rows in host memory is what forces the
+     * verify to synchronise and copy them out.  Nothing between here and the
+     * draft reads them, so when the head can take them device-to-device we ask
+     * for no slab at all and the copy, its return leg and the synchronize that
+     * had to precede it all disappear from the round.
+     */
+    float *const hc =
+        mtp_hyper_on_device(st, model) ? NULL : st->hc_scratch;
     st->counters.drafted += (uint64_t)n;
     const uint64_t verify_t0 = mtp_now_ns();
     const int vrc = compact_logits
@@ -1442,6 +1500,27 @@ int ds4_qwen4exp_mtp_head_forward_last(ds4_qwen4exp_mtp_head *h,
                                        char *err, size_t errlen) {
     return mtp_head_forward_impl(h, next_tokens, multi_in, pos0, n_tokens,
                                  draft_out, multi_out, true, NULL, 0u, false, err, errlen);
+}
+
+/* forward_last with the pre-final-mixer rows taken device-to-device out of
+ * `multi_device` at row `first_device_row`, instead of uploaded from a host
+ * slab.  Everything after the hand-off is the same code on the same bytes:
+ * the copy lands in the same `t_hyper` the host write would have filled, at
+ * the same offset, with the same length. */
+int ds4_qwen4exp_mtp_head_forward_last_device(ds4_qwen4exp_mtp_head *h,
+                                       const int *next_tokens,
+                                       const ds4_gpu_tensor *multi_device,
+                                       uint32_t first_device_row,
+                                       uint32_t pos0, uint32_t n_tokens,
+                                       int *draft_out, float *multi_out,
+                                       char *err, size_t errlen) {
+    if (!multi_device) {
+        return mtp_fail(err, errlen,
+                        "qwen4exp MTP head: device hyper source is null");
+    }
+    return mtp_head_forward_impl(h, next_tokens, NULL, pos0, n_tokens,
+                                 draft_out, multi_out, true, multi_device,
+                                 first_device_row, false, err, errlen);
 }
 
 

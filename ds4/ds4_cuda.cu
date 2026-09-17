@@ -1014,7 +1014,8 @@ static_assert(sizeof(ds4_decode_graph_key) == 48u,
 struct cuda_decode_graph_entry {
     ds4_decode_graph_key key;
     cudaGraphExec_t      exec;
-    int                  state;   /* 0 empty, 1 warmed, 2 ready, 3 dead */
+    int                  state;    /* 0 empty, 1 warmed, 2 ready, 3 dead */
+    int                  uploaded; /* this exec's device image is resident */
     uint64_t             hits;
 };
 
@@ -1086,11 +1087,51 @@ static inline int cuda_decode_graph_upload_on(void) {
     return on;
 }
 
+/* Whether a chunk that is ALREADY resident is uploaded again every round.
+ *
+ * MEASURED, window-4 nsys capture of the depth-1 decode leg (67 timed rounds):
+ * cudaGraphUpload ran 197 times, ~2.94 per round, median 127 us of host time,
+ * spread evenly across all ten deciles of the window -- steady state, not
+ * warm-up (cudaGraphInstantiate is 10-of-11 calls in the first decile, so
+ * capture really is warm-up only).  Splitting cudaGraphLaunch by whether an
+ * upload had just ended: 542 us median with a recent upload (n=187) against
+ * 214 us without (n=132), and the launches sit in a strict upload/launch
+ * alternation with each upload ending exactly where the next launch begins.
+ *
+ * The mechanism: ds4_gpu_decode_graph_prefetch issues cudaGraphUpload for
+ * chunk c+1 on g_decode_graph_stream -- the SAME stream chunk c is replaying
+ * on -- so it is stream-ordered BEHIND the running chunk and AHEAD of the next
+ * launch rather than overlapped with either.  It cannot hide.  And the exec it
+ * uploads was already uploaded once at instantiate time below, and a graph
+ * exec stays resident, so in steady state every one of those ~186 uploads
+ * re-uploads an image the device already holds.
+ *
+ * So the prefetch keeps its purpose -- an exec whose image is NOT yet resident
+ * is still uploaded off the launch's critical path -- and loses only the
+ * repeat.  Set DS4_CUDA_GRAPH_UPLOAD_REPEAT=1 to restore the per-round
+ * re-upload in the same binary for an A/B.
+ *
+ * Nothing about a graph's contents or its ordering depends on when, or how
+ * often, its executable is uploaded. */
+static inline int cuda_decode_graph_upload_repeat_on(void) {
+    static int init = 0;
+    static int on = 0;
+    if (!init) {
+        init = 1;
+        const char *s = getenv("DS4_CUDA_GRAPH_UPLOAD_REPEAT");
+        if (s && *s)
+            on = (s[0] != '0' && strcmp(s, "off") != 0 &&
+                  strcmp(s, "no") != 0 && strcmp(s, "false") != 0) ? 1 : 0;
+    }
+    return on;
+}
+
 static void cuda_decode_graph_entry_kill(cuda_decode_graph_entry *e) {
     if (e->exec) {
         (void)cudaGraphExecDestroy(e->exec);
         e->exec = NULL;
     }
+    e->uploaded = 0;
     e->state = 3;
 }
 
@@ -1104,6 +1145,7 @@ extern "C" void ds4_gpu_decode_graphs_invalidate(void) {
                     e->exec = NULL;
                 }
                 e->state = 0;
+                e->uploaded = 0;
                 e->hits = 0;
                 memset(&e->key, 0, sizeof(e->key));
             }
@@ -1140,6 +1182,7 @@ static cuda_decode_graph_entry *cuda_decode_graph_find(
     if (slot) {
         memcpy(&slot->key, key, sizeof(*key));
         slot->state = 0;   /* caller advances the state machine */
+        slot->uploaded = 0;
         return slot;
     }
     return NULL;           /* all variants busy with other keys: stay eager */
@@ -1161,10 +1204,14 @@ extern "C" int ds4_gpu_decode_graph_prefetch(const ds4_decode_graph_key *key) {
         cuda_decode_graph_entry *e = &g_decode_graphs[key->il][key->island][v];
         if (e->state != 2 || !e->exec) continue;
         if (memcmp(&e->key, key, sizeof(*key)) != 0) continue;
+        /* Already resident: re-uploading it would only stream-order an
+         * enqueue between this chunk's replay and the next launch. */
+        if (e->uploaded && !cuda_decode_graph_upload_repeat_on()) return 1;
         if (cudaGraphUpload(e->exec, g_decode_graph_stream) != cudaSuccess) {
             (void)cudaGetLastError();
             return 0;
         }
+        e->uploaded = 1;
         return 1;
     }
     return 0;
@@ -1264,7 +1311,7 @@ extern "C" int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) {
      * failure is not fatal: the launch does the upload itself, which is the
      * behaviour without this call. */
     if (cuda_decode_graph_upload_on()) {
-        (void)cudaGraphUpload(exec, g_decode_graph_stream);
+        e->uploaded = (cudaGraphUpload(exec, g_decode_graph_stream) == cudaSuccess);
         (void)cudaGetLastError();
     }
     if (getenv("DS4_CUDA_DECODE_GRAPH_LOG") != NULL) {
@@ -5746,8 +5793,33 @@ __global__ static void matmul_q8_0_preq_warp8_kernel(
     uint64_t row = (uint64_t)blockIdx.x * (blockDim.x >> 5u) + (threadIdx.x >> 5u);
     const uint64_t tok = (uint64_t)blockIdx.y;
     uint32_t lane = threadIdx.x & 31u;
-    if (row >= out_dim) return;
-    const unsigned char *wr = w + row * blocks * 34;
+    /* PDL consumer.  The stream predecessor at the decode widths that reach
+     * this launch is qwen4exp_hc_norm_quant / the Q8 activation quantizer,
+     * which triggers at its top, so this kernel's grid may start while that
+     * one is still draining.  Everything before the fence must therefore read
+     * only memory the predecessor does not write.
+     *
+     * `w` is a frozen model weight tensor: resident before the round begins
+     * and never a quantizer output.  Each warp's first pass over the K walk
+     * reads the thirty-four-byte blocks at `wr + lane * 34`, so warming
+     * exactly those lines in L2 here spends the predecessor's tail on this
+     * kernel's first loads instead of idling on them afterwards.
+     * `prefetch.global.L2` is a hint with no destination register: it moves no
+     * value, so it cannot be folded away as dead and cannot change one.
+     *
+     * The out-of-range early return moved BELOW the fence on purpose.
+     * cudaGridDependencySynchronize() must be reached by every thread of the
+     * block; at eight warps per block a tail block can hold warps whose row is
+     * past out_dim, and returning before the fence would leave the fence
+     * unreached by part of the block. */
+    const int live = row < out_dim;
+    const unsigned char *wr = live ? w + row * blocks * 34 : w;
+    if (live && (uint64_t)lane < blocks) {
+        const unsigned char *pf = wr + (uint64_t)lane * 34;
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(pf) : "memory");
+    }
+    QWEN4EXP_PDL_SYNC();
+    if (!live) return;
     const int8_t *xqr = xq + tok * blocks * 32u;
     const float *xsr = xscale + tok * blocks;
     float acc = 0.0f;
@@ -17588,6 +17660,26 @@ int ds4_qwen4exp_pdl_enabled(void) {
     return enabled;
 }
 
+/* The one-row narrow-projection warp kernel's programmatic launch, off with
+ * DS4_QWEN4EXP_WARP8_NO_PDL.  Read once, like every other valve here.
+ *
+ * Setting it restores the plain triple-chevron launch that path has always
+ * had.  The kernel itself is unchanged by the valve: its fence is a no-op in a
+ * plainly launched kernel and its L2 prefetch hint moves no value, so ONE
+ * binary holds both arms and an A/B needs no rebuild between them.  This is
+ * the global ds4_qwen4exp_pdl_enabled() valve's narrower sibling -- that one
+ * moves every PDL site at once, which is the wrong instrument for attributing
+ * one launch. */
+static int g_warp8_pdl_off = -1;
+static int cuda_qwen4exp_warp8_pdl_off(void) {
+    if (g_warp8_pdl_off < 0) {
+        const char *s = getenv("DS4_QWEN4EXP_WARP8_NO_PDL");
+        g_warp8_pdl_off = (s && *s && s[0] != '0' && strcmp(s, "off") != 0 &&
+                           strcmp(s, "no") != 0 && strcmp(s, "false") != 0) ? 1 : 0;
+    }
+    return g_warp8_pdl_off;
+}
+
 /* The pipelined tile (matmul_q8_0_preq_rows_mma_pipe_kernel) serves the
  * prefill widths unless DS4_CUDA_NO_MMA_PIPE is set; the tile above is the
  * fallback and stays the oracle the test holds it against.  Read once; the
@@ -18117,10 +18209,25 @@ static int cuda_matmul_q8_0_preq_rows_exact(
      * eight rows with the SAME per-row arithmetic. */
     if (n_rows == 1u || getenv("DS4_QWEN4EXP_NO_ROW_TILE") != NULL) {
         dim3 grid(wgrid, n_rows, 1u);
-        matmul_q8_0_preq_warp8_kernel<<<grid, wthreads, 0, cuda_decode_stream()>>>(
-                (float *)out->ptr,
-                reinterpret_cast<const unsigned char *>(wptr),
-                xq, xscale, in_dim, out_dim, blocks, use_dp4a);
+        /* The one-row decode call is the PDL consumer; it is the width whose
+         * predecessor quantizer actually triggers.  The NO_ROW_TILE arm is the
+         * same-binary prefill measurement aid and runs at widths the producer
+         * deliberately does not trigger at, so it keeps the plain launch and
+         * the geometry it has always had.  DS4_QWEN4EXP_WARP8_NO_PDL restores
+         * the plain launch at one row too, which is how this arm is measured
+         * on ONE binary against itself. */
+        if (n_rows == 1u && !cuda_qwen4exp_warp8_pdl_off()) {
+            QWEN4EXP_LAUNCH_PDL(matmul_q8_0_preq_warp8_kernel, grid, wthreads, 0,
+                                cuda_decode_stream(),
+                    (float *)out->ptr,
+                    reinterpret_cast<const unsigned char *>(wptr),
+                    xq, xscale, in_dim, out_dim, blocks, use_dp4a);
+        } else {
+            matmul_q8_0_preq_warp8_kernel<<<grid, wthreads, 0, cuda_decode_stream()>>>(
+                    (float *)out->ptr,
+                    reinterpret_cast<const unsigned char *>(wptr),
+                    xq, xscale, in_dim, out_dim, blocks, use_dp4a);
+        }
         return cuda_ok(cudaGetLastError(),
                        "q8_0 decode rows exact warp launch");
     }
