@@ -13345,7 +13345,7 @@ static uint32_t qwen4exp_cuda_threads(uint32_t value) {
  * Both bounds are scheduling bounds.  The kernel's arithmetic does not depend
  * on GROUP at all (see its note), so moving these numbers cannot move a
  * single output bit. */
-#define QWEN4EXP_QSA_GROUP_MIN_ROWS   64u
+#define QWEN4EXP_QSA_GROUP_MIN_ROWS 2u
 #define QWEN4EXP_QSA_GROUP_SHARED_CAP (48u * 1024u)
 
 static size_t qwen4exp_qsa_group_shared(uint32_t group, uint32_t head_dim,
