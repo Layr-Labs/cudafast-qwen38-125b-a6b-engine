@@ -328,6 +328,7 @@ struct ds4_qwen4exp_session {
     bool              ple_ready;      /* the hash constants were readable */
     uint64_t         *ple_ids;        /* host [n_batch][head_count]       */
     float            *ple_rows_host;  /* host [n_batch][ple_embd]         */
+    bool              ple_rows_host_pinned; /* pinned => async upload DMA */
     ds4_gpu_tensor   *ple_conv_state; /* [state_rows][n_hc * n_embd]      */
     ds4_gpu_tensor   *ple_rows;       /* [n_batch][ple_embd]              */
     ds4_gpu_tensor   *ple_key;        /* key projection, then the gate    */
@@ -764,7 +765,19 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
         s->ple_value = qwen4exp_alloc_zeroed(B * E * f, &ok);
         if (ok) {
             s->ple_ids = calloc((size_t)B * DS4_N_PLE_HEAD, sizeof(uint64_t));
-            s->ple_rows_host = calloc((size_t)B * DS4_N_PLE_EMBD, sizeof(float));
+            /* Pinned first: the per-round upload then rides a true async DMA
+             * instead of a staged copy that blocks the host.  A pageable
+             * fallback keeps the session usable when the driver refuses the
+             * allocation; the upload call degrades to the old staging path. */
+            s->ple_rows_host = (float *)ds4_gpu_host_pinned_alloc(
+                (uint64_t)B * DS4_N_PLE_EMBD * sizeof(float));
+            s->ple_rows_host_pinned = s->ple_rows_host != NULL;
+            if (!s->ple_rows_host)
+                s->ple_rows_host =
+                    calloc((size_t)B * DS4_N_PLE_EMBD, sizeof(float));
+            else
+                memset(s->ple_rows_host, 0,
+                       (size_t)B * DS4_N_PLE_EMBD * sizeof(float));
             ok = s->ple_ids != NULL && s->ple_rows_host != NULL;
         }
         if (ok) {
@@ -888,7 +901,8 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->ple_aux);
     ds4_gpu_tensor_free(s->ple_value);
     free(s->ple_ids);
-    free(s->ple_rows_host);
+    if (s->ple_rows_host_pinned) ds4_gpu_host_pinned_free(s->ple_rows_host);
+    else free(s->ple_rows_host);
     ds4_gpu_tensor_free(s->d_pos);
     ds4_gpu_tensor_free(s->d_adopt);
     ds4_gpu_tensor_free(s->d_gdn_replay);
@@ -1132,9 +1146,27 @@ static void *qw_ple_gather_worker(void *arg) {
         ds4_ple_history_reset(&seg->s->ple_constants, &local);
     }
     seg->ok = 1;
+    /* Two passes over the segment: ids first, then the dequant.  The id pass
+     * is pure arithmetic on the token stream; splitting it out means the
+     * dequant pass can prefetch the NEXT token's table rows while the
+     * current token's heads dequantize, hiding the mmap misses the serial
+     * interleave used to eat one head at a time.  Same ids, same rows. */
     for (uint32_t t = seg->t0; t < seg->t1; t++) {
         ds4_ple_row_ids(&seg->s->ple_constants, &local, seg->tokens + t, 1u,
                         seg->s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD);
+    }
+    for (uint32_t t = seg->t0; t < seg->t1; t++) {
+        if (t + 1u < seg->t1) {
+            const uint64_t *nids =
+                seg->s->ple_ids + (uint64_t)(t + 1u) * DS4_N_PLE_HEAD;
+            for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
+                const uint8_t *nr = ds4_qwen4exp_ple_row(seg->ple, nids[h]);
+                if (nr) {
+                    __builtin_prefetch(nr, 0, 1);
+                    __builtin_prefetch(nr + 64, 0, 1);
+                }
+            }
+        }
         for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
             const uint64_t row =
                 seg->s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h];
@@ -1300,6 +1332,22 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
             }
         }
         for (uint32_t t = 0; t < n_tokens; t++) {
+            /* The NEXT token's sixteen rows are the misses this token's
+             * dequant can hide: their ids are already computed, so ask for
+             * the table lines now and they arrive while this token's heads
+             * dequantize.  A 90-byte row spans two lines.  Hint only -- an
+             * out-of-range id still refuses in the head loop, unchanged. */
+            if (t + 1u < n_tokens) {
+                const uint64_t *nids =
+                    s->ple_ids + (uint64_t)(t + 1u) * DS4_N_PLE_HEAD;
+                for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
+                    const uint8_t *nr = ds4_qwen4exp_ple_row(&w->ple, nids[h]);
+                    if (nr) {
+                        __builtin_prefetch(nr, 0, 1);
+                        __builtin_prefetch(nr + 64, 0, 1);
+                    }
+                }
+            }
             /* The head's destination strides are constants of the shape, so
              * the token base is hoisted out of the head loop and the head
              * offset is carried as a pointer step instead of a multiply per
@@ -1308,10 +1356,6 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
             float *dst = s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD;
             for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
                 const uint64_t row = ids[h];
-                /* Every head of this token except the last is followed by
-                 * another table row, so ask for the next id early.  Hint. */
-                if (h + 1u < DS4_N_PLE_HEAD)
-                    __builtin_prefetch(ids + h + 1u, 0, 1);
                 const uint8_t *quant = ds4_qwen4exp_ple_row(&w->ple, row);
                 /* Cold: a hashed row past the table is a hard refusal that has
                  * never fired in a scored run, so keep it out of the hot path. */
@@ -1363,6 +1407,21 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
             ds4_ple_row_ids(&s->ple_constants, &s->ple_history, tokens,
                             n_tokens, s->ple_ids);
             for (uint32_t t = 0; t < n_tokens; t++) {
+                /* Same next-token row prefetch as the snapshot path: the ids
+                 * for t+1 are already in s->ple_ids, so the table lines are
+                 * in flight while this token's heads dequantize. */
+                if (t + 1u < n_tokens) {
+                    const uint64_t *nids =
+                        s->ple_ids + (uint64_t)(t + 1u) * DS4_N_PLE_HEAD;
+                    for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
+                        const uint8_t *nr =
+                            ds4_qwen4exp_ple_row(&w->ple, nids[h]);
+                        if (nr) {
+                            __builtin_prefetch(nr, 0, 1);
+                            __builtin_prefetch(nr + 64, 0, 1);
+                        }
+                    }
+                }
                 for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
                     const uint64_t row =
                         s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h];
@@ -1459,14 +1518,18 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 "ds4: qwen4exp PLE gather %u rows took %.3f ms\n",
                 n_tokens, (now_sec() - gather_t0) * 1000.0);
     }
-    if (!ds4_gpu_tensor_write(s->ple_rows, 0, s->ple_rows_host,
+    /* The upload leaves the host's critical path: from the pinned stage this
+     * is a queued DMA on the legacy stream, ordered before the forward's own
+     * work by the stream rules and covered by the round's synchronize.  A
+     * pageable fallback buffer makes the same call stage and block, which is
+     * the old behaviour. */
+    if (!ds4_gpu_tensor_write_async(s->ple_rows, 0, s->ple_rows_host,
                               (uint64_t)n_tokens * DS4_N_PLE_EMBD * sizeof(float))) {
         fprintf(stderr, "ds4: qwen4exp n-gram row upload failed at block %u\n", il);
         return false;
     }
     return true;
 }
-
 /* The device half: the two Q8_0 projections, the three grouped norms, the gate
  * and the dilated convolution, over the rows the gather uploaded.  This is the
  * `ple_block` op boundary of the MLX reference dump. */

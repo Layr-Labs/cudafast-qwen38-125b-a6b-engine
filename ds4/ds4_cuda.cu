@@ -3514,6 +3514,43 @@ extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset
     return ok;
 }
 
+extern "C" void *ds4_gpu_host_pinned_alloc(uint64_t bytes) {
+    if (bytes == 0) return NULL;
+    void *p = NULL;
+    /* Pinned host memory is not bound to a device; no WITH_DEVICE needed.
+     * cudaMallocHost leaves the pages uninitialised -- the caller memsets
+     * when it needs calloc semantics. */
+    if (cudaMallocHost(&p, (size_t)bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    return p;
+}
+
+extern "C" void ds4_gpu_host_pinned_free(void *p) {
+    if (p) (void)cudaFreeHost(p);
+}
+
+extern "C" int ds4_gpu_tensor_write_async(ds4_gpu_tensor *tensor, uint64_t offset,
+                                          const void *data, uint64_t bytes) {
+    if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
+    /* The legacy stream cannot carry captured work: a capture in flight
+     * takes the synchronous path, which is also what the caller gets when
+     * the source is pageable (the driver stages it and blocks). */
+    if (g_decode_graph_capturing) {
+        return ds4_gpu_tensor_write(tensor, offset, data, bytes);
+    }
+    int d = ds4_tensor_device_idx(tensor);
+    int ok = 0;
+    WITH_DEVICE(g_gpu[d].device_id) {
+        ok = cuda_ok(cudaMemcpyAsync((char *)tensor->ptr + offset, data,
+                                   (size_t)bytes, cudaMemcpyHostToDevice,
+                                   (cudaStream_t)0),
+                     "tensor write async");
+    }
+    return ok;
+}
+
 extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                      const ds4_gpu_tensor *src, uint64_t src_offset,
                                      uint64_t bytes) {
@@ -17357,6 +17394,12 @@ int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows) {
  * change after the first call and a captured graph replays the launches it
  * recorded, so the choice is capture-safe.  Defined here so both translation
  * units share one cached read of the environment. */
+/* This build's note auto09170557_2 records that six provable-equivalence
+ * removals stacked into one tree measured four tenths of one percent slower
+ * with a standard error of nearly four tenths, which is neutral. Their
+ * combined arithmetic is a few microseconds against a round of about fifty
+ * milliseconds.
+ */
 int ds4_qwen4exp_pdl_enabled(void) {
     static int resolved = 0;
     static int enabled = 0;
