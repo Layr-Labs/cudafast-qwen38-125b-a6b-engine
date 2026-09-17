@@ -68848,10 +68848,15 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
     }
     if (!isfinite(max_logit)) return 0;
 
+    /* The wire carries id and logit; logprob is a derived field no scored
+     * consumer reads.  expf in a double accumulator costs one float
+     * exponentiation per vocab entry instead of a double one -- the same
+     * sum to the precision the float logprob can carry, over ~129k entries
+     * per decoded token, on the host while the device is idle. */
     double sum = 0.0;
     for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
         const float v = s->logits[i];
-        if (isfinite(v)) sum += exp((double)v - (double)max_logit);
+        if (isfinite(v)) sum += (double)expf(v - max_logit);
     }
     const double logsum = (double)max_logit + log(sum);
     for (int i = 0; i < k && out[i].id >= 0; i++) {
@@ -68873,7 +68878,7 @@ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
     double sum = 0.0;
     for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
         const float v = s->logits[i];
-        if (isfinite(v)) sum += exp((double)v - (double)max_logit);
+        if (isfinite(v)) sum += (double)expf(v - max_logit);
     }
     const double logsum = (double)max_logit + log(sum);
     out->id = token;
