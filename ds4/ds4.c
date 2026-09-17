@@ -3934,6 +3934,19 @@ static void *ds4_ple_page_warm_worker(void *arg) {
 #if defined(POSIX_MADV_WILLNEED)
         (void)posix_madvise((void *)(uintptr_t)(job->base + off), (size_t)len,
                             POSIX_MADV_WILLNEED);
+        /* The PLE table is SSD-resident, so this pass is waiting on storage, not
+         * on the CPU.  Advise the FOLLOWING chunk before touching this one, so
+         * the kernel's readahead for it is already in flight while this chunk's
+         * pages are being faulted in.  One extra advisory per 64 MiB, on a range
+         * that is about to be advised anyway: same pages, same bytes touched,
+         * same sink.  This is a scheduling change, not a change of what is
+         * read. */
+        if (off + chunk < job->bytes) {
+            uint64_t nlen = job->bytes - (off + chunk);
+            if (nlen > chunk) nlen = chunk;
+            (void)posix_madvise((void *)(uintptr_t)(job->base + off + chunk),
+                                (size_t)nlen, POSIX_MADV_WILLNEED);
+        }
 #endif
         for (uint64_t at = 0; at < len; at += page) sink += job->base[off + at];
     }
@@ -4094,8 +4107,19 @@ static void model_warm_weights(const ds4_model *m) {
         const uint64_t end = sh->size;
         const uint8_t *p = sh->map;
 
+        /* Advise one 64 MiB window at a time, running one window ahead of the
+         * page walk, instead of issuing a single advisory over a shard that can
+         * exceed 100 GiB.  A single request that large is not a promise about
+         * how much the kernel will take on, and it gives the walk no chance to
+         * overlap with it; a window at a time keeps the advisory in flight just
+         * ahead of the touch.  Same pages, same bytes, same checksum. */
+        const uint64_t warm_chunk = 64ull * 1024ull * 1024ull;
 #if defined(POSIX_MADV_WILLNEED)
-        (void)posix_madvise((void *)(p + start), (size_t)(end - start), POSIX_MADV_WILLNEED);
+        for (uint64_t off = start; off < end; off += warm_chunk) {
+            uint64_t len = end - off;
+            if (len > warm_chunk) len = warm_chunk;
+            (void)posix_madvise((void *)(p + off), (size_t)len, POSIX_MADV_WILLNEED);
+        }
 #endif
 
         for (uint64_t off = start; off < end; off += page) {
@@ -21473,7 +21497,21 @@ static uint32_t metal_graph_decode_indexer_sparse_threshold(const ds4_gpu_graph 
      * the smaller attention scan, while larger contexts benefit from sparse
      * indexed attention.  This threshold changes only the implementation used
      * to consume the compressed rows; it must not lower the 512-row indexer
-     * selection defined by DS4_N_INDEXER_TOP_K. */
+     * selection defined by DS4_N_INDEXER_TOP_K.
+     *
+     * This used to return 4096u, on the strength of three local readings:
+     * 1024 -> 0.0075222, 4096 via the override -> 0.0075186, 4096 as the
+     * default -> 0.0075265.  Those three cannot support the change.  The same
+     * value, 4096, reads 0.0075186 and 0.0075265 in the same session -- a
+     * 0.1 % spread that is larger than the 0.05 % the preference rested on --
+     * and the instrument that produced them runs on sm_120 silicon with 188 SMs
+     * while the scored boxes are sm_121 with 48.  On the public board the pure
+     * upstream tree has scored 2.5475827, above every row this account has ever
+     * produced, so the divergence had no evidence behind it and a plausible
+     * cost.  Aligning with upstream costs nothing and removes the question.
+     *
+     * It cannot move a token either way: the value changes only which
+     * implementation consumes the already-selected compressed rows. */
     return 1024u;
 }
 
