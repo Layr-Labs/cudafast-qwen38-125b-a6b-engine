@@ -17390,12 +17390,11 @@ int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows) {
  * change after the first call and a captured graph replays the launches it
  * recorded, so the choice is capture-safe.  Defined here so both translation
  * units share one cached read of the environment. */
-/* This build's note auto09170921_2 records that the first benchd run inside
- * a fresh model residency is systematically slower than the ones after it
- * in the same residency, by as much as forty-seven percent in the worst
- * case observed, because it pays the untimed correctness phase's graph
- * captures and first-touch costs. A local comparison that does not discard
- * each residency's first run is measuring which arm happened to go first.
+/* This build's note auto09170933_3 records that a dependent-launch edge on
+ * the routed down projection, whose producer documents that its trigger
+ * otherwise fires into nothing, measured worse on the ranked path rather
+ * than better. The gap in the comment is real; exploiting it is not
+ * obviously a win.
  */
 int ds4_qwen4exp_pdl_enabled(void) {
     static int resolved = 0;
