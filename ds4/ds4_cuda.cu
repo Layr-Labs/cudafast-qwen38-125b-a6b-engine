@@ -17820,6 +17820,7 @@ static int cuda_q8_mma_pipe_launch(float *out, const unsigned char *w,
 
 static void cuda_q8_mma_pipe_prepare(void) {
     if (!cuda_q8_mma_available()) return;
+    (void)cuda_q8_mma_pipe_attr<2, 2, 4, 4, 4, 3>();
     (void)cuda_q8_mma_pipe_attr<2, 2, 4, 4, 4, 2>();
     (void)cuda_q8_mma_pipe_attr<2, 4, 4, 4, 4, 2>();
     (void)cuda_q8_mma_pipe_attr<2, 8, 4, 4, 4, 2>();
@@ -17875,6 +17876,99 @@ static int cuda_q8_mma_pipe_try(float *out, const unsigned char *w,
     }
     if (out_dim > 384u && out_dim <= 1024u) {
         return cuda_q8_mma_pipe_launch<2, 4, 4, 4, 4, 2>(out, w, xq, xscale, out_dim, n_rows, blocks);
+    }
+    /* THREE stages on the 128x64 rung, two everywhere else, because three is
+     * the deepest that fits here and it is free.
+     *
+     * STAGE_BYTES = A_BYTES + B_BYTES + AS_BYTES + WS_BYTES with BM = 128,
+     * A_STRIDE = B_STRIDE = 144, G = 4:
+     *
+     *   BN=64   18432 +  9216 + 2048 + 1024 = 30720  -> x2 61440   x3  92160
+     *   BN=128  18432 + 18432 + 2048 + 2048 = 40960  -> x2 81920   x3 122880
+     *   BN=256  18432 + 36864 + 2048 + 4096 = 61440  -> x2 122880
+     *
+     * cudaDevAttrMaxSharedMemoryPerBlockOptin measured 101376 on this box, so
+     * x3 fits ONLY at BN=64 -- 122880 is why the 256-wide rung above is an
+     * opt-in a device may refuse, and it is equally why BN=128 stays at two.
+     *
+     * It is free because it does not cost a CTA.  Shared per SM is 102400
+     * (four CTAs of the 24288-byte routed-MoE kernel fit and five do not), so
+     * 102400/61440 = 1 CTA per SM at two stages and 102400/92160 = 1 at
+     * three: the same single CTA either way.  THREADS is (CWARPS + PWARPS)*32
+     * = 8 warps, unchanged, and the staging registers are per k-chunk
+     * (KA + KS + KB = 14 uint4 at this rung) not per stage, so the register
+     * footprint is unchanged too.  Nothing is traded for the third buffer.
+     *
+     * What it buys: at 8 warps on the SM there is no occupancy to hide the
+     * weight fetch with, so all of the hiding is the pipeline's depth.  The
+     * producer already issues stage s's LDGs before it waits on EMPTY[s],
+     * which covers one stage of fetch with one stage of compute; at STAGES=2
+     * it then blocks on the buffer holding s-1, so its stores and its
+     * half->float scale conversion cannot run ahead.  At STAGES=3 it waits on
+     * s-2 instead and can land a whole further stage, which is also slack
+     * against jitter between the four producer warps.
+     *
+     * Bit-exact, and not merely "the same arithmetic" the way the rungs above
+     * are: STAGES changes only `buf = s % STAGES`, i.e. WHICH buffer a stage
+     * occupies.  The consumer's accumulation is unchanged in every index --
+     * ascending s, ascending gg inside it, the same acc[mi][ni][e] fma chain.
+     * The barrier ids stay clear as well: FULL[b] = 1 + 2b and EMPTY[b] =
+     * 2 + 2b run to 6 at three stages, below the epilogue's 13 and the
+     * producers' own 15.
+     *
+     * The explicit two-stage fallback below is the point of writing it as a
+     * ladder rather than editing the template argument in place: if any box
+     * refuses the 92160-byte opt-in, cuda_q8_mma_pipe_launch returns 0 and
+     * this rung would otherwise fall out of the pipe altogether and into the
+     * slower non-pipelined tile -- a regression, not a null.  With the
+     * fallback the worst case is byte-for-byte today's kernel.
+     *
+     * PRIOR MEASUREMENT, and it was a null.  I have drawn this exact rung at
+     * STAGES=3 before, as submission af3ec6b9 on an older base.  It landed on
+     * the same box as its own base and gave a valid paired contrast of
+     * +0.192% decode and -0.288% prefill -- both well inside the control
+     * spread, so: no effect detected.  I recorded the depth axis as closed on
+     * this rung at the time.  I am shipping it again anyway, and the reason is
+     * not that I disbelieve the number, it is that the number never had the
+     * power to say anything.  A single-draw leg on this benchmark carries
+     * roughly 1% of dispersion (measured from 152 identical-tree redraw pairs),
+     * so a contrast of 0.19% and 0.29% is a coin flip either way.  This arm is
+     * unmeasurable in this instrument.  It ships because it is free and
+     * fail-safe, and NO gain is claimed for it.  Anyone reading this for ideas
+     * should treat the depth axis as unresolved rather than promising.
+     *
+     * The base has also moved since af3ec6b9 -- the row_store epilogue and
+     * ~500 further insertions landed in this kernel's family -- but that does
+     * not rescue the arm: row_store's gate BM*(BN+4)*4 <= SMEM is 34816 <=
+     * 61440, already satisfied at two stages, so the third stage does not
+     * switch it on.  The mechanism is unchanged and so is my expectation.
+     *
+     * Not yet measured on THIS base.  This tree was dispatched once and never
+     * timed: the
+     * runner's thermal preflight refused it at "current 51.0C, min seen 51.0C,
+     * target <=50C, waited 180s", so score.json came back with
+     * benchmark_wall_seconds 0.0, checked_steps 1 and every metric zeroed.  The
+     * build and the engine boot had both succeeded -- engine_backend was fully
+     * populated -- so nothing below had run when the draw was discarded.  Worth
+     * knowing that a one-degree thermal miss consumes a submission slot and
+     * publishes no measurement at all; a zeroed passed_correctness in that
+     * state means "not measured", not "failed".
+     *
+     * That same discarded draw did re-read the occupancy channel off this box,
+     * which is free and outlives the draw:
+     *
+     *   gu[reg=32 smem=11584 lmem=0 occ=6]   dn[reg=48 smem=0 lmem=0 occ=5]
+     *   gdn[reg=126 lmem=0]                  mm[reg=128 smem=24288 lmem=0 occ=4]
+     *   md[reg=79 smem=15872 lmem=0 occ=6]
+     *   smem/blk_optin=101376 sm=48 cc=12.1 integrated=1 nvcc=V13.0.88
+     *
+     * mm at occ=4 with smem=24288 is the pair of bounds this file's per-SM
+     * figure of 102400 above was inferred from (4*24288 = 97152 fits, 5 does
+     * not), so the free-CTA argument for the third stage is measured on this
+     * box, not assumed.  Note reg=128 for mm: a comment elsewhere in the tree
+     * still quotes 167, which is stale. */
+    if (cuda_q8_mma_pipe_launch<2, 2, 4, 4, 4, 3>(out, w, xq, xscale, out_dim, n_rows, blocks)) {
+        return 1;
     }
     return cuda_q8_mma_pipe_launch<2, 2, 4, 4, 4, 2>(out, w, xq, xscale, out_dim, n_rows, blocks);
 }
