@@ -17628,6 +17628,45 @@ extern "C" void ds4_gpu_set_q8_mma_pipe_wide(int mode) {
     g_q8_mma_pipe_wide = mode;
 }
 
+/* The deep rung of the pipe ladder below, DS4_CUDA_MMA_PIPE_DEEP: 0 keeps the
+ * two-stage ladder, unset or 1 tries a third stage buffer on the 128x64 tile
+ * before falling back to it.
+ *
+ * Why a third stage is free HERE and nowhere else in this ladder.  The stage
+ * footprint is A_BYTES + B_BYTES + AS_BYTES + WS_BYTES = 18432 + 9216 + 2048 +
+ * 1024 = 30720 on the 128x64 tile, so two stages are 61440 and three are
+ * 92160, both under this device's 101376 per-block opt-in.  The occupancy that
+ * would normally pay for the depth is ALREADY spent: 101376 / 61440 = 1.65, so
+ * the shipped rung is one block per SM, and one block per SM is also what
+ * 92160 buys.  A third buffer cannot cost a residency the tile never had.
+ * The 128x128 rung is a different story -- 40960 a stage, so three stages want
+ * 122880 and the opt-in is refused -- which is why this valve is scoped to the
+ * tile below and not to the ladder as a whole.
+ *
+ * It does not touch the arithmetic.  STAGES enters the kernel only through
+ * `buf = s % STAGES`, which chooses WHICH buffer stage s lands in; consumers
+ * still walk s strictly ascending and the B skew is `(s * B_RAW) & 15`, a
+ * function of s alone.  So every product reaches its accumulator in the same
+ * order at either depth -- the kernel's contract two hundred lines up, same as
+ * the wide valve above.  Read once like the others; the test flips it through
+ * ds4_gpu_set_q8_mma_pipe_deep. */
+static int g_q8_mma_pipe_deep = -1;
+static int cuda_q8_mma_pipe_deep_mode(void) {
+    if (g_q8_mma_pipe_deep < 0) {
+        int mode = 1;
+        const char *e = getenv("DS4_CUDA_MMA_PIPE_DEEP");
+        if (e != NULL) {
+            mode = atoi(e);
+            if (mode < 0 || mode > 1) mode = 1;
+        }
+        g_q8_mma_pipe_deep = mode;
+    }
+    return g_q8_mma_pipe_deep;
+}
+extern "C" void ds4_gpu_set_q8_mma_pipe_deep(int mode) {
+    g_q8_mma_pipe_deep = mode;
+}
+
 /* The device's occupancy limits, as a compact string the caller can append to
  * an identity that reaches the run's metrics.  See ds4.h for why this is worth
  * publishing.
@@ -17738,6 +17777,11 @@ static void cuda_q8_mma_pipe_prepare(void) {
     (void)cuda_q8_mma_pipe_attr<2, 2, 4, 4, 4, 2>();
     (void)cuda_q8_mma_pipe_attr<2, 4, 4, 4, 4, 2>();
     (void)cuda_q8_mma_pipe_attr<2, 8, 4, 4, 4, 2>();
+    /* The deep rung, opted in here for the same reason as the three above: the
+     * memoised attr call is the only cudaFuncSetAttribute on the path, and
+     * doing it at prepare time keeps it out of the timed phase.  A device that
+     * refuses 92160 memoises the refusal and the ladder falls back. */
+    (void)cuda_q8_mma_pipe_attr<2, 2, 4, 4, 4, 3>();
 }
 
 /* The pipelined tile's shape ladder.  Returns 0 when the call is not one it
@@ -17790,6 +17834,15 @@ static int cuda_q8_mma_pipe_try(float *out, const unsigned char *w,
     }
     if (out_dim > 384u && out_dim <= 1024u) {
         return cuda_q8_mma_pipe_launch<2, 4, 4, 4, 4, 2>(out, w, xq, xscale, out_dim, n_rows, blocks);
+    }
+    /* The 128x64 tile, three stages first (see the deep-rung comment above).
+     * This is the rung the 2560-wide out projections land on -- 6144 -> 2560
+     * measured 401 us here against the 128x128 tile's 452 -- and the only rung
+     * whose three-stage footprint (92160) clears the opt-in.  A refusal is
+     * memoised and returns 0, so the two-stage launch below still runs. */
+    if (cuda_q8_mma_pipe_deep_mode() != 0 &&
+        cuda_q8_mma_pipe_launch<2, 2, 4, 4, 4, 3>(out, w, xq, xscale, out_dim, n_rows, blocks)) {
+        return 1;
     }
     return cuda_q8_mma_pipe_launch<2, 2, 4, 4, 4, 2>(out, w, xq, xscale, out_dim, n_rows, blocks);
 }

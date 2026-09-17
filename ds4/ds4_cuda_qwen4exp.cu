@@ -14820,7 +14820,31 @@ static uint32_t qwen4exp_qsa_split_width(uint32_t n_tokens, uint32_t n_head,
         const long v = strtol(forced, NULL, 10);
         return (v > 0 && v <= 32) ? (uint32_t)v : 0u;
     }
-    /* One model-shaped row benefits from twice as many independent head
+    /* A model-shaped one-row draft takes three, for the two-row argument
+     * below applied to the shape it did not cover.  Both kernels here are
+     * __launch_bounds__(256, 1), so the wave count is the live block count
+     * over the 48 SMs, and the live block count is (n_head / g) * tiles *
+     * n_tokens with tiles retired by `base >= count`: at this context count
+     * is the KV length, 1024 prompt rows plus at most 128 generated, so
+     * five tiles of 256.  One row therefore launches (24/g) * 5:
+     *
+     *     g   live   waves   heads a block   waves * work
+     *     2     60     2           2            1.00
+     *     3     40     1           3            0.75
+     *     4     30     1           4            1.00
+     *     6     20     1           6            1.50
+     *
+     * The shipped two is on the same second-partial-wave cliff the two-row
+     * call was, and three is the smallest width that clears it, so it is the
+     * unique minimum at one row exactly as six is at two.  The same rule
+     * reproduces the measured two-row choice: the smallest g dividing gqa
+     * whose live blocks fit one wave.  Each K row is also requested eight
+     * times from L2 instead of twelve.  Bit-exact for the reason the group
+     * note gives: GROUP only sets head0 and the per-head trip count, every
+     * head keeps its own `contrib` accumulated j ascending, and 12 % 3 == 0
+     * so a group never straddles a kv_head.
+     *
+     * One model-shaped row benefits from twice as many independent head
      * groups.  A model-shaped two-row verify takes six.  Its scores kernel
      * holds 138 registers, one block per SM, and at four heads the sixty
      * live blocks a call below the indexer budget launches need a second
@@ -14833,7 +14857,7 @@ static uint32_t qwen4exp_qsa_split_width(uint32_t n_tokens, uint32_t n_head,
      * they must be.  Other multi-row calls retain four heads and their
      * K/V reuse. */
     if (n_head == 24u && n_kv_head == 2u && head_dim == 256u) {
-        if (n_tokens == 1u) return 2u;
+        if (n_tokens == 1u) return 3u;
         if (n_tokens == 2u) return 6u;
     }
     return 4u;
@@ -14900,7 +14924,20 @@ static int qwen4exp_qsa_attention_split(
         case 12u: QWEN4EXP_QSA_SPLIT_LAUNCH(12u, QWEN4EXP_QSA_SPLIT_VSTEP); break;
         case 6u:  QWEN4EXP_QSA_SPLIT_LAUNCH(6u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
         case 4u:  QWEN4EXP_QSA_SPLIT_LAUNCH(4u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
-        case 3u:  QWEN4EXP_QSA_SPLIT_LAUNCH(3u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
+        case 3u:
+            /* The one-row model shape keeps the shallower dense V prefetch it
+             * was measured with at two heads, so the width is the only thing
+             * this draw changes.  VSTEP only batches the loads; the products
+             * still land j ascending into one accumulator a head, so the
+             * depth is bit-exact at either value. */
+            if (!sparse && n_tokens == 1u && n_head == 24u &&
+                n_kv_head == 2u && head_dim == 256u &&
+                getenv("DS4_QWEN4EXP_NO_QSA_SHORT_V") == NULL) {
+                QWEN4EXP_QSA_SPLIT_LAUNCH(3u, 8u);
+            } else {
+                QWEN4EXP_QSA_SPLIT_LAUNCH(3u, QWEN4EXP_QSA_SPLIT_VSTEP);
+            }
+            break;
         case 2u:
             /* Preserve the ordered products; only reduce dense V prefetch
              * depth for the measured one-row model shape. */
