@@ -6137,19 +6137,41 @@ __global__ static void matmul_q8_hc_down_pair_kernel(
 
 /* HC up has ten Q8 groups. Pair lanes within one warp and retain the
  * original zero-padded 32-chain tree, without a shared-memory remap. */
-template<int R>
+template<int R, bool Stage = false>
 __global__ static void matmul_q8_hc_warp_pair_kernel(
         float *out, const unsigned char *w,
         const int8_t *xq, const float *xs, uint64_t out_dim, uint32_t rows) {
+    extern __shared__ uint4 hc_pair_panel[];
+    char *const gpanel = (char *)hc_pair_panel;
     const unsigned lane = threadIdx.x & 31u;
     const unsigned group = lane >> 1u, half = lane & 1u;
-    const uint64_t row = (uint64_t)blockIdx.x * 4u + (threadIdx.x >> 5u);
-    if (row >= out_dim) return;
+    const unsigned local_row = threadIdx.x >> 5u;
+    const uint64_t block_row = (uint64_t)blockIdx.x * 4u;
+    const uint64_t row = block_row + local_row;
+    const bool row_valid = row < out_dim;
+    if (Stage) {
+        const uint32_t rows_here = out_dim > block_row
+            ? (uint32_t)(out_dim - block_row < 4u ? out_dim - block_row : 4u)
+            : 0u;
+        const uint64_t panel_bytes = (uint64_t)rows_here * 340u;
+        const char *const gp = w + block_row * 340u;
+        for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
+             i += (uint64_t)blockDim.x * 16u) {
+            if (i + 16u <= panel_bytes)
+                *(uint4 *)(gpanel + i) = *(const uint4 *)(const void *)(gp + i);
+            else
+                for (uint64_t j = i; j < panel_bytes; j++) gpanel[j] = gp[j];
+        }
+        QWEN4EXP_PDL_SYNC();
+        __syncthreads();
+    }
     float acc[R];
 #pragma unroll
     for (int r = 0; r < R; r++) acc[r] = 0.0f;
-    if (group < 10u) {
-        const unsigned char *blk = w + row * 340u + group * 34u;
+    if (row_valid && group < 10u) {
+        const unsigned char *blk = Stage
+            ? (const unsigned char *)(gpanel + (uint64_t)local_row * 340u + group * 34u)
+            : (w + row * 340u + group * 34u);
         const unsigned char *payload = blk + 2u + half * 16u;
         const uintptr_t address = (uintptr_t)payload;
         const unsigned shift = (address & 3u) * 8u;
@@ -6170,7 +6192,7 @@ __global__ static void matmul_q8_hc_warp_pair_kernel(
          * word -- so the fence goes here and holds the activation reads
          * (xq/xs, the silu kernel's output) until it releases.  Nothing
          * else moves. */
-        QWEN4EXP_PDL_SYNC();
+        if (!Stage) QWEN4EXP_PDL_SYNC();
 #pragma unroll
         for (int r = 0; r < R; r++) {
             if ((unsigned)r < rows) {
@@ -6192,7 +6214,7 @@ __global__ static void matmul_q8_hc_warp_pair_kernel(
 #pragma unroll
         for (int d = 16; d >= 2; d >>= 1)
             acc[r] += __shfl_down_sync(0xffffffffu, acc[r], d);
-        if (lane == 0u && (unsigned)r < rows)
+        if (lane == 0u && row_valid && (unsigned)r < rows)
             out[(uint64_t)r * out_dim + row] = acc[r];
     }
 }
@@ -17390,13 +17412,6 @@ int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows) {
  * change after the first call and a captured graph replays the launches it
  * recorded, so the choice is capture-safe.  Defined here so both translation
  * units share one cached read of the environment. */
-/* This build's note auto09170921_2 records that the first benchd run inside
- * a fresh model residency is systematically slower than the ones after it
- * in the same residency, by as much as forty-seven percent in the worst
- * case observed, because it pays the untimed correctness phase's graph
- * captures and first-touch costs. A local comparison that does not discard
- * each residency's first run is measuring which arm happened to go first.
- */
 int ds4_qwen4exp_pdl_enabled(void) {
     static int resolved = 0;
     static int enabled = 0;
@@ -17765,6 +17780,10 @@ static int cuda_matmul_q8_0_preq_rows_exact(
          * projections retain their ordinary cache policy. */
         if (in_dim == 320u && out_dim == 10240u &&
             getenv("DS4_Q8_NO_STREAM_LOADS") == NULL) {
+            const size_t hc_pair_panel = (size_t)4u * (size_t)blocks * 34u;
+            const int hc_pair_stage = hc_pair_panel <= 12288u &&
+                (((uintptr_t)wptr) & 15u) == 0u &&
+                getenv("DS4_QWEN4EXP_NO_PAIR_LANES_STAGE") == NULL;
             if (n_rows == 4u ||
                 (n_rows == 3u && getenv("DS4_QWEN4EXP_WIDE_VERIFY_R2") == NULL)) {
                 /* One four-row tile, weight read once (streaming loads, as
@@ -17778,28 +17797,52 @@ static int cuda_matmul_q8_0_preq_rows_exact(
                 /* Rows 0..1 as one warp-pair call, row 2 as a one-row call
                  * on shifted views; per-row arithmetic is independent of
                  * `rows`.  Plain launches (no trigger at three rows). */
-                matmul_q8_hc_warp_pair_kernel<2><<<
-                        (unsigned)((out_dim + 3u) / 4u), 128, 0,
-                        cuda_decode_stream()>>>(
-                        (float *)out->ptr, (const unsigned char *)wptr,
-                        xq, xscale, out_dim, 2u);
-                matmul_q8_hc_warp_pair_kernel<2><<<
-                        (unsigned)((out_dim + 3u) / 4u), 128, 0,
-                        cuda_decode_stream()>>>(
-                        (float *)out->ptr + 2u * out_dim,
-                        (const unsigned char *)wptr,
-                        xq + 2u * blocks * 32u, xscale + 2u * blocks,
-                        out_dim, 1u);
+                if (hc_pair_stage) {
+                    matmul_q8_hc_warp_pair_kernel<2, true><<<
+                            (unsigned)((out_dim + 3u) / 4u), 128,
+                            hc_pair_panel, cuda_decode_stream()>>>(
+                            (float *)out->ptr, (const unsigned char *)wptr,
+                            xq, xscale, out_dim, 2u);
+                    matmul_q8_hc_warp_pair_kernel<2, true><<<
+                            (unsigned)((out_dim + 3u) / 4u), 128,
+                            hc_pair_panel, cuda_decode_stream()>>>(
+                            (float *)out->ptr + 2u * out_dim,
+                            (const unsigned char *)wptr,
+                            xq + 2u * blocks * 32u, xscale + 2u * blocks,
+                            out_dim, 1u);
+                } else {
+                    matmul_q8_hc_warp_pair_kernel<2><<<
+                            (unsigned)((out_dim + 3u) / 4u), 128, 0,
+                            cuda_decode_stream()>>>(
+                            (float *)out->ptr, (const unsigned char *)wptr,
+                            xq, xscale, out_dim, 2u);
+                    matmul_q8_hc_warp_pair_kernel<2><<<
+                            (unsigned)((out_dim + 3u) / 4u), 128, 0,
+                            cuda_decode_stream()>>>(
+                            (float *)out->ptr + 2u * out_dim,
+                            (const unsigned char *)wptr,
+                            xq + 2u * blocks * 32u, xscale + 2u * blocks,
+                            out_dim, 1u);
+                }
             } else if (getenv("DS4_Q8_NO_HC_WARP_PAIR") == NULL) {
                 /* PDL consumer: the stream predecessor is
                  * qwen4exp_hc_silu_quant, which triggers at its top
                  * (ds4_cuda_qwen4exp.cuh). */
-                QWEN4EXP_LAUNCH_PDL(
-                        (matmul_q8_hc_warp_pair_kernel<2>),
-                        (unsigned)((out_dim + 3u) / 4u), 128, 0,
-                        cuda_decode_stream(),
-                        (float *)out->ptr, (const unsigned char *)wptr,
-                        xq, xscale, out_dim, n_rows);
+                if (hc_pair_stage) {
+                    QWEN4EXP_LAUNCH_PDL(
+                            (matmul_q8_hc_warp_pair_kernel<2, true>),
+                            (unsigned)((out_dim + 3u) / 4u), 128,
+                            hc_pair_panel, cuda_decode_stream(),
+                            (float *)out->ptr, (const unsigned char *)wptr,
+                            xq, xscale, out_dim, n_rows);
+                } else {
+                    QWEN4EXP_LAUNCH_PDL(
+                            (matmul_q8_hc_warp_pair_kernel<2>),
+                            (unsigned)((out_dim + 3u) / 4u), 128, 0,
+                            cuda_decode_stream(),
+                            (float *)out->ptr, (const unsigned char *)wptr,
+                            xq, xscale, out_dim, n_rows);
+                }
             } else {
                 /* PDL consumer: the valve leg of the HC up edge; the stream
                  * predecessor qwen4exp_hc_silu_quant triggers at its top. */
