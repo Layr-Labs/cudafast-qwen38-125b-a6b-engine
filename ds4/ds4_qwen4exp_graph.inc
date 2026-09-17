@@ -334,6 +334,27 @@ struct ds4_qwen4exp_session {
     ds4_gpu_tensor   *ple_aux;        /* query, then the convolution input */
     ds4_gpu_tensor   *ple_value;      /* value projection, [n_batch][embd] */
 
+    /* Speculative pre-gather.  The verify's gather below runs on the host
+     * while the device waits on it, and the draft chain's head forwards then
+     * leave the host blocked inside the batch-end synchronize.  The seam
+     * posts each next-round token as it becomes known -- the fed token at the
+     * commit point, each draft at its chain step -- and the head calls
+     * ds4_qwen4exp_ple_pg_presync() in the window between its last kernel
+     * launch and that synchronize, so the row reads and the dequant run on
+     * this same thread in time the device sync was going to spend anyway.
+     * No thread is spawned: the rows are read on the gather's own thread.
+     * The gather copies a slot whose token AND hashed ids both match; a miss
+     * costs the inline gather it replaces, so the path is never slower. */
+    ds4_ple_history   ple_pg_shadow;   /* history the posted tokens imply   */
+    const ds4_qwen4exp_weights *ple_pg_w; /* the table the slots read       */
+    uint64_t         *ple_pg_ids;      /* [slots][head_count] hashed ids    */
+    float            *ple_pg_rows;     /* [slots][ple_embd] gathered rows   */
+    int32_t           ple_pg_tok[DS4_QWEN4EXP_MTP_MAX_COMMIT];
+    uint64_t          ple_pg_valid;    /* bit i: slot i holds gathered rows */
+    int               ple_pg_pending;  /* slot whose rows the head gathers  */
+    uint32_t          ple_pg_n;        /* slots posted since the reseed     */
+    bool              ple_pg_armed;    /* shadow mirrors the live history   */
+
     /* Rollback bookkeeping.  A rejecting round has written state for a token
      * that is not committed; these are the snapshots and cursors that undo it.
      * The GDN state and the PLE conv state are SNAPSHOT class -- overwritten in
@@ -768,6 +789,16 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
             ok = s->ple_ids != NULL && s->ple_rows_host != NULL;
         }
         if (ok) {
+            s->ple_pg_ids = calloc(
+                (size_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * DS4_N_PLE_HEAD,
+                sizeof(uint64_t));
+            s->ple_pg_rows = calloc(
+                (size_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * DS4_N_PLE_EMBD,
+                sizeof(float));
+            ok = s->ple_pg_ids != NULL && s->ple_pg_rows != NULL;
+            s->ple_pg_pending = -1;
+        }
+        if (ok) {
             s->ple_ready = qwen4exp_ple_read_constants(m, w, &s->ple_constants);
             ds4_ple_history_reset(&s->ple_constants, &s->ple_history);
         }
@@ -888,6 +919,8 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->ple_aux);
     ds4_gpu_tensor_free(s->ple_value);
     free(s->ple_ids);
+    free(s->ple_pg_ids);
+    free(s->ple_pg_rows);
     free(s->ple_rows_host);
     ds4_gpu_tensor_free(s->d_pos);
     ds4_gpu_tensor_free(s->d_adopt);
@@ -1014,6 +1047,10 @@ void ds4_qwen4exp_session_reset(ds4_qwen4exp_session *s) {
     }
     qwen4exp_zero_tensor(s->ple_conv_state);
     ds4_ple_history_reset(&s->ple_constants, &s->ple_history);
+    s->ple_pg_armed = false;
+    s->ple_pg_pending = -1;
+    s->ple_pg_valid = 0;
+    s->ple_pg_n = 0;
     s->pos = 0;
     s->state_dirty = false;
 }
@@ -1240,6 +1277,81 @@ static void qw_ple_pool_init(void) {
     pthread_mutex_unlock(&g_qw_ple_pool.mutex);
 }
 
+/* ---------------------------------------------------------------
+ * Speculative pre-gather: the draft-window gather.
+ *
+ * The verify's gather runs on the host while the device waits on it, and the
+ * draft chain's head forwards then leave the host blocked inside the
+ * batch-end synchronize for the whole GPU tail.  The seam posts each token
+ * the next verify will gather as it becomes known -- the fed token at the
+ * commit point, each draft at its chain step -- and the head calls
+ * ds4_qwen4exp_ple_pg_presync() between its last kernel launch and that
+ * synchronize, so the posted token's table reads and dequant run on this
+ * same thread in time the device sync was going to spend anyway.  No thread
+ * is spawned and nothing runs concurrently with the gather's own caller.
+ *
+ * A slot is a (token, ids, rows) triple.  The verify's gather copies a slot
+ * whose token and hashed ids both match the row it is about to read; equal
+ * ids name equal rows, so the copy is byte-for-byte the inline gather's
+ * output.  A miss costs the inline gather it replaces, so the path is never
+ * slower, and the last draft of a chain -- posted by no later step -- simply
+ * gathers inline as it always has.
+ *
+ * The shadow history is what makes a posted token's ids the ids the verify
+ * will hash: it is reseeded from the live history at the commit point (the
+ * first draft call of a chain, when the rollback has already restored the
+ * live history to the accepted prefix) and advanced one token per post, so
+ * at the next verify it equals the live history token for token. */
+
+void ds4_qwen4exp_ple_pg_reseed(ds4_qwen4exp_session *s,
+                                const ds4_qwen4exp_weights *w) {
+    if (!s) return;
+    s->ple_pg_shadow = s->ple_history;
+    s->ple_pg_w = w;
+    s->ple_pg_valid = 0;
+    s->ple_pg_n = 0;
+    s->ple_pg_pending = -1;
+    s->ple_pg_armed = true;
+}
+
+void ds4_qwen4exp_ple_pg_post(ds4_qwen4exp_session *s, int32_t token) {
+    if (!s || !s->ple_pg_armed || !s->ple_pg_ids ||
+        s->ple_pg_n >= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT) {
+        return;
+    }
+    /* One outstanding gather at a time: a token posted while the previous
+     * one still waits for a head window is left to the inline gather. */
+    if (s->ple_pg_pending >= 0) return;
+    const uint32_t slot = s->ple_pg_n;
+    /* The ids are hashed NOW, not in the head window: the shadow history is
+     * order-sensitive, so each post must advance it before the next post's
+     * ids are computed.  The row reads are what the window defers. */
+    ds4_ple_row_ids(&s->ple_constants, &s->ple_pg_shadow, &token, 1u,
+                    s->ple_pg_ids + (size_t)slot * DS4_N_PLE_HEAD);
+    s->ple_pg_tok[slot] = token;
+    s->ple_pg_pending = (int)slot;
+    s->ple_pg_n = slot + 1u;
+}
+
+void ds4_qwen4exp_ple_pg_presync(ds4_qwen4exp_session *s) {
+    if (!s || s->ple_pg_pending < 0) return;
+    const uint32_t slot = (uint32_t)s->ple_pg_pending;
+    s->ple_pg_pending = -1;
+    const ds4_qwen4exp_weights *w = s->ple_pg_w;
+    if (!w || !s->ple_pg_rows) return;
+    const uint64_t *ids = s->ple_pg_ids + (size_t)slot * DS4_N_PLE_HEAD;
+    float *dst = s->ple_pg_rows + (size_t)slot * DS4_N_PLE_EMBD;
+    const uint32_t blocks_per_row =
+        DS4_N_PLE_ROW_DIM / DS4_PLE_IQ4_NL_BLOCK_ELEMS;
+    for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
+        const uint8_t *quant = ds4_qwen4exp_ple_row(&w->ple, ids[h]);
+        if (!quant) return;   /* the inline gather names the bad row itself */
+        ds4_ple_dequant_iq4_nl(quant, blocks_per_row, dst);
+        dst += DS4_N_PLE_ROW_DIM;
+    }
+    s->ple_pg_valid |= 1ull << slot;
+}
+
 static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                                       const ds4_qwen4exp_weights *w,
                                       const int32_t *tokens,
@@ -1300,6 +1412,28 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
             }
         }
         for (uint32_t t = 0; t < n_tokens; t++) {
+            /* A pre-gathered slot whose token and hashed ids both match this
+             * row carries byte-for-byte the rows the inline loop below would
+             * dequant -- equal ids name equal table rows -- so the copy is
+             * the gather, done in the draft window instead of here. */
+            if (s->ple_pg_valid) {
+                bool hit = false;
+                for (uint32_t i = 0; i < s->ple_pg_n; i++) {
+                    if (!(s->ple_pg_valid & (1ull << i)) ||
+                        s->ple_pg_tok[i] != tokens[t]) continue;
+                    if (memcmp(s->ple_pg_ids + (size_t)i * DS4_N_PLE_HEAD,
+                               s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD,
+                               (size_t)DS4_N_PLE_HEAD * sizeof(uint64_t)) != 0)
+                        continue;
+                    memcpy(s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD,
+                           s->ple_pg_rows + (size_t)i * DS4_N_PLE_EMBD,
+                           (size_t)DS4_N_PLE_EMBD * sizeof(float));
+                    s->ple_pg_valid &= ~(1ull << i);
+                    hit = true;
+                    break;
+                }
+                if (hit) continue;
+            }
             /* The head's destination strides are constants of the shape, so
              * the token base is hoisted out of the head loop and the head
              * offset is carried as a pointer step instead of a multiply per
@@ -2898,36 +3032,6 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         DS4_QWEN4EXP_MTP_MAX_COMMIT, s->adopt_state, s->adopt_conv);
     if (replay_step.settle) {
         const uint32_t rs = s->adopt_state, rc = s->adopt_conv;
-        /* ONE BATCH, ONE SYNCHRONIZE, when both halves settle the same row.
-         *
-         * qwen4exp_session_copy_layers() opens its own command batch and ends
-         * it with ds4_gpu_end_commands() + ds4_gpu_synchronize(), so calling it
-         * twice -- once for the recurrent state and once for the convolution --
-         * drains the stream TWICE for one rollback.  The two passes copy
-         * disjoint buffers (gdn_state[il] from the state snapshot,
-         * gdn_conv[il] from the conv snapshot) and neither reads what the other
-         * writes, so nothing orders one before the other and the split buys
-         * nothing.
-         *
-         * The common case is exactly the mergeable one: the plan forces a
-         * settle whenever `recurrent != conv`, so on the path that survives to
-         * here with both non-zero they are equal, and one call with both flags
-         * does the same work per layer in one batch behind one drain.
-         *
-         * BIT-IDENTICAL: the same rows are copied out of the same snapshots
-         * into the same destinations, and the per-layer loop inside
-         * copy_layers already handles both flags together -- the only thing
-         * that changes is that the conv copies join the batch the state copies
-         * were already in.  The unequal and single-sided cases keep the
-         * original two-call form below. */
-        if (rs != 0u && rs == rc) {
-            if (!qwen4exp_session_copy_layers(s, rs - 1u, true, true)) {
-                fprintf(stderr, "ds4: qwen4exp GDN rollback could not settle\n");
-                return false;
-            }
-            s->adopt_state = 0u;
-            s->adopt_conv = 0u;
-        } else
         if ((rs != 0u && !qwen4exp_session_copy_layers(s, rs - 1u, true, false)) ||
             (rc != 0u && !qwen4exp_session_copy_layers(s, rc - 1u, false, true))) {
             fprintf(stderr, "ds4: qwen4exp GDN rollback could not settle\n");
