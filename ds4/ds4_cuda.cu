@@ -5880,54 +5880,11 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
                                  ? out_dim - (uint64_t)blockIdx.x * 4u : 4u;
         const uint64_t panel_bytes = rows_here * blocks * 34u;
         const char *const gp = (const char *)w + (uint64_t)blockIdx.x * 4u * blocks * 34u;
-        /* THE FILL'S DEPTH, at the two-row tile.  The rolled form below emits
-         * one LDG.E.128 followed immediately by its dependent STS.128, so a
-         * thread holds exactly one sixteen-byte request in flight.  Both
-         * launch gates bound the panel at 12,288 bytes and the fill advances
-         * 4,096 bytes a trip, so three trips cover every panel either arm
-         * admits -- a fourth would need i >= 12,288, which the gate forbids.
-         * Hoisting the three loads above the three stores puts three requests
-         * per thread in flight for the same bytes, at the same addresses, in
-         * each thread's own ascending order.  The threads' shared ranges are
-         * disjoint, no thread reads shared memory inside the fill, and the
-         * barrier below is unmoved, so the publication order is the shipping
-         * one.  Measured on the LM head shape over forty-eight interleaved
-         * samples a side: -0.93% min, -1.26% p25, -0.69% median, bit for bit
-         * the shipping output eagerly and through a captured graph replay.
-         *
-         * R >= 2 ONLY, and no launch bound, both for the same reason: the
-         * three uint4 take the allocation from 46 to 48 registers, which the
-         * two-row tile absorbs (five resident blocks per SM either way,
-         * measured), while the one-row tile sits at 40 and would be pushed to
-         * 48 and lose its sixth block.  A __launch_bounds__ on this shared
-         * template would also drop maxThreadsPerBlock to 256 for EVERY
-         * instantiation and ptxas re-chooses on that alone: <4,false,false>
-         * moves 46 -> 62 registers and 5 -> 4 blocks per SM without a line of
-         * its own code changing.  The rolled form stays for every other R. */
-        if (R >= 2) {
-            uint4 qw_pl_fill[3];
-#pragma unroll
-            for (int k = 0; k < 3; k++) {
-                const uint64_t i = ((uint64_t)threadIdx.x + 256u * (uint64_t)k) * 16u;
-                if (i + 16u <= panel_bytes)
-                    qw_pl_fill[k] = *(const uint4 *)(const void *)(gp + i);
-            }
-#pragma unroll
-            for (int k = 0; k < 3; k++) {
-                const uint64_t i = ((uint64_t)threadIdx.x + 256u * (uint64_t)k) * 16u;
-                if (i + 16u <= panel_bytes)
-                    *(uint4 *)(gpanel + i) = qw_pl_fill[k];
-            }
-            const uint64_t whole = (panel_bytes / 16u) * 16u;
-            for (uint64_t j = whole + (uint64_t)threadIdx.x; j < panel_bytes; j += 256u)
-                gpanel[j] = gp[j];
-        } else {
-            for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes; i += 256u * 16u) {
-                if (i + 16u <= panel_bytes)
-                    *(uint4 *)(gpanel + i) = *(const uint4 *)(const void *)(gp + i);
-                else
-                    for (uint64_t j = i; j < panel_bytes; j++) gpanel[j] = gp[j];
-            }
+        for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes; i += 256u * 16u) {
+            if (i + 16u <= panel_bytes)
+                *(uint4 *)(gpanel + i) = *(const uint4 *)(const void *)(gp + i);
+            else
+                for (uint64_t j = i; j < panel_bytes; j++) gpanel[j] = gp[j];
         }
         QWEN4EXP_PDL_SYNC();
         __syncthreads();
@@ -20637,54 +20594,11 @@ __global__ static void qwen_q8_projection_triple_kernel(
                                  ? out_dim - (uint64_t)block * 4u : 4u;
         const uint64_t panel_bytes = rows_here * blocks * 34u;
         const char *const gp = (const char *)w + (uint64_t)block * 4u * blocks * 34u;
-        /* THE FILL'S DEPTH, at the two-row tile.  The rolled form below emits
-         * one LDG.E.128 followed immediately by its dependent STS.128, so a
-         * thread holds exactly one sixteen-byte request in flight.  Both
-         * launch gates bound the panel at 12,288 bytes and the fill advances
-         * 4,096 bytes a trip, so three trips cover every panel either arm
-         * admits -- a fourth would need i >= 12,288, which the gate forbids.
-         * Hoisting the three loads above the three stores puts three requests
-         * per thread in flight for the same bytes, at the same addresses, in
-         * each thread's own ascending order.  The threads' shared ranges are
-         * disjoint, no thread reads shared memory inside the fill, and the
-         * barrier below is unmoved, so the publication order is the shipping
-         * one.  Measured on the LM head shape over forty-eight interleaved
-         * samples a side: -0.93% min, -1.26% p25, -0.69% median, bit for bit
-         * the shipping output eagerly and through a captured graph replay.
-         *
-         * R >= 2 ONLY, and no launch bound, both for the same reason: the
-         * three uint4 take the allocation from 46 to 48 registers, which the
-         * two-row tile absorbs (five resident blocks per SM either way,
-         * measured), while the one-row tile sits at 40 and would be pushed to
-         * 48 and lose its sixth block.  A __launch_bounds__ on this shared
-         * template would also drop maxThreadsPerBlock to 256 for EVERY
-         * instantiation and ptxas re-chooses on that alone: <4,false,false>
-         * moves 46 -> 62 registers and 5 -> 4 blocks per SM without a line of
-         * its own code changing.  The rolled form stays for every other R. */
-        if (R >= 2) {
-            uint4 qw_pl_fill[3];
-#pragma unroll
-            for (int k = 0; k < 3; k++) {
-                const uint64_t i = ((uint64_t)threadIdx.x + 256u * (uint64_t)k) * 16u;
-                if (i + 16u <= panel_bytes)
-                    qw_pl_fill[k] = *(const uint4 *)(const void *)(gp + i);
-            }
-#pragma unroll
-            for (int k = 0; k < 3; k++) {
-                const uint64_t i = ((uint64_t)threadIdx.x + 256u * (uint64_t)k) * 16u;
-                if (i + 16u <= panel_bytes)
-                    *(uint4 *)(gpanel + i) = qw_pl_fill[k];
-            }
-            const uint64_t whole = (panel_bytes / 16u) * 16u;
-            for (uint64_t j = whole + (uint64_t)threadIdx.x; j < panel_bytes; j += 256u)
-                gpanel[j] = gp[j];
-        } else {
-            for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes; i += 256u * 16u) {
-                if (i + 16u <= panel_bytes)
-                    *(uint4 *)(gpanel + i) = *(const uint4 *)(const void *)(gp + i);
-                else
-                    for (uint64_t j = i; j < panel_bytes; j++) gpanel[j] = gp[j];
-            }
+        for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes; i += 256u * 16u) {
+            if (i + 16u <= panel_bytes)
+                *(uint4 *)(gpanel + i) = *(const uint4 *)(const void *)(gp + i);
+            else
+                for (uint64_t j = i; j < panel_bytes; j++) gpanel[j] = gp[j];
         }
         QWEN4EXP_PDL_SYNC();
         __syncthreads();
