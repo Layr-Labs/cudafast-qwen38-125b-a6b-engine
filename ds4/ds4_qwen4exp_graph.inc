@@ -402,11 +402,6 @@ struct ds4_qwen4exp_session {
     ds4_gpu_tensor *gdn_out;
 
     ds4_gpu_tensor *mixed_q8; /* shared by sequential GDN/QSA projections */
-    /* 1 when the attention mixer that just ran also wrote mixed_q8, so the
-     * block behind it must not run the pre-quantize again.  Set only by
-     * qwen4exp_graph_residual and cleared by it on every call, so it can
-     * never outlive the mixer that produced it. */
-    int mixed_q8_folded;
     ds4_gpu_tensor *gdn_out_q8; /* prefill GDN output norm, as ssm_out's Q8_0 */
     ds4_gpu_tensor *qsa_doubled;
     ds4_gpu_tensor *qsa_q;
@@ -1558,13 +1553,7 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
      * session scratch: both GDN Q8 projections read the same mixed input.
      * The F32 alpha/beta projections still read the original float values.
      * Width-specific graph islands capture a stable scratch and scale offset. */
-    /* The attention mixer in front of this block may already have written
-     * mixed_q8 out of the row it was storing (bit for bit this call's output;
-     * ds4_gpu_qwen4exp_hc_mixer_q8_tensor states the contract). */
-    const int q8_done = s->mixed_q8_folded;
-    s->mixed_q8_folded = 0;
-    if (!q8_done &&
-        !ds4_qwen4exp_quantize_q8_0(s->mixed_q8, 0, q8_soff, s->mixed,
+    if (!ds4_qwen4exp_quantize_q8_0(s->mixed_q8, 0, q8_soff, s->mixed,
                                     DS4_N_EMBD, n_tokens)) {
         fprintf(stderr, "ds4: qwen4exp GDN pre-quantize failed at block %u\n", il);
         return false;
@@ -1587,21 +1576,6 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
             QW_MAP(m, l->attn_qkv), QW_MAPSZ(m, l->attn_qkv), QW_OFF(l->attn_qkv),
             DS4_N_EMBD, cfg->gdn_qkv_dim, s->mixed_q8, 0, q8_soff, n_tokens,
             &conv_slab, DS4_N_GDN_KEY_HEAD, DS4_N_GDN_VALUE_HEAD, DS4_RMS_EPS);
-    }
-#endif
-
-    /* PREFILL (CUDA): alpha and beta in one launch when the eight-warp F32
-     * tile would serve both, reading the mixed input once while it is still
-     * warm from the quantize above.  A decline launches nothing and the two
-     * calls below run. */
-    int gdn_ab_paired = 0;
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    if (n_tokens >= 8u) {
-        gdn_ab_paired = ds4_gpu_matmul_f32_pair_decode_rows_exact_tensor(
-            s->gdn_alpha, s->gdn_beta,
-            QW_MAP(m, l->ssm_alpha), QW_MAPSZ(m, l->ssm_alpha), QW_OFF(l->ssm_alpha),
-            QW_MAP(m, l->ssm_beta), QW_MAPSZ(m, l->ssm_beta), QW_OFF(l->ssm_beta),
-            DS4_N_EMBD, DS4_N_GDN_VALUE_HEAD, s->mixed, n_tokens);
     }
 #endif
 
@@ -1632,16 +1606,14 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
                                         QW_MAPSZ(m, l->attn_gate), QW_OFF(l->attn_gate),
                                         DS4_N_EMBD, cfg->gdn_inner,
                                         s->mixed_q8, 0, q8_soff, n_tokens) ||
-            (!gdn_ab_paired &&
-             !ds4_qwen4exp_matmul_f32(s->gdn_alpha, QW_MAP(m, l->ssm_alpha),
+            !ds4_qwen4exp_matmul_f32(s->gdn_alpha, QW_MAP(m, l->ssm_alpha),
                                        QW_MAPSZ(m, l->ssm_alpha), QW_OFF(l->ssm_alpha),
                                        DS4_N_EMBD, DS4_N_GDN_VALUE_HEAD,
-                                       s->mixed, n_tokens)) ||
-            (!gdn_ab_paired &&
-             !ds4_qwen4exp_matmul_f32(s->gdn_beta, QW_MAP(m, l->ssm_beta),
+                                       s->mixed, n_tokens) ||
+            !ds4_qwen4exp_matmul_f32(s->gdn_beta, QW_MAP(m, l->ssm_beta),
                                        QW_MAPSZ(m, l->ssm_beta), QW_OFF(l->ssm_beta),
                                        DS4_N_EMBD, DS4_N_GDN_VALUE_HEAD,
-                                       s->mixed, n_tokens))) {
+                                       s->mixed, n_tokens)) {
             fprintf(stderr, "ds4: qwen4exp GDN projections failed at block %u\n", il);
             return false;
         }
@@ -1765,10 +1737,7 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
     const uint64_t q8_qbytes = (uint64_t)n_tokens * q8_blocks * 32u;
     const uint64_t q8_soff = (q8_qbytes + 15u) & ~15ull;
 
-    const int q8_done = s->mixed_q8_folded;
-    s->mixed_q8_folded = 0;
-    if (!q8_done &&
-        !ds4_qwen4exp_quantize_q8_0(s->mixed_q8, 0, q8_soff, s->mixed,
+    if (!ds4_qwen4exp_quantize_q8_0(s->mixed_q8, 0, q8_soff, s->mixed,
                                     DS4_N_EMBD, n_tokens)) {
         fprintf(stderr, "ds4: qwen4exp QSA pre-quantize failed at block %u\n", il);
         return false;
@@ -2112,15 +2081,7 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
         return false;
     }
     QW_MOE_TICK(QW_MOE_T_ROUTER);
-    /* At the decode and verify widths the selection rides the expert-grouping
-     * launch instead of costing one of its own: the grouping kernel is one
-     * block and the top-k is one warp per token, so the whole producer fits
-     * inside the consumer.  The predicate is the single decision point -- the
-     * backend asserts the same one -- so the selection runs exactly once. */
-    const int moe_fuse_router = ds4_gpu_qwen4exp_moe_router_fused_ok(
-            DS4_N_EXPERT, DS4_N_EXPERT_USED, n_tokens);
-    if (!moe_fuse_router &&
-        !ds4_gpu_qwen4exp_router_select_tensor(s->moe_selected, s->moe_weights,
+    if (!ds4_gpu_qwen4exp_router_select_tensor(s->moe_selected, s->moe_weights,
                                                s->moe_logits, DS4_N_EXPERT,
                                                DS4_N_EXPERT_USED, n_tokens)) {
         fprintf(stderr, "ds4: qwen4exp router select failed at block %u\n", il);
@@ -2140,14 +2101,12 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
     const ds4_gpu_qwen4exp_slab gate_slab = QW_SLAB(m, l->ffn_gate_exps);
     const ds4_gpu_qwen4exp_slab up_slab = QW_SLAB(m, l->ffn_up_exps);
     const ds4_gpu_qwen4exp_slab down_slab = QW_SLAB(m, l->ffn_down_exps);
-    if (!ds4_gpu_qwen4exp_routed_moe_router_tensor(
+    if (!ds4_gpu_qwen4exp_routed_moe_tensor(
             s->block_out, s->moe_mid, s->moe_down_partial,
             &gate_slab, &up_slab, &down_slab,
             DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD,
             s->moe_selected, s->moe_weights, DS4_N_EXPERT, DS4_N_EXPERT_USED,
-            s->mixed, n_tokens, DS4_N_EXPERT_USED * DS4_N_FF_EXP,
-            moe_fuse_router ? s->moe_logits : NULL,
-            moe_fuse_router ? s->moe_weights : NULL)) {
+            s->mixed, n_tokens, DS4_N_EXPERT_USED * DS4_N_FF_EXP)) {
         fprintf(stderr, "ds4: qwen4exp routed experts failed at block %u\n", il);
         return false;
     }
@@ -2312,12 +2271,6 @@ static bool qwen4exp_hc_flush_pending(ds4_qwen4exp_session *s, uint32_t n_tokens
                                              n_tokens) != 0;
 }
 
-/* want_mixed_q8: ask the backend to fold the Q8_0 pre-quantize of s->mixed --
- * the one the GDN/QSA projections behind an ATTENTION mixer read -- into the
- * mixer itself.  s->mixed_q8_folded reports what happened and the block behind
- * the mixer skips its own quantize only on a 1.  The FFN and final mixers pass
- * 0: their `mixed` feeds the f32 router tree and the LM head, not this
- * quantization. */
 static bool qwen4exp_graph_residual(ds4_qwen4exp_session *s,
                                     const ds4_model *m,
                                     const ds4_tensor *norm,
@@ -2325,13 +2278,11 @@ static bool qwen4exp_graph_residual(ds4_qwen4exp_session *s,
                                     const ds4_tensor *up,
                                     const ds4_tensor *inject,
                                     float norm_weight_offset,
-                                    uint32_t n_tokens,
-                                    int want_mixed_q8) {
+                                    uint32_t n_tokens) {
     /* An owed inject is applied by the mixer itself, inside its first read
      * of the residual; the pair (inject kernel, mixer) is what it computes. */
     const bool pending = s->hc_pending;
     s->hc_pending = false;
-    s->mixed_q8_folded = 0;
 #ifdef DS4_TEST_HOOKS
     /* The tower's final mixer is the only call with no inject head.  Copy what
      * it is about to read, inside this batch so the ordering is the GPU's and
@@ -2360,21 +2311,6 @@ static bool qwen4exp_graph_residual(ds4_qwen4exp_session *s,
             DS4_N_EMBD, DS4_N_HC, DS4_N_HC_LOWRANK, n_tokens,
             DS4_HC_EPS, norm_weight_offset, 1, s->block_out, s->inject) != 0;
     }
-    if (want_mixed_q8) {
-        const uint64_t q8_blocks = (uint64_t)DS4_N_EMBD / 32u;
-        const uint64_t q8_qbytes = (uint64_t)n_tokens * q8_blocks * 32u;
-        const uint64_t q8_soff = (q8_qbytes + 15u) & ~15ull;
-        int folded = 0;
-        const int rc = ds4_gpu_qwen4exp_hc_mixer_q8_tensor(
-            s->mixed, inject ? s->inject : NULL, s->normed, s->lowrank, s->wide,
-            s->hyper, &norm_slab, &down_slab, &up_slab,
-            inject ? &inject_slab : NULL,
-            DS4_N_EMBD, DS4_N_HC, DS4_N_HC_LOWRANK, n_tokens,
-            DS4_HC_EPS, norm_weight_offset, 1,
-            s->mixed_q8, 0, q8_soff, &folded);
-        s->mixed_q8_folded = rc != 0 ? folded : 0;
-        return rc != 0;
-    }
     return ds4_gpu_qwen4exp_hc_mixer_tensor(
         s->mixed, inject ? s->inject : NULL, s->normed, s->lowrank, s->wide,
         s->hyper, &norm_slab, &down_slab, &up_slab,
@@ -2395,7 +2331,7 @@ static bool qwen4exp_graph_layer_island_encode(
         /* --- attention side ------------------------------------------- */
         if (!qwen4exp_graph_residual(s, m, l->hc_attn_norm, l->hc_attn_down,
                                      l->hc_attn_up, l->hc_attn_inject,
-                                     l->hc_attn_norm_offset, n_tokens, 1)) {
+                                     l->hc_attn_norm_offset, n_tokens)) {
             fprintf(stderr, "ds4: qwen4exp attention mixer failed at block %u\n", il);
             return false;
         }
@@ -2422,7 +2358,7 @@ static bool qwen4exp_graph_layer_island_encode(
         /* --- feed-forward side ---------------------------------------- */
         if (!qwen4exp_graph_residual(s, m, l->hc_ffn_norm, l->hc_ffn_down,
                                      l->hc_ffn_up, l->hc_ffn_inject,
-                                     l->hc_ffn_norm_offset, n_tokens, 0)) {
+                                     l->hc_ffn_norm_offset, n_tokens)) {
             fprintf(stderr, "ds4: qwen4exp FFN mixer failed at block %u\n", il);
             return false;
         }
@@ -3095,7 +3031,7 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
      * n_embd and stands in for the model.norm this checkpoint does not have. */
     if (!qwen4exp_graph_residual(s, m, w->output_hc_norm, w->output_hc_down,
                                  w->output_hc_up, NULL,
-                                 w->output_hc_norm_offset, n_tokens, 0)) {
+                                 w->output_hc_norm_offset, n_tokens)) {
         fprintf(stderr, "ds4: qwen4exp final mixer failed\n");
         return qwen4exp_forward_fail();
     }
@@ -3409,17 +3345,13 @@ static bool qwen4exp_graph_head_cache_encode(ds4_qwen4exp_session *s,
         uint32_t il, uint32_t n_tokens) {
     const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
     if (!qwen4exp_graph_residual(s, m, l->hc_attn_norm, l->hc_attn_down,
-            l->hc_attn_up, l->hc_attn_inject, l->hc_attn_norm_offset, n_tokens,
-            1))
+            l->hc_attn_up, l->hc_attn_inject, l->hc_attn_norm_offset, n_tokens))
         return false;
     const uint64_t blocks = (uint64_t)DS4_N_EMBD / 32u;
     const uint64_t qbytes = (uint64_t)n_tokens * blocks * 32u;
     const uint64_t soff = (qbytes + 15u) & ~15ull;
-    const int q8_done = s->mixed_q8_folded;
-    s->mixed_q8_folded = 0;
-    if ((!q8_done &&
-         !ds4_qwen4exp_quantize_q8_0(s->mixed_q8, 0, soff, s->mixed,
-                                     DS4_N_EMBD, n_tokens)) ||
+    if (!ds4_qwen4exp_quantize_q8_0(s->mixed_q8, 0, soff, s->mixed,
+                                   DS4_N_EMBD, n_tokens) ||
         !ds4_qwen4exp_matmul_q8_0_preq(s->qsa_kin, QW_MAP(m, l->attn_k),
             QW_MAPSZ(m, l->attn_k), QW_OFF(l->attn_k), DS4_N_EMBD,
             cfg->qsa_kv_dim, s->mixed_q8, 0, soff, n_tokens) ||
@@ -3479,7 +3411,7 @@ static bool qwen4exp_graph_head_block_encode(
     const char *stage = "attention mixer";
     bool ok = qwen4exp_graph_residual(s, m, l->hc_attn_norm, l->hc_attn_down,
                                       l->hc_attn_up, l->hc_attn_inject,
-                                      l->hc_attn_norm_offset, n_tokens, 1);
+                                      l->hc_attn_norm_offset, n_tokens);
     QW_HB_TICK(QW_HB_T_ATTN_MIX);
     if (ok) { stage = "QSA"; ok = qwen4exp_graph_qsa_block(s, l, m, il, n_tokens); }
     QW_HB_TICK(QW_HB_T_QSA);
@@ -3494,7 +3426,7 @@ static bool qwen4exp_graph_head_block_encode(
         stage = "FFN mixer";
         ok = qwen4exp_graph_residual(s, m, l->hc_ffn_norm, l->hc_ffn_down,
                                      l->hc_ffn_up, l->hc_ffn_inject,
-                                     l->hc_ffn_norm_offset, n_tokens, 0);
+                                     l->hc_ffn_norm_offset, n_tokens);
     }
     QW_HB_TICK(QW_HB_T_FFN_MIX);
     if (ok) {
@@ -3760,7 +3692,7 @@ bool ds4_qwen4exp_graph_head_logits(ds4_qwen4exp_session       *s,
     }
     if (!qwen4exp_graph_residual(s, m, w->output_hc_norm, w->output_hc_down,
                                  w->output_hc_up, NULL,
-                                 w->output_hc_norm_offset, 1u, 0)) {
+                                 w->output_hc_norm_offset, 1u)) {
         fprintf(stderr, "ds4: qwen4exp final mixer failed on the head row\n");
         return qwen4exp_forward_fail();
     }

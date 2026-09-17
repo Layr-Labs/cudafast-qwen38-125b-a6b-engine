@@ -571,12 +571,6 @@ static int mtp_commit_one(ds4_qwen4exp_mtp_state *st,
     return 1;
 }
 
-/* This build's note auto09171904_3 records that a dependent-launch edge on
- * the routed down projection, whose producer documents that its trigger
- * otherwise fires into nothing, measured worse on the ranked path rather
- * than better. The gap in the comment is real; exploiting it is not
- * obviously a win.
- */
 int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
                            const ds4_qwen4exp_mtp_model *model,
                            int first_token,

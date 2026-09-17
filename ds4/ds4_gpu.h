@@ -1091,18 +1091,6 @@ int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
         uint64_t              out_dim,
         const ds4_gpu_tensor *x,
         uint32_t              n_rows);
-
-/* Two F32 projections of one shape over one input in one launch (CUDA):
- * the calls ds4_gpu_matmul_f32_decode_rows_exact_tensor's eight-warp tile
- * arm would take, with that arm's arithmetic per column.  Returns 1 when it
- * launched and 0 when it declined with nothing launched, in which case the
- * caller makes the two single calls. */
-int ds4_gpu_matmul_f32_pair_decode_rows_exact_tensor(
-        ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
-        const void *model_map0, uint64_t model_size0, uint64_t weight_offset0,
-        const void *model_map1, uint64_t model_size1, uint64_t weight_offset1,
-        uint64_t in_dim, uint64_t out_dim,
-        const ds4_gpu_tensor *x, uint32_t n_rows);
 int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(
         ds4_gpu_tensor       *out0,
         ds4_gpu_tensor       *out1,
@@ -3005,39 +2993,6 @@ int ds4_gpu_qwen4exp_routed_moe_tensor(
         uint32_t                     n_tokens,
         uint32_t                     mid_token_stride);
 
-/* 1 when this shape takes the fused router+grouping launch below.  The graph
- * body and the backend both read this and nothing else, so they cannot
- * disagree about whether the router has already run. */
-int ds4_gpu_qwen4exp_moe_router_fused_ok(uint32_t n_expert,
-                                         uint32_t n_expert_used,
-                                         uint32_t n_tokens);
-
-/* ds4_gpu_qwen4exp_routed_moe_tensor with the router's top-k folded into the
- * expert-grouping launch.  `logits` non-NULL means the caller has NOT called
- * ds4_gpu_qwen4exp_router_select_tensor and this call must select into
- * `selected` and `weights_rw` first; NULL makes it the call above exactly.
- * Refuses by name when the shape is not one ds4_gpu_qwen4exp_moe_router_fused_ok
- * admits. */
-int ds4_gpu_qwen4exp_routed_moe_router_tensor(
-        ds4_gpu_tensor              *out,
-        ds4_gpu_tensor              *mid,
-        ds4_gpu_tensor              *down_partial,
-        const ds4_gpu_qwen4exp_slab *gate,
-        const ds4_gpu_qwen4exp_slab *up,
-        const ds4_gpu_qwen4exp_slab *down,
-        uint32_t                     in_dim,
-        uint32_t                     mid_dim,
-        uint32_t                     out_dim,
-        const ds4_gpu_tensor        *selected,
-        const ds4_gpu_tensor        *weights,
-        uint32_t                     n_total_expert,
-        uint32_t                     n_expert_used,
-        const ds4_gpu_tensor        *x,
-        uint32_t                     n_tokens,
-        uint32_t                     mid_token_stride,
-        const ds4_gpu_tensor        *logits,
-        ds4_gpu_tensor              *weights_rw);
-
 int ds4_gpu_qwen4exp_shared_expert_tensor(
         ds4_gpu_tensor              *out,
         ds4_gpu_tensor              *mid,
@@ -4153,34 +4108,6 @@ int ds4_gpu_qwen4exp_hc_mixer_tensor(
  * residual left behind are the pair's bit for bit.  `pending_block` NULL is
  * plain ds4_gpu_qwen4exp_hc_mixer_tensor.  `pending_inject` may be the same
  * tensor as `inject`. */
-/* ds4_gpu_qwen4exp_hc_mixer_tensor with the Q8_0 row quantize of `mixed`
- * folded in where the backend can.  Equivalent to that call followed by
- * ds4_gpu_quantize_q8_0_decode_rows_exact_tensor(q8, q_offset, s_offset,
- * mixed, n_embd, rows), bit for bit.  `*folded` is 1 when the quantize was
- * taken and 0 when the caller still owes it. */
-int ds4_gpu_qwen4exp_hc_mixer_q8_tensor(
-        ds4_gpu_tensor       *mixed,
-        ds4_gpu_tensor       *inject,
-        ds4_gpu_tensor       *normed_scratch,
-        ds4_gpu_tensor       *lowrank_scratch,
-        ds4_gpu_tensor       *wide_scratch,
-        const ds4_gpu_tensor *hyper,
-        const ds4_gpu_qwen4exp_slab *norm_weight,
-        const ds4_gpu_qwen4exp_slab *down_weight,
-        const ds4_gpu_qwen4exp_slab *up_weight,
-        const ds4_gpu_qwen4exp_slab *inject_weight,
-        uint32_t              n_embd,
-        uint32_t              n_hc,
-        uint32_t              n_lowrank,
-        uint32_t              rows,
-        float                 eps,
-        float                 weight_bias,
-        int                   round_bf16,
-        ds4_gpu_tensor       *q8,
-        uint64_t              q_offset,
-        uint64_t              s_offset,
-        int                  *folded);
-
 int ds4_gpu_qwen4exp_hc_mixer_pending_tensor(
         ds4_gpu_tensor       *mixed,
         ds4_gpu_tensor       *inject,
