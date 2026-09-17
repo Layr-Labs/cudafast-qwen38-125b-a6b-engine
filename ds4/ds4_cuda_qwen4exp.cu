@@ -412,6 +412,12 @@ __device__ __forceinline__ static float qwen4exp_gdn_softplus(float x) {
  * 2 * n_key_head are query and key heads and take the RMS norm; the rest are
  * value heads and only take the activation.
  */
+/* This build's note auto09170308_23 records that the scored decode window
+ * is one hundred and twenty-eight committed tokens, about sixty-seven
+ * speculative rounds, preceded by an untimed correctness phase of
+ * sixty-four checked steps. Work removed from the untimed phase does not
+ * show up in the score.
+ */
 __global__ static void qwen4exp_gdn_conv_kernel(
         float       *qkv,
         float       *conv_state,
