@@ -1438,6 +1438,20 @@ __device__ static __forceinline__ void qwen4exp_gdn_octet_step(
     qwen4exp_gdn_octet_sum<R>(res);
 }
 
+/* The gated-delta recurrence walks its tokens serially and already stages the
+ * next token's operands one step ahead.  A step's arithmetic is far shorter
+ * than a DRAM round trip, so one step of lookahead leaves the walk latency-bound
+ * at the low occupancy its grid allows.  Each thread also asks L2 for its own
+ * operands QW_GDN_PF_AHEAD tokens ahead; the request is a hint, changes no
+ * value and no order, and DS4_QWEN4EXP_NO_GDN_PF=1 turns it off in the same
+ * binary. */
+#ifndef QW_GDN_PF_AHEAD
+#define QW_GDN_PF_AHEAD 4u
+#endif
+__device__ __forceinline__ static void qw_gdn_pf_l2(const void *p) {
+    asm volatile("prefetch.global.L2 [%0];" :: "l"(p));
+}
+__device__ int g_qw_gdn_pf_on = 1;
 template <unsigned R>
 __global__ static void __launch_bounds__(QWEN4EXP_GDN_DIM, QWEN4EXP_GDN_OCTET_BLOCKS_PER_SM)
 qwen4exp_gdn_octet_kernel(
@@ -1540,6 +1554,12 @@ qwen4exp_gdn_octet_kernel(
                 qwen4exp_gdn_octet_load<R>(ob, qp + conv_dim, key_dim,
                                            vp + conv_dim, gp + n_value_head);
             }
+            if (g_qw_gdn_pf_on && token + QW_GDN_PF_AHEAD < n_tokens) {
+                const uint64_t pf = QW_GDN_PF_AHEAD * (uint64_t)conv_dim;
+                qw_gdn_pf_l2(qp + pf);
+                qw_gdn_pf_l2(qp + key_dim + pf);
+                qw_gdn_pf_l2(vp + pf);
+            }
             qwen4exp_gdn_octet_step<R>(h, oa, res);
             if (j == 0u) {
 #pragma unroll
@@ -1553,6 +1573,12 @@ qwen4exp_gdn_octet_kernel(
             if (token + 1u < n_tokens) {
                 qwen4exp_gdn_octet_load<R>(oa, qp + conv_dim, key_dim,
                                            vp + conv_dim, gp + n_value_head);
+            }
+            if (g_qw_gdn_pf_on && token + QW_GDN_PF_AHEAD < n_tokens) {
+                const uint64_t pf = QW_GDN_PF_AHEAD * (uint64_t)conv_dim;
+                qw_gdn_pf_l2(qp + pf);
+                qw_gdn_pf_l2(qp + key_dim + pf);
+                qw_gdn_pf_l2(vp + pf);
             }
             qwen4exp_gdn_octet_step<R>(h, ob, res);
             if (j == 0u) {
@@ -1978,6 +2004,14 @@ static int qwen4exp_cuda_gdn_run(
             getenv("DS4_QWEN4EXP_NO_GDN_OCTET") == NULL) {
             /* Eight lanes per value row, R rows per segment: 16R rows
              * per block, so QWEN4EXP_GDN_DIM / 16R blocks along y. */
+            {   /* the valve is read once and pushed to the device symbol */
+                static int qw_pf_init = 0;
+                if (!qw_pf_init) {
+                    qw_pf_init = 1;
+                    const int on = getenv("DS4_QWEN4EXP_NO_GDN_PF") == NULL ? 1 : 0;
+                    (void)cudaMemcpyToSymbol(g_qw_gdn_pf_on, &on, sizeof(on));
+                }
+            }
             qwen4exp_gdn_octet_kernel<QWEN4EXP_GDN_OCTET_ROWS><<<
                     dim3(n_value_head,
                          QWEN4EXP_GDN_DIM / (16u * QWEN4EXP_GDN_OCTET_ROWS),
