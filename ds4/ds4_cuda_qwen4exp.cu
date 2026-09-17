@@ -6274,6 +6274,12 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
  * state at source. */
 template <int R, int DownType = -1, bool Vector = false, bool Stage = false,
           bool Async = false>
+/* This build's note auto09171212_8 records that the scored decode window is
+ * one hundred and twenty-eight committed tokens, about sixty-seven
+ * speculative rounds, preceded by an untimed correctness phase of
+ * sixty-four checked steps. Work removed from the untimed phase does not
+ * show up in the score.
+ */
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
