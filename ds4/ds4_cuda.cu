@@ -6727,6 +6727,24 @@ __device__ __forceinline__ static void q8_mma_sts_16(void *smem, uint4 v) {
                  :: "r"(s), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
 }
 
+/* The 8-byte pair of the two above, for the one staged array whose row is
+ * narrower than 16 bytes: the activation scales at G == 2 hold exactly two
+ * floats per row (AS row stride is G floats, which the consumer already
+ * reads back as a float2).  Both are 8-byte aligned by the dispatch guard
+ * `blocks % 8 == 0`: the scale index is `row * blocks + s * G`, a multiple
+ * of 8 plus an even number, so the pair never straddles a bank pair. */
+__device__ __forceinline__ static uint2 q8_mma_ldg_8(const void *gmem) {
+    uint2 v;
+    asm volatile("ld.global.v2.u32 {%0,%1}, [%2];" : "=r"(v.x), "=r"(v.y) : "l"(gmem));
+    return v;
+}
+
+__device__ __forceinline__ static void q8_mma_sts_8(void *smem, uint2 v) {
+    const uint32_t s = (uint32_t)__cvta_generic_to_shared(smem);
+    asm volatile("st.shared.v2.u32 [%0], {%1,%2};"
+                 :: "r"(s), "r"(v.x), "r"(v.y) : "memory");
+}
+
 __device__ __forceinline__ static void q8_mma_ldmatrix_x4(uint32_t r[4],
                                                           const void *smem) {
     const uint32_t s = (uint32_t)__cvta_generic_to_shared(smem);
@@ -6869,9 +6887,21 @@ matmul_q8_0_preq_rows_mma_pipe_kernel(float *out,
          * every memory the weights can live in. */
         constexpr int PT = 32 * C::PWARPS;
         constexpr int KA = (BM * C::A_CHUNKS + PT - 1) / PT;
-        constexpr int KS = (BM * (G / 4) + PT - 1) / PT;
+        /* Activation-scale staging granularity.  A row of sAs is G floats
+         * wide, so at G >= 4 it stages as G/4 sixteen-byte chunks and SSW/SSC
+         * reduce to exactly the shipped `4` and `G / 4`; at G == 2 a row is a
+         * single eight-byte pair.  Spelled this way because `G / 4` is a
+         * compile-time zero at G == 2 and `idx / (G / 4)` is then a division
+         * by zero in a constant expression -- which is the only thing that
+         * ever blocked G == 2, since the consumer has read that case back as
+         * a float2 all along.  The second assert is the guarantee that the
+         * three shipped rungs keep byte-for-byte the same staging. */
+        constexpr int SSW = (G >= 4) ? 4 : 2;          /* scales per chunk */
+        constexpr int SSC = G / SSW;                   /* chunks per row */
+        constexpr int KS = (BM * SSC + PT - 1) / PT;
         constexpr int KB = (BN * C::B_CHUNKS + PT - 1) / PT;
-        static_assert(G % 4 == 0, "activation scales: 16-byte chunks");
+        static_assert(G % SSW == 0, "activation scales: whole chunks per row");
+        static_assert(G < 4 || (SSW == 4 && SSC == G / 4), "G >= 4 keeps the shipped granularity");
         const int pl = (int)lane + 32 * pw;   /* producer lane, 0 .. PT-1 */
 
         for (uint64_t s = 0; s < nstage; s++) {
@@ -6901,12 +6931,18 @@ matmul_q8_0_preq_rows_mma_pipe_kernel(float *out,
 #pragma unroll
             for (int k = 0; k < KS; k++) {
                 const int idx = pl + k * PT;
-                const int r = idx / (G / 4);
-                const int c = idx - r * (G / 4);
+                const int r = idx / SSC;
+                const int c = idx - r * SSC;
                 const uint64_t row = (uint64_t)m0 + (uint32_t)r;
                 rs[k] = make_uint4(0u, 0u, 0u, 0u);
-                if (idx < BM * (G / 4) && row < (uint64_t)n_rows) {
-                    rs[k] = q8_mma_ldg_16_cg(xscale + row * blocks + g0 + (uint32_t)c * 4u);
+                if (idx < BM * SSC && row < (uint64_t)n_rows) {
+                    const float *sp = xscale + row * blocks + g0 + (uint32_t)c * (uint32_t)SSW;
+                    if (SSW == 4) {
+                        rs[k] = q8_mma_ldg_16_cg(sp);
+                    } else {
+                        const uint2 v2 = q8_mma_ldg_8(sp);
+                        rs[k] = make_uint4(v2.x, v2.y, 0u, 0u);
+                    }
                 }
             }
 #pragma unroll
@@ -6947,9 +6983,13 @@ matmul_q8_0_preq_rows_mma_pipe_kernel(float *out,
 #pragma unroll
             for (int k = 0; k < KS; k++) {
                 const int idx = pl + k * PT;
-                const int r = idx / (G / 4);
-                const int c = idx - r * (G / 4);
-                if (idx < BM * (G / 4)) q8_mma_sts_16(sAs + r * G + c * 4, rs[k]);
+                const int r = idx / SSC;
+                const int c = idx - r * SSC;
+                if (idx < BM * SSC) {
+                    float *dp = sAs + r * G + c * SSW;
+                    if (SSW == 4) q8_mma_sts_16(dp, rs[k]);
+                    else          q8_mma_sts_8(dp, make_uint2(rs[k].x, rs[k].y));
+                }
             }
 #pragma unroll
             for (int k = 0; k < KB; k++) {
@@ -17628,6 +17668,83 @@ extern "C" void ds4_gpu_set_q8_mma_pipe_wide(int mode) {
     g_q8_mma_pipe_wide = mode;
 }
 
+/* The deep rung of the pipe ladder below, DS4_CUDA_MMA_PIPE_DEEP: 0 keeps the
+ * two-stage ladder, unset or 1 tries a third stage buffer on the 128x64 tile
+ * before falling back to it.
+ *
+ * Why a third stage is free HERE and nowhere else in this ladder.  The stage
+ * footprint is A_BYTES + B_BYTES + AS_BYTES + WS_BYTES = 18432 + 9216 + 2048 +
+ * 1024 = 30720 on the 128x64 tile, so two stages are 61440 and three are
+ * 92160, both under this device's 101376 per-block opt-in.  The occupancy that
+ * would normally pay for the depth is ALREADY spent: 101376 / 61440 = 1.65, so
+ * the shipped rung is one block per SM, and one block per SM is also what
+ * 92160 buys.  A third buffer cannot cost a residency the tile never had.
+ * The 128x128 rung is a different story -- 40960 a stage, so three stages want
+ * 122880 and the opt-in is refused -- which is why this valve is scoped to the
+ * tile below and not to the ladder as a whole.
+ *
+ * It does not touch the arithmetic.  STAGES enters the kernel only through
+ * `buf = s % STAGES`, which chooses WHICH buffer stage s lands in; consumers
+ * still walk s strictly ascending and the B skew is `(s * B_RAW) & 15`, a
+ * function of s alone.  So every product reaches its accumulator in the same
+ * order at either depth -- the kernel's contract two hundred lines up, same as
+ * the wide valve above.  Read once like the others; the test flips it through
+ * ds4_gpu_set_q8_mma_pipe_deep. */
+static int g_q8_mma_pipe_deep = -1;
+static int cuda_q8_mma_pipe_deep_mode(void) {
+    if (g_q8_mma_pipe_deep < 0) {
+        int mode = 1;
+        const char *e = getenv("DS4_CUDA_MMA_PIPE_DEEP");
+        if (e != NULL) {
+            mode = atoi(e);
+            if (mode < 0 || mode > 1) mode = 1;
+        }
+        g_q8_mma_pipe_deep = mode;
+    }
+    return g_q8_mma_pipe_deep;
+}
+extern "C" void ds4_gpu_set_q8_mma_pipe_deep(int mode) {
+    g_q8_mma_pipe_deep = mode;
+}
+
+/* The wide rung's depth valve, and the one knob that is not shared-memory
+ * arithmetic.  The 128x128 tile cannot hold a third stage at G == 4 (122880
+ * against a 101376 opt-in), so the only way to deepen the rung that carries
+ * the widest projections is to halve the k32 steps a stage covers.  At G == 2
+ * a stage is 22528 B, so FOUR buffers cost 90112 -- still one block per SM,
+ * exactly as the shipped two-stage 81920 is, and covering the same eight k32
+ * steps.  So this isolates buffer count with the k window, the tile, the
+ * thread count and the residency all held fixed; the price is that nstage
+ * doubles, hence twice as many stage handshakes for the same work.
+ *
+ * Bit-exact for the same reason the depth valve is, and it needs no tail
+ * argument: cuda_q8_mma_pipe_try rejects on `blocks % 8 != 0`, so blocks is a
+ * multiple of every legal G and nstage*G == blocks exactly -- there are no
+ * K-padding steps at any G.  A k32 step is `s * G + gg` with both loops
+ * ascending, so the step sequence is 0..blocks-1 whatever G is, and the
+ * accumulation order into acc[mi][ni][e] is unchanged.  The `(gg & 1)` word
+ * alignment branch is parity-preserving because every legal G is even, and
+ * `skew = (s * B_RAW) & 15` is the source misalignment `s * G * 34 & 15` by
+ * construction.  B_WINDOW still covers skew + B_RAW exactly: at G == 2,
+ * B_RAW = 68 = 4 (mod 16) so B_GCD = 4, skew is a multiple of 4 and at most
+ * 12, and 12 + 68 = 80 = B_WINDOW. */
+static int g_q8_mma_pipe_g2 = -1;
+static int cuda_q8_mma_pipe_g2_mode(void) {
+    if (g_q8_mma_pipe_g2 < 0) {
+        int mode = 1;
+        const char *e = getenv("DS4_CUDA_MMA_PIPE_G2");
+        if (e != NULL) {
+            mode = atoi(e);
+            if (mode < 0 || mode > 1) mode = 1;
+        }
+        g_q8_mma_pipe_g2 = mode;
+    }
+    return g_q8_mma_pipe_g2;
+}
+extern "C" void ds4_gpu_set_q8_mma_pipe_g2(int mode) {
+    g_q8_mma_pipe_g2 = mode;
+}
+
 /* The device's occupancy limits, as a compact string the caller can append to
  * an identity that reaches the run's metrics.  See ds4.h for why this is worth
  * publishing.
@@ -17738,6 +17855,14 @@ static void cuda_q8_mma_pipe_prepare(void) {
     (void)cuda_q8_mma_pipe_attr<2, 2, 4, 4, 4, 2>();
     (void)cuda_q8_mma_pipe_attr<2, 4, 4, 4, 4, 2>();
     (void)cuda_q8_mma_pipe_attr<2, 8, 4, 4, 4, 2>();
+    /* The deep rung, opted in here for the same reason as the three above: the
+     * memoised attr call is the only cudaFuncSetAttribute on the path, and
+     * doing it at prepare time keeps it out of the timed phase.  A device that
+     * refuses 92160 memoises the refusal and the ladder falls back. */
+    (void)cuda_q8_mma_pipe_attr<2, 2, 4, 4, 4, 3>();
+    /* The wide rung's four-buffer G == 2 variant, opted in for the same
+     * reason: 90112 is the largest footprint the ladder asks for. */
+    (void)cuda_q8_mma_pipe_attr<2, 4, 4, 4, 2, 4>();
 }
 
 /* The pipelined tile's shape ladder.  Returns 0 when the call is not one it
@@ -17783,6 +17908,14 @@ static int cuda_q8_mma_pipe_try(float *out, const unsigned char *w,
             cuda_q8_mma_pipe_launch<2, 8, 4, 4, 4, 2>(out, w, xq, xscale, out_dim, n_rows, blocks)) {
             return 1;
         }
+        /* Four buffers over the same eight k32 steps as the two-stage rung
+         * below, at the same one block per SM (90112 against 101376); see the
+         * G == 2 valve's comment.  A refusal is memoised and returns 0, so the
+         * shipped two-stage launch on the next line still runs. */
+        if (cuda_q8_mma_pipe_g2_mode() != 0 &&
+            cuda_q8_mma_pipe_launch<2, 4, 4, 4, 2, 4>(out, w, xq, xscale, out_dim, n_rows, blocks)) {
+            return 1;
+        }
         if (cuda_q8_mma_pipe_launch<2, 4, 4, 4, 4, 2>(out, w, xq, xscale, out_dim, n_rows, blocks)) {
             return 1;
         }
@@ -17790,6 +17923,15 @@ static int cuda_q8_mma_pipe_try(float *out, const unsigned char *w,
     }
     if (out_dim > 384u && out_dim <= 1024u) {
         return cuda_q8_mma_pipe_launch<2, 4, 4, 4, 4, 2>(out, w, xq, xscale, out_dim, n_rows, blocks);
+    }
+    /* The 128x64 tile, three stages first (see the deep-rung comment above).
+     * This is the rung the 2560-wide out projections land on -- 6144 -> 2560
+     * measured 401 us here against the 128x128 tile's 452 -- and the only rung
+     * whose three-stage footprint (92160) clears the opt-in.  A refusal is
+     * memoised and returns 0, so the two-stage launch below still runs. */
+    if (cuda_q8_mma_pipe_deep_mode() != 0 &&
+        cuda_q8_mma_pipe_launch<2, 2, 4, 4, 4, 3>(out, w, xq, xscale, out_dim, n_rows, blocks)) {
+        return 1;
     }
     return cuda_q8_mma_pipe_launch<2, 2, 4, 4, 4, 2>(out, w, xq, xscale, out_dim, n_rows, blocks);
 }
