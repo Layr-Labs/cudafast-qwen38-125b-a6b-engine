@@ -412,12 +412,6 @@ __device__ __forceinline__ static float qwen4exp_gdn_softplus(float x) {
  * 2 * n_key_head are query and key heads and take the RMS norm; the rest are
  * value heads and only take the activation.
  */
-/* This build's note auto09170554_1 records that the captured-graph lookup
- * is a linear scan with no eviction, and both directions off the shipped
- * width were measured: sixteen slots is about three and a half percent
- * slower than eight, four slots about half a percent slower than eight. The
- * cost is not linear in the slot count and eight is a measured optimum.
- */
 __global__ static void qwen4exp_gdn_conv_kernel(
         float       *qkv,
         float       *conv_state,

@@ -3602,9 +3602,22 @@ bool ds4_qwen4exp_graph_verify_top1_rows(ds4_qwen4exp_session       *s,
     s->spec_logit_rows = 0u;
     s->spec_top1_rows = 0u;
     if (!forward_ok) return false;
-    if (hc_rows && !ds4_qwen4exp_session_read_hyper(s, 0, n_tokens, hc_rows)) {
-        fprintf(stderr, "ds4: qwen4exp compact verify hyper read failed\n");
-        return false;
+    /* The two readbacks are one round trip: the hyper rows and the top-1
+     * block are both produced by the forward that just synchronized, so the
+     * pair stages them together instead of paying a pageable staging round
+     * trip each. */
+    if (hc_rows) {
+        const uint64_t row = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+        if (!s->hyper ||
+            (uint64_t)n_tokens > s->plan.n_batch ||
+            !ds4_gpu_tensor_read_pair(s->hyper, 0, hc_rows,
+                                      (uint64_t)n_tokens * row,
+                                      s->spec_top1, 0, row_top1,
+                                      (uint64_t)n_tokens * sizeof(int32_t))) {
+            fprintf(stderr, "ds4: qwen4exp compact verify read failed\n");
+            return false;
+        }
+        return true;
     }
     return ds4_gpu_tensor_read(s->spec_top1, 0, row_top1,
                                (uint64_t)n_tokens * sizeof(int32_t)) != 0;

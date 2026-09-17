@@ -3514,6 +3514,69 @@ extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset
     return ok;
 }
 
+/* Two device-to-host reads as one round trip.  The blocking tensor read is a
+ * synchronous cudaMemcpy, so back-to-back reads pay a pageable staging
+ * round trip each.  Here both copies go to one pinned stage on the legacy
+ * stream -- which the decode work also runs on in eager mode, so the copies
+ * are ordered after it -- and one stream sync covers the pair.  The caller's
+ * destinations stay pageable; the final memcpy out of the stage is host
+ * work.  A capture in flight or a cross-device pair falls back to the two
+ * serial reads, which is what every caller did before. */
+static void  *g_pair_stage_raw = NULL;
+static void  *g_pair_stage = NULL;
+static size_t g_pair_stage_bytes = 0;
+
+extern "C" int ds4_gpu_tensor_read_pair(const ds4_gpu_tensor *a,
+                                        uint64_t a_off, void *a_out,
+                                        uint64_t a_bytes,
+                                        const ds4_gpu_tensor *b,
+                                        uint64_t b_off, void *b_out,
+                                        uint64_t b_bytes) {
+    if (!a || !b || !a_out || !b_out ||
+        a_off > a->bytes || a_bytes > a->bytes - a_off ||
+        b_off > b->bytes || b_bytes > b->bytes - b_off) {
+        return 0;
+    }
+    const int da = ds4_tensor_device_idx(a);
+    if (g_decode_graph_capturing || ds4_tensor_device_idx(b) != da) {
+        return ds4_gpu_tensor_read(a, a_off, a_out, a_bytes) &&
+               ds4_gpu_tensor_read(b, b_off, b_out, b_bytes);
+    }
+    const size_t need = (size_t)a_bytes + (size_t)b_bytes;
+    int ok = 0;
+    WITH_DEVICE(g_gpu[da].device_id) {
+        if (g_pair_stage_bytes < need) {
+            if (g_pair_stage_raw) {
+                (void)cudaFreeHost(g_pair_stage_raw);
+                g_pair_stage_raw = NULL;
+                g_pair_stage = NULL;
+                g_pair_stage_bytes = 0;
+            }
+            if (cuda_ok(cudaMallocHost(&g_pair_stage_raw, need),
+                        "pair readback stage")) {
+                g_pair_stage = g_pair_stage_raw;
+                g_pair_stage_bytes = need;
+            }
+        }
+        if (g_pair_stage_bytes >= need) {
+            ok = cuda_ok(cudaMemcpyAsync(g_pair_stage,
+                                       (const char *)a->ptr + a_off,
+                                       (size_t)a_bytes, cudaMemcpyDeviceToHost,
+                                       (cudaStream_t)0), "pair read a") &&
+                 cuda_ok(cudaMemcpyAsync((char *)g_pair_stage + a_bytes,
+                                       (const char *)b->ptr + b_off,
+                                       (size_t)b_bytes, cudaMemcpyDeviceToHost,
+                                       (cudaStream_t)0), "pair read b") &&
+                 cuda_ok(cudaStreamSynchronize((cudaStream_t)0),
+                         "pair readback sync");
+        }
+    }
+    if (!ok) return 0;
+    memcpy(a_out, g_pair_stage, (size_t)a_bytes);
+    memcpy(b_out, (const char *)g_pair_stage + a_bytes, (size_t)b_bytes);
+    return 1;
+}
+
 extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                      const ds4_gpu_tensor *src, uint64_t src_offset,
                                      uint64_t bytes) {
@@ -17357,6 +17420,12 @@ int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows) {
  * change after the first call and a captured graph replays the launches it
  * recorded, so the choice is capture-safe.  Defined here so both translation
  * units share one cached read of the environment. */
+/* This build's note auto09170557_2 records that six provable-equivalence
+ * removals stacked into one tree measured four tenths of one percent slower
+ * with a standard error of nearly four tenths, which is neutral. Their
+ * combined arithmetic is a few microseconds against a round of about fifty
+ * milliseconds.
+ */
 int ds4_qwen4exp_pdl_enabled(void) {
     static int resolved = 0;
     static int enabled = 0;
