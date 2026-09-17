@@ -922,37 +922,29 @@ static inline cublasHandle_t cuda_cublas_for_tier(int logical_tier) {
  * DS4_CUDA_DECODE_GRAPHS=0 (or off/no/false) disables everything. */
 #define CUDA_DECODE_GRAPH_LAYERS   64u
 #define CUDA_DECODE_GRAPH_ISLANDS   4u
-/* EIGHT SLOTS, NOT FOUR.  The key is n_tokens | (spec_snapshot_rows << 8) and
- * cuda_decode_graph_find() has NO eviction: when every slot of a
- * (layer, island) row holds another key it returns NULL, begin() returns -1,
- * and that island encodes EAGERLY FOR THE REST OF THE PROCESS -- permanently,
- * per island, and silently. A speculative cycle reaches at least three values
- * of that key, so four slots leaves one spare. Same keys, same graphs, same
- * kernels in the same order; the cost is a memcmp over at most eight 48-byte
- * keys off the device, and one more executable graph per row only if the run
- * actually has a fifth shape -- which is the case this is for.
+
+/* The variant table is keyed on the full ds4_decode_graph_key: layer,
+ * island and the variant word.  Eight slots per row leaves four spare
+ * past the decode leg's own identities. Same keys, same graphs, same
+ * kernels in the same order; the cost is a memcmp over at most eight
+ * 48-byte keys off the device, and one more executable graph per row
+ * only if the run actually has a ninth shape.
  *
- * THE KEY GREW AND THIS DID NOT, so the spare the paragraph above counts on is
- * gone.  When it was written the variant was `n_tokens | (spec_snapshot_rows
- * << 8)`.  ds4_qwen4exp_gdn_graph_variant() now folds two more fields into it,
- * the recurrent-buffer parity and the replay-active flag:
- *
- *     width | (snapshots << 8) | (phase << 16) | (active << 17)
- *
- * The GDN replay added both AFTER four was chosen.  At the scored width the
- * parity alternates on every accepting round and the active flag is set, so the
- * decode leg alone reaches four identities per (layer, island) row -- exactly
- * the slot count, with nothing left for the correctness free-run leg's own
- * width, which shares those rows.  The first key that finds the row full does
- * not evict anything: it drops that island onto the eager path permanently and
- * silently, for the rest of the process, which is the failure this comment
- * already warns about.
+ * THE KEY GREW PAST FOUR.  The variant is
+ * `width | (spec_snapshot_rows << 8) | (parity << 16) | (active << 17)`:
+ * ds4_qwen4exp_gdn_graph_variant() folds the recurrent-buffer parity and the
+ * replay-active flag into the identity.  At the scored width the decode leg
+ * alone reaches four identities per (layer, island) row -- the two parities
+ * under the active flag -- and a rejecting round's one-row replay adds
+ * width-1 keys on the same rows.  At four slots the first key past the
+ * decode leg's own set does not evict anything: it drops that island onto
+ * the eager path permanently and silently, for the rest of the process.
  *
  * Eight restores the headroom the original reasoning assumed.  It adds
- * CUDA_DECODE_GRAPH_LAYERS * CUDA_DECODE_GRAPH_ISLANDS * 4 entries of key plus
- * pointer, populates none of them until a key asks, and changes no graph's
- * contents, no launch order and no arithmetic -- only how many identities may
- * be resident before the lookup gives up. */
+ * CUDA_DECODE_GRAPH_LAYERS * CUDA_DECODE_GRAPH_ISLANDS * 4 entries of key
+ * plus pointer, populates none of them until a key asks, and changes no
+ * graph's contents, no launch order and no arithmetic -- only how many
+ * identities may be resident before the lookup gives up. */
 #define CUDA_DECODE_GRAPH_VARIANTS  8u
 
 /* Mirrors the public `struct ds4_decode_graph_key` decl in ds4_gpu.h

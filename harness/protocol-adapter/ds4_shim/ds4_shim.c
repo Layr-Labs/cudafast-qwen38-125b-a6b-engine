@@ -142,14 +142,75 @@ ds4s_handle *ds4s_open(const char *model_path, const char *mtp_head_path,
      */
     if (getenv("DS4_SHIM_NO_WARMUP") == NULL) {
         const int vocab = ds4s_vocab_size(h);
-        enum { WARM_PROMPT = 1024, WARM_ROUNDS = 4, WARM_CAP = 8 };
+        /* THE WARM-UP RUNS UNTIL BOTH PARITIES AND A REJECTION ARE SEEN.
+         *
+         * Four rounds warm the 2-row verify and the head island, which is
+         * what this warm-up was written for.  The decode capture, though, is
+         * keyed on more than the shape: ds4_qwen4exp_gdn_graph_variant()
+         * folds the width, the snapshot count, the recurrent buffer PARITY
+         * and the replay-active flag into one identity.  At the scored width
+         * the live decode identities are the two parities -- and parity
+         * flips only on a round that SWAPS, which is a round whose draft was
+         * accepted.
+         *
+         * So reaching both captures needs the warm-up to produce an
+         * accepting round from each parity, and the prompt it drives is an
+         * arithmetic sequence chosen to resemble nothing this engine will be
+         * asked for.  Its accept/reject pattern is arbitrary, and a fixed
+         * round count can leave one parity uncaptured -- and can leave the
+         * rejecting round's one-row replay shapes uncaptured too.
+         *
+         * A shape left uncaptured is captured inside the TIMED window, and a
+         * capture walks the whole layer stack for every chunk.  The scored
+         * decode window is short, so that cost is not amortised the way it
+         * would be in a long serve; it lands almost entirely on the
+         * measurement.
+         *
+         * The loop below therefore does not count rounds; it counts
+         * OUTCOMES, through the engine's own speculation counters.  It stops
+         * once the warm-up has produced at least two accepting rounds --
+         * the second accept proves a round ran at the post-swap parity, so
+         * both parities have been captured -- and at least two rejecting
+         * rounds, so the one-row replay keys exist on both sides of a swap.
+         * WARM_ROUNDS_MAX bounds the boot cost when the synthetic prompt
+         * happens to accept or reject every draft; the pattern is arbitrary,
+         * so the cap is generous and the gate is what normally closes the
+         * loop.
+         *
+         * Still best-effort and still followed by ds4s_invalidate(), so the
+         * cost is boot time, which is outside the timed window, and a
+         * failure leaves exactly the tree that shipped before it. */
+        enum { WARM_PROMPT = 1024, WARM_ROUNDS_MIN = 8,
+               WARM_ROUNDS_MAX = 32, WARM_CAP = 8 };
         if (vocab > 16) {
             int32_t *ids = (int32_t *)malloc((size_t)WARM_PROMPT * sizeof(*ids));
             if (ids) {
                 const int32_t span = (int32_t)(vocab - 8);
                 for (int i = 0; i < WARM_PROMPT; i++)
                     ids[i] = (int32_t)(1 + (i % span));
-                if (ds4s_sync(h, ids, (size_t)WARM_PROMPT) == 0) {
+                /* THE PREFILL IS WARMED MORE THAN ONCE, because the scored
+                 * prefill is a SINGLE forward.
+                 *
+                 * The decode measurement averages its first-call costs over
+                 * hundreds of tokens; the prefill measurement does not average
+                 * anything at all -- it is one 1024-row forward, so every cost
+                 * that a first call pays and a second call does not lands
+                 * whole on the number.  Workspace allocation, the cuBLAS
+                 * handle's own first-use setup, the L2 state the tiles want
+                 * and any first-touch of a staging buffer are all in that
+                 * class.  One warm sync leaves the scored forward as the
+                 * second; three leave it as the fourth, which is past where
+                 * any of those costs can still be outstanding.
+                 *
+                 * Boot time only, outside the timed window, and still
+                 * best-effort: a failed sync just leaves the loop early and
+                 * the invalidate below runs regardless. */
+                int warm_pf_ok = 0;
+                for (int pf = 0; pf < 3; pf++) {
+                    if (ds4s_sync(h, ids, (size_t)WARM_PROMPT) != 0) break;
+                    warm_pf_ok = 1;
+                }
+                if (warm_pf_ok) {
                     /* the 1-row teacher-forced shape */
                     (void)ds4s_eval(h, ids[WARM_PROMPT - 1]);
                     /* the speculative shapes: the 2-row verify and the head's
@@ -157,11 +218,27 @@ ds4s_handle *ds4s_open(const char *model_path, const char *mtp_head_path,
                     if (mtp_draft_tokens >= 1) {
                         int32_t out[WARM_CAP];
                         int32_t t = ds4s_argmax(h);
-                        for (int r = 0; r < WARM_ROUNDS; r++) {
+                        uint64_t hits0 = 0;
+                        ds4s_spec_counters(h, NULL, &hits0, NULL, NULL);
+                        for (int r = 0; r < WARM_ROUNDS_MAX; r++) {
                             const int n = ds4s_eval_speculative(h, t, 2, out,
                                                                 WARM_CAP);
                             if (n <= 0) break;
                             t = out[n - 1];
+                            /* Outcome gate: two accepts prove both parities
+                             * ran (the second accept is a post-swap round);
+                             * two rejects put the one-row replay keys on
+                             * both sides of a swap.  The minimum keeps a
+                             * degenerate early pattern from closing the
+                             * loop before the shapes exist. */
+                            if (r + 1 >= WARM_ROUNDS_MIN) {
+                                uint64_t hits = 0;
+                                ds4s_spec_counters(h, NULL, &hits, NULL, NULL);
+                                const uint64_t accepts = hits - hits0;
+                                const uint64_t rejects =
+                                    (uint64_t)(r + 1) - accepts;
+                                if (accepts >= 2u && rejects >= 2u) break;
+                            }
                         }
                     }
                 }
