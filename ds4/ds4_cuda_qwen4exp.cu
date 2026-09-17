@@ -13659,7 +13659,11 @@ extern "C" int ds4_gpu_qwen4exp_qsa_prep_joint_dpos_tensor(
         if ((i!=4 || out[i]) && !glm53_cuda_tensor_has(out[i],oe[i],4u)) return 0;
     for (unsigned i=0;i<6;i++) if (!glm53_cuda_tensor_has(in[i],ie[i],4u)) return 0;
     if (dp && !glm53_cuda_tensor_has(dp,1,4u)) return 0;
-    bool joint=rows<=2u && (dim&(dim-1u))==0u &&
+    /* rows<=2 is the depth-1 verify width, rows==3 the depth-2 one; the
+     * kernel itself is row-generic (one block per head per token).
+     * DS4_QWEN4EXP_NO_ROWS3_TWINS=1 keeps three rows on the split path. */
+    bool joint=(rows<=2u || (rows==3u && getenv("DS4_QWEN4EXP_NO_ROWS3_TWINS")==NULL)) &&
+               (dim&(dim-1u))==0u &&
                getenv("DS4_QWEN4EXP_NO_QSA_PREP_JOINT")==NULL;
     for (unsigned i=0;joint && i<5;i++) if (out[i]) {
         for (unsigned j=0;j<6;j++) joint &= qwen4exp_hc_ranges_disjoint(

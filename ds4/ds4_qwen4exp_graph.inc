@@ -10,6 +10,13 @@
 
 #include "ds4_qwen4exp_model_registration.h"
 #include "ds4_qwen4exp_qsa_scratch.h"
+
+/* Verify widths the fused row twins (GDN four-projection, QSA Q8 triple, QSA
+ * joint prep) take: two rows for depth-1 MTP, three for depth 2.  The CUDA
+ * side instantiates R=1,2,3 and applies the same valve
+ * (DS4_QWEN4EXP_NO_ROWS3_TWINS=1 keeps three rows on the generic path). */
+#define QWEN4EXP_TWIN_ROWS_OK(n) \
+    ((n) <= 2u || ((n) == 3u && getenv("DS4_QWEN4EXP_NO_ROWS3_TWINS") == NULL))
 #include "ds4_qwen4exp_gdn_replay.h"
 
 /* ======================================================================
@@ -99,7 +106,7 @@ void ds4_qwen4exp_session_plan_compute(ds4_qwen4exp_session_plan *plan,
         (((uint64_t)DS4_N_GDN_KEY_HEAD + DS4_N_GDN_VALUE_HEAD) *
          DS4_N_GDN_HEAD_DIM + 2ull * DS4_N_GDN_VALUE_HEAD) * f;
     act += sizeof(uint32_t);                      /* replay prefix       */
-    act += 2ull * DS4_N_GDN_VALUE_HEAD * 2u * f;   /* replay gate pairs   */
+    act += (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * DS4_N_GDN_VALUE_HEAD * 2u * f; /* replay gate pairs */
     act += B * sizeof(int32_t);                    /* tokens              */
     act += 3ull * B * H * E * f;                   /* hyper, normed, wide */
     act += 2ull * B * H * E * f;                   /* PLE key/gated, query/conv */
@@ -776,8 +783,12 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
     s->d_pos = qwen4exp_alloc_zeroed(sizeof(uint32_t), &ok);
     if (s->gdn_replay_enabled) {
         s->d_gdn_replay = qwen4exp_alloc_zeroed(sizeof(uint32_t), &ok);
+        /* One float2 gate pair per (verify row, value head).  Sized for the
+         * widest verify the MTP cycle can commit, not for the depth-1 pair,
+         * so a deeper declaration never runs the conv kernel past the end. */
         s->gdn_replay_gates = qwen4exp_alloc_zeroed(
-            2ull * DS4_N_GDN_VALUE_HEAD * 2u * sizeof(float), &ok);
+            (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * DS4_N_GDN_VALUE_HEAD * 2u *
+                sizeof(float), &ok);
     }
     if (getenv("DS4_QWEN4EXP_NO_LAZY_ROLLBACK") == NULL) {
         /* Zeroed on the device, so flag, mirror and pending all start at live. */
@@ -1560,7 +1571,7 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
     }
 
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    if (n_tokens<=2u && getenv("DS4_QWEN4EXP_NO_GDN_PROJECTION_FUSION")==NULL) {
+    if (QWEN4EXP_TWIN_ROWS_OK(n_tokens) && getenv("DS4_QWEN4EXP_NO_GDN_PROJECTION_FUSION")==NULL) {
         ds4_gpu_tensor *outs[4]={s->gdn_qkv,s->gdn_gate,s->gdn_alpha,s->gdn_beta};
         const void *maps[4]={QW_MAP(m,l->attn_qkv),QW_MAP(m,l->attn_gate),
                             QW_MAP(m,l->ssm_alpha),QW_MAP(m,l->ssm_beta)};
@@ -1711,7 +1722,7 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
 
     /* Projections.  q is DOUBLED: half query, half output gate. */
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    if (n_tokens<=2u && getenv("DS4_QWEN4EXP_NO_QSA_Q8_TRIPLE")==NULL) {
+    if (QWEN4EXP_TWIN_ROWS_OK(n_tokens) && getenv("DS4_QWEN4EXP_NO_QSA_Q8_TRIPLE")==NULL) {
         ds4_gpu_tensor *outs[3]={s->qsa_doubled,s->qsa_kin,s->qsa_vin};
         const void *maps[3]={QW_MAP(m,l->attn_q),QW_MAP(m,l->attn_k),QW_MAP(m,l->attn_v)};
         const uint64_t sizes[3]={QW_MAPSZ(m,l->attn_q),QW_MAPSZ(m,l->attn_k),QW_MAPSZ(m,l->attn_v)};
@@ -1741,7 +1752,7 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
     }
 
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    if (n_tokens<=2u) {
+    if (QWEN4EXP_TWIN_ROWS_OK(n_tokens)) {
         ds4_gpu_tensor *outs[5]={s->qsa_q,s->qsa_gate,s->qsa_k[il],s->qsa_v[il],NULL};
         const ds4_gpu_tensor *ins[6]={s->qsa_doubled,s->qsa_kin,s->qsa_vin,
                                     s->attn_q_norm[il],s->attn_k_norm[il],s->inv_freq};

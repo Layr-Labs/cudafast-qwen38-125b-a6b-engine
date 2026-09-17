@@ -456,12 +456,12 @@ static int mtp_draft_chain(ds4_qwen4exp_mtp_state *st,
     const uint32_t j0 = st->head_rows < pos ? pos : st->head_rows;
     float *const ping = st->hc_scratch +
                         (size_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * st->hc_dim;
-    const float *cur_hc = hc_rows + (size_t)n * st->hc_dim;
+    const float *cur_hc = hc_rows ? hc_rows + (size_t)n * st->hc_dim : NULL;
     int cur_tok = next_fed;
     uint32_t p = pos + (uint32_t)n;
     int k = 0;
 
-    if (model->draft_rows) {
+    if (model->draft_rows_device || model->draft_rows) {
         /*
          * The seed rows and chain step 0 in ONE head forward.  Rows j0 .. start
          * take the tokens toks[j0 - pos + 1 .. n] and then next_fed, over the
@@ -479,9 +479,16 @@ static int mtp_draft_chain(ds4_qwen4exp_mtp_state *st,
         rows_tok[seeds] = next_fed;
         float *multi_out = (1 < st->depth) ? ping : NULL;
         int draft = -1;
-        if (model->draft_rows(model->ctx, rows_tok,
-                              hc_rows + (size_t)k0 * st->hc_dim,
-                              j0, seeds + 1u, &draft, multi_out) != 0) {
+        /* Device-side slab when the seam offers it: the head copies rows
+         * k0 .. k0 + seeds of the target's own hyper stream, and the host
+         * slab (NULL in that case) is never read. */
+        const int drc = model->draft_rows_device
+            ? model->draft_rows_device(model->ctx, rows_tok, k0, j0,
+                                       seeds + 1u, &draft, multi_out)
+            : model->draft_rows(model->ctx, rows_tok,
+                                hc_rows + (size_t)k0 * st->hc_dim,
+                                j0, seeds + 1u, &draft, multi_out);
+        if (drc != 0) {
             return mtp_fail(err, errlen,
                             "qwen4exp MTP: %u-row head forward at position %u "
                             "failed", seeds + 1u, j0);
@@ -652,7 +659,9 @@ int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
     /* No round-start snapshot.  The verify forward itself leaves the state
      * after each drafted row in a slot, so there is nothing to copy first and
      * nothing to rewind to afterwards. */
-    float *const hc = st->hc_scratch;
+    /* With a device-side draft slab the verify owes no hyper read-back: a
+     * NULL slab tells verify_rows / verify_rows_top1 to skip the D2H copy. */
+    float *const hc = model->draft_rows_device ? NULL : st->hc_scratch;
     float *const row_logits = st->logits_rows;
     int row_top1[DS4_QWEN4EXP_MTP_MAX_COMMIT];
     const bool compact_logits =
@@ -1444,6 +1453,22 @@ int ds4_qwen4exp_mtp_head_forward_last(ds4_qwen4exp_mtp_head *h,
                                  draft_out, multi_out, true, NULL, 0u, false, err, errlen);
 }
 
+
+int ds4_qwen4exp_mtp_head_forward_last_device(ds4_qwen4exp_mtp_head *h,
+                                              const int *next_tokens,
+                                              const ds4_gpu_tensor *target_hyper,
+                                              uint32_t first_row,
+                                              uint32_t pos0, uint32_t n_tokens,
+                                              int *draft_out, float *multi_out,
+                                              char *err, size_t errlen) {
+    if (!target_hyper) {
+        return mtp_fail(err, errlen,
+                        "qwen4exp MTP head: no device hyper stream to read");
+    }
+    return mtp_head_forward_impl(h, next_tokens, NULL, pos0, n_tokens,
+                                 draft_out, multi_out, true, target_hyper,
+                                 first_row, false, err, errlen);
+}
 
 void ds4_qwen4exp_mtp_head_reset_cache(ds4_qwen4exp_mtp_head *h) {
     if (!h) return;

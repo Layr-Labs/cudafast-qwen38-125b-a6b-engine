@@ -19169,6 +19169,16 @@ struct qwen_gdn_projection_args {
  * this is reverted regardless of what the composite says. A spill trades
  * registers for local memory traffic on the kernel we are trying to unblock,
  * and `lmem=0` is the only reading that makes the occupancy argument valid. */
+/* Verify-width cap for the fused row twins (GDN four-projection below, the
+ * Q8 triple, and the QSA joint prep in ds4_cuda_qwen4exp.cu).  Depth-1 MTP
+ * verifies two rows per round; depth 2 verifies three.  The three-row
+ * instantiations read each weight panel once for all three rows, exactly as
+ * the two-row ones do.  DS4_QWEN4EXP_NO_ROWS3_TWINS=1 keeps them out so a
+ * depth-2 leg can be A/B'd against the generic per-projection fallback. */
+static inline uint32_t qw_twin_rows_cap(void) {
+    return getenv("DS4_QWEN4EXP_NO_ROWS3_TWINS") ? 2u : 3u;
+}
+
 #if defined(__CUDACC__) && CUDART_VERSION >= 12040
 #define QW_GDN_PROJ_ATTR __maxnreg__(40)
 #else
@@ -19682,7 +19692,7 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
     a.od[0]=qkv_dim;a.od[1]=gate_dim;a.blocks=blocks;a.n_rows=rows;
     a.xq=(const int8_t *)((const char *)q->ptr+qoff);
     a.xscale=(const float *)((const char *)q->ptr+soff);a.x=(const float *)x->ptr;
-    if (rows<=2u && in_dim==2560u && qkv_dim>512u && gate_dim>512u &&
+    if (rows<=qw_twin_rows_cap() && in_dim==2560u && qkv_dim>512u && gate_dim>512u &&
         cuda_q8_use_dp4a() && getenv("DS4_QWEN4EXP_NO_ROW_TILE")==NULL &&
         getenv("DS4_QWEN4EXP_PAIR_LANES_R2")==NULL &&
         getenv("DS4_F32_NO_VECTOR_DECODE")==NULL &&
@@ -19710,12 +19720,20 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
             else
                 QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1>),
                                     grid, 256, 0, cuda_decode_stream(), a);
-        } else {
+        } else if (rows==2u) {
             if (gdn_stage)
                 QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2,true>),
                                     grid, 256, gdn_panel, cuda_decode_stream(), a);
             else
                 QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2>),
+                                    grid, 256, 0, cuda_decode_stream(), a);
+        } else {
+            /* Three rows: the depth-2 MTP verify width. */
+            if (gdn_stage)
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<3,true>),
+                                    grid, 256, gdn_panel, cuda_decode_stream(), a);
+            else
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<3>),
                                     grid, 256, 0, cuda_decode_stream(), a);
         }
         return cuda_ok(cudaGetLastError(),"GDN four projections launch");
@@ -19901,7 +19919,7 @@ extern "C" int ds4_gpu_matmul_q8_0_preq_triple_rows_exact_tensor(
     }
     const int8_t *xq=(const int8_t *)((const char *)q->ptr+qoff);
     const float *xs=(const float *)((const char *)q->ptr+soff);
-    if (rows<=2u && in_dim!=320u && cuda_q8_use_dp4a() &&
+    if (rows<=qw_twin_rows_cap() && in_dim!=320u && cuda_q8_use_dp4a() &&
         getenv("DS4_QWEN4EXP_NO_ROW_TILE")==NULL &&
         getenv("DS4_QWEN4EXP_PAIR_LANES_R2")==NULL &&
         getenv("DS4_QWEN4EXP_Q8_WIDE_BLOCKS")==NULL &&
@@ -19916,8 +19934,14 @@ extern "C" int ds4_gpu_matmul_q8_0_preq_triple_rows_exact_tensor(
                 (float *)outs[0]->ptr,(float *)outs[1]->ptr,(float *)outs[2]->ptr,
                 (const unsigned char *)w[0],(const unsigned char *)w[1],
                 (const unsigned char *)w[2],xq,xs,od[0],od[1],od[2],rows,blocks);
-        else
+        else if (rows==2u)
             QWEN4EXP_LAUNCH_PDL((qwen_q8_projection_triple_kernel<2>),
+                                grid, 256, 0, cuda_decode_stream(),
+                (float *)outs[0]->ptr,(float *)outs[1]->ptr,(float *)outs[2]->ptr,
+                (const unsigned char *)w[0],(const unsigned char *)w[1],
+                (const unsigned char *)w[2],xq,xs,od[0],od[1],od[2],rows,blocks);
+        else /* three rows: the depth-2 MTP verify width */
+            QWEN4EXP_LAUNCH_PDL((qwen_q8_projection_triple_kernel<3>),
                                 grid, 256, 0, cuda_decode_stream(),
                 (float *)outs[0]->ptr,(float *)outs[1]->ptr,(float *)outs[2]->ptr,
                 (const unsigned char *)w[0],(const unsigned char *)w[1],
