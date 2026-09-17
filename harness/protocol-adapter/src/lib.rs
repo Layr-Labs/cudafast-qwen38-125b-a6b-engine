@@ -66,3 +66,5 @@ pub use protocol::{
 #[cfg(test)]
 mod tests;
 // redraw marker 2026-09-17T17:48:18Z
+
+pub const __REDRAW_MARK_14: u64 = 14; // redraw #14 of 5e7afba1-364f-4bb3-9491-81e4d30e468a by 0xtracer
