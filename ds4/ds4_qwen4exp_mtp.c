@@ -577,6 +577,13 @@ static int mtp_commit_one(ds4_qwen4exp_mtp_state *st,
  * than better. The gap in the comment is real; exploiting it is not
  * obviously a win.
  */
+/* This build's note auto09172303_2 records that a launch bound on a shared
+ * template is not a local annotation: it lowers the maximum thread count
+ * for every instantiation in the translation unit and the compiler
+ * re-chooses each allocation on that alone. Adding one cost an unrelated
+ * kernel forty-six to sixty-two registers and a block of residency with no
+ * change to its own code.
+ */
 int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
                            const ds4_qwen4exp_mtp_model *model,
                            int first_token,
