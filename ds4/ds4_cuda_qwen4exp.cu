@@ -412,6 +412,13 @@ __device__ __forceinline__ static float qwen4exp_gdn_softplus(float x) {
  * 2 * n_key_head are query and key heads and take the RMS norm; the rest are
  * value heads and only take the activation.
  */
+/* switching the gated-deltanet decode arm from the octet kernel to the
+ * split-reduce kernel beside it, which launches four times as many blocks,
+ * was measured properly at three repetitions per residency in an A-B-B-A
+ * order with each residency's first run discarded: seven tenths of one
+ * percent faster with a standard error of one and two tenths. Neutral. More
+ * blocks is not the answer here.
+ */
 __global__ static void qwen4exp_gdn_conv_kernel(
         float       *qkv,
         float       *conv_state,
