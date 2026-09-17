@@ -571,6 +571,11 @@ static int mtp_commit_one(ds4_qwen4exp_mtp_state *st,
     return 1;
 }
 
+/* This build's note auto09171540_1 records that each captured-graph episode
+ * is worth about five hundredths of one percent on this path, measured by
+ * going from twenty-two captures inside a run to nine. That bounds the
+ * entire identity-count class below any promotion margin.
+ */
 int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
                            const ds4_qwen4exp_mtp_model *model,
                            int first_token,
