@@ -18,6 +18,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 /* =========================================================================
  * Errors.
  * ========================================================================= */
@@ -770,6 +774,20 @@ static float ple_fp16_to_fp32(uint16_t h) {
     return f;
 }
 
+#if defined(__aarch64__)
+/* Widen eight int8 codebook values to fp32, scale by the block's d and
+ * store.  vcvtq_f32_s32 on a sign-extended int8 produces exactly (float)v,
+ * and vmulq_f32 is the same IEEE single-precision multiply the scalar loop
+ * performs, so each stored value is bit-identical to d * (float)kv[i]. */
+static inline void ple_iq4nl_store8(float *dst, int8x8_t v, float32x4_t dv) {
+    const int16x8_t w = vmovl_s8(v);
+    vst1q_f32(dst,
+              vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(w))), dv));
+    vst1q_f32(dst + 4,
+              vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(w))), dv));
+}
+#endif
+
 /* `blocks` and `out` never alias: the caller passes a const view of the
  * memory-mapped shard and a disjoint host staging buffer.  Saying so lets
  * the compiler keep the scale and the nibble byte live across the stores
@@ -802,6 +820,23 @@ void ds4_ple_dequant_iq4_nl(const void *__restrict blocks, size_t block_count,
         if (b + 1u < block_count)
             __builtin_prefetch(y + DS4_PLE_IQ4_NL_BLOCK_ELEMS, 1, 3);
 
+#if defined(__aarch64__)
+        /* One 16-byte load feeds both nibble halves through the 16-entry
+         * table lookup, then widen int8 -> int16 -> int32 -> fp32 and scale.
+         * Same lookups, same order, same values as the scalar loop. */
+        {
+            const uint8x16_t  qv  = vld1q_u8(qs);
+            const int8x16_t   lut = vld1q_s8(kv);
+            const int8x16_t   lo  =
+                vqtbl1q_s8(lut, vandq_u8(qv, vdupq_n_u8(0x0Fu)));
+            const int8x16_t   hi  = vqtbl1q_s8(lut, vshrq_n_u8(qv, 4));
+            const float32x4_t dv  = vdupq_n_f32(d);
+            ple_iq4nl_store8(y,      vget_low_s8(lo),  dv);
+            ple_iq4nl_store8(y + 8,  vget_high_s8(lo), dv);
+            ple_iq4nl_store8(y + 16, vget_low_s8(hi),  dv);
+            ple_iq4nl_store8(y + 24, vget_high_s8(hi), dv);
+        }
+#else
         /* Unrolled by two: the block is a fixed sixteen nibble bytes, so the
          * trip count is a compile-time constant and half the loop-carried
          * bookkeeping disappears.  Same reads, same order, same values. */
@@ -812,6 +847,7 @@ void ds4_ple_dequant_iq4_nl(const void *__restrict blocks, size_t block_count,
             y[j + 16] = d * (float)ple_kvalues_iq4nl_hi[q0];
             y[j + 17] = d * (float)ple_kvalues_iq4nl_hi[q1];
         }
+#endif
         p += DS4_PLE_IQ4_NL_BLOCK_BYTES;
     }
 }
