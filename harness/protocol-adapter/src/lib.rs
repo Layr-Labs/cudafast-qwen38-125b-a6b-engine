@@ -67,4 +67,4 @@ pub use protocol::{
 mod tests;
 // redraw marker 2026-09-17T17:48:18Z
 
-pub const __REDRAW_MARK_16: u64 = 16; // redraw #16 of 6a7ea5ff-714b-4e2c-b3ec-4a2553bf32f7 by 0xtracer
+pub const __REDRAW_MARK_18: u64 = 18; // redraw #18 of b898427d-49cb-46d1-b4da-5c287db8c6a1 by 0xtracer
