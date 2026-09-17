@@ -52,6 +52,17 @@ uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
+/* Pinned staging for the per-token uploads.  A synchronous pageable
+ * cudaMemcpy stages through a driver bounce buffer and serializes on the
+ * legacy stream; a pinned source on the decode stream is a true async DMA
+ * that overlaps the launch train that follows it.  ds4_gpu_host_pin returns
+ * nonzero when the range registered; callers keep the synchronous write as
+ * the fallback, so a backend without a decode stream loses nothing. */
+int  ds4_gpu_host_pin(void *ptr, uint64_t bytes);
+void ds4_gpu_host_unpin(void *ptr);
+int  ds4_gpu_tensor_write_decode_stream(ds4_gpu_tensor *tensor,
+                                        uint64_t offset, const void *data,
+                                        uint64_t bytes);
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,

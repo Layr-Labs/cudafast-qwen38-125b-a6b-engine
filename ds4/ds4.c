@@ -161,6 +161,13 @@ int ds4_gpu_set_current_device_fenced(int logical_tier) { (void)logical_tier; re
 void ds4_gpu_enable_q8_dequant_gemm(void) {}
 void ds4_gpu_enable_q8_dense_mma(void) {}
 int ds4_gpu_tensor_copy_async(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint64_t bytes) { (void)dst; (void)src; (void)bytes; return 0; }
+int ds4_gpu_host_pin(void *ptr, uint64_t bytes) { (void)ptr; (void)bytes; return 0; }
+void ds4_gpu_host_unpin(void *ptr) { (void)ptr; }
+int ds4_gpu_tensor_write_decode_stream(ds4_gpu_tensor *tensor,
+                                       uint64_t offset, const void *data,
+                                       uint64_t bytes) {
+    return ds4_gpu_tensor_write(tensor, offset, data, bytes);
+}
 int ds4_gpu_tensor_copy_xdev_default(ds4_gpu_tensor *dst,
                                      const ds4_gpu_tensor *src,
                                      uint64_t bytes) {

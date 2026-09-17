@@ -328,6 +328,8 @@ struct ds4_qwen4exp_session {
     bool              ple_ready;      /* the hash constants were readable */
     uint64_t         *ple_ids;        /* host [n_batch][head_count]       */
     float            *ple_rows_host;  /* host [n_batch][ple_embd]         */
+    int32_t          *tokens_host;    /* pinned staging for the id upload   */
+    int               ple_host_pinned;/* both staging buffers registered    */
     ds4_gpu_tensor   *ple_conv_state; /* [state_rows][n_hc * n_embd]      */
     ds4_gpu_tensor   *ple_rows;       /* [n_batch][ple_embd]              */
     ds4_gpu_tensor   *ple_key;        /* key projection, then the gate    */
@@ -765,7 +767,25 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
         if (ok) {
             s->ple_ids = calloc((size_t)B * DS4_N_PLE_HEAD, sizeof(uint64_t));
             s->ple_rows_host = calloc((size_t)B * DS4_N_PLE_EMBD, sizeof(float));
-            ok = s->ple_ids != NULL && s->ple_rows_host != NULL;
+            s->tokens_host = calloc((size_t)B, sizeof(int32_t));
+            ok = s->ple_ids != NULL && s->ple_rows_host != NULL &&
+                 s->tokens_host != NULL;
+        }
+        /* Pin the two per-token upload sources once.  A pinned source turns
+         * the upload into a true async DMA on the decode stream instead of a
+         * staged synchronous copy on the legacy stream; a backend that cannot
+         * pin leaves ple_host_pinned clear and the synchronous write stays. */
+        if (ok) {
+            const uint64_t rows_bytes =
+                (uint64_t)B * DS4_N_PLE_EMBD * sizeof(float);
+            const uint64_t ids_bytes = (uint64_t)B * sizeof(int32_t);
+            s->ple_host_pinned =
+                ds4_gpu_host_pin(s->ple_rows_host, rows_bytes) &&
+                ds4_gpu_host_pin(s->tokens_host, ids_bytes);
+            if (!s->ple_host_pinned) {
+                ds4_gpu_host_unpin(s->ple_rows_host);
+                ds4_gpu_host_unpin(s->tokens_host);
+            }
         }
         if (ok) {
             s->ple_ready = qwen4exp_ple_read_constants(m, w, &s->ple_constants);
@@ -887,8 +907,13 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->ple_key);
     ds4_gpu_tensor_free(s->ple_aux);
     ds4_gpu_tensor_free(s->ple_value);
+    if (s->ple_host_pinned) {
+        ds4_gpu_host_unpin(s->ple_rows_host);
+        ds4_gpu_host_unpin(s->tokens_host);
+    }
     free(s->ple_ids);
     free(s->ple_rows_host);
+    free(s->tokens_host);
     ds4_gpu_tensor_free(s->d_pos);
     ds4_gpu_tensor_free(s->d_adopt);
     ds4_gpu_tensor_free(s->d_gdn_replay);
@@ -1459,8 +1484,15 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 "ds4: qwen4exp PLE gather %u rows took %.3f ms\n",
                 n_tokens, (now_sec() - gather_t0) * 1000.0);
     }
-    if (!ds4_gpu_tensor_write(s->ple_rows, 0, s->ple_rows_host,
-                              (uint64_t)n_tokens * DS4_N_PLE_EMBD * sizeof(float))) {
+    const uint64_t ple_upload_bytes =
+        (uint64_t)n_tokens * DS4_N_PLE_EMBD * sizeof(float);
+    const int ple_uploaded = s->ple_host_pinned
+        ? ds4_gpu_tensor_write_decode_stream(s->ple_rows, 0,
+                                             s->ple_rows_host,
+                                             ple_upload_bytes)
+        : ds4_gpu_tensor_write(s->ple_rows, 0, s->ple_rows_host,
+                               ple_upload_bytes);
+    if (!ple_uploaded) {
         fprintf(stderr, "ds4: qwen4exp n-gram row upload failed at block %u\n", il);
         return false;
     }
@@ -2864,8 +2896,17 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         return false;
     }
 
-    if (!ds4_gpu_tensor_write(s->tokens, 0, tokens,
-                              (uint64_t)n_tokens * sizeof(int32_t))) {
+    const uint64_t ids_bytes = (uint64_t)n_tokens * sizeof(int32_t);
+    int ids_uploaded;
+    if (s->ple_host_pinned && s->tokens_host) {
+        memcpy(s->tokens_host, tokens, (size_t)ids_bytes);
+        ids_uploaded = ds4_gpu_tensor_write_decode_stream(s->tokens, 0,
+                                                        s->tokens_host,
+                                                        ids_bytes);
+    } else {
+        ids_uploaded = ds4_gpu_tensor_write(s->tokens, 0, tokens, ids_bytes);
+    }
+    if (!ids_uploaded) {
         fprintf(stderr, "ds4: qwen4exp token upload failed\n");
         return false;
     }
