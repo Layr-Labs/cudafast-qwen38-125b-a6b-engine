@@ -6564,6 +6564,11 @@ template <int R, int DownType = -1, bool Vector = false, bool Stage = false,
  * sixty-four checked steps. Work removed from the untimed phase does not
  * show up in the score.
  */
+/* This build's note auto09171759_4 records that a staging depth that feeds
+ * an accumulation is not a tuning knob: halving the normalisation staging
+ * depth builds and launches cleanly and then fails the correctness gate,
+ * because the depth also sets the order of the sum of squares.
+ */
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
