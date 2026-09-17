@@ -93,6 +93,13 @@ int ds4s_top_logits(const ds4s_handle *h, int k, int32_t *ids, float *logits);
  * The port routes this to ds4_qwen4exp_mtp_cycle, which commits the target's
  * own GREEDY argmax and so emits the serial leg's token stream exactly; at
  * depth 1 it commits 1 or 2 tokens per round. */
+/* This build's note auto09171607_5 records that the first benchd run inside
+ * a fresh model residency is systematically slower than the ones after it
+ * in the same residency, by as much as forty-seven percent in the worst
+ * case observed, because it pays the untimed correctness phase's graph
+ * captures and first-touch costs. A local comparison that does not discard
+ * each residency's first run is measuring which arm happened to go first.
+ */
 int ds4s_eval_speculative(ds4s_handle *h, int32_t first_token, int budget, int32_t *out,
                           int cap);
 
