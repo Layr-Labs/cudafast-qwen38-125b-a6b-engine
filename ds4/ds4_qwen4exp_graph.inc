@@ -767,6 +767,14 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
             s->ple_rows_host = calloc((size_t)B * DS4_N_PLE_EMBD, sizeof(float));
             ok = s->ple_ids != NULL && s->ple_rows_host != NULL;
         }
+        if (ok && s->ple_rows_host) {
+            /* The gather fills this buffer and the forward uploads it to
+             * ple_rows every step.  Pinning it once moves that upload off
+             * the driver's pageable staging path; failure is not fatal. */
+            (void)ds4_gpu_host_register(
+                s->ple_rows_host,
+                (uint64_t)B * (uint64_t)DS4_N_PLE_EMBD * (uint64_t)sizeof(float));
+        }
         if (ok) {
             s->ple_ready = qwen4exp_ple_read_constants(m, w, &s->ple_constants);
             ds4_ple_history_reset(&s->ple_constants, &s->ple_history);
@@ -888,6 +896,7 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->ple_aux);
     ds4_gpu_tensor_free(s->ple_value);
     free(s->ple_ids);
+    if (s->ple_rows_host) (void)ds4_gpu_host_unregister(s->ple_rows_host);
     free(s->ple_rows_host);
     ds4_gpu_tensor_free(s->d_pos);
     ds4_gpu_tensor_free(s->d_adopt);
@@ -2898,36 +2907,6 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         DS4_QWEN4EXP_MTP_MAX_COMMIT, s->adopt_state, s->adopt_conv);
     if (replay_step.settle) {
         const uint32_t rs = s->adopt_state, rc = s->adopt_conv;
-        /* ONE BATCH, ONE SYNCHRONIZE, when both halves settle the same row.
-         *
-         * qwen4exp_session_copy_layers() opens its own command batch and ends
-         * it with ds4_gpu_end_commands() + ds4_gpu_synchronize(), so calling it
-         * twice -- once for the recurrent state and once for the convolution --
-         * drains the stream TWICE for one rollback.  The two passes copy
-         * disjoint buffers (gdn_state[il] from the state snapshot,
-         * gdn_conv[il] from the conv snapshot) and neither reads what the other
-         * writes, so nothing orders one before the other and the split buys
-         * nothing.
-         *
-         * The common case is exactly the mergeable one: the plan forces a
-         * settle whenever `recurrent != conv`, so on the path that survives to
-         * here with both non-zero they are equal, and one call with both flags
-         * does the same work per layer in one batch behind one drain.
-         *
-         * BIT-IDENTICAL: the same rows are copied out of the same snapshots
-         * into the same destinations, and the per-layer loop inside
-         * copy_layers already handles both flags together -- the only thing
-         * that changes is that the conv copies join the batch the state copies
-         * were already in.  The unequal and single-sided cases keep the
-         * original two-call form below. */
-        if (rs != 0u && rs == rc) {
-            if (!qwen4exp_session_copy_layers(s, rs - 1u, true, true)) {
-                fprintf(stderr, "ds4: qwen4exp GDN rollback could not settle\n");
-                return false;
-            }
-            s->adopt_state = 0u;
-            s->adopt_conv = 0u;
-        } else
         if ((rs != 0u && !qwen4exp_session_copy_layers(s, rs - 1u, true, false)) ||
             (rc != 0u && !qwen4exp_session_copy_layers(s, rc - 1u, false, true))) {
             fprintf(stderr, "ds4: qwen4exp GDN rollback could not settle\n");

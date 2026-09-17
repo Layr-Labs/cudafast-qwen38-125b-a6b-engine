@@ -76227,6 +76227,19 @@ static bool ds4_session_qwen4exp_spec_init(ds4_session *s,
                                     err, errlen) != 0) {
         return false;
     }
+    /* The verify's device-to-host readbacks land in these two buffers every
+     * round (hc_scratch takes up to ~1.4 MiB of hyper rows).  Pageable
+     * destinations force the driver through its staging path; pinning them
+     * once here takes the fast path for the life of the state.  A failed
+     * registration is not fatal -- the copies still work, just slower. */
+    (void)ds4_gpu_host_register(
+        s->qwen4exp_spec.hc_scratch,
+        (uint64_t)DS4_QWEN4EXP_MTP_HC_ROWS * (uint64_t)s->qwen4exp_seam.hc_dim *
+            (uint64_t)sizeof(float));
+    (void)ds4_gpu_host_register(
+        s->qwen4exp_spec.logits_rows,
+        (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT *
+            (uint64_t)s->qwen4exp_seam.n_vocab * (uint64_t)sizeof(float));
     head->want_margin = s->qwen4exp_spec.stop_margin > 0.0f ||
                         s->qwen4exp_spec.drop_margin > 0.0f ||
                         s->qwen4exp_spec.margin_log;
@@ -77039,6 +77052,12 @@ int ds4_qwen4exp_test_depth_table(const char *model_path,
                 }
             }
 
+#ifndef DS4_NO_GPU
+            if (sess->qwen4exp_spec.hc_scratch)
+                (void)ds4_gpu_host_unregister(sess->qwen4exp_spec.hc_scratch);
+            if (sess->qwen4exp_spec.logits_rows)
+                (void)ds4_gpu_host_unregister(sess->qwen4exp_spec.logits_rows);
+#endif
             ds4_qwen4exp_mtp_state_free(&sess->qwen4exp_spec);
             ds4_qwen4exp_mtp_head_free(&sess->qwen4exp_head);
             free(sess->logits);
@@ -77385,8 +77404,13 @@ int ds4_qwen4exp_test_session_spec(const char *path, const char *head_path,
     }
 
 
+#ifndef DS4_NO_GPU
+    if (sess->qwen4exp_spec.hc_scratch)
+        (void)ds4_gpu_host_unregister(sess->qwen4exp_spec.hc_scratch);
+    if (sess->qwen4exp_spec.logits_rows)
+        (void)ds4_gpu_host_unregister(sess->qwen4exp_spec.logits_rows);
+#endif
     ds4_qwen4exp_mtp_state_free(&sess->qwen4exp_spec);
-    ds4_qwen4exp_mtp_head_free(&sess->qwen4exp_head);
     free(sess->logits);
     free(sess);
     ds4_qwen4exp_session_close(e->qwen4exp_session);

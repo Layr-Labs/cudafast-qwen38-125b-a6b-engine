@@ -6073,6 +6073,18 @@ extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset
     return cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes, cudaMemcpyDeviceToHost), "tensor read");
 }
 
+extern "C" int ds4_gpu_host_register(void *ptr, uint64_t bytes) {
+    if (!ptr || bytes == 0) return 0;
+    return cuda_ok(cudaHostRegister(ptr, (size_t)bytes,
+                                    cudaHostRegisterDefault | cudaHostRegisterPortable),
+                   "host register");
+}
+
+extern "C" int ds4_gpu_host_unregister(void *ptr) {
+    if (!ptr) return 0;
+    return cuda_ok(cudaHostUnregister(ptr), "host unregister");
+}
+
 extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                      const ds4_gpu_tensor *src, uint64_t src_offset,
                                      uint64_t bytes) {
