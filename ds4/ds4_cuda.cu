@@ -3513,6 +3513,24 @@ extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset
     }
     return ok;
 }
+/* cudaMemcpyAsync on the legacy stream is stream-ordered against every
+ * kernel this file launches, so the bytes land before the next kernel
+ * touches them.  With a pageable source the call blocks only while the
+ * driver stages the bytes into its own pinned bounce buffer; the DMA
+ * itself drains behind the next launches instead of holding the host the
+ * way cudaMemcpy does. */
+extern "C" int ds4_gpu_tensor_write_async(ds4_gpu_tensor *tensor, uint64_t offset,
+                                          const void *data, uint64_t bytes) {
+    if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
+    int d = ds4_tensor_device_idx(tensor);
+    int ok = 0;
+    WITH_DEVICE(g_gpu[d].device_id) {
+        ok = cuda_ok(cudaMemcpyAsync((char *)tensor->ptr + offset, data,
+                                   (size_t)bytes, cudaMemcpyHostToDevice, 0),
+                     "tensor write async");
+    }
+    return ok;
+}
 
 extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                      const ds4_gpu_tensor *src, uint64_t src_offset,
@@ -4059,6 +4077,14 @@ extern "C" int ds4_gpu_end_commands(void) {
         return cuda_ok(cudaStreamSynchronize(0), "end commands stream");
     }
     return cuda_ok(cudaDeviceSynchronize(), "end commands");
+}
+/* The pair end_commands + synchronize is two device synchronises back to
+ * back; the second can only ever observe the first one's quiescence, so one
+ * cudaDeviceSynchronize is the whole contract, with or without
+ * DS4_CUDA_END_STREAM_SYNC (stream-0 copies never waited on the non-blocking
+ * streams either way). */
+extern "C" int ds4_gpu_end_commands_sync(void) {
+    return cuda_ok(cudaDeviceSynchronize(), "end commands sync");
 }
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
 
