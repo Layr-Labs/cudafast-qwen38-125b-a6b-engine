@@ -646,6 +646,253 @@ static void test_head_vocab_rule(void) {
           "a composite head vocabulary is refused");
 }
 
+/* Independent fp16 -> fp32, written from the IEEE-754 half layout rather than
+ * copied from the implementation, so the check below has a real oracle. */
+static float iq4nl_ref_fp16_to_fp32(uint16_t h) {
+    const uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    const uint32_t exp  = (h >> 10) & 0x1Fu;
+    const uint32_t man  = h & 0x3FFu;
+    uint32_t bits;
+
+    if (exp == 0u) {
+        if (man == 0u) {
+            bits = sign;
+        } else {
+            uint32_t m = man, e = 0u;
+            while ((m & 0x400u) == 0u) { m <<= 1; e++; }
+            bits = sign | ((127u - 15u - e + 1u) << 23) | ((m & 0x3FFu) << 13);
+        }
+    } else if (exp == 0x1Fu) {
+        bits = sign | 0x7F800000u | (man << 13);
+    } else {
+        bits = sign | ((exp + 127u - 15u) << 23) | (man << 13);
+    }
+
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+static int iq4nl_same_bits(float a, float b) {
+    if (a != a || b != b) return (a != a) && (b != b); /* NaN: both NaN is agreement */
+    if (a == 0.0f && b == 0.0f) return 1;              /* signed zero is not observable here */
+    uint32_t x, y;
+    memcpy(&x, &a, sizeof(x));
+    memcpy(&y, &b, sizeof(y));
+    return x == y;
+}
+
+/* Exhaustive bit-identity sweep for the one function this tree diverges on.
+ *
+ * The tree's sole divergence from upstream is that ds4_ple_dequant_iq4_nl holds
+ * the high-half code-book base in a register instead of re-addressing
+ * ple_kvalues_iq4nl_hi[].  That changes only where the table is addressed from,
+ * so this compares the implementation against an independently written
+ * expression of the IQ4_NL block layout -- a sixteen-entry code book, the fp16
+ * scale, and the low/high nibble split -- over every byte value in the nibble
+ * plane and a spread of scales, comparing float BITS rather than values so a
+ * wrong value cannot pass by comparing equal. */
+static void test_dequant_iq4_nl_bit_identity(void) {
+    static const int8_t kvalues[16] = {
+        -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+    };
+    static const uint16_t scales[] = {
+        0x3C00u, /*  1.0                */
+        0x3800u, /*  0.5                */
+        0xB800u, /* -0.5                */
+        0x4000u, /*  2.0                */
+        0x3E00u, /*  1.5                */
+        0x0400u, /*  smallest normal    */
+        0x0001u, /*  smallest subnormal */
+        0x8001u, /* -smallest subnormal */
+        0x7C00u, /* +inf                */
+        0xFC00u, /* -inf                */
+        0x7E00u, /*  NaN                */
+        0x0000u, /*  0.0                */
+    };
+    uint8_t block[DS4_PLE_IQ4_NL_BLOCK_BYTES];
+    float out[DS4_PLE_IQ4_NL_BLOCK_ELEMS];
+    uint64_t compared = 0, mismatched = 0;
+
+    for (size_t s = 0; s < sizeof(scales) / sizeof(scales[0]); s++) {
+        block[0] = (uint8_t)(scales[s] & 0xFFu);
+        block[1] = (uint8_t)(scales[s] >> 8);
+        const float d = iq4nl_ref_fp16_to_fp32(scales[s]);
+        for (int lo = 0; lo < 256; lo++) {
+            for (int hi = 0; hi < 256; hi++) {
+                for (int j = 0; j < 16; j++) {
+                    block[2 + j] = (uint8_t)((((hi + j) & 0x0F) << 4) | ((lo + j) & 0x0F));
+                }
+                ds4_ple_dequant_iq4_nl(block, 1, out);
+                for (int j = 0; j < 16; j++) {
+                    const float want_lo = d * (float)kvalues[(lo + j) & 0x0F];
+                    const float want_hi = d * (float)kvalues[(hi + j) & 0x0F];
+                    if (!iq4nl_same_bits(out[j], want_lo)) mismatched++;
+                    if (!iq4nl_same_bits(out[j + 16], want_hi)) mismatched++;
+                    compared += 2;
+                }
+            }
+        }
+    }
+
+    CHECK(mismatched == 0, "every dequantized float matches the reference bit for bit");
+    fprintf(stderr, "  compared %llu floats over %zu scales\n",
+            (unsigned long long)compared, sizeof(scales) / sizeof(scales[0]));
+}
+
+/* The scale path over its whole domain.
+ *
+ * The implementation's comment states the guard-free converter is "verified
+ * against the original over the full 16-bit domain", but the converter is
+ * static and no test in the tree exercises that claim.  This makes it
+ * checkable the only way a host test can: through the dequant, with a block
+ * that visits every entry of both code-book halves, for all 65536 fp16 scale
+ * bit patterns -- zeros, subnormals, normals of both signs, both infinities and
+ * every NaN payload.  The reference decoder is the independent one above. */
+static void test_dequant_iq4_nl_scale_domain(void) {
+    static const int8_t kvalues[16] = {
+        -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+    };
+    uint8_t block[DS4_PLE_IQ4_NL_BLOCK_BYTES];
+    float out[DS4_PLE_IQ4_NL_BLOCK_ELEMS];
+    uint64_t compared = 0, mismatched = 0;
+
+    /* Low nibble 15-j and high nibble j, so the block walks the whole code book. */
+    for (int j = 0; j < 16; j++) {
+        block[2 + j] = (uint8_t)((j << 4) | (15 - j));
+    }
+
+    for (uint32_t h = 0; h < 65536u; h++) {
+        block[0] = (uint8_t)(h & 0xFFu);
+        block[1] = (uint8_t)(h >> 8);
+        const float d = iq4nl_ref_fp16_to_fp32((uint16_t)h);
+        ds4_ple_dequant_iq4_nl(block, 1, out);
+        for (int j = 0; j < 16; j++) {
+            const float want_lo = d * (float)kvalues[15 - j];
+            const float want_hi = d * (float)kvalues[j];
+            if (!iq4nl_same_bits(out[j], want_lo)) mismatched++;
+            if (!iq4nl_same_bits(out[j + 16], want_hi)) mismatched++;
+            compared += 2;
+        }
+    }
+
+    CHECK(mismatched == 0, "every one of the 65536 fp16 scales converts bit-exactly");
+    fprintf(stderr, "  compared %llu floats over all 65536 scales\n",
+            (unsigned long long)compared);
+}
+
+/* A whole token row, not one block.
+ *
+ * Every check above drives the dequant with `block_count == 1`, but the scored
+ * decode path calls it once per head per token over a token row's five
+ * consecutive blocks, as the function's own LIVE PATH note says.  The block
+ * stride, the output offset and both prefetch guards are only reachable with
+ * `block_count > 1`, so this drives the shipped shape -- five blocks, five
+ * different scales, five different nibble planes -- against the same
+ * independent reference, and then checks the prefix property that a short call
+ * is the head of a long one and writes nothing beyond its own blocks. */
+#define PLE_TEST_ROW_BLOCKS 5
+
+static void test_dequant_iq4_nl_row(void) {
+    static const int8_t kvalues[16] = {
+        -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+    };
+    static const uint16_t scales[PLE_TEST_ROW_BLOCKS] = {
+        0x3C00u, 0x3800u, 0xB800u, 0x4000u, 0x0001u
+    };
+    uint8_t row[PLE_TEST_ROW_BLOCKS * DS4_PLE_IQ4_NL_BLOCK_BYTES];
+    float out[PLE_TEST_ROW_BLOCKS * DS4_PLE_IQ4_NL_BLOCK_ELEMS];
+    float part[PLE_TEST_ROW_BLOCKS * DS4_PLE_IQ4_NL_BLOCK_ELEMS];
+    uint64_t compared = 0, mismatched = 0;
+
+    for (int b = 0; b < PLE_TEST_ROW_BLOCKS; b++) {
+        uint8_t *p = row + b * DS4_PLE_IQ4_NL_BLOCK_BYTES;
+        p[0] = (uint8_t)(scales[b] & 0xFFu);
+        p[1] = (uint8_t)(scales[b] >> 8);
+        for (int j = 0; j < 16; j++) {
+            /* Distinct planes per block, so a stride error cannot cancel out. */
+            p[2 + j] = (uint8_t)(((b * 5 + j) & 0x0F) | (((b * 11 + 3 * j) & 0x0F) << 4));
+        }
+    }
+
+    ds4_ple_dequant_iq4_nl(row, PLE_TEST_ROW_BLOCKS, out);
+
+    for (int b = 0; b < PLE_TEST_ROW_BLOCKS; b++) {
+        const float d = iq4nl_ref_fp16_to_fp32(scales[b]);
+        const uint8_t *p = row + b * DS4_PLE_IQ4_NL_BLOCK_BYTES;
+        for (int j = 0; j < 16; j++) {
+            const uint8_t q = p[2 + j];
+            const float want_lo = d * (float)kvalues[q & 0x0F];
+            const float want_hi = d * (float)kvalues[q >> 4];
+            if (!iq4nl_same_bits(out[b * DS4_PLE_IQ4_NL_BLOCK_ELEMS + j], want_lo)) mismatched++;
+            if (!iq4nl_same_bits(out[b * DS4_PLE_IQ4_NL_BLOCK_ELEMS + 16 + j], want_hi)) mismatched++;
+            compared += 2;
+        }
+    }
+    CHECK(mismatched == 0, "every block of a five-block row matches the reference");
+    fprintf(stderr, "  compared %llu floats over %d consecutive blocks\n",
+            (unsigned long long)compared, PLE_TEST_ROW_BLOCKS);
+
+    /* A short call must be the head of the whole-row call: same start, same
+     * stride, same values, and nothing written past its own blocks. */
+    int head_ok = 1;
+    for (size_t n = 1; n <= PLE_TEST_ROW_BLOCKS; n++) {
+        memset(part, 0, sizeof(part));
+        ds4_ple_dequant_iq4_nl(row, n, part);
+        for (size_t i = 0; i < n * DS4_PLE_IQ4_NL_BLOCK_ELEMS; i++) {
+            if (!iq4nl_same_bits(part[i], out[i])) head_ok = 0;
+        }
+        for (size_t i = n * DS4_PLE_IQ4_NL_BLOCK_ELEMS; i < sizeof(part) / sizeof(part[0]); i++) {
+            if (part[i] != 0.0f) head_ok = 0;
+        }
+    }
+    CHECK(head_ok, "a short call is the head of the whole-row call, and stops there");
+}
+
+/* The one guard this tree added.
+ *
+ * `__builtin_expect(!p || !out, 0)` is the only engine line this account
+ * contributed, and nothing exercised it: every check above passes valid
+ * pointers, and the caller has already refused a NULL row, so the guard is
+ * documented as never taken.  A guard that is never driven is a claim rather
+ * than a fact, so this drives the refusal paths directly and checks that they
+ * return without touching the destination -- and that the function still
+ * dequantizes correctly immediately afterwards. */
+static void test_dequant_iq4_nl_refusals(void) {
+    static const int8_t kvalues[16] = {
+        -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+    };
+    const float sentinel = 12345.0f;
+    uint8_t block[DS4_PLE_IQ4_NL_BLOCK_BYTES];
+    float out[DS4_PLE_IQ4_NL_BLOCK_ELEMS];
+    int untouched = 1;
+
+    /* 0xA5A5 is an ordinary negative normal, so a refused call cannot be
+     * confused with a successful one by the values it would have written. */
+    memset(block, 0xA5, sizeof(block));
+    for (int i = 0; i < DS4_PLE_IQ4_NL_BLOCK_ELEMS; i++) out[i] = sentinel;
+
+    ds4_ple_dequant_iq4_nl(NULL, 1, out);
+    ds4_ple_dequant_iq4_nl(block, 1, NULL);
+    ds4_ple_dequant_iq4_nl(NULL, 0, NULL);
+    ds4_ple_dequant_iq4_nl(block, 0, out);
+    for (int i = 0; i < DS4_PLE_IQ4_NL_BLOCK_ELEMS; i++) {
+        if (out[i] != sentinel) untouched = 0;
+    }
+    CHECK(untouched, "a refused call, and a zero block count, write nothing");
+
+    const uint16_t half = (uint16_t)(block[0] | (uint16_t)(block[1] << 8));
+    const float d = iq4nl_ref_fp16_to_fp32(half);
+    ds4_ple_dequant_iq4_nl(block, 1, out);
+    int ok = 1;
+    for (int j = 0; j < 16; j++) {
+        const uint8_t q = block[2 + j];
+        if (!iq4nl_same_bits(out[j], d * (float)kvalues[q & 0x0F])) ok = 0;
+        if (!iq4nl_same_bits(out[j + 16], d * (float)kvalues[q >> 4])) ok = 0;
+    }
+    CHECK(ok, "the function still dequantizes correctly after a refused call");
+}
+
 int main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "constants") == 0) {
         return probe_constants(argc - 2, argv + 2);
@@ -677,6 +924,10 @@ int main(int argc, char **argv) {
     RUN(test_eos_boundary_shape);
     RUN(test_row_ids_stay_inside_the_table);
     RUN(test_dequant_iq4_nl);
+    RUN(test_dequant_iq4_nl_bit_identity);
+    RUN(test_dequant_iq4_nl_scale_domain);
+    RUN(test_dequant_iq4_nl_row);
+    RUN(test_dequant_iq4_nl_refusals);
     RUN(test_refusal_without_a_checkpoint);
     RUN(test_hash_constants_derivation);
     RUN(test_head_vocab_rule);
