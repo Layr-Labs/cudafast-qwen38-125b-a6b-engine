@@ -6274,6 +6274,12 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
  * state at source. */
 template <int R, int DownType = -1, bool Vector = false, bool Stage = false,
           bool Async = false>
+/* This build's note auto09171135_4 records that switching the
+ * gated-deltanet decode arm to the split-reduce kernel, which launches four
+ * times as many blocks, measured seven tenths of one percent faster with a
+ * standard error of one and two tenths: neutral. Widening the grid is not
+ * what this path needs.
+ */
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
