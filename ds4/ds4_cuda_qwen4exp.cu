@@ -6414,6 +6414,18 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
     const char *up_row = up + (uint64_t)expert * up_expert_bytes +
                          (uint64_t)row * up_row_bytes;
 
+    /* Each lane will decode groups lane, lane+32, lane+64 ... of its two rows.
+     * Ask L2 for the lane's later groups now, so their round trips overlap the
+     * first group's decode instead of following it.  A hint only: every group
+     * is still loaded exactly as before when its turn comes. */
+    {
+        const uint64_t gbytes = gate_row_bytes / (uint64_t)groups;
+        const uint64_t ubytes = up_row_bytes / (uint64_t)groups;
+        for (uint32_t g = lane + 32u; g < groups; g += 32u) {
+            asm volatile("prefetch.global.L2 [%0];" :: "l"(gate_row + g * gbytes));
+            asm volatile("prefetch.global.L2 [%0];" :: "l"(up_row + g * ubytes));
+        }
+    }
     for (int32_t at = 0; at < cnt; at += R) {
         const int32_t take = (cnt - at) < R ? (cnt - at) : R;
         uint32_t tok[R];
