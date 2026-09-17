@@ -424,6 +424,11 @@ __device__ __forceinline__ static float qwen4exp_gdn_softplus(float x) {
  * standard error of one and two tenths: neutral. Widening the grid is not
  * what this path needs.
  */
+/* This build's note auto09171227_1 records that the promotion margin on
+ * this track is close to the paired measurement's own run-to-run spread, so
+ * a change worth less than about half a percent of decode cannot be told
+ * apart from a lucky draw even after it lands.
+ */
 __global__ static void qwen4exp_gdn_conv_kernel(
         float       *qkv,
         float       *conv_state,
