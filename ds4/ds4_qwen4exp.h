@@ -91,6 +91,8 @@ typedef struct {
 typedef struct {
     ds4_tensor *tensor;   /* per_layer_token_embd.weight                    */
     const uint8_t *base;  /* first byte of row 0 inside its shard mapping   */
+    int      fd;          /* the shard's descriptor, kept for row reads     */
+    uint64_t file_offset; /* byte offset of row 0 inside that descriptor    */
     uint64_t rows;        /* 320,001,536 in the production artifact         */
     uint64_t covered_rows;/* rows the head vocabularies actually cover      */
     uint64_t row_dim;     /* 160 values per row                             */

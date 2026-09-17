@@ -1095,6 +1095,30 @@ void ds4_qwen4exp_session_reset(ds4_qwen4exp_session *s) {
  * knob); a positive value pins the thread count.  Unset, the gather takes
  * the online CPUs capped at 16 -- enough to keep the SSD queue deep without
  * starving the decode path's own helpers. */
+/* Fetch one quantized row through the shard's descriptor instead of a demand
+ * fault on the mapping.  The table is 26.8 GiB of MAP_PRIVATE file pages on a
+ * box whose model residency already holds ~104 GiB, so the gather's scattered
+ * 90-byte rows are refaults: each one pays the fault entry, the page-table
+ * work and the TLB pressure on top of the read itself.  pread() takes the
+ * same pages through the page cache with none of that machinery, and the
+ * bytes that land are the same bytes the mapping would have handed over.
+ * A short or failed read falls back to the mapped pointer, so the only way
+ * this changes a value is if the mapping itself was already wrong. */
+#define QW_PLE_ROW_SCRATCH 256u
+
+static const uint8_t *qw_ple_row(const ds4_qwen4exp_ple_table *t, uint64_t row,
+                                 uint8_t *scratch) {
+    if (!t || row >= t->rows) return NULL;
+    if (t->fd >= 0 && t->row_bytes <= QW_PLE_ROW_SCRATCH) {
+        const ssize_t got = pread(t->fd, scratch, (size_t)t->row_bytes,
+                                  (off_t)(t->file_offset +
+                                          row * t->row_bytes));
+        if (got == (ssize_t)t->row_bytes) return scratch;
+    }
+    if (!t->base) return NULL;
+    return t->base + row * t->row_bytes;
+}
+
 typedef struct {
     const ds4_qwen4exp_ple_table *ple;
     const ds4_qwen4exp_session   *s;
@@ -1132,13 +1156,14 @@ static void *qw_ple_gather_worker(void *arg) {
         ds4_ple_history_reset(&seg->s->ple_constants, &local);
     }
     seg->ok = 1;
+    uint8_t row_scratch[QW_PLE_ROW_SCRATCH];
     for (uint32_t t = seg->t0; t < seg->t1; t++) {
         ds4_ple_row_ids(&seg->s->ple_constants, &local, seg->tokens + t, 1u,
                         seg->s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD);
         for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
             const uint64_t row =
                 seg->s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h];
-            const uint8_t *quant = ds4_qwen4exp_ple_row(seg->ple, row);
+            const uint8_t *quant = qw_ple_row(seg->ple, row, row_scratch);
             if (!quant) { seg->ok = 0; return NULL; }
             ds4_ple_dequant_iq4_nl(
                 quant, seg->blocks_per_row,
@@ -1299,6 +1324,7 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 s->ple_history_rows[t] = s->ple_history;
             }
         }
+        uint8_t row_scratch[QW_PLE_ROW_SCRATCH];
         for (uint32_t t = 0; t < n_tokens; t++) {
             /* The head's destination strides are constants of the shape, so
              * the token base is hoisted out of the head loop and the head
@@ -1312,7 +1338,7 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                  * another table row, so ask for the next id early.  Hint. */
                 if (h + 1u < DS4_N_PLE_HEAD)
                     __builtin_prefetch(ids + h + 1u, 0, 1);
-                const uint8_t *quant = ds4_qwen4exp_ple_row(&w->ple, row);
+                const uint8_t *quant = qw_ple_row(&w->ple, row, row_scratch);
                 /* Cold: a hashed row past the table is a hard refusal that has
                  * never fired in a scored run, so keep it out of the hot path. */
                 if (__builtin_expect(!quant, 0)) {
@@ -1362,11 +1388,12 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
         if (nthreads == 1) {
             ds4_ple_row_ids(&s->ple_constants, &s->ple_history, tokens,
                             n_tokens, s->ple_ids);
+            uint8_t row_scratch[QW_PLE_ROW_SCRATCH];
             for (uint32_t t = 0; t < n_tokens; t++) {
                 for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
                     const uint64_t row =
                         s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h];
-                    const uint8_t *quant = ds4_qwen4exp_ple_row(&w->ple, row);
+                    const uint8_t *quant = qw_ple_row(&w->ple, row, row_scratch);
                     if (!quant) {
                         fprintf(stderr,
                                 "ds4: qwen4exp block %u hashed token %u head %u "
@@ -2898,36 +2925,6 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         DS4_QWEN4EXP_MTP_MAX_COMMIT, s->adopt_state, s->adopt_conv);
     if (replay_step.settle) {
         const uint32_t rs = s->adopt_state, rc = s->adopt_conv;
-        /* ONE BATCH, ONE SYNCHRONIZE, when both halves settle the same row.
-         *
-         * qwen4exp_session_copy_layers() opens its own command batch and ends
-         * it with ds4_gpu_end_commands() + ds4_gpu_synchronize(), so calling it
-         * twice -- once for the recurrent state and once for the convolution --
-         * drains the stream TWICE for one rollback.  The two passes copy
-         * disjoint buffers (gdn_state[il] from the state snapshot,
-         * gdn_conv[il] from the conv snapshot) and neither reads what the other
-         * writes, so nothing orders one before the other and the split buys
-         * nothing.
-         *
-         * The common case is exactly the mergeable one: the plan forces a
-         * settle whenever `recurrent != conv`, so on the path that survives to
-         * here with both non-zero they are equal, and one call with both flags
-         * does the same work per layer in one batch behind one drain.
-         *
-         * BIT-IDENTICAL: the same rows are copied out of the same snapshots
-         * into the same destinations, and the per-layer loop inside
-         * copy_layers already handles both flags together -- the only thing
-         * that changes is that the conv copies join the batch the state copies
-         * were already in.  The unequal and single-sided cases keep the
-         * original two-call form below. */
-        if (rs != 0u && rs == rc) {
-            if (!qwen4exp_session_copy_layers(s, rs - 1u, true, true)) {
-                fprintf(stderr, "ds4: qwen4exp GDN rollback could not settle\n");
-                return false;
-            }
-            s->adopt_state = 0u;
-            s->adopt_conv = 0u;
-        } else
         if ((rs != 0u && !qwen4exp_session_copy_layers(s, rs - 1u, true, false)) ||
             (rc != 0u && !qwen4exp_session_copy_layers(s, rc - 1u, false, true))) {
             fprintf(stderr, "ds4: qwen4exp GDN rollback could not settle\n");

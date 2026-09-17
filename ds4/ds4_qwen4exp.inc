@@ -1142,6 +1142,11 @@ static void weights_bind_qwen4exp_ple_table(ds4_qwen4exp_ple_table *ple,
 
     ple->tensor = t;
     ple->base = (const uint8_t *)tensor_data(m, t);
+    /* The shard descriptor stays open for the model's life and abs_offset is
+     * the tensor's byte offset inside that file, so a row can be fetched with
+     * pread() instead of a demand fault on the mapping. */
+    ple->fd = m->shard[t->map_index].fd;
+    ple->file_offset = t->abs_offset;
     ple->rows = t->dim[1];
     ple->row_dim = t->dim[0];
     ple->row_bytes = row_bytes;
