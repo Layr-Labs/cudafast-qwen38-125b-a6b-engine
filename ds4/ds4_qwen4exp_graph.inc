@@ -1299,6 +1299,16 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 s->ple_history_rows[t] = s->ple_history;
             }
         }
+        /* The table is SSD-resident, and a row is reached by hashed id, so the
+         * rows this scan wants are scattered across it: one head's row is very
+         * unlikely to share a page with the head before it.  Each first touch
+         * of such a page is therefore a storage fault taken with the dequant
+         * already waiting on it.  Asking for the NEXT head's page before this
+         * head is dequantized gives that fault the whole of the current head's
+         * dequant to complete in.  Nothing here changes which rows are read or
+         * what is computed from them; it only moves when the kernel is told to
+         * start fetching a page it is about to be asked for anyway. */
+        const uintptr_t ple_page = (uintptr_t)sysconf(_SC_PAGESIZE);
         for (uint32_t t = 0; t < n_tokens; t++) {
             /* The head's destination strides are constants of the shape, so
              * the token base is hoisted out of the head loop and the head
@@ -1322,6 +1332,29 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                             il, t, h, row, w->ple.rows);
                     return false;
                 }
+#if defined(POSIX_MADV_WILLNEED) && !defined(DS4_NO_GPU)
+                /* One head ahead inside the token, and -- at the last head --
+                 * the first head of the next token, so the run of pages this
+                 * scan wants is requested continuously rather than restarting
+                 * cold at every token boundary. */
+                if (ple_page != 0) {
+                    uint64_t ahead = UINT64_MAX;
+                    if (h + 1u < DS4_N_PLE_HEAD) {
+                        ahead = ids[h + 1u];
+                    } else if (t + 1u < n_tokens) {
+                        ahead = s->ple_ids[(uint64_t)(t + 1u) * DS4_N_PLE_HEAD];
+                    }
+                    if (ahead != UINT64_MAX) {
+                        const uint8_t *nq = ds4_qwen4exp_ple_row(&w->ple, ahead);
+                        if (nq) {
+                            const uintptr_t np = (uintptr_t)nq & ~(ple_page - 1u);
+                            if (np != ((uintptr_t)quant & ~(ple_page - 1u)))
+                                (void)posix_madvise((void *)np, (size_t)ple_page,
+                                                    POSIX_MADV_WILLNEED);
+                        }
+                    }
+                }
+#endif
                 ds4_ple_dequant_iq4_nl(quant, blocks_per_row, dst);
                 dst += DS4_N_PLE_ROW_DIM;
             }
