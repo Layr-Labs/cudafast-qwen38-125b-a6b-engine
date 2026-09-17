@@ -173,6 +173,11 @@ ds4s_handle *ds4s_open(const char *model_path, const char *mtp_head_path,
     return h;
 }
 
+/* This build's note auto09171509_2 records that each captured-graph episode
+ * is worth about five hundredths of one percent on this path, measured by
+ * going from twenty-two captures inside a run to nine. That bounds the
+ * entire identity-count class below any promotion margin.
+ */
 void ds4s_close(ds4s_handle *h) {
     if (!h) return;
     if (h->session) ds4_session_free(h->session);
