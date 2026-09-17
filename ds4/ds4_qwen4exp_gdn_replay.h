@@ -4,7 +4,31 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define DS4_QWEN4EXP_GDN_REPLAY_ROWS 2u
+/* THE TAPE DEPTH IS A PURE COST, NOT A CAPABILITY.
+ *
+ * `prefix` cycles 0, 1, ... ROWS and then folds into the checkpoint and resets,
+ * and the recurrent kernel's loop runs `prefix + n_tokens` sequential steps --
+ * so the replayed steps average ROWS/2 per forward, every one of them a
+ * register-carried step with two warp reductions in it.  Nothing else in the
+ * controller depends on the depth: `reuse` (and therefore `settle`, the host
+ * rollback copy that drains the stream, and `swap`) is a function of
+ * `previous`, `recurrent` and `conv` only, never of `prefix`.  So a deeper tape
+ * buys no avoided settle -- it only lengthens the replay -- and the fold it
+ * defers is a single float4 store per state element.
+ *
+ * At depth 1 the decode forward (n_tokens == 2) averages 0.5 + 2 = 2.5 steps
+ * instead of 1.0 + 2 = 3.0: one sixth of the sequential work in a latency-bound
+ * recurrence, for a smaller tape.
+ *
+ * BIT-EXACT.  The checkpoint is a float4 *copy* of the carried state at a step
+ * boundary, not a recomputation, so folding after one transition instead of two
+ * reproduces the identical `h` bit for bit: the same transitions are applied to
+ * the same state in the same order, and only the point at which the register
+ * value is spilled to the checkpoint moves.  The depth also has to satisfy
+ * prefix <= ROWS for the virtual row-zero snapshot (rows = prefix + 1 entries
+ * when prefix < ROWS, 0 when it equals ROWS), which holds at 1 exactly as it
+ * does at 2. */
+#define DS4_QWEN4EXP_GDN_REPLAY_ROWS 1u
 
 /* Host transition policy, independent of CUDA. A replay verify leaves a
  * virtual row-zero snapshot: checkpoint + its bounded transition log. */
