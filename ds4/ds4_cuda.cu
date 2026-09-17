@@ -1014,7 +1014,8 @@ static_assert(sizeof(ds4_decode_graph_key) == 48u,
 struct cuda_decode_graph_entry {
     ds4_decode_graph_key key;
     cudaGraphExec_t      exec;
-    int                  state;   /* 0 empty, 1 warmed, 2 ready, 3 dead */
+    int                  state;    /* 0 empty, 1 warmed, 2 ready, 3 dead */
+    int                  uploaded; /* this exec's device image is resident */
     uint64_t             hits;
 };
 
@@ -1086,11 +1087,51 @@ static inline int cuda_decode_graph_upload_on(void) {
     return on;
 }
 
+/* Whether a chunk that is ALREADY resident is uploaded again every round.
+ *
+ * MEASURED, window-4 nsys capture of the depth-1 decode leg (67 timed rounds):
+ * cudaGraphUpload ran 197 times, ~2.94 per round, median 127 us of host time,
+ * spread evenly across all ten deciles of the window -- steady state, not
+ * warm-up (cudaGraphInstantiate is 10-of-11 calls in the first decile, so
+ * capture really is warm-up only).  Splitting cudaGraphLaunch by whether an
+ * upload had just ended: 542 us median with a recent upload (n=187) against
+ * 214 us without (n=132), and the launches sit in a strict upload/launch
+ * alternation with each upload ending exactly where the next launch begins.
+ *
+ * The mechanism: ds4_gpu_decode_graph_prefetch issues cudaGraphUpload for
+ * chunk c+1 on g_decode_graph_stream -- the SAME stream chunk c is replaying
+ * on -- so it is stream-ordered BEHIND the running chunk and AHEAD of the next
+ * launch rather than overlapped with either.  It cannot hide.  And the exec it
+ * uploads was already uploaded once at instantiate time below, and a graph
+ * exec stays resident, so in steady state every one of those ~186 uploads
+ * re-uploads an image the device already holds.
+ *
+ * So the prefetch keeps its purpose -- an exec whose image is NOT yet resident
+ * is still uploaded off the launch's critical path -- and loses only the
+ * repeat.  Set DS4_CUDA_GRAPH_UPLOAD_REPEAT=1 to restore the per-round
+ * re-upload in the same binary for an A/B.
+ *
+ * Nothing about a graph's contents or its ordering depends on when, or how
+ * often, its executable is uploaded. */
+static inline int cuda_decode_graph_upload_repeat_on(void) {
+    static int init = 0;
+    static int on = 0;
+    if (!init) {
+        init = 1;
+        const char *s = getenv("DS4_CUDA_GRAPH_UPLOAD_REPEAT");
+        if (s && *s)
+            on = (s[0] != '0' && strcmp(s, "off") != 0 &&
+                  strcmp(s, "no") != 0 && strcmp(s, "false") != 0) ? 1 : 0;
+    }
+    return on;
+}
+
 static void cuda_decode_graph_entry_kill(cuda_decode_graph_entry *e) {
     if (e->exec) {
         (void)cudaGraphExecDestroy(e->exec);
         e->exec = NULL;
     }
+    e->uploaded = 0;
     e->state = 3;
 }
 
@@ -1104,6 +1145,7 @@ extern "C" void ds4_gpu_decode_graphs_invalidate(void) {
                     e->exec = NULL;
                 }
                 e->state = 0;
+                e->uploaded = 0;
                 e->hits = 0;
                 memset(&e->key, 0, sizeof(e->key));
             }
@@ -1140,6 +1182,7 @@ static cuda_decode_graph_entry *cuda_decode_graph_find(
     if (slot) {
         memcpy(&slot->key, key, sizeof(*key));
         slot->state = 0;   /* caller advances the state machine */
+        slot->uploaded = 0;
         return slot;
     }
     return NULL;           /* all variants busy with other keys: stay eager */
@@ -1161,10 +1204,14 @@ extern "C" int ds4_gpu_decode_graph_prefetch(const ds4_decode_graph_key *key) {
         cuda_decode_graph_entry *e = &g_decode_graphs[key->il][key->island][v];
         if (e->state != 2 || !e->exec) continue;
         if (memcmp(&e->key, key, sizeof(*key)) != 0) continue;
+        /* Already resident: re-uploading it would only stream-order an
+         * enqueue between this chunk's replay and the next launch. */
+        if (e->uploaded && !cuda_decode_graph_upload_repeat_on()) return 1;
         if (cudaGraphUpload(e->exec, g_decode_graph_stream) != cudaSuccess) {
             (void)cudaGetLastError();
             return 0;
         }
+        e->uploaded = 1;
         return 1;
     }
     return 0;
@@ -1264,7 +1311,7 @@ extern "C" int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) {
      * failure is not fatal: the launch does the upload itself, which is the
      * behaviour without this call. */
     if (cuda_decode_graph_upload_on()) {
-        (void)cudaGraphUpload(exec, g_decode_graph_stream);
+        e->uploaded = (cudaGraphUpload(exec, g_decode_graph_stream) == cudaSuccess);
         (void)cudaGetLastError();
     }
     if (getenv("DS4_CUDA_DECODE_GRAPH_LOG") != NULL) {
