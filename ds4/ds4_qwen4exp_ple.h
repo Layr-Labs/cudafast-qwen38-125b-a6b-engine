@@ -171,6 +171,14 @@ void ds4_ple_row_ids(const ds4_ple_constants *c,
                      size_t                   count,
                      uint64_t                *out);
 
+/* Point the row prefetcher at the table the engine bound.  `base` is the
+ * first byte of `per_layer_token_embd.weight` inside its shard mapping,
+ * `row_bytes` the quantized stride and `rows` the table height.  Called once
+ * at bind; a NULL base turns prefetching off (tests that exercise the hash
+ * without a table take that path). */
+void ds4_ple_prefetch_bind(const void *base, uint64_t row_bytes,
+                           uint64_t rows);
+
 /* ------------------------------------------------------------- dequant */
 
 /* Dequantize `block_count` IQ4_NL blocks into `block_count * 32` floats.

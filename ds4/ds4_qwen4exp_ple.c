@@ -6,6 +6,13 @@
  * from a shard set that the engine mapping does not necessarily cover, and
  * because the tests must exercise it without a model. */
 
+/* madvise/MADV_WILLNEED for the row prefetcher below.  The engine build
+ * passes -D_GNU_SOURCE already; the standalone test recipe does not, and
+ * without it strict -std=c99 hides both names. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "ds4_qwen4exp_ple.h"
 
 #include <fcntl.h>
@@ -641,6 +648,75 @@ void ds4_ple_history_reset(const ds4_ple_constants *c, ds4_ple_history *h) {
     for (int i = 0; i < DS4_PLE_MAX_NGRAM; i++) h->previous[i] = c->eos_token_id;
 }
 
+/* ------------------------------------------------------------------ *
+ * Row prefetch.
+ *
+ * The gather reads `head_count` random 90-byte rows out of the 26.8 GiB
+ * SSD-resident table per token, and every read is a page fault when the
+ * page cache does not already hold the row.  Faults are serial: the loop
+ * cannot touch row h + 1's page until row h's fault has been served, so a
+ * token costs sixteen round trips to the disk one after another.
+ *
+ * madvise(MADV_WILLNEED) is asynchronous readahead: the call returns
+ * immediately and the kernel pulls the pages in the background.  Issuing
+ * it for every id this call just produced lets all of a token's rows --
+ * and, at prefill width, the whole chunk's -- stream in together while
+ * the caller is still on its way to the read loop, so the faults overlap
+ * instead of queueing.  On a warm page the advise is a cheap no-op; on an
+ * id past the table it is a bounded ENOMEM the kernel ignores, which is
+ * also why the sweep never changes the ids or the history.
+ *
+ * The table pointer arrives at bind time rather than through the
+ * constants, so every caller of ds4_ple_row_ids -- the serial gather, the
+ * threaded segments and the speculative per-row path -- prefetches
+ * without a signature change. */
+static const uint8_t *g_ple_pf_base      = NULL;
+static uint64_t       g_ple_pf_row_bytes = 0;
+static uint64_t       g_ple_pf_rows      = 0;
+
+void ds4_ple_prefetch_bind(const void *base, uint64_t row_bytes,
+                           uint64_t rows) {
+    g_ple_pf_base      = (const uint8_t *)base;
+    g_ple_pf_row_bytes = row_bytes;
+    g_ple_pf_rows      = rows;
+}
+
+#if defined(MADV_WILLNEED)
+static void ple_prefetch_ids(const uint64_t *ids, size_t n) {
+    const uint8_t *base = g_ple_pf_base;
+    if (!base || g_ple_pf_row_bytes == 0) return;
+    static long page = 0;
+    if (page == 0) {
+        page = sysconf(_SC_PAGESIZE);
+        if (page <= 0) page = 4096;
+    }
+    const size_t  pg  = (size_t)page;
+    const uint64_t rb = g_ple_pf_row_bytes;
+    /* `covered` is the first byte no issued advise has asked for yet; an
+     * id whose whole row lies below it shares a page range already in
+     * flight, which is the only dedup a random-order sweep can do cheaply. */
+    uint64_t covered = 0;
+    for (size_t i = 0; i < n; i++) {
+        const uint64_t r = ids[i];
+        if (r >= g_ple_pf_rows) continue;
+        const uint64_t off = r * rb;
+        /* madvise wants a page-aligned address and the tensor base is not
+         * necessarily one, so align the absolute address, not the offset. */
+        const uintptr_t a0 = (uintptr_t)base + off;
+        const uintptr_t a1 = a0 + rb - 1u;
+        if (a1 + 1u <= covered) continue;
+        const uintptr_t p0 = a0 & ~(uintptr_t)(pg - 1u);
+        const uintptr_t p1 = a1 & ~(uintptr_t)(pg - 1u);
+        (void)madvise((void *)p0, (size_t)(p1 - p0 + pg), MADV_WILLNEED);
+        if (p1 + pg > covered) covered = p1 + pg;
+    }
+}
+#else
+static void ple_prefetch_ids(const uint64_t *ids, size_t n) {
+    (void)ids; (void)n;
+}
+#endif
+
 /* `out` and `tokens` are disjoint from `c` and from each other: `c` is a
  * const view of the shape, `tokens` the caller's input row and `out` a
  * caller-owned id buffer.  Without the qualifiers the compiler has to assume
@@ -688,6 +764,9 @@ void ds4_ple_row_ids(const ds4_ple_constants *__restrict c, ds4_ple_history *h,
         }
         if (ngram >= 2) h->previous[1] = cur;
         row += head_count;
+        /* Every id this call wrote names a row the caller is about to read;
+         * start the pages now so the faults overlap instead of serializing. */
+        ple_prefetch_ids(row - head_count, head_count);
     }
 }
 
@@ -1076,12 +1155,18 @@ bool ds4_ple_table_open(const char *const *gguf_paths, size_t path_count,
 
     t->head = -1;
     t->tail = -1;
+    /* The standalone table feeds the same row prefetcher the engine's
+     * bound table does. */
+    ds4_ple_prefetch_bind(t->mapping.map + t->tensor_offset,
+                          (uint64_t)t->quant_row_bytes,
+                          t->constants.table_rows);
     *out = t;
     return true;
 }
 
 void ds4_ple_table_close(ds4_ple_table *t) {
     if (!t) return;
+    ds4_ple_prefetch_bind(NULL, 0, 0);
     ple_map_close(&t->mapping);
     free(t->arena);
     free(t->slot_row);

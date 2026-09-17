@@ -1147,6 +1147,9 @@ static void weights_bind_qwen4exp_ple_table(ds4_qwen4exp_ple_table *ple,
     ple->row_bytes = row_bytes;
     ple->bytes = t->bytes;
     ple->type = t->type;
+    /* The gather's row prefetcher reads this mapping; hand it the same
+     * base and stride the row accessor uses. */
+    ds4_ple_prefetch_bind(ple->base, ple->row_bytes, ple->rows);
 
     qwen4exp_validate_ple_heads(m, ple->rows, ple);
     qwen4exp_read_ple_hash_constants(m, ple);
