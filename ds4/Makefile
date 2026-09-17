@@ -16,6 +16,7 @@ QWEN4EXP_GU_DQ_TEST := tests/test_qwen4exp_gateup_dq
 QWEN4EXP_QSA_TEST := tests/test_qwen4exp_qsa
 QWEN4EXP_GDN_REF_TEST := tests/test_qwen4exp_gdn_ref
 QWEN4EXP_GDN_ROWS_TEST := tests/test_qwen4exp_gdn_value_reuse
+QWEN4EXP_GDN_VARIANT_TEST := tests/test_qwen4exp_gdn_variant
 QWEN4EXP_QSA_REF_TEST := tests/test_qwen4exp_qsa_ref
 QWEN4EXP_GRAPH_TEST := tests/test_qwen4exp_graph
 QWEN4EXP_PLE_KERNEL_TEST := tests/test_qwen4exp_ple_kernels
@@ -1064,7 +1065,7 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 	./tests/test_mxfp4_dot
 
 clean:
-	rm -f ds4_qwen4exp_mtp.o ds4_qwen4exp_mtp_hooks.o ds4_qwen4exp_mtp_cpu.o ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_qwen4exp_gdn tests/test_qwen4exp_gdn_replay tests/test_qwen4exp_moe tests/test_qwen4exp_gateup_dq tests/test_qwen4exp_hc_norm tests/test_qwen4exp_qsa tests/test_qwen4exp_graph tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_model_shard_fd tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_qwen4exp_loader tests/test_qwen4exp_model_registration tests/test_qwen4exp_ple tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4_qwen4exp_mtp.o ds4_qwen4exp_mtp_hooks.o ds4_qwen4exp_mtp_cpu.o ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_qwen4exp_gdn tests/test_qwen4exp_gdn_replay tests/test_qwen4exp_gdn_variant tests/test_qwen4exp_moe tests/test_qwen4exp_gateup_dq tests/test_qwen4exp_hc_norm tests/test_qwen4exp_qsa tests/test_qwen4exp_graph tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_model_shard_fd tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_qwen4exp_loader tests/test_qwen4exp_model_registration tests/test_qwen4exp_ple tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
 
 # Bounded GDN replay: host checks execute production kernel/lifecycle bodies;
 # the CUDA contract also checks convolution, output Q8 and graph replay.
@@ -1080,3 +1081,17 @@ tests/test_qwen4exp_gdn_replay: tests/test_qwen4exp_gdn_replay.o $(GPU_TEST_OBJS
 
 test-qwen4exp-gdn-replay: tests/test_qwen4exp_gdn_replay
 	./tests/test_qwen4exp_gdn_replay
+
+# The variant key's algebra alone: ds4_qwen4exp_gdn_graph_variant is a static
+# inline in a header that includes only stdbool/stdint, so this test needs no GPU
+# objects and no engine.  It locks the two claims that the decode-graph
+# slot-count comments and the shim's WARM_ROUNDS assertion both rest on.
+tests/test_qwen4exp_gdn_variant.o: tests/test_qwen4exp_gdn_variant.c ds4_qwen4exp_gdn_replay.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+$(QWEN4EXP_GDN_VARIANT_TEST): tests/test_qwen4exp_gdn_variant.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+.PHONY: test-qwen4exp-gdn-variant
+test-qwen4exp-gdn-variant: $(QWEN4EXP_GDN_VARIANT_TEST)
+	./$(QWEN4EXP_GDN_VARIANT_TEST)
