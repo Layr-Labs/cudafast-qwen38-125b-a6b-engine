@@ -1095,6 +1095,61 @@ void ds4_qwen4exp_session_reset(ds4_qwen4exp_session *s) {
  * knob); a positive value pins the thread count.  Unset, the gather takes
  * the online CPUs capped at 16 -- enough to keep the SSD queue deep without
  * starving the decode path's own helpers. */
+
+/* Advise the kernel about a set of table rows before the first one is
+ * touched.  The n-gram table is 26.8 GiB and stays mapped on the solid-state
+ * disk: a hashed row id is a real page-in whenever the n-gram lands on a row
+ * the page cache does not hold, which for a random 16-of-320M selection is
+ * the common case rather than the tail.  Without the advise the gather
+ * touches the sixteen rows of a token one at a time and stalls on each fault
+ * in turn -- the dequant of head h cannot start until head h's row has been
+ * read in, and the read of head h + 1 does not begin until head h's dequant
+ * has issued its first load.  Sixteen random 90-byte reads, each rounded to
+ * a page, serialize into sixteen dependent faults per token, and the device
+ * sits idle behind all of them because the gather runs on the host between
+ * the layer-1 boundary and the ple_rows upload.
+ *
+ * The advise converts those dependent faults into concurrent readaheads
+ * issued before the first dequant: the kernel starts every page-in the set
+ * needs while the loop is still dequantizing the first row, so the per-token
+ * cost collapses from sixteen serial fault latencies toward the slowest
+ * single page-in of the set.  The cost model is asymmetric in the right
+ * direction: on a page that is already resident the advise degenerates to a
+ * no-op syscall, so the worst it can do is nothing, and it only does nothing
+ * when the page was already there.
+ *
+ * The hint is value-neutral: it changes no byte the gather writes, it is
+ * skipped for row ids past the table bound, and the bounds-checked accessor
+ * keeps the cold out-of-range refusal intact.  The page size resolves once
+ * per process, the same discipline the gather already applies to the
+ * thread-count environment lookup. */
+static void qw_ple_advise_rows(const ds4_qwen4exp_ple_table *ple,
+                               const uint64_t *ids, uint32_t n) {
+#if defined(POSIX_MADV_WILLNEED)
+    if (!ple || !ple->base || !ids) return;
+    static size_t qw_ple_page = 0;
+    if (qw_ple_page == 0) {
+        const long p = sysconf(_SC_PAGESIZE);
+        qw_ple_page = p > 0 ? (size_t)p : (size_t)4096;
+    }
+    const size_t page = qw_ple_page;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint64_t row = ids[i];
+        if (row >= ple->rows) continue;
+        const uint64_t start = row * ple->row_bytes;
+        const uint64_t end = start + ple->row_bytes;
+        const uint64_t a0 = start - (start % page);
+        uint64_t a1 = (end + page - 1u) / page * page;
+        if (a1 > ple->bytes) a1 = ple->bytes;
+        if (a1 > a0) {
+            (void)posix_madvise((void *)(ple->base + a0),
+                                (size_t)(a1 - a0), POSIX_MADV_WILLNEED);
+        }
+    }
+#else
+    (void)ple; (void)ids; (void)n;
+#endif
+}
 typedef struct {
     const ds4_qwen4exp_ple_table *ple;
     const ds4_qwen4exp_session   *s;
@@ -1135,9 +1190,23 @@ static void *qw_ple_gather_worker(void *arg) {
     for (uint32_t t = seg->t0; t < seg->t1; t++) {
         ds4_ple_row_ids(&seg->s->ple_constants, &local, seg->tokens + t, 1u,
                         seg->s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD);
+        /* Advise this token's whole row set before the first row is read:
+         * the kernel issues every page-in the set needs while the loop is
+         * still dequantizing the first head. */
+        qw_ple_advise_rows(seg->ple,
+                           seg->s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD,
+                           DS4_N_PLE_HEAD);
         for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
             const uint64_t row =
                 seg->s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h];
+            /* Prefetch the next head's actual row bytes -- the load the loop
+             * is about to stall on -- not the next row id, which is already
+             * in L1 because the id array was just written.  Hint. */
+            if (h + 1u < DS4_N_PLE_HEAD) {
+                const uint8_t *next = ds4_qwen4exp_ple_row(seg->ple,
+                    seg->s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h + 1u]);
+                if (next) __builtin_prefetch(next, 0, 1);
+            }
             const uint8_t *quant = ds4_qwen4exp_ple_row(seg->ple, row);
             if (!quant) { seg->ok = 0; return NULL; }
             ds4_ple_dequant_iq4_nl(
@@ -1299,6 +1368,11 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 s->ple_history_rows[t] = s->ple_history;
             }
         }
+        /* Advise the whole call's row set before the first row is touched:
+         * every page-in the call will need is in flight before the first
+         * dequant, the widest overlap the path allows. */
+        qw_ple_advise_rows(&w->ple, s->ple_ids,
+                           n_tokens * DS4_N_PLE_HEAD);
         for (uint32_t t = 0; t < n_tokens; t++) {
             /* The head's destination strides are constants of the shape, so
              * the token base is hoisted out of the head loop and the head
@@ -1309,9 +1383,15 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
             for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
                 const uint64_t row = ids[h];
                 /* Every head of this token except the last is followed by
-                 * another table row, so ask for the next id early.  Hint. */
-                if (h + 1u < DS4_N_PLE_HEAD)
-                    __builtin_prefetch(ids + h + 1u, 0, 1);
+                 * another table row, so prefetch the next head's actual row
+                 * bytes -- the load the loop is about to stall on -- not the
+                 * next row id, which is already in L1 because the id array
+                 * was just written.  Hint. */
+                if (h + 1u < DS4_N_PLE_HEAD) {
+                    const uint8_t *next =
+                        ds4_qwen4exp_ple_row(&w->ple, ids[h + 1u]);
+                    if (next) __builtin_prefetch(next, 0, 1);
+                }
                 const uint8_t *quant = ds4_qwen4exp_ple_row(&w->ple, row);
                 /* Cold: a hashed row past the table is a hard refusal that has
                  * never fired in a scored run, so keep it out of the hot path. */
@@ -1363,9 +1443,24 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
             ds4_ple_row_ids(&s->ple_constants, &s->ple_history, tokens,
                             n_tokens, s->ple_ids);
             for (uint32_t t = 0; t < n_tokens; t++) {
+                /* Advise this token's whole row set before the first row is
+                 * read: token t's page-ins overlap token t's dequant, and
+                 * the next token's advise issues while the current rows are
+                 * still being consumed. */
+                qw_ple_advise_rows(&w->ple,
+                                   s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD,
+                                   DS4_N_PLE_HEAD);
                 for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
                     const uint64_t row =
                         s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h];
+                    /* Prefetch the next head's actual row bytes -- the load
+                     * the loop is about to stall on -- not the next row id,
+                     * which is already in L1.  Hint. */
+                    if (h + 1u < DS4_N_PLE_HEAD) {
+                        const uint8_t *next = ds4_qwen4exp_ple_row(&w->ple,
+                            s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h + 1u]);
+                        if (next) __builtin_prefetch(next, 0, 1);
+                    }
                     const uint8_t *quant = ds4_qwen4exp_ple_row(&w->ple, row);
                     if (!quant) {
                         fprintf(stderr,
@@ -3041,8 +3136,10 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     }
     QW_TRACE(QW_SLICE_HEAD);
     QW_TRACE_REPORT(n_tokens);
-    /* Commit and wait: the logits are read on the host from here on. */
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
+    /* Commit and wait: the logits are read on the host from here on.  One
+     * device synchronize is the whole contract -- the end_commands call this
+     * used to sit beside was a second drain of an already-idle device. */
+    if (!ds4_gpu_synchronize()) {
         fprintf(stderr, "ds4: qwen4exp command batch did not complete\n");
         return false;
     }
@@ -3095,7 +3192,7 @@ static bool qwen4exp_session_copy_layers(ds4_qwen4exp_session *s,
                                      (uint64_t)row * bytes, bytes) != 0;
         }
     }
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) return false;
+    if (!ds4_gpu_synchronize()) return false;
     if (ok && recurrent) s->gdn_replay_previous = false;
     return ok;
 }
@@ -3670,7 +3767,7 @@ bool ds4_qwen4exp_graph_head_logits(ds4_qwen4exp_session       *s,
         fprintf(stderr, "ds4: qwen4exp LM head failed on the head row\n");
         return qwen4exp_forward_fail();
     }
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
+    if (!ds4_gpu_synchronize()) {
         fprintf(stderr, "ds4: qwen4exp command batch did not complete\n");
         return false;
     }
@@ -3868,7 +3965,7 @@ static int qwen4exp_rb_ple_conv_select(void *ctx, uint32_t row) {
     const bool ok = ds4_gpu_tensor_copy(s->ple_conv_state, 0,
                                         s->ple_conv_snapshot,
                                         (uint64_t)row * bytes, bytes) != 0;
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) return -1;
+    if (!ds4_gpu_synchronize()) return -1;
     return ok ? 0 : -1;
 }
 static int qwen4exp_rb_qsa_kv_truncate(void *ctx, uint32_t pos) {
