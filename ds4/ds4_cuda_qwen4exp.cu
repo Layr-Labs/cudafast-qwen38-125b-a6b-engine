@@ -6274,6 +6274,11 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
  * state at source. */
 template <int R, int DownType = -1, bool Vector = false, bool Stage = false,
           bool Async = false>
+/* This build's note auto09171152_6 records that the promotion margin on
+ * this track is close to the paired measurement's own run-to-run spread, so
+ * a change worth less than about half a percent of decode cannot be told
+ * apart from a lucky draw even after it lands.
+ */
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
