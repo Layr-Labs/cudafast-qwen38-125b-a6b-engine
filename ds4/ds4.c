@@ -76004,6 +76004,46 @@ static bool ds4_session_is_qwen4exp(const ds4_session *s) {
  * drafted position against the target's own argmax there, and the one forward
  * already has every row's pre-final-mixer state, so the head runs over the
  * chain once instead of once per comparison. */
+/* ---- PLE row prefetch, driven by the draft chain ----------------------
+ *
+ * The gather inside the next verify cannot overlap anything: the decode
+ * replay needs ple_rows before it launches, so its SSD faults are exposed
+ * on the accept loop's critical path.  The draft chain is the one window
+ * that can hide them -- each head forward keeps the device busy while the
+ * host waits on its readback, and the chain is exactly where the next
+ * verify's tokens become known, one per step: the fed token, then each
+ * draft the head emits.
+ *
+ * The ids a token hashes to are a pure function of the n-gram history at
+ * that point, and the history the next gather starts from is the session's
+ * CURRENT ple_history -- the gather advances it only inside the verify,
+ * and a rollback restores it before the chain runs.  So a clone of
+ * ple_history fed the same tokens produces the same ids the gather will
+ * compute, and WILLNEED on those rows lands the pages before the gather
+ * asks for them.  Hint only: a wrong or stale hint costs a readahead the
+ * dequant loop never touches, never a wrong value.
+ *
+ * `g_qw_ple_prefetch_count` is how many tokens of the NEXT verify have
+ * been hinted since the last verify reset it: 0 means the fed token is
+ * still owed, so the first draft_step after a verify without a draft_rows
+ * hints it before the draft it produced. */
+static ds4_ple_history g_qw_ple_prefetch_history;
+static uint32_t        g_qw_ple_prefetch_count;
+
+static void qwen4exp_seam_ple_prefetch(ds4_session *s, int token) {
+    ds4_engine *e = s->engine;
+    ds4_qwen4exp_session *qs = e->qwen4exp_session;
+    if (!qs || !qs->ple_ready) return;
+    if (g_qw_ple_prefetch_count == 0u) {
+        g_qw_ple_prefetch_history = qs->ple_history;
+    }
+    uint64_t ids[DS4_PLE_MAX_HEADS];
+    ds4_ple_row_ids(&qs->ple_constants, &g_qw_ple_prefetch_history,
+                    &tok, 1u, ids);
+    g_qw_ple_prefetch_count++;
+    qw_ple_madvise_rows(&e->qwen4exp_weights->ple, ids, DS4_N_PLE_HEAD);
+}
+
 static int qwen4exp_seam_verify_rows(void *ctx, const int *tokens, uint32_t n,
                                      uint32_t pos0, float *hc_rows,
                                      float *row_logits) {
@@ -76016,6 +76056,9 @@ static int qwen4exp_seam_verify_rows(void *ctx, const int *tokens, uint32_t n,
                 "the session is at %u\n", pos0, at);
         return -1;
     }
+    /* A verify consumes the hinted set: the next round's prefetch starts
+     * from the fed token again. */
+    g_qw_ple_prefetch_count = 0u;
     /* The widest verify is the fed token plus the whole chain; the bound is
      * stated here so a cycle deeper than the envelope fails loudly instead of
      * overrunning. */
@@ -76035,6 +76078,7 @@ static int qwen4exp_seam_verify_rows_top1(void *ctx, const int *tokens,
     ds4_engine *e = s->engine;
     const uint32_t at = ds4_qwen4exp_session_pos(e->qwen4exp_session);
     if (at != pos0 || n > (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT) return -1;
+    g_qw_ple_prefetch_count = 0u;
     int32_t buf[DS4_QWEN4EXP_MTP_MAX_COMMIT];
     for (uint32_t i = 0; i < n; i++) buf[i] = (int32_t)tokens[i];
     return ds4_qwen4exp_graph_verify_top1_rows(
@@ -76092,6 +76136,14 @@ static int qwen4exp_seam_draft_step(void *ctx, int next_token,
         }
     }
 #endif
+    /* The next verify's tokens, as they become known: the fed token when no
+     * draft_rows ran this round (count 0), then the draft just produced.
+     * After the forced-token override so the hinted token is the one the
+     * verify will actually see. */
+    if (g_qw_ple_prefetch_count == 0u) {
+        qwen4exp_seam_ple_prefetch(s, next_token);
+    }
+    qwen4exp_seam_ple_prefetch(s, *draft_out);
     return 0;
 }
 
@@ -76120,6 +76172,11 @@ static int qwen4exp_seam_draft_rows(void *ctx, const int *next_tokens,
         }
     }
 #endif
+    /* The fed token is the last row's input; the draft the head emitted is
+     * the token after it.  Both are next-verify tokens, hinted while the
+     * chain's next forward keeps the device busy. */
+    qwen4exp_seam_ple_prefetch(s, next_tokens[n - 1u]);
+    qwen4exp_seam_ple_prefetch(s, *draft_out);
     return 0;
 }
 
