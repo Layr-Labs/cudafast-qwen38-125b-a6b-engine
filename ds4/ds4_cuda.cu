@@ -1014,7 +1014,8 @@ static_assert(sizeof(ds4_decode_graph_key) == 48u,
 struct cuda_decode_graph_entry {
     ds4_decode_graph_key key;
     cudaGraphExec_t      exec;
-    int                  state;   /* 0 empty, 1 warmed, 2 ready, 3 dead */
+    int                  state;    /* 0 empty, 1 warmed, 2 ready, 3 dead */
+    int                  uploaded; /* this exec's device image is resident */
     uint64_t             hits;
 };
 
@@ -1086,11 +1087,51 @@ static inline int cuda_decode_graph_upload_on(void) {
     return on;
 }
 
+/* Whether a chunk that is ALREADY resident is uploaded again every round.
+ *
+ * MEASURED, window-4 nsys capture of the depth-1 decode leg (67 timed rounds):
+ * cudaGraphUpload ran 197 times, ~2.94 per round, median 127 us of host time,
+ * spread evenly across all ten deciles of the window -- steady state, not
+ * warm-up (cudaGraphInstantiate is 10-of-11 calls in the first decile, so
+ * capture really is warm-up only).  Splitting cudaGraphLaunch by whether an
+ * upload had just ended: 542 us median with a recent upload (n=187) against
+ * 214 us without (n=132), and the launches sit in a strict upload/launch
+ * alternation with each upload ending exactly where the next launch begins.
+ *
+ * The mechanism: ds4_gpu_decode_graph_prefetch issues cudaGraphUpload for
+ * chunk c+1 on g_decode_graph_stream -- the SAME stream chunk c is replaying
+ * on -- so it is stream-ordered BEHIND the running chunk and AHEAD of the next
+ * launch rather than overlapped with either.  It cannot hide.  And the exec it
+ * uploads was already uploaded once at instantiate time below, and a graph
+ * exec stays resident, so in steady state every one of those ~186 uploads
+ * re-uploads an image the device already holds.
+ *
+ * So the prefetch keeps its purpose -- an exec whose image is NOT yet resident
+ * is still uploaded off the launch's critical path -- and loses only the
+ * repeat.  Set DS4_CUDA_GRAPH_UPLOAD_REPEAT=1 to restore the per-round
+ * re-upload in the same binary for an A/B.
+ *
+ * Nothing about a graph's contents or its ordering depends on when, or how
+ * often, its executable is uploaded. */
+static inline int cuda_decode_graph_upload_repeat_on(void) {
+    static int init = 0;
+    static int on = 0;
+    if (!init) {
+        init = 1;
+        const char *s = getenv("DS4_CUDA_GRAPH_UPLOAD_REPEAT");
+        if (s && *s)
+            on = (s[0] != '0' && strcmp(s, "off") != 0 &&
+                  strcmp(s, "no") != 0 && strcmp(s, "false") != 0) ? 1 : 0;
+    }
+    return on;
+}
+
 static void cuda_decode_graph_entry_kill(cuda_decode_graph_entry *e) {
     if (e->exec) {
         (void)cudaGraphExecDestroy(e->exec);
         e->exec = NULL;
     }
+    e->uploaded = 0;
     e->state = 3;
 }
 
@@ -1104,6 +1145,7 @@ extern "C" void ds4_gpu_decode_graphs_invalidate(void) {
                     e->exec = NULL;
                 }
                 e->state = 0;
+                e->uploaded = 0;
                 e->hits = 0;
                 memset(&e->key, 0, sizeof(e->key));
             }
@@ -1140,6 +1182,7 @@ static cuda_decode_graph_entry *cuda_decode_graph_find(
     if (slot) {
         memcpy(&slot->key, key, sizeof(*key));
         slot->state = 0;   /* caller advances the state machine */
+        slot->uploaded = 0;
         return slot;
     }
     return NULL;           /* all variants busy with other keys: stay eager */
@@ -1161,10 +1204,14 @@ extern "C" int ds4_gpu_decode_graph_prefetch(const ds4_decode_graph_key *key) {
         cuda_decode_graph_entry *e = &g_decode_graphs[key->il][key->island][v];
         if (e->state != 2 || !e->exec) continue;
         if (memcmp(&e->key, key, sizeof(*key)) != 0) continue;
+        /* Already resident: re-uploading it would only stream-order an
+         * enqueue between this chunk's replay and the next launch. */
+        if (e->uploaded && !cuda_decode_graph_upload_repeat_on()) return 1;
         if (cudaGraphUpload(e->exec, g_decode_graph_stream) != cudaSuccess) {
             (void)cudaGetLastError();
             return 0;
         }
+        e->uploaded = 1;
         return 1;
     }
     return 0;
@@ -1264,7 +1311,7 @@ extern "C" int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) {
      * failure is not fatal: the launch does the upload itself, which is the
      * behaviour without this call. */
     if (cuda_decode_graph_upload_on()) {
-        (void)cudaGraphUpload(exec, g_decode_graph_stream);
+        e->uploaded = (cudaGraphUpload(exec, g_decode_graph_stream) == cudaSuccess);
         (void)cudaGetLastError();
     }
     if (getenv("DS4_CUDA_DECODE_GRAPH_LOG") != NULL) {
@@ -13467,10 +13514,35 @@ __global__ static void hc_split_weighted_sum_fused_kernel(
     uint32_t d = threadIdx.x;
     if (t >= n_rows || n_hc != 4) return;
     const uint32_t mix_hc = 24;
-    float *sp = split + (uint64_t)t * mix_hc;
-    if (d == 0) hc4_split_one(sp, mix + (uint64_t)t * mix_hc, scale, base, sinkhorn_iters, epsv);
+    /* COLUMN BLOCKS ON blockIdx.y.  The grid was n_rows blocks of 256 threads,
+     * so a two-row verify ran the whole 2560-column sum on TWO of this part's
+     * forty-eight SMs and the other forty-six idled -- the GRID, not registers
+     * and not shared memory, was the limit.  The columns are independent: a
+     * column writes one out[] element and reads nothing another column writes,
+     * and there is no reduction anywhere in this kernel, so they split across
+     * blocks freely.  gridDim.y == 1 walks the shipped stride exactly, which is
+     * what prefill launches, where n_rows already fills the part and the split
+     * would only replicate the serial prologue a thousand times over.
+     *
+     * Every float chain is untouched: a column still accumulates h = 0..3
+     * ascending into an acc that starts at 0.0f over the same two operands, and
+     * sp[] holds the same 24 floats hc4_split_one has always produced from the
+     * same mix row, scale and base.  It lands in shared rather than global
+     * because only one block per row may own the global buffer; hc4_split_one
+     * never READS out[] -- every reference to it is a store of an
+     * already-computed value -- so the destination address space cannot change
+     * a result. */
+    __shared__ float sp[24];
+    if (d == 0) {
+        hc4_split_one(sp, mix + (uint64_t)t * mix_hc, scale, base, sinkhorn_iters, epsv);
+        if (blockIdx.y == 0) {
+            float *gp = split + (uint64_t)t * mix_hc;
+            for (uint32_t i = 0; i < mix_hc; i++) gp[i] = sp[i];
+        }
+    }
     __syncthreads();
-    for (uint32_t col = d; col < n_embd; col += blockDim.x) {
+    for (uint32_t col = blockIdx.y * blockDim.x + d; col < n_embd;
+         col += blockDim.x * gridDim.y) {
         float acc = 0.0f;
         for (uint32_t h = 0; h < 4; h++) {
             acc += residual_hc[(uint64_t)t * 4u * n_embd + (uint64_t)h * n_embd + col] * sp[h];
@@ -13479,6 +13551,23 @@ __global__ static void hc_split_weighted_sum_fused_kernel(
     }
 }
 
+/* GRID STARVATION, AUDITED AND DELIBERATELY NOT FIXED.  This kernel is the
+ * norm-fused sibling of hc_split_weighted_sum_fused_kernel above, and it is
+ * starved harder: ds4_gpu_hc_split_weighted_sum_norm_tensor launches it only
+ * when n_rows == 1, with a grid of ONE block of 256 threads -- one SM of the
+ * part's forty-eight, running a 2560-column pass.  The column-block split that
+ * the plain kernel took does NOT transfer here, and the reason is worth
+ * recording so it is not tried: this kernel couples the columns TWICE over.
+ * It reduces `sum += acc * acc` over every column into one norm_scale, and it
+ * then READS BACK out[] to write norm_out[].  A second block holding half the
+ * columns would compute half the sum and would read a row another block is
+ * still writing, so the split needs a two-pass or atomic structure (a scratch
+ * accumulator plus a second launch) rather than a second grid dimension.
+ * This path is left as shipped rather than redesigned blind: nothing here can
+ * be compiled or run on the authoring machine, and a wrong norm_scale is a
+ * silent numeric change, not a crash.  The n_rows > 1 case does not reach this
+ * kernel at all -- that entry point falls back to the plain kernel plus
+ * ds4_gpu_rms_norm_weight_rows_tensor. */
 __global__ static void hc_split_weighted_sum_norm_fused_kernel(
         float *out,
         float *norm_out,
@@ -29860,7 +29949,20 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_tensor(
     const float *scale = (const float *)cuda_resolve_weight_ptr(model_map, scale_offset, 3ull * sizeof(float), logical_tier, "hc_scale");
     const float *base = (const float *)cuda_resolve_weight_ptr(model_map, base_offset, mix_bytes, logical_tier, "hc_base");
     if (!scale || !base) return 0;
-    hc_split_weighted_sum_fused_kernel<<<(uint32_t)n_rows, 256, 0, cuda_decode_stream()>>>(
+    /* Column blocks: enough that a two- or three-row verify puts its 2560
+     * columns on distinct SMs instead of two, and exactly ONE when n_rows
+     * already fills the part, which keeps prefill on the shipped
+     * one-block-per-row walk.  288 is 48 SMs times the six blocks the
+     * 1536-thread ceiling admits at 256 threads; the ceil(n_embd/256) clamp
+     * stops a block being launched with no column to own, and for every row
+     * count this path sees in decode (1..3) the clamp is what binds at ten, so
+     * the target itself is not a tuned constant. */
+    const uint32_t col_blocks_max = (n_embd + 255u) / 256u;
+    uint32_t col_blocks = 288u / (n_rows ? (uint32_t)n_rows : 1u);
+    if (col_blocks > col_blocks_max) col_blocks = col_blocks_max;
+    if (col_blocks == 0) col_blocks = 1;
+    hc_split_weighted_sum_fused_kernel<<<dim3((uint32_t)n_rows, col_blocks, 1u),
+                                        256, 0, cuda_decode_stream()>>>(
             (float *)out->ptr,
             (float *)split->ptr,
             (const float *)mix->ptr,
