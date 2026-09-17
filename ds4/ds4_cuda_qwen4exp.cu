@@ -5073,6 +5073,22 @@ qwen4exp_moe_gateup_split_kernel(
      * -- the fence is a no-op, exactly as it is for the kernel beside it. */
     QWEN4EXP_PDL_SYNC();
     if (active) {
+    /* The routed gate/up edge, opened on the kernel the COOP decode path runs.
+     *
+     * The dependent launch already exists in this file on
+     * qwen4exp_moe_gateup_q_kernel, and its comment states the mechanism: the
+     * blocks are already up and scheduled when the quantizer's last group
+     * retires, instead of paying a launch behind it. The coop schedule does not
+     * use that kernel -- it uses this one, and this one was launched plainly.
+     *
+     * .nc rule: no pointer in this signature carries __restrict__, so no
+     * activation load can be hoisted above the fence as ld.global.nc.
+     * Deadlock rule: it constrains the PRODUCER, and the quantizer bounds
+     * itself to one wave before it triggers, so a multi-wave dependent is safe.
+     * Launched plainly -- three rows, every prefill width -- the fence is a
+     * no-op, exactly as it is for the kernel beside it. */
+    QWEN4EXP_PDL_SYNC();
+
         if ((int32_t)blockIdx.y >= active[0]) return;
         expert = (uint32_t)active[1 + blockIdx.y];
     }
@@ -8389,7 +8405,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             (down_slab->expert_bytes % 16u) == 0u &&
             ((uintptr_t)down & 15u) == 0u &&
             dn_shared <= QW_DOWN_PANEL_MAX_BYTES &&
-            getenv("DS4_QWEN4EXP_NO_DOWN_PANEL") == NULL;
+            getenv("DS4_QWEN4EXP_DOWN_PANEL") != NULL;
         if (down_slab->type == DS4_QWEN4EXP_TY_q8_0) {
             if (dn_stage && getenv("DS4_QWEN4EXP_NO_DOWN_ASYNC") == NULL) {
                 QWEN4EXP_DOWN_ASYNC(DS4_QWEN4EXP_TY_q8_0);
