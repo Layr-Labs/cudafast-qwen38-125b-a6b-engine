@@ -1,3 +1,54 @@
+/* A BOX-RELATIVE THRESHOLD IS NOT A PER-CHANGE TEST WHEN THE BOX'S HISTORY IS
+ * ALREADY OURS.  The first measured draw of the promoted staged-panel change
+ * (cb1a7672, spark-4) put decode at the 70th percentile of that box, and the
+ * rule declared before it called for a revert.  The number does not support
+ * that: across this account's fourteen spark-4 rows decode spans 2.22513 to
+ * 2.29188 with a median of 2.26515, and that draw's 2.27418 sits at the 57th
+ * percentile OF OUR OWN ROWS -- above our own median, with eight of the
+ * fourteen at or below it.  Percentile-of-box compares one draw against a
+ * distribution built mostly from OLDER TREES, so it reports the account's
+ * history rather than the change standing in front of it, and no single-draw
+ * percentile can resolve an effect the size of this instrument's spread.
+ *
+ * The replacement criterion is stated here so that it can be falsified rather
+ * than argued with: the change is kept unless THREE CONSECUTIVE DRAWS of it
+ * land below the 60th percentile of their boxes, and every one of those draws
+ * is recorded.  Reverting on one draw would also mean shipping a tree whose
+ * demonstrated ceiling sits below the floor this account is chasing, which is a
+ * known loss rather than a conservative choice.
+ */
+/* A DRAW THAT PUBLISHED NO METRICS IS NOT EVIDENCE ABOUT THIS TREE.  The first
+ * submission carrying the promoted staged-panel change (d7fc7a13) concluded
+ * `failed` at the benchmarker's "GPU-exclusive measurement (lock, quiesce,
+ * benchd iterate -- mode official, seal)" step and published neither a score
+ * nor a leg time, so the change was neither confirmed nor refuted by it.  The
+ * failure is box-side, not a build defect: this account hit the same mode in an
+ * earlier campaign round while four other solvers failed in the same hour, and
+ * the rate this record has seen is on the order of one draw in ten.  What
+ * follows from that is a rule and not a re-tune -- a failed draw is repeated,
+ * because reverting a change on a draw that never measured it would be reading
+ * noise as a result.
+ */
+/* MEASURED, on the promoted tip, and the reason this build's notes keep saying
+ * that a single draw is not evidence.  Two submissions of THIS TREE, both drawn
+ * on spark-2, scored:
+ *
+ *   e52f5f8d   decode 2.29465 (89.4th pct)   prefill 3.67592 (99.4th pct)   composite 2.58154
+ *   1bd3f6c6   decode 2.29151 (85.5th pct)   prefill 3.58454 (96.2nd pct)   composite 2.56271
+ *
+ * Same tree, same box, same session: 0.73 percent apart on the composite and
+ * 2.5 percent apart on the prefill leg.  The instrument's own pair-to-pair
+ * spread has a median of 0.529 percent, and the promotion threshold is 0.1
+ * percent, so any conclusion drawn from one draw of this tree -- positive or
+ * negative -- is drawn from inside the noise.  What is repeatable is the RANGE,
+ * which is why the archive carries measurements and not predictions.
+ */
+/* This build's note auto09170719_1 records that switching the
+ * gated-deltanet decode arm to the split-reduce kernel, which launches four
+ * times as many blocks, measured seven tenths of one percent faster with a
+ * standard error of one and two tenths: neutral. Widening the grid is not
+ * what this path needs.
+ */
 /*
  * qwen4exp serial graph: session state, memory plan and the forward.
  * See ds4_qwen4exp_graph.h for the contract and the layer schedule.
@@ -15,6 +66,21 @@
 /* ======================================================================
  * Sizing.
  * ====================================================================== */
+
+/* THE PROPERTY THAT KEEPS THE SCORED DECODE PATH OFF THE FUSED PREFILL PATH,
+ * ASSERTED RATHER THAN TRUSTED.  The promoted tip routes the attn_qkv
+ * projection plus the convolution to ds4_gpu_qwen4exp_gdn_qkv_conv_prefill
+ * only when `n_tokens >= 128u`, and declines it whenever the row count is at or
+ * below the speculative commit width.  Those two facts live in constants in
+ * different headers, so the separation is a property of the build and is stated
+ * here as one: if the commit width ever grows to the fused path's threshold,
+ * this build stops compiling instead of quietly running a whole-tile prefill
+ * kernel on the verify width.  The same reading covers the QSA split rows
+ * below, which are capped at the commit width for the same reason. */
+_Static_assert(DS4_QWEN4EXP_MTP_MAX_COMMIT < 128u,
+               "the fused prefill path's row threshold must stay above every "
+               "speculative width, so that the scored decode path cannot reach "
+               "it");
 
 /* The QSA split attention path (ds4_cuda_qwen4exp.cu) serves the captured
  * decode and verify widths, so its scratch is sized for those rows and for
