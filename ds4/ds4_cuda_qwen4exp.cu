@@ -3826,19 +3826,40 @@ __global__ static void qwen4exp_router_select_topk_kernel(
     }
 
     if (Native) {
-        float m = -FLT_MAX;
-        if (lane == 0u) {
-            for (uint32_t i = 0; i < n_expert_used; i++) {
-                const float v = lg[(uint32_t)sel[i]];
-                if (v > m) m = v;
-            }
-        }
-        m = __shfl_sync(0xffffffffu, m, 0u);
         /* Selected ids were stored by lane zero above. Publish them before
          * other lanes read; no block-wide barrier is needed in one warp. */
         __syncwarp();
-        const float e = lane < n_expert_used
-                ? expf(lg[(uint32_t)sel[lane]] - m) : 0.0f;
+        /* One load per lane, all ten in parallel, and the max is taken over
+         * those same registers.  The serial form this replaces had lane zero
+         * walk sel[0..n_expert_used) and lg[sel[i]] one dependent load at a
+         * time purely to find `m`, then every lane reloaded the identical
+         * value a few lines later -- twenty dependent global loads with
+         * thirty-one lanes idle, on the serial critical path of all
+         * forty-eight layers (this kernel launches <<<n_tokens, 32>>>, so at
+         * decode it is one warp on one SM and nothing else is in flight).
+         *
+         * Bit-exact by construction rather than by tolerance: `m` feeds only
+         * the subtraction below, max over a fixed multiset of finite floats
+         * is order-independent, and equal floats are bit-identical, so the
+         * butterfly yields the very value the serial `if (v > m)` walk did.
+         * The -FLT_MAX padding cannot win -- every selected logit is a finite
+         * router output -- and it is what the serial walk seeded `m` with.
+         * Signed zero is not observable here either: expf(0 - (+/-0)) and
+         * expf(-0 - (+/-0)) are all exactly 1.0f.
+         *
+         * The visibility rule is unchanged, not weakened: the parallel read of
+         * sel[lane] is the one the shipped code already performed after this
+         * same __syncwarp(), only now the max reads those registers instead of
+         * re-walking memory ahead of it. */
+        const float mine = lane < n_expert_used
+                ? lg[(uint32_t)sel[lane]] : -FLT_MAX;
+        float m = mine;
+#pragma unroll
+        for (uint32_t off = 16u; off > 0u; off >>= 1u) {
+            const float other = __shfl_xor_sync(0xffffffffu, m, off);
+            if (other > m) m = other;
+        }
+        const float e = lane < n_expert_used ? expf(mine - m) : 0.0f;
         float sum = 0.0f;
         for (uint32_t i = 0; i < n_expert_used; i++) {
             const float term = __shfl_sync(0xffffffffu, e, i);
@@ -4381,19 +4402,50 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
     }
 
     if (Native) {
-        float m = -FLT_MAX;
-        if (lane == 0u) {
-            for (uint32_t i = 0; i < n_expert_used; i++) {
-                const float v = lg[(uint32_t)sel[i]];
-                if (v > m) m = v;
-            }
-        }
-        m = __shfl_sync(0xffffffffu, m, 0u);
-        /* Selected ids were stored by lane zero above. Publish them before
-         * other lanes read; no block-wide barrier is needed in one warp. */
+        /* The max over the selected logits, one load per lane instead of a
+         * serial walk by lane zero.
+         *
+         * The form this replaces had lane zero read sel[i] and then the
+         * dependent lg[sel[i]] for each of n_expert_used ranks -- twenty
+         * dependent global loads with thirty-one lanes idle -- to produce a
+         * value it then broadcast.  Five lines below, every lane loads
+         * lg[sel[lane]] anyway for its own expf.  So the serial walk bought
+         * nothing the parallel load does not already have, and it cost the
+         * whole block: this is the fused kernel, so every one of its 512
+         * threads waits at the __syncthreads below for warp zero to finish
+         * that chain before the grouping half may read `selected`.
+         *
+         * Bit-exact by construction, not by tolerance.  `m` feeds only the
+         * subtraction below; the max over a fixed multiset of finite floats
+         * does not depend on the order it is taken in, and equal floats here
+         * are bit-identical.  Lanes at or above n_expert_used carry -FLT_MAX,
+         * which cannot win and is exactly what the serial walk seeded `m`
+         * with.  Every lane of a participating warp reaches the butterfly:
+         * warps at or above n_tokens skip this half by branching, never by
+         * returning, so a warp that is here is here in full and the
+         * full-mask intrinsic is valid -- the same invariant the surrounding
+         * top-k already depends on.
+         *
+         * One subtlety the host parity gate surfaced rather than assumed: the
+         * butterfly is uniform in VALUE but need not be uniform in BIT
+         * PATTERN, because max(+0,-0) keeps whichever operand the `>` test
+         * left.  That is unobservable here -- expf(±0 - ±0) is exactly 1.0f
+         * for all four sign combinations -- and the gate exercised the case
+         * rather than arguing it.
+         *
+         * The __syncwarp is kept where it was and means what it did: lane
+         * zero stored the selected ids above and every lane reads them here.
+         * The visibility rule is unchanged, not weakened. */
         __syncwarp();
-        const float e = lane < n_expert_used
-                ? expf(lg[(uint32_t)sel[lane]] - m) : 0.0f;
+        const float mine = lane < n_expert_used
+                ? lg[(uint32_t)sel[lane]] : -FLT_MAX;
+        float m = mine;
+#pragma unroll
+        for (uint32_t off = 16u; off > 0u; off >>= 1u) {
+            const float other = __shfl_xor_sync(0xffffffffu, m, off);
+            if (other > m) m = other;
+        }
+        const float e = lane < n_expert_used ? expf(mine - m) : 0.0f;
         float sum = 0.0f;
         for (uint32_t i = 0; i < n_expert_used; i++) {
             const float term = __shfl_sync(0xffffffffu, e, i);
@@ -4991,8 +5043,12 @@ template <int GateType = -1, int UpType = -1, bool PairTasks = false,
  *
  * MEASURED, and the __launch_bounds__ below does not do that job.  The probe
  * (ds4_gpu_qwen4exp_kernel_limits) read this kernel for the first time in
- * submission `20812211` and reported, for the shipped arm
- * QW_GATEUP_DMA_ARM = 5, `mm[reg=167 smem=24288 lmem=0 occ=3]`.  The register
+ * submission `20812211` and reported, for the arm shipped at the time,
+ * QW_GATEUP_DMA_ARM = 5, `mm[reg=167 smem=24288 lmem=0 occ=3]`.  (The arm is 6
+ * now.  That reading still applies: 6 and 5 differ only in QW_DMA_SWZ, a
+ * relabelling of shared slots, which changes no register or shared-memory
+ * figure.  See the QW_DMA_SWZ comment for why the predicate is `>= 5`.)
+ * The register
  * figure is exactly the 167 above, so the comment was right about that -- but
  * Dma >= 2 resolves the bound to (128, 3), whose implied ceiling is
  * 65,536 / (128 * 3) = 170, and 167 <= 170.  THE BOUND IS A NO-OP HERE: ptxas
@@ -5104,8 +5160,33 @@ qwen4exp_moe_gateup_mma_kernel(
             * needs stride == 2 mod 4) but 2-way conflicting for the staging
             * STORE (which needs an odd stride) -- no linear map serves both.
             * XOR-ing the unit index with bit 2 of the piece index fixes the
-            * store and provably leaves the read conflict-free. */
-           QW_DMA_SWZ = (Dma == 5) ? 1 : 0,
+            * store and provably leaves the read conflict-free.
+            *
+            * THE PREDICATE IS `>= 5`, NOT `== 5`, AND THAT IS THE FIX.  It
+            * used to read `Dma == 5` while QW_GATEUP_DMA_ARM was 5, so the
+            * swizzle was live.  The arm was then bumped to 6 with no `Dma == 6`
+            * case added anywhere, and 6 falls through every test in this enum
+            * exactly as 3 does: J = 8, PER = 2, ASYNC = 1, HDR = 0 -- and
+            * SWZ = 0.  So the bump silently reinstated the 2-way staging-store
+            * conflict this line exists to remove, which is the one and only
+            * behavioural difference between arm 5 and arm 6.  An equality test
+            * on a number that is incremented when a new arm is added is a trap:
+            * it turns "add an arm" into "drop every feature keyed to the old
+            * number".  Every rung at or above 5 carries the swizzle now, so the
+            * next bump cannot drop it again.
+            *
+            * Bit-exact by construction: the slot map is the SINGLE source of
+            * truth for this buffer.  All five sRaw accesses go through
+            * qw_dma_slot -- the cp.async destination and the synchronous store
+            * take their slot from qw_dma_src, which calls it, and the three
+            * tile reads call it directly -- so relabelling slots moves bytes
+            * to different shared addresses and hands the same bytes back.  The
+            * relabelling is injective: the XOR flips only bit 0, so
+            * (u ^ b) stays inside [0, 64), and j * 66 + [0, 64) are disjoint
+            * intervals because 66 >= 64.  Max slot 7 * 66 + 63 = 525, inside
+            * QW_DMA_SLOTS = 526.  Nothing about the dequant, the tile stores,
+            * the MMA sequence, the epilogue or the accumulation order moves. */
+           QW_DMA_SWZ = (Dma >= 5) ? 1 : 0,
            QW_DMA_HDR = (Dma == 4) ? 1 : 0,
            QW_DMA_NF = 64 * QW_DMA_J / (int)QW_MMA_THREADS,
            QW_DMA_SLOTS = Dma ? ((QW_DMA_J - 1) * (int)QW_DMA_US + 64) : 1 };
@@ -15943,8 +16024,9 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
      * The specific question.  The gate/up tile carries, in its own words, "the
      * DMA arms need the occupancy pinned: without a minimum ptxas takes 167
      * registers (3 CTAs/SM) and throws away the whole point of the 64 B arm,
-     * which is that its staging buffer still fits four."  The shipped arm is
-     * QW_GATEUP_DMA_ARM = 5, which resolves that kernel's
+     * which is that its staging buffer still fits four."  The shipped arm was
+     * QW_GATEUP_DMA_ARM = 5 when this was written and is 6 now; both resolve
+     * that kernel's
      * __launch_bounds__(QW_MMA_THREADS, Dma >= 2 ? 3 : ...) to (128, 3) -- an
      * implied register ceiling of 65,536 / (128 * 3) = 170.  167 <= 170, so THE
      * BOUND IS A NO-OP on the shipped arm: ptxas would take 167 either way, and
