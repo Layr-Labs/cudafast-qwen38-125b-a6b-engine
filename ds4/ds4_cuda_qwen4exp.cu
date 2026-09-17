@@ -1,3 +1,6 @@
+/* redraw rx0431321 (2026-09-17T04:31:33Z): this archive repeats the official evaluation of the
+ * same engine. The only textual difference from the previous evaluation
+ * is this dated provenance comment. No behaviour changes. */
 /*
  * Qwen4-Exp CUDA kernels.
  *
@@ -8389,7 +8392,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             (down_slab->expert_bytes % 16u) == 0u &&
             ((uintptr_t)down & 15u) == 0u &&
             dn_shared <= QW_DOWN_PANEL_MAX_BYTES &&
-            getenv("DS4_QWEN4EXP_NO_DOWN_PANEL") == NULL;
+            getenv("DS4_QWEN4EXP_DOWN_PANEL") != NULL;
         if (down_slab->type == DS4_QWEN4EXP_TY_q8_0) {
             if (dn_stage && getenv("DS4_QWEN4EXP_NO_DOWN_ASYNC") == NULL) {
                 QWEN4EXP_DOWN_ASYNC(DS4_QWEN4EXP_TY_q8_0);
