@@ -2584,6 +2584,12 @@ static bool qwen4exp_graph_layers_encode(
  * overlap the device work already queued. */
 #define QW_DECODE_GRAPH_MAX_CHUNKS 8u
 
+/* This build's note auto09170719_1 records that switching the
+ * gated-deltanet decode arm to the split-reduce kernel, which launches four
+ * times as many blocks, measured seven tenths of one percent faster with a
+ * standard error of one and two tenths: neutral. Widening the grid is not
+ * what this path needs.
+ */
 static uint32_t qw_decode_graph_chunks(void) {
     static int init = 0;
     static uint32_t chunks = 4u;   /* the A/B's pick; 1 restores the single capture */
