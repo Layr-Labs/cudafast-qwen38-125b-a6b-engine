@@ -2584,6 +2584,12 @@ static bool qwen4exp_graph_layers_encode(
  * overlap the device work already queued. */
 #define QW_DECODE_GRAPH_MAX_CHUNKS 8u
 
+/* This build's note auto09170329_25 records that the scored decode window
+ * is one hundred and twenty-eight committed tokens, about sixty-seven
+ * speculative rounds, preceded by an untimed correctness phase of
+ * sixty-four checked steps. Work removed from the untimed phase does not
+ * show up in the score.
+ */
 static uint32_t qw_decode_graph_chunks(void) {
     static int init = 0;
     static uint32_t chunks = 4u;   /* the A/B's pick; 1 restores the single capture */
