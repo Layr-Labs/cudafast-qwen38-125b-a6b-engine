@@ -8,6 +8,26 @@
 
 /* Host transition policy, independent of CUDA. A replay verify leaves a
  * virtual row-zero snapshot: checkpoint + its bounded transition log. */
+
+/* The four fields above are a contract, not just a record, and two shipped
+ * decisions rest on it:
+ *
+ *   - The boot warm-up in the resident shim carries a static assertion that
+ *     its round count can reach both recurrent-buffer parities. That argument
+ *     needs `swap` to be exactly "the replay is active and the previous round
+ *     was not reusable" -- a parity can only be captured on a round that
+ *     settles and swaps -- and it needs `active` to mean one specific shape
+ *     (a two-row verify with a single snapshot).
+ *   - The decode-graph variant table's slot count was raised 4 -> 8 -> 16
+ *     across three promoted submissions on the reasoning that the key grew.
+ *     That reasoning needs ds4_qwen4exp_gdn_graph_variant() to be injective in
+ *     every one of its four fields, or slots would alias rather than run out.
+ *
+ * Both functions are `static inline` here and this header includes only
+ * <stdbool.h> and <stdint.h>, so the contract is drivable with no GPU, no
+ * engine and no checkpoint: ds4/tests/test_qwen4exp_gdn_variant.c drives both
+ * over their reachable domains and recomputes each predicate rather than
+ * trusting it. Change a clause here and that test is expected to fail. */
 typedef struct {
     bool active;
     bool settle;
@@ -33,6 +53,11 @@ static inline ds4_qwen4exp_gdn_replay_step ds4_qwen4exp_gdn_replay_plan(
 /* Physical recurrent-buffer addresses alternate even on an ordinary forward
  * after replay. Both parity and kernel choice must identify a graph. The log
  * length is device data, so it deliberately does not multiply graph entries. */
+/* The decode-graph identity: width, snapshots, phase and replay-active are
+ * packed into disjoint bit fields (see above -- injectivity across all four is
+ * tested, and the slot table's size depends on it). "Phase" is the recurrent
+ * buffer parity, so a round that never swaps can never reveal the other
+ * identity; that is why the warm-up must be long enough to settle and swap. */
 static inline uint32_t ds4_qwen4exp_gdn_graph_variant(
         uint32_t width, uint32_t snapshots, uint32_t phase, bool active) {
     return width | (snapshots << 8u) | (phase << 16u) |
