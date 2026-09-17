@@ -1,3 +1,4 @@
+/* ROUND 93 PROMOTION DRAW — stamp 20260917T212233Z. Tip 0c7e91d. Qual R88=2.62452 s2; R90=2.61316 s8. R91 s7 nq; R92=2.61066 s4 nq-handicap. */
 /*
  * qwen4exp serial graph: session state, memory plan and the forward.
  * See ds4_qwen4exp_graph.h for the contract and the layer schedule.
