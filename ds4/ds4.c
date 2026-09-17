@@ -40676,12 +40676,116 @@ int ds4_token_assistant(ds4_engine *e) {
     return e->vocab.assistant_id;
 }
 
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#elif defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
+/* Vector argmax over one range.  The scalar unrolled8 loop below retires one
+ * compare-and-maybe-update per element; the vector forms run the same
+ * strict-greater comparison eight lanes at a time and keep each lane's own
+ * best index, so the merge order -- and therefore the tie-break, lowest
+ * index wins -- is the same one the scalar merge performs.  NaNs behave the
+ * same way too: a NaN compares false against the running best in both
+ * forms, so it can never win a lane. */
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+static inline void argmax_f32_simd_range(
+        const float *logits,
+        uint32_t     begin,
+        uint32_t     end,
+        int         *best,
+        float       *best_v) {
+    uint32_t i = begin;
+    float32x4_t bv0 = vdupq_n_f32(*best_v), bv1 = bv0;
+    uint32x4_t bi0 = vdupq_n_u32((uint32_t)*best),
+               bi1 = bi0;
+    const uint32x4_t lane = {0u, 1u, 2u, 3u};
+    uint32x4_t cur = vdupq_n_u32(begin);
+    while (end - i >= 8u) {
+        const float32x4_t x0 = vld1q_f32(logits + i);
+        const float32x4_t x1 = vld1q_f32(logits + i + 4u);
+        const uint32x4_t m0 = vcgtq_f32(x0, bv0);
+        const uint32x4_t m1 = vcgtq_f32(x1, bv1);
+        bv0 = vbslq_f32(m0, x0, bv0);
+        bv1 = vbslq_f32(m1, x1, bv1);
+        bi0 = vbslq_u32(m0, vaddq_u32(cur, lane), bi0);
+        bi1 = vbslq_u32(m1, vaddq_u32(cur, vaddq_u32(lane, vdupq_n_u32(4u))), bi1);
+        cur = vaddq_u32(cur, vdupq_n_u32(8u));
+        i += 8u;
+    }
+    float v[8];
+    uint32_t b[8];
+    vst1q_f32(v, bv0);
+    vst1q_f32(v + 4, bv1);
+    vst1q_u32(b, bi0);
+    vst1q_u32(b + 4, bi1);
+    for (uint32_t k = 0; k < 8u; k++) {
+        if (v[k] > *best_v || (v[k] == *best_v && (int)b[k] < *best)) {
+            *best_v = v[k];
+            *best = (int)b[k];
+        }
+    }
+    for (; i < end; i++) {
+        const float x = logits[i];
+        if (x > *best_v) {
+            *best_v = x;
+            *best = (int)i;
+        }
+    }
+}
+#elif defined(__AVX2__)
+static inline void argmax_f32_simd_range(
+        const float *logits,
+        uint32_t     begin,
+        uint32_t     end,
+        int         *best,
+        float       *best_v) {
+    uint32_t i = begin;
+    __m256 bv = _mm256_set1_ps(*best_v);
+    __m256i bi = _mm256_set1_epi32(*best);
+    const __m256i lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    __m256i cur = _mm256_set1_epi32((int)begin);
+    const __m256i step = _mm256_set1_epi32(8);
+    while (end - i >= 8u) {
+        const __m256 x = _mm256_loadu_ps(logits + i);
+        const __m256 m = _mm256_cmp_ps(x, bv, _CMP_GT_OQ);
+        bv = _mm256_blendv_ps(bv, x, m);
+        bi = _mm256_blendv_epi8(bi, _mm256_add_epi32(cur, lane),
+                                _mm256_castps_si256(m));
+        cur = _mm256_add_epi32(cur, step);
+        i += 8u;
+    }
+    float v[8];
+    int32_t b[8];
+    _mm256_storeu_ps(v, bv);
+    _mm256_storeu_si256((__m256i *)b, bi);
+    for (uint32_t k = 0; k < 8u; k++) {
+        if (v[k] > *best_v || (v[k] == *best_v && (int)b[k] < *best)) {
+            *best_v = v[k];
+            *best = (int)b[k];
+        }
+    }
+    for (; i < end; i++) {
+        const float x = logits[i];
+        if (x > *best_v) {
+            *best_v = x;
+            *best = (int)i;
+        }
+    }
+}
+#endif
+
 static inline void argmax_f32_unrolled8_range(
         const float *logits,
         uint32_t     begin,
         uint32_t     end,
         int         *best,
         float       *best_v) {
+#if defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(__AVX2__)
+    argmax_f32_simd_range(logits, begin, end, best, best_v);
+    return;
+#endif
     uint32_t i = begin;
     int b0 = *best, b1 = *best, b2 = *best, b3 = *best;
     int b4 = *best, b5 = *best, b6 = *best, b7 = *best;
