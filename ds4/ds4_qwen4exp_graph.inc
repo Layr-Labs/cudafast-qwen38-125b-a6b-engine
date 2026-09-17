@@ -328,6 +328,7 @@ struct ds4_qwen4exp_session {
     bool              ple_ready;      /* the hash constants were readable */
     uint64_t         *ple_ids;        /* host [n_batch][head_count]       */
     float            *ple_rows_host;  /* host [n_batch][ple_embd]         */
+    uint8_t          *verify_stage;   /* host [n_batch*hc*4 + commit*4]     */
     ds4_gpu_tensor   *ple_conv_state; /* [state_rows][n_hc * n_embd]      */
     ds4_gpu_tensor   *ple_rows;       /* [n_batch][ple_embd]              */
     ds4_gpu_tensor   *ple_key;        /* key projection, then the gate    */
@@ -766,6 +767,10 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
             s->ple_ids = calloc((size_t)B * DS4_N_PLE_HEAD, sizeof(uint64_t));
             s->ple_rows_host = calloc((size_t)B * DS4_N_PLE_EMBD, sizeof(float));
             ok = s->ple_ids != NULL && s->ple_rows_host != NULL;
+            s->verify_stage = malloc(
+                (size_t)B * DS4_N_HC * DS4_N_EMBD * sizeof(float) +
+                (size_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * sizeof(int32_t));
+            ok = ok && s->verify_stage != NULL;
         }
         if (ok) {
             s->ple_ready = qwen4exp_ple_read_constants(m, w, &s->ple_constants);
@@ -792,7 +797,12 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
     }
 
     s->tokens      = qwen4exp_alloc_zeroed(B * sizeof(int32_t), &ok);
-    s->hyper       = qwen4exp_alloc_zeroed(B * H * E * f, &ok);
+    /* One row of slack past the batch: the compact verify's top-1 lands in
+     * the tail so the hyper rows and the token ids come back in ONE device
+     * read instead of two blocking copies. */
+    s->hyper       = qwen4exp_alloc_zeroed(
+            B * H * E * f +
+            (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * sizeof(int32_t), &ok);
     s->normed      = qwen4exp_alloc_zeroed(B * H * E * f, &ok);
     s->wide        = qwen4exp_alloc_zeroed(B * H * E * f, &ok);
     s->lowrank     = qwen4exp_alloc_zeroed(B * DS4_N_HC_LOWRANK * f, &ok);
@@ -847,8 +857,8 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
     s->shexp_gate   = qwen4exp_alloc_zeroed(B * f, &ok);
     s->logits       = qwen4exp_alloc_zeroed(
             (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * cfg->n_vocab * f, &ok);
-    s->spec_top1     = qwen4exp_alloc_zeroed(
-            (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * sizeof(int32_t), &ok);
+    /* The compact verify's top-1 lands in hyper's tail slack instead of a
+     * tensor of its own, so the two readbacks fuse into one copy. */
 #ifdef DS4_TEST_HOOKS
     s->final_mixer_snapshot = qwen4exp_alloc_zeroed(B * H * E * f, &ok);
 #endif
@@ -887,6 +897,7 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->ple_key);
     ds4_gpu_tensor_free(s->ple_aux);
     ds4_gpu_tensor_free(s->ple_value);
+    free(s->verify_stage);
     free(s->ple_ids);
     free(s->ple_rows_host);
     ds4_gpu_tensor_free(s->d_pos);
@@ -931,7 +942,6 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->shexp_mid);
     ds4_gpu_tensor_free(s->shexp_gate);
     ds4_gpu_tensor_free(s->logits);
-    ds4_gpu_tensor_free(s->spec_top1);
 #ifdef DS4_TEST_HOOKS
     ds4_gpu_tensor_free(s->final_mixer_snapshot);
 #endif
@@ -3066,17 +3076,28 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         fprintf(stderr, "ds4: qwen4exp LM head failed\n");
         return qwen4exp_forward_fail();
     }
-    if (s->spec_top1_rows != 0u &&
-        (s->spec_top1_rows != logit_rows ||
-         !ds4_gpu_indexer_topk_tensor(s->spec_top1, s->logits,
-                                      cfg->n_vocab, logit_rows, 1u))) {
-        fprintf(stderr, "ds4: qwen4exp compact verify top-1 failed\n");
-        return qwen4exp_forward_fail();
+    if (s->spec_top1_rows != 0u) {
+        /* The top-1 ids land in hyper's tail slack, right after the rows the
+         * verify reads back, so the caller's hyper read and this read fuse
+         * into one device copy.  The view borrows hyper's storage; it owns
+         * nothing and is never freed. */
+        ds4_gpu_tensor top1_tail = {
+            (char *)s->hyper->ptr +
+                (uint64_t)n_tokens * DS4_N_HC * DS4_N_EMBD * sizeof(float),
+            (uint64_t)s->spec_top1_rows * sizeof(int32_t),
+            0, s->hyper->device_id
+        };
+        if (s->spec_top1_rows != logit_rows ||
+            !ds4_gpu_indexer_topk_tensor(&top1_tail, s->logits,
+                                         cfg->n_vocab, logit_rows, 1u)) {
+            fprintf(stderr, "ds4: qwen4exp compact verify top-1 failed\n");
+            return qwen4exp_forward_fail();
+        }
     }
     QW_TRACE(QW_SLICE_HEAD);
     QW_TRACE_REPORT(n_tokens);
     /* Commit and wait: the logits are read on the host from here on. */
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
+    if (!ds4_gpu_end_commands_sync()) {
         fprintf(stderr, "ds4: qwen4exp command batch did not complete\n");
         return false;
     }
@@ -3129,7 +3150,7 @@ static bool qwen4exp_session_copy_layers(ds4_qwen4exp_session *s,
                                      (uint64_t)row * bytes, bytes) != 0;
         }
     }
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) return false;
+    if (!ds4_gpu_end_commands_sync()) return false;
     if (ok && recurrent) s->gdn_replay_previous = false;
     return ok;
 }
@@ -3636,12 +3657,20 @@ bool ds4_qwen4exp_graph_verify_top1_rows(ds4_qwen4exp_session       *s,
     s->spec_logit_rows = 0u;
     s->spec_top1_rows = 0u;
     if (!forward_ok) return false;
-    if (hc_rows && !ds4_qwen4exp_session_read_hyper(s, 0, n_tokens, hc_rows)) {
-        fprintf(stderr, "ds4: qwen4exp compact verify hyper read failed\n");
+    /* One device read for both halves: the forward left the top-1 ids in
+     * hyper's tail slack, right after the rows, so a single copy covers the
+     * stream rows and the ids.  Two blocking reads become one. */
+    const uint64_t hc_bytes =
+        (uint64_t)n_tokens * DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    const uint64_t fused = hc_bytes + (uint64_t)n_tokens * sizeof(int32_t);
+    if (!ds4_gpu_tensor_read(s->hyper, 0, s->verify_stage, fused)) {
+        fprintf(stderr, "ds4: qwen4exp compact verify read failed\n");
         return false;
     }
-    return ds4_gpu_tensor_read(s->spec_top1, 0, row_top1,
-                               (uint64_t)n_tokens * sizeof(int32_t)) != 0;
+    if (hc_rows) memcpy(hc_rows, s->verify_stage, (size_t)hc_bytes);
+    memcpy(row_top1, s->verify_stage + hc_bytes,
+           (size_t)n_tokens * sizeof(int32_t));
+    return true;
 }
 
 bool ds4_qwen4exp_graph_read_logit_row(ds4_qwen4exp_session *s,
@@ -3704,7 +3733,7 @@ bool ds4_qwen4exp_graph_head_logits(ds4_qwen4exp_session       *s,
         fprintf(stderr, "ds4: qwen4exp LM head failed on the head row\n");
         return qwen4exp_forward_fail();
     }
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
+    if (!ds4_gpu_end_commands_sync()) {
         fprintf(stderr, "ds4: qwen4exp command batch did not complete\n");
         return false;
     }
@@ -3902,7 +3931,7 @@ static int qwen4exp_rb_ple_conv_select(void *ctx, uint32_t row) {
     const bool ok = ds4_gpu_tensor_copy(s->ple_conv_state, 0,
                                         s->ple_conv_snapshot,
                                         (uint64_t)row * bytes, bytes) != 0;
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) return -1;
+    if (!ds4_gpu_end_commands_sync()) return -1;
     return ok ? 0 : -1;
 }
 static int qwen4exp_rb_qsa_kv_truncate(void *ctx, uint32_t pos) {
@@ -4048,7 +4077,7 @@ int ds4_qwen4exp_test_head_block_run(const char *target_path,
             ds4_gpu_begin_commands()) {
             ok1 = ds4_qwen4exp_graph_head_block(&ctx, s, hyper,
                                                 head_w.block_index, 0u, n_tokens);
-            if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) ok1 = 0;
+            if (!ds4_gpu_end_commands_sync()) ok1 = 0;
         }
         if (ok1) (void)ds4_gpu_tensor_read(hyper, 0, a, bytes);
 
@@ -4056,7 +4085,7 @@ int ds4_qwen4exp_test_head_block_run(const char *target_path,
             ds4_gpu_begin_commands()) {
             ok2 = ds4_qwen4exp_graph_head_block(&ctx, s, hyper,
                                                 head_w.block_index, 0u, n_tokens);
-            if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) ok2 = 0;
+            if (!ds4_gpu_end_commands_sync()) ok2 = 0;
         }
         if (ok2) (void)ds4_gpu_tensor_read(hyper, 0, b, bytes);
 
