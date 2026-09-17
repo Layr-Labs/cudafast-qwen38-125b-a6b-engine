@@ -3159,6 +3159,20 @@ extern "C" void ds4_gpu_cleanup(void) {
             (void)cudaStreamDestroy((cudaStream_t)c->stream);
             c->stream = NULL;
         }
+        for (uint32_t s = 0; s < DS4_H2D_STAGE_SLOTS; s++) {
+            if (g_h2d_stage_event[i][s]) {
+                /* An armed event may still cover an in-flight copy out of
+                 * the slot; drain it before the pinned bytes go away. */
+                (void)cudaEventSynchronize(g_h2d_stage_event[i][s]);
+                (void)cudaEventDestroy(g_h2d_stage_event[i][s]);
+                g_h2d_stage_event[i][s] = NULL;
+            }
+            if (g_h2d_stage[i][s]) {
+                (void)cudaFreeHost(g_h2d_stage[i][s]);
+                g_h2d_stage[i][s] = NULL;
+            }
+        }
+        g_h2d_stage_next[i] = 0;
         if (c->cublas) {
             (void)cublasDestroy((cublasHandle_t)c->cublas);
             c->cublas = NULL;
@@ -3490,14 +3504,92 @@ extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint
     return ok;
 }
 
+/* ------------------------------------------------------------------------
+ * Pinned staging ring for small host-to-device writes.
+ *
+ * ds4_gpu_tensor_write() is the path every per-step upload takes -- the
+ * token row, the n-gram embedding rows, the speculative head row -- and it
+ * used a synchronous cudaMemcpy.  A synchronous copy out of pageable memory
+ * is staged through a driver bounce buffer and the call does not return
+ * until the copy completes on the device, so the host stalls twice per
+ * write: once in the bounce memcpy and once on the transfer itself.  The
+ * staged path below copies the payload into a pinned slot and issues the
+ * device copy with cudaMemcpyAsync on the legacy stream, which returns as
+ * soon as the copy is queued.  Ordering is unchanged: the legacy stream is
+ * implicitly ordered against every blocking stream, and every consumer of
+ * these tensors launches on cuda_decode_stream() -- the legacy stream in
+ * eager mode, a blocking stream while a decode graph captures.  A slot is
+ * not reused until the event recorded after its copy has fired, so the
+ * pinned bytes are never overwritten under an in-flight transfer.  Writes
+ * larger than a slot, or any failure to stage, fall back to the original
+ * synchronous copy. */
+#define DS4_H2D_STAGE_BYTES (256u * 1024u)
+#define DS4_H2D_STAGE_SLOTS 4u
+
+static void       *g_h2d_stage[DS4_MAX_GPUS][DS4_H2D_STAGE_SLOTS];
+static cudaEvent_t g_h2d_stage_event[DS4_MAX_GPUS][DS4_H2D_STAGE_SLOTS];
+static uint32_t    g_h2d_stage_next[DS4_MAX_GPUS];
+
+/* Returns 1 when the write was queued through the pinned ring, 0 when the
+ * caller should take the synchronous path, -1 on a hard failure. */
+static int cuda_h2d_staged_write(int d, void *dst, const void *src, size_t bytes) {
+    if (d < 0 || d >= DS4_MAX_GPUS || bytes > DS4_H2D_STAGE_BYTES) return 0;
+
+    const uint32_t slot = g_h2d_stage_next[d];
+    g_h2d_stage_next[d] = (slot + 1u) % DS4_H2D_STAGE_SLOTS;
+
+    if (!g_h2d_stage[d][slot]) {
+        if (cudaMallocHost(&g_h2d_stage[d][slot], DS4_H2D_STAGE_BYTES) != cudaSuccess) {
+            (void)cudaGetLastError();
+            g_h2d_stage[d][slot] = NULL;
+            return 0;
+        }
+        if (cudaEventCreateWithFlags(&g_h2d_stage_event[d][slot],
+                                     cudaEventDisableTiming) != cudaSuccess) {
+            (void)cudaGetLastError();
+            (void)cudaFreeHost(g_h2d_stage[d][slot]);
+            g_h2d_stage[d][slot] = NULL;
+            g_h2d_stage_event[d][slot] = NULL;
+            return 0;
+        }
+    } else if (g_h2d_stage_event[d][slot]) {
+        /* The slot's last copy must be done before its bytes are replaced. */
+        if (cudaEventSynchronize(g_h2d_stage_event[d][slot]) != cudaSuccess) {
+            return -1;
+        }
+    }
+
+    memcpy(g_h2d_stage[d][slot], src, bytes);
+    if (!cuda_ok(cudaMemcpyAsync(dst, g_h2d_stage[d][slot], bytes,
+                                 cudaMemcpyHostToDevice, 0),
+                 "tensor write staged copy")) {
+        return -1;
+    }
+    if (cudaEventRecord(g_h2d_stage_event[d][slot], 0) != cudaSuccess) {
+        /* The copy is queued but the slot can no longer prove completion;
+         * drain the stream once so the next reuse is safe, then disarm. */
+        (void)cudaGetLastError();
+        (void)cudaStreamSynchronize(0);
+        (void)cudaEventDestroy(g_h2d_stage_event[d][slot]);
+        g_h2d_stage_event[d][slot] = NULL;
+    }
+    return 1;
+}
+
 extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     int d = ds4_tensor_device_idx(tensor);
     int ok = 0;
     WITH_DEVICE(g_gpu[d].device_id) {
-        ok = cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, data, (size_t)bytes,
-                                cudaMemcpyHostToDevice),
-                     "tensor write");
+        const int staged = cuda_h2d_staged_write(
+            d, (char *)tensor->ptr + offset, data, (size_t)bytes);
+        if (staged > 0) {
+            ok = 1;
+        } else {
+            ok = cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, data, (size_t)bytes,
+                                    cudaMemcpyHostToDevice),
+                         "tensor write");
+        }
     }
     return ok;
 }

@@ -1559,26 +1559,6 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
         return false;
     }
 
-    /* PREFILL (CUDA): the attn_qkv projection with the convolution in its
-     * epilogue, into the block's convolution scratch, on the widths and the
-     * tier the entry serves (whole 128-token tiles, no snapshot rows, no
-     * adoption flag, no replay).  A decline launches nothing and the plain
-     * projection below runs; the block then takes the matching prefill
-     * entry, which finishes each tile's first three rows instead of
-     * running the convolution.  The slab is the convolution's own,
-     * resolved once here for both. */
-    const ds4_gpu_qwen4exp_slab conv_slab = QW_SLAB(m, l->ssm_conv1d);
-    int gdn_conv_fused = 0;
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    if (n_tokens >= 128u && !s->gdn_replay_active && s->spec_snapshot_rows == 0u &&
-        !(s->d_adopt != NULL && n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT)) {
-        gdn_conv_fused = ds4_gpu_qwen4exp_gdn_qkv_conv_prefill(
-            QW_MAP(m, l->attn_qkv), QW_MAPSZ(m, l->attn_qkv), QW_OFF(l->attn_qkv),
-            DS4_N_EMBD, cfg->gdn_qkv_dim, s->mixed_q8, 0, q8_soff, n_tokens,
-            &conv_slab, DS4_N_GDN_KEY_HEAD, DS4_N_GDN_VALUE_HEAD, DS4_RMS_EPS);
-    }
-#endif
-
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (n_tokens<=2u && getenv("DS4_QWEN4EXP_NO_GDN_PROJECTION_FUSION")==NULL) {
         ds4_gpu_tensor *outs[4]={s->gdn_qkv,s->gdn_gate,s->gdn_alpha,s->gdn_beta};
@@ -1597,11 +1577,10 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
     } else
 #endif
     {
-        if ((!gdn_conv_fused &&
-             !ds4_qwen4exp_matmul_q8_0_preq(s->gdn_qkv, QW_MAP(m, l->attn_qkv),
+        if (!ds4_qwen4exp_matmul_q8_0_preq(s->gdn_qkv, QW_MAP(m, l->attn_qkv),
                                         QW_MAPSZ(m, l->attn_qkv), QW_OFF(l->attn_qkv),
                                         DS4_N_EMBD, cfg->gdn_qkv_dim,
-                                        s->mixed_q8, 0, q8_soff, n_tokens)) ||
+                                        s->mixed_q8, 0, q8_soff, n_tokens) ||
             !ds4_qwen4exp_matmul_q8_0_preq(s->gdn_gate, QW_MAP(m, l->attn_gate),
                                         QW_MAPSZ(m, l->attn_gate), QW_OFF(l->attn_gate),
                                         DS4_N_EMBD, cfg->gdn_inner,
@@ -1622,8 +1601,8 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
 
     /* One slab per tensor.  These four are four GGUF tensors; resolving
      * ssm_a, ssm_dt.bias and ssm_norm through the convolution's mapping would
-     * read the right offsets out of the wrong shard on a split set.  The
-     * convolution's slab was resolved above the projections. */
+     * read the right offsets out of the wrong shard on a split set. */
+    const ds4_gpu_qwen4exp_slab conv_slab = QW_SLAB(m, l->ssm_conv1d);
     const ds4_gpu_qwen4exp_slab a_log_slab = QW_SLAB(m, l->ssm_a);
     const ds4_gpu_qwen4exp_slab dt_bias_slab = QW_SLAB(m, l->ssm_dt_bias);
     const ds4_gpu_qwen4exp_slab ssm_norm_slab = QW_SLAB(m, l->ssm_norm);
@@ -1655,19 +1634,6 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
             DS4_N_GDN_KEY_HEAD, DS4_N_GDN_VALUE_HEAD, n_tokens,
             DS4_QWEN4EXP_GDN_HEADS_TILED, DS4_RMS_EPS, DS4_RMS_EPS,
             out_q8 ? s->gdn_out_q8 : NULL, 0u, out_q8_soff, &replay);
-    } else if (gdn_conv_fused) {
-        /* The projection above ran fused with the convolution (CUDA only,
-         * whole 128-token tiles): the same block through the entry that
-         * finishes each tile's first three rows instead of convolving. */
-        rc = ds4_gpu_qwen4exp_gdn_prefill_fused_q8(
-              s->gdn_out, s->gdn_conv[il], s->gdn_state[il],
-              s->gdn_conv_snapshot[il], s->gdn_state_snapshot[il],
-              s->spec_snapshot_rows, s->gdn_qkv,
-              s->gdn_alpha, s->gdn_beta, s->gdn_gate,
-              &conv_slab, &a_log_slab, &dt_bias_slab, &ssm_norm_slab,
-              DS4_N_GDN_KEY_HEAD, DS4_N_GDN_VALUE_HEAD, n_tokens,
-              DS4_QWEN4EXP_GDN_HEADS_TILED, DS4_RMS_EPS, DS4_RMS_EPS,
-              out_q8 ? s->gdn_out_q8 : NULL, 0u, out_q8_soff);
     } else
 #endif
     rc = adopt_width
@@ -2618,6 +2584,12 @@ static bool qwen4exp_graph_layers_encode(
  * overlap the device work already queued. */
 #define QW_DECODE_GRAPH_MAX_CHUNKS 8u
 
+/* This build's note auto09170719_1 records that switching the
+ * gated-deltanet decode arm to the split-reduce kernel, which launches four
+ * times as many blocks, measured seven tenths of one percent faster with a
+ * standard error of one and two tenths: neutral. Widening the grid is not
+ * what this path needs.
+ */
 static uint32_t qw_decode_graph_chunks(void) {
     static int init = 0;
     static uint32_t chunks = 4u;   /* the A/B's pick; 1 restores the single capture */
