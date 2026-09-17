@@ -1135,6 +1135,20 @@ static void *qw_ple_gather_worker(void *arg) {
     for (uint32_t t = seg->t0; t < seg->t1; t++) {
         ds4_ple_row_ids(&seg->s->ple_constants, &local, seg->tokens + t, 1u,
                         seg->s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD);
+        const uint64_t *ids = seg->s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD;
+        /* The sixteen row ids are known before the first dequant, so the
+         * table reads do not have to serialize behind one another: ask for
+         * every row's lines up front and let the misses overlap.  A row is
+         * ninety bytes, so three line hints cover it at any alignment.
+         * Pure hint: the values produced are unchanged. */
+        for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
+            const uint8_t *q = ds4_qwen4exp_ple_row(seg->ple, ids[h]);
+            if (q) {
+                __builtin_prefetch(q, 0, 3);
+                __builtin_prefetch(q + 64, 0, 3);
+                __builtin_prefetch(q + 128, 0, 3);
+            }
+        }
         for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
             const uint64_t row =
                 seg->s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h];
@@ -1306,6 +1320,20 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
              * head.  Same addresses, same values. */
             const uint64_t *ids = s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD;
             float *dst = s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD;
+            /* All sixteen row ids of this token are known before the first
+             * dequant, so the table reads do not have to serialize behind
+             * one another: ask for every row's lines up front and let the
+             * misses overlap.  A row is ninety bytes, so three line hints
+             * cover it at any alignment.  Pure hint: the values produced
+             * are unchanged. */
+            for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
+                const uint8_t *q = ds4_qwen4exp_ple_row(&w->ple, ids[h]);
+                if (q) {
+                    __builtin_prefetch(q, 0, 3);
+                    __builtin_prefetch(q + 64, 0, 3);
+                    __builtin_prefetch(q + 128, 0, 3);
+                }
+            }
             for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
                 const uint64_t row = ids[h];
                 /* Every head of this token except the last is followed by
@@ -1363,6 +1391,19 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
             ds4_ple_row_ids(&s->ple_constants, &s->ple_history, tokens,
                             n_tokens, s->ple_ids);
             for (uint32_t t = 0; t < n_tokens; t++) {
+                const uint64_t *ids = s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD;
+                /* Same overlap as the decode path: the sixteen row ids are
+                 * already computed, so issue every row's lines before the
+                 * first dequant instead of letting each read wait on the
+                 * last.  Ninety bytes is at most three lines.  Hint only. */
+                for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
+                    const uint8_t *q = ds4_qwen4exp_ple_row(&w->ple, ids[h]);
+                    if (q) {
+                        __builtin_prefetch(q, 0, 3);
+                        __builtin_prefetch(q + 64, 0, 3);
+                        __builtin_prefetch(q + 128, 0, 3);
+                    }
+                }
                 for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
                     const uint64_t row =
                         s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h];
