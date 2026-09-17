@@ -6132,6 +6132,9 @@ extern "C" int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const 
 extern "C" int ds4_gpu_end_commands(void) {
     return cuda_ok(cudaDeviceSynchronize(), "end commands");
 }
+extern "C" int ds4_gpu_end_commands_sync(void) {
+    return cuda_ok(cudaDeviceSynchronize(), "end commands sync");
+}
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
 
 extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
