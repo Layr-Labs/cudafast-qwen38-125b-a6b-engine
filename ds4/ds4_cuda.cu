@@ -5980,6 +5980,7 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
  * work while one 64-thread block owns each output. Retain all 32 original
  * float chains and their reduction tree; only the integer dot is split.
  * The two-token verifier benefits; one-token calls keep the original warp. */
+template<bool TokenGrid = false>
 __global__ static void matmul_q8_hc_down_pair_kernel(
         float *out, const unsigned char *w, const int8_t *xq,
         const float *xs, uint32_t rows) {
@@ -6014,16 +6015,11 @@ __global__ static void matmul_q8_hc_down_pair_kernel(
     const unsigned group = threadIdx.x / L;
     const unsigned part = threadIdx.x % L;
     const uint64_t row = blockIdx.x;
-    /* ONE TOKEN PER BLOCK.  The grid was 320 blocks of one warp, which is 6.67
-     * warps an SM on a part that carries 48 -- the GRID, not registers, was the
-     * limit.  A token's sum is independent of the other token's, so moving the
-     * token to blockIdx.y doubles the grid without adding a warp behind any
-     * barrier, which is the direction the L sweep already showed is the only
-     * one that wins here.  Every float chain is untouched: this block walks the
-     * same b = group, group+32, ... in the same order, reads the same
-     * at = tok*320 + b, and folds through the same warp tree. */
-    const unsigned tok = blockIdx.y;
-    float acc[1] = {0.0f};
+    constexpr unsigned TokenRows = TokenGrid ? 1u : 2u;
+    const unsigned token0 = TokenGrid ? blockIdx.y : 0u;
+    float acc[TokenRows];
+#pragma unroll
+    for (unsigned r = 0; r < TokenRows; r++) acc[r] = 0.0f;
     /* PDL: the first walk step (b = group, which every lane owns, group
      * being under 32 and the walk being 320 wide) with its WEIGHT loads
      * issued above the fence and held in registers, so they fly while the
@@ -6050,17 +6046,21 @@ __global__ static void matmul_q8_hc_down_pair_kernel(
         float ws = 0.0f;
         if (part == 0u) ws = __half2float(*(const __half *)blk);
         QWEN4EXP_PDL_SYNC();
-        if (tok < rows) {
-            const unsigned at = tok * 320u + group;
-            const int32_t *xw =
-                    (const int32_t *)(xq + at * 32u + part * (32u/L));
-            int dot = 0;
 #pragma unroll
-            for (int j = 0; j < 8/L; j++) dot = __dp4a(wq[j], xw[j], dot);
+        for (unsigned r = 0; r < TokenRows; r++) {
+            const unsigned token = token0 + r;
+            if (token < rows) {
+                const unsigned at = token * 320u + group;
+                const int32_t *xw =
+                        (const int32_t *)(xq + at * 32u + part * (32u/L));
+                int dot = 0;
 #pragma unroll
-            for (int d = 1; d < L; d *= 2)
-                dot += __shfl_xor_sync(0xffffffffu, dot, d);
-            if (part == 0u) acc[0] += ws * xs[at] * (float)dot;
+                for (int j = 0; j < 8/L; j++) dot = __dp4a(wq[j], xw[j], dot);
+#pragma unroll
+                for (int d = 1; d < L; d *= 2)
+                    dot += __shfl_xor_sync(0xffffffffu, dot, d);
+                if (part == 0u) acc[r] += ws * xs[at] * (float)dot;
+            }
         }
     }
     for (unsigned b = group + 32u; b < 320u; b += 32u) {
@@ -6081,24 +6081,36 @@ __global__ static void matmul_q8_hc_down_pair_kernel(
         wq[8/L - 1] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
         float ws = 0.0f;
         if (part == 0u) ws = __half2float(*(const __half *)blk);
-        if (tok < rows) {
-            const unsigned at = tok * 320u + b;
-            const int32_t *xw = (const int32_t *)(xq + at * 32u + part * (32u/L));
-            int dot = 0;
 #pragma unroll
-            for (int j = 0; j < 8/L; j++) dot = __dp4a(wq[j], xw[j], dot);
+        for (unsigned r = 0; r < TokenRows; r++) {
+            const unsigned token = token0 + r;
+            if (token < rows) {
+                const unsigned at = token * 320u + b;
+                const int32_t *xw = (const int32_t *)(xq + at * 32u + part * (32u/L));
+                int dot = 0;
 #pragma unroll
-            for (int d = 1; d < L; d *= 2)
-                dot += __shfl_xor_sync(0xffffffffu, dot, d);
-            if (part == 0u) acc[0] += ws * xs[at] * (float)dot;
+                for (int j = 0; j < 8/L; j++) dot = __dp4a(wq[j], xw[j], dot);
+#pragma unroll
+                for (int d = 1; d < L; d *= 2)
+                    dot += __shfl_xor_sync(0xffffffffu, dot, d);
+                if (part == 0u) acc[r] += ws * xs[at] * (float)dot;
+            }
         }
     }
-    __shared__ float partial[1][32];
-    if (part == 0u) partial[0][group] = acc[0];
+    __shared__ float partial[TokenRows][32];
+    if (part == 0u) {
+#pragma unroll
+        for (unsigned r = 0; r < TokenRows; r++) partial[r][group] = acc[r];
+    }
     __syncthreads();
     if (threadIdx.x < 32u) {
-        const float total = warp_sum_f32(partial[0][threadIdx.x]);
-        if (threadIdx.x == 0u && tok < rows) out[tok * 320u + row] = total;
+#pragma unroll
+        for (unsigned r = 0; r < TokenRows; r++) {
+            const float total = warp_sum_f32(partial[r][threadIdx.x]);
+            const unsigned token = token0 + r;
+            if (threadIdx.x == 0u && token < rows)
+                out[token * 320u + row] = total;
+        }
     }
 }
 
@@ -17682,6 +17694,10 @@ static int cuda_matmul_q8_0_preq_rows_exact(
         getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
         getenv("DS4_Q8_NO_HC_DOWN_PAIR") == NULL &&
         (((uintptr_t)wptr & 1u) == 0u)) {
+        /* One token per block is faster for the HC verifier's one/two-row
+         * launches on GB10; retain an escape hatch for local ablation. */
+        const bool token_grid =
+            getenv("DS4_Q8_NO_HC_DOWN_TOKEN_GRID") == NULL;
         if (n_rows == 4u ||
             (n_rows == 3u && getenv("DS4_QWEN4EXP_WIDE_VERIFY_R2") == NULL)) {
             /* One four-row tile: the weight block is read once for all three
@@ -17697,21 +17713,44 @@ static int cuda_matmul_q8_0_preq_rows_exact(
             /* Rows 0..1 as one pair call, row 2 as a one-row call on shifted
              * views.  The kernel's per-row arithmetic does not depend on
              * `rows`, so each row is the value a two-row call gives it. */
-            matmul_q8_hc_down_pair_kernel<<<dim3(320u, 2u, 1u), 32, 0, cuda_decode_stream()>>>(
-                    (float *)out->ptr, (const unsigned char *)wptr,
-                    xq, xscale, 2u);
-            matmul_q8_hc_down_pair_kernel<<<dim3(320u, 1u, 1u), 32, 0, cuda_decode_stream()>>>(
-                    (float *)out->ptr + 2u * out_dim, (const unsigned char *)wptr,
-                    xq + 2u * blocks * 32u, xscale + 2u * blocks, 1u);
+            if (token_grid) {
+                matmul_q8_hc_down_pair_kernel<true><<<
+                        dim3(320u, 2u, 1u), 32, 0, cuda_decode_stream()>>>(
+                        (float *)out->ptr, (const unsigned char *)wptr,
+                        xq, xscale, 2u);
+                matmul_q8_hc_down_pair_kernel<true><<<
+                        dim3(320u, 1u, 1u), 32, 0, cuda_decode_stream()>>>(
+                        (float *)out->ptr + 2u * out_dim,
+                        (const unsigned char *)wptr,
+                        xq + 2u * blocks * 32u, xscale + 2u * blocks, 1u);
+            } else {
+                matmul_q8_hc_down_pair_kernel<false><<<
+                        320, 32, 0, cuda_decode_stream()>>>(
+                        (float *)out->ptr, (const unsigned char *)wptr,
+                        xq, xscale, 2u);
+                matmul_q8_hc_down_pair_kernel<false><<<
+                        320, 32, 0, cuda_decode_stream()>>>(
+                        (float *)out->ptr + 2u * out_dim,
+                        (const unsigned char *)wptr,
+                        xq + 2u * blocks * 32u, xscale + 2u * blocks, 1u);
+            }
             return cuda_ok(cudaGetLastError(), "q8 HC down pair launch (3 rows)");
         }
         /* PDL consumer: the stream predecessor is qwen4exp_hc_norm_quant,
          * which triggers at its top, and the kernel's weight-word prefetch
          * rides the norm's window (ds4_cuda_qwen4exp.cuh). */
-        QWEN4EXP_LAUNCH_PDL(matmul_q8_hc_down_pair_kernel, dim3(320u, n_rows, 1u), 32, 0,
-                            cuda_decode_stream(),
-                (float *)out->ptr, (const unsigned char *)wptr,
-                xq, xscale, n_rows);
+        if (token_grid) {
+            QWEN4EXP_LAUNCH_PDL((matmul_q8_hc_down_pair_kernel<true>),
+                                dim3(320u, n_rows, 1u), 32, 0,
+                                cuda_decode_stream(),
+                    (float *)out->ptr, (const unsigned char *)wptr,
+                    xq, xscale, n_rows);
+        } else {
+            QWEN4EXP_LAUNCH_PDL((matmul_q8_hc_down_pair_kernel<false>),
+                                320, 32, 0, cuda_decode_stream(),
+                    (float *)out->ptr, (const unsigned char *)wptr,
+                    xq, xscale, n_rows);
+        }
         return cuda_ok(cudaGetLastError(), "q8 HC down pair launch");
     }
     /* Two lanes read each full group at one/two-row decode widths. Integer
