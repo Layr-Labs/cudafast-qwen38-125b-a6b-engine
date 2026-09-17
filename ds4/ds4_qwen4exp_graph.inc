@@ -3041,11 +3041,12 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     }
     QW_TRACE(QW_SLICE_HEAD);
     QW_TRACE_REPORT(n_tokens);
-    /* Commit and wait: the logits are read on the host from here on. */
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
-        fprintf(stderr, "ds4: qwen4exp command batch did not complete\n");
-        return false;
-    }
+    /* The readback below is a synchronous cudaMemcpy on the legacy stream,
+     * which already waits on every blocking stream in the process -- the
+     * decode stream included, since cudaStreamCreate made it blocking.  The
+     * two explicit device drains this line used to carry were a second and
+     * third wait for the same work; the memcpy is the only wait the host
+     * needs, and its cuda_ok surfaces a sticky launch error the same way. */
     if (logits_out &&
         !ds4_gpu_tensor_read(s->logits, 0, logits_out,
                              (uint64_t)logit_rows * cfg->n_vocab *
@@ -3095,9 +3096,13 @@ static bool qwen4exp_session_copy_layers(ds4_qwen4exp_session *s,
                                      (uint64_t)row * bytes, bytes) != 0;
         }
     }
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) return false;
-    if (ok && recurrent) s->gdn_replay_previous = false;
-    return ok;
+    /* The copies above are synchronous cudaMemcpy calls on the legacy
+     * stream; each already waited on every blocking stream, so the last one
+     * leaves the device drained.  The two explicit drains that followed were
+     * waits on work that had already completed. */
+    if (!ok) return false;
+    if (recurrent) s->gdn_replay_previous = false;
+    return true;
 }
 
 /* The rollback's GDN select.  With lazy rollback armed it records the row each
@@ -3670,10 +3675,9 @@ bool ds4_qwen4exp_graph_head_logits(ds4_qwen4exp_session       *s,
         fprintf(stderr, "ds4: qwen4exp LM head failed on the head row\n");
         return qwen4exp_forward_fail();
     }
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
-        fprintf(stderr, "ds4: qwen4exp command batch did not complete\n");
-        return false;
-    }
+    /* The readback below is a synchronous cudaMemcpy on the legacy stream;
+     * it waits on every blocking stream itself, so the two explicit drains
+     * this line used to carry were waits on work already complete. */
     return ds4_gpu_tensor_read(s->logits, 0, logits,
                                (uint64_t)cfg->n_vocab * sizeof(float)) != 0;
 }
@@ -3868,7 +3872,9 @@ static int qwen4exp_rb_ple_conv_select(void *ctx, uint32_t row) {
     const bool ok = ds4_gpu_tensor_copy(s->ple_conv_state, 0,
                                         s->ple_conv_snapshot,
                                         (uint64_t)row * bytes, bytes) != 0;
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) return -1;
+    /* The copy is a synchronous cudaMemcpy on the legacy stream: it already
+     * waited on every blocking stream, so the device is drained when it
+     * returns.  The two explicit drains that used to follow were redundant. */
     return ok ? 0 : -1;
 }
 static int qwen4exp_rb_qsa_kv_truncate(void *ctx, uint32_t pos) {
