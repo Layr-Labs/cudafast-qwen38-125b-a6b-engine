@@ -972,6 +972,31 @@ bool ds4_qwen4exp_session_read_hyper(const ds4_qwen4exp_session *s,
                                (uint64_t)n_tokens * row) != 0;
 }
 
+/* The stream-ordered half of read_hyper: same bounds checks, but the
+ * copy is issued on the legacy stream and the caller owns the wait.
+ * The verify window batches it with the top-1 readback so the round
+ * pays one device sync for both instead of one per copy. */
+static bool ds4_qwen4exp_session_read_hyper_async(const ds4_qwen4exp_session *s,
+                                                  uint32_t                    first,
+                                                  uint32_t                    n_tokens,
+                                                  float                      *out) {
+    if (!s || !s->hyper || !out || n_tokens == 0) {
+        fprintf(stderr, "ds4: qwen4exp hyper read-back called with %s%s%s\n",
+                (s && s->hyper) ? "" : "no session stream ",
+                out ? "" : "no destination ", n_tokens ? "" : "no rows");
+        return false;
+    }
+    if ((uint64_t)first + n_tokens > s->plan.n_batch) {
+        fprintf(stderr,
+                "ds4: qwen4exp hyper read-back of rows %u..%u passes the "
+                "session batch %u\n", first, first + n_tokens, s->plan.n_batch);
+        return false;
+    }
+    const uint64_t row = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    return ds4_gpu_tensor_read_async(s->hyper, (uint64_t)first * row, out,
+                                     (uint64_t)n_tokens * row) != 0;
+}
+
 static void qwen4exp_zero_tensor(ds4_gpu_tensor *t) {
     if (!t) return;
     const uint64_t bytes = ds4_gpu_tensor_bytes(t);
@@ -1459,7 +1484,11 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 "ds4: qwen4exp PLE gather %u rows took %.3f ms\n",
                 n_tokens, (now_sec() - gather_t0) * 1000.0);
     }
-    if (!ds4_gpu_tensor_write(s->ple_rows, 0, s->ple_rows_host,
+    /* Stream-ordered upload: the copy is queued on the legacy stream ahead
+     * of the kernels that consume ple_rows, so the host is free to keep
+     * launching while the bytes move.  ple_rows_host is not rewritten until
+     * the next gather, which sits behind this forward's device sync. */
+    if (!ds4_gpu_tensor_write_async(s->ple_rows, 0, s->ple_rows_host,
                               (uint64_t)n_tokens * DS4_N_PLE_EMBD * sizeof(float))) {
         fprintf(stderr, "ds4: qwen4exp n-gram row upload failed at block %u\n", il);
         return false;
@@ -3602,12 +3631,18 @@ bool ds4_qwen4exp_graph_verify_top1_rows(ds4_qwen4exp_session       *s,
     s->spec_logit_rows = 0u;
     s->spec_top1_rows = 0u;
     if (!forward_ok) return false;
-    if (hc_rows && !ds4_qwen4exp_session_read_hyper(s, 0, n_tokens, hc_rows)) {
+    /* Both readbacks are issued on the legacy stream before the host waits:
+     * one device sync covers the hyper rows and the top-1 ids, where the
+     * serial path paid a full blocking round trip for each. */
+    if (hc_rows && !ds4_qwen4exp_session_read_hyper_async(s, 0, n_tokens, hc_rows)) {
         fprintf(stderr, "ds4: qwen4exp compact verify hyper read failed\n");
         return false;
     }
-    return ds4_gpu_tensor_read(s->spec_top1, 0, row_top1,
-                               (uint64_t)n_tokens * sizeof(int32_t)) != 0;
+    if (!ds4_gpu_tensor_read_async(s->spec_top1, 0, row_top1,
+                                   (uint64_t)n_tokens * sizeof(int32_t))) {
+        return false;
+    }
+    return ds4_gpu_synchronize() != 0;
 }
 
 bool ds4_qwen4exp_graph_read_logit_row(ds4_qwen4exp_session *s,

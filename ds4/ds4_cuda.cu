@@ -3476,6 +3476,32 @@ extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset
     return ok;
 }
 
+extern "C" int ds4_gpu_tensor_write_async(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
+    if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
+    int d = ds4_tensor_device_idx(tensor);
+    int ok = 0;
+    WITH_DEVICE(g_gpu[d].device_id) {
+        ok = cuda_ok(cudaMemcpyAsync((char *)tensor->ptr + offset, data,
+                                   (size_t)bytes, cudaMemcpyHostToDevice,
+                                   (cudaStream_t)0),
+                     "tensor write async");
+    }
+    return ok;
+}
+
+extern "C" int ds4_gpu_tensor_read_async(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
+    if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
+    int d = ds4_tensor_device_idx(tensor);
+    int ok = 0;
+    WITH_DEVICE(g_gpu[d].device_id) {
+        ok = cuda_ok(cudaMemcpyAsync(data, (const char *)tensor->ptr + offset,
+                                     (size_t)bytes, cudaMemcpyDeviceToHost,
+                                     (cudaStream_t)0),
+                     "tensor read async");
+    }
+    return ok;
+}
+
 extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                      const ds4_gpu_tensor *src, uint64_t src_offset,
                                      uint64_t bytes) {
