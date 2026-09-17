@@ -18110,15 +18110,15 @@ static int cuda_matmul_q8_0_preq_rows_exact(
              * its next portion in flight behind its walk (the kernel's own
              * note has the numbers).  DS4_QWEN4EXP_NO_PAIR_LANES_ROLL
              * restores the shipping kernel from the same binary. */
-            const size_t pl_roll_smem = (size_t)2u * 4u * 64u * 34u;
-            const int pl_roll = pl_panel > 12288u && (blocks % 64u) == 0u &&
+            const size_t pl_roll_smem = (size_t)2u * 4u * 32u * 34u;
+            const int pl_roll = pl_panel > 12288u && (blocks % 32u) == 0u &&
                 (((uintptr_t)wptr) & 15u) == 0u &&
                 getenv("DS4_QWEN4EXP_NO_PAIR_LANES_ROLL") == NULL;
             if (n_rows == 1u && pl_roll &&
                 getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL) {
                 /* PDL consumer as below; the first portion rides the window. */
                 QWEN4EXP_LAUNCH_PDL(
-                        (matmul_q8_0_preq_pair_lanes_roll_kernel<1, 64>),
+                        (matmul_q8_0_preq_pair_lanes_roll_kernel<1, 32>),
                         (dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u)),
                         256, pl_roll_smem, cuda_decode_stream(),
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
@@ -18160,7 +18160,7 @@ static int cuda_matmul_q8_0_preq_rows_exact(
                         out_dim, n_rows, blocks);
             } else if (pl_roll) {
                 QWEN4EXP_LAUNCH_PDL(
-                        (matmul_q8_0_preq_pair_lanes_roll_kernel<2, 64>),
+                        (matmul_q8_0_preq_pair_lanes_roll_kernel<2, 32>),
                         (dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u)),
                         256, pl_roll_smem, cuda_decode_stream(),
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
