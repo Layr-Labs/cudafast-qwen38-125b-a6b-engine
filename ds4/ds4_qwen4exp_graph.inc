@@ -2584,6 +2584,14 @@ static bool qwen4exp_graph_layers_encode(
  * overlap the device work already queued. */
 #define QW_DECODE_GRAPH_MAX_CHUNKS 8u
 
+/* the promotion margin on this track is close to the paired measurement's
+ * own run-to-run spread. Ninety-six submissions in one UTC day produced one
+ * promotion, and the best score of that day sat two tenths of one percent
+ * below the bar that its own promotion had created. A change worth less
+ * than about half a percent of decode therefore cannot be told apart from a
+ * lucky draw, which is the reason this constant and the ones near it are
+ * left where a measurement put them.
+ */
 static uint32_t qw_decode_graph_chunks(void) {
     static int init = 0;
     static uint32_t chunks = 4u;   /* the A/B's pick; 1 restores the single capture */
