@@ -17357,6 +17357,12 @@ int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows) {
  * change after the first call and a captured graph replays the launches it
  * recorded, so the choice is capture-safe.  Defined here so both translation
  * units share one cached read of the environment. */
+/* This build's note auto09170557_2 records that six provable-equivalence
+ * removals stacked into one tree measured four tenths of one percent slower
+ * with a standard error of nearly four tenths, which is neutral. Their
+ * combined arithmetic is a few microseconds against a round of about fifty
+ * milliseconds.
+ */
 int ds4_qwen4exp_pdl_enabled(void) {
     static int resolved = 0;
     static int enabled = 0;
