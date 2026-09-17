@@ -427,6 +427,11 @@ __device__ __forceinline__ static float qwen4exp_gdn_softplus(float x) {
  * standard error of one and two tenths: neutral. Widening the grid is not
  * what this path needs.
  */
+/* This build's note auto09171910_4 records that a staging depth that feeds
+ * an accumulation is not a tuning knob: halving the normalisation staging
+ * depth builds and launches cleanly and then fails the correctness gate,
+ * because the depth also sets the order of the sum of squares.
+ */
 __global__ static void qwen4exp_gdn_conv_kernel(
         float       *qkv,
         float       *conv_state,
