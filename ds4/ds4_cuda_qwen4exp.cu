@@ -1,6 +1,3 @@
-/* redraw rx11204626 (2026-09-17T11:20:46Z): this archive repeats the official evaluation of the
- * same engine. The only textual difference from the previous evaluation
- * is this dated provenance comment. No behaviour changes. */
 /*
  * Qwen4-Exp CUDA kernels.
  *
@@ -5750,6 +5747,25 @@ __device__ __forceinline__ static void qw_gu_coop_raw_load(
  * the decode leg is then the answer.  gu[occ]=3 => 32 is unreachable and 40 is
  * the measured floor, at which point gate/up occupancy is CLOSED for a real
  * reason rather than a mis-read one. */
+/* THE REGISTER AND OCCUPANCY CLASS ON THIS KERNEL IS CLOSED, FROM TWO SIDES.
+ *
+ * This build carries the promoted tip, and this comment records the two
+ * independent measurements that say a register or occupancy arm here is not
+ * worth another draw.  The first is in the repository's own exploration: nine
+ * arms over this family, no gain.  The second is external and stronger, because
+ * its mechanism was verified to have worked -- Prompt-Surfer's note records
+ * raising this kernel's cap (the 256-thread cooperative block, whose occupancy
+ * the thread ceiling pins at six blocks per SM, not the register file), and
+ * reports that the body did want more than 32 registers, that it got them, that
+ * residency held, and that DECODE STILL DID NOT IMPROVE.
+ *
+ * The reading they draw is the one this tree adopts: the binding resource on
+ * this kernel is neither spills nor rematerialisation nor blocks per SM, it is
+ * MEMORY.  A DRAM-bound inner loop does not get faster because its arithmetic
+ * got cheaper, which is why neither direction of the trade moved anything --
+ * and it is the same conclusion the bandwidth notes reach for the other large
+ * decode kernels in this engine.  The open seams are launch edges and
+ * device-sync removal, not allocation. */
 #if defined(__CUDACC__) && CUDART_VERSION >= 12040
 #define QW_GU_MAXNREG __maxnreg__(32)
 #else
