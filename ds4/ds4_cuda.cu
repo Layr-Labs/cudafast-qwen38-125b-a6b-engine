@@ -17876,6 +17876,25 @@ static int cuda_q8_mma_pipe_try(float *out, const unsigned char *w,
     if (out_dim > 384u && out_dim <= 1024u) {
         return cuda_q8_mma_pipe_launch<2, 4, 4, 4, 4, 2>(out, w, xq, xscale, out_dim, n_rows, blocks);
     }
+    /* STAGES stays 2 on this rung, and that is now a measurement rather than a
+     * default.  A third stage was drawn twice on the official runner, each
+     * time paired against a machine-code-identical baseline on the SAME box
+     * with the SAME baseline_calibration_sha256 -- the only comparison this
+     * benchmark offers that is not confounded by which box a draw landed on:
+     *
+     *   af3ec6b9  +0.192% decode  -0.288% prefill
+     *   9ea57be6  +0.052% decode  -0.300% prefill   (bundled, see below)
+     *
+     * The prefill sign and magnitude replicate across two independent draws,
+     * and this pipe is prefill-only, so the -0.29% is attributable to the rung
+     * even though 9ea57be6 also carried two cp.async fill conversions on
+     * decode-path kernels.  At 1% prefill = 25 bips of the composite that is
+     * about -7.5 bips, against a +10-bip promotion floor.  The register
+     * readout confirms the rung was live in both: mm[reg=] moved 127 -> 128
+     * with occupancy unchanged at 4, so this is not a spill artifact.
+     *
+     * Depth on this rung is therefore measured NEGATIVE, not merely unproven.
+     * Do not re-add it without a same-box paired contrast that disagrees. */
     return cuda_q8_mma_pipe_launch<2, 2, 4, 4, 4, 2>(out, w, xq, xscale, out_dim, n_rows, blocks);
 }
 
@@ -19973,6 +19992,41 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
         const uint64_t panel_bytes = (uint64_t)(B/64u) * blocks * 34u;
         const char *const gp = (const char *)w + (uint64_t)block * panel_bytes;
         if (((uintptr_t)gp & 15u) == 0u) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+            /* THE FILL'S DEPTH.  The rolled form kept below emits one LDG.E.128
+             * and then immediately its dependent STS.128, so a thread holds
+             * exactly one sixteen-byte request in flight and pays this panel's
+             * three trips as three serialized round trips.  Occupancy cannot
+             * cover that: the fill is the first thing a block does, so every
+             * resident warp is inside it at the same instant and the warps that
+             * would hide the latency are all waiting on the same latency.  That
+             * is why residency arguments about this kernel (~48 warps/SM) do not
+             * settle it either way.
+             *
+             * cp.async issues global->shared without routing the bytes through a
+             * register, so the depth costs nothing against this kernel's hard
+             * __maxnreg__(40) -- the register-hoist form of this same fix, which
+             * holds three uint4 live, is exactly what that cap forbids here.
+             *
+             * The bytes are unchanged: same addresses, same verbatim image, each
+             * thread's own ascending order, and waited to completion BEFORE the
+             * fence, precisely where the synchronous form completed.  The fence
+             * order below is untouched, so the -39 bip lesson (a staging barrier
+             * above the PDL fence) is not re-litigated, and no copy is left in
+             * flight across the grid dependency sync.  The scalar tail and the
+             * merely-word-aligned fallback are untouched. */
+            for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
+                 i += (uint64_t)B * 16u) {
+                if (i + 16u <= panel_bytes)
+                    tt_cp_async_16B(gpanel + i, (const void *)(gp + i), true);
+                else
+                    for (uint64_t j = i; j < panel_bytes; j++) gpanel[j] = gp[j];
+            }
+            tt_cp_async_commit();
+            tt_cp_async_wait_group<0>();
+#else
+            /* Pre-sm80 tt_cp_async_16B ZEROES the destination, so the
+             * synchronous fill is the only correct form there. */
             for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
                  i += (uint64_t)B * 16u) {
                 if (i + 16u <= panel_bytes)
@@ -19980,6 +20034,7 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
                 else
                     for (uint64_t j = i; j < panel_bytes; j++) gpanel[j] = gp[j];
             }
+#endif
         } else {
             for (uint64_t i = (uint64_t)threadIdx.x * 4u; i < panel_bytes;
                  i += (uint64_t)B * 4u) {
