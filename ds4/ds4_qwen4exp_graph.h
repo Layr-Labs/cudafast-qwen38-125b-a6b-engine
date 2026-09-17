@@ -217,6 +217,17 @@ bool ds4_qwen4exp_graph_read_logit_row(ds4_qwen4exp_session *s,
                                        uint32_t row,
                                        float *logits);
 
+/* Speculative pre-gather: the seam reseeds the shadow history at the commit
+ * point, posts each next-verify token as it becomes known, and the head runs
+ * ds4_qwen4exp_ple_pg_presync between its last kernel launch and the
+ * batch-end synchronize so the posted token's table reads and dequant land
+ * in the device-sync window on the same thread.  The gather copies a slot
+ * whose token and ids match; a miss gathers inline. */
+void ds4_qwen4exp_ple_pg_reseed(ds4_qwen4exp_session *s,
+                                const ds4_qwen4exp_weights *w);
+void ds4_qwen4exp_ple_pg_post(ds4_qwen4exp_session *s, int32_t token);
+void ds4_qwen4exp_ple_pg_presync(ds4_qwen4exp_session *s);
+
 /* The target's LM head over ONE supplied pre-final-mixer row.  Runs the final
  * mixer and the head, the same two ops the forward ends with, so a row that
  * came out of a verify yields exactly the logits that verify would have. */
