@@ -16,6 +16,7 @@ QWEN4EXP_GU_DQ_TEST := tests/test_qwen4exp_gateup_dq
 QWEN4EXP_QSA_TEST := tests/test_qwen4exp_qsa
 QWEN4EXP_GDN_REF_TEST := tests/test_qwen4exp_gdn_ref
 QWEN4EXP_GDN_ROWS_TEST := tests/test_qwen4exp_gdn_value_reuse
+QWEN4EXP_GDN_VARIANT_TEST := tests/test_qwen4exp_gdn_variant
 QWEN4EXP_QSA_REF_TEST := tests/test_qwen4exp_qsa_ref
 QWEN4EXP_GRAPH_TEST := tests/test_qwen4exp_graph
 QWEN4EXP_PLE_KERNEL_TEST := tests/test_qwen4exp_ple_kernels
@@ -1080,3 +1081,10 @@ tests/test_qwen4exp_gdn_replay: tests/test_qwen4exp_gdn_replay.o $(GPU_TEST_OBJS
 
 test-qwen4exp-gdn-replay: tests/test_qwen4exp_gdn_replay
 	./tests/test_qwen4exp_gdn_replay
+
+# Campaign addition: gdn variant battery (590 checks).
+tests/test_qwen4exp_gdn_variant.o: tests/test_qwen4exp_gdn_variant.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_qwen4exp_gdn_variant.c
+
+$(QWEN4EXP_GDN_VARIANT_TEST): tests/test_qwen4exp_gdn_variant.o $(GPU_TEST_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
