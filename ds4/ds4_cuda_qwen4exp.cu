@@ -1669,7 +1669,7 @@ static float *qwen4exp_conv_scratch(int tier, uint64_t elements) {
 /* Snapshot slots a lazy-rollback flag may name: DS4_QWEN4EXP_IMPLEMENTED_DEPTH
  * (ds4_qwen4exp_mtp.h, which this unit does not include), the count the graph
  * allocates and the bound its select applies. */
-#define QWEN4EXP_GDN_ADOPT_SLOTS 6u
+#define QWEN4EXP_GDN_ADOPT_SLOTS 4u
 
 /* Defined beside the Q8_0 quantize seam it shares with the HC mixer. */
 __global__ static void qwen4exp_gdn_output_quant_kernel(
@@ -8190,7 +8190,20 @@ __device__ __forceinline__ static void qsp_bar_arrive(int id, int count) {
 template <int MATRICES, int LOGCH, int KMAX>
 struct qsp_cfg {
     static constexpr int NT = 2;
-    static constexpr int PWARPS = 4;
+    /* Eight producer warps for the DOWN projection only (MATRICES == 1).
+     * This kernel is bound by producer global-load LATENCY -- measured: removing
+     * every MMA makes it SLOWER, removing every global load takes 31-39% off
+     * the wall, and perfectly coalescing the weight fetch is 4% slower still.
+     * Doubling the producer warps halves the per-thread staging while doubling
+     * the warps issuing loads: the same total staging, twice the memory-level
+     * parallelism.  PWARPS moves only WHICH producer thread stages WHICH
+     * element -- no value, no smem address contents and no consumer
+     * instruction changes, so the result is bit-identical.
+     * Gate/up (MATRICES == 2) keeps four: it showed no measured in-engine gain
+     * at eight, so it is left exactly as it was.  Verified by a whole-unit
+     * ptxas census: of 212 kernels, only the seven <1,*,*> instantiations
+     * move, and all seven lose their register spill. */
+    static constexpr int PWARPS = (MATRICES == 1) ? 8 : 4;
     static constexpr int THREADS = (QSP_CWARPS + PWARPS) * 32;
     static constexpr int BN = 2 * NT * 8;             /* WN = 2 */
     static constexpr int CH = 1 << LOGCH;
