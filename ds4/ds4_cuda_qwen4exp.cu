@@ -418,6 +418,12 @@ __device__ __forceinline__ static float qwen4exp_gdn_softplus(float x) {
  * slower than eight, four slots about half a percent slower than eight. The
  * cost is not linear in the slot count and eight is a measured optimum.
  */
+/* This build's note auto09170747_4 records that the captured-graph lookup
+ * is a linear scan with no eviction, and both directions off the shipped
+ * width were measured: sixteen slots is about three and a half percent
+ * slower than eight, four slots about half a percent slower than eight. The
+ * cost is not linear in the slot count and eight is a measured optimum.
+ */
 __global__ static void qwen4exp_gdn_conv_kernel(
         float       *qkv,
         float       *conv_state,
@@ -10688,6 +10694,28 @@ qwen4exp_hc_up_mix_pipe_kernel(
                 }
             }
 
+            /* L2 PREFETCH OF THE EPILOGUE'S RESIDUAL LINES.  The mix below reads
+             * the residual as one 128-byte line per token and stream: five hundred
+             * and twelve lines per block, the only DRAM traffic the block has, and
+             * with one block resident per SM nothing covers that read.  Stage zero
+             * and stage one global loads are in flight here; behind them the
+             * producers ask the cache for the lines of the epilogue's first and
+             * second pass, so each has a stage or more to land.  Issued at the top
+             * of the block, ahead of stage zero's loads, the same request measured
+             * slower; issued after the last stage, too late.  A prefetch changes no
+             * value: every load below reads the same bytes. */
+            if (s < 2u) {
+                const int base = (int)s * QHP_CWARPS * 8 * QHP_NT;
+                for (int i = pl; i < QHP_CWARPS * 8 * QHP_NT; i += PT) {
+                    const uint32_t t = (uint32_t)(base + i) / (uint32_t)QHP_NT;
+                    const uint32_t h = (uint32_t)(base + i) - t * (uint32_t)QHP_NT;
+                    const uint32_t r = m0 + t;
+                    if (t < (uint32_t)QHP_BM && r < n_rows) {
+                        qw_prefetch_l2((const char *)(hyper +
+                                ((uint64_t)r * QHP_NT + h) * n_embd + d0));
+                    }
+                }
+            }
             if (s >= (uint32_t)QHP_STAGES) qsp_bar_sync(2 + 2 * buf, BAR_COUNT);
 
 #pragma unroll
@@ -10858,6 +10886,17 @@ qwen4exp_hc_up_mix_pipe_kernel(
         static_assert(QHP_BM % (QHP_CWARPS * TPP) == 0, "tokens per warp pass");
 #pragma unroll 1
         for (int t0 = warp * TPP; t0 < QHP_BM; t0 += QHP_CWARPS * TPP) {
+            /* The next pass's lines, asked for while this pass's loads and
+             * sigmoids run; the thirty-two lanes name the pass's eight tokens
+             * across four streams. */
+            {
+                const int tn = t0 + QHP_CWARPS * TPP + (int)(lane >> 2);
+                const uint32_t rn = m0 + (uint32_t)tn;
+                if (tn < QHP_BM && rn < n_rows) {
+                    qw_prefetch_l2((const char *)(hyper +
+                            ((uint64_t)rn * QHP_NT + (lane & 3u)) * n_embd + d0));
+                }
+            }
             float hv[TPP][QHP_NT], ns[TPP][QHP_NT];
 #pragma unroll
             for (int i = 0; i < TPP; i++) {
