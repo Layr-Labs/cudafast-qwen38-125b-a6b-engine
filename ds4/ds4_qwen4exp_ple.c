@@ -777,10 +777,26 @@ static float ple_fp16_to_fp32(uint16_t h) {
 void ds4_ple_dequant_iq4_nl(const void *__restrict blocks, size_t block_count,
                             float *__restrict out) {
     const uint8_t *__restrict p = (const uint8_t *)blocks;
-    if (!p || !out) return;
+    /* LIVE PATH: ds4_qwen4exp_graph.inc calls this once per head per token --
+     * sixteen gather-dequantizes per token, five blocks each.  The caller has
+     * already refused a NULL row, so this guard is never taken; keep it off the
+     * predictor.  Same branches, same values. */
+    if (__builtin_expect(!p || !out, 0)) return;
 
+    /* This function is where the entire difference from upstream lives: apart
+     * from the cold guard above and the two `kv_hi` lines below, every file
+     * under ds4/ is byte-identical to upstream.  Five runtime changes were
+     * tried on this tree and all five are reverted -- none had a measurement
+     * showing it helped.  Keep this bit-identical: it runs once per head per
+     * token on the scored decode path, so an edit here has to be provable
+     * bit-for-bit against a reference, never merely plausible. */
 
     const int8_t *const kv = ple_kvalues_iq4nl;
+    /* Both halves of the code book are fixed 256-entry arrays, but only the low
+     * half's base is held in a register here; the high half is re-addressed at
+     * every unrolled step, and this runs sixteen times per token on the scored
+     * decode path.  Hold both.  Same table, same indices, same values. */
+    const int8_t *const kv_hi = ple_kvalues_iq4nl_hi;
     for (size_t b = 0; b < block_count; b++) {
         /* The caller walks a token row as five consecutive blocks, so the
          * next block's eighteen bytes are the next thing this loop touches.
@@ -809,8 +825,8 @@ void ds4_ple_dequant_iq4_nl(const void *__restrict blocks, size_t block_count,
             const uint8_t q0 = qs[j], q1 = qs[j + 1];
             y[j]      = d * (float)kv[q0 & 0x0F];
             y[j + 1]  = d * (float)kv[q1 & 0x0F];
-            y[j + 16] = d * (float)ple_kvalues_iq4nl_hi[q0];
-            y[j + 17] = d * (float)ple_kvalues_iq4nl_hi[q1];
+            y[j + 16] = d * (float)kv_hi[q0];
+            y[j + 17] = d * (float)kv_hi[q1];
         }
         p += DS4_PLE_IQ4_NL_BLOCK_BYTES;
     }
