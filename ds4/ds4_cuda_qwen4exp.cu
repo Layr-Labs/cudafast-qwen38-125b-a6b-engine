@@ -3221,7 +3221,7 @@ __global__ static void qwen4exp_router_select_kernel(
 
 /* Pairs are packed as token * n_expert_used + slot, which is exactly the index
  * `selected` and `weights` are addressed by. */
-__global__ static void qwen4exp_moe_group_count_kernel(
+__global__ static void qwen4exp_moe_group_count_scalar_kernel(
         int32_t *counts,
         const int32_t *selected,
         uint32_t n_total_expert,
@@ -3231,6 +3231,35 @@ __global__ static void qwen4exp_moe_group_count_kernel(
     const int32_t e = selected[p];
     if (e < 0 || (uint32_t)e >= n_total_expert) return;
     atomicAdd(&counts[e], 1);
+}
+
+__global__ static void qwen4exp_moe_group_count_kernel(
+        int32_t *counts,
+        const int32_t *selected,
+        uint32_t n_total_expert,
+        uint32_t n_pairs) {
+    const uint32_t p = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned warp_mask = __activemask();
+    const bool in_range = p < n_pairs;
+    int32_t e = -1;
+    if (in_range) e = selected[p];
+    const bool valid = in_range && e >= 0 && (uint32_t)e < n_total_expert;
+
+    /* Every lane in a warp reaches the ballots, including tail and invalid
+     * pairs.  One lane adds the population of each expert in this warp; the
+     * resulting count is exactly the sum of the old per-pair atomics. */
+    const unsigned valid_mask = __ballot_sync(warp_mask, valid);
+    unsigned remaining = valid_mask;
+    const unsigned lane = threadIdx.x & 31u;
+    while (remaining != 0u) {
+        const unsigned leader = (unsigned)(__ffs((int)remaining) - 1);
+        const int32_t leader_e = __shfl_sync(warp_mask, e, leader);
+        const unsigned same = __ballot_sync(
+                warp_mask, valid && e == leader_e);
+        const int same_count = __popc(same);
+        if (lane == leader) atomicAdd(&counts[leader_e], same_count);
+        remaining &= ~same;
+    }
 }
 
 /* One full warp scans 32 experts at a time.  Every lane participates in every
@@ -8070,9 +8099,16 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
                      "qwen4exp MoE group counts reset")) {
             return 0;
         }
-        qwen4exp_moe_group_count_kernel<<<pair_blocks, threads, 0, stream>>>(
-                sc.counts, (const int32_t *)selected->ptr,
-                n_total_expert, n_pairs);
+        if (getenv("DS4_QWEN4EXP_NO_GROUP_WARP_ATOMICS") != NULL) {
+            qwen4exp_moe_group_count_scalar_kernel<<<
+                    pair_blocks, threads, 0, stream>>>(
+                    sc.counts, (const int32_t *)selected->ptr,
+                    n_total_expert, n_pairs);
+        } else {
+            qwen4exp_moe_group_count_kernel<<<pair_blocks, threads, 0, stream>>>(
+                    sc.counts, (const int32_t *)selected->ptr,
+                    n_total_expert, n_pairs);
+        }
         if (n_total_expert <= QWEN4EXP_MOE_SCAN_THREADS &&
             getenv("DS4_QWEN4EXP_SERIAL_GROUP_SCAN") == NULL) {
             qwen4exp_moe_group_scan_parallel_kernel<<<
