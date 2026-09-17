@@ -13512,6 +13512,25 @@ __global__ static void hc_split_weighted_sum_fused_kernel(
     }
 }
 
+/* GRID STARVATION, AUDITED AND DELIBERATELY NOT FIXED.  This kernel is the
+ * norm-fused sibling of hc_split_weighted_sum_fused_kernel above, and it is
+ * starved harder: ds4_gpu_hc_split_weighted_sum_norm_tensor launches it only
+ * when n_rows == 1, with a grid of ONE block of 256 threads -- one SM of the
+ * part's forty-eight, running a 2560-column pass.
+ *
+ * No column split can be applied here, and the reason is worth recording so it
+ * is not tried: this kernel couples the columns TWICE over.  It reduces
+ * `sum += acc * acc` over every column into one norm_scale, and it then READS
+ * BACK out[] to write norm_out[].  A second block holding half the columns
+ * would compute half the sum and would read a row another block is still
+ * writing, so a fix needs a two-pass or atomic structure -- a scratch
+ * accumulator plus a second launch -- not a second grid dimension.
+ *
+ * This path is left as shipped rather than redesigned blind: nothing here can
+ * be compiled or run on the authoring machine, and a wrong norm_scale is a
+ * silent numeric change, not a crash.  The n_rows > 1 case does not reach this
+ * kernel at all -- that entry point falls back to the plain kernel plus
+ * ds4_gpu_rms_norm_weight_rows_tensor. */
 __global__ static void hc_split_weighted_sum_norm_fused_kernel(
         float *out,
         float *norm_out,
@@ -17390,13 +17409,6 @@ int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows) {
  * change after the first call and a captured graph replays the launches it
  * recorded, so the choice is capture-safe.  Defined here so both translation
  * units share one cached read of the environment. */
-/* This build's note auto09170921_2 records that the first benchd run inside
- * a fresh model residency is systematically slower than the ones after it
- * in the same residency, by as much as forty-seven percent in the worst
- * case observed, because it pays the untimed correctness phase's graph
- * captures and first-touch costs. A local comparison that does not discard
- * each residency's first run is measuring which arm happened to go first.
- */
 int ds4_qwen4exp_pdl_enabled(void) {
     static int resolved = 0;
     static int enabled = 0;
