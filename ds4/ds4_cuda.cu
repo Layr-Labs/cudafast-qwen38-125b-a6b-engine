@@ -13467,10 +13467,35 @@ __global__ static void hc_split_weighted_sum_fused_kernel(
     uint32_t d = threadIdx.x;
     if (t >= n_rows || n_hc != 4) return;
     const uint32_t mix_hc = 24;
-    float *sp = split + (uint64_t)t * mix_hc;
-    if (d == 0) hc4_split_one(sp, mix + (uint64_t)t * mix_hc, scale, base, sinkhorn_iters, epsv);
+    /* COLUMN BLOCKS ON blockIdx.y.  The grid was n_rows blocks of 256 threads,
+     * so a two-row verify ran the whole 2560-column sum on TWO of this part's
+     * forty-eight SMs and the other forty-six idled -- the GRID, not registers
+     * and not shared memory, was the limit.  The columns are independent: a
+     * column writes one out[] element and reads nothing another column writes,
+     * and there is no reduction anywhere in this kernel, so they split across
+     * blocks freely.  gridDim.y == 1 walks the shipped stride exactly, which is
+     * what prefill launches, where n_rows already fills the part and the split
+     * would only replicate the serial prologue a thousand times over.
+     *
+     * Every float chain is untouched: a column still accumulates h = 0..3
+     * ascending into an acc that starts at 0.0f over the same two operands, and
+     * sp[] holds the same 24 floats hc4_split_one has always produced from the
+     * same mix row, scale and base.  It lands in shared rather than global
+     * because only one block per row may own the global buffer; hc4_split_one
+     * never READS out[] -- every reference to it is a store of an
+     * already-computed value -- so the destination address space cannot change
+     * a result. */
+    __shared__ float sp[24];
+    if (d == 0) {
+        hc4_split_one(sp, mix + (uint64_t)t * mix_hc, scale, base, sinkhorn_iters, epsv);
+        if (blockIdx.y == 0) {
+            float *gp = split + (uint64_t)t * mix_hc;
+            for (uint32_t i = 0; i < mix_hc; i++) gp[i] = sp[i];
+        }
+    }
     __syncthreads();
-    for (uint32_t col = d; col < n_embd; col += blockDim.x) {
+    for (uint32_t col = blockIdx.y * blockDim.x + d; col < n_embd;
+         col += blockDim.x * gridDim.y) {
         float acc = 0.0f;
         for (uint32_t h = 0; h < 4; h++) {
             acc += residual_hc[(uint64_t)t * 4u * n_embd + (uint64_t)h * n_embd + col] * sp[h];
@@ -29860,7 +29885,20 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_tensor(
     const float *scale = (const float *)cuda_resolve_weight_ptr(model_map, scale_offset, 3ull * sizeof(float), logical_tier, "hc_scale");
     const float *base = (const float *)cuda_resolve_weight_ptr(model_map, base_offset, mix_bytes, logical_tier, "hc_base");
     if (!scale || !base) return 0;
-    hc_split_weighted_sum_fused_kernel<<<(uint32_t)n_rows, 256, 0, cuda_decode_stream()>>>(
+    /* Column blocks: enough that a two- or three-row verify puts its 2560
+     * columns on distinct SMs instead of two, and exactly ONE when n_rows
+     * already fills the part, which keeps prefill on the shipped
+     * one-block-per-row walk.  288 is 48 SMs times the six blocks the
+     * 1536-thread ceiling admits at 256 threads; the ceil(n_embd/256) clamp
+     * stops a block being launched with no column to own, and for every row
+     * count this path sees in decode (1..3) the clamp is what binds at ten, so
+     * the target itself is not a tuned constant. */
+    const uint32_t col_blocks_max = (n_embd + 255u) / 256u;
+    uint32_t col_blocks = 288u / (n_rows ? (uint32_t)n_rows : 1u);
+    if (col_blocks > col_blocks_max) col_blocks = col_blocks_max;
+    if (col_blocks == 0) col_blocks = 1;
+    hc_split_weighted_sum_fused_kernel<<<dim3((uint32_t)n_rows, col_blocks, 1u),
+                                        256, 0, cuda_decode_stream()>>>(
             (float *)out->ptr,
             (float *)split->ptr,
             (const float *)mix->ptr,
