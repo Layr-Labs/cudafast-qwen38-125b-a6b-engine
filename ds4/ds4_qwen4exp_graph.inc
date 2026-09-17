@@ -1579,6 +1579,21 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
     }
 #endif
 
+    /* PREFILL (CUDA): alpha and beta in one launch when the eight-warp F32
+     * tile would serve both, reading the mixed input once while it is still
+     * warm from the quantize above.  A decline launches nothing and the two
+     * calls below run. */
+    int gdn_ab_paired = 0;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (n_tokens >= 8u) {
+        gdn_ab_paired = ds4_gpu_matmul_f32_pair_decode_rows_exact_tensor(
+            s->gdn_alpha, s->gdn_beta,
+            QW_MAP(m, l->ssm_alpha), QW_MAPSZ(m, l->ssm_alpha), QW_OFF(l->ssm_alpha),
+            QW_MAP(m, l->ssm_beta), QW_MAPSZ(m, l->ssm_beta), QW_OFF(l->ssm_beta),
+            DS4_N_EMBD, DS4_N_GDN_VALUE_HEAD, s->mixed, n_tokens);
+    }
+#endif
+
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (n_tokens<=2u && getenv("DS4_QWEN4EXP_NO_GDN_PROJECTION_FUSION")==NULL) {
         ds4_gpu_tensor *outs[4]={s->gdn_qkv,s->gdn_gate,s->gdn_alpha,s->gdn_beta};
@@ -1606,14 +1621,16 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
                                         QW_MAPSZ(m, l->attn_gate), QW_OFF(l->attn_gate),
                                         DS4_N_EMBD, cfg->gdn_inner,
                                         s->mixed_q8, 0, q8_soff, n_tokens) ||
-            !ds4_qwen4exp_matmul_f32(s->gdn_alpha, QW_MAP(m, l->ssm_alpha),
+            (!gdn_ab_paired &&
+             !ds4_qwen4exp_matmul_f32(s->gdn_alpha, QW_MAP(m, l->ssm_alpha),
                                        QW_MAPSZ(m, l->ssm_alpha), QW_OFF(l->ssm_alpha),
                                        DS4_N_EMBD, DS4_N_GDN_VALUE_HEAD,
-                                       s->mixed, n_tokens) ||
-            !ds4_qwen4exp_matmul_f32(s->gdn_beta, QW_MAP(m, l->ssm_beta),
+                                       s->mixed, n_tokens)) ||
+            (!gdn_ab_paired &&
+             !ds4_qwen4exp_matmul_f32(s->gdn_beta, QW_MAP(m, l->ssm_beta),
                                        QW_MAPSZ(m, l->ssm_beta), QW_OFF(l->ssm_beta),
                                        DS4_N_EMBD, DS4_N_GDN_VALUE_HEAD,
-                                       s->mixed, n_tokens)) {
+                                       s->mixed, n_tokens))) {
             fprintf(stderr, "ds4: qwen4exp GDN projections failed at block %u\n", il);
             return false;
         }
@@ -2618,6 +2635,14 @@ static bool qwen4exp_graph_layers_encode(
  * overlap the device work already queued. */
 #define QW_DECODE_GRAPH_MAX_CHUNKS 8u
 
+/* This build's note auto09171327_2 records that the gated-deltanet path is
+ * twenty-seven percent of a decode step while moving a constant-size
+ * recurrent state of roughly three megabytes per layer, which at this box's
+ * bandwidth should take about eleven microseconds and takes about three
+ * hundred and ten. It is therefore latency and occupancy bound rather than
+ * bandwidth bound, where the routed expert path beside it runs at about
+ * eighty percent of peak.
+ */
 static uint32_t qw_decode_graph_chunks(void) {
     static int init = 0;
     static uint32_t chunks = 4u;   /* the A/B's pick; 1 restores the single capture */

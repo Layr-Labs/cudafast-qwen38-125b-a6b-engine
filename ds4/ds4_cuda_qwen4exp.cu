@@ -10204,6 +10204,16 @@ __global__ static void qwen4exp_gdn_output_quant_kernel(
         uint32_t     n_value_head,
         uint32_t     n_tokens,
         float        norm_eps) {
+    /* PDL producer for the state-out projection that follows on the stream.
+     * That projection is already launched with the programmatic attribute and
+     * already places its fence after its first weight loads and before its
+     * first activation read, so the early window it asks for has never been
+     * opened: nothing upstream triggered.  At the decode widths this grid is
+     * n_tokens by n_value_head, ninety-six blocks of a hundred and twenty-
+     * eight threads, one wave on this device, which is the deadlock rule in
+     * ds4_cuda_qwen4exp.cuh.  The gate reads a kernel argument so it is
+     * grid-uniform, and prefill, whose grid is orders larger, never fires. */
+    if (n_tokens <= 2u) QWEN4EXP_PDL_TRIGGER();
     const uint32_t token = blockIdx.x;
     const uint32_t head = blockIdx.y;
     const uint32_t tid = threadIdx.x;
