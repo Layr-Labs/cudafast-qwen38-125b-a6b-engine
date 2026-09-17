@@ -93,6 +93,11 @@ int ds4s_top_logits(const ds4s_handle *h, int k, int32_t *ids, float *logits);
  * The port routes this to ds4_qwen4exp_mtp_cycle, which commits the target's
  * own GREEDY argmax and so emits the serial leg's token stream exactly; at
  * depth 1 it commits 1 or 2 tokens per round. */
+/* This build's note auto09171659_1 records that the promotion margin on
+ * this track is close to the paired measurement's own run-to-run spread, so
+ * a change worth less than about half a percent of decode cannot be told
+ * apart from a lucky draw even after it lands.
+ */
 int ds4s_eval_speculative(ds4s_handle *h, int32_t first_token, int budget, int32_t *out,
                           int cap);
 

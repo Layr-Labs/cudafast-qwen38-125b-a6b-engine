@@ -4259,6 +4259,287 @@ __global__ static void qwen4exp_moe_group_small_kernel(
     }
 }
 
+/* qwen4exp_router_select_topk_kernel and qwen4exp_moe_group_small_kernel as
+ * ONE launch.
+ *
+ * The two are adjacent on the stream at every decode and verify width, and
+ * the second reads nothing but the first's output.  The top-k is n_tokens
+ * blocks of ONE WARP and the grouping is ONE BLOCK of 512 threads: between
+ * them they run at most seven warps and 512 threads, move about eleven
+ * kilobytes, and cost 6.1 us and 7.5 us -- almost all of it launch and
+ * teardown, not work.  Fusing them keeps every thread the top-k had (warp w
+ * still serves token w, with the same 32 lanes) and merely moves those warps
+ * into the grouping block, so no memory-bound work is handed to a narrower
+ * grid.  That is the whole reason this collapse is safe where folding an
+ * 80-block inject into an 8-block norm was not.
+ *
+ * The grid-wide dependency the graph edge carried was n_tokens blocks to one.
+ * n_tokens is under eight here (the grouping kernel's own gate), so the whole
+ * producer fits in one block and the edge becomes a __syncthreads.
+ *
+ * Not one arithmetic statement of either half is changed: the top-k's lane
+ * index is threadIdx.x & 31 where it was threadIdx.x of a 32-thread block,
+ * its token is threadIdx.x >> 5 where it was blockIdx.x, and every warp
+ * intrinsic already uses the full mask and stays inside its own warp.
+ */
+template<bool Native>
+__global__ static void qwen4exp_moe_router_group_small_kernel(
+        int32_t *counts,
+        int32_t *offsets,
+        int32_t *cursor,
+        int32_t *active,
+        int32_t *pairs,
+        float *mid,
+        int32_t *selected,
+        uint32_t n_expert,
+        uint32_t n_pairs,
+        uint32_t n_expert_used,
+        uint32_t mid_dim,
+        uint32_t mid_token_stride,
+        float *weights_out,
+        const float *logits,
+        uint32_t n_tokens) {
+    __shared__ int32_t warp_count_prefix[QWEN4EXP_MOE_SCAN_THREADS / 32];
+    __shared__ int32_t warp_live_prefix[QWEN4EXP_MOE_SCAN_THREADS / 32];
+    /* Hoisted here from the grouping half: it has to precede the FIRST global
+     * read of the fused kernel, which is now the router's `logits`.  A no-op
+     * on the plain launch this kernel takes, correct if it is ever launched
+     * with the programmatic attribute. */
+    QWEN4EXP_PDL_SYNC();
+    /* The trigger the standalone top-k carried is GONE, deliberately: it
+     * existed for the grouping kernel, which is now the second half of this
+     * one.  A retained trigger would open a launch window across the whole
+     * fused kernel for any PSS-attributed launch that ever lands behind it,
+     * which is a hazard with no remaining benefit.
+     *
+     * Warp w serves token w.  Warps at or above n_tokens skip this half by
+     * BRANCHING, never by returning: every thread has to reach the
+     * __syncthreads below, and a partial warp must never reach one of the
+     * full-mask warp intrinsics inside. */
+    const uint32_t rtok = threadIdx.x >> 5u;
+    if (rtok < n_tokens) {
+    const uint32_t tok = rtok;
+    const uint32_t lane = threadIdx.x & 31u;
+    const float *lg = logits + (uint64_t)tok * n_expert;
+    int32_t *sel = selected + (uint64_t)tok * n_expert_used;
+    float *w = weights_out + (uint64_t)tok * n_expert_used;
+
+    float scores[16];
+    uint32_t live = 0u;
+#pragma unroll
+    for (uint32_t j = 0; j < 16u; j++) {
+        const uint32_t e = lane + j * 32u;
+        scores[j] = e < n_expert ? lg[e] : -FLT_MAX;
+        if (e < n_expert) live |= 1u << j;
+    }
+
+    for (uint32_t rank = 0; rank < n_expert_used; rank++) {
+        float best_v = -FLT_MAX;
+        int32_t best_i = INT32_MAX;
+#pragma unroll
+        for (uint32_t j = 0; j < 16u; j++) {
+            if ((live & (1u << j)) == 0u) continue;
+            const int32_t e = (int32_t)(lane + j * 32u);
+            const float v = scores[j];
+            if (v > best_v || (v == best_v && e < best_i)) {
+                best_v = v;
+                best_i = e;
+            }
+        }
+
+#if __CUDA_ARCH__ >= 800
+        if (Native) {
+            /* Float order as unsigned integer order. Canonical zero keeps
+             * the old comparison's equal treatment of positive/negative zero. */
+            const uint32_t bits = best_v == 0.0f ? 0u : __float_as_uint(best_v);
+            const uint32_t key = bits & 0x80000000u ? ~bits : bits ^ 0x80000000u;
+            const uint32_t winning_key = __reduce_max_sync(0xffffffffu, key);
+            best_i = __reduce_min_sync(0xffffffffu,
+                    key == winning_key ? best_i : INT32_MAX);
+        } else
+#endif
+        {
+#pragma unroll
+            for (uint32_t off = 16u; off > 0u; off >>= 1u) {
+                const float other_v =
+                    __shfl_down_sync(0xffffffffu, best_v, off);
+                const int32_t other_i =
+                    __shfl_down_sync(0xffffffffu, best_i, off);
+                if (other_v > best_v ||
+                    (other_v == best_v && other_i < best_i)) {
+                    best_v = other_v;
+                    best_i = other_i;
+                }
+            }
+        }
+        const int32_t chosen =
+            __shfl_sync(0xffffffffu, best_i, 0u);
+        if (lane == 0u) sel[rank] = chosen;
+        if (((uint32_t)chosen & 31u) == lane) {
+            live &= ~(1u << ((uint32_t)chosen >> 5u));
+        }
+    }
+
+    if (Native) {
+        float m = -FLT_MAX;
+        if (lane == 0u) {
+            for (uint32_t i = 0; i < n_expert_used; i++) {
+                const float v = lg[(uint32_t)sel[i]];
+                if (v > m) m = v;
+            }
+        }
+        m = __shfl_sync(0xffffffffu, m, 0u);
+        /* Selected ids were stored by lane zero above. Publish them before
+         * other lanes read; no block-wide barrier is needed in one warp. */
+        __syncwarp();
+        const float e = lane < n_expert_used
+                ? expf(lg[(uint32_t)sel[lane]] - m) : 0.0f;
+        float sum = 0.0f;
+        for (uint32_t i = 0; i < n_expert_used; i++) {
+            const float term = __shfl_sync(0xffffffffu, e, i);
+            if (lane == 0u) sum += term;
+        }
+        float inv = 0.0f;
+        if (lane == 0u) inv = 1.0f / sum;
+        inv = __shfl_sync(0xffffffffu, inv, 0u);
+        if (lane < n_expert_used) w[lane] = e * inv;
+    } else {
+        /* Same serial softmax and the same selected-logit order as the full-sort
+         * path below. */
+        if (lane == 0u) {
+            float m = -FLT_MAX;
+            for (uint32_t i = 0; i < n_expert_used; i++) {
+                const float v = lg[(uint32_t)sel[i]];
+                if (v > m) m = v;
+            }
+            float sum = 0.0f;
+            for (uint32_t i = 0; i < n_expert_used; i++) {
+                const float e = expf(lg[(uint32_t)sel[i]] - m);
+                w[i] = e;
+                sum += e;
+            }
+            const float inv = 1.0f / sum;
+            for (uint32_t i = 0; i < n_expert_used; i++) w[i] *= inv;
+        }
+    }    }
+    /* The whole barrier this fusion turns a graph edge into: it publishes the
+     * router warps' `selected` stores to every thread of the block before the
+     * grouping half's first read of them. */
+    __syncthreads();
+    /* PDL consumer of the router's top-k, which triggers at its top.  This
+     * kernel is one 512-thread block and its very first global read is
+     * `selected`, the router's output, so there is no weight load to hoist
+     * above the fence and nothing moves: the fence sits at the top and the
+     * whole win is that this block is already resident when the router's
+     * warps retire, instead of costing a launch afterwards.  Every read below
+     * it is an activation read, per the header's rule, and none of this
+     * kernel's pointers carries __restrict__, so the .nc hazard does not
+     * apply.  Plainly launched -- at the prefill widths where the caller
+     * takes the wide grouping path instead -- the fence is a no-op. */
+    const uint32_t e = threadIdx.x;
+    const uint32_t lane = e & 31u;
+    const uint32_t warp = e >> 5u;
+
+    int32_t count = 0;
+    if (e < n_expert) {
+        for (uint32_t p = 0; p < n_pairs; p++) {
+            count += selected[p] == (int32_t)e;
+        }
+        counts[e] = count;
+    }
+    int32_t count_prefix = count;
+    int32_t live_prefix = count > 0 ? 1 : 0;
+#pragma unroll
+    for (uint32_t delta = 1u; delta < 32u; delta <<= 1u) {
+        const int32_t prior_count =
+            __shfl_up_sync(0xffffffffu, count_prefix, delta);
+        const int32_t prior_live =
+            __shfl_up_sync(0xffffffffu, live_prefix, delta);
+        if (lane >= delta) {
+            count_prefix += prior_count;
+            live_prefix += prior_live;
+        }
+    }
+    if (lane == 31u) {
+        warp_count_prefix[warp] = count_prefix;
+        warp_live_prefix[warp] = live_prefix;
+    }
+    __syncthreads();
+
+    if (warp == 0u) {
+        const uint32_t n_warps = QWEN4EXP_MOE_SCAN_THREADS / 32;
+        int32_t warp_count = lane < n_warps ? warp_count_prefix[lane] : 0;
+        int32_t warp_live = lane < n_warps ? warp_live_prefix[lane] : 0;
+#pragma unroll
+        for (uint32_t delta = 1u; delta < 32u; delta <<= 1u) {
+            const int32_t prior_count =
+                __shfl_up_sync(0xffffffffu, warp_count, delta);
+            const int32_t prior_live =
+                __shfl_up_sync(0xffffffffu, warp_live, delta);
+            if (lane >= delta) {
+                warp_count += prior_count;
+                warp_live += prior_live;
+            }
+        }
+        if (lane < n_warps) {
+            warp_count_prefix[lane] = warp_count;
+            warp_live_prefix[lane] = warp_live;
+        }
+    }
+    __syncthreads();
+
+    if (warp > 0u) {
+        count_prefix += warp_count_prefix[warp - 1u];
+        live_prefix += warp_live_prefix[warp - 1u];
+    }
+    if (e < n_expert) {
+        const int32_t offset = count_prefix - count;
+        offsets[e] = offset;
+        cursor[e] = offset + count;
+        if (count > 0) active[live_prefix] = (int32_t)e;
+        int32_t at = offset;
+        for (uint32_t p = 0; p < n_pairs; p++) {
+            if (selected[p] == (int32_t)e) pairs[at++] = (int32_t)p;
+        }
+    }
+    if (e == 0u) {
+        active[0] = warp_live_prefix[QWEN4EXP_MOE_SCAN_THREADS / 32 - 1u];
+    }
+    /* The normal router never emits an invalid id.  Preserve the public
+     * tensor helper's defensive zero semantics without paying a second launch
+     * in the normal case; an invalid pair's one thread writes its short
+     * intermediate row here. */
+    if (e < n_pairs) {
+        const int32_t expert = selected[e];
+        if (expert < 0 || (uint32_t)expert >= n_expert) {
+            const uint32_t token = e / n_expert_used;
+            const uint32_t slot = e - token * n_expert_used;
+            float *dst = mid + (uint64_t)token * mid_token_stride +
+                         (uint64_t)slot * mid_dim;
+            for (uint32_t row = 0; row < mid_dim; row++) dst[row] = 0.0f;
+        }
+    }}
+
+/* Does this shape take the fused router+grouping launch?  BOTH sites that
+ * must agree read THIS function and nothing else: the graph body, to decide
+ * whether to run the router itself, and the routed-MoE entry, to check that
+ * the caller's decision matches its own.  A shape is fused when the grouping
+ * takes its one-block path (the same n_tokens and expert bounds
+ * qwen4exp_moe_group_small_kernel is launched under) and the router takes its
+ * warp top-k.  Every valve either half honours is honoured here too, so
+ * turning one off turns the fusion off with it. */
+extern "C" int ds4_gpu_qwen4exp_moe_router_fused_ok(uint32_t n_expert,
+                                                    uint32_t n_expert_used,
+                                                    uint32_t n_tokens) {
+    return n_tokens > 0u && n_tokens < 8u &&
+           n_expert > 0u && n_expert <= (uint32_t)QWEN4EXP_MOE_SCAN_THREADS &&
+           n_expert_used > 0u && n_expert_used <= 32u &&
+           n_expert_used <= n_expert &&
+           getenv("DS4_QWEN4EXP_SERIAL_GROUP_SCAN") == NULL &&
+           getenv("DS4_QWEN4EXP_NO_ROUTER_NATIVE") == NULL &&
+           getenv("DS4_QWEN4EXP_NO_MOE_ROUTER_FUSE") == NULL;
+}
+
 __global__ static void qwen4exp_moe_group_scatter_kernel(
         int32_t *pairs,
         int32_t *cursor,
@@ -8653,7 +8934,11 @@ static int qwen4exp_moe_tile(uint32_t n_rows) {
     return 8;
 }
 
-extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
+/* The routed MoE body.  `logits` non-NULL means the caller has NOT run the
+ * router and wants it fused into the grouping launch; `weights_rw` is then the
+ * softmax-weight buffer that fused kernel writes.  Both NULL is the shipping
+ * path, unchanged. */
+static int qwen4exp_routed_moe_cuda(
         ds4_gpu_tensor              *out,
         ds4_gpu_tensor              *mid,
         ds4_gpu_tensor              *down_partial,
@@ -8669,7 +8954,9 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         uint32_t                     n_expert_used,
         const ds4_gpu_tensor        *x,
         uint32_t                     n_tokens,
-        uint32_t                     mid_token_stride) {
+        uint32_t                     mid_token_stride,
+        const ds4_gpu_tensor        *logits,
+        ds4_gpu_tensor              *weights_rw) {
     if (!out || !mid || !gate_slab || !up_slab || !down_slab ||
         !gate_slab->map || !up_slab->map || !down_slab->map ||
         !selected || !weights || !x ||
@@ -8798,7 +9085,36 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
     const int small_group =
         n_tokens < 8u && n_total_expert <= QWEN4EXP_MOE_SCAN_THREADS &&
         getenv("DS4_QWEN4EXP_SERIAL_GROUP_SCAN") == NULL;
-    if (small_group) {
+    /* The caller passes `logits` exactly when ds4_gpu_qwen4exp_moe_router_fused_ok
+     * said so and therefore did NOT select the experts itself.  That predicate is
+     * the only decision point; if a caller reaches here disagreeing with it,
+     * refuse loudly rather than select twice or not at all. */
+    const int fuse_router = logits != NULL;
+    if (fuse_router &&
+        (!weights_rw || !small_group ||
+         !ds4_gpu_qwen4exp_moe_router_fused_ok(n_total_expert, n_expert_used,
+                                               n_tokens) ||
+         logits->bytes < (uint64_t)n_tokens * n_total_expert * sizeof(float) ||
+         weights_rw->bytes < (uint64_t)n_pairs * sizeof(float))) {
+        fprintf(stderr, "ds4: CUDA qwen4exp fused MoE router asked for a shape "
+                        "it does not serve\n");
+        return 0;
+    }
+
+    if (fuse_router) {
+        /* The router's top-k is the first half of this launch now, so there is
+         * no programmatic pair left to attribute and the launch is plain: warp
+         * w selects token w's experts, one __syncthreads publishes them, and
+         * the same 512 threads group them.  The fence in the body is a no-op
+         * on a plain launch. */
+        qwen4exp_moe_router_group_small_kernel<true>
+                <<<dim3(1u, 1u, 1u), QWEN4EXP_MOE_SCAN_THREADS, 0, stream>>>(
+                sc.counts, sc.offsets, sc.cursor, sc.active, sc.pairs,
+                (float *)mid->ptr, (int32_t *)selected->ptr,
+                n_total_expert, n_pairs, n_expert_used, mid_dim,
+                mid_token_stride, (float *)weights_rw->ptr,
+                (const float *)logits->ptr, n_tokens);
+    } else if (small_group) {
         /* PSS: the router's top-k is the stream predecessor and triggers at
          * these widths (its gate is the same n_tokens < 8 this branch is), so
          * this one block comes up while the router's warps are still retiring.
@@ -8955,7 +9271,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
 #define DS4_GATEUP_DMA_BUILD 1
 #endif
 #if DS4_GATEUP_DMA_BUILD
-#define QW_GATEUP_DMA_ARM 5
+#define QW_GATEUP_DMA_ARM 4
 #else
 #define QW_GATEUP_DMA_ARM 0
 #endif
@@ -9238,6 +9554,58 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
 #undef QWEN4EXP_DOWN_ASYNC
     return cuda_ok(cudaGetLastError(), "qwen4exp MoE down launch");
 }
+
+#define DS4_QWEN4EXP_ROUTED_MOE_ARGS                                          \
+    out, mid, down_partial, gate_slab, up_slab, down_slab, in_dim, mid_dim,   \
+    out_dim, selected, weights, n_total_expert, n_expert_used, x, n_tokens,   \
+    mid_token_stride
+
+/* The shipping entry, signature untouched: the router has already run. */
+extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
+        ds4_gpu_tensor              *out,
+        ds4_gpu_tensor              *mid,
+        ds4_gpu_tensor              *down_partial,
+        const ds4_gpu_qwen4exp_slab *gate_slab,
+        const ds4_gpu_qwen4exp_slab *up_slab,
+        const ds4_gpu_qwen4exp_slab *down_slab,
+        uint32_t                     in_dim,
+        uint32_t                     mid_dim,
+        uint32_t                     out_dim,
+        const ds4_gpu_tensor        *selected,
+        const ds4_gpu_tensor        *weights,
+        uint32_t                     n_total_expert,
+        uint32_t                     n_expert_used,
+        const ds4_gpu_tensor        *x,
+        uint32_t                     n_tokens,
+        uint32_t                     mid_token_stride) {
+    return qwen4exp_routed_moe_cuda(DS4_QWEN4EXP_ROUTED_MOE_ARGS, NULL, NULL);
+}
+
+/* The same block with the router's selection folded into its grouping launch.
+ * `logits` NULL is exactly the call above. */
+extern "C" int ds4_gpu_qwen4exp_routed_moe_router_tensor(
+        ds4_gpu_tensor              *out,
+        ds4_gpu_tensor              *mid,
+        ds4_gpu_tensor              *down_partial,
+        const ds4_gpu_qwen4exp_slab *gate_slab,
+        const ds4_gpu_qwen4exp_slab *up_slab,
+        const ds4_gpu_qwen4exp_slab *down_slab,
+        uint32_t                     in_dim,
+        uint32_t                     mid_dim,
+        uint32_t                     out_dim,
+        const ds4_gpu_tensor        *selected,
+        const ds4_gpu_tensor        *weights,
+        uint32_t                     n_total_expert,
+        uint32_t                     n_expert_used,
+        const ds4_gpu_tensor        *x,
+        uint32_t                     n_tokens,
+        uint32_t                     mid_token_stride,
+        const ds4_gpu_tensor        *logits,
+        ds4_gpu_tensor              *weights_rw) {
+    return qwen4exp_routed_moe_cuda(DS4_QWEN4EXP_ROUTED_MOE_ARGS, logits,
+                                    weights_rw);
+}
+#undef DS4_QWEN4EXP_ROUTED_MOE_ARGS
 
 extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         ds4_gpu_tensor              *out,
@@ -10207,6 +10575,16 @@ __global__ static void qwen4exp_gdn_output_quant_kernel(
         uint32_t     n_value_head,
         uint32_t     n_tokens,
         float        norm_eps) {
+    /* PDL producer for the state-out projection that follows on the stream.
+     * That projection is already launched with the programmatic attribute and
+     * already places its fence after its first weight loads and before its
+     * first activation read, so the early window it asks for has never been
+     * opened: nothing upstream triggered.  At the decode widths this grid is
+     * n_tokens by n_value_head, ninety-six blocks of a hundred and twenty-
+     * eight threads, one wave on this device, which is the deadlock rule in
+     * ds4_cuda_qwen4exp.cuh.  The gate reads a kernel argument so it is
+     * grid-uniform, and prefill, whose grid is orders larger, never fires. */
+    if (n_tokens <= 2u) QWEN4EXP_PDL_TRIGGER();
     const uint32_t token = blockIdx.x;
     const uint32_t head = blockIdx.y;
     const uint32_t tid = threadIdx.x;
@@ -12242,6 +12620,21 @@ __global__ static void qwen4exp_qsa_prep_joint_kernel(
         uint32_t n_tokens,uint32_t n_head,uint32_t n_head_kv,uint32_t head_dim,
         uint32_t rot_dim,uint32_t pos0,uint32_t cache_cap,
         float eps,float q_offset,float k_offset,const uint32_t *d_pos){
+    /* PDL producer for the joint state projection that follows on the
+     * stream.  That projection already loads its first weight word, then
+     * fences, then reads its activation, so the early window it asks for was
+     * complete except that nothing upstream opened it.  This trigger sits
+     * above the head/token bound check below on purpose: a block that took
+     * that early return would never trigger and the dependent would never
+     * launch.  The deadlock rule in ds4_cuda_qwen4exp.cuh asks for a single
+     * wave, and the gate states that condition directly on the grid rather
+     * than on the row argument, which cannot then be fooled by a launch that
+     * rounds its y extent up: at the decode widths the grid is twenty-six by
+     * two, fifty-two blocks of two hundred and fifty-six threads at thirty-two
+     * registers and a kilobyte of shared memory, which this device holds eight
+     * deep on each of its forty-eight multiprocessors.  Prefill, whose y extent
+     * is the whole window, never fires. */
+    if (gridDim.x * gridDim.y * gridDim.z <= 96u) QWEN4EXP_PDL_TRIGGER();
     extern __shared__ float shared[];
     const uint32_t token=blockIdx.y,tid=threadIdx.x,nth=blockDim.x;
     /* Part 3 is Part 0 without the gate store, for a caller that reads the
@@ -14124,6 +14517,16 @@ __global__ static void qwen4exp_qsa_output_gate_doubled_quant_kernel(
         const float *doubled,
         const float *out,
         uint32_t     n_values) {
+    /* PDL producer for the state-out projection that follows on the stream.
+     * In the twelve attention layers this kernel, not the gated-deltanet
+     * quantizer, is the projection's stream predecessor, and it carried no
+     * trigger, so those layers kept the serialized edge the other thirty-six
+     * no longer pay.  Grid is n_values over two hundred and fifty-six, which
+     * is forty-eight blocks at the decode widths -- one per multiprocessor,
+     * and this kernel holds eight deep at eighteen registers, so the single-
+     * wave condition has a wide margin.  The gate reads gridDim, which is
+     * uniform across the grid, and excludes every prefill width. */
+    if (gridDim.x <= 48u) QWEN4EXP_PDL_TRIGGER();
     const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
