@@ -1143,6 +1143,16 @@ static void *qw_ple_gather_worker(void *arg) {
         for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
             const uint64_t row =
                 seg->s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h];
+            /* The dependent load is the next row's mapped bytes; ask for
+             * them one head early.  This worker's ids stop at its own token,
+             * so the hint stays inside the row it just wrote. */
+            if (h + 1u < DS4_N_PLE_HEAD) {
+                const uint64_t nrow =
+                    seg->s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h + 1u];
+                if (nrow < seg->ple->rows)
+                    __builtin_prefetch(
+                        seg->ple->base + nrow * seg->ple->row_bytes, 0, 1);
+            }
             const uint8_t *quant = ds4_qwen4exp_ple_row(seg->ple, row);
             if (!quant) { seg->ok = 0; return NULL; }
             ds4_ple_dequant_iq4_nl(
@@ -1313,10 +1323,18 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
             float *dst = s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD;
             for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
                 const uint64_t row = ids[h];
-                /* Every head of this token except the last is followed by
-                 * another table row, so ask for the next id early.  Hint. */
-                if (h + 1u < DS4_N_PLE_HEAD)
-                    __builtin_prefetch(ids + h + 1u, 0, 1);
+                /* The dependent load is the next row's mapped bytes, not
+                 * the next id -- the id array is already hot.  Ask for the
+                 * row one head early, across the token boundary too: every
+                 * id of this call is already written.  Hint; an out-of-range
+                 * id prefetches nothing and the check below still refuses. */
+                const uint32_t ni = h + 1u;
+                const uint64_t nrow = ni < DS4_N_PLE_HEAD
+                    ? ids[ni]
+                    : (t + 1u < n_tokens ? ids[DS4_N_PLE_HEAD] : UINT64_MAX);
+                if (nrow < w->ple.rows)
+                    __builtin_prefetch(w->ple.base + nrow * w->ple.row_bytes,
+                                       0, 1);
                 const uint8_t *quant = ds4_qwen4exp_ple_row(&w->ple, row);
                 /* Cold: a hashed row past the table is a hard refusal that has
                  * never fired in a scored run, so keep it out of the hot path. */
@@ -1371,6 +1389,15 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
                     const uint64_t row =
                         s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h];
+                    /* Same hint as the speculative loop: the next row's
+                     * mapped bytes are the dependent load, so ask for them
+                     * one head early, across the token boundary too. */
+                    const uint64_t ni2 = (uint64_t)t * DS4_N_PLE_HEAD + h + 1u;
+                    const uint64_t nrow = ni2 < (uint64_t)n_tokens * DS4_N_PLE_HEAD
+                        ? s->ple_ids[ni2] : UINT64_MAX;
+                    if (nrow < w->ple.rows)
+                        __builtin_prefetch(
+                            w->ple.base + nrow * w->ple.row_bytes, 0, 1);
                     const uint8_t *quant = ds4_qwen4exp_ple_row(&w->ple, row);
                     if (!quant) {
                         fprintf(stderr,
