@@ -1095,6 +1095,22 @@ void ds4_qwen4exp_session_reset(ds4_qwen4exp_session *s) {
  * knob); a positive value pins the thread count.  Unset, the gather takes
  * the online CPUs capped at 16 -- enough to keep the SSD queue deep without
  * starving the decode path's own helpers. */
+/* Ask for both cache lines of one n-gram table row.  The gather reads
+ * sixteen scattered 90-byte rows per token straight out of the shard
+ * mapping, and each row's first touch is a DRAM miss that serializes
+ * behind the previous head's dequant.  Hinting the next row while the
+ * current one dequantizes overlaps the miss with the work.  A hashed id
+ * past the table maps to NULL and is skipped -- the real read still
+ * refuses by name.  Hint only: no value this module returns changes. */
+static inline void qw_ple_prefetch_row(const ds4_qwen4exp_ple_table *ple,
+                                       uint64_t row) {
+    const uint8_t *p = ds4_qwen4exp_ple_row(ple, row);
+    if (p) {
+        __builtin_prefetch(p, 0, 1);
+        __builtin_prefetch(p + 64, 0, 1);
+    }
+}
+
 typedef struct {
     const ds4_qwen4exp_ple_table *ple;
     const ds4_qwen4exp_session   *s;
@@ -1135,9 +1151,13 @@ static void *qw_ple_gather_worker(void *arg) {
     for (uint32_t t = seg->t0; t < seg->t1; t++) {
         ds4_ple_row_ids(&seg->s->ple_constants, &local, seg->tokens + t, 1u,
                         seg->s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD);
+        const uint64_t *ids = seg->s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD;
         for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
-            const uint64_t row =
-                seg->s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h];
+            const uint64_t row = ids[h];
+            /* The next head's row is a scattered read out of the shard
+             * mapping; hint it while this one dequantizes. */
+            if (h + 1u < DS4_N_PLE_HEAD)
+                qw_ple_prefetch_row(seg->ple, ids[h + 1u]);
             const uint8_t *quant = ds4_qwen4exp_ple_row(seg->ple, row);
             if (!quant) { seg->ok = 0; return NULL; }
             ds4_ple_dequant_iq4_nl(
@@ -1308,10 +1328,17 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
             float *dst = s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD;
             for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
                 const uint64_t row = ids[h];
-                /* Every head of this token except the last is followed by
-                 * another table row, so ask for the next id early.  Hint. */
-                if (h + 1u < DS4_N_PLE_HEAD)
-                    __builtin_prefetch(ids + h + 1u, 0, 1);
+                /* The next table row is a scattered read out of the shard
+                 * mapping; hint it while this one dequantizes.  At the last
+                 * head the next row belongs to the next token, whose ids
+                 * are already computed. */
+                const uint64_t next =
+                    (h + 1u < DS4_N_PLE_HEAD) ? ids[h + 1u]
+                    : (t + 1u < n_tokens)
+                        ? s->ple_ids[(uint64_t)(t + 1u) * DS4_N_PLE_HEAD]
+                        : UINT64_MAX;
+                if (next != UINT64_MAX)
+                    qw_ple_prefetch_row(&w->ple, next);
                 const uint8_t *quant = ds4_qwen4exp_ple_row(&w->ple, row);
                 /* Cold: a hashed row past the table is a hard refusal that has
                  * never fired in a scored run, so keep it out of the hot path. */
@@ -1363,9 +1390,19 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
             ds4_ple_row_ids(&s->ple_constants, &s->ple_history, tokens,
                             n_tokens, s->ple_ids);
             for (uint32_t t = 0; t < n_tokens; t++) {
+                const uint64_t *ids = s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD;
                 for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
-                    const uint64_t row =
-                        s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h];
+                    const uint64_t row = ids[h];
+                    /* Same scattered-read hint as the armed path: the next
+                     * row's lines are asked for while this one dequantizes,
+                     * across the token boundary too. */
+                    const uint64_t next =
+                        (h + 1u < DS4_N_PLE_HEAD) ? ids[h + 1u]
+                        : (t + 1u < n_tokens)
+                            ? s->ple_ids[(uint64_t)(t + 1u) * DS4_N_PLE_HEAD]
+                            : UINT64_MAX;
+                    if (next != UINT64_MAX)
+                        qw_ple_prefetch_row(&w->ple, next);
                     const uint8_t *quant = ds4_qwen4exp_ple_row(&w->ple, row);
                     if (!quant) {
                         fprintf(stderr,
