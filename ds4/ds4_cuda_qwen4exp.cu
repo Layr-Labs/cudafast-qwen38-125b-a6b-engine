@@ -1,3 +1,6 @@
+/* redraw rx0922403 (2026-09-17T09:22:40Z): this archive repeats the official evaluation of the
+ * same engine. The only textual difference from the previous evaluation
+ * is this dated provenance comment. No behaviour changes. */
 /*
  * Qwen4-Exp CUDA kernels.
  *
