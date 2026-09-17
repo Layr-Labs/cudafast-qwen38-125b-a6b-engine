@@ -4991,8 +4991,12 @@ template <int GateType = -1, int UpType = -1, bool PairTasks = false,
  *
  * MEASURED, and the __launch_bounds__ below does not do that job.  The probe
  * (ds4_gpu_qwen4exp_kernel_limits) read this kernel for the first time in
- * submission `20812211` and reported, for the shipped arm
- * QW_GATEUP_DMA_ARM = 5, `mm[reg=167 smem=24288 lmem=0 occ=3]`.  The register
+ * submission `20812211` and reported, for the arm shipped at the time,
+ * QW_GATEUP_DMA_ARM = 5, `mm[reg=167 smem=24288 lmem=0 occ=3]`.  (The arm is 6
+ * now.  That reading still applies: 6 and 5 differ only in QW_DMA_SWZ, a
+ * relabelling of shared slots, which changes no register or shared-memory
+ * figure.  See the QW_DMA_SWZ comment for why the predicate is `>= 5`.)
+ * The register
  * figure is exactly the 167 above, so the comment was right about that -- but
  * Dma >= 2 resolves the bound to (128, 3), whose implied ceiling is
  * 65,536 / (128 * 3) = 170, and 167 <= 170.  THE BOUND IS A NO-OP HERE: ptxas
@@ -5104,8 +5108,33 @@ qwen4exp_moe_gateup_mma_kernel(
             * needs stride == 2 mod 4) but 2-way conflicting for the staging
             * STORE (which needs an odd stride) -- no linear map serves both.
             * XOR-ing the unit index with bit 2 of the piece index fixes the
-            * store and provably leaves the read conflict-free. */
-           QW_DMA_SWZ = (Dma == 5) ? 1 : 0,
+            * store and provably leaves the read conflict-free.
+            *
+            * THE PREDICATE IS `>= 5`, NOT `== 5`, AND THAT IS THE FIX.  It
+            * used to read `Dma == 5` while QW_GATEUP_DMA_ARM was 5, so the
+            * swizzle was live.  The arm was then bumped to 6 with no `Dma == 6`
+            * case added anywhere, and 6 falls through every test in this enum
+            * exactly as 3 does: J = 8, PER = 2, ASYNC = 1, HDR = 0 -- and
+            * SWZ = 0.  So the bump silently reinstated the 2-way staging-store
+            * conflict this line exists to remove, which is the one and only
+            * behavioural difference between arm 5 and arm 6.  An equality test
+            * on a number that is incremented when a new arm is added is a trap:
+            * it turns "add an arm" into "drop every feature keyed to the old
+            * number".  Every rung at or above 5 carries the swizzle now, so the
+            * next bump cannot drop it again.
+            *
+            * Bit-exact by construction: the slot map is the SINGLE source of
+            * truth for this buffer.  All five sRaw accesses go through
+            * qw_dma_slot -- the cp.async destination and the synchronous store
+            * take their slot from qw_dma_src, which calls it, and the three
+            * tile reads call it directly -- so relabelling slots moves bytes
+            * to different shared addresses and hands the same bytes back.  The
+            * relabelling is injective: the XOR flips only bit 0, so
+            * (u ^ b) stays inside [0, 64), and j * 66 + [0, 64) are disjoint
+            * intervals because 66 >= 64.  Max slot 7 * 66 + 63 = 525, inside
+            * QW_DMA_SLOTS = 526.  Nothing about the dequant, the tile stores,
+            * the MMA sequence, the epilogue or the accumulation order moves. */
+           QW_DMA_SWZ = (Dma >= 5) ? 1 : 0,
            QW_DMA_HDR = (Dma == 4) ? 1 : 0,
            QW_DMA_NF = 64 * QW_DMA_J / (int)QW_MMA_THREADS,
            QW_DMA_SLOTS = Dma ? ((QW_DMA_J - 1) * (int)QW_DMA_US + 64) : 1 };
@@ -6206,11 +6235,50 @@ qwen4exp_moe_gateup_split_kernel(
         const char *const ub = up +
             (uint64_t)expert * up_expert_bytes +
             (uint64_t)row0 * up_row_bytes;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+        /* THE FILL'S DEPTH.  The rolled form kept below emits an LDG.E.128 and
+         * then immediately its dependent STS.128, twice per trip, so a thread
+         * holds exactly one sixteen-byte request in flight and pays this panel
+         * as two to four serialized round trips (words = 360 u4 over 256
+         * threads).  Occupancy cannot cover that: the fill is a PROLOGUE, so
+         * every resident warp is inside it at the same instant and the warps
+         * that would hide the latency are all blocked on the same latency.
+         *
+         * cp.async issues global->shared without routing the bytes through a
+         * register, which is what makes the depth available under this kernel's
+         * QW_GU_MAXNREG cap -- the register-hoist form of the same fix holds
+         * every piece live and is exactly what that cap forbids.
+         *
+         * .ca not .cg, and NOT my choice: the helper's own comment records a
+         * measured 161.5 vs 133.8 GB/s on this file's other fetch map, because
+         * .cg bypasses L1 and a q4_K super-block's 128-byte payload line is
+         * touched twice.  Reusing the shipped helper keeps that finding.
+         *
+         * The bytes are unchanged: same addresses, same verbatim image, each
+         * thread's own ascending order, waited to completion before the same
+         * __syncthreads() that published the panel before.  No PDL fence is
+         * involved -- QWEN4EXP_PDL_SYNC() is above this block -- so the fence
+         * ordering rule is not in play here.  Alignment adds no precondition:
+         * cp.async.ca needs exactly the 16-byte alignment the uint4 load it
+         * replaces already needed, and the host gates this arm on
+         * ((uintptr_t)gate & 15) == 0, the same for up, and expert_bytes % 16.
+         * Every i is u4-granular so there is no partial tail to handle. */
+        for (uint32_t i = threadIdx.x; i < words; i += blockDim.x) {
+            qw_cpasync16((uint32_t)__cvta_generic_to_shared(&wcoop[i]),
+                         (const void *)(gb + (uint64_t)i * 16u));
+            qw_cpasync16(
+                (uint32_t)__cvta_generic_to_shared(&wcoop[QW_GU_COOP_U4 + i]),
+                (const void *)(ub + (uint64_t)i * 16u));
+        }
+        qw_cpasync_commit();
+        qw_cpasync_wait0();
+#else
         for (uint32_t i = threadIdx.x; i < words; i += blockDim.x) {
             wcoop[i] = *(const uint4 *)(const void *)(gb + (uint64_t)i * 16u);
             wcoop[QW_GU_COOP_U4 + i] =
                 *(const uint4 *)(const void *)(ub + (uint64_t)i * 16u);
         }
+#endif
         __syncthreads();
         wsh = wcoop + (second ? QW_GU_COOP_U4 : 0u);
         wrow = warp >> 1u;
@@ -15429,7 +15497,31 @@ static uint32_t qwen4exp_qsa_split_width(uint32_t n_tokens, uint32_t n_head,
         const long v = strtol(forced, NULL, 10);
         return (v > 0 && v <= 32) ? (uint32_t)v : 0u;
     }
-    /* One model-shaped row benefits from twice as many independent head
+    /* A model-shaped one-row draft takes three, for the two-row argument
+     * below applied to the shape it did not cover.  Both kernels here are
+     * __launch_bounds__(256, 1), so the wave count is the live block count
+     * over the 48 SMs, and the live block count is (n_head / g) * tiles *
+     * n_tokens with tiles retired by `base >= count`: at this context count
+     * is the KV length, 1024 prompt rows plus at most 128 generated, so
+     * five tiles of 256.  One row therefore launches (24/g) * 5:
+     *
+     *     g   live   waves   heads a block   waves * work
+     *     2     60     2           2            1.00
+     *     3     40     1           3            0.75
+     *     4     30     1           4            1.00
+     *     6     20     1           6            1.50
+     *
+     * The shipped two is on the same second-partial-wave cliff the two-row
+     * call was, and three is the smallest width that clears it, so it is the
+     * unique minimum at one row exactly as six is at two.  The same rule
+     * reproduces the measured two-row choice: the smallest g dividing gqa
+     * whose live blocks fit one wave.  Each K row is also requested eight
+     * times from L2 instead of twelve.  Bit-exact for the reason the group
+     * note gives: GROUP only sets head0 and the per-head trip count, every
+     * head keeps its own `contrib` accumulated j ascending, and 12 % 3 == 0
+     * so a group never straddles a kv_head.
+     *
+     * One model-shaped row benefits from twice as many independent head
      * groups.  A model-shaped two-row verify takes six.  Its scores kernel
      * holds 138 registers, one block per SM, and at four heads the sixty
      * live blocks a call below the indexer budget launches need a second
@@ -15442,7 +15534,7 @@ static uint32_t qwen4exp_qsa_split_width(uint32_t n_tokens, uint32_t n_head,
      * they must be.  Other multi-row calls retain four heads and their
      * K/V reuse. */
     if (n_head == 24u && n_kv_head == 2u && head_dim == 256u) {
-        if (n_tokens == 1u) return 2u;
+        if (n_tokens == 1u) return 3u;
         if (n_tokens == 2u) return 6u;
     }
     return 4u;
@@ -15509,7 +15601,20 @@ static int qwen4exp_qsa_attention_split(
         case 12u: QWEN4EXP_QSA_SPLIT_LAUNCH(12u, QWEN4EXP_QSA_SPLIT_VSTEP); break;
         case 6u:  QWEN4EXP_QSA_SPLIT_LAUNCH(6u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
         case 4u:  QWEN4EXP_QSA_SPLIT_LAUNCH(4u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
-        case 3u:  QWEN4EXP_QSA_SPLIT_LAUNCH(3u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
+        case 3u:
+            /* The one-row model shape keeps the shallower dense V prefetch it
+             * was measured with at two heads, so the width is the only thing
+             * this draw changes.  VSTEP only batches the loads; the products
+             * still land j ascending into one accumulator a head, so the
+             * depth is bit-exact at either value. */
+            if (!sparse && n_tokens == 1u && n_head == 24u &&
+                n_kv_head == 2u && head_dim == 256u &&
+                getenv("DS4_QWEN4EXP_NO_QSA_SHORT_V") == NULL) {
+                QWEN4EXP_QSA_SPLIT_LAUNCH(3u, 8u);
+            } else {
+                QWEN4EXP_QSA_SPLIT_LAUNCH(3u, QWEN4EXP_QSA_SPLIT_VSTEP);
+            }
+            break;
         case 2u:
             /* Preserve the ordered products; only reduce dense V prefetch
              * depth for the measured one-row model shape. */
@@ -16164,8 +16269,9 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
      * The specific question.  The gate/up tile carries, in its own words, "the
      * DMA arms need the occupancy pinned: without a minimum ptxas takes 167
      * registers (3 CTAs/SM) and throws away the whole point of the 64 B arm,
-     * which is that its staging buffer still fits four."  The shipped arm is
-     * QW_GATEUP_DMA_ARM = 5, which resolves that kernel's
+     * which is that its staging buffer still fits four."  The shipped arm was
+     * QW_GATEUP_DMA_ARM = 5 when this was written and is 6 now; both resolve
+     * that kernel's
      * __launch_bounds__(QW_MMA_THREADS, Dma >= 2 ? 3 : ...) to (128, 3) -- an
      * implied register ceiling of 65,536 / (128 * 3) = 170.  167 <= 170, so THE
      * BOUND IS A NO-OP on the shipped arm: ptxas would take 167 either way, and

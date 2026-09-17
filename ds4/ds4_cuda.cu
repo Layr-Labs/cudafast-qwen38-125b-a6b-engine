@@ -17876,6 +17876,36 @@ static int cuda_q8_mma_pipe_try(float *out, const unsigned char *w,
     if (out_dim > 384u && out_dim <= 1024u) {
         return cuda_q8_mma_pipe_launch<2, 4, 4, 4, 4, 2>(out, w, xq, xscale, out_dim, n_rows, blocks);
     }
+    /* STAGES stays 2 on this rung.  A third stage was drawn twice and both
+     * draws read prefill down against a same-box, same-calibration baseline:
+     *
+     *   af3ec6b9  +0.192% decode  -0.288% prefill
+     *   9ea57be6  +0.052% decode  -0.300% prefill   (bundled with two fills)
+     *
+     * I previously wrote here that this makes depth "measured NEGATIVE", on
+     * two supports.  BOTH SUPPORTS HAVE SINCE FAILED, so read the numbers
+     * above as unattributed, not as a verdict on this rung:
+     *
+     *  1. I claimed the readout `mm[reg=]` moving 127 -> 128 fingerprinted the
+     *     rung as live.  It does not.  Trees carrying no third stage at all
+     *     read 128 (01eac02c, a0cb35e5, and every comment-only clone of
+     *     93890c6), and the 128 -> 127 step on promoted main happens at
+     *     58dc5bf, a router/group fusion that has nothing to do with this
+     *     pipe.  A +-1 register on one kernel tracks incidental code motion in
+     *     the same translation unit; it is not an arm fingerprint.
+     *  2. I claimed the -0.29% replicated.  b8a71a4f then drew this same tree
+     *     with the third stage REMOVED, on the same box and calibration as
+     *     9ea57be6, and prefill read -0.622% against that baseline -- twice
+     *     as far down with the rung gone.  The three same-box readings fall
+     *     monotonically with wall-clock (19:11, 22:28, 22:42), which is the
+     *     drift signature, not an effect of this code.
+     *
+     * A same-box, same-calibration pair is NOT a controlled contrast unless
+     * the two draws are close in time.  Four comment-only clones of 93890c6
+     * on one box span 1.0% of composite across three hours and rise
+     * monotonically.  Depth on this rung is therefore UNPROVEN in both
+     * directions; it stays off because it costs 30,720 B of shared memory for
+     * no residency gain (1 CTA/SM either way), not because it measured bad. */
     return cuda_q8_mma_pipe_launch<2, 2, 4, 4, 4, 2>(out, w, xq, xscale, out_dim, n_rows, blocks);
 }
 
@@ -19973,6 +20003,41 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
         const uint64_t panel_bytes = (uint64_t)(B/64u) * blocks * 34u;
         const char *const gp = (const char *)w + (uint64_t)block * panel_bytes;
         if (((uintptr_t)gp & 15u) == 0u) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+            /* THE FILL'S DEPTH.  The rolled form kept below emits one LDG.E.128
+             * and then immediately its dependent STS.128, so a thread holds
+             * exactly one sixteen-byte request in flight and pays this panel's
+             * three trips as three serialized round trips.  Occupancy cannot
+             * cover that: the fill is the first thing a block does, so every
+             * resident warp is inside it at the same instant and the warps that
+             * would hide the latency are all waiting on the same latency.  That
+             * is why residency arguments about this kernel (~48 warps/SM) do not
+             * settle it either way.
+             *
+             * cp.async issues global->shared without routing the bytes through a
+             * register, so the depth costs nothing against this kernel's hard
+             * __maxnreg__(40) -- the register-hoist form of this same fix, which
+             * holds three uint4 live, is exactly what that cap forbids here.
+             *
+             * The bytes are unchanged: same addresses, same verbatim image, each
+             * thread's own ascending order, and waited to completion BEFORE the
+             * fence, precisely where the synchronous form completed.  The fence
+             * order below is untouched, so the -39 bip lesson (a staging barrier
+             * above the PDL fence) is not re-litigated, and no copy is left in
+             * flight across the grid dependency sync.  The scalar tail and the
+             * merely-word-aligned fallback are untouched. */
+            for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
+                 i += (uint64_t)B * 16u) {
+                if (i + 16u <= panel_bytes)
+                    tt_cp_async_16B(gpanel + i, (const void *)(gp + i), true);
+                else
+                    for (uint64_t j = i; j < panel_bytes; j++) gpanel[j] = gp[j];
+            }
+            tt_cp_async_commit();
+            tt_cp_async_wait_group<0>();
+#else
+            /* Pre-sm80 tt_cp_async_16B ZEROES the destination, so the
+             * synchronous fill is the only correct form there. */
             for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
                  i += (uint64_t)B * 16u) {
                 if (i + 16u <= panel_bytes)
@@ -19980,6 +20045,7 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
                 else
                     for (uint64_t j = i; j < panel_bytes; j++) gpanel[j] = gp[j];
             }
+#endif
         } else {
             for (uint64_t i = (uint64_t)threadIdx.x * 4u; i < panel_bytes;
                  i += (uint64_t)B * 4u) {
