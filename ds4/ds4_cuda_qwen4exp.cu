@@ -6564,6 +6564,14 @@ template <int R, int DownType = -1, bool Vector = false, bool Stage = false,
  * sixty-four checked steps. Work removed from the untimed phase does not
  * show up in the score.
  */
+/* This build's note auto09171959_1 records that the gated-deltanet path is
+ * twenty-seven percent of a decode step while moving a constant-size
+ * recurrent state of roughly three megabytes per layer, which at this box's
+ * bandwidth should take about eleven microseconds and takes about three
+ * hundred and ten. It is therefore latency and occupancy bound rather than
+ * bandwidth bound, where the routed expert path beside it runs at about
+ * eighty percent of peak.
+ */
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
