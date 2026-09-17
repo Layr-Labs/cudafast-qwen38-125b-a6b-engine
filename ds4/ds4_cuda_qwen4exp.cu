@@ -4026,7 +4026,7 @@ qwen4exp_moe_gateup_mma_kernel(
         int8_t *mq,
         float *ms,
         int32_t *msum,
-        const char *gate,
+        const char * __restrict__ gate,
         const char *up,
         const int8_t *xq,
         const float *xs,
