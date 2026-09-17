@@ -978,6 +978,7 @@ struct cuda_decode_graph_entry {
     cudaGraphExec_t      exec;
     int                  state;   /* 0 empty, 1 warmed, 2 ready, 3 dead */
     uint64_t             hits;
+    uint64_t             last_used;
 };
 
 static cuda_decode_graph_entry
@@ -987,6 +988,7 @@ static cudaStream_t g_decode_graph_stream = NULL;
 static int g_decode_graph_capturing = 0;
 static uint64_t g_decode_graph_replays = 0;
 static uint64_t g_decode_graph_captures = 0;
+static uint64_t g_decode_graph_access = 0;
 
 extern "C" int ds4_gpu_decode_graphs_supported(void) {
     static int init = 0;
@@ -1067,6 +1069,7 @@ extern "C" void ds4_gpu_decode_graphs_invalidate(void) {
                 }
                 e->state = 0;
                 e->hits = 0;
+                e->last_used = 0;
                 memset(&e->key, 0, sizeof(e->key));
             }
         }
@@ -1093,18 +1096,35 @@ static cuda_decode_graph_entry *cuda_decode_graph_find(
     if (key->il >= CUDA_DECODE_GRAPH_LAYERS ||
         key->island >= CUDA_DECODE_GRAPH_ISLANDS) return NULL;
     cuda_decode_graph_entry *slot = NULL;
+    cuda_decode_graph_entry *oldest = NULL;
     for (uint32_t v = 0; v < CUDA_DECODE_GRAPH_VARIANTS; v++) {
         cuda_decode_graph_entry *e = &g_decode_graphs[key->il][key->island][v];
         if (e->state != 0 &&
-            memcmp(&e->key, key, sizeof(*key)) == 0) return e;
+            memcmp(&e->key, key, sizeof(*key)) == 0) {
+            e->last_used = ++g_decode_graph_access;
+            return e;
+        }
         if (e->state == 0 && !slot) slot = e;
+        if (!oldest || e->last_used < oldest->last_used) oldest = e;
+    }
+    if (!slot && oldest) {
+        // Reclaim a stale identity instead of leaving every new shape eager.
+        // CUDA defers an executable graph's resources until its launches finish.
+        if (oldest->exec && cudaGraphExecDestroy(oldest->exec) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return NULL;
+        }
+        oldest->exec = NULL;
+        oldest->hits = 0;
+        slot = oldest;
     }
     if (slot) {
+        slot->last_used = ++g_decode_graph_access;
         memcpy(&slot->key, key, sizeof(*key));
         slot->state = 0;   /* caller advances the state machine */
         return slot;
     }
-    return NULL;           /* all variants busy with other keys: stay eager */
+    return NULL;           /* no reusable entry: preserve the eager fallback */
 }
 
 /* Upload a ready exec now rather than at its next launch.  Costs the caller
