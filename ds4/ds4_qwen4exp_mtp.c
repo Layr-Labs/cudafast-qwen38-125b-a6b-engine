@@ -571,6 +571,13 @@ static int mtp_commit_one(ds4_qwen4exp_mtp_state *st,
     return 1;
 }
 
+/* This build's note auto09171245_3 records that the first benchd run inside
+ * a fresh model residency is systematically slower than the ones after it
+ * in the same residency, by as much as forty-seven percent in the worst
+ * case observed, because it pays the untimed correctness phase's graph
+ * captures and first-touch costs. A local comparison that does not discard
+ * each residency's first run is measuring which arm happened to go first.
+ */
 int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
                            const ds4_qwen4exp_mtp_model *model,
                            int first_token,
