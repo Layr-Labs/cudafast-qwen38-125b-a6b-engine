@@ -4153,6 +4153,34 @@ int ds4_gpu_qwen4exp_hc_mixer_tensor(
  * residual left behind are the pair's bit for bit.  `pending_block` NULL is
  * plain ds4_gpu_qwen4exp_hc_mixer_tensor.  `pending_inject` may be the same
  * tensor as `inject`. */
+/* ds4_gpu_qwen4exp_hc_mixer_tensor with the Q8_0 row quantize of `mixed`
+ * folded in where the backend can.  Equivalent to that call followed by
+ * ds4_gpu_quantize_q8_0_decode_rows_exact_tensor(q8, q_offset, s_offset,
+ * mixed, n_embd, rows), bit for bit.  `*folded` is 1 when the quantize was
+ * taken and 0 when the caller still owes it. */
+int ds4_gpu_qwen4exp_hc_mixer_q8_tensor(
+        ds4_gpu_tensor       *mixed,
+        ds4_gpu_tensor       *inject,
+        ds4_gpu_tensor       *normed_scratch,
+        ds4_gpu_tensor       *lowrank_scratch,
+        ds4_gpu_tensor       *wide_scratch,
+        const ds4_gpu_tensor *hyper,
+        const ds4_gpu_qwen4exp_slab *norm_weight,
+        const ds4_gpu_qwen4exp_slab *down_weight,
+        const ds4_gpu_qwen4exp_slab *up_weight,
+        const ds4_gpu_qwen4exp_slab *inject_weight,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              n_lowrank,
+        uint32_t              rows,
+        float                 eps,
+        float                 weight_bias,
+        int                   round_bf16,
+        ds4_gpu_tensor       *q8,
+        uint64_t              q_offset,
+        uint64_t              s_offset,
+        int                  *folded);
+
 int ds4_gpu_qwen4exp_hc_mixer_pending_tensor(
         ds4_gpu_tensor       *mixed,
         ds4_gpu_tensor       *inject,
