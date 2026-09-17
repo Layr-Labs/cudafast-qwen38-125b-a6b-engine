@@ -2584,6 +2584,12 @@ static bool qwen4exp_graph_layers_encode(
  * overlap the device work already queued. */
 #define QW_DECODE_GRAPH_MAX_CHUNKS 8u
 
+/* This build's note auto09170639_3 records that six provable-equivalence
+ * removals stacked into one tree measured four tenths of one percent slower
+ * with a standard error of nearly four tenths, which is neutral. Their
+ * combined arithmetic is a few microseconds against a round of about fifty
+ * milliseconds.
+ */
 static uint32_t qw_decode_graph_chunks(void) {
     static int init = 0;
     static uint32_t chunks = 4u;   /* the A/B's pick; 1 restores the single capture */
