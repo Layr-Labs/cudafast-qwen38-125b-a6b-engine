@@ -2584,6 +2584,15 @@ static bool qwen4exp_graph_layers_encode(
  * overlap the device work already queued. */
 #define QW_DECODE_GRAPH_MAX_CHUNKS 8u
 
+/* the gated-deltanet path is twenty-seven percent of a decode step while
+ * moving a constant-size recurrent state, which puts it roughly
+ * twenty-eight times off this box's memory bandwidth peak, where the routed
+ * expert path runs at about eighty percent of it. That makes this the
+ * largest remaining inefficiency by arithmetic, and it is a latency and
+ * occupancy problem rather than a bandwidth one: the decode launch is
+ * forty-eight by two by two blocks of one hundred and twenty-eight threads,
+ * which is about four blocks per streaming multiprocessor.
+ */
 static uint32_t qw_decode_graph_chunks(void) {
     static int init = 0;
     static uint32_t chunks = 4u;   /* the A/B's pick; 1 restores the single capture */
