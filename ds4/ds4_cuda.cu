@@ -120,7 +120,6 @@ static int g_cuda_decode_score4;
 static int g_cuda_decode_score8;
 static int g_cuda_no_decode_value512;
 static int g_cuda_no_top1;
-static int g_cuda_end_stream_sync;
 static int g_cuda_no_setdevice_cache;
 static int g_cuda_exact_score_split_graph;
 static int g_cuda_exact_score_split_ldg;
@@ -270,7 +269,6 @@ static void cuda_decode_dispatch_env_refresh(void) {
     g_cuda_decode_score8 = getenv("DS4_CUDA_DECODE_SCORE8") != NULL;
     g_cuda_no_decode_value512 = getenv("DS4_CUDA_NO_DECODE_VALUE512") != NULL;
     g_cuda_no_top1 = getenv("DS4_CUDA_NO_TOP1") != NULL;
-    g_cuda_end_stream_sync = getenv("DS4_CUDA_END_STREAM_SYNC") != NULL;
     g_cuda_no_setdevice_cache = getenv("DS4_CUDA_NO_SETDEVICE_CACHE") != NULL;
     g_cuda_exact_score_split_graph =
         getenv("DS4_CUDA_EXACT_SCORE_SPLIT_GRAPH") != NULL;
@@ -4052,15 +4050,25 @@ extern "C" int ds4_gpu_pack_slot_rows_f32_tensor(
     return cuda_ok(cudaGetLastError(), "pack_slot_rows_f32 launch");
 }
 
-extern "C" int ds4_gpu_begin_commands(void) { return 1; }
-extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
-extern "C" int ds4_gpu_end_commands(void) {
-    if (g_cuda_end_stream_sync) {
-        return cuda_ok(cudaStreamSynchronize(0), "end commands stream");
+/* The command batch drains on the streams compute work can occupy: the
+ * legacy stream, which eager launches and the synchronous copies use, and
+ * the decode-graph stream, which island replays launch on.  The model
+ * prefetch, model upload and selected-expert upload streams are created
+ * cudaStreamNonBlocking and carry no consumer the host is about to read,
+ * so a device-wide synchronize here only waits on background traffic that
+ * is still in flight during the decode window. */
+static int ds4_cuda_compute_sync(const char *what) {
+    if (g_decode_graph_stream &&
+        !cuda_ok(cudaStreamSynchronize(g_decode_graph_stream), what)) {
+        return 0;
     }
-    return cuda_ok(cudaDeviceSynchronize(), "end commands");
+    return cuda_ok(cudaStreamSynchronize(0), what);
 }
-extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
+
+extern "C" int ds4_gpu_begin_commands(void) { return 1; }
+extern "C" int ds4_gpu_flush_commands(void) { return ds4_cuda_compute_sync("flush"); }
+extern "C" int ds4_gpu_end_commands(void) { return ds4_cuda_compute_sync("end commands"); }
+extern "C" int ds4_gpu_synchronize(void) { return ds4_cuda_compute_sync("synchronize"); }
 
 /* See ds4_gpu.h.  The owner of the mapping tells us it is going away, because
  * once it is unmapped its address proves nothing: the next GGUF can be handed
