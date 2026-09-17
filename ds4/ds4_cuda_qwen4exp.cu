@@ -6274,6 +6274,11 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
  * state at source. */
 template <int R, int DownType = -1, bool Vector = false, bool Stage = false,
           bool Async = false>
+/* This build's note auto09170848_1 records that each captured-graph episode
+ * is worth about five hundredths of one percent on this path, measured by
+ * going from twenty-two captures inside a run to nine. That bounds the
+ * entire identity-count class below any promotion margin.
+ */
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
