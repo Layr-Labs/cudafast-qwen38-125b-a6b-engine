@@ -278,6 +278,17 @@ static bool qwen4exp_ple_read_constants(const ds4_model            *m,
     out->row_total = w->ple.covered_rows;
     return true;
 }
+/* Dequantized PLE row cache.  A table row's dequantized form is a pure
+ * function of its row id -- the table is immutable for the session -- so a
+ * hit replays bytes that are provably identical to what the gather would
+ * produce.  The cache is keyed on the row id alone, never on request input,
+ * and lives for the session: a row gathered for one token is reused whenever
+ * the same n-gram context recurs, which includes the committed token's rows
+ * reappearing as the next round's fed slot.  Direct-mapped, 8192 slots:
+ * ~1.1 MiB at the 32-float row width, small enough to stay cache-resident
+ * next to the gather loop. */
+#define DS4_QWEN4EXP_PLE_ROW_CACHE_N 8192u
+
 
 struct ds4_qwen4exp_session {
     ds4_qwen4exp_session_plan plan;
@@ -327,6 +338,8 @@ struct ds4_qwen4exp_session {
     ds4_ple_constants ple_constants;
     bool              ple_ready;      /* the hash constants were readable */
     uint64_t         *ple_ids;        /* host [n_batch][head_count]       */
+    uint64_t         *ple_row_cache_keys;   /* [CACHE_N], row+1 or 0      */
+    float            *ple_row_cache_vals;   /* [CACHE_N][row_dim]         */
     float            *ple_rows_host;  /* host [n_batch][ple_embd]         */
     ds4_gpu_tensor   *ple_conv_state; /* [state_rows][n_hc * n_embd]      */
     ds4_gpu_tensor   *ple_rows;       /* [n_batch][ple_embd]              */
@@ -765,7 +778,12 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
         if (ok) {
             s->ple_ids = calloc((size_t)B * DS4_N_PLE_HEAD, sizeof(uint64_t));
             s->ple_rows_host = calloc((size_t)B * DS4_N_PLE_EMBD, sizeof(float));
-            ok = s->ple_ids != NULL && s->ple_rows_host != NULL;
+            s->ple_row_cache_keys = calloc(DS4_QWEN4EXP_PLE_ROW_CACHE_N,
+                                           sizeof(uint64_t));
+            s->ple_row_cache_vals = malloc((size_t)DS4_QWEN4EXP_PLE_ROW_CACHE_N *
+                                           DS4_N_PLE_ROW_DIM * sizeof(float));
+            ok = s->ple_ids != NULL && s->ple_rows_host != NULL &&
+                 s->ple_row_cache_keys != NULL && s->ple_row_cache_vals != NULL;
         }
         if (ok) {
             s->ple_ready = qwen4exp_ple_read_constants(m, w, &s->ple_constants);
@@ -889,6 +907,8 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->ple_value);
     free(s->ple_ids);
     free(s->ple_rows_host);
+    free(s->ple_row_cache_keys);
+    free(s->ple_row_cache_vals);
     ds4_gpu_tensor_free(s->d_pos);
     ds4_gpu_tensor_free(s->d_adopt);
     ds4_gpu_tensor_free(s->d_gdn_replay);
@@ -1312,6 +1332,23 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                  * another table row, so ask for the next id early.  Hint. */
                 if (h + 1u < DS4_N_PLE_HEAD)
                     __builtin_prefetch(ids + h + 1u, 0, 1);
+                /* A row's dequantized form is a pure function of its id, so
+                 * a cache hit replays exactly the bytes the gather below
+                 * would write -- the table is immutable for the session.
+                 * The committed token's rows reappear as the next round's
+                 * fed slot, so the cache hits at least once per round even
+                 * before contextual n-gram repeats. */
+                const uint64_t cix =
+                    (row * 0x9E3779B97F4A7C15ull) &
+                    (DS4_QWEN4EXP_PLE_ROW_CACHE_N - 1u);
+                if (s->ple_row_cache_keys[cix] == row + 1u) {
+                    memcpy(dst,
+                           s->ple_row_cache_vals +
+                               (size_t)cix * DS4_N_PLE_ROW_DIM,
+                           DS4_N_PLE_ROW_DIM * sizeof(float));
+                    dst += DS4_N_PLE_ROW_DIM;
+                    continue;
+                }
                 const uint8_t *quant = ds4_qwen4exp_ple_row(&w->ple, row);
                 /* Cold: a hashed row past the table is a hard refusal that has
                  * never fired in a scored run, so keep it out of the hot path. */
@@ -1323,6 +1360,9 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                     return false;
                 }
                 ds4_ple_dequant_iq4_nl(quant, blocks_per_row, dst);
+                memcpy(s->ple_row_cache_vals + (size_t)cix * DS4_N_PLE_ROW_DIM,
+                       dst, DS4_N_PLE_ROW_DIM * sizeof(float));
+                s->ple_row_cache_keys[cix] = row + 1u;
                 dst += DS4_N_PLE_ROW_DIM;
             }
         }
@@ -2898,36 +2938,6 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         DS4_QWEN4EXP_MTP_MAX_COMMIT, s->adopt_state, s->adopt_conv);
     if (replay_step.settle) {
         const uint32_t rs = s->adopt_state, rc = s->adopt_conv;
-        /* ONE BATCH, ONE SYNCHRONIZE, when both halves settle the same row.
-         *
-         * qwen4exp_session_copy_layers() opens its own command batch and ends
-         * it with ds4_gpu_end_commands() + ds4_gpu_synchronize(), so calling it
-         * twice -- once for the recurrent state and once for the convolution --
-         * drains the stream TWICE for one rollback.  The two passes copy
-         * disjoint buffers (gdn_state[il] from the state snapshot,
-         * gdn_conv[il] from the conv snapshot) and neither reads what the other
-         * writes, so nothing orders one before the other and the split buys
-         * nothing.
-         *
-         * The common case is exactly the mergeable one: the plan forces a
-         * settle whenever `recurrent != conv`, so on the path that survives to
-         * here with both non-zero they are equal, and one call with both flags
-         * does the same work per layer in one batch behind one drain.
-         *
-         * BIT-IDENTICAL: the same rows are copied out of the same snapshots
-         * into the same destinations, and the per-layer loop inside
-         * copy_layers already handles both flags together -- the only thing
-         * that changes is that the conv copies join the batch the state copies
-         * were already in.  The unequal and single-sided cases keep the
-         * original two-call form below. */
-        if (rs != 0u && rs == rc) {
-            if (!qwen4exp_session_copy_layers(s, rs - 1u, true, true)) {
-                fprintf(stderr, "ds4: qwen4exp GDN rollback could not settle\n");
-                return false;
-            }
-            s->adopt_state = 0u;
-            s->adopt_conv = 0u;
-        } else
         if ((rs != 0u && !qwen4exp_session_copy_layers(s, rs - 1u, true, false)) ||
             (rc != 0u && !qwen4exp_session_copy_layers(s, rc - 1u, false, true))) {
             fprintf(stderr, "ds4: qwen4exp GDN rollback could not settle\n");
