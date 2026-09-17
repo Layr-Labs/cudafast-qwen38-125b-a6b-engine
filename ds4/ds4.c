@@ -76022,6 +76022,19 @@ static int qwen4exp_seam_verify_rows(void *ctx, const int *tokens, uint32_t n,
     int32_t buf[DS4_QWEN4EXP_MTP_MAX_COMMIT];
     if (n > (uint32_t)(sizeof(buf) / sizeof(buf[0]))) return -1;
     for (uint32_t i = 0; i < n; i++) buf[i] = (int32_t)tokens[i];
+    /* The draft seeds only rows the head cache does not already hold: rows
+     * [min(head_rows, pos0 + n - 1), pos0 + n) of this verify.  Rows below
+     * that are verified but never read back, so tell the graph where the
+     * consumed range starts.  `head_rows` is the pre-round count; the
+     * chain's own truncate can only lower the first row it needs, and the
+     * clamp keeps this a lower bound of it. */
+    {
+        const uint32_t hr = s->qwen4exp_spec.head_rows;
+        e->qwen4exp_session->verify_hyper_first =
+            (hr > pos0 && n > 1u)
+                ? (hr - pos0 < n - 1u ? hr - pos0 : n - 1u)
+                : 0u;
+    }
     return ds4_qwen4exp_graph_verify_rows(e->qwen4exp_session,
                                           e->qwen4exp_weights, &e->model,
                                           buf, n, hc_rows, row_logits,
@@ -76035,6 +76048,13 @@ static int qwen4exp_seam_verify_rows_top1(void *ctx, const int *tokens,
     ds4_engine *e = s->engine;
     const uint32_t at = ds4_qwen4exp_session_pos(e->qwen4exp_session);
     if (at != pos0 || n > (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT) return -1;
+    {
+        const uint32_t hr = s->qwen4exp_spec.head_rows;
+        e->qwen4exp_session->verify_hyper_first =
+            (hr > pos0 && n > 1u)
+                ? (hr - pos0 < n - 1u ? hr - pos0 : n - 1u)
+                : 0u;
+    }
     int32_t buf[DS4_QWEN4EXP_MTP_MAX_COMMIT];
     for (uint32_t i = 0; i < n; i++) buf[i] = (int32_t)tokens[i];
     return ds4_qwen4exp_graph_verify_top1_rows(
