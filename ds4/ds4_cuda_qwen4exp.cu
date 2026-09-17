@@ -14818,9 +14818,22 @@ static uint32_t qwen4exp_qsa_split_width(uint32_t n_tokens, uint32_t n_head,
         return (v > 0 && v <= 32) ? (uint32_t)v : 0u;
     }
     /* One model-shaped row benefits from twice as many independent head
-     * groups. Multi-row calls retain four heads and their K/V reuse. */
-    return n_tokens == 1u && n_head == 24u && n_kv_head == 2u && head_dim == 256u
-        ? 2u : 4u;
+     * groups.  A model-shaped two-row verify takes six.  Its scores kernel
+     * holds 138 registers, one block per SM, and at four heads the sixty
+     * live blocks a call below the indexer budget launches need a second
+     * partial wave on the 48 SMs; at six heads the forty fit in one wave,
+     * and each K row is requested four times from L2 instead of six.
+     * Measured on the split chain, scores plus probs plus fold, per layer:
+     * 33.5 to 30.0 us at position 1024, 35.3 to 31.0 at 1100, 36.8 to
+     * 34.5 at 1216, and level with four heads at 1800 and beyond; the
+     * output bytes identical at every position, as the group note says
+     * they must be.  Other multi-row calls retain four heads and their
+     * K/V reuse. */
+    if (n_head == 24u && n_kv_head == 2u && head_dim == 256u) {
+        if (n_tokens == 1u) return 2u;
+        if (n_tokens == 2u) return 6u;
+    }
+    return 4u;
 }
 
 /* The split path.  Returns 1 when it launched, 0 when the shape or the
