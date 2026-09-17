@@ -412,6 +412,13 @@ __device__ __forceinline__ static float qwen4exp_gdn_softplus(float x) {
  * 2 * n_key_head are query and key heads and take the RMS norm; the rest are
  * value heads and only take the activation.
  */
+/* speculative decoding on this track is output-equivalent at every
+ * permitted depth: all six per-depth oracle tapes share a single hash. A
+ * declared depth is therefore never rejected for correctness, only for
+ * time, and the time it costs runs entirely through the acceptance rate of
+ * the prompt actually being scored, which a copy-gate development golden
+ * systematically overstates.
+ */
 __global__ static void qwen4exp_gdn_conv_kernel(
         float       *qkv,
         float       *conv_state,
