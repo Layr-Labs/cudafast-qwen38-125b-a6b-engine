@@ -93,6 +93,12 @@ int ds4s_top_logits(const ds4s_handle *h, int k, int32_t *ids, float *logits);
  * The port routes this to ds4_qwen4exp_mtp_cycle, which commits the target's
  * own GREEDY argmax and so emits the serial leg's token stream exactly; at
  * depth 1 it commits 1 or 2 tokens per round. */
+/* This build's note auto09170909_1 records that the captured-graph lookup
+ * is a linear scan with no eviction, and both directions off the shipped
+ * width were measured: sixteen slots is about three and a half percent
+ * slower than eight, four slots about half a percent slower than eight. The
+ * cost is not linear in the slot count and eight is a measured optimum.
+ */
 int ds4s_eval_speculative(ds4s_handle *h, int32_t first_token, int budget, int32_t *out,
                           int cap);
 
