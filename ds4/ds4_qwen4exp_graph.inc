@@ -3099,6 +3099,15 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         fprintf(stderr, "ds4: qwen4exp final mixer failed\n");
         return qwen4exp_forward_fail();
     }
+    /* The compact verify reads the hyper rows back on the host.  Queue that
+     * copy now, on the staging stream: it is ordered after the final mixer by
+     * an event and runs while the LM head and the top-1 kernel below still
+     * execute, instead of serialising behind the full-device drain. */
+    if (s->spec_top1_rows != 0u) {
+        (void)ds4_gpu_d2h_stage_begin(
+            s->hyper, 0,
+            (uint64_t)n_tokens * DS4_N_HC * DS4_N_EMBD * sizeof(float));
+    }
     QW_TRACE(QW_SLICE_FINAL_MIX);
 
     /*
@@ -3704,9 +3713,16 @@ bool ds4_qwen4exp_graph_verify_top1_rows(ds4_qwen4exp_session       *s,
     s->spec_logit_rows = 0u;
     s->spec_top1_rows = 0u;
     if (!forward_ok) return false;
-    if (hc_rows && !ds4_qwen4exp_session_read_hyper(s, 0, n_tokens, hc_rows)) {
-        fprintf(stderr, "ds4: qwen4exp compact verify hyper read failed\n");
-        return false;
+    if (hc_rows) {
+        const uint64_t hyper_bytes =
+            (uint64_t)n_tokens * DS4_N_HC * DS4_N_EMBD * sizeof(float);
+        const void *stage = ds4_gpu_d2h_stage(hyper_bytes);
+        if (stage) {
+            memcpy(hc_rows, stage, (size_t)hyper_bytes);
+        } else if (!ds4_qwen4exp_session_read_hyper(s, 0, n_tokens, hc_rows)) {
+            fprintf(stderr, "ds4: qwen4exp compact verify hyper read failed\n");
+            return false;
+        }
     }
     return ds4_gpu_tensor_read(s->spec_top1, 0, row_top1,
                                (uint64_t)n_tokens * sizeof(int32_t)) != 0;
@@ -3720,6 +3736,15 @@ bool ds4_qwen4exp_graph_read_logit_row(ds4_qwen4exp_session *s,
         return false;
     }
     const uint64_t bytes = (uint64_t)cfg->n_vocab * sizeof(float);
+    /* The device is idle here, so the staged copy starts at once; the win is
+     * the pinned destination, which skips the driver's pageable staging. */
+    if (ds4_gpu_d2h_stage_begin(s->logits, (uint64_t)row * bytes, bytes)) {
+        const void *stage = ds4_gpu_d2h_stage(bytes);
+        if (stage) {
+            memcpy(logits, stage, (size_t)bytes);
+            return true;
+        }
+    }
     return ds4_gpu_tensor_read(s->logits, (uint64_t)row * bytes,
                                logits, bytes) != 0;
 }

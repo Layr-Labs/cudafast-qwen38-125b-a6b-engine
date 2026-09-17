@@ -53,6 +53,15 @@ void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
+/* Pinned staging for the per-round device-to-host readbacks.  _begin queues
+ * an async copy of `bytes` from `tensor`+`offset` into a pinned stage on a
+ * side stream, ordered after the work already queued on the compute stream,
+ * and returns 1 when the copy was queued (0 -> caller uses the synchronous
+ * read).  ds4_gpu_d2h_stage waits for the queued copy and returns the stage
+ * pointer, or NULL when nothing matching `bytes` is in flight. */
+int ds4_gpu_d2h_stage_begin(const ds4_gpu_tensor *tensor, uint64_t offset,
+                            uint64_t bytes);
+const void *ds4_gpu_d2h_stage(uint64_t bytes);
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
