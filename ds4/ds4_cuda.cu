@@ -17820,6 +17820,7 @@ static int cuda_q8_mma_pipe_launch(float *out, const unsigned char *w,
 
 static void cuda_q8_mma_pipe_prepare(void) {
     if (!cuda_q8_mma_available()) return;
+    (void)cuda_q8_mma_pipe_attr<2, 2, 4, 4, 4, 3>();
     (void)cuda_q8_mma_pipe_attr<2, 2, 4, 4, 4, 2>();
     (void)cuda_q8_mma_pipe_attr<2, 4, 4, 4, 4, 2>();
     (void)cuda_q8_mma_pipe_attr<2, 8, 4, 4, 4, 2>();
@@ -17875,6 +17876,54 @@ static int cuda_q8_mma_pipe_try(float *out, const unsigned char *w,
     }
     if (out_dim > 384u && out_dim <= 1024u) {
         return cuda_q8_mma_pipe_launch<2, 4, 4, 4, 4, 2>(out, w, xq, xscale, out_dim, n_rows, blocks);
+    }
+    /* THREE stages on the 128x64 rung, two everywhere else, because three is
+     * the deepest that fits here and it is free.
+     *
+     * STAGE_BYTES = A_BYTES + B_BYTES + AS_BYTES + WS_BYTES with BM = 128,
+     * A_STRIDE = B_STRIDE = 144, G = 4:
+     *
+     *   BN=64   18432 +  9216 + 2048 + 1024 = 30720  -> x2 61440   x3  92160
+     *   BN=128  18432 + 18432 + 2048 + 2048 = 40960  -> x2 81920   x3 122880
+     *   BN=256  18432 + 36864 + 2048 + 4096 = 61440  -> x2 122880
+     *
+     * cudaDevAttrMaxSharedMemoryPerBlockOptin measured 101376 on this box, so
+     * x3 fits ONLY at BN=64 -- 122880 is why the 256-wide rung above is an
+     * opt-in a device may refuse, and it is equally why BN=128 stays at two.
+     *
+     * It is free because it does not cost a CTA.  Shared per SM is 102400
+     * (four CTAs of the 24288-byte routed-MoE kernel fit and five do not), so
+     * 102400/61440 = 1 CTA per SM at two stages and 102400/92160 = 1 at
+     * three: the same single CTA either way.  THREADS is (CWARPS + PWARPS)*32
+     * = 8 warps, unchanged, and the staging registers are per k-chunk
+     * (KA + KS + KB = 14 uint4 at this rung) not per stage, so the register
+     * footprint is unchanged too.  Nothing is traded for the third buffer.
+     *
+     * What it buys: at 8 warps on the SM there is no occupancy to hide the
+     * weight fetch with, so all of the hiding is the pipeline's depth.  The
+     * producer already issues stage s's LDGs before it waits on EMPTY[s],
+     * which covers one stage of fetch with one stage of compute; at STAGES=2
+     * it then blocks on the buffer holding s-1, so its stores and its
+     * half->float scale conversion cannot run ahead.  At STAGES=3 it waits on
+     * s-2 instead and can land a whole further stage, which is also slack
+     * against jitter between the four producer warps.
+     *
+     * Bit-exact, and not merely "the same arithmetic" the way the rungs above
+     * are: STAGES changes only `buf = s % STAGES`, i.e. WHICH buffer a stage
+     * occupies.  The consumer's accumulation is unchanged in every index --
+     * ascending s, ascending gg inside it, the same acc[mi][ni][e] fma chain.
+     * The barrier ids stay clear as well: FULL[b] = 1 + 2b and EMPTY[b] =
+     * 2 + 2b run to 6 at three stages, below the epilogue's 13 and the
+     * producers' own 15.
+     *
+     * The explicit two-stage fallback below is the point of writing it as a
+     * ladder rather than editing the template argument in place: if any box
+     * refuses the 92160-byte opt-in, cuda_q8_mma_pipe_launch returns 0 and
+     * this rung would otherwise fall out of the pipe altogether and into the
+     * slower non-pipelined tile -- a regression, not a null.  With the
+     * fallback the worst case is byte-for-byte today's kernel. */
+    if (cuda_q8_mma_pipe_launch<2, 2, 4, 4, 4, 3>(out, w, xq, xscale, out_dim, n_rows, blocks)) {
+        return 1;
     }
     return cuda_q8_mma_pipe_launch<2, 2, 4, 4, 4, 2>(out, w, xq, xscale, out_dim, n_rows, blocks);
 }
