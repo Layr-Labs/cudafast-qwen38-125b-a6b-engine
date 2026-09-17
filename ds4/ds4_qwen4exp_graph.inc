@@ -327,7 +327,14 @@ struct ds4_qwen4exp_session {
     ds4_ple_constants ple_constants;
     bool              ple_ready;      /* the hash constants were readable */
     uint64_t         *ple_ids;        /* host [n_batch][head_count]       */
-    float            *ple_rows_host;  /* host [n_batch][ple_embd]         */
+    float            *ple_rows_host[2]; /* host [n_batch][ple_embd], ping-pong */
+    uint32_t          ple_rows_sel;     /* which half the next gather fills   */
+    bool              ple_rows_pinned;  /* halves came from ds4_gpu_host_alloc */
+    /* Pinned stage for the token upload, ping-ponged on the same selector as
+     * the PLE halves: the async write must not still be reading the half the
+     * next forward fills. */
+    int32_t          *tokens_stage[2];
+    bool              tokens_stage_pinned;
     ds4_gpu_tensor   *ple_conv_state; /* [state_rows][n_hc * n_embd]      */
     ds4_gpu_tensor   *ple_rows;       /* [n_batch][ple_embd]              */
     ds4_gpu_tensor   *ple_key;        /* key projection, then the gate    */
@@ -761,11 +768,38 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
                 DS4_QWEN4EXP_IMPLEMENTED_DEPTH, &ok);
         s->ple_key   = qwen4exp_alloc_zeroed(B * H * E * f, &ok);
         s->ple_aux   = qwen4exp_alloc_zeroed(B * H * E * f, &ok);
-        s->ple_value = qwen4exp_alloc_zeroed(B * E * f, &ok);
         if (ok) {
             s->ple_ids = calloc((size_t)B * DS4_N_PLE_HEAD, sizeof(uint64_t));
-            s->ple_rows_host = calloc((size_t)B * DS4_N_PLE_EMBD, sizeof(float));
-            ok = s->ple_ids != NULL && s->ple_rows_host != NULL;
+            /* Pinned halves so the row upload is a real DMA enqueue rather
+             * than a staged pageable copy; two of them so the async upload
+             * can still be in flight while the next gather writes. */
+            s->ple_rows_host[0] = ds4_gpu_host_alloc(
+                (uint64_t)B * DS4_N_PLE_EMBD * sizeof(float));
+            s->ple_rows_host[1] = ds4_gpu_host_alloc(
+                (uint64_t)B * DS4_N_PLE_EMBD * sizeof(float));
+            s->ple_rows_pinned = s->ple_rows_host[0] && s->ple_rows_host[1];
+            if (!s->ple_rows_pinned) {
+                ds4_gpu_host_free(s->ple_rows_host[0]);
+                ds4_gpu_host_free(s->ple_rows_host[1]);
+                s->ple_rows_host[0] = calloc((size_t)B * DS4_N_PLE_EMBD,
+                                             sizeof(float));
+                s->ple_rows_host[1] = calloc((size_t)B * DS4_N_PLE_EMBD,
+                                             sizeof(float));
+            }
+            s->tokens_stage[0] = ds4_gpu_host_alloc(
+                (uint64_t)B * sizeof(int32_t));
+            s->tokens_stage[1] = ds4_gpu_host_alloc(
+                (uint64_t)B * sizeof(int32_t));
+            s->tokens_stage_pinned = s->tokens_stage[0] && s->tokens_stage[1];
+            if (!s->tokens_stage_pinned) {
+                ds4_gpu_host_free(s->tokens_stage[0]);
+                ds4_gpu_host_free(s->tokens_stage[1]);
+                s->tokens_stage[0] = malloc((size_t)B * sizeof(int32_t));
+                s->tokens_stage[1] = malloc((size_t)B * sizeof(int32_t));
+            }
+            ok = s->ple_ids != NULL && s->ple_rows_host[0] != NULL &&
+                 s->ple_rows_host[1] != NULL && s->tokens_stage[0] != NULL &&
+                 s->tokens_stage[1] != NULL;
         }
         if (ok) {
             s->ple_ready = qwen4exp_ple_read_constants(m, w, &s->ple_constants);
@@ -870,8 +904,6 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
         ds4_gpu_tensor_free(s->gdn_state[il]);
         ds4_gpu_tensor_free(s->gdn_checkpoint[il]);
         ds4_gpu_tensor_free(s->gdn_replay_tape[il]);
-        ds4_gpu_tensor_free(s->gdn_conv_snapshot[il]);
-        ds4_gpu_tensor_free(s->gdn_state_snapshot[il]);
         ds4_gpu_tensor_free(s->qsa_k[il]);
         ds4_gpu_tensor_free(s->qsa_v[il]);
         ds4_gpu_tensor_free(s->idx_tape[il]);
@@ -887,8 +919,21 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->ple_key);
     ds4_gpu_tensor_free(s->ple_aux);
     ds4_gpu_tensor_free(s->ple_value);
+    if (s->tokens_stage_pinned) {
+        ds4_gpu_host_free(s->tokens_stage[0]);
+        ds4_gpu_host_free(s->tokens_stage[1]);
+    } else {
+        free(s->tokens_stage[0]);
+        free(s->tokens_stage[1]);
+    }
     free(s->ple_ids);
-    free(s->ple_rows_host);
+    if (s->ple_rows_pinned) {
+        ds4_gpu_host_free(s->ple_rows_host[0]);
+        ds4_gpu_host_free(s->ple_rows_host[1]);
+    } else {
+        free(s->ple_rows_host[0]);
+        free(s->ple_rows_host[1]);
+    }
     ds4_gpu_tensor_free(s->d_pos);
     ds4_gpu_tensor_free(s->d_adopt);
     ds4_gpu_tensor_free(s->d_gdn_replay);
@@ -1142,7 +1187,7 @@ static void *qw_ple_gather_worker(void *arg) {
             if (!quant) { seg->ok = 0; return NULL; }
             ds4_ple_dequant_iq4_nl(
                 quant, seg->blocks_per_row,
-                seg->s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD +
+                seg->s->ple_rows_host[seg->s->ple_rows_sel] + (uint64_t)t * DS4_N_PLE_EMBD +
                     (uint64_t)h * DS4_N_PLE_ROW_DIM);
         }
     }
@@ -1305,7 +1350,7 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
              * offset is carried as a pointer step instead of a multiply per
              * head.  Same addresses, same values. */
             const uint64_t *ids = s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD;
-            float *dst = s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD;
+            float *dst = s->ple_rows_host[s->ple_rows_sel] + (uint64_t)t * DS4_N_PLE_EMBD;
             for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
                 const uint64_t row = ids[h];
                 /* Every head of this token except the last is followed by
@@ -1377,7 +1422,7 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                     }
                     ds4_ple_dequant_iq4_nl(
                         quant, blocks_per_row,
-                        s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD +
+                        s->ple_rows_host[s->ple_rows_sel] + (uint64_t)t * DS4_N_PLE_EMBD +
                             (uint64_t)h * DS4_N_PLE_ROW_DIM);
                 }
             }
@@ -1459,11 +1504,19 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 "ds4: qwen4exp PLE gather %u rows took %.3f ms\n",
                 n_tokens, (now_sec() - gather_t0) * 1000.0);
     }
-    if (!ds4_gpu_tensor_write(s->ple_rows, 0, s->ple_rows_host,
-                              (uint64_t)n_tokens * DS4_N_PLE_EMBD * sizeof(float))) {
+    /* The upload is enqueued, not waited on: the legacy stream orders it
+     * before every kernel that reads ple_rows, and the ping-pong half means
+     * the next gather writes the other buffer while this DMA is in flight.
+     * A pageable fallback degrades the enqueue to the synchronous staging
+     * path, which is still correct. */
+    if (!ds4_gpu_tensor_write_async(s->ple_rows, 0,
+                                    s->ple_rows_host[s->ple_rows_sel],
+                                    (uint64_t)n_tokens * DS4_N_PLE_EMBD *
+                                        sizeof(float))) {
         fprintf(stderr, "ds4: qwen4exp n-gram row upload failed at block %u\n", il);
         return false;
     }
+    s->ple_rows_sel ^= 1u;
     return true;
 }
 
@@ -2868,7 +2921,6 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
                 s->plan.n_ctx);
         return false;
     }
-
     /* From here on this call writes the caches, the recurrent states, the
      * convolution histories and `pos`; see `state_dirty`. */
     s->state_dirty = true;
@@ -2898,12 +2950,17 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         return false;
     }
 
-    if (!ds4_gpu_tensor_write(s->tokens, 0, tokens,
+    /* The token array is the caller's stack, so it cannot be pinned; stage it
+     * through a pinned half and enqueue the copy.  The half ping-pongs on the
+     * PLE selector, which flips once per forward, so the next forward's stage
+     * write cannot race this DMA. */
+    int32_t *tok_stage = s->tokens_stage[s->ple_rows_sel];
+    memcpy(tok_stage, tokens, (size_t)n_tokens * sizeof(int32_t));
+    if (!ds4_gpu_tensor_write_async(s->tokens, 0, tok_stage,
                               (uint64_t)n_tokens * sizeof(int32_t))) {
         fprintf(stderr, "ds4: qwen4exp token upload failed\n");
         return false;
     }
-
     /* The PLE host half runs BEFORE the batch opens: the row upload is a
      * memcpy into a shared buffer, and a memcpy between an encode and a commit
      * would land ahead of work already encoded.  Nothing here touches the

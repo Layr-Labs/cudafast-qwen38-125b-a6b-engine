@@ -53,6 +53,19 @@ void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
+/* Pinned host memory for upload staging.  A pinned source is what makes
+ * ds4_gpu_tensor_write_async() actually asynchronous; a pageable one
+ * degrades the copy to the synchronous staging path, which stays correct.
+ * host_alloc returns NULL on failure and callers fall back to malloc; the
+ * matching host_free must only see a pointer host_alloc returned. */
+void *ds4_gpu_host_alloc(uint64_t bytes);
+void ds4_gpu_host_free(void *ptr);
+/* Enqueue a host-to-device copy on the legacy stream and return once it is
+ * queued.  The copy is ordered before the stream's later work exactly like
+ * ds4_gpu_tensor_write, but the caller does not wait for the DMA.  The
+ * source must stay valid until the copy retires; callers that rewrite the
+ * source every call should double-buffer. */
+int ds4_gpu_tensor_write_async(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
