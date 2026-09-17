@@ -4045,8 +4045,13 @@ qwen4exp_moe_gateup_mma_kernel(
      * fragment reads. Padding only these temporary rows trades staging-store
      * conflicts for cheaper repeated fragment loads. The Q8 task and the
      * ordinary expert loop keep their measured 132-byte layout. */
-    enum { GU_LD = PairTasks && GateType != DS4_QWEN4EXP_TY_q8_0
-                       ? 144 : QW_MMA_LD };
+    /* 132-byte tile rows for every task shape.  The 144-byte rows the
+     * bounded tasks used for conflict-free fragment reads put the tile at
+     * 26,464 bytes of shared memory, which admits three resident blocks per
+     * SM; at 25,312 four fit, which is the residency the 128-register cap
+     * was taken for, and the fourth block measured worth more than the
+     * conflict-free reads. */
+    enum { GU_LD = QW_MMA_LD };
     __shared__ __align__(16) int8_t sAg[QW_MMA_BM * GU_LD];
     __shared__ __align__(16) int8_t sAu[QW_MMA_BM * GU_LD];
     __shared__ __align__(16) int8_t sB [QW_MMA_BN * GU_LD];
@@ -4210,6 +4215,32 @@ qwen4exp_moe_gateup_mma_kernel(
         w[4] = b.x; w[5] = b.y; w[6] = b.z; w[7] = b.w;
     };
 
+    /* ROLLING L2 PREFETCH, ONE SUPER-BLOCK AHEAD OF THE FILL.  A prefetch
+     * changes no value; every load below reads the same bytes.  Rolling rather
+     * than whole-region because the block's lifetime is longer than the lines
+     * would survive in this cache.  The super-block extent is the row's bytes
+     * per eight groups, so the loop serves every K-quant row layout, and a row
+     * starts on a 32-byte boundary so a super-block begins at most 112 bytes
+     * into a line.  The last line asked for is clamped inside the region. */
+    const uint32_t pf_blk = (uint32_t)(gate_row_bytes * 8u / groups);
+    const uint32_t pf_nl = (pf_blk + 112u + 127u) / 128u;
+    const uint32_t pf_nsb = groups / 8u;
+    const uint32_t pf_gend = QW_MMA_BM * (uint32_t)gate_row_bytes - 1u;
+    const uint32_t pf_uend = QW_MMA_BM * (uint32_t)up_row_bytes - 1u;
+    const char *const pf_gbase = gate_e + (uint64_t)row0 * gate_row_bytes;
+    const char *const pf_ubase = up_e + (uint64_t)row0 * up_row_bytes;
+    auto qw_pf_sb = [&](uint32_t sb) {
+        if (sb >= pf_nsb) return;
+        for (uint32_t i = tid; i < QW_MMA_BM * 2u * pf_nl; i += QW_MMA_THREADS) {
+            const uint32_t u = i / pf_nl, j = i - u * pf_nl;
+            const uint32_t off = (u >> 1) * (uint32_t)gate_row_bytes +
+                                 sb * pf_blk + 128u * j;
+            if (u & 1u) qw_prefetch_l2(pf_ubase + (off < pf_uend ? off : pf_uend));
+            else qw_prefetch_l2(pf_gbase + (off < pf_gend ? off : pf_gend));
+        }
+    };
+    qw_pf_sb(1u);
+
     const int32_t first_pair = PairTasks ? active[2u + 2u * blockIdx.y] : 0;
     const int32_t end_pair = PairTasks ? min(cnt, first_pair + QW_MMA_BN) : cnt;
     for (int32_t nbase = first_pair; nbase < end_pair; nbase += QW_MMA_BN) {
@@ -4263,6 +4294,9 @@ qwen4exp_moe_gateup_mma_kernel(
              * thread's copies visible to every other -- no barrier is added. */
             if (dma_on && QW_DMA_ASYNC) qw_cpasync_wait0();
             __syncthreads();
+            /* The fill for the next super-block is issued during this chunk
+             * pair; ask the cache for the one beyond it now. */
+            if (((kc >> 2) & 1u) == 0u) qw_pf_sb((kc >> 3) + 2u);
             if (dma_on) {
                 qw_dma_read(kc, raww);
                 /* The synchronous arm issues the next fill's global loads
