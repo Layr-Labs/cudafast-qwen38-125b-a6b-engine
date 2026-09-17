@@ -21,6 +21,7 @@
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
+#include <mutex>
 
 #include "cuda/mmq/ds4_mmq.h"
 #include "cuda/mmq/ds4_repack.h"
@@ -3140,6 +3141,8 @@ extern "C" int ds4_gpu_init(void) {
     return ds4_gpu_init_multi(&cfg);
 }
 
+static void cuda_write_stage_release(int d);
+
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
     g_current_logical_tier = -1;
@@ -3159,6 +3162,7 @@ extern "C" void ds4_gpu_cleanup(void) {
             (void)cudaStreamDestroy((cudaStream_t)c->stream);
             c->stream = NULL;
         }
+        cuda_write_stage_release(i);
         if (c->cublas) {
             (void)cublasDestroy((cublasHandle_t)c->cublas);
             c->cublas = NULL;
@@ -3490,14 +3494,146 @@ extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint
     return ok;
 }
 
+/* A synchronous cudaMemcpy H2D parks the host on the DMA for the whole copy:
+ * the driver stages the pageable source, waits for the transfer, and only
+ * then returns.  Every decode step issues several of these (tokens,
+ * positions, the PLE row block, the MTP hyper input), so the stall is paid
+ * per step on the host critical path.
+ *
+ * The staging ring below turns the write into a host memcpy into a pinned
+ * slot plus a cudaMemcpyAsync on the LEGACY stream.  The legacy stream
+ * synchronizes with every blocking stream, and all decode work -- eager
+ * launches and graph replays alike -- rides blocking streams, so the copy
+ * lands before any subsequently issued device work reads the tensor, exactly
+ * the ordering the synchronous copy gave.  The host is back after the
+ * staging memcpy while the DMA is still in flight.
+ *
+ * A slot is reused only after its completion event has passed, so a later
+ * write can never overwrite a staging buffer an earlier DMA is still
+ * reading.  Writes larger than a slot, writes issued while a decode graph
+ * is capturing (a captured copy would re-read a staging buffer that no
+ * longer holds the same bytes), and any failure to build the ring all fall
+ * back to the original synchronous copy. */
+enum {
+    DS4_WRITE_STAGE_SLOTS = 4,
+    DS4_WRITE_STAGE_BYTES = 8u * 1024u * 1024u
+};
+
+typedef struct {
+    void       *host;
+    cudaEvent_t event;
+    int         recorded;
+} ds4_write_stage_slot;
+
+typedef struct {
+    ds4_write_stage_slot slot[DS4_WRITE_STAGE_SLOTS];
+    uint32_t             next;
+    int                  state; /* 0 untried, 1 ready, -1 unavailable */
+} ds4_write_stage_ring;
+
+static ds4_write_stage_ring g_write_stage[DS4_MAX_GPUS];
+static std::mutex           g_write_stage_mutex;
+
+static void cuda_write_stage_init(int d) {
+    ds4_write_stage_ring *r = &g_write_stage[d];
+    if (r->state != 0) return;
+    r->state = -1;
+    for (int i = 0; i < DS4_WRITE_STAGE_SLOTS; i++) {
+        if (cudaHostAlloc(&r->slot[i].host, DS4_WRITE_STAGE_BYTES,
+                          cudaHostAllocDefault) != cudaSuccess) {
+            r->slot[i].host = NULL;
+            goto fail;
+        }
+        if (cudaEventCreateWithFlags(&r->slot[i].event,
+                                     cudaEventDisableTiming) != cudaSuccess) {
+            r->slot[i].event = NULL;
+            goto fail;
+        }
+        r->slot[i].recorded = 0;
+    }
+    r->state = 1;
+    return;
+fail:
+    (void)cudaGetLastError();
+    for (int i = 0; i < DS4_WRITE_STAGE_SLOTS; i++) {
+        if (r->slot[i].host)  (void)cudaFreeHost(r->slot[i].host);
+        if (r->slot[i].event) (void)cudaEventDestroy(r->slot[i].event);
+        r->slot[i].host = NULL;
+        r->slot[i].event = NULL;
+    }
+}
+
+static void cuda_write_stage_release(int d) {
+    ds4_write_stage_ring *r = &g_write_stage[d];
+    if (r->state != 1) return;
+    for (int i = 0; i < DS4_WRITE_STAGE_SLOTS; i++) {
+        if (r->slot[i].host)  (void)cudaFreeHost(r->slot[i].host);
+        if (r->slot[i].event) (void)cudaEventDestroy(r->slot[i].event);
+        r->slot[i].host = NULL;
+        r->slot[i].event = NULL;
+        r->slot[i].recorded = 0;
+    }
+    r->state = 0;
+}
+
+static int cuda_tensor_write_staged(ds4_gpu_tensor *tensor, uint64_t offset,
+                                    const void *data, uint64_t bytes, int d) {
+    ds4_write_stage_ring *r = &g_write_stage[d];
+    if (r->state == 0) cuda_write_stage_init(d);
+    if (r->state != 1) return -1; /* ring unavailable: caller goes sync */
+    ds4_write_stage_slot *s = &r->slot[r->next];
+    r->next = (r->next + 1u) % DS4_WRITE_STAGE_SLOTS;
+    if (s->recorded) {
+        /* The slot's last DMA must be done before the staging memcpy
+         * overwrites it.  Query first: in steady state the event has long
+         * passed and the wait is a poll, not a block. */
+        cudaError_t q = cudaEventQuery(s->event);
+        if (q == cudaErrorNotReady) {
+            if (!cuda_ok(cudaEventSynchronize(s->event),
+                         "tensor write staging wait")) {
+                return 0;
+            }
+        } else if (q != cudaSuccess) {
+            return cuda_ok(q, "tensor write staging query");
+        }
+        s->recorded = 0;
+    }
+    memcpy(s->host, data, (size_t)bytes);
+    if (!cuda_ok(cudaMemcpyAsync((char *)tensor->ptr + offset, s->host,
+                                 (size_t)bytes, cudaMemcpyHostToDevice,
+                                 (cudaStream_t)0),
+                 "tensor write")) {
+        return 0;
+    }
+    if (cudaEventRecord(s->event, (cudaStream_t)0) == cudaSuccess) {
+        s->recorded = 1;
+    } else {
+        /* The copy is queued but untracked: drain it before the slot is
+         * handed out again. */
+        (void)cudaGetLastError();
+        (void)cudaStreamSynchronize((cudaStream_t)0);
+    }
+    return 1;
+}
+
 extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     int d = ds4_tensor_device_idx(tensor);
     int ok = 0;
     WITH_DEVICE(g_gpu[d].device_id) {
-        ok = cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, data, (size_t)bytes,
-                                cudaMemcpyHostToDevice),
-                     "tensor write");
+        int staged = -1;
+        if (!g_decode_graph_capturing && bytes <= DS4_WRITE_STAGE_BYTES &&
+            d >= 0 && d < DS4_MAX_GPUS) {
+            std::lock_guard<std::mutex> lock(g_write_stage_mutex);
+            staged = cuda_tensor_write_staged(tensor, offset, data, bytes, d);
+        }
+        if (staged >= 0) {
+            ok = staged;
+        } else {
+            ok = cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, data,
+                                    (size_t)bytes, cudaMemcpyHostToDevice),
+                         "tensor write");
+        }
     }
     return ok;
 }
