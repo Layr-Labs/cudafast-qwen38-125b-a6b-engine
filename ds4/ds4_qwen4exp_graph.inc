@@ -1,3 +1,4 @@
+/* ROUND 96 PROMOTION DRAW — stamp 20260917T221751Z. Tip eba814d record 2.6468193 bar 2.6494661. R95 failed workflow no-metrics. */
 /*
  * qwen4exp serial graph: session state, memory plan and the forward.
  * See ds4_qwen4exp_graph.h for the contract and the layer schedule.
