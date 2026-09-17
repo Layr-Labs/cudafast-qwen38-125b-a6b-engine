@@ -15772,6 +15772,33 @@ extern "C" int ds4_gpu_qwen4exp_ple_conv_tensor(
     return cuda_ok(cudaGetLastError(), "qwen4exp_ple_conv launch");
 }
 
+#include "ds4_qwen4exp_ple_dequant.cuh"
+
+extern "C" int ds4_gpu_qwen4exp_ple_iq4nl_dequant_tensor(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *src,
+        uint32_t              n_rows,
+        uint32_t              row_vals) {
+    if (!dst || !src || n_rows == 0u || row_vals == 0u ||
+        (row_vals & 31u) != 0u) {
+        return 0;
+    }
+    const uint64_t src_bytes =
+        (uint64_t)n_rows * (row_vals / 32u) * DS4_PLE_IQ4_NL_BLOCK_BYTES;
+    const uint64_t dst_bytes = (uint64_t)n_rows * row_vals * sizeof(float);
+    if (src->bytes < src_bytes || dst->bytes < dst_bytes) {
+        return 0;
+    }
+    if (!ds4_ple_iq4nl_dequant_launch(
+            src->ptr, (float *)dst->ptr, (int)n_rows,
+            (int)((row_vals / 32u) * DS4_PLE_IQ4_NL_BLOCK_BYTES),
+            (int)row_vals, cuda_decode_stream())) {
+        return 0;
+    }
+    return cuda_ok(cudaGetLastError(), "qwen4exp_ple_iq4nl_dequant launch");
+}
+
+
 #include "ds4_qwen4exp_hc_host.inc"
 #include "ds4_qwen4exp_ple_host.inc"
 

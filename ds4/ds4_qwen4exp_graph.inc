@@ -328,6 +328,8 @@ struct ds4_qwen4exp_session {
     bool              ple_ready;      /* the hash constants were readable */
     uint64_t         *ple_ids;        /* host [n_batch][head_count]       */
     float            *ple_rows_host;  /* host [n_batch][ple_embd]         */
+    uint8_t          *ple_quant_host; /* host [n_batch][head][row quant]  */
+    ds4_gpu_tensor   *ple_quant;      /* device [n_batch][head][row quant] */
     ds4_gpu_tensor   *ple_conv_state; /* [state_rows][n_hc * n_embd]      */
     ds4_gpu_tensor   *ple_rows;       /* [n_batch][ple_embd]              */
     ds4_gpu_tensor   *ple_key;        /* key projection, then the gate    */
@@ -762,10 +764,19 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
         s->ple_key   = qwen4exp_alloc_zeroed(B * H * E * f, &ok);
         s->ple_aux   = qwen4exp_alloc_zeroed(B * H * E * f, &ok);
         s->ple_value = qwen4exp_alloc_zeroed(B * E * f, &ok);
+        s->ple_quant = qwen4exp_alloc_zeroed(
+            B * DS4_N_PLE_HEAD *
+                (DS4_N_PLE_ROW_DIM / DS4_PLE_IQ4_NL_BLOCK_ELEMS) *
+                DS4_PLE_IQ4_NL_BLOCK_BYTES, &ok);
         if (ok) {
             s->ple_ids = calloc((size_t)B * DS4_N_PLE_HEAD, sizeof(uint64_t));
             s->ple_rows_host = calloc((size_t)B * DS4_N_PLE_EMBD, sizeof(float));
-            ok = s->ple_ids != NULL && s->ple_rows_host != NULL;
+            s->ple_quant_host = calloc(
+                (size_t)B * DS4_N_PLE_HEAD *
+                    (DS4_N_PLE_ROW_DIM / DS4_PLE_IQ4_NL_BLOCK_ELEMS),
+                DS4_PLE_IQ4_NL_BLOCK_BYTES);
+            ok = s->ple_ids != NULL && s->ple_rows_host != NULL &&
+                 s->ple_quant_host != NULL;
         }
         if (ok) {
             s->ple_ready = qwen4exp_ple_read_constants(m, w, &s->ple_constants);
@@ -887,8 +898,10 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->ple_key);
     ds4_gpu_tensor_free(s->ple_aux);
     ds4_gpu_tensor_free(s->ple_value);
+    ds4_gpu_tensor_free(s->ple_quant);
     free(s->ple_ids);
     free(s->ple_rows_host);
+    free(s->ple_quant_host);
     ds4_gpu_tensor_free(s->d_pos);
     ds4_gpu_tensor_free(s->d_adopt);
     ds4_gpu_tensor_free(s->d_gdn_replay);
@@ -1103,6 +1116,7 @@ typedef struct {
     uint32_t                      t0;
     uint32_t                      t1;
     uint32_t                      blocks_per_row;
+    int                           dev_dequant;
     int                           ok;
 } qw_ple_gather_seg;
 
@@ -1140,10 +1154,19 @@ static void *qw_ple_gather_worker(void *arg) {
                 seg->s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h];
             const uint8_t *quant = ds4_qwen4exp_ple_row(seg->ple, row);
             if (!quant) { seg->ok = 0; return NULL; }
-            ds4_ple_dequant_iq4_nl(
-                quant, seg->blocks_per_row,
-                seg->s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD +
-                    (uint64_t)h * DS4_N_PLE_ROW_DIM);
+            if (seg->dev_dequant) {
+                const uint32_t row_quant_bytes =
+                    seg->blocks_per_row * DS4_PLE_IQ4_NL_BLOCK_BYTES;
+                memcpy(seg->s->ple_quant_host +
+                           (uint64_t)t * DS4_N_PLE_HEAD * row_quant_bytes +
+                           (uint64_t)h * row_quant_bytes,
+                       quant, row_quant_bytes);
+            } else {
+                ds4_ple_dequant_iq4_nl(
+                    quant, seg->blocks_per_row,
+                    seg->s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD +
+                        (uint64_t)h * DS4_N_PLE_ROW_DIM);
+            }
         }
     }
     return NULL;
@@ -1237,8 +1260,17 @@ static void qw_ple_pool_init(void) {
     }
     g_qw_ple_pool.initialized = true;
     atexit(qw_ple_pool_shutdown);
+
     pthread_mutex_unlock(&g_qw_ple_pool.mutex);
 }
+
+/* The CUDA qwen4exp object supplies the device-side IQ4_NL dequantiser.
+ * Builds without it leave the weak reference empty -- NULL on ELF and a
+ * weak-import NULL on Mach-O -- and the gather keeps the host expansion
+ * below, byte for byte. */
+extern int ds4_gpu_qwen4exp_ple_iq4nl_dequant_tensor(
+        ds4_gpu_tensor *dst, const ds4_gpu_tensor *src,
+        uint32_t n_rows, uint32_t row_vals) __attribute__((weak));
 
 static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                                       const ds4_qwen4exp_weights *w,
@@ -1285,6 +1317,19 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
         getenv("DS4_QWEN4EXP_PLE_GATHER_TIME") ? now_sec() : 0.0;
     const uint32_t block_elems = DS4_PLE_IQ4_NL_BLOCK_ELEMS;
     const uint32_t blocks_per_row = DS4_N_PLE_ROW_DIM / block_elems;
+    /* When the device dequantiser resolved, the gather stages the raw
+     * 90-byte quant rows instead of expanding them: the host writes 7.1x
+     * fewer bytes, the upload moves 7.1x fewer bytes, and the expansion
+     * runs on the device inside the same decode stream.  The weak symbol
+     * is NULL on builds without the CUDA object, which keeps the host
+     * path below byte for byte. */
+#if !defined(__APPLE__) && (defined(__GNUC__) || defined(__clang__))
+    const int dev_dequant =
+        ds4_gpu_qwen4exp_ple_iq4nl_dequant_tensor != NULL;
+#else
+    const int dev_dequant = 0;
+#endif
+    const uint32_t row_quant_bytes = blocks_per_row * DS4_PLE_IQ4_NL_BLOCK_BYTES;
 
     /* When slots are armed the ids are produced ONE ROW AT A TIME so the
      * n-gram history after each row can be kept beside them.  The contract on
@@ -1322,8 +1367,15 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                             il, t, h, row, w->ple.rows);
                     return false;
                 }
-                ds4_ple_dequant_iq4_nl(quant, blocks_per_row, dst);
-                dst += DS4_N_PLE_ROW_DIM;
+                if (dev_dequant) {
+                    memcpy(s->ple_quant_host +
+                               (uint64_t)t * DS4_N_PLE_HEAD * row_quant_bytes +
+                               (uint64_t)h * row_quant_bytes,
+                           quant, row_quant_bytes);
+                } else {
+                    ds4_ple_dequant_iq4_nl(quant, blocks_per_row, dst);
+                    dst += DS4_N_PLE_ROW_DIM;
+                }
             }
         }
     } else {
@@ -1375,10 +1427,17 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                                 il, t, h, row, w->ple.rows);
                         return false;
                     }
-                    ds4_ple_dequant_iq4_nl(
-                        quant, blocks_per_row,
-                        s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD +
-                            (uint64_t)h * DS4_N_PLE_ROW_DIM);
+                    if (dev_dequant) {
+                        memcpy(s->ple_quant_host +
+                                   (uint64_t)t * DS4_N_PLE_HEAD * row_quant_bytes +
+                                   (uint64_t)h * row_quant_bytes,
+                               quant, row_quant_bytes);
+                    } else {
+                        ds4_ple_dequant_iq4_nl(
+                            quant, blocks_per_row,
+                            s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD +
+                                (uint64_t)h * DS4_N_PLE_ROW_DIM);
+                    }
                 }
             }
         } else {
@@ -1407,6 +1466,7 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 g_qw_ple_pool.segs[i].t1 = t1;
                 g_qw_ple_pool.segs[i].blocks_per_row = blocks_per_row;
                 g_qw_ple_pool.segs[i].ok = 0;
+                g_qw_ple_pool.segs[i].dev_dequant = dev_dequant;
             }
 
             if (actual_threads > 1 && g_qw_ple_pool.initialized) {
@@ -1458,6 +1518,29 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
         fprintf(stderr,
                 "ds4: qwen4exp PLE gather %u rows took %.3f ms\n",
                 n_tokens, (now_sec() - gather_t0) * 1000.0);
+    }
+    if (dev_dequant) {
+        /* The staged rows are still IQ4_NL: 90 bytes each instead of the
+         * 640 the float expansion would have moved.  The upload is one
+         * blocking copy like before, then the expansion runs on the decode
+         * stream ahead of the block's own kernels. */
+        if (!ds4_gpu_tensor_write(s->ple_quant, 0, s->ple_quant_host,
+                                  (uint64_t)n_tokens * DS4_N_PLE_HEAD *
+                                      row_quant_bytes)) {
+            fprintf(stderr,
+                    "ds4: qwen4exp n-gram quant upload failed at block %u\n",
+                    il);
+            return false;
+        }
+        if (!ds4_gpu_qwen4exp_ple_iq4nl_dequant_tensor(
+                s->ple_rows, s->ple_quant,
+                n_tokens * DS4_N_PLE_HEAD, DS4_N_PLE_ROW_DIM)) {
+            fprintf(stderr,
+                    "ds4: qwen4exp n-gram device dequant failed at block %u\n",
+                    il);
+            return false;
+        }
+        return true;
     }
     if (!ds4_gpu_tensor_write(s->ple_rows, 0, s->ple_rows_host,
                               (uint64_t)n_tokens * DS4_N_PLE_EMBD * sizeof(float))) {
