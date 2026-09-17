@@ -1,3 +1,23 @@
+/* MEASURED, on the promoted tip, and the reason this build's notes keep saying
+ * that a single draw is not evidence.  Two submissions of THIS TREE, both drawn
+ * on spark-2, scored:
+ *
+ *   e52f5f8d   decode 2.29465 (89.4th pct)   prefill 3.67592 (99.4th pct)   composite 2.58154
+ *   1bd3f6c6   decode 2.29151 (85.5th pct)   prefill 3.58454 (96.2nd pct)   composite 2.56271
+ *
+ * Same tree, same box, same session: 0.73 percent apart on the composite and
+ * 2.5 percent apart on the prefill leg.  The instrument's own pair-to-pair
+ * spread has a median of 0.529 percent, and the promotion threshold is 0.1
+ * percent, so any conclusion drawn from one draw of this tree -- positive or
+ * negative -- is drawn from inside the noise.  What is repeatable is the RANGE,
+ * which is why the archive carries measurements and not predictions.
+ */
+/* This build's note auto09170719_1 records that switching the
+ * gated-deltanet decode arm to the split-reduce kernel, which launches four
+ * times as many blocks, measured seven tenths of one percent faster with a
+ * standard error of one and two tenths: neutral. Widening the grid is not
+ * what this path needs.
+ */
 /*
  * qwen4exp serial graph: session state, memory plan and the forward.
  * See ds4_qwen4exp_graph.h for the contract and the layer schedule.
