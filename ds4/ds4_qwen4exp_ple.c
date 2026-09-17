@@ -18,6 +18,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
+
 /* =========================================================================
  * Errors.
  * ========================================================================= */
@@ -781,6 +785,50 @@ void ds4_ple_dequant_iq4_nl(const void *__restrict blocks, size_t block_count,
 
 
     const int8_t *const kv = ple_kvalues_iq4nl;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    /* NEON: the sixteen-entry code book is one vector, and vqtbl1q_s8
+     * resolves all sixteen nibble lookups of a half in a single
+     * instruction, so a block costs two table lookups plus the widening
+     * converts instead of thirty-two scalar loads and multiplies.
+     * int8 -> int16 -> int32 -> float32 is exact for every table value
+     * (|kv| <= 127), and vmulq_f32 is the same IEEE single-precision
+     * multiply the scalar loop performs, so the output is bit-identical:
+     * same code book, same order, same rounding. */
+    const int8x16_t kv_vec = vld1q_s8(kv);
+    const uint8x16_t lo_mask = vdupq_n_u8(0x0F);
+    for (size_t b = 0; b < block_count; b++) {
+        if (b + 1u < block_count)
+            __builtin_prefetch(p + DS4_PLE_IQ4_NL_BLOCK_BYTES, 0, 1);
+        uint16_t half;
+        memcpy(&half, p, sizeof(half));
+        const float d = ple_fp16_to_fp32(half);
+        float *y = out + b * DS4_PLE_IQ4_NL_BLOCK_ELEMS;
+
+        if (b + 1u < block_count)
+            __builtin_prefetch(y + DS4_PLE_IQ4_NL_BLOCK_ELEMS, 1, 3);
+
+        const uint8x16_t q = vld1q_u8(p + 2);
+        const int8x16_t lo = vqtbl1q_s8(kv_vec, vandq_u8(q, lo_mask));
+        const int8x16_t hi = vqtbl1q_s8(kv_vec, vshrq_n_u8(q, 4));
+        const float32x4_t dv = vdupq_n_f32(d);
+
+        const int16x8_t lo_a = vmovl_s8(vget_low_s8(lo));
+        const int16x8_t lo_b = vmovl_s8(vget_high_s8(lo));
+        vst1q_f32(y +  0, vmulq_f32(dv, vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo_a)))));
+        vst1q_f32(y +  4, vmulq_f32(dv, vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo_a)))));
+        vst1q_f32(y +  8, vmulq_f32(dv, vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo_b)))));
+        vst1q_f32(y + 12, vmulq_f32(dv, vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo_b)))));
+
+        const int16x8_t hi_a = vmovl_s8(vget_low_s8(hi));
+        const int16x8_t hi_b = vmovl_s8(vget_high_s8(hi));
+        vst1q_f32(y + 16, vmulq_f32(dv, vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi_a)))));
+        vst1q_f32(y + 20, vmulq_f32(dv, vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi_a)))));
+        vst1q_f32(y + 24, vmulq_f32(dv, vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi_b)))));
+        vst1q_f32(y + 28, vmulq_f32(dv, vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi_b)))));
+
+        p += DS4_PLE_IQ4_NL_BLOCK_BYTES;
+    }
+#else
     for (size_t b = 0; b < block_count; b++) {
         /* The caller walks a token row as five consecutive blocks, so the
          * next block's eighteen bytes are the next thing this loop touches.
@@ -814,6 +862,7 @@ void ds4_ple_dequant_iq4_nl(const void *__restrict blocks, size_t block_count,
         }
         p += DS4_PLE_IQ4_NL_BLOCK_BYTES;
     }
+#endif
 }
 
 /* =========================================================================
