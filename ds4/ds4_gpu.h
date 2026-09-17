@@ -1091,6 +1091,18 @@ int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
         uint64_t              out_dim,
         const ds4_gpu_tensor *x,
         uint32_t              n_rows);
+
+/* Two F32 projections of one shape over one input in one launch (CUDA):
+ * the calls ds4_gpu_matmul_f32_decode_rows_exact_tensor's eight-warp tile
+ * arm would take, with that arm's arithmetic per column.  Returns 1 when it
+ * launched and 0 when it declined with nothing launched, in which case the
+ * caller makes the two single calls. */
+int ds4_gpu_matmul_f32_pair_decode_rows_exact_tensor(
+        ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
+        const void *model_map0, uint64_t model_size0, uint64_t weight_offset0,
+        const void *model_map1, uint64_t model_size1, uint64_t weight_offset1,
+        uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint32_t n_rows);
 int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(
         ds4_gpu_tensor       *out0,
         ds4_gpu_tensor       *out1,

@@ -1,6 +1,3 @@
-/* redraw rx11204626 (2026-09-17T11:20:46Z): this archive repeats the official evaluation of the
- * same engine. The only textual difference from the previous evaluation
- * is this dated provenance comment. No behaviour changes. */
 /*
  * Qwen4-Exp CUDA kernels.
  *
@@ -10207,6 +10204,16 @@ __global__ static void qwen4exp_gdn_output_quant_kernel(
         uint32_t     n_value_head,
         uint32_t     n_tokens,
         float        norm_eps) {
+    /* PDL producer for the state-out projection that follows on the stream.
+     * That projection is already launched with the programmatic attribute and
+     * already places its fence after its first weight loads and before its
+     * first activation read, so the early window it asks for has never been
+     * opened: nothing upstream triggered.  At the decode widths this grid is
+     * n_tokens by n_value_head, ninety-six blocks of a hundred and twenty-
+     * eight threads, one wave on this device, which is the deadlock rule in
+     * ds4_cuda_qwen4exp.cuh.  The gate reads a kernel argument so it is
+     * grid-uniform, and prefill, whose grid is orders larger, never fires. */
+    if (n_tokens <= 2u) QWEN4EXP_PDL_TRIGGER();
     const uint32_t token = blockIdx.x;
     const uint32_t head = blockIdx.y;
     const uint32_t tid = threadIdx.x;
@@ -12242,6 +12249,21 @@ __global__ static void qwen4exp_qsa_prep_joint_kernel(
         uint32_t n_tokens,uint32_t n_head,uint32_t n_head_kv,uint32_t head_dim,
         uint32_t rot_dim,uint32_t pos0,uint32_t cache_cap,
         float eps,float q_offset,float k_offset,const uint32_t *d_pos){
+    /* PDL producer for the joint state projection that follows on the
+     * stream.  That projection already loads its first weight word, then
+     * fences, then reads its activation, so the early window it asks for was
+     * complete except that nothing upstream opened it.  This trigger sits
+     * above the head/token bound check below on purpose: a block that took
+     * that early return would never trigger and the dependent would never
+     * launch.  The deadlock rule in ds4_cuda_qwen4exp.cuh asks for a single
+     * wave, and the gate states that condition directly on the grid rather
+     * than on the row argument, which cannot then be fooled by a launch that
+     * rounds its y extent up: at the decode widths the grid is twenty-six by
+     * two, fifty-two blocks of two hundred and fifty-six threads at thirty-two
+     * registers and a kilobyte of shared memory, which this device holds eight
+     * deep on each of its forty-eight multiprocessors.  Prefill, whose y extent
+     * is the whole window, never fires. */
+    if (gridDim.x * gridDim.y * gridDim.z <= 96u) QWEN4EXP_PDL_TRIGGER();
     extern __shared__ float shared[];
     const uint32_t token=blockIdx.y,tid=threadIdx.x,nth=blockDim.x;
     /* Part 3 is Part 0 without the gate store, for a caller that reads the
@@ -14124,6 +14146,16 @@ __global__ static void qwen4exp_qsa_output_gate_doubled_quant_kernel(
         const float *doubled,
         const float *out,
         uint32_t     n_values) {
+    /* PDL producer for the state-out projection that follows on the stream.
+     * In the twelve attention layers this kernel, not the gated-deltanet
+     * quantizer, is the projection's stream predecessor, and it carried no
+     * trigger, so those layers kept the serialized edge the other thirty-six
+     * no longer pay.  Grid is n_values over two hundred and fifty-six, which
+     * is forty-eight blocks at the decode widths -- one per multiprocessor,
+     * and this kernel holds eight deep at eighteen registers, so the single-
+     * wave condition has a wide margin.  The gate reads gridDim, which is
+     * uniform across the grid, and excludes every prefill width. */
+    if (gridDim.x <= 48u) QWEN4EXP_PDL_TRIGGER();
     const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
