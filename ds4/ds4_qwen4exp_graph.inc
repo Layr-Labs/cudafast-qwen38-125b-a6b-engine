@@ -428,6 +428,12 @@ struct ds4_qwen4exp_session {
     ds4_gpu_tensor *logits;
     ds4_gpu_tensor *spec_top1;
 
+    /* First hyper row the next draft consumes, set by the seam from the head
+     * cache's row count.  Rows below it are verified but never read back:
+     * the head already holds their cache rows, so the verify's readback and
+     * the draft's upload both start here instead of at row zero. */
+    uint32_t verify_hyper_first;
+
     /* PREFILL ONLY.  True while `hyper` still owes the last block's inject:
      * the value the model means is hyper + block_out * inject, and the next
      * mixer applies it on its first read of the residual instead of a
@@ -3076,7 +3082,7 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     QW_TRACE(QW_SLICE_HEAD);
     QW_TRACE_REPORT(n_tokens);
     /* Commit and wait: the logits are read on the host from here on. */
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
+    if (!ds4_gpu_end_commands_sync()) {
         fprintf(stderr, "ds4: qwen4exp command batch did not complete\n");
         return false;
     }
@@ -3129,7 +3135,7 @@ static bool qwen4exp_session_copy_layers(ds4_qwen4exp_session *s,
                                      (uint64_t)row * bytes, bytes) != 0;
         }
     }
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) return false;
+    if (!ds4_gpu_end_commands_sync()) return false;
     if (ok && recurrent) s->gdn_replay_previous = false;
     return ok;
 }
@@ -3602,15 +3608,28 @@ bool ds4_qwen4exp_graph_verify_rows(ds4_qwen4exp_session       *s,
         (n_tokens > 1u && n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT)
             ? n_tokens - 1u : 0u;
     s->spec_logit_rows = logit_rows > 1u ? logit_rows : 0u;
+    /* Consume the narrowing hint before the forward so a failed call can
+     * never leave it armed for the next one. */
+    const uint32_t hyper_first = s->verify_hyper_first;
+    s->verify_hyper_first = 0u;
     const bool forward_ok =
         ds4_qwen4exp_graph_forward(s, w, m, tokens, n_tokens, logits);
     s->spec_snapshot_rows = 0u;
     s->spec_logit_rows = 0u;
     if (!forward_ok) return false;
-    if (hc_rows && !ds4_qwen4exp_session_read_hyper(s, 0, n_tokens, hc_rows)) {
+    /* Rows below `hyper_first` are verified but never consumed: the head
+     * cache already holds their positions, so the draft starts at that row.
+     * They land at their natural offsets so the buffer's indexing is
+     * unchanged. */
+    uint32_t first = hyper_first;
+    if (first > n_tokens) first = n_tokens;
+    if (hc_rows && first < n_tokens &&
+        !ds4_qwen4exp_session_read_hyper(
+            s, first, n_tokens - first,
+            hc_rows + (size_t)first * DS4_N_HC * DS4_N_EMBD)) {
         fprintf(stderr,
                 "ds4: qwen4exp could not read %u pre-final-mixer rows back "
-                "(session batch %u)\n", n_tokens, s->plan.n_batch);
+                "(session batch %u)\n", n_tokens - first, s->plan.n_batch);
         return false;
     }
     return true;
@@ -3630,13 +3649,26 @@ bool ds4_qwen4exp_graph_verify_top1_rows(ds4_qwen4exp_session       *s,
     s->spec_snapshot_rows = n_tokens > 1u ? n_tokens - 1u : 0u;
     s->spec_logit_rows = n_tokens > 1u ? n_tokens : 0u;
     s->spec_top1_rows = n_tokens;
+    /* Consume the narrowing hint before the forward so a failed call can
+     * never leave it armed for the next one. */
+    const uint32_t hyper_first = s->verify_hyper_first;
+    s->verify_hyper_first = 0u;
     const bool forward_ok =
         ds4_qwen4exp_graph_forward(s, w, m, tokens, n_tokens, NULL);
     s->spec_snapshot_rows = 0u;
     s->spec_logit_rows = 0u;
     s->spec_top1_rows = 0u;
     if (!forward_ok) return false;
-    if (hc_rows && !ds4_qwen4exp_session_read_hyper(s, 0, n_tokens, hc_rows)) {
+    /* Rows below `hyper_first` are verified but never consumed: the head
+     * cache already covers their positions, so the draft starts at that
+     * row.  They land at their natural offsets so the buffer's indexing is
+     * unchanged. */
+    uint32_t first = hyper_first;
+    if (first > n_tokens) first = n_tokens;
+    if (hc_rows && first < n_tokens &&
+        !ds4_qwen4exp_session_read_hyper(
+            s, first, n_tokens - first,
+            hc_rows + (size_t)first * DS4_N_HC * DS4_N_EMBD)) {
         fprintf(stderr, "ds4: qwen4exp compact verify hyper read failed\n");
         return false;
     }
@@ -3704,7 +3736,7 @@ bool ds4_qwen4exp_graph_head_logits(ds4_qwen4exp_session       *s,
         fprintf(stderr, "ds4: qwen4exp LM head failed on the head row\n");
         return qwen4exp_forward_fail();
     }
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
+    if (!ds4_gpu_end_commands_sync()) {
         fprintf(stderr, "ds4: qwen4exp command batch did not complete\n");
         return false;
     }
@@ -3902,7 +3934,7 @@ static int qwen4exp_rb_ple_conv_select(void *ctx, uint32_t row) {
     const bool ok = ds4_gpu_tensor_copy(s->ple_conv_state, 0,
                                         s->ple_conv_snapshot,
                                         (uint64_t)row * bytes, bytes) != 0;
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) return -1;
+    if (!ds4_gpu_end_commands_sync()) return -1;
     return ok ? 0 : -1;
 }
 static int qwen4exp_rb_qsa_kv_truncate(void *ctx, uint32_t pos) {
@@ -4048,7 +4080,7 @@ int ds4_qwen4exp_test_head_block_run(const char *target_path,
             ds4_gpu_begin_commands()) {
             ok1 = ds4_qwen4exp_graph_head_block(&ctx, s, hyper,
                                                 head_w.block_index, 0u, n_tokens);
-            if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) ok1 = 0;
+            if (!ds4_gpu_end_commands_sync()) ok1 = 0;
         }
         if (ok1) (void)ds4_gpu_tensor_read(hyper, 0, a, bytes);
 
@@ -4056,7 +4088,7 @@ int ds4_qwen4exp_test_head_block_run(const char *target_path,
             ds4_gpu_begin_commands()) {
             ok2 = ds4_qwen4exp_graph_head_block(&ctx, s, hyper,
                                                 head_w.block_index, 0u, n_tokens);
-            if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) ok2 = 0;
+            if (!ds4_gpu_end_commands_sync()) ok2 = 0;
         }
         if (ok2) (void)ds4_gpu_tensor_read(hyper, 0, b, bytes);
 
