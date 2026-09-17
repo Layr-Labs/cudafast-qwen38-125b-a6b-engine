@@ -4991,8 +4991,12 @@ template <int GateType = -1, int UpType = -1, bool PairTasks = false,
  *
  * MEASURED, and the __launch_bounds__ below does not do that job.  The probe
  * (ds4_gpu_qwen4exp_kernel_limits) read this kernel for the first time in
- * submission `20812211` and reported, for the shipped arm
- * QW_GATEUP_DMA_ARM = 5, `mm[reg=167 smem=24288 lmem=0 occ=3]`.  The register
+ * submission `20812211` and reported, for the arm shipped at the time,
+ * QW_GATEUP_DMA_ARM = 5, `mm[reg=167 smem=24288 lmem=0 occ=3]`.  (The arm is 6
+ * now.  That reading still applies: 6 and 5 differ only in QW_DMA_SWZ, a
+ * relabelling of shared slots, which changes no register or shared-memory
+ * figure.  See the QW_DMA_SWZ comment for why the predicate is `>= 5`.)
+ * The register
  * figure is exactly the 167 above, so the comment was right about that -- but
  * Dma >= 2 resolves the bound to (128, 3), whose implied ceiling is
  * 65,536 / (128 * 3) = 170, and 167 <= 170.  THE BOUND IS A NO-OP HERE: ptxas
@@ -5104,8 +5108,33 @@ qwen4exp_moe_gateup_mma_kernel(
             * needs stride == 2 mod 4) but 2-way conflicting for the staging
             * STORE (which needs an odd stride) -- no linear map serves both.
             * XOR-ing the unit index with bit 2 of the piece index fixes the
-            * store and provably leaves the read conflict-free. */
-           QW_DMA_SWZ = (Dma == 5) ? 1 : 0,
+            * store and provably leaves the read conflict-free.
+            *
+            * THE PREDICATE IS `>= 5`, NOT `== 5`, AND THAT IS THE FIX.  It
+            * used to read `Dma == 5` while QW_GATEUP_DMA_ARM was 5, so the
+            * swizzle was live.  The arm was then bumped to 6 with no `Dma == 6`
+            * case added anywhere, and 6 falls through every test in this enum
+            * exactly as 3 does: J = 8, PER = 2, ASYNC = 1, HDR = 0 -- and
+            * SWZ = 0.  So the bump silently reinstated the 2-way staging-store
+            * conflict this line exists to remove, which is the one and only
+            * behavioural difference between arm 5 and arm 6.  An equality test
+            * on a number that is incremented when a new arm is added is a trap:
+            * it turns "add an arm" into "drop every feature keyed to the old
+            * number".  Every rung at or above 5 carries the swizzle now, so the
+            * next bump cannot drop it again.
+            *
+            * Bit-exact by construction: the slot map is the SINGLE source of
+            * truth for this buffer.  All five sRaw accesses go through
+            * qw_dma_slot -- the cp.async destination and the synchronous store
+            * take their slot from qw_dma_src, which calls it, and the three
+            * tile reads call it directly -- so relabelling slots moves bytes
+            * to different shared addresses and hands the same bytes back.  The
+            * relabelling is injective: the XOR flips only bit 0, so
+            * (u ^ b) stays inside [0, 64), and j * 66 + [0, 64) are disjoint
+            * intervals because 66 >= 64.  Max slot 7 * 66 + 63 = 525, inside
+            * QW_DMA_SLOTS = 526.  Nothing about the dequant, the tile stores,
+            * the MMA sequence, the epilogue or the accumulation order moves. */
+           QW_DMA_SWZ = (Dma >= 5) ? 1 : 0,
            QW_DMA_HDR = (Dma == 4) ? 1 : 0,
            QW_DMA_NF = 64 * QW_DMA_J / (int)QW_MMA_THREADS,
            QW_DMA_SLOTS = Dma ? ((QW_DMA_J - 1) * (int)QW_DMA_US + 64) : 1 };
@@ -16164,8 +16193,9 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
      * The specific question.  The gate/up tile carries, in its own words, "the
      * DMA arms need the occupancy pinned: without a minimum ptxas takes 167
      * registers (3 CTAs/SM) and throws away the whole point of the 64 B arm,
-     * which is that its staging buffer still fits four."  The shipped arm is
-     * QW_GATEUP_DMA_ARM = 5, which resolves that kernel's
+     * which is that its staging buffer still fits four."  The shipped arm was
+     * QW_GATEUP_DMA_ARM = 5 when this was written and is 6 now; both resolve
+     * that kernel's
      * __launch_bounds__(QW_MMA_THREADS, Dma >= 2 ? 3 : ...) to (128, 3) -- an
      * implied register ceiling of 65,536 / (128 * 3) = 170.  167 <= 170, so THE
      * BOUND IS A NO-OP on the shipped arm: ptxas would take 167 either way, and
