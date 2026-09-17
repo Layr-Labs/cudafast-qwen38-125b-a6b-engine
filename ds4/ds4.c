@@ -76098,6 +76098,43 @@ static int qwen4exp_seam_draft_step(void *ctx, int next_token,
 /* Several head rows in one forward: the seed rows a round owes the head cache
  * and the round's first draft, as one launch chain and one readback.  Same
  * head, same cache rows, same drafts as draft_step row by row. */
+/* The device-source twin of the seam below.  The verify has just written the
+ * pre-final-mixer rows into the session's hyper tensor and, on this path, was
+ * not asked to copy them out, so the head reads row `first_row` onward
+ * straight from that tensor.  `first_row` indexes exactly the rows that
+ * `hc_rows + first_row * hc_dim` named on the host path. */
+static int qwen4exp_seam_draft_rows_device(void *ctx, const int *next_tokens,
+                                           uint32_t first_row, uint32_t pos0,
+                                           uint32_t n, int *draft_out,
+                                           float *multi_out) {
+    ds4_session *s = ctx;
+    char err[256];
+    ds4_gpu_tensor *hyper = (s->engine && s->engine->qwen4exp_session)
+        ? ds4_qwen4exp_session_hyper(s->engine->qwen4exp_session) : NULL;
+    if (!hyper) {
+        fprintf(stderr, "ds4: qwen4exp MTP seam: no device hyper tensor\n");
+        return -1;
+    }
+    if (ds4_qwen4exp_mtp_head_forward_last_device(&s->qwen4exp_head,
+                                                  next_tokens, hyper, first_row,
+                                                  pos0, n, draft_out, multi_out,
+                                                  err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4: qwen4exp MTP device seam: %s\n", err);
+        return -1;
+    }
+#ifdef DS4_TEST_HOOKS
+    /* Same forced-token rule as the host seam, so a test that drives one path
+     * sees the same drafts on the other. */
+    if (s->qwen4exp_forced_tokens) {
+        const uint32_t want = pos0 + n - 1u + 2u;
+        if (want < (uint32_t)s->qwen4exp_forced_len) {
+            *draft_out = s->qwen4exp_forced_tokens[want];
+        }
+    }
+#endif
+    return 0;
+}
+
 static int qwen4exp_seam_draft_rows(void *ctx, const int *next_tokens,
                                     const float *hc_rows, uint32_t pos0,
                                     uint32_t n, int *draft_out,
@@ -76215,6 +76252,7 @@ static bool ds4_session_qwen4exp_spec_init(ds4_session *s,
     s->qwen4exp_seam.head_logits  = qwen4exp_seam_head_logits;
     s->qwen4exp_seam.draft_step   = qwen4exp_seam_draft_step;
     s->qwen4exp_seam.draft_rows   = qwen4exp_seam_draft_rows;
+    s->qwen4exp_seam.draft_rows_device = qwen4exp_seam_draft_rows_device;
     s->qwen4exp_seam.draft_margin = qwen4exp_seam_draft_margin;
 
     const int depth = ds4_qwen4exp_mtp_depth_from_draft_tokens(

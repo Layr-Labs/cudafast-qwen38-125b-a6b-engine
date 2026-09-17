@@ -5747,6 +5747,121 @@ __device__ __forceinline__ static void qw_gu_coop_raw_load(
  * the decode leg is then the answer.  gu[occ]=3 => 32 is unreachable and 40 is
  * the measured floor, at which point gate/up occupancy is CLOSED for a real
  * reason rather than a mis-read one. */
+/* NOW 40, BECAUSE THE BLOCK HALVED AND THE CAP DID NOT.
+ *
+ * Everything above reasons at 512 threads -- "4 x 32 x 512 = 65,536", "the
+ * 23,168 B static panel".  That was the eight-row block.  QW_GU_COOP_ROWS is
+ * FOUR, so the shipped block is `P * 64` = 256 threads with an 11,584 B panel,
+ * and the comment on that constant states the consequence itself: registers and
+ * shared memory both have slack for four more blocks and "the thread ceiling is
+ * the whole binding constraint once one halves".  The cap was sized to buy a
+ * fourth block against a register file that was actually binding at 512
+ * threads.  At 256 it is not binding, so the cap buys nothing and is paid for
+ * out of the one resource this kernel is most sensitive to.
+ *
+ * The ranked box says so directly.  `officialMetrics.engine_backend` publishes
+ * the probe for rejected submissions too, and our own `f7e97bb` run on
+ * `spark-7` returned:
+ *
+ *     gu[reg=32 smem=11584 lmem=0 maxt=1024 occ=6]
+ *
+ * occ=6, not the 4 the pre-committed readout above anticipated, because the
+ * readout was written for the 512-thread block.  Six is exactly the thread
+ * ceiling, 1536 / 256.  What binds at 256 threads, per block:
+ *
+ *   threads   1536 / 256                  -> 6 blocks   <- binds
+ *   reg=32    65,536 / (32 x 256=8,192)   -> 8 blocks
+ *   smem      101,376 / 11,584            -> 8 blocks
+ *
+ * So residency is 6 with two blocks' worth of register slack sitting unused.
+ * Spending it costs no block, at an 8-register allocation granularity:
+ *
+ *   reg=40 -> 40 x 256 = 10,240/block -> 65,536 / 10,240 = 6.4 -> 6 blocks
+ *   reg=48 -> 48 x 256 = 12,288/block -> 65,536 / 12,288 = 5.3 -> 5 blocks
+ *
+ * 40 is therefore the largest allocation that holds residency at 6, and 48 is
+ * the first that does not.  This is not an occupancy trade: 32 and 40 are the
+ * same six blocks, and 40 hands the body eight more registers toward the 47 the
+ * retraction above establishes as its untouched natural want.  That direction
+ * is the one with a credit on this kernel -- 40 won +0.545% of decode as
+ * `ebc0169b` -- and it is the direction the `ec7bb97f` result argues for, where
+ * taking live state OUT of this loop lost 11% of decode while GAINING a block.
+ *
+ * Arithmetic is untouched.  __maxnreg__ constrains allocation only; every lane
+ * walks the same groups in the same order through the same warp_sum_f32 tree,
+ * so the row-invariance residual the graph parity test asserts to be exactly
+ * zero is unmoved, and no gate that compares values can see this.
+ *
+ * READOUT, pre-committed, and it is published whatever the composite does:
+ * gu[lmem] != 0 => 40 spills at this body shape => revert to 32 regardless of
+ * score.  gu[reg=40 ... occ=6] => the cap took and residency held, which is the
+ * whole claim, and the decode leg is then the only open question.
+ * gu[occ]=5 => the 8-register granularity rounded against this shape and 40 is
+ * refused; revert. */
+/* MEASURED ON THE RANKED BOX, AND REJECTED. THE CAP STAYS AT 32.
+ *
+ * Everything above was tested. Submission `f0e439a1` carried exactly this
+ * kernel at __maxnreg__(40) and nothing else, on top of the then-frontier tree
+ * `d638bc9`. Do not re-run it; this comment is here so that nobody does.
+ *
+ * COMPILE-TIME EVIDENCE (real, and it held up). The translation unit was built
+ * twice with `-Xptxas -v`, identical in every other flag:
+ *
+ *   instantiation                         cap 32                  cap 40
+ *   <2,12,false,4,false>  smem     64  32 reg, 624/436 spill   40 reg, 564/380
+ *   <2,12,true, 1,false>  smem     16  32 reg, 792/600 spill   40 reg, 552/384
+ *   <2,12,true, 4,true>   smem 11,584  32 reg,   0/0   spill   40 reg,   0/0
+ *
+ * The third row is the instantiation the decode leg runs -- its 11,584 B panel
+ * is the `gu[smem=11584]` the ranked box publishes back. It TAKES all forty
+ * registers when allowed forty, so at 32 it was not comfortable, it was
+ * rematerialising behind a clean lmem=0. The other two spilled outright at 32
+ * and spilled less at 40. That much is simply true and is worth keeping.
+ *
+ * RUNTIME EVIDENCE (also real, also held up). A standalone probe at this exact
+ * launch shape (256 threads, 11,584 B static shared) on the GB10, sm_121,
+ * reports 6 blocks/SM at reg=32, 6 at reg=40, 5 at reg=48. The thread ceiling
+ * (1536 / 256 = 6) binds at 32 and at 40; the register file only takes over at
+ * 48. And the ranked box confirmed it in flight, publishing
+ *
+ *   gu[reg=40 smem=11584 lmem=0 maxt=1024 occ=6]
+ *
+ * against gu[reg=32 ... occ=6] from the two runs before it. The cap took. No
+ * local memory appeared. Residency did not move. Every pre-committed condition
+ * for "the mechanism worked" was satisfied.
+ *
+ * AND THE DECODE LEG STILL SAID NO. Against the parent tree's own draw:
+ *
+ *   d638bc9  reg=32   decode_speedup 2.31584   prefill 3.5859   composite 2.58333
+ *   c18d702  reg=40   decode_speedup 2.29029   prefill 3.5040   composite 2.54718
+ *
+ * -1.10 percent decode, on a track whose measured decode dispersion is about
+ * 0.32 percent. Single draws on different boxes, and the parent's figure is a
+ * selected maximum, so this is not a clean two-sided experiment -- but it is
+ * emphatically not support, and the submit calculus on this track does not
+ * carry a change that has no positive evidence behind it.
+ *
+ * WHAT THIS COSTS THE GENERAL RULE, which is the part worth reading. The five
+ * register/occupancy results on record before this one all bought RESIDENCY and
+ * paid for it inside the inner loop. The argument for this arm was that it ran
+ * that trade backwards -- spending an unused block's worth of register slack on
+ * the inner loop at unchanged occupancy -- and therefore sat off the trade-off
+ * curve entirely, with no occupancy purchased and so none to lose.
+ *
+ * That argument was wrong, and it was wrong in an informative way. The body
+ * does want more than 32 registers, it does get them, residency does hold, and
+ * decode still does not improve. So the binding constraint on this kernel is
+ * not its register allocation in either direction: not the spills, not the
+ * rematerialisation, not the blocks per SM. It is memory, as the repository's
+ * bandwidth notes already say of every large decode kernel here. Giving a
+ * DRAM-bound inner loop cheaper arithmetic buys nothing, and that is why the
+ * direction of the trade never mattered.
+ *
+ * The practical rule this leaves: on this engine, stop proposing register and
+ * occupancy arms on the big decode kernels. Six attempts, six non-gains, both
+ * directions, with the mechanism verified to have worked in this one. The open
+ * seams are launch edges and device-sync removal, not allocation.
+ */
 #if defined(__CUDACC__) && CUDART_VERSION >= 12040
 #define QW_GU_MAXNREG __maxnreg__(32)
 #else
