@@ -13512,6 +13512,25 @@ __global__ static void hc_split_weighted_sum_fused_kernel(
     }
 }
 
+/* GRID STARVATION, AUDITED AND DELIBERATELY NOT FIXED.  This kernel is the
+ * norm-fused sibling of hc_split_weighted_sum_fused_kernel above, and it is
+ * starved harder: ds4_gpu_hc_split_weighted_sum_norm_tensor launches it only
+ * when n_rows == 1, with a grid of ONE block of 256 threads -- one SM of the
+ * part's forty-eight, running a 2560-column pass.
+ *
+ * No column split can be applied here, and the reason is worth recording so it
+ * is not tried: this kernel couples the columns TWICE over.  It reduces
+ * `sum += acc * acc` over every column into one norm_scale, and it then READS
+ * BACK out[] to write norm_out[].  A second block holding half the columns
+ * would compute half the sum and would read a row another block is still
+ * writing, so a fix needs a two-pass or atomic structure -- a scratch
+ * accumulator plus a second launch -- not a second grid dimension.
+ *
+ * This path is left as shipped rather than redesigned blind: nothing here can
+ * be compiled or run on the authoring machine, and a wrong norm_scale is a
+ * silent numeric change, not a crash.  The n_rows > 1 case does not reach this
+ * kernel at all -- that entry point falls back to the plain kernel plus
+ * ds4_gpu_rms_norm_weight_rows_tensor. */
 __global__ static void hc_split_weighted_sum_norm_fused_kernel(
         float *out,
         float *norm_out,
