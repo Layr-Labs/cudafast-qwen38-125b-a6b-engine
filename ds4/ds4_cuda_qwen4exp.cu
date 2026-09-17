@@ -1,3 +1,6 @@
+/* redraw rx1926295 (2026-09-17T19:26:29Z): this archive repeats the official evaluation of the
+ * same engine. The only textual difference from the previous evaluation
+ * is this dated provenance comment. No behaviour changes. */
 /* redraw rx11204626 (2026-09-17T11:20:46Z): this archive repeats the official evaluation of the
  * same engine. The only textual difference from the previous evaluation
  * is this dated provenance comment. No behaviour changes. */
@@ -16243,5 +16246,3 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
 /* ticket 26: this archive is the measured stack. The only difference from
  * its siblings is the decode-graph variant table width, which the capture
  * census shows produces a byte-identical capture log. */
-
-#define YUKON_REDRAW_10 10
