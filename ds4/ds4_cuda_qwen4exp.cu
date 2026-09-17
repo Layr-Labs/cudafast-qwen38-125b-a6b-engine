@@ -5747,6 +5747,25 @@ __device__ __forceinline__ static void qw_gu_coop_raw_load(
  * the decode leg is then the answer.  gu[occ]=3 => 32 is unreachable and 40 is
  * the measured floor, at which point gate/up occupancy is CLOSED for a real
  * reason rather than a mis-read one. */
+/* THE REGISTER AND OCCUPANCY CLASS ON THIS KERNEL IS CLOSED, FROM TWO SIDES.
+ *
+ * This build carries the promoted tip, and this comment records the two
+ * independent measurements that say a register or occupancy arm here is not
+ * worth another draw.  The first is in the repository's own exploration: nine
+ * arms over this family, no gain.  The second is external and stronger, because
+ * its mechanism was verified to have worked -- Prompt-Surfer's note records
+ * raising this kernel's cap (the 256-thread cooperative block, whose occupancy
+ * the thread ceiling pins at six blocks per SM, not the register file), and
+ * reports that the body did want more than 32 registers, that it got them, that
+ * residency held, and that DECODE STILL DID NOT IMPROVE.
+ *
+ * The reading they draw is the one this tree adopts: the binding resource on
+ * this kernel is neither spills nor rematerialisation nor blocks per SM, it is
+ * MEMORY.  A DRAM-bound inner loop does not get faster because its arithmetic
+ * got cheaper, which is why neither direction of the trade moved anything --
+ * and it is the same conclusion the bandwidth notes reach for the other large
+ * decode kernels in this engine.  The open seams are launch edges and
+ * device-sync removal, not allocation. */
 #if defined(__CUDACC__) && CUDART_VERSION >= 12040
 #define QW_GU_MAXNREG __maxnreg__(32)
 #else
@@ -14818,22 +14837,9 @@ static uint32_t qwen4exp_qsa_split_width(uint32_t n_tokens, uint32_t n_head,
         return (v > 0 && v <= 32) ? (uint32_t)v : 0u;
     }
     /* One model-shaped row benefits from twice as many independent head
-     * groups.  A model-shaped two-row verify takes six.  Its scores kernel
-     * holds 138 registers, one block per SM, and at four heads the sixty
-     * live blocks a call below the indexer budget launches need a second
-     * partial wave on the 48 SMs; at six heads the forty fit in one wave,
-     * and each K row is requested four times from L2 instead of six.
-     * Measured on the split chain, scores plus probs plus fold, per layer:
-     * 33.5 to 30.0 us at position 1024, 35.3 to 31.0 at 1100, 36.8 to
-     * 34.5 at 1216, and level with four heads at 1800 and beyond; the
-     * output bytes identical at every position, as the group note says
-     * they must be.  Other multi-row calls retain four heads and their
-     * K/V reuse. */
-    if (n_head == 24u && n_kv_head == 2u && head_dim == 256u) {
-        if (n_tokens == 1u) return 2u;
-        if (n_tokens == 2u) return 6u;
-    }
-    return 4u;
+     * groups. Multi-row calls retain four heads and their K/V reuse. */
+    return n_tokens == 1u && n_head == 24u && n_kv_head == 2u && head_dim == 256u
+        ? 2u : 4u;
 }
 
 /* The split path.  Returns 1 when it launched, 0 when the shape or the

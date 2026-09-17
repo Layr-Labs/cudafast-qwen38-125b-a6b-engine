@@ -6009,178 +6009,6 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
     }
 }
 
-/* THE ROLLING ARM of the pair-lanes kernel, for the panels the staged arm
- * cannot hold.  The staged arm copies the block's whole four-row run into
- * shared memory before the walk; at in_dim 6144 that panel is 26,112 bytes,
- * residency falls from four blocks per SM to three, and it loses eleven
- * percent.  A phased panel of the same fill, one third of the run at a
- * time, keeps the residency and measures neutral: both forms fetch and
- * then walk, so the fill is never in flight while the walk runs.  Here the
- * panel is two portions of PB groups per row, double buffered, and the NEXT
- * portion is fetched into registers at the top of each phase, flies behind
- * the walk of the current one, and is parked into the other buffer behind
- * it; one barrier per phase publishes the parked portion and retires the
- * walked one.  Measured at 6144 to 2560 with PB 64 over twelve rotating
- * copies: two rows 74.1 to 71.0 us (226 to 235 GB/s), one row 73.2 to 69.5
- * us (228 to 240 GB/s), bit for bit the shipping output.
- *
- * The arithmetic is the walk above on the panel address.  The decoder takes
- * its shift from the address it is given, and the piece base of every row
- * and every portion is a multiple of sixteen bytes, so every word is the
- * word the global walk loads; per thread the groups b ascend across the
- * phases exactly as the rolled walk visits them, b = group, group + 32 and
- * so on, so each accumulator sees the same products in the same order.  PB
- * is a multiple of sixteen, so within a phase every lane of a warp takes
- * the same trips and the pair shuffle keeps its mask; the host requires
- * blocks to be a multiple of PB.  The phase loop and the barriers are
- * block-uniform: rows_here and portion are block-wide values and no barrier
- * sits under the row guard.  The grid dependency sync happens once, after
- * the first portion is parked and before the first activation read, as the
- * staged arm does; the weights do not depend on the predecessor.
- *
- * The launch bound lifts the 64-register cap a bare 256-thread kernel gets
- * from the 1024-thread default, and its two blocks per SM cap the
- * allocation at 128 so no compiler can take the kernel to one.  Capped at
- * 64 the kernel keeps four resident blocks per SM and measures 72.4 us at
- * two rows and 71.1 at one; at two blocks it takes 102 and 88 registers
- * and measures 71.3 and 69.7.  Fewer, deeper blocks win here because each
- * block keeps its next portion in flight on its own, the finding this
- * engine's notes record three times over: residency is not throughput. */
-template <int R, int PB>
-__global__ static void __launch_bounds__(256, 2) matmul_q8_0_preq_pair_lanes_roll_kernel(
-        float *out, const unsigned char *w,
-        const int8_t *xq, const float *xscale,
-        uint64_t out_dim, uint32_t n_rows, uint64_t blocks) {
-    extern __shared__ uint4 qw_pl_panel[];
-    char *const gpanel = (char *)qw_pl_panel;
-    constexpr uint64_t PIECE = (uint64_t)PB * 34u;
-    constexpr uint64_t BUF = 4u * PIECE;
-    constexpr int NV = (int)((BUF + 4095u) / 4096u);
-    const uint32_t local_row = threadIdx.x >> 6u;
-    const uint32_t local_lane = threadIdx.x & 63u;
-    const uint32_t group = local_lane >> 1u;
-    const uint32_t half = local_lane & 1u;
-    const uint64_t row = (uint64_t)blockIdx.x * 4u + local_row;
-    const uint32_t row0 = blockIdx.y * R;
-    const uint32_t take = n_rows - row0 < R ? n_rows - row0 : R;
-    float acc[R];
-#pragma unroll
-    for (int r = 0; r < R; r++) acc[r] = 0.0f;
-
-    /* Block-uniform, above every barrier. */
-    const uint64_t rows_here = out_dim - (uint64_t)blockIdx.x * 4u < 4u
-                             ? out_dim - (uint64_t)blockIdx.x * 4u : 4u;
-    const char *const gp = (const char *)w + (uint64_t)blockIdx.x * 4u * blocks * 34u;
-    const uint64_t portion = rows_here * PIECE;
-    const uint64_t nph = blocks / PB;
-    uint4 nx[NV];
-#pragma unroll
-    for (int k = 0; k < NV; k++) nx[k] = make_uint4(0u, 0u, 0u, 0u);
-
-    /* Portion p into registers: thread t carries the uint4 at panel offsets
-     * (t + 256 k) * 16, dense in the panel and row-strided in the slab. */
-#define QW_PL_ROLL_FETCH(p_)                                                   \
-    do {                                                                       \
-        _Pragma("unroll")                                                      \
-        for (int k = 0; k < NV; k++) {                                         \
-            const uint64_t i_ = ((uint64_t)threadIdx.x + 256u * (uint64_t)k) * 16u; \
-            if (i_ < portion) {                                                \
-                const uint64_t r_ = i_ / PIECE, off_ = i_ - r_ * PIECE;        \
-                nx[k] = *(const uint4 *)(const void *)(gp + r_ * blocks * 34u + \
-                                                       (uint64_t)(p_) * PIECE + off_); \
-            }                                                                  \
-        }                                                                      \
-    } while (0)
-#define QW_PL_ROLL_PARK(buf_)                                                  \
-    do {                                                                       \
-        _Pragma("unroll")                                                      \
-        for (int k = 0; k < NV; k++) {                                         \
-            const uint64_t i_ = ((uint64_t)threadIdx.x + 256u * (uint64_t)k) * 16u; \
-            if (i_ < portion) *(uint4 *)((buf_) + i_) = nx[k];                 \
-        }                                                                      \
-    } while (0)
-
-    QW_PL_ROLL_FETCH(0u);
-    QW_PL_ROLL_PARK(gpanel);
-    QWEN4EXP_PDL_SYNC();
-    __syncthreads();
-
-    for (uint64_t p = 0; p < nph; p++) {
-        const char *const cur = gpanel + (p & 1u) * BUF;
-        char *const nxt = gpanel + ((p + 1u) & 1u) * BUF;
-        const bool more = p + 1u < nph;
-        if (more) QW_PL_ROLL_FETCH(p + 1u);
-        if (row < out_dim) {
-            const unsigned char *wr = (const unsigned char *)(cur + (uint64_t)local_row * PIECE);
-            const uint64_t b_lo = p * (uint64_t)PB, b_hi = b_lo + (uint64_t)PB;
-            /* The smallest b = group + 32 k at or past b_lo. */
-            for (uint64_t b = (uint64_t)group + ((b_lo + 31u - group) / 32u) * 32u;
-                 b < b_hi; b += 32u) {
-                /* Name both lanes of every live pair even if independent
-                 * scheduling has temporarily separated their execution. */
-                const uint64_t warp_base = b - (uint64_t)(group & 15u);
-                const uint64_t remaining = blocks - warp_base;
-                const uint32_t live_pairs = (uint32_t)(remaining < 16u ? remaining : 16u);
-                const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
-                const int8_t *payload = (const int8_t *)(wr + (b - b_lo) * 34u + 2u) + half * 16u;
-                const uintptr_t address = (uintptr_t)payload;
-                const uint32_t shift = (uint32_t)(address & 3u) * 8u;
-                const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
-                uint32_t previous = words[0];
-                int32_t wq[4];
-#pragma unroll
-                for (int j = 0; j < 3; j++) {
-                    const uint32_t next = words[j + 1];
-                    wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
-                    previous = next;
-                }
-                const uint16_t *lastp = (const uint16_t *)(const void *)(payload + 14);
-                const uint16_t last = *lastp;
-                wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
-                const __half *scale = (const __half *)(wr + (b - b_lo) * 34u);
-                const float ws = __half2float(*scale);
-#pragma unroll
-                for (int r = 0; r < R; r++) {
-                    if ((uint32_t)r < take) {
-                        const uint64_t at = ((uint64_t)row0 + r) * blocks + b;
-                        const int32_t *xw = (const int32_t *)(xq + at * 32u + half * 16u);
-                        int dot = 0;
-#pragma unroll
-                        for (int j = 0; j < 4; j++) dot = __dp4a(wq[j], xw[j], dot);
-                        dot += __shfl_xor_sync(active, dot, 1);
-                        if (half == 0u) acc[r] += ws * xscale[at] * (float)dot;
-                    }
-                }
-            }
-        }
-        if (more) QW_PL_ROLL_PARK(nxt);
-        __syncthreads();
-    }
-#undef QW_PL_ROLL_FETCH
-#undef QW_PL_ROLL_PARK
-
-    /* Pair logical groups g and g + 16 before the remaining four levels
-     * of the original 32-leaf reduction tree.  Physical even lanes are
-     * logical lanes 0..15, so distances 16,8,4,2 preserve operand order. */
-    __shared__ float upper[R][4][16];
-    if (half == 0u && local_lane >= 32u) {
-#pragma unroll
-        for (int r = 0; r < R; r++) upper[r][local_row][group - 16u] = acc[r];
-    }
-    __syncthreads();
-    if (local_lane < 32u && half == 0u) {
-#pragma unroll
-        for (int r = 0; r < R; r++) {
-            float total = acc[r] + upper[r][local_row][group];
-#pragma unroll
-            for (int d = 16; d >= 2; d >>= 1)
-                total += __shfl_down_sync(0x55555555u, total, d);
-            if (local_lane == 0u && row < out_dim && (uint32_t)r < take)
-                out[((uint64_t)row0 + r) * out_dim + row] = total;
-        }
-    }
-}
-
 /* HC down has only 320 outputs. Two lanes per group expose more integer
  * work while one 64-thread block owns each output. Retain all 32 original
  * float chains and their reduction tree; only the integer dot is split.
@@ -13684,6 +13512,25 @@ __global__ static void hc_split_weighted_sum_fused_kernel(
     }
 }
 
+/* GRID STARVATION, AUDITED AND DELIBERATELY NOT FIXED.  This kernel is the
+ * norm-fused sibling of hc_split_weighted_sum_fused_kernel above, and it is
+ * starved harder: ds4_gpu_hc_split_weighted_sum_norm_tensor launches it only
+ * when n_rows == 1, with a grid of ONE block of 256 threads -- one SM of the
+ * part's forty-eight, running a 2560-column pass.
+ *
+ * No column split can be applied here, and the reason is worth recording so it
+ * is not tried: this kernel couples the columns TWICE over.  It reduces
+ * `sum += acc * acc` over every column into one norm_scale, and it then READS
+ * BACK out[] to write norm_out[].  A second block holding half the columns
+ * would compute half the sum and would read a row another block is still
+ * writing, so a fix needs a two-pass or atomic structure -- a scratch
+ * accumulator plus a second launch -- not a second grid dimension.
+ *
+ * This path is left as shipped rather than redesigned blind: nothing here can
+ * be compiled or run on the authoring machine, and a wrong norm_scale is a
+ * silent numeric change, not a crash.  The n_rows > 1 case does not reach this
+ * kernel at all -- that entry point falls back to the plain kernel plus
+ * ds4_gpu_rms_norm_weight_rows_tensor. */
 __global__ static void hc_split_weighted_sum_norm_fused_kernel(
         float *out,
         float *norm_out,
@@ -17562,13 +17409,6 @@ int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows) {
  * change after the first call and a captured graph replays the launches it
  * recorded, so the choice is capture-safe.  Defined here so both translation
  * units share one cached read of the environment. */
-/* This build's note auto09170921_2 records that the first benchd run inside
- * a fresh model residency is systematically slower than the ones after it
- * in the same residency, by as much as forty-seven percent in the worst
- * case observed, because it pays the untimed correctness phase's graph
- * captures and first-touch costs. A local comparison that does not discard
- * each residency's first run is measuring which arm happened to go first.
- */
 int ds4_qwen4exp_pdl_enabled(void) {
     static int resolved = 0;
     static int enabled = 0;
@@ -18015,30 +17855,7 @@ static int cuda_matmul_q8_0_preq_rows_exact(
             const int pl_stage = pl_panel <= 12288u &&
                 (((uintptr_t)wptr) & 15u) == 0u &&
                 getenv("DS4_QWEN4EXP_NO_PAIR_LANES_STAGE") == NULL;
-            /* THE ROLLING ARM'S GATE: the panels the staged arm declines,
-             * where sixty-four groups divide the row, on a sixteen-byte
-             * aligned slab.  Its shared request is two portions of four
-             * rows of sixty-four groups, 17,408 bytes, inside the default
-             * carveout; at in_dim 6144 the kernel measures 2 resident
-             * blocks per SM against the shipping kernel's 4 and still runs
-             * 4 to 5 percent faster, because every resident block keeps
-             * its next portion in flight behind its walk (the kernel's own
-             * note has the numbers).  DS4_QWEN4EXP_NO_PAIR_LANES_ROLL
-             * restores the shipping kernel from the same binary. */
-            const size_t pl_roll_smem = (size_t)2u * 4u * 64u * 34u;
-            const int pl_roll = pl_panel > 12288u && (blocks % 64u) == 0u &&
-                (((uintptr_t)wptr) & 15u) == 0u &&
-                getenv("DS4_QWEN4EXP_NO_PAIR_LANES_ROLL") == NULL;
-            if (n_rows == 1u && pl_roll &&
-                getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL) {
-                /* PDL consumer as below; the first portion rides the window. */
-                QWEN4EXP_LAUNCH_PDL(
-                        (matmul_q8_0_preq_pair_lanes_roll_kernel<1, 64>),
-                        (dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u)),
-                        256, pl_roll_smem, cuda_decode_stream(),
-                        (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
-                        out_dim, n_rows, blocks);
-            } else if (n_rows == 1u && pl_stage &&
+            if (n_rows == 1u && pl_stage &&
                 getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL) {
                 /* PDL consumer as below; the staged fill rides the window. */
                 QWEN4EXP_LAUNCH_PDL(
@@ -18071,13 +17888,6 @@ static int cuda_matmul_q8_0_preq_rows_exact(
                 matmul_q8_0_preq_pair_lanes_kernel<2, false><<<
                         dim3((unsigned)((out_dim + 3u) / 4u), 2u, 1u),
                         256, 0, cuda_decode_stream()>>>(
-                        (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
-                        out_dim, n_rows, blocks);
-            } else if (pl_roll) {
-                QWEN4EXP_LAUNCH_PDL(
-                        (matmul_q8_0_preq_pair_lanes_roll_kernel<2, 64>),
-                        (dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u)),
-                        256, pl_roll_smem, cuda_decode_stream(),
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
                         out_dim, n_rows, blocks);
             } else if (pl_stage) {
