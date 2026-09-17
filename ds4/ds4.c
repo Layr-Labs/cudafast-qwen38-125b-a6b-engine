@@ -76066,10 +76066,26 @@ static int qwen4exp_seam_head_logits(void *ctx, const float *hc_row,
                                           hc_row, logits) ? 0 : -1;
 }
 
+/* The head's launch-to-sync window, spent on the next verify's n-gram rows:
+ * the posted token's table reads and dequant run here, on this thread, while
+ * the device finishes the forward the batch end is about to wait on. */
+static void qwen4exp_seam_ple_presync(void *ctx) {
+    ds4_session *s = ctx;
+    ds4_qwen4exp_ple_pg_presync(s->engine->qwen4exp_session);
+}
+
 static int qwen4exp_seam_draft_step(void *ctx, int next_token,
                                     const float *hc_row, uint32_t pos,
                                     int *draft_out, float *multi_out) {
     ds4_session *s = ctx;
+    ds4_qwen4exp_session *qs = s->engine->qwen4exp_session;
+    /* The first draft call of a chain reseeds the shadow history from the
+     * live one -- the rollback has already restored it to the accepted
+     * prefix -- and every call posts the token it feeds, so the head's
+     * launch-to-sync window gathers the row the next verify will need. */
+    if (!qs->ple_pg_armed)
+        ds4_qwen4exp_ple_pg_reseed(qs, s->engine->qwen4exp_weights);
+    ds4_qwen4exp_ple_pg_post(qs, (int32_t)next_token);
     char err[256];
     if (ds4_qwen4exp_mtp_head_forward(&s->qwen4exp_head, &next_token, hc_row,
                                       pos, 1u, draft_out, multi_out,
@@ -76103,6 +76119,13 @@ static int qwen4exp_seam_draft_rows(void *ctx, const int *next_tokens,
                                     uint32_t n, int *draft_out,
                                     float *multi_out) {
     ds4_session *s = ctx;
+    ds4_qwen4exp_session *qs = s->engine->qwen4exp_session;
+    /* The commit point: the rollback has already restored the live n-gram
+     * history to the accepted prefix, so the shadow reseeds from it and the
+     * fed token -- the last row's input -- is posted for the head's
+     * launch-to-sync window to gather. */
+    ds4_qwen4exp_ple_pg_reseed(qs, s->engine->qwen4exp_weights);
+    ds4_qwen4exp_ple_pg_post(qs, (int32_t)next_tokens[n - 1u]);
     char err[256];
     if (ds4_qwen4exp_mtp_head_forward_last(&s->qwen4exp_head, next_tokens,
                                            hc_rows, pos0, n, draft_out,
@@ -76231,6 +76254,9 @@ static bool ds4_session_qwen4exp_spec_init(ds4_session *s,
                         s->qwen4exp_spec.drop_margin > 0.0f ||
                         s->qwen4exp_spec.margin_log;
     head->last_margin = -1.0f;
+    /* The draft-window gather: the batch-end hook spends each head forward's
+     * launch-to-sync window on the n-gram rows the next verify will read. */
+    ds4_gpu_set_pre_sync(qwen4exp_seam_ple_presync, s);
     s->qwen4exp_spec_failed = false;
     s->qwen4exp_spec_ready = true;
     return true;
