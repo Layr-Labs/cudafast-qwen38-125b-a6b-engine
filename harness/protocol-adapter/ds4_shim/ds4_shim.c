@@ -241,8 +241,12 @@ int ds4s_top_logits(const ds4s_handle *h, int k, int32_t *ids, float *logits) {
         set_err((ds4s_handle *)h, "out of memory allocating the top-k buffer");
         return 0;
     }
-    const int n = ds4_session_top_logprobs(h->session, scores, k);
-    if (n <= 0) set_err((ds4s_handle *)h, "ds4_session_top_logprobs returned no finite logits");
+    /* Only `id` and `logit` are copied out below, so ask for the ranked list
+     * without the softmax normalisation: `logprob` is dead on this wire and
+     * computing it costs a second full-vocabulary pass of double exp() per
+     * call.  Both timed verbs land here, so neither is favoured. */
+    const int n = ds4_session_top_logits(h->session, scores, k);
+    if (n <= 0) set_err((ds4s_handle *)h, "ds4_session_top_logits returned no finite logits");
     int written = 0;
     for (int i = 0; i < n && i < k; i++) {
         if (scores[i].id < 0) break;
