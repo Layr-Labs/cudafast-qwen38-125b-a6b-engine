@@ -6009,6 +6009,178 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
     }
 }
 
+/* THE ROLLING ARM of the pair-lanes kernel, for the panels the staged arm
+ * cannot hold.  The staged arm copies the block's whole four-row run into
+ * shared memory before the walk; at in_dim 6144 that panel is 26,112 bytes,
+ * residency falls from four blocks per SM to three, and it loses eleven
+ * percent.  A phased panel of the same fill, one third of the run at a
+ * time, keeps the residency and measures neutral: both forms fetch and
+ * then walk, so the fill is never in flight while the walk runs.  Here the
+ * panel is two portions of PB groups per row, double buffered, and the NEXT
+ * portion is fetched into registers at the top of each phase, flies behind
+ * the walk of the current one, and is parked into the other buffer behind
+ * it; one barrier per phase publishes the parked portion and retires the
+ * walked one.  Measured at 6144 to 2560 with PB 64 over twelve rotating
+ * copies: two rows 74.1 to 71.0 us (226 to 235 GB/s), one row 73.2 to 69.5
+ * us (228 to 240 GB/s), bit for bit the shipping output.
+ *
+ * The arithmetic is the walk above on the panel address.  The decoder takes
+ * its shift from the address it is given, and the piece base of every row
+ * and every portion is a multiple of sixteen bytes, so every word is the
+ * word the global walk loads; per thread the groups b ascend across the
+ * phases exactly as the rolled walk visits them, b = group, group + 32 and
+ * so on, so each accumulator sees the same products in the same order.  PB
+ * is a multiple of sixteen, so within a phase every lane of a warp takes
+ * the same trips and the pair shuffle keeps its mask; the host requires
+ * blocks to be a multiple of PB.  The phase loop and the barriers are
+ * block-uniform: rows_here and portion are block-wide values and no barrier
+ * sits under the row guard.  The grid dependency sync happens once, after
+ * the first portion is parked and before the first activation read, as the
+ * staged arm does; the weights do not depend on the predecessor.
+ *
+ * The launch bound lifts the 64-register cap a bare 256-thread kernel gets
+ * from the 1024-thread default, and its two blocks per SM cap the
+ * allocation at 128 so no compiler can take the kernel to one.  Capped at
+ * 64 the kernel keeps four resident blocks per SM and measures 72.4 us at
+ * two rows and 71.1 at one; at two blocks it takes 102 and 88 registers
+ * and measures 71.3 and 69.7.  Fewer, deeper blocks win here because each
+ * block keeps its next portion in flight on its own, the finding this
+ * engine's notes record three times over: residency is not throughput. */
+template <int R, int PB>
+__global__ static void __launch_bounds__(256, 2) matmul_q8_0_preq_pair_lanes_roll_kernel(
+        float *out, const unsigned char *w,
+        const int8_t *xq, const float *xscale,
+        uint64_t out_dim, uint32_t n_rows, uint64_t blocks) {
+    extern __shared__ uint4 qw_pl_panel[];
+    char *const gpanel = (char *)qw_pl_panel;
+    constexpr uint64_t PIECE = (uint64_t)PB * 34u;
+    constexpr uint64_t BUF = 4u * PIECE;
+    constexpr int NV = (int)((BUF + 4095u) / 4096u);
+    const uint32_t local_row = threadIdx.x >> 6u;
+    const uint32_t local_lane = threadIdx.x & 63u;
+    const uint32_t group = local_lane >> 1u;
+    const uint32_t half = local_lane & 1u;
+    const uint64_t row = (uint64_t)blockIdx.x * 4u + local_row;
+    const uint32_t row0 = blockIdx.y * R;
+    const uint32_t take = n_rows - row0 < R ? n_rows - row0 : R;
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) acc[r] = 0.0f;
+
+    /* Block-uniform, above every barrier. */
+    const uint64_t rows_here = out_dim - (uint64_t)blockIdx.x * 4u < 4u
+                             ? out_dim - (uint64_t)blockIdx.x * 4u : 4u;
+    const char *const gp = (const char *)w + (uint64_t)blockIdx.x * 4u * blocks * 34u;
+    const uint64_t portion = rows_here * PIECE;
+    const uint64_t nph = blocks / PB;
+    uint4 nx[NV];
+#pragma unroll
+    for (int k = 0; k < NV; k++) nx[k] = make_uint4(0u, 0u, 0u, 0u);
+
+    /* Portion p into registers: thread t carries the uint4 at panel offsets
+     * (t + 256 k) * 16, dense in the panel and row-strided in the slab. */
+#define QW_PL_ROLL_FETCH(p_)                                                   \
+    do {                                                                       \
+        _Pragma("unroll")                                                      \
+        for (int k = 0; k < NV; k++) {                                         \
+            const uint64_t i_ = ((uint64_t)threadIdx.x + 256u * (uint64_t)k) * 16u; \
+            if (i_ < portion) {                                                \
+                const uint64_t r_ = i_ / PIECE, off_ = i_ - r_ * PIECE;        \
+                nx[k] = *(const uint4 *)(const void *)(gp + r_ * blocks * 34u + \
+                                                       (uint64_t)(p_) * PIECE + off_); \
+            }                                                                  \
+        }                                                                      \
+    } while (0)
+#define QW_PL_ROLL_PARK(buf_)                                                  \
+    do {                                                                       \
+        _Pragma("unroll")                                                      \
+        for (int k = 0; k < NV; k++) {                                         \
+            const uint64_t i_ = ((uint64_t)threadIdx.x + 256u * (uint64_t)k) * 16u; \
+            if (i_ < portion) *(uint4 *)((buf_) + i_) = nx[k];                 \
+        }                                                                      \
+    } while (0)
+
+    QW_PL_ROLL_FETCH(0u);
+    QW_PL_ROLL_PARK(gpanel);
+    QWEN4EXP_PDL_SYNC();
+    __syncthreads();
+
+    for (uint64_t p = 0; p < nph; p++) {
+        const char *const cur = gpanel + (p & 1u) * BUF;
+        char *const nxt = gpanel + ((p + 1u) & 1u) * BUF;
+        const bool more = p + 1u < nph;
+        if (more) QW_PL_ROLL_FETCH(p + 1u);
+        if (row < out_dim) {
+            const unsigned char *wr = (const unsigned char *)(cur + (uint64_t)local_row * PIECE);
+            const uint64_t b_lo = p * (uint64_t)PB, b_hi = b_lo + (uint64_t)PB;
+            /* The smallest b = group + 32 k at or past b_lo. */
+            for (uint64_t b = (uint64_t)group + ((b_lo + 31u - group) / 32u) * 32u;
+                 b < b_hi; b += 32u) {
+                /* Name both lanes of every live pair even if independent
+                 * scheduling has temporarily separated their execution. */
+                const uint64_t warp_base = b - (uint64_t)(group & 15u);
+                const uint64_t remaining = blocks - warp_base;
+                const uint32_t live_pairs = (uint32_t)(remaining < 16u ? remaining : 16u);
+                const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
+                const int8_t *payload = (const int8_t *)(wr + (b - b_lo) * 34u + 2u) + half * 16u;
+                const uintptr_t address = (uintptr_t)payload;
+                const uint32_t shift = (uint32_t)(address & 3u) * 8u;
+                const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
+                uint32_t previous = words[0];
+                int32_t wq[4];
+#pragma unroll
+                for (int j = 0; j < 3; j++) {
+                    const uint32_t next = words[j + 1];
+                    wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
+                    previous = next;
+                }
+                const uint16_t *lastp = (const uint16_t *)(const void *)(payload + 14);
+                const uint16_t last = *lastp;
+                wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
+                const __half *scale = (const __half *)(wr + (b - b_lo) * 34u);
+                const float ws = __half2float(*scale);
+#pragma unroll
+                for (int r = 0; r < R; r++) {
+                    if ((uint32_t)r < take) {
+                        const uint64_t at = ((uint64_t)row0 + r) * blocks + b;
+                        const int32_t *xw = (const int32_t *)(xq + at * 32u + half * 16u);
+                        int dot = 0;
+#pragma unroll
+                        for (int j = 0; j < 4; j++) dot = __dp4a(wq[j], xw[j], dot);
+                        dot += __shfl_xor_sync(active, dot, 1);
+                        if (half == 0u) acc[r] += ws * xscale[at] * (float)dot;
+                    }
+                }
+            }
+        }
+        if (more) QW_PL_ROLL_PARK(nxt);
+        __syncthreads();
+    }
+#undef QW_PL_ROLL_FETCH
+#undef QW_PL_ROLL_PARK
+
+    /* Pair logical groups g and g + 16 before the remaining four levels
+     * of the original 32-leaf reduction tree.  Physical even lanes are
+     * logical lanes 0..15, so distances 16,8,4,2 preserve operand order. */
+    __shared__ float upper[R][4][16];
+    if (half == 0u && local_lane >= 32u) {
+#pragma unroll
+        for (int r = 0; r < R; r++) upper[r][local_row][group - 16u] = acc[r];
+    }
+    __syncthreads();
+    if (local_lane < 32u && half == 0u) {
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            float total = acc[r] + upper[r][local_row][group];
+#pragma unroll
+            for (int d = 16; d >= 2; d >>= 1)
+                total += __shfl_down_sync(0x55555555u, total, d);
+            if (local_lane == 0u && row < out_dim && (uint32_t)r < take)
+                out[((uint64_t)row0 + r) * out_dim + row] = total;
+        }
+    }
+}
+
 /* HC down has only 320 outputs. Two lanes per group expose more integer
  * work while one 64-thread block owns each output. Retain all 32 original
  * float chains and their reduction tree; only the integer dot is split.
@@ -6895,21 +7067,63 @@ matmul_q8_0_preq_rows_mma_pipe_kernel(float *out,
         q8_mma_bar_arrive(2 + 2 * buf, BAR_COUNT);
     }
 
+    /* The tile through shared memory, stored as whole rows.  The MMA layout
+     * leaves every thread two adjacent floats of eight rows, a scattered
+     * 8-byte store pattern; staged through the stage buffers the K loop has
+     * finished with, a row goes out as 512-byte lines.  The values are the
+     * accumulators, moved; no arithmetic.  Every production rung's tile fits
+     * its stage buffers; a rung whose tile would not (the 256-wide opt-in)
+     * keeps the direct store. */
+    constexpr bool row_store = BM * (BN + 4) * 4 <= C::SMEM;
+    if (!row_store) {
+#pragma unroll
+        for (int mi = 0; mi < MT; mi++) {
+            const uint64_t r_lo = (uint64_t)m0 + wm * MT * 16 + mi * 16 + g4;
+            const uint64_t r_hi = r_lo + 8u;
+#pragma unroll
+            for (int ni = 0; ni < NT; ni++) {
+                const uint64_t c0 = n0 + wn * NT * 8 + ni * 8 + t4 * 2u;
+                const uint64_t c1 = c0 + 1u;
+                if (r_lo < (uint64_t)n_rows) {
+                    if (c0 < out_dim) out[r_lo * out_dim + c0] = acc[mi][ni][0];
+                    if (c1 < out_dim) out[r_lo * out_dim + c1] = acc[mi][ni][1];
+                }
+                if (r_hi < (uint64_t)n_rows) {
+                    if (c0 < out_dim) out[r_hi * out_dim + c0] = acc[mi][ni][2];
+                    if (c1 < out_dim) out[r_hi * out_dim + c1] = acc[mi][ni][3];
+                }
+            }
+        }
+        return;
+    }
+    q8_mma_bar_sync(13, C::CWARPS * 32);   /* every consumer has left the last stage */
+    float *tile = (float *)q8_mma_smem;
+    constexpr int TS = BN + 4;
 #pragma unroll
     for (int mi = 0; mi < MT; mi++) {
-        const uint64_t r_lo = (uint64_t)m0 + wm * MT * 16 + mi * 16 + g4;
-        const uint64_t r_hi = r_lo + 8u;
+        const int rl = wm * MT * 16 + mi * 16 + (int)g4, rh = rl + 8;
 #pragma unroll
         for (int ni = 0; ni < NT; ni++) {
-            const uint64_t c0 = n0 + wn * NT * 8 + ni * 8 + t4 * 2u;
-            const uint64_t c1 = c0 + 1u;
-            if (r_lo < (uint64_t)n_rows) {
-                if (c0 < out_dim) out[r_lo * out_dim + c0] = acc[mi][ni][0];
-                if (c1 < out_dim) out[r_lo * out_dim + c1] = acc[mi][ni][1];
-            }
-            if (r_hi < (uint64_t)n_rows) {
-                if (c0 < out_dim) out[r_hi * out_dim + c0] = acc[mi][ni][2];
-                if (c1 < out_dim) out[r_hi * out_dim + c1] = acc[mi][ni][3];
+            const int c = wn * NT * 8 + ni * 8 + (int)t4 * 2;
+            tile[rl * TS + c] = acc[mi][ni][0];
+            tile[rl * TS + c + 1] = acc[mi][ni][1];
+            tile[rh * TS + c] = acc[mi][ni][2];
+            tile[rh * TS + c + 1] = acc[mi][ni][3];
+        }
+    }
+    q8_mma_bar_sync(13, C::CWARPS * 32);   /* the tile is whole */
+    const bool vec = (out_dim & 3u) == 0u && ((((uintptr_t)out) & 15u) == 0u);
+    for (int r = warp; r < BM; r += C::CWARPS) {
+        const uint64_t row = (uint64_t)m0 + (uint32_t)r;
+        if (row >= (uint64_t)n_rows) continue;
+        for (int c = (int)lane * 4; c < BN; c += 128) {
+            if (vec && n0 + (uint32_t)c + 3u < out_dim) {
+                *(float4 *)(out + row * out_dim + n0 + (uint32_t)c) = *(const float4 *)(tile + r * TS + c);
+            } else {
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    if (n0 + (uint32_t)(c + e) < out_dim) out[row * out_dim + n0 + (uint32_t)(c + e)] = tile[r * TS + c + e];
+                }
             }
         }
     }
@@ -17397,6 +17611,11 @@ int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows) {
  * captures and first-touch costs. A local comparison that does not discard
  * each residency's first run is measuring which arm happened to go first.
  */
+/* This build's note auto09171113_1 records that a staging depth that feeds
+ * an accumulation is not a tuning knob: halving the normalisation staging
+ * depth builds and launches cleanly and then fails the correctness gate,
+ * because the depth also sets the order of the sum of squares.
+ */
 int ds4_qwen4exp_pdl_enabled(void) {
     static int resolved = 0;
     static int enabled = 0;
@@ -17843,7 +18062,30 @@ static int cuda_matmul_q8_0_preq_rows_exact(
             const int pl_stage = pl_panel <= 12288u &&
                 (((uintptr_t)wptr) & 15u) == 0u &&
                 getenv("DS4_QWEN4EXP_NO_PAIR_LANES_STAGE") == NULL;
-            if (n_rows == 1u && pl_stage &&
+            /* THE ROLLING ARM'S GATE: the panels the staged arm declines,
+             * where sixty-four groups divide the row, on a sixteen-byte
+             * aligned slab.  Its shared request is two portions of four
+             * rows of sixty-four groups, 17,408 bytes, inside the default
+             * carveout; at in_dim 6144 the kernel measures 2 resident
+             * blocks per SM against the shipping kernel's 4 and still runs
+             * 4 to 5 percent faster, because every resident block keeps
+             * its next portion in flight behind its walk (the kernel's own
+             * note has the numbers).  DS4_QWEN4EXP_NO_PAIR_LANES_ROLL
+             * restores the shipping kernel from the same binary. */
+            const size_t pl_roll_smem = (size_t)2u * 4u * 64u * 34u;
+            const int pl_roll = pl_panel > 12288u && (blocks % 64u) == 0u &&
+                (((uintptr_t)wptr) & 15u) == 0u &&
+                getenv("DS4_QWEN4EXP_NO_PAIR_LANES_ROLL") == NULL;
+            if (n_rows == 1u && pl_roll &&
+                getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL) {
+                /* PDL consumer as below; the first portion rides the window. */
+                QWEN4EXP_LAUNCH_PDL(
+                        (matmul_q8_0_preq_pair_lanes_roll_kernel<1, 64>),
+                        (dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u)),
+                        256, pl_roll_smem, cuda_decode_stream(),
+                        (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
+                        out_dim, n_rows, blocks);
+            } else if (n_rows == 1u && pl_stage &&
                 getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL) {
                 /* PDL consumer as below; the staged fill rides the window. */
                 QWEN4EXP_LAUNCH_PDL(
@@ -17876,6 +18118,13 @@ static int cuda_matmul_q8_0_preq_rows_exact(
                 matmul_q8_0_preq_pair_lanes_kernel<2, false><<<
                         dim3((unsigned)((out_dim + 3u) / 4u), 2u, 1u),
                         256, 0, cuda_decode_stream()>>>(
+                        (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
+                        out_dim, n_rows, blocks);
+            } else if (pl_roll) {
+                QWEN4EXP_LAUNCH_PDL(
+                        (matmul_q8_0_preq_pair_lanes_roll_kernel<2, 64>),
+                        (dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u)),
+                        256, pl_roll_smem, cuda_decode_stream(),
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
                         out_dim, n_rows, blocks);
             } else if (pl_stage) {
@@ -19060,6 +19309,106 @@ static void matmul_f32_warp_tile8_kernel(
     }
 }
 
+/* The eight-warp tile over TWO projections of one input, alpha and beta of
+ * the gated delta net ([2560, 48] each): column tiles past the first
+ * projection's take the second weight and write the second output, so the
+ * 10 MB activation tensor is read once for both.  Nothing a warp computes
+ * changes: a column tile never straddles the two, and each one runs
+ * matmul_f32_warp_tile8_kernel's text over its own weight, chain for
+ * chain and fold for fold, so every output is the bits the single launch
+ * stores.  tests/test_qwen4exp_gdn holds the pair to the two launches. */
+template <int TM, int TN, int WR, int WC, int MC>
+__global__ __launch_bounds__(32 * WR * WC, 1)
+static void matmul_f32_warp_tile8_pair_kernel(
+        float *out,
+        const float *w,
+        float *out2,
+        const float *w2,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint32_t n_rows) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5;
+    const uint32_t wr_i = warp / (uint32_t)WC, wc_i = warp % (uint32_t)WC;
+    uint32_t tile = blockIdx.x * (uint32_t)WC + wc_i;
+    const uint32_t ntn = (uint32_t)(out_dim / (uint64_t)TN);
+    /* Two projections of one input in one launch: column tiles past the
+     * first take the second weight and write the second output.  A tile
+     * never straddles the two, so every column's chain is the one the
+     * single-projection launch walks. */
+    if (tile >= 2u * ntn) return;
+    if (tile >= ntn) {
+        tile -= ntn;
+        w = w2;
+        out = out2;
+    }
+    const uint32_t col0 = tile * (uint32_t)TN;
+    const uint32_t row0 = (blockIdx.y * (uint32_t)WR + wr_i) * (uint32_t)TM;
+    if (row0 >= n_rows) return;
+    const uint32_t take = n_rows - row0 < (uint32_t)TM ? n_rows - row0
+                                                       : (uint32_t)TM;
+
+    const float *wr[TN];
+    const float *xr[TM];
+#pragma unroll
+    for (int c = 0; c < TN; c++) wr[c] = w + (uint64_t)(col0 + c) * in_dim;
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+        xr[t] = x + (uint64_t)(row0 + (t < (int)take ? (uint32_t)t : 0u)) * in_dim;
+    const uint32_t mcnt = (uint32_t)(in_dim >> 8);
+
+    float A[TM][TN], B[TM][TN], t0[TM][TN], t1[TM][TN];
+
+    /* h(p,64) = (c_p + c_{p+128}) + (c_{p+64} + c_{p+192}) */
+    matmul_f32_warp_tile_pair<TM, TN, MC>(t0, t1, 0u, 4u, lane, mcnt, wr, xr);
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int c = 0; c < TN; c++) A[t][c] = t0[t][c] + t1[t][c];
+    matmul_f32_warp_tile_pair<TM, TN, MC>(t0, t1, 2u, 6u, lane, mcnt, wr, xr);
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int c = 0; c < TN; c++) A[t][c] = A[t][c] + (t0[t][c] + t1[t][c]);
+    /* h(p+32,64) = (c_{p+32} + c_{p+160}) + (c_{p+96} + c_{p+224}) */
+    matmul_f32_warp_tile_pair<TM, TN, MC>(t0, t1, 1u, 5u, lane, mcnt, wr, xr);
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int c = 0; c < TN; c++) B[t][c] = t0[t][c] + t1[t][c];
+    matmul_f32_warp_tile_pair<TM, TN, MC>(t0, t1, 3u, 7u, lane, mcnt, wr, xr);
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int c = 0; c < TN; c++) B[t][c] = B[t][c] + (t0[t][c] + t1[t][c]);
+
+    /* h(p,32) = h(p,64) + h(p+32,64), then strides 16, 8, 4, 2, 1. */
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int c = 0; c < TN; c++) {
+            float s = A[t][c] + B[t][c];
+#pragma unroll
+            for (int d = 16; d > 0; d >>= 1) {
+                s = s + __shfl_down_sync(0xffffffffu, s, d);
+            }
+            A[t][c] = s;
+        }
+    if (lane == 0u) {
+#pragma unroll
+        for (int t = 0; t < TM; t++) {
+            if ((uint32_t)t < take) {
+#pragma unroll
+                for (int c = 0; c < TN; c++) {
+                    out[(uint64_t)(row0 + (uint32_t)t) * out_dim +
+                        (uint64_t)(col0 + (uint32_t)c)] = A[t][c];
+                }
+            }
+        }
+    }
+}
+
 /* The eight-warp arrangement: four row groups by two column groups, so a
  * block covers 24 rows by 16 columns.  DS4_F32_NO_WARP_TILE8 keeps the
  * four-warp kernel above. */
@@ -19755,6 +20104,73 @@ extern "C" int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
                 in_dim, out_dim, n_rows);
     }
     return cuda_ok(cudaGetLastError(), "matmul_f32 decode rows tile launch");
+}
+
+/* ds4_gpu_matmul_f32_decode_rows_exact_tensor for two weights of one shape
+ * over one input, in one launch, on exactly the calls that entry's eight-warp
+ * tile arm takes (the same conditions, checked here first); anything else
+ * declines with nothing launched and the caller makes the two single calls,
+ * as does DS4_QWEN4EXP_NO_F32_PAIR=1.  Per column the arithmetic is that
+ * arm's own, so the outputs are the ones the two calls would store. */
+extern "C" int ds4_gpu_matmul_f32_pair_decode_rows_exact_tensor(
+        ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
+        const void *model_map0, uint64_t model_size0, uint64_t weight_offset0,
+        const void *model_map1, uint64_t model_size1, uint64_t weight_offset1,
+        uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint32_t n_rows) {
+    if (!out0 || !out1 || !x || !model_map0 || !model_map1 ||
+        in_dim == 0 || out_dim == 0 || n_rows < 8u) {
+        return 0;
+    }
+    if (getenv("DS4_QWEN4EXP_NO_F32_PAIR") != NULL ||
+        getenv("DS4_QWEN4EXP_NO_ROW_TILE") != NULL ||
+        getenv("DS4_F32_NO_WARP_TILE") != NULL) {
+        return 0;
+    }
+    if (in_dim != 2560u || matmul_f32_warp_tile8_off() ||
+        !matmul_f32_warp_tile_ok(in_dim, out_dim, n_rows)) {
+        return 0;
+    }
+    if (out_dim > UINT64_MAX / in_dim) return 0;
+    const uint64_t weight_elems = in_dim * out_dim;
+    if (weight_elems > UINT64_MAX / sizeof(float)) return 0;
+    const uint64_t weight_bytes = weight_elems * sizeof(float);
+    if (weight_offset0 > model_size0 || weight_bytes > model_size0 - weight_offset0 ||
+        weight_offset1 > model_size1 || weight_bytes > model_size1 - weight_offset1) {
+        return 0;
+    }
+    if (x->bytes < (uint64_t)n_rows * in_dim * sizeof(float) ||
+        out0->bytes < (uint64_t)n_rows * out_dim * sizeof(float) ||
+        out1->bytes < (uint64_t)n_rows * out_dim * sizeof(float)) {
+        return 0;
+    }
+    const int logical_tier = ds4_tensor_device_idx(out0);
+    if (ds4_tensor_device_idx(out1) != logical_tier ||
+        ds4_tensor_device_idx(x) != logical_tier) {
+        return 0;
+    }
+    const unsigned wr8 = DS4_F32_WARP_TILE8_WR, wc8 = DS4_F32_WARP_TILE8_WC;
+    const unsigned bm8 = wr8 * DS4_F32_WARP_TILE_TM;
+    const uint64_t ytiles8 = ((uint64_t)n_rows + bm8 - 1u) / bm8;
+    if (ytiles8 > 65535u) return 0;
+    const char *w0 = cuda_resolve_weight_ptr(model_map0, weight_offset0,
+                                             weight_bytes, logical_tier,
+                                             "f32 pair rows exact");
+    const char *w1 = cuda_resolve_weight_ptr(model_map1, weight_offset1,
+                                             weight_bytes, logical_tier,
+                                             "f32 pair rows exact");
+    if (!w0 || !w1) return 0;
+    const unsigned ntn = (unsigned)(out_dim / (uint64_t)DS4_F32_WARP_TILE_TN);
+    dim3 grid8((2u * ntn + wc8 - 1u) / wc8, (unsigned)ytiles8, 1);
+    matmul_f32_warp_tile8_pair_kernel<DS4_F32_WARP_TILE_TM,
+                                      DS4_F32_WARP_TILE_TN,
+                                      DS4_F32_WARP_TILE8_WR,
+                                      DS4_F32_WARP_TILE8_WC, 2560 / 256>
+        <<<grid8, 32 * wr8 * wc8, 0, cuda_decode_stream()>>>(
+            (float *)out0->ptr, (const float *)w0,
+            (float *)out1->ptr, (const float *)w1,
+            (const float *)x->ptr, in_dim, out_dim, n_rows);
+    return cuda_ok(cudaGetLastError(), "matmul_f32 pair warp tile8 launch");
 }
 
 /* Compare ranges without overflowing an end address. */
