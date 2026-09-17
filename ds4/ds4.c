@@ -76022,9 +76022,11 @@ static int qwen4exp_seam_verify_rows(void *ctx, const int *tokens, uint32_t n,
     int32_t buf[DS4_QWEN4EXP_MTP_MAX_COMMIT];
     if (n > (uint32_t)(sizeof(buf) / sizeof(buf[0]))) return -1;
     for (uint32_t i = 0; i < n; i++) buf[i] = (int32_t)tokens[i];
+    /* The hyper rows stay in the session's pinned stage; the draft uploads
+     * them from there, so this call asks for no pageable readback. */
     return ds4_qwen4exp_graph_verify_rows(e->qwen4exp_session,
                                           e->qwen4exp_weights, &e->model,
-                                          buf, n, hc_rows, row_logits,
+                                          buf, n, NULL, row_logits,
                                           n) ? 0 : -1;
 }
 
@@ -76037,9 +76039,10 @@ static int qwen4exp_seam_verify_rows_top1(void *ctx, const int *tokens,
     if (at != pos0 || n > (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT) return -1;
     int32_t buf[DS4_QWEN4EXP_MTP_MAX_COMMIT];
     for (uint32_t i = 0; i < n; i++) buf[i] = (int32_t)tokens[i];
+    /* Same: the rows stay in the pinned stage for the draft to upload. */
     return ds4_qwen4exp_graph_verify_top1_rows(
                e->qwen4exp_session, e->qwen4exp_weights, &e->model,
-               buf, n, hc_rows, row_top1) ? 0 : -1;
+               buf, n, NULL, row_top1) ? 0 : -1;
 }
 
 static int qwen4exp_seam_read_logit_row(void *ctx, uint32_t row,
@@ -76069,9 +76072,22 @@ static int qwen4exp_seam_head_logits(void *ctx, const float *hc_row,
 static int qwen4exp_seam_draft_step(void *ctx, int next_token,
                                     const float *hc_row, uint32_t pos,
                                     int *draft_out, float *multi_out) {
+
     ds4_session *s = ctx;
+    ds4_qwen4exp_session *qs = s->engine->qwen4exp_session;
     char err[256];
-    if (ds4_qwen4exp_mtp_head_forward(&s->qwen4exp_head, &next_token, hc_row,
+    /* A seed step's row is one the verify left in the pinned stage; a chain
+     * step's row is the head's own multi output, which only ever arrives as
+     * a host pointer.  The position tells them apart. */
+    const float *src = hc_row;
+    if (qs->verify_stage &&
+        pos >= qs->verify_stage_pos &&
+        pos < qs->verify_stage_pos + qs->verify_stage_rows) {
+        src = qs->verify_stage +
+              (size_t)(pos - qs->verify_stage_pos) *
+              (size_t)DS4_N_HC * DS4_N_EMBD;
+    }
+    if (ds4_qwen4exp_mtp_head_forward(&s->qwen4exp_head, &next_token, src,
                                       pos, 1u, draft_out, multi_out,
                                       err, sizeof(err)) != 0) {
         fprintf(stderr, "ds4: qwen4exp MTP seam: %s\n", err);
@@ -76103,9 +76119,31 @@ static int qwen4exp_seam_draft_rows(void *ctx, const int *next_tokens,
                                     uint32_t n, int *draft_out,
                                     float *multi_out) {
     ds4_session *s = ctx;
+    ds4_engine *e = s->engine;
+    ds4_qwen4exp_session *qs = e->qwen4exp_session;
     char err[256];
+    /* The verify left its rows in the session's pinned stage; when the stage
+     * covers this call's rows the head uploads straight from it -- a pinned
+     * source, and no pageable round-trip ever happened.  When the stage
+     * missed, `hyper` itself still holds the rows and a direct read fills
+     * the caller's buffer; only a stale buffer falls back to what the
+     * caller passed. */
+    const float *src = hc_rows;
+    if (qs->verify_stage &&
+        pos0 >= qs->verify_stage_pos &&
+        pos0 + n <= qs->verify_stage_pos + qs->verify_stage_rows) {
+        src = qs->verify_stage +
+              (size_t)(pos0 - qs->verify_stage_pos) *
+              (size_t)DS4_N_HC * DS4_N_EMBD;
+    } else if (hc_rows && qs->hyper_rows &&
+               pos0 >= qs->hyper_pos &&
+               pos0 + n <= qs->hyper_pos + qs->hyper_rows &&
+               ds4_qwen4exp_session_read_hyper(
+                   qs, pos0 - qs->hyper_pos, n, (float *)hc_rows)) {
+        src = hc_rows;
+    }
     if (ds4_qwen4exp_mtp_head_forward_last(&s->qwen4exp_head, next_tokens,
-                                           hc_rows, pos0, n, draft_out,
+                                           src, pos0, n, draft_out,
                                            multi_out, err, sizeof(err)) != 0) {
         fprintf(stderr, "ds4: qwen4exp MTP seam: %s\n", err);
         return -1;
