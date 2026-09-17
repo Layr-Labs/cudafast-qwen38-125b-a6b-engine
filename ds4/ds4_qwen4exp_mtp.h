@@ -408,6 +408,28 @@ typedef struct {
                       float *multi_out);
 
     /*
+     * OPTIONAL device-source twin of draft_rows.  Same head, same cache rows,
+     * same draft; the difference is where the pre-final-mixer rows come from.
+     * draft_rows takes them as a HOST slab, which means the verify had to copy
+     * them out of the GPU and this call copies them straight back in.  Nothing
+     * on the host reads them in between -- at depth 1 the slab's only consumer
+     * is this call -- so the round trip buys nothing and costs two blocking
+     * transfers of n * hc_dim floats plus the synchronize that has to precede
+     * the read.
+     *
+     * This entry instead names the row by INDEX into the session's own hyper
+     * tensor, which is already device-resident from the verify, and the head
+     * fetches it device-to-device.  `first_row` indexes the same rows in the
+     * same order that `hc_rows + first_row * hc_dim` would have addressed.
+     *
+     * NULL: the host path, unchanged.  A binding must only set this when the
+     * verify can be asked to leave the rows on the device (hc_rows NULL).
+     */
+    int (*draft_rows_device)(void *ctx, const int *next_tokens,
+                             uint32_t first_row, uint32_t pos0, uint32_t n,
+                             int *draft_out, float *multi_out);
+
+    /*
      * OPTIONAL: top-1 minus runner-up logit of the draft the latest draft_step
      * or draft_rows call returned, or a negative value when that call did not
      * measure one.  It can only shorten a chain (stop_margin / drop_margin in
@@ -920,6 +942,22 @@ int ds4_qwen4exp_mtp_head_forward(ds4_qwen4exp_mtp_head *h,
 int ds4_qwen4exp_mtp_head_forward_last(ds4_qwen4exp_mtp_head *h,
                                        const int *next_tokens,
                                        const float *multi_in,
+                                       uint32_t pos0, uint32_t n_tokens,
+                                       int *draft_out, float *multi_out,
+                                       char *err, size_t errlen);
+
+/*
+ * forward_last, with `multi_in` named as a DEVICE row range instead of a host
+ * slab: rows `first_device_row .. first_device_row + n_tokens` of
+ * `multi_device`, which is the verify's own hyper tensor.  The head copies
+ * them device-to-device, so the rows never leave the GPU and the round drops
+ * both the readback and its return upload.  Identical in every other respect
+ * to ds4_qwen4exp_mtp_head_forward_last.
+ */
+int ds4_qwen4exp_mtp_head_forward_last_device(ds4_qwen4exp_mtp_head *h,
+                                       const int *next_tokens,
+                                       const ds4_gpu_tensor *multi_device,
+                                       uint32_t first_device_row,
                                        uint32_t pos0, uint32_t n_tokens,
                                        int *draft_out, float *multi_out,
                                        char *err, size_t errlen);
