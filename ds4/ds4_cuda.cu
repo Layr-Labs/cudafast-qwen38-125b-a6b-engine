@@ -1014,7 +1014,8 @@ static_assert(sizeof(ds4_decode_graph_key) == 48u,
 struct cuda_decode_graph_entry {
     ds4_decode_graph_key key;
     cudaGraphExec_t      exec;
-    int                  state;   /* 0 empty, 1 warmed, 2 ready, 3 dead */
+    int                  state;    /* 0 empty, 1 warmed, 2 ready, 3 dead */
+    int                  uploaded; /* this exec's device image is resident */
     uint64_t             hits;
 };
 
@@ -1086,11 +1087,51 @@ static inline int cuda_decode_graph_upload_on(void) {
     return on;
 }
 
+/* Whether a chunk that is ALREADY resident is uploaded again every round.
+ *
+ * MEASURED, window-4 nsys capture of the depth-1 decode leg (67 timed rounds):
+ * cudaGraphUpload ran 197 times, ~2.94 per round, median 127 us of host time,
+ * spread evenly across all ten deciles of the window -- steady state, not
+ * warm-up (cudaGraphInstantiate is 10-of-11 calls in the first decile, so
+ * capture really is warm-up only).  Splitting cudaGraphLaunch by whether an
+ * upload had just ended: 542 us median with a recent upload (n=187) against
+ * 214 us without (n=132), and the launches sit in a strict upload/launch
+ * alternation with each upload ending exactly where the next launch begins.
+ *
+ * The mechanism: ds4_gpu_decode_graph_prefetch issues cudaGraphUpload for
+ * chunk c+1 on g_decode_graph_stream -- the SAME stream chunk c is replaying
+ * on -- so it is stream-ordered BEHIND the running chunk and AHEAD of the next
+ * launch rather than overlapped with either.  It cannot hide.  And the exec it
+ * uploads was already uploaded once at instantiate time below, and a graph
+ * exec stays resident, so in steady state every one of those ~186 uploads
+ * re-uploads an image the device already holds.
+ *
+ * So the prefetch keeps its purpose -- an exec whose image is NOT yet resident
+ * is still uploaded off the launch's critical path -- and loses only the
+ * repeat.  Set DS4_CUDA_GRAPH_UPLOAD_REPEAT=1 to restore the per-round
+ * re-upload in the same binary for an A/B.
+ *
+ * Nothing about a graph's contents or its ordering depends on when, or how
+ * often, its executable is uploaded. */
+static inline int cuda_decode_graph_upload_repeat_on(void) {
+    static int init = 0;
+    static int on = 0;
+    if (!init) {
+        init = 1;
+        const char *s = getenv("DS4_CUDA_GRAPH_UPLOAD_REPEAT");
+        if (s && *s)
+            on = (s[0] != '0' && strcmp(s, "off") != 0 &&
+                  strcmp(s, "no") != 0 && strcmp(s, "false") != 0) ? 1 : 0;
+    }
+    return on;
+}
+
 static void cuda_decode_graph_entry_kill(cuda_decode_graph_entry *e) {
     if (e->exec) {
         (void)cudaGraphExecDestroy(e->exec);
         e->exec = NULL;
     }
+    e->uploaded = 0;
     e->state = 3;
 }
 
@@ -1104,6 +1145,7 @@ extern "C" void ds4_gpu_decode_graphs_invalidate(void) {
                     e->exec = NULL;
                 }
                 e->state = 0;
+                e->uploaded = 0;
                 e->hits = 0;
                 memset(&e->key, 0, sizeof(e->key));
             }
@@ -1140,6 +1182,7 @@ static cuda_decode_graph_entry *cuda_decode_graph_find(
     if (slot) {
         memcpy(&slot->key, key, sizeof(*key));
         slot->state = 0;   /* caller advances the state machine */
+        slot->uploaded = 0;
         return slot;
     }
     return NULL;           /* all variants busy with other keys: stay eager */
@@ -1161,10 +1204,14 @@ extern "C" int ds4_gpu_decode_graph_prefetch(const ds4_decode_graph_key *key) {
         cuda_decode_graph_entry *e = &g_decode_graphs[key->il][key->island][v];
         if (e->state != 2 || !e->exec) continue;
         if (memcmp(&e->key, key, sizeof(*key)) != 0) continue;
+        /* Already resident: re-uploading it would only stream-order an
+         * enqueue between this chunk's replay and the next launch. */
+        if (e->uploaded && !cuda_decode_graph_upload_repeat_on()) return 1;
         if (cudaGraphUpload(e->exec, g_decode_graph_stream) != cudaSuccess) {
             (void)cudaGetLastError();
             return 0;
         }
+        e->uploaded = 1;
         return 1;
     }
     return 0;
@@ -1264,7 +1311,7 @@ extern "C" int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) {
      * failure is not fatal: the launch does the upload itself, which is the
      * behaviour without this call. */
     if (cuda_decode_graph_upload_on()) {
-        (void)cudaGraphUpload(exec, g_decode_graph_stream);
+        e->uploaded = (cudaGraphUpload(exec, g_decode_graph_stream) == cudaSuccess);
         (void)cudaGetLastError();
     }
     if (getenv("DS4_CUDA_DECODE_GRAPH_LOG") != NULL) {
@@ -5746,8 +5793,33 @@ __global__ static void matmul_q8_0_preq_warp8_kernel(
     uint64_t row = (uint64_t)blockIdx.x * (blockDim.x >> 5u) + (threadIdx.x >> 5u);
     const uint64_t tok = (uint64_t)blockIdx.y;
     uint32_t lane = threadIdx.x & 31u;
-    if (row >= out_dim) return;
-    const unsigned char *wr = w + row * blocks * 34;
+    /* PDL consumer.  The stream predecessor at the decode widths that reach
+     * this launch is qwen4exp_hc_norm_quant / the Q8 activation quantizer,
+     * which triggers at its top, so this kernel's grid may start while that
+     * one is still draining.  Everything before the fence must therefore read
+     * only memory the predecessor does not write.
+     *
+     * `w` is a frozen model weight tensor: resident before the round begins
+     * and never a quantizer output.  Each warp's first pass over the K walk
+     * reads the thirty-four-byte blocks at `wr + lane * 34`, so warming
+     * exactly those lines in L2 here spends the predecessor's tail on this
+     * kernel's first loads instead of idling on them afterwards.
+     * `prefetch.global.L2` is a hint with no destination register: it moves no
+     * value, so it cannot be folded away as dead and cannot change one.
+     *
+     * The out-of-range early return moved BELOW the fence on purpose.
+     * cudaGridDependencySynchronize() must be reached by every thread of the
+     * block; at eight warps per block a tail block can hold warps whose row is
+     * past out_dim, and returning before the fence would leave the fence
+     * unreached by part of the block. */
+    const int live = row < out_dim;
+    const unsigned char *wr = live ? w + row * blocks * 34 : w;
+    if (live && (uint64_t)lane < blocks) {
+        const unsigned char *pf = wr + (uint64_t)lane * 34;
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(pf) : "memory");
+    }
+    QWEN4EXP_PDL_SYNC();
+    if (!live) return;
     const int8_t *xqr = xq + tok * blocks * 32u;
     const float *xsr = xscale + tok * blocks;
     float acc = 0.0f;
@@ -5843,13 +5915,11 @@ __global__ static void matmul_q8_0_preq_rows_exact_tile_kernel(
 /* Two adjacent lanes share a Q8 group. Their integer partials may be
  * combined freely; each even lane keeps its original float group chain.
  * Shared memory remaps the 32 finished chains onto one reduction warp. */
-template <int R, bool Streaming = true, bool Stage = false>
+template <int R, bool Streaming = true>
 __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
         float *out, const unsigned char *w,
         const int8_t *xq, const float *xscale,
         uint64_t out_dim, uint32_t n_rows, uint64_t blocks) {
-    extern __shared__ uint4 qw_pl_panel[];
-    char *const gpanel = (char *)qw_pl_panel;
     const uint32_t local_row = threadIdx.x >> 6u;
     const uint32_t local_lane = threadIdx.x & 63u;
     const uint32_t group = local_lane >> 1u;
@@ -5861,39 +5931,8 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
 #pragma unroll
     for (int r = 0; r < R; r++) acc[r] = 0.0f;
 
-    /* Stage: the block's four consecutive weight rows copied into dynamic
-     * shared memory as one dense uint4 run, then the walk below reads them
-     * there at the same relative offsets.  The decoder derives its shift from
-     * the address it is given, so the words are the same words, and every
-     * dot, every add and the reduction tree below are the shipping text on
-     * the shipping bytes.  The fill sits above the grid dependency fence
-     * because the weights do not depend on the predecessor; the activation
-     * reads stay below it, and the first walk step then skips its own fence,
-     * so a thread performs exactly one grid dependency sync either way.  The
-     * last block stages only the rows that exist.  Every quantity here is
-     * block-uniform and the barrier precedes the row guard below, so all 256
-     * threads reach it.  The fill is uint4: the host takes this arm only for
-     * a 16-byte-aligned slab, and only where the panel keeps the shipping
-     * residency (the note at the launch says why that is the test). */
-    if (Stage) {
-        const uint64_t rows_here = out_dim - (uint64_t)blockIdx.x * 4u < 4u
-                                 ? out_dim - (uint64_t)blockIdx.x * 4u : 4u;
-        const uint64_t panel_bytes = rows_here * blocks * 34u;
-        const char *const gp = (const char *)w + (uint64_t)blockIdx.x * 4u * blocks * 34u;
-        for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes; i += 256u * 16u) {
-            if (i + 16u <= panel_bytes)
-                *(uint4 *)(gpanel + i) = *(const uint4 *)(const void *)(gp + i);
-            else
-                for (uint64_t j = i; j < panel_bytes; j++) gpanel[j] = gp[j];
-        }
-        QWEN4EXP_PDL_SYNC();
-        __syncthreads();
-    }
-
     if (row < out_dim) {
-        const unsigned char *wr = Stage
-            ? (const unsigned char *)(gpanel + (uint64_t)local_row * blocks * 34u)
-            : (w + row * blocks * 34u);
+        const unsigned char *wr = w + row * blocks * 34u;
         /* PDL: the first walk step (b = group) with its WEIGHT loads issued
          * above the fence and held in registers, so they fly while the
          * quantizer drains.  The activation reads (xq/xscale, that kernel's
@@ -5930,7 +5969,7 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
             const float ws = Streaming
                 ? __half2float(__ushort_as_half(__ldcs((const uint16_t *)scale)))
                 : __half2float(*scale);
-            if (!Stage) QWEN4EXP_PDL_SYNC();
+            QWEN4EXP_PDL_SYNC();
 #pragma unroll
             for (int r = 0; r < R; r++) {
                 if ((uint32_t)r < take) {
@@ -17409,6 +17448,26 @@ int ds4_qwen4exp_pdl_enabled(void) {
     return enabled;
 }
 
+/* The one-row narrow-projection warp kernel's programmatic launch, off with
+ * DS4_QWEN4EXP_WARP8_NO_PDL.  Read once, like every other valve here.
+ *
+ * Setting it restores the plain triple-chevron launch that path has always
+ * had.  The kernel itself is unchanged by the valve: its fence is a no-op in a
+ * plainly launched kernel and its L2 prefetch hint moves no value, so ONE
+ * binary holds both arms and an A/B needs no rebuild between them.  This is
+ * the global ds4_qwen4exp_pdl_enabled() valve's narrower sibling -- that one
+ * moves every PDL site at once, which is the wrong instrument for attributing
+ * one launch. */
+static int g_warp8_pdl_off = -1;
+static int cuda_qwen4exp_warp8_pdl_off(void) {
+    if (g_warp8_pdl_off < 0) {
+        const char *s = getenv("DS4_QWEN4EXP_WARP8_NO_PDL");
+        g_warp8_pdl_off = (s && *s && s[0] != '0' && strcmp(s, "off") != 0 &&
+                           strcmp(s, "no") != 0 && strcmp(s, "false") != 0) ? 1 : 0;
+    }
+    return g_warp8_pdl_off;
+}
+
 /* The pipelined tile (matmul_q8_0_preq_rows_mma_pipe_kernel) serves the
  * prefill widths unless DS4_CUDA_NO_MMA_PIPE is set; the tile above is the
  * fallback and stays the oracle the test holds it against.  Read once; the
@@ -17807,45 +17866,7 @@ static int cuda_matmul_q8_0_preq_rows_exact(
             /* Retain the promoted call-width specialization for the
              * general dense projections. The HC warp geometry above is
              * independent of this two-warp kernel's token-row bound. */
-            /* THE STAGED ARM, and what its gate is for.
-             *
-             * matmul_q8_0_preq_pair_lanes_kernel<R, false, true> copies the
-             * block's four rows into dynamic shared memory as one dense run
-             * before the walk, the staging qwen_gdn_projection_kernel already
-             * ships.  A bare stream of this kernel's own word-by-word request
-             * order runs five percent under the same bytes read in address
-             * order, and the staged arm closes that: the LM head went from
-             * 227 to 240 GB/s (2,980 to 2,813 us at two rows, 2,932 to 2,789
-             * at one), bit for bit the shipping output.
-             *
-             * The gate is a RESIDENCY test, not a bandwidth one.  The panel is
-             * 4 * blocks * 34 bytes of dynamic shared memory per block, and
-             * what it costs is blocks per SM.  At in_dim 2560 it is 10,880
-             * bytes, the kernel keeps five (two rows) and six (one row)
-             * resident blocks per SM, and it wins.  At in_dim 6144 it is
-             * 26,112 bytes, residency falls from four to three blocks per SM,
-             * and the very same staging LOSES eleven percent on ssm_out and
-             * attn_output.  A staging win is an occupancy question before it
-             * is a fetch-order one, so the arm is taken only where the panel
-             * leaves residency where the shipping kernel has it, which
-             * 12,288 bytes bounds.  The fill is uint4, so the slab must be
-             * 16-byte aligned; a slab that is not keeps the shipping kernel.
-             * DS4_QWEN4EXP_NO_PAIR_LANES_STAGE restores the shipping kernel
-             * from the same binary. */
-            const size_t pl_panel = (size_t)4u * (size_t)blocks * 34u;
-            const int pl_stage = pl_panel <= 12288u &&
-                (((uintptr_t)wptr) & 15u) == 0u &&
-                getenv("DS4_QWEN4EXP_NO_PAIR_LANES_STAGE") == NULL;
-            if (n_rows == 1u && pl_stage &&
-                getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL) {
-                /* PDL consumer as below; the staged fill rides the window. */
-                QWEN4EXP_LAUNCH_PDL(
-                        (matmul_q8_0_preq_pair_lanes_kernel<1, false, true>),
-                        (dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u)),
-                        256, pl_panel, cuda_decode_stream(),
-                        (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
-                        out_dim, n_rows, blocks);
-            } else if (n_rows == 1u && getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL) {
+            if (n_rows == 1u && getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL) {
                 /* PDL consumer: the stream predecessor is the decode
                  * quantizer, which triggers at its top (decode widths). */
                 QWEN4EXP_LAUNCH_PDL(
@@ -17869,13 +17890,6 @@ static int cuda_matmul_q8_0_preq_rows_exact(
                 matmul_q8_0_preq_pair_lanes_kernel<2, false><<<
                         dim3((unsigned)((out_dim + 3u) / 4u), 2u, 1u),
                         256, 0, cuda_decode_stream()>>>(
-                        (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
-                        out_dim, n_rows, blocks);
-            } else if (pl_stage) {
-                QWEN4EXP_LAUNCH_PDL(
-                        (matmul_q8_0_preq_pair_lanes_kernel<2, false, true>),
-                        (dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u)),
-                        256, pl_panel, cuda_decode_stream(),
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
                         out_dim, n_rows, blocks);
             } else {
@@ -17908,10 +17922,25 @@ static int cuda_matmul_q8_0_preq_rows_exact(
      * eight rows with the SAME per-row arithmetic. */
     if (n_rows == 1u || getenv("DS4_QWEN4EXP_NO_ROW_TILE") != NULL) {
         dim3 grid(wgrid, n_rows, 1u);
-        matmul_q8_0_preq_warp8_kernel<<<grid, wthreads, 0, cuda_decode_stream()>>>(
-                (float *)out->ptr,
-                reinterpret_cast<const unsigned char *>(wptr),
-                xq, xscale, in_dim, out_dim, blocks, use_dp4a);
+        /* The one-row decode call is the PDL consumer; it is the width whose
+         * predecessor quantizer actually triggers.  The NO_ROW_TILE arm is the
+         * same-binary prefill measurement aid and runs at widths the producer
+         * deliberately does not trigger at, so it keeps the plain launch and
+         * the geometry it has always had.  DS4_QWEN4EXP_WARP8_NO_PDL restores
+         * the plain launch at one row too, which is how this arm is measured
+         * on ONE binary against itself. */
+        if (n_rows == 1u && !cuda_qwen4exp_warp8_pdl_off()) {
+            QWEN4EXP_LAUNCH_PDL(matmul_q8_0_preq_warp8_kernel, grid, wthreads, 0,
+                                cuda_decode_stream(),
+                    (float *)out->ptr,
+                    reinterpret_cast<const unsigned char *>(wptr),
+                    xq, xscale, in_dim, out_dim, blocks, use_dp4a);
+        } else {
+            matmul_q8_0_preq_warp8_kernel<<<grid, wthreads, 0, cuda_decode_stream()>>>(
+                    (float *)out->ptr,
+                    reinterpret_cast<const unsigned char *>(wptr),
+                    xq, xscale, in_dim, out_dim, blocks, use_dp4a);
+        }
         return cuda_ok(cudaGetLastError(),
                        "q8_0 decode rows exact warp launch");
     }
@@ -19844,14 +19873,12 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
 
 /* K/V blocks precede the large Q grid. Each output retains its original
  * 32 float chains; paired integer partials combine exactly before scaling. */
-template<int R, bool Stage = false>
+template<int R>
 __global__ static void qwen_q8_projection_triple_kernel(
         float *out0, float *out1, float *out2,
         const unsigned char *w0, const unsigned char *w1, const unsigned char *w2,
         const int8_t *xq, const float *xscale, uint64_t od0, uint64_t od1,
         uint64_t od2, uint32_t n_rows, uint64_t blocks) {
-    extern __shared__ uint4 qw_tr_panel[];
-    char *const gpanel = (char *)qw_tr_panel;
     constexpr bool SmallFirst=true, Streaming=false;
     const uint32_t nb0=(uint32_t)((od0+3u)/4u), nb1=(uint32_t)((od1+3u)/4u), nb2=(uint32_t)((od2+3u)/4u);
     const uint32_t flat=SmallFirst ? (blockIdx.x<nb1+nb2 ? blockIdx.x+nb0 : blockIdx.x-nb1-nb2) : blockIdx.x;
@@ -19871,41 +19898,8 @@ __global__ static void qwen_q8_projection_triple_kernel(
 #pragma unroll
     for (int r = 0; r < R; r++) acc[r] = 0.0f;
 
-    /* Stage: the block's four consecutive weight rows copied into dynamic
-     * shared memory as one dense uint4 run, then the walk below reads them
-     * there at the same relative offsets.  The decoder derives its shift from
-     * the address it is given, so the words are the same words, and every
-     * dot, every add and the reduction tree below are the shipping text on
-     * the shipping bytes.  The fill sits above the grid dependency fence
-     * because the weights do not depend on the predecessor; the activation
-     * reads stay below it, and the first walk step then skips its own fence,
-     * so a thread performs exactly one grid dependency sync either way.  The
-     * last block stages only the rows that exist.  Every quantity here is
-     * block-uniform and the barrier precedes the row guard below, so all 256
-     * threads reach it.  The fill is uint4: the host takes this arm only for
-     * a 16-byte-aligned slab, and only where the panel keeps the shipping
-     * residency; the note at the pair-lanes launch says why that is the test.
-     * The rows are the block's four rows of ITS slab, so the panel base is
-     * taken from the per-slab block index, not from the grid index. */
-    if (Stage) {
-        const uint64_t rows_here = out_dim - (uint64_t)block * 4u < 4u
-                                 ? out_dim - (uint64_t)block * 4u : 4u;
-        const uint64_t panel_bytes = rows_here * blocks * 34u;
-        const char *const gp = (const char *)w + (uint64_t)block * 4u * blocks * 34u;
-        for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes; i += 256u * 16u) {
-            if (i + 16u <= panel_bytes)
-                *(uint4 *)(gpanel + i) = *(const uint4 *)(const void *)(gp + i);
-            else
-                for (uint64_t j = i; j < panel_bytes; j++) gpanel[j] = gp[j];
-        }
-        QWEN4EXP_PDL_SYNC();
-        __syncthreads();
-    }
-
     if (row < out_dim) {
-        const unsigned char *wr = Stage
-            ? (const unsigned char *)(gpanel + (uint64_t)local_row * blocks * 34u)
-            : (w + row * blocks * 34u);
+        const unsigned char *wr = w + row * blocks * 34u;
         /* PDL: the first walk step (b = group) with its WEIGHT loads issued
          * above the fence and held in registers, so they fly while the
          * QSA pre-quantizer drains.  The activation reads (xq/xscale, that
@@ -19942,7 +19936,7 @@ __global__ static void qwen_q8_projection_triple_kernel(
             const float ws = Streaming
                 ? __half2float(__ushort_as_half(__ldcs((const uint16_t *)scale)))
                 : __half2float(*scale);
-            if (!Stage) QWEN4EXP_PDL_SYNC();
+            QWEN4EXP_PDL_SYNC();
 #pragma unroll
             for (int r = 0; r < R; r++) {
                 if ((uint32_t)r < take) {
@@ -20056,32 +20050,11 @@ extern "C" int ds4_gpu_matmul_q8_0_preq_triple_rows_exact_tensor(
         getenv("DS4_QWEN4EXP_NO_QSA_Q8_TRIPLE")==NULL &&
         (((uintptr_t)w[0]|(uintptr_t)w[1]|(uintptr_t)w[2])&1u)==0u) {
         const unsigned grid=(unsigned)((od[0]+3u)/4u+(od[1]+3u)/4u+(od[2]+3u)/4u);
-        /* The staged arm, gated exactly as the pair-lanes launch is (the
-         * residency note there): the panel is 10,880 bytes at in_dim 2560,
-         * where the kernel keeps five and six blocks per SM and measured
-         * 160-162 to 152-155 us on attn_q/k/v at two rows, bit for bit.
-         * Every slab must be 16-byte aligned for the uint4 fill. */
-        const size_t tr_panel=(size_t)4u*(size_t)blocks*34u;
-        const int tr_stage=tr_panel<=12288u &&
-            ((((uintptr_t)w[0])|((uintptr_t)w[1])|((uintptr_t)w[2]))&15u)==0u &&
-            getenv("DS4_QWEN4EXP_NO_PAIR_LANES_STAGE")==NULL;
         /* PDL consumer: the stream predecessor is the QSA pre-quantizer,
          * which triggers at its top at these decode widths. */
-        if (rows==1u && tr_stage)
-            QWEN4EXP_LAUNCH_PDL((qwen_q8_projection_triple_kernel<1, true>),
-                                grid, 256, tr_panel, cuda_decode_stream(),
-                (float *)outs[0]->ptr,(float *)outs[1]->ptr,(float *)outs[2]->ptr,
-                (const unsigned char *)w[0],(const unsigned char *)w[1],
-                (const unsigned char *)w[2],xq,xs,od[0],od[1],od[2],rows,blocks);
-        else if (rows==1u)
+        if (rows==1u)
             QWEN4EXP_LAUNCH_PDL((qwen_q8_projection_triple_kernel<1>),
                                 grid, 256, 0, cuda_decode_stream(),
-                (float *)outs[0]->ptr,(float *)outs[1]->ptr,(float *)outs[2]->ptr,
-                (const unsigned char *)w[0],(const unsigned char *)w[1],
-                (const unsigned char *)w[2],xq,xs,od[0],od[1],od[2],rows,blocks);
-        else if (tr_stage)
-            QWEN4EXP_LAUNCH_PDL((qwen_q8_projection_triple_kernel<2, true>),
-                                grid, 256, tr_panel, cuda_decode_stream(),
                 (float *)outs[0]->ptr,(float *)outs[1]->ptr,(float *)outs[2]->ptr,
                 (const unsigned char *)w[0],(const unsigned char *)w[1],
                 (const unsigned char *)w[2],xq,xs,od[0],od[1],od[2],rows,blocks);

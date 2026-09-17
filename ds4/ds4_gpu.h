@@ -3767,55 +3767,6 @@ int ds4_gpu_qwen4exp_gdn_prefill_q8(
         uint64_t              q_offset,
         uint64_t              s_offset);
 
-/* PREFILL, CUDA: the attn_qkv Q8_0 projection with the gated delta net's
- * convolution, SiLU and QK norm in its epilogue, written into the block's
- * convolution scratch.  Returns 1 when it ran, 0 when it declined (a width
- * that is not whole 128-token tiles, a device without the int8 MMA, or the
- * valve DS4_QWEN4EXP_NO_GDN_CONV_FUSE); a decline launches nothing and the
- * caller runs the plain projection.  After a 1, the block runs through
- * ds4_gpu_qwen4exp_gdn_prefill_fused_q8 instead of _prefill_q8. */
-int ds4_gpu_qwen4exp_gdn_qkv_conv_prefill(
-        const void           *model_map,
-        uint64_t              model_size,
-        uint64_t              weight_offset,
-        uint64_t              in_dim,
-        uint64_t              out_dim,
-        const ds4_gpu_tensor *q,
-        uint64_t              q_offset,
-        uint64_t              s_offset,
-        uint32_t              n_tokens,
-        const ds4_gpu_qwen4exp_slab *conv_weight,
-        uint32_t              n_key_head,
-        uint32_t              n_value_head,
-        float                 qk_norm_eps);
-
-/* ds4_gpu_qwen4exp_gdn_prefill_q8 for a block whose projection ran through
- * ds4_gpu_qwen4exp_gdn_qkv_conv_prefill; identical arguments. */
-int ds4_gpu_qwen4exp_gdn_prefill_fused_q8(
-        ds4_gpu_tensor       *out,
-        ds4_gpu_tensor       *conv_state,
-        ds4_gpu_tensor       *recurrent_state,
-        ds4_gpu_tensor       *conv_snapshot,
-        ds4_gpu_tensor       *state_snapshot,
-        uint32_t              n_snapshot_rows,
-        ds4_gpu_tensor       *qkv,
-        const ds4_gpu_tensor *raw_alpha,
-        const ds4_gpu_tensor *raw_beta,
-        const ds4_gpu_tensor *output_gate,
-        const ds4_gpu_qwen4exp_slab *conv_weight,
-        const ds4_gpu_qwen4exp_slab *a_log,
-        const ds4_gpu_qwen4exp_slab *dt_bias,
-        const ds4_gpu_qwen4exp_slab *output_norm,
-        uint32_t              n_key_head,
-        uint32_t              n_value_head,
-        uint32_t              n_tokens,
-        uint32_t              head_layout,
-        float                 qk_norm_eps,
-        float                 norm_eps,
-        ds4_gpu_tensor       *out_q8,
-        uint64_t              q_offset,
-        uint64_t              s_offset);
-
 int ds4_gpu_qwen4exp_gdn_decode_q8(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *conv_state,
