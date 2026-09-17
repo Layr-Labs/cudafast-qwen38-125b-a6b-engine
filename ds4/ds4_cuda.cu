@@ -4060,6 +4060,14 @@ extern "C" int ds4_gpu_end_commands(void) {
     }
     return cuda_ok(cudaDeviceSynchronize(), "end commands");
 }
+/* The pair end_commands + synchronize is two device synchronises back to
+ * back; the second can only ever observe the first one's quiescence, so one
+ * cudaDeviceSynchronize is the whole contract, with or without
+ * DS4_CUDA_END_STREAM_SYNC (stream-0 copies never waited on the non-blocking
+ * streams either way). */
+extern "C" int ds4_gpu_end_commands_sync(void) {
+    return cuda_ok(cudaDeviceSynchronize(), "end commands sync");
+}
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
 
 /* See ds4_gpu.h.  The owner of the mapping tells us it is going away, because
