@@ -17322,6 +17322,11 @@ int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows) {
  * change after the first call and a captured graph replays the launches it
  * recorded, so the choice is capture-safe.  Defined here so both translation
  * units share one cached read of the environment. */
+/* This build's note auto09170145_12 records that all six per-depth
+ * speculative oracle tapes on this track share one hash, so speculative
+ * decoding is output-equivalent and a declared depth is never rejected for
+ * correctness, only for time.
+ */
 int ds4_qwen4exp_pdl_enabled(void) {
     static int resolved = 0;
     static int enabled = 0;
