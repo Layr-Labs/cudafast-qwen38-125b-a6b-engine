@@ -21,6 +21,7 @@
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
+#include <mutex>
 
 #include "cuda/mmq/ds4_mmq.h"
 #include "cuda/mmq/ds4_repack.h"
@@ -3502,14 +3503,62 @@ extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, con
     return ok;
 }
 
+/* Pinned staging for small synchronous device->host reads.  A pageable
+ * cudaMemcpy cannot DMA into the caller's buffer: the driver copies through
+ * an internal bounce stage, and every call is its own sync boundary.  The
+ * decode path takes several of these per token -- router selected ids,
+ * flags, top-1 rows, hyper rows -- at 4 bytes to ~1 MB each.  Staging the
+ * copy through a pinned buffer lets the copy engine write it directly and
+ * issue it async on the decode stream, so it overlaps the tail of the
+ * producing work instead of starting only after the device goes idle.
+ *
+ * The stage is a grow-only buffer shared by every reader; the mutex
+ * serialises reads so two callers cannot interleave staged bytes.  Reads
+ * above the cap, a failed allocation, or a copy error fall back to the
+ * plain pageable cudaMemcpy, which is also the failure path. */
+static void *g_dtoh_stage = NULL;
+static size_t g_dtoh_stage_cap = 0;
+static int g_dtoh_stage_failed = 0;
+static std::mutex g_dtoh_stage_mu;
+enum { DS4_DTOH_STAGE_MAX = 4u * 1024u * 1024u };
+
 extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     int d = ds4_tensor_device_idx(tensor);
     int ok = 0;
     WITH_DEVICE(g_gpu[d].device_id) {
-        ok = cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes,
-                                cudaMemcpyDeviceToHost),
-                     "tensor read");
+        if (bytes <= (uint64_t)DS4_DTOH_STAGE_MAX && !g_decode_graph_capturing) {
+            std::lock_guard<std::mutex> lock(g_dtoh_stage_mu);
+            if (bytes > g_dtoh_stage_cap && !g_dtoh_stage_failed) {
+                void *np = NULL;
+                if (cudaHostAlloc(&np, (size_t)bytes, cudaHostAllocPortable) ==
+                        cudaSuccess && np) {
+                    if (g_dtoh_stage) (void)cudaFreeHost(g_dtoh_stage);
+                    g_dtoh_stage = np;
+                    g_dtoh_stage_cap = (size_t)bytes;
+                } else {
+                    g_dtoh_stage_failed = 1;
+                }
+            }
+            if (g_dtoh_stage && bytes <= g_dtoh_stage_cap) {
+                const cudaStream_t stream = cuda_decode_stream();
+                cudaError_t e = cudaMemcpyAsync(g_dtoh_stage,
+                                                (const char *)tensor->ptr + offset,
+                                                (size_t)bytes,
+                                                cudaMemcpyDeviceToHost,
+                                                stream);
+                if (e == cudaSuccess) e = cudaStreamSynchronize(stream);
+                if (e == cudaSuccess) {
+                    memcpy(data, g_dtoh_stage, (size_t)bytes);
+                    ok = 1;
+                }
+            }
+        }
+        if (!ok) {
+            ok = cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes,
+                                    cudaMemcpyDeviceToHost),
+                         "tensor read");
+        }
     }
     return ok;
 }
