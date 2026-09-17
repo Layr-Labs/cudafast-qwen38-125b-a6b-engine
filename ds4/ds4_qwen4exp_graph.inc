@@ -279,6 +279,12 @@ static bool qwen4exp_ple_read_constants(const ds4_model            *m,
     return true;
 }
 
+
+/* Direct-mapped dequantized-row cache for the PLE gather: 64K slots of one
+ * row each, ~40 MiB at the 160-float row this build gathers.  The table is
+ * immutable for the session, so a tag hit is the whole row -- no mapped
+ * read, no dequant -- and a miss costs one extra row copy. */
+#define QW_PLE_CACHE_SLOTS 65536u
 struct ds4_qwen4exp_session {
     ds4_qwen4exp_session_plan plan;
     uint32_t pos;
@@ -328,6 +334,13 @@ struct ds4_qwen4exp_session {
     bool              ple_ready;      /* the hash constants were readable */
     uint64_t         *ple_ids;        /* host [n_batch][head_count]       */
     float            *ple_rows_host;  /* host [n_batch][ple_embd]         */
+    /* Dequantized-row cache.  The table is immutable for the life of the
+     * session, so a row's floats are a pure function of its id and a tag hit
+     * skips both the mapped read and the dequant.  Direct-mapped, tag is
+     * row + 1 so calloc's zero means empty.  Serial gather paths only: the
+     * pool workers write ple_rows_host directly and never touch these. */
+    uint64_t         *ple_cache_tags;   /* [QW_PLE_CACHE_SLOTS]             */
+    float            *ple_cache_rows;   /* [QW_PLE_CACHE_SLOTS][row_dim]    */
     ds4_gpu_tensor   *ple_conv_state; /* [state_rows][n_hc * n_embd]      */
     ds4_gpu_tensor   *ple_rows;       /* [n_batch][ple_embd]              */
     ds4_gpu_tensor   *ple_key;        /* key projection, then the gate    */
@@ -773,6 +786,14 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
             ok = s->ple_ids != NULL && s->ple_rows_host != NULL;
         }
         if (ok) {
+            s->ple_cache_tags = calloc(QW_PLE_CACHE_SLOTS, sizeof(uint64_t));
+            s->ple_cache_rows =
+                malloc((size_t)QW_PLE_CACHE_SLOTS * DS4_N_PLE_ROW_DIM *
+                       sizeof(float));
+            /* A failed cache allocation is not fatal: the wrapper falls back
+             * to the uncached dequant. */
+        }
+        if (ok) {
             s->ple_ready = qwen4exp_ple_read_constants(m, w, &s->ple_constants);
             ds4_ple_history_reset(&s->ple_constants, &s->ple_history);
         }
@@ -894,6 +915,8 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->ple_value);
     free(s->ple_ids);
     free(s->ple_rows_host);
+    free(s->ple_cache_tags);
+    free(s->ple_cache_rows);
     ds4_gpu_tensor_free(s->d_pos);
     ds4_gpu_tensor_free(s->d_adopt);
     ds4_gpu_tensor_free(s->d_gdn_replay);
@@ -1111,6 +1134,9 @@ typedef struct {
     int                           ok;
 } qw_ple_gather_seg;
 
+
+static int qw_ple_cache_probe(const ds4_qwen4exp_session *s, uint64_t row,
+                              float *dst);
 static void *qw_ple_gather_worker(void *arg) {
     qw_ple_gather_seg *seg = (qw_ple_gather_seg *)arg;
     ds4_ple_history local;
@@ -1145,10 +1171,13 @@ static void *qw_ple_gather_worker(void *arg) {
                 seg->s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h];
             const uint8_t *quant = ds4_qwen4exp_ple_row(seg->ple, row);
             if (!quant) { seg->ok = 0; return NULL; }
-            ds4_ple_dequant_iq4_nl(
-                quant, seg->blocks_per_row,
+            float *const dst =
                 seg->s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD +
-                    (uint64_t)h * DS4_N_PLE_ROW_DIM);
+                    (uint64_t)h * DS4_N_PLE_ROW_DIM;
+            /* Probe only: workers never store, so a hit is a memcpy and a
+             * miss dequants straight to dst without touching the cache. */
+            if (!qw_ple_cache_probe(seg->s, row, dst))
+                ds4_ple_dequant_iq4_nl(quant, seg->blocks_per_row, dst);
         }
     }
     return NULL;
@@ -1245,6 +1274,51 @@ static void qw_ple_pool_init(void) {
     pthread_mutex_unlock(&g_qw_ple_pool.mutex);
 }
 
+/* Dequantize one table row into dst, through the session's direct-mapped
+ * row cache.  The table is immutable for the session, so a tag hit is the
+ * whole row -- no mapped read, no dequant -- and a miss dequantizes into
+ * the slot and copies out, so the next gather of the same id is a hit.
+ * Serial gather paths only: the pool workers write ple_rows_host directly
+ * and never touch the cache, so there is no cross-thread slot race. */
+static void qw_ple_dequant_cached(ds4_qwen4exp_session *s,
+                                  const uint8_t *quant, uint64_t row,
+                                  uint32_t blocks_per_row, float *dst) {
+    if (s->ple_cache_tags && s->ple_cache_rows) {
+        const uint32_t slot = (uint32_t)(row & (QW_PLE_CACHE_SLOTS - 1u));
+        float *const crow =
+            s->ple_cache_rows + (size_t)slot * DS4_N_PLE_ROW_DIM;
+        if (s->ple_cache_tags[slot] == row + 1u) {
+            memcpy(dst, crow, (size_t)DS4_N_PLE_ROW_DIM * sizeof(float));
+            return;
+        }
+        ds4_ple_dequant_iq4_nl(quant, blocks_per_row, crow);
+        memcpy(dst, crow, (size_t)DS4_N_PLE_ROW_DIM * sizeof(float));
+        s->ple_cache_tags[slot] = row + 1u;
+        return;
+    }
+    ds4_ple_dequant_iq4_nl(quant, blocks_per_row, dst);
+}
+
+/* Read-only probe for the pool workers: a hit copies the cached row out,
+ * a miss leaves the caller to dequant.  Workers never store -- two workers
+ * evicting the same slot could interleave one row's tag with another's
+ * floats, so population stays on the serial paths where only the master
+ * runs.  During a parallel gather nothing writes the cache, so a tag read
+ * here is always consistent. */
+static int qw_ple_cache_probe(const ds4_qwen4exp_session *s, uint64_t row,
+                              float *dst) {
+    if (s->ple_cache_tags && s->ple_cache_rows) {
+        const uint32_t slot = (uint32_t)(row & (QW_PLE_CACHE_SLOTS - 1u));
+        if (s->ple_cache_tags[slot] == row + 1u) {
+            memcpy(dst,
+                   s->ple_cache_rows + (size_t)slot * DS4_N_PLE_ROW_DIM,
+                   (size_t)DS4_N_PLE_ROW_DIM * sizeof(float));
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                                       const ds4_qwen4exp_weights *w,
                                       const int32_t *tokens,
@@ -1260,6 +1334,7 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
         fprintf(stderr,
                 "ds4: qwen4exp block %u needs the n-gram table as IQ4_NL; this "
                 "artifact stores it as type %u, which no gather covers\n",
+
                 il, w->ple.type);
         return false;
     }
@@ -1327,7 +1402,7 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                             il, t, h, row, w->ple.rows);
                     return false;
                 }
-                ds4_ple_dequant_iq4_nl(quant, blocks_per_row, dst);
+                qw_ple_dequant_cached(s, quant, row, blocks_per_row, dst);
                 dst += DS4_N_PLE_ROW_DIM;
             }
         }
@@ -1380,8 +1455,8 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                                 il, t, h, row, w->ple.rows);
                         return false;
                     }
-                    ds4_ple_dequant_iq4_nl(
-                        quant, blocks_per_row,
+                    qw_ple_dequant_cached(
+                        s, quant, row, blocks_per_row,
                         s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD +
                             (uint64_t)h * DS4_N_PLE_ROW_DIM);
                 }
