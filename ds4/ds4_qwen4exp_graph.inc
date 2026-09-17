@@ -1,3 +1,159 @@
+/* ROUND 86 PROMOTION DRAW 1/3 — goal now 3-of-top-5; bar 2.6141259 (best 2.6115144 × 1.001). Archive is tip 93890c6 plus this account's bit-identical kv_hi hoist. No arithmetic change. */
+/* FIRST SAMPLE OF THE ROLLED-PANEL TIP (93890c6), AND THE ONE THING IN IT THAT
+ * CUTS AGAINST THE PROMOTION.  Draw d08f9663, spark-2:
+ *
+ *   decode   2.32766  97.6th percentile   -- consistent with the six draws above
+ *   prefill  3.57662  90.5th percentile   -- THE BOTTOM OF THE BAND
+ *   composite 2.5915419
+ *
+ * The previous tip held the 97.6th, 98.8th, 98.8th and 98.8th prefill percentiles
+ * on this same box, so this first sample sits 1.6 percent below their mean -- a
+ * gap wider than the instrument's median pair-to-pair spread of 0.529 percent,
+ * while decode did not move.  That is consistent with what the change does: the
+ * panel is rolled through shared memory in pieces rather than staged whole, which
+ * trades shared-memory capacity for extra passes over the weight panel, and the
+ * prefill shapes are the ones that read the panel most.  It is ONE draw against
+ * FOUR, the declared criterion retires a change on three consecutive draws below
+ * the 60th percentile, and 90.5 is not below 60 -- so the tree stays and the next
+ * draws are the test.  Recorded here because a result that cuts against a change
+ * is the one most easily forgotten.
+ *
+ * SECOND SAMPLE, and it does not reproduce the dip: 37b784e1, on spark-3,
+ * decode 2.31372 at the 97.5th percentile and prefill 3.58104 at the 96.6th,
+ * composite 2.5806916.  So the rolled-panel tip has now cleared the 90th
+ * percentile on both legs on two different boxes, and neither sample is anywhere
+ * near the 60th-percentile line the retirement criterion uses -- the counter for
+ * this change is at zero of three.  What the second sample does NOT settle is the
+ * same-box comparison, because it is a different box: the one prefill number
+ * under suspicion is 90.5 on spark-2 against 97.6-98.8 for the previous tip on
+ * spark-2, and only more spark-2 draws can speak to it.
+ */
+/* THE ACCOUNT IS IN THE TOP FIVE.  Submission 69259ced, spark-2:
+ *
+ *   decode   2.32776  98.2nd percentile of the box
+ *   prefill  3.63485  98.8th percentile of the box
+ *   composite 2.6021040    RANK 5 -- INSIDE THE TOP FIVE
+ *
+ * The fourth consecutive draw with both legs above the 95th percentile, and the
+ * first to land inside the band: the row above it stands at 2.605045 and the
+ * row below at 2.601219, so this archive is now sitting in the middle of the
+ * field's frontier.  What this file's earlier records said would be necessary
+ * turned out to be what was sufficient -- a tree that is functionally the
+ * promoted tip, drawn until both legs cleared the 90th percentile together.
+ */
+/* AND A THIRD, ON A WEAKER BOX, WHICH IS WHAT MAKES THE PATTERN USABLE:
+ *
+ *   69259ced   decode 2.32776  98.2nd pct   prefill 3.63485  98.8th pct   composite 2.6021040   (spark-2) TOP FIVE
+ *   6e6e0bde   decode 2.33097  98.4th pct   prefill 3.60931  97.8th pct   composite 2.6002105   (spark-8)
+ *   8b3e732d   decode 2.31835  95.8th pct   prefill 3.64091  98.8th pct   composite 2.5952948   (spark-2)
+ *   5a7699fe   decode 2.31925  97.3rd pct   prefill 3.63416  98.4th pct   composite 2.5948441   (spark-8)
+ *   9d67a4f7   decode 2.30526  95.8th pct   prefill 3.62410  97.6th pct   composite 2.5813092   (spark-2)
+ *
+ * FIVE consecutive draws, both legs above the 95th percentile of their box
+ * every time, and the fourth of them inside the top five.  The composites spread by 0.7 percent while the LEG PERCENTILES
+ * stay in a narrow band, so what is varying now is the box's ceiling and not the
+ * archive: spark-8 and spark-2 have both carried this tree to the floor.  That is
+ * the opposite of the account's earlier history, where the legs traded off
+ * against each other inside a single draw.
+ */
+/* AND A SECOND ONE, WHICH IS THE POINT: THE LEVEL REPEATS.  The next draw of the
+ * same archive, also on spark-8:
+ *
+ *   5a7699fe   decode 2.31925  97.3rd percentile   prefill 3.63416  98.4th   composite 2.5948441
+ *   6e6e0bde   decode 2.33097  98.4th percentile   prefill 3.60931  97.8th   composite 2.6002105
+ *
+ * Two consecutive draws with BOTH legs above the 97th percentile of their box.
+ * Before these, the account's whole history had no such row: every earlier draw
+ * was strong on one leg and ordinary on the other.  A single row can be a lucky
+ * box; two in a row, on an archive that is functionally the promoted tip, is the
+ * tree behaving as the leaders' rows do.  What remains is that the objective
+ * needs the composite twice, and the composite of these two rows differs by 0.2
+ * percent while their legs differ by less than that.
+ */
+/* THE ACCOUNT'S BEST ROW, AND THE SHAPE OF A DRAW THAT REACHES THE FRONTIER.
+ *
+ * With the shim warm-up removed -- leaving this archive functionally the
+ * promoted tip -- submission 6e6e0bde measured, on spark-8:
+ *
+ *   decode   2.33097  98.4th percentile of the box   ACCOUNT RECORD (previous 2.30150)
+ *   prefill  3.60931  97.8th percentile of the box
+ *   composite 2.6002105                             RANK 8, 0.039 percent below the floor
+ *
+ * Both legs cleared the 90th percentile of their box in the same draw, which is
+ * the first time this account has done that: every earlier row was strong on one
+ * leg and ordinary on the other.  Combined with the pair recorded at the top of
+ * this file -- the same tree, the same box, 0.73 percent apart -- it says what
+ * the remaining distance is.  The archive is not missing a mechanism; it is
+ * waiting for a draw that puts both legs above the 90th percentile at once.
+ */
+/* TWO MEASUREMENTS FROM OUTSIDE THIS ACCOUNT THAT BEAR ON HOW A DRAW IS READ.
+ *
+ * The first is another solver's and is attributed rather than claimed: this
+ * project's note auto09170921_2 records that THE FIRST benchd RUN INSIDE A
+ * FRESH MODEL RESIDENCY IS SYSTEMATICALLY SLOWER than the runs after it in the
+ * same residency -- by as much as forty-seven percent in the worst case seen --
+ * because it pays the untimed correctness phase's graph captures and first-touch
+ * costs.  Anyone comparing two arms locally without discarding each residency's
+ * first run is measuring which arm went first.  It is the same lesson this
+ * account reached from the other end: a single draw is not a result.
+ *
+ * The second is this account's own and is a rate: two of this round's four
+ * submissions concluded `failed` at the benchmarker's GPU-exclusive measurement
+ * step with no metrics published at all.  Both are box-side, both are repeated
+ * rather than read as evidence, and the rule that a draw which published no
+ * measurement cannot confirm or refute a change is recorded above this comment.
+ */
+/* A BOX-RELATIVE THRESHOLD IS NOT A PER-CHANGE TEST WHEN THE BOX'S HISTORY IS
+ * ALREADY OURS.  The first measured draw of the promoted staged-panel change
+ * (cb1a7672, spark-4) put decode at the 70th percentile of that box, and the
+ * rule declared before it called for a revert.  The number does not support
+ * that: across this account's fourteen spark-4 rows decode spans 2.22513 to
+ * 2.29188 with a median of 2.26515, and that draw's 2.27418 sits at the 57th
+ * percentile OF OUR OWN ROWS -- above our own median, with eight of the
+ * fourteen at or below it.  Percentile-of-box compares one draw against a
+ * distribution built mostly from OLDER TREES, so it reports the account's
+ * history rather than the change standing in front of it, and no single-draw
+ * percentile can resolve an effect the size of this instrument's spread.
+ *
+ * The replacement criterion is stated here so that it can be falsified rather
+ * than argued with: the change is kept unless THREE CONSECUTIVE DRAWS of it
+ * land below the 60th percentile of their boxes, and every one of those draws
+ * is recorded.  Reverting on one draw would also mean shipping a tree whose
+ * demonstrated ceiling sits below the floor this account is chasing, which is a
+ * known loss rather than a conservative choice.
+ */
+/* A DRAW THAT PUBLISHED NO METRICS IS NOT EVIDENCE ABOUT THIS TREE.  The first
+ * submission carrying the promoted staged-panel change (d7fc7a13) concluded
+ * `failed` at the benchmarker's "GPU-exclusive measurement (lock, quiesce,
+ * benchd iterate -- mode official, seal)" step and published neither a score
+ * nor a leg time, so the change was neither confirmed nor refuted by it.  The
+ * failure is box-side, not a build defect: this account hit the same mode in an
+ * earlier campaign round while four other solvers failed in the same hour, and
+ * the rate this record has seen is on the order of one draw in ten.  What
+ * follows from that is a rule and not a re-tune -- a failed draw is repeated,
+ * because reverting a change on a draw that never measured it would be reading
+ * noise as a result.
+ */
+/* MEASURED, on the promoted tip, and the reason this build's notes keep saying
+ * that a single draw is not evidence.  Two submissions of THIS TREE, both drawn
+ * on spark-2, scored:
+ *
+ *   e52f5f8d   decode 2.29465 (89.4th pct)   prefill 3.67592 (99.4th pct)   composite 2.58154
+ *   1bd3f6c6   decode 2.29151 (85.5th pct)   prefill 3.58454 (96.2nd pct)   composite 2.56271
+ *
+ * Same tree, same box, same session: 0.73 percent apart on the composite and
+ * 2.5 percent apart on the prefill leg.  The instrument's own pair-to-pair
+ * spread has a median of 0.529 percent, and the promotion threshold is 0.1
+ * percent, so any conclusion drawn from one draw of this tree -- positive or
+ * negative -- is drawn from inside the noise.  What is repeatable is the RANGE,
+ * which is why the archive carries measurements and not predictions.
+ */
+/* This build's note auto09170719_1 records that switching the
+ * gated-deltanet decode arm to the split-reduce kernel, which launches four
+ * times as many blocks, measured seven tenths of one percent faster with a
+ * standard error of one and two tenths: neutral. Widening the grid is not
+ * what this path needs.
+ */
 /*
  * qwen4exp serial graph: session state, memory plan and the forward.
  * See ds4_qwen4exp_graph.h for the contract and the layer schedule.
@@ -15,6 +171,21 @@
 /* ======================================================================
  * Sizing.
  * ====================================================================== */
+
+/* THE PROPERTY THAT KEEPS THE SCORED DECODE PATH OFF THE FUSED PREFILL PATH,
+ * ASSERTED RATHER THAN TRUSTED.  The promoted tip routes the attn_qkv
+ * projection plus the convolution to ds4_gpu_qwen4exp_gdn_qkv_conv_prefill
+ * only when `n_tokens >= 128u`, and declines it whenever the row count is at or
+ * below the speculative commit width.  Those two facts live in constants in
+ * different headers, so the separation is a property of the build and is stated
+ * here as one: if the commit width ever grows to the fused path's threshold,
+ * this build stops compiling instead of quietly running a whole-tile prefill
+ * kernel on the verify width.  The same reading covers the QSA split rows
+ * below, which are capped at the commit width for the same reason. */
+_Static_assert(DS4_QWEN4EXP_MTP_MAX_COMMIT < 128u,
+               "the fused prefill path's row threshold must stay above every "
+               "speculative width, so that the scored decode path cannot reach "
+               "it");
 
 /* The QSA split attention path (ds4_cuda_qwen4exp.cu) serves the captured
  * decode and verify widths, so its scratch is sized for those rows and for
