@@ -17432,21 +17432,84 @@ extern "C" void ds4_gpu_set_q8_mma_pipe(int mode) {
 }
 
 /* The wide-output rung of the pipe ladder below, DS4_CUDA_MMA_PIPE_WIDE:
- * 0 keeps the prior ladder; unset or 1 routes out_dim > 4096 through the
+ * 0 keeps the prior ladder; 1 routes out_dim > 4096 through the
  * 128x128 tile; 2 tries the 256-wide tile first (see the ladder).
  * The tile shape does not enter the pipe's arithmetic -- the kernel's
  * contract two hundred lines up holds every instantiation to the same per
  * output accumulation chain -- so the valve routes, it does not compute.
  * Read once like g_q8_mma_pipe; the test flips it through
- * ds4_gpu_set_q8_mma_pipe_wide. */
+ * ds4_gpu_set_q8_mma_pipe_wide.
+ *
+ * THE DEFAULT IS NOW 0, and here is the measurement that moved it.  A
+ * boot-time probe shipped in submission 72637333 reported the compiled shape
+ * of four rungs of this ladder on the live device (a = shared-memory opt-in
+ * accepted, r = registers/thread, l = local/spill bytes, o = blocks/SM):
+ *
+ *   pA[a=1 r=243 l=0   o=1]  <2,2,4,4,4,2>  128x64   256 thr   61,440 B
+ *   pB[a=1 r=250 l=0   o=1]  <2,2,4,4,4,3>  128x64   256 thr   92,160 B
+ *   pC[a=1 r=168 l=32  o=1]  <2,4,4,4,4,2>  128x128  384 thr   81,920 B
+ *   pD[a=0 r=96  l=536 o=0]  <2,8,4,4,4,2>  128x256  640 thr  122,880 B
+ *
+ * Every rung is the same kernel template at a different tile shape, so every
+ * rung wants the same per-thread live state.  pA and pB say what that state
+ * costs when nothing caps it: 243-250 registers, no spill.  Now count what
+ * each rung is allowed -- __launch_bounds__(THREADS,1) caps a thread at
+ * 65536/THREADS:
+ *
+ *   128x64   256 thr   cap 256   took 243/250   spill 0      no shortfall
+ *   128x128  384 thr   cap 170   took 168       spill 32 B   ~73 registers short
+ *   128x256  640 thr   cap 102   took 96        spill 536 B  moot: a=0, refused
+ *
+ * So the 128x128 rung is not marginally tight, it is ~73 registers short of
+ * what this arithmetic wants, and only 32 bytes of that went to local memory.
+ * The rest did not vanish; ptxas rematerialized it, which no static counter
+ * reports.  This tree has already paid for that lesson once: a __maxnreg__ cap
+ * elsewhere that reached lmem=0 and full occupancy still lost 10.2% to
+ * recomputation.  Note pD's l=536 also settles the comment below that 640
+ * threads "may spill as much as it saves" -- and that mode 2 is unreachable
+ * here, refused outright, not merely untried.
+ *
+ * Against that, the 128-wide tile's advantage is real but narrower than it
+ * looks: it halves the y-block count and so the L2 re-reads of the quantized
+ * activations (684/822/278 MB per launch for the three widest projections
+ * become 342/411/139).  But that is L2 traffic, not DRAM traffic -- the
+ * weights are read once either way -- while the register shortfall lands
+ * inside the accumulation loop.
+ *
+ * WHICH BRANCH THIS MOVES IS THE WHOLE ARGUMENT.  The ladder's author timed
+ * three production shapes at 1024 rows: 6144->2560 (128x64 wins, 401 vs 452
+ * us, i.e. the 128-wide tile loses 11.3%), 10240->320 (128x64 wins, 120 vs
+ * 157) and 2560->512 (128x128 wins, 48 vs 50).  All three have out_dim <=
+ * 4096, so all three are served by branches BELOW this valve, and this change
+ * touches none of them -- including the 384 < out_dim <= 1024 rung, which is
+ * the one case the 128-wide tile won.  The out_dim > 4096 rung is the only
+ * rung choice in the ladder with no timing behind it at all; it was
+ * extrapolated from the L2 amplification model, and that model's own
+ * prediction (the 128-wide tile should win hardest at out_dim 2560, the most
+ * amplified case measured) is exactly where it lost by 11.3%.
+ *
+ * Wave quantization does not rescue it either.  At 1024 rows grid.x = 8 on 48
+ * SMs and pA, pB and pC all sit at o=1, so out 6144 gives 768/16.0 waves
+ * against 384/8.0, out 12288 gives 1536/32.0 against 768/16.0 (both pairs
+ * exact), and out 10240 gives 1280/26.67 against 640/13.33 -- both two-thirds
+ * full in the last wave, with the 128x64 tail a smaller share of its total.
+ *
+ * Bit-exactness is asserted by this tree's own mutation test: the
+ * wide_rung_off mutant in tests/qwen4exp_mma_pipe_mutants.sh is documented as
+ * one whose "outputs would still match (every rung is the same arithmetic)",
+ * caught by the routing check ds4_gpu_q8_mma_pipe_last_bn rather than by a
+ * byte comparison.  Only the DEFAULT moves here, so
+ * ds4_gpu_set_q8_mma_pipe_wide(1) still reaches the 128-wide rung and that
+ * mutant is still caught; DS4_CUDA_MMA_PIPE_WIDE=1 restores the old routing
+ * for anyone with hardware who wants the A/B. */
 static int g_q8_mma_pipe_wide = -1;
 static int cuda_q8_mma_pipe_wide_mode(void) {
     if (g_q8_mma_pipe_wide < 0) {
-        int mode = 1;
+        int mode = 0;
         const char *e = getenv("DS4_CUDA_MMA_PIPE_WIDE");
         if (e != NULL) {
             mode = atoi(e);
-            if (mode < 0 || mode > 2) mode = 1;
+            if (mode < 0 || mode > 2) mode = 0;
         }
         g_q8_mma_pipe_wide = mode;
     }
