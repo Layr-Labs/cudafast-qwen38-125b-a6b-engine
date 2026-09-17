@@ -12,6 +12,17 @@
 #include "ds4_qwen4exp_qsa_scratch.h"
 #include "ds4_qwen4exp_gdn_replay.h"
 
+/* Double-buffered pinned staging for the n-gram row upload, defined in
+ * ds4_cuda_qwen4exp.cu.  Weak: the CPU and test-hook builds of this unit have
+ * no CUDA backend, where the symbols resolve to NULL and the session keeps
+ * its calloc'd staging buffer and blocking write. */
+extern void *ds4_qwen4exp_ple_stage_create(size_t bytes) __attribute__((weak));
+extern void ds4_qwen4exp_ple_stage_destroy(void *stage) __attribute__((weak));
+extern void *ds4_qwen4exp_ple_stage_acquire(void *stage) __attribute__((weak));
+extern int ds4_qwen4exp_ple_stage_upload(void *stage, ds4_gpu_tensor *dst,
+                                       uint64_t offset, uint64_t bytes)
+    __attribute__((weak));
+
 /* ======================================================================
  * Sizing.
  * ====================================================================== */
@@ -328,6 +339,7 @@ struct ds4_qwen4exp_session {
     bool              ple_ready;      /* the hash constants were readable */
     uint64_t         *ple_ids;        /* host [n_batch][head_count]       */
     float            *ple_rows_host;  /* host [n_batch][ple_embd]         */
+    void             *ple_stage;      /* pinned double-buffer for the upload */
     ds4_gpu_tensor   *ple_conv_state; /* [state_rows][n_hc * n_embd]      */
     ds4_gpu_tensor   *ple_rows;       /* [n_batch][ple_embd]              */
     ds4_gpu_tensor   *ple_key;        /* key projection, then the gate    */
@@ -766,6 +778,19 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
             s->ple_ids = calloc((size_t)B * DS4_N_PLE_HEAD, sizeof(uint64_t));
             s->ple_rows_host = calloc((size_t)B * DS4_N_PLE_EMBD, sizeof(float));
             ok = s->ple_ids != NULL && s->ple_rows_host != NULL;
+            /* Prefer the pinned double-buffer: the gather then packs into a
+             * buffer the copy engine is not reading and the upload rides the
+             * decode stream asynchronously, instead of staging through a
+             * bounce buffer behind a blocking write.  Where the CUDA unit is
+             * absent the weak symbol is NULL and the calloc'd buffer stays. */
+            if (ok && ds4_qwen4exp_ple_stage_create != NULL) {
+                s->ple_stage = ds4_qwen4exp_ple_stage_create(
+                    (size_t)B * DS4_N_PLE_EMBD * sizeof(float));
+                if (s->ple_stage) {
+                    free(s->ple_rows_host);
+                    s->ple_rows_host = NULL;
+                }
+            }
         }
         if (ok) {
             s->ple_ready = qwen4exp_ple_read_constants(m, w, &s->ple_constants);
@@ -881,14 +906,21 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
         ds4_gpu_tensor_free(s->attn_q_norm[il]);
         ds4_gpu_tensor_free(s->attn_k_norm[il]);
     }
+    free(s->ple_ids);
+    /* With the stage live, ple_rows_host only borrows one of its pinned
+     * buffers -- nothing to free.  Without it, the calloc'd buffer is ours. */
+    if (s->ple_stage) {
+        if (ds4_qwen4exp_ple_stage_destroy != NULL)
+            ds4_qwen4exp_ple_stage_destroy(s->ple_stage);
+    } else {
+        free(s->ple_rows_host);
+    }
     ds4_gpu_tensor_free(s->ple_conv_state);
     ds4_gpu_tensor_free(s->ple_conv_snapshot);
     ds4_gpu_tensor_free(s->ple_rows);
     ds4_gpu_tensor_free(s->ple_key);
     ds4_gpu_tensor_free(s->ple_aux);
     ds4_gpu_tensor_free(s->ple_value);
-    free(s->ple_ids);
-    free(s->ple_rows_host);
     ds4_gpu_tensor_free(s->d_pos);
     ds4_gpu_tensor_free(s->d_adopt);
     ds4_gpu_tensor_free(s->d_gdn_replay);
@@ -1277,6 +1309,20 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
         return false;
     }
 
+    /* With the pinned stage live, pack into the buffer the copy engine is
+     * not reading.  The acquire waits only on the upload issued two gathers
+     * ago, which has long drained; the first two calls never block. */
+    if (s->ple_stage) {
+        s->ple_rows_host =
+            (float *)ds4_qwen4exp_ple_stage_acquire(s->ple_stage);
+        if (!s->ple_rows_host) {
+            fprintf(stderr,
+                    "ds4: qwen4exp block %u lost its n-gram staging buffer\n",
+                    il);
+            return false;
+        }
+    }
+
     /* Row ids for this call's tokens; the history is advanced past the last
      * one, so a prefill chunk and the decode steps after it name the same
      * rows a single long call would. */
@@ -1459,8 +1505,20 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 "ds4: qwen4exp PLE gather %u rows took %.3f ms\n",
                 n_tokens, (now_sec() - gather_t0) * 1000.0);
     }
-    if (!ds4_gpu_tensor_write(s->ple_rows, 0, s->ple_rows_host,
-                              (uint64_t)n_tokens * DS4_N_PLE_EMBD * sizeof(float))) {
+    const uint64_t upload_bytes =
+        (uint64_t)n_tokens * DS4_N_PLE_EMBD * sizeof(float);
+    if (s->ple_stage) {
+        /* Pinned source, asynchronous on the decode stream the PLE block
+         * kernels consume it from: the copy is stream-ordered ahead of them
+         * and the host moves on without waiting for it to drain. */
+        if (!ds4_qwen4exp_ple_stage_upload(s->ple_stage, s->ple_rows, 0,
+                                         upload_bytes)) {
+            fprintf(stderr,
+                    "ds4: qwen4exp n-gram row upload failed at block %u\n", il);
+            return false;
+        }
+    } else if (!ds4_gpu_tensor_write(s->ple_rows, 0, s->ple_rows_host,
+                                     upload_bytes)) {
         fprintf(stderr, "ds4: qwen4exp n-gram row upload failed at block %u\n", il);
         return false;
     }

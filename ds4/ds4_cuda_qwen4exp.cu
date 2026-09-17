@@ -54,6 +54,7 @@
 #include "ds4_qwen4exp_moe_types.h"
 #include "ds4_qwen4exp_hc_types.h"
 #include "ds4_qwen4exp_qsa_scratch.h"
+#include "ds4_qwen4exp_ple_stage.cuh"
 
 #define CUDA_QK_K 256
 
@@ -15770,6 +15771,47 @@ extern "C" int ds4_gpu_qwen4exp_ple_conv_tensor(
             channels, conv_kernel, dilation, state_len, rows,
             n_snapshot_rows);
     return cuda_ok(cudaGetLastError(), "qwen4exp_ple_conv launch");
+}
+
+/* ------------------------------------------------------------------
+ * Double-buffered pinned staging for the n-gram row upload.
+ *
+ * The graph (ds4_qwen4exp_graph.inc) reaches these through weak externs, so
+ * the CPU and test-hook builds that lack this unit keep their calloc'd
+ * staging buffer and blocking write.  Here they are the real thing: two
+ * pinned buffers and an event each, the upload issued on the decode stream
+ * the PLE block kernels consume it from, so the copy is stream-ordered and
+ * the host never waits on the copy engine before repacking.
+ * ------------------------------------------------------------------ */
+
+extern "C" void *ds4_qwen4exp_ple_stage_create(size_t bytes) {
+    ds4_ple_stage *s = (ds4_ple_stage *)calloc(1, sizeof(ds4_ple_stage));
+    if (!s) return NULL;
+    if (ds4_ple_stage_create(s, bytes) != 0) {
+        free(s);
+        return NULL;
+    }
+    return s;
+}
+
+extern "C" void ds4_qwen4exp_ple_stage_destroy(void *stage) {
+    if (!stage) return;
+    ds4_ple_stage_destroy((ds4_ple_stage *)stage);
+    free(stage);
+}
+
+extern "C" void *ds4_qwen4exp_ple_stage_acquire(void *stage) {
+    return stage ? ds4_ple_stage_acquire((ds4_ple_stage *)stage) : NULL;
+}
+
+extern "C" int ds4_qwen4exp_ple_stage_upload(void *stage, ds4_gpu_tensor *dst,
+                                           uint64_t offset, uint64_t bytes) {
+    if (!stage || !dst || offset > dst->bytes || bytes > dst->bytes - offset)
+        return 0;
+    return cuda_ok(ds4_ple_stage_upload((ds4_ple_stage *)stage,
+                                        (char *)dst->ptr + offset,
+                                        (size_t)bytes, cuda_decode_stream()),
+                   "ple stage upload");
 }
 
 #include "ds4_qwen4exp_hc_host.inc"
