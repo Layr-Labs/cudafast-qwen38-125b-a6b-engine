@@ -1135,6 +1135,33 @@ static void *qw_ple_gather_worker(void *arg) {
     for (uint32_t t = seg->t0; t < seg->t1; t++) {
         ds4_ple_row_ids(&seg->s->ple_constants, &local, seg->tokens + t, 1u,
                         seg->s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD);
+        /* The n-gram table stays mapped on the solid-state disk and a token
+         * selects sixteen scattered rows of it.  Walked in head order the rows
+         * are faulted one at a time and each dequant waits for its own page, so
+         * the step costs the SUM of the page-ins.  Advising all sixteen before
+         * the first dequant issues them together and the step costs the slowest
+         * one instead.  A resident page makes the advise a bounded no-op, so the
+         * worst case is that nothing happens; no byte is read differently and no
+         * value changes. */
+#if defined(POSIX_MADV_WILLNEED)
+        {
+            const uint64_t *const pre =
+                seg->s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD;
+            const size_t pg = (size_t)sysconf(_SC_PAGESIZE);
+            if (pg != 0u) {
+                for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
+                    const uint8_t *const q =
+                        ds4_qwen4exp_ple_row(seg->ple, pre[h]);
+                    if (!q) continue;
+                    uintptr_t a = (uintptr_t)q;
+                    const uintptr_t end = a + seg->ple->row_bytes;
+                    a -= a % pg;
+                    (void)posix_madvise((void *)a, (size_t)(end - a),
+                                        POSIX_MADV_WILLNEED);
+                }
+            }
+        }
+#endif
         for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
             const uint64_t row =
                 seg->s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h];
