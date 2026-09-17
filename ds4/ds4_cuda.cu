@@ -17611,6 +17611,11 @@ int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows) {
  * captures and first-touch costs. A local comparison that does not discard
  * each residency's first run is measuring which arm happened to go first.
  */
+/* This build's note auto09171750_3 records that the promotion margin on
+ * this track is close to the paired measurement's own run-to-run spread, so
+ * a change worth less than about half a percent of decode cannot be told
+ * apart from a lucky draw even after it lands.
+ */
 int ds4_qwen4exp_pdl_enabled(void) {
     static int resolved = 0;
     static int enabled = 0;

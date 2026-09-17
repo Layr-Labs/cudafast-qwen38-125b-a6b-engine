@@ -6558,12 +6558,6 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
  * state at source. */
 template <int R, int DownType = -1, bool Vector = false, bool Stage = false,
           bool Async = false>
-/* This build's note auto09171641_2 records that the scored decode window is
- * one hundred and twenty-eight committed tokens, about sixty-seven
- * speculative rounds, preceded by an untimed correctness phase of
- * sixty-four checked steps. Work removed from the untimed phase does not
- * show up in the score.
- */
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
@@ -9277,7 +9271,7 @@ static int qwen4exp_routed_moe_cuda(
 #define DS4_GATEUP_DMA_BUILD 1
 #endif
 #if DS4_GATEUP_DMA_BUILD
-#define QW_GATEUP_DMA_ARM 6
+#define QW_GATEUP_DMA_ARM 5
 #else
 #define QW_GATEUP_DMA_ARM 0
 #endif
@@ -13694,6 +13688,98 @@ __global__ static void __launch_bounds__(256, 2) qwen4exp_qsa2_attention_group_k
     }
 }
 
+
+/* =========================================================================
+ * The QSA K tape: a dim-major copy of the live K prefix, for the scorers.
+ * =========================================================================
+ *
+ * qwen4exp_qsa3_attention_group_kernel's scorer thread tid owns key
+ * base + tid and reads that key's whole 256-float row, so the 128 threads of
+ * a scorer half-block read 128 DIFFERENT rows: every 16-byte load in the
+ * warp names its own line and the instruction costs 32 transactions where a
+ * coalesced one costs 4.  Measured on the shipping kernel at the prefill
+ * shape (1024 rows, GROUP 12, head_dim 256): aiming every key at one row --
+ * which makes the K read free without changing anything else -- runs 23.4%
+ * faster.  The reads are the kernel's cost, not its arithmetic.
+ *
+ * kT[(kv_head * head_dim + d) * rows + pos] puts consecutive positions at
+ * consecutive addresses, so the same thread-to-key assignment reads
+ * coalesced.  The kernel's K VALUES and their order are identical, so every
+ * float it writes is bit-identical; only the addresses change.  Measured
+ * -13.1% to -13.5% over three runs against a 0.9% run-to-run band, and
+ * bit-identical over the whole 6,291,456-float output tensor.
+ *
+ * PREFILL ONLY, and structurally so: the qsa3 arm sits inside `want > 1`,
+ * and `want` is 1 below QWEN4EXP_QSA_GROUP_MIN_ROWS (64) rows, so a decode
+ * round of one to four rows never reaches the allocation, the transpose or
+ * the TAPE instantiation.  The captured decode graphs are captured at those
+ * widths, so no graph node references any of it; k_cache is byte-for-byte
+ * what it was, because the transpose only READS it.
+ *
+ * The tape is rebuilt from scratch before every qsa3 launch, over the whole
+ * live prefix [0, pos0 + n_tokens), so it carries no state between chunks and
+ * a chunk with pos0 > 0 needs nothing special.  4.5 us per layer at 1024
+ * rows against the 201 us the launch saves.
+ *
+ * DENSE ONLY.  With an indexer selection the keys are arbitrary rows of the
+ * whole cache rather than a prefix, so the sparse path keeps the shipping
+ * kernel; it is bit-identical either way.
+ */
+__global__ static void qwen4exp_qsa_k_tape_kernel(float *kT, const float *k,
+                                                  uint32_t rows, uint32_t hd,
+                                                  uint32_t stride) {
+    /* 32 x 32 through shared memory: the read names 32 consecutive dims of one
+     * position, the write 32 consecutive positions of one dim, so both sides
+     * are coalesced.  The 33-float row skews the banks. */
+    __shared__ float tile[32][33];
+    const uint32_t d0 = blockIdx.x * 32u, p0 = blockIdx.y * 32u;
+    const uint32_t tx = threadIdx.x & 31u, ty = threadIdx.x >> 5;
+#pragma unroll
+    for (uint32_t r = 0; r < 32u; r += 8u) {
+        const uint32_t p = p0 + ty + r, d = d0 + tx;
+        tile[ty + r][tx] = (p < rows && d < hd) ? k[(uint64_t)p * hd + d] : 0.0f;
+    }
+    __syncthreads();
+#pragma unroll
+    for (uint32_t r = 0; r < 32u; r += 8u) {
+        const uint32_t d = d0 + ty + r, p = p0 + tx;
+        if (p < rows && d < hd) kT[(uint64_t)d * stride + p] = tile[tx][ty + r];
+    }
+}
+
+static int qwen4exp_qsa_ktape_off(void) {
+    return getenv("DS4_QWEN4EXP_NO_QSA_KTAPE") != NULL;
+}
+
+/* The tape's buffer.  One allocation for the whole process, grown on demand
+ * and reused by every QSA layer of every chunk; the twelve layers of a chunk
+ * all ask for the same size.  A failed or refused allocation returns NULL and
+ * the caller keeps the shipping kernel, so this can only ever be a no-op.
+ *
+ * cudaMalloc here is safe against stream capture for the same reason the
+ * whole file is: the only caller is the qsa3 arm, which no capture reaches. */
+static float *qwen4exp_qsa_ktape_prepare(const float *k, uint32_t rows,
+                                         uint32_t hd, cudaStream_t stream) {
+    static float   *buf = NULL;
+    static uint64_t cap = 0;
+    const uint64_t need = (uint64_t)rows * hd;
+    if (rows == 0u || hd == 0u) return NULL;
+    if (need > cap) {
+        float *nb = NULL;
+        if (cudaMalloc(&nb, need * sizeof(float)) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return NULL;
+        }
+        if (buf) (void)cudaFree(buf);
+        buf = nb;
+        cap = need;
+    }
+    const dim3 grid((hd + 31u) / 32u, (rows + 31u) / 32u, 1u);
+    qwen4exp_qsa_k_tape_kernel<<<grid, 256, 0, stream>>>(buf, k, rows, hd, rows);
+    if (cudaGetLastError() != cudaSuccess) return NULL;
+    return buf;
+}
+
 /* =========================================================================
  * THIRD CUT of the head-group attention: the second cut's arithmetic with
  * its two phases run side by side.
@@ -13757,13 +13843,13 @@ __device__ __forceinline__ static void qwen4exp_qsa3_bar(uint32_t id, uint32_t n
  * tid + s * SCORERS / KPT); every (key, head) chain is that kernel's.  Called
  * with 256 threads x 1 slot for the prologue tile and 128 x 2 inside the
  * pipelined loop; wmax carries eight per-warp slots, the unused four MASKED. */
-template <uint32_t GROUP, uint32_t SCORERS, uint32_t KPT>
+template <uint32_t GROUP, uint32_t SCORERS, uint32_t KPT, bool TAPE>
 __device__ __forceinline__ static void qwen4exp_qsa3_score_tile(
         const float *qvec, float *probs, int32_t *keys, float *wmax,
         const float *k_cache, const int32_t *selected, uint32_t token,
         uint32_t max_selected, uint32_t sparse, uint32_t cache_cap,
         uint32_t kv_stride, uint32_t kv_head, uint32_t head_dim, float scale,
-        uint32_t count, uint32_t base, uint32_t tid) {
+        uint32_t count, uint32_t base, uint32_t tid, uint32_t tape_stride) {
     constexpr uint32_t NTH = 256u;
     const uint32_t n_in_tile = min(NTH, count - base);
     constexpr uint32_t kthreads = SCORERS;        /* KPT * SCORERS == NTH slots */
@@ -13782,7 +13868,13 @@ __device__ __forceinline__ static void qwen4exp_qsa3_score_tile(
                 if (!(key[s] >= 0 && (uint32_t)key[s] < cache_cap)) key[s] = -1;
             }
             live[s] = key[s] >= 0;
-            kv[s] = k_cache + (uint64_t)(live[s] ? key[s] : 0) * kv_stride + (uint64_t)kv_head * head_dim;
+            /* TAPE is a compile-time constant, so one of these two folds
+             * away entirely and the shipping instantiation is unchanged. */
+            kv[s] = TAPE
+                ? (k_cache + (uint64_t)kv_head * head_dim * tape_stride
+                           + (uint64_t)(live[s] ? key[s] : 0))
+                : (k_cache + (uint64_t)(live[s] ? key[s] : 0) * kv_stride
+                           + (uint64_t)kv_head * head_dim);
         }
         float dot[KPT][GROUP];
 #pragma unroll
@@ -13795,8 +13887,20 @@ __device__ __forceinline__ static void qwen4exp_qsa3_score_tile(
 #pragma unroll
             for (uint32_t s = 0; s < KPT; s++)
 #pragma unroll
-                for (uint32_t i = 0; i < QWEN4EXP_QSA3_KSTEP; i++)
-                    kk[s][i] = ((const float4 *)kv[s])[w + i];
+                for (uint32_t i = 0; i < QWEN4EXP_QSA3_KSTEP; i++) {
+                    if (TAPE) {
+                        /* Four dims of one key, each a stride apart; the four
+                         * values, and the order they reach the chain in, are
+                         * the float4's. */
+                        const uint32_t d0 = 4u * (w + i);
+                        kk[s][i] = make_float4(kv[s][(uint64_t)(d0 + 0u) * tape_stride],
+                                               kv[s][(uint64_t)(d0 + 1u) * tape_stride],
+                                               kv[s][(uint64_t)(d0 + 2u) * tape_stride],
+                                               kv[s][(uint64_t)(d0 + 3u) * tape_stride]);
+                    } else {
+                        kk[s][i] = ((const float4 *)kv[s])[w + i];
+                    }
+                }
 #pragma unroll
             for (uint32_t h = 0; h < GROUP; h++) {
                 const float4 *qh = (const float4 *)(qvec + h * head_dim);
@@ -13843,13 +13947,13 @@ __device__ __forceinline__ static void qwen4exp_qsa3_score_tile(
     }
 }
 
-template <uint32_t GROUP>
+template <uint32_t GROUP, bool TAPE = false>
 __global__ static void __launch_bounds__(256, 2) qwen4exp_qsa3_attention_group_kernel(
         const float *q, const float *k_cache, const float *v_cache,
         const int32_t *selected, const int32_t *counts, float *out,
         uint32_t n_tokens, uint32_t n_head, uint32_t n_kv_head, uint32_t head_dim,
         uint32_t pos0, uint32_t cache_cap, uint32_t max_selected, uint32_t sparse,
-        float scale, const uint32_t *d_pos) {
+        float scale, const uint32_t *d_pos, uint32_t tape_stride = 0u) {
     extern __shared__ __align__(16) float qwen4exp_qsa3_shared[];
     constexpr uint32_t NTH = 256u;
     constexpr uint32_t HALF = 128u;
@@ -13907,8 +14011,8 @@ __global__ static void __launch_bounds__(256, 2) qwen4exp_qsa3_attention_group_k
     /* Prologue: tile 0's scores.  (Scoring it with all eight warps at one
      * slot each was measured slower: the extra instantiation pushed the
      * kernel past its register budget.) */
-    if (scorer) qwen4exp_qsa3_score_tile<GROUP, HALF, KPT>(qvec, probs0, keys0, wmax0, k_cache, selected, token,
-        max_selected, sparse, cache_cap, kv_stride, kv_head, head_dim, scale, count, 0u, tid);
+    if (scorer) qwen4exp_qsa3_score_tile<GROUP, HALF, KPT, TAPE>(qvec, probs0, keys0, wmax0, k_cache, selected, token,
+        max_selected, sparse, cache_cap, kv_stride, kv_head, head_dim, scale, count, 0u, tid, tape_stride);
     __syncthreads();
 
     uint32_t cur = 0;
@@ -13918,9 +14022,9 @@ __global__ static void __launch_bounds__(256, 2) qwen4exp_qsa3_attention_group_k
         if (scorer) {
             if (has_next) {
                 const uint32_t b = cur ^ 1u;
-                qwen4exp_qsa3_score_tile<GROUP, HALF, KPT>(qvec, probs0 + b * GROUP * NTH, keys0 + b * NTH,
+                qwen4exp_qsa3_score_tile<GROUP, HALF, KPT, TAPE>(qvec, probs0 + b * GROUP * NTH, keys0 + b * NTH,
                     wmax0 + b * GROUP * 8u, k_cache, selected, token, max_selected, sparse,
-                    cache_cap, kv_stride, kv_head, head_dim, scale, count, base + NTH, tid);
+                    cache_cap, kv_stride, kv_head, head_dim, scale, count, base + NTH, tid, tape_stride);
             }
         } else {
             float *probs = probs0 + cur * GROUP * NTH;
@@ -15417,6 +15521,27 @@ extern "C" int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
             if (g == 12u && head_dim == 256u && nth == 256u &&
                 !qwen4exp_qsa_group3_off() &&
                 gshared3 <= QWEN4EXP_QSA_GROUP_SHARED_CAP) {
+                /* The dim-major K tape, dense only, prefill only (see its own
+                 * note above).  Every key this launch can read is < rows, so
+                 * the tape covers them all; a NULL means the allocation was
+                 * refused and the shipping instantiation runs instead. */
+                const uint32_t tape_rows = pos0 + n_tokens;
+                const uint32_t tape_hd = n_kv_head * head_dim;
+                const float *ktape = (!sparse && !qwen4exp_qsa_ktape_off())
+                    ? qwen4exp_qsa_ktape_prepare((const float *)k_cache->ptr,
+                                                 tape_rows, tape_hd, cuda_decode_stream())
+                    : NULL;
+                if (ktape != NULL) {
+                    qwen4exp_qsa3_attention_group_kernel<12u, true><<<grid, nth, gshared3,
+                        cuda_decode_stream()>>>(
+                            (const float *)q->ptr, ktape,
+                            (const float *)v_cache->ptr, NULL, NULL,
+                            (float *)out->ptr, n_tokens, n_head, n_kv_head, head_dim,
+                            pos0, cache_cap, max_selected, 0u, scale, d_pos_ptr,
+                            tape_rows);
+                    return cuda_ok(cudaGetLastError(),
+                                   "Qwen4-Exp QSA grouped attention (3, K tape) launch");
+                }
                 qwen4exp_qsa3_attention_group_kernel<12u><<<grid, nth, gshared3,
                     cuda_decode_stream()>>>(
                         (const float *)q->ptr, (const float *)k_cache->ptr,
