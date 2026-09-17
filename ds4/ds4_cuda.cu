@@ -17449,6 +17449,139 @@ extern "C" void ds4_gpu_set_q8_mma_pipe_wide(int mode) {
     g_q8_mma_pipe_wide = mode;
 }
 
+/* THE PIPE'S DEPTH, on the one rung that has room for a third stage.
+ * DS4_CUDA_MMA_PIPE_DEEP: unset or 1 tries STAGES=3 on the 128x64 tile before
+ * the shipped STAGES=2; 0 keeps the shipped depth exactly.
+ *
+ * Why this rung and only this rung.  q8_mma_pipe_cfg::SMEM is
+ * STAGES * STAGE_BYTES, and STAGE_BYTES is fixed by the tile:
+ *
+ *   128x64   A 128*144 + B 64*144 + As 128*4*4 + Ws 4*64*4 = 30,720 B
+ *   128x128  A 128*144 + B 128*144 + As 2,048  + Ws 2,048  = 40,960 B
+ *   128x256  A 128*144 + B 256*144 + As 2,048  + Ws 4,096  = 61,440 B
+ *
+ * against this device's cudaDevAttrMaxSharedMemoryPerBlockOptin of 101,376
+ * (hw_limits below publishes it, and it has read 101376 on every ranked run):
+ *
+ *   128x64  x3 =  92,160  FITS, and is the only third stage that does
+ *   128x128 x3 = 122,880  refused
+ *   128x256 x2 = 122,880  refused -- so the wide=2 rung the ladder offers
+ *                         is unreachable on this box, not merely untried
+ *
+ * Why a third stage should pay here, and why it costs nothing to try.  Both
+ * shipped rungs already sit at ONE block per SM (101,376 / 61,440 = 1), so the
+ * extra 30,720 B cannot cost residency -- there is no second block to lose.
+ * That one block is 256 threads, 8 of the SM's 48 warps, and 4 of those 8 are
+ * producers: nothing else is resident to hide a global miss, so the only
+ * latency hiding this kernel has is its own pipeline. At STAGES=2 a stage's
+ * LDG walk (KA 8 + KS 1 + KB 5 = 14 uint4 per producer lane) must hide under
+ * exactly ONE stage of consumer compute; at 3 it may span two.
+ *
+ * Why it is bit-exact.  STAGES enters the kernel only as `buf = s % STAGES`,
+ * the `s >= STAGES` guard on the EMPTY wait, and the barrier ids 1+2*buf /
+ * 2+2*buf. It never reaches the accumulation: every consumer thread still
+ * walks s ascending, then gg ascending, into its own acc[mi][ni][e]. That is
+ * the kernel's contract, the same reason the ladder's existing rungs are
+ * interchangeable. The static_assert on the template sanctions 2..7 and the
+ * barrier numbering is built for it -- 3 stages uses ids 1..6 plus the
+ * producers' own 15, seven of the sixteen a CTA has.
+ *
+ * A refused opt-in is not a hazard: cuda_q8_mma_pipe_launch returns 0 without
+ * launching and the shipped 2-stage rung runs, exactly as the wide rung
+ * already falls back. */
+static int g_q8_mma_pipe_deep = -1;
+static int cuda_q8_mma_pipe_deep_mode(void) {
+    if (g_q8_mma_pipe_deep < 0) {
+        int mode = 1;
+        const char *e = getenv("DS4_CUDA_MMA_PIPE_DEEP");
+        if (e != NULL) {
+            mode = atoi(e);
+            if (mode < 0 || mode > 1) mode = 1;
+        }
+        g_q8_mma_pipe_deep = mode;
+    }
+    return g_q8_mma_pipe_deep;
+}
+extern "C" void ds4_gpu_set_q8_mma_pipe_deep(int mode) {
+    g_q8_mma_pipe_deep = mode;
+}
+
+/* THE WARP-SPECIALIZED PIPE'S OWN REGISTER AND RESIDENCY STATE.
+ *
+ * ds4_gpu_qwen4exp_kernel_limits() reports five kernels, all of them in the
+ * other translation unit and none of them this one.  The pipe is the newest and
+ * least understood kernel in the tree -- a producer/consumer tile with 4 warps
+ * that only copy, named barriers, ldmatrix.x4 and mma.m16n8k32 -- and NOTHING
+ * about its compiled shape has ever been published.  Four rungs are reported,
+ * abbreviated to keep the whole limits string inside the ident buffer:
+ *
+ *   pA  <2,2,4,4,4,2>  128x64  256 thr  61,440 B   the shipped out-projection rung
+ *   pB  <2,2,4,4,4,3>  128x64  256 thr  92,160 B   this submission's third stage
+ *   pC  <2,4,4,4,4,2>  128x128 384 thr  81,920 B   the shipped wide rung
+ *   pD  <2,8,4,4,4,2>  128x256 640 thr 122,880 B   the wide=2 rung
+ *
+ * a = the dynamic-shared opt-in was accepted, r = registers, l = spill bytes,
+ * o = blocks/SM at the launch shape (THREADS, SMEM).
+ *
+ * Three things this answers that no amount of source reading can.
+ *
+ *   1. pB[a] and pB[o] say whether the third stage actually took.  92,160 fits
+ *      101,376 by my arithmetic, but that arithmetic has been wrong twice on
+ *      exactly this kind of question, and a refused opt-in falls back SILENTLY
+ *      -- the run would simply be the frontier and I would have no way to know.
+ *      pB[a]=1 o=1 means the tree that was measured is the tree I described.
+ *   2. pD[a] is a falsifiable PREDICTION: 122,880 > 101,376, so it must read 0.
+ *      If it reads 1, either the opt-in ceiling is not what hw_limits has been
+ *      publishing or STAGE_BYTES is not what I computed, and every occupancy
+ *      claim in this note is void.  The valve offers wide=2 as a measurement
+ *      arm; this says the arm is unreachable on this box rather than untried.
+ *   3. pA[r] and pA[l] are the empirical cost of warp specialization on this
+ *      compiler -- the number the routed-MoE q4_K prefill pair needs before
+ *      anyone writes a producer/consumer pipeline for it blind.  mm[reg]=167 at
+ *      128 threads is what the ordinary tile costs; if the pipe's consumers come
+ *      in far under that with l=0, the structure is affordable there too.
+ *
+ * Read every r with the caveat the other unit's probe earned the hard way:
+ * ptxas re-allocates registers when an unrelated kernel in the same unit
+ * changes, so these are only comparable within one compilation.  pA and pC are
+ * source-identical to the frontier and act as that comparison's own control:
+ * if they move, this submission's single added instantiation perturbed the
+ * unit's allocation and pB[r] cannot be differenced against pA[r]. */
+template <int WM, int WN, int MT, int NT, int G, int STAGES>
+static void cuda_q8_pipe_probe(int *ok, int *regs, int *lmem, int *occ) {
+    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES> C;
+    *ok = 0;
+    *regs = -1;
+    *lmem = -1;
+    *occ = -1;
+    /* The same opt-in cuda_q8_mma_pipe_attr makes, asked here so the answer is
+     * published whether or not that path has run yet.  It is idempotent. */
+    if (cudaFuncSetAttribute(matmul_q8_0_preq_rows_mma_pipe_kernel<WM, WN, MT, NT, G, STAGES>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             C::SMEM) == cudaSuccess) {
+        *ok = 1;
+    } else {
+        (void)cudaGetLastError();
+    }
+    cudaFuncAttributes a;
+    if (cudaFuncGetAttributes(
+            &a, matmul_q8_0_preq_rows_mma_pipe_kernel<WM, WN, MT, NT, G, STAGES>) ==
+        cudaSuccess) {
+        *regs = a.numRegs;
+        *lmem = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    int o = 0;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &o, matmul_q8_0_preq_rows_mma_pipe_kernel<WM, WN, MT, NT, G, STAGES>,
+            C::THREADS, C::SMEM) == cudaSuccess) {
+        *occ = o;
+    } else {
+        (void)cudaGetLastError();
+    }
+}
+
 /* The device's occupancy limits, as a compact string the caller can append to
  * an identity that reaches the run's metrics.  See ds4.h for why this is worth
  * publishing.
@@ -17511,7 +17644,28 @@ extern "C" const char *ds4_gpu_hw_limits(void) {
      * is diagnostic only and snprintf keeps it terminated. */
     const char *kl = ds4_gpu_qwen4exp_kernel_limits();
     if (kl && kl[0] && (size_t)n + 2u < sizeof(buf)) {
-        snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", kl);
+        const int m = snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", kl);
+        if (m > 0) {
+            n += m;
+            if (n > (int)sizeof(buf) - 1) n = (int)sizeof(buf) - 1;
+        }
+    }
+    /* The four pipe rungs, from the unit that owns them.  Same truncation
+     * argument as above: diagnostic only, and snprintf keeps it terminated. */
+    if ((size_t)n + 2u < sizeof(buf)) {
+        int a_ok = 0, a_r = -1, a_l = -1, a_o = -1;
+        int b_ok = 0, b_r = -1, b_l = -1, b_o = -1;
+        int c_ok = 0, c_r = -1, c_l = -1, c_o = -1;
+        int d_ok = 0, d_r = -1, d_l = -1, d_o = -1;
+        cuda_q8_pipe_probe<2, 2, 4, 4, 4, 2>(&a_ok, &a_r, &a_l, &a_o);
+        cuda_q8_pipe_probe<2, 2, 4, 4, 4, 3>(&b_ok, &b_r, &b_l, &b_o);
+        cuda_q8_pipe_probe<2, 4, 4, 4, 4, 2>(&c_ok, &c_r, &c_l, &c_o);
+        cuda_q8_pipe_probe<2, 8, 4, 4, 4, 2>(&d_ok, &d_r, &d_l, &d_o);
+        snprintf(buf + n, sizeof(buf) - (size_t)n,
+                 " pA[a=%d r=%d l=%d o=%d] pB[a=%d r=%d l=%d o=%d]"
+                 " pC[a=%d r=%d l=%d o=%d] pD[a=%d r=%d l=%d o=%d]",
+                 a_ok, a_r, a_l, a_o, b_ok, b_r, b_l, b_o,
+                 c_ok, c_r, c_l, c_o, d_ok, d_r, d_l, d_o);
     }
     return buf;
 }
@@ -17557,6 +17711,7 @@ static int cuda_q8_mma_pipe_launch(float *out, const unsigned char *w,
 static void cuda_q8_mma_pipe_prepare(void) {
     if (!cuda_q8_mma_available()) return;
     (void)cuda_q8_mma_pipe_attr<2, 2, 4, 4, 4, 2>();
+    (void)cuda_q8_mma_pipe_attr<2, 2, 4, 4, 4, 3>();
     (void)cuda_q8_mma_pipe_attr<2, 4, 4, 4, 4, 2>();
     (void)cuda_q8_mma_pipe_attr<2, 8, 4, 4, 4, 2>();
 }
@@ -17611,6 +17766,17 @@ static int cuda_q8_mma_pipe_try(float *out, const unsigned char *w,
     }
     if (out_dim > 384u && out_dim <= 1024u) {
         return cuda_q8_mma_pipe_launch<2, 4, 4, 4, 4, 2>(out, w, xq, xscale, out_dim, n_rows, blocks);
+    }
+    /* The 128x64 tile, the rung the out projections land on (out_dim <= 384 and
+     * 1024 < out_dim <= 4096: the hc lowrank at 320, and the 2560-wide ssm_out
+     * and attention output the wide valve's 4096 deliberately keeps here).  Its
+     * third stage is the only one this device's 101,376 B opt-in has room for;
+     * see the DS4_CUDA_MMA_PIPE_DEEP comment for the footprint arithmetic and
+     * for why STAGES cannot reach the accumulation.  A refusal falls through to
+     * the shipped depth. */
+    if (cuda_q8_mma_pipe_deep_mode() != 0 &&
+        cuda_q8_mma_pipe_launch<2, 2, 4, 4, 4, 3>(out, w, xq, xscale, out_dim, n_rows, blocks)) {
+        return 1;
     }
     return cuda_q8_mma_pipe_launch<2, 2, 4, 4, 4, 2>(out, w, xq, xscale, out_dim, n_rows, blocks);
 }
