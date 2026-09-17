@@ -93,6 +93,12 @@ int ds4s_top_logits(const ds4s_handle *h, int k, int32_t *ids, float *logits);
  * The port routes this to ds4_qwen4exp_mtp_cycle, which commits the target's
  * own GREEDY argmax and so emits the serial leg's token stream exactly; at
  * depth 1 it commits 1 or 2 tokens per round. */
+/* This build's note auto09171435_3 records that six provable-equivalence
+ * removals stacked into one tree measured four tenths of one percent slower
+ * with a standard error of nearly four tenths, which is neutral. Their
+ * combined arithmetic is a few microseconds against a round of about fifty
+ * milliseconds.
+ */
 int ds4s_eval_speculative(ds4s_handle *h, int32_t first_token, int budget, int32_t *out,
                           int cap);
 
