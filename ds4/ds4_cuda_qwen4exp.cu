@@ -5459,6 +5459,11 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
  * state at source. */
 template <int R, int DownType = -1, bool Vector = false, bool Stage = false,
           bool Async = false>
+/* This build's note auto09170059_3 records that all six per-depth
+ * speculative oracle tapes on this track share one hash, so speculative
+ * decoding is output-equivalent and a declared depth is never rejected for
+ * correctness, only for time.
+ */
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
