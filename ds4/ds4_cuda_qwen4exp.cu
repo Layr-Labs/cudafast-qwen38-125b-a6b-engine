@@ -15772,6 +15772,35 @@ extern "C" int ds4_gpu_qwen4exp_ple_conv_tensor(
     return cuda_ok(cudaGetLastError(), "qwen4exp_ple_conv launch");
 }
 
+#include "ds4_qwen4exp_ple_upload.cuh"
+
+/* Pinned staging for the PLE gather.  The host side weak-links these; a
+ * build without the CUDA object keeps the pageable calloc and the blocking
+ * tensor write, byte for byte. */
+extern "C" void *ds4_gpu_qwen4exp_ple_host_alloc(uint64_t bytes) {
+    return ds4_ple_pinned_alloc((size_t)bytes);
+}
+
+extern "C" void ds4_gpu_qwen4exp_ple_host_free(void *p) {
+    ds4_ple_pinned_free(p);
+}
+
+/* Queue the staged rows on the decode stream ahead of the block kernels
+ * and record the event the next gather waits on before rewriting the
+ * staging buffer. */
+extern "C" int ds4_gpu_qwen4exp_ple_upload_tensor(
+        ds4_gpu_tensor *dst, const void *src, uint64_t bytes) {
+    if (!dst || !src || bytes == 0u || dst->bytes < bytes) {
+        return 0;
+    }
+    return ds4_ple_upload_async(dst->ptr, src, (size_t)bytes,
+                                cuda_decode_stream());
+}
+
+extern "C" int ds4_gpu_qwen4exp_ple_upload_wait(void) {
+    return ds4_ple_upload_wait();
+}
+
 #include "ds4_qwen4exp_hc_host.inc"
 #include "ds4_qwen4exp_ple_host.inc"
 

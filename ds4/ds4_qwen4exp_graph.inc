@@ -328,6 +328,7 @@ struct ds4_qwen4exp_session {
     bool              ple_ready;      /* the hash constants were readable */
     uint64_t         *ple_ids;        /* host [n_batch][head_count]       */
     float            *ple_rows_host;  /* host [n_batch][ple_embd]         */
+    int               ple_host_pinned; /* staging came from cudaHostAlloc  */
     ds4_gpu_tensor   *ple_conv_state; /* [state_rows][n_hc * n_embd]      */
     ds4_gpu_tensor   *ple_rows;       /* [n_batch][ple_embd]              */
     ds4_gpu_tensor   *ple_key;        /* key projection, then the gate    */
@@ -764,7 +765,19 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
         s->ple_value = qwen4exp_alloc_zeroed(B * E * f, &ok);
         if (ok) {
             s->ple_ids = calloc((size_t)B * DS4_N_PLE_HEAD, sizeof(uint64_t));
-            s->ple_rows_host = calloc((size_t)B * DS4_N_PLE_EMBD, sizeof(float));
+            /* Pinned staging when the CUDA object supplies it: the upload
+             * then DMAs straight out of this buffer instead of staging
+             * through a driver bounce buffer, and it can run async on the
+             * decode stream.  A pageable calloc stays the fallback. */
+            if (ds4_gpu_qwen4exp_ple_host_alloc) {
+                s->ple_rows_host = (float *)ds4_gpu_qwen4exp_ple_host_alloc(
+                    (uint64_t)B * DS4_N_PLE_EMBD * sizeof(float));
+                s->ple_host_pinned = s->ple_rows_host != NULL;
+            }
+            if (!s->ple_rows_host) {
+                s->ple_rows_host =
+                    calloc((size_t)B * DS4_N_PLE_EMBD, sizeof(float));
+            }
             ok = s->ple_ids != NULL && s->ple_rows_host != NULL;
         }
         if (ok) {
@@ -887,8 +900,12 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->ple_key);
     ds4_gpu_tensor_free(s->ple_aux);
     ds4_gpu_tensor_free(s->ple_value);
+    if (s->ple_host_pinned && ds4_gpu_qwen4exp_ple_host_free) {
+        ds4_gpu_qwen4exp_ple_host_free(s->ple_rows_host);
+    } else {
+        free(s->ple_rows_host);
+    }
     free(s->ple_ids);
-    free(s->ple_rows_host);
     ds4_gpu_tensor_free(s->d_pos);
     ds4_gpu_tensor_free(s->d_adopt);
     ds4_gpu_tensor_free(s->d_gdn_replay);
@@ -1240,6 +1257,18 @@ static void qw_ple_pool_init(void) {
     pthread_mutex_unlock(&g_qw_ple_pool.mutex);
 }
 
+/* The CUDA qwen4exp object supplies pinned staging and a stream-ordered
+ * upload for the gather.  Builds without it leave the weak references
+ * empty and the gather keeps the pageable calloc plus the blocking tensor
+ * write, byte for byte. */
+extern void *ds4_gpu_qwen4exp_ple_host_alloc(uint64_t bytes)
+        __attribute__((weak));
+extern void ds4_gpu_qwen4exp_ple_host_free(void *p) __attribute__((weak));
+extern int ds4_gpu_qwen4exp_ple_upload_tensor(
+        ds4_gpu_tensor *dst, const void *src, uint64_t bytes)
+        __attribute__((weak));
+extern int ds4_gpu_qwen4exp_ple_upload_wait(void) __attribute__((weak));
+
 static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                                       const ds4_qwen4exp_weights *w,
                                       const int32_t *tokens,
@@ -1256,6 +1285,16 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 "ds4: qwen4exp block %u needs the n-gram table as IQ4_NL; this "
                 "artifact stores it as type %u, which no gather covers\n",
                 il, w->ple.type);
+        return false;
+    }
+    /* The last gather's upload may still be reading the staging buffer.
+     * The event it recorded is the only thing between this call's writes
+     * and a torn row; with no upload queued the wait is a no-op. */
+    if (s->ple_host_pinned && ds4_gpu_qwen4exp_ple_upload_wait &&
+        !ds4_gpu_qwen4exp_ple_upload_wait()) {
+        fprintf(stderr,
+                "ds4: qwen4exp block %u could not confirm the previous "
+                "n-gram upload\n", il);
         return false;
     }
     if (w->ple.row_dim != DS4_N_PLE_ROW_DIM ||
@@ -1458,6 +1497,21 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
         fprintf(stderr,
                 "ds4: qwen4exp PLE gather %u rows took %.3f ms\n",
                 n_tokens, (now_sec() - gather_t0) * 1000.0);
+    }
+    if (s->ple_host_pinned && ds4_gpu_qwen4exp_ple_upload_tensor) {
+        /* Pinned staging DMAs straight to the device on the decode stream,
+         * ordered ahead of the block kernels that read the rows; the host
+         * does not wait for it.  The next gather's event wait is what keeps
+         * the staging buffer from being rewritten under the copy. */
+        if (!ds4_gpu_qwen4exp_ple_upload_tensor(
+                s->ple_rows, s->ple_rows_host,
+                (uint64_t)n_tokens * DS4_N_PLE_EMBD * sizeof(float))) {
+            fprintf(stderr,
+                    "ds4: qwen4exp n-gram async upload failed at block %u\n",
+                    il);
+            return false;
+        }
+        return true;
     }
     if (!ds4_gpu_tensor_write(s->ple_rows, 0, s->ple_rows_host,
                               (uint64_t)n_tokens * DS4_N_PLE_EMBD * sizeof(float))) {
