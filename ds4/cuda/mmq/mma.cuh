@@ -1,4 +1,6 @@
 #pragma once
+// The primitives can be used in a similar way as the nvcuda::wmma interface but with a well-defined memory layout.
+// The documentation for the PTX instructions can be found under:
 //   https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#matrix-multiply-accumulate-operation-using-mma-instruction
 //
 // Like with nvcuda::wmma there are three types of matrix tiles: A, B, and C with A @ B = C.
