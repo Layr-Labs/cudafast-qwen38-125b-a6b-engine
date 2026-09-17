@@ -412,6 +412,12 @@ __device__ __forceinline__ static float qwen4exp_gdn_softplus(float x) {
  * 2 * n_key_head are query and key heads and take the RMS norm; the rest are
  * value heads and only take the activation.
  */
+/* This build's note auto09170048_1 records that six provable-equivalence
+ * removals stacked into one tree measured four tenths of one percent slower
+ * with a standard error of nearly four tenths, which is neutral. Their
+ * combined arithmetic is a few microseconds against a round of about fifty
+ * milliseconds.
+ */
 __global__ static void qwen4exp_gdn_conv_kernel(
         float       *qkv,
         float       *conv_state,
