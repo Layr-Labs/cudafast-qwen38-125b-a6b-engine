@@ -14818,8 +14818,36 @@ static uint32_t qwen4exp_qsa_split_width(uint32_t n_tokens, uint32_t n_head,
         return (v > 0 && v <= 32) ? (uint32_t)v : 0u;
     }
     /* One model-shaped row benefits from twice as many independent head
-     * groups. Multi-row calls retain four heads and their K/V reuse. */
-    return n_tokens == 1u && n_head == 24u && n_kv_head == 2u && head_dim == 256u
+     * groups.  The two-row verify forward benefits MORE, not less, so it takes
+     * the same width; wider calls retain four heads and their K/V reuse.
+     *
+     * The grid is (n_head/g, max_tiles, n_tokens) and a block's work is
+     * proportional to g, so g trades block count against work per block at
+     * constant total work.  At this shape only the first ceil(count/256) tile
+     * rows survive the `base >= count` guard, which is 5 at the benchmark's
+     * context, so the blocks that actually run are 5 * n_tokens * 24/g:
+     *
+     *     one row,  g=4 -> 30 blocks of 4 units;  makespan 4 units on 48 SMs
+     *     one row,  g=2 -> 60 blocks of 2 units;  makespan 4 units
+     *     two rows, g=4 -> 60 blocks of 4 units;  makespan 8 units
+     *     two rows, g=2 -> 120 blocks of 2 units; makespan 6 units
+     *
+     * At one row the quantization is a wash (4 against 4) and the measured win
+     * came from elsewhere -- occupancy, or simply more requests in flight.  At
+     * two rows the quantization is NOT a wash: 60/48 rounds up to two waves
+     * and wastes 37% of the device, while 120/48 rounds up to three half-waves
+     * and wastes 17%.  Both effects point the same way here.
+     *
+     * Halving g also halves this path's shared footprint (the probs kernel
+     * goes 9216 -> 5120 bytes, the scores kernel 41088 -> 38976), so residency
+     * cannot get worse.  Scratch is sized from (n_tokens, n_head, max_tiles)
+     * and does not mention g, so no width can overflow it.
+     *
+     * The K rows a block reads are shared by every group with the same
+     * kv_head, so halving g doubles how many blocks ask for the same lines --
+     * but at two rows the token axis already duplicates those reads, and the
+     * unique K per layer is ~2.5 MB, which L2 holds. */
+    return n_tokens <= 2u && n_head == 24u && n_kv_head == 2u && head_dim == 256u
         ? 2u : 4u;
 }
 
@@ -15412,7 +15440,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_tensor(
  * swallowed and reported as -1; the function never touches device state and is
  * called once, off the timed path. */
 extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
-    static char buf[384];
+    static char buf[576];
     static int built = 0;
     if (built) return buf;
     built = 1;
@@ -15426,6 +15454,21 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
     int md_regs = -1, md_smem = -1, md_lmem = -1, md_occ = -1;
     /* The drift control: a kernel nobody in this line of work has touched. */
     int gd_regs = -1, gd_lmem = -1;
+    /* THE LIVE DECODE ATTENTION, read here for the first time.  Every kernel
+     * above is a matmul; these three are the QSA split path, which is what runs
+     * attention on the 12 full-attention layers at one and two rows, and no
+     * probe has ever reported them.  They are queried WITH their launch-time
+     * dynamic shared size, because that is what binds them: the scores tile is
+     * 38,976 B at g=2, and 101,376 / 38,976 is 2 blocks per SM on shared memory
+     * alone, so `qs[occ]` is the number that says whether the live decode
+     * attention runs at a residency anyone would accept.  `q3[]` is the
+     * prefill-only group kernel at the production width for the same reason.
+     * All four are instantiations the switch above already emits, so nothing new
+     * is compiled and no launch changes. */
+    int qs_regs = -1, qs_smem = -1, qs_lmem = -1, qs_occ = -1;
+    int qp_regs = -1, qp_occ = -1;
+    int qf_regs = -1, qf_occ = -1;
+    int q3_regs = -1, q3_occ = -1;
 
     cudaFuncAttributes a;
     if (cudaFuncGetAttributes(
@@ -15581,16 +15624,108 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
         (void)cudaGetLastError();
     }
 
+    /* ---- THE QSA SPLIT PATH, at the shape and the dynamic shared size the
+     * live decode launch uses.  nth and head_dim are both 256 on this model, so
+     * these repeat the launcher's own two expressions at g=2, the width the
+     * one-row draft takes; the launcher's arithmetic is unchanged and this only
+     * reads it back.  Passing the dynamic size is the whole point -- at 0 the
+     * runtime would report the register bound and miss the 38,976 B tile that
+     * actually decides the number. */
+    {
+        const uint32_t p_nth = 256u, p_hd = 256u, p_g = 2u;
+        const size_t p_sc = ((size_t)p_g * p_hd +
+                             (((size_t)p_g * (p_nth >> 5u) + 3u) & ~(size_t)3u) +
+                             (size_t)p_nth * QWEN4EXP_QSA_SPLIT_KPITCH) *
+                            sizeof(float);
+        const size_t p_pr = (size_t)2u * p_g * p_nth * sizeof(float) +
+                            (size_t)p_nth * sizeof(int32_t);
+        if (cudaFuncGetAttributes(
+                &a, qwen4exp_qsa_split_scores_kernel<2u>) == cudaSuccess) {
+            qs_regs = a.numRegs;
+            qs_smem = (int)p_sc;          /* dynamic: report what is launched */
+            qs_lmem = (int)a.localSizeBytes;
+        } else {
+            (void)cudaGetLastError();
+        }
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &occ, qwen4exp_qsa_split_scores_kernel<2u>, (int)p_nth,
+                p_sc) == cudaSuccess) {
+            qs_occ = occ;
+        } else {
+            (void)cudaGetLastError();
+        }
+        /* V = 8u, NOT QWEN4EXP_QSA_SPLIT_VSTEP.  The g == 2 case has a
+         * short-V arm gated on exactly this model's one-row dense shape
+         * (n_tokens == 1, n_head == 24, n_kv_head == 2, head_dim == 256), so
+         * <2u, 8u> is the instantiation the draft row actually launches and
+         * <2u, 16u> is the fallback nothing here takes. */
+        if (cudaFuncGetAttributes(
+                &a, qwen4exp_qsa_split_probs_kernel<2u, 8u>) == cudaSuccess) {
+            qp_regs = a.numRegs;
+        } else {
+            (void)cudaGetLastError();
+        }
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &occ, qwen4exp_qsa_split_probs_kernel<2u, 8u>, (int)p_nth,
+                p_pr) == cudaSuccess) {
+            qp_occ = occ;
+        } else {
+            (void)cudaGetLastError();
+        }
+        /* The fold kernel takes no dynamic shared and launches at head_dim
+         * threads, not nth. */
+        if (cudaFuncGetAttributes(
+                &a, qwen4exp_qsa_split_fold_kernel) == cudaSuccess) {
+            qf_regs = a.numRegs;
+        } else {
+            (void)cudaGetLastError();
+        }
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &occ, qwen4exp_qsa_split_fold_kernel, (int)p_hd, 0) ==
+            cudaSuccess) {
+            qf_occ = occ;
+        } else {
+            (void)cudaGetLastError();
+        }
+        /* The prefill group kernel at the production width (g = gqa = 12). */
+        const size_t p_g3 = qwen4exp_qsa_group3_shared(12u, p_hd, p_nth);
+        if (cudaFuncGetAttributes(
+                &a, qwen4exp_qsa3_attention_group_kernel<12u>) == cudaSuccess) {
+            q3_regs = a.numRegs;
+        } else {
+            (void)cudaGetLastError();
+        }
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &occ, qwen4exp_qsa3_attention_group_kernel<12u>, (int)p_nth,
+                p_g3) == cudaSuccess) {
+            q3_occ = occ;
+        } else {
+            (void)cudaGetLastError();
+        }
+    }
+
     snprintf(buf, sizeof(buf),
              "gu[reg=%d smem=%d lmem=%d maxt=%d occ=%d] dn[reg=%d smem=%d "
              "lmem=%d maxt=%d occ=%d] gdn[reg=%d lmem=%d] "
              "mm[reg=%d smem=%d lmem=%d occ=%d] "
-             "md[reg=%d smem=%d lmem=%d occ=%d]",
+             "md[reg=%d smem=%d lmem=%d occ=%d] "
+             /* Abbreviated on purpose.  The consumer in ds4_cuda.cu appends
+              * this into a static char[448] that a live readout shows is
+              * already 361 chars deep (185 of prefix + 176 of the five fields
+              * above), so there are 86 characters left in the whole channel.
+              * `r=`/`ds=`/`l=`/`o=` renders the four new kernels in ~78 worst
+              * case; the long spellings would have been ~89 and the last field
+              * would have been silently truncated.  Appended at the END so any
+              * future overflow costs this probe's data and nothing earlier. */
+             "qs[r=%d ds=%d l=%d o=%d] qp[r=%d o=%d] "
+             "qf[r=%d o=%d] q3[r=%d o=%d]",
              gu_regs, gu_smem, gu_lmem, gu_maxt, gu_occ,
              dn_regs, dn_smem, dn_lmem, dn_maxt, dn_occ,
              gd_regs, gd_lmem,
              mg_regs, mg_smem, mg_lmem, mg_occ,
-             md_regs, md_smem, md_lmem, md_occ);
+             md_regs, md_smem, md_lmem, md_occ,
+             qs_regs, qs_smem, qs_lmem, qs_occ, qp_regs, qp_occ,
+             qf_regs, qf_occ, q3_regs, q3_occ);
     return buf;
 }
 
