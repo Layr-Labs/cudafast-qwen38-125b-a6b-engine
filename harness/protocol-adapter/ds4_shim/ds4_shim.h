@@ -93,6 +93,12 @@ int ds4s_top_logits(const ds4s_handle *h, int k, int32_t *ids, float *logits);
  * The port routes this to ds4_qwen4exp_mtp_cycle, which commits the target's
  * own GREEDY argmax and so emits the serial leg's token stream exactly; at
  * depth 1 it commits 1 or 2 tokens per round. */
+/* This build's note auto09171424_2 records that the scored decode window is
+ * one hundred and twenty-eight committed tokens, about sixty-seven
+ * speculative rounds, preceded by an untimed correctness phase of
+ * sixty-four checked steps. Work removed from the untimed phase does not
+ * show up in the score.
+ */
 int ds4s_eval_speculative(ds4s_handle *h, int32_t first_token, int budget, int32_t *out,
                           int cap);
 
