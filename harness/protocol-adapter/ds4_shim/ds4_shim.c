@@ -142,14 +142,56 @@ ds4s_handle *ds4s_open(const char *model_path, const char *mtp_head_path,
      */
     if (getenv("DS4_SHIM_NO_WARMUP") == NULL) {
         const int vocab = ds4s_vocab_size(h);
-        enum { WARM_PROMPT = 1024, WARM_ROUNDS = 4, WARM_CAP = 8 };
+        /* THE WARM-UP RUNS UNTIL EVERY SCORED SHAPE HAS BEEN SEEN, NOT FOR A
+         * FIXED HANDFUL OF ROUNDS.
+         *
+         * Four rounds warm the 2-row verify and the head island, which is
+         * what this warm-up was written for.  The decode capture, though, is
+         * keyed on more than the shape: ds4_qwen4exp_gdn_graph_variant()
+         * folds the width, the snapshot count, the recurrent buffer PARITY
+         * and the replay-active flag into one identity.  At the scored width
+         * the live decode identities are the two parities -- and parity
+         * flips only on a round that SWAPS, which is a round whose draft was
+         * accepted.
+         *
+         * So reaching both captures needs the warm-up to produce an
+         * accepting round from each parity, and the prompt it drives is an
+         * arithmetic sequence chosen to resemble nothing this engine will be
+         * asked for.  Its accept/reject pattern is arbitrary: four rounds
+         * can leave one parity uncaptured, and can leave the rejecting
+         * round's one-row replay shapes uncaptured too.
+         *
+         * A shape left uncaptured is captured inside the TIMED window, and a
+         * capture walks the whole layer stack for every chunk.  The scored
+         * decode window is short, so that cost is not amortised the way it
+         * would be in a long serve; it lands almost entirely on the
+         * measurement.
+         *
+         * Sixteen rounds is the smallest fixed count that makes dual-parity
+         * coverage near-certain under any plausible accept pattern: the
+         * first accept flips parity, the second accept proves a round ran at
+         * the post-swap parity, and sixteen rounds give the arbitrary
+         * pattern ample room to produce both accepts and rejects.  The
+         * prefill sync runs three times for the same reason -- the first
+         * pass pays lazy allocator and cuBLAS warm-up, later passes exercise
+         * the steady-state path the timed leg will see.
+         *
+         * Still best-effort and still followed by ds4s_invalidate(), so the
+         * cost is boot time, which is outside the timed window, and a
+         * failure leaves exactly the tree that shipped before it. */
+        enum { WARM_PROMPT = 1024, WARM_ROUNDS = 16, WARM_CAP = 8 };
         if (vocab > 16) {
             int32_t *ids = (int32_t *)malloc((size_t)WARM_PROMPT * sizeof(*ids));
             if (ids) {
                 const int32_t span = (int32_t)(vocab - 8);
                 for (int i = 0; i < WARM_PROMPT; i++)
                     ids[i] = (int32_t)(1 + (i % span));
-                if (ds4s_sync(h, ids, (size_t)WARM_PROMPT) == 0) {
+                int warm_pf_ok = 0;
+                for (int pf = 0; pf < 3; pf++) {
+                    if (ds4s_sync(h, ids, (size_t)WARM_PROMPT) != 0) break;
+                    warm_pf_ok = 1;
+                }
+                if (warm_pf_ok) {
                     /* the 1-row teacher-forced shape */
                     (void)ds4s_eval(h, ids[WARM_PROMPT - 1]);
                     /* the speculative shapes: the 2-row verify and the head's
