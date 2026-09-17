@@ -15911,6 +15911,59 @@ __global__ static void qwen4exp_ple_conv_kernel(
     }
 }
 
+/* The IQ4_NL code book, ggml's kvalues_iq4nl.  The host dequantizer
+ * ds4_ple_dequant_iq4_nl carries the same sixteen entries, so a block
+ * expanded here is bit-identical to the row the host path stages. */
+static __device__ const int8_t qwen4exp_ple_kvalues_iq4nl[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+};
+
+/* One thread per 18-byte IQ4_NL block: one f16 scale, then the sixteen
+ * packed bytes whose low nibbles fill the first half of the block and whose
+ * high nibbles fill the second -- the same order
+ * dequantize_row_iq4_nl writes. */
+static __global__ void qwen4exp_ple_dequant_iq4nl_kernel(
+        float * __restrict__ out,
+        const uint8_t * __restrict__ src,
+        uint32_t n_blocks) {
+    const uint32_t b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= n_blocks) return;
+    const uint8_t *p = src + (size_t)b * 18u;
+    const float d = __half2float(__ushort_as_half(
+            (unsigned short)(p[0] | ((unsigned short)p[1] << 8))));
+    float *y = out + (size_t)b * 32u;
+    const uint8_t *qs = p + 2;
+    for (int j = 0; j < 16; j++) {
+        const uint8_t q = qs[j];
+        y[j]      = d * (float)qwen4exp_ple_kvalues_iq4nl[q & 0x0F];
+        y[j + 16] = d * (float)qwen4exp_ple_kvalues_iq4nl[q >> 4];
+    }
+}
+
+extern "C" int ds4_gpu_qwen4exp_ple_dequant_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *ngram_rows,
+        uint32_t              ple_embd,
+        uint32_t              rows) {
+    if (!out || !ngram_rows || ple_embd == 0 || rows == 0 ||
+        ple_embd % 32u != 0) {
+        return 0;
+    }
+    const uint64_t blocks_per_row = ple_embd / 32u;
+    const uint64_t n_blocks = (uint64_t)rows * blocks_per_row;
+    if (ngram_rows->bytes < n_blocks * 18u ||
+        out->bytes < (uint64_t)rows * ple_embd * sizeof(float)) {
+        return 0;
+    }
+    const unsigned threads = 256u;
+    qwen4exp_ple_dequant_iq4nl_kernel<<<
+            (unsigned)((n_blocks + threads - 1u) / threads), threads, 0,
+            cuda_decode_stream()>>>(
+            (float *)out->ptr, (const uint8_t *)ngram_rows->ptr,
+            (uint32_t)n_blocks);
+    return cuda_ok(cudaGetLastError(), "qwen4exp_ple_dequant launch");
+}
+
 extern "C" int ds4_gpu_qwen4exp_ple_gate_tensor(
         ds4_gpu_tensor       *out_hc,
         const ds4_gpu_tensor *key_hc,

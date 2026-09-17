@@ -4312,6 +4312,18 @@ int ds4_gpu_qwen4exp_ple_conv_tensor(
         uint32_t              dilation,
         uint32_t              rows);
 
+/* Dequantize the gathered n-gram rows on the device: `ngram_rows` holds
+ * `rows` packed IQ4_NL rows of `ple_embd` values each (ple_embd/32 blocks of
+ * 18 bytes), `out` receives the same rows as fp32, bit-identical to the host
+ * dequantizer ds4_ple_dequant_iq4_nl.  Uploading the 90-byte rows and
+ * expanding them here replaces a 640-byte-per-row host dequant plus a
+ * pageable fp32 upload. */
+int ds4_gpu_qwen4exp_ple_dequant_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *ngram_rows,
+        uint32_t              ple_embd,
+        uint32_t              rows);
+
 /* The whole PLE block over already-gathered n-gram rows, composed out of the
  * two kernels above, the grouped RMS norm and the Q8_0 matmul.  This is the
  * `ple_block` op boundary of the MLX reference dump.

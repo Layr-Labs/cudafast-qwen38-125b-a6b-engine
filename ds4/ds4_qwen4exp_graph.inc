@@ -279,6 +279,32 @@ static bool qwen4exp_ple_read_constants(const ds4_model            *m,
     return true;
 }
 
+/* On the CUDA build the gather stages the raw IQ4_NL row bytes and the
+ * device expands them (ds4_gpu_qwen4exp_ple_dequant_tensor): the upload
+ * shrinks from 640 fp32 bytes per head-row to the 90 bytes the table
+ * stores, and the host's dequant pass disappears.  Every other backend
+ * keeps the fp32 staging it has always used. */
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+#define QW_PLE_DEVICE_DEQUANT 1
+#endif
+
+#ifdef QW_PLE_DEVICE_DEQUANT
+#define QW_PLE_STAGE_T uint8_t
+#define QW_PLE_STAGE(s_) ((s_)->ple_quant_host)
+#define QW_PLE_ROW_STRIDE \
+    ((DS4_N_PLE_ROW_DIM / DS4_PLE_IQ4_NL_BLOCK_ELEMS) * \
+     DS4_PLE_IQ4_NL_BLOCK_BYTES)
+#define QW_PLE_STORE_ROW(dst_, quant_, bpr_) \
+    memcpy((dst_), (quant_), \
+           (size_t)(bpr_) * DS4_PLE_IQ4_NL_BLOCK_BYTES)
+#else
+#define QW_PLE_STAGE_T float
+#define QW_PLE_STAGE(s_) ((s_)->ple_rows_host)
+#define QW_PLE_ROW_STRIDE DS4_N_PLE_ROW_DIM
+#define QW_PLE_STORE_ROW(dst_, quant_, bpr_) \
+    ds4_ple_dequant_iq4_nl((quant_), (bpr_), (dst_))
+#endif
+
 struct ds4_qwen4exp_session {
     ds4_qwen4exp_session_plan plan;
     uint32_t pos;
@@ -324,12 +350,15 @@ struct ds4_qwen4exp_session {
      * The history and the window ride the session, so a reset restores them
      * with the caches. */
     ds4_ple_history   ple_history;
+
     ds4_ple_constants ple_constants;
     bool              ple_ready;      /* the hash constants were readable */
     uint64_t         *ple_ids;        /* host [n_batch][head_count]       */
     float            *ple_rows_host;  /* host [n_batch][ple_embd]         */
+    uint8_t          *ple_quant_host; /* host [n_batch][ple_embd/32*18]   */
     ds4_gpu_tensor   *ple_conv_state; /* [state_rows][n_hc * n_embd]      */
     ds4_gpu_tensor   *ple_rows;       /* [n_batch][ple_embd]              */
+    ds4_gpu_tensor   *ple_rows_quant; /* [n_batch][ple_embd/32*18] bytes  */
     ds4_gpu_tensor   *ple_key;        /* key projection, then the gate    */
     ds4_gpu_tensor   *ple_aux;        /* query, then the convolution input */
     ds4_gpu_tensor   *ple_value;      /* value projection, [n_batch][embd] */
@@ -769,8 +798,18 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
         s->ple_value = qwen4exp_alloc_zeroed(B * E * f, &ok);
         if (ok) {
             s->ple_ids = calloc((size_t)B * DS4_N_PLE_HEAD, sizeof(uint64_t));
+#ifdef QW_PLE_DEVICE_DEQUANT
+            /* The device expands the rows; the host stages the packed
+             * IQ4_NL bytes only. */
+            s->ple_quant_host = calloc((size_t)B * DS4_N_PLE_HEAD,
+                                       QW_PLE_ROW_STRIDE);
+            s->ple_rows_quant = qwen4exp_alloc_zeroed(
+                (uint64_t)B * DS4_N_PLE_HEAD * QW_PLE_ROW_STRIDE, &ok);
+            ok = ok && s->ple_ids != NULL && s->ple_quant_host != NULL;
+#else
             s->ple_rows_host = calloc((size_t)B * DS4_N_PLE_EMBD, sizeof(float));
             ok = s->ple_ids != NULL && s->ple_rows_host != NULL;
+#endif
         }
         if (ok) {
             s->ple_ready = qwen4exp_ple_read_constants(m, w, &s->ple_constants);
@@ -894,6 +933,8 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->ple_value);
     free(s->ple_ids);
     free(s->ple_rows_host);
+    free(s->ple_quant_host);
+    ds4_gpu_tensor_free(s->ple_rows_quant);
     ds4_gpu_tensor_free(s->d_pos);
     ds4_gpu_tensor_free(s->d_adopt);
     ds4_gpu_tensor_free(s->d_gdn_replay);
@@ -1145,10 +1186,10 @@ static void *qw_ple_gather_worker(void *arg) {
                 seg->s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h];
             const uint8_t *quant = ds4_qwen4exp_ple_row(seg->ple, row);
             if (!quant) { seg->ok = 0; return NULL; }
-            ds4_ple_dequant_iq4_nl(
-                quant, seg->blocks_per_row,
-                seg->s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD +
-                    (uint64_t)h * DS4_N_PLE_ROW_DIM);
+            QW_PLE_STORE_ROW(
+                QW_PLE_STAGE(seg->s) + (uint64_t)t * DS4_N_PLE_EMBD +
+                    (uint64_t)h * QW_PLE_ROW_STRIDE,
+                quant, seg->blocks_per_row);
         }
     }
     return NULL;
@@ -1310,7 +1351,7 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
              * offset is carried as a pointer step instead of a multiply per
              * head.  Same addresses, same values. */
             const uint64_t *ids = s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD;
-            float *dst = s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD;
+            QW_PLE_STAGE_T *dst = QW_PLE_STAGE(s) + (uint64_t)t * DS4_N_PLE_EMBD;
             for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
                 const uint64_t row = ids[h];
                 /* Every head of this token except the last is followed by
@@ -1327,8 +1368,8 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                             il, t, h, row, w->ple.rows);
                     return false;
                 }
-                ds4_ple_dequant_iq4_nl(quant, blocks_per_row, dst);
-                dst += DS4_N_PLE_ROW_DIM;
+                QW_PLE_STORE_ROW(dst, quant, blocks_per_row);
+                dst += QW_PLE_ROW_STRIDE;
             }
         }
     } else {
@@ -1380,10 +1421,10 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                                 il, t, h, row, w->ple.rows);
                         return false;
                     }
-                    ds4_ple_dequant_iq4_nl(
-                        quant, blocks_per_row,
-                        s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD +
-                            (uint64_t)h * DS4_N_PLE_ROW_DIM);
+                    QW_PLE_STORE_ROW(
+                        QW_PLE_STAGE(s) + (uint64_t)t * DS4_N_PLE_EMBD +
+                            (uint64_t)h * QW_PLE_ROW_STRIDE,
+                        quant, blocks_per_row);
                 }
             }
         } else {
@@ -1464,8 +1505,16 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 "ds4: qwen4exp PLE gather %u rows took %.3f ms\n",
                 n_tokens, (now_sec() - gather_t0) * 1000.0);
     }
+#ifdef QW_PLE_DEVICE_DEQUANT
+    /* The packed rows: n_tokens * 16 * 90 bytes instead of
+     * n_tokens * 2560 * 4. */
+    if (!ds4_gpu_tensor_write(s->ple_rows_quant, 0, s->ple_quant_host,
+                              (uint64_t)n_tokens * DS4_N_PLE_HEAD *
+                              QW_PLE_ROW_STRIDE)) {
+#else
     if (!ds4_gpu_tensor_write(s->ple_rows, 0, s->ple_rows_host,
                               (uint64_t)n_tokens * DS4_N_PLE_EMBD * sizeof(float))) {
+#endif
         fprintf(stderr, "ds4: qwen4exp n-gram row upload failed at block %u\n", il);
         return false;
     }
@@ -1491,6 +1540,17 @@ static bool qwen4exp_graph_ple_block(ds4_qwen4exp_session *s,
     const ds4_gpu_qwen4exp_slab norm_query_slab = QW_SLAB(m, l->ple_norm_query);
     const ds4_gpu_qwen4exp_slab norm_conv_slab = QW_SLAB(m, l->ple_norm_conv);
     const ds4_gpu_qwen4exp_slab conv_slab = QW_SLAB(m, l->ple_conv1d);
+#ifdef QW_PLE_DEVICE_DEQUANT
+    /* Expand the packed rows the gather uploaded.  Inside a capture this
+     * becomes one more node of the island's graph, so a replay runs it for
+     * free; outside one it is an ordinary launch on the decode stream. */
+    if (!ds4_gpu_qwen4exp_ple_dequant_tensor(
+            s->ple_rows, s->ple_rows_quant, DS4_N_PLE_EMBD, n_tokens)) {
+        fprintf(stderr, "ds4: qwen4exp PLE row dequant refused at block %u\n", il);
+        return false;
+    }
+#endif
+
 
     if (!ds4_gpu_qwen4exp_ple_block_tensor(
             s->hyper, s->ple_conv_state, s->ple_conv_snapshot,
