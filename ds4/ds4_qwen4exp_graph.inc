@@ -1579,21 +1579,6 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
     }
 #endif
 
-    /* PREFILL (CUDA): alpha and beta in one launch when the eight-warp F32
-     * tile would serve both, reading the mixed input once while it is still
-     * warm from the quantize above.  A decline launches nothing and the two
-     * calls below run. */
-    int gdn_ab_paired = 0;
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    if (n_tokens >= 8u) {
-        gdn_ab_paired = ds4_gpu_matmul_f32_pair_decode_rows_exact_tensor(
-            s->gdn_alpha, s->gdn_beta,
-            QW_MAP(m, l->ssm_alpha), QW_MAPSZ(m, l->ssm_alpha), QW_OFF(l->ssm_alpha),
-            QW_MAP(m, l->ssm_beta), QW_MAPSZ(m, l->ssm_beta), QW_OFF(l->ssm_beta),
-            DS4_N_EMBD, DS4_N_GDN_VALUE_HEAD, s->mixed, n_tokens);
-    }
-#endif
-
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (n_tokens<=2u && getenv("DS4_QWEN4EXP_NO_GDN_PROJECTION_FUSION")==NULL) {
         ds4_gpu_tensor *outs[4]={s->gdn_qkv,s->gdn_gate,s->gdn_alpha,s->gdn_beta};
@@ -1621,16 +1606,14 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
                                         QW_MAPSZ(m, l->attn_gate), QW_OFF(l->attn_gate),
                                         DS4_N_EMBD, cfg->gdn_inner,
                                         s->mixed_q8, 0, q8_soff, n_tokens) ||
-            (!gdn_ab_paired &&
-             !ds4_qwen4exp_matmul_f32(s->gdn_alpha, QW_MAP(m, l->ssm_alpha),
+            !ds4_qwen4exp_matmul_f32(s->gdn_alpha, QW_MAP(m, l->ssm_alpha),
                                        QW_MAPSZ(m, l->ssm_alpha), QW_OFF(l->ssm_alpha),
                                        DS4_N_EMBD, DS4_N_GDN_VALUE_HEAD,
-                                       s->mixed, n_tokens)) ||
-            (!gdn_ab_paired &&
-             !ds4_qwen4exp_matmul_f32(s->gdn_beta, QW_MAP(m, l->ssm_beta),
+                                       s->mixed, n_tokens) ||
+            !ds4_qwen4exp_matmul_f32(s->gdn_beta, QW_MAP(m, l->ssm_beta),
                                        QW_MAPSZ(m, l->ssm_beta), QW_OFF(l->ssm_beta),
                                        DS4_N_EMBD, DS4_N_GDN_VALUE_HEAD,
-                                       s->mixed, n_tokens))) {
+                                       s->mixed, n_tokens)) {
             fprintf(stderr, "ds4: qwen4exp GDN projections failed at block %u\n", il);
             return false;
         }
@@ -2098,15 +2081,7 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
         return false;
     }
     QW_MOE_TICK(QW_MOE_T_ROUTER);
-    /* At the decode and verify widths the selection rides the expert-grouping
-     * launch instead of costing one of its own: the grouping kernel is one
-     * block and the top-k is one warp per token, so the whole producer fits
-     * inside the consumer.  The predicate is the single decision point -- the
-     * backend asserts the same one -- so the selection runs exactly once. */
-    const int moe_fuse_router = ds4_gpu_qwen4exp_moe_router_fused_ok(
-            DS4_N_EXPERT, DS4_N_EXPERT_USED, n_tokens);
-    if (!moe_fuse_router &&
-        !ds4_gpu_qwen4exp_router_select_tensor(s->moe_selected, s->moe_weights,
+    if (!ds4_gpu_qwen4exp_router_select_tensor(s->moe_selected, s->moe_weights,
                                                s->moe_logits, DS4_N_EXPERT,
                                                DS4_N_EXPERT_USED, n_tokens)) {
         fprintf(stderr, "ds4: qwen4exp router select failed at block %u\n", il);
@@ -2126,14 +2101,12 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
     const ds4_gpu_qwen4exp_slab gate_slab = QW_SLAB(m, l->ffn_gate_exps);
     const ds4_gpu_qwen4exp_slab up_slab = QW_SLAB(m, l->ffn_up_exps);
     const ds4_gpu_qwen4exp_slab down_slab = QW_SLAB(m, l->ffn_down_exps);
-    if (!ds4_gpu_qwen4exp_routed_moe_router_tensor(
+    if (!ds4_gpu_qwen4exp_routed_moe_tensor(
             s->block_out, s->moe_mid, s->moe_down_partial,
             &gate_slab, &up_slab, &down_slab,
             DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD,
             s->moe_selected, s->moe_weights, DS4_N_EXPERT, DS4_N_EXPERT_USED,
-            s->mixed, n_tokens, DS4_N_EXPERT_USED * DS4_N_FF_EXP,
-            moe_fuse_router ? s->moe_logits : NULL,
-            moe_fuse_router ? s->moe_weights : NULL)) {
+            s->mixed, n_tokens, DS4_N_EXPERT_USED * DS4_N_FF_EXP)) {
         fprintf(stderr, "ds4: qwen4exp routed experts failed at block %u\n", il);
         return false;
     }
