@@ -17419,6 +17419,268 @@ extern "C" void ds4_gpu_set_q8_mma_pipe_wide(int mode) {
     g_q8_mma_pipe_wide = mode;
 }
 
+/* --------------------------------------------------------------------------
+ * A bounded microbenchmark of the device itself, run once at boot and
+ * published through the same string.
+ *
+ * WHY THE WINDOW IS LEGITIMATE.  ds4s_hw_limits() is called from
+ * harness/protocol-adapter/ds4_shim/ds4_resident.c:596 -- AFTER the comment
+ * there marked "THE ONE LOAD" and BEFORE bind().  So at this point the weights
+ * are already resident, the context is up, benchd has not connected, and no
+ * phase clock exists.  The resident's own comment says as much: "done once HERE
+ * -- after the one load, before the socket binds -- so no timed phase can see
+ * it."  This adds a measurement to that same window; it does not move any work
+ * into or out of a timed phase.
+ *
+ * WHY MEASURE RATHER THAN READ AN ATTRIBUTE.  The comment below explains that
+ * peak DRAM bandwidth is deliberately absent because
+ * cudaDevAttrGlobalMemoryBusWidth and cudaDevAttrMemoryClockRate appear nowhere
+ * else in this tree and so are not known to compile against the pinned toolkit.
+ * That reasoning is right and is kept.  This supplies the number that was
+ * wanted -- ACHIEVED, not a spec-sheet product -- using only CUDA entry points
+ * this file already calls: cudaMalloc, cudaMemset, cudaStreamCreateWithFlags,
+ * cudaEventCreate/Record/ElapsedTime, cudaStreamBeginCapture/EndCapture,
+ * cudaGraphInstantiate/Launch, and the matching destroys.
+ *
+ * WHAT IT IS FOR.  Three constants that occupancy, byte-count and
+ * launch-dispatch arguments in this line of work all rest on are currently
+ * DERIVED rather than measured on the ranked box:
+ *
+ *   1. achieved streaming read bandwidth -- the denominator of every roofline
+ *      claim, including the conclusion that routed decode is instruction-bound
+ *      rather than bandwidth-bound.  If achieved read sits close to the
+ *      LPDDR5X ceiling, that conclusion is wrong and the whole byte-reduction
+ *      class reopens.
+ *   2. eager launch cost -- the numerator of "launch dispatch is at most a
+ *      couple of percent".
+ *   3. graph-replay cost per node -- the mechanism behind this tree's own
+ *      largest structural decision, capturing the whole 48-layer stack in four
+ *      chunks instead of launching it.
+ *
+ * (2) and (3) measured with the SAME empty kernel give the eager-vs-graph
+ * crossover on this box, which no note on this benchmark has ever published a
+ * measured value for.
+ *
+ * WHY IT CANNOT MOVE THE SCORE IT IS PUBLISHED ALONGSIDE.
+ *   - It touches no engine state: its own stream, its own events, its own
+ *     allocation, all destroyed before it returns.  The default and legacy
+ *     streams are never named, no cuBLAS handle is bound or rebound, no kernel
+ *     attribute is set, and nothing any decode or prefill path reads is
+ *     written.
+ *   - Total device work is bounded by construction: ~2k empty launches,
+ *     768 MiB of reads and 4k replayed empty nodes, together on the order of
+ *     10 ms, against a checkpoint load measured in minutes.  Far too small and
+ *     far too early to move a clock or thermal state that a phase beginning
+ *     after a separate socket connect could see.
+ *   - Every step is failure-guarded.  Any CUDA error abandons the probe, clears
+ *     the sticky error with cudaGetLastError(), and yields an EMPTY string, so
+ *     the published identity degrades to exactly what it is today.
+ *   - It is appended LAST, so a truncation can only ever cost the measurement
+ *     and never the device attributes or the kernel limits.
+ *   - DS4_CUDA_BOOT_PROBE=0 disables it outright.
+ *
+ * This is a measurement, not an optimisation.  I expect the ranked score to be
+ * a null and say so in the note rather than after the fact.
+ * ------------------------------------------------------------------------ */
+
+__global__ void ds4_boot_probe_nop_kernel(void) { }
+
+/* A grid-stride 128-bit streaming read.  The accumulator is consumed by a
+ * comparison a memset-to-zero buffer can never satisfy, so ptxas cannot drop
+ * the loads and no bandwidth is spent writing a reduction back. */
+__global__ void ds4_boot_probe_read_kernel(const uint4 *__restrict__ src,
+                                           unsigned long long *sink,
+                                           unsigned long long n4) {
+    unsigned long long i =
+        (unsigned long long)blockIdx.x * (unsigned long long)blockDim.x +
+        (unsigned long long)threadIdx.x;
+    const unsigned long long stride =
+        (unsigned long long)gridDim.x * (unsigned long long)blockDim.x;
+    unsigned long long acc = 0ull;
+    for (; i < n4; i += stride) {
+        const uint4 v = src[i];
+        acc += (unsigned long long)v.x + (unsigned long long)v.y +
+               (unsigned long long)v.z + (unsigned long long)v.w;
+    }
+    if (acc == 0xFFFFFFFFFFFFFFFFull) sink[0] = acc;
+}
+
+static const char *ds4_gpu_boot_probe(void) {
+    static char buf[160];
+    static int built = 0;
+    if (built) return buf;
+    built = 1;
+    buf[0] = '\0';
+
+    const char *off = getenv("DS4_CUDA_BOOT_PROBE");
+    if (off != NULL && atoi(off) == 0) return buf;
+
+    /* 128 MiB of uint4: larger than any plausible L2 on this part, so the
+     * passes measure DRAM and not cache, and trivial against a box holding a
+     * 114 GB checkpoint in unified memory. */
+    const unsigned long long n4 = (128ull << 20) / 16ull;
+    const size_t bytes = (size_t)n4 * 16u;
+    const int nop_iters = 2000;
+    const int read_iters = 6;
+    const int graph_nodes = 128;
+    const int graph_reps = 32;
+    const int blocks = 768;          /* 16 per SM at the 48 SMs this box has */
+    const int threads = 256;
+
+    cudaStream_t st = NULL;
+    cudaEvent_t ev0 = NULL, ev1 = NULL;
+    uint4 *src = NULL;
+    unsigned long long *sink = NULL;
+    float nop_ms = -1.0f, read_ms = -1.0f, rep_ms = -1.0f;
+    int ok = 1;
+
+    if (cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking) != cudaSuccess) {
+        st = NULL;
+        ok = 0;
+    }
+    if (ok && cudaEventCreate(&ev0) != cudaSuccess) { ev0 = NULL; ok = 0; }
+    if (ok && cudaEventCreate(&ev1) != cudaSuccess) { ev1 = NULL; ok = 0; }
+    if (ok && cudaMalloc((void **)&src, bytes) != cudaSuccess) { src = NULL; ok = 0; }
+    if (ok && cudaMalloc((void **)&sink, sizeof(*sink)) != cudaSuccess) { sink = NULL; ok = 0; }
+    if (ok && cudaMemset(src, 0, bytes) != cudaSuccess) ok = 0;
+    if (ok && cudaMemset(sink, 0, sizeof(*sink)) != cudaSuccess) ok = 0;
+    if (ok && cudaStreamSynchronize(st) != cudaSuccess) ok = 0;
+
+    /* 1. Eager launch cost: back to back on one stream, with nothing to run. */
+    if (ok) {
+        ds4_boot_probe_nop_kernel<<<1, 32, 0, st>>>();
+        if (cudaStreamSynchronize(st) == cudaSuccess &&
+            cudaEventRecord(ev0, st) == cudaSuccess) {
+            for (int i = 0; i < nop_iters; i++) {
+                ds4_boot_probe_nop_kernel<<<1, 32, 0, st>>>();
+            }
+            if (cudaEventRecord(ev1, st) == cudaSuccess &&
+                cudaStreamSynchronize(st) == cudaSuccess) {
+                if (cudaEventElapsedTime(&nop_ms, ev0, ev1) != cudaSuccess) {
+                    nop_ms = -1.0f;
+                }
+            }
+        }
+        (void)cudaGetLastError();
+    }
+
+    /* 2. Achieved streaming read bandwidth, after one untimed warm pass. */
+    if (ok) {
+        ds4_boot_probe_read_kernel<<<blocks, threads, 0, st>>>(src, sink, n4);
+        if (cudaStreamSynchronize(st) == cudaSuccess &&
+            cudaEventRecord(ev0, st) == cudaSuccess) {
+            for (int i = 0; i < read_iters; i++) {
+                ds4_boot_probe_read_kernel<<<blocks, threads, 0, st>>>(src, sink, n4);
+            }
+            if (cudaEventRecord(ev1, st) == cudaSuccess &&
+                cudaStreamSynchronize(st) == cudaSuccess) {
+                if (cudaEventElapsedTime(&read_ms, ev0, ev1) != cudaSuccess) {
+                    read_ms = -1.0f;
+                }
+            }
+        }
+        (void)cudaGetLastError();
+    }
+
+    /* 3. Graph replay cost per node.  The same empty kernel as (1), so the
+     * difference between the two is dispatch and nothing else.  Sequenced last
+     * because a failed capture leaves a stream unusable, and this stream is
+     * destroyed immediately afterwards either way. */
+    if (ok && nop_ms >= 0.0f) {
+        cudaGraph_t g = NULL;
+        cudaGraphExec_t gx = NULL;
+        if (cudaStreamBeginCapture(st, cudaStreamCaptureModeGlobal) ==
+            cudaSuccess) {
+            for (int i = 0; i < graph_nodes; i++) {
+                ds4_boot_probe_nop_kernel<<<1, 32, 0, st>>>();
+            }
+            if (cudaStreamEndCapture(st, &g) == cudaSuccess && g != NULL &&
+                cudaGraphInstantiate(&gx, g, NULL, NULL, 0) == cudaSuccess &&
+                gx != NULL) {
+                if (cudaGraphLaunch(gx, st) == cudaSuccess &&
+                    cudaStreamSynchronize(st) == cudaSuccess &&
+                    cudaEventRecord(ev0, st) == cudaSuccess) {
+                    for (int i = 0; i < graph_reps; i++) {
+                        (void)cudaGraphLaunch(gx, st);
+                    }
+                    if (cudaEventRecord(ev1, st) == cudaSuccess &&
+                        cudaStreamSynchronize(st) == cudaSuccess) {
+                        if (cudaEventElapsedTime(&rep_ms, ev0, ev1) !=
+                            cudaSuccess) {
+                            rep_ms = -1.0f;
+                        }
+                    }
+                }
+            }
+        }
+        if (gx) (void)cudaGraphExecDestroy(gx);
+        if (g) (void)cudaGraphDestroy(g);
+        (void)cudaGetLastError();
+    }
+
+    if (src) (void)cudaFree(src);
+    if (sink) (void)cudaFree(sink);
+    if (ev0) (void)cudaEventDestroy(ev0);
+    if (ev1) (void)cudaEventDestroy(ev1);
+    if (st) (void)cudaStreamDestroy(st);
+    (void)cudaGetLastError();
+
+    const double nop_us = (nop_ms >= 0.0f)
+        ? (double)nop_ms * 1000.0 / (double)nop_iters
+        : -1.0;
+    const double rep_us = (rep_ms >= 0.0f)
+        ? (double)rep_ms * 1000.0 /
+              ((double)graph_nodes * (double)graph_reps)
+        : -1.0;
+    const double rd_gbs = (read_ms > 0.0f)
+        ? ((double)bytes * (double)read_iters) /
+              ((double)read_ms * 1.0e-3) / 1.0e9
+        : -1.0;
+
+    /* Publish ONLY the legs that actually produced a number.  A leg that failed
+     * is absent rather than printed as a sentinel, so nothing downstream can
+     * read a -1 as a measurement, and a partial result (say the graph capture
+     * declined but the read pass ran) still reaches the metrics.  If no leg
+     * survived, the field disappears entirely. */
+    int n = snprintf(buf, sizeof(buf), "probe[");
+    if (n < 0 || (size_t)n >= sizeof(buf)) {
+        buf[0] = '\0';
+        return buf;
+    }
+    int fields = 0;
+    if (nop_us >= 0.0) {
+        const int m = snprintf(buf + n, sizeof(buf) - (size_t)n, "%seager=%.3fus",
+                               fields ? " " : "", nop_us);
+        if (m > 0 && (size_t)m < sizeof(buf) - (size_t)n) {
+            n += m;
+            fields++;
+        }
+    }
+    if (rep_us >= 0.0) {
+        const int m = snprintf(buf + n, sizeof(buf) - (size_t)n, "%sgnode=%.3fus",
+                               fields ? " " : "", rep_us);
+        if (m > 0 && (size_t)m < sizeof(buf) - (size_t)n) {
+            n += m;
+            fields++;
+        }
+    }
+    if (rd_gbs >= 0.0) {
+        const int m = snprintf(buf + n, sizeof(buf) - (size_t)n, "%srd=%.1fGB/s",
+                               fields ? " " : "", rd_gbs);
+        if (m > 0 && (size_t)m < sizeof(buf) - (size_t)n) {
+            n += m;
+            fields++;
+        }
+    }
+    if (fields == 0 || (size_t)n + 2u > sizeof(buf)) {
+        buf[0] = '\0';
+        return buf;
+    }
+    buf[n] = ']';
+    buf[n + 1] = '\0';
+    return buf;
+}
+
 /* The device's occupancy limits, as a compact string the caller can append to
  * an identity that reaches the run's metrics.  See ds4.h for why this is worth
  * publishing.
@@ -17445,8 +17707,11 @@ extern "C" const char *ds4_gpu_hw_limits(void) {
      * which now carries the two prefill tiles as well.  Oversized on purpose:
      * ds4_resident drops the WHOLE limits string rather than truncating it if it
      * does not fit its own ident buffer, so a tight fit here loses the
-     * measurement silently. */
-    static char buf[448];
+     * measurement silently.  Widened from 448 for the measured probe field: the
+     * three strings together are about 280 bytes, and the resident's own
+     * ident_buf is 768, so 640 plus the ~44-byte engine ident still fits it
+     * with room. */
+    static char buf[640];
     static int built = 0;
     if (built) return buf;
     built = 1;
@@ -17481,7 +17746,15 @@ extern "C" const char *ds4_gpu_hw_limits(void) {
      * is diagnostic only and snprintf keeps it terminated. */
     const char *kl = ds4_gpu_qwen4exp_kernel_limits();
     if (kl && kl[0] && (size_t)n + 2u < sizeof(buf)) {
-        snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", kl);
+        const int m = snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", kl);
+        if (m > 0) n += m;
+        if (n < 0 || (size_t)n >= sizeof(buf)) n = (int)sizeof(buf) - 1;
+    }
+    /* The measured probe LAST, so a truncation can only ever cost the
+     * measurement and never the device attributes or the kernel limits. */
+    const char *pb = ds4_gpu_boot_probe();
+    if (pb && pb[0] && (size_t)n + 2u < sizeof(buf)) {
+        snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", pb);
     }
     return buf;
 }
