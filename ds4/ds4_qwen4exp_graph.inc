@@ -2081,7 +2081,15 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
         return false;
     }
     QW_MOE_TICK(QW_MOE_T_ROUTER);
-    if (!ds4_gpu_qwen4exp_router_select_tensor(s->moe_selected, s->moe_weights,
+    /* At the decode and verify widths the selection rides the expert-grouping
+     * launch instead of costing one of its own: the grouping kernel is one
+     * block and the top-k is one warp per token, so the whole producer fits
+     * inside the consumer.  The predicate is the single decision point -- the
+     * backend asserts the same one -- so the selection runs exactly once. */
+    const int moe_fuse_router = ds4_gpu_qwen4exp_moe_router_fused_ok(
+            DS4_N_EXPERT, DS4_N_EXPERT_USED, n_tokens);
+    if (!moe_fuse_router &&
+        !ds4_gpu_qwen4exp_router_select_tensor(s->moe_selected, s->moe_weights,
                                                s->moe_logits, DS4_N_EXPERT,
                                                DS4_N_EXPERT_USED, n_tokens)) {
         fprintf(stderr, "ds4: qwen4exp router select failed at block %u\n", il);
@@ -2101,12 +2109,14 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
     const ds4_gpu_qwen4exp_slab gate_slab = QW_SLAB(m, l->ffn_gate_exps);
     const ds4_gpu_qwen4exp_slab up_slab = QW_SLAB(m, l->ffn_up_exps);
     const ds4_gpu_qwen4exp_slab down_slab = QW_SLAB(m, l->ffn_down_exps);
-    if (!ds4_gpu_qwen4exp_routed_moe_tensor(
+    if (!ds4_gpu_qwen4exp_routed_moe_router_tensor(
             s->block_out, s->moe_mid, s->moe_down_partial,
             &gate_slab, &up_slab, &down_slab,
             DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD,
             s->moe_selected, s->moe_weights, DS4_N_EXPERT, DS4_N_EXPERT_USED,
-            s->mixed, n_tokens, DS4_N_EXPERT_USED * DS4_N_FF_EXP)) {
+            s->mixed, n_tokens, DS4_N_EXPERT_USED * DS4_N_FF_EXP,
+            moe_fuse_router ? s->moe_logits : NULL,
+            moe_fuse_router ? s->moe_weights : NULL)) {
         fprintf(stderr, "ds4: qwen4exp routed experts failed at block %u\n", il);
         return false;
     }
