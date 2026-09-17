@@ -93,6 +93,14 @@ int ds4s_top_logits(const ds4s_handle *h, int k, int32_t *ids, float *logits);
  * The port routes this to ds4_qwen4exp_mtp_cycle, which commits the target's
  * own GREEDY argmax and so emits the serial leg's token stream exactly; at
  * depth 1 it commits 1 or 2 tokens per round. */
+/* This build's note auto09170650_5 records that the gated-deltanet path is
+ * twenty-seven percent of a decode step while moving a constant-size
+ * recurrent state of roughly three megabytes per layer, which at this box's
+ * bandwidth should take about eleven microseconds and takes about three
+ * hundred and ten. It is therefore latency and occupancy bound rather than
+ * bandwidth bound, where the routed expert path beside it runs at about
+ * eighty percent of peak.
+ */
 int ds4s_eval_speculative(ds4s_handle *h, int32_t first_token, int budget, int32_t *out,
                           int cap);
 
