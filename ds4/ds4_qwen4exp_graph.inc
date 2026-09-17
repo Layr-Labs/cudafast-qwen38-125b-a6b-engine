@@ -1245,6 +1245,204 @@ static void qw_ple_pool_init(void) {
     pthread_mutex_unlock(&g_qw_ple_pool.mutex);
 }
 
+/* ----------------------------------------------------------------------
+ * The speculative pre-gather.
+ *
+ * The verify's token list is known one round early: the draft chain that
+ * runs right after a verify produces, in order, the token the next round
+ * feeds and every draft it will compare.  Each of those head forwards is
+ * device work the host only waits on, so the n-gram gather for the NEXT
+ * verify -- the hash, the mapped row reads and the dequant -- runs on this
+ * thread inside the chain's own latency instead of inside the verify, where
+ * the serial scan leaves the device idle.
+ *
+ * EXACTNESS.  The worker writes only the gather's own destinations
+ * (ple_ids, ple_rows_host) plus its private per-token history records.  The
+ * join commits them only when the tokens the verify actually feeds are a
+ * prefix of what was gathered AND the history the worker seeded from still
+ * equals the session's -- i.e. only when the result is byte-for-byte what
+ * the serial scan below would have produced.  A trimmed chain, an
+ * invalidated parent, a reset or a missed feed all fail that check and fall
+ * back to the serial scan, which overwrites every byte the worker touched.
+ * ---------------------------------------------------------------------- */
+typedef struct {
+    pthread_mutex_t                  mutex;
+    pthread_cond_t                   work_cond;
+    pthread_cond_t                   done_cond;
+    pthread_t                        thread;
+    ds4_qwen4exp_session            *s;
+    const ds4_qwen4exp_ple_table    *ple;
+    ds4_ple_history                  seed;
+    int32_t                          tok[DS4_QWEN4EXP_MTP_MAX_COMMIT + 2];
+    ds4_ple_history                  hist_after[DS4_QWEN4EXP_MTP_MAX_COMMIT + 2];
+    uint32_t                         fed;
+    uint32_t                         done;
+    int                              ok;
+    bool                             filling;
+    bool                             shutdown;
+    bool                             initialized;
+} qw_ple_pregather_t;
+
+static qw_ple_pregather_t g_qw_ple_pregather = {
+    PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER
+};
+
+static void qw_ple_pregather_shutdown(void) {
+    qw_ple_pregather_t *j = &g_qw_ple_pregather;
+    pthread_mutex_lock(&j->mutex);
+    if (!j->initialized) {
+        pthread_mutex_unlock(&j->mutex);
+        return;
+    }
+    j->shutdown = true;
+    pthread_cond_broadcast(&j->work_cond);
+    pthread_mutex_unlock(&j->mutex);
+    pthread_join(j->thread, NULL);
+    j->initialized = false;
+}
+
+static void *qw_ple_pregather_thread(void *arg) {
+    (void)arg;
+    qw_ple_pregather_t *j = &g_qw_ple_pregather;
+    pthread_mutex_lock(&j->mutex);
+    for (;;) {
+        while ((j->done >= j->fed || !j->filling) && !j->shutdown) {
+            pthread_cond_wait(&j->work_cond, &j->mutex);
+        }
+        if (j->shutdown) break;
+        const uint32_t t = j->done;
+        ds4_qwen4exp_session *s = j->s;
+        const ds4_qwen4exp_ple_table *ple = j->ple;
+        const int32_t token = j->tok[t];
+        /* The history is token-serial, so row t seeds from the record the
+         * previous row left -- the same chain the serial scan carries in the
+         * session. */
+        ds4_ple_history hist = (t == 0u) ? j->seed : j->hist_after[t - 1u];
+        pthread_mutex_unlock(&j->mutex);
+
+        int ok = 1;
+        ds4_ple_row_ids(&s->ple_constants, &hist, &token, 1u,
+                        s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD);
+        const uint64_t *ids = s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD;
+        float *dst = s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD;
+        for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
+            const uint8_t *quant = ds4_qwen4exp_ple_row(ple, ids[h]);
+            if (!quant) { ok = 0; break; }
+            ds4_ple_dequant_iq4_nl(
+                quant, DS4_N_PLE_ROW_DIM / DS4_PLE_IQ4_NL_BLOCK_ELEMS, dst);
+            dst += DS4_N_PLE_ROW_DIM;
+        }
+
+        pthread_mutex_lock(&j->mutex);
+        if (!ok) {
+            j->ok = 0;
+            j->done = j->fed;   /* drain: the join falls back either way */
+        } else {
+            j->hist_after[t] = hist;
+            j->done = t + 1u;
+        }
+        pthread_cond_broadcast(&j->done_cond);
+    }
+    pthread_mutex_unlock(&j->mutex);
+    return NULL;
+}
+
+/* Feed one token of the next verify's row list, in row order.  The first
+ * call of a round reseeds the job from the session's carried history, which
+ * at chain time is exactly the state the verify's serial scan would start
+ * from: the rollback has already run (rejecting round) or was not needed
+ * (accepting one).  Calls past the session batch are dropped; the join then
+ * sees a short job and falls back. */
+void ds4_qwen4exp_graph_ple_feed(ds4_qwen4exp_session *s,
+                                 const ds4_qwen4exp_weights *w,
+                                 int32_t token) {
+    if (!s || !w || !s->ple_ready || w->ple.type != DS4_TENSOR_IQ4_NL) return;
+    qw_ple_pregather_t *j = &g_qw_ple_pregather;
+    pthread_mutex_lock(&j->mutex);
+    if (!j->initialized) {
+        j->shutdown = false;
+        j->initialized =
+            pthread_create(&j->thread, NULL, qw_ple_pregather_thread,
+                           NULL) == 0;
+        if (j->initialized) atexit(qw_ple_pregather_shutdown);
+    }
+    if (!j->initialized) {
+        pthread_mutex_unlock(&j->mutex);
+        return;
+    }
+    if (!(j->filling && j->s == s)) {
+        /* A job that never reached its join -- an abandoned round or a
+         * reset -- is drained before the reseed so the worker is never
+         * mid-write into buffers a different job owns. */
+        while (j->done < j->fed) {
+            pthread_cond_wait(&j->done_cond, &j->mutex);
+        }
+        j->s = s;
+        j->ple = &w->ple;
+        j->seed = s->ple_history;
+        j->fed = 0;
+        j->done = 0;
+        j->ok = 1;
+        j->filling = true;
+    }
+    const uint32_t cap = s->plan.n_batch <
+        (uint32_t)(sizeof(j->tok) / sizeof(j->tok[0]))
+        ? s->plan.n_batch
+        : (uint32_t)(sizeof(j->tok) / sizeof(j->tok[0]));
+    if (j->fed < cap) {
+        j->tok[j->fed++] = token;
+        pthread_cond_signal(&j->work_cond);
+    }
+    pthread_mutex_unlock(&j->mutex);
+}
+
+/* Commit the pre-gathered rows when they are provably what the serial scan
+ * would produce for THIS call: same session, enough rows, every compared
+ * token equal, and the seed history untouched since the feed.  On any
+ * mismatch the job is discarded and the caller runs the serial scan, so the
+ * worst case is the gather costing what it always cost.  Either way the job
+ * is drained and reset before return, so the worker never writes into a
+ * buffer the serial scan is filling. */
+static bool qw_ple_pregather_join(ds4_qwen4exp_session *s,
+                                  const int32_t *tokens, uint32_t n_tokens) {
+    qw_ple_pregather_t *j = &g_qw_ple_pregather;
+    bool committed = false;
+    pthread_mutex_lock(&j->mutex);
+    if (j->initialized && j->filling && j->s == s && j->fed >= n_tokens) {
+        while (j->done < n_tokens && j->ok) {
+            pthread_cond_wait(&j->done_cond, &j->mutex);
+        }
+        if (j->ok && j->done >= n_tokens &&
+            memcmp(&j->seed, &s->ple_history, sizeof(ds4_ple_history)) == 0) {
+            committed = true;
+            for (uint32_t t = 0; t < n_tokens; t++) {
+                if (j->tok[t] != tokens[t]) { committed = false; break; }
+            }
+        }
+        if (committed) {
+            /* Same records the serial scan leaves: the per-row slots the
+             * rollback selects from, and the carried history after the last
+             * token. */
+            const uint32_t snap = s->spec_snapshot_rows < n_tokens
+                ? s->spec_snapshot_rows : n_tokens;
+            for (uint32_t t = 0; t < snap; t++) {
+                s->ple_history_rows[t] = j->hist_after[t];
+            }
+            s->ple_history = j->hist_after[n_tokens - 1u];
+        }
+    }
+    if (j->initialized) {
+        while (j->done < j->fed) {
+            pthread_cond_wait(&j->done_cond, &j->mutex);
+        }
+        j->filling = false;
+        j->fed = 0;
+        j->done = 0;
+    }
+    pthread_mutex_unlock(&j->mutex);
+    return committed;
+}
+
 static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                                       const ds4_qwen4exp_weights *w,
                                       const int32_t *tokens,
@@ -1296,6 +1494,7 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
      * ds4_ple_row_ids is that a run of single-token calls names the same rows
      * a single long call would, so this is the same ids either way; splitting
      * it is how the per-row history is observed, not a different computation. */
+    if (!qw_ple_pregather_join(s, tokens, n_tokens)) {
     if (s->spec_snapshot_rows > 0) {
         for (uint32_t t = 0; t < n_tokens; t++) {
             ds4_ple_row_ids(&s->ple_constants, &s->ple_history, tokens + t, 1u,
@@ -1458,6 +1657,7 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                                       scratch);
             }
         }
+    }
     }
     if (gather_t0 != 0.0) {
         fprintf(stderr,

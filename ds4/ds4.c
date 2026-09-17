@@ -76092,6 +76092,13 @@ static int qwen4exp_seam_draft_step(void *ctx, int next_token,
         }
     }
 #endif
+    /* The chain's draft_step calls are the only ones this seam sees: the
+     * seed rows a round owes the head cache go through draft_rows below.
+     * The drafted token is the next verify's next row, so feed it to the
+     * pre-gather after the test hook has had its say. */
+    ds4_qwen4exp_graph_ple_feed(s->engine->qwen4exp_session,
+                                s->engine->qwen4exp_weights,
+                                (int32_t)*draft_out);
     return 0;
 }
 
@@ -76103,7 +76110,15 @@ static int qwen4exp_seam_draft_rows(void *ctx, const int *next_tokens,
                                     uint32_t n, int *draft_out,
                                     float *multi_out) {
     ds4_session *s = ctx;
+    ds4_engine *e = s->engine;
     char err[256];
+    /* The last input row is the token the next round feeds: announce it
+     * first so the pre-gather's row zero is already running while the head
+     * produces the draft that becomes row one. */
+    if (n > 0u) {
+        ds4_qwen4exp_graph_ple_feed(e->qwen4exp_session, e->qwen4exp_weights,
+                                    (int32_t)next_tokens[n - 1u]);
+    }
     if (ds4_qwen4exp_mtp_head_forward_last(&s->qwen4exp_head, next_tokens,
                                            hc_rows, pos0, n, draft_out,
                                            multi_out, err, sizeof(err)) != 0) {
@@ -76120,6 +76135,9 @@ static int qwen4exp_seam_draft_rows(void *ctx, const int *next_tokens,
         }
     }
 #endif
+    /* The draft this forward produced is the next verify's row one. */
+    ds4_qwen4exp_graph_ple_feed(e->qwen4exp_session, e->qwen4exp_weights,
+                                (int32_t)*draft_out);
     return 0;
 }
 
@@ -76128,6 +76146,7 @@ static float qwen4exp_seam_draft_margin(void *ctx) {
     ds4_session *s = ctx;
     return s->qwen4exp_head.last_margin;
 }
+
 
 /* Build the seam, the rollback set and the head, once per session.  Returns
  * false with a named message when anything refuses, and the caller returns -1:

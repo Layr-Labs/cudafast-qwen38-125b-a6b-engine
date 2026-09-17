@@ -217,6 +217,18 @@ bool ds4_qwen4exp_graph_read_logit_row(ds4_qwen4exp_session *s,
                                        uint32_t row,
                                        float *logits);
 
+/* Feed one token of the NEXT verify's row list, in row order, to the
+ * speculative pre-gather: the n-gram row ids, the mapped row reads and the
+ * dequant for that row run on a worker thread while the caller is still
+ * producing the rest of the chain.  The next forward's gather commits the
+ * result only when the tokens it is fed are a prefix of what was gathered
+ * and the history the feed seeded from is unchanged; anything else falls
+ * back to the serial scan, so a feed is a hint that can never change a
+ * value the device sees.  Calls outside a draft chain are ignored. */
+void ds4_qwen4exp_graph_ple_feed(ds4_qwen4exp_session       *s,
+                                 const ds4_qwen4exp_weights *w,
+                                 int32_t                    token);
+
 /* The target's LM head over ONE supplied pre-final-mixer row.  Runs the final
  * mixer and the head, the same two ops the forward ends with, so a row that
  * came out of a verify yields exactly the logits that verify would have. */
