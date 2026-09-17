@@ -6068,6 +6068,15 @@ extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, con
     return cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, data, (size_t)bytes, cudaMemcpyHostToDevice), "tensor write");
 }
 
+/* No pinned-host staging path here: the fallbacks the header promises. */
+extern "C" void *ds4_gpu_host_alloc_pinned(uint64_t bytes) {
+    return malloc((size_t)(bytes ? bytes : 1));
+}
+extern "C" void ds4_gpu_host_free_pinned(void *p) { free(p); }
+extern "C" int ds4_gpu_tensor_write_async(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
+    return ds4_gpu_tensor_write(tensor, offset, data, bytes);
+}
+
 extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     return cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes, cudaMemcpyDeviceToHost), "tensor read");

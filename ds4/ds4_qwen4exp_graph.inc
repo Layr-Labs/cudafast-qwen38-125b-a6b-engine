@@ -769,7 +769,8 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
         s->ple_value = qwen4exp_alloc_zeroed(B * E * f, &ok);
         if (ok) {
             s->ple_ids = calloc((size_t)B * DS4_N_PLE_HEAD, sizeof(uint64_t));
-            s->ple_rows_host = calloc((size_t)B * DS4_N_PLE_EMBD, sizeof(float));
+            s->ple_rows_host = (float *)ds4_gpu_host_alloc_pinned(
+                (uint64_t)B * DS4_N_PLE_EMBD * sizeof(float));
             ok = s->ple_ids != NULL && s->ple_rows_host != NULL;
         }
         if (ok) {
@@ -892,8 +893,7 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->ple_key);
     ds4_gpu_tensor_free(s->ple_aux);
     ds4_gpu_tensor_free(s->ple_value);
-    free(s->ple_ids);
-    free(s->ple_rows_host);
+    ds4_gpu_host_free_pinned(s->ple_rows_host);
     ds4_gpu_tensor_free(s->d_pos);
     ds4_gpu_tensor_free(s->d_adopt);
     ds4_gpu_tensor_free(s->d_gdn_replay);
@@ -1464,7 +1464,7 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 "ds4: qwen4exp PLE gather %u rows took %.3f ms\n",
                 n_tokens, (now_sec() - gather_t0) * 1000.0);
     }
-    if (!ds4_gpu_tensor_write(s->ple_rows, 0, s->ple_rows_host,
+    if (!ds4_gpu_tensor_write_async(s->ple_rows, 0, s->ple_rows_host,
                               (uint64_t)n_tokens * DS4_N_PLE_EMBD * sizeof(float))) {
         fprintf(stderr, "ds4: qwen4exp n-gram row upload failed at block %u\n", il);
         return false;

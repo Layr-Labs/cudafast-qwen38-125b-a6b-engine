@@ -3502,6 +3502,44 @@ extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, con
     return ok;
 }
 
+extern "C" void *ds4_gpu_host_alloc_pinned(uint64_t bytes) {
+    if (bytes == 0) bytes = 1;
+    void *p = NULL;
+    /* Pinned staging is what makes the async upload a real DMA instead of a
+     * synchronous bounce through the driver's pageable staging. */
+    if (cudaMallocHost(&p, (size_t)bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    return p;
+}
+
+extern "C" void ds4_gpu_host_free_pinned(void *p) {
+    if (!p) return;
+    /* A pinned buffer can still be the source of an in-flight async copy;
+     * freeing it without draining first is undefined.  Session teardown is
+     * the only caller, so the synchronize costs nothing measurable. */
+    (void)cudaDeviceSynchronize();
+    (void)cudaFreeHost(p);
+}
+
+extern "C" int ds4_gpu_tensor_write_async(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
+    if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
+    int d = ds4_tensor_device_idx(tensor);
+    int ok = 0;
+    WITH_DEVICE(g_gpu[d].device_id) {
+        /* The decode stream is the legacy stream outside capture and the
+         * blocking capture stream inside one, so the copy is ordered ahead
+         * of every kernel the caller launches next either way -- the same
+         * ordering ds4_gpu_tensor_copy already relies on. */
+        ok = cuda_ok(cudaMemcpyAsync((char *)tensor->ptr + offset, data,
+                                    (size_t)bytes, cudaMemcpyHostToDevice,
+                                    cuda_decode_stream()),
+                     "tensor write async");
+    }
+    return ok;
+}
+
 extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     int d = ds4_tensor_device_idx(tensor);

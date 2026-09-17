@@ -52,6 +52,17 @@ uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
+
+/* Pinned host staging for the hot upload paths: cudaMallocHost memory a
+ * cudaMemcpyAsync can source without staging through the driver's pageable
+ * bounce buffer.  ds4_gpu_tensor_write_async issues the copy on the decode
+ * stream and returns before it lands; the caller must not rewrite the host
+ * buffer until a stream or device synchronize has run.  Backends without a
+ * pinned path fall back to ordinary malloc and a synchronous copy. */
+void *ds4_gpu_host_alloc_pinned(uint64_t bytes);
+void ds4_gpu_host_free_pinned(void *p);
+int ds4_gpu_tensor_write_async(ds4_gpu_tensor *tensor, uint64_t offset,
+                               const void *data, uint64_t bytes);
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
