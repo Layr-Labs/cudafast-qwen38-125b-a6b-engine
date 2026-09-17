@@ -418,6 +418,12 @@ __device__ __forceinline__ static float qwen4exp_gdn_softplus(float x) {
  * slower than eight, four slots about half a percent slower than eight. The
  * cost is not linear in the slot count and eight is a measured optimum.
  */
+/* This build's note auto09170812_1 records that switching the
+ * gated-deltanet decode arm to the split-reduce kernel, which launches four
+ * times as many blocks, measured seven tenths of one percent faster with a
+ * standard error of one and two tenths: neutral. Widening the grid is not
+ * what this path needs.
+ */
 __global__ static void qwen4exp_gdn_conv_kernel(
         float       *qkv,
         float       *conv_state,
@@ -1668,6 +1674,576 @@ __global__ static void qwen4exp_gdn_output_quant_kernel(
         const float *output_norm, uint32_t n_value_head, uint32_t n_tokens,
         float norm_eps);
 
+/* =========================================================================
+ * PREFILL: the attn_qkv projection with the gated delta net's depthwise
+ * convolution, SiLU and query/key RMS norm in its epilogue.
+ *
+ * At prefill widths the projection writes 42 MB of raw rows that the
+ * token-parallel convolution reads straight back and rewrites, 84 MB of
+ * DRAM traffic per layer that is the whole cost of that kernel (it measures
+ * at its bandwidth floor).  Here the projection's 128 x 128 tile -- one
+ * head block wide, so a row's norm closes inside it -- is staged through
+ * the shared memory the K loop has finished with and convolved in place,
+ * and the convolution kernel does not run.
+ *
+ * The GEMM is matmul_q8_0_preq_rows_mma_pipe_kernel (ds4_cuda.cu), text
+ * for text, with its epilogue replaced.  That kernel's float chain is
+ * pinned PTX (mul.rn.ftz, fma.rn.ftz, sub.rn.ftz), so this translation
+ * unit's flags do not enter it: the tile it accumulates is the bit pattern
+ * the ds4_cuda.cu build stores, and tests/test_qwen4exp_gdn holds the pair
+ * bit-equal.  The epilogue is qwen4exp_gdn_conv_parallel_kernel's
+ * arithmetic under this unit's flags, which are that kernel's own.
+ *
+ * Taken for whole 128-token tiles only (n_tokens a multiple of 128), with
+ * no snapshot rows and no adoption flag, on the int8 MMA tier: the entry
+ * below declines anything else and the shipping projection and
+ * convolution run instead.  DS4_QWEN4EXP_NO_GDN_CONV_FUSE=1 declines
+ * always.
+ * ========================================================================= */
+__device__ __forceinline__ static uint4 q8_mma_ldg_16(const void *gmem) {
+    uint4 v;
+    asm volatile("ld.global.v4.u32 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(gmem));
+    return v;
+}
+
+/* Streaming (L2-only) load for the activations, which this block never
+ * re-reads: keeps L1 for the weight windows, whose lines carry over from
+ * one stage to the next (measured 1-3% at the prefill shapes). */
+__device__ __forceinline__ static uint4 q8_mma_ldg_16_cg(const void *gmem) {
+    uint4 v;
+    asm volatile("ld.global.cg.v4.u32 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(gmem));
+    return v;
+}
+
+__device__ __forceinline__ static uint32_t q8_mma_ldg_4(const void *gmem) {
+    uint32_t v;
+    asm volatile("ld.global.u32 %0, [%1];" : "=r"(v) : "l"(gmem));
+    return v;
+}
+
+__device__ __forceinline__ static void q8_mma_sts_16(void *smem, uint4 v) {
+    const uint32_t s = (uint32_t)__cvta_generic_to_shared(smem);
+    asm volatile("st.shared.v4.u32 [%0], {%1,%2,%3,%4};"
+                 :: "r"(s), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
+}
+
+__device__ __forceinline__ static void q8_mma_ldmatrix_x4(uint32_t r[4],
+                                                          const void *smem) {
+    const uint32_t s = (uint32_t)__cvta_generic_to_shared(smem);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(s));
+}
+
+/* D = A * B + C with C a register the compiler keeps, so the seeded
+ * accumulator costs no moves. */
+__device__ __forceinline__ static void q8_mma_m16n8k32_seeded(int32_t d[4],
+                                                              const uint32_t a[4],
+                                                              const uint32_t b[2],
+                                                              int32_t c) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};"
+        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]),
+          "r"(c));
+#else
+    (void)a; (void)b; (void)c; (void)d;
+    __trap();
+#endif
+}
+
+/* The three float ops of the tile's K loop, as the fast-math build of this
+ * unit emits them for the tile above; pinned so that no flag can move them. */
+__device__ __forceinline__ static float q8_mma_fmul_ftz(float a, float b) {
+    float r;
+    asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+    return r;
+}
+
+__device__ __forceinline__ static float q8_mma_fma_ftz(float a, float b, float c) {
+    float r;
+    asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(r) : "f"(a), "f"(b), "f"(c));
+    return r;
+}
+
+/* (float)dot, from the accumulator seeded with Q8_MMA_MAGIC; see above. */
+#define Q8_MMA_MAGIC_BITS 0x4B400000
+#define Q8_MMA_MAGIC_F 12582912.0f
+
+__device__ __forceinline__ static float q8_mma_dot_to_f32(int32_t d_magic) {
+    float r;
+    asm("sub.rn.ftz.f32 %0, %1, %2;"
+        : "=f"(r) : "f"(__int_as_float(d_magic)), "f"(Q8_MMA_MAGIC_F));
+    return r;
+}
+
+
+/* Named barriers: FULL[b] -- the producer has landed stage buffer b and
+ * converted its scales; EMPTY[b] -- every consumer is done reading it. */
+__device__ __forceinline__ static void q8_mma_bar_sync(int id, int count) {
+    asm volatile("bar.sync %0, %1;" :: "r"(id), "r"(count) : "memory");
+}
+__device__ __forceinline__ static void q8_mma_bar_arrive(int id, int count) {
+    asm volatile("bar.arrive %0, %1;" :: "r"(id), "r"(count) : "memory");
+}
+
+#ifndef Q8_MMA_MINB
+#define Q8_MMA_MINB 1
+#endif
+
+template <int WM, int WN, int MT, int NT, int G, int STAGES>
+struct q8_mma_pipe_cfg {
+    static constexpr int BM = WM * MT * 16;
+    static constexpr int BN = WN * NT * 8;
+    static constexpr int CWARPS = WM * WN;              /* consumer warps */
+    static constexpr int PWARPS = 4;                    /* producer warps */
+    static constexpr int THREADS = (CWARPS + PWARPS) * 32;
+    static constexpr int A_STRIDE = G * 32 + 16;
+    static constexpr int A_CHUNKS = G * 2;
+    static constexpr int B_RAW = G * 34;
+    static constexpr int B_GCD = (B_RAW % 16 == 0) ? 16 : (B_RAW % 8 == 0) ? 8 : (B_RAW % 4 == 0) ? 4 : 2;
+    static constexpr int B_SKEW_MAX = 16 - B_GCD;
+    static constexpr int B_WINDOW = ((B_RAW + B_SKEW_MAX + 15) / 16) * 16;
+    static constexpr int B_CHUNKS = B_WINDOW / 16;
+    static constexpr int B_STRIDE = ((B_WINDOW / 4) % 8 == 4) ? B_WINDOW : B_WINDOW + 16;
+    static constexpr int A_BYTES = BM * A_STRIDE;
+    static constexpr int B_BYTES = BN * B_STRIDE;
+    static constexpr int AS_BYTES = BM * G * 4;
+    static constexpr int WS_BYTES = G * BN * 4;          /* converted weight scales [gg][BN] */
+    static constexpr int STAGE_BYTES = A_BYTES + B_BYTES + AS_BYTES + WS_BYTES;
+    static constexpr int SMEM = STAGES * STAGE_BYTES;
+    static_assert(G == 2 || G == 4 || G == 8, "G is the k32 steps per stage");
+    static_assert(STAGES >= 2 && STAGES <= 7, "named barriers: FULL/EMPTY per stage buffer, 15 is the producers' own");
+    static_assert((A_STRIDE / 4) % 8 == 4, "A stride must be 4 mod 8 words");
+    static_assert((B_STRIDE / 4) % 8 == 4, "B stride must be 4 mod 8 words");
+    static_assert(B_STRIDE % 16 == 0 && A_STRIDE % 16 == 0, "row alignment");
+    static_assert(B_GCD >= 4, "skew must keep word parity");
+};
+
+template <int WM, int WN, int MT, int NT, int G, int STAGES>
+__global__ __launch_bounds__((WM * WN + 4) * 32, Q8_MMA_MINB) static void
+qwen4exp_gdn_qkv_conv_mma_pipe_kernel(float *out,
+                                      float *side,
+                                      const float *conv_weight,
+                                      uint32_t n_key_head,
+                                      uint32_t n_value_head,
+                                      float qk_norm_eps,
+                                      const unsigned char *w,
+                                      const int8_t *xq,
+                                      const float *xscale,
+                                      uint64_t out_dim,
+                                      uint32_t n_rows,
+                                      uint64_t blocks) {
+    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES> C;
+    constexpr int BM = C::BM, BN = C::BN;
+    constexpr int QW_CONV_TS = BN + 4;   /* the tile as rows, 4 mod 8 words apart */
+    static_assert(BN == 128, "one head block per column tile");
+    static_assert(BM * QW_CONV_TS * 4 <= C::SMEM, "the tile fits the stage buffers");
+
+    extern __shared__ __align__(16) unsigned char q8_mma_smem[];
+    unsigned char *sA_all = q8_mma_smem;
+    unsigned char *sB_all = sA_all + STAGES * C::A_BYTES;
+    float *sAs_all = (float *)(sB_all + STAGES * C::B_BYTES);
+    float *sWs_all = sAs_all + STAGES * (C::AS_BYTES / 4);
+
+    const int tid = (int)threadIdx.x;
+    const uint32_t lane = threadIdx.x & 31u;
+    const int warp = tid >> 5;
+
+    const uint32_t m0 = (uint32_t)blockIdx.x * BM;
+    const uint64_t n0 = (uint64_t)blockIdx.y * BN;
+    if (m0 >= n_rows || n0 >= out_dim) return;
+
+    const uint64_t nstage = (blocks + (uint64_t)G - 1u) / (uint64_t)G;
+    const uint64_t w_row_bytes = blocks * 34u;
+    /* Barrier ids: 1 + 2*b is FULL[b], 2 + 2*b is EMPTY[b]; 0 is __syncthreads. */
+    constexpr int BAR_COUNT = C::THREADS;
+
+    if (warp >= C::CWARPS) {
+        const int pw = warp - C::CWARPS;
+        /* ---- The producer warps: every copy of every stage and the weight
+         * scales' half -> float, in stage order, the chunk lists dealt
+         * between them.  They never compute. */
+        /* Each producer lane owns, per stage, a fixed set of 16-byte
+         * chunks: chunk idx = lane + 32*(k*PWARPS + pw) over the activation
+         * chunks (row idx / A_CHUNKS, column idx % A_CHUNKS), the scale
+         * chunks (one per row), and the weight window chunks (whole rows
+         * per instruction: row idx / B_CHUNKS, column idx % B_CHUNKS, so an
+         * instruction's lanes walk a few rows end to end -- the L1 pays per
+         * distinct line, and lane-per-row copies measured twice as slow).
+         * A stage is loaded whole into registers with plain LDG, then stored
+         * to its buffer, so the copy is the tile above's kind of access on
+         * every memory the weights can live in. */
+        constexpr int PT = 32 * C::PWARPS;
+        constexpr int KA = (BM * C::A_CHUNKS + PT - 1) / PT;
+        constexpr int KS = (BM * (G / 4) + PT - 1) / PT;
+        constexpr int KB = (BN * C::B_CHUNKS + PT - 1) / PT;
+        static_assert(G % 4 == 0, "activation scales: 16-byte chunks");
+        const int pl = (int)lane + 32 * pw;   /* producer lane, 0 .. PT-1 */
+
+        for (uint64_t s = 0; s < nstage; s++) {
+            const int buf = (int)(s % (uint64_t)STAGES);
+            unsigned char *sA = sA_all + buf * C::A_BYTES;
+            unsigned char *sB = sB_all + buf * C::B_BYTES;
+            float *sAs = sAs_all + buf * (C::AS_BYTES / 4);
+            float *sWs = sWs_all + buf * (C::WS_BYTES / 4);
+            const uint64_t g0 = s * (uint64_t)G;
+            const uint64_t seg_off = s * (uint64_t)C::B_RAW;
+            const uint64_t win_off = seg_off & ~(uint64_t)15u;
+            const int skew = (int)(seg_off & 15u);
+
+            /* The stage into registers. */
+            uint4 ra[KA], rs[KS], rb[KB];
+#pragma unroll
+            for (int k = 0; k < KA; k++) {
+                const int idx = pl + k * PT;
+                const int r = idx / C::A_CHUNKS;
+                const int c = idx - r * C::A_CHUNKS;
+                const uint64_t row = (uint64_t)m0 + (uint32_t)r;
+                ra[k] = make_uint4(0u, 0u, 0u, 0u);
+                if (idx < BM * C::A_CHUNKS && row < (uint64_t)n_rows) {
+                    ra[k] = q8_mma_ldg_16_cg(xq + (row * blocks + g0 + (uint32_t)(c >> 1)) * 32u + (c & 1) * 16);
+                }
+            }
+#pragma unroll
+            for (int k = 0; k < KS; k++) {
+                const int idx = pl + k * PT;
+                const int r = idx / (G / 4);
+                const int c = idx - r * (G / 4);
+                const uint64_t row = (uint64_t)m0 + (uint32_t)r;
+                rs[k] = make_uint4(0u, 0u, 0u, 0u);
+                if (idx < BM * (G / 4) && row < (uint64_t)n_rows) {
+                    rs[k] = q8_mma_ldg_16_cg(xscale + row * blocks + g0 + (uint32_t)c * 4u);
+                }
+            }
+#pragma unroll
+            for (int k = 0; k < KB; k++) {
+                const int idx = pl + k * PT;
+                const int r = idx / C::B_CHUNKS;
+                const int c = idx - r * C::B_CHUNKS;
+                const uint64_t row = n0 + (uint32_t)r;
+                rb[k] = make_uint4(0u, 0u, 0u, 0u);
+                if (idx < BN * C::B_CHUNKS && row < out_dim) {
+                    const unsigned char *src = w + row * w_row_bytes + win_off + (uint32_t)c * 16u;
+                    /* Only the tensor's last row's window can leave it. */
+                    const int64_t in_row = (row + 1u == out_dim)
+                        ? (int64_t)w_row_bytes - (int64_t)win_off - (int64_t)c * 16 : 16;
+                    if (in_row >= 16) {
+                        rb[k] = q8_mma_ldg_16(src);
+                    } else {
+                        uint32_t q[4];
+#pragma unroll
+                        for (int i = 0; i < 4; i++) q[i] = ((int64_t)i * 4 < in_row) ? q8_mma_ldg_4(src + i * 4) : 0u;
+                        rb[k] = make_uint4(q[0], q[1], q[2], q[3]);
+                    }
+                }
+            }
+
+            /* The buffer must be free: consumers arrive on EMPTY[buf] when
+             * they finish stage s - STAGES. */
+            if (s >= (uint64_t)STAGES) q8_mma_bar_sync(2 + 2 * buf, BAR_COUNT);
+
+            /* The stage into its buffer. */
+#pragma unroll
+            for (int k = 0; k < KA; k++) {
+                const int idx = pl + k * PT;
+                const int r = idx / C::A_CHUNKS;
+                const int c = idx - r * C::A_CHUNKS;
+                if (idx < BM * C::A_CHUNKS) q8_mma_sts_16(sA + r * C::A_STRIDE + c * 16, ra[k]);
+            }
+#pragma unroll
+            for (int k = 0; k < KS; k++) {
+                const int idx = pl + k * PT;
+                const int r = idx / (G / 4);
+                const int c = idx - r * (G / 4);
+                if (idx < BM * (G / 4)) q8_mma_sts_16(sAs + r * G + c * 4, rs[k]);
+            }
+#pragma unroll
+            for (int k = 0; k < KB; k++) {
+                const int idx = pl + k * PT;
+                const int r = idx / C::B_CHUNKS;
+                const int c = idx - r * C::B_CHUNKS;
+                if (idx < BN * C::B_CHUNKS) q8_mma_sts_16(sB + r * C::B_STRIDE + c * 16, rb[k]);
+            }
+            /* Every producer's stores are visible to every producer: the
+             * scales below lie in rows another one stored. */
+            q8_mma_bar_sync(15, C::PWARPS * 32);
+
+            /* Weight scales, half -> float, [gg][BN]. */
+#pragma unroll
+            for (int j = 0; j < (G * BN + PT - 1) / PT; j++) {
+                const int i = pl + j * PT;
+                if (i < G * BN) {
+                    const int gg = i / BN;
+                    const int rr = i - gg * BN;
+                    uint16_t h;
+                    memcpy(&h, sB + rr * C::B_STRIDE + skew + gg * 34, 2);
+                    sWs[gg * BN + rr] = __half2float(__ushort_as_half(h));
+                }
+            }
+            __syncwarp();
+            q8_mma_bar_arrive(1 + 2 * buf, BAR_COUNT);
+        }
+    } else {
+    /* ---- Consumers. */
+    const int wm = warp / WN;
+    const int wn = warp % WN;
+    const uint32_t g4 = lane >> 2u;
+    const uint32_t t4 = lane & 3u;
+
+    float acc[MT][NT][4];
+#pragma unroll
+    for (int mi = 0; mi < MT; mi++)
+#pragma unroll
+        for (int ni = 0; ni < NT; ni++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) acc[mi][ni][e] = 0.0f;
+
+    const int a_lrow = (int)(lane & 15u);
+    const int a_lk = (int)(lane >> 4u) * 16;
+    const int32_t magic = Q8_MMA_MAGIC_BITS;
+
+    for (uint64_t s = 0; s < nstage; s++) {
+        const int buf = (int)(s % (uint64_t)STAGES);
+        q8_mma_bar_sync(1 + 2 * buf, BAR_COUNT);
+
+        const unsigned char *sA = sA_all + C::A_BYTES * buf; /* consumers: stage s's activations */
+        const unsigned char *sB = sB_all + buf * C::B_BYTES;
+        const float *sAs = sAs_all + buf * (C::AS_BYTES / 4);
+        const float *sWs = sWs_all + buf * (C::WS_BYTES / 4);
+        const int skew = (int)((s * (uint64_t)C::B_RAW) & 15u);
+
+        float xs[MT][2][G];
+#pragma unroll
+        for (int mi = 0; mi < MT; mi++) {
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+                const int r = wm * MT * 16 + mi * 16 + h * 8 + (int)g4;
+                if (G == 2) {
+                    const float2 v = *(const float2 *)(sAs + r * G);
+                    xs[mi][h][0] = v.x; xs[mi][h][1 % G] = v.y;
+                } else {
+#pragma unroll
+                    for (int q = 0; q < G / 4; q++) {
+                        const float4 v = *(const float4 *)(sAs + r * G + q * 4);
+                        xs[mi][h][(q * 4 + 0) % G] = v.x; xs[mi][h][(q * 4 + 1) % G] = v.y;
+                        xs[mi][h][(q * 4 + 2) % G] = v.z; xs[mi][h][(q * 4 + 3) % G] = v.w;
+                    }
+                }
+            }
+        }
+
+#pragma unroll
+        for (int gg = 0; gg < G; gg++) { /* the stage's k32 steps, ascending */
+            uint32_t af[MT][4];
+#pragma unroll
+            for (int mi = 0; mi < MT; mi++) {
+                const int rbase = wm * MT * 16 + mi * 16;
+                q8_mma_ldmatrix_x4(af[mi], sA + (rbase + a_lrow) * C::A_STRIDE + gg * 32 + a_lk);
+            }
+#pragma unroll
+            for (int ni = 0; ni < NT; ni++) {
+                const int c = wn * NT * 8 + ni * 8;
+                const unsigned char *pb = sB + (c + (int)g4) * C::B_STRIDE + skew + gg * 34 + 2 + (int)t4 * 4;
+                uint32_t bf[2];
+                if ((gg & 1) == 0) {
+                    const uint32_t *pw = (const uint32_t *)(pb - 2);
+                    bf[0] = __funnelshift_r(pw[0], pw[1], 16u);
+                    bf[1] = __funnelshift_r(pw[4], pw[5], 16u);
+                } else {
+                    const uint32_t *pw = (const uint32_t *)pb;
+                    bf[0] = pw[0];
+                    bf[1] = pw[4];
+                }
+                const float2 wsp = *(const float2 *)(sWs + gg * BN + c + (int)t4 * 2);
+                int32_t d[MT][4];
+#pragma unroll
+                for (int mi = 0; mi < MT; mi++) q8_mma_m16n8k32_seeded(d[mi], af[mi], bf, magic);
+#pragma unroll
+                for (int mi = 0; mi < MT; mi++) {
+                    acc[mi][ni][0] = q8_mma_fma_ftz(q8_mma_fmul_ftz(wsp.x, xs[mi][0][gg]), q8_mma_dot_to_f32(d[mi][0]), acc[mi][ni][0]);
+                    acc[mi][ni][1] = q8_mma_fma_ftz(q8_mma_fmul_ftz(wsp.y, xs[mi][0][gg]), q8_mma_dot_to_f32(d[mi][1]), acc[mi][ni][1]);
+                    acc[mi][ni][2] = q8_mma_fma_ftz(q8_mma_fmul_ftz(wsp.x, xs[mi][1][gg]), q8_mma_dot_to_f32(d[mi][2]), acc[mi][ni][2]);
+                    acc[mi][ni][3] = q8_mma_fma_ftz(q8_mma_fmul_ftz(wsp.y, xs[mi][1][gg]), q8_mma_dot_to_f32(d[mi][3]), acc[mi][ni][3]);
+                }
+            }
+        }
+        /* Done with this buffer. */
+        q8_mma_bar_arrive(2 + 2 * buf, BAR_COUNT);
+    }
+
+        /* The tile into shared memory as whole rows, once every consumer has
+         * left the last stage's buffers (the rows alias them). */
+        q8_mma_bar_sync(13, C::CWARPS * 32);
+        float *tile = (float *)q8_mma_smem;
+#pragma unroll
+        for (int mi = 0; mi < MT; mi++) {
+            const int rl = wm * MT * 16 + mi * 16 + (int)g4, rh = rl + 8;
+#pragma unroll
+            for (int ni = 0; ni < NT; ni++) {
+                const int c = wn * NT * 8 + ni * 8 + (int)t4 * 2;
+                tile[rl * QW_CONV_TS + c] = acc[mi][ni][0];
+                tile[rl * QW_CONV_TS + c + 1] = acc[mi][ni][1];
+                tile[rh * QW_CONV_TS + c] = acc[mi][ni][2];
+                tile[rh * QW_CONV_TS + c + 1] = acc[mi][ni][3];
+            }
+        }
+    }
+    __syncthreads();
+
+    /* ---- The epilogue: qwen4exp_gdn_conv_parallel_kernel's four-tap causal
+     * convolution, SiLU and query/key RMS norm over the tile's rows, every
+     * warp of the block taking part.  A column tile is one head block (BN is
+     * the head width and n0 a multiple of it), so a row's norm closes inside
+     * the tile; the row is walked by four warps as thread-per-channel, the
+     * same lane-to-channel mapping, the same warp_sum_f32 partials and the
+     * same four-partial butterfly as that kernel's block, so every bit is
+     * the one it stores.  A row's three predecessors are the tile's own rows
+     * for every row but the first three, whose predecessors belong to the
+     * tile before; those rows, and the tile's last three, are stored raw to
+     * `side` and the first three are finished by the fix-up kernel.  The
+     * convolution's inputs are the raw projection rows this tile computed,
+     * which is what that kernel read back from global memory. */
+    {
+        __shared__ float qw_conv_red[3][2][4];
+        const float *tile = (const float *)q8_mma_smem;
+        const uint32_t key_blocks = 2u * n_key_head;
+        const uint32_t conv_dim = (key_blocks + n_value_head) * 128u;
+        const uint32_t hblock = (uint32_t)(n0 / 128u);
+        const bool is_key = hblock < key_blocks;
+        const float post_scale = hblock < n_key_head
+            ? 0x1.6a09e6p-4f
+            : 1.0f;
+        const int grp = warp >> 2;            /* three groups of four warps */
+        const int gwarp = warp & 3;
+        const uint32_t ch = (uint32_t)gwarp * 32u + lane;
+        const uint32_t channel = (uint32_t)n0 + ch;
+        const float w0 = conv_weight[(uint64_t)channel * 4u + 0u];
+        const float w1 = conv_weight[(uint64_t)channel * 4u + 1u];
+        const float w2 = conv_weight[(uint64_t)channel * 4u + 2u];
+        const float w3 = conv_weight[(uint64_t)channel * 4u + 3u];
+        const uint64_t tile_idx = (uint64_t)blockIdx.x;
+        for (int r = grp; r < BM; r += 3) {
+            const uint64_t token = (uint64_t)m0 + (uint32_t)r;
+            if (token >= (uint64_t)n_rows) break;
+            const float raw = tile[r * QW_CONV_TS + (int)ch];
+            if (r < 3) {
+                side[(tile_idx * 6u + (uint32_t)r) * conv_dim + channel] = raw;
+                continue;
+            }
+            if (r >= BM - 3) {
+                side[(tile_idx * 6u + 3u + (uint32_t)(r - (BM - 3))) * conv_dim + channel] = raw;
+            }
+            float acc = 0.0f;
+            acc = fmaf(tile[(r - 3) * QW_CONV_TS + (int)ch], w0, acc);
+            acc = fmaf(tile[(r - 2) * QW_CONV_TS + (int)ch], w1, acc);
+            acc = fmaf(tile[(r - 1) * QW_CONV_TS + (int)ch], w2, acc);
+            acc = fmaf(raw, w3, acc);
+            const float activated = qwen4exp_gdn_silu(acc);
+            float *dst = out + token * conv_dim + channel;
+            if (!is_key) {
+                *dst = activated;
+                continue;
+            }
+            float *red = qw_conv_red[grp][(r / 3) & 1];
+            const float sumsq = warp_sum_f32(activated * activated);
+            if (lane == 0u) red[gwarp] = sumsq;
+            q8_mma_bar_sync(5 + grp, 128);
+            float total = lane < 4u ? red[lane] : 0.0f;
+            total = warp_sum_all_f32(total);
+            *dst = activated * rsqrtf(total + qk_norm_eps) * post_scale;
+        }
+    }
+}
+/* The three rows of every 128-token tile whose convolution window reaches
+ * into the tile before, from the raw rows the fused kernel set aside (the
+ * carried history for the first tile), with that kernel's arithmetic; and
+ * the decay/beta pair of every token, which the token-parallel convolution
+ * evaluated in its first channel block. */
+__global__ static void qwen4exp_gdn_conv_fixup_kernel(
+        float        *__restrict__ out,
+        const float  *__restrict__ side,
+        const float  *conv_state,
+        const float  *conv_weight,
+        float2       *gate_pairs,
+        const float  *raw_alpha,
+        const float  *raw_beta,
+        const float  *a_log,
+        const float  *dt_bias,
+        uint32_t      n_key_head,
+        uint32_t      n_value_head,
+        uint32_t      n_tokens,
+        float         qk_norm_eps) {
+    const uint32_t block = blockIdx.x;
+    const uint32_t tile = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    const uint32_t key_blocks = 2u * n_key_head;
+    const uint32_t blocks = key_blocks + n_value_head;
+    if (block >= blocks) return;
+    __shared__ float red[2][4];
+    const uint32_t conv_dim = blocks * QWEN4EXP_GDN_DIM;
+    const uint32_t channel = block * QWEN4EXP_GDN_DIM + tid;
+    const bool is_key = block < key_blocks;
+    const float post_scale = block < n_key_head
+        ? 0x1.6a09e6p-4f
+        : 1.0f;
+    const float w0 = conv_weight[(uint64_t)channel * 4u + 0u];
+    const float w1 = conv_weight[(uint64_t)channel * 4u + 1u];
+    const float w2 = conv_weight[(uint64_t)channel * 4u + 2u];
+    const float w3 = conv_weight[(uint64_t)channel * 4u + 3u];
+    /* Raw rows -3..-1 of the tile and its own raw rows 0..2. */
+    const float *prev = tile == 0u
+        ? conv_state
+        : side + ((uint64_t)(tile - 1u) * 6u + 3u) * conv_dim;
+    const float *cur = side + (uint64_t)tile * 6u * conv_dim;
+    for (uint32_t r = 0; r < 3u; r++) {
+        const uint32_t token = tile * 128u + r;
+        if (token >= n_tokens) break;
+        float x[4];
+        #pragma unroll
+        for (uint32_t k = 0; k < 4u; k++) {
+            const uint32_t back = 3u - k;
+            x[k] = r >= back
+                ? cur[(uint64_t)(r - back) * conv_dim + channel]
+                : prev[(uint64_t)(k + r) * conv_dim + channel];
+        }
+        float acc = 0.0f;
+        acc = fmaf(x[0], w0, acc);
+        acc = fmaf(x[1], w1, acc);
+        acc = fmaf(x[2], w2, acc);
+        acc = fmaf(x[3], w3, acc);
+        const float activated = qwen4exp_gdn_silu(acc);
+        float *dst = out + (uint64_t)token * conv_dim + channel;
+        if (!is_key) {
+            *dst = activated;
+            continue;
+        }
+        const float sumsq = warp_sum_f32(activated * activated);
+        if (lane == 0u) red[r & 1u][warp] = sumsq;
+        __syncthreads();
+        float total = lane < 4u ? red[r & 1u][lane] : 0.0f;
+        total = warp_sum_all_f32(total);
+        *dst = activated * rsqrtf(total + qk_norm_eps) * post_scale;
+    }
+    if (block == 0u) {
+        const uint32_t token = tile * 128u + tid;
+        if (token < n_tokens) {
+            for (uint32_t head = 0; head < n_value_head; head++) {
+                const uint64_t gate = (uint64_t)token * n_value_head + head;
+                gate_pairs[gate] = make_float2(
+                    expf(a_log[head] *
+                        qwen4exp_gdn_softplus(
+                            raw_alpha[gate] + dt_bias[head])),
+                    qwen4exp_gdn_sigmoid(raw_beta[gate]));
+            }
+        }
+    }
+}
 /* The host half of qwen4exp_gpu_gdn_run in ds4_metal.m: the same validation,
  * the same four weight ranges, and the same three launches in stream order.
  * `out_q8`, when given (one row of prefill only), receives the output norm as
@@ -1678,6 +2254,95 @@ static int qwen4exp_replay_gate_disjoint(const void *a, uint64_t an,
     const uintptr_t ap = (uintptr_t)a, bp = (uintptr_t)b;
     if (!a || !b || an > UINTPTR_MAX - ap || bn > UINTPTR_MAX - bp) return 0;
     return ap + an <= bp || bp + bn <= ap;
+}
+
+/* The fused kernel's launch geometry is the projection's own rung at these
+ * widths: the 128 x 128 tile, 8 consumer and 4 producer warps, two stages. */
+typedef q8_mma_pipe_cfg<2, 4, 4, 4, 4, 2> qwen4exp_gdn_qkv_conv_cfg;
+
+static int qwen4exp_gdn_qkv_conv_attr(void) {
+    static int state = 0;   /* 0 unset, 1 ok, -1 refused */
+    if (state == 0) {
+        state = (cudaFuncSetAttribute(
+                     qwen4exp_gdn_qkv_conv_mma_pipe_kernel<2, 4, 4, 4, 4, 2>,
+                     cudaFuncAttributeMaxDynamicSharedMemorySize,
+                     qwen4exp_gdn_qkv_conv_cfg::SMEM) == cudaSuccess) ? 1 : -1;
+        if (state < 0) (void)cudaGetLastError();
+    }
+    return state > 0;
+}
+
+/* The raw-row side buffer follows the gate pairs in the convolution
+ * scratch: six rows per 128-token tile. */
+static uint64_t qwen4exp_gdn_conv_side_elements(uint32_t n_tokens, uint64_t conv_dim) {
+    return (uint64_t)(n_tokens / 128u) * 6u * conv_dim;
+}
+
+/* Runs the fused projection into the convolution scratch and returns 1;
+ * returns 0 without launching anything when the call is not one it serves,
+ * and the caller runs the shipping projection and convolution. */
+extern "C" int ds4_gpu_qwen4exp_gdn_qkv_conv_prefill(
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *q,
+        uint64_t              q_offset,
+        uint64_t              s_offset,
+        uint32_t              n_tokens,
+        const ds4_gpu_qwen4exp_slab *conv_weight_slab,
+        uint32_t              n_key_head,
+        uint32_t              n_value_head,
+        float                 qk_norm_eps) {
+    if (getenv("DS4_QWEN4EXP_NO_GDN_CONV_FUSE") != NULL ||
+        getenv("DS4_CUDA_NO_MMA_PIPE") != NULL ||
+        getenv("DS4_QWEN4EXP_NO_ROW_TILE") != NULL) return 0;
+    if (!q || !q->ptr || !model_map || !conv_weight_slab ||
+        n_key_head == 0u || n_value_head == 0u || n_tokens < 128u ||
+        (n_tokens % 128u) != 0u || n_tokens > 65535u ||
+        in_dim == 0u || (in_dim & 255u) != 0u ||
+        out_dim != (uint64_t)(2u * n_key_head + n_value_head) * QWEN4EXP_GDN_DIM ||
+        !ds4_cuda_qwen4exp_q8_mma_active(n_tokens)) return 0;
+    const uint64_t blocks = in_dim / 32u;
+    if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * 34u)) return 0;
+    const uint64_t weight_bytes = out_dim * blocks * 34u;
+    if (weight_bytes > model_size - weight_offset) return 0;
+    const uint64_t qbytes = (uint64_t)n_tokens * blocks * 32u;
+    const uint64_t sbytes = (uint64_t)n_tokens * blocks * sizeof(float);
+    if ((q_offset & 15u) != 0u || (s_offset & 15u) != 0u ||
+        q_offset > q->bytes || s_offset > q->bytes ||
+        q->bytes - q_offset < qbytes || q->bytes - s_offset < sbytes) return 0;
+    const int logical_tier = ds4_tensor_device_idx(q);
+    const char *wptr = cuda_resolve_weight_ptr(
+            model_map, weight_offset, weight_bytes, logical_tier,
+            "GDN qkv conv projection");
+    if (!wptr) return 0;
+    const int8_t *xq = (const int8_t *)((const char *)q->ptr + q_offset);
+    const float *xscale = (const float *)((const char *)q->ptr + s_offset);
+    if ((((uintptr_t)wptr) & 15u) != 0u || (((uintptr_t)xq) & 15u) != 0u ||
+        (((uintptr_t)xscale) & 15u) != 0u) return 0;
+    const uint64_t conv_dim = out_dim;
+    const float *conv_weight = qwen4exp_gdn_weight_f32(
+        conv_weight_slab->map, conv_weight_slab->map_size,
+        conv_weight_slab->offset, conv_dim * 4u,
+        logical_tier, "GDN convolution");
+    if (!conv_weight) return 0;
+    const uint64_t qkv_elements = (uint64_t)n_tokens * conv_dim;
+    const uint64_t gate_elements = (uint64_t)n_tokens * n_value_head;
+    const uint64_t side_elements = qwen4exp_gdn_conv_side_elements(n_tokens, conv_dim);
+    float *conv_out = qwen4exp_conv_scratch(
+        logical_tier, qkv_elements + 2u * gate_elements + side_elements);
+    if (!conv_out || !qwen4exp_gdn_qkv_conv_attr()) return 0;
+    float *side = conv_out + qkv_elements + 2u * gate_elements;
+    typedef qwen4exp_gdn_qkv_conv_cfg C;
+    dim3 grid(n_tokens / C::BM, (unsigned)(out_dim / C::BN), 1u);
+    qwen4exp_gdn_qkv_conv_mma_pipe_kernel<2, 4, 4, 4, 4, 2>
+        <<<grid, C::THREADS, C::SMEM, cuda_decode_stream()>>>(
+            conv_out, side, conv_weight, n_key_head, n_value_head, qk_norm_eps,
+            reinterpret_cast<const unsigned char *>(wptr), xq, xscale,
+            out_dim, n_tokens, blocks);
+    return cuda_ok(cudaGetLastError(), "qwen4exp GDN qkv conv projection launch");
 }
 
 static int qwen4exp_cuda_gdn_run(
@@ -1711,7 +2376,8 @@ static int qwen4exp_cuda_gdn_run(
         uint64_t              s_offset,
         const ds4_gpu_tensor *adopt,
         const char           *label,
-        const ds4_gpu_qwen4exp_gdn_replay *replay = NULL) {
+        const ds4_gpu_qwen4exp_gdn_replay *replay = NULL,
+        int                   conv_fused = 0) {
     uint64_t key_dim = 0, value_dim = 0, conv_dim = 0, slots = 0;
     uint64_t qkv_elements = 0, out_elements = 0, gate_elements = 0;
     uint64_t conv_elements = 0, state_elements = 0, state_rows = 0;
@@ -1897,19 +2563,60 @@ static int qwen4exp_cuda_gdn_run(
      * the recurrence reads its qkv from where that kernel wrote. */
     float *conv_out = NULL;
     float2 *gate_pairs = NULL;
+    /* A fused call is refused outright when its conditions do not hold:
+     * the projection was written into the scratch on that promise. */
+    if (conv_fused && (adopt_row || replay || n_rows != 1u ||
+                       n_snapshot_rows != 0u || n_tokens < 128u ||
+                       (n_tokens % 128u) != 0u || n_tokens > 65535u)) {
+        fprintf(stderr, "ds4: qwen4exp GDN %s cannot take the fused convolution\n",
+                label);
+        return 0;
+    }
     if (!adopt_row && n_rows == 1u &&
         n_tokens >= QWEN4EXP_GDN_CONV_PARALLEL_MIN_TOKENS &&
         n_tokens <= 65535u) {
         uint64_t scratch_elements = 0;
         if (gate_elements <= (UINT64_MAX - qkv_elements) / 2u) {
             scratch_elements = qkv_elements + 2u * gate_elements;
+            if (conv_fused) {
+                scratch_elements += qwen4exp_gdn_conv_side_elements(
+                    n_tokens, (uint64_t)(2u * n_key_head + n_value_head) * QWEN4EXP_GDN_DIM);
+            }
             conv_out = qwen4exp_conv_scratch(logical_tier, scratch_elements);
+        }
+        if (conv_fused && !conv_out) {
+            fprintf(stderr, "ds4: qwen4exp GDN %s lost its convolution scratch\n",
+                    label);
+            return 0;
         }
         if (conv_out) {
             gate_pairs = (float2 *)(conv_out + qkv_elements);
         }
     }
-    if (conv_out) {
+    if (conv_out && conv_fused) {
+        /* The fused projection has convolved every row but the first three
+         * of each 128-token tile into conv_out and set the raw rows those
+         * need aside; finish them, evaluate the gates, and carry the last
+         * three raw rows as the serial loop would have left them. */
+        const float *side = conv_out + qkv_elements + 2u * gate_elements;
+        qwen4exp_gdn_conv_fixup_kernel<<<
+                dim3(blocks, n_tokens / 128u, 1u),
+                QWEN4EXP_GDN_DIM, 0, stream>>>(
+                conv_out, side, (const float *)conv_state->ptr, conv_weight,
+                gate_pairs,
+                (const float *)raw_alpha->ptr,
+                (const float *)raw_beta->ptr, a_log, dt_bias,
+                n_key_head, n_value_head, n_tokens, qk_norm_eps);
+        const uint64_t conv_dim = (uint64_t)blocks * QWEN4EXP_GDN_DIM;
+        const uint64_t window = (uint64_t)QWEN4EXP_GDN_HISTORY * conv_dim;
+        if (!cuda_ok(cudaMemcpyAsync(conv_state->ptr,
+                                     side + ((uint64_t)(n_tokens / 128u - 1u) * 6u + 3u) * conv_dim,
+                                     window * sizeof(float),
+                                     cudaMemcpyDeviceToDevice, stream),
+                     "qwen4exp GDN conv history carry (fused)")) {
+            return 0;
+        }
+    } else if (conv_out) {
         qwen4exp_gdn_conv_parallel_kernel<<<
                 dim3(blocks, n_rows, n_tokens),
                 QWEN4EXP_GDN_DIM, 0, stream>>>(
@@ -2142,6 +2849,43 @@ extern "C" int ds4_gpu_qwen4exp_gdn_prefill_q8(
         output_norm_slab,
         n_key_head, n_value_head, 1u, n_tokens, head_layout,
         qk_norm_eps, norm_eps, out_q8, q_offset, s_offset, NULL, "prefill");
+}
+
+/* ds4_gpu_qwen4exp_gdn_prefill_q8 after ds4_gpu_qwen4exp_gdn_qkv_conv_prefill
+ * has written the convolved rows: the same block with the convolution
+ * kernel replaced by the fix-up of each tile's first three rows. */
+extern "C" int ds4_gpu_qwen4exp_gdn_prefill_fused_q8(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *conv_snapshot,
+        ds4_gpu_tensor       *state_snapshot,
+        uint32_t              n_snapshot_rows,
+        ds4_gpu_tensor       *qkv,
+        const ds4_gpu_tensor *raw_alpha,
+        const ds4_gpu_tensor *raw_beta,
+        const ds4_gpu_tensor *output_gate,
+        const ds4_gpu_qwen4exp_slab *conv_weight_slab,
+        const ds4_gpu_qwen4exp_slab *a_log_slab,
+        const ds4_gpu_qwen4exp_slab *dt_bias_slab,
+        const ds4_gpu_qwen4exp_slab *output_norm_slab,
+        uint32_t              n_key_head,
+        uint32_t              n_value_head,
+        uint32_t              n_tokens,
+        uint32_t              head_layout,
+        float                 qk_norm_eps,
+        float                 norm_eps,
+        ds4_gpu_tensor       *out_q8,
+        uint64_t              q_offset,
+        uint64_t              s_offset) {
+    return qwen4exp_cuda_gdn_run(
+        out, conv_state, recurrent_state, conv_snapshot, state_snapshot,
+        n_snapshot_rows, qkv, raw_alpha, raw_beta,
+        output_gate, conv_weight_slab, a_log_slab, dt_bias_slab,
+        output_norm_slab,
+        n_key_head, n_value_head, 1u, n_tokens, head_layout,
+        qk_norm_eps, norm_eps, out_q8, q_offset, s_offset, NULL, "prefill",
+        NULL, 1);
 }
 
 extern "C" int ds4_gpu_qwen4exp_gdn_decode_q8(
@@ -10688,6 +11432,28 @@ qwen4exp_hc_up_mix_pipe_kernel(
                 }
             }
 
+            /* L2 PREFETCH OF THE EPILOGUE'S RESIDUAL LINES.  The mix below reads
+             * the residual as one 128-byte line per token and stream: five hundred
+             * and twelve lines per block, the only DRAM traffic the block has, and
+             * with one block resident per SM nothing covers that read.  Stage zero
+             * and stage one global loads are in flight here; behind them the
+             * producers ask the cache for the lines of the epilogue's first and
+             * second pass, so each has a stage or more to land.  Issued at the top
+             * of the block, ahead of stage zero's loads, the same request measured
+             * slower; issued after the last stage, too late.  A prefetch changes no
+             * value: every load below reads the same bytes. */
+            if (s < 2u) {
+                const int base = (int)s * QHP_CWARPS * 8 * QHP_NT;
+                for (int i = pl; i < QHP_CWARPS * 8 * QHP_NT; i += PT) {
+                    const uint32_t t = (uint32_t)(base + i) / (uint32_t)QHP_NT;
+                    const uint32_t h = (uint32_t)(base + i) - t * (uint32_t)QHP_NT;
+                    const uint32_t r = m0 + t;
+                    if (t < (uint32_t)QHP_BM && r < n_rows) {
+                        qw_prefetch_l2((const char *)(hyper +
+                                ((uint64_t)r * QHP_NT + h) * n_embd + d0));
+                    }
+                }
+            }
             if (s >= (uint32_t)QHP_STAGES) qsp_bar_sync(2 + 2 * buf, BAR_COUNT);
 
 #pragma unroll
@@ -10858,6 +11624,17 @@ qwen4exp_hc_up_mix_pipe_kernel(
         static_assert(QHP_BM % (QHP_CWARPS * TPP) == 0, "tokens per warp pass");
 #pragma unroll 1
         for (int t0 = warp * TPP; t0 < QHP_BM; t0 += QHP_CWARPS * TPP) {
+            /* The next pass's lines, asked for while this pass's loads and
+             * sigmoids run; the thirty-two lanes name the pass's eight tokens
+             * across four streams. */
+            {
+                const int tn = t0 + QHP_CWARPS * TPP + (int)(lane >> 2);
+                const uint32_t rn = m0 + (uint32_t)tn;
+                if (tn < QHP_BM && rn < n_rows) {
+                    qw_prefetch_l2((const char *)(hyper +
+                            ((uint64_t)rn * QHP_NT + (lane & 3u)) * n_embd + d0));
+                }
+            }
             float hv[TPP][QHP_NT], ns[TPP][QHP_NT];
 #pragma unroll
             for (int i = 0; i < TPP; i++) {
