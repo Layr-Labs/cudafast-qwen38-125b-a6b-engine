@@ -2618,6 +2618,11 @@ static bool qwen4exp_graph_layers_encode(
  * overlap the device work already queued. */
 #define QW_DECODE_GRAPH_MAX_CHUNKS 8u
 
+/* This build's note auto09171023_1 records that each captured-graph episode
+ * is worth about five hundredths of one percent on this path, measured by
+ * going from twenty-two captures inside a run to nine. That bounds the
+ * entire identity-count class below any promotion margin.
+ */
 static uint32_t qw_decode_graph_chunks(void) {
     static int init = 0;
     static uint32_t chunks = 4u;   /* the A/B's pick; 1 restores the single capture */
