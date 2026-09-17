@@ -18,6 +18,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
+
 /* =========================================================================
  * Errors.
  * ========================================================================= */
@@ -805,6 +809,31 @@ void ds4_ple_dequant_iq4_nl(const void *__restrict blocks, size_t block_count,
         /* Unrolled by two: the block is a fixed sixteen nibble bytes, so the
          * trip count is a compile-time constant and half the loop-carried
          * bookkeeping disappears.  Same reads, same order, same values. */
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+        /* NEON: the whole block is one 16-byte nibble load and two table
+         * lookups.  vqtbl1q_s8 indexes the same kvalues table the scalar
+         * loop reads, and vcvtq_f32_s32 + vmulq_f32 produce the identical
+         * d * (float)kv product -- no reassociation, bit-identical. */
+        {
+            const int8x16_t ktab = vld1q_s8(kv);
+            const uint8x16_t q = vld1q_u8(qs);
+            const float32x4_t dv = vdupq_n_f32(d);
+            const int8x16_t lo = vqtbl1q_s8(ktab, vandq_u8(q, vdupq_n_u8(0x0F)));
+            const int8x16_t hi = vqtbl1q_s8(ktab, vshrq_n_u8(q, 4));
+            const int16x8_t lo16 = vmovl_s8(vget_low_s8(lo));
+            const int16x8_t hi16 = vmovl_s8(vget_low_s8(hi));
+            const int16x8_t lo16h = vmovl_s8(vget_high_s8(lo));
+            const int16x8_t hi16h = vmovl_s8(vget_high_s8(hi));
+            vst1q_f32(y,      vmulq_f32(dv, vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo16)))));
+            vst1q_f32(y + 4,  vmulq_f32(dv, vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo16)))));
+            vst1q_f32(y + 8,  vmulq_f32(dv, vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo16h)))));
+            vst1q_f32(y + 12, vmulq_f32(dv, vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo16h)))));
+            vst1q_f32(y + 16, vmulq_f32(dv, vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi16)))));
+            vst1q_f32(y + 20, vmulq_f32(dv, vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi16)))));
+            vst1q_f32(y + 24, vmulq_f32(dv, vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi16h)))));
+            vst1q_f32(y + 28, vmulq_f32(dv, vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi16h)))));
+        }
+#else
         for (int j = 0; j < DS4_PLE_IQ4_NL_BLOCK_ELEMS / 2; j += 2) {
             const uint8_t q0 = qs[j], q1 = qs[j + 1];
             y[j]      = d * (float)kv[q0 & 0x0F];
@@ -812,6 +841,7 @@ void ds4_ple_dequant_iq4_nl(const void *__restrict blocks, size_t block_count,
             y[j + 16] = d * (float)ple_kvalues_iq4nl_hi[q0];
             y[j + 17] = d * (float)ple_kvalues_iq4nl_hi[q1];
         }
+#endif
         p += DS4_PLE_IQ4_NL_BLOCK_BYTES;
     }
 }
