@@ -1150,6 +1150,23 @@ static void weights_bind_qwen4exp_ple_table(ds4_qwen4exp_ple_table *ple,
 
     qwen4exp_validate_ple_heads(m, ple->rows, ple);
     qwen4exp_read_ple_hash_constants(m, ple);
+
+    /* The scored leg reads sixteen n-gram rows per token (graph.inc:1302-1328)
+     * and every id is hash-derived, so on a table of this size the accesses are
+     * effectively random: consecutive lookups land nowhere near each other.
+     * Kernel readahead therefore fetches neighbours that the next lookup will
+     * not use, and whatever it pulls in competes for the page cache with the
+     * rows that will be used -- on a box where the resident engine plus this
+     * table already exceed RAM.  Ask for random-access advice so the readahead
+     * stops.  The explicit WILLNEED pass at prepare still faults the table in,
+     * because an explicit advisory outranks this one.  I/O pattern only: same
+     * rows, same bytes, same values. */
+#if defined(POSIX_MADV_RANDOM)
+    if (ple->base && ple->bytes != 0) {
+        (void)posix_madvise((void *)(uintptr_t)ple->base, (size_t)ple->bytes,
+                            POSIX_MADV_RANDOM);
+    }
+#endif
     qwen4exp_plan_charge(plan, DS4_QWEN4EXP_MEM_PLE, t);
     g_ds4_qwen4exp.ple_rows = ple->rows;
 }
