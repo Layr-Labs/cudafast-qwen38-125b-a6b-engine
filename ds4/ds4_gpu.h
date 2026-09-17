@@ -53,6 +53,12 @@ void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
+/* Enqueue the same device-to-host copy without waiting for it.  The copy is
+ * stream-ordered after everything already submitted, so a command batch that
+ * ends in end_commands/synchronize covers it: the caller gets the bytes for
+ * the price of the enqueue instead of a second driver round-trip.  The
+ * destination must stay live until the next device synchronize. */
+int ds4_gpu_tensor_read_async(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
@@ -108,6 +114,11 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
                                              const char *label);
 #endif
 int ds4_gpu_end_commands(void);
+/* Commit the open batch and wait for the device in one call.  On CUDA the
+ * pair `end_commands(); synchronize();` runs cudaDeviceSynchronize twice;
+ * this is the same wait once.  Semantics are the pair's: the device is
+ * quiescent when it returns nonzero. */
+int ds4_gpu_end_commands_sync(void);
 int ds4_gpu_synchronize(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);

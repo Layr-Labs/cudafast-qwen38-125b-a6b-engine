@@ -6073,6 +6073,16 @@ extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset
     return cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes, cudaMemcpyDeviceToHost), "tensor read");
 }
 
+extern "C" int ds4_gpu_tensor_read_async(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
+    if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
+    /* Same ordering contract as the CUDA backend: the copy joins the work
+     * already submitted on the default stream and the caller's synchronize
+     * covers it. */
+    return cuda_ok(cudaMemcpyAsync(data, (const char *)tensor->ptr + offset,
+                                   (size_t)bytes, cudaMemcpyDeviceToHost, 0),
+                   "tensor read async");
+}
+
 extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                      const ds4_gpu_tensor *src, uint64_t src_offset,
                                      uint64_t bytes) {
@@ -6131,6 +6141,9 @@ extern "C" int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const 
 }
 extern "C" int ds4_gpu_end_commands(void) {
     return cuda_ok(cudaDeviceSynchronize(), "end commands");
+}
+extern "C" int ds4_gpu_end_commands_sync(void) {
+    return cuda_ok(cudaDeviceSynchronize(), "end commands sync");
 }
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
 
