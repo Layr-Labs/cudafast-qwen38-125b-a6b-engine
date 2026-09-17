@@ -161,6 +161,30 @@ int ds4_gpu_set_current_device_fenced(int logical_tier) { (void)logical_tier; re
 void ds4_gpu_enable_q8_dequant_gemm(void) {}
 void ds4_gpu_enable_q8_dense_mma(void) {}
 int ds4_gpu_tensor_copy_async(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint64_t bytes) { (void)dst; (void)src; (void)bytes; return 0; }
+/* The PLE row upload is quantized on every backend; where no device kernel
+ * exists the expansion runs on the host through the same dequant the gather
+ * used to call, so the values the block consumes are unchanged. */
+void ds4_ple_dequant_iq4_nl(const void *blocks, size_t block_count, float *out);
+int ds4_gpu_qwen4exp_ple_dequant_iq4nl(ds4_gpu_tensor *dst,
+                                     const ds4_gpu_tensor *src,
+                                     uint64_t n_blocks) {
+    if (!dst || !src) return 0;
+    if (n_blocks == 0) return 1;
+    const uint64_t qbytes = n_blocks * 18u;
+    const uint64_t fbytes = n_blocks * 32u * sizeof(float);
+    if (qbytes > src->bytes || fbytes > dst->bytes) return 0;
+    uint8_t *qbuf = (uint8_t *)malloc((size_t)qbytes);
+    float *fbuf = (float *)malloc((size_t)fbytes);
+    int ok = 0;
+    if (qbuf && fbuf &&
+        ds4_gpu_tensor_read(src, 0, qbuf, qbytes)) {
+        ds4_ple_dequant_iq4_nl(qbuf, (size_t)n_blocks, fbuf);
+        ok = ds4_gpu_tensor_write(dst, 0, fbuf, fbytes);
+    }
+    free(qbuf);
+    free(fbuf);
+    return ok;
+}
 int ds4_gpu_tensor_copy_xdev_default(ds4_gpu_tensor *dst,
                                      const ds4_gpu_tensor *src,
                                      uint64_t bytes) {
