@@ -273,7 +273,7 @@ static bool glm53_cuda_tensor_has(
         tensor->bytes >= elements * elem_size;
 }
 
-__device__ static float dev_f16_to_f32(uint16_t v) {
+__device__ __forceinline__ static float dev_f16_to_f32(uint16_t v) {
     return __half2float(*reinterpret_cast<const __half *>(&v));
 }
 
