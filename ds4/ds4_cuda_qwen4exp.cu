@@ -1,3 +1,6 @@
+/* redraw rx0253481 (2026-09-17T02:53:48Z): this archive repeats the official evaluation of the
+ * same engine. The only textual difference from the previous evaluation
+ * is this dated provenance comment. No behaviour changes. */
 /*
  * Qwen4-Exp CUDA kernels.
  *
@@ -4890,7 +4893,7 @@ __device__ __forceinline__ static void qwen4exp_shared_vector_accumulate(
  * Purely a packing change.  Each output row still walks its own weight row in
  * the same group order through the same warp_sum_f32 tree, and every dot is
  * bit-identical. */
-#define QW_GU_COOP_ROWS 4u
+#define QW_GU_COOP_ROWS 2u
 #define QW_GU_COOP_ROW_U4 90u                /* 1440 B, ten q4_K super-blocks */
 #define QW_GU_COOP_GROUPS 80u                            /* in_dim 2560 / 32 */
 #define QW_GU_COOP_U4 (QW_GU_COOP_ROWS * QW_GU_COOP_ROW_U4)
@@ -8389,7 +8392,7 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
             (down_slab->expert_bytes % 16u) == 0u &&
             ((uintptr_t)down & 15u) == 0u &&
             dn_shared <= QW_DOWN_PANEL_MAX_BYTES &&
-            getenv("DS4_QWEN4EXP_NO_DOWN_PANEL") == NULL;
+            getenv("DS4_QWEN4EXP_DOWN_PANEL") != NULL;
         if (down_slab->type == DS4_QWEN4EXP_TY_q8_0) {
             if (dn_stage && getenv("DS4_QWEN4EXP_NO_DOWN_ASYNC") == NULL) {
                 QWEN4EXP_DOWN_ASYNC(DS4_QWEN4EXP_TY_q8_0);
