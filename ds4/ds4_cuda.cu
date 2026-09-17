@@ -27851,6 +27851,19 @@ __global__ static void moe_down_q4K_tile16_mma_kernel(
     extern __shared__ unsigned char t16_sh[];
     __shared__ uint32_t s_pair[16];
     __shared__ uint32_t s_np;
+    /* One 64-row band of the output tile, staged so it leaves as whole lines.
+     * The MMA layout hands each thread two floats of two different tokens at
+     * output rows `row0 + n0` and `row0 + n0 + 1`, so a warp's store touches
+     * eight tokens at stride two -- eight separate transactions carrying 16
+     * useful bytes each.  Held here first, the band goes out as 64 contiguous
+     * floats per token: one 128-byte line per warp.  4,096 B of static shared
+     * against a dynamic request of at most 16*8*292 = 37,376 B (the launch
+     * gate requires midq_blocks <= 8), so the >48 KB opt-in this kernel asks
+     * for still clears by a wide margin and residency is unchanged -- one
+     * block per SM either way.  Values are the accumulators, moved; there is
+     * no arithmetic here and every address is still written exactly once, so
+     * the result is bit-identical by construction. */
+    __shared__ float dt_band[16u * 64u]; /* [token][row within the 64-row band] */
     if (threadIdx.x == 0) {
         uint32_t np = 0;
         for (; np < 16u; np++) {
@@ -27880,7 +27893,16 @@ __global__ static void moe_down_q4K_tile16_mma_kernel(
     const uint32_t n0 = (lane & 3u) * 2u;
     for (uint32_t rr = 0; rr < ROW_SPAN / 64u; rr++) {
         const uint32_t row0 = blockIdx.x * ROW_SPAN + rr * 64u + warp * 8u;
-        if (row0 >= out_dim) continue;
+        /* This was `if (row0 >= out_dim) continue;`.  The predicate is
+         * warp-uniform but NOT block-uniform -- warp w tests row0 + w*8 -- so a
+         * `continue` here would let some warps reach the band flush's
+         * __syncthreads() below while others skipped past it, which deadlocks.
+         * As a guarded block it is exactly equivalent: the skipped code was the
+         * entire remainder of the iteration.  The block's body is deliberately
+         * NOT re-indented, so this diff is two lines of control flow rather than
+         * eighty lines of whitespace and a reviewer can see that nothing inside
+         * the accumulation changed. */
+        if (row0 < out_dim) {
         const char *wrow = down_base + (uint64_t)expert * down_expert_bytes + (uint64_t)row0 * down_row_bytes;
         float s0[8] = {0,0,0,0,0,0,0,0};
         float s1[8] = {0,0,0,0,0,0,0,0};
@@ -27954,8 +27976,30 @@ __global__ static void moe_down_q4K_tile16_mma_kernel(
             const uint32_t p = (e < 2u) ? mtokA : mtokB;
             const uint32_t row = row0 + n0 + (e & 1u);
             if (p >= np || row >= out_dim) continue;
-            down_out[(uint64_t)s_pair[p] * out_dim + row] = rr4[e];
+            /* (warp, lane, e) -> (token, band row) is a bijection onto the whole
+             * 16x64 band: p covers 0..15 as lane>>2 over the two e halves, and
+             * warp*8 + (lane&3)*2 + (e&1) covers 0..63 over 8 warps.  So no cell
+             * is written twice and the flush below reproduces exactly the set of
+             * addresses this store used to write, under the same two guards. */
+            dt_band[p * 64u + (warp * 8u + n0 + (e & 1u))] = rr4[e];
         }
+        }
+        /* Block-uniform: the guard above is a block, not a continue. */
+        __syncthreads();
+        /* 64 consecutive rows of one token per 64 consecutive threads, so each
+         * warp emits 32 contiguous floats -- one 128-byte line.  The band base
+         * blockIdx.x*ROW_SPAN + rr*64 is a multiple of 64 floats, so the run is
+         * line-aligned whenever the token stride is; nothing depends on it. */
+        for (uint32_t i = threadIdx.x; i < 16u * 64u; i += blockDim.x) {
+            const uint32_t p = i >> 6u;
+            const uint32_t r = i & 63u;
+            if (p >= np) continue;
+            const uint32_t row = blockIdx.x * ROW_SPAN + rr * 64u + r;
+            if (row >= out_dim) continue;
+            down_out[(uint64_t)s_pair[p] * out_dim + row] = dt_band[i];
+        }
+        /* The next band reuses dt_band. */
+        __syncthreads();
     }
 }
 
