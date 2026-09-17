@@ -2,7 +2,6 @@
 //   https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#matrix-multiply-accumulate-operation-using-mma-instruction
 //
 // Like with nvcuda::wmma there are three types of matrix tiles: A, B, and C with A @ B = C.
-// B is a column-major matrix with shape K x N.
 // C is a column-major matrix with shape M x N.
 // A, B, and C are represented using the same fundamental data type: a row-major matrix with I rows and J columns.
 // Note that J is measured in physical 32 bit elements instead of logical elements.
