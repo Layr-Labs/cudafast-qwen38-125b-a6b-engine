@@ -1126,6 +1126,53 @@ extern "C" int ds4_gpu_qwen4exp_update_dpos(
     return cuda_ok(cudaGetLastError(), "qwen4exp position update launch");
 }
 
+/* The n-gram table's on-disk row format, expanded on the device.  One thread
+ * per 18-byte block: an fp16 scale then sixteen bytes whose low and high
+ * nibbles index the same sixteen-entry table the host dequant uses, written
+ * in the same y[j], y[j+1], y[j+16], y[j+17] order.  __half2float and the
+ * fp32 multiply are IEEE-exact, so the output is bit-identical to
+ * ds4_ple_dequant_iq4_nl. */
+__device__ static const int8_t qw_ple_kv_iq4nl[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+};
+
+__global__ static void qwen4exp_ple_dequant_iq4nl_kernel(
+        float *__restrict out, const uint8_t *__restrict in,
+        uint64_t n_blocks) {
+    const uint64_t b = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= n_blocks) return;
+    const uint8_t *p = in + b * 18u;
+    uint16_t half_bits;
+    memcpy(&half_bits, p, sizeof(half_bits));
+    const float d = __half2float(__ushort_as_half(half_bits));
+    const uint8_t *qs = p + 2;
+    float *y = out + b * 32u;
+    for (int j = 0; j < 16; j += 2) {
+        const uint8_t q0 = qs[j], q1 = qs[j + 1];
+        y[j]      = d * (float)qw_ple_kv_iq4nl[q0 & 0x0F];
+        y[j + 1]  = d * (float)qw_ple_kv_iq4nl[q1 & 0x0F];
+        y[j + 16] = d * (float)qw_ple_kv_iq4nl[q0 >> 4];
+        y[j + 17] = d * (float)qw_ple_kv_iq4nl[q1 >> 4];
+    }
+}
+
+extern "C" int ds4_gpu_qwen4exp_ple_dequant_iq4nl(
+        ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint64_t n_blocks) {
+    if (!dst || !dst->ptr || !src || !src->ptr) return 0;
+    if (n_blocks == 0) return 1;
+    if (n_blocks * 18u > src->bytes || n_blocks * 32u * sizeof(float) > dst->bytes)
+        return 0;
+    int d = ds4_tensor_device_idx(dst);
+    int ok = 0;
+    WITH_DEVICE(g_gpu[d].device_id) {
+        qwen4exp_ple_dequant_iq4nl_kernel<<<(unsigned)((n_blocks + 255u) / 256u),
+                                            256, 0, cuda_decode_stream()>>>(
+                (float *)dst->ptr, (const uint8_t *)src->ptr, n_blocks);
+        ok = cuda_ok(cudaGetLastError(), "qwen4exp PLE dequant launch");
+    }
+    return ok;
+}
+
 static cuda_decode_graph_entry *cuda_decode_graph_find(
         const ds4_decode_graph_key *key) {
     if (key->il >= CUDA_DECODE_GRAPH_LAYERS ||
@@ -4059,6 +4106,14 @@ extern "C" int ds4_gpu_end_commands(void) {
         return cuda_ok(cudaStreamSynchronize(0), "end commands stream");
     }
     return cuda_ok(cudaDeviceSynchronize(), "end commands");
+}
+/* The pair end_commands + synchronize is two device synchronises back to
+ * back; the second can only ever observe the first one's quiescence, so one
+ * cudaDeviceSynchronize is the whole contract, with or without
+ * DS4_CUDA_END_STREAM_SYNC (stream-0 copies never waited on the non-blocking
+ * streams either way). */
+extern "C" int ds4_gpu_end_commands_sync(void) {
+    return cuda_ok(cudaDeviceSynchronize(), "end commands sync");
 }
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
 

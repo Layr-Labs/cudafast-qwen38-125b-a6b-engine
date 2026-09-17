@@ -6089,6 +6089,45 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                    "tensor copy enqueue");
 }
 
+/* See ds4_gpu.h.  Same kernel as the CUDA backend: one thread per 18-byte
+ * IQ4_NL block, fp16 scale plus sixteen nibble bytes, same table, same
+ * output order -- bit-identical to ds4_ple_dequant_iq4_nl. */
+__device__ static const int8_t qw_ple_kv_iq4nl[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+};
+
+__global__ static void qwen4exp_ple_dequant_iq4nl_kernel(
+        float *__restrict out, const uint8_t *__restrict in,
+        uint64_t n_blocks) {
+    const uint64_t b = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= n_blocks) return;
+    const uint8_t *p = in + b * 18u;
+    uint16_t half_bits;
+    memcpy(&half_bits, p, sizeof(half_bits));
+    const float d = __half2float(__ushort_as_half(half_bits));
+    const uint8_t *qs = p + 2;
+    float *y = out + b * 32u;
+    for (int j = 0; j < 16; j += 2) {
+        const uint8_t q0 = qs[j], q1 = qs[j + 1];
+        y[j]      = d * (float)qw_ple_kv_iq4nl[q0 & 0x0F];
+        y[j + 1]  = d * (float)qw_ple_kv_iq4nl[q1 & 0x0F];
+        y[j + 16] = d * (float)qw_ple_kv_iq4nl[q0 >> 4];
+        y[j + 17] = d * (float)qw_ple_kv_iq4nl[q1 >> 4];
+    }
+}
+
+extern "C" int ds4_gpu_qwen4exp_ple_dequant_iq4nl(
+        ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint64_t n_blocks) {
+    if (!dst || !dst->ptr || !src || !src->ptr) return 0;
+    if (n_blocks == 0) return 1;
+    if (n_blocks * 18u > src->bytes || n_blocks * 32u * sizeof(float) > dst->bytes)
+        return 0;
+    qwen4exp_ple_dequant_iq4nl_kernel<<<(unsigned)((n_blocks + 255u) / 256u),
+                                        256, 0, (cudaStream_t)0>>>(
+            (float *)dst->ptr, (const uint8_t *)src->ptr, n_blocks);
+    return cuda_ok(cudaGetLastError(), "qwen4exp PLE dequant launch");
+}
+
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
 extern "C" int ds4_gpu_flush_encoder(void) { return ds4_gpu_flush_commands(); }
@@ -6131,6 +6170,9 @@ extern "C" int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const 
 }
 extern "C" int ds4_gpu_end_commands(void) {
     return cuda_ok(cudaDeviceSynchronize(), "end commands");
+}
+extern "C" int ds4_gpu_end_commands_sync(void) {
+    return cuda_ok(cudaDeviceSynchronize(), "end commands sync");
 }
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
 
