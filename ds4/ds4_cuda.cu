@@ -17569,6 +17569,14 @@ int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows) {
  * captures and first-touch costs. A local comparison that does not discard
  * each residency's first run is measuring which arm happened to go first.
  */
+/* This build's note auto09171201_7 records that the gated-deltanet path is
+ * twenty-seven percent of a decode step while moving a constant-size
+ * recurrent state of roughly three megabytes per layer, which at this box's
+ * bandwidth should take about eleven microseconds and takes about three
+ * hundred and ten. It is therefore latency and occupancy bound rather than
+ * bandwidth bound, where the routed expert path beside it runs at about
+ * eighty percent of peak.
+ */
 int ds4_qwen4exp_pdl_enabled(void) {
     static int resolved = 0;
     static int enabled = 0;
