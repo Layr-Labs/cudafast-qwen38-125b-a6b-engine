@@ -3594,9 +3594,36 @@ __device__ __forceinline__ static void dev_qwen4exp_group_decode(
 
 /* The two floating-point operations of the contract, for one group of one
  * row.  Everything above feeds this and nothing else adds to `acc`. */
+/* The routed down projection reads its activation group as two sixteen-byte
+ * vectors (qwen4exp_shared_vector_accumulate); every other consumer of the same
+ * groups reads the same bytes as eight four-byte words.  The groups are
+ * thirty-two byte strides of one scratch allocation, so the wider read is
+ * available at every site.  The dp4a operand order and the integer accumulator
+ * chain are the ones qwen4exp_dp4a<32> already builds, so the result is the
+ * same value; only the number of load instructions differs.  The alignment is
+ * tested rather than assumed, and DS4_QWEN4EXP_NO_VEC_ACC=1 restores the word
+ * reads everywhere in the same binary. */
+__device__ int g_qw_vec_acc_on = 1;
 __device__ __forceinline__ static void qwen4exp_group_accumulate(
         float *acc, const int8_t *wq, const float *wa, const float *wb,
         int halves, const int8_t *xqg, float xscale, int32_t xsum) {
+    if (halves == 1 && g_qw_vec_acc_on &&
+        (((uintptr_t)(const void *)xqg & 15u) == 0u)) {
+        const int4 lo = *(const int4 *)(const void *)xqg;
+        const int4 hi = *(const int4 *)(const void *)(xqg + 16);
+        int32_t dot = 0;
+        dot = __dp4a(qwen4exp_load_i8x4(wq + 0),  lo.x, dot);
+        dot = __dp4a(qwen4exp_load_i8x4(wq + 4),  lo.y, dot);
+        dot = __dp4a(qwen4exp_load_i8x4(wq + 8),  lo.z, dot);
+        dot = __dp4a(qwen4exp_load_i8x4(wq + 12), lo.w, dot);
+        dot = __dp4a(qwen4exp_load_i8x4(wq + 16), hi.x, dot);
+        dot = __dp4a(qwen4exp_load_i8x4(wq + 20), hi.y, dot);
+        dot = __dp4a(qwen4exp_load_i8x4(wq + 24), hi.z, dot);
+        dot = __dp4a(qwen4exp_load_i8x4(wq + 28), hi.w, dot);
+        *acc += (wa[0] * xscale) * (float)dot;
+        *acc += (wb[0] * xscale) * (float)xsum;
+        return;
+    }
     if (halves == 1) {
         const int32_t dot = qwen4exp_dp4a<32>(wq, xqg);
         *acc += (wa[0] * xscale) * (float)dot;
@@ -8944,6 +8971,14 @@ static int qwen4exp_moe_tile(uint32_t n_rows) {
  * router and wants it fused into the grouping launch; `weights_rw` is then the
  * softmax-weight buffer that fused kernel writes.  Both NULL is the shipping
  * path, unchanged. */
+static void qw_vec_acc_valve_init(void) {
+    static int done = 0;
+    if (done) return;
+    done = 1;
+    const int on = getenv("DS4_QWEN4EXP_NO_VEC_ACC") == NULL ? 1 : 0;
+    (void)cudaMemcpyToSymbol(g_qw_vec_acc_on, &on, sizeof(on));
+}
+
 static int qwen4exp_routed_moe_cuda(
         ds4_gpu_tensor              *out,
         ds4_gpu_tensor              *mid,
@@ -8963,6 +8998,7 @@ static int qwen4exp_routed_moe_cuda(
         uint32_t                     mid_token_stride,
         const ds4_gpu_tensor        *logits,
         ds4_gpu_tensor              *weights_rw) {
+    qw_vec_acc_valve_init();
     if (!out || !mid || !gate_slab || !up_slab || !down_slab ||
         !gate_slab->map || !up_slab->map || !down_slab->map ||
         !selected || !weights || !x ||
