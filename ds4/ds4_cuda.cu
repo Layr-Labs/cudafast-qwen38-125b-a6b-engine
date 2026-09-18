@@ -1170,6 +1170,219 @@ extern "C" int ds4_gpu_decode_graph_prefetch(const ds4_decode_graph_key *key) {
     return 0;
 }
 
+/* ------------------------------------------------------------------------
+ * ONE-SHOT GRAPH CAPTURE, for the prefill layer stack.
+ *
+ * WHY IT IS A DIFFERENT ENTRY FROM THE CACHED ONE ABOVE.  A decode island is
+ * replayed 67 times a run, so its graph is built once and kept.  A PREFILL
+ * layer runs EXACTLY ONCE -- every prefill kernel appears once per layer,
+ * counted from the engine's own trace -- so there is nothing to cache and a
+ * cache would be actively wrong: a graph that outlived its prefill would let
+ * a later, TIMED prefill inherit work built in an earlier one, which is the
+ * deferred-seed-work defect docs/participant-contract.md section 5.1.1 exists
+ * to prevent.  These graphs are therefore destroyed inside the window that
+ * built them, and this entry has no key and no table.
+ *
+ * WHAT MAKES IT PAY ANYWAY.  Capture is host-only and replay is GPU-only, so
+ * they PIPELINE: end() launches layer k's graph asynchronously and the host
+ * walks straight into layer k+1's capture while the device is still running
+ * layer k.  Per layer that is ~33 launches of host work -- a fraction of a
+ * millisecond -- against 12-13 ms of GPU time, so the capture is hidden by
+ * construction rather than by estimate.
+ *
+ * THAT IS THE WHOLE INVARIANT, AND IT IS FRAGILE.  Capture does not delete
+ * host work; it moves it from BEHIND the GPU span to IN FRONT of it.  A
+ * capture that is not overlapped by the previous layer's replay is pure added
+ * latency, and the whole-prefill variant of this idea loses for exactly that
+ * reason: one capture of all 1,618 launches has nothing running behind it.
+ * Anything added here must keep end() asynchronous.
+ * ------------------------------------------------------------------------ */
+#define DS4_ONESHOT_GRAPH_MAX 512
+static cudaGraphExec_t g_oneshot_execs[DS4_ONESHOT_GRAPH_MAX];
+static int      g_oneshot_n = 0;
+static int      g_oneshot_capturing = 0;
+static uint64_t g_oneshot_captures = 0;
+static uint64_t g_oneshot_declines = 0;
+
+/* THE INVARIANT PROBE.  This design is worth something only while the host's
+ * capture of layer k+1 is overlapped by the device's replay of layer k.  If
+ * anything ever makes end() synchronous, the host's per-layer time jumps from
+ * a fraction of a millisecond to the layer's whole GPU time and the design has
+ * silently become the whole-prefill one, which LOSES.  This measures exactly
+ * that, with CLOCK_MONOTONIC rather than from a trace, and prints it under
+ * DS4_QWEN4EXP_PF_GRAPH_LOG.  It is the one number that separates the two. */
+static double   g_oneshot_host_ns = 0.0;
+static double   g_oneshot_host_max_ns = 0.0;
+static uint64_t g_oneshot_begin_ns = 0;
+/* THE OTHER END OF THE LIFECYCLE.  Capture was instrumented and held; the cost
+ * then landed on DESTRUCTION, at the one point in a forward where the device
+ * has nothing queued -- 99 cudaGraphExecDestroy at ~15 us each, measured as a
+ * 1.512 ms lengthening of the quantize -> glm_embed_tokens gap at the forward
+ * boundary.  WHEN YOU GUARD A LIFECYCLE, GUARD BOTH ENDS: this is the same
+ * probe, on the destroy side. */
+static double   g_oneshot_destroy_ns = 0.0;
+static uint64_t cuda_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+extern "C" uint64_t ds4_gpu_oneshot_graph_captures(void) { return g_oneshot_captures; }
+
+/* Print and reset the CAPTURE statistics for the forward that just finished.
+ * Deliberately separate from destruction: the two ends of the lifecycle are
+ * now paid at different points and have to be reported at different points. */
+extern "C" void ds4_gpu_oneshot_graph_report(void) {
+    if (g_oneshot_captures == 0) return;
+    if (getenv("DS4_QWEN4EXP_PF_GRAPH_LOG") != NULL && g_oneshot_n > 0) {
+        fprintf(stderr, "ds4: pf graph: %d graphs this forward, host capture "
+                "total %.3f ms, mean %.3f ms, max %.3f ms (declines %llu)\n",
+                g_oneshot_n, g_oneshot_host_ns / 1e6,
+                g_oneshot_host_ns / 1e6 / (double)g_oneshot_n,
+                g_oneshot_host_max_ns / 1e6,
+                (unsigned long long)g_oneshot_declines);
+    }
+    g_oneshot_host_ns = 0.0;
+    g_oneshot_host_max_ns = 0.0;
+}
+
+/* Destroy graphs the caller GUARANTEES have completed, WITHOUT synchronizing.
+ *
+ * The only call site is one full device sync later than the forward that built
+ * them: the next prefill, after its layers 0..3 have been issued eagerly, so
+ * about 51 ms of GPU work is queued and the ~1.5 ms of destruction hides
+ * behind it.  Synchronizing here would be catastrophic rather than merely
+ * wasteful -- it would wait out that queued work -- which is why this entry
+ * exists separately from the syncing one below rather than taking a flag. */
+extern "C" void ds4_gpu_oneshot_graph_retire_settled(void) {
+    if (g_oneshot_n == 0) return;
+    const uint64_t t0 = cuda_now_ns();
+    const int n = g_oneshot_n;
+    for (int i = 0; i < g_oneshot_n; i++) {
+        if (g_oneshot_execs[i]) (void)cudaGraphExecDestroy(g_oneshot_execs[i]);
+        g_oneshot_execs[i] = NULL;
+    }
+    g_oneshot_n = 0;
+    (void)cudaGetLastError();
+    g_oneshot_destroy_ns = (double)(cuda_now_ns() - t0);
+    if (getenv("DS4_QWEN4EXP_PF_GRAPH_LOG") != NULL) {
+        fprintf(stderr, "ds4: pf graph: destroyed %d graphs in %.3f ms, "
+                "behind queued layer 0-3 work\n", n, g_oneshot_destroy_ns / 1e6);
+    }
+}
+
+/* Destroy every graph still parked, synchronizing first.  For the error path
+ * and for teardown, where nothing guarantees completion. */
+extern "C" void ds4_gpu_oneshot_graph_retire(void) {
+    if (g_oneshot_n == 0) return;
+    if (getenv("DS4_QWEN4EXP_PF_GRAPH_LOG") != NULL) {
+        /* HOST time spent capturing, against the GPU time it must hide behind
+         * (a prefill layer is 12-13 ms).  A mean well under a millisecond means
+         * the capture is pipelined; anything near the layer time means it is
+         * not, and the design has inverted into the one that loses. */
+        fprintf(stderr, "ds4: pf graph: %d graphs this forward, host capture "
+                "total %.3f ms, mean %.3f ms, max %.3f ms (declines %llu)\n",
+                g_oneshot_n, g_oneshot_host_ns / 1e6,
+                g_oneshot_host_ns / 1e6 / (double)g_oneshot_n,
+                g_oneshot_host_max_ns / 1e6,
+                (unsigned long long)g_oneshot_declines);
+    }
+    g_oneshot_host_ns = 0.0;
+    g_oneshot_host_max_ns = 0.0;
+    if (g_decode_graph_stream) (void)cudaStreamSynchronize(g_decode_graph_stream);
+    (void)cudaDeviceSynchronize();
+    for (int i = 0; i < g_oneshot_n; i++) {
+        if (g_oneshot_execs[i]) (void)cudaGraphExecDestroy(g_oneshot_execs[i]);
+        g_oneshot_execs[i] = NULL;
+    }
+    g_oneshot_n = 0;
+    (void)cudaGetLastError();
+}
+
+/* 0 = capturing, caller must encode and then call end(); -1 = declined, the
+ * caller encodes eagerly exactly as before. */
+extern "C" int ds4_gpu_oneshot_graph_begin(void) {
+    if (!ds4_gpu_decode_graphs_supported()) return -1;
+    if (g_decode_graph_capturing || g_oneshot_capturing) return -1;  /* no nesting */
+    if (g_oneshot_n >= DS4_ONESHOT_GRAPH_MAX) { g_oneshot_declines++; return -1; }
+    if (!g_decode_graph_stream) {
+        /* BLOCKING stream on purpose: it synchronizes with the legacy NULL
+         * stream the eager prologue and epilogue ride, which is what orders
+         * the captured layer stack against them without an explicit event. */
+        if (!cuda_ok(cudaStreamCreate(&g_decode_graph_stream),
+                     "one-shot graph stream create")) {
+            g_decode_graph_stream = NULL;
+            return -1;
+        }
+    }
+    (void)cublasSetStream(cuda_cublas_for_tier(0), g_decode_graph_stream);
+    if (cudaStreamBeginCapture(g_decode_graph_stream,
+                               cudaStreamCaptureModeGlobal) != cudaSuccess) {
+        (void)cudaGetLastError();
+        (void)cublasSetStream(cuda_cublas_for_tier(0), NULL);
+        g_oneshot_declines++;
+        return -1;
+    }
+    g_decode_graph_capturing = 1;   /* routes cuda_decode_stream() at every launch */
+    g_oneshot_capturing = 1;
+    g_oneshot_begin_ns = cuda_now_ns();
+    return 0;
+}
+
+/* Abandon a capture whose encode failed.  Nothing was executed. */
+extern "C" void ds4_gpu_oneshot_graph_abort(void) {
+    if (!g_oneshot_capturing) return;
+    g_decode_graph_capturing = 0;
+    g_oneshot_capturing = 0;
+    cudaGraph_t graph = NULL;
+    (void)cudaStreamEndCapture(g_decode_graph_stream, &graph);
+    if (graph) (void)cudaGraphDestroy(graph);
+    (void)cublasSetStream(cuda_cublas_for_tier(0), NULL);
+    (void)cudaGetLastError();
+    g_oneshot_declines++;
+}
+
+/* 0 = the layer is launched and in flight; -1 = nothing ran, encode eagerly. */
+extern "C" int ds4_gpu_oneshot_graph_end(void) {
+    if (!g_oneshot_capturing) return -1;
+    g_decode_graph_capturing = 0;
+    g_oneshot_capturing = 0;
+    cudaGraph_t graph = NULL;
+    cudaError_t err = cudaStreamEndCapture(g_decode_graph_stream, &graph);
+    (void)cublasSetStream(cuda_cublas_for_tier(0), NULL);
+    if (err != cudaSuccess || graph == NULL) {
+        (void)cudaGetLastError();
+        if (graph) (void)cudaGraphDestroy(graph);
+        g_oneshot_declines++;
+        return -1;
+    }
+    cudaGraphExec_t exec = NULL;
+    err = cudaGraphInstantiate(&exec, graph, NULL, NULL, 0);
+    (void)cudaGraphDestroy(graph);
+    if (err != cudaSuccess || exec == NULL) {
+        (void)cudaGetLastError();
+        g_oneshot_declines++;
+        return -1;
+    }
+    /* ASYNCHRONOUS ON PURPOSE.  The host returns here while the device runs
+     * this layer, and captures the next one behind it.  See the invariant. */
+    err = cudaGraphLaunch(exec, g_decode_graph_stream);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        (void)cudaGraphExecDestroy(exec);
+        g_oneshot_declines++;
+        return -1;
+    }
+    g_oneshot_execs[g_oneshot_n++] = exec;
+    g_oneshot_captures++;
+    {
+        const double dt = (double)(cuda_now_ns() - g_oneshot_begin_ns);
+        g_oneshot_host_ns += dt;
+        if (dt > g_oneshot_host_max_ns) g_oneshot_host_max_ns = dt;
+    }
+    return 0;
+}
+
 extern "C" int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) {
     if (!key || !ds4_gpu_decode_graphs_supported()) return -1;
     if (g_decode_graph_capturing) return -1;   /* no nesting */
