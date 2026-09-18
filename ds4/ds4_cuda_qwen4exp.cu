@@ -493,6 +493,14 @@ __device__ __forceinline__ static float qwen4exp_gdn_softplus(float x) {
  * standard error of one and two tenths: neutral. Widening the grid is not
  * what this path needs.
  */
+/* This build's note auto09181957_69 records that asynchronous copy buys
+ * prefetch depth at no register cost, so it pays exactly where memory level
+ * parallelism is capped by the register budget and costs where occupancy
+ * already hides the latency. The same technique measured minus fourteen
+ * percent at a thirty-two register site with six blocks per multiprocessor
+ * and plus fifty-five percent at a two hundred and fifty-five register site
+ * with one.
+ */
 __global__ static void qwen4exp_gdn_conv_kernel(
         float       *qkv,
         float       *conv_state,
@@ -6075,14 +6083,72 @@ __device__ __forceinline__ static void qwen4exp_shared_vector_accumulate(
  * uint4 and a super-block is 9 of them: one 16-byte header (d, dmin, twelve
  * scale bytes) then four 32-byte payload slices, and group g takes slice
  * (g % 8) >> 1 of super-block g / 8 -- the address qw_raw_load computes. */
-__device__ __forceinline__ static void qw_gu_coop_raw_load(
+/* PANEL GEOMETRY PER WEIGHT TYPE, in uint4, at the tower's in_dim 2560.
+ *
+ * The panel is sized from the type's OWN shipped row and is filled with that
+ * row's bytes at that row's stride: q4_K ten 144-byte super-blocks (1440 B),
+ * q5_K ten 176-byte super-blocks (1760 B), q8_0 eighty 34-byte blocks
+ * (2720 B).  Nothing is re-quantised, re-represented, re-strided or permuted
+ * on the way in -- contract 3.4 forbids that in memory as well as on disk --
+ * so the staged image is byte-for-byte the span the block's own warps would
+ * otherwise have read individually.
+ *
+ * `stage_raw` says whether the 32-byte payload slice of a group can be handed
+ * to the decoder as pre-loaded words.  A q4_K or q5_K group's payload is a
+ * 32-byte slice at a 16-byte-aligned offset inside its super-block, so it can.
+ * A q8_0 group IS its 34-byte block, whose payload sits two bytes past a word
+ * boundary for every other group, so nothing is staged and the decoder reads
+ * the panel directly -- which is exactly what qw_raw_load already refuses to
+ * do for q8_0 on the slab, and what the routed DOWN panel has always done. */
+template <int Type> struct qw_gu_panel {
+    static const unsigned row_u4 = 0u;
+    static const unsigned sb_u4 = 0u;
+    static const unsigned payload_u4 = 0u;
+    static const bool stage_raw = false;
+};
+template <> struct qw_gu_panel<DS4_QWEN4EXP_TY_q4_K> {
+    static const unsigned row_u4 = QW_GU_COOP_ROW_U4;  /* 1440 B */
+    static const unsigned sb_u4 = 9u;                  /*  144 B super-block */
+    static const unsigned payload_u4 = 1u;             /* after the 16 B head */
+    static const bool stage_raw = true;
+};
+template <> struct qw_gu_panel<DS4_QWEN4EXP_TY_q5_K> {
+    static const unsigned row_u4 = 110u;               /* 1760 B */
+    static const unsigned sb_u4 = 11u;                 /*  176 B super-block */
+    static const unsigned payload_u4 = 3u;             /* 16 B head + 32 B qh */
+    static const bool stage_raw = true;
+};
+template <> struct qw_gu_panel<DS4_QWEN4EXP_TY_q8_0> {
+    static const unsigned row_u4 = 170u;               /* 2720 B, 80 x 34 B */
+    static const unsigned sb_u4 = 0u;
+    static const unsigned payload_u4 = 0u;
+    static const bool stage_raw = false;
+};
+
+/* The eight payload words the decoder wants for (row, group), read out of the
+ * staged copy of the identical row bytes.  Returns false for a type whose
+ * payload cannot be addressed as an aligned 32-byte window, in which case the
+ * caller passes NULL and the decoder reads the panel itself -- the same
+ * `rawp = ... ? raw : NULL` contract qw_raw_load has on the slab.
+ *
+ * q4_K: super-block 9 uint4, one 16-byte header then four 32-byte slices, and
+ * group g takes slice (g % 8) >> 1 of super-block g / 8.  q5_K is the same
+ * shape with a 176-byte super-block whose header is followed by 32 bytes of
+ * high-bit plane, so the payload starts one slice later: 11 and 3 rather than
+ * 9 and 1.  Both are the address qw_raw_load computes on the slab. */
+template <int Type>
+__device__ __forceinline__ static bool qw_gu_coop_raw_load(
         const uint4 *sh, uint32_t wrow, uint32_t g, uint32_t *w) {
-    const uint32_t b = wrow * QW_GU_COOP_ROW_U4 + (g >> 3) * 9u + 1u
+    if (!qw_gu_panel<Type>::stage_raw) return false;
+    const uint32_t b = wrow * qw_gu_panel<Type>::row_u4
+                     + (g >> 3) * qw_gu_panel<Type>::sb_u4
+                     + qw_gu_panel<Type>::payload_u4
                      + ((g & 7u) >> 1) * 2u;
     const uint4 lo = sh[b];
     const uint4 hi = sh[b + 1u];
     w[0] = lo.x; w[1] = lo.y; w[2] = lo.z; w[3] = lo.w;
     w[4] = hi.x; w[5] = hi.y; w[6] = hi.z; w[7] = hi.w;
+    return true;
 }
 /* ======================================================================== */
 
@@ -6107,8 +6173,44 @@ __device__ __forceinline__ static void qw_gu_coop_raw_load(
  * the decode leg is then the answer.  gu[occ]=3 => 32 is unreachable and 40 is
  * the measured floor, at which point gate/up occupancy is CLOSED for a real
  * reason rather than a mis-read one. */
+/* PER-INSTANTIATION, not per-template.  __maxnreg__ takes a constant
+ * EXPRESSION, and a template parameter is constant inside the template, so the
+ * three instantiations can carry three different caps out of one spelling.
+ * Verified on this toolchain with a register-hungry probe: <12> came back at
+ * the 24 it was capped to, <13> at 40 and <8> at 63 under a cap of 64, each
+ * with its own spill state.  The q4_K arms keep 32 -- the expression is 32 for
+ * Type 12 -- so nothing about the shipped kernel moves, and the TU census
+ * confirms it: 217 -> 219 entry functions, zero shared kernels changed.
+ *
+ * WHY THE NEW ARMS ARE NOT CAPPED AT 32.  32 was chosen to buy a FOURTH block
+ * against an 11,584-byte q4_K panel, where registers were the binding
+ * constraint.  They are not binding for the wider panels:
+ *
+ *   q5_K panel 14,144 B -> 101,376/14,144 = 7 blocks on shared, 1536/256 = 6
+ *                          on threads.  6 blocks needs <= 65,536/(6*256) = 42
+ *                          registers, so 40 is the largest allocation that
+ *                          keeps the q4_K arm's own residency.
+ *   q8_0 panel 21,824 B -> 101,376/21,824 = 4 blocks on SHARED MEMORY, whatever
+ *                          the registers do.  4 blocks needs <= 64, so 64 is
+ *                          free: the cap below it buys nothing and only pays
+ *                          spills.
+ *
+ * At 32 both new arms spilled (q5_K 40 B of stack, 72/80 B of spill traffic;
+ * q8_0 16 B and 24/32) in the innermost loop of a kernel that is already at the
+ * memory wall.  The readout stands unchanged and is measured, not computed:
+ * the probe reports gu5[lmem]/gu8[lmem] and gu5[occ]/gu8[occ] from
+ * cudaFuncGetAttributes and cudaOccupancyMaxActiveBlocksPerMultiprocessor. */
+#ifndef QW_GU_NREG_Q5K
+#define QW_GU_NREG_Q5K 40
+#endif
+#ifndef QW_GU_NREG_Q80
+#define QW_GU_NREG_Q80 64
+#endif
+#define QW_GU_NREG_FOR(T)                                                     \
+    ((T) == (int)DS4_QWEN4EXP_TY_q8_0 ? QW_GU_NREG_Q80 :                      \
+     (T) == (int)DS4_QWEN4EXP_TY_q5_K ? QW_GU_NREG_Q5K : 32)
 #if defined(__CUDACC__) && CUDART_VERSION >= 12040
-#define QW_GU_MAXNREG __maxnreg__(32)
+#define QW_GU_MAXNREG __maxnreg__(QW_GU_NREG_FOR(Type))
 #else
 #define QW_GU_MAXNREG
 #endif
@@ -6261,7 +6363,13 @@ qwen4exp_moe_gateup_split_kernel(
     /* The staged panel.  Both early returns above are uniform over the block
      * (blockIdx.y, the active list and counts[expert] are block-invariant), so
      * every thread that reaches the barrier below reaches it together. */
-    __shared__ __align__(16) uint4 wcoop[Coop ? 2u * QW_GU_COOP_U4 : 1u];
+    /* The panel is sized from the instantiated type's own row, so the same
+     * body serves q4_K (11,520 B at four rows), q5_K (14,080 B) and q8_0
+     * (21,760 B).  For the q4_K instantiation OutputRows * row_u4 is
+     * QW_GU_COOP_ROWS * QW_GU_COOP_ROW_U4, the constant this used to spell. */
+    const uint32_t PanelU4 = (uint32_t)OutputRows * qw_gu_panel<Type>::row_u4;
+    __shared__ __align__(16) uint4 wcoop[
+        Coop ? 2u * OutputRows * qw_gu_panel<Type>::row_u4 : 1u];
     const uint4 *wsh = NULL;
     uint32_t wrow = 0u;
     if (Coop) {
@@ -6270,12 +6378,12 @@ qwen4exp_moe_gateup_split_kernel(
          * refuses every other shape; this is the belt to that brace, and it is
          * uniform over the block, outside the group loop, and free. */
         if (groups != QW_GU_COOP_GROUPS ||
-            gate_row_bytes != (uint64_t)QW_GU_COOP_ROW_U4 * 16u ||
-            up_row_bytes != (uint64_t)QW_GU_COOP_ROW_U4 * 16u) return;
+            gate_row_bytes != (uint64_t)qw_gu_panel<Type>::row_u4 * 16u ||
+            up_row_bytes != (uint64_t)qw_gu_panel<Type>::row_u4 * 16u) return;
         const uint32_t row0 = blockIdx.x * OutputRows;
         const uint32_t left = mid_dim > row0 ? mid_dim - row0 : 0u;
         const uint32_t rows_here = left < OutputRows ? left : OutputRows;
-        const uint32_t words = rows_here * QW_GU_COOP_ROW_U4;
+        const uint32_t words = rows_here * qw_gu_panel<Type>::row_u4;
         const char *const gb = gate +
             (uint64_t)expert * gate_expert_bytes +
             (uint64_t)row0 * gate_row_bytes;
@@ -6284,11 +6392,11 @@ qwen4exp_moe_gateup_split_kernel(
             (uint64_t)row0 * up_row_bytes;
         for (uint32_t i = threadIdx.x; i < words; i += blockDim.x) {
             wcoop[i] = *(const uint4 *)(const void *)(gb + (uint64_t)i * 16u);
-            wcoop[QW_GU_COOP_U4 + i] =
+            wcoop[PanelU4 + i] =
                 *(const uint4 *)(const void *)(ub + (uint64_t)i * 16u);
         }
         __syncthreads();
-        wsh = wcoop + (second ? QW_GU_COOP_U4 : 0u);
+        wsh = wcoop + (second ? PanelU4 : 0u);
         wrow = warp >> 1u;
     }
     for (int32_t at = 0; at < cnt; at += R) {
@@ -6327,7 +6435,7 @@ qwen4exp_moe_gateup_split_kernel(
                 if (Coop) \
                     dev_qwen4exp_group_decode_w((uint32_t)Type, \
                         (const char *)(const void *) \
-                            &wsh[wrow * QW_GU_COOP_ROW_U4], g_, \
+                            &wsh[wrow * qw_gu_panel<Type>::row_u4], g_, \
                         (RAWP), wq, wa, wb); \
                 else \
                     dev_qwen4exp_group_decode_w((uint32_t)Type, weight_row, g_, \
@@ -6352,9 +6460,10 @@ qwen4exp_moe_gateup_split_kernel(
                 uint32_t raw1[8];
                 const uint32_t *p0, *p1;
                 if (Coop) {
-                    qw_gu_coop_raw_load(wsh, wrow, g, raw0);
-                    qw_gu_coop_raw_load(wsh, wrow, g + 32u, raw1);
-                    p0 = raw0; p1 = raw1;
+                    p0 = qw_gu_coop_raw_load<Type>(wsh, wrow, g, raw0)
+                       ? raw0 : NULL;
+                    p1 = qw_gu_coop_raw_load<Type>(wsh, wrow, g + 32u, raw1)
+                       ? raw1 : NULL;
                 } else {
                     p0 = qw_raw_load((uint32_t)Type, weight_row, g, raw0)
                        ? raw0 : NULL;
@@ -6368,8 +6477,8 @@ qwen4exp_moe_gateup_split_kernel(
                 uint32_t raw[8];
                 const uint32_t *rawp;
                 if (Coop) {
-                    qw_gu_coop_raw_load(wsh, wrow, g, raw);
-                    rawp = raw;
+                    rawp = qw_gu_coop_raw_load<Type>(wsh, wrow, g, raw)
+                         ? raw : NULL;
                 } else {
                     rawp = qw_raw_load((uint32_t)Type, weight_row, g, raw)
                          ? raw : NULL;
@@ -9082,6 +9191,42 @@ static int qwen4exp_moe_tile(uint32_t n_rows) {
     return 8;
 }
 
+/* The host side of qw_gu_panel: the row the cooperative panel is sized for,
+ * and the per-type valves.  Read once per call, like every other valve in
+ * this launcher. */
+static uint64_t qw_gu_panel_row_bytes(uint32_t type) {
+    switch (type) {
+    case (uint32_t)DS4_QWEN4EXP_TY_q4_K: return (uint64_t)QW_GU_COOP_ROW_U4 * 16ull;
+    case (uint32_t)DS4_QWEN4EXP_TY_q5_K: return 110ull * 16ull;
+    case (uint32_t)DS4_QWEN4EXP_TY_q8_0: return 170ull * 16ull;
+    default: return 0ull;
+    }
+}
+static int qw_gu_coop_env_on(void) {
+    const char *e = getenv("DS4_GATEUP_COOP");
+    return e == NULL || e[0] != '0';
+}
+/* A one-shot positive control.  DS4_QWEN4EXP_PANEL_DEBUG=1 prints the first
+ * time each type takes the panel arm, so "the arm is selected" is observed in
+ * the engine's own log rather than inferred from a timing difference. */
+static void qw_gu_panel_taken(uint32_t type, uint32_t n_tokens, uint32_t rows) {
+    static int shown[2];
+    const int i = type == (uint32_t)DS4_QWEN4EXP_TY_q5_K ? 0 : 1;
+    if (shown[i]) return;
+    if (getenv("DS4_QWEN4EXP_PANEL_DEBUG") == NULL) return;
+    shown[i] = 1;
+    fprintf(stderr, "ds4: gate/up cooperative panel TAKEN for type %u "
+                    "(n_tokens=%u expert rows=%u)\n", type, n_tokens, rows);
+}
+static int qw_gu_panel_type_on(uint32_t type) {
+    const char *e = NULL;
+    if (type == (uint32_t)DS4_QWEN4EXP_TY_q5_K)
+        e = getenv("DS4_QWEN4EXP_SPLIT_GATEUP_Q5K");
+    else if (type == (uint32_t)DS4_QWEN4EXP_TY_q8_0)
+        e = getenv("DS4_QWEN4EXP_SPLIT_GATEUP_Q80");
+    return e == NULL || e[0] != '0';
+}
+
 /* The routed MoE body.  `logits` non-NULL means the caller has NOT run the
  * router and wants it fused into the grouping launch; `weights_rw` is then the
  * softmax-weight buffer that fused kernel writes.  Both NULL is the shipping
@@ -9584,6 +9729,67 @@ static int qwen4exp_routed_moe_cuda(
         else if (vector) { QWEN4EXP_SPLIT_GATEUP(true, 1u, false); }
         else { QWEN4EXP_SPLIT_GATEUP(false, 4u, false); }
 #undef QWEN4EXP_SPLIT_GATEUP
+    }
+    /* ---- THE SAME COOPERATIVE PANEL FOR THE TWO LAYERS THAT ARE NOT q4_K ----
+     *
+     * The arm above is selected only when BOTH slabs are q4_K, and the panel
+     * above it was sized for a q4_K row, so exactly two of the forty-nine
+     * routed gate/up calls in a decode round have always fallen through to the
+     * generic per-group kernel: blk.2, whose ffn_gate_exps/ffn_up_exps are the
+     * artifact's ONLY Q5_K tensors, and blk.48, the MTP head, whose experts are
+     * Q8_0.  At the same shape the generic kernel costs about twice what the
+     * panel kernel costs, and the excess over the DRAM floor is several
+     * milliseconds of a ranked run.
+     *
+     * Nothing about the arithmetic changes.  The panel is a verbatim byte image
+     * of the same rows at the same stride (contract 3.4), the decoder is called
+     * with the same (type, g) at the same offset inside it, lane l still owns
+     * groups l, l+32, l+64 in that order, and the fold is the same
+     * warp_sum_f32 tree, so every emitted float is the generic kernel's.
+     *
+     * Per-type valves, so ONE binary carries both arms and an A/B is two runs
+     * of one build:
+     *   DS4_QWEN4EXP_SPLIT_GATEUP_Q5K=0   blk.2 back on the generic kernel
+     *   DS4_QWEN4EXP_SPLIT_GATEUP_Q80=0   the head back on the generic kernel
+     * DS4_QWEN4EXP_NO_SPLIT_GATEUP and DS4_GATEUP_COOP=0 stand all three down
+     * exactly as they already do for q4_K. */
+    else if ((n_tokens <= 2u || wide_verify) && tile == 2 && specialize &&
+             (DS4_GATEUP_COOP_BUILD != 0) &&
+             gate_slab->type == up_slab->type &&
+             (gate_slab->type == (uint32_t)DS4_QWEN4EXP_TY_q5_K ||
+              gate_slab->type == (uint32_t)DS4_QWEN4EXP_TY_q8_0) &&
+             getenv("DS4_QWEN4EXP_NO_SPLIT_GATEUP") == NULL &&
+             qw_gu_panel_type_on(gate_slab->type) &&
+             ((uintptr_t)sc.xq & 15u) == 0u &&
+             getenv("DS4_QWEN4EXP_NO_SPLIT_VECTOR") == NULL &&
+             qw_gu_coop_env_on() &&
+             xgroups == QW_GU_COOP_GROUPS &&
+             gate_slab->row_bytes == qw_gu_panel_row_bytes(gate_slab->type) &&
+             up_slab->row_bytes == qw_gu_panel_row_bytes(up_slab->type) &&
+             ((uintptr_t)gate & 15u) == 0u && ((uintptr_t)up & 15u) == 0u &&
+             (gate_slab->expert_bytes & 15ull) == 0ull &&
+             (up_slab->expert_bytes & 15ull) == 0ull) {
+#define QWEN4EXP_SPLIT_PANEL(T) \
+        QWEN4EXP_LAUNCH_PDL( \
+            (qwen4exp_moe_gateup_split_kernel<2, T, true, QW_GU_COOP_ROWS, \
+                                              true>), \
+            (dim3((mid_dim + QW_GU_COOP_ROWS - 1u) / QW_GU_COOP_ROWS, \
+                  gu_rows, 1)), \
+            QW_GU_COOP_ROWS * 64u, 0, stream, \
+            (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum, \
+            sc.pairs, sc.counts, sc.offsets, gu_active, \
+            (const float *)weights->ptr, \
+            gate_slab->expert_bytes, gate_slab->row_bytes, \
+            up_slab->expert_bytes, up_slab->row_bytes, \
+            gate_slab->type, up_slab->type, xgroups, mid_dim, \
+            mid_token_stride, n_expert_used)
+        qw_gu_panel_taken(gate_slab->type, n_tokens, gu_rows);
+        if (gate_slab->type == (uint32_t)DS4_QWEN4EXP_TY_q5_K) {
+            QWEN4EXP_SPLIT_PANEL(DS4_QWEN4EXP_TY_q5_K);
+        } else {
+            QWEN4EXP_SPLIT_PANEL(DS4_QWEN4EXP_TY_q8_0);
+        }
+#undef QWEN4EXP_SPLIT_PANEL
     }
     else if (tile == 8) { QWEN4EXP_GATEUP(8); }
     else if (tile == 4) { QWEN4EXP_GATEUP(4); }
@@ -16325,7 +16531,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_tensor(
  * swallowed and reported as -1; the function never touches device state and is
  * called once, off the timed path. */
 extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
-    static char buf[384];
+    static char buf[640];
     static int built = 0;
     if (built) return buf;
     built = 1;
@@ -16333,6 +16539,11 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
 
     int gu_regs = -1, gu_smem = -1, gu_lmem = -1, gu_maxt = -1;
     int gu_occ = -1, dn_occ = -1;
+    /* The two panel instantiations this build adds, read the same way: the
+     * q8_0 panel is 21,760 B of STATIC shared against the q4_K panel's 11,520,
+     * so occupancy is asked for rather than computed. */
+    int g5_regs = -1, g5_smem = -1, g5_lmem = -1, g5_occ = -1;
+    int g8_regs = -1, g8_smem = -1, g8_lmem = -1, g8_occ = -1;
     int dn_regs = -1, dn_smem = -1, dn_lmem = -1, dn_maxt = -1;
     /* The two PREFILL tile kernels, read here for the first time. */
     int mg_regs = -1, mg_smem = -1, mg_lmem = -1, mg_occ = -1;
@@ -16353,6 +16564,23 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
     } else {
         (void)cudaGetLastError();
     }
+
+    if (cudaFuncGetAttributes(
+            &a,
+            qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q5_K, true,
+                                             QW_GU_COOP_ROWS, true>) ==
+        cudaSuccess) {
+        g5_regs = a.numRegs; g5_smem = (int)a.sharedSizeBytes;
+        g5_lmem = (int)a.localSizeBytes;
+    } else { (void)cudaGetLastError(); }
+    if (cudaFuncGetAttributes(
+            &a,
+            qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q8_0, true,
+                                             QW_GU_COOP_ROWS, true>) ==
+        cudaSuccess) {
+        g8_regs = a.numRegs; g8_smem = (int)a.sharedSizeBytes;
+        g8_lmem = (int)a.localSizeBytes;
+    } else { (void)cudaGetLastError(); }
 
     if (cudaFuncGetAttributes(
             &a,
@@ -16417,6 +16645,20 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
     } else {
         (void)cudaGetLastError();
     }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ,
+            qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q5_K, true,
+                                             QW_GU_COOP_ROWS, true>,
+            (int)(QW_GU_COOP_ROWS * 64u), 0) == cudaSuccess) {
+        g5_occ = occ;
+    } else { (void)cudaGetLastError(); }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ,
+            qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q8_0, true,
+                                             QW_GU_COOP_ROWS, true>,
+            (int)(QW_GU_COOP_ROWS * 64u), 0) == cudaSuccess) {
+        g8_occ = occ;
+    } else { (void)cudaGetLastError(); }
 
     /* ---- THE PREFILL TILE KERNELS, read here for the first time ----
      * Everything above, and every arm this line of work has submitted, is a
@@ -16498,12 +16740,16 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
              "gu[reg=%d smem=%d lmem=%d maxt=%d occ=%d] dn[reg=%d smem=%d "
              "lmem=%d maxt=%d occ=%d] gdn[reg=%d lmem=%d] "
              "mm[reg=%d smem=%d lmem=%d occ=%d] "
-             "md[reg=%d smem=%d lmem=%d occ=%d]",
+             "md[reg=%d smem=%d lmem=%d occ=%d] "
+             "gu5[reg=%d smem=%d lmem=%d occ=%d] "
+             "gu8[reg=%d smem=%d lmem=%d occ=%d]",
              gu_regs, gu_smem, gu_lmem, gu_maxt, gu_occ,
              dn_regs, dn_smem, dn_lmem, dn_maxt, dn_occ,
              gd_regs, gd_lmem,
              mg_regs, mg_smem, mg_lmem, mg_occ,
-             md_regs, md_smem, md_lmem, md_occ);
+             md_regs, md_smem, md_lmem, md_occ,
+             g5_regs, g5_smem, g5_lmem, g5_occ,
+             g8_regs, g8_smem, g8_lmem, g8_occ);
     return buf;
 }
 
