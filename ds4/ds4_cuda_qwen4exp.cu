@@ -15684,12 +15684,68 @@ extern "C" uint64_t ds4_gpu_qwen4exp_qsa_split_scratch_bytes(
     return ds4_qwen4exp_qsa_split_bytes(n_tokens, n_head, head_dim, max_count);
 }
 
+/* The two shared-memory requests the split path makes at a given width, and
+ * whether both clear QWEN4EXP_QSA_GROUP_SHARED_CAP.  ONE copy of this
+ * arithmetic, called by the launcher below -- which is where it used to live
+ * inline -- and by the one-wave rule, which must not propose a width the
+ * launcher would then refuse.  A refusal there is `return 0`, i.e. the caller
+ * silently falls back to the per-head kernel for the whole call; correct, but a
+ * width policy that can switch off the path it is tuning is not a tuning
+ * change.  Deriving nth from head_dim with the launcher's own
+ * qwen4exp_cuda_threads() keeps the two callers exactly in step. */
+static int qwen4exp_qsa_split_shared_fits(uint32_t g, uint32_t head_dim,
+                                          size_t *sc_out, size_t *pr_out) {
+    const uint32_t nth = qwen4exp_cuda_threads(head_dim);
+    const size_t sc_shared = ((size_t)g * head_dim +
+                              (((size_t)g * (nth >> 5u) + 3u) & ~(size_t)3u) +
+                              (size_t)nth * QWEN4EXP_QSA_SPLIT_KPITCH) *
+                             sizeof(float);
+    const size_t pr_shared = (size_t)2u * g * nth * sizeof(float) +
+                             (size_t)nth * sizeof(int32_t);
+    if (sc_out) *sc_out = sc_shared;
+    if (pr_out) *pr_out = pr_shared;
+    return (sc_shared <= QWEN4EXP_QSA_GROUP_SHARED_CAP &&
+            pr_shared <= QWEN4EXP_QSA_GROUP_SHARED_CAP) ? 1 : 0;
+}
+
+/* The SM count, queried once.  The one-wave rule in the width policy below
+ * needs it, and 0 means the query did not answer, in which case that rule is
+ * skipped and the measured constants stand.  Cached like
+ * ds4_qwen4exp_hc_staged_off() so a decode row pays for it at most once over
+ * the whole run, and a failure is consumed HERE rather than surviving to the
+ * cudaGetLastError() the split launcher reads at its tail -- the error is only
+ * cleared on the branch where this function's own call is the one that set it,
+ * so a real launch failure from earlier still reaches that check.
+ *
+ * Capture-safe: a device attribute query is not a stream-ordered operation, the
+ * tree already issues one from a launch path in ds4_cuda.cu, and the value is
+ * constant for the process, so a graph captured against it stays valid. */
+static uint32_t qwen4exp_qsa_wave_sms(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        int dev = 0, n = 0;
+        cached = 0;
+        if (cudaGetDevice(&dev) == cudaSuccess) {
+            if (cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount,
+                                       dev) == cudaSuccess && n > 0) {
+                cached = n;
+            } else {
+                (void)cudaGetLastError();
+            }
+        } else {
+            (void)cudaGetLastError();
+        }
+    }
+    return (uint32_t)cached;
+}
+
 /* Group width for the split path: DS4_QWEN4EXP_NO_QSA_SPLIT turns the path
  * off, DS4_QWEN4EXP_QSA_SPLIT_GROUP sets the width.  Read fresh for the same
  * reason qwen4exp_qsa_group_width is; a decode row pays one getenv per layer
  * and a captured one pays it once at capture. */
 static uint32_t qwen4exp_qsa_split_width(uint32_t n_tokens, uint32_t n_head,
-                                         uint32_t n_kv_head, uint32_t head_dim) {
+                                         uint32_t n_kv_head, uint32_t head_dim,
+                                         uint32_t max_tiles) {
     if (getenv("DS4_QWEN4EXP_NO_QSA_SPLIT") != NULL) return 0u;
     const char *forced = getenv("DS4_QWEN4EXP_QSA_SPLIT_GROUP");
     if (forced != NULL) {
@@ -15709,8 +15765,92 @@ static uint32_t qwen4exp_qsa_split_width(uint32_t n_tokens, uint32_t n_head,
      * they must be.  Other multi-row calls retain four heads and their
      * K/V reuse. */
     if (n_head == 24u && n_kv_head == 2u && head_dim == 256u) {
-        if (n_tokens == 1u) return 2u;
-        if (n_tokens == 2u) return 6u;
+        /* THE ONE-WAVE RULE.  The paragraph above IS the argument, but it was
+         * applied to the two-row verify only, and the two constants it left
+         * behind are the answer at the position where it was measured rather
+         * than at every position the scored window visits.  The grid is
+         * (n_head / g, max_tiles, n_tokens) and the scores kernel is
+         * __launch_bounds__(256, 1), so one block owns one SM and the live
+         * block count is exactly that product.  Take the SMALLEST g whose
+         * product fits a single wave -- smallest, because g is also the divisor
+         * on how many times each K row is pulled from L2, so any g beyond what
+         * one wave needs trades parallelism for reuse already paid for.
+         *
+         * It REPRODUCES the measured constants rather than replacing them: at
+         * 48 SMs it returns 2 for one row at max_tiles 4, 6 for two rows at
+         * max_tiles 5, and 4 for the multi-row default at max_tiles 4 -- the
+         * three widths this function already had.  It disagrees in exactly one
+         * place, ONE row at max_tiles >= 5, which is every decode position past
+         * 1024: the shipped 2 puts 60 blocks into 1.25 waves, the identical
+         * partial-wave tail the two-row case was retuned to remove, and 3 puts
+         * 40 into one while pulling each K row 8 times instead of 12.
+         *
+         * THREE GUARDS keep this a tail-removal instead of a retune, and
+         * together they narrow the whole change to that single cell.
+         *
+         * One: only widths 1 and 2 consult the rule.  Wider calls keep their
+         * width byte-for-byte; they are not the shape reasoned about here, and
+         * the tail above says they hold four heads deliberately.
+         *
+         * Two: the rule only runs when the SHIPPED width is the thing that
+         * overflows the wave.  If the width already in place fits, it stands.
+         * Without this the bare "smallest g" would also fire on short counts,
+         * where the shipped 2 and 6 already fit one wave and smallest-g would
+         * walk g DOWN to 1 -- more blocks, but each K row pulled 24 times, a
+         * reuse loss on shapes for which no wave argument was ever made.  This
+         * is what makes every tile count up to 4, i.e. every position through
+         * 1024 and so the whole prefill-shaped region, byte-identical.
+         *
+         * Three: a width is only proposed if the launcher will accept it, via
+         * the shared-memory helper the launcher itself now calls.  g = 12 is the
+         * one divisor of gqa that misses the 48 KiB cap (49536 B of scores
+         * shared), and the launcher's response to a width it cannot fit is
+         * `return 0` -- the caller then takes the per-head kernel for the entire
+         * call.  A width policy that can switch off the path it is tuning is not
+         * a tuning change, so 12 is filtered out rather than proposed.
+         *
+         * The three guards leave the two-row verify path -- the one every
+         * measurement in the paragraph above was taken on -- unchanged at EVERY
+         * tile count: past max_tiles 6 the only width that would fit its wave is
+         * the capped-out 12, so it falls back to the measured 6.  What remains
+         * is one row at max_tiles >= 5 and nothing else in the table.
+         *
+         * g = 3 divides gqa = 12, its <3u> instantiation is already compiled in
+         * the switch below, and it is strictly cheaper than the <6u> already
+         * shipping on the two-row path in both resources: 40032 B of scores
+         * shared against 43200, and two fewer elements in the per-head score[]
+         * and dot[] register arrays.  The values cannot move -- g only decides
+         * which block owns which head, each head's dot product walks the same
+         * words in the same order, gqa % g == 0 keeps a group inside one KV
+         * head, and the cross-tile reduction in the fold kernel never sees g. */
+        /* The width this function has always returned for this row count. */
+        const uint32_t shipped = (n_tokens == 1u) ? 2u
+                               : (n_tokens == 2u) ? 6u : 4u;
+        const uint32_t nsm = qwen4exp_qsa_wave_sms();
+        if (n_tokens <= 2u && nsm != 0u && max_tiles != 0u) {
+            const uint32_t gqa = n_head / n_kv_head;
+            const uint64_t shipped_blocks = (uint64_t)(n_head / shipped) *
+                                            (uint64_t)max_tiles *
+                                            (uint64_t)n_tokens;
+            /* Guard two: only a shipped width that overflows the wave is
+             * reconsidered.  <= nsm means it already fits and stands. */
+            if (shipped_blocks > (uint64_t)nsm) {
+                for (uint32_t g = 1u; g <= gqa; g++) {
+                    if ((gqa % g) != 0u) continue;
+                    if (!qwen4exp_qsa_split_shared_fits(g, head_dim, NULL,
+                                                        NULL)) {
+                        continue;
+                    }
+                    if ((uint64_t)(n_head / g) * (uint64_t)max_tiles *
+                            (uint64_t)n_tokens <= (uint64_t)nsm) {
+                        return g;
+                    }
+                }
+            }
+        }
+        /* The shipped width fits, no width fits, or the SM count did not
+         * answer: the measured constants, unchanged. */
+        return shipped;
     }
     return 4u;
 }
@@ -15738,11 +15878,16 @@ static int qwen4exp_qsa_attention_split(
         return 0;
     }
     const uint32_t gqa = n_head / n_kv_head;
-    uint32_t g = qwen4exp_qsa_split_width(n_tokens, n_head, n_kv_head, head_dim);
+    /* Hoisted above the width choice, which now reads it: the tile count is the
+     * y extent of the grid and so the second factor in the wave the width has
+     * to fit.  Same expression and same value as before, only computed one step
+     * earlier. */
+    const uint32_t max_tiles = (max_count + nth - 1u) / nth;
+    uint32_t g = qwen4exp_qsa_split_width(n_tokens, n_head, n_kv_head, head_dim,
+                                          max_tiles);
     if (g == 0u) return 0;
     if (g > gqa) g = gqa;
     while (g > 1u && (gqa % g) != 0u) g--;
-    const uint32_t max_tiles = (max_count + nth - 1u) / nth;
     const uint64_t rows = (uint64_t)n_tokens * n_head * max_tiles;
     float *sc = (float *)scratch->ptr;
     float *ct = sc + rows * nth;
@@ -15751,14 +15896,10 @@ static int qwen4exp_qsa_attention_split(
     const int32_t *sel = sparse ? (const int32_t *)selected->ptr : NULL;
     const int32_t *cnt = sparse ? (const int32_t *)counts->ptr : NULL;
     const dim3 grid(n_head / g, max_tiles, n_tokens);
-    const size_t sc_shared = ((size_t)g * head_dim +
-                              (((size_t)g * (nth >> 5u) + 3u) & ~(size_t)3u) +
-                              (size_t)nth * QWEN4EXP_QSA_SPLIT_KPITCH) *
-                             sizeof(float);
-    const size_t pr_shared = (size_t)2u * g * nth * sizeof(float) +
-                             (size_t)nth * sizeof(int32_t);
-    if (sc_shared > QWEN4EXP_QSA_GROUP_SHARED_CAP ||
-        pr_shared > QWEN4EXP_QSA_GROUP_SHARED_CAP) {
+    size_t sc_shared = 0, pr_shared = 0;
+    /* Same two expressions and the same two comparisons as before, moved into
+     * the helper the width policy also consults. */
+    if (!qwen4exp_qsa_split_shared_fits(g, head_dim, &sc_shared, &pr_shared)) {
         return 0;
     }
 #define QWEN4EXP_QSA_SPLIT_LAUNCH(G, V)                                          \
@@ -15772,25 +15913,57 @@ static int qwen4exp_qsa_attention_split(
             (const float *)v_cache->ptr, sel, cnt, sc, tmax, ct, tsum,        \
             n_tokens, n_head, n_kv_head, head_dim, pos0, cache_cap,           \
             max_selected, sparse ? 1u : 0u, max_tiles, d_pos)
+    /* The reduced dense V prefetch depth belongs to the ROW COUNT, not to the
+     * width.  It arrived attached to `case 2u` because 2 was the only width one
+     * row ever took, so the two were the same condition; once the one-wave rule
+     * can hand one row a different width, they are not.  Reaching `case 3u` with
+     * QWEN4EXP_QSA_SPLIT_VSTEP would silently trade a measured tuning for an
+     * unmeasured one, which is the opposite of what that rule is for -- so the
+     * predicate moves into a macro and every width one row can reach keeps it.
+     *
+     * The predicate is the original one, unweakened, including the model-shape
+     * clauses and the env valve: `n_tokens == 1u` makes it false on the verify
+     * path and false in prefill, so `case 6u` at two rows and `case 4u` at 1024
+     * launch the same <G, 16u> instantiation as before, and `case 2u` expands to
+     * exactly the code it replaces.  The only pair (width, depth) that is new is
+     * one row at a width only the rule produces.  Widths 12 and 1 are left alone
+     * because one row cannot reach either: 12 misses the shared-memory cap and 1
+     * is below every wave the rule considers.
+     *
+     * Preserving the 8 rather than taking the 16 is the smaller of the two
+     * assumptions, but it IS an assumption: the depth was measured at GROUP 2
+     * and I am carrying it to GROUP 3 on the argument that it describes how many
+     * value rows a lane keeps in flight, which is per-lane and has no GROUP in
+     * it. If anything GROUP 3 wants it more, since `contrib[GROUP]` is one
+     * register deeper. Neither depth is measured at GROUP 3 and I cannot measure
+     * either. Both land the same products in the same accumulators in the same
+     * order -- VSTEP is a scheduling number, as the header comment says -- so
+     * whichever is faster, the emitted tokens are identical.
+     *
+     * Cost of the hoist: `case 4u` and `case 6u` now reach a getenv they did not
+     * reach before, once per split launch. Those are capture-time or eager-side
+     * calls -- decode replays graphs -- so at 48 layers it is a few microseconds
+     * of prefill against a 621.6 ms leg, which is 0.02 bips. */
+#define QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH(G)                                 \
+    do {                                                                      \
+        if (!sparse && n_tokens == 1u && n_head == 24u &&                     \
+            n_kv_head == 2u && head_dim == 256u &&                            \
+            getenv("DS4_QWEN4EXP_NO_QSA_SHORT_V") == NULL) {                  \
+            QWEN4EXP_QSA_SPLIT_LAUNCH(G, 8u);                                 \
+        } else {                                                              \
+            QWEN4EXP_QSA_SPLIT_LAUNCH(G, QWEN4EXP_QSA_SPLIT_VSTEP);           \
+        }                                                                     \
+    } while (0)
     switch (g) {
         case 12u: QWEN4EXP_QSA_SPLIT_LAUNCH(12u, QWEN4EXP_QSA_SPLIT_VSTEP); break;
-        case 6u:  QWEN4EXP_QSA_SPLIT_LAUNCH(6u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
-        case 4u:  QWEN4EXP_QSA_SPLIT_LAUNCH(4u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
-        case 3u:  QWEN4EXP_QSA_SPLIT_LAUNCH(3u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
-        case 2u:
-            /* Preserve the ordered products; only reduce dense V prefetch
-             * depth for the measured one-row model shape. */
-            if (!sparse && n_tokens == 1u && n_head == 24u &&
-                n_kv_head == 2u && head_dim == 256u &&
-                getenv("DS4_QWEN4EXP_NO_QSA_SHORT_V") == NULL) {
-                QWEN4EXP_QSA_SPLIT_LAUNCH(2u, 8u);
-            } else {
-                QWEN4EXP_QSA_SPLIT_LAUNCH(2u, QWEN4EXP_QSA_SPLIT_VSTEP);
-            }
-            break;
+        case 6u:  QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH(6u);  break;
+        case 4u:  QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH(4u);  break;
+        case 3u:  QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH(3u);  break;
+        case 2u:  QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH(2u);  break;
         case 1u:  QWEN4EXP_QSA_SPLIT_LAUNCH(1u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
         default:  return 0;
     }
+#undef QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH
 #undef QWEN4EXP_QSA_SPLIT_LAUNCH
     qwen4exp_qsa_split_fold_kernel<<<dim3(n_head, n_tokens), head_dim, 0,
         cuda_decode_stream()>>>(
