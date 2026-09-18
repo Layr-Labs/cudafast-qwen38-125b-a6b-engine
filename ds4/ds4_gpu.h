@@ -4355,6 +4355,15 @@ int ds4_gpu_qwen4exp_ple_block_tensor(
         float                 norm_conv_bias,
         int                   round_bf16);
 
+/* Expand packed IQ4_NL n-gram rows into the float rows
+ * ds4_gpu_qwen4exp_ple_block_tensor consumes.  `in` holds n_blocks consecutive
+ * 18-byte blocks (one f16 scale, sixteen nibble bytes each); `out` receives
+ * n_blocks * 32 floats in the same order the host dequantizer wrote them.
+ * Bit-identical to ds4_ple_dequant_iq4_nl. */
+int ds4_gpu_qwen4exp_ple_dequant(ds4_gpu_tensor       *out,
+                                 const ds4_gpu_tensor *in,
+                                 uint64_t             n_blocks);
+
 #ifdef __cplusplus
 }
 #endif

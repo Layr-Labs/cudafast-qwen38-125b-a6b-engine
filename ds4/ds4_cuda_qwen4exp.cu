@@ -15993,6 +15993,78 @@ extern "C" int ds4_gpu_qwen4exp_ple_conv_tensor(
     return cuda_ok(cudaGetLastError(), "qwen4exp_ple_conv launch");
 }
 
+
+/* ------------------------------------------------------------------------
+ * PLE n-gram row dequantization.
+ *
+ * The host gather stages the table's packed IQ4_NL rows verbatim -- one f16
+ * scale and sixteen nibble bytes per 32-value block -- and the block's first
+ * device op expands them into the float rows every projection reads.  The
+ * exponent/mantissa bit assembly for the scale (subnormals normalised by one
+ * clz shift, never a data-dependent loop) and the same single fp32 multiply
+ * per element, so the rows the block consumes are identical to the ones the
+ * host loop produced. */
+
+__device__ static const int8_t qwen4exp_ple_kv_iq4nl[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+};
+
+/* Bit-identical twin of the host ple_fp16_to_fp32: a select plus a shift,
+ * no data-dependent loop, exact over the whole 16-bit domain. */
+__device__ __forceinline__ static float qwen4exp_ple_fp16_to_fp32(uint16_t h) {
+    const uint32_t sign     = (uint32_t)(h & 0x8000u) << 16;
+    const uint32_t exponent = (h >> 10) & 0x1Fu;
+    const uint32_t mantissa = h & 0x3FFu;
+    uint32_t bits;
+    if (exponent == 0u) {
+        if (mantissa == 0u) {
+            bits = sign;
+        } else {
+            const uint32_t e = (uint32_t)__clz(mantissa) - 21u;
+            const uint32_t m = (mantissa << e) & 0x3FFu;
+            bits = sign | ((127u - 15u - e + 1u) << 23) | (m << 13);
+        }
+    } else if (exponent == 0x1Fu) {
+        bits = sign | 0x7F800000u | (mantissa << 13);
+    } else {
+        bits = sign | ((exponent + 127u - 15u) << 23) | (mantissa << 13);
+    }
+    return __uint_as_float(bits);
+}
+
+/* One thread per 32-value block: eighteen packed bytes in, thirty-two floats
+ * out, in the same order the host loop wrote them -- low nibbles first, then
+ * the high nibbles of the same bytes. */
+__global__ static void qwen4exp_ple_dequant_kernel(
+        float *__restrict__ out, const uint8_t *__restrict__ in,
+        uint64_t n_blocks) {
+    const uint64_t b = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= n_blocks) return;
+    const uint8_t *p = in + b * 18u;
+    uint16_t half;
+    memcpy(&half, p, sizeof(half));
+    const float d = qwen4exp_ple_fp16_to_fp32(half);
+    const uint8_t *qs = p + 2;
+    float *y = out + b * 32u;
+    for (int j = 0; j < 16; j++) {
+        const uint8_t q = qs[j];
+        y[j]      = d * (float)qwen4exp_ple_kv_iq4nl[q & 0x0F];
+        y[j + 16] = d * (float)qwen4exp_ple_kv_iq4nl[q >> 4];
+    }
+}
+
+extern "C" int ds4_gpu_qwen4exp_ple_dequant(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *in, uint64_t n_blocks) {
+    if (!out || !in || n_blocks == 0 ||
+        in->bytes < n_blocks * 18u || out->bytes < n_blocks * 32u * sizeof(float)) {
+        return 0;
+    }
+    qwen4exp_ple_dequant_kernel<<<
+        (unsigned)((n_blocks + 255u) / 256u), 256, 0, cuda_decode_stream()>>>(
+            (float *)out->ptr, (const uint8_t *)in->ptr, n_blocks);
+    return cuda_ok(cudaGetLastError(), "qwen4exp_ple_dequant launch");
+}
+
 #include "ds4_qwen4exp_hc_host.inc"
 #include "ds4_qwen4exp_ple_host.inc"
 

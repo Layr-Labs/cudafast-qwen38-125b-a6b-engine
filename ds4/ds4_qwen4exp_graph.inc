@@ -327,9 +327,10 @@ struct ds4_qwen4exp_session {
     ds4_ple_constants ple_constants;
     bool              ple_ready;      /* the hash constants were readable */
     uint64_t         *ple_ids;        /* host [n_batch][head_count]       */
-    float            *ple_rows_host;  /* host [n_batch][ple_embd]         */
+    uint8_t          *ple_rows_quant; /* host [n_batch][head_count][row_bytes] */
     ds4_gpu_tensor   *ple_conv_state; /* [state_rows][n_hc * n_embd]      */
     ds4_gpu_tensor   *ple_rows;       /* [n_batch][ple_embd]              */
+    ds4_gpu_tensor   *ple_rows_q;     /* [n_batch][head_count][row_bytes] */
     ds4_gpu_tensor   *ple_key;        /* key projection, then the gate    */
     ds4_gpu_tensor   *ple_aux;        /* query, then the convolution input */
     ds4_gpu_tensor   *ple_value;      /* value projection, [n_batch][embd] */
@@ -761,6 +762,9 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
         s->ple_conv_state = qwen4exp_alloc_zeroed(
             (uint64_t)DS4_QWEN4EXP_PLE_STATE_ROWS * H * E * f, &ok);
         s->ple_rows  = qwen4exp_alloc_zeroed(B * DS4_N_PLE_EMBD * f, &ok);
+        s->ple_rows_q = qwen4exp_alloc_zeroed(
+            (uint64_t)B * DS4_N_PLE_HEAD *
+                (w->ple.row_bytes ? w->ple.row_bytes : 1u), &ok);
         s->ple_conv_snapshot = qwen4exp_alloc_zeroed(
             ds4_gpu_tensor_bytes(s->ple_conv_state) *
                 DS4_QWEN4EXP_IMPLEMENTED_DEPTH, &ok);
@@ -769,8 +773,10 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
         s->ple_value = qwen4exp_alloc_zeroed(B * E * f, &ok);
         if (ok) {
             s->ple_ids = calloc((size_t)B * DS4_N_PLE_HEAD, sizeof(uint64_t));
-            s->ple_rows_host = calloc((size_t)B * DS4_N_PLE_EMBD, sizeof(float));
-            ok = s->ple_ids != NULL && s->ple_rows_host != NULL;
+            s->ple_rows_quant = calloc(
+                (size_t)B * DS4_N_PLE_HEAD,
+                w->ple.row_bytes ? (size_t)w->ple.row_bytes : 1u);
+            ok = s->ple_ids != NULL && s->ple_rows_quant != NULL;
         }
         if (ok) {
             s->ple_ready = qwen4exp_ple_read_constants(m, w, &s->ple_constants);
@@ -889,11 +895,12 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->ple_conv_state);
     ds4_gpu_tensor_free(s->ple_conv_snapshot);
     ds4_gpu_tensor_free(s->ple_rows);
+    ds4_gpu_tensor_free(s->ple_rows_q);
     ds4_gpu_tensor_free(s->ple_key);
     ds4_gpu_tensor_free(s->ple_aux);
     ds4_gpu_tensor_free(s->ple_value);
     free(s->ple_ids);
-    free(s->ple_rows_host);
+    free(s->ple_rows_quant);
     ds4_gpu_tensor_free(s->d_pos);
     ds4_gpu_tensor_free(s->d_adopt);
     ds4_gpu_tensor_free(s->d_gdn_replay);
@@ -1061,14 +1068,17 @@ void ds4_qwen4exp_session_reset(ds4_qwen4exp_session *s) {
  *
  * HOST.  The n-gram table is 26.8 GiB and stays mapped on the solid-state
  * disk.  ds4_ple_row_ids() hashes the recent history into one row id per head
- * (signed int64 throughout, with the end-of-sequence shift rule), the row
- * bytes are read straight out of the shard mapping through
- * ds4_qwen4exp_ple_row(), dequantized, and the [tok][ple_embd] block is the
- * only thing uploaded.  Nothing here keeps a second copy of the table.
+ * (signed int64 throughout, with the end-of-sequence shift rule), and the row
+ * bytes are copied straight out of the shard mapping through
+ * ds4_qwen4exp_ple_row() -- the packed IQ4_NL blocks themselves, not a
+ * dequantized expansion.  Nothing here keeps a second copy of the table.
  *
- * DEVICE.  ds4_gpu_qwen4exp_ple_block_tensor: the two Q8_0 projections, the
- * three grouped norms, the gate and the dilated depthwise convolution, in the
- * reference's order.
+ * DEVICE.  ds4_gpu_qwen4exp_ple_dequant expands the staged blocks into the
+ * float rows, bit-identical to the host dequantizer, then
+ * ds4_gpu_qwen4exp_ple_block_tensor runs the two Q8_0 projections, the
+ * three grouped norms, the gate and the dilated depthwise convolution, in
+ * the reference's order.  The packed upload is a seventh of the bytes the
+ * float rows were, and the dequant work leaves the host entirely.
  *
  * The refusal stays for what the kernels do not cover: a table quantized as
  * anything but IQ4_NL, a row width that is not a whole number of IQ4_NL
@@ -1079,16 +1089,16 @@ void ds4_qwen4exp_session_reset(ds4_qwen4exp_session *s) {
  *
  * The n-gram row gather is a host-side scan: 16 random 90-byte reads out of
  * the SSD-mapped IQ4_NL table per token, each one a page fault when the page
- * cache does not hold the row, plus a 160-value dequant.  At the prefill
- * width that is 16K serial faults while the device sits idle, and the fault
- * latency -- not the arithmetic -- dominates a cold chunk.
+ * cache does not hold the row.  At the prefill width that is 16K serial
+ * faults while the device sits idle, and the fault latency dominates a cold
+ * chunk.
  *
  * The scan is embarrassingly parallel: a token's row ids depend only on the
  * token itself and the (ngram - 1) tokens before it, so a segment's entry
  * history is reproduced exactly by warming a fresh history over the tokens
  * that precede the segment (a reset history is all EOS, which is what the
- * sequential scan starts from too).  Each thread then reads and dequantizes
- * into its own disjoint slice of ple_rows_host, byte for byte what the serial
+ * sequential scan starts from too).  Each thread then copies its rows into a
+ * disjoint slice of ple_rows_quant, byte for byte what the serial
  * loop would have written.  The tail segment's history becomes the session's
  * carried history, which is the state the sequential scan would have ended
  * with.  No number the device sees changes; only the wall time does.
@@ -1107,7 +1117,6 @@ typedef struct {
     uint32_t                      n_tokens;
     uint32_t                      t0;
     uint32_t                      t1;
-    uint32_t                      blocks_per_row;
     int                           ok;
 } qw_ple_gather_seg;
 
@@ -1145,10 +1154,9 @@ static void *qw_ple_gather_worker(void *arg) {
                 seg->s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h];
             const uint8_t *quant = ds4_qwen4exp_ple_row(seg->ple, row);
             if (!quant) { seg->ok = 0; return NULL; }
-            ds4_ple_dequant_iq4_nl(
-                quant, seg->blocks_per_row,
-                seg->s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD +
-                    (uint64_t)h * DS4_N_PLE_ROW_DIM);
+            memcpy(seg->s->ple_rows_quant +
+                       ((uint64_t)t * DS4_N_PLE_HEAD + h) * seg->ple->row_bytes,
+                   quant, (size_t)seg->ple->row_bytes);
         }
     }
     return NULL;
@@ -1288,8 +1296,7 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
 
     const double gather_t0 =
         getenv("DS4_QWEN4EXP_PLE_GATHER_TIME") ? now_sec() : 0.0;
-    const uint32_t block_elems = DS4_PLE_IQ4_NL_BLOCK_ELEMS;
-    const uint32_t blocks_per_row = DS4_N_PLE_ROW_DIM / block_elems;
+    const uint64_t row_bytes = w->ple.row_bytes;
 
     /* When slots are armed the ids are produced ONE ROW AT A TIME so the
      * n-gram history after each row can be kept beside them.  The contract on
@@ -1308,9 +1315,10 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
             /* The head's destination strides are constants of the shape, so
              * the token base is hoisted out of the head loop and the head
              * offset is carried as a pointer step instead of a multiply per
-             * head.  Same addresses, same values. */
+             * head.  The staged bytes are the table's own packed rows; the
+             * device dequantizes them inside the block. */
             const uint64_t *ids = s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD;
-            float *dst = s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD;
+            uint8_t *dst = s->ple_rows_quant + (uint64_t)t * DS4_N_PLE_HEAD * row_bytes;
             for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
                 const uint64_t row = ids[h];
                 /* Every head of this token except the last is followed by
@@ -1327,8 +1335,8 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                             il, t, h, row, w->ple.rows);
                     return false;
                 }
-                ds4_ple_dequant_iq4_nl(quant, blocks_per_row, dst);
-                dst += DS4_N_PLE_ROW_DIM;
+                memcpy(dst, quant, (size_t)row_bytes);
+                dst += row_bytes;
             }
         }
     } else {
@@ -1380,10 +1388,9 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                                 il, t, h, row, w->ple.rows);
                         return false;
                     }
-                    ds4_ple_dequant_iq4_nl(
-                        quant, blocks_per_row,
-                        s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD +
-                            (uint64_t)h * DS4_N_PLE_ROW_DIM);
+                    memcpy(s->ple_rows_quant +
+                               ((uint64_t)t * DS4_N_PLE_HEAD + h) * row_bytes,
+                           quant, (size_t)row_bytes);
                 }
             }
         } else {
@@ -1410,7 +1417,6 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 g_qw_ple_pool.segs[i].n_tokens = n_tokens;
                 g_qw_ple_pool.segs[i].t0 = t0;
                 g_qw_ple_pool.segs[i].t1 = t1;
-                g_qw_ple_pool.segs[i].blocks_per_row = blocks_per_row;
                 g_qw_ple_pool.segs[i].ok = 0;
             }
 
@@ -1464,8 +1470,8 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 "ds4: qwen4exp PLE gather %u rows took %.3f ms\n",
                 n_tokens, (now_sec() - gather_t0) * 1000.0);
     }
-    if (!ds4_gpu_tensor_write(s->ple_rows, 0, s->ple_rows_host,
-                              (uint64_t)n_tokens * DS4_N_PLE_EMBD * sizeof(float))) {
+    if (!ds4_gpu_tensor_write(s->ple_rows_q, 0, s->ple_rows_quant,
+                              (uint64_t)n_tokens * DS4_N_PLE_HEAD * row_bytes)) {
         fprintf(stderr, "ds4: qwen4exp n-gram row upload failed at block %u\n", il);
         return false;
     }
@@ -1489,6 +1495,18 @@ static bool qwen4exp_graph_ple_block(ds4_qwen4exp_session *s,
     const ds4_gpu_qwen4exp_slab value_slab = QW_SLAB(m, l->ple_value);
     const ds4_gpu_qwen4exp_slab norm_key_slab = QW_SLAB(m, l->ple_norm_key);
     const ds4_gpu_qwen4exp_slab norm_query_slab = QW_SLAB(m, l->ple_norm_query);
+
+    /* The upload staged the table's packed IQ4_NL rows; expand them on the
+     * device in the same order the host dequantizer wrote them, so the block
+     * reads the identical floats. */
+    if (!ds4_gpu_qwen4exp_ple_dequant(
+            s->ple_rows, s->ple_rows_q,
+            (uint64_t)n_tokens * DS4_N_PLE_HEAD *
+                (DS4_N_PLE_ROW_DIM / DS4_PLE_IQ4_NL_BLOCK_ELEMS))) {
+        fprintf(stderr, "ds4: qwen4exp PLE row dequant refused at block %u\n", il);
+        return false;
+    }
+
     const ds4_gpu_qwen4exp_slab norm_conv_slab = QW_SLAB(m, l->ple_norm_conv);
     const ds4_gpu_qwen4exp_slab conv_slab = QW_SLAB(m, l->ple_conv1d);
 
