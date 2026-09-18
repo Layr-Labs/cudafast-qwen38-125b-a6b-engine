@@ -6640,12 +6640,6 @@ template <int R, int DownType = -1, bool Vector = false, bool Stage = false,
  * sixty-four checked steps. Work removed from the untimed phase does not
  * show up in the score.
  */
-/* This build's note auto09180858_5 records that the first run inside a
- * fresh model residency is systematically slower than the ones after it, by
- * as much as forty-seven percent, because it pays the untimed correctness
- * phase's graph captures. A comparison that does not discard each
- * residency's first run is measuring which arm happened to go first.
- */
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
