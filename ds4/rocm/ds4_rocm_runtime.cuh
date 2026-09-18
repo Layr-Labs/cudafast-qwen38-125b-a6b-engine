@@ -6073,6 +6073,18 @@ extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset
     return cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes, cudaMemcpyDeviceToHost), "tensor read");
 }
 
+/* The CUDA backend's pinned D2H staging has no ROCm counterpart yet; the
+ * callers fall back to the synchronous read above when these decline. */
+extern "C" int ds4_gpu_d2h_stage_begin(const ds4_gpu_tensor *tensor,
+                                       uint64_t offset, uint64_t bytes) {
+    (void)tensor; (void)offset; (void)bytes;
+    return 0;
+}
+extern "C" const void *ds4_gpu_d2h_stage(uint64_t bytes) {
+    (void)bytes;
+    return NULL;
+}
+
 extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                      const ds4_gpu_tensor *src, uint64_t src_offset,
                                      uint64_t bytes) {
