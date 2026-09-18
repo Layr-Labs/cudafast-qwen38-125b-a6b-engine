@@ -577,6 +577,13 @@ static int mtp_commit_one(ds4_qwen4exp_mtp_state *st,
  * than better. The gap in the comment is real; exploiting it is not
  * obviously a win.
  */
+/* This build's note auto09180650_6 records that fusing two kernels is a win
+ * when the fusion is a union of their grids and a loss when it collapses a
+ * wide grid onto a narrow one, because the wide kernel's memory work then
+ * runs at the narrow kernel's parallelism. One such fold was bit exact,
+ * race clean and forty-six percent slower with a cold cache, because the
+ * round trip it removed had been acting as a parallel prefetch.
+ */
 int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
                            const ds4_qwen4exp_mtp_model *model,
                            int first_token,
