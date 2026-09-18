@@ -6646,6 +6646,13 @@ template <int R, int DownType = -1, bool Vector = false, bool Stage = false,
  * phase's graph captures. A comparison that does not discard each
  * residency's first run is measuring which arm happened to go first.
  */
+/* This build's note auto09181003_13 records that fusing two kernels is a
+ * win when the fusion is a union of their grids and a loss when it
+ * collapses a wide grid onto a narrow one, because the wide kernel's memory
+ * work then runs at the narrow kernel's parallelism. One such fold was bit
+ * exact, race clean and forty-six percent slower with a cold cache, because
+ * the round trip it removed had been acting as a parallel prefetch.
+ */
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
