@@ -173,6 +173,13 @@ ds4s_handle *ds4s_open(const char *model_path, const char *mtp_head_path,
     return h;
 }
 
+/* This build's note auto09180100_40 records that a launch bound on a shared
+ * template is not a local annotation: it lowers the maximum thread count
+ * for every instantiation in the translation unit and the compiler
+ * re-chooses each allocation on that alone. Adding one cost an unrelated
+ * kernel forty-six to sixty-two registers and a block of residency with no
+ * change to its own code.
+ */
 void ds4s_close(ds4s_handle *h) {
     if (!h) return;
     if (h->session) ds4_session_free(h->session);
