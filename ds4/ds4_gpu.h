@@ -1389,6 +1389,8 @@ int ds4_gpu_qkv_pair_quad_compressor_store_tensor(
         uint32_t              ratio,
         uint32_t              pos);
 
+/* SWEEP: DS4_QWEN4EXP_WIDE3=1 -- the fused decode projections also take 3- and 4-row verifies. */
+int ds4_qwen4exp_wide3_enabled(void);
 int ds4_gpu_matmul_f32_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -3074,6 +3076,39 @@ int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         uint32_t                     n_tokens,
         int                          pre_quantized);
 
+/* SWEEP 2026-09-18 (DS4_SHEXP_SIDE): the same call with an own output buffer.
+ * Returns 2 when gate * down was written to `out_own` on the side stream (add
+ * it to `out` in the FFN inject: ds4_gpu_qwen4exp_hc_inject2_tensor), 1 when
+ * the call added into `out` in stream order as before, 0 on failure. */
+int ds4_gpu_qwen4exp_shared_expert_side_tensor(
+        ds4_gpu_tensor              *out,
+        ds4_gpu_tensor              *out_own,
+        ds4_gpu_tensor              *mid,
+        ds4_gpu_tensor              *gate_scale,
+        const ds4_gpu_qwen4exp_slab *router,
+        const ds4_gpu_qwen4exp_slab *gate,
+        const ds4_gpu_qwen4exp_slab *up,
+        const ds4_gpu_qwen4exp_slab *down,
+        uint32_t                     in_dim,
+        uint32_t                     mid_dim,
+        uint32_t                     out_dim,
+        const ds4_gpu_tensor        *x,
+        uint32_t                     n_tokens,
+        int                          pre_quantized);
+
+/* out_hc = residual_hc + (block_out + gate_scale * shared_tot) * inject, per
+ * stream: the shared down kernel's in-place add applied in the inject. */
+int ds4_gpu_qwen4exp_hc_inject2_tensor(
+        ds4_gpu_tensor       *out_hc,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *shared_tot,
+        const ds4_gpu_tensor *gate_scale,
+        const ds4_gpu_tensor *inject,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              rows);
+
 int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *mid,
@@ -4029,28 +4064,6 @@ int  ds4_gpu_decode_graphs_supported(void);
 /* Upload a ready decode-graph exec now, so its next launch does not.
  * Returns 1 when an upload was issued, 0 otherwise (never an error). */
 int  ds4_gpu_decode_graph_prefetch(const ds4_decode_graph_key *key);
-/* One-shot graph capture for the PREFILL layer stack: capture, instantiate,
- * launch, and destroy inside the window that built it.  No key and no cache --
- * a prefill layer runs exactly once, and a graph outliving its prefill would
- * let a timed prefill inherit work built in an untimed one, which is the
- * deferred-seed-work defect participant-contract 5.1.1 names.  begin() returns
- * 0 when capturing and -1 when it declines, in which case the caller encodes
- * eagerly exactly as before.  end() is ASYNCHRONOUS: it launches and returns
- * so the host captures the next layer while this one runs on the device.
- * retire() synchronizes first and is safe to call anywhere. */
-int      ds4_gpu_oneshot_graph_begin(void);
-/* retire_settled() destroys WITHOUT synchronizing and is valid only where the
- * caller guarantees completion -- one full device sync later than the forward
- * that built the graphs.  report() prints and resets the capture statistics.
- * The two ends of the lifecycle are paid at different points, so they are
- * reported at different points. */
-void     ds4_gpu_oneshot_graph_retire_settled(void);
-void     ds4_gpu_oneshot_graph_report(void);
-int      ds4_gpu_oneshot_graph_end(void);
-void     ds4_gpu_oneshot_graph_abort(void);
-void     ds4_gpu_oneshot_graph_retire(void);
-uint64_t ds4_gpu_oneshot_graph_captures(void);
-
 int  ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key);
 /* 0: capture committed and launched; -1: capture failed (entry retired;
  * the caller must re-encode the island eagerly -- no work was executed). */
@@ -4095,6 +4108,28 @@ int ds4_gpu_qwen4exp_rms_norm_tensor(
         float                 eps,
         float                 weight_bias,
         int                   round_bf16);
+
+/* SWEEP 2026-09-18: prefetch the first `bytes[i]` of up to four weight regions
+ * into the L2 on the decode stream (prefetch.global.L2; no value changes).
+ * Regions that do not resolve are skipped; returns 0 only on a launch error. */
+int ds4_gpu_qwen4exp_l2_prefetch(
+        int                  n,
+        const void *const   *maps,
+        const uint64_t      *sizes,
+        const uint64_t      *offsets,
+        const uint64_t      *bytes);
+/* The decode stream waits for the pending forked prefetch (no-op if none). */
+int ds4_gpu_qwen4exp_l2_prefetch_join(void);
+
+/* SWEEP 2026-09-18: the dense Q8 MMA pipe on raw pointers, on `stream` (NULL =
+ * the decode stream), with `acc_scale` != NULL turning the store into
+ * `out += acc_scale[row] * acc`.  bn 64 or 128 picks the tile.  Plain
+ * ascending-group chains.  Returns 0 when the shape or alignment is refused
+ * (in_dim % 128, 16-byte aligned weights, xq and scales). */
+int ds4_gpu_matmul_q8_0_preq_raw_pipe(
+        float *out, const unsigned char *w, const int8_t *xq, const float *xscale,
+        uint64_t in_dim, uint64_t out_dim, uint32_t n_rows, const float *acc_scale,
+        void *stream, int bn);
 
 /* silu(x * scale) in place, over `n` values. */
 int ds4_gpu_qwen4exp_scale_silu_tensor(
