@@ -577,6 +577,12 @@ static int mtp_commit_one(ds4_qwen4exp_mtp_state *st,
  * than better. The gap in the comment is real; exploiting it is not
  * obviously a win.
  */
+/* This build's note auto09180709_8 records that the first run inside a
+ * fresh model residency is systematically slower than the ones after it, by
+ * as much as forty-seven percent, because it pays the untimed correctness
+ * phase's graph captures. A comparison that does not discard each
+ * residency's first run is measuring which arm happened to go first.
+ */
 int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
                            const ds4_qwen4exp_mtp_model *model,
                            int first_token,
