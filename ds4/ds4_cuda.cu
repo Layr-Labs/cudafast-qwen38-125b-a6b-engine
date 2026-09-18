@@ -3490,14 +3490,83 @@ extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint
     return ok;
 }
 
+/* Staged async upload ring.  A small ds4_gpu_tensor_write is a blocking
+ * cudaMemcpy: the host waits on the copy's own synchronisation inside the
+ * serial gap between one forward's last launch and the next one's first.
+ * Copying the payload into a pinned slot and issuing cudaMemcpyAsync on
+ * the decode stream removes that wait -- the legacy stream orders the
+ * upload ahead of every kernel and replay that consumes it, exactly as
+ * the blocking copy did.  Each slot carries an event recorded after its
+ * DMA; a slot is only reused once that event completes, so the staged
+ * bytes are never overwritten while a copy is still reading them. */
+#define DS4_H2D_STAGE_SLOTS 8u
+#define DS4_H2D_STAGE_BYTES (1u << 20)
+static void       *g_h2d_stage[DS4_H2D_STAGE_SLOTS];
+static cudaEvent_t g_h2d_stage_ev[DS4_H2D_STAGE_SLOTS];
+static int         g_h2d_stage_dev = -1;
+static uint32_t    g_h2d_stage_next;
+
+static int ds4_h2d_stage_ready(int dev) {
+    if (g_h2d_stage_dev >= 0) return g_h2d_stage_dev == dev;
+    for (uint32_t i = 0; i < DS4_H2D_STAGE_SLOTS; i++) {
+        if (cudaMallocHost(&g_h2d_stage[i], DS4_H2D_STAGE_BYTES) !=
+                cudaSuccess ||
+            cudaEventCreateWithFlags(&g_h2d_stage_ev[i],
+                                     cudaEventDisableTiming) !=
+                cudaSuccess) {
+            for (uint32_t j = 0; j <= i; j++) {
+                if (g_h2d_stage[j]) (void)cudaFreeHost(g_h2d_stage[j]);
+                if (g_h2d_stage_ev[j]) (void)cudaEventDestroy(g_h2d_stage_ev[j]);
+                g_h2d_stage[j] = NULL;
+                g_h2d_stage_ev[j] = NULL;
+            }
+            (void)cudaGetLastError();
+            return 0;
+        }
+    }
+    g_h2d_stage_dev = dev;
+    return 1;
+}
+
 extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     int d = ds4_tensor_device_idx(tensor);
     int ok = 0;
     WITH_DEVICE(g_gpu[d].device_id) {
-        ok = cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, data, (size_t)bytes,
-                                cudaMemcpyHostToDevice),
-                     "tensor write");
+        /* Small uploads go through the staged ring: a host memcpy into a
+         * pinned slot plus cudaMemcpyAsync on the decode stream, instead
+         * of a blocking copy that stalls the host inside the serial gap.
+         * Captures keep the blocking form so the bytes land eagerly and
+         * the replay sees the same values. */
+        if (bytes != 0 && bytes <= DS4_H2D_STAGE_BYTES &&
+            !g_decode_graph_capturing &&
+            ds4_h2d_stage_ready(g_gpu[d].device_id)) {
+            const uint32_t slot = g_h2d_stage_next++ % DS4_H2D_STAGE_SLOTS;
+            if (!cuda_ok(cudaEventSynchronize(g_h2d_stage_ev[slot]),
+                         "staged upload slot wait")) {
+                return 0;
+            }
+            memcpy(g_h2d_stage[slot], data, (size_t)bytes);
+            ok = cuda_ok(cudaMemcpyAsync((char *)tensor->ptr + offset,
+                                       g_h2d_stage[slot], (size_t)bytes,
+                                       cudaMemcpyHostToDevice,
+                                       cuda_decode_stream()),
+                         "staged tensor write");
+            if (ok &&
+                !cuda_ok(cudaEventRecord(g_h2d_stage_ev[slot],
+                                         cuda_decode_stream()),
+                         "staged upload event record")) {
+                /* The copy is enqueued but its completion is untracked;
+                 * drain the stream so the slot cannot be reused early. */
+                ok = cuda_ok(cudaStreamSynchronize(cuda_decode_stream()),
+                             "staged upload fallback drain");
+            }
+        }
+        if (!ok) {
+            ok = cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, data,
+                                    (size_t)bytes, cudaMemcpyHostToDevice),
+                         "tensor write");
+        }
     }
     return ok;
 }
