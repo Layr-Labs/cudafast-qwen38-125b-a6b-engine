@@ -408,6 +408,20 @@ typedef struct {
                       float *multi_out);
 
     /*
+     * OPTIONAL: the same as draft_rows, but the multi-stream rows are copied
+     * on-device from the caller's own residency starting at verify-relative row
+     * `first_row` (== k0), instead of from a host `hc_rows` slab.  Set ONLY
+     * alongside verify_rows_top1 + defer_frontier_logits, where the verify's
+     * hyper output is still resident on-device and is bit-for-bit the rows
+     * draft_rows would have re-uploaded.  When non-NULL the cycle passes NULL
+     * for the verify's `hc_rows`, since the host read-back is then pure
+     * round-trip.  NULL: use draft_rows / the host path unchanged.
+     */
+    int (*draft_rows_device)(void *ctx, const int *next_tokens,
+                             uint32_t first_row, uint32_t pos0, uint32_t n,
+                             int *draft_out, float *multi_out);
+
+    /*
      * OPTIONAL: top-1 minus runner-up logit of the draft the latest draft_step
      * or draft_rows call returned, or a negative value when that call did not
      * measure one.  It can only shorten a chain (stop_margin / drop_margin in
@@ -917,19 +931,23 @@ int ds4_qwen4exp_mtp_head_forward(ds4_qwen4exp_mtp_head *h,
  * `hyper` row (hc_dim floats).  Every row still runs the block and writes its
  * own cache row; what is narrower is the readback and the argmax.  This is the
  * entry the seam's draft_rows binds to. */
-int ds4_qwen4exp_mtp_head_forward_last_device(ds4_qwen4exp_mtp_head *h,
-                                              const int *next_tokens,
-                                              const ds4_gpu_tensor *hyper_device,
-                                              uint32_t first_row,
-                                              uint32_t pos0, uint32_t n_tokens,
-                                              int *draft_out, float *multi_out,
-                                              char *err, size_t errlen);
 int ds4_qwen4exp_mtp_head_forward_last(ds4_qwen4exp_mtp_head *h,
                                        const int *next_tokens,
                                        const float *multi_in,
                                        uint32_t pos0, uint32_t n_tokens,
                                        int *draft_out, float *multi_out,
                                        char *err, size_t errlen);
+
+/* The same as ds4_qwen4exp_mtp_head_forward_last, but the multi-stream rows are
+ * copied on-device from `multi_device` beginning at row `first_device_row`,
+ * rather than uploaded from a host slab.  Used when those rows are the verify's
+ * own hyper output, still resident on-device: the head reads the identical
+ * bytes with no host round-trip. */
+int ds4_qwen4exp_mtp_head_forward_last_device(
+        ds4_qwen4exp_mtp_head *h, const int *next_tokens,
+        const ds4_gpu_tensor *multi_device, uint32_t first_device_row,
+        uint32_t pos0, uint32_t n_tokens, int *draft_out, float *multi_out,
+        char *err, size_t errlen);
 
 /* Greedy argmax with the canonical lowest-id tie-break the shim's ds4s_argmax
  * documents.  Shared so the head and the cycle cannot break ties apart. */
