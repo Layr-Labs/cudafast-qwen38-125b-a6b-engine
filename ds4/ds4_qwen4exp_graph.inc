@@ -1,3 +1,4 @@
+/* ROUND 104 PROMOTION DRAW — stamp 20260918T010737Z. Tip eba814d. R100=2.64129 s2 best; R103=2.63013 s4 handicap. Bar 2.649466. */
 /*
  * qwen4exp serial graph: session state, memory plan and the forward.
  * See ds4_qwen4exp_graph.h for the contract and the layer schedule.
