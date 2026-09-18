@@ -20919,7 +20919,10 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
          * would let a merely word-aligned slab fall back silently and make the
          * arm a no-op.  DS4_QWEN4EXP_NO_GDN_PANEL stands it down. */
         const size_t gdn_panel=(size_t)(256u/64u)*(size_t)blocks*34u+16u;
+        /* The cooperative fill copies four complete rows before the row
+         * guard. Ragged outputs require the direct reader to avoid overread. */
         const int gdn_stage =
+            ((qkv_dim | gate_dim) & 3u) == 0u &&
             ((((uintptr_t)a.weights[0]|(uintptr_t)a.weights[1])&3u)==0u) &&
             gdn_panel<=49152u &&
             getenv("DS4_QWEN4EXP_NO_GDN_PANEL")==NULL;

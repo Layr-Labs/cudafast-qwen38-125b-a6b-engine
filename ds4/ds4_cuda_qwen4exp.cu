@@ -6827,6 +6827,123 @@ __global__ static void qwen4exp_moe_down_q_kernel(
     }
 }
 
+/* Native Q5_1 decode panels: same two-buffer schedule and FP accumulation
+ * as the staged down kernel. Bulk copies transfer the original weight bytes.
+ * The host guard guarantees full eight-row blocks, 16-byte aligned panels,
+ * and at most 32 routed experts. Activations remain behind the PDL fence. */
+/* Same two-panel arithmetic schedule; one bulk copy issues a complete panel. */
+__device__ __forceinline__ static void qwen4exp_down_bulk_wait(uint64_t *bar, unsigned parity) {
+    const unsigned address = (unsigned)__cvta_generic_to_shared(bar);
+    unsigned ready;
+    do {
+        asm volatile("{ .reg .pred done;\n"
+                     "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 done, [%1], %2;\n"
+                     "selp.b32 %0, 1, 0, done; }"
+                     : "=r"(ready) : "r"(address), "r"(parity) : "memory");
+    } while (!ready);
+}
+
+__global__ static void qwen4exp_moe_down_bulk_kernel(
+        float *out, const char *down, const int32_t *selected,
+        const int8_t *mq, const float *ms, const int32_t *msum,
+        uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        uint32_t down_type, uint32_t groups, uint32_t out_dim,
+        uint32_t n_tokens, uint32_t n_total_expert, uint32_t n_expert_used) {
+    extern __shared__ uint4 qw_down_bulk_panels[];
+    __shared__ __align__(8) uint64_t completion[2];
+    char *const panels = (char *)qw_down_bulk_panels;
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned row0 = blockIdx.x * 8u;
+    const unsigned row = row0 + (threadIdx.x >> 5u);
+    const unsigned tok0 = blockIdx.y * 2u;
+    if (row >= out_dim || tok0 >= n_tokens) return;
+    const unsigned take = n_tokens - tok0 < 2u ? n_tokens - tok0 : 2u;
+    const unsigned panel_bytes = (unsigned)(8u * down_row_bytes);
+    int route[2];
+#pragma unroll
+    for (int r = 0; r < 2; ++r)
+        route[r] = (unsigned)r < take && lane < n_expert_used
+            ? selected[(uint64_t)(tok0 + r) * n_expert_used + lane] : -1;
+    if (threadIdx.x == 0) {
+#pragma unroll
+        for (unsigned i = 0; i < 2; ++i) {
+            const unsigned addr = (unsigned)__cvta_generic_to_shared(completion + i);
+            asm volatile("mbarrier.init.shared.b64 [%0], 1;" :: "r"(addr) : "memory");
+        }
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    }
+    __syncthreads();
+    float acc[2] = {0.0f, 0.0f};
+    auto fill = [&](unsigned slot, unsigned rr, unsigned buffer) {
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            if ((unsigned)r == rr) {
+                // All lanes execute the shuffle before electing the copy issuer.
+                const int e = __shfl_sync(0xffffffffu, route[r], slot);
+                if (threadIdx.x == 0) {
+                    const bool valid = e >= 0 && (unsigned)e < n_total_expert;
+                    const unsigned bytes = valid ? panel_bytes : 0u;
+                    const unsigned bar = (unsigned)__cvta_generic_to_shared(completion + buffer);
+                    uint64_t arrival;
+                    asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 %0, [%1], %2;"
+                                 : "=l"(arrival) : "r"(bar), "r"(bytes) : "memory");
+                    if (valid) {
+                        const char *gp = down + (uint64_t)(unsigned)e * down_expert_bytes
+                                             + (uint64_t)row0 * down_row_bytes;
+                        const unsigned dst = (unsigned)__cvta_generic_to_shared(
+                            panels + (uint64_t)buffer * panel_bytes);
+                        asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                                     :: "r"(dst), "l"(gp), "r"(bytes), "r"(bar) : "memory");
+                    }
+                }
+            }
+        }
+    };
+    if (n_expert_used) fill(0u, 0u, 0u);
+    QWEN4EXP_PDL_SYNC();
+    for (unsigned slot = 0; slot < n_expert_used; ++slot) {
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            if ((unsigned)r < take) {
+                const unsigned step = slot * take + (unsigned)r;
+                qwen4exp_down_bulk_wait(completion + (step & 1u), (step >> 1u) & 1u);
+                __syncthreads();
+                const unsigned nr = (unsigned)r + 1u < take ? (unsigned)r + 1u : 0u;
+                const unsigned ns = (unsigned)r + 1u < take ? slot : slot + 1u;
+                if (ns < n_expert_used) fill(ns, nr, (step + 1u) & 1u);
+                const int e = __shfl_sync(0xffffffffu, route[r], slot);
+                if (e < 0 || (unsigned)e >= n_total_expert) continue;
+                const char *drow = panels + (uint64_t)(step & 1u) * panel_bytes
+                                  + (uint64_t)(row - row0) * down_row_bytes;
+                const uint64_t mrow = (uint64_t)(tok0 + (unsigned)r) * n_expert_used + slot;
+                for (unsigned g = lane; g < groups; g += 32u) {
+                    int8_t wq[32]; float wa[2], wb[2]; int halves = 1;
+                    dev_qwen4exp_group_decode(DS4_QWEN4EXP_TY_q5_1,
+                                              drow, g, wq, wa, wb, &halves);
+                    const uint64_t at = mrow * groups + g;
+                    qwen4exp_shared_vector_accumulate(&acc[r], wq, wa[0], wb[0],
+                                                      mq + at * 32u, ms[at], msum[at]);
+                }
+            }
+        }
+    }
+    // No thread may still be waiting when the barrier storage is invalidated.
+    __syncthreads();
+    if (threadIdx.x == 0) {
+#pragma unroll
+        for (unsigned i = 0; i < 2; ++i) {
+            const unsigned addr = (unsigned)__cvta_generic_to_shared(completion + i);
+            asm volatile("mbarrier.inval.shared.b64 [%0];" :: "r"(addr) : "memory");
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+        const float sum = warp_sum_f32(acc[r]);
+        if (lane == 0u && (unsigned)r < take)
+            out[(uint64_t)(tok0 + (unsigned)r) * out_dim + row] = sum;
+    }
+}
+
 /* The shared expert: no routing, so the tile is consecutive tokens and the
  * decoded group serves all of them. */
 template <int R, int GateType = -1, int UpType = -1, bool Vector = false>
@@ -8447,10 +8564,16 @@ qwen4exp_shared_pipe_mma_kernel(
                         uint32_t q[4] = {0u, 0u, 0u, 0u};
 #pragma unroll
                         for (int j = 0; j < 4; j++) {
-                            if (j * 4 < inside) {
+                            if (j * 4 + 4 <= inside) {
                                 uint32_t v;
                                 asm volatile("ld.global.u32 %0, [%1];" : "=r"(v) : "l"(win + 32 + j * 4));
                                 q[j] = v;
+                            } else if (j * 4 + 2 <= inside) {
+                                /* A Q8 matrix may end on a half-word. Do not
+                                 * read four bytes when only two remain. */
+                                uint16_t v;
+                                asm volatile("ld.global.u16 %0, [%1];" : "=h"(v) : "l"(win + 32 + j * 4));
+                                q[j] = (uint32_t)v;
                             }
                         }
                         rb[k][2] = make_uint4(q[0], q[1], q[2], q[3]);
@@ -9730,7 +9853,23 @@ static int qwen4exp_routed_moe_cuda(
             }
         } else {
             if (dn_stage && getenv("DS4_QWEN4EXP_NO_DOWN_ASYNC") == NULL) {
-                QWEN4EXP_DOWN_ASYNC(DS4_QWEN4EXP_TY_q5_1);
+                const bool bulk = n_tokens <= 2u &&
+                    down_slab->type == DS4_QWEN4EXP_TY_q5_1 &&
+                    mgroups == 20u && down_slab->row_bytes == 480u &&
+                    n_expert_used > 0u && n_expert_used <= 32u;
+                if (bulk) {
+                    if (qwen4exp_pdl_routed_down()) {
+                        QWEN4EXP_LAUNCH_PDL(qwen4exp_moe_down_bulk_kernel,
+                            dn_grid, threads, (size_t)dn_shared, stream,
+                            QWEN4EXP_DOWN_ARGS);
+                    } else {
+                        qwen4exp_moe_down_bulk_kernel<<<
+                            dn_grid, threads, (size_t)dn_shared, stream>>>(
+                            QWEN4EXP_DOWN_ARGS);
+                    }
+                } else {
+                    QWEN4EXP_DOWN_ASYNC(DS4_QWEN4EXP_TY_q5_1);
+                }
             } else if (dn_stage) {
                 QWEN4EXP_DOWN_IMPL_S(2, DS4_QWEN4EXP_TY_q5_1, true, true,
                                      (size_t)dn_shared);
@@ -16325,7 +16464,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_tensor(
  * swallowed and reported as -1; the function never touches device state and is
  * called once, off the timed path. */
 extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
-    static char buf[384];
+    static char buf[512];
     static int built = 0;
     if (built) return buf;
     built = 1;
@@ -16334,6 +16473,7 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
     int gu_regs = -1, gu_smem = -1, gu_lmem = -1, gu_maxt = -1;
     int gu_occ = -1, dn_occ = -1;
     int dn_regs = -1, dn_smem = -1, dn_lmem = -1, dn_maxt = -1;
+    int db_regs = -1, db_smem = -1, db_lmem = -1, db_occ = -1;
     /* The two PREFILL tile kernels, read here for the first time. */
     int mg_regs = -1, mg_smem = -1, mg_lmem = -1, mg_occ = -1;
     int md_regs = -1, md_smem = -1, md_lmem = -1, md_occ = -1;
@@ -16418,6 +16558,22 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
         (void)cudaGetLastError();
     }
 
+    /* Query the actual native Q5_1 bulk launch: 256 threads and two
+     * 3840-byte dynamic panels. Static barrier bytes are reported separately. */
+    if (cudaFuncGetAttributes(&a, qwen4exp_moe_down_bulk_kernel) == cudaSuccess) {
+        db_regs = a.numRegs;
+        db_smem = (int)a.sharedSizeBytes;
+        db_lmem = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ, qwen4exp_moe_down_bulk_kernel, 256, 7680) == cudaSuccess) {
+        db_occ = occ;
+    } else {
+        (void)cudaGetLastError();
+    }
+
     /* ---- THE PREFILL TILE KERNELS, read here for the first time ----
      * Everything above, and every arm this line of work has submitted, is a
      * DECODE-width kernel.  But `docs/participant-contract.md` 5.1.1 is explicit
@@ -16498,12 +16654,14 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
              "gu[reg=%d smem=%d lmem=%d maxt=%d occ=%d] dn[reg=%d smem=%d "
              "lmem=%d maxt=%d occ=%d] gdn[reg=%d lmem=%d] "
              "mm[reg=%d smem=%d lmem=%d occ=%d] "
-             "md[reg=%d smem=%d lmem=%d occ=%d]",
+             "md[reg=%d smem=%d lmem=%d occ=%d] "
+             "q5bulk[reg=%d smem=%d lmem=%d occ=%d dyn=7680]",
              gu_regs, gu_smem, gu_lmem, gu_maxt, gu_occ,
              dn_regs, dn_smem, dn_lmem, dn_maxt, dn_occ,
              gd_regs, gd_lmem,
              mg_regs, mg_smem, mg_lmem, mg_occ,
-             md_regs, md_smem, md_lmem, md_occ);
+             md_regs, md_smem, md_lmem, md_occ,
+             db_regs, db_smem, db_lmem, db_occ);
     return buf;
 }
 
