@@ -9211,6 +9211,46 @@ __global__ static void rope_tail_decode_rows_kernel(
         float beta_slow) {
     const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t pairs = n_rows * n_head * (n_rot / 2u);
+    const uint32_t npair = n_rot >> 1u;
+    /* The frequency factor, the YaRN ramp and the mscale depend only on the
+     * pair index and the launch constants -- every (row, head) recomputes
+     * the same npair transcendentals.  Evaluate them once per block in
+     * shared memory instead: identical device powf/logf calls on identical
+     * inputs, so every element below is bit-for-bit the value the per-thread
+     * evaluation produced.  npair <= 256 whenever head_dim <= 512; the
+     * fallback keeps larger rotations correct. */
+    __shared__ float sh_freq[256];
+    __shared__ float sh_ramp[256];
+    __shared__ float sh_corr0, sh_corr1, sh_mscale;
+    const bool tabulated = npair <= 256u;
+    if (tabulated) {
+        if (threadIdx.x == 0u) {
+            if (ext_factor != 0.0f) {
+                const float denom = 2.0f * logf(freq_base);
+                sh_corr0 = fmaxf(0.0f, floorf((float)n_rot *
+                    logf((float)n_ctx_orig /
+                         (beta_fast * 2.0f * (float)M_PI)) / denom));
+                sh_corr1 = fminf((float)(n_rot - 1u), ceilf((float)n_rot *
+                    logf((float)n_ctx_orig /
+                         (beta_slow * 2.0f * (float)M_PI)) / denom));
+                sh_mscale =
+                    attn_factor * (1.0f + 0.1f * logf(1.0f / freq_scale));
+            } else {
+                sh_mscale = attn_factor;
+            }
+        }
+        for (uint32_t p = threadIdx.x; p < npair; p += blockDim.x) {
+            sh_freq[p] = powf(freq_base, -((float)(p * 2u)) / (float)n_rot);
+        }
+        __syncthreads();
+        if (ext_factor != 0.0f) {
+            for (uint32_t p = threadIdx.x; p < npair; p += blockDim.x) {
+                sh_ramp[p] = rope_yarn_ramp_dev(sh_corr0, sh_corr1,
+                                                (int)(p * 2u)) * ext_factor;
+            }
+            __syncthreads();
+        }
+    }
     if (gid >= pairs) return;
     const uint32_t pair = gid % (n_rot / 2u);
     const uint32_t tmp = gid / (n_rot / 2u);
@@ -9220,31 +9260,39 @@ __global__ static void rope_tail_decode_rows_kernel(
     const uint32_t i = pair * 2u;
 
     float corr0 = 0.0f, corr1 = 0.0f;
-    if (ext_factor != 0.0f) {
-        const float denom = 2.0f * logf(freq_base);
-        corr0 = floorf((float)n_rot *
-                       logf((float)n_ctx_orig /
-                            (beta_fast * 2.0f * (float)M_PI)) / denom);
-        corr1 = ceilf((float)n_rot *
-                      logf((float)n_ctx_orig /
-                           (beta_slow * 2.0f * (float)M_PI)) / denom);
-        corr0 = fmaxf(0.0f, corr0);
-        corr1 = fminf((float)(n_rot - 1u), corr1);
+    float freq_i, ramp_mix = 0.0f, mscale;
+    if (tabulated) {
+        freq_i = sh_freq[pair];
+        ramp_mix = ext_factor != 0.0f ? sh_ramp[pair] : 0.0f;
+        mscale = sh_mscale;
+    } else {
+        freq_i = powf(freq_base, -((float)i) / (float)n_rot);
+        mscale = attn_factor;
+        if (ext_factor != 0.0f) {
+            const float denom = 2.0f * logf(freq_base);
+            corr0 = floorf((float)n_rot *
+                           logf((float)n_ctx_orig /
+                                (beta_fast * 2.0f * (float)M_PI)) / denom);
+            corr1 = ceilf((float)n_rot *
+                          logf((float)n_ctx_orig /
+                               (beta_slow * 2.0f * (float)M_PI)) / denom);
+            corr0 = fmaxf(0.0f, corr0);
+            corr1 = fminf((float)(n_rot - 1u), corr1);
+            ramp_mix = rope_yarn_ramp_dev(corr0, corr1, (int)i) * ext_factor;
+            mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+        }
     }
 
-    const float theta_extrap = (float)rows.row[row].pos *
-        powf(freq_base, -((float)i) / (float)n_rot);
+    const float theta_extrap = (float)rows.row[row].pos * freq_i;
     const float theta_interp = freq_scale * theta_extrap;
     float theta = theta_interp;
-    float mscale = attn_factor;
     if (ext_factor != 0.0f) {
-        const float ramp_mix =
-            rope_yarn_ramp_dev(corr0, corr1, (int)i) * ext_factor;
         theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
-        mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
     }
-    const float c = cosf(theta) * mscale;
-    float s = sinf(theta) * mscale;
+    float s, c;
+    sincosf(theta, &s, &c);
+    c *= mscale;
+    s *= mscale;
     if (inverse) s = -s;
 
     float *tail = x + ((uint64_t)row * n_head + h) * head_dim + n_nope;
