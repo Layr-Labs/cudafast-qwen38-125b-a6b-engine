@@ -76123,6 +76123,39 @@ static int qwen4exp_seam_draft_rows(void *ctx, const int *next_tokens,
     return 0;
 }
 
+/* draft_rows, sourcing the multi rows from the session's own device hyper.
+ * first_row is the verify-relative row (k0) of next_tokens[0]; the verify wrote
+ * session hyper row i for position pos+i, so device row k0 is exactly the slab
+ * host draft_rows uploaded from hc_scratch + k0.  No host round-trip. */
+static int qwen4exp_seam_draft_rows_device(void *ctx, const int *next_tokens,
+                                           uint32_t first_row, uint32_t pos0,
+                                           uint32_t n, int *draft_out,
+                                           float *multi_out) {
+    ds4_session *s = ctx;
+    ds4_engine *e = s->engine;
+    char err[256];
+    const ds4_gpu_tensor *hyper =
+        ds4_qwen4exp_session_hyper(e->qwen4exp_session);
+    if (!hyper) {
+        fprintf(stderr, "ds4: qwen4exp MTP seam: no device hyper for draft\n");
+        return -1;
+    }
+    if (ds4_qwen4exp_mtp_head_forward_last_device(
+            &s->qwen4exp_head, next_tokens, hyper, first_row, pos0, n,
+            draft_out, multi_out, err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4: qwen4exp MTP seam: %s\n", err);
+        return -1;
+    }
+#ifdef DS4_TEST_HOOKS
+    if (s->qwen4exp_forced_tokens) {
+        const uint32_t want = pos0 + n - 1u + 2u;
+        if (want < (uint32_t)s->qwen4exp_forced_len)
+            *draft_out = s->qwen4exp_forced_tokens[want];
+    }
+#endif
+    return 0;
+}
+
 /* The margin of the draft the latest head call returned; -1 when unmeasured. */
 static float qwen4exp_seam_draft_margin(void *ctx) {
     ds4_session *s = ctx;
@@ -76215,6 +76248,7 @@ static bool ds4_session_qwen4exp_spec_init(ds4_session *s,
     s->qwen4exp_seam.head_logits  = qwen4exp_seam_head_logits;
     s->qwen4exp_seam.draft_step   = qwen4exp_seam_draft_step;
     s->qwen4exp_seam.draft_rows   = qwen4exp_seam_draft_rows;
+    s->qwen4exp_seam.draft_rows_device = qwen4exp_seam_draft_rows_device;
     s->qwen4exp_seam.draft_margin = qwen4exp_seam_draft_margin;
 
     const int depth = ds4_qwen4exp_mtp_depth_from_draft_tokens(
