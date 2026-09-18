@@ -76066,6 +76066,70 @@ static int qwen4exp_seam_head_logits(void *ctx, const float *hc_row,
                                           hc_row, logits) ? 0 : -1;
 }
 
+#if defined(POSIX_MADV_WILLNEED)
+/* Scratch n-gram history for the advise below.  It is seeded from the
+ * session's post-commit history and advanced one token per advised draft
+ * input; a position that stops being contiguous -- a new chain, a serial
+ * step, a reset -- re-seeds it.  Hint state only: a wrong prediction costs
+ * a few page-ins and changes no value the model sees. */
+static ds4_ple_history qwen4exp_ple_adv_hist;
+static uint32_t        qwen4exp_ple_adv_pos;
+static bool            qwen4exp_ple_adv_valid;
+#endif
+
+/* The next verify's PLE rows, warmed under the head's own forward.
+ *
+ * The draft chain hands this seam every token the NEXT verify round will
+ * gather -- `next_token` here is the following round's toks[k+1] -- one head
+ * forward before that gather runs.  The gather's row reads are page faults
+ * on a 26.8 GiB SSD-mapped table sitting on the critical path (the device
+ * batch has not opened), so each draft step advises the sixteen rows its
+ * input token will name: the page-ins then ride the head's own GPU time and
+ * the verify's gather finds the pages already in flight or resident.
+ *
+ * Only real draft inputs are advised: a token whose position precedes the
+ * committed frontier (pos + 2 < session pos) is a head-cache seed the last
+ * verify already gathered, and seeding the scratch over it would only
+ * pollute the ids. */
+static void qwen4exp_ple_advise_token(ds4_session *s, int next_token,
+                                    uint32_t pos) {
+#if defined(POSIX_MADV_WILLNEED)
+    ds4_engine *e = s->engine;
+    ds4_qwen4exp_session *qs = e->qwen4exp_session;
+    const ds4_qwen4exp_weights *w = e->qwen4exp_weights;
+    if (!qs || !w || !qs->ple_ready || next_token < 0) return;
+    if (DS4_N_PLE_HEAD > DS4_PLE_MAX_HEADS) return;
+    if (pos + 2u < ds4_qwen4exp_session_pos(qs)) return;
+    if (!qwen4exp_ple_adv_valid || pos != qwen4exp_ple_adv_pos + 1u) {
+        qwen4exp_ple_adv_hist = qs->ple_history;
+    }
+    qwen4exp_ple_adv_valid = true;
+    qwen4exp_ple_adv_pos = pos;
+    uint64_t ids[DS4_PLE_MAX_HEADS];
+    const int32_t tok = (int32_t)next_token;
+    ds4_ple_row_ids(&qs->ple_constants, &qwen4exp_ple_adv_hist, &tok, 1u, ids);
+    static long ple_adv_page = 0;
+    if (ple_adv_page == 0) {
+        ple_adv_page = sysconf(_SC_PAGESIZE);
+        if (ple_adv_page <= 0) ple_adv_page = -1;
+    }
+    if (ple_adv_page <= 0) return;
+    const uintptr_t page = (uintptr_t)ple_adv_page;
+    for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
+        const uint8_t *quant = ds4_qwen4exp_ple_row(&w->ple, ids[h]);
+        if (!quant) continue;
+        const uintptr_t start = (uintptr_t)quant & ~(page - 1u);
+        const uintptr_t end = (uintptr_t)quant + w->ple.row_bytes;
+        (void)posix_madvise((void *)start, (size_t)(end - start),
+                            POSIX_MADV_WILLNEED);
+    }
+#else
+    (void)s;
+    (void)next_token;
+    (void)pos;
+#endif
+}
+
 static int qwen4exp_seam_draft_step(void *ctx, int next_token,
                                     const float *hc_row, uint32_t pos,
                                     int *draft_out, float *multi_out) {
@@ -76077,6 +76141,9 @@ static int qwen4exp_seam_draft_step(void *ctx, int next_token,
         fprintf(stderr, "ds4: qwen4exp MTP seam: %s\n", err);
         return -1;
     }
+    /* The token just consumed is the next verify's gather input; start its
+     * row page-ins now so they ride the head's next forward. */
+    qwen4exp_ple_advise_token(s, next_token, pos);
 #ifdef DS4_TEST_HOOKS
     /* `next_token` lands at pos + 1, so the draft is the token at pos + 2.
      *
@@ -76109,6 +76176,12 @@ static int qwen4exp_seam_draft_rows(void *ctx, const int *next_tokens,
                                            multi_out, err, sizeof(err)) != 0) {
         fprintf(stderr, "ds4: qwen4exp MTP seam: %s\n", err);
         return -1;
+    }
+    /* Only the last input is a real draft input -- the rows before it are
+     * head-cache seeds the last verify already gathered.  The position gate
+     * inside the advise drops anything earlier than the frontier anyway. */
+    if (n > 0u) {
+        qwen4exp_ple_advise_token(s, next_tokens[n - 1u], pos0 + n - 1u);
     }
 #ifdef DS4_TEST_HOOKS
     /* The last row sits at pos0 + n - 1 and drafts the token two past it, the
