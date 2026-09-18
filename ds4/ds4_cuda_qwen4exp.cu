@@ -549,7 +549,11 @@ __global__ static void qwen4exp_gdn_conv_kernel(
     const float w2 = conv_weight[(uint64_t)channel * 4u + 2u];
     const float w3 = conv_weight[(uint64_t)channel * 4u + 3u];
 
-    float raw = qkv[(uint64_t)row * n_tokens * conv_dim + channel];
+    /* Every qkv element is read exactly once per launch (this thread's
+     * channel, this token) and never again -- a pure stream.  Evict-first
+     * keeps those lines from displacing the persistent conv/recurrent state
+     * in L2.  Same bits, cache hint only. */
+    float raw = __ldcs(qkv + (uint64_t)row * n_tokens * conv_dim + channel);
     for (uint32_t token = 0; token < n_tokens; token++) {
         const uint64_t index =
             ((uint64_t)row * n_tokens + token) * conv_dim + channel;
@@ -571,7 +575,7 @@ __global__ static void qwen4exp_gdn_conv_kernel(
          * this point and is thrown away. */
         const uint64_t ahead =
             index + (token + 1u < n_tokens ? conv_dim : 0u);
-        const float raw_next = qkv[ahead];
+        const float raw_next = __ldcs(qkv + ahead);
 
         /* The window as it stands AFTER this token, which is what a rollback
          * to length token + 1 needs.  Written before the key/value branch
@@ -934,19 +938,21 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
      * Twin of that kernel -- keep the two expressions identical. */
     const float decay_coeff = a_log[head];
     const float bias = dt_bias[head];
-
     for (uint32_t token = 0; token < n_tokens; token++) {
         const uint64_t slot = (uint64_t)row * n_tokens + token;
         const uint64_t base = slot * conv_dim + key_head * QWEN4EXP_GDN_DIM;
-        const float4 q4 = *(const float4 *)(qkv + base + k0);
-        const float4 k4 = *(const float4 *)(qkv + base + key_dim + k0);
-        const float v_row = qkv[slot * conv_dim + 2u * (uint64_t)key_dim +
-            head * QWEN4EXP_GDN_DIM + value];
+        /* qkv and the gate rows are read exactly once per launch -- pure
+         * streams.  Evict-first keeps them from displacing the persistent
+         * recurrent state in L2.  Same bits, cache hint only. */
+        const float4 q4 = __ldcs((const float4 *)(qkv + base + k0));
+        const float4 k4 = __ldcs((const float4 *)(qkv + base + key_dim + k0));
+        const float v_row = __ldcs(qkv + slot * conv_dim + 2u * (uint64_t)key_dim +
+            head * QWEN4EXP_GDN_DIM + value);
         const uint64_t gate = slot * n_value_head + head;
         float g = 0.0f;
         float beta = 0.0f;
         if (PRECOMPUTED_GATES) {
-            const float2 pair = gate_pairs[gate];
+            const float2 pair = __ldcs(gate_pairs + gate);
             g = pair.x;
             beta = pair.y;
         } else {
@@ -956,8 +962,8 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
              * short decode and speculative-verify path inexpensive. */
             if (lane == 0u) {
                 g = expf(decay_coeff *
-                    qwen4exp_gdn_softplus(raw_alpha[gate] + bias));
-                beta = qwen4exp_gdn_sigmoid(raw_beta[gate]);
+                    qwen4exp_gdn_softplus(__ldcs(raw_alpha + gate) + bias));
+                beta = qwen4exp_gdn_sigmoid(__ldcs(raw_beta + gate));
             }
             g = __shfl_sync(0xffffffffu, g, 0);
             beta = __shfl_sync(0xffffffffu, beta, 0);
@@ -975,7 +981,8 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
         h.w = fmaf(k4.w, delta_v, h.w);
         const float result = warp_sum_all_f32(dot4_f32(h, q4));
         if (lane == 0u) {
-            out[slot * value_dim + head * QWEN4EXP_GDN_DIM + value] = result;
+            __stcs(out + slot * value_dim + head * QWEN4EXP_GDN_DIM + value,
+                   result);
         }
 
         /* Post-token rollback state; SNAP_PLAIN restores the original cache hint. */
