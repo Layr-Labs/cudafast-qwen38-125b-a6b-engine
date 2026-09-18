@@ -427,6 +427,13 @@ __device__ __forceinline__ static float qwen4exp_gdn_softplus(float x) {
  * standard error of one and two tenths: neutral. Widening the grid is not
  * what this path needs.
  */
+/* This build's note auto09180059_39 records that fusing two kernels is a
+ * win when the fusion is a union of their grids and a loss when it
+ * collapses a wide grid onto a narrow one, because the wide kernel's memory
+ * work then runs at the narrow kernel's parallelism. One such fold was bit
+ * exact, race clean and forty-six percent slower with a cold cache, because
+ * the round trip it removed had been acting as a parallel prefetch.
+ */
 __global__ static void qwen4exp_gdn_conv_kernel(
         float       *qkv,
         float       *conv_state,
@@ -8190,7 +8197,20 @@ __device__ __forceinline__ static void qsp_bar_arrive(int id, int count) {
 template <int MATRICES, int LOGCH, int KMAX>
 struct qsp_cfg {
     static constexpr int NT = 2;
-    static constexpr int PWARPS = 4;
+    /* Eight producer warps for the DOWN projection only (MATRICES == 1).
+     * This kernel is bound by producer global-load LATENCY -- measured: removing
+     * every MMA makes it SLOWER, removing every global load takes 31-39% off
+     * the wall, and perfectly coalescing the weight fetch is 4% slower still.
+     * Doubling the producer warps halves the per-thread staging while doubling
+     * the warps issuing loads: the same total staging, twice the memory-level
+     * parallelism.  PWARPS moves only WHICH producer thread stages WHICH
+     * element -- no value, no smem address contents and no consumer
+     * instruction changes, so the result is bit-identical.
+     * Gate/up (MATRICES == 2) keeps four: it showed no measured in-engine gain
+     * at eight, so it is left exactly as it was.  Verified by a whole-unit
+     * ptxas census: of 212 kernels, only the seven <1,*,*> instantiations
+     * move, and all seven lose their register spill. */
+    static constexpr int PWARPS = (MATRICES == 1) ? 8 : 4;
     static constexpr int THREADS = (QSP_CWARPS + PWARPS) * 32;
     static constexpr int BN = 2 * NT * 8;             /* WN = 2 */
     static constexpr int CH = 1 << LOGCH;
