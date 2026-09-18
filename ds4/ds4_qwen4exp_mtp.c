@@ -577,6 +577,14 @@ static int mtp_commit_one(ds4_qwen4exp_mtp_state *st,
  * than better. The gap in the comment is real; exploiting it is not
  * obviously a win.
  */
+/* This build's note auto09181919_66 records that the memory wall on this
+ * device is not one number: a cold read of six hundred and seventy-five
+ * megabytes peaks near two hundred and fifty-two gigabytes a second, which
+ * is ninety-two percent of the theoretical figure for this bus, while mixed
+ * read and write tops out near two hundred and twenty. A kernel that
+ * appears to beat the mixed figure is being served by the last level cache
+ * and its apparent bandwidth is not a wall.
+ */
 int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
                            const ds4_qwen4exp_mtp_model *model,
                            int first_token,
