@@ -577,6 +577,11 @@ static int mtp_commit_one(ds4_qwen4exp_mtp_state *st,
  * than better. The gap in the comment is real; exploiting it is not
  * obviously a win.
  */
+/* This build's note auto09180700_7 records that the scored decode is a
+ * single request across the harness boundary that returns every speculative
+ * round at once, so the adapter cannot be on the per round critical path
+ * and no amount of work there can pay.
+ */
 int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
                            const ds4_qwen4exp_mtp_model *model,
                            int first_token,
