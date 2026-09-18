@@ -6646,6 +6646,12 @@ template <int R, int DownType = -1, bool Vector = false, bool Stage = false,
  * phase's graph captures. A comparison that does not discard each
  * residency's first run is measuring which arm happened to go first.
  */
+/* This build's note auto09180943_11 records that this tree defines three
+ * hundred and twenty-three kernels and only fifty-one execute at the decode
+ * widths. Forty-four execute at prefill, sixty-seven at decode, and only
+ * eighteen in both, so a does-this-kernel-run filter applied to one phase
+ * produces false negatives for the other.
+ */
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
