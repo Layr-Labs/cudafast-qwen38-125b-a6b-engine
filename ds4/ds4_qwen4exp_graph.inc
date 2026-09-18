@@ -3139,8 +3139,11 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     }
     QW_TRACE(QW_SLICE_HEAD);
     QW_TRACE_REPORT(n_tokens);
-    /* Commit and wait: the logits are read on the host from here on. */
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
+    /* Commit and wait: the logits are read on the host from here on.
+     * ds4_gpu_end_commands() IS the wait -- on every backend it is a
+     * device-wide synchronize, so a second ds4_gpu_synchronize() here
+     * would only pay another full sync call to observe an idle device. */
+    if (!ds4_gpu_end_commands()) {
         fprintf(stderr, "ds4: qwen4exp command batch did not complete\n");
         return false;
     }
@@ -3193,7 +3196,9 @@ static bool qwen4exp_session_copy_layers(ds4_qwen4exp_session *s,
                                      (uint64_t)row * bytes, bytes) != 0;
         }
     }
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) return false;
+    /* end_commands is the device-wide wait; a second synchronize would
+     * only re-observe the idle device it already drained. */
+    if (!ds4_gpu_end_commands()) return false;
     if (ok && recurrent) s->gdn_replay_previous = false;
     return ok;
 }
@@ -3772,7 +3777,9 @@ bool ds4_qwen4exp_graph_head_logits(ds4_qwen4exp_session       *s,
         fprintf(stderr, "ds4: qwen4exp LM head failed on the head row\n");
         return qwen4exp_forward_fail();
     }
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
+    /* end_commands is the device-wide wait; a second synchronize would
+     * only re-observe the idle device it already drained. */
+    if (!ds4_gpu_end_commands()) {
         fprintf(stderr, "ds4: qwen4exp command batch did not complete\n");
         return false;
     }
@@ -3970,7 +3977,9 @@ static int qwen4exp_rb_ple_conv_select(void *ctx, uint32_t row) {
     const bool ok = ds4_gpu_tensor_copy(s->ple_conv_state, 0,
                                         s->ple_conv_snapshot,
                                         (uint64_t)row * bytes, bytes) != 0;
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) return -1;
+    /* end_commands is the device-wide wait; a second synchronize would
+     * only re-observe the idle device it already drained. */
+    if (!ds4_gpu_end_commands()) return -1;
     return ok ? 0 : -1;
 }
 static int qwen4exp_rb_qsa_kv_truncate(void *ctx, uint32_t pos) {
