@@ -504,7 +504,12 @@ __global__ static void qwen4exp_gdn_conv_kernel(
         uint32_t     n_tokens,
         uint32_t     n_snapshot_rows,
         float        qk_norm_eps,
-        const uint32_t *adopt_row) {
+        const uint32_t *adopt_row,
+        float2       *gate_pairs,
+        const float  *raw_alpha,
+        const float  *raw_beta,
+        const float  *a_log,
+        const float  *dt_bias) {
     const uint32_t block = blockIdx.x;
     const uint32_t row = blockIdx.y;
     const uint32_t tid = threadIdx.x;
@@ -607,6 +612,24 @@ __global__ static void qwen4exp_gdn_conv_kernel(
     history[channel] = h0;
     history[(uint64_t)conv_dim + channel] = h1;
     history[(uint64_t)2u * conv_dim + channel] = h2;
+    /* One publisher per (row, head): the recurrence's gate pair for a token
+     * is head-local, so block 0's first n_value_head threads evaluate it
+     * once each -- the same expressions the recurrence's lane 0 runs --
+     * instead of once per value-row block.  Stream order publishes the
+     * pairs before the recurrence reads them; the host checked that the
+     * gate inputs cannot alias this kernel's writes. */
+    if (gate_pairs && block == 0u && tid < n_value_head) {
+        const float coeff = a_log[tid];
+        const float bias = dt_bias[tid];
+        const uint64_t slot0 = (uint64_t)row * n_tokens;
+        for (uint32_t token = 0; token < n_tokens; ++token) {
+            const uint64_t gate = (slot0 + token) * n_value_head + tid;
+            const float g = expf(coeff *
+                qwen4exp_gdn_softplus(raw_alpha[gate] + bias));
+            const float beta = qwen4exp_gdn_sigmoid(raw_beta[gate]);
+            gate_pairs[gate] = make_float2(g, beta);
+        }
+    }
 }
 
 /* Replay-only twin: original serial convolution followed by gate publication. */
@@ -2632,6 +2655,7 @@ static int qwen4exp_cuda_gdn_run(
      * the recurrence reads its qkv from where that kernel wrote. */
     float *conv_out = NULL;
     float2 *gate_pairs = NULL;
+    float2 *serial_gates = NULL;
     /* A fused call is refused outright when its conditions do not hold:
      * the projection was written into the scratch on that promise. */
     if (conv_fused && (adopt_row || replay || n_rows != 1u ||
@@ -2719,12 +2743,42 @@ static int qwen4exp_cuda_gdn_run(
                 (const float *)raw_alpha->ptr, (const float *)raw_beta->ptr,
                 a_log, dt_bias);
     } else {
+        /* Serial convolution: publish the recurrence's gate pairs from the
+         * same kernel when the gate inputs cannot alias its writes -- the
+         * same early-reads check the replay path runs -- so the recurrence
+         * can take its precomputed-gates twin.  The scratch is the tier's
+         * conv scratch, free on this path; a failed allocation or an
+         * overlapping view keeps the in-kernel evaluation. */
+        if (!replay && n_value_head <= QWEN4EXP_GDN_DIM &&
+            getenv("DS4_QWEN4EXP_NO_GDN_SERIAL_GATES") == NULL) {
+            const void *gate_sources[] = {raw_alpha->ptr, raw_beta->ptr,
+                                          a_log, dt_bias};
+            const uint64_t gate_bytes[] = {raw_alpha->bytes, raw_beta->bytes,
+                (uint64_t)n_value_head * sizeof(float),
+                (uint64_t)n_value_head * sizeof(float)};
+            const ds4_gpu_tensor *conv_writes[] = {qkv, conv_state,
+                                                   conv_snapshot};
+            bool early_reads_safe = true;
+            for (unsigned i = 0; i < 4u; ++i)
+                for (const ds4_gpu_tensor *t : conv_writes)
+                    if (t && !qwen4exp_replay_gate_disjoint(
+                            gate_sources[i], gate_bytes[i],
+                            t->ptr, t->bytes))
+                        early_reads_safe = false;
+            if (early_reads_safe) {
+                float *scratch = qwen4exp_conv_scratch(logical_tier,
+                                                       2u * gate_elements);
+                serial_gates = (float2 *)scratch;
+            }
+        }
         qwen4exp_gdn_conv_kernel<<<dim3(blocks, n_rows, 1u),
                                    QWEN4EXP_GDN_DIM, 0, stream>>>(
                 (float *)qkv->ptr, (float *)conv_state->ptr, conv_weight,
                 conv_snapshot ? (float *)conv_snapshot->ptr : NULL,
                 n_key_head, n_value_head, n_rows, n_tokens, n_snapshot_rows,
-                qk_norm_eps, adopt_row);
+                qk_norm_eps, adopt_row, serial_gates,
+                (const float *)raw_alpha->ptr, (const float *)raw_beta->ptr,
+                a_log, dt_bias);
     }
     if (!cuda_ok(cudaGetLastError(), "qwen4exp GDN convolution launch")) {
         return 0;
@@ -2814,6 +2868,21 @@ static int qwen4exp_cuda_gdn_run(
                     getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u,
                     NULL);
         }
+    } else if (serial_gates) {
+        /* The serial convolution published the same pairs the lane-0
+         * evaluation below computes, bit for bit; read them instead. */
+        qwen4exp_gdn_recurrence_kernel<true><<<
+                recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
+                (float *)out->ptr, (float *)recurrent_state->ptr,
+                (const float *)qkv->ptr,
+                (const float *)raw_alpha->ptr,
+                (const float *)raw_beta->ptr, a_log, dt_bias,
+                serial_gates,
+                state_snapshot ? (float *)state_snapshot->ptr : NULL,
+                n_key_head, n_value_head, n_rows, n_tokens, head_layout,
+                n_snapshot_rows,
+                getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u,
+                adopt_row);
     } else {
         qwen4exp_gdn_recurrence_kernel<false><<<
                 recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
