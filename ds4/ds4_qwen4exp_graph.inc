@@ -2669,12 +2669,6 @@ static bool qwen4exp_graph_layers_encode_range(
     return true;
 }
 
-static bool qwen4exp_graph_layers_encode(
-        ds4_qwen4exp_session *s, const ds4_qwen4exp_weights *w,
-        const ds4_model *m, uint32_t n_tokens, bool use_islands) {
-    return qwen4exp_graph_layers_encode_range(s, w, m, n_tokens, use_islands,
-                                              0u, g_ds4_qwen4exp.n_layer);
-}
 
 /* How many consecutive captures the target stack is cut into.  1 is the single
  * whole-stack capture, which is what this build did before; the default trades
@@ -2726,14 +2720,14 @@ static void qw_decode_graph_trace_range(const ds4_qwen4exp_weights *w,
 static bool qw_decode_graph_chunk(ds4_qwen4exp_session *s,
                                   const ds4_qwen4exp_weights *w,
                                   const ds4_model *m, uint32_t n_tokens,
-                                  uint32_t chunk, uint32_t il_first,
-                                  uint32_t il_last) {
+                                  uint32_t key_il, int32_t next_key_il,
+                                  uint32_t il_first, uint32_t il_last) {
     ds4_decode_graph_key key;
     memset(&key, 0, sizeof(key));
-    /* Chunk index as the layer slot: island three has no per-layer entry, so
-     * chunk c and the per-layer caches of layer c cannot collide. */
-    key.il = chunk;
-    key.island = 3u;
+    /* The caller names the key slot: chunk c of a segment and the per-layer
+     * caches of layer c cannot collide, and the two segments the PLE gather
+     * splits the stack into take disjoint bases. */
+    key.il = key_il;
     key.variant = ds4_qwen4exp_gdn_graph_variant(
             n_tokens, s->spec_snapshot_rows, s->gdn_replay_phase,
             s->gdn_replay_active);
@@ -2750,9 +2744,9 @@ static bool qw_decode_graph_chunk(ds4_qwen4exp_session *s,
         /* Upload the NEXT chunk while the device runs this one, so its launch
          * finds the graph resident instead of uploading it in front of an idle
          * GPU.  A miss is a no-op. */
-        if (il_last < g_ds4_qwen4exp.n_layer) {
+        if (next_key_il >= 0) {
             ds4_decode_graph_key next = key;
-            next.il = chunk + 1u;
+            next.il = (uint32_t)next_key_il;
             (void)ds4_gpu_decode_graph_prefetch(&next);
         }
         return true;
@@ -2779,9 +2773,17 @@ static bool qw_decode_graph_chunk(ds4_qwen4exp_session *s,
                                               il_first, il_last);
 }
 
-static bool qwen4exp_graph_layers(
+/* The layer stack over [il_first, il_last).  The forward calls it twice: once
+ * for the layers ahead of the PLE block and once for the rest, with the host
+ * n-gram gather between the two launches so the gather's page faults ride the
+ * first segment's device execution instead of an idle GPU.  `key_base` is the
+ * island-3 slot the segment's graphs key on; the two segments take disjoint
+ * bases so their cached graphs never collide. */
+static bool qwen4exp_graph_layers_range(
         ds4_qwen4exp_session *s, const ds4_qwen4exp_weights *w,
-        const ds4_model *m, uint32_t n_tokens) {
+        const ds4_model *m, uint32_t n_tokens,
+        uint32_t il_first, uint32_t il_last, uint32_t key_base) {
+    if (il_first >= il_last) return true;
     bool capture_ok =
         n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
         (uint64_t)s->pos + n_tokens <= DS4_N_INDEXER_TOP_K &&
@@ -2801,17 +2803,21 @@ static bool qwen4exp_graph_layers(
      * sets it.  Cutting the capture at a layer boundary therefore cannot move
      * an inject across it, and a forward that replays some chunks and encodes
      * others is the same computation in the same order. */
+    const uint32_t n_span = il_last - il_first;
     if (capture_ok && qw_decode_graph_chunks() > 1u) {
-        const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
         uint32_t chunks = qw_decode_graph_chunks();
-        if (chunks > cfg->n_layer) chunks = cfg->n_layer;
-        const uint32_t per = (cfg->n_layer + chunks - 1u) / chunks;
+        if (chunks > n_span) chunks = n_span;
+        const uint32_t per = (n_span + chunks - 1u) / chunks;
         for (uint32_t c = 0; c < chunks; c++) {
-            const uint32_t il_first = c * per;
-            if (il_first >= cfg->n_layer) break;
-            uint32_t il_last = il_first + per;
-            if (il_last > cfg->n_layer) il_last = cfg->n_layer;
-            if (!qw_decode_graph_chunk(s, w, m, n_tokens, c, il_first, il_last)) {
+            const uint32_t first = il_first + c * per;
+            if (first >= il_last) break;
+            uint32_t last = first + per;
+            if (last > il_last) last = il_last;
+            const uint32_t key_il = key_base + c;
+            const int32_t next_key_il = (c + 1u < chunks && last < il_last)
+                ? (int32_t)(key_il + 1u) : -1;
+            if (!qw_decode_graph_chunk(s, w, m, n_tokens, key_il, next_key_il,
+                                       first, last)) {
                 return false;
             }
         }
@@ -2822,7 +2828,7 @@ static bool qwen4exp_graph_layers(
         memset(&key, 0, sizeof(key));
         /* Target layer zero has no island-three entry.  The existing head
          * uses island three at its own layer index, so the caches are disjoint. */
-        key.il = 0u;
+        key.il = key_base;
         key.island = 3u;
         key.variant = ds4_qwen4exp_gdn_graph_variant(
             n_tokens, s->spec_snapshot_rows, s->gdn_replay_phase,
@@ -2836,8 +2842,7 @@ static bool qwen4exp_graph_layers(
         if (state == 1) {
 #ifdef DS4_TEST_HOOKS
             /* Preserve the logical slice trace even when encoding is skipped. */
-            const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
-            for (uint32_t il = 0; il < cfg->n_layer; il++) {
+            for (uint32_t il = il_first; il < il_last; il++) {
                 const ds4_qwen4exp_layer_weights *l = &w->layer[il];
                 if (l->has_ple) QW_TRACE(QW_SLICE_PLE);
                 QW_TRACE(QW_SLICE_ATTN_MIX);
@@ -2856,7 +2861,8 @@ static bool qwen4exp_graph_layers(
             const bool trace_overflow = g_qwen4exp_trace_overflow;
 #endif
             /* Encode primitives directly, without nested per-layer captures. */
-            if (qwen4exp_graph_layers_encode(s, w, m, n_tokens, false)) {
+            if (qwen4exp_graph_layers_encode_range(s, w, m, n_tokens, false,
+                                                   il_first, il_last)) {
                 if (ds4_gpu_decode_graph_end(&key) == 0) return true;
             } else {
                 ds4_gpu_decode_graph_abort(&key);
@@ -2869,7 +2875,8 @@ static bool qwen4exp_graph_layers(
              * per-layer path for this call and any retired/full cache entry. */
         }
     }
-    return qwen4exp_graph_layers_encode(s, w, m, n_tokens, true);
+    return qwen4exp_graph_layers_encode_range(s, w, m, n_tokens, true,
+                                              il_first, il_last);
 }
 
 /* Diagnostic/fallback bridge: publish the virtual row-zero snapshot into
@@ -2968,20 +2975,12 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         return false;
     }
 
-    /* The PLE host half runs BEFORE the batch opens: the row upload is a
-     * memcpy into a shared buffer, and a memcpy between an encode and a commit
-     * would land ahead of work already encoded.  Nothing here touches the
-     * device beyond that one write. */
-    {
-        const ds4_qwen4exp_layer_weights *ple = &w->layer[cfg->ple_layer];
-        if (ple->has_ple &&
-            !qwen4exp_graph_ple_gather(s, w, tokens, n_tokens, cfg->ple_layer)) {
-            fprintf(stderr,
-                    "ds4: qwen4exp n-gram row gather failed for block %u\n",
-                    cfg->ple_layer);
-            return false;
-        }
-    }
+    /* The PLE host gather no longer runs here.  It sits between the two
+     * layer-stack segments below, after the first segment's launches are
+     * already executing on the device: the row upload is a stream-ordered
+     * memcpy, so it lands after that segment's kernels and ahead of the
+     * segment that consumes the rows, and the gather's page faults ride the
+     * first segment's execution instead of an idle GPU. */
 
     /* One command batch for the whole forward.  Every op below joins it rather
      * than taking its own command buffer, and the blits that append to the KV
@@ -3079,7 +3078,32 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     }
     QW_TRACE(QW_SLICE_EMBED);
 
-    if (!qwen4exp_graph_layers(s, w, m, n_tokens)) {
+    /* The stack is cut at the PLE block.  Segment A -- every layer ahead of
+     * cfg->ple_layer -- is launched first; while the device runs it, the host
+     * hashes this call's n-gram row ids, faults the rows out of the
+     * SSD-resident table and dequantizes them, and the upload's blocking
+     * memcpy orders itself after segment A and before segment B's PLE block
+     * encode.  Segment B then encodes the PLE block and the rest of the
+     * tower.  Same kernels, same order, same numbers: only the host's idle
+     * window moved.  The two segments key their cached graphs on disjoint
+     * island-3 bases (0 and QW_DECODE_GRAPH_MAX_CHUNKS). */
+    const bool has_ple = cfg->ple_layer < cfg->n_layer &&
+                         w->layer[cfg->ple_layer].has_ple;
+    const uint32_t ple_split = has_ple ? cfg->ple_layer : 0u;
+    if (!qwen4exp_graph_layers_range(s, w, m, n_tokens,
+                                     0u, ple_split, 0u)) {
+        return qwen4exp_forward_fail();
+    }
+    if (has_ple &&
+        !qwen4exp_graph_ple_gather(s, w, tokens, n_tokens, cfg->ple_layer)) {
+        fprintf(stderr,
+                "ds4: qwen4exp n-gram row gather failed for block %u\n",
+                cfg->ple_layer);
+        return qwen4exp_forward_fail();
+    }
+    if (!qwen4exp_graph_layers_range(s, w, m, n_tokens,
+                                     ple_split, cfg->n_layer,
+                                     QW_DECODE_GRAPH_MAX_CHUNKS)) {
         /* Layers that ran have already advanced the live state and rewritten
          * slots, so the state is undefined until the next reset or sync, as
          * it is on the copy path; `state_dirty` is set above. */
