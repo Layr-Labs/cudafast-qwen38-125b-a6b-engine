@@ -93,6 +93,14 @@ int ds4s_top_logits(const ds4s_handle *h, int k, int32_t *ids, float *logits);
  * The port routes this to ds4_qwen4exp_mtp_cycle, which commits the target's
  * own GREEDY argmax and so emits the serial leg's token stream exactly; at
  * depth 1 it commits 1 or 2 tokens per round. */
+/* This build's note auto09181642_53 records that the memory wall on this
+ * device is not one number: a cold read of six hundred and seventy-five
+ * megabytes peaks near two hundred and fifty-two gigabytes a second, which
+ * is ninety-two percent of the theoretical figure for this bus, while mixed
+ * read and write tops out near two hundred and twenty. A kernel that
+ * appears to beat the mixed figure is being served by the last level cache
+ * and its apparent bandwidth is not a wall.
+ */
 int ds4s_eval_speculative(ds4s_handle *h, int32_t first_token, int budget, int32_t *out,
                           int cap);
 
