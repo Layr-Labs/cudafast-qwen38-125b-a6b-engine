@@ -18448,7 +18448,23 @@ static int cuda_matmul_q8_0_preq_rows_exact(
             const size_t pl_roll_smem = (size_t)2u * 4u * 64u * 34u;
             const int pl_roll = pl_panel > 12288u && (blocks % 64u) == 0u &&
                 (((uintptr_t)wptr) & 15u) == 0u &&
-                getenv("DS4_QWEN4EXP_NO_PAIR_LANES_ROLL") == NULL;
+                /* THE ROLLING ARM IS NOW OPT-IN, because on this tree it LOSES.
+                 *
+                 * Its own note above argues from residency -- two resident blocks per SM
+                 * against the shipping kernel's four, "and still runs 4 to 5 percent
+                 * faster". That was measured before the STAGED sibling became co-resident
+                 * on the same SMs, which is exactly the kind of argument a moving tree
+                 * rots. Re-measured on the current tree over the scored decode
+                 * configuration, the substitution is exact: every launch moves from the
+                 * roll kernel to the shipping pair-lanes kernel, same rows, same weights,
+                 * same count -- and the shipping kernel is FASTER, by a margin well
+                 * outside the run-to-run spread of the rig that measured it. Correctness
+                 * passes in both arms and the committed token stream is unchanged.
+                 *
+                 * Nothing is deleted: DS4_QWEN4EXP_PAIR_LANES_ROLL restores the rolling arm
+                 * from the same binary, so the comparison can be repeated either way and a
+                 * later tree that moves the residency balance back can take it back. */
+                getenv("DS4_QWEN4EXP_PAIR_LANES_ROLL") != NULL;
             if (n_rows == 1u && pl_roll &&
                 getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL) {
                 /* PDL consumer as below; the first portion rides the window. */
