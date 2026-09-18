@@ -6625,112 +6625,6 @@ __global__ static void matmul_q8_hc_warp_pair_kernel(
     }
 }
 
-/* The kernel above with its WEIGHT TRAFFIC restructured, and nothing else.
- *
- * The block's four output rows are 4 * 340 = 1360 contiguous bytes of the
- * q8_0 slab, and 1360 = 16 * 85, so a block's run starts 16-byte aligned
- * whenever the tensor base is (the launcher gates on that).  It therefore
- * arrives as ONE __ldcs uint4 per thread -- eighty-five perfectly coalesced
- * 16-byte requests for the whole block -- instead of twenty lanes each
- * issuing four 4-byte and two 2-byte requests scattered over the same 340
- * bytes, and the walk below then runs against shared memory.
- *
- * SAME ARITHMETIC.  The lane-to-element map (group = lane>>1, half = lane&1,
- * groups 0..9 live), the address-parity shift, the __funnelshift_r
- * extraction, the four-step __dp4a chain, the pair combine on mask
- * 0x000fffff and the zero-padded 16/8/4/2 butterfly are the kernel above's,
- * character for character; only the route the weight bytes take changes.
- * In SASS the value chain is instruction for instruction the same: eight
- * IDP.4A.S8.S8 in the same chained order, two SHFL.BFLY, two I2FP.F32.S32,
- * two FMUL.FTZ, two FFMA.FTZ against RZ, four SHF.R.W.U32, one HADD2.F32
- * and the same seventeen FADD.FTZ against twenty SHFL.  The only extra
- * integer instruction is an IDP.2A address multiply feeding IADD.64.
- *
- * PDL: unchanged in kind.  Every weight byte the block owns is in shared
- * memory before the fence, exactly as every weight word a lane owned was in
- * registers before the fence above, so the fence still holds the activation
- * reads (xq/xs, the silu kernel's output) and nothing else moves.  The
- * __syncthreads() that publishes the staged run is above the fence for the
- * same reason. */
-template<int R>
-__global__ static void matmul_q8_hc_warp_pair_stage_kernel(
-        float *out, const unsigned char *w,
-        const int8_t *xq, const float *xs, uint64_t out_dim, uint32_t rows) {
-    __shared__ __align__(16) unsigned char sw[4 * 340];
-    const unsigned lane = threadIdx.x & 31u;
-    const unsigned group = lane >> 1u, half = lane & 1u;
-    const unsigned rl = threadIdx.x >> 5u;
-    const uint64_t row0 = (uint64_t)blockIdx.x * 4u;
-    if (threadIdx.x < 85u) {
-        ((uint4 *)sw)[threadIdx.x] =
-                __ldcs((const uint4 *)(w + row0 * 340u) + threadIdx.x);
-    }
-    __syncthreads();
-    QWEN4EXP_PDL_SYNC();
-    const uint64_t row = row0 + rl;
-    float acc[R];
-#pragma unroll
-    for (int r = 0; r < R; r++) acc[r] = 0.0f;
-    if (group < 10u && row < out_dim) {
-        const unsigned char *blk = sw + rl * 340u + group * 34u;
-        const unsigned char *payload = blk + 2u + half * 16u;
-        const uintptr_t address = (uintptr_t)payload;
-        const unsigned shift = (address & 3u) * 8u;
-        const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
-        uint32_t previous = words[0];
-        int32_t wq[4];
-#pragma unroll
-        for (int j = 0; j < 3; j++) {
-            const uint32_t next = words[j + 1];
-            wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
-            previous = next;
-        }
-        const uint16_t last = *(const uint16_t *)(payload + 14u);
-        wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
-        const float ws = __half2float(__ushort_as_half(*(const uint16_t *)blk));
-#pragma unroll
-        for (int r = 0; r < R; r++) {
-            if ((unsigned)r < rows) {
-                const unsigned at = (unsigned)r * 10u + group;
-                const int32_t *xw = (const int32_t *)(xq + at * 32u + half * 16u);
-                int dot = 0;
-#pragma unroll
-                for (int j = 0; j < 4; j++) dot = __dp4a(wq[j], xw[j], dot);
-                dot += __shfl_xor_sync(0x000fffffu, dot, 1);
-                if (!half) acc[r] += ws * xs[at] * (float)dot;
-            }
-        }
-    }
-    /* Original chains 16..31 are zero. Chains 0..15 now occupy the even
-     * lanes; original strides 8,4,2,1 become physical strides 16,8,4,2. */
-#pragma unroll
-    for (int r = 0; r < R; r++) {
-        acc[r] = acc[r] + 0.0f;
-#pragma unroll
-        for (int d = 16; d >= 2; d >>= 1)
-            acc[r] += __shfl_down_sync(0xffffffffu, acc[r], d);
-        if (lane == 0u && (unsigned)r < rows && row < out_dim)
-            out[(uint64_t)r * out_dim + row] = acc[r];
-    }
-}
-
-/* The staged weight route above is DEFAULT ON with a kill switch, matching
- * every other measured path in this tree: DS4_Q8_HC_WARP_PAIR_STAGE=0
- * restores the shipped kernel exactly.  It was authored default-off for A/B
- * measurement, and a default-off valve ships as a no-op because the scored
- * run sets no environment.  Resolved once, as ds4_qwen4exp_pdl_enabled does,
- * so no launch pays a getenv. */
-static int cuda_q8_hc_warp_pair_stage(void) {
-    static int resolved = 0;
-    static int enabled = 0;
-    if (!resolved) {
-        const char *e = getenv("DS4_Q8_HC_WARP_PAIR_STAGE");
-        enabled = (e && e[0] == '0') ? 0 : 1;
-        resolved = 1;
-    }
-    return enabled;
-}
-
 /* The same per-output-element arithmetic as the tile kernel above, on the int8
  * tensor cores, with the whole prefill width in ONE tile.
  *
@@ -18369,29 +18263,13 @@ static int cuda_matmul_q8_0_preq_rows_exact(
             } else if (getenv("DS4_Q8_NO_HC_WARP_PAIR") == NULL) {
                 /* PDL consumer: the stream predecessor is
                  * qwen4exp_hc_silu_quant, which triggers at its top
-                 * (ds4_cuda_qwen4exp.cuh).
-                 *
-                 * The staged weight route is the same grid, the same block
-                 * shape, the same warps per row and the same arithmetic; its
-                 * uint4 stage needs the slab 16-byte aligned and the row
-                 * count a multiple of four, both of which hold at this gated
-                 * shape and neither of which the kernel may assume. */
-                if (cuda_q8_hc_warp_pair_stage() &&
-                    (((uintptr_t)wptr & 15u) == 0u) && ((out_dim & 3u) == 0u)) {
-                    QWEN4EXP_LAUNCH_PDL(
-                            (matmul_q8_hc_warp_pair_stage_kernel<2>),
-                            (unsigned)((out_dim + 3u) / 4u), 128, 0,
-                            cuda_decode_stream(),
-                            (float *)out->ptr, (const unsigned char *)wptr,
-                            xq, xscale, out_dim, n_rows);
-                } else {
-                    QWEN4EXP_LAUNCH_PDL(
-                            (matmul_q8_hc_warp_pair_kernel<2>),
-                            (unsigned)((out_dim + 3u) / 4u), 128, 0,
-                            cuda_decode_stream(),
-                            (float *)out->ptr, (const unsigned char *)wptr,
-                            xq, xscale, out_dim, n_rows);
-                }
+                 * (ds4_cuda_qwen4exp.cuh). */
+                QWEN4EXP_LAUNCH_PDL(
+                        (matmul_q8_hc_warp_pair_kernel<2>),
+                        (unsigned)((out_dim + 3u) / 4u), 128, 0,
+                        cuda_decode_stream(),
+                        (float *)out->ptr, (const unsigned char *)wptr,
+                        xq, xscale, out_dim, n_rows);
             } else {
                 /* PDL consumer: the valve leg of the HC up edge; the stream
                  * predecessor qwen4exp_hc_silu_quant triggers at its top. */
