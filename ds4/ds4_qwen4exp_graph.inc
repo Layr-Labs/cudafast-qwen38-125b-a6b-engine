@@ -1,3 +1,4 @@
+/* ROUND 110 PROMOTION DRAW — stamp 20260918T195952Z. Tip 2352dfa. Best 2.661911. Bar 2.664573. R109=2.62498 s3 nq. Jev redraw 0.79 act_all. */
 /*
  * qwen4exp serial graph: session state, memory plan and the forward.
  * See ds4_qwen4exp_graph.h for the contract and the layer schedule.
