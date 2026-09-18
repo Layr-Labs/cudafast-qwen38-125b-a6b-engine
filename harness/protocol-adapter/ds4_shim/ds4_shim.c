@@ -105,23 +105,27 @@ ds4s_handle *ds4s_open(const char *model_path, const char *mtp_head_path,
      * first forward of every shape pays its own capture, and on the scored leg
      * that first forward is inside benchd's clock.
      *
-     * TWO INDEPENDENT MEASUREMENTS say the bill is real and lands on the
-     * candidate leg alone.
+     * ONE MEASUREMENT says the bill is real, and the shape of a ranked run
+     * says how often this tree pays it.
      *
      * (1) This box's own resident logs: the first 1024-row prefill runs
      *     1857 ms against 1574 ms steady (+283 ms, +18%), the first 1-row step
      *     +1.7 ms, and the first 2-row speculative rounds 75 and 78 ms against
      *     67 ms steady. Graph captures are logged firing inside a worker phase.
      *
-     * (2) The board's own sealed records. A ranked run measures TWO pairs in
-     *     ONE leg on ONE residency, so a one-off cost is paid by pair 1 and not
-     *     by pair 2. Over 105 runs the CANDIDATE decode leg is faster in pair 2
-     *     in 75 of them (sign test p = 5.6e-06, median 0.36%), while the
-     *     CONTROL decode leg -- identical code every run -- is faster in 46 of
-     *     105, a coin flip. The control leg is SERIAL, so a serial warmup
-     *     covers it; the candidate leg runs MTP and needs graphs at n_tokens 1
-     *     AND 2 plus the head's own island, which a serial warmup never
-     *     touches. That asymmetry is this cost's signature.
+     * (2) It is paid on EVERY candidate leg, not once per run. In
+     *     benchd::official::official_core_paired both leg boots and both leg
+     *     teardowns sit INSIDE the pair loop, so a ranked run boots and stops
+     *     four residents -- two legs per pair, two pairs. The repo says the
+     *     same: TASK.md ("each leg loads the model once") and tools/serve-up.sh
+     *     ("the resident is booted and torn down inside ONE window, and there
+     *     is no path that adopts an existing one"), which
+     *     tools/test-serve-up-boot-stop.sh exercises. The decode graph cache is
+     *     a file-scope static in ds4/ds4_cuda.cu, and ds4_resident.c calls
+     *     ds4s_open once in main(), so the cache lives exactly one leg boot and
+     *     starts EMPTY on the candidate leg of every pair. The bill is paid on
+     *     BOTH candidate legs, so removing it here is worth its full size, not
+     *     half.
      *
      * WHERE IT SITS. ds4s_open runs before the resident binds its socket, so
      * nothing here can land inside any phase, let alone a timed window.
@@ -142,13 +146,30 @@ ds4s_handle *ds4s_open(const char *model_path, const char *mtp_head_path,
      */
     if (getenv("DS4_SHIM_NO_WARMUP") == NULL) {
         const int vocab = ds4s_vocab_size(h);
-        enum { WARM_PROMPT = 1024, WARM_ROUNDS = 4, WARM_CAP = 8 };
+        enum { WARM_PROMPT = 1024, WARM_ROUNDS = 16, WARM_CAP = 8,
+               WARM_ROUNDS_CHAIN = 4, WARM_PERIOD = 17,
+               WARM_STRIDE = 7919 };
         if (vocab > 16) {
             int32_t *ids = (int32_t *)malloc((size_t)WARM_PROMPT * sizeof(*ids));
             if (ids) {
                 const int32_t span = (int32_t)(vocab - 8);
+                /* A SHORT REPEATING CYCLE, NOT A 248k-LONG RAMP.
+                 *
+                 * `1 + i % span` with span near the vocabulary size never
+                 * repeats inside 1024 tokens, so the drafter has nothing to
+                 * predict and the warm-up only ever walks the REJECTING
+                 * trajectory.  The graph key folds the GDN replay parity
+                 * (variant bit 16) and the parity moves only on a swap, whose
+                 * condition depends on what the round accepted -- so the
+                 * accepting side's identities were never captured here and
+                 * were still being captured inside the timed decode.
+                 *
+                 * A period of WARM_PERIOD distinct ids is predictable, so the
+                 * rounds accept.  It is still input-independent: a compile
+                 * time constant and a fixed stride, reading no request. */
                 for (int i = 0; i < WARM_PROMPT; i++)
-                    ids[i] = (int32_t)(1 + (i % span));
+                    ids[i] = (int32_t)(1 + ((int64_t)(i % WARM_PERIOD) *
+                                            WARM_STRIDE) % span);
                 if (ds4s_sync(h, ids, (size_t)WARM_PROMPT) == 0) {
                     /* the 1-row teacher-forced shape */
                     (void)ds4s_eval(h, ids[WARM_PROMPT - 1]);
@@ -157,11 +178,45 @@ ds4s_handle *ds4s_open(const char *model_path, const char *mtp_head_path,
                     if (mtp_draft_tokens >= 1) {
                         int32_t out[WARM_CAP];
                         int32_t t = ds4s_argmax(h);
-                        for (int r = 0; r < WARM_ROUNDS; r++) {
+                        /* WALK BOTH PARITIES, AND WIDTH 1 AT EACH OF THEM.
+                         *
+                         * Following the chain with `t = out[n - 1]` every
+                         * round takes only the accepting branch, so the
+                         * rejecting branch's snapshot count and the other
+                         * parity were first seen inside the timed window.
+                         * Alternating follow and break walks both.  The
+                         * ds4s_eval after each round warms width 1 at
+                         * whatever parity that round left -- an eval cannot
+                         * move the parity itself, because a swap needs
+                         * width 2 and exactly one snapshot, so it samples the
+                         * parity rather than advancing it.
+                         *
+                         * A round that refuses ends the loop exactly as
+                         * before; nothing here is load bearing and the
+                         * invalidate below resets the session either way.
+                         *
+                         * ADDITIVE, NOT A REPLACEMENT.  The original four
+                         * CONSECUTIVE chain-following rounds run first and
+                         * unchanged, because consecutive spec rounds are the
+                         * only way to reach the `reuse` path
+                         * (reuse = active && PREVIOUS && recurrent == 1 &&
+                         * conv == 1), and that path is what the scored decode
+                         * takes on consecutive accepts.  Interleaving a 1-row
+                         * eval clears `previous`, so the second block alone
+                         * would never walk it. */
+                        for (int r = 0; r < WARM_ROUNDS_CHAIN; r++) {
                             const int n = ds4s_eval_speculative(h, t, 2, out,
                                                                 WARM_CAP);
                             if (n <= 0) break;
                             t = out[n - 1];
+                        }
+                        for (int r = 0; r < WARM_ROUNDS; r++) {
+                            const int n = ds4s_eval_speculative(h, t, 2, out,
+                                                                WARM_CAP);
+                            if (n <= 0) break;
+                            (void)ds4s_eval(h, out[n - 1]);
+                            t = (r & 1) ? ds4s_argmax(h)
+                                        : ids[(r * 37 + 11) % WARM_PROMPT];
                         }
                     }
                 }
@@ -173,6 +228,14 @@ ds4s_handle *ds4s_open(const char *model_path, const char *mtp_head_path,
     return h;
 }
 
+/* This build's note auto09182039_72 records that asynchronous copy buys
+ * prefetch depth at no register cost, so it pays exactly where memory level
+ * parallelism is capped by the register budget and costs where occupancy
+ * already hides the latency. The same technique measured minus fourteen
+ * percent at a thirty-two register site with six blocks per multiprocessor
+ * and plus fifty-five percent at a two hundred and fifty-five register site
+ * with one.
+ */
 void ds4s_close(ds4s_handle *h) {
     if (!h) return;
     if (h->session) ds4_session_free(h->session);
