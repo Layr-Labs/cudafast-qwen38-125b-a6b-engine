@@ -2302,6 +2302,20 @@ static bool qwen4exp_hc_defer_ok(uint32_t n_tokens) {
     return n_tokens >= DS4_QWEN4EXP_HC_DEFER_MIN_ROWS && !qwen4exp_hc_defer_off();
 }
 
+/* SWEEP 2026-09-18: at decode widths, defer ONLY the attention block's inject
+ * to the FFN mixer of the same layer (the fused mixer folds it into its first
+ * pass, qwen4exp_hc_norm_quant_pending_kernel).  The FFN inject stays the
+ * standalone kernel, so hc_pending is false at every layer boundary and the
+ * chunk-boundary invariant above holds unchanged.  DS4_HC_PEND=1 selects it. */
+static bool qwen4exp_hc_decode_fold_ok(uint32_t n_tokens) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_HC_PEND");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return cached && n_tokens <= 2u;
+}
+
 /* Settle an owed inject with the standalone kernel.  Used where the next
  * reader of `hyper` is not a mixer (the PLE block, a diagnostic dump). */
 static bool qwen4exp_hc_flush_pending(ds4_qwen4exp_session *s, uint32_t n_tokens) {
@@ -2409,7 +2423,7 @@ static bool qwen4exp_graph_layer_island_encode(
          * applied here (qwen4exp_hc_defer_ok); the slice trace keeps its
          * order either way, it records what the model computed. */
         const bool defer = qwen4exp_hc_defer_ok(n_tokens);
-        if (defer) {
+        if (defer || qwen4exp_hc_decode_fold_ok(n_tokens)) {
             s->hc_pending = true;
         } else if (!ds4_gpu_qwen4exp_hc_inject_tensor(s->hyper, s->hyper, s->block_out,
                                                s->inject, DS4_N_EMBD, DS4_N_HC,

@@ -180,6 +180,16 @@ static void *qwen4exp_group_scratch(int tier, uint64_t bytes) {
 static int qwen4exp_shared_fork_on(void) {
     return getenv("DS4_QWEN4EXP_NO_SHARED_FORK") == NULL;
 }
+/* SWEEP 2026-09-18: routed down panel ring depth valve, read once. */
+static int qwen4exp_down_depth(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_DOWN_DEPTH");
+        v = e ? atoi(e) : 2;
+        if (v != 3 && v != 4) v = 2;
+    }
+    return v;
+}
 
 static cudaStream_t g_qwen4exp_fork_stream[16];
 static cudaEvent_t  g_qwen4exp_fork_xq_ready[16];
@@ -189,6 +199,22 @@ static int          g_qwen4exp_fork_state[16];   /* 0 unset, 1 ready, -1 refused
 /* The side stream and its two events for one device, created on first use.
  * Non-blocking, so in eager mode it does not serialize against the legacy
  * stream the main path rides there; every ordering it needs is an event. */
+/* SWEEP 2026-09-18: DS4_QWEN4EXP_FORK_PRIO=1 creates the side stream at the
+ * device's greatest stream priority, so the shared-expert blocks are
+ * scheduled ahead of the routed grid's remaining blocks as SM slots free,
+ * instead of draining behind them.  Scheduling only: no value changes. */
+static cudaError_t qwen4exp_fork_stream_create(cudaStream_t *s) {
+    const char *e = getenv("DS4_QWEN4EXP_FORK_PRIO");
+    if (e && e[0] && e[0] != '0') {
+        int least = 0, greatest = 0;
+        if (cudaDeviceGetStreamPriorityRange(&least, &greatest) == cudaSuccess) {
+            return cudaStreamCreateWithPriority(s, cudaStreamNonBlocking, greatest);
+        }
+        (void)cudaGetLastError();
+    }
+    return cudaStreamCreateWithFlags(s, cudaStreamNonBlocking);
+}
+
 static int qwen4exp_fork_ready(int tier, cudaStream_t stream) {
     if (tier < 0 || tier >= 16) return 0;
     if (g_qwen4exp_fork_state[tier] > 0) return 1;
@@ -204,7 +230,7 @@ static int qwen4exp_fork_ready(int tier, cudaStream_t stream) {
     if (st != cudaStreamCaptureStatusNone) return 0;
     cudaStream_t s = NULL;
     cudaEvent_t a = NULL, b = NULL;
-    if (cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) == cudaSuccess &&
+    if (qwen4exp_fork_stream_create(&s) == cudaSuccess &&
         cudaEventCreateWithFlags(&a, cudaEventDisableTiming) == cudaSuccess &&
         cudaEventCreateWithFlags(&b, cudaEventDisableTiming) == cudaSuccess) {
         g_qwen4exp_fork_stream[tier] = s;
@@ -4960,6 +4986,11 @@ __device__ __forceinline__ static void qw_cpasync_commit(void) {
 __device__ __forceinline__ static void qw_cpasync_wait0(void) {
     asm volatile("cp.async.wait_group 0;\n" ::);
 }
+/* SWEEP 2026-09-18: wait until at most N copy groups are still pending. */
+template <int N>
+__device__ __forceinline__ static void qw_cpasync_wait_n(void) {
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+}
 /* prefetch.global.L2 brings the 128-byte line holding the address into the L2.
  * It has no architectural effect on any value: the loads that follow read the
  * same bytes whether the line was prefetched or not. */
@@ -5993,6 +6024,11 @@ __device__ __forceinline__ static void qwen4exp_shared_vector_accumulate(
 #define QW_GU_COOP_ROW_U4 90u                /* 1440 B, ten q4_K super-blocks */
 #define QW_GU_COOP_GROUPS 80u                            /* in_dim 2560 / 32 */
 #define QW_GU_COOP_U4 (QW_GU_COOP_ROWS * QW_GU_COOP_ROW_U4)
+/* SWEEP 2026-09-18: rolling L2 prefetch for the coop panel, D blocks ahead on
+ * the same expert (blocks are dispatched x-fastest, so block x+D is one of the
+ * next to start).  A prefetch changes no value; every load reads the same
+ * bytes.  DS4_GU_PF=D sets the distance (0 = shipped, no prefetch). */
+static __device__ int g_qw_gu_pf_dist = 0;
 
 /* The eight payload words qw_raw_load's q4_K arm returns for (row, group),
  * read out of the staged copy of the identical row bytes.  A q4_K row is 90
@@ -6210,6 +6246,27 @@ qwen4exp_moe_gateup_split_kernel(
             wcoop[i] = *(const uint4 *)(const void *)(gb + (uint64_t)i * 16u);
             wcoop[QW_GU_COOP_U4 + i] =
                 *(const uint4 *)(const void *)(ub + (uint64_t)i * 16u);
+        }
+        {
+            const int pfd = g_qw_gu_pf_dist;
+            /* Distance in LINEAR block order (x fastest, then y = expert slot),
+             * so a distance past one wave lands on the blocks that start next. */
+            const uint32_t plin = blockIdx.y * gridDim.x + blockIdx.x + (uint32_t)(pfd > 0 ? pfd : 0);
+            const uint32_t py = plin / gridDim.x, px = plin - py * gridDim.x;
+            const bool pok = pfd > 0 && py < gridDim.y && (!active || (int32_t)py < active[0]);
+            if (pok) {
+                const uint32_t pexpert = active ? (uint32_t)active[1 + py] : py;
+                const uint32_t prow0 = px * OutputRows;
+                const uint32_t pleft = mid_dim > prow0 ? mid_dim - prow0 : 0u;
+                const uint32_t prows = pleft < OutputRows ? pleft : OutputRows;
+                const uint32_t plines = (prows * QW_GU_COOP_ROW_U4 * 16u + 127u) / 128u;
+                const char *const pg = gate + (uint64_t)pexpert * gate_expert_bytes + (uint64_t)prow0 * gate_row_bytes;
+                const char *const pu = up + (uint64_t)pexpert * up_expert_bytes + (uint64_t)prow0 * up_row_bytes;
+                for (uint32_t i = threadIdx.x; i < 2u * plines; i += blockDim.x) {
+                    if (i < plines) qw_prefetch_l2(pg + (uint64_t)i * 128u);
+                    else qw_prefetch_l2(pu + (uint64_t)(i - plines) * 128u);
+                }
+            }
         }
         __syncthreads();
         wsh = wcoop + (second ? QW_GU_COOP_U4 : 0u);
@@ -6557,7 +6614,7 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
  * either.  If registers ever need to come down, it has to be by removing live
  * state at source. */
 template <int R, int DownType = -1, bool Vector = false, bool Stage = false,
-          bool Async = false>
+          bool Async = false, int Depth = 2>
 /* This build's note auto09171641_2 records that the scored decode window is
  * one hundred and twenty-eight committed tokens, about sixty-seven
  * speculative rounds, preceded by an untimed correctness phase of
@@ -6659,8 +6716,14 @@ __global__ static void qwen4exp_moe_down_q_kernel(
         }
     };
     if (Stage) {
-        qw_fill_step(0u, 0u, spanel);
-        if (Async) qw_cpasync_commit();
+        /* SWEEP: Depth panels in the ring (2 = the shipped pair); the prologue
+         * lands the first Depth-1 steps so Depth-1 fills are always in flight. */
+        for (uint32_t ps = 0; ps < (uint32_t)Depth - 1u; ps++) {
+            const uint32_t pslot = ps / take, pr = ps - (ps / take) * take;
+            if (pslot >= n_expert_used) break;
+            qw_fill_step(pslot, pr, spanel + (uint64_t)(ps % (uint32_t)Depth) * panel_bytes);
+            if (Async) qw_cpasync_commit();
+        }
     }
     for (uint32_t slot = 0; slot < n_expert_used; slot++) {
 #pragma unroll
@@ -6674,15 +6737,25 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                      * The barrier also retires its previous readers before
                      * that buffer is reused. Invalid routes commit an empty
                      * group and still reach both fences. */
-                    if (Async) qw_cpasync_wait0();
+                    if (Async) {
+                        /* Groups in flight = min(Depth-1, steps left incl. this one);
+                         * this step's must land, so allow one fewer to stay pending
+                         * (zero at the tail, exactly the shipped wait0). */
+                        const uint32_t steps_total = n_expert_used * take;
+                        const uint32_t left = steps_total - step;          /* >= 1 */
+                        const uint32_t allow = (uint32_t)(Depth - 2) < left - 1u
+                                             ? (uint32_t)(Depth - 2) : left - 1u;
+                        if (allow >= 2u) qw_cpasync_wait_n<(Depth > 3 ? 2 : 0)>();
+                        else if (allow == 1u) qw_cpasync_wait_n<(Depth > 2 ? 1 : 0)>();
+                        else qw_cpasync_wait0();
+                    }
                     __syncthreads();
-                    const uint32_t nr =
-                        (uint32_t)r + 1u < take ? (uint32_t)r + 1u : 0u;
-                    const uint32_t nslot =
-                        (uint32_t)r + 1u < take ? slot : slot + 1u;
+                    const uint32_t ns = step + (uint32_t)Depth - 1u;
+                    const uint32_t nslot = ns / take;
+                    const uint32_t nr = ns - nslot * take;
                     if (nslot < n_expert_used) {
                         qw_fill_step(nslot, nr, spanel +
-                                     (uint64_t)((step + 1u) & 1u) * panel_bytes);
+                                     (uint64_t)(ns % (uint32_t)Depth) * panel_bytes);
                         if (Async) qw_cpasync_commit();
                     }
                 }
@@ -6691,7 +6764,7 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                     : selected[(uint64_t)t * n_expert_used + slot];
                 if (e < 0 || (uint32_t)e >= n_total_expert) continue;
                 const char *const drow = Stage
-                    ? spanel + (uint64_t)(step & 1u) * panel_bytes +
+                    ? spanel + (uint64_t)(step % (uint32_t)Depth) * panel_bytes +
                       (uint64_t)(row - row0) * down_row_bytes
                     : down + (uint64_t)(uint32_t)e * down_expert_bytes +
                       (uint64_t)row * down_row_bytes;
@@ -9384,6 +9457,24 @@ static int qwen4exp_routed_moe_cuda(
          * removes the arm at compile time.  The static shared panel is sized
          * for the tower's q4_K gate/up row (groups 80, 1440-byte rows), so any
          * other shape keeps the shipped block. */
+        /* SWEEP: DS4_GU_PF=D publishes the coop prefetch distance once, from the
+         * first (eager) routed call; never inside a capture. */
+        {
+            static int gu_pf_done = 0;
+            if (!gu_pf_done) {
+                cudaStreamCaptureStatus cst = cudaStreamCaptureStatusNone;
+                if (cudaStreamIsCapturing(stream, &cst) == cudaSuccess && cst == cudaStreamCaptureStatusNone) {
+                    const char *e = getenv("DS4_GU_PF");
+                    int d = e ? atoi(e) : 400;  /* default ON at one wave; DS4_GU_PF=0 disables */
+                    if (d < 0) d = 0;
+                    if (cudaMemcpyToSymbol(g_qw_gu_pf_dist, &d, sizeof(d)) != cudaSuccess) (void)cudaGetLastError();
+                    fprintf(stderr, "ds4: sweep gu prefetch distance %d\n", d);
+                    gu_pf_done = 1;
+                } else {
+                    (void)cudaGetLastError();
+                }
+            }
+        }
         const char *const coop_env = getenv("DS4_GATEUP_COOP");
         const bool coop = (DS4_GATEUP_COOP_BUILD != 0) && vector &&
             (coop_env == NULL || coop_env[0] != '0') &&
@@ -9446,7 +9537,20 @@ static int qwen4exp_routed_moe_cuda(
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
             mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
 #define QWEN4EXP_DOWN_IMPL(R, DT, V) QWEN4EXP_DOWN_IMPL_S(R, DT, V, false, 0)
-#define QWEN4EXP_DOWN_ASYNC(DT) \
+#define QWEN4EXP_DOWN_ASYNC_D(DT, D) \
+    qwen4exp_moe_down_q_kernel<2, DT, true, true, true, D><<< \
+            dn_grid, threads, (size_t)(dn_panel * (uint64_t)(D)), stream>>>( \
+            (float *)out->ptr, down, (const int32_t *)selected->ptr, \
+            sc.mq, sc.ms, sc.msum, \
+            down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
+            mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
+/* SWEEP: DS4_DOWN_DEPTH=3|4 deepens the panel ring; unset = the shipped pair. */
+#define QWEN4EXP_DOWN_ASYNC(DT) do { \
+    const int dd_ = qwen4exp_down_depth(); \
+    if (dd_ == 3 && dn_panel * 3u <= QW_DOWN_PANEL_MAX_BYTES) { QWEN4EXP_DOWN_ASYNC_D(DT, 3); } \
+    else if (dd_ == 4 && dn_panel * 4u <= QW_DOWN_PANEL_MAX_BYTES) { QWEN4EXP_DOWN_ASYNC_D(DT, 4); } \
+    else { QWEN4EXP_DOWN_ASYNC_2(DT); } } while (0)
+#define QWEN4EXP_DOWN_ASYNC_2(DT) \
     qwen4exp_moe_down_q_kernel<2, DT, true, true, true><<< \
             dn_grid, threads, (size_t)dn_shared, stream>>>( \
             (float *)out->ptr, down, (const int32_t *)selected->ptr, \
@@ -9494,9 +9598,12 @@ static int qwen4exp_routed_moe_cuda(
 #undef QWEN4EXP_DOWN_MMA
         if (!cuda_ok(cudaGetLastError(), "qwen4exp MoE down tile launch")) return 0;
         if (getenv("DS4_QWEN4EXP_NO_COMBINE_GRID") == NULL) {
+            /* SWEEP: DS4_COMBINE_THREADS=512 widens the combine grid block. */
+            const char *cth_env = getenv("DS4_COMBINE_THREADS");
+            const unsigned cth = (cth_env && atoi(cth_env) == 512) ? 512u : threads;
             qwen4exp_moe_down_combine_grid_kernel<<<
-                    dim3((out_dim + threads - 1u) / threads, n_tokens, 1),
-                    threads, 0, stream>>>(
+                    dim3((out_dim + cth - 1u) / cth, n_tokens, 1),
+                    cth, 0, stream>>>(
                     (float *)out->ptr, (const float *)down_partial->ptr,
                     (const int32_t *)selected->ptr, out_dim, n_tokens,
                     n_expert_used, n_total_expert);
@@ -11499,6 +11606,82 @@ __device__ __forceinline__ static float qwen4exp_hc_norm_scale_regs(
     return 1.0f / sqrtf(total / (float)group + eps);
 }
 
+
+/* SWEEP 2026-09-18: the decode-width staged norm+quant with the PREVIOUS
+ * block's inject folded in on the way in (qwen4exp_hc_inject_kernel's one
+ * FFMA, block * inject + residual, as __fmaf_rn; the product's operand order
+ * does not enter an FMA's rounding), the updated residual written back in
+ * place so every later reader sees what the standalone kernel would have
+ * left, the statistic taken off the same ten register values by the same
+ * chain (qwen4exp_hc_norm_scale_regs), and the quantize walk verbatim.
+ * DS4_HC_PEND=1 selects it at rows <= 2; unset keeps the two kernels. */
+__global__ static void qwen4exp_hc_norm_quant_pending_kernel(
+        int8_t *xq, float *xscale, float *nscale,
+        float *x, const float *w, const float *pblock, const float *pinject,
+        uint32_t n, uint32_t group, uint32_t rows,
+        float eps, float weight_bias, int round_bf16) {
+    if (rows <= 2u) QWEN4EXP_PDL_TRIGGER();
+    const uint32_t g = blockIdx.x;
+    const uint32_t row = blockIdx.y;
+    if (row >= rows) return;
+
+    const uint64_t base = (uint64_t)row * n + (uint64_t)g * group;
+    float *xg = x + base;
+    const float *wg = w + (uint64_t)g * group;
+
+    float wv[QWEN4EXP_HC_STAGED_STEPS];
+#pragma unroll
+    for (uint32_t s = 0; s < QWEN4EXP_HC_STAGED_STEPS; s++) {
+        wv[s] = wg[s * QWEN4EXP_HC_THREADS + threadIdx.x];
+    }
+    QWEN4EXP_PDL_SYNC();
+
+    const uint32_t n_hc = n / group;
+    const float pi = pinject[(uint64_t)row * n_hc + g];
+    const float *pb = pblock + (uint64_t)row * group;
+    float xv[QWEN4EXP_HC_STAGED_STEPS];
+#pragma unroll
+    for (uint32_t s = 0; s < QWEN4EXP_HC_STAGED_STEPS; s++) {
+        const uint32_t d = s * QWEN4EXP_HC_THREADS + threadIdx.x;
+        xv[s] = __fmaf_rn(pb[d], pi, xg[d]);
+        xg[d] = xv[s];
+    }
+
+    __shared__ float partial[QWEN4EXP_HC_THREADS];
+    const float scale = qwen4exp_hc_norm_scale_regs(xv, group, eps, partial);
+    if (threadIdx.x == 0u) nscale[(uint64_t)row * (n / group) + g] = scale;
+
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t warps = blockDim.x >> 5u;
+    const uint64_t row_blocks = n / 32u;
+    const uint64_t blk0 = (uint64_t)row * row_blocks + (uint64_t)g * (group / 32u);
+#pragma unroll
+    for (uint32_t k = 0; k < QWEN4EXP_HC_STAGED_STEPS; k++) {
+        const float v = qwen4exp_hc_normed_value(xv[k], scale, wv[k],
+                                                 weight_bias, round_bf16);
+        const float vz = qwen4exp_q8_ftz(v);
+        float a = qwen4exp_q8_ftz(fabsf(v));
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+        }
+        const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
+        const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
+        const uint64_t pair = blk0 + (uint64_t)(k * warps + warp);
+        if (lane == 0u) xscale[pair] = d;
+        int q = (int)lrintf(qwen4exp_q8_ftz(vz * id));
+        q = q > 127 ? 127 : (q < -128 ? -128 : q);
+        xq[pair * 32u + lane] = (int8_t)q;
+    }
+}
+
+static int qwen4exp_hc_pend_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DS4_HC_PEND"); v = (e && e[0] && e[0] != '0') ? 1 : 0; }
+    return v;
+}
+
 /* qwen4exp_hc_norm_quant_kernel with the inject head folded in.  Grid (rows),
  * one block per token; the streams run in sequence, each with the reduction
  * and the quantize of the per-stream kernel, and the inject accumulators ride
@@ -11527,156 +11710,17 @@ __device__ __forceinline__ static float qwen4exp_hc_norm_scale_regs(
  * at the top and writes its four new ones at the very end, after several
  * barriers, and no block touches another token's slots. */
 template <int Staged, int InjectType, int Pending>
-__global__ static void qwen4exp_hc_norm_quant_inject_kernel(
-        int8_t *xq, float *xscale, float *nscale, float *inject,
-        const float *x, const float *w, const char *iw,
-        uint32_t group, uint32_t n_hc, uint32_t rows,
-        float eps, float weight_bias, int round_bf16,
-        uint32_t weight_type, uint32_t weight_row_bytes,
-        float *xw, const float *pblock, const float *pinject) {
-    /* PDL producer, as the per-stream norm above; this arm runs at the row
-     * threshold only, where the projection behind it is the plain MMA tile.
-     * The row gate makes that structural rather than a caller convention:
-     * the threshold's widths never fire the trigger at all (the deadlock
-     * rule, ds4_cuda_qwen4exp.cuh). */
-    if (rows <= 2u) QWEN4EXP_PDL_TRIGGER();
-    const uint32_t row = blockIdx.x;
-    if (row >= rows) return;
+__global__ static void qwen4exp_hc_norm_quant_inject_kernel
+#include "ds4_qwen4exp_hc_nqi_body.inc"
 
-    __shared__ float partial[QWEN4EXP_HC_THREADS];
-    float iacc[QWEN4EXP_HC_MAX_STREAMS];
-#pragma unroll
-    for (int ho = 0; ho < QWEN4EXP_HC_MAX_STREAMS; ho++) iacc[ho] = 0.0f;
-
-    const uint32_t lane = threadIdx.x & 31u;
-    const uint32_t warp = threadIdx.x >> 5u;
-    const uint32_t warps = blockDim.x >> 5u;
-    const uint32_t n = n_hc * group;
-    const uint64_t row_blocks = n / 32u;
-    const float *pb = Pending ? pblock + (uint64_t)row * group : NULL;
-
-    for (uint32_t g = 0; g < n_hc; g++) {
-        const float *xg = x + (uint64_t)row * n + (uint64_t)g * group;
-        const float *wg = w + (uint64_t)g * group;
-        const uint64_t blk0 = (uint64_t)row * row_blocks + (uint64_t)g * (group / 32u);
-        if (Staged) {
-            float xv[QWEN4EXP_HC_STAGED_STEPS];
-            float wv[QWEN4EXP_HC_STAGED_STEPS];
-#pragma unroll
-            for (uint32_t s = 0; s < QWEN4EXP_HC_STAGED_STEPS; s++) {
-                xv[s] = xg[s * QWEN4EXP_HC_THREADS + threadIdx.x];
-                wv[s] = wg[s * QWEN4EXP_HC_THREADS + threadIdx.x];
-            }
-            if (Pending) {
-                /* qwen4exp_hc_inject_kernel's FFMA: residual + block * inject. */
-                const float pi = pinject[(uint64_t)row * n_hc + g];
-                float *xo = xw + (uint64_t)row * n + (uint64_t)g * group;
-#pragma unroll
-                for (uint32_t s = 0; s < QWEN4EXP_HC_STAGED_STEPS; s++) {
-                    const uint32_t d = s * QWEN4EXP_HC_THREADS + threadIdx.x;
-                    xv[s] = __fmaf_rn(pb[d], pi, xv[s]);
-                    xo[d] = xv[s];
-                }
-            }
-            /* partial[0] is still being read by the previous stream's callers. */
-            __syncthreads();
-            const float scale = qwen4exp_hc_norm_scale_regs(xv, group, eps, partial);
-            if (threadIdx.x == 0u) nscale[(uint64_t)row * n_hc + g] = scale;
-#pragma unroll
-            for (uint32_t k = 0; k < QWEN4EXP_HC_STAGED_STEPS; k++) {
-                const uint32_t i = k * QWEN4EXP_HC_THREADS + threadIdx.x;
-                const float v = qwen4exp_hc_normed_value(xv[k], scale, wv[k],
-                                                         weight_bias, round_bf16);
-                const float vz = qwen4exp_q8_ftz(v);
-                float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-                for (int off = 16; off > 0; off >>= 1) {
-                    a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-                }
-                const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
-                const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
-                const uint64_t pair = blk0 + (uint64_t)(k * warps + warp);
-                if (lane == 0u) xscale[pair] = d;
-                int q = (int)lrintf(qwen4exp_q8_ftz(vz * id));
-                q = q > 127 ? 127 : (q < -128 ? -128 : q);
-                xq[pair * 32u + lane] = (int8_t)q;
-
-                /* The same __fmaf_rn chain as the rolled arm, the inject value
-                 * taken by the typed staged accessor (n_embd := group, hs := g,
-                 * s := k resolves to flat index g*group + i). */
-#pragma unroll
-                for (int ho = 0; ho < QWEN4EXP_HC_MAX_STREAMS; ho++) {
-                    if ((uint32_t)ho < n_hc) {
-                        iacc[ho] = __fmaf_rn(v, qwen4exp_hc_inject_value_staged<InjectType>(
-                                iw + (uint64_t)ho * weight_row_bytes, group, g, k),
-                                iacc[ho]);
-                    }
-                }
-                (void)i;
-            }
-            continue;
-        }
-        if (Pending) {
-            /* qwen4exp_hc_inject_kernel's FFMA, applied in place before the
-             * statistic reads the stream. */
-            const float pi = pinject[(uint64_t)row * n_hc + g];
-            float *xo = xw + (uint64_t)row * n + (uint64_t)g * group;
-            for (uint32_t i = threadIdx.x; i < group; i += blockDim.x) {
-                xo[i] = __fmaf_rn(pb[i], pi, xg[i]);
-            }
-            __syncthreads();
-        }
-        /* partial[0] is still being read by the previous stream's callers. */
-        __syncthreads();
-        const float scale = qwen4exp_hc_norm_scale(xg, group, eps, partial);
-        if (threadIdx.x == 0u) nscale[(uint64_t)row * n_hc + g] = scale;
-
-        uint32_t k = 0;
-        for (uint32_t i = threadIdx.x; i < group; i += blockDim.x, k++) {
-            const float v = qwen4exp_hc_normed_value(xg[i], scale, wg[i],
-                                                     weight_bias, round_bf16);
-            const float vz = qwen4exp_q8_ftz(v);
-            float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
-                a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-            }
-            const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
-            const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
-            const uint64_t pair = blk0 + (uint64_t)(k * warps + warp);
-            if (lane == 0u) xscale[pair] = d;
-            int q = (int)lrintf(qwen4exp_q8_ftz(vz * id));
-            q = q > 127 ? 127 : (q < -128 ? -128 : q);
-            xq[pair * 32u + lane] = (int8_t)q;
-
-            /* __fmaf_rn, not `+= v * w`: the inject kernels' `+=` contracts
-             * to one FFMA, and here the compiler hoisted the add of the
-             * always-live stream 0 out of the weight-type switch, leaving a
-             * rounded FMUL behind it -- one ulp on one inject in 192. */
-            const uint32_t fi = g * group + i;
-#pragma unroll
-            for (int ho = 0; ho < QWEN4EXP_HC_MAX_STREAMS; ho++) {
-                if ((uint32_t)ho < n_hc) {
-                    iacc[ho] = __fmaf_rn(v, dev_qwen4exp_inject_value(
-                            weight_type, iw + (uint64_t)ho * weight_row_bytes, fi),
-                            iacc[ho]);
-                }
-            }
-        }
-    }
-
-#pragma unroll
-    for (int ho = 0; ho < QWEN4EXP_HC_MAX_STREAMS; ho++) {
-        if ((uint32_t)ho < n_hc) {
-            __syncthreads();
-            const float total = qwen4exp_block_sum_f32(iacc[ho], partial);
-            if (threadIdx.x == 0) {
-                inject[(uint64_t)row * n_hc + (uint32_t)ho] =
-                    2.0f * qwen4exp_sigmoid(total * (1.0f / (float)n_hc));
-            }
-        }
-    }
-}
+/* SWEEP 2026-09-18: the same body under a residency floor.  The shipped
+ * instantiation above is untouched; DS4_HC_NQI_MINB=2|3|4 selects this twin
+ * from one binary so several residencies can be measured without a rebuild.
+ * A residency floor changes no arithmetic: same threads, same statements. */
+template <int Staged, int InjectType, int Pending, int MinB>
+__global__ __launch_bounds__(QWEN4EXP_HC_THREADS, MinB) static void
+qwen4exp_hc_norm_quant_inject_mb_kernel
+#include "ds4_qwen4exp_hc_nqi_body.inc"
 
 /* The staged norm+quant+inject arms are the default at the production shape;
  * this is their valve, read once like the others. */
@@ -11692,6 +11736,75 @@ static int ds4_qwen4exp_hc_nqi_staged_off(void) {
 /* Every instantiation of the kernel above behind one call.  `pending` picks
  * the Pending arm; the staged arms need the production group width and a
  * typed inject weight, everything else keeps the rolled generic arm. */
+/* SWEEP 2026-09-18: a per-weight dequantized copy of the Q8_0 inject weights
+ * (an input-independent cache of a dequantized tensor, contract section 8),
+ * so the staged norm+quant+inject arm reads one float per (stream, element)
+ * instead of decoding a 34-byte Q8_0 block for each of them.  The table is
+ * written ONCE per weight by the SAME accessor the Q8_0 arm evaluates in the
+ * chain (qwen4exp_hc_inject_value_staged<Q8_0>, same thread <-> element
+ * mapping), so every value the f32 arm feeds its __fmaf_rn is the bit the
+ * Q8_0 arm would have computed in place.  DS4_HC_INJECT_F32=1 selects it;
+ * unset keeps the shipped Q8_0 arm. */
+__global__ static void qwen4exp_hc_inject_f32_table_kernel(
+        float *tab, const char *iw, uint32_t group, uint32_t n_hc,
+        uint32_t weight_row_bytes) {
+    const uint32_t s = blockIdx.x, hs = blockIdx.y, ho = blockIdx.z;
+    const uint32_t n = n_hc * group;
+    tab[(uint64_t)ho * n + (uint64_t)hs * group + s * QWEN4EXP_HC_THREADS + threadIdx.x] =
+        qwen4exp_hc_inject_value_staged<DS4_QWEN4EXP_TY_q8_0>(
+                iw + (uint64_t)ho * weight_row_bytes, group, hs, s);
+}
+
+static int qwen4exp_hc_inject_f32_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_HC_INJECT_F32");
+        v = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return v;
+}
+
+static const float *qwen4exp_hc_inject_f32_table(const char *iw, uint32_t group,
+                                                 uint32_t n_hc, uint32_t weight_row_bytes) {
+    enum { CAP = 256 };
+    static struct { const char *key; float *tab; } cache[CAP];
+    static int count = 0;
+    for (int i = 0; i < count; i++) {
+        if (cache[i].key == iw) return cache[i].tab;
+    }
+    if (count >= CAP || group != QWEN4EXP_HC_STAGED_STEPS * QWEN4EXP_HC_THREADS ||
+        n_hc > (uint32_t)QWEN4EXP_HC_MAX_STREAMS) return NULL;
+    const size_t bytes = (size_t)n_hc * n_hc * group * sizeof(float);
+    float *tab = NULL;
+    if (cudaMalloc((void **)&tab, bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    qwen4exp_hc_inject_f32_table_kernel<<<dim3(QWEN4EXP_HC_STAGED_STEPS, n_hc, n_hc),
+                                          QWEN4EXP_HC_THREADS, 0, cuda_decode_stream()>>>(
+            tab, iw, group, n_hc, weight_row_bytes);
+    if (cudaGetLastError() != cudaSuccess) {
+        (void)cudaFree(tab);
+        return NULL;
+    }
+    cache[count].key = iw;
+    cache[count].tab = tab;
+    count++;
+    return tab;
+}
+
+/* SWEEP valve: DS4_HC_NQI_MINB=2|3|4 routes every arm through the twin with
+ * that residency floor; unset or 1 keeps the shipped kernel.  Read once. */
+static int qwen4exp_hc_nqi_minb(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_HC_NQI_MINB");
+        v = e ? atoi(e) : 1;
+        if (v < 1 || v > 4) v = 1;
+    }
+    return v;
+}
+
 static void qwen4exp_hc_norm_quant_inject_launch(
         int8_t *xq, float *xscale, float *nscale, float *inject,
         const float *x, const float *w, const char *iw,
@@ -11705,12 +11818,34 @@ static void qwen4exp_hc_norm_quant_inject_launch(
         group == QWEN4EXP_HC_STAGED_STEPS * QWEN4EXP_HC_THREADS &&
         (weight_type == (uint32_t)DS4_QWEN4EXP_TY_f32 ||
          weight_type == (uint32_t)DS4_QWEN4EXP_TY_q8_0);
-#define QWEN4EXP_HC_NQI_LAUNCH(S, T, P)                                       \
-    qwen4exp_hc_norm_quant_inject_kernel<S, T, P>                              \
+    /* SWEEP: the Q8_0 staged arm over its dequantized table (see
+     * qwen4exp_hc_inject_f32_table): same values, one float load each. */
+    if (staged && weight_type == (uint32_t)DS4_QWEN4EXP_TY_q8_0 &&
+        qwen4exp_hc_inject_f32_on()) {
+        const float *tab = qwen4exp_hc_inject_f32_table(iw, group, n_hc, weight_row_bytes);
+        if (tab) {
+            iw = (const char *)tab;
+            weight_type = (uint32_t)DS4_QWEN4EXP_TY_f32;
+            weight_row_bytes = n_hc * group * (uint32_t)sizeof(float);
+        }
+    }
+#define QWEN4EXP_HC_NQI_ARGS                                                   \
         <<<dim3(rows, 1u, 1u), threads, 0, cuda_decode_stream()>>>(            \
             xq, xscale, nscale, inject, x, w, iw, group, n_hc, rows, eps,      \
             weight_bias, round_bf16, weight_type, weight_row_bytes,            \
             xw, pblock, pinject)
+#define QWEN4EXP_HC_NQI_LAUNCH(S, T, P)                                       \
+    do {                                                                       \
+        const int mb_ = qwen4exp_hc_nqi_minb();                                \
+        if (mb_ == 2)                                                          \
+            qwen4exp_hc_norm_quant_inject_mb_kernel<S, T, P, 2> QWEN4EXP_HC_NQI_ARGS; \
+        else if (mb_ == 3)                                                     \
+            qwen4exp_hc_norm_quant_inject_mb_kernel<S, T, P, 3> QWEN4EXP_HC_NQI_ARGS; \
+        else if (mb_ == 4)                                                     \
+            qwen4exp_hc_norm_quant_inject_mb_kernel<S, T, P, 4> QWEN4EXP_HC_NQI_ARGS; \
+        else                                                                   \
+            qwen4exp_hc_norm_quant_inject_kernel<S, T, P> QWEN4EXP_HC_NQI_ARGS; \
+    } while (0)
     if (staged && weight_type == (uint32_t)DS4_QWEN4EXP_TY_f32) {
         if (pending) QWEN4EXP_HC_NQI_LAUNCH(1, DS4_QWEN4EXP_TY_f32, 1);
         else         QWEN4EXP_HC_NQI_LAUNCH(1, DS4_QWEN4EXP_TY_f32, 0);
@@ -12282,7 +12417,9 @@ static int qwen4exp_hc_mixer_fused_cuda(
     const int inject_in_norm =
         upw && inject && rows >= QWEN4EXP_HC_FUSE_MIX_MIN_ROWS;
 
-    if (pending_block && !inject_in_norm) {
+    const int pend_fold = pending_block && !inject_in_norm && staged && rows <= 2u &&
+        n_embd == QWEN4EXP_HC_STAGED_STEPS * QWEN4EXP_HC_THREADS && threads == QWEN4EXP_HC_THREADS && qwen4exp_hc_pend_on();
+    if (pending_block && !inject_in_norm && !pend_fold) {
         /* No pass here folds the apply in: run the standalone kernel, so the
          * residual every leg below reads is the updated one. */
         qwen4exp_hc_inject_kernel<<<dim3((n_embd + 255u) / 256u, n_hc, rows),
@@ -12308,7 +12445,17 @@ static int qwen4exp_hc_mixer_fused_cuda(
          * which triggers at its top, and the kernel's normw prefetch rides
          * that window (ds4_cuda_qwen4exp.cuh).  Verify and prefill keep the
          * plain launch. */
-        if (rows <= 2u) {
+        if (rows <= 2u && pend_fold) {
+            QWEN4EXP_LAUNCH_PDL(
+                    qwen4exp_hc_norm_quant_pending_kernel,
+                    (dim3(n_hc, rows, 1u)), threads, 0,
+                    cuda_decode_stream(),
+                    xq, xscale, nscale, (float *)hyper->ptr, normw,
+                    (const float *)pending_block->ptr,
+                    (const float *)pending_inject->ptr,
+                    (uint32_t)wide, n_embd, rows, eps, weight_bias,
+                    round_bf16);
+        } else if (rows <= 2u) {
             QWEN4EXP_LAUNCH_PDL(
                     (qwen4exp_hc_norm_quant_kernel<1>),
                     (dim3(n_hc, rows, 1u)), threads, 0,
