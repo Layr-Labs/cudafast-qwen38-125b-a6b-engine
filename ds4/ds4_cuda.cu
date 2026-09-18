@@ -18032,6 +18032,42 @@ extern "C" void ds4_gpu_set_q8_mma_pipe_wide(int mode) {
     g_q8_mma_pipe_wide = mode;
 }
 
+/* Measurement arm for the rungs the ladder's own stage arithmetic never
+ * reached.  Every rung the ladder instantiates is STAGES=2 at G=4, i.e. a
+ * 40 KB stage and an 80 KB block -- one block per SM on this device (100 KB
+ * opt-in), with only 40 KB in flight.  G=2 halves the stage to 22.5 KB, and
+ * that is what makes a sub-50 KB block possible: two blocks per SM, 45-49 KB
+ * each, at 768 threads.  The 256-wide rung at G=4 needs 120 KB and is refused;
+ * at G=2 it is 66 KB and fits.  Read once; 0 (unset) keeps the shipped
+ * ladder.  Applies to every width the pipe takes, so the narrow projections
+ * (out 2560/320) get the same arm.
+ *
+ *   1: <2,2,4,4,4,3>  BM128  BN64 256thr G4 ST3  90 KB  -> 3-deep ring, the
+ *                     only sub-100 KB rung the ladder never instantiates
+ *   2: <4,2,4,4,4,2>  BM256  BN64 384thr G4 ST2 100 KB  -> halves gridX
+ *
+ * G=2 is NOT available, whatever the stage arithmetic says: the producer
+ * stages the activation scales as 16-byte chunks, one per row per 32-element
+ * block, and the kernel asserts G % 4 == 0 (ds4_cuda.cu, "activation scales:
+ * 16-byte chunks").  G=2 makes that array zero-sized and the instantiation
+ * fails to compile -- so the sub-50 KB / two-blocks-per-SM corner of the
+ * shape space is closed by the kernel, not by shared memory, and the 256-wide
+ * rung DS4_CUDA_MMA_PIPE_WIDE=2 asks for (120 KB at G=4/G=8) can never run.
+ */
+static int g_q8_mma_pipe_shape = -1;
+static int cuda_q8_mma_pipe_shape_mode(void) {
+    if (g_q8_mma_pipe_shape < 0) {
+        const char *e = getenv("DS4_CUDA_MMA_PIPE_SHAPE");
+        int mode = (e != NULL && e[0] != '\0') ? atoi(e) : 0;
+        if (mode < 0 || mode > 2) mode = 0;
+        g_q8_mma_pipe_shape = mode;
+    }
+    return g_q8_mma_pipe_shape;
+}
+extern "C" void ds4_gpu_set_q8_mma_pipe_shape(int mode) {
+    g_q8_mma_pipe_shape = mode;
+}
+
 /* The device's occupancy limits, as a compact string the caller can append to
  * an identity that reaches the run's metrics.  See ds4.h for why this is worth
  * publishing.
@@ -18142,6 +18178,10 @@ static void cuda_q8_mma_pipe_prepare(void) {
     (void)cuda_q8_mma_pipe_attr<2, 2, 4, 4, 4, 2>();
     (void)cuda_q8_mma_pipe_attr<2, 4, 4, 4, 4, 2>();
     (void)cuda_q8_mma_pipe_attr<2, 8, 4, 4, 4, 2>();
+    /* The shape arms (DS4_CUDA_MMA_PIPE_SHAPE): prepped here so no launch has
+     * to take the opt-in inside a stream capture, whichever arm is selected. */
+    (void)cuda_q8_mma_pipe_attr<2, 2, 4, 4, 4, 3>();
+    (void)cuda_q8_mma_pipe_attr<4, 2, 4, 4, 4, 2>();
 }
 
 /* The pipelined tile's shape ladder.  Returns 0 when the call is not one it
@@ -18181,6 +18221,32 @@ static int cuda_q8_mma_pipe_try(float *out, const unsigned char *w,
      * measured the faster of the two.  Every rung is the same arithmetic
      * (the kernel's contract), so the choice is byte-for-byte safe; the
      * valve only says which rung. */
+    const int shape = cuda_q8_mma_pipe_shape_mode();
+    if (shape != 0) {
+        /* One line per arm, once per process.  A refused shared-memory opt-in
+         * falls through silently, and requested bytes alone cannot show which
+         * rung ran -- that is how DS4_CUDA_MMA_PIPE_WIDE=2 has been a no-op on
+         * this device: it asks for the 120 KB rung and gets the 128-wide one. */
+        static int reported[3];
+        int took = 0;
+        if (shape == 1 &&
+            cuda_q8_mma_pipe_launch<2, 2, 4, 4, 4, 3>(out, w, xq, xscale, out_dim, n_rows, blocks)) {
+            took = 1;
+        } else if (shape == 2 &&
+            cuda_q8_mma_pipe_launch<4, 2, 4, 4, 4, 2>(out, w, xq, xscale, out_dim, n_rows, blocks)) {
+            took = 1;
+        }
+        if (took) {
+            if (!reported[shape]) {
+                reported[shape] = 1;
+                fprintf(stderr, "ds4: q8 pipe shape arm %d routed (BN %d, out %llu, rows %u)\n",
+                        shape, g_q8_mma_pipe_last_bn,
+                        (unsigned long long)out_dim, n_rows);
+            }
+            return 1;
+        }
+        /* Refused opt-in: fall through to the ladder below. */
+    }
     const int wide = cuda_q8_mma_pipe_wide_mode();
     if (wide != 0 && out_dim > 4096u) {
         if (wide >= 2 &&

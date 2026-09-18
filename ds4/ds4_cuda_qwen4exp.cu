@@ -5036,6 +5036,19 @@ __device__ __forceinline__ static void qw_cpasync_commit(void) {
 __device__ __forceinline__ static void qw_cpasync_wait0(void) {
     asm volatile("cp.async.wait_group 0;\n" ::);
 }
+/* PERSISTING-STORES STORE: the partials a consumer launch reads back within the
+ * same chunk.  createpolicy + .L2::cache_hint is the only form sm_121 ptxas
+ * takes for a scalar f32 store (a bare .L2::evict_last operand is refused:
+ * "requires .v8.b32/.v4.b64 type").  l2 == 0 keeps the shipped plain store. */
+__device__ __forceinline__ static uint64_t qw_pol_evict_last(void) {
+    uint64_t p;
+    asm("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(p));
+    return p;
+}
+__device__ __forceinline__ static void qw_st_evl(float *p, float v, uint64_t pol) {
+    asm volatile("st.global.L2::cache_hint.f32 [%0], %1, %2;"
+                 :: "l"(p), "f"(v), "l"(pol));
+}
 /* prefetch.global.L2 brings the 128-byte line holding the address into the L2.
  * It has no architectural effect on any value: the loads that follow read the
  * same bytes whether the line was prefetched or not. */
@@ -5741,6 +5754,8 @@ qwen4exp_moe_down_mma_kernel(
         uint32_t down_type,
         uint32_t groups,
         uint32_t out_dim,
+        uint32_t row_off,
+        uint32_t l2,
         uint32_t dq_stage) {
     __shared__ __align__(16) int8_t sA[QW_DOWN_MMA_BM * QW_MMA_LD];
     __shared__ __align__(16) int8_t sB[QW_MMA_BN * QW_MMA_LD];
@@ -5752,7 +5767,9 @@ qwen4exp_moe_down_mma_kernel(
     const uint32_t tid  = threadIdx.x;
     const uint32_t warp = tid >> 5;
     const uint32_t lane = tid & 31;
-    const uint32_t row0 = blockIdx.x * QW_DOWN_MMA_BM;
+    /* row_off is the launch's column window start (the partials-chunk valve);
+     * out_dim stays the full stride so every index below is the shipped one. */
+    const uint32_t row0 = row_off + blockIdx.x * QW_DOWN_MMA_BM;
     if (row0 >= out_dim) return;
     if (active && (int32_t)blockIdx.y >= active[0]) return;
     const uint32_t expert = active ? (uint32_t)active[1 + blockIdx.y]
@@ -5913,6 +5930,7 @@ qwen4exp_moe_down_mma_kernel(
         }
 
         const uint32_t m0 = warp * 16u + (lane >> 2);
+        const uint64_t pol = l2 ? qw_pol_evict_last() : 0ull;
 #pragma unroll
         for (int nt = 0; nt < QW_DOWN_MMA_NT; nt++) {
 #pragma unroll
@@ -5922,7 +5940,9 @@ qwen4exp_moe_down_mma_kernel(
                 const uint32_t mr = m0 + ((r & 2) ? 8u : 0u);
                 const uint32_t orow = row0 + mr;
                 if (orow >= out_dim) continue;
-                partial[(uint64_t)sPair[nn] * out_dim + orow] = acc[nt * 4 + r];
+                float *const dst = partial + (uint64_t)sPair[nn] * out_dim + orow;
+                if (l2) { qw_st_evl(dst, acc[nt * 4 + r], pol); }
+                else    { *dst = acc[nt * 4 + r]; }
             }
         }
         __syncthreads();
@@ -6069,6 +6089,11 @@ __device__ __forceinline__ static void qwen4exp_shared_vector_accumulate(
 #define QW_GU_COOP_ROW_U4 90u                /* 1440 B, ten q4_K super-blocks */
 #define QW_GU_COOP_GROUPS 80u                            /* in_dim 2560 / 32 */
 #define QW_GU_COOP_U4 (QW_GU_COOP_ROWS * QW_GU_COOP_ROW_U4)
+/* SWEEP 2026-09-18: rolling L2 prefetch for the coop panel, D blocks ahead on
+ * the same expert (blocks are dispatched x-fastest, so block x+D is one of the
+ * next to start).  A prefetch changes no value; every load reads the same
+ * bytes.  DS4_GU_PF=D sets the distance (0 = shipped, no prefetch). */
+static __device__ int g_qw_gu_pf_dist = 0;
 
 /* The eight payload words qw_raw_load's q4_K arm returns for (row, group),
  * read out of the staged copy of the identical row bytes.  A q4_K row is 90
@@ -6286,6 +6311,21 @@ qwen4exp_moe_gateup_split_kernel(
             wcoop[i] = *(const uint4 *)(const void *)(gb + (uint64_t)i * 16u);
             wcoop[QW_GU_COOP_U4 + i] =
                 *(const uint4 *)(const void *)(ub + (uint64_t)i * 16u);
+        }
+        {
+            const int pfd = g_qw_gu_pf_dist;
+            if (pfd > 0 && blockIdx.x + (uint32_t)pfd < gridDim.x) {
+                const uint32_t prow0 = row0 + (uint32_t)pfd * OutputRows;
+                const uint32_t pleft = mid_dim > prow0 ? mid_dim - prow0 : 0u;
+                const uint32_t prows = pleft < OutputRows ? pleft : OutputRows;
+                const uint32_t plines = (prows * QW_GU_COOP_ROW_U4 * 16u + 127u) / 128u;
+                const char *const pg = gate + (uint64_t)expert * gate_expert_bytes + (uint64_t)prow0 * gate_row_bytes;
+                const char *const pu = up + (uint64_t)expert * up_expert_bytes + (uint64_t)prow0 * up_row_bytes;
+                for (uint32_t i = threadIdx.x; i < 2u * plines; i += blockDim.x) {
+                    if (i < plines) qw_prefetch_l2(pg + (uint64_t)i * 128u);
+                    else qw_prefetch_l2(pu + (uint64_t)(i - plines) * 128u);
+                }
+            }
         }
         __syncthreads();
         wsh = wcoop + (second ? QW_GU_COOP_U4 : 0u);
@@ -8766,6 +8806,10 @@ static int qwen4exp_shared_pipe_dispatch(
     return 0;
 }
 
+/* SWEEP 2026-09-18 (F3): the shared-expert prefill GEMMs re-staged, same
+ * arithmetic; DS4_SHARED_PIPE2 selects them (off unset). */
+#include "ds4_cuda_qwen4exp_shared_pipe2.inc"
+
 /* Does this call take the tile?
  *
  * DS4_QWEN4EXP_SHARED_MMA is the kill switch and the test handle: "0" keeps
@@ -9080,6 +9124,57 @@ static int qwen4exp_moe_tile(uint32_t n_rows) {
      * DS4_QWEN4EXP_NO_WIDE_VERIFY restores the eight-row tile. */
     if (n_rows == 3u && getenv("DS4_QWEN4EXP_NO_WIDE_VERIFY") == NULL) return 2;
     return 8;
+}
+
+/* ======================= partials chunking (the L2 round trip) ==============
+ * DS4_MOE_DOWN_CHUNK=N runs the (down tile, combine) pair N times over
+ * out_dim/N columns instead of once over all of it, so each chunk's partials
+ * are written and read back while they are still in L2.  DS4_MOE_DOWN_L2=MB
+ * raises the persisting carve-out to MB megabytes and marks the chunk's stores
+ * evict_last (see the .L2::cache_hint store above).  Unset: one chunk, no
+ * carve-out, plain stores -- the shipped launches, unchanged. */
+static uint32_t qwen4exp_down_chunk_cols(uint32_t out_dim) {
+    const char *e = getenv("DS4_MOE_DOWN_CHUNK");
+    if (e == NULL || *e == '\0') return out_dim;
+    const long n = strtol(e, NULL, 10);
+    if (n <= 1) return out_dim;
+    uint32_t cols = (uint32_t)((out_dim + (uint32_t)n - 1u) / (uint32_t)n);
+    cols = (cols + QW_DOWN_MMA_BM - 1u) / QW_DOWN_MMA_BM * QW_DOWN_MMA_BM;
+    if (cols == 0u || cols >= out_dim) return out_dim;
+    return cols;
+}
+static uint32_t qwen4exp_down_l2_mode(void) {
+    const char *e = getenv("DS4_MOE_DOWN_L2");
+    if (e == NULL || *e == '\0') return 0u;
+    return strtol(e, NULL, 10) > 0 ? 1u : 0u;
+}
+static int qwen4exp_down_l2_carve(void) {
+    /* ONE-SHOT: cudaDeviceSetLimit may sync the device, so it must not be
+     * reached again inside a graph replay -- and a refusal (capture in flight,
+     * or a driver that caps the carve-out) is reported once, not per layer. */
+    static int done = 0, ok = 1;
+    if (done != 0) return ok;
+    done = 1;
+    const char *e = getenv("DS4_MOE_DOWN_L2");
+    if (e == NULL || *e == '\0') return 1;
+    const long mb = strtol(e, NULL, 10);
+    if (mb <= 0) return 1;
+    size_t cur = 0;
+    if (cudaDeviceGetLimit(&cur, cudaLimitPersistingL2CacheSize) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;                       /* the A/B keeps going either way */
+    }
+    const size_t want = (size_t)mb * 1024u * 1024u;
+    if (cur == want) return 1;
+    const cudaError_t rc = cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, want);
+    if (rc != cudaSuccess) {
+        (void)cudaGetLastError();
+        fprintf(stderr,
+                "ds4: DS4_MOE_DOWN_L2 carve-out %ld MB refused (%s)\n",
+                mb, cudaGetErrorString(rc));
+        ok = 0;
+    }
+    return 1;
 }
 
 /* The routed MoE body.  `logits` non-NULL means the caller has NOT run the
@@ -9549,6 +9644,23 @@ static int qwen4exp_routed_moe_cuda(
          * removes the arm at compile time.  The static shared panel is sized
          * for the tower's q4_K gate/up row (groups 80, 1440-byte rows), so any
          * other shape keeps the shipped block. */
+        /* SWEEP: DS4_GU_PF=D publishes the coop prefetch distance once, from the
+         * first (eager) routed call; never inside a capture. */
+        {
+            static int gu_pf_done = 0;
+            if (!gu_pf_done) {
+                cudaStreamCaptureStatus cst = cudaStreamCaptureStatusNone;
+                if (cudaStreamIsCapturing(stream, &cst) == cudaSuccess && cst == cudaStreamCaptureStatusNone) {
+                    const char *e = getenv("DS4_GU_PF");
+                    int d = e ? atoi(e) : 0;
+                    if (d < 0) d = 0;
+                    if (cudaMemcpyToSymbol(g_qw_gu_pf_dist, &d, sizeof(d)) != cudaSuccess) (void)cudaGetLastError();
+                    gu_pf_done = 1;
+                } else {
+                    (void)cudaGetLastError();
+                }
+            }
+        }
         const char *const coop_env = getenv("DS4_GATEUP_COOP");
         const bool coop = (DS4_GATEUP_COOP_BUILD != 0) && vector &&
             (coop_env == NULL || coop_env[0] != '0') &&
@@ -9661,14 +9773,22 @@ static int qwen4exp_routed_moe_cuda(
          * loads; DS4_QWEN4EXP_NO_Q51_WIDE_LOAD restores the word loop. */
         const bool dn_wide6 =
             getenv("DS4_QWEN4EXP_NO_Q51_WIDE_LOAD") == NULL;
+        const int dn_cgrid = getenv("DS4_QWEN4EXP_NO_COMBINE_GRID") == NULL;
+        const uint32_t dn_cols = dn_cgrid ? qwen4exp_down_chunk_cols(out_dim)
+                                          : out_dim;
+        const uint32_t dn_l2 = dn_cgrid ? qwen4exp_down_l2_mode() : 0u;
+        if (dn_l2 != 0u && !qwen4exp_down_l2_carve()) return 0;
+        for (uint32_t c0 = 0; c0 < out_dim; c0 += dn_cols) {
+            const uint32_t cw =
+                (out_dim - c0 < dn_cols) ? (out_dim - c0) : dn_cols;
 #define QWEN4EXP_DOWN_MMA(DT, W6) \
         qwen4exp_moe_down_mma_kernel<DT, W6><<< \
-                dim3(out_dim / QW_DOWN_MMA_BM, gu_rows, 1), \
+                dim3(cw / QW_DOWN_MMA_BM, gu_rows, 1), \
                 QW_DOWN_MMA_THREADS, 0, stream>>>( \
                 (float *)down_partial->ptr, down, sc.mq, sc.ms, sc.msum, \
                 sc.pairs, sc.counts, sc.offsets, gu_active, \
                 down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
-                mgroups, out_dim, dn_dq_stage)
+                mgroups, out_dim, c0, dn_l2, dn_dq_stage)
         if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q5_1) {
             if (dn_wide6) {
                 QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q5_1, true);
@@ -9682,11 +9802,15 @@ static int qwen4exp_routed_moe_cuda(
         }
 #undef QWEN4EXP_DOWN_MMA
         if (!cuda_ok(cudaGetLastError(), "qwen4exp MoE down tile launch")) return 0;
-        if (getenv("DS4_QWEN4EXP_NO_COMBINE_GRID") == NULL) {
+        if (dn_cgrid) {
+            /* The combine reads the chunk's own columns only, so the grid
+             * shrinks with it; out_dim stays the stride the partials were
+             * written with (the shipped index). */
             qwen4exp_moe_down_combine_grid_kernel<<<
-                    dim3((out_dim + threads - 1u) / threads, n_tokens, 1),
+                    dim3((cw + threads - 1u) / threads, n_tokens, 1),
                     threads, 0, stream>>>(
-                    (float *)out->ptr, (const float *)down_partial->ptr,
+                    (float *)out->ptr + c0,
+                    (const float *)down_partial->ptr + c0,
                     (const int32_t *)selected->ptr, out_dim, n_tokens,
                     n_expert_used, n_total_expert);
         } else {
@@ -9697,6 +9821,7 @@ static int qwen4exp_routed_moe_cuda(
                     (float *)out->ptr, (const float *)down_partial->ptr,
                     (const int32_t *)selected->ptr, out_dim, n_tokens,
                     n_expert_used, n_total_expert);
+        }
         }
         return cuda_ok(cudaGetLastError(), "qwen4exp MoE down combine launch");
     }
@@ -10044,6 +10169,12 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
     const int pipe_gateup = qwen4exp_shared_pipe_ok(gu_types, 2u, xgroups, n_tokens, xq, gate, up, &gu_pk, &gu_pl);
     const int pipe_down = qwen4exp_shared_pipe_ok(dn_types, 1u, mgroups, n_tokens, mq, down, NULL, &dn_pk, &dn_pl);
     if (pipe_gateup &&
+        qwen4exp_shared_pipe2_gateup((float *)mid->ptr, gate, up, xq, xs,
+                                     gate_slab->row_bytes, up_slab->row_bytes,
+                                     xgroups, mid_dim, n_tokens, side)) {
+        /* SWEEP (F3): the re-staged twin, DS4_SHARED_PIPE2=1|2. */
+        ds4_gpu_qwen4exp_shared_mma_launches++;
+    } else if (pipe_gateup &&
         qwen4exp_shared_pipe_dispatch<2>(gu_pk, gu_pl, (float *)mid->ptr, gate, up, xq, xs,
                                          NULL, gate_slab->row_bytes, up_slab->row_bytes,
                                          xgroups, mid_dim, n_tokens, side)) {
@@ -10174,6 +10305,12 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
     }
 
     if (pipe_down &&
+        qwen4exp_shared_pipe2_down((float *)out->ptr, down, mq, ms,
+                                   (const float *)gate_scale->ptr, down_slab->row_bytes,
+                                   mgroups, out_dim, n_tokens, stream)) {
+        /* SWEEP (F3): the whole-K twin, DS4_SHARED_PIPE2=1|3. */
+        ds4_gpu_qwen4exp_shared_mma_launches++;
+    } else if (pipe_down &&
         qwen4exp_shared_pipe_dispatch<1>(dn_pk, dn_pl, (float *)out->ptr, down, NULL, mq, ms,
                                          (const float *)gate_scale->ptr, down_slab->row_bytes,
                                          0u, mgroups, out_dim, n_tokens, stream)) {
