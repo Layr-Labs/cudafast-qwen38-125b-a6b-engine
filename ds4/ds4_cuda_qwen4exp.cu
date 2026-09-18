@@ -8952,11 +8952,16 @@ extern "C" int ds4_gpu_qwen4exp_router_select_tensor(
 __global__ static void qwen4exp_ehx_pack_kernel(
         float *out, const float *embedding, const float *hidden,
         uint32_t n_hc, uint32_t n_embd) {
+    /* PDL edge on the MTP head's pack step: gated trigger for a single-wave
+     * grid (the decode-time pair count is a handful of blocks), fence before
+     * the first read of the normed embedding/hidden rows. */
+    if (gridDim.x <= 96u) QWEN4EXP_PDL_TRIGGER();
     const uint64_t pair = blockIdx.x;
     const uint32_t t = (uint32_t)(pair / n_hc);
     const uint64_t dst = pair * 2ull * n_embd;
     const uint64_t e_src = (uint64_t)t * n_embd;
     const uint64_t h_src = pair * n_embd;
+    QWEN4EXP_PDL_SYNC();
     for (uint32_t k = threadIdx.x; k < n_embd; k += blockDim.x) {
         out[dst + k] = embedding[e_src + k];
         out[dst + n_embd + k] = hidden[h_src + k];
@@ -8983,9 +8988,9 @@ extern "C" int ds4_gpu_qwen4exp_ehx_pack_tensor(
         return 0;
     }
     const unsigned threads = 256u;
-    qwen4exp_ehx_pack_kernel<<<
+    QWEN4EXP_LAUNCH_PDL(qwen4exp_ehx_pack_kernel,
             (unsigned)pairs, threads, 0,
-            cuda_decode_stream()>>>(
+            cuda_decode_stream(),
             (float *)out->ptr, (const float *)embedding->ptr,
             (const float *)hidden->ptr, n_hc, n_embd);
     return cuda_ok(cudaGetLastError(), "qwen4exp ehx pack launch");

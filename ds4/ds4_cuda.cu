@@ -5764,9 +5764,18 @@ __global__ static void quantize_q8_0_f32_kernel(
         const float *x,
         uint64_t in_dim,
         uint64_t blocks) {
+    /* PDL producer/consumer on the decode stream: the trigger is gated to a
+     * grid the device can hold at once (48 SMs x 32 resident 32-thread
+     * blocks = 1536), so a prefill launch never carries it -- the deadlock
+     * rule at the trigger macro (ds4_cuda_qwen4exp.cuh).  The fence orders
+     * this block's read of x behind the stream predecessor's completion when
+     * the launch carries the serialization attribute; it is a no-op on a
+     * plain launch. */
+    if (gridDim.x * gridDim.y <= 1536u) QWEN4EXP_PDL_TRIGGER();
     uint64_t b = blockIdx.x;
     uint64_t tok = blockIdx.y;
     if (b >= blocks) return;
+    QWEN4EXP_PDL_SYNC();
     uint64_t i0 = b * 32;
     uint64_t bn = in_dim - i0 < 32 ? in_dim - i0 : 32;
     const float *xr = x + tok * in_dim + i0;
@@ -5842,6 +5851,10 @@ __global__ static void quantize_q8_0_f32_rows_warp_kernel(int8_t *xq,
     const uint64_t pair =
         (uint64_t)blockIdx.x * (blockDim.x >> 5u) + (threadIdx.x >> 5u);
     if (pair >= (uint64_t)n_rows * blocks) return;
+    /* The launch now carries the serialization attribute too (the decode
+     * rows-exact callers below), so this block is also a consumer: fence
+     * before the first read of x, after the pair guard. */
+    QWEN4EXP_PDL_SYNC();
     const uint64_t row = pair / blocks;
     const uint64_t b = pair - row * blocks;
     const uint32_t lane = threadIdx.x & 31u;
@@ -5876,9 +5889,13 @@ __global__ static void quantize_q8_0_group_slice_rows_kernel(
         uint32_t n_groups_total,
         uint32_t group0,
         uint32_t group_cnt) {
+    /* Same PDL edge as quantize_q8_0_f32_kernel: gated trigger for a
+     * single-wave grid, fence before the first activation read. */
+    if (gridDim.x * gridDim.y <= 1536u) QWEN4EXP_PDL_TRIGGER();
     const uint64_t b = blockIdx.x;
     const uint64_t packed_row = blockIdx.y;
     if (b >= blocks) return;
+    QWEN4EXP_PDL_SYNC();
     const uint64_t token = packed_row / group_cnt;
     const uint64_t group = group0 + packed_row - token * group_cnt;
     const uint64_t i0 = b * 32u;
@@ -5921,9 +5938,14 @@ __global__ static void matmul_q8_0_preq_kernel(
         uint64_t n_tok,
         uint64_t blocks,
         int use_dp4a) {
+    /* Same PDL edge as the warp8 kernel below: gated trigger for a
+     * single-wave grid, fence before the first activation read. */
+    if (gridDim.x * gridDim.y * blockDim.x <= 73728u &&
+        gridDim.x * gridDim.y <= 1536u) QWEN4EXP_PDL_TRIGGER();
     uint64_t row = (uint64_t)blockIdx.x;
     uint64_t tok = (uint64_t)blockIdx.y;
     if (row >= out_dim || tok >= n_tok) return;
+    QWEN4EXP_PDL_SYNC();
     const unsigned char *wr = w + row * blocks * 34;
     const int8_t *xqr = xq + tok * blocks * 32;
     const float *xsr = xscale + tok * blocks;
@@ -5956,10 +5978,18 @@ __global__ static void matmul_q8_0_preq_warp8_kernel(
         uint64_t out_dim,
         uint64_t blocks,
         int use_dp4a) {
+    /* PDL consumer of the quantize launch that precedes it on the decode
+     * stream, and producer for whatever PDL consumer follows.  The trigger
+     * is gated to a single-wave grid (48 SMs x 1536 resident threads / 256 =
+     * 288 blocks); the fence sits after the row guard and before the first
+     * read of the quantized activation. */
+    if (gridDim.x * gridDim.y * blockDim.x <= 73728u &&
+        gridDim.x * gridDim.y <= 1536u) QWEN4EXP_PDL_TRIGGER();
     uint64_t row = (uint64_t)blockIdx.x * (blockDim.x >> 5u) + (threadIdx.x >> 5u);
     const uint64_t tok = (uint64_t)blockIdx.y;
     uint32_t lane = threadIdx.x & 31u;
     if (row >= out_dim) return;
+    QWEN4EXP_PDL_SYNC();
     const unsigned char *wr = w + row * blocks * 34;
     const int8_t *xqr = xq + tok * blocks * 32u;
     const float *xsr = xscale + tok * blocks;
@@ -6006,10 +6036,15 @@ __global__ static void matmul_q8_0_preq_rows_exact_tile_kernel(
         uint32_t n_rows,
         uint64_t blocks,
         int use_dp4a) {
+    /* Same PDL edge: gated trigger for a single-wave grid, fence before the
+     * first activation read. */
+    if (gridDim.x * gridDim.y * blockDim.x <= 73728u &&
+        gridDim.x * gridDim.y <= 1536u) QWEN4EXP_PDL_TRIGGER();
     const uint64_t row = (uint64_t)blockIdx.x * (blockDim.x >> 5u) + (threadIdx.x >> 5u);
     const uint32_t row0 = (uint32_t)blockIdx.y * (uint32_t)R;
     const uint32_t lane = threadIdx.x & 31u;
     if (row >= out_dim || row0 >= n_rows) return;
+    QWEN4EXP_PDL_SYNC();
     const uint32_t take = n_rows - row0 < (uint32_t)R ? n_rows - row0
                                                       : (uint32_t)R;
 
@@ -7616,10 +7651,15 @@ __global__ static void matmul_q8_0_pair_preq_warp8_kernel(
         uint64_t out1_dim,
         uint64_t blocks,
         int use_dp4a) {
+    /* Same PDL edge: gated trigger for a single-wave grid, fence before the
+     * first activation read. */
+    if (gridDim.x * gridDim.y * blockDim.x <= 73728u &&
+        gridDim.x * gridDim.y <= 1536u) QWEN4EXP_PDL_TRIGGER();
     uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
     const uint64_t tok = (uint64_t)blockIdx.y;
     uint32_t lane = threadIdx.x & 31u;
     if (row >= out0_dim && row >= out1_dim) return;
+    QWEN4EXP_PDL_SYNC();
     float acc0 = 0.0f;
     float acc1 = 0.0f;
     const unsigned char *wr0 = row < out0_dim ? w0 + row * blocks * 34 : NULL;
@@ -7666,9 +7706,14 @@ __global__ static void shared_mid_q8_0_preq_warp8_exact_kernel(
         uint32_t expert_split,
         bool home_rank,
         int use_dp4a) {
+    /* Same PDL edge: gated trigger for a single-wave grid, fence before the
+     * first activation read. */
+    if (gridDim.x * gridDim.y * blockDim.x <= 73728u &&
+        gridDim.x * gridDim.y <= 1536u) QWEN4EXP_PDL_TRIGGER();
     const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
     const uint32_t lane = threadIdx.x & 31u;
     if (row >= out_dim) return;
+    QWEN4EXP_PDL_SYNC();
     if (selected) {
         /* Complementary predicates select exactly one writer; ties stay on
          * the home rank to avoid an unnecessary peer store. */
@@ -7731,12 +7776,17 @@ __global__ static void matmul_q8_0_pair_preq_batch_kernel(
         uint64_t n_tok,
         uint64_t blocks,
         int use_dp4a) {
+    /* Same PDL edge: gated trigger for a single-wave grid, fence before the
+     * first activation read. */
+    if (gridDim.x * gridDim.y * blockDim.x <= 73728u &&
+        gridDim.x * gridDim.y <= 1536u) QWEN4EXP_PDL_TRIGGER();
     const uint64_t row = (uint64_t)blockIdx.x;
     const uint64_t tok = (uint64_t)blockIdx.y;
     if (tok >= n_tok) return;
     const int has0 = row < out0_dim;
     const int has1 = row < out1_dim;
     if (!has0 && !has1) return;
+    QWEN4EXP_PDL_SYNC();
 
     const unsigned char *wr0 = has0 ? w0 + row * blocks * 34u : NULL;
     const unsigned char *wr1 = has1 ? w1 + row * blocks * 34u : NULL;
@@ -7795,12 +7845,17 @@ __global__ static void matmul_q8_0_pair_preq_batch_tok2_exact_kernel(
         uint64_t n_tok,
         uint64_t blocks,
         int use_dp4a) {
+    /* Same PDL edge: gated trigger for a single-wave grid, fence before the
+     * first activation read. */
+    if (gridDim.x * gridDim.y * blockDim.x <= 73728u &&
+        gridDim.x * gridDim.y <= 1536u) QWEN4EXP_PDL_TRIGGER();
     const uint64_t row = (uint64_t)blockIdx.x;
     const uint64_t tok0 = (uint64_t)blockIdx.y * 2u;
     if (tok0 >= n_tok) return;
     const int has0 = row < out0_dim;
     const int has1 = row < out1_dim;
     if (!has0 && !has1) return;
+    QWEN4EXP_PDL_SYNC();
     const int valid1 = tok0 + 1u < n_tok;
 
     const unsigned char *wr0 = has0 ? w0 + row * blocks * 34u : NULL;
@@ -7904,9 +7959,14 @@ __global__ static void matmul_q8_0_hc_expand_preq_warp8_kernel(
         int has_owned_slots,
         uint32_t owned_expert_split,
         int use_dp4a) {
+    /* Same PDL edge: gated trigger for a single-wave grid, fence before the
+     * first activation read. */
+    if (gridDim.x * gridDim.y * blockDim.x <= 73728u &&
+        gridDim.x * gridDim.y <= 1536u) QWEN4EXP_PDL_TRIGGER();
     const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
     const uint32_t lane = threadIdx.x & 31u;
     if (row >= out_dim) return;
+    QWEN4EXP_PDL_SYNC();
     const unsigned char *wr = w + row * blocks * 34;
     float acc = 0.0f;
     for (uint64_t b = lane; b < blocks; b += 32u) {
@@ -8011,10 +8071,15 @@ __global__ static void matmul_q8_0_preq_batch_warp8_kernel(
         uint64_t n_tok,
         uint64_t blocks,
         int use_dp4a) {
+    /* Same PDL edge: gated trigger for a single-wave grid, fence before the
+     * first activation read. */
+    if (gridDim.x * gridDim.y * blockDim.x <= 73728u &&
+        gridDim.x * gridDim.y <= 1536u) QWEN4EXP_PDL_TRIGGER();
     const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
     const uint64_t tok = (uint64_t)blockIdx.y;
     const uint32_t lane = threadIdx.x & 31u;
     if (row >= out_dim || tok >= n_tok) return;
+    QWEN4EXP_PDL_SYNC();
 
     const unsigned char *wr = w + row * blocks * 34;
     const int8_t *xqr = xq + tok * blocks * 32;
@@ -8042,9 +8107,14 @@ __global__ static void matmul_q8_0_preq_batch_warp8_tok2_kernel(
         uint64_t out_dim,
         uint64_t blocks,
         int use_dp4a) {
+    /* Same PDL edge: gated trigger for a single-wave grid, fence before the
+     * first activation read. */
+    if (gridDim.x * gridDim.y * blockDim.x <= 73728u &&
+        gridDim.x * gridDim.y <= 1536u) QWEN4EXP_PDL_TRIGGER();
     const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
     const uint32_t lane = threadIdx.x & 31u;
     if (row >= out_dim) return;
+    QWEN4EXP_PDL_SYNC();
 
     const unsigned char *wr = w + row * blocks * 34u;
     const int8_t *xqr0 = xq;
@@ -8095,10 +8165,15 @@ __global__ static void matmul_q8_0_preq_batch_warp8_tok4_kernel(
         uint64_t n_tok,
         uint64_t blocks,
         int use_dp4a) {
+    /* Same PDL edge: gated trigger for a single-wave grid, fence before the
+     * first activation read. */
+    if (gridDim.x * gridDim.y * blockDim.x <= 73728u &&
+        gridDim.x * gridDim.y <= 1536u) QWEN4EXP_PDL_TRIGGER();
     const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
     const uint64_t tok0 = (uint64_t)blockIdx.y * 4u;
     const uint32_t lane = threadIdx.x & 31u;
     if (row >= out_dim || tok0 >= n_tok) return;
+    QWEN4EXP_PDL_SYNC();
 
     const unsigned char *wr = w + row * blocks * 34;
     const int8_t *xqr0 = xq + tok0 * blocks * 32;
@@ -8296,9 +8371,14 @@ __global__ static void matmul_q8_0_preq_batch_tok2_exact_kernel(
         uint64_t n_tok,
         uint64_t blocks,
         int use_dp4a) {
+    /* Same PDL edge: gated trigger for a single-wave grid, fence before the
+     * first activation read. */
+    if (gridDim.x * gridDim.y * blockDim.x <= 73728u &&
+        gridDim.x * gridDim.y <= 1536u) QWEN4EXP_PDL_TRIGGER();
     const uint64_t row = (uint64_t)blockIdx.x;
     const uint64_t tok0 = (uint64_t)blockIdx.y * 2u;
     if (row >= out_dim || tok0 >= n_tok) return;
+    QWEN4EXP_PDL_SYNC();
     const int valid1 = tok0 + 1u < n_tok;
     const unsigned char *wr = w + row * blocks * 34u;
     const int8_t *xqr0 = xq + tok0 * blocks * 32u;
@@ -8658,11 +8738,16 @@ __global__ static void grouped_q8_0_a_preq_warp8_kernel(
         uint32_t n_tokens,
         uint64_t blocks,
         int use_dp4a) {
+    /* Same PDL edge: gated trigger for a single-wave grid, fence before the
+     * first activation read. */
+    if (gridDim.x * gridDim.y * blockDim.x <= 73728u &&
+        gridDim.x * gridDim.y <= 1536u) QWEN4EXP_PDL_TRIGGER();
     const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
     const uint64_t tok = (uint64_t)blockIdx.y;
     const uint32_t lane = threadIdx.x & 31u;
     const uint64_t low_dim = (uint64_t)n_groups * rank;
     if (row >= low_dim || tok >= n_tokens) return;
+    QWEN4EXP_PDL_SYNC();
 
     const uint64_t group = row / rank;
     const uint64_t row_in_group = row - group * rank;
@@ -8696,11 +8781,16 @@ __global__ static void grouped_q8_0_a_preq_warp8_tok2_kernel(
         uint32_t n_tokens,
         uint64_t blocks,
         int use_dp4a) {
+    /* Same PDL edge: gated trigger for a single-wave grid, fence before the
+     * first activation read. */
+    if (gridDim.x * gridDim.y * blockDim.x <= 73728u &&
+        gridDim.x * gridDim.y <= 1536u) QWEN4EXP_PDL_TRIGGER();
     const uint32_t tid_in_tok = threadIdx.x & 255u;
     const uint64_t row = (uint64_t)blockIdx.x * 8u + (tid_in_tok >> 5u);
     const uint64_t tok = (uint64_t)blockIdx.y * 2u + (threadIdx.x >> 8u);
     const uint32_t lane = threadIdx.x & 31u;
     const uint64_t low_dim = (uint64_t)n_groups * rank;
+    if (row < low_dim && tok < n_tokens) QWEN4EXP_PDL_SYNC();
 
     float acc = 0.0f;
     if (row < low_dim && tok < n_tokens) {
@@ -17242,10 +17332,10 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
     dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1);
-    quantize_q8_0_f32_kernel<<<qgrid, 32, 0, cuda_decode_stream()>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    QWEN4EXP_LAUNCH_PDL(quantize_q8_0_f32_kernel, qgrid, 32, 0, cuda_decode_stream(), xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 quantize launch")) return 0;
     if (n_tok == 1) {
-        matmul_q8_0_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256, 0, cuda_decode_stream()>>>(
+        QWEN4EXP_LAUNCH_PDL(matmul_q8_0_preq_warp8_kernel, ((unsigned)out_dim + 7u) / 8u, 256, 0, cuda_decode_stream(),
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
                 xq,
@@ -17290,7 +17380,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
         blocks <= 32u &&
         n_tok >= 4u) {
         dim3 bgrid(((unsigned)out_dim + 7u) / 8u, ((unsigned)n_tok + 3u) / 4u, 1);
-        matmul_q8_0_preq_batch_warp8_tok4_kernel<<<bgrid, 256, 0, cuda_decode_stream()>>>(
+        QWEN4EXP_LAUNCH_PDL(matmul_q8_0_preq_batch_warp8_tok4_kernel, bgrid, 256, 0, cuda_decode_stream(),
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
                 xq,
@@ -17306,8 +17396,8 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
         (blocks <= 32u || force_decode_warp)) {
         if (force_decode_warp &&
             getenv("DS4_CUDA_GLM_VERIFY_NO_Q8_TOK2") == NULL) {
-            matmul_q8_0_preq_batch_warp8_tok2_kernel
-                    <<<((unsigned)out_dim + 7u) / 8u, 256, 0, cuda_decode_stream()>>>(
+            QWEN4EXP_LAUNCH_PDL(matmul_q8_0_preq_batch_warp8_tok2_kernel,
+                    ((unsigned)out_dim + 7u) / 8u, 256, 0, cuda_decode_stream(),
                     (float *)out->ptr,
                     reinterpret_cast<const unsigned char *>(wptr),
                     xq,
@@ -17320,7 +17410,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                            "matmul_q8_0 batch tok2 warp launch");
         }
         dim3 bgrid(((unsigned)out_dim + 7u) / 8u, (unsigned)n_tok, 1);
-        matmul_q8_0_preq_batch_warp8_kernel<<<bgrid, 256, 0, cuda_decode_stream()>>>(
+        QWEN4EXP_LAUNCH_PDL(matmul_q8_0_preq_batch_warp8_kernel, bgrid, 256, 0, cuda_decode_stream(),
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
                 xq,
@@ -17336,7 +17426,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     if (getenv("DS4_CUDA_NO_Q8_BATCH_EXACT_TOK2") == NULL &&
         n_tok >= 2u) {
         dim3 bgrid((unsigned)out_dim, ((unsigned)n_tok + 1u) / 2u, 1);
-        matmul_q8_0_preq_batch_tok2_exact_kernel<<<bgrid, exact_threads, 0, cuda_decode_stream()>>>(
+        QWEN4EXP_LAUNCH_PDL(matmul_q8_0_preq_batch_tok2_exact_kernel, bgrid, exact_threads, 0, cuda_decode_stream(),
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
                 xq,
@@ -17349,7 +17439,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
         return cuda_ok(cudaGetLastError(), "matmul_q8_0 exact tok2 launch");
     }
     dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
-    matmul_q8_0_preq_kernel<<<grid, exact_threads, 0, cuda_decode_stream()>>>((float *)out->ptr,
+    QWEN4EXP_LAUNCH_PDL(matmul_q8_0_preq_kernel, grid, exact_threads, 0, cuda_decode_stream(), (float *)out->ptr,
                                                      reinterpret_cast<const unsigned char *>(wptr),
                                                      xq,
                                                      xscale,
@@ -17737,13 +17827,13 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
     dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1);
-    quantize_q8_0_f32_kernel<<<qgrid, 32, 0, cuda_decode_stream()>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    QWEN4EXP_LAUNCH_PDL(quantize_q8_0_f32_kernel, qgrid, 32, 0, cuda_decode_stream(), xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 pair quantize launch")) return 0;
     if (n_tok != 1) {
         if (force_decode_warp &&
             getenv("DS4_CUDA_GLM_VERIFY_NO_Q8_TOK2") == NULL) {
-            matmul_q8_0_preq_batch_warp8_tok2_kernel
-                    <<<((unsigned)out0_dim + 7u) / 8u, 256, 0, cuda_decode_stream()>>>(
+            QWEN4EXP_LAUNCH_PDL(matmul_q8_0_preq_batch_warp8_tok2_kernel,
+                    ((unsigned)out0_dim + 7u) / 8u, 256, 0, cuda_decode_stream(),
                     (float *)out0->ptr,
                     reinterpret_cast<const unsigned char *>(w0),
                     xq, xscale, in_dim, out0_dim, blocks, use_dp4a);
@@ -17751,8 +17841,8 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
                          "matmul_q8_0 pair0 tok2 warp launch")) {
                 return 0;
             }
-            matmul_q8_0_preq_batch_warp8_tok2_kernel
-                    <<<((unsigned)out1_dim + 7u) / 8u, 256, 0, cuda_decode_stream()>>>(
+            QWEN4EXP_LAUNCH_PDL(matmul_q8_0_preq_batch_warp8_tok2_kernel,
+                    ((unsigned)out1_dim + 7u) / 8u, 256, 0, cuda_decode_stream(),
                     (float *)out1->ptr,
                     reinterpret_cast<const unsigned char *>(w1),
                     xq, xscale, in_dim, out1_dim, blocks, use_dp4a);
@@ -17805,7 +17895,7 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
             blocks <= 32u &&
             n_tok >= 4u) {
             dim3 grid0(((unsigned)out0_dim + 7u) / 8u, ((unsigned)n_tok + 3u) / 4u, 1);
-            matmul_q8_0_preq_batch_warp8_tok4_kernel<<<grid0, 256, 0, cuda_decode_stream()>>>(
+            QWEN4EXP_LAUNCH_PDL(matmul_q8_0_preq_batch_warp8_tok4_kernel, grid0, 256, 0, cuda_decode_stream(),
                     (float *)out0->ptr,
                     reinterpret_cast<const unsigned char *>(w0),
                     xq,
@@ -17817,7 +17907,7 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
                     use_dp4a);
             if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 pair0 batch tok4 launch")) return 0;
             dim3 grid1(((unsigned)out1_dim + 7u) / 8u, ((unsigned)n_tok + 3u) / 4u, 1);
-            matmul_q8_0_preq_batch_warp8_tok4_kernel<<<grid1, 256, 0, cuda_decode_stream()>>>(
+            QWEN4EXP_LAUNCH_PDL(matmul_q8_0_preq_batch_warp8_tok4_kernel, grid1, 256, 0, cuda_decode_stream(),
                     (float *)out1->ptr,
                     reinterpret_cast<const unsigned char *>(w1),
                     xq,
@@ -17832,7 +17922,7 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
         if (getenv("DS4_CUDA_NO_Q8_BATCH_WARP") == NULL &&
             blocks <= 32u) {
             dim3 grid0(((unsigned)out0_dim + 7u) / 8u, (unsigned)n_tok, 1);
-            matmul_q8_0_preq_batch_warp8_kernel<<<grid0, 256, 0, cuda_decode_stream()>>>(
+            QWEN4EXP_LAUNCH_PDL(matmul_q8_0_preq_batch_warp8_kernel, grid0, 256, 0, cuda_decode_stream(),
                     (float *)out0->ptr,
                     reinterpret_cast<const unsigned char *>(w0),
                     xq,
@@ -17844,7 +17934,7 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
                     use_dp4a);
             if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 pair0 batch warp launch")) return 0;
             dim3 grid1(((unsigned)out1_dim + 7u) / 8u, (unsigned)n_tok, 1);
-            matmul_q8_0_preq_batch_warp8_kernel<<<grid1, 256, 0, cuda_decode_stream()>>>(
+            QWEN4EXP_LAUNCH_PDL(matmul_q8_0_preq_batch_warp8_kernel, grid1, 256, 0, cuda_decode_stream(),
                     (float *)out1->ptr,
                     reinterpret_cast<const unsigned char *>(w1),
                     xq,
@@ -17862,7 +17952,7 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
             if (getenv("DS4_CUDA_NO_Q8_PAIR_BATCH_EXACT_TOK2") == NULL &&
                 n_tok >= 2u) {
                 dim3 grid((unsigned)max_out_dim, ((unsigned)n_tok + 1u) / 2u, 1);
-                matmul_q8_0_pair_preq_batch_tok2_exact_kernel<<<grid, exact_threads, 0, cuda_decode_stream()>>>(
+                QWEN4EXP_LAUNCH_PDL(matmul_q8_0_pair_preq_batch_tok2_exact_kernel, grid, exact_threads, 0, cuda_decode_stream(),
                         (float *)out0->ptr,
                         (float *)out1->ptr,
                         reinterpret_cast<const unsigned char *>(w0),
@@ -17878,7 +17968,7 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
                 return cuda_ok(cudaGetLastError(), "matmul_q8_0 pair exact tok2 launch");
             }
             dim3 grid((unsigned)max_out_dim, (unsigned)n_tok, 1);
-            matmul_q8_0_pair_preq_batch_kernel<<<grid, exact_threads, 0, cuda_decode_stream()>>>(
+            QWEN4EXP_LAUNCH_PDL(matmul_q8_0_pair_preq_batch_kernel, grid, exact_threads, 0, cuda_decode_stream(),
                     (float *)out0->ptr,
                     (float *)out1->ptr,
                     reinterpret_cast<const unsigned char *>(w0),
@@ -17895,7 +17985,7 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
         }
         const unsigned exact_threads = cuda_q8_exact_threads(blocks);
         dim3 grid0((unsigned)out0_dim, (unsigned)n_tok, 1);
-        matmul_q8_0_preq_kernel<<<grid0, exact_threads, 0, cuda_decode_stream()>>>((float *)out0->ptr,
+        QWEN4EXP_LAUNCH_PDL(matmul_q8_0_preq_kernel, grid0, exact_threads, 0, cuda_decode_stream(), (float *)out0->ptr,
                                                           reinterpret_cast<const unsigned char *>(w0),
                                                           xq,
                                                           xscale,
@@ -17903,7 +17993,7 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
                                                           use_dp4a);
         if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 pair0 batch launch")) return 0;
         dim3 grid1((unsigned)out1_dim, (unsigned)n_tok, 1);
-        matmul_q8_0_preq_kernel<<<grid1, exact_threads, 0, cuda_decode_stream()>>>((float *)out1->ptr,
+        QWEN4EXP_LAUNCH_PDL(matmul_q8_0_preq_kernel, grid1, exact_threads, 0, cuda_decode_stream(), (float *)out1->ptr,
                                                           reinterpret_cast<const unsigned char *>(w1),
                                                           xq,
                                                           xscale,
@@ -17912,7 +18002,7 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
         return cuda_ok(cudaGetLastError(), "matmul_q8_0 pair1 batch launch");
     }
     const uint64_t max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
-    matmul_q8_0_pair_preq_warp8_kernel<<<((unsigned)max_out + 7u) / 8u, 256, 0, cuda_decode_stream()>>>(
+    QWEN4EXP_LAUNCH_PDL(matmul_q8_0_pair_preq_warp8_kernel, ((unsigned)max_out + 7u) / 8u, 256, 0, cuda_decode_stream(),
             (float *)out0->ptr,
             (float *)out1->ptr,
             reinterpret_cast<const unsigned char *>(w0),
@@ -18537,7 +18627,7 @@ static int cuda_matmul_q8_0_preq_rows_exact(
      * eight rows with the SAME per-row arithmetic. */
     if (n_rows == 1u || getenv("DS4_QWEN4EXP_NO_ROW_TILE") != NULL) {
         dim3 grid(wgrid, n_rows, 1u);
-        matmul_q8_0_preq_warp8_kernel<<<grid, wthreads, 0, cuda_decode_stream()>>>(
+        QWEN4EXP_LAUNCH_PDL(matmul_q8_0_preq_warp8_kernel, grid, wthreads, 0, cuda_decode_stream(),
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
                 xq, xscale, in_dim, out_dim, blocks, use_dp4a);
@@ -18546,22 +18636,22 @@ static int cuda_matmul_q8_0_preq_rows_exact(
     }
     if (n_rows >= 8u) {
         dim3 grid(wgrid, (n_rows + 7u) / 8u, 1u);
-        matmul_q8_0_preq_rows_exact_tile_kernel<8>
-            <<<grid, wthreads, 0, cuda_decode_stream()>>>(
+        QWEN4EXP_LAUNCH_PDL((matmul_q8_0_preq_rows_exact_tile_kernel<8>),
+            grid, wthreads, 0, cuda_decode_stream(),
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
                 xq, xscale, in_dim, out_dim, n_rows, blocks, use_dp4a);
     } else if (n_rows >= 4u) {
         dim3 grid(wgrid, (n_rows + 3u) / 4u, 1u);
-        matmul_q8_0_preq_rows_exact_tile_kernel<4>
-            <<<grid, wthreads, 0, cuda_decode_stream()>>>(
+        QWEN4EXP_LAUNCH_PDL((matmul_q8_0_preq_rows_exact_tile_kernel<4>),
+            grid, wthreads, 0, cuda_decode_stream(),
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
                 xq, xscale, in_dim, out_dim, n_rows, blocks, use_dp4a);
     } else {
         dim3 grid(wgrid, (n_rows + 1u) / 2u, 1u);
-        matmul_q8_0_preq_rows_exact_tile_kernel<2>
-            <<<grid, wthreads, 0, cuda_decode_stream()>>>(
+        QWEN4EXP_LAUNCH_PDL((matmul_q8_0_preq_rows_exact_tile_kernel<2>),
+            grid, wthreads, 0, cuda_decode_stream(),
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
                 xq, xscale, in_dim, out_dim, n_rows, blocks, use_dp4a);
@@ -18613,7 +18703,7 @@ extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
     float *xscale = (float *)((char *)tmp + scale_offset);
     const uint64_t qpairs = (uint64_t)n_rows * blocks;
     const unsigned qgrid = (unsigned)((qpairs + 7u) / 8u);
-    quantize_q8_0_f32_rows_warp_kernel<<<qgrid, 256, 0, cuda_decode_stream()>>>(
+    QWEN4EXP_LAUNCH_PDL(quantize_q8_0_f32_rows_warp_kernel, qgrid, 256, 0, cuda_decode_stream(),
             xq, xscale, (const float *)x->ptr, in_dim, blocks, n_rows);
     if (!cuda_ok(cudaGetLastError(),
                  "q8_0 decode rows exact quantize launch")) {
@@ -18703,7 +18793,7 @@ extern "C" int ds4_gpu_quantize_q8_0_decode_rows_exact_tensor(
     float *xscale = (float *)((char *)q->ptr + s_offset);
     const uint64_t qpairs = (uint64_t)n_rows * blocks;
     const unsigned qgrid = (unsigned)((qpairs + 7u) / 8u);
-    quantize_q8_0_f32_rows_warp_kernel<<<qgrid, 256, 0, cuda_decode_stream()>>>(
+    QWEN4EXP_LAUNCH_PDL(quantize_q8_0_f32_rows_warp_kernel, qgrid, 256, 0, cuda_decode_stream(),
             xq, xscale, (const float *)x->ptr, in_dim, blocks, n_rows);
     return cuda_ok(cudaGetLastError(), "q8_0 decode rows quantize launch");
 }
@@ -18763,7 +18853,7 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
     dim3 qgrid((unsigned)blocks, n_rows, 1u);
-    quantize_q8_0_f32_kernel<<<qgrid, 32, 0, cuda_decode_stream()>>>(
+    QWEN4EXP_LAUNCH_PDL(quantize_q8_0_f32_kernel, qgrid, 32, 0, cuda_decode_stream(),
             xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(),
                  "q8_0 pair decode rows exact quantize launch")) {
@@ -18771,7 +18861,7 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(
     }
     const uint64_t max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
     dim3 grid(((unsigned)max_out + 7u) / 8u, n_rows, 1u);
-    matmul_q8_0_pair_preq_warp8_kernel<<<grid, 256, 0, cuda_decode_stream()>>>(
+    QWEN4EXP_LAUNCH_PDL(matmul_q8_0_pair_preq_warp8_kernel, grid, 256, 0, cuda_decode_stream(),
             (float *)out0->ptr,
             (float *)out1->ptr,
             reinterpret_cast<const unsigned char *>(w0),
@@ -18840,9 +18930,9 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
-    quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32, 0, cuda_decode_stream()>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    QWEN4EXP_LAUNCH_PDL(quantize_q8_0_f32_kernel, (unsigned)blocks, 32, 0, cuda_decode_stream(), xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand quantize launch")) return 0;
-    matmul_q8_0_hc_expand_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256, 0, cuda_decode_stream()>>>(
+    QWEN4EXP_LAUNCH_PDL(matmul_q8_0_hc_expand_preq_warp8_kernel, ((unsigned)out_dim + 7u) / 8u, 256, 0, cuda_decode_stream(),
             (float *)out_hc->ptr,
             (float *)block_out->ptr,
             block_add ? (const float *)block_add->ptr : (const float *)block_out->ptr,
@@ -23749,7 +23839,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         float *xscale = (float *)((char *)tmp + scale_offset);
         const int use_dp4a = cuda_q8_use_dp4a();
         dim3 qgrid((unsigned)blocks_a, (unsigned)x_rows, 1);
-        quantize_q8_0_f32_kernel<<<qgrid, 32, 0, cuda_decode_stream()>>>(xq,
+        QWEN4EXP_LAUNCH_PDL(quantize_q8_0_f32_kernel, qgrid, 32, 0, cuda_decode_stream(), xq,
                                                 xscale,
                                                 (const float *)heads->ptr,
                                                 group_dim,
@@ -23777,7 +23867,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
             /* handled */
         } else if (getenv("DS4_CUDA_NO_ATTN_A_TOK2") == NULL && n_tokens >= 2u) {
             dim3 grid_a(((unsigned)low_dim + 7u) / 8u, ((unsigned)n_tokens + 1u) / 2u, 1);
-            grouped_q8_0_a_preq_warp8_tok2_kernel<<<grid_a, 512, 0, cuda_decode_stream()>>>((float *)low->ptr,
+            QWEN4EXP_LAUNCH_PDL(grouped_q8_0_a_preq_warp8_tok2_kernel, grid_a, 512, 0, cuda_decode_stream(), (float *)low->ptr,
                                                                    out_a,
                                                                    xq,
                                                                    xscale,
@@ -23789,7 +23879,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                                                                    use_dp4a);
         } else {
             dim3 grid_a(((unsigned)low_dim + 7u) / 8u, (unsigned)n_tokens, 1);
-            grouped_q8_0_a_preq_warp8_kernel<<<grid_a, 256, 0, cuda_decode_stream()>>>((float *)low->ptr,
+            QWEN4EXP_LAUNCH_PDL(grouped_q8_0_a_preq_warp8_kernel, grid_a, 256, 0, cuda_decode_stream(), (float *)low->ptr,
                                                               out_a,
                                                               xq,
                                                               xscale,
@@ -23873,7 +23963,6 @@ extern "C" int ds4_gpu_attention_output_low_q8_rows_exact_tensor(
             cuda_resolve_weight_ptr(model_map, a_offset, out_a_bytes,
                                     logical_tier, "attn_out_a_rows"));
     if (!out_a) return 0;
-
     const uint64_t x_rows = (uint64_t)n_rows * group_cnt;
     const uint64_t xq_bytes = x_rows * blocks_a * 32u;
     const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
@@ -23884,7 +23973,7 @@ extern "C" int ds4_gpu_attention_output_low_q8_rows_exact_tensor(
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
     dim3 qgrid((unsigned)blocks_a, (unsigned)x_rows, 1);
-    quantize_q8_0_group_slice_rows_kernel<<<qgrid, 32, 0, cuda_decode_stream()>>>(
+    QWEN4EXP_LAUNCH_PDL(quantize_q8_0_group_slice_rows_kernel, qgrid, 32, 0, cuda_decode_stream(),
             xq,
             xscale,
             (const float *)heads->ptr,
@@ -23896,7 +23985,7 @@ extern "C" int ds4_gpu_attention_output_low_q8_rows_exact_tensor(
     if (!cuda_ok(cudaGetLastError(),
                  "attention_output_low_q8 rows prequant launch")) return 0;
     dim3 grid_a(((unsigned)low_dim + 7u) / 8u, n_rows, 1u);
-    grouped_q8_0_a_preq_warp8_kernel<<<grid_a, 256, 0, cuda_decode_stream()>>>((float *)low->ptr,
+    QWEN4EXP_LAUNCH_PDL(grouped_q8_0_a_preq_warp8_kernel, grid_a, 256, 0, cuda_decode_stream(), (float *)low->ptr,
                                                       out_a,
                                                       xq,
                                                       xscale,
@@ -24078,15 +24167,15 @@ extern "C" int ds4_gpu_shared_mid_swiglu_q8_0_decode_exact_tensor(
         if (!tmp) return 0;
         xq = (int8_t *)tmp;
         xscale = (float *)((char *)tmp + scale_offset);
-        quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32, 0, cuda_decode_stream()>>>(
+        QWEN4EXP_LAUNCH_PDL(quantize_q8_0_f32_kernel, (unsigned)blocks, 32, 0, cuda_decode_stream(),
                 xq, xscale, (const float *)x->ptr, in_dim, blocks);
         if (!cuda_ok(cudaGetLastError(),
                      "shared mid q8 exact quantize launch")) {
             return 0;
         }
     }
-    shared_mid_q8_0_preq_warp8_exact_kernel<<<
-            ((unsigned)out_dim + 7u) / 8u, 256, 0, cuda_decode_stream()>>>(
+    QWEN4EXP_LAUNCH_PDL(shared_mid_q8_0_preq_warp8_exact_kernel,
+            ((unsigned)out_dim + 7u) / 8u, 256, 0, cuda_decode_stream(),
             (float *)mid->ptr,
             (const unsigned char *)gate_w,
             (const unsigned char *)up_w,
