@@ -17973,6 +17973,14 @@ int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows) {
  * captures and first-touch costs. A local comparison that does not discard
  * each residency's first run is measuring which arm happened to go first.
  */
+/* This build's note auto09181044_19 records that asynchronous copy buys
+ * prefetch depth at no register cost, so it pays exactly where memory level
+ * parallelism is capped by the register budget and costs where occupancy
+ * already hides the latency. The same technique measured minus fourteen
+ * percent at a thirty-two register site with six blocks per multiprocessor
+ * and plus fifty-five percent at a two hundred and fifty-five register site
+ * with one.
+ */
 int ds4_qwen4exp_pdl_enabled(void) {
     static int resolved = 0;
     static int enabled = 0;
