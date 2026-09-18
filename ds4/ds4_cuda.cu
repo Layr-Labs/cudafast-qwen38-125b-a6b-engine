@@ -3502,14 +3502,43 @@ extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, con
     return ok;
 }
 
+/* Declared in ds4_gpu.h, defined in ds4_cuda_qwen4exp.cu; redeclared here
+ * per this file's no-ds4_gpu.h convention. */
+extern "C" int ds4_gpu_qwen4exp_result_publish(const ds4_gpu_tensor *src_a,
+                                               uint64_t a_offset,
+                                               uint64_t a_bytes,
+                                               const ds4_gpu_tensor *src_b,
+                                               uint64_t b_offset,
+                                               uint32_t b_count,
+                                               uint32_t b_stride);
+extern "C" int ds4_gpu_qwen4exp_result_mailbox_read(void *dst_a,
+                                                  uint64_t a_bytes,
+                                                  float *dst_b,
+                                                  uint32_t b_count);
+
 extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     int d = ds4_tensor_device_idx(tensor);
     int ok = 0;
     WITH_DEVICE(g_gpu[d].device_id) {
-        ok = cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes,
-                                cudaMemcpyDeviceToHost),
-                     "tensor read");
+        /* Small word-aligned reads go through the result mailbox: one
+         * publish kernel writes the words into mapped host memory and
+         * the host polls a generation word, which is cheaper than the
+         * blocking copy's own synchronisation on the decode path.  The
+         * mailbox is single-shot, so a consumed or refused read falls
+         * through to the established blocking copy. */
+        if (bytes != 0 && bytes <= 64u && (bytes & 3u) == 0 &&
+            !g_decode_graph_capturing &&
+            ds4_gpu_qwen4exp_result_publish(tensor, offset, bytes,
+                                            NULL, 0, 0, 0) != 0) {
+            ok = ds4_gpu_qwen4exp_result_mailbox_read(data, bytes,
+                                                    NULL, 0);
+        }
+        if (!ok) {
+            ok = cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset,
+                                    (size_t)bytes, cudaMemcpyDeviceToHost),
+                         "tensor read");
+        }
     }
     return ok;
 }

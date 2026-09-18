@@ -53,6 +53,22 @@ void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
+/* Decode result mailbox: enqueue a publish of small per-step results
+ * (top-1 ids, plus an optional strided float row) into host-mapped
+ * memory, then read them after a generation-word poll instead of a
+ * device drain plus a blocking copy.  Both return 0 when no mailbox is
+ * armed so callers keep the drained readback as the fallback. */
+int ds4_gpu_qwen4exp_result_publish(const ds4_gpu_tensor *src_a,
+                                    uint64_t              a_offset,
+                                    uint64_t              a_bytes,
+                                    const ds4_gpu_tensor *src_b,
+                                    uint64_t              b_offset,
+                                    uint32_t              b_count,
+                                    uint32_t              b_stride);
+int ds4_gpu_qwen4exp_result_mailbox_read(void    *dst_a,
+                                       uint64_t  a_bytes,
+                                       float    *dst_b,
+                                       uint32_t  b_count);
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);

@@ -54,6 +54,7 @@
 #include "ds4_qwen4exp_moe_types.h"
 #include "ds4_qwen4exp_hc_types.h"
 #include "ds4_qwen4exp_qsa_scratch.h"
+#include "ds4_qwen4exp_verify_mailbox.h"
 
 #define CUDA_QK_K 256
 
@@ -16245,3 +16246,162 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
  * census shows produces a byte-identical capture log. */
 
 #define YUKON_REDRAW_10 10
+
+/* ------------------------------------------------------------------
+ * Decode result mailbox.
+ *
+ * The verify and the draft head each end a forward with a handful of
+ * result words the host must see: the compact verify's per-row top-1
+ * ids, and the head's top-1 ids plus the row-zero logits its NaN rule
+ * needs.  The established path drains the whole device
+ * (ds4_gpu_end_commands -> cudaDeviceSynchronize, then a second
+ * ds4_gpu_synchronize on the verify) and follows it with a blocking
+ * cudaMemcpy per result -- two driver round-trips plus the copy's own
+ * synchronisation inside the serial gap between one forward and the
+ * next launch.
+ *
+ * The mailbox removes that gap.  One thread block copies the result
+ * words into host-mapped memory through the allocation's device alias,
+ * fences them system-wide, and bumps a generation word.  The host
+ * polls the generation word and reads the payload out of its own
+ * memory; a bounded spin covers the wait and a stream synchronise is
+ * the fallback, so the data the host sees is identical to what the
+ * drained readback produced -- only the round-trips are gone.
+ * ------------------------------------------------------------------ */
+
+#define DS4_RESULT_MAILBOX_B_OFF 64u
+
+static ds4_verify_mailbox *g_result_mb_host;
+static ds4_verify_mailbox *g_result_mb_dev;
+static uint64_t            g_result_mb_seq;
+static uint64_t            g_result_mb_ready;
+
+int ds4_verify_mailbox_alloc(ds4_verify_mailbox **host,
+                             ds4_verify_mailbox **device) {
+    if (!host || !device) return 0;
+    void *h = NULL;
+    if (!cuda_ok(cudaHostAlloc(&h, sizeof(ds4_verify_mailbox),
+                             cudaHostAllocMapped),
+                 "result mailbox alloc")) {
+        return 0;
+    }
+    memset(h, 0, sizeof(ds4_verify_mailbox));
+    void *d = NULL;
+    if (!cuda_ok(cudaHostGetDevicePointer(&d, h, 0),
+                 "result mailbox device alias")) {
+        (void)cudaFreeHost(h);
+        return 0;
+    }
+    *host = (ds4_verify_mailbox *)h;
+    *device = (ds4_verify_mailbox *)d;
+    return 1;
+}
+
+void ds4_verify_mailbox_free(ds4_verify_mailbox *host) {
+    if (host) (void)cudaFreeHost((void *)host);
+}
+
+__global__ static void qwen4exp_result_publish_kernel(
+        ds4_verify_mailbox *mb,
+        const uint32_t     *src_a,
+        uint32_t            a_words,
+        const float        *src_b,
+        uint32_t            b_count,
+        uint32_t            b_stride,
+        uint64_t            seq) {
+    const uint32_t t = threadIdx.x;
+    for (uint32_t i = t; i < a_words; i += blockDim.x) {
+        ((volatile uint32_t *)mb->payload)[i] = src_a[i];
+    }
+    if (src_b) {
+        volatile float *dst =
+            (volatile float *)(mb->payload + DS4_RESULT_MAILBOX_B_OFF);
+        for (uint32_t i = t; i < b_count; i += blockDim.x) {
+            dst[i] = src_b[(uint64_t)i * b_stride];
+        }
+    }
+    __syncthreads();
+    if (t == 0u) {
+        mb->len = a_words * sizeof(uint32_t);
+        mb->reserved0 = b_count;
+        __threadfence_system();
+        mb->seq = seq;
+    }
+}
+
+extern "C" int ds4_gpu_qwen4exp_result_publish(
+        const ds4_gpu_tensor *src_a,
+        uint64_t              a_offset,
+        uint64_t              a_bytes,
+        const ds4_gpu_tensor *src_b,
+        uint64_t              b_offset,
+        uint32_t              b_count,
+        uint32_t              b_stride) {
+    if (!src_a || !src_a->ptr || a_bytes == 0 ||
+        (a_bytes & 3u) != 0 ||
+        a_bytes > DS4_RESULT_MAILBOX_B_OFF ||
+        a_offset > src_a->bytes || a_bytes > src_a->bytes - a_offset) {
+        return 0;
+    }
+    if (b_count) {
+        if (!src_b || !src_b->ptr ||
+            b_count * sizeof(float) >
+                DS4_VERIFY_MAILBOX_PAYLOAD - DS4_RESULT_MAILBOX_B_OFF ||
+            b_offset > src_b->bytes ||
+            (uint64_t)(b_count - 1u) * b_stride * sizeof(float) +
+                    sizeof(float) >
+                src_b->bytes - b_offset) {
+            return 0;
+        }
+    }
+    if (!g_result_mb_host &&
+        !ds4_verify_mailbox_alloc(&g_result_mb_host, &g_result_mb_dev)) {
+        return 0;
+    }
+    const uint64_t seq = ++g_result_mb_seq;
+    qwen4exp_result_publish_kernel<<<1, 32, 0, cuda_decode_stream()>>>(
+            g_result_mb_dev,
+            (const uint32_t *)((const char *)src_a->ptr + a_offset),
+            (uint32_t)(a_bytes / sizeof(uint32_t)),
+            b_count ? (const float *)((const char *)src_b->ptr + b_offset)
+                    : NULL,
+            b_count, b_stride, seq);
+    if (!cuda_ok(cudaGetLastError(), "result mailbox publish launch")) {
+        return 0;
+    }
+    g_result_mb_ready = seq;
+    return 1;
+}
+
+extern "C" int ds4_gpu_qwen4exp_result_mailbox_read(void    *dst_a,
+                                                  uint64_t  a_bytes,
+                                                  float    *dst_b,
+                                                  uint32_t  b_count) {
+    if (!g_result_mb_ready || !dst_a) return 0;
+    const uint64_t want = g_result_mb_ready;
+    g_result_mb_ready = 0;
+    /* The spin covers the whole wait: the host reaches this point while
+     * the forward is still running, so polling the generation word is
+     * what removes the synchronise's driver round-trip from the serial
+     * gap.  The stream sync is only the fallback for a stalled publish. */
+    if (!ds4_verify_mailbox_poll(g_result_mb_host, want, 400000000ull)) {
+        if (!cuda_ok(cudaStreamSynchronize(cuda_decode_stream()),
+                     "result mailbox wait")) {
+            return 0;
+        }
+        if (g_result_mb_host->seq < want) return 0;
+    }
+    const ds4_verify_mailbox *mb = g_result_mb_host;
+    if (a_bytes > mb->len ||
+        b_count > mb->reserved0 ||
+        b_count * sizeof(float) >
+            DS4_VERIFY_MAILBOX_PAYLOAD - DS4_RESULT_MAILBOX_B_OFF) {
+        return 0;
+    }
+    memcpy(dst_a, (const void *)mb->payload, (size_t)a_bytes);
+    if (dst_b && b_count) {
+        memcpy(dst_b, (const void *)(mb->payload + DS4_RESULT_MAILBOX_B_OFF),
+               (size_t)b_count * sizeof(float));
+    }
+    return 1;
+}

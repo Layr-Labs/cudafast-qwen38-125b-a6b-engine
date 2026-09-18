@@ -3137,10 +3137,23 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         fprintf(stderr, "ds4: qwen4exp compact verify top-1 failed\n");
         return qwen4exp_forward_fail();
     }
+    /* The compact verify reads only spec_top1.  Publish it into the
+     * result mailbox while the batch is still open: the reader polls a
+     * generation word instead of draining the device twice and then
+     * issuing a blocking copy, so the serial gap between this forward
+     * and the next launch loses both driver round-trips.  Any refusal
+     * keeps the established drain below. */
+    const bool top1_published =
+        s->spec_top1_rows != 0u && logits_out == NULL &&
+        ds4_gpu_qwen4exp_result_publish(s->spec_top1, 0,
+                                        (uint64_t)logit_rows *
+                                            sizeof(int32_t),
+                                        NULL, 0, 0, 0) != 0;
     QW_TRACE(QW_SLICE_HEAD);
     QW_TRACE_REPORT(n_tokens);
     /* Commit and wait: the logits are read on the host from here on. */
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
+    if (!top1_published &&
+        (!ds4_gpu_end_commands() || !ds4_gpu_synchronize())) {
         fprintf(stderr, "ds4: qwen4exp command batch did not complete\n");
         return false;
     }
@@ -3708,7 +3721,11 @@ bool ds4_qwen4exp_graph_verify_top1_rows(ds4_qwen4exp_session       *s,
         fprintf(stderr, "ds4: qwen4exp compact verify hyper read failed\n");
         return false;
     }
-    return ds4_gpu_tensor_read(s->spec_top1, 0, row_top1,
+    return ds4_gpu_qwen4exp_result_mailbox_read(row_top1,
+                                              (uint64_t)n_tokens *
+                                                  sizeof(int32_t),
+                                              NULL, 0) != 0 ||
+           ds4_gpu_tensor_read(s->spec_top1, 0, row_top1,
                                (uint64_t)n_tokens * sizeof(int32_t)) != 0;
 }
 
