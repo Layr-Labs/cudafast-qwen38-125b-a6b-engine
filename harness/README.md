@@ -36,4 +36,4 @@ scripted session with no GPU. The `ds4-engine` feature is off by default, so
 `cuda-engine` serves the mock unless the box build asks for ds4;
 `tools/ds4/build.sh` produces the `libds4qwen.so` the feature links. The real
 GPU drive is box-validated by `tools/ds4/mtp-exactness-gate.py`.
-<!-- ranked variance draw 20260918T170910Z-235 -->
+<!-- ranked variance draw 20260918T175327Z-238 -->
