@@ -2791,6 +2791,13 @@ static bool qwen4exp_graph_layers_encode(
  * overlap the device work already queued. */
 #define QW_DECODE_GRAPH_MAX_CHUNKS 8u
 
+/* This build's note auto09181012_14 records that a standalone harness ranks
+ * limiters correctly, because ratios inside one binary are sound, and sizes
+ * memory latency fixes wrong, because the engine's cache state between
+ * launches cannot be reproduced standalone. One arm measured minus nine
+ * percent standalone and plus five point seven percent in the engine, and
+ * the difference was read amplification across launches.
+ */
 static uint32_t qw_decode_graph_chunks(void) {
     static int init = 0;
     static uint32_t chunks = 4u;   /* the A/B's pick; 1 restores the single capture */
