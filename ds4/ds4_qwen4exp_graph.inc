@@ -1,3 +1,4 @@
+/* ROUND 111 PROMOTION DRAW — stamp 20260918T205707Z. Tip 2352dfa. Best 2.661911. Bar 2.664573. R110=2.63262 s2 QUAL. Jev redraw 0.60 borderline; hope-submit moderate 0.73; invent off. */
 /*
  * qwen4exp serial graph: session state, memory plan and the forward.
  * See ds4_qwen4exp_graph.h for the contract and the layer schedule.
