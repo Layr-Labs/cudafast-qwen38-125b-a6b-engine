@@ -328,6 +328,18 @@ struct ds4_qwen4exp_session {
     bool              ple_ready;      /* the hash constants were readable */
     uint64_t         *ple_ids;        /* host [n_batch][head_count]       */
     float            *ple_rows_host;  /* host [n_batch][ple_embd]         */
+    /* Look-ahead gather: while a prefill chunk's forward runs on the device,
+     * the pool gathers the NEXT chunk's rows into ple_ids/ple_rows_host.
+     * ple_prompt is the unconsumed tail of the prompt the sync loop armed;
+     * ple_pf_* describes the in-flight prefetch and ple_pf_rows how many
+     * leading tokens' rows it completed. */
+    const int32_t    *ple_prompt;
+    uint32_t          ple_prompt_left;
+    const int32_t    *ple_pf_tokens;
+    uint32_t          ple_pf_count;
+    uint32_t          ple_pf_rows;
+    uint32_t          ple_pf_segs;
+    bool              ple_pf_active;
     ds4_gpu_tensor   *ple_conv_state; /* [state_rows][n_hc * n_embd]      */
     ds4_gpu_tensor   *ple_rows;       /* [n_batch][ple_embd]              */
     ds4_gpu_tensor   *ple_key;        /* key projection, then the gate    */
@@ -866,8 +878,13 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
     return s;
 }
 
+/* Defined with the gather below; a close or reset must not free or reuse the
+ * buffers a look-ahead gather is still writing. */
+static void qw_ple_prefetch_join(ds4_qwen4exp_session *s);
+
 void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     if (!s) return;
+    qw_ple_prefetch_join(s);
     /* Graph nodes retain session buffer addresses, even across resets. */
     ds4_gpu_decode_graphs_invalidate();
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
@@ -993,6 +1010,14 @@ static void qwen4exp_zero_tensor(ds4_gpu_tensor *t) {
 
 void ds4_qwen4exp_session_reset(ds4_qwen4exp_session *s) {
     if (!s) return;
+    /* A look-ahead gather may still be writing ple_ids/ple_rows_host for a
+     * prompt this reset abandons; join it before the state it reads is
+     * touched. */
+    qw_ple_prefetch_join(s);
+    s->ple_prompt = NULL;
+    s->ple_prompt_left = 0;
+    s->ple_pf_tokens = NULL;
+    s->ple_pf_rows = 0;
     s->head_cache_pos = 0;
     /* A pending adoption names a slot of the state being discarded; the zeroed
      * live buffers are what the next forward must read. */
@@ -1245,6 +1270,133 @@ static void qw_ple_pool_init(void) {
     pthread_mutex_unlock(&g_qw_ple_pool.mutex);
 }
 
+/* Resolved once per process.  The gather runs on every forward round, and
+ * both getenv and sysconf(_SC_NPROCESSORS_ONLN) are libc calls that walk
+ * external state -- the environ array and the online-CPU map -- to return a
+ * value that cannot change while the engine is open.  Caching it removes
+ * two of those walks from the round. */
+static long qw_ple_gather_thread_count(void) {
+    static long ple_gather_threads_cached = -1;
+    if (ple_gather_threads_cached < 0) {
+        const char * const thr_env =
+            getenv("DS4_QWEN4EXP_PLE_GATHER_THREADS");
+        long v = 0;
+        if (thr_env && thr_env[0]) {
+            char *end = NULL;
+            v = strtol(thr_env, &end, 10);
+            if (end == thr_env || v < 0) v = 0;
+        }
+        if (v <= 0) {
+            v = sysconf(_SC_NPROCESSORS_ONLN);
+            if (v > 16) v = 16;
+            if (v < 1) v = 1;
+        }
+        ple_gather_threads_cached = v;
+    }
+    return ple_gather_threads_cached;
+}
+
+/* Wait for the in-flight look-ahead gather, if any, and record how many
+ * leading tokens' rows it completed.  The workers wrote ple_ids and
+ * ple_rows_host for the token slice ple_pf_tokens[0, ple_pf_count); a
+ * gather whose tokens pointer IS that slice can skip its row reads for the
+ * first ple_pf_rows tokens.  A failed segment leaves ple_pf_rows at 0 and
+ * the caller gathers everything itself. */
+static void qw_ple_prefetch_join(ds4_qwen4exp_session *s) {
+    if (!s->ple_pf_active) return;
+    pthread_mutex_lock(&g_qw_ple_pool.mutex);
+    while (g_qw_ple_pool.completed_workers < g_qw_ple_pool.active_workers) {
+        pthread_cond_wait(&g_qw_ple_pool.done_cond, &g_qw_ple_pool.mutex);
+    }
+    pthread_mutex_unlock(&g_qw_ple_pool.mutex);
+    s->ple_pf_rows = 0;
+    for (uint32_t i = 1; i <= s->ple_pf_segs; i++) {
+        if (g_qw_ple_pool.segs[i].ok != 1) break;
+        s->ple_pf_rows = g_qw_ple_pool.segs[i].t1;
+    }
+    s->ple_pf_active = false;
+}
+
+/* Dispatch the next chunk's gather to the pool without waiting for it.
+ * The PLE block is layer 1 of 48, so the rest of this chunk's forward is
+ * still running on the device while the workers fault in the next chunk's
+ * rows; the next gather then finds them in ple_rows_host instead of paying
+ * the faults on the critical path.  The workers' entry history is the
+ * session's post-chunk history, exactly what the sequential scan would
+ * carry into that chunk.  Everything they write is disjoint from what the
+ * device is reading, and the join above orders it before the next use. */
+static void qw_ple_prefetch_start(ds4_qwen4exp_session *s,
+                                  const ds4_qwen4exp_weights *w,
+                                  uint32_t blocks_per_row,
+                                  uint32_t chunk_tokens) {
+    if (!s->ple_prompt || s->ple_prompt_left == 0) return;
+    if (s->ple_pf_active) return;
+    /* The next chunk is this chunk's width, or the tail when less remains. */
+    const uint32_t n_tokens =
+        s->ple_prompt_left < chunk_tokens ? s->ple_prompt_left : chunk_tokens;
+    if (n_tokens < 8u) return;
+
+    long nthreads = qw_ple_gather_thread_count();
+    if (nthreads <= 1) return;
+    if ((uint32_t)nthreads > n_tokens) nthreads = (long)n_tokens;
+    if (nthreads > QW_PLE_MAX_THREADS - 1) nthreads = QW_PLE_MAX_THREADS - 1;
+
+    qw_ple_pool_init();
+    if (!g_qw_ple_pool.initialized || g_qw_ple_pool.n_threads < 2u) return;
+    if ((long)g_qw_ple_pool.n_threads - 1 < nthreads)
+        nthreads = (long)g_qw_ple_pool.n_threads - 1;
+    if (nthreads < 1) return;
+
+    const uint32_t per = (n_tokens + (uint32_t)nthreads - 1u) /
+                         (uint32_t)nthreads;
+    uint32_t actual = 0;
+    for (long i = 0; i < nthreads; i++) {
+        const uint32_t t0 = (uint32_t)i * per;
+        if (t0 >= n_tokens) break;
+        actual++;
+        uint32_t t1 = t0 + per;
+        if (t1 > n_tokens) t1 = n_tokens;
+        const uint32_t slot = i + 1;
+        g_qw_ple_pool.segs[slot].ple = &w->ple;
+        g_qw_ple_pool.segs[slot].s = s;
+        g_qw_ple_pool.segs[slot].tokens = s->ple_prompt;
+        g_qw_ple_pool.segs[slot].n_tokens = n_tokens;
+        g_qw_ple_pool.segs[slot].t0 = t0;
+        g_qw_ple_pool.segs[slot].t1 = t1;
+        g_qw_ple_pool.segs[slot].blocks_per_row = blocks_per_row;
+        g_qw_ple_pool.segs[slot].ok = 0;
+    }
+    if (actual == 0) return;
+
+    s->ple_pf_tokens = s->ple_prompt;
+    s->ple_pf_count = n_tokens;
+    s->ple_pf_rows = 0;
+    s->ple_pf_segs = actual;
+    s->ple_pf_active = true;
+
+    pthread_mutex_lock(&g_qw_ple_pool.mutex);
+    g_qw_ple_pool.active_workers = actual;
+    g_qw_ple_pool.completed_workers = 0;
+    g_qw_ple_pool.generation++;
+    pthread_cond_broadcast(&g_qw_ple_pool.work_cond);
+    pthread_mutex_unlock(&g_qw_ple_pool.mutex);
+}
+
+void ds4_qwen4exp_session_ple_prompt(ds4_qwen4exp_session *s,
+                                     const int32_t *tokens,
+                                     uint32_t n_tokens) {
+    if (!s) return;
+    /* The in-flight gather reads the prompt slice it was armed with; it must
+     * finish before the caller can free or rearm that memory. */
+    qw_ple_prefetch_join(s);
+    /* Results belong to the prompt being replaced; a stale slice pointer
+     * could alias the next prompt's buffer. */
+    s->ple_pf_tokens = NULL;
+    s->ple_pf_rows = 0;
+    s->ple_prompt = tokens;
+    s->ple_prompt_left = tokens ? n_tokens : 0;
+}
+
 static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                                       const ds4_qwen4exp_weights *w,
                                       const int32_t *tokens,
@@ -1282,6 +1434,14 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
         return false;
     }
 
+    /* A look-ahead gather may still be running from the previous chunk;
+     * join it before anything reads or writes the buffers it fills.  When
+     * its token slice IS this call's, its ids and rows are already in
+     * place and the row reads below are skipped. */
+    qw_ple_prefetch_join(s);
+    const bool ple_rows_ready =
+        s->ple_pf_rows >= n_tokens && s->ple_pf_tokens == tokens;
+
     /* Row ids for this call's tokens; the history is advanced past the last
      * one, so a prefill chunk and the decode steps after it name the same
      * rows a single long call would. */
@@ -1304,6 +1464,7 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 s->ple_history_rows[t] = s->ple_history;
             }
         }
+        if (!ple_rows_ready)
         for (uint32_t t = 0; t < n_tokens; t++) {
             /* The head's destination strides are constants of the shape, so
              * the token base is hoisted out of the head loop and the head
@@ -1338,35 +1499,13 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
          * disjoint token range; the tail thread's local history -- the state
          * a sequential scan would have ended with -- is copied back after
          * the join, so the session still carries the same history forward. */
-        long nthreads = 1;
-        /* Resolved once per process.  This runs on every prefill round, and
-         * both getenv and sysconf(_SC_NPROCESSORS_ONLN) are libc calls that
-         * walk external state -- the environ array and the online-CPU map --
-         * to return a value that cannot change while the engine is open.
-         * Caching it removes two of those walks from the round. */
-        static long ple_gather_threads_cached = -1;
-        if (ple_gather_threads_cached < 0) {
-            const char * const thr_env =
-                getenv("DS4_QWEN4EXP_PLE_GATHER_THREADS");
-            long v = 0;
-            if (thr_env && thr_env[0]) {
-                char *end = NULL;
-                v = strtol(thr_env, &end, 10);
-                if (end == thr_env || v < 0) v = 0;
-            }
-            if (v <= 0) {
-                v = sysconf(_SC_NPROCESSORS_ONLN);
-                if (v > 16) v = 16;
-                if (v < 1) v = 1;
-            }
-            ple_gather_threads_cached = v;
-        }
-        nthreads = ple_gather_threads_cached;
+        long nthreads = qw_ple_gather_thread_count();
         if (nthreads <= 1 || n_tokens < 64u) nthreads = 1;
 
         if (nthreads == 1) {
             ds4_ple_row_ids(&s->ple_constants, &s->ple_history, tokens,
                             n_tokens, s->ple_ids);
+            if (!ple_rows_ready)
             for (uint32_t t = 0; t < n_tokens; t++) {
                 for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
                     const uint64_t row =
@@ -1387,6 +1526,10 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 }
             }
         } else {
+            /* A look-ahead gather that covered this call already wrote
+             * ple_ids and ple_rows_host; skip the dispatch and only leave
+             * the carried history the scan would have produced. */
+            if (!ple_rows_ready) {
             if ((uint32_t)nthreads > n_tokens) nthreads = (long)n_tokens;
             if (nthreads > QW_PLE_MAX_THREADS) nthreads = QW_PLE_MAX_THREADS;
 
@@ -1445,6 +1588,7 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                     return false;
                 }
             }
+            }
             /* The carried history is the state after the LAST token; re-warm
              * a fresh history over the final (ngram - 1) tokens and leave it
              * in the session -- exactly what the sequential scan leaves. */
@@ -1469,6 +1613,20 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
         fprintf(stderr, "ds4: qwen4exp n-gram row upload failed at block %u\n", il);
         return false;
     }
+    /* Consume this call's slice of the armed prompt; whatever remains is the
+     * next chunk's tokens, and the pool gathers their rows while the rest of
+     * this forward runs on the device. */
+    if (s->ple_prompt) {
+        if (s->ple_prompt == tokens && s->ple_prompt_left >= n_tokens) {
+            s->ple_prompt += n_tokens;
+            s->ple_prompt_left -= n_tokens;
+        } else {
+            s->ple_prompt = NULL;
+            s->ple_prompt_left = 0;
+        }
+    }
+    qw_ple_prefetch_start(s, w, blocks_per_row, n_tokens);
+
     return true;
 }
 
@@ -4431,6 +4589,12 @@ const ds4_qwen4exp_session_plan *ds4_qwen4exp_session_plan_of(
 }
 
 void ds4_qwen4exp_session_reset(ds4_qwen4exp_session *s) { (void)s; }
+
+void ds4_qwen4exp_session_ple_prompt(ds4_qwen4exp_session *s,
+                                     const int32_t *tokens,
+                                     uint32_t n_tokens) {
+    (void)s; (void)tokens; (void)n_tokens;
+}
 
 uint32_t ds4_qwen4exp_session_pos(const ds4_qwen4exp_session *s) {
     (void)s;

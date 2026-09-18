@@ -133,6 +133,14 @@ const ds4_qwen4exp_session_plan *ds4_qwen4exp_session_plan_of(
  * stay allocated: this is what a free-run repeat calls between runs. */
 void ds4_qwen4exp_session_reset(ds4_qwen4exp_session *s);
 
+/* Arm the look-ahead PLE gather with the unconsumed tail of the prompt a
+ * sync is about to replay.  Each forward consumes its own slice and the
+ * pool gathers the next chunk's rows while the rest of the forward runs on
+ * the device.  NULL disarms. */
+void ds4_qwen4exp_session_ple_prompt(ds4_qwen4exp_session *s,
+                                     const int32_t *tokens,
+                                     uint32_t n_tokens);
+
 uint32_t ds4_qwen4exp_session_pos(const ds4_qwen4exp_session *s);
 
 /*

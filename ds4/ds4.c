@@ -67665,14 +67665,23 @@ static int ds4_session_qwen4exp_sync(ds4_session *s, const ds4_tokens *prompt,
     s->checkpoint_valid = false;
 
     const uint32_t batch = plan->n_batch;
+    /* Arm the look-ahead PLE gather with the whole prompt: each chunk's
+     * gather consumes its slice and the pool gathers the next chunk's rows
+     * while the rest of that forward runs on the device. */
+    ds4_qwen4exp_session_ple_prompt(e->qwen4exp_session,
+                                    prompt->v, (uint32_t)prompt->len);
     for (int at = 0; at < prompt->len; ) {
         const uint32_t take = (uint32_t)((prompt->len - at) < (int)batch
                                          ? (prompt->len - at) : (int)batch);
         const int rc = ds4_session_qwen4exp_rows(s, prompt->v + at, take,
                                                  err, errlen);
-        if (rc != 0) return rc;
+        if (rc != 0) {
+            ds4_qwen4exp_session_ple_prompt(e->qwen4exp_session, NULL, 0);
+            return rc;
+        }
         at += (int)take;
     }
+    ds4_qwen4exp_session_ple_prompt(e->qwen4exp_session, NULL, 0);
     return 0;
 }
 #endif /* !DS4_NO_GPU */
