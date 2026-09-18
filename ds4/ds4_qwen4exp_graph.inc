@@ -429,6 +429,10 @@ struct ds4_qwen4exp_session {
     ds4_gpu_tensor *moe_down_partial;
     ds4_gpu_tensor *shexp_mid;
     ds4_gpu_tensor *shexp_gate;
+    /* SWEEP 2026-09-18 (DS4_SHEXP_SIDE): the shared expert's gate * down in
+     * its own buffer, and the flag that says the FFN inject owes its add. */
+    ds4_gpu_tensor *shexp_out;
+    int             shexp_side;
 
     ds4_gpu_tensor *logits;
     ds4_gpu_tensor *spec_top1;
@@ -850,6 +854,8 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
         qwen4exp_alloc_zeroed(B * DS4_N_EXPERT_USED * DS4_N_EMBD * f, &ok);
     s->shexp_mid    = qwen4exp_alloc_zeroed(B * DS4_N_FF_SHEXP * f, &ok);
     s->shexp_gate   = qwen4exp_alloc_zeroed(B * f, &ok);
+    s->shexp_out    = qwen4exp_alloc_zeroed(B * DS4_N_EMBD * f, &ok);
+    s->shexp_side   = 0;
     s->logits       = qwen4exp_alloc_zeroed(
             (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * cfg->n_vocab * f, &ok);
     s->spec_top1     = qwen4exp_alloc_zeroed(
@@ -935,6 +941,7 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->moe_mid);
     ds4_gpu_tensor_free(s->shexp_mid);
     ds4_gpu_tensor_free(s->shexp_gate);
+    ds4_gpu_tensor_free(s->shexp_out);
     ds4_gpu_tensor_free(s->logits);
     ds4_gpu_tensor_free(s->spec_top1);
 #ifdef DS4_TEST_HOOKS
@@ -1544,6 +1551,103 @@ static bool qw_qsa_gate_from_doubled(uint32_t n_tokens, uint32_t q_width,
 /* The GDN block.  head_layout is TILED for anything the loader bound: the
  * llama.cpp converter reorders the value heads into ggml's broadcast order and
  * the binder does not undo it, so value head j reads key head j % n_key_head. */
+/* SWEEP 2026-09-18: L2 warm of the next streaming kernel's leading bytes at
+ * the head of a glue window (ds4_gpu_qwen4exp_l2_prefetch; a prefetch changes
+ * no value).  DS4_L2PF=1 turns it on at the decode widths (<= 2 rows);
+ * DS4_L2PF_PROJ_MB (GDN/QSA input projection, default 8), DS4_L2PF_OUT_MB
+ * (output projection, 6), DS4_L2PF_HEAD_MB (LM head, 8), DS4_L2PF_ROUTER=1
+ * (the f32 router matrix, whole) and DS4_L2PF_SHEXP=1 (shared gate/up, whole)
+ * size the regions; every region is clamped to its tensor. */
+typedef struct { int on; uint64_t proj, out, head; int router, shexp; unsigned sites; } qw_l2pf_cfg_t;
+static const qw_l2pf_cfg_t *qw_l2pf_cfg(void) {
+    static qw_l2pf_cfg_t c;
+    static int init = 0;
+    if (!init) {
+        const char *e;
+        init = 1;
+        e = getenv("DS4_L2PF"); c.on = (e && e[0] && e[0] != '0') ? 1 : 0;
+        e = getenv("DS4_L2PF_PROJ_MB"); c.proj = (uint64_t)(e ? atoi(e) : 8) << 20;
+        e = getenv("DS4_L2PF_OUT_MB"); c.out = (uint64_t)(e ? atoi(e) : 6) << 20;
+        e = getenv("DS4_L2PF_HEAD_MB"); c.head = (uint64_t)(e ? atoi(e) : 8) << 20;
+        e = getenv("DS4_L2PF_ROUTER"); c.router = e ? atoi(e) : 1;
+        e = getenv("DS4_L2PF_SHEXP"); c.shexp = e ? atoi(e) : 1;
+        /* Site mask: 1 = before the attention mixer (input projection), 2 =
+         * after the GDN/QSA projection (output projection), 4 = before the
+         * FFN mixer (router + shared gate/up).  The HC pair kernels in the
+         * mixer windows are DRAM-latency-bound and run 2.5x slower under a
+         * concurrent prefetch stream, so the default keeps only site 2. */
+        e = getenv("DS4_L2PF_SITES"); c.sites = (unsigned)(e ? atoi(e) : 2);
+        if (c.on)
+            fprintf(stderr, "ds4: sweep l2pf on: proj %llu MB out %llu MB head %llu MB router %d shexp %d\n",
+                    (unsigned long long)(c.proj >> 20), (unsigned long long)(c.out >> 20),
+                    (unsigned long long)(c.head >> 20), c.router, c.shexp);
+    }
+    return &c;
+}
+static uint64_t qw_l2pf_tensor_bytes(const ds4_tensor *t) {
+    uint64_t ne = 1, b = 0;
+    if (!t) return 0;
+    for (int i = 0; i < t->ndim; i++) ne *= t->dim[i];
+    if (!tensor_nbytes(t->type, ne, &b)) return 0;
+    return b;
+}
+static void qw_l2pf(unsigned site, const ds4_model *m, uint32_t n_tokens, int n,
+                    const ds4_tensor *t0, uint64_t b0,
+                    const ds4_tensor *t1, uint64_t b1,
+                    const ds4_tensor *t2, uint64_t b2) {
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    const ds4_tensor *ts[3] = {t0, t1, t2};
+    const uint64_t bs[3] = {b0, b1, b2};
+    const void *maps[3];
+    uint64_t sizes[3], offs[3], bytes[3];
+    int k = 0;
+    if (n_tokens > 2u || !qw_l2pf_cfg()->on || !(qw_l2pf_cfg()->sites & site)) return;
+    for (int i = 0; i < n && i < 3; i++) {
+        uint64_t tb, want = bs[i];
+        if (!ts[i] || want == 0) continue;
+        tb = qw_l2pf_tensor_bytes(ts[i]);
+        if (tb == 0) continue;
+        if (want > tb) want = tb;
+        maps[k] = QW_MAP(m, ts[i]);
+        sizes[k] = QW_MAPSZ(m, ts[i]);
+        offs[k] = QW_OFF(ts[i]);
+        bytes[k] = want;
+        k++;
+    }
+    if (k) (void)ds4_gpu_qwen4exp_l2_prefetch(k, maps, sizes, offs, bytes);
+#else
+    (void)site; (void)m; (void)n_tokens; (void)n; (void)t0; (void)b0; (void)t1; (void)b1; (void)t2; (void)b2;
+#endif
+}
+/* The consumer's launch site: the decode stream waits for the forked prefetch. */
+static void qw_l2pf_join(void) {
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (qw_l2pf_cfg()->on) (void)ds4_gpu_qwen4exp_l2_prefetch_join();
+#endif
+}
+
+/* SWEEP 2026-09-18 (DS4_SHEXP_SIDE=1): shared expert on its side stream with
+ * its own output buffer at the decode widths; see qwen4exp_graph_moe_block. */
+static int qw_shexp_side_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DS4_SHEXP_SIDE"); v = e ? ((e[0] && e[0] != '0') ? 1 : 0) : 1;  /* default ON; =0 disables */ }
+    return v;
+}
+/* The FFN inject: routed + shared when the shared expert wrote its own
+ * buffer this layer (the add the in-place kernel performed, same order),
+ * the plain inject otherwise.  Consumes the flag. */
+static bool qwen4exp_graph_ffn_inject(ds4_qwen4exp_session *s, uint32_t n_tokens) {
+    if (s->shexp_side) {
+        s->shexp_side = 0;
+        return ds4_gpu_qwen4exp_hc_inject2_tensor(s->hyper, s->hyper, s->block_out,
+                                                  s->shexp_out, s->shexp_gate, s->inject,
+                                                  DS4_N_EMBD, DS4_N_HC, n_tokens) != 0;
+    }
+    return ds4_gpu_qwen4exp_hc_inject_tensor(s->hyper, s->hyper, s->block_out,
+                                             s->inject, DS4_N_EMBD, DS4_N_HC,
+                                             n_tokens) != 0;
+}
+
 static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
                                      const ds4_qwen4exp_layer_weights *l,
                                      const ds4_model *m,
@@ -1605,8 +1709,9 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
     }
 #endif
 
+    qw_l2pf_join();   /* the attention-mixer window's prefetch (attn_qkv) */
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    if (n_tokens<=2u && getenv("DS4_QWEN4EXP_NO_GDN_PROJECTION_FUSION")==NULL) {
+    if ((n_tokens<=2u || (n_tokens<=4u && ds4_qwen4exp_wide3_enabled())) && getenv("DS4_QWEN4EXP_NO_GDN_PROJECTION_FUSION")==NULL) {
         ds4_gpu_tensor *outs[4]={s->gdn_qkv,s->gdn_gate,s->gdn_alpha,s->gdn_beta};
         const void *maps[4]={QW_MAP(m,l->attn_qkv),QW_MAP(m,l->attn_gate),
                             QW_MAP(m,l->ssm_alpha),QW_MAP(m,l->ssm_beta)};
@@ -1647,6 +1752,8 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
         }
 
     }
+
+    qw_l2pf(2u, m, n_tokens, 1, l->ssm_out, qw_l2pf_cfg()->out, NULL, 0, NULL, 0);
 
     /* One slab per tensor.  These four are four GGUF tensors; resolving
      * ssm_a, ssm_dt.bias and ssm_norm through the convolution's mapping would
@@ -1730,6 +1837,7 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
         return false;
     }
 
+    qw_l2pf_join();   /* the GDN-core window's prefetch (ssm_out) */
     const int proj_ok = out_q8
         ? ds4_qwen4exp_matmul_q8_0_preq(s->block_out, QW_MAP(m, l->ssm_out),
                                         QW_MAPSZ(m, l->ssm_out), QW_OFF(l->ssm_out),
@@ -1774,9 +1882,10 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
         return false;
     }
 
+    qw_l2pf_join();   /* the attention-mixer window's prefetch (attn_q) */
     /* Projections.  q is DOUBLED: half query, half output gate. */
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    if (n_tokens<=2u && getenv("DS4_QWEN4EXP_NO_QSA_Q8_TRIPLE")==NULL) {
+    if ((n_tokens<=2u || (n_tokens<=4u && ds4_qwen4exp_wide3_enabled())) && getenv("DS4_QWEN4EXP_NO_QSA_Q8_TRIPLE")==NULL) {
         ds4_gpu_tensor *outs[3]={s->qsa_doubled,s->qsa_kin,s->qsa_vin};
         const void *maps[3]={QW_MAP(m,l->attn_q),QW_MAP(m,l->attn_k),QW_MAP(m,l->attn_v)};
         const uint64_t sizes[3]={QW_MAPSZ(m,l->attn_q),QW_MAPSZ(m,l->attn_k),QW_MAPSZ(m,l->attn_v)};
@@ -1805,6 +1914,7 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
         return false;
     }
 
+    qw_l2pf(2u, m, n_tokens, 1, l->attn_output, qw_l2pf_cfg()->out, NULL, 0, NULL, 0);
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (n_tokens<=2u) {
         ds4_gpu_tensor *outs[5]={s->qsa_q,s->qsa_gate,s->qsa_k[il],s->qsa_v[il],NULL};
@@ -1951,6 +2061,7 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
         return false;
     }
 
+    qw_l2pf_join();   /* the QSA-core window's prefetch (attn_output) */
     if (!(gate_q8
           ? ds4_qwen4exp_matmul_q8_0_preq(s->block_out, QW_MAP(m, l->attn_output),
                                           QW_MAPSZ(m, l->attn_output),
@@ -2101,6 +2212,7 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
      * scale live experts, and the top-k selection they drive is discrete, so a
      * row-count difference here can move which experts a row uses. */
     const int moe_timing = qw_hb_time_on() && n_tokens == 1u;
+    qw_l2pf_join();   /* the FFN-mixer window's prefetch (router, shared gate/up) */
     const int moe_lane = qw_moe_in_head_block ? 1 : 0;
     uint64_t moe_mark = moe_timing ? qw_hb_now_ns() : 0;
 
@@ -2162,7 +2274,22 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
      * stream. Routed scratch retains its quantization through this call;
      * Metal's prequantized entry point keeps its ordinary implementation. */
     const int reuse_quant = getenv("DS4_QWEN4EXP_NO_MOE_QUANT_REUSE") == NULL;
-    if (!ds4_gpu_qwen4exp_shared_expert_preq_tensor(
+    /* SWEEP 2026-09-18 (DS4_SHEXP_SIDE=1): at the decode widths the shared
+     * expert may finish on its side stream into its own buffer; the FFN
+     * inject then adds it (bit-identical sum).  A stale flag means a caller
+     * never consumed the previous layer's buffer: refuse the side path then. */
+    if (qw_shexp_side_on() && (n_tokens <= 2u || (n_tokens <= 4u && ds4_qwen4exp_wide3_enabled())) && !s->shexp_side) {
+        const int rc = ds4_gpu_qwen4exp_shared_expert_side_tensor(
+                s->block_out, s->shexp_out, s->shexp_mid, s->shexp_gate,
+                &sh_router_slab, &sh_gate_slab, &sh_up_slab, &sh_down_slab,
+                DS4_N_EMBD, DS4_N_FF_SHEXP, DS4_N_EMBD, s->mixed, n_tokens,
+                reuse_quant);
+        if (!rc) {
+            fprintf(stderr, "ds4: qwen4exp shared expert (side) failed at block %u\n", il);
+            return false;
+        }
+        s->shexp_side = (rc == 2) ? 1 : 0;
+    } else if (!ds4_gpu_qwen4exp_shared_expert_preq_tensor(
             s->block_out, s->shexp_mid, s->shexp_gate,
             &sh_router_slab, &sh_gate_slab, &sh_up_slab, &sh_down_slab,
             DS4_N_EMBD, DS4_N_FF_SHEXP, DS4_N_EMBD, s->mixed, n_tokens,
@@ -2302,6 +2429,20 @@ static bool qwen4exp_hc_defer_ok(uint32_t n_tokens) {
     return n_tokens >= DS4_QWEN4EXP_HC_DEFER_MIN_ROWS && !qwen4exp_hc_defer_off();
 }
 
+/* SWEEP 2026-09-18: at decode widths, defer ONLY the attention block's inject
+ * to the FFN mixer of the same layer (the fused mixer folds it into its first
+ * pass, qwen4exp_hc_norm_quant_pending_kernel).  The FFN inject stays the
+ * standalone kernel, so hc_pending is false at every layer boundary and the
+ * chunk-boundary invariant above holds unchanged.  DS4_HC_PEND=1 selects it. */
+static bool qwen4exp_hc_decode_fold_ok(uint32_t n_tokens) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_HC_PEND");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return cached && n_tokens <= 2u;
+}
+
 /* Settle an owed inject with the standalone kernel.  Used where the next
  * reader of `hyper` is not a mixer (the PLE block, a diagnostic dump). */
 static bool qwen4exp_hc_flush_pending(ds4_qwen4exp_session *s, uint32_t n_tokens) {
@@ -2393,6 +2534,8 @@ static bool qwen4exp_graph_layer_island_encode(
         const ds4_model *m, uint32_t il, uint32_t n_tokens, uint32_t island) {
     if (island == 0u) {
         /* --- attention side ------------------------------------------- */
+        qw_l2pf(1u, m, n_tokens, 1, l->is_full_attention ? l->attn_q : l->attn_qkv,
+                qw_l2pf_cfg()->proj, NULL, 0, NULL, 0);
         if (!qwen4exp_graph_residual(s, m, l->hc_attn_norm, l->hc_attn_down,
                                      l->hc_attn_up, l->hc_attn_inject,
                                      l->hc_attn_norm_offset, n_tokens, 1)) {
@@ -2409,7 +2552,7 @@ static bool qwen4exp_graph_layer_island_encode(
          * applied here (qwen4exp_hc_defer_ok); the slice trace keeps its
          * order either way, it records what the model computed. */
         const bool defer = qwen4exp_hc_defer_ok(n_tokens);
-        if (defer) {
+        if (defer || qwen4exp_hc_decode_fold_ok(n_tokens)) {
             s->hc_pending = true;
         } else if (!ds4_gpu_qwen4exp_hc_inject_tensor(s->hyper, s->hyper, s->block_out,
                                                s->inject, DS4_N_EMBD, DS4_N_HC,
@@ -2420,6 +2563,13 @@ static bool qwen4exp_graph_layer_island_encode(
         QW_TRACE(QW_SLICE_ATTN_INJECT);
 
         /* --- feed-forward side ---------------------------------------- */
+        {
+            const qw_l2pf_cfg_t *pc = qw_l2pf_cfg();
+            qw_l2pf(4u, m, n_tokens, 3,
+                    pc->router ? l->ffn_gate_inp : NULL, (uint64_t)16u << 20,
+                    pc->shexp ? l->ffn_gate_shexp : NULL, (uint64_t)16u << 20,
+                    pc->shexp ? l->ffn_up_shexp : NULL, (uint64_t)16u << 20);
+        }
         if (!qwen4exp_graph_residual(s, m, l->hc_ffn_norm, l->hc_ffn_down,
                                      l->hc_ffn_up, l->hc_ffn_inject,
                                      l->hc_ffn_norm_offset, n_tokens, 0)) {
@@ -2433,58 +2583,17 @@ static bool qwen4exp_graph_layer_island_encode(
         QW_TRACE(QW_SLICE_MOE);
         if (defer) {
             s->hc_pending = true;
-        } else if (!ds4_gpu_qwen4exp_hc_inject_tensor(s->hyper, s->hyper, s->block_out,
-                                               s->inject, DS4_N_EMBD, DS4_N_HC,
-                                               n_tokens)) {
+        } else if (!qwen4exp_graph_ffn_inject(s, n_tokens)) {
             fprintf(stderr, "ds4: qwen4exp FFN inject failed at block %u\n", il);
             return false;
         }
         QW_TRACE(QW_SLICE_FFN_INJECT);
     }
+    /* A prefetch forked in this island whose consumer lives outside it (the
+     * eager QSA block after island 0 of a full-attention layer) rejoins here,
+     * before the island's capture closes. */
+    qw_l2pf_join();
     return true;
-}
-
-/* PREFILL LAYER CAPTURE.
- *
- * Prefill runs 100% eager: 1,618 launches, zero graph nodes, against a decode
- * phase that is 99,294 of 101,929 graphed.  Each eager launch costs ~2.3 us of
- * device-side dispatch that a graph node does not (measured standalone, with no
- * profiler attached, at 1,618 launches: eager span minus replay span is 3.67 ms
- * at every kernel duration from 1 to 100 us), and the engine's own trace shows
- * 1,370 inter-kernel gaps at a 2.69 us median.  Capturing the layer stack
- * collapses that class.
- *
- * WHY FROM LAYER 4, AND WHY THAT IS CORRECTNESS RATHER THAN TUNING.  Layers
- * 0-2 are gated-deltanet and layer 3 is the first full-attention layer, so
- * running all four eagerly puts every lazily sized allocator -- tmp scratch,
- * cuBLAS workspaces -- at steady state in BOTH layer shapes before the first
- * capture.  A cudaMalloc inside a stream capture is illegal; the decode path
- * solves the same problem with its state-0 warm pass, which a prefill layer
- * cannot use because it runs exactly once.  Cost: 4 layers of 48.
- *
- * WHY IT MAY CAPTURE AT ALL.  Counted in HOST ISSUE ORDER from the engine's
- * own prefill trace, all 13 capture-illegal calls (blocking cudaMemcpy,
- * cudaDeviceSynchronize) sit before launch 0 or after launch 1,577 of 1,618 --
- * the prologue and the LM-head epilogue.  Launches 0..1,576 are the whole
- * 48-layer tower and contain none.  If that ever stops being true the capture
- * simply fails and the layer is encoded eagerly, which is why every call site
- * below keeps the eager path as its fallback rather than as an error.
- *
- * DS4_QWEN4EXP_NO_PF_GRAPH restores the eager stack for an A/B. */
-#define DS4_QWEN4EXP_PF_GRAPH_MIN_ROWS    128u
-#define DS4_QWEN4EXP_PF_GRAPH_WARM_LAYERS   4u
-
-static bool qw_pf_graph_on(uint32_t n_tokens, uint32_t il) {
-    static int init = 0, enabled = 0;
-    if (!init) {
-        init = 1;
-        enabled = getenv("DS4_QWEN4EXP_NO_PF_GRAPH") == NULL;
-    }
-    return enabled && n_tokens >= DS4_QWEN4EXP_PF_GRAPH_MIN_ROWS &&
-           il >= DS4_QWEN4EXP_PF_GRAPH_WARM_LAYERS &&
-           /* profilers synchronize between operations, forbidden in capture */
-           !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
-           ds4_gpu_decode_graphs_supported();
 }
 
 static bool qwen4exp_graph_layer_island(
@@ -2545,22 +2654,6 @@ static bool qwen4exp_graph_layer_island(
              * re-encode this call eagerly exactly once, including on error. */
         }
     }
-    if (qw_pf_graph_on(n_tokens, il) && ds4_gpu_oneshot_graph_begin() == 0) {
-#ifdef DS4_TEST_HOOKS
-        const uint32_t pf_trace_len = g_qwen4exp_trace_len;
-        const bool pf_trace_overflow = g_qwen4exp_trace_overflow;
-#endif
-        if (qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens, island) &&
-            ds4_gpu_oneshot_graph_end() == 0) {
-            return true;
-        }
-        ds4_gpu_oneshot_graph_abort();   /* no-op if end() already closed it */
-#ifdef DS4_TEST_HOOKS
-        g_qwen4exp_trace_len = pf_trace_len;
-        g_qwen4exp_trace_overflow = pf_trace_overflow;
-#endif
-        /* Nothing executed: fall through to the eager encode below. */
-    }
     return qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens, island);
 }
 
@@ -2605,21 +2698,6 @@ static bool qwen4exp_graph_qsa_island(
             g_qwen4exp_trace_overflow = trace_overflow;
 #endif
         }
-    }
-    if (qw_pf_graph_on(n_tokens, il) && ds4_gpu_oneshot_graph_begin() == 0) {
-#ifdef DS4_TEST_HOOKS
-        const uint32_t pf_trace_len = g_qwen4exp_trace_len;
-        const bool pf_trace_overflow = g_qwen4exp_trace_overflow;
-#endif
-        if (qwen4exp_graph_qsa_block(s, l, m, il, n_tokens) &&
-            ds4_gpu_oneshot_graph_end() == 0) {
-            return true;
-        }
-        ds4_gpu_oneshot_graph_abort();
-#ifdef DS4_TEST_HOOKS
-        g_qwen4exp_trace_len = pf_trace_len;
-        g_qwen4exp_trace_overflow = pf_trace_overflow;
-#endif
     }
     return qwen4exp_graph_qsa_block(s, l, m, il, n_tokens);
 }
@@ -2690,12 +2768,6 @@ int ds4_qwen4exp_test_layer_sums(double *out, int cap, int *rows_out) {
 
 static bool qwen4exp_forward_fail(void) {
     (void)ds4_gpu_end_commands();
-    /* Close any capture still open FIRST.  This is a shared error path and
-     * retire() synchronizes, which is illegal inside an active capture and
-     * would invalidate it with an error nothing here would see.  abort() is a
-     * no-op when nothing is capturing, so this is safe from every caller. */
-    ds4_gpu_oneshot_graph_abort();
-    ds4_gpu_oneshot_graph_retire();
     return false;
 }
 
@@ -2708,35 +2780,6 @@ static bool qwen4exp_graph_layers_encode_range(
         uint32_t il_first, uint32_t il_last) {
     for (uint32_t il = il_first; il < il_last; il++) {
         const ds4_qwen4exp_layer_weights *l = &w->layer[il];
-
-        /* Destroy the PREVIOUS forward's captured graphs HERE, not at the end
-         * of the forward that built them.
-         *
-         * WHY HERE.  At this point layers 0..3 have been ISSUED eagerly, so
-         * roughly 51 ms of GPU work is queued and the ~1.5 ms of
-         * cudaGraphExecDestroy hides behind it.  At the end of a forward the
-         * device has nothing left queued, and the same destruction is pure
-         * exposed idle: measured as a 1.512 ms lengthening of one gap, which
-         * ate most of the 2.49 ms the capture saves.  Capture was guarded and
-         * held at 120x slack; this is the other end of the same lifecycle.
-         *
-         * WHY IT IS SAFE.  The graphs freed here belong to the PREVIOUS
-         * forward, which ended with ds4_gpu_end_commands() +
-         * ds4_gpu_synchronize() -- a full device sync -- so none of them is
-         * still reachable by the device.  retire_settled() therefore does not
-         * synchronize, and must not: synchronizing here would wait out exactly
-         * the queued work it is meant to hide behind.
-         *
-         * WHY IT IS NOT A CACHE.  Nothing is REUSED.  An executable graph is
-         * launched exactly once, inside ds4_gpu_oneshot_graph_end(), the
-         * instant it is instantiated; no other code path launches from the
-         * parked array.  This moves DESTRUCTION within a prefill window; it
-         * does not move prefill WORK between windows, so
-         * participant-contract 5.1.1 is untouched. */
-        if (il == DS4_QWEN4EXP_PF_GRAPH_WARM_LAYERS &&
-            qw_pf_graph_on(n_tokens, il)) {
-            ds4_gpu_oneshot_graph_retire_settled();
-        }
 
         /* --- per-layer n-gram embedding, one block only ----------------
          * FIRST in the layer, ahead of the attention mixer, and a plain
@@ -2832,6 +2875,11 @@ static void qw_decode_graph_trace_range(const ds4_qwen4exp_weights *w,
  * mixed forward (some chunks replayed, some eager) is the same computation --
  * the capture stream is a blocking stream, so it orders against the legacy
  * stream the eager path uses. */
+static uint32_t qw_decode_graph_first(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DS4_CUDA_DECODE_GRAPH_FIRST"); v = e ? atoi(e) : 2;  /* default: a 2-layer first chunk; =0 restores the even split */ if (v < 0) v = 0; }
+    return (uint32_t)v;
+}
 static bool qw_decode_graph_chunk(ds4_qwen4exp_session *s,
                                   const ds4_qwen4exp_weights *w,
                                   const ds4_model *m, uint32_t n_tokens,
@@ -2914,15 +2962,29 @@ static bool qwen4exp_graph_layers(
         const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
         uint32_t chunks = qw_decode_graph_chunks();
         if (chunks > cfg->n_layer) chunks = cfg->n_layer;
-        const uint32_t per = (cfg->n_layer + chunks - 1u) / chunks;
+        /* SWEEP 2026-09-18: DS4_CUDA_DECODE_GRAPH_FIRST=n makes chunk 0 n
+         * layers and splits the rest evenly (0 = the even split).  The first
+         * launch of a round finds an empty GPU queue and the GPU waits for the
+         * whole host launch call -- 145 us for a 12-layer chunk (nsys API
+         * trace) -- while a one-layer chunk launches in ~15 us and the next,
+         * larger launch overlaps its execution. */
+        const uint32_t first = qw_decode_graph_first();
+        uint32_t il_first = 0u;
         for (uint32_t c = 0; c < chunks; c++) {
-            const uint32_t il_first = c * per;
             if (il_first >= cfg->n_layer) break;
-            uint32_t il_last = il_first + per;
+            uint32_t il_last;
+            if (first > 0u && c == 0u) {
+                il_last = first < cfg->n_layer ? first : cfg->n_layer;
+            } else {
+                const uint32_t left_chunks = chunks - c;
+                const uint32_t left_layers = cfg->n_layer - il_first;
+                il_last = il_first + (left_layers + left_chunks - 1u) / left_chunks;
+            }
             if (il_last > cfg->n_layer) il_last = cfg->n_layer;
             if (!qw_decode_graph_chunk(s, w, m, n_tokens, c, il_first, il_last)) {
                 return false;
             }
+            il_first = il_last;
         }
         return true;
     }
@@ -3251,14 +3313,8 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     /* Commit and wait: the logits are read on the host from here on. */
     if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
         fprintf(stderr, "ds4: qwen4exp command batch did not complete\n");
-        ds4_gpu_oneshot_graph_retire();
         return false;
     }
-    /* Report the capture half of the lifecycle; the destroy half is paid in
-     * the NEXT forward, behind its queued eager layers.  Nothing is reused
-     * between the two -- every executable graph is launched once, at the
-     * instant it is instantiated -- so 5.1.1 is untouched. */
-    ds4_gpu_oneshot_graph_report();
     if (logits_out &&
         !ds4_gpu_tensor_read(s->logits, 0, logits_out,
                              (uint64_t)logit_rows * cfg->n_vocab *
@@ -3621,9 +3677,7 @@ static bool qwen4exp_graph_head_block_encode(
     QW_HB_TICK(QW_HB_T_MOE);
     if (ok) {
         stage = "FFN inject";
-        ok = ds4_gpu_qwen4exp_hc_inject_tensor(s->hyper, s->hyper, s->block_out,
-                                               s->inject, DS4_N_EMBD, DS4_N_HC,
-                                               n_tokens) != 0;
+        ok = qwen4exp_graph_ffn_inject(s, n_tokens);
     }
     QW_HB_TICK(QW_HB_T_FFN_INJECT);
     if (timing && ok) qw_hb_stage_calls++;
