@@ -1148,6 +1148,24 @@ static void weights_bind_qwen4exp_ple_table(ds4_qwen4exp_ple_table *ple,
     ple->bytes = t->bytes;
     ple->type = t->type;
 
+#if defined(POSIX_MADV_RANDOM)
+    /* The gather faults sixteen scattered rows per token out of this mapping;
+     * under fault-around readahead each one drags in a cluster the step never
+     * reads, and the device waits on the disk.  The standalone table module
+     * puts the same advice on its own mapping (ds4_qwen4exp_ple.c). */
+    {
+        const long ple_page = sysconf(_SC_PAGESIZE);
+        if (ple_page > 0) {
+            uintptr_t a0 = (uintptr_t)ple->base;
+            const uintptr_t a1 = a0 + ple->bytes;
+            a0 -= a0 % (uintptr_t)ple_page;
+            if (a1 > a0)
+                (void)posix_madvise((void *)a0, (size_t)(a1 - a0),
+                                    POSIX_MADV_RANDOM);
+        }
+    }
+#endif
+
     qwen4exp_validate_ple_heads(m, ple->rows, ple);
     qwen4exp_read_ple_hash_constants(m, ple);
     qwen4exp_plan_charge(plan, DS4_QWEN4EXP_MEM_PLE, t);

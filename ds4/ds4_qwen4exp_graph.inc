@@ -1100,6 +1100,44 @@ void ds4_qwen4exp_session_reset(ds4_qwen4exp_session *s) {
  * knob); a positive value pins the thread count.  Unset, the gather takes
  * the online CPUs capped at 16 -- enough to keep the SSD queue deep without
  * starving the decode path's own helpers. */
+/* Start the disk reads for `count` row ids before the dequant pass touches
+ * them.  A gather faults sixteen scattered 90-byte rows per token out of the
+ * SSD-resident table; issued one at a time inside the dequant loop those are
+ * sixteen serial storage round-trips the device waits on.  WILLNEED hands the
+ * whole set to the kernel's readahead at once, so the faults below join reads
+ * already in flight instead of queueing behind each other.  Advice only: no
+ * value the gather returns depends on the hint landing. */
+static void qw_ple_gather_prefetch(const ds4_qwen4exp_ple_table *ple,
+                                   const uint64_t *ids, size_t count) {
+#if defined(POSIX_MADV_WILLNEED)
+    if (!ple || !ple->base || !ids) return;
+    static size_t ple_page = 0;
+    if (ple_page == 0) {
+        const long p = sysconf(_SC_PAGESIZE);
+        ple_page = p > 0 ? (size_t)p : 4096u;
+    }
+    const uint64_t page = (uint64_t)ple_page;
+    for (size_t i = 0; i < count; i++) {
+        const uint64_t row = ids[i];
+        if (row >= ple->rows) continue;
+        const uint64_t start = row * ple->row_bytes;
+        uint64_t end = start + ple->row_bytes;
+        if (end > ple->bytes) end = ple->bytes;
+        uintptr_t a0 = (uintptr_t)(ple->base + start);
+        uintptr_t a1 = (uintptr_t)(ple->base + end);
+        a0 -= a0 % page;
+        a1 = (a1 + page - 1u) / page * page;
+        if (a1 > a0)
+            (void)posix_madvise((void *)a0, (size_t)(a1 - a0),
+                                POSIX_MADV_WILLNEED);
+    }
+#else
+    (void)ple;
+    (void)ids;
+    (void)count;
+#endif
+}
+
 typedef struct {
     const ds4_qwen4exp_ple_table *ple;
     const ds4_qwen4exp_session   *s;
@@ -1137,9 +1175,17 @@ static void *qw_ple_gather_worker(void *arg) {
         ds4_ple_history_reset(&seg->s->ple_constants, &local);
     }
     seg->ok = 1;
+    /* Ids for the whole segment first, then one disk hint covering every row
+     * the segment will fault, then the dequant: the reads are all in flight
+     * before the first row is touched instead of serialising per head. */
     for (uint32_t t = seg->t0; t < seg->t1; t++) {
         ds4_ple_row_ids(&seg->s->ple_constants, &local, seg->tokens + t, 1u,
                         seg->s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD);
+    }
+    qw_ple_gather_prefetch(seg->ple,
+                           seg->s->ple_ids + (uint64_t)seg->t0 * DS4_N_PLE_HEAD,
+                           (size_t)(seg->t1 - seg->t0) * DS4_N_PLE_HEAD);
+    for (uint32_t t = seg->t0; t < seg->t1; t++) {
         for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
             const uint64_t row =
                 seg->s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h];
@@ -1304,6 +1350,10 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 s->ple_history_rows[t] = s->ple_history;
             }
         }
+        /* Every id this call will fault is known now; start the reads before
+         * the dequant touches the first row. */
+        qw_ple_gather_prefetch(&w->ple, s->ple_ids,
+                               (size_t)n_tokens * DS4_N_PLE_HEAD);
         for (uint32_t t = 0; t < n_tokens; t++) {
             /* The head's destination strides are constants of the shape, so
              * the token base is hoisted out of the head loop and the head
@@ -1367,6 +1417,8 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
         if (nthreads == 1) {
             ds4_ple_row_ids(&s->ple_constants, &s->ple_history, tokens,
                             n_tokens, s->ple_ids);
+            qw_ple_gather_prefetch(&w->ple, s->ple_ids,
+                                   (size_t)n_tokens * DS4_N_PLE_HEAD);
             for (uint32_t t = 0; t < n_tokens; t++) {
                 for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
                     const uint64_t row =
