@@ -15,6 +15,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -975,6 +978,50 @@ static void ple_size_hot_set(ds4_ple_table *t, uint64_t ceiling) {
     t->resident_bytes = capacity * per_slot + buckets * sizeof(int32_t);
 }
 
+
+/* The table's rows are served from the shard mapping at run time, and nothing
+ * at load touches that range: the resident tensors are copied to the device
+ * through the mapping, the PLE tensor is not.  On a box that starts cold, every
+ * first touch of a row is therefore a disk read inside the timed window.  This
+ * asks the kernel for the whole tensor range once, in the background, while the
+ * rest of the load is still running.  It changes no value: the rows are the
+ * same bytes whether they came from the page cache or the disk.  Skipped when
+ * free memory would not hold the range with headroom, and by
+ * DS4_QWEN4EXP_NO_PLE_WARM=1. */
+typedef struct { int fd; uint64_t off; uint64_t len; } ple_warm_job;
+static void *ple_warm_thread(void *arg) {
+    ple_warm_job *j = (ple_warm_job *)arg;
+    /* Let the weight load have the disk to itself first, then walk the range
+     * in 64 MiB pieces with a short pause between them, so the request never
+     * competes with the load and never saturates the device. */
+    sleep(90);
+    const uint64_t chunk = 64ull << 20;
+    for (uint64_t o = 0; o < j->len; o += chunk) {
+        const uint64_t n = j->len - o < chunk ? j->len - o : chunk;
+        if (readahead(j->fd, (off64_t)(j->off + o), (size_t)n) != 0 && errno != EINVAL) break;
+        usleep(4000);
+    }
+    free(j);
+    return NULL;
+}
+static void ple_warm_range(int fd, uint64_t off, uint64_t len) {
+    if (fd < 0 || len == 0 || getenv("DS4_QWEN4EXP_NO_PLE_WARM")) return;
+    const long pages = sysconf(_SC_AVPHYS_PAGES), psz = sysconf(_SC_PAGESIZE);
+    if (pages > 0 && psz > 0) {
+        const uint64_t avail = (uint64_t)pages * (uint64_t)psz;
+        if (avail < len + (len >> 2)) {
+            fprintf(stderr, "ds4_ple: not warming %" PRIu64 " bytes: %" PRIu64 " available\n", len, avail);
+            return;
+        }
+    }
+    ple_warm_job *j = malloc(sizeof(*j));
+    if (!j) return;
+    j->fd = fd; j->off = off; j->len = len;
+    pthread_t th;
+    if (pthread_create(&th, NULL, ple_warm_thread, j) == 0) pthread_detach(th);
+    else free(j);
+}
+
 bool ds4_ple_table_open(const char *const *gguf_paths, size_t path_count,
                         uint64_t cache_bytes, ds4_ple_table **out,
                         char *err, size_t err_size) {
@@ -1033,6 +1080,8 @@ bool ds4_ple_table_open(const char *const *gguf_paths, size_t path_count,
                          DS4_PLE_IQ4_NL_BLOCK_BYTES;
     t->row_floats      = t->constants.row_dim;
     t->tensor_offset   = scan.tensor_offset;
+    ple_warm_range(t->mapping.fd, t->tensor_offset,
+                   (uint64_t)scan.tensor_dim1 * (uint64_t)t->quant_row_bytes);
 
     uint64_t need = scan.tensor_dim1 * (uint64_t)t->quant_row_bytes;
     if (t->tensor_offset > t->mapping.size || need > t->mapping.size - t->tensor_offset) {
