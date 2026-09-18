@@ -493,6 +493,14 @@ __device__ __forceinline__ static float qwen4exp_gdn_softplus(float x) {
  * standard error of one and two tenths: neutral. Widening the grid is not
  * what this path needs.
  */
+/* This build's note auto09180925_8 records that a kernel launched with the
+ * programmatic stream serialization attribute parks at its fence, and the
+ * profiler counts that parked time as the kernel's duration, so any
+ * opportunity sized from durations double counts work that is already
+ * overlapped. Size a gap as the consumer's start minus the predecessor's
+ * end; a negative value means the work is already hidden and there is
+ * nothing to win.
+ */
 __global__ static void qwen4exp_gdn_conv_kernel(
         float       *qkv,
         float       *conv_state,
