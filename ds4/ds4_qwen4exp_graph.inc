@@ -1,3 +1,4 @@
+/* ROUND 112 PROMOTION DRAW — stamp 20260918T215813Z. Tip 2352dfa. Best 2.661911. Bar 2.664573. R111=2.61251 s4 handicap. Jev: box_dominates 0.76, bar_ratchets 0.78, redraw conf 0.47 escalate. */
 /*
  * qwen4exp serial graph: session state, memory plan and the forward.
  * See ds4_qwen4exp_graph.h for the contract and the layer schedule.
