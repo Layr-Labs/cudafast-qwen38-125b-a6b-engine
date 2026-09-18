@@ -261,13 +261,17 @@ int ds4_qwen4exp_mtp_state_init(ds4_qwen4exp_mtp_state *st, int depth,
                         "positive", hc_dim, n_vocab);
     }
     st->depth = depth;
+    st->adaptive_depth = depth == 2 &&
+        getenv("DS4_QWEN4EXP_NO_ADAPTIVE_DRAFT") == NULL;
+    st->draft_limit = depth;
     st->hc_dim = hc_dim;
     st->n_vocab = n_vocab;
     /* Off at depth 1, where a kept first draft leaves nothing to stop or drop;
      * the keep-one gate described in the header at depth >= 2. */
     const bool gated = depth >= 2;
-    st->stop_margin = mtp_env_margin("DS4_QWEN4EXP_MTP_STOP_MARGIN", gated ? 2.0f : 0.0f);
-    st->drop_margin = mtp_env_margin("DS4_QWEN4EXP_MTP_DROP_MARGIN", gated ? 2.0f : 0.0f);
+    const float default_margin = st->adaptive_depth ? 4.0f : gated ? 2.0f : 0.0f;
+    st->stop_margin = mtp_env_margin("DS4_QWEN4EXP_MTP_STOP_MARGIN", default_margin);
+    st->drop_margin = mtp_env_margin("DS4_QWEN4EXP_MTP_DROP_MARGIN", default_margin);
     {
         const char *keep = getenv("DS4_QWEN4EXP_MTP_DROP_KEEP");
         st->drop_keep = (keep && keep[0]) ? atoi(keep) : (gated ? 1 : 0);
@@ -295,7 +299,7 @@ void ds4_qwen4exp_mtp_state_free(ds4_qwen4exp_mtp_state *st) {
     st->logits_rows = NULL;
 }
 
-void ds4_qwen4exp_mtp_invalidate(ds4_qwen4exp_mtp_state *st) {
+static void mtp_clear_pending(ds4_qwen4exp_mtp_state *st) {
     for (int k = 0; k < DS4_QWEN4EXP_IMPLEMENTED_DEPTH; k++) {
         st->pending[k] = -1;
         st->pending_margin[k] = -1.0f;
@@ -304,6 +308,14 @@ void ds4_qwen4exp_mtp_invalidate(ds4_qwen4exp_mtp_state *st) {
     st->pending_parent = -1;
     st->frontier_top1_valid = false;
     st->frontier_logits_deferred = false;
+}
+
+void ds4_qwen4exp_mtp_invalidate(ds4_qwen4exp_mtp_state *st) {
+    mtp_clear_pending(st);
+    st->acceptance_history = 0;
+    st->acceptance_samples = 0;
+    st->adaptive_position_valid = false;
+    st->draft_limit = st->adaptive_depth ? 1 : st->depth;
 }
 
 int ds4_qwen4exp_mtp_counters_check(const ds4_qwen4exp_mtp_counters *c,
@@ -441,7 +453,15 @@ static int mtp_draft_chain(ds4_qwen4exp_mtp_state *st,
                            int n, uint32_t pos, int next_fed,
                            char *err, size_t errlen) {
     const uint64_t t0 = mtp_now_ns();
-    ds4_qwen4exp_mtp_invalidate(st);
+    mtp_clear_pending(st);
+    /* A completed verify contributes one first-draft outcome.
+     * Pending-chain replacement is internal, unlike request invalidation. */
+    st->draft_limit = st->depth;
+    if (st->adaptive_depth &&
+        (st->acceptance_samples < 8u ||
+         __builtin_popcount((unsigned)st->acceptance_history) < 7)) {
+        st->draft_limit = 1;
+    }
     /* The chain's first row: the head has to hold every row below it. */
     const uint32_t start = pos + (uint32_t)n;
     if (mtp_head_cache_truncate(st->rollback, start, err, errlen) != 0) {
@@ -477,7 +497,7 @@ static int mtp_draft_chain(ds4_qwen4exp_mtp_state *st,
         int rows_tok[DS4_QWEN4EXP_MTP_MAX_COMMIT];
         for (uint32_t i = 0; i < seeds; i++) rows_tok[i] = toks[k0 + i + 1u];
         rows_tok[seeds] = next_fed;
-        float *multi_out = (1 < st->depth) ? ping : NULL;
+        float *multi_out = (1 < st->draft_limit) ? ping : NULL;
         int draft = -1;
         if (model->draft_rows(model->ctx, rows_tok,
                               hc_rows + (size_t)k0 * st->hc_dim,
@@ -510,7 +530,7 @@ static int mtp_draft_chain(ds4_qwen4exp_mtp_state *st,
         st->head_rows = start;
     }
 
-    for (; k < st->depth; k++) {
+    for (; k < st->draft_limit; k++) {
         /* The margin gate's chain half: nothing past an unsure link. */
         if (k > 0 && st->stop_margin > 0.0f &&
             st->pending_margin[k - 1] >= 0.0f &&
@@ -518,7 +538,7 @@ static int mtp_draft_chain(ds4_qwen4exp_mtp_state *st,
             break;
         }
         /* The last step's `multi` row would have no reader. */
-        float *multi_out = (k + 1 < st->depth)
+        float *multi_out = (k + 1 < st->draft_limit)
                          ? ping + (size_t)(k & 1) * st->hc_dim : NULL;
         int draft = -1;
         if (model->draft_step(model->ctx, cur_tok, cur_hc, p, &draft,
@@ -561,6 +581,8 @@ static int mtp_commit_one(ds4_qwen4exp_mtp_state *st,
     }
     const int next = ds4_qwen4exp_mtp_argmax(logits, model->n_vocab);
     if (next_out) *next_out = next;
+    st->adaptive_next_pos = pos + 1u;
+    st->adaptive_position_valid = true;
     if (mtp_draft_chain(st, model, hc0, NULL, 0, pos, next,
                         err, errlen) != 0) {
         return -1;
@@ -611,6 +633,11 @@ int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
     st->frontier_top1_valid = false;
     st->frontier_logits_deferred = false;
 
+    if (st->adaptive_depth && st->adaptive_position_valid &&
+        pos != st->adaptive_next_pos) {
+        ds4_qwen4exp_mtp_invalidate(st);
+    }
+
     /* A chain belongs to the token it was drafted from.  Anything else -- a
      * rewind, a different sampled token -- makes the whole chain stale, not
      * just its head: every link after the first was drafted on the assumption
@@ -653,7 +680,7 @@ int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
                    "the verify carries the fed token plus the whole chain");
     toks[0] = first_token;
     for (int k = 0; k < n; k++) toks[k + 1] = st->pending[k];
-    ds4_qwen4exp_mtp_invalidate(st);
+    mtp_clear_pending(st);
 
     /* No round-start snapshot.  The verify forward itself leaves the state
      * after each drafted row in a slot, so there is nothing to copy first and
@@ -701,6 +728,13 @@ int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
         a++;
     }
     st->counters.accepted += (uint64_t)a;
+    if (st->adaptive_depth) {
+        st->acceptance_history = (uint8_t)
+            ((st->acceptance_history << 1u) | (a > 0 ? 1u : 0u));
+        if (st->acceptance_samples < 8u) st->acceptance_samples++;
+    }
+    st->adaptive_next_pos = pos + (uint32_t)a + 1u;
+    st->adaptive_position_valid = true;
 
     /* The target head has already produced every row.  A greedy-only compact
      * seam can carry the exact GPU winner forward and leave the full selected

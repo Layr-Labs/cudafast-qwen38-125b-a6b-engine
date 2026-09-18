@@ -76074,11 +76074,21 @@ static int qwen4exp_seam_head_logits(void *ctx, const float *hc_row,
                                           hc_row, logits) ? 0 : -1;
 }
 
+static void qwen4exp_seam_draft_policy(ds4_session *s) {
+    const ds4_qwen4exp_mtp_state *st = &s->qwen4exp_spec;
+    /* A kept single draft has no margin decision. Avoid its unused readback
+     * while preserving explicit logging and a caller's drop-first policy. */
+    const bool margins = st->stop_margin > 0.0f || st->drop_margin > 0.0f;
+    s->qwen4exp_head.want_margin = st->margin_log ||
+        (margins && (!st->adaptive_depth || st->draft_limit > 1 || st->drop_keep < 1));
+}
+
 static int qwen4exp_seam_draft_step(void *ctx, int next_token,
                                     const float *hc_row, uint32_t pos,
                                     int *draft_out, float *multi_out) {
     ds4_session *s = ctx;
     char err[256];
+    qwen4exp_seam_draft_policy(s);
     if (ds4_qwen4exp_mtp_head_forward(&s->qwen4exp_head, &next_token, hc_row,
                                       pos, 1u, draft_out, multi_out,
                                       err, sizeof(err)) != 0) {
@@ -76112,6 +76122,7 @@ static int qwen4exp_seam_draft_rows(void *ctx, const int *next_tokens,
                                     float *multi_out) {
     ds4_session *s = ctx;
     char err[256];
+    qwen4exp_seam_draft_policy(s);
     int rc;
     const float *base = s->qwen4exp_hc_host_base;
     const uint32_t hc_dim = s->qwen4exp_head.n_hc * s->qwen4exp_head.n_embd;

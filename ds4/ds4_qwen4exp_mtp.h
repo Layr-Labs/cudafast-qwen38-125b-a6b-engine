@@ -478,6 +478,14 @@ typedef struct {
      * must outlive the state; nothing here copies it. */
     const ds4_qwen4exp_rollback_set *rollback;
     int      depth;          /* 0 = serial, N = N drafts per verify         */
+    /* Depth two is admitted only after sustained first-draft acceptance.
+     * This history belongs to the current request and contains no tokens. */
+    bool     adaptive_depth;
+    uint8_t  acceptance_history;
+    uint8_t  acceptance_samples;
+    uint32_t adaptive_next_pos;
+    bool     adaptive_position_valid;
+    int      draft_limit;    /* selected depth for the chain being built    */
     /* The carried chain, pending[0] first.  pending[k] is the head's guess at
      * the token k + 1 places after `pending_parent`. */
     int      pending[DS4_QWEN4EXP_IMPLEMENTED_DEPTH];
@@ -496,7 +504,8 @@ typedef struct {
      * Neither changes a committed token: the target verifies what is offered.
      * DEFAULTS.  Off at depth 1: a one-draft chain has nothing to stop, a kept
      * first draft has nothing to drop, and no margin is read back.  At depth
-     * >= 2, stop = drop = 2.0 and keep = 1: the first draft is always verified,
+     * >= 2, stop = drop = 2.0 and keep = 1; adaptive depth two uses 4.0.
+     * The first draft is always verified,
      * and a second joins the verify only when both links cleared the margin.
      * Any env value overrides, and 0 disarms.  Why, on a GB10: a verify row
      * costs 4.6-6.9 ms and a head step 1.4 ms, so dropping a 40-60 %-likely

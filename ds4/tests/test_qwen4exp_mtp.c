@@ -697,6 +697,7 @@ typedef struct {
      * would report zero of them. */
     uint64_t head_rows_from_target;
     uint64_t head_rows_from_chain;
+    uint64_t adaptive_one, adaptive_two, adaptive_transitions;
     uint64_t accept_hist[DS4_QWEN4EXP_MTP_MAX_COMMIT + 1];
     int      faulted;
     char     err[512];
@@ -740,6 +741,8 @@ static int run_mtp(int first_token, int n, int *out, mtp_run *run,
     ref_reset(sm, BREAK_NONE, 0);
     int ser_fed = first_token;
     uint32_t ser_pos = 0;
+    /* Independent FIFO oracle, derived from committed verification results. */
+    unsigned recent[8] = {0}, observed = 0, last_limit = 1;
 
     while (produced < n) {
         int committed[DS4_QWEN4EXP_MTP_MAX_COMMIT];
@@ -747,6 +750,7 @@ static int run_mtp(int first_token, int n, int *out, mtp_run *run,
         const uint64_t verify_before = m.n_verify;
         const uint64_t selects_before = m.selects;
         const uint32_t pos_before = pos;
+        const uint64_t drafted_before = st.counters.drafted;
         /* The round's starting state, kept so the rollback can be checked
          * against a replay that never used a slot. */
         refmodel *pre = malloc(sizeof(*pre));
@@ -769,6 +773,26 @@ static int run_mtp(int first_token, int n, int *out, mtp_run *run,
             rc = -1;
             free(pre);
             break;
+        }
+        if (st.adaptive_depth) {
+            if (st.counters.drafted > drafted_before) {
+                for (unsigned j = 0; j < 7; j++) recent[j] = recent[j + 1];
+                recent[7] = got > 1;
+                if (observed < 8) observed++;
+            }
+            unsigned wins = 0;
+            for (unsigned j = 0; j < 8; j++) wins += recent[j];
+            const unsigned expected = observed == 8 && wins >= 7 ? 2 : 1;
+            if ((unsigned)st.draft_limit != expected || st.n_pending != (int)expected ||
+                st.acceptance_samples != observed) {
+                snprintf(run->err, sizeof(run->err),
+                         "adaptive FIFO mismatch after round %d: expected %u, limit %d pending %d",
+                         run->rounds, expected, st.draft_limit, st.n_pending);
+                run->faulted = 1; rc = -1; free(pre); break;
+            }
+            if (expected == 1) run->adaptive_one++; else run->adaptive_two++;
+            if (expected != last_limit) run->adaptive_transitions++;
+            last_limit = expected;
         }
         if (committed[0] != pending) {
             snprintf(run->err, sizeof(run->err),
@@ -2545,6 +2569,59 @@ static void test_draft_vocab_shortlist(void) {
     unsetenv("DS4_QWEN4EXP_DRAFT_VOCAB_TAIL");
 }
 
+static void test_adaptive_depth(void) {
+    printf("adaptive depth: request boundaries and observed acceptance\n");
+    unsetenv("DS4_QWEN4EXP_NO_ADAPTIVE_DRAFT");
+    for (int batch = 0; batch < 2; batch++) {
+        g_ref_batched_draft = batch;
+        for (int p = 0; p < N_PROMPTS; p++) {
+            int serial[N_TOKENS], candidate[N_TOKENS];
+            mtp_run run;
+            CHECK(run_serial(g_prompts[p], N_TOKENS, serial) == 0, "serial failed");
+            CHECK(run_mtp(g_prompts[p], N_TOKENS, candidate, &run,
+                          BREAK_NONE, 0, 2) == 0, "adaptive cycle: %s", run.err);
+            CHECK(!memcmp(serial, candidate, sizeof(serial)), "adaptive token drift");
+            CHECK(run.adaptive_one > 8 && run.adaptive_two > 0 &&
+                  run.adaptive_transitions > 1,
+                  "adaptive depth transitions were not exercised");
+        }
+    }
+    g_ref_batched_draft = 1;
+    for (int mode = 0; mode < 3; mode++) {
+        refmodel m;
+        ds4_qwen4exp_mtp_model model;
+        ds4_qwen4exp_rollback_set set;
+        ds4_qwen4exp_mtp_state st;
+        ref_reset(&m, BREAK_NONE, 0);
+        CHECK(ref_build(&m, &model, &set) == 0, "reference build failed");
+        CHECK(ds4_qwen4exp_mtp_state_init(&st, 2, &set, REF_HC_DIM,
+                  REF_VOCAB, g_err, sizeof(g_err)) == 0, "state init failed");
+        CHECK(st.adaptive_depth && st.draft_limit == 1 && st.stop_margin == 4.0f &&
+              st.drop_margin == 4.0f, "release policy initialization");
+        st.acceptance_history = 255;
+        st.acceptance_samples = 8;
+        st.adaptive_position_valid = true;
+        st.adaptive_next_pos = mode == 1 ? 99u : 0u;
+        if (mode == 0) {
+            ds4_qwen4exp_mtp_invalidate(&st);
+            CHECK(!st.acceptance_samples && !st.acceptance_history &&
+                  !st.adaptive_position_valid && st.draft_limit == 1,
+                  "explicit invalidation retained request history");
+        } else if (mode == 2) {
+            st.n_pending = 1;
+            st.pending_parent = 4; /* caller supplies a different sampled token */
+        }
+        float logits[REF_VOCAB];
+        int committed[DS4_QWEN4EXP_MTP_MAX_COMMIT];
+        int got = ds4_qwen4exp_mtp_cycle(&st, &model, 3, 0, 1, committed,
+                DS4_QWEN4EXP_MTP_MAX_COMMIT, logits, g_err, sizeof(g_err));
+        CHECK(got == 1 && st.n_pending == 1 && st.draft_limit == 1 &&
+              st.acceptance_samples == 0 && st.counters.drafted == 0,
+              "boundary/budget mode %d retained a deeper policy: %s", mode, g_err);
+        ds4_qwen4exp_mtp_state_free(&st);
+    }
+}
+
 int main(void) {
     printf("qwen4exp MTP tests\n\n");
     test_exactness();
@@ -2580,6 +2657,10 @@ int main(void) {
     test_head_wiring();
     printf("\n");
     test_draft_vocab_shortlist();
+    printf("\n");
+    /* Keep the legacy depth-envelope suite available through its valve;
+     * the adaptive release path is exercised independently in every run. */
+    test_adaptive_depth();
     printf("\n");
     if (g_failures) {
         printf("FAILED: %d check(s)\n", g_failures);

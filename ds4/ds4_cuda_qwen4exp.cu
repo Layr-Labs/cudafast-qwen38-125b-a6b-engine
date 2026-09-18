@@ -8447,10 +8447,16 @@ qwen4exp_shared_pipe_mma_kernel(
                         uint32_t q[4] = {0u, 0u, 0u, 0u};
 #pragma unroll
                         for (int j = 0; j < 4; j++) {
-                            if (j * 4 < inside) {
+                            if (j * 4 + 4 <= inside) {
                                 uint32_t v;
                                 asm volatile("ld.global.u32 %0, [%1];" : "=r"(v) : "l"(win + 32 + j * 4));
                                 q[j] = v;
+                            } else if (j * 4 + 2 <= inside) {
+                                /* A Q8 matrix may end on a half-word. Do not
+                                 * read four bytes when only two remain. */
+                                uint16_t v;
+                                asm volatile("ld.global.u16 %0, [%1];" : "=h"(v) : "l"(win + 32 + j * 4));
+                                q[j] = (uint32_t)v;
                             }
                         }
                         rb[k][2] = make_uint4(q[0], q[1], q[2], q[3]);
