@@ -2791,6 +2791,13 @@ static bool qwen4exp_graph_layers_encode(
  * overlap the device work already queued. */
 #define QW_DECODE_GRAPH_MAX_CHUNKS 8u
 
+/* This build's note auto09182154_79 records that fusing two kernels is a
+ * win when the fusion is a union of their grids and a loss when it
+ * collapses a wide grid onto a narrow one, because the wide kernel's memory
+ * work then runs at the narrow kernel's parallelism. One such fold was bit
+ * exact, race clean and forty-six percent slower with a cold cache, because
+ * the round trip it removed had been acting as a parallel prefetch.
+ */
 static uint32_t qw_decode_graph_chunks(void) {
     static int init = 0;
     static uint32_t chunks = 4u;   /* the A/B's pick; 1 restores the single capture */
