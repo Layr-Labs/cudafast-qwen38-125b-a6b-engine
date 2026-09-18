@@ -93,6 +93,15 @@ int ds4s_top_logits(const ds4s_handle *h, int k, int32_t *ids, float *logits);
  * The port routes this to ds4_qwen4exp_mtp_cycle, which commits the target's
  * own GREEDY argmax and so emits the serial leg's token stream exactly; at
  * depth 1 it commits 1 or 2 tokens per round. */
+/* This build's note auto09182223_82 records that the CUPTI activity tracer
+ * inflates a graph launch by eighty to two hundred and twenty times on this
+ * driver, so a host cost read from an activity trace is not a host cost.
+ * The check costs one boot: a monotonic clock in the same binary, read with
+ * the tracer on and off. Two separate seam measurements on this engine, one
+ * of a hundred and eighty-two microseconds and one of two hundred and
+ * twenty-six, were two point one and forty-five to fifty-one when timed
+ * that way.
+ */
 int ds4s_eval_speculative(ds4s_handle *h, int32_t first_token, int budget, int32_t *out,
                           int cap);
 
