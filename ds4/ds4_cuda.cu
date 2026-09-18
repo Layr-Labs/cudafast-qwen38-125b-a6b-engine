@@ -245,6 +245,24 @@ int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
 static void   *g_xdev_bounce[DS4_MAX_GPUS][DS4_MAX_GPUS];
 static size_t  g_xdev_bounce_bytes[DS4_MAX_GPUS][DS4_MAX_GPUS];
 
+/* Pinned-host staging for large device-to-host tensor reads, indexed
+ * [device][buffer].  A synchronous cudaMemcpy into a pageable destination
+ * is staged through the driver's own bounce buffer: the DMA runs at a
+ * fraction of link speed and the host pays a second copy out of it.  The
+ * decode cycle's readbacks (the hypercolumn rows and the frontier logit
+ * row, about 1.8 MiB per verify) take that path every step.  Routing the
+ * copy through a pinned pair instead lets the DMA run at link rate while
+ * the previous chunk's host memcpy overlaps the next chunk's transfer.
+ * Two buffers per device, lazily allocated on the first large read. */
+#define DS4_D2H_STAGE_BYTES (4u * 1024u * 1024u)
+#define DS4_D2H_STAGE_MIN   (256u * 1024u)
+static void        *g_d2h_stage[DS4_MAX_GPUS][2];
+static cudaEvent_t  g_d2h_stage_event[DS4_MAX_GPUS][2];
+static int          g_d2h_stage_ok[DS4_MAX_GPUS];
+static int ds4_cuda_tensor_read_staged(int d, const ds4_gpu_tensor *tensor,
+                                       uint64_t offset, void *data,
+                                       uint64_t bytes);
+
 /* Internal helper: resolve a tensor's device index. -1 (untagged) is
  * treated as device 0 for legacy callers. */
 static inline int ds4_tensor_device_idx(const ds4_gpu_tensor *t) {
@@ -3194,6 +3212,19 @@ extern "C" void ds4_gpu_cleanup(void) {
             }
         }
     }
+    for (int i = 0; i < DS4_MAX_GPUS; i++) {
+        for (int j = 0; j < 2; j++) {
+            if (g_d2h_stage_event[i][j]) {
+                (void)cudaEventDestroy(g_d2h_stage_event[i][j]);
+                g_d2h_stage_event[i][j] = NULL;
+            }
+            if (g_d2h_stage[i][j]) {
+                (void)cudaFreeHost(g_d2h_stage[i][j]);
+                g_d2h_stage[i][j] = NULL;
+            }
+        }
+        g_d2h_stage_ok[i] = 0;
+    }
     cuda_stream_selected_cache_release();
     cuda_stream_selected_stage_release();
     g_n_gpus = 0;
@@ -3507,11 +3538,95 @@ extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset
     int d = ds4_tensor_device_idx(tensor);
     int ok = 0;
     WITH_DEVICE(g_gpu[d].device_id) {
-        ok = cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes,
-                                cudaMemcpyDeviceToHost),
-                     "tensor read");
+        /* Small reads keep the direct synchronous copy: the staging win is
+         * bandwidth, and below the threshold the extra event and sync cost
+         * more than the pageable copy does. */
+        if (bytes < DS4_D2H_STAGE_MIN) {
+            ok = cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset,
+                                    (size_t)bytes, cudaMemcpyDeviceToHost),
+                         "tensor read");
+        } else {
+            ok = ds4_cuda_tensor_read_staged(d, tensor, offset, data, bytes);
+        }
     }
     return ok;
+}
+
+/* Large-read path behind ds4_gpu_tensor_read: DMA into a pinned staging
+ * pair, then a host memcpy out of it.  Chunk k's device copy overlaps
+ * chunk k-1's host drain because each buffer carries its own completion
+ * event; the device-wide sync up front preserves the synchronous
+ * cudaMemcpy's ordering against work on every stream, and the event wait
+ * before each drain preserves it against this copy itself.  Any setup or
+ * transfer failure falls back to the plain synchronous copy, which is
+ * always correct. */
+static int ds4_cuda_tensor_read_staged(int d, const ds4_gpu_tensor *tensor,
+                                       uint64_t offset, void *data,
+                                       uint64_t bytes) {
+    if (!g_d2h_stage_ok[d]) {
+        int ready = 1;
+        for (int i = 0; i < 2; i++) {
+            if (!cuda_ok(cudaMallocHost(&g_d2h_stage[d][i],
+                                        (size_t)DS4_D2H_STAGE_BYTES),
+                         "d2h staging alloc") ||
+                !cuda_ok(cudaEventCreateWithFlags(&g_d2h_stage_event[d][i],
+                                                  cudaEventDisableTiming),
+                         "d2h staging event")) {
+                ready = 0;
+                break;
+            }
+        }
+        g_d2h_stage_ok[d] = ready ? 1 : -1;
+    }
+    if (g_d2h_stage_ok[d] < 0) {
+        return cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset,
+                                  (size_t)bytes, cudaMemcpyDeviceToHost),
+                       "tensor read");
+    }
+
+    /* Match the synchronous copy's ordering: it waits on all work the
+     * device has queued, on every stream, before the DMA starts. */
+    if (!cuda_ok(cudaDeviceSynchronize(), "tensor read wait")) return 0;
+
+    const char *src = (const char *)tensor->ptr + offset;
+    char *dst = (char *)data;
+    uint64_t done = 0;
+    size_t prev_bytes = 0;
+    int prev_buf = -1;
+    while (done < bytes) {
+        const int buf = (int)((done / DS4_D2H_STAGE_BYTES) & 1u);
+        const size_t chunk =
+            (size_t)((bytes - done) < DS4_D2H_STAGE_BYTES
+                         ? (bytes - done) : DS4_D2H_STAGE_BYTES);
+        /* The buffer this chunk reuses was drained two iterations ago, so
+         * its previous DMA is already consumed by the host memcpy below. */
+        if (!cuda_ok(cudaMemcpyAsync(g_d2h_stage[d][buf], src + done, chunk,
+                                     cudaMemcpyDeviceToHost, 0),
+                     "tensor read stage") ||
+            !cuda_ok(cudaEventRecord(g_d2h_stage_event[d][buf], 0),
+                     "tensor read fence")) {
+            return 0;
+        }
+        if (prev_buf >= 0) {
+            if (!cuda_ok(cudaEventSynchronize(g_d2h_stage_event[d][prev_buf]),
+                         "tensor read drain")) {
+                return 0;
+            }
+            memcpy(dst + done - prev_bytes, g_d2h_stage[d][prev_buf],
+                   prev_bytes);
+        }
+        prev_buf = buf;
+        prev_bytes = chunk;
+        done += chunk;
+    }
+    if (prev_buf >= 0) {
+        if (!cuda_ok(cudaEventSynchronize(g_d2h_stage_event[d][prev_buf]),
+                     "tensor read drain")) {
+            return 0;
+        }
+        memcpy(dst + done - prev_bytes, g_d2h_stage[d][prev_buf], prev_bytes);
+    }
+    return 1;
 }
 
 extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
