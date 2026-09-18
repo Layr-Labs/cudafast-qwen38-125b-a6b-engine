@@ -13048,6 +13048,9 @@ __global__ static void qwen4exp_qsa_tape_append_kernel(
         uint32_t pos0,
         uint32_t cache_cap,
         const uint32_t *d_pos) {
+    /* PDL producer for the pool update that follows on the stream: the
+     * append grid is a handful of blocks at decode widths, one wave. */
+    if (gridDim.x <= 96u) QWEN4EXP_PDL_TRIGGER();
     const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= (uint64_t)n_tokens * head_dim) return;
     const uint32_t token = (uint32_t)(gid / head_dim);
@@ -13055,6 +13058,9 @@ __global__ static void qwen4exp_qsa_tape_append_kernel(
     const uint32_t p0 = d_pos ? *d_pos : pos0;
     const uint32_t pos = p0 + token;
     if (pos >= cache_cap) return;
+    /* The fence: d_pos and the index math above are not written by the
+     * kernel this launch overlaps; raw_k is. */
+    QWEN4EXP_PDL_SYNC();
     tape[(uint64_t)pos * head_dim + d] = raw_k[gid];
 }
 
@@ -13074,6 +13080,9 @@ __global__ static void qwen4exp_qsa_pool_update_kernel(
         float weight_offset,
         const uint32_t *d_pos,
         uint32_t n_tokens, const float *raw_k=NULL, uint32_t pos0=0) {
+    /* PDL producer for the indexer scores that follow on the stream: the
+     * grid is a few pool slots, one wave at every width this entry serves. */
+    if (gridDim.x <= 96u) QWEN4EXP_PDL_TRIGGER();
     extern __shared__ float qwen4exp_pool_shared[];
     const uint32_t tid = threadIdx.x;
     const uint32_t nth = blockDim.x;
@@ -13121,6 +13130,11 @@ __global__ static void qwen4exp_qsa_pool_update_kernel(
     float *vec = qwen4exp_pool_shared;
     float *scratch = qwen4exp_pool_shared + head_dim;
 
+    /* The fence: d_pos, the bounds math and the append stores above are
+     * this kernel's own or written before the layer stack; the tape rows
+     * the pool reduction reads below are the append's output, and the
+     * weight/inv_freq reads are weights. */
+    QWEN4EXP_PDL_SYNC();
     for (uint32_t d = tid; d < head_dim; d += nth) {
         float acc = 0.0f;
         for (uint32_t j = 0; j < pool_size; j++) {
@@ -13159,6 +13173,11 @@ __global__ static void qwen4exp_qsa_indexer_scores_kernel(
         uint32_t pos0,
         uint32_t pool_size,
         float norm_divisor) {
+    /* PDL producer for the top-k that follows on the stream.  The grid is
+     * (pool block, token): one wave while the indexer window is short, and
+     * the gate keeps a long-context prefill from carrying a live trigger
+     * (the deadlock rule, ds4_cuda_qwen4exp.cuh). */
+    if (gridDim.x * gridDim.y <= 96u) QWEN4EXP_PDL_TRIGGER();
     extern __shared__ float qwen4exp_score_shared[];
     const uint32_t block = blockIdx.x;
     const uint32_t token = blockIdx.y;
@@ -13174,6 +13193,9 @@ __global__ static void qwen4exp_qsa_indexer_scores_kernel(
         return;
     }
 
+    /* The fence: the visible-block math above is index arithmetic; the
+     * pool rows below are the pool update's output. */
+    QWEN4EXP_PDL_SYNC();
     const float *k = pool + (uint64_t)block * head_dim;
     float total = 0.0f;
     for (uint32_t h = 0; h < n_head; h++) {
@@ -13199,6 +13221,9 @@ __global__ static void qwen4exp_qsa_indexer_select_kernel(
         uint32_t pos0,
         uint32_t pool_size,
         uint32_t max_selected) {
+    /* PDL producer for the split attention scores that follow on the
+     * stream: one block per token, one wave at decode and verify. */
+    if (n_tokens <= 2u) QWEN4EXP_PDL_TRIGGER();
     extern __shared__ int32_t qwen4exp_select_shared[];
     __shared__ uint32_t n_valid;
     const uint32_t token = blockIdx.x;
@@ -13208,6 +13233,9 @@ __global__ static void qwen4exp_qsa_indexer_select_kernel(
 
     int32_t *ids = qwen4exp_select_shared;
     const int32_t sentinel = 0x7fffffff;
+    /* The fence: everything this kernel reads -- the top-k candidates and
+     * the scores they index -- is upstream of the launch edge it rides. */
+    QWEN4EXP_PDL_SYNC();
     for (uint32_t i = tid; i < sort_width; i += nth) {
         int32_t block = sentinel;
         if (i < top_k) {
@@ -14624,6 +14652,11 @@ qwen4exp_qsa_split_scores_kernel(
         uint32_t max_tiles,
         float scale,
         const uint32_t *d_pos) {
+    /* PDL producer for the probs kernel that follows on the stream.  The
+     * grid is (head group, tile, token): one wave while the selected
+     * window is short, gated so a long-context call never carries a live
+     * trigger (the deadlock rule, ds4_cuda_qwen4exp.cuh). */
+    if (gridDim.x * gridDim.y * gridDim.z <= 96u) QWEN4EXP_PDL_TRIGGER();
     extern __shared__ __align__(16) float qwen4exp_attn_sc_shared[];
     const uint32_t group = blockIdx.x;
     const uint32_t tile = blockIdx.y;
@@ -14636,6 +14669,9 @@ qwen4exp_qsa_split_scores_kernel(
     if (head0 + GROUP > n_head || token >= n_tokens) return;
 
     const uint32_t p0 = d_pos ? *d_pos : pos0;
+    /* The fence: d_pos is written before the layer stack; the counts row
+     * below is the indexer select's output. */
+    QWEN4EXP_PDL_SYNC();
     const uint32_t count = sparse ? (uint32_t)counts[token] : p0 + token + 1u;
     const uint32_t base = tile * nth;
     if (base >= count) return;
@@ -14771,6 +14807,9 @@ qwen4exp_qsa_split_probs_kernel(
         uint32_t sparse,
         uint32_t max_tiles,
         const uint32_t *d_pos) {
+    /* PDL producer for the fold kernel that follows on the stream, same
+     * one-wave gate as the scores kernel beside it. */
+    if (gridDim.x * gridDim.y * gridDim.z <= 96u) QWEN4EXP_PDL_TRIGGER();
     extern __shared__ __align__(16) float qwen4exp_attn_pr_shared[];
     const uint32_t group = blockIdx.x;
     const uint32_t tile = blockIdx.y;
@@ -14781,6 +14820,9 @@ qwen4exp_qsa_split_probs_kernel(
     if (head0 + GROUP > n_head || token >= n_tokens) return;
 
     const uint32_t p0 = d_pos ? *d_pos : pos0;
+    /* The fence: d_pos is written before the layer stack; the counts row
+     * below is the indexer select's output. */
+    QWEN4EXP_PDL_SYNC();
     const uint32_t count = sparse ? (uint32_t)counts[token] : p0 + token + 1u;
     const uint32_t base = tile * nth;
     if (base >= count) return;
@@ -14904,11 +14946,17 @@ __global__ static void qwen4exp_qsa_split_fold_kernel(
         uint32_t max_tiles,
         uint32_t tile_width,
         const uint32_t *d_pos) {
+    /* PDL producer for the output gate that follows on the stream: the
+     * grid is (head, token), one wave at decode and verify. */
+    if (gridDim.x * gridDim.y <= 96u) QWEN4EXP_PDL_TRIGGER();
     const uint32_t head = blockIdx.x;
     const uint32_t token = blockIdx.y;
     const uint32_t tid = threadIdx.x;
     if (head >= n_head || token >= n_tokens || tid >= head_dim) return;
     const uint32_t p0 = d_pos ? *d_pos : pos0;
+    /* The fence: d_pos is written before the layer stack; the counts row
+     * below is the indexer select's output. */
+    QWEN4EXP_PDL_SYNC();
     const uint32_t count = sparse ? (uint32_t)counts[token] : p0 + token + 1u;
     float *dst = out + ((uint64_t)token * n_head + head) * head_dim;
     if (count == 0u) {
@@ -14935,8 +14983,15 @@ __global__ static void qwen4exp_qsa_output_gate_kernel(
         const float *gate,
         float *out,
         uint32_t n_values) {
+    /* PDL producer for the quantize or projection that follows on the
+     * stream: the flat grid is one wave at decode widths. */
+    if (gridDim.x <= 96u) QWEN4EXP_PDL_TRIGGER();
     const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= n_values) return;
+    /* The fence: both reads below are the attention fold's output or the
+     * projections' gate row, upstream of the launch edge this kernel
+     * rides. */
+    QWEN4EXP_PDL_SYNC();
     out[gid] = out[gid] * (1.0f / (1.0f + expf(-gate[gid])));
 }
 
@@ -14958,9 +15013,16 @@ __global__ static void qwen4exp_qsa_output_gate_quant_kernel(
         const float *gate,
         const float *out,
         uint32_t     n_values) {
+    /* PDL producer for the attn_output projection that follows on the
+     * stream: the flat grid is one wave at decode widths. */
+    if (gridDim.x <= 96u) QWEN4EXP_PDL_TRIGGER();
     const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
+    /* The fence: `out` is the attention fold's store and `gate` the
+     * projections' row, both upstream of the launch edge this kernel
+     * rides. */
+    QWEN4EXP_PDL_SYNC();
     const float v = gid < n_values
         ? out[gid] * (1.0f / (1.0f + expf(-gate[gid])))
         : 0.0f;
@@ -15003,6 +15065,10 @@ __global__ static void qwen4exp_qsa_output_gate_doubled_quant_kernel(
     const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
+    /* The fence: `out` is the attention fold's store and `doubled` the
+     * projection's row, both upstream of the launch edge this kernel
+     * rides. */
+    QWEN4EXP_PDL_SYNC();
     const float v = gid < n_values
         ? out[gid] * (1.0f / (1.0f + expf(-doubled[2u * gid - threadIdx.x +
                                                    blockDim.x])))
@@ -15338,7 +15404,9 @@ extern "C" int ds4_gpu_qwen4exp_qsa_prep_kv_append_fused_dpos_tensor(
     }
     const dim3 grid(n_head_kv, n_tokens);
     const uint32_t nth = qwen4exp_cuda_threads(head_dim);
-    qwen4exp_qsa_prep_joint_kernel<1><<<grid,nth,nth*sizeof(float),cuda_decode_stream()>>>(
+    QWEN4EXP_LAUNCH_PDL(
+            (qwen4exp_qsa_prep_joint_kernel<1>),
+            grid, nth, nth*sizeof(float), cuda_decode_stream(),
             NULL,(const float*)raw_k->ptr,(const float*)raw_v->ptr,NULL,
             (const float*)weight->ptr,(const float*)inv_freq->ptr,NULL,NULL,
             (float*)k_cache->ptr,(float*)v_cache->ptr,k_out?(float*)k_out->ptr:NULL,
@@ -15452,17 +15520,20 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_pool_update_dpos_tensor(
         const uint32_t nth=qwen4exp_cuda_threads(head_dim);
         const uint32_t slots=n_tokens/pool_size+(n_tokens%pool_size!=0u)+1u;
         const size_t shared=((size_t)head_dim+nth)*sizeof(float);
-        qwen4exp_qsa_pool_update_kernel<true><<<slots,nth,shared,cuda_decode_stream()>>>(
+        QWEN4EXP_LAUNCH_PDL(
+            (qwen4exp_qsa_pool_update_kernel<true>),
+            slots, nth, shared, cuda_decode_stream(),
             (float*)tape->ptr,(const float*)k_norm_weight->ptr,(const float*)inv_freq->ptr,
             (float*)pool->ptr,0,slots,head_dim,pool_size,rot_dim,cache_cap,eps,
             weight_offset,d_pos_ptr,n_tokens,(const float*)raw_k->ptr,pos0);
         return cuda_ok(cudaGetLastError(),"Qwen4-Exp indexer append/pool launch");
     }
     const uint64_t append = (uint64_t)n_tokens * head_dim;
-    qwen4exp_qsa_tape_append_kernel<<<
-        (unsigned)((append + 255u) / 256u), 256u, 0, cuda_decode_stream()>>>(
-            (const float *)raw_k->ptr, (float *)tape->ptr, n_tokens, head_dim,
-            pos0, cache_cap, d_pos_ptr);
+    QWEN4EXP_LAUNCH_PDL(
+        (qwen4exp_qsa_tape_append_kernel),
+        (unsigned)((append + 255u) / 256u), 256u, 0, cuda_decode_stream(),
+        (const float *)raw_k->ptr, (float *)tape->ptr, n_tokens, head_dim,
+        pos0, cache_cap, d_pos_ptr);
     if (!cuda_ok(cudaGetLastError(), "Qwen4-Exp indexer tape append launch")) {
         return 0;
     }
@@ -15474,11 +15545,13 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_pool_update_dpos_tensor(
          * capture topology fixed. The device position selects the live slots.
          * This covers both a ragged boundary crossing and every prefill block. */
         const uint32_t slots = n_tokens / pool_size + (n_tokens % pool_size != 0u);
-        qwen4exp_qsa_pool_update_kernel<<<slots, nth, shared, cuda_decode_stream()>>>(
-                (float *)tape->ptr, (const float *)k_norm_weight->ptr,
-                (const float *)inv_freq->ptr, (float *)pool->ptr, 0,
-                slots, head_dim, pool_size, rot_dim, cache_cap, eps,
-                weight_offset, d_pos_ptr, n_tokens);
+        QWEN4EXP_LAUNCH_PDL(
+            (qwen4exp_qsa_pool_update_kernel<false>),
+            slots, nth, shared, cuda_decode_stream(),
+            (float*)tape->ptr,(const float*)k_norm_weight->ptr,
+            (const float*)inv_freq->ptr,(float*)pool->ptr,0,
+            slots,head_dim,pool_size,rot_dim,cache_cap,eps,
+            weight_offset,d_pos_ptr,n_tokens);
         if (!cuda_ok(cudaGetLastError(), "Qwen4-Exp indexer pool update launch")) {
             return 0;
         }
@@ -15486,12 +15559,13 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_pool_update_dpos_tensor(
         const uint32_t block0 = pos0 / pool_size;
         const uint32_t block1 = (pos0 + n_tokens) / pool_size;
         if (block1 > block0) {
-            qwen4exp_qsa_pool_update_kernel<<<block1 - block0, nth, shared,
-                cuda_decode_stream()>>>(
-                    (float *)tape->ptr, (const float *)k_norm_weight->ptr,
-                    (const float *)inv_freq->ptr, (float *)pool->ptr, block0,
-                    block1 - block0, head_dim, pool_size, rot_dim, cache_cap, eps,
-                    weight_offset, NULL, n_tokens);
+            QWEN4EXP_LAUNCH_PDL(
+                (qwen4exp_qsa_pool_update_kernel<false>),
+                block1 - block0, nth, shared, cuda_decode_stream(),
+                (float*)tape->ptr,(const float*)k_norm_weight->ptr,
+                (const float*)inv_freq->ptr,(float*)pool->ptr,block0,
+                block1 - block0,head_dim,pool_size,rot_dim,cache_cap,eps,
+                weight_offset,NULL,n_tokens);
             if (!cuda_ok(cudaGetLastError(), "Qwen4-Exp indexer pool update launch")) {
                 return 0;
             }
@@ -15634,11 +15708,13 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_scores_tensor(
         return cuda_ok(cudaGetLastError(), "Qwen4-Exp indexer scores tiled launch");
     }
     const uint32_t nth = qwen4exp_cuda_threads(head_dim);
-    qwen4exp_qsa_indexer_scores_kernel<<<dim3(n_blocks, n_tokens), nth,
-        nth * sizeof(float), cuda_decode_stream()>>>(
-            (const float *)q->ptr, (const float *)pool->ptr,
-            (float *)scores->ptr, n_tokens, n_blocks, n_head, head_dim, pos0,
-            pool_size, sqrtf((float)head_dim));
+    QWEN4EXP_LAUNCH_PDL(
+        (qwen4exp_qsa_indexer_scores_kernel),
+        dim3(n_blocks, n_tokens), nth, nth * sizeof(float),
+        cuda_decode_stream(),
+        (const float *)q->ptr, (const float *)pool->ptr,
+        (float *)scores->ptr, n_tokens, n_blocks, n_head, head_dim, pos0,
+        pool_size, sqrtf((float)head_dim));
     return cuda_ok(cudaGetLastError(), "Qwen4-Exp indexer scores launch");
 }
 
@@ -15666,11 +15742,13 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_select_tensor(
     uint32_t sort_width = 1;
     while (sort_width < top_k) sort_width *= 2;
     const uint32_t nth = qwen4exp_cuda_threads(sort_width);
-    qwen4exp_qsa_indexer_select_kernel<<<n_tokens, nth,
-        (size_t)sort_width * sizeof(int32_t), cuda_decode_stream()>>>(
-            (const float *)scores->ptr, (const int32_t *)topk->ptr,
-            (int32_t *)selected->ptr, (int32_t *)counts->ptr, n_tokens,
-            n_blocks, top_k, sort_width, pos0, pool_size, max_selected);
+    QWEN4EXP_LAUNCH_PDL(
+        (qwen4exp_qsa_indexer_select_kernel),
+        n_tokens, nth, (size_t)sort_width * sizeof(int32_t),
+        cuda_decode_stream(),
+        (const float *)scores->ptr, (const int32_t *)topk->ptr,
+        (int32_t *)selected->ptr, (int32_t *)counts->ptr, n_tokens,
+        n_blocks, top_k, sort_width, pos0, pool_size, max_selected);
     return cuda_ok(cudaGetLastError(), "Qwen4-Exp indexer selection launch");
 }
 
@@ -15762,16 +15840,18 @@ static int qwen4exp_qsa_attention_split(
         return 0;
     }
 #define QWEN4EXP_QSA_SPLIT_LAUNCH(G, V)                                          \
-    qwen4exp_qsa_split_scores_kernel<G><<<grid, nth, sc_shared,               \
-        cuda_decode_stream()>>>(                                              \
-            (const float *)q->ptr, (const float *)k_cache->ptr, sel, cnt,     \
-            sc, tmax, n_tokens, n_head, n_kv_head, head_dim, pos0, cache_cap, \
-            max_selected, sparse ? 1u : 0u, max_tiles, scale, d_pos);         \
-    qwen4exp_qsa_split_probs_kernel<G, V><<<grid, nth, pr_shared,                \
-        cuda_decode_stream()>>>(                                              \
-            (const float *)v_cache->ptr, sel, cnt, sc, tmax, ct, tsum,        \
-            n_tokens, n_head, n_kv_head, head_dim, pos0, cache_cap,           \
-            max_selected, sparse ? 1u : 0u, max_tiles, d_pos)
+    QWEN4EXP_LAUNCH_PDL(                                                         \
+        (qwen4exp_qsa_split_scores_kernel<G>),                                   \
+        grid, nth, sc_shared, cuda_decode_stream(),                              \
+        (const float *)q->ptr, (const float *)k_cache->ptr, sel, cnt,            \
+        sc, tmax, n_tokens, n_head, n_kv_head, head_dim, pos0, cache_cap,        \
+        max_selected, sparse ? 1u : 0u, max_tiles, scale, d_pos);                \
+    QWEN4EXP_LAUNCH_PDL(                                                         \
+        (qwen4exp_qsa_split_probs_kernel<G, V>),                                 \
+        grid, nth, pr_shared, cuda_decode_stream(),                              \
+        (const float *)v_cache->ptr, sel, cnt, sc, tmax, ct, tsum,               \
+        n_tokens, n_head, n_kv_head, head_dim, pos0, cache_cap,                  \
+        max_selected, sparse ? 1u : 0u, max_tiles, d_pos)
     switch (g) {
         case 12u: QWEN4EXP_QSA_SPLIT_LAUNCH(12u, QWEN4EXP_QSA_SPLIT_VSTEP); break;
         case 6u:  QWEN4EXP_QSA_SPLIT_LAUNCH(6u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
@@ -15792,10 +15872,11 @@ static int qwen4exp_qsa_attention_split(
         default:  return 0;
     }
 #undef QWEN4EXP_QSA_SPLIT_LAUNCH
-    qwen4exp_qsa_split_fold_kernel<<<dim3(n_head, n_tokens), head_dim, 0,
-        cuda_decode_stream()>>>(
-            tmax, tsum, ct, cnt, (float *)out->ptr, n_tokens, n_head,
-            head_dim, pos0, sparse ? 1u : 0u, max_tiles, nth, d_pos);
+    QWEN4EXP_LAUNCH_PDL(
+        (qwen4exp_qsa_split_fold_kernel),
+        dim3(n_head, n_tokens), head_dim, 0, cuda_decode_stream(),
+        tmax, tsum, ct, cnt, (float *)out->ptr, n_tokens, n_head,
+        head_dim, pos0, sparse ? 1u : 0u, max_tiles, nth, d_pos);
     return cuda_ok(cudaGetLastError(), "Qwen4-Exp QSA split attention launch")
         ? 1 : -1;
 }
@@ -15994,9 +16075,10 @@ extern "C" int ds4_gpu_qwen4exp_qsa_output_gate_tensor(
         !glm53_cuda_tensor_has(gate, n_values, sizeof(float))) {
         return 0;
     }
-    qwen4exp_qsa_output_gate_kernel<<<
-        (unsigned)((n_values + 255u) / 256u), 256u, 0, cuda_decode_stream()>>>(
-            (const float *)gate->ptr, (float *)out->ptr, n_values);
+    QWEN4EXP_LAUNCH_PDL(
+        (qwen4exp_qsa_output_gate_kernel),
+        (unsigned)((n_values + 255u) / 256u), 256u, 0, cuda_decode_stream(),
+        (const float *)gate->ptr, (float *)out->ptr, n_values);
     return cuda_ok(cudaGetLastError(), "Qwen4-Exp QSA output gate launch");
 }
 
@@ -16024,11 +16106,12 @@ extern "C" int ds4_gpu_qwen4exp_qsa_output_gate_q8_tensor(
         ds4_tensor_device_idx(q8) != ds4_tensor_device_idx(out)) {
         return 0;
     }
-    qwen4exp_qsa_output_gate_quant_kernel<<<
-        (unsigned)(n_values / 256u), 256u, 0, cuda_decode_stream()>>>(
-            (int8_t *)((char *)q8->ptr + q_offset),
-            (float *)((char *)q8->ptr + s_offset),
-            (const float *)gate->ptr, (const float *)out->ptr, n_values);
+    QWEN4EXP_LAUNCH_PDL(
+        (qwen4exp_qsa_output_gate_quant_kernel),
+        (unsigned)(n_values / 256u), 256u, 0, cuda_decode_stream(),
+        (int8_t *)((char *)q8->ptr + q_offset),
+        (float *)((char *)q8->ptr + s_offset),
+        (const float *)gate->ptr, (const float *)out->ptr, n_values);
     return cuda_ok(cudaGetLastError(), "Qwen4-Exp QSA output gate quantize launch");
 }
 
@@ -16058,11 +16141,12 @@ extern "C" int ds4_gpu_qwen4exp_qsa_output_gate_doubled_q8_tensor(
         ds4_tensor_device_idx(q8) != ds4_tensor_device_idx(out)) {
         return 0;
     }
-    qwen4exp_qsa_output_gate_doubled_quant_kernel<<<
-        (unsigned)(n_values / 256u), 256u, 0, cuda_decode_stream()>>>(
-            (int8_t *)((char *)q8->ptr + q_offset),
-            (float *)((char *)q8->ptr + s_offset),
-            (const float *)doubled->ptr, (const float *)out->ptr, n_values);
+    QWEN4EXP_LAUNCH_PDL(
+        (qwen4exp_qsa_output_gate_doubled_quant_kernel),
+        (unsigned)(n_values / 256u), 256u, 0, cuda_decode_stream(),
+        (int8_t *)((char *)q8->ptr + q_offset),
+        (float *)((char *)q8->ptr + s_offset),
+        (const float *)doubled->ptr, (const float *)out->ptr, n_values);
     return cuda_ok(cudaGetLastError(),
                    "Qwen4-Exp QSA output gate (doubled) quantize launch");
 }
