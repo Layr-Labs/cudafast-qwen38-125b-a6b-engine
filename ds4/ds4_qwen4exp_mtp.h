@@ -917,13 +917,6 @@ int ds4_qwen4exp_mtp_head_forward(ds4_qwen4exp_mtp_head *h,
  * `hyper` row (hc_dim floats).  Every row still runs the block and writes its
  * own cache row; what is narrower is the readback and the argmax.  This is the
  * entry the seam's draft_rows binds to. */
-int ds4_qwen4exp_mtp_head_forward_last_device(ds4_qwen4exp_mtp_head *h,
-                                              const int *next_tokens,
-                                              const ds4_gpu_tensor *hyper_device,
-                                              uint32_t first_row,
-                                              uint32_t pos0, uint32_t n_tokens,
-                                              int *draft_out, float *multi_out,
-                                              char *err, size_t errlen);
 int ds4_qwen4exp_mtp_head_forward_last(ds4_qwen4exp_mtp_head *h,
                                        const int *next_tokens,
                                        const float *multi_in,
