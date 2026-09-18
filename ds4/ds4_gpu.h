@@ -4029,6 +4029,28 @@ int  ds4_gpu_decode_graphs_supported(void);
 /* Upload a ready decode-graph exec now, so its next launch does not.
  * Returns 1 when an upload was issued, 0 otherwise (never an error). */
 int  ds4_gpu_decode_graph_prefetch(const ds4_decode_graph_key *key);
+/* One-shot graph capture for the PREFILL layer stack: capture, instantiate,
+ * launch, and destroy inside the window that built it.  No key and no cache --
+ * a prefill layer runs exactly once, and a graph outliving its prefill would
+ * let a timed prefill inherit work built in an untimed one, which is the
+ * deferred-seed-work defect participant-contract 5.1.1 names.  begin() returns
+ * 0 when capturing and -1 when it declines, in which case the caller encodes
+ * eagerly exactly as before.  end() is ASYNCHRONOUS: it launches and returns
+ * so the host captures the next layer while this one runs on the device.
+ * retire() synchronizes first and is safe to call anywhere. */
+int      ds4_gpu_oneshot_graph_begin(void);
+/* retire_settled() destroys WITHOUT synchronizing and is valid only where the
+ * caller guarantees completion -- one full device sync later than the forward
+ * that built the graphs.  report() prints and resets the capture statistics.
+ * The two ends of the lifecycle are paid at different points, so they are
+ * reported at different points. */
+void     ds4_gpu_oneshot_graph_retire_settled(void);
+void     ds4_gpu_oneshot_graph_report(void);
+int      ds4_gpu_oneshot_graph_end(void);
+void     ds4_gpu_oneshot_graph_abort(void);
+void     ds4_gpu_oneshot_graph_retire(void);
+uint64_t ds4_gpu_oneshot_graph_captures(void);
+
 int  ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key);
 /* 0: capture committed and launched; -1: capture failed (entry retired;
  * the caller must re-encode the island eagerly -- no work was executed). */
