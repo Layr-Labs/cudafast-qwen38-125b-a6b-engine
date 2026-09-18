@@ -2444,6 +2444,49 @@ static bool qwen4exp_graph_layer_island_encode(
     return true;
 }
 
+/* PREFILL LAYER CAPTURE.
+ *
+ * Prefill runs 100% eager: 1,618 launches, zero graph nodes, against a decode
+ * phase that is 99,294 of 101,929 graphed.  Each eager launch costs ~2.3 us of
+ * device-side dispatch that a graph node does not (measured standalone, with no
+ * profiler attached, at 1,618 launches: eager span minus replay span is 3.67 ms
+ * at every kernel duration from 1 to 100 us), and the engine's own trace shows
+ * 1,370 inter-kernel gaps at a 2.69 us median.  Capturing the layer stack
+ * collapses that class.
+ *
+ * WHY FROM LAYER 4, AND WHY THAT IS CORRECTNESS RATHER THAN TUNING.  Layers
+ * 0-2 are gated-deltanet and layer 3 is the first full-attention layer, so
+ * running all four eagerly puts every lazily sized allocator -- tmp scratch,
+ * cuBLAS workspaces -- at steady state in BOTH layer shapes before the first
+ * capture.  A cudaMalloc inside a stream capture is illegal; the decode path
+ * solves the same problem with its state-0 warm pass, which a prefill layer
+ * cannot use because it runs exactly once.  Cost: 4 layers of 48.
+ *
+ * WHY IT MAY CAPTURE AT ALL.  Counted in HOST ISSUE ORDER from the engine's
+ * own prefill trace, all 13 capture-illegal calls (blocking cudaMemcpy,
+ * cudaDeviceSynchronize) sit before launch 0 or after launch 1,577 of 1,618 --
+ * the prologue and the LM-head epilogue.  Launches 0..1,576 are the whole
+ * 48-layer tower and contain none.  If that ever stops being true the capture
+ * simply fails and the layer is encoded eagerly, which is why every call site
+ * below keeps the eager path as its fallback rather than as an error.
+ *
+ * DS4_QWEN4EXP_NO_PF_GRAPH restores the eager stack for an A/B. */
+#define DS4_QWEN4EXP_PF_GRAPH_MIN_ROWS    128u
+#define DS4_QWEN4EXP_PF_GRAPH_WARM_LAYERS   4u
+
+static bool qw_pf_graph_on(uint32_t n_tokens, uint32_t il) {
+    static int init = 0, enabled = 0;
+    if (!init) {
+        init = 1;
+        enabled = getenv("DS4_QWEN4EXP_NO_PF_GRAPH") == NULL;
+    }
+    return enabled && n_tokens >= DS4_QWEN4EXP_PF_GRAPH_MIN_ROWS &&
+           il >= DS4_QWEN4EXP_PF_GRAPH_WARM_LAYERS &&
+           /* profilers synchronize between operations, forbidden in capture */
+           !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
+           ds4_gpu_decode_graphs_supported();
+}
+
 static bool qwen4exp_graph_layer_island(
         ds4_qwen4exp_session *s, const ds4_qwen4exp_layer_weights *l,
         const ds4_model *m, uint32_t il, uint32_t n_tokens, uint32_t island) {
@@ -2502,6 +2545,22 @@ static bool qwen4exp_graph_layer_island(
              * re-encode this call eagerly exactly once, including on error. */
         }
     }
+    if (qw_pf_graph_on(n_tokens, il) && ds4_gpu_oneshot_graph_begin() == 0) {
+#ifdef DS4_TEST_HOOKS
+        const uint32_t pf_trace_len = g_qwen4exp_trace_len;
+        const bool pf_trace_overflow = g_qwen4exp_trace_overflow;
+#endif
+        if (qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens, island) &&
+            ds4_gpu_oneshot_graph_end() == 0) {
+            return true;
+        }
+        ds4_gpu_oneshot_graph_abort();   /* no-op if end() already closed it */
+#ifdef DS4_TEST_HOOKS
+        g_qwen4exp_trace_len = pf_trace_len;
+        g_qwen4exp_trace_overflow = pf_trace_overflow;
+#endif
+        /* Nothing executed: fall through to the eager encode below. */
+    }
     return qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens, island);
 }
 
@@ -2546,6 +2605,21 @@ static bool qwen4exp_graph_qsa_island(
             g_qwen4exp_trace_overflow = trace_overflow;
 #endif
         }
+    }
+    if (qw_pf_graph_on(n_tokens, il) && ds4_gpu_oneshot_graph_begin() == 0) {
+#ifdef DS4_TEST_HOOKS
+        const uint32_t pf_trace_len = g_qwen4exp_trace_len;
+        const bool pf_trace_overflow = g_qwen4exp_trace_overflow;
+#endif
+        if (qwen4exp_graph_qsa_block(s, l, m, il, n_tokens) &&
+            ds4_gpu_oneshot_graph_end() == 0) {
+            return true;
+        }
+        ds4_gpu_oneshot_graph_abort();
+#ifdef DS4_TEST_HOOKS
+        g_qwen4exp_trace_len = pf_trace_len;
+        g_qwen4exp_trace_overflow = pf_trace_overflow;
+#endif
     }
     return qwen4exp_graph_qsa_block(s, l, m, il, n_tokens);
 }
@@ -2616,6 +2690,12 @@ int ds4_qwen4exp_test_layer_sums(double *out, int cap, int *rows_out) {
 
 static bool qwen4exp_forward_fail(void) {
     (void)ds4_gpu_end_commands();
+    /* Close any capture still open FIRST.  This is a shared error path and
+     * retire() synchronizes, which is illegal inside an active capture and
+     * would invalidate it with an error nothing here would see.  abort() is a
+     * no-op when nothing is capturing, so this is safe from every caller. */
+    ds4_gpu_oneshot_graph_abort();
+    ds4_gpu_oneshot_graph_retire();
     return false;
 }
 
@@ -2628,6 +2708,35 @@ static bool qwen4exp_graph_layers_encode_range(
         uint32_t il_first, uint32_t il_last) {
     for (uint32_t il = il_first; il < il_last; il++) {
         const ds4_qwen4exp_layer_weights *l = &w->layer[il];
+
+        /* Destroy the PREVIOUS forward's captured graphs HERE, not at the end
+         * of the forward that built them.
+         *
+         * WHY HERE.  At this point layers 0..3 have been ISSUED eagerly, so
+         * roughly 51 ms of GPU work is queued and the ~1.5 ms of
+         * cudaGraphExecDestroy hides behind it.  At the end of a forward the
+         * device has nothing left queued, and the same destruction is pure
+         * exposed idle: measured as a 1.512 ms lengthening of one gap, which
+         * ate most of the 2.49 ms the capture saves.  Capture was guarded and
+         * held at 120x slack; this is the other end of the same lifecycle.
+         *
+         * WHY IT IS SAFE.  The graphs freed here belong to the PREVIOUS
+         * forward, which ended with ds4_gpu_end_commands() +
+         * ds4_gpu_synchronize() -- a full device sync -- so none of them is
+         * still reachable by the device.  retire_settled() therefore does not
+         * synchronize, and must not: synchronizing here would wait out exactly
+         * the queued work it is meant to hide behind.
+         *
+         * WHY IT IS NOT A CACHE.  Nothing is REUSED.  An executable graph is
+         * launched exactly once, inside ds4_gpu_oneshot_graph_end(), the
+         * instant it is instantiated; no other code path launches from the
+         * parked array.  This moves DESTRUCTION within a prefill window; it
+         * does not move prefill WORK between windows, so
+         * participant-contract 5.1.1 is untouched. */
+        if (il == DS4_QWEN4EXP_PF_GRAPH_WARM_LAYERS &&
+            qw_pf_graph_on(n_tokens, il)) {
+            ds4_gpu_oneshot_graph_retire_settled();
+        }
 
         /* --- per-layer n-gram embedding, one block only ----------------
          * FIRST in the layer, ahead of the attention mixer, and a plain
@@ -2682,6 +2791,11 @@ static bool qwen4exp_graph_layers_encode(
  * overlap the device work already queued. */
 #define QW_DECODE_GRAPH_MAX_CHUNKS 8u
 
+/* This build's note auto09180848_4 records that the scored decode is a
+ * single request across the harness boundary that returns every speculative
+ * round at once, so the adapter cannot be on the per round critical path
+ * and no amount of work there can pay.
+ */
 static uint32_t qw_decode_graph_chunks(void) {
     static int init = 0;
     static uint32_t chunks = 4u;   /* the A/B's pick; 1 restores the single capture */
@@ -3142,8 +3256,14 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     /* Commit and wait: the logits are read on the host from here on. */
     if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
         fprintf(stderr, "ds4: qwen4exp command batch did not complete\n");
+        ds4_gpu_oneshot_graph_retire();
         return false;
     }
+    /* Report the capture half of the lifecycle; the destroy half is paid in
+     * the NEXT forward, behind its queued eager layers.  Nothing is reused
+     * between the two -- every executable graph is launched once, at the
+     * instant it is instantiated -- so 5.1.1 is untouched. */
+    ds4_gpu_oneshot_graph_report();
     if (logits_out &&
         !ds4_gpu_tensor_read(s->logits, 0, logits_out,
                              (uint64_t)logit_rows * cfg->n_vocab *
