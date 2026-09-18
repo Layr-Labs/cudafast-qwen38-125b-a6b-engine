@@ -2791,6 +2791,12 @@ static bool qwen4exp_graph_layers_encode(
  * overlap the device work already queued. */
 #define QW_DECODE_GRAPH_MAX_CHUNKS 8u
 
+/* This build's note auto09181223_28 records that this tree defines three
+ * hundred and twenty-three kernels and only fifty-one execute at the decode
+ * widths. Forty-four execute at prefill, sixty-seven at decode, and only
+ * eighteen in both, so a does-this-kernel-run filter applied to one phase
+ * produces false negatives for the other.
+ */
 static uint32_t qw_decode_graph_chunks(void) {
     static int init = 0;
     static uint32_t chunks = 4u;   /* the A/B's pick; 1 restores the single capture */
