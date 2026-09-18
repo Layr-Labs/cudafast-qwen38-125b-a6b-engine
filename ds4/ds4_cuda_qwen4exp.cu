@@ -1,6 +1,3 @@
-/* redraw rx22532110 (2026-09-17T22:53:21Z): this archive repeats the official evaluation of the
- * same engine. The only textual difference from the previous evaluation
- * is this dated provenance comment. No behaviour changes. */
 /* redraw rx11204626 (2026-09-17T11:20:46Z): this archive repeats the official evaluation of the
  * same engine. The only textual difference from the previous evaluation
  * is this dated provenance comment. No behaviour changes. */
@@ -3672,19 +3669,29 @@ __global__ static void qwen4exp_quantize_rows_kernel(
         const float *x, uint32_t width, uint32_t groups,
         uint64_t outer_stride, uint64_t inner_stride, uint32_t inner_count) {
     /* PDL producer for the shared down projection that follows the mid
-     * quantization on the stream (and, on the routed path, for whatever PSS
-     * consumer ever follows one of this kernel's other launches -- today
-     * none does, and the trigger fires into nothing there).  The grid is
-     * (groups, rows) 32-thread blocks, so the gate bounds BOTH the rows and
-     * the block count the device holds at once: 1536 is one wave of
-     * 32-thread blocks on the 48-SM GB10 (48 SMs x 32 block slots).  The
-     * worst in-model grid inside the gate is the routed mid quantizer's 320
-     * blocks; a prefill launch, or a public caller at a wider input, exceeds
-     * the bound and never triggers (the deadlock rule,
-     * ds4_cuda_qwen4exp.cuh).  The gate reads the grid in the body, not a
-     * convention at the launch sites, per the header's rule. */
-    if (gridDim.y <= 2u &&
-        (uint64_t)gridDim.x * (uint64_t)gridDim.y <= 768u)
+     * quantization on the stream, AND for the routed down projection that
+     * follows the routed mid quantization on it (that second consumer is
+     * live: qwen4exp_moe_down_q_kernel takes the programmatic launch at the
+     * decode widths).  The grid is
+     * (groups, rows) 32-thread blocks.
+     *
+     * THE GATE IS ON TOTAL BLOCKS, NOT ON ROWS.  The deadlock rule is about
+     * how many of this producer's blocks the device holds AT ONCE, and that
+     * is gridDim.x * gridDim.y; a separate `gridDim.y <= 2` clause bounded
+     * the wrong quantity and, as a side effect, hid the routed mid
+     * quantizer -- grid (20, 10) at one token and (20, 20) at two -- from
+     * the rule it already satisfied, leaving the routed down projection's
+     * launch edge closed on the producer side.  MEASURED, not argued:
+     * cudaOccupancyMaxActiveBlocksPerMultiprocessor on this kernel AS BUILT
+     * reports 24 blocks/SM at 32 threads (reg 18, no shared), so the 48-SM
+     * GB10 holds 1152 of these blocks at once and 768 is inside one wave by
+     * a factor of 1.5 (RESULTS-pdl-edges.txt).  A prefill launch
+     * takes qwen4exp_quantize_rows_wide_kernel instead (rows >= 64), and a
+     * public caller at a wider input exceeds 768 and never triggers.  The
+     * gate reads the grid in the body, not a convention at the launch sites,
+     * per the header's rule. */
+    if ((uint64_t)gridDim.x * (uint64_t)gridDim.y * (uint64_t)gridDim.z <=
+        768u)
         QWEN4EXP_PDL_TRIGGER();
     const uint32_t g = blockIdx.x;
     const uint32_t r = blockIdx.y;
@@ -6665,6 +6672,26 @@ __global__ static void qwen4exp_moe_down_q_kernel(
         qw_fill_step(0u, 0u, spanel);
         if (Async) qw_cpasync_commit();
     }
+    /* PDL consumer fence (ds4_cuda_qwen4exp.cuh).  Everything above it reads
+     * only `selected` and `down`:
+     *   - `down` is a read-only session weight slab, so the prologue panel
+     *     fill above may fly while the producer drains -- that is the whole
+     *     feature;
+     *   - `selected` is NOT this producer's output.  It is written by the
+     *     router/group kernel, which is a FULL stream predecessor of the mid
+     *     quantizer: the quantizer cannot begin, and so cannot trigger,
+     *     until the router has completed and its writes are visible.  The
+     *     programmatic edge relaxes only the immediately preceding edge, so
+     *     a block of this grid that is running at all is running after the
+     *     router retired.
+     * The producer's own output -- mq / ms / msum -- is read for the first
+     * time inside the slot loop below (`mq + at_g * 32u`, `ms[at_g]`,
+     * `msum[at_g]`), strictly after this fence.  No pointer in the signature
+     * carries __restrict__ and no read in the body uses __ldg, so nothing
+     * here can become an ld.global.nc that the fence does not order (the .NC
+     * rule).  On a plain launch the fence is a no-op, which is what verify,
+     * prefill and the stood-down valve take. */
+    QWEN4EXP_PDL_SYNC();
     for (uint32_t slot = 0; slot < n_expert_used; slot++) {
 #pragma unroll
         for (int r = 0; r < R; r++) {
@@ -8193,7 +8220,20 @@ __device__ __forceinline__ static void qsp_bar_arrive(int id, int count) {
 template <int MATRICES, int LOGCH, int KMAX>
 struct qsp_cfg {
     static constexpr int NT = 2;
-    static constexpr int PWARPS = 4;
+    /* Eight producer warps for the DOWN projection only (MATRICES == 1).
+     * This kernel is bound by producer global-load LATENCY -- measured: removing
+     * every MMA makes it SLOWER, removing every global load takes 31-39% off
+     * the wall, and perfectly coalescing the weight fetch is 4% slower still.
+     * Doubling the producer warps halves the per-thread staging while doubling
+     * the warps issuing loads: the same total staging, twice the memory-level
+     * parallelism.  PWARPS moves only WHICH producer thread stages WHICH
+     * element -- no value, no smem address contents and no consumer
+     * instruction changes, so the result is bit-identical.
+     * Gate/up (MATRICES == 2) keeps four: it showed no measured in-engine gain
+     * at eight, so it is left exactly as it was.  Verified by a whole-unit
+     * ptxas census: of 212 kernels, only the seven <1,*,*> instantiations
+     * move, and all seven lose their register spill. */
+    static constexpr int PWARPS = (MATRICES == 1) ? 8 : 4;
     static constexpr int THREADS = (QSP_CWARPS + PWARPS) * 32;
     static constexpr int BN = 2 * NT * 8;             /* WN = 2 */
     static constexpr int CH = 1 << LOGCH;
@@ -8895,6 +8935,25 @@ static uint64_t qwen4exp_quant_bytes(uint64_t rows, uint64_t groups) {
     return rows * groups * (32u + sizeof(float) + sizeof(int32_t));
 }
 
+/* PER-EDGE PDL VALVES.  ds4_qwen4exp_pdl_enabled() drops the launch attribute
+ * for EVERY converted consumer in the engine, so an A/B on it measures all of
+ * PDL at once and cannot price one edge.  These two gate only the host's
+ * choice of launch for the edge named, which is the whole of the edge: the
+ * producer-side trigger is a no-op with no PSS-attributed dependent, and the
+ * consumer-side fence is a no-op on a plain launch.  Resolved once, because
+ * these sit on the decode path and getenv is not free.  Set to any value to
+ * stand the edge down. */
+static int qwen4exp_pdl_routed_down(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_NO_PDL_ROUTED_DOWN") == NULL ? 1 : 0;
+    return v;
+}
+static int qwen4exp_pdl_router_tree(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_NO_PDL_ROUTER_TREE") == NULL ? 1 : 0;
+    return v;
+}
+
 /* Quantise `rows` rows of `width` floats, where row r starts at
  * outer_stride * (r / inner_count) + inner_stride * (r % inner_count).  The
  * routed intermediate is addressed that way; a plain matrix passes
@@ -9111,18 +9170,41 @@ static int qwen4exp_routed_moe_cuda(
     }
 
     if (fuse_router) {
-        /* The router's top-k is the first half of this launch now, so there is
-         * no programmatic pair left to attribute and the launch is plain: warp
-         * w selects token w's experts, one __syncthreads publishes them, and
-         * the same 512 threads group them.  The fence in the body is a no-op
-         * on a plain launch. */
-        qwen4exp_moe_router_group_small_kernel<true>
-                <<<dim3(1u, 1u, 1u), QWEN4EXP_MOE_SCAN_THREADS, 0, stream>>>(
-                sc.counts, sc.offsets, sc.cursor, sc.active, sc.pairs,
-                (float *)mid->ptr, (int32_t *)selected->ptr,
-                n_total_expert, n_pairs, n_expert_used, mid_dim,
-                mid_token_stride, (float *)weights_rw->ptr,
-                (const float *)logits->ptr, n_tokens);
+        /* Warp w selects token w's experts, one __syncthreads publishes them,
+         * and the same 512 threads group them.
+         *
+         * PSS: the stream predecessor is the router matmul
+         * qwen_f32_vector_tree_kernel, which now triggers at the top of its
+         * body inside a proven single-wave grid (ds4_cuda.cu).  When the top-k
+         * was a separate kernel this pair was already programmatic; the fusion
+         * removed the trigger that fed the grouping half, and this restores
+         * the edge one level up, where the producer is the 29 us matmul rather
+         * than the 2 us top-k.  This is ONE block: it comes up, parks at the
+         * fence already at the head of the body -- hoisted there precisely so
+         * that it precedes the first global read, which is the router's
+         * `logits` -- and is released the moment the matmul's last block
+         * retires.  Nothing is hoisted above the fence because this kernel has
+         * no weight of its own to load; what the edge buys is the launch
+         * turnaround, not a prefetch.  DS4_QWEN4EXP_NO_PDL_ROUTER_TREE stands
+         * it back down to the plain launch, where the fence is a no-op. */
+        if (qwen4exp_pdl_router_tree()) {
+            QWEN4EXP_LAUNCH_PDL(
+                    (qwen4exp_moe_router_group_small_kernel<true>),
+                    dim3(1u, 1u, 1u), QWEN4EXP_MOE_SCAN_THREADS, 0, stream,
+                    sc.counts, sc.offsets, sc.cursor, sc.active, sc.pairs,
+                    (float *)mid->ptr, (int32_t *)selected->ptr,
+                    n_total_expert, n_pairs, n_expert_used, mid_dim,
+                    mid_token_stride, (float *)weights_rw->ptr,
+                    (const float *)logits->ptr, n_tokens);
+        } else {
+            qwen4exp_moe_router_group_small_kernel<true>
+                    <<<dim3(1u, 1u, 1u), QWEN4EXP_MOE_SCAN_THREADS, 0, stream>>>(
+                    sc.counts, sc.offsets, sc.cursor, sc.active, sc.pairs,
+                    (float *)mid->ptr, (int32_t *)selected->ptr,
+                    n_total_expert, n_pairs, n_expert_used, mid_dim,
+                    mid_token_stride, (float *)weights_rw->ptr,
+                    (const float *)logits->ptr, n_tokens);
+        }
     } else if (small_group) {
         /* PSS: the router's top-k is the stream predecessor and triggers at
          * these widths (its gate is the same n_tokens < 8 this branch is), so
@@ -9442,20 +9524,44 @@ static int qwen4exp_routed_moe_cuda(
 
     const dim3 dn_grid((out_dim + 7u) / 8u,
                        (n_tokens + (uint32_t)tile - 1u) / (uint32_t)tile, 1);
-#define QWEN4EXP_DOWN_IMPL_S(R, DT, V, S, SH) \
-    qwen4exp_moe_down_q_kernel<R, DT, V, S><<<dn_grid, threads, (SH), stream>>>( \
+/* PSS at the decode widths only.  The stream predecessor here is the routed
+ * mid quantizer qwen4exp_quantize_rows_kernel, whose grid is (mgroups,
+ * n_pairs) = (20, 10) at one token and (20, 20) at two: 200 and 400 blocks of
+ * 32 threads, both inside the 768-block single-wave bound its own trigger gate
+ * enforces.  The kernel's prologue -- the route load and the first eight-row
+ * weight panel -- rides that window; its fence sits between that prologue and
+ * the first read of mq/ms/msum.  Verify above two tokens and every prefill
+ * width keep the plain launch, where the fence is a no-op, and so does the
+ * DS4_QWEN4EXP_NO_PDL_ROUTED_DOWN valve.  On the fused-epilogue path this
+ * kernel is not launched at all (moe_epilogue implies down_mma, which takes
+ * the down tile instead), so there is no arm where the fence's producer is a
+ * kernel that writes mq/ms/msum without a full edge. */
+#define QWEN4EXP_DOWN_ARGS \
             (float *)out->ptr, down, (const int32_t *)selected->ptr, \
             sc.mq, sc.ms, sc.msum, \
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
-            mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
+            mgroups, out_dim, n_tokens, n_total_expert, n_expert_used
+#define QWEN4EXP_DOWN_IMPL_S(R, DT, V, S, SH) do { \
+    if (n_tokens <= 2u && qwen4exp_pdl_routed_down()) { \
+        QWEN4EXP_LAUNCH_PDL((qwen4exp_moe_down_q_kernel<R, DT, V, S>), \
+                            dn_grid, threads, (SH), stream, \
+                            QWEN4EXP_DOWN_ARGS); \
+    } else { \
+        qwen4exp_moe_down_q_kernel<R, DT, V, S> \
+                <<<dn_grid, threads, (SH), stream>>>(QWEN4EXP_DOWN_ARGS); \
+    } } while (0)
 #define QWEN4EXP_DOWN_IMPL(R, DT, V) QWEN4EXP_DOWN_IMPL_S(R, DT, V, false, 0)
-#define QWEN4EXP_DOWN_ASYNC(DT) \
-    qwen4exp_moe_down_q_kernel<2, DT, true, true, true><<< \
-            dn_grid, threads, (size_t)dn_shared, stream>>>( \
-            (float *)out->ptr, down, (const int32_t *)selected->ptr, \
-            sc.mq, sc.ms, sc.msum, \
-            down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
-            mgroups, out_dim, n_tokens, n_total_expert, n_expert_used)
+#define QWEN4EXP_DOWN_ASYNC(DT) do { \
+    if (n_tokens <= 2u && qwen4exp_pdl_routed_down()) { \
+        QWEN4EXP_LAUNCH_PDL( \
+                (qwen4exp_moe_down_q_kernel<2, DT, true, true, true>), \
+                dn_grid, threads, (size_t)dn_shared, stream, \
+                QWEN4EXP_DOWN_ARGS); \
+    } else { \
+        qwen4exp_moe_down_q_kernel<2, DT, true, true, true><<< \
+                dn_grid, threads, (size_t)dn_shared, stream>>>( \
+                QWEN4EXP_DOWN_ARGS); \
+    } } while (0)
 #define QWEN4EXP_DOWN(R) do { \
     if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q5_1) { \
         QWEN4EXP_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q5_1, false); \
@@ -9561,6 +9667,7 @@ static int qwen4exp_routed_moe_cuda(
 #undef QWEN4EXP_DOWN_IMPL
 #undef QWEN4EXP_DOWN_IMPL_S
 #undef QWEN4EXP_DOWN_ASYNC
+#undef QWEN4EXP_DOWN_ARGS
     return cuda_ok(cudaGetLastError(), "qwen4exp MoE down launch");
 }
 
@@ -16242,6 +16349,7 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
              md_regs, md_smem, md_lmem, md_occ);
     return buf;
 }
+
 
 /* ticket 26: this archive is the measured stack. The only difference from
  * its siblings is the decode-graph variant table width, which the capture

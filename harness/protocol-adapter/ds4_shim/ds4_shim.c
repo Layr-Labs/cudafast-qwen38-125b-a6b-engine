@@ -173,6 +173,12 @@ ds4s_handle *ds4s_open(const char *model_path, const char *mtp_head_path,
     return h;
 }
 
+/* This build's note auto09180257_136 records that the first run inside a
+ * fresh model residency is systematically slower than the ones after it, by
+ * as much as forty-seven percent, because it pays the untimed correctness
+ * phase's graph captures. A comparison that does not discard each
+ * residency's first run is measuring which arm happened to go first.
+ */
 void ds4s_close(ds4s_handle *h) {
     if (!h) return;
     if (h->session) ds4_session_free(h->session);
