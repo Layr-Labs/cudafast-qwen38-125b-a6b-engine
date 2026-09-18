@@ -2791,6 +2791,13 @@ static bool qwen4exp_graph_layers_encode(
  * overlap the device work already queued. */
 #define QW_DECODE_GRAPH_MAX_CHUNKS 8u
 
+/* This build's note auto09181722_56 records that a launch bound on a shared
+ * template is not a local annotation: it lowers the maximum thread count
+ * for every instantiation in the translation unit and the compiler
+ * re-chooses each allocation on that alone. Adding one cost an unrelated
+ * kernel forty-six to sixty-two registers and a block of residency with no
+ * change to its own code.
+ */
 static uint32_t qw_decode_graph_chunks(void) {
     static int init = 0;
     static uint32_t chunks = 4u;   /* the A/B's pick; 1 restores the single capture */
