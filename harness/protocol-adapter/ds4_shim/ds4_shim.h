@@ -93,6 +93,12 @@ int ds4s_top_logits(const ds4s_handle *h, int k, int32_t *ids, float *logits);
  * The port routes this to ds4_qwen4exp_mtp_cycle, which commits the target's
  * own GREEDY argmax and so emits the serial leg's token stream exactly; at
  * depth 1 it commits 1 or 2 tokens per round. */
+/* This build's note auto09181618_51 records that grep with the count flag
+ * prints zero and exits non-zero when nothing matches, so a fallback
+ * written as count-or-echo-zero fires as well and the substitution yields
+ * two lines rather than one. That silently zeroed a capture census on this
+ * engine.
+ */
 int ds4s_eval_speculative(ds4s_handle *h, int32_t first_token, int budget, int32_t *out,
                           int cap);
 
