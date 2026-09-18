@@ -121,6 +121,31 @@ static int g_cuda_decode_score8;
 static int g_cuda_no_decode_value512;
 static int g_cuda_no_top1;
 static int g_cuda_end_stream_sync;
+
+/* Pinned staging for the per-round device-to-host readbacks (see
+ * ds4_gpu_d2h_stage_begin below). */
+static void          *g_d2h_stage = NULL;
+static uint64_t       g_d2h_stage_bytes = 0;
+static uint64_t       g_d2h_pending = 0;
+static cudaStream_t   g_d2h_stream = NULL;
+static cudaEvent_t    g_d2h_ev = NULL;
+/* Pinned staging for small host-to-device writes.  The decode round issues
+ * a handful of tensor writes per step -- token ids, the PLE row block, the
+ * head's stream rows -- and each one was a pageable synchronous cudaMemcpy:
+ * the driver staged the source through its own bounce buffer and the host
+ * blocked until the copy retired.  A small ring of pinned slots turns the
+ * same write into a host memcpy plus a cudaMemcpyAsync on the legacy
+ * stream, which keeps the exact ordering the synchronous copy had (the
+ * legacy stream synchronises with every blocking stream) while the host
+ * walks on to the next launch.  A slot carries an event so a reuse waits
+ * for its previous copy to be done before the host overwrites it. */
+#define DS4_H2D_STAGE_SLOTS 4
+#define DS4_H2D_STAGE_MAX   (4ull * 1024ull * 1024ull)
+static void        *g_h2d_stage[DS4_H2D_STAGE_SLOTS];
+static uint64_t     g_h2d_stage_bytes[DS4_H2D_STAGE_SLOTS];
+static cudaEvent_t  g_h2d_ev[DS4_H2D_STAGE_SLOTS];
+static int          g_h2d_slot = 0;
+
 static int g_cuda_no_setdevice_cache;
 static int g_cuda_exact_score_split_graph;
 static int g_cuda_exact_score_split_ldg;
@@ -3194,6 +3219,32 @@ extern "C" void ds4_gpu_cleanup(void) {
             }
         }
     }
+    if (g_d2h_stage) {
+        (void)cudaFreeHost(g_d2h_stage);
+        g_d2h_stage = NULL;
+        g_d2h_stage_bytes = 0;
+    }
+    g_d2h_pending = 0;
+    if (g_d2h_stream) {
+        (void)cudaStreamDestroy(g_d2h_stream);
+        g_d2h_stream = NULL;
+    }
+    if (g_d2h_ev) {
+        (void)cudaEventDestroy(g_d2h_ev);
+        g_d2h_ev = NULL;
+    }
+    for (int i = 0; i < DS4_H2D_STAGE_SLOTS; i++) {
+        if (g_h2d_stage[i]) {
+            (void)cudaFreeHost(g_h2d_stage[i]);
+            g_h2d_stage[i] = NULL;
+            g_h2d_stage_bytes[i] = 0;
+        }
+        if (g_h2d_ev[i]) {
+            (void)cudaEventDestroy(g_h2d_ev[i]);
+            g_h2d_ev[i] = NULL;
+        }
+    }
+    g_h2d_slot = 0;
     cuda_stream_selected_cache_release();
     cuda_stream_selected_stage_release();
     g_n_gpus = 0;
@@ -3489,15 +3540,57 @@ extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint
     }
     return ok;
 }
+/* Stage `bytes` of `data` through a pinned slot and queue the device copy
+ * asynchronously.  Returns 1 when the write was queued, 0 when the caller
+ * should take the synchronous path -- a capture in flight (the async copy
+ * would become a graph node reading a slot that later holds different
+ * bytes), an oversized write, or any allocation failure. */
+static int h2d_stage_write(ds4_gpu_tensor *tensor, uint64_t offset,
+                           const void *data, uint64_t bytes) {
+    if (g_decode_graph_capturing || bytes == 0 ||
+        bytes > DS4_H2D_STAGE_MAX) {
+        return 0;
+    }
+    const int slot = g_h2d_slot;
+    g_h2d_slot = (g_h2d_slot + 1) % DS4_H2D_STAGE_SLOTS;
+    if (g_h2d_stage_bytes[slot] < bytes) {
+        if (g_h2d_stage[slot]) (void)cudaFreeHost(g_h2d_stage[slot]);
+        g_h2d_stage[slot] = NULL;
+        g_h2d_stage_bytes[slot] = 0;
+        if (!cuda_ok(cudaMallocHost(&g_h2d_stage[slot], (size_t)bytes),
+                     "h2d stage alloc")) return 0;
+        g_h2d_stage_bytes[slot] = bytes;
+    }
+    if (!g_h2d_ev[slot] &&
+        !cuda_ok(cudaEventCreateWithFlags(&g_h2d_ev[slot],
+                                          cudaEventDisableTiming),
+                 "h2d stage event")) return 0;
+    /* The slot's previous copy must be done before the host overwrites it.
+     * In steady state the event is already set and this is a query. */
+    if (!cuda_ok(cudaEventSynchronize(g_h2d_ev[slot]), "h2d stage reuse"))
+        return 0;
+    memcpy(g_h2d_stage[slot], data, (size_t)bytes);
+    if (!cuda_ok(cudaMemcpyAsync((char *)tensor->ptr + offset,
+                                 g_h2d_stage[slot], (size_t)bytes,
+                                 cudaMemcpyHostToDevice, (cudaStream_t)0),
+                 "h2d stage copy")) return 0;
+    if (!cuda_ok(cudaEventRecord(g_h2d_ev[slot], (cudaStream_t)0),
+                 "h2d stage record")) return 0;
+    return 1;
+}
 
 extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     int d = ds4_tensor_device_idx(tensor);
     int ok = 0;
     WITH_DEVICE(g_gpu[d].device_id) {
-        ok = cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, data, (size_t)bytes,
-                                cudaMemcpyHostToDevice),
-                     "tensor write");
+        if (!h2d_stage_write(tensor, offset, data, bytes)) {
+            ok = cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, data, (size_t)bytes,
+                                    cudaMemcpyHostToDevice),
+                         "tensor write");
+        } else {
+            ok = 1;
+        }
     }
     return ok;
 }
@@ -3512,6 +3605,75 @@ extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset
                      "tensor read");
     }
     return ok;
+}
+
+/* Pinned staging for the per-round device-to-host readbacks.  The compact
+ * verify reads the pre-final-mixer hyper rows (about 1.5 MB) and the frontier
+ * logit row (about 1 MB) every speculative round; a pageable synchronous
+ * cudaMemcpy pays the staging copy inside the driver and cannot start until
+ * the whole device drains.  _begin instead queues the copy on a dedicated
+ * stream ordered by an event recorded on the compute stream, so the transfer
+ * runs while the LM head and top-1 kernels still execute, and lands in pinned
+ * memory at full link rate.  ds4_gpu_d2h_stage waits on the copy event and
+ * hands the stage to the caller. */
+static int d2h_stage_queue(const ds4_gpu_tensor *tensor,
+                           uint64_t offset, uint64_t bytes) {
+    /* A capture in flight owns the compute stream; an event recorded into it
+     * would become a graph node and the cross-stream wait would be refused.
+     * Decline and let the caller take the synchronous read. */
+    if (g_decode_graph_capturing) return 0;
+    if (g_d2h_stage_bytes < bytes) {
+        if (g_d2h_stage) (void)cudaFreeHost(g_d2h_stage);
+        g_d2h_stage = NULL;
+        g_d2h_stage_bytes = 0;
+        if (!cuda_ok(cudaMallocHost(&g_d2h_stage, (size_t)bytes),
+                     "d2h stage alloc")) return 0;
+        g_d2h_stage_bytes = bytes;
+    }
+    if (!g_d2h_stream &&
+        !cuda_ok(cudaStreamCreateWithFlags(&g_d2h_stream,
+                                           cudaStreamNonBlocking),
+                 "d2h stage stream")) return 0;
+    if (!g_d2h_ev &&
+        !cuda_ok(cudaEventCreateWithFlags(&g_d2h_ev,
+                                          cudaEventDisableTiming),
+                 "d2h stage event")) return 0;
+    const cudaStream_t compute = cuda_decode_stream();
+    if (!cuda_ok(cudaEventRecord(g_d2h_ev, compute),
+                 "d2h stage record")) return 0;
+    if (!cuda_ok(cudaStreamWaitEvent(g_d2h_stream, g_d2h_ev, 0),
+                 "d2h stage wait")) return 0;
+    if (!cuda_ok(cudaMemcpyAsync(g_d2h_stage,
+                                 (const char *)tensor->ptr + offset,
+                                 (size_t)bytes, cudaMemcpyDeviceToHost,
+                                 g_d2h_stream),
+                 "d2h stage copy")) return 0;
+    if (!cuda_ok(cudaEventRecord(g_d2h_ev, g_d2h_stream),
+                 "d2h stage done record")) return 0;
+    g_d2h_pending = bytes;
+    return 1;
+}
+
+extern "C" int ds4_gpu_d2h_stage_begin(const ds4_gpu_tensor *tensor,
+                                       uint64_t offset, uint64_t bytes) {
+    g_d2h_pending = 0;
+    if (!tensor || bytes == 0 || offset > tensor->bytes ||
+        bytes > tensor->bytes - offset) return 0;
+    int d = ds4_tensor_device_idx(tensor);
+    int ok = 0;
+    WITH_DEVICE(g_gpu[d].device_id) {
+        ok = d2h_stage_queue(tensor, offset, bytes);
+    }
+    return ok;
+}
+
+
+extern "C" const void *ds4_gpu_d2h_stage(uint64_t bytes) {
+    const uint64_t pending = g_d2h_pending;
+    g_d2h_pending = 0;
+    if (pending == 0 || pending != bytes || !g_d2h_stage) return NULL;
+    if (!cuda_ok(cudaEventSynchronize(g_d2h_ev), "d2h stage sync")) return NULL;
+    return g_d2h_stage;
 }
 
 extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
