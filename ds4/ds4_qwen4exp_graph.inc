@@ -1100,6 +1100,37 @@ void ds4_qwen4exp_session_reset(ds4_qwen4exp_session *s) {
  * knob); a positive value pins the thread count.  Unset, the gather takes
  * the online CPUs capped at 16 -- enough to keep the SSD queue deep without
  * starving the decode path's own helpers. */
+/* Ask the kernel to start the page-ins for one table row.  The gather below
+ * names sixteen scattered 90-byte rows per token out of an SSD-mapped table
+ * that is far larger than the page cache, so a cold row is a synchronous
+ * fault on the critical path -- the device batch has not opened yet and the
+ * host has nothing else to run.  Issuing WILLNEED for every row the step
+ * already hashed lets the block layer keep all of them in flight at once:
+ * the first dequant then waits on a page that is already arriving instead of
+ * queueing fault number k behind fault k - 1.  A hint only: it changes no
+ * value the gather writes, and a platform without it falls through to the
+ * same serial faults it always took. */
+static void qw_ple_willneed(const ds4_qwen4exp_ple_table *ple, uint64_t row) {
+#if defined(POSIX_MADV_WILLNEED)
+    const uint8_t *quant = ds4_qwen4exp_ple_row(ple, row);
+    if (!quant) return;
+    static long ple_page = 0;
+    if (ple_page == 0) {
+        ple_page = sysconf(_SC_PAGESIZE);
+        if (ple_page <= 0) ple_page = -1;
+    }
+    if (ple_page <= 0) return;
+    const uintptr_t page = (uintptr_t)ple_page;
+    const uintptr_t start = (uintptr_t)quant & ~(page - 1u);
+    const uintptr_t end = (uintptr_t)quant + ple->row_bytes;
+    (void)posix_madvise((void *)start, (size_t)(end - start),
+                        POSIX_MADV_WILLNEED);
+#else
+    (void)ple;
+    (void)row;
+#endif
+}
+
 typedef struct {
     const ds4_qwen4exp_ple_table *ple;
     const ds4_qwen4exp_session   *s;
@@ -1137,9 +1168,22 @@ static void *qw_ple_gather_worker(void *arg) {
         ds4_ple_history_reset(&seg->s->ple_constants, &local);
     }
     seg->ok = 1;
+    /* Pass one: hash the segment's ids and start every row's page-in.  The
+     * ids land in ple_ids exactly as the fused loop left them; the WILLNEED
+     * calls only move the faults off the dequant loop's critical path. */
     for (uint32_t t = seg->t0; t < seg->t1; t++) {
+        const uint64_t *ids =
+            seg->s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD;
         ds4_ple_row_ids(&seg->s->ple_constants, &local, seg->tokens + t, 1u,
                         seg->s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD);
+        for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
+            qw_ple_willneed(seg->ple, ids[h]);
+        }
+    }
+    /* Pass two: dequantize.  A cold row now blocks on a read the kernel
+     * already queued beside the other fifteen, not on one it just heard
+     * about. */
+    for (uint32_t t = seg->t0; t < seg->t1; t++) {
         for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
             const uint64_t row =
                 seg->s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h];
@@ -1304,6 +1348,16 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 s->ple_history_rows[t] = s->ple_history;
             }
         }
+        /* Every id the verify rows name is known now; start all of their
+         * page-ins before the first dequant so a cold row waits on a read
+         * already in flight.  The armed path is one to four tokens, so this
+         * is the whole decode-side gather. */
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            const uint64_t *ids = s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD;
+            for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
+                qw_ple_willneed(&w->ple, ids[h]);
+            }
+        }
         for (uint32_t t = 0; t < n_tokens; t++) {
             /* The head's destination strides are constants of the shape, so
              * the token base is hoisted out of the head loop and the head
@@ -1367,6 +1421,16 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
         if (nthreads == 1) {
             ds4_ple_row_ids(&s->ple_constants, &s->ple_history, tokens,
                             n_tokens, s->ple_ids);
+            /* Same fan-out as the armed path: the ids are all in ple_ids, so
+             * every row's page-in can be queued before the first dequant
+             * faults on it. */
+            for (uint32_t t = 0; t < n_tokens; t++) {
+                const uint64_t *ids =
+                    s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD;
+                for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
+                    qw_ple_willneed(&w->ple, ids[h]);
+                }
+            }
             for (uint32_t t = 0; t < n_tokens; t++) {
                 for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
                     const uint64_t row =

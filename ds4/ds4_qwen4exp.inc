@@ -1148,6 +1148,24 @@ static void weights_bind_qwen4exp_ple_table(ds4_qwen4exp_ple_table *ple,
     ple->bytes = t->bytes;
     ple->type = t->type;
 
+#if defined(POSIX_MADV_RANDOM)
+    /* The gather faults sixteen scattered 90-byte rows per token.  Under
+     * default readahead every first touch pulls a page cluster the row read
+     * never uses, so the device waits on disk it did not ask for.  The
+     * standalone PLE module advises its own mapping the same way; this is
+     * the same hint over the tensor's range inside the shard mapping. */
+    {
+        const long page = sysconf(_SC_PAGESIZE);
+        if (page > 0) {
+            const uintptr_t p = (uintptr_t)ple->base;
+            const uintptr_t start = p & ~((uintptr_t)page - 1u);
+            const uintptr_t end = p + ple->bytes;
+            (void)posix_madvise((void *)start, (size_t)(end - start),
+                                POSIX_MADV_RANDOM);
+        }
+    }
+#endif
+
     qwen4exp_validate_ple_heads(m, ple->rows, ple);
     qwen4exp_read_ple_hash_constants(m, ple);
     qwen4exp_plan_charge(plan, DS4_QWEN4EXP_MEM_PLE, t);
