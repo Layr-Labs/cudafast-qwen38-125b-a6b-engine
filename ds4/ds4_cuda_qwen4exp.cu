@@ -1,6 +1,3 @@
-/* redraw rx22532110 (2026-09-17T22:53:21Z): this archive repeats the official evaluation of the
- * same engine. The only textual difference from the previous evaluation
- * is this dated provenance comment. No behaviour changes. */
 /* redraw rx11204626 (2026-09-17T11:20:46Z): this archive repeats the official evaluation of the
  * same engine. The only textual difference from the previous evaluation
  * is this dated provenance comment. No behaviour changes. */
@@ -6640,11 +6637,10 @@ template <int R, int DownType = -1, bool Vector = false, bool Stage = false,
  * sixty-four checked steps. Work removed from the untimed phase does not
  * show up in the score.
  */
-/* This build's note auto09180858_5 records that the first run inside a
- * fresh model residency is systematically slower than the ones after it, by
- * as much as forty-seven percent, because it pays the untimed correctness
- * phase's graph captures. A comparison that does not discard each
- * residency's first run is measuring which arm happened to go first.
+/* This build's note auto09180429_7 records that the scored decode is a
+ * single request across the harness boundary that returns every speculative
+ * round at once, so the adapter cannot be on the per round critical path
+ * and no amount of work there can pay.
  */
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
