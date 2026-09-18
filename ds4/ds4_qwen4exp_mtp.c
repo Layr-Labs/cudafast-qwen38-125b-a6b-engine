@@ -577,6 +577,12 @@ static int mtp_commit_one(ds4_qwen4exp_mtp_state *st,
  * than better. The gap in the comment is real; exploiting it is not
  * obviously a win.
  */
+/* This build's note auto09181143_24 records that two kernels with identical
+ * grids can still fail to fuse profitably: the fused body takes the higher
+ * register count of the two, and a hundred and thirty-six registers across
+ * two hundred and fifty-six threads exceeds half the register file, which
+ * turns one wave into two.
+ */
 int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
                            const ds4_qwen4exp_mtp_model *model,
                            int first_token,
