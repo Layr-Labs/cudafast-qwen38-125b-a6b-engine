@@ -108,6 +108,26 @@ int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows);
  * same way. */
 int ds4_qwen4exp_pdl_enabled(void);
 
+/* SWEEP (DS4_QWEN4EXP_WIDE3=1): the fused decode projections (GDN four, QSA
+ * triple) and the side-stream shared expert also take the 3- and 4-row
+ * verifies of draft depth 2 and 3 (R=3/4 instantiations of the same kernels;
+ * each row's chain is the row's own).  Off: the <= 2 gates, the generic path. */
+#ifdef __cplusplus
+extern "C"
+#endif
+int ds4_qwen4exp_wide3_enabled(void);
+
+/* SWEEP (DS4_PDL_EXT=1): two more programmatic edges at the decode widths --
+ * router top-k/grouping behind the f32 router matvec (which now triggers at
+ * its top when single-wave), and the HC silu+quant behind the HC down pair
+ * (which now triggers at rows <= 2).  Fences guard every activation read;
+ * with the valve off both consumers launch plainly and the triggers fire
+ * into nothing, as the header rules require. */
+#ifdef __cplusplus
+extern "C"
+#endif
+int ds4_qwen4exp_pdl_ext_enabled(void);
+
 /* Occupancy attributes of the two production routed-MoE decode kernels, which
  * are static to ds4_cuda_qwen4exp.cu and so can only report from inside it.
  * Defined there, consumed by ds4_gpu_hw_limits() in ds4_cuda.cu.  Returns a

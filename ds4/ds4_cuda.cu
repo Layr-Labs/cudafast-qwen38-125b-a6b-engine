@@ -1170,219 +1170,6 @@ extern "C" int ds4_gpu_decode_graph_prefetch(const ds4_decode_graph_key *key) {
     return 0;
 }
 
-/* ------------------------------------------------------------------------
- * ONE-SHOT GRAPH CAPTURE, for the prefill layer stack.
- *
- * WHY IT IS A DIFFERENT ENTRY FROM THE CACHED ONE ABOVE.  A decode island is
- * replayed 67 times a run, so its graph is built once and kept.  A PREFILL
- * layer runs EXACTLY ONCE -- every prefill kernel appears once per layer,
- * counted from the engine's own trace -- so there is nothing to cache and a
- * cache would be actively wrong: a graph that outlived its prefill would let
- * a later, TIMED prefill inherit work built in an earlier one, which is the
- * deferred-seed-work defect docs/participant-contract.md section 5.1.1 exists
- * to prevent.  These graphs are therefore destroyed inside the window that
- * built them, and this entry has no key and no table.
- *
- * WHAT MAKES IT PAY ANYWAY.  Capture is host-only and replay is GPU-only, so
- * they PIPELINE: end() launches layer k's graph asynchronously and the host
- * walks straight into layer k+1's capture while the device is still running
- * layer k.  Per layer that is ~33 launches of host work -- a fraction of a
- * millisecond -- against 12-13 ms of GPU time, so the capture is hidden by
- * construction rather than by estimate.
- *
- * THAT IS THE WHOLE INVARIANT, AND IT IS FRAGILE.  Capture does not delete
- * host work; it moves it from BEHIND the GPU span to IN FRONT of it.  A
- * capture that is not overlapped by the previous layer's replay is pure added
- * latency, and the whole-prefill variant of this idea loses for exactly that
- * reason: one capture of all 1,618 launches has nothing running behind it.
- * Anything added here must keep end() asynchronous.
- * ------------------------------------------------------------------------ */
-#define DS4_ONESHOT_GRAPH_MAX 512
-static cudaGraphExec_t g_oneshot_execs[DS4_ONESHOT_GRAPH_MAX];
-static int      g_oneshot_n = 0;
-static int      g_oneshot_capturing = 0;
-static uint64_t g_oneshot_captures = 0;
-static uint64_t g_oneshot_declines = 0;
-
-/* THE INVARIANT PROBE.  This design is worth something only while the host's
- * capture of layer k+1 is overlapped by the device's replay of layer k.  If
- * anything ever makes end() synchronous, the host's per-layer time jumps from
- * a fraction of a millisecond to the layer's whole GPU time and the design has
- * silently become the whole-prefill one, which LOSES.  This measures exactly
- * that, with CLOCK_MONOTONIC rather than from a trace, and prints it under
- * DS4_QWEN4EXP_PF_GRAPH_LOG.  It is the one number that separates the two. */
-static double   g_oneshot_host_ns = 0.0;
-static double   g_oneshot_host_max_ns = 0.0;
-static uint64_t g_oneshot_begin_ns = 0;
-/* THE OTHER END OF THE LIFECYCLE.  Capture was instrumented and held; the cost
- * then landed on DESTRUCTION, at the one point in a forward where the device
- * has nothing queued -- 99 cudaGraphExecDestroy at ~15 us each, measured as a
- * 1.512 ms lengthening of the quantize -> glm_embed_tokens gap at the forward
- * boundary.  WHEN YOU GUARD A LIFECYCLE, GUARD BOTH ENDS: this is the same
- * probe, on the destroy side. */
-static double   g_oneshot_destroy_ns = 0.0;
-static uint64_t cuda_now_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-}
-
-extern "C" uint64_t ds4_gpu_oneshot_graph_captures(void) { return g_oneshot_captures; }
-
-/* Print and reset the CAPTURE statistics for the forward that just finished.
- * Deliberately separate from destruction: the two ends of the lifecycle are
- * now paid at different points and have to be reported at different points. */
-extern "C" void ds4_gpu_oneshot_graph_report(void) {
-    if (g_oneshot_captures == 0) return;
-    if (getenv("DS4_QWEN4EXP_PF_GRAPH_LOG") != NULL && g_oneshot_n > 0) {
-        fprintf(stderr, "ds4: pf graph: %d graphs this forward, host capture "
-                "total %.3f ms, mean %.3f ms, max %.3f ms (declines %llu)\n",
-                g_oneshot_n, g_oneshot_host_ns / 1e6,
-                g_oneshot_host_ns / 1e6 / (double)g_oneshot_n,
-                g_oneshot_host_max_ns / 1e6,
-                (unsigned long long)g_oneshot_declines);
-    }
-    g_oneshot_host_ns = 0.0;
-    g_oneshot_host_max_ns = 0.0;
-}
-
-/* Destroy graphs the caller GUARANTEES have completed, WITHOUT synchronizing.
- *
- * The only call site is one full device sync later than the forward that built
- * them: the next prefill, after its layers 0..3 have been issued eagerly, so
- * about 51 ms of GPU work is queued and the ~1.5 ms of destruction hides
- * behind it.  Synchronizing here would be catastrophic rather than merely
- * wasteful -- it would wait out that queued work -- which is why this entry
- * exists separately from the syncing one below rather than taking a flag. */
-extern "C" void ds4_gpu_oneshot_graph_retire_settled(void) {
-    if (g_oneshot_n == 0) return;
-    const uint64_t t0 = cuda_now_ns();
-    const int n = g_oneshot_n;
-    for (int i = 0; i < g_oneshot_n; i++) {
-        if (g_oneshot_execs[i]) (void)cudaGraphExecDestroy(g_oneshot_execs[i]);
-        g_oneshot_execs[i] = NULL;
-    }
-    g_oneshot_n = 0;
-    (void)cudaGetLastError();
-    g_oneshot_destroy_ns = (double)(cuda_now_ns() - t0);
-    if (getenv("DS4_QWEN4EXP_PF_GRAPH_LOG") != NULL) {
-        fprintf(stderr, "ds4: pf graph: destroyed %d graphs in %.3f ms, "
-                "behind queued layer 0-3 work\n", n, g_oneshot_destroy_ns / 1e6);
-    }
-}
-
-/* Destroy every graph still parked, synchronizing first.  For the error path
- * and for teardown, where nothing guarantees completion. */
-extern "C" void ds4_gpu_oneshot_graph_retire(void) {
-    if (g_oneshot_n == 0) return;
-    if (getenv("DS4_QWEN4EXP_PF_GRAPH_LOG") != NULL) {
-        /* HOST time spent capturing, against the GPU time it must hide behind
-         * (a prefill layer is 12-13 ms).  A mean well under a millisecond means
-         * the capture is pipelined; anything near the layer time means it is
-         * not, and the design has inverted into the one that loses. */
-        fprintf(stderr, "ds4: pf graph: %d graphs this forward, host capture "
-                "total %.3f ms, mean %.3f ms, max %.3f ms (declines %llu)\n",
-                g_oneshot_n, g_oneshot_host_ns / 1e6,
-                g_oneshot_host_ns / 1e6 / (double)g_oneshot_n,
-                g_oneshot_host_max_ns / 1e6,
-                (unsigned long long)g_oneshot_declines);
-    }
-    g_oneshot_host_ns = 0.0;
-    g_oneshot_host_max_ns = 0.0;
-    if (g_decode_graph_stream) (void)cudaStreamSynchronize(g_decode_graph_stream);
-    (void)cudaDeviceSynchronize();
-    for (int i = 0; i < g_oneshot_n; i++) {
-        if (g_oneshot_execs[i]) (void)cudaGraphExecDestroy(g_oneshot_execs[i]);
-        g_oneshot_execs[i] = NULL;
-    }
-    g_oneshot_n = 0;
-    (void)cudaGetLastError();
-}
-
-/* 0 = capturing, caller must encode and then call end(); -1 = declined, the
- * caller encodes eagerly exactly as before. */
-extern "C" int ds4_gpu_oneshot_graph_begin(void) {
-    if (!ds4_gpu_decode_graphs_supported()) return -1;
-    if (g_decode_graph_capturing || g_oneshot_capturing) return -1;  /* no nesting */
-    if (g_oneshot_n >= DS4_ONESHOT_GRAPH_MAX) { g_oneshot_declines++; return -1; }
-    if (!g_decode_graph_stream) {
-        /* BLOCKING stream on purpose: it synchronizes with the legacy NULL
-         * stream the eager prologue and epilogue ride, which is what orders
-         * the captured layer stack against them without an explicit event. */
-        if (!cuda_ok(cudaStreamCreate(&g_decode_graph_stream),
-                     "one-shot graph stream create")) {
-            g_decode_graph_stream = NULL;
-            return -1;
-        }
-    }
-    (void)cublasSetStream(cuda_cublas_for_tier(0), g_decode_graph_stream);
-    if (cudaStreamBeginCapture(g_decode_graph_stream,
-                               cudaStreamCaptureModeGlobal) != cudaSuccess) {
-        (void)cudaGetLastError();
-        (void)cublasSetStream(cuda_cublas_for_tier(0), NULL);
-        g_oneshot_declines++;
-        return -1;
-    }
-    g_decode_graph_capturing = 1;   /* routes cuda_decode_stream() at every launch */
-    g_oneshot_capturing = 1;
-    g_oneshot_begin_ns = cuda_now_ns();
-    return 0;
-}
-
-/* Abandon a capture whose encode failed.  Nothing was executed. */
-extern "C" void ds4_gpu_oneshot_graph_abort(void) {
-    if (!g_oneshot_capturing) return;
-    g_decode_graph_capturing = 0;
-    g_oneshot_capturing = 0;
-    cudaGraph_t graph = NULL;
-    (void)cudaStreamEndCapture(g_decode_graph_stream, &graph);
-    if (graph) (void)cudaGraphDestroy(graph);
-    (void)cublasSetStream(cuda_cublas_for_tier(0), NULL);
-    (void)cudaGetLastError();
-    g_oneshot_declines++;
-}
-
-/* 0 = the layer is launched and in flight; -1 = nothing ran, encode eagerly. */
-extern "C" int ds4_gpu_oneshot_graph_end(void) {
-    if (!g_oneshot_capturing) return -1;
-    g_decode_graph_capturing = 0;
-    g_oneshot_capturing = 0;
-    cudaGraph_t graph = NULL;
-    cudaError_t err = cudaStreamEndCapture(g_decode_graph_stream, &graph);
-    (void)cublasSetStream(cuda_cublas_for_tier(0), NULL);
-    if (err != cudaSuccess || graph == NULL) {
-        (void)cudaGetLastError();
-        if (graph) (void)cudaGraphDestroy(graph);
-        g_oneshot_declines++;
-        return -1;
-    }
-    cudaGraphExec_t exec = NULL;
-    err = cudaGraphInstantiate(&exec, graph, NULL, NULL, 0);
-    (void)cudaGraphDestroy(graph);
-    if (err != cudaSuccess || exec == NULL) {
-        (void)cudaGetLastError();
-        g_oneshot_declines++;
-        return -1;
-    }
-    /* ASYNCHRONOUS ON PURPOSE.  The host returns here while the device runs
-     * this layer, and captures the next one behind it.  See the invariant. */
-    err = cudaGraphLaunch(exec, g_decode_graph_stream);
-    if (err != cudaSuccess) {
-        (void)cudaGetLastError();
-        (void)cudaGraphExecDestroy(exec);
-        g_oneshot_declines++;
-        return -1;
-    }
-    g_oneshot_execs[g_oneshot_n++] = exec;
-    g_oneshot_captures++;
-    {
-        const double dt = (double)(cuda_now_ns() - g_oneshot_begin_ns);
-        g_oneshot_host_ns += dt;
-        if (dt > g_oneshot_host_max_ns) g_oneshot_host_max_ns = dt;
-    }
-    return 0;
-}
-
 extern "C" int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) {
     if (!key || !ds4_gpu_decode_graphs_supported()) return -1;
     if (g_decode_graph_capturing) return -1;   /* no nesting */
@@ -6437,6 +6224,33 @@ __global__ static void __launch_bounds__(256, 2) matmul_q8_0_preq_pair_lanes_rol
     }
 }
 
+/* SWEEP 2026-09-18: L2 prefetch valve for the hyper-connection pair kernels.
+ * DS4_HC_PF=D (published once from the host, never inside a capture): the
+ * up kernel prefetches the rows of block x+D, the down kernel prefetches its
+ * own whole row at entry.  A prefetch changes no value. */
+static __device__ int g_q8_hc_pf = 0;
+static int q8_hc_hoist_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DS4_HC_HOIST"); v = (e && e[0] && e[0] != '0') ? 1 : 0; }
+    return v;
+}
+static int q8_hc_unroll_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DS4_HC_UNROLL"); v = (e && e[0] && e[0] != '0') ? 1 : 0; }
+    return v;
+}
+static int q8_hc_up8_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DS4_HC_UP8"); v = (e && e[0] && e[0] != '0') ? 1 : 0; }
+    return v;
+}
+static __device__ int g_q8_gdn_pf = 0;
+static __device__ int g_q8_hc_pf_down = 0;  /* SWEEP: DS4_HC_PF_DOWN=1 own-row entry prefetch in the down pair (measured negative); =2 cross-block */
+static __device__ int g_q8_hc_pf_down_dist = 64;  /* SWEEP: DS4_HC_PF_DOWN_D, blocks ahead for mode 2 */   /* SWEEP: DS4_GDN_PF=D, GDN projection panel prefetch */
+__device__ __forceinline__ static void q8_hc_prefetch_l2(const void *p) {
+    asm volatile("prefetch.global.L2 [%0];" :: "l"(p));
+}
+
 /* HC down has only 320 outputs. Two lanes per group expose more integer
  * work while one 64-thread block owns each output. Retain all 32 original
  * float chains and their reduction tree; only the integer dot is split.
@@ -6444,6 +6258,9 @@ __global__ static void __launch_bounds__(256, 2) matmul_q8_0_preq_pair_lanes_rol
 __global__ static void matmul_q8_hc_down_pair_kernel(
         float *out, const unsigned char *w, const int8_t *xq,
         const float *xs, uint32_t rows) {
+    /* SWEEP PDL_EXT: producer for the silu+quant behind it; 320 x rows
+     * one-warp blocks, single-wave at rows <= 2 (the deadlock rule). */
+    if (rows <= 2u) QWEN4EXP_PDL_TRIGGER();
     /* ONE LANE PER GROUP, NOT TWO.
      *
      * L splits one 32-element Q8 group's INTEGER dot across L lanes and
@@ -6485,6 +6302,18 @@ __global__ static void matmul_q8_hc_down_pair_kernel(
      * at = tok*320 + b, and folds through the same warp tree. */
     const unsigned tok = blockIdx.y;
     float acc[1] = {0.0f};
+    if (g_q8_hc_pf > 0 && g_q8_hc_pf_down > 0) {
+        /* SWEEP: mode 1 prefetches this block's own row at entry (measured
+         * +20 % worse); mode 2 prefetches the row of block x + D instead
+         * (DS4_HC_PF_DOWN=2, DS4_HC_PF_DOWN_D), the cross-block form that
+         * paid in the up pair. */
+        const uint64_t prow = g_q8_hc_pf_down >= 2
+            ? row + (uint64_t)g_q8_hc_pf_down_dist : row;
+        if (prow < 320u) {
+            const unsigned char *const rb = w + prow * 10880u;
+            for (unsigned i = threadIdx.x; i < 85u; i += 32u) q8_hc_prefetch_l2(rb + i * 128u);
+        }
+    }
     /* PDL: the first walk step (b = group, which every lane owns, group
      * being under 32 and the walk being 320 wide) with its WEIGHT loads
      * issued above the fence and held in registers, so they fly while the
@@ -6563,6 +6392,292 @@ __global__ static void matmul_q8_hc_down_pair_kernel(
     }
 }
 
+/* SWEEP 2026-09-18: the down pair with EVERY step's weight words HOISTED: the ten
+ * (b = group + 32 s) reads of a lane are issued together, above the fence, before
+ * any arithmetic, so a row streams with ten loads in flight per lane instead of
+ * one per step (the walk below is latency-bound: 22 us for 3.5 MB).  Same lane,
+ * same ascending b, same `acc += ws * xs * dot` chain, same shared fold and warp
+ * tree: bit-identical.  DS4_HC_HOIST=1 selects it. */
+__global__ static void matmul_q8_hc_down_hoist_kernel(
+        float *out, const unsigned char *w, const int8_t *xq,
+        const float *xs, uint32_t rows) {
+    const unsigned group = threadIdx.x;
+    const uint64_t row = blockIdx.x;
+    const unsigned tok = blockIdx.y;
+    constexpr unsigned STEPS = 10u;
+    if (g_q8_hc_pf > 0 && g_q8_hc_pf_down > 0) {
+        const uint64_t prow = g_q8_hc_pf_down >= 2
+            ? row + (uint64_t)g_q8_hc_pf_down_dist : row;
+        if (prow < 320u) {
+            const unsigned char *const rb = w + prow * 10880u;
+            for (unsigned i = threadIdx.x; i < 85u; i += 32u) q8_hc_prefetch_l2(rb + i * 128u);
+        }
+    }
+    int32_t wq[STEPS][8];
+    float ws[STEPS];
+    const unsigned char *const rowp = w + row * 10880u;
+#pragma unroll
+    for (unsigned s = 0; s < STEPS; s++) {
+        const unsigned b = group + 32u * s;
+        const unsigned char *blk = rowp + b * 34u;
+        const unsigned char *payload = blk + 2u;
+        const uintptr_t address = (uintptr_t)payload;
+        const unsigned shift = (address & 3u) * 8u;
+        const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
+        uint32_t previous = words[0];
+#pragma unroll
+        for (int j = 0; j < 7; j++) {
+            const uint32_t next = words[j + 1];
+            wq[s][j] = (int32_t)__funnelshift_r(previous, next, shift);
+            previous = next;
+        }
+        const uint16_t last = *(const uint16_t *)(payload + 30u);
+        wq[s][7] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
+        ws[s] = __half2float(*(const __half *)blk);
+    }
+    QWEN4EXP_PDL_SYNC();
+    float acc = 0.0f;
+    if (tok < rows) {
+#pragma unroll
+        for (unsigned s = 0; s < STEPS; s++) {
+            const unsigned b = group + 32u * s;
+            const unsigned at = tok * 320u + b;
+            const int32_t *xw = (const int32_t *)(xq + at * 32u);
+            int dot = 0;
+#pragma unroll
+            for (int j = 0; j < 8; j++) dot = __dp4a(wq[s][j], xw[j], dot);
+            acc += ws[s] * xs[at] * (float)dot;
+        }
+    }
+    __shared__ float partial[32];
+    partial[group] = acc;
+    __syncthreads();
+    if (threadIdx.x < 32u) {
+        const float total = warp_sum_f32(partial[threadIdx.x]);
+        if (threadIdx.x == 0u && tok < rows) out[tok * 320u + row] = total;
+    }
+}
+
+/* SWEEP 2026-09-18 (DS4_HC_DSTAGE=1): the HC down pair with the 10,880-byte weight
+ * row STAGED through shared memory by a 128-thread block with coalesced 16-byte
+ * loads -- the pair walk's 34-byte groups cost nine 4-byte transactions per lane
+ * per step against the row's misaligned layout, while the staged copy is the
+ * coop panel's kind of access -- and BOTH tokens per block (the row is read once
+ * instead of once per token).  Warp t then computes token t with the pair
+ * kernel's exact walk: the same lane -> group, the same ascending b, the same
+ * funnel-shifted words at the same in-row alignment (rows are 16-byte aligned in
+ * both memories), the same `acc += ws * xs * dot`, the same partial[] fold and
+ * warp tree.  Bit-identical. */
+__global__ static void __launch_bounds__(128)
+matmul_q8_hc_down_stage_kernel(float *out, const unsigned char *w, const int8_t *xq,
+                               const float *xs, uint32_t rows) {
+    __shared__ __align__(16) unsigned char srow[10880];
+    __shared__ float partial[2][32];
+    const uint64_t row = blockIdx.x;
+    const unsigned warp = threadIdx.x >> 5u, lane = threadIdx.x & 31u;
+    const unsigned char *const rowp = w + row * 10880u;
+    if (g_q8_hc_pf > 0 && g_q8_hc_pf_down > 0) {
+        const uint64_t prow = g_q8_hc_pf_down >= 2
+            ? row + (uint64_t)g_q8_hc_pf_down_dist : row;
+        if (prow < 320u) {
+            const unsigned char *const rb = w + prow * 10880u;
+            for (unsigned i = threadIdx.x; i < 85u; i += 128u) q8_hc_prefetch_l2(rb + i * 128u);
+        }
+    }
+    {
+        uint4 v[6];
+#pragma unroll
+        for (int k = 0; k < 6; k++) {
+            const unsigned i = threadIdx.x + 128u * (unsigned)k;
+            if (i < 680u) v[k] = *(const uint4 *)(rowp + (uint64_t)i * 16u);
+        }
+#pragma unroll
+        for (int k = 0; k < 6; k++) {
+            const unsigned i = threadIdx.x + 128u * (unsigned)k;
+            if (i < 680u) *(uint4 *)(srow + i * 16u) = v[k];
+        }
+    }
+    QWEN4EXP_PDL_SYNC();
+    __syncthreads();
+    if (warp < 2u && warp < rows) {
+        const unsigned tok = warp;
+        float acc = 0.0f;
+        for (unsigned b = lane; b < 320u; b += 32u) {
+            const unsigned char *blk = srow + b * 34u;
+            const unsigned char *payload = blk + 2u;
+            const uintptr_t address = (uintptr_t)payload;
+            const unsigned shift = (address & 3u) * 8u;
+            const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
+            uint32_t previous = words[0];
+            int32_t wq[8];
+#pragma unroll
+            for (int j = 0; j < 7; j++) {
+                const uint32_t next = words[j + 1];
+                wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
+                previous = next;
+            }
+            const uint16_t last = *(const uint16_t *)(payload + 30u);
+            wq[7] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
+            const float ws = __half2float(*(const __half *)blk);
+            const unsigned at = tok * 320u + b;
+            const int32_t *xw = (const int32_t *)(xq + at * 32u);
+            int dot = 0;
+#pragma unroll
+            for (int j = 0; j < 8; j++) dot = __dp4a(wq[j], xw[j], dot);
+            acc += ws * xs[at] * (float)dot;
+        }
+        partial[tok][lane] = acc;
+    }
+    __syncthreads();
+    if (warp < 2u && warp < rows) {
+        const float total = warp_sum_f32(partial[warp][lane]);
+        if (lane == 0u) out[warp * 320u + row] = total;
+    }
+}
+static int q8_hc_dstage_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DS4_HC_DSTAGE"); v = (e && e[0] && e[0] != '0') ? 1 : 0; }
+    return v;
+}
+
+/* SWEEP 2026-09-18: the down pair walk with its nine remainder passes unrolled so the
+ * loads of every pass can be issued together; per-group statements and the ascending-b
+ * accumulation are the shipped ones (DS4_HC_UNROLL=1 selects it). */
+__global__ static void matmul_q8_hc_down_pair_unroll_kernel(
+        float *out, const unsigned char *w, const int8_t *xq,
+        const float *xs, uint32_t rows) {
+    /* ONE LANE PER GROUP, NOT TWO.
+     *
+     * L splits one 32-element Q8 group's INTEGER dot across L lanes and
+     * combines the partials with __shfl_xor_sync.  At L = 1 there are no
+     * partials to combine: each lane owns a whole group, issues eight __dp4a
+     * and no shuffles, and the block is 32 threads -- ONE warp, so the
+     * __syncthreads() before the shared partial[] fold costs nothing because
+     * there is nothing to wait for.
+     *
+     * MEASURED, not argued.  The engine's own slice profiler at the two-row
+     * verify width, n=59 per arm, each arm normalised by the sum of the eight
+     * slices the change cannot touch (drift between the two runs was +0.06%,
+     * so this comparison needed almost none):
+     *     attn_mix  5.354 -> 5.190 ms   -3.12%
+     *     ffn_mix   5.547 -> 5.538 ms   -0.22%
+     * We went the OTHER way first and the same rig refused it: at L = 4, four
+     * warps a block, attn_mix +2.66% and ffn_mix +4.63% with `moe` and `head`
+     * flat as controls.  The barrier is what costs, exactly as this engine's
+     * own comment on the vector gate/up schedule says, and the direction that
+     * wins is FEWER warps behind it -- not more resident ones.
+     *
+     * NOTHING ARITHMETIC MOVES.  Integer addition is associative, so lane 0's
+     * int32 dot is the same at any L; only part == 0 touches the float chain
+     * and it walks b = group, group+32, ... in the same order; the cross-group
+     * reduction writes the same 32 partial[] values and folds them with the
+     * same warp tree, which never mentions L; and each lane reads
+     * payload + part * (32 / L), which at L = 1 is the payload itself. */
+    constexpr unsigned L = 1u;
+    const unsigned group = threadIdx.x / L;
+    const unsigned part = threadIdx.x % L;
+    const uint64_t row = blockIdx.x;
+    /* ONE TOKEN PER BLOCK.  The grid was 320 blocks of one warp, which is 6.67
+     * warps an SM on a part that carries 48 -- the GRID, not registers, was the
+     * limit.  A token's sum is independent of the other token's, so moving the
+     * token to blockIdx.y doubles the grid without adding a warp behind any
+     * barrier, which is the direction the L sweep already showed is the only
+     * one that wins here.  Every float chain is untouched: this block walks the
+     * same b = group, group+32, ... in the same order, reads the same
+     * at = tok*320 + b, and folds through the same warp tree. */
+    const unsigned tok = blockIdx.y;
+    float acc[1] = {0.0f};
+    if (g_q8_hc_pf > 0 && g_q8_hc_pf_down > 0) {
+        /* SWEEP: mode 1 prefetches this block's own row at entry (measured
+         * +20 % worse); mode 2 prefetches the row of block x + D instead
+         * (DS4_HC_PF_DOWN=2, DS4_HC_PF_DOWN_D), the cross-block form that
+         * paid in the up pair. */
+        const uint64_t prow = g_q8_hc_pf_down >= 2
+            ? row + (uint64_t)g_q8_hc_pf_down_dist : row;
+        if (prow < 320u) {
+            const unsigned char *const rb = w + prow * 10880u;
+            for (unsigned i = threadIdx.x; i < 85u; i += 32u) q8_hc_prefetch_l2(rb + i * 128u);
+        }
+    }
+    /* PDL: the first walk step (b = group, which every lane owns, group
+     * being under 32 and the walk being 320 wide) with its WEIGHT loads
+     * issued above the fence and held in registers, so they fly while the
+     * norm kernel drains.  The activation reads (xq/xs, that kernel's
+     * output) stay below it; every statement is the loop's own, and b
+     * ascends exactly as the rolled walk did, so the accumulation order is
+     * untouched.  The walk's remainder runs unchanged from group + 32. */
+    {
+        const unsigned char *blk = w + row * 10880u + group * 34u;
+        const unsigned char *payload = blk + 2u + part * (32u / L);
+        const uintptr_t address = (uintptr_t)payload;
+        const unsigned shift = (address & 3u) * 8u;
+        const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
+        uint32_t previous = words[0];
+        int32_t wq[8/L];
+#pragma unroll
+        for (int j = 0; j < 8/L - 1; j++) {
+            const uint32_t next = words[j + 1];
+            wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
+            previous = next;
+        }
+        const uint16_t last = *(const uint16_t *)(payload + 32u/L - 2u);
+        wq[8/L - 1] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
+        float ws = 0.0f;
+        if (part == 0u) ws = __half2float(*(const __half *)blk);
+        QWEN4EXP_PDL_SYNC();
+        if (tok < rows) {
+            const unsigned at = tok * 320u + group;
+            const int32_t *xw =
+                    (const int32_t *)(xq + at * 32u + part * (32u/L));
+            int dot = 0;
+#pragma unroll
+            for (int j = 0; j < 8/L; j++) dot = __dp4a(wq[j], xw[j], dot);
+#pragma unroll
+            for (int d = 1; d < L; d *= 2)
+                dot += __shfl_xor_sync(0xffffffffu, dot, d);
+            if (part == 0u) acc[0] += ws * xs[at] * (float)dot;
+        }
+    }
+#pragma unroll
+    for (unsigned b = group + 32u; b < 320u; b += 32u) {
+        const unsigned char *blk = w + row * 10880u + b * 34u;
+        const unsigned char *payload = blk + 2u + part * (32u / L);
+        const uintptr_t address = (uintptr_t)payload;
+        const unsigned shift = (address & 3u) * 8u;
+        const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
+        uint32_t previous = words[0];
+        int32_t wq[8/L];
+#pragma unroll
+        for (int j = 0; j < 8/L - 1; j++) {
+            const uint32_t next = words[j + 1];
+            wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
+            previous = next;
+        }
+        const uint16_t last = *(const uint16_t *)(payload + 32u/L - 2u);
+        wq[8/L - 1] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
+        float ws = 0.0f;
+        if (part == 0u) ws = __half2float(*(const __half *)blk);
+        if (tok < rows) {
+            const unsigned at = tok * 320u + b;
+            const int32_t *xw = (const int32_t *)(xq + at * 32u + part * (32u/L));
+            int dot = 0;
+#pragma unroll
+            for (int j = 0; j < 8/L; j++) dot = __dp4a(wq[j], xw[j], dot);
+#pragma unroll
+            for (int d = 1; d < L; d *= 2)
+                dot += __shfl_xor_sync(0xffffffffu, dot, d);
+            if (part == 0u) acc[0] += ws * xs[at] * (float)dot;
+        }
+    }
+    __shared__ float partial[1][32];
+    if (part == 0u) partial[0][group] = acc[0];
+    __syncthreads();
+    if (threadIdx.x < 32u) {
+        const float total = warp_sum_f32(partial[0][threadIdx.x]);
+        if (threadIdx.x == 0u && tok < rows) out[tok * 320u + row] = total;
+    }
+}
+
 /* HC up has ten Q8 groups. Pair lanes within one warp and retain the
  * original zero-padded 32-chain tree, without a shared-memory remap. */
 template<int R>
@@ -6573,6 +6688,22 @@ __global__ static void matmul_q8_hc_warp_pair_kernel(
     const unsigned group = lane >> 1u, half = lane & 1u;
     const uint64_t row = (uint64_t)blockIdx.x * 4u + (threadIdx.x >> 5u);
     if (row >= out_dim) return;
+    {
+        const int pfd = g_q8_hc_pf;
+        if (pfd > 0) {
+            const uint64_t prow = ((uint64_t)blockIdx.x + (uint64_t)pfd) * 4u;
+            if (prow < out_dim) {
+                const uint64_t pbytes = (out_dim - prow < 4u ? out_dim - prow : 4u) * 340u;
+                const unsigned char *const pb = w + prow * 340u;
+                const unsigned char *const pend = w + out_dim * 340u - 128u;
+                const unsigned nl = (unsigned)((pbytes + 127u) / 128u);
+                if (threadIdx.x < nl) {
+                    const unsigned char *a = pb + (uint64_t)threadIdx.x * 128u;
+                    q8_hc_prefetch_l2(a < pend ? a : pend);
+                }
+            }
+        }
+    }
     float acc[R];
 #pragma unroll
     for (int r = 0; r < R; r++) acc[r] = 0.0f;
@@ -6625,69 +6756,58 @@ __global__ static void matmul_q8_hc_warp_pair_kernel(
     }
 }
 
-/* The kernel above with its WEIGHT TRAFFIC restructured, and nothing else.
- *
- * The block's four output rows are 4 * 340 = 1360 contiguous bytes of the
- * q8_0 slab, and 1360 = 16 * 85, so a block's run starts 16-byte aligned
- * whenever the tensor base is (the launcher gates on that).  It therefore
- * arrives as ONE __ldcs uint4 per thread -- eighty-five perfectly coalesced
- * 16-byte requests for the whole block -- instead of twenty lanes each
- * issuing four 4-byte and two 2-byte requests scattered over the same 340
- * bytes, and the walk below then runs against shared memory.
- *
- * SAME ARITHMETIC.  The lane-to-element map (group = lane>>1, half = lane&1,
- * groups 0..9 live), the address-parity shift, the __funnelshift_r
- * extraction, the four-step __dp4a chain, the pair combine on mask
- * 0x000fffff and the zero-padded 16/8/4/2 butterfly are the kernel above's,
- * character for character; only the route the weight bytes take changes.
- * In SASS the value chain is instruction for instruction the same: eight
- * IDP.4A.S8.S8 in the same chained order, two SHFL.BFLY, two I2FP.F32.S32,
- * two FMUL.FTZ, two FFMA.FTZ against RZ, four SHF.R.W.U32, one HADD2.F32
- * and the same seventeen FADD.FTZ against twenty SHFL.  The only extra
- * integer instruction is an IDP.2A address multiply feeding IADD.64.
- *
- * PDL: unchanged in kind.  Every weight byte the block owns is in shared
- * memory before the fence, exactly as every weight word a lane owned was in
- * registers before the fence above, so the fence still holds the activation
- * reads (xq/xs, the silu kernel's output) and nothing else moves.  The
- * __syncthreads() that publishes the staged run is above the fence for the
- * same reason. */
+/* SWEEP 2026-09-18: eight rows per block (256 threads) instead of four; each warp
+ * still owns one row and the same lane-pair chains (DS4_HC_UP8=1 selects it). */
 template<int R>
-__global__ static void matmul_q8_hc_warp_pair_stage_kernel(
+__global__ static void matmul_q8_hc_warp_pair8_kernel(
         float *out, const unsigned char *w,
         const int8_t *xq, const float *xs, uint64_t out_dim, uint32_t rows) {
-    __shared__ __align__(16) unsigned char sw[4 * 340];
     const unsigned lane = threadIdx.x & 31u;
     const unsigned group = lane >> 1u, half = lane & 1u;
-    const unsigned rl = threadIdx.x >> 5u;
-    const uint64_t row0 = (uint64_t)blockIdx.x * 4u;
-    if (threadIdx.x < 85u) {
-        ((uint4 *)sw)[threadIdx.x] =
-                __ldcs((const uint4 *)(w + row0 * 340u) + threadIdx.x);
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    if (row >= out_dim) return;
+    {
+        const int pfd = g_q8_hc_pf;
+        if (pfd > 0) {
+            const uint64_t prow = ((uint64_t)blockIdx.x + (uint64_t)pfd) * 8u;
+            if (prow < out_dim) {
+                const uint64_t pbytes = (out_dim - prow < 8u ? out_dim - prow : 8u) * 340u;
+                const unsigned char *const pb = w + prow * 340u;
+                const unsigned char *const pend = w + out_dim * 340u - 128u;
+                const unsigned nl = (unsigned)((pbytes + 127u) / 128u);
+                if (threadIdx.x < nl) {
+                    const unsigned char *a = pb + (uint64_t)threadIdx.x * 128u;
+                    q8_hc_prefetch_l2(a < pend ? a : pend);
+                }
+            }
+        }
     }
-    __syncthreads();
-    QWEN4EXP_PDL_SYNC();
-    const uint64_t row = row0 + rl;
     float acc[R];
 #pragma unroll
     for (int r = 0; r < R; r++) acc[r] = 0.0f;
-    if (group < 10u && row < out_dim) {
-        const unsigned char *blk = sw + rl * 340u + group * 34u;
+    if (group < 10u) {
+        const unsigned char *blk = w + row * 340u + group * 34u;
         const unsigned char *payload = blk + 2u + half * 16u;
         const uintptr_t address = (uintptr_t)payload;
         const unsigned shift = (address & 3u) * 8u;
         const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
-        uint32_t previous = words[0];
+        uint32_t previous = __ldcs(words);
         int32_t wq[4];
 #pragma unroll
         for (int j = 0; j < 3; j++) {
-            const uint32_t next = words[j + 1];
+            const uint32_t next = __ldcs(words + j + 1);
             wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
             previous = next;
         }
-        const uint16_t last = *(const uint16_t *)(payload + 14u);
+        const uint16_t last = __ldcs((const uint16_t *)(payload + 14u));
         wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
-        const float ws = __half2float(__ushort_as_half(*(const uint16_t *)blk));
+        const float ws = __half2float(__ushort_as_half(__ldcs((const uint16_t *)blk)));
+        /* PDL: every weight word this lane owns is in registers -- this
+         * kernel reads the whole weight group before the first activation
+         * word -- so the fence goes here and holds the activation reads
+         * (xq/xs, the silu kernel's output) until it releases.  Nothing
+         * else moves. */
+        QWEN4EXP_PDL_SYNC();
 #pragma unroll
         for (int r = 0; r < R; r++) {
             if ((unsigned)r < rows) {
@@ -6709,26 +6829,9 @@ __global__ static void matmul_q8_hc_warp_pair_stage_kernel(
 #pragma unroll
         for (int d = 16; d >= 2; d >>= 1)
             acc[r] += __shfl_down_sync(0xffffffffu, acc[r], d);
-        if (lane == 0u && (unsigned)r < rows && row < out_dim)
+        if (lane == 0u && (unsigned)r < rows)
             out[(uint64_t)r * out_dim + row] = acc[r];
     }
-}
-
-/* The staged weight route above is DEFAULT ON with a kill switch, matching
- * every other measured path in this tree: DS4_Q8_HC_WARP_PAIR_STAGE=0
- * restores the shipped kernel exactly.  It was authored default-off for A/B
- * measurement, and a default-off valve ships as a no-op because the scored
- * run sets no environment.  Resolved once, as ds4_qwen4exp_pdl_enabled does,
- * so no launch pays a getenv. */
-static int cuda_q8_hc_warp_pair_stage(void) {
-    static int resolved = 0;
-    static int enabled = 0;
-    if (!resolved) {
-        const char *e = getenv("DS4_Q8_HC_WARP_PAIR_STAGE");
-        enabled = (e && e[0] == '0') ? 0 : 1;
-        resolved = 1;
-    }
-    return enabled;
 }
 
 /* The same per-output-element arithmetic as the tile kernel above, on the int8
@@ -7077,6 +7180,15 @@ __device__ __forceinline__ static uint4 q8_mma_ldg_16_cg(const void *gmem) {
     return v;
 }
 
+/* SWEEP 2026-09-18: an 8-byte-aligned pair of loads for weight rows whose
+ * byte length is 8 mod 16 (K = 640: 20 groups x 34 B = 680 B), where the
+ * 16-byte load of every odd row would be misaligned.  Same bytes. */
+__device__ __forceinline__ static uint4 q8_mma_ldg_16_a8(const void *gmem) {
+    uint2 lo, hi;
+    asm volatile("ld.global.v2.u32 {%0,%1}, [%2];" : "=r"(lo.x), "=r"(lo.y) : "l"(gmem));
+    asm volatile("ld.global.v2.u32 {%0,%1}, [%2];" : "=r"(hi.x), "=r"(hi.y) : "l"((const char *)gmem + 8));
+    return make_uint4(lo.x, lo.y, hi.x, hi.y);
+}
 __device__ __forceinline__ static uint32_t q8_mma_ldg_4(const void *gmem) {
     uint32_t v;
     asm volatile("ld.global.u32 %0, [%1];" : "=r"(v) : "l"(gmem));
@@ -7088,6 +7200,7 @@ __device__ __forceinline__ static void q8_mma_sts_16(void *smem, uint4 v) {
     asm volatile("st.shared.v4.u32 [%0], {%1,%2,%3,%4};"
                  :: "r"(s), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
 }
+
 
 __device__ __forceinline__ static void q8_mma_ldmatrix_x4(uint32_t r[4],
                                                           const void *smem) {
@@ -7185,311 +7298,46 @@ struct q8_mma_pipe_cfg {
 
 template <int WM, int WN, int MT, int NT, int G, int STAGES>
 __global__ __launch_bounds__((WM * WN + 4) * 32, Q8_MMA_MINB) static void
-matmul_q8_0_preq_rows_mma_pipe_kernel(float *out,
-                                      const unsigned char *w,
-                                      const int8_t *xq,
-                                      const float *xscale,
-                                      uint64_t out_dim,
-                                      uint32_t n_rows,
-                                      uint64_t blocks) {
-    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES> C;
-    constexpr int BM = C::BM, BN = C::BN;
+matmul_q8_0_preq_rows_mma_pipe_kernel
+#include "ds4_cuda_q8_pipe_kernel.inc"
 
-    extern __shared__ __align__(16) unsigned char q8_mma_smem[];
-    unsigned char *sA_all = q8_mma_smem;
-    unsigned char *sB_all = sA_all + STAGES * C::A_BYTES;
-    float *sAs_all = (float *)(sB_all + STAGES * C::B_BYTES);
-    float *sWs_all = sAs_all + STAGES * (C::AS_BYTES / 4);
+/* SWEEP 2026-09-17: the same body under a register cap.  The shipped
+ * instantiation above keeps __launch_bounds__ and its measured rung; this
+ * twin exists only so a second residency can be measured from one binary.
+ * DS4_Q8_PIPE_CAP selects it; unset means the shipped path, untouched. */
+template <int WM, int WN, int MT, int NT, int G, int STAGES, int CAP>
+__global__ __maxnreg__(CAP) static void
+matmul_q8_0_preq_rows_mma_pipe_cap_kernel
+#include "ds4_cuda_q8_pipe_kernel.inc"
 
-    const int tid = (int)threadIdx.x;
-    const uint32_t lane = threadIdx.x & 31u;
-    const int warp = tid >> 5;
-
-    const uint32_t m0 = (uint32_t)blockIdx.x * BM;
-    const uint64_t n0 = (uint64_t)blockIdx.y * BN;
-    if (m0 >= n_rows || n0 >= out_dim) return;
-
-    const uint64_t nstage = (blocks + (uint64_t)G - 1u) / (uint64_t)G;
-    const uint64_t w_row_bytes = blocks * 34u;
-    /* Barrier ids: 1 + 2*b is FULL[b], 2 + 2*b is EMPTY[b]; 0 is __syncthreads. */
-    constexpr int BAR_COUNT = C::THREADS;
-
-    if (warp >= C::CWARPS) {
-        const int pw = warp - C::CWARPS;
-        /* ---- The producer warps: every copy of every stage and the weight
-         * scales' half -> float, in stage order, the chunk lists dealt
-         * between them.  They never compute. */
-        /* Each producer lane owns, per stage, a fixed set of 16-byte
-         * chunks: chunk idx = lane + 32*(k*PWARPS + pw) over the activation
-         * chunks (row idx / A_CHUNKS, column idx % A_CHUNKS), the scale
-         * chunks (one per row), and the weight window chunks (whole rows
-         * per instruction: row idx / B_CHUNKS, column idx % B_CHUNKS, so an
-         * instruction's lanes walk a few rows end to end -- the L1 pays per
-         * distinct line, and lane-per-row copies measured twice as slow).
-         * A stage is loaded whole into registers with plain LDG, then stored
-         * to its buffer, so the copy is the tile above's kind of access on
-         * every memory the weights can live in. */
-        constexpr int PT = 32 * C::PWARPS;
-        constexpr int KA = (BM * C::A_CHUNKS + PT - 1) / PT;
-        constexpr int KS = (BM * (G / 4) + PT - 1) / PT;
-        constexpr int KB = (BN * C::B_CHUNKS + PT - 1) / PT;
-        static_assert(G % 4 == 0, "activation scales: 16-byte chunks");
-        const int pl = (int)lane + 32 * pw;   /* producer lane, 0 .. PT-1 */
-
-        for (uint64_t s = 0; s < nstage; s++) {
-            const int buf = (int)(s % (uint64_t)STAGES);
-            unsigned char *sA = sA_all + buf * C::A_BYTES;
-            unsigned char *sB = sB_all + buf * C::B_BYTES;
-            float *sAs = sAs_all + buf * (C::AS_BYTES / 4);
-            float *sWs = sWs_all + buf * (C::WS_BYTES / 4);
-            const uint64_t g0 = s * (uint64_t)G;
-            const uint64_t seg_off = s * (uint64_t)C::B_RAW;
-            const uint64_t win_off = seg_off & ~(uint64_t)15u;
-            const int skew = (int)(seg_off & 15u);
-
-            /* The stage into registers. */
-            uint4 ra[KA], rs[KS], rb[KB];
-#pragma unroll
-            for (int k = 0; k < KA; k++) {
-                const int idx = pl + k * PT;
-                const int r = idx / C::A_CHUNKS;
-                const int c = idx - r * C::A_CHUNKS;
-                const uint64_t row = (uint64_t)m0 + (uint32_t)r;
-                ra[k] = make_uint4(0u, 0u, 0u, 0u);
-                if (idx < BM * C::A_CHUNKS && row < (uint64_t)n_rows) {
-                    ra[k] = q8_mma_ldg_16_cg(xq + (row * blocks + g0 + (uint32_t)(c >> 1)) * 32u + (c & 1) * 16);
-                }
-            }
-#pragma unroll
-            for (int k = 0; k < KS; k++) {
-                const int idx = pl + k * PT;
-                const int r = idx / (G / 4);
-                const int c = idx - r * (G / 4);
-                const uint64_t row = (uint64_t)m0 + (uint32_t)r;
-                rs[k] = make_uint4(0u, 0u, 0u, 0u);
-                if (idx < BM * (G / 4) && row < (uint64_t)n_rows) {
-                    rs[k] = q8_mma_ldg_16_cg(xscale + row * blocks + g0 + (uint32_t)c * 4u);
-                }
-            }
-#pragma unroll
-            for (int k = 0; k < KB; k++) {
-                const int idx = pl + k * PT;
-                const int r = idx / C::B_CHUNKS;
-                const int c = idx - r * C::B_CHUNKS;
-                const uint64_t row = n0 + (uint32_t)r;
-                rb[k] = make_uint4(0u, 0u, 0u, 0u);
-                if (idx < BN * C::B_CHUNKS && row < out_dim) {
-                    const unsigned char *src = w + row * w_row_bytes + win_off + (uint32_t)c * 16u;
-                    /* Only the tensor's last row's window can leave it. */
-                    const int64_t in_row = (row + 1u == out_dim)
-                        ? (int64_t)w_row_bytes - (int64_t)win_off - (int64_t)c * 16 : 16;
-                    if (in_row >= 16) {
-                        rb[k] = q8_mma_ldg_16(src);
-                    } else {
-                        uint32_t q[4];
-#pragma unroll
-                        for (int i = 0; i < 4; i++) q[i] = ((int64_t)i * 4 < in_row) ? q8_mma_ldg_4(src + i * 4) : 0u;
-                        rb[k] = make_uint4(q[0], q[1], q[2], q[3]);
-                    }
-                }
-            }
-
-            /* The buffer must be free: consumers arrive on EMPTY[buf] when
-             * they finish stage s - STAGES. */
-            if (s >= (uint64_t)STAGES) q8_mma_bar_sync(2 + 2 * buf, BAR_COUNT);
-
-            /* The stage into its buffer. */
-#pragma unroll
-            for (int k = 0; k < KA; k++) {
-                const int idx = pl + k * PT;
-                const int r = idx / C::A_CHUNKS;
-                const int c = idx - r * C::A_CHUNKS;
-                if (idx < BM * C::A_CHUNKS) q8_mma_sts_16(sA + r * C::A_STRIDE + c * 16, ra[k]);
-            }
-#pragma unroll
-            for (int k = 0; k < KS; k++) {
-                const int idx = pl + k * PT;
-                const int r = idx / (G / 4);
-                const int c = idx - r * (G / 4);
-                if (idx < BM * (G / 4)) q8_mma_sts_16(sAs + r * G + c * 4, rs[k]);
-            }
-#pragma unroll
-            for (int k = 0; k < KB; k++) {
-                const int idx = pl + k * PT;
-                const int r = idx / C::B_CHUNKS;
-                const int c = idx - r * C::B_CHUNKS;
-                if (idx < BN * C::B_CHUNKS) q8_mma_sts_16(sB + r * C::B_STRIDE + c * 16, rb[k]);
-            }
-            /* Every producer's stores are visible to every producer: the
-             * scales below lie in rows another one stored. */
-            q8_mma_bar_sync(15, C::PWARPS * 32);
-
-            /* Weight scales, half -> float, [gg][BN]. */
-#pragma unroll
-            for (int j = 0; j < (G * BN + PT - 1) / PT; j++) {
-                const int i = pl + j * PT;
-                if (i < G * BN) {
-                    const int gg = i / BN;
-                    const int rr = i - gg * BN;
-                    uint16_t h;
-                    memcpy(&h, sB + rr * C::B_STRIDE + skew + gg * 34, 2);
-                    sWs[gg * BN + rr] = __half2float(__ushort_as_half(h));
-                }
-            }
-            __syncwarp();
-            q8_mma_bar_arrive(1 + 2 * buf, BAR_COUNT);
-        }
-        return;
-    }
-
-    /* ---- Consumers. */
-    const int wm = warp / WN;
-    const int wn = warp % WN;
-    const uint32_t g4 = lane >> 2u;
-    const uint32_t t4 = lane & 3u;
-
-    float acc[MT][NT][4];
-#pragma unroll
-    for (int mi = 0; mi < MT; mi++)
-#pragma unroll
-        for (int ni = 0; ni < NT; ni++)
-#pragma unroll
-            for (int e = 0; e < 4; e++) acc[mi][ni][e] = 0.0f;
-
-    const int a_lrow = (int)(lane & 15u);
-    const int a_lk = (int)(lane >> 4u) * 16;
-    const int32_t magic = Q8_MMA_MAGIC_BITS;
-
-    for (uint64_t s = 0; s < nstage; s++) {
-        const int buf = (int)(s % (uint64_t)STAGES);
-        q8_mma_bar_sync(1 + 2 * buf, BAR_COUNT);
-
-        const unsigned char *sA = sA_all + buf * C::A_BYTES; /* consumers: stage s's activations */
-        const unsigned char *sB = sB_all + buf * C::B_BYTES;
-        const float *sAs = sAs_all + buf * (C::AS_BYTES / 4);
-        const float *sWs = sWs_all + buf * (C::WS_BYTES / 4);
-        const int skew = (int)((s * (uint64_t)C::B_RAW) & 15u);
-
-        float xs[MT][2][G];
-#pragma unroll
-        for (int mi = 0; mi < MT; mi++) {
-#pragma unroll
-            for (int h = 0; h < 2; h++) {
-                const int r = wm * MT * 16 + mi * 16 + h * 8 + (int)g4;
-                if (G == 2) {
-                    const float2 v = *(const float2 *)(sAs + r * G);
-                    xs[mi][h][0] = v.x; xs[mi][h][1 % G] = v.y;
-                } else {
-#pragma unroll
-                    for (int q = 0; q < G / 4; q++) {
-                        const float4 v = *(const float4 *)(sAs + r * G + q * 4);
-                        xs[mi][h][(q * 4 + 0) % G] = v.x; xs[mi][h][(q * 4 + 1) % G] = v.y;
-                        xs[mi][h][(q * 4 + 2) % G] = v.z; xs[mi][h][(q * 4 + 3) % G] = v.w;
-                    }
-                }
-            }
-        }
-
-#pragma unroll
-        for (int gg = 0; gg < G; gg++) { /* the stage's k32 steps, ascending */
-            uint32_t af[MT][4];
-#pragma unroll
-            for (int mi = 0; mi < MT; mi++) {
-                const int rbase = wm * MT * 16 + mi * 16;
-                q8_mma_ldmatrix_x4(af[mi], sA + (rbase + a_lrow) * C::A_STRIDE + gg * 32 + a_lk);
-            }
-#pragma unroll
-            for (int ni = 0; ni < NT; ni++) {
-                const int c = wn * NT * 8 + ni * 8;
-                const unsigned char *pb = sB + (c + (int)g4) * C::B_STRIDE + skew + gg * 34 + 2 + (int)t4 * 4;
-                uint32_t bf[2];
-                if ((gg & 1) == 0) {
-                    const uint32_t *pw = (const uint32_t *)(pb - 2);
-                    bf[0] = __funnelshift_r(pw[0], pw[1], 16u);
-                    bf[1] = __funnelshift_r(pw[4], pw[5], 16u);
-                } else {
-                    const uint32_t *pw = (const uint32_t *)pb;
-                    bf[0] = pw[0];
-                    bf[1] = pw[4];
-                }
-                const float2 wsp = *(const float2 *)(sWs + gg * BN + c + (int)t4 * 2);
-                int32_t d[MT][4];
-#pragma unroll
-                for (int mi = 0; mi < MT; mi++) q8_mma_m16n8k32_seeded(d[mi], af[mi], bf, magic);
-#pragma unroll
-                for (int mi = 0; mi < MT; mi++) {
-                    acc[mi][ni][0] = q8_mma_fma_ftz(q8_mma_fmul_ftz(wsp.x, xs[mi][0][gg]), q8_mma_dot_to_f32(d[mi][0]), acc[mi][ni][0]);
-                    acc[mi][ni][1] = q8_mma_fma_ftz(q8_mma_fmul_ftz(wsp.y, xs[mi][0][gg]), q8_mma_dot_to_f32(d[mi][1]), acc[mi][ni][1]);
-                    acc[mi][ni][2] = q8_mma_fma_ftz(q8_mma_fmul_ftz(wsp.x, xs[mi][1][gg]), q8_mma_dot_to_f32(d[mi][2]), acc[mi][ni][2]);
-                    acc[mi][ni][3] = q8_mma_fma_ftz(q8_mma_fmul_ftz(wsp.y, xs[mi][1][gg]), q8_mma_dot_to_f32(d[mi][3]), acc[mi][ni][3]);
-                }
-            }
-        }
-        /* Done with this buffer. */
-        q8_mma_bar_arrive(2 + 2 * buf, BAR_COUNT);
-    }
-
-    /* The tile through shared memory, stored as whole rows.  The MMA layout
-     * leaves every thread two adjacent floats of eight rows, a scattered
-     * 8-byte store pattern; staged through the stage buffers the K loop has
-     * finished with, a row goes out as 512-byte lines.  The values are the
-     * accumulators, moved; no arithmetic.  Every production rung's tile fits
-     * its stage buffers; a rung whose tile would not (the 256-wide opt-in)
-     * keeps the direct store. */
-    constexpr bool row_store = BM * (BN + 4) * 4 <= C::SMEM;
-    if (!row_store) {
-#pragma unroll
-        for (int mi = 0; mi < MT; mi++) {
-            const uint64_t r_lo = (uint64_t)m0 + wm * MT * 16 + mi * 16 + g4;
-            const uint64_t r_hi = r_lo + 8u;
-#pragma unroll
-            for (int ni = 0; ni < NT; ni++) {
-                const uint64_t c0 = n0 + wn * NT * 8 + ni * 8 + t4 * 2u;
-                const uint64_t c1 = c0 + 1u;
-                if (r_lo < (uint64_t)n_rows) {
-                    if (c0 < out_dim) out[r_lo * out_dim + c0] = acc[mi][ni][0];
-                    if (c1 < out_dim) out[r_lo * out_dim + c1] = acc[mi][ni][1];
-                }
-                if (r_hi < (uint64_t)n_rows) {
-                    if (c0 < out_dim) out[r_hi * out_dim + c0] = acc[mi][ni][2];
-                    if (c1 < out_dim) out[r_hi * out_dim + c1] = acc[mi][ni][3];
-                }
-            }
-        }
-        return;
-    }
-    q8_mma_bar_sync(13, C::CWARPS * 32);   /* every consumer has left the last stage */
-    float *tile = (float *)q8_mma_smem;
-    constexpr int TS = BN + 4;
-#pragma unroll
-    for (int mi = 0; mi < MT; mi++) {
-        const int rl = wm * MT * 16 + mi * 16 + (int)g4, rh = rl + 8;
-#pragma unroll
-        for (int ni = 0; ni < NT; ni++) {
-            const int c = wn * NT * 8 + ni * 8 + (int)t4 * 2;
-            tile[rl * TS + c] = acc[mi][ni][0];
-            tile[rl * TS + c + 1] = acc[mi][ni][1];
-            tile[rh * TS + c] = acc[mi][ni][2];
-            tile[rh * TS + c + 1] = acc[mi][ni][3];
-        }
-    }
-    q8_mma_bar_sync(13, C::CWARPS * 32);   /* the tile is whole */
-    const bool vec = (out_dim & 3u) == 0u && ((((uintptr_t)out) & 15u) == 0u);
-    for (int r = warp; r < BM; r += C::CWARPS) {
-        const uint64_t row = (uint64_t)m0 + (uint32_t)r;
-        if (row >= (uint64_t)n_rows) continue;
-        for (int c = (int)lane * 4; c < BN; c += 128) {
-            if (vec && n0 + (uint32_t)c + 3u < out_dim) {
-                *(float4 *)(out + row * out_dim + n0 + (uint32_t)c) = *(const float4 *)(tile + r * TS + c);
-            } else {
-#pragma unroll
-                for (int e = 0; e < 4; e++) {
-                    if (n0 + (uint32_t)(c + e) < out_dim) out[row * out_dim + n0 + (uint32_t)(c + e)] = tile[r * TS + c + e];
-                }
-            }
-        }
-    }
+/* SWEEP 2026-09-18: cp.async (LDGSTS) helpers for the producer warps of the
+ * twin below.  src-size < 16 zero-fills the rest of the 16-byte chunk. */
+__device__ __forceinline__ static void q8_mma_cpasync_16_cg(void *smem, const void *gmem, uint32_t bytes) {
+    const uint32_t s = (uint32_t)__cvta_generic_to_shared(smem);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
+                 :: "r"(s), "l"(gmem), "r"(bytes) : "memory");
 }
+__device__ __forceinline__ static void q8_mma_cpasync_16_ca(void *smem, const void *gmem, uint32_t bytes) {
+    const uint32_t s = (uint32_t)__cvta_generic_to_shared(smem);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;"
+                 :: "r"(s), "l"(gmem), "r"(bytes) : "memory");
+}
+__device__ __forceinline__ static void q8_mma_cpasync_commit(void) {
+    asm volatile("cp.async.commit_group;" ::: "memory");
+}
+template <int N>
+__device__ __forceinline__ static void q8_mma_cpasync_wait(void) {
+    asm volatile("cp.async.wait_group %0;" :: "n"(N) : "memory");
+}
+
+/* SWEEP 2026-09-18: the pipe tile with cp.async producers (same consumers,
+ * same buffers, same bytes; ds4_cuda_q8_pipe_async_kernel.inc).  The shipped
+ * instantiation above is untouched; DS4_Q8_PIPE_ASYNC selects this twin. */
+template <int WM, int WN, int MT, int NT, int G, int STAGES>
+__global__ __launch_bounds__((WM * WN + 4) * 32, Q8_MMA_MINB) static void
+matmul_q8_0_preq_rows_mma_pipe_async_kernel
+#include "ds4_cuda_q8_pipe_async_kernel.inc"
+
 
 
 __device__ __forceinline__ static uint32_t q8_top1_float_ordered_key(float v) {
@@ -17973,6 +17821,16 @@ int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows) {
  * captures and first-touch costs. A local comparison that does not discard
  * each residency's first run is measuring which arm happened to go first.
  */
+extern "C" int ds4_qwen4exp_pdl_ext_enabled(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DS4_PDL_EXT"); v = e ? ((e[0] && e[0] != '0') ? 1 : 0) : 1; }  /* default ON; =0 disables */
+    return v && ds4_qwen4exp_pdl_enabled();
+}
+extern "C" int ds4_qwen4exp_wide3_enabled(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DS4_QWEN4EXP_WIDE3"); v = (e && e[0] && e[0] != '0') ? 1 : 0; }
+    return v;
+}
 int ds4_qwen4exp_pdl_enabled(void) {
     static int resolved = 0;
     static int enabled = 0;
@@ -18123,6 +17981,62 @@ static bool cuda_q8_mma_pipe_attr(void) {
     return state > 0;
 }
 
+#if 1
+/* SWEEP: attr/launch for the register-capped twin. */
+template <int WM, int WN, int MT, int NT, int G, int STAGES, int CAP>
+static bool cuda_q8_mma_pipe_cap_attr(void) {
+    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES> C;
+    static int state = 0;
+    if (state == 0) {
+        state = (cudaFuncSetAttribute(
+                     matmul_q8_0_preq_rows_mma_pipe_cap_kernel<WM, WN, MT, NT, G, STAGES, CAP>,
+                     cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM) == cudaSuccess) ? 1 : -1;
+        if (state < 0) (void)cudaGetLastError();
+    }
+    return state > 0;
+}
+template <int WM, int WN, int MT, int NT, int G, int STAGES, int CAP>
+static int cuda_q8_mma_pipe_cap_launch(float *out, const unsigned char *w,
+                                       const int8_t *xq, const float *xscale,
+                                       uint64_t out_dim, uint32_t n_rows,
+                                       uint64_t blocks) {
+    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES> C;
+    if (!cuda_q8_mma_pipe_cap_attr<WM, WN, MT, NT, G, STAGES, CAP>()) return 0;
+    dim3 grid((n_rows + C::BM - 1u) / C::BM, (unsigned)((out_dim + C::BN - 1u) / C::BN), 1u);
+    matmul_q8_0_preq_rows_mma_pipe_cap_kernel<WM, WN, MT, NT, G, STAGES, CAP>
+        <<<grid, C::THREADS, C::SMEM, cuda_decode_stream()>>>(out, w, xq, xscale, out_dim, n_rows, blocks, (const float *)NULL);
+    g_q8_mma_pipe_last_bn = C::BN;
+    return 1;
+}
+#endif
+
+/* SWEEP: attr/launch for the cp.async twin. */
+template <int WM, int WN, int MT, int NT, int G, int STAGES>
+static bool cuda_q8_mma_pipe_async_attr(void) {
+    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES> C;
+    static int state = 0;
+    if (state == 0) {
+        state = (cudaFuncSetAttribute(
+                     matmul_q8_0_preq_rows_mma_pipe_async_kernel<WM, WN, MT, NT, G, STAGES>,
+                     cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM) == cudaSuccess) ? 1 : -1;
+        if (state < 0) (void)cudaGetLastError();
+    }
+    return state > 0;
+}
+template <int WM, int WN, int MT, int NT, int G, int STAGES>
+static int cuda_q8_mma_pipe_async_launch(float *out, const unsigned char *w,
+                                         const int8_t *xq, const float *xscale,
+                                         uint64_t out_dim, uint32_t n_rows,
+                                         uint64_t blocks) {
+    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES> C;
+    if (!cuda_q8_mma_pipe_async_attr<WM, WN, MT, NT, G, STAGES>()) return 0;
+    dim3 grid((n_rows + C::BM - 1u) / C::BM, (unsigned)((out_dim + C::BN - 1u) / C::BN), 1u);
+    matmul_q8_0_preq_rows_mma_pipe_async_kernel<WM, WN, MT, NT, G, STAGES>
+        <<<grid, C::THREADS, C::SMEM, cuda_decode_stream()>>>(out, w, xq, xscale, out_dim, n_rows, blocks);
+    g_q8_mma_pipe_last_bn = C::BN;
+    return 1;
+}
+
 template <int WM, int WN, int MT, int NT, int G, int STAGES>
 static int cuda_q8_mma_pipe_launch(float *out, const unsigned char *w,
                                    const int8_t *xq, const float *xscale,
@@ -18132,9 +18046,40 @@ static int cuda_q8_mma_pipe_launch(float *out, const unsigned char *w,
     if (!cuda_q8_mma_pipe_attr<WM, WN, MT, NT, G, STAGES>()) return 0;
     dim3 grid((n_rows + C::BM - 1u) / C::BM, (unsigned)((out_dim + C::BN - 1u) / C::BN), 1u);
     matmul_q8_0_preq_rows_mma_pipe_kernel<WM, WN, MT, NT, G, STAGES>
-        <<<grid, C::THREADS, C::SMEM, cuda_decode_stream()>>>(out, w, xq, xscale, out_dim, n_rows, blocks);
+        <<<grid, C::THREADS, C::SMEM, cuda_decode_stream()>>>(out, w, xq, xscale, out_dim, n_rows, blocks, (const float *)NULL);
     g_q8_mma_pipe_last_bn = C::BN;
     return 1;
+}
+
+/* SWEEP 2026-09-18: the same launch on a caller's stream with the scaled-
+ * accumulate epilogue, for the shared expert's prefill GEMMs (DS4_SHEXP_PIPE). */
+template <int WM, int WN, int MT, int NT, int G, int STAGES>
+static int cuda_q8_mma_pipe_launch_on(cudaStream_t s, float *out, const unsigned char *w,
+                                      const int8_t *xq, const float *xscale,
+                                      uint64_t out_dim, uint32_t n_rows,
+                                      uint64_t blocks, const float *acc_scale) {
+    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES> C;
+    if (!cuda_q8_mma_pipe_attr<WM, WN, MT, NT, G, STAGES>()) return 0;
+    dim3 grid((n_rows + C::BM - 1u) / C::BM, (unsigned)((out_dim + C::BN - 1u) / C::BN), 1u);
+    matmul_q8_0_preq_rows_mma_pipe_kernel<WM, WN, MT, NT, G, STAGES>
+        <<<grid, C::THREADS, C::SMEM, s>>>(out, w, xq, xscale, out_dim, n_rows, blocks, acc_scale);
+    return cudaGetLastError() == cudaSuccess ? 1 : 0;
+}
+extern "C" int ds4_gpu_matmul_q8_0_preq_raw_pipe(
+        float *out, const unsigned char *w, const int8_t *xq, const float *xscale,
+        uint64_t in_dim, uint64_t out_dim, uint32_t n_rows, const float *acc_scale,
+        void *stream_v, int bn) {
+    if (!out || !w || !xq || !xscale || n_rows == 0u || out_dim == 0u ||
+        (in_dim % 128u) != 0u || !cuda_q8_mma_available() ||
+        (((uintptr_t)w) & 15u) != 0u || (((uintptr_t)xq) & 15u) != 0u ||
+        (((uintptr_t)xscale) & 15u) != 0u) {
+        return 0;
+    }
+    const uint64_t blocks = in_dim / 32u;
+    cudaStream_t s = stream_v ? (cudaStream_t)stream_v : cuda_decode_stream();
+    if (bn >= 128)
+        return cuda_q8_mma_pipe_launch_on<2, 4, 4, 4, 4, 2>(s, out, w, xq, xscale, out_dim, n_rows, blocks, acc_scale);
+    return cuda_q8_mma_pipe_launch_on<2, 2, 4, 4, 4, 2>(s, out, w, xq, xscale, out_dim, n_rows, blocks, acc_scale);
 }
 
 static void cuda_q8_mma_pipe_prepare(void) {
@@ -18142,6 +18087,14 @@ static void cuda_q8_mma_pipe_prepare(void) {
     (void)cuda_q8_mma_pipe_attr<2, 2, 4, 4, 4, 2>();
     (void)cuda_q8_mma_pipe_attr<2, 4, 4, 4, 4, 2>();
     (void)cuda_q8_mma_pipe_attr<2, 8, 4, 4, 4, 2>();
+    /* SWEEP: the capped twin's shared-memory opt-in, taken here at enable
+     * time for the same reason the shipped rungs are: a launch must never
+     * perform cudaFuncSetAttribute inside a stream capture. */
+    (void)cuda_q8_mma_pipe_cap_attr<2, 2, 2, 4, 4, 2, 128>();
+    (void)cuda_q8_mma_pipe_cap_attr<2, 2, 4, 4, 4, 2, 128>();
+    (void)cuda_q8_mma_pipe_async_attr<2, 2, 4, 4, 4, 2>();
+    (void)cuda_q8_mma_pipe_async_attr<2, 2, 4, 4, 4, 3>();
+    (void)cuda_q8_mma_pipe_async_attr<2, 4, 4, 4, 4, 2>();
 }
 
 /* The pipelined tile's shape ladder.  Returns 0 when the call is not one it
@@ -18181,6 +18134,46 @@ static int cuda_q8_mma_pipe_try(float *out, const unsigned char *w,
      * measured the faster of the two.  Every rung is the same arithmetic
      * (the kernel's contract), so the choice is byte-for-byte safe; the
      * valve only says which rung. */
+
+    /* SWEEP: DS4_Q8_PIPE_ASYNC=1|2|3 routes every pipe call through the
+     * cp.async twin on the 128x64 tile with 2, 3 or 4 stages.  Unset (0)
+     * leaves every shipped decision in place. */
+    {
+        static int q8_async = -2;
+        if (q8_async == -2) {
+            const char *e = getenv("DS4_Q8_PIPE_ASYNC");
+            q8_async = e ? atoi(e) : 2;  /* default: 3-stage cp.async rung; =0 restores the shipped pipe */
+        }
+        if (q8_async == 1 &&
+            cuda_q8_mma_pipe_async_launch<2, 2, 4, 4, 4, 2>(out, w, xq, xscale, out_dim, n_rows, blocks)) {
+            return 1;
+        }
+        if (q8_async == 2 &&
+            cuda_q8_mma_pipe_async_launch<2, 2, 4, 4, 4, 3>(out, w, xq, xscale, out_dim, n_rows, blocks)) {
+            return 1;
+        }
+        if (q8_async == 3 &&
+            cuda_q8_mma_pipe_async_launch<2, 4, 4, 4, 4, 2>(out, w, xq, xscale, out_dim, n_rows, blocks)) {
+            return 1;
+        }
+    }
+    /* SWEEP: DS4_Q8_PIPE_CAP=1|2 picks a register-capped rung before the
+     * shipped ladder.  Unset (0) leaves every shipped decision in place. */
+    {
+        static int q8_cap = -2;
+        if (q8_cap == -2) {
+            const char *e = getenv("DS4_Q8_PIPE_CAP");
+            q8_cap = e ? atoi(e) : 0;
+        }
+        if (q8_cap == 1 &&
+            cuda_q8_mma_pipe_cap_launch<2, 2, 2, 4, 4, 2, 128>(out, w, xq, xscale, out_dim, n_rows, blocks)) {
+            return 1;
+        }
+        if (q8_cap == 2 && out_dim >= 384u &&
+            cuda_q8_mma_pipe_cap_launch<2, 2, 4, 4, 4, 2, 128>(out, w, xq, xscale, out_dim, n_rows, blocks)) {
+            return 1;
+        }
+    }
     const int wide = cuda_q8_mma_pipe_wide_mode();
     if (wide != 0 && out_dim > 4096u) {
         if (wide >= 2 &&
@@ -18324,10 +18317,56 @@ static int cuda_matmul_q8_0_preq_rows_exact(
         /* PDL consumer: the stream predecessor is qwen4exp_hc_norm_quant,
          * which triggers at its top, and the kernel's weight-word prefetch
          * rides the norm's window (ds4_cuda_qwen4exp.cuh). */
-        QWEN4EXP_LAUNCH_PDL(matmul_q8_hc_down_pair_kernel, dim3(320u, n_rows, 1u), 32, 0,
-                            cuda_decode_stream(),
-                (float *)out->ptr, (const unsigned char *)wptr,
-                xq, xscale, n_rows);
+        {
+            static int hc_pf_done = 0;
+            if (!hc_pf_done) {
+                cudaStreamCaptureStatus cst = cudaStreamCaptureStatusNone;
+                if (cudaStreamIsCapturing(cuda_decode_stream(), &cst) == cudaSuccess &&
+                    cst == cudaStreamCaptureStatusNone) {
+                    const char *e = getenv("DS4_HC_PF");
+                    int d = e ? atoi(e) : 768;  /* default ON (up pair only); =0 disables */
+                    if (d < 0) d = 0;
+                    if (cudaMemcpyToSymbol(g_q8_hc_pf, &d, sizeof(d)) != cudaSuccess) (void)cudaGetLastError();
+                    {
+                        const char *e2 = getenv("DS4_HC_PF_DOWN");
+                        int d2 = e2 ? atoi(e2) : 0;
+                        if (d2 < 0) d2 = 0;
+                        if (cudaMemcpyToSymbol(g_q8_hc_pf_down, &d2, sizeof(d2)) != cudaSuccess) (void)cudaGetLastError();
+                        {
+                            const char *e3 = getenv("DS4_HC_PF_DOWN_D");
+                            int d3 = e3 ? atoi(e3) : 64;
+                            if (d3 < 0) d3 = 0;
+                            if (cudaMemcpyToSymbol(g_q8_hc_pf_down_dist, &d3, sizeof(d3)) != cudaSuccess) (void)cudaGetLastError();
+                        }
+                    }
+                    fprintf(stderr, "ds4: sweep hc prefetch distance %d\n", d);
+                    hc_pf_done = 1;
+                } else {
+                    (void)cudaGetLastError();
+                }
+            }
+        }
+        if (q8_hc_dstage_on() && n_rows <= 2u && ((uintptr_t)wptr & 15u) == 0u) {
+            QWEN4EXP_LAUNCH_PDL(matmul_q8_hc_down_stage_kernel, dim3(320u, 1u, 1u), 128, 0,
+                                cuda_decode_stream(),
+                    (float *)out->ptr, (const unsigned char *)wptr,
+                    xq, xscale, n_rows);
+        } else if (q8_hc_hoist_on()) {
+            QWEN4EXP_LAUNCH_PDL(matmul_q8_hc_down_hoist_kernel, dim3(320u, n_rows, 1u), 32, 0,
+                                cuda_decode_stream(),
+                    (float *)out->ptr, (const unsigned char *)wptr,
+                    xq, xscale, n_rows);
+        } else if (q8_hc_unroll_on()) {
+            QWEN4EXP_LAUNCH_PDL(matmul_q8_hc_down_pair_unroll_kernel, dim3(320u, n_rows, 1u), 32, 0,
+                                cuda_decode_stream(),
+                    (float *)out->ptr, (const unsigned char *)wptr,
+                    xq, xscale, n_rows);
+        } else {
+            QWEN4EXP_LAUNCH_PDL(matmul_q8_hc_down_pair_kernel, dim3(320u, n_rows, 1u), 32, 0,
+                                cuda_decode_stream(),
+                    (float *)out->ptr, (const unsigned char *)wptr,
+                    xq, xscale, n_rows);
+        }
         return cuda_ok(cudaGetLastError(), "q8 HC down pair launch");
     }
     /* Two lanes read each full group at one/two-row decode widths. Integer
@@ -18369,18 +18408,11 @@ static int cuda_matmul_q8_0_preq_rows_exact(
             } else if (getenv("DS4_Q8_NO_HC_WARP_PAIR") == NULL) {
                 /* PDL consumer: the stream predecessor is
                  * qwen4exp_hc_silu_quant, which triggers at its top
-                 * (ds4_cuda_qwen4exp.cuh).
-                 *
-                 * The staged weight route is the same grid, the same block
-                 * shape, the same warps per row and the same arithmetic; its
-                 * uint4 stage needs the slab 16-byte aligned and the row
-                 * count a multiple of four, both of which hold at this gated
-                 * shape and neither of which the kernel may assume. */
-                if (cuda_q8_hc_warp_pair_stage() &&
-                    (((uintptr_t)wptr & 15u) == 0u) && ((out_dim & 3u) == 0u)) {
+                 * (ds4_cuda_qwen4exp.cuh). */
+                if (q8_hc_up8_on()) {
                     QWEN4EXP_LAUNCH_PDL(
-                            (matmul_q8_hc_warp_pair_stage_kernel<2>),
-                            (unsigned)((out_dim + 3u) / 4u), 128, 0,
+                            (matmul_q8_hc_warp_pair8_kernel<2>),
+                            (unsigned)((out_dim + 7u) / 8u), 256, 0,
                             cuda_decode_stream(),
                             (float *)out->ptr, (const unsigned char *)wptr,
                             xq, xscale, out_dim, n_rows);
@@ -19908,126 +19940,15 @@ __device__ __forceinline__ void ds4_stage_pair(
 
 template <int TM, int TN, int WR, int WC, int MC, int STAGES, int CG>
 __global__ __launch_bounds__(32 * WR * WC, 1)
-static void matmul_f32_warp_tile8_stage_kernel(
-        float *out,
-        const float *w,
-        const float *x,
-        uint64_t in_dim,
-        uint64_t out_dim,
-        uint32_t n_rows) {
-    const int NW = WC * TN;            /* 16 weight columns per block  */
-    const int NX = WR * TM;            /* 24 activation rows per block */
-    const int SROW = 64;               /* two 32-chunks, ja then jb    */
-    const int SSZ = (NW + NX) * SROW;  /* 2560 floats = 10,240 B       */
-    __shared__ float st[STAGES * SSZ];
+static void matmul_f32_warp_tile8_stage_kernel
+#include "ds4_cuda_tile8_stage_body.inc"
 
-    const uint32_t lane = threadIdx.x & 31u;
-    const uint32_t warp = threadIdx.x >> 5;
-    const uint32_t wr_i = warp / (uint32_t)WC, wc_i = warp % (uint32_t)WC;
-    const uint32_t tile = blockIdx.x * (uint32_t)WC + wc_i;
-    const uint32_t ntn = (uint32_t)(out_dim / (uint64_t)TN);
-    const bool live_col = tile < ntn;
-    const uint32_t col0 = live_col ? tile * (uint32_t)TN : 0u;
-    const uint32_t row0_raw = (blockIdx.y * (uint32_t)WR + wr_i) * (uint32_t)TM;
-    const bool live_row = row0_raw < n_rows;
-    const uint32_t row0 = live_row ? row0_raw : 0u;
-    const uint32_t take = live_row
-        ? (n_rows - row0 < (uint32_t)TM ? n_rows - row0 : (uint32_t)TM)
-        : (uint32_t)TM;
-
-    /* Fill assignment, fixed for the kernel.  NW*64/4 = 256 weight chunks:
-     * thread tid takes chunk tid.  NX*64/4 = 384 activation chunks: thread tid
-     * takes tid, and tid < 128 takes 256 + tid.  A chunk is 4 consecutive
-     * floats inside one 32-element half, so it never straddles the ja|jb seam. */
-    const uint32_t tid = threadIdx.x;
-    const uint32_t wq_row = tid >> 4, wq_k = (tid & 15u) << 2;
-    const uint32_t xq0_row = tid >> 4, xq0_k = (tid & 15u) << 2;
-    const uint32_t xq1 = tid + 256u;
-    const uint32_t xq1_row = xq1 >> 4, xq1_k = (xq1 & 15u) << 2;
-
-    const uint32_t gcol = blockIdx.x * (uint32_t)NW + wq_row;
-    const uint32_t gcol_c = (uint64_t)gcol < out_dim ? gcol : 0u;
-
-    ds4_stage_fill_ctx f;
-    f.wsrc = w + (uint64_t)gcol_c * in_dim + (wq_k & 31u);
-    {   /* per-ROW-GROUP source row, with the shipping substitution */
-        const uint32_t g0 = xq0_row / (uint32_t)TM, t0i = xq0_row % (uint32_t)TM;
-        const uint32_t rb0 = (blockIdx.y * (uint32_t)WR + g0) * (uint32_t)TM;
-        const uint32_t tk0 = rb0 < n_rows
-            ? (n_rows - rb0 < (uint32_t)TM ? n_rows - rb0 : (uint32_t)TM) : 0u;
-        const uint32_t sr0 = rb0 < n_rows ? (rb0 + (t0i < tk0 ? t0i : 0u)) : 0u;
-        const uint32_t g1 = xq1_row / (uint32_t)TM, t1i = xq1_row % (uint32_t)TM;
-        const uint32_t rb1 = (blockIdx.y * (uint32_t)WR + g1) * (uint32_t)TM;
-        const uint32_t tk1 = rb1 < n_rows
-            ? (n_rows - rb1 < (uint32_t)TM ? n_rows - rb1 : (uint32_t)TM) : 0u;
-        const uint32_t sr1 = rb1 < n_rows ? (rb1 + (t1i < tk1 ? t1i : 0u)) : 0u;
-        f.x0src = x + (uint64_t)sr0 * in_dim + (xq0_k & 31u);
-        f.x1src = x + (uint64_t)sr1 * in_dim + (xq1_k & 31u);
-    }
-    f.wdst  = &st[wq_row * SROW + wq_k];
-    f.x0dst = &st[(NW + xq0_row) * SROW + xq0_k];
-    f.x1dst = &st[(NW + xq1_row) * SROW + xq1_k];
-    f.wj_hi  = wq_k  >= 32u ? 1u : 0u;
-    f.x0j_hi = xq0_k >= 32u ? 1u : 0u;
-    f.x1j_hi = xq1_k >= 32u ? 1u : 0u;
-    f.xq1_live = tid < 128u;
-
-#pragma unroll
-    for (int s = 0; s < STAGES - 1; s++)
-        ds4_stage_fill<CG>(f, s / MC, s % MC, s % STAGES, SSZ);
-
-    float A[TM][TN], B[TM][TN], t0[TM][TN], t1[TM][TN];
-    const float *sw = &st[wc_i * (uint32_t)TN * SROW];
-    const float *sx = &st[(NW + wr_i * (uint32_t)TM) * SROW];
-
-    /* h(p,64) = (c_p + c_{p+128}) + (c_{p+64} + c_{p+192}) */
-    ds4_stage_pair<TM, TN, MC, STAGES, 0, SROW, SSZ, CG>(t0, t1, sw, sx, lane, f);
-#pragma unroll
-    for (int t = 0; t < TM; t++)
-#pragma unroll
-        for (int c = 0; c < TN; c++) A[t][c] = t0[t][c] + t1[t][c];
-    ds4_stage_pair<TM, TN, MC, STAGES, 1, SROW, SSZ, CG>(t0, t1, sw, sx, lane, f);
-#pragma unroll
-    for (int t = 0; t < TM; t++)
-#pragma unroll
-        for (int c = 0; c < TN; c++) A[t][c] = A[t][c] + (t0[t][c] + t1[t][c]);
-    /* h(p+32,64) = (c_{p+32} + c_{p+160}) + (c_{p+96} + c_{p+224}) */
-    ds4_stage_pair<TM, TN, MC, STAGES, 2, SROW, SSZ, CG>(t0, t1, sw, sx, lane, f);
-#pragma unroll
-    for (int t = 0; t < TM; t++)
-#pragma unroll
-        for (int c = 0; c < TN; c++) B[t][c] = t0[t][c] + t1[t][c];
-    ds4_stage_pair<TM, TN, MC, STAGES, 3, SROW, SSZ, CG>(t0, t1, sw, sx, lane, f);
-#pragma unroll
-    for (int t = 0; t < TM; t++)
-#pragma unroll
-        for (int c = 0; c < TN; c++) B[t][c] = B[t][c] + (t0[t][c] + t1[t][c]);
-
-    /* h(p,32) = h(p,64) + h(p+32,64), then strides 16, 8, 4, 2, 1. */
-#pragma unroll
-    for (int t = 0; t < TM; t++)
-#pragma unroll
-        for (int c = 0; c < TN; c++) {
-            float s = A[t][c] + B[t][c];
-#pragma unroll
-            for (int d = 16; d > 0; d >>= 1) {
-                s = s + __shfl_down_sync(0xffffffffu, s, d);
-            }
-            A[t][c] = s;
-        }
-    if (lane == 0u && live_col && live_row) {
-#pragma unroll
-        for (int t = 0; t < TM; t++) {
-            if ((uint32_t)t < take) {
-#pragma unroll
-                for (int c = 0; c < TN; c++) {
-                    out[(uint64_t)(row0 + (uint32_t)t) * out_dim +
-                        (uint64_t)(col0 + (uint32_t)c)] = A[t][c];
-                }
-            }
-        }
-    }
-}
+/* SWEEP 2026-09-18: the same body under a residency floor MinB; the shipped
+ * instantiation above is untouched.  DS4_TILE8_MINB selects it at launch. */
+template <int TM, int TN, int WR, int WC, int MC, int STAGES, int CG, int MinB>
+__global__ __launch_bounds__(32 * WR * WC, MinB)
+static void matmul_f32_warp_tile8_stage_mb_kernel
+#include "ds4_cuda_tile8_stage_body.inc"
 
 /* The eight-warp arrangement: four row groups by two column groups, so a
  * block covers 24 rows by 16 columns.  DS4_F32_NO_WARP_TILE8 keeps the
@@ -20111,34 +20032,10 @@ template<int R, int C, int U>
 __global__ __launch_bounds__(256/C)
 static void qwen_f32_vector_tree_kernel(float *out, const float *w,
                                        const float *x, uint64_t out_dim) {
-    /* PDL PRODUCER.  At decode this kernel IS the router matmul, and its one
-     * consumer -- the fused router/group kernel -- is a single block that can
-     * do nothing until this grid's output exists.  Triggering here lets that
-     * block come up, be scheduled and park at its own fence while this grid
-     * runs, instead of paying a full launch turnaround after it drains.
-     *
-     * The trigger is the FIRST statement of the body, above the `t >= 32`
-     * return further down, so every block signals: a block that returned
-     * without signalling would leave the dependent waiting on whole-grid
-     * completion, which is a hang risk rather than a slowdown.
-     *
-     * THE DEADLOCK RULE, discharged by measurement rather than arithmetic:
-     * the launched grids are out_dim blocks, 512 for the router (64 threads)
-     * and 48 for the GDN alpha/beta projections (128 threads).
-     * cudaOccupancyMaxActiveBlocksPerMultiprocessor on these instantiations AS
-     * BUILT reports 24 blocks/SM for <2,4,1> and <1,4,1> at 64 threads (reg
-     * 32 and 22, 2 KB of static shared), so the 48-SM GB10 holds 1152 of them
-     * at once: 512 is one wave with a factor of 2.25 to spare, and 48 for the
-     * GDN arms is trivially inside it.  A dependent parked at its fence
-     * therefore cannot be holding a slot this grid still needs.  The bound is read from the grid in the body
-     * per ds4_cuda_qwen4exp.cuh's rule, so a wider caller never triggers.
-     *
-     * This kernel is BOTH a PDL consumer (the fence below, for the mixer's
-     * closing kernel) and now a producer.  The two are independent: the fence
-     * is this grid's wait on its own predecessor, the trigger is this grid's
-     * signal to its successor, and neither changes when the other fires. */
-    if ((uint64_t)gridDim.x * (uint64_t)gridDim.y * (uint64_t)gridDim.z <= 512u)
-        QWEN4EXP_PDL_TRIGGER();
+    /* SWEEP PDL_EXT: producer for the router grouping kernel behind it.  The
+     * decode grids are 48 and 512 blocks of 64-128 threads: single-wave on
+     * this device (the deadlock rule); wider grids never trigger. */
+    if (gridDim.x <= 1536u && gridDim.y == 1u) QWEN4EXP_PDL_TRIGGER();
     const unsigned t = threadIdx.x;
     const unsigned lane = t & 31u;
     const uint64_t col = blockIdx.x;
@@ -20218,7 +20115,6 @@ static void qwen_f32_vector_tree_kernel(float *out, const float *w,
         }
     }
 }
-
 
 /* One block owns either a Q8 output group or an F32 projection row.
  * Preserve each original arithmetic tree; float blocks come first in the grid.
@@ -20336,6 +20232,25 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
          * request so that read stays inside the allocation. */
         const uint64_t panel_bytes = (uint64_t)(B/64u) * blocks * 34u;
         const char *const gp = (const char *)w + (uint64_t)block * panel_bytes;
+        {
+            /* SWEEP: prefetch block+D's panel into L2 (DS4_GDN_PF); no value changes. */
+            const int pfd = g_q8_gdn_pf;
+            if (pfd > 0) {
+                const uint64_t pblk = (uint64_t)block + (uint64_t)pfd;
+                const uint64_t nblk = (out_dim + (B/64u) - 1u) / (B/64u);
+                if (pblk < nblk) {
+                    const uint64_t total = out_dim * blocks * 34u;
+                    const uint64_t pbytes = (pblk + 1u < nblk) ? panel_bytes : total - pblk * panel_bytes;
+                    const char *const pp = (const char *)w + pblk * panel_bytes;
+                    const char *const last = pp + pbytes - 1u;
+                    const unsigned nl = (unsigned)((pbytes + 127u) / 128u);
+                    for (unsigned i = threadIdx.x; i < nl; i += B) {
+                        const char *addr = pp + (uint64_t)i * 128u;
+                        q8_hc_prefetch_l2(addr <= last ? addr : last);
+                    }
+                }
+            }
+        }
         if (((uintptr_t)gp & 15u) == 0u) {
             for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
                  i += (uint64_t)B * 16u) {
@@ -20715,6 +20630,31 @@ extern "C" int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
         /* The eight-warp block at the production chain length only: the
          * runtime-count arm measured slower there, and nothing in the tower
          * reaches it. */
+        /* SWEEP: DS4_F32_TILE8_SHAPE=48|38|64 picks (TM, TN) for the tile8 block. */
+        static int t8shape = -1;
+        if (t8shape < 0) {
+            const char *e = getenv("DS4_F32_TILE8_SHAPE");
+            t8shape = e ? atoi(e) : 0;
+        }
+        if (in_dim == 2560u && !matmul_f32_warp_tile8_off() &&
+            (t8shape == 48 || t8shape == 38 || t8shape == 64)) {
+            const unsigned tm8 = (unsigned)(t8shape / 10), tn8 = (unsigned)(t8shape % 10);
+            const unsigned wr8 = DS4_F32_WARP_TILE8_WR, wc8 = DS4_F32_WARP_TILE8_WC;
+            const unsigned ntn2 = (unsigned)(out_dim / (uint64_t)tn8);
+            const uint64_t ytiles8 = ((uint64_t)n_rows + (uint64_t)wr8 * tm8 - 1u) / ((uint64_t)wr8 * tm8);
+            if (ytiles8 <= 65535u && (out_dim % tn8) == 0u) {
+                dim3 grid8s((ntn2 + wc8 - 1u) / wc8, (unsigned)ytiles8, 1);
+#define T8L(TM_, TN_) matmul_f32_warp_tile8_kernel<TM_, TN_, DS4_F32_WARP_TILE8_WR, DS4_F32_WARP_TILE8_WC, 2560 / 256> \
+                    <<<grid8s, 32 * wr8 * wc8, 0, cuda_decode_stream()>>>( \
+                        (float *)out->ptr, (const float *)w, \
+                        (const float *)x->ptr, in_dim, out_dim, n_rows)
+                if (t8shape == 48) T8L(4, 8);
+                else if (t8shape == 38) T8L(3, 8);
+                else T8L(6, 4);
+#undef T8L
+                return cuda_ok(cudaGetLastError(), "matmul_f32 warp tile8 shaped launch");
+            }
+        }
         if (in_dim == 2560u && !matmul_f32_warp_tile8_off()) {
             const unsigned wr8 = DS4_F32_WARP_TILE8_WR, wc8 = DS4_F32_WARP_TILE8_WC;
             const unsigned bm8 = wr8 * DS4_F32_WARP_TILE_TM;
@@ -20732,14 +20672,31 @@ extern "C" int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
                  * kernel if one is ever needed. */
                 if ((((uintptr_t)w | (uintptr_t)x->ptr) & 15u) == 0u &&
                     !matmul_f32_warp_tile8_stage_off()) {
-                    matmul_f32_warp_tile8_stage_kernel<
-                            DS4_F32_WARP_TILE_TM, DS4_F32_WARP_TILE_TN,
-                            DS4_F32_WARP_TILE8_WR, DS4_F32_WARP_TILE8_WC,
-                            2560 / 256, DS4_F32_WARP_TILE8_STAGES,
-                            DS4_F32_WARP_TILE8_STAGE_CG>
-                        <<<grid8, 32 * wr8 * wc8, 0, cuda_decode_stream()>>>(
-                            (float *)out->ptr, (const float *)w,
-                            (const float *)x->ptr, in_dim, out_dim, n_rows);
+                    {
+                        /* SWEEP valve: DS4_TILE8_MINB=2|3 runs the same text under
+                         * a residency floor (a twin instantiation, one binary). */
+                        static int t8mb = -1;
+                        if (t8mb < 0) {
+                            const char *e = getenv("DS4_TILE8_MINB");
+                            t8mb = e ? atoi(e) : 1;
+                        }
+#define DS4_T8_TPL DS4_F32_WARP_TILE_TM, DS4_F32_WARP_TILE_TN,                 \
+                   DS4_F32_WARP_TILE8_WR, DS4_F32_WARP_TILE8_WC,               \
+                   2560 / 256, DS4_F32_WARP_TILE8_STAGES,                      \
+                   DS4_F32_WARP_TILE8_STAGE_CG
+#define DS4_T8_ARGS                                                            \
+                        <<<grid8, 32 * wr8 * wc8, 0, cuda_decode_stream()>>>(  \
+                            (float *)out->ptr, (const float *)w,               \
+                            (const float *)x->ptr, in_dim, out_dim, n_rows)
+                        if (t8mb == 2)
+                            matmul_f32_warp_tile8_stage_mb_kernel<DS4_T8_TPL, 2> DS4_T8_ARGS;
+                        else if (t8mb == 3)
+                            matmul_f32_warp_tile8_stage_mb_kernel<DS4_T8_TPL, 3> DS4_T8_ARGS;
+                        else
+                            matmul_f32_warp_tile8_stage_kernel<DS4_T8_TPL> DS4_T8_ARGS;
+#undef DS4_T8_TPL
+#undef DS4_T8_ARGS
+                    }
                     return cuda_ok(cudaGetLastError(),
                                    "matmul_f32 warp tile8 stage launch");
                 }
@@ -20904,7 +20861,7 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
     a.od[0]=qkv_dim;a.od[1]=gate_dim;a.blocks=blocks;a.n_rows=rows;
     a.xq=(const int8_t *)((const char *)q->ptr+qoff);
     a.xscale=(const float *)((const char *)q->ptr+soff);a.x=(const float *)x->ptr;
-    if (rows<=2u && in_dim==2560u && qkv_dim>512u && gate_dim>512u &&
+    if ((rows<=2u || (rows<=4u && ds4_qwen4exp_wide3_enabled())) && in_dim==2560u && qkv_dim>512u && gate_dim>512u &&
         cuda_q8_use_dp4a() && getenv("DS4_QWEN4EXP_NO_ROW_TILE")==NULL &&
         getenv("DS4_QWEN4EXP_PAIR_LANES_R2")==NULL &&
         getenv("DS4_F32_NO_VECTOR_DECODE")==NULL &&
@@ -20923,6 +20880,23 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
             ((((uintptr_t)a.weights[0]|(uintptr_t)a.weights[1])&3u)==0u) &&
             gdn_panel<=49152u &&
             getenv("DS4_QWEN4EXP_NO_GDN_PANEL")==NULL;
+        {
+            static int gdn_pf_done = 0;
+            if (!gdn_pf_done) {
+                cudaStreamCaptureStatus cst = cudaStreamCaptureStatusNone;
+                if (cudaStreamIsCapturing(cuda_decode_stream(), &cst) == cudaSuccess &&
+                    cst == cudaStreamCaptureStatusNone) {
+                    const char *e = getenv("DS4_GDN_PF");
+                    int d = e ? atoi(e) : 0;
+                    if (d < 0) d = 0;
+                    if (cudaMemcpyToSymbol(g_q8_gdn_pf, &d, sizeof(d)) != cudaSuccess) (void)cudaGetLastError();
+                    fprintf(stderr, "ds4: sweep gdn prefetch distance %d\n", d);
+                    gdn_pf_done = 1;
+                } else {
+                    (void)cudaGetLastError();
+                }
+            }
+        }
         /* PDL consumer: the stream predecessor is the mixed-input quantizer,
          * which triggers at its top at these decode widths. */
         if (rows==1u) {
@@ -20932,12 +20906,27 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
             else
                 QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1>),
                                     grid, 256, 0, cuda_decode_stream(), a);
-        } else {
+        } else if (rows==2u) {
             if (gdn_stage)
                 QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2,true>),
                                     grid, 256, gdn_panel, cuda_decode_stream(), a);
             else
                 QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2>),
+                                    grid, 256, 0, cuda_decode_stream(), a);
+        } else if (rows==3u) {
+            /* SWEEP WIDE3: the depth-2 verify, one three-row tile. */
+            if (gdn_stage)
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<3,true>),
+                                    grid, 256, gdn_panel, cuda_decode_stream(), a);
+            else
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<3>),
+                                    grid, 256, 0, cuda_decode_stream(), a);
+        } else {
+            if (gdn_stage)
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<4,true>),
+                                    grid, 256, gdn_panel, cuda_decode_stream(), a);
+            else
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<4>),
                                     grid, 256, 0, cuda_decode_stream(), a);
         }
         return cuda_ok(cudaGetLastError(),"GDN four projections launch");
@@ -21201,7 +21190,7 @@ extern "C" int ds4_gpu_matmul_q8_0_preq_triple_rows_exact_tensor(
     }
     const int8_t *xq=(const int8_t *)((const char *)q->ptr+qoff);
     const float *xs=(const float *)((const char *)q->ptr+soff);
-    if (rows<=2u && in_dim!=320u && cuda_q8_use_dp4a() &&
+    if ((rows<=2u || (rows<=4u && ds4_qwen4exp_wide3_enabled())) && in_dim!=320u && cuda_q8_use_dp4a() &&
         getenv("DS4_QWEN4EXP_NO_ROW_TILE")==NULL &&
         getenv("DS4_QWEN4EXP_PAIR_LANES_R2")==NULL &&
         getenv("DS4_QWEN4EXP_Q8_WIDE_BLOCKS")==NULL &&
@@ -21231,14 +21220,38 @@ extern "C" int ds4_gpu_matmul_q8_0_preq_triple_rows_exact_tensor(
                 (float *)outs[0]->ptr,(float *)outs[1]->ptr,(float *)outs[2]->ptr,
                 (const unsigned char *)w[0],(const unsigned char *)w[1],
                 (const unsigned char *)w[2],xq,xs,od[0],od[1],od[2],rows,blocks);
-        else if (tr_stage)
+        else if (rows==2u && tr_stage)
             QWEN4EXP_LAUNCH_PDL((qwen_q8_projection_triple_kernel<2, true>),
                                 grid, 256, tr_panel, cuda_decode_stream(),
                 (float *)outs[0]->ptr,(float *)outs[1]->ptr,(float *)outs[2]->ptr,
                 (const unsigned char *)w[0],(const unsigned char *)w[1],
                 (const unsigned char *)w[2],xq,xs,od[0],od[1],od[2],rows,blocks);
-        else
+        else if (rows==2u)
             QWEN4EXP_LAUNCH_PDL((qwen_q8_projection_triple_kernel<2>),
+                                grid, 256, 0, cuda_decode_stream(),
+                (float *)outs[0]->ptr,(float *)outs[1]->ptr,(float *)outs[2]->ptr,
+                (const unsigned char *)w[0],(const unsigned char *)w[1],
+                (const unsigned char *)w[2],xq,xs,od[0],od[1],od[2],rows,blocks);
+        else if (rows==3u && tr_stage)   /* SWEEP WIDE3: three- and four-row verifies */
+            QWEN4EXP_LAUNCH_PDL((qwen_q8_projection_triple_kernel<3, true>),
+                                grid, 256, tr_panel, cuda_decode_stream(),
+                (float *)outs[0]->ptr,(float *)outs[1]->ptr,(float *)outs[2]->ptr,
+                (const unsigned char *)w[0],(const unsigned char *)w[1],
+                (const unsigned char *)w[2],xq,xs,od[0],od[1],od[2],rows,blocks);
+        else if (rows==3u)
+            QWEN4EXP_LAUNCH_PDL((qwen_q8_projection_triple_kernel<3>),
+                                grid, 256, 0, cuda_decode_stream(),
+                (float *)outs[0]->ptr,(float *)outs[1]->ptr,(float *)outs[2]->ptr,
+                (const unsigned char *)w[0],(const unsigned char *)w[1],
+                (const unsigned char *)w[2],xq,xs,od[0],od[1],od[2],rows,blocks);
+        else if (tr_stage)
+            QWEN4EXP_LAUNCH_PDL((qwen_q8_projection_triple_kernel<4, true>),
+                                grid, 256, tr_panel, cuda_decode_stream(),
+                (float *)outs[0]->ptr,(float *)outs[1]->ptr,(float *)outs[2]->ptr,
+                (const unsigned char *)w[0],(const unsigned char *)w[1],
+                (const unsigned char *)w[2],xq,xs,od[0],od[1],od[2],rows,blocks);
+        else
+            QWEN4EXP_LAUNCH_PDL((qwen_q8_projection_triple_kernel<4>),
                                 grid, 256, 0, cuda_decode_stream(),
                 (float *)outs[0]->ptr,(float *)outs[1]->ptr,(float *)outs[2]->ptr,
                 (const unsigned char *)w[0],(const unsigned char *)w[1],
