@@ -1,3 +1,4 @@
+/* ROUND 109 PROMOTION DRAW — stamp 20260918T194049Z. Tip 2352dfa. Best 2.661911 (terrapinelf spark-6). Bar 2.664573. R100=2.64129 s2 best-ours. R108=2.62222 s5 nq. */
 /*
  * qwen4exp serial graph: session state, memory plan and the forward.
  * See ds4_qwen4exp_graph.h for the contract and the layer schedule.
