@@ -76103,12 +76103,28 @@ static int qwen4exp_seam_draft_rows(void *ctx, const int *next_tokens,
                                     uint32_t n, int *draft_out,
                                     float *multi_out) {
     ds4_session *s = ctx;
+    ds4_engine *e = s->engine;
     char err[256];
+    /* The next round's verify vector starts with the fed token, which is the
+     * last row's input: offer it now so the gather-ahead worker faults its
+     * n-gram rows while the head forward below occupies the device. */
+    if (n > 0u) {
+        const int32_t parent = (int32_t)next_tokens[n - 1u];
+        ds4_qwen4exp_ple_gather_offer(e->qwen4exp_session,
+                                      e->qwen4exp_weights, &parent, 1u, 0);
+    }
     if (ds4_qwen4exp_mtp_head_forward_last(&s->qwen4exp_head, next_tokens,
                                            hc_rows, pos0, n, draft_out,
                                            multi_out, err, sizeof(err)) != 0) {
         fprintf(stderr, "ds4: qwen4exp MTP seam: %s\n", err);
         return -1;
+    }
+    /* The draft the head just returned is the vector's second token: append
+     * it so the worker keeps faulting through the inter-round gap. */
+    {
+        const int32_t draft = (int32_t)*draft_out;
+        ds4_qwen4exp_ple_gather_offer(e->qwen4exp_session,
+                                      e->qwen4exp_weights, &draft, 1u, 1);
     }
 #ifdef DS4_TEST_HOOKS
     /* The last row sits at pos0 + n - 1 and drafts the token two past it, the

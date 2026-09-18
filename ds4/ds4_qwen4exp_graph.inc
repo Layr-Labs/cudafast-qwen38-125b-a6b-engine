@@ -346,6 +346,11 @@ struct ds4_qwen4exp_session {
     ds4_gpu_tensor *gdn_state_snapshot[DS4_MAX_LAYER];
     ds4_gpu_tensor *ple_conv_snapshot;
     ds4_ple_history ple_history_rows[DS4_QWEN4EXP_IMPLEMENTED_DEPTH];
+    /* The gather-ahead worker: a thread that faults and dequantizes the NEXT
+     * round's n-gram rows while the draft head forward occupies the device,
+     * so the verify's gather adopts finished rows instead of stalling the
+     * command stream on storage.  NULL until the first offer allocates it. */
+    struct qw_ple_ahead_state *ple_ahead;
     /* How many slots the CURRENT forward is writing.  Armed by
      * ds4_qwen4exp_graph_verify_rows and zero everywhere else, so a prefill
      * chunk of 512 never asks for 512 slots. */
@@ -866,6 +871,9 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
     return s;
 }
 
+static void qw_ple_ahead_destroy(ds4_qwen4exp_session *s);
+
+
 void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     if (!s) return;
     /* Graph nodes retain session buffer addresses, even across resets. */
@@ -892,6 +900,9 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->ple_key);
     ds4_gpu_tensor_free(s->ple_aux);
     ds4_gpu_tensor_free(s->ple_value);
+    /* The gather-ahead worker may be mid-fault inside the table mapping;
+     * it is joined before anything it reads can be freed or unmapped. */
+    qw_ple_ahead_destroy(s);
     free(s->ple_ids);
     free(s->ple_rows_host);
     ds4_gpu_tensor_free(s->d_pos);
@@ -1245,6 +1256,226 @@ static void qw_ple_pool_init(void) {
     pthread_mutex_unlock(&g_qw_ple_pool.mutex);
 }
 
+/* ======================================================================
+ * The gather-ahead worker.
+ *
+ * A speculative round's verify vector is known the moment the draft head
+ * forward returns it: the fed token plus the chain.  The gather that turns
+ * those tokens into dequantized rows is pure host work -- hash, fault, read,
+ * dequantize -- and today it runs inside the verify's forward, on the
+ * critical path, while the device sits idle between the draft and the
+ * verify.  This worker takes the same vector as soon as the draft names it
+ * and does the faulting and dequantizing while the head forward and the
+ * inter-round host gap still have the wall clock.
+ *
+ * CORRECTNESS IS A COMPARE, NOT A CONTRACT.  The worker never touches the
+ * session's history or buffers: it snapshots the entry history and the hash
+ * constants at offer time, keeps its own staging, and the gather adopts the
+ * staged result only when the call's token vector, its length and the
+ * session's live entry history all match the staged ones byte for byte.
+ * Anything else -- a trimmed chain, an invalidated draft, a serial forward
+ * in between, a reset -- misses and the gather runs exactly the serial code
+ * it always ran, so a stale or partial staging can only waste work, never
+ * change a value.  The staged per-row histories are the same snapshots the
+ * armed path writes: `rows[t]` is the history after token t.
+ * ====================================================================== */
+struct qw_ple_ahead_state {
+    pthread_mutex_t   mutex;
+    pthread_cond_t    work_cond;
+    pthread_cond_t    done_cond;
+    pthread_t         thread;
+    int               started;
+    int               quit;
+    uint64_t          gen;          /* bumped on every reset               */
+    uint32_t          staged_n;     /* tokens offered for this generation  */
+    uint32_t          done_n;       /* tokens the worker finished          */
+    int               failed;       /* a row id fell past the table        */
+    ds4_ple_constants constants;    /* snapshot taken at the reset         */
+    ds4_qwen4exp_ple_table ple;     /* the table mapping, by value         */
+    ds4_ple_history   entry;        /* history the staged vector starts at */
+    int32_t           tokens[DS4_QWEN4EXP_MTP_MAX_COMMIT];
+    uint64_t         *ids;          /* [MAX_COMMIT][head_count]            */
+    float            *rows_host;    /* [MAX_COMMIT][ple_embd]              */
+    ds4_ple_history   rows[DS4_QWEN4EXP_MTP_MAX_COMMIT];
+};
+
+static void *qw_ple_ahead_worker(void *arg) {
+    struct qw_ple_ahead_state *a = (struct qw_ple_ahead_state *)arg;
+    const uint32_t blocks_per_row =
+        DS4_N_PLE_ROW_DIM / DS4_PLE_IQ4_NL_BLOCK_ELEMS;
+    uint64_t wgen = 0;
+    uint32_t next = 0;
+    ds4_ple_history hist;
+    memset(&hist, 0, sizeof(hist));
+    pthread_mutex_lock(&a->mutex);
+    for (;;) {
+        while (!a->quit &&
+               (a->gen == wgen ? next >= a->staged_n : a->staged_n == 0u)) {
+            pthread_cond_wait(&a->work_cond, &a->mutex);
+        }
+        if (a->quit) break;
+        if (a->gen != wgen) {
+            /* New vector: adopt the generation and its entry history. */
+            wgen = a->gen;
+            next = 0;
+            hist = a->entry;
+        }
+        const uint32_t t = next;
+        const int32_t tok = a->tokens[t];
+        pthread_mutex_unlock(&a->mutex);
+
+        /* The same ids and the same bytes the serial gather produces: the
+         * hash runs over the worker's own history, the row comes out of the
+         * same mapping, and the dequant is the same call. */
+        uint64_t ids[DS4_PLE_MAX_HEADS];
+        ds4_ple_row_ids(&a->constants, &hist, &tok, 1u, ids);
+        int ok = 1;
+        float *dst = a->rows_host + (uint64_t)t * DS4_N_PLE_EMBD;
+        for (uint32_t h = 0; h < DS4_N_PLE_HEAD && ok; h++) {
+            const uint8_t *quant = ds4_qwen4exp_ple_row(&a->ple, ids[h]);
+            if (!quant) {
+                ok = 0;
+                break;
+            }
+            ds4_ple_dequant_iq4_nl(quant, blocks_per_row, dst);
+            dst += DS4_N_PLE_ROW_DIM;
+        }
+
+        pthread_mutex_lock(&a->mutex);
+        if (a->gen == wgen && !a->quit) {
+            if (!ok) {
+                a->failed = 1;
+                next = UINT32_MAX;   /* stop this generation */
+            } else {
+                memcpy(a->ids + (uint64_t)t * DS4_N_PLE_HEAD, ids,
+                       (uint64_t)DS4_N_PLE_HEAD * sizeof(uint64_t));
+                a->rows[t] = hist;
+                a->done_n = t + 1u;
+            }
+            pthread_cond_broadcast(&a->done_cond);
+        }
+    }
+    pthread_mutex_unlock(&a->mutex);
+    return NULL;
+}
+
+/* Offer the next round's verify vector.  `append == false` starts a new
+ * vector at the fed token; `append == true` adds the draft the head just
+ * returned.  A vector longer than the commit envelope is dropped whole --
+ * the gather will miss and run serially, which is the same outcome a deeper
+ * chain gets from a partial staging anyway. */
+void ds4_qwen4exp_ple_gather_offer(ds4_qwen4exp_session       *s,
+                                   const ds4_qwen4exp_weights *w,
+                                   const int32_t              *tokens,
+                                   uint32_t                    n_tokens,
+                                   int                         append) {
+    if (!s || !w || !tokens || n_tokens == 0u || !s->ple_ready) return;
+    if (DS4_N_PLE_HEAD > DS4_PLE_MAX_HEADS) return;
+    struct qw_ple_ahead_state *a = s->ple_ahead;
+    if (!a) {
+        a = calloc(1, sizeof(*a));
+        if (!a) return;
+        pthread_mutex_init(&a->mutex, NULL);
+        pthread_cond_init(&a->work_cond, NULL);
+        pthread_cond_init(&a->done_cond, NULL);
+        a->ids = calloc((uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * DS4_N_PLE_HEAD,
+                        sizeof(uint64_t));
+        a->rows_host = calloc((uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT *
+                              DS4_N_PLE_EMBD, sizeof(float));
+        if (!a->ids || !a->rows_host ||
+            pthread_create(&a->thread, NULL, qw_ple_ahead_worker, a) != 0) {
+            free(a->ids);
+            free(a->rows_host);
+            free(a);
+            return;
+        }
+        a->started = 1;
+        s->ple_ahead = a;
+    }
+    pthread_mutex_lock(&a->mutex);
+    if (!append || a->staged_n == 0u) {
+        a->gen++;
+        a->staged_n = 0u;
+        a->done_n = 0u;
+        a->failed = 0;
+        a->constants = s->ple_constants;
+        a->ple = w->ple;
+        a->entry = s->ple_history;
+    }
+    if (a->staged_n + n_tokens > (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT) {
+        /* Overflow: drop the vector so the gather misses rather than waits
+         * on a staging that can never match. */
+        a->gen++;
+        a->staged_n = 0u;
+        a->done_n = 0u;
+        a->failed = 0;
+        pthread_mutex_unlock(&a->mutex);
+        return;
+    }
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        a->tokens[a->staged_n + i] = tokens[i];
+    }
+    a->staged_n += n_tokens;
+    pthread_cond_broadcast(&a->work_cond);
+    pthread_mutex_unlock(&a->mutex);
+}
+
+/* Adopt the staged gather when it is THIS call's gather: same length, same
+ * tokens, same entry history.  Waits out an in-flight tail -- the worker is
+ * ahead of the caller by construction, so the wait is the overlap paying
+ * off, not a stall.  Any mismatch or failure misses and the caller runs the
+ * serial path it always ran. */
+static bool qw_ple_ahead_take(ds4_qwen4exp_session *s,
+                              const int32_t *tokens, uint32_t n_tokens,
+                              uint32_t snap) {
+    struct qw_ple_ahead_state *a = s->ple_ahead;
+    if (!a) return false;
+    bool hit = false;
+    pthread_mutex_lock(&a->mutex);
+    const uint64_t gen = a->gen;
+    if (a->staged_n == n_tokens && !a->failed &&
+        memcmp(a->tokens, tokens, (uint64_t)n_tokens * sizeof(int32_t)) == 0 &&
+        memcmp(&a->entry, &s->ple_history, sizeof(ds4_ple_history)) == 0) {
+        while (a->gen == gen && !a->failed && a->done_n < a->staged_n) {
+            pthread_cond_wait(&a->done_cond, &a->mutex);
+        }
+        if (a->gen == gen && !a->failed && a->done_n == n_tokens) {
+            memcpy(s->ple_ids, a->ids,
+                   (uint64_t)n_tokens * DS4_N_PLE_HEAD * sizeof(uint64_t));
+            memcpy(s->ple_rows_host, a->rows_host,
+                   (uint64_t)n_tokens * DS4_N_PLE_EMBD * sizeof(float));
+            for (uint32_t t = 0; t < snap && t < n_tokens; t++) {
+                s->ple_history_rows[t] = a->rows[t];
+            }
+            s->ple_history = a->rows[n_tokens - 1u];
+            hit = true;
+        }
+    }
+    /* Consumed or not, this staging is spent: a later call that sees it
+     * again must miss on its own compare, not adopt a leftover. */
+    a->gen++;
+    a->staged_n = 0u;
+    a->done_n = 0u;
+    a->failed = 0;
+    pthread_mutex_unlock(&a->mutex);
+    return hit;
+}
+
+static void qw_ple_ahead_destroy(ds4_qwen4exp_session *s) {
+    struct qw_ple_ahead_state *a = s->ple_ahead;
+    if (!a) return;
+    s->ple_ahead = NULL;
+    pthread_mutex_lock(&a->mutex);
+    a->quit = 1;
+    pthread_cond_broadcast(&a->work_cond);
+    pthread_cond_broadcast(&a->done_cond);
+    pthread_mutex_unlock(&a->mutex);
+    if (a->started) pthread_join(a->thread, NULL);
+    free(a->ids);
+    free(a->rows_host);
+    free(a);
+}
+
 static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                                       const ds4_qwen4exp_weights *w,
                                       const int32_t *tokens,
@@ -1296,7 +1527,14 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
      * ds4_ple_row_ids is that a run of single-token calls names the same rows
      * a single long call would, so this is the same ids either way; splitting
      * it is how the per-row history is observed, not a different computation. */
-    if (s->spec_snapshot_rows > 0) {
+    /* The gather-ahead worker may already hold this call's rows: the draft
+     * seam offered it the next round's vector while the head forward ran.
+     * Adoption is a full compare -- length, tokens and entry history -- so a
+     * hit is byte-for-byte what the loops below would have produced, and a
+     * miss costs one memcmp and falls through to them unchanged. */
+    const bool ple_ahead_hit =
+        qw_ple_ahead_take(s, tokens, n_tokens, s->spec_snapshot_rows);
+    if (!ple_ahead_hit && s->spec_snapshot_rows > 0) {
         for (uint32_t t = 0; t < n_tokens; t++) {
             ds4_ple_row_ids(&s->ple_constants, &s->ple_history, tokens + t, 1u,
                             s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD);
@@ -1331,7 +1569,7 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 dst += DS4_N_PLE_ROW_DIM;
             }
         }
-    } else {
+    } else if (!ple_ahead_hit) {
         /* The prefill width: split the scan across worker threads when the
          * chunk is wide enough to be worth the spawn and the run has not
          * turned the pool off.  Every thread writes ids and rows for a
