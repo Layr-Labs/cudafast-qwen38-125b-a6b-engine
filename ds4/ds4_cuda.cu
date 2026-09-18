@@ -4192,12 +4192,111 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     return 1;
 }
 
+/* MAP THE WEIGHTS INTO THE DEVICE PAGE TABLES ONCE, AT INIT.
+ *
+ * cuda_model_prefetch_range() above is the only code in this file that issues
+ * any residency advice for the model mapping, and BOTH of its call sites are
+ * gated behind getenv("DS4_CUDA_COPY_MODEL_CHUNKED").  The aux path
+ * (ds4_gpu_set_aux_model_map_range) takes the `integrated && pageable` branch
+ * on a GB10 and direct-maps with no advice at all.  So on the ranked box the
+ * model mapping carries ZERO residency advice and every page is faulted in by
+ * the driver on first device touch.
+ *
+ * For weights walked in a fixed order that is a one-off warm-up cost.  For a
+ * table read at a DATA-DEPENDENT index -- the n-gram/PLE reader -- "first
+ * touch" recurs every round, on different pages each time, and the fault tail
+ * shows up in the per-round idle attribution as one of four gap rows.
+ *
+ * SetAccessedBy is the advice for exactly this and nothing more: it establishes
+ * the device-side mappings without migrating a byte and without declaring a
+ * preferred home.  That is the only member of the family that is SAFE on a
+ * part where "device memory" and "host memory" are the same physical 128 GiB:
+ *
+ *   SetReadMostly        -- asks for read-duplication.  On a coherent
+ *                           integrated part duplication would cost real RAM
+ *                           against a 103.7 GiB resident.  Not taken.
+ *   SetPreferredLocation -- names a home for pages that already live in the
+ *                           one memory there is.  Meaningless here at best.
+ *                           Not taken.
+ *   MemPrefetchAsync     -- a migration of the full mapping.  On this part it
+ *                           is 103.7 GiB of pointless work, and it is the one
+ *                           call that could plausibly push the box into
+ *                           reclaim.  Not taken.
+ *
+ * API legality was verified model-free on this box before the arm was written,
+ * because the pre-existing call site is env-gated off and may never have run
+ * here: a 64 MiB file-backed MAP_PRIVATE/PROT_READ mmap (the same shape as the
+ * GGUF mapping, not cudaMallocManaged memory) accepts SetReadMostly,
+ * SetAccessedBy, SetPreferredLocation and cudaMemPrefetchAsync, all returning
+ * cudaSuccess, on integrated=1 pageableMemoryAccess=1
+ * concurrentManagedAccess=1.  So the call below cannot fail for a reason that
+ * a checkpoint-sized mapping would reveal and a probe would not.
+ *
+ * Failure is not fatal and is not silent: an unsupported advice leaves the
+ * engine in exactly the state it is in today (fault on first touch), which is
+ * why this is unconditional rather than env-gated.  Advice moves no data,
+ * changes no value, and orders nothing -- no kernel can observe whether it
+ * ran.
+ *
+ * READOUT, pre-committed: this is an init-time call on a path the scored
+ * window does not re-enter, so if it costs anything it costs model-load time,
+ * which is not scored.  A decode leg that moves by more than the draw noise in
+ * EITHER direction is the signal; a null means the driver accepted the advice
+ * and ignored it, which on an integrated part is a live possibility. */
+static void cuda_model_advise_accessed_by(const void *model_map,
+                                          uint64_t model_size,
+                                          uint64_t map_offset,
+                                          uint64_t map_size) {
+    if (!model_map || map_size == 0 || map_offset > model_size ||
+        map_size > model_size - map_offset) return;
+    if (getenv("DS4_CUDA_NO_MODEL_ADVISE") != NULL) return;
+
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) { (void)cudaGetLastError(); return; }
+    int pageable = 0;
+    if (cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccess,
+                               device) != cudaSuccess || !pageable) {
+        (void)cudaGetLastError();
+        return;
+    }
+#if CUDART_VERSION >= 13000
+    cudaMemLocation loc;
+    memset(&loc, 0, sizeof(loc));
+    loc.type = cudaMemLocationTypeDevice;
+    loc.id = device;
+#else
+    int loc = device;
+#endif
+    /* Round out to whole pages: cudaMemAdvise takes a byte range but acts on
+     * pages, and a partial page at either end would otherwise be left out. */
+    const long page_sz_l = sysconf(_SC_PAGESIZE);
+    const uint64_t page_sz = page_sz_l > 0 ? (uint64_t)page_sz_l : 4096u;
+    const uintptr_t host_addr = (uintptr_t)((const char *)model_map + map_offset);
+    const uintptr_t adv_addr = host_addr & ~(uintptr_t)(page_sz - 1u);
+    const uint64_t adv_delta = (uint64_t)(host_addr - adv_addr);
+    const uint64_t adv_bytes = (adv_delta + map_size + page_sz - 1u) & ~(page_sz - 1u);
+
+    const cudaError_t err =
+        cudaMemAdvise((void *)adv_addr, (size_t)adv_bytes,
+                      cudaMemAdviseSetAccessedBy, loc);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA model accessed-by advise skipped: %s\n",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return;
+    }
+    fprintf(stderr, "ds4: CUDA advised %.2f GiB model mapping accessed-by device\n",
+            (double)adv_bytes / 1073741824.0);
+}
+
 extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes) {
     (void)max_tensor_bytes;
     if (!ds4_gpu_register_model_map_no_copy(model_map, model_size)) return 0;
     if (getenv("DS4_CUDA_COPY_MODEL_CHUNKED") != NULL &&
         !cuda_model_copy_chunked(model_map, model_size, map_offset, map_size)) {
         (void)cuda_model_prefetch_range(model_map, model_size, map_offset, map_size);
+    } else {
+        cuda_model_advise_accessed_by(model_map, model_size, map_offset, map_size);
     }
     return 1;
 }
@@ -4231,6 +4330,12 @@ extern "C" int ds4_gpu_set_aux_model_map_range(
         fprintf(stderr,
                 "ds4: CUDA directly mapped %.2f GiB auxiliary model\n",
                 (double)map_size / 1073741824.0);
+        /* This is the branch a GB10 takes, and until now it direct-mapped with
+         * no residency advice whatsoever -- see the long comment on
+         * cuda_model_advise_accessed_by().  Direct mapping establishes the
+         * ENGINE's view of the range; it does not establish the DEVICE page
+         * tables, which is what removes the fault on first touch. */
+        cuda_model_advise_accessed_by(model_map, model_size, map_offset, map_size);
         return 1;
     }
 
