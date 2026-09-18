@@ -375,6 +375,7 @@ struct ds4_qwen4exp_session {
     uint32_t        adopt_state;   /* recurrent state: row + 1, or 0 */
     uint32_t        adopt_conv;    /* conv history: row + 1, or 0 */
     uint32_t        adopt_device;  /* host mirror of *d_adopt */
+    uint32_t        adopt_ple;     /* PLE conv state: row + 1, or 0 */
     ds4_gpu_tensor *d_gdn_replay;
     ds4_gpu_tensor *gdn_replay_gates;
     bool gdn_replay_enabled;
@@ -998,6 +999,7 @@ void ds4_qwen4exp_session_reset(ds4_qwen4exp_session *s) {
      * live buffers are what the next forward must read. */
     s->adopt_state = 0u;
     s->adopt_conv = 0u;
+    s->adopt_ple = 0u;
     s->gdn_replay_active = false;
     s->gdn_replay_previous = false;
     s->gdn_replay_prefix = 0u;
@@ -2619,6 +2621,21 @@ static bool qwen4exp_forward_fail(void) {
     return false;
 }
 
+/* Issue a pending lazy PLE-conv adoption inside the caller's open batch.
+ * The copy is stream-ordered ahead of everything the batch encodes after it,
+ * so the PLE block reads the restored window and the restore rides the
+ * forward's own drain instead of a private batch and synchronize. */
+static bool qwen4exp_ple_adopt_flush(ds4_qwen4exp_session *s) {
+    if (s->adopt_ple == 0u) return true;
+    const uint64_t bytes = ds4_gpu_tensor_bytes(s->ple_conv_state);
+    const bool ok = ds4_gpu_tensor_copy(s->ple_conv_state, 0,
+                                        s->ple_conv_snapshot,
+                                        (uint64_t)(s->adopt_ple - 1u) * bytes,
+                                        bytes) != 0;
+    if (ok) s->adopt_ple = 0u;
+    return ok;
+}
+
 /* The PLE host gather and token/position uploads precede this device-only
  * layer stack.  A captured stack retains the same operations and scratch
  * addresses while replacing the per-layer graph launch train with one call. */
@@ -3067,6 +3084,15 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         fprintf(stderr, "ds4: qwen4exp could not open a command batch\n");
         return false;
     }
+    /* A rejecting round deferred its PLE conv restore to here: the copy joins
+     * this batch ahead of every layer encode, so the PLE block reads the
+     * adopted window and the restore drains with the forward instead of a
+     * private batch and synchronize at select time. */
+    if (!qwen4exp_ple_adopt_flush(s)) {
+        fprintf(stderr, "ds4: qwen4exp PLE conv rollback could not settle\n");
+        return qwen4exp_forward_fail();
+    }
+
 
     /* Layer-0 seed: gather the embedding row and tile it into every stream. */
     if (!ds4_gpu_qwen4exp_embed_tokens_hc_tensor(
@@ -3832,6 +3858,18 @@ static double qwen4exp_gdn_checksum(const ds4_qwen4exp_session *s, uint32_t il,
                                          bytes);
 }
 
+/* The PLE conv window with a pending lazy adoption reads, like the GDN
+ * objects above, as the snapshot slot the next forward will restore. */
+static double qwen4exp_ple_checksum(const ds4_qwen4exp_session *s) {
+    if (!s->ple_conv_state || !s->ple_conv_snapshot || s->adopt_ple == 0u) {
+        return qwen4exp_state_checksum(s->ple_conv_state);
+    }
+    const uint64_t bytes = ds4_gpu_tensor_bytes(s->ple_conv_state);
+    return qwen4exp_state_checksum_range(s->ple_conv_snapshot,
+                                         (uint64_t)(s->adopt_ple - 1u) * bytes,
+                                         bytes);
+}
+
 /*
  * The same carried state, ONE OBJECT PER ENTRY rather than one sum per layer.
  *
@@ -3890,7 +3928,7 @@ int ds4_qwen4exp_test_state_object(const ds4_qwen4exp_session *s, int index,
     switch (index - layer_entries) {
     case 0:
         if (name && name_len) snprintf(name, name_len, "ple_conv_state");
-        if (sum) *sum = qwen4exp_state_checksum(s->ple_conv_state);
+        if (sum) *sum = qwen4exp_ple_checksum(s);
         return 1;
     case 1: {
         if (name && name_len) snprintf(name, name_len, "ple_history");
@@ -3930,7 +3968,7 @@ void ds4_qwen4exp_test_state_checksums(const ds4_qwen4exp_session *s,
                   qwen4exp_state_checksum(s->idx_pool[il]);
     }
     if ((int)cfg->n_layer + 1 < cap) {
-        out[cfg->n_layer] = qwen4exp_state_checksum(s->ple_conv_state);
+        out[cfg->n_layer] = qwen4exp_ple_checksum(s);
         double h = 0.0;
         for (uint32_t i = 0; i < DS4_PLE_MAX_NGRAM; i++) {
             h += (double)s->ple_history.previous[i] * (double)(i + 1u);
@@ -3965,13 +4003,14 @@ static int qwen4exp_rb_ple_conv_select(void *ctx, uint32_t row) {
     ds4_qwen4exp_session *s = ctx;
     if (row >= DS4_QWEN4EXP_IMPLEMENTED_DEPTH) return -1;
     s->state_dirty = true;   /* see `state_dirty` */
-    const uint64_t bytes = ds4_gpu_tensor_bytes(s->ple_conv_state);
-    if (!ds4_gpu_begin_commands()) return -1;
-    const bool ok = ds4_gpu_tensor_copy(s->ple_conv_state, 0,
-                                        s->ple_conv_snapshot,
-                                        (uint64_t)row * bytes, bytes) != 0;
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) return -1;
-    return ok ? 0 : -1;
+    /* Lazy, like the GDN objects: record the slot and let the next forward
+     * issue the copy inside its own batch ahead of the PLE block encode, so
+     * the restore rides that forward's drain instead of a private batch and
+     * synchronize here.  Nothing reads ple_conv_state between a select and
+     * the next forward -- the head block carries no PLE state -- and a reset
+     * clears the flag with the buffers. */
+    s->adopt_ple = row + 1u;
+    return 0;
 }
 static int qwen4exp_rb_qsa_kv_truncate(void *ctx, uint32_t pos) {
     ds4_qwen4exp_session *s = ctx;
