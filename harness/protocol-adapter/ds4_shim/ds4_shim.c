@@ -142,16 +142,54 @@ ds4s_handle *ds4s_open(const char *model_path, const char *mtp_head_path,
      */
     if (getenv("DS4_SHIM_NO_WARMUP") == NULL) {
         const int vocab = ds4s_vocab_size(h);
-        enum { WARM_PROMPT = 1024, WARM_ROUNDS = 4, WARM_CAP = 8 };
-        if (vocab > 16) {
-            int32_t *ids = (int32_t *)malloc((size_t)WARM_PROMPT * sizeof(*ids));
+        enum { WARM_ROUNDS = 4, WARM_CAP = 8 };
+        /* THE WARM PROMPT MUST BE AS WIDE AS THE WIDEST PREFILL FORWARD, not
+         * merely wide enough to reach the decode shapes.
+         *
+         * The routed MoE keeps ONE grown-in-place device scratch per tier
+         * (ds4_cuda_qwen4exp.cu), and its size is linear in the forward's row
+         * count: the quantised input alone is n_tokens * xgroups * 32 bytes.
+         * Growing it frees the old allocation, and because captured decode
+         * islands bake these addresses into their kernel nodes the grow path
+         * must -- correctly -- call ds4_gpu_decode_graphs_invalidate() first.
+         *
+         * A prompt is prefilled in forwards of at most
+         * DS4_QWEN4EXP_MAX_PREFILL_ROWS, which is 4096. So a 1024-row warm
+         * prompt sized that scratch for 1024 rows, captured every decode
+         * island against it, and then the FIRST SCORED PREFILL -- wider than
+         * 1024 rows, hence a 4096-row forward -- grew the same scratch and
+         * retired every graph the warm-up had just paid for. The captures
+         * were then re-taken inside benchd's clock. Widening the warm prompt
+         * to the batch ceiling makes the scratch reach its final size here,
+         * before any window opens, so the islands captured below are the ones
+         * the scored leg actually runs.
+         *
+         * This is the residue the note above predicted and did not remove:
+         * with the 1024-row warm-up in the tree the pair-1/pair-2 asymmetry
+         * it documents is still present on the candidate leg and still absent
+         * on the control leg.
+         *
+         * Clamped to the session context so a small-context open still warms
+         * the widest forward that context permits. Everything stays
+         * best-effort: a failed sync leaves exactly the tree that shipped
+         * before, and DS4_SHIM_NO_WARMUP=1 stands the whole block down. */
+        /* Tracks DS4_QWEN4EXP_MAX_PREFILL_ROWS (ds4_qwen4exp.h), which the
+         * public ds4.h does not export; keep the two in step. A value BELOW
+         * the engine's ceiling only leaves part of the residue behind, and a
+         * value above it is clamped by the batch cap anyway, so the shim is
+         * safe either way if the engine's ceiling moves. */
+        enum { WARM_MAX_PREFILL_ROWS = 4096 };
+        int warm_prompt = WARM_MAX_PREFILL_ROWS;
+        if (ctx_size - 64 < warm_prompt) warm_prompt = ctx_size - 64;
+        if (vocab > 16 && warm_prompt > 16) {
+            int32_t *ids = (int32_t *)malloc((size_t)warm_prompt * sizeof(*ids));
             if (ids) {
                 const int32_t span = (int32_t)(vocab - 8);
-                for (int i = 0; i < WARM_PROMPT; i++)
+                for (int i = 0; i < warm_prompt; i++)
                     ids[i] = (int32_t)(1 + (i % span));
-                if (ds4s_sync(h, ids, (size_t)WARM_PROMPT) == 0) {
+                if (ds4s_sync(h, ids, (size_t)warm_prompt) == 0) {
                     /* the 1-row teacher-forced shape */
-                    (void)ds4s_eval(h, ids[WARM_PROMPT - 1]);
+                    (void)ds4s_eval(h, ids[warm_prompt - 1]);
                     /* the speculative shapes: the 2-row verify and the head's
                      * own island, which only a speculative cycle reaches */
                     if (mtp_draft_tokens >= 1) {
