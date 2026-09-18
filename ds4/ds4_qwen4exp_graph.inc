@@ -1464,7 +1464,7 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 "ds4: qwen4exp PLE gather %u rows took %.3f ms\n",
                 n_tokens, (now_sec() - gather_t0) * 1000.0);
     }
-    if (!ds4_gpu_tensor_write(s->ple_rows, 0, s->ple_rows_host,
+    if (!ds4_gpu_tensor_write_async(s->ple_rows, 0, s->ple_rows_host,
                               (uint64_t)n_tokens * DS4_N_PLE_EMBD * sizeof(float))) {
         fprintf(stderr, "ds4: qwen4exp n-gram row upload failed at block %u\n", il);
         return false;
@@ -2962,7 +2962,7 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         return false;
     }
 
-    if (!ds4_gpu_tensor_write(s->tokens, 0, tokens,
+    if (!ds4_gpu_tensor_write_async(s->tokens, 0, tokens,
                               (uint64_t)n_tokens * sizeof(int32_t))) {
         fprintf(stderr, "ds4: qwen4exp token upload failed\n");
         return false;
