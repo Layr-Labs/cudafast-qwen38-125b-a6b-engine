@@ -1440,6 +1440,23 @@ int ds4_qwen4exp_mtp_head_forward(ds4_qwen4exp_mtp_head *h,
                                  draft_out, multi_out, false, NULL, 0u, false, err, errlen);
 }
 
+static bool mtp_cache_source_range(const ds4_qwen4exp_mtp_head *h, uint32_t first, uint32_t rows);
+/* The draft's hyper rows taken straight from the target's device tensor:
+ * the same forward as ds4_qwen4exp_mtp_head_forward_last, with the row upload
+ * replaced by a device-to-device copy. */
+int ds4_qwen4exp_mtp_head_forward_last_device(ds4_qwen4exp_mtp_head *h,
+                                              const int *next_tokens,
+                                              const ds4_gpu_tensor *hyper_device,
+                                              uint32_t first_row,
+                                              uint32_t pos0, uint32_t n_tokens,
+                                              int *draft_out, float *multi_out,
+                                              char *err, size_t errlen) {
+    if (!hyper_device || !mtp_cache_source_range(h, first_row, n_tokens))
+        return mtp_fail(err, errlen, "qwen4exp MTP: invalid device hyper rows");
+    return mtp_head_forward_impl(h, next_tokens, NULL, pos0, n_tokens,
+                                 draft_out, multi_out, true, hyper_device, first_row, false, err, errlen);
+}
+
 int ds4_qwen4exp_mtp_head_forward_last(ds4_qwen4exp_mtp_head *h,
                                        const int *next_tokens,
                                        const float *multi_in,
