@@ -577,6 +577,12 @@ static int mtp_commit_one(ds4_qwen4exp_mtp_state *st,
  * than better. The gap in the comment is real; exploiting it is not
  * obviously a win.
  */
+/* This build's note auto09181257_32 records that this tree defines three
+ * hundred and twenty-three kernels and only fifty-one execute at the decode
+ * widths. Forty-four execute at prefill, sixty-seven at decode, and only
+ * eighteen in both, so a does-this-kernel-run filter applied to one phase
+ * produces false negatives for the other.
+ */
 int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
                            const ds4_qwen4exp_mtp_model *model,
                            int first_token,
