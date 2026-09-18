@@ -8766,6 +8766,10 @@ static int qwen4exp_shared_pipe_dispatch(
     return 0;
 }
 
+/* SWEEP 2026-09-18 (F3): the shared-expert prefill GEMMs re-staged, same
+ * arithmetic; DS4_SHARED_PIPE2 selects them (off unset). */
+#include "ds4_cuda_qwen4exp_shared_pipe2.inc"
+
 /* Does this call take the tile?
  *
  * DS4_QWEN4EXP_SHARED_MMA is the kill switch and the test handle: "0" keeps
@@ -10044,6 +10048,12 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
     const int pipe_gateup = qwen4exp_shared_pipe_ok(gu_types, 2u, xgroups, n_tokens, xq, gate, up, &gu_pk, &gu_pl);
     const int pipe_down = qwen4exp_shared_pipe_ok(dn_types, 1u, mgroups, n_tokens, mq, down, NULL, &dn_pk, &dn_pl);
     if (pipe_gateup &&
+        qwen4exp_shared_pipe2_gateup((float *)mid->ptr, gate, up, xq, xs,
+                                     gate_slab->row_bytes, up_slab->row_bytes,
+                                     xgroups, mid_dim, n_tokens, side)) {
+        /* SWEEP (F3): the re-staged twin, DS4_SHARED_PIPE2=1|2. */
+        ds4_gpu_qwen4exp_shared_mma_launches++;
+    } else if (pipe_gateup &&
         qwen4exp_shared_pipe_dispatch<2>(gu_pk, gu_pl, (float *)mid->ptr, gate, up, xq, xs,
                                          NULL, gate_slab->row_bytes, up_slab->row_bytes,
                                          xgroups, mid_dim, n_tokens, side)) {
@@ -10174,6 +10184,12 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
     }
 
     if (pipe_down &&
+        qwen4exp_shared_pipe2_down((float *)out->ptr, down, mq, ms,
+                                   (const float *)gate_scale->ptr, down_slab->row_bytes,
+                                   mgroups, out_dim, n_tokens, stream)) {
+        /* SWEEP (F3): the whole-K twin, DS4_SHARED_PIPE2=1|3. */
+        ds4_gpu_qwen4exp_shared_mma_launches++;
+    } else if (pipe_down &&
         qwen4exp_shared_pipe_dispatch<1>(dn_pk, dn_pl, (float *)out->ptr, down, NULL, mq, ms,
                                          (const float *)gate_scale->ptr, down_slab->row_bytes,
                                          0u, mgroups, out_dim, n_tokens, stream)) {
