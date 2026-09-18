@@ -3528,20 +3528,20 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
     int d = ds4_tensor_device_idx(dst);
     int ok = 0;
     WITH_DEVICE(g_gpu[d].device_id) {
-        if (g_decode_graph_capturing) {
-            ok = cuda_ok(cudaMemcpyAsync((char *)dst->ptr + dst_offset,
-                                         (const char *)src->ptr + src_offset,
-                                         (size_t)bytes,
-                                         cudaMemcpyDeviceToDevice,
-                                         cuda_decode_stream()),
-                         "tensor copy");
-        } else {
-            ok = cuda_ok(cudaMemcpy((char *)dst->ptr + dst_offset,
-                                    (const char *)src->ptr + src_offset,
-                                    (size_t)bytes,
-                                    cudaMemcpyDeviceToDevice),
-                         "tensor copy");
-        }
+        /* One async copy on the decode stream in both modes.  The eager
+         * path used to be a blocking cudaMemcpy: the host waited on the
+         * copy's own synchronisation inside the serial gap, once per
+         * call, and the rollback settle issues dozens of these per step
+         * (the GDN state and conv restores, the draft pack loops).  The
+         * legacy stream serialises with the blocking graph stream the
+         * replays run on, so the async copy lands in exactly the order
+         * the blocking one did -- only the host's wait is gone. */
+        ok = cuda_ok(cudaMemcpyAsync((char *)dst->ptr + dst_offset,
+                                       (const char *)src->ptr + src_offset,
+                                       (size_t)bytes,
+                                       cudaMemcpyDeviceToDevice,
+                                       cuda_decode_stream()),
+                     "tensor copy");
     }
     return ok;
 }
