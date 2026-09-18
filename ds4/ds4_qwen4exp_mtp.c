@@ -461,7 +461,7 @@ static int mtp_draft_chain(ds4_qwen4exp_mtp_state *st,
     uint32_t p = pos + (uint32_t)n;
     int k = 0;
 
-    if (model->draft_rows) {
+    if (model->draft_rows || model->draft_rows_device) {
         /*
          * The seed rows and chain step 0 in ONE head forward.  Rows j0 .. start
          * take the tokens toks[j0 - pos + 1 .. n] and then next_fed, over the
@@ -479,9 +479,16 @@ static int mtp_draft_chain(ds4_qwen4exp_mtp_state *st,
         rows_tok[seeds] = next_fed;
         float *multi_out = (1 < st->depth) ? ping : NULL;
         int draft = -1;
-        if (model->draft_rows(model->ctx, rows_tok,
-                              hc_rows + (size_t)k0 * st->hc_dim,
-                              j0, seeds + 1u, &draft, multi_out) != 0) {
+        /* Same rows, same order, same bytes -- only the transfer path differs.
+         * The device seam takes them from row k0 of the verify's own on-device
+         * hyper (hc_rows is NULL then); otherwise the host slab is uploaded. */
+        const int drc = model->draft_rows_device
+            ? model->draft_rows_device(model->ctx, rows_tok, k0,
+                                       j0, seeds + 1u, &draft, multi_out)
+            : model->draft_rows(model->ctx, rows_tok,
+                                hc_rows + (size_t)k0 * st->hc_dim,
+                                j0, seeds + 1u, &draft, multi_out);
+        if (drc != 0) {
             return mtp_fail(err, errlen,
                             "qwen4exp MTP: %u-row head forward at position %u "
                             "failed", seeds + 1u, j0);
@@ -549,7 +556,10 @@ static int mtp_commit_one(ds4_qwen4exp_mtp_state *st,
                           int first_token, uint32_t pos,
                           int *accepted, float *logits,
                           int *next_out, char *err, size_t errlen) {
-    float *hc0 = st->hc_scratch;
+    /* NULL when the draft sources its multi row from device (see the cycle):
+     * the decode then skips the hyper read-back and the draft copies row 0 of
+     * the session's device hyper directly. */
+    float *hc0 = model->draft_rows_device ? NULL : st->hc_scratch;
     const uint64_t t0 = mtp_now_ns();
     const int drc = model->decode_token(model->ctx, first_token, pos, hc0,
                                         logits);
@@ -658,7 +668,12 @@ int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
     /* No round-start snapshot.  The verify forward itself leaves the state
      * after each drafted row in a slot, so there is nothing to copy first and
      * nothing to rewind to afterwards. */
-    float *const hc = st->hc_scratch;
+    /* The verify writes its hyper rows here for the draft to re-upload.  When
+     * the seam can copy them into the head on-device (draft_rows_device), that
+     * read-back is pure round-trip: skip it and pass NULL, so the verify leaves
+     * the rows only where they already are -- the session's device hyper buffer
+     * -- and the draft reads them from there. */
+    float *const hc = model->draft_rows_device ? NULL : st->hc_scratch;
     float *const row_logits = st->logits_rows;
     int row_top1[DS4_QWEN4EXP_MTP_MAX_COMMIT];
     const bool compact_logits =
@@ -1440,23 +1455,6 @@ int ds4_qwen4exp_mtp_head_forward(ds4_qwen4exp_mtp_head *h,
                                  draft_out, multi_out, false, NULL, 0u, false, err, errlen);
 }
 
-static bool mtp_cache_source_range(const ds4_qwen4exp_mtp_head *h, uint32_t first, uint32_t rows);
-/* The draft's hyper rows taken straight from the target's device tensor:
- * the same forward as ds4_qwen4exp_mtp_head_forward_last, with the row upload
- * replaced by a device-to-device copy. */
-int ds4_qwen4exp_mtp_head_forward_last_device(ds4_qwen4exp_mtp_head *h,
-                                              const int *next_tokens,
-                                              const ds4_gpu_tensor *hyper_device,
-                                              uint32_t first_row,
-                                              uint32_t pos0, uint32_t n_tokens,
-                                              int *draft_out, float *multi_out,
-                                              char *err, size_t errlen) {
-    if (!hyper_device || !mtp_cache_source_range(h, first_row, n_tokens))
-        return mtp_fail(err, errlen, "qwen4exp MTP: invalid device hyper rows");
-    return mtp_head_forward_impl(h, next_tokens, NULL, pos0, n_tokens,
-                                 draft_out, multi_out, true, hyper_device, first_row, false, err, errlen);
-}
-
 int ds4_qwen4exp_mtp_head_forward_last(ds4_qwen4exp_mtp_head *h,
                                        const int *next_tokens,
                                        const float *multi_in,
@@ -1465,6 +1463,16 @@ int ds4_qwen4exp_mtp_head_forward_last(ds4_qwen4exp_mtp_head *h,
                                        char *err, size_t errlen) {
     return mtp_head_forward_impl(h, next_tokens, multi_in, pos0, n_tokens,
                                  draft_out, multi_out, true, NULL, 0u, false, err, errlen);
+}
+
+int ds4_qwen4exp_mtp_head_forward_last_device(
+        ds4_qwen4exp_mtp_head *h, const int *next_tokens,
+        const ds4_gpu_tensor *multi_device, uint32_t first_device_row,
+        uint32_t pos0, uint32_t n_tokens, int *draft_out, float *multi_out,
+        char *err, size_t errlen) {
+    return mtp_head_forward_impl(h, next_tokens, NULL, pos0, n_tokens,
+                                 draft_out, multi_out, true, multi_device,
+                                 first_device_row, false, err, errlen);
 }
 
 

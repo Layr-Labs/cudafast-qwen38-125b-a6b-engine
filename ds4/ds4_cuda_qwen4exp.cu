@@ -1,6 +1,3 @@
-/* redraw rx22532110 (2026-09-17T22:53:21Z): this archive repeats the official evaluation of the
- * same engine. The only textual difference from the previous evaluation
- * is this dated provenance comment. No behaviour changes. */
 /* redraw rx11204626 (2026-09-17T11:20:46Z): this archive repeats the official evaluation of the
  * same engine. The only textual difference from the previous evaluation
  * is this dated provenance comment. No behaviour changes. */
@@ -6035,7 +6032,7 @@ __device__ __forceinline__ static void qw_gu_coop_raw_load(
  * the measured floor, at which point gate/up occupancy is CLOSED for a real
  * reason rather than a mis-read one. */
 #if defined(__CUDACC__) && CUDART_VERSION >= 12040
-#define QW_GU_MAXNREG __maxnreg__(32)
+#define QW_GU_MAXNREG __maxnreg__(40)
 #else
 #define QW_GU_MAXNREG
 #endif
