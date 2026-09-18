@@ -505,6 +505,14 @@ __global__ static void qwen4exp_gdn_conv_kernel(
         uint32_t     n_snapshot_rows,
         float        qk_norm_eps,
         const uint32_t *adopt_row) {
+    /* PDL producer for the recurrence that follows on the stream, and
+     * consumer of the fused projections ahead of it: the trigger opens the
+     * dependent's launch window while this kernel's own fence below still
+     * waits on the projections (the both-ways rule, ds4_cuda_qwen4exp.cuh).
+     * The grid is (2*key + value) channel blocks by n_rows -- eighty blocks
+     * at this model's widths, one wave, so the deadlock rule's bound holds
+     * wherever the trigger can fire. */
+    if (gridDim.x * gridDim.y * gridDim.z <= 96u) QWEN4EXP_PDL_TRIGGER();
     const uint32_t block = blockIdx.x;
     const uint32_t row = blockIdx.y;
     const uint32_t tid = threadIdx.x;
@@ -549,6 +557,10 @@ __global__ static void qwen4exp_gdn_conv_kernel(
     const float w2 = conv_weight[(uint64_t)channel * 4u + 2u];
     const float w3 = conv_weight[(uint64_t)channel * 4u + 3u];
 
+    /* The fence: the history window, the convolution weights and the adopt
+     * flag above are not written by the projections kernel this launch
+     * overlaps; the convolved qkv below is. */
+    QWEN4EXP_PDL_SYNC();
     float raw = qkv[(uint64_t)row * n_tokens * conv_dim + channel];
     for (uint32_t token = 0; token < n_tokens; token++) {
         const uint64_t index =
@@ -624,6 +636,10 @@ __global__ static void qwen4exp_gdn_conv_replay_gates_kernel(
         const uint32_t *adopt_row, float2 *gate_pairs,
         const float *raw_alpha, const float *raw_beta,
         const float *a_log, const float *dt_bias) {
+    /* PDL producer for the replay recurrence that follows on the stream,
+     * and consumer of the fused projections ahead of it -- the same edge
+     * the serial twin carries.  Eighty blocks by n_rows, one wave. */
+    if (gridDim.x * gridDim.y * gridDim.z <= 96u) QWEN4EXP_PDL_TRIGGER();
     const uint32_t block = blockIdx.x;
     const uint32_t row = blockIdx.y;
     const uint32_t tid = threadIdx.x;
@@ -668,6 +684,10 @@ __global__ static void qwen4exp_gdn_conv_replay_gates_kernel(
     const float w2 = conv_weight[(uint64_t)channel * 4u + 2u];
     const float w3 = conv_weight[(uint64_t)channel * 4u + 3u];
 
+    /* The fence: history, weights, the adopt flag and the raw gate rows
+     * the publisher tail reads are not written by the kernel this launch
+     * overlaps; the convolved qkv below is. */
+    QWEN4EXP_PDL_SYNC();
     float raw = qkv[(uint64_t)row * n_tokens * conv_dim + channel];
     for (uint32_t token = 0; token < n_tokens; token++) {
         const uint64_t index =
@@ -882,7 +902,7 @@ template <bool PRECOMPUTED_GATES>
 __global__ static void qwen4exp_gdn_recurrence_kernel(
         float       *__restrict__ out,
         float       *__restrict__ state,
-        const float *__restrict__ qkv,
+        const float *qkv,
         const float *__restrict__ raw_alpha,
         const float *__restrict__ raw_beta,
         const float *__restrict__ a_log,
@@ -935,6 +955,13 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
     const float decay_coeff = a_log[head];
     const float bias = dt_bias[head];
 
+    /* The fence: the standing state, a_log, dt_bias and the adopt flag
+     * above are not written by the convolution this launch overlaps; the
+     * convolved qkv (and the gate pairs the <true> arm reads) below are.
+     * qkv carries no __restrict__ for exactly this reason -- an .nc load
+     * hoisted above the fence could read a half-convolved row (the .nc
+     * rule, ds4_cuda_qwen4exp.cuh). */
+    QWEN4EXP_PDL_SYNC();
     for (uint32_t token = 0; token < n_tokens; token++) {
         const uint64_t slot = (uint64_t)row * n_tokens + token;
         const uint64_t base = slot * conv_dim + key_head * QWEN4EXP_GDN_DIM;
@@ -1032,6 +1059,11 @@ __global__ static void qwen4exp_gdn_replay_kernel(
     float4 h = *(const float4 *)(checkpoint + state_off);
     const float decay_coeff = n_tokens ? a_log[head] : 0.0f;
     const float bias = n_tokens ? dt_bias[head] : 0.0f;
+    /* The fence: the control word, the checkpoint and the tape above are
+     * written before the layer stack runs or by earlier rounds, never by
+     * the convolution this launch overlaps; the convolved qkv and the raw
+     * gate rows below are. */
+    QWEN4EXP_PDL_SYNC();
     for (uint32_t step = 0; step < prefix + n_tokens; step++) {
         const bool replay = step < prefix;
         const uint32_t token = replay ? 0u : step - prefix;
@@ -1113,6 +1145,11 @@ __global__ static void qwen4exp_gdn_replay_gates_kernel(
     const uint64_t state_off = ((uint64_t)head * QWEN4EXP_GDN_DIM + value) *
                                QWEN4EXP_GDN_DIM + k0;
     float4 h = *(const float4 *)(checkpoint + state_off);
+    /* The fence: the control word, the checkpoint and the tape above are
+     * written before the layer stack runs or by earlier rounds, never by
+     * the convolution this launch overlaps; the convolved qkv and the
+     * published gate pairs below are. */
+    QWEN4EXP_PDL_SYNC();
     for (uint32_t step = 0; step < prefix + n_tokens; step++) {
         const bool replay = step < prefix;
         const uint32_t token = replay ? 0u : step - prefix;
@@ -1660,6 +1697,13 @@ __global__ static void qwen4exp_gdn_output_kernel(
         uint32_t     n_rows,
         uint32_t     n_tokens,
         float        norm_eps) {
+    /* PDL producer for the quantize that follows on the stream at decode
+     * widths, and consumer of the recurrence ahead of it.  The grid is
+     * (token, value head, row): forty-eight blocks at decode, ninety-six
+     * at a two-row verify, one wave either way; prefill's token axis is
+     * orders larger and never fires (the deadlock rule,
+     * ds4_cuda_qwen4exp.cuh). */
+    if (gridDim.x * gridDim.y * gridDim.z <= 96u) QWEN4EXP_PDL_TRIGGER();
     const uint32_t token = blockIdx.x;
     const uint32_t head = blockIdx.y;
     const uint32_t row = blockIdx.z;
@@ -1671,6 +1715,10 @@ __global__ static void qwen4exp_gdn_output_kernel(
     const uint32_t value_dim = n_value_head * QWEN4EXP_GDN_DIM;
     const uint64_t base = ((uint64_t)row * n_tokens + token) * value_dim +
         head * QWEN4EXP_GDN_DIM;
+    /* The fence: everything this kernel reads is the recurrence's output
+     * or the projections' gate row, both upstream of the launch edge this
+     * kernel rides. */
+    QWEN4EXP_PDL_SYNC();
     const float raw = out[base + tid];
     float total = warp_sum_f32(raw * raw);
     if (lane == 0u) partial[warp] = total;
@@ -2711,16 +2759,18 @@ static int qwen4exp_cuda_gdn_run(
             return 0;
         }
     } else if (replay_gates) {
-        qwen4exp_gdn_conv_replay_gates_kernel<<<dim3(blocks, n_rows, 1u),
-                QWEN4EXP_GDN_DIM, 0, stream>>>(
+        QWEN4EXP_LAUNCH_PDL(
+                (qwen4exp_gdn_conv_replay_gates_kernel),
+                dim3(blocks, n_rows, 1u), QWEN4EXP_GDN_DIM, 0, stream,
                 (float *)qkv->ptr, (float *)conv_state->ptr, conv_weight,
                 (float *)conv_snapshot->ptr, n_key_head, n_value_head, n_rows,
                 n_tokens, n_snapshot_rows, qk_norm_eps, adopt_row, replay_gates,
                 (const float *)raw_alpha->ptr, (const float *)raw_beta->ptr,
                 a_log, dt_bias);
     } else {
-        qwen4exp_gdn_conv_kernel<<<dim3(blocks, n_rows, 1u),
-                                   QWEN4EXP_GDN_DIM, 0, stream>>>(
+        QWEN4EXP_LAUNCH_PDL(
+                (qwen4exp_gdn_conv_kernel),
+                dim3(blocks, n_rows, 1u), QWEN4EXP_GDN_DIM, 0, stream,
                 (float *)qkv->ptr, (float *)conv_state->ptr, conv_weight,
                 conv_snapshot ? (float *)conv_snapshot->ptr : NULL,
                 n_key_head, n_value_head, n_rows, n_tokens, n_snapshot_rows,
@@ -2733,21 +2783,25 @@ static int qwen4exp_cuda_gdn_run(
     const dim3 recurrence_grid(
         n_value_head, QWEN4EXP_GDN_DIM / 4u, n_rows);
     if (replay_gates) {
-        qwen4exp_gdn_replay_gates_kernel<<<recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
-            (float *)out->ptr, (float *)recurrent_state->ptr,
-            (float *)replay->checkpoint->ptr, (float *)replay->tape->ptr,
-            (const float *)qkv->ptr, (const float *)raw_alpha->ptr,
-            (const float *)raw_beta->ptr, replay_gates,
-            n_key_head, n_value_head, n_tokens, head_layout,
-            (const uint32_t *)replay->control->ptr, 0u);
+        QWEN4EXP_LAUNCH_PDL(
+                (qwen4exp_gdn_replay_gates_kernel),
+                recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream,
+                (float *)out->ptr, (float *)recurrent_state->ptr,
+                (float *)replay->checkpoint->ptr, (float *)replay->tape->ptr,
+                (const float *)qkv->ptr, (const float *)raw_alpha->ptr,
+                (const float *)raw_beta->ptr, replay_gates,
+                n_key_head, n_value_head, n_tokens, head_layout,
+                (const uint32_t *)replay->control->ptr, 0u);
     } else if (replay) {
-        qwen4exp_gdn_replay_kernel<<<recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
-            (float *)out->ptr, (float *)recurrent_state->ptr,
-            (float *)replay->checkpoint->ptr, (float *)replay->tape->ptr,
-            (const float *)qkv->ptr, (const float *)raw_alpha->ptr,
-            (const float *)raw_beta->ptr, a_log, dt_bias,
-            n_key_head, n_value_head, n_tokens, head_layout,
-            (const uint32_t *)replay->control->ptr, 0u);
+        QWEN4EXP_LAUNCH_PDL(
+                (qwen4exp_gdn_replay_kernel),
+                recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream,
+                (float *)out->ptr, (float *)recurrent_state->ptr,
+                (float *)replay->checkpoint->ptr, (float *)replay->tape->ptr,
+                (const float *)qkv->ptr, (const float *)raw_alpha->ptr,
+                (const float *)raw_beta->ptr, a_log, dt_bias,
+                n_key_head, n_value_head, n_tokens, head_layout,
+                (const uint32_t *)replay->control->ptr, 0u);
     } else if (gate_pairs) {
         if (n_key_head == 16u && n_value_head == 48u &&
             getenv("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE") == NULL &&
@@ -2815,8 +2869,9 @@ static int qwen4exp_cuda_gdn_run(
                     NULL);
         }
     } else {
-        qwen4exp_gdn_recurrence_kernel<false><<<
-                recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
+        QWEN4EXP_LAUNCH_PDL(
+                (qwen4exp_gdn_recurrence_kernel<false>),
+                recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream,
                 (float *)out->ptr, (float *)recurrent_state->ptr,
                 (const float *)qkv->ptr,
                 (const float *)raw_alpha->ptr,
@@ -2833,8 +2888,9 @@ static int qwen4exp_cuda_gdn_run(
     }
 
     if (out_q8) {
-        qwen4exp_gdn_output_quant_kernel<<<dim3(n_tokens, n_value_head, 1u),
-                                           QWEN4EXP_GDN_DIM, 0, stream>>>(
+        QWEN4EXP_LAUNCH_PDL(
+                (qwen4exp_gdn_output_quant_kernel),
+                dim3(n_tokens, n_value_head, 1u), QWEN4EXP_GDN_DIM, 0, stream,
                 (int8_t *)((char *)out_q8->ptr + q_offset),
                 (float *)((char *)out_q8->ptr + s_offset),
                 (const float *)out->ptr, (const float *)output_gate->ptr,
@@ -2842,8 +2898,9 @@ static int qwen4exp_cuda_gdn_run(
         return cuda_ok(cudaGetLastError(),
                        "qwen4exp GDN output norm quantize launch");
     }
-    qwen4exp_gdn_output_kernel<<<dim3(n_tokens, n_value_head, n_rows),
-                                 QWEN4EXP_GDN_DIM, 0, stream>>>(
+    QWEN4EXP_LAUNCH_PDL(
+            (qwen4exp_gdn_output_kernel),
+            dim3(n_tokens, n_value_head, n_rows), QWEN4EXP_GDN_DIM, 0, stream,
             (float *)out->ptr, (const float *)output_gate->ptr, output_norm,
             n_value_head, n_rows, n_tokens, norm_eps);
     return cuda_ok(cudaGetLastError(), "qwen4exp GDN output norm launch");
@@ -10867,6 +10924,10 @@ __global__ static void qwen4exp_gdn_output_quant_kernel(
     const uint32_t value_dim = n_value_head * QWEN4EXP_GDN_DIM;
     const uint64_t base = (uint64_t)token * value_dim +
         head * QWEN4EXP_GDN_DIM;
+    /* The fence: `out` is the recurrence's store and `output_gate` the
+     * projections' row, both upstream of the launch edge this kernel
+     * rides. */
+    QWEN4EXP_PDL_SYNC();
     const float raw = out[base + tid];
     float total = warp_sum_f32(raw * raw);
     if (lane == 0u) partial[warp] = total;
