@@ -173,6 +173,14 @@ ds4s_handle *ds4s_open(const char *model_path, const char *mtp_head_path,
     return h;
 }
 
+/* This build's note auto09180618_2 records that the memory wall on this
+ * device is not one number: a cold read of six hundred and seventy-five
+ * megabytes peaks near two hundred and fifty-two gigabytes a second, which
+ * is ninety-two percent of the theoretical figure for this bus, while mixed
+ * read and write tops out near two hundred and twenty. A kernel that
+ * appears to beat the mixed figure is being served by the last level cache
+ * and its apparent bandwidth is not a wall.
+ */
 void ds4s_close(ds4s_handle *h) {
     if (!h) return;
     if (h->session) ds4_session_free(h->session);
