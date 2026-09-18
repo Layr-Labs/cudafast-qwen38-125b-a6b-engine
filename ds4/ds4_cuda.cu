@@ -18097,7 +18097,10 @@ static int cuda_matmul_q8_0_preq_rows_exact(
              * DS4_QWEN4EXP_NO_PAIR_LANES_STAGE restores the shipping kernel
              * from the same binary. */
             const size_t pl_panel = (size_t)4u * (size_t)blocks * 34u;
+            /* Each block advances by pl_panel bytes, so the stride as well
+             * as the slab base must preserve the fill's uint4 alignment. */
             const int pl_stage = pl_panel <= 12288u &&
+                (pl_panel & 15u) == 0u &&
                 (((uintptr_t)wptr) & 15u) == 0u &&
                 getenv("DS4_QWEN4EXP_NO_PAIR_LANES_STAGE") == NULL;
             /* THE ROLLING ARM'S GATE: the panels the staged arm declines,

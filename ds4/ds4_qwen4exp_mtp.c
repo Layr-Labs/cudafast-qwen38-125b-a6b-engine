@@ -266,8 +266,8 @@ int ds4_qwen4exp_mtp_state_init(ds4_qwen4exp_mtp_state *st, int depth,
     /* Off at depth 1, where a kept first draft leaves nothing to stop or drop;
      * the keep-one gate described in the header at depth >= 2. */
     const bool gated = depth >= 2;
-    st->stop_margin = mtp_env_margin("DS4_QWEN4EXP_MTP_STOP_MARGIN", gated ? 2.0f : 0.0f);
-    st->drop_margin = mtp_env_margin("DS4_QWEN4EXP_MTP_DROP_MARGIN", gated ? 2.0f : 0.0f);
+    st->stop_margin = mtp_env_margin("DS4_QWEN4EXP_MTP_STOP_MARGIN", gated ? 4.0f : 0.0f);
+    st->drop_margin = mtp_env_margin("DS4_QWEN4EXP_MTP_DROP_MARGIN", gated ? 4.0f : 0.0f);
     {
         const char *keep = getenv("DS4_QWEN4EXP_MTP_DROP_KEEP");
         st->drop_keep = (keep && keep[0]) ? atoi(keep) : (gated ? 1 : 0);

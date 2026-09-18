@@ -496,7 +496,7 @@ typedef struct {
      * Neither changes a committed token: the target verifies what is offered.
      * DEFAULTS.  Off at depth 1: a one-draft chain has nothing to stop, a kept
      * first draft has nothing to drop, and no margin is read back.  At depth
-     * >= 2, stop = drop = 2.0 and keep = 1: the first draft is always verified,
+     * >= 2, stop = drop = 4.0 and keep = 1: the first draft is always verified,
      * and a second joins the verify only when both links cleared the margin.
      * Any env value overrides, and 0 disarms.  Why, on a GB10: a verify row
      * costs 4.6-6.9 ms and a head step 1.4 ms, so dropping a 40-60 %-likely
@@ -504,11 +504,11 @@ typedef struct {
      * one pays for its row only when it is itself likely.  On the public
      * passage with eight instruction variants (one ungated depth-3 margin log
      * each), drafts under margin 1 were accepted about half the time and drafts
-     * over 4 nearly always.  The keep-one policy simulated 5-16 % faster per
-     * token than depth 1 on all eight.  On the lowest-acceptance variant, two
-     * traced legs each ran the free run 6.3-6.4 % faster than depth 1 (63 vs
-     * 74 rounds).  Ungated depth 2 runs every second draft, and lost on a
-     * prompt whose second drafts land 38 % of the time. */
+     * over 4 nearly always.  Requiring margin 4 for extra links limits the
+     * unused target rows that less predictable text incurs at margin 2,
+     * while preserving the first draft and its depth-1 acceptance benefit.
+     * The threshold is global and independent of the prompt.  Every offered
+     * draft is still checked against the target's greedy token. */
     float    stop_margin;
     float    drop_margin;
     int      drop_keep;
