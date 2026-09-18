@@ -54822,6 +54822,12 @@ struct ds4_session {
     ds4_qwen4exp_mtp_head      qwen4exp_head;
     const float               *qwen4exp_hc_host_base;   /* the verify's host hyper buffer, or NULL */
     uint32_t                   qwen4exp_hc_host_rows;
+    /* Where the multi row the next draft step consumes sits on the device:
+     * the head's own t_hyper at chain_row, left there by the last head
+     * forward (draft_rows' last row, or a draft_step's row 0).  NULL means
+     * the next step's hc_row is a real verify row and must be consumed. */
+    ds4_gpu_tensor            *qwen4exp_chain_multi;
+    uint32_t                   qwen4exp_chain_row;
     /* Set at create for a qwen4exp session.  ds4_session_is_qwen4exp() reads
      * the model shape, which is process-global; this says THIS session was
      * built on the qwen4exp path, which is what the refusals below key on. */
@@ -76023,6 +76029,7 @@ static int qwen4exp_seam_verify_rows(void *ctx, const int *tokens, uint32_t n,
      * overrunning. */
     int32_t buf[DS4_QWEN4EXP_MTP_MAX_COMMIT];
     if (n > (uint32_t)(sizeof(buf) / sizeof(buf[0]))) return -1;
+    s->qwen4exp_chain_multi = NULL;
     for (uint32_t i = 0; i < n; i++) buf[i] = (int32_t)tokens[i];
     return ds4_qwen4exp_graph_verify_rows(e->qwen4exp_session,
                                           e->qwen4exp_weights, &e->model,
@@ -76045,6 +76052,7 @@ static int qwen4exp_seam_verify_rows_top1(void *ctx, const int *tokens,
     const int dev_rows = getenv("DS4_QWEN4EXP_NO_DEVICE_HYPER") == NULL;
     s->qwen4exp_hc_host_base = dev_rows ? hc_rows : NULL;
     s->qwen4exp_hc_host_rows = n;
+    s->qwen4exp_chain_multi = NULL;
     return ds4_qwen4exp_graph_verify_top1_rows(
                e->qwen4exp_session, e->qwen4exp_weights, &e->model,
                buf, n, dev_rows ? NULL : hc_rows, row_top1) ? 0 : -1;
@@ -76079,12 +76087,46 @@ static int qwen4exp_seam_draft_step(void *ctx, int next_token,
                                     int *draft_out, float *multi_out) {
     ds4_session *s = ctx;
     char err[256];
-    if (ds4_qwen4exp_mtp_head_forward(&s->qwen4exp_head, &next_token, hc_row,
-                                      pos, 1u, draft_out, multi_out,
-                                      err, sizeof(err)) != 0) {
+    int rc;
+    /* A row inside the verify's host window is a real target row and goes
+     * through the host forward.  Outside the window the cycle is feeding a
+     * chain step the previous step's multi row back: that row never needed
+     * to leave the device -- it sits in the head's own t_hyper at chain_row,
+     * where the last head forward wrote it -- so the device forward stages
+     * it straight from there.  The 80 KiB D2H readback and the 80 KiB H2D
+     * upload the host path would pay for the same row are both skipped, and
+     * the step's own multi row stays on the device for the step after. */
+    const float *base = s->qwen4exp_hc_host_base;
+    const uint32_t hc_dim = s->qwen4exp_head.n_hc * s->qwen4exp_head.n_embd;
+    const int in_window =
+        hc_row && base && hc_dim && hc_row >= base &&
+        ((size_t)(hc_row - base)) % hc_dim == 0u &&
+        (hc_row - base) / hc_dim < s->qwen4exp_hc_host_rows;
+    if (!in_window && s->qwen4exp_chain_multi) {
+        rc = ds4_qwen4exp_mtp_head_forward_last_device(
+                 &s->qwen4exp_head, &next_token, s->qwen4exp_chain_multi,
+                 s->qwen4exp_chain_row, pos, 1u, draft_out, NULL,
+                 err, sizeof(err));
+    } else if (hc_row) {
+        /* multi_out is deliberately unfilled here too: the cycle only feeds
+         * it back as the next step's hc_row, and chain_multi routes that
+         * step to the device copy instead. */
+        rc = ds4_qwen4exp_mtp_head_forward(&s->qwen4exp_head, &next_token,
+                                           hc_row, pos, 1u, draft_out,
+                                           NULL, err, sizeof(err));
+    } else {
+        fprintf(stderr, "ds4: qwen4exp MTP seam: draft step at position %u "
+                "has no multi row\n", pos);
+        return -1;
+    }
+    if (rc != 0) {
         fprintf(stderr, "ds4: qwen4exp MTP seam: %s\n", err);
         return -1;
     }
+    /* Either way the step's own multi row is t_hyper row 0 now: a chained
+     * step that follows consumes it from the device. */
+    s->qwen4exp_chain_multi = s->qwen4exp_head.t_hyper;
+    s->qwen4exp_chain_row = 0u;
 #ifdef DS4_TEST_HOOKS
     /* `next_token` lands at pos + 1, so the draft is the token at pos + 2.
      *
@@ -76122,7 +76164,7 @@ static int qwen4exp_seam_draft_rows(void *ctx, const int *next_tokens,
         rc = ds4_qwen4exp_mtp_head_forward_last_device(
                  &s->qwen4exp_head, next_tokens,
                  ds4_qwen4exp_session_hyper(s->engine->qwen4exp_session), first,
-                 pos0, n, draft_out, multi_out, err, sizeof(err));
+                 pos0, n, draft_out, NULL, err, sizeof(err));
     } else {
         /* The host path. If the verify skipped its host copy, make it now so
          * the rows the head reads are the target's, not stale memory. */
@@ -76134,12 +76176,17 @@ static int qwen4exp_seam_draft_rows(void *ctx, const int *next_tokens,
         }
         rc = ds4_qwen4exp_mtp_head_forward_last(&s->qwen4exp_head, next_tokens,
                                                 hc_rows, pos0, n, draft_out,
-                                                multi_out, err, sizeof(err));
+                                                NULL, err, sizeof(err));
     }
     if (rc != 0) {
         fprintf(stderr, "ds4: qwen4exp MTP seam: %s\n", err);
         return -1;
     }
+    /* The multi row a following chain step consumes is the last row this
+     * forward wrote, still in the head's own hyper tensor -- the caller's
+     * multi_out is deliberately unfilled so the row is never read back. */
+    s->qwen4exp_chain_multi = s->qwen4exp_head.t_hyper;
+    s->qwen4exp_chain_row = n - 1u;
 #ifdef DS4_TEST_HOOKS
     /* The last row sits at pos0 + n - 1 and drafts the token two past it, the
      * same rule the one-row seam applies. */
@@ -76152,6 +76199,7 @@ static int qwen4exp_seam_draft_rows(void *ctx, const int *next_tokens,
 #endif
     return 0;
 }
+
 
 /* The margin of the draft the latest head call returned; -1 when unmeasured. */
 static float qwen4exp_seam_draft_margin(void *ctx) {
