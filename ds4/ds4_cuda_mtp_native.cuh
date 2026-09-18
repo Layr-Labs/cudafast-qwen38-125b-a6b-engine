@@ -229,9 +229,14 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
             key_in,flag,scores,width,prefix,tail,vocab);
         if (!cuda_ok(cudaGetLastError(),"native screen keys")) return -1;
     }
-    uint32_t invalid = 0;
-    if (!ds4_gpu_tensor_read(scratch,l.flag,&invalid,4)) return -1;
-    if (invalid) return 0;
+    /* The non-finite flag is READ AT THE BOTTOM, not here.  Reading it here
+     * split one screen into two device submissions: everything above was
+     * issued, the blocking 4-byte D2H drained the device, and the sort and
+     * refinement chain below was then submitted to an idle GPU.  A resubmission
+     * after a drain does not start for ~209 us on this box (measured over the
+     * timed window: 3.87 such restarts per round, 1.489 ms of the 1.81 ms total
+     * per-round GPU idle), so the split cost a full cold restart every round
+     * for a flag that decides nothing until the function returns. */
     size_t temporary = (size_t)(scratch->bytes-l.temporary);
     /* Rank on the high score word alone. Keys are written in row order, so
      * original IDs strictly increase over the whole input and the packed low
@@ -277,7 +282,33 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
     mtp_native_projection_kernel<false><<<(MTP_NATIVE_CAP+3u)/4u,256,0,cuda_decode_stream()>>>(
         (float *)out->ptr,(const unsigned char *)w,xq,xs,MTP_NATIVE_CAP,
         (const uint32_t *)ids->ptr,vocab,prefix,tail);
-    return cuda_ok(cudaGetLastError(),"native exact refinement") ? (int)MTP_NATIVE_CAP : -1;
+    if (!cuda_ok(cudaGetLastError(),"native exact refinement")) return -1;
+    /* SAME VALUE, SAME ORDER, ONE FEWER DRAIN.
+     *
+     * `invalid` is raised only by mtp_native_projection_kernel<true,true> and
+     * mtp_native_keys, both launched above this point on cuda_decode_stream(),
+     * and ds4_gpu_tensor_read is a blocking cudaMemcpy on that same stream --
+     * so the byte read here is the byte the old read at the top of the sort
+     * chain returned.  What changes is only WHERE the host waits: the screen
+     * now issues one contiguous run of work and drains once, at the end, where
+     * the caller drains anyway (ds4_qwen4exp_mtp.c ds4_gpu_end_commands() and
+     * the top-1 readback that follows it).
+     *
+     * The sorts and the refinement now also run on the non-finite path, and
+     * their output is dead there: a zero return leaves `screened` false, and
+     * the borrowed LM head then rewrites out->ptr over draft_prefix (+ tail)
+     * entries, which strictly contains the MTP_NATIVE_CAP entries written here
+     * because the function already refused unless wide > MTP_NATIVE_CAP; ids
+     * is read only under `screened`.  The extra work is also SAFE: a candidate
+     * id never depends on a score.  mtp_native_keys derives it from the row
+     * index alone (`i < prefix ? i : vocab - tail + i - prefix`, so always
+     * < vocab) and puts it in the key's low word, the score only ever reaching
+     * the high word; the sorts permute keys without forming new ones.  So the
+     * refinement's gather stays in bounds even when every score is NaN. */
+    uint32_t invalid = 0;
+    if (!ds4_gpu_tensor_read(scratch,l.flag,&invalid,4)) return -1;
+    if (invalid) return 0;
+    return (int)MTP_NATIVE_CAP;
 }
 __global__ static void mtp_native_map(uint32_t *winner, const float *logits,
                                       const uint32_t *ids, uint32_t count, uint32_t vocab) {
