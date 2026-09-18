@@ -6035,7 +6035,7 @@ __device__ __forceinline__ static void qw_gu_coop_raw_load(
  * the measured floor, at which point gate/up occupancy is CLOSED for a real
  * reason rather than a mis-read one. */
 #if defined(__CUDACC__) && CUDART_VERSION >= 12040
-#define QW_GU_MAXNREG __maxnreg__(32)
+#define QW_GU_MAXNREG __maxnreg__(40)
 #else
 #define QW_GU_MAXNREG
 #endif
