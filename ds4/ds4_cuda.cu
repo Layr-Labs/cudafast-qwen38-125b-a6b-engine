@@ -5904,23 +5904,63 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
          * instantiation and ptxas re-chooses on that alone: <4,false,false>
          * moves 46 -> 62 registers and 5 -> 4 blocks per SM without a line of
          * its own code changing.  The rolled form stays for every other R. */
+        /* THE FILL'S ADDRESS PHASE.  The panel stride is 4*blocks*34, and at
+         * blocks = 80 that is 10,880 = 128 * 85: an exact multiple of the
+         * 128-byte sector.  So the stride can never correct a misaligned base,
+         * and EVERY block inherits the tensor pointer's own residue mod 128.
+         * cuda_model_ptr is g_model_device_base + offset and the GGUF loader
+         * aligns to 32 (ds4.c: m->alignment = 32), so that residue is the
+         * tensor's own file offset residue.  Across the staged checkpoint's
+         * four shards plus the MTP head, 86 q8_0 tensors sit at residue 32, 72
+         * at residue 64, and NOT ONE at 0.
+         *
+         * At residue 32 and 96 a 512-byte warp request straddles a fifth
+         * 128-byte sector; at 0 and 64 it does not.  Measured on the LM head
+         * shape, 25 launches a cell, per-launch min: residue 32 and 96 lose
+         * 4.6% against residue 0, residue 64 loses 0.4%.  Reading a
+         * 128-byte-ALIGNED SUPERSET -- back the base down to the enclosing
+         * boundary and drop the head bytes on the store side -- recovers +4.5%
+         * at residue 32 and +4.6% at 96, and costs 0.3% to 0.7% at 0 and 64,
+         * where there is nothing to recover.  So only 32 and 96 take the arm.
+         *
+         * The weights do not move and are not re-represented.  gpanel receives
+         * the same bytes at the same shared offsets and the walk below is
+         * untouched: this changes the request address, not the data.
+         *
+         * Four conditions, each of which alone makes head 0:
+         *   (head & 63) == 0    residue 0 or 64, nothing to recover
+         *   (head & 15) != 0    would unalign the uint4 STORES into gpanel
+         *   gp == w             this is the slab's FIRST panel, so backing down
+         *                       would read up to 96 bytes before it.  Every
+         *                       other block has a whole panel of the same slab
+         *                       behind it, so its widened read stays in bounds.
+         *   span > 3 * 4096     the three trips below must still cover it.
+         * The shared allocation and the launch geometry are unchanged. */
         if (R >= 2) {
+            unsigned head = (unsigned)((uintptr_t)gp & 127u);
+            if ((head & 63u) == 0u || (head & 15u) != 0u ||
+                gp == (const char *)w || panel_bytes + head > 3u * 4096u) head = 0u;
+            const char *const ap = gp - head;
+            const uint64_t span = panel_bytes + head;
             uint4 qw_pl_fill[3];
 #pragma unroll
             for (int k = 0; k < 3; k++) {
                 const uint64_t i = ((uint64_t)threadIdx.x + 256u * (uint64_t)k) * 16u;
-                if (i + 16u <= panel_bytes)
-                    qw_pl_fill[k] = *(const uint4 *)(const void *)(gp + i);
+                if (i >= head && i + 16u <= span)
+                    qw_pl_fill[k] = *(const uint4 *)(const void *)(ap + i);
             }
 #pragma unroll
             for (int k = 0; k < 3; k++) {
                 const uint64_t i = ((uint64_t)threadIdx.x + 256u * (uint64_t)k) * 16u;
-                if (i + 16u <= panel_bytes)
-                    *(uint4 *)(gpanel + i) = qw_pl_fill[k];
+                if (i >= head && i + 16u <= span)
+                    *(uint4 *)(gpanel + i - head) = qw_pl_fill[k];
             }
-            const uint64_t whole = (panel_bytes / 16u) * 16u;
-            for (uint64_t j = whole + (uint64_t)threadIdx.x; j < panel_bytes; j += 256u)
-                gpanel[j] = gp[j];
+            /* head and panel_bytes are both 16-byte multiples here, so this is
+             * the shipping tail bound shifted by head.  It is empty whenever 16
+             * divides panel_bytes, as it does at blocks = 80. */
+            const uint64_t whole = head + (panel_bytes / 16u) * 16u;
+            for (uint64_t j = whole + (uint64_t)threadIdx.x; j < span; j += 256u)
+                gpanel[j - head] = ap[j];
         } else {
             for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes; i += 256u * 16u) {
                 if (i + 16u <= panel_bytes)
@@ -20661,23 +20701,63 @@ __global__ static void qwen_q8_projection_triple_kernel(
          * instantiation and ptxas re-chooses on that alone: <4,false,false>
          * moves 46 -> 62 registers and 5 -> 4 blocks per SM without a line of
          * its own code changing.  The rolled form stays for every other R. */
+        /* THE FILL'S ADDRESS PHASE.  The panel stride is 4*blocks*34, and at
+         * blocks = 80 that is 10,880 = 128 * 85: an exact multiple of the
+         * 128-byte sector.  So the stride can never correct a misaligned base,
+         * and EVERY block inherits the tensor pointer's own residue mod 128.
+         * cuda_model_ptr is g_model_device_base + offset and the GGUF loader
+         * aligns to 32 (ds4.c: m->alignment = 32), so that residue is the
+         * tensor's own file offset residue.  Across the staged checkpoint's
+         * four shards plus the MTP head, 86 q8_0 tensors sit at residue 32, 72
+         * at residue 64, and NOT ONE at 0.
+         *
+         * At residue 32 and 96 a 512-byte warp request straddles a fifth
+         * 128-byte sector; at 0 and 64 it does not.  Measured on the LM head
+         * shape, 25 launches a cell, per-launch min: residue 32 and 96 lose
+         * 4.6% against residue 0, residue 64 loses 0.4%.  Reading a
+         * 128-byte-ALIGNED SUPERSET -- back the base down to the enclosing
+         * boundary and drop the head bytes on the store side -- recovers +4.5%
+         * at residue 32 and +4.6% at 96, and costs 0.3% to 0.7% at 0 and 64,
+         * where there is nothing to recover.  So only 32 and 96 take the arm.
+         *
+         * The weights do not move and are not re-represented.  gpanel receives
+         * the same bytes at the same shared offsets and the walk below is
+         * untouched: this changes the request address, not the data.
+         *
+         * Four conditions, each of which alone makes head 0:
+         *   (head & 63) == 0    residue 0 or 64, nothing to recover
+         *   (head & 15) != 0    would unalign the uint4 STORES into gpanel
+         *   gp == w             this is the slab's FIRST panel, so backing down
+         *                       would read up to 96 bytes before it.  Every
+         *                       other block has a whole panel of the same slab
+         *                       behind it, so its widened read stays in bounds.
+         *   span > 3 * 4096     the three trips below must still cover it.
+         * The shared allocation and the launch geometry are unchanged. */
         if (R >= 2) {
+            unsigned head = (unsigned)((uintptr_t)gp & 127u);
+            if ((head & 63u) == 0u || (head & 15u) != 0u ||
+                gp == (const char *)w || panel_bytes + head > 3u * 4096u) head = 0u;
+            const char *const ap = gp - head;
+            const uint64_t span = panel_bytes + head;
             uint4 qw_pl_fill[3];
 #pragma unroll
             for (int k = 0; k < 3; k++) {
                 const uint64_t i = ((uint64_t)threadIdx.x + 256u * (uint64_t)k) * 16u;
-                if (i + 16u <= panel_bytes)
-                    qw_pl_fill[k] = *(const uint4 *)(const void *)(gp + i);
+                if (i >= head && i + 16u <= span)
+                    qw_pl_fill[k] = *(const uint4 *)(const void *)(ap + i);
             }
 #pragma unroll
             for (int k = 0; k < 3; k++) {
                 const uint64_t i = ((uint64_t)threadIdx.x + 256u * (uint64_t)k) * 16u;
-                if (i + 16u <= panel_bytes)
-                    *(uint4 *)(gpanel + i) = qw_pl_fill[k];
+                if (i >= head && i + 16u <= span)
+                    *(uint4 *)(gpanel + i - head) = qw_pl_fill[k];
             }
-            const uint64_t whole = (panel_bytes / 16u) * 16u;
-            for (uint64_t j = whole + (uint64_t)threadIdx.x; j < panel_bytes; j += 256u)
-                gpanel[j] = gp[j];
+            /* head and panel_bytes are both 16-byte multiples here, so this is
+             * the shipping tail bound shifted by head.  It is empty whenever 16
+             * divides panel_bytes, as it does at blocks = 80. */
+            const uint64_t whole = head + (panel_bytes / 16u) * 16u;
+            for (uint64_t j = whole + (uint64_t)threadIdx.x; j < span; j += 256u)
+                gpanel[j - head] = ap[j];
         } else {
             for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes; i += 256u * 16u) {
                 if (i + 16u <= panel_bytes)

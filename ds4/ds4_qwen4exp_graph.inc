@@ -2749,11 +2749,48 @@ static bool qw_decode_graph_chunk(ds4_qwen4exp_session *s,
 #endif
         /* Upload the NEXT chunk while the device runs this one, so its launch
          * finds the graph resident instead of uploading it in front of an idle
-         * GPU.  A miss is a no-op. */
-        if (il_last < g_ds4_qwen4exp.n_layer) {
+         * GPU.  A miss is a no-op.
+         *
+         * THE CHAIN WRAPS, BECAUSE THE ROUND DOES.  The guard used to be
+         * `if (il_last < n_layer)`, which prefetches chunks 1..C-1 and stops:
+         * the LAST chunk of a round prefetches nothing, so chunk 0 is the one
+         * chunk in the cycle that no one ever uploads ahead of its launch.  It
+         * pays the upload inline instead, and it pays it against a device that
+         * has just drained at the round boundary -- the worst moment there is.
+         *
+         * The window-4 nsys capture of a depth-1 leg measures exactly that:
+         * over 64 rounds, the gap in front of chunk 0's launch is 243 us in
+         * the 60 rounds where the upload happened there, and 1.4-1.5 us in the
+         * 4 rounds where chunk 0 happened to still be resident.  Same kernels,
+         * same round, two populations 170x apart -- the upload is the whole
+         * gap, and residency is the whole difference.  (Why residency is lost
+         * at all: uploading chunks 1..C-1 is what displaces chunk 0, so the
+         * steady state of a non-wrapping chain is chunk 0 permanently evicted.
+         * A wrapping chain rotates instead, and every chunk's launch finds its
+         * own graph already there.)
+         *
+         * Wrapping is free when it misses.  `next` copies the current key, so
+         * the wrap carries THIS round's gdn variant; if the next round opens
+         * on a different variant the prefetch memcmps against no entry and
+         * returns 0 without touching the device.  And a prefetch is a
+         * cudaGraphUpload of an already-instantiated exec: it moves no data
+         * the graph does not already own, launches nothing, and orders
+         * nothing.  No kernel, argument, or sequence below this line can
+         * observe whether it ran, which is why this arm cannot move a token.
+         *
+         * `chunk != 0` keeps a single-chunk round from prefetching the graph
+         * it is launching right now (a no-op, but a pointless one).  The
+         * C > 1 guard at the call site makes that unreachable today; it is
+         * here so it stays true if it ever is not. */
+        {
             ds4_decode_graph_key next = key;
-            next.il = chunk + 1u;
-            (void)ds4_gpu_decode_graph_prefetch(&next);
+            if (il_last < g_ds4_qwen4exp.n_layer) {
+                next.il = chunk + 1u;
+                (void)ds4_gpu_decode_graph_prefetch(&next);
+            } else if (chunk != 0u) {
+                next.il = 0u;
+                (void)ds4_gpu_decode_graph_prefetch(&next);
+            }
         }
         return true;
     }
