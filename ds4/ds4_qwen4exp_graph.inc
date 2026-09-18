@@ -2791,6 +2791,14 @@ static bool qwen4exp_graph_layers_encode(
  * overlap the device work already queued. */
 #define QW_DECODE_GRAPH_MAX_CHUNKS 8u
 
+/* This build's note auto09181708_55 records that asynchronous copy buys
+ * prefetch depth at no register cost, so it pays exactly where memory level
+ * parallelism is capped by the register budget and costs where occupancy
+ * already hides the latency. The same technique measured minus fourteen
+ * percent at a thirty-two register site with six blocks per multiprocessor
+ * and plus fifty-five percent at a two hundred and fifty-five register site
+ * with one.
+ */
 static uint32_t qw_decode_graph_chunks(void) {
     static int init = 0;
     static uint32_t chunks = 4u;   /* the A/B's pick; 1 restores the single capture */
