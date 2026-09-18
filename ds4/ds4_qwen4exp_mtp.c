@@ -577,6 +577,12 @@ static int mtp_commit_one(ds4_qwen4exp_mtp_state *st,
  * than better. The gap in the comment is real; exploiting it is not
  * obviously a win.
  */
+/* This build's note auto09180452_9 records that removing every tensor core
+ * instruction from one projection kernel makes it slower, which means the
+ * arithmetic was never its limiter; ablation of its global loads takes a
+ * third off the wall, and a variant with identical instruction counts and
+ * perfectly coalesced addresses is four percent slower still.
+ */
 int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
                            const ds4_qwen4exp_mtp_model *model,
                            int first_token,
