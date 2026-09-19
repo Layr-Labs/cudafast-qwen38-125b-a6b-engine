@@ -1189,33 +1189,58 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
      * against it yields fc_embedding(e) + fc_hidden(h_s) for every stream. */
     if (ok) {
         stage = "eh_proj rows";
-        if (h->hooks.ehx_pack) {
-            ok = h->hooks.ehx_pack(h->t_ehx, h->t_e_normed, h->t_h_normed,
-                                   n_tokens, n_hc, n_embd) != 0;
+        /* The fused path quantizes the packed rows straight into the
+         * prequantized matmul's layout, skipping the F32 staging tensor and
+         * the quantize launch; the bytes the matmul reads are identical. */
+        const int ehx_fused = h->hooks.ehx_pack_quant &&
+            h->hooks.matmul_q8_0_preq && (n_embd & 15u) == 0u;
+        if (ehx_fused) {
+            const uint64_t ehx_rows = (uint64_t)n_tokens * n_hc;
+            const uint64_t ehx_blocks = (2ull * n_embd) / 32u;
+            const uint64_t ehx_soff =
+                (ehx_rows * ehx_blocks * 32u + 15u) & ~15ull;
+            ok = h->hooks.ehx_pack_quant(
+                     h->t_ehx, 0u, ehx_soff, h->t_e_normed, h->t_h_normed,
+                     n_tokens, n_hc, n_embd) != 0;
+            MTP_HEAD_TICK(MTP_HEAD_T_EHX);
+            if (ok) {
+                stage = "eh_proj";
+                ok = h->hooks.matmul_q8_0_preq(
+                         h->t_hyper, h->head_map, h->head_size,
+                         h->eh_proj_offset, 2ull * n_embd, n_embd,
+                         h->t_ehx, 0u, ehx_soff, ehx_rows) != 0;
+            }
+            MTP_HEAD_TICK(MTP_HEAD_T_EH_PROJ);
         } else {
-            for (uint32_t t = 0; ok && t < n_tokens; t++) {
-                for (uint32_t s = 0; ok && s < n_hc; s++) {
-                    const uint64_t dst =
-                        ((uint64_t)t * n_hc + s) * 2ull * embd_bytes;
-                    ok = ds4_gpu_tensor_copy(
-                             h->t_ehx, dst, h->t_e_normed,
-                             (uint64_t)t * embd_bytes, embd_bytes) != 0 &&
-                         ds4_gpu_tensor_copy(
-                             h->t_ehx, dst + embd_bytes, h->t_h_normed,
-                             ((uint64_t)t * hc_dim + (uint64_t)s * n_embd) * f,
-                             embd_bytes) != 0;
+            if (h->hooks.ehx_pack) {
+                ok = h->hooks.ehx_pack(h->t_ehx, h->t_e_normed, h->t_h_normed,
+                                       n_tokens, n_hc, n_embd) != 0;
+            } else {
+                for (uint32_t t = 0; ok && t < n_tokens; t++) {
+                    for (uint32_t s = 0; ok && s < n_hc; s++) {
+                        const uint64_t dst =
+                            ((uint64_t)t * n_hc + s) * 2ull * embd_bytes;
+                        ok = ds4_gpu_tensor_copy(
+                                 h->t_ehx, dst, h->t_e_normed,
+                                 (uint64_t)t * embd_bytes, embd_bytes) != 0 &&
+                             ds4_gpu_tensor_copy(
+                                 h->t_ehx, dst + embd_bytes, h->t_h_normed,
+                                 ((uint64_t)t * hc_dim + (uint64_t)s * n_embd) * f,
+                                 embd_bytes) != 0;
+                    }
                 }
             }
+            MTP_HEAD_TICK(MTP_HEAD_T_EHX);
+            if (ok) {
+                stage = "eh_proj";
+                ok = h->hooks.matmul_q8_0(h->t_hyper, h->head_map, h->head_size,
+                                          h->eh_proj_offset, 2ull * n_embd,
+                                          n_embd, h->t_ehx,
+                                          (uint64_t)n_tokens * n_hc) != 0;
+            }
+            MTP_HEAD_TICK(MTP_HEAD_T_EH_PROJ);
         }
     }
-    MTP_HEAD_TICK(MTP_HEAD_T_EHX);
-    if (ok) {
-        stage = "eh_proj";
-        ok = h->hooks.matmul_q8_0(h->t_hyper, h->head_map, h->head_size,
-                                  h->eh_proj_offset, 2ull * n_embd, n_embd,
-                                  h->t_ehx, (uint64_t)n_tokens * n_hc) != 0;
-    }
-    MTP_HEAD_TICK(MTP_HEAD_T_EH_PROJ);
     if (ok) {
         stage = "block";
         ds4_qwen4exp_block_forward_fn block = cache_only
