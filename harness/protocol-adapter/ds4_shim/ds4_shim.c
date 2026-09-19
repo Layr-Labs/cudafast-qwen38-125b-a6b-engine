@@ -313,8 +313,12 @@ int ds4s_eval_speculative(ds4s_handle *h, int32_t first_token, int budget, int32
                           int cap) {
     if (!h || !out || cap <= 0 || budget <= 0) return -1;
     /* The engine writes at most `want` entries, and `want` is capped at the
-     * buffer's size, so no depth the pin may grow to can overrun it. */
-    int accepted[17];
+     * buffer's size, so no depth the pin may grow to can overrun it.  The
+     * accepted ids land directly in the caller's int32_t buffer: int32_t is
+     * int on this ABI, so the staging array was a pure type-spelling bridge
+     * and the engine never retains the pointer. */
+    _Static_assert(_Generic((int32_t)0, int: 1, default: 0),
+                   "int32_t must be int for the zero-copy accepted buffer");
     int want = cap < 17 ? cap : 17;
     if (want > budget) want = budget;
     char err[256] = {0};
@@ -327,14 +331,12 @@ int ds4s_eval_speculative(ds4s_handle *h, int32_t first_token, int budget, int32
      * eos_token -1 never matches: the benchmark commits an exact token count
      * and does not stop at end-of-sequence. */
     const int n = ds4_session_eval_speculative_argmax(h->session, (int)first_token, budget, -1,
-                                                      accepted, want, err, sizeof(err));
+                                                      (int *)out, want, err, sizeof(err));
     if (n <= 0) {
         set_err(h, err[0] ? err : "ds4_session_eval_speculative_argmax failed");
         return -1;
     }
-    const int written = n < cap ? n : cap;
-    for (int i = 0; i < written; i++) out[i] = (int32_t)accepted[i];
-    return written;
+    return n < cap ? n : cap;
 }
 
 void ds4s_spec_counters(const ds4s_handle *h, uint64_t *drafts, uint64_t *hits,
