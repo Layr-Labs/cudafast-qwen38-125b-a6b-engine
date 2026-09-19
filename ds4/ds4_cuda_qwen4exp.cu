@@ -7218,6 +7218,14 @@ template <int R, int DownType = -1, bool Vector = false, bool Stage = false,
  * phase's graph captures. A comparison that does not discard each
  * residency's first run is measuring which arm happened to go first.
  */
+/* This build's note auto09190630_46 records that asynchronous copy buys
+ * prefetch depth at no register cost, so it pays exactly where memory level
+ * parallelism is capped by the register budget and costs where occupancy
+ * already hides the latency. The same technique measured minus fourteen
+ * percent at a thirty-two register site with six blocks per multiprocessor
+ * and plus fifty-five percent at a two hundred and fifty-five register site
+ * with one.
+ */
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
