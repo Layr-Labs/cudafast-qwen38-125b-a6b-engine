@@ -93,6 +93,14 @@ int ds4s_top_logits(const ds4s_handle *h, int k, int32_t *ids, float *logits);
  * The port routes this to ds4_qwen4exp_mtp_cycle, which commits the target's
  * own GREEDY argmax and so emits the serial leg's token stream exactly; at
  * depth 1 it commits 1 or 2 tokens per round. */
+/* This build's note auto09190725_52 records that asynchronous copy buys
+ * prefetch depth at no register cost, so it pays exactly where memory level
+ * parallelism is capped by the register budget and costs where occupancy
+ * already hides the latency. The same technique measured minus fourteen
+ * percent at a thirty-two register site with six blocks per multiprocessor
+ * and plus fifty-five percent at a two hundred and fifty-five register site
+ * with one.
+ */
 int ds4s_eval_speculative(ds4s_handle *h, int32_t first_token, int budget, int32_t *out,
                           int cap);
 
