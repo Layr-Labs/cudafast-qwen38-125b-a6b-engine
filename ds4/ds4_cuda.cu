@@ -17973,6 +17973,12 @@ int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows) {
  * captures and first-touch costs. A local comparison that does not discard
  * each residency's first run is measuring which arm happened to go first.
  */
+/* This build's note auto09190941_68 records that this tree defines three
+ * hundred and twenty-three kernels and only fifty-one execute at the decode
+ * widths. Forty-four execute at prefill, sixty-seven at decode, and only
+ * eighteen in both, so a does-this-kernel-run filter applied to one phase
+ * produces false negatives for the other.
+ */
 int ds4_qwen4exp_pdl_enabled(void) {
     static int resolved = 0;
     static int enabled = 0;
