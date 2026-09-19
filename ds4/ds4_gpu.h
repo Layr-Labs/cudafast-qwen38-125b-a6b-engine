@@ -889,23 +889,21 @@ int ds4_gpu_mtp_native_screen_init(uint32_t width, uint64_t *bytes, uint32_t *ca
 int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out, ds4_gpu_tensor *ids,
     ds4_gpu_tensor *scratch, const void *map, uint64_t bytes, uint64_t offset,
     uint32_t dim, uint32_t vocab, uint32_t prefix, uint32_t tail,
-    const ds4_gpu_tensor *x, int defer_invalid);
+    const ds4_gpu_tensor *x);
 int ds4_gpu_mtp_native_screen2_init(uint32_t width, uint64_t *bytes,
     uint32_t *capacity);
 int ds4_gpu_mtp_native_screen2(ds4_gpu_tensor *out, ds4_gpu_tensor *ids,
     ds4_gpu_tensor *scratch, const void *map, uint64_t bytes, uint64_t offset,
     uint32_t dim, uint32_t vocab, uint32_t prefix, uint32_t tail,
-    const ds4_gpu_tensor *x, int defer_invalid);
+    const ds4_gpu_tensor *x);
 int ds4_gpu_mtp_native_map(ds4_gpu_tensor *winner, const ds4_gpu_tensor *logits,
-    const ds4_gpu_tensor *ids, const ds4_gpu_tensor *scratch,
-    uint32_t count, uint32_t vocab, uint32_t screen_width, int defer_invalid);
+    const ds4_gpu_tensor *ids, uint32_t count, uint32_t vocab);
 int ds4_gpu_mtp_native_scatter(ds4_gpu_tensor *out, uint64_t out_offset,
     const ds4_gpu_tensor *values, const ds4_gpu_tensor *ids,
     uint32_t count, uint32_t vocab);
 int ds4_gpu_mtp_native_scatter2(ds4_gpu_tensor *out,
     const ds4_gpu_tensor *values, const ds4_gpu_tensor *ids,
-    const ds4_gpu_tensor *scratch, ds4_gpu_tensor *winner,
-    uint32_t count, uint32_t vocab, uint32_t screen_width, int defer_invalid);
+    uint32_t count, uint32_t vocab);
 
 int ds4_gpu_matmul_q8_0_top1_tensor(
         ds4_gpu_tensor       *selected,
