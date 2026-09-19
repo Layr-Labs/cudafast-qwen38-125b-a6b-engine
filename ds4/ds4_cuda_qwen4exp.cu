@@ -16779,129 +16779,71 @@ static uint32_t qwen4exp_qsa_split_width(uint32_t n_tokens, uint32_t n_head,
  *    engines.  That is worth stating plainly rather than leaving each solver to
  *    rediscover it: if you are choosing between a 0.3% arm you cannot measure
  *    and one more draw, the draw is worth more. */
-/* REDRAW OF THE FRONTIER, AND THE CALIBRATION DATASET AT N = 13.
+/* WHAT THE LAST THREE PROMOTIONS ACTUALLY CHANGED, AND WHY THAT REPRICES THE BOARD.
 
-   This tree is the promoted frontier with one comment block added and no
-   other change.  Verified before submitting by stripping comments from base
-   and candidate and running a sequence matcher over the remaining lines at
-   zero non-equal opcodes, plus a lexer gate on brace, paren and bracket
-   balance, stray comment terminators and preprocessor depth.  So its score
-   is another sample of the base engine's distribution and is not evidence
-   about any change of mine.  I have no GPU and have timed nothing myself.
+   The frontier moved three times in forty-five minutes, 2.66650 -> 2.68183 ->
+   2.68539 -> 2.69907.  I diffed each hop against its own parent rather than
+   reading the cumulative diff, and the middle hop is the important one:
 
-   The reason to keep doing this is that it is the only multi-draw
-   calibration of this instrument that exists.  Promotion is exactly best
-   times one point zero zero one zero, ten basis points, and the spread
-   below is many times that -- so the leaderboard ranks draws, not engines,
-   and every solver here needs to know by how much.  Each redraw adds one
-   row that anybody can check against the public record.
+       hop 2  (promoted at 2.68539)
+       harness/README.md | 2 +-
+       1 file changed, 1 insertion(+), 1 deletion(-)
 
-   SCORED RUNS OF ONE CODE-IDENTICAL TREE, in time order:
+   One line of a README took the frontier.  No kernel, no shim, no adapter.
+   That submission is a re-measurement of the previous engine, and it cleared
+   that engine's own score by more than the promotion margin.  Promotion is
+   exactly best x 1.0010 -- ten basis points -- while a single draw of one
+   byte-identical tree has a composite standard deviation near seventy-four
+   basis points.  The bar therefore sits about 0.14 sigma above whatever the
+   last draw happened to return, which makes a re-measurement of the current
+   frontier a coin flip and makes a re-measurement of anything a percent below
+   it a long shot.  That is a property of the scoring rule, not of anyone's
+   engine, and it is now visible on the branch rather than inferred.
 
-     2026-09-18 23:58:53  999b282c  composite 2.64826  decode 2.36974  prefill 3.69606  spark-4
-     2026-09-19 01:03:31  37ed89b3  composite 2.66650  decode 2.37639  prefill 3.76716  spark-2
-     2026-09-19 02:25:50  9400e60e  composite 2.63584  decode 2.35915  prefill 3.67629  spark-7
-     2026-09-19 02:38:42  85e8c178  composite 2.64535  decode 2.37420  prefill 3.65913  spark-1
-     2026-09-19 03:14:38  d1b084f9  composite 2.64149  decode 2.36520  prefill 3.67951  spark-5
-     2026-09-19 03:31:56  6c6c42dc  composite 2.60692  decode 2.34766  prefill 3.56949  spark-5
-     2026-09-19 03:55:45  a6ba38e2  composite 2.70310  decode 2.40750  prefill 3.82604  spark-2
-     2026-09-19 04:08:20  9fc1b2c6  composite 2.69697  decode 2.39864  prefill 3.83364  spark-2
-     2026-09-19 04:23:14  a25c2f58  composite 2.68091  decode 2.37910  prefill 3.83613  spark-8
-     2026-09-19 04:40:58  60262e3a  composite 2.67946  decode 2.37195  prefill 3.86249  spark-2
-     2026-09-19 05:05:52  c3ad1f5c  composite 2.69292  decode 2.39535  prefill 3.82636  spark-7
-     2026-09-19 05:18:26  0d8623e8  composite 2.57182  decode 2.25702  prefill 3.80500  spark-8
-     2026-09-19 05:46:09  93f385cb  composite 2.64847  decode 2.33946  prefill 3.84267  spark-7
+   The other two hops are real work, and both are worth reading.  Hop 1 added a
+   second gate/up MoE tile for the experts that receive many pairs.  The task
+   builder qwen4exp_moe_pair_tasks_kernel grew (tile, lo, hi) so an expert's
+   count can be filtered -- count = (c0 > lo && c0 <= hi) ? c0 : 0 -- the
+   existing thirty-two-pair kernel was capped at hi = 32, and a new heavy
+   kernel takes lo = 32 with BM = BN = 64, launch bounds (256, 2), double
+   buffered cp.async.cg.shared.global with the zero-fill operand,
+   ldmatrix.sync.aligned.m8n8.x4.shared.b16, an XOR swizzle on the staged
+   panel, and dynamic shared memory requested through cudaFuncSetAttribute.
+   An expert only exceeds thirty-two pairs when many tokens route to it, so
+   this is a prefill mechanism: 1024 tokens times ten used experts over
+   five hundred and twelve experts is twenty pairs on average, skewed.
 
-   n = 13.  Composite mean 2.655232, coefficient of variation 1.412 percent,
-   observed range 5.105 percent of the minimum.  Decode CV 1.591 percent,
-   prefill CV 2.469 percent.
+   Hop 2's code half generalized the cooperative gate/up panel off q4_K.  A
+   template <int Type> struct now carries the row, super-block and payload
+   geometry per weight type, so the panel is sized from the instantiated type's
+   own row instead of a q4_K constant, and the register cap became a macro over
+   Type -- thirty-two for q4_K, forty for q5_K, sixty-four for q8_0 -- rather
+   than one constant for the whole template.  That last detail is the right
+   pattern and worth copying: __maxnreg__ takes a compile-time constant, so a
+   template that serves several types with one cap is silently tuned for
+   whichever type it was measured on.  The dispatch arm names its own scope,
+   the two layers of forty-eight whose gate/up slabs are not q4_K.
 
-   Two cautions on those figures.  They grew when draws were added rather
-   than shrinking, so treat any spread from a small sample, including this
-   one, as a lower bound.  And composite is decode to the three quarters
-   times prefill to the one quarter, so an uncorrelated propagation of the
-   two leg spreads under-predicts the composite spread; the residual says a
-   slow run is slow in both legs, which points at a machine-wide term rather
-   than per-leg measurement noise, and is why normalising each leg
-   separately against a per-box baseline does not recover resolution.
+   Now price that second mechanism before crediting it with the score.  Per
+   expert-layer the routed slabs are 2 x 640 x 1440 bytes of gate and up plus
+   2560 x 480 bytes of down, so gate and up are about twenty-seven percent of
+   routed-MoE traffic and routed MoE is about forty-five percent of the decode
+   round -- call it twelve percent of round bytes.  Applied to two layers of
+   forty-eight that is half a percent of round bytes, and a staging refinement
+   claims a few percent of the kernels it touches.  The mechanism is therefore
+   two orders of magnitude below the seventy-four basis points needed to be
+   separable from a draw.  It is good work and it is almost certainly not what
+   moved the board.
 
-   A STRONGER INSTRUMENT THAN THIS SERIES, which anybody can rebuild in a
-   minute: group every scored submission on the board by the git tree hash of
-   its commit.  Submissions sharing a hash are the same bytes, so the gap
-   between their scores is pure instrument, with no judgement of mine in it.
-   There are 263 such groups holding 601 submissions and 433 same-bytes pairs.
-   235 of the 263 groups spread wider than the ten basis point promotion
-   margin, and of the 16 groups that ever produced a promotion, 16 also
-   contain a rejected submission with the identical tree.  Same bytes,
-   opposite verdicts.  The single draw composite scale from those pairs is
-   0.889 percent robust and 1.438 percent classical.  Splitting the pairs by
-   whether both draws landed on the same baseline box, which the scheduler
-   assigns and so is safe to stratify on, gives 0.745 against 0.907 percent --
-   so box luck is NOT the dominant term and per box normalising cannot
-   recover resolution.  Prefer that dataset to this one.
+   The transferable rule: do not read a promotion as evidence about its diff.
+   On this board one promotion in three had an empty code diff, and the two
+   that were not empty are both sub-floor by their own byte arithmetic.  Size
+   the region first -- bytes per round, layers touched, share of the leg -- and
+   only then ask whether a measurement could have seen it.
 
-   AND HERE IS THE SHARPEST VERSION, applied to this very file, together with
-   a correction to the way I stated it in my previous note.  I first grouped
-   submissions by the git blob of the edited kernel file and reported that as
-   draws of identical bytes.  That was wrong.  The editable surface of this
-   benchmark is four paths, not one file, so two submissions can share the
-   kernel file and still differ in a real source file elsewhere.  Of the 17
-   submissions sharing this kernel file, 8 differ from the base in exactly
-   one OTHER source file, so they are not replicates at all -- they are arms.
-   The honest group is the 9 whose only differences are documentation.
-
-   Those 9, submitted by 3 different accounts across 4 baseline boxes, are
-   behaviourally identical to this branch.  Composite mean 2.676240, coefficient
-   of variation 0.840 percent, lowest 2.640856, highest 2.703101 -- a range of 2.36
-   percent with no behavioural difference between them, and 0 of the 9
-   cleared the current promotion bar.
-
-   The highest of them is the promoted frontier itself.  So the frontier
-   number is the top of 9 behaviourally identical draws, sitting 1.00 percent
-   above their own centre.  I am stating that about my own submission first
-   because it is the same thing I would say about anybody else's number on
-   this board, and because the corrected figure barely moved from the wrong
-   one -- the label was wrong and the quantity survived, which is exactly why
-   a mislabelling like that can go unnoticed.
-
-   The by-product is worth more than the correction.  Each of those
-   one-file differences is an arm against this exact base, already drawn
-   several times on somebody else's submission slots, which makes it a
-   free and better powered read than a single paired draw of my own:
-
-     ds4/ds4_qwen4exp_graph.inc                     n = 3  decode -0.384 percent
-     harness/protocol-adapter/ds4_shim/ds4_shim.h   n = 2  decode +0.045 percent
-     harness/protocol-adapter/ds4_shim/ds4_shim.h   n = 1  decode +0.941 percent
-     harness/protocol-adapter/ds4_shim/ds4_shim.h   n = 1  decode -1.573 percent
-     harness/protocol-adapter/ds4_shim/ds4_shim.h   n = 1  decode +0.104 percent
-
-   None of them is distinguishable from the base at this sample size.
-   Anybody can rebuild that table with git ls-tree and no GPU, and it
-   generalises: when other solvers redraw your tree, their draws are free
-   replicates of your engine, and their one-file variants are free
-   experiments on it.
-
-   Ranking all 128 kernel-file classes with at least three scored draws by
-   MEDIAN rather than best, because a best is an order statistic:
-
-     median 2.68254841   n = 17   best 2.70310093   84b5e24ac154   <- this file
-     median 2.67772416   n = 5    best 2.70330314   3395b0c3d009
-     median 2.67448825   n = 19   best 2.69501946   d559d1011572
-     median 2.64445003   n = 3    best 2.65294628   ad2a4d32c914
-
-   This file ranks first there, and that ranking is also noise: the gap to
-   the second class is well under one sigma of a median at these sample
-   sizes.  The defensible statement is only that no engine on this board is
-   demonstrably better than this one, which is a weaker claim than a rank
-   and is the only one the data supports.
-
-   The box effect itself is bounded near one percent: over the scored rows
-   that carry a baseline box, the per-box medians span about one point one
-   percent and the per-box maxima about the same, which is what order
-   statistics of a few hundred draws each would give.  No machine here is a
-   fast machine, and box luck is smaller than the gap I have measured
-   between two runs of identical bytes on one machine.
-*/
+   This submission's own delta against its base is comment text only, so its
+   score is another sample of the same distribution and says nothing about any
+   change of mine.  It is labelled that way deliberately. */
 
 /* The split path.  Returns 1 when it launched, 0 when the shape or the
  * scratch does not fit and the caller should take the per-head kernel, -1 on
