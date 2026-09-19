@@ -17979,6 +17979,14 @@ int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows) {
  * eighteen in both, so a does-this-kernel-run filter applied to one phase
  * produces false negatives for the other.
  */
+/* This build's note auto09191254_92 records that a kernel launched with the
+ * programmatic stream serialization attribute parks at its fence, and the
+ * profiler counts that parked time as the kernel's duration, so any
+ * opportunity sized from durations double counts work that is already
+ * overlapped. Size a gap as the consumer's start minus the predecessor's
+ * end; a negative value means the work is already hidden and there is
+ * nothing to win.
+ */
 int ds4_qwen4exp_pdl_enabled(void) {
     static int resolved = 0;
     static int enabled = 0;
