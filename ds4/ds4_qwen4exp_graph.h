@@ -72,7 +72,7 @@ typedef struct {
     uint64_t gdn_recurrent_bytes; /* [n_value_head][dim][state] f32 per GDN layer */
     uint64_t gdn_conv_bytes;      /* [conv - 1][conv_dim] f32 per GDN layer      */
     uint64_t qsa_kv_bytes;        /* k and v caches per QSA layer                */
-    uint64_t qsa_indexer_bytes;   /* exact key tape and pooled blocks per QSA layer */
+    uint64_t qsa_indexer_bytes;   /* key tape, pool and lazy f32 prefix per QSA layer */
     uint64_t ple_state_bytes;     /* dilated conv window, [9][n_hc * n_embd]     */
     /* The speculative cycle's per-row state slots.  A verify of N + 1 rows
      * mirrors the carried state after each of its first N rows, so a round

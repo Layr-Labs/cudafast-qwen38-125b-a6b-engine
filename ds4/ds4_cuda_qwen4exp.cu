@@ -13924,6 +13924,24 @@ __global__ static void qwen4exp_qsa_tape_append_kernel(
     tape[(uint64_t)pos * head_dim + d] = raw_k[gid];
 }
 
+__global__ static void qwen4exp_indexer_defer_dpos_kernel(
+        float *deferred,
+        const float *rows,
+        uint32_t n_tokens,
+        uint32_t capacity,
+        uint32_t row_width,
+        uint32_t pos0,
+        const uint32_t *d_pos) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t count = (uint64_t)n_tokens * row_width;
+    if (gid >= count) return;
+    const uint32_t token = (uint32_t)(gid / row_width);
+    const uint32_t dim = (uint32_t)(gid - (uint64_t)token * row_width);
+    const uint32_t base = d_pos ? *d_pos : pos0;
+    if (base >= capacity || token >= capacity - base) return;
+    deferred[((uint64_t)base + token) * row_width + dim] = rows[gid];
+}
+
 template<bool Append=false>
 __global__ static void qwen4exp_qsa_pool_update_kernel(
         float *tape,
@@ -16364,6 +16382,30 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_pool_update_dpos_tensor(
         }
     }
     return 1;
+}
+
+extern "C" int ds4_gpu_qwen4exp_indexer_defer_dpos_tensor(
+        ds4_gpu_tensor       *deferred,
+        const ds4_gpu_tensor *rows,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              capacity,
+        uint32_t              row_width,
+        const ds4_gpu_tensor *d_pos) {
+    if (!deferred || !rows || !n_tokens || !capacity || !row_width ||
+        !glm53_cuda_tensor_has(deferred, (uint64_t)capacity * row_width,
+                               sizeof(float)) ||
+        !glm53_cuda_tensor_has(rows, (uint64_t)n_tokens * row_width,
+                               sizeof(float)) ||
+        (d_pos && !glm53_cuda_tensor_has(d_pos, 1u, sizeof(uint32_t))) ||
+        (!d_pos && ((uint64_t)pos0 + n_tokens > capacity))) return 0;
+    const uint64_t count = (uint64_t)n_tokens * row_width;
+    qwen4exp_indexer_defer_dpos_kernel<<<
+        (unsigned)((count + 255u) / 256u), 256u, 0, cuda_decode_stream()>>>(
+            (float *)deferred->ptr, (const float *)rows->ptr, n_tokens,
+            capacity, row_width, pos0,
+            d_pos ? (const uint32_t *)d_pos->ptr : NULL);
+    return cuda_ok(cudaGetLastError(), "Qwen4-Exp indexer defer launch");
 }
 
 extern "C" int ds4_gpu_qwen4exp_qsa_indexer_pool_update_tensor(

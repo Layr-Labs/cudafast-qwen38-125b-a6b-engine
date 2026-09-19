@@ -11,6 +11,7 @@
 #include "ds4_qwen4exp_model_registration.h"
 #include "ds4_qwen4exp_qsa_scratch.h"
 #include "ds4_qwen4exp_gdn_replay.h"
+#include "ds4_qwen4exp_indexer_defer.h"
 
 /* CUDA supplies the native output-row screen.  Keep these weak just like the
  * MTP hook binding does: Metal/ROCm and CPU-only test links have no such
@@ -91,6 +92,15 @@ void ds4_qwen4exp_session_plan_compute(ds4_qwen4exp_session_plan *plan,
     const uint64_t knorm_one = (uint64_t)DS4_N_INDEXER_HEAD_DIM * f;
     plan->qsa_kv_bytes = 2ull * kv_one * plan->n_qsa_layer;
     plan->qsa_indexer_bytes = (tape_one + pool_one + knorm_one) * plan->n_qsa_layer;
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    /* CUDA can postpone indexer-K until its first reader.  Charge the exact
+     * f32 mixer rows retained for that purpose even though allocation failure
+     * has a correct eager fallback. */
+    const uint64_t deferred_rows = n_ctx < DS4_N_INDEXER_TOP_K
+        ? n_ctx : DS4_N_INDEXER_TOP_K;
+    plan->qsa_indexer_bytes +=
+        deferred_rows * E * f * plan->n_qsa_layer;
+#endif
 
     /* PLE: the depthwise convolution is DILATED by the n-gram size, so its
      * rolling window is (ple_conv - 1) * n_ngram rows -- nine on the pinned
@@ -141,7 +151,11 @@ void ds4_qwen4exp_session_plan_compute(ds4_qwen4exp_session_plan *plan,
     act += 3ull * B * q_width * f;                 /* q, gate, attn out   */
     act += 2ull * B * cfg->qsa_kv_dim * f;
     act += B * cfg->indexer_q_dim * f;
-    act += B * cfg->indexer_k_dim * f;
+    uint64_t idx_k_rows = B;
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (idx_k_rows < deferred_rows) idx_k_rows = deferred_rows;
+#endif
+    act += idx_k_rows * cfg->indexer_k_dim * f;
     act += B * blocks * f;                         /* block scores        */
     act += B * top_k * sizeof(int32_t);
     act += B * max_selected * sizeof(int32_t);
@@ -324,6 +338,9 @@ struct ds4_qwen4exp_session {
     ds4_gpu_tensor *qsa_v[DS4_MAX_LAYER];
     ds4_gpu_tensor *idx_tape[DS4_MAX_LAYER];
     ds4_gpu_tensor *idx_pool[DS4_MAX_LAYER];
+    ds4_gpu_tensor *idx_deferred[DS4_MAX_LAYER];
+    ds4_qwen4exp_indexer_defer_state idx_defer_state[DS4_MAX_LAYER];
+    bool indexer_defer_enabled;
 
     /* Per-layer indexer norm weights, uploaded once: the pool update takes the
      * k_layernorm weight as a tensor rather than a model offset. */
@@ -624,6 +641,10 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
         getenv("DS4_QWEN4EXP_NO_LAZY_ROLLBACK") == NULL &&
         ds4_gpu_qwen4exp_gdn_replay_supported();
 #endif
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    s->indexer_defer_enabled =
+        getenv("DS4_QWEN4EXP_NO_INDEXER_DEFER") == NULL;
+#endif
 
     const uint64_t E = DS4_N_EMBD;
     const uint64_t H = DS4_N_HC;
@@ -725,6 +746,27 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
                 (uint64_t)n_ctx * DS4_N_INDEXER_KV_HEAD * DS4_N_INDEXER_HEAD_DIM * f, &ok);
             s->idx_pool[il] = qwen4exp_alloc_zeroed(
                 blocks * DS4_N_INDEXER_KV_HEAD * DS4_N_INDEXER_HEAD_DIM * f, &ok);
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+            if (ok && s->indexer_defer_enabled) {
+                const uint64_t rows = n_ctx < DS4_N_INDEXER_TOP_K
+                    ? n_ctx : DS4_N_INDEXER_TOP_K;
+                g_qwen4exp_alloc_count++;
+                s->idx_deferred[il] = ds4_gpu_tensor_alloc(rows * E * f);
+                if (!s->idx_deferred[il]) {
+                    /* Optional optimization: release earlier staging buffers
+                     * and keep the exact eager indexer rather than refusing a
+                     * session whose required state fitted. */
+                    s->indexer_defer_enabled = false;
+                    for (uint32_t j = 0; j <= il; j++) {
+                        ds4_gpu_tensor_free(s->idx_deferred[j]);
+                        s->idx_deferred[j] = NULL;
+                    }
+                    fprintf(stderr,
+                            "ds4: qwen4exp indexer defer allocation fell back "
+                            "to eager projection\n");
+                }
+            }
+#endif
             s->idx_q_norm[il] = qwen4exp_alloc_zeroed(
                 (uint64_t)DS4_N_INDEXER_HEAD_DIM * f, &ok);
             s->idx_k_norm[il] = qwen4exp_alloc_zeroed(
@@ -858,7 +900,15 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
     s->qsa_kin     = qwen4exp_alloc_zeroed(B * cfg->qsa_kv_dim * f, &ok);
     s->qsa_vin     = qwen4exp_alloc_zeroed(B * cfg->qsa_kv_dim * f, &ok);
     s->idx_q       = qwen4exp_alloc_zeroed(B * cfg->indexer_q_dim * f, &ok);
-    s->idx_k       = qwen4exp_alloc_zeroed(B * cfg->indexer_k_dim * f, &ok);
+    uint64_t idx_k_rows = B;
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    {
+        const uint64_t deferred_rows = n_ctx < DS4_N_INDEXER_TOP_K
+            ? n_ctx : DS4_N_INDEXER_TOP_K;
+        if (idx_k_rows < deferred_rows) idx_k_rows = deferred_rows;
+    }
+#endif
+    s->idx_k       = qwen4exp_alloc_zeroed(idx_k_rows * cfg->indexer_k_dim * f, &ok);
     s->idx_scores  = qwen4exp_alloc_zeroed(B * blocks * f, &ok);
     s->idx_topk    = qwen4exp_alloc_zeroed(B * top_k * sizeof(int32_t), &ok);
     s->idx_selected = qwen4exp_alloc_zeroed(B * max_selected * sizeof(int32_t), &ok);
@@ -923,6 +973,7 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
         ds4_gpu_tensor_free(s->qsa_v[il]);
         ds4_gpu_tensor_free(s->idx_tape[il]);
         ds4_gpu_tensor_free(s->idx_pool[il]);
+        ds4_gpu_tensor_free(s->idx_deferred[il]);
         ds4_gpu_tensor_free(s->idx_q_norm[il]);
         ds4_gpu_tensor_free(s->idx_k_norm[il]);
         ds4_gpu_tensor_free(s->attn_q_norm[il]);
@@ -1039,6 +1090,9 @@ static void qwen4exp_zero_tensor(ds4_gpu_tensor *t) {
 void ds4_qwen4exp_session_reset(ds4_qwen4exp_session *s) {
     if (!s) return;
     s->head_cache_pos = 0;
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        ds4_qwen4exp_indexer_defer_reset(&s->idx_defer_state[il]);
+    }
     /* A pending adoption names a slot of the state being discarded; the zeroed
      * live buffers are what the next forward must read. */
     s->adopt_state = 0u;
@@ -1791,6 +1845,94 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
     return true;
 }
 
+static ds4_qwen4exp_indexer_defer_action qwen4exp_indexer_defer_action_for(
+        const ds4_qwen4exp_session *s, uint32_t il, uint32_t pos,
+        uint32_t n_tokens) {
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    return ds4_qwen4exp_indexer_defer_plan(
+        &s->idx_defer_state[il], s->idx_deferred[il] != NULL,
+        pos, n_tokens, DS4_N_INDEXER_TOP_K);
+#else
+    (void)s; (void)il; (void)pos; (void)n_tokens;
+    return DS4_QWEN4EXP_INDEXER_EAGER;
+#endif
+}
+
+static bool qwen4exp_indexer_materialize(
+        ds4_qwen4exp_session *s, const ds4_qwen4exp_layer_weights *l,
+        const ds4_model *m, uint32_t il) {
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    ds4_qwen4exp_indexer_defer_state *state = &s->idx_defer_state[il];
+    const uint32_t rows = state->rows;
+    if (rows != 0u &&
+        (!ds4_qwen4exp_matmul_bf16(s->idx_k, QW_MAP(m, l->indexer_k_proj),
+                                   QW_MAPSZ(m, l->indexer_k_proj),
+                                   QW_OFF(l->indexer_k_proj),
+                                   DS4_N_EMBD, g_ds4_qwen4exp.indexer_k_dim,
+                                   s->idx_deferred[il], rows) ||
+         !ds4_gpu_qwen4exp_qsa_indexer_pool_update_tensor(
+             s->idx_pool[il], s->idx_tape[il], s->idx_k,
+             s->idx_k_norm[il], s->inv_freq, 0u, rows, s->plan.n_ctx,
+             DS4_N_INDEXER_HEAD_DIM, DS4_N_INDEXER_COMPRESS_RATIO,
+             DS4_N_ROT, DS4_RMS_EPS, l->indexer_k_norm_offset))) {
+        fprintf(stderr,
+                "ds4: qwen4exp deferred indexer materialization failed at "
+                "block %u\n", il);
+        return false;
+    }
+    ds4_qwen4exp_indexer_defer_materialized(state);
+    return true;
+#else
+    (void)s; (void)l; (void)m; (void)il;
+    return false;
+#endif
+}
+
+static bool qwen4exp_indexer_k_update(
+        ds4_qwen4exp_session *s, const ds4_qwen4exp_layer_weights *l,
+        const ds4_model *m, uint32_t il, uint32_t pos0,
+        uint32_t n_tokens) {
+    ds4_qwen4exp_indexer_defer_action action =
+        qwen4exp_indexer_defer_action_for(s, il, pos0, n_tokens);
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (action == DS4_QWEN4EXP_INDEXER_DEFER) {
+        const uint32_t capacity = s->plan.n_ctx < DS4_N_INDEXER_TOP_K
+            ? s->plan.n_ctx : DS4_N_INDEXER_TOP_K;
+        if (!ds4_gpu_qwen4exp_indexer_defer_dpos_tensor(
+                s->idx_deferred[il], s->mixed, pos0, n_tokens, capacity,
+                DS4_N_EMBD, s->d_pos) ||
+            !ds4_qwen4exp_indexer_defer_commit(
+                &s->idx_defer_state[il], pos0, n_tokens)) {
+            fprintf(stderr,
+                    "ds4: qwen4exp indexer defer failed at block %u\n", il);
+            return false;
+        }
+        return true;
+    }
+    if (action == DS4_QWEN4EXP_INDEXER_MATERIALIZE_EAGER &&
+        !qwen4exp_indexer_materialize(s, l, m, il)) return false;
+#else
+    (void)action;
+#endif
+    if (!ds4_qwen4exp_matmul_bf16(s->idx_k, QW_MAP(m, l->indexer_k_proj),
+                                  QW_MAPSZ(m, l->indexer_k_proj),
+                                  QW_OFF(l->indexer_k_proj),
+                                  DS4_N_EMBD,
+                                  g_ds4_qwen4exp.indexer_k_dim,
+                                  s->mixed, n_tokens) ||
+        !ds4_gpu_qwen4exp_qsa_indexer_pool_update_dpos_tensor(
+            s->idx_pool[il], s->idx_tape[il], s->idx_k,
+            s->idx_k_norm[il], s->inv_freq, pos0, n_tokens,
+            s->plan.n_ctx, DS4_N_INDEXER_HEAD_DIM,
+            DS4_N_INDEXER_COMPRESS_RATIO, DS4_N_ROT, DS4_RMS_EPS,
+            l->indexer_k_norm_offset, s->d_pos)) {
+        fprintf(stderr,
+                "ds4: qwen4exp indexer key update failed at block %u\n", il);
+        return false;
+    }
+    return true;
+}
+
 static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
                                      const ds4_qwen4exp_layer_weights *l,
                                      const ds4_model *m,
@@ -1895,20 +2037,15 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
     /* Indexer: BF16 projections, the exact unrotated key tape, pooled blocks,
      * block scores, top-k, and the "keep OR own" expansion.
      *
-     * The k projection feeds the pool update, which runs on every call so the
-     * tape stays exact for the positions that DO index later.  The q
-     * projection feeds only the norm/rope/scores/select chain below, and that
-     * chain runs only when `indexed`.  Below the budget its result was written
-     * and never read, so it moves under the same condition.  This removes a
-     * computation whose output no reader observes; it does not change one. */
+     * Below the budget neither projected k nor its pool has a reader.  CUDA
+     * retains the exact f32 mixer rows instead and materializes them with the
+     * same BF16 and pool kernels at the first indexed call.  Other backends,
+     * the runtime valve and allocation/sequence fallbacks stay eager.  The q
+     * projection feeds only the norm/rope/scores/select chain below and is
+     * likewise needed only when `indexed`. */
     const bool indexed = (uint64_t)pos0 + n_tokens > DS4_N_INDEXER_TOP_K;
 
-    if (!ds4_qwen4exp_matmul_bf16(s->idx_k, QW_MAP(m, l->indexer_k_proj),
-                                  QW_MAPSZ(m, l->indexer_k_proj),
-                                  QW_OFF(l->indexer_k_proj),
-                                  DS4_N_EMBD, cfg->indexer_k_dim,
-                                  s->mixed, n_tokens)) {
-        fprintf(stderr, "ds4: qwen4exp indexer projections failed at block %u\n", il);
+    if (!qwen4exp_indexer_k_update(s, l, m, il, pos0, n_tokens)) {
         return false;
     }
     if (indexed &&
@@ -1920,15 +2057,6 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
         fprintf(stderr, "ds4: qwen4exp indexer projections failed at block %u\n", il);
         return false;
     }
-    if (!ds4_gpu_qwen4exp_qsa_indexer_pool_update_dpos_tensor(
-            s->idx_pool[il], s->idx_tape[il], s->idx_k, s->idx_k_norm[il],
-            s->inv_freq, pos0, n_tokens, s->plan.n_ctx,
-            DS4_N_INDEXER_HEAD_DIM, ratio, DS4_N_ROT, DS4_RMS_EPS,
-            l->indexer_k_norm_offset, s->d_pos)) {
-        fprintf(stderr, "ds4: qwen4exp indexer pool update failed at block %u\n", il);
-        return false;
-    }
-
     const ds4_gpu_tensor *sel = NULL;
     const ds4_gpu_tensor *counts = NULL;
     if (indexed) {
@@ -2612,19 +2740,25 @@ static bool qwen4exp_graph_layer_island(
 static bool qwen4exp_graph_qsa_island(
         ds4_qwen4exp_session *s, const ds4_qwen4exp_layer_weights *l,
         const ds4_model *m, uint32_t il, uint32_t n_tokens) {
+    const ds4_qwen4exp_indexer_defer_action defer_action =
+        qwen4exp_indexer_defer_action_for(s, il, s->pos, n_tokens);
     const bool qsa_capture_ok =
         n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
         (uint64_t)s->pos + n_tokens <= DS4_N_INDEXER_TOP_K &&
+        defer_action != DS4_QWEN4EXP_INDEXER_MATERIALIZE_EAGER &&
         !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
         ds4_gpu_decode_graphs_supported();
     if (qsa_capture_ok) {
+        const ds4_qwen4exp_indexer_defer_state saved_defer =
+            s->idx_defer_state[il];
         ds4_decode_graph_key key;
         memset(&key, 0, sizeof(key));
         key.il = il;
         key.island = 2u;
         key.variant = ds4_qwen4exp_gdn_graph_variant(
             n_tokens, s->spec_snapshot_rows, s->gdn_replay_phase,
-            s->gdn_replay_active);
+            s->gdn_replay_active) |
+            ((uint32_t)(defer_action == DS4_QWEN4EXP_INDEXER_DEFER) << 24u);
         key._pad = 0x5157454eu;
         key.cur_hc = s->hyper;
         key.after_attn_hc = s;
@@ -2632,6 +2766,14 @@ static bool qwen4exp_graph_qsa_island(
         key.attn_norm = (void *)m;
         const int state = ds4_gpu_decode_graph_begin(&key);
         if (state == 1) {
+            if (defer_action == DS4_QWEN4EXP_INDEXER_DEFER &&
+                !ds4_qwen4exp_indexer_defer_commit(
+                    &s->idx_defer_state[il], s->pos, n_tokens)) {
+                fprintf(stderr,
+                        "ds4: qwen4exp indexer graph replay lost sequence at "
+                        "block %u\n", il);
+                return false;
+            }
             QW_TRACE(QW_SLICE_QSA);
             return true;
         }
@@ -2645,6 +2787,7 @@ static bool qwen4exp_graph_qsa_island(
             } else {
                 ds4_gpu_decode_graph_abort(&key);
             }
+            s->idx_defer_state[il] = saved_defer;
 #ifdef DS4_TEST_HOOKS
             g_qwen4exp_trace_len = trace_len;
             g_qwen4exp_trace_overflow = trace_overflow;
@@ -2652,6 +2795,8 @@ static bool qwen4exp_graph_qsa_island(
         }
     }
     if (qw_pf_graph_on(n_tokens, il) && ds4_gpu_oneshot_graph_begin() == 0) {
+        const ds4_qwen4exp_indexer_defer_state saved_defer =
+            s->idx_defer_state[il];
 #ifdef DS4_TEST_HOOKS
         const uint32_t pf_trace_len = g_qwen4exp_trace_len;
         const bool pf_trace_overflow = g_qwen4exp_trace_overflow;
@@ -2661,6 +2806,7 @@ static bool qwen4exp_graph_qsa_island(
             return true;
         }
         ds4_gpu_oneshot_graph_abort();
+        s->idx_defer_state[il] = saved_defer;
 #ifdef DS4_TEST_HOOKS
         g_qwen4exp_trace_len = pf_trace_len;
         g_qwen4exp_trace_overflow = pf_trace_overflow;
@@ -2830,6 +2976,47 @@ static bool qwen4exp_graph_layers_encode(
                                               0u, g_ds4_qwen4exp.n_layer);
 }
 
+/* Whole-stack and chunk graphs skip every host call site on replay.  The
+ * deferred indexer rows are host bookkeeping for device work carried by those
+ * graphs, so the outer owner must advance them exactly once when it replays.
+ *
+ * An outer graph may cover several QSA layers.  They normally have the same
+ * mode, but requiring that explicitly keeps a graph captured with staging
+ * kernels from ever serving a layer that has already materialized (or an
+ * allocation fallback that stayed eager).  A materialization action cannot be
+ * captured because it changes the mode after the graph runs. */
+static bool qwen4exp_indexer_defer_range_mode(
+        const ds4_qwen4exp_session *s, const ds4_qwen4exp_weights *w,
+        uint32_t il_first, uint32_t il_last, uint32_t pos,
+        uint32_t n_tokens, bool *deferred) {
+    int mode = -1;
+    for (uint32_t il = il_first; il < il_last; il++) {
+        if (!w->layer[il].is_full_attention) continue;
+        const ds4_qwen4exp_indexer_defer_action action =
+            qwen4exp_indexer_defer_action_for(s, il, pos, n_tokens);
+        if (action == DS4_QWEN4EXP_INDEXER_MATERIALIZE_EAGER) return false;
+        const int layer_mode = action == DS4_QWEN4EXP_INDEXER_DEFER ? 1 : 0;
+        if (mode >= 0 && mode != layer_mode) return false;
+        mode = layer_mode;
+    }
+    if (deferred) *deferred = mode == 1;
+    return true;
+}
+
+static bool qwen4exp_indexer_defer_range_commit(
+        ds4_qwen4exp_session *s, const ds4_qwen4exp_weights *w,
+        uint32_t il_first, uint32_t il_last, uint32_t pos,
+        uint32_t n_tokens) {
+    uint32_t layers[DS4_MAX_LAYER];
+    uint32_t n_layers = 0u;
+    for (uint32_t il = il_first; il < il_last; il++) {
+        if (!w->layer[il].is_full_attention) continue;
+        layers[n_layers++] = il;
+    }
+    return ds4_qwen4exp_indexer_defer_commit_layers(
+        s->idx_defer_state, DS4_MAX_LAYER, layers, n_layers, pos, n_tokens);
+}
+
 /* How many consecutive captures the target stack is cut into.  1 is the single
  * whole-stack capture, which is what this build did before; the default trades
  * one long launch against an idle GPU for one short one plus launches that
@@ -2882,6 +3069,13 @@ static bool qw_decode_graph_chunk(ds4_qwen4exp_session *s,
                                   const ds4_model *m, uint32_t n_tokens,
                                   uint32_t chunk, uint32_t il_first,
                                   uint32_t il_last) {
+    bool indexer_deferred = false;
+    if (!qwen4exp_indexer_defer_range_mode(
+            s, w, il_first, il_last, s->pos, n_tokens,
+            &indexer_deferred)) {
+        return qwen4exp_graph_layers_encode_range(
+            s, w, m, n_tokens, true, il_first, il_last);
+    }
     ds4_decode_graph_key key;
     memset(&key, 0, sizeof(key));
     /* Chunk index as the layer slot: island three has no per-layer entry, so
@@ -2890,7 +3084,8 @@ static bool qw_decode_graph_chunk(ds4_qwen4exp_session *s,
     key.island = 3u;
     key.variant = ds4_qwen4exp_gdn_graph_variant(
             n_tokens, s->spec_snapshot_rows, s->gdn_replay_phase,
-            s->gdn_replay_active);
+            s->gdn_replay_active) |
+            ((uint32_t)indexer_deferred << 24u);
     key._pad = 0x51575343u; /* QWSC: one chunk of the target layer stack */
     key.cur_hc = s->hyper;
     key.after_attn_hc = s;
@@ -2898,6 +3093,13 @@ static bool qw_decode_graph_chunk(ds4_qwen4exp_session *s,
     key.attn_norm = (void *)m;
     const int state = ds4_gpu_decode_graph_begin(&key);
     if (state == 1) {
+        if (indexer_deferred &&
+            !qwen4exp_indexer_defer_range_commit(
+                s, w, il_first, il_last, s->pos, n_tokens)) {
+            fprintf(stderr,
+                    "ds4: qwen4exp indexer chunk graph replay lost sequence\n");
+            return false;
+        }
 #ifdef DS4_TEST_HOOKS
         qw_decode_graph_trace_range(w, il_first, il_last);
 #endif
@@ -2912,17 +3114,20 @@ static bool qw_decode_graph_chunk(ds4_qwen4exp_session *s,
         return true;
     }
     if (state == 0) {
+        ds4_qwen4exp_indexer_defer_state saved_defer[DS4_MAX_LAYER];
+        memcpy(saved_defer, s->idx_defer_state, sizeof(saved_defer));
 #ifdef DS4_TEST_HOOKS
         const uint32_t trace_len = g_qwen4exp_trace_len;
         const bool trace_overflow = g_qwen4exp_trace_overflow;
 #endif
-        if (qwen4exp_graph_layers_encode_range(s, w, m, n_tokens, false,
-                                               il_first, il_last)) {
-            if (ds4_gpu_decode_graph_end(&key) == 0) return true;
-        } else {
+        if (!qwen4exp_graph_layers_encode_range(
+                s, w, m, n_tokens, false, il_first, il_last)) {
             ds4_gpu_decode_graph_abort(&key);
+            memcpy(s->idx_defer_state, saved_defer, sizeof(saved_defer));
             return false;
         }
+        if (ds4_gpu_decode_graph_end(&key) == 0) return true;
+        memcpy(s->idx_defer_state, saved_defer, sizeof(saved_defer));
 #ifdef DS4_TEST_HOOKS
         g_qwen4exp_trace_len = trace_len;
         g_qwen4exp_trace_overflow = trace_overflow;
@@ -2952,9 +3157,12 @@ static bool qwen4exp_graph_layers(
      * capture_ok requires n_tokens <= DS4_QWEN4EXP_MTP_MAX_COMMIT.  So at
      * every width that captures, hc_pending is false at every layer boundary
      * -- the forward clears it on entry and nothing in a decode-width layer
-     * sets it.  Cutting the capture at a layer boundary therefore cannot move
-     * an inject across it, and a forward that replays some chunks and encodes
-     * others is the same computation in the same order. */
+     * sets it.  The indexer defer prefix is private to each QSA layer; the
+     * chunk owner above advances exactly the layers its replay covers and
+     * restores them on capture failure.  Cutting the capture at a layer
+     * boundary therefore cannot move an inject or a prefix across it, and a
+     * forward that replays some chunks and encodes others is the same
+     * computation in the same order. */
     if (capture_ok && qw_decode_graph_chunks() > 1u) {
         const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
         uint32_t chunks = qw_decode_graph_chunks();
@@ -2972,6 +3180,12 @@ static bool qwen4exp_graph_layers(
         return true;
     }
     if (capture_ok) {
+        bool indexer_deferred = false;
+        if (!qwen4exp_indexer_defer_range_mode(
+                s, w, 0u, g_ds4_qwen4exp.n_layer, s->pos, n_tokens,
+                &indexer_deferred)) {
+            return qwen4exp_graph_layers_encode(s, w, m, n_tokens, true);
+        }
         ds4_decode_graph_key key;
         memset(&key, 0, sizeof(key));
         /* Target layer zero has no island-three entry.  The existing head
@@ -2980,7 +3194,8 @@ static bool qwen4exp_graph_layers(
         key.island = 3u;
         key.variant = ds4_qwen4exp_gdn_graph_variant(
             n_tokens, s->spec_snapshot_rows, s->gdn_replay_phase,
-            s->gdn_replay_active);
+            s->gdn_replay_active) |
+            ((uint32_t)indexer_deferred << 24u);
         key._pad = 0x51575354u; /* QWST: the complete target layer stack */
         key.cur_hc = s->hyper;
         key.after_attn_hc = s;
@@ -2988,6 +3203,13 @@ static bool qwen4exp_graph_layers(
         key.attn_norm = (void *)m;
         const int state = ds4_gpu_decode_graph_begin(&key);
         if (state == 1) {
+            if (indexer_deferred &&
+                !qwen4exp_indexer_defer_range_commit(
+                    s, w, 0u, g_ds4_qwen4exp.n_layer, s->pos, n_tokens)) {
+                fprintf(stderr,
+                        "ds4: qwen4exp indexer stack graph replay lost sequence\n");
+                return false;
+            }
 #ifdef DS4_TEST_HOOKS
             /* Preserve the logical slice trace even when encoding is skipped. */
             const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
@@ -3005,6 +3227,8 @@ static bool qwen4exp_graph_layers(
             return true;
         }
         if (state == 0) {
+            ds4_qwen4exp_indexer_defer_state saved_defer[DS4_MAX_LAYER];
+            memcpy(saved_defer, s->idx_defer_state, sizeof(saved_defer));
 #ifdef DS4_TEST_HOOKS
             const uint32_t trace_len = g_qwen4exp_trace_len;
             const bool trace_overflow = g_qwen4exp_trace_overflow;
@@ -3015,6 +3239,7 @@ static bool qwen4exp_graph_layers(
             } else {
                 ds4_gpu_decode_graph_abort(&key);
             }
+            memcpy(s->idx_defer_state, saved_defer, sizeof(saved_defer));
 #ifdef DS4_TEST_HOOKS
             g_qwen4exp_trace_len = trace_len;
             g_qwen4exp_trace_overflow = trace_overflow;
@@ -3575,6 +3800,20 @@ bool ds4_qwen4exp_session_add_head_block(ds4_qwen4exp_session             *s,
         (uint64_t)n_ctx * DS4_N_INDEXER_KV_HEAD * DS4_N_INDEXER_HEAD_DIM * f, &ok);
     s->idx_pool[il] = qwen4exp_alloc_zeroed(
         blocks * DS4_N_INDEXER_KV_HEAD * DS4_N_INDEXER_HEAD_DIM * f, &ok);
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (ok && s->indexer_defer_enabled) {
+        const uint64_t rows = n_ctx < DS4_N_INDEXER_TOP_K
+            ? n_ctx : DS4_N_INDEXER_TOP_K;
+        g_qwen4exp_alloc_count++;
+        s->idx_deferred[il] = ds4_gpu_tensor_alloc(
+            rows * DS4_N_EMBD * f);
+        if (!s->idx_deferred[il]) {
+            fprintf(stderr,
+                    "ds4: qwen4exp head indexer defer allocation fell back "
+                    "to eager projection\n");
+        }
+    }
+#endif
     s->idx_q_norm[il] = qwen4exp_alloc_zeroed(
         (uint64_t)DS4_N_INDEXER_HEAD_DIM * f, &ok);
     s->idx_k_norm[il] = qwen4exp_alloc_zeroed((uint64_t)DS4_N_INDEXER_HEAD_DIM * f, &ok);
@@ -3637,14 +3876,7 @@ static bool qwen4exp_graph_head_cache_encode(ds4_qwen4exp_session *s,
             s->attn_k_norm[il], s->inv_freq, s->pos, n_tokens, DS4_N_HEAD_KV,
             DS4_N_HEAD_DIM, DS4_N_ROT, s->plan.n_ctx, DS4_RMS_EPS,
             l->attn_k_norm_offset, s->d_pos) ||
-        !ds4_qwen4exp_matmul_bf16(s->idx_k, QW_MAP(m, l->indexer_k_proj),
-            QW_MAPSZ(m, l->indexer_k_proj), QW_OFF(l->indexer_k_proj),
-            DS4_N_EMBD, cfg->indexer_k_dim, s->mixed, n_tokens) ||
-        !ds4_gpu_qwen4exp_qsa_indexer_pool_update_dpos_tensor(
-            s->idx_pool[il], s->idx_tape[il], s->idx_k, s->idx_k_norm[il],
-            s->inv_freq, s->pos, n_tokens, s->plan.n_ctx,
-            DS4_N_INDEXER_HEAD_DIM, DS4_N_INDEXER_COMPRESS_RATIO,
-            DS4_N_ROT, DS4_RMS_EPS, l->indexer_k_norm_offset, s->d_pos))
+        !qwen4exp_indexer_k_update(s, l, m, il, s->pos, n_tokens))
         return false;
     return true;
 }
@@ -3764,11 +3996,16 @@ int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
         return 0;
     }
 
+    const ds4_qwen4exp_indexer_defer_action defer_action =
+        qwen4exp_indexer_defer_action_for(s, il, s->pos, n_tokens);
     const bool capture_ok =
         n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
         (uint64_t)s->pos + n_tokens <= DS4_N_INDEXER_TOP_K &&
+        defer_action != DS4_QWEN4EXP_INDEXER_MATERIALIZE_EAGER &&
         !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
         ds4_gpu_decode_graphs_supported();
+    const ds4_qwen4exp_indexer_defer_state saved_defer =
+        s->idx_defer_state[il];
     ds4_decode_graph_key key;
     int graph_state = -1;
     if (capture_ok) {
@@ -3777,7 +4014,8 @@ int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
         key.island = 3u;
         key.variant = ds4_qwen4exp_gdn_graph_variant(
             n_tokens, s->spec_snapshot_rows, s->gdn_replay_phase,
-            s->gdn_replay_active);
+            s->gdn_replay_active) |
+            ((uint32_t)(defer_action == DS4_QWEN4EXP_INDEXER_DEFER) << 24u);
         key._pad = 0x4d545048u;
         key.cur_hc = hyper;
         key.after_attn_hc = s;
@@ -3788,6 +4026,12 @@ int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
 
     const char *stage = "attention mixer";
     bool ok = graph_state == 1;
+    if (graph_state == 1 &&
+        defer_action == DS4_QWEN4EXP_INDEXER_DEFER) {
+        ok = ds4_qwen4exp_indexer_defer_commit(
+            &s->idx_defer_state[il], s->pos, n_tokens);
+        if (!ok) stage = "indexer graph sequence";
+    }
     if (graph_state != 1) {
         ok = qwen4exp_graph_head_block_encode(
                 s, c->l, c->m, il, n_tokens, &stage);
@@ -3798,6 +4042,7 @@ int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
                 if (!ok) ds4_gpu_decode_graph_abort(&key);
                 /* A failed capture executed no kernels.  Re-encode the block
                  * eagerly once so this proposal still advances its caches. */
+                s->idx_defer_state[il] = saved_defer;
                 ok = qwen4exp_graph_head_block_encode(
                         s, c->l, c->m, il, n_tokens, &stage);
             }
@@ -4197,6 +4442,10 @@ static int qwen4exp_rb_qsa_indexer_truncate(void *ctx, uint32_t pos) {
     if (pos > s->plan.n_ctx) return -1;
     s->state_dirty = true;   /* see `state_dirty` */
     s->indexer_valid_blocks = pos / DS4_N_INDEXER_COMPRESS_RATIO;
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        ds4_qwen4exp_indexer_defer_rollback(
+            &s->idx_defer_state[il], pos);
+    }
     return 0;
 }
 static int qwen4exp_rb_head_cache_truncate(void *ctx, uint32_t pos) {
