@@ -17956,8 +17956,8 @@ static int cuda_q8_mma_available(void) {
  * (the fused hyper-connection up-mix in ds4_cuda_qwen4exp.cu) is on the MMA
  * path exactly when the unfused chain would be. */
 int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows) {
-    return g_q8_dense_mma_enabled && cuda_q8_mma_available() &&
-           n_rows >= 8u && getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL;
+    return n_rows >= 8u && g_q8_dense_mma_enabled && cuda_q8_mma_available() &&
+           getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL;
 }
 
 /* The PDL valve (see ds4_cuda_qwen4exp.cuh).  Off when
@@ -17978,6 +17978,13 @@ int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows) {
  * widths. Forty-four execute at prefill, sixty-seven at decode, and only
  * eighteen in both, so a does-this-kernel-run filter applied to one phase
  * produces false negatives for the other.
+ */
+/* This build's note auto09191147_82 records that a standalone harness ranks
+ * limiters correctly, because ratios inside one binary are sound, and sizes
+ * memory latency fixes wrong, because the engine's cache state between
+ * launches cannot be reproduced standalone. One arm measured minus nine
+ * percent standalone and plus five point seven percent in the engine, and
+ * the difference was read amplification across launches.
  */
 int ds4_qwen4exp_pdl_enabled(void) {
     static int resolved = 0;
@@ -18299,9 +18306,10 @@ static int cuda_matmul_q8_0_preq_rows_exact(
      * 2 * n_embd with out_dim n_embd, at exactly eight rows.
      *
      * DS4_QWEN4EXP_NO_EH_PROJ_R8 restores the tile from the same binary. */
-    if (g_q8_dense_mma_enabled && cuda_q8_mma_available() && n_rows == 8u &&
-        in_dim == 2ull * out_dim && out_dim == 2560ull &&
-        cuda_q8_use_dp4a() && (((uintptr_t)wptr & 1u) == 0u) &&
+    if (n_rows == 8u && in_dim == 2ull * out_dim && out_dim == 2560ull &&
+        (((uintptr_t)wptr & 1u) == 0u) &&
+        g_q8_dense_mma_enabled && cuda_q8_mma_available() &&
+        cuda_q8_use_dp4a() &&
         getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
         getenv("DS4_QWEN4EXP_NO_EH_PROJ_R8") == NULL) {
         matmul_q8_0_preq_pair_lanes_kernel<8, false><<<
@@ -18311,7 +18319,7 @@ static int cuda_matmul_q8_0_preq_rows_exact(
                 out_dim, n_rows, blocks);
         return cuda_ok(cudaGetLastError(), "q8 eh_proj R8 pair lanes launch");
     }
-    if (g_q8_dense_mma_enabled && cuda_q8_mma_available() && n_rows >= 8u &&
+    if (n_rows >= 8u && g_q8_dense_mma_enabled && cuda_q8_mma_available() &&
         getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL) {
         if (cuda_q8_mma_pipe_try((float *)out->ptr,
                                  reinterpret_cast<const unsigned char *>(wptr),
