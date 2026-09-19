@@ -132,122 +132,6 @@ static void *qwen4exp_group_scratch(int tier, uint64_t bytes) {
 }
 
 /* ------------------------------------------------------------------------
- * THE MoE INPUT PREQUANT.
- *
- * The routed MoE opens with a standalone pass over its own input: 80 one-warp
- * blocks that read 2560 floats of `mixed`, write 2560 int8 plus 80 scales and
- * 80 group sums, and do nothing else.  At the decode widths that pass moves
- * 13 KB -- 0.05 us of the box's 241 GB/s -- and costs a graph node plus a
- * full kernel round trip on a serial stream, 48 times per round.  It is the
- * same defect shape the attention mixer's folded Q8_0 quantize already
- * removed on the other side of the block: the kernel one step upstream is
- * ALREADY holding every value in a register, in exactly the lane that owns it.
- *
- * The FFN mixer's mix leg writes `mixed` at one thread per column, 256-thread
- * blocks, so warp w of block bx owns columns [(bx*8+w)*32, +32) of its token
- * -- which IS group bx*8+w, the unit dev_qwen4exp_quantize_group consumes.
- * So the mixer can leave xq/xs/xsum behind and the routed call can skip its
- * first kernel entirely.  The quantiser called is the MoE's own device
- * function on the bytes it would itself have read back, so this is a
- * scheduling change and not a numerical one.
- *
- * WHY A HANDSHAKE RATHER THAN A PARAMETER.  The scratch the routed call
- * quantises into is sized by the routed call: mq_offset + mq_bytes +
- * task_bytes needs mid_dim, n_expert_used and the task-list decision, none of
- * which a mixer knows.  qwen4exp_group_scratch is grow-only and
- * pointer-stable, so a mixer that asked for the xq prefix alone would get the
- * right pointer -- unless the pool had never been grown yet, in which case it
- * would allocate short and the routed call's grow would free the buffer the
- * mixer had just written.  So the routed call PUBLISHES the layout it used and
- * a mixer folds only against a published layout that still holds: same input
- * buffer, same rows, same groups, same base, same pool size.  Layer 0 of a
- * fresh shape therefore keeps the shipped pass and every layer after it folds.
- * A pool grow retires the decode graphs, so a captured fold cannot outlive the
- * layout it was captured against.
- *
- * DECODE WIDTHS ONLY.  The prefill quantiser is a different kernel
- * (qwen4exp_quantize_rows_wide_kernel, rows >= 64) whose 8-groups-per-block
- * mapping the mix leg does not reproduce, and at prefill the 13 KB is 0.4% of
- * a pass that moves 3 GB, so there is nothing there to win.  Prefill keeps the
- * shipped path byte for byte.
- *
- * THE VALVE: DS4_QWEN4EXP_NO_MOE_PREQUANT stands the fold down and restores
- * the standalone pass, for an A/B out of one build.
- * ------------------------------------------------------------------------ */
-static int qwen4exp_moe_prequant_on(void) {
-    static int v = -1;
-    if (v < 0) v = getenv("DS4_QWEN4EXP_NO_MOE_PREQUANT") == NULL ? 1 : 0;
-    return v;
-}
-
-/* What the routed call quantised, and out of which pool. */
-typedef struct {
-    int         valid;
-    const void *x;
-    const void *base;
-    uint64_t    pool_bytes;
-    uint32_t    rows;
-    uint32_t    xgroups;
-} qwen4exp_preq_layout;
-static qwen4exp_preq_layout g_qwen4exp_preq_layout[16];
-
-/* What a mixer left behind: consumed and cleared by the FIRST routed call
- * after it, which is the MoE of the same block with only the router matmul and
- * the pair grouping in between -- neither of which writes the xq prefix.  A
- * mismatch drops the arm and the routed call quantises as shipped, so a stale
- * arm can only cost the fold, never the values. */
-typedef struct {
-    int         armed;
-    const void *x;
-    const void *base;
-    uint32_t    rows;
-    uint32_t    xgroups;
-} qwen4exp_preq_arm;
-static qwen4exp_preq_arm g_qwen4exp_preq_arm[16];
-
-/* The pool as it stands, without asking for any size -- the mixer must not be
- * able to allocate or grow it. */
-static const void *qwen4exp_group_scratch_peek(int tier, uint64_t *bytes_out) {
-    if (tier < 0 || tier >= 16) return NULL;
-    if (bytes_out) *bytes_out = g_qwen4exp_group_bytes[tier];
-    return g_qwen4exp_group_scratch[tier];
-}
-
-static void qwen4exp_preq_publish(int tier, const void *x, const void *base,
-                                  uint32_t rows, uint32_t xgroups) {
-    if (tier < 0 || tier >= 16) return;
-    qwen4exp_preq_layout *ly = &g_qwen4exp_preq_layout[tier];
-    ly->valid = 1;
-    ly->x = x;
-    ly->base = base;
-    ly->pool_bytes = g_qwen4exp_group_bytes[tier];
-    ly->rows = rows;
-    ly->xgroups = xgroups;
-}
-
-/* Resolve the three destinations a mixer would fill, or NULL when no published
- * layout matches.  The offsets are the routed call's own
- * (xq | xs | xsum at the pool prefix); they are written in one place here and
- * asserted against the routed call's by the pointer equality below. */
-static int qwen4exp_preq_targets(int tier, const void *x, uint32_t rows,
-                                 uint32_t xgroups, int8_t **xq, float **xs,
-                                 int32_t **xsum) {
-    if (!qwen4exp_moe_prequant_on() || tier < 0 || tier >= 16) return 0;
-    const qwen4exp_preq_layout *ly = &g_qwen4exp_preq_layout[tier];
-    uint64_t have = 0;
-    const void *base = qwen4exp_group_scratch_peek(tier, &have);
-    if (!ly->valid || !base || ly->base != base || ly->pool_bytes != have ||
-        ly->x != x || ly->rows != rows || ly->xgroups != xgroups) {
-        return 0;
-    }
-    char *b = (char *)base;
-    *xq = (int8_t *)b;
-    *xs = (float *)(b + (uint64_t)rows * xgroups * 32u);
-    *xsum = (int32_t *)(*xs + (uint64_t)rows * xgroups);
-    return 1;
-}
-
-/* ------------------------------------------------------------------------
  * The shared-expert fork.
  *
  * One MoE block is ds4_gpu_qwen4exp_routed_moe_tensor followed by
@@ -4366,18 +4250,6 @@ __global__ static void qwen4exp_moe_group_small_kernel(
      * apply.  Plainly launched -- at the prefill widths where the caller
      * takes the wide grouping path instead -- the fence is a no-op. */
     QWEN4EXP_PDL_SYNC();
-    /* AND a producer, for the same reason the fused variant above is one: when
-     * the MoE-input prequant fold removes the routed input quantizer from the
-     * decode stream, this one block becomes the stream predecessor of the
-     * PSS-launched gate/up projection, whose own fence is its first statement.
-     * The trigger grants LAUNCH permission only; gate/up's
-     * cudaGridDependencySynchronize() still waits for this grid to complete, so
-     * the data edge is unchanged.  One block, so the producer-side deadlock
-     * rule is satisfied by a factor of 768; the gate reads the grid in the body
-     * rather than trusting the launch sites. */
-    if ((uint64_t)gridDim.x * (uint64_t)gridDim.y * (uint64_t)gridDim.z <=
-        768u)
-        QWEN4EXP_PDL_TRIGGER();
     const uint32_t e = threadIdx.x;
     const uint32_t lane = e & 31u;
     const uint32_t warp = e >> 5u;
@@ -4510,47 +4382,13 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
      * on the plain launch this kernel takes, correct if it is ever launched
      * with the programmatic attribute. */
     QWEN4EXP_PDL_SYNC();
-    /* AND THE TRIGGER, RESTORED FOR THE KERNEL THAT NOW FOLLOWS THIS ONE.
+    /* The trigger the standalone top-k carried is GONE, deliberately: it
+     * existed for the grouping kernel, which is now the second half of this
+     * one.  A retained trigger would open a launch window across the whole
+     * fused kernel for any PSS-attributed launch that ever lands behind it,
+     * which is a hazard with no remaining benefit.
      *
-     * The comment this replaces said the standalone top-k's trigger was
-     * deliberately dropped because the grouping kernel it fed is now this
-     * kernel's second half, and that a retained trigger "would open a launch
-     * window across the whole fused kernel for any PSS-attributed launch that
-     * ever lands behind it."  That was true while the routed input quantizer
-     * sat between this kernel and the gate/up projection: the quantizer
-     * triggered, so the edge that mattered was already closed and the trigger
-     * here bought nothing.
-     *
-     * The MoE-input prequant fold (see the routed entry) removes that
-     * quantizer from the decode stream, which makes THIS kernel gate/up's
-     * stream predecessor -- and gate/up is launched with the programmatic
-     * attribute at exactly those widths.  Without a trigger its fence degrades
-     * to a plain completion wait and the launch turnaround the fold was meant
-     * to save comes straight back as exposed dispatch.  So the trigger belongs
-     * here now, for the same reason it belonged on the standalone top-k.
-     *
-     * WHY THE HAZARD THE OLD COMMENT NAMED DOES NOT BITE.  A trigger grants a
-     * dependent grid permission to LAUNCH; it does not release that grid's own
-     * cudaGridDependencySynchronize(), which still waits for this grid to
-     * COMPLETE.  So a PSS-attributed successor is only exposed if it reads this
-     * kernel's output ABOVE its own fence.  The one such successor is
-     * qwen4exp_moe_gateup_q_kernel, whose QWEN4EXP_PDL_SYNC() is its first
-     * statement with nothing hoisted above it (its own comment says so, and its
-     * weight addresses are data dependent on active[] so nothing COULD be
-     * hoisted).  The deadlock rule constrains the producer: this launch is
-     * dim3(1,1,1), so the gate below is satisfied by a factor of 768 and this
-     * grid trivially fits one wave and will always reach the trigger.  The gate
-     * reads the grid in the body rather than trusting the launch sites, per the
-     * header's rule.
-     *
-     * DS4_QWEN4EXP_NO_MOE_PREQUANT, which stands the fold down, leaves the
-     * quantizer in place and then this trigger is the redundant one the old
-     * comment described -- harmless, because the quantizer is the immediate
-     * predecessor there and its trigger is the one gate/up consumes. */
-    if ((uint64_t)gridDim.x * (uint64_t)gridDim.y * (uint64_t)gridDim.z <=
-        768u)
-        QWEN4EXP_PDL_TRIGGER();
-    /* Warp w serves token w.  Warps at or above n_tokens skip this half by
+     * Warp w serves token w.  Warps at or above n_tokens skip this half by
      * BRANCHING, never by returning: every thread has to reach the
      * __syncthreads below, and a partial warp must never reach one of the
      * full-mask warp intrinsics inside. */
@@ -6237,14 +6075,72 @@ __device__ __forceinline__ static void qwen4exp_shared_vector_accumulate(
  * uint4 and a super-block is 9 of them: one 16-byte header (d, dmin, twelve
  * scale bytes) then four 32-byte payload slices, and group g takes slice
  * (g % 8) >> 1 of super-block g / 8 -- the address qw_raw_load computes. */
-__device__ __forceinline__ static void qw_gu_coop_raw_load(
+/* PANEL GEOMETRY PER WEIGHT TYPE, in uint4, at the tower's in_dim 2560.
+ *
+ * The panel is sized from the type's OWN shipped row and is filled with that
+ * row's bytes at that row's stride: q4_K ten 144-byte super-blocks (1440 B),
+ * q5_K ten 176-byte super-blocks (1760 B), q8_0 eighty 34-byte blocks
+ * (2720 B).  Nothing is re-quantised, re-represented, re-strided or permuted
+ * on the way in -- contract 3.4 forbids that in memory as well as on disk --
+ * so the staged image is byte-for-byte the span the block's own warps would
+ * otherwise have read individually.
+ *
+ * `stage_raw` says whether the 32-byte payload slice of a group can be handed
+ * to the decoder as pre-loaded words.  A q4_K or q5_K group's payload is a
+ * 32-byte slice at a 16-byte-aligned offset inside its super-block, so it can.
+ * A q8_0 group IS its 34-byte block, whose payload sits two bytes past a word
+ * boundary for every other group, so nothing is staged and the decoder reads
+ * the panel directly -- which is exactly what qw_raw_load already refuses to
+ * do for q8_0 on the slab, and what the routed DOWN panel has always done. */
+template <int Type> struct qw_gu_panel {
+    static const unsigned row_u4 = 0u;
+    static const unsigned sb_u4 = 0u;
+    static const unsigned payload_u4 = 0u;
+    static const bool stage_raw = false;
+};
+template <> struct qw_gu_panel<DS4_QWEN4EXP_TY_q4_K> {
+    static const unsigned row_u4 = QW_GU_COOP_ROW_U4;  /* 1440 B */
+    static const unsigned sb_u4 = 9u;                  /*  144 B super-block */
+    static const unsigned payload_u4 = 1u;             /* after the 16 B head */
+    static const bool stage_raw = true;
+};
+template <> struct qw_gu_panel<DS4_QWEN4EXP_TY_q5_K> {
+    static const unsigned row_u4 = 110u;               /* 1760 B */
+    static const unsigned sb_u4 = 11u;                 /*  176 B super-block */
+    static const unsigned payload_u4 = 3u;             /* 16 B head + 32 B qh */
+    static const bool stage_raw = true;
+};
+template <> struct qw_gu_panel<DS4_QWEN4EXP_TY_q8_0> {
+    static const unsigned row_u4 = 170u;               /* 2720 B, 80 x 34 B */
+    static const unsigned sb_u4 = 0u;
+    static const unsigned payload_u4 = 0u;
+    static const bool stage_raw = false;
+};
+
+/* The eight payload words the decoder wants for (row, group), read out of the
+ * staged copy of the identical row bytes.  Returns false for a type whose
+ * payload cannot be addressed as an aligned 32-byte window, in which case the
+ * caller passes NULL and the decoder reads the panel itself -- the same
+ * `rawp = ... ? raw : NULL` contract qw_raw_load has on the slab.
+ *
+ * q4_K: super-block 9 uint4, one 16-byte header then four 32-byte slices, and
+ * group g takes slice (g % 8) >> 1 of super-block g / 8.  q5_K is the same
+ * shape with a 176-byte super-block whose header is followed by 32 bytes of
+ * high-bit plane, so the payload starts one slice later: 11 and 3 rather than
+ * 9 and 1.  Both are the address qw_raw_load computes on the slab. */
+template <int Type>
+__device__ __forceinline__ static bool qw_gu_coop_raw_load(
         const uint4 *sh, uint32_t wrow, uint32_t g, uint32_t *w) {
-    const uint32_t b = wrow * QW_GU_COOP_ROW_U4 + (g >> 3) * 9u + 1u
+    if (!qw_gu_panel<Type>::stage_raw) return false;
+    const uint32_t b = wrow * qw_gu_panel<Type>::row_u4
+                     + (g >> 3) * qw_gu_panel<Type>::sb_u4
+                     + qw_gu_panel<Type>::payload_u4
                      + ((g & 7u) >> 1) * 2u;
     const uint4 lo = sh[b];
     const uint4 hi = sh[b + 1u];
     w[0] = lo.x; w[1] = lo.y; w[2] = lo.z; w[3] = lo.w;
     w[4] = hi.x; w[5] = hi.y; w[6] = hi.z; w[7] = hi.w;
+    return true;
 }
 /* ======================================================================== */
 
@@ -6269,8 +6165,44 @@ __device__ __forceinline__ static void qw_gu_coop_raw_load(
  * the decode leg is then the answer.  gu[occ]=3 => 32 is unreachable and 40 is
  * the measured floor, at which point gate/up occupancy is CLOSED for a real
  * reason rather than a mis-read one. */
+/* PER-INSTANTIATION, not per-template.  __maxnreg__ takes a constant
+ * EXPRESSION, and a template parameter is constant inside the template, so the
+ * three instantiations can carry three different caps out of one spelling.
+ * Verified on this toolchain with a register-hungry probe: <12> came back at
+ * the 24 it was capped to, <13> at 40 and <8> at 63 under a cap of 64, each
+ * with its own spill state.  The q4_K arms keep 32 -- the expression is 32 for
+ * Type 12 -- so nothing about the shipped kernel moves, and the TU census
+ * confirms it: 217 -> 219 entry functions, zero shared kernels changed.
+ *
+ * WHY THE NEW ARMS ARE NOT CAPPED AT 32.  32 was chosen to buy a FOURTH block
+ * against an 11,584-byte q4_K panel, where registers were the binding
+ * constraint.  They are not binding for the wider panels:
+ *
+ *   q5_K panel 14,144 B -> 101,376/14,144 = 7 blocks on shared, 1536/256 = 6
+ *                          on threads.  6 blocks needs <= 65,536/(6*256) = 42
+ *                          registers, so 40 is the largest allocation that
+ *                          keeps the q4_K arm's own residency.
+ *   q8_0 panel 21,824 B -> 101,376/21,824 = 4 blocks on SHARED MEMORY, whatever
+ *                          the registers do.  4 blocks needs <= 64, so 64 is
+ *                          free: the cap below it buys nothing and only pays
+ *                          spills.
+ *
+ * At 32 both new arms spilled (q5_K 40 B of stack, 72/80 B of spill traffic;
+ * q8_0 16 B and 24/32) in the innermost loop of a kernel that is already at the
+ * memory wall.  The readout stands unchanged and is measured, not computed:
+ * the probe reports gu5[lmem]/gu8[lmem] and gu5[occ]/gu8[occ] from
+ * cudaFuncGetAttributes and cudaOccupancyMaxActiveBlocksPerMultiprocessor. */
+#ifndef QW_GU_NREG_Q5K
+#define QW_GU_NREG_Q5K 40
+#endif
+#ifndef QW_GU_NREG_Q80
+#define QW_GU_NREG_Q80 64
+#endif
+#define QW_GU_NREG_FOR(T)                                                     \
+    ((T) == (int)DS4_QWEN4EXP_TY_q8_0 ? QW_GU_NREG_Q80 :                      \
+     (T) == (int)DS4_QWEN4EXP_TY_q5_K ? QW_GU_NREG_Q5K : 32)
 #if defined(__CUDACC__) && CUDART_VERSION >= 12040
-#define QW_GU_MAXNREG __maxnreg__(32)
+#define QW_GU_MAXNREG __maxnreg__(QW_GU_NREG_FOR(Type))
 #else
 #define QW_GU_MAXNREG
 #endif
@@ -6423,7 +6355,13 @@ qwen4exp_moe_gateup_split_kernel(
     /* The staged panel.  Both early returns above are uniform over the block
      * (blockIdx.y, the active list and counts[expert] are block-invariant), so
      * every thread that reaches the barrier below reaches it together. */
-    __shared__ __align__(16) uint4 wcoop[Coop ? 2u * QW_GU_COOP_U4 : 1u];
+    /* The panel is sized from the instantiated type's own row, so the same
+     * body serves q4_K (11,520 B at four rows), q5_K (14,080 B) and q8_0
+     * (21,760 B).  For the q4_K instantiation OutputRows * row_u4 is
+     * QW_GU_COOP_ROWS * QW_GU_COOP_ROW_U4, the constant this used to spell. */
+    const uint32_t PanelU4 = (uint32_t)OutputRows * qw_gu_panel<Type>::row_u4;
+    __shared__ __align__(16) uint4 wcoop[
+        Coop ? 2u * OutputRows * qw_gu_panel<Type>::row_u4 : 1u];
     const uint4 *wsh = NULL;
     uint32_t wrow = 0u;
     if (Coop) {
@@ -6432,12 +6370,12 @@ qwen4exp_moe_gateup_split_kernel(
          * refuses every other shape; this is the belt to that brace, and it is
          * uniform over the block, outside the group loop, and free. */
         if (groups != QW_GU_COOP_GROUPS ||
-            gate_row_bytes != (uint64_t)QW_GU_COOP_ROW_U4 * 16u ||
-            up_row_bytes != (uint64_t)QW_GU_COOP_ROW_U4 * 16u) return;
+            gate_row_bytes != (uint64_t)qw_gu_panel<Type>::row_u4 * 16u ||
+            up_row_bytes != (uint64_t)qw_gu_panel<Type>::row_u4 * 16u) return;
         const uint32_t row0 = blockIdx.x * OutputRows;
         const uint32_t left = mid_dim > row0 ? mid_dim - row0 : 0u;
         const uint32_t rows_here = left < OutputRows ? left : OutputRows;
-        const uint32_t words = rows_here * QW_GU_COOP_ROW_U4;
+        const uint32_t words = rows_here * qw_gu_panel<Type>::row_u4;
         const char *const gb = gate +
             (uint64_t)expert * gate_expert_bytes +
             (uint64_t)row0 * gate_row_bytes;
@@ -6446,11 +6384,11 @@ qwen4exp_moe_gateup_split_kernel(
             (uint64_t)row0 * up_row_bytes;
         for (uint32_t i = threadIdx.x; i < words; i += blockDim.x) {
             wcoop[i] = *(const uint4 *)(const void *)(gb + (uint64_t)i * 16u);
-            wcoop[QW_GU_COOP_U4 + i] =
+            wcoop[PanelU4 + i] =
                 *(const uint4 *)(const void *)(ub + (uint64_t)i * 16u);
         }
         __syncthreads();
-        wsh = wcoop + (second ? QW_GU_COOP_U4 : 0u);
+        wsh = wcoop + (second ? PanelU4 : 0u);
         wrow = warp >> 1u;
     }
     for (int32_t at = 0; at < cnt; at += R) {
@@ -6489,7 +6427,7 @@ qwen4exp_moe_gateup_split_kernel(
                 if (Coop) \
                     dev_qwen4exp_group_decode_w((uint32_t)Type, \
                         (const char *)(const void *) \
-                            &wsh[wrow * QW_GU_COOP_ROW_U4], g_, \
+                            &wsh[wrow * qw_gu_panel<Type>::row_u4], g_, \
                         (RAWP), wq, wa, wb); \
                 else \
                     dev_qwen4exp_group_decode_w((uint32_t)Type, weight_row, g_, \
@@ -6514,9 +6452,10 @@ qwen4exp_moe_gateup_split_kernel(
                 uint32_t raw1[8];
                 const uint32_t *p0, *p1;
                 if (Coop) {
-                    qw_gu_coop_raw_load(wsh, wrow, g, raw0);
-                    qw_gu_coop_raw_load(wsh, wrow, g + 32u, raw1);
-                    p0 = raw0; p1 = raw1;
+                    p0 = qw_gu_coop_raw_load<Type>(wsh, wrow, g, raw0)
+                       ? raw0 : NULL;
+                    p1 = qw_gu_coop_raw_load<Type>(wsh, wrow, g + 32u, raw1)
+                       ? raw1 : NULL;
                 } else {
                     p0 = qw_raw_load((uint32_t)Type, weight_row, g, raw0)
                        ? raw0 : NULL;
@@ -6530,8 +6469,8 @@ qwen4exp_moe_gateup_split_kernel(
                 uint32_t raw[8];
                 const uint32_t *rawp;
                 if (Coop) {
-                    qw_gu_coop_raw_load(wsh, wrow, g, raw);
-                    rawp = raw;
+                    rawp = qw_gu_coop_raw_load<Type>(wsh, wrow, g, raw)
+                         ? raw : NULL;
                 } else {
                     rawp = qw_raw_load((uint32_t)Type, weight_row, g, raw)
                          ? raw : NULL;
@@ -9244,6 +9183,42 @@ static int qwen4exp_moe_tile(uint32_t n_rows) {
     return 8;
 }
 
+/* The host side of qw_gu_panel: the row the cooperative panel is sized for,
+ * and the per-type valves.  Read once per call, like every other valve in
+ * this launcher. */
+static uint64_t qw_gu_panel_row_bytes(uint32_t type) {
+    switch (type) {
+    case (uint32_t)DS4_QWEN4EXP_TY_q4_K: return (uint64_t)QW_GU_COOP_ROW_U4 * 16ull;
+    case (uint32_t)DS4_QWEN4EXP_TY_q5_K: return 110ull * 16ull;
+    case (uint32_t)DS4_QWEN4EXP_TY_q8_0: return 170ull * 16ull;
+    default: return 0ull;
+    }
+}
+static int qw_gu_coop_env_on(void) {
+    const char *e = getenv("DS4_GATEUP_COOP");
+    return e == NULL || e[0] != '0';
+}
+/* A one-shot positive control.  DS4_QWEN4EXP_PANEL_DEBUG=1 prints the first
+ * time each type takes the panel arm, so "the arm is selected" is observed in
+ * the engine's own log rather than inferred from a timing difference. */
+static void qw_gu_panel_taken(uint32_t type, uint32_t n_tokens, uint32_t rows) {
+    static int shown[2];
+    const int i = type == (uint32_t)DS4_QWEN4EXP_TY_q5_K ? 0 : 1;
+    if (shown[i]) return;
+    if (getenv("DS4_QWEN4EXP_PANEL_DEBUG") == NULL) return;
+    shown[i] = 1;
+    fprintf(stderr, "ds4: gate/up cooperative panel TAKEN for type %u "
+                    "(n_tokens=%u expert rows=%u)\n", type, n_tokens, rows);
+}
+static int qw_gu_panel_type_on(uint32_t type) {
+    const char *e = NULL;
+    if (type == (uint32_t)DS4_QWEN4EXP_TY_q5_K)
+        e = getenv("DS4_QWEN4EXP_SPLIT_GATEUP_Q5K");
+    else if (type == (uint32_t)DS4_QWEN4EXP_TY_q8_0)
+        e = getenv("DS4_QWEN4EXP_SPLIT_GATEUP_Q80");
+    return e == NULL || e[0] != '0';
+}
+
 /* The routed MoE body.  `logits` non-NULL means the caller has NOT run the
  * router and wants it fused into the grouping launch; `weights_rw` is then the
  * softmax-weight buffer that fused kernel writes.  Both NULL is the shipping
@@ -9492,60 +9467,11 @@ static int qwen4exp_routed_moe_cuda(
     }
     if (!cuda_ok(cudaGetLastError(), "qwen4exp MoE pair list")) return 0;
 
-    /* THE MoE INPUT QUANTIZE, TAKEN ONE KERNEL EARLIER WHEN THE MIXER HAD IT.
-     *
-     * `x` here is the FFN mixer's `mixed` output, and at the decode widths that
-     * mixer's dual kernel already holds every one of these 32 floats in the
-     * registers of the warp that wrote them (mix_blocks * 8 warps, one warp per
-     * 32-column group -- the identity mapping is spelled out at the publish
-     * helper near the top of this file).  So the standalone pass below re-reads
-     * a row that was live one kernel ago.  At one token that is 80 one-warp
-     * blocks moving 13 KB: ~0.05 us of traffic, but a graph node (0.84 us) plus
-     * a full kernel round trip, 48 times per decode round.
-     *
-     * The handshake is host-side and deliberately narrow: the mixer folds only
-     * when the layout this call published on the PREVIOUS layer still describes
-     * the pool (same base, same total bytes, same rows, same groups) and the
-     * tensor it is about to write is the one this call will read.  Any drift --
-     * a pool grow, a width change, a different tensor -- fails the compare, the
-     * mixer does not fold, the arm is not set, and this call quantizes exactly
-     * as it always did.  A pool grow additionally retires the decode graphs, so
-     * a captured fold cannot outlive the layout it was captured against.
-     *
-     * The arm is CONSUMED here whether or not it matches, so a stale arm can
-     * never be taken by a later layer.
-     *
-     * PDL: the quantizer is the programmatic producer whose trigger releases
-     * the gate/up launch below.  When this pass is skipped, the stream
-     * predecessor is the one-block grouping kernel instead, and that kernel now
-     * carries the trigger itself (see its body), so the edge is preserved
-     * rather than silently dropped.
-     *
-     * DS4_QWEN4EXP_NO_MOE_PREQUANT stands the whole thing down. */
-    int preq_taken = 0;
-    if (logical_tier >= 0 && logical_tier < 16) {
-        qwen4exp_preq_arm *pa = &g_qwen4exp_preq_arm[logical_tier];
-        if (pa->armed) {
-            pa->armed = 0;
-            if (pa->x == (const void *)x->ptr &&
-                pa->base == (const void *)sc.xq &&
-                pa->rows == n_tokens && pa->xgroups == xgroups) {
-                preq_taken = 1;
-            }
-        }
-    }
-    if (!preq_taken &&
-        !qwen4exp_quantize_rows(sc.xq, sc.xs, sc.xsum, (const float *)x->ptr,
+    if (!qwen4exp_quantize_rows(sc.xq, sc.xs, sc.xsum, (const float *)x->ptr,
                                 n_tokens, in_dim, xgroups, in_dim, 0, 1,
                                 stream)) {
         return 0;
     }
-    /* Publish the layout for the NEXT layer's FFN mixer.  Unconditional: the
-     * mixer re-validates every field against the pool as it stands when IT
-     * runs, so publishing after a fold that was taken is what keeps the fold
-     * live layer after layer. */
-    qwen4exp_preq_publish(logical_tier, (const void *)x->ptr,
-                          (const void *)sc.xq, n_tokens, xgroups);
 
     /* The shared-expert fork's first event: the quantized activation the
      * shared gate/up needs is complete here, and nothing below writes the
@@ -9795,6 +9721,67 @@ static int qwen4exp_routed_moe_cuda(
         else if (vector) { QWEN4EXP_SPLIT_GATEUP(true, 1u, false); }
         else { QWEN4EXP_SPLIT_GATEUP(false, 4u, false); }
 #undef QWEN4EXP_SPLIT_GATEUP
+    }
+    /* ---- THE SAME COOPERATIVE PANEL FOR THE TWO LAYERS THAT ARE NOT q4_K ----
+     *
+     * The arm above is selected only when BOTH slabs are q4_K, and the panel
+     * above it was sized for a q4_K row, so exactly two of the forty-nine
+     * routed gate/up calls in a decode round have always fallen through to the
+     * generic per-group kernel: blk.2, whose ffn_gate_exps/ffn_up_exps are the
+     * artifact's ONLY Q5_K tensors, and blk.48, the MTP head, whose experts are
+     * Q8_0.  At the same shape the generic kernel costs about twice what the
+     * panel kernel costs, and the excess over the DRAM floor is several
+     * milliseconds of a ranked run.
+     *
+     * Nothing about the arithmetic changes.  The panel is a verbatim byte image
+     * of the same rows at the same stride (contract 3.4), the decoder is called
+     * with the same (type, g) at the same offset inside it, lane l still owns
+     * groups l, l+32, l+64 in that order, and the fold is the same
+     * warp_sum_f32 tree, so every emitted float is the generic kernel's.
+     *
+     * Per-type valves, so ONE binary carries both arms and an A/B is two runs
+     * of one build:
+     *   DS4_QWEN4EXP_SPLIT_GATEUP_Q5K=0   blk.2 back on the generic kernel
+     *   DS4_QWEN4EXP_SPLIT_GATEUP_Q80=0   the head back on the generic kernel
+     * DS4_QWEN4EXP_NO_SPLIT_GATEUP and DS4_GATEUP_COOP=0 stand all three down
+     * exactly as they already do for q4_K. */
+    else if ((n_tokens <= 2u || wide_verify) && tile == 2 && specialize &&
+             (DS4_GATEUP_COOP_BUILD != 0) &&
+             gate_slab->type == up_slab->type &&
+             (gate_slab->type == (uint32_t)DS4_QWEN4EXP_TY_q5_K ||
+              gate_slab->type == (uint32_t)DS4_QWEN4EXP_TY_q8_0) &&
+             getenv("DS4_QWEN4EXP_NO_SPLIT_GATEUP") == NULL &&
+             qw_gu_panel_type_on(gate_slab->type) &&
+             ((uintptr_t)sc.xq & 15u) == 0u &&
+             getenv("DS4_QWEN4EXP_NO_SPLIT_VECTOR") == NULL &&
+             qw_gu_coop_env_on() &&
+             xgroups == QW_GU_COOP_GROUPS &&
+             gate_slab->row_bytes == qw_gu_panel_row_bytes(gate_slab->type) &&
+             up_slab->row_bytes == qw_gu_panel_row_bytes(up_slab->type) &&
+             ((uintptr_t)gate & 15u) == 0u && ((uintptr_t)up & 15u) == 0u &&
+             (gate_slab->expert_bytes & 15ull) == 0ull &&
+             (up_slab->expert_bytes & 15ull) == 0ull) {
+#define QWEN4EXP_SPLIT_PANEL(T) \
+        QWEN4EXP_LAUNCH_PDL( \
+            (qwen4exp_moe_gateup_split_kernel<2, T, true, QW_GU_COOP_ROWS, \
+                                              true>), \
+            (dim3((mid_dim + QW_GU_COOP_ROWS - 1u) / QW_GU_COOP_ROWS, \
+                  gu_rows, 1)), \
+            QW_GU_COOP_ROWS * 64u, 0, stream, \
+            (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum, \
+            sc.pairs, sc.counts, sc.offsets, gu_active, \
+            (const float *)weights->ptr, \
+            gate_slab->expert_bytes, gate_slab->row_bytes, \
+            up_slab->expert_bytes, up_slab->row_bytes, \
+            gate_slab->type, up_slab->type, xgroups, mid_dim, \
+            mid_token_stride, n_expert_used)
+        qw_gu_panel_taken(gate_slab->type, n_tokens, gu_rows);
+        if (gate_slab->type == (uint32_t)DS4_QWEN4EXP_TY_q5_K) {
+            QWEN4EXP_SPLIT_PANEL(DS4_QWEN4EXP_TY_q5_K);
+        } else {
+            QWEN4EXP_SPLIT_PANEL(DS4_QWEN4EXP_TY_q8_0);
+        }
+#undef QWEN4EXP_SPLIT_PANEL
     }
     else if (tile == 8) { QWEN4EXP_GATEUP(8); }
     else if (tile == 4) { QWEN4EXP_GATEUP(4); }
@@ -11373,14 +11360,14 @@ __global__ static void qwen4exp_hc_inject_weights_renorm_kernel(
  * kernel above: InjectType < 0 is the rolled walk verbatim, a typed arm
  * stages the walk's elements in registers first.  The mix leg is the same
  * in every instantiation, including its `#pragma unroll 1`. */
-template <int InjectType = -1, bool Quant = false, bool Sum = false>
+template <int InjectType = -1, bool Quant = false>
 __global__ static void qwen4exp_hc_mix_inject_dual_kernel(
         float *mixed, float *inject, const float *hyper, const float *nscale,
         const float *normw, const float *gate_values, const char *w,
         uint32_t n_embd, uint32_t n_hc, uint32_t rows,
         float weight_bias, int round_bf16,
         uint32_t weight_type, uint32_t weight_row_bytes,
-        int8_t *xq, float *xscale, int32_t *xsum) {
+        int8_t *xq, float *xscale) {
     /* PDL producer: the decode arm of the mix that closes the mixer, so the
      * router GEMV behind it launches at its top.  Grid is (mix_blocks +
      * n_hc, rows) -- 14*2 blocks at the two-row decode.  Triggered at the
@@ -11448,40 +11435,6 @@ __global__ static void qwen4exp_hc_mix_inject_dual_kernel(
             int q = (int)lrintf(qwen4exp_q8_ftz(vz * id));
             q = q > 127 ? 127 : (q < -128 ? -128 : q);
             xq[pair * 32u + lane] = (int8_t)q;
-        }
-        /* Sum: the ROUTED MoE's input quantize, which is a different quantiser
-         * from the Quant leg above -- m/127.0f and 1.0f/d rather than the
-         * fast-math reciprocal, plus the int32 group sum the q4_K `wb` term
-         * needs -- so it calls the MoE's own device function rather than
-         * repeating its arithmetic.  Design note at qwen4exp_preq_targets.
-         *
-         * WHY IT READS `out` BACK INSTEAD OF PASSING `v`.  Bit-exactness here
-         * is structural, not argued: the function is the one the standalone
-         * kernel calls, and the bytes it reduces are the bytes the standalone
-         * kernel would have read -- `mixed` as this launch leaves it.  A f32
-         * store followed by a f32 load of the same address is exact, and
-         * `mixed` carries no __restrict__, so the load cannot be hoisted above
-         * the store it depends on.  __syncwarp() publishes the other 31 lanes'
-         * stores to this warp (its memory guarantee covers exactly the mask it
-         * synchronises) which is the whole group: the mapping is the identity
-         * the comment above describes, so the 32 columns of group
-         * (blockIdx.x*8 + warp) are the 32 lanes of this warp and nothing
-         * outside it contributes.  No thread of a mix block returns early --
-         * n_embd is a multiple of blockDim.x at this entry -- so the barrier is
-         * convergent.
-         *
-         * `at` is the standalone kernel's `r * groups + g` with r = t and
-         * g = blockIdx.x * (blockDim.x/32) + warp, and `d & ~31u` is g * 32,
-         * so both the destination and the source slice are that kernel's. */
-        if (Sum) {
-            const uint32_t lane = threadIdx.x & 31u;
-            __syncwarp();
-            dev_qwen4exp_quantize_group(
-                    xq, xscale, xsum,
-                    out + (uint64_t)t * n_embd + (d & ~31u), lane, 32u,
-                    (uint64_t)t * (n_embd / 32u) +
-                        (uint64_t)blockIdx.x * (blockDim.x >> 5u) +
-                        (threadIdx.x >> 5u));
         }
     } else {
         float *out = inject;
@@ -11700,24 +11653,21 @@ static int qwen4exp_hc_staged_ok(uint32_t n_embd, uint32_t n_hc) {
         }                                                                    \
     } while (0)
 
-#define QWEN4EXP_HC_DUAL_LAUNCH_QS(QUANT, SUM, GRID, ...) do {               \
+#define QWEN4EXP_HC_DUAL_LAUNCH_Q(QUANT, GRID, ...) do {                     \
         if (staged && inject_weight->type == (uint32_t)DS4_QWEN4EXP_TY_f32) {\
             qwen4exp_hc_mix_inject_dual_kernel<                              \
-                DS4_QWEN4EXP_TY_f32, QUANT, SUM><<<GRID, threads, 0,         \
+                DS4_QWEN4EXP_TY_f32, QUANT><<<GRID, threads, 0,              \
                 cuda_decode_stream()>>>(__VA_ARGS__);                        \
         } else if (staged &&                                                 \
                    inject_weight->type == (uint32_t)DS4_QWEN4EXP_TY_q8_0) {  \
             qwen4exp_hc_mix_inject_dual_kernel<                              \
-                DS4_QWEN4EXP_TY_q8_0, QUANT, SUM><<<GRID, threads, 0,        \
+                DS4_QWEN4EXP_TY_q8_0, QUANT><<<GRID, threads, 0,             \
                 cuda_decode_stream()>>>(__VA_ARGS__);                        \
         } else {                                                             \
-            qwen4exp_hc_mix_inject_dual_kernel<-1, QUANT, SUM>               \
+            qwen4exp_hc_mix_inject_dual_kernel<-1, QUANT>                    \
                 <<<GRID, threads, 0, cuda_decode_stream()>>>(__VA_ARGS__);   \
         }                                                                    \
     } while (0)
-
-#define QWEN4EXP_HC_DUAL_LAUNCH_Q(QUANT, GRID, ...)                          \
-    QWEN4EXP_HC_DUAL_LAUNCH_QS(QUANT, false, GRID, __VA_ARGS__)
 
 #define QWEN4EXP_HC_DUAL_LAUNCH(GRID, ...)                                   \
     QWEN4EXP_HC_DUAL_LAUNCH_Q(false, GRID, __VA_ARGS__)
@@ -12958,41 +12908,6 @@ static int qwen4exp_hc_mixer_fused_cuda(
                 qwen4exp_hc_ranges_disjoint(q8_xscale, s_bytes_out, normw, norm_bytes) &&
                 qwen4exp_hc_ranges_disjoint(q8_xscale, s_bytes_out, iw, iw_bytes) &&
                 qwen4exp_hc_ranges_disjoint(q8_xscale, s_bytes_out, wide_scratch->ptr, hc_bytes);
-            /* The routed MoE's input quantize, folded into the same store, for
-             * the FFN mixer only: `inject` is non-NULL here, which excludes the
-             * tower's final mixer (it passes no inject head and feeds the LM
-             * head, not an MoE block), and `quant` is false here, which
-             * excludes the attention mixer (it asked for the OTHER fold).
-             * Decode widths only, and only against a layout the routed call
-             * published and still holds -- design note at
-             * qwen4exp_preq_targets. */
-            int8_t  *pq_xq = NULL;
-            float   *pq_xs = NULL;
-            int32_t *pq_xsum = NULL;
-            /* One span covers all three destinations: they are the routed
-             * call's contiguous pool prefix, xq | xs | xsum. */
-            const uint64_t pq_bytes = (uint64_t)rows * (n_embd / 32u) *
-                (32u + sizeof(float) + sizeof(int32_t));
-            const int preq =
-                !quant && rows <= 2u && (n_embd % 32u) == 0u &&
-                (threads % 32u) == 0u &&
-                /* The Sum leg's __syncwarp() and the shuffle trees inside
-                 * dev_qwen4exp_quantize_group are full-mask, so no thread of a
-                 * mix block may take the `d >= n_embd` early return.  The entry
-                 * gate above already pins n_embd to 2560 and `threads` to a
-                 * whole number of warps, but this is the condition the
-                 * convergence argument actually rests on, so state it. */
-                (n_embd % threads) == 0u &&
-                qwen4exp_preq_targets(cuda_current_tier(), (const void *)mixed->ptr,
-                                      rows, n_embd / 32u,
-                                      &pq_xq, &pq_xs, &pq_xsum) &&
-                qwen4exp_hc_ranges_disjoint(pq_xq, pq_bytes, mixed->ptr, mix_bytes) &&
-                qwen4exp_hc_ranges_disjoint(pq_xq, pq_bytes, inject->ptr, inj_bytes) &&
-                qwen4exp_hc_ranges_disjoint(pq_xq, pq_bytes, hyper->ptr, hc_bytes) &&
-                qwen4exp_hc_ranges_disjoint(pq_xq, pq_bytes, nscale, n_bytes) &&
-                qwen4exp_hc_ranges_disjoint(pq_xq, pq_bytes, normw, norm_bytes) &&
-                qwen4exp_hc_ranges_disjoint(pq_xq, pq_bytes, iw, iw_bytes) &&
-                qwen4exp_hc_ranges_disjoint(pq_xq, pq_bytes, wide_scratch->ptr, hc_bytes);
             if (quant) {
                 QWEN4EXP_HC_DUAL_LAUNCH_Q(true,
                         dim3(mix_blocks + n_hc, rows, 1u),
@@ -13001,17 +12916,8 @@ static int qwen4exp_hc_mixer_fused_cuda(
                         (const float *)wide_scratch->ptr, iw,
                         n_embd, n_hc, rows, weight_bias, round_bf16,
                         inject_weight->type, (uint32_t)iw_row_bytes,
-                        q8_xq, q8_xscale, (int32_t *)NULL);
+                        q8_xq, q8_xscale);
                 if (q8_folded) *q8_folded = 1;
-            } else if (preq) {
-                QWEN4EXP_HC_DUAL_LAUNCH_QS(false, true,
-                        dim3(mix_blocks + n_hc, rows, 1u),
-                        (float *)mixed->ptr, (float *)inject->ptr,
-                        (const float *)hyper->ptr, nscale, normw,
-                        (const float *)wide_scratch->ptr, iw,
-                        n_embd, n_hc, rows, weight_bias, round_bf16,
-                        inject_weight->type, (uint32_t)iw_row_bytes,
-                        pq_xq, pq_xs, pq_xsum);
             } else {
                 QWEN4EXP_HC_DUAL_LAUNCH(
                         dim3(mix_blocks + n_hc, rows, 1u),
@@ -13020,28 +12926,9 @@ static int qwen4exp_hc_mixer_fused_cuda(
                         (const float *)wide_scratch->ptr, iw,
                         n_embd, n_hc, rows, weight_bias, round_bf16,
                         inject_weight->type, (uint32_t)iw_row_bytes,
-                        (int8_t *)NULL, (float *)NULL, (int32_t *)NULL);
+                        (int8_t *)NULL, (float *)NULL);
             }
-            /* Arm only when the launch encoded.  A launch that did not leaves
-             * no arm, so the routed call quantises as shipped.  The arm is
-             * cleared on every pass through here, folded or not, so an arm can
-             * never outlive the mixer that set it: the routed call of the same
-             * block consumes and clears it, and the next mixer to reach this
-             * point starts from zero. */
-            const cudaError_t dual_err = cudaGetLastError();
-            const int dual_tier = cuda_current_tier();
-            if (dual_tier >= 0 && dual_tier < 16) {
-                qwen4exp_preq_arm *pa = &g_qwen4exp_preq_arm[dual_tier];
-                pa->armed = 0;
-                if (preq && dual_err == cudaSuccess) {
-                    pa->armed = 1;
-                    pa->x = (const void *)mixed->ptr;
-                    pa->base = (const void *)pq_xq;
-                    pa->rows = rows;
-                    pa->xgroups = n_embd / 32u;
-                }
-            }
-            return cuda_ok(dual_err, "qwen4exp_hc_mix_inject_dual launch");
+            return cuda_ok(cudaGetLastError(), "qwen4exp_hc_mix_inject_dual launch");
         }
     }
 
@@ -15995,68 +15882,12 @@ extern "C" uint64_t ds4_gpu_qwen4exp_qsa_split_scratch_bytes(
     return ds4_qwen4exp_qsa_split_bytes(n_tokens, n_head, head_dim, max_count);
 }
 
-/* The two shared-memory requests the split path makes at a given width, and
- * whether both clear QWEN4EXP_QSA_GROUP_SHARED_CAP.  ONE copy of this
- * arithmetic, called by the launcher below -- which is where it used to live
- * inline -- and by the one-wave rule, which must not propose a width the
- * launcher would then refuse.  A refusal there is `return 0`, i.e. the caller
- * silently falls back to the per-head kernel for the whole call; correct, but a
- * width policy that can switch off the path it is tuning is not a tuning
- * change.  Deriving nth from head_dim with the launcher's own
- * qwen4exp_cuda_threads() keeps the two callers exactly in step. */
-static int qwen4exp_qsa_split_shared_fits(uint32_t g, uint32_t head_dim,
-                                          size_t *sc_out, size_t *pr_out) {
-    const uint32_t nth = qwen4exp_cuda_threads(head_dim);
-    const size_t sc_shared = ((size_t)g * head_dim +
-                              (((size_t)g * (nth >> 5u) + 3u) & ~(size_t)3u) +
-                              (size_t)nth * QWEN4EXP_QSA_SPLIT_KPITCH) *
-                             sizeof(float);
-    const size_t pr_shared = (size_t)2u * g * nth * sizeof(float) +
-                             (size_t)nth * sizeof(int32_t);
-    if (sc_out) *sc_out = sc_shared;
-    if (pr_out) *pr_out = pr_shared;
-    return (sc_shared <= QWEN4EXP_QSA_GROUP_SHARED_CAP &&
-            pr_shared <= QWEN4EXP_QSA_GROUP_SHARED_CAP) ? 1 : 0;
-}
-
-/* The SM count, queried once.  The one-wave rule in the width policy below
- * needs it, and 0 means the query did not answer, in which case that rule is
- * skipped and the measured constants stand.  Cached like
- * ds4_qwen4exp_hc_staged_off() so a decode row pays for it at most once over
- * the whole run, and a failure is consumed HERE rather than surviving to the
- * cudaGetLastError() the split launcher reads at its tail -- the error is only
- * cleared on the branch where this function's own call is the one that set it,
- * so a real launch failure from earlier still reaches that check.
- *
- * Capture-safe: a device attribute query is not a stream-ordered operation, the
- * tree already issues one from a launch path in ds4_cuda.cu, and the value is
- * constant for the process, so a graph captured against it stays valid. */
-static uint32_t qwen4exp_qsa_wave_sms(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        int dev = 0, n = 0;
-        cached = 0;
-        if (cudaGetDevice(&dev) == cudaSuccess) {
-            if (cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount,
-                                       dev) == cudaSuccess && n > 0) {
-                cached = n;
-            } else {
-                (void)cudaGetLastError();
-            }
-        } else {
-            (void)cudaGetLastError();
-        }
-    }
-    return (uint32_t)cached;
-}
-
 /* Group width for the split path: DS4_QWEN4EXP_NO_QSA_SPLIT turns the path
  * off, DS4_QWEN4EXP_QSA_SPLIT_GROUP sets the width.  Read fresh for the same
  * reason qwen4exp_qsa_group_width is; a decode row pays one getenv per layer
  * and a captured one pays it once at capture. */
 static uint32_t qwen4exp_qsa_split_width(uint32_t n_tokens, uint32_t n_head,
-                                         uint32_t n_kv_head, uint32_t head_dim,
-                                         uint32_t max_tiles) {
+                                         uint32_t n_kv_head, uint32_t head_dim) {
     if (getenv("DS4_QWEN4EXP_NO_QSA_SPLIT") != NULL) return 0u;
     const char *forced = getenv("DS4_QWEN4EXP_QSA_SPLIT_GROUP");
     if (forced != NULL) {
@@ -16076,92 +15907,8 @@ static uint32_t qwen4exp_qsa_split_width(uint32_t n_tokens, uint32_t n_head,
      * they must be.  Other multi-row calls retain four heads and their
      * K/V reuse. */
     if (n_head == 24u && n_kv_head == 2u && head_dim == 256u) {
-        /* THE ONE-WAVE RULE.  The paragraph above IS the argument, but it was
-         * applied to the two-row verify only, and the two constants it left
-         * behind are the answer at the position where it was measured rather
-         * than at every position the scored window visits.  The grid is
-         * (n_head / g, max_tiles, n_tokens) and the scores kernel is
-         * __launch_bounds__(256, 1), so one block owns one SM and the live
-         * block count is exactly that product.  Take the SMALLEST g whose
-         * product fits a single wave -- smallest, because g is also the divisor
-         * on how many times each K row is pulled from L2, so any g beyond what
-         * one wave needs trades parallelism for reuse already paid for.
-         *
-         * It REPRODUCES the measured constants rather than replacing them: at
-         * 48 SMs it returns 2 for one row at max_tiles 4, 6 for two rows at
-         * max_tiles 5, and 4 for the multi-row default at max_tiles 4 -- the
-         * three widths this function already had.  It disagrees in exactly one
-         * place, ONE row at max_tiles >= 5, which is every decode position past
-         * 1024: the shipped 2 puts 60 blocks into 1.25 waves, the identical
-         * partial-wave tail the two-row case was retuned to remove, and 3 puts
-         * 40 into one while pulling each K row 8 times instead of 12.
-         *
-         * THREE GUARDS keep this a tail-removal instead of a retune, and
-         * together they narrow the whole change to that single cell.
-         *
-         * One: only widths 1 and 2 consult the rule.  Wider calls keep their
-         * width byte-for-byte; they are not the shape reasoned about here, and
-         * the tail above says they hold four heads deliberately.
-         *
-         * Two: the rule only runs when the SHIPPED width is the thing that
-         * overflows the wave.  If the width already in place fits, it stands.
-         * Without this the bare "smallest g" would also fire on short counts,
-         * where the shipped 2 and 6 already fit one wave and smallest-g would
-         * walk g DOWN to 1 -- more blocks, but each K row pulled 24 times, a
-         * reuse loss on shapes for which no wave argument was ever made.  This
-         * is what makes every tile count up to 4, i.e. every position through
-         * 1024 and so the whole prefill-shaped region, byte-identical.
-         *
-         * Three: a width is only proposed if the launcher will accept it, via
-         * the shared-memory helper the launcher itself now calls.  g = 12 is the
-         * one divisor of gqa that misses the 48 KiB cap (49536 B of scores
-         * shared), and the launcher's response to a width it cannot fit is
-         * `return 0` -- the caller then takes the per-head kernel for the entire
-         * call.  A width policy that can switch off the path it is tuning is not
-         * a tuning change, so 12 is filtered out rather than proposed.
-         *
-         * The three guards leave the two-row verify path -- the one every
-         * measurement in the paragraph above was taken on -- unchanged at EVERY
-         * tile count: past max_tiles 6 the only width that would fit its wave is
-         * the capped-out 12, so it falls back to the measured 6.  What remains
-         * is one row at max_tiles >= 5 and nothing else in the table.
-         *
-         * g = 3 divides gqa = 12, its <3u> instantiation is already compiled in
-         * the switch below, and it is strictly cheaper than the <6u> already
-         * shipping on the two-row path in both resources: 40032 B of scores
-         * shared against 43200, and two fewer elements in the per-head score[]
-         * and dot[] register arrays.  The values cannot move -- g only decides
-         * which block owns which head, each head's dot product walks the same
-         * words in the same order, gqa % g == 0 keeps a group inside one KV
-         * head, and the cross-tile reduction in the fold kernel never sees g. */
-        /* The width this function has always returned for this row count. */
-        const uint32_t shipped = (n_tokens == 1u) ? 2u
-                               : (n_tokens == 2u) ? 6u : 4u;
-        const uint32_t nsm = qwen4exp_qsa_wave_sms();
-        if (n_tokens <= 2u && nsm != 0u && max_tiles != 0u) {
-            const uint32_t gqa = n_head / n_kv_head;
-            const uint64_t shipped_blocks = (uint64_t)(n_head / shipped) *
-                                            (uint64_t)max_tiles *
-                                            (uint64_t)n_tokens;
-            /* Guard two: only a shipped width that overflows the wave is
-             * reconsidered.  <= nsm means it already fits and stands. */
-            if (shipped_blocks > (uint64_t)nsm) {
-                for (uint32_t g = 1u; g <= gqa; g++) {
-                    if ((gqa % g) != 0u) continue;
-                    if (!qwen4exp_qsa_split_shared_fits(g, head_dim, NULL,
-                                                        NULL)) {
-                        continue;
-                    }
-                    if ((uint64_t)(n_head / g) * (uint64_t)max_tiles *
-                            (uint64_t)n_tokens <= (uint64_t)nsm) {
-                        return g;
-                    }
-                }
-            }
-        }
-        /* The shipped width fits, no width fits, or the SM count did not
-         * answer: the measured constants, unchanged. */
-        return shipped;
+        if (n_tokens == 1u) return 2u;
+        if (n_tokens == 2u) return 6u;
     }
     return 4u;
 }
@@ -16189,16 +15936,11 @@ static int qwen4exp_qsa_attention_split(
         return 0;
     }
     const uint32_t gqa = n_head / n_kv_head;
-    /* Hoisted above the width choice, which now reads it: the tile count is the
-     * y extent of the grid and so the second factor in the wave the width has
-     * to fit.  Same expression and same value as before, only computed one step
-     * earlier. */
-    const uint32_t max_tiles = (max_count + nth - 1u) / nth;
-    uint32_t g = qwen4exp_qsa_split_width(n_tokens, n_head, n_kv_head, head_dim,
-                                          max_tiles);
+    uint32_t g = qwen4exp_qsa_split_width(n_tokens, n_head, n_kv_head, head_dim);
     if (g == 0u) return 0;
     if (g > gqa) g = gqa;
     while (g > 1u && (gqa % g) != 0u) g--;
+    const uint32_t max_tiles = (max_count + nth - 1u) / nth;
     const uint64_t rows = (uint64_t)n_tokens * n_head * max_tiles;
     float *sc = (float *)scratch->ptr;
     float *ct = sc + rows * nth;
@@ -16207,10 +15949,14 @@ static int qwen4exp_qsa_attention_split(
     const int32_t *sel = sparse ? (const int32_t *)selected->ptr : NULL;
     const int32_t *cnt = sparse ? (const int32_t *)counts->ptr : NULL;
     const dim3 grid(n_head / g, max_tiles, n_tokens);
-    size_t sc_shared = 0, pr_shared = 0;
-    /* Same two expressions and the same two comparisons as before, moved into
-     * the helper the width policy also consults. */
-    if (!qwen4exp_qsa_split_shared_fits(g, head_dim, &sc_shared, &pr_shared)) {
+    const size_t sc_shared = ((size_t)g * head_dim +
+                              (((size_t)g * (nth >> 5u) + 3u) & ~(size_t)3u) +
+                              (size_t)nth * QWEN4EXP_QSA_SPLIT_KPITCH) *
+                             sizeof(float);
+    const size_t pr_shared = (size_t)2u * g * nth * sizeof(float) +
+                             (size_t)nth * sizeof(int32_t);
+    if (sc_shared > QWEN4EXP_QSA_GROUP_SHARED_CAP ||
+        pr_shared > QWEN4EXP_QSA_GROUP_SHARED_CAP) {
         return 0;
     }
 #define QWEN4EXP_QSA_SPLIT_LAUNCH(G, V)                                          \
@@ -16224,57 +15970,25 @@ static int qwen4exp_qsa_attention_split(
             (const float *)v_cache->ptr, sel, cnt, sc, tmax, ct, tsum,        \
             n_tokens, n_head, n_kv_head, head_dim, pos0, cache_cap,           \
             max_selected, sparse ? 1u : 0u, max_tiles, d_pos)
-    /* The reduced dense V prefetch depth belongs to the ROW COUNT, not to the
-     * width.  It arrived attached to `case 2u` because 2 was the only width one
-     * row ever took, so the two were the same condition; once the one-wave rule
-     * can hand one row a different width, they are not.  Reaching `case 3u` with
-     * QWEN4EXP_QSA_SPLIT_VSTEP would silently trade a measured tuning for an
-     * unmeasured one, which is the opposite of what that rule is for -- so the
-     * predicate moves into a macro and every width one row can reach keeps it.
-     *
-     * The predicate is the original one, unweakened, including the model-shape
-     * clauses and the env valve: `n_tokens == 1u` makes it false on the verify
-     * path and false in prefill, so `case 6u` at two rows and `case 4u` at 1024
-     * launch the same <G, 16u> instantiation as before, and `case 2u` expands to
-     * exactly the code it replaces.  The only pair (width, depth) that is new is
-     * one row at a width only the rule produces.  Widths 12 and 1 are left alone
-     * because one row cannot reach either: 12 misses the shared-memory cap and 1
-     * is below every wave the rule considers.
-     *
-     * Preserving the 8 rather than taking the 16 is the smaller of the two
-     * assumptions, but it IS an assumption: the depth was measured at GROUP 2
-     * and I am carrying it to GROUP 3 on the argument that it describes how many
-     * value rows a lane keeps in flight, which is per-lane and has no GROUP in
-     * it. If anything GROUP 3 wants it more, since `contrib[GROUP]` is one
-     * register deeper. Neither depth is measured at GROUP 3 and I cannot measure
-     * either. Both land the same products in the same accumulators in the same
-     * order -- VSTEP is a scheduling number, as the header comment says -- so
-     * whichever is faster, the emitted tokens are identical.
-     *
-     * Cost of the hoist: `case 4u` and `case 6u` now reach a getenv they did not
-     * reach before, once per split launch. Those are capture-time or eager-side
-     * calls -- decode replays graphs -- so at 48 layers it is a few microseconds
-     * of prefill against a 621.6 ms leg, which is 0.02 bips. */
-#define QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH(G)                                 \
-    do {                                                                      \
-        if (!sparse && n_tokens == 1u && n_head == 24u &&                     \
-            n_kv_head == 2u && head_dim == 256u &&                            \
-            getenv("DS4_QWEN4EXP_NO_QSA_SHORT_V") == NULL) {                  \
-            QWEN4EXP_QSA_SPLIT_LAUNCH(G, 8u);                                 \
-        } else {                                                              \
-            QWEN4EXP_QSA_SPLIT_LAUNCH(G, QWEN4EXP_QSA_SPLIT_VSTEP);           \
-        }                                                                     \
-    } while (0)
     switch (g) {
         case 12u: QWEN4EXP_QSA_SPLIT_LAUNCH(12u, QWEN4EXP_QSA_SPLIT_VSTEP); break;
-        case 6u:  QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH(6u);  break;
-        case 4u:  QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH(4u);  break;
-        case 3u:  QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH(3u);  break;
-        case 2u:  QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH(2u);  break;
+        case 6u:  QWEN4EXP_QSA_SPLIT_LAUNCH(6u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
+        case 4u:  QWEN4EXP_QSA_SPLIT_LAUNCH(4u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
+        case 3u:  QWEN4EXP_QSA_SPLIT_LAUNCH(3u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
+        case 2u:
+            /* Preserve the ordered products; only reduce dense V prefetch
+             * depth for the measured one-row model shape. */
+            if (!sparse && n_tokens == 1u && n_head == 24u &&
+                n_kv_head == 2u && head_dim == 256u &&
+                getenv("DS4_QWEN4EXP_NO_QSA_SHORT_V") == NULL) {
+                QWEN4EXP_QSA_SPLIT_LAUNCH(2u, 8u);
+            } else {
+                QWEN4EXP_QSA_SPLIT_LAUNCH(2u, QWEN4EXP_QSA_SPLIT_VSTEP);
+            }
+            break;
         case 1u:  QWEN4EXP_QSA_SPLIT_LAUNCH(1u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
         default:  return 0;
     }
-#undef QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH
 #undef QWEN4EXP_QSA_SPLIT_LAUNCH
     qwen4exp_qsa_split_fold_kernel<<<dim3(n_head, n_tokens), head_dim, 0,
         cuda_decode_stream()>>>(
@@ -16809,7 +16523,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_tensor(
  * swallowed and reported as -1; the function never touches device state and is
  * called once, off the timed path. */
 extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
-    static char buf[384];
+    static char buf[640];
     static int built = 0;
     if (built) return buf;
     built = 1;
@@ -16817,6 +16531,11 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
 
     int gu_regs = -1, gu_smem = -1, gu_lmem = -1, gu_maxt = -1;
     int gu_occ = -1, dn_occ = -1;
+    /* The two panel instantiations this build adds, read the same way: the
+     * q8_0 panel is 21,760 B of STATIC shared against the q4_K panel's 11,520,
+     * so occupancy is asked for rather than computed. */
+    int g5_regs = -1, g5_smem = -1, g5_lmem = -1, g5_occ = -1;
+    int g8_regs = -1, g8_smem = -1, g8_lmem = -1, g8_occ = -1;
     int dn_regs = -1, dn_smem = -1, dn_lmem = -1, dn_maxt = -1;
     /* The two PREFILL tile kernels, read here for the first time. */
     int mg_regs = -1, mg_smem = -1, mg_lmem = -1, mg_occ = -1;
@@ -16837,6 +16556,23 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
     } else {
         (void)cudaGetLastError();
     }
+
+    if (cudaFuncGetAttributes(
+            &a,
+            qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q5_K, true,
+                                             QW_GU_COOP_ROWS, true>) ==
+        cudaSuccess) {
+        g5_regs = a.numRegs; g5_smem = (int)a.sharedSizeBytes;
+        g5_lmem = (int)a.localSizeBytes;
+    } else { (void)cudaGetLastError(); }
+    if (cudaFuncGetAttributes(
+            &a,
+            qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q8_0, true,
+                                             QW_GU_COOP_ROWS, true>) ==
+        cudaSuccess) {
+        g8_regs = a.numRegs; g8_smem = (int)a.sharedSizeBytes;
+        g8_lmem = (int)a.localSizeBytes;
+    } else { (void)cudaGetLastError(); }
 
     if (cudaFuncGetAttributes(
             &a,
@@ -16901,6 +16637,20 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
     } else {
         (void)cudaGetLastError();
     }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ,
+            qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q5_K, true,
+                                             QW_GU_COOP_ROWS, true>,
+            (int)(QW_GU_COOP_ROWS * 64u), 0) == cudaSuccess) {
+        g5_occ = occ;
+    } else { (void)cudaGetLastError(); }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ,
+            qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q8_0, true,
+                                             QW_GU_COOP_ROWS, true>,
+            (int)(QW_GU_COOP_ROWS * 64u), 0) == cudaSuccess) {
+        g8_occ = occ;
+    } else { (void)cudaGetLastError(); }
 
     /* ---- THE PREFILL TILE KERNELS, read here for the first time ----
      * Everything above, and every arm this line of work has submitted, is a
@@ -16982,12 +16732,16 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
              "gu[reg=%d smem=%d lmem=%d maxt=%d occ=%d] dn[reg=%d smem=%d "
              "lmem=%d maxt=%d occ=%d] gdn[reg=%d lmem=%d] "
              "mm[reg=%d smem=%d lmem=%d occ=%d] "
-             "md[reg=%d smem=%d lmem=%d occ=%d]",
+             "md[reg=%d smem=%d lmem=%d occ=%d] "
+             "gu5[reg=%d smem=%d lmem=%d occ=%d] "
+             "gu8[reg=%d smem=%d lmem=%d occ=%d]",
              gu_regs, gu_smem, gu_lmem, gu_maxt, gu_occ,
              dn_regs, dn_smem, dn_lmem, dn_maxt, dn_occ,
              gd_regs, gd_lmem,
              mg_regs, mg_smem, mg_lmem, mg_occ,
-             md_regs, md_smem, md_lmem, md_occ);
+             md_regs, md_smem, md_lmem, md_occ,
+             g5_regs, g5_smem, g5_lmem, g5_occ,
+             g8_regs, g8_smem, g8_lmem, g8_occ);
     return buf;
 }
 
