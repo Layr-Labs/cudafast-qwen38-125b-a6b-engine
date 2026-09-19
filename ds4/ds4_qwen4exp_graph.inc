@@ -12,6 +12,21 @@
 #include "ds4_qwen4exp_qsa_scratch.h"
 #include "ds4_qwen4exp_gdn_replay.h"
 
+/* CUDA supplies the native output-row screen.  Keep these weak just like the
+ * MTP hook binding does: Metal/ROCm and CPU-only test links have no such
+ * symbol and retain the full-vocabulary head without a backend stub. */
+#if defined(__GNUC__)
+extern int ds4_gpu_mtp_native_screen2_init(
+        uint32_t, uint64_t *, uint32_t *) __attribute__((weak));
+extern int ds4_gpu_mtp_native_screen2(
+        ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *, const void *,
+        uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t,
+        const ds4_gpu_tensor *) __attribute__((weak));
+extern int ds4_gpu_mtp_native_scatter2(
+        ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *,
+        uint32_t, uint32_t) __attribute__((weak));
+#endif
+
 /* ======================================================================
  * Sizing.
  * ====================================================================== */
@@ -432,6 +447,13 @@ struct ds4_qwen4exp_session {
 
     ds4_gpu_tensor *logits;
     ds4_gpu_tensor *spec_top1;
+    /* CUDA R2 target-head screen.  One fused coarse pass shares the weight
+     * stream while ranking and exact refinement remain independent per row.
+     * One-row verification deliberately retains the exact full head. */
+    ds4_gpu_tensor *target_native_scratch2;
+    ds4_gpu_tensor *target_native_ids;
+    ds4_gpu_tensor *target_native_logits;
+    uint32_t        target_native_capacity;
 
     /* PREFILL ONLY.  True while `hyper` still owes the last block's inject:
      * the value the model means is hyper + block_out * inject, and the next
@@ -854,6 +876,26 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
             (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * cfg->n_vocab * f, &ok);
     s->spec_top1     = qwen4exp_alloc_zeroed(
             (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * sizeof(int32_t), &ok);
+    if (ok && getenv("DS4_QWEN4EXP_NO_TARGET_NATIVE_SCREEN") == NULL &&
+        ds4_gpu_mtp_native_screen2_init && ds4_gpu_mtp_native_screen2 &&
+        ds4_gpu_mtp_native_scatter2) {
+        uint64_t scratch2_bytes = 0;
+        uint32_t capacity = 0;
+        const int rc = ds4_gpu_mtp_native_screen2_init(
+                cfg->n_vocab, &scratch2_bytes, &capacity);
+        if (rc < 0) {
+            ok = false;
+        } else if (rc > 0 && scratch2_bytes && capacity &&
+                   capacity <= cfg->n_vocab) {
+            s->target_native_scratch2 =
+                qwen4exp_alloc_zeroed(scratch2_bytes, &ok);
+            s->target_native_ids = qwen4exp_alloc_zeroed(
+                2ull * capacity * sizeof(uint32_t), &ok);
+            s->target_native_logits = qwen4exp_alloc_zeroed(
+                2ull * capacity * sizeof(float), &ok);
+            if (ok) s->target_native_capacity = capacity;
+        }
+    }
 #ifdef DS4_TEST_HOOKS
     s->final_mixer_snapshot = qwen4exp_alloc_zeroed(B * H * E * f, &ok);
 #endif
@@ -937,6 +979,9 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->shexp_gate);
     ds4_gpu_tensor_free(s->logits);
     ds4_gpu_tensor_free(s->spec_top1);
+    ds4_gpu_tensor_free(s->target_native_scratch2);
+    ds4_gpu_tensor_free(s->target_native_ids);
+    ds4_gpu_tensor_free(s->target_native_logits);
 #ifdef DS4_TEST_HOOKS
     ds4_gpu_tensor_free(s->final_mixer_snapshot);
 #endif
@@ -3231,11 +3276,57 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
             return qwen4exp_forward_fail();
         }
     }
-    if (!ds4_qwen4exp_matmul_q8_0(s->logits, QW_MAP(m, w->output),
-                                    QW_MAPSZ(m, w->output), QW_OFF(w->output),
-                                    DS4_N_EMBD, cfg->n_vocab,
-                                    logit_rows == 1u ? s->embed_rows : s->mixed,
-                                    logit_rows)) {
+    const ds4_gpu_tensor *head_x =
+        logit_rows == 1u ? s->embed_rows : s->mixed;
+    bool target_screened = false;
+    if (logit_rows == 2u && s->target_native_capacity &&
+        s->target_native_scratch2 && s->target_native_ids &&
+        s->target_native_logits && ds4_gpu_mtp_native_screen2 &&
+        ds4_gpu_mtp_native_scatter2 && cfg->n_vocab > 276u) {
+        /* Screen the WHOLE vocabulary.  The 276 added-token rows are reserved
+         * by the native selector and prefix + tail is exactly n_vocab, so no
+         * token id is excluded before the approximate rank.  Every retained
+         * row is then recomputed by the ordinary exact Q8 dot and scattered
+         * back to its original id; only omitted rows become -FLT_MAX.
+         *
+         * This conservative target-only gate deliberately excludes the
+         * one-row decode head.  A declined R2 screen and every R1 call use the
+         * ordinary full-vocabulary projection below. */
+        const uint32_t tail = 276u;
+        const uint32_t prefix = cfg->n_vocab - tail;
+        if (!ds4_gpu_tensor_fill_f32(
+                s->logits, -FLT_MAX,
+                2ull * cfg->n_vocab)) {
+            fprintf(stderr, "ds4: qwen4exp target-screen logit clear failed\n");
+            return qwen4exp_forward_fail();
+        }
+        const int rc = ds4_gpu_mtp_native_screen2(
+                s->target_native_logits, s->target_native_ids,
+                s->target_native_scratch2, QW_MAP(m, w->output),
+                QW_MAPSZ(m, w->output), QW_OFF(w->output), DS4_N_EMBD,
+                cfg->n_vocab, prefix, tail, head_x);
+        if (rc < 0) {
+            fprintf(stderr,
+                    "ds4: qwen4exp target LM-head R2 screen failed\n");
+            return qwen4exp_forward_fail();
+        }
+        if ((uint32_t)rc == s->target_native_capacity) {
+            if (!ds4_gpu_mtp_native_scatter2(
+                    s->logits, s->target_native_logits,
+                    s->target_native_ids, s->target_native_capacity,
+                    cfg->n_vocab)) {
+                fprintf(stderr,
+                        "ds4: qwen4exp target LM-head R2 scatter failed\n");
+                return qwen4exp_forward_fail();
+            }
+            target_screened = true;
+        }
+    }
+    if (!target_screened &&
+        !ds4_qwen4exp_matmul_q8_0(s->logits, QW_MAP(m, w->output),
+                                  QW_MAPSZ(m, w->output), QW_OFF(w->output),
+                                  DS4_N_EMBD, cfg->n_vocab, head_x,
+                                  logit_rows)) {
         fprintf(stderr, "ds4: qwen4exp LM head failed\n");
         return qwen4exp_forward_fail();
     }
