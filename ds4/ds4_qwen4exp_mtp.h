@@ -725,10 +725,9 @@ typedef struct {
     int (*native_init)(uint32_t, uint64_t *, uint32_t *);
     int (*native_screen)(ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *,
                          const void *, uint64_t, uint64_t, uint32_t, uint32_t,
-                         uint32_t, uint32_t, const ds4_gpu_tensor *, int);
+                         uint32_t, uint32_t, const ds4_gpu_tensor *);
     int (*native_map)(ds4_gpu_tensor *, const ds4_gpu_tensor *,
-                      const ds4_gpu_tensor *, const ds4_gpu_tensor *, uint32_t,
-                      uint32_t, uint32_t, int);
+                      const ds4_gpu_tensor *, uint32_t, uint32_t);
     ds4_qwen4exp_block_forward_fn block;
     ds4_qwen4exp_block_forward_fn cache_seed; /* optional cache-only hook */
 } ds4_qwen4exp_mtp_gpu_hooks;
