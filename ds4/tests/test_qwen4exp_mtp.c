@@ -369,6 +369,15 @@ static int ref_decode_token(void *ctx, int token, uint32_t pos,
     return 0;
 }
 
+static int ref_decode_token_top1(void *ctx, int token, uint32_t pos,
+                                 float *hc_row, int *top1) {
+    refmodel *m = ctx;
+    if (!top1 || ref_decode_token(ctx, token, pos, hc_row,
+                                  m->compact_logits[0]) != 0) return -1;
+    *top1 = ds4_qwen4exp_mtp_argmax(m->compact_logits[0], REF_VOCAB);
+    return 0;
+}
+
 static int ref_head_logits(void *ctx, const float *hc_row, float *logits) {
     refmodel *m = ctx;
     m->n_head++;
@@ -1536,6 +1545,48 @@ static void test_deferred_frontier_logits(void) {
     ds4_qwen4exp_mtp_state_free(&st);
 }
 
+/* The no-pending/reject replay path is one row rather than a wide verify.  It
+ * must publish the same lazy frontier contract instead of eagerly copying a
+ * distribution merely so the caller can take its greedy winner. */
+static void test_deferred_commit_one_logits(void) {
+    printf("deferred commit-one frontier logits\n");
+    refmodel m;
+    ds4_qwen4exp_mtp_model model;
+    ds4_qwen4exp_rollback_set set;
+    ds4_qwen4exp_mtp_state st;
+    ref_reset(&m, BREAK_NONE, 0);
+    CHECK(ref_build(&m, &model, &set) == 0, "reference build failed");
+    model.defer_frontier_logits = true;
+    model.decode_token_top1 = ref_decode_token_top1;
+    CHECK(ds4_qwen4exp_mtp_state_init(&st, 1, &set, REF_HC_DIM, REF_VOCAB,
+                                      g_err, sizeof(g_err)) == 0,
+          "state init failed: %s", g_err);
+
+    float logits[REF_VOCAB];
+    for (uint32_t i = 0; i < REF_VOCAB; i++) logits[i] = -1234.0f;
+    int committed[DS4_QWEN4EXP_MTP_MAX_COMMIT];
+    unsetenv("DS4_QWEN4EXP_NO_COMMIT1_DEFER");
+    const int got = ds4_qwen4exp_mtp_cycle(
+        &st, &model, 3, 0, 2, committed, 2, logits, g_err, sizeof(g_err));
+    CHECK(got == 1, "deferred commit-one failed: %s", g_err);
+    CHECK(m.n_read_logit == 0,
+          "deferred commit-one eagerly read %llu frontier rows",
+          (unsigned long long)m.n_read_logit);
+    CHECK(st.frontier_row == 0u && st.frontier_top1_valid &&
+          st.frontier_logits_deferred,
+          "deferred commit-one did not publish a deferred row-zero frontier");
+    CHECK(st.frontier_top1 == ds4_qwen4exp_mtp_argmax(
+              m.compact_logits[0], REF_VOCAB),
+          "deferred commit-one top-1 does not match its resident row");
+    CHECK(logits[0] == -1234.0f,
+          "deferred commit-one unexpectedly overwrote host logits");
+    CHECK(model.read_logit_row(model.ctx, st.frontier_row, logits) == 0,
+          "deferred commit-one lazy materialization failed");
+    CHECK(ds4_qwen4exp_mtp_argmax(logits, REF_VOCAB) == st.frontier_top1,
+          "deferred commit-one materialization changed top-1");
+    ds4_qwen4exp_mtp_state_free(&st);
+}
+
 /* ========================================================================
  * The head wiring
  * ========================================================================
@@ -2576,6 +2627,8 @@ int main(void) {
     test_budget();
     printf("\n");
     test_deferred_frontier_logits();
+    printf("\n");
+    test_deferred_commit_one_logits();
     printf("\n");
     test_head_wiring();
     printf("\n");

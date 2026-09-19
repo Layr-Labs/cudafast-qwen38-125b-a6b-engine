@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <float.h>
 #include <sys/mman.h>
 #define DIM 2560u
 #define CAP 2048u
@@ -72,9 +73,10 @@ static void compare_r2_paths(const void *w,uint64_t bytes,uint64_t offset,
         *ids2=ds4_gpu_tensor_alloc(2ull*CAP2*4u),
         *scratch2=ds4_gpu_tensor_alloc(scratch2_bytes),
         *scattered=ds4_gpu_tensor_alloc(2ull*VOCAB*4u),
+        *winner2=ds4_gpu_tensor_alloc(2ull*4u),
         *full2=ds4_gpu_tensor_alloc(2ull*PREFIX*4u),
         *tail2=ds4_gpu_tensor_alloc(2ull*TAIL*4u);
-    need(x2&&out2&&ids2&&scratch2&&scattered&&full2&&tail2,
+    need(x2&&out2&&ids2&&scratch2&&scattered&&winner2&&full2&&tail2,
          "R2 GPU allocations");
     float *a2=malloc(2ull*DIM*4u),*after=malloc(2ull*DIM*4u),
         *values[2]={malloc(2ull*CAP2*4u),malloc(2ull*CAP2*4u)},
@@ -127,13 +129,37 @@ static void compare_r2_paths(const void *w,uint64_t bytes,uint64_t offset,
         for(uint32_t i=0;i<TAIL;i++)
             need(row_ids[CAP2-TAIL+i]==VOCAB-TAIL+i,"R2 mandatory tail");
     }
-    need(ds4_gpu_tensor_fill_f32(scattered,-INFINITY,2ull*VOCAB)&&
+    need(ds4_gpu_tensor_fill_f32(scattered,-FLT_MAX,2ull*VOCAB)&&
          ds4_gpu_mtp_native_scatter2(scattered,out2,ids2,CAP2,VOCAB)&&
          ds4_gpu_tensor_read(scattered,0,dense,2ull*VOCAB*4u),"R2 scatter");
     for(uint32_t r=0;r<2;r++) for(uint32_t i=0;i<CAP2;i++)
         need(!memcmp(&dense[(uint64_t)r*VOCAB+
                             selected_ids[1][(uint64_t)r*CAP2+i]],
                      &values[1][(uint64_t)r*CAP2+i],4),"R2 scattered value");
+    uint32_t winners[2];
+    need(ds4_gpu_mtp_native_top1_map2(winner2,out2,ids2,CAP2,VOCAB)&&
+         ds4_gpu_tensor_read(winner2,0,winners,sizeof winners),
+         "R2 compact top1");
+    for(uint32_t r=0;r<2;r++) {
+        uint32_t best=0;
+        for(uint32_t i=1;i<VOCAB;i++)
+            if(dense[(uint64_t)r*VOCAB+i]>dense[(uint64_t)r*VOCAB+best])best=i;
+        need(winners[r]==best,"R2 compact/dense top1 differs");
+    }
+    float *edge=malloc(2ull*CAP2*4u);
+    need(edge!=NULL,"R2 edge allocation");
+    for(uint32_t i=0;i<CAP2;i++) edge[i]=-INFINITY;
+    edge[0]=NAN;
+    for(uint32_t i=0;i<CAP2;i++) edge[CAP2+i]=-FLT_MAX;
+    need(ds4_gpu_tensor_write(out2,0,edge,2ull*CAP2*4u)&&
+         ds4_gpu_mtp_native_top1_map2(winner2,out2,ids2,CAP2,VOCAB)&&
+         ds4_gpu_tensor_read(winner2,0,winners,sizeof winners),
+         "R2 compact top1 edge cases");
+    uint32_t missing=0;
+    while(missing<CAP2&&selected_ids[1][missing]==missing)missing++;
+    need(winners[0]==missing,"R2 compact omitted -FLT_MAX sentinel");
+    need(winners[1]==0,"R2 compact original-ID tie");
+    free(edge);
     setenv("DS4_QWEN4EXP_NO_TARGET_NATIVE_SCREEN_R2","1",1);
     need(ds4_gpu_mtp_native_screen2(out2,ids2,scratch2,w,bytes,offset,DIM,VOCAB,
          PREFIX,TAIL,x2)==0,"R2 valve fallback");
@@ -142,6 +168,7 @@ static void compare_r2_paths(const void *w,uint64_t bytes,uint64_t offset,
     free(reference);free(tail_ref);free(selected_ids[0]);free(selected_ids[1]);
     ds4_gpu_tensor_free(x2);ds4_gpu_tensor_free(out2);ds4_gpu_tensor_free(ids2);
     ds4_gpu_tensor_free(scratch2);ds4_gpu_tensor_free(scattered);
+    ds4_gpu_tensor_free(winner2);
     ds4_gpu_tensor_free(full2);ds4_gpu_tensor_free(tail2);
 }
 static void run_case(int adversarial, uint32_t offset) {

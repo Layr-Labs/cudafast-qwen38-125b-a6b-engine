@@ -550,16 +550,27 @@ static int mtp_commit_one(ds4_qwen4exp_mtp_state *st,
                           int *accepted, float *logits,
                           int *next_out, char *err, size_t errlen) {
     float *hc0 = st->hc_scratch;
+    const bool defer_logits = model->decode_token_top1 != NULL &&
+        model->read_logit_row != NULL && model->defer_frontier_logits &&
+        getenv("DS4_QWEN4EXP_NO_COMMIT1_DEFER") == NULL;
+    int next = -1;
     const uint64_t t0 = mtp_now_ns();
-    const int drc = model->decode_token(model->ctx, first_token, pos, hc0,
-                                        logits);
+    const int drc = defer_logits
+        ? model->decode_token_top1(model->ctx, first_token, pos, hc0, &next)
+        : model->decode_token(model->ctx, first_token, pos, hc0, logits);
     st->counters.verify_ns += mtp_now_ns() - t0;
     if (drc != 0) {
         return mtp_fail(err, errlen,
                         "qwen4exp MTP: target decode of token %d at position "
                         "%u failed", first_token, pos);
     }
-    const int next = ds4_qwen4exp_mtp_argmax(logits, model->n_vocab);
+    if (!defer_logits) next = ds4_qwen4exp_mtp_argmax(logits, model->n_vocab);
+    if (next < 0 || (uint32_t)next >= model->n_vocab) {
+        return mtp_fail(err, errlen,
+                        "qwen4exp MTP: target decode at position %u returned "
+                        "invalid top-1 %d for vocabulary %u",
+                        pos, next, model->n_vocab);
+    }
     if (next_out) *next_out = next;
     if (mtp_draft_chain(st, model, hc0, NULL, 0, pos, next,
                         err, errlen) != 0) {
@@ -568,6 +579,12 @@ static int mtp_commit_one(ds4_qwen4exp_mtp_state *st,
     accepted[0] = first_token;
     st->counters.committed += 1;
     st->counters.commit_hist[1] += 1;
+    if (defer_logits) {
+        st->frontier_row = 0u;
+        st->frontier_top1 = next;
+        st->frontier_top1_valid = true;
+        st->frontier_logits_deferred = true;
+    }
     return 1;
 }
 
@@ -587,10 +604,9 @@ int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
     if (!st->hc_scratch || !st->logits_rows) {
         return mtp_fail(err, errlen, "qwen4exp MTP: state is not initialised");
     }
-    /* `logits` is not optional.  Every path below takes an argmax over it, and
-     * the caller's next sample reads it: a NULL here is a caller that has no
-     * frontier distribution to sample from, so its leg would repeat one token
-     * for ever.  Refuse by name -- the argmax would otherwise dereference it. */
+    /* `logits` is not optional.  Compact greedy paths may carry only the exact
+     * top-1 and materialize this buffer lazily, but every fallback and every
+     * non-greedy caller still needs storage for the frontier distribution. */
     if (!logits) {
         return mtp_fail(err, errlen,
                         "qwen4exp MTP: the cycle was given no logit buffer to "
