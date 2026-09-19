@@ -17885,3 +17885,12 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
  * census shows produces a byte-identical capture log. */
 
 #define YUKON_REDRAW_10 10
+
+/* Second measurement of the promoted frontier artifact a4fc7c67
+ * (ercumentyildirim, official 2.76440365607712, promoted ref
+ * 182308f82569dda23f3a9890bd63cd2ab1fc65a2), previously re-measured by
+ * public submission 387b156e (DPZZxlz, 2.76077967398746). This comment and
+ * the unincluded header ds4/ds4_redraw_387b156e.cuh are the only byte
+ * differences from that blob; no statement, declaration, or flag reaches
+ * the compiler, so the engine is identical and the submission is one
+ * fresh independent paired measurement of the same artifact. */
