@@ -2,7 +2,7 @@
 from pathlib import Path
 import re,subprocess,tempfile
 repo=Path(__file__).resolve().parents[2]
-s=(repo/'ds4/ds4_cuda_mtp_native.cuh').read_text();main=(repo/'ds4/ds4_cuda.cu').read_text()
+s=(repo/'ds4/ds4_cuda_mtp_screen.cuh').read_text();main=(repo/'ds4/ds4_cuda.cu').read_text()
 def block(text,needle):
  start=text.index('{',text.index(needle));end=start+1;depth=1
  while depth:
