@@ -549,6 +549,84 @@ extern "C" int ds4_gpu_mtp_native_screen2(ds4_gpu_tensor *out,
     }
     return (int)MTP_TARGET_NATIVE_CAP;
 }
+
+/* The compact verify caller needs only the original-vocabulary winner of each
+ * refined row.  The dense path fills every omitted vocabulary entry with
+ * -FLT_MAX before scattering the refined values, so include the smallest
+ * omitted original ID as that sentinel candidate.  Comparing original IDs
+ * retains the dense top-1 tie rule even if the shortlist representation ever
+ * stops being ordered. */
+__global__ static void mtp_native_top1_map2_kernel(
+        uint32_t *winner, const float *logits, const uint32_t *ids,
+        uint32_t count, uint32_t vocab) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (row >= 2u || tid >= 1024u) return;
+    const uint32_t *row_ids = ids + (uint64_t)row * count;
+    const float *row_logits = logits + (uint64_t)row * count;
+
+    __shared__ float values[1024];
+    __shared__ uint32_t indices[1024];
+    __shared__ uint32_t missing;
+    if (tid == 0u) {
+        uint32_t lo = 0u, hi = count;
+        while (lo < hi) {
+            const uint32_t mid = lo + (hi - lo) / 2u;
+            if (row_ids[mid] == mid) lo = mid + 1u;
+            else hi = mid;
+        }
+        missing = lo;
+    }
+    __syncthreads();
+
+    float best_value = tid == 0u ? -FLT_MAX : -INFINITY;
+    uint32_t best_id = tid == 0u ? missing : UINT32_MAX;
+    for (uint32_t i = tid; i < count; i += 1024u) {
+        const float value = row_logits[i];
+        const uint32_t id = row_ids[i];
+        if (value > best_value || (value == best_value && id < best_id)) {
+            best_value = value;
+            best_id = id;
+        }
+    }
+    values[tid] = best_value;
+    indices[tid] = best_id;
+    __syncthreads();
+    for (uint32_t stride = 512u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            const float value = values[tid + stride];
+            const uint32_t id = indices[tid + stride];
+            if (value > values[tid] ||
+                (value == values[tid] && id < indices[tid])) {
+                values[tid] = value;
+                indices[tid] = id;
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0u) winner[row] = indices[0] < vocab ? indices[0] : UINT32_MAX;
+}
+
+extern "C" int ds4_gpu_mtp_native_top1_map2(ds4_gpu_tensor *winner,
+        const ds4_gpu_tensor *logits, const ds4_gpu_tensor *ids,
+        uint32_t count, uint32_t vocab) {
+    if (!winner || !logits || !ids || !count || count >= vocab ||
+        winner->bytes < 2u * sizeof(uint32_t) ||
+        logits->bytes < 2ull * count * sizeof(float) ||
+        ids->bytes < 2ull * count * sizeof(uint32_t)) return 0;
+    const int tier = ds4_tensor_device_idx(winner);
+    int current = -1;
+    if (tier < 0 || tier >= g_n_gpus ||
+        ds4_tensor_device_idx(logits) != tier ||
+        ds4_tensor_device_idx(ids) != tier ||
+        cudaGetDevice(&current) != cudaSuccess ||
+        current != g_gpu[tier].device_id) return 0;
+    mtp_native_top1_map2_kernel<<<2, 1024, 0, cuda_decode_stream()>>>(
+        (uint32_t *)winner->ptr, (const float *)logits->ptr,
+        (const uint32_t *)ids->ptr, count, vocab);
+    return cuda_ok(cudaGetLastError(), "native target compact top-1 map");
+}
+
 __global__ static void mtp_native_map(uint32_t *winner, const float *logits,
                                       const uint32_t *ids, uint32_t count, uint32_t vocab) {
     const uint32_t bits = __float_as_uint(logits[0]);
