@@ -20361,7 +20361,7 @@ struct qwen_gdn_projection_args {
 #else
 #define QW_GDN_PROJ_ATTR __launch_bounds__(256)
 #endif
-template<int R, bool Stage=false>
+template<int R, bool Stage=false, bool Fixed=false>
 __global__ QW_GDN_PROJ_ATTR
 static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
     extern __shared__ uint4 qw_gdn_panel[];
@@ -20369,16 +20369,25 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
     constexpr unsigned B=256u;
     constexpr bool FloatFirst=true, Streaming=false;
     constexpr int C=2, U=10;
-    const uint32_t split=(uint32_t)((a.od[0]+B/64u-1u)/(B/64u));
-    const uint32_t qblocks=split+(uint32_t)((a.od[1]+B/64u-1u)/(B/64u));
+    /* The ranked model is the only shape that reaches Fixed.  Naming its
+     * dimensions here lets ptxas erase the generic bounds, divisions and
+     * short-tail machinery from the two decode instantiations while the
+     * ordinary template remains the exact fallback for tests and other
+     * shapes. */
+    const uint64_t blocks=Fixed ? 80u : a.blocks;
+    const uint32_t split=Fixed ? 2560u
+        : (uint32_t)((a.od[0]+B/64u-1u)/(B/64u));
+    const uint32_t qblocks=Fixed ? 4096u
+        : split+(uint32_t)((a.od[1]+B/64u-1u)/(B/64u));
     const bool is_float=FloatFirst ? blockIdx.x<96u : blockIdx.x>=qblocks;
     if (!is_float) {
         const uint32_t qb=FloatFirst ? blockIdx.x-96u : blockIdx.x;
         const bool second=qb>=split;
         const uint32_t block=second?qb-split:qb;
         float *out=second?a.out[1]:a.out[0]; const unsigned char *w=second?a.weights[1]:a.weights[0];
-        const uint64_t out_dim=second?a.od[1]:a.od[0],blocks=a.blocks;
-        const uint32_t n_rows=a.n_rows;
+        const uint64_t out_dim=Fixed ? (second ? 6144u : 10240u)
+                                     : (second ? a.od[1] : a.od[0]);
+        const uint32_t n_rows=Fixed ? (uint32_t)R : a.n_rows;
         const int8_t *xq=a.xq; const float *xscale=a.xscale;
     if (Stage) {
         /* Four consecutive rows of one slab: one dense run, grid-strided by
@@ -20388,9 +20397,31 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
          * past the end are read by the last block's unaligned word pair and
          * then discarded by the funnel shift; the launch adds 16 bytes to the
          * request so that read stays inside the allocation. */
-        const uint64_t panel_bytes = (uint64_t)(B/64u) * blocks * 34u;
+        const uint64_t panel_bytes = Fixed ? 10880u
+            : (uint64_t)(B/64u) * blocks * 34u;
         const char *const gp = (const char *)w + (uint64_t)block * panel_bytes;
-        if (((uintptr_t)gp & 15u) == 0u) {
+        if (Fixed && ((uintptr_t)gp & 15u) == 0u) {
+            /* Exactly 680 aligned 16-byte pieces: every thread publishes two,
+             * and the first 168 publish a third. */
+            const uint64_t i=(uint64_t)threadIdx.x*16u;
+            *(uint4 *)(gpanel+i)=*(const uint4 *)(const void *)(gp+i);
+            *(uint4 *)(gpanel+i+4096u)=
+                *(const uint4 *)(const void *)(gp+i+4096u);
+            if (threadIdx.x<168u)
+                *(uint4 *)(gpanel+i+8192u)=
+                    *(const uint4 *)(const void *)(gp+i+8192u);
+        } else if (Fixed) {
+            /* A merely word-aligned synthetic slab.  2,720 words divide into
+             * ten pieces per thread plus one piece for lanes 0..159. */
+            const uint64_t i=(uint64_t)threadIdx.x*4u;
+#pragma unroll
+            for (unsigned j=0;j<10u;j++)
+                *(uint32_t *)(gpanel+i+(uint64_t)j*1024u)=
+                    *(const uint32_t *)(const void *)(gp+i+(uint64_t)j*1024u);
+            if (threadIdx.x<160u)
+                *(uint32_t *)(gpanel+i+10240u)=
+                    *(const uint32_t *)(const void *)(gp+i+10240u);
+        } else if (((uintptr_t)gp & 15u) == 0u) {
             for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
                  i += (uint64_t)B * 16u) {
                 if (i + 16u <= panel_bytes)
@@ -20480,6 +20511,7 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
                 }
             }
         }
+#pragma unroll
         for (uint64_t b = group + 32u; b < blocks; b += 32u) {
             /* Name both lanes of every live pair even if independent
              * scheduling has temporarily separated their execution. */
@@ -20977,17 +21009,32 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
             ((((uintptr_t)a.weights[0]|(uintptr_t)a.weights[1])&3u)==0u) &&
             gdn_panel<=49152u &&
             getenv("DS4_QWEN4EXP_NO_GDN_PANEL")==NULL;
+        const int gdn_fixed =
+            qkv_dim==10240u && gate_dim==6144u &&
+            getenv("DS4_QWEN4EXP_NO_GDN_FIXED")==NULL;
         /* PDL consumer: the stream predecessor is the mixed-input quantizer,
          * which triggers at its top at these decode widths. */
         if (rows==1u) {
-            if (gdn_stage)
+            if (gdn_fixed && gdn_stage)
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1,true,true>),
+                                    grid, 256, gdn_panel, cuda_decode_stream(), a);
+            else if (gdn_fixed)
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1,false,true>),
+                                    grid, 256, 0, cuda_decode_stream(), a);
+            else if (gdn_stage)
                 QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1,true>),
                                     grid, 256, gdn_panel, cuda_decode_stream(), a);
             else
                 QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1>),
                                     grid, 256, 0, cuda_decode_stream(), a);
         } else {
-            if (gdn_stage)
+            if (gdn_fixed && gdn_stage)
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2,true,true>),
+                                    grid, 256, gdn_panel, cuda_decode_stream(), a);
+            else if (gdn_fixed)
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2,false,true>),
+                                    grid, 256, 0, cuda_decode_stream(), a);
+            else if (gdn_stage)
                 QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2,true>),
                                     grid, 256, gdn_panel, cuda_decode_stream(), a);
             else
