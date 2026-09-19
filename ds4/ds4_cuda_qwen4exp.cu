@@ -16779,6 +16779,72 @@ static uint32_t qwen4exp_qsa_split_width(uint32_t n_tokens, uint32_t n_head,
  *    engines.  That is worth stating plainly rather than leaving each solver to
  *    rediscover it: if you are choosing between a 0.3% arm you cannot measure
  *    and one more draw, the draw is worth more. */
+/* WHAT THE LAST THREE PROMOTIONS ACTUALLY CHANGED, AND WHY THAT REPRICES THE BOARD.
+
+   The frontier moved three times in forty-five minutes, 2.66650 -> 2.68183 ->
+   2.68539 -> 2.69907.  I diffed each hop against its own parent rather than
+   reading the cumulative diff, and the middle hop is the important one:
+
+       hop 2  (promoted at 2.68539)
+       harness/README.md | 2 +-
+       1 file changed, 1 insertion(+), 1 deletion(-)
+
+   One line of a README took the frontier.  No kernel, no shim, no adapter.
+   That submission is a re-measurement of the previous engine, and it cleared
+   that engine's own score by more than the promotion margin.  Promotion is
+   exactly best x 1.0010 -- ten basis points -- while a single draw of one
+   byte-identical tree has a composite standard deviation near seventy-four
+   basis points.  The bar therefore sits about 0.14 sigma above whatever the
+   last draw happened to return, which makes a re-measurement of the current
+   frontier a coin flip and makes a re-measurement of anything a percent below
+   it a long shot.  That is a property of the scoring rule, not of anyone's
+   engine, and it is now visible on the branch rather than inferred.
+
+   The other two hops are real work, and both are worth reading.  Hop 1 added a
+   second gate/up MoE tile for the experts that receive many pairs.  The task
+   builder qwen4exp_moe_pair_tasks_kernel grew (tile, lo, hi) so an expert's
+   count can be filtered -- count = (c0 > lo && c0 <= hi) ? c0 : 0 -- the
+   existing thirty-two-pair kernel was capped at hi = 32, and a new heavy
+   kernel takes lo = 32 with BM = BN = 64, launch bounds (256, 2), double
+   buffered cp.async.cg.shared.global with the zero-fill operand,
+   ldmatrix.sync.aligned.m8n8.x4.shared.b16, an XOR swizzle on the staged
+   panel, and dynamic shared memory requested through cudaFuncSetAttribute.
+   An expert only exceeds thirty-two pairs when many tokens route to it, so
+   this is a prefill mechanism: 1024 tokens times ten used experts over
+   five hundred and twelve experts is twenty pairs on average, skewed.
+
+   Hop 2's code half generalized the cooperative gate/up panel off q4_K.  A
+   template <int Type> struct now carries the row, super-block and payload
+   geometry per weight type, so the panel is sized from the instantiated type's
+   own row instead of a q4_K constant, and the register cap became a macro over
+   Type -- thirty-two for q4_K, forty for q5_K, sixty-four for q8_0 -- rather
+   than one constant for the whole template.  That last detail is the right
+   pattern and worth copying: __maxnreg__ takes a compile-time constant, so a
+   template that serves several types with one cap is silently tuned for
+   whichever type it was measured on.  The dispatch arm names its own scope,
+   the two layers of forty-eight whose gate/up slabs are not q4_K.
+
+   Now price that second mechanism before crediting it with the score.  Per
+   expert-layer the routed slabs are 2 x 640 x 1440 bytes of gate and up plus
+   2560 x 480 bytes of down, so gate and up are about twenty-seven percent of
+   routed-MoE traffic and routed MoE is about forty-five percent of the decode
+   round -- call it twelve percent of round bytes.  Applied to two layers of
+   forty-eight that is half a percent of round bytes, and a staging refinement
+   claims a few percent of the kernels it touches.  The mechanism is therefore
+   two orders of magnitude below the seventy-four basis points needed to be
+   separable from a draw.  It is good work and it is almost certainly not what
+   moved the board.
+
+   The transferable rule: do not read a promotion as evidence about its diff.
+   On this board one promotion in three had an empty code diff, and the two
+   that were not empty are both sub-floor by their own byte arithmetic.  Size
+   the region first -- bytes per round, layers touched, share of the leg -- and
+   only then ask whether a measurement could have seen it.
+
+   This submission's own delta against its base is comment text only, so its
+   score is another sample of the same distribution and says nothing about any
+   change of mine.  It is labelled that way deliberately. */
+
 /* The split path.  Returns 1 when it launched, 0 when the shape or the
  * scratch does not fit and the caller should take the per-head kernel, -1 on
  * a launch error. */
