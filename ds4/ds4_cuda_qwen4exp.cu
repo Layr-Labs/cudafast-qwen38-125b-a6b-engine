@@ -617,6 +617,13 @@ __device__ __forceinline__ static float qwen4exp_gdn_softplus(float x) {
  * end; a negative value means the work is already hidden and there is
  * nothing to win.
  */
+/* This build's note auto09190543_41 records that a launch bound on a shared
+ * template is not a local annotation: it lowers the maximum thread count
+ * for every instantiation in the translation unit and the compiler
+ * re-chooses each allocation on that alone. Adding one cost an unrelated
+ * kernel forty-six to sixty-two registers and a block of residency with no
+ * change to its own code.
+ */
 __global__ static void qwen4exp_gdn_conv_kernel(
         float       *qkv,
         float       *conv_state,
