@@ -3349,8 +3349,12 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     }
     QW_TRACE(QW_SLICE_HEAD);
     QW_TRACE_REPORT(n_tokens);
-    /* Commit and wait: the logits are read on the host from here on. */
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
+    /* CUDA has no command buffer to close here, and every successful entry
+     * immediately reaches a blocking D2H read: logits below for serial, or
+     * compact top-1 in ds4_qwen4exp_graph_verify_top1_rows.  Let that required
+     * read own completion instead of draining the device twice first.  Other
+     * backends keep their ordinary end operation in the helper. */
+    if (!ds4_gpu_end_commands_for_readback()) {
         fprintf(stderr, "ds4: qwen4exp command batch did not complete\n");
         ds4_gpu_oneshot_graph_retire();
         return false;
@@ -4037,7 +4041,7 @@ bool ds4_qwen4exp_graph_head_logits(ds4_qwen4exp_session       *s,
         fprintf(stderr, "ds4: qwen4exp LM head failed on the head row\n");
         return qwen4exp_forward_fail();
     }
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
+    if (!ds4_gpu_end_commands_for_readback()) {
         fprintf(stderr, "ds4: qwen4exp command batch did not complete\n");
         return false;
     }

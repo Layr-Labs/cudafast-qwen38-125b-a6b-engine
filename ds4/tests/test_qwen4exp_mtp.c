@@ -1648,6 +1648,9 @@ int ds4_gpu_indexer_topk_tensor(ds4_gpu_tensor *selected,
 }
 int ds4_gpu_begin_commands(void) { return 1; }
 int ds4_gpu_end_commands(void) { return 1; }
+int ds4_gpu_end_commands_for_readback(void) {
+    return ds4_gpu_end_commands();
+}
 int ds4_gpu_synchronize(void) { return 1; }
 
 /* ---- the recorded call log --------------------------------------------- */

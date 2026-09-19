@@ -6132,6 +6132,11 @@ extern "C" int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const 
 extern "C" int ds4_gpu_end_commands(void) {
     return cuda_ok(cudaDeviceSynchronize(), "end commands");
 }
+extern "C" int ds4_gpu_end_commands_for_readback(void) {
+    /* This optimization is CUDA-scoped.  Preserve ROCm's established
+     * command-boundary semantics until its stream ordering is measured. */
+    return ds4_gpu_end_commands();
+}
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
 
 extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {

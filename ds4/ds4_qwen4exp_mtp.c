@@ -1396,7 +1396,10 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                                   defer_invalid) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_TOP1);
-    if (ok) ok = ds4_gpu_end_commands() != 0;
+    /* The top-1 D2H immediately below is mandatory on every successful head
+     * call.  On CUDA it is the completion fence; cache-only calls above keep
+     * their ordinary end_commands because they have no following readback. */
+    if (ok) ok = ds4_gpu_end_commands_for_readback() != 0;
     else (void)ds4_gpu_synchronize();
     MTP_HEAD_TICK(MTP_HEAD_T_END);
 

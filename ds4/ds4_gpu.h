@@ -108,6 +108,12 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
                                              const char *label);
 #endif
 int ds4_gpu_end_commands(void);
+/* End a command batch whose next operation is a blocking device-to-host
+ * tensor read.  CUDA's command batch is only a lexical boundary, so that
+ * read can own completion instead of paying a separate device fence first.
+ * Backends with a real command buffer retain their ordinary end operation. */
+/* The following declaration is the shared blocking-read boundary. */
+int ds4_gpu_end_commands_for_readback(void);
 int ds4_gpu_synchronize(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);

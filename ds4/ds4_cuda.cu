@@ -121,6 +121,7 @@ static int g_cuda_decode_score8;
 static int g_cuda_no_decode_value512;
 static int g_cuda_no_top1;
 static int g_cuda_end_stream_sync;
+static int g_cuda_no_defer_readback_end;
 static int g_cuda_no_setdevice_cache;
 static int g_cuda_exact_score_split_graph;
 static int g_cuda_exact_score_split_ldg;
@@ -271,6 +272,8 @@ static void cuda_decode_dispatch_env_refresh(void) {
     g_cuda_no_decode_value512 = getenv("DS4_CUDA_NO_DECODE_VALUE512") != NULL;
     g_cuda_no_top1 = getenv("DS4_CUDA_NO_TOP1") != NULL;
     g_cuda_end_stream_sync = getenv("DS4_CUDA_END_STREAM_SYNC") != NULL;
+    g_cuda_no_defer_readback_end =
+        getenv("DS4_CUDA_NO_DEFER_READBACK_END") != NULL;
     g_cuda_no_setdevice_cache = getenv("DS4_CUDA_NO_SETDEVICE_CACHE") != NULL;
     g_cuda_exact_score_split_graph =
         getenv("DS4_CUDA_EXACT_SCORE_SPLIT_GRAPH") != NULL;
@@ -4272,6 +4275,20 @@ extern "C" int ds4_gpu_end_commands(void) {
         return cuda_ok(cudaStreamSynchronize(0), "end commands stream");
     }
     return cuda_ok(cudaDeviceSynchronize(), "end commands");
+}
+extern "C" int ds4_gpu_end_commands_for_readback(void) {
+    /* CUDA begin/end_commands do not own a command buffer: launches have
+     * already been submitted to their streams.  Every caller of this entry
+     * immediately performs a synchronous cudaMemcpy(...DeviceToHost), which
+     * both waits for the producing work and reports an asynchronous failure.
+     * An extra cudaDeviceSynchronize here only drains the same work early.
+     *
+     * Keep a same-binary valve for exact A/Bs and for diagnosing a future
+     * caller that violates the immediate-blocking-read contract. */
+    if (g_cuda_no_defer_readback_end) {
+        return ds4_gpu_end_commands();
+    }
+    return 1;
 }
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
 
