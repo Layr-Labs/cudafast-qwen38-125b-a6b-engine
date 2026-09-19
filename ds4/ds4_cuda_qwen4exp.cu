@@ -16054,6 +16054,18 @@ static uint32_t qwen4exp_qsa_wave_sms(void) {
  * off, DS4_QWEN4EXP_QSA_SPLIT_GROUP sets the width.  Read fresh for the same
  * reason qwen4exp_qsa_group_width is; a decode row pays one getenv per layer
  * and a captured one pays it once at capture. */
+/* How many divisors above the smallest wave-fitting width to take. 0 is the
+ * one-wave rule exactly as first shipped and measured at +0.770% box-normalized
+ * decode, which is the best of my seven draws, so 0 is what this submission
+ * ships. The knob stays because the ladder above it is enumerated and testable:
+ * at one row and max_tiles = 5 the widths that fit the wave are g = 3 (40 live
+ * blocks, each K row pulled 8x), 4 (30 blocks, 6x) and 6 (20 blocks, 4x). If
+ * fewer widths fit than STEPS asks for, the widest fitting one stands, so the
+ * knob can never overflow the wave or the 48 KiB shared cap. */
+#ifndef QWEN4EXP_QSA_SPLIT_WIDTH_STEPS
+#define QWEN4EXP_QSA_SPLIT_WIDTH_STEPS 0u
+#endif
+
 static uint32_t qwen4exp_qsa_split_width(uint32_t n_tokens, uint32_t n_head,
                                          uint32_t n_kv_head, uint32_t head_dim,
                                          uint32_t max_tiles) {
@@ -16146,6 +16158,19 @@ static uint32_t qwen4exp_qsa_split_width(uint32_t n_tokens, uint32_t n_head,
             /* Guard two: only a shipped width that overflows the wave is
              * reconsidered.  <= nsm means it already fits and stands. */
             if (shipped_blocks > (uint64_t)nsm) {
+                /* "Smallest g that fits one wave" is an ARGUMENT, not a
+                 * measurement: it assumes that once the partial-wave tail is
+                 * gone, parallelism beats L2 reuse. Stepping one divisor up
+                 * keeps the single wave and pulls each K row n_head/g times
+                 * fewer, at the cost of leaving SMs idle -- at one row and
+                 * max_tiles 5 the fitting widths are 3, 4 and 6, i.e. 40, 30
+                 * and 20 live blocks on 48 SMs. STEPS makes that a knob so it
+                 * can be measured instead of asserted. STEPS = 0 reproduces
+                 * the rule byte for byte; if fewer widths fit than STEPS asks
+                 * for, the largest fitting width stands, so the knob can never
+                 * propose a width that overflows the wave or the shared cap. */
+                uint32_t steps = 0u;
+                uint32_t widest = 0u;
                 for (uint32_t g = 1u; g <= gqa; g++) {
                     if ((gqa % g) != 0u) continue;
                     if (!qwen4exp_qsa_split_shared_fits(g, head_dim, NULL,
@@ -16154,9 +16179,12 @@ static uint32_t qwen4exp_qsa_split_width(uint32_t n_tokens, uint32_t n_head,
                     }
                     if ((uint64_t)(n_head / g) * (uint64_t)max_tiles *
                             (uint64_t)n_tokens <= (uint64_t)nsm) {
-                        return g;
+                        widest = g;
+                        if (steps >= QWEN4EXP_QSA_SPLIT_WIDTH_STEPS) return g;
+                        steps++;
                     }
                 }
+                if (widest != 0u) return widest;
             }
         }
         /* The shipped width fits, no width fits, or the SM count did not
@@ -16255,22 +16283,60 @@ static int qwen4exp_qsa_attention_split(
      * reach before, once per split launch. Those are capture-time or eager-side
      * calls -- decode replays graphs -- so at 48 layers it is a few microseconds
      * of prefill against a 621.6 ms leg, which is 0.02 bips. */
-#define QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH(G)                                 \
+/* The depth is a per-(row count, width) choice, so the macro takes it. Width 2
+ * keeps the depth the previous author measured, 8, byte for byte. The widths
+ * only the one-wave rule can reach carry QWEN4EXP_QSA_SPLIT_ROWDEPTH_WIDE,
+ * which is the knob this submission sweeps: 8 was never measured at GROUP 3
+ * either, it was only the safer of two guesses, and `contrib[GROUP]` is one
+ * register deeper there than at GROUP 2. Going shallower trades value-load
+ * parallelism for registers; going deeper trades the other way. Either result
+ * is information, and neither can move a token: both the strided loop and its
+ * scalar tail accumulate contrib[h] with __fmaf_rn in strictly ascending j for
+ * any depth, so every depth is bit-identical. */
+/* MEASURED, three points on one box-normalized scale: depth 4 read +0.286%,
+ * depth 8 +0.770%, depth 16 +0.590% against the pooled per-box decode-ratio
+ * median. An interior maximum, so 8 it is -- the same value the previous
+ * author measured at GROUP 2, which is mildly reassuring about the hoist. */
+#ifndef QWEN4EXP_QSA_SPLIT_ROWDEPTH_WIDE
+#define QWEN4EXP_QSA_SPLIT_ROWDEPTH_WIDE 8u
+#endif
+/* The row-count ceiling the reduced depth applies to. 1 is the predicate
+ * exactly as shipped: the depth was measured at ONE row, so it was gated at one
+ * row. But live decode is n_tokens in {1, 2} -- one row per draft step and two
+ * rows for the verify leg -- and the two-row leg is the one the reduced depth
+ * was never offered, because it takes g = 6 at every tile count and therefore
+ * lands on the default depth 16.
+ *
+ * That is the deepest live set anywhere in this kernel: a[16] + contrib[6] = 22
+ * floats held across the load batch, against a[8] + contrib[2] = 10 at the
+ * configuration where 8 was measured to beat 16. So if the measured win at one
+ * row came from register pressure rather than from anything about one row, the
+ * two-row leg should want it more, not less. If it came from value-load
+ * parallelism that two rows already supply, this reads negative and the
+ * predicate goes back to == 1 permanently. Either way it is one comparison, it
+ * cannot move a token, and it leaves prefill alone: n_tokens 3 and 1024 take
+ * g = 4 and this predicate excludes them. */
+#ifndef QWEN4EXP_QSA_SPLIT_ROWDEPTH_MAXROWS
+#define QWEN4EXP_QSA_SPLIT_ROWDEPTH_MAXROWS 2u
+#endif
+#define QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH(G, D)                              \
     do {                                                                      \
-        if (!sparse && n_tokens == 1u && n_head == 24u &&                     \
+        if (!sparse && n_tokens >= 1u &&                                      \
+            n_tokens <= QWEN4EXP_QSA_SPLIT_ROWDEPTH_MAXROWS &&                \
+            n_head == 24u &&                                                  \
             n_kv_head == 2u && head_dim == 256u &&                            \
             getenv("DS4_QWEN4EXP_NO_QSA_SHORT_V") == NULL) {                  \
-            QWEN4EXP_QSA_SPLIT_LAUNCH(G, 8u);                                 \
+            QWEN4EXP_QSA_SPLIT_LAUNCH(G, (D));                                \
         } else {                                                              \
             QWEN4EXP_QSA_SPLIT_LAUNCH(G, QWEN4EXP_QSA_SPLIT_VSTEP);           \
         }                                                                     \
     } while (0)
     switch (g) {
         case 12u: QWEN4EXP_QSA_SPLIT_LAUNCH(12u, QWEN4EXP_QSA_SPLIT_VSTEP); break;
-        case 6u:  QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH(6u);  break;
-        case 4u:  QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH(4u);  break;
-        case 3u:  QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH(3u);  break;
-        case 2u:  QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH(2u);  break;
+        case 6u:  QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH(6u, QWEN4EXP_QSA_SPLIT_ROWDEPTH_WIDE);  break;
+        case 4u:  QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH(4u, QWEN4EXP_QSA_SPLIT_ROWDEPTH_WIDE);  break;
+        case 3u:  QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH(3u, QWEN4EXP_QSA_SPLIT_ROWDEPTH_WIDE);  break;
+        case 2u:  QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH(2u, 8u);  break;
         case 1u:  QWEN4EXP_QSA_SPLIT_LAUNCH(1u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
         default:  return 0;
     }
