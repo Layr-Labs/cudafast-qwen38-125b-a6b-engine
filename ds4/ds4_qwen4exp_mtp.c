@@ -3,10 +3,6 @@
  * See ds4_qwen4exp_mtp.h for the contract this implements.
  */
 
-/* Composition draw fd9ef08906: this tree is byte-identical in code to the three-arm
- * composition (deferred invalid readback, fused ehx pack-quantize, target screen
- * 24 groups / cap 16384).  Comment only, so the scored difference against the
- * sibling draws of this same code is an instrument reading, not an effect. */
 #include "ds4_qwen4exp_mtp.h"
 
 #include <errno.h>
@@ -1176,19 +1172,16 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
     uint64_t tmark = timing ? mtp_now_ns() : 0;
 
     /* The ids the embedding gather reads.  int is the caller's type; the
-     * kernel takes int32, and the two agree on every target this builds for. */
-    int32_t ids_stack[DS4_QWEN4EXP_MTP_CACHE_SEED_MAX_ROWS];
-    int32_t *ids = ids_stack;
-    if (n_tokens > sizeof(ids_stack) / sizeof(ids_stack[0])) {
-        ids = malloc((size_t)n_tokens * sizeof(int32_t));
-        if (!ids) return mtp_fail(err, errlen, "qwen4exp MTP head: out of memory");
-    }
-    for (uint32_t t = 0; t < n_tokens; t++) ids[t] = (int32_t)next_tokens[t];
+     * kernel takes int32, and the two agree on every target this builds for,
+     * so the caller's array is already the upload buffer -- copying it into
+     * a staging array was pure host overhead on the draft path. */
+    _Static_assert(sizeof(int) == sizeof(int32_t),
+                   "qwen4exp MTP head: token ids must be 32-bit");
+    const int32_t *ids = (const int32_t *)next_tokens;
 
     const char *stage = "token upload";
     bool ok = ds4_gpu_tensor_write(h->t_tokens, 0, ids,
                                    (uint64_t)n_tokens * sizeof(int32_t)) != 0;
-    if (ids != ids_stack) free(ids);
     MTP_HEAD_TICK(MTP_HEAD_T_TOKEN);
     if (ok) {
         stage = "multi-stream upload";
@@ -1235,71 +1228,33 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
      * against it yields fc_embedding(e) + fc_hidden(h_s) for every stream. */
     if (ok) {
         stage = "eh_proj rows";
-        /* PROVENANCE: the fused pack-quantize kernel and this call site are not
-         * original to this submission.  They come from the arm that four other
-         * solvers on this benchmark independently drew twenty times (the
-         * earliest tree carrying it that I could find is 3fc37386); I composed
-         * it here unchanged with the deferred-invalid readback from i34-9's
-         * 077d66d9 and my own 24/16384 target-screen retune.  Grouping all 167
-         * scored draws since the promoted base by whether they carry this arm
-         * gives a median 0.396% above the code-identical redraw population,
-         * which is the largest supported shift of any arm on the board -- not
-         * significant on its own (Mann-Whitney p=0.12), but the best-evidenced
-         * single change available, and no tree had yet combined it with either
-         * of the other two.
-         *
-         * The fused path quantizes the packed rows straight into the
-         * prequantized matmul's layout, skipping the F32 staging tensor and
-         * the quantize launch; the bytes the matmul reads are identical. */
-        const int ehx_fused = h->hooks.ehx_pack_quant &&
-            h->hooks.matmul_q8_0_preq && (n_embd & 15u) == 0u;
-        if (ehx_fused) {
-            const uint64_t ehx_rows = (uint64_t)n_tokens * n_hc;
-            const uint64_t ehx_blocks = (2ull * n_embd) / 32u;
-            const uint64_t ehx_soff =
-                (ehx_rows * ehx_blocks * 32u + 15u) & ~15ull;
-            ok = h->hooks.ehx_pack_quant(
-                     h->t_ehx, 0u, ehx_soff, h->t_e_normed, h->t_h_normed,
-                     n_tokens, n_hc, n_embd) != 0;
-            MTP_HEAD_TICK(MTP_HEAD_T_EHX);
-            if (ok) {
-                stage = "eh_proj";
-                ok = h->hooks.matmul_q8_0_preq(
-                         h->t_hyper, h->head_map, h->head_size,
-                         h->eh_proj_offset, 2ull * n_embd, n_embd,
-                         h->t_ehx, 0u, ehx_soff, ehx_rows) != 0;
-            }
-            MTP_HEAD_TICK(MTP_HEAD_T_EH_PROJ);
+        if (h->hooks.ehx_pack) {
+            ok = h->hooks.ehx_pack(h->t_ehx, h->t_e_normed, h->t_h_normed,
+                                   n_tokens, n_hc, n_embd) != 0;
         } else {
-            if (h->hooks.ehx_pack) {
-                ok = h->hooks.ehx_pack(h->t_ehx, h->t_e_normed, h->t_h_normed,
-                                       n_tokens, n_hc, n_embd) != 0;
-            } else {
-                for (uint32_t t = 0; ok && t < n_tokens; t++) {
-                    for (uint32_t s = 0; ok && s < n_hc; s++) {
-                        const uint64_t dst =
-                            ((uint64_t)t * n_hc + s) * 2ull * embd_bytes;
-                        ok = ds4_gpu_tensor_copy(
-                                 h->t_ehx, dst, h->t_e_normed,
-                                 (uint64_t)t * embd_bytes, embd_bytes) != 0 &&
-                             ds4_gpu_tensor_copy(
-                                 h->t_ehx, dst + embd_bytes, h->t_h_normed,
-                                 ((uint64_t)t * hc_dim + (uint64_t)s * n_embd) * f,
-                                 embd_bytes) != 0;
-                    }
+            for (uint32_t t = 0; ok && t < n_tokens; t++) {
+                for (uint32_t s = 0; ok && s < n_hc; s++) {
+                    const uint64_t dst =
+                        ((uint64_t)t * n_hc + s) * 2ull * embd_bytes;
+                    ok = ds4_gpu_tensor_copy(
+                             h->t_ehx, dst, h->t_e_normed,
+                             (uint64_t)t * embd_bytes, embd_bytes) != 0 &&
+                         ds4_gpu_tensor_copy(
+                             h->t_ehx, dst + embd_bytes, h->t_h_normed,
+                             ((uint64_t)t * hc_dim + (uint64_t)s * n_embd) * f,
+                             embd_bytes) != 0;
                 }
             }
-            MTP_HEAD_TICK(MTP_HEAD_T_EHX);
-            if (ok) {
-                stage = "eh_proj";
-                ok = h->hooks.matmul_q8_0(h->t_hyper, h->head_map, h->head_size,
-                                          h->eh_proj_offset, 2ull * n_embd,
-                                          n_embd, h->t_ehx,
-                                          (uint64_t)n_tokens * n_hc) != 0;
-            }
-            MTP_HEAD_TICK(MTP_HEAD_T_EH_PROJ);
         }
     }
+    MTP_HEAD_TICK(MTP_HEAD_T_EHX);
+    if (ok) {
+        stage = "eh_proj";
+        ok = h->hooks.matmul_q8_0(h->t_hyper, h->head_map, h->head_size,
+                                  h->eh_proj_offset, 2ull * n_embd, n_embd,
+                                  h->t_ehx, (uint64_t)n_tokens * n_hc) != 0;
+    }
+    MTP_HEAD_TICK(MTP_HEAD_T_EH_PROJ);
     if (ok) {
         stage = "block";
         ds4_qwen4exp_block_forward_fn block = cache_only
