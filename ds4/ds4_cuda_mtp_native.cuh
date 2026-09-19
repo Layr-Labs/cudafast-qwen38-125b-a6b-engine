@@ -13,9 +13,27 @@ static constexpr uint32_t MTP_NATIVE_DIM = 2560u;
 static constexpr uint32_t MTP_NATIVE_SCREEN_GROUPS = 24u;
 /* Target verification needs substantially stronger recall than the draft
  * proposal.  R2 still streams these groups once for both rows, while a wider
- * exact shortlist protects hidden top-logit checks. */
+ * exact shortlist protects hidden top-logit checks.
+ *
+ * The screen depth is 32, not 40, because 32 is the ONE point where this
+ * kernel's group map has no waste.  A row is 64 lanes = 32 groups = 2 warps,
+ * and the loop is `for (b = group; b < work_blocks; b += 32)`.  At
+ * work_blocks == 40 the eight groups 0..7 -- all of them inside warp 0 -- take
+ * a SECOND iteration that warp 1 does not, and its `live_pairs` mask comes out
+ * 8 of 16, so that whole second pass runs a half-empty warp.  The row cannot
+ * retire until warp 0 finishes, so 40 groups buys 25% more screen depth for
+ * 100% more inner-loop latency.  At work_blocks == 32 every group takes
+ * exactly one iteration, `live_pairs` is 16 for both warps, and the coarse
+ * pass reads 32/80 of each row instead of 40/80.
+ *
+ * Recall is still strictly wider than the draft screen that ships above and
+ * passes the golden gate today: 32 groups against its 24, over an exact
+ * shortlist of 8192 against its 2048.  The shortlist is untouched, so this
+ * changes the coarse PROPOSAL only -- every retained row is still recomputed
+ * by the ordinary exact Q8 dot over all 80 groups and scattered back to its
+ * own id, exactly as before. */
 static constexpr uint32_t MTP_TARGET_NATIVE_CAP = 8192u;
-static constexpr uint32_t MTP_TARGET_NATIVE_SCREEN_GROUPS = 40u;
+static constexpr uint32_t MTP_TARGET_NATIVE_SCREEN_GROUPS = 32u;
 static constexpr uint32_t MTP_NATIVE_MAX_WIDTH = 1u << 20;
 template <bool Screen, bool EmitKeys = false>
 __global__ static void mtp_native_projection_kernel(
