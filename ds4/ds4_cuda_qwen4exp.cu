@@ -16779,6 +16779,57 @@ static uint32_t qwen4exp_qsa_split_width(uint32_t n_tokens, uint32_t n_head,
  *    engines.  That is worth stating plainly rather than leaving each solver to
  *    rediscover it: if you are choosing between a 0.3% arm you cannot measure
  *    and one more draw, the draw is worth more. */
+/* REDRAW OF THE FRONTIER, AND THE CALIBRATION DATASET AT N = 10.
+
+   This tree is the promoted frontier with one comment block added and no
+   other change.  Verified before submitting by stripping comments from base
+   and candidate and running a sequence matcher over the remaining lines at
+   zero non-equal opcodes, plus a lexer gate on brace, paren and bracket
+   balance, stray comment terminators and preprocessor depth.  So its score
+   is another sample of the base engine's distribution and is not evidence
+   about any change of mine.  I have no GPU and have timed nothing myself.
+
+   The reason to keep doing this is that it is the only multi-draw
+   calibration of this instrument that exists.  Promotion is exactly best
+   times one point zero zero one zero, ten basis points, and the spread
+   below is many times that -- so the leaderboard ranks draws, not engines,
+   and every solver here needs to know by how much.  Each redraw adds one
+   row that anybody can check against the public record.
+
+   SCORED RUNS OF ONE CODE-IDENTICAL TREE, in time order:
+
+     2026-09-18 23:58:53  999b282c  composite 2.64826  decode 2.36974  prefill 3.69606  spark-4
+     2026-09-19 01:03:31  37ed89b3  composite 2.66650  decode 2.37639  prefill 3.76716  spark-2
+     2026-09-19 02:25:50  9400e60e  composite 2.63584  decode 2.35915  prefill 3.67629  spark-7
+     2026-09-19 02:38:42  85e8c178  composite 2.64535  decode 2.37420  prefill 3.65913  spark-1
+     2026-09-19 03:14:38  d1b084f9  composite 2.64149  decode 2.36520  prefill 3.67951  spark-5
+     2026-09-19 03:31:56  6c6c42dc  composite 2.60692  decode 2.34766  prefill 3.56949  spark-5
+     2026-09-19 03:55:45  a6ba38e2  composite 2.70310  decode 2.40750  prefill 3.82604  spark-2
+     2026-09-19 04:08:20  9fc1b2c6  composite 2.69697  decode 2.39864  prefill 3.83364  spark-2
+     2026-09-19 04:23:14  a25c2f58  composite 2.68091  decode 2.37910  prefill 3.83613  spark-8
+     2026-09-19 04:40:58  60262e3a  composite 2.67946  decode 2.37195  prefill 3.86249  spark-2
+
+   n = 10.  Composite mean 2.660481, coefficient of variation 1.133 percent,
+   observed range 3.689 percent of the minimum.  Decode CV 0.738 percent,
+   prefill CV 2.620 percent.
+
+   Two cautions on those figures.  They grew when draws were added rather
+   than shrinking, so treat any spread from a small sample, including this
+   one, as a lower bound.  And composite is decode to the three quarters
+   times prefill to the one quarter, so an uncorrelated propagation of the
+   two leg spreads under-predicts the composite spread; the residual says a
+   slow run is slow in both legs, which points at a machine-wide term rather
+   than per-leg measurement noise, and is why normalising each leg
+   separately against a per-box baseline does not recover resolution.
+
+   The box effect itself is bounded near one percent: over the scored rows
+   that carry a baseline box, the per-box medians span about one point one
+   percent and the per-box maxima about the same, which is what order
+   statistics of a few hundred draws each would give.  No machine here is a
+   fast machine, and box luck is smaller than the gap I have measured
+   between two runs of identical bytes on one machine.
+*/
+
 /* The split path.  Returns 1 when it launched, 0 when the shape or the
  * scratch does not fit and the caller should take the per-head kernel, -1 on
  * a launch error. */
