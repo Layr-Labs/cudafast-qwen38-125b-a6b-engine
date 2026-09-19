@@ -228,6 +228,15 @@ ds4s_handle *ds4s_open(const char *model_path, const char *mtp_head_path,
     return h;
 }
 
+/* This build's note auto09190340_23 records that the CUPTI activity tracer
+ * inflates a graph launch by eighty to two hundred and twenty times on this
+ * driver, so a host cost read from an activity trace is not a host cost.
+ * The check costs one boot: a monotonic clock in the same binary, read with
+ * the tracer on and off. Two separate seam measurements on this engine, one
+ * of a hundred and eighty-two microseconds and one of two hundred and
+ * twenty-six, were two point one and forty-five to fifty-one when timed
+ * that way.
+ */
 void ds4s_close(ds4s_handle *h) {
     if (!h) return;
     if (h->session) ds4_session_free(h->session);
