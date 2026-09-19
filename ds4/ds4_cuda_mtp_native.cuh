@@ -314,7 +314,8 @@ static bool mtp_native_key_range_disjoint(const void *a, uint64_t an,
 extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
         ds4_gpu_tensor *ids, ds4_gpu_tensor *scratch, const void *map,
         uint64_t map_bytes, uint64_t offset, uint32_t in_dim, uint32_t vocab,
-        uint32_t prefix, uint32_t tail, const ds4_gpu_tensor *x) {
+        uint32_t prefix, uint32_t tail, const ds4_gpu_tensor *x,
+        int defer_invalid) {
     const uint64_t wide = (uint64_t)prefix + tail;
     if (in_dim != MTP_NATIVE_DIM || !prefix || !tail || tail >= MTP_NATIVE_CAP ||
         prefix > vocab || tail > vocab - prefix || wide <= MTP_NATIVE_CAP ||
@@ -370,9 +371,13 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
             key_in,flag,scores,width,prefix,tail,vocab);
         if (!cuda_ok(cudaGetLastError(),"native screen keys")) return -1;
     }
-    uint32_t invalid = 0;
-    if (!ds4_gpu_tensor_read(scratch,l.flag,&invalid,4)) return -1;
-    if (invalid) return 0;
+    defer_invalid = defer_invalid &&
+        getenv("DS4_MTP_NO_DEFER_INVALID_FLAG") == nullptr;
+    if (!defer_invalid) {
+        uint32_t invalid = 0;
+        if (!ds4_gpu_tensor_read(scratch,l.flag,&invalid,4)) return -1;
+        if (invalid) return 0;
+    }
     size_t temporary = (size_t)(scratch->bytes-l.temporary);
     /* Rank on the high score word alone. Keys are written in row order, so
      * original IDs strictly increase over the whole input and the packed low
@@ -426,7 +431,8 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
 extern "C" int ds4_gpu_mtp_native_screen2(ds4_gpu_tensor *out,
         ds4_gpu_tensor *ids, ds4_gpu_tensor *scratch, const void *map,
         uint64_t map_bytes, uint64_t offset, uint32_t in_dim, uint32_t vocab,
-        uint32_t prefix, uint32_t tail, const ds4_gpu_tensor *x) {
+        uint32_t prefix, uint32_t tail, const ds4_gpu_tensor *x,
+        int defer_invalid) {
     const uint64_t wide = (uint64_t)prefix + tail;
     if (in_dim != MTP_NATIVE_DIM || !prefix || !tail ||
         tail >= MTP_TARGET_NATIVE_CAP || prefix > vocab ||
@@ -508,9 +514,13 @@ extern "C" int ds4_gpu_mtp_native_screen2(ds4_gpu_tensor *out,
         }
         if (!cuda_ok(cudaGetLastError(), "native R2 screen keys")) return -1;
     }
-    uint32_t invalid = 0;
-    if (!ds4_gpu_tensor_read(scratch, l.flag, &invalid, 4)) return -1;
-    if (invalid) return 0;
+    defer_invalid = defer_invalid &&
+        getenv("DS4_MTP_NO_DEFER_INVALID_FLAG") == nullptr;
+    if (!defer_invalid) {
+        uint32_t invalid = 0;
+        if (!ds4_gpu_tensor_read(scratch, l.flag, &invalid, 4)) return -1;
+        if (invalid) return 0;
+    }
 
     int id_bits = 1;
     while (id_bits < 32 && ((uint32_t)1u << id_bits) < vocab) id_bits++;
@@ -550,23 +560,36 @@ extern "C" int ds4_gpu_mtp_native_screen2(ds4_gpu_tensor *out,
     return (int)MTP_TARGET_NATIVE_CAP;
 }
 __global__ static void mtp_native_map(uint32_t *winner, const float *logits,
-                                      const uint32_t *ids, uint32_t count, uint32_t vocab) {
+                                      const uint32_t *ids, const uint32_t *invalid,
+                                      uint32_t count, uint32_t vocab) {
     const uint32_t bits = __float_as_uint(logits[0]);
     const uint32_t packed = (bits & 0x7fffffffu) > 0x7f800000u ? 0u : winner[0];
     const uint32_t original = packed < count ? ids[packed] : UINT32_MAX;
     winner[0] = original < vocab ? original : UINT32_MAX;
+    if (invalid) winner[1] = *invalid;
 }
 extern "C" int ds4_gpu_mtp_native_map(ds4_gpu_tensor *winner,
         const ds4_gpu_tensor *logits, const ds4_gpu_tensor *ids,
-        uint32_t count, uint32_t vocab) {
+        const ds4_gpu_tensor *scratch, uint32_t count, uint32_t vocab,
+        uint32_t screen_width, int defer_invalid) {
+    defer_invalid = defer_invalid &&
+        getenv("DS4_MTP_NO_DEFER_INVALID_FLAG") == nullptr;
+    const mtp_native_layout l = mtp_native_offsets(screen_width);
     if (!winner || !logits || !ids || count != MTP_NATIVE_CAP || !vocab ||
-        winner->bytes < 4 || logits->bytes < (uint64_t)count*4 || ids->bytes < (uint64_t)count*4) return 0;
+        winner->bytes < (defer_invalid ? 8u : 4u) ||
+        logits->bytes < (uint64_t)count*4 || ids->bytes < (uint64_t)count*4 ||
+        (defer_invalid && (!scratch || screen_width > MTP_NATIVE_MAX_WIDTH ||
+                           scratch->bytes < l.flag + sizeof(uint32_t)))) return 0;
     const int tier=ds4_tensor_device_idx(winner); int current=-1;
     if (tier<0 || tier>=g_n_gpus || ds4_tensor_device_idx(logits)!=tier ||
-        ds4_tensor_device_idx(ids)!=tier || cudaGetDevice(&current)!=cudaSuccess ||
+        ds4_tensor_device_idx(ids)!=tier ||
+        (defer_invalid && ds4_tensor_device_idx(scratch)!=tier) ||
+        cudaGetDevice(&current)!=cudaSuccess ||
         current!=g_gpu[tier].device_id) return 0;
     mtp_native_map<<<1,1,0,cuda_decode_stream()>>>((uint32_t *)winner->ptr,
-        (const float *)logits->ptr,(const uint32_t *)ids->ptr,count,vocab);
+        (const float *)logits->ptr,(const uint32_t *)ids->ptr,
+        defer_invalid ? (const uint32_t *)((const char *)scratch->ptr + l.flag) : nullptr,
+        count,vocab);
     return cuda_ok(cudaGetLastError(),"native original winner map");
 }
 
@@ -608,8 +631,10 @@ extern "C" int ds4_gpu_mtp_native_scatter(ds4_gpu_tensor *out,
 
 __global__ static void mtp_native_scatter2_kernel(
         float *out, const float *values, const uint32_t *ids,
+        const uint32_t *invalid, uint32_t *winner,
         uint32_t count, uint32_t vocab) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i == 0u && invalid) winner[2] = *invalid;
     if (i >= 2u * count) return;
     const uint32_t r = i >= count;
     const uint32_t j = i - r * count;
@@ -621,21 +646,34 @@ __global__ static void mtp_native_scatter2_kernel(
 
 extern "C" int ds4_gpu_mtp_native_scatter2(ds4_gpu_tensor *out,
         const ds4_gpu_tensor *values, const ds4_gpu_tensor *ids,
-        uint32_t count, uint32_t vocab) {
+        const ds4_gpu_tensor *scratch, ds4_gpu_tensor *winner,
+        uint32_t count, uint32_t vocab, uint32_t screen_width,
+        int defer_invalid) {
+    defer_invalid = defer_invalid &&
+        getenv("DS4_MTP_NO_DEFER_INVALID_FLAG") == nullptr;
+    const mtp_native_layout2 l = mtp_native_offsets2(screen_width);
     if (!out || !values || !ids || !count || !vocab ||
         out->bytes < 2ull * vocab * sizeof(float) ||
         values->bytes < 2ull * count * sizeof(float) ||
-        ids->bytes < 2ull * count * sizeof(uint32_t)) return 0;
+        ids->bytes < 2ull * count * sizeof(uint32_t) ||
+        (defer_invalid && (!scratch || !winner ||
+                           screen_width > MTP_NATIVE_MAX_WIDTH ||
+                           scratch->bytes < l.flag + sizeof(uint32_t) ||
+                           winner->bytes < 3u * sizeof(uint32_t)))) return 0;
     const int tier = ds4_tensor_device_idx(out);
     int current = -1;
     if (tier < 0 || tier >= g_n_gpus ||
         ds4_tensor_device_idx(values) != tier ||
         ds4_tensor_device_idx(ids) != tier ||
+        (defer_invalid && (ds4_tensor_device_idx(scratch) != tier ||
+                           ds4_tensor_device_idx(winner) != tier)) ||
         cudaGetDevice(&current) != cudaSuccess ||
         current != g_gpu[tier].device_id) return 0;
     mtp_native_scatter2_kernel<<<(2u * count + 255u) / 256u, 256, 0,
             cuda_decode_stream()>>>(
         (float *)out->ptr, (const float *)values->ptr,
-        (const uint32_t *)ids->ptr, count, vocab);
+        (const uint32_t *)ids->ptr,
+        defer_invalid ? (const uint32_t *)((const char *)scratch->ptr + l.flag) : nullptr,
+        defer_invalid ? (uint32_t *)winner->ptr : nullptr, count, vocab);
     return cuda_ok(cudaGetLastError(), "native target R2 scatter");
 }
