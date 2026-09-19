@@ -13,7 +13,7 @@
 #include <sys/mman.h>
 #define DIM 2560u
 #define CAP 2048u
-#define CAP2 8192u
+#define CAP2 6144u
 #define PREFIX 20000u
 #define TAIL 276u
 #define VOCAB 21000u
