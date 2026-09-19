@@ -38397,4 +38397,4 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
 #include "ds4_glm53_vision_gpu.cuh"
 #include "ds4_deepseek4_vision_gpu.cuh"
 
-#include "ds4_cuda_mtp_native.cuh"
+#include "ds4_cuda_mtp_screen.cuh"

@@ -1,5 +1,5 @@
 # Host ordering oracle for the native MTP screen score sort; no GPU, no CUDA,
-# no compiler. ds4/tests/test_mtp_native_key_oracle.py pins HOW keys are
+# no compiler. ds4/tests/test_mtp_key_oracle.py pins HOW keys are
 # produced (standalone and fused producers, IEEE and FTZ). This one pins WHAT
 # the production radix bit range must order: a stable descending sort on the
 # packed high score word alone (CUB bits [32,64)) reproduces the full 64-bit
@@ -9,7 +9,7 @@
 # key arrays and the selected IDs (unpack + ascending ID sort, the next two
 # production steps) for both orderings, over ties (including canonical signed
 # zero), finite specials and the mandatory zero/tail rows. Refined outputs are
-# an exact per-row function of the selected IDs (test_mtp_native_screen.c pins
+# an exact per-row function of the selected IDs (test_mtp_screen.c pins
 # them row-by-row against ordinary rows), so selected-ID parity is
 # refined-output parity. Non-finite scores never reach the sort: they raise
 # the invalid flag and the screen falls back first.
@@ -17,7 +17,7 @@ from pathlib import Path
 import random, re, struct
 
 repo = Path(__file__).resolve().parents[2]
-cuh = (repo/'ds4/ds4_cuda_mtp_native.cuh').read_text()
+cuh = (repo/'ds4/ds4_cuda_mtp_screen.cuh').read_text()
 cu = (repo/'ds4/ds4_cuda.cu').read_text()
 
 def radix_calls(text):
