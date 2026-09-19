@@ -121,6 +121,8 @@ static int g_cuda_decode_score8;
 static int g_cuda_no_decode_value512;
 static int g_cuda_no_top1;
 static int g_cuda_end_stream_sync;
+static int g_cuda_no_defer_readback_end;
+static int g_cuda_no_small_i32_write;
 static int g_cuda_no_setdevice_cache;
 static int g_cuda_exact_score_split_graph;
 static int g_cuda_exact_score_split_ldg;
@@ -271,6 +273,10 @@ static void cuda_decode_dispatch_env_refresh(void) {
     g_cuda_no_decode_value512 = getenv("DS4_CUDA_NO_DECODE_VALUE512") != NULL;
     g_cuda_no_top1 = getenv("DS4_CUDA_NO_TOP1") != NULL;
     g_cuda_end_stream_sync = getenv("DS4_CUDA_END_STREAM_SYNC") != NULL;
+    g_cuda_no_defer_readback_end =
+        getenv("DS4_CUDA_NO_DEFER_READBACK_END") != NULL;
+    g_cuda_no_small_i32_write =
+        getenv("DS4_CUDA_NO_SMALL_I32_WRITE") != NULL;
     g_cuda_no_setdevice_cache = getenv("DS4_CUDA_NO_SETDEVICE_CACHE") != NULL;
     g_cuda_exact_score_split_graph =
         getenv("DS4_CUDA_EXACT_SCORE_SPLIT_GRAPH") != NULL;
@@ -3715,6 +3721,94 @@ extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, con
     return ok;
 }
 
+__global__ static void tensor_write_i32_small_kernel(
+        int32_t *dst, int4 lo, int4 hi, uint32_t count) {
+    if (threadIdx.x != 0u || blockIdx.x != 0u) return;
+    if (count > 0u) dst[0] = lo.x;
+    if (count > 1u) dst[1] = lo.y;
+    if (count > 2u) dst[2] = lo.z;
+    if (count > 3u) dst[3] = lo.w;
+    if (count > 4u) dst[4] = hi.x;
+    if (count > 5u) dst[5] = hi.y;
+    if (count > 6u) dst[6] = hi.z;
+    if (count > 7u) dst[7] = hi.w;
+}
+
+extern "C" int ds4_gpu_tensor_write_i32_small(
+        ds4_gpu_tensor *tensor, const int32_t *data, uint32_t count) {
+    if (!tensor || !data || count == 0u ||
+        tensor->bytes < (uint64_t)count * sizeof(int32_t)) {
+        return 0;
+    }
+    if (count > 8u || g_cuda_no_small_i32_write) {
+        return ds4_gpu_tensor_write(tensor, 0, data,
+                                    (uint64_t)count * sizeof(int32_t));
+    }
+    int32_t packed[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    for (uint32_t i = 0; i < count; i++) packed[i] = data[i];
+    const int4 lo = make_int4(packed[0], packed[1], packed[2], packed[3]);
+    const int4 hi = make_int4(packed[4], packed[5], packed[6], packed[7]);
+    int ok = 0;
+    const int d = ds4_tensor_device_idx(tensor);
+    WITH_DEVICE(g_gpu[d].device_id) {
+        /* Values are copied into the launch parameter buffer before return;
+         * no host allocation remains live for the asynchronous kernel. */
+        /* Token publication happens before qwen's command batch/capture.
+         * Keep it on the legacy stream, whose ordering with the graph's
+         * deliberately blocking stream is the existing upload contract. */
+        tensor_write_i32_small_kernel<<<1, 1>>>(
+                (int32_t *)tensor->ptr, lo, hi, count);
+        ok = cuda_ok(cudaGetLastError(), "small i32 tensor write launch");
+    }
+    return ok;
+}
+
+__global__ static void qwen4exp_update_dpos_tokens_kernel(
+        uint32_t *d_pos, int32_t *tokens, uint32_t pos,
+        int4 lo, int4 hi, uint32_t count) {
+    if (threadIdx.x != 0u || blockIdx.x != 0u) return;
+    *d_pos = pos;
+    if (count > 0u) tokens[0] = lo.x;
+    if (count > 1u) tokens[1] = lo.y;
+    if (count > 2u) tokens[2] = lo.z;
+    if (count > 3u) tokens[3] = lo.w;
+    if (count > 4u) tokens[4] = hi.x;
+    if (count > 5u) tokens[5] = hi.y;
+    if (count > 6u) tokens[6] = hi.z;
+    if (count > 7u) tokens[7] = hi.w;
+}
+
+extern "C" int ds4_gpu_qwen4exp_update_dpos_tokens(
+        ds4_gpu_tensor *d_pos, ds4_gpu_tensor *tokens, uint32_t pos,
+        const int32_t *token_data, uint32_t n_tokens) {
+    if (!d_pos || !tokens || !token_data || n_tokens == 0u ||
+        d_pos->bytes < sizeof(uint32_t) ||
+        tokens->bytes < (uint64_t)n_tokens * sizeof(int32_t)) {
+        return 0;
+    }
+    if (n_tokens > 8u || g_cuda_no_small_i32_write) {
+        return ds4_gpu_tensor_write(tokens, 0, token_data,
+                                    (uint64_t)n_tokens * sizeof(int32_t)) &&
+               ds4_gpu_qwen4exp_update_dpos(d_pos, pos);
+    }
+    const int pd = ds4_tensor_device_idx(d_pos);
+    const int td = ds4_tensor_device_idx(tokens);
+    if (pd != td) return 0;
+    int32_t packed[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    for (uint32_t i = 0; i < n_tokens; i++) packed[i] = token_data[i];
+    const int4 lo = make_int4(packed[0], packed[1], packed[2], packed[3]);
+    const int4 hi = make_int4(packed[4], packed[5], packed[6], packed[7]);
+    int ok = 0;
+    WITH_DEVICE(g_gpu[pd].device_id) {
+        qwen4exp_update_dpos_tokens_kernel<<<1, 1, 0, cuda_decode_stream()>>>(
+                (uint32_t *)d_pos->ptr, (int32_t *)tokens->ptr,
+                pos, lo, hi, n_tokens);
+        ok = cuda_ok(cudaGetLastError(),
+                     "qwen4exp position/token update launch");
+    }
+    return ok;
+}
+
 extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     int d = ds4_tensor_device_idx(tensor);
@@ -4272,6 +4366,20 @@ extern "C" int ds4_gpu_end_commands(void) {
         return cuda_ok(cudaStreamSynchronize(0), "end commands stream");
     }
     return cuda_ok(cudaDeviceSynchronize(), "end commands");
+}
+extern "C" int ds4_gpu_end_commands_for_readback(void) {
+    /* CUDA begin/end_commands do not own a command buffer: launches have
+     * already been submitted to their streams.  Every caller of this entry
+     * immediately performs a synchronous cudaMemcpy(...DeviceToHost), which
+     * both waits for the producing work and reports an asynchronous failure.
+     * An extra cudaDeviceSynchronize here only drains the same work early.
+     *
+     * Keep a same-binary valve for exact A/Bs and for diagnosing a future
+     * caller that violates the immediate-blocking-read contract. */
+    if (g_cuda_no_defer_readback_end) {
+        return ds4_gpu_end_commands();
+    }
+    return 1;
 }
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
 

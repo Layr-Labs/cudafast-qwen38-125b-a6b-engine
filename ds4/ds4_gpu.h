@@ -52,6 +52,10 @@ uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
+/* Small token/control rows can ride in CUDA kernel parameters instead of a
+ * synchronising host-to-device memcpy.  Wider writes use tensor_write. */
+int ds4_gpu_tensor_write_i32_small(ds4_gpu_tensor *tensor,
+                                   const int32_t *data, uint32_t count);
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
@@ -108,6 +112,11 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
                                              const char *label);
 #endif
 int ds4_gpu_end_commands(void);
+/* End a command batch whose next operation is a blocking device-to-host
+ * tensor read.  CUDA's command batch is only a lexical boundary, so that
+ * read can own completion instead of paying a separate device fence first.
+ * Backends with a real command buffer retain their ordinary end operation. */
+int ds4_gpu_end_commands_for_readback(void);
 int ds4_gpu_synchronize(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
@@ -4069,6 +4078,15 @@ int  ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key);
 int  ds4_gpu_qwen4exp_update_dpos(
         ds4_gpu_tensor *d_pos,
         uint32_t        pos);
+/* Publish decode position and a small token row in one by-value CUDA launch.
+ * Wider rows and backends without that launch retain the two established
+ * operations. */
+int  ds4_gpu_qwen4exp_update_dpos_tokens(
+        ds4_gpu_tensor *d_pos,
+        ds4_gpu_tensor *tokens,
+        uint32_t        pos,
+        const int32_t  *token_data,
+        uint32_t        n_tokens);
 
 int  ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key);
