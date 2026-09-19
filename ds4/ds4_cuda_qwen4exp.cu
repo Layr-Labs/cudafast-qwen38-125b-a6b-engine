@@ -4312,7 +4312,7 @@ __global__ static void qwen4exp_moe_group_scan_parallel_kernel(
 /* `lo` and `hi` select the experts whose pair count c satisfies lo < c <= hi
  * (the others contribute no windows), so one routing can be split into the
  * 32-pair tile's list and the heavy tile's list. */
-/* build record 20260919T203222Z-5 */
+/* build record 20260919T202249Z-4 */
 __global__ static void qwen4exp_moe_pair_tasks_kernel(
         int32_t *tasks, const int32_t *counts, unsigned total,
         int32_t tile = 32, int32_t lo = 0, int32_t hi = 0x7fffffff) {
@@ -17885,3 +17885,4 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
  * census shows produces a byte-identical capture log. */
 
 #define YUKON_REDRAW_10 10
+// redraw cba9e1af 20260919T210133Z
