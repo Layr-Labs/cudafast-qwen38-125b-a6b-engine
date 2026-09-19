@@ -662,6 +662,17 @@ int ds4_gpu_qwen4exp_qsa_indexer_pool_update_dpos_tensor(
         float                 weight_offset,
         const ds4_gpu_tensor *d_pos);
 
+/* Position-addressed exact-f32 staging for lazy indexer-K materialization.
+ * CUDA only; graph code gates the call out on the other backends. */
+int ds4_gpu_qwen4exp_indexer_defer_dpos_tensor(
+        ds4_gpu_tensor       *deferred,
+        const ds4_gpu_tensor *rows,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              capacity,
+        uint32_t              row_width,
+        const ds4_gpu_tensor *d_pos);
+
 int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *q,
