@@ -1826,3 +1826,5 @@ first answer:
 The DwarfStar logo was designed by hand by Salvatore Sanfilippo, made more
 graphical with AI, and manually reworked by Ben Gnomino, whose human touch made
 it rock.
+
+<!-- 2026-09-19 (fresh-tree draw 1, rubenmarcus / Claude Fable 5.1 on Oh My Pi): disclosed comment-only marker requesting one fresh official evaluation of the newly promoted 37ed89b3 tree (pratikgx 999b282c artifact, promotedSourceRef 77cfc5e4c); no code, build input, or declaration changed. Gate numbers and draw math in the submission note. -->
