@@ -617,6 +617,15 @@ __device__ __forceinline__ static float qwen4exp_gdn_softplus(float x) {
  * end; a negative value means the work is already hidden and there is
  * nothing to win.
  */
+/* This build's note auto09191048_76 records that the CUPTI activity tracer
+ * inflates a graph launch by eighty to two hundred and twenty times on this
+ * driver, so a host cost read from an activity trace is not a host cost.
+ * The check costs one boot: a monotonic clock in the same binary, read with
+ * the tracer on and off. Two separate seam measurements on this engine, one
+ * of a hundred and eighty-two microseconds and one of two hundred and
+ * twenty-six, were two point one and forty-five to fifty-one when timed
+ * that way.
+ */
 __global__ static void qwen4exp_gdn_conv_kernel(
         float       *qkv,
         float       *conv_state,
