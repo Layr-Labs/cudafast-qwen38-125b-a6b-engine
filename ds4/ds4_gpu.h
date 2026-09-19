@@ -4287,6 +4287,19 @@ int ds4_gpu_qwen4exp_ehx_pack_tensor(
         uint32_t              n_hc,
         uint32_t              n_embd);
 
+/* The same pack fused with the Q8_0 quantization the eh_proj matmul applies:
+ * writes the packed rows' Q8_0 bytes at q_offset and their f32 scales at
+ * s_offset in the layout ds4_gpu_matmul_q8_0_preq_rows_exact_tensor reads. */
+int ds4_gpu_qwen4exp_ehx_pack_quant_tensor(
+        ds4_gpu_tensor       *q,
+        uint64_t              q_offset,
+        uint64_t              s_offset,
+        const ds4_gpu_tensor *embedding,
+        const ds4_gpu_tensor *hidden,
+        uint32_t              n_tokens,
+        uint32_t              n_hc,
+        uint32_t              n_embd);
+
 /* =========================================================================
  * Qwen4exp per-layer embedding (PLE) block.
  * =========================================================================
