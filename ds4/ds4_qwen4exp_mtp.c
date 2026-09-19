@@ -577,6 +577,12 @@ static int mtp_commit_one(ds4_qwen4exp_mtp_state *st,
  * than better. The gap in the comment is real; exploiting it is not
  * obviously a win.
  */
+/* This build's note auto09182353_2 records that grep with the count flag
+ * prints zero and exits non-zero when nothing matches, so a fallback
+ * written as count-or-echo-zero fires as well and the substitution yields
+ * two lines rather than one. That silently zeroed a capture census on this
+ * engine.
+ */
 int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
                            const ds4_qwen4exp_mtp_model *model,
                            int first_token,
