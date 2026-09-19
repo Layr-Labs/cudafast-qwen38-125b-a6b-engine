@@ -617,6 +617,12 @@ __device__ __forceinline__ static float qwen4exp_gdn_softplus(float x) {
  * end; a negative value means the work is already hidden and there is
  * nothing to win.
  */
+/* This build's note auto09191028_74 records that two kernels with identical
+ * grids can still fail to fuse profitably: the fused body takes the higher
+ * register count of the two, and a hundred and thirty-six registers across
+ * two hundred and fifty-six threads exceeds half the register file, which
+ * turns one wave into two.
+ */
 __global__ static void qwen4exp_gdn_conv_kernel(
         float       *qkv,
         float       *conv_state,
@@ -4312,7 +4318,6 @@ __global__ static void qwen4exp_moe_group_scan_parallel_kernel(
 /* `lo` and `hi` select the experts whose pair count c satisfies lo < c <= hi
  * (the others contribute no windows), so one routing can be split into the
  * 32-pair tile's list and the heavy tile's list. */
-/* build record 20260919T203222Z-5 */
 __global__ static void qwen4exp_moe_pair_tasks_kernel(
         int32_t *tasks, const int32_t *counts, unsigned total,
         int32_t tile = 32, int32_t lo = 0, int32_t hi = 0x7fffffff) {
@@ -5941,7 +5946,6 @@ __device__ __forceinline__ static void qw_ldsm_x4(uint32_t *r, uint32_t addr) {
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(addr));
 }
 
-template <bool L2Ahead>
 __global__ __launch_bounds__(QW_GUH_THREADS, 2) static void
 qwen4exp_moe_gateup_heavy_kernel(
         int8_t *mq,
@@ -6061,20 +6065,6 @@ qwen4exp_moe_gateup_heavy_kernel(
     };
 
     const uint32_t nchunk = groups / 4u;
-    /* L2Ahead: the first header thread of each (projection, row) asks the
-     * L2 for the line chunk c + 3 copies from, while chunk c + 1's copies
-     * are in flight.  The copies of one chunk are 64-byte pieces of 128
-     * rows 1440 bytes apart; issued only one chunk ahead they leave the
-     * weight stream's DRAM latency exposed at every barrier.  A prefetch
-     * moves no data into the tile and changes no operand. */
-    auto l2_ahead = [&](uint32_t c) {
-        if (L2Ahead && h_half == 0u && h_live && c < nchunk) {
-            const char *p = h_rowp + (c >> 1) * 144u + (c & 1u) * 64u + 16u;
-            asm volatile("prefetch.global.L2 [%0];\n" :: "l"(p));
-        }
-    };
-    l2_ahead(1u);
-    l2_ahead(2u);
     load_hdr(0u);
     issue(0u);
     load_hdr(1u);
@@ -6099,7 +6089,6 @@ qwen4exp_moe_gateup_heavy_kernel(
         qw_cpasync_wait0();
         __syncthreads();
         if (c + 1u < nchunk) { issue(c + 1u); load_hdr(c + 2u); }
-        l2_ahead(c + 3u);
         const uint32_t st = smem0 + (c & 1u) * QW_GUH_STAGE;
         const unsigned char *stp = guh_smem + (c & 1u) * QW_GUH_STAGE;
         const float *wa = (const float *)(const void *)(stp + QW_GUH_OFF_WA);
@@ -9579,88 +9568,6 @@ extern "C" int ds4_gpu_qwen4exp_ehx_pack_tensor(
             (const float *)hidden->ptr, n_hc, n_embd);
     return cuda_ok(cudaGetLastError(), "qwen4exp ehx pack launch");
 }
-/* The pack above fused with the Q8_0 quantization the eh_proj matmul applies
- * to its output.  Row (t, s) is [e_normed(t) | h_normed(t, s)] quantized
- * group by group exactly as quantize_q8_0_f32_rows_warp_kernel quantizes the
- * packed row: the same warp fmaxf over the same thirty-two values, the same
- * divide by 127, the same lrintf and clamp, the same zero fill past the live
- * width.  The F32 staging tensor and its write-and-read round trip are gone;
- * the matmul reads this kernel's output through the prequantized entry, so
- * the eh_proj input is bit for bit what the two-kernel path produced. */
-__global__ static void qwen4exp_ehx_pack_quant_kernel(
-        int8_t *xq, float *xscale,
-        const float *embedding, const float *hidden,
-        uint32_t n_hc, uint32_t n_embd, uint64_t blocks, uint32_t n_rows) {
-    const uint64_t pair =
-        (uint64_t)blockIdx.x * (blockDim.x >> 5u) + (threadIdx.x >> 5u);
-    if (pair >= (uint64_t)n_rows * blocks) return;
-    const uint64_t row = pair / blocks;
-    const uint64_t b = pair - row * blocks;
-    const uint32_t lane = threadIdx.x & 31u;
-    const uint64_t i0 = b * 32u;
-    const uint64_t in_dim = 2ull * n_embd;
-    const uint64_t bn = in_dim - i0 < 32u ? in_dim - i0 : 32u;
-    const uint64_t k = i0 + lane;
-    const uint32_t t = (uint32_t)(row / n_hc);
-    const float xv = ((uint64_t)lane < bn)
-        ? (k < n_embd ? embedding[(uint64_t)t * n_embd + k]
-                      : hidden[row * n_embd + (k - n_embd)])
-        : 0.0f;
-    float a = fabsf(xv);
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-    }
-    const float d = a / 127.0f;
-    const float id = d != 0.0f ? 1.0f / d : 0.0f;
-    if (lane == 0u) xscale[pair] = d;
-    int8_t *dst = xq + pair * 32u;
-    if ((uint64_t)lane < bn) {
-        int v = (int)lrintf(xv * id);
-        v = v > 127 ? 127 : (v < -128 ? -128 : v);
-        dst[lane] = (int8_t)v;
-    } else {
-        dst[lane] = 0;
-    }
-}
-
-extern "C" int ds4_gpu_qwen4exp_ehx_pack_quant_tensor(
-        ds4_gpu_tensor       *q,
-        uint64_t              q_offset,
-        uint64_t              s_offset,
-        const ds4_gpu_tensor *embedding,
-        const ds4_gpu_tensor *hidden,
-        uint32_t              n_tokens,
-        uint32_t              n_hc,
-        uint32_t              n_embd) {
-    if (!q || !embedding || !hidden || n_tokens == 0u || n_hc == 0u ||
-        n_embd == 0u || (n_embd & 15u) != 0u) {
-        return 0;
-    }
-    const uint64_t rows = (uint64_t)n_tokens * n_hc;
-    const uint64_t blocks = (2ull * n_embd) / 32u;
-    const uint64_t qbytes = rows * blocks * 32u;
-    const uint64_t sbytes = rows * blocks * sizeof(float);
-    if ((q_offset & 15u) != 0u || (s_offset & 15u) != 0u ||
-        q_offset > q->bytes || s_offset > q->bytes ||
-        q->bytes - q_offset < qbytes || q->bytes - s_offset < sbytes ||
-        embedding->bytes < (uint64_t)n_tokens * n_embd * sizeof(float) ||
-        hidden->bytes < rows * n_embd * sizeof(float)) {
-        fprintf(stderr,
-                "ds4: CUDA qwen4exp ehx pack-quant received undersized buffers\n");
-        return 0;
-    }
-    int8_t *xq = (int8_t *)((char *)q->ptr + q_offset);
-    float *xscale = (float *)((char *)q->ptr + s_offset);
-    const uint64_t qpairs = rows * blocks;
-    const unsigned qgrid = (unsigned)((qpairs + 7u) / 8u);
-    qwen4exp_ehx_pack_quant_kernel<<<qgrid, 256, 0,
-            cuda_decode_stream()>>>(
-            xq, xscale, (const float *)embedding->ptr,
-            (const float *)hidden->ptr, n_hc, n_embd, blocks,
-            (uint32_t)rows);
-    return cuda_ok(cudaGetLastError(), "qwen4exp ehx pack-quant launch");
-}
 /* Scratch for one expert call: the Q8_0 activation prefix, then the pair
  * list and routed intermediate.  Laid out here so the sizes are visible
  * beside the kernels that read them.
@@ -10248,23 +10155,12 @@ static int qwen4exp_routed_moe_cuda(
             if (!cuda_ok(cudaGetLastError(), "qwen4exp gate/up pair tasks")) return 0;
         }
         if (gu_heavy) {
-            /* DS4_GU_HEAVY_L2AHEAD=0 launches the tile without the L2
-             * prefetch (the same instructions as before it existed). */
-            static int guh_ahead = -1;
-            if (guh_ahead < 0) {
-                const char *e = getenv("DS4_GU_HEAVY_L2AHEAD");
-                guh_ahead = (e == NULL || e[0] != '0') ? 1 : 0;
-            }
             static int guh_attr = 0;
             if (guh_attr == 0) {
-                guh_attr = (cudaFuncSetAttribute(
-                        qwen4exp_moe_gateup_heavy_kernel<true>,
+                guh_attr = cudaFuncSetAttribute(
+                        qwen4exp_moe_gateup_heavy_kernel,
                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                        (int)QW_GUH_SMEM) == cudaSuccess &&
-                            cudaFuncSetAttribute(
-                        qwen4exp_moe_gateup_heavy_kernel<false>,
-                        cudaFuncAttributeMaxDynamicSharedMemorySize,
-                        (int)QW_GUH_SMEM) == cudaSuccess) ? 1 : -1;
+                        (int)QW_GUH_SMEM) == cudaSuccess ? 1 : -1;
                 (void)cudaGetLastError();
             }
             if (guh_attr < 0) {
@@ -10276,8 +10172,7 @@ static int qwen4exp_routed_moe_cuda(
                     gu_tasks_heavy, sc.counts, n_total_expert, (int32_t)QW_GUH_BN,
                     32, 0x7fffffff);
             if (!cuda_ok(cudaGetLastError(), "qwen4exp gate/up heavy tasks")) return 0;
-            (guh_ahead ? qwen4exp_moe_gateup_heavy_kernel<true>
-                       : qwen4exp_moe_gateup_heavy_kernel<false>)<<<
+            qwen4exp_moe_gateup_heavy_kernel<<<
                     dim3(mid_dim / QW_GUH_BM, (unsigned)task_capacity, 1),
                     QW_GUH_THREADS, QW_GUH_SMEM, stream>>>(
                     sc.mq, sc.ms, sc.msum, gate, up, sc.xq, sc.xs, sc.xsum,
