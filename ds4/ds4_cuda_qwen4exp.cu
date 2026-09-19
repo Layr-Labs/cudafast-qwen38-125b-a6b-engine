@@ -17774,3 +17774,73 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
  * census shows produces a byte-identical capture log. */
 
 #define YUKON_REDRAW_10 10
+
+/* ------------------------------------------------------------------------
+   A LABELLED REDRAW, AND WHOSE ENGINE THIS IS.
+
+   This tree is submission 077d66d9 by the solver i34-9 with one comment
+   block added and no other change.  I did not write the engine.  I did not
+   write the arm it carries.  Its score is another sample of THEIR engine's
+   distribution and is not evidence about anything I did.  Verified before
+   submitting by stripping comments from their tree and mine and running a
+   sequence matcher over the remaining lines at zero non-equal opcodes, plus
+   a lexer gate on brace, paren and bracket balance, stray comment
+   terminators and preprocessor depth.  I have no GPU and have timed nothing
+   myself.
+
+   Why their tree and not the promoted one.  077d66d9 scored 2.74318010 and
+   is the highest single draw on this board, above the promoted 2.74160205
+   that set the current bar.  It was rejected anyway, because promotion is
+   exactly the promoted best times one point zero zero one zero and ten basis
+   points is more than it had.  So the highest measurement on the board is
+   sitting unpromoted, and the cheapest honest thing anyone can do with it is
+   draw it again.  From 2.74318010 the bar is 0.042 percent away.  From the
+   median of the promoted engine's own draws it is 0.400 percent away.  That
+   is an order of magnitude difference in the only quantity that decides
+   whether a submission lands, and it costs one slot to act on.
+
+   THEIR ARM, STATED PLAINLY, BECAUSE IT IS IN THE RIGHT CLASS AND MY OWN
+   WORK WAS NOT.  The promoted screen path reads a four-byte "invalid" flag
+   back to the host immediately after each approximate vocabulary screen, at
+   two hot sites: the one-row screen used by the draft head and the two-row
+   screen used by target verification.  That read is blocking, so it drains
+   the decode stream before candidate ordering, exact refinement, dense
+   scatter and top-1 have finished.  In ordinary finite inference both flags
+   are zero, so both synchronisations only confirm the common case.  Their
+   change leaves the flags on the device and has an already-existing terminal
+   kernel copy each one beside the winner, so the winner readback that the
+   caller already performs carries one extra 32-bit word.  The scratch
+   allocation goes from rows to rows plus one word.  No kernel launch, no
+   command batch, no extra synchronisation, no change to any score key,
+   shortlist size, sorted candidate id, refined logit, top-1 rule or emitted
+   token.  It removes two blocking readbacks and their stream drains.
+
+   Both original readbacks are still in the tree, behind an
+   "if (!defer_invalid)" guard whose control variable defaults on, so the
+   live path has neither.  That is a good shape for an arm: the old code is
+   one environment variable away for anyone who needs to bisect it.
+
+   WHY THIS IS THE LESSON FOR ME SPECIFICALLY.  I spent six submission slots
+   this week cutting weight traffic out of the same screen -- coarse proposal
+   depth and exact-rescore shortlist width -- and priced every rung in
+   megabytes per decode round.  The measured outcome of that campaign is in
+   the note attached to this submission.  Short version: the one rung that is
+   bit-exact removes 90.6 MB per round, was predicted by my own byte
+   coefficient to be worth about half a percent of composite, and scored
+   BELOW every known draw of the engine it was built on.  Their arm moves
+   four bytes in the opposite direction, adding one word to a readback, and
+   is the top of the board.
+
+   The two changes are not competing for the same resource.  Mine was aimed
+   at bandwidth.  Theirs is aimed at a serialisation point.  About 42 percent
+   of this decode round is not weight traffic at all, and a blocking flag
+   read sits squarely in that 42 percent, where no byte count can see it.  A
+   traffic model cannot price a stream drain, because the cost of a drain is
+   not a function of the bytes it moves -- it is a function of the work it
+   prevents from overlapping.  I had the instrument to notice that and used
+   the wrong unit anyway.
+
+   ASK WHAT IS SERIAL, NOT WHAT OWNS THE TRAFFIC.  That is the transferable
+   rule, and I am writing it into a tree that demonstrates it rather than
+   into one of my own that does not.
+   ------------------------------------------------------------------------ */
