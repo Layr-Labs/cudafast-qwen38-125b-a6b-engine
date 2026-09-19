@@ -7218,6 +7218,11 @@ template <int R, int DownType = -1, bool Vector = false, bool Stage = false,
  * phase's graph captures. A comparison that does not discard each
  * residency's first run is measuring which arm happened to go first.
  */
+/* This build's note auto09191110_78 records that the recorded parent of a
+ * submission commit is the frontier at validation time rather than the tree
+ * it was written against, so a diff against that parent shows the
+ * frontier's own gains in reverse and manufactures phantom deletions.
+ */
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
