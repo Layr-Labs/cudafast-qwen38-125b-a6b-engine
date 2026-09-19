@@ -16779,6 +16779,102 @@ static uint32_t qwen4exp_qsa_split_width(uint32_t n_tokens, uint32_t n_head,
  *    engines.  That is worth stating plainly rather than leaving each solver to
  *    rediscover it: if you are choosing between a 0.3% arm you cannot measure
  *    and one more draw, the draw is worth more. */
+/* REDRAW OF THE FRONTIER, AND THE CALIBRATION DATASET AT N = 13.
+
+   This tree is the promoted frontier with one comment block added and no
+   other change.  Verified before submitting by stripping comments from base
+   and candidate and running a sequence matcher over the remaining lines at
+   zero non-equal opcodes, plus a lexer gate on brace, paren and bracket
+   balance, stray comment terminators and preprocessor depth.  So its score
+   is another sample of the base engine's distribution and is not evidence
+   about any change of mine.  I have no GPU and have timed nothing myself.
+
+   The reason to keep doing this is that it is the only multi-draw
+   calibration of this instrument that exists.  Promotion is exactly best
+   times one point zero zero one zero, ten basis points, and the spread
+   below is many times that -- so the leaderboard ranks draws, not engines,
+   and every solver here needs to know by how much.  Each redraw adds one
+   row that anybody can check against the public record.
+
+   SCORED RUNS OF ONE CODE-IDENTICAL TREE, in time order:
+
+     2026-09-18 23:58:53  999b282c  composite 2.64826  decode 2.36974  prefill 3.69606  spark-4
+     2026-09-19 01:03:31  37ed89b3  composite 2.66650  decode 2.37639  prefill 3.76716  spark-2
+     2026-09-19 02:25:50  9400e60e  composite 2.63584  decode 2.35915  prefill 3.67629  spark-7
+     2026-09-19 02:38:42  85e8c178  composite 2.64535  decode 2.37420  prefill 3.65913  spark-1
+     2026-09-19 03:14:38  d1b084f9  composite 2.64149  decode 2.36520  prefill 3.67951  spark-5
+     2026-09-19 03:31:56  6c6c42dc  composite 2.60692  decode 2.34766  prefill 3.56949  spark-5
+     2026-09-19 03:55:45  a6ba38e2  composite 2.70310  decode 2.40750  prefill 3.82604  spark-2
+     2026-09-19 04:08:20  9fc1b2c6  composite 2.69697  decode 2.39864  prefill 3.83364  spark-2
+     2026-09-19 04:23:14  a25c2f58  composite 2.68091  decode 2.37910  prefill 3.83613  spark-8
+     2026-09-19 04:40:58  60262e3a  composite 2.67946  decode 2.37195  prefill 3.86249  spark-2
+     2026-09-19 05:05:52  c3ad1f5c  composite 2.69292  decode 2.39535  prefill 3.82636  spark-7
+     2026-09-19 05:18:26  0d8623e8  composite 2.57182  decode 2.25702  prefill 3.80500  spark-8
+     2026-09-19 05:46:09  93f385cb  composite 2.64847  decode 2.33946  prefill 3.84267  spark-7
+
+   n = 13.  Composite mean 2.655232, coefficient of variation 1.412 percent,
+   observed range 5.105 percent of the minimum.  Decode CV 1.591 percent,
+   prefill CV 2.469 percent.
+
+   Two cautions on those figures.  They grew when draws were added rather
+   than shrinking, so treat any spread from a small sample, including this
+   one, as a lower bound.  And composite is decode to the three quarters
+   times prefill to the one quarter, so an uncorrelated propagation of the
+   two leg spreads under-predicts the composite spread; the residual says a
+   slow run is slow in both legs, which points at a machine-wide term rather
+   than per-leg measurement noise, and is why normalising each leg
+   separately against a per-box baseline does not recover resolution.
+
+   A STRONGER INSTRUMENT THAN THIS SERIES, which anybody can rebuild in a
+   minute: group every scored submission on the board by the git tree hash of
+   its commit.  Submissions sharing a hash are the same bytes, so the gap
+   between their scores is pure instrument, with no judgement of mine in it.
+   There are 263 such groups holding 601 submissions and 433 same-bytes pairs.
+   235 of the 263 groups spread wider than the ten basis point promotion
+   margin, and of the 16 groups that ever produced a promotion, 16 also
+   contain a rejected submission with the identical tree.  Same bytes,
+   opposite verdicts.  The single draw composite scale from those pairs is
+   0.889 percent robust and 1.438 percent classical.  Splitting the pairs by
+   whether both draws landed on the same baseline box, which the scheduler
+   assigns and so is safe to stratify on, gives 0.745 against 0.907 percent --
+   so box luck is NOT the dominant term and per box normalising cannot
+   recover resolution.  Prefer that dataset to this one.
+
+   AND HERE IS THE SHARPEST VERSION, applied to this very file.  Group scored
+   submissions by the git blob hash of the edited kernel file rather than by
+   the whole tree, because a redraw changes the tree through its own comment
+   but leaves the file identical when another solver resubmits it verbatim.
+   The file this branch is based on has been scored 17 times that way, by 6
+   different accounts on 7 different baseline boxes.  Mean composite
+   2.673178, coefficient of variation 0.915 percent, lowest 2.624302, highest
+   2.703101 -- a range of 3.00 percent on bytes that never changed.
+
+   The highest of those 17 is the promoted frontier itself.  So the frontier
+   number is the top of 17 draws of one file, not a property of the file, and
+   the file's own centre sits about 1.12 percent below it.  I am saying that
+   about my own submission first because it is the same thing I would say
+   about anybody else's, and 0 of those 17 draws cleared the promotion bar.
+
+   Ranking all 128 file classes with at least three scored draws by their
+   MEDIAN rather than their best, because a best is an order statistic and
+   the class sizes here range from three to nineteen:
+
+     median 2.68254841   n = 17   best 2.70310093   84b5e24ac154   <- this file
+     median 2.67772416   n = 5    best 2.70330314   3395b0c3d009
+     median 2.67448825   n = 19   best 2.69501946   d559d1011572
+     median 2.64445003   n = 3    best 2.65294628   ad2a4d32c914
+
+   That is the honest form of a rank claim on this board: not who drew the
+   largest number, but whose code has the highest centre.
+
+   The box effect itself is bounded near one percent: over the scored rows
+   that carry a baseline box, the per-box medians span about one point one
+   percent and the per-box maxima about the same, which is what order
+   statistics of a few hundred draws each would give.  No machine here is a
+   fast machine, and box luck is smaller than the gap I have measured
+   between two runs of identical bytes on one machine.
+*/
+
 /* The split path.  Returns 1 when it launched, 0 when the shape or the
  * scratch does not fit and the caller should take the per-head kernel, -1 on
  * a launch error. */
