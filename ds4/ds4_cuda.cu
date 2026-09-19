@@ -21007,7 +21007,7 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
 
 /* K/V blocks precede the large Q grid. Each output retains its original
  * 32 float chains; paired integer partials combine exactly before scaling. */
-template<int R, bool Stage = false>
+template<int R, bool Stage = false, bool Fixed = false>
 __global__ static void qwen_q8_projection_triple_kernel(
         float *out0, float *out1, float *out2,
         const unsigned char *w0, const unsigned char *w1, const unsigned char *w2,
@@ -21016,20 +21016,26 @@ __global__ static void qwen_q8_projection_triple_kernel(
     extern __shared__ uint4 qw_tr_panel[];
     char *const gpanel = (char *)qw_tr_panel;
     constexpr bool SmallFirst=true, Streaming=false;
-    const uint32_t nb0=(uint32_t)((od0+3u)/4u), nb1=(uint32_t)((od1+3u)/4u), nb2=(uint32_t)((od2+3u)/4u);
+    const uint64_t nblocks=Fixed ? 80u : blocks;
+    const uint32_t nb0=Fixed ? 3072u : (uint32_t)((od0+3u)/4u);
+    const uint32_t nb1=Fixed ? 128u : (uint32_t)((od1+3u)/4u);
+    const uint32_t nb2=Fixed ? 128u : (uint32_t)((od2+3u)/4u);
     const uint32_t flat=SmallFirst ? (blockIdx.x<nb1+nb2 ? blockIdx.x+nb0 : blockIdx.x-nb1-nb2) : blockIdx.x;
     const unsigned which=flat<nb0 ? 0u : (flat<nb0+nb1 ? 1u : 2u);
     const uint32_t block=which==0u ? flat : (which==1u ? flat-nb0 : flat-nb0-nb1);
     float *out=which==0u ? out0 : (which==1u ? out1 : out2);
     const unsigned char *w=which==0u ? w0 : (which==1u ? w1 : w2);
-    const uint64_t out_dim=which==0u ? od0 : (which==1u ? od1 : od2);
+    const uint64_t out_dim=Fixed
+        ? (which==0u ? 12288u : 512u)
+        : (which==0u ? od0 : (which==1u ? od1 : od2));
     const uint32_t local_row = threadIdx.x >> 6u;
     const uint32_t local_lane = threadIdx.x & 63u;
     const uint32_t group = local_lane >> 1u;
     const uint32_t half = local_lane & 1u;
     const uint64_t row = (uint64_t)block * 4u + local_row;
-    const uint32_t row0 = blockIdx.y * R;
-    const uint32_t take = n_rows - row0 < R ? n_rows - row0 : R;
+    const uint32_t row0 = Fixed ? 0u : blockIdx.y * R;
+    const uint32_t take = Fixed ? (uint32_t)R
+                                : (n_rows - row0 < R ? n_rows - row0 : R);
     float acc[R];
 #pragma unroll
     for (int r = 0; r < R; r++) acc[r] = 0.0f;
@@ -21051,10 +21057,12 @@ __global__ static void qwen_q8_projection_triple_kernel(
      * The rows are the block's four rows of ITS slab, so the panel base is
      * taken from the per-slab block index, not from the grid index. */
     if (Stage) {
-        const uint64_t rows_here = out_dim - (uint64_t)block * 4u < 4u
-                                 ? out_dim - (uint64_t)block * 4u : 4u;
-        const uint64_t panel_bytes = rows_here * blocks * 34u;
-        const char *const gp = (const char *)w + (uint64_t)block * 4u * blocks * 34u;
+        const uint64_t rows_here = Fixed ? 4u
+            : (out_dim - (uint64_t)block * 4u < 4u
+               ? out_dim - (uint64_t)block * 4u : 4u);
+        const uint64_t panel_bytes = rows_here * nblocks * 34u;
+        const char *const gp =
+            (const char *)w + (uint64_t)block * 4u * nblocks * 34u;
         /* THE FILL'S DEPTH, at the two-row tile.  The rolled form below emits
          * one LDG.E.128 followed immediately by its dependent STS.128, so a
          * thread holds exactly one sixteen-byte request in flight.  Both
@@ -21079,7 +21087,31 @@ __global__ static void qwen_q8_projection_triple_kernel(
          * instantiation and ptxas re-chooses on that alone: <4,false,false>
          * moves 46 -> 62 registers and 5 -> 4 blocks per SM without a line of
          * its own code changing.  The rolled form stays for every other R. */
-        if (R >= 2) {
+        if (Fixed && R >= 2) {
+            /* The ranked panel is exactly 680 uint4s.  Name its two full
+             * 256-thread stripes and its 168-thread tail directly so ptxas
+             * does not retain generic loop and end-of-panel arithmetic. */
+            const uint64_t i = (uint64_t)threadIdx.x * 16u;
+            uint4 qw_pl_fill[3];
+            qw_pl_fill[0] = *(const uint4 *)(const void *)(gp + i);
+            qw_pl_fill[1] = *(const uint4 *)(const void *)(gp + i + 4096u);
+            if (threadIdx.x < 168u)
+                qw_pl_fill[2] = *(const uint4 *)(const void *)(gp + i + 8192u);
+            *(uint4 *)(gpanel + i) = qw_pl_fill[0];
+            *(uint4 *)(gpanel + i + 4096u) = qw_pl_fill[1];
+            if (threadIdx.x < 168u)
+                *(uint4 *)(gpanel + i + 8192u) = qw_pl_fill[2];
+        } else if (Fixed) {
+            /* Keep the one-row fill at one request in flight, as in the
+             * generic path, while erasing its induction and limit checks. */
+            const uint64_t i = (uint64_t)threadIdx.x * 16u;
+            *(uint4 *)(gpanel + i) = *(const uint4 *)(const void *)(gp + i);
+            *(uint4 *)(gpanel + i + 4096u) =
+                *(const uint4 *)(const void *)(gp + i + 4096u);
+            if (threadIdx.x < 168u)
+                *(uint4 *)(gpanel + i + 8192u) =
+                    *(const uint4 *)(const void *)(gp + i + 8192u);
+        } else if (R >= 2) {
             uint4 qw_pl_fill[3];
 #pragma unroll
             for (int k = 0; k < 3; k++) {
@@ -21108,10 +21140,10 @@ __global__ static void qwen_q8_projection_triple_kernel(
         __syncthreads();
     }
 
-    if (row < out_dim) {
+    if (Fixed || row < out_dim) {
         const unsigned char *wr = Stage
-            ? (const unsigned char *)(gpanel + (uint64_t)local_row * blocks * 34u)
-            : (w + row * blocks * 34u);
+            ? (const unsigned char *)(gpanel + (uint64_t)local_row * nblocks * 34u)
+            : (w + row * nblocks * 34u);
         /* PDL: the first walk step (b = group) with its WEIGHT loads issued
          * above the fence and held in registers, so they fly while the
          * QSA pre-quantizer drains.  The activation reads (xq/xscale, that
@@ -21119,14 +21151,15 @@ __global__ static void qwen_q8_projection_triple_kernel(
          * own, b ascends exactly as the rolled walk did, and the guard is
          * the loop's own bounds check for a walk shorter than a warp's
          * groups.  The walk's remainder runs unchanged from group + 32. */
-        if (group < blocks) {
+        if (Fixed || group < nblocks) {
             const uint64_t b = group;
             /* Name both lanes of every live pair even if independent
              * scheduling has temporarily separated their execution. */
             const uint64_t warp_base = b - (uint64_t)(group & 15u);
-            const uint64_t remaining = blocks - warp_base;
+            const uint64_t remaining = nblocks - warp_base;
             const uint32_t live_pairs = (uint32_t)(remaining < 16u ? remaining : 16u);
-            const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
+            const unsigned active = Fixed ? 0xffffffffu
+                : 0xffffffffu >> (32u - 2u * live_pairs);
             const int8_t *payload = (const int8_t *)(wr + b * 34u + 2u) + half * 16u;
             const uintptr_t address = (uintptr_t)payload;
             const uint32_t shift = (uint32_t)(address & 3u) * 8u;
@@ -21152,7 +21185,7 @@ __global__ static void qwen_q8_projection_triple_kernel(
 #pragma unroll
             for (int r = 0; r < R; r++) {
                 if ((uint32_t)r < take) {
-                    const uint64_t at = ((uint64_t)row0 + r) * blocks + b;
+                    const uint64_t at = ((uint64_t)row0 + r) * nblocks + b;
                     const int32_t *xw = (const int32_t *)(xq + at * 32u + half * 16u);
                     int dot = 0;
 #pragma unroll
@@ -21162,13 +21195,15 @@ __global__ static void qwen_q8_projection_triple_kernel(
                 }
             }
         }
-        for (uint64_t b = group + 32u; b < blocks; b += 32u) {
+#pragma unroll
+        for (uint64_t b = group + 32u; b < nblocks; b += 32u) {
             /* Name both lanes of every live pair even if independent
              * scheduling has temporarily separated their execution. */
             const uint64_t warp_base = b - (uint64_t)(group & 15u);
-            const uint64_t remaining = blocks - warp_base;
+            const uint64_t remaining = nblocks - warp_base;
             const uint32_t live_pairs = (uint32_t)(remaining < 16u ? remaining : 16u);
-            const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
+            const unsigned active = Fixed ? 0xffffffffu
+                : 0xffffffffu >> (32u - 2u * live_pairs);
             const int8_t *payload = (const int8_t *)(wr + b * 34u + 2u) + half * 16u;
             const uintptr_t address = (uintptr_t)payload;
             const uint32_t shift = (uint32_t)(address & 3u) * 8u;
@@ -21193,7 +21228,7 @@ __global__ static void qwen_q8_projection_triple_kernel(
 #pragma unroll
             for (int r = 0; r < R; r++) {
                 if ((uint32_t)r < take) {
-                    const uint64_t at = ((uint64_t)row0 + r) * blocks + b;
+                    const uint64_t at = ((uint64_t)row0 + r) * nblocks + b;
                     const int32_t *xw = (const int32_t *)(xq + at * 32u + half * 16u);
                     int dot = 0;
 #pragma unroll
@@ -21221,7 +21256,8 @@ __global__ static void qwen_q8_projection_triple_kernel(
 #pragma unroll
             for (int d = 16; d >= 2; d >>= 1)
                 total += __shfl_down_sync(0x55555555u, total, d);
-            if (local_lane == 0u && row < out_dim && (uint32_t)r < take)
+            if (local_lane == 0u && (Fixed || row < out_dim) &&
+                (uint32_t)r < take)
                 out[((uint64_t)row0 + r) * out_dim + row] = total;
         }
     }
@@ -21271,11 +21307,32 @@ extern "C" int ds4_gpu_matmul_q8_0_preq_triple_rows_exact_tensor(
         const int tr_stage=tr_panel<=12288u &&
             ((((uintptr_t)w[0])|((uintptr_t)w[1])|((uintptr_t)w[2]))&15u)==0u &&
             getenv("DS4_QWEN4EXP_NO_PAIR_LANES_STAGE")==NULL;
+        /* Measurement redraw: the first official candidate pair was noisy.
+         * The ranked geometry is still invariant: K=2560 (80 Q8 groups),
+         * Q=12288, K=V=512, and one or two rows.  Naming those constants
+         * removes generic dimension/tail arithmetic from every block while
+         * leaving the decoder, DP4A chains and reduction tree untouched; the
+         * generic instantiations remain in this binary as the exact fallback. */
+        const int tr_fixed=in_dim==2560u && od[0]==12288u &&
+            od[1]==512u && od[2]==512u &&
+            getenv("DS4_QWEN4EXP_NO_QSA_TRIPLE_FIXED")==NULL;
         /* PDL consumer: the stream predecessor is the QSA pre-quantizer,
          * which triggers at its top at these decode widths. */
-        if (rows==1u && tr_stage)
+        if (rows==1u && tr_stage && tr_fixed)
+            QWEN4EXP_LAUNCH_PDL((qwen_q8_projection_triple_kernel<1, true, true>),
+                                grid, 256, tr_panel, cuda_decode_stream(),
+                (float *)outs[0]->ptr,(float *)outs[1]->ptr,(float *)outs[2]->ptr,
+                (const unsigned char *)w[0],(const unsigned char *)w[1],
+                (const unsigned char *)w[2],xq,xs,od[0],od[1],od[2],rows,blocks);
+        else if (rows==1u && tr_stage)
             QWEN4EXP_LAUNCH_PDL((qwen_q8_projection_triple_kernel<1, true>),
                                 grid, 256, tr_panel, cuda_decode_stream(),
+                (float *)outs[0]->ptr,(float *)outs[1]->ptr,(float *)outs[2]->ptr,
+                (const unsigned char *)w[0],(const unsigned char *)w[1],
+                (const unsigned char *)w[2],xq,xs,od[0],od[1],od[2],rows,blocks);
+        else if (rows==1u && tr_fixed)
+            QWEN4EXP_LAUNCH_PDL((qwen_q8_projection_triple_kernel<1, false, true>),
+                                grid, 256, 0, cuda_decode_stream(),
                 (float *)outs[0]->ptr,(float *)outs[1]->ptr,(float *)outs[2]->ptr,
                 (const unsigned char *)w[0],(const unsigned char *)w[1],
                 (const unsigned char *)w[2],xq,xs,od[0],od[1],od[2],rows,blocks);
@@ -21285,9 +21342,21 @@ extern "C" int ds4_gpu_matmul_q8_0_preq_triple_rows_exact_tensor(
                 (float *)outs[0]->ptr,(float *)outs[1]->ptr,(float *)outs[2]->ptr,
                 (const unsigned char *)w[0],(const unsigned char *)w[1],
                 (const unsigned char *)w[2],xq,xs,od[0],od[1],od[2],rows,blocks);
+        else if (tr_stage && tr_fixed)
+            QWEN4EXP_LAUNCH_PDL((qwen_q8_projection_triple_kernel<2, true, true>),
+                                grid, 256, tr_panel, cuda_decode_stream(),
+                (float *)outs[0]->ptr,(float *)outs[1]->ptr,(float *)outs[2]->ptr,
+                (const unsigned char *)w[0],(const unsigned char *)w[1],
+                (const unsigned char *)w[2],xq,xs,od[0],od[1],od[2],rows,blocks);
         else if (tr_stage)
             QWEN4EXP_LAUNCH_PDL((qwen_q8_projection_triple_kernel<2, true>),
                                 grid, 256, tr_panel, cuda_decode_stream(),
+                (float *)outs[0]->ptr,(float *)outs[1]->ptr,(float *)outs[2]->ptr,
+                (const unsigned char *)w[0],(const unsigned char *)w[1],
+                (const unsigned char *)w[2],xq,xs,od[0],od[1],od[2],rows,blocks);
+        else if (tr_fixed)
+            QWEN4EXP_LAUNCH_PDL((qwen_q8_projection_triple_kernel<2, false, true>),
+                                grid, 256, 0, cuda_decode_stream(),
                 (float *)outs[0]->ptr,(float *)outs[1]->ptr,(float *)outs[2]->ptr,
                 (const unsigned char *)w[0],(const unsigned char *)w[1],
                 (const unsigned char *)w[2],xq,xs,od[0],od[1],od[2],rows,blocks);
