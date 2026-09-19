@@ -14,7 +14,7 @@ static constexpr uint32_t MTP_NATIVE_SCREEN_GROUPS = 24u;
 /* Target verification needs substantially stronger recall than the draft
  * proposal.  R2 still streams these groups once for both rows, while a wider
  * exact shortlist protects hidden top-logit checks. */
-static constexpr uint32_t MTP_TARGET_NATIVE_CAP = 8192u;
+static constexpr uint32_t MTP_TARGET_NATIVE_CAP = 6144u;
 static constexpr uint32_t MTP_TARGET_NATIVE_SCREEN_GROUPS = 40u;
 static constexpr uint32_t MTP_NATIVE_MAX_WIDTH = 1u << 20;
 template <bool Screen, bool EmitKeys = false>
