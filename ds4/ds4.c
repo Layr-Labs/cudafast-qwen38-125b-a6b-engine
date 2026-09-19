@@ -67607,13 +67607,17 @@ static int ds4_session_qwen4exp_rows(ds4_session *s, const int *tokens,
                  (unsigned)n);
         return 1;
     }
-    int32_t buf[DS4_QWEN4EXP_SERIAL_MAX_ROWS];
-    if (n > (uint32_t)(sizeof(buf) / sizeof(buf[0]))) {
+    if (n > (uint32_t)DS4_QWEN4EXP_SERIAL_MAX_ROWS) {
         snprintf(err, errlen, "qwen4exp: chunk of %u exceeds the serial buffer",
                  (unsigned)n);
         return 1;
     }
-    for (uint32_t i = 0; i < n; i++) buf[i] = (int32_t)tokens[i];
+    /* int and int32_t agree on every target this builds for, so the caller's
+     * token array is already the row-id buffer the verifier reads; copying it
+     * per chunk was pure host overhead on the scored path. */
+    _Static_assert(sizeof(int) == sizeof(int32_t),
+                   "qwen4exp: token ids must be 32-bit");
+    const int32_t *row_ids = (const int32_t *)tokens;
     /* A caller may feed serial rows without sync or eager prepare. Initialize
      * before its first target HC row can be overwritten by a later forward;
      * any lazy allocation is charged to that real call. */
@@ -67624,7 +67628,7 @@ static int ds4_session_qwen4exp_rows(ds4_session *s, const int *tokens,
         return 1;
     if (!ds4_qwen4exp_graph_verify_rows(e->qwen4exp_session,
                                         e->qwen4exp_weights, &e->model,
-                                        buf, n, NULL, s->logits, 1u)) {
+                                        row_ids, n, NULL, s->logits, 1u)) {
         snprintf(err, errlen, "qwen4exp: the forward refused");
         return 1;
     }
