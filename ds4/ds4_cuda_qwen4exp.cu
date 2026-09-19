@@ -4312,6 +4312,7 @@ __global__ static void qwen4exp_moe_group_scan_parallel_kernel(
 /* `lo` and `hi` select the experts whose pair count c satisfies lo < c <= hi
  * (the others contribute no windows), so one routing can be split into the
  * 32-pair tile's list and the heavy tile's list. */
+/* build record 20260919T203222Z-5 */
 __global__ static void qwen4exp_moe_pair_tasks_kernel(
         int32_t *tasks, const int32_t *counts, unsigned total,
         int32_t tile = 32, int32_t lo = 0, int32_t hi = 0x7fffffff) {
@@ -5940,6 +5941,7 @@ __device__ __forceinline__ static void qw_ldsm_x4(uint32_t *r, uint32_t addr) {
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(addr));
 }
 
+template <bool L2Ahead>
 __global__ __launch_bounds__(QW_GUH_THREADS, 2) static void
 qwen4exp_moe_gateup_heavy_kernel(
         int8_t *mq,
@@ -6059,6 +6061,20 @@ qwen4exp_moe_gateup_heavy_kernel(
     };
 
     const uint32_t nchunk = groups / 4u;
+    /* L2Ahead: the first header thread of each (projection, row) asks the
+     * L2 for the line chunk c + 3 copies from, while chunk c + 1's copies
+     * are in flight.  The copies of one chunk are 64-byte pieces of 128
+     * rows 1440 bytes apart; issued only one chunk ahead they leave the
+     * weight stream's DRAM latency exposed at every barrier.  A prefetch
+     * moves no data into the tile and changes no operand. */
+    auto l2_ahead = [&](uint32_t c) {
+        if (L2Ahead && h_half == 0u && h_live && c < nchunk) {
+            const char *p = h_rowp + (c >> 1) * 144u + (c & 1u) * 64u + 16u;
+            asm volatile("prefetch.global.L2 [%0];\n" :: "l"(p));
+        }
+    };
+    l2_ahead(1u);
+    l2_ahead(2u);
     load_hdr(0u);
     issue(0u);
     load_hdr(1u);
@@ -6083,6 +6099,7 @@ qwen4exp_moe_gateup_heavy_kernel(
         qw_cpasync_wait0();
         __syncthreads();
         if (c + 1u < nchunk) { issue(c + 1u); load_hdr(c + 2u); }
+        l2_ahead(c + 3u);
         const uint32_t st = smem0 + (c & 1u) * QW_GUH_STAGE;
         const unsigned char *stp = guh_smem + (c & 1u) * QW_GUH_STAGE;
         const float *wa = (const float *)(const void *)(stp + QW_GUH_OFF_WA);
@@ -10231,12 +10248,23 @@ static int qwen4exp_routed_moe_cuda(
             if (!cuda_ok(cudaGetLastError(), "qwen4exp gate/up pair tasks")) return 0;
         }
         if (gu_heavy) {
+            /* DS4_GU_HEAVY_L2AHEAD=0 launches the tile without the L2
+             * prefetch (the same instructions as before it existed). */
+            static int guh_ahead = -1;
+            if (guh_ahead < 0) {
+                const char *e = getenv("DS4_GU_HEAVY_L2AHEAD");
+                guh_ahead = (e == NULL || e[0] != '0') ? 1 : 0;
+            }
             static int guh_attr = 0;
             if (guh_attr == 0) {
-                guh_attr = cudaFuncSetAttribute(
-                        qwen4exp_moe_gateup_heavy_kernel,
+                guh_attr = (cudaFuncSetAttribute(
+                        qwen4exp_moe_gateup_heavy_kernel<true>,
                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                        (int)QW_GUH_SMEM) == cudaSuccess ? 1 : -1;
+                        (int)QW_GUH_SMEM) == cudaSuccess &&
+                            cudaFuncSetAttribute(
+                        qwen4exp_moe_gateup_heavy_kernel<false>,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                        (int)QW_GUH_SMEM) == cudaSuccess) ? 1 : -1;
                 (void)cudaGetLastError();
             }
             if (guh_attr < 0) {
@@ -10248,7 +10276,8 @@ static int qwen4exp_routed_moe_cuda(
                     gu_tasks_heavy, sc.counts, n_total_expert, (int32_t)QW_GUH_BN,
                     32, 0x7fffffff);
             if (!cuda_ok(cudaGetLastError(), "qwen4exp gate/up heavy tasks")) return 0;
-            qwen4exp_moe_gateup_heavy_kernel<<<
+            (guh_ahead ? qwen4exp_moe_gateup_heavy_kernel<true>
+                       : qwen4exp_moe_gateup_heavy_kernel<false>)<<<
                     dim3(mid_dim / QW_GUH_BM, (unsigned)task_capacity, 1),
                     QW_GUH_THREADS, QW_GUH_SMEM, stream>>>(
                     sc.mq, sc.ms, sc.msum, gate, up, sc.xq, sc.xs, sc.xsum,
