@@ -617,6 +617,12 @@ __device__ __forceinline__ static float qwen4exp_gdn_softplus(float x) {
  * end; a negative value means the work is already hidden and there is
  * nothing to win.
  */
+/* This build's note auto09190809_57 records that removing every tensor core
+ * instruction from one projection kernel makes it slower, which means the
+ * arithmetic was never its limiter; ablation of its global loads takes a
+ * third off the wall, and a variant with identical instruction counts and
+ * perfectly coalesced addresses is four percent slower still.
+ */
 __global__ static void qwen4exp_gdn_conv_kernel(
         float       *qkv,
         float       *conv_state,
