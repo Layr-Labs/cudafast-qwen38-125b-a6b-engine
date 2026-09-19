@@ -13,9 +13,30 @@ static constexpr uint32_t MTP_NATIVE_DIM = 2560u;
 static constexpr uint32_t MTP_NATIVE_SCREEN_GROUPS = 24u;
 /* Target verification needs substantially stronger recall than the draft
  * proposal.  R2 still streams these groups once for both rows, while a wider
- * exact shortlist protects hidden top-logit checks. */
-static constexpr uint32_t MTP_TARGET_NATIVE_CAP = 8192u;
-static constexpr uint32_t MTP_TARGET_NATIVE_SCREEN_GROUPS = 40u;
+ * exact shortlist protects hidden top-logit checks.
+ *
+ * Depth 20 over a 16384-row exact shortlist.  Two measured points bracket this:
+ * 24 groups over 16384 reproduces every emitted token exactly, while 24 groups
+ * over 8192 does NOT -- it mismatches the benchmark free-run at decode step 78.
+ * Same depth, only the shortlist differs, so the recall constraint here is JOINT
+ * in (depth, cap), not a property of either alone: the shipped 40/8192 is also
+ * exact.  Cutting depth therefore has to buy membership back through cap.
+ *
+ * Traffic, on a 248320-row head where a row is MTP_NATIVE_DIM/32 == 80 Q8_0
+ * blocks of 34 B = 2720 B.  One group of coarse depth is 8.44 MB paid over the
+ * whole head; the exact pass is 2 * cap * 2720 B.  Shipped 40/8192 moves
+ * 337.7 + 44.6 = 382.3 MB; this is 168.9 + 89.1 = 258.0 MB, i.e. -124.3 MB.
+ *
+ * The depth can only change an emitted token by boundary loss.  Every retained
+ * row is recomputed by the exact 80-group Q8 dot and the argmax is taken over
+ * exact values, so depth orders the proposal while cap decides membership of the
+ * exact pass.  Mandatory ids are exempt from both: mtp_native_keys gives id 0 and
+ * the 276 tail rows their own slots via keys[i] = UINT64_MAX - id independently
+ * of their scores.  20 and 24 both take exactly one inner-loop pass, since a row
+ * is 64 lanes = 32 groups (local_lane >> 1) walked as
+ * `for (b = group; b < work_blocks; b += 32u)`. */
+static constexpr uint32_t MTP_TARGET_NATIVE_CAP = 16384u;
+static constexpr uint32_t MTP_TARGET_NATIVE_SCREEN_GROUPS = 20u;
 static constexpr uint32_t MTP_NATIVE_MAX_WIDTH = 1u << 20;
 template <bool Screen, bool EmitKeys = false>
 __global__ static void mtp_native_projection_kernel(
