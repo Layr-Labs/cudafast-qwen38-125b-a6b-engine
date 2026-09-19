@@ -263,7 +263,18 @@ void ds4s_invalidate(ds4s_handle *h) {
 int ds4s_sync(ds4s_handle *h, const int32_t *tokens, size_t n) {
     if (!h || !tokens || n == 0) return -1;
     ds4_tokens prompt = {0};
-    for (size_t i = 0; i < n; i++) ds4_tokens_push(&prompt, (int)tokens[i]);
+    /* One allocation for the whole prompt instead of the push loop's
+     * doubling reallocs (64, 128, 256, ...): a long prompt pays log2(n/64)
+     * realloc+memcpy rounds on the scored prefill path, and this pays one
+     * malloc plus the same per-token store. */
+    prompt.v = (int *)malloc(n * sizeof(*prompt.v));
+    if (!prompt.v) {
+        set_err(h, "out of memory staging the prompt tokens");
+        return -1;
+    }
+    prompt.cap = (int)n;
+    for (size_t i = 0; i < n; i++) prompt.v[i] = (int)tokens[i];
+    prompt.len = (int)n;
     char err[256] = {0};
     const int rc = ds4_session_sync(h->session, &prompt, err, sizeof(err));
     ds4_tokens_free(&prompt);
