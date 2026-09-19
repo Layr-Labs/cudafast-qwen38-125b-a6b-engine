@@ -187,22 +187,24 @@ static long field_int_array(const char *line, const char *key, int32_t **out) {
     const char *at = field(line, key);
     *out = NULL;
     if (!at || *at != '[') return -1;
-    at++;
-    size_t cap = 64, n = 0;
+    /* Count first, allocate once: every element is at least one byte of
+     * the bracketed region, so the region length bounds the element
+     * count for any input the parser accepts (including space-separated
+     * values with no commas). This replaces a 64-element malloc followed
+     * by doubling reallocs — for a multi-thousand-token prompt that was
+     * a chain of ever-larger copies on every request. */
+    size_t cap = 1;
+    for (const char *p = at + 1; *p && *p != ']'; p++) cap++;
     int32_t *buf = malloc(cap * sizeof(*buf));
     if (!buf) return -1;
+    size_t n = 0;
+    at++;
     while (*at && *at != ']') {
         while (*at == ' ' || *at == ',') at++;
         if (*at == ']' || !*at) break;
         char *end = NULL;
         const long long v = strtoll(at, &end, 10);
         if (end == at) { free(buf); return -1; }
-        if (n == cap) {
-            cap *= 2;
-            int32_t *grown = realloc(buf, cap * sizeof(*buf));
-            if (!grown) { free(buf); return -1; }
-            buf = grown;
-        }
         buf[n++] = (int32_t)v;
         at = end;
         while (*at == ' ') at++;
