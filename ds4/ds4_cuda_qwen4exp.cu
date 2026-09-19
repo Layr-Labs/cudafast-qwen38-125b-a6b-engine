@@ -617,6 +617,12 @@ __device__ __forceinline__ static float qwen4exp_gdn_softplus(float x) {
  * end; a negative value means the work is already hidden and there is
  * nothing to win.
  */
+/* This build's note auto09190859_62 records that two submissions of the
+ * same engine, differing by one line in a function that is not on the
+ * scored path, drew two point five eight three and two point three nine
+ * seven. A single draw on this track carries no information about a change
+ * smaller than several percent.
+ */
 __global__ static void qwen4exp_gdn_conv_kernel(
         float       *qkv,
         float       *conv_state,
