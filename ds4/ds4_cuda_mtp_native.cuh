@@ -300,6 +300,68 @@ __global__ static void mtp_native_unpack_ids_n(
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count) ids[i] = UINT32_MAX - (uint32_t)keys[i];
 }
+
+template <uint32_t BLOCK_THREADS, uint32_t ITEMS_PER_THREAD>
+__global__ static void mtp_native_id_block_sort_kernel(
+        uint32_t *ids, const uint64_t *score_keys,
+        uint32_t key_stride, uint32_t count, int end_bit) {
+    using BlockSort = cub::BlockRadixSort<
+        uint32_t, BLOCK_THREADS, ITEMS_PER_THREAD>;
+    extern __shared__ __align__(16) unsigned char sort_smem[];
+    typename BlockSort::TempStorage &storage =
+        *reinterpret_cast<typename BlockSort::TempStorage *>(sort_smem);
+    const uint32_t row = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    uint32_t values[ITEMS_PER_THREAD];
+#pragma unroll
+    for (uint32_t item = 0; item < ITEMS_PER_THREAD; item++) {
+        const uint32_t i = tid * ITEMS_PER_THREAD + item;
+        values[item] = i < count
+            ? UINT32_MAX - (uint32_t)score_keys[(uint64_t)row * key_stride + i]
+            : UINT32_MAX;
+    }
+    BlockSort(storage).Sort(values, 0, end_bit);
+#pragma unroll
+    for (uint32_t item = 0; item < ITEMS_PER_THREAD; item++) {
+        const uint32_t i = tid * ITEMS_PER_THREAD + item;
+        if (i < count) ids[(uint64_t)row * count + i] = values[item];
+    }
+}
+
+/* 1 launched, 0 unsupported/disabled, -1 launch error.  Readiness is cached
+ * per specialization after the first native screen, before graph capture. */
+template <uint32_t BLOCK_THREADS, uint32_t ITEMS_PER_THREAD>
+static int mtp_native_id_block_sort_try(
+        uint32_t *ids, const uint64_t *score_keys, uint32_t key_stride,
+        uint32_t count, uint32_t rows, int end_bit) {
+    if (getenv("DS4_MTP_NO_BLOCK_ID_SORT") != nullptr) return 0;
+    using BlockSort = cub::BlockRadixSort<
+        uint32_t, BLOCK_THREADS, ITEMS_PER_THREAD>;
+    const int smem = (int)sizeof(typename BlockSort::TempStorage);
+    static int ready = -1;
+    if (ready < 0) {
+        int dev = 0, limit = 0;
+        ready = 0;
+        cudaError_t rc = cudaGetDevice(&dev);
+        if (rc == cudaSuccess)
+            rc = cudaDeviceGetAttribute(
+                &limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+        if (rc == cudaSuccess && limit >= smem)
+            rc = cudaFuncSetAttribute(
+                mtp_native_id_block_sort_kernel<
+                    BLOCK_THREADS, ITEMS_PER_THREAD>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        if (rc == cudaSuccess && limit >= smem) ready = 1;
+        else (void)cudaGetLastError();
+    }
+    if (!ready) return 0;
+    mtp_native_id_block_sort_kernel<
+        BLOCK_THREADS, ITEMS_PER_THREAD><<<
+            rows, BLOCK_THREADS, (size_t)smem, cuda_decode_stream()>>>(
+                ids, score_keys, key_stride, count, end_bit);
+    return cuda_ok(cudaGetLastError(), "native original-ID block sort")
+        ? 1 : -1;
+}
 /* Moving key writes into projection is equivalent only when scratch writes
  * cannot change another input/output view or a concurrently read weight. */
 static bool mtp_native_key_range_disjoint(const void *a, uint64_t an,
@@ -386,9 +448,6 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
      * 78 drafts accepted). */
     if (!cuda_ok(cub::DeviceRadixSort::SortKeysDescending(base+l.temporary,temporary,
             key_in,key_out,width,32,64,cuda_decode_stream()),"native score sort")) return -1;
-    mtp_native_unpack_ids<<<(MTP_NATIVE_CAP+255u)/256u,256,0,cuda_decode_stream()>>>(id_tmp,key_out);
-    if (!cuda_ok(cudaGetLastError(),"native candidate unpack")) return -1;
-    temporary = (size_t)(scratch->bytes-l.temporary);
     /* RANK ONLY THE BITS A TOKEN ID CAN OCCUPY.
      *
      * The array this sorts is the unpacked ORIGINAL IDS, not the packed keys:
@@ -411,10 +470,19 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
     int id_bits = 1;
     while (id_bits < 32 && ((uint32_t)1u << id_bits) < vocab) id_bits++;
     if (id_bits > 32) id_bits = 32;
-    if (!cuda_ok(cub::DeviceRadixSort::SortKeys(base+l.temporary,temporary,
-            id_tmp,(uint32_t *)ids->ptr,MTP_NATIVE_CAP,0,id_bits,
-            cuda_decode_stream()),
-            "native original-ID sort")) return -1;
+    const int block_sorted = mtp_native_id_block_sort_try<256u, 8u>(
+        (uint32_t *)ids->ptr, key_out, width, MTP_NATIVE_CAP, 1u, id_bits);
+    if (block_sorted < 0) return -1;
+    if (!block_sorted) {
+        mtp_native_unpack_ids<<<(MTP_NATIVE_CAP+255u)/256u,256,0,
+                cuda_decode_stream()>>>(id_tmp,key_out);
+        if (!cuda_ok(cudaGetLastError(),"native candidate unpack")) return -1;
+        temporary = (size_t)(scratch->bytes-l.temporary);
+        if (!cuda_ok(cub::DeviceRadixSort::SortKeys(
+                base+l.temporary,temporary,id_tmp,(uint32_t *)ids->ptr,
+                MTP_NATIVE_CAP,0,id_bits,cuda_decode_stream()),
+                "native original-ID sort")) return -1;
+    }
     mtp_native_projection_kernel<false><<<(MTP_NATIVE_CAP+3u)/4u,256,0,cuda_decode_stream()>>>(
         (float *)out->ptr,(const unsigned char *)w,xq,xs,MTP_NATIVE_CAP,
         (const uint32_t *)ids->ptr,vocab,prefix,tail);
@@ -519,23 +587,38 @@ extern "C" int ds4_gpu_mtp_native_screen2(ds4_gpu_tensor *out,
         size_t temporary = (size_t)(scratch->bytes - l.temporary);
         uint64_t *kin = key_in + (uint64_t)r * width;
         uint64_t *kout = key_out + (uint64_t)r * width;
-        uint32_t *itmp = id_tmp + (uint64_t)r * MTP_TARGET_NATIVE_CAP;
-        uint32_t *iout = (uint32_t *)ids->ptr +
-            (uint64_t)r * MTP_TARGET_NATIVE_CAP;
         if (!cuda_ok(cub::DeviceRadixSort::SortKeysDescending(
                 base + l.temporary, temporary, kin, kout, width, 32, 64,
                 cuda_decode_stream()), "native R2 score sort")) return -1;
-        mtp_native_unpack_ids_n<<<
-                (MTP_TARGET_NATIVE_CAP + 255u) / 256u, 256, 0,
-                cuda_decode_stream()>>>(itmp, kout, MTP_TARGET_NATIVE_CAP);
-        if (!cuda_ok(cudaGetLastError(), "native R2 candidate unpack"))
-            return -1;
-        temporary = (size_t)(scratch->bytes - l.temporary);
-        if (!cuda_ok(cub::DeviceRadixSort::SortKeys(
-                base + l.temporary, temporary, itmp, iout,
-                MTP_TARGET_NATIVE_CAP,
-                0, id_bits, cuda_decode_stream()),
-                "native R2 original-ID sort")) return -1;
+    }
+    const int block_sorted = mtp_native_id_block_sort_try<512u, 16u>(
+        (uint32_t *)ids->ptr, key_out, width, MTP_TARGET_NATIVE_CAP, 2u,
+        id_bits);
+    if (block_sorted < 0) return -1;
+    if (!block_sorted) {
+        for (uint32_t r = 0; r < 2u; r++) {
+            size_t temporary = (size_t)(scratch->bytes - l.temporary);
+            uint64_t *kout = key_out + (uint64_t)r * width;
+            uint32_t *itmp = id_tmp +
+                (uint64_t)r * MTP_TARGET_NATIVE_CAP;
+            uint32_t *iout = (uint32_t *)ids->ptr +
+                (uint64_t)r * MTP_TARGET_NATIVE_CAP;
+            mtp_native_unpack_ids_n<<<
+                    (MTP_TARGET_NATIVE_CAP + 255u) / 256u, 256, 0,
+                    cuda_decode_stream()>>>(itmp, kout,
+                                            MTP_TARGET_NATIVE_CAP);
+            if (!cuda_ok(cudaGetLastError(), "native R2 candidate unpack"))
+                return -1;
+            if (!cuda_ok(cub::DeviceRadixSort::SortKeys(
+                    base + l.temporary, temporary, itmp, iout,
+                    MTP_TARGET_NATIVE_CAP, 0, id_bits,
+                    cuda_decode_stream()),
+                    "native R2 original-ID sort")) return -1;
+        }
+    }
+    for (uint32_t r = 0; r < 2u; r++) {
+        uint32_t *iout = (uint32_t *)ids->ptr +
+            (uint64_t)r * MTP_TARGET_NATIVE_CAP;
         mtp_native_projection_kernel<false><<<
             (MTP_TARGET_NATIVE_CAP + 3u) / 4u, 256, 0,
             cuda_decode_stream()>>>(
@@ -549,6 +632,84 @@ extern "C" int ds4_gpu_mtp_native_screen2(ds4_gpu_tensor *out,
     }
     return (int)MTP_TARGET_NATIVE_CAP;
 }
+
+/* The compact verify caller needs only the original-vocabulary winner of each
+ * refined row.  The dense path fills every omitted vocabulary entry with
+ * -FLT_MAX before scattering the refined values, so include the smallest
+ * omitted original ID as that sentinel candidate.  Comparing original IDs
+ * retains the dense top-1 tie rule even if the shortlist representation ever
+ * stops being ordered. */
+__global__ static void mtp_native_top1_map2_kernel(
+        uint32_t *winner, const float *logits, const uint32_t *ids,
+        uint32_t count, uint32_t vocab) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (row >= 2u || tid >= 1024u) return;
+    const uint32_t *row_ids = ids + (uint64_t)row * count;
+    const float *row_logits = logits + (uint64_t)row * count;
+
+    __shared__ float values[1024];
+    __shared__ uint32_t indices[1024];
+    __shared__ uint32_t missing;
+    if (tid == 0u) {
+        uint32_t lo = 0u, hi = count;
+        while (lo < hi) {
+            const uint32_t mid = lo + (hi - lo) / 2u;
+            if (row_ids[mid] == mid) lo = mid + 1u;
+            else hi = mid;
+        }
+        missing = lo;
+    }
+    __syncthreads();
+
+    float best_value = tid == 0u ? -FLT_MAX : -INFINITY;
+    uint32_t best_id = tid == 0u ? missing : UINT32_MAX;
+    for (uint32_t i = tid; i < count; i += 1024u) {
+        const float value = row_logits[i];
+        const uint32_t id = row_ids[i];
+        if (value > best_value || (value == best_value && id < best_id)) {
+            best_value = value;
+            best_id = id;
+        }
+    }
+    values[tid] = best_value;
+    indices[tid] = best_id;
+    __syncthreads();
+    for (uint32_t stride = 512u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            const float value = values[tid + stride];
+            const uint32_t id = indices[tid + stride];
+            if (value > values[tid] ||
+                (value == values[tid] && id < indices[tid])) {
+                values[tid] = value;
+                indices[tid] = id;
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0u) winner[row] = indices[0] < vocab ? indices[0] : UINT32_MAX;
+}
+
+extern "C" int ds4_gpu_mtp_native_top1_map2(ds4_gpu_tensor *winner,
+        const ds4_gpu_tensor *logits, const ds4_gpu_tensor *ids,
+        uint32_t count, uint32_t vocab) {
+    if (!winner || !logits || !ids || !count || count >= vocab ||
+        winner->bytes < 2u * sizeof(uint32_t) ||
+        logits->bytes < 2ull * count * sizeof(float) ||
+        ids->bytes < 2ull * count * sizeof(uint32_t)) return 0;
+    const int tier = ds4_tensor_device_idx(winner);
+    int current = -1;
+    if (tier < 0 || tier >= g_n_gpus ||
+        ds4_tensor_device_idx(logits) != tier ||
+        ds4_tensor_device_idx(ids) != tier ||
+        cudaGetDevice(&current) != cudaSuccess ||
+        current != g_gpu[tier].device_id) return 0;
+    mtp_native_top1_map2_kernel<<<2, 1024, 0, cuda_decode_stream()>>>(
+        (uint32_t *)winner->ptr, (const float *)logits->ptr,
+        (const uint32_t *)ids->ptr, count, vocab);
+    return cuda_ok(cudaGetLastError(), "native target compact top-1 map");
+}
+
 __global__ static void mtp_native_map(uint32_t *winner, const float *logits,
                                       const uint32_t *ids, uint32_t count, uint32_t vocab) {
     const uint32_t bits = __float_as_uint(logits[0]);
