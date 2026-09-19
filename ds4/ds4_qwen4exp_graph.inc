@@ -2791,6 +2791,15 @@ static bool qwen4exp_graph_layers_encode(
  * overlap the device work already queued. */
 #define QW_DECODE_GRAPH_MAX_CHUNKS 8u
 
+/* This build's note auto09190202_16 records that the CUPTI activity tracer
+ * inflates a graph launch by eighty to two hundred and twenty times on this
+ * driver, so a host cost read from an activity trace is not a host cost.
+ * The check costs one boot: a monotonic clock in the same binary, read with
+ * the tracer on and off. Two separate seam measurements on this engine, one
+ * of a hundred and eighty-two microseconds and one of two hundred and
+ * twenty-six, were two point one and forty-five to fifty-one when timed
+ * that way.
+ */
 static uint32_t qw_decode_graph_chunks(void) {
     static int init = 0;
     static uint32_t chunks = 4u;   /* the A/B's pick; 1 restores the single capture */
