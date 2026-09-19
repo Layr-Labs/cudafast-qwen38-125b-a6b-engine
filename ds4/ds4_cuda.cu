@@ -18298,11 +18298,26 @@ static int cuda_matmul_q8_0_preq_rows_exact(
         cuda_q8_use_dp4a() && (((uintptr_t)wptr & 1u) == 0u) &&
         getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
         getenv("DS4_QWEN4EXP_NO_EH_PROJ_R8") == NULL) {
-        matmul_q8_0_preq_pair_lanes_kernel<8, false><<<
-                dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u),
-                256, 0, cuda_decode_stream()>>>(
-                (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
-                out_dim, n_rows, blocks);
+        /* The rolling arm at PB 32: this shape's panel is 21,760 bytes,
+         * past the staged arm's 12,288-byte residency bound, and its 160
+         * groups do not divide the 64-group portion, so it has never had a
+         * staged fetch order.  Two 4,352-byte portions keep the next one in
+         * flight behind the walk; the words are the shipping words in the
+         * shipping order and the reduction is the kernel's own. */
+        if ((((uintptr_t)wptr & 15u) == 0u) && (blocks % 32u) == 0u &&
+            getenv("DS4_QWEN4EXP_NO_PAIR_LANES_ROLL32") == NULL) {
+            matmul_q8_0_preq_pair_lanes_roll_kernel<8, 32><<<
+                    dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u),
+                    256, (size_t)8704u, cuda_decode_stream()>>>(
+                    (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
+                    out_dim, n_rows, blocks);
+        } else {
+            matmul_q8_0_preq_pair_lanes_kernel<8, false><<<
+                    dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u),
+                    256, 0, cuda_decode_stream()>>>(
+                    (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
+                    out_dim, n_rows, blocks);
+        }
         return cuda_ok(cudaGetLastError(), "q8 eh_proj R8 pair lanes launch");
     }
     if (g_q8_dense_mma_enabled && cuda_q8_mma_available() && n_rows >= 8u &&
@@ -18497,6 +18512,18 @@ static int cuda_matmul_q8_0_preq_rows_exact(
             const int pl_roll = pl_panel > 12288u && (blocks % 64u) == 0u &&
                 (((uintptr_t)wptr) & 15u) == 0u &&
                 getenv("DS4_QWEN4EXP_NO_PAIR_LANES_ROLL") == NULL;
+            /* THE 32-GROUP PORTION, for the panels the staged arm declines
+             * where sixty-four groups do not divide the row.  The head's
+             * eh_proj at in_dim 5120 is the shape this track ships: 160
+             * groups, a 21,760-byte panel, five portions of thirty-two.
+             * Two 8,704-byte buffers keep the next portion in flight behind
+             * the walk exactly as the 64-group arm does, and the arithmetic
+             * is the same walk on the same words. */
+            const size_t pl_roll32_smem = (size_t)2u * 4u * 32u * 34u;
+            const int pl_roll32 = pl_panel > 12288u && (blocks % 64u) != 0u &&
+                (blocks % 32u) == 0u &&
+                (((uintptr_t)wptr) & 15u) == 0u &&
+                getenv("DS4_QWEN4EXP_NO_PAIR_LANES_ROLL32") == NULL;
             if (n_rows == 1u && pl_roll &&
                 getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL) {
                 /* PDL consumer as below; the first portion rides the window. */
@@ -18504,6 +18531,15 @@ static int cuda_matmul_q8_0_preq_rows_exact(
                         (matmul_q8_0_preq_pair_lanes_roll_kernel<1, 64>),
                         (dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u)),
                         256, pl_roll_smem, cuda_decode_stream(),
+                        (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
+                        out_dim, n_rows, blocks);
+            } else if (n_rows == 1u && pl_roll32 &&
+                getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL) {
+                /* PDL consumer as below; the first portion rides the window. */
+                QWEN4EXP_LAUNCH_PDL(
+                        (matmul_q8_0_preq_pair_lanes_roll_kernel<1, 32>),
+                        (dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u)),
+                        256, pl_roll32_smem, cuda_decode_stream(),
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
                         out_dim, n_rows, blocks);
             } else if (n_rows == 1u && pl_stage &&
@@ -18527,12 +18563,36 @@ static int cuda_matmul_q8_0_preq_rows_exact(
             } else if (n_rows == 4u ||
                        (n_rows == 3u &&
                         getenv("DS4_QWEN4EXP_WIDE_VERIFY_R2") == NULL)) {
-                /* One four-row tile: the weight read once for three rows. */
-                matmul_q8_0_preq_pair_lanes_kernel<4, false><<<
-                        dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u),
-                        256, 0, cuda_decode_stream()>>>(
-                        (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
-                        out_dim, n_rows, blocks);
+                /* One four-row tile: the weight read once for three rows.
+                 * The panel arms are the two-row arm's own -- the rolling
+                 * portions past the residency bound, the staged fill under
+                 * it -- chosen on the same gates, launched plainly as this
+                 * branch's calls are. */
+                if (pl_roll) {
+                    matmul_q8_0_preq_pair_lanes_roll_kernel<4, 64><<<
+                            dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u),
+                            256, pl_roll_smem, cuda_decode_stream()>>>(
+                            (float *)out->ptr, (const unsigned char *)wptr,
+                            xq, xscale, out_dim, n_rows, blocks);
+                } else if (pl_roll32) {
+                    matmul_q8_0_preq_pair_lanes_roll_kernel<4, 32><<<
+                            dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u),
+                            256, pl_roll32_smem, cuda_decode_stream()>>>(
+                            (float *)out->ptr, (const unsigned char *)wptr,
+                            xq, xscale, out_dim, n_rows, blocks);
+                } else if (pl_stage) {
+                    matmul_q8_0_preq_pair_lanes_kernel<4, false, true><<<
+                            dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u),
+                            256, pl_panel, cuda_decode_stream()>>>(
+                            (float *)out->ptr, (const unsigned char *)wptr,
+                            xq, xscale, out_dim, n_rows, blocks);
+                } else {
+                    matmul_q8_0_preq_pair_lanes_kernel<4, false><<<
+                            dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u),
+                            256, 0, cuda_decode_stream()>>>(
+                            (float *)out->ptr, (const unsigned char *)wptr,
+                            xq, xscale, out_dim, n_rows, blocks);
+                }
             } else if (n_rows == 3u) {
                 /* The same two-row tile kernel over two tiles, launched
                  * plainly (no producer triggers at three rows). */
@@ -18546,6 +18606,13 @@ static int cuda_matmul_q8_0_preq_rows_exact(
                         (matmul_q8_0_preq_pair_lanes_roll_kernel<2, 64>),
                         (dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u)),
                         256, pl_roll_smem, cuda_decode_stream(),
+                        (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
+                        out_dim, n_rows, blocks);
+            } else if (pl_roll32) {
+                QWEN4EXP_LAUNCH_PDL(
+                        (matmul_q8_0_preq_pair_lanes_roll_kernel<2, 32>),
+                        (dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u)),
+                        256, pl_roll32_smem, cuda_decode_stream(),
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
                         out_dim, n_rows, blocks);
             } else if (pl_stage) {
