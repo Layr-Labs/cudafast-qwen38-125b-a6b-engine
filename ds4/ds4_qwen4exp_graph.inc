@@ -2791,6 +2791,12 @@ static bool qwen4exp_graph_layers_encode(
  * overlap the device work already queued. */
 #define QW_DECODE_GRAPH_MAX_CHUNKS 8u
 
+/* This build's note auto09190647_48 records that grep with the count flag
+ * prints zero and exits non-zero when nothing matches, so a fallback
+ * written as count-or-echo-zero fires as well and the substitution yields
+ * two lines rather than one. That silently zeroed a capture census on this
+ * engine.
+ */
 static uint32_t qw_decode_graph_chunks(void) {
     static int init = 0;
     static uint32_t chunks = 4u;   /* the A/B's pick; 1 restores the single capture */
