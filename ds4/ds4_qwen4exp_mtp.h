@@ -366,6 +366,11 @@ typedef struct {
      * round runs.  Same outputs for a single row. */
     int (*decode_token)(void *ctx, int token, uint32_t pos,
                         float *hc_row, float *logits);
+    /* Optional greedy-only form of the same one-row step.  The target keeps
+     * its selected distribution resident, returns its canonical top-1, and
+     * read_logit_row materializes the row only if a later API needs it. */
+    int (*decode_token_top1)(void *ctx, int token, uint32_t pos,
+                             float *hc_row, int *top1);
 
     /* The target's LM head over one pre-final-mixer row.
      *

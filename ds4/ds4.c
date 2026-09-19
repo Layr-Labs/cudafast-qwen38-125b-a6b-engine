@@ -76057,6 +76057,27 @@ static int qwen4exp_seam_read_logit_row(void *ctx, uint32_t row,
                s->engine->qwen4exp_session, row, logits) ? 0 : -1;
 }
 
+/* Greedy one-row form.  R1 still evaluates the complete vocabulary; the graph
+ * reduces that exact resident row on-device so the cycle need not copy one
+ * MiB of logits to the host merely to take its argmax. */
+static int qwen4exp_seam_decode_token_top1(void *ctx, int token, uint32_t pos,
+                                           float *hc_row, int *top1) {
+    ds4_session *s = ctx;
+    ds4_engine *e = s->engine;
+    const uint32_t at = ds4_qwen4exp_session_pos(e->qwen4exp_session);
+    if (at != pos || !top1) return -1;
+    const int32_t tok = (int32_t)token;
+    /* The draft head consumes this same target hyper row immediately.  Keep
+     * it resident just as the wide verify seam does; draft_rows recognizes
+     * hc_row as the logical base and borrows the session tensor directly. */
+    const int dev_rows = getenv("DS4_QWEN4EXP_NO_DEVICE_HYPER") == NULL;
+    s->qwen4exp_hc_host_base = dev_rows ? hc_row : NULL;
+    s->qwen4exp_hc_host_rows = 1u;
+    return ds4_qwen4exp_graph_verify_top1_rows(
+            e->qwen4exp_session, e->qwen4exp_weights, &e->model,
+            &tok, 1u, dev_rows ? NULL : hc_row, top1) ? 0 : -1;
+}
+
 /* One row, through the SAME entry point as the verify: the cycle requires row
  * t of an n-row verify to equal a one-row decode from the same state bit for
  * bit, and one implementation is how that is guaranteed rather than tested. */
@@ -76242,6 +76263,7 @@ static bool ds4_session_qwen4exp_spec_init(ds4_session *s,
     s->qwen4exp_seam.read_logit_row = qwen4exp_seam_read_logit_row;
     s->qwen4exp_seam.defer_frontier_logits = true;
     s->qwen4exp_seam.decode_token = qwen4exp_seam_decode_token;
+    s->qwen4exp_seam.decode_token_top1 = qwen4exp_seam_decode_token_top1;
     s->qwen4exp_seam.head_logits  = qwen4exp_seam_head_logits;
     s->qwen4exp_seam.draft_step   = qwen4exp_seam_draft_step;
     s->qwen4exp_seam.draft_rows   = qwen4exp_seam_draft_rows;
@@ -76277,12 +76299,10 @@ static int ds4_session_qwen4exp_spec_cycle(ds4_session *s, int first_token,
     const uint32_t pos = ds4_qwen4exp_session_pos(e->qwen4exp_session);
     if (ds4_session_qwen4exp_cache_feed_tail(s, first_token, pos, err, errlen) != 0)
         return -1;
-    /* s->logits, not a scratch buffer.  The cycle leaves the distribution for
-     * the position after everything it committed, and the caller's next
-     * iteration samples its fed token straight out of s->logits -- the serial
-     * path fills it the same way from the same forward.  Passing a scratch
-     * here, or NULL, leaves the prefill's distribution standing and the leg
-     * emits one token over and over. */
+    /* s->logits, not a scratch buffer.  The cycle either leaves the frontier
+     * distribution here or publishes an exact top-1 plus a lazy resident row.
+     * Non-greedy and inspection APIs materialize that row back into this same
+     * buffer before reading it. */
     const int n = ds4_qwen4exp_mtp_cycle(&s->qwen4exp_spec, &s->qwen4exp_seam,
                                          first_token, pos, max_tokens,
                                          accepted, accepted_cap, s->logits,
