@@ -12,10 +12,36 @@ static constexpr uint32_t MTP_NATIVE_DIM = 2560u;
  * selected-row dots. */
 static constexpr uint32_t MTP_NATIVE_SCREEN_GROUPS = 24u;
 /* Target verification needs substantially stronger recall than the draft
- * proposal.  R2 still streams these groups once for both rows, while a wider
- * exact shortlist protects hidden top-logit checks. */
-static constexpr uint32_t MTP_TARGET_NATIVE_CAP = 8192u;
-static constexpr uint32_t MTP_TARGET_NATIVE_SCREEN_GROUPS = 40u;
+ * proposal.  This buys that recall where it is CHEAP -- in the exact shortlist
+ * -- and stops paying for it where it is expensive, in the coarse screen depth.
+ *
+ * A row is 80 Q8_0 blocks of 34 B = 2720 B, so over 248320 rows the coarse pass
+ * costs 3.38 MB per group and the exact pass costs 5.44 MB per 1024 retained
+ * rows at two rows of output.  Depth is therefore about 7.5x dearer per unit of
+ * recall than width, and the shipped 40/8192 split spends on the dear one:
+ *
+ *      40 groups / cap  8192 :  337.7 + 44.6 = 382.3 MB
+ *      24 groups / cap 16384 :  202.6 + 89.1 = 291.7 MB
+ *
+ * 90.6 MB less traffic with the retained set DOUBLED, so the only failure mode
+ * a depth cut has here -- the true argmax falling outside the retained top-cap,
+ * since every retained row is still recomputed by the exact 80-group dot and
+ * the argmax is taken over exact values -- is guarded more widely than before,
+ * not less.
+ *
+ * 24 is also the group map's second waste-free point.  A row is 64 lanes = 32
+ * groups and the walk is `for (b = group; b < work_blocks; b += 32)`, so any
+ * work_blocks above 32 costs a whole second iteration: at 40 the eight groups
+ * 0..7, all inside warp 0, take one that warp 1 does not, with `live_pairs`
+ * masking it to a half-empty warp, and the row cannot retire until warp 0 is
+ * done.  24 and 32 both take exactly one iteration; 24 leaves groups 24..31
+ * idle, which is the same shape the draft screen above has run at since it was
+ * taken 40 -> 24 for this reason.
+ *
+ * 24 groups is exactly the depth that draft screen ships at and passes the
+ * golden gate with, over a shortlist a quarter of this one. */
+static constexpr uint32_t MTP_TARGET_NATIVE_CAP = 16384u;
+static constexpr uint32_t MTP_TARGET_NATIVE_SCREEN_GROUPS = 24u;
 static constexpr uint32_t MTP_NATIVE_MAX_WIDTH = 1u << 20;
 template <bool Screen, bool EmitKeys = false>
 __global__ static void mtp_native_projection_kernel(
