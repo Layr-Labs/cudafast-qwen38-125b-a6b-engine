@@ -291,7 +291,7 @@ int32_t ds4s_argmax(const ds4s_handle *h) {
 
 int ds4s_top_logits(const ds4s_handle *h, int k, int32_t *ids, float *logits) {
     if (!h || !ids || !logits || k <= 0) return 0;
-    ds4_token_score *scores = calloc((size_t)k, sizeof(*scores));
+    ds4_token_score *scores = malloc((size_t)k * sizeof(*scores));
     if (!scores) {
         set_err((ds4s_handle *)h, "out of memory allocating the top-k buffer");
         return 0;
