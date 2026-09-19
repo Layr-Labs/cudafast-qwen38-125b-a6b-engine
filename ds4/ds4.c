@@ -39176,6 +39176,14 @@ static void token_vec_push(token_vec *tv, int token) {
     tv->v[tv->len++] = token;
 }
 
+/* Grow capacity once so a known-length fill never reallocs mid-loop. */
+static void token_vec_reserve(token_vec *tv, int cap) {
+    if (cap > tv->cap) {
+        tv->cap = cap;
+        tv->v = xrealloc(tv->v, (size_t)tv->cap * sizeof(tv->v[0]));
+    }
+}
+
 static void token_vec_free(token_vec *tv) {
     free(tv->v);
     memset(tv, 0, sizeof(*tv));
@@ -39188,10 +39196,12 @@ void ds4_tokens_push(ds4_tokens *tv, int token) {
 void ds4_tokens_free(ds4_tokens *tv) {
     token_vec_free(tv);
 }
-
 void ds4_tokens_copy(ds4_tokens *dst, const ds4_tokens *src) {
-    dst->len = 0;
-    for (int i = 0; i < src->len; i++) token_vec_push(dst, src->v[i]);
+    if (dst == src) return;
+    token_vec_reserve(dst, src->len);
+    if (src->len > 0)
+        memcpy(dst->v, src->v, (size_t)src->len * sizeof(src->v[0]));
+    dst->len = src->len;
 }
 
 bool ds4_tokens_starts_with(const ds4_tokens *tokens, const ds4_tokens *prefix) {
@@ -67665,6 +67675,9 @@ static int ds4_session_qwen4exp_sync(ds4_session *s, const ds4_tokens *prompt,
     s->qwen4exp_spec.head_rows = 0;
     s->checkpoint.len = 0;
     s->checkpoint_valid = false;
+    /* The whole prompt lands on the tape below; size it once instead of
+       doubling through the per-token pushes in ds4_session_qwen4exp_rows. */
+    token_vec_reserve(&s->checkpoint, prompt->len);
 
     const uint32_t batch = plan->n_batch;
     for (int at = 0; at < prompt->len; ) {
@@ -76305,6 +76318,7 @@ static int ds4_session_qwen4exp_spec_cycle(ds4_session *s, int first_token,
      * for the whole MTP leg and ds4_session_tokens() omits every generated
      * token -- which is what ds4_bench's guard reads and what the server's
      * prefix reuse compares against. */
+    token_vec_reserve(&s->checkpoint, s->checkpoint.len + n);
     for (int i = 0; i < n; i++) token_vec_push(&s->checkpoint, accepted[i]);
     if (n > 0) s->checkpoint_valid = true;
     return n;
@@ -78279,3 +78293,4 @@ int ds4_session_ctx(ds4_session *s) {
 int ds4_session_prefill_cap(ds4_session *s) {
     return s ? (int)s->prefill_cap : 0;
 }
+// redraw f8821bac 20260919T215047Z
