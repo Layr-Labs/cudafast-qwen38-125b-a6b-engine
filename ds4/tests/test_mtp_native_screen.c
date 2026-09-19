@@ -13,6 +13,7 @@
 #include <sys/mman.h>
 #define DIM 2560u
 #define CAP 2048u
+#define CAP2 8192u
 #define PREFIX 20000u
 #define TAIL 276u
 #define VOCAB 21000u
@@ -60,6 +61,88 @@ static int compare_key_paths(ds4_gpu_tensor *out,ds4_gpu_tensor *ids,
     need(!memcmp(values[0],values[1],CAP*4u)&&!memcmp(selected_ids[0],selected_ids[1],CAP*4u),"AB IDs/refinement or fallback canary parity");
     int result=status[1];for(unsigned i=0;i<2;i++){free(keys[i]);free(selected_ids[i]);free(values[i]);}
     free(score_canary);free(score_after);return result;
+}
+static void compare_r2_paths(const void *w,uint64_t bytes,uint64_t offset,
+        const float *activation) {
+    uint64_t scratch2_bytes=0;uint32_t cap2=0;
+    need(ds4_gpu_mtp_native_screen2_init(WIDTH,&scratch2_bytes,&cap2)==1&&cap2==CAP2,
+         "R2 scratch query");
+    ds4_gpu_tensor *x2=ds4_gpu_tensor_alloc(2ull*DIM*4u),
+        *out2=ds4_gpu_tensor_alloc(2ull*CAP2*4u),
+        *ids2=ds4_gpu_tensor_alloc(2ull*CAP2*4u),
+        *scratch2=ds4_gpu_tensor_alloc(scratch2_bytes),
+        *scattered=ds4_gpu_tensor_alloc(2ull*VOCAB*4u),
+        *full2=ds4_gpu_tensor_alloc(2ull*PREFIX*4u),
+        *tail2=ds4_gpu_tensor_alloc(2ull*TAIL*4u);
+    need(x2&&out2&&ids2&&scratch2&&scattered&&full2&&tail2,
+         "R2 GPU allocations");
+    float *a2=malloc(2ull*DIM*4u),*after=malloc(2ull*DIM*4u),
+        *values[2]={malloc(2ull*CAP2*4u),malloc(2ull*CAP2*4u)},
+        *dense=malloc(2ull*VOCAB*4u),*reference=malloc(2ull*PREFIX*4u),
+        *tail_ref=malloc(2ull*TAIL*4u);
+    uint32_t *selected_ids[2]={malloc(2ull*CAP2*4u),malloc(2ull*CAP2*4u)};
+    need(a2&&after&&values[0]&&values[1]&&dense&&reference&&tail_ref&&
+         selected_ids[0]&&selected_ids[1],"R2 host allocations");
+    memcpy(a2,activation,DIM*4u);
+    for(uint32_t i=0;i<DIM;i++) a2[DIM+i]=activation[DIM-1u-i]*0.75f+0.125f;
+    need(ds4_gpu_tensor_write(x2,0,a2,2ull*DIM*4u),"R2 activations");
+    unsetenv("DS4_QWEN4EXP_NO_TARGET_NATIVE_SCREEN_R2");
+    for(uint32_t mode=0;mode<2;mode++) {
+        if(mode==0)setenv("DS4_MTP_NO_FUSED_SCREEN_KEYS","1",1);
+        else unsetenv("DS4_MTP_NO_FUSED_SCREEN_KEYS");
+        need(ds4_gpu_mtp_native_screen2(out2,ids2,scratch2,w,bytes,offset,
+             DIM,VOCAB,PREFIX,TAIL,x2)==CAP2,"R2 screen");
+        need(ds4_gpu_tensor_read(out2,0,values[mode],2ull*CAP2*4u)&&
+             ds4_gpu_tensor_read(ids2,0,selected_ids[mode],2ull*CAP2*4u),
+             "R2 outputs");
+        need(ds4_gpu_tensor_read(x2,0,after,2ull*DIM*4u)&&
+             !memcmp(a2,after,2ull*DIM*4u),"R2 input unchanged");
+    }
+    need(!memcmp(selected_ids[0],selected_ids[1],2ull*CAP2*4u),
+         "R2 fused-key shortlist differs");
+    need(!memcmp(values[0],values[1],2ull*CAP2*4u),
+         "R2 fused-key refinement differs");
+    need(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(full2,w,bytes,offset,
+         DIM,PREFIX,x2,2),"R2 ordinary prefix");
+    need(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(tail2,w,bytes,
+         offset+(uint64_t)(VOCAB-TAIL)*ROW,DIM,TAIL,x2,2),
+         "R2 ordinary tail");
+    need(ds4_gpu_tensor_read(full2,0,reference,2ull*PREFIX*4u)&&
+         ds4_gpu_tensor_read(tail2,0,tail_ref,2ull*TAIL*4u),
+         "R2 oracle read");
+    for(uint32_t r=0;r<2;r++) {
+        const uint32_t *row_ids=selected_ids[1]+(uint64_t)r*CAP2;
+        const float *row_values=values[1]+(uint64_t)r*CAP2;
+        need(row_ids[0]==0,"R2 mandatory zero");
+        for(uint32_t i=0;i<CAP2;i++) {
+            const uint32_t id=row_ids[i];
+            need(i==0||id>row_ids[i-1],"R2 sorted unique IDs");
+            need(id<PREFIX||(id>=VOCAB-TAIL&&id<VOCAB),"R2 static domain");
+            const float exact=id<PREFIX?
+                reference[(uint64_t)r*PREFIX+id]:
+                tail_ref[(uint64_t)r*TAIL+id-(VOCAB-TAIL)];
+            need(!memcmp(&exact,&row_values[i],4),
+                 "R2 refinement differs from ordinary row");
+        }
+        for(uint32_t i=0;i<TAIL;i++)
+            need(row_ids[CAP2-TAIL+i]==VOCAB-TAIL+i,"R2 mandatory tail");
+    }
+    need(ds4_gpu_tensor_fill_f32(scattered,-INFINITY,2ull*VOCAB)&&
+         ds4_gpu_mtp_native_scatter2(scattered,out2,ids2,CAP2,VOCAB)&&
+         ds4_gpu_tensor_read(scattered,0,dense,2ull*VOCAB*4u),"R2 scatter");
+    for(uint32_t r=0;r<2;r++) for(uint32_t i=0;i<CAP2;i++)
+        need(!memcmp(&dense[(uint64_t)r*VOCAB+
+                            selected_ids[1][(uint64_t)r*CAP2+i]],
+                     &values[1][(uint64_t)r*CAP2+i],4),"R2 scattered value");
+    setenv("DS4_QWEN4EXP_NO_TARGET_NATIVE_SCREEN_R2","1",1);
+    need(ds4_gpu_mtp_native_screen2(out2,ids2,scratch2,w,bytes,offset,DIM,VOCAB,
+         PREFIX,TAIL,x2)==0,"R2 valve fallback");
+    unsetenv("DS4_QWEN4EXP_NO_TARGET_NATIVE_SCREEN_R2");
+    free(a2);free(after);free(values[0]);free(values[1]);free(dense);
+    free(reference);free(tail_ref);free(selected_ids[0]);free(selected_ids[1]);
+    ds4_gpu_tensor_free(x2);ds4_gpu_tensor_free(out2);ds4_gpu_tensor_free(ids2);
+    ds4_gpu_tensor_free(scratch2);ds4_gpu_tensor_free(scattered);
+    ds4_gpu_tensor_free(full2);ds4_gpu_tensor_free(tail2);
 }
 static void run_case(int adversarial, uint32_t offset) {
     const uint64_t bytes=offset+(uint64_t)VOCAB*ROW;
@@ -112,6 +195,8 @@ static void run_case(int adversarial, uint32_t offset) {
             for(unsigned i=0;i<CAP;i++) need(found[i]!=PREFIX-1 && selected[i]==0,"screen is approximate");
             for(unsigned i=1;i<CAP-TAIL;i++) need(found[i]==i,"coarse tie lowest ID");
         }
+        if(!adversarial && replay==0)
+            compare_r2_paths(w,bytes,offset,activation);
     }
     /* Map original IDs, reject bad packed IDs, and preserve legacy NaN0. */
     uint32_t packed=CAP-1,mapped=0;
