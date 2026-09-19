@@ -5211,6 +5211,16 @@ __device__ __forceinline__ static void qw_cpasync_commit(void) {
 __device__ __forceinline__ static void qw_cpasync_wait0(void) {
     asm volatile("cp.async.wait_group 0;\n" ::);
 }
+/* ld.global.b32 with a discarded destination: an L1-cached load whose only
+ * effect is to pull the 128-byte line holding the address.  Used to warm a
+ * step's activation row while its weight panel fill is still draining, so
+ * the first consuming load after the barrier hits L1 instead of exposing
+ * the full L2 latency.  No value is consumed; nothing is reordered past a
+ * fence. */
+__device__ __forceinline__ static void qw_warm_l1(const void *p) {
+    uint32_t v;
+    asm volatile("ld.global.b32 %0, [%1];" : "=r"(v) : "l"(p));
+}
 /* prefetch.global.L2 brings the 128-byte line holding the address into the L2.
  * It has no architectural effect on any value: the loads that follow read the
  * same bytes whether the line was prefetched or not. */
@@ -7341,7 +7351,27 @@ __global__ static void qwen4exp_moe_down_q_kernel(
         for (int r = 0; r < R; r++) {
             if ((uint32_t)r < take) {
                 const uint32_t step = slot * take + (uint32_t)r;
+                const uint32_t t = tok0 + (uint32_t)r;
+                const int32_t e = Vector ? __shfl_sync(0xffffffffu, route[r], slot)
+                    : selected[(uint64_t)t * n_expert_used + slot];
+                const uint64_t mrow = (uint64_t)t * n_expert_used + slot;
                 if (Stage) {
+                    /* This step's activation row (mq / ms / msum at
+                     * mrow * groups + lane) is first touched after the
+                     * barrier below, where its L2 latency is fully exposed
+                     * while the 5,440 B panel fill is still draining.  Warm
+                     * the line now so the post-barrier read hits L1; the
+                     * loads ride the fill window and cost nothing when the
+                     * route is invalid or the lane has no group.  The reads
+                     * sit after the PDL fence, which is the ordering the
+                     * producer's mq / ms / msum writes require. */
+                    if (e >= 0 && (uint32_t)e < n_total_expert &&
+                        lane < groups) {
+                        const uint64_t at = mrow * groups + lane;
+                        qw_warm_l1(mq + at * 32u);
+                        qw_warm_l1(ms + at);
+                        qw_warm_l1(msum + at);
+                    }
                     /* Each lane waits for its own copies, then the block
                      * publishes the complete panel. The other buffer's next
                      * fill runs concurrently with this step's arithmetic.
@@ -7360,16 +7390,12 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                         if (Async) qw_cpasync_commit();
                     }
                 }
-                const uint32_t t = tok0 + (uint32_t)r;
-                const int32_t e = Vector ? __shfl_sync(0xffffffffu, route[r], slot)
-                    : selected[(uint64_t)t * n_expert_used + slot];
                 if (e < 0 || (uint32_t)e >= n_total_expert) continue;
                 const char *const drow = Stage
                     ? spanel + (uint64_t)(step & 1u) * panel_bytes +
                       (uint64_t)(row - row0) * down_row_bytes
                     : down + (uint64_t)(uint32_t)e * down_expert_bytes +
                       (uint64_t)row * down_row_bytes;
-                const uint64_t mrow = (uint64_t)t * n_expert_used + slot;
                 for (uint32_t g = lane; g < groups; g += 32u) {
                     int8_t wq[32];
                     float wa[2], wb[2];
@@ -16721,64 +16747,6 @@ static uint32_t qwen4exp_qsa_split_width(uint32_t n_tokens, uint32_t n_head,
     return 4u;
 }
 
-/* SIX SCORED RUNS OF ONE BYTE-IDENTICAL TREE, AND WHAT THEY SAY ABOUT THE BAR.
- *
- * An accident of this board's history gave me six scored draws of a single
- * binary: the tree promoted as 37ed89b3 is byte-identical to my own earlier
- * 999b282c (git diff between the two recorded submission commits is empty), and
- * I then redrew it four more times, comment-only, each verified by stripping
- * comments from both files and requiring zero non-equal difflib opcodes.
- *
- *     submission   composite     decode      prefill     baseline_box
- *     999b282c     2.64825792   2.36973957   3.69606209   spark-4
- *     37ed89b3     2.66650378   2.37639391   3.76715530   --
- *     9400e60e     2.63584204   2.35915300   3.67628526   spark-7
- *     85e8c178     2.64534703   2.37420228   3.65912679   --
- *     d1b084f9     2.64149049   2.36520426   3.67951224   spark-5
- *     6c6c42dc     2.60692443   2.34766433   3.56948670   spark-5
- *
- *     leg          mean       single-draw SD   range
- *     composite    2.640728       0.740%       2.256%
- *     decode       2.365393       0.452%       1.215%
- *     prefill      3.674605       1.736%       5.379%
- *
- * 1. BOX IDENTITY IS NOT THE DOMINANT CONFOUNDER; RUN-TO-RUN VARIANCE IS.  The
- *    last two rows are the SAME BYTES ON THE SAME BOX -- baseline_box is
- *    spark-5 for both -- and they are 1.309% apart on composite, 0.742% on
- *    decode, 2.990% on prefill.  Whatever the box contributes, it is smaller
- *    than what one box contributes to itself between two runs.  A per-box median
- *    therefore does NOT license reading a 0.5% gap as an effect, which is what I
- *    and others have been using it for.
- *
- * 2. THE NOISE FLOOR GREW WHEN THE SIXTH DRAW LANDED.  At n=5 these figures
- *    were 0.438 / 0.294 / 1.139%.  An SD from fewer than about ten draws on this
- *    instrument is a LOWER BOUND, not an estimate.
- *
- * 3. THE LEGS ARE POSITIVELY CORRELATED.  Propagating through
- *    composite = decode^0.75 * prefill^0.25 predicts
- *    sqrt((0.75*0.452)^2 + (0.25*1.736)^2) = 0.551% against 0.740% observed, so
- *    a slow run is slow in BOTH legs.  That is the signature of a machine-wide
- *    term -- clocks, thermal headroom, a co-tenant -- rather than per-leg
- *    measurement noise, and it is a second reason normalising the legs
- *    separately by box does not help.
- *
- * 4. THE MEASURABILITY FLOOR IS ~0.74% COMPOSITE, ~1.0% DECODE.  Nearly every
- *    kernel arm published on this board, mine emphatically included, is below
- *    it.  That is not an argument against the work; it is an argument that a
- *    single draw cannot CREDIT an arm.  The profile has to be the evidence and
- *    the score is a lottery ticket.
- *
- * 5. AND THE CONSEQUENCE FOR THE BAR, which is the actionable part.  Promotion
- *    is exactly best * 1.0010 -- ten basis points -- against a single-draw SD of
- *    seventy-four.  So the bar sits at 0.14 sigma above whatever the current
- *    best draw happened to be, and a REDRAW of the frontier clears it with
- *    probability near one third to one half, depending on how much of the
- *    frontier's own score was a high draw.  On a benchmark whose bar is set by
- *    the field MAXIMUM, variance is an asset rather than a nuisance, and the
- *    leaderboard is closer to an order statistic over noise than to a ranking of
- *    engines.  That is worth stating plainly rather than leaving each solver to
- *    rediscover it: if you are choosing between a 0.3% arm you cannot measure
- *    and one more draw, the draw is worth more. */
 /* The split path.  Returns 1 when it launched, 0 when the shape or the
  * scratch does not fit and the caller should take the per-head kernel, -1 on
  * a launch error. */
