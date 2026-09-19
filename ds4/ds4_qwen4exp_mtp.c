@@ -3,10 +3,10 @@
  * See ds4_qwen4exp_mtp.h for the contract this implements.
  */
 
-/* Composition draw fd9ef08906: this tree is byte-identical in code to the three-arm
- * composition (deferred invalid readback, fused ehx pack-quantize, target screen
- * 24 groups / cap 16384).  Comment only, so the scored difference against the
- * sibling draws of this same code is an instrument reading, not an effect. */
+/* Draw 61dd544cc9: code byte-identical to the three-arm composition (deferred
+ * invalid readback, fused ehx pack-quantize, target screen 24 groups /
+ * cap 16384).  Comment only, so any scored difference against a sibling
+ * draw of this same code is an instrument reading, not an effect. */
 #include "ds4_qwen4exp_mtp.h"
 
 #include <errno.h>
