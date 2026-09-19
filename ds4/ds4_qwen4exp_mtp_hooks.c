@@ -52,10 +52,9 @@
 extern int ds4_gpu_mtp_native_screen_init(uint32_t, uint64_t *, uint32_t *) __attribute__((weak));
 extern int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *,
     const void *, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t,
-    const ds4_gpu_tensor *, int) __attribute__((weak));
+    const ds4_gpu_tensor *) __attribute__((weak));
 extern int ds4_gpu_mtp_native_map(ds4_gpu_tensor *, const ds4_gpu_tensor *,
-    const ds4_gpu_tensor *, const ds4_gpu_tensor *, uint32_t, uint32_t,
-    uint32_t, int) __attribute__((weak));
+    const ds4_gpu_tensor *, uint32_t, uint32_t) __attribute__((weak));
 extern int ds4_gpu_qwen4exp_ehx_pack_tensor(
         ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *,
         uint32_t, uint32_t, uint32_t) __attribute__((weak));
