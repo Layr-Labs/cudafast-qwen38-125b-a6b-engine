@@ -25,6 +25,9 @@ extern int ds4_gpu_mtp_native_screen2(
 extern int ds4_gpu_mtp_native_scatter2(
         ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *,
         uint32_t, uint32_t) __attribute__((weak));
+extern int ds4_gpu_mtp_native_top1_map2(
+        ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *,
+        uint32_t, uint32_t) __attribute__((weak));
 #endif
 
 /* ======================================================================
@@ -447,13 +450,15 @@ struct ds4_qwen4exp_session {
 
     ds4_gpu_tensor *logits;
     ds4_gpu_tensor *spec_top1;
-    /* CUDA R2 target-head screen.  One fused coarse pass shares the weight
+    /* CUDA target-head screen.  One fused coarse pass shares the weight
      * stream while ranking and exact refinement remain independent per row.
-     * One-row verification deliberately retains the exact full head. */
+     * A compact one-row verify duplicates its activation into the otherwise
+     * unused second lane; ordinary one-row logits retain the exact full head. */
     ds4_gpu_tensor *target_native_scratch2;
     ds4_gpu_tensor *target_native_ids;
     ds4_gpu_tensor *target_native_logits;
     uint32_t        target_native_capacity;
+    uint32_t        target_native_compact_rows;
 
     /* PREFILL ONLY.  True while `hyper` still owes the last block's inject:
      * the value the model means is hyper + block_out * inject, and the next
@@ -3278,8 +3283,11 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     }
     const ds4_gpu_tensor *head_x =
         logit_rows == 1u ? s->embed_rows : s->mixed;
+    s->target_native_compact_rows = 0u;
     bool target_screened = false;
-    if (logit_rows == 2u && s->target_native_capacity &&
+    bool target_compact_top1 = false;
+    const bool compact_r1 = logit_rows == 1u && s->spec_top1_rows == 1u;
+    if ((logit_rows == 2u || compact_r1) && s->target_native_capacity &&
         s->target_native_scratch2 && s->target_native_ids &&
         s->target_native_logits && ds4_gpu_mtp_native_screen2 &&
         ds4_gpu_mtp_native_scatter2 && cfg->n_vocab > 276u) {
@@ -3289,15 +3297,17 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
          * row is then recomputed by the ordinary exact Q8 dot and scattered
          * back to its original id; only omitted rows become -FLT_MAX.
          *
-         * This conservative target-only gate deliberately excludes the
-         * one-row decode head.  A declined R2 screen and every R1 call use the
-         * ordinary full-vocabulary projection below. */
+         * Compact R1 verification consumes only top-1, so duplicate its
+         * activation into the second lane and reuse the exact same wide R2
+         * selector.  User-visible one-row logits never take this path. */
         const uint32_t tail = 276u;
         const uint32_t prefix = cfg->n_vocab - tail;
-        if (!ds4_gpu_tensor_fill_f32(
-                s->logits, -FLT_MAX,
-                2ull * cfg->n_vocab)) {
-            fprintf(stderr, "ds4: qwen4exp target-screen logit clear failed\n");
+        if (compact_r1 && !ds4_gpu_tensor_copy(
+                s->embed_rows, (uint64_t)DS4_N_EMBD * sizeof(float),
+                s->embed_rows, 0,
+                (uint64_t)DS4_N_EMBD * sizeof(float))) {
+            fprintf(stderr,
+                    "ds4: qwen4exp target-screen R1 duplicate failed\n");
             return qwen4exp_forward_fail();
         }
         const int rc = ds4_gpu_mtp_native_screen2(
@@ -3311,13 +3321,35 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
             return qwen4exp_forward_fail();
         }
         if ((uint32_t)rc == s->target_native_capacity) {
-            if (!ds4_gpu_mtp_native_scatter2(
-                    s->logits, s->target_native_logits,
-                    s->target_native_ids, s->target_native_capacity,
-                    cfg->n_vocab)) {
-                fprintf(stderr,
-                        "ds4: qwen4exp target LM-head R2 scatter failed\n");
-                return qwen4exp_forward_fail();
+            const bool compact = s->spec_top1_rows == 2u && !logits_out &&
+                getenv("DS4_QWEN4EXP_NO_COMPACT_TARGET_TOP1") == NULL &&
+                ds4_gpu_mtp_native_top1_map2;
+            if (compact) {
+                if (!ds4_gpu_mtp_native_top1_map2(
+                        s->spec_top1, s->target_native_logits,
+                        s->target_native_ids, s->target_native_capacity,
+                        cfg->n_vocab)) {
+                    fprintf(stderr,
+                            "ds4: qwen4exp compact target top-1 failed\n");
+                    return qwen4exp_forward_fail();
+                }
+                target_compact_top1 = true;
+                s->target_native_compact_rows = 2u;
+            } else {
+                if (!ds4_gpu_tensor_fill_f32(
+                        s->logits, -FLT_MAX, 2ull * cfg->n_vocab)) {
+                    fprintf(stderr,
+                            "ds4: qwen4exp target-screen logit clear failed\n");
+                    return qwen4exp_forward_fail();
+                }
+                if (!ds4_gpu_mtp_native_scatter2(
+                        s->logits, s->target_native_logits,
+                        s->target_native_ids, s->target_native_capacity,
+                        cfg->n_vocab)) {
+                    fprintf(stderr,
+                            "ds4: qwen4exp target LM-head R2 scatter failed\n");
+                    return qwen4exp_forward_fail();
+                }
             }
             target_screened = true;
         }
@@ -3330,7 +3362,7 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         fprintf(stderr, "ds4: qwen4exp LM head failed\n");
         return qwen4exp_forward_fail();
     }
-    if (s->spec_top1_rows != 0u &&
+    if (s->spec_top1_rows != 0u && !target_compact_top1 &&
         (s->spec_top1_rows != logit_rows ||
          !ds4_gpu_indexer_topk_tensor(s->spec_top1, s->logits,
                                       cfg->n_vocab, logit_rows, 1u))) {
@@ -3924,6 +3956,34 @@ bool ds4_qwen4exp_graph_read_logit_row(ds4_qwen4exp_session *s,
     const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
     if (!s || !logits || row >= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT) {
         return false;
+    }
+    if (row < s->target_native_compact_rows &&
+        s->target_native_capacity && s->target_native_ids &&
+        s->target_native_logits) {
+        const uint64_t n = s->target_native_capacity;
+        uint32_t *ids = (uint32_t *)malloc((size_t)n * sizeof(uint32_t));
+        float *values = (float *)malloc((size_t)n * sizeof(float));
+        if (!ids || !values) {
+            free(ids);
+            free(values);
+            return false;
+        }
+        const uint64_t id_offset = (uint64_t)row * n * sizeof(uint32_t);
+        const uint64_t value_offset = (uint64_t)row * n * sizeof(float);
+        const bool ok =
+            ds4_gpu_tensor_read(s->target_native_ids, id_offset, ids,
+                                n * sizeof(uint32_t)) &&
+            ds4_gpu_tensor_read(s->target_native_logits, value_offset, values,
+                                n * sizeof(float));
+        if (ok) {
+            for (uint32_t i = 0; i < cfg->n_vocab; i++) logits[i] = -FLT_MAX;
+            for (uint32_t i = 0; i < n; i++) {
+                if (ids[i] < cfg->n_vocab) logits[ids[i]] = values[i];
+            }
+        }
+        free(ids);
+        free(values);
+        return ok;
     }
     const uint64_t bytes = (uint64_t)cfg->n_vocab * sizeof(float);
     return ds4_gpu_tensor_read(s->logits, (uint64_t)row * bytes,

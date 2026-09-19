@@ -76062,7 +76062,24 @@ static int qwen4exp_seam_read_logit_row(void *ctx, uint32_t row,
  * bit, and one implementation is how that is guaranteed rather than tested. */
 static int qwen4exp_seam_decode_token(void *ctx, int token, uint32_t pos,
                                       float *hc_row, float *logits) {
-    return qwen4exp_seam_verify_rows(ctx, &token, 1u, pos, hc_row, logits);
+    if (getenv("DS4_QWEN4EXP_NO_COMMIT1_TARGET_SCREEN") != NULL) {
+        return qwen4exp_seam_verify_rows(
+                ctx, &token, 1u, pos, hc_row, logits);
+    }
+    ds4_session *s = ctx;
+    ds4_engine *e = s->engine;
+    const uint32_t at = ds4_qwen4exp_session_pos(e->qwen4exp_session);
+    if (at != pos) return -1;
+    const int32_t tok = (int32_t)token;
+    int top1 = -1;
+    if (!ds4_qwen4exp_graph_verify_top1_rows(
+            e->qwen4exp_session, e->qwen4exp_weights, &e->model,
+            &tok, 1u, hc_row, &top1)) {
+        return -1;
+    }
+    (void)top1;
+    return ds4_qwen4exp_graph_read_logit_row(
+            e->qwen4exp_session, 0u, logits) ? 0 : -1;
 }
 
 static int qwen4exp_seam_head_logits(void *ctx, const float *hc_row,

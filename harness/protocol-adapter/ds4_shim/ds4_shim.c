@@ -147,7 +147,7 @@ ds4s_handle *ds4s_open(const char *model_path, const char *mtp_head_path,
     if (getenv("DS4_SHIM_NO_WARMUP") == NULL) {
         const int vocab = ds4s_vocab_size(h);
         enum { WARM_PROMPT = 1024, WARM_ROUNDS = 16, WARM_CAP = 8,
-               WARM_ROUNDS_CHAIN = 4, WARM_PERIOD = 17,
+               WARM_ROUNDS_CHAIN = 24, WARM_PERIOD = 17,
                WARM_STRIDE = 7919 };
         if (vocab > 16) {
             int32_t *ids = (int32_t *)malloc((size_t)WARM_PROMPT * sizeof(*ids));
@@ -178,26 +178,32 @@ ds4s_handle *ds4s_open(const char *model_path, const char *mtp_head_path,
                     if (mtp_draft_tokens >= 1) {
                         int32_t out[WARM_CAP];
                         int32_t t = ds4s_argmax(h);
-                        /* WALK BOTH PARITIES, AND WIDTH 1 AT EACH OF THEM.
+                        /* WALK THE ACTUAL FRONTIER, BOTH PARITIES, AND WIDTH 1.
                          *
-                         * Following the chain with `t = out[n - 1]` every
-                         * round takes only the accepting branch, so the
-                         * rejecting branch's snapshot count and the other
-                         * parity were first seen inside the timed window.
-                         * Alternating follow and break walks both.  The
-                         * ds4s_eval after each round warms width 1 at
-                         * whatever parity that round left -- an eval cannot
-                         * move the parity itself, because a swap needs
-                         * width 2 and exactly one snapshot, so it samples the
-                         * parity rather than advancing it.
+                         * `out` contains only tokens the cycle committed; its
+                         * last entry is NOT the frontier token the next cycle
+                         * consumes.  Production reads that token through
+                         * ds4s_argmax().  Feeding out[n - 1] therefore broke
+                         * pending_parent on every warm round, invalidated the
+                         * draft chain, and repeatedly exercised only the plain
+                         * one-row cycle.  Read the frontier after every state-
+                         * advancing call exactly as the production driver does.
+                         *
+                         * The first loop is long enough for the natural chain
+                         * to revisit each two-row graph identity after its
+                         * first eager sight, so capture happens before the
+                         * socket is published.  The second loop evaluates a
+                         * frontier after every second speculative round.  That
+                         * samples width 1 at the parity the preceding two-row
+                         * round left, then deliberately clears the chain; the
+                         * following pair rebuilds it and reaches width 2 again.
                          *
                          * A round that refuses ends the loop exactly as
                          * before; nothing here is load bearing and the
                          * invalidate below resets the session either way.
                          *
-                         * ADDITIVE, NOT A REPLACEMENT.  The original four
-                         * CONSECUTIVE chain-following rounds run first and
-                         * unchanged, because consecutive spec rounds are the
+                         * ADDITIVE, NOT A REPLACEMENT.  The consecutive
+                         * chain-following rounds run first, because they are the
                          * only way to reach the `reuse` path
                          * (reuse = active && PREVIOUS && recurrent == 1 &&
                          * conv == 1), and that path is what the scored decode
@@ -208,15 +214,15 @@ ds4s_handle *ds4s_open(const char *model_path, const char *mtp_head_path,
                             const int n = ds4s_eval_speculative(h, t, 2, out,
                                                                 WARM_CAP);
                             if (n <= 0) break;
-                            t = out[n - 1];
+                            t = ds4s_argmax(h);
                         }
                         for (int r = 0; r < WARM_ROUNDS; r++) {
                             const int n = ds4s_eval_speculative(h, t, 2, out,
                                                                 WARM_CAP);
                             if (n <= 0) break;
-                            (void)ds4s_eval(h, out[n - 1]);
-                            t = (r & 1) ? ds4s_argmax(h)
-                                        : ids[(r * 37 + 11) % WARM_PROMPT];
+                            t = ds4s_argmax(h);
+                            if ((r & 1) && ds4s_eval(h, t) == 0)
+                                t = ds4s_argmax(h);
                         }
                     }
                 }
