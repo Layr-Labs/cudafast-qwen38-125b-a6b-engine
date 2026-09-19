@@ -3116,12 +3116,6 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         return false;
     }
 
-    if (!ds4_gpu_tensor_write(s->tokens, 0, tokens,
-                              (uint64_t)n_tokens * sizeof(int32_t))) {
-        fprintf(stderr, "ds4: qwen4exp token upload failed\n");
-        return false;
-    }
-
     /* The PLE host half runs BEFORE the batch opens: the row upload is a
      * memcpy into a shared buffer, and a memcpy between an encode and a commit
      * would land ahead of work already encoded.  Nothing here touches the
@@ -3213,8 +3207,12 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         }
         s->adopt_device = s->adopt_state;
     }
-    if (s->d_pos && !ds4_gpu_qwen4exp_update_dpos(s->d_pos, s->pos)) {
-        fprintf(stderr, "ds4: qwen4exp position update failed\n");
+    const bool token_pos_ok = s->d_pos
+        ? ds4_gpu_qwen4exp_update_dpos_tokens(
+              s->d_pos, s->tokens, s->pos, tokens, n_tokens) != 0
+        : ds4_gpu_tensor_write_i32_small(s->tokens, tokens, n_tokens) != 0;
+    if (!token_pos_ok) {
+        fprintf(stderr, "ds4: qwen4exp position/token update failed\n");
         return false;
     }
     if (!ds4_gpu_begin_commands()) {
@@ -3339,8 +3337,12 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     }
     QW_TRACE(QW_SLICE_HEAD);
     QW_TRACE_REPORT(n_tokens);
-    /* Commit and wait: the logits are read on the host from here on. */
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
+    /* CUDA has no command buffer to close here, and every successful entry
+     * immediately reaches a blocking D2H read: logits below for serial, or
+     * compact top-1 in ds4_qwen4exp_graph_verify_top1_rows.  Let that required
+     * read own completion instead of draining the device twice first.  Other
+     * backends keep their ordinary end operation in the helper. */
+    if (!ds4_gpu_end_commands_for_readback()) {
         fprintf(stderr, "ds4: qwen4exp command batch did not complete\n");
         ds4_gpu_oneshot_graph_retire();
         return false;
@@ -3978,7 +3980,7 @@ bool ds4_qwen4exp_graph_head_logits(ds4_qwen4exp_session       *s,
         fprintf(stderr, "ds4: qwen4exp LM head failed on the head row\n");
         return qwen4exp_forward_fail();
     }
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
+    if (!ds4_gpu_end_commands_for_readback()) {
         fprintf(stderr, "ds4: qwen4exp command batch did not complete\n");
         return false;
     }

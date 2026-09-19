@@ -6068,6 +6068,20 @@ extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, con
     return cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, data, (size_t)bytes, cudaMemcpyHostToDevice), "tensor write");
 }
 
+extern "C" int ds4_gpu_tensor_write_i32_small(
+        ds4_gpu_tensor *tensor, const int32_t *data, uint32_t count) {
+    return ds4_gpu_tensor_write(tensor, 0, data,
+                                (uint64_t)count * sizeof(int32_t));
+}
+
+extern "C" int ds4_gpu_qwen4exp_update_dpos_tokens(
+        ds4_gpu_tensor *d_pos, ds4_gpu_tensor *tokens, uint32_t pos,
+        const int32_t *token_data, uint32_t n_tokens) {
+    return ds4_gpu_tensor_write(tokens, 0, token_data,
+                                (uint64_t)n_tokens * sizeof(int32_t)) &&
+           ds4_gpu_qwen4exp_update_dpos(d_pos, pos);
+}
+
 extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     return cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes, cudaMemcpyDeviceToHost), "tensor read");
@@ -6131,6 +6145,11 @@ extern "C" int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const 
 }
 extern "C" int ds4_gpu_end_commands(void) {
     return cuda_ok(cudaDeviceSynchronize(), "end commands");
+}
+extern "C" int ds4_gpu_end_commands_for_readback(void) {
+    /* This optimization is CUDA-scoped.  Preserve ROCm's established
+     * command-boundary semantics until its stream ordering is measured. */
+    return ds4_gpu_end_commands();
 }
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
 

@@ -1606,6 +1606,11 @@ int ds4_gpu_tensor_write(ds4_gpu_tensor *t, uint64_t off, const void *src,
     memcpy(t->data + off, src, (size_t)bytes);
     return 1;
 }
+int ds4_gpu_tensor_write_i32_small(ds4_gpu_tensor *t, const int32_t *src,
+                                   uint32_t count) {
+    return ds4_gpu_tensor_write(t, 0, src,
+                                (uint64_t)count * sizeof(int32_t));
+}
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *t, uint64_t off, void *dst,
                         uint64_t bytes) {
     if (!t || off + bytes > t->bytes) return 0;
@@ -1648,6 +1653,9 @@ int ds4_gpu_indexer_topk_tensor(ds4_gpu_tensor *selected,
 }
 int ds4_gpu_begin_commands(void) { return 1; }
 int ds4_gpu_end_commands(void) { return 1; }
+int ds4_gpu_end_commands_for_readback(void) {
+    return ds4_gpu_end_commands();
+}
 int ds4_gpu_synchronize(void) { return 1; }
 
 /* ---- the recorded call log --------------------------------------------- */

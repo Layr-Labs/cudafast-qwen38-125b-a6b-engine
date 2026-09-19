@@ -1140,8 +1140,7 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
     for (uint32_t t = 0; t < n_tokens; t++) ids[t] = (int32_t)next_tokens[t];
 
     const char *stage = "token upload";
-    bool ok = ds4_gpu_tensor_write(h->t_tokens, 0, ids,
-                                   (uint64_t)n_tokens * sizeof(int32_t)) != 0;
+    bool ok = ds4_gpu_tensor_write_i32_small(h->t_tokens, ids, n_tokens) != 0;
     if (ids != ids_stack) free(ids);
     MTP_HEAD_TICK(MTP_HEAD_T_TOKEN);
     if (ok) {
@@ -1338,7 +1337,10 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                                   draft_width, h->n_vocab) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_TOP1);
-    if (ok) ok = ds4_gpu_end_commands() != 0;
+    /* The top-1 D2H immediately below is mandatory on every successful head
+     * call.  On CUDA it is the completion fence; cache-only calls above keep
+     * their ordinary end_commands because they have no following readback. */
+    if (ok) ok = ds4_gpu_end_commands_for_readback() != 0;
     else (void)ds4_gpu_synchronize();
     MTP_HEAD_TICK(MTP_HEAD_T_END);
 
