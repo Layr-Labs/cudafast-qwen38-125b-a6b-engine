@@ -1,21 +1,25 @@
 /* Host integration/lifetime/error contract only; mock selection does not test
  * CUDA numerics. Reuses existing independent head algebra and GPU mocks.
  * cc -O3 -ffast-math -fno-finite-math-only -std=c11 -D_GNU_SOURCE -Ids4 \
- * ds4/tests/test_mtp_native_hooks.c ds4/ds4_qwen4exp_mtp.c -lm -o /tmp/test-native-hooks
+ * ds4/tests/test_mtp_hooks.c ds4/ds4_qwen4exp_mtp.c -lm -o /tmp/test-native-hooks
  */
 #define main original_mtp_main
 #include "test_qwen4exp_mtp.c"
 #undef main
 static unsigned calls,maps;
 static int mode;
+static int invalid;
 static float observed[HEAD_N_EMBD];
 static int screen_mock(ds4_gpu_tensor *out,ds4_gpu_tensor *ids,ds4_gpu_tensor *scratch,
         const void *map,uint64_t bytes,uint64_t offset,uint32_t dim,uint32_t vocab,
-        uint32_t prefix,uint32_t tail,const ds4_gpu_tensor *x) {
+        uint32_t prefix,uint32_t tail,const ds4_gpu_tensor *x,int defer_invalid) {
     calls++;
     CHECK(scratch && dim==HEAD_N_EMBD && vocab==HEAD_N_VOCAB && prefix==5 && tail==2,"screen inputs");
+    CHECK(defer_invalid==(getenv("DS4_MTP_NO_DEFER_INVALID_FLAG")==NULL),
+          "screen defer mode");
     memcpy(observed,x->data,sizeof observed);
     if(mode) return mode==10?0:mode;
+    if(invalid && !defer_invalid) return 0;
     float full[HEAD_N_VOCAB];ds4_gpu_tensor view={sizeof full,(unsigned char *)full,1};
     CHECK(stub_matmul(&view,map,bytes,offset,dim,vocab,x,1),"oracle projection");
     /* Compact exact rows in original ID order; mandatory0/tail and one other. */
@@ -25,11 +29,16 @@ static int screen_mock(ds4_gpu_tensor *out,ds4_gpu_tensor *ids,ds4_gpu_tensor *s
     return 4;
 }
 static int map_mock(ds4_gpu_tensor *winner,const ds4_gpu_tensor *logits,
-                    const ds4_gpu_tensor *ids,uint32_t count,uint32_t vocab) {
-    maps++;CHECK(count==4 && vocab==HEAD_N_VOCAB,"map inputs");
+                    const ds4_gpu_tensor *ids,const ds4_gpu_tensor *scratch,
+                    uint32_t count,uint32_t vocab,uint32_t width,
+                    int defer_invalid) {
+    maps++;CHECK(scratch && count==4 && vocab==HEAD_N_VOCAB && width==7,
+                 "map inputs");
     uint32_t bits;memcpy(&bits,logits->data,4);
     uint32_t p=(bits&0x7fffffffu)>0x7f800000u?0:*(uint32_t *)winner->data;
-    *(uint32_t *)winner->data=p<count?((uint32_t *)ids->data)[p]:UINT32_MAX;return 1;
+    *(uint32_t *)winner->data=p<count?((uint32_t *)ids->data)[p]:UINT32_MAX;
+    if(defer_invalid) ((uint32_t *)winner->data)[1]=(uint32_t)invalid;
+    return 1;
 }
 static void attach(ds4_qwen4exp_mtp_head *h) {
     h->hooks.native_screen=screen_mock;h->hooks.native_map=map_mock;
@@ -53,6 +62,22 @@ int main(void) {
         for(unsigned i=0;i<4;i++) {CHECK(((float *)h.t_logits->data)[i]==full[chosen[i]],"selected exact row");if(full[chosen[i]]>full[chosen[best]])best=i;}
         CHECK(got==(int)chosen[best],"original ID winner");
     }
+    invalid=1;calls=maps=0;int fallback=-1;
+    CHECK(ds4_qwen4exp_mtp_head_forward(&h,tokens,input,12,1,&fallback,NULL,
+          g_err,sizeof g_err)==0&&calls==1&&maps==1,
+          "deferred nonfinite fallback");
+    float fallback_full[HEAD_N_VOCAB];oracle_logits(tokens,input,0,fallback_full);
+    const unsigned fallback_ids[]={0,1,2,3,4,6,7};unsigned fallback_best=0;
+    for(unsigned i=1;i<7;i++)
+        if(fallback_full[fallback_ids[i]]>fallback_full[fallback_ids[fallback_best]])
+            fallback_best=i;
+    CHECK(fallback==(int)fallback_ids[fallback_best],
+          "deferred fallback winner");
+    setenv("DS4_MTP_NO_DEFER_INVALID_FLAG","1",1);calls=maps=0;
+    CHECK(ds4_qwen4exp_mtp_head_forward(&h,tokens,input,12,1,&fallback,NULL,
+          g_err,sizeof g_err)==0&&calls==1&&maps==0,
+          "immediate nonfinite valve fallback");
+    unsetenv("DS4_MTP_NO_DEFER_INVALID_FLAG");invalid=0;
     calls=maps=0;int ids[HEAD_ROWS];
     CHECK(ds4_qwen4exp_mtp_head_forward(&h,tokens,input,12,HEAD_ROWS,ids,NULL,g_err,sizeof g_err)==0 && calls==0,"multirow fallback");
     CHECK(ds4_qwen4exp_mtp_head_forward_last(&h,tokens,input,12,HEAD_ROWS,ids,NULL,g_err,sizeof g_err)==0 && calls==1,"last-only short batch eligible");

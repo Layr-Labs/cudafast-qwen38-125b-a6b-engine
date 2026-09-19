@@ -188,21 +188,20 @@ static long field_int_array(const char *line, const char *key, int32_t **out) {
     *out = NULL;
     if (!at || *at != '[') return -1;
     at++;
-    size_t cap = 64, n = 0;
-    int32_t *buf = malloc(cap * sizeof(*buf));
+    /* Every element costs at least one byte before the closing ']', so the
+       region length is an exact capacity bound: one allocation, no doubling,
+       no prefix copies. */
+    const char *close = strchr(at, ']');
+    if (!close) return -1;
+    int32_t *buf = malloc(((size_t)(close - at) + 1) * sizeof(*buf));
     if (!buf) return -1;
+    size_t n = 0;
     while (*at && *at != ']') {
         while (*at == ' ' || *at == ',') at++;
         if (*at == ']' || !*at) break;
         char *end = NULL;
         const long long v = strtoll(at, &end, 10);
         if (end == at) { free(buf); return -1; }
-        if (n == cap) {
-            cap *= 2;
-            int32_t *grown = realloc(buf, cap * sizeof(*buf));
-            if (!grown) { free(buf); return -1; }
-            buf = grown;
-        }
         buf[n++] = (int32_t)v;
         at = end;
         while (*at == ' ') at++;
