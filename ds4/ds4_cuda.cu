@@ -17979,6 +17979,12 @@ int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows) {
  * eighteen in both, so a does-this-kernel-run filter applied to one phase
  * produces false negatives for the other.
  */
+/* This build's note auto09191120_79 records that two kernels with identical
+ * grids can still fail to fuse profitably: the fused body takes the higher
+ * register count of the two, and a hundred and thirty-six registers across
+ * two hundred and fifty-six threads exceeds half the register file, which
+ * turns one wave into two.
+ */
 int ds4_qwen4exp_pdl_enabled(void) {
     static int resolved = 0;
     static int enabled = 0;
