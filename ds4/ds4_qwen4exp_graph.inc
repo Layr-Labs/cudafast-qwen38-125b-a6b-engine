@@ -2836,6 +2836,12 @@ static bool qwen4exp_graph_layers_encode(
  * overlap the device work already queued. */
 #define QW_DECODE_GRAPH_MAX_CHUNKS 8u
 
+/* This build's note auto09191213_85 records that the first run inside a
+ * fresh model residency is systematically slower than the ones after it, by
+ * as much as forty-seven percent, because it pays the untimed correctness
+ * phase's graph captures. A comparison that does not discard each
+ * residency's first run is measuring which arm happened to go first.
+ */
 static uint32_t qw_decode_graph_chunks(void) {
     static int init = 0;
     static uint32_t chunks = 4u;   /* the A/B's pick; 1 restores the single capture */
