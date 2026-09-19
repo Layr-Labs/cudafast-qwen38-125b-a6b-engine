@@ -1,3 +1,6 @@
+/* redraw rx0919dual (2026-09-19): binary-equivalent frontier calibration after
+ * dual-GB10 screening rejected the activation-warm, MTP-warp32, and PLE arms.
+ * This archive intentionally changes no executable statement. */
 /* redraw rx22532110 (2026-09-17T22:53:21Z): this archive repeats the official evaluation of the
  * same engine. The only textual difference from the previous evaluation
  * is this dated provenance comment. No behaviour changes. */
