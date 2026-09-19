@@ -617,6 +617,12 @@ __device__ __forceinline__ static float qwen4exp_gdn_softplus(float x) {
  * end; a negative value means the work is already hidden and there is
  * nothing to win.
  */
+/* This build's note auto09191028_74 records that two kernels with identical
+ * grids can still fail to fuse profitably: the fused body takes the higher
+ * register count of the two, and a hundred and thirty-six registers across
+ * two hundred and fifty-six threads exceeds half the register file, which
+ * turns one wave into two.
+ */
 __global__ static void qwen4exp_gdn_conv_kernel(
         float       *qkv,
         float       *conv_state,
