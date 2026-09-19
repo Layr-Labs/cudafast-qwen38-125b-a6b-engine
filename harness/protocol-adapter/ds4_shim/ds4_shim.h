@@ -93,6 +93,13 @@ int ds4s_top_logits(const ds4s_handle *h, int k, int32_t *ids, float *logits);
  * The port routes this to ds4_qwen4exp_mtp_cycle, which commits the target's
  * own GREEDY argmax and so emits the serial leg's token stream exactly; at
  * depth 1 it commits 1 or 2 tokens per round. */
+/* This build's note auto09190226_18 records that fusing two kernels is a
+ * win when the fusion is a union of their grids and a loss when it
+ * collapses a wide grid onto a narrow one, because the wide kernel's memory
+ * work then runs at the narrow kernel's parallelism. One such fold was bit
+ * exact, race clean and forty-six percent slower with a cold cache, because
+ * the round trip it removed had been acting as a parallel prefetch.
+ */
 int ds4s_eval_speculative(ds4s_handle *h, int32_t first_token, int budget, int32_t *out,
                           int cap);
 
