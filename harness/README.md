@@ -37,3 +37,5 @@ scripted session with no GPU. The `ds4-engine` feature is off by default, so
 `tools/ds4/build.sh` produces the `libds4qwen.so` the feature links. The real
 GPU drive is box-validated by `tools/ds4/mtp-exactness-gate.py`.
 <!-- ranked variance draw 20260918T170910Z-235 -->
+
+<!-- ranked current frontier redraw 20260919T201322Z-terrapinelf-08 -->
