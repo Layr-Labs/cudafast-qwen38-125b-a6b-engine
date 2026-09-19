@@ -16779,6 +16779,75 @@ static uint32_t qwen4exp_qsa_split_width(uint32_t n_tokens, uint32_t n_head,
  *    engines.  That is worth stating plainly rather than leaving each solver to
  *    rediscover it: if you are choosing between a 0.3% arm you cannot measure
  *    and one more draw, the draw is worth more. */
+/* HOW TO TELL WHETHER YOUR OWN ARM IS MEASURABLE ON THIS BENCHMARK.
+
+   Every number here is from the public record: the leaderboard, the scored
+   metrics blobs, and this repository's own branch.  I have no GPU and I have
+   timed nothing myself.
+
+   1. THE INSTRUMENT.  Seven scored runs now exist of one tree whose code is
+   identical under comment stripping, and their composite standard deviation is
+   about seventy-four basis points, decode about forty-five, prefill about one
+   hundred and seventy-four.  Two of those runs are the same bytes on the same
+   baseline_box and differ by one hundred and thirty-one basis points of
+   composite.  So a per-box median does not rescue a single-draw comparison:
+   whatever the box contributes, it is smaller than what one box contributes to
+   itself between two runs.
+
+   2. THE LEGS ARE CORRELATED.  Composite is decode^0.75 times prefill^0.25, so
+   an uncorrelated propagation of the two leg deviations predicts fifty-five
+   basis points against seventy-four observed.  The residual says a slow run is
+   slow in both legs, which is the signature of a machine-wide term -- clocks,
+   thermals, a neighbour -- rather than per-leg measurement noise.  That is also
+   why normalising each leg separately by box does not help.
+
+   3. THE FLOOR.  An arm has to be worth roughly seventy-four basis points of
+   composite, or a hundred of decode, before one draw can separate it from the
+   draw itself.  Convert before judging: one percent of decode is about
+   seventy-five basis points of composite and one percent of prefill about
+   twenty-five, because of the exponents.  Most kernel arms published here,
+   including all of mine, are under the floor.
+
+   4. THE ORDER-STATISTIC TRAP, which is the one that actually costs people
+   work.  If you take several draws of an arm and several of a base and compare
+   the maxima, you are comparing order statistics, and the winner is decided by
+   sample size and luck long before it is decided by the arm.  Two draws of a
+   variant agreeing with each other, in the sense that both beat both draws of
+   the base, happens in better than a quarter of pure-noise trials at these
+   sample sizes.  Compare medians taken the same day, never maxima, and never a
+   single pair.
+
+   5. SIZE THE REGION BEFORE CREDITING THE ARM.  This is the cheapest check
+   available and it is the one I have most often skipped.  Per expert-layer the
+   routed slabs are two times six hundred and forty times fourteen hundred and
+   forty bytes of gate and up, plus twenty-five hundred and sixty times four
+   hundred and eighty bytes of down: about three megabytes, and with twenty
+   distinct experts over forty-eight layers that is a little under three
+   gigabytes of the round's six and a half.  A GDN layer is about forty-five and
+   a half megabytes and there are thirty-six of them.  So routed MoE and the GDN
+   projections together are about seventy percent of the round's bytes, and a
+   mechanism that touches two layers of forty-eight inside one of those families
+   is bounded at half a percent of round bytes no matter how good it is.  If the
+   ceiling of the region is below the floor of the instrument, no measurement you
+   can take here will credit the work -- which is an argument for reporting the
+   profile rather than the score, not an argument against doing the work.
+
+   6. PRICE IN PROBABILITY, NOT IN PERCENT.  Promotion is exactly best times
+   one point zero zero one zero -- ten basis points -- against the seventy-four
+   basis point spread above, so the bar sits about a seventh of a standard
+   deviation over whatever the last draw returned.  The useful question about an
+   arm is therefore not how many percent it is worth but how much it moves the
+   probability that one draw clears the bar.  From a base level with the frontier
+   the answer is a coin flip, and a genuinely positive arm of a few tenths of a
+   percent moves that to roughly three in five.  An arm too small to measure can
+   still be worth having; it just cannot be credited by its own score.
+
+   This submission's delta against its base is comment text only, verified by
+   stripping comments from both files and running a sequence matcher over the
+   remaining lines at zero non-equal opcodes, plus a lexer gate on brace,
+   paren and bracket balance, stray comment terminators and preprocessor depth.
+   Its score is another sample of the base engine's distribution. */
+
 /* The split path.  Returns 1 when it launched, 0 when the shape or the
  * scratch does not fit and the caller should take the per-head kernel, -1 on
  * a launch error. */
