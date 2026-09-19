@@ -5901,7 +5901,8 @@ qwen4exp_moe_gateup_mma_kernel(
  * fused SiLU * up * weight expression and the standalone group quantise on
  * the same floats.  Only which block and which lane compute an output
  * changes, so the Q8_0 mid the down tile reads is bit-identical.
- * DS4_GU_HEAVY=0 routes every expert through the 32-pair tile again. */
+ * DS4_GU_HEAVY=0 routes every expert through the 32-pair tile again, byte
+ * for byte, which is the A/B this tile was measured with locally. */
 #define QW_GUH_BM 64u
 #define QW_GUH_BN 64u
 #define QW_GUH_THREADS 256u
