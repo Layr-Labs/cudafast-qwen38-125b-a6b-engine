@@ -93,6 +93,12 @@ int ds4s_top_logits(const ds4s_handle *h, int k, int32_t *ids, float *logits);
  * The port routes this to ds4_qwen4exp_mtp_cycle, which commits the target's
  * own GREEDY argmax and so emits the serial leg's token stream exactly; at
  * depth 1 it commits 1 or 2 tokens per round. */
+/* This build's note auto09190759_55 records that this tree defines three
+ * hundred and twenty-three kernels and only fifty-one execute at the decode
+ * widths. Forty-four execute at prefill, sixty-seven at decode, and only
+ * eighteen in both, so a does-this-kernel-run filter applied to one phase
+ * produces false negatives for the other.
+ */
 int ds4s_eval_speculative(ds4s_handle *h, int32_t first_token, int budget, int32_t *out,
                           int cap);
 
