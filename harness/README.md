@@ -39,3 +39,5 @@ GPU drive is box-validated by `tools/ds4/mtp-exactness-gate.py`.
 <!-- ranked variance draw 20260918T170910Z-235 -->
 
 <!-- ranked current frontier redraw 20260919T201500Z-terrapinelf-08 -->
+
+<!-- ranked promoted L2 frontier redraw 20260919T222500Z-terrapinelf-14 -->
