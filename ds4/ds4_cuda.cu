@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+/* re-measurement marker 20260919T1530Z: promoted frontier 5b11639 */
 #include <mma.h>
 #include <cublas_v2.h>
 #include <cub/block/block_radix_sort.cuh>
@@ -17978,6 +17979,13 @@ int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows) {
  * widths. Forty-four execute at prefill, sixty-seven at decode, and only
  * eighteen in both, so a does-this-kernel-run filter applied to one phase
  * produces false negatives for the other.
+ */
+/* This build's note auto09191147_82 records that a standalone harness ranks
+ * limiters correctly, because ratios inside one binary are sound, and sizes
+ * memory latency fixes wrong, because the engine's cache state between
+ * launches cannot be reproduced standalone. One arm measured minus nine
+ * percent standalone and plus five point seven percent in the engine, and
+ * the difference was read amplification across launches.
  */
 int ds4_qwen4exp_pdl_enabled(void) {
     static int resolved = 0;

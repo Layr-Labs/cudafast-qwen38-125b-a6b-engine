@@ -315,7 +315,7 @@ impl Engine for Ds4Engine {
             )));
         }
         let mut tokens: Vec<i64> = Vec::with_capacity(count as usize);
-        let mut acceptance_lengths: Vec<i64> = Vec::new();
+        let mut acceptance_lengths: Vec<i64> = Vec::with_capacity(count as usize);
         let (drafted_total, accepted_total, verify_replay_disagreements) = {
             let mut s = self.lock();
             match route {
