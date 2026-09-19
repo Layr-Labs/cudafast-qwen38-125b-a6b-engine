@@ -4301,17 +4301,12 @@ __global__ static void qwen4exp_moe_group_scan_parallel_kernel(
  * of live experts: no more than min(n_pairs, n_total_expert). Counts, offsets,
  * active experts and the pair list remain untouched. All 512 threads join the
  * warp/block scans, including padded expert lanes. */
-/* `lo` and `hi` select the experts whose pair count c satisfies lo < c <= hi
- * (the others contribute no windows), so one routing can be split into the
- * 32-pair tile's list and the heavy tile's list. */
 __global__ static void qwen4exp_moe_pair_tasks_kernel(
-        int32_t *tasks, const int32_t *counts, unsigned total,
-        int32_t tile = 32, int32_t lo = 0, int32_t hi = 0x7fffffff) {
+        int32_t *tasks, const int32_t *counts, unsigned total) {
     __shared__ int32_t warp_prefix[16];
     const unsigned e = threadIdx.x, lane = e & 31u, warp = e >> 5u;
-    const int32_t c0 = e < total ? counts[e] : 0;
-    const int32_t count = (c0 > lo && c0 <= hi) ? c0 : 0;
-    const int32_t tiles = (count + tile - 1) / tile;
+    const int32_t count = e < total ? counts[e] : 0;
+    const int32_t tiles = (count + 31) / 32;
     int32_t prefix = tiles;
 #pragma unroll
     for (unsigned d = 1; d < 32; d <<= 1) {
@@ -4334,7 +4329,7 @@ __global__ static void qwen4exp_moe_pair_tasks_kernel(
     const int32_t start = prefix - tiles;
     for (int32_t t = 0; t < tiles; t++) {
         tasks[1 + 2 * (start + t)] = (int32_t)e;
-        tasks[2 + 2 * (start + t)] = t * tile;
+        tasks[2 + 2 * (start + t)] = t * 32;
     }
     if (e == 0) tasks[0] = warp_prefix[15];
 }
@@ -5872,302 +5867,6 @@ qwen4exp_moe_gateup_mma_kernel(
     }
 }
 
-/* ============ THE HEAVY-EXPERT GATE/UP TILE (prefill, q4_K) ================
- * The pair-task tile above gives every 32-pair window of an expert its own
- * 32x32 block.  Routing at a 1024-row prefill is very uneven -- a layer has
- * ~350 live experts, of which ~180 hold eight pairs or fewer and a dozen
- * hold several hundred -- and the popular experts' windows are computed by
- * a small, barrier-bound tile at a fraction of the part's MMA rate while the
- * rare experts' windows stream their weights at the DRAM wall.
- *
- * This tile takes the experts holding more than 32 pairs, in 64-pair
- * windows: 64 mid rows x 64 pairs, eight warps each owning 16 rows x 32 pairs
- * of BOTH projections.  Each K chunk (four groups) reaches shared memory
- * through cp.async into one of two stages -- the raw q4_K payload (two
- * 32-byte slices per row, XOR-swizzled so ldmatrix is conflict free), the
- * Q8 activation words, their scales and sums -- so the next chunk's copies
- * run under this chunk's MMAs and there is one barrier per chunk.  One
- * ldmatrix of a payload slice serves both groups of its pair: the even group
- * is (w & 0x0f0f0f0f) and the odd group ((w >> 4) & 0x0f0f0f0f), the words
- * qw_q4k_parity_store writes, so every MMA operand is the byte the 32-pair
- * tile multiplies.
- *
- * EVERY OUTPUT IS COMPUTED BY THE SAME OPERATIONS IN THE SAME ORDER.  Each
- * group's integer dot is an exact s32 MMA of the same 32 products; the
- * scales are wa = f16(d) * sc and wb = -f16(dmin) * mn exactly as the tile's
- * slice-parity staging derives them; the per-output float chain is the
- * tile's own -- acc = fmaf(wa * xs, (float)dot, acc); acc = fmaf(wb * xs,
- * (float)xsum, acc), groups ascending from zero -- and the epilogue is the
- * fused SiLU * up * weight expression and the standalone group quantise on
- * the same floats.  Only which block and which lane compute an output
- * changes, so the Q8_0 mid the down tile reads is bit-identical.
- * DS4_GU_HEAVY=0 routes every expert through the 32-pair tile again. */
-#define QW_GUH_BM 64u
-#define QW_GUH_BN 64u
-#define QW_GUH_THREADS 256u
-#define QW_GUH_NT 4
-#define QW_GUH_W_LD 64u
-#define QW_GUH_X_LD 128u
-#define QW_GUH_OFF_W 0u
-#define QW_GUH_OFF_X (QW_GUH_OFF_W + 2u * QW_GUH_BM * QW_GUH_W_LD)
-#define QW_GUH_OFF_XS (QW_GUH_OFF_X + QW_GUH_BN * QW_GUH_X_LD)
-#define QW_GUH_OFF_XM (QW_GUH_OFF_XS + 4u * QW_GUH_BN * 4u)
-#define QW_GUH_OFF_WA (QW_GUH_OFF_XM + 4u * QW_GUH_BN * 4u)
-#define QW_GUH_OFF_WB (QW_GUH_OFF_WA + 2u * QW_GUH_BM * 4u * 4u)
-#define QW_GUH_STAGE (QW_GUH_OFF_WB + 2u * QW_GUH_BM * 4u * 4u)
-#define QW_GUH_SMEM (2u * QW_GUH_STAGE)
-
-__device__ __forceinline__ static void qw_cpasync16_zfill(
-        uint32_t dst, const void *src, uint32_t n) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
-                 :: "r"(dst), "l"(src), "r"(n));
-}
-__device__ __forceinline__ static void qw_cpasync4_zfill(
-        uint32_t dst, const void *src, uint32_t n) {
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n"
-                 :: "r"(dst), "l"(src), "r"(n));
-}
-__device__ __forceinline__ static void qw_ldsm_x4(uint32_t *r, uint32_t addr) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(addr));
-}
-
-__global__ __launch_bounds__(QW_GUH_THREADS, 2) static void
-qwen4exp_moe_gateup_heavy_kernel(
-        int8_t *mq,
-        float *ms,
-        int32_t *msum,
-        const char *gate,
-        const char *up,
-        const int8_t *xq,
-        const float *xs,
-        const int32_t *xsum,
-        const int32_t *pairs,
-        const int32_t *counts,
-        const int32_t *offsets,
-        const int32_t *tasks,
-        const float *weights,
-        uint64_t gate_expert_bytes,
-        uint64_t gate_row_bytes,
-        uint64_t up_expert_bytes,
-        uint64_t up_row_bytes,
-        uint32_t groups,
-        uint32_t mid_dim,
-        uint32_t n_expert_used) {
-    extern __shared__ __align__(16) unsigned char guh_smem[];
-    __shared__ uint32_t sTok[QW_GUH_BN];
-    const uint32_t tid = threadIdx.x;
-    const uint32_t warp = tid >> 5;
-    const uint32_t lane = tid & 31u;
-    const uint32_t row0 = blockIdx.x * QW_GUH_BM;
-    if ((int32_t)blockIdx.y >= tasks[0]) return;
-    const uint32_t expert = (uint32_t)tasks[1u + 2u * blockIdx.y];
-    const int32_t nbase = tasks[2u + 2u * blockIdx.y];
-    const int32_t cnt = counts[expert];
-    const int32_t base = offsets[expert];
-    const int32_t take = min(cnt - nbase, (int32_t)QW_GUH_BN);
-    if (take <= 0) return;
-    for (uint32_t i = tid; i < QW_GUH_BN; i += QW_GUH_THREADS)
-        sTok[i] = (int32_t)i < take ? (uint32_t)pairs[base + nbase + (int32_t)i]
-                                    : 0xffffffffu;
-    __syncthreads();
-    const uint32_t smem0 = (uint32_t)__cvta_generic_to_shared(guh_smem);
-    const char *const gate_e = gate + (uint64_t)expert * gate_expert_bytes;
-    const char *const up_e = up + (uint64_t)expert * up_expert_bytes;
-
-    /* The super-block header this thread decodes the scales from: one
-     * (projection, row) and one of the chunk's two slices, loaded one chunk
-     * ahead of the chunk whose scales it becomes. */
-    const uint32_t h_mat = tid / (2u * QW_GUH_BM);
-    const uint32_t h_row = (tid >> 1) % QW_GUH_BM, h_half = tid & 1u;
-    const char *const h_rowp = h_mat
-        ? up_e + (uint64_t)(row0 + h_row) * up_row_bytes
-        : gate_e + (uint64_t)(row0 + h_row) * gate_row_bytes;
-    const bool h_live = row0 + h_row < mid_dim;
-    uint4 hdr = make_uint4(0u, 0u, 0u, 0u);
-    auto load_hdr = [&](uint32_t c) {
-        if (h_live && 4u * c < groups)
-            hdr = *(const uint4 *)(const void *)
-                (h_rowp + (uint64_t)((4u * c) >> 3) * 144u);
-    };
-    /* Chunk c into stage c & 1: 2 x 64 rows x 64 payload bytes, 64 pairs x
-     * four 32-byte activation groups, their scales and sums, and the 2 x 64
-     * rows x 4 groups of (wa, wb). */
-    auto issue = [&](uint32_t c) {
-        const uint32_t st = smem0 + (c & 1u) * QW_GUH_STAGE;
-        const uint32_t g0 = 4u * c;
-#pragma unroll
-        for (uint32_t k = 0; k < 2u; k++) {
-            const uint32_t q = tid + QW_GUH_THREADS * k;
-            const uint32_t mat = q / (4u * QW_GUH_BM);
-            const uint32_t row = (q >> 2) % QW_GUH_BM, j = q & 3u;
-            const bool live = row0 + row < mid_dim;
-            const char *src = (mat
-                    ? up_e + (uint64_t)(row0 + row) * up_row_bytes
-                    : gate_e + (uint64_t)(row0 + row) * gate_row_bytes)
-                + (uint64_t)(g0 >> 3) * 144u + 16u + (g0 & 7u) * 16u + 16u * j;
-            qw_cpasync16_zfill(st + QW_GUH_OFF_W + (mat * QW_GUH_BM + row) * QW_GUH_W_LD +
-                                   16u * (j ^ ((row >> 1) & 3u)),
-                               live ? src : gate_e, live ? 16u : 0u);
-        }
-#pragma unroll
-        for (uint32_t k = 0; k < 2u; k++) {
-            const uint32_t q = tid + QW_GUH_THREADS * k;
-            const uint32_t tok = q >> 3, gg = (q >> 1) & 3u, j = q & 1u;
-            const bool live = sTok[tok] != 0xffffffffu;
-            const uint64_t t = live ? (uint64_t)(sTok[tok] / n_expert_used) : 0u;
-            qw_cpasync16_zfill(st + QW_GUH_OFF_X + tok * QW_GUH_X_LD +
-                                   16u * ((2u * gg + j) ^ (tok & 7u)),
-                               xq + (t * groups + g0 + gg) * 32u + 16u * j,
-                               live ? 16u : 0u);
-        }
-        {
-            const uint32_t tok = tid >> 2, gg = tid & 3u;
-            const bool live = sTok[tok] != 0xffffffffu;
-            const uint64_t t = live ? (uint64_t)(sTok[tok] / n_expert_used) : 0u;
-            qw_cpasync4_zfill(st + QW_GUH_OFF_XS + (gg * QW_GUH_BN + tok) * 4u,
-                              xs + t * groups + g0 + gg, live ? 4u : 0u);
-            qw_cpasync4_zfill(st + QW_GUH_OFF_XM + (gg * QW_GUH_BN + tok) * 4u,
-                              xsum + t * groups + g0 + gg, live ? 4u : 0u);
-        }
-        qw_cpasync_commit();
-        float *wa = (float *)(void *)(guh_smem + (c & 1u) * QW_GUH_STAGE + QW_GUH_OFF_WA);
-        float *wb = (float *)(void *)(guh_smem + (c & 1u) * QW_GUH_STAGE + QW_GUH_OFF_WB);
-        const uint32_t j0 = (g0 & 7u) + 2u * h_half;
-#pragma unroll
-        for (uint32_t p = 0; p < 2u; p++) {
-            float a = 0.0f, b = 0.0f;
-            if (h_live) {
-                uint32_t sc, mn;
-                qw_q4k_header_scale_min(j0 + p, hdr.y, hdr.z, hdr.w, &sc, &mn);
-                const float df = dev_f16_to_f32((uint16_t)(hdr.x & 0xffffu));
-                const float ndmf = -dev_f16_to_f32((uint16_t)(hdr.x >> 16u));
-                a = df * (float)sc;
-                b = ndmf * (float)mn;
-            }
-            wa[(h_mat * QW_GUH_BM + h_row) * 4u + 2u * h_half + p] = a;
-            wb[(h_mat * QW_GUH_BM + h_row) * 4u + 2u * h_half + p] = b;
-        }
-    };
-
-    const uint32_t nchunk = groups / 4u;
-    load_hdr(0u);
-    issue(0u);
-    load_hdr(1u);
-
-    float accG[QW_GUH_NT * 4], accU[QW_GUH_NT * 4];
-#pragma unroll
-    for (int i = 0; i < QW_GUH_NT * 4; i++) { accG[i] = 0.0f; accU[i] = 0.0f; }
-    const uint32_t wr = (warp % (QW_GUH_BM / 16u)) * 16u;
-    const uint32_t wn = (warp / (QW_GUH_BM / 16u)) * 32u;
-    const int32_t live_nt =
-        min((int32_t)QW_GUH_NT, max(0, (take - (int32_t)wn + 7) / 8));
-    const uint32_t m0 = wr + (lane >> 2), m1 = m0 + 8u;
-    const uint32_t a_row = wr + (lane & 7u) + ((lane >> 3) & 1u) * 8u;
-    const uint32_t a_sw = (a_row >> 1) & 3u;
-    const uint32_t b_mi = lane >> 3;
-    const uint32_t b_tok = wn + (b_mi >> 1) * 8u + (lane & 7u);
-    const uint32_t b_sw = b_tok & 7u;
-
-    for (uint32_t c = 0; c < nchunk; c++) {
-        /* Chunk c's copies have landed and every warp is done with the
-         * stage chunk c + 1 is about to overwrite. */
-        qw_cpasync_wait0();
-        __syncthreads();
-        if (c + 1u < nchunk) { issue(c + 1u); load_hdr(c + 2u); }
-        const uint32_t st = smem0 + (c & 1u) * QW_GUH_STAGE;
-        const unsigned char *stp = guh_smem + (c & 1u) * QW_GUH_STAGE;
-        const float *wa = (const float *)(const void *)(stp + QW_GUH_OFF_WA);
-        const float *wb = (const float *)(const void *)(stp + QW_GUH_OFF_WB);
-        const float *sxs = (const float *)(const void *)(stp + QW_GUH_OFF_XS);
-        const int32_t *sxm = (const int32_t *)(const void *)(stp + QW_GUH_OFF_XM);
-#pragma unroll
-        for (uint32_t pp = 0; pp < 2u; pp++) {
-            uint32_t rg[4], ru[4];
-            const uint32_t a_ch = 16u * ((2u * pp + (lane >> 4)) ^ a_sw);
-            qw_ldsm_x4(rg, st + QW_GUH_OFF_W + a_row * QW_GUH_W_LD + a_ch);
-            qw_ldsm_x4(ru, st + QW_GUH_OFF_W + (QW_GUH_BM + a_row) * QW_GUH_W_LD + a_ch);
-#pragma unroll
-            for (uint32_t p = 0; p < 2u; p++) {
-                const uint32_t gg = 2u * pp + p;
-                uint32_t ag[4], au[4];
-#pragma unroll
-                for (int i = 0; i < 4; i++) {
-                    ag[i] = (rg[i] >> (4u * p)) & 0x0f0f0f0fu;
-                    au[i] = (ru[i] >> (4u * p)) & 0x0f0f0f0fu;
-                }
-                const float wag0 = wa[m0 * 4u + gg], wag1 = wa[m1 * 4u + gg];
-                const float wbg0 = wb[m0 * 4u + gg], wbg1 = wb[m1 * 4u + gg];
-                const float wau0 = wa[(QW_GUH_BM + m0) * 4u + gg];
-                const float wau1 = wa[(QW_GUH_BM + m1) * 4u + gg];
-                const float wbu0 = wb[(QW_GUH_BM + m0) * 4u + gg];
-                const float wbu1 = wb[(QW_GUH_BM + m1) * 4u + gg];
-#pragma unroll
-                for (int np = 0; np < 2; np++) {
-                    if (2 * np >= live_nt) break;
-                    uint32_t bf[4];
-                    qw_ldsm_x4(bf, st + QW_GUH_OFF_X +
-                                   (b_tok + (uint32_t)np * 16u) * QW_GUH_X_LD +
-                                   16u * ((2u * gg + (b_mi & 1u)) ^ b_sw));
-#pragma unroll
-                    for (int h = 0; h < 2; h++) {
-                        const int nt = 2 * np + h;
-                        if (nt >= live_nt) break;
-                        const uint32_t b2[2] = {bf[2 * h], bf[2 * h + 1]};
-                        int32_t dg[4] = {0, 0, 0, 0}, du[4] = {0, 0, 0, 0};
-                        qw_mma_m16n8k32(dg, ag, b2);
-                        qw_mma_m16n8k32(du, au, b2);
-                        const uint32_t n0 = wn + (uint32_t)nt * 8u + (lane & 3u) * 2u;
-                        const float2 sc2 = *(const float2 *)(const void *)&sxs[gg * QW_GUH_BN + n0];
-                        const int2 sm2 = *(const int2 *)(const void *)&sxm[gg * QW_GUH_BN + n0];
-#pragma unroll
-                        for (int r = 0; r < 4; r++) {
-                            const float sc = (r & 1) ? sc2.y : sc2.x;
-                            const float sm = (float)((r & 1) ? sm2.y : sm2.x);
-                            const float wa_g = (r & 2) ? wag1 : wag0;
-                            const float wb_g = (r & 2) ? wbg1 : wbg0;
-                            const float wa_u = (r & 2) ? wau1 : wau0;
-                            const float wb_u = (r & 2) ? wbu1 : wbu0;
-                            const int at = nt * 4 + r;
-                            accG[at] = fmaf(wa_g * sc, (float)dg[r], accG[at]);
-                            accG[at] = fmaf(wb_g * sc, sm, accG[at]);
-                            accU[at] = fmaf(wa_u * sc, (float)du[r], accU[at]);
-                            accU[at] = fmaf(wb_u * sc, sm, accU[at]);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    __syncthreads();
-
-    /* The fused SiLU * up * weight, staged for the group quantise. */
-    float *const sMid = (float *)(void *)guh_smem;
-#pragma unroll
-    for (int nt = 0; nt < QW_GUH_NT; nt++) {
-#pragma unroll
-        for (int r = 0; r < 4; r++) {
-            const uint32_t mr = m0 + ((r & 2) ? 8u : 0u);
-            const uint32_t nn = wn + nt * 8u + (lane & 3u) * 2u + (r & 1);
-            if ((int32_t)nn >= take) continue;
-            if (row0 + mr >= mid_dim) continue;
-            const uint32_t p = sTok[nn];
-            const float g = accG[nt * 4 + r];
-            sMid[nn * QW_GUH_BM + mr] =
-                (g / (1.0f + expf(-g))) * accU[nt * 4 + r] * weights[p];
-        }
-    }
-    __syncthreads();
-    const uint32_t halves = QW_GUH_BM / 32u;
-    for (uint32_t it = warp; it < (uint32_t)take * halves; it += QW_GUH_THREADS / 32u) {
-        const uint32_t nn = it / halves, h = it - nn * halves;
-        if (row0 + h * 32u >= mid_dim) continue;
-        dev_qwen4exp_quantize_group(
-                mq, ms, msum, &sMid[nn * QW_GUH_BM + h * 32u], lane, 32u,
-                (uint64_t)sTok[nn] * (mid_dim / 32u) + blockIdx.x * halves + h);
-    }
-}
-
 /* The down projection on the same tile.
  *
  * This is the operation the tile is worth the most on.  Its weight is the
@@ -6538,14 +6237,72 @@ __device__ __forceinline__ static void qwen4exp_shared_vector_accumulate(
  * uint4 and a super-block is 9 of them: one 16-byte header (d, dmin, twelve
  * scale bytes) then four 32-byte payload slices, and group g takes slice
  * (g % 8) >> 1 of super-block g / 8 -- the address qw_raw_load computes. */
-__device__ __forceinline__ static void qw_gu_coop_raw_load(
+/* PANEL GEOMETRY PER WEIGHT TYPE, in uint4, at the tower's in_dim 2560.
+ *
+ * The panel is sized from the type's OWN shipped row and is filled with that
+ * row's bytes at that row's stride: q4_K ten 144-byte super-blocks (1440 B),
+ * q5_K ten 176-byte super-blocks (1760 B), q8_0 eighty 34-byte blocks
+ * (2720 B).  Nothing is re-quantised, re-represented, re-strided or permuted
+ * on the way in -- contract 3.4 forbids that in memory as well as on disk --
+ * so the staged image is byte-for-byte the span the block's own warps would
+ * otherwise have read individually.
+ *
+ * `stage_raw` says whether the 32-byte payload slice of a group can be handed
+ * to the decoder as pre-loaded words.  A q4_K or q5_K group's payload is a
+ * 32-byte slice at a 16-byte-aligned offset inside its super-block, so it can.
+ * A q8_0 group IS its 34-byte block, whose payload sits two bytes past a word
+ * boundary for every other group, so nothing is staged and the decoder reads
+ * the panel directly -- which is exactly what qw_raw_load already refuses to
+ * do for q8_0 on the slab, and what the routed DOWN panel has always done. */
+template <int Type> struct qw_gu_panel {
+    static const unsigned row_u4 = 0u;
+    static const unsigned sb_u4 = 0u;
+    static const unsigned payload_u4 = 0u;
+    static const bool stage_raw = false;
+};
+template <> struct qw_gu_panel<DS4_QWEN4EXP_TY_q4_K> {
+    static const unsigned row_u4 = QW_GU_COOP_ROW_U4;  /* 1440 B */
+    static const unsigned sb_u4 = 9u;                  /*  144 B super-block */
+    static const unsigned payload_u4 = 1u;             /* after the 16 B head */
+    static const bool stage_raw = true;
+};
+template <> struct qw_gu_panel<DS4_QWEN4EXP_TY_q5_K> {
+    static const unsigned row_u4 = 110u;               /* 1760 B */
+    static const unsigned sb_u4 = 11u;                 /*  176 B super-block */
+    static const unsigned payload_u4 = 3u;             /* 16 B head + 32 B qh */
+    static const bool stage_raw = true;
+};
+template <> struct qw_gu_panel<DS4_QWEN4EXP_TY_q8_0> {
+    static const unsigned row_u4 = 170u;               /* 2720 B, 80 x 34 B */
+    static const unsigned sb_u4 = 0u;
+    static const unsigned payload_u4 = 0u;
+    static const bool stage_raw = false;
+};
+
+/* The eight payload words the decoder wants for (row, group), read out of the
+ * staged copy of the identical row bytes.  Returns false for a type whose
+ * payload cannot be addressed as an aligned 32-byte window, in which case the
+ * caller passes NULL and the decoder reads the panel itself -- the same
+ * `rawp = ... ? raw : NULL` contract qw_raw_load has on the slab.
+ *
+ * q4_K: super-block 9 uint4, one 16-byte header then four 32-byte slices, and
+ * group g takes slice (g % 8) >> 1 of super-block g / 8.  q5_K is the same
+ * shape with a 176-byte super-block whose header is followed by 32 bytes of
+ * high-bit plane, so the payload starts one slice later: 11 and 3 rather than
+ * 9 and 1.  Both are the address qw_raw_load computes on the slab. */
+template <int Type>
+__device__ __forceinline__ static bool qw_gu_coop_raw_load(
         const uint4 *sh, uint32_t wrow, uint32_t g, uint32_t *w) {
-    const uint32_t b = wrow * QW_GU_COOP_ROW_U4 + (g >> 3) * 9u + 1u
+    if (!qw_gu_panel<Type>::stage_raw) return false;
+    const uint32_t b = wrow * qw_gu_panel<Type>::row_u4
+                     + (g >> 3) * qw_gu_panel<Type>::sb_u4
+                     + qw_gu_panel<Type>::payload_u4
                      + ((g & 7u) >> 1) * 2u;
     const uint4 lo = sh[b];
     const uint4 hi = sh[b + 1u];
     w[0] = lo.x; w[1] = lo.y; w[2] = lo.z; w[3] = lo.w;
     w[4] = hi.x; w[5] = hi.y; w[6] = hi.z; w[7] = hi.w;
+    return true;
 }
 /* ======================================================================== */
 
@@ -6570,8 +6327,44 @@ __device__ __forceinline__ static void qw_gu_coop_raw_load(
  * the decode leg is then the answer.  gu[occ]=3 => 32 is unreachable and 40 is
  * the measured floor, at which point gate/up occupancy is CLOSED for a real
  * reason rather than a mis-read one. */
+/* PER-INSTANTIATION, not per-template.  __maxnreg__ takes a constant
+ * EXPRESSION, and a template parameter is constant inside the template, so the
+ * three instantiations can carry three different caps out of one spelling.
+ * Verified on this toolchain with a register-hungry probe: <12> came back at
+ * the 24 it was capped to, <13> at 40 and <8> at 63 under a cap of 64, each
+ * with its own spill state.  The q4_K arms keep 32 -- the expression is 32 for
+ * Type 12 -- so nothing about the shipped kernel moves, and the TU census
+ * confirms it: 217 -> 219 entry functions, zero shared kernels changed.
+ *
+ * WHY THE NEW ARMS ARE NOT CAPPED AT 32.  32 was chosen to buy a FOURTH block
+ * against an 11,584-byte q4_K panel, where registers were the binding
+ * constraint.  They are not binding for the wider panels:
+ *
+ *   q5_K panel 14,144 B -> 101,376/14,144 = 7 blocks on shared, 1536/256 = 6
+ *                          on threads.  6 blocks needs <= 65,536/(6*256) = 42
+ *                          registers, so 40 is the largest allocation that
+ *                          keeps the q4_K arm's own residency.
+ *   q8_0 panel 21,824 B -> 101,376/21,824 = 4 blocks on SHARED MEMORY, whatever
+ *                          the registers do.  4 blocks needs <= 64, so 64 is
+ *                          free: the cap below it buys nothing and only pays
+ *                          spills.
+ *
+ * At 32 both new arms spilled (q5_K 40 B of stack, 72/80 B of spill traffic;
+ * q8_0 16 B and 24/32) in the innermost loop of a kernel that is already at the
+ * memory wall.  The readout stands unchanged and is measured, not computed:
+ * the probe reports gu5[lmem]/gu8[lmem] and gu5[occ]/gu8[occ] from
+ * cudaFuncGetAttributes and cudaOccupancyMaxActiveBlocksPerMultiprocessor. */
+#ifndef QW_GU_NREG_Q5K
+#define QW_GU_NREG_Q5K 40
+#endif
+#ifndef QW_GU_NREG_Q80
+#define QW_GU_NREG_Q80 64
+#endif
+#define QW_GU_NREG_FOR(T)                                                     \
+    ((T) == (int)DS4_QWEN4EXP_TY_q8_0 ? QW_GU_NREG_Q80 :                      \
+     (T) == (int)DS4_QWEN4EXP_TY_q5_K ? QW_GU_NREG_Q5K : 32)
 #if defined(__CUDACC__) && CUDART_VERSION >= 12040
-#define QW_GU_MAXNREG __maxnreg__(32)
+#define QW_GU_MAXNREG __maxnreg__(QW_GU_NREG_FOR(Type))
 #else
 #define QW_GU_MAXNREG
 #endif
@@ -6724,7 +6517,13 @@ qwen4exp_moe_gateup_split_kernel(
     /* The staged panel.  Both early returns above are uniform over the block
      * (blockIdx.y, the active list and counts[expert] are block-invariant), so
      * every thread that reaches the barrier below reaches it together. */
-    __shared__ __align__(16) uint4 wcoop[Coop ? 2u * QW_GU_COOP_U4 : 1u];
+    /* The panel is sized from the instantiated type's own row, so the same
+     * body serves q4_K (11,520 B at four rows), q5_K (14,080 B) and q8_0
+     * (21,760 B).  For the q4_K instantiation OutputRows * row_u4 is
+     * QW_GU_COOP_ROWS * QW_GU_COOP_ROW_U4, the constant this used to spell. */
+    const uint32_t PanelU4 = (uint32_t)OutputRows * qw_gu_panel<Type>::row_u4;
+    __shared__ __align__(16) uint4 wcoop[
+        Coop ? 2u * OutputRows * qw_gu_panel<Type>::row_u4 : 1u];
     const uint4 *wsh = NULL;
     uint32_t wrow = 0u;
     if (Coop) {
@@ -6733,12 +6532,12 @@ qwen4exp_moe_gateup_split_kernel(
          * refuses every other shape; this is the belt to that brace, and it is
          * uniform over the block, outside the group loop, and free. */
         if (groups != QW_GU_COOP_GROUPS ||
-            gate_row_bytes != (uint64_t)QW_GU_COOP_ROW_U4 * 16u ||
-            up_row_bytes != (uint64_t)QW_GU_COOP_ROW_U4 * 16u) return;
+            gate_row_bytes != (uint64_t)qw_gu_panel<Type>::row_u4 * 16u ||
+            up_row_bytes != (uint64_t)qw_gu_panel<Type>::row_u4 * 16u) return;
         const uint32_t row0 = blockIdx.x * OutputRows;
         const uint32_t left = mid_dim > row0 ? mid_dim - row0 : 0u;
         const uint32_t rows_here = left < OutputRows ? left : OutputRows;
-        const uint32_t words = rows_here * QW_GU_COOP_ROW_U4;
+        const uint32_t words = rows_here * qw_gu_panel<Type>::row_u4;
         const char *const gb = gate +
             (uint64_t)expert * gate_expert_bytes +
             (uint64_t)row0 * gate_row_bytes;
@@ -6747,11 +6546,11 @@ qwen4exp_moe_gateup_split_kernel(
             (uint64_t)row0 * up_row_bytes;
         for (uint32_t i = threadIdx.x; i < words; i += blockDim.x) {
             wcoop[i] = *(const uint4 *)(const void *)(gb + (uint64_t)i * 16u);
-            wcoop[QW_GU_COOP_U4 + i] =
+            wcoop[PanelU4 + i] =
                 *(const uint4 *)(const void *)(ub + (uint64_t)i * 16u);
         }
         __syncthreads();
-        wsh = wcoop + (second ? QW_GU_COOP_U4 : 0u);
+        wsh = wcoop + (second ? PanelU4 : 0u);
         wrow = warp >> 1u;
     }
     for (int32_t at = 0; at < cnt; at += R) {
@@ -6790,7 +6589,7 @@ qwen4exp_moe_gateup_split_kernel(
                 if (Coop) \
                     dev_qwen4exp_group_decode_w((uint32_t)Type, \
                         (const char *)(const void *) \
-                            &wsh[wrow * QW_GU_COOP_ROW_U4], g_, \
+                            &wsh[wrow * qw_gu_panel<Type>::row_u4], g_, \
                         (RAWP), wq, wa, wb); \
                 else \
                     dev_qwen4exp_group_decode_w((uint32_t)Type, weight_row, g_, \
@@ -6815,9 +6614,10 @@ qwen4exp_moe_gateup_split_kernel(
                 uint32_t raw1[8];
                 const uint32_t *p0, *p1;
                 if (Coop) {
-                    qw_gu_coop_raw_load(wsh, wrow, g, raw0);
-                    qw_gu_coop_raw_load(wsh, wrow, g + 32u, raw1);
-                    p0 = raw0; p1 = raw1;
+                    p0 = qw_gu_coop_raw_load<Type>(wsh, wrow, g, raw0)
+                       ? raw0 : NULL;
+                    p1 = qw_gu_coop_raw_load<Type>(wsh, wrow, g + 32u, raw1)
+                       ? raw1 : NULL;
                 } else {
                     p0 = qw_raw_load((uint32_t)Type, weight_row, g, raw0)
                        ? raw0 : NULL;
@@ -6831,8 +6631,8 @@ qwen4exp_moe_gateup_split_kernel(
                 uint32_t raw[8];
                 const uint32_t *rawp;
                 if (Coop) {
-                    qw_gu_coop_raw_load(wsh, wrow, g, raw);
-                    rawp = raw;
+                    rawp = qw_gu_coop_raw_load<Type>(wsh, wrow, g, raw)
+                         ? raw : NULL;
                 } else {
                     rawp = qw_raw_load((uint32_t)Type, weight_row, g, raw)
                          ? raw : NULL;
@@ -9545,6 +9345,42 @@ static int qwen4exp_moe_tile(uint32_t n_rows) {
     return 8;
 }
 
+/* The host side of qw_gu_panel: the row the cooperative panel is sized for,
+ * and the per-type valves.  Read once per call, like every other valve in
+ * this launcher. */
+static uint64_t qw_gu_panel_row_bytes(uint32_t type) {
+    switch (type) {
+    case (uint32_t)DS4_QWEN4EXP_TY_q4_K: return (uint64_t)QW_GU_COOP_ROW_U4 * 16ull;
+    case (uint32_t)DS4_QWEN4EXP_TY_q5_K: return 110ull * 16ull;
+    case (uint32_t)DS4_QWEN4EXP_TY_q8_0: return 170ull * 16ull;
+    default: return 0ull;
+    }
+}
+static int qw_gu_coop_env_on(void) {
+    const char *e = getenv("DS4_GATEUP_COOP");
+    return e == NULL || e[0] != '0';
+}
+/* A one-shot positive control.  DS4_QWEN4EXP_PANEL_DEBUG=1 prints the first
+ * time each type takes the panel arm, so "the arm is selected" is observed in
+ * the engine's own log rather than inferred from a timing difference. */
+static void qw_gu_panel_taken(uint32_t type, uint32_t n_tokens, uint32_t rows) {
+    static int shown[2];
+    const int i = type == (uint32_t)DS4_QWEN4EXP_TY_q5_K ? 0 : 1;
+    if (shown[i]) return;
+    if (getenv("DS4_QWEN4EXP_PANEL_DEBUG") == NULL) return;
+    shown[i] = 1;
+    fprintf(stderr, "ds4: gate/up cooperative panel TAKEN for type %u "
+                    "(n_tokens=%u expert rows=%u)\n", type, n_tokens, rows);
+}
+static int qw_gu_panel_type_on(uint32_t type) {
+    const char *e = NULL;
+    if (type == (uint32_t)DS4_QWEN4EXP_TY_q5_K)
+        e = getenv("DS4_QWEN4EXP_SPLIT_GATEUP_Q5K");
+    else if (type == (uint32_t)DS4_QWEN4EXP_TY_q8_0)
+        e = getenv("DS4_QWEN4EXP_SPLIT_GATEUP_Q80");
+    return e == NULL || e[0] != '0';
+}
+
 /* The routed MoE body.  `logits` non-NULL means the caller has NOT run the
  * router and wants it fused into the grouping launch; `weights_rw` is then the
  * softmax-weight buffer that fused kernel writes.  Both NULL is the shipping
@@ -9644,8 +9480,7 @@ static int qwen4exp_routed_moe_cuda(
         getenv("DS4_QWEN4EXP_NO_EXPERT_COMPACT") == NULL &&
         getenv("DS4_QWEN4EXP_GENERIC_EXPERTS") == NULL &&
         getenv("DS4_QWEN4EXP_NO_GU_PAIR_TASKS") == NULL;
-    /* Two task lists: the 32-pair tile's, and after it the heavy tile's. */
-    const uint64_t task_bytes = pair_tasks ? 2u * (1u + 2u * task_capacity) * 4u : 0u;
+    const uint64_t task_bytes = pair_tasks ? (1u + 2u * task_capacity) * 4u : 0u;
 
     const int tile = qwen4exp_moe_tile(n_tokens);
     /* The depth-2 verify (three rows) keeps the two-row decode kernels: every
@@ -9980,57 +9815,10 @@ static int qwen4exp_routed_moe_cuda(
          * are unaffected either way. */
         const uint32_t gu_dq_stage =
             getenv("DS4_QWEN4EXP_NO_GATEUP_DQ") == NULL ? 1u : 0u;
-        /* The heavy tile takes the experts of more than 32 pairs on the
-         * q4_K slab (the ranked gate/up type) when the fused Q8_0 epilogue
-         * is on; its copies need the same sixteen-byte alignment and whole
-         * super-block K extent the DMA arm checks. */
-        const char *gu_heavy_env = getenv("DS4_GU_HEAVY");
-        const bool gu_heavy = pair_tasks && specialize && moe_epilogue &&
-            gate_slab->type == DS4_QWEN4EXP_TY_q4_K &&
-            up_slab->type == DS4_QWEN4EXP_TY_q4_K &&
-            (xgroups % 8u) == 0u && (mid_dim % QW_GUH_BM) == 0u &&
-            ((((uintptr_t)gate) | ((uintptr_t)up) |
-              (uintptr_t)gate_slab->expert_bytes |
-              (uintptr_t)up_slab->expert_bytes |
-              (uintptr_t)gate_slab->row_bytes |
-              (uintptr_t)up_slab->row_bytes) & 15u) == 0u &&
-            (gu_heavy_env == NULL || gu_heavy_env[0] != '0');
-        int32_t *const gu_tasks_heavy =
-            gu_tasks ? gu_tasks + (1u + 2u * task_capacity) : NULL;
         if (pair_tasks) {
             qwen4exp_moe_pair_tasks_kernel<<<1, 512, 0, stream>>>(
-                    gu_tasks, sc.counts, n_total_expert, 32,
-                    0, gu_heavy ? 32 : 0x7fffffff);
+                    gu_tasks, sc.counts, n_total_expert);
             if (!cuda_ok(cudaGetLastError(), "qwen4exp gate/up pair tasks")) return 0;
-        }
-        if (gu_heavy) {
-            static int guh_attr = 0;
-            if (guh_attr == 0) {
-                guh_attr = cudaFuncSetAttribute(
-                        qwen4exp_moe_gateup_heavy_kernel,
-                        cudaFuncAttributeMaxDynamicSharedMemorySize,
-                        (int)QW_GUH_SMEM) == cudaSuccess ? 1 : -1;
-                (void)cudaGetLastError();
-            }
-            if (guh_attr < 0) {
-                fprintf(stderr, "ds4: qwen4exp heavy gate/up tile refused its "
-                                "shared memory\n");
-                return 0;
-            }
-            qwen4exp_moe_pair_tasks_kernel<<<1, 512, 0, stream>>>(
-                    gu_tasks_heavy, sc.counts, n_total_expert, (int32_t)QW_GUH_BN,
-                    32, 0x7fffffff);
-            if (!cuda_ok(cudaGetLastError(), "qwen4exp gate/up heavy tasks")) return 0;
-            qwen4exp_moe_gateup_heavy_kernel<<<
-                    dim3(mid_dim / QW_GUH_BM, (unsigned)task_capacity, 1),
-                    QW_GUH_THREADS, QW_GUH_SMEM, stream>>>(
-                    sc.mq, sc.ms, sc.msum, gate, up, sc.xq, sc.xs, sc.xsum,
-                    sc.pairs, sc.counts, sc.offsets, gu_tasks_heavy,
-                    (const float *)weights->ptr,
-                    gate_slab->expert_bytes, gate_slab->row_bytes,
-                    up_slab->expert_bytes, up_slab->row_bytes,
-                    xgroups, mid_dim, n_expert_used);
-            if (!cuda_ok(cudaGetLastError(), "qwen4exp gate/up heavy")) return 0;
         }
 #define QWEN4EXP_GATEUP_MMA_IMPL(GT, UT, TASKS, DMA) \
         qwen4exp_moe_gateup_mma_kernel<GT, UT, TASKS, DMA><<< \
@@ -10144,6 +9932,67 @@ static int qwen4exp_routed_moe_cuda(
         else if (vector) { QWEN4EXP_SPLIT_GATEUP(true, 1u, false); }
         else { QWEN4EXP_SPLIT_GATEUP(false, 4u, false); }
 #undef QWEN4EXP_SPLIT_GATEUP
+    }
+    /* ---- THE SAME COOPERATIVE PANEL FOR THE TWO LAYERS THAT ARE NOT q4_K ----
+     *
+     * The arm above is selected only when BOTH slabs are q4_K, and the panel
+     * above it was sized for a q4_K row, so exactly two of the forty-nine
+     * routed gate/up calls in a decode round have always fallen through to the
+     * generic per-group kernel: blk.2, whose ffn_gate_exps/ffn_up_exps are the
+     * artifact's ONLY Q5_K tensors, and blk.48, the MTP head, whose experts are
+     * Q8_0.  At the same shape the generic kernel costs about twice what the
+     * panel kernel costs, and the excess over the DRAM floor is several
+     * milliseconds of a ranked run.
+     *
+     * Nothing about the arithmetic changes.  The panel is a verbatim byte image
+     * of the same rows at the same stride (contract 3.4), the decoder is called
+     * with the same (type, g) at the same offset inside it, lane l still owns
+     * groups l, l+32, l+64 in that order, and the fold is the same
+     * warp_sum_f32 tree, so every emitted float is the generic kernel's.
+     *
+     * Per-type valves, so ONE binary carries both arms and an A/B is two runs
+     * of one build:
+     *   DS4_QWEN4EXP_SPLIT_GATEUP_Q5K=0   blk.2 back on the generic kernel
+     *   DS4_QWEN4EXP_SPLIT_GATEUP_Q80=0   the head back on the generic kernel
+     * DS4_QWEN4EXP_NO_SPLIT_GATEUP and DS4_GATEUP_COOP=0 stand all three down
+     * exactly as they already do for q4_K. */
+    else if ((n_tokens <= 2u || wide_verify) && tile == 2 && specialize &&
+             (DS4_GATEUP_COOP_BUILD != 0) &&
+             gate_slab->type == up_slab->type &&
+             (gate_slab->type == (uint32_t)DS4_QWEN4EXP_TY_q5_K ||
+              gate_slab->type == (uint32_t)DS4_QWEN4EXP_TY_q8_0) &&
+             getenv("DS4_QWEN4EXP_NO_SPLIT_GATEUP") == NULL &&
+             qw_gu_panel_type_on(gate_slab->type) &&
+             ((uintptr_t)sc.xq & 15u) == 0u &&
+             getenv("DS4_QWEN4EXP_NO_SPLIT_VECTOR") == NULL &&
+             qw_gu_coop_env_on() &&
+             xgroups == QW_GU_COOP_GROUPS &&
+             gate_slab->row_bytes == qw_gu_panel_row_bytes(gate_slab->type) &&
+             up_slab->row_bytes == qw_gu_panel_row_bytes(up_slab->type) &&
+             ((uintptr_t)gate & 15u) == 0u && ((uintptr_t)up & 15u) == 0u &&
+             (gate_slab->expert_bytes & 15ull) == 0ull &&
+             (up_slab->expert_bytes & 15ull) == 0ull) {
+#define QWEN4EXP_SPLIT_PANEL(T) \
+        QWEN4EXP_LAUNCH_PDL( \
+            (qwen4exp_moe_gateup_split_kernel<2, T, true, QW_GU_COOP_ROWS, \
+                                              true>), \
+            (dim3((mid_dim + QW_GU_COOP_ROWS - 1u) / QW_GU_COOP_ROWS, \
+                  gu_rows, 1)), \
+            QW_GU_COOP_ROWS * 64u, 0, stream, \
+            (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum, \
+            sc.pairs, sc.counts, sc.offsets, gu_active, \
+            (const float *)weights->ptr, \
+            gate_slab->expert_bytes, gate_slab->row_bytes, \
+            up_slab->expert_bytes, up_slab->row_bytes, \
+            gate_slab->type, up_slab->type, xgroups, mid_dim, \
+            mid_token_stride, n_expert_used)
+        qw_gu_panel_taken(gate_slab->type, n_tokens, gu_rows);
+        if (gate_slab->type == (uint32_t)DS4_QWEN4EXP_TY_q5_K) {
+            QWEN4EXP_SPLIT_PANEL(DS4_QWEN4EXP_TY_q5_K);
+        } else {
+            QWEN4EXP_SPLIT_PANEL(DS4_QWEN4EXP_TY_q8_0);
+        }
+#undef QWEN4EXP_SPLIT_PANEL
     }
     else if (tile == 8) { QWEN4EXP_GATEUP(8); }
     else if (tile == 4) { QWEN4EXP_GATEUP(4); }
@@ -17158,7 +17007,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_tensor(
  * swallowed and reported as -1; the function never touches device state and is
  * called once, off the timed path. */
 extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
-    static char buf[384];
+    static char buf[640];
     static int built = 0;
     if (built) return buf;
     built = 1;
@@ -17166,6 +17015,11 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
 
     int gu_regs = -1, gu_smem = -1, gu_lmem = -1, gu_maxt = -1;
     int gu_occ = -1, dn_occ = -1;
+    /* The two panel instantiations this build adds, read the same way: the
+     * q8_0 panel is 21,760 B of STATIC shared against the q4_K panel's 11,520,
+     * so occupancy is asked for rather than computed. */
+    int g5_regs = -1, g5_smem = -1, g5_lmem = -1, g5_occ = -1;
+    int g8_regs = -1, g8_smem = -1, g8_lmem = -1, g8_occ = -1;
     int dn_regs = -1, dn_smem = -1, dn_lmem = -1, dn_maxt = -1;
     /* The two PREFILL tile kernels, read here for the first time. */
     int mg_regs = -1, mg_smem = -1, mg_lmem = -1, mg_occ = -1;
@@ -17186,6 +17040,23 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
     } else {
         (void)cudaGetLastError();
     }
+
+    if (cudaFuncGetAttributes(
+            &a,
+            qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q5_K, true,
+                                             QW_GU_COOP_ROWS, true>) ==
+        cudaSuccess) {
+        g5_regs = a.numRegs; g5_smem = (int)a.sharedSizeBytes;
+        g5_lmem = (int)a.localSizeBytes;
+    } else { (void)cudaGetLastError(); }
+    if (cudaFuncGetAttributes(
+            &a,
+            qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q8_0, true,
+                                             QW_GU_COOP_ROWS, true>) ==
+        cudaSuccess) {
+        g8_regs = a.numRegs; g8_smem = (int)a.sharedSizeBytes;
+        g8_lmem = (int)a.localSizeBytes;
+    } else { (void)cudaGetLastError(); }
 
     if (cudaFuncGetAttributes(
             &a,
@@ -17250,6 +17121,20 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
     } else {
         (void)cudaGetLastError();
     }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ,
+            qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q5_K, true,
+                                             QW_GU_COOP_ROWS, true>,
+            (int)(QW_GU_COOP_ROWS * 64u), 0) == cudaSuccess) {
+        g5_occ = occ;
+    } else { (void)cudaGetLastError(); }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ,
+            qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q8_0, true,
+                                             QW_GU_COOP_ROWS, true>,
+            (int)(QW_GU_COOP_ROWS * 64u), 0) == cudaSuccess) {
+        g8_occ = occ;
+    } else { (void)cudaGetLastError(); }
 
     /* ---- THE PREFILL TILE KERNELS, read here for the first time ----
      * Everything above, and every arm this line of work has submitted, is a
@@ -17331,12 +17216,16 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
              "gu[reg=%d smem=%d lmem=%d maxt=%d occ=%d] dn[reg=%d smem=%d "
              "lmem=%d maxt=%d occ=%d] gdn[reg=%d lmem=%d] "
              "mm[reg=%d smem=%d lmem=%d occ=%d] "
-             "md[reg=%d smem=%d lmem=%d occ=%d]",
+             "md[reg=%d smem=%d lmem=%d occ=%d] "
+             "gu5[reg=%d smem=%d lmem=%d occ=%d] "
+             "gu8[reg=%d smem=%d lmem=%d occ=%d]",
              gu_regs, gu_smem, gu_lmem, gu_maxt, gu_occ,
              dn_regs, dn_smem, dn_lmem, dn_maxt, dn_occ,
              gd_regs, gd_lmem,
              mg_regs, mg_smem, mg_lmem, mg_occ,
-             md_regs, md_smem, md_lmem, md_occ);
+             md_regs, md_smem, md_lmem, md_occ,
+             g5_regs, g5_smem, g5_lmem, g5_occ,
+             g8_regs, g8_smem, g8_lmem, g8_occ);
     return buf;
 }
 
