@@ -607,6 +607,9 @@ mod ffi {
     pub struct FfiSession {
         handle: *mut c_void,
         mtp_armed: bool,
+        /* Reused i32 narrowing buffer for sync(): one allocation per
+         * session instead of one Vec per prompt. */
+        narrow_buf: Vec<i32>,
     }
 
     // The handle is only ever used behind the factory's Mutex.
@@ -651,6 +654,7 @@ mod ffi {
             Ok(Self {
                 handle,
                 mtp_armed: config.mtp_draft_tokens >= 2,
+                narrow_buf: Vec::new(),
             })
         }
 
@@ -679,12 +683,15 @@ mod ffi {
         }
 
         fn sync(&mut self, tokens: &[i64]) -> Result<(), String> {
-            let narrow: Vec<i32> = tokens
-                .iter()
-                .map(|&t| Self::narrow(t))
-                .collect::<Result<_, _>>()?;
+            self.narrow_buf.clear();
+            self.narrow_buf.reserve(tokens.len());
+            for &t in tokens {
+                self.narrow_buf.push(Self::narrow(t)?);
+            }
             // SAFETY: the slice outlives the call; the shim copies it.
-            let rc = unsafe { ds4s_sync(self.handle, narrow.as_ptr(), narrow.len()) };
+            let rc = unsafe {
+                ds4s_sync(self.handle, self.narrow_buf.as_ptr(), self.narrow_buf.len())
+            };
             if rc != 0 {
                 return Err(format!("ds4 sync failed: {}", self.last_error()));
             }
