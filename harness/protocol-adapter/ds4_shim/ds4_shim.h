@@ -93,6 +93,14 @@ int ds4s_top_logits(const ds4s_handle *h, int k, int32_t *ids, float *logits);
  * The port routes this to ds4_qwen4exp_mtp_cycle, which commits the target's
  * own GREEDY argmax and so emits the serial leg's token stream exactly; at
  * depth 1 it commits 1 or 2 tokens per round. */
+/* This build's note auto09190522_37 records that a kernel launched with the
+ * programmatic stream serialization attribute parks at its fence, and the
+ * profiler counts that parked time as the kernel's duration, so any
+ * opportunity sized from durations double counts work that is already
+ * overlapped. Size a gap as the consumer's start minus the predecessor's
+ * end; a negative value means the work is already hidden and there is
+ * nothing to win.
+ */
 int ds4s_eval_speculative(ds4s_handle *h, int32_t first_token, int budget, int32_t *out,
                           int cap);
 
