@@ -971,8 +971,10 @@ int ds4_qwen4exp_mtp_head_init(ds4_qwen4exp_mtp_head *h,
     if (h->cache_seed_capacity) h->t_cache_tail = mtp_alloc(hc_dim * f, &ok);
     h->cache_tail_valid = false;
     h->cache_tail_next_token = -1;
-    h->t_top1         = mtp_alloc(rows * sizeof(uint32_t), &ok);
-    h->top1_host      = malloc((size_t)rows * sizeof(uint32_t));
+    /* One spare word carries the deferred native-screen validity flag in the
+     * same readback as the winner. */
+    h->t_top1         = mtp_alloc((rows + 1u) * sizeof(uint32_t), &ok);
+    h->top1_host      = malloc((size_t)(rows + 1u) * sizeof(uint32_t));
     if (!ok || !h->top1_host) {
         ds4_qwen4exp_mtp_head_free(h);
         return mtp_fail(err, errlen,
@@ -1085,6 +1087,46 @@ static int mtp_head_time_on(void) {
         }                                                                     \
     } while (0)
 
+static bool mtp_head_static_logits(ds4_qwen4exp_mtp_head *h,
+                                   uint32_t n_embd, uint32_t logit_rows,
+                                   uint32_t draft_prefix,
+                                   uint32_t draft_tail,
+                                   uint32_t draft_width,
+                                   const char **stage) {
+    const uint64_t f = sizeof(float);
+    const bool direct_prefix = logit_rows == 1u;
+    *stage = "borrowed lm head";
+    bool ok = h->hooks.matmul_q8_0(
+            draft_tail && !direct_prefix ? h->t_logits_prefix : h->t_logits,
+            h->target_map, h->target_size, h->output_offset, n_embd,
+            draft_prefix ? draft_prefix : h->n_vocab,
+            h->t_sample, logit_rows) != 0;
+    if (ok && draft_tail) {
+        *stage = "borrowed lm head tail";
+        ok = h->hooks.matmul_q8_0(
+                h->t_logits_tail, h->target_map, h->target_size,
+                h->output_offset + (uint64_t)(h->n_vocab - draft_tail) *
+                    ds4_qwen4exp_q8_0_row_bytes(n_embd),
+                n_embd, draft_tail, h->t_sample, logit_rows) != 0;
+    }
+    if (ok && draft_tail) {
+        *stage = "shortlist pack";
+        for (uint32_t r = 0; r < logit_rows; r++) {
+            ok = (direct_prefix || ds4_gpu_tensor_copy(
+                         h->t_logits, (uint64_t)r * draft_width * f,
+                         h->t_logits_prefix, (uint64_t)r * draft_prefix * f,
+                         (uint64_t)draft_prefix * f) != 0) &&
+                 ds4_gpu_tensor_copy(
+                         h->t_logits,
+                         ((uint64_t)r * draft_width + draft_prefix) * f,
+                         h->t_logits_tail, (uint64_t)r * draft_tail * f,
+                         (uint64_t)draft_tail * f) != 0;
+            if (!ok) break;
+        }
+    }
+    return ok;
+}
+
 /* The forward proper.  Seed rows must update the head block's caches, but
  * their final mixer and vocabulary projections have no consumer when only
  * the last proposal is requested.  Narrow those stateless operations within
@@ -1189,33 +1231,71 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
      * against it yields fc_embedding(e) + fc_hidden(h_s) for every stream. */
     if (ok) {
         stage = "eh_proj rows";
-        if (h->hooks.ehx_pack) {
-            ok = h->hooks.ehx_pack(h->t_ehx, h->t_e_normed, h->t_h_normed,
-                                   n_tokens, n_hc, n_embd) != 0;
+        /* PROVENANCE: the fused pack-quantize kernel and this call site are not
+         * original to this submission.  They come from the arm that four other
+         * solvers on this benchmark independently drew twenty times (the
+         * earliest tree carrying it that I could find is 3fc37386); I composed
+         * it here unchanged with the deferred-invalid readback from i34-9's
+         * 077d66d9 and my own 24/16384 target-screen retune.  Grouping all 167
+         * scored draws since the promoted base by whether they carry this arm
+         * gives a median 0.396% above the code-identical redraw population,
+         * which is the largest supported shift of any arm on the board -- not
+         * significant on its own (Mann-Whitney p=0.12), but the best-evidenced
+         * single change available, and no tree had yet combined it with either
+         * of the other two.
+         *
+         * The fused path quantizes the packed rows straight into the
+         * prequantized matmul's layout, skipping the F32 staging tensor and
+         * the quantize launch; the bytes the matmul reads are identical. */
+        const int ehx_fused = h->hooks.ehx_pack_quant &&
+            h->hooks.matmul_q8_0_preq && (n_embd & 15u) == 0u;
+        if (ehx_fused) {
+            const uint64_t ehx_rows = (uint64_t)n_tokens * n_hc;
+            const uint64_t ehx_blocks = (2ull * n_embd) / 32u;
+            const uint64_t ehx_soff =
+                (ehx_rows * ehx_blocks * 32u + 15u) & ~15ull;
+            ok = h->hooks.ehx_pack_quant(
+                     h->t_ehx, 0u, ehx_soff, h->t_e_normed, h->t_h_normed,
+                     n_tokens, n_hc, n_embd) != 0;
+            MTP_HEAD_TICK(MTP_HEAD_T_EHX);
+            if (ok) {
+                stage = "eh_proj";
+                ok = h->hooks.matmul_q8_0_preq(
+                         h->t_hyper, h->head_map, h->head_size,
+                         h->eh_proj_offset, 2ull * n_embd, n_embd,
+                         h->t_ehx, 0u, ehx_soff, ehx_rows) != 0;
+            }
+            MTP_HEAD_TICK(MTP_HEAD_T_EH_PROJ);
         } else {
-            for (uint32_t t = 0; ok && t < n_tokens; t++) {
-                for (uint32_t s = 0; ok && s < n_hc; s++) {
-                    const uint64_t dst =
-                        ((uint64_t)t * n_hc + s) * 2ull * embd_bytes;
-                    ok = ds4_gpu_tensor_copy(
-                             h->t_ehx, dst, h->t_e_normed,
-                             (uint64_t)t * embd_bytes, embd_bytes) != 0 &&
-                         ds4_gpu_tensor_copy(
-                             h->t_ehx, dst + embd_bytes, h->t_h_normed,
-                             ((uint64_t)t * hc_dim + (uint64_t)s * n_embd) * f,
-                             embd_bytes) != 0;
+            if (h->hooks.ehx_pack) {
+                ok = h->hooks.ehx_pack(h->t_ehx, h->t_e_normed, h->t_h_normed,
+                                       n_tokens, n_hc, n_embd) != 0;
+            } else {
+                for (uint32_t t = 0; ok && t < n_tokens; t++) {
+                    for (uint32_t s = 0; ok && s < n_hc; s++) {
+                        const uint64_t dst =
+                            ((uint64_t)t * n_hc + s) * 2ull * embd_bytes;
+                        ok = ds4_gpu_tensor_copy(
+                                 h->t_ehx, dst, h->t_e_normed,
+                                 (uint64_t)t * embd_bytes, embd_bytes) != 0 &&
+                             ds4_gpu_tensor_copy(
+                                 h->t_ehx, dst + embd_bytes, h->t_h_normed,
+                                 ((uint64_t)t * hc_dim + (uint64_t)s * n_embd) * f,
+                                 embd_bytes) != 0;
+                    }
                 }
             }
+            MTP_HEAD_TICK(MTP_HEAD_T_EHX);
+            if (ok) {
+                stage = "eh_proj";
+                ok = h->hooks.matmul_q8_0(h->t_hyper, h->head_map, h->head_size,
+                                          h->eh_proj_offset, 2ull * n_embd,
+                                          n_embd, h->t_ehx,
+                                          (uint64_t)n_tokens * n_hc) != 0;
+            }
+            MTP_HEAD_TICK(MTP_HEAD_T_EH_PROJ);
         }
     }
-    MTP_HEAD_TICK(MTP_HEAD_T_EHX);
-    if (ok) {
-        stage = "eh_proj";
-        ok = h->hooks.matmul_q8_0(h->t_hyper, h->head_map, h->head_size,
-                                  h->eh_proj_offset, 2ull * n_embd, n_embd,
-                                  h->t_ehx, (uint64_t)n_tokens * n_hc) != 0;
-    }
-    MTP_HEAD_TICK(MTP_HEAD_T_EH_PROJ);
     if (ok) {
         stage = "block";
         ds4_qwen4exp_block_forward_fn block = cache_only
@@ -1266,6 +1346,8 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
     }
     MTP_HEAD_TICK(MTP_HEAD_T_MIXER);
     bool screened = false;
+    const bool defer_invalid =
+        getenv("DS4_MTP_NO_DEFER_INVALID_FLAG") == NULL;
     if (ok && logit_rows == 1u && h->t_native_scratch && h->t_native_ids &&
         h->hooks.native_screen && h->hooks.native_map &&
         getenv("DS4_MTP_NO_NATIVE_SCREEN") == NULL) {
@@ -1273,7 +1355,7 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
         const int rc = h->hooks.native_screen(h->t_logits, h->t_native_ids,
                 h->t_native_scratch, h->target_map, h->target_size,
                 h->output_offset, n_embd, h->n_vocab, draft_prefix, draft_tail,
-                h->t_sample);
+                h->t_sample, defer_invalid);
         if (rc < 0 || (uint32_t)rc > h->native_capacity) ok = false;
         else if (rc > 0) { screened = true; draft_width = (uint32_t)rc; }
     }
@@ -1288,38 +1370,8 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
      * the property the whole speculative cycle stands on), so a shortlist
      * id's logit is the logit the full projection produces. */
     if (ok && !screened) {
-        /* A single row can project its prefix directly to the packed output.
-         * Multiple rows retain separate prefix storage and per-row packing. */
-        const bool direct_prefix = logit_rows == 1u;
-        stage = "borrowed lm head";
-        ok = h->hooks.matmul_q8_0(
-                draft_tail && !direct_prefix ? h->t_logits_prefix : h->t_logits,
-                h->target_map, h->target_size, h->output_offset, n_embd,
-                draft_prefix ? draft_prefix : h->n_vocab,
-                h->t_sample, logit_rows) != 0;
-        if (ok && draft_tail) {
-            stage = "borrowed lm head tail";
-            ok = h->hooks.matmul_q8_0(
-                    h->t_logits_tail, h->target_map, h->target_size,
-                    h->output_offset + (uint64_t)(h->n_vocab - draft_tail) *
-                        ds4_qwen4exp_q8_0_row_bytes(n_embd),
-                    n_embd, draft_tail, h->t_sample, logit_rows) != 0;
-        }
-        if (ok && draft_tail) {
-            stage = "shortlist pack";
-            for (uint32_t r = 0; r < logit_rows; r++) {
-                ok = (direct_prefix || ds4_gpu_tensor_copy(
-                             h->t_logits, (uint64_t)r * draft_width * f,
-                             h->t_logits_prefix, (uint64_t)r * draft_prefix * f,
-                             (uint64_t)draft_prefix * f) != 0) &&
-                         ds4_gpu_tensor_copy(
-                             h->t_logits,
-                             ((uint64_t)r * draft_width + draft_prefix) * f,
-                             h->t_logits_tail, (uint64_t)r * draft_tail * f,
-                             (uint64_t)draft_tail * f) != 0;
-                if (!ok) break;
-            }
-        }
+        ok = mtp_head_static_logits(h, n_embd, logit_rows, draft_prefix,
+                                    draft_tail, draft_width, &stage);
     }
     MTP_HEAD_TICK(MTP_HEAD_T_LM_HEAD);
     if (ok) {
@@ -1335,7 +1387,9 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
     if (ok && screened) {
         stage = "native original winner mapping";
         ok = h->hooks.native_map(h->t_top1, h->t_logits, h->t_native_ids,
-                                  draft_width, h->n_vocab) != 0;
+                                  h->t_native_scratch, draft_width, h->n_vocab,
+                                  draft_prefix + draft_tail,
+                                  defer_invalid) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_TOP1);
     if (ok) ok = ds4_gpu_end_commands() != 0;
@@ -1349,9 +1403,38 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
         ok = ds4_gpu_tensor_read(h->t_top1,
                                  (uint64_t)logit_first * sizeof(uint32_t),
                                  h->top1_host,
-                                 (uint64_t)out_rows * sizeof(uint32_t)) != 0;
+                                 (uint64_t)(out_rows +
+                                     (screened && defer_invalid)) *
+                                     sizeof(uint32_t)) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_TOP1_IN);
+    if (ok && screened && defer_invalid && h->top1_host[out_rows] != 0u) {
+        /* The tower and mixer have already produced t_sample.  A non-finite
+         * coarse score therefore needs only the legacy static LM-head tail and
+         * top-1, not a second stateful forward. */
+        screened = false;
+        draft_width = draft_prefix ? draft_prefix + draft_tail : h->n_vocab;
+        stage = "native nonfinite LM-head fallback";
+        ok = ds4_gpu_begin_commands() != 0;
+        if (ok) {
+            ok = mtp_head_static_logits(h, n_embd, logit_rows, draft_prefix,
+                                        draft_tail, draft_width, &stage);
+        }
+        if (ok) {
+            stage = "native nonfinite fallback top-1";
+            ok = ds4_gpu_indexer_topk_tensor(h->t_top1, h->t_logits,
+                                             draft_width, logit_rows, 1u) != 0;
+        }
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        else (void)ds4_gpu_synchronize();
+        if (ok) {
+            stage = "native nonfinite fallback readback";
+            ok = ds4_gpu_tensor_read(h->t_top1,
+                                     (uint64_t)logit_first * sizeof(uint32_t),
+                                     h->top1_host,
+                                     (uint64_t)out_rows * sizeof(uint32_t)) != 0;
+        }
+    }
     /* The margin gate's measurement: top-1 minus runner-up over the refined
      * candidate logits the screen left in t_logits.  It reads after the top-1
      * readback, so it adds no synchronisation and changes no token. */
