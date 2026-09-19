@@ -132,122 +132,6 @@ static void *qwen4exp_group_scratch(int tier, uint64_t bytes) {
 }
 
 /* ------------------------------------------------------------------------
- * THE MoE INPUT PREQUANT.
- *
- * The routed MoE opens with a standalone pass over its own input: 80 one-warp
- * blocks that read 2560 floats of `mixed`, write 2560 int8 plus 80 scales and
- * 80 group sums, and do nothing else.  At the decode widths that pass moves
- * 13 KB -- 0.05 us of the box's 241 GB/s -- and costs a graph node plus a
- * full kernel round trip on a serial stream, 48 times per round.  It is the
- * same defect shape the attention mixer's folded Q8_0 quantize already
- * removed on the other side of the block: the kernel one step upstream is
- * ALREADY holding every value in a register, in exactly the lane that owns it.
- *
- * The FFN mixer's mix leg writes `mixed` at one thread per column, 256-thread
- * blocks, so warp w of block bx owns columns [(bx*8+w)*32, +32) of its token
- * -- which IS group bx*8+w, the unit dev_qwen4exp_quantize_group consumes.
- * So the mixer can leave xq/xs/xsum behind and the routed call can skip its
- * first kernel entirely.  The quantiser called is the MoE's own device
- * function on the bytes it would itself have read back, so this is a
- * scheduling change and not a numerical one.
- *
- * WHY A HANDSHAKE RATHER THAN A PARAMETER.  The scratch the routed call
- * quantises into is sized by the routed call: mq_offset + mq_bytes +
- * task_bytes needs mid_dim, n_expert_used and the task-list decision, none of
- * which a mixer knows.  qwen4exp_group_scratch is grow-only and
- * pointer-stable, so a mixer that asked for the xq prefix alone would get the
- * right pointer -- unless the pool had never been grown yet, in which case it
- * would allocate short and the routed call's grow would free the buffer the
- * mixer had just written.  So the routed call PUBLISHES the layout it used and
- * a mixer folds only against a published layout that still holds: same input
- * buffer, same rows, same groups, same base, same pool size.  Layer 0 of a
- * fresh shape therefore keeps the shipped pass and every layer after it folds.
- * A pool grow retires the decode graphs, so a captured fold cannot outlive the
- * layout it was captured against.
- *
- * DECODE WIDTHS ONLY.  The prefill quantiser is a different kernel
- * (qwen4exp_quantize_rows_wide_kernel, rows >= 64) whose 8-groups-per-block
- * mapping the mix leg does not reproduce, and at prefill the 13 KB is 0.4% of
- * a pass that moves 3 GB, so there is nothing there to win.  Prefill keeps the
- * shipped path byte for byte.
- *
- * THE VALVE: DS4_QWEN4EXP_NO_MOE_PREQUANT stands the fold down and restores
- * the standalone pass, for an A/B out of one build.
- * ------------------------------------------------------------------------ */
-static int qwen4exp_moe_prequant_on(void) {
-    static int v = -1;
-    if (v < 0) v = getenv("DS4_QWEN4EXP_NO_MOE_PREQUANT") == NULL ? 1 : 0;
-    return v;
-}
-
-/* What the routed call quantised, and out of which pool. */
-typedef struct {
-    int         valid;
-    const void *x;
-    const void *base;
-    uint64_t    pool_bytes;
-    uint32_t    rows;
-    uint32_t    xgroups;
-} qwen4exp_preq_layout;
-static qwen4exp_preq_layout g_qwen4exp_preq_layout[16];
-
-/* What a mixer left behind: consumed and cleared by the FIRST routed call
- * after it, which is the MoE of the same block with only the router matmul and
- * the pair grouping in between -- neither of which writes the xq prefix.  A
- * mismatch drops the arm and the routed call quantises as shipped, so a stale
- * arm can only cost the fold, never the values. */
-typedef struct {
-    int         armed;
-    const void *x;
-    const void *base;
-    uint32_t    rows;
-    uint32_t    xgroups;
-} qwen4exp_preq_arm;
-static qwen4exp_preq_arm g_qwen4exp_preq_arm[16];
-
-/* The pool as it stands, without asking for any size -- the mixer must not be
- * able to allocate or grow it. */
-static const void *qwen4exp_group_scratch_peek(int tier, uint64_t *bytes_out) {
-    if (tier < 0 || tier >= 16) return NULL;
-    if (bytes_out) *bytes_out = g_qwen4exp_group_bytes[tier];
-    return g_qwen4exp_group_scratch[tier];
-}
-
-static void qwen4exp_preq_publish(int tier, const void *x, const void *base,
-                                  uint32_t rows, uint32_t xgroups) {
-    if (tier < 0 || tier >= 16) return;
-    qwen4exp_preq_layout *ly = &g_qwen4exp_preq_layout[tier];
-    ly->valid = 1;
-    ly->x = x;
-    ly->base = base;
-    ly->pool_bytes = g_qwen4exp_group_bytes[tier];
-    ly->rows = rows;
-    ly->xgroups = xgroups;
-}
-
-/* Resolve the three destinations a mixer would fill, or NULL when no published
- * layout matches.  The offsets are the routed call's own
- * (xq | xs | xsum at the pool prefix); they are written in one place here and
- * asserted against the routed call's by the pointer equality below. */
-static int qwen4exp_preq_targets(int tier, const void *x, uint32_t rows,
-                                 uint32_t xgroups, int8_t **xq, float **xs,
-                                 int32_t **xsum) {
-    if (!qwen4exp_moe_prequant_on() || tier < 0 || tier >= 16) return 0;
-    const qwen4exp_preq_layout *ly = &g_qwen4exp_preq_layout[tier];
-    uint64_t have = 0;
-    const void *base = qwen4exp_group_scratch_peek(tier, &have);
-    if (!ly->valid || !base || ly->base != base || ly->pool_bytes != have ||
-        ly->x != x || ly->rows != rows || ly->xgroups != xgroups) {
-        return 0;
-    }
-    char *b = (char *)base;
-    *xq = (int8_t *)b;
-    *xs = (float *)(b + (uint64_t)rows * xgroups * 32u);
-    *xsum = (int32_t *)(*xs + (uint64_t)rows * xgroups);
-    return 1;
-}
-
-/* ------------------------------------------------------------------------
  * The shared-expert fork.
  *
  * One MoE block is ds4_gpu_qwen4exp_routed_moe_tensor followed by
@@ -4366,18 +4250,6 @@ __global__ static void qwen4exp_moe_group_small_kernel(
      * apply.  Plainly launched -- at the prefill widths where the caller
      * takes the wide grouping path instead -- the fence is a no-op. */
     QWEN4EXP_PDL_SYNC();
-    /* AND a producer, for the same reason the fused variant above is one: when
-     * the MoE-input prequant fold removes the routed input quantizer from the
-     * decode stream, this one block becomes the stream predecessor of the
-     * PSS-launched gate/up projection, whose own fence is its first statement.
-     * The trigger grants LAUNCH permission only; gate/up's
-     * cudaGridDependencySynchronize() still waits for this grid to complete, so
-     * the data edge is unchanged.  One block, so the producer-side deadlock
-     * rule is satisfied by a factor of 768; the gate reads the grid in the body
-     * rather than trusting the launch sites. */
-    if ((uint64_t)gridDim.x * (uint64_t)gridDim.y * (uint64_t)gridDim.z <=
-        768u)
-        QWEN4EXP_PDL_TRIGGER();
     const uint32_t e = threadIdx.x;
     const uint32_t lane = e & 31u;
     const uint32_t warp = e >> 5u;
@@ -4510,47 +4382,13 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
      * on the plain launch this kernel takes, correct if it is ever launched
      * with the programmatic attribute. */
     QWEN4EXP_PDL_SYNC();
-    /* AND THE TRIGGER, RESTORED FOR THE KERNEL THAT NOW FOLLOWS THIS ONE.
+    /* The trigger the standalone top-k carried is GONE, deliberately: it
+     * existed for the grouping kernel, which is now the second half of this
+     * one.  A retained trigger would open a launch window across the whole
+     * fused kernel for any PSS-attributed launch that ever lands behind it,
+     * which is a hazard with no remaining benefit.
      *
-     * The comment this replaces said the standalone top-k's trigger was
-     * deliberately dropped because the grouping kernel it fed is now this
-     * kernel's second half, and that a retained trigger "would open a launch
-     * window across the whole fused kernel for any PSS-attributed launch that
-     * ever lands behind it."  That was true while the routed input quantizer
-     * sat between this kernel and the gate/up projection: the quantizer
-     * triggered, so the edge that mattered was already closed and the trigger
-     * here bought nothing.
-     *
-     * The MoE-input prequant fold (see the routed entry) removes that
-     * quantizer from the decode stream, which makes THIS kernel gate/up's
-     * stream predecessor -- and gate/up is launched with the programmatic
-     * attribute at exactly those widths.  Without a trigger its fence degrades
-     * to a plain completion wait and the launch turnaround the fold was meant
-     * to save comes straight back as exposed dispatch.  So the trigger belongs
-     * here now, for the same reason it belonged on the standalone top-k.
-     *
-     * WHY THE HAZARD THE OLD COMMENT NAMED DOES NOT BITE.  A trigger grants a
-     * dependent grid permission to LAUNCH; it does not release that grid's own
-     * cudaGridDependencySynchronize(), which still waits for this grid to
-     * COMPLETE.  So a PSS-attributed successor is only exposed if it reads this
-     * kernel's output ABOVE its own fence.  The one such successor is
-     * qwen4exp_moe_gateup_q_kernel, whose QWEN4EXP_PDL_SYNC() is its first
-     * statement with nothing hoisted above it (its own comment says so, and its
-     * weight addresses are data dependent on active[] so nothing COULD be
-     * hoisted).  The deadlock rule constrains the producer: this launch is
-     * dim3(1,1,1), so the gate below is satisfied by a factor of 768 and this
-     * grid trivially fits one wave and will always reach the trigger.  The gate
-     * reads the grid in the body rather than trusting the launch sites, per the
-     * header's rule.
-     *
-     * DS4_QWEN4EXP_NO_MOE_PREQUANT, which stands the fold down, leaves the
-     * quantizer in place and then this trigger is the redundant one the old
-     * comment described -- harmless, because the quantizer is the immediate
-     * predecessor there and its trigger is the one gate/up consumes. */
-    if ((uint64_t)gridDim.x * (uint64_t)gridDim.y * (uint64_t)gridDim.z <=
-        768u)
-        QWEN4EXP_PDL_TRIGGER();
-    /* Warp w serves token w.  Warps at or above n_tokens skip this half by
+     * Warp w serves token w.  Warps at or above n_tokens skip this half by
      * BRANCHING, never by returning: every thread has to reach the
      * __syncthreads below, and a partial warp must never reach one of the
      * full-mask warp intrinsics inside. */
@@ -9492,60 +9330,11 @@ static int qwen4exp_routed_moe_cuda(
     }
     if (!cuda_ok(cudaGetLastError(), "qwen4exp MoE pair list")) return 0;
 
-    /* THE MoE INPUT QUANTIZE, TAKEN ONE KERNEL EARLIER WHEN THE MIXER HAD IT.
-     *
-     * `x` here is the FFN mixer's `mixed` output, and at the decode widths that
-     * mixer's dual kernel already holds every one of these 32 floats in the
-     * registers of the warp that wrote them (mix_blocks * 8 warps, one warp per
-     * 32-column group -- the identity mapping is spelled out at the publish
-     * helper near the top of this file).  So the standalone pass below re-reads
-     * a row that was live one kernel ago.  At one token that is 80 one-warp
-     * blocks moving 13 KB: ~0.05 us of traffic, but a graph node (0.84 us) plus
-     * a full kernel round trip, 48 times per decode round.
-     *
-     * The handshake is host-side and deliberately narrow: the mixer folds only
-     * when the layout this call published on the PREVIOUS layer still describes
-     * the pool (same base, same total bytes, same rows, same groups) and the
-     * tensor it is about to write is the one this call will read.  Any drift --
-     * a pool grow, a width change, a different tensor -- fails the compare, the
-     * mixer does not fold, the arm is not set, and this call quantizes exactly
-     * as it always did.  A pool grow additionally retires the decode graphs, so
-     * a captured fold cannot outlive the layout it was captured against.
-     *
-     * The arm is CONSUMED here whether or not it matches, so a stale arm can
-     * never be taken by a later layer.
-     *
-     * PDL: the quantizer is the programmatic producer whose trigger releases
-     * the gate/up launch below.  When this pass is skipped, the stream
-     * predecessor is the one-block grouping kernel instead, and that kernel now
-     * carries the trigger itself (see its body), so the edge is preserved
-     * rather than silently dropped.
-     *
-     * DS4_QWEN4EXP_NO_MOE_PREQUANT stands the whole thing down. */
-    int preq_taken = 0;
-    if (logical_tier >= 0 && logical_tier < 16) {
-        qwen4exp_preq_arm *pa = &g_qwen4exp_preq_arm[logical_tier];
-        if (pa->armed) {
-            pa->armed = 0;
-            if (pa->x == (const void *)x->ptr &&
-                pa->base == (const void *)sc.xq &&
-                pa->rows == n_tokens && pa->xgroups == xgroups) {
-                preq_taken = 1;
-            }
-        }
-    }
-    if (!preq_taken &&
-        !qwen4exp_quantize_rows(sc.xq, sc.xs, sc.xsum, (const float *)x->ptr,
+    if (!qwen4exp_quantize_rows(sc.xq, sc.xs, sc.xsum, (const float *)x->ptr,
                                 n_tokens, in_dim, xgroups, in_dim, 0, 1,
                                 stream)) {
         return 0;
     }
-    /* Publish the layout for the NEXT layer's FFN mixer.  Unconditional: the
-     * mixer re-validates every field against the pool as it stands when IT
-     * runs, so publishing after a fold that was taken is what keeps the fold
-     * live layer after layer. */
-    qwen4exp_preq_publish(logical_tier, (const void *)x->ptr,
-                          (const void *)sc.xq, n_tokens, xgroups);
 
     /* The shared-expert fork's first event: the quantized activation the
      * shared gate/up needs is complete here, and nothing below writes the
@@ -11373,14 +11162,14 @@ __global__ static void qwen4exp_hc_inject_weights_renorm_kernel(
  * kernel above: InjectType < 0 is the rolled walk verbatim, a typed arm
  * stages the walk's elements in registers first.  The mix leg is the same
  * in every instantiation, including its `#pragma unroll 1`. */
-template <int InjectType = -1, bool Quant = false, bool Sum = false>
+template <int InjectType = -1, bool Quant = false>
 __global__ static void qwen4exp_hc_mix_inject_dual_kernel(
         float *mixed, float *inject, const float *hyper, const float *nscale,
         const float *normw, const float *gate_values, const char *w,
         uint32_t n_embd, uint32_t n_hc, uint32_t rows,
         float weight_bias, int round_bf16,
         uint32_t weight_type, uint32_t weight_row_bytes,
-        int8_t *xq, float *xscale, int32_t *xsum) {
+        int8_t *xq, float *xscale) {
     /* PDL producer: the decode arm of the mix that closes the mixer, so the
      * router GEMV behind it launches at its top.  Grid is (mix_blocks +
      * n_hc, rows) -- 14*2 blocks at the two-row decode.  Triggered at the
@@ -11448,40 +11237,6 @@ __global__ static void qwen4exp_hc_mix_inject_dual_kernel(
             int q = (int)lrintf(qwen4exp_q8_ftz(vz * id));
             q = q > 127 ? 127 : (q < -128 ? -128 : q);
             xq[pair * 32u + lane] = (int8_t)q;
-        }
-        /* Sum: the ROUTED MoE's input quantize, which is a different quantiser
-         * from the Quant leg above -- m/127.0f and 1.0f/d rather than the
-         * fast-math reciprocal, plus the int32 group sum the q4_K `wb` term
-         * needs -- so it calls the MoE's own device function rather than
-         * repeating its arithmetic.  Design note at qwen4exp_preq_targets.
-         *
-         * WHY IT READS `out` BACK INSTEAD OF PASSING `v`.  Bit-exactness here
-         * is structural, not argued: the function is the one the standalone
-         * kernel calls, and the bytes it reduces are the bytes the standalone
-         * kernel would have read -- `mixed` as this launch leaves it.  A f32
-         * store followed by a f32 load of the same address is exact, and
-         * `mixed` carries no __restrict__, so the load cannot be hoisted above
-         * the store it depends on.  __syncwarp() publishes the other 31 lanes'
-         * stores to this warp (its memory guarantee covers exactly the mask it
-         * synchronises) which is the whole group: the mapping is the identity
-         * the comment above describes, so the 32 columns of group
-         * (blockIdx.x*8 + warp) are the 32 lanes of this warp and nothing
-         * outside it contributes.  No thread of a mix block returns early --
-         * n_embd is a multiple of blockDim.x at this entry -- so the barrier is
-         * convergent.
-         *
-         * `at` is the standalone kernel's `r * groups + g` with r = t and
-         * g = blockIdx.x * (blockDim.x/32) + warp, and `d & ~31u` is g * 32,
-         * so both the destination and the source slice are that kernel's. */
-        if (Sum) {
-            const uint32_t lane = threadIdx.x & 31u;
-            __syncwarp();
-            dev_qwen4exp_quantize_group(
-                    xq, xscale, xsum,
-                    out + (uint64_t)t * n_embd + (d & ~31u), lane, 32u,
-                    (uint64_t)t * (n_embd / 32u) +
-                        (uint64_t)blockIdx.x * (blockDim.x >> 5u) +
-                        (threadIdx.x >> 5u));
         }
     } else {
         float *out = inject;
@@ -11700,24 +11455,21 @@ static int qwen4exp_hc_staged_ok(uint32_t n_embd, uint32_t n_hc) {
         }                                                                    \
     } while (0)
 
-#define QWEN4EXP_HC_DUAL_LAUNCH_QS(QUANT, SUM, GRID, ...) do {               \
+#define QWEN4EXP_HC_DUAL_LAUNCH_Q(QUANT, GRID, ...) do {                     \
         if (staged && inject_weight->type == (uint32_t)DS4_QWEN4EXP_TY_f32) {\
             qwen4exp_hc_mix_inject_dual_kernel<                              \
-                DS4_QWEN4EXP_TY_f32, QUANT, SUM><<<GRID, threads, 0,         \
+                DS4_QWEN4EXP_TY_f32, QUANT><<<GRID, threads, 0,              \
                 cuda_decode_stream()>>>(__VA_ARGS__);                        \
         } else if (staged &&                                                 \
                    inject_weight->type == (uint32_t)DS4_QWEN4EXP_TY_q8_0) {  \
             qwen4exp_hc_mix_inject_dual_kernel<                              \
-                DS4_QWEN4EXP_TY_q8_0, QUANT, SUM><<<GRID, threads, 0,        \
+                DS4_QWEN4EXP_TY_q8_0, QUANT><<<GRID, threads, 0,             \
                 cuda_decode_stream()>>>(__VA_ARGS__);                        \
         } else {                                                             \
-            qwen4exp_hc_mix_inject_dual_kernel<-1, QUANT, SUM>               \
+            qwen4exp_hc_mix_inject_dual_kernel<-1, QUANT>                    \
                 <<<GRID, threads, 0, cuda_decode_stream()>>>(__VA_ARGS__);   \
         }                                                                    \
     } while (0)
-
-#define QWEN4EXP_HC_DUAL_LAUNCH_Q(QUANT, GRID, ...)                          \
-    QWEN4EXP_HC_DUAL_LAUNCH_QS(QUANT, false, GRID, __VA_ARGS__)
 
 #define QWEN4EXP_HC_DUAL_LAUNCH(GRID, ...)                                   \
     QWEN4EXP_HC_DUAL_LAUNCH_Q(false, GRID, __VA_ARGS__)
@@ -12958,41 +12710,6 @@ static int qwen4exp_hc_mixer_fused_cuda(
                 qwen4exp_hc_ranges_disjoint(q8_xscale, s_bytes_out, normw, norm_bytes) &&
                 qwen4exp_hc_ranges_disjoint(q8_xscale, s_bytes_out, iw, iw_bytes) &&
                 qwen4exp_hc_ranges_disjoint(q8_xscale, s_bytes_out, wide_scratch->ptr, hc_bytes);
-            /* The routed MoE's input quantize, folded into the same store, for
-             * the FFN mixer only: `inject` is non-NULL here, which excludes the
-             * tower's final mixer (it passes no inject head and feeds the LM
-             * head, not an MoE block), and `quant` is false here, which
-             * excludes the attention mixer (it asked for the OTHER fold).
-             * Decode widths only, and only against a layout the routed call
-             * published and still holds -- design note at
-             * qwen4exp_preq_targets. */
-            int8_t  *pq_xq = NULL;
-            float   *pq_xs = NULL;
-            int32_t *pq_xsum = NULL;
-            /* One span covers all three destinations: they are the routed
-             * call's contiguous pool prefix, xq | xs | xsum. */
-            const uint64_t pq_bytes = (uint64_t)rows * (n_embd / 32u) *
-                (32u + sizeof(float) + sizeof(int32_t));
-            const int preq =
-                !quant && rows <= 2u && (n_embd % 32u) == 0u &&
-                (threads % 32u) == 0u &&
-                /* The Sum leg's __syncwarp() and the shuffle trees inside
-                 * dev_qwen4exp_quantize_group are full-mask, so no thread of a
-                 * mix block may take the `d >= n_embd` early return.  The entry
-                 * gate above already pins n_embd to 2560 and `threads` to a
-                 * whole number of warps, but this is the condition the
-                 * convergence argument actually rests on, so state it. */
-                (n_embd % threads) == 0u &&
-                qwen4exp_preq_targets(cuda_current_tier(), (const void *)mixed->ptr,
-                                      rows, n_embd / 32u,
-                                      &pq_xq, &pq_xs, &pq_xsum) &&
-                qwen4exp_hc_ranges_disjoint(pq_xq, pq_bytes, mixed->ptr, mix_bytes) &&
-                qwen4exp_hc_ranges_disjoint(pq_xq, pq_bytes, inject->ptr, inj_bytes) &&
-                qwen4exp_hc_ranges_disjoint(pq_xq, pq_bytes, hyper->ptr, hc_bytes) &&
-                qwen4exp_hc_ranges_disjoint(pq_xq, pq_bytes, nscale, n_bytes) &&
-                qwen4exp_hc_ranges_disjoint(pq_xq, pq_bytes, normw, norm_bytes) &&
-                qwen4exp_hc_ranges_disjoint(pq_xq, pq_bytes, iw, iw_bytes) &&
-                qwen4exp_hc_ranges_disjoint(pq_xq, pq_bytes, wide_scratch->ptr, hc_bytes);
             if (quant) {
                 QWEN4EXP_HC_DUAL_LAUNCH_Q(true,
                         dim3(mix_blocks + n_hc, rows, 1u),
@@ -13001,17 +12718,8 @@ static int qwen4exp_hc_mixer_fused_cuda(
                         (const float *)wide_scratch->ptr, iw,
                         n_embd, n_hc, rows, weight_bias, round_bf16,
                         inject_weight->type, (uint32_t)iw_row_bytes,
-                        q8_xq, q8_xscale, (int32_t *)NULL);
+                        q8_xq, q8_xscale);
                 if (q8_folded) *q8_folded = 1;
-            } else if (preq) {
-                QWEN4EXP_HC_DUAL_LAUNCH_QS(false, true,
-                        dim3(mix_blocks + n_hc, rows, 1u),
-                        (float *)mixed->ptr, (float *)inject->ptr,
-                        (const float *)hyper->ptr, nscale, normw,
-                        (const float *)wide_scratch->ptr, iw,
-                        n_embd, n_hc, rows, weight_bias, round_bf16,
-                        inject_weight->type, (uint32_t)iw_row_bytes,
-                        pq_xq, pq_xs, pq_xsum);
             } else {
                 QWEN4EXP_HC_DUAL_LAUNCH(
                         dim3(mix_blocks + n_hc, rows, 1u),
@@ -13020,28 +12728,9 @@ static int qwen4exp_hc_mixer_fused_cuda(
                         (const float *)wide_scratch->ptr, iw,
                         n_embd, n_hc, rows, weight_bias, round_bf16,
                         inject_weight->type, (uint32_t)iw_row_bytes,
-                        (int8_t *)NULL, (float *)NULL, (int32_t *)NULL);
+                        (int8_t *)NULL, (float *)NULL);
             }
-            /* Arm only when the launch encoded.  A launch that did not leaves
-             * no arm, so the routed call quantises as shipped.  The arm is
-             * cleared on every pass through here, folded or not, so an arm can
-             * never outlive the mixer that set it: the routed call of the same
-             * block consumes and clears it, and the next mixer to reach this
-             * point starts from zero. */
-            const cudaError_t dual_err = cudaGetLastError();
-            const int dual_tier = cuda_current_tier();
-            if (dual_tier >= 0 && dual_tier < 16) {
-                qwen4exp_preq_arm *pa = &g_qwen4exp_preq_arm[dual_tier];
-                pa->armed = 0;
-                if (preq && dual_err == cudaSuccess) {
-                    pa->armed = 1;
-                    pa->x = (const void *)mixed->ptr;
-                    pa->base = (const void *)pq_xq;
-                    pa->rows = rows;
-                    pa->xgroups = n_embd / 32u;
-                }
-            }
-            return cuda_ok(dual_err, "qwen4exp_hc_mix_inject_dual launch");
+            return cuda_ok(cudaGetLastError(), "qwen4exp_hc_mix_inject_dual launch");
         }
     }
 
@@ -16224,57 +15913,25 @@ static int qwen4exp_qsa_attention_split(
             (const float *)v_cache->ptr, sel, cnt, sc, tmax, ct, tsum,        \
             n_tokens, n_head, n_kv_head, head_dim, pos0, cache_cap,           \
             max_selected, sparse ? 1u : 0u, max_tiles, d_pos)
-    /* The reduced dense V prefetch depth belongs to the ROW COUNT, not to the
-     * width.  It arrived attached to `case 2u` because 2 was the only width one
-     * row ever took, so the two were the same condition; once the one-wave rule
-     * can hand one row a different width, they are not.  Reaching `case 3u` with
-     * QWEN4EXP_QSA_SPLIT_VSTEP would silently trade a measured tuning for an
-     * unmeasured one, which is the opposite of what that rule is for -- so the
-     * predicate moves into a macro and every width one row can reach keeps it.
-     *
-     * The predicate is the original one, unweakened, including the model-shape
-     * clauses and the env valve: `n_tokens == 1u` makes it false on the verify
-     * path and false in prefill, so `case 6u` at two rows and `case 4u` at 1024
-     * launch the same <G, 16u> instantiation as before, and `case 2u` expands to
-     * exactly the code it replaces.  The only pair (width, depth) that is new is
-     * one row at a width only the rule produces.  Widths 12 and 1 are left alone
-     * because one row cannot reach either: 12 misses the shared-memory cap and 1
-     * is below every wave the rule considers.
-     *
-     * Preserving the 8 rather than taking the 16 is the smaller of the two
-     * assumptions, but it IS an assumption: the depth was measured at GROUP 2
-     * and I am carrying it to GROUP 3 on the argument that it describes how many
-     * value rows a lane keeps in flight, which is per-lane and has no GROUP in
-     * it. If anything GROUP 3 wants it more, since `contrib[GROUP]` is one
-     * register deeper. Neither depth is measured at GROUP 3 and I cannot measure
-     * either. Both land the same products in the same accumulators in the same
-     * order -- VSTEP is a scheduling number, as the header comment says -- so
-     * whichever is faster, the emitted tokens are identical.
-     *
-     * Cost of the hoist: `case 4u` and `case 6u` now reach a getenv they did not
-     * reach before, once per split launch. Those are capture-time or eager-side
-     * calls -- decode replays graphs -- so at 48 layers it is a few microseconds
-     * of prefill against a 621.6 ms leg, which is 0.02 bips. */
-#define QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH(G)                                 \
-    do {                                                                      \
-        if (!sparse && n_tokens == 1u && n_head == 24u &&                     \
-            n_kv_head == 2u && head_dim == 256u &&                            \
-            getenv("DS4_QWEN4EXP_NO_QSA_SHORT_V") == NULL) {                  \
-            QWEN4EXP_QSA_SPLIT_LAUNCH(G, 8u);                                 \
-        } else {                                                              \
-            QWEN4EXP_QSA_SPLIT_LAUNCH(G, QWEN4EXP_QSA_SPLIT_VSTEP);           \
-        }                                                                     \
-    } while (0)
     switch (g) {
         case 12u: QWEN4EXP_QSA_SPLIT_LAUNCH(12u, QWEN4EXP_QSA_SPLIT_VSTEP); break;
-        case 6u:  QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH(6u);  break;
-        case 4u:  QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH(4u);  break;
-        case 3u:  QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH(3u);  break;
-        case 2u:  QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH(2u);  break;
+        case 6u:  QWEN4EXP_QSA_SPLIT_LAUNCH(6u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
+        case 4u:  QWEN4EXP_QSA_SPLIT_LAUNCH(4u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
+        case 3u:  QWEN4EXP_QSA_SPLIT_LAUNCH(3u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
+        case 2u:
+            /* Preserve the ordered products; only reduce dense V prefetch
+             * depth for the measured one-row model shape. */
+            if (!sparse && n_tokens == 1u && n_head == 24u &&
+                n_kv_head == 2u && head_dim == 256u &&
+                getenv("DS4_QWEN4EXP_NO_QSA_SHORT_V") == NULL) {
+                QWEN4EXP_QSA_SPLIT_LAUNCH(2u, 8u);
+            } else {
+                QWEN4EXP_QSA_SPLIT_LAUNCH(2u, QWEN4EXP_QSA_SPLIT_VSTEP);
+            }
+            break;
         case 1u:  QWEN4EXP_QSA_SPLIT_LAUNCH(1u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
         default:  return 0;
     }
-#undef QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH
 #undef QWEN4EXP_QSA_SPLIT_LAUNCH
     qwen4exp_qsa_split_fold_kernel<<<dim3(n_head, n_tokens), head_dim, 0,
         cuda_decode_stream()>>>(
