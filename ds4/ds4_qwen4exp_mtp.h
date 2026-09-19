@@ -704,6 +704,18 @@ typedef struct {
     int (*ehx_pack)(ds4_gpu_tensor *out, const ds4_gpu_tensor *embedding,
                     const ds4_gpu_tensor *hidden, uint32_t n_tokens,
                     uint32_t n_hc, uint32_t n_embd);
+    /* Optional fused pack+quantize and the prequantized matmul it feeds.
+     * Both are bound together or neither is; NULL keeps the pack hook (or
+     * the portable copy sequence) plus the quantizing matmul entry. */
+    int (*ehx_pack_quant)(ds4_gpu_tensor *q, uint64_t q_offset,
+                          uint64_t s_offset, const ds4_gpu_tensor *embedding,
+                          const ds4_gpu_tensor *hidden, uint32_t n_tokens,
+                          uint32_t n_hc, uint32_t n_embd);
+    int (*matmul_q8_0_preq)(ds4_gpu_tensor *out, const void *model_map,
+                            uint64_t model_size, uint64_t weight_offset,
+                            uint64_t in_dim, uint64_t out_dim,
+                            const ds4_gpu_tensor *q, uint64_t q_offset,
+                            uint64_t s_offset, uint64_t n_tok);
     int (*matmul_q8_0)(ds4_gpu_tensor *out, const void *model_map,
                        uint64_t model_size, uint64_t weight_offset,
                        uint64_t in_dim, uint64_t out_dim,
