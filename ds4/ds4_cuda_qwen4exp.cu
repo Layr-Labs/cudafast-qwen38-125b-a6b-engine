@@ -16255,22 +16255,35 @@ static int qwen4exp_qsa_attention_split(
      * reach before, once per split launch. Those are capture-time or eager-side
      * calls -- decode replays graphs -- so at 48 layers it is a few microseconds
      * of prefill against a 621.6 ms leg, which is 0.02 bips. */
-#define QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH(G)                                 \
+/* The depth is a per-(row count, width) choice, so the macro takes it. Width 2
+ * keeps the depth the previous author measured, 8, byte for byte. The widths
+ * only the one-wave rule can reach carry QWEN4EXP_QSA_SPLIT_ROWDEPTH_WIDE,
+ * which is the knob this submission sweeps: 8 was never measured at GROUP 3
+ * either, it was only the safer of two guesses, and `contrib[GROUP]` is one
+ * register deeper there than at GROUP 2. Going shallower trades value-load
+ * parallelism for registers; going deeper trades the other way. Either result
+ * is information, and neither can move a token: both the strided loop and its
+ * scalar tail accumulate contrib[h] with __fmaf_rn in strictly ascending j for
+ * any depth, so every depth is bit-identical. */
+#ifndef QWEN4EXP_QSA_SPLIT_ROWDEPTH_WIDE
+#define QWEN4EXP_QSA_SPLIT_ROWDEPTH_WIDE 4u
+#endif
+#define QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH(G, D)                              \
     do {                                                                      \
         if (!sparse && n_tokens == 1u && n_head == 24u &&                     \
             n_kv_head == 2u && head_dim == 256u &&                            \
             getenv("DS4_QWEN4EXP_NO_QSA_SHORT_V") == NULL) {                  \
-            QWEN4EXP_QSA_SPLIT_LAUNCH(G, 8u);                                 \
+            QWEN4EXP_QSA_SPLIT_LAUNCH(G, (D));                                \
         } else {                                                              \
             QWEN4EXP_QSA_SPLIT_LAUNCH(G, QWEN4EXP_QSA_SPLIT_VSTEP);           \
         }                                                                     \
     } while (0)
     switch (g) {
         case 12u: QWEN4EXP_QSA_SPLIT_LAUNCH(12u, QWEN4EXP_QSA_SPLIT_VSTEP); break;
-        case 6u:  QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH(6u);  break;
-        case 4u:  QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH(4u);  break;
-        case 3u:  QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH(3u);  break;
-        case 2u:  QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH(2u);  break;
+        case 6u:  QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH(6u, QWEN4EXP_QSA_SPLIT_ROWDEPTH_WIDE);  break;
+        case 4u:  QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH(4u, QWEN4EXP_QSA_SPLIT_ROWDEPTH_WIDE);  break;
+        case 3u:  QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH(3u, QWEN4EXP_QSA_SPLIT_ROWDEPTH_WIDE);  break;
+        case 2u:  QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH(2u, 8u);  break;
         case 1u:  QWEN4EXP_QSA_SPLIT_LAUNCH(1u, QWEN4EXP_QSA_SPLIT_VSTEP);  break;
         default:  return 0;
     }
