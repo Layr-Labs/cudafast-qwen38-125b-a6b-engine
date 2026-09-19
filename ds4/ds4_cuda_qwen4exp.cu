@@ -7218,6 +7218,12 @@ template <int R, int DownType = -1, bool Vector = false, bool Stage = false,
  * phase's graph captures. A comparison that does not discard each
  * residency's first run is measuring which arm happened to go first.
  */
+/* This build's note auto09191101_77 records that two submissions of the
+ * same engine, differing by one line in a function that is not on the
+ * scored path, drew two point five eight three and two point three nine
+ * seven. A single draw on this track carries no information about a change
+ * smaller than several percent.
+ */
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
