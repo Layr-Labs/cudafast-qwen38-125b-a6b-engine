@@ -674,12 +674,30 @@ void ds4_kvstore_tokens_copy_prefix(ds4_tokens *dst, const ds4_tokens *src, int 
     dst->len = 0;
     if (!src) return;
     if (n > src->len) n = src->len;
-    for (int i = 0; i < n; i++) ds4_tokens_push(dst, src->v[i]);
+    if (n <= 0) return;
+    /* Reserve once, then one memcpy: same 64-then-double growth as
+     * ds4_tokens_push, so the final capacity is identical. */
+    if (n > dst->cap) {
+        int cap = dst->cap ? dst->cap : 64;
+        while (cap < n) cap *= 2;
+        dst->v = kv_xrealloc(dst->v, (size_t)cap * sizeof(dst->v[0]));
+        dst->cap = cap;
+    }
+    memcpy(dst->v, src->v, (size_t)n * sizeof(src->v[0]));
+    dst->len = n;
 }
 
 static void tokens_append(ds4_tokens *dst, const ds4_tokens *src) {
-    if (!dst || !src) return;
-    for (int i = 0; i < src->len; i++) ds4_tokens_push(dst, src->v[i]);
+    if (!dst || !src || src->len <= 0) return;
+    const int need = dst->len + src->len;
+    if (need > dst->cap) {
+        int cap = dst->cap ? dst->cap : 64;
+        while (cap < need) cap *= 2;
+        dst->v = kv_xrealloc(dst->v, (size_t)cap * sizeof(dst->v[0]));
+        dst->cap = cap;
+    }
+    memmove(dst->v + dst->len, src->v, (size_t)src->len * sizeof(src->v[0]));
+    dst->len = need;
 }
 
 void ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
