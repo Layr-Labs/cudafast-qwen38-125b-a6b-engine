@@ -6854,9 +6854,12 @@ qwen4exp_moe_gateup_split_kernel(
             (uint64_t)expert * up_expert_bytes +
             (uint64_t)row0 * up_row_bytes;
         for (uint32_t i = threadIdx.x; i < words; i += blockDim.x) {
-            wcoop[i] = *(const uint4 *)(const void *)(gb + (uint64_t)i * 16u);
+            /* One-shot weight stream: the panel is consumed out of shared
+             * and these global lines are never re-read, so they are fetched
+             * evict-first, matching the dense matmuls' __ldcs policy. */
+            wcoop[i] = __ldcs((const uint4 *)(const void *)(gb + (uint64_t)i * 16u));
             wcoop[PanelU4 + i] =
-                *(const uint4 *)(const void *)(ub + (uint64_t)i * 16u);
+                __ldcs((const uint4 *)(const void *)(ub + (uint64_t)i * 16u));
         }
         __syncthreads();
         wsh = wcoop + (second ? PanelU4 : 0u);
@@ -7306,7 +7309,7 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                         qw_cpasync16((uint32_t)__cvta_generic_to_shared(dst + o),
                                      gp + o);
                     } else {
-                        *(uint4 *)(dst + o) = *(const uint4 *)(gp + o);
+                        *(uint4 *)(dst + o) = __ldcs((const uint4 *)(gp + o));
                     }
                 }
             }
@@ -7573,7 +7576,7 @@ __global__ static void qwen4exp_shared_down_q_kernel(
         for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
              i += (uint64_t)blockDim.x * 16u) {
             if (i + 16u <= panel_bytes)
-                *(uint4 *)(spanel + i) = *(const uint4 *)(const void *)(gp + i);
+                *(uint4 *)(spanel + i) = __ldcs((const uint4 *)(const void *)(gp + i));
             else
                 for (uint64_t j = i; j < panel_bytes; j++) spanel[j] = gp[j];
         }
