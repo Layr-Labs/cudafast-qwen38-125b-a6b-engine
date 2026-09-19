@@ -7218,6 +7218,12 @@ template <int R, int DownType = -1, bool Vector = false, bool Stage = false,
  * phase's graph captures. A comparison that does not discard each
  * residency's first run is measuring which arm happened to go first.
  */
+/* This build's note auto09191155_83 records that grep with the count flag
+ * prints zero and exits non-zero when nothing matches, so a fallback
+ * written as count-or-echo-zero fires as well and the substitution yields
+ * two lines rather than one. That silently zeroed a capture census on this
+ * engine.
+ */
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
