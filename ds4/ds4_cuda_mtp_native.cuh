@@ -299,3 +299,39 @@ extern "C" int ds4_gpu_mtp_native_map(ds4_gpu_tensor *winner,
         (const float *)logits->ptr,(const uint32_t *)ids->ptr,count,vocab);
     return cuda_ok(cudaGetLastError(),"native original winner map");
 }
+
+__global__ static void mtp_native_scatter_kernel(
+        float *out, const float *values, const uint32_t *ids,
+        uint32_t count, uint32_t vocab) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const uint32_t id = ids[i];
+    if (id < vocab) out[id] = values[i];
+}
+
+/* Restore refined shortlist logits to their original vocabulary positions.
+ * The caller initializes the full row to -FLT_MAX first.  Native screening
+ * sorts ids into strictly increasing original-id order, so every destination
+ * is unique and this needs neither atomics nor a second permutation. */
+extern "C" int ds4_gpu_mtp_native_scatter(ds4_gpu_tensor *out,
+        uint64_t out_offset, const ds4_gpu_tensor *values,
+        const ds4_gpu_tensor *ids, uint32_t count, uint32_t vocab) {
+    if (!out || !values || !ids || !count || !vocab ||
+        out_offset > out->bytes ||
+        (uint64_t)vocab * sizeof(float) > out->bytes - out_offset ||
+        values->bytes < (uint64_t)count * sizeof(float) ||
+        ids->bytes < (uint64_t)count * sizeof(uint32_t) ||
+        (out_offset & (sizeof(float) - 1u)) != 0u) return 0;
+    const int tier = ds4_tensor_device_idx(out);
+    int current = -1;
+    if (tier < 0 || tier >= g_n_gpus ||
+        ds4_tensor_device_idx(values) != tier ||
+        ds4_tensor_device_idx(ids) != tier ||
+        cudaGetDevice(&current) != cudaSuccess ||
+        current != g_gpu[tier].device_id) return 0;
+    float *row = (float *)((char *)out->ptr + out_offset);
+    mtp_native_scatter_kernel<<<(count + 255u) / 256u, 256, 0,
+            cuda_decode_stream()>>>(row, (const float *)values->ptr,
+                                    (const uint32_t *)ids->ptr, count, vocab);
+    return cuda_ok(cudaGetLastError(), "native target scatter");
+}
