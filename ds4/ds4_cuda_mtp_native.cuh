@@ -15,7 +15,8 @@ static constexpr uint32_t MTP_NATIVE_SCREEN_GROUPS = 24u;
  * proposal.  R2 still streams these groups once for both rows, while a wider
  * exact shortlist protects hidden top-logit checks. */
 static constexpr uint32_t MTP_TARGET_NATIVE_CAP = 8192u;
-static constexpr uint32_t MTP_TARGET_NATIVE_SCREEN_GROUPS = 40u;
+/* Keep the full first 32-group wave plus four pairs in the partial wave. */
+static constexpr uint32_t MTP_TARGET_NATIVE_SCREEN_GROUPS = 36u;
 static constexpr uint32_t MTP_NATIVE_MAX_WIDTH = 1u << 20;
 template <bool Screen, bool EmitKeys = false>
 __global__ static void mtp_native_projection_kernel(
