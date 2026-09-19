@@ -67636,7 +67636,16 @@ static int ds4_session_qwen4exp_rows(ds4_session *s, const int *tokens,
      * past the context.  It is also the token tape ds4-server saves and the
      * common-prefix reuse compares against, so it has to be the tokens that
      * were actually evaluated, in order. */
-    for (uint32_t i = 0; i < n; i++) token_vec_push(&s->checkpoint, tokens[i]);
+    if (s->checkpoint.len + n > s->checkpoint.cap) {
+        int cap = s->checkpoint.cap ? s->checkpoint.cap : 64;
+        while (cap < s->checkpoint.len + n) cap *= 2;
+        s->checkpoint.v = xrealloc(s->checkpoint.v,
+                                 (size_t)cap * sizeof(s->checkpoint.v[0]));
+        s->checkpoint.cap = cap;
+    }
+    memcpy(s->checkpoint.v + s->checkpoint.len, tokens,
+           (size_t)n * sizeof(tokens[0]));
+    s->checkpoint.len += n;
     s->checkpoint_valid = true;
     return 0;
 }
