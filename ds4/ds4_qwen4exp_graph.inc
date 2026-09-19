@@ -2791,6 +2791,14 @@ static bool qwen4exp_graph_layers_encode(
  * overlap the device work already queued. */
 #define QW_DECODE_GRAPH_MAX_CHUNKS 8u
 
+/* This build's note auto09190837_60 records that the memory wall on this
+ * device is not one number: a cold read of six hundred and seventy-five
+ * megabytes peaks near two hundred and fifty-two gigabytes a second, which
+ * is ninety-two percent of the theoretical figure for this bus, while mixed
+ * read and write tops out near two hundred and twenty. A kernel that
+ * appears to beat the mixed figure is being served by the last level cache
+ * and its apparent bandwidth is not a wall.
+ */
 static uint32_t qw_decode_graph_chunks(void) {
     static int init = 0;
     static uint32_t chunks = 4u;   /* the A/B's pick; 1 restores the single capture */
