@@ -1118,6 +1118,12 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
         }
     }
     *state_ptr = h;
+    /* The recurrence is the producer of the gated output norm's edge.  Every
+     * store this kernel owes its reader has been issued by here, so the
+     * dependent grid may begin the part of its prologue that does not read
+     * this output: the completion the consumer's fence waits on is still this
+     * kernel's own, so the trigger relaxes launch latency and nothing else. */
+    QWEN4EXP_PDL_TRIGGER();
 }
 
 /* Bounded input replay for a two-row verify. The base state stays intact
@@ -1795,6 +1801,17 @@ __global__ static void qwen4exp_gdn_output_kernel(
     const uint32_t value_dim = n_value_head * QWEN4EXP_GDN_DIM;
     const uint64_t base = ((uint64_t)row * n_tokens + token) * value_dim +
         head * QWEN4EXP_GDN_DIM;
+    /* PDL consumer fence.  The norm weight is a read-only session tensor
+     * addressed by launch math alone -- it is not the recurrence's output --
+     * so its load is issued above the fence and held in a register while the
+     * producer drains.  Everything the producer writes (`out`) and the gate
+     * the projection published are read below it.  The early return above is
+     * block-uniform (it is blockIdx arithmetic), so every thread that reaches
+     * the fence reaches it together, and on a plain launch the fence is a
+     * no-op.  The epilogue multiplies the same four terms in the same order,
+     * so every emitted float is the shipped one. */
+    const float nw = output_norm[tid];
+    QWEN4EXP_PDL_SYNC();
     const float raw = out[base + tid];
     float total = warp_sum_f32(raw * raw);
     if (lane == 0u) partial[warp] = total;
@@ -1802,8 +1819,17 @@ __global__ static void qwen4exp_gdn_output_kernel(
     total = lane < 4u ? partial[lane] : 0.0f;
     total = warp_sum_all_f32(total);
     const float scale = rsqrtf(total / (float)QWEN4EXP_GDN_DIM + norm_eps);
-    out[base + tid] = raw * scale * output_norm[tid] *
+    out[base + tid] = raw * scale * nw *
         qwen4exp_gdn_sigmoid(output_gate[base + tid]);
+}
+
+/* The host half of that edge, read once: DS4_QWEN4EXP_NO_PDL_GDN_OUTPUT puts
+ * the gated output norm back on the plain launch, where its fence and the
+ * producer's trigger are both no-ops. */
+static int qwen4exp_pdl_gdn_output(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_NO_PDL_GDN_OUTPUT") == NULL ? 1 : 0;
+    return v;
 }
 
 static const float *qwen4exp_gdn_weight_f32(
@@ -2966,10 +2992,24 @@ static int qwen4exp_cuda_gdn_run(
         return cuda_ok(cudaGetLastError(),
                        "qwen4exp GDN output norm quantize launch");
     }
-    qwen4exp_gdn_output_kernel<<<dim3(n_tokens, n_value_head, n_rows),
-                                 QWEN4EXP_GDN_DIM, 0, stream>>>(
-            (float *)out->ptr, (const float *)output_gate->ptr, output_norm,
-            n_value_head, n_rows, n_tokens, norm_eps);
+    /* Decode widths only: the recurrence that precedes this norm on the
+     * stream triggers its dependent grid, and this kernel's prologue -- the
+     * norm weight load -- rides that window.  Verify above two tokens and
+     * every prefill width keep the plain launch, where the fence and the
+     * trigger are both no-ops. */
+    if (n_tokens <= 2u && qwen4exp_pdl_gdn_output()) {
+        QWEN4EXP_LAUNCH_PDL(
+                qwen4exp_gdn_output_kernel,
+                (dim3(n_tokens, n_value_head, n_rows)), QWEN4EXP_GDN_DIM, 0,
+                stream,
+                (float *)out->ptr, (const float *)output_gate->ptr,
+                output_norm, n_value_head, n_rows, n_tokens, norm_eps);
+    } else {
+        qwen4exp_gdn_output_kernel<<<dim3(n_tokens, n_value_head, n_rows),
+                                     QWEN4EXP_GDN_DIM, 0, stream>>>(
+                (float *)out->ptr, (const float *)output_gate->ptr,
+                output_norm, n_value_head, n_rows, n_tokens, norm_eps);
+    }
     return cuda_ok(cudaGetLastError(), "qwen4exp GDN output norm launch");
 }
 
