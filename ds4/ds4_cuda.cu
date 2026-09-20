@@ -18069,11 +18069,11 @@ extern "C" void ds4_gpu_set_q8_mma_pipe(int mode) {
 static int g_q8_mma_pipe_wide = -1;
 static int cuda_q8_mma_pipe_wide_mode(void) {
     if (g_q8_mma_pipe_wide < 0) {
-        int mode = 1;
+        int mode = 2;
         const char *e = getenv("DS4_CUDA_MMA_PIPE_WIDE");
         if (e != NULL) {
             mode = atoi(e);
-            if (mode < 0 || mode > 2) mode = 1;
+            if (mode < 0 || mode > 2) mode = 2;
         }
         g_q8_mma_pipe_wide = mode;
     }
@@ -18219,6 +18219,9 @@ static void cuda_q8_mma_pipe_prepare(void) {
     (void)cuda_q8_mma_pipe_attr<2, 2, 4, 4, 4, 2>();
     (void)cuda_q8_mma_pipe_attr<2, 4, 4, 4, 4, 2>();
     (void)cuda_q8_mma_pipe_attr<2, 8, 4, 4, 4, 2>();
+    (void)cuda_q8_mma_pipe_attr<2, 2, 4, 4, 4, 2, true>();
+    (void)cuda_q8_mma_pipe_attr<2, 4, 4, 4, 4, 2, true>();
+    (void)cuda_q8_mma_pipe_attr<2, 8, 4, 4, 4, 2, true>();
 }
 
 /* The pipelined tile's shape ladder.  Returns 0 when the call is not one it

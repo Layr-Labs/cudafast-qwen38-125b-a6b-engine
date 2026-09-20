@@ -4350,6 +4350,71 @@ __global__ static void qwen4exp_moe_pair_tasks_kernel(
     if (e == 0) tasks[0] = warp_prefix[15];
 }
 
+/* Fused light and heavy pair-tasks kernel: performs the prefix-scan for both
+ * the 32-pair light tile (0 < c <= 32) and the heavy tile (c > 32) in a single
+ * 512-thread CTA pass, eliminating an extra kernel launch from the stream. */
+__global__ static void qwen4exp_moe_dual_pair_tasks_kernel(
+        int32_t *tasks_light, int32_t *tasks_heavy, const int32_t *counts, unsigned total,
+        int32_t tile_light = 32, int32_t tile_heavy = 64) {
+    __shared__ int32_t warp_prefix_l[16];
+    __shared__ int32_t warp_prefix_h[16];
+    const unsigned e = threadIdx.x, lane = e & 31u, warp = e >> 5u;
+    const int32_t c0 = e < total ? counts[e] : 0;
+    const int32_t count_l = (c0 > 0 && c0 <= 32) ? c0 : 0;
+    const int32_t tiles_l = (count_l + tile_light - 1) / tile_light;
+    int32_t prefix_l = tiles_l;
+
+    const int32_t count_h = (c0 > 32) ? c0 : 0;
+    const int32_t tiles_h = (count_h + tile_heavy - 1) / tile_heavy;
+    int32_t prefix_h = tiles_h;
+
+#pragma unroll
+    for (unsigned d = 1; d < 32; d <<= 1) {
+        int32_t vl = __shfl_up_sync(0xffffffffu, prefix_l, d);
+        if (lane >= d) prefix_l += vl;
+        int32_t vh = __shfl_up_sync(0xffffffffu, prefix_h, d);
+        if (lane >= d) prefix_h += vh;
+    }
+    if (lane == 31) {
+        warp_prefix_l[warp] = prefix_l;
+        warp_prefix_h[warp] = prefix_h;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        int32_t vl = lane < 16 ? warp_prefix_l[lane] : 0;
+        int32_t vh = lane < 16 ? warp_prefix_h[lane] : 0;
+#pragma unroll
+        for (unsigned d = 1; d < 32; d <<= 1) {
+            int32_t pl = __shfl_up_sync(0xffffffffu, vl, d);
+            if (lane >= d) vl += pl;
+            int32_t ph = __shfl_up_sync(0xffffffffu, vh, d);
+            if (lane >= d) vh += ph;
+        }
+        if (lane < 16) {
+            warp_prefix_l[lane] = vl;
+            warp_prefix_h[lane] = vh;
+        }
+    }
+    __syncthreads();
+    if (warp) {
+        prefix_l += warp_prefix_l[warp - 1];
+        prefix_h += warp_prefix_h[warp - 1];
+    }
+    const int32_t start_l = prefix_l - tiles_l;
+    for (int32_t t = 0; t < tiles_l; t++) {
+        tasks_light[1 + 2 * (start_l + t)] = (int32_t)e;
+        tasks_light[2 + 2 * (start_l + t)] = t * tile_light;
+    }
+    if (e == 0) tasks_light[0] = warp_prefix_l[15];
+
+    const int32_t start_h = prefix_h - tiles_h;
+    for (int32_t t = 0; t < tiles_h; t++) {
+        tasks_heavy[1 + 2 * (start_h + t)] = (int32_t)e;
+        tasks_heavy[2 + 2 * (start_h + t)] = t * tile_heavy;
+    }
+    if (e == 0) tasks_heavy[0] = warp_prefix_h[15];
+}
+
 /* At decode and verify widths there are at most seventy pairs.  A single
  * 512-thread block can build the complete expert metadata without a memset,
  * count launch, scan launch, scatter launch, or inter-block atomics.  Each
@@ -10353,10 +10418,14 @@ static int qwen4exp_routed_moe_cuda(
             (gu_heavy_env == NULL || gu_heavy_env[0] != '0');
         int32_t *const gu_tasks_heavy =
             gu_tasks ? gu_tasks + (1u + 2u * task_capacity) : NULL;
-        if (pair_tasks) {
+        if (pair_tasks && gu_heavy) {
+            qwen4exp_moe_dual_pair_tasks_kernel<<<1, 512, 0, stream>>>(
+                    gu_tasks, gu_tasks_heavy, sc.counts, n_total_expert, 32, (int32_t)QW_GUH_BN);
+            if (!cuda_ok(cudaGetLastError(), "qwen4exp gate/up dual pair tasks")) return 0;
+        } else if (pair_tasks) {
             qwen4exp_moe_pair_tasks_kernel<<<1, 512, 0, stream>>>(
                     gu_tasks, sc.counts, n_total_expert, 32,
-                    0, gu_heavy ? 32 : 0x7fffffff);
+                    0, 0x7fffffff);
             if (!cuda_ok(cudaGetLastError(), "qwen4exp gate/up pair tasks")) return 0;
         }
         if (gu_heavy) {
@@ -10384,10 +10453,12 @@ static int qwen4exp_routed_moe_cuda(
                                 "shared memory\n");
                 return 0;
             }
-            qwen4exp_moe_pair_tasks_kernel<<<1, 512, 0, stream>>>(
-                    gu_tasks_heavy, sc.counts, n_total_expert, (int32_t)QW_GUH_BN,
-                    32, 0x7fffffff);
-            if (!cuda_ok(cudaGetLastError(), "qwen4exp gate/up heavy tasks")) return 0;
+            if (!pair_tasks) {
+                qwen4exp_moe_pair_tasks_kernel<<<1, 512, 0, stream>>>(
+                        gu_tasks_heavy, sc.counts, n_total_expert, (int32_t)QW_GUH_BN,
+                        32, 0x7fffffff);
+                if (!cuda_ok(cudaGetLastError(), "qwen4exp gate/up heavy tasks")) return 0;
+            }
             (guh_ahead ? qwen4exp_moe_gateup_heavy_kernel<true>
                        : qwen4exp_moe_gateup_heavy_kernel<false>)<<<
                     dim3(mid_dim / QW_GUH_BM, (unsigned)task_capacity, 1),
@@ -11452,6 +11523,32 @@ __global__ static void qwen4exp_hc_mix_kernel(
     out[(uint64_t)t * n_embd + d] = acc * (1.0f / (float)n_hc);
 }
 
+/* 128-bit vectorized hyper-connection mixer: processes 4 continuous channels
+ * per thread via float4 LDG/STG, cutting memory instruction count by 4x. */
+__global__ static void qwen4exp_hc_mix_vec4_kernel(
+        float4 *out, const float4 *normed, const float4 *wide,
+        uint32_t n_embd4, uint32_t n_hc, uint32_t n_tokens) {
+    const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t t = blockIdx.y;
+    if (d >= n_embd4 || t >= n_tokens) return;
+
+    const uint64_t row = ((uint64_t)t * n_hc) * n_embd4 + d;
+
+    float acc_x = 0.0f, acc_y = 0.0f, acc_z = 0.0f, acc_w = 0.0f;
+    for (uint32_t h = 0; h < n_hc; h++) {
+        const uint64_t idx = row + (uint64_t)h * n_embd4;
+        const float4 w = wide[idx];
+        const float4 n = normed[idx];
+        acc_x += qwen4exp_sigmoid(w.x) * n.x;
+        acc_y += qwen4exp_sigmoid(w.y) * n.y;
+        acc_z += qwen4exp_sigmoid(w.z) * n.z;
+        acc_w += qwen4exp_sigmoid(w.w) * n.w;
+    }
+    const float inv_hc = 1.0f / (float)n_hc;
+    out[(uint64_t)t * n_embd4 + d] = make_float4(
+        acc_x * inv_hc, acc_y * inv_hc, acc_z * inv_hc, acc_w * inv_hc);
+}
+
 __global__ static void qwen4exp_hc_inject_weights_kernel(
         float *out, const float *normed, const char *w,
         uint32_t n_embd, uint32_t n_hc, uint32_t rows,
@@ -11511,6 +11608,39 @@ __global__ static void qwen4exp_hc_inject_kernel(
     out[i] = residual[i] + blk * inject[(uint64_t)t * n_hc + h];
 }
 
+/* 128-bit vectorized hyper-connection inject: 4 channels per thread via
+ * float4 LDG/STG vector operations. */
+__global__ static void qwen4exp_hc_inject_vec4_kernel(
+        float4 *out, const float4 *residual, const float4 *block,
+        const float *inject, const float4 *shexp_tot, const float *shexp_gate,
+        uint32_t n_embd4, uint32_t n_hc,
+        uint32_t n_tokens) {
+    if (n_tokens <= 2u) QWEN4EXP_PDL_TRIGGER();
+    const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t h = blockIdx.y;
+    const uint32_t t = blockIdx.z;
+    if (d >= n_embd4 || h >= n_hc || t >= n_tokens) return;
+
+    const uint64_t i = ((uint64_t)t * n_hc + h) * n_embd4 + d;
+    const uint64_t bi = (uint64_t)t * n_embd4 + d;
+    float4 blk = block[bi];
+    if (shexp_tot) {
+        const float g = shexp_gate[t];
+        const float4 st = shexp_tot[bi];
+        blk.x += g * st.x;
+        blk.y += g * st.y;
+        blk.z += g * st.z;
+        blk.w += g * st.w;
+    }
+    const float inj = inject[(uint64_t)t * n_hc + h];
+    const float4 res = residual[i];
+    out[i] = make_float4(
+        res.x + blk.x * inj,
+        res.y + blk.y * inj,
+        res.z + blk.z * inj,
+        res.w + blk.w * inj);
+}
+
 
 extern "C" int ds4_gpu_qwen4exp_rms_norm_tensor(
         ds4_gpu_tensor       *out,
@@ -11567,10 +11697,21 @@ extern "C" int ds4_gpu_qwen4exp_hc_mix_tensor(
         wide->bytes < hc_bytes) {
         return 0;
     }
-    qwen4exp_hc_mix_kernel<<<dim3((n_embd + 255u) / 256u, rows, 1u), 256, 0,
-                             cuda_decode_stream()>>>(
-            (float *)out->ptr, (const float *)normed->ptr,
-            (const float *)wide->ptr, n_embd, n_hc, rows);
+    if ((n_embd % 4u) == 0 &&
+        ((uintptr_t)out->ptr % 16u) == 0 &&
+        ((uintptr_t)normed->ptr % 16u) == 0 &&
+        ((uintptr_t)wide->ptr % 16u) == 0) {
+        const uint32_t n_embd4 = n_embd / 4u;
+        qwen4exp_hc_mix_vec4_kernel<<<dim3((n_embd4 + 255u) / 256u, rows, 1u), 256, 0,
+                                      cuda_decode_stream()>>>(
+                (float4 *)out->ptr, (const float4 *)normed->ptr,
+                (const float4 *)wide->ptr, n_embd4, n_hc, rows);
+    } else {
+        qwen4exp_hc_mix_kernel<<<dim3((n_embd + 255u) / 256u, rows, 1u), 256, 0,
+                                 cuda_decode_stream()>>>(
+                (float *)out->ptr, (const float *)normed->ptr,
+                (const float *)wide->ptr, n_embd, n_hc, rows);
+    }
     return cuda_ok(cudaGetLastError(), "qwen4exp_hc_mix launch");
 }
 
@@ -11642,11 +11783,24 @@ extern "C" int ds4_gpu_qwen4exp_hc_inject_tensor(
             sa->armed = 0;
         }
     }
-    qwen4exp_hc_inject_kernel<<<dim3((n_embd + 255u) / 256u, n_hc, rows), 256,
-                                0, cuda_decode_stream()>>>(
-            (float *)out_hc->ptr, (const float *)residual_hc->ptr,
-            (const float *)block_out->ptr, (const float *)inject->ptr,
-            sd_tot, sd_gate, n_embd, n_hc, rows);
+    if ((n_embd % 4u) == 0 &&
+        ((uintptr_t)out_hc->ptr % 16u) == 0 &&
+        ((uintptr_t)residual_hc->ptr % 16u) == 0 &&
+        ((uintptr_t)block_out->ptr % 16u) == 0 &&
+        (!sd_tot || ((uintptr_t)sd_tot % 16u) == 0)) {
+        const uint32_t n_embd4 = n_embd / 4u;
+        qwen4exp_hc_inject_vec4_kernel<<<dim3((n_embd4 + 255u) / 256u, n_hc, rows), 256,
+                                         0, cuda_decode_stream()>>>(
+                (float4 *)out_hc->ptr, (const float4 *)residual_hc->ptr,
+                (const float4 *)block_out->ptr, (const float *)inject->ptr,
+                (const float4 *)sd_tot, sd_gate, n_embd4, n_hc, rows);
+    } else {
+        qwen4exp_hc_inject_kernel<<<dim3((n_embd + 255u) / 256u, n_hc, rows), 256,
+                                    0, cuda_decode_stream()>>>(
+                (float *)out_hc->ptr, (const float *)residual_hc->ptr,
+                (const float *)block_out->ptr, (const float *)inject->ptr,
+                sd_tot, sd_gate, n_embd, n_hc, rows);
+    }
     return cuda_ok(cudaGetLastError(), "qwen4exp_hc_inject launch");
 }
 
