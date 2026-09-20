@@ -1806,6 +1806,63 @@ __global__ static void qwen4exp_gdn_output_kernel(
         qwen4exp_gdn_sigmoid(output_gate[base + tid]);
 }
 
+/* THE SHARED EXPERT LAUNCHER'S SCREENS, RESOLVED ONCE.
+ *
+ * The shared expert runs on every layer of the tower, beside the routed
+ * call, and its launcher screens each call against a set of named bisection
+ * valves before it can pick a kernel: the type-specialisation screen, the
+ * rotating single-token screen and its width companion, the vector screen,
+ * the tensor-core staging screen, the verify-width screen and the down
+ * panel's own valve.  Three of them are read more than once per call,
+ * because sibling rungs of the ladder re-test the same name.
+ *
+ * Each was a `getenv`.  On glibc that is a linear scan of `environ` with a
+ * comparison per entry, and a MISS -- the ranked case, since these valves
+ * exist to be unset -- walks the whole array before returning null.  The
+ * scan sits on the host between two kernel launches of a launch-bound round
+ * and cannot change its answer: the environment of a running process is
+ * fixed for the purposes of these flags.
+ *
+ * These resolvers cache the answer in a function-local static, the form this
+ * unit's own dependent-launch and staged-weight valves already use.  A
+ * benign race between two threads resolving the same name writes the same
+ * value.  Every name is kept, so bisection is unchanged. */
+static int qwen4exp_shared_generic_experts(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_GENERIC_EXPERTS") != NULL;
+    return v;
+}
+static int qwen4exp_shared_moe_r(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_MOE_R") != NULL;
+    return v;
+}
+static int qwen4exp_shared_no_r1(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_NO_SHARED_R1") != NULL;
+    return v;
+}
+static int qwen4exp_shared_no_wide_verify(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_NO_WIDE_VERIFY") != NULL;
+    return v;
+}
+static int qwen4exp_shared_no_vector(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_NO_SHARED_VECTOR") != NULL;
+    return v;
+}
+static int qwen4exp_shared_stage_set(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_SHARED_STAGE") != NULL;
+    return v;
+}
+static int qwen4exp_shared_no_down_panel(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_NO_SHARED_DOWN_PANEL") != NULL;
+    return v;
+}
+
 static const float *qwen4exp_gdn_weight_f32(
         const void *model_map,
         uint64_t    model_size,
@@ -10851,8 +10908,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
     cudaStream_t stream = cuda_decode_stream();
     const unsigned threads = 256u;
     const size_t shared = (size_t)threads * sizeof(float);
-    const bool specialize_shared =
-        getenv("DS4_QWEN4EXP_GENERIC_EXPERTS") == NULL;
+    const bool specialize_shared = !qwen4exp_shared_generic_experts();
 
     const uint32_t xgroups = in_dim / 32u;
     const uint32_t mgroups = mid_dim / 32u;
@@ -10943,8 +10999,8 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         gate_slab->type == DS4_QWEN4EXP_TY_q8_0 &&
         up_slab->type == DS4_QWEN4EXP_TY_q8_0 &&
         down_slab->type == DS4_QWEN4EXP_TY_q8_0 &&
-        getenv("DS4_QWEN4EXP_MOE_R") == NULL &&
-        getenv("DS4_QWEN4EXP_NO_SHARED_R1") == NULL;
+        !qwen4exp_shared_moe_r() &&
+        !qwen4exp_shared_no_r1();
     /* The aligned activation prefix and intermediate groups can be loaded
      * as two int4 values. Keep the row tile, warp ownership, reduction and
      * Q8 decoder unchanged. The rotating-weight screen supports two-token
@@ -10952,14 +11008,14 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
     const bool vector_shared =
         (n_tokens == 2u ||
          ((n_tokens == 3u || n_tokens == 4u) &&
-          getenv("DS4_QWEN4EXP_NO_WIDE_VERIFY") == NULL)) &&
+          !qwen4exp_shared_no_wide_verify())) &&
         in_dim == 2560u && mid_dim == 640u && out_dim == 2560u &&
         specialize_shared &&
         gate_slab->type == DS4_QWEN4EXP_TY_q8_0 &&
         up_slab->type == DS4_QWEN4EXP_TY_q8_0 &&
         down_slab->type == DS4_QWEN4EXP_TY_q8_0 &&
-        getenv("DS4_QWEN4EXP_MOE_R") == NULL &&
-        getenv("DS4_QWEN4EXP_NO_SHARED_VECTOR") == NULL;
+        !qwen4exp_shared_moe_r() &&
+        !qwen4exp_shared_no_vector();
     const int tile = single_q8 ? 1 : qwen4exp_moe_tile(n_tokens);
     const uint32_t tiles = (n_tokens + (uint32_t)tile - 1u) / (uint32_t)tile;
 
@@ -10983,8 +11039,8 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         gate_slab->type == (uint32_t)DS4_QWEN4EXP_TY_q8_0 &&
         up_slab->type == (uint32_t)DS4_QWEN4EXP_TY_q8_0 &&
         down_slab->type == (uint32_t)DS4_QWEN4EXP_TY_q8_0 &&
-        getenv("DS4_QWEN4EXP_SHARED_STAGE") == NULL &&
-        getenv("DS4_QWEN4EXP_MOE_R") == NULL;
+        !qwen4exp_shared_stage_set() &&
+        !qwen4exp_shared_moe_r();
     const uint32_t mma_tiles = (n_tokens + QW_SH_BN - 1u) / QW_SH_BN;
 
     /* Two tensor-core tiles now sit here.  Both return the per-row kernels'
@@ -11218,7 +11274,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         (sd_panel % 16u) == 0u &&
         ((uintptr_t)down & 15u) == 0u &&
         sd_panel <= QW_DOWN_PANEL_MAX_BYTES &&
-        getenv("DS4_QWEN4EXP_NO_SHARED_DOWN_PANEL") == NULL;
+        !qwen4exp_shared_no_down_panel();
 #define QWEN4EXP_SH_DOWN_IMPL(R, DT, V) do { \
     if (n_tokens <= 2u) { \
         if (sd_stage) { \
