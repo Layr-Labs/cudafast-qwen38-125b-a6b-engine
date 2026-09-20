@@ -27129,22 +27129,42 @@ __global__ static void moe_down_sum6_qwarp32_kernel(
         uint64_t down_row_bytes,
         uint32_t midq_blocks,
         uint32_t out_dim) {
+    /* perf-06: TWO ROW TILES PER BLOCK in the direct down-sum kernels.
+     *
+     * A block's down-projection weight rows are its own, but the quantised
+     * mid activation of every routed slot is read whole by EVERY block:
+     * there is one grid over the output dimension and each of its blocks
+     * pulls all the slots' activation blocks again.  The traffic of this
+     * step is therefore proportional to the block count, and at 32 rows per
+     * block the grid is many times the device's resident block capacity --
+     * the surplus blocks add no parallelism, only another pass over the mid
+     * activation, on the decode leg.  Two tiles of 32 halve the block count
+     * and halve those passes.
+     *
+     * DS4_MOE_DOWN_SUM_ROW_TILES = 1u restores the shipped geometry. */
+#ifndef DS4_MOE_DOWN_SUM_ROW_TILES
+#define DS4_MOE_DOWN_SUM_ROW_TILES 2u
+#endif
+#define DS4_MOE_DOWN_SUM_ROWS_PER_BLOCK (32u * DS4_MOE_DOWN_SUM_ROW_TILES)
     uint32_t lane = threadIdx.x & 7u;
-    uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
-    if (row >= out_dim) return;
-    float total = 0.0f;
-    #pragma unroll
-    for (uint32_t slot = 0; slot < 6u; slot++) {
-        int32_t expert_i = selected[slot];
-        if (expert_i < 0) expert_i = 0;
-        const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
-        const cuda_block_q8_K *xq = midq + (uint64_t)slot * midq_blocks;
-        float acc = 0.0f;
-        for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_q2_K_q8_K_block(wr + b, xq + b);
-        acc = quarter_warp_sum_f32(acc, lane);
-        if (lane == 0) total += acc;
+    for (uint32_t rr = 0; rr < DS4_MOE_DOWN_SUM_ROW_TILES; rr++) {
+        const uint32_t row = blockIdx.x * DS4_MOE_DOWN_SUM_ROWS_PER_BLOCK
+                           + (threadIdx.x >> 3u) + rr * 32u;
+        if (row >= out_dim) continue;
+        float total = 0.0f;
+        #pragma unroll
+        for (uint32_t slot = 0; slot < 6u; slot++) {
+            int32_t expert_i = selected[slot];
+            if (expert_i < 0) expert_i = 0;
+            const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
+            const cuda_block_q8_K *xq = midq + (uint64_t)slot * midq_blocks;
+            float acc = 0.0f;
+            for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_q2_K_q8_K_block(wr + b, xq + b);
+            acc = quarter_warp_sum_f32(acc, lane);
+            if (lane == 0) total += acc;
+        }
+        if (lane == 0) out[row] = total;
     }
-    if (lane == 0) out[row] = total;
 }
 
 __global__ static void moe_down_owned_slots_qwarp32_kernel(
@@ -27327,22 +27347,28 @@ __global__ static void moe_down_sum3_qwarp32_kernel(
         uint64_t down_row_bytes,
         uint32_t midq_blocks,
         uint32_t out_dim) {
+    /* Same tile count as the six-slot form above: the three-slot form is the
+     * peer-owned variant of the same reduction and is launched from the same
+     * grid, so the two must walk the same rows per block. */
     uint32_t lane = threadIdx.x & 7u;
-    uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
-    if (row >= out_dim) return;
-    float total = 0.0f;
-    #pragma unroll
-    for (uint32_t slot = 0; slot < 3u; slot++) {
-        int32_t expert_i = selected[slot];
-        if (expert_i < 0) expert_i = 0;
-        const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
-        const cuda_block_q8_K *xq = midq + (uint64_t)slot * midq_blocks;
-        float acc = 0.0f;
-        for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_q2_K_q8_K_block(wr + b, xq + b);
-        acc = quarter_warp_sum_f32(acc, lane);
-        if (lane == 0) total += acc;
+    for (uint32_t rr = 0; rr < DS4_MOE_DOWN_SUM_ROW_TILES; rr++) {
+        const uint32_t row = blockIdx.x * DS4_MOE_DOWN_SUM_ROWS_PER_BLOCK
+                           + (threadIdx.x >> 3u) + rr * 32u;
+        if (row >= out_dim) continue;
+        float total = 0.0f;
+        #pragma unroll
+        for (uint32_t slot = 0; slot < 3u; slot++) {
+            int32_t expert_i = selected[slot];
+            if (expert_i < 0) expert_i = 0;
+            const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
+            const cuda_block_q8_K *xq = midq + (uint64_t)slot * midq_blocks;
+            float acc = 0.0f;
+            for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_q2_K_q8_K_block(wr + b, xq + b);
+            acc = quarter_warp_sum_f32(acc, lane);
+            if (lane == 0) total += acc;
+        }
+        if (lane == 0) out[row] = total;
     }
-    if (lane == 0) out[row] = total;
 }
 
 __global__ static void moe_down_q4K_sum6_qwarp32_kernel(
@@ -30392,8 +30418,14 @@ static int routed_moe_launch(
                         }
                     }
                 } else {
+                    /* The two q2_K forms walk DS4_MOE_DOWN_SUM_ROW_TILES
+                     * tiles of 32 rows, so their grid divisor is the rows
+                     * per block, not 32.  The Q4_K forms above are
+                     * untouched and keep the shipped grid. */
+                    const dim3 sgrid_t((out_dim + DS4_MOE_DOWN_SUM_ROWS_PER_BLOCK - 1u)
+                                       / DS4_MOE_DOWN_SUM_ROWS_PER_BLOCK, 1, 1);
                     if (n_expert == 6u) {
-                        moe_down_sum6_qwarp32_kernel<<<sgrid, 256, 0, cuda_decode_stream()>>>(
+                        moe_down_sum6_qwarp32_kernel<<<sgrid_t, 256, 0, cuda_decode_stream()>>>(
                             (float *)out->ptr,
                             down_w,
                             midq,
@@ -30403,7 +30435,7 @@ static int routed_moe_launch(
                             midq_blocks,
                             out_dim);
                     } else {
-                        moe_down_sum3_qwarp32_kernel<<<sgrid, 256, 0, cuda_decode_stream()>>>(
+                        moe_down_sum3_qwarp32_kernel<<<sgrid_t, 256, 0, cuda_decode_stream()>>>(
                             (float *)out->ptr,
                             down_w,
                             midq,
