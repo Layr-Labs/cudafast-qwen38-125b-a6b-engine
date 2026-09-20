@@ -1588,6 +1588,29 @@ static bool qw_qsa_gate_from_doubled(uint32_t n_tokens, uint32_t q_width,
            (inplace_off != 0);
 }
 
+/* THE THREE-ROW VERIFY ON THE DECODE-WIDTH FUSED PROJECTIONS (S1 step 3).
+ * A depth-2 verify is three rows, and the fused decode projections below were
+ * gated at two, so 35 GDN layers fell back to two matmul_q8_0_preq plus two
+ * matmul_f32 launches each and 13 QSA layers to three matmul_q8_0_preq.  The
+ * kernels are generic in the row tile (`float acc[R]`, take-guarded, one
+ * independent accumulator chain and reduction tree per row), so a <3>
+ * instantiation gives row r exactly the value the <1>/<2> instantiations give
+ * it: R changes work sharing, never the arithmetic of a live row.
+ *
+ * WHAT THIS DOES CHANGE: at three rows the fused kernels replace the GENERIC
+ * matmul path, which reduces in a different order.  No row that exists at a
+ * one- or two-row decode moves -- those widths already take the fused arm --
+ * but a three-row verify's rows are now scored the way a two-row verify's rows
+ * are, instead of the way a prefill row is.  The emitted stream must be
+ * re-proven bit-exact at depth 2 (tokhash + top-5 logits), and it is the same
+ * class of change the wide-verify MoE tiles already made at a46b39fd.
+ * DS4_QWEN4EXP_NO_W3_FUSED=1 restores the two-row gates exactly. */
+static bool qw_w3_fused(uint32_t n_tokens) {
+    static int on = -1;
+    if (on < 0) on = getenv("DS4_QWEN4EXP_NO_W3_FUSED") == NULL ? 1 : 0;
+    return n_tokens <= 2u || (n_tokens == 3u && on != 0);
+}
+
 /* The GDN block.  head_layout is TILED for anything the loader bound: the
  * llama.cpp converter reorders the value heads into ggml's broadcast order and
  * the binder does not undo it, so value head j reads key head j % n_key_head. */
@@ -1653,7 +1676,7 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
 #endif
 
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    if (n_tokens<=2u && getenv("DS4_QWEN4EXP_NO_GDN_PROJECTION_FUSION")==NULL) {
+    if (qw_w3_fused(n_tokens) && getenv("DS4_QWEN4EXP_NO_GDN_PROJECTION_FUSION")==NULL) {
         ds4_gpu_tensor *outs[4]={s->gdn_qkv,s->gdn_gate,s->gdn_alpha,s->gdn_beta};
         const void *maps[4]={QW_MAP(m,l->attn_qkv),QW_MAP(m,l->attn_gate),
                             QW_MAP(m,l->ssm_alpha),QW_MAP(m,l->ssm_beta)};
@@ -1823,7 +1846,7 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
 
     /* Projections.  q is DOUBLED: half query, half output gate. */
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    if (n_tokens<=2u && getenv("DS4_QWEN4EXP_NO_QSA_Q8_TRIPLE")==NULL) {
+    if (qw_w3_fused(n_tokens) && getenv("DS4_QWEN4EXP_NO_QSA_Q8_TRIPLE")==NULL) {
         ds4_gpu_tensor *outs[3]={s->qsa_doubled,s->qsa_kin,s->qsa_vin};
         const void *maps[3]={QW_MAP(m,l->attn_q),QW_MAP(m,l->attn_k),QW_MAP(m,l->attn_v)};
         const uint64_t sizes[3]={QW_MAPSZ(m,l->attn_q),QW_MAPSZ(m,l->attn_k),QW_MAPSZ(m,l->attn_v)};
@@ -1853,7 +1876,7 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
     }
 
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    if (n_tokens<=2u) {
+    if (qw_w3_fused(n_tokens)) {
         ds4_gpu_tensor *outs[5]={s->qsa_q,s->qsa_gate,s->qsa_k[il],s->qsa_v[il],NULL};
         const ds4_gpu_tensor *ins[6]={s->qsa_doubled,s->qsa_kin,s->qsa_vin,
                                     s->attn_q_norm[il],s->attn_k_norm[il],s->inv_freq};
