@@ -10947,10 +10947,35 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         getenv("DS4_QWEN4EXP_NO_SHARED_R1") == NULL;
     /* The aligned activation prefix and intermediate groups can be loaded
      * as two int4 values. Keep the row tile, warp ownership, reduction and
-     * Q8 decoder unchanged. The rotating-weight screen supports two-token
-     * calls; single-token, wider and other-shape calls keep scalar reads. */
+     * Q8 decoder unchanged.
+     *
+     * THE SINGLE-TOKEN WIDTH.  This screen used to start at two tokens
+     * because the verify widths were what it was written for, and the
+     * one-token call was left on the scalar reader.  That is the width the
+     * serial decode round actually runs: every decode step of the reference
+     * schedule calls this entry with n_tokens == 1, so the shared expert's
+     * gate/up and down projections read their quantized activation groups
+     * one four-byte piece at a time on the only path the decode leg ever
+     * takes, while the two-token verify width reads the same groups as two
+     * int4 loads.  Nothing in the vector reader is a function of the row
+     * tile: qwen4exp_shared_vector_accumulate consumes ONE row's 32-byte
+     * group (`xq + at_g * 32`, `mq + at_g * 32`) with the same dp4a words
+     * and the same float accumulation order as the scalar reader, and it is
+     * selected per row inside the `r` loop, so R = 1 instantiates it
+     * exactly as R = 2 does.  The group offset is a multiple of 32 bytes
+     * for every token index, so the base alignment the two screens below
+     * already test is the whole alignment requirement.  The single-token
+     * call therefore joins the screen and every other shape -- wider
+     * prefill tiles, non-Q8 slabs, misaligned pools -- keeps scalar reads.
+     *
+     * Bit-exactness is the property the vector reader already had at the
+     * verify widths, unchanged: same weights, same decoded groups, same
+     * dp4a partial products, same order of the float adds, same warp
+     * reduction.  DS4_QWEN4EXP_NO_SHARED_VECTOR pins the scalar reader at
+     * every width and is the oracle the shared-vector test compares
+     * against. */
     const bool vector_shared =
-        (n_tokens == 2u ||
+        (n_tokens == 1u || n_tokens == 2u ||
          ((n_tokens == 3u || n_tokens == 4u) &&
           getenv("DS4_QWEN4EXP_NO_WIDE_VERIFY") == NULL)) &&
         in_dim == 2560u && mid_dim == 640u && out_dim == 2560u &&
