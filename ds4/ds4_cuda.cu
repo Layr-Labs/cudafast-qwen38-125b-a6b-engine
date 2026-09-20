@@ -737,6 +737,11 @@ static void cuda_range_trace(const char *what, uint64_t offset,
             what ? what : "(unnamed)", (unsigned long long)offset, kind);
 }
 
+/* The index of the range that answered the last sub-range resolution; see
+ * the note inside cuda_model_range_ptr.  A hint is only ever a starting
+ * guess: it is bounds checked and re-tested before use. */
+static size_t g_model_range_hint;
+
 static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
     const uint64_t end = offset + bytes;
@@ -751,12 +756,41 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
             return r.device_ptr;
         }
     }
-    for (const cuda_model_range &r : g_model_ranges) {
+    /* LAST-HIT HINT.  The exact-offset map above answers only a resolution
+     * whose offset IS a range's start; every sub-range resolution -- which
+     * is what a projection asks for when several tensors share one cached
+     * range -- falls through to this scan, and the scan is linear in the
+     * number of cached ranges.  The decode round resolves a weight pointer
+     * for every projection of every layer, on the host, between two kernel
+     * launches, so the same walk is repeated tens of times per token and
+     * lands overwhelmingly on the range it landed on the last time.
+     *
+     * The hint is the index of the range that answered last.  It is a pure
+     * ordering change: the entry it names is checked with THIS loop's own
+     * containment predicate before it is used, and the index is bounds
+     * checked against the current vector, so a stale or recycled hint can
+     * only fail the test and fall through to the scan.  A range that
+     * contains the span is a cached copy of exactly those host bytes, so
+     * the pointer returned addresses the same weights the scan would have
+     * returned. */
+    if (g_model_range_hint < g_model_ranges.size()) {
+        const cuda_model_range &r = g_model_ranges[g_model_range_hint];
+        if (r.host_base == model_map && offset >= r.offset &&
+            end <= r.offset + r.bytes) {
+            cuda_range_trace(what, offset,
+                             r.borrowed ? "HINT borrowed (host mmap)"
+                                        : "HINT device allocation");
+            return r.device_ptr + (offset - r.offset);
+        }
+    }
+    for (size_t ri = 0; ri < g_model_ranges.size(); ri++) {
+        const cuda_model_range &r = g_model_ranges[ri];
         if (r.host_base == model_map && offset >= r.offset &&
             end <= r.offset + r.bytes) {
             cuda_range_trace(what, offset,
                              r.borrowed ? "SCAN borrowed (host mmap)"
                                         : "SCAN device allocation");
+            g_model_range_hint = ri;
             return r.device_ptr + (offset - r.offset);
         }
         if (r.host_base == model_map && r.host_registered &&
@@ -38469,3 +38503,4 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
 #include "ds4_deepseek4_vision_gpu.cuh"
 
 #include "ds4_cuda_mtp_native.cuh"
+#define GAUNTLET_REDRAW_eb44fbad_20260920T212438Z 1
