@@ -6444,6 +6444,21 @@ __global__ static void __launch_bounds__(256, 2) matmul_q8_0_preq_pair_lanes_rol
 __global__ static void matmul_q8_hc_down_pair_kernel(
         float *out, const unsigned char *w, const int8_t *xq,
         const float *xs, uint32_t rows) {
+    /* PDL PRODUCER for the silu/quantize that follows it on the stream (the
+     * relay; ds4_cuda_qwen4exp.cu's hc_silu_quant launch says what it buys).
+     * THE DEADLOCK RULE (ds4_cuda_qwen4exp.cuh): a trigger may only ride a
+     * producer that is single-wave at every width a PSS-attributed consumer
+     * can follow it at.  This kernel's grid is (320, rows) of ONE warp, so
+     * at rows <= 2 it is at most 640 blocks against 24 blocks/SM x 48 SMs =
+     * 1152 slots (REG:40 x 32 threads = 1280 of 65536 registers and 1152 B
+     * of shared memory per block, so the hardware block cap is what binds) --
+     * every block is resident before any dependent block can take a slot.
+     * The three-row verify launches this kernel twice, at rows 2 and rows 1,
+     * and its successor there is a 30-pair quantizer that carries neither
+     * the attribute nor a trigger, so the trigger fires into nothing.
+     * A trigger with no PSS dependent behind it is a no-op, which is what
+     * DS4_HC_PDL_RELAY=0 leaves it as. */
+    if (rows <= 2u) QWEN4EXP_PDL_TRIGGER();
     /* ONE LANE PER GROUP, NOT TWO.
      *
      * L splits one 32-element Q8 group's INTEGER dot across L lanes and
