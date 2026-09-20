@@ -2088,6 +2088,33 @@ qwen4exp_gdn_qkv_conv_mma_pipe_kernel(float *out,
             const uint64_t win_off = seg_off & ~(uint64_t)15u;
             const int skew = (int)(seg_off & 15u);
 
+#ifndef QW_GDN_PIPE_L2_AHEAD
+#define QW_GDN_PIPE_L2_AHEAD 2
+#endif
+            /* Ask for complete 128-byte lines of the future weight window.
+             * One producer lane owns one output row here; the hint does not
+             * need to come from the lane that later copies the line. */
+            if (QW_GDN_PIPE_L2_AHEAD != 0) {
+                const uint64_t ahead = s + (uint64_t)QW_GDN_PIPE_L2_AHEAD;
+                if (ahead < nstage) {
+                    const uint64_t pf_off =
+                        (ahead * (uint64_t)C::B_RAW) & ~(uint64_t)15u;
+#pragma unroll
+                    for (int r = pl; r < BN; r += PT) {
+                        const uint64_t row = n0 + (uint32_t)r;
+                        if (row + 1u < out_dim) {
+                            const unsigned char *base =
+                                w + row * w_row_bytes + pf_off;
+#pragma unroll
+                            for (int c = 0; c < C::B_CHUNKS; c += 8) {
+                                asm volatile("prefetch.global.L2 [%0];"
+                                             :: "l"(base + (uint32_t)c * 16u));
+                            }
+                        }
+                    }
+                }
+            }
+
             /* The stage into registers. */
             uint4 ra[KA], rs[KS], rb[KB];
 #pragma unroll
