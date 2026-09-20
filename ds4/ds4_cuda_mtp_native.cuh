@@ -33,6 +33,142 @@ static constexpr uint32_t MTP_NATIVE_SCREEN_GROUPS = 24u;
 static constexpr uint32_t MTP_TARGET_NATIVE_CAP = 16384u;
 static constexpr uint32_t MTP_TARGET_NATIVE_SCREEN_GROUPS = 24u;
 static constexpr uint32_t MTP_NATIVE_MAX_WIDTH = 1u << 20;
+
+/* Exact device-only top-K selection on the score word.  The existing radix
+ * sort is stable and its inputs arrive in increasing original-ID order, so
+ * equal score words retain increasing IDs.  Four histogram passes recover the
+ * exact Kth score word.  An in-place scan then keeps every greater score and
+ * exactly the first required equal-score rows.  The later ID sort makes the
+ * arbitrary atomic order of strictly-greater rows unobservable.
+ *
+ * This stays entirely on the decode stream: unlike sampled partial selection,
+ * it has no count-dependent host decision and composes with invalid deferral. */
+struct mtp_device_select_state {
+    uint32_t threshold;
+    uint32_t rank;
+    uint32_t greater;
+    uint32_t write;
+    uint32_t histogram[256];
+};
+
+__global__ static void mtp_device_select_init(
+        mtp_device_select_state *state, uint32_t rows, uint32_t count) {
+    const uint32_t row = threadIdx.x;
+    if (row < rows) {
+        state[row].threshold = 0u;
+        state[row].rank = count - 1u;
+        state[row].greater = 0u;
+        state[row].write = 0u;
+    }
+}
+
+__global__ static void mtp_device_select_histogram(
+        mtp_device_select_state *state, const uint64_t *keys,
+        uint32_t width, uint32_t rows, uint32_t shift) {
+    __shared__ uint32_t histogram[256];
+    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x)
+        histogram[i] = 0u;
+    __syncthreads();
+    const uint32_t row = blockIdx.y;
+    if (row >= rows) return;
+    const uint32_t threshold = state[row].threshold;
+    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+         i < width; i += blockDim.x * gridDim.x) {
+        const uint32_t high = (uint32_t)(keys[(uint64_t)row * width + i] >> 32);
+        if (shift == 24u || (high >> (shift + 8u)) ==
+                            (threshold >> (shift + 8u)))
+            atomicAdd(histogram + ((high >> shift) & 255u), 1u);
+    }
+    __syncthreads();
+    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x)
+        if (histogram[i]) atomicAdd(state[row].histogram + i, histogram[i]);
+}
+
+__global__ static void mtp_device_select_digit(
+        mtp_device_select_state *state, uint32_t rows, uint32_t shift) {
+    const uint32_t row = blockIdx.x;
+    if (row >= rows || threadIdx.x) return;
+    uint32_t rank = state[row].rank;
+    uint32_t greater = state[row].greater;
+    for (int digit = 255; digit >= 0; --digit) {
+        const uint32_t count = state[row].histogram[digit];
+        if (rank < count) {
+            state[row].threshold |= (uint32_t)digit << shift;
+            state[row].rank = rank;
+            state[row].greater = greater;
+            return;
+        }
+        rank -= count;
+        greater += count;
+    }
+}
+
+__global__ static void mtp_device_select_equal_flags(
+        uint32_t *ranks, const uint64_t *keys,
+        const mtp_device_select_state *state, uint32_t width, uint32_t row) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < width)
+        ranks[i] = (uint32_t)(keys[(uint64_t)row * width + i] >> 32) ==
+                   state[row].threshold;
+}
+
+__global__ static void mtp_device_select_ids(
+        uint32_t *ids, const uint32_t *equal_rank, const uint64_t *keys,
+        mtp_device_select_state *state, uint32_t width, uint32_t row) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= width) return;
+    const uint64_t key = keys[(uint64_t)row * width + i];
+    const uint32_t high = (uint32_t)(key >> 32);
+    uint32_t out;
+    if (high > state[row].threshold) {
+        out = atomicAdd(&state[row].write, 1u);
+    } else if (high == state[row].threshold &&
+               equal_rank[i] <= state[row].rank) {
+        out = state[row].greater + equal_rank[i];
+    } else {
+        return;
+    }
+    ids[out] = UINT32_MAX - (uint32_t)key;
+}
+
+static bool mtp_device_select_ids_async(
+        uint32_t *ids, uint32_t *ranks, const uint64_t *keys,
+        mtp_device_select_state *state, char *temporary, size_t temporary_bytes,
+        uint32_t width, uint32_t count, uint32_t rows) {
+    const cudaStream_t stream = cuda_decode_stream();
+    mtp_device_select_init<<<1, 32, 0, stream>>>(state, rows, count);
+    if (!cuda_ok(cudaGetLastError(), "native select init")) return false;
+    const uint32_t blocks = (width + 1023u) / 1024u < 48u
+        ? (width + 1023u) / 1024u : 48u;
+    for (uint32_t shift = 24u;; shift -= 8u) {
+        for (uint32_t row = 0; row < rows; ++row)
+            if (!cuda_ok(cudaMemsetAsync(state[row].histogram, 0,
+                            sizeof(state[row].histogram), stream),
+                         "native select histogram reset")) return false;
+        mtp_device_select_histogram<<<dim3(blocks, rows), 256, 0, stream>>>(
+            state, keys, width, rows, shift);
+        if (!cuda_ok(cudaGetLastError(), "native select histogram")) return false;
+        mtp_device_select_digit<<<rows, 1, 0, stream>>>(state, rows, shift);
+        if (!cuda_ok(cudaGetLastError(), "native select digit")) return false;
+        if (!shift) break;
+    }
+    for (uint32_t row = 0; row < rows; ++row) {
+        uint32_t *row_ranks = ranks + (uint64_t)row * width;
+        mtp_device_select_equal_flags<<<(width + 255u) / 256u, 256, 0, stream>>>(
+            row_ranks, keys, state, width, row);
+        if (!cuda_ok(cudaGetLastError(), "native select equal flags")) return false;
+        size_t bytes = temporary_bytes;
+        if (!cuda_ok(cub::DeviceScan::ExclusiveSum(
+                temporary, bytes, row_ranks, width, stream),
+                "native select equal ranks")) return false;
+        mtp_device_select_ids<<<(width + 255u) / 256u, 256, 0, stream>>>(
+            ids + (uint64_t)row * count, row_ranks, keys,
+            state, width, row);
+        if (!cuda_ok(cudaGetLastError(), "native select IDs")) return false;
+    }
+    return true;
+}
+
 template <bool Screen, bool EmitKeys = false>
 __global__ static void mtp_native_projection_kernel(
         float *out, const unsigned char *w,
@@ -152,14 +288,16 @@ extern "C" int ds4_gpu_mtp_native_screen_init(uint32_t width,
     if (!bytes || !capacity) return -1;
     *bytes = 0; *capacity = 0;
     if (width <= MTP_NATIVE_CAP || width > MTP_NATIVE_MAX_WIDTH) return 0;
-    size_t a = 0, b = 0;
+    size_t a = 0, b = 0, c = 0;
     if (cub::DeviceRadixSort::SortKeysDescending(nullptr, a,
             (const uint64_t *)nullptr, (uint64_t *)nullptr, width, 32, 64,
             cuda_decode_stream()) != cudaSuccess ||
         cub::DeviceRadixSort::SortKeys(nullptr, b,
             (const uint32_t *)nullptr, (uint32_t *)nullptr, MTP_NATIVE_CAP, 0, 32,
-            cuda_decode_stream()) != cudaSuccess) return -1;
-    *bytes = mtp_native_offsets(width).temporary + std::max(a,b);
+            cuda_decode_stream()) != cudaSuccess ||
+        cub::DeviceScan::ExclusiveSum(nullptr, c, (uint32_t *)nullptr,
+            width, cuda_decode_stream()) != cudaSuccess) return -1;
+    *bytes = mtp_native_offsets(width).temporary + std::max(a,std::max(b,c));
     *capacity = MTP_NATIVE_CAP;
     return 1;
 }
@@ -189,15 +327,17 @@ extern "C" int ds4_gpu_mtp_native_screen2_init(uint32_t width,
     *bytes = 0; *capacity = 0;
     if (width <= MTP_TARGET_NATIVE_CAP || width > MTP_NATIVE_MAX_WIDTH)
         return 0;
-    size_t a = 0, b = 0;
+    size_t a = 0, b = 0, c = 0;
     if (cub::DeviceRadixSort::SortKeysDescending(nullptr, a,
             (const uint64_t *)nullptr, (uint64_t *)nullptr, width, 32, 64,
             cuda_decode_stream()) != cudaSuccess ||
         cub::DeviceRadixSort::SortKeys(nullptr, b,
             (const uint32_t *)nullptr, (uint32_t *)nullptr,
             MTP_TARGET_NATIVE_CAP,
-            0, 32, cuda_decode_stream()) != cudaSuccess) return -1;
-    *bytes = mtp_native_offsets2(width).temporary + std::max(a, b);
+            0, 32, cuda_decode_stream()) != cudaSuccess ||
+        cub::DeviceScan::ExclusiveSum(nullptr, c, (uint32_t *)nullptr,
+            width, cuda_decode_stream()) != cudaSuccess) return -1;
+    *bytes = mtp_native_offsets2(width).temporary + std::max(a, std::max(b, c));
     *capacity = MTP_TARGET_NATIVE_CAP;
     return 1;
 }
@@ -405,10 +545,24 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
      * Ranked confirmation: every run carrying it (PRs #531-#535) drafted and
      * accepted exactly as the tip does on the hidden prompt (79 rounds, 49 of
      * 78 drafts accepted). */
-    if (!cuda_ok(cub::DeviceRadixSort::SortKeysDescending(base+l.temporary,temporary,
-            key_in,key_out,width,32,64,cuda_decode_stream()),"native score sort")) return -1;
-    mtp_native_unpack_ids<<<(MTP_NATIVE_CAP+255u)/256u,256,0,cuda_decode_stream()>>>(id_tmp,key_out);
-    if (!cuda_ok(cudaGetLastError(),"native candidate unpack")) return -1;
+    /* The 2K draft shape does not amortize four histogram launches.  Keep it
+     * available for diagnosis, with the original radix path as production. */
+    const bool device_select =
+        getenv("DS4_MTP_DRAFT_DEVICE_SELECT") != nullptr &&
+        getenv("DS4_MTP_NO_DRAFT_DEVICE_SELECT") == nullptr;
+    if (device_select) {
+        if (!mtp_device_select_ids_async(id_tmp, (uint32_t *)scores, key_in,
+                (mtp_device_select_state *)key_out,
+                base + l.temporary, temporary, width, MTP_NATIVE_CAP, 1u))
+            return -1;
+    } else {
+        if (!cuda_ok(cub::DeviceRadixSort::SortKeysDescending(
+                base+l.temporary,temporary,key_in,key_out,width,32,64,
+                cuda_decode_stream()),"native score sort")) return -1;
+        mtp_native_unpack_ids<<<(MTP_NATIVE_CAP+255u)/256u,256,0,
+                cuda_decode_stream()>>>(id_tmp,key_out);
+        if (!cuda_ok(cudaGetLastError(),"native candidate unpack")) return -1;
+    }
     temporary = (size_t)(scratch->bytes-l.temporary);
     /* RANK ONLY THE BITS A TOKEN ID CAN OCCUPY.
      *
@@ -541,21 +695,31 @@ extern "C" int ds4_gpu_mtp_native_screen2(ds4_gpu_tensor *out,
     int id_bits = 1;
     while (id_bits < 32 && ((uint32_t)1u << id_bits) < vocab) id_bits++;
     if (id_bits > 32) id_bits = 32;
+    const bool device_select =
+        getenv("DS4_MTP_NO_TARGET_DEVICE_SELECT") == nullptr;
+    size_t temporary = (size_t)(scratch->bytes - l.temporary);
+    if (device_select && !mtp_device_select_ids_async(
+            id_tmp, (uint32_t *)scores, key_in,
+            (mtp_device_select_state *)key_out,
+            base + l.temporary, temporary, width,
+            MTP_TARGET_NATIVE_CAP, 2u)) return -1;
     for (uint32_t r = 0; r < 2u; r++) {
-        size_t temporary = (size_t)(scratch->bytes - l.temporary);
+        temporary = (size_t)(scratch->bytes - l.temporary);
         uint64_t *kin = key_in + (uint64_t)r * width;
         uint64_t *kout = key_out + (uint64_t)r * width;
         uint32_t *itmp = id_tmp + (uint64_t)r * MTP_TARGET_NATIVE_CAP;
         uint32_t *iout = (uint32_t *)ids->ptr +
             (uint64_t)r * MTP_TARGET_NATIVE_CAP;
-        if (!cuda_ok(cub::DeviceRadixSort::SortKeysDescending(
-                base + l.temporary, temporary, kin, kout, width, 32, 64,
-                cuda_decode_stream()), "native R2 score sort")) return -1;
-        mtp_native_unpack_ids_n<<<
-                (MTP_TARGET_NATIVE_CAP + 255u) / 256u, 256, 0,
-                cuda_decode_stream()>>>(itmp, kout, MTP_TARGET_NATIVE_CAP);
-        if (!cuda_ok(cudaGetLastError(), "native R2 candidate unpack"))
-            return -1;
+        if (!device_select) {
+            if (!cuda_ok(cub::DeviceRadixSort::SortKeysDescending(
+                    base + l.temporary, temporary, kin, kout, width, 32, 64,
+                    cuda_decode_stream()), "native R2 score sort")) return -1;
+            mtp_native_unpack_ids_n<<<
+                    (MTP_TARGET_NATIVE_CAP + 255u) / 256u, 256, 0,
+                    cuda_decode_stream()>>>(itmp, kout, MTP_TARGET_NATIVE_CAP);
+            if (!cuda_ok(cudaGetLastError(), "native R2 candidate unpack"))
+                return -1;
+        }
         temporary = (size_t)(scratch->bytes - l.temporary);
         if (!cuda_ok(cub::DeviceRadixSort::SortKeys(
                 base + l.temporary, temporary, itmp, iout,
