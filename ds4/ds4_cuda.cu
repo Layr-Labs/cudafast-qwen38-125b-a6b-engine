@@ -402,6 +402,7 @@ enum cuda_derived_kind {
     CUDA_DERIVED_IQ2_XXS_ALIGNED_MOE = 4,
     CUDA_DERIVED_Q8_0_ALIGNED_DENSE = 5,
     CUDA_DERIVED_Q2_K_ALIGNED_MOE = 6,
+    CUDA_DERIVED_Q8_0_MTP_SCREEN = 7,
 };
 
 struct cuda_derived_range {
@@ -38398,3 +38399,7 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
 #include "ds4_deepseek4_vision_gpu.cuh"
 
 #include "ds4_cuda_mtp_native.cuh"
+
+/* resubmission build record 20260920T19:05Z: box-flake retry of addc47d6, mechanism identical */
+
+/* resubmission build record 20260920T19:20Z roll-2: identical mechanism, fresh paired draw */
