@@ -1119,8 +1119,22 @@ extern "C" int ds4_gpu_qwen4exp_update_dpos(
         ds4_gpu_tensor *d_pos,
         uint32_t pos) {
     if (!d_pos || !d_pos->ptr || d_pos->bytes < sizeof(uint32_t)) return 0;
-    /* Keep the existing stream ordering with graph consumers, passing the
-     * scalar by value without a host staging transfer or stack lifetime. */
+    /* A four-byte async H2D copy preserves stream ordering while avoiding a
+     * standalone one-thread launch. Pageable host memory is staged by the
+     * CUDA runtime before this call returns; the stream receives the copied
+     * scalar, so the stack argument cannot outlive its use. Set the valve to
+     * zero for the original kernel in a same-binary A/B. */
+    static int use_copy = -1;
+    if (use_copy < 0) {
+        const char *e = getenv("DS4_QWEN4EXP_DPOS_COPY");
+        use_copy = (e == NULL || e[0] != '0') ? 1 : 0;
+    }
+    if (use_copy) {
+        return cuda_ok(cudaMemcpyAsync(d_pos->ptr, &pos, sizeof(pos),
+                                       cudaMemcpyHostToDevice,
+                                       cuda_decode_stream()),
+                       "qwen4exp position update copy");
+    }
     qwen4exp_update_dpos_kernel<<<1, 1, 0, cuda_decode_stream()>>>(
             (uint32_t *)d_pos->ptr, pos);
     return cuda_ok(cudaGetLastError(), "qwen4exp position update launch");
