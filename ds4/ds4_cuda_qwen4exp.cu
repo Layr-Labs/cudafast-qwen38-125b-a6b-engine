@@ -4313,6 +4313,7 @@ __global__ static void qwen4exp_moe_group_scan_parallel_kernel(
  * (the others contribute no windows), so one routing can be split into the
  * 32-pair tile's list and the heavy tile's list. */
 /* build record 20260919T203222Z-5 */
+/* build record 20260920T052352Z-63 */
 __global__ static void qwen4exp_moe_pair_tasks_kernel(
         int32_t *tasks, const int32_t *counts, unsigned total,
         int32_t tile = 32, int32_t lo = 0, int32_t hi = 0x7fffffff) {
@@ -9435,7 +9436,7 @@ __global__ static void qwen4exp_shared_gate_kernel(
      * construction.  Row-gated to the same <= 2 the converted launch site
      * fires at: a prefill launch runs to a thousand blocks and never carries
      * a trigger (the deadlock rule, ds4_cuda_qwen4exp.cuh). */
-    if (n_tokens <= 2u) QWEN4EXP_PDL_TRIGGER();
+    if (n_tokens <= 4u) QWEN4EXP_PDL_TRIGGER();
     extern __shared__ float ds4_qwen4exp_smem[];
     const uint32_t token = blockIdx.x;
     if (token >= n_tokens) return;
@@ -9698,6 +9699,28 @@ static int qwen4exp_pdl_routed_down(void) {
     static int v = -1;
     if (v < 0) v = getenv("DS4_QWEN4EXP_NO_PDL_ROUTED_DOWN") == NULL ? 1 : 0;
     return v;
+}
+/* THE VERIFY-WIDTH CONSUMER GATE (S1 step 2).  The frontier attributes the
+ * one- and two-row decode launches only, because the producers used to
+ * trigger at <= 2 rows only.  The producers in this file now gate on TOTAL
+ * BLOCKS (the routed input quantizer, the router top-k, the grouping kernel)
+ * or on <= 4 rows (the shared gate, the HC and GDN norms), so every one of
+ * them already carries a live trigger at the three-row depth-2 verify; only
+ * the consumers' launch gates were still pinned at two.  This widens them to
+ * the verify widths, behind ds4_qwen4exp_verify_pdl_enabled()
+ * (DS4_QWEN4EXP_NO_VERIFY_PDL=1 restores the two-row behaviour exactly).
+ *
+ * SAFETY.  The kernels are unchanged and are the same instantiations the
+ * two-row path already launches with the attribute: each one's
+ * QWEN4EXP_PDL_SYNC() precedes its first activation read, so the data edge is
+ * carried in the body at any width.  A consumer whose predecessor happens not
+ * to trigger is merely un-accelerated, never unsafe, because the fence then
+ * waits for that grid's completion.  The DEADLOCK rule constrains producers
+ * only, and every producer that can precede these launches bounds its own
+ * grid in its body. */
+static int qwen4exp_pdl_verify_width(uint32_t n_tokens) {
+    return n_tokens <= 2u ||
+           (n_tokens <= 4u && ds4_qwen4exp_verify_pdl_enabled());
 }
 static int qwen4exp_pdl_router_tree(void) {
     static int v = -1;
@@ -10163,7 +10186,7 @@ static int qwen4exp_routed_moe_cuda(
  * to consume; verify at three rows and every prefill width keep the plain
  * launch and the body's fence is a no-op there. */
 #define QWEN4EXP_GATEUP_IMPL(R, GT, UT) do { \
-    if (n_tokens <= 2u) { \
+    if (qwen4exp_pdl_verify_width(n_tokens)) { \
         QWEN4EXP_LAUNCH_PDL( \
                 (qwen4exp_moe_gateup_q_kernel<R, GT, UT>), \
                 gu_grid, threads, 0, stream, \
@@ -10499,7 +10522,7 @@ static int qwen4exp_routed_moe_cuda(
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
             mgroups, out_dim, n_tokens, n_total_expert, n_expert_used
 #define QWEN4EXP_DOWN_IMPL_S(R, DT, V, S, SH) do { \
-    if (n_tokens <= 2u && qwen4exp_pdl_routed_down()) { \
+    if (qwen4exp_pdl_verify_width(n_tokens) && qwen4exp_pdl_routed_down()) { \
         QWEN4EXP_LAUNCH_PDL((qwen4exp_moe_down_q_kernel<R, DT, V, S>), \
                             dn_grid, threads, (SH), stream, \
                             QWEN4EXP_DOWN_ARGS); \
@@ -10509,7 +10532,7 @@ static int qwen4exp_routed_moe_cuda(
     } } while (0)
 #define QWEN4EXP_DOWN_IMPL(R, DT, V) QWEN4EXP_DOWN_IMPL_S(R, DT, V, false, 0)
 #define QWEN4EXP_DOWN_ASYNC(DT) do { \
-    if (n_tokens <= 2u && qwen4exp_pdl_routed_down()) { \
+    if (qwen4exp_pdl_verify_width(n_tokens) && qwen4exp_pdl_routed_down()) { \
         QWEN4EXP_LAUNCH_PDL( \
                 (qwen4exp_moe_down_q_kernel<2, DT, true, true, true>), \
                 dn_grid, threads, (size_t)dn_shared, stream, \
@@ -10960,7 +10983,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
  * kernel's weight-group prefetch rides that window
  * (ds4_cuda_qwen4exp.cuh).  Verify and prefill keep the plain launch. */
 #define QWEN4EXP_SH_GATEUP_IMPL(R, GT, UT, V) do { \
-    if (n_tokens <= 2u) { \
+    if (qwen4exp_pdl_verify_width(n_tokens)) { \
         QWEN4EXP_LAUNCH_PDL( \
                 (qwen4exp_shared_gateup_q_kernel<R, GT, UT, V>), \
                 (dim3((mid_dim + 7u) / 8u, tiles, 1)), \
@@ -11108,7 +11131,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         sd_panel <= QW_DOWN_PANEL_MAX_BYTES &&
         getenv("DS4_QWEN4EXP_NO_SHARED_DOWN_PANEL") == NULL;
 #define QWEN4EXP_SH_DOWN_IMPL(R, DT, V) do { \
-    if (n_tokens <= 2u) { \
+    if (qwen4exp_pdl_verify_width(n_tokens)) { \
         if (sd_stage) { \
             QWEN4EXP_LAUNCH_PDL( \
                     (qwen4exp_shared_down_q_kernel<R, DT, V, true>), \
@@ -11380,7 +11403,7 @@ __global__ static void qwen4exp_hc_inject_kernel(
      * construction.  Row-gated to the same <= 2 the converted launch site
      * fires at: a verify or prefill launch never carries a trigger (the
      * deadlock rule, ds4_cuda_qwen4exp.cuh). */
-    if (n_tokens <= 2u) QWEN4EXP_PDL_TRIGGER();
+    if (n_tokens <= 4u) QWEN4EXP_PDL_TRIGGER();
     const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t h = blockIdx.y;
     const uint32_t t = blockIdx.z;
@@ -11733,7 +11756,7 @@ __global__ static void qwen4exp_gdn_output_quant_kernel(
      * eight threads, one wave on this device, which is the deadlock rule in
      * ds4_cuda_qwen4exp.cuh.  The gate reads a kernel argument so it is
      * grid-uniform, and prefill, whose grid is orders larger, never fires. */
-    if (n_tokens <= 2u) QWEN4EXP_PDL_TRIGGER();
+    if (n_tokens <= 4u) QWEN4EXP_PDL_TRIGGER();
     const uint32_t token = blockIdx.x;
     const uint32_t head = blockIdx.y;
     const uint32_t tid = threadIdx.x;
@@ -11789,7 +11812,7 @@ __global__ static void qwen4exp_hc_norm_quant_kernel(
      * construction.  A verify or prefill width never carries a trigger:
      * no PSS consumer follows one there, and its grid need not be one wave
      * (the deadlock rule, ds4_cuda_qwen4exp.cuh). */
-    if (rows <= 2u) QWEN4EXP_PDL_TRIGGER();
+    if (rows <= 4u) QWEN4EXP_PDL_TRIGGER();
     const uint32_t g = blockIdx.x;
     const uint32_t row = blockIdx.y;
     if (row >= rows) return;
@@ -11910,7 +11933,7 @@ __global__ static void qwen4exp_hc_mix_renorm_kernel(
      * 20 blocks is fewer than the device has SMs, so the launch is
      * single-wave by construction; a verify or prefill width never carries
      * a trigger (the deadlock rule, ds4_cuda_qwen4exp.cuh). */
-    if (n_tokens <= 2u) QWEN4EXP_PDL_TRIGGER();
+    if (n_tokens <= 4u) QWEN4EXP_PDL_TRIGGER();
     const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t t = blockIdx.y;
     if (d >= n_embd || t >= n_tokens) return;
@@ -12054,7 +12077,7 @@ __global__ static void qwen4exp_hc_mix_inject_dual_kernel(
      * sites fire at: 28 blocks is fewer than the device has SMs, so the
      * launch is single-wave by construction; a verify or prefill width never
      * carries a trigger (the deadlock rule, ds4_cuda_qwen4exp.cuh). */
-    if (rows <= 2u) QWEN4EXP_PDL_TRIGGER();
+    if (rows <= 4u) QWEN4EXP_PDL_TRIGGER();
     const uint32_t mix_blocks = (n_embd + 255u) / 256u;
     if (blockIdx.x < mix_blocks) {
         float *out = mixed;
@@ -12236,7 +12259,7 @@ __global__ static void qwen4exp_hc_mix_inject_renorm_kernel(
      * gate makes that structural rather than a caller convention: the
      * threshold's widths never fire the trigger at all (the deadlock rule,
      * ds4_cuda_qwen4exp.cuh). */
-    if (rows <= 2u) QWEN4EXP_PDL_TRIGGER();
+    if (rows <= 4u) QWEN4EXP_PDL_TRIGGER();
     extern __shared__ float smix[];
     const uint32_t t = blockIdx.x;
     if (t >= rows) return;
@@ -12404,7 +12427,7 @@ __global__ static void qwen4exp_hc_silu_quant_kernel(
      * three blocks is single-wave by construction.  A verify or prefill
      * width never carries a trigger (the deadlock rule,
      * ds4_cuda_qwen4exp.cuh). */
-    if (pairs <= 20u) QWEN4EXP_PDL_TRIGGER();
+    if (pairs <= 40u) QWEN4EXP_PDL_TRIGGER();
     const uint64_t pair = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
     if (pair >= pairs) return;
     const uint32_t lane = threadIdx.x & 31u;
@@ -12719,7 +12742,7 @@ __global__ static void qwen4exp_hc_norm_quant_inject_kernel(
      * The row gate makes that structural rather than a caller convention:
      * the threshold's widths never fire the trigger at all (the deadlock
      * rule, ds4_cuda_qwen4exp.cuh). */
-    if (rows <= 2u) QWEN4EXP_PDL_TRIGGER();
+    if (rows <= 4u) QWEN4EXP_PDL_TRIGGER();
     const uint32_t row = blockIdx.x;
     if (row >= rows) return;
 
@@ -13489,7 +13512,7 @@ static int qwen4exp_hc_mixer_fused_cuda(
          * which triggers at its top, and the kernel's normw prefetch rides
          * that window (ds4_cuda_qwen4exp.cuh).  Verify and prefill keep the
          * plain launch. */
-        if (rows <= 2u) {
+        if (qwen4exp_pdl_verify_width(rows)) {
             QWEN4EXP_LAUNCH_PDL(
                     (qwen4exp_hc_norm_quant_kernel<1>),
                     (dim3(n_hc, rows, 1u)), threads, 0,
