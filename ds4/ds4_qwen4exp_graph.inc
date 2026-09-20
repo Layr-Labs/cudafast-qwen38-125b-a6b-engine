@@ -2840,7 +2840,7 @@ static bool qwen4exp_graph_layers_encode(
 
 static uint32_t qw_decode_graph_chunks(void) {
     static int init = 0;
-    static uint32_t chunks = 4u;   /* the A/B's pick; 1 restores the single capture */
+    static uint32_t chunks = 8u;   /* the A/B's pick; 1 restores the single capture */
     if (!init) {
         init = 1;
         const char *s = getenv("DS4_CUDA_DECODE_GRAPH_CHUNKS");
