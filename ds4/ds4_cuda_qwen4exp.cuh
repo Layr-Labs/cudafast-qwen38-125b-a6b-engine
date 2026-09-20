@@ -108,6 +108,15 @@ int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows);
  * same way. */
 int ds4_qwen4exp_pdl_enabled(void);
 
+/* The VERIFY-WIDTH programmatic edges (fkiene 691d6089).  The frontier only
+ * attributes the one/two-row decode launches, because the producers only
+ * trigger at <= 2 rows; this widens the producers' gates to the verify widths
+ * (3 and 4 rows, 40 HC pairs) and attributes the launches that consume them.
+ * Resolved once per process, defined next to ds4_qwen4exp_pdl_enabled.
+ * DS4_QWEN4EXP_NO_VERIFY_PDL set to a non-zero value drops the attribute from
+ * the verify-width launches only; the one/two-row edges are unaffected. */
+int ds4_qwen4exp_verify_pdl_enabled(void);
+
 /* Occupancy attributes of the two production routed-MoE decode kernels, which
  * are static to ds4_cuda_qwen4exp.cu and so can only report from inside it.
  * Defined there, consumed by ds4_gpu_hw_limits() in ds4_cuda.cu.  Returns a
@@ -119,13 +128,13 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void);
  * programmatic stream serialization attribute when PDL is on and without it
  * when it is not -- a zero-attribute cudaLaunchKernelEx is the plain launch.
  * Failures reach the caller's cudaGetLastError() check unchanged. */
-#define QWEN4EXP_LAUNCH_PDL(KERNEL, GRID, BLOCK, SMEM, STREAM, ...)        \
+#define QWEN4EXP_LAUNCH_PDL_ON(ONEXPR, KERNEL, GRID, BLOCK, SMEM, STREAM, ...)        \
     do {                                                                   \
         cudaLaunchAttribute qw_attr[1];                                    \
         qw_attr[0].id =                                                    \
             cudaLaunchAttributeProgrammaticStreamSerialization;            \
         qw_attr[0].val.programmaticStreamSerializationAllowed = 1;          \
-        const int qw_pdl = ds4_qwen4exp_pdl_enabled();                     \
+        const int qw_pdl = ds4_qwen4exp_pdl_enabled() && (ONEXPR);                     \
         cudaLaunchConfig_t qw_cfg;                                         \
         qw_cfg.gridDim = (GRID);                                           \
         qw_cfg.blockDim = (BLOCK);                                         \
@@ -136,11 +145,19 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void);
         (void)cudaLaunchKernelEx(&qw_cfg, KERNEL, __VA_ARGS__);            \
     } while (0)
 #else
-#define QWEN4EXP_LAUNCH_PDL(KERNEL, GRID, BLOCK, SMEM, STREAM, ...)        \
+#define QWEN4EXP_LAUNCH_PDL_ON(ONEXPR, KERNEL, GRID, BLOCK, SMEM, STREAM, ...)        \
     do {                                                                   \
-        (void)ds4_qwen4exp_pdl_enabled();                                  \
+        (void)(ds4_qwen4exp_pdl_enabled() && (ONEXPR));                                  \
         KERNEL<<<(GRID), (BLOCK), (SMEM), (STREAM)>>>(__VA_ARGS__);        \
     } while (0)
 #endif
+
+/* The frontier's edges, always on when PDL is on. */
+#define QWEN4EXP_LAUNCH_PDL(KERNEL, GRID, BLOCK, SMEM, STREAM, ...)        \
+    QWEN4EXP_LAUNCH_PDL_ON(1, KERNEL, GRID, BLOCK, SMEM, STREAM, __VA_ARGS__)
+/* The verify-width edges, behind their own valve. */
+#define QWEN4EXP_LAUNCH_PDL_V(KERNEL, GRID, BLOCK, SMEM, STREAM, ...)      \
+    QWEN4EXP_LAUNCH_PDL_ON(ds4_qwen4exp_verify_pdl_enabled(), KERNEL,      \
+                           GRID, BLOCK, SMEM, STREAM, __VA_ARGS__)
 
 #endif /* DS4_CUDA_QWEN4EXP_CUH */
