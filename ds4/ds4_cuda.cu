@@ -7092,31 +7092,6 @@ __device__ __forceinline__ static uint4 q8_mma_ldg_16_cg(const void *gmem) {
     return v;
 }
 
-/* ACTIVATION L2 EVICTION PRIORITY (template arm ActPol, valve
- * DS4_CUDA_PIPE_ACTPOL).  Every y-block of the tile re-reads the SAME xq /
- * xscale while the single-use weight stream evicts it; tagging only the
- * activation loads `evict_last` keeps it resident.  This is the SHIPPED
- * DS4_GU_L2POL mechanism (createpolicy + ld.global.L2::cache_hint), which
- * needs NO device set-aside -- unlike the runtime access-policy window, whose
- * mandatory cudaLimitPersistingL2CacheSize carve-out was measured to cost the
- * MoE tiles far more than the GEMM gains (prefill-budget.txt S10).  A cache
- * policy is a hint: no load returns a different value, so the two arms are
- * bit-exact by construction.  `.cg` is kept, so the only change to the
- * instruction is the extra policy operand. */
-__device__ __forceinline__ static uint64_t q8_mma_pol_last(void) {
-    uint64_t p;
-    asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(p));
-    return p;
-}
-__device__ __forceinline__ static uint4 q8_mma_ldg_16_cg_pol(const void *gmem,
-                                                             uint64_t pol) {
-    uint4 v;
-    asm volatile("ld.global.cg.L2::cache_hint.v4.u32 {%0,%1,%2,%3}, [%4], %5;"
-                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
-                 : "l"(gmem), "l"(pol));
-    return v;
-}
-
 __device__ __forceinline__ static uint32_t q8_mma_ldg_4(const void *gmem) {
     uint32_t v;
     asm volatile("ld.global.u32 %0, [%1];" : "=r"(v) : "l"(gmem));
@@ -7223,7 +7198,7 @@ struct q8_mma_pipe_cfg {
     static_assert(B_GCD >= 4, "skew must keep word parity");
 };
 
-template <int WM, int WN, int MT, int NT, int G, int STAGES, bool ActPol = false>
+template <int WM, int WN, int MT, int NT, int G, int STAGES>
 __global__ __launch_bounds__((WM * WN + 4) * 32, Q8_MMA_MINB) static void
 matmul_q8_0_preq_rows_mma_pipe_kernel(float *out,
                                       const unsigned char *w,
@@ -7234,7 +7209,6 @@ matmul_q8_0_preq_rows_mma_pipe_kernel(float *out,
                                       uint64_t blocks) {
     typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES> C;
     constexpr int BM = C::BM, BN = C::BN;
-    const uint64_t act_pol = ActPol ? q8_mma_pol_last() : 0ull;
 
     extern __shared__ __align__(16) unsigned char q8_mma_smem[];
     unsigned char *sA_all = q8_mma_smem;
@@ -7298,9 +7272,7 @@ matmul_q8_0_preq_rows_mma_pipe_kernel(float *out,
                 const uint64_t row = (uint64_t)m0 + (uint32_t)r;
                 ra[k] = make_uint4(0u, 0u, 0u, 0u);
                 if (idx < BM * C::A_CHUNKS && row < (uint64_t)n_rows) {
-                    const int8_t *asrc = xq + (row * blocks + g0 + (uint32_t)(c >> 1)) * 32u + (c & 1) * 16;
-                    ra[k] = ActPol ? q8_mma_ldg_16_cg_pol(asrc, act_pol)
-                                   : q8_mma_ldg_16_cg(asrc);
+                    ra[k] = q8_mma_ldg_16_cg(xq + (row * blocks + g0 + (uint32_t)(c >> 1)) * 32u + (c & 1) * 16);
                 }
             }
 #pragma unroll
@@ -7311,9 +7283,7 @@ matmul_q8_0_preq_rows_mma_pipe_kernel(float *out,
                 const uint64_t row = (uint64_t)m0 + (uint32_t)r;
                 rs[k] = make_uint4(0u, 0u, 0u, 0u);
                 if (idx < BM * (G / 4) && row < (uint64_t)n_rows) {
-                    const float *ssrc = xscale + row * blocks + g0 + (uint32_t)c * 4u;
-                    rs[k] = ActPol ? q8_mma_ldg_16_cg_pol(ssrc, act_pol)
-                                   : q8_mma_ldg_16_cg(ssrc);
+                    rs[k] = q8_mma_ldg_16_cg(xscale + row * blocks + g0 + (uint32_t)c * 4u);
                 }
             }
 #pragma unroll
@@ -18161,36 +18131,17 @@ extern "C" int ds4_gpu_q8_mma_pipe_last_bn(void) {
 /* The dynamic shared memory opt-in, once per instantiation; done eagerly
  * from ds4_gpu_enable_q8_dense_mma so no launch has to do it inside a
  * stream capture. */
-template <int WM, int WN, int MT, int NT, int G, int STAGES, bool ActPol = false>
+template <int WM, int WN, int MT, int NT, int G, int STAGES>
 static bool cuda_q8_mma_pipe_attr(void) {
     typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES> C;
     static int state = 0;   /* 0 unset, 1 ok, -1 refused */
     if (state == 0) {
-        state = (cudaFuncSetAttribute(matmul_q8_0_preq_rows_mma_pipe_kernel<WM, WN, MT, NT, G, STAGES, ActPol>,
+        state = (cudaFuncSetAttribute(matmul_q8_0_preq_rows_mma_pipe_kernel<WM, WN, MT, NT, G, STAGES>,
                                       cudaFuncAttributeMaxDynamicSharedMemorySize,
                                       C::SMEM) == cudaSuccess) ? 1 : -1;
         if (state < 0) (void)cudaGetLastError();
     }
     return state > 0;
-}
-
-/* DS4_CUDA_PIPE_ACTPOL=0 restores the shipped activation loads exactly (the
- * ActPol=false instantiation IS the shipped kernel: same PTX, no policy
- * operand).  THE GATE `out_dim >= 4096` IS THE MEASUREMENT, not a guess: the
- * policy protects a SMALL activation from a LARGE single-use weight stream,
- * so it pays on 2560 -> 12288 (standalone -7.4/-8.3%, in engine -9 to -14%)
- * and 2560 -> 6144 (-6.6/-6.5%, in engine -7 to -14%), and is null or
- * NEGATIVE where the activation is bigger than the weight -- 10240 -> 320 is
- * +2.4/+0.6% standalone, and letting the gate down to 2048 cost more in
- * collateral L2 pressure on the MoE tiles than the extra shapes returned.
- * See /root/qwen/notes/prefill-budget.txt S13/S14. */
-static int cuda_q8_mma_pipe_actpol(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *e = getenv("DS4_CUDA_PIPE_ACTPOL");
-        cached = (e == NULL || e[0] != '0') ? 1 : 0;
-    }
-    return cached;
 }
 
 template <int WM, int WN, int MT, int NT, int G, int STAGES>
@@ -18200,16 +18151,9 @@ static int cuda_q8_mma_pipe_launch(float *out, const unsigned char *w,
                                    uint64_t blocks) {
     typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES> C;
     if (!cuda_q8_mma_pipe_attr<WM, WN, MT, NT, G, STAGES>()) return 0;
-    const bool actpol = out_dim >= 4096u && cuda_q8_mma_pipe_actpol() &&
-                        cuda_q8_mma_pipe_attr<WM, WN, MT, NT, G, STAGES, true>();
     dim3 grid((n_rows + C::BM - 1u) / C::BM, (unsigned)((out_dim + C::BN - 1u) / C::BN), 1u);
-    if (actpol) {
-        matmul_q8_0_preq_rows_mma_pipe_kernel<WM, WN, MT, NT, G, STAGES, true>
-            <<<grid, C::THREADS, C::SMEM, cuda_decode_stream()>>>(out, w, xq, xscale, out_dim, n_rows, blocks);
-    } else {
-        matmul_q8_0_preq_rows_mma_pipe_kernel<WM, WN, MT, NT, G, STAGES>
-            <<<grid, C::THREADS, C::SMEM, cuda_decode_stream()>>>(out, w, xq, xscale, out_dim, n_rows, blocks);
-    }
+    matmul_q8_0_preq_rows_mma_pipe_kernel<WM, WN, MT, NT, G, STAGES>
+        <<<grid, C::THREADS, C::SMEM, cuda_decode_stream()>>>(out, w, xq, xscale, out_dim, n_rows, blocks);
     g_q8_mma_pipe_last_bn = C::BN;
     return 1;
 }
