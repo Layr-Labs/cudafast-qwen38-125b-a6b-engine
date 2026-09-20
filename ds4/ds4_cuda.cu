@@ -25810,36 +25810,59 @@ __global__ static void moe_gate_up_mid_sorted_qwarp32_kernel(
         uint32_t expert_mid_dim,
         uint32_t n_expert,
         float clamp) {
+    /* perf-07: TWO ROW TILES PER BLOCK.
+     *
+     * The gate and up rows a block reads belong to it alone, but the token's
+     * quantised activation is read whole by every block of the pair column,
+     * so this step's activation traffic is proportional to the block count
+     * rather than to the work.  At 32 rows per block the grid over the
+     * intermediate dimension issues several times more blocks than the
+     * device can hold resident: the surplus blocks add no parallelism the
+     * SMs can use, they only pull the activation through again, on the
+     * decode leg.  Two tiles of 32 halve the block count and halve those
+     * passes.  The pair resolution -- sorted pair, token, slot, expert and
+     * the token's activation base -- does not depend on the row, so it is
+     * done once per block and both tiles reuse it, exactly as the shipped
+     * kernel did it once per block.
+     *
+     * MOE_SORTED_ROW_TILES = 1u restores the shipped geometry. */
+#ifndef MOE_SORTED_ROW_TILES
+#define MOE_SORTED_ROW_TILES 2u
+#endif
+#define MOE_SORTED_ROWS_PER_BLOCK (32u * MOE_SORTED_ROW_TILES)
     uint32_t lane = threadIdx.x & 7u;
-    uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
     uint32_t pair = sorted_pairs[blockIdx.y];
-    if (row >= expert_mid_dim) return;
     uint32_t tok = pair / n_expert;
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
     uint32_t expert = (uint32_t)expert_i;
-    const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
-    const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
     const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
-    float gate = 0.0f;
-    float up = 0.0f;
-    for (uint32_t b = lane; b < xq_blocks; b += 8u) {
-        gate += dev_dot_iq2_xxs_q8_K_block(gr + b, xqb + b);
-        up += dev_dot_iq2_xxs_q8_K_block(ur + b, xqb + b);
-    }
-    gate = quarter_warp_sum_f32(gate, lane);
-    up = quarter_warp_sum_f32(up, lane);
-    if (lane == 0) {
-        if (clamp > 1.0e-6f) {
-            if (gate > clamp) gate = clamp;
-            if (up > clamp) up = clamp;
-            if (up < -clamp) up = -clamp;
+    for (uint32_t rr = 0; rr < MOE_SORTED_ROW_TILES; rr++) {
+        const uint32_t row = blockIdx.x * MOE_SORTED_ROWS_PER_BLOCK
+                           + (threadIdx.x >> 3u) + rr * 32u;
+        if (row >= expert_mid_dim) continue;
+        const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+        const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+        float gate = 0.0f;
+        float up = 0.0f;
+        for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+            gate += dev_dot_iq2_xxs_q8_K_block(gr + b, xqb + b);
+            up += dev_dot_iq2_xxs_q8_K_block(ur + b, xqb + b);
         }
-        const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
-        gate_out[off] = gate;
-        up_out[off] = up;
-        mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+        gate = quarter_warp_sum_f32(gate, lane);
+        up = quarter_warp_sum_f32(up, lane);
+        if (lane == 0) {
+            if (clamp > 1.0e-6f) {
+                if (gate > clamp) gate = clamp;
+                if (up > clamp) up = clamp;
+                if (up < -clamp) up = -clamp;
+            }
+            const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+            gate_out[off] = gate;
+            up_out[off] = up;
+            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+        }
     }
 }
 
@@ -30107,7 +30130,11 @@ static int routed_moe_launch(
                     pair_count,
                     clamp);
             } else if (ok && sorted_pairs) {
-                moe_gate_up_mid_sorted_qwarp32_kernel<<<mgrid, 256, 0, cuda_decode_stream()>>>(
+                /* Divisor follows the kernel's row tile; the other branches
+                 * keep the shipped mgrid. */
+                const dim3 mgrid_t((expert_mid_dim + MOE_SORTED_ROWS_PER_BLOCK - 1u)
+                                   / MOE_SORTED_ROWS_PER_BLOCK, n_tokens * n_expert, 1);
+                moe_gate_up_mid_sorted_qwarp32_kernel<<<mgrid_t, 256, 0, cuda_decode_stream()>>>(
                     (float *)gate->ptr,
                     (float *)up->ptr,
                     (float *)mid->ptr,
