@@ -7518,7 +7518,8 @@ __global__ static void qwen4exp_moe_down_q_kernel(
 
 /* The shared expert: no routing, so the tile is consecutive tokens and the
  * decoded group serves all of them. */
-template <int R, int GateType = -1, int UpType = -1, bool Vector = false>
+template <int R, int GateType = -1, int UpType = -1, bool Vector = false,
+          bool Stage = false>
 __global__ static void qwen4exp_shared_gateup_q_kernel(
         float *mid,
         const char *gate,
@@ -7539,8 +7540,65 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
     if (row >= mid_dim || tok0 >= n_tokens) return;
     const uint32_t take = n_tokens - tok0 < (uint32_t)R ? n_tokens - tok0
                                                         : (uint32_t)R;
-    const char *gate_row = gate + (uint64_t)row * gate_row_bytes;
-    const char *up_row = up + (uint64_t)row * up_row_bytes;
+    /* The block's eight-row gate panel and eight-row up panel, copied once
+     * with coalesced 16-byte loads and decoded out of shared -- the same
+     * defect and the same remedy the shared DOWN projection in this tree
+     * already carries, applied to the gate/up projection, which that arm
+     * does not cover.  A warp's own row is 80 groups of 34 bytes at the
+     * checkpoint's shape and `dev_qwen4exp_group_decode` fetches each group
+     * as several sub-word pieces strided by the group size, so one load
+     * instruction asks for scattered four-byte pieces of a row no other
+     * lane is reading.  The eight gate rows a block owns are
+     * 8 * gate_row_bytes CONSECUTIVE bytes of the single shared-expert
+     * slab, and so are its eight up rows, so both spans can be fetched as
+     * one dense burst each.
+     *
+     * Bit-exactness: each panel is a verbatim byte image of the span the
+     * block's own warps would have read individually, written by the block,
+     * read by the block, dead with the block.  dev_qwen4exp_group_decode is
+     * called with the SAME (type, g) and a row pointer at the same offset
+     * within the panel, and the decoder is alignment-agnostic by
+     * construction.  Accumulation order, the lane-to-group map and the warp
+     * reduction are untouched.
+     *
+     * Fence order: the fill issues weight loads that do not depend on the
+     * sigmoid gate, so it goes ABOVE the grid dependency sync and the
+     * barrier BELOW it, and the drain absorbs the fill.  Both sit at block
+     * scope after the only early return, which is block-uniform once
+     * mid_dim % 8 == 0 -- required at the launch before this arm is
+     * selected -- and the staged arm skips the sync inside the walk, so a
+     * thread performs exactly one grid dependency sync either way. */
+    extern __shared__ uint4 qw_shgu_panel[];
+    char *const gpanel = (char *)qw_shgu_panel;
+    char *const upanel = gpanel + (uint64_t)8u * gate_row_bytes;
+    if (Stage) {
+        const uint64_t gate_bytes = (uint64_t)8u * gate_row_bytes;
+        const uint64_t up_bytes = (uint64_t)8u * up_row_bytes;
+        const char *const gsrc = gate + (uint64_t)(blockIdx.x * 8u) * gate_row_bytes;
+        const char *const usrc = up + (uint64_t)(blockIdx.x * 8u) * up_row_bytes;
+        for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < gate_bytes;
+             i += (uint64_t)blockDim.x * 16u) {
+            if (i + 16u <= gate_bytes)
+                *(uint4 *)(gpanel + i) = *(const uint4 *)(const void *)(gsrc + i);
+            else
+                for (uint64_t j = i; j < gate_bytes; j++) gpanel[j] = gsrc[j];
+        }
+        for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < up_bytes;
+             i += (uint64_t)blockDim.x * 16u) {
+            if (i + 16u <= up_bytes)
+                *(uint4 *)(upanel + i) = *(const uint4 *)(const void *)(usrc + i);
+            else
+                for (uint64_t j = i; j < up_bytes; j++) upanel[j] = usrc[j];
+        }
+        QWEN4EXP_PDL_SYNC();
+        __syncthreads();
+    }
+    const char *gate_row = Stage
+        ? (gpanel + (uint64_t)(threadIdx.x >> 5u) * gate_row_bytes)
+        : (gate + (uint64_t)row * gate_row_bytes);
+    const char *up_row = Stage
+        ? (upanel + (uint64_t)(threadIdx.x >> 5u) * up_row_bytes)
+        : (up + (uint64_t)row * up_row_bytes);
 
     float ag[R];
     float au[R];
@@ -7566,7 +7624,8 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
         dev_qwen4exp_group_decode(
                 UpType < 0 ? up_type : (uint32_t)UpType,
                 up_row, g, uw, ua, ub, &uh);
-        QWEN4EXP_PDL_SYNC();
+        /* The staged arm already waited, at block scope, above. */
+        if (!Stage) QWEN4EXP_PDL_SYNC();
 #pragma unroll
         for (int r = 0; r < R; r++) {
             if ((uint32_t)r < take) {
@@ -11071,15 +11130,45 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
  * quantizes the input itself, that quantizer, which triggers too -- and the
  * kernel's weight-group prefetch rides that window
  * (ds4_cuda_qwen4exp.cuh).  Verify and prefill keep the plain launch. */
+/* The eight-row gate panel and the eight-row up panel.  mid_dim % 8 keeps the
+ * kernel's only early return block-uniform, which the staged arm's barrier
+ * needs; a panel is 8 * row_bytes and the shipped q8_0 row width (2,720) is a
+ * multiple of 16, so an aligned slab base makes both panel bases aligned and
+ * the up panel, which starts at 8 * gate_row_bytes, aligned as well.  Only the
+ * decode widths take it: there the gate/up grid is a few dozen blocks, so the
+ * dynamic footprint costs no parallelism the launch could have used, while a
+ * prefill tile keeps its own staging.
+ * DS4_QWEN4EXP_NO_SHARED_GATEUP_PANEL stands it down. */
+    const uint64_t sg_gate_panel = (uint64_t)8u * gate_slab->row_bytes;
+    const uint64_t sg_up_panel = (uint64_t)8u * up_slab->row_bytes;
+    const uint64_t sg_panel = sg_gate_panel + sg_up_panel;
+    const int sg_stage =
+        (mid_dim % 8u) == 0u &&
+        (sg_gate_panel % 16u) == 0u &&
+        (sg_up_panel % 16u) == 0u &&
+        ((uintptr_t)gate & 15u) == 0u &&
+        ((uintptr_t)up & 15u) == 0u &&
+        sg_panel <= (uint64_t)46u * 1024u &&
+        getenv("DS4_QWEN4EXP_NO_SHARED_GATEUP_PANEL") == NULL;
 #define QWEN4EXP_SH_GATEUP_IMPL(R, GT, UT, V) do { \
     if (n_tokens <= 2u) { \
-        QWEN4EXP_LAUNCH_PDL( \
-                (qwen4exp_shared_gateup_q_kernel<R, GT, UT, V>), \
-                (dim3((mid_dim + 7u) / 8u, tiles, 1)), \
-                threads, 0, side, \
-                (float *)mid->ptr, gate, up, xq, xs, xsum, \
-                gate_slab->row_bytes, up_slab->row_bytes, \
-                gate_slab->type, up_slab->type, xgroups, mid_dim, n_tokens); \
+        if (sg_stage) { \
+            QWEN4EXP_LAUNCH_PDL( \
+                    (qwen4exp_shared_gateup_q_kernel<R, GT, UT, V, true>), \
+                    (dim3((mid_dim + 7u) / 8u, tiles, 1)), \
+                    threads, (size_t)sg_panel, side, \
+                    (float *)mid->ptr, gate, up, xq, xs, xsum, \
+                    gate_slab->row_bytes, up_slab->row_bytes, \
+                    gate_slab->type, up_slab->type, xgroups, mid_dim, n_tokens); \
+        } else { \
+            QWEN4EXP_LAUNCH_PDL( \
+                    (qwen4exp_shared_gateup_q_kernel<R, GT, UT, V>), \
+                    (dim3((mid_dim + 7u) / 8u, tiles, 1)), \
+                    threads, 0, side, \
+                    (float *)mid->ptr, gate, up, xq, xs, xsum, \
+                    gate_slab->row_bytes, up_slab->row_bytes, \
+                    gate_slab->type, up_slab->type, xgroups, mid_dim, n_tokens); \
+        } \
     } else { \
         qwen4exp_shared_gateup_q_kernel<R, GT, UT, V> \
             <<<dim3((mid_dim + 7u) / 8u, tiles, 1), threads, 0, side>>>( \
