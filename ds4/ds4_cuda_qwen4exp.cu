@@ -13114,6 +13114,50 @@ qwen4exp_hc_up_mix_pipe_kernel(
             uint4 ra[KA];
             float rs[KS];
             uint4 rb[KB][3];
+            /* L2 PREFETCH, TWO STAGES AHEAD OF THE ACTIVATION TILE.
+             *
+             * The weight blocks are not this pipe's only cold operand.  The
+             * quantised activation buffer for a hyper-connection projection
+             * is the token count times the embedding width, far past what
+             * the last-level cache holds, and a stage's activation chunk is
+             * separated from the next stage's adjacent chunk by a barrier
+             * handoff, a full round of shared stores and the whole weight
+             * stream of the stage -- bytes that are never reused and are
+             * numerous enough to evict the activation lines the following
+             * stage will want.  The producers are the side the pipe waits
+             * on, so the miss is discovered where it costs pipeline depth.
+             *
+             * The address is the activation load's own expression evaluated
+             * at `s + AHEAD`: the same token row, the same block index
+             * advanced by that many stage steps, the same thirty-two-byte
+             * group stride and the same sixteen-byte half within the group.
+             * One request per 128-byte line, since a row's groups are
+             * contiguous and eight sixteen-byte chunks share a line.
+             * prefetch.global.L2 writes no register, produces no value and
+             * cannot change a loaded byte; the guards are the load's own --
+             * a stage that exists, a token inside the batch and a block
+             * inside the row. */
+#ifndef QHP_PIPE_ACT_L2_AHEAD
+#define QHP_PIPE_ACT_L2_AHEAD 2
+#endif
+            if (QHP_PIPE_ACT_L2_AHEAD != 0 &&
+                s + QHP_PIPE_ACT_L2_AHEAD < nstage) {
+                const uint64_t ga = g0 + (uint64_t)QHP_PIPE_ACT_L2_AHEAD * QHP_G;
+#pragma unroll
+                for (int k = 0; k < KA; k++) {
+                    const int i = pl + k * PT;
+                    const int t = i / (QHP_G * 2);
+                    const int rem = i - t * (QHP_G * 2);
+                    const uint64_t g = ga + (uint64_t)(rem >> 1);
+                    const uint64_t tok = (uint64_t)m0 + (uint32_t)t;
+                    if (i < NA && tok < (uint64_t)n_rows && g < blocks &&
+                        (rem & 7) == 0) {
+                        const int8_t *pre =
+                            xq + (tok * blocks + g) * 32u + (rem & 1) * 16;
+                        asm volatile("prefetch.global.L2 [%0];" :: "l"(pre));
+                    }
+                }
+            }
 #pragma unroll
             for (int k = 0; k < KA; k++) {
                 const int i = pl + k * PT;
