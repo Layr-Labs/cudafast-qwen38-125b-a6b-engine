@@ -2088,6 +2088,55 @@ qwen4exp_gdn_qkv_conv_mma_pipe_kernel(float *out,
             const uint64_t win_off = seg_off & ~(uint64_t)15u;
             const int skew = (int)(seg_off & 15u);
 
+            /* L2 PREFETCH, TWO STAGES AHEAD OF THE ACTIVATION TILE.
+             *
+             * The weight window is not this pipe's only cold operand.  At
+             * the token-tile widths this kernel is taken for, the quantised
+             * activation buffer is far larger than the last-level cache: a
+             * stage reads `BM` rows of it at the stage's own k-offset, the
+             * next stage reads the same rows one stage-step further along,
+             * and between the two requests sit a barrier handoff, a full
+             * round of shared stores and the whole weight window of the
+             * stage -- a never-reused stream large enough to evict exactly
+             * the activation lines that the following stage will want.  The
+             * producers are the side the pipe waits on, so the miss is
+             * discovered where it costs pipeline depth.
+             *
+             * The address is the activation load's own expression evaluated
+             * at `s + AHEAD`: the same row for this lane's chunk, the same
+             * block index advanced by that many stage steps, the same
+             * thirty-two-byte group stride and the same sixteen-byte half
+             * within the group.  One request per 128-byte line, since a
+             * row's groups are contiguous and eight sixteen-byte chunks
+             * share a line.  prefetch.global.L2 writes no register, produces
+             * no value and cannot change a loaded byte; the guards are the
+             * load's own -- a stage that exists and a row inside the
+             * activation buffer. */
+#ifndef QW_GDN_PIPE_ACT_L2_AHEAD
+#define QW_GDN_PIPE_ACT_L2_AHEAD 2
+#endif
+            if (QW_GDN_PIPE_ACT_L2_AHEAD != 0) {
+                const uint64_t a_ahead = s + (uint64_t)QW_GDN_PIPE_ACT_L2_AHEAD;
+                if (a_ahead < nstage) {
+                    const uint64_t ga = a_ahead * (uint64_t)G;
+#pragma unroll
+                    for (int k = 0; k < KA; k++) {
+                        const int idx = pl + k * PT;
+                        const int r = idx / C::A_CHUNKS;
+                        const int c = idx - r * C::A_CHUNKS;
+                        const uint64_t row = (uint64_t)m0 + (uint32_t)r;
+                        if (idx < BM * C::A_CHUNKS && row < (uint64_t)n_rows &&
+                            (c & 7) == 0) {
+                            const int8_t *pre =
+                                xq + (row * blocks + ga + (uint32_t)(c >> 1)) * 32u
+                                   + (c & 1) * 16;
+                            asm volatile("prefetch.global.L2 [%0];"
+                                         :: "l"(pre));
+                        }
+                    }
+                }
+            }
+
             /* The stage into registers. */
             uint4 ra[KA], rs[KS], rb[KB];
 #pragma unroll
