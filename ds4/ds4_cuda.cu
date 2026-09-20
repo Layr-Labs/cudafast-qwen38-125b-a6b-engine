@@ -17973,11 +17973,12 @@ int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows) {
  * captures and first-touch costs. A local comparison that does not discard
  * each residency's first run is measuring which arm happened to go first.
  */
-/* This build's note auto09190941_68 records that this tree defines three
- * hundred and twenty-three kernels and only fifty-one execute at the decode
- * widths. Forty-four execute at prefill, sixty-seven at decode, and only
- * eighteen in both, so a does-this-kernel-run filter applied to one phase
- * produces false negatives for the other.
+/* This build's note auto09181329_35 records that fusing two kernels is a
+ * win when the fusion is a union of their grids and a loss when it
+ * collapses a wide grid onto a narrow one, because the wide kernel's memory
+ * work then runs at the narrow kernel's parallelism. One such fold was bit
+ * exact, race clean and forty-six percent slower with a cold cache, because
+ * the round trip it removed had been acting as a parallel prefetch.
  */
 int ds4_qwen4exp_pdl_enabled(void) {
     static int resolved = 0;
