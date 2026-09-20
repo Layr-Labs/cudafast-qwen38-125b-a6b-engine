@@ -483,6 +483,28 @@ __device__ static float warp_sum_f32(float v) {
     return v;
 }
 
+/* HALF-WARP REDUCTION, and why it is not a reassociation.
+ *
+ * warp_sum_f32's first step, offset 16, is exactly "add lane L+16's value to
+ * lane L's".  Every later step -- 8, 4, 2, 1 -- reads only lanes 0..15 from
+ * lane 0's point of view, and only lanes 16..31 from lane 16's.  So the
+ * 32-lane butterfly DECOMPOSES: fold lane L+16 into lane L, then run the
+ * butterfly below.
+ *
+ * A caller that has already done that fold in lane -- which is what a kernel
+ * packing two output rows into one warp does for free, because each half of
+ * the warp accumulates its row's strip L and strip L+16 into two registers
+ * and adds them -- finishes with this butterfly and lands on the SAME float
+ * bits warp_sum_f32 would have produced for that row on a warp of its own.
+ * Same operands, same pairing, same order; one shuffle fewer.  Lane 0 carries
+ * the low sixteen lanes' total, lane 16 the high sixteen's. */
+__device__ static float warp_sum16_f32(float v) {
+    for (int offset = 8; offset > 0; offset >>= 1) {
+        v += __shfl_down_sync(0xffffffffu, v, offset);
+    }
+    return v;
+}
+
 /* Metal's simd_sum, exactly: the butterfly leaves the total in EVERY lane, so
  * a reduction whose result the whole warp needs costs no broadcast after it.
  * Lane 0 adds the same operands in the same order as warp_sum_f32 -- at step
@@ -7534,29 +7556,118 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
         uint32_t mid_dim,
         uint32_t n_tokens) {
     const uint32_t lane = threadIdx.x & 31u;
-    const uint32_t row = blockIdx.x * 8u + (threadIdx.x >> 5u);
+    /* ---- TWO OUTPUT ROWS IN ONE WARP ----
+     *
+     * The mechanism is warp_sum16_f32 above: the shipped 32-lane butterfly's
+     * offset-16 step IS "fold lane L+16 into lane L", and nothing after it
+     * crosses the halfway line.  So lanes 0..15 can carry one output row and
+     * lanes 16..31 the next, each half folding its row's strip `half` and
+     * strip `half + 16` in lane before the 16-lane butterfly.  Both rows come
+     * out bit-identical to the shipped result -- the same per-group terms
+     * added in the same order, then the same add tree minus one shuffle.
+     *
+     * WHY IT PAYS AT THIS SHAPE.  groups == xgroups == in_dim / 32 ==
+     * 2560 / 32 == 80, so the shipped walk is g = lane, lane + 32, lane + 64:
+     * three rounds, of which the third runs on sixteen lanes of thirty-two.
+     * 80 group decodes over 96 lane-slots (83.3%), with a divergent tail
+     * round the whole warp waits on.
+     *
+     *   walk              rounds per row   lane-slots used
+     *   shipped                        3   80 / 96  = 83.3%
+     *   this arm                     2.5   160 / 160 = 100%
+     *
+     * Under the fold every lane decodes five groups -- strips
+     * {half, half+32, half+64} and {half+16, half+48} -- and the warp retires
+     * TWO rows, with no divergence anywhere.  The block keeps its eight rows
+     * and the grid is untouched; it needs four warps instead of eight, so the
+     * launch drops to 128 threads.  This kernel maps no shared memory, so
+     * halving the block costs no occupancy -- the panel-staging kernels below
+     * could not say the same.
+     *
+     * The activation side pays on top: at_g carries the token and the group
+     * but NOT the row, so at a given strip step both halves of the warp ask
+     * for exactly the same xq / xs / xsum bytes.
+     *
+     * A warp may only leave early if BOTH its rows are out of range -- every
+     * lane has to reach the full-mask shuffles -- so a straddling warp clamps
+     * its row for addressing and drops its store instead. */
+    const uint32_t half = lane & 15u;
+    const uint32_t rowpair = blockIdx.x * 8u + (threadIdx.x >> 5u) * 2u;
+    const uint32_t row = rowpair + (lane >> 4u);
     const uint32_t tok0 = blockIdx.y * (uint32_t)R;
-    if (row >= mid_dim || tok0 >= n_tokens) return;
+    if (rowpair >= mid_dim || tok0 >= n_tokens) return;
+    const uint32_t row_live = row < mid_dim ? row : mid_dim - 1u;
     const uint32_t take = n_tokens - tok0 < (uint32_t)R ? n_tokens - tok0
                                                         : (uint32_t)R;
-    const char *gate_row = gate + (uint64_t)row * gate_row_bytes;
-    const char *up_row = up + (uint64_t)row * up_row_bytes;
+    const char *gate_row = gate + (uint64_t)row_live * gate_row_bytes;
+    const char *up_row = up + (uint64_t)row_live * up_row_bytes;
 
-    float ag[R];
-    float au[R];
+    /* Four accumulator arrays, not one indexed pair: strip `half` and strip
+     * `half + 16` must stay in registers or the fold costs more than the
+     * round it saves. */
+    float ag0[R], ag1[R];
+    float au0[R], au1[R];
 #pragma unroll
-    for (int r = 0; r < R; r++) { ag[r] = 0.0f; au[r] = 0.0f; }
+    for (int r = 0; r < R; r++) {
+        ag0[r] = 0.0f; ag1[r] = 0.0f;
+        au0[r] = 0.0f; au1[r] = 0.0f;
+    }
 
-    /* PDL: the first walk step (g = lane) with its WEIGHT loads -- both group
-     * decodes read only the gate/up rows, fixed single-expert slabs whose
-     * addresses are launch math -- issued above the fence and held in
+    /* One walk step, for whichever accumulator pair owns the strip.  The body
+     * is character-identical to the shipped step -- same decoder call, same
+     * (type, g), same activation address arithmetic, same accumulate -- so the
+     * only thing this arm changes is WHICH register the term lands in. */
+#define QWEN4EXP_SH_GU_STEP(GG, AG, AU) do { \
+        const uint32_t g_ = (GG); \
+        int8_t gw[32], uw[32]; \
+        float ga[2], gb[2], ua[2], ub[2]; \
+        int gh = 1, uh = 1; \
+        dev_qwen4exp_group_decode( \
+                GateType < 0 ? gate_type : (uint32_t)GateType, \
+                gate_row, g_, gw, ga, gb, &gh); \
+        dev_qwen4exp_group_decode( \
+                UpType < 0 ? up_type : (uint32_t)UpType, \
+                up_row, g_, uw, ua, ub, &uh); \
+        _Pragma("unroll") \
+        for (int r = 0; r < R; r++) { \
+            if ((uint32_t)r < take) { \
+                const uint64_t at_g = \
+                    (uint64_t)(tok0 + (uint32_t)r) * groups + g_; \
+                const int8_t *xqg = xq + at_g * 32u; \
+                const float sc = xs[at_g]; \
+                const int32_t sm = xsum[at_g]; \
+                if constexpr (Vector) { \
+                    qwen4exp_shared_vector_accumulate(&AG[r], gw, ga[0], gb[0], \
+                                                      xqg, sc, sm); \
+                    qwen4exp_shared_vector_accumulate(&AU[r], uw, ua[0], ub[0], \
+                                                      xqg, sc, sm); \
+                } else { \
+                    qwen4exp_group_accumulate(&AG[r], gw, ga, gb, gh, xqg, sc, sm); \
+                    qwen4exp_group_accumulate(&AU[r], uw, ua, ub, uh, xqg, sc, sm); \
+                } \
+            } \
+        } \
+    } while (0)
+
+    /* PDL: the FIRST strip's first step (g = half) with its WEIGHT loads --
+     * both group decodes read only the gate/up rows, fixed single-expert slabs
+     * whose addresses are launch math -- issued above the fence and held in
      * registers, so they fly while the sigmoid gate drains.  The activation
      * reads (xq/xs/xsum, the quantized input) stay below it; every statement
      * is the loop's own, g ascends exactly as the rolled walk did, and the
      * guard is the loop's own bounds check for a walk a lane does not start.
-     * The walk's remainder runs unchanged from lane + 32. */
-    if (lane < groups) {
-        const uint32_t g = lane;
+     *
+     * Only ONE step is hoisted, exactly as the shipped kernel hoists one: the
+     * second strip's first step (g = half + 16) would put four decoded groups
+     * in flight above the fence, and 128 bytes of quantized weight in
+     * registers is the wrong trade for a second prefetch.  It runs in the
+     * second remainder walk below instead.
+     *
+     * The remainders then run from half + 32 for the first strip and from
+     * half + 16 for the second, each ascending by 32, so each accumulator sees
+     * its groups in exactly the ascending order the shipped lane saw them. */
+    if (half < groups) {
+        const uint32_t g = half;
         int8_t gw[32], uw[32];
         float ga[2], gb[2], ua[2], ub[2];
         int gh = 1, uh = 1;
@@ -7575,52 +7686,36 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
                 const float sc = xs[at_g];
                 const int32_t sm = xsum[at_g];
                 if constexpr (Vector) {
-                    qwen4exp_shared_vector_accumulate(&ag[r], gw, ga[0], gb[0],
+                    qwen4exp_shared_vector_accumulate(&ag0[r], gw, ga[0], gb[0],
                                                       xqg, sc, sm);
-                    qwen4exp_shared_vector_accumulate(&au[r], uw, ua[0], ub[0],
+                    qwen4exp_shared_vector_accumulate(&au0[r], uw, ua[0], ub[0],
                                                       xqg, sc, sm);
                 } else {
-                    qwen4exp_group_accumulate(&ag[r], gw, ga, gb, gh, xqg, sc, sm);
-                    qwen4exp_group_accumulate(&au[r], uw, ua, ub, uh, xqg, sc, sm);
+                    qwen4exp_group_accumulate(&ag0[r], gw, ga, gb, gh, xqg, sc, sm);
+                    qwen4exp_group_accumulate(&au0[r], uw, ua, ub, uh, xqg, sc, sm);
                 }
             }
         }
     }
-    for (uint32_t g = lane + 32u; g < groups; g += 32u) {
-        int8_t gw[32], uw[32];
-        float ga[2], gb[2], ua[2], ub[2];
-        int gh = 1, uh = 1;
-        dev_qwen4exp_group_decode(
-                GateType < 0 ? gate_type : (uint32_t)GateType,
-                gate_row, g, gw, ga, gb, &gh);
-        dev_qwen4exp_group_decode(
-                UpType < 0 ? up_type : (uint32_t)UpType,
-                up_row, g, uw, ua, ub, &uh);
-#pragma unroll
-        for (int r = 0; r < R; r++) {
-            if ((uint32_t)r < take) {
-                const uint64_t at_g = (uint64_t)(tok0 + (uint32_t)r) * groups + g;
-                const int8_t *xqg = xq + at_g * 32u;
-                const float sc = xs[at_g];
-                const int32_t sm = xsum[at_g];
-                if constexpr (Vector) {
-                    qwen4exp_shared_vector_accumulate(&ag[r], gw, ga[0], gb[0],
-                                                      xqg, sc, sm);
-                    qwen4exp_shared_vector_accumulate(&au[r], uw, ua[0], ub[0],
-                                                      xqg, sc, sm);
-                } else {
-                    qwen4exp_group_accumulate(&ag[r], gw, ga, gb, gh, xqg, sc, sm);
-                    qwen4exp_group_accumulate(&au[r], uw, ua, ub, uh, xqg, sc, sm);
-                }
-            }
-        }
+    for (uint32_t g = half + 32u; g < groups; g += 32u) {
+        QWEN4EXP_SH_GU_STEP(g, ag0, au0);
     }
+    for (uint32_t g = half + 16u; g < groups; g += 32u) {
+        QWEN4EXP_SH_GU_STEP(g, ag1, au1);
+    }
+#undef QWEN4EXP_SH_GU_STEP
 
+    /* ag0[r] + ag1[r] IS the shipped butterfly's offset-16 step: strip `half`
+     * is what lane `half` accumulated, strip `half + 16` is what lane
+     * `half + 16` accumulated, and the shipped tree adds them in that order.
+     * warp_sum16_f32 then finishes the same tree.  Lane 0 holds the low row's
+     * total and lane 16 the high row's, so `half == 0u` is the storing lane in
+     * both halves. */
 #pragma unroll
     for (int r = 0; r < R; r++) {
-        const float g = warp_sum_f32(ag[r]);
-        const float u = warp_sum_f32(au[r]);
-        if (lane == 0u && (uint32_t)r < take) {
+        const float g = warp_sum16_f32(ag0[r] + ag1[r]);
+        const float u = warp_sum16_f32(au0[r] + au1[r]);
+        if (half == 0u && (uint32_t)r < take && row < mid_dim) {
             mid[(uint64_t)(tok0 + (uint32_t)r) * mid_dim + row] =
                 (g / (1.0f + expf(-g))) * u;
         }
@@ -11071,18 +11166,25 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
  * quantizes the input itself, that quantizer, which triggers too -- and the
  * kernel's weight-group prefetch rides that window
  * (ds4_cuda_qwen4exp.cuh).  Verify and prefill keep the plain launch. */
+/* FOUR WARPS, not eight: the kernel packs two output rows into every warp
+ * (see warp_sum16_f32), so the same eight rows per block and the same grid
+ * need half the warps.  This kernel maps no shared memory, so the narrower
+ * block costs nothing but the warps it removes.  The shared DOWN launch below
+ * keeps `threads`; its walk is one round at twenty groups and the fold buys
+ * it nothing. */
+    const unsigned gu_threads = 128u;
 #define QWEN4EXP_SH_GATEUP_IMPL(R, GT, UT, V) do { \
     if (n_tokens <= 2u) { \
         QWEN4EXP_LAUNCH_PDL( \
                 (qwen4exp_shared_gateup_q_kernel<R, GT, UT, V>), \
                 (dim3((mid_dim + 7u) / 8u, tiles, 1)), \
-                threads, 0, side, \
+                gu_threads, 0, side, \
                 (float *)mid->ptr, gate, up, xq, xs, xsum, \
                 gate_slab->row_bytes, up_slab->row_bytes, \
                 gate_slab->type, up_slab->type, xgroups, mid_dim, n_tokens); \
     } else { \
         qwen4exp_shared_gateup_q_kernel<R, GT, UT, V> \
-            <<<dim3((mid_dim + 7u) / 8u, tiles, 1), threads, 0, side>>>( \
+            <<<dim3((mid_dim + 7u) / 8u, tiles, 1), gu_threads, 0, side>>>( \
                     (float *)mid->ptr, gate, up, xq, xs, xsum, \
                     gate_slab->row_bytes, up_slab->row_bytes, \
                     gate_slab->type, up_slab->type, xgroups, mid_dim, n_tokens); \
