@@ -20344,6 +20344,87 @@ static void qwen_f32_vector_tree_kernel(float *out, const float *w,
     }
 }
 
+/* The 512-column tower router has four independent 64-thread reduction
+ * trees per 256-thread CTA.  This is qwen_f32_vector_tree_kernel<R,4,1>
+ * packed four columns at a time: every leaf chain and every reduction edge
+ * stays in the same order, while the grid carries 128 CTAs instead of 512.
+ * Keeping this as a router-only kernel avoids changing the measured GDN
+ * geometry. */
+template<int R>
+__global__ __launch_bounds__(256)
+static void qwen_f32_router_tree4_kernel(float *out, const float *w,
+                                         const float *x, uint64_t out_dim) {
+    QWEN4EXP_PDL_TRIGGER();
+    constexpr unsigned C = 4u;
+    constexpr unsigned T = 64u;
+    const unsigned group = threadIdx.x / T;
+    const unsigned t = threadIdx.x - group * T;
+    const unsigned lane = t & 31u;
+    const uint64_t col = (uint64_t)blockIdx.x * 4u + group;
+    float acc[R][C];
+#pragma unroll
+    for (int r = 0; r < R; r++)
+#pragma unroll
+        for (unsigned j = 0; j < C; j++) acc[r][j] = 0.0f;
+
+    {
+        const unsigned at = C * t;
+        float wv[C];
+        qwen_f32_vector_read<4>(wv, w + col * 2560u + at);
+        QWEN4EXP_PDL_SYNC();
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            float xv[C];
+            qwen_f32_vector_read<4>(xv, x + (uint64_t)r * 2560u + at);
+#pragma unroll
+            for (unsigned j = 0; j < C; j++) acc[r][j] += wv[j] * xv[j];
+        }
+    }
+#pragma unroll 1
+    for (int m = 1; m < 10; m++) {
+        const unsigned at = C * t + 256u * (unsigned)m;
+        float wv[C];
+        qwen_f32_vector_read<4>(wv, w + col * 2560u + at);
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            float xv[C];
+            qwen_f32_vector_read<4>(xv, x + (uint64_t)r * 2560u + at);
+#pragma unroll
+            for (unsigned j = 0; j < C; j++) acc[r][j] += wv[j] * xv[j];
+        }
+    }
+
+    __shared__ float partial[R][4][C][T];
+#pragma unroll
+    for (int r = 0; r < R; r++)
+#pragma unroll
+        for (unsigned j = 0; j < C; j++)
+            partial[r][group][j][t] = acc[r][j];
+    __syncthreads();
+    if (t >= 32u) return;
+#pragma unroll
+    for (int r = 0; r < R; r++)
+#pragma unroll
+        for (unsigned j = 0; j < C; j++)
+            acc[r][j] = partial[r][group][j][lane] +
+                        partial[r][group][j][lane + 32u];
+#pragma unroll
+    for (int r = 0; r < R; r++) {
+#pragma unroll
+        for (unsigned j = 0; j < C; j++) {
+#pragma unroll
+            for (int d = 16; d > 0; d >>= 1)
+                acc[r][j] += __shfl_down_sync(0xffffffffu, acc[r][j], d);
+        }
+        if (lane == 0u) {
+            acc[r][0] += acc[r][2];
+            acc[r][1] += acc[r][3];
+            acc[r][0] += acc[r][1];
+            out[(uint64_t)r * out_dim + col] = acc[r][0];
+        }
+    }
+}
+
 
 /* One block owns either a Q8 output group or an F32 projection row.
  * Preserve each original arithmetic tree; float blocks come first in the grid.
@@ -20720,6 +20801,30 @@ extern "C" int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
                                             weight_bytes, logical_tier,
                                             "f32 decode rows exact");
     if (!w) return 0;
+
+    /* Four exact router trees per CTA.  The dedicated valve falls through to
+     * the shipping one-tree CTA in the branch below, which is a same-binary
+     * bitwise control. */
+    if (in_dim == 2560u && out_dim == 512u && n_rows <= 2u &&
+        (((uintptr_t)w | (uintptr_t)x->ptr) & 15u) == 0u &&
+        getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
+        getenv("DS4_F32_NO_VECTOR_DECODE") == NULL &&
+        getenv("DS4_QWEN4EXP_NO_ROUTER_CTA4") == NULL) {
+        if (n_rows == 1u) {
+            QWEN4EXP_LAUNCH_PDL((qwen_f32_router_tree4_kernel<1>),
+                                (unsigned)out_dim / 4u, 256, 0,
+                                cuda_decode_stream(),
+                                (float *)out->ptr, (const float *)w,
+                                (const float *)x->ptr, out_dim);
+        } else {
+            QWEN4EXP_LAUNCH_PDL((qwen_f32_router_tree4_kernel<2>),
+                                (unsigned)out_dim / 4u, 256, 0,
+                                cuda_decode_stream(),
+                                (float *)out->ptr, (const float *)w,
+                                (const float *)x->ptr, out_dim);
+        }
+        return cuda_ok(cudaGetLastError(), "matmul_f32 router CTA4 launch");
+    }
 
     /* The depth-2 verify (three rows): the R=2 tree on rows 0..1 and the R=1
      * tree on row 2, on row-shifted views.  The tree is per-row bit-equal at

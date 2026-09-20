@@ -14,10 +14,13 @@ static uint32_t random_word(void) {
 static void check(int ok, const char *why) {
     if (!ok) { fprintf(stderr, "F32 vector decode: %s\n", why); exit(1); }
 }
-static void pin(unsigned candidate) {
-    check((candidate ? unsetenv("DS4_F32_NO_VECTOR_DECODE") :
-                       setenv("DS4_F32_NO_VECTOR_DECODE", "1", 1)) == 0,
+static void pin(unsigned mode) {
+    check((mode ? unsetenv("DS4_F32_NO_VECTOR_DECODE") :
+                  setenv("DS4_F32_NO_VECTOR_DECODE", "1", 1)) == 0,
           "reference pin");
+    check((mode == 2u ? setenv("DS4_QWEN4EXP_NO_ROUTER_CTA4", "1", 1) :
+                        unsetenv("DS4_QWEN4EXP_NO_ROUTER_CTA4")) == 0,
+          "router CTA4 pin");
 }
 static void shape(uint64_t in, uint64_t out, uint64_t offset) {
     const uint32_t max_rows = 64;
@@ -57,8 +60,7 @@ static void shape(uint64_t in, uint64_t out, uint64_t offset) {
         check(ds4_gpu_matmul_f32_decode_rows_exact_tensor(
             yt, map, size, offset, in, out, xt, rows), "oracle");
         check(ds4_gpu_tensor_read(yt, 0, ref, yn * sizeof(float)), "oracle read");
-        {
-            const unsigned mode = 1;
+        for (unsigned mode = 1; mode <= 2; mode++) {
             pin(mode);
             check(ds4_gpu_tensor_write(yt, 0, poison, yn * sizeof(float)), "candidate poison");
             check(ds4_gpu_matmul_f32_decode_rows_exact_tensor(
@@ -84,6 +86,7 @@ int main(void) {
     shape(2560, 48, 64); shape(2560, 48, 68);
     shape(2560, 49, 68); shape(257, 48, 64);
     unsetenv("DS4_F32_NO_VECTOR_DECODE");
-    puts("F32 vector decode: all 54 full-output/canary comparisons pass");
+    unsetenv("DS4_QWEN4EXP_NO_ROUTER_CTA4");
+    puts("F32 vector decode: all 108 full-output/canary comparisons pass");
     return 0;
 }
