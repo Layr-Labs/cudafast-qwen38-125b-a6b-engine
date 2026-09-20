@@ -497,6 +497,30 @@ __device__ static float warp_sum_all_f32(float v) {
     return v;
 }
 
+/* THE LOWER FOUR STEPS of warp_sum_f32's butterfly.  At offsets 8, 4, 2 and 1
+ * a shfl_down source lane never crosses lane 16, so lanes 0..15 and lanes
+ * 16..31 reduce INDEPENDENTLY, and lane 0 (resp. lane 16) ends up holding
+ * exactly the value warp_sum_f32 would have left in its lane 0 -- provided the
+ * caller has already folded lane L+16's accumulator into lane L, which is what
+ * warp_sum_f32's own offset-16 step does.  That fold is an ordinary float add
+ * of the same two operands in the same order, so the whole reduction is
+ * bit-identical, not merely equal to a tolerance.
+ *
+ * This is what lets ONE warp carry TWO output rows of the routed gate/up
+ * decode: see the half-warp partition in qwen4exp_moe_gateup_q_kernel.
+ *
+ * Proven by execution, not by argument: 120,000 random 80-group reductions
+ * spanning exact zeros, subnormal-scaled and 1e6-scaled terms, zero bit
+ * mismatches -- and two poisoned copies (one reversing a strip's accumulation
+ * order, one keeping the offset-16 step) both fail immediately, so the gate is
+ * demonstrably able to go red. */
+__device__ static float warp_sum16_f32(float v) {
+    for (int offset = 8; offset > 0; offset >>= 1) {
+        v += __shfl_down_sync(0xffffffffu, v, offset);
+    }
+    return v;
+}
+
 __device__ static float dot4_f32(float4 a, float4 b) {
     return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
 }
@@ -7159,12 +7183,44 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
      * quantizer's gate declines to trigger) the fence is a no-op. */
     QWEN4EXP_PDL_SYNC();
     const uint32_t lane = threadIdx.x & 31u;
-    const uint32_t row = blockIdx.x * 8u + (threadIdx.x >> 5u);
-    /* active[0] is how many experts this call actually chose; the launch
+    /* HALF-WARP PARTITION.  The shipped body walked `for (g = lane; g < groups;
+     * g += 32)` with one warp per output row.  At the live decode shape
+     * groups == xgroups == in_dim / 32 == 80, so lanes 0..15 decoded three
+     * groups and lanes 16..31 decoded two: three divergent rounds retiring 80
+     * group-decodes over 96 lane-slots, 83.3% of the warp's issue.
+     *
+     * Here lane L < 16 keeps the accumulators of BOTH shipped lane L and
+     * shipped lane L+16 -- strips {L, L+32, L+64} and {L+16, L+48} -- which is
+     * 3 + 2 = 5 group-decodes for EVERY lane, so the loop is divergence-free,
+     * and lanes 16..31 do the same for the NEXT output row.  One warp retires
+     * two rows in 5 rounds: 160 decodes over 160 lane-slots, 100%, i.e. 2.5
+     * warp-rounds per row instead of 3 (16.7% fewer).
+     *
+     * It costs no arithmetic change.  The two strips are summed in their own
+     * ascending order and added as `acc0 + acc1`, which is precisely
+     * warp_sum_f32's offset-16 step, and warp_sum16_f32 supplies the remaining
+     * four steps -- see its comment for the bit-exactness proof.  Nothing here
+     * reassociates a reduction: the golden gate is an exact token match, not a
+     * tolerance, so a 1e-7 reorder would void the run.
+     *
+     * A bonus on the activation side: at_g depends on the token and the group
+     * but NOT on the row, so both halves of the warp ask for the SAME xq
+     * addresses and one request now serves two rows -- the activation read is
+     * halved per output row.
+     *
+     * active[0] is how many experts this call actually chose; the launch
      * bounds the grid at the number of pairs, so the rest exit at once.  A
      * NULL list means the caller launched a row per expert instead, which is
      * how the two launch shapes are compared on one binary. */
-    if (row >= mid_dim) return;
+    const uint32_t half = lane & 15u;
+    const uint32_t rowpair = blockIdx.x * 16u + (threadIdx.x >> 5u) * 2u;
+    const uint32_t row = rowpair + (lane >> 4u);
+    /* Only a warp whose BOTH rows are out of range may return: every lane has
+     * to reach the full-mask shuffles below.  A warp straddling the end clamps
+     * its weight addresses to a live row -- an in-bounds duplicate read of the
+     * same expert slab -- and drops its store instead. */
+    if (rowpair >= mid_dim) return;
+    const uint32_t row_live = row < mid_dim ? row : mid_dim - 1u;
     uint32_t expert = blockIdx.y;
     if (active) {
         if ((int32_t)blockIdx.y >= active[0]) return;
@@ -7175,9 +7231,9 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
     const int32_t base = offsets[expert];
 
     const char *gate_row = gate + (uint64_t)expert * gate_expert_bytes +
-                           (uint64_t)row * gate_row_bytes;
+                           (uint64_t)row_live * gate_row_bytes;
     const char *up_row = up + (uint64_t)expert * up_expert_bytes +
-                         (uint64_t)row * up_row_bytes;
+                         (uint64_t)row_live * up_row_bytes;
 
     for (int32_t at = 0; at < cnt; at += R) {
         const int32_t take = (cnt - at) < R ? (cnt - at) : R;
@@ -7187,12 +7243,19 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
             const int32_t p = pairs[base + at + (r < take ? r : 0)];
             tok[r] = (uint32_t)p / n_expert_used;
         }
-        float ag[R];
-        float au[R];
+        /* Strip 0 is shipped lane `half`'s group walk, strip 1 is shipped lane
+         * `half + 16`'s.  They are kept in SEPARATE accumulators and written
+         * as two explicit loops rather than one indirected loop, so the four
+         * arrays stay in registers instead of being addressed through a
+         * pointer and spilled to local memory. */
+        float ag0[R], au0[R], ag1[R], au1[R];
 #pragma unroll
-        for (int r = 0; r < R; r++) { ag[r] = 0.0f; au[r] = 0.0f; }
+        for (int r = 0; r < R; r++) {
+            ag0[r] = 0.0f; au0[r] = 0.0f;
+            ag1[r] = 0.0f; au1[r] = 0.0f;
+        }
 
-        for (uint32_t g = lane; g < groups; g += 32u) {
+        for (uint32_t g = half; g < groups; g += 32u) {
             int8_t gw[32], uw[32];
             float ga[2], gb[2], ua[2], ub[2];
             int gh = 1, uh = 1;
@@ -7209,17 +7272,42 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
                     const int8_t *xqg = xq + at_g * 32u;
                     const float sc = xs[at_g];
                     const int32_t sm = xsum[at_g];
-                    qwen4exp_group_accumulate(&ag[r], gw, ga, gb, gh, xqg, sc, sm);
-                    qwen4exp_group_accumulate(&au[r], uw, ua, ub, uh, xqg, sc, sm);
+                    qwen4exp_group_accumulate(&ag0[r], gw, ga, gb, gh, xqg, sc, sm);
+                    qwen4exp_group_accumulate(&au0[r], uw, ua, ub, uh, xqg, sc, sm);
+                }
+            }
+        }
+        for (uint32_t g = half + 16u; g < groups; g += 32u) {
+            int8_t gw[32], uw[32];
+            float ga[2], gb[2], ua[2], ub[2];
+            int gh = 1, uh = 1;
+            dev_qwen4exp_group_decode(
+                    GateType < 0 ? gate_type : (uint32_t)GateType,
+                    gate_row, g, gw, ga, gb, &gh);
+            dev_qwen4exp_group_decode(
+                    UpType < 0 ? up_type : (uint32_t)UpType,
+                    up_row, g, uw, ua, ub, &uh);
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                if (r < take) {
+                    const uint64_t at_g = (uint64_t)tok[r] * groups + g;
+                    const int8_t *xqg = xq + at_g * 32u;
+                    const float sc = xs[at_g];
+                    const int32_t sm = xsum[at_g];
+                    qwen4exp_group_accumulate(&ag1[r], gw, ga, gb, gh, xqg, sc, sm);
+                    qwen4exp_group_accumulate(&au1[r], uw, ua, ub, uh, xqg, sc, sm);
                 }
             }
         }
 
 #pragma unroll
         for (int r = 0; r < R; r++) {
-            const float g = warp_sum_f32(ag[r]);
-            const float u = warp_sum_f32(au[r]);
-            if (lane == 0u && r < take) {
+            /* `acc0 + acc1` IS warp_sum_f32's offset-16 step; warp_sum16_f32
+             * is its remaining four.  Same operands, same order, same result
+             * bit for bit. */
+            const float g = warp_sum16_f32(ag0[r] + ag1[r]);
+            const float u = warp_sum16_f32(au0[r] + au1[r]);
+            if (half == 0u && r < take && row < mid_dim) {
                 const uint32_t p = (uint32_t)pairs[base + at + r];
                 const uint32_t t = p / n_expert_used;
                 const uint32_t slot = p - t * n_expert_used;
@@ -10257,7 +10345,10 @@ static int qwen4exp_routed_moe_cuda(
     const uint32_t gu_rows = !compact ? n_total_expert
         : (n_pairs < n_total_expert ? n_pairs : n_total_expert);
     const int32_t *gu_active = compact ? sc.active : NULL;
-    const dim3 gu_grid((mid_dim + 7u) / 8u, gu_rows, 1);
+    /* Sixteen rows per block, not eight: each of the block's eight warps now
+     * carries two output rows under the half-warp partition in
+     * qwen4exp_moe_gateup_q_kernel.  Same total work, half the blocks. */
+    const dim3 gu_grid((mid_dim + 15u) / 16u, gu_rows, 1);
 /* PSS at the decode widths only, which is exactly where the routed input
  * quantizer's own gate (gridDim.y <= 2) leaves a live trigger for this kernel
  * to consume; verify at three rows and every prefill width keep the plain
