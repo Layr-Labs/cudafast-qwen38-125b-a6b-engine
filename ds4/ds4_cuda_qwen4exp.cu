@@ -9164,6 +9164,49 @@ qwen4exp_shared_pipe_mma_kernel(
                 const int slot = i - t * SLOTS;
                 if (i < NS) sAs[t * SLOTS + slot] = rs[k];
             }
+            /* L2 PREFETCH, TWO STAGES AHEAD OF THE WEIGHT BLOCKS.
+             *
+             * This pipe's producers load their quantised blocks straight
+             * from the two weight slabs and consume them in the stage that
+             * issued the load, so every block is a cold miss: a slab is read
+             * once per call and nothing else in the round touches these
+             * bytes first.  The block a lane reads is chosen through the
+             * bit-reversed chunk order, so successive stages do not even
+             * walk the slab forwards -- there is no stride for the hardware
+             * to follow, and the producers, the side the pipe waits on,
+             * discover the latency at the point of use.
+             *
+             * The address below is the load's own expression evaluated at
+             * `s + AHEAD`: the same slab, the same row, the same block index
+             * through the same reversal.  prefetch.global.L2 asks for the
+             * line holding it and nothing more -- no register is written, no
+             * value is produced, and the load that eventually reads the
+             * block reads the same bytes whether the line was warm or cold.
+             * The guards are the staging loop's own: a stage that exists, a
+             * row inside the tensor and a block index inside the row. */
+#ifndef QSP_PIPE_L2_AHEAD
+#define QSP_PIPE_L2_AHEAD 2
+#endif
+            if (QSP_PIPE_L2_AHEAD != 0 && s + QSP_PIPE_L2_AHEAD < C::NSTAGE) {
+                const int sa = s + QSP_PIPE_L2_AHEAD;
+#pragma unroll
+                for (int k = 0; k < KB; k++) {
+                    const int i = pl + k * PT;
+                    const int m = i / (QSP_BN * SLOTS);
+                    const int rem = i - m * (QSP_BN * SLOTS);
+                    const int r = rem / SLOTS;
+                    const int slot = rem - r * SLOTS;
+                    const uint32_t c = qs_rev5((uint32_t)(sa * CH + slot / KMAX));
+                    const uint32_t g = c + 32u * (uint32_t)(slot % KMAX);
+                    if (i < NB && (row0 + (uint32_t)r) < n_dim && g < groups) {
+                        const char *pre = (m == 0 ? w0 : w1) +
+                            (uint64_t)(row0 + (uint32_t)r) *
+                                (m == 0 ? w0_row_bytes : w1_row_bytes) +
+                            (uint64_t)g * 34u;
+                        asm volatile("prefetch.global.L2 [%0];" :: "l"(pre));
+                    }
+                }
+            }
 #pragma unroll
             for (int k = 0; k < KB; k++) {
                 const int i = pl + k * PT;
