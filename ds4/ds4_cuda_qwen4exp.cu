@@ -9705,6 +9705,28 @@ static int qwen4exp_pdl_router_tree(void) {
     return v;
 }
 
+/* Hot routed-MoE valves are immutable after process startup.  Cache each
+ * decision at its call site so decode does not call getenv on every layer.
+ * Each helper retains the diagnostic environment switch and a cold-start
+ * sentinel, while avoiding the linear multi-key cache used by an old graft. */
+#define QW_ENV_CACHED_UNSET(NAME, FN) \
+static int FN(void) { \
+    static int v = -1; \
+    static int bypass = -1; \
+    if (bypass < 0) bypass = getenv("DS4_QWEN4EXP_NO_ENV_CACHE") != NULL; \
+    if (bypass) return getenv(NAME) == NULL ? 1 : 0; \
+    if (v < 0) v = getenv(NAME) == NULL ? 1 : 0; \
+    return v; \
+}
+QW_ENV_CACHED_UNSET("DS4_QWEN4EXP_NO_MMA", qw_no_mma)
+QW_ENV_CACHED_UNSET("DS4_QWEN4EXP_NO_EXPERT_COMPACT", qw_no_expert_compact)
+QW_ENV_CACHED_UNSET("DS4_QWEN4EXP_GENERIC_EXPERTS", qw_generic_experts)
+QW_ENV_CACHED_UNSET("DS4_QWEN4EXP_NO_GU_PAIR_TASKS", qw_no_gu_pair_tasks)
+QW_ENV_CACHED_UNSET("DS4_QWEN4EXP_NO_WIDE_VERIFY", qw_no_wide_verify)
+QW_ENV_CACHED_UNSET("DS4_QWEN4EXP_NO_DOWN_VECTOR", qw_no_down_vector)
+QW_ENV_CACHED_UNSET("DS4_QWEN4EXP_SERIAL_GROUP_SCAN", qw_serial_group_scan)
+#undef QW_ENV_CACHED_UNSET
+
 /* Quantise `rows` rows of `width` floats, where row r starts at
  * outer_stride * (r / inner_count) + inner_stride * (r % inner_count).  The
  * routed intermediate is addressed that way; a plain matrix passes
@@ -9739,7 +9761,7 @@ static int qwen4exp_moe_tile(uint32_t n_rows) {
     if (n_rows >= 8u) return 8;
     /* FOUR rows is the depth-3 verify: two R=2 tiles keep it on the same
      * decode-width kernels as the three-row call below. */
-    if (n_rows == 4u && getenv("DS4_QWEN4EXP_NO_WIDE_VERIFY") == NULL) return 2;
+    if (n_rows == 4u && qw_no_wide_verify()) return 2;
     if (n_rows >= 4u) return 4;
     /* The usual one-row decode and two-row verify need at most two live
      * accumulators.  Keep their weight reuse while reducing the padded
@@ -9749,7 +9771,7 @@ static int qwen4exp_moe_tile(uint32_t n_rows) {
      * tiles, the second with take 1 -- so it stays on the decode-width
      * kernels; R changes work sharing, not the arithmetic of a live row.
      * DS4_QWEN4EXP_NO_WIDE_VERIFY restores the eight-row tile. */
-    if (n_rows == 3u && getenv("DS4_QWEN4EXP_NO_WIDE_VERIFY") == NULL) return 2;
+    if (n_rows == 3u && qw_no_wide_verify()) return 2;
     return 8;
 }
 
@@ -9884,10 +9906,10 @@ static int qwen4exp_routed_moe_cuda(
         (gate_slab->type == DS4_QWEN4EXP_TY_q4_K ||
          gate_slab->type == DS4_QWEN4EXP_TY_q5_K ||
          gate_slab->type == DS4_QWEN4EXP_TY_q8_0) &&
-        getenv("DS4_QWEN4EXP_NO_MMA") == NULL &&
-        getenv("DS4_QWEN4EXP_NO_EXPERT_COMPACT") == NULL &&
-        getenv("DS4_QWEN4EXP_GENERIC_EXPERTS") == NULL &&
-        getenv("DS4_QWEN4EXP_NO_GU_PAIR_TASKS") == NULL;
+        qw_no_mma() &&
+        qw_no_expert_compact() &&
+        qw_generic_experts() &&
+        qw_no_gu_pair_tasks();
     /* Two task lists: the 32-pair tile's, and after it the heavy tile's. */
     const uint64_t task_bytes = pair_tasks ? 2u * (1u + 2u * task_capacity) * 4u : 0u;
 
@@ -9897,14 +9919,14 @@ static int qwen4exp_routed_moe_cuda(
      * three-row call is two tiles.  DS4_QWEN4EXP_NO_WIDE_VERIFY restores the
      * <= 2 gates. */
     const bool wide_verify = (n_tokens == 3u || n_tokens == 4u) &&
-        getenv("DS4_QWEN4EXP_NO_WIDE_VERIFY") == NULL;
+        qw_no_wide_verify();
     const bool down_vector = tile == 2 && (n_tokens <= 2u || wide_verify) &&
         n_expert_used <= 32u &&
         (down_slab->type == DS4_QWEN4EXP_TY_q8_0 ||
          ((n_tokens == 2u || wide_verify) &&
           down_slab->type == DS4_QWEN4EXP_TY_q5_1)) &&
-        getenv("DS4_QWEN4EXP_GENERIC_EXPERTS") == NULL &&
-        getenv("DS4_QWEN4EXP_NO_DOWN_VECTOR") == NULL;
+        qw_generic_experts() &&
+        qw_no_down_vector();
     uint64_t mq_offset = xq_bytes + idx_bytes + pair_bytes;
     /* Align short-down scratch; preserve shared input and metadata offsets. */
     if (down_vector) mq_offset = (mq_offset + 15u) & ~uint64_t(15u);
@@ -9940,7 +9962,7 @@ static int qwen4exp_routed_moe_cuda(
 
     const int small_group =
         n_tokens < 8u && n_total_expert <= QWEN4EXP_MOE_SCAN_THREADS &&
-        getenv("DS4_QWEN4EXP_SERIAL_GROUP_SCAN") == NULL;
+        qw_serial_group_scan();
     /* The caller passes `logits` exactly when ds4_gpu_qwen4exp_moe_router_fused_ok
      * said so and therefore did NOT select the experts itself.  That predicate is
      * the only decision point; if a caller reaches here disagreeing with it,
@@ -10016,7 +10038,7 @@ static int qwen4exp_routed_moe_cuda(
                 sc.counts, (const int32_t *)selected->ptr,
                 n_total_expert, n_pairs);
         if (n_total_expert <= QWEN4EXP_MOE_SCAN_THREADS &&
-            getenv("DS4_QWEN4EXP_SERIAL_GROUP_SCAN") == NULL) {
+            qw_serial_group_scan()) {
             qwen4exp_moe_group_scan_parallel_kernel<<<
                     1, QWEN4EXP_MOE_SCAN_THREADS, 0, stream>>>(
                     sc.offsets, sc.cursor, sc.active, sc.counts,
@@ -10134,7 +10156,7 @@ static int qwen4exp_routed_moe_cuda(
         (mid_dim % QW_MMA_BM) == 0 && (xgroups % QW_MMA_G) == 0 &&
         gate_slab->type != (uint32_t)DS4_QWEN4EXP_TY_q6_K &&
         up_slab->type != (uint32_t)DS4_QWEN4EXP_TY_q6_K &&
-        getenv("DS4_QWEN4EXP_NO_MMA") == NULL;
+        qw_no_mma();
 
     /* The down tile decides whether the mid projection has a float consumer.
      * When the down tile runs it reads the Q8_0 scratch (mq/ms/msum) and never
@@ -10153,7 +10175,7 @@ static int qwen4exp_routed_moe_cuda(
     /* One block row per expert the call CHOSE, not per expert that exists.
      * n_pairs bounds the number of distinct experts, and the kernel exits the
      * rows past active[0]. */
-    const int compact = getenv("DS4_QWEN4EXP_NO_EXPERT_COMPACT") == NULL;
+    const int compact = qw_no_expert_compact();
     const uint32_t gu_rows = !compact ? n_total_expert
         : (n_pairs < n_total_expert ? n_pairs : n_total_expert);
     const int32_t *gu_active = compact ? sc.active : NULL;
@@ -10188,7 +10210,7 @@ static int qwen4exp_routed_moe_cuda(
     /* Resolve the format once on the host, where tensor metadata already
      * lives.  This exposes fixed nibble decoding and a fixed one-half
      * accumulation to nvcc, without converting or copying any weight. */
-    const bool specialize = getenv("DS4_QWEN4EXP_GENERIC_EXPERTS") == NULL;
+    const bool specialize = qw_generic_experts();
     /* ---- the DMA staging arm of the routed q4_K gate/up prefill tile ----
      * Compile switch: -DDS4_GATEUP_DMA_BUILD=0 removes the arm entirely (the
      * q4_K specialisation then instantiates Dma = 0, which is the shipped
@@ -10740,7 +10762,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
     const unsigned threads = 256u;
     const size_t shared = (size_t)threads * sizeof(float);
     const bool specialize_shared =
-        getenv("DS4_QWEN4EXP_GENERIC_EXPERTS") == NULL;
+        qw_generic_experts();
 
     const uint32_t xgroups = in_dim / 32u;
     const uint32_t mgroups = mid_dim / 32u;
@@ -10840,7 +10862,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
     const bool vector_shared =
         (n_tokens == 2u ||
          ((n_tokens == 3u || n_tokens == 4u) &&
-          getenv("DS4_QWEN4EXP_NO_WIDE_VERIFY") == NULL)) &&
+          qw_no_wide_verify())) &&
         in_dim == 2560u && mid_dim == 640u && out_dim == 2560u &&
         specialize_shared &&
         gate_slab->type == DS4_QWEN4EXP_TY_q8_0 &&
