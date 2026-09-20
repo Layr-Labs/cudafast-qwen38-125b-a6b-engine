@@ -10,10 +10,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <float.h>
 #include <sys/mman.h>
 #define DIM 2560u
 #define CAP 2048u
-#define CAP2 8192u
+#define CAP2 16384u
 #define PREFIX 20000u
 #define TAIL 276u
 #define VOCAB 21000u
@@ -88,6 +89,7 @@ static void compare_r2_paths(const void *w,uint64_t bytes,uint64_t offset,
     for(uint32_t i=0;i<DIM;i++) a2[DIM+i]=activation[DIM-1u-i]*0.75f+0.125f;
     need(ds4_gpu_tensor_write(x2,0,a2,2ull*DIM*4u),"R2 activations");
     unsetenv("DS4_QWEN4EXP_NO_TARGET_NATIVE_SCREEN_R2");
+    unsetenv("DS4_MTP_NO_R2_EXACT_FUSION");
     for(uint32_t mode=0;mode<2;mode++) {
         if(mode==0)setenv("DS4_MTP_NO_FUSED_SCREEN_KEYS","1",1);
         else unsetenv("DS4_MTP_NO_FUSED_SCREEN_KEYS");
@@ -103,6 +105,16 @@ static void compare_r2_paths(const void *w,uint64_t bytes,uint64_t offset,
          "R2 fused-key shortlist differs");
     need(!memcmp(values[0],values[1],2ull*CAP2*4u),
          "R2 fused-key refinement differs");
+    setenv("DS4_MTP_NO_R2_EXACT_FUSION","1",1);
+    need(ds4_gpu_mtp_native_screen2(out2,ids2,scratch2,w,bytes,offset,
+         DIM,VOCAB,PREFIX,TAIL,x2,0)==CAP2,"R2 exact-fusion control");
+    need(ds4_gpu_tensor_read(out2,0,values[0],2ull*CAP2*4u)&&
+         ds4_gpu_tensor_read(ids2,0,selected_ids[0],2ull*CAP2*4u),
+         "R2 exact-fusion control outputs");
+    unsetenv("DS4_MTP_NO_R2_EXACT_FUSION");
+    need(!memcmp(selected_ids[0],selected_ids[1],2ull*CAP2*4u)&&
+         !memcmp(values[0],values[1],2ull*CAP2*4u),
+         "R2 exact-fusion parity");
     need(ds4_gpu_mtp_native_screen2(out2,ids2,scratch2,w,bytes,offset,
          DIM,VOCAB,PREFIX,TAIL,x2,1)==CAP2,"R2 deferred finite screen");
     need(ds4_gpu_tensor_read(out2,0,values[0],2ull*CAP2*4u)&&
@@ -136,7 +148,7 @@ static void compare_r2_paths(const void *w,uint64_t bytes,uint64_t offset,
         for(uint32_t i=0;i<TAIL;i++)
             need(row_ids[CAP2-TAIL+i]==VOCAB-TAIL+i,"R2 mandatory tail");
     }
-    need(ds4_gpu_tensor_fill_f32(scattered,-INFINITY,2ull*VOCAB)&&
+    need(ds4_gpu_tensor_fill_f32(scattered,-FLT_MAX,2ull*VOCAB)&&
          ds4_gpu_mtp_native_scatter2(scattered,out2,ids2,scratch2,winner2,
                                      CAP2,VOCAB,WIDTH,1)&&
          ds4_gpu_indexer_topk_tensor(winner2,scattered,VOCAB,2,1)&&
@@ -148,6 +160,34 @@ static void compare_r2_paths(const void *w,uint64_t bytes,uint64_t offset,
         need(!memcmp(&dense[(uint64_t)r*VOCAB+
                             selected_ids[1][(uint64_t)r*CAP2+i]],
                      &values[1][(uint64_t)r*CAP2+i],4),"R2 scattered value");
+    need(ds4_gpu_mtp_native_top1_map2(winner2,out2,ids2,scratch2,CAP2,
+         VOCAB,WIDTH,1)&&
+         ds4_gpu_tensor_read(winner2,0,winner_words,sizeof winner_words),
+         "R2 compact top1");
+    for(uint32_t r=0;r<2;r++) {
+        uint32_t best=0;
+        for(uint32_t i=1;i<VOCAB;i++)
+            if(dense[(uint64_t)r*VOCAB+i]>
+               dense[(uint64_t)r*VOCAB+best])best=i;
+        need(winner_words[r]==best,"R2 compact/dense top1 differs");
+    }
+    need(winner_words[2]==0u,"R2 compact deferred finite status");
+    float *edge=malloc(2ull*CAP2*4u);
+    need(edge!=NULL,"R2 edge allocation");
+    for(uint32_t i=0;i<CAP2;i++) edge[i]=-INFINITY;
+    edge[0]=NAN;
+    for(uint32_t i=0;i<CAP2;i++) edge[CAP2+i]=-FLT_MAX;
+    need(ds4_gpu_tensor_write(out2,0,edge,2ull*CAP2*4u)&&
+         ds4_gpu_mtp_native_top1_map2(winner2,out2,ids2,scratch2,CAP2,
+                                      VOCAB,WIDTH,1)&&
+         ds4_gpu_tensor_read(winner2,0,winner_words,sizeof winner_words),
+         "R2 compact top1 edge cases");
+    uint32_t missing=0;
+    while(missing<CAP2&&selected_ids[1][missing]==missing)missing++;
+    need(winner_words[0]==missing,"R2 compact omitted -FLT_MAX sentinel");
+    need(winner_words[1]==0,"R2 compact original-ID tie");
+    need(winner_words[2]==0u,"R2 compact edge status");
+    free(edge);
     setenv("DS4_QWEN4EXP_NO_TARGET_NATIVE_SCREEN_R2","1",1);
     need(ds4_gpu_mtp_native_screen2(out2,ids2,scratch2,w,bytes,offset,DIM,VOCAB,
          PREFIX,TAIL,x2,0)==0,"R2 valve fallback");
@@ -202,6 +242,11 @@ static void check_r2_nonfinite_rows(const void *w,uint64_t bytes,uint64_t offset
         uint32_t status[3];
         need(ds4_gpu_tensor_read(winner,0,status,sizeof status)&&status[2]==1u,
              bad?"R2 row-1 NaN status":"R2 row-0 NaN status");
+        need(ds4_gpu_mtp_native_top1_map2(winner,out,ids,scratch,CAP2,VOCAB,
+             WIDTH,1)&&ds4_gpu_tensor_read(winner,0,status,sizeof status)&&
+             status[2]==1u,
+             bad?"R2 compact row-1 NaN status":
+                 "R2 compact row-0 NaN status");
     }
     setenv("DS4_MTP_NO_DEFER_INVALID_FLAG","1",1);
     need(ds4_gpu_mtp_native_screen2(out,ids,scratch,w,bytes,offset,DIM,VOCAB,
