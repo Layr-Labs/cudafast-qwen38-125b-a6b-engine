@@ -7194,7 +7194,14 @@ __device__ __forceinline__ static void q8_mma_bar_arrive(int id, int count) {
 #define Q8_MMA_MINB 1
 #endif
 
-template <int WM, int WN, int MT, int NT, int G, int STAGES>
+/* CvtC: the weight block scales are converted half -> float BY THE CONSUMER,
+ * straight out of sB, instead of by the producer into a separate sWs buffer.
+ * It is the same halfword through the same __half2float feeding the same FMA
+ * in the same order, so it is bit-exact; what it removes is the producer's
+ * `bar.sync 15` rendezvous, which existed only because the conversion loop
+ * read scales that OTHER producer warps had stored.  See
+ * /root/qwen/notes/q8tile-plan.md S2. */
+template <int WM, int WN, int MT, int NT, int G, int STAGES, bool CvtC = false>
 struct q8_mma_pipe_cfg {
     static constexpr int BM = WM * MT * 16;
     static constexpr int BN = WN * NT * 8;
@@ -7212,7 +7219,7 @@ struct q8_mma_pipe_cfg {
     static constexpr int A_BYTES = BM * A_STRIDE;
     static constexpr int B_BYTES = BN * B_STRIDE;
     static constexpr int AS_BYTES = BM * G * 4;
-    static constexpr int WS_BYTES = G * BN * 4;          /* converted weight scales [gg][BN] */
+    static constexpr int WS_BYTES = CvtC ? 0 : (G * BN * 4); /* converted weight scales [gg][BN] */
     static constexpr int STAGE_BYTES = A_BYTES + B_BYTES + AS_BYTES + WS_BYTES;
     static constexpr int SMEM = STAGES * STAGE_BYTES;
     static_assert(G == 2 || G == 4 || G == 8, "G is the k32 steps per stage");
@@ -7223,7 +7230,7 @@ struct q8_mma_pipe_cfg {
     static_assert(B_GCD >= 4, "skew must keep word parity");
 };
 
-template <int WM, int WN, int MT, int NT, int G, int STAGES, bool ActPol = false>
+template <int WM, int WN, int MT, int NT, int G, int STAGES, bool ActPol = false, bool CvtC = false>
 __global__ __launch_bounds__((WM * WN + 4) * 32, Q8_MMA_MINB) static void
 matmul_q8_0_preq_rows_mma_pipe_kernel(float *out,
                                       const unsigned char *w,
@@ -7232,7 +7239,7 @@ matmul_q8_0_preq_rows_mma_pipe_kernel(float *out,
                                       uint64_t out_dim,
                                       uint32_t n_rows,
                                       uint64_t blocks) {
-    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES> C;
+    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES, CvtC> C;
     constexpr int BM = C::BM, BN = C::BN;
     const uint64_t act_pol = ActPol ? q8_mma_pol_last() : 0ull;
 
@@ -7365,6 +7372,19 @@ matmul_q8_0_preq_rows_mma_pipe_kernel(float *out,
                 const int c = idx - r * C::B_CHUNKS;
                 if (idx < BN * C::B_CHUNKS) q8_mma_sts_16(sB + r * C::B_STRIDE + c * 16, rb[k]);
             }
+            if (CvtC) {
+                /* The consumer converts the block scales itself, so no
+                 * producer reads another producer's stores and the four
+                 * warps never rendezvous: a warp whose loads have landed
+                 * issues the next stage without waiting for the slowest.
+                 * `bar.arrive` carries no memory ordering of its own (the
+                 * rendezvous below was providing it as a side effect) and
+                 * `__syncwarp` is intra-warp, so the stores are released
+                 * with an explicit block fence. */
+                __threadfence_block();
+                q8_mma_bar_arrive(1 + 2 * buf, BAR_COUNT);
+                continue;
+            }
             /* Every producer's stores are visible to every producer: the
              * scales below lie in rows another one stored. */
             q8_mma_bar_sync(15, C::PWARPS * 32);
@@ -7457,7 +7477,23 @@ matmul_q8_0_preq_rows_mma_pipe_kernel(float *out,
                     bf[0] = pw[0];
                     bf[1] = pw[4];
                 }
-                const float2 wsp = *(const float2 *)(sWs + gg * BN + c + (int)t4 * 2);
+                float2 wsp;
+                if (CvtC) {
+                    /* The two halfwords are the q8_0 block scales of output
+                     * rows c + t4*2 and c + t4*2 + 1 -- the same bytes the
+                     * producer fed to sWs.  B_STRIDE/4 = 4 (mod 32), so the
+                     * eight distinct rows a warp needs land on eight distinct
+                     * banks and the eight lanes sharing a t4 broadcast; skew
+                     * is even and gg*34 is even, so both are 2-byte aligned. */
+                    const unsigned char *ps = sB + (c + (int)t4 * 2) * C::B_STRIDE + skew + gg * 34;
+                    uint16_t hs0, hs1;
+                    memcpy(&hs0, ps, 2);
+                    memcpy(&hs1, ps + C::B_STRIDE, 2);
+                    wsp = make_float2(__half2float(__ushort_as_half(hs0)),
+                                      __half2float(__ushort_as_half(hs1)));
+                } else {
+                    wsp = *(const float2 *)(sWs + gg * BN + c + (int)t4 * 2);
+                }
                 int32_t d[MT][4];
 #pragma unroll
                 for (int mi = 0; mi < MT; mi++) q8_mma_m16n8k32_seeded(d[mi], af[mi], bf, magic);
@@ -18161,12 +18197,12 @@ extern "C" int ds4_gpu_q8_mma_pipe_last_bn(void) {
 /* The dynamic shared memory opt-in, once per instantiation; done eagerly
  * from ds4_gpu_enable_q8_dense_mma so no launch has to do it inside a
  * stream capture. */
-template <int WM, int WN, int MT, int NT, int G, int STAGES, bool ActPol = false>
+template <int WM, int WN, int MT, int NT, int G, int STAGES, bool ActPol = false, bool CvtC = false>
 static bool cuda_q8_mma_pipe_attr(void) {
-    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES> C;
+    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES, CvtC> C;
     static int state = 0;   /* 0 unset, 1 ok, -1 refused */
     if (state == 0) {
-        state = (cudaFuncSetAttribute(matmul_q8_0_preq_rows_mma_pipe_kernel<WM, WN, MT, NT, G, STAGES, ActPol>,
+        state = (cudaFuncSetAttribute(matmul_q8_0_preq_rows_mma_pipe_kernel<WM, WN, MT, NT, G, STAGES, ActPol, CvtC>,
                                       cudaFuncAttributeMaxDynamicSharedMemorySize,
                                       C::SMEM) == cudaSuccess) ? 1 : -1;
         if (state < 0) (void)cudaGetLastError();
@@ -18193,17 +18229,49 @@ static int cuda_q8_mma_pipe_actpol(void) {
     return cached;
 }
 
+/* DS4_CUDA_Q8_CVTSCALE=0 restores the shipped producer exactly (the
+ * CvtC=false instantiation IS the shipped kernel: the same template
+ * arguments it had before this parameter existed, so the same PTX).  Unset
+ * or anything else converts the weight block scales in the consumer and
+ * drops the producer's `bar.sync 15` rendezvous and its sWs buffer.  The
+ * arithmetic is untouched -- same halfword, same __half2float, same FMA
+ * order -- and the standalone harness word-compares all 1024 x out_dim
+ * outputs against the shipped ladder on five production shapes.
+ * /root/qwen/notes/q8tile-plan.md S2 has the measurements. */
+static int g_q8_mma_pipe_cvtscale = -1;
+static int cuda_q8_mma_pipe_cvtscale(void) {
+    if (g_q8_mma_pipe_cvtscale < 0) {
+        const char *e = getenv("DS4_CUDA_Q8_CVTSCALE");
+        g_q8_mma_pipe_cvtscale = (e != NULL && e[0] == '0') ? 0 : 1;
+    }
+    return g_q8_mma_pipe_cvtscale;
+}
+
 template <int WM, int WN, int MT, int NT, int G, int STAGES>
 static int cuda_q8_mma_pipe_launch(float *out, const unsigned char *w,
                                    const int8_t *xq, const float *xscale,
                                    uint64_t out_dim, uint32_t n_rows,
                                    uint64_t blocks) {
-    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES> C;
+    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES> C;          /* shipped smem */
+    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES, true> CC;    /* no sWs */
+    /* The BASE opt-in still decides whether this rung exists at all, so the
+     * valve can never make a rung launch that the shipped ladder refuses. */
     if (!cuda_q8_mma_pipe_attr<WM, WN, MT, NT, G, STAGES>()) return 0;
+    const bool cvtc = cuda_q8_mma_pipe_cvtscale() &&
+                      cuda_q8_mma_pipe_attr<WM, WN, MT, NT, G, STAGES, false, true>();
     const bool actpol = out_dim >= 4096u && cuda_q8_mma_pipe_actpol() &&
-                        cuda_q8_mma_pipe_attr<WM, WN, MT, NT, G, STAGES, true>();
+                        (cvtc ? cuda_q8_mma_pipe_attr<WM, WN, MT, NT, G, STAGES, true, true>()
+                              : cuda_q8_mma_pipe_attr<WM, WN, MT, NT, G, STAGES, true>());
     dim3 grid((n_rows + C::BM - 1u) / C::BM, (unsigned)((out_dim + C::BN - 1u) / C::BN), 1u);
-    if (actpol) {
+    if (cvtc) {
+        if (actpol) {
+            matmul_q8_0_preq_rows_mma_pipe_kernel<WM, WN, MT, NT, G, STAGES, true, true>
+                <<<grid, CC::THREADS, CC::SMEM, cuda_decode_stream()>>>(out, w, xq, xscale, out_dim, n_rows, blocks);
+        } else {
+            matmul_q8_0_preq_rows_mma_pipe_kernel<WM, WN, MT, NT, G, STAGES, false, true>
+                <<<grid, CC::THREADS, CC::SMEM, cuda_decode_stream()>>>(out, w, xq, xscale, out_dim, n_rows, blocks);
+        }
+    } else if (actpol) {
         matmul_q8_0_preq_rows_mma_pipe_kernel<WM, WN, MT, NT, G, STAGES, true>
             <<<grid, C::THREADS, C::SMEM, cuda_decode_stream()>>>(out, w, xq, xscale, out_dim, n_rows, blocks);
     } else {
@@ -18219,6 +18287,12 @@ static void cuda_q8_mma_pipe_prepare(void) {
     (void)cuda_q8_mma_pipe_attr<2, 2, 4, 4, 4, 2>();
     (void)cuda_q8_mma_pipe_attr<2, 4, 4, 4, 4, 2>();
     (void)cuda_q8_mma_pipe_attr<2, 8, 4, 4, 4, 2>();
+    (void)cuda_q8_mma_pipe_attr<2, 2, 4, 4, 4, 2, false, true>();
+    (void)cuda_q8_mma_pipe_attr<2, 4, 4, 4, 4, 2, false, true>();
+    (void)cuda_q8_mma_pipe_attr<2, 8, 4, 4, 4, 2, false, true>();
+    (void)cuda_q8_mma_pipe_attr<2, 2, 4, 4, 4, 2, true, true>();
+    (void)cuda_q8_mma_pipe_attr<2, 4, 4, 4, 4, 2, true, true>();
+    (void)cuda_q8_mma_pipe_attr<2, 8, 4, 4, 4, 2, true, true>();
 }
 
 /* The pipelined tile's shape ladder.  Returns 0 when the call is not one it
@@ -20432,24 +20506,31 @@ struct qwen_gdn_projection_args {
 #else
 #define QW_GDN_PROJ_ATTR __launch_bounds__(256)
 #endif
-template<int R, bool Stage=false>
+template<int R, bool Stage=false, bool Fixed=false, bool Async=false>
 __global__ QW_GDN_PROJ_ATTR
 static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
+    static_assert(!Async || Stage, "asynchronous GDN fill requires a panel");
     extern __shared__ uint4 qw_gdn_panel[];
     char *const gpanel = (char *)qw_gdn_panel;
     constexpr unsigned B=256u;
     constexpr bool FloatFirst=true, Streaming=false;
     constexpr int C=2, U=10;
-    const uint32_t split=(uint32_t)((a.od[0]+B/64u-1u)/(B/64u));
-    const uint32_t qblocks=split+(uint32_t)((a.od[1]+B/64u-1u)/(B/64u));
+    /* Fixed is selected only for the model's production geometry. The
+     * generic values remain the exact fallback for tests and other shapes. */
+    const uint64_t blocks=Fixed ? 80u : a.blocks;
+    const uint32_t split=Fixed ? 2560u
+        : (uint32_t)((a.od[0]+B/64u-1u)/(B/64u));
+    const uint32_t qblocks=Fixed ? 4096u
+        : split+(uint32_t)((a.od[1]+B/64u-1u)/(B/64u));
     const bool is_float=FloatFirst ? blockIdx.x<96u : blockIdx.x>=qblocks;
     if (!is_float) {
         const uint32_t qb=FloatFirst ? blockIdx.x-96u : blockIdx.x;
         const bool second=qb>=split;
         const uint32_t block=second?qb-split:qb;
         float *out=second?a.out[1]:a.out[0]; const unsigned char *w=second?a.weights[1]:a.weights[0];
-        const uint64_t out_dim=second?a.od[1]:a.od[0],blocks=a.blocks;
-        const uint32_t n_rows=a.n_rows;
+        const uint64_t out_dim=Fixed ? (second ? 6144u : 10240u)
+                                     : (second ? a.od[1] : a.od[0]);
+        const uint32_t n_rows=Fixed ? (uint32_t)R : a.n_rows;
         const int8_t *xq=a.xq; const float *xscale=a.xscale;
     if (Stage) {
         /* Four consecutive rows of one slab: one dense run, grid-strided by
@@ -20459,9 +20540,42 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
          * past the end are read by the last block's unaligned word pair and
          * then discarded by the funnel shift; the launch adds 16 bytes to the
          * request so that read stays inside the allocation. */
-        const uint64_t panel_bytes = (uint64_t)(B/64u) * blocks * 34u;
+        const uint64_t panel_bytes = Fixed ? 10880u
+            : (uint64_t)(B/64u) * blocks * 34u;
         const char *const gp = (const char *)w + (uint64_t)block * panel_bytes;
-        if (((uintptr_t)gp & 15u) == 0u) {
+        if (Async) {
+            /* The production panel is exactly 680 aligned 16-byte chunks.
+             * cp.async carries them straight to shared memory without tying
+             * up destination registers; the predecessor drain below overlaps
+             * their flight before the wait publishes the complete panel. */
+            for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
+                 i += (uint64_t)B * 16u) {
+                ds4_cp_async16<1>((float *)(void *)(gpanel + i),
+                                  (const float *)(const void *)(gp + i));
+            }
+            ds4_cp_async_commit();
+        } else if (Fixed && ((uintptr_t)gp & 15u) == 0u) {
+            /* Production panel: 680 aligned pieces; every thread copies two,
+             * and lanes 0..167 copy the final piece. */
+            const uint64_t i=(uint64_t)threadIdx.x*16u;
+            *(uint4 *)(gpanel+i)=*(const uint4 *)(const void *)(gp+i);
+            *(uint4 *)(gpanel+i+4096u)=
+                *(const uint4 *)(const void *)(gp+i+4096u);
+            if (threadIdx.x<168u)
+                *(uint4 *)(gpanel+i+8192u)=
+                    *(const uint4 *)(const void *)(gp+i+8192u);
+        } else if (Fixed) {
+            /* Word-aligned synthetic fallback; generic shapes keep the
+             * promoted tail-safe implementation below. */
+            const uint64_t i=(uint64_t)threadIdx.x*4u;
+#pragma unroll
+            for (unsigned j=0;j<10u;j++)
+                *(uint32_t *)(gpanel+i+(uint64_t)j*1024u)=
+                    *(const uint32_t *)(const void *)(gp+i+(uint64_t)j*1024u);
+            if (threadIdx.x<160u)
+                *(uint32_t *)(gpanel+i+10240u)=
+                    *(const uint32_t *)(const void *)(gp+i+10240u);
+        } else if (((uintptr_t)gp & 15u) == 0u) {
             for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
                  i += (uint64_t)B * 16u) {
                 if (i + 16u <= panel_bytes)
@@ -20482,6 +20596,7 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
         /* The drain absorbs the fill; the barrier is nearly satisfied by the
          * time it is reached.  Order matters -- see the header. */
         QWEN4EXP_PDL_SYNC();
+        if (Async) ds4_cp_async_wait<0>();
         __syncthreads();
     }
     const uint32_t local_row = threadIdx.x >> 6u;
@@ -20551,6 +20666,7 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
                 }
             }
         }
+#pragma unroll
         for (uint64_t b = group + 32u; b < blocks; b += 32u) {
             /* Name both lanes of every live pair even if independent
              * scheduling has temporarily separated their execution. */
@@ -21048,22 +21164,40 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
             ((((uintptr_t)a.weights[0]|(uintptr_t)a.weights[1])&3u)==0u) &&
             gdn_panel<=49152u &&
             getenv("DS4_QWEN4EXP_NO_GDN_PANEL")==NULL;
+        const int gdn_async = gdn_stage &&
+            ((((uintptr_t)a.weights[0]|(uintptr_t)a.weights[1])&15u)==0u) &&
+            getenv("DS4_QWEN4EXP_NO_GDN_CP_ASYNC")==NULL;
+        const int gdn_fixed =
+            qkv_dim==10240u && gate_dim==6144u &&
+            getenv("DS4_QWEN4EXP_NO_GDN_FIXED")==NULL;
         /* PDL consumer: the stream predecessor is the mixed-input quantizer,
          * which triggers at its top at these decode widths. */
         if (rows==1u) {
-            if (gdn_stage)
-                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1,true>),
-                                    grid, 256, gdn_panel, cuda_decode_stream(), a);
+            if (gdn_fixed && gdn_async)
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1,true,true,true>), grid, 256, gdn_panel, cuda_decode_stream(), a);
+            else if (gdn_fixed && gdn_stage)
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1,true,true,false>), grid, 256, gdn_panel, cuda_decode_stream(), a);
+            else if (gdn_fixed)
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1,false,true,false>), grid, 256, 0, cuda_decode_stream(), a);
+            else if (gdn_async)
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1,true,false,true>), grid, 256, gdn_panel, cuda_decode_stream(), a);
+            else if (gdn_stage)
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1,true,false,false>), grid, 256, gdn_panel, cuda_decode_stream(), a);
             else
-                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1>),
-                                    grid, 256, 0, cuda_decode_stream(), a);
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1,false,false,false>), grid, 256, 0, cuda_decode_stream(), a);
         } else {
-            if (gdn_stage)
-                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2,true>),
-                                    grid, 256, gdn_panel, cuda_decode_stream(), a);
+            if (gdn_fixed && gdn_async)
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2,true,true,true>), grid, 256, gdn_panel, cuda_decode_stream(), a);
+            else if (gdn_fixed && gdn_stage)
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2,true,true,false>), grid, 256, gdn_panel, cuda_decode_stream(), a);
+            else if (gdn_fixed)
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2,false,true,false>), grid, 256, 0, cuda_decode_stream(), a);
+            else if (gdn_async)
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2,true,false,true>), grid, 256, gdn_panel, cuda_decode_stream(), a);
+            else if (gdn_stage)
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2,true,false,false>), grid, 256, gdn_panel, cuda_decode_stream(), a);
             else
-                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2>),
-                                    grid, 256, 0, cuda_decode_stream(), a);
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2,false,false,false>), grid, 256, 0, cuda_decode_stream(), a);
         }
         return cuda_ok(cudaGetLastError(),"GDN four projections launch");
     }
