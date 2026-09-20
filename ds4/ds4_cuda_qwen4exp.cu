@@ -13206,6 +13206,50 @@ qwen4exp_hc_up_mix_pipe_kernel(
                 const int i = pl + k * PT;
                 if (i < NS) sAs[i] = rs[k];             /* [t][slot] */
             }
+            /* L2 PREFETCH, TWO STAGES AHEAD OF THE WEIGHT BLOCKS.
+             *
+             * The producers read this tile's quantised blocks straight from
+             * the weight slab and consume them in the stage that issued the
+             * load, so every block is a cold miss: the slab is read once per
+             * call and nothing else in the round touches these bytes first.
+             * A stage advances the block index by a fixed step within the
+             * same rows, but the steps are separated by a barrier handoff
+             * and a full round of shared stores, so the memory system never
+             * sees the run of consecutive requests it would need to run
+             * ahead on its own.  The producers are the side the pipe waits
+             * on, so that latency is paid inside the stage they are trying
+             * to retire.
+             *
+             * The address below is the load's own expression evaluated at
+             * `s + AHEAD`: the same row from the same head and channel, the
+             * same block index advanced by that many stage steps, the same
+             * thirty-four-byte stride.  prefetch.global.L2 asks for the line
+             * holding it and nothing more -- no register is written, no
+             * value produced, and the load that eventually reads the block
+             * reads the same bytes whether the line was warm or cold.  The
+             * guards are the staging loop's own: a stage that exists, a
+             * channel inside the embedding and a block inside the row. */
+#ifndef QHP_PIPE_L2_AHEAD
+#define QHP_PIPE_L2_AHEAD 2
+#endif
+            if (QHP_PIPE_L2_AHEAD != 0 && s + QHP_PIPE_L2_AHEAD < nstage) {
+                const uint64_t ga = g0 + (uint64_t)QHP_PIPE_L2_AHEAD * QHP_G;
+#pragma unroll
+                for (int k = 0; k < KB; k++) {
+                    const int i = pl + k * PT;
+                    const int r = i / QHP_G;
+                    const int slot = i - r * QHP_G;
+                    const uint64_t g = ga + (uint64_t)slot;
+                    const int wn = r >> 5, h = (r >> 3) & 3, j = r & 7;
+                    const uint32_t d = d0 + (uint32_t)(wn * 8 + j);
+                    if (i < NB && d < n_embd && g < blocks) {
+                        const char *pre = (const char *)(const void *)
+                            (w + ((uint64_t)h * n_embd + d) * w_row_bytes +
+                             g * 34u);
+                        asm volatile("prefetch.global.L2 [%0];" :: "l"(pre));
+                    }
+                }
+            }
 #pragma unroll
             for (int k = 0; k < KB; k++) {
                 const int i = pl + k * PT;
