@@ -7363,6 +7363,36 @@ __global__ static void qwen4exp_moe_down_q_kernel(
     const uint32_t take = n_tokens - tok0 < (uint32_t)R ? n_tokens - tok0
                                                         : (uint32_t)R;
     const uint64_t panel_bytes = (uint64_t)8u * down_row_bytes;
+    /* THE ACTIVATION TILE, published by the panel's own barrier.
+     *
+     * A block's eight warps all work the same (slot, token) step, and at that
+     * step every one of them reads the SAME quantised mid row: the same
+     * `groups * 32` payload bytes, the same `groups` scales and the same
+     * `groups` sums, because the activation depends on the step and not on
+     * the output row a warp owns.  Eight warps therefore issue eight copies
+     * of that request, and the out_dim/8 blocks of the grid issue it again
+     * once each -- the panel arm removed exactly this duplication on the
+     * WEIGHT side and left it standing on the activation side.
+     *
+     * The tile is small: at the live shape twenty groups is 640 payload bytes
+     * plus 160 bytes of scales and sums, so two buffers add 1,600 bytes to a
+     * 10,880-byte panel pair and the kernel keeps its residency.  It is
+     * filled by the same lambda that fills the panel, into the same buffer
+     * parity, and it is published and retired by the barrier the panel
+     * already has: no barrier is added, moved or removed.
+     *
+     * Bit-exact: a verbatim byte image of the same span, read at the same
+     * offsets by the same lanes, handed to the same accumulate in the same
+     * order.  The vector accumulate's sixteen-byte reads stay aligned because
+     * the panel pair and the tile stride are both multiples of sixteen.
+     * -DDS4_DOWN_ACT_TILE=0 restores the direct global reads. */
+#ifndef DS4_DOWN_ACT_TILE
+#define DS4_DOWN_ACT_TILE 1
+#endif
+    const bool act_on = Stage && (DS4_DOWN_ACT_TILE != 0) &&
+        (groups & 3u) == 0u && ((uintptr_t)mq & 15u) == 0u;
+    const uint64_t act_bytes = act_on ? (uint64_t)groups * 40u : 0u;
+    char *const sact = spanel + 2u * panel_bytes;
 
     /* Up to 32 IDs, freshly loaded on every call or graph replay. */
     int32_t route[R];
@@ -7408,12 +7438,13 @@ __global__ static void qwen4exp_moe_down_q_kernel(
      * rather than incremented, so an out-of-range expert cannot desynchronise
      * the parity from the fill sequence, and acc[r] still absorbs slots 0..
      * n_expert_used-1 in ascending order for each token. */
-    auto qw_fill_step = [&](uint32_t slot, uint32_t rr, char *const dst) {
+    auto qw_fill_step = [&](uint32_t slot, uint32_t rr, uint32_t buf) {
 #pragma unroll
         for (int r = 0; r < R; r++) {
             if ((uint32_t)r == rr) {
                 const int32_t e = __shfl_sync(0xffffffffu, route[r], slot);
                 if (e < 0 || (uint32_t)e >= n_total_expert) return;
+                char *const dst = spanel + (uint64_t)buf * panel_bytes;
                 const char *const gp = down +
                     (uint64_t)(uint32_t)e * down_expert_bytes +
                     (uint64_t)row0 * down_row_bytes;
@@ -7426,11 +7457,30 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                         *(uint4 *)(dst + o) = *(const uint4 *)(gp + o);
                     }
                 }
+                if (act_on) {
+                    const uint64_t mr =
+                        (uint64_t)(tok0 + rr) * n_expert_used + slot;
+                    char *const ad = sact + (uint64_t)buf * act_bytes;
+                    const char *const qs = (const char *)(const void *)
+                        (mq + mr * (uint64_t)groups * 32u);
+                    for (uint64_t o = (uint64_t)threadIdx.x * 16u;
+                         o < (uint64_t)groups * 32u;
+                         o += (uint64_t)blockDim.x * 16u)
+                        *(uint4 *)(ad + o) =
+                            *(const uint4 *)(const void *)(qs + o);
+                    float *const as =
+                        (float *)(void *)(ad + (uint64_t)groups * 32u);
+                    int32_t *const am = (int32_t *)(void *)(as + groups);
+                    for (uint32_t i = threadIdx.x; i < groups; i += blockDim.x) {
+                        as[i] = ms[mr * (uint64_t)groups + i];
+                        am[i] = msum[mr * (uint64_t)groups + i];
+                    }
+                }
             }
         }
     };
     if (Stage) {
-        qw_fill_step(0u, 0u, spanel);
+        qw_fill_step(0u, 0u, 0u);
         if (Async) qw_cpasync_commit();
     }
     /* PDL consumer fence (ds4_cuda_qwen4exp.cuh).  Everything above it reads
@@ -7472,8 +7522,7 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                     const uint32_t nslot =
                         (uint32_t)r + 1u < take ? slot : slot + 1u;
                     if (nslot < n_expert_used) {
-                        qw_fill_step(nslot, nr, spanel +
-                                     (uint64_t)((step + 1u) & 1u) * panel_bytes);
+                        qw_fill_step(nslot, nr, (step + 1u) & 1u);
                         if (Async) qw_cpasync_commit();
                     }
                 }
@@ -7487,6 +7536,13 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                     : down + (uint64_t)(uint32_t)e * down_expert_bytes +
                       (uint64_t)row * down_row_bytes;
                 const uint64_t mrow = (uint64_t)t * n_expert_used + slot;
+                const char *const abuf = act_on
+                    ? sact + (uint64_t)(step & 1u) * act_bytes : NULL;
+                const float *const as = act_on
+                    ? (const float *)(const void *)(abuf + (uint64_t)groups * 32u)
+                    : NULL;
+                const int32_t *const am = act_on
+                    ? (const int32_t *)(const void *)(as + groups) : NULL;
                 for (uint32_t g = lane; g < groups; g += 32u) {
                     int8_t wq[32];
                     float wa[2], wb[2];
@@ -7495,13 +7551,17 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                             DownType < 0 ? down_type : (uint32_t)DownType,
                             drow, g, wq, wa, wb, &halves);
                     const uint64_t at_g = mrow * groups + g;
+                    const int8_t *const xqg = act_on
+                        ? (const int8_t *)(const void *)(abuf + (uint64_t)g * 32u)
+                        : mq + at_g * 32u;
+                    const float xsc = act_on ? as[g] : ms[at_g];
+                    const int32_t xsm = act_on ? am[g] : msum[at_g];
                     if (Vector && halves == 1)
                         qwen4exp_shared_vector_accumulate(&acc[r], wq, wa[0], wb[0],
-                            mq + at_g * 32u, ms[at_g], msum[at_g]);
+                                                          xqg, xsc, xsm);
                     else
                         qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves,
-                                                  mq + at_g * 32u, ms[at_g],
-                                                  msum[at_g]);
+                                                  xqg, xsc, xsm);
                 }
             }
         }
@@ -10700,7 +10760,15 @@ static int qwen4exp_routed_moe_cuda(
          * exactly two live buffers to overlap a fill with the preceding
          * step's compute, which is half what slot-level double buffering
          * needed and keeps the kernel at 64 warps/SM. */
-        const uint64_t dn_shared = 2u * dn_panel;
+        /* The activation tile rides behind the two panels, two buffers of
+         * `groups * 40` bytes on the same parity.  The predicates are the
+         * kernel's own (a group count that is a multiple of four and a
+         * 16-byte-aligned mq, which this branch already requires), so the
+         * allocation and the kernel's use of it cannot disagree. */
+        const uint64_t dn_act =
+            (DS4_DOWN_ACT_TILE != 0) && (mgroups & 3u) == 0u
+                ? (uint64_t)mgroups * 40u : 0u;
+        const uint64_t dn_shared = 2u * (dn_panel + dn_act);
         const int dn_stage =
             (out_dim % 8u) == 0u &&
             (dn_panel % 16u) == 0u &&
