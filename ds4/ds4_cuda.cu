@@ -20432,9 +20432,10 @@ struct qwen_gdn_projection_args {
 #else
 #define QW_GDN_PROJ_ATTR __launch_bounds__(256)
 #endif
-template<int R, bool Stage=false>
+template<int R, bool Stage=false, bool Async=false>
 __global__ QW_GDN_PROJ_ATTR
 static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
+    static_assert(!Async || Stage, "asynchronous GDN fill requires a panel");
     extern __shared__ uint4 qw_gdn_panel[];
     char *const gpanel = (char *)qw_gdn_panel;
     constexpr unsigned B=256u;
@@ -20461,7 +20462,18 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
          * request so that read stays inside the allocation. */
         const uint64_t panel_bytes = (uint64_t)(B/64u) * blocks * 34u;
         const char *const gp = (const char *)w + (uint64_t)block * panel_bytes;
-        if (((uintptr_t)gp & 15u) == 0u) {
+        if (Async) {
+            /* The production panel is exactly 680 aligned 16-byte chunks.
+             * cp.async carries them straight to shared memory without tying
+             * up destination registers; the predecessor drain below overlaps
+             * their flight before the wait publishes the complete panel. */
+            for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
+                 i += (uint64_t)B * 16u) {
+                ds4_cp_async16<1>((float *)(void *)(gpanel + i),
+                                  (const float *)(const void *)(gp + i));
+            }
+            ds4_cp_async_commit();
+        } else if (((uintptr_t)gp & 15u) == 0u) {
             for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
                  i += (uint64_t)B * 16u) {
                 if (i + 16u <= panel_bytes)
@@ -20482,6 +20494,7 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
         /* The drain absorbs the fill; the barrier is nearly satisfied by the
          * time it is reached.  Order matters -- see the header. */
         QWEN4EXP_PDL_SYNC();
+        if (Async) ds4_cp_async_wait<0>();
         __syncthreads();
     }
     const uint32_t local_row = threadIdx.x >> 6u;
@@ -21048,17 +21061,26 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
             ((((uintptr_t)a.weights[0]|(uintptr_t)a.weights[1])&3u)==0u) &&
             gdn_panel<=49152u &&
             getenv("DS4_QWEN4EXP_NO_GDN_PANEL")==NULL;
+        const int gdn_async = gdn_stage &&
+            ((((uintptr_t)a.weights[0]|(uintptr_t)a.weights[1])&15u)==0u) &&
+            getenv("DS4_QWEN4EXP_NO_GDN_CP_ASYNC")==NULL;
         /* PDL consumer: the stream predecessor is the mixed-input quantizer,
          * which triggers at its top at these decode widths. */
         if (rows==1u) {
-            if (gdn_stage)
+            if (gdn_async)
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1,true,true>),
+                                    grid, 256, gdn_panel, cuda_decode_stream(), a);
+            else if (gdn_stage)
                 QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1,true>),
                                     grid, 256, gdn_panel, cuda_decode_stream(), a);
             else
                 QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1>),
                                     grid, 256, 0, cuda_decode_stream(), a);
         } else {
-            if (gdn_stage)
+            if (gdn_async)
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2,true,true>),
+                                    grid, 256, gdn_panel, cuda_decode_stream(), a);
+            else if (gdn_stage)
                 QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2,true>),
                                     grid, 256, gdn_panel, cuda_decode_stream(), a);
             else
