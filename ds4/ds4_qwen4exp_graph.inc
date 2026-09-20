@@ -12,22 +12,6 @@
 #include "ds4_qwen4exp_qsa_scratch.h"
 #include "ds4_qwen4exp_gdn_replay.h"
 
-/* CUDA supplies the native output-row screen.  Keep these weak just like the
- * MTP hook binding does: Metal/ROCm and CPU-only test links have no such
- * symbol and retain the full-vocabulary head without a backend stub. */
-#if defined(__GNUC__)
-extern int ds4_gpu_mtp_native_screen2_init(
-        uint32_t, uint64_t *, uint32_t *) __attribute__((weak));
-extern int ds4_gpu_mtp_native_screen2(
-        ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *, const void *,
-        uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t,
-        const ds4_gpu_tensor *, int) __attribute__((weak));
-extern int ds4_gpu_mtp_native_scatter2(
-        ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *,
-        const ds4_gpu_tensor *, ds4_gpu_tensor *, uint32_t, uint32_t,
-        uint32_t, int) __attribute__((weak));
-#endif
-
 /* ======================================================================
  * Sizing.
  * ====================================================================== */
@@ -362,6 +346,11 @@ struct ds4_qwen4exp_session {
     ds4_gpu_tensor *gdn_state_snapshot[DS4_MAX_LAYER];
     ds4_gpu_tensor *ple_conv_snapshot;
     ds4_ple_history ple_history_rows[DS4_QWEN4EXP_IMPLEMENTED_DEPTH];
+    /* The gather-ahead worker: a thread that faults and dequantizes the NEXT
+     * round's n-gram rows while the draft head forward occupies the device,
+     * so the verify's gather adopts finished rows instead of stalling the
+     * command stream on storage.  NULL until the first offer allocates it. */
+    struct qw_ple_ahead_state *ple_ahead;
     /* How many slots the CURRENT forward is writing.  Armed by
      * ds4_qwen4exp_graph_verify_rows and zero everywhere else, so a prefill
      * chunk of 512 never asks for 512 slots. */
@@ -375,7 +364,6 @@ struct ds4_qwen4exp_session {
      * but argmax runs before the command batch closes and only these indices
      * cross to the host until acceptance selects one full frontier row. */
     uint32_t        spec_top1_rows;
-    bool            target_native_deferred;
     uint32_t        indexer_valid_blocks;
     uint32_t        head_cache_pos;
 
@@ -449,13 +437,6 @@ struct ds4_qwen4exp_session {
 
     ds4_gpu_tensor *logits;
     ds4_gpu_tensor *spec_top1;
-    /* CUDA R2 target-head screen.  One fused coarse pass shares the weight
-     * stream while ranking and exact refinement remain independent per row.
-     * One-row verification deliberately retains the exact full head. */
-    ds4_gpu_tensor *target_native_scratch2;
-    ds4_gpu_tensor *target_native_ids;
-    ds4_gpu_tensor *target_native_logits;
-    uint32_t        target_native_capacity;
 
     /* PREFILL ONLY.  True while `hyper` still owes the last block's inject:
      * the value the model means is hyper + block_out * inject, and the next
@@ -877,27 +858,7 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
     s->logits       = qwen4exp_alloc_zeroed(
             (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * cfg->n_vocab * f, &ok);
     s->spec_top1     = qwen4exp_alloc_zeroed(
-            ((uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT + 1u) * sizeof(int32_t), &ok);
-    if (ok && getenv("DS4_QWEN4EXP_NO_TARGET_NATIVE_SCREEN") == NULL &&
-        ds4_gpu_mtp_native_screen2_init && ds4_gpu_mtp_native_screen2 &&
-        ds4_gpu_mtp_native_scatter2) {
-        uint64_t scratch2_bytes = 0;
-        uint32_t capacity = 0;
-        const int rc = ds4_gpu_mtp_native_screen2_init(
-                cfg->n_vocab, &scratch2_bytes, &capacity);
-        if (rc < 0) {
-            ok = false;
-        } else if (rc > 0 && scratch2_bytes && capacity &&
-                   capacity <= cfg->n_vocab) {
-            s->target_native_scratch2 =
-                qwen4exp_alloc_zeroed(scratch2_bytes, &ok);
-            s->target_native_ids = qwen4exp_alloc_zeroed(
-                2ull * capacity * sizeof(uint32_t), &ok);
-            s->target_native_logits = qwen4exp_alloc_zeroed(
-                2ull * capacity * sizeof(float), &ok);
-            if (ok) s->target_native_capacity = capacity;
-        }
-    }
+            (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * sizeof(int32_t), &ok);
 #ifdef DS4_TEST_HOOKS
     s->final_mixer_snapshot = qwen4exp_alloc_zeroed(B * H * E * f, &ok);
 #endif
@@ -909,6 +870,9 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
     }
     return s;
 }
+
+static void qw_ple_ahead_destroy(ds4_qwen4exp_session *s);
+
 
 void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     if (!s) return;
@@ -936,6 +900,9 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->ple_key);
     ds4_gpu_tensor_free(s->ple_aux);
     ds4_gpu_tensor_free(s->ple_value);
+    /* The gather-ahead worker may be mid-fault inside the table mapping;
+     * it is joined before anything it reads can be freed or unmapped. */
+    qw_ple_ahead_destroy(s);
     free(s->ple_ids);
     free(s->ple_rows_host);
     ds4_gpu_tensor_free(s->d_pos);
@@ -981,9 +948,6 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->shexp_gate);
     ds4_gpu_tensor_free(s->logits);
     ds4_gpu_tensor_free(s->spec_top1);
-    ds4_gpu_tensor_free(s->target_native_scratch2);
-    ds4_gpu_tensor_free(s->target_native_ids);
-    ds4_gpu_tensor_free(s->target_native_logits);
 #ifdef DS4_TEST_HOOKS
     ds4_gpu_tensor_free(s->final_mixer_snapshot);
 #endif
@@ -1292,6 +1256,226 @@ static void qw_ple_pool_init(void) {
     pthread_mutex_unlock(&g_qw_ple_pool.mutex);
 }
 
+/* ======================================================================
+ * The gather-ahead worker.
+ *
+ * A speculative round's verify vector is known the moment the draft head
+ * forward returns it: the fed token plus the chain.  The gather that turns
+ * those tokens into dequantized rows is pure host work -- hash, fault, read,
+ * dequantize -- and today it runs inside the verify's forward, on the
+ * critical path, while the device sits idle between the draft and the
+ * verify.  This worker takes the same vector as soon as the draft names it
+ * and does the faulting and dequantizing while the head forward and the
+ * inter-round host gap still have the wall clock.
+ *
+ * CORRECTNESS IS A COMPARE, NOT A CONTRACT.  The worker never touches the
+ * session's history or buffers: it snapshots the entry history and the hash
+ * constants at offer time, keeps its own staging, and the gather adopts the
+ * staged result only when the call's token vector, its length and the
+ * session's live entry history all match the staged ones byte for byte.
+ * Anything else -- a trimmed chain, an invalidated draft, a serial forward
+ * in between, a reset -- misses and the gather runs exactly the serial code
+ * it always ran, so a stale or partial staging can only waste work, never
+ * change a value.  The staged per-row histories are the same snapshots the
+ * armed path writes: `rows[t]` is the history after token t.
+ * ====================================================================== */
+struct qw_ple_ahead_state {
+    pthread_mutex_t   mutex;
+    pthread_cond_t    work_cond;
+    pthread_cond_t    done_cond;
+    pthread_t         thread;
+    int               started;
+    int               quit;
+    uint64_t          gen;          /* bumped on every reset               */
+    uint32_t          staged_n;     /* tokens offered for this generation  */
+    uint32_t          done_n;       /* tokens the worker finished          */
+    int               failed;       /* a row id fell past the table        */
+    ds4_ple_constants constants;    /* snapshot taken at the reset         */
+    ds4_qwen4exp_ple_table ple;     /* the table mapping, by value         */
+    ds4_ple_history   entry;        /* history the staged vector starts at */
+    int32_t           tokens[DS4_QWEN4EXP_MTP_MAX_COMMIT];
+    uint64_t         *ids;          /* [MAX_COMMIT][head_count]            */
+    float            *rows_host;    /* [MAX_COMMIT][ple_embd]              */
+    ds4_ple_history   rows[DS4_QWEN4EXP_MTP_MAX_COMMIT];
+};
+
+static void *qw_ple_ahead_worker(void *arg) {
+    struct qw_ple_ahead_state *a = (struct qw_ple_ahead_state *)arg;
+    const uint32_t blocks_per_row =
+        DS4_N_PLE_ROW_DIM / DS4_PLE_IQ4_NL_BLOCK_ELEMS;
+    uint64_t wgen = 0;
+    uint32_t next = 0;
+    ds4_ple_history hist;
+    memset(&hist, 0, sizeof(hist));
+    pthread_mutex_lock(&a->mutex);
+    for (;;) {
+        while (!a->quit &&
+               (a->gen == wgen ? next >= a->staged_n : a->staged_n == 0u)) {
+            pthread_cond_wait(&a->work_cond, &a->mutex);
+        }
+        if (a->quit) break;
+        if (a->gen != wgen) {
+            /* New vector: adopt the generation and its entry history. */
+            wgen = a->gen;
+            next = 0;
+            hist = a->entry;
+        }
+        const uint32_t t = next;
+        const int32_t tok = a->tokens[t];
+        pthread_mutex_unlock(&a->mutex);
+
+        /* The same ids and the same bytes the serial gather produces: the
+         * hash runs over the worker's own history, the row comes out of the
+         * same mapping, and the dequant is the same call. */
+        uint64_t ids[DS4_PLE_MAX_HEADS];
+        ds4_ple_row_ids(&a->constants, &hist, &tok, 1u, ids);
+        int ok = 1;
+        float *dst = a->rows_host + (uint64_t)t * DS4_N_PLE_EMBD;
+        for (uint32_t h = 0; h < DS4_N_PLE_HEAD && ok; h++) {
+            const uint8_t *quant = ds4_qwen4exp_ple_row(&a->ple, ids[h]);
+            if (!quant) {
+                ok = 0;
+                break;
+            }
+            ds4_ple_dequant_iq4_nl(quant, blocks_per_row, dst);
+            dst += DS4_N_PLE_ROW_DIM;
+        }
+
+        pthread_mutex_lock(&a->mutex);
+        if (a->gen == wgen && !a->quit) {
+            if (!ok) {
+                a->failed = 1;
+                next = UINT32_MAX;   /* stop this generation */
+            } else {
+                memcpy(a->ids + (uint64_t)t * DS4_N_PLE_HEAD, ids,
+                       (uint64_t)DS4_N_PLE_HEAD * sizeof(uint64_t));
+                a->rows[t] = hist;
+                a->done_n = t + 1u;
+            }
+            pthread_cond_broadcast(&a->done_cond);
+        }
+    }
+    pthread_mutex_unlock(&a->mutex);
+    return NULL;
+}
+
+/* Offer the next round's verify vector.  `append == false` starts a new
+ * vector at the fed token; `append == true` adds the draft the head just
+ * returned.  A vector longer than the commit envelope is dropped whole --
+ * the gather will miss and run serially, which is the same outcome a deeper
+ * chain gets from a partial staging anyway. */
+void ds4_qwen4exp_ple_gather_offer(ds4_qwen4exp_session       *s,
+                                   const ds4_qwen4exp_weights *w,
+                                   const int32_t              *tokens,
+                                   uint32_t                    n_tokens,
+                                   int                         append) {
+    if (!s || !w || !tokens || n_tokens == 0u || !s->ple_ready) return;
+    if (DS4_N_PLE_HEAD > DS4_PLE_MAX_HEADS) return;
+    struct qw_ple_ahead_state *a = s->ple_ahead;
+    if (!a) {
+        a = calloc(1, sizeof(*a));
+        if (!a) return;
+        pthread_mutex_init(&a->mutex, NULL);
+        pthread_cond_init(&a->work_cond, NULL);
+        pthread_cond_init(&a->done_cond, NULL);
+        a->ids = calloc((uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * DS4_N_PLE_HEAD,
+                        sizeof(uint64_t));
+        a->rows_host = calloc((uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT *
+                              DS4_N_PLE_EMBD, sizeof(float));
+        if (!a->ids || !a->rows_host ||
+            pthread_create(&a->thread, NULL, qw_ple_ahead_worker, a) != 0) {
+            free(a->ids);
+            free(a->rows_host);
+            free(a);
+            return;
+        }
+        a->started = 1;
+        s->ple_ahead = a;
+    }
+    pthread_mutex_lock(&a->mutex);
+    if (!append || a->staged_n == 0u) {
+        a->gen++;
+        a->staged_n = 0u;
+        a->done_n = 0u;
+        a->failed = 0;
+        a->constants = s->ple_constants;
+        a->ple = w->ple;
+        a->entry = s->ple_history;
+    }
+    if (a->staged_n + n_tokens > (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT) {
+        /* Overflow: drop the vector so the gather misses rather than waits
+         * on a staging that can never match. */
+        a->gen++;
+        a->staged_n = 0u;
+        a->done_n = 0u;
+        a->failed = 0;
+        pthread_mutex_unlock(&a->mutex);
+        return;
+    }
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        a->tokens[a->staged_n + i] = tokens[i];
+    }
+    a->staged_n += n_tokens;
+    pthread_cond_broadcast(&a->work_cond);
+    pthread_mutex_unlock(&a->mutex);
+}
+
+/* Adopt the staged gather when it is THIS call's gather: same length, same
+ * tokens, same entry history.  Waits out an in-flight tail -- the worker is
+ * ahead of the caller by construction, so the wait is the overlap paying
+ * off, not a stall.  Any mismatch or failure misses and the caller runs the
+ * serial path it always ran. */
+static bool qw_ple_ahead_take(ds4_qwen4exp_session *s,
+                              const int32_t *tokens, uint32_t n_tokens,
+                              uint32_t snap) {
+    struct qw_ple_ahead_state *a = s->ple_ahead;
+    if (!a) return false;
+    bool hit = false;
+    pthread_mutex_lock(&a->mutex);
+    const uint64_t gen = a->gen;
+    if (a->staged_n == n_tokens && !a->failed &&
+        memcmp(a->tokens, tokens, (uint64_t)n_tokens * sizeof(int32_t)) == 0 &&
+        memcmp(&a->entry, &s->ple_history, sizeof(ds4_ple_history)) == 0) {
+        while (a->gen == gen && !a->failed && a->done_n < a->staged_n) {
+            pthread_cond_wait(&a->done_cond, &a->mutex);
+        }
+        if (a->gen == gen && !a->failed && a->done_n == n_tokens) {
+            memcpy(s->ple_ids, a->ids,
+                   (uint64_t)n_tokens * DS4_N_PLE_HEAD * sizeof(uint64_t));
+            memcpy(s->ple_rows_host, a->rows_host,
+                   (uint64_t)n_tokens * DS4_N_PLE_EMBD * sizeof(float));
+            for (uint32_t t = 0; t < snap && t < n_tokens; t++) {
+                s->ple_history_rows[t] = a->rows[t];
+            }
+            s->ple_history = a->rows[n_tokens - 1u];
+            hit = true;
+        }
+    }
+    /* Consumed or not, this staging is spent: a later call that sees it
+     * again must miss on its own compare, not adopt a leftover. */
+    a->gen++;
+    a->staged_n = 0u;
+    a->done_n = 0u;
+    a->failed = 0;
+    pthread_mutex_unlock(&a->mutex);
+    return hit;
+}
+
+static void qw_ple_ahead_destroy(ds4_qwen4exp_session *s) {
+    struct qw_ple_ahead_state *a = s->ple_ahead;
+    if (!a) return;
+    s->ple_ahead = NULL;
+    pthread_mutex_lock(&a->mutex);
+    a->quit = 1;
+    pthread_cond_broadcast(&a->work_cond);
+    pthread_cond_broadcast(&a->done_cond);
+    pthread_mutex_unlock(&a->mutex);
+    if (a->started) pthread_join(a->thread, NULL);
+    free(a->ids);
+    free(a->rows_host);
+    free(a);
+}
+
 static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                                       const ds4_qwen4exp_weights *w,
                                       const int32_t *tokens,
@@ -1343,7 +1527,14 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
      * ds4_ple_row_ids is that a run of single-token calls names the same rows
      * a single long call would, so this is the same ids either way; splitting
      * it is how the per-row history is observed, not a different computation. */
-    if (s->spec_snapshot_rows > 0) {
+    /* The gather-ahead worker may already hold this call's rows: the draft
+     * seam offered it the next round's vector while the head forward ran.
+     * Adoption is a full compare -- length, tokens and entry history -- so a
+     * hit is byte-for-byte what the loops below would have produced, and a
+     * miss costs one memcmp and falls through to them unchanged. */
+    const bool ple_ahead_hit =
+        qw_ple_ahead_take(s, tokens, n_tokens, s->spec_snapshot_rows);
+    if (!ple_ahead_hit && s->spec_snapshot_rows > 0) {
         for (uint32_t t = 0; t < n_tokens; t++) {
             ds4_ple_row_ids(&s->ple_constants, &s->ple_history, tokens + t, 1u,
                             s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD);
@@ -1378,7 +1569,7 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 dst += DS4_N_PLE_ROW_DIM;
             }
         }
-    } else {
+    } else if (!ple_ahead_hit) {
         /* The prefill width: split the scan across worker threads when the
          * chunk is wide enough to be worth the spawn and the run has not
          * turned the pool off.  Every thread writes ids and rows for a
@@ -2491,49 +2682,6 @@ static bool qwen4exp_graph_layer_island_encode(
     return true;
 }
 
-/* PREFILL LAYER CAPTURE.
- *
- * Prefill runs 100% eager: 1,618 launches, zero graph nodes, against a decode
- * phase that is 99,294 of 101,929 graphed.  Each eager launch costs ~2.3 us of
- * device-side dispatch that a graph node does not (measured standalone, with no
- * profiler attached, at 1,618 launches: eager span minus replay span is 3.67 ms
- * at every kernel duration from 1 to 100 us), and the engine's own trace shows
- * 1,370 inter-kernel gaps at a 2.69 us median.  Capturing the layer stack
- * collapses that class.
- *
- * WHY FROM LAYER 4, AND WHY THAT IS CORRECTNESS RATHER THAN TUNING.  Layers
- * 0-2 are gated-deltanet and layer 3 is the first full-attention layer, so
- * running all four eagerly puts every lazily sized allocator -- tmp scratch,
- * cuBLAS workspaces -- at steady state in BOTH layer shapes before the first
- * capture.  A cudaMalloc inside a stream capture is illegal; the decode path
- * solves the same problem with its state-0 warm pass, which a prefill layer
- * cannot use because it runs exactly once.  Cost: 4 layers of 48.
- *
- * WHY IT MAY CAPTURE AT ALL.  Counted in HOST ISSUE ORDER from the engine's
- * own prefill trace, all 13 capture-illegal calls (blocking cudaMemcpy,
- * cudaDeviceSynchronize) sit before launch 0 or after launch 1,577 of 1,618 --
- * the prologue and the LM-head epilogue.  Launches 0..1,576 are the whole
- * 48-layer tower and contain none.  If that ever stops being true the capture
- * simply fails and the layer is encoded eagerly, which is why every call site
- * below keeps the eager path as its fallback rather than as an error.
- *
- * DS4_QWEN4EXP_NO_PF_GRAPH restores the eager stack for an A/B. */
-#define DS4_QWEN4EXP_PF_GRAPH_MIN_ROWS    128u
-#define DS4_QWEN4EXP_PF_GRAPH_WARM_LAYERS   4u
-
-static bool qw_pf_graph_on(uint32_t n_tokens, uint32_t il) {
-    static int init = 0, enabled = 0;
-    if (!init) {
-        init = 1;
-        enabled = getenv("DS4_QWEN4EXP_NO_PF_GRAPH") == NULL;
-    }
-    return enabled && n_tokens >= DS4_QWEN4EXP_PF_GRAPH_MIN_ROWS &&
-           il >= DS4_QWEN4EXP_PF_GRAPH_WARM_LAYERS &&
-           /* profilers synchronize between operations, forbidden in capture */
-           !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
-           ds4_gpu_decode_graphs_supported();
-}
-
 static bool qwen4exp_graph_layer_island(
         ds4_qwen4exp_session *s, const ds4_qwen4exp_layer_weights *l,
         const ds4_model *m, uint32_t il, uint32_t n_tokens, uint32_t island) {
@@ -2592,22 +2740,6 @@ static bool qwen4exp_graph_layer_island(
              * re-encode this call eagerly exactly once, including on error. */
         }
     }
-    if (qw_pf_graph_on(n_tokens, il) && ds4_gpu_oneshot_graph_begin() == 0) {
-#ifdef DS4_TEST_HOOKS
-        const uint32_t pf_trace_len = g_qwen4exp_trace_len;
-        const bool pf_trace_overflow = g_qwen4exp_trace_overflow;
-#endif
-        if (qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens, island) &&
-            ds4_gpu_oneshot_graph_end() == 0) {
-            return true;
-        }
-        ds4_gpu_oneshot_graph_abort();   /* no-op if end() already closed it */
-#ifdef DS4_TEST_HOOKS
-        g_qwen4exp_trace_len = pf_trace_len;
-        g_qwen4exp_trace_overflow = pf_trace_overflow;
-#endif
-        /* Nothing executed: fall through to the eager encode below. */
-    }
     return qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens, island);
 }
 
@@ -2652,21 +2784,6 @@ static bool qwen4exp_graph_qsa_island(
             g_qwen4exp_trace_overflow = trace_overflow;
 #endif
         }
-    }
-    if (qw_pf_graph_on(n_tokens, il) && ds4_gpu_oneshot_graph_begin() == 0) {
-#ifdef DS4_TEST_HOOKS
-        const uint32_t pf_trace_len = g_qwen4exp_trace_len;
-        const bool pf_trace_overflow = g_qwen4exp_trace_overflow;
-#endif
-        if (qwen4exp_graph_qsa_block(s, l, m, il, n_tokens) &&
-            ds4_gpu_oneshot_graph_end() == 0) {
-            return true;
-        }
-        ds4_gpu_oneshot_graph_abort();
-#ifdef DS4_TEST_HOOKS
-        g_qwen4exp_trace_len = pf_trace_len;
-        g_qwen4exp_trace_overflow = pf_trace_overflow;
-#endif
     }
     return qwen4exp_graph_qsa_block(s, l, m, il, n_tokens);
 }
@@ -2737,12 +2854,6 @@ int ds4_qwen4exp_test_layer_sums(double *out, int cap, int *rows_out) {
 
 static bool qwen4exp_forward_fail(void) {
     (void)ds4_gpu_end_commands();
-    /* Close any capture still open FIRST.  This is a shared error path and
-     * retire() synchronizes, which is illegal inside an active capture and
-     * would invalidate it with an error nothing here would see.  abort() is a
-     * no-op when nothing is capturing, so this is safe from every caller. */
-    ds4_gpu_oneshot_graph_abort();
-    ds4_gpu_oneshot_graph_retire();
     return false;
 }
 
@@ -2755,35 +2866,6 @@ static bool qwen4exp_graph_layers_encode_range(
         uint32_t il_first, uint32_t il_last) {
     for (uint32_t il = il_first; il < il_last; il++) {
         const ds4_qwen4exp_layer_weights *l = &w->layer[il];
-
-        /* Destroy the PREVIOUS forward's captured graphs HERE, not at the end
-         * of the forward that built them.
-         *
-         * WHY HERE.  At this point layers 0..3 have been ISSUED eagerly, so
-         * roughly 51 ms of GPU work is queued and the ~1.5 ms of
-         * cudaGraphExecDestroy hides behind it.  At the end of a forward the
-         * device has nothing left queued, and the same destruction is pure
-         * exposed idle: measured as a 1.512 ms lengthening of one gap, which
-         * ate most of the 2.49 ms the capture saves.  Capture was guarded and
-         * held at 120x slack; this is the other end of the same lifecycle.
-         *
-         * WHY IT IS SAFE.  The graphs freed here belong to the PREVIOUS
-         * forward, which ended with ds4_gpu_end_commands() +
-         * ds4_gpu_synchronize() -- a full device sync -- so none of them is
-         * still reachable by the device.  retire_settled() therefore does not
-         * synchronize, and must not: synchronizing here would wait out exactly
-         * the queued work it is meant to hide behind.
-         *
-         * WHY IT IS NOT A CACHE.  Nothing is REUSED.  An executable graph is
-         * launched exactly once, inside ds4_gpu_oneshot_graph_end(), the
-         * instant it is instantiated; no other code path launches from the
-         * parked array.  This moves DESTRUCTION within a prefill window; it
-         * does not move prefill WORK between windows, so
-         * participant-contract 5.1.1 is untouched. */
-        if (il == DS4_QWEN4EXP_PF_GRAPH_WARM_LAYERS &&
-            qw_pf_graph_on(n_tokens, il)) {
-            ds4_gpu_oneshot_graph_retire_settled();
-        }
 
         /* --- per-layer n-gram embedding, one block only ----------------
          * FIRST in the layer, ahead of the attention mixer, and a plain
@@ -3278,65 +3360,11 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
             return qwen4exp_forward_fail();
         }
     }
-    const ds4_gpu_tensor *head_x =
-        logit_rows == 1u ? s->embed_rows : s->mixed;
-    bool target_screened = false;
-    s->target_native_deferred = false;
-    const bool defer_target_invalid =
-        logit_rows == 2u && s->spec_top1_rows == logit_rows &&
-        getenv("DS4_MTP_NO_DEFER_INVALID_FLAG") == NULL;
-    if (logit_rows == 2u && s->target_native_capacity &&
-        s->target_native_scratch2 && s->target_native_ids &&
-        s->target_native_logits && ds4_gpu_mtp_native_screen2 &&
-        ds4_gpu_mtp_native_scatter2 && cfg->n_vocab > 276u) {
-        /* Screen the WHOLE vocabulary.  The 276 added-token rows are reserved
-         * by the native selector and prefix + tail is exactly n_vocab, so no
-         * token id is excluded before the approximate rank.  Every retained
-         * row is then recomputed by the ordinary exact Q8 dot and scattered
-         * back to its original id; only omitted rows become -FLT_MAX.
-         *
-         * This conservative target-only gate deliberately excludes the
-         * one-row decode head.  A declined R2 screen and every R1 call use the
-         * ordinary full-vocabulary projection below. */
-        const uint32_t tail = 276u;
-        const uint32_t prefix = cfg->n_vocab - tail;
-        if (!ds4_gpu_tensor_fill_f32(
-                s->logits, -FLT_MAX,
-                2ull * cfg->n_vocab)) {
-            fprintf(stderr, "ds4: qwen4exp target-screen logit clear failed\n");
-            return qwen4exp_forward_fail();
-        }
-        const int rc = ds4_gpu_mtp_native_screen2(
-                s->target_native_logits, s->target_native_ids,
-                s->target_native_scratch2, QW_MAP(m, w->output),
-                QW_MAPSZ(m, w->output), QW_OFF(w->output), DS4_N_EMBD,
-                cfg->n_vocab, prefix, tail, head_x,
-                defer_target_invalid);
-        if (rc < 0) {
-            fprintf(stderr,
-                    "ds4: qwen4exp target LM-head R2 screen failed\n");
-            return qwen4exp_forward_fail();
-        }
-        if ((uint32_t)rc == s->target_native_capacity) {
-            if (!ds4_gpu_mtp_native_scatter2(
-                    s->logits, s->target_native_logits,
-                    s->target_native_ids, s->target_native_scratch2,
-                    s->spec_top1, s->target_native_capacity,
-                    cfg->n_vocab, prefix + tail,
-                    defer_target_invalid)) {
-                fprintf(stderr,
-                        "ds4: qwen4exp target LM-head R2 scatter failed\n");
-                return qwen4exp_forward_fail();
-            }
-            target_screened = true;
-            s->target_native_deferred = defer_target_invalid;
-        }
-    }
-    if (!target_screened &&
-        !ds4_qwen4exp_matmul_q8_0(s->logits, QW_MAP(m, w->output),
-                                  QW_MAPSZ(m, w->output), QW_OFF(w->output),
-                                  DS4_N_EMBD, cfg->n_vocab, head_x,
-                                  logit_rows)) {
+    if (!ds4_qwen4exp_matmul_q8_0(s->logits, QW_MAP(m, w->output),
+                                    QW_MAPSZ(m, w->output), QW_OFF(w->output),
+                                    DS4_N_EMBD, cfg->n_vocab,
+                                    logit_rows == 1u ? s->embed_rows : s->mixed,
+                                    logit_rows)) {
         fprintf(stderr, "ds4: qwen4exp LM head failed\n");
         return qwen4exp_forward_fail();
     }
@@ -3352,14 +3380,8 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     /* Commit and wait: the logits are read on the host from here on. */
     if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
         fprintf(stderr, "ds4: qwen4exp command batch did not complete\n");
-        ds4_gpu_oneshot_graph_retire();
         return false;
     }
-    /* Report the capture half of the lifecycle; the destroy half is paid in
-     * the NEXT forward, behind its queued eager layers.  Nothing is reused
-     * between the two -- every executable graph is launched once, at the
-     * instant it is instantiated -- so 5.1.1 is untouched. */
-    ds4_gpu_oneshot_graph_report();
     if (logits_out &&
         !ds4_gpu_tensor_read(s->logits, 0, logits_out,
                              (uint64_t)logit_rows * cfg->n_vocab *
@@ -3900,34 +3922,6 @@ bool ds4_qwen4exp_graph_verify_rows(ds4_qwen4exp_session       *s,
     return true;
 }
 
-static bool qwen4exp_graph_rerun_lm_top1(
-        ds4_qwen4exp_session *s, const ds4_qwen4exp_weights *w,
-        const ds4_model *m, uint32_t n_tokens) {
-    const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
-    if (!ds4_gpu_begin_commands()) {
-        fprintf(stderr,
-                "ds4: qwen4exp nonfinite fallback could not open a command batch\n");
-        return false;
-    }
-    if (!ds4_qwen4exp_matmul_q8_0(s->logits, QW_MAP(m, w->output),
-                                  QW_MAPSZ(m, w->output), QW_OFF(w->output),
-                                  DS4_N_EMBD, cfg->n_vocab, s->mixed,
-                                  n_tokens) ||
-        !ds4_gpu_indexer_topk_tensor(s->spec_top1, s->logits,
-                                     cfg->n_vocab, n_tokens, 1u)) {
-        fprintf(stderr,
-                "ds4: qwen4exp nonfinite fallback LM head failed\n");
-        (void)ds4_gpu_end_commands();
-        return false;
-    }
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
-        fprintf(stderr,
-                "ds4: qwen4exp nonfinite fallback batch did not complete\n");
-        return false;
-    }
-    return true;
-}
-
 bool ds4_qwen4exp_graph_verify_top1_rows(ds4_qwen4exp_session       *s,
                                          const ds4_qwen4exp_weights *w,
                                          const ds4_model            *m,
@@ -3948,33 +3942,12 @@ bool ds4_qwen4exp_graph_verify_top1_rows(ds4_qwen4exp_session       *s,
     s->spec_logit_rows = 0u;
     s->spec_top1_rows = 0u;
     if (!forward_ok) return false;
-    const bool deferred = s->target_native_deferred;
-    s->target_native_deferred = false;
-    uint32_t compact[DS4_QWEN4EXP_MTP_MAX_COMMIT + 1u];
-    if (!ds4_gpu_tensor_read(s->spec_top1, 0, compact,
-                             (uint64_t)(n_tokens + deferred) *
-                                 sizeof(uint32_t))) {
-        fprintf(stderr, "ds4: qwen4exp compact verify top-1 read failed\n");
-        return false;
-    }
-    if (deferred && compact[n_tokens] != 0u) {
-        /* `mixed` still holds the final-mixer rows.  Recompute only the exact
-         * target LM head and argmax; recurrent and convolution state must not
-         * advance a second time. */
-        if (!qwen4exp_graph_rerun_lm_top1(s, w, m, n_tokens) ||
-            !ds4_gpu_tensor_read(s->spec_top1, 0, compact,
-                                 (uint64_t)n_tokens * sizeof(uint32_t))) {
-            fprintf(stderr,
-                    "ds4: qwen4exp compact verify nonfinite fallback failed\n");
-            return false;
-        }
-    }
-    for (uint32_t r = 0; r < n_tokens; r++) row_top1[r] = (int)compact[r];
     if (hc_rows && !ds4_qwen4exp_session_read_hyper(s, 0, n_tokens, hc_rows)) {
         fprintf(stderr, "ds4: qwen4exp compact verify hyper read failed\n");
         return false;
     }
-    return true;
+    return ds4_gpu_tensor_read(s->spec_top1, 0, row_top1,
+                               (uint64_t)n_tokens * sizeof(int32_t)) != 0;
 }
 
 bool ds4_qwen4exp_graph_read_logit_row(ds4_qwen4exp_session *s,
