@@ -6161,10 +6161,23 @@ qwen4exp_moe_gateup_heavy_kernel(
     };
 
     const uint32_t nchunk = groups / 4u;
+    /* How far ahead the request runs, as ONE name read by both the prologue
+     * and the loop.  The tree ships this distance as three separate literals
+     * -- two in the prologue and a `c + 3` in the loop -- and a literal moved
+     * in one place and not the other leaves a silent gap in the stream rather
+     * than a compile error.  A chunk's copies are 64-byte pieces of 128 rows
+     * 1,440 bytes apart, so its fill is a scatter of partial lines, and one
+     * more chunk of lead is one more barrier of cover.  The distance is the
+     * only thing this changes.
+     *
+     * This is the WEIGHT stream, so it is orthogonal to the L2 eviction
+     * policy this base added on the ACTIVATION loads (DS4_GU_L2POL,
+     * DS4_CUDA_PIPE_ACTPOL): a prefetch asks for a line earlier, a policy
+     * says how long a line stays.  Neither touches the other's operands. */
+    const uint32_t guh_l2_dist = 6u;
     /* L2Ahead: the first header thread of each (projection, row) asks the
-     * L2 for the line chunk c + 3 copies from, while chunk c + 1's copies
-     * are in flight.  The copies of one chunk are 64-byte pieces of 128
-     * rows 1440 bytes apart; issued only one chunk ahead they leave the
+     * L2 for the line chunk c + guh_l2_dist copies from, while chunk c + 1's
+     * copies are in flight.  Issued only one chunk ahead they leave the
      * weight stream's DRAM latency exposed at every barrier.  A prefetch
      * moves no data into the tile and changes no operand. */
     auto l2_ahead = [&](uint32_t c) {
@@ -6173,8 +6186,8 @@ qwen4exp_moe_gateup_heavy_kernel(
             asm volatile("prefetch.global.L2 [%0];\n" :: "l"(p));
         }
     };
-    l2_ahead(1u);
-    l2_ahead(2u);
+#pragma unroll
+    for (uint32_t k = 1u; k < guh_l2_dist; k++) l2_ahead(k);
     load_hdr(0u);
     issue(0u);
     load_hdr(1u);
@@ -6199,7 +6212,7 @@ qwen4exp_moe_gateup_heavy_kernel(
         qw_cpasync_wait0();
         __syncthreads();
         if (c + 1u < nchunk) { issue(c + 1u); load_hdr(c + 2u); }
-        l2_ahead(c + 3u);
+        l2_ahead(c + guh_l2_dist);
         const uint32_t st = smem0 + (c & 1u) * QW_GUH_STAGE;
         const unsigned char *stp = guh_smem + (c & 1u) * QW_GUH_STAGE;
         const float *wa = (const float *)(const void *)(stp + QW_GUH_OFF_WA);
