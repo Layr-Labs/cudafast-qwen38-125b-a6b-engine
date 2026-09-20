@@ -7662,7 +7662,8 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
  * is block-uniform once out_dim % 8 == 0 -- required at the launch before this
  * arm is selected -- and the staged arm skips the deep call inside the walk, so
  * a thread performs exactly one grid dependency sync either way. */
-template <int R, int DownType = -1, bool Vector = false, bool Stage = false>
+template <int R, int DownType = -1, bool Vector = false, bool Stage = false,
+          bool Async = false>
 __global__ static void qwen4exp_shared_down_q_kernel(
         float *out,
         const char *down,
@@ -7684,17 +7685,37 @@ __global__ static void qwen4exp_shared_down_q_kernel(
                                                         : (uint32_t)R;
     extern __shared__ uint4 qw_shdown_panel[];
     char *const spanel = (char *)qw_shdown_panel;
+    /* Async: the same fill, the same bytes, the same shared addresses, issued
+     * as cp.async.ca.shared.global instead of an LDG into a register and an
+     * STS out of it.  The ROUTED down tile in this tree already carries that
+     * arm and this one did not: the synchronous form holds exactly one
+     * sixteen-byte request per thread in flight, because the store depends on
+     * the load, while the asynchronous form lets every trip of the loop be in
+     * flight at once and lets the whole panel land across the PDL drain rather
+     * than in front of it.  The commit sits above the grid dependency sync and
+     * the wait below it, so the fill overlaps the predecessor's tail; the
+     * barrier that publishes the panel is unmoved.  Nothing about the image
+     * changes -- cp.async moves the same sixteen bytes to the same offset --
+     * so the decoder below reads the identical panel either way. */
     if (Stage) {
         const uint64_t panel_bytes = (uint64_t)8u * down_row_bytes;
         const char *const gp = down + (uint64_t)(blockIdx.x * 8u) * down_row_bytes;
         for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
              i += (uint64_t)blockDim.x * 16u) {
-            if (i + 16u <= panel_bytes)
-                *(uint4 *)(spanel + i) = *(const uint4 *)(const void *)(gp + i);
-            else
+            if (i + 16u <= panel_bytes) {
+                if (Async)
+                    qw_cpasync16(
+                            (uint32_t)__cvta_generic_to_shared(spanel + i),
+                            gp + i);
+                else
+                    *(uint4 *)(spanel + i) = *(const uint4 *)(const void *)(gp + i);
+            } else {
                 for (uint64_t j = i; j < panel_bytes; j++) spanel[j] = gp[j];
+            }
         }
+        if (Async) qw_cpasync_commit();
         QWEN4EXP_PDL_SYNC();
+        if (Async) qw_cpasync_wait0();
         __syncthreads();
     }
     const char *down_row = Stage
@@ -11219,9 +11240,24 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         ((uintptr_t)down & 15u) == 0u &&
         sd_panel <= QW_DOWN_PANEL_MAX_BYTES &&
         getenv("DS4_QWEN4EXP_NO_SHARED_DOWN_PANEL") == NULL;
+/* The asynchronous fill of that panel, at the decode widths this launcher
+ * gives the PDL arm.  The gate is the panel's own: a 16-byte-aligned slab
+ * base and a panel that is a whole number of 16-byte pieces are exactly what
+ * cp.async needs, and both are already required above.
+ * DS4_QWEN4EXP_NO_SHARED_DOWN_ASYNC restores the LDG/STS fill. */
+    const int sd_async =
+        sd_stage && getenv("DS4_QWEN4EXP_NO_SHARED_DOWN_ASYNC") == NULL;
 #define QWEN4EXP_SH_DOWN_IMPL(R, DT, V) do { \
     if (n_tokens <= 2u) { \
-        if (sd_stage) { \
+        if (sd_async) { \
+            QWEN4EXP_LAUNCH_PDL( \
+                    (qwen4exp_shared_down_q_kernel<R, DT, V, true, true>), \
+                    (dim3((out_dim + 7u) / 8u, tiles, 1)), \
+                    threads, (size_t)sd_panel, sd_stream, \
+                    (float *)out->ptr, down, mq, ms, msum, \
+                    (const float *)gate_scale->ptr, sd_tot, down_slab->row_bytes, \
+                    down_slab->type, mgroups, out_dim, n_tokens); \
+        } else if (sd_stage) { \
             QWEN4EXP_LAUNCH_PDL( \
                     (qwen4exp_shared_down_q_kernel<R, DT, V, true>), \
                     (dim3((out_dim + 7u) / 8u, tiles, 1)), \
