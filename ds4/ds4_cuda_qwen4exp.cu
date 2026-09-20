@@ -18048,3 +18048,9 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
  * census shows produces a byte-identical capture log. */
 
 #define YUKON_REDRAW_10 10
+
+/* zarar@1337 redraw marker: preserved promoted engine source. */
+
+/* zarar@1337 frontier draw marker 2. */
+
+/* zarar@1337 frontier redraw loop marker 1. */
