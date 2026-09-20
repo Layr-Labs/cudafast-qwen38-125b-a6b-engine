@@ -442,6 +442,235 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
     return cuda_ok(cudaGetLastError(),"native exact refinement") ? (int)MTP_NATIVE_CAP : -1;
 }
 
+/* The target R2 selector repeats a long, pointer-stable CUB/refinement tail
+ * for each speculative round.  Keep its exact serial node order, but submit
+ * the two rows as one reusable CUDA graph after one eager settling pass.
+ * Inputs are freshly produced before every replay; the graph caches work, not
+ * values.  A complete pointer/shape key prevents a session or allocation from
+ * reusing nodes that name stale storage. */
+struct mtp_native_screen2_graph_key {
+    void *out;
+    void *ids;
+    void *scratch;
+    const void *input;
+    const void *weight;
+    uint64_t scratch_bytes;
+    uint32_t width;
+    uint32_t vocab;
+    uint32_t prefix;
+    uint32_t tail;
+    uint32_t id_bits;
+    uint32_t fuse_keys;
+};
+
+struct mtp_native_screen2_graph_entry {
+    mtp_native_screen2_graph_key key;
+    cudaGraphExec_t exec;
+    uint32_t state; /* 0 empty, 1 eagerly settled, 2 ready, 3 retired */
+    uint64_t replays;
+};
+
+static constexpr uint32_t MTP_NATIVE_SCREEN2_GRAPH_SLOTS = 4u;
+static mtp_native_screen2_graph_entry
+    g_mtp_native_screen2_graph[MTP_NATIVE_SCREEN2_GRAPH_SLOTS];
+static cudaStream_t g_mtp_native_screen2_capture_stream;
+
+static void mtp_native_screen2_graph_invalidate(void) {
+    for (uint32_t i = 0; i < MTP_NATIVE_SCREEN2_GRAPH_SLOTS; i++) {
+        mtp_native_screen2_graph_entry *e = &g_mtp_native_screen2_graph[i];
+        if (e->exec) (void)cudaGraphExecDestroy(e->exec);
+        memset(e, 0, sizeof(*e));
+    }
+}
+
+static void mtp_native_screen2_graph_cleanup(void) {
+    mtp_native_screen2_graph_invalidate();
+    if (g_mtp_native_screen2_capture_stream) {
+        (void)cudaStreamDestroy(g_mtp_native_screen2_capture_stream);
+        g_mtp_native_screen2_capture_stream = nullptr;
+    }
+}
+
+static mtp_native_screen2_graph_entry *mtp_native_screen2_graph_find(
+        const mtp_native_screen2_graph_key *key) {
+    mtp_native_screen2_graph_entry *empty = nullptr;
+    for (uint32_t i = 0; i < MTP_NATIVE_SCREEN2_GRAPH_SLOTS; i++) {
+        mtp_native_screen2_graph_entry *e = &g_mtp_native_screen2_graph[i];
+        if (e->state != 0u &&
+            memcmp(&e->key, key, sizeof(*key)) == 0) return e;
+        if (e->state == 0u && !empty) empty = e;
+    }
+    if (empty) {
+        empty->key = *key;
+        empty->state = 1u;
+    }
+    return empty;
+}
+
+static int mtp_native_screen2_tail(
+        float *out, uint32_t *ids, char *base, uint64_t scratch_bytes,
+        const mtp_native_layout2 &l, const unsigned char *w,
+        const int8_t *xq, const float *xs, uint32_t width, uint32_t vocab,
+        uint32_t prefix, uint32_t tail, int id_bits, cudaStream_t stream) {
+    uint64_t *key_in = (uint64_t *)(base + l.key_in);
+    uint64_t *key_out = (uint64_t *)(base + l.key_out);
+    uint32_t *id_tmp = (uint32_t *)(base + l.id_tmp);
+    for (uint32_t r = 0; r < 2u; r++) {
+        size_t temporary = (size_t)(scratch_bytes - l.temporary);
+        uint64_t *kin = key_in + (uint64_t)r * width;
+        uint64_t *kout = key_out + (uint64_t)r * width;
+        uint32_t *itmp = id_tmp + (uint64_t)r * MTP_TARGET_NATIVE_CAP;
+        uint32_t *iout = ids + (uint64_t)r * MTP_TARGET_NATIVE_CAP;
+        if (!cuda_ok(cub::DeviceRadixSort::SortKeysDescending(
+                base + l.temporary, temporary, kin, kout, width, 32, 64,
+                stream), "native R2 score sort")) return 0;
+        mtp_native_unpack_ids_n<<<
+                (MTP_TARGET_NATIVE_CAP + 255u) / 256u, 256, 0, stream>>>(
+            itmp, kout, MTP_TARGET_NATIVE_CAP);
+        if (!cuda_ok(cudaGetLastError(), "native R2 candidate unpack"))
+            return 0;
+        temporary = (size_t)(scratch_bytes - l.temporary);
+        if (!cuda_ok(cub::DeviceRadixSort::SortKeys(
+                base + l.temporary, temporary, itmp, iout,
+                MTP_TARGET_NATIVE_CAP, 0, id_bits, stream),
+                "native R2 original-ID sort")) return 0;
+        mtp_native_projection_kernel<false><<<
+            (MTP_TARGET_NATIVE_CAP + 3u) / 4u, 256, 0, stream>>>(
+            out + (uint64_t)r * MTP_TARGET_NATIVE_CAP, w,
+            xq + (uint64_t)r * MTP_NATIVE_DIM,
+            xs + (uint64_t)r * (MTP_NATIVE_DIM / 32u),
+            MTP_TARGET_NATIVE_CAP, iout, vocab, prefix, tail);
+        if (!cuda_ok(cudaGetLastError(), "native R2 exact refinement"))
+            return 0;
+    }
+    return 1;
+}
+
+/* 1 means the exact tail was launched by a graph. 0 asks the caller to issue
+ * the unchanged eager tail. Capture failures retire only that cache slot and
+ * fall back before any tail work has executed. */
+static int mtp_native_screen2_graph_launch(
+        float *out, uint32_t *ids, char *base, uint64_t scratch_bytes,
+        const mtp_native_layout2 &l, const unsigned char *w,
+        const float *input, int8_t *xq, float *xs, float *scores,
+        uint64_t *key_in, uint32_t *flag, uint32_t width, uint32_t vocab,
+        uint32_t prefix, uint32_t tail, int id_bits, bool fuse_keys) {
+    if (getenv("DS4_MTP_NO_R2_SELECT_GRAPH") != nullptr ||
+        !ds4_gpu_decode_graphs_supported() || g_decode_graph_capturing)
+        return 0;
+    mtp_native_screen2_graph_key key{};
+    key.out = out;
+    key.ids = ids;
+    key.scratch = base;
+    key.input = input;
+    key.weight = w;
+    key.scratch_bytes = scratch_bytes;
+    key.width = width;
+    key.vocab = vocab;
+    key.prefix = prefix;
+    key.tail = tail;
+    key.id_bits = (uint32_t)id_bits;
+    key.fuse_keys = fuse_keys ? 1u : 0u;
+    mtp_native_screen2_graph_entry *e = mtp_native_screen2_graph_find(&key);
+    if (!e || e->state == 3u) return 0;
+    if (e->state == 2u) {
+        const cudaError_t err = cudaGraphLaunch(e->exec, cuda_decode_stream());
+        if (err == cudaSuccess) {
+            e->replays++;
+            return 1;
+        }
+        (void)cudaGetLastError();
+        (void)cudaGraphExecDestroy(e->exec);
+        e->exec = nullptr;
+        e->state = 3u;
+        return 0;
+    }
+    /* state 1 is installed on first sight; that call remains the required
+     * eager CUB settling pass. Capture on the next call. */
+    if (e->replays == 0u) {
+        e->replays = 1u;
+        return 0;
+    }
+    if (!g_mtp_native_screen2_capture_stream &&
+        cudaStreamCreateWithFlags(&g_mtp_native_screen2_capture_stream,
+                                  cudaStreamNonBlocking) != cudaSuccess) {
+        (void)cudaGetLastError();
+        e->state = 3u;
+        return 0;
+    }
+    cudaError_t err = cudaStreamBeginCapture(
+        g_mtp_native_screen2_capture_stream, cudaStreamCaptureModeGlobal);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        e->state = 3u;
+        return 0;
+    }
+    cudaStream_t capture_stream = g_mtp_native_screen2_capture_stream;
+    int encoded = cuda_ok(cudaMemsetAsync(flag, 0, 4, capture_stream),
+                          "native R2 graph screen flag");
+    if (encoded) {
+        quantize_q8_0_f32_rows_warp_kernel<<<20, 256, 0, capture_stream>>>(
+            xq, xs, input, MTP_NATIVE_DIM, 80, 2);
+        encoded = cuda_ok(cudaGetLastError(),
+                          "native R2 graph screen quantize");
+    }
+    if (encoded && fuse_keys) {
+        mtp_native_projection2_screen_kernel<true><<<
+            (width + 3u) / 4u, 256, 0, capture_stream>>>(
+            scores, w, xq, xs, width, vocab, prefix, tail, key_in, flag);
+        encoded = cuda_ok(cudaGetLastError(),
+                          "native fused R2 graph screen keys");
+    } else if (encoded) {
+        mtp_native_projection2_screen_kernel<false><<<
+            (width + 3u) / 4u, 256, 0, capture_stream>>>(
+            scores, w, xq, xs, width, vocab, prefix, tail);
+        if (cuda_ok(cudaGetLastError(), "native R2 graph coarse screen")) {
+            for (uint32_t r = 0; r < 2u; r++) {
+                mtp_native_keys<<<(width + 255u) / 256u, 256, 0,
+                        capture_stream>>>(
+                    key_in + (uint64_t)r * width, flag,
+                    scores + (uint64_t)r * width, width, prefix, tail, vocab);
+            }
+            encoded = cuda_ok(cudaGetLastError(),
+                              "native R2 graph screen keys");
+        } else {
+            encoded = 0;
+        }
+    }
+    if (encoded) {
+        encoded = mtp_native_screen2_tail(
+            out, ids, base, scratch_bytes, l, w, xq, xs, width, vocab,
+            prefix, tail, id_bits, capture_stream);
+    }
+    cudaGraph_t graph = nullptr;
+    err = cudaStreamEndCapture(g_mtp_native_screen2_capture_stream, &graph);
+    if (!encoded || err != cudaSuccess || !graph) {
+        (void)cudaGetLastError();
+        if (graph) (void)cudaGraphDestroy(graph);
+        e->state = 3u;
+        return 0;
+    }
+    cudaGraphExec_t exec = nullptr;
+    err = cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+    (void)cudaGraphDestroy(graph);
+    if (err != cudaSuccess || !exec) {
+        (void)cudaGetLastError();
+        e->state = 3u;
+        return 0;
+    }
+    err = cudaGraphLaunch(exec, cuda_decode_stream());
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        (void)cudaGraphExecDestroy(exec);
+        e->state = 3u;
+        return 0;
+    }
+    e->exec = exec;
+    e->state = 2u;
+    e->replays = 0u;
+    return 1;
+}
+
 /* Two-row target-only form.  Coarse scores share each streamed weight group;
  * shortlist ranking and exact dots remain independent per row. */
 extern "C" int ds4_gpu_mtp_native_screen2(ds4_gpu_tensor *out,
@@ -489,16 +718,7 @@ extern "C" int ds4_gpu_mtp_native_screen2(ds4_gpu_tensor *out,
     float *xs = (float *)(base + l.xscale);
     float *scores = (float *)(base + l.scores);
     uint64_t *key_in = (uint64_t *)(base + l.key_in);
-    uint64_t *key_out = (uint64_t *)(base + l.key_out);
-    uint32_t *id_tmp = (uint32_t *)(base + l.id_tmp);
     uint32_t *flag = (uint32_t *)(base + l.flag);
-    if (!cuda_ok(cudaMemsetAsync(flag, 0, 4, cuda_decode_stream()),
-                 "native R2 screen flag")) return -1;
-    quantize_q8_0_f32_rows_warp_kernel<<<20, 256, 0,
-            cuda_decode_stream()>>>(
-        xq, xs, (const float *)x->ptr, in_dim, 80, 2);
-    if (!cuda_ok(cudaGetLastError(), "native R2 screen quantize")) return -1;
-
     const bool fuse_keys = getenv("DS4_MTP_NO_FUSED_SCREEN_KEYS") == nullptr &&
         mtp_native_key_range_disjoint(
             scratch->ptr, scratch->bytes, w, (uint64_t)vocab * 80u * 34u) &&
@@ -508,6 +728,28 @@ extern "C" int ds4_gpu_mtp_native_screen2(ds4_gpu_tensor *out,
             scratch->ptr, scratch->bytes, out->ptr, out->bytes) &&
         mtp_native_key_range_disjoint(
             scratch->ptr, scratch->bytes, ids->ptr, ids->bytes);
+    defer_invalid = defer_invalid &&
+        getenv("DS4_MTP_NO_DEFER_INVALID_FLAG") == nullptr;
+    int id_bits = 1;
+    while (id_bits < 32 && ((uint32_t)1u << id_bits) < vocab) id_bits++;
+    if (id_bits > 32) id_bits = 32;
+    /* Deferred invalid handling removes the only host decision inside this
+     * sequence, so the complete target R2 screen and its two exact serial
+     * tails can be replayed as one graph. Immediate-invalid callers retain
+     * the original eager readback boundary. */
+    if (defer_invalid && mtp_native_screen2_graph_launch(
+            (float *)out->ptr, (uint32_t *)ids->ptr, base, scratch->bytes,
+            l, (const unsigned char *)w, (const float *)x->ptr, xq, xs,
+            scores, key_in, flag, width, vocab, prefix, tail, id_bits,
+            fuse_keys)) return (int)MTP_TARGET_NATIVE_CAP;
+
+    if (!cuda_ok(cudaMemsetAsync(flag, 0, 4, cuda_decode_stream()),
+                 "native R2 screen flag")) return -1;
+    quantize_q8_0_f32_rows_warp_kernel<<<20, 256, 0,
+            cuda_decode_stream()>>>(
+        xq, xs, (const float *)x->ptr, in_dim, 80, 2);
+    if (!cuda_ok(cudaGetLastError(), "native R2 screen quantize")) return -1;
+
     if (fuse_keys) {
         mtp_native_projection2_screen_kernel<true><<<
             (width + 3u) / 4u, 256, 0, cuda_decode_stream()>>>(
@@ -530,49 +772,16 @@ extern "C" int ds4_gpu_mtp_native_screen2(ds4_gpu_tensor *out,
         }
         if (!cuda_ok(cudaGetLastError(), "native R2 screen keys")) return -1;
     }
-    defer_invalid = defer_invalid &&
-        getenv("DS4_MTP_NO_DEFER_INVALID_FLAG") == nullptr;
     if (!defer_invalid) {
         uint32_t invalid = 0;
         if (!ds4_gpu_tensor_read(scratch, l.flag, &invalid, 4)) return -1;
         if (invalid) return 0;
     }
 
-    int id_bits = 1;
-    while (id_bits < 32 && ((uint32_t)1u << id_bits) < vocab) id_bits++;
-    if (id_bits > 32) id_bits = 32;
-    for (uint32_t r = 0; r < 2u; r++) {
-        size_t temporary = (size_t)(scratch->bytes - l.temporary);
-        uint64_t *kin = key_in + (uint64_t)r * width;
-        uint64_t *kout = key_out + (uint64_t)r * width;
-        uint32_t *itmp = id_tmp + (uint64_t)r * MTP_TARGET_NATIVE_CAP;
-        uint32_t *iout = (uint32_t *)ids->ptr +
-            (uint64_t)r * MTP_TARGET_NATIVE_CAP;
-        if (!cuda_ok(cub::DeviceRadixSort::SortKeysDescending(
-                base + l.temporary, temporary, kin, kout, width, 32, 64,
-                cuda_decode_stream()), "native R2 score sort")) return -1;
-        mtp_native_unpack_ids_n<<<
-                (MTP_TARGET_NATIVE_CAP + 255u) / 256u, 256, 0,
-                cuda_decode_stream()>>>(itmp, kout, MTP_TARGET_NATIVE_CAP);
-        if (!cuda_ok(cudaGetLastError(), "native R2 candidate unpack"))
-            return -1;
-        temporary = (size_t)(scratch->bytes - l.temporary);
-        if (!cuda_ok(cub::DeviceRadixSort::SortKeys(
-                base + l.temporary, temporary, itmp, iout,
-                MTP_TARGET_NATIVE_CAP,
-                0, id_bits, cuda_decode_stream()),
-                "native R2 original-ID sort")) return -1;
-        mtp_native_projection_kernel<false><<<
-            (MTP_TARGET_NATIVE_CAP + 3u) / 4u, 256, 0,
-            cuda_decode_stream()>>>(
-            (float *)out->ptr + (uint64_t)r * MTP_TARGET_NATIVE_CAP,
-            (const unsigned char *)w,
-            xq + (uint64_t)r * MTP_NATIVE_DIM,
-            xs + (uint64_t)r * (MTP_NATIVE_DIM / 32u),
-            MTP_TARGET_NATIVE_CAP, iout, vocab, prefix, tail);
-        if (!cuda_ok(cudaGetLastError(), "native R2 exact refinement"))
-            return -1;
-    }
+    if (!mtp_native_screen2_tail(
+            (float *)out->ptr, (uint32_t *)ids->ptr, base, scratch->bytes,
+            l, (const unsigned char *)w, xq, xs, width, vocab, prefix, tail,
+            id_bits, cuda_decode_stream())) return -1;
     return (int)MTP_TARGET_NATIVE_CAP;
 }
 __global__ static void mtp_native_map(uint32_t *winner, const float *logits,

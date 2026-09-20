@@ -13,7 +13,7 @@
 #include <sys/mman.h>
 #define DIM 2560u
 #define CAP 2048u
-#define CAP2 8192u
+#define CAP2 16384u
 #define PREFIX 20000u
 #define TAIL 276u
 #define VOCAB 21000u
@@ -103,6 +103,28 @@ static void compare_r2_paths(const void *w,uint64_t bytes,uint64_t offset,
          "R2 fused-key shortlist differs");
     need(!memcmp(values[0],values[1],2ull*CAP2*4u),
          "R2 fused-key refinement differs");
+    /* The second arm above captures and launches the pointer-stable R2 tail.
+     * Force its exact eager valve, then replay it once more with a changed
+     * activation. Both schedules must retain the same IDs and score bits. */
+    for(uint32_t i=0;i<2u*DIM;i++) a2[i]=a2[i]*0.875f+0.03125f;
+    need(ds4_gpu_tensor_write(x2,0,a2,2ull*DIM*4u),
+         "R2 graph changed activation");
+    setenv("DS4_MTP_NO_R2_SELECT_GRAPH","1",1);
+    need(ds4_gpu_mtp_native_screen2(out2,ids2,scratch2,w,bytes,offset,
+         DIM,VOCAB,PREFIX,TAIL,x2,1)==CAP2,"R2 eager valve screen");
+    need(ds4_gpu_tensor_read(out2,0,values[0],2ull*CAP2*4u)&&
+         ds4_gpu_tensor_read(ids2,0,selected_ids[0],2ull*CAP2*4u),
+         "R2 eager valve outputs");
+    unsetenv("DS4_MTP_NO_R2_SELECT_GRAPH");
+    need(ds4_gpu_mtp_native_screen2(out2,ids2,scratch2,w,bytes,offset,
+         DIM,VOCAB,PREFIX,TAIL,x2,1)==CAP2,"R2 graph replay screen");
+    need(ds4_gpu_tensor_read(out2,0,values[1],2ull*CAP2*4u)&&
+         ds4_gpu_tensor_read(ids2,0,selected_ids[1],2ull*CAP2*4u),
+         "R2 graph replay outputs");
+    need(!memcmp(selected_ids[0],selected_ids[1],2ull*CAP2*4u),
+         "R2 graph valve shortlist differs");
+    need(!memcmp(values[0],values[1],2ull*CAP2*4u),
+         "R2 graph valve refinement differs");
     need(ds4_gpu_mtp_native_screen2(out2,ids2,scratch2,w,bytes,offset,
          DIM,VOCAB,PREFIX,TAIL,x2,1)==CAP2,"R2 deferred finite screen");
     need(ds4_gpu_tensor_read(out2,0,values[0],2ull*CAP2*4u)&&
