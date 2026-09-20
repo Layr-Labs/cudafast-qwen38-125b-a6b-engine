@@ -18193,6 +18193,85 @@ static int cuda_q8_mma_pipe_actpol(void) {
     return cached;
 }
 
+/* THE DENSE Q8 DISPATCH'S VALVES, RESOLVED ONCE.
+ *
+ * This dispatcher is the single busiest host function in a decode round:
+ * every dense quantised projection in the tower reaches it -- the attention
+ * query/key/value and output projections, the deltanet in and out
+ * projections, the hyper-connection legs and the language-model head -- so
+ * it runs many times per layer and dozens of times per token.
+ *
+ * Its ladder screens each call against named bisection valves, and the same
+ * names recur down the rungs: the row-tile screen is tested at five places,
+ * the three-row verify screen at four, the pair-lanes width screen at three,
+ * and the warp-pair, staged, rolling, streaming and wide-block screens once
+ * each.  Every test was a `getenv`, which on glibc walks `environ` with a
+ * comparison per entry and, on the MISS that a ranked run always takes,
+ * walks it to the end before returning null.
+ *
+ * That work sits on the host between two kernel launches of a launch-bound
+ * round and its answer cannot change: the environment of a running process
+ * is fixed for the purposes of these flags.  These resolvers cache it in a
+ * function-local static -- the form the actpol valve directly above and the
+ * staged-weight valve earlier in this file already use.  A benign race
+ * between two threads resolving the same name writes the same value, and
+ * every name is kept, so bisection is unchanged. */
+static int cuda_q8_no_row_tile(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_NO_ROW_TILE") != NULL;
+    return v;
+}
+static int cuda_q8_no_eh_proj_r8(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_NO_EH_PROJ_R8") != NULL;
+    return v;
+}
+static int cuda_q8_no_wide_verify(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_NO_WIDE_VERIFY") != NULL;
+    return v;
+}
+static int cuda_q8_wide_verify_r2(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_WIDE_VERIFY_R2") != NULL;
+    return v;
+}
+static int cuda_q8_no_hc_down_pair(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_Q8_NO_HC_DOWN_PAIR") != NULL;
+    return v;
+}
+static int cuda_q8_no_stream_loads(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_Q8_NO_STREAM_LOADS") != NULL;
+    return v;
+}
+static int cuda_q8_no_hc_warp_pair(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_Q8_NO_HC_WARP_PAIR") != NULL;
+    return v;
+}
+static int cuda_q8_no_pair_lanes_stage(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_NO_PAIR_LANES_STAGE") != NULL;
+    return v;
+}
+static int cuda_q8_no_pair_lanes_roll(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_NO_PAIR_LANES_ROLL") != NULL;
+    return v;
+}
+static int cuda_q8_pair_lanes_r2(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_PAIR_LANES_R2") != NULL;
+    return v;
+}
+static int cuda_q8_wide_blocks(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_Q8_WIDE_BLOCKS") != NULL;
+    return v;
+}
+
 template <int WM, int WN, int MT, int NT, int G, int STAGES>
 static int cuda_q8_mma_pipe_launch(float *out, const unsigned char *w,
                                    const int8_t *xq, const float *xscale,
@@ -18373,8 +18452,8 @@ static int cuda_matmul_q8_0_preq_rows_exact(
     if (g_q8_dense_mma_enabled && cuda_q8_mma_available() && n_rows == 8u &&
         in_dim == 2ull * out_dim && out_dim == 2560ull &&
         cuda_q8_use_dp4a() && (((uintptr_t)wptr & 1u) == 0u) &&
-        getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
-        getenv("DS4_QWEN4EXP_NO_EH_PROJ_R8") == NULL) {
+        !cuda_q8_no_row_tile() &&
+        !cuda_q8_no_eh_proj_r8()) {
         matmul_q8_0_preq_pair_lanes_kernel<8, false><<<
                 dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u),
                 256, 0, cuda_decode_stream()>>>(
@@ -18383,7 +18462,7 @@ static int cuda_matmul_q8_0_preq_rows_exact(
         return cuda_ok(cudaGetLastError(), "q8 eh_proj R8 pair lanes launch");
     }
     if (g_q8_dense_mma_enabled && cuda_q8_mma_available() && n_rows >= 8u &&
-        getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL) {
+        !cuda_q8_no_row_tile()) {
         if (cuda_q8_mma_pipe_try((float *)out->ptr,
                                  reinterpret_cast<const unsigned char *>(wptr),
                                  xq, xscale, out_dim, n_rows, blocks)) {
@@ -18417,14 +18496,14 @@ static int cuda_matmul_q8_0_preq_rows_exact(
      * three-row consumer is launched plainly and its fence is a no-op.
      * DS4_QWEN4EXP_NO_WIDE_VERIFY restores the <= 2 gates. */
     const bool wide_verify3 = (n_rows == 3u || n_rows == 4u) &&
-        getenv("DS4_QWEN4EXP_NO_WIDE_VERIFY") == NULL;
+        !cuda_q8_no_wide_verify();
     if (use_dp4a && (n_rows == 2u || wide_verify3) &&
         in_dim == 10240u && out_dim == 320u &&
-        getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
-        getenv("DS4_Q8_NO_HC_DOWN_PAIR") == NULL &&
+        !cuda_q8_no_row_tile() &&
+        !cuda_q8_no_hc_down_pair() &&
         (((uintptr_t)wptr & 1u) == 0u)) {
         if (n_rows == 4u ||
-            (n_rows == 3u && getenv("DS4_QWEN4EXP_WIDE_VERIFY_R2") == NULL)) {
+            (n_rows == 3u && !cuda_q8_wide_verify_r2())) {
             /* One four-row tile: the weight block is read once for all three
              * rows (the split below reads it twice).  Same per-row chains. */
             matmul_q8_0_preq_pair_lanes_kernel<4, false><<<
@@ -18460,14 +18539,14 @@ static int cuda_matmul_q8_0_preq_rows_exact(
      * tree are restored. Wider calls and partial groups keep their kernels. */
     if (use_dp4a && (n_rows <= 2u || wide_verify3) && out_dim > 512u &&
         (in_dim & 31u) == 0u &&
-        getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
+        !cuda_q8_no_row_tile() &&
         (((uintptr_t)wptr & 1u) == 0u)) {
         /* Real-input first-use timing supports streaming for HC up. Larger
          * projections retain their ordinary cache policy. */
         if (in_dim == 320u && out_dim == 10240u &&
-            getenv("DS4_Q8_NO_STREAM_LOADS") == NULL) {
+            !cuda_q8_no_stream_loads()) {
             if (n_rows == 4u ||
-                (n_rows == 3u && getenv("DS4_QWEN4EXP_WIDE_VERIFY_R2") == NULL)) {
+                (n_rows == 3u && !cuda_q8_wide_verify_r2())) {
                 /* One four-row tile, weight read once (streaming loads, as
                  * the HC up valve leg).  Same per-row chains. */
                 matmul_q8_0_preq_pair_lanes_kernel<4><<<
@@ -18475,7 +18554,7 @@ static int cuda_matmul_q8_0_preq_rows_exact(
                         256, 0, cuda_decode_stream()>>>(
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
                         out_dim, n_rows, blocks);
-            } else if (n_rows == 3u && getenv("DS4_Q8_NO_HC_WARP_PAIR") == NULL) {
+            } else if (n_rows == 3u && !cuda_q8_no_hc_warp_pair()) {
                 /* Rows 0..1 as one warp-pair call, row 2 as a one-row call
                  * on shifted views; per-row arithmetic is independent of
                  * `rows`.  Plain launches (no trigger at three rows). */
@@ -18491,7 +18570,7 @@ static int cuda_matmul_q8_0_preq_rows_exact(
                         (const unsigned char *)wptr,
                         xq + 2u * blocks * 32u, xscale + 2u * blocks,
                         out_dim, 1u);
-            } else if (getenv("DS4_Q8_NO_HC_WARP_PAIR") == NULL) {
+            } else if (!cuda_q8_no_hc_warp_pair()) {
                 /* PDL consumer: the stream predecessor is
                  * qwen4exp_hc_silu_quant, which triggers at its top
                  * (ds4_cuda_qwen4exp.cuh).
@@ -18559,7 +18638,7 @@ static int cuda_matmul_q8_0_preq_rows_exact(
             const size_t pl_panel = (size_t)4u * (size_t)blocks * 34u;
             const int pl_stage = pl_panel <= 12288u &&
                 (((uintptr_t)wptr) & 15u) == 0u &&
-                getenv("DS4_QWEN4EXP_NO_PAIR_LANES_STAGE") == NULL;
+                !cuda_q8_no_pair_lanes_stage();
             /* THE ROLLING ARM'S GATE: the panels the staged arm declines,
              * where sixty-four groups divide the row, on a sixteen-byte
              * aligned slab.  Its shared request is two portions of four
@@ -18573,9 +18652,9 @@ static int cuda_matmul_q8_0_preq_rows_exact(
             const size_t pl_roll_smem = (size_t)2u * 4u * 64u * 34u;
             const int pl_roll = pl_panel > 12288u && (blocks % 64u) == 0u &&
                 (((uintptr_t)wptr) & 15u) == 0u &&
-                getenv("DS4_QWEN4EXP_NO_PAIR_LANES_ROLL") == NULL;
+                !cuda_q8_no_pair_lanes_roll();
             if (n_rows == 1u && pl_roll &&
-                getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL) {
+                !cuda_q8_pair_lanes_r2()) {
                 /* PDL consumer as below; the first portion rides the window. */
                 QWEN4EXP_LAUNCH_PDL(
                         (matmul_q8_0_preq_pair_lanes_roll_kernel<1, 64>),
@@ -18584,7 +18663,7 @@ static int cuda_matmul_q8_0_preq_rows_exact(
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
                         out_dim, n_rows, blocks);
             } else if (n_rows == 1u && pl_stage &&
-                getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL) {
+                !cuda_q8_pair_lanes_r2()) {
                 /* PDL consumer as below; the staged fill rides the window. */
                 QWEN4EXP_LAUNCH_PDL(
                         (matmul_q8_0_preq_pair_lanes_kernel<1, false, true>),
@@ -18592,7 +18671,7 @@ static int cuda_matmul_q8_0_preq_rows_exact(
                         256, pl_panel, cuda_decode_stream(),
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
                         out_dim, n_rows, blocks);
-            } else if (n_rows == 1u && getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL) {
+            } else if (n_rows == 1u && !cuda_q8_pair_lanes_r2()) {
                 /* PDL consumer: the stream predecessor is the decode
                  * quantizer, which triggers at its top (decode widths). */
                 QWEN4EXP_LAUNCH_PDL(
@@ -18603,7 +18682,7 @@ static int cuda_matmul_q8_0_preq_rows_exact(
                         out_dim, n_rows, blocks);
             } else if (n_rows == 4u ||
                        (n_rows == 3u &&
-                        getenv("DS4_QWEN4EXP_WIDE_VERIFY_R2") == NULL)) {
+                        !cuda_q8_wide_verify_r2())) {
                 /* One four-row tile: the weight read once for three rows. */
                 matmul_q8_0_preq_pair_lanes_kernel<4, false><<<
                         dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u),
@@ -18651,7 +18730,7 @@ static int cuda_matmul_q8_0_preq_rows_exact(
      * extra synchronization is involved.  Wide/prefill calls keep their old
      * block geometry.  The override permits a same-binary geometry check. */
     const unsigned warps = n_rows < 8u && out_dim <= 512u &&
-        getenv("DS4_QWEN4EXP_Q8_WIDE_BLOCKS") == NULL ? 1u : 8u;
+        !cuda_q8_wide_blocks() ? 1u : 8u;
     const unsigned wthreads = warps * 32u;
     const unsigned wgrid = ((unsigned)out_dim + warps - 1u) / warps;
 
@@ -18660,7 +18739,7 @@ static int cuda_matmul_q8_0_preq_rows_exact(
      * kernels stand: one row is the decode call and takes the per-row kernel,
      * and above that the eight-row tile reads each weight block once for up to
      * eight rows with the SAME per-row arithmetic. */
-    if (n_rows == 1u || getenv("DS4_QWEN4EXP_NO_ROW_TILE") != NULL) {
+    if (n_rows == 1u || cuda_q8_no_row_tile()) {
         dim3 grid(wgrid, n_rows, 1u);
         matmul_q8_0_preq_warp8_kernel<<<grid, wthreads, 0, cuda_decode_stream()>>>(
                 (float *)out->ptr,
@@ -38469,3 +38548,4 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
 #include "ds4_deepseek4_vision_gpu.cuh"
 
 #include "ds4_cuda_mtp_native.cuh"
+#define GAUNTLET_REDRAW_f1732987_20260920T190431Z 1
