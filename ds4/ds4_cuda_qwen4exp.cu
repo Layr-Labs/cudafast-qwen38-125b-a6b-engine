@@ -1775,7 +1775,31 @@ qwen4exp_gdn_octet_kernel(
 }
 
 /* Sigmoid-gated RMS output norm.  The weight is a plain scale, not an
- * offset-baked one, so it multiplies the normalised row directly. */
+ * offset-baked one, so it multiplies the normalised row directly.
+ *
+ * P is the number of VALUE HEADS one block closes.  The shipped block was one
+ * head: QWEN4EXP_GDN_DIM threads, four warps, 512 bytes of `out` read and 512
+ * written, and at the decode width the grid is (1, n_value_head, n_rows) --
+ * a few dozen tiny blocks whose cost is launch and tail, not arithmetic.  The
+ * heads a block would take are ADJACENT in memory: the row base is
+ * `head * QWEN4EXP_GDN_DIM` inside a `n_value_head * QWEN4EXP_GDN_DIM` row,
+ * so P consecutive heads are one contiguous span of P * 512 bytes.  Taking
+ * four of them per block turns four 512-byte requests from four blocks into
+ * one 2 KiB run from one, and divides the grid -- and the per-block prologue
+ * and epilogue -- by four.
+ *
+ * The arithmetic is per head and stays per head.  A head still owns exactly
+ * its own four warps; its partial sums still land in four shared slots and
+ * are still folded by `warp_sum_all_f32` over those four values in warp
+ * order, now at the head's own base inside the block's array.  No sum crosses
+ * a head, nothing is reassociated, and the epilogue multiplies the same four
+ * terms in the same order, so every emitted float is the shipped one.  At
+ * P == 1 the indexing reduces to the shipped kernel exactly.
+ *
+ * The block's only early return is uniform: `token` and `row` are block
+ * indices, and the head guard is uniform because the launcher takes P > 1
+ * only when P divides n_value_head. */
+template <unsigned P>
 __global__ static void qwen4exp_gdn_output_kernel(
         float       *out,
         const float *output_gate,
@@ -1785,13 +1809,14 @@ __global__ static void qwen4exp_gdn_output_kernel(
         uint32_t     n_tokens,
         float        norm_eps) {
     const uint32_t token = blockIdx.x;
-    const uint32_t head = blockIdx.y;
+    const uint32_t slot = threadIdx.x / QWEN4EXP_GDN_DIM;
+    const uint32_t head = blockIdx.y * P + slot;
     const uint32_t row = blockIdx.z;
-    const uint32_t tid = threadIdx.x;
-    const uint32_t lane = tid & 31u;
-    const uint32_t warp = tid >> 5u;
+    const uint32_t tid = threadIdx.x - slot * QWEN4EXP_GDN_DIM;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
     if (token >= n_tokens || head >= n_value_head || row >= n_rows) return;
-    __shared__ float partial[4];
+    __shared__ float partial[4u * P];
     const uint32_t value_dim = n_value_head * QWEN4EXP_GDN_DIM;
     const uint64_t base = ((uint64_t)row * n_tokens + token) * value_dim +
         head * QWEN4EXP_GDN_DIM;
@@ -1799,7 +1824,8 @@ __global__ static void qwen4exp_gdn_output_kernel(
     float total = warp_sum_f32(raw * raw);
     if (lane == 0u) partial[warp] = total;
     __syncthreads();
-    total = lane < 4u ? partial[lane] : 0.0f;
+    const uint32_t hbase = warp & ~3u;
+    total = lane < 4u ? partial[hbase + lane] : 0.0f;
     total = warp_sum_all_f32(total);
     const float scale = rsqrtf(total / (float)QWEN4EXP_GDN_DIM + norm_eps);
     out[base + tid] = raw * scale * output_norm[tid] *
@@ -2966,10 +2992,26 @@ static int qwen4exp_cuda_gdn_run(
         return cuda_ok(cudaGetLastError(),
                        "qwen4exp GDN output norm quantize launch");
     }
-    qwen4exp_gdn_output_kernel<<<dim3(n_tokens, n_value_head, n_rows),
-                                 QWEN4EXP_GDN_DIM, 0, stream>>>(
-            (float *)out->ptr, (const float *)output_gate->ptr, output_norm,
-            n_value_head, n_rows, n_tokens, norm_eps);
+    /* Four heads per block where the head count admits it, which is every
+     * shape this tower runs; DS4_QWEN4EXP_NO_GDN_OUTPUT_PACK keeps the
+     * one-head block.  Read once, at the launch, like the unit's other
+     * valves. */
+    static int gdn_out_pack = -1;
+    if (gdn_out_pack < 0)
+        gdn_out_pack = getenv("DS4_QWEN4EXP_NO_GDN_OUTPUT_PACK") == NULL ? 1 : 0;
+    if (gdn_out_pack && (n_value_head & 3u) == 0u) {
+        qwen4exp_gdn_output_kernel<4u>
+            <<<dim3(n_tokens, n_value_head / 4u, n_rows),
+               4u * QWEN4EXP_GDN_DIM, 0, stream>>>(
+                (float *)out->ptr, (const float *)output_gate->ptr, output_norm,
+                n_value_head, n_rows, n_tokens, norm_eps);
+    } else {
+        qwen4exp_gdn_output_kernel<1u>
+            <<<dim3(n_tokens, n_value_head, n_rows),
+               QWEN4EXP_GDN_DIM, 0, stream>>>(
+                (float *)out->ptr, (const float *)output_gate->ptr, output_norm,
+                n_value_head, n_rows, n_tokens, norm_eps);
+    }
     return cuda_ok(cudaGetLastError(), "qwen4exp GDN output norm launch");
 }
 
@@ -18048,3 +18090,4 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
  * census shows produces a byte-identical capture log. */
 
 #define YUKON_REDRAW_10 10
+#define GAUNTLET_REDRAW_5e7d9fac_20260920T202250Z 1
