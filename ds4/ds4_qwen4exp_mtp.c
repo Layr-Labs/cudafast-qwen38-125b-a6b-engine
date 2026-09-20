@@ -457,6 +457,49 @@ static int mtp_draft_chain(ds4_qwen4exp_mtp_state *st,
         return 0;
     }
 
+    /* A prompt/history match needs neither the learned head block nor its
+     * vocabulary projection.  Ask it before repairing or extending the head
+     * cache; the session seam publishes any target rows this zero-model-cost
+     * path leaves missing.  `toks` is the just-committed target prefix and
+     * next_fed is the frontier token from which pending[0] is predicted. */
+    if (model->lookup_drafts) {
+        int found[DS4_QWEN4EXP_IMPLEMENTED_DEPTH];
+        const int got = model->lookup_drafts(model->ctx, toks,
+                                              (uint32_t)n + 1u, next_fed,
+                                              found, (uint32_t)st->depth);
+        if (got < 0) {
+            return mtp_fail(err, errlen,
+                            "qwen4exp MTP: prompt lookup failed at position %u",
+                            start);
+        }
+        if (got > st->depth) {
+            return mtp_fail(err, errlen,
+                            "qwen4exp MTP: prompt lookup returned %d drafts "
+                            "for depth %d", got, st->depth);
+        }
+        if (got > 0) {
+            for (int k = 0; k < got; k++) {
+                if (found[k] < 0 || (uint32_t)found[k] >= model->n_vocab) {
+                    return mtp_fail(err, errlen,
+                                    "qwen4exp MTP: prompt lookup returned "
+                                    "invalid token %d", found[k]);
+                }
+                st->pending[k] = found[k];
+                st->pending_margin[k] = -1.0f;
+            }
+            st->n_pending = got;
+            st->pending_parent = next_fed;
+            st->counters.draft_ns += mtp_now_ns() - t0;
+            return 0;
+        }
+    }
+
+    int draft_depth = st->depth;
+    if (model->mtp_fallback_depth > 0u &&
+        model->mtp_fallback_depth < (uint32_t)draft_depth) {
+        draft_depth = (int)model->mtp_fallback_depth;
+    }
+
     const uint32_t j0 = st->head_rows < pos ? pos : st->head_rows;
     float *const ping = st->hc_scratch +
                         (size_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * st->hc_dim;
@@ -481,7 +524,7 @@ static int mtp_draft_chain(ds4_qwen4exp_mtp_state *st,
         int rows_tok[DS4_QWEN4EXP_MTP_MAX_COMMIT];
         for (uint32_t i = 0; i < seeds; i++) rows_tok[i] = toks[k0 + i + 1u];
         rows_tok[seeds] = next_fed;
-        float *multi_out = (1 < st->depth) ? ping : NULL;
+        float *multi_out = (1 < draft_depth) ? ping : NULL;
         int draft = -1;
         if (model->draft_rows(model->ctx, rows_tok,
                               hc_rows + (size_t)k0 * st->hc_dim,
@@ -514,7 +557,7 @@ static int mtp_draft_chain(ds4_qwen4exp_mtp_state *st,
         st->head_rows = start;
     }
 
-    for (; k < st->depth; k++) {
+    for (; k < draft_depth; k++) {
         /* The margin gate's chain half: nothing past an unsure link. */
         if (k > 0 && st->stop_margin > 0.0f &&
             st->pending_margin[k - 1] >= 0.0f &&
@@ -522,7 +565,7 @@ static int mtp_draft_chain(ds4_qwen4exp_mtp_state *st,
             break;
         }
         /* The last step's `multi` row would have no reader. */
-        float *multi_out = (k + 1 < st->depth)
+        float *multi_out = (k + 1 < draft_depth)
                          ? ping + (size_t)(k & 1) * st->hc_dim : NULL;
         int draft = -1;
         if (model->draft_step(model->ctx, cur_tok, cur_hc, p, &draft,
@@ -565,7 +608,8 @@ static int mtp_commit_one(ds4_qwen4exp_mtp_state *st,
     }
     const int next = ds4_qwen4exp_mtp_argmax(logits, model->n_vocab);
     if (next_out) *next_out = next;
-    if (mtp_draft_chain(st, model, hc0, NULL, 0, pos, next,
+    const int committed[1] = { first_token };
+    if (mtp_draft_chain(st, model, hc0, committed, 0, pos, next,
                         err, errlen) != 0) {
         return -1;
     }

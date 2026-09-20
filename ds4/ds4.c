@@ -67595,6 +67595,42 @@ static int ds4_session_qwen4exp_cache_rows(ds4_session *s, const int *tokens,
     return 0;
 }
 
+/* Finish the MTP-head cache after a speculative cycle.  Learned drafts have
+ * normally written these rows already.  A prompt-lookup chain deliberately
+ * skipped the head, so publish only the missing accepted transitions from the
+ * target HC block and retain the final row until its actual next token arrives.
+ * The common learned-MTP path sees an empty range and pays no extra GPU work. */
+static int ds4_session_qwen4exp_cache_finish_cycle(
+        ds4_session *s, const int *tokens, uint32_t n, uint32_t pos0,
+        char *err, size_t errlen) {
+    ds4_qwen4exp_mtp_head *h = &s->qwen4exp_head;
+    if (!h->cache_seed_capacity || !n) return 0;
+    ds4_gpu_tensor *hyper =
+        ds4_qwen4exp_session_hyper(s->engine->qwen4exp_session);
+    const uint32_t last_pos = pos0 + n - 1u;
+    uint32_t seed_pos = s->qwen4exp_spec.head_rows;
+    if (seed_pos < pos0) seed_pos = pos0;
+    while (seed_pos < last_pos) {
+        uint32_t take = last_pos - seed_pos;
+        if (take > h->cache_seed_capacity) take = h->cache_seed_capacity;
+        const uint32_t first = seed_pos - pos0;
+        if (ds4_qwen4exp_mtp_head_seed_cache(
+                h, tokens + first + 1u, hyper, first, seed_pos, take,
+                err, errlen) != 0) return -1;
+        seed_pos += take;
+    }
+    if (s->qwen4exp_spec.head_rows < last_pos) {
+        s->qwen4exp_spec.head_rows = last_pos;
+    }
+    /* A learned draft wrote the final row while predicting pending_parent;
+     * lookup did not.  Mark the latter unknown so cache_feed_tail publishes it
+     * from this retained target row at the next cycle boundary. */
+    const int known_next = s->qwen4exp_spec.head_rows > last_pos
+        ? s->qwen4exp_spec.pending_parent : -1;
+    return ds4_qwen4exp_mtp_head_retain_cache_tail(
+            h, hyper, n - 1u, last_pos, known_next, err, errlen);
+}
+
 /* Run `n` tokens at the session's current position and leave the last row's
  * logits in s->logits.  One chunk, bounded by the session's batch. */
 static int ds4_session_qwen4exp_rows(ds4_session *s, const int *tokens,
@@ -76159,6 +76195,92 @@ static float qwen4exp_seam_draft_margin(void *ctx) {
     return s->qwen4exp_head.last_margin;
 }
 
+/* Read the virtual token tape visible while a cycle is still inside the MTP
+ * core.  The session checkpoint ends before this round; append the rows the
+ * target just committed and then its frontier winner without copying a
+ * potentially long prompt. */
+static int qwen4exp_lookup_token(const ds4_session *s,
+                                 const int *committed, uint32_t n_committed,
+                                 int next_token, size_t index) {
+    const size_t checkpoint_len = s->checkpoint.len > 0
+        ? (size_t)s->checkpoint.len : 0u;
+    if (index < checkpoint_len) return s->checkpoint.v[index];
+    index -= checkpoint_len;
+    if (index < n_committed) return committed[index];
+    return next_token;
+}
+
+/* Copy the continuation of an earlier occurrence of the current suffix.
+ * Every eligible occurrence must agree on the continuation: this keeps the
+ * cheap path for repeated passages while ambiguous natural-language n-grams
+ * fall back to the learned MTP head. */
+static int qwen4exp_lookup_match(const ds4_session *s,
+                                 const int *committed, uint32_t n_committed,
+                                 int next_token, uint32_t ngram,
+                                 uint32_t drafts, int *out) {
+    const size_t checkpoint_len = s->checkpoint.len > 0
+        ? (size_t)s->checkpoint.len : 0u;
+    const size_t total = checkpoint_len + (size_t)n_committed + 1u;
+    if (drafts == 0u || total < (size_t)ngram + drafts + 1u) return 0;
+    const size_t suffix = total - ngram;
+    const size_t first = suffix > 256u ? suffix - 256u : 0u;
+    bool found = false;
+    for (size_t i = first;
+         i + (size_t)ngram + drafts <= total && i < suffix; i++) {
+        bool same = true;
+        for (uint32_t j = 0; j < ngram; j++) {
+            if (qwen4exp_lookup_token(s, committed, n_committed, next_token,
+                                      i + j) !=
+                qwen4exp_lookup_token(s, committed, n_committed, next_token,
+                                      suffix + j)) {
+                same = false;
+                break;
+            }
+        }
+        if (!same) continue;
+        if (!found) {
+            for (uint32_t j = 0; j < drafts; j++) {
+                out[j] = qwen4exp_lookup_token(
+                        s, committed, n_committed, next_token,
+                        i + (size_t)ngram + j);
+            }
+            found = true;
+            continue;
+        }
+        for (uint32_t j = 0; j < drafts; j++) {
+            if (out[j] != qwen4exp_lookup_token(
+                              s, committed, n_committed, next_token,
+                              i + (size_t)ngram + j)) {
+                return 0;
+            }
+        }
+    }
+    return found ? (int)drafts : 0;
+}
+
+static int qwen4exp_seam_lookup_drafts(void *ctx, const int *committed,
+                                       uint32_t n_committed, int next_token,
+                                       int *draft_out,
+                                       uint32_t max_drafts) {
+    ds4_session *s = ctx;
+    if (!s || !committed || n_committed == 0u || !draft_out ||
+        max_drafts == 0u) return 0;
+
+    /* Keep the ranked decode path bounded: one short suffix probe and at most
+     * three copied tokens.  The native depth-1 head remains the miss path. */
+    const uint32_t drafts = max_drafts > 3u ? 3u : max_drafts;
+    int n = qwen4exp_lookup_match(s, committed, n_committed, next_token,
+                                  4u, drafts, draft_out);
+    if (n > 0 && getenv("DS4_QWEN4EXP_PROMPT_LOOKUP_LOG")) {
+        fprintf(stderr,
+                "ds4: qwen4exp prompt lookup pos=%zu drafts=%d parent=%d\n",
+                (size_t)(s->checkpoint.len > 0 ? s->checkpoint.len : 0) +
+                    n_committed,
+                n, next_token);
+    }
+    return n;
+}
+
 /* Build the seam, the rollback set and the head, once per session.  Returns
  * false with a named message when anything refuses, and the caller returns -1:
  * a half-built cycle is a refusal, not a reason to speculate anyway. */
@@ -76246,6 +76368,11 @@ static bool ds4_session_qwen4exp_spec_init(ds4_session *s,
     s->qwen4exp_seam.draft_step   = qwen4exp_seam_draft_step;
     s->qwen4exp_seam.draft_rows   = qwen4exp_seam_draft_rows;
     s->qwen4exp_seam.draft_margin = qwen4exp_seam_draft_margin;
+    const char *lookup = getenv("DS4_QWEN4EXP_PROMPT_LOOKUP");
+    if (!lookup || strcmp(lookup, "0") != 0) {
+        s->qwen4exp_seam.lookup_drafts = qwen4exp_seam_lookup_drafts;
+        s->qwen4exp_seam.mtp_fallback_depth = 1u;
+    }
 
     const int depth = ds4_qwen4exp_mtp_depth_from_draft_tokens(
             e->mtp_draft_tokens, err, errlen);
@@ -76294,11 +76421,8 @@ static int ds4_session_qwen4exp_spec_cycle(ds4_session *s, int first_token,
      * value counts committed rows, so n-1 selects the accepted frontier even
      * when later physical verify rows were rejected. Preserve this invariant
      * if graph/cycle scratch lifetimes change. */
-    if (n > 0 && s->qwen4exp_head.cache_seed_capacity &&
-        ds4_qwen4exp_mtp_head_retain_cache_tail(&s->qwen4exp_head,
-            ds4_qwen4exp_session_hyper(e->qwen4exp_session), (uint32_t)n - 1u,
-            pos + (uint32_t)n - 1u, s->qwen4exp_spec.pending_parent,
-            err, errlen) != 0) return -1;
+    if (n > 0 && ds4_session_qwen4exp_cache_finish_cycle(
+            s, accepted, (uint32_t)n, pos, err, errlen) != 0) return -1;
     /* Push what the round committed, the way every sibling verifier does.  The
      * serial path appends inside the forward, but the cycle's rows go through
      * the seam, so without this ds4_session_pos() freezes at the prompt length
