@@ -402,6 +402,7 @@ enum cuda_derived_kind {
     CUDA_DERIVED_IQ2_XXS_ALIGNED_MOE = 4,
     CUDA_DERIVED_Q8_0_ALIGNED_DENSE = 5,
     CUDA_DERIVED_Q2_K_ALIGNED_MOE = 6,
+    CUDA_DERIVED_Q8_0_MTP_SCREEN = 7,
 };
 
 struct cuda_derived_range {
