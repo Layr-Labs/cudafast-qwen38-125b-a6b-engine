@@ -3964,8 +3964,12 @@ __global__ void q8_0_aligned_dense_vec_kernel(
     float acc = 0.0f;
     for (int b0 = 0; b0 < nb; b0 += 32) {
         const int b = b0 + lane;
-        const int4 w0 = qs[(rbase + b) * 2 + 0];   // aligned 16B loads
-        const int4 w1 = qs[(rbase + b) * 2 + 1];
+        /* The weight stream is read exactly once per launch -- a pure
+         * stream, like the __ldcs paths in ds4_cuda.cu.  Evict-first keeps
+         * it from displacing the activation block and persistent state in
+         * L2.  Same bits, cache hint only. */
+        const int4 w0 = __ldcs(qs + (rbase + b) * 2 + 0);
+        const int4 w1 = __ldcs(qs + (rbase + b) * 2 + 1);
         const int *u = (const int *)x8[b].qs;
         int sumi = 0;
         sumi = ggml_cuda_dp4a(w0.x, u[0], sumi);
@@ -3976,7 +3980,9 @@ __global__ void q8_0_aligned_dense_vec_kernel(
         sumi = ggml_cuda_dp4a(w1.y, u[5], sumi);
         sumi = ggml_cuda_dp4a(w1.z, u[6], sumi);
         sumi = ggml_cuda_dp4a(w1.w, u[7], sumi);
-        acc += __half2float(dq[rbase + b]) * __low2float(x8[b].ds) * (float)sumi;
+        acc += __half2float(__ushort_as_half(
+                    __ldcs((const uint16_t *)dq + rbase + b))) *
+               __low2float(x8[b].ds) * (float)sumi;
     }
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
@@ -4010,9 +4016,10 @@ __global__ void q8_0_aligned_dense_vec_nc_kernel(
 
     for (int b0 = 0; b0 < nb; b0 += 32) {
         const int b = b0 + lane;
-        const int4 w0 = qs[(rbase + b) * 2 + 0];   // aligned 16B, read once
-        const int4 w1 = qs[(rbase + b) * 2 + 1];
-        const float dw = __half2float(dq[rbase + b]);
+        const int4 w0 = __ldcs(qs + (rbase + b) * 2 + 0);   // aligned 16B, read once
+        const int4 w1 = __ldcs(qs + (rbase + b) * 2 + 1);
+        const float dw = __half2float(__ushort_as_half(
+                __ldcs((const uint16_t *)dq + rbase + b)));
 #pragma unroll
         for (int c = 0; c < NC; c++) {
             const block_q8_1 *xb = &x8[(size_t)c * nb + b];
@@ -4082,8 +4089,8 @@ __global__ void q8_0_aligned_dense_vec_pair_kernel(
     float acc = 0.0f;
     for (int b0 = 0; b0 < nb; b0 += 32) {
         const int b = b0 + lane;
-        const int4 w0 = qs[(rbase + b) * 2 + 0];
-        const int4 w1 = qs[(rbase + b) * 2 + 1];
+        const int4 w0 = __ldcs(qs + (rbase + b) * 2 + 0);
+        const int4 w1 = __ldcs(qs + (rbase + b) * 2 + 1);
         const int *u = (const int *)x8[b].qs;
         int sumi = 0;
         sumi = ggml_cuda_dp4a(w0.x, u[0], sumi);
@@ -4094,7 +4101,8 @@ __global__ void q8_0_aligned_dense_vec_pair_kernel(
         sumi = ggml_cuda_dp4a(w1.y, u[5], sumi);
         sumi = ggml_cuda_dp4a(w1.z, u[6], sumi);
         sumi = ggml_cuda_dp4a(w1.w, u[7], sumi);
-        acc += __half2float(dq[rbase + b]) *
+        acc += __half2float(__ushort_as_half(
+                    __ldcs((const uint16_t *)dq + rbase + b))) *
                __low2float(x8[b].ds) * (float)sumi;
     }
 #pragma unroll
@@ -4949,3 +4957,4 @@ template void mul_mat_q_case<GGML_TYPE_Q4_K>(
     ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
 template void mul_mat_q_case<GGML_TYPE_MXFP4>(
     ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+// redraw fe17f43d 20260920T022223Z
