@@ -52,6 +52,17 @@ uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
+
+/* Pinned host staging for the hot upload paths: cudaMallocHost memory a
+ * cudaMemcpyAsync can source without staging through the driver's pageable
+ * bounce buffer.  ds4_gpu_tensor_write_async issues the copy on the decode
+ * stream and returns before it lands; the caller must not rewrite the host
+ * buffer until a stream or device synchronize has run.  Backends without a
+ * pinned path fall back to ordinary malloc and a synchronous copy. */
+void *ds4_gpu_host_alloc_pinned(uint64_t bytes);
+void ds4_gpu_host_free_pinned(void *p);
+int ds4_gpu_tensor_write_async(ds4_gpu_tensor *tensor, uint64_t offset,
+                               const void *data, uint64_t bytes);
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
@@ -889,23 +900,9 @@ int ds4_gpu_mtp_native_screen_init(uint32_t width, uint64_t *bytes, uint32_t *ca
 int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out, ds4_gpu_tensor *ids,
     ds4_gpu_tensor *scratch, const void *map, uint64_t bytes, uint64_t offset,
     uint32_t dim, uint32_t vocab, uint32_t prefix, uint32_t tail,
-    const ds4_gpu_tensor *x, int defer_invalid);
-int ds4_gpu_mtp_native_screen2_init(uint32_t width, uint64_t *bytes,
-    uint32_t *capacity);
-int ds4_gpu_mtp_native_screen2(ds4_gpu_tensor *out, ds4_gpu_tensor *ids,
-    ds4_gpu_tensor *scratch, const void *map, uint64_t bytes, uint64_t offset,
-    uint32_t dim, uint32_t vocab, uint32_t prefix, uint32_t tail,
-    const ds4_gpu_tensor *x, int defer_invalid);
+    const ds4_gpu_tensor *x);
 int ds4_gpu_mtp_native_map(ds4_gpu_tensor *winner, const ds4_gpu_tensor *logits,
-    const ds4_gpu_tensor *ids, const ds4_gpu_tensor *scratch,
-    uint32_t count, uint32_t vocab, uint32_t screen_width, int defer_invalid);
-int ds4_gpu_mtp_native_scatter(ds4_gpu_tensor *out, uint64_t out_offset,
-    const ds4_gpu_tensor *values, const ds4_gpu_tensor *ids,
-    uint32_t count, uint32_t vocab);
-int ds4_gpu_mtp_native_scatter2(ds4_gpu_tensor *out,
-    const ds4_gpu_tensor *values, const ds4_gpu_tensor *ids,
-    const ds4_gpu_tensor *scratch, ds4_gpu_tensor *winner,
-    uint32_t count, uint32_t vocab, uint32_t screen_width, int defer_invalid);
+    const ds4_gpu_tensor *ids, uint32_t count, uint32_t vocab);
 
 int ds4_gpu_matmul_q8_0_top1_tensor(
         ds4_gpu_tensor       *selected,
@@ -4043,28 +4040,6 @@ int  ds4_gpu_decode_graphs_supported(void);
 /* Upload a ready decode-graph exec now, so its next launch does not.
  * Returns 1 when an upload was issued, 0 otherwise (never an error). */
 int  ds4_gpu_decode_graph_prefetch(const ds4_decode_graph_key *key);
-/* One-shot graph capture for the PREFILL layer stack: capture, instantiate,
- * launch, and destroy inside the window that built it.  No key and no cache --
- * a prefill layer runs exactly once, and a graph outliving its prefill would
- * let a timed prefill inherit work built in an untimed one, which is the
- * deferred-seed-work defect participant-contract 5.1.1 names.  begin() returns
- * 0 when capturing and -1 when it declines, in which case the caller encodes
- * eagerly exactly as before.  end() is ASYNCHRONOUS: it launches and returns
- * so the host captures the next layer while this one runs on the device.
- * retire() synchronizes first and is safe to call anywhere. */
-int      ds4_gpu_oneshot_graph_begin(void);
-/* retire_settled() destroys WITHOUT synchronizing and is valid only where the
- * caller guarantees completion -- one full device sync later than the forward
- * that built the graphs.  report() prints and resets the capture statistics.
- * The two ends of the lifecycle are paid at different points, so they are
- * reported at different points. */
-void     ds4_gpu_oneshot_graph_retire_settled(void);
-void     ds4_gpu_oneshot_graph_report(void);
-int      ds4_gpu_oneshot_graph_end(void);
-void     ds4_gpu_oneshot_graph_abort(void);
-void     ds4_gpu_oneshot_graph_retire(void);
-uint64_t ds4_gpu_oneshot_graph_captures(void);
-
 int  ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key);
 /* 0: capture committed and launched; -1: capture failed (entry retired;
  * the caller must re-encode the island eagerly -- no work was executed). */
@@ -4283,19 +4258,6 @@ int ds4_gpu_qwen4exp_embed_tokens_hc_tensor(
  * unit. */
 int ds4_gpu_qwen4exp_ehx_pack_tensor(
         ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *embedding,
-        const ds4_gpu_tensor *hidden,
-        uint32_t              n_tokens,
-        uint32_t              n_hc,
-        uint32_t              n_embd);
-
-/* The same pack fused with the Q8_0 quantization the eh_proj matmul applies:
- * writes the packed rows' Q8_0 bytes at q_offset and their f32 scales at
- * s_offset in the layout ds4_gpu_matmul_q8_0_preq_rows_exact_tensor reads. */
-int ds4_gpu_qwen4exp_ehx_pack_quant_tensor(
-        ds4_gpu_tensor       *q,
-        uint64_t              q_offset,
-        uint64_t              s_offset,
         const ds4_gpu_tensor *embedding,
         const ds4_gpu_tensor *hidden,
         uint32_t              n_tokens,

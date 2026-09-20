@@ -1170,219 +1170,6 @@ extern "C" int ds4_gpu_decode_graph_prefetch(const ds4_decode_graph_key *key) {
     return 0;
 }
 
-/* ------------------------------------------------------------------------
- * ONE-SHOT GRAPH CAPTURE, for the prefill layer stack.
- *
- * WHY IT IS A DIFFERENT ENTRY FROM THE CACHED ONE ABOVE.  A decode island is
- * replayed 67 times a run, so its graph is built once and kept.  A PREFILL
- * layer runs EXACTLY ONCE -- every prefill kernel appears once per layer,
- * counted from the engine's own trace -- so there is nothing to cache and a
- * cache would be actively wrong: a graph that outlived its prefill would let
- * a later, TIMED prefill inherit work built in an earlier one, which is the
- * deferred-seed-work defect docs/participant-contract.md section 5.1.1 exists
- * to prevent.  These graphs are therefore destroyed inside the window that
- * built them, and this entry has no key and no table.
- *
- * WHAT MAKES IT PAY ANYWAY.  Capture is host-only and replay is GPU-only, so
- * they PIPELINE: end() launches layer k's graph asynchronously and the host
- * walks straight into layer k+1's capture while the device is still running
- * layer k.  Per layer that is ~33 launches of host work -- a fraction of a
- * millisecond -- against 12-13 ms of GPU time, so the capture is hidden by
- * construction rather than by estimate.
- *
- * THAT IS THE WHOLE INVARIANT, AND IT IS FRAGILE.  Capture does not delete
- * host work; it moves it from BEHIND the GPU span to IN FRONT of it.  A
- * capture that is not overlapped by the previous layer's replay is pure added
- * latency, and the whole-prefill variant of this idea loses for exactly that
- * reason: one capture of all 1,618 launches has nothing running behind it.
- * Anything added here must keep end() asynchronous.
- * ------------------------------------------------------------------------ */
-#define DS4_ONESHOT_GRAPH_MAX 512
-static cudaGraphExec_t g_oneshot_execs[DS4_ONESHOT_GRAPH_MAX];
-static int      g_oneshot_n = 0;
-static int      g_oneshot_capturing = 0;
-static uint64_t g_oneshot_captures = 0;
-static uint64_t g_oneshot_declines = 0;
-
-/* THE INVARIANT PROBE.  This design is worth something only while the host's
- * capture of layer k+1 is overlapped by the device's replay of layer k.  If
- * anything ever makes end() synchronous, the host's per-layer time jumps from
- * a fraction of a millisecond to the layer's whole GPU time and the design has
- * silently become the whole-prefill one, which LOSES.  This measures exactly
- * that, with CLOCK_MONOTONIC rather than from a trace, and prints it under
- * DS4_QWEN4EXP_PF_GRAPH_LOG.  It is the one number that separates the two. */
-static double   g_oneshot_host_ns = 0.0;
-static double   g_oneshot_host_max_ns = 0.0;
-static uint64_t g_oneshot_begin_ns = 0;
-/* THE OTHER END OF THE LIFECYCLE.  Capture was instrumented and held; the cost
- * then landed on DESTRUCTION, at the one point in a forward where the device
- * has nothing queued -- 99 cudaGraphExecDestroy at ~15 us each, measured as a
- * 1.512 ms lengthening of the quantize -> glm_embed_tokens gap at the forward
- * boundary.  WHEN YOU GUARD A LIFECYCLE, GUARD BOTH ENDS: this is the same
- * probe, on the destroy side. */
-static double   g_oneshot_destroy_ns = 0.0;
-static uint64_t cuda_now_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-}
-
-extern "C" uint64_t ds4_gpu_oneshot_graph_captures(void) { return g_oneshot_captures; }
-
-/* Print and reset the CAPTURE statistics for the forward that just finished.
- * Deliberately separate from destruction: the two ends of the lifecycle are
- * now paid at different points and have to be reported at different points. */
-extern "C" void ds4_gpu_oneshot_graph_report(void) {
-    if (g_oneshot_captures == 0) return;
-    if (getenv("DS4_QWEN4EXP_PF_GRAPH_LOG") != NULL && g_oneshot_n > 0) {
-        fprintf(stderr, "ds4: pf graph: %d graphs this forward, host capture "
-                "total %.3f ms, mean %.3f ms, max %.3f ms (declines %llu)\n",
-                g_oneshot_n, g_oneshot_host_ns / 1e6,
-                g_oneshot_host_ns / 1e6 / (double)g_oneshot_n,
-                g_oneshot_host_max_ns / 1e6,
-                (unsigned long long)g_oneshot_declines);
-    }
-    g_oneshot_host_ns = 0.0;
-    g_oneshot_host_max_ns = 0.0;
-}
-
-/* Destroy graphs the caller GUARANTEES have completed, WITHOUT synchronizing.
- *
- * The only call site is one full device sync later than the forward that built
- * them: the next prefill, after its layers 0..3 have been issued eagerly, so
- * about 51 ms of GPU work is queued and the ~1.5 ms of destruction hides
- * behind it.  Synchronizing here would be catastrophic rather than merely
- * wasteful -- it would wait out that queued work -- which is why this entry
- * exists separately from the syncing one below rather than taking a flag. */
-extern "C" void ds4_gpu_oneshot_graph_retire_settled(void) {
-    if (g_oneshot_n == 0) return;
-    const uint64_t t0 = cuda_now_ns();
-    const int n = g_oneshot_n;
-    for (int i = 0; i < g_oneshot_n; i++) {
-        if (g_oneshot_execs[i]) (void)cudaGraphExecDestroy(g_oneshot_execs[i]);
-        g_oneshot_execs[i] = NULL;
-    }
-    g_oneshot_n = 0;
-    (void)cudaGetLastError();
-    g_oneshot_destroy_ns = (double)(cuda_now_ns() - t0);
-    if (getenv("DS4_QWEN4EXP_PF_GRAPH_LOG") != NULL) {
-        fprintf(stderr, "ds4: pf graph: destroyed %d graphs in %.3f ms, "
-                "behind queued layer 0-3 work\n", n, g_oneshot_destroy_ns / 1e6);
-    }
-}
-
-/* Destroy every graph still parked, synchronizing first.  For the error path
- * and for teardown, where nothing guarantees completion. */
-extern "C" void ds4_gpu_oneshot_graph_retire(void) {
-    if (g_oneshot_n == 0) return;
-    if (getenv("DS4_QWEN4EXP_PF_GRAPH_LOG") != NULL) {
-        /* HOST time spent capturing, against the GPU time it must hide behind
-         * (a prefill layer is 12-13 ms).  A mean well under a millisecond means
-         * the capture is pipelined; anything near the layer time means it is
-         * not, and the design has inverted into the one that loses. */
-        fprintf(stderr, "ds4: pf graph: %d graphs this forward, host capture "
-                "total %.3f ms, mean %.3f ms, max %.3f ms (declines %llu)\n",
-                g_oneshot_n, g_oneshot_host_ns / 1e6,
-                g_oneshot_host_ns / 1e6 / (double)g_oneshot_n,
-                g_oneshot_host_max_ns / 1e6,
-                (unsigned long long)g_oneshot_declines);
-    }
-    g_oneshot_host_ns = 0.0;
-    g_oneshot_host_max_ns = 0.0;
-    if (g_decode_graph_stream) (void)cudaStreamSynchronize(g_decode_graph_stream);
-    (void)cudaDeviceSynchronize();
-    for (int i = 0; i < g_oneshot_n; i++) {
-        if (g_oneshot_execs[i]) (void)cudaGraphExecDestroy(g_oneshot_execs[i]);
-        g_oneshot_execs[i] = NULL;
-    }
-    g_oneshot_n = 0;
-    (void)cudaGetLastError();
-}
-
-/* 0 = capturing, caller must encode and then call end(); -1 = declined, the
- * caller encodes eagerly exactly as before. */
-extern "C" int ds4_gpu_oneshot_graph_begin(void) {
-    if (!ds4_gpu_decode_graphs_supported()) return -1;
-    if (g_decode_graph_capturing || g_oneshot_capturing) return -1;  /* no nesting */
-    if (g_oneshot_n >= DS4_ONESHOT_GRAPH_MAX) { g_oneshot_declines++; return -1; }
-    if (!g_decode_graph_stream) {
-        /* BLOCKING stream on purpose: it synchronizes with the legacy NULL
-         * stream the eager prologue and epilogue ride, which is what orders
-         * the captured layer stack against them without an explicit event. */
-        if (!cuda_ok(cudaStreamCreate(&g_decode_graph_stream),
-                     "one-shot graph stream create")) {
-            g_decode_graph_stream = NULL;
-            return -1;
-        }
-    }
-    (void)cublasSetStream(cuda_cublas_for_tier(0), g_decode_graph_stream);
-    if (cudaStreamBeginCapture(g_decode_graph_stream,
-                               cudaStreamCaptureModeGlobal) != cudaSuccess) {
-        (void)cudaGetLastError();
-        (void)cublasSetStream(cuda_cublas_for_tier(0), NULL);
-        g_oneshot_declines++;
-        return -1;
-    }
-    g_decode_graph_capturing = 1;   /* routes cuda_decode_stream() at every launch */
-    g_oneshot_capturing = 1;
-    g_oneshot_begin_ns = cuda_now_ns();
-    return 0;
-}
-
-/* Abandon a capture whose encode failed.  Nothing was executed. */
-extern "C" void ds4_gpu_oneshot_graph_abort(void) {
-    if (!g_oneshot_capturing) return;
-    g_decode_graph_capturing = 0;
-    g_oneshot_capturing = 0;
-    cudaGraph_t graph = NULL;
-    (void)cudaStreamEndCapture(g_decode_graph_stream, &graph);
-    if (graph) (void)cudaGraphDestroy(graph);
-    (void)cublasSetStream(cuda_cublas_for_tier(0), NULL);
-    (void)cudaGetLastError();
-    g_oneshot_declines++;
-}
-
-/* 0 = the layer is launched and in flight; -1 = nothing ran, encode eagerly. */
-extern "C" int ds4_gpu_oneshot_graph_end(void) {
-    if (!g_oneshot_capturing) return -1;
-    g_decode_graph_capturing = 0;
-    g_oneshot_capturing = 0;
-    cudaGraph_t graph = NULL;
-    cudaError_t err = cudaStreamEndCapture(g_decode_graph_stream, &graph);
-    (void)cublasSetStream(cuda_cublas_for_tier(0), NULL);
-    if (err != cudaSuccess || graph == NULL) {
-        (void)cudaGetLastError();
-        if (graph) (void)cudaGraphDestroy(graph);
-        g_oneshot_declines++;
-        return -1;
-    }
-    cudaGraphExec_t exec = NULL;
-    err = cudaGraphInstantiate(&exec, graph, NULL, NULL, 0);
-    (void)cudaGraphDestroy(graph);
-    if (err != cudaSuccess || exec == NULL) {
-        (void)cudaGetLastError();
-        g_oneshot_declines++;
-        return -1;
-    }
-    /* ASYNCHRONOUS ON PURPOSE.  The host returns here while the device runs
-     * this layer, and captures the next one behind it.  See the invariant. */
-    err = cudaGraphLaunch(exec, g_decode_graph_stream);
-    if (err != cudaSuccess) {
-        (void)cudaGetLastError();
-        (void)cudaGraphExecDestroy(exec);
-        g_oneshot_declines++;
-        return -1;
-    }
-    g_oneshot_execs[g_oneshot_n++] = exec;
-    g_oneshot_captures++;
-    {
-        const double dt = (double)(cuda_now_ns() - g_oneshot_begin_ns);
-        g_oneshot_host_ns += dt;
-        if (dt > g_oneshot_host_max_ns) g_oneshot_host_max_ns = dt;
-    }
-    return 0;
-}
-
 extern "C" int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) {
     if (!key || !ds4_gpu_decode_graphs_supported()) return -1;
     if (g_decode_graph_capturing) return -1;   /* no nesting */
@@ -3711,6 +3498,44 @@ extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, con
         ok = cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, data, (size_t)bytes,
                                 cudaMemcpyHostToDevice),
                      "tensor write");
+    }
+    return ok;
+}
+
+extern "C" void *ds4_gpu_host_alloc_pinned(uint64_t bytes) {
+    if (bytes == 0) bytes = 1;
+    void *p = NULL;
+    /* Pinned staging is what makes the async upload a real DMA instead of a
+     * synchronous bounce through the driver's pageable staging. */
+    if (cudaMallocHost(&p, (size_t)bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    return p;
+}
+
+extern "C" void ds4_gpu_host_free_pinned(void *p) {
+    if (!p) return;
+    /* A pinned buffer can still be the source of an in-flight async copy;
+     * freeing it without draining first is undefined.  Session teardown is
+     * the only caller, so the synchronize costs nothing measurable. */
+    (void)cudaDeviceSynchronize();
+    (void)cudaFreeHost(p);
+}
+
+extern "C" int ds4_gpu_tensor_write_async(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
+    if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
+    int d = ds4_tensor_device_idx(tensor);
+    int ok = 0;
+    WITH_DEVICE(g_gpu[d].device_id) {
+        /* The decode stream is the legacy stream outside capture and the
+         * blocking capture stream inside one, so the copy is ordered ahead
+         * of every kernel the caller launches next either way -- the same
+         * ordering ds4_gpu_tensor_copy already relies on. */
+        ok = cuda_ok(cudaMemcpyAsync((char *)tensor->ptr + offset, data,
+                                    (size_t)bytes, cudaMemcpyHostToDevice,
+                                    cuda_decode_stream()),
+                     "tensor write async");
     }
     return ok;
 }
@@ -6623,112 +6448,6 @@ __global__ static void matmul_q8_hc_warp_pair_kernel(
         if (lane == 0u && (unsigned)r < rows)
             out[(uint64_t)r * out_dim + row] = acc[r];
     }
-}
-
-/* The kernel above with its WEIGHT TRAFFIC restructured, and nothing else.
- *
- * The block's four output rows are 4 * 340 = 1360 contiguous bytes of the
- * q8_0 slab, and 1360 = 16 * 85, so a block's run starts 16-byte aligned
- * whenever the tensor base is (the launcher gates on that).  It therefore
- * arrives as ONE __ldcs uint4 per thread -- eighty-five perfectly coalesced
- * 16-byte requests for the whole block -- instead of twenty lanes each
- * issuing four 4-byte and two 2-byte requests scattered over the same 340
- * bytes, and the walk below then runs against shared memory.
- *
- * SAME ARITHMETIC.  The lane-to-element map (group = lane>>1, half = lane&1,
- * groups 0..9 live), the address-parity shift, the __funnelshift_r
- * extraction, the four-step __dp4a chain, the pair combine on mask
- * 0x000fffff and the zero-padded 16/8/4/2 butterfly are the kernel above's,
- * character for character; only the route the weight bytes take changes.
- * In SASS the value chain is instruction for instruction the same: eight
- * IDP.4A.S8.S8 in the same chained order, two SHFL.BFLY, two I2FP.F32.S32,
- * two FMUL.FTZ, two FFMA.FTZ against RZ, four SHF.R.W.U32, one HADD2.F32
- * and the same seventeen FADD.FTZ against twenty SHFL.  The only extra
- * integer instruction is an IDP.2A address multiply feeding IADD.64.
- *
- * PDL: unchanged in kind.  Every weight byte the block owns is in shared
- * memory before the fence, exactly as every weight word a lane owned was in
- * registers before the fence above, so the fence still holds the activation
- * reads (xq/xs, the silu kernel's output) and nothing else moves.  The
- * __syncthreads() that publishes the staged run is above the fence for the
- * same reason. */
-template<int R>
-__global__ static void matmul_q8_hc_warp_pair_stage_kernel(
-        float *out, const unsigned char *w,
-        const int8_t *xq, const float *xs, uint64_t out_dim, uint32_t rows) {
-    __shared__ __align__(16) unsigned char sw[4 * 340];
-    const unsigned lane = threadIdx.x & 31u;
-    const unsigned group = lane >> 1u, half = lane & 1u;
-    const unsigned rl = threadIdx.x >> 5u;
-    const uint64_t row0 = (uint64_t)blockIdx.x * 4u;
-    if (threadIdx.x < 85u) {
-        ((uint4 *)sw)[threadIdx.x] =
-                __ldcs((const uint4 *)(w + row0 * 340u) + threadIdx.x);
-    }
-    __syncthreads();
-    QWEN4EXP_PDL_SYNC();
-    const uint64_t row = row0 + rl;
-    float acc[R];
-#pragma unroll
-    for (int r = 0; r < R; r++) acc[r] = 0.0f;
-    if (group < 10u && row < out_dim) {
-        const unsigned char *blk = sw + rl * 340u + group * 34u;
-        const unsigned char *payload = blk + 2u + half * 16u;
-        const uintptr_t address = (uintptr_t)payload;
-        const unsigned shift = (address & 3u) * 8u;
-        const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
-        uint32_t previous = words[0];
-        int32_t wq[4];
-#pragma unroll
-        for (int j = 0; j < 3; j++) {
-            const uint32_t next = words[j + 1];
-            wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
-            previous = next;
-        }
-        const uint16_t last = *(const uint16_t *)(payload + 14u);
-        wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
-        const float ws = __half2float(__ushort_as_half(*(const uint16_t *)blk));
-#pragma unroll
-        for (int r = 0; r < R; r++) {
-            if ((unsigned)r < rows) {
-                const unsigned at = (unsigned)r * 10u + group;
-                const int32_t *xw = (const int32_t *)(xq + at * 32u + half * 16u);
-                int dot = 0;
-#pragma unroll
-                for (int j = 0; j < 4; j++) dot = __dp4a(wq[j], xw[j], dot);
-                dot += __shfl_xor_sync(0x000fffffu, dot, 1);
-                if (!half) acc[r] += ws * xs[at] * (float)dot;
-            }
-        }
-    }
-    /* Original chains 16..31 are zero. Chains 0..15 now occupy the even
-     * lanes; original strides 8,4,2,1 become physical strides 16,8,4,2. */
-#pragma unroll
-    for (int r = 0; r < R; r++) {
-        acc[r] = acc[r] + 0.0f;
-#pragma unroll
-        for (int d = 16; d >= 2; d >>= 1)
-            acc[r] += __shfl_down_sync(0xffffffffu, acc[r], d);
-        if (lane == 0u && (unsigned)r < rows && row < out_dim)
-            out[(uint64_t)r * out_dim + row] = acc[r];
-    }
-}
-
-/* The staged weight route above is DEFAULT ON with a kill switch, matching
- * every other measured path in this tree: DS4_Q8_HC_WARP_PAIR_STAGE=0
- * restores the shipped kernel exactly.  It was authored default-off for A/B
- * measurement, and a default-off valve ships as a no-op because the scored
- * run sets no environment.  Resolved once, as ds4_qwen4exp_pdl_enabled does,
- * so no launch pays a getenv. */
-static int cuda_q8_hc_warp_pair_stage(void) {
-    static int resolved = 0;
-    static int enabled = 0;
-    if (!resolved) {
-        const char *e = getenv("DS4_Q8_HC_WARP_PAIR_STAGE");
-        enabled = (e && e[0] == '0') ? 0 : 1;
-        resolved = 1;
-    }
-    return enabled;
 }
 
 /* The same per-output-element arithmetic as the tile kernel above, on the int8
@@ -17973,12 +17692,6 @@ int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows) {
  * captures and first-touch costs. A local comparison that does not discard
  * each residency's first run is measuring which arm happened to go first.
  */
-/* This build's note auto09190941_68 records that this tree defines three
- * hundred and twenty-three kernels and only fifty-one execute at the decode
- * widths. Forty-four execute at prefill, sixty-seven at decode, and only
- * eighteen in both, so a does-this-kernel-run filter applied to one phase
- * produces false negatives for the other.
- */
 int ds4_qwen4exp_pdl_enabled(void) {
     static int resolved = 0;
     static int enabled = 0;
@@ -18263,54 +17976,6 @@ static int cuda_matmul_q8_0_preq_rows_exact(
      * occupancy alone: the block count is ceil(n_rows/BM) * ceil(out_dim/BN),
      * and a projection as narrow as the hyper-connection down (out_dim 320)
      * would leave most of the device idle on the widest tile. */
-    /* THE MTP HEAD'S eh_proj AT TWO COMMITTED ROWS.
-     *
-     * The head calls this entry with `n_tokens * n_hc` rows, n_hc 4, so it is
-     * FOUR rows when it proposes from one committed token and EIGHT when it
-     * proposes from two.  Eight is exactly the width at which the tile above
-     * takes over, and the tile is the wrong kernel for it: at 5120 -> 2560 the
-     * 128x64 tile is grid (1, 40), forty blocks on a forty-eight SM part, and
-     * it pads its M dimension from eight rows to a hundred and twenty-eight.
-     * Measured in the trace it runs 114 us for a 13.9 MB weight, 122 GB/s,
-     * while the FOUR-row call beside it already reads the same 13.9 MB through
-     * matmul_q8_0_preq_pair_lanes_kernel<4, false> in 63 us.
-     *
-     * So the eight-row call takes the same kernel at R = 8: grid
-     * (out_dim / 4, 1), 640 blocks of 256 threads, each block owning four
-     * output rows and walking K once for all eight token rows.  The weight is
-     * read ONCE, exactly as at four rows -- the two-tile alternative
-     * (grid.y = 2 at R = 4) would read it twice and is the thing to avoid.
-     *
-     * WIDTH-EXACTNESS, and why this is allowed to move a value at all.  The
-     * comment below states the engine's rule: the tile takes eight rows and up
-     * and the per-row kernels take fewer, and what that costs is exactness
-     * BETWEEN those two regimes.  Moving the head's eight-row call to the
-     * per-row side makes it MORE consistent with its own four-row call, not
-     * less -- rows of an eight-row call now equal rows of a one-row call,
-     * which is the invariant ds4_qwen4exp_mtp_hooks.c was written to restore
-     * and which tests/test_qwen4exp_graph asserts across widths 1 to 4.
-     *
-     * It is also the one place on this track where a value is free to move at
-     * all: docs/participant-contract.md 4.4, "The head only proposes tokens.
-     * The organizer-pinned target model decides every emitted token."  An ulp
-     * here can only change a PROPOSAL, and a changed proposal is priced by the
-     * acceptance rate, which the A/B measures directly.  Nothing in the target
-     * tower reaches this arm: the gate is the head's own shape, in_dim
-     * 2 * n_embd with out_dim n_embd, at exactly eight rows.
-     *
-     * DS4_QWEN4EXP_NO_EH_PROJ_R8 restores the tile from the same binary. */
-    if (g_q8_dense_mma_enabled && cuda_q8_mma_available() && n_rows == 8u &&
-        in_dim == 2ull * out_dim && out_dim == 2560ull &&
-        cuda_q8_use_dp4a() && (((uintptr_t)wptr & 1u) == 0u) &&
-        getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL &&
-        getenv("DS4_QWEN4EXP_NO_EH_PROJ_R8") == NULL) {
-        matmul_q8_0_preq_pair_lanes_kernel<8, false><<<
-                dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u),
-                256, 0, cuda_decode_stream()>>>(
-                (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
-                out_dim, n_rows, blocks);
-        return cuda_ok(cudaGetLastError(), "q8 eh_proj R8 pair lanes launch");
-    }
     if (g_q8_dense_mma_enabled && cuda_q8_mma_available() && n_rows >= 8u &&
         getenv("DS4_QWEN4EXP_NO_ROW_TILE") == NULL) {
         if (cuda_q8_mma_pipe_try((float *)out->ptr,
@@ -18423,29 +18088,13 @@ static int cuda_matmul_q8_0_preq_rows_exact(
             } else if (getenv("DS4_Q8_NO_HC_WARP_PAIR") == NULL) {
                 /* PDL consumer: the stream predecessor is
                  * qwen4exp_hc_silu_quant, which triggers at its top
-                 * (ds4_cuda_qwen4exp.cuh).
-                 *
-                 * The staged weight route is the same grid, the same block
-                 * shape, the same warps per row and the same arithmetic; its
-                 * uint4 stage needs the slab 16-byte aligned and the row
-                 * count a multiple of four, both of which hold at this gated
-                 * shape and neither of which the kernel may assume. */
-                if (cuda_q8_hc_warp_pair_stage() &&
-                    (((uintptr_t)wptr & 15u) == 0u) && ((out_dim & 3u) == 0u)) {
-                    QWEN4EXP_LAUNCH_PDL(
-                            (matmul_q8_hc_warp_pair_stage_kernel<2>),
-                            (unsigned)((out_dim + 3u) / 4u), 128, 0,
-                            cuda_decode_stream(),
-                            (float *)out->ptr, (const unsigned char *)wptr,
-                            xq, xscale, out_dim, n_rows);
-                } else {
-                    QWEN4EXP_LAUNCH_PDL(
-                            (matmul_q8_hc_warp_pair_kernel<2>),
-                            (unsigned)((out_dim + 3u) / 4u), 128, 0,
-                            cuda_decode_stream(),
-                            (float *)out->ptr, (const unsigned char *)wptr,
-                            xq, xscale, out_dim, n_rows);
-                }
+                 * (ds4_cuda_qwen4exp.cuh). */
+                QWEN4EXP_LAUNCH_PDL(
+                        (matmul_q8_hc_warp_pair_kernel<2>),
+                        (unsigned)((out_dim + 3u) / 4u), 128, 0,
+                        cuda_decode_stream(),
+                        (float *)out->ptr, (const unsigned char *)wptr,
+                        xq, xscale, out_dim, n_rows);
             } else {
                 /* PDL consumer: the valve leg of the HC up edge; the stream
                  * predecessor qwen4exp_hc_silu_quant triggers at its top. */
@@ -20165,34 +19814,6 @@ template<int R, int C, int U>
 __global__ __launch_bounds__(256/C)
 static void qwen_f32_vector_tree_kernel(float *out, const float *w,
                                        const float *x, uint64_t out_dim) {
-    /* PDL PRODUCER.  At decode this kernel IS the router matmul, and its one
-     * consumer -- the fused router/group kernel -- is a single block that can
-     * do nothing until this grid's output exists.  Triggering here lets that
-     * block come up, be scheduled and park at its own fence while this grid
-     * runs, instead of paying a full launch turnaround after it drains.
-     *
-     * The trigger is the FIRST statement of the body, above the `t >= 32`
-     * return further down, so every block signals: a block that returned
-     * without signalling would leave the dependent waiting on whole-grid
-     * completion, which is a hang risk rather than a slowdown.
-     *
-     * THE DEADLOCK RULE, discharged by measurement rather than arithmetic:
-     * the launched grids are out_dim blocks, 512 for the router (64 threads)
-     * and 48 for the GDN alpha/beta projections (128 threads).
-     * cudaOccupancyMaxActiveBlocksPerMultiprocessor on these instantiations AS
-     * BUILT reports 24 blocks/SM for <2,4,1> and <1,4,1> at 64 threads (reg
-     * 32 and 22, 2 KB of static shared), so the 48-SM GB10 holds 1152 of them
-     * at once: 512 is one wave with a factor of 2.25 to spare, and 48 for the
-     * GDN arms is trivially inside it.  A dependent parked at its fence
-     * therefore cannot be holding a slot this grid still needs.  The bound is read from the grid in the body
-     * per ds4_cuda_qwen4exp.cuh's rule, so a wider caller never triggers.
-     *
-     * This kernel is BOTH a PDL consumer (the fence below, for the mixer's
-     * closing kernel) and now a producer.  The two are independent: the fence
-     * is this grid's wait on its own predecessor, the trigger is this grid's
-     * signal to its successor, and neither changes when the other fires. */
-    if ((uint64_t)gridDim.x * (uint64_t)gridDim.y * (uint64_t)gridDim.z <= 512u)
-        QWEN4EXP_PDL_TRIGGER();
     const unsigned t = threadIdx.x;
     const unsigned lane = t & 31u;
     const uint64_t col = blockIdx.x;
@@ -20272,7 +19893,6 @@ static void qwen_f32_vector_tree_kernel(float *out, const float *w,
         }
     }
 }
-
 
 /* One block owns either a Q8 output group or an F32 projection row.
  * Preserve each original arithmetic tree; float blocks come first in the grid.
