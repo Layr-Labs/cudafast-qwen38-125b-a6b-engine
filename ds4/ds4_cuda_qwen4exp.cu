@@ -1806,6 +1806,79 @@ __global__ static void qwen4exp_gdn_output_kernel(
         qwen4exp_gdn_sigmoid(output_gate[base + tid]);
 }
 
+/* THE ROUTED EXPERT LAUNCHER'S SCREENS, RESOLVED ONCE.
+ *
+ * The routed mixture-of-experts call runs on all forty-eight layers of every
+ * decoded token, and on the way to its kernels it consults a dozen named
+ * bisection valves: the four that decide whether the pair-task lists are
+ * built, the verify-width screen, the group-scan screen, the tensor-core
+ * screen and the epilogue that depends on it, the expert-compaction screen,
+ * the type-specialisation screen, and the two that admit the split gate/up
+ * schedule and its vector reads -- several of them read more than once per
+ * call from sibling rungs of the same ladder.
+ *
+ * Each was a `getenv`, which on glibc is a linear scan of `environ` with a
+ * comparison per entry, and a MISS -- the ranked case, since these valves
+ * exist to be unset -- walks the whole array before returning null.  That
+ * scan sits on the host between two kernel launches of a launch-bound round,
+ * and it cannot change its answer: the environment of a running process is
+ * fixed for the purposes of these flags.
+ *
+ * These resolvers cache the answer in a function-local static, the form this
+ * unit's own dependent-launch and staged-weight valves already use.  A
+ * benign race between two threads resolving the same name writes the same
+ * value.  Every name is kept, so bisection is unchanged. */
+static int qwen4exp_moe_no_mma(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_NO_MMA") != NULL;
+    return v;
+}
+static int qwen4exp_moe_no_expert_compact(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_NO_EXPERT_COMPACT") != NULL;
+    return v;
+}
+static int qwen4exp_moe_generic_experts(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_GENERIC_EXPERTS") != NULL;
+    return v;
+}
+static int qwen4exp_moe_no_gu_pair_tasks(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_NO_GU_PAIR_TASKS") != NULL;
+    return v;
+}
+static int qwen4exp_moe_no_wide_verify(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_NO_WIDE_VERIFY") != NULL;
+    return v;
+}
+static int qwen4exp_moe_no_down_vector(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_NO_DOWN_VECTOR") != NULL;
+    return v;
+}
+static int qwen4exp_moe_serial_group_scan(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_SERIAL_GROUP_SCAN") != NULL;
+    return v;
+}
+static int qwen4exp_moe_no_moe_epilogue(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_NO_MOE_EPILOGUE") != NULL;
+    return v;
+}
+static int qwen4exp_moe_no_split_gateup(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_NO_SPLIT_GATEUP") != NULL;
+    return v;
+}
+static int qwen4exp_moe_no_split_vector(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_NO_SPLIT_VECTOR") != NULL;
+    return v;
+}
+
 static const float *qwen4exp_gdn_weight_f32(
         const void *model_map,
         uint64_t    model_size,
@@ -9984,10 +10057,10 @@ static int qwen4exp_routed_moe_cuda(
         (gate_slab->type == DS4_QWEN4EXP_TY_q4_K ||
          gate_slab->type == DS4_QWEN4EXP_TY_q5_K ||
          gate_slab->type == DS4_QWEN4EXP_TY_q8_0) &&
-        getenv("DS4_QWEN4EXP_NO_MMA") == NULL &&
-        getenv("DS4_QWEN4EXP_NO_EXPERT_COMPACT") == NULL &&
-        getenv("DS4_QWEN4EXP_GENERIC_EXPERTS") == NULL &&
-        getenv("DS4_QWEN4EXP_NO_GU_PAIR_TASKS") == NULL;
+        !qwen4exp_moe_no_mma() &&
+        !qwen4exp_moe_no_expert_compact() &&
+        !qwen4exp_moe_generic_experts() &&
+        !qwen4exp_moe_no_gu_pair_tasks();
     /* Two task lists: the 32-pair tile's, and after it the heavy tile's. */
     const uint64_t task_bytes = pair_tasks ? 2u * (1u + 2u * task_capacity) * 4u : 0u;
 
@@ -9997,14 +10070,14 @@ static int qwen4exp_routed_moe_cuda(
      * three-row call is two tiles.  DS4_QWEN4EXP_NO_WIDE_VERIFY restores the
      * <= 2 gates. */
     const bool wide_verify = (n_tokens == 3u || n_tokens == 4u) &&
-        getenv("DS4_QWEN4EXP_NO_WIDE_VERIFY") == NULL;
+        !qwen4exp_moe_no_wide_verify();
     const bool down_vector = tile == 2 && (n_tokens <= 2u || wide_verify) &&
         n_expert_used <= 32u &&
         (down_slab->type == DS4_QWEN4EXP_TY_q8_0 ||
          ((n_tokens == 2u || wide_verify) &&
           down_slab->type == DS4_QWEN4EXP_TY_q5_1)) &&
-        getenv("DS4_QWEN4EXP_GENERIC_EXPERTS") == NULL &&
-        getenv("DS4_QWEN4EXP_NO_DOWN_VECTOR") == NULL;
+        !qwen4exp_moe_generic_experts() &&
+        !qwen4exp_moe_no_down_vector();
     uint64_t mq_offset = xq_bytes + idx_bytes + pair_bytes;
     /* Align short-down scratch; preserve shared input and metadata offsets. */
     if (down_vector) mq_offset = (mq_offset + 15u) & ~uint64_t(15u);
@@ -10040,7 +10113,7 @@ static int qwen4exp_routed_moe_cuda(
 
     const int small_group =
         n_tokens < 8u && n_total_expert <= QWEN4EXP_MOE_SCAN_THREADS &&
-        getenv("DS4_QWEN4EXP_SERIAL_GROUP_SCAN") == NULL;
+        !qwen4exp_moe_serial_group_scan();
     /* The caller passes `logits` exactly when ds4_gpu_qwen4exp_moe_router_fused_ok
      * said so and therefore did NOT select the experts itself.  That predicate is
      * the only decision point; if a caller reaches here disagreeing with it,
@@ -10116,7 +10189,7 @@ static int qwen4exp_routed_moe_cuda(
                 sc.counts, (const int32_t *)selected->ptr,
                 n_total_expert, n_pairs);
         if (n_total_expert <= QWEN4EXP_MOE_SCAN_THREADS &&
-            getenv("DS4_QWEN4EXP_SERIAL_GROUP_SCAN") == NULL) {
+            !qwen4exp_moe_serial_group_scan()) {
             qwen4exp_moe_group_scan_parallel_kernel<<<
                     1, QWEN4EXP_MOE_SCAN_THREADS, 0, stream>>>(
                     sc.offsets, sc.cursor, sc.active, sc.counts,
@@ -10234,7 +10307,7 @@ static int qwen4exp_routed_moe_cuda(
         (mid_dim % QW_MMA_BM) == 0 && (xgroups % QW_MMA_G) == 0 &&
         gate_slab->type != (uint32_t)DS4_QWEN4EXP_TY_q6_K &&
         up_slab->type != (uint32_t)DS4_QWEN4EXP_TY_q6_K &&
-        getenv("DS4_QWEN4EXP_NO_MMA") == NULL;
+        !qwen4exp_moe_no_mma();
 
     /* The down tile decides whether the mid projection has a float consumer.
      * When the down tile runs it reads the Q8_0 scratch (mq/ms/msum) and never
@@ -10248,12 +10321,12 @@ static int qwen4exp_routed_moe_cuda(
     const int down_mma = use_mma && (out_dim % QW_DOWN_MMA_BM) == 0 &&
                          down_slab->type != (uint32_t)DS4_QWEN4EXP_TY_q6_K;
     const int moe_epilogue = down_mma &&
-        getenv("DS4_QWEN4EXP_NO_MOE_EPILOGUE") == NULL;
+        !qwen4exp_moe_no_moe_epilogue();
 
     /* One block row per expert the call CHOSE, not per expert that exists.
      * n_pairs bounds the number of distinct experts, and the kernel exits the
      * rows past active[0]. */
-    const int compact = getenv("DS4_QWEN4EXP_NO_EXPERT_COMPACT") == NULL;
+    const int compact = !qwen4exp_moe_no_expert_compact();
     const uint32_t gu_rows = !compact ? n_total_expert
         : (n_pairs < n_total_expert ? n_pairs : n_total_expert);
     const int32_t *gu_active = compact ? sc.active : NULL;
@@ -10288,7 +10361,7 @@ static int qwen4exp_routed_moe_cuda(
     /* Resolve the format once on the host, where tensor metadata already
      * lives.  This exposes fixed nibble decoding and a fixed one-half
      * accumulation to nvcc, without converting or copying any weight. */
-    const bool specialize = getenv("DS4_QWEN4EXP_GENERIC_EXPERTS") == NULL;
+    const bool specialize = !qwen4exp_moe_generic_experts();
     /* ---- the DMA staging arm of the routed q4_K gate/up prefill tile ----
      * Compile switch: -DDS4_GATEUP_DMA_BUILD=0 removes the arm entirely (the
      * q4_K specialisation then instantiates Dma = 0, which is the shipped
@@ -10466,10 +10539,10 @@ static int qwen4exp_routed_moe_cuda(
     else if ((n_tokens <= 2u || wide_verify) && tile == 2 && specialize &&
              gate_slab->type == DS4_QWEN4EXP_TY_q4_K &&
              up_slab->type == DS4_QWEN4EXP_TY_q4_K &&
-             getenv("DS4_QWEN4EXP_NO_SPLIT_GATEUP") == NULL) {
+             !qwen4exp_moe_no_split_gateup()) {
         /* Vector reads require alignment; the scalar schedule remains available. */
         const bool vector = ((uintptr_t)sc.xq & 15u) == 0u &&
-            getenv("DS4_QWEN4EXP_NO_SPLIT_VECTOR") == NULL;
+            !qwen4exp_moe_no_split_vector();
         /* COOPERATIVE 8-ROW PANEL.  Kernel-only: the shipped bytes, the
          * shipped order, the same per-lane pieces, only the block shape and
          * where the loads are served from change.  DS4_GATEUP_COOP=0 restores
@@ -10541,10 +10614,10 @@ static int qwen4exp_routed_moe_cuda(
              gate_slab->type == up_slab->type &&
              (gate_slab->type == (uint32_t)DS4_QWEN4EXP_TY_q5_K ||
               gate_slab->type == (uint32_t)DS4_QWEN4EXP_TY_q8_0) &&
-             getenv("DS4_QWEN4EXP_NO_SPLIT_GATEUP") == NULL &&
+             !qwen4exp_moe_no_split_gateup() &&
              qw_gu_panel_type_on(gate_slab->type) &&
              ((uintptr_t)sc.xq & 15u) == 0u &&
-             getenv("DS4_QWEN4EXP_NO_SPLIT_VECTOR") == NULL &&
+             !qwen4exp_moe_no_split_vector() &&
              qw_gu_coop_env_on() &&
              xgroups == QW_GU_COOP_GROUPS &&
              gate_slab->row_bytes == qw_gu_panel_row_bytes(gate_slab->type) &&
