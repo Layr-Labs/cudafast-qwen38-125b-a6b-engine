@@ -33,7 +33,7 @@ static constexpr uint32_t MTP_NATIVE_SCREEN_GROUPS = 24u;
 static constexpr uint32_t MTP_TARGET_NATIVE_CAP = 16384u;
 static constexpr uint32_t MTP_TARGET_NATIVE_SCREEN_GROUPS = 24u;
 static constexpr uint32_t MTP_NATIVE_MAX_WIDTH = 1u << 20;
-template <bool Screen, bool EmitKeys = false>
+template <bool Screen, bool EmitKeys = false, bool GridRows = false>
 __global__ static void mtp_native_projection_kernel(
         float *out, const unsigned char *w,
         const int8_t *xq, const float *xscale,
@@ -51,14 +51,15 @@ __global__ static void mtp_native_projection_kernel(
     const uint32_t half = local_lane & 1u;
     /* Width <= 2^20; byte addressing is widened separately below. */
     const uint32_t row = blockIdx.x * 4u + local_row;
-    constexpr uint32_t row0 = 0u;
+    const uint32_t row0 = GridRows ? blockIdx.y : 0u;
     constexpr uint32_t take = 1u;
     float acc[R];
 #pragma unroll
     for (int r = 0; r < R; r++) acc[r] = 0.0f;
 
     const uint32_t weight_row = row >= out_dim ? n_vocab : Screen
-        ? (row < prefix ? row : n_vocab - tail + (row - prefix)) : ids[row];
+        ? (row < prefix ? row : n_vocab - tail + (row - prefix))
+        : ids[(uint64_t)row0 * out_dim + row];
     const bool valid = row < out_dim && weight_row < n_vocab;
     if (valid) {
         const unsigned char *wr = w + (uint64_t)weight_row * blocks * 34u;
@@ -294,6 +295,7 @@ __global__ static void mtp_native_projection2_screen_kernel(
         }
     }
 }
+
 __global__ static void mtp_native_keys(uint64_t *keys, uint32_t *invalid,
         const float *scores, uint32_t width, uint32_t prefix,
         uint32_t tail, uint32_t vocab) {
@@ -541,6 +543,13 @@ extern "C" int ds4_gpu_mtp_native_screen2(ds4_gpu_tensor *out,
     int id_bits = 1;
     while (id_bits < 32 && ((uint32_t)1u << id_bits) < vocab) id_bits++;
     if (id_bits > 32) id_bits = 32;
+    /* The fused grid reads both completed ID rows while either output row may
+     * run. Preserve the legacy serial schedule for aliased tensor views. */
+    const bool fuse_exact =
+        getenv("DS4_MTP_NO_R2_EXACT_FUSION") == nullptr &&
+        mtp_native_key_range_disjoint(
+            out->ptr, 2ull * MTP_TARGET_NATIVE_CAP * sizeof(float),
+            ids->ptr, 2ull * MTP_TARGET_NATIVE_CAP * sizeof(uint32_t));
     for (uint32_t r = 0; r < 2u; r++) {
         size_t temporary = (size_t)(scratch->bytes - l.temporary);
         uint64_t *kin = key_in + (uint64_t)r * width;
@@ -562,19 +571,123 @@ extern "C" int ds4_gpu_mtp_native_screen2(ds4_gpu_tensor *out,
                 MTP_TARGET_NATIVE_CAP,
                 0, id_bits, cuda_decode_stream()),
                 "native R2 original-ID sort")) return -1;
-        mtp_native_projection_kernel<false><<<
-            (MTP_TARGET_NATIVE_CAP + 3u) / 4u, 256, 0,
-            cuda_decode_stream()>>>(
-            (float *)out->ptr + (uint64_t)r * MTP_TARGET_NATIVE_CAP,
-            (const unsigned char *)w,
-            xq + (uint64_t)r * MTP_NATIVE_DIM,
-            xs + (uint64_t)r * (MTP_NATIVE_DIM / 32u),
-            MTP_TARGET_NATIVE_CAP, iout, vocab, prefix, tail);
-        if (!cuda_ok(cudaGetLastError(), "native R2 exact refinement"))
+        if (!fuse_exact) {
+            mtp_native_projection_kernel<false><<<
+                (MTP_TARGET_NATIVE_CAP + 3u) / 4u, 256, 0,
+                cuda_decode_stream()>>>(
+                (float *)out->ptr + (uint64_t)r * MTP_TARGET_NATIVE_CAP,
+                (const unsigned char *)w,
+                xq + (uint64_t)r * MTP_NATIVE_DIM,
+                xs + (uint64_t)r * (MTP_NATIVE_DIM / 32u),
+                MTP_TARGET_NATIVE_CAP, iout, vocab, prefix, tail);
+            if (!cuda_ok(cudaGetLastError(), "native R2 exact refinement"))
+                return -1;
+        }
+    }
+    if (fuse_exact) {
+        const dim3 grid((MTP_TARGET_NATIVE_CAP + 3u) / 4u, 2u);
+        /* GridRows is a compile-time specialization of the same exact-dot
+         * kernel. Each y slice retains its own IDs, input row, output row,
+         * shared state and accumulation order. */
+        /* Both target rows retain one shared launch boundary here. */
+        mtp_native_projection_kernel<false, false, true><<<
+            grid, 256, 0, cuda_decode_stream()>>>(
+            (float *)out->ptr, (const unsigned char *)w, xq, xs,
+            MTP_TARGET_NATIVE_CAP, (const uint32_t *)ids->ptr,
+            vocab, prefix, tail);
+        if (!cuda_ok(cudaGetLastError(), "native fused R2 exact refinement"))
             return -1;
     }
     return (int)MTP_TARGET_NATIVE_CAP;
 }
+
+/* Compact verification needs only the original-vocabulary winner for each
+ * refined row.  Dense screening represents every omitted vocabulary entry
+ * as -FLT_MAX, so seed the reduction with the smallest omitted original ID.
+ * Comparing original IDs preserves the dense top-1 tie rule even if the
+ * shortlist representation stops being ordered. */
+__global__ static void mtp_native_top1_map2_kernel(
+        uint32_t *winner, const float *logits, const uint32_t *ids,
+        const uint32_t *invalid, uint32_t count, uint32_t vocab) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (row >= 2u || tid >= 1024u) return;
+    if (row == 0u && tid == 0u && invalid) winner[2] = *invalid;
+    const uint32_t *row_ids = ids + (uint64_t)row * count;
+    const float *row_logits = logits + (uint64_t)row * count;
+
+    __shared__ float values[1024];
+    __shared__ uint32_t indices[1024];
+    __shared__ uint32_t missing;
+    if (tid == 0u) {
+        uint32_t lo = 0u, hi = count;
+        while (lo < hi) {
+            const uint32_t mid = lo + (hi - lo) / 2u;
+            if (row_ids[mid] == mid) lo = mid + 1u;
+            else hi = mid;
+        }
+        missing = lo;
+    }
+    __syncthreads();
+
+    float best_value = tid == 0u ? -FLT_MAX : -INFINITY;
+    uint32_t best_id = tid == 0u ? missing : UINT32_MAX;
+    for (uint32_t i = tid; i < count; i += 1024u) {
+        const float value = row_logits[i];
+        const uint32_t id = row_ids[i];
+        if (value > best_value || (value == best_value && id < best_id)) {
+            best_value = value;
+            best_id = id;
+        }
+    }
+    values[tid] = best_value;
+    indices[tid] = best_id;
+    __syncthreads();
+    for (uint32_t stride = 512u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            const float value = values[tid + stride];
+            const uint32_t id = indices[tid + stride];
+            if (value > values[tid] ||
+                (value == values[tid] && id < indices[tid])) {
+                values[tid] = value;
+                indices[tid] = id;
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0u) winner[row] = indices[0] < vocab ? indices[0] : UINT32_MAX;
+}
+
+extern "C" int ds4_gpu_mtp_native_top1_map2(ds4_gpu_tensor *winner,
+        const ds4_gpu_tensor *logits, const ds4_gpu_tensor *ids,
+        const ds4_gpu_tensor *scratch, uint32_t count, uint32_t vocab,
+        uint32_t screen_width, int defer_invalid) {
+    defer_invalid = defer_invalid &&
+        getenv("DS4_MTP_NO_DEFER_INVALID_FLAG") == nullptr;
+    const mtp_native_layout2 l = mtp_native_offsets2(screen_width);
+    if (!winner || !logits || !ids || !count || count >= vocab ||
+        winner->bytes < (defer_invalid ? 3u : 2u) * sizeof(uint32_t) ||
+        logits->bytes < 2ull * count * sizeof(float) ||
+        ids->bytes < 2ull * count * sizeof(uint32_t) ||
+        (defer_invalid && (!scratch || screen_width > MTP_NATIVE_MAX_WIDTH ||
+                           scratch->bytes < l.flag + sizeof(uint32_t)))) return 0;
+    const int tier = ds4_tensor_device_idx(winner);
+    int current = -1;
+    if (tier < 0 || tier >= g_n_gpus ||
+        ds4_tensor_device_idx(logits) != tier ||
+        ds4_tensor_device_idx(ids) != tier ||
+        (defer_invalid && ds4_tensor_device_idx(scratch) != tier) ||
+        cudaGetDevice(&current) != cudaSuccess ||
+        current != g_gpu[tier].device_id) return 0;
+    mtp_native_top1_map2_kernel<<<2, 1024, 0, cuda_decode_stream()>>>(
+        (uint32_t *)winner->ptr, (const float *)logits->ptr,
+        (const uint32_t *)ids->ptr,
+        defer_invalid ?
+            (const uint32_t *)((const char *)scratch->ptr + l.flag) : nullptr,
+        count, vocab);
+    return cuda_ok(cudaGetLastError(), "native target compact top-1 map");
+}
+
 __global__ static void mtp_native_map(uint32_t *winner, const float *logits,
                                       const uint32_t *ids, const uint32_t *invalid,
                                       uint32_t count, uint32_t vocab) {
