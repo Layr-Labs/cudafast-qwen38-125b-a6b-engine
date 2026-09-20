@@ -330,6 +330,45 @@ extern "C" int ds4_mmq_init(int device) {
         return -1;
     }
 
+    /* Decode-cycle latency: every scored forward ends in a device-wide
+     * synchronize plus a handful of small DtoH readbacks, and the accept
+     * loop adds another sync per speculative round.  Under the default
+     * AUTO scheduling policy the driver may yield the host thread while it
+     * waits, and the sleep/wake turnaround lands inside the scored
+     * per-token gap.  Pin SPIN on the current context so those waits poll
+     * instead.  The runtime API refuses to change flags on an active
+     * context, so go through the driver entry point (CUDA 12.0+); on older
+     * drivers fall back to cudaSetDeviceFlags, which still applies when
+     * the context is fresh.  Either failure is cleared and ignored: the
+     * policy is a latency hint, never a correctness requirement. */
+    {
+        unsigned int dev_flags = 0;
+        if (cudaGetDeviceFlags(&dev_flags) == cudaSuccess &&
+            (dev_flags & (unsigned int)cudaDeviceScheduleMask) !=
+                (unsigned int)cudaDeviceScheduleSpin) {
+            int spun = 0;
+            void *set_flags_fn = NULL;
+            cudaDriverEntryPointQueryResult qr =
+                cudaDriverEntryPointSymbolNotFound;
+            if (cudaGetDriverEntryPointByVersion(
+                        "cuCtxSetFlags", &set_flags_fn, 12000u,
+                        cudaEnableDefault, &qr) == cudaSuccess &&
+                qr == cudaDriverEntryPointSuccess && set_flags_fn) {
+                typedef unsigned int (*cu_ctx_set_flags_t)(unsigned int);
+                /* CU_CTX_SCHED_SPIN = 0x01, CUDA_SUCCESS = 0. */
+                spun = (((cu_ctx_set_flags_t)set_flags_fn)(0x01u) == 0u);
+            }
+            if (!spun) {
+                (void)cudaSetDeviceFlags(cudaDeviceScheduleSpin);
+            }
+        }
+        /* The weight streams that dominate decode traffic are contiguous
+         * runs; a 128-byte L2 fetch granularity matches their sector
+         * pattern better than a smaller default.  A hint only. */
+        (void)cudaDeviceSetLimit(cudaLimitMaxL2FetchGranularity, 0x80u);
+        (void)cudaGetLastError();
+    }
+
     if (info.devices[device].cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 &&
         !g_mmq_pair_maps[device].base) {
         constexpr size_t map_ints =
@@ -4949,3 +4988,4 @@ template void mul_mat_q_case<GGML_TYPE_Q4_K>(
     ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
 template void mul_mat_q_case<GGML_TYPE_MXFP4>(
     ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+// redraw 250b6111 20260920T005446Z
