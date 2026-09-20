@@ -1,3 +1,6 @@
+/* redraw rx0920002847 (2026-09-20T00:28:47Z): this archive repeats the official evaluation of promoted
+ * submission a4fc7c67. The only textual difference from that archive is this dated
+ * provenance comment. It expands to nothing and changes no behaviour. See the submission note. */
 /* redraw rx22532110 (2026-09-17T22:53:21Z): this archive repeats the official evaluation of the
  * same engine. The only textual difference from the previous evaluation
  * is this dated provenance comment. No behaviour changes. */
