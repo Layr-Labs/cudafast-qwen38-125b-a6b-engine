@@ -2088,6 +2088,51 @@ qwen4exp_gdn_qkv_conv_mma_pipe_kernel(float *out,
             const uint64_t win_off = seg_off & ~(uint64_t)15u;
             const int skew = (int)(seg_off & 15u);
 
+            /* L2 PREFETCH, TWO STAGES AHEAD OF THE WEIGHT WINDOW.
+             *
+             * The producers read this tile's weight window with plain global
+             * loads and consume it in the same stage, so the window's first
+             * touch is always a cold miss to device memory: the rows of one
+             * stage are `B_RAW` bytes further along the same output rows as
+             * the previous stage's, a stride the hardware prefetcher does not
+             * follow across the barrier-separated stages, and nothing else in
+             * the round reads those bytes first.
+             *
+             * prefetch.global.L2 asks for the line holding an address and
+             * nothing more: it moves no data into shared memory, writes no
+             * register, and the loads that follow read the same bytes whether
+             * the line was warm or not, so the arithmetic is untouched.  Each
+             * lane asks for the window it will itself load two stages later,
+             * one request per 128-byte line (the chunk map gives eight
+             * sixteen-byte chunks per line, so only the first asks), and only
+             * for a stage that exists and a row that is not the tensor's last
+             * -- the last row is the one whose window may run past the row
+             * end, and the load path below already special-cases it. */
+#ifndef QW_GDN_PIPE_L2_AHEAD
+#define QW_GDN_PIPE_L2_AHEAD 2
+#endif
+            if (QW_GDN_PIPE_L2_AHEAD != 0) {
+                const uint64_t ahead = s + (uint64_t)QW_GDN_PIPE_L2_AHEAD;
+                if (ahead < nstage) {
+                    const uint64_t a_off =
+                        (ahead * (uint64_t)C::B_RAW) & ~(uint64_t)15u;
+#pragma unroll
+                    for (int k = 0; k < KB; k++) {
+                        const int idx = pl + k * PT;
+                        const int r = idx / C::B_CHUNKS;
+                        const int c = idx - r * C::B_CHUNKS;
+                        const uint64_t row = n0 + (uint32_t)r;
+                        if (idx < BN * C::B_CHUNKS && row + 1u < out_dim &&
+                            (c & 7) == 0) {
+                            const unsigned char *pre =
+                                w + row * w_row_bytes + a_off + (uint32_t)c * 16u;
+                            asm volatile("prefetch.global.L2 [%0];"
+                                         :: "l"(pre));
+                        }
+                    }
+                }
+            }
+
             /* The stage into registers. */
             uint4 ra[KA], rs[KS], rb[KB];
 #pragma unroll
