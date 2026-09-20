@@ -408,6 +408,29 @@ typedef struct {
                       float *multi_out);
 
     /*
+     * OPTIONAL: a zero-model-cost draft source over the already committed
+     * token tape.  `committed[0..n_committed)` are the rows the current target
+     * forward just committed and `next_token` is its frontier winner; together
+     * they follow the model context owned by `ctx`.  Return 0 for no match,
+     * 1..max_drafts for a chain in draft_out, or -1 on failure.
+     *
+     * The target still verifies every returned token.  This hook therefore
+     * changes only where a speculative proposal comes from, never which token
+     * is committed.  Unlike draft_step it writes no MTP-head cache row; the
+     * session seam must publish any missing accepted rows from the target HC
+     * block before the next cycle.
+     */
+    int (*lookup_drafts)(void *ctx, const int *committed,
+                         uint32_t n_committed, int next_token,
+                         int *draft_out, uint32_t max_drafts);
+
+    /* Maximum learned-MTP depth after lookup_drafts returns no match.  Zero
+     * keeps the state's declared depth, preserving the original cycle for all
+     * existing seams.  A smaller nonzero value lets a hybrid use wide exact
+     * prompt copies while retaining the robust depth-1 MTP fallback. */
+    uint32_t mtp_fallback_depth;
+
+    /*
      * OPTIONAL: top-1 minus runner-up logit of the draft the latest draft_step
      * or draft_rows call returned, or a negative value when that call did not
      * measure one.  It can only shorten a chain (stop_margin / drop_margin in
