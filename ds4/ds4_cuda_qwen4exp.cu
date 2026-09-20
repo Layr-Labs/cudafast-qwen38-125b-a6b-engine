@@ -6970,11 +6970,44 @@ qwen4exp_moe_gateup_split_kernel(
         const char *const ub = up +
             (uint64_t)expert * up_expert_bytes +
             (uint64_t)row0 * up_row_bytes;
+/* THE FILL'S DEPTH.  The rolled pair below emits two LDG.E.128 and the two
+ * STS.128 that consume them, so a thread carries two sixteen-byte requests in
+ * flight and then stalls on the stores that depend on them; the panel of a
+ * routed expert is read exactly once per call, so there is nothing in cache to
+ * cover that stall and reads in flight are the only lever -- the same argument
+ * the group walk below this fill already makes for its own two-groups-in-
+ * flight staging.  The asynchronous form issues every trip's copy straight
+ * into the panel with no register relay and no load-to-store dependence, so
+ * the whole fill is outstanding at once and the block's barrier is the only
+ * thing it waits on.
+ *
+ * The image is unchanged: the same sixteen bytes move from the same slab
+ * offset to the same panel offset, so the decoder below reads an identical
+ * verbatim byte image of the rows the block's warps would have read
+ * individually.  Alignment is the launcher's existing panel gate -- both slab
+ * bases sixteen-byte aligned, both expert strides a multiple of sixteen and a
+ * row a whole number of sixteen-byte words -- which is exactly what the copy
+ * instruction requires of both endpoints.  -DDS4_GATEUP_COOP_ASYNC=0 restores
+ * the load/store fill. */
+#ifndef DS4_GATEUP_COOP_ASYNC
+#define DS4_GATEUP_COOP_ASYNC 1
+#endif
+#if DS4_GATEUP_COOP_ASYNC
+        for (uint32_t i = threadIdx.x; i < words; i += blockDim.x) {
+            qw_cpasync16((uint32_t)__cvta_generic_to_shared(&wcoop[i]),
+                         gb + (uint64_t)i * 16u);
+            qw_cpasync16((uint32_t)__cvta_generic_to_shared(&wcoop[PanelU4 + i]),
+                         ub + (uint64_t)i * 16u);
+        }
+        qw_cpasync_commit();
+        qw_cpasync_wait0();
+#else
         for (uint32_t i = threadIdx.x; i < words; i += blockDim.x) {
             wcoop[i] = *(const uint4 *)(const void *)(gb + (uint64_t)i * 16u);
             wcoop[PanelU4 + i] =
                 *(const uint4 *)(const void *)(ub + (uint64_t)i * 16u);
         }
+#endif
         __syncthreads();
         wsh = wcoop + (second ? PanelU4 : 0u);
         wrow = warp >> 1u;
