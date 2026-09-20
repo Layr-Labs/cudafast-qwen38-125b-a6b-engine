@@ -7288,6 +7288,55 @@ matmul_q8_0_preq_rows_mma_pipe_kernel(float *out,
             const uint64_t win_off = seg_off & ~(uint64_t)15u;
             const int skew = (int)(seg_off & 15u);
 
+            /* L2 PREFETCH, TWO STAGES AHEAD OF THE WEIGHT WINDOW.
+             *
+             * The producers read this tile's weight window with plain global
+             * loads and consume it in the stage that issued them, so the
+             * window's first touch is always a cold miss to device memory:
+             * a weight slab is read once per call, nothing else in the round
+             * reads these bytes first, and consecutive stages walk the same
+             * output rows at a whole-stage stride with a barrier handoff and
+             * a full round of shared stores between them -- no run of
+             * consecutive requests for the hardware to extrapolate from.
+             * The producers are the side the pipeline waits on, so that
+             * latency is paid inside the stage they are trying to retire.
+             *
+             * prefetch.global.L2 asks for the line holding an address and
+             * nothing more: it writes no register, produces no value, and
+             * the loads that follow read the same bytes whether the line was
+             * warm or cold, so no operand and no result can move.  Each lane
+             * asks for the window it will itself load two stages later --
+             * the load below's own address arithmetic at `s + AHEAD` -- one
+             * request per 128-byte line, since the chunk map gives eight
+             * sixteen-byte chunks per line and only the first need ask.  The
+             * guards keep it to a stage that exists and skip the tensor's
+             * last row, the one row whose window may run past the row end
+             * and which the load below already narrows. */
+#ifndef Q8_MMA_PIPE_L2_AHEAD
+#define Q8_MMA_PIPE_L2_AHEAD 2
+#endif
+            if (Q8_MMA_PIPE_L2_AHEAD != 0) {
+                const uint64_t ahead = s + (uint64_t)Q8_MMA_PIPE_L2_AHEAD;
+                if (ahead < nstage) {
+                    const uint64_t a_off =
+                        (ahead * (uint64_t)C::B_RAW) & ~(uint64_t)15u;
+#pragma unroll
+                    for (int k = 0; k < KB; k++) {
+                        const int idx = pl + k * PT;
+                        const int r = idx / C::B_CHUNKS;
+                        const int c = idx - r * C::B_CHUNKS;
+                        const uint64_t row = n0 + (uint32_t)r;
+                        if (idx < BN * C::B_CHUNKS && row + 1u < out_dim &&
+                            (c & 7) == 0) {
+                            const unsigned char *pre =
+                                w + row * w_row_bytes + a_off + (uint32_t)c * 16u;
+                            asm volatile("prefetch.global.L2 [%0];"
+                                         :: "l"(pre));
+                        }
+                    }
+                }
+            }
+
             /* The stage into registers. */
             uint4 ra[KA], rs[KS], rb[KB];
 #pragma unroll
