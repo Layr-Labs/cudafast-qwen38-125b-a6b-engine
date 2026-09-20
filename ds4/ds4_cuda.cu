@@ -7288,6 +7288,54 @@ matmul_q8_0_preq_rows_mma_pipe_kernel(float *out,
             const uint64_t win_off = seg_off & ~(uint64_t)15u;
             const int skew = (int)(seg_off & 15u);
 
+            /* L2 PREFETCH, TWO STAGES AHEAD OF THE ACTIVATION TILE.
+             *
+             * The weight side of this pipe is not the only cold operand.  At
+             * the widths this tile is taken for, the quantised activation
+             * buffer is far larger than the last-level cache: a stage reads
+             * `BM` rows of it at the stage's own k-offset, the next stage
+             * reads the same rows one k-chunk further along, and between the
+             * two requests sit a barrier handoff, a full round of shared
+             * stores and the whole weight window of the stage.  By the time
+             * the next activation chunk is asked for, the line it lives on
+             * has usually been pushed out by the weight stream that runs
+             * beside it, and the producers -- the side the pipe waits on --
+             * discover that at the point of use.
+             *
+             * The address is the activation load's own expression evaluated
+             * at `s + AHEAD`: the same row for this lane's chunk, the same
+             * block index advanced by that many stage steps, the same
+             * thirty-two-byte group stride.  One request per 128-byte line,
+             * since a row's groups are contiguous and eight sixteen-byte
+             * chunks share a line.  prefetch.global.L2 writes no register,
+             * produces no value and cannot change a loaded byte; the guards
+             * are the load's own (a stage that exists and a row inside the
+             * activation buffer). */
+#ifndef Q8_MMA_PIPE_ACT_L2_AHEAD
+#define Q8_MMA_PIPE_ACT_L2_AHEAD 2
+#endif
+            if (Q8_MMA_PIPE_ACT_L2_AHEAD != 0) {
+                const uint64_t ahead = s + (uint64_t)Q8_MMA_PIPE_ACT_L2_AHEAD;
+                if (ahead < nstage) {
+                    const uint64_t ga = ahead * (uint64_t)G;
+#pragma unroll
+                    for (int k = 0; k < KA; k++) {
+                        const int idx = pl + k * PT;
+                        const int r = idx / C::A_CHUNKS;
+                        const int c = idx - r * C::A_CHUNKS;
+                        const uint64_t row = (uint64_t)m0 + (uint32_t)r;
+                        if (idx < BM * C::A_CHUNKS && row < (uint64_t)n_rows &&
+                            (c & 7) == 0) {
+                            const int8_t *pre =
+                                xq + (row * blocks + ga + (uint32_t)(c >> 1)) * 32u
+                                   + (c & 1) * 16;
+                            asm volatile("prefetch.global.L2 [%0];"
+                                         :: "l"(pre));
+                        }
+                    }
+                }
+            }
+
             /* The stage into registers. */
             uint4 ra[KA], rs[KS], rb[KB];
 #pragma unroll
