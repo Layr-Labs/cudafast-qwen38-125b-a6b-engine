@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+/* terrapinelf controlled frontier redraw 20260920T0250Z: inert source marker. */
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <mma.h>
