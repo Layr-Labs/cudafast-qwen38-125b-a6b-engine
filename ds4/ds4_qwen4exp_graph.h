@@ -217,6 +217,20 @@ bool ds4_qwen4exp_graph_read_logit_row(ds4_qwen4exp_session *s,
                                        uint32_t row,
                                        float *logits);
 
+/* Offer the NEXT round's verify vector to the gather-ahead worker: the fed
+ * token first (`append` 0), then each draft the head returns (`append` 1).
+ * The worker faults and dequantizes those rows while the draft forward and
+ * the inter-round gap still have the wall clock; the gather adopts the
+ * staged result only when the call's tokens and the session's live entry
+ * history match the staged ones exactly, and runs the serial path on any
+ * mismatch.  Purely advisory: a session that never offers gathers as
+ * before. */
+void ds4_qwen4exp_ple_gather_offer(ds4_qwen4exp_session       *s,
+                                   const ds4_qwen4exp_weights *w,
+                                   const int32_t              *tokens,
+                                   uint32_t                    n_tokens,
+                                   int                         append);
+
 /* The target's LM head over ONE supplied pre-final-mixer row.  Runs the final
  * mixer and the head, the same two ops the forward ends with, so a row that
  * came out of a verify yields exactly the logits that verify would have. */
