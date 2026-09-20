@@ -2840,7 +2840,12 @@ static bool qwen4exp_graph_layers_encode(
 
 static uint32_t qw_decode_graph_chunks(void) {
     static int init = 0;
-    static uint32_t chunks = 4u;   /* the A/B's pick; 1 restores the single capture */
+    /* 8, NOT 4.  cudaGraphLaunch host cost is linear in the chunk node count
+     * (~0.43 us/node + ~7 us) and the FIRST chunk of every forward is launched
+     * with the GPU already dry, so the chunk size sets the exposed idle:
+     * measured total decode-window GPU idle 50.3 ms at 2 chunks, 36.0 at 4,
+     * 29.3 at 8.  DS4_CUDA_DECODE_GRAPH_CHUNKS restores any of them. */
+    static uint32_t chunks = 8u;
     if (!init) {
         init = 1;
         const char *s = getenv("DS4_CUDA_DECODE_GRAPH_CHUNKS");
