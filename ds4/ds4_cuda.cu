@@ -25434,8 +25434,21 @@ __global__ static DS4_CUDA_UNUSED void moe_gate_up_mid_hwarp16_kernel(
 // blocks (e.g. 1 tile -> 32 rows/block -> ~4x more blocks -> ~384) to fill the
 // SMs. The per-row arithmetic is identical regardless of this value, so output
 // is bit-identical; only the qgrid.x divisor must match MOE_DECODE_ROWS_PER_BLOCK.
+// perf-04b: two tiles, not one. The count of blocks is not the only thing the
+// divisor moves: every block re-reads the SAME quantised activation rows of
+// its token, once per block, so the activation traffic of the routed gate/up
+// decode step is proportional to the block count. One tile per block (32 rows)
+// issues ~384 blocks against a device with far fewer resident slots, so the
+// extra blocks do not add parallelism the SMs can use -- they only re-read the
+// activation rows again. Two tiles (64 rows/block, ~192 blocks) still issues
+// several blocks per SM, enough to cover the tail and the ragged last tile,
+// while halving the number of times the activation rows are fetched. The
+// historical 4 went too far the other way (~96 blocks, the grid could not fill
+// the device). Per-row arithmetic, accumulation order and the emitted values
+// are untouched at any value; -DMOE_DECODE_ROW_TILES=1u restores the shipped
+// geometry exactly.
 #ifndef MOE_DECODE_ROW_TILES
-#define MOE_DECODE_ROW_TILES 1u
+#define MOE_DECODE_ROW_TILES 2u
 #endif
 #define MOE_DECODE_ROWS_PER_BLOCK (32u * MOE_DECODE_ROW_TILES)
 
@@ -30933,7 +30946,11 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
                 resident_expert_count,
                 clamp);
     } else {
-        dim3 gate_grid((expert_mid_dim + 31u) / 32u, 6u, 1u);
+        /* Same divisor as the row tile the kernel walks, so the grid covers
+         * the rows exactly once with no blocks whose every tile is past the
+         * end.  The row map is unchanged: row = bx * ROWS_PER_BLOCK +
+         * row_lane + rr * 32 is still a bijection onto the rows it covers. */
+        dim3 gate_grid((expert_mid_dim + MOE_DECODE_ROWS_PER_BLOCK - 1u) / MOE_DECODE_ROWS_PER_BLOCK, 6u, 1u);
         moe_gate_up_mid_decode_lut_owned_qwarp32_kernel<<<gate_grid, 256>>>(
                 (float *)gate->ptr,
                 (float *)up->ptr,
