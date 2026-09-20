@@ -1806,6 +1806,55 @@ __global__ static void qwen4exp_gdn_output_kernel(
         qwen4exp_gdn_sigmoid(output_gate[base + tid]);
 }
 
+/* THE GDN LAUNCHER'S VALVES, RESOLVED ONCE.
+ *
+ * Every bisection valve on this block's launch path was read with getenv at
+ * the launch itself, and the deltanet block is thirty-six of the tower's
+ * forty-eight layers.  A decode step therefore walks the process environment
+ * several times per layer -- the recurrence arm alone tests up to four names
+ * before it picks a kernel and then reads the snapshot valve as a launch
+ * argument -- and glibc's getenv is a linear scan over `environ` with a
+ * strncmp per entry.  That is host work sitting directly between two kernel
+ * launches on the critical path of a launch-bound round, and it buys nothing
+ * after the first call: the environment does not change inside a run.
+ *
+ * These resolvers cache the answer in a function-local static, which is the
+ * form this unit's other valves already use.  A benign race between two
+ * threads resolving the same name writes the same value.  Nothing about the
+ * decision changes -- the same names select the same arms and the snapshot
+ * flag reaches the kernels with the same value -- so the device does the same
+ * work in the same order and emits the same bytes. */
+static int qwen4exp_gdn_no_replay_gates(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_NO_GDN_REPLAY_GATES") != NULL;
+    return v;
+}
+static int qwen4exp_gdn_no_value_reuse(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE") != NULL;
+    return v;
+}
+static int qwen4exp_gdn_no_octet(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_NO_GDN_OCTET") != NULL;
+    return v;
+}
+static int qwen4exp_gdn_no_split_reduce(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_NO_GDN_SPLIT_REDUCE") != NULL;
+    return v;
+}
+static int qwen4exp_gdn_no_value_vector(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_NO_GDN_VALUE_VECTOR") != NULL;
+    return v;
+}
+static uint32_t qwen4exp_gdn_snap_plain(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL;
+    return (uint32_t)v;
+}
+
 static const float *qwen4exp_gdn_weight_f32(
         const void *model_map,
         uint64_t    model_size,
@@ -2742,7 +2791,7 @@ static int qwen4exp_cuda_gdn_run(
                                                        t->ptr, t->bytes))
                     early_reads_safe = false;
         if (early_reads_safe && n_key_head == 16u && n_value_head == 48u &&
-            getenv("DS4_QWEN4EXP_NO_GDN_REPLAY_GATES") == NULL)
+            !qwen4exp_gdn_no_replay_gates())
             replay_gates = (float2 *)scratch->ptr;
     }
 
@@ -2874,8 +2923,7 @@ static int qwen4exp_cuda_gdn_run(
             (const uint32_t *)replay->control->ptr, 0u);
     } else if (gate_pairs) {
         if (n_key_head == 16u && n_value_head == 48u &&
-            getenv("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE") == NULL &&
-            getenv("DS4_QWEN4EXP_NO_GDN_OCTET") == NULL) {
+            !qwen4exp_gdn_no_value_reuse() && !qwen4exp_gdn_no_octet()) {
             /* Eight lanes per value row, R rows per segment: 16R rows
              * per block, so QWEN4EXP_GDN_DIM / 16R blocks along y. */
             qwen4exp_gdn_octet_kernel<QWEN4EXP_GDN_OCTET_ROWS><<<
@@ -2888,9 +2936,9 @@ static int qwen4exp_cuda_gdn_run(
                     state_snapshot ? (float *)state_snapshot->ptr : NULL,
                     n_key_head, n_value_head, n_rows, n_tokens, head_layout,
                     n_snapshot_rows,
-                    getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
-        } else if (getenv("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE") == NULL &&
-            getenv("DS4_QWEN4EXP_NO_GDN_SPLIT_REDUCE") == NULL) {
+                    qwen4exp_gdn_snap_plain());
+        } else if (!qwen4exp_gdn_no_value_reuse() &&
+            !qwen4exp_gdn_no_split_reduce()) {
             qwen4exp_gdn_split_reduce_kernel<<<
                     dim3(n_value_head, QWEN4EXP_GDN_DIM / 16u, n_rows),
                     QWEN4EXP_GDN_DIM, 0, stream>>>(
@@ -2899,10 +2947,10 @@ static int qwen4exp_cuda_gdn_run(
                     state_snapshot ? (float *)state_snapshot->ptr : NULL,
                     n_key_head, n_value_head, n_rows, n_tokens, head_layout,
                     n_snapshot_rows,
-                    getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
+                    qwen4exp_gdn_snap_plain());
         } else if (n_key_head == 16u && n_value_head == 48u &&
-            getenv("DS4_QWEN4EXP_NO_GDN_VALUE_REUSE") == NULL) {
-            if (getenv("DS4_QWEN4EXP_NO_GDN_VALUE_VECTOR") == NULL) {
+            !qwen4exp_gdn_no_value_reuse()) {
+            if (!qwen4exp_gdn_no_value_vector()) {
                 qwen4exp_gdn_value_reuse_kernel<4u, true><<<
                         dim3(n_value_head, QWEN4EXP_GDN_DIM / 16u, n_rows), QWEN4EXP_GDN_DIM, 0, stream>>>(
                         (float *)out->ptr, (float *)recurrent_state->ptr, conv_out,
@@ -2912,7 +2960,7 @@ static int qwen4exp_cuda_gdn_run(
                         state_snapshot ? (float *)state_snapshot->ptr : NULL,
                         n_key_head, n_value_head, n_rows, n_tokens, head_layout,
                         n_snapshot_rows,
-                        getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
+                        qwen4exp_gdn_snap_plain());
             } else {
                 qwen4exp_gdn_value_reuse_kernel<4u><<<
                         dim3(n_value_head, QWEN4EXP_GDN_DIM / 16u, n_rows), QWEN4EXP_GDN_DIM, 0, stream>>>(
@@ -2923,7 +2971,7 @@ static int qwen4exp_cuda_gdn_run(
                         state_snapshot ? (float *)state_snapshot->ptr : NULL,
                         n_key_head, n_value_head, n_rows, n_tokens, head_layout,
                         n_snapshot_rows,
-                        getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u);
+                        qwen4exp_gdn_snap_plain());
             }
         } else {
             qwen4exp_gdn_recurrence_kernel<true><<<
@@ -2935,7 +2983,7 @@ static int qwen4exp_cuda_gdn_run(
                     state_snapshot ? (float *)state_snapshot->ptr : NULL,
                     n_key_head, n_value_head, n_rows, n_tokens, head_layout,
                     n_snapshot_rows,
-                    getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u,
+                    qwen4exp_gdn_snap_plain(),
                     NULL);
         }
     } else {
@@ -2949,7 +2997,7 @@ static int qwen4exp_cuda_gdn_run(
                 state_snapshot ? (float *)state_snapshot->ptr : NULL,
                 n_key_head, n_value_head, n_rows, n_tokens, head_layout,
                 n_snapshot_rows,
-                getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u,
+                qwen4exp_gdn_snap_plain(),
                 adopt_row);
     }
     if (!cuda_ok(cudaGetLastError(), "qwen4exp GDN recurrence launch")) {
