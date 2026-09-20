@@ -4313,7 +4313,6 @@ __global__ static void qwen4exp_moe_group_scan_parallel_kernel(
  * (the others contribute no windows), so one routing can be split into the
  * 32-pair tile's list and the heavy tile's list. */
 /* build record 20260919T203222Z-5 */
-/* build record 20260920T112423Z-103 */
 __global__ static void qwen4exp_moe_pair_tasks_kernel(
         int32_t *tasks, const int32_t *counts, unsigned total,
         int32_t tile = 32, int32_t lo = 0, int32_t hi = 0x7fffffff) {
@@ -5207,76 +5206,6 @@ __device__ __forceinline__ static void qw_cpasync16(uint32_t dst,
     asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
                  :: "r"(dst), "l"(src));
 }
-/* L2 EVICTION-PRIORITY POLICIES.  A cache policy is a hint: it changes which
- * line the L2 throws out first, never a value any load returns, so every arm
- * below is bit-exact by construction.
- *
- * The gate/up tile streams ~1.8 MB of q4_K weight per window and reads the
- * SAME 2.6 MB of quantised activations from every one of the twenty row
- * blocks of every window (421 MB of activation reads per layer against a
- * 2.6 MB footprint).  The weight stream has no reuse at all -- each byte is
- * read once -- yet it is what evicts the activations from the 24 MB L2.
- * Tagging the activation reads `evict_last` keeps them resident without
- * reserving anything.
- *
- * NOTE ON cp.async: `cp.async.*.L2::cache_hint` assembles on this toolchain
- * (nvcc 13.0.88, sm_121a) but faults at run time ("an illegal instruction
- * was encountered") in the heavy tile, in both the ignore-src and the plain
- * form.  Only the `ld.global.L2::cache_hint` forms below are used.
- *
- * `qw_pol_off` is evict_normal at fraction 1.0, i.e. exactly the default the
- * un-hinted instruction takes, so the valve's OFF arm runs the same
- * instruction stream with an inert policy rather than a second code path. */
-__device__ __forceinline__ static uint64_t qw_pol_last(void) {
-    uint64_t p;
-    asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;"
-                 : "=l"(p));
-    return p;
-}
-__device__ __forceinline__ static uint64_t qw_pol_off(void) {
-    uint64_t p;
-    asm volatile("createpolicy.fractional.L2::evict_normal.b64 %0, 1.0;"
-                 : "=l"(p));
-    return p;
-}
-__device__ __forceinline__ static void qw_ldg16_pol(const void *src,
-                                                    uint4 *out, uint64_t pol) {
-    asm volatile("ld.global.L2::cache_hint.v4.u32 {%0,%1,%2,%3}, [%4], %5;"
-                 : "=r"(out->x), "=r"(out->y), "=r"(out->z), "=r"(out->w)
-                 : "l"(src), "l"(pol));
-}
-__device__ __forceinline__ static float qw_ldg32f_pol(const float *src,
-                                                      uint64_t pol) {
-    float v;
-    asm volatile("ld.global.L2::cache_hint.f32 %0, [%1], %2;"
-                 : "=f"(v) : "l"(src), "l"(pol));
-    return v;
-}
-__device__ __forceinline__ static int32_t qw_ldg32i_pol(const int32_t *src,
-                                                        uint64_t pol) {
-    int32_t v;
-    asm volatile("ld.global.L2::cache_hint.s32 %0, [%1], %2;"
-                 : "=r"(v) : "l"(src), "l"(pol));
-    return v;
-}
-/* The activation payload of one group, with an L2 policy.  The sixteen-byte
- * arm is the one qw_load_words8 takes for these addresses (xq + 32*group is
- * 32-byte aligned), and it returns the same eight words in the same order;
- * anything else falls back to the shipped loader unhinted. */
-__device__ __forceinline__ static void qw_load_words8_pol(const uint32_t *qw,
-                                                          uint32_t *w,
-                                                          uint64_t pol) {
-    if ((((uintptr_t)qw) & 15u) == 0u) {
-        uint4 a, b;
-        qw_ldg16_pol(qw, &a, pol);
-        qw_ldg16_pol(qw + 4, &b, pol);
-        w[0] = a.x; w[1] = a.y; w[2] = a.z; w[3] = a.w;
-        w[4] = b.x; w[5] = b.y; w[6] = b.z; w[7] = b.w;
-        return;
-    }
-    qw_load_words8(qw, w);
-}
-
 __device__ __forceinline__ static void qw_cpasync_commit(void) {
     asm volatile("cp.async.commit_group;\n" ::);
 }
@@ -5478,34 +5407,6 @@ qwen4exp_moe_gateup_mma_kernel(
      * of sixteen, so either every super-block of the slab takes the vector
      * header or the guard stands the whole block down to the per-group
      * staging below, which decodes the same bytes its own way. */
-    /* L2 EVICTION POLICY VALVE (dq_stage bit 1; bit 0 is the staging arm).
-     *
-     * Every window of this tile reads ~1.8 MB of q4_K weight ONCE, and every
-     * one of the twenty row blocks of every window re-reads the SAME
-     * quantised activation rows: 421 MB of activation reads per layer against
-     * a 2.6 MB footprint, while 437 MB of single-use weight streams past
-     * them through a 24 MB L2.  Tagging the activation reads `evict_last`
-     * keeps that 2.6 MB resident for the whole launch without reserving
-     * anything.  It is a hint: no load below returns a different value under
-     * any policy, so the arms are bit-exact against each other by
-     * construction.  OFF is evict_normal at fraction one -- the default
-     * priority -- so both arms issue the identical instruction stream and
-     * differ only in a policy register's contents.
-     *
-     * Measured (standalone harness, real routing counts, four layers, min of
-     * eleven, second repeat of each -- the settled one): light tile
-     * 2028/2318/2226/2841 us shipped against 1992/2278/2180/2781 with this
-     * on, -1.8/-1.7/-2.0/-2.1 %.  (The first, less settled repeat of each
-     * read -2.7 to -3.2 %; the settled figure is the one quoted.)  End to
-     * end on the full engine the tile is ~105 ms of a ~618 ms prefill
-     * forward, so that predicts ~-0.3 % of prefill, which is what the
-     * interleaved qbench A/B measures.  The mirror image,
-     * tagging the single-use WEIGHT stream `evict_first`, was measured and is
-     * 8-9 % WORSE on the same four layers (2158/2552/2465/3092): the rolling
-     * prefetch and the header load both want the weight line to survive from
-     * the prefetch to the cp.async that consumes it. */
-    const uint64_t polA = (dq_stage & 2u) ? qw_pol_last() : qw_pol_off();
-
     const uint32_t w_sel = tid & 3u;
     const uint32_t w_tile = w_sel & 1u;
     const uint32_t w_slice = w_sel >> 1;
@@ -5513,7 +5414,7 @@ qwen4exp_moe_gateup_mma_kernel(
     int8_t *const sWt = w_tile ? sAu : sAg;
     float *const sWAt = w_tile ? sWAu : sWAg;
     float *const sWBt = w_tile ? sWBu : sWBg;
-    const bool w_fast = (dq_stage & 1u) != 0u &&
+    const bool w_fast = dq_stage != 0u &&
         GateType == DS4_QWEN4EXP_TY_q4_K && UpType == DS4_QWEN4EXP_TY_q4_K &&
         (((uintptr_t)w_row) & 15u) == 0u;
     /* Block-uniform by construction (the expert bases and the row stride are
@@ -5521,7 +5422,7 @@ qwen4exp_moe_gateup_mma_kernel(
      * taken by the whole CTA or by none of it.  It also implies w_fast for
      * every thread, and it keeps the dq_stage diagnostic valve meaningful:
      * with dq_stage == 0 the block takes the per-group staging and no DMA. */
-    const bool dma_on = Dma != 0 && (dq_stage & 1u) != 0u &&
+    const bool dma_on = Dma != 0 && dq_stage != 0u &&
         GateType == DS4_QWEN4EXP_TY_q4_K && UpType == DS4_QWEN4EXP_TY_q4_K &&
         ((((uintptr_t)gate_e) | ((uintptr_t)up_e) | (uintptr_t)gate_row_bytes |
           (uintptr_t)up_row_bytes) & 15u) == 0u &&
@@ -5660,10 +5561,10 @@ qwen4exp_moe_gateup_mma_kernel(
         if (sTok[act_tk] != 0xffffffffu && act_gg < groups) {
             const uint32_t token = sTok[act_tk] / n_expert_used;
             const uint64_t at_g = (uint64_t)token * groups + act_gg;
-            qw_load_words8_pol((const uint32_t *)(const void *)(xq + at_g * 32u),
-                               rawb, polA);
-            act_scale = qw_ldg32f_pol(&xs[at_g], polA);
-            act_sum = (float)qw_ldg32i_pol(&xsum[at_g], polA);
+            qw_load_words8((const uint32_t *)(const void *)(xq + at_g * 32u),
+                           rawb);
+            act_scale = xs[at_g];
+            act_sum = (float)xsum[at_g];
             haveb = 1;
         }
 
@@ -5834,11 +5735,11 @@ qwen4exp_moe_gateup_mma_kernel(
                 if (sTok[act_tk] != 0xffffffffu && ga < groups) {
                     const uint32_t token = sTok[act_tk] / n_expert_used;
                     const uint64_t at_g = (uint64_t)token * groups + ga;
-                    qw_load_words8_pol(
+                    qw_load_words8(
                             (const uint32_t *)(const void *)(xq + at_g * 32u),
-                            rawb, polA);
-                    act_scale = qw_ldg32f_pol(&xs[at_g], polA);
-                    act_sum = (float)qw_ldg32i_pol(&xsum[at_g], polA);
+                            rawb);
+                    act_scale = xs[at_g];
+                    act_sum = (float)xsum[at_g];
                     haveb = 1;
                 } else {
                     haveb = 0;
@@ -10321,20 +10222,8 @@ static int qwen4exp_routed_moe_cuda(
          * shapes of both specialised and generic instantiations see one
          * answer.  The other weight formats never take the new staging and
          * are unaffected either way. */
-        uint32_t gu_dq_stage =
+        const uint32_t gu_dq_stage =
             getenv("DS4_QWEN4EXP_NO_GATEUP_DQ") == NULL ? 1u : 0u;
-        /* L2 EVICTION POLICY (bit 1 of the same word; see the kernel).
-         * DS4_GU_L2POL=0 restores the shipped priorities.  The policy is a
-         * hint, so both arms compute the same bytes.
-         *
-         * Taken only on the pair-task shape, which is n_tokens >= 64: that
-         * is the width whose activation footprint is re-read by twenty row
-         * blocks of a few hundred windows.  A decode-width launch reads a
-         * couple of kilobytes of activation once, has nothing to keep, and
-         * runs the shipped priorities byte for byte. */
-        if (pair_tasks && (getenv("DS4_GU_L2POL") == NULL ||
-                           getenv("DS4_GU_L2POL")[0] != '0'))
-            gu_dq_stage |= 2u;
         /* The heavy tile takes the experts of more than 32 pairs on the
          * q4_K slab (the ranked gate/up type) when the fused Q8_0 epilogue
          * is on; its copies need the same sixteen-byte alignment and whole
@@ -10430,7 +10319,7 @@ static int qwen4exp_routed_moe_cuda(
              * repeats the test itself (block-uniform, outside the K loop)
              * and falls back rather than stage a fill it cannot hold. */
             const char *gu_dma_env = getenv("DS4_GATEUP_DMA");
-            const bool gu_dma = QW_GATEUP_DMA_ARM != 0 && (gu_dq_stage & 1u) != 0u &&
+            const bool gu_dma = QW_GATEUP_DMA_ARM != 0 && gu_dq_stage != 0u &&
                 (gu_dma_env == NULL || gu_dma_env[0] != '0') &&
                 (xgroups % 8u) == 0u &&
                 ((((uintptr_t)gate) | ((uintptr_t)up) |
@@ -12516,18 +12405,6 @@ __global__ static void qwen4exp_hc_silu_quant_kernel(
      * width never carries a trigger (the deadlock rule,
      * ds4_cuda_qwen4exp.cuh). */
     if (pairs <= 20u) QWEN4EXP_PDL_TRIGGER();
-    /* PDL CONSUMER of the HC down projection (the relay).  This kernel has
-     * nothing of its own to prefetch -- every byte it reads is the down
-     * projection's output -- so the fence is its FIRST statement after the
-     * trigger.  The point of making it a consumer is not this kernel: the
-     * trigger above fires as soon as this block comes up, which is while the
-     * down projection is still running, so the UP projection's staged weight
-     * slab (matmul_q8_hc_warp_pair_stage_kernel loads it whole, above its own
-     * fence) flies during the down projection instead of during this 1.0 us
-     * kernel.  With a plain launch the fence is a no-op and this is exactly
-     * the shipped kernel.  `lowrank` carries no __restrict__/const, so no
-     * ld.global.nc may be hoisted above the fence (the .NC rule). */
-    QWEN4EXP_PDL_SYNC();
     const uint64_t pair = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
     if (pair >= pairs) return;
     const uint32_t lane = threadIdx.x & 31u;
@@ -13472,21 +13349,6 @@ static int ds4_qwen4exp_hc_wide_off(void) {
  * first, so the residual is updated on return whichever path was taken.  A
  * -1 (shape declined) is returned before any launch, so the caller's fallback
  * still owes the apply. */
-/* The HC PDL relay valve (see the launch site below).  Default ON with a
- * kill switch, as every other measured path in this tree: a scored run sets
- * no environment, so a default-off valve would ship as a no-op.  Resolved
- * once, so no launch pays a getenv. */
-static int qwen4exp_hc_relay_enabled(void) {
-    static int resolved = 0;
-    static int enabled = 0;
-    if (!resolved) {
-        const char *e = getenv("DS4_HC_PDL_RELAY");
-        enabled = (e && e[0] == '0') ? 0 : 1;
-        resolved = 1;
-    }
-    return enabled;
-}
-
 static int qwen4exp_hc_mixer_fused_cuda(
         ds4_gpu_tensor       *mixed,
         ds4_gpu_tensor       *inject,
@@ -13661,34 +13523,10 @@ static int qwen4exp_hc_mixer_fused_cuda(
          * q/scale ranges, leaving the stream norm scales at n_off untouched.
          * The narrow input is no larger than either reserved range. */
         const uint64_t low_pairs = (uint64_t)rows * (n_lowrank / 32u);
-        /* THE RELAY.  At the two-row decode width the stream is
-         *     hc_norm_quant -> hc_down_pair -> hc_silu_quant -> hc_up
-         * and the up projection stages its WHOLE weight slab above its own
-         * fence -- but its PDL window was this 1.0 us quantizer, so only a
-         * handful of its blocks ever prefetched anything.  Attributing this
-         * launch relays the chain: hc_down_pair triggers at its top (it is
-         * 640 blocks of one warp, 24 blocks/SM x 48 = 1152 slots, so it is
-         * single-wave and may carry a trigger -- the deadlock rule), this
-         * kernel's blocks come up during it and fire their own trigger, and
-         * the up projection's blocks stage their weights across the down
-         * projection's 17.5 us instead of across 1.0 us.
-         * NOTHING ARITHMETIC MOVES: every kernel body below the fences is
-         * the shipped one, on the shipped grids, in the shipped order.
-         * DS4_HC_PDL_RELAY=0 drops the attribute; the fence in a plainly
-         * launched kernel is a no-op and the down trigger fires into
-         * nothing, which is the shipped behaviour exactly. */
-        if (low_pairs <= 20u && qwen4exp_hc_relay_enabled()) {
-            QWEN4EXP_LAUNCH_PDL(qwen4exp_hc_silu_quant_kernel,
-                                (unsigned)((low_pairs + 7u) / 8u), 256, 0,
-                                cuda_decode_stream(),
-                                (float *)lowrank_scratch->ptr, xq, xscale,
-                                low_pairs, 1.0f / (float)n_hc);
-        } else {
         qwen4exp_hc_silu_quant_kernel<<<(unsigned)((low_pairs + 7u) / 8u),
                                        256, 0, cuda_decode_stream()>>>(
                 (float *)lowrank_scratch->ptr, xq, xscale, low_pairs,
                 1.0f / (float)n_hc);
-        }
         if (!cuda_ok(cudaGetLastError(), "qwen4exp_hc_silu_quant launch")) return 0;
         if (upw) {
             /* The same two tile shapes the unfused ladder picks for a wide
