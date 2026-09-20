@@ -12,22 +12,6 @@
 #include "ds4_qwen4exp_qsa_scratch.h"
 #include "ds4_qwen4exp_gdn_replay.h"
 
-/* CUDA supplies the native output-row screen.  Keep these weak just like the
- * MTP hook binding does: Metal/ROCm and CPU-only test links have no such
- * symbol and retain the full-vocabulary head without a backend stub. */
-#if defined(__GNUC__)
-extern int ds4_gpu_mtp_native_screen2_init(
-        uint32_t, uint64_t *, uint32_t *) __attribute__((weak));
-extern int ds4_gpu_mtp_native_screen2(
-        ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *, const void *,
-        uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t,
-        const ds4_gpu_tensor *, int) __attribute__((weak));
-extern int ds4_gpu_mtp_native_scatter2(
-        ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *,
-        const ds4_gpu_tensor *, ds4_gpu_tensor *, uint32_t, uint32_t,
-        uint32_t, int) __attribute__((weak));
-#endif
-
 /* ======================================================================
  * Sizing.
  * ====================================================================== */
@@ -375,7 +359,6 @@ struct ds4_qwen4exp_session {
      * but argmax runs before the command batch closes and only these indices
      * cross to the host until acceptance selects one full frontier row. */
     uint32_t        spec_top1_rows;
-    bool            target_native_deferred;
     uint32_t        indexer_valid_blocks;
     uint32_t        head_cache_pos;
 
@@ -449,13 +432,6 @@ struct ds4_qwen4exp_session {
 
     ds4_gpu_tensor *logits;
     ds4_gpu_tensor *spec_top1;
-    /* CUDA R2 target-head screen.  One fused coarse pass shares the weight
-     * stream while ranking and exact refinement remain independent per row.
-     * One-row verification deliberately retains the exact full head. */
-    ds4_gpu_tensor *target_native_scratch2;
-    ds4_gpu_tensor *target_native_ids;
-    ds4_gpu_tensor *target_native_logits;
-    uint32_t        target_native_capacity;
 
     /* PREFILL ONLY.  True while `hyper` still owes the last block's inject:
      * the value the model means is hyper + block_out * inject, and the next
@@ -877,27 +853,7 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
     s->logits       = qwen4exp_alloc_zeroed(
             (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * cfg->n_vocab * f, &ok);
     s->spec_top1     = qwen4exp_alloc_zeroed(
-            ((uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT + 1u) * sizeof(int32_t), &ok);
-    if (ok && getenv("DS4_QWEN4EXP_NO_TARGET_NATIVE_SCREEN") == NULL &&
-        ds4_gpu_mtp_native_screen2_init && ds4_gpu_mtp_native_screen2 &&
-        ds4_gpu_mtp_native_scatter2) {
-        uint64_t scratch2_bytes = 0;
-        uint32_t capacity = 0;
-        const int rc = ds4_gpu_mtp_native_screen2_init(
-                cfg->n_vocab, &scratch2_bytes, &capacity);
-        if (rc < 0) {
-            ok = false;
-        } else if (rc > 0 && scratch2_bytes && capacity &&
-                   capacity <= cfg->n_vocab) {
-            s->target_native_scratch2 =
-                qwen4exp_alloc_zeroed(scratch2_bytes, &ok);
-            s->target_native_ids = qwen4exp_alloc_zeroed(
-                2ull * capacity * sizeof(uint32_t), &ok);
-            s->target_native_logits = qwen4exp_alloc_zeroed(
-                2ull * capacity * sizeof(float), &ok);
-            if (ok) s->target_native_capacity = capacity;
-        }
-    }
+            (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * sizeof(int32_t), &ok);
 #ifdef DS4_TEST_HOOKS
     s->final_mixer_snapshot = qwen4exp_alloc_zeroed(B * H * E * f, &ok);
 #endif
@@ -981,9 +937,6 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->shexp_gate);
     ds4_gpu_tensor_free(s->logits);
     ds4_gpu_tensor_free(s->spec_top1);
-    ds4_gpu_tensor_free(s->target_native_scratch2);
-    ds4_gpu_tensor_free(s->target_native_ids);
-    ds4_gpu_tensor_free(s->target_native_logits);
 #ifdef DS4_TEST_HOOKS
     ds4_gpu_tensor_free(s->final_mixer_snapshot);
 #endif
@@ -3278,65 +3231,11 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
             return qwen4exp_forward_fail();
         }
     }
-    const ds4_gpu_tensor *head_x =
-        logit_rows == 1u ? s->embed_rows : s->mixed;
-    bool target_screened = false;
-    s->target_native_deferred = false;
-    const bool defer_target_invalid =
-        logit_rows == 2u && s->spec_top1_rows == logit_rows &&
-        getenv("DS4_MTP_NO_DEFER_INVALID_FLAG") == NULL;
-    if (logit_rows == 2u && s->target_native_capacity &&
-        s->target_native_scratch2 && s->target_native_ids &&
-        s->target_native_logits && ds4_gpu_mtp_native_screen2 &&
-        ds4_gpu_mtp_native_scatter2 && cfg->n_vocab > 276u) {
-        /* Screen the WHOLE vocabulary.  The 276 added-token rows are reserved
-         * by the native selector and prefix + tail is exactly n_vocab, so no
-         * token id is excluded before the approximate rank.  Every retained
-         * row is then recomputed by the ordinary exact Q8 dot and scattered
-         * back to its original id; only omitted rows become -FLT_MAX.
-         *
-         * This conservative target-only gate deliberately excludes the
-         * one-row decode head.  A declined R2 screen and every R1 call use the
-         * ordinary full-vocabulary projection below. */
-        const uint32_t tail = 276u;
-        const uint32_t prefix = cfg->n_vocab - tail;
-        if (!ds4_gpu_tensor_fill_f32(
-                s->logits, -FLT_MAX,
-                2ull * cfg->n_vocab)) {
-            fprintf(stderr, "ds4: qwen4exp target-screen logit clear failed\n");
-            return qwen4exp_forward_fail();
-        }
-        const int rc = ds4_gpu_mtp_native_screen2(
-                s->target_native_logits, s->target_native_ids,
-                s->target_native_scratch2, QW_MAP(m, w->output),
-                QW_MAPSZ(m, w->output), QW_OFF(w->output), DS4_N_EMBD,
-                cfg->n_vocab, prefix, tail, head_x,
-                defer_target_invalid);
-        if (rc < 0) {
-            fprintf(stderr,
-                    "ds4: qwen4exp target LM-head R2 screen failed\n");
-            return qwen4exp_forward_fail();
-        }
-        if ((uint32_t)rc == s->target_native_capacity) {
-            if (!ds4_gpu_mtp_native_scatter2(
-                    s->logits, s->target_native_logits,
-                    s->target_native_ids, s->target_native_scratch2,
-                    s->spec_top1, s->target_native_capacity,
-                    cfg->n_vocab, prefix + tail,
-                    defer_target_invalid)) {
-                fprintf(stderr,
-                        "ds4: qwen4exp target LM-head R2 scatter failed\n");
-                return qwen4exp_forward_fail();
-            }
-            target_screened = true;
-            s->target_native_deferred = defer_target_invalid;
-        }
-    }
-    if (!target_screened &&
-        !ds4_qwen4exp_matmul_q8_0(s->logits, QW_MAP(m, w->output),
-                                  QW_MAPSZ(m, w->output), QW_OFF(w->output),
-                                  DS4_N_EMBD, cfg->n_vocab, head_x,
-                                  logit_rows)) {
+    if (!ds4_qwen4exp_matmul_q8_0(s->logits, QW_MAP(m, w->output),
+                                    QW_MAPSZ(m, w->output), QW_OFF(w->output),
+                                    DS4_N_EMBD, cfg->n_vocab,
+                                    logit_rows == 1u ? s->embed_rows : s->mixed,
+                                    logit_rows)) {
         fprintf(stderr, "ds4: qwen4exp LM head failed\n");
         return qwen4exp_forward_fail();
     }
@@ -3900,34 +3799,6 @@ bool ds4_qwen4exp_graph_verify_rows(ds4_qwen4exp_session       *s,
     return true;
 }
 
-static bool qwen4exp_graph_rerun_lm_top1(
-        ds4_qwen4exp_session *s, const ds4_qwen4exp_weights *w,
-        const ds4_model *m, uint32_t n_tokens) {
-    const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
-    if (!ds4_gpu_begin_commands()) {
-        fprintf(stderr,
-                "ds4: qwen4exp nonfinite fallback could not open a command batch\n");
-        return false;
-    }
-    if (!ds4_qwen4exp_matmul_q8_0(s->logits, QW_MAP(m, w->output),
-                                  QW_MAPSZ(m, w->output), QW_OFF(w->output),
-                                  DS4_N_EMBD, cfg->n_vocab, s->mixed,
-                                  n_tokens) ||
-        !ds4_gpu_indexer_topk_tensor(s->spec_top1, s->logits,
-                                     cfg->n_vocab, n_tokens, 1u)) {
-        fprintf(stderr,
-                "ds4: qwen4exp nonfinite fallback LM head failed\n");
-        (void)ds4_gpu_end_commands();
-        return false;
-    }
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
-        fprintf(stderr,
-                "ds4: qwen4exp nonfinite fallback batch did not complete\n");
-        return false;
-    }
-    return true;
-}
-
 bool ds4_qwen4exp_graph_verify_top1_rows(ds4_qwen4exp_session       *s,
                                          const ds4_qwen4exp_weights *w,
                                          const ds4_model            *m,
@@ -3948,33 +3819,12 @@ bool ds4_qwen4exp_graph_verify_top1_rows(ds4_qwen4exp_session       *s,
     s->spec_logit_rows = 0u;
     s->spec_top1_rows = 0u;
     if (!forward_ok) return false;
-    const bool deferred = s->target_native_deferred;
-    s->target_native_deferred = false;
-    uint32_t compact[DS4_QWEN4EXP_MTP_MAX_COMMIT + 1u];
-    if (!ds4_gpu_tensor_read(s->spec_top1, 0, compact,
-                             (uint64_t)(n_tokens + deferred) *
-                                 sizeof(uint32_t))) {
-        fprintf(stderr, "ds4: qwen4exp compact verify top-1 read failed\n");
-        return false;
-    }
-    if (deferred && compact[n_tokens] != 0u) {
-        /* `mixed` still holds the final-mixer rows.  Recompute only the exact
-         * target LM head and argmax; recurrent and convolution state must not
-         * advance a second time. */
-        if (!qwen4exp_graph_rerun_lm_top1(s, w, m, n_tokens) ||
-            !ds4_gpu_tensor_read(s->spec_top1, 0, compact,
-                                 (uint64_t)n_tokens * sizeof(uint32_t))) {
-            fprintf(stderr,
-                    "ds4: qwen4exp compact verify nonfinite fallback failed\n");
-            return false;
-        }
-    }
-    for (uint32_t r = 0; r < n_tokens; r++) row_top1[r] = (int)compact[r];
     if (hc_rows && !ds4_qwen4exp_session_read_hyper(s, 0, n_tokens, hc_rows)) {
         fprintf(stderr, "ds4: qwen4exp compact verify hyper read failed\n");
         return false;
     }
-    return true;
+    return ds4_gpu_tensor_read(s->spec_top1, 0, row_top1,
+                               (uint64_t)n_tokens * sizeof(int32_t)) != 0;
 }
 
 bool ds4_qwen4exp_graph_read_logit_row(ds4_qwen4exp_session *s,
