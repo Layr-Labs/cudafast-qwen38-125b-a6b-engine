@@ -5941,7 +5941,7 @@ __device__ __forceinline__ static void qw_ldsm_x4(uint32_t *r, uint32_t addr) {
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(addr));
 }
 
-template <bool L2Ahead>
+template <bool L2Ahead, bool L2Full>
 __global__ __launch_bounds__(QW_GUH_THREADS, 2) static void
 qwen4exp_moe_gateup_heavy_kernel(
         int8_t *mq,
@@ -6065,11 +6065,17 @@ qwen4exp_moe_gateup_heavy_kernel(
      * L2 for the line chunk c + 3 copies from, while chunk c + 1's copies
      * are in flight.  The copies of one chunk are 64-byte pieces of 128
      * rows 1440 bytes apart; issued only one chunk ahead they leave the
-     * weight stream's DRAM latency exposed at every barrier.  A prefetch
-     * moves no data into the tile and changes no operand. */
+     * weight stream's DRAM latency exposed at every barrier.  A q4_K
+     * super-block is 144 bytes and may straddle two 128-byte L2 lines.  Its
+     * even chunk keeps the original +16 request; the odd chunk names the
+     * super-block's final valid byte so the other line is resident too.
+     * L2Full=false retains the original odd-chunk +80 request exactly.  A
+     * prefetch moves no data into the tile and changes no operand. */
     auto l2_ahead = [&](uint32_t c) {
         if (L2Ahead && h_half == 0u && h_live && c < nchunk) {
-            const char *p = h_rowp + (c >> 1) * 144u + (c & 1u) * 64u + 16u;
+            const uint32_t in_sb =
+                (c & 1u) * (L2Full ? 127u : 64u) + 16u;
+            const char *p = h_rowp + (c >> 1) * 144u + in_sb;
             asm volatile("prefetch.global.L2 [%0];\n" :: "l"(p));
         }
     };
@@ -10249,20 +10255,31 @@ static int qwen4exp_routed_moe_cuda(
         }
         if (gu_heavy) {
             /* DS4_GU_HEAVY_L2AHEAD=0 launches the tile without the L2
-             * prefetch (the same instructions as before it existed). */
+             * prefetch (the same instructions as before it existed).
+             * DS4_GU_HEAVY_L2FULL=0 retains the original one-address-per-
+             * payload choice for a same-binary coverage comparison. */
             static int guh_ahead = -1;
             if (guh_ahead < 0) {
                 const char *e = getenv("DS4_GU_HEAVY_L2AHEAD");
                 guh_ahead = (e == NULL || e[0] != '0') ? 1 : 0;
             }
+            static int guh_full = -1;
+            if (guh_full < 0) {
+                const char *e = getenv("DS4_GU_HEAVY_L2FULL");
+                guh_full = (e == NULL || e[0] != '0') ? 1 : 0;
+            }
             static int guh_attr = 0;
             if (guh_attr == 0) {
                 guh_attr = (cudaFuncSetAttribute(
-                        qwen4exp_moe_gateup_heavy_kernel<true>,
+                        qwen4exp_moe_gateup_heavy_kernel<true, true>,
                         cudaFuncAttributeMaxDynamicSharedMemorySize,
                         (int)QW_GUH_SMEM) == cudaSuccess &&
                             cudaFuncSetAttribute(
-                        qwen4exp_moe_gateup_heavy_kernel<false>,
+                        qwen4exp_moe_gateup_heavy_kernel<true, false>,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                        (int)QW_GUH_SMEM) == cudaSuccess &&
+                            cudaFuncSetAttribute(
+                        qwen4exp_moe_gateup_heavy_kernel<false, false>,
                         cudaFuncAttributeMaxDynamicSharedMemorySize,
                         (int)QW_GUH_SMEM) == cudaSuccess) ? 1 : -1;
                 (void)cudaGetLastError();
@@ -10276,8 +10293,10 @@ static int qwen4exp_routed_moe_cuda(
                     gu_tasks_heavy, sc.counts, n_total_expert, (int32_t)QW_GUH_BN,
                     32, 0x7fffffff);
             if (!cuda_ok(cudaGetLastError(), "qwen4exp gate/up heavy tasks")) return 0;
-            (guh_ahead ? qwen4exp_moe_gateup_heavy_kernel<true>
-                       : qwen4exp_moe_gateup_heavy_kernel<false>)<<<
+            (guh_ahead
+                ? (guh_full ? qwen4exp_moe_gateup_heavy_kernel<true, true>
+                            : qwen4exp_moe_gateup_heavy_kernel<true, false>)
+                : qwen4exp_moe_gateup_heavy_kernel<false, false>)<<<
                     dim3(mid_dim / QW_GUH_BM, (unsigned)task_capacity, 1),
                     QW_GUH_THREADS, QW_GUH_SMEM, stream>>>(
                     sc.mq, sc.ms, sc.msum, gate, up, sc.xq, sc.xs, sc.xsum,
