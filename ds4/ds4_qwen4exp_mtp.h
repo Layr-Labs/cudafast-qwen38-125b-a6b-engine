@@ -704,18 +704,6 @@ typedef struct {
     int (*ehx_pack)(ds4_gpu_tensor *out, const ds4_gpu_tensor *embedding,
                     const ds4_gpu_tensor *hidden, uint32_t n_tokens,
                     uint32_t n_hc, uint32_t n_embd);
-    /* Optional fused pack+quantize and the prequantized matmul it feeds.
-     * Both are bound together or neither is; NULL keeps the pack hook (or
-     * the portable copy sequence) plus the quantizing matmul entry. */
-    int (*ehx_pack_quant)(ds4_gpu_tensor *q, uint64_t q_offset,
-                          uint64_t s_offset, const ds4_gpu_tensor *embedding,
-                          const ds4_gpu_tensor *hidden, uint32_t n_tokens,
-                          uint32_t n_hc, uint32_t n_embd);
-    int (*matmul_q8_0_preq)(ds4_gpu_tensor *out, const void *model_map,
-                            uint64_t model_size, uint64_t weight_offset,
-                            uint64_t in_dim, uint64_t out_dim,
-                            const ds4_gpu_tensor *q, uint64_t q_offset,
-                            uint64_t s_offset, uint64_t n_tok);
     int (*matmul_q8_0)(ds4_gpu_tensor *out, const void *model_map,
                        uint64_t model_size, uint64_t weight_offset,
                        uint64_t in_dim, uint64_t out_dim,
@@ -725,10 +713,9 @@ typedef struct {
     int (*native_init)(uint32_t, uint64_t *, uint32_t *);
     int (*native_screen)(ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *,
                          const void *, uint64_t, uint64_t, uint32_t, uint32_t,
-                         uint32_t, uint32_t, const ds4_gpu_tensor *, int);
+                         uint32_t, uint32_t, const ds4_gpu_tensor *);
     int (*native_map)(ds4_gpu_tensor *, const ds4_gpu_tensor *,
-                      const ds4_gpu_tensor *, const ds4_gpu_tensor *, uint32_t,
-                      uint32_t, uint32_t, int);
+                      const ds4_gpu_tensor *, uint32_t, uint32_t);
     ds4_qwen4exp_block_forward_fn block;
     ds4_qwen4exp_block_forward_fn cache_seed; /* optional cache-only hook */
 } ds4_qwen4exp_mtp_gpu_hooks;
@@ -930,13 +917,6 @@ int ds4_qwen4exp_mtp_head_forward(ds4_qwen4exp_mtp_head *h,
  * `hyper` row (hc_dim floats).  Every row still runs the block and writes its
  * own cache row; what is narrower is the readback and the argmax.  This is the
  * entry the seam's draft_rows binds to. */
-int ds4_qwen4exp_mtp_head_forward_last_device(ds4_qwen4exp_mtp_head *h,
-                                              const int *next_tokens,
-                                              const ds4_gpu_tensor *hyper_device,
-                                              uint32_t first_row,
-                                              uint32_t pos0, uint32_t n_tokens,
-                                              int *draft_out, float *multi_out,
-                                              char *err, size_t errlen);
 int ds4_qwen4exp_mtp_head_forward_last(ds4_qwen4exp_mtp_head *h,
                                        const int *next_tokens,
                                        const float *multi_in,
