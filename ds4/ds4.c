@@ -54820,8 +54820,6 @@ struct ds4_session {
     ds4_qwen4exp_mtp_model     qwen4exp_seam;
     ds4_qwen4exp_rollback_set  qwen4exp_rollback;
     ds4_qwen4exp_mtp_head      qwen4exp_head;
-    const float               *qwen4exp_hc_host_base;   /* the verify's host hyper buffer, or NULL */
-    uint32_t                   qwen4exp_hc_host_rows;
     /* Set at create for a qwen4exp session.  ds4_session_is_qwen4exp() reads
      * the model shape, which is process-global; this says THIS session was
      * built on the qwen4exp path, which is what the refusals below key on. */
@@ -76039,15 +76037,9 @@ static int qwen4exp_seam_verify_rows_top1(void *ctx, const int *tokens,
     if (at != pos0 || n > (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT) return -1;
     int32_t buf[DS4_QWEN4EXP_MTP_MAX_COMMIT];
     for (uint32_t i = 0; i < n; i++) buf[i] = (int32_t)tokens[i];
-    /* The draft that follows takes its hyper rows from the session's device
-     * tensor (see qwen4exp_seam_draft_rows); the host copy is only made when
-     * the valve keeps the old path. */
-    const int dev_rows = getenv("DS4_QWEN4EXP_NO_DEVICE_HYPER") == NULL;
-    s->qwen4exp_hc_host_base = dev_rows ? hc_rows : NULL;
-    s->qwen4exp_hc_host_rows = n;
     return ds4_qwen4exp_graph_verify_top1_rows(
                e->qwen4exp_session, e->qwen4exp_weights, &e->model,
-               buf, n, dev_rows ? NULL : hc_rows, row_top1) ? 0 : -1;
+               buf, n, hc_rows, row_top1) ? 0 : -1;
 }
 
 static int qwen4exp_seam_read_logit_row(void *ctx, uint32_t row,
@@ -76112,31 +76104,9 @@ static int qwen4exp_seam_draft_rows(void *ctx, const int *next_tokens,
                                     float *multi_out) {
     ds4_session *s = ctx;
     char err[256];
-    int rc;
-    const float *base = s->qwen4exp_hc_host_base;
-    const uint32_t hc_dim = s->qwen4exp_head.n_hc * s->qwen4exp_head.n_embd;
-    if (base && hc_rows >= base && hc_dim &&
-        ((size_t)(hc_rows - base)) % hc_dim == 0u &&
-        (hc_rows - base) / hc_dim + n <= s->qwen4exp_hc_host_rows) {
-        const uint32_t first = (uint32_t)((hc_rows - base) / hc_dim);
-        rc = ds4_qwen4exp_mtp_head_forward_last_device(
-                 &s->qwen4exp_head, next_tokens,
-                 ds4_qwen4exp_session_hyper(s->engine->qwen4exp_session), first,
-                 pos0, n, draft_out, multi_out, err, sizeof(err));
-    } else {
-        /* The host path. If the verify skipped its host copy, make it now so
-         * the rows the head reads are the target's, not stale memory. */
-        if (base && s->qwen4exp_hc_host_rows &&
-            !ds4_qwen4exp_session_read_hyper(s->engine->qwen4exp_session, 0,
-                                             s->qwen4exp_hc_host_rows, (float *)base)) {
-            fprintf(stderr, "ds4: qwen4exp MTP seam: hyper read failed\n");
-            return -1;
-        }
-        rc = ds4_qwen4exp_mtp_head_forward_last(&s->qwen4exp_head, next_tokens,
-                                                hc_rows, pos0, n, draft_out,
-                                                multi_out, err, sizeof(err));
-    }
-    if (rc != 0) {
+    if (ds4_qwen4exp_mtp_head_forward_last(&s->qwen4exp_head, next_tokens,
+                                           hc_rows, pos0, n, draft_out,
+                                           multi_out, err, sizeof(err)) != 0) {
         fprintf(stderr, "ds4: qwen4exp MTP seam: %s\n", err);
         return -1;
     }

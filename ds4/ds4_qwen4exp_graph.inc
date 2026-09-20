@@ -12,22 +12,6 @@
 #include "ds4_qwen4exp_qsa_scratch.h"
 #include "ds4_qwen4exp_gdn_replay.h"
 
-/* CUDA supplies the native output-row screen.  Keep these weak just like the
- * MTP hook binding does: Metal/ROCm and CPU-only test links have no such
- * symbol and retain the full-vocabulary head without a backend stub. */
-#if defined(__GNUC__)
-extern int ds4_gpu_mtp_native_screen2_init(
-        uint32_t, uint64_t *, uint32_t *) __attribute__((weak));
-extern int ds4_gpu_mtp_native_screen2(
-        ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *, const void *,
-        uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t,
-        const ds4_gpu_tensor *, int) __attribute__((weak));
-extern int ds4_gpu_mtp_native_scatter2(
-        ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *,
-        const ds4_gpu_tensor *, ds4_gpu_tensor *, uint32_t, uint32_t,
-        uint32_t, int) __attribute__((weak));
-#endif
-
 /* ======================================================================
  * Sizing.
  * ====================================================================== */
@@ -375,7 +359,6 @@ struct ds4_qwen4exp_session {
      * but argmax runs before the command batch closes and only these indices
      * cross to the host until acceptance selects one full frontier row. */
     uint32_t        spec_top1_rows;
-    bool            target_native_deferred;
     uint32_t        indexer_valid_blocks;
     uint32_t        head_cache_pos;
 
@@ -449,13 +432,6 @@ struct ds4_qwen4exp_session {
 
     ds4_gpu_tensor *logits;
     ds4_gpu_tensor *spec_top1;
-    /* CUDA R2 target-head screen.  One fused coarse pass shares the weight
-     * stream while ranking and exact refinement remain independent per row.
-     * One-row verification deliberately retains the exact full head. */
-    ds4_gpu_tensor *target_native_scratch2;
-    ds4_gpu_tensor *target_native_ids;
-    ds4_gpu_tensor *target_native_logits;
-    uint32_t        target_native_capacity;
 
     /* PREFILL ONLY.  True while `hyper` still owes the last block's inject:
      * the value the model means is hyper + block_out * inject, and the next
@@ -877,27 +853,7 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
     s->logits       = qwen4exp_alloc_zeroed(
             (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * cfg->n_vocab * f, &ok);
     s->spec_top1     = qwen4exp_alloc_zeroed(
-            ((uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT + 1u) * sizeof(int32_t), &ok);
-    if (ok && getenv("DS4_QWEN4EXP_NO_TARGET_NATIVE_SCREEN") == NULL &&
-        ds4_gpu_mtp_native_screen2_init && ds4_gpu_mtp_native_screen2 &&
-        ds4_gpu_mtp_native_scatter2) {
-        uint64_t scratch2_bytes = 0;
-        uint32_t capacity = 0;
-        const int rc = ds4_gpu_mtp_native_screen2_init(
-                cfg->n_vocab, &scratch2_bytes, &capacity);
-        if (rc < 0) {
-            ok = false;
-        } else if (rc > 0 && scratch2_bytes && capacity &&
-                   capacity <= cfg->n_vocab) {
-            s->target_native_scratch2 =
-                qwen4exp_alloc_zeroed(scratch2_bytes, &ok);
-            s->target_native_ids = qwen4exp_alloc_zeroed(
-                2ull * capacity * sizeof(uint32_t), &ok);
-            s->target_native_logits = qwen4exp_alloc_zeroed(
-                2ull * capacity * sizeof(float), &ok);
-            if (ok) s->target_native_capacity = capacity;
-        }
-    }
+            (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * sizeof(int32_t), &ok);
 #ifdef DS4_TEST_HOOKS
     s->final_mixer_snapshot = qwen4exp_alloc_zeroed(B * H * E * f, &ok);
 #endif
@@ -981,9 +937,6 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->shexp_gate);
     ds4_gpu_tensor_free(s->logits);
     ds4_gpu_tensor_free(s->spec_top1);
-    ds4_gpu_tensor_free(s->target_native_scratch2);
-    ds4_gpu_tensor_free(s->target_native_ids);
-    ds4_gpu_tensor_free(s->target_native_logits);
 #ifdef DS4_TEST_HOOKS
     ds4_gpu_tensor_free(s->final_mixer_snapshot);
 #endif
@@ -1147,6 +1100,49 @@ void ds4_qwen4exp_session_reset(ds4_qwen4exp_session *s) {
  * knob); a positive value pins the thread count.  Unset, the gather takes
  * the online CPUs capped at 16 -- enough to keep the SSD queue deep without
  * starving the decode path's own helpers. */
+/* Ask the kernel to bring the row pages in before the gather touches them.
+ * A page fault on a cold row waits on the disk; a WILLNEED issued for every
+ * row of the batch puts all of those reads in flight together, so the
+ * gather's serial dequant walks pages that are already arriving rather than
+ * stalling one fault at a time.  Hint only: it changes no value the gather
+ * reads, and a row past the table is skipped here and refused by the gather
+ * itself. */
+static void qw_ple_hint_rows(const ds4_qwen4exp_ple_table *ple,
+                             const uint64_t *ids, uint64_t count) {
+#if defined(POSIX_MADV_WILLNEED)
+    if (!ple || !ple->base || !ids || count == 0) return;
+    /* Resolved once per process; sysconf walks external state for a value
+     * that cannot change while the engine is open. */
+    static long ple_hint_page = 0;
+    if (ple_hint_page == 0) {
+        const long p = sysconf(_SC_PAGESIZE);
+        ple_hint_page = (p > 0 && (p & (p - 1)) == 0) ? p : -1;
+    }
+    if (ple_hint_page <= 0) return;
+    const uint64_t page = (uint64_t)ple_hint_page;
+    /* `ple->base` is a GGUF-aligned tensor offset inside the shard mapping,
+     * not a page boundary; madvise needs the page that contains it. */
+    const uintptr_t base_addr = (uintptr_t)ple->base;
+    const uintptr_t map_base  = base_addr & ~(uintptr_t)(page - 1u);
+    const uint64_t  delta     = (uint64_t)(base_addr - map_base);
+    uint64_t prev_start = UINT64_MAX;
+    for (uint64_t i = 0; i < count; i++) {
+        const uint64_t row = ids[i];
+        if (row >= ple->rows) continue;
+        const uint64_t off   = delta + row * ple->row_bytes;
+        const uint64_t start = off & ~(page - 1u);
+        if (start == prev_start) continue; /* page already in flight */
+        prev_start = start;
+        uint64_t end   = (off + ple->row_bytes + page - 1u) & ~(page - 1u);
+        if (end > delta + ple->bytes) end = delta + ple->bytes;
+        (void)posix_madvise((void *)(map_base + start), (size_t)(end - start),
+                            POSIX_MADV_WILLNEED);
+    }
+#else
+    (void)ple; (void)ids; (void)count;
+#endif
+}
+
 typedef struct {
     const ds4_qwen4exp_ple_table *ple;
     const ds4_qwen4exp_session   *s;
@@ -1184,9 +1180,17 @@ static void *qw_ple_gather_worker(void *arg) {
         ds4_ple_history_reset(&seg->s->ple_constants, &local);
     }
     seg->ok = 1;
+    /* The segment's ids are known only after its own scan, so the hint runs
+     * between the two passes: every row page is in flight before the first
+     * dequant touches one. */
     for (uint32_t t = seg->t0; t < seg->t1; t++) {
         ds4_ple_row_ids(&seg->s->ple_constants, &local, seg->tokens + t, 1u,
                         seg->s->ple_ids + (uint64_t)t * DS4_N_PLE_HEAD);
+    }
+    qw_ple_hint_rows(seg->ple,
+                     seg->s->ple_ids + (uint64_t)seg->t0 * DS4_N_PLE_HEAD,
+                     (uint64_t)(seg->t1 - seg->t0) * DS4_N_PLE_HEAD);
+    for (uint32_t t = seg->t0; t < seg->t1; t++) {
         for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
             const uint64_t row =
                 seg->s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h];
@@ -1351,6 +1355,10 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 s->ple_history_rows[t] = s->ple_history;
             }
         }
+        /* Every id of the batch is known now; put all of the row pages in
+         * flight before the serial dequant touches the first cold one. */
+        qw_ple_hint_rows(&w->ple, s->ple_ids,
+                         (uint64_t)n_tokens * DS4_N_PLE_HEAD);
         for (uint32_t t = 0; t < n_tokens; t++) {
             /* The head's destination strides are constants of the shape, so
              * the token base is hoisted out of the head loop and the head
@@ -1414,6 +1422,8 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
         if (nthreads == 1) {
             ds4_ple_row_ids(&s->ple_constants, &s->ple_history, tokens,
                             n_tokens, s->ple_ids);
+            qw_ple_hint_rows(&w->ple, s->ple_ids,
+                             (uint64_t)n_tokens * DS4_N_PLE_HEAD);
             for (uint32_t t = 0; t < n_tokens; t++) {
                 for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
                     const uint64_t row =
@@ -2491,49 +2501,6 @@ static bool qwen4exp_graph_layer_island_encode(
     return true;
 }
 
-/* PREFILL LAYER CAPTURE.
- *
- * Prefill runs 100% eager: 1,618 launches, zero graph nodes, against a decode
- * phase that is 99,294 of 101,929 graphed.  Each eager launch costs ~2.3 us of
- * device-side dispatch that a graph node does not (measured standalone, with no
- * profiler attached, at 1,618 launches: eager span minus replay span is 3.67 ms
- * at every kernel duration from 1 to 100 us), and the engine's own trace shows
- * 1,370 inter-kernel gaps at a 2.69 us median.  Capturing the layer stack
- * collapses that class.
- *
- * WHY FROM LAYER 4, AND WHY THAT IS CORRECTNESS RATHER THAN TUNING.  Layers
- * 0-2 are gated-deltanet and layer 3 is the first full-attention layer, so
- * running all four eagerly puts every lazily sized allocator -- tmp scratch,
- * cuBLAS workspaces -- at steady state in BOTH layer shapes before the first
- * capture.  A cudaMalloc inside a stream capture is illegal; the decode path
- * solves the same problem with its state-0 warm pass, which a prefill layer
- * cannot use because it runs exactly once.  Cost: 4 layers of 48.
- *
- * WHY IT MAY CAPTURE AT ALL.  Counted in HOST ISSUE ORDER from the engine's
- * own prefill trace, all 13 capture-illegal calls (blocking cudaMemcpy,
- * cudaDeviceSynchronize) sit before launch 0 or after launch 1,577 of 1,618 --
- * the prologue and the LM-head epilogue.  Launches 0..1,576 are the whole
- * 48-layer tower and contain none.  If that ever stops being true the capture
- * simply fails and the layer is encoded eagerly, which is why every call site
- * below keeps the eager path as its fallback rather than as an error.
- *
- * DS4_QWEN4EXP_NO_PF_GRAPH restores the eager stack for an A/B. */
-#define DS4_QWEN4EXP_PF_GRAPH_MIN_ROWS    128u
-#define DS4_QWEN4EXP_PF_GRAPH_WARM_LAYERS   4u
-
-static bool qw_pf_graph_on(uint32_t n_tokens, uint32_t il) {
-    static int init = 0, enabled = 0;
-    if (!init) {
-        init = 1;
-        enabled = getenv("DS4_QWEN4EXP_NO_PF_GRAPH") == NULL;
-    }
-    return enabled && n_tokens >= DS4_QWEN4EXP_PF_GRAPH_MIN_ROWS &&
-           il >= DS4_QWEN4EXP_PF_GRAPH_WARM_LAYERS &&
-           /* profilers synchronize between operations, forbidden in capture */
-           !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
-           ds4_gpu_decode_graphs_supported();
-}
-
 static bool qwen4exp_graph_layer_island(
         ds4_qwen4exp_session *s, const ds4_qwen4exp_layer_weights *l,
         const ds4_model *m, uint32_t il, uint32_t n_tokens, uint32_t island) {
@@ -2592,22 +2559,6 @@ static bool qwen4exp_graph_layer_island(
              * re-encode this call eagerly exactly once, including on error. */
         }
     }
-    if (qw_pf_graph_on(n_tokens, il) && ds4_gpu_oneshot_graph_begin() == 0) {
-#ifdef DS4_TEST_HOOKS
-        const uint32_t pf_trace_len = g_qwen4exp_trace_len;
-        const bool pf_trace_overflow = g_qwen4exp_trace_overflow;
-#endif
-        if (qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens, island) &&
-            ds4_gpu_oneshot_graph_end() == 0) {
-            return true;
-        }
-        ds4_gpu_oneshot_graph_abort();   /* no-op if end() already closed it */
-#ifdef DS4_TEST_HOOKS
-        g_qwen4exp_trace_len = pf_trace_len;
-        g_qwen4exp_trace_overflow = pf_trace_overflow;
-#endif
-        /* Nothing executed: fall through to the eager encode below. */
-    }
     return qwen4exp_graph_layer_island_encode(s, l, m, il, n_tokens, island);
 }
 
@@ -2652,21 +2603,6 @@ static bool qwen4exp_graph_qsa_island(
             g_qwen4exp_trace_overflow = trace_overflow;
 #endif
         }
-    }
-    if (qw_pf_graph_on(n_tokens, il) && ds4_gpu_oneshot_graph_begin() == 0) {
-#ifdef DS4_TEST_HOOKS
-        const uint32_t pf_trace_len = g_qwen4exp_trace_len;
-        const bool pf_trace_overflow = g_qwen4exp_trace_overflow;
-#endif
-        if (qwen4exp_graph_qsa_block(s, l, m, il, n_tokens) &&
-            ds4_gpu_oneshot_graph_end() == 0) {
-            return true;
-        }
-        ds4_gpu_oneshot_graph_abort();
-#ifdef DS4_TEST_HOOKS
-        g_qwen4exp_trace_len = pf_trace_len;
-        g_qwen4exp_trace_overflow = pf_trace_overflow;
-#endif
     }
     return qwen4exp_graph_qsa_block(s, l, m, il, n_tokens);
 }
@@ -2737,12 +2673,6 @@ int ds4_qwen4exp_test_layer_sums(double *out, int cap, int *rows_out) {
 
 static bool qwen4exp_forward_fail(void) {
     (void)ds4_gpu_end_commands();
-    /* Close any capture still open FIRST.  This is a shared error path and
-     * retire() synchronizes, which is illegal inside an active capture and
-     * would invalidate it with an error nothing here would see.  abort() is a
-     * no-op when nothing is capturing, so this is safe from every caller. */
-    ds4_gpu_oneshot_graph_abort();
-    ds4_gpu_oneshot_graph_retire();
     return false;
 }
 
@@ -2755,35 +2685,6 @@ static bool qwen4exp_graph_layers_encode_range(
         uint32_t il_first, uint32_t il_last) {
     for (uint32_t il = il_first; il < il_last; il++) {
         const ds4_qwen4exp_layer_weights *l = &w->layer[il];
-
-        /* Destroy the PREVIOUS forward's captured graphs HERE, not at the end
-         * of the forward that built them.
-         *
-         * WHY HERE.  At this point layers 0..3 have been ISSUED eagerly, so
-         * roughly 51 ms of GPU work is queued and the ~1.5 ms of
-         * cudaGraphExecDestroy hides behind it.  At the end of a forward the
-         * device has nothing left queued, and the same destruction is pure
-         * exposed idle: measured as a 1.512 ms lengthening of one gap, which
-         * ate most of the 2.49 ms the capture saves.  Capture was guarded and
-         * held at 120x slack; this is the other end of the same lifecycle.
-         *
-         * WHY IT IS SAFE.  The graphs freed here belong to the PREVIOUS
-         * forward, which ended with ds4_gpu_end_commands() +
-         * ds4_gpu_synchronize() -- a full device sync -- so none of them is
-         * still reachable by the device.  retire_settled() therefore does not
-         * synchronize, and must not: synchronizing here would wait out exactly
-         * the queued work it is meant to hide behind.
-         *
-         * WHY IT IS NOT A CACHE.  Nothing is REUSED.  An executable graph is
-         * launched exactly once, inside ds4_gpu_oneshot_graph_end(), the
-         * instant it is instantiated; no other code path launches from the
-         * parked array.  This moves DESTRUCTION within a prefill window; it
-         * does not move prefill WORK between windows, so
-         * participant-contract 5.1.1 is untouched. */
-        if (il == DS4_QWEN4EXP_PF_GRAPH_WARM_LAYERS &&
-            qw_pf_graph_on(n_tokens, il)) {
-            ds4_gpu_oneshot_graph_retire_settled();
-        }
 
         /* --- per-layer n-gram embedding, one block only ----------------
          * FIRST in the layer, ahead of the attention mixer, and a plain
@@ -3278,65 +3179,11 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
             return qwen4exp_forward_fail();
         }
     }
-    const ds4_gpu_tensor *head_x =
-        logit_rows == 1u ? s->embed_rows : s->mixed;
-    bool target_screened = false;
-    s->target_native_deferred = false;
-    const bool defer_target_invalid =
-        logit_rows == 2u && s->spec_top1_rows == logit_rows &&
-        getenv("DS4_MTP_NO_DEFER_INVALID_FLAG") == NULL;
-    if (logit_rows == 2u && s->target_native_capacity &&
-        s->target_native_scratch2 && s->target_native_ids &&
-        s->target_native_logits && ds4_gpu_mtp_native_screen2 &&
-        ds4_gpu_mtp_native_scatter2 && cfg->n_vocab > 276u) {
-        /* Screen the WHOLE vocabulary.  The 276 added-token rows are reserved
-         * by the native selector and prefix + tail is exactly n_vocab, so no
-         * token id is excluded before the approximate rank.  Every retained
-         * row is then recomputed by the ordinary exact Q8 dot and scattered
-         * back to its original id; only omitted rows become -FLT_MAX.
-         *
-         * This conservative target-only gate deliberately excludes the
-         * one-row decode head.  A declined R2 screen and every R1 call use the
-         * ordinary full-vocabulary projection below. */
-        const uint32_t tail = 276u;
-        const uint32_t prefix = cfg->n_vocab - tail;
-        if (!ds4_gpu_tensor_fill_f32(
-                s->logits, -FLT_MAX,
-                2ull * cfg->n_vocab)) {
-            fprintf(stderr, "ds4: qwen4exp target-screen logit clear failed\n");
-            return qwen4exp_forward_fail();
-        }
-        const int rc = ds4_gpu_mtp_native_screen2(
-                s->target_native_logits, s->target_native_ids,
-                s->target_native_scratch2, QW_MAP(m, w->output),
-                QW_MAPSZ(m, w->output), QW_OFF(w->output), DS4_N_EMBD,
-                cfg->n_vocab, prefix, tail, head_x,
-                defer_target_invalid);
-        if (rc < 0) {
-            fprintf(stderr,
-                    "ds4: qwen4exp target LM-head R2 screen failed\n");
-            return qwen4exp_forward_fail();
-        }
-        if ((uint32_t)rc == s->target_native_capacity) {
-            if (!ds4_gpu_mtp_native_scatter2(
-                    s->logits, s->target_native_logits,
-                    s->target_native_ids, s->target_native_scratch2,
-                    s->spec_top1, s->target_native_capacity,
-                    cfg->n_vocab, prefix + tail,
-                    defer_target_invalid)) {
-                fprintf(stderr,
-                        "ds4: qwen4exp target LM-head R2 scatter failed\n");
-                return qwen4exp_forward_fail();
-            }
-            target_screened = true;
-            s->target_native_deferred = defer_target_invalid;
-        }
-    }
-    if (!target_screened &&
-        !ds4_qwen4exp_matmul_q8_0(s->logits, QW_MAP(m, w->output),
-                                  QW_MAPSZ(m, w->output), QW_OFF(w->output),
-                                  DS4_N_EMBD, cfg->n_vocab, head_x,
-                                  logit_rows)) {
+    if (!ds4_qwen4exp_matmul_q8_0(s->logits, QW_MAP(m, w->output),
+                                    QW_MAPSZ(m, w->output), QW_OFF(w->output),
+                                    DS4_N_EMBD, cfg->n_vocab,
+                                    logit_rows == 1u ? s->embed_rows : s->mixed,
+                                    logit_rows)) {
         fprintf(stderr, "ds4: qwen4exp LM head failed\n");
         return qwen4exp_forward_fail();
     }
@@ -3352,14 +3199,8 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     /* Commit and wait: the logits are read on the host from here on. */
     if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
         fprintf(stderr, "ds4: qwen4exp command batch did not complete\n");
-        ds4_gpu_oneshot_graph_retire();
         return false;
     }
-    /* Report the capture half of the lifecycle; the destroy half is paid in
-     * the NEXT forward, behind its queued eager layers.  Nothing is reused
-     * between the two -- every executable graph is launched once, at the
-     * instant it is instantiated -- so 5.1.1 is untouched. */
-    ds4_gpu_oneshot_graph_report();
     if (logits_out &&
         !ds4_gpu_tensor_read(s->logits, 0, logits_out,
                              (uint64_t)logit_rows * cfg->n_vocab *
@@ -3900,34 +3741,6 @@ bool ds4_qwen4exp_graph_verify_rows(ds4_qwen4exp_session       *s,
     return true;
 }
 
-static bool qwen4exp_graph_rerun_lm_top1(
-        ds4_qwen4exp_session *s, const ds4_qwen4exp_weights *w,
-        const ds4_model *m, uint32_t n_tokens) {
-    const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
-    if (!ds4_gpu_begin_commands()) {
-        fprintf(stderr,
-                "ds4: qwen4exp nonfinite fallback could not open a command batch\n");
-        return false;
-    }
-    if (!ds4_qwen4exp_matmul_q8_0(s->logits, QW_MAP(m, w->output),
-                                  QW_MAPSZ(m, w->output), QW_OFF(w->output),
-                                  DS4_N_EMBD, cfg->n_vocab, s->mixed,
-                                  n_tokens) ||
-        !ds4_gpu_indexer_topk_tensor(s->spec_top1, s->logits,
-                                     cfg->n_vocab, n_tokens, 1u)) {
-        fprintf(stderr,
-                "ds4: qwen4exp nonfinite fallback LM head failed\n");
-        (void)ds4_gpu_end_commands();
-        return false;
-    }
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
-        fprintf(stderr,
-                "ds4: qwen4exp nonfinite fallback batch did not complete\n");
-        return false;
-    }
-    return true;
-}
-
 bool ds4_qwen4exp_graph_verify_top1_rows(ds4_qwen4exp_session       *s,
                                          const ds4_qwen4exp_weights *w,
                                          const ds4_model            *m,
@@ -3948,33 +3761,12 @@ bool ds4_qwen4exp_graph_verify_top1_rows(ds4_qwen4exp_session       *s,
     s->spec_logit_rows = 0u;
     s->spec_top1_rows = 0u;
     if (!forward_ok) return false;
-    const bool deferred = s->target_native_deferred;
-    s->target_native_deferred = false;
-    uint32_t compact[DS4_QWEN4EXP_MTP_MAX_COMMIT + 1u];
-    if (!ds4_gpu_tensor_read(s->spec_top1, 0, compact,
-                             (uint64_t)(n_tokens + deferred) *
-                                 sizeof(uint32_t))) {
-        fprintf(stderr, "ds4: qwen4exp compact verify top-1 read failed\n");
-        return false;
-    }
-    if (deferred && compact[n_tokens] != 0u) {
-        /* `mixed` still holds the final-mixer rows.  Recompute only the exact
-         * target LM head and argmax; recurrent and convolution state must not
-         * advance a second time. */
-        if (!qwen4exp_graph_rerun_lm_top1(s, w, m, n_tokens) ||
-            !ds4_gpu_tensor_read(s->spec_top1, 0, compact,
-                                 (uint64_t)n_tokens * sizeof(uint32_t))) {
-            fprintf(stderr,
-                    "ds4: qwen4exp compact verify nonfinite fallback failed\n");
-            return false;
-        }
-    }
-    for (uint32_t r = 0; r < n_tokens; r++) row_top1[r] = (int)compact[r];
     if (hc_rows && !ds4_qwen4exp_session_read_hyper(s, 0, n_tokens, hc_rows)) {
         fprintf(stderr, "ds4: qwen4exp compact verify hyper read failed\n");
         return false;
     }
-    return true;
+    return ds4_gpu_tensor_read(s->spec_top1, 0, row_top1,
+                               (uint64_t)n_tokens * sizeof(int32_t)) != 0;
 }
 
 bool ds4_qwen4exp_graph_read_logit_row(ds4_qwen4exp_session *s,
