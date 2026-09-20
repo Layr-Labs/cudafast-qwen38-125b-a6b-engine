@@ -6161,10 +6161,23 @@ qwen4exp_moe_gateup_heavy_kernel(
     };
 
     const uint32_t nchunk = groups / 4u;
+    /* How far ahead the request runs, as ONE name read by both the prologue
+     * and the loop.  The tree ships this distance as three separate literals
+     * -- two in the prologue and a `c + 3` in the loop -- and a literal moved
+     * in one place and not the other leaves a silent gap in the stream rather
+     * than a compile error.  A chunk's copies are 64-byte pieces of 128 rows
+     * 1,440 bytes apart, so its fill is a scatter of partial lines, and one
+     * more chunk of lead is one more barrier of cover.  The distance is the
+     * only thing this changes.
+     *
+     * This is the WEIGHT stream, so it is orthogonal to the L2 eviction
+     * policy this base added on the ACTIVATION loads (DS4_GU_L2POL,
+     * DS4_CUDA_PIPE_ACTPOL): a prefetch asks for a line earlier, a policy
+     * says how long a line stays.  Neither touches the other's operands. */
+    const uint32_t guh_l2_dist = 6u;
     /* L2Ahead: the first header thread of each (projection, row) asks the
-     * L2 for the line chunk c + 3 copies from, while chunk c + 1's copies
-     * are in flight.  The copies of one chunk are 64-byte pieces of 128
-     * rows 1440 bytes apart; issued only one chunk ahead they leave the
+     * L2 for the line chunk c + guh_l2_dist copies from, while chunk c + 1's
+     * copies are in flight.  Issued only one chunk ahead they leave the
      * weight stream's DRAM latency exposed at every barrier.  A prefetch
      * moves no data into the tile and changes no operand. */
     auto l2_ahead = [&](uint32_t c) {
@@ -6173,8 +6186,8 @@ qwen4exp_moe_gateup_heavy_kernel(
             asm volatile("prefetch.global.L2 [%0];\n" :: "l"(p));
         }
     };
-    l2_ahead(1u);
-    l2_ahead(2u);
+#pragma unroll
+    for (uint32_t k = 1u; k < guh_l2_dist; k++) l2_ahead(k);
     load_hdr(0u);
     issue(0u);
     load_hdr(1u);
@@ -6199,7 +6212,7 @@ qwen4exp_moe_gateup_heavy_kernel(
         qw_cpasync_wait0();
         __syncthreads();
         if (c + 1u < nchunk) { issue(c + 1u); load_hdr(c + 2u); }
-        l2_ahead(c + 3u);
+        l2_ahead(c + guh_l2_dist);
         const uint32_t st = smem0 + (c & 1u) * QW_GUH_STAGE;
         const unsigned char *stp = guh_smem + (c & 1u) * QW_GUH_STAGE;
         const float *wa = (const float *)(const void *)(stp + QW_GUH_OFF_WA);
@@ -7375,6 +7388,15 @@ __global__ static void qwen4exp_moe_down_q_kernel(
 #pragma unroll
     for (int r = 0; r < R; r++) acc[r] = 0.0f;
 
+    /* ACTIVATION L2 EVICTION PRIORITY for the routed DOWN projection.
+     * `at_g` below is (t * n_expert_used + slot) * groups + g -- it contains
+     * no `row`, `row0` or `blockIdx.x` -- and the grid is (out_dim/8, tokens),
+     * so at the decode width all 320 grid.x blocks read the IDENTICAL
+     * mq/ms/msum slab while the down weight stream evicts it.  One
+     * `createpolicy` per block, hoisted out of every loop.  A policy is a
+     * hint: no load below returns a different value. */
+    const uint64_t mpol = qw_pol_last();
+
     /* Double buffering at TOKEN-PANEL granularity rather than slot
      * granularity.  The two tokens route to different experts, so a slot's
      * two panels are two independent fills that two independent stretches of
@@ -7495,13 +7517,32 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                             DownType < 0 ? down_type : (uint32_t)DownType,
                             drow, g, wq, wa, wb, &halves);
                     const uint64_t at_g = mrow * groups + g;
+                    /* The same 32 bytes, the same scale and the same integer
+                     * sum, fetched with the eviction policy attached and then
+                     * handed to the UNCHANGED accumulators as a verbatim byte
+                     * image.  `mq + at_g * 32u` is 32-byte aligned off a
+                     * device allocation, so qw_load_words8_pol takes its
+                     * aligned uint4 path; it falls back to the plain load if
+                     * that ever stops holding.  The staging buffer is a pair
+                     * of uint4, which carries 16-byte alignment by definition,
+                     * so the accumulators' int4 reads are aligned without an
+                     * explicit attribute.  Both accumulator branches read
+                     * the staged copy, so the policy covers the group path as
+                     * well as the vector one. */
+                    uint4 mqg4[2];
+                    qw_load_words8_pol(
+                            (const uint32_t *)(const void *)(mq + at_g * 32u),
+                            (uint32_t *)(void *)mqg4, mpol);
+                    const int8_t *const mqg =
+                            (const int8_t *)(const void *)mqg4;
+                    const float msc = qw_ldg32f_pol(&ms[at_g], mpol);
+                    const int32_t msm = qw_ldg32i_pol(&msum[at_g], mpol);
                     if (Vector && halves == 1)
                         qwen4exp_shared_vector_accumulate(&acc[r], wq, wa[0], wb[0],
-                            mq + at_g * 32u, ms[at_g], msum[at_g]);
+                            mqg, msc, msm);
                     else
                         qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves,
-                                                  mq + at_g * 32u, ms[at_g],
-                                                  msum[at_g]);
+                                                  mqg, msc, msm);
                 }
             }
         }
