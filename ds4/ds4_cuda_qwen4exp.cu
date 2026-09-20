@@ -4315,6 +4315,7 @@ __global__ static void qwen4exp_moe_group_scan_parallel_kernel(
 /* build record 20260919T203222Z-5 */
 /* build record 20260920T112423Z-103 */
 /* build record 20260920T120351Z-108 */
+/* build record 20260920T182142Z-149 */
 __global__ static void qwen4exp_moe_pair_tasks_kernel(
         int32_t *tasks, const int32_t *counts, unsigned total,
         int32_t tile = 32, int32_t lo = 0, int32_t hi = 0x7fffffff) {
@@ -18048,3 +18049,5 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
  * census shows produces a byte-identical capture log. */
 
 #define YUKON_REDRAW_10 10
+
+/* zarar@1337 CvtC draw marker 2. */
