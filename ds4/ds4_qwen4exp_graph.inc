@@ -2836,11 +2836,11 @@ static bool qwen4exp_graph_layers_encode(
  * whole-stack capture, which is what this build did before; the default trades
  * one long launch against an idle GPU for one short one plus launches that
  * overlap the device work already queued. */
-#define QW_DECODE_GRAPH_MAX_CHUNKS 8u
+#define QW_DECODE_GRAPH_MAX_CHUNKS 16u
 
 static uint32_t qw_decode_graph_chunks(void) {
     static int init = 0;
-    static uint32_t chunks = 4u;   /* the A/B's pick; 1 restores the single capture */
+    static uint32_t chunks = 12u;  /* 12 chunks = 4 layers/chunk (exact GDN/QSA period) */
     if (!init) {
         init = 1;
         const char *s = getenv("DS4_CUDA_DECODE_GRAPH_CHUNKS");
