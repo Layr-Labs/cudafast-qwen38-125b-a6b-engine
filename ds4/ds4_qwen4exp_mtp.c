@@ -1220,13 +1220,42 @@ static int mtp_head_forward_impl(ds4_qwen4exp_mtp_head *h,
                                h->rms_eps, h->weight_bias, h->round_bf16) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_ENORM);
-    /* h = fc_hidden(hnorm(multi)).  hnorm is UNGROUPED: one statistic over the
-     * whole n_hc * n_embd row, unlike every hyper-connection norm. */
+    /* h = fc_hidden(hnorm(multi)).  hnorm is UNGROUPED here: ONE statistic over
+     * the whole n_hc * n_embd row.
+     *
+     * THAT IS THE ONLY 10240-WIDE NORM IN THIS MODEL COMPUTED THAT WAY, and the
+     * exception is asserted (ds4_qwen4exp_mtp.h, ds4_gpu.h, and a unit test that
+     * restates the code) rather than sourced.  Every other norm of this width --
+     * the target's `output_hc_norm`, all 96 tower `hc_attn_norm`/`hc_ffn_norm`,
+     * and the head's OWN `blk.48.nextn.hc_head_norm`, which sits in the same
+     * namespace in the same file at the same shape -- passes `group = n_embd`
+     * and so keeps FOUR statistics, one per hyper-connection stream, with the
+     * weight still flat-indexed (`normw[h * n_embd + d]`).
+     *
+     * The streams carry deliberately different magnitudes (per-stream means of
+     * `blk.48.nextn.hnorm.weight` are 1.016 / 0.264 / 0.746 / 0.660), so a
+     * pooled statistic is dominated by the largest and the other three reach
+     * `eh_proj` at the wrong scale -- the head reading a DISTORTED view of state
+     * that exists correctly, which is the shape of the one change that has ever
+     * moved this engine's draft acceptance.
+     *
+     * This is a DRAFT-ONLY path.  The pinned target verifies every proposed
+     * token, so neither setting can change an emitted token: the only observable
+     * is the accepted/drafted counter, and the higher one is the one that is
+     * closer to the head the checkpoint was trained as.  DS4_MTP_HNORM_GROUPED=0
+     * restores the shipped pooled statistic; =1 (the default) groups per stream. */
     if (ok) {
+        static int hn_grouped = -1;
+        if (hn_grouped < 0) {
+            const char *e = getenv("DS4_MTP_HNORM_GROUPED");
+            hn_grouped = (e && e[0] == '0') ? 0 : 1;
+        }
         stage = "hnorm";
         ok = h->hooks.rms_norm(h->t_h_normed, h->t_hyper,
                                h->head_map, h->head_size, h->hnorm_offset,
-                               (uint32_t)hc_dim, (uint32_t)hc_dim, n_tokens,
+                               (uint32_t)hc_dim,
+                               hn_grouped ? n_embd : (uint32_t)hc_dim,
+                               n_tokens,
                                h->rms_eps, h->weight_bias, h->round_bf16) != 0;
     }
     MTP_HEAD_TICK(MTP_HEAD_T_HNORM);
