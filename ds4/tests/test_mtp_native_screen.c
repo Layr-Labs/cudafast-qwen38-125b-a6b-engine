@@ -78,19 +78,28 @@ static void compare_r2_paths(const void *w,uint64_t bytes,uint64_t offset,
     need(x2&&out2&&ids2&&scratch2&&scattered&&full2&&tail2&&winner2,
          "R2 GPU allocations");
     float *a2=malloc(2ull*DIM*4u),*after=malloc(2ull*DIM*4u),
-        *values[2]={malloc(2ull*CAP2*4u),malloc(2ull*CAP2*4u)},
+        *values[3]={malloc(2ull*CAP2*4u),malloc(2ull*CAP2*4u),
+                    malloc(2ull*CAP2*4u)},
         *dense=malloc(2ull*VOCAB*4u),*reference=malloc(2ull*PREFIX*4u),
         *tail_ref=malloc(2ull*TAIL*4u);
-    uint32_t *selected_ids[2]={malloc(2ull*CAP2*4u),malloc(2ull*CAP2*4u)};
-    need(a2&&after&&values[0]&&values[1]&&dense&&reference&&tail_ref&&
-         selected_ids[0]&&selected_ids[1],"R2 host allocations");
+    uint32_t *selected_ids[3]={malloc(2ull*CAP2*4u),malloc(2ull*CAP2*4u),
+                               malloc(2ull*CAP2*4u)};
+    need(a2&&after&&values[0]&&values[1]&&values[2]&&dense&&reference&&
+         tail_ref&&selected_ids[0]&&selected_ids[1]&&selected_ids[2],
+         "R2 host allocations");
     memcpy(a2,activation,DIM*4u);
     for(uint32_t i=0;i<DIM;i++) a2[DIM+i]=activation[DIM-1u-i]*0.75f+0.125f;
     need(ds4_gpu_tensor_write(x2,0,a2,2ull*DIM*4u),"R2 activations");
     unsetenv("DS4_QWEN4EXP_NO_TARGET_NATIVE_SCREEN_R2");
-    for(uint32_t mode=0;mode<2;mode++) {
-        if(mode==0)setenv("DS4_MTP_NO_FUSED_SCREEN_KEYS","1",1);
-        else unsetenv("DS4_MTP_NO_FUSED_SCREEN_KEYS");
+    for(uint32_t mode=0;mode<3;mode++) {
+        if(mode==0) {
+            setenv("DS4_MTP_NO_ALIGNED_SCREEN","1",1);
+            unsetenv("DS4_MTP_NO_FUSED_SCREEN_KEYS");
+        } else {
+            unsetenv("DS4_MTP_NO_ALIGNED_SCREEN");
+            if(mode==1)setenv("DS4_MTP_NO_FUSED_SCREEN_KEYS","1",1);
+            else unsetenv("DS4_MTP_NO_FUSED_SCREEN_KEYS");
+        }
         need(ds4_gpu_mtp_native_screen2(out2,ids2,scratch2,w,bytes,offset,
              DIM,VOCAB,PREFIX,TAIL,x2,0)==CAP2,"R2 screen");
         need(ds4_gpu_tensor_read(out2,0,values[mode],2ull*CAP2*4u)&&
@@ -99,10 +108,14 @@ static void compare_r2_paths(const void *w,uint64_t bytes,uint64_t offset,
         need(ds4_gpu_tensor_read(x2,0,after,2ull*DIM*4u)&&
              !memcmp(a2,after,2ull*DIM*4u),"R2 input unchanged");
     }
-    need(!memcmp(selected_ids[0],selected_ids[1],2ull*CAP2*4u),
-         "R2 fused-key shortlist differs");
-    need(!memcmp(values[0],values[1],2ull*CAP2*4u),
-         "R2 fused-key refinement differs");
+    unsetenv("DS4_MTP_NO_ALIGNED_SCREEN");
+    unsetenv("DS4_MTP_NO_FUSED_SCREEN_KEYS");
+    for(uint32_t mode=1;mode<3;mode++) {
+        need(!memcmp(selected_ids[0],selected_ids[mode],2ull*CAP2*4u),
+             "R2 aligned/raw shortlist differs");
+        need(!memcmp(values[0],values[mode],2ull*CAP2*4u),
+             "R2 aligned/raw refinement differs");
+    }
     need(ds4_gpu_mtp_native_screen2(out2,ids2,scratch2,w,bytes,offset,
          DIM,VOCAB,PREFIX,TAIL,x2,1)==CAP2,"R2 deferred finite screen");
     need(ds4_gpu_tensor_read(out2,0,values[0],2ull*CAP2*4u)&&
@@ -120,8 +133,8 @@ static void compare_r2_paths(const void *w,uint64_t bytes,uint64_t offset,
          ds4_gpu_tensor_read(tail2,0,tail_ref,2ull*TAIL*4u),
          "R2 oracle read");
     for(uint32_t r=0;r<2;r++) {
-        const uint32_t *row_ids=selected_ids[1]+(uint64_t)r*CAP2;
-        const float *row_values=values[1]+(uint64_t)r*CAP2;
+        const uint32_t *row_ids=selected_ids[2]+(uint64_t)r*CAP2;
+        const float *row_values=values[2]+(uint64_t)r*CAP2;
         need(row_ids[0]==0,"R2 mandatory zero");
         for(uint32_t i=0;i<CAP2;i++) {
             const uint32_t id=row_ids[i];
@@ -146,8 +159,8 @@ static void compare_r2_paths(const void *w,uint64_t bytes,uint64_t offset,
          winner_words[2]==0u,"R2 deferred finite status");
     for(uint32_t r=0;r<2;r++) for(uint32_t i=0;i<CAP2;i++)
         need(!memcmp(&dense[(uint64_t)r*VOCAB+
-                            selected_ids[1][(uint64_t)r*CAP2+i]],
-                     &values[1][(uint64_t)r*CAP2+i],4),"R2 scattered value");
+                            selected_ids[2][(uint64_t)r*CAP2+i]],
+                     &values[2][(uint64_t)r*CAP2+i],4),"R2 scattered value");
     setenv("DS4_QWEN4EXP_NO_TARGET_NATIVE_SCREEN_R2","1",1);
     need(ds4_gpu_mtp_native_screen2(out2,ids2,scratch2,w,bytes,offset,DIM,VOCAB,
          PREFIX,TAIL,x2,0)==0,"R2 valve fallback");
@@ -162,8 +175,9 @@ static void compare_r2_paths(const void *w,uint64_t bytes,uint64_t offset,
          DIM,PREFIX,x2,2),"R2 captured static fallback");
     need(ds4_gpu_decode_graph_end(&key)==0,"R2 capture end");
     ds4_gpu_decode_graphs_invalidate();
-    free(a2);free(after);free(values[0]);free(values[1]);free(dense);
+    free(a2);free(after);free(values[0]);free(values[1]);free(values[2]);free(dense);
     free(reference);free(tail_ref);free(selected_ids[0]);free(selected_ids[1]);
+    free(selected_ids[2]);
     ds4_gpu_tensor_free(x2);ds4_gpu_tensor_free(out2);ds4_gpu_tensor_free(ids2);
     ds4_gpu_tensor_free(scratch2);ds4_gpu_tensor_free(scattered);
     ds4_gpu_tensor_free(full2);ds4_gpu_tensor_free(tail2);
