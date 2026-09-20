@@ -2040,7 +2040,6 @@ qwen4exp_gdn_qkv_conv_mma_pipe_kernel(float *out,
     unsigned char *sA_all = q8_mma_smem;
     unsigned char *sB_all = sA_all + STAGES * C::A_BYTES;
     float *sAs_all = (float *)(sB_all + STAGES * C::B_BYTES);
-    float *sWs_all = sAs_all + STAGES * (C::AS_BYTES / 4);
 
     const int tid = (int)threadIdx.x;
     const uint32_t lane = threadIdx.x & 31u;
@@ -2082,7 +2081,6 @@ qwen4exp_gdn_qkv_conv_mma_pipe_kernel(float *out,
             unsigned char *sA = sA_all + buf * C::A_BYTES;
             unsigned char *sB = sB_all + buf * C::B_BYTES;
             float *sAs = sAs_all + buf * (C::AS_BYTES / 4);
-            float *sWs = sWs_all + buf * (C::WS_BYTES / 4);
             const uint64_t g0 = s * (uint64_t)G;
             const uint64_t seg_off = s * (uint64_t)C::B_RAW;
             const uint64_t win_off = seg_off & ~(uint64_t)15u;
@@ -2161,22 +2159,23 @@ qwen4exp_gdn_qkv_conv_mma_pipe_kernel(float *out,
                 const int c = idx - r * C::B_CHUNKS;
                 if (idx < BN * C::B_CHUNKS) q8_mma_sts_16(sB + r * C::B_STRIDE + c * 16, rb[k]);
             }
-            /* Every producer's stores are visible to every producer: the
-             * scales below lie in rows another one stored. */
-            q8_mma_bar_sync(15, C::PWARPS * 32);
-
-            /* Weight scales, half -> float, [gg][BN]. */
-#pragma unroll
-            for (int j = 0; j < (G * BN + PT - 1) / PT; j++) {
-                const int i = pl + j * PT;
-                if (i < G * BN) {
-                    const int gg = i / BN;
-                    const int rr = i - gg * BN;
-                    uint16_t h;
-                    memcpy(&h, sB + rr * C::B_STRIDE + skew + gg * 34, 2);
-                    sWs[gg * BN + rr] = __half2float(__ushort_as_half(h));
-                }
-            }
+            /* CONSUMER-SIDE WEIGHT SCALES.  The producers used to reread the
+             * rows they had just stored, convert every block's half scale to
+             * float and publish a [gg][BN] plane for the consumers.  That put
+             * G * BN conversions, G * BN shared loads and G * BN shared
+             * stores per stage on the warps the pipe waits on -- they own
+             * every copy in flight -- and it forced a producer-only barrier,
+             * because a producer converting a row had to see another
+             * producer's store of it.
+             *
+             * A consumer needs exactly two of those scales per lane per
+             * column tile, it already holds the row base it reads the quants
+             * from, and it is not the side the pipe is waiting on.  The
+             * conversion therefore moves to the point of use below, the
+             * producers do nothing but copy, and that private barrier goes
+             * with the pass that needed it.  The staged bytes are the shipped
+             * ones either way and the value a lane multiplies by is the same
+             * half through the same intrinsic. */
             __syncwarp();
             q8_mma_bar_arrive(1 + 2 * buf, BAR_COUNT);
         }
@@ -2206,7 +2205,6 @@ qwen4exp_gdn_qkv_conv_mma_pipe_kernel(float *out,
         const unsigned char *sA = sA_all + C::A_BYTES * buf; /* consumers: stage s's activations */
         const unsigned char *sB = sB_all + buf * C::B_BYTES;
         const float *sAs = sAs_all + buf * (C::AS_BYTES / 4);
-        const float *sWs = sWs_all + buf * (C::WS_BYTES / 4);
         const int skew = (int)((s * (uint64_t)C::B_RAW) & 15u);
 
         float xs[MT][2][G];
@@ -2251,7 +2249,14 @@ qwen4exp_gdn_qkv_conv_mma_pipe_kernel(float *out,
                     bf[0] = pw[0];
                     bf[1] = pw[4];
                 }
-                const float2 wsp = *(const float2 *)(sWs + gg * BN + c + (int)t4 * 2);
+                const unsigned char *ps =
+                    sB + (c + (int)t4 * 2) * C::B_STRIDE + skew + gg * 34;
+                uint16_t hs0, hs1;
+                memcpy(&hs0, ps, 2);
+                memcpy(&hs1, ps + C::B_STRIDE, 2);
+                const float2 wsp =
+                    make_float2(__half2float(__ushort_as_half(hs0)),
+                                __half2float(__ushort_as_half(hs1)));
                 int32_t d[MT][4];
 #pragma unroll
                 for (int mi = 0; mi < MT; mi++) q8_mma_m16n8k32_seeded(d[mi], af[mi], bf, magic);
