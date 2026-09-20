@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <cuda.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <mma.h>
@@ -1119,8 +1120,39 @@ extern "C" int ds4_gpu_qwen4exp_update_dpos(
         ds4_gpu_tensor *d_pos,
         uint32_t pos) {
     if (!d_pos || !d_pos->ptr || d_pos->bytes < sizeof(uint32_t)) return 0;
-    /* Keep the existing stream ordering with graph consumers, passing the
-     * scalar by value without a host staging transfer or stack lifetime. */
+    /* dpos-memop retry marker 20260920T012000Z: use a stream-ordered driver
+     * memset for this one-word device update.  It has the same ordering as
+     * the old kernel but avoids a launch and does not depend on pageable host
+     * memory lifetime. Set the valve to zero for the original kernel in a
+     * same-binary A/B. */
+    static int use_memop = -1;
+    if (use_memop < 0) {
+        const char *e = getenv("DS4_QWEN4EXP_DPOS_COPY");
+        use_memop = (e == NULL || e[0] != '0') ? 1 : 0;
+    }
+    if (use_memop) {
+        /* Resolve through the runtime so the engine's standalone CUDA
+         * binaries (whose Makefile intentionally links only cudart/cublas)
+         * do not acquire a direct libcuda link dependency. */
+        typedef CUresult (CUDAAPI *ds4_memset_d32_async_fn)(
+                CUdeviceptr, unsigned int, size_t, CUstream);
+        static ds4_memset_d32_async_fn memset_d32_async;
+        static int memset_d32_init;
+        if (!memset_d32_init) {
+            void *entry = NULL;
+            if (cudaGetDriverEntryPoint("cuMemsetD32Async", &entry,
+                                        cudaEnableDefault, NULL) == cudaSuccess)
+                memset_d32_async = (ds4_memset_d32_async_fn)entry;
+            memset_d32_init = 1;
+        }
+        if (memset_d32_async) {
+            CUresult r = memset_d32_async((CUdeviceptr)d_pos->ptr, pos, 1,
+                                          (CUstream)cuda_decode_stream());
+            if (r == CUDA_SUCCESS) return 1;
+            fprintf(stderr, "ds4: qwen4exp position update memop failed: CUresult=%d\n",
+                    (int)r);
+        }
+    }
     qwen4exp_update_dpos_kernel<<<1, 1, 0, cuda_decode_stream()>>>(
             (uint32_t *)d_pos->ptr, pos);
     return cuda_ok(cudaGetLastError(), "qwen4exp position update launch");
