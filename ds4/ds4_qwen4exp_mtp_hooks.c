@@ -52,21 +52,12 @@
 extern int ds4_gpu_mtp_native_screen_init(uint32_t, uint64_t *, uint32_t *) __attribute__((weak));
 extern int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *,
     const void *, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t,
-    const ds4_gpu_tensor *, int) __attribute__((weak));
+    const ds4_gpu_tensor *) __attribute__((weak));
 extern int ds4_gpu_mtp_native_map(ds4_gpu_tensor *, const ds4_gpu_tensor *,
-    const ds4_gpu_tensor *, const ds4_gpu_tensor *, uint32_t, uint32_t,
-    uint32_t, int) __attribute__((weak));
+    const ds4_gpu_tensor *, uint32_t, uint32_t) __attribute__((weak));
 extern int ds4_gpu_qwen4exp_ehx_pack_tensor(
         ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *,
         uint32_t, uint32_t, uint32_t) __attribute__((weak));
-extern int ds4_gpu_qwen4exp_ehx_pack_quant_tensor(
-        ds4_gpu_tensor *, uint64_t, uint64_t,
-        const ds4_gpu_tensor *, const ds4_gpu_tensor *,
-        uint32_t, uint32_t, uint32_t) __attribute__((weak));
-extern int ds4_gpu_matmul_q8_0_preq_rows_exact_tensor(
-        ds4_gpu_tensor *, const void *, uint64_t, uint64_t, uint64_t,
-        uint64_t, const ds4_gpu_tensor *, uint64_t, uint64_t,
-        uint32_t) __attribute__((weak));
 #endif
 
 /* The hook takes uint64_t rows because that is the upstream entry's type; the
@@ -85,21 +76,6 @@ static int mtp_matmul_q8_0_decode_rows(ds4_gpu_tensor *out,
     return ds4_qwen4exp_matmul_q8_0(out, model_map, model_size, weight_offset,
                                     in_dim, out_dim, x, (uint32_t)n_tok);
 }
-/* The prequantized entry takes uint32_t rows; the same narrowing argument as
- * the decode-order wrapper above applies. */
-static int mtp_matmul_q8_0_preq_rows(ds4_gpu_tensor *out,
-                                     const void *model_map,
-                                     uint64_t model_size,
-                                     uint64_t weight_offset,
-                                     uint64_t in_dim, uint64_t out_dim,
-                                     const ds4_gpu_tensor *q,
-                                     uint64_t q_offset, uint64_t s_offset,
-                                     uint64_t n_tok) {
-    if (n_tok == 0u || n_tok > UINT32_MAX) return 0;
-    return ds4_gpu_matmul_q8_0_preq_rows_exact_tensor(
-            out, model_map, model_size, weight_offset, in_dim, out_dim,
-            q, q_offset, s_offset, (uint32_t)n_tok);
-}
 
 void ds4_qwen4exp_mtp_default_hooks(ds4_qwen4exp_mtp_gpu_hooks *hooks) {
     hooks->rms_norm    = ds4_gpu_qwen4exp_rms_norm_tensor;
@@ -110,15 +86,11 @@ void ds4_qwen4exp_mtp_default_hooks(ds4_qwen4exp_mtp_gpu_hooks *hooks) {
     hooks->native_init = ds4_gpu_mtp_native_screen_init;
     hooks->native_screen = ds4_gpu_mtp_native_screen;
     hooks->native_map = ds4_gpu_mtp_native_map;
-    hooks->ehx_pack_quant = ds4_gpu_qwen4exp_ehx_pack_quant_tensor;
-    hooks->matmul_q8_0_preq = mtp_matmul_q8_0_preq_rows;
 #else
     hooks->ehx_pack    = NULL;
     hooks->native_init = NULL;
     hooks->native_screen = NULL;
     hooks->native_map = NULL;
-    hooks->ehx_pack_quant = NULL;
-    hooks->matmul_q8_0_preq = NULL;
 #endif
     hooks->matmul_q8_0 = mtp_matmul_q8_0_decode_rows;
     hooks->block       = ds4_qwen4exp_graph_head_block;
