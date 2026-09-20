@@ -7,6 +7,7 @@
  * because the tests must exercise it without a model. */
 
 #include "ds4_qwen4exp_ple.h"
+#include "ds4_ple_dequant_simd.h"
 
 #include <fcntl.h>
 #include <inttypes.h>
@@ -779,8 +780,14 @@ void ds4_ple_dequant_iq4_nl(const void *__restrict blocks, size_t block_count,
     const uint8_t *__restrict p = (const uint8_t *)blocks;
     if (!p || !out) return;
 
-
     const int8_t *const kv = ple_kvalues_iq4nl;
+#if DS4_PLE_DEQUANT_SIMD
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    const int8x16_t ple_kv_simd = vld1q_s8(kv);
+#else
+    const __m128i ple_kv_simd = _mm_loadu_si128((const __m128i *)kv);
+#endif
+#endif
     for (size_t b = 0; b < block_count; b++) {
         /* The caller walks a token row as five consecutive blocks, so the
          * next block's eighteen bytes are the next thing this loop touches.
@@ -802,6 +809,13 @@ void ds4_ple_dequant_iq4_nl(const void *__restrict blocks, size_t block_count,
         if (b + 1u < block_count)
             __builtin_prefetch(y + DS4_PLE_IQ4_NL_BLOCK_ELEMS, 1, 3);
 
+#if DS4_PLE_DEQUANT_SIMD
+        /* The whole nibble expansion is two 16-entry byte-table lookups --
+         * vqtbl1q_s8 / pshufb -- plus a widening multiply, eight stores per
+         * block instead of thirty-two scalar ones.  The table vector is
+         * loaded once per call above; same values, same order. */
+        ds4_ple_iq4nl_block_simd(qs, d, ple_kv_simd, y);
+#else
         /* Unrolled by two: the block is a fixed sixteen nibble bytes, so the
          * trip count is a compile-time constant and half the loop-carried
          * bookkeeping disappears.  Same reads, same order, same values. */
@@ -812,6 +826,7 @@ void ds4_ple_dequant_iq4_nl(const void *__restrict blocks, size_t block_count,
             y[j + 16] = d * (float)ple_kvalues_iq4nl_hi[q0];
             y[j + 17] = d * (float)ple_kvalues_iq4nl_hi[q1];
         }
+#endif
         p += DS4_PLE_IQ4_NL_BLOCK_BYTES;
     }
 }
