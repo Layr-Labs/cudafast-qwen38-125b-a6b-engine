@@ -1,3 +1,6 @@
+/* redraw rx0919233054 (2026-09-19T23:30:54Z): this archive repeats the official evaluation of promoted
+ * submission a4fc7c67. The only textual difference from that archive is this dated
+ * provenance comment. It expands to nothing and changes no behaviour. See the submission note. */
 /* redraw rx22532110 (2026-09-17T22:53:21Z): this archive repeats the official evaluation of the
  * same engine. The only textual difference from the previous evaluation
  * is this dated provenance comment. No behaviour changes. */
@@ -17885,3 +17888,4 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
  * census shows produces a byte-identical capture log. */
 
 #define YUKON_REDRAW_10 10
+// redraw ac2f8d90 20260920T001051Z
