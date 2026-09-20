@@ -9072,6 +9072,53 @@ qwen4exp_shared_pipe_mma_kernel(
             float *sAs = sAs_all + buf * (C::AS_BYTES / 4);
             float *sWs = sWs_all + buf * (C::WS_BYTES / 4);
 
+            /* L2 PREFETCH, TWO STAGES AHEAD OF THE ACTIVATION TILE.
+             *
+             * The weight blocks are not this pipe's only cold operand.  The
+             * quantised activation buffer is the token count times the input
+             * width, past what the last-level cache holds at the widths this
+             * tile is taken for, and a stage's activation groups are
+             * separated from the next stage's by a barrier handoff, a full
+             * round of shared stores and the whole weight stream of the
+             * stage -- bytes read once, never reused, and numerous enough to
+             * evict the activation lines the following stage will want.  The
+             * group index also runs through the bit-reversed chunk order, so
+             * successive stages do not walk the buffer forwards and the
+             * hardware has no stride to follow.  The producers are the side
+             * the pipe waits on, so the miss is discovered where it costs
+             * pipeline depth.
+             *
+             * The address is the activation load's own expression evaluated
+             * at `s + AHEAD`: the same token, the same group through the
+             * same reversal, the same thirty-two-byte stride and the same
+             * sixteen-byte half.  prefetch.global.L2 writes no register,
+             * produces no value and cannot change a loaded byte; the guards
+             * are the load's own -- a stage that exists, a token inside the
+             * batch and a group inside the row -- and only the first half of
+             * a group asks, since both halves share a line. */
+#ifndef QSP_PIPE_ACT_L2_AHEAD
+#define QSP_PIPE_ACT_L2_AHEAD 2
+#endif
+            if (QSP_PIPE_ACT_L2_AHEAD != 0 &&
+                s + QSP_PIPE_ACT_L2_AHEAD < C::NSTAGE) {
+                const int sa = s + QSP_PIPE_ACT_L2_AHEAD;
+#pragma unroll
+                for (int k = 0; k < KA; k++) {
+                    const int i = pl + k * PT;
+                    const int t = i / (SLOTS * 2);
+                    const int rem = i - t * (SLOTS * 2);
+                    const int slot = rem >> 1, half = rem & 1;
+                    const uint32_t c = qs_rev5((uint32_t)(sa * CH + slot / KMAX));
+                    const uint32_t g = c + 32u * (uint32_t)(slot % KMAX);
+                    const uint32_t tok = tok0 + (uint32_t)t;
+                    if (i < NA && tok < n_tokens && g < groups && half == 0) {
+                        const int8_t *pre =
+                            xq + ((uint64_t)tok * groups + g) * 32u;
+                        asm volatile("prefetch.global.L2 [%0];" :: "l"(pre));
+                    }
+                }
+            }
+
             /* Activations of the stage into registers. */
             uint4 ra[KA];
             float rs[KS];
