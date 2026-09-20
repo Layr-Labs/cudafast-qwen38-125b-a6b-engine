@@ -23,6 +23,7 @@
 #include <algorithm>
 
 #include "cuda/mmq/ds4_mmq.h"
+/* terrapinelf frontier redraw 20260920T2316Z: inert source provenance marker. */
 #include "cuda/mmq/ds4_repack.h"
 #include "ds4_image.h"
 
