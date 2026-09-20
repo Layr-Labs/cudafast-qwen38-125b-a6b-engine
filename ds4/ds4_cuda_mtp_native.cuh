@@ -202,6 +202,99 @@ extern "C" int ds4_gpu_mtp_native_screen2_init(uint32_t width,
     return 1;
 }
 
+/* The target screen reads only the first 40 of each row's 80 Q8_0 blocks.
+ * GGUF's 34-byte block stride makes every other payload unaligned and forces
+ * the hot kernel to reconstruct four words with funnel shifts.  Keep a compact
+ * screen-only SoA copy: fp16 scales first, then naturally aligned 32-byte
+ * payloads.  It is built lazily during the runner's correctness warmup and is
+ * owned by g_derived_ranges, so ordinary CUDA cleanup releases it. */
+struct mtp_native_aligned_screen {
+    const __half *dq;
+    const int8_t *qs;
+};
+
+__global__ static void mtp_native_repack_screen_kernel(
+        __half *dq, int8_t *qs, const unsigned char *w,
+        uint32_t width, uint32_t n_vocab, uint32_t prefix, uint32_t tail) {
+    constexpr uint64_t source_blocks = MTP_NATIVE_DIM / 32u;
+    constexpr uint64_t screen_blocks = MTP_TARGET_NATIVE_SCREEN_GROUPS;
+    const uint64_t packed_block =
+        (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t total = (uint64_t)width * screen_blocks;
+    if (packed_block >= total) return;
+    const uint32_t row = (uint32_t)(packed_block / screen_blocks);
+    const uint32_t b = (uint32_t)(packed_block -
+        (uint64_t)row * screen_blocks);
+    const uint32_t weight_row = row < prefix ? row
+        : n_vocab - tail + (row - prefix);
+    const unsigned char *src = w +
+        ((uint64_t)weight_row * source_blocks + b) * 34u;
+    dq[packed_block] = *(const __half *)src;
+#pragma unroll
+    for (int j = 0; j < 32; j++)
+        qs[packed_block * 32u + (uint32_t)j] = (int8_t)src[2 + j];
+}
+
+static bool mtp_native_get_aligned_screen(
+        mtp_native_aligned_screen *screen,
+        const void *map, uint64_t offset, uint64_t source_bytes,
+        const unsigned char *w, uint32_t width, uint32_t n_vocab,
+        uint32_t prefix, uint32_t tail) {
+    if (!screen) return false;
+    screen->dq = nullptr;
+    screen->qs = nullptr;
+    if (getenv("DS4_MTP_NO_ALIGNED_SCREEN") != nullptr ||
+        getenv("DS4_CUDA_NO_DERIVED_WEIGHTS") != nullptr) return false;
+
+    const uint64_t block_count =
+        (uint64_t)width * MTP_TARGET_NATIVE_SCREEN_GROUPS;
+    if (!block_count || block_count > UINT64_MAX / 32u) return false;
+    const uint64_t q_offset = mtp_native_align(block_count * sizeof(__half));
+    const uint64_t bytes = q_offset + block_count * 32u;
+    const char *artifact = cuda_derived_weight_ptr(
+        map, offset, source_bytes, CUDA_DERIVED_Q8_0_MTP_SCREEN,
+        prefix, tail, MTP_TARGET_NATIVE_SCREEN_GROUPS, bytes);
+    if (!artifact) {
+        char *device = nullptr;
+        cudaError_t err = cudaMalloc((void **)&device, (size_t)bytes);
+        if (err != cudaSuccess) {
+            (void)cudaGetLastError();
+            static int warned = 0;
+            if (!warned) {
+                warned = 1;
+                fprintf(stderr,
+                    "ds4: aligned MTP screen allocation failed; using raw Q8\n");
+            }
+            return false;
+        }
+        mtp_native_repack_screen_kernel<<<
+            (unsigned)((block_count + 255u) / 256u), 256, 0,
+            cuda_decode_stream()>>>(
+                (__half *)device, (int8_t *)(device + q_offset), w,
+                width, n_vocab, prefix, tail);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            (void)cudaFree(device);
+            (void)cudaGetLastError();
+            fprintf(stderr,
+                "ds4: aligned MTP screen repack failed; using raw Q8\n");
+            return false;
+        }
+        g_derived_ranges.push_back({
+            map, offset, source_bytes, CUDA_DERIVED_Q8_0_MTP_SCREEN,
+            prefix, tail, MTP_TARGET_NATIVE_SCREEN_GROUPS, bytes, device,
+        });
+        g_derived_artifact_bytes += bytes;
+        artifact = device;
+        fprintf(stderr,
+            "ds4: built aligned MTP target screen (%.2f MiB)\n",
+            (double)bytes / 1048576.0);
+    }
+    screen->dq = (const __half *)artifact;
+    screen->qs = (const int8_t *)(artifact + q_offset);
+    return true;
+}
+
 template <bool EmitKeys = false>
 __global__ static void mtp_native_projection2_screen_kernel(
         float *out, const unsigned char *w,
@@ -248,6 +341,83 @@ __global__ static void mtp_native_projection2_screen_kernel(
                 previous, (uint32_t)last, shift);
             const float ws = __half2float(
                 *(const __half *)(wr + b * 34u));
+#pragma unroll
+            for (int r = 0; r < 2; r++) {
+                const uint64_t at = (uint64_t)r * blocks + b;
+                const int32_t *xw =
+                    (const int32_t *)(xq + at * 32u + half * 16u);
+                int dot = 0;
+#pragma unroll
+                for (int j = 0; j < 4; j++)
+                    dot = __dp4a(wq[j], xw[j], dot);
+                dot += __shfl_xor_sync(active, dot, 1);
+                if (half == 0u)
+                    acc[r] += ws * xscale[at] * (float)dot;
+            }
+        }
+    }
+
+    __shared__ float partial[2][4][32];
+    if (half == 0u) {
+        partial[0][local_row][group] = acc[0];
+        partial[1][local_row][group] = acc[1];
+    }
+    __syncthreads();
+    if (local_lane < 32u) {
+#pragma unroll
+        for (int r = 0; r < 2; r++) {
+            const float total = warp_sum_f32(
+                partial[r][local_row][local_lane]);
+            if (local_lane == 0u && row < width) {
+                const float value = valid ? total : -INFINITY;
+                const uint64_t at = (uint64_t)r * width + row;
+                if (EmitKeys) {
+                    const uint32_t id = row < prefix ? row
+                        : n_vocab - tail + (row - prefix);
+                    if (!isfinite(value)) atomicOr(invalid, 1u);
+                    if (!id || row >= prefix)
+                        keys[at] = UINT64_MAX - id;
+                    else
+                        keys[at] = q8_top1_pack_key(
+                            value == 0.0f ? 0.0f : value, id);
+                } else {
+                    out[at] = value;
+                }
+            }
+        }
+    }
+}
+
+template <bool EmitKeys = false>
+__global__ static void mtp_native_projection2_aligned_screen_kernel(
+        float *out, const __half *dq, const int8_t *qs,
+        const int8_t *xq, const float *xscale,
+        uint32_t width, uint32_t n_vocab, uint32_t prefix, uint32_t tail,
+        uint64_t *keys = nullptr, uint32_t *invalid = nullptr) {
+    constexpr uint64_t blocks = MTP_NATIVE_DIM / 32u;
+    constexpr uint64_t work_blocks = MTP_TARGET_NATIVE_SCREEN_GROUPS;
+    const uint32_t local_row = threadIdx.x >> 6u;
+    const uint32_t local_lane = threadIdx.x & 63u;
+    const uint32_t group = local_lane >> 1u;
+    const uint32_t half = local_lane & 1u;
+    const uint32_t row = blockIdx.x * 4u + local_row;
+    float acc[2] = {0.0f, 0.0f};
+
+    const uint32_t weight_row = row < prefix ? row
+        : n_vocab - tail + (row - prefix);
+    const bool valid = row < width && weight_row < n_vocab;
+    if (valid) {
+        for (uint64_t b = group; b < work_blocks; b += 32u) {
+            const uint64_t warp_base = b - (uint64_t)(group & 15u);
+            const uint64_t remaining = work_blocks - warp_base;
+            const uint32_t live_pairs =
+                (uint32_t)(remaining < 16u ? remaining : 16u);
+            const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
+            const uint64_t packed_block = (uint64_t)row * work_blocks + b;
+            const int4 packed = *(const int4 *)(const void *)(
+                qs + packed_block * 32u + half * 16u);
+            const int32_t wq[4] = {packed.x, packed.y, packed.z, packed.w};
+            const float ws = __half2float(dq[packed_block]);
 #pragma unroll
             for (int r = 0; r < 2; r++) {
                 const uint64_t at = (uint64_t)r * blocks + b;
@@ -483,6 +653,11 @@ extern "C" int ds4_gpu_mtp_native_screen2(ds4_gpu_tensor *out,
         "native target output R2");
     if (!w) return -1;
     if ((uintptr_t)w & 1u) return 0;
+    const uint64_t source_bytes = (uint64_t)vocab * 80u * 34u;
+    mtp_native_aligned_screen aligned_screen;
+    const bool use_aligned_screen = mtp_native_get_aligned_screen(
+        &aligned_screen, map, offset, source_bytes,
+        (const unsigned char *)w, width, vocab, prefix, tail);
 
     char *base = (char *)scratch->ptr;
     int8_t *xq = (int8_t *)base;
@@ -509,17 +684,31 @@ extern "C" int ds4_gpu_mtp_native_screen2(ds4_gpu_tensor *out,
         mtp_native_key_range_disjoint(
             scratch->ptr, scratch->bytes, ids->ptr, ids->bytes);
     if (fuse_keys) {
-        mtp_native_projection2_screen_kernel<true><<<
-            (width + 3u) / 4u, 256, 0, cuda_decode_stream()>>>(
-            scores, (const unsigned char *)w, xq, xs, width, vocab,
-            prefix, tail, key_in, flag);
+        if (use_aligned_screen) {
+            mtp_native_projection2_aligned_screen_kernel<true><<<
+                (width + 3u) / 4u, 256, 0, cuda_decode_stream()>>>(
+                scores, aligned_screen.dq, aligned_screen.qs, xq, xs,
+                width, vocab, prefix, tail, key_in, flag);
+        } else {
+            mtp_native_projection2_screen_kernel<true><<<
+                (width + 3u) / 4u, 256, 0, cuda_decode_stream()>>>(
+                scores, (const unsigned char *)w, xq, xs, width, vocab,
+                prefix, tail, key_in, flag);
+        }
         if (!cuda_ok(cudaGetLastError(), "native fused R2 screen keys"))
             return -1;
     } else {
-        mtp_native_projection2_screen_kernel<false><<<
-            (width + 3u) / 4u, 256, 0, cuda_decode_stream()>>>(
-            scores, (const unsigned char *)w, xq, xs, width, vocab,
-            prefix, tail);
+        if (use_aligned_screen) {
+            mtp_native_projection2_aligned_screen_kernel<false><<<
+                (width + 3u) / 4u, 256, 0, cuda_decode_stream()>>>(
+                scores, aligned_screen.dq, aligned_screen.qs, xq, xs,
+                width, vocab, prefix, tail);
+        } else {
+            mtp_native_projection2_screen_kernel<false><<<
+                (width + 3u) / 4u, 256, 0, cuda_decode_stream()>>>(
+                scores, (const unsigned char *)w, xq, xs, width, vocab,
+                prefix, tail);
+        }
         if (!cuda_ok(cudaGetLastError(), "native R2 coarse screen"))
             return -1;
         for (uint32_t r = 0; r < 2u; r++) {
