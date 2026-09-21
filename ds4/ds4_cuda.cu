@@ -29002,22 +29002,46 @@ __global__ static void moe_down_sorted_p2_qwarp32_kernel(
         uint32_t out_dim,
         uint32_t n_expert,
         uint32_t pair_count) {
+    /* perf-08: TWO ROW TILES PER BLOCK.
+     *
+     * The down-projection weight rows a block reads are its own, but the
+     * pair's quantised mid activation is read whole by every block of the
+     * pair column, so this step's activation traffic is proportional to the
+     * block count rather than to the work.  At sixteen rows per block --
+     * sixteen because two pairs are packed into a 256-thread block with
+     * eight-lane quarter-warps, not because anything weighed traffic -- the
+     * grid over the model width issues far more blocks than the device can
+     * hold resident; the surplus blocks add no parallelism the SMs can use
+     * and only pull the activation through again, on the decode leg.  Two
+     * tiles of sixteen halve the block count and halve those passes.  The
+     * pair resolution does not depend on the row, so it is done once per
+     * block exactly as before and both tiles reuse it.
+     *
+     * MOE_DOWN_P2_ROW_TILES = 1u restores the shipped geometry. */
+#ifndef MOE_DOWN_P2_ROW_TILES
+#define MOE_DOWN_P2_ROW_TILES 2u
+#endif
+#define MOE_DOWN_P2_ROWS_PER_BLOCK (16u * MOE_DOWN_P2_ROW_TILES)
     uint32_t lane = threadIdx.x & 7u;
     uint32_t pair_lane = (threadIdx.x >> 3u) & 1u;
-    uint32_t row = blockIdx.x * 16u + (threadIdx.x >> 4u);
     uint32_t sorted_idx = blockIdx.y * 2u + pair_lane;
-    if (row >= out_dim || sorted_idx >= pair_count) return;
+    if (sorted_idx >= pair_count) return;
     uint32_t pair = sorted_pairs[sorted_idx];
     uint32_t tok = pair / n_expert;
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
-    const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
     const cuda_block_q8_K *xq = midq + (uint64_t)pair * midq_blocks;
-    float acc = 0.0f;
-    for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_q2_K_q8_K_block(wr + b, xq + b);
-    acc = quarter_warp_sum_f32(acc, lane);
-    if (lane == 0) down_out[(uint64_t)pair * out_dim + row] = acc;
+    for (uint32_t rr = 0; rr < MOE_DOWN_P2_ROW_TILES; rr++) {
+        const uint32_t row = blockIdx.x * MOE_DOWN_P2_ROWS_PER_BLOCK
+                           + (threadIdx.x >> 4u) + rr * 16u;
+        if (row >= out_dim) continue;
+        const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
+        float acc = 0.0f;
+        for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_q2_K_q8_K_block(wr + b, xq + b);
+        acc = quarter_warp_sum_f32(acc, lane);
+        if (lane == 0) down_out[(uint64_t)pair * out_dim + row] = acc;
+    }
 }
 
 __global__ static void moe_sum_kernel(float *out, const float *down, uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens) {
@@ -30555,7 +30579,9 @@ static int routed_moe_launch(
                         midq_blocks, out_dim, n_expert, use_atomic_down);
                 }
             } else if (sorted_pairs && use_p2_sorted) {
-                dim3 p2_dgrid((out_dim + 15u) / 16u, (pair_count + 1u) / 2u, 1);
+                /* Divisor follows the kernel's row tile so the grid covers
+                 * each row exactly once. */
+                dim3 p2_dgrid((out_dim + MOE_DOWN_P2_ROWS_PER_BLOCK - 1u) / MOE_DOWN_P2_ROWS_PER_BLOCK, (pair_count + 1u) / 2u, 1);
                 moe_down_sorted_p2_qwarp32_kernel<<<p2_dgrid, 256, 0, cuda_decode_stream()>>>(
                     (float *)down->ptr,
                     down_w,
