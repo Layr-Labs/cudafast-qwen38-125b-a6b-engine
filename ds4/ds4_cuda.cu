@@ -11275,6 +11275,38 @@ __global__ static void attention_decode_split_value_kernel(
     const uint32_t g1 = g0 + cnt;
     const float *row_scores = score_exp + (uint64_t)h * n_score;
     float *pout = partials + ((uint64_t)h * S + j) * head_dim;
+    /* The segment's score and its source row are the same for every output
+     * dimension, yet the per-dimension loop recomputed the ring-buffer
+     * remainder and re-read the score for each of them. Resolve the segment
+     * once per block in chunks, then let every dimension read the resolved
+     * pair. The accumulation order per dimension is unchanged. */
+    __shared__ float seg_score[128];
+    __shared__ uint32_t seg_row[128];
+    if (head_dim <= blockDim.x) {
+        const uint32_t d = threadIdx.x;
+        float acc = 0.0f;
+        for (uint32_t base = g0; base < g1; base += 128u) {
+            const uint32_t span = (g1 - base) < 128u ? (g1 - base) : 128u;
+            for (uint32_t t = threadIdx.x; t < span; t += blockDim.x) {
+                const uint32_t g = base + t;
+                seg_score[t] = row_scores[g];
+                seg_row[t] = g < raw_count
+                    ? ((raw_start + raw_first_idx + g) % raw_cap)
+                    : (g - raw_count);
+            }
+            __syncthreads();
+            if (d < head_dim) {
+                for (uint32_t t = 0; t < span; t++) {
+                    const float s = seg_score[t];
+                    const uint64_t off = (uint64_t)seg_row[t] * head_dim + d;
+                    acc += (base + t < raw_count ? raw_kv[off] : comp_kv[off]) * s;
+                }
+            }
+            __syncthreads();
+        }
+        if (d < head_dim) pout[d] = acc;
+        return;
+    }
     for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
         for (uint32_t g = g0; g < g1; g++) {
