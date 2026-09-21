@@ -24989,12 +24989,48 @@ __global__ static void q8_K_quantize_kernel(cuda_block_q8_K *out, const float *x
     abs_part[tid] = tid < CUDA_QK_K ? fabsf(v) : 0.0f;
     val_part[tid] = v;
     __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    for (uint32_t stride = blockDim.x >> 1; stride > 32u; stride >>= 1) {
         if (tid < stride && abs_part[tid + stride] > abs_part[tid]) {
             abs_part[tid] = abs_part[tid + stride];
             val_part[tid] = val_part[tid + stride];
         }
         __syncthreads();
+    }
+    /* The last six levels live inside one warp, where the shared tournament
+     * needs no block barrier: the same pairings in the same order, carrying
+     * the same value beside the magnitude, with the same strict comparison. */
+    if (blockDim.x >= 64u) {
+        if (tid < 32u) {
+            float a = abs_part[tid];
+            float m = val_part[tid];
+            const float a32 = abs_part[tid + 32u];
+            if (a32 > a) {
+                a = a32;
+                m = val_part[tid + 32u];
+            }
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                const float ao = __shfl_down_sync(0xffffffffu, a, offset);
+                const float mo = __shfl_down_sync(0xffffffffu, m, offset);
+                if (ao > a) {
+                    a = ao;
+                    m = mo;
+                }
+            }
+            if (tid == 0u) {
+                abs_part[0] = a;
+                val_part[0] = m;
+            }
+        }
+        __syncthreads();
+    } else {
+        for (uint32_t stride = blockDim.x >> 1; stride > 0u; stride >>= 1) {
+            if (tid < stride && abs_part[tid + stride] > abs_part[tid]) {
+                abs_part[tid] = abs_part[tid + stride];
+                val_part[tid] = val_part[tid + stride];
+            }
+            __syncthreads();
+        }
     }
     float amax = abs_part[0];
     if (amax == 0.0f) {
@@ -25162,12 +25198,45 @@ __global__ static void q8_K_quantize_owned_kernel(
     abs_part[tid] = tid < CUDA_QK_K ? fabsf(v) : 0.0f;
     val_part[tid] = v;
     __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    for (uint32_t stride = blockDim.x >> 1; stride > 32u; stride >>= 1) {
         if (tid < stride && abs_part[tid + stride] > abs_part[tid]) {
             abs_part[tid] = abs_part[tid + stride];
             val_part[tid] = val_part[tid + stride];
         }
         __syncthreads();
+    }
+    if (blockDim.x >= 64u) {
+        if (tid < 32u) {
+            float a = abs_part[tid];
+            float m = val_part[tid];
+            const float a32 = abs_part[tid + 32u];
+            if (a32 > a) {
+                a = a32;
+                m = val_part[tid + 32u];
+            }
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                const float ao = __shfl_down_sync(0xffffffffu, a, offset);
+                const float mo = __shfl_down_sync(0xffffffffu, m, offset);
+                if (ao > a) {
+                    a = ao;
+                    m = mo;
+                }
+            }
+            if (tid == 0u) {
+                abs_part[0] = a;
+                val_part[0] = m;
+            }
+        }
+        __syncthreads();
+    } else {
+        for (uint32_t stride = blockDim.x >> 1; stride > 0u; stride >>= 1) {
+            if (tid < stride && abs_part[tid + stride] > abs_part[tid]) {
+                abs_part[tid] = abs_part[tid + stride];
+                val_part[tid] = val_part[tid + stride];
+            }
+            __syncthreads();
+        }
     }
     const float amax = abs_part[0];
     if (amax == 0.0f) {
