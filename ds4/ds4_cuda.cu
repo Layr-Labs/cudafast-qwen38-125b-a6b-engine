@@ -25558,11 +25558,11 @@ __global__ static void moe_gate_up_mid_decode_lut_owned_qwarp32_kernel(
         float *gate_out,
         float *up_out,
         float *mid_out,
-        const char *gate_base,
-        const char *up_base,
-        const cuda_block_q8_K *xq,
-        const int32_t *selected,
-        const float *weights,
+        const char *__restrict__ gate_base,
+        const char *__restrict__ up_base,
+        const cuda_block_q8_K *__restrict__ xq,
+        const int32_t *__restrict__ selected,
+        const float *__restrict__ weights,
         uint64_t gate_expert_bytes,
         uint64_t gate_row_bytes,
         uint32_t xq_blocks,
@@ -25592,8 +25592,8 @@ __global__ static void moe_gate_up_mid_decode_lut_owned_qwarp32_kernel(
     for (uint32_t rr = 0; rr < MOE_DECODE_ROW_TILES; rr++) {
         uint32_t row = blockIdx.x * MOE_DECODE_ROWS_PER_BLOCK + row_lane + rr * 32u;
         if (row >= expert_mid_dim) continue;
-        const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
-        const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+        const cuda_block_iq2_xxs *__restrict__ gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+        const cuda_block_iq2_xxs *__restrict__ ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
         float gate = 0.0f;
         float up = 0.0f;
         for (uint32_t b = lane; b < xq_blocks; b += 8u) {
@@ -27148,10 +27148,10 @@ __global__ static void moe_down_sum6_qwarp32_kernel(
 }
 
 __global__ static void moe_down_owned_slots_qwarp32_kernel(
-        float *down_out,
-        const char *down_base,
-        const cuda_block_q8_K *midq,
-        const int32_t *selected,
+        float *__restrict__ down_out,
+        const char *__restrict__ down_base,
+        const cuda_block_q8_K *__restrict__ midq,
+        const int32_t *__restrict__ selected,
         uint64_t down_expert_bytes,
         uint64_t down_row_bytes,
         uint32_t midq_blocks,
@@ -27159,18 +27159,25 @@ __global__ static void moe_down_owned_slots_qwarp32_kernel(
         uint32_t expert_base,
         uint32_t expert_count) {
     const uint32_t lane = threadIdx.x & 7u;
-    const uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
     const uint32_t slot = blockIdx.y;
-    if (row >= out_dim || slot >= 6u) return;
+    if (slot >= 6u) return;
+    /* The ownership verdict is a function of the grid column alone, so it is
+     * warp-uniform and independent of the row this thread owns. Deciding it
+     * before the row bound and before any 64-bit weight address arithmetic
+     * retires an unowned slot column on one selection load instead of on a
+     * full descriptor computation. The verdict and the emitted values are
+     * unchanged. */
     uint32_t expert = 0;
     if (!moe_owned_local_expert(selected[slot], expert_base,
                                 expert_count, &expert)) {
         return;
     }
-    const cuda_block_q2_K *wr =
+    const uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    if (row >= out_dim) return;
+    const cuda_block_q2_K *__restrict__ wr =
         (const cuda_block_q2_K *)(down_base +
             (uint64_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes);
-    const cuda_block_q8_K *xq = midq + (uint64_t)slot * midq_blocks;
+    const cuda_block_q8_K *__restrict__ xq = midq + (uint64_t)slot * midq_blocks;
     float acc = 0.0f;
     for (uint32_t b = lane; b < midq_blocks; b += 8u) {
         acc += dev_dot_q2_K_q8_K_block(wr + b, xq + b);
@@ -27378,10 +27385,10 @@ __global__ static void moe_down_q4K_sum6_qwarp32_kernel(
 }
 
 __global__ static void moe_down_q4K_owned_slots_qwarp32_kernel(
-        float *down_out,
-        const char *down_base,
-        const cuda_block_q8_K *midq,
-        const int32_t *selected,
+        float *__restrict__ down_out,
+        const char *__restrict__ down_base,
+        const cuda_block_q8_K *__restrict__ midq,
+        const int32_t *__restrict__ selected,
         uint64_t down_expert_bytes,
         uint64_t down_row_bytes,
         uint32_t midq_blocks,
@@ -27389,18 +27396,19 @@ __global__ static void moe_down_q4K_owned_slots_qwarp32_kernel(
         uint32_t expert_base,
         uint32_t expert_count) {
     const uint32_t lane = threadIdx.x & 7u;
-    const uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
     const uint32_t slot = blockIdx.y;
-    if (row >= out_dim || slot >= 6u) return;
+    if (slot >= 6u) return;
     uint32_t expert = 0;
     if (!moe_owned_local_expert(selected[slot], expert_base,
                                 expert_count, &expert)) {
         return;
     }
-    const cuda_block_q4_K *wr =
+    const uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    if (row >= out_dim) return;
+    const cuda_block_q4_K *__restrict__ wr =
         (const cuda_block_q4_K *)(down_base +
             (uint64_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes);
-    const cuda_block_q8_K *xq = midq + (uint64_t)slot * midq_blocks;
+    const cuda_block_q8_K *__restrict__ xq = midq + (uint64_t)slot * midq_blocks;
     const bool vec_ok = ((((uintptr_t)down_base | down_row_bytes |
                            down_expert_bytes) & 15u) == 0u);
     float acc = 0.0f;
@@ -38469,3 +38477,4 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
 #include "ds4_deepseek4_vision_gpu.cuh"
 
 #include "ds4_cuda_mtp_native.cuh"
+#define GAUNTLET_REDRAW_4090b7e7_20260921T012040Z 1
