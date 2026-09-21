@@ -4140,6 +4140,79 @@ __global__ static void qwen4exp_router_select_kernel(
     }
 }
 
+static bool qwen4exp_parse_decimal_u32(const char *text, uint32_t *value_out) {
+    if (!text || !text[0] || !value_out) return false;
+    uint32_t value = 0u;
+    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
+        if (*p < (unsigned char)'0' || *p > (unsigned char)'9') return false;
+        const uint32_t digit = (uint32_t)(*p - (unsigned char)'0');
+        if (value > (UINT32_MAX - digit) / 10u) return false;
+        value = value * 10u + digit;
+    }
+    *value_out = value;
+    return true;
+}
+
+/* Resolve the track-specific decode valve once per process.  The ranked path
+ * uses top-10 routing, where keeping the strongest eight experts is the
+ * shipping default; KEEP=10 is the exact rollback.  Other router shapes stay
+ * exact.  A new resident process is started for every benchmark window, so an
+ * environment override is still isolated per run without paying getenv on
+ * every MoE block. */
+static bool qwen4exp_lossy_decode_config(
+        uint32_t n_expert_used, uint32_t *keep_out, int *renorm_out) {
+    static int configured = 0;
+    static int valid = 1;
+    static uint32_t configured_keep = 8u;
+    static int configured_renorm = 0;
+
+    if (!configured) {
+        const char *keep_text = getenv("DS4_QWEN4EXP_LOSSY_DECODE_KEEP");
+        uint32_t keep = 8u;
+        if (keep_text && !qwen4exp_parse_decimal_u32(keep_text, &keep)) {
+            fprintf(stderr, "ds4: CUDA qwen4exp invalid "
+                            "DS4_QWEN4EXP_LOSSY_DECODE_KEEP='%s' "
+                            "(expected decimal 1..10)\n",
+                    keep_text);
+            valid = 0;
+        } else if (keep == 0u || keep > 10u) {
+            fprintf(stderr, "ds4: CUDA qwen4exp out-of-range "
+                            "DS4_QWEN4EXP_LOSSY_DECODE_KEEP='%s' "
+                            "(expected decimal 1..10)\n",
+                    keep_text ? keep_text : "8");
+            valid = 0;
+        } else {
+            configured_keep = keep;
+        }
+
+        if (valid && configured_keep < 10u) {
+            const char *renorm_text =
+                getenv("DS4_QWEN4EXP_LOSSY_DECODE_RENORM");
+            if (renorm_text && strcmp(renorm_text, "0") != 0 &&
+                strcmp(renorm_text, "1") != 0) {
+                fprintf(stderr, "ds4: CUDA qwen4exp invalid "
+                                "DS4_QWEN4EXP_LOSSY_DECODE_RENORM='%s' "
+                                "(expected 0 or 1 when KEEP is active)\n",
+                        renorm_text);
+                valid = 0;
+            } else {
+                configured_renorm =
+                    renorm_text && strcmp(renorm_text, "1") == 0;
+            }
+        }
+        configured = 1;
+    }
+
+    *keep_out = n_expert_used;
+    *renorm_out = 0;
+    if (!valid) return false;
+    if (n_expert_used == 10u && configured_keep < n_expert_used) {
+        *keep_out = configured_keep;
+        *renorm_out = configured_renorm;
+    }
+    return true;
+}
+
 
 
 /* ---------------------------------------------------------------------------
@@ -4316,6 +4389,7 @@ __global__ static void qwen4exp_moe_group_scan_parallel_kernel(
 /* build record 20260920T112423Z-103 */
 /* build record 20260920T120351Z-108 */
 /* build record 20260921T160157Z-8 */
+/* build record 20260921T045321Z-216 */
 __global__ static void qwen4exp_moe_pair_tasks_kernel(
         int32_t *tasks, const int32_t *counts, unsigned total,
         int32_t tile = 32, int32_t lo = 0, int32_t hi = 0x7fffffff) {
@@ -4503,7 +4577,7 @@ __global__ static void qwen4exp_moe_group_small_kernel(
  * its token is threadIdx.x >> 5 where it was blockIdx.x, and every warp
  * intrinsic already uses the full mask and stays inside its own warp.
  */
-template<bool Native>
+template<bool Native, bool Lossy>
 __global__ static void qwen4exp_moe_router_group_small_kernel(
         int32_t *counts,
         int32_t *offsets,
@@ -4519,7 +4593,9 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
         uint32_t mid_token_stride,
         float *weights_out,
         const float *logits,
-        uint32_t n_tokens) {
+        uint32_t n_tokens,
+        uint32_t lossy_keep,
+        int lossy_renorm) {
     __shared__ int32_t warp_count_prefix[QWEN4EXP_MOE_SCAN_THREADS / 32];
     __shared__ int32_t warp_live_prefix[QWEN4EXP_MOE_SCAN_THREADS / 32];
     /* Hoisted here from the grouping half: it has to precede the FIRST global
@@ -4676,7 +4752,29 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
             const float inv = 1.0f / sum;
             for (uint32_t i = 0; i < n_expert_used; i++) w[i] *= inv;
         }
-    }    }
+    }
+
+    if (Lossy) {
+        /* Decode uses this fused router rather than the standalone top-k.
+         * Invalidate the low-ranked tail before the block-wide grouping half
+         * counts pairs, so every downstream expert kernel naturally skips it.
+         * The exact specialization carries none of this device-side work. */
+        __syncwarp();
+        if (lane == 0u) {
+            for (uint32_t i = lossy_keep; i < n_expert_used; i++) {
+                sel[i] = -1;
+                w[i] = 0.0f;
+            }
+            if (lossy_renorm) {
+                float retained_sum = 0.0f;
+                for (uint32_t i = 0; i < lossy_keep; i++)
+                    retained_sum = __fadd_rn(retained_sum, w[i]);
+                const float inv = 1.0f / retained_sum;
+                for (uint32_t i = 0; i < lossy_keep; i++) w[i] *= inv;
+            }
+        }
+    }
+    }
     /* The whole barrier this fusion turns a graph edge into: it publishes the
      * router warps' `selected` stores to every thread of the block before the
      * grouping half's first read of them. */
@@ -9912,7 +10010,8 @@ static int qwen4exp_routed_moe_cuda(
         uint32_t                     n_tokens,
         uint32_t                     mid_token_stride,
         const ds4_gpu_tensor        *logits,
-        ds4_gpu_tensor              *weights_rw) {
+        ds4_gpu_tensor              *weights_rw,
+        int                          in_head_block) {
     if (!out || !mid || !gate_slab || !up_slab || !down_slab ||
         !gate_slab->map || !up_slab->map || !down_slab->map ||
         !selected || !weights || !x ||
@@ -10058,6 +10157,19 @@ static int qwen4exp_routed_moe_cuda(
         return 0;
     }
 
+    uint32_t lossy_keep = n_expert_used;
+    int lossy_renorm = 0;
+    if (!qwen4exp_lossy_decode_config(n_expert_used, &lossy_keep,
+                                      &lossy_renorm)) {
+        return 0;
+    }
+    /* Keep the MTP head exact.  It is only one block, so pruning it contributes
+     * little compute but can perturb draft acceptance; the 48-layer target
+     * tower carries essentially all of the useful expert-work reduction. */
+    const bool lossy_fused = fuse_router && in_head_block == 0 &&
+                             n_expert_used == 10u && n_tokens <= 2u &&
+                             lossy_keep < n_expert_used;
+
     if (fuse_router) {
         /* Warp w selects token w's experts, one __syncthreads publishes them,
          * and the same 512 threads group them.
@@ -10077,22 +10189,47 @@ static int qwen4exp_routed_moe_cuda(
          * turnaround, not a prefetch.  DS4_QWEN4EXP_NO_PDL_ROUTER_TREE stands
          * it back down to the plain launch, where the fence is a no-op. */
         if (qwen4exp_pdl_router_tree()) {
-            QWEN4EXP_LAUNCH_PDL(
-                    (qwen4exp_moe_router_group_small_kernel<true>),
-                    dim3(1u, 1u, 1u), QWEN4EXP_MOE_SCAN_THREADS, 0, stream,
-                    sc.counts, sc.offsets, sc.cursor, sc.active, sc.pairs,
-                    (float *)mid->ptr, (int32_t *)selected->ptr,
-                    n_total_expert, n_pairs, n_expert_used, mid_dim,
-                    mid_token_stride, (float *)weights_rw->ptr,
-                    (const float *)logits->ptr, n_tokens);
+            if (lossy_fused) {
+                QWEN4EXP_LAUNCH_PDL(
+                        (qwen4exp_moe_router_group_small_kernel<true, true>),
+                        dim3(1u, 1u, 1u), QWEN4EXP_MOE_SCAN_THREADS, 0, stream,
+                        sc.counts, sc.offsets, sc.cursor, sc.active, sc.pairs,
+                        (float *)mid->ptr, (int32_t *)selected->ptr,
+                        n_total_expert, n_pairs, n_expert_used, mid_dim,
+                        mid_token_stride, (float *)weights_rw->ptr,
+                        (const float *)logits->ptr, n_tokens,
+                        lossy_keep, lossy_renorm);
+            } else {
+                QWEN4EXP_LAUNCH_PDL(
+                        (qwen4exp_moe_router_group_small_kernel<true, false>),
+                        dim3(1u, 1u, 1u), QWEN4EXP_MOE_SCAN_THREADS, 0, stream,
+                        sc.counts, sc.offsets, sc.cursor, sc.active, sc.pairs,
+                        (float *)mid->ptr, (int32_t *)selected->ptr,
+                        n_total_expert, n_pairs, n_expert_used, mid_dim,
+                        mid_token_stride, (float *)weights_rw->ptr,
+                        (const float *)logits->ptr, n_tokens,
+                        n_expert_used, 0);
+            }
         } else {
-            qwen4exp_moe_router_group_small_kernel<true>
-                    <<<dim3(1u, 1u, 1u), QWEN4EXP_MOE_SCAN_THREADS, 0, stream>>>(
-                    sc.counts, sc.offsets, sc.cursor, sc.active, sc.pairs,
-                    (float *)mid->ptr, (int32_t *)selected->ptr,
-                    n_total_expert, n_pairs, n_expert_used, mid_dim,
-                    mid_token_stride, (float *)weights_rw->ptr,
-                    (const float *)logits->ptr, n_tokens);
+            if (lossy_fused) {
+                qwen4exp_moe_router_group_small_kernel<true, true>
+                        <<<dim3(1u, 1u, 1u), QWEN4EXP_MOE_SCAN_THREADS, 0, stream>>>(
+                        sc.counts, sc.offsets, sc.cursor, sc.active, sc.pairs,
+                        (float *)mid->ptr, (int32_t *)selected->ptr,
+                        n_total_expert, n_pairs, n_expert_used, mid_dim,
+                        mid_token_stride, (float *)weights_rw->ptr,
+                        (const float *)logits->ptr, n_tokens,
+                        lossy_keep, lossy_renorm);
+            } else {
+                qwen4exp_moe_router_group_small_kernel<true, false>
+                        <<<dim3(1u, 1u, 1u), QWEN4EXP_MOE_SCAN_THREADS, 0, stream>>>(
+                        sc.counts, sc.offsets, sc.cursor, sc.active, sc.pairs,
+                        (float *)mid->ptr, (int32_t *)selected->ptr,
+                        n_total_expert, n_pairs, n_expert_used, mid_dim,
+                        mid_token_stride, (float *)weights_rw->ptr,
+                        (const float *)logits->ptr, n_tokens,
+                        n_expert_used, 0);
+            }
         }
     } else if (small_group) {
         /* PSS: the router's top-k is the stream predecessor and triggers at
@@ -10764,7 +10901,8 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         const ds4_gpu_tensor        *x,
         uint32_t                     n_tokens,
         uint32_t                     mid_token_stride) {
-    return qwen4exp_routed_moe_cuda(DS4_QWEN4EXP_ROUTED_MOE_ARGS, NULL, NULL);
+    return qwen4exp_routed_moe_cuda(DS4_QWEN4EXP_ROUTED_MOE_ARGS,
+                                    NULL, NULL, 0);
 }
 
 /* The same block with the router's selection folded into its grouping launch.
@@ -10787,9 +10925,10 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_router_tensor(
         uint32_t                     n_tokens,
         uint32_t                     mid_token_stride,
         const ds4_gpu_tensor        *logits,
-        ds4_gpu_tensor              *weights_rw) {
+        ds4_gpu_tensor              *weights_rw,
+        int                          in_head_block) {
     return qwen4exp_routed_moe_cuda(DS4_QWEN4EXP_ROUTED_MOE_ARGS, logits,
-                                    weights_rw);
+                                    weights_rw, in_head_block);
 }
 #undef DS4_QWEN4EXP_ROUTED_MOE_ARGS
 
