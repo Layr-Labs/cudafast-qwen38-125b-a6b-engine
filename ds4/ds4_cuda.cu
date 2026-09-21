@@ -26279,38 +26279,67 @@ __global__ static void moe_gate_up_mid_sorted_p2_qwarp32_kernel(
         uint32_t n_expert,
         uint32_t pair_count,
         float clamp) {
+    /* perf-05: TWO ROW TILES PER BLOCK.
+     *
+     * The weight rows a block reads are its own -- no two blocks read the
+     * same gate or up row -- but the quantised activation of the token is
+     * shared by every block of the pair and each of them fetches it
+     * independently, so the activation traffic of this step is proportional
+     * to the block count and not to the work.  With sixteen rows per block
+     * the grid issues far more blocks than the device has resident slots;
+     * the surplus blocks add no parallelism the SMs can use, they only read
+     * the activation again.  Two tiles of sixteen halve the block count and
+     * halve those re-reads while still leaving several blocks per SM.
+     *
+     * The row map stays a bijection: blockIdx.x * (16 * TILES) +
+     * (threadIdx.x >> 4) + rr * 16 enumerates each row of the block's span
+     * exactly once, and the kernel's own bound check drops the rows past
+     * the intermediate dimension, so every output is written by exactly one
+     * warp quarter as before.  Nothing inside a row moves: the same weight
+     * rows are dotted against the same activation blocks in the same order,
+     * and the same clamp, gate and routing weight are applied to the same
+     * operands.  P2_ROW_TILES = 1u restores the shipped geometry exactly.
+     */
+#ifndef MOE_P2_ROW_TILES
+#define MOE_P2_ROW_TILES 2u
+#endif
+#define MOE_P2_ROWS_PER_BLOCK (16u * MOE_P2_ROW_TILES)
     uint32_t lane = threadIdx.x & 7u;
     uint32_t pair_lane = (threadIdx.x >> 3u) & 1u;
-    uint32_t row = blockIdx.x * 16u + (threadIdx.x >> 4u);
     uint32_t sorted_idx = blockIdx.y * 2u + pair_lane;
-    if (row >= expert_mid_dim || sorted_idx >= pair_count) return;
+    if (sorted_idx >= pair_count) return;
     uint32_t pair = sorted_pairs[sorted_idx];
     uint32_t tok = pair / n_expert;
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
     uint32_t expert = (uint32_t)expert_i;
-    const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
-    const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
     const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
-    float gate = 0.0f;
-    float up = 0.0f;
-    for (uint32_t b = lane; b < xq_blocks; b += 8u) {
-        gate += dev_dot_iq2_xxs_q8_K_block(gr + b, xqb + b);
-        up += dev_dot_iq2_xxs_q8_K_block(ur + b, xqb + b);
-    }
-    gate = quarter_warp_sum_f32(gate, lane);
-    up = quarter_warp_sum_f32(up, lane);
-    if (lane == 0) {
-        if (clamp > 1.0e-6f) {
-            if (gate > clamp) gate = clamp;
-            if (up > clamp) up = clamp;
-            if (up < -clamp) up = -clamp;
+    for (uint32_t rr = 0; rr < MOE_P2_ROW_TILES; rr++) {
+        const uint32_t row = blockIdx.x * MOE_P2_ROWS_PER_BLOCK
+                           + (threadIdx.x >> 4u) + rr * 16u;
+        if (row >= expert_mid_dim) continue;
+        const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+        const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+        float gate = 0.0f;
+        float up = 0.0f;
+        for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+            gate += dev_dot_iq2_xxs_q8_K_block(gr + b, xqb + b);
+            up += dev_dot_iq2_xxs_q8_K_block(ur + b, xqb + b);
         }
-        const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
-        gate_out[off] = gate;
-        up_out[off] = up;
-        mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+        gate = quarter_warp_sum_f32(gate, lane);
+        up = quarter_warp_sum_f32(up, lane);
+        if (lane == 0) {
+            if (clamp > 1.0e-6f) {
+                if (gate > clamp) gate = clamp;
+                if (up > clamp) up = clamp;
+                if (up < -clamp) up = -clamp;
+            }
+            const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+            gate_out[off] = gate;
+            up_out[off] = up;
+            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+        }
     }
 }
 
@@ -30088,7 +30117,10 @@ static int routed_moe_launch(
                         write_gate_up, clamp);
                 }
             } else if (ok && sorted_pairs && use_p2_sorted) {
-                dim3 p2_mgrid((expert_mid_dim + 15u) / 16u, (pair_count + 1u) / 2u, 1);
+                /* Divisor follows the kernel's row tile, so the grid covers
+                 * each row exactly once and no block has every tile past the
+                 * end of the intermediate dimension. */
+                dim3 p2_mgrid((expert_mid_dim + MOE_P2_ROWS_PER_BLOCK - 1u) / MOE_P2_ROWS_PER_BLOCK, (pair_count + 1u) / 2u, 1);
                 moe_gate_up_mid_sorted_p2_qwarp32_kernel<<<p2_mgrid, 256, 0, cuda_decode_stream()>>>(
                     (float *)gate->ptr,
                     (float *)up->ptr,
@@ -38469,3 +38501,4 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
 #include "ds4_deepseek4_vision_gpu.cuh"
 
 #include "ds4_cuda_mtp_native.cuh"
+#define GAUNTLET_REDRAW_cb1938d1_20260921T003058Z 1
