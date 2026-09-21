@@ -29055,6 +29055,59 @@ __global__ static void moe_sum_owned_kernel(
     out[gid] = acc;
 }
 
+/* Four output columns per thread. Per element the accumulation is the scalar
+ * kernel's, over the same slots in the same order; only the transaction width
+ * changes, so the host selects these forms only when the width divides by four
+ * and both operands are sixteen-byte aligned. */
+__global__ static void moe_sum_vec4_kernel(
+        float4 *out,
+        const float4 *down,
+        uint32_t out_dim4,
+        uint32_t n_expert,
+        uint32_t n_tokens) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = (uint64_t)n_tokens * out_dim4;
+    if (gid >= n) return;
+    const uint32_t tok = (uint32_t)(gid / out_dim4);
+    const uint32_t row = (uint32_t)(gid - (uint64_t)tok * out_dim4);
+    float ax = 0.0f, ay = 0.0f, az = 0.0f, aw = 0.0f;
+    for (uint32_t e = 0; e < n_expert; e++) {
+        const float4 v = down[((uint64_t)tok * n_expert + e) * out_dim4 + row];
+        ax += v.x;
+        ay += v.y;
+        az += v.z;
+        aw += v.w;
+    }
+    out[gid] = make_float4(ax, ay, az, aw);
+}
+
+__global__ static void moe_sum_owned_vec4_kernel(
+        float4 *out,
+        const float4 *down,
+        const int32_t *selected,
+        uint32_t out_dim4,
+        uint32_t n_expert,
+        uint32_t n_tokens) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = (uint64_t)n_tokens * out_dim4;
+    if (gid >= n) return;
+    const uint32_t tok = (uint32_t)(gid / out_dim4);
+    const uint32_t row = (uint32_t)(gid - (uint64_t)tok * out_dim4);
+    float ax = 0.0f, ay = 0.0f, az = 0.0f, aw = 0.0f;
+    #pragma unroll
+    for (uint32_t slot = 0; slot < 6u; slot++) {
+        if (slot >= n_expert) break;
+        const uint64_t pair = (uint64_t)tok * n_expert + slot;
+        float4 value = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (selected[pair] >= 0) value = down[pair * out_dim4 + row];
+        ax = __fadd_rn(ax, value.x);
+        ay = __fadd_rn(ay, value.y);
+        az = __fadd_rn(az, value.z);
+        aw = __fadd_rn(aw, value.w);
+    }
+    out[gid] = make_float4(ax, ay, az, aw);
+}
+
 __device__ static float dev_iq2_xxs_dot_f32(const cuda_block_iq2_xxs *row, const float *x, uint32_t nb) {
     float acc = 0.0f;
     for (uint32_t b = 0; b < nb; b++) {
@@ -30613,12 +30666,30 @@ static int routed_moe_launch(
         if (prof_ev[5]) (void)cudaEventRecord(prof_ev[5], 0);
         if (ok && !use_atomic_down && !use_direct_down_sum) {
             uint64_t n = (uint64_t)n_tokens * out_dim;
-            if (use_owned_sparse_buffers) {
+            const int sum_vec4 = (out_dim & 3u) == 0u &&
+                ((((uintptr_t)out->ptr) | ((uintptr_t)down->ptr)) & 15u) == 0u;
+            const uint64_t n4 = n / 4u;
+            if (use_owned_sparse_buffers && sum_vec4) {
+                moe_sum_owned_vec4_kernel<<<(n4 + 255) / 256, 256, 0, cuda_decode_stream()>>>(
+                        (float4 *)out->ptr,
+                        (const float4 *)down->ptr,
+                        (const int32_t *)selected->ptr,
+                        out_dim / 4u,
+                        n_expert,
+                        n_tokens);
+            } else if (use_owned_sparse_buffers) {
                 moe_sum_owned_kernel<<<(n + 255) / 256, 256, 0, cuda_decode_stream()>>>(
                         (float *)out->ptr,
                         (const float *)down->ptr,
                         (const int32_t *)selected->ptr,
                         out_dim,
+                        n_expert,
+                        n_tokens);
+            } else if (sum_vec4) {
+                moe_sum_vec4_kernel<<<(n4 + 255) / 256, 256, 0, cuda_decode_stream()>>>(
+                        (float4 *)out->ptr,
+                        (const float4 *)down->ptr,
+                        out_dim / 4u,
                         n_expert,
                         n_tokens);
             } else {
@@ -30686,7 +30757,12 @@ static int routed_moe_launch(
     }
     if (ok) {
         uint64_t n = (uint64_t)n_tokens * out_dim;
-        moe_sum_kernel<<<(n + 255) / 256, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
+        if ((out_dim & 3u) == 0u &&
+            ((((uintptr_t)out->ptr) | ((uintptr_t)down->ptr)) & 15u) == 0u) {
+            moe_sum_vec4_kernel<<<(n / 4u + 255) / 256, 256, 0, cuda_decode_stream()>>>((float4 *)out->ptr, (const float4 *)down->ptr, out_dim / 4u, n_expert, n_tokens);
+        } else {
+            moe_sum_kernel<<<(n + 255) / 256, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
+        }
         ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");
     }
     return ok;
