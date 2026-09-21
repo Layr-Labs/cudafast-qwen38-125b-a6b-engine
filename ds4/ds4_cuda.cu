@@ -7194,14 +7194,7 @@ __device__ __forceinline__ static void q8_mma_bar_arrive(int id, int count) {
 #define Q8_MMA_MINB 1
 #endif
 
-/* CvtC: the weight block scales are converted half -> float BY THE CONSUMER,
- * straight out of sB, instead of by the producer into a separate sWs buffer.
- * It is the same halfword through the same __half2float feeding the same FMA
- * in the same order, so it is bit-exact; what it removes is the producer's
- * `bar.sync 15` rendezvous, which existed only because the conversion loop
- * read scales that OTHER producer warps had stored.  See
- * /root/qwen/notes/q8tile-plan.md S2. */
-template <int WM, int WN, int MT, int NT, int G, int STAGES, bool CvtC = false>
+template <int WM, int WN, int MT, int NT, int G, int STAGES>
 struct q8_mma_pipe_cfg {
     static constexpr int BM = WM * MT * 16;
     static constexpr int BN = WN * NT * 8;
@@ -7219,7 +7212,7 @@ struct q8_mma_pipe_cfg {
     static constexpr int A_BYTES = BM * A_STRIDE;
     static constexpr int B_BYTES = BN * B_STRIDE;
     static constexpr int AS_BYTES = BM * G * 4;
-    static constexpr int WS_BYTES = CvtC ? 0 : (G * BN * 4); /* converted weight scales [gg][BN] */
+    static constexpr int WS_BYTES = G * BN * 4;          /* converted weight scales [gg][BN] */
     static constexpr int STAGE_BYTES = A_BYTES + B_BYTES + AS_BYTES + WS_BYTES;
     static constexpr int SMEM = STAGES * STAGE_BYTES;
     static_assert(G == 2 || G == 4 || G == 8, "G is the k32 steps per stage");
@@ -7230,7 +7223,7 @@ struct q8_mma_pipe_cfg {
     static_assert(B_GCD >= 4, "skew must keep word parity");
 };
 
-template <int WM, int WN, int MT, int NT, int G, int STAGES, bool ActPol = false, bool CvtC = false>
+template <int WM, int WN, int MT, int NT, int G, int STAGES, bool ActPol = false>
 __global__ __launch_bounds__((WM * WN + 4) * 32, Q8_MMA_MINB) static void
 matmul_q8_0_preq_rows_mma_pipe_kernel(float *out,
                                       const unsigned char *w,
@@ -7239,7 +7232,7 @@ matmul_q8_0_preq_rows_mma_pipe_kernel(float *out,
                                       uint64_t out_dim,
                                       uint32_t n_rows,
                                       uint64_t blocks) {
-    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES, CvtC> C;
+    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES> C;
     constexpr int BM = C::BM, BN = C::BN;
     const uint64_t act_pol = ActPol ? q8_mma_pol_last() : 0ull;
 
@@ -7372,19 +7365,6 @@ matmul_q8_0_preq_rows_mma_pipe_kernel(float *out,
                 const int c = idx - r * C::B_CHUNKS;
                 if (idx < BN * C::B_CHUNKS) q8_mma_sts_16(sB + r * C::B_STRIDE + c * 16, rb[k]);
             }
-            if (CvtC) {
-                /* The consumer converts the block scales itself, so no
-                 * producer reads another producer's stores and the four
-                 * warps never rendezvous: a warp whose loads have landed
-                 * issues the next stage without waiting for the slowest.
-                 * `bar.arrive` carries no memory ordering of its own (the
-                 * rendezvous below was providing it as a side effect) and
-                 * `__syncwarp` is intra-warp, so the stores are released
-                 * with an explicit block fence. */
-                __threadfence_block();
-                q8_mma_bar_arrive(1 + 2 * buf, BAR_COUNT);
-                continue;
-            }
             /* Every producer's stores are visible to every producer: the
              * scales below lie in rows another one stored. */
             q8_mma_bar_sync(15, C::PWARPS * 32);
@@ -7477,23 +7457,7 @@ matmul_q8_0_preq_rows_mma_pipe_kernel(float *out,
                     bf[0] = pw[0];
                     bf[1] = pw[4];
                 }
-                float2 wsp;
-                if (CvtC) {
-                    /* The two halfwords are the q8_0 block scales of output
-                     * rows c + t4*2 and c + t4*2 + 1 -- the same bytes the
-                     * producer fed to sWs.  B_STRIDE/4 = 4 (mod 32), so the
-                     * eight distinct rows a warp needs land on eight distinct
-                     * banks and the eight lanes sharing a t4 broadcast; skew
-                     * is even and gg*34 is even, so both are 2-byte aligned. */
-                    const unsigned char *ps = sB + (c + (int)t4 * 2) * C::B_STRIDE + skew + gg * 34;
-                    uint16_t hs0, hs1;
-                    memcpy(&hs0, ps, 2);
-                    memcpy(&hs1, ps + C::B_STRIDE, 2);
-                    wsp = make_float2(__half2float(__ushort_as_half(hs0)),
-                                      __half2float(__ushort_as_half(hs1)));
-                } else {
-                    wsp = *(const float2 *)(sWs + gg * BN + c + (int)t4 * 2);
-                }
+                const float2 wsp = *(const float2 *)(sWs + gg * BN + c + (int)t4 * 2);
                 int32_t d[MT][4];
 #pragma unroll
                 for (int mi = 0; mi < MT; mi++) q8_mma_m16n8k32_seeded(d[mi], af[mi], bf, magic);
@@ -18197,12 +18161,12 @@ extern "C" int ds4_gpu_q8_mma_pipe_last_bn(void) {
 /* The dynamic shared memory opt-in, once per instantiation; done eagerly
  * from ds4_gpu_enable_q8_dense_mma so no launch has to do it inside a
  * stream capture. */
-template <int WM, int WN, int MT, int NT, int G, int STAGES, bool ActPol = false, bool CvtC = false>
+template <int WM, int WN, int MT, int NT, int G, int STAGES, bool ActPol = false>
 static bool cuda_q8_mma_pipe_attr(void) {
-    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES, CvtC> C;
+    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES> C;
     static int state = 0;   /* 0 unset, 1 ok, -1 refused */
     if (state == 0) {
-        state = (cudaFuncSetAttribute(matmul_q8_0_preq_rows_mma_pipe_kernel<WM, WN, MT, NT, G, STAGES, ActPol, CvtC>,
+        state = (cudaFuncSetAttribute(matmul_q8_0_preq_rows_mma_pipe_kernel<WM, WN, MT, NT, G, STAGES, ActPol>,
                                       cudaFuncAttributeMaxDynamicSharedMemorySize,
                                       C::SMEM) == cudaSuccess) ? 1 : -1;
         if (state < 0) (void)cudaGetLastError();
@@ -18229,49 +18193,17 @@ static int cuda_q8_mma_pipe_actpol(void) {
     return cached;
 }
 
-/* DS4_CUDA_Q8_CVTSCALE=0 restores the shipped producer exactly (the
- * CvtC=false instantiation IS the shipped kernel: the same template
- * arguments it had before this parameter existed, so the same PTX).  Unset
- * or anything else converts the weight block scales in the consumer and
- * drops the producer's `bar.sync 15` rendezvous and its sWs buffer.  The
- * arithmetic is untouched -- same halfword, same __half2float, same FMA
- * order -- and the standalone harness word-compares all 1024 x out_dim
- * outputs against the shipped ladder on five production shapes.
- * /root/qwen/notes/q8tile-plan.md S2 has the measurements. */
-static int g_q8_mma_pipe_cvtscale = -1;
-static int cuda_q8_mma_pipe_cvtscale(void) {
-    if (g_q8_mma_pipe_cvtscale < 0) {
-        const char *e = getenv("DS4_CUDA_Q8_CVTSCALE");
-        g_q8_mma_pipe_cvtscale = (e != NULL && e[0] == '0') ? 0 : 1;
-    }
-    return g_q8_mma_pipe_cvtscale;
-}
-
 template <int WM, int WN, int MT, int NT, int G, int STAGES>
 static int cuda_q8_mma_pipe_launch(float *out, const unsigned char *w,
                                    const int8_t *xq, const float *xscale,
                                    uint64_t out_dim, uint32_t n_rows,
                                    uint64_t blocks) {
-    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES> C;          /* shipped smem */
-    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES, true> CC;    /* no sWs */
-    /* The BASE opt-in still decides whether this rung exists at all, so the
-     * valve can never make a rung launch that the shipped ladder refuses. */
+    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES> C;
     if (!cuda_q8_mma_pipe_attr<WM, WN, MT, NT, G, STAGES>()) return 0;
-    const bool cvtc = cuda_q8_mma_pipe_cvtscale() &&
-                      cuda_q8_mma_pipe_attr<WM, WN, MT, NT, G, STAGES, false, true>();
     const bool actpol = out_dim >= 4096u && cuda_q8_mma_pipe_actpol() &&
-                        (cvtc ? cuda_q8_mma_pipe_attr<WM, WN, MT, NT, G, STAGES, true, true>()
-                              : cuda_q8_mma_pipe_attr<WM, WN, MT, NT, G, STAGES, true>());
+                        cuda_q8_mma_pipe_attr<WM, WN, MT, NT, G, STAGES, true>();
     dim3 grid((n_rows + C::BM - 1u) / C::BM, (unsigned)((out_dim + C::BN - 1u) / C::BN), 1u);
-    if (cvtc) {
-        if (actpol) {
-            matmul_q8_0_preq_rows_mma_pipe_kernel<WM, WN, MT, NT, G, STAGES, true, true>
-                <<<grid, CC::THREADS, CC::SMEM, cuda_decode_stream()>>>(out, w, xq, xscale, out_dim, n_rows, blocks);
-        } else {
-            matmul_q8_0_preq_rows_mma_pipe_kernel<WM, WN, MT, NT, G, STAGES, false, true>
-                <<<grid, CC::THREADS, CC::SMEM, cuda_decode_stream()>>>(out, w, xq, xscale, out_dim, n_rows, blocks);
-        }
-    } else if (actpol) {
+    if (actpol) {
         matmul_q8_0_preq_rows_mma_pipe_kernel<WM, WN, MT, NT, G, STAGES, true>
             <<<grid, C::THREADS, C::SMEM, cuda_decode_stream()>>>(out, w, xq, xscale, out_dim, n_rows, blocks);
     } else {
@@ -18287,12 +18219,6 @@ static void cuda_q8_mma_pipe_prepare(void) {
     (void)cuda_q8_mma_pipe_attr<2, 2, 4, 4, 4, 2>();
     (void)cuda_q8_mma_pipe_attr<2, 4, 4, 4, 4, 2>();
     (void)cuda_q8_mma_pipe_attr<2, 8, 4, 4, 4, 2>();
-    (void)cuda_q8_mma_pipe_attr<2, 2, 4, 4, 4, 2, false, true>();
-    (void)cuda_q8_mma_pipe_attr<2, 4, 4, 4, 4, 2, false, true>();
-    (void)cuda_q8_mma_pipe_attr<2, 8, 4, 4, 4, 2, false, true>();
-    (void)cuda_q8_mma_pipe_attr<2, 2, 4, 4, 4, 2, true, true>();
-    (void)cuda_q8_mma_pipe_attr<2, 4, 4, 4, 4, 2, true, true>();
-    (void)cuda_q8_mma_pipe_attr<2, 8, 4, 4, 4, 2, true, true>();
 }
 
 /* The pipelined tile's shape ladder.  Returns 0 when the call is not one it
@@ -26676,6 +26602,71 @@ __global__ static void moe_gate_up_mid_decode_q4K_hwarp16_row8_kernel(
     }
 }
 
+/* Gate and up share one warp in the single-token MoE tiles.
+ *
+ * Each of the eight warps in these decode blocks owns one intermediate row
+ * and walks the token's quantised activation blocks with `b = lane; b <
+ * xq_blocks; b += 32`, doing BOTH the gate dot and the up dot for every block
+ * it takes.  At decode the activation is one token, so `xq_blocks` is the
+ * hidden dimension over `CUDA_QK_K` - the same count the shared staging path
+ * below caps at sixteen.  With sixteen blocks and thirty-two lanes, half of
+ * every warp sits idle for the whole loop while the other half issues two
+ * weight streams back to back, so the tile runs at half its lane width and
+ * the gate row and the up row are fetched in series.
+ *
+ * Splitting the warp fixes both: lanes 0..15 accumulate the gate row and
+ * lanes 16..31 accumulate the up row, each over the same ascending block
+ * order, so every lane issues exactly one dot and the two weight streams are
+ * in flight together.  The reduction is the same tree over the same values.
+ * The 32-lane butterfly the parent used starts with `v += v[lane + 16]`,
+ * which on this shape adds an exact zero into every live lane and then runs
+ * the eight/four/two/one tree over lanes 0..15; the half-warp reduction is
+ * that tree, run once per half, and the up sum is shuffled back to lane 0.
+ * Per-block dot values are produced by the same routine on the same operands
+ * in the same order, so the emitted tokens are unchanged.
+ *
+ * The split is only taken when one pass covers the row (`xq_blocks <= 16`);
+ * wider activations keep the strided loop, which no longer leaves lanes idle.
+ * Building with -DDS4_MOE_DECODE_SPLIT_GU=0 restores the shared-warp loop. */
+#ifndef DS4_MOE_DECODE_SPLIT_GU
+#define DS4_MOE_DECODE_SPLIT_GU 1
+#endif
+
+__device__ __forceinline__ static bool moe_decode_gu_split_ok(uint32_t xq_blocks) {
+#if DS4_MOE_DECODE_SPLIT_GU
+    return xq_blocks <= 16u;
+#else
+    (void)xq_blocks;
+    return false;
+#endif
+}
+
+__device__ __forceinline__ static void moe_decode_gu_split_dot(
+        const cuda_block_q4_K *gr,
+        const cuda_block_q4_K *ur,
+        const cuda_block_q8_K *xqb,
+        uint32_t xq_blocks,
+        uint32_t lane,
+        bool vec_ok,
+        float *gate_out,
+        float *up_out) {
+    const uint32_t half = lane & 15u;
+    const cuda_block_q4_K *wr = (lane >= 16u) ? ur : gr;
+    float acc = 0.0f;
+    if (vec_ok) {
+        for (uint32_t b = half; b < xq_blocks; b += 16u) {
+            dev_dot_q4_K_q8_K_block_vec(wr + b, xqb + b, &acc);
+        }
+    } else {
+        for (uint32_t b = half; b < xq_blocks; b += 16u) {
+            acc += dev_dot_q4_K_q8_K_block(wr + b, xqb + b);
+        }
+    }
+    acc = half_warp_sum_f32(acc, half);
+    *gate_out = __shfl_sync(0xffffffffu, acc, 0);
+    *up_out = __shfl_sync(0xffffffffu, acc, 16);
+}
+
 __global__ static void moe_gate_up_mid_decode_q4K_warp32_kernel(
         float *gate_out,
         float *up_out,
@@ -26712,12 +26703,16 @@ __global__ static void moe_gate_up_mid_decode_q4K_warp32_kernel(
     const cuda_block_q4_K *ur = (const cuda_block_q4_K *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
     float gate = 0.0f;
     float up = 0.0f;
-    for (uint32_t b = lane; b < xq_blocks; b += 32u) {
-        gate += dev_dot_q4_K_q8_K_block(gr + b, xqb + b);
-        up += dev_dot_q4_K_q8_K_block(ur + b, xqb + b);
+    if (moe_decode_gu_split_ok(xq_blocks)) {
+        moe_decode_gu_split_dot(gr, ur, xqb, xq_blocks, lane, false, &gate, &up);
+    } else {
+        for (uint32_t b = lane; b < xq_blocks; b += 32u) {
+            gate += dev_dot_q4_K_q8_K_block(gr + b, xqb + b);
+            up += dev_dot_q4_K_q8_K_block(ur + b, xqb + b);
+        }
+        gate = warp_sum_f32(gate);
+        up = warp_sum_f32(up);
     }
-    gate = warp_sum_f32(gate);
-    up = warp_sum_f32(up);
     if (lane == 0u) {
         if (clamp > 1.0e-6f) {
             if (gate > clamp) gate = clamp;
@@ -26773,19 +26768,23 @@ __global__ static void moe_gate_up_mid_decode_q4K_warp32_noaux_kernel(
     float up = 0.0f;
     const bool vec_ok = ((((uintptr_t)gate_base | (uintptr_t)up_base |
                            gate_row_bytes | gate_expert_bytes) & 15u) == 0u);
-    if (vec_ok) {
-        for (uint32_t b = lane; b < xq_blocks; b += 32u) {
-            dev_dot_q4_K_q8_K_block_vec(gr + b, xqb + b, &gate);
-            dev_dot_q4_K_q8_K_block_vec(ur + b, xqb + b, &up);
-        }
+    if (moe_decode_gu_split_ok(xq_blocks)) {
+        moe_decode_gu_split_dot(gr, ur, xqb, xq_blocks, lane, vec_ok, &gate, &up);
     } else {
-        for (uint32_t b = lane; b < xq_blocks; b += 32u) {
-            gate += dev_dot_q4_K_q8_K_block(gr + b, xqb + b);
-            up += dev_dot_q4_K_q8_K_block(ur + b, xqb + b);
+        if (vec_ok) {
+            for (uint32_t b = lane; b < xq_blocks; b += 32u) {
+                dev_dot_q4_K_q8_K_block_vec(gr + b, xqb + b, &gate);
+                dev_dot_q4_K_q8_K_block_vec(ur + b, xqb + b, &up);
+            }
+        } else {
+            for (uint32_t b = lane; b < xq_blocks; b += 32u) {
+                gate += dev_dot_q4_K_q8_K_block(gr + b, xqb + b);
+                up += dev_dot_q4_K_q8_K_block(ur + b, xqb + b);
+            }
         }
+        gate = warp_sum_f32(gate);
+        up = warp_sum_f32(up);
     }
-    gate = warp_sum_f32(gate);
-    up = warp_sum_f32(up);
     if (lane == 0u) {
         if (clamp > 1.0e-6f) {
             if (gate > clamp) gate = clamp;
@@ -26836,19 +26835,23 @@ __global__ static void moe_gate_up_mid_decode_q4K_owned_warp32_noaux_kernel(
     const cuda_block_q4_K *ur = (const cuda_block_q4_K *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
     float gate = 0.0f;
     float up = 0.0f;
-    if (vec_ok) {
-        for (uint32_t b = lane; b < xq_blocks; b += 32u) {
-            dev_dot_q4_K_q8_K_block_vec(gr + b, xqb + b, &gate);
-            dev_dot_q4_K_q8_K_block_vec(ur + b, xqb + b, &up);
-        }
+    if (moe_decode_gu_split_ok(xq_blocks)) {
+        moe_decode_gu_split_dot(gr, ur, xqb, xq_blocks, lane, vec_ok, &gate, &up);
     } else {
-        for (uint32_t b = lane; b < xq_blocks; b += 32u) {
-            gate += dev_dot_q4_K_q8_K_block(gr + b, xqb + b);
-            up += dev_dot_q4_K_q8_K_block(ur + b, xqb + b);
+        if (vec_ok) {
+            for (uint32_t b = lane; b < xq_blocks; b += 32u) {
+                dev_dot_q4_K_q8_K_block_vec(gr + b, xqb + b, &gate);
+                dev_dot_q4_K_q8_K_block_vec(ur + b, xqb + b, &up);
+            }
+        } else {
+            for (uint32_t b = lane; b < xq_blocks; b += 32u) {
+                gate += dev_dot_q4_K_q8_K_block(gr + b, xqb + b);
+                up += dev_dot_q4_K_q8_K_block(ur + b, xqb + b);
+            }
         }
+        gate = warp_sum_f32(gate);
+        up = warp_sum_f32(up);
     }
-    gate = warp_sum_f32(gate);
-    up = warp_sum_f32(up);
     if (lane == 0u) {
         if (clamp > 1.0e-6f) {
             if (gate > clamp) gate = clamp;
