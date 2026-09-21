@@ -5365,7 +5365,42 @@ template <int GateType = -1, int UpType = -1, bool PairTasks = false,
  * original bound verbatim.  Dropping maxThreadsPerBlock is harmless under a
  * hard cap: the launch is 128 threads either way and residency is pinned by
  * the cap, not by the hint. */
-#if defined(__CUDACC__) && CUDART_VERSION >= 12040
+/* nb-mmrev: REVERT the cap above, and here is why it is worth a tree.
+ *
+ * The cap landed in the bundle accepted as `a0cfbcbf` at 2.4827459586612, whose
+ * documented win is the DECODE gate/up register ladder (+0.545%, then +0.775%
+ * of decode).  The prefill `mm` cap rode along in that same bundle, so its
+ * ISOLATED effect on the composite has never been measured -- not once.  The
+ * comment above records only that the cap TOOK (`mm[reg]` 167 -> 128, `occ`
+ * 3 -> 4, `lmem` 0), which is a statement about ptxas, not about the score.
+ *
+ * And `lmem = 0` is weaker evidence than it looks.  A 23% squeeze on a tile
+ * that stages through cp.async and holds QW_MMA_NT * 4 accumulators has to be
+ * paid for somewhere; with no local frame, ptxas pays in REMATERIALIZATION --
+ * reloading from shared and recomputing addresses inside the inner loop -- and
+ * that cost is invisible in every field the probe prints.  What the cap buys
+ * is exactly one more CTA (3 -> 4).  On a compute-bound MMA tile a 4th CTA is
+ * worth little if the 3 resident ones already keep the tensor pipes fed, so
+ * the trade is plausibly NEGATIVE and has never been priced.
+ *
+ * Single variable: this flips the attribute and nothing else.  Do NOT bundle
+ * the `dn` probe repoint into this tree -- bundling is the exact error that
+ * left this question open for two promotions.
+ *
+ * THE READOUT, pre-committed before the draw:
+ *   `mm[reg=167 ... occ=3]`  -> the revert took; the composite then answers,
+ *                               and a gain means the shipped cap costs prefill.
+ *   `mm[reg]` still 128      -> the revert did NOT take (the >= 12.4 arm still
+ *                               won, or ptxas landed at 128 on its own) and the
+ *                               draw is VOID -- read nothing from the score.
+ *   `mm[lmem] != 0`          -> the __launch_bounds__ path spilled; revert this
+ *                               revert regardless of the composite.
+ * Control for TU-wide ptxas drift with `gu`/`md` reg, never `gu5`/`gu8`/`dn`,
+ * which read instantiations that never launch. */
+#define QW_MMA_NO_OCC_CAP 1
+
+#if defined(__CUDACC__) && CUDART_VERSION >= 12040 &&                          \
+    !defined(QW_MMA_NO_OCC_CAP)
 #define QW_MMA_OCC_ATTR __maxnreg__(128)
 #else
 #define QW_MMA_OCC_ATTR                                                        \
