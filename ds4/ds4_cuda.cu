@@ -25519,7 +25519,10 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
     __shared__ uint64_t s_iq2_grid[256];
     __shared__ uint8_t s_iq2_signs[128];
     if (xq_blocks <= 16u) {
-        for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
+        const uint32_t xq_words = xq_blocks * (uint32_t)(sizeof(cuda_block_q8_K) / 4u);
+        uint32_t *sxq_w = (uint32_t *)sxq;
+        const uint32_t *xqb_w = (const uint32_t *)xqb;
+        for (uint32_t i = threadIdx.x; i < xq_words; i += blockDim.x) sxq_w[i] = xqb_w[i];
         for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
         for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
         __syncthreads();
@@ -25583,7 +25586,10 @@ __global__ static void moe_gate_up_mid_decode_lut_owned_qwarp32_kernel(
     __shared__ uint64_t s_iq2_grid[256];
     __shared__ uint8_t s_iq2_signs[128];
     if (xq_blocks <= 16u) {
-        for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
+        const uint32_t xq_words = xq_blocks * (uint32_t)(sizeof(cuda_block_q8_K) / 4u);
+        uint32_t *sxq_w = (uint32_t *)sxq;
+        const uint32_t *xqb_w = (const uint32_t *)xqb;
+        for (uint32_t i = threadIdx.x; i < xq_words; i += blockDim.x) sxq_w[i] = xqb_w[i];
         for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
         for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
         __syncthreads();
@@ -26451,7 +26457,10 @@ __global__ static void moe_gate_up_mid_decode_q4K_qwarp32_kernel(
     const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
     __shared__ cuda_block_q8_K sxq[16];
     if (xq_blocks <= 16u) {
-        for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
+        const uint32_t xq_words = xq_blocks * (uint32_t)(sizeof(cuda_block_q8_K) / 4u);
+        uint32_t *sxq_w = (uint32_t *)sxq;
+        const uint32_t *xqb_w = (const uint32_t *)xqb;
+        for (uint32_t i = threadIdx.x; i < xq_words; i += blockDim.x) sxq_w[i] = xqb_w[i];
         __syncthreads();
         xqb = sxq;
     }
@@ -26512,7 +26521,10 @@ __global__ static void moe_gate_up_mid_decode_q4K_hwarp16_kernel(
     const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
     __shared__ cuda_block_q8_K sxq[16];
     if (xq_blocks <= 16u) {
-        for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
+        const uint32_t xq_words = xq_blocks * (uint32_t)(sizeof(cuda_block_q8_K) / 4u);
+        uint32_t *sxq_w = (uint32_t *)sxq;
+        const uint32_t *xqb_w = (const uint32_t *)xqb;
+        for (uint32_t i = threadIdx.x; i < xq_words; i += blockDim.x) sxq_w[i] = xqb_w[i];
         __syncthreads();
         xqb = sxq;
     }
@@ -26569,7 +26581,10 @@ __global__ static void moe_gate_up_mid_decode_q4K_hwarp16_row8_kernel(
     const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
     __shared__ cuda_block_q8_K sxq[16];
     if (xq_blocks <= 16u) {
-        for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
+        const uint32_t xq_words = xq_blocks * (uint32_t)(sizeof(cuda_block_q8_K) / 4u);
+        uint32_t *sxq_w = (uint32_t *)sxq;
+        const uint32_t *xqb_w = (const uint32_t *)xqb;
+        for (uint32_t i = threadIdx.x; i < xq_words; i += blockDim.x) sxq_w[i] = xqb_w[i];
         __syncthreads();
         xqb = sxq;
     }
@@ -26630,7 +26645,10 @@ __global__ static void moe_gate_up_mid_decode_q4K_warp32_kernel(
     const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
     __shared__ cuda_block_q8_K sxq[16];
     if (xq_blocks <= 16u) {
-        for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
+        const uint32_t xq_words = xq_blocks * (uint32_t)(sizeof(cuda_block_q8_K) / 4u);
+        uint32_t *sxq_w = (uint32_t *)sxq;
+        const uint32_t *xqb_w = (const uint32_t *)xqb;
+        for (uint32_t i = threadIdx.x; i < xq_words; i += blockDim.x) sxq_w[i] = xqb_w[i];
         __syncthreads();
         xqb = sxq;
     }
@@ -26814,7 +26832,10 @@ __global__ static void moe_gate_up_mid_decode_q4K_warp32_noaux_sidecar_kernel(
     __shared__ float tile_vals[8];
     __shared__ float tile_abs[8];
     if (xq_blocks <= 16u) {
-        for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
+        const uint32_t xq_words = xq_blocks * (uint32_t)(sizeof(cuda_block_q8_K) / 4u);
+        uint32_t *sxq_w = (uint32_t *)sxq;
+        const uint32_t *xqb_w = (const uint32_t *)xqb;
+        for (uint32_t i = threadIdx.x; i < xq_words; i += blockDim.x) sxq_w[i] = xqb_w[i];
         __syncthreads();
         xqb = sxq;
     }
@@ -26897,7 +26918,10 @@ __global__ static void moe_gate_up_mid_decode_q4K_warp32_row16_kernel(
     const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
     __shared__ cuda_block_q8_K sxq[16];
     if (xq_blocks <= 16u) {
-        for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
+        const uint32_t xq_words = xq_blocks * (uint32_t)(sizeof(cuda_block_q8_K) / 4u);
+        uint32_t *sxq_w = (uint32_t *)sxq;
+        const uint32_t *xqb_w = (const uint32_t *)xqb;
+        for (uint32_t i = threadIdx.x; i < xq_words; i += blockDim.x) sxq_w[i] = xqb_w[i];
         __syncthreads();
         xqb = sxq;
     }
@@ -26958,7 +26982,10 @@ __global__ static void moe_gate_up_midq_decode_q4K_qwarp32_kernel(
     __shared__ float iscale_s;
 
     if (xq_blocks <= 16u) {
-        for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
+        const uint32_t xq_words = xq_blocks * (uint32_t)(sizeof(cuda_block_q8_K) / 4u);
+        uint32_t *sxq_w = (uint32_t *)sxq;
+        const uint32_t *xqb_w = (const uint32_t *)xqb;
+        for (uint32_t i = threadIdx.x; i < xq_words; i += blockDim.x) sxq_w[i] = xqb_w[i];
         __syncthreads();
         xqb = sxq;
     }
