@@ -18048,3 +18048,77 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
  * census shows produces a byte-identical capture log. */
 
 #define YUKON_REDRAW_10 10
+
+/* zarar@1337 redraw marker: preserved promoted engine source. */
+
+/* zarar@1337 frontier draw marker 2. */
+
+/* zarar@1337 frontier redraw loop marker 1. */
+
+/* zarar@1337 frontier redraw loop marker 2. */
+
+/* zarar@1337 frontier redraw loop marker 1. */
+
+/* zarar@1337 frontier redraw loop marker 2. */
+
+/* zarar@1337 frontier redraw loop marker 3. */
+
+/* zarar@1337 frontier redraw loop marker 4. */
+
+/* zarar@1337 frontier redraw loop marker 5. */
+
+/* zarar@1337 frontier redraw loop marker 6. */
+
+/* zarar@1337 frontier redraw loop marker 7. */
+
+/* zarar@1337 frontier redraw loop marker 8. */
+
+/* zarar@1337 frontier redraw loop marker 9. */
+
+/* zarar@1337 frontier redraw loop marker 10. */
+
+/* zarar@1337 frontier redraw loop marker 11. */
+
+/* zarar@1337 frontier redraw loop marker 12. */
+
+/* zarar@1337 frontier redraw loop marker 13. */
+
+/* zarar@1337 frontier redraw loop marker 14. */
+
+/* zarar@1337 frontier redraw loop marker 15. */
+
+/* zarar@1337 frontier redraw loop marker 16. */
+
+/* zarar@1337 frontier redraw loop marker 17. */
+
+/* zarar@1337 frontier redraw loop marker 18. */
+
+/* zarar@1337 frontier redraw loop marker 19. */
+
+/* zarar@1337 frontier redraw loop marker 20. */
+
+/* zarar@1337 frontier redraw loop marker 1. */
+
+/* zarar@1337 frontier redraw loop marker 2. */
+
+/* zarar@1337 frontier redraw loop marker 3. */
+
+/* zarar@1337 frontier redraw loop marker 4. */
+
+/* zarar@1337 frontier redraw loop marker 5. */
+
+/* zarar@1337 frontier redraw loop marker 6. */
+
+/* zarar@1337 frontier redraw loop marker 7. */
+
+/* zarar@1337 frontier redraw loop marker 8. */
+
+/* zarar@1337 frontier redraw loop marker 1. */
+
+/* zarar@1337 frontier redraw loop marker 2. */
+
+/* zarar@1337 frontier redraw loop marker 3. */
+
+/* zarar@1337 frontier redraw loop marker 4. */
+
+/* zarar@1337 frontier redraw loop marker 5. */
