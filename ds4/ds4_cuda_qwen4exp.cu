@@ -1774,6 +1774,235 @@ qwen4exp_gdn_octet_kernel(
     }
 }
 
+/* =========================================================================
+ * THE DECODE REPLAY RECURRENCE, EIGHT LANES PER VALUE ROW.
+ *
+ * WHY THIS EXISTS.  The three kernels above are a ladder of increasingly
+ * efficient GDN recurrences -- value reuse, split reduce, and the octet
+ * kernel with its pinned arithmetic and operand double buffer -- and every
+ * one of them is PREFILL ONLY.  The octet header says why: "Decode and
+ * speculative verify never reach this gate", and the split-reduce header
+ * gives the reason as "the decode and verify widths carry no precomputed
+ * gates and stay on qwen4exp_gdn_recurrence_kernel<false>".
+ *
+ * THAT REASON NO LONGER HOLDS.  The shipped decode path is the lazy-rollback
+ * replay, and qwen4exp_gdn_replay_gates_kernel takes a `gate_pairs` pointer:
+ * the convolution publishes the current gates into s->gdn_replay_gates, armed
+ * whenever n_key_head == 16 and n_value_head == 48, which ds4.c ships.  So
+ * decode DOES carry precomputed gates, and it has been paying the one-row
+ * 32-lane butterfly anyway.  The exclusion is stale, not structural.
+ *
+ * WHAT IT COSTS TO KEEP THE ONE-ROW SHAPE.  The shipped decode launch is
+ * dim3(n_value_head, QWEN4EXP_GDN_DIM / 4, n_rows) = dim3(48, 32, 1), which
+ * is 1536 blocks of 128 threads = 6144 warps, one value row per warp, and at
+ * four blocks per SM on 48 SMs that drains in EIGHT waves.  Each warp pays
+ * two five-level xor butterflies per step -- ten shuffles and ten dependent
+ * adds per value row per token -- on the recurrence's critical path, because
+ * the second reduction reads the state the first one updated.
+ *
+ * At R = QWEN4EXP_GDN_OCTET_ROWS the same work is dim3(48, 4, 1) = 192 blocks,
+ * which the octet header already identifies as "the single-wave geometry on 48
+ * SMs".  A row costs 6/4 = 1.5 shuffle issues per token instead of 10, and the
+ * warp reads one q and one k row for four value rows instead of four times
+ * over, because neither operand depends on `value`.
+ *
+ * BIT-EXACTNESS, which is mandatory here and is the whole reason this is a
+ * port rather than a rewrite.  The step below performs, operand for operand
+ * and rounding point for rounding point, what qwen4exp_gdn_replay_gates_kernel
+ * performs, using the SAME helpers the prefill octet kernel uses:
+ *   - decay is one __fmul_rn per element, as `h.x *= g` compiles to;
+ *   - each quad's dot is qwen4exp_gdn_dot4_pinned, which spells the
+ *     contraction plain dot4_f32 compiles to and pins it so it cannot drift;
+ *   - the five-level sum tree is qwen4exp_gdn_fold4 (levels 16 and 8, as two
+ *     local adds of exactly the pairs those levels pair) composed with
+ *     qwen4exp_gdn_octet_sum (levels 4, 2, 1, inside the segment).  The xor
+ *     butterfly leaves every lane the same float because IEEE addition is
+ *     commutative, and commutativity is the only property the fold relies on;
+ *   - delta is __fsub_rn then __fmul_rn, and the update is __fmaf_rn.
+ * No value crosses between value rows, and the state, the output, the tape
+ * records and the checkpoint are written at the same addresses.
+ *
+ * The one assumption this shares with the three kernels above is that plain
+ * dot4_f32 contracts to qwen4exp_gdn_dot4_pinned's sequence on this
+ * toolchain.  That assumption is already load-bearing at prefill on the
+ * frontier: the value-reuse and octet kernels run there against an
+ * exact-token golden, and the state they leave is what decode continues from,
+ * so a mismatch would already be drifting tokens today.
+ *
+ * Off with DS4_QWEN4EXP_NO_GDN_REPLAY_OCTET=1, which restores the one-row
+ * kernel exactly.
+ * ========================================================================= */
+template <unsigned R>
+__global__ static void qwen4exp_gdn_replay_gates_octet_kernel(
+        float *out, float *state, float *checkpoint, float *tape,
+        const float *qkv, const float2 *gate_pairs,
+        uint32_t n_key_head, uint32_t n_value_head, uint32_t n_tokens,
+        uint32_t head_layout, const uint32_t *control, uint32_t replay_rows) {
+    static_assert(QWEN4EXP_GDN_DIM % (4u * QWEN4EXP_GDN_OCTET_SEGMENTS * R) == 0u,
+                  "value rows per block must divide the head");
+    const uint32_t head = blockIdx.x;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t seg = lane >> 3u;   /* which value-row group of the warp */
+    const uint32_t j = lane & 7u;      /* lane within the eight-lane segment */
+    const uint32_t value0 =
+        ((blockIdx.y * 4u + warp) * QWEN4EXP_GDN_OCTET_SEGMENTS + seg) * R;
+    /* Every guard here must be WARP-uniform, because the reduction below is a
+     * full-mask butterfly: a lane that returns early while its segment
+     * partners shuffle is undefined behaviour.  `head` is blockIdx.x and the
+     * row bound is tested against the LAST row the warp carries, not this
+     * lane's, so both are uniform across the warp by construction. */
+    const uint32_t warp_row_end =
+        ((blockIdx.y * 4u + warp) + 1u) * QWEN4EXP_GDN_OCTET_SEGMENTS * R;
+    if (head >= n_value_head || warp_row_end > QWEN4EXP_GDN_DIM) return;
+    const uint32_t prefix = control ? *control : replay_rows;
+    if (prefix > DS4_QWEN4EXP_GDN_REPLAY_ROWS) return;
+    const uint32_t key_dim = n_key_head * QWEN4EXP_GDN_DIM;
+    const uint32_t value_dim = n_value_head * QWEN4EXP_GDN_DIM;
+    const uint32_t conv_dim = 2u * key_dim + value_dim;
+    const uint32_t tape_stride = (key_dim + value_dim + 2u * n_value_head + 3u) & ~3u;
+    const uint32_t repeats = n_value_head / n_key_head;
+    const uint32_t key_head = head_layout != 0u ? head % n_key_head : head / repeats;
+    const uint32_t key_writer = head_layout != 0u ? key_head : key_head * repeats;
+    /* Quad m of this lane is original lane j + 8m: key columns 4j + 32m. */
+    const uint32_t c0 = j * 4u;
+    const uint64_t state_base = ((uint64_t)head * QWEN4EXP_GDN_DIM + value0) *
+                               QWEN4EXP_GDN_DIM + c0;
+    float4 h[R][QWEN4EXP_GDN_OCTET_QUADS];
+#pragma unroll
+    for (unsigned r = 0; r < R; r++) {
+#pragma unroll
+        for (unsigned m = 0; m < QWEN4EXP_GDN_OCTET_QUADS; m++) {
+            h[r][m] = *(const float4 *)(checkpoint + state_base +
+                r * QWEN4EXP_GDN_DIM + m * 32u);
+        }
+    }
+    for (uint32_t step = 0; step < prefix + n_tokens; step++) {
+        const bool replay = step < prefix;
+        const uint32_t token = replay ? 0u : step - prefix;
+        const float *const saved = tape + (uint64_t)(replay ? step : 0u) * tape_stride;
+        const uint64_t base = (uint64_t)token * conv_dim + key_head * QWEN4EXP_GDN_DIM;
+        const float *const kp = replay
+            ? saved + key_head * QWEN4EXP_GDN_DIM + c0
+            : qkv + base + key_dim + c0;
+        float4 k4[QWEN4EXP_GDN_OCTET_QUADS];
+#pragma unroll
+        for (unsigned m = 0; m < QWEN4EXP_GDN_OCTET_QUADS; m++) {
+            k4[m] = *(const float4 *)(kp + m * 32u);
+        }
+        /* The eight lanes of a segment want the same scalar and the segments
+         * want R adjacent ones: one transaction, broadcast. */
+        const float *const vp = replay
+            ? saved + key_dim + head * QWEN4EXP_GDN_DIM + value0
+            : qkv + (uint64_t)token * conv_dim + 2u * (uint64_t)key_dim +
+              head * QWEN4EXP_GDN_DIM + value0;
+        float v_row[R];
+#pragma unroll
+        for (unsigned r = 0; r < R; r++) v_row[r] = vp[r];
+        /* The gate pair depends on the head only, so it is the same float2 for
+         * every value row the warp carries. */
+        float2 pair;
+        if (replay) {
+            pair = ((const float2 *)(saved + key_dim + value_dim))[head];
+        } else {
+            pair = gate_pairs[(uint64_t)token * n_value_head + head];
+            if (token == 0u && prefix < DS4_QWEN4EXP_GDN_REPLAY_ROWS) {
+                float *const record = tape + (uint64_t)prefix * tape_stride;
+                /* One segment owns the whole 128-column key row: its eight
+                 * lanes hold four quads each. */
+                if (value0 == 0u && head == key_writer) {
+#pragma unroll
+                    for (unsigned m = 0; m < QWEN4EXP_GDN_OCTET_QUADS; m++) {
+                        *(float4 *)(record + key_head * QWEN4EXP_GDN_DIM +
+                                    c0 + m * 32u) = k4[m];
+                    }
+                }
+                if (j == 0u) {
+#pragma unroll
+                    for (unsigned r = 0; r < R; r++) {
+                        record[key_dim + head * QWEN4EXP_GDN_DIM + value0 + r] =
+                            v_row[r];
+                    }
+                    if (value0 == 0u) {
+                        ((float2 *)(record + key_dim + value_dim))[head] = pair;
+                    }
+                }
+            }
+        }
+        const float g = pair.x;
+        const float beta = pair.y;
+        float hk[R];
+#pragma unroll
+        for (unsigned r = 0; r < R; r++) {
+            float p[QWEN4EXP_GDN_OCTET_QUADS];
+#pragma unroll
+            for (unsigned m = 0; m < QWEN4EXP_GDN_OCTET_QUADS; m++) {
+                h[r][m].x = __fmul_rn(h[r][m].x, g);
+                h[r][m].y = __fmul_rn(h[r][m].y, g);
+                h[r][m].z = __fmul_rn(h[r][m].z, g);
+                h[r][m].w = __fmul_rn(h[r][m].w, g);
+                p[m] = qwen4exp_gdn_dot4_pinned(h[r][m], k4[m]);
+            }
+            hk[r] = qwen4exp_gdn_fold4(p[0], p[1], p[2], p[3]);
+        }
+        qwen4exp_gdn_octet_sum<R>(hk);
+#pragma unroll
+        for (unsigned r = 0; r < R; r++) {
+            const float delta_v = __fmul_rn(__fsub_rn(v_row[r], hk[r]), beta);
+#pragma unroll
+            for (unsigned m = 0; m < QWEN4EXP_GDN_OCTET_QUADS; m++) {
+                h[r][m].x = __fmaf_rn(k4[m].x, delta_v, h[r][m].x);
+                h[r][m].y = __fmaf_rn(k4[m].y, delta_v, h[r][m].y);
+                h[r][m].z = __fmaf_rn(k4[m].z, delta_v, h[r][m].z);
+                h[r][m].w = __fmaf_rn(k4[m].w, delta_v, h[r][m].w);
+            }
+        }
+        if (!replay) {
+            float4 q4[QWEN4EXP_GDN_OCTET_QUADS];
+#pragma unroll
+            for (unsigned m = 0; m < QWEN4EXP_GDN_OCTET_QUADS; m++) {
+                q4[m] = *(const float4 *)(qkv + base + c0 + m * 32u);
+            }
+            float res[R];
+#pragma unroll
+            for (unsigned r = 0; r < R; r++) {
+                float p[QWEN4EXP_GDN_OCTET_QUADS];
+#pragma unroll
+                for (unsigned m = 0; m < QWEN4EXP_GDN_OCTET_QUADS; m++) {
+                    p[m] = qwen4exp_gdn_dot4_pinned(h[r][m], q4[m]);
+                }
+                res[r] = qwen4exp_gdn_fold4(p[0], p[1], p[2], p[3]);
+            }
+            qwen4exp_gdn_octet_sum<R>(res);
+            if (j == 0u) {
+#pragma unroll
+                for (unsigned r = 0; r < R; r++) {
+                    out[(uint64_t)token * value_dim + head * QWEN4EXP_GDN_DIM +
+                        value0 + r] = res[r];
+                }
+            }
+            if (token == 0u && prefix == DS4_QWEN4EXP_GDN_REPLAY_ROWS) {
+#pragma unroll
+                for (unsigned r = 0; r < R; r++) {
+#pragma unroll
+                    for (unsigned m = 0; m < QWEN4EXP_GDN_OCTET_QUADS; m++) {
+                        *(float4 *)(checkpoint + state_base +
+                            r * QWEN4EXP_GDN_DIM + m * 32u) = h[r][m];
+                    }
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (unsigned r = 0; r < R; r++) {
+#pragma unroll
+        for (unsigned m = 0; m < QWEN4EXP_GDN_OCTET_QUADS; m++) {
+            *(float4 *)(state + state_base + r * QWEN4EXP_GDN_DIM + m * 32u) =
+                h[r][m];
+        }
+    }
+}
+
 /* Sigmoid-gated RMS output norm.  The weight is a plain scale, not an
  * offset-baked one, so it multiplies the normalised row directly. */
 __global__ static void qwen4exp_gdn_output_kernel(
@@ -2857,13 +3086,33 @@ static int qwen4exp_cuda_gdn_run(
     const dim3 recurrence_grid(
         n_value_head, QWEN4EXP_GDN_DIM / 4u, n_rows);
     if (replay_gates) {
-        qwen4exp_gdn_replay_gates_kernel<<<recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
-            (float *)out->ptr, (float *)recurrent_state->ptr,
-            (float *)replay->checkpoint->ptr, (float *)replay->tape->ptr,
-            (const float *)qkv->ptr, (const float *)raw_alpha->ptr,
-            (const float *)raw_beta->ptr, replay_gates,
-            n_key_head, n_value_head, n_tokens, head_layout,
-            (const uint32_t *)replay->control->ptr, 0u);
+        /* The decode recurrence, eight lanes per value row.  Same geometry
+         * rule as the prefill octet kernel above: 16R value rows per block,
+         * so QWEN4EXP_GDN_DIM / 16R blocks along y, which is 192 blocks of
+         * 128 threads at R = 2 against the one-row kernel's 1536.  The
+         * arithmetic is bit-identical (see the kernel header); off with
+         * DS4_QWEN4EXP_NO_GDN_REPLAY_OCTET to restore the one-row form. */
+        if (n_key_head == 16u && n_value_head == 48u &&
+            getenv("DS4_QWEN4EXP_NO_GDN_REPLAY_OCTET") == NULL) {
+            qwen4exp_gdn_replay_gates_octet_kernel<QWEN4EXP_GDN_OCTET_ROWS><<<
+                    dim3(n_value_head,
+                         QWEN4EXP_GDN_DIM / (16u * QWEN4EXP_GDN_OCTET_ROWS),
+                         n_rows),
+                    QWEN4EXP_GDN_DIM, 0, stream>>>(
+                (float *)out->ptr, (float *)recurrent_state->ptr,
+                (float *)replay->checkpoint->ptr, (float *)replay->tape->ptr,
+                (const float *)qkv->ptr, replay_gates,
+                n_key_head, n_value_head, n_tokens, head_layout,
+                (const uint32_t *)replay->control->ptr, 0u);
+        } else {
+            qwen4exp_gdn_replay_gates_kernel<<<recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
+                (float *)out->ptr, (float *)recurrent_state->ptr,
+                (float *)replay->checkpoint->ptr, (float *)replay->tape->ptr,
+                (const float *)qkv->ptr, (const float *)raw_alpha->ptr,
+                (const float *)raw_beta->ptr, replay_gates,
+                n_key_head, n_value_head, n_tokens, head_layout,
+                (const uint32_t *)replay->control->ptr, 0u);
+        }
     } else if (replay) {
         qwen4exp_gdn_replay_kernel<<<recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
             (float *)out->ptr, (float *)recurrent_state->ptr,
@@ -17839,6 +18088,8 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
     int md_regs = -1, md_smem = -1, md_lmem = -1, md_occ = -1;
     /* The drift control: a kernel nobody in this line of work has touched. */
     int gd_regs = -1, gd_lmem = -1;
+    int r1_regs = -1, r1_lmem = -1, r1_occ = -1;
+    int ro_regs = -1, ro_lmem = -1, ro_occ = -1;
 
     cudaFuncAttributes a;
     if (cudaFuncGetAttributes(
@@ -17896,6 +18147,43 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
         cudaSuccess) {
         gd_regs = a.numRegs;
         gd_lmem = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+
+    /* ---- THE TWO DECODE GDN RECURRENCES, SIDE BY SIDE IN ONE COMPILATION ----
+     * `gdn[...]` above is the PREFILL octet kernel, and reading it as the GDN
+     * kernel was a mistake this file's own comments repeated: the shipped decode
+     * recurrence is qwen4exp_gdn_replay_gates_kernel, whose register count no
+     * arm has ever read.  `rg1` is that one-row kernel; `rgo` is the eight-lanes-
+     * per-value-row port of it that this tree dispatches instead.
+     *
+     * Reading BOTH matters more than reading either.  ptxas allocates registers
+     * translation-unit-wide and the probe comment above records the same
+     * unchanged source reporting 40, 60, 56 and 47 across four builds, so an
+     * absolute count from one draw proves nothing.  A DIFFERENCE between two
+     * kernels measured in the same compilation is not exposed to that drift.
+     *
+     * Pre-committed reads, so the next arm is not chosen after the fact:
+     *   rgo[lmem] != 0        -> revert, whatever the composite says.  A spill
+     *                            inside a serial recurrence is fatal, and R rows
+     *                            of four float4 is 32 live floats per lane
+     *                            against the one-row kernel's 4.
+     *   rgo[occ] <= rg1[occ]  -> the wave-count half of the argument is wrong and
+     *                            only the 6.7x shuffle reduction is left.
+     *   rgo[occ] >= 8         -> 192 blocks land in one wave as intended. */
+    if (cudaFuncGetAttributes(&a, qwen4exp_gdn_replay_gates_kernel) ==
+        cudaSuccess) {
+        r1_regs = a.numRegs;
+        r1_lmem = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaFuncGetAttributes(
+            &a, qwen4exp_gdn_replay_gates_octet_kernel<QWEN4EXP_GDN_OCTET_ROWS>) ==
+        cudaSuccess) {
+        ro_regs = a.numRegs;
+        ro_lmem = (int)a.localSizeBytes;
     } else {
         (void)cudaGetLastError();
     }
@@ -18025,9 +18313,26 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
         (void)cudaGetLastError();
     }
 
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ, qwen4exp_gdn_replay_gates_kernel,
+            (int)QWEN4EXP_GDN_DIM, 0) == cudaSuccess) {
+        r1_occ = occ;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ,
+            qwen4exp_gdn_replay_gates_octet_kernel<QWEN4EXP_GDN_OCTET_ROWS>,
+            (int)QWEN4EXP_GDN_DIM, 0) == cudaSuccess) {
+        ro_occ = occ;
+    } else {
+        (void)cudaGetLastError();
+    }
+
     snprintf(buf, sizeof(buf),
              "gu[reg=%d smem=%d lmem=%d maxt=%d occ=%d] dn[reg=%d smem=%d "
              "lmem=%d maxt=%d occ=%d] gdn[reg=%d lmem=%d] "
+             "rg1[reg=%d lmem=%d occ=%d] rgo[reg=%d lmem=%d occ=%d] "
              "mm[reg=%d smem=%d lmem=%d occ=%d] "
              "md[reg=%d smem=%d lmem=%d occ=%d] "
              "gu5[reg=%d smem=%d lmem=%d occ=%d] "
@@ -18035,6 +18340,7 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
              gu_regs, gu_smem, gu_lmem, gu_maxt, gu_occ,
              dn_regs, dn_smem, dn_lmem, dn_maxt, dn_occ,
              gd_regs, gd_lmem,
+             r1_regs, r1_lmem, r1_occ, ro_regs, ro_lmem, ro_occ,
              mg_regs, mg_smem, mg_lmem, mg_occ,
              md_regs, md_smem, md_lmem, md_occ,
              g5_regs, g5_smem, g5_lmem, g5_occ,
