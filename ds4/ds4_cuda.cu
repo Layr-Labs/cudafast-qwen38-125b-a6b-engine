@@ -11809,7 +11809,17 @@ __global__ static void attention_decode_splitkv_kernel(
     for (uint32_t r = raw_lo + threadIdx.x; r < raw_hi; r += blockDim.x) {
         raw_rows[r - raw_lo] = (raw_start + raw_first_idx + r) % raw_cap;
     }
+    /* The chunk's rows all dot against the same query row, so stage it beside
+     * the raw row map and reuse the barrier below. */
+    __shared__ float q_stage[512];
+    const bool q_staged = head_dim <= 512u;
+    if (q_staged) {
+        for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            q_stage[d] = qh[d];
+        }
+    }
     __syncthreads();
+    if (q_staged) qh = q_stage;
     float *pout = partials + (((uint64_t)t * n_head + h) * S + j) * (head_dim + 2u);
     /* Pass 1: scores for this chunk's rows into shared scores[0..cnt). */
     float local_max = -INFINITY;
