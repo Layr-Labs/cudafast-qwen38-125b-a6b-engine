@@ -27158,25 +27158,48 @@ __global__ static void moe_down_owned_slots_qwarp32_kernel(
         uint32_t out_dim,
         uint32_t expert_base,
         uint32_t expert_count) {
+    /* perf-10: TWO ROW TILES PER BLOCK.
+     *
+     * The down-projection weight rows a block reads are its own, but the
+     * slot's quantised intermediate activation is read whole by every block
+     * of the slot column, so this step's activation traffic is proportional
+     * to the block count and not to the work.  At 32 rows per block the
+     * grid over the model width issues far more blocks than the device can
+     * hold resident; the surplus blocks add no parallelism the SMs can use
+     * and only pull the activation through again, on the decode leg.  Two
+     * tiles of 32 halve the block count and halve those passes.  The slot's
+     * ownership test and its activation base depend on the grid column
+     * alone, so they stay once per block and both tiles reuse them; a slot
+     * this rank does not own still leaves immediately, at no row.
+     *
+     * MOE_DOWN_OWNED_ROW_TILES = 1u restores the shipped geometry. */
+#ifndef MOE_DOWN_OWNED_ROW_TILES
+#define MOE_DOWN_OWNED_ROW_TILES 2u
+#endif
+#define MOE_DOWN_OWNED_ROWS_PER_BLOCK (32u * MOE_DOWN_OWNED_ROW_TILES)
     const uint32_t lane = threadIdx.x & 7u;
-    const uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
     const uint32_t slot = blockIdx.y;
-    if (row >= out_dim || slot >= 6u) return;
+    if (slot >= 6u) return;
     uint32_t expert = 0;
     if (!moe_owned_local_expert(selected[slot], expert_base,
                                 expert_count, &expert)) {
         return;
     }
-    const cuda_block_q2_K *wr =
-        (const cuda_block_q2_K *)(down_base +
-            (uint64_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes);
     const cuda_block_q8_K *xq = midq + (uint64_t)slot * midq_blocks;
-    float acc = 0.0f;
-    for (uint32_t b = lane; b < midq_blocks; b += 8u) {
-        acc += dev_dot_q2_K_q8_K_block(wr + b, xq + b);
+    for (uint32_t rr = 0; rr < MOE_DOWN_OWNED_ROW_TILES; rr++) {
+        const uint32_t row = blockIdx.x * MOE_DOWN_OWNED_ROWS_PER_BLOCK
+                           + (threadIdx.x >> 3u) + rr * 32u;
+        if (row >= out_dim) continue;
+        const cuda_block_q2_K *wr =
+            (const cuda_block_q2_K *)(down_base +
+                (uint64_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes);
+        float acc = 0.0f;
+        for (uint32_t b = lane; b < midq_blocks; b += 8u) {
+            acc += dev_dot_q2_K_q8_K_block(wr + b, xq + b);
+        }
+        acc = quarter_warp_sum_f32(acc, lane);
+        if (lane == 0) down_out[(uint64_t)slot * out_dim + row] = acc;
     }
-    acc = quarter_warp_sum_f32(acc, lane);
-    if (lane == 0) down_out[(uint64_t)slot * out_dim + row] = acc;
 }
 
 /* Map one of two packed operands for a three-slot reduction group. The only
@@ -31004,7 +31027,11 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
                 resident_expert_base,
                 resident_expert_count);
     } else {
-        moe_down_owned_slots_qwarp32_kernel<<<down_grid, 256>>>(
+        /* Divisor follows the kernel's row tile; the packed and Q4_K owned
+         * forms above keep the shipped down_grid. */
+        const dim3 down_grid_t((out_dim + MOE_DOWN_OWNED_ROWS_PER_BLOCK - 1u)
+                               / MOE_DOWN_OWNED_ROWS_PER_BLOCK, down_grid.y, 1u);
+        moe_down_owned_slots_qwarp32_kernel<<<down_grid_t, 256>>>(
                 down_dst,
                 down_w,
                 midq,
