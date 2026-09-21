@@ -15891,7 +15891,16 @@ qwen4exp_qsa_split_scores_kernel(
     }
 }
 
-template <uint32_t GROUP, uint32_t VSTEP>
+/* The running maximum through the tile prefix is the same for every thread
+ * in a probability block.  The original spelling recomputed that prefix in
+ * all 256 threads, even though only GROUP values exist.  Keep a valve for
+ * byte-for-byte A/B checks, while the default computes each head's prefix in
+ * one lane and broadcasts it through shared memory. */
+static int qwen4exp_qsa_split_mmax_off(void) {
+    return getenv("DS4_QWEN4EXP_NO_QSA_SPLIT_MMAX") != NULL;
+}
+
+template <uint32_t GROUP, uint32_t VSTEP, bool PREFIX_SHARED = true>
 __global__ static void __launch_bounds__(256, 1)
 qwen4exp_qsa_split_probs_kernel(
         const float *v_cache,
@@ -15931,6 +15940,7 @@ qwen4exp_qsa_split_probs_kernel(
     float *trow = qwen4exp_attn_pr_shared;           /* GROUP * nth      */
     float *probs = trow + GROUP * nth;               /* GROUP * nth      */
     int32_t *keys = (int32_t *)(probs + GROUP * nth);/* nth              */
+    float *prefix = (float *)(keys + nth);             /* GROUP running maxima */
 
     const int32_t key = qwen4exp_qsa_tile_key(selected, token, max_selected,
                                               base, tid, n_in_tile, cache_cap,
@@ -15943,15 +15953,33 @@ qwen4exp_qsa_split_probs_kernel(
      * GROUP heads' loads are asked for together, ahead of the barriers. */
     float m[GROUP];
     float p[GROUP];
-#pragma unroll
-    for (uint32_t h = 0; h < GROUP; h++) {
-        m[h] = QWEN4EXP_QSA_MASKED_SCORE;
-        p[h] = sc[(row + h * max_tiles) * nth + tid];
-    }
-    for (uint32_t t = 0; t <= tile; t++) {
+    if (PREFIX_SHARED) {
+        /* One lane owns each head's prefix; every other lane only consumes
+         * the resulting value.  The fmaxf chain and its order are unchanged
+         * from the old all-lanes loop. */
+        if (tid < GROUP) {
+            float v = QWEN4EXP_QSA_MASKED_SCORE;
+            for (uint32_t t = 0; t <= tile; t++)
+                v = fmaxf(v, tmax[row + tid * max_tiles - tile + t]);
+            prefix[tid] = v;
+        }
+        __syncthreads();
 #pragma unroll
         for (uint32_t h = 0; h < GROUP; h++) {
-            m[h] = fmaxf(m[h], tmax[row + h * max_tiles - tile + t]);
+            m[h] = prefix[h];
+            p[h] = sc[(row + h * max_tiles) * nth + tid];
+        }
+    } else {
+#pragma unroll
+        for (uint32_t h = 0; h < GROUP; h++) {
+            m[h] = QWEN4EXP_QSA_MASKED_SCORE;
+            p[h] = sc[(row + h * max_tiles) * nth + tid];
+        }
+        for (uint32_t t = 0; t <= tile; t++) {
+#pragma unroll
+            for (uint32_t h = 0; h < GROUP; h++) {
+                m[h] = fmaxf(m[h], tmax[row + h * max_tiles - tile + t]);
+            }
         }
     }
 #pragma unroll
@@ -16030,6 +16058,15 @@ qwen4exp_qsa_split_probs_kernel(
     }
 }
 
+/* The tile fold has the same prefix statistics for every output channel in a
+ * head.  Keep an A/B valve for the original all-lanes spelling while the
+ * default computes each tile rescale and the final denominator once in lane
+ * zero, then broadcasts the tiny statistics row through shared memory. */
+static int qwen4exp_qsa_split_fold_stats_off(void) {
+    return getenv("DS4_QWEN4EXP_NO_QSA_SPLIT_FOLD_STATS") != NULL;
+}
+
+template <bool STATS_SHARED = true>
 __global__ static void qwen4exp_qsa_split_fold_kernel(
         const float *tmax,
         const float *tsum,
@@ -16057,16 +16094,37 @@ __global__ static void qwen4exp_qsa_split_fold_kernel(
     }
     const uint32_t n_tiles = (count + tile_width - 1u) / tile_width;
     const uint64_t row = ((uint64_t)token * n_head + head) * max_tiles;
-    float run_max = QWEN4EXP_QSA_MASKED_SCORE;
+    extern __shared__ float fold_stats[];
     float run_sum = 0.0f;
     float acc = 0.0f;
-    for (uint32_t t = 0; t < n_tiles; t++) {
-        const float new_max = fmaxf(run_max, tmax[row + t]);
-        const float rescale = (run_max > QWEN4EXP_QSA_MASKED_LIMIT)
-            ? expf(run_max - new_max) : 0.0f;
-        run_sum = __fmaf_rn(run_sum, rescale, tsum[row + t]);
-        acc = __fmaf_rn(acc, rescale, ct[(row + t) * head_dim + tid]);
-        run_max = new_max;
+    if (STATS_SHARED) {
+        if (tid == 0u) {
+            float run_max = QWEN4EXP_QSA_MASKED_SCORE;
+            for (uint32_t t = 0; t < n_tiles; t++) {
+                const float new_max = fmaxf(run_max, tmax[row + t]);
+                const float rescale = (run_max > QWEN4EXP_QSA_MASKED_LIMIT)
+                    ? expf(run_max - new_max) : 0.0f;
+                fold_stats[t] = rescale;
+                run_sum = __fmaf_rn(run_sum, rescale, tsum[row + t]);
+                run_max = new_max;
+            }
+            fold_stats[n_tiles] = run_sum;
+        }
+        __syncthreads();
+        run_sum = fold_stats[n_tiles];
+        for (uint32_t t = 0; t < n_tiles; t++) {
+            acc = __fmaf_rn(acc, fold_stats[t], ct[(row + t) * head_dim + tid]);
+        }
+    } else {
+        float run_max = QWEN4EXP_QSA_MASKED_SCORE;
+        for (uint32_t t = 0; t < n_tiles; t++) {
+            const float new_max = fmaxf(run_max, tmax[row + t]);
+            const float rescale = (run_max > QWEN4EXP_QSA_MASKED_LIMIT)
+                ? expf(run_max - new_max) : 0.0f;
+            run_sum = __fmaf_rn(run_sum, rescale, tsum[row + t]);
+            acc = __fmaf_rn(acc, rescale, ct[(row + t) * head_dim + tid]);
+            run_max = new_max;
+        }
     }
     dst[tid] = (run_sum > 0.0f) ? acc / run_sum : 0.0f;
 }
@@ -16840,8 +16898,12 @@ static int qwen4exp_qsa_split_shared_fits(uint32_t g, uint32_t head_dim,
                               (((size_t)g * (nth >> 5u) + 3u) & ~(size_t)3u) +
                               (size_t)nth * QWEN4EXP_QSA_SPLIT_KPITCH) *
                              sizeof(float);
+    /* The probability kernel keeps GROUP prefix maxima in shared memory so
+     * one lane computes each tile's running fmaxf chain.  The disabled A/B
+     * spelling uses the same allocation and simply leaves this tail unused. */
     const size_t pr_shared = (size_t)2u * g * nth * sizeof(float) +
-                             (size_t)nth * sizeof(int32_t);
+                             (size_t)nth * sizeof(int32_t) +
+                             (size_t)g * sizeof(float);
     if (sc_out) *sc_out = sc_shared;
     if (pr_out) *pr_out = pr_shared;
     return (sc_shared <= QWEN4EXP_QSA_GROUP_SHARED_CAP &&
@@ -17230,11 +17292,19 @@ static int qwen4exp_qsa_attention_split(
             (const float *)q->ptr, (const float *)k_cache->ptr, sel, cnt,     \
             sc, tmax, n_tokens, n_head, n_kv_head, head_dim, pos0, cache_cap, \
             max_selected, sparse ? 1u : 0u, max_tiles, scale, d_pos);         \
-    qwen4exp_qsa_split_probs_kernel<G, V><<<grid, nth, pr_shared,                \
-        cuda_decode_stream()>>>(                                              \
-            (const float *)v_cache->ptr, sel, cnt, sc, tmax, ct, tsum,        \
-            n_tokens, n_head, n_kv_head, head_dim, pos0, cache_cap,           \
-            max_selected, sparse ? 1u : 0u, max_tiles, d_pos)
+    if (qwen4exp_qsa_split_mmax_off()) {                                      \
+        qwen4exp_qsa_split_probs_kernel<G, V, false><<<grid, nth, pr_shared, \
+            cuda_decode_stream()>>>(                                         \
+                (const float *)v_cache->ptr, sel, cnt, sc, tmax, ct, tsum,   \
+                n_tokens, n_head, n_kv_head, head_dim, pos0, cache_cap,      \
+                max_selected, sparse ? 1u : 0u, max_tiles, d_pos);           \
+    } else {                                                                  \
+        qwen4exp_qsa_split_probs_kernel<G, V, true><<<grid, nth, pr_shared,  \
+            cuda_decode_stream()>>>(                                         \
+                (const float *)v_cache->ptr, sel, cnt, sc, tmax, ct, tsum,   \
+                n_tokens, n_head, n_kv_head, head_dim, pos0, cache_cap,      \
+                max_selected, sparse ? 1u : 0u, max_tiles, d_pos);           \
+    }
     /* The reduced dense V prefetch depth belongs to the ROW COUNT, not to the
      * width.  It arrived attached to `case 2u` because 2 was the only width one
      * row ever took, so the two were the same condition; once the one-wave rule
@@ -17287,10 +17357,18 @@ static int qwen4exp_qsa_attention_split(
     }
 #undef QWEN4EXP_QSA_SPLIT_LAUNCH_ROWDEPTH
 #undef QWEN4EXP_QSA_SPLIT_LAUNCH
-    qwen4exp_qsa_split_fold_kernel<<<dim3(n_head, n_tokens), head_dim, 0,
-        cuda_decode_stream()>>>(
+    const size_t fold_shared = ((size_t)max_tiles + 1u) * sizeof(float);
+    if (qwen4exp_qsa_split_fold_stats_off()) {
+        qwen4exp_qsa_split_fold_kernel<false><<<dim3(n_head, n_tokens), head_dim,
+            fold_shared, cuda_decode_stream()>>>(
             tmax, tsum, ct, cnt, (float *)out->ptr, n_tokens, n_head,
             head_dim, pos0, sparse ? 1u : 0u, max_tiles, nth, d_pos);
+    } else {
+        qwen4exp_qsa_split_fold_kernel<true><<<dim3(n_head, n_tokens), head_dim,
+            fold_shared, cuda_decode_stream()>>>(
+            tmax, tsum, ct, cnt, (float *)out->ptr, n_tokens, n_head,
+            head_dim, pos0, sparse ? 1u : 0u, max_tiles, nth, d_pos);
+    }
     return cuda_ok(cudaGetLastError(), "Qwen4-Exp QSA split attention launch")
         ? 1 : -1;
 }
