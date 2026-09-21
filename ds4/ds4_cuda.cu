@@ -27216,8 +27216,11 @@ __device__ __forceinline__ static int moe_owned_packed_component(
     return -1;
 }
 
-/* One thread owns an output column and loads all source slots before writing.
- * This permits packed_out == slots for the non-peer-copy fallback. */
+/* One thread owns an output column. The four packed operands are resolved once
+ * per block, because the resolution is a function of the selection array alone
+ * and is identical for every column. Each thread then loads only the source
+ * slots its own operands name, and every load is issued before any store, so
+ * packed_out == slots stays permitted for the non-peer-copy fallback. */
 __global__ static void moe_down_owned_pack_f32_slots_kernel(
         float *packed_out,
         const float *slots,
@@ -27225,30 +27228,40 @@ __global__ static void moe_down_owned_pack_f32_slots_kernel(
         uint32_t out_dim,
         uint32_t expert_base,
         uint32_t expert_count) {
+    __shared__ int s_first[4];
+    __shared__ int s_pair[4];
+    if (threadIdx.x == 0u) {
+        #pragma unroll
+        for (uint32_t packed_slot = 0; packed_slot < 4u; packed_slot++) {
+            bool prefix_pair = false;
+            s_first[packed_slot] = moe_owned_packed_component(
+                    selected, packed_slot / 2u, packed_slot & 1u,
+                    expert_base, expert_count, &prefix_pair);
+            s_pair[packed_slot] = prefix_pair ? 1 : 0;
+        }
+    }
+    __syncthreads();
+
     const uint32_t col =
         (uint32_t)((uint64_t)blockIdx.x * blockDim.x + threadIdx.x);
     if (col >= out_dim) return;
 
-    float slotv[6];
-    #pragma unroll
-    for (uint32_t slot = 0; slot < 6u; slot++) {
-        slotv[slot] = slots[(uint64_t)slot * out_dim + col];
-    }
-
     float packed[4];
     #pragma unroll
     for (uint32_t packed_slot = 0; packed_slot < 4u; packed_slot++) {
-        bool prefix_pair = false;
-        const int first_slot = moe_owned_packed_component(
-                selected, packed_slot / 2u, packed_slot & 1u,
-                expert_base, expert_count, &prefix_pair);
+        const int first_slot = s_first[packed_slot];
         if (first_slot < 0) {
             packed[packed_slot] = 0.0f;
-        } else if (prefix_pair) {
-            float value = __fadd_rn(0.0f, slotv[first_slot]);
-            packed[packed_slot] = __fadd_rn(value, slotv[first_slot + 1]);
+            continue;
+        }
+        const float first = slots[(uint64_t)(uint32_t)first_slot * out_dim + col];
+        if (s_pair[packed_slot]) {
+            const float second =
+                slots[(uint64_t)(uint32_t)(first_slot + 1) * out_dim + col];
+            const float value = __fadd_rn(0.0f, first);
+            packed[packed_slot] = __fadd_rn(value, second);
         } else {
-            packed[packed_slot] = slotv[first_slot];
+            packed[packed_slot] = first;
         }
     }
 
