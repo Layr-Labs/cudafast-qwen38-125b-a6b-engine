@@ -1796,14 +1796,25 @@ __global__ static void qwen4exp_gdn_output_kernel(
     const uint64_t base = ((uint64_t)row * n_tokens + token) * value_dim +
         head * QWEN4EXP_GDN_DIM;
     const float raw = out[base + tid];
+    /* The epilogue's two operands do not depend on the reduction, so issue
+     * them with the row read instead of after the barrier.  Left where the
+     * parent had them, both loads are requested only once `total` is known,
+     * and their latency is exposed at the very end of the kernel with no work
+     * left to hide it: the block has just paid a warp butterfly, a barrier
+     * and a second butterfly, and then stalls on two fresh global reads
+     * before it can store.  Hoisted, they travel under the whole reduction.
+     * The only store in the kernel happens after both reads in either order,
+     * so the values read are the same even if the gate range aliases the
+     * output range, and the scale they are multiplied by is unchanged. */
+    const float gate = output_gate[base + tid];
+    const float norm = output_norm[tid];
     float total = warp_sum_f32(raw * raw);
     if (lane == 0u) partial[warp] = total;
     __syncthreads();
     total = lane < 4u ? partial[lane] : 0.0f;
     total = warp_sum_all_f32(total);
     const float scale = rsqrtf(total / (float)QWEN4EXP_GDN_DIM + norm_eps);
-    out[base + tid] = raw * scale * output_norm[tid] *
-        qwen4exp_gdn_sigmoid(output_gate[base + tid]);
+    out[base + tid] = raw * scale * norm * qwen4exp_gdn_sigmoid(gate);
 }
 
 static const float *qwen4exp_gdn_weight_f32(
