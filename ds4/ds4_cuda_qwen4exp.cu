@@ -1796,14 +1796,19 @@ __global__ static void qwen4exp_gdn_output_kernel(
     const uint64_t base = ((uint64_t)row * n_tokens + token) * value_dim +
         head * QWEN4EXP_GDN_DIM;
     const float raw = out[base + tid];
+    /* The gate and the norm weight do not depend on the reduction below, so
+     * issue their loads before it and let them land while the shuffles run.
+     * The epilogue multiplies the same values in the same order. */
+    const float gate_in = output_gate[base + tid];
+    const float norm_w = output_norm[tid];
     float total = warp_sum_f32(raw * raw);
     if (lane == 0u) partial[warp] = total;
     __syncthreads();
     total = lane < 4u ? partial[lane] : 0.0f;
     total = warp_sum_all_f32(total);
     const float scale = rsqrtf(total / (float)QWEN4EXP_GDN_DIM + norm_eps);
-    out[base + tid] = raw * scale * output_norm[tid] *
-        qwen4exp_gdn_sigmoid(output_gate[base + tid]);
+    out[base + tid] = raw * scale * norm_w *
+        qwen4exp_gdn_sigmoid(gate_in);
 }
 
 static const float *qwen4exp_gdn_weight_f32(
