@@ -1213,8 +1213,45 @@ __global__ static void qwen4exp_gdn_replay_kernel(
     *(float4 *)(state + state_off) = h;
 }
 
+/* THE LIVE DECODE GDN RECURRENCE, and the first register cap aimed at it.
+ *
+ * Every register argument this line of work has made about GDN read
+ * gdn[reg=126] out of the probe, and that number belongs to
+ * qwen4exp_gdn_octet_kernel -- the deliberate drift control, third in the
+ * dispatch ladder and never launched at decode.  The ladder in
+ * qwen4exp_cuda_gdn_run is replay_gates -> replay -> gate_pairs(octet) ->
+ * split_reduce, and the decode arm resolves from source with no measurement:
+ *
+ *   ds4_qwen4exp_gdn_replay_plan() sets active = enabled && width == 2 &&
+ *   snapshots == 1, which is exactly the shipped draft_tokens=2 decode step;
+ *   qwen4exp_graph_gdn_block() then takes ds4_gpu_qwen4exp_gdn_replay_q8() and
+ *   passes gate_scratch = s->gdn_replay_gates, allocated whenever replay is
+ *   enabled; and gdn_run arms replay_gates when early_reads_safe and
+ *   n_key_head == 16 && n_value_head == 48, which ds4.c ships exactly.
+ *
+ * So THIS kernel is the one decode launches, 1536 blocks of 128 threads
+ * (grid = n_value_head x GDN_DIM/4 x 1 = 48 x 32 x 1), 32 blocks per SM to
+ * drain, and its register count has never been read.
+ *
+ * The cap.  At 128 threads and 65,536 registers per SM the rungs are
+ * 65536/(128*R) blocks: R<=128 -> 4, <=96 -> 5, <=80 -> 6, <=64 -> 8, against a
+ * thread ceiling of 1536/128 = 12 blocks.  96 is the conservative rung by the
+ * gate/up precedent in this file, where 32% below natural was safe and 50%
+ * below spilled.
+ *
+ * The falsifier is published in the same string: rg[lmem] must stay 0.  A
+ * non-zero local frame means ptxas paid for the cap in spills on a kernel whose
+ * inner loop is a serial recurrence, and this arm is then wrong regardless of
+ * what the composite does.  rg[occ] says whether the cap bought the fifth
+ * block; rp[...] reads the fallback replay kernel for contrast, uncapped. */
+#if defined(__CUDACC__) && CUDART_VERSION >= 12040
+#define QW_GDN_REPLAY_ATTR __maxnreg__(96)
+#else
+#define QW_GDN_REPLAY_ATTR
+#endif
+
 /* Same scalar replay geometry and recurrence, with current gates published by conv. */
-__global__ static void qwen4exp_gdn_replay_gates_kernel(
+__global__ QW_GDN_REPLAY_ATTR static void qwen4exp_gdn_replay_gates_kernel(
         float *out, float *state, float *checkpoint, float *tape,
         const float *qkv, const float *raw_alpha, const float *raw_beta,
         const float2 *gate_pairs,
@@ -17839,6 +17876,16 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
     int md_regs = -1, md_smem = -1, md_lmem = -1, md_occ = -1;
     /* The drift control: a kernel nobody in this line of work has touched. */
     int gd_regs = -1, gd_lmem = -1;
+    /* THE LIVE DECODE GDN RECURRENCE and its fallback, read here for the first
+     * time.  Everything ever published under gdn[...] is the octet drift
+     * control; the ladder in qwen4exp_cuda_gdn_run resolves to replay_gates at
+     * the shipped decode width, and to replay when the gate scratch is absent.
+     * rg[lmem] is the falsifier for the __maxnreg__(96) cap on rg. */
+    int rg_regs = -1, rg_lmem = -1, rg_occ = -1;
+    int rp_regs = -1, rp_lmem = -1, rp_occ = -1;
+    /* The occupancy scratch below (`occ`) is declared after the attribute
+     * reads; these two queries run above it and take their own. */
+    int occ_early = 0;
 
     cudaFuncAttributes a;
     if (cudaFuncGetAttributes(
@@ -17896,6 +17943,39 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
         cudaSuccess) {
         gd_regs = a.numRegs;
         gd_lmem = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+
+    /* Both replay kernels are queried at the block shape and dynamic-shared
+     * size they are actually launched with -- QWEN4EXP_GDN_DIM threads and 0
+     * dynamic bytes, exact for both (the launch at the recurrence grid passes a
+     * literal 0).  No launch happens here; cudaFuncGetAttributes and
+     * cudaOccupancyMaxActiveBlocksPerMultiprocessor are pure queries. */
+    if (cudaFuncGetAttributes(&a, qwen4exp_gdn_replay_gates_kernel) ==
+        cudaSuccess) {
+        rg_regs = a.numRegs;
+        rg_lmem = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ_early, qwen4exp_gdn_replay_gates_kernel,
+            (int)QWEN4EXP_GDN_DIM, 0) == cudaSuccess) {
+        rg_occ = occ_early;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaFuncGetAttributes(&a, qwen4exp_gdn_replay_kernel) == cudaSuccess) {
+        rp_regs = a.numRegs;
+        rp_lmem = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ_early, qwen4exp_gdn_replay_kernel,
+            (int)QWEN4EXP_GDN_DIM, 0) == cudaSuccess) {
+        rp_occ = occ_early;
     } else {
         (void)cudaGetLastError();
     }
@@ -18028,6 +18108,7 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
     snprintf(buf, sizeof(buf),
              "gu[reg=%d smem=%d lmem=%d maxt=%d occ=%d] dn[reg=%d smem=%d "
              "lmem=%d maxt=%d occ=%d] gdn[reg=%d lmem=%d] "
+             "rg[reg=%d lmem=%d occ=%d] rp[reg=%d lmem=%d occ=%d] "
              "mm[reg=%d smem=%d lmem=%d occ=%d] "
              "md[reg=%d smem=%d lmem=%d occ=%d] "
              "gu5[reg=%d smem=%d lmem=%d occ=%d] "
@@ -18035,6 +18116,8 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
              gu_regs, gu_smem, gu_lmem, gu_maxt, gu_occ,
              dn_regs, dn_smem, dn_lmem, dn_maxt, dn_occ,
              gd_regs, gd_lmem,
+             rg_regs, rg_lmem, rg_occ,
+             rp_regs, rp_lmem, rp_occ,
              mg_regs, mg_smem, mg_lmem, mg_occ,
              md_regs, md_smem, md_lmem, md_occ,
              g5_regs, g5_smem, g5_lmem, g5_occ,
