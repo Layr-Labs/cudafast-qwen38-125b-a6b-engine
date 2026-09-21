@@ -6564,11 +6564,37 @@ __global__ static void qwen4exp_moe_down_combine_grid_kernel(
     if (row >= out_dim || token >= n_tokens) return;
     const uint64_t pair0 = (uint64_t)token * n_expert_used;
     float acc = 0.0f;
-    for (uint32_t slot = 0; slot < n_expert_used; slot++) {
-        const uint64_t pair = pair0 + slot;
-        const int32_t e = selected[pair];
-        if (e < 0 || (uint32_t)e >= n_total_expert) continue;
-        acc += partial[pair * out_dim + row];
+    /* The slot walk had every partial load waiting on its own `selected`
+     * load: the routing entry is read, tested, and only then is the partial
+     * row's address allowed to issue, so the ten reads of the token's
+     * partials are a chain of ten dependent round trips instead of ten
+     * independent ones.  The routing entries are a handful of ints that every
+     * thread of every block of this token reads identically, while the
+     * partials are the wide stream.  Reading the entries first collapses the
+     * validity decision into a register mask, and the partial loads then
+     * issue back to back with nothing between them.
+     *
+     * Same entries, same test, same skipped slots, and the surviving partials
+     * are added in the same ascending slot order, so every out[token][row] is
+     * the same numbers added in the same order.  The mask form needs the slot
+     * count to fit its width; a wider routing keeps the original walk. */
+    if (n_expert_used <= 32u) {
+        uint32_t keep = 0u;
+        for (uint32_t slot = 0; slot < n_expert_used; slot++) {
+            const int32_t e = selected[pair0 + slot];
+            if (e >= 0 && (uint32_t)e < n_total_expert) keep |= 1u << slot;
+        }
+        for (uint32_t slot = 0; slot < n_expert_used; slot++) {
+            if (((keep >> slot) & 1u) == 0u) continue;
+            acc += partial[(pair0 + slot) * out_dim + row];
+        }
+    } else {
+        for (uint32_t slot = 0; slot < n_expert_used; slot++) {
+            const uint64_t pair = pair0 + slot;
+            const int32_t e = selected[pair];
+            if (e < 0 || (uint32_t)e >= n_total_expert) continue;
+            acc += partial[pair * out_dim + row];
+        }
     }
     out[(uint64_t)token * out_dim + row] = acc;
 }
