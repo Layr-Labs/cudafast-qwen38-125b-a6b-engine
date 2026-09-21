@@ -42,19 +42,16 @@ def one(pattern, what):
     return hits[0]
 
 # Wiring: the score sort and its scratch-size query must both sort the high
-# word only, and the selected-ID sort must stay the full ascending 32-bit one.
+# word only. The fused selected-ID sort is exercised on a GPU by
+# test_mtp_native_unpack_sort.py.
 score_name, _, score_args = one(r'key_in\s*,\s*key_out', 'score sort')
 init_name, _, init_args = one(r'\(\s*const\s+uint64_t\s*\*\s*\)\s*nullptr', 'score sort scratch query')
-id_name, _, id_args = one(r'\bid_tmp\b', 'selected-ID sort')
 score_n, score_lo, score_hi = trailing(score_args)
 init_n, init_lo, init_hi = trailing(init_args)
-id_n, id_lo, id_hi = trailing(id_args)
 assert score_name == 'SortKeysDescending' and score_n == 'width' \
     and (score_lo, score_hi) == ('32', '64'), 'production score sort bits drifted'
 assert init_name == 'SortKeysDescending' and init_n == 'width' \
     and (init_lo, init_hi) == ('32', '64'), 'scratch query bits must match the sort'
-assert id_name == 'SortKeys' and id_n == 'MTP_NATIVE_CAP' \
-    and (id_lo, id_hi) == ('0', '32'), 'selected-ID sort bits drifted'
 
 # Key layout, extracted from the producers rather than restated.
 fk = re.search(r'q8_top1_float_ordered_key\(float v\)\s*\{\s*const uint32_t u = '
