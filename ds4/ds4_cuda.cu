@@ -6009,9 +6009,31 @@ __global__ static void matmul_q8_0_preq_rows_exact_tile_kernel(
     const uint64_t row = (uint64_t)blockIdx.x * (blockDim.x >> 5u) + (threadIdx.x >> 5u);
     const uint32_t row0 = (uint32_t)blockIdx.y * (uint32_t)R;
     const uint32_t lane = threadIdx.x & 31u;
-    if (row >= out_dim || row0 >= n_rows) return;
+    if (row0 >= n_rows) return;
     const uint32_t take = n_rows - row0 < (uint32_t)R ? n_rows - row0
                                                       : (uint32_t)R;
+
+    /* Every weight-row warp in the grid walks the same quantised activation
+     * tile, so the tile is re-read once per warp. Stage it once per block
+     * when it fits the window. The loop forms the same element indices either
+     * way, because the staged copy starts at this tile's own base. The
+     * staging precedes the output-row bound so that every thread of a live
+     * block reaches the barrier. */
+    __shared__ int8_t s_xq[4096];
+    __shared__ float s_xscale[128];
+    const bool stage = blocks <= 128u && (uint64_t)take * blocks * 32u <= 4096u;
+    const int8_t *xq_tile = xq + (uint64_t)row0 * blocks * 32u;
+    const float *xs_tile = xscale + (uint64_t)row0 * blocks;
+    if (stage) {
+        const uint32_t nq = (uint32_t)((uint64_t)take * blocks * 32u);
+        for (uint32_t i = threadIdx.x; i < nq; i += blockDim.x) s_xq[i] = xq_tile[i];
+        const uint32_t ns = (uint32_t)((uint64_t)take * blocks);
+        for (uint32_t i = threadIdx.x; i < ns; i += blockDim.x) s_xscale[i] = xs_tile[i];
+        __syncthreads();
+        xq_tile = s_xq;
+        xs_tile = s_xscale;
+    }
+    if (row >= out_dim) return;
 
     const unsigned char *wr = w + row * blocks * 34u;
     float acc[R];
@@ -6034,11 +6056,11 @@ __global__ static void matmul_q8_0_preq_rows_exact_tile_kernel(
 #pragma unroll
         for (int r = 0; r < R; r++) {
             if ((uint32_t)r < take) {
-                const uint64_t at = ((uint64_t)row0 + (uint64_t)r) * blocks + b;
+                const uint64_t at = (uint64_t)r * blocks + b;
                 const int dot = words
-                    ? dot_i8x32_dp4a_words(wq, xq + at * 32u)
-                    : dot_i8_block(qs, xq + at * 32u, bn, use_dp4a);
-                acc[r] += ws * xscale[at] * (float)dot;
+                    ? dot_i8x32_dp4a_words(wq, xq_tile + at * 32u)
+                    : dot_i8_block(qs, xq_tile + at * 32u, bn, use_dp4a);
+                acc[r] += ws * xs_tile[at] * (float)dot;
             }
         }
     }
