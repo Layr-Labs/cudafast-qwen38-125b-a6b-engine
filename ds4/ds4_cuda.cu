@@ -7369,7 +7369,9 @@ matmul_q8_0_preq_rows_mma_pipe_kernel(float *out,
              * scales below lie in rows another one stored. */
             q8_mma_bar_sync(15, C::PWARPS * 32);
 
-            /* Weight scales, half -> float, [gg][BN]. */
+            /* Weight scales stay in their shipped half form here; the
+             * consumers convert the two they read. Half the scale bytes cross
+             * shared memory and the producers issue no conversion. */
 #pragma unroll
             for (int j = 0; j < (G * BN + PT - 1) / PT; j++) {
                 const int i = pl + j * PT;
@@ -7378,7 +7380,7 @@ matmul_q8_0_preq_rows_mma_pipe_kernel(float *out,
                     const int rr = i - gg * BN;
                     uint16_t h;
                     memcpy(&h, sB + rr * C::B_STRIDE + skew + gg * 34, 2);
-                    sWs[gg * BN + rr] = __half2float(__ushort_as_half(h));
+                    ((__half *)sWs)[gg * BN + rr] = __ushort_as_half(h);
                 }
             }
             __syncwarp();
@@ -7457,7 +7459,10 @@ matmul_q8_0_preq_rows_mma_pipe_kernel(float *out,
                     bf[0] = pw[0];
                     bf[1] = pw[4];
                 }
-                const float2 wsp = *(const float2 *)(sWs + gg * BN + c + (int)t4 * 2);
+                const __half *sWh = (const __half *)sWs;
+                const int wsi = gg * BN + c + (int)t4 * 2;
+                const float2 wsp = make_float2(__half2float(sWh[wsi]),
+                                               __half2float(sWh[wsi + 1]));
                 int32_t d[MT][4];
 #pragma unroll
                 for (int mi = 0; mi < MT; mi++) q8_mma_m16n8k32_seeded(d[mi], af[mi], bf, magic);
