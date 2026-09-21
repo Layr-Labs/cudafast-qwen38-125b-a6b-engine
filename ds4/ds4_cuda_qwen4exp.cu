@@ -6971,7 +6971,27 @@ qwen4exp_moe_gateup_split_kernel(
         const char *const ub = up +
             (uint64_t)expert * up_expert_bytes +
             (uint64_t)row0 * up_row_bytes;
-        for (uint32_t i = threadIdx.x; i < words; i += blockDim.x) {
+        /* The walk's bound is uniform over the block and its first sweeps are
+         * full: with OutputRows * 64 threads, the sweeps below `bulk` have
+         * every lane in range and only the last sweep is ragged.  The rolled
+         * form tested `i < words` on every sweep, so each pair of 16-byte
+         * copies carried a predicate for a question that is answered once,
+         * inside the prologue every thread must finish before the barrier
+         * below releases the panel and any arithmetic can start.  The full
+         * sweeps run unguarded here and the ragged remainder runs once, over
+         * exactly the indices the rolled walk's last sweep covered.  The
+         * source addresses, the destination offsets, the gate-then-up order
+         * and the staged bytes are the rolled walk's own: the panel is the
+         * same verbatim image of the same shipped rows. */
+        const uint32_t nthr = (uint32_t)OutputRows * 64u;
+        const uint32_t bulk = words / nthr * nthr;
+        for (uint32_t i = threadIdx.x; i < bulk; i += nthr) {
+            wcoop[i] = *(const uint4 *)(const void *)(gb + (uint64_t)i * 16u);
+            wcoop[PanelU4 + i] =
+                *(const uint4 *)(const void *)(ub + (uint64_t)i * 16u);
+        }
+        if (bulk + threadIdx.x < words) {
+            const uint32_t i = bulk + threadIdx.x;
             wcoop[i] = *(const uint4 *)(const void *)(gb + (uint64_t)i * 16u);
             wcoop[PanelU4 + i] =
                 *(const uint4 *)(const void *)(ub + (uint64_t)i * 16u);
