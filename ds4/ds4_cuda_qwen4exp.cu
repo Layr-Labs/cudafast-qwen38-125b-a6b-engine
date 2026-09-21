@@ -11882,6 +11882,41 @@ __global__ static void qwen4exp_gdn_output_quant_kernel(
     xq[pair * 32u + lane] = (int8_t)q;
 }
 
+/* Warp-wide maximum of a value that is NON-NEGATIVE by construction.  Every
+ * Q8_0 block scale in this file is the warp maximum of fabsf() of a flushed
+ * activation, so each lane holds a positive zero, a positive finite, or +inf.
+ *
+ * Over that domain the IEEE-754 binary32 encoding is order-isomorphic to the
+ * unsigned integer order of its bits: the sign bit is clear on every operand,
+ * and the exponent field sits above the mantissa field, most significant
+ * first, so one value exceeds another exactly when its bit pattern does as an
+ * unsigned integer.  Positive zero encodes as the all-zero pattern, which is
+ * both the smallest pattern and the identity of this maximum.  The reduction
+ * therefore returns the float the butterfly returned, bit for bit, and every
+ * scale derived from it is unchanged.
+ *
+ * What it removes is DEPTH.  The butterfly is five DEPENDENT shuffle-and-max
+ * pairs: each shuffle consumes the previous fmaxf, so the five latencies add,
+ * and no lane can form the block scale -- nor the reciprocal, the quantised
+ * byte or the scale store that follow it -- until all five have retired in
+ * order.  REDUX.SYNC performs the same reduction as ONE warp instruction.  In
+ * these quantisers the surrounding work is one load, a short pointwise chain,
+ * a reciprocal and two stores, so the reduction's depth is the kernel's.
+ *
+ * The instruction is sm_80 and newer.  Older architectures and the host pass
+ * keep the butterfly, character for character. */
+__device__ __forceinline__ static float qwen4exp_warp_max_nonneg(float a) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    return __uint_as_float(
+            __reduce_max_sync(0xffffffffu, __float_as_uint(a)));
+#else
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+    return a;
+#endif
+}
+
 /* hcNorm, then the Q8_0 row quantize the down projection wants, in one pass.
  *
  * Grid (n_hc, rows), blockDim.x QWEN4EXP_HC_THREADS: one block per (token,
@@ -12215,10 +12250,7 @@ __global__ static void qwen4exp_hc_mix_inject_dual_kernel(
             const uint32_t warp = threadIdx.x >> 5u;
             const float vz = qwen4exp_q8_ftz(v);
             float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
-                a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-            }
+            a = qwen4exp_warp_max_nonneg(a);
             const float qd = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
             const float id = qd != 0.0f ? qwen4exp_q8_rcp_approx(qd) : 0.0f;
             const uint64_t pair = (uint64_t)t * (n_embd / 32u) +
@@ -12540,9 +12572,7 @@ __global__ static void qwen4exp_hc_silu_quant_kernel(
 
     const float vz = qwen4exp_q8_ftz(v);
     float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+    a = qwen4exp_warp_max_nonneg(a);
     const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
     const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
     if (lane == 0u) xscale[pair] = d;
@@ -12894,10 +12924,7 @@ __global__ static void qwen4exp_hc_norm_quant_inject_kernel(
                                                          weight_bias, round_bf16);
                 const float vz = qwen4exp_q8_ftz(v);
                 float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-                for (int off = 16; off > 0; off >>= 1) {
-                    a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-                }
+                a = qwen4exp_warp_max_nonneg(a);
                 const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
                 const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
                 const uint64_t pair = blk0 + (uint64_t)(k * warps + warp);
@@ -12942,10 +12969,7 @@ __global__ static void qwen4exp_hc_norm_quant_inject_kernel(
                                                      weight_bias, round_bf16);
             const float vz = qwen4exp_q8_ftz(v);
             float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
-                a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-            }
+            a = qwen4exp_warp_max_nonneg(a);
             const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
             const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
             const uint64_t pair = blk0 + (uint64_t)(k * warps + warp);
@@ -16107,10 +16131,7 @@ __global__ static void qwen4exp_qsa_output_gate_quant_kernel(
         : 0.0f;
     const float vz = qwen4exp_q8_ftz(v);
     float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-    }
+    a = qwen4exp_warp_max_nonneg(a);
     const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
     const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
     const uint64_t pair = (uint64_t)blockIdx.x * 8u + warp;
@@ -16150,10 +16171,7 @@ __global__ static void qwen4exp_qsa_output_gate_doubled_quant_kernel(
         : 0.0f;
     const float vz = qwen4exp_q8_ftz(v);
     float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-    }
+    a = qwen4exp_warp_max_nonneg(a);
     const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
     const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
     const uint64_t pair = (uint64_t)blockIdx.x * 8u + warp;
