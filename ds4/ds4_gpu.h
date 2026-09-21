@@ -3050,7 +3050,8 @@ int ds4_gpu_qwen4exp_routed_moe_router_tensor(
         uint32_t                     n_tokens,
         uint32_t                     mid_token_stride,
         const ds4_gpu_tensor        *logits,
-        ds4_gpu_tensor              *weights_rw);
+        ds4_gpu_tensor              *weights_rw,
+        int                          in_head_block);
 
 int ds4_gpu_qwen4exp_shared_expert_tensor(
         ds4_gpu_tensor              *out,
