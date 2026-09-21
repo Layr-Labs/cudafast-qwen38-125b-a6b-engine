@@ -1002,6 +1002,51 @@ __global__ static void qwen4exp_gdn_conv_parallel_kernel(
  * reference: one block owns one (row, value head, four value rows), one warp
  * owns one value row, and each lane owns four adjacent key columns.
  */
+/* The recurrent state is the decode round's largest stream, and it is read
+ * exactly once and written exactly once per token.
+ *
+ * Thirty-six of the forty-eight layers carry a gated-deltanet state of
+ * `n_rows * n_value_head * QWEN4EXP_GDN_DIM * QWEN4EXP_GDN_DIM` floats.  Every
+ * emitted token pulls all of it in, decays it, rank-one updates it and writes
+ * all of it back: no cell is touched twice inside one forward, and the next
+ * forward is a separate launch far beyond any reuse window the caches can
+ * hold.  At default cache priority those lines are nonetheless allocated and
+ * retained at both levels, where they evict the lines the same decode round
+ * does reuse - the q/k rows a warp re-reads per token, the gate pairs, the
+ * output row, and the quantised weight stream of the MoE and attention
+ * launches that overlap this one.  The state is several megabytes per layer
+ * per token; nothing else in the round moves that much data with so little
+ * reuse, so it is the dominant polluter of the shared cache.
+ *
+ * Issuing the state load and the state writeback with the streaming, evict
+ * first cache policy keeps the traffic exactly as it is and tells the cache
+ * not to retain it: the lines are marked lowest priority for replacement
+ * instead of displacing data with real reuse.  Both accesses are ordinary
+ * coherent accesses; `__stcs` is the same store the snapshot path in these
+ * kernels already uses.  The bytes, their order, and every arithmetic
+ * operation downstream are unchanged, so the emitted tokens are bit-identical.
+ * Building with -DDS4_GDN_STATE_STREAM=0 restores the default-cached state
+ * access. */
+#ifndef DS4_GDN_STATE_STREAM
+#define DS4_GDN_STATE_STREAM 1
+#endif
+
+__device__ __forceinline__ static float4 qwen4exp_gdn_state_load(const float4 *p) {
+#if DS4_GDN_STATE_STREAM
+    return __ldcs(p);
+#else
+    return *p;
+#endif
+}
+
+__device__ __forceinline__ static void qwen4exp_gdn_state_store(float4 *p, float4 v) {
+#if DS4_GDN_STATE_STREAM
+    __stcs(p, v);
+#else
+    *p = v;
+#endif
+}
+
 template <bool PRECOMPUTED_GATES>
 __global__ static void qwen4exp_gdn_recurrence_kernel(
         float       *__restrict__ out,
@@ -1053,7 +1098,7 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
               ((uint64_t)n_rows * n_value_head * QWEN4EXP_GDN_DIM *
                QWEN4EXP_GDN_DIM) + state_off
         : state + state_off;
-    float4 h = *(const float4 *)state_src;
+    float4 h = qwen4exp_gdn_state_load((const float4 *)state_src);
     /* ssm_a IS ALREADY -exp(A_log); see the note in metal/qwen4exp_gdn.metal.
      * Twin of that kernel -- keep the two expressions identical. */
     const float decay_coeff = a_log[head];
@@ -1117,7 +1162,7 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
             }
         }
     }
-    *state_ptr = h;
+    qwen4exp_gdn_state_store(state_ptr, h);
 }
 
 /* Bounded input replay for a two-row verify. The base state stays intact
