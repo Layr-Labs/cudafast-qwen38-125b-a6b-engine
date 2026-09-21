@@ -95,9 +95,12 @@ __global__ static void mtp_native_projection_kernel(
                 if ((uint32_t)r < take) {
                     const uint64_t at = ((uint64_t)row0 + r) * blocks + b;
                     const int32_t *xw = (const int32_t *)(xq + at * 32u + half * 16u);
-                    int dot = 0;
-#pragma unroll
-                    for (int j = 0; j < 4; j++) dot = __dp4a(wq[j], xw[j], dot);
+                    // YUKON-20260921: two independent integer accumulation chains.
+                    int dot_even = __dp4a(wq[0], xw[0], 0);
+                    int dot_odd = __dp4a(wq[1], xw[1], 0);
+                    dot_even = __dp4a(wq[2], xw[2], dot_even);
+                    dot_odd = __dp4a(wq[3], xw[3], dot_odd);
+                    int dot = dot_even + dot_odd;
                     dot += __shfl_xor_sync(active, dot, 1);
                     if (half == 0u) acc[r] += ws * xscale[at] * (float)dot;
                 }
@@ -253,10 +256,12 @@ __global__ static void mtp_native_projection2_screen_kernel(
                 const uint64_t at = (uint64_t)r * blocks + b;
                 const int32_t *xw =
                     (const int32_t *)(xq + at * 32u + half * 16u);
-                int dot = 0;
-#pragma unroll
-                for (int j = 0; j < 4; j++)
-                    dot = __dp4a(wq[j], xw[j], dot);
+                // YUKON-20260921: two independent integer accumulation chains.
+                int dot_even = __dp4a(wq[0], xw[0], 0);
+                int dot_odd = __dp4a(wq[1], xw[1], 0);
+                dot_even = __dp4a(wq[2], xw[2], dot_even);
+                dot_odd = __dp4a(wq[3], xw[3], dot_odd);
+                int dot = dot_even + dot_odd;
                 dot += __shfl_xor_sync(active, dot, 1);
                 if (half == 0u)
                     acc[r] += ws * xscale[at] * (float)dot;
