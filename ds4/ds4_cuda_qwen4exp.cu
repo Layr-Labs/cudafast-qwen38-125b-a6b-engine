@@ -7688,12 +7688,25 @@ __global__ static void qwen4exp_shared_down_q_kernel(
     if (Stage) {
         const uint64_t panel_bytes = (uint64_t)8u * down_row_bytes;
         const char *const gp = down + (uint64_t)(blockIdx.x * 8u) * down_row_bytes;
-        for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
+        /* The vector span is uniform across the block and known before the
+         * walk: bytes below `bulk` are exactly the ones a 16-byte copy can
+         * take, and `panel_bytes - bulk` is the ragged remainder.  The rolled
+         * form asked `i + 16 <= panel_bytes` on every 16-byte step, so each
+         * copy carried a predicate for a question whose answer changes once,
+         * in a walk that every thread in the block has to finish before the
+         * barrier below releases the panel.  Splitting it leaves the bulk
+         * walk a straight sequence of uint4 copies and runs the remainder
+         * once, from the single thread whose stride reaches it.  The source
+         * bytes, their addresses, the destination offsets and the ascending
+         * order are the rolled walk's own; the panel image is identical. */
+        const uint64_t bulk = panel_bytes & ~(uint64_t)15u;
+        for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < bulk;
              i += (uint64_t)blockDim.x * 16u) {
-            if (i + 16u <= panel_bytes)
-                *(uint4 *)(spanel + i) = *(const uint4 *)(const void *)(gp + i);
-            else
-                for (uint64_t j = i; j < panel_bytes; j++) spanel[j] = gp[j];
+            *(uint4 *)(spanel + i) = *(const uint4 *)(const void *)(gp + i);
+        }
+        for (uint64_t i = bulk + (uint64_t)threadIdx.x; i < panel_bytes;
+             i += (uint64_t)blockDim.x) {
+            spanel[i] = gp[i];
         }
         QWEN4EXP_PDL_SYNC();
         __syncthreads();
@@ -18049,3 +18062,4 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
  * census shows produces a byte-identical capture log. */
 
 #define YUKON_REDRAW_10 10
+#define GAUNTLET_REDRAW_d80f9a8c_20260921T213044Z 1
