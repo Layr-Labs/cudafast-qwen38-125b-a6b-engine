@@ -681,6 +681,31 @@ int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
         const ds4_gpu_tensor *scratch,
         uint32_t              max_count);
 
+/* Decode split-attention fold plus doubled output gate and Q8 publication.
+ * Returns 1 when fused, 0 when unsupported/disabled, and -1 on launch error. */
+int ds4_gpu_qwen4exp_qsa_attention_fold_gate_q8_dpos_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *q8,
+        uint64_t              q_offset,
+        uint64_t              s_offset,
+        const ds4_gpu_tensor *doubled,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k_cache,
+        const ds4_gpu_tensor *v_cache,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *counts,
+        uint32_t              n_tokens,
+        uint32_t              n_head,
+        uint32_t              n_kv_head,
+        uint32_t              head_dim,
+        uint32_t              pos0,
+        uint32_t              cache_cap,
+        uint32_t              max_selected,
+        float                 scale,
+        const ds4_gpu_tensor *d_pos,
+        const ds4_gpu_tensor *scratch,
+        uint32_t              max_count);
+
 /* Bytes of `scratch` the attention call above wants to take its split path
  * for `n_tokens` rows of at most `max_count` keys each; 0 for a shape the
  * split path does not serve.  Passing NULL scratch keeps the per-head kernel. */
@@ -3050,7 +3075,8 @@ int ds4_gpu_qwen4exp_routed_moe_router_tensor(
         uint32_t                     n_tokens,
         uint32_t                     mid_token_stride,
         const ds4_gpu_tensor        *logits,
-        ds4_gpu_tensor              *weights_rw);
+        ds4_gpu_tensor              *weights_rw,
+        int                          in_head_block);
 
 int ds4_gpu_qwen4exp_shared_expert_tensor(
         ds4_gpu_tensor              *out,
