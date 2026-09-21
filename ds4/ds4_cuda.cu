@@ -26786,6 +26786,84 @@ __global__ static void moe_gate_up_mid_decode_q4K_owned_warp32_noaux_kernel(
     }
 }
 
+/* Sixteen-lane partial reduction. With an operand count that fits sixteen
+ * lanes the full-warp form leaves the upper half holding +0, and its first
+ * shuffle folds those zeros in exactly; the remaining four steps are these
+ * four. The result on lane 0 is therefore the full-warp form's, bit for bit. */
+__device__ static float half_warp_sum_f32(float v) {
+    const uint32_t mask = 0xffffu << (threadIdx.x & 16u);
+    for (int offset = 8; offset > 0; offset >>= 1) {
+        v += __shfl_down_sync(mask, v, offset, 16);
+    }
+    return v;
+}
+
+/* Row-paired form of the owned Q4_K decode gate/up tile: two rows per warp,
+ * sixteen lanes each. The host selects it only when the quantised activation
+ * is at most sixteen blocks, so each lane holds exactly the block the
+ * full-warp form gave it and no lane's operand set changes. */
+__global__ static void moe_gate_up_mid_decode_q4K_owned_half16_noaux_kernel(
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const cuda_block_q8_K *xq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t expert_base,
+        uint32_t expert_count,
+        float clamp) {
+    uint32_t lane = threadIdx.x & 15u;
+    uint32_t row = blockIdx.x * 16u + (threadIdx.x >> 4u);
+    uint32_t pair = blockIdx.y;
+    uint32_t expert = 0u;
+    if (!moe_owned_local_expert(selected[pair], expert_base, expert_count,
+                                &expert)) return;
+    const cuda_block_q8_K *xqb = xq;
+    __shared__ cuda_block_q8_K sxq[16];
+    if (xq_blocks <= 16u) {
+        const uint32_t words = xq_blocks * (uint32_t)(sizeof(cuda_block_q8_K) / 4u);
+        uint32_t *dst = (uint32_t *)sxq;
+        const uint32_t *srcw = (const uint32_t *)xqb;
+        for (uint32_t i = threadIdx.x; i < words; i += blockDim.x) dst[i] = srcw[i];
+        __syncthreads();
+        xqb = sxq;
+    }
+    if (row >= expert_mid_dim) return;
+    const bool vec_ok = ((((uintptr_t)gate_base | (uintptr_t)up_base |
+                           gate_row_bytes | gate_expert_bytes) & 15u) == 0u);
+    const cuda_block_q4_K *gr = (const cuda_block_q4_K *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+    const cuda_block_q4_K *ur = (const cuda_block_q4_K *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+    float gate = 0.0f;
+    float up = 0.0f;
+    if (vec_ok) {
+        for (uint32_t b = lane; b < xq_blocks; b += 16u) {
+            dev_dot_q4_K_q8_K_block_vec(gr + b, xqb + b, &gate);
+            dev_dot_q4_K_q8_K_block_vec(ur + b, xqb + b, &up);
+        }
+    } else {
+        for (uint32_t b = lane; b < xq_blocks; b += 16u) {
+            gate += dev_dot_q4_K_q8_K_block(gr + b, xqb + b);
+            up += dev_dot_q4_K_q8_K_block(ur + b, xqb + b);
+        }
+    }
+    gate = half_warp_sum_f32(gate);
+    up = half_warp_sum_f32(up);
+    if (lane == 0u) {
+        if (clamp > 1.0e-6f) {
+            if (gate > clamp) gate = clamp;
+            if (up > clamp) up = clamp;
+            if (up < -clamp) up = -clamp;
+        }
+        const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+        mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[pair];
+    }
+}
+
 __global__ static void moe_gate_up_mid_decode_q4K_warp32_noaux_sidecar_kernel(
         float *mid_out,
         float *amax_sidecar,
@@ -30915,7 +30993,24 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
     }
     if (!cuda_ok(cudaGetLastError(), "owned routed_moe x quantize launch")) return 0;
 
-    if (q4k_path) {
+    if (q4k_path && xq_blocks <= 16u && (expert_mid_dim & 15u) == 0u) {
+        dim3 gate_grid(expert_mid_dim / 16u, 6u, 1u);
+        moe_gate_up_mid_decode_q4K_owned_half16_noaux_kernel<<<gate_grid, 256>>>(
+                (float *)mid->ptr,
+                gate_w,
+                up_w,
+                xq,
+                (const int32_t *)selected->ptr,
+                (const float *)weights->ptr,
+                gate_expert_bytes,
+                gate_row_bytes,
+                xq_blocks,
+                expert_mid_dim,
+                6u,
+                resident_expert_base,
+                resident_expert_count,
+                clamp);
+    } else if (q4k_path) {
         dim3 gate_grid((expert_mid_dim + 7u) / 8u, 6u, 1u);
         moe_gate_up_mid_decode_q4K_owned_warp32_noaux_kernel<<<gate_grid, 256>>>(
                 (float *)mid->ptr,
