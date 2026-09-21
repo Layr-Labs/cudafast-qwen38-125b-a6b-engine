@@ -56,3 +56,5 @@ clone.
 
 A head only PROPOSES tokens. The organizer-pinned target decides every emitted
 token. The serial control leg of every ranked pair runs with the drafter off.
+
+<!-- Baseline measurement marker for dun999 public-artifact submit on 2026-09-22; no engine/behavior change. -->
