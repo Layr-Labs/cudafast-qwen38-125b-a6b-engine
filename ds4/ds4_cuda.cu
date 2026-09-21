@@ -25578,6 +25578,10 @@ __global__ static void moe_gate_up_mid_decode_lut_owned_qwarp32_kernel(
     uint32_t expert = 0u;
     if (!moe_owned_local_expert(selected[pair], expert_base, expert_count,
                                 &expert)) return;
+    /* The routing weight is a per-slot scalar the epilogue needs and the
+     * accumulation does not. Issue its load before the dot so it lands while
+     * the block dots run; the epilogue multiplies the same value. */
+    const float route_w = weights[pair];
     const cuda_block_q8_K *xqb = xq;
     __shared__ cuda_block_q8_K sxq[16];
     __shared__ uint64_t s_iq2_grid[256];
@@ -25613,7 +25617,7 @@ __global__ static void moe_gate_up_mid_decode_lut_owned_qwarp32_kernel(
                 gate_out[off] = gate;
                 up_out[off] = up;
             }
-            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[pair];
+            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * route_w;
         }
     }
 }
@@ -26746,6 +26750,7 @@ __global__ static void moe_gate_up_mid_decode_q4K_owned_warp32_noaux_kernel(
     uint32_t expert = 0u;
     if (!moe_owned_local_expert(selected[pair], expert_base, expert_count,
                                 &expert)) return;
+    const float route_w = weights[pair];
     const cuda_block_q8_K *xqb = xq;
     __shared__ cuda_block_q8_K sxq[16];
     if (xq_blocks <= 16u) {
@@ -26782,7 +26787,7 @@ __global__ static void moe_gate_up_mid_decode_q4K_owned_warp32_noaux_kernel(
             if (up < -clamp) up = -clamp;
         }
         const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
-        mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[pair];
+        mid_out[off] = (gate / (1.0f + expf(-gate))) * up * route_w;
     }
 }
 
