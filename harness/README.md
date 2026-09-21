@@ -1,5 +1,6 @@
 # `harness/` — the CUDA engine's protocol side
 
+<!-- Public archive marker: zarar@1337 depth-one rider. -->
 This directory holds the Engine Protocol v1 adapter. The adapter is what benchd
 talks to. It IS an editable path (`benchmark.json` `editablePaths` lists
 `harness`): the adapter is the engine's protocol side, and the measurement is
