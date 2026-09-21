@@ -5278,6 +5278,25 @@ __device__ __forceinline__ static void qw_load_words8_pol(const uint32_t *qw,
     qw_load_words8(qw, w);
 }
 
+/* qw_tile_copy_group with an L2 eviction policy on the global read.  The
+ * source is an activation group at `mq + at * 32`, so it is 32-byte aligned
+ * and the two sixteen-byte loads are the same eight words in the same order
+ * the shipped loop reads; a misaligned pointer falls back to that loop
+ * unhinted.  A policy changes eviction order only, never a returned value. */
+__device__ __forceinline__ static void qw_tile_copy_group_pol(
+        int8_t *dst, const int8_t *src, uint64_t pol) {
+    if ((((uintptr_t)src) & 15u) == 0u) {
+        uint4 a, b;
+        qw_ldg16_pol(src, &a, pol);
+        qw_ldg16_pol(src + 16, &b, pol);
+        uint32_t *w = (uint32_t *)(void *)dst;
+        w[0] = a.x; w[1] = a.y; w[2] = a.z; w[3] = a.w;
+        w[4] = b.x; w[5] = b.y; w[6] = b.z; w[7] = b.w;
+        return;
+    }
+    qw_tile_copy_group(dst, src);
+}
+
 __device__ __forceinline__ static void qw_cpasync_commit(void) {
     asm volatile("cp.async.commit_group;\n" ::);
 }
@@ -6386,8 +6405,30 @@ qwen4exp_moe_down_mma_kernel(
      * instantiation keep the oracle; a row whose blocks are not word
      * aligned stages nothing and decodes from the row, exactly as before. */
     const uint32_t dtype = DownType < 0 ? down_type : (uint32_t)DownType;
-    const bool w_dq = dq_stage != 0u &&
+    /* bit 0 is the staging arm; the launch site has only ever passed 0 or 1,
+     * so masking it is the same test this line has always made. */
+    const bool w_dq = (dq_stage & 1u) != 0u &&
                       dtype == (uint32_t)DS4_QWEN4EXP_TY_q5_1;
+    /* L2 EVICTION POLICY ON THE ACTIVATION READS (dq_stage bit 1).
+     *
+     * This tile has the same weight-versus-activation asymmetry the LIGHT
+     * gate/up tile was given a policy for in promotion e8c3489, and it never
+     * got one.  The grid is (out_dim / QW_DOWN_MMA_BM) x (active experts):
+     * for one expert, EVERY row block walks the SAME routed activation
+     * columns -- `mq`, `ms` and `msum` at `p * groups + g` depend only on the
+     * pair index and the group, not on blockIdx.x -- while the down weight
+     * slab under it is read exactly once per expert.  So the single-use
+     * weight stream is what evicts a small, heavily re-read activation
+     * footprint from the 24 MB L2, which is precisely the situation
+     * `evict_last` on the activation loads exists for.
+     *
+     * Bit-exact by construction: a cache policy changes which line the L2
+     * discards first and never a value a load returns.  OFF is evict_normal
+     * at fraction one -- the default priority -- so both arms issue the same
+     * instruction stream and differ only in a policy register's contents.
+     *
+     * DS4_QWEN4EXP_DOWN_L2POL=0 stands it down. */
+    const uint64_t polD = (dq_stage & 2u) ? qw_pol_last() : qw_pol_off();
 
     for (int32_t nbase = 0; nbase < cnt; nbase += QW_MMA_BN) {
         const int32_t take = (cnt - nbase) < QW_MMA_BN ? (cnt - nbase)
@@ -6443,10 +6484,11 @@ qwen4exp_moe_down_mma_kernel(
                 const uint32_t p = sPair[tk];
                 if (p != 0xffffffffu && g < groups) {
                     const uint64_t at = (uint64_t)p * groups + g;
-                    qw_tile_copy_group(&sB[tk * QW_MMA_LD + gg * 32],
-                                       mq + at * 32u);
-                    sXS  [tk * QW_MMA_G + gg] = ms[at];
-                    sXSUM[tk * QW_MMA_G + gg] = (float)msum[at];
+                    qw_tile_copy_group_pol(&sB[tk * QW_MMA_LD + gg * 32],
+                                           mq + at * 32u, polD);
+                    sXS  [tk * QW_MMA_G + gg] = qw_ldg32f_pol(&ms[at], polD);
+                    sXSUM[tk * QW_MMA_G + gg] =
+                        (float)qw_ldg32i_pol(&msum[at], polD);
                 } else {
                     qw_tile_store_zero(&sB[tk * QW_MMA_LD + gg * 32]);
                     sXS[tk * QW_MMA_G + gg] = 0.0f;
@@ -10644,8 +10686,12 @@ static int qwen4exp_routed_moe_cuda(
         /* DS4_QWEN4EXP_NO_DOWN_DQ stands the down tile's word-direct q5_1
          * staging down and runs the oracle decode + repack the kernel has
          * always had, byte for byte.  Read once, before the launch. */
+        /* bit 1 carries the activation L2 eviction policy; see the kernel.
+         * DS4_QWEN4EXP_DOWN_L2POL=0 stands it down. */
+        const char *dn_pol_env = getenv("DS4_QWEN4EXP_DOWN_L2POL");
         const uint32_t dn_dq_stage =
-            getenv("DS4_QWEN4EXP_NO_DOWN_DQ") == NULL ? 1u : 0u;
+            (getenv("DS4_QWEN4EXP_NO_DOWN_DQ") == NULL ? 1u : 0u) |
+            ((dn_pol_env && dn_pol_env[0] == '0') ? 0u : 2u);
         /* The q5_1 staging reads its six block words as three eight-byte
          * loads; DS4_QWEN4EXP_NO_Q51_WIDE_LOAD restores the word loop. */
         const bool dn_wide6 =
