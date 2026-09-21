@@ -207,6 +207,26 @@ void ds4_qwen4exp_session_plan_print(const ds4_qwen4exp_session_plan *plan) {
 
 #ifndef DS4_NO_GPU
 
+/* Experiment #3 (parent 76817ae0): ds4_gpu_end_commands() already performs
+ * cudaDeviceSynchronize() (or a stream sync when DS4_CUDA_END_STREAM_SYNC is
+ * set).  A trailing ds4_gpu_synchronize() on the verify / forward / rollback
+ * hot paths is therefore a second full-device wait.  Default drops that
+ * redundant sync; DS4_QWEN4EXP_KEEP_END_SYNC=1 restores tip double-sync. */
+static int qwen4exp_keep_end_sync(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_QWEN4EXP_KEEP_END_SYNC");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
+static int qwen4exp_end_commands_wait(void) {
+    if (!ds4_gpu_end_commands()) return 0;
+    if (qwen4exp_keep_end_sync()) return ds4_gpu_synchronize();
+    return 1;
+}
+
 #define QW_MAP(m, t)   ((const void *)(m)->shard[(t)->map_index].map)
 #define QW_MAPSZ(m, t) ((m)->shard[(t)->map_index].size)
 #define QW_OFF(t)      ((t)->abs_offset)
@@ -3411,8 +3431,9 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     }
     QW_TRACE(QW_SLICE_HEAD);
     QW_TRACE_REPORT(n_tokens);
-    /* Commit and wait: the logits are read on the host from here on. */
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
+    /* Commit and wait: the logits are read on the host from here on.
+     * end_commands already drains the device; KEEP_END_SYNC restores tip. */
+    if (!qwen4exp_end_commands_wait()) {
         fprintf(stderr, "ds4: qwen4exp command batch did not complete\n");
         ds4_gpu_oneshot_graph_retire();
         return false;
@@ -3471,7 +3492,7 @@ static bool qwen4exp_session_copy_layers(ds4_qwen4exp_session *s,
                                      (uint64_t)row * bytes, bytes) != 0;
         }
     }
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) return false;
+    if (!qwen4exp_end_commands_wait()) return false;
     if (ok && recurrent) s->gdn_replay_previous = false;
     return ok;
 }
@@ -3982,7 +4003,7 @@ static bool qwen4exp_graph_rerun_lm_top1(
         (void)ds4_gpu_end_commands();
         return false;
     }
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
+    if (!qwen4exp_end_commands_wait()) {
         fprintf(stderr,
                 "ds4: qwen4exp nonfinite fallback batch did not complete\n");
         return false;
@@ -4099,7 +4120,7 @@ bool ds4_qwen4exp_graph_head_logits(ds4_qwen4exp_session       *s,
         fprintf(stderr, "ds4: qwen4exp LM head failed on the head row\n");
         return qwen4exp_forward_fail();
     }
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
+    if (!qwen4exp_end_commands_wait()) {
         fprintf(stderr, "ds4: qwen4exp command batch did not complete\n");
         return false;
     }
@@ -4297,7 +4318,7 @@ static int qwen4exp_rb_ple_conv_select(void *ctx, uint32_t row) {
     const bool ok = ds4_gpu_tensor_copy(s->ple_conv_state, 0,
                                         s->ple_conv_snapshot,
                                         (uint64_t)row * bytes, bytes) != 0;
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) return -1;
+    if (!qwen4exp_end_commands_wait()) return -1;
     return ok ? 0 : -1;
 }
 static int qwen4exp_rb_qsa_kv_truncate(void *ctx, uint32_t pos) {
