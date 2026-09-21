@@ -6593,6 +6593,51 @@ __device__ __forceinline__ static void qwen4exp_shared_vector_accumulate(
     *acc += (wb * scale) * (float)sum;
 }
 
+/* The gate projection and the up projection of one output row consume the
+ * SAME activation group: the same 32 quantised bytes, the same scale and the
+ * same row sum.  Called once per projection, the accumulate above reads those
+ * 32 bytes twice -- two 16-byte reads for the gate chain and two more,
+ * identical in address and value, for the up chain -- so the activation side
+ * of this loop asks for twice the bytes it needs while the weight side asks
+ * for exactly what it needs.
+ *
+ * This form reads the group once and feeds both chains from it.  The DP4A
+ * words, their operand order, the per-chain integer accumulation and the two
+ * float folds are the single-projection accumulate's own, emitted for the gate
+ * chain and then for the up chain exactly as the two calls emitted them; the
+ * accumulators are independent, so neither chain's order changes and every
+ * emitted float is bit-identical.  Both dp4a chains stay live, which is what
+ * this loop's ILP depends on. */
+__device__ __forceinline__ static void qwen4exp_shared_vector_accumulate2(
+        float *acc0, const int8_t *wq0, float wa0, float wb0,
+        float *acc1, const int8_t *wq1, float wa1, float wb1,
+        const int8_t *xq, float scale, int sum) {
+    const int4 lo = *(const int4 *)(const void *)xq;
+    const int4 hi = *(const int4 *)(const void *)(xq + 16);
+    int d0 = 0;
+    d0 = __dp4a(qwen4exp_load_i8x4(wq0 + 0), lo.x, d0);
+    d0 = __dp4a(qwen4exp_load_i8x4(wq0 + 4), lo.y, d0);
+    d0 = __dp4a(qwen4exp_load_i8x4(wq0 + 8), lo.z, d0);
+    d0 = __dp4a(qwen4exp_load_i8x4(wq0 + 12), lo.w, d0);
+    d0 = __dp4a(qwen4exp_load_i8x4(wq0 + 16), hi.x, d0);
+    d0 = __dp4a(qwen4exp_load_i8x4(wq0 + 20), hi.y, d0);
+    d0 = __dp4a(qwen4exp_load_i8x4(wq0 + 24), hi.z, d0);
+    d0 = __dp4a(qwen4exp_load_i8x4(wq0 + 28), hi.w, d0);
+    int d1 = 0;
+    d1 = __dp4a(qwen4exp_load_i8x4(wq1 + 0), lo.x, d1);
+    d1 = __dp4a(qwen4exp_load_i8x4(wq1 + 4), lo.y, d1);
+    d1 = __dp4a(qwen4exp_load_i8x4(wq1 + 8), lo.z, d1);
+    d1 = __dp4a(qwen4exp_load_i8x4(wq1 + 12), lo.w, d1);
+    d1 = __dp4a(qwen4exp_load_i8x4(wq1 + 16), hi.x, d1);
+    d1 = __dp4a(qwen4exp_load_i8x4(wq1 + 20), hi.y, d1);
+    d1 = __dp4a(qwen4exp_load_i8x4(wq1 + 24), hi.z, d1);
+    d1 = __dp4a(qwen4exp_load_i8x4(wq1 + 28), hi.w, d1);
+    *acc0 += (wa0 * scale) * (float)d0;
+    *acc0 += (wb0 * scale) * (float)sum;
+    *acc1 += (wa1 * scale) * (float)d1;
+    *acc1 += (wb1 * scale) * (float)sum;
+}
+
 /* Adjacent warps own the gate and up projection of one output row. Each
  * carries one decoded matrix and its accumulators, reducing register pressure
  * during a two-token verify. Every projection retains the original ascending
@@ -7576,10 +7621,9 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
                 const float sc = xs[at_g];
                 const int32_t sm = xsum[at_g];
                 if constexpr (Vector) {
-                    qwen4exp_shared_vector_accumulate(&ag[r], gw, ga[0], gb[0],
-                                                      xqg, sc, sm);
-                    qwen4exp_shared_vector_accumulate(&au[r], uw, ua[0], ub[0],
-                                                      xqg, sc, sm);
+                    qwen4exp_shared_vector_accumulate2(
+                            &ag[r], gw, ga[0], gb[0],
+                            &au[r], uw, ua[0], ub[0], xqg, sc, sm);
                 } else {
                     qwen4exp_group_accumulate(&ag[r], gw, ga, gb, gh, xqg, sc, sm);
                     qwen4exp_group_accumulate(&au[r], uw, ua, ub, uh, xqg, sc, sm);
@@ -7605,10 +7649,9 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
                 const float sc = xs[at_g];
                 const int32_t sm = xsum[at_g];
                 if constexpr (Vector) {
-                    qwen4exp_shared_vector_accumulate(&ag[r], gw, ga[0], gb[0],
-                                                      xqg, sc, sm);
-                    qwen4exp_shared_vector_accumulate(&au[r], uw, ua[0], ub[0],
-                                                      xqg, sc, sm);
+                    qwen4exp_shared_vector_accumulate2(
+                            &ag[r], gw, ga[0], gb[0],
+                            &au[r], uw, ua[0], ub[0], xqg, sc, sm);
                 } else {
                     qwen4exp_group_accumulate(&ag[r], gw, ga, gb, gh, xqg, sc, sm);
                     qwen4exp_group_accumulate(&au[r], uw, ua, ub, uh, xqg, sc, sm);
