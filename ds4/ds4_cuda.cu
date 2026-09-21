@@ -1016,6 +1016,9 @@ struct cuda_decode_graph_entry {
     cudaGraphExec_t      exec;
     int                  state;   /* 0 empty, 1 warmed, 2 ready, 3 dead */
     uint64_t             hits;
+    /* 1 once this exec's device image has been uploaded; see
+     * cuda_graph_upload_once_on().  Cleared whenever exec changes. */
+    int                  uploaded;
 };
 
 static cuda_decode_graph_entry
@@ -1086,11 +1089,35 @@ static inline int cuda_decode_graph_upload_on(void) {
     return on;
 }
 
+/* Whether a ready exec's image is uploaded ONCE PER INSTANTIATION instead of
+ * once per call.  cudaGraphUpload walks the instantiated node list and leaves
+ * the device image in place for the exec's lifetime, so only the first upload
+ * of a given exec moves anything: every later one is host work spent in front
+ * of a launch that would have found the image resident regardless.  The decode
+ * walk asks for chunk c+1 on every token of the run, so on a 67-token window
+ * 66 of those 67 uploads are re-walks of an image already on the device.
+ * DS4_CUDA_GRAPH_UPLOAD_ONCE=0 restores the unconditional per-call upload. */
+static inline int cuda_graph_upload_once_on(void) {
+    static int init = 0;
+    static int on = 1;
+    if (!init) {
+        init = 1;
+        const char *s = getenv("DS4_CUDA_GRAPH_UPLOAD_ONCE");
+        on = !(s && *s &&
+               (s[0] == '0' ||
+                strcmp(s, "off") == 0 || strcmp(s, "OFF") == 0 ||
+                strcmp(s, "no") == 0 || strcmp(s, "NO") == 0 ||
+                strcmp(s, "false") == 0 || strcmp(s, "FALSE") == 0));
+    }
+    return on;
+}
+
 static void cuda_decode_graph_entry_kill(cuda_decode_graph_entry *e) {
     if (e->exec) {
         (void)cudaGraphExecDestroy(e->exec);
         e->exec = NULL;
     }
+    e->uploaded = 0;
     e->state = 3;
 }
 
@@ -1105,6 +1132,7 @@ extern "C" void ds4_gpu_decode_graphs_invalidate(void) {
                 }
                 e->state = 0;
                 e->hits = 0;
+                e->uploaded = 0;
                 memset(&e->key, 0, sizeof(e->key));
             }
         }
@@ -1140,6 +1168,7 @@ static cuda_decode_graph_entry *cuda_decode_graph_find(
     if (slot) {
         memcpy(&slot->key, key, sizeof(*key));
         slot->state = 0;   /* caller advances the state machine */
+        slot->uploaded = 0;
         return slot;
     }
     return NULL;           /* all variants busy with other keys: stay eager */
@@ -1161,10 +1190,14 @@ extern "C" int ds4_gpu_decode_graph_prefetch(const ds4_decode_graph_key *key) {
         cuda_decode_graph_entry *e = &g_decode_graphs[key->il][key->island][v];
         if (e->state != 2 || !e->exec) continue;
         if (memcmp(&e->key, key, sizeof(*key)) != 0) continue;
+        /* Already resident: the upload this call would issue copies nothing
+         * and the launch it precedes is unaffected, so skip the node walk. */
+        if (e->uploaded && cuda_graph_upload_once_on()) return 0;
         if (cudaGraphUpload(e->exec, g_decode_graph_stream) != cudaSuccess) {
             (void)cudaGetLastError();
             return 0;
         }
+        e->uploaded = 1;
         return 1;
     }
     return 0;
@@ -1299,6 +1332,9 @@ extern "C" void ds4_gpu_oneshot_graph_retire(void) {
     (void)cudaGetLastError();
 }
 
+/* Defined below with the priority rationale; both creation sites share it. */
+static cudaStream_t cuda_decode_graph_stream_create(void);
+
 /* 0 = capturing, caller must encode and then call end(); -1 = declined, the
  * caller encodes eagerly exactly as before. */
 extern "C" int ds4_gpu_oneshot_graph_begin(void) {
@@ -1309,11 +1345,8 @@ extern "C" int ds4_gpu_oneshot_graph_begin(void) {
         /* BLOCKING stream on purpose: it synchronizes with the legacy NULL
          * stream the eager prologue and epilogue ride, which is what orders
          * the captured layer stack against them without an explicit event. */
-        if (!cuda_ok(cudaStreamCreate(&g_decode_graph_stream),
-                     "one-shot graph stream create")) {
-            g_decode_graph_stream = NULL;
-            return -1;
-        }
+        g_decode_graph_stream = cuda_decode_graph_stream_create();
+        if (!g_decode_graph_stream) return -1;
     }
     (void)cublasSetStream(cuda_cublas_for_tier(0), g_decode_graph_stream);
     if (cudaStreamBeginCapture(g_decode_graph_stream,
@@ -1342,6 +1375,92 @@ extern "C" void ds4_gpu_oneshot_graph_abort(void) {
     g_oneshot_declines++;
 }
 
+/* PRE-UPLOAD OF A CACHED DECODE GRAPH EXEC.
+ *
+ * The two per-step decode graphs below (the attention score-split pair and
+ * the routed-MoE four-node chain) are instantiated once per tier and then
+ * relaunched every decode step with fresh node parameters.  An exec that has
+ * never been uploaded pays its device-side upload inside the first
+ * `cudaGraphLaunch` that touches it, on the stream that launch is issued on,
+ * and that launch sits in the exposed head of a decode step: the host reaches
+ * it straight out of the synchronisation that read the previous step back,
+ * with a dry device in front of it.  `cudaGraphUpload` performs exactly the
+ * same work, but as a standalone stream operation issued while the tier is
+ * still being built, so the step that first launches the exec only pays the
+ * launch itself.  It changes no node, no parameter and no ordering: the graph
+ * executes identically whether or not it was uploaded beforehand.
+ *
+ * Fail-open by construction.  A driver that refuses the upload leaves the
+ * exec exactly as instantiated and the error is swallowed here so that no
+ * later unrelated `cudaGetLastError` sees it.  DS4_CUDA_GRAPH_PREUPLOAD=0
+ * skips the call entirely and restores the shipped sequence. */
+static int cuda_graph_preupload_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_CUDA_GRAPH_PREUPLOAD");
+        cached = (e != NULL && e[0] == '0') ? 0 : 1;
+    }
+    return cached;
+}
+
+static void cuda_graph_exec_preupload(cudaGraphExec_t exec, cudaStream_t stream) {
+#if !defined(CUDART_VERSION) || CUDART_VERSION >= 11010
+    if (exec == NULL || !cuda_graph_preupload_enabled()) return;
+    if (cudaGraphUpload(exec, stream) != cudaSuccess) (void)cudaGetLastError();
+#else
+    (void)exec;
+    (void)stream;
+#endif
+}
+
+/* PRIORITY OF THE DECODE ISLAND STREAM.
+ *
+ * Every captured decode island replays on `g_decode_graph_stream`, and that
+ * stream is created with the default priority, which is the same priority the
+ * eager path, the prefill-width launches and the cuBLAS handles run at.  A
+ * decode step is latency-bound and single-stream wide: its islands never fill
+ * the device, so whenever any residual work from the previous step or from a
+ * side stream is still resident, the island's blocks queue behind it for the
+ * few microseconds it takes to drain.  Creating the stream at the greatest
+ * priority the device reports makes the scheduler hand free SMs to the island
+ * first, which removes that head-of-line wait from the exposed part of the
+ * step.  Priority is a scheduling hint only: it reorders nothing that is
+ * ordered, changes no kernel, and cannot change a result.
+ *
+ * The flag stays `cudaStreamDefault` on purpose.  The stream must keep legacy
+ * NULL-stream synchronisation, because the per-step cached graphs below launch
+ * on stream 0 and the eager encode path rides the legacy stream; a
+ * non-blocking stream here would drop that implicit ordering.
+ *
+ * Fail-open: a device that reports no priority range, or a driver that refuses
+ * the prioritised creation, falls back to the shipped `cudaStreamCreate`.
+ * DS4_CUDA_GRAPH_STREAM_PRIORITY=0 takes the shipped path directly. */
+static int cuda_graph_stream_priority_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_CUDA_GRAPH_STREAM_PRIORITY");
+        cached = (e != NULL && e[0] == '0') ? 0 : 1;
+    }
+    return cached;
+}
+
+static cudaStream_t cuda_decode_graph_stream_create(void) {
+    cudaStream_t s = NULL;
+    if (cuda_graph_stream_priority_enabled()) {
+        int lo = 0, hi = 0;
+        if (cudaDeviceGetStreamPriorityRange(&lo, &hi) == cudaSuccess && hi != lo) {
+            if (cudaStreamCreateWithPriority(&s, cudaStreamDefault, hi) == cudaSuccess
+                && s != NULL) {
+                return s;
+            }
+            s = NULL;
+        }
+        (void)cudaGetLastError();
+    }
+    if (!cuda_ok(cudaStreamCreate(&s), "decode graph stream create")) return NULL;
+    return s;
+}
+
 /* 0 = the layer is launched and in flight; -1 = nothing ran, encode eagerly. */
 extern "C" int ds4_gpu_oneshot_graph_end(void) {
     if (!g_oneshot_capturing) return -1;
@@ -1364,6 +1483,9 @@ extern "C" int ds4_gpu_oneshot_graph_end(void) {
         g_oneshot_declines++;
         return -1;
     }
+    /* The image is uploaded before the asynchronous launch below, so the
+     * first replay of this layer does not carry the copy in front of it. */
+    cuda_graph_exec_preupload(exec, g_decode_graph_stream);
     /* ASYNCHRONOUS ON PURPOSE.  The host returns here while the device runs
      * this layer, and captures the next one behind it.  See the invariant. */
     err = cudaGraphLaunch(exec, g_decode_graph_stream);
@@ -1409,9 +1531,8 @@ extern "C" int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) {
     }
     /* state == 1: capture this encode. */
     if (!g_decode_graph_stream) {
-        if (!cuda_ok(cudaStreamCreate(&g_decode_graph_stream),
-                     "decode graph stream create")) {
-            g_decode_graph_stream = NULL;
+        g_decode_graph_stream = cuda_decode_graph_stream_create();
+        if (!g_decode_graph_stream) {
             cuda_decode_graph_entry_kill(e);
             return -1;
         }
@@ -1459,6 +1580,23 @@ extern "C" int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) {
         cuda_decode_graph_entry_kill(e);
         return -1;
     }
+    /* Upload ahead of the first launch rather than after it: the launch
+     * below then finds the graph image already resident on the device, and
+     * a failure is not fatal because the launch still uploads itself. */
+    if (cuda_decode_graph_upload_on()) {
+        (void)cudaGraphUpload(exec, g_decode_graph_stream);
+        (void)cudaGetLastError();
+        /* This island's image is now resident for the life of this exec: the
+         * chunk-to-chunk prefetch does not have to re-issue it per token. */
+        e->uploaded = 1;
+    } else {
+        /* Same copy, the other gate: the island image still has to reach the
+         * device before the launch below, and paying it inside that first
+         * replay is what the pre-upload path exists to avoid.  The helper has
+         * its own gate, so residency is not asserted here. */
+        cuda_graph_exec_preupload(exec, g_decode_graph_stream);
+        e->uploaded = 0;
+    }
     /* Capture recorded the work without executing it: launch now so this
      * token's island actually runs. */
     err = cudaGraphLaunch(exec, g_decode_graph_stream);
@@ -1473,13 +1611,6 @@ extern "C" int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) {
     e->exec = exec;
     e->state = 2;
     g_decode_graph_captures++;
-    /* The upload the first replay would otherwise do, done here instead. A
-     * failure is not fatal: the launch does the upload itself, which is the
-     * behaviour without this call. */
-    if (cuda_decode_graph_upload_on()) {
-        (void)cudaGraphUpload(exec, g_decode_graph_stream);
-        (void)cudaGetLastError();
-    }
     if (getenv("DS4_CUDA_DECODE_GRAPH_LOG") != NULL) {
         fprintf(stderr, "ds4: decode graph captured il=%u island=%u (total %llu)\n",
                 key->il, key->island,
@@ -7194,7 +7325,13 @@ __device__ __forceinline__ static void q8_mma_bar_arrive(int id, int count) {
 #define Q8_MMA_MINB 1
 #endif
 
-template <int WM, int WN, int MT, int NT, int G, int STAGES>
+/* CvtC: the weight block scales are converted half -> float BY THE CONSUMER,
+ * straight out of sB, instead of by the producer into a separate sWs buffer.
+ * It is the same halfword through the same __half2float feeding the same FMA
+ * in the same order, so it is bit-exact; what it removes is the producer's
+ * `bar.sync 15` rendezvous, which existed only because the conversion loop
+ * read scales that OTHER producer warps had stored. */
+template <int WM, int WN, int MT, int NT, int G, int STAGES, bool CvtC = false>
 struct q8_mma_pipe_cfg {
     static constexpr int BM = WM * MT * 16;
     static constexpr int BN = WN * NT * 8;
@@ -7212,7 +7349,7 @@ struct q8_mma_pipe_cfg {
     static constexpr int A_BYTES = BM * A_STRIDE;
     static constexpr int B_BYTES = BN * B_STRIDE;
     static constexpr int AS_BYTES = BM * G * 4;
-    static constexpr int WS_BYTES = G * BN * 4;          /* converted weight scales [gg][BN] */
+    static constexpr int WS_BYTES = CvtC ? 0 : (G * BN * 4); /* converted weight scales [gg][BN] */
     static constexpr int STAGE_BYTES = A_BYTES + B_BYTES + AS_BYTES + WS_BYTES;
     static constexpr int SMEM = STAGES * STAGE_BYTES;
     static_assert(G == 2 || G == 4 || G == 8, "G is the k32 steps per stage");
@@ -7223,7 +7360,7 @@ struct q8_mma_pipe_cfg {
     static_assert(B_GCD >= 4, "skew must keep word parity");
 };
 
-template <int WM, int WN, int MT, int NT, int G, int STAGES, bool ActPol = false>
+template <int WM, int WN, int MT, int NT, int G, int STAGES, bool ActPol = false, bool CvtC = false>
 __global__ __launch_bounds__((WM * WN + 4) * 32, Q8_MMA_MINB) static void
 matmul_q8_0_preq_rows_mma_pipe_kernel(float *out,
                                       const unsigned char *w,
@@ -7232,7 +7369,7 @@ matmul_q8_0_preq_rows_mma_pipe_kernel(float *out,
                                       uint64_t out_dim,
                                       uint32_t n_rows,
                                       uint64_t blocks) {
-    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES> C;
+    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES, CvtC> C;
     constexpr int BM = C::BM, BN = C::BN;
     const uint64_t act_pol = ActPol ? q8_mma_pol_last() : 0ull;
 
@@ -7365,6 +7502,19 @@ matmul_q8_0_preq_rows_mma_pipe_kernel(float *out,
                 const int c = idx - r * C::B_CHUNKS;
                 if (idx < BN * C::B_CHUNKS) q8_mma_sts_16(sB + r * C::B_STRIDE + c * 16, rb[k]);
             }
+            if (CvtC) {
+                /* The consumer converts the block scales itself, so no
+                 * producer reads another producer's stores and the four
+                 * warps never rendezvous: a warp whose loads have landed
+                 * issues the next stage without waiting for the slowest.
+                 * `bar.arrive` carries no memory ordering of its own (the
+                 * rendezvous below was providing it as a side effect) and
+                 * `__syncwarp` is intra-warp, so the stores are released
+                 * with an explicit block fence. */
+                __threadfence_block();
+                q8_mma_bar_arrive(1 + 2 * buf, BAR_COUNT);
+                continue;
+            }
             /* Every producer's stores are visible to every producer: the
              * scales below lie in rows another one stored. */
             q8_mma_bar_sync(15, C::PWARPS * 32);
@@ -7457,7 +7607,23 @@ matmul_q8_0_preq_rows_mma_pipe_kernel(float *out,
                     bf[0] = pw[0];
                     bf[1] = pw[4];
                 }
-                const float2 wsp = *(const float2 *)(sWs + gg * BN + c + (int)t4 * 2);
+                float2 wsp;
+                if (CvtC) {
+                    /* The two halfwords are the q8_0 block scales of output
+                     * rows c + t4*2 and c + t4*2 + 1 -- the same bytes the
+                     * producer fed to sWs.  B_STRIDE/4 = 4 (mod 32), so the
+                     * eight distinct rows a warp needs land on eight distinct
+                     * banks and the eight lanes sharing a t4 broadcast; skew
+                     * is even and gg*34 is even, so both are 2-byte aligned. */
+                    const unsigned char *ps = sB + (c + (int)t4 * 2) * C::B_STRIDE + skew + gg * 34;
+                    uint16_t hs0, hs1;
+                    memcpy(&hs0, ps, 2);
+                    memcpy(&hs1, ps + C::B_STRIDE, 2);
+                    wsp = make_float2(__half2float(__ushort_as_half(hs0)),
+                                      __half2float(__ushort_as_half(hs1)));
+                } else {
+                    wsp = *(const float2 *)(sWs + gg * BN + c + (int)t4 * 2);
+                }
                 int32_t d[MT][4];
 #pragma unroll
                 for (int mi = 0; mi < MT; mi++) q8_mma_m16n8k32_seeded(d[mi], af[mi], bf, magic);
@@ -11466,6 +11632,8 @@ static int attention_decode_score_split_graph_launch(
             attention_decode_score_split_graph_destroy_one(logical_tier);
             return -1;
         }
+        /* Upload before the step that first launches it; see the helper. */
+        cuda_graph_exec_preupload(c->exec, 0);
         c->n_head = n_head;
         c->head_dim = head_dim;
         c->S = S;
@@ -12495,6 +12663,44 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
         out4[lane + 96u] = o3;
     }
 }
+
+/* STAGE DEPTH OF THE PREFILL-WIDTH INDEXED QSA ONLINE KERNEL.
+ *
+ * The kernel below streams the selected KV rows of one query token through a
+ * shared staging tile, `ROWS_PER_STAGE` rows at a time, and folds each row
+ * into the block's online-softmax accumulators in ASCENDING ROW ORDER.  The
+ * row order does not depend on the stage depth: the outer loop advances
+ * `row0` by the depth and the inner loop walks `rr = 0 .. nr-1`, so rows are
+ * visited as 0, 1, 2, ... for every depth.  The accumulator recurrence is
+ * therefore the same sequence of the same float operations at any depth, and
+ * the emitted head vector is bit-identical -- this is a scheduling change,
+ * not a reassociation.
+ *
+ * The depth is what the row stream costs.  Each stage pays two block-wide
+ * barriers (one after the fill, one before the tile is overwritten) and, at
+ * the barrier, the whole block waits on the LAST outstanding global load of
+ * the fill; the 16 warps have nothing else to run, because the consume phase
+ * of the same stage is what follows.  At a depth of 8 rows over 512 threads
+ * the fill is one 16-byte load per thread, which is far too little to cover
+ * the latency of a gathered read out of the compressed KV pool: the tile is
+ * indexed through `topk`, so consecutive rows are arbitrary pool rows and
+ * every stage is a fresh dependent gather.  Doubling the depth halves the
+ * number of those exposed barrier pairs over a row set, and hands the
+ * memory pipe two loads per thread per stage to overlap instead of one, so
+ * the second one is already in flight while the first is being waited on.
+ * Prefill and batched verify are the widths that reach this kernel
+ * (`n_tokens > 1`); decode takes the score-split path above.
+ *
+ * The cost is shared memory: the tile is `depth * 128` float4, so 16 rows is
+ * 32 KiB per block, under the 48 KiB static limit, and the two resident
+ * blocks the launch bounds ask for fit the ranked device's per-SM shared
+ * budget with room to spare.  Nothing else in the block scales with depth --
+ * `raw_rows` is fixed at 256 entries and the accumulators are registers.
+ * Building with -DDS4_QSA_ONLINE_STAGE_ROWS=8u restores the shipped depth in
+ * the same source. */
+#ifndef DS4_QSA_ONLINE_STAGE_ROWS
+#define DS4_QSA_ONLINE_STAGE_ROWS 16u
+#endif
 
 template <uint32_t ROWS_PER_STAGE, uint32_t HEADS_PER_GROUP>
 __global__ static void __launch_bounds__(512, 2)
@@ -13833,7 +14039,102 @@ static int ds4_cuda_attn_tokentile_arch_ok(void) {
     return prop.major >= 8;
 }
 
-__global__ static void __launch_bounds__(256, 4)
+/* Head-group width for the single-token decode pass of the online-softmax
+ * mixed attention kernel.  One warp owns one query head and every warp in the
+ * block consumes the same staged KV rows, so the width decides how many heads
+ * a single pass over the KV page serves: at 8 the 512-float KV row is fetched
+ * once per 8 heads, at 16 once per 16.  Decode is the leg where that stream is
+ * the whole cost -- the resident KV rows are read end to end for one token, so
+ * halving the number of block-level passes halves the kernel's global traffic.
+ *
+ * Nothing in the block scales with the width: `raw_rows` is a fixed 256-entry
+ * index list, the staging tile stays 4 rows (8 KiB), and every softmax
+ * accumulator is a per-warp register.  The launch bound keeps the resident
+ * thread count at 1024 per SM for either width, so the wider block trades two
+ * resident blocks for four without changing the register budget per thread.
+ * The arithmetic per head is untouched, so the emitted tokens are bit-identical
+ * across widths.  Building with -DDS4_DECODE_HEAD_GROUP_W=8u restores the
+ * shipped width in the same source. */
+#ifndef DS4_DECODE_HEAD_GROUP_W
+#define DS4_DECODE_HEAD_GROUP_W 16u
+#endif
+
+/* Depth of the shared KV staging tile in the same kernel.  The block stages
+ * `DS4_DECODE_KV_STAGE_ROWS` KV rows, barriers once, scores them from shared
+ * memory, and barriers again before refilling, so the number of block-wide
+ * barriers over a decode step is `n_score / depth` pairs and the number of
+ * independent row loads in flight per staging pass is `depth * 512` floats.
+ * At depth 4 a 512-thread block issues exactly one float4 load per thread per
+ * pass and then stalls on the barrier with only 8 KiB of the KV page in
+ * flight; at depth 8 each thread issues two independent loads, the barrier
+ * count halves, and the memory pipe stays fed across the scoring phase.  The
+ * tile costs `depth * 2 KiB` of shared memory (16 KiB at depth 8, plus the
+ * 1 KiB row-index list), which still leaves the two resident blocks per SM the
+ * launch bound asks for.  Rows are consumed in the same increasing order at
+ * any depth and each row's online-softmax update is unchanged, so the emitted
+ * tokens are bit-identical.  Building with -DDS4_DECODE_KV_STAGE_ROWS=4u
+ * restores the shipped depth in the same source. */
+#ifndef DS4_DECODE_KV_STAGE_ROWS
+#define DS4_DECODE_KV_STAGE_ROWS 8u
+#endif
+
+/* Double buffering of that staging tile.  The single-token decode block used
+ * to spend two block-wide barriers per staging pass: one to publish the rows
+ * it had just copied in, and one after scoring to make the tile safe to
+ * overwrite.  With two tiles the pass issues the NEXT pass's global loads
+ * into the idle tile immediately after the publishing barrier and then scores
+ * the live tile, so the copy latency of pass i+1 overlaps the online-softmax
+ * update of pass i and the post-scoring barrier disappears: one barrier per
+ * pass instead of two, and the loads of pass i+1 are in flight for the whole
+ * length of pass i's scoring rather than issued cold after it.
+ *
+ * The write-after-read hazard on the idle tile is carried by the same single
+ * barrier.  A pass writes the tile the previous pass read, and the previous
+ * pass's reads are separated from those writes by the publishing barrier at
+ * the top of the pass.  Rows are still staged and consumed in ascending
+ * order, nothing is reassociated, and the running max/sum/accumulator update
+ * per row is untouched, so the emitted tokens are bit-identical to the
+ * single-tile schedule.  The cost is one extra staging tile of shared memory
+ * (`DS4_DECODE_KV_STAGE_ROWS * 2 KiB`), which the decode launch has to spare:
+ * it runs one block per head group with no occupancy competition.  Building
+ * with -DDS4_DECODE_KV_DOUBLE_BUFFER=0 restores the single-tile schedule in
+ * the same source. */
+#ifndef DS4_DECODE_KV_DOUBLE_BUFFER
+#define DS4_DECODE_KV_DOUBLE_BUFFER 1
+#endif
+
+/* Single-use global reads for the staged KV rows.
+ *
+ * Every float4 a staging pass pulls out of `raw_kv` / `comp_kv` is written
+ * straight into shared memory and is read back from shared, never from
+ * global, for the rest of the block's life: each block owns a distinct head
+ * group but walks the SAME key/value rows, so a row line that lands in L1
+ * here is dead weight in this SM after the copy retires.  At single-token
+ * decode the block also keeps hot lines it does re-read - the query vectors
+ * held in registers are loaded once, but `raw_rows`, the online-softmax
+ * scratch and the next launch's weight stream all compete for the same L1
+ * and the same L2 sectors.  Issuing the KV stage with the evict-first
+ * streaming qualifier marks those lines as lowest priority, so the copy no
+ * longer displaces the reused lines on its way through the cache.
+ *
+ * This changes cache replacement priority only.  The loaded bytes, their
+ * order, and the accumulation order downstream are all unchanged, so the
+ * emitted tokens are bit-identical.  Building with
+ * -DDS4_DECODE_KV_STREAM_LOADS=0 restores the default-cached loads. */
+#ifndef DS4_DECODE_KV_STREAM_LOADS
+#define DS4_DECODE_KV_STREAM_LOADS 1
+#endif
+
+__device__ __forceinline__ static float4 ds4_decode_kv_stage_load(const float4 *p) {
+#if DS4_DECODE_KV_STREAM_LOADS
+    return __ldcs(p);
+#else
+    return *p;
+#endif
+}
+
+template <uint32_t HEADS_PER_GROUP>
+__global__ static void __launch_bounds__(HEADS_PER_GROUP * 32u, 1024u / (HEADS_PER_GROUP * 32u))
 attention_decode_mixed_heads8_online_kernel(
         float *heads,
         const float *sinks,
@@ -13855,13 +14156,17 @@ attention_decode_mixed_heads8_online_kernel(
     if (t >= n_tokens || head_dim != 512u) return;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
-    const uint32_t head = head_group * 8u + warp;
+    const uint32_t head = head_group * HEADS_PER_GROUP + warp;
     const bool valid_head = head < n_head;
 
     __shared__ uint32_t raw_rows[256];
     __shared__ uint32_t raw_count_s;
     __shared__ uint32_t raw_first_idx_s;
-    __shared__ float4 kv_shared[4 * 128];
+#if DS4_DECODE_KV_DOUBLE_BUFFER
+    __shared__ float4 kv_shared[2 * DS4_DECODE_KV_STAGE_ROWS * 128];
+#else
+    __shared__ float4 kv_shared[DS4_DECODE_KV_STAGE_ROWS * 128];
+#endif
 
     const uint32_t qpos = pos0 + t;
     const uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
@@ -13923,8 +14228,90 @@ attention_decode_mixed_heads8_online_kernel(
     float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 o1 = o0, o2 = o0, o3 = o0;
 
-    for (uint32_t row0 = 0; row0 < n_score; row0 += 4u) {
-        const uint32_t nr = n_score - row0 < 4u ? n_score - row0 : 4u;
+#if DS4_DECODE_KV_DOUBLE_BUFFER
+    if (n_score != 0u) {
+        uint32_t cur = 0u;
+        {
+            const uint32_t nr0 = n_score < DS4_DECODE_KV_STAGE_ROWS
+                ? n_score
+                : DS4_DECODE_KV_STAGE_ROWS;
+            for (uint32_t off = threadIdx.x; off < nr0 * 128u; off += blockDim.x) {
+                const uint32_t rr = off >> 7u;
+                const uint32_t c4 = off & 127u;
+                const float4 *src = rr < raw_count
+                    ? (const float4 *)(raw_kv + (uint64_t)raw_rows[rr] * head_dim)
+                    : (const float4 *)(comp_kv + (uint64_t)(rr - raw_count) * head_dim);
+                kv_shared[off] = ds4_decode_kv_stage_load(src + c4);
+            }
+        }
+        for (uint32_t row0 = 0; row0 < n_score; row0 += DS4_DECODE_KV_STAGE_ROWS) {
+            const uint32_t nr = n_score - row0 < DS4_DECODE_KV_STAGE_ROWS
+                ? n_score - row0
+                : DS4_DECODE_KV_STAGE_ROWS;
+            __syncthreads();
+            const uint32_t nxt = cur ^ 1u;
+            const uint32_t next_row0 = row0 + DS4_DECODE_KV_STAGE_ROWS;
+            if (next_row0 < n_score) {
+                const uint32_t nn = n_score - next_row0 < DS4_DECODE_KV_STAGE_ROWS
+                    ? n_score - next_row0
+                    : DS4_DECODE_KV_STAGE_ROWS;
+                float4 *stage = kv_shared + nxt * (DS4_DECODE_KV_STAGE_ROWS * 128u);
+                for (uint32_t off = threadIdx.x; off < nn * 128u; off += blockDim.x) {
+                    const uint32_t rr = off >> 7u;
+                    const uint32_t c4 = off & 127u;
+                    const uint32_t sr = next_row0 + rr;
+                    const float4 *src = sr < raw_count
+                        ? (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim)
+                        : (const float4 *)(comp_kv + (uint64_t)(sr - raw_count) * head_dim);
+                    stage[off] = ds4_decode_kv_stage_load(src + c4);
+                }
+            }
+            if (valid_head) {
+                const float4 *live = kv_shared + cur * (DS4_DECODE_KV_STAGE_ROWS * 128u);
+                for (uint32_t rr = 0; rr < nr; rr++) {
+                    const float4 *kv4 = live + rr * 128u;
+                    float4 k0 = kv4[lane +  0u];
+                    float4 k1 = kv4[lane + 32u];
+                    float4 k2 = kv4[lane + 64u];
+                    float4 k3 = kv4[lane + 96u];
+                    float score = dot4_f32(q0, k0) +
+                                  dot4_f32(q1, k1) +
+                                  dot4_f32(q2, k2) +
+                                  dot4_f32(q3, k3);
+                    score = warp_sum_f32(score) * scale;
+                    score = __shfl_sync(0xffffffffu, score, 0);
+
+                    const float new_m = fmaxf(max_s, score);
+                    const float old_scale = expf(max_s - new_m);
+                    const float row_scale = expf(score - new_m);
+                    sum_s = sum_s * old_scale + row_scale;
+                    o0.x = o0.x * old_scale + k0.x * row_scale;
+                    o0.y = o0.y * old_scale + k0.y * row_scale;
+                    o0.z = o0.z * old_scale + k0.z * row_scale;
+                    o0.w = o0.w * old_scale + k0.w * row_scale;
+                    o1.x = o1.x * old_scale + k1.x * row_scale;
+                    o1.y = o1.y * old_scale + k1.y * row_scale;
+                    o1.z = o1.z * old_scale + k1.z * row_scale;
+                    o1.w = o1.w * old_scale + k1.w * row_scale;
+                    o2.x = o2.x * old_scale + k2.x * row_scale;
+                    o2.y = o2.y * old_scale + k2.y * row_scale;
+                    o2.z = o2.z * old_scale + k2.z * row_scale;
+                    o2.w = o2.w * old_scale + k2.w * row_scale;
+                    o3.x = o3.x * old_scale + k3.x * row_scale;
+                    o3.y = o3.y * old_scale + k3.y * row_scale;
+                    o3.z = o3.z * old_scale + k3.z * row_scale;
+                    o3.w = o3.w * old_scale + k3.w * row_scale;
+                    max_s = new_m;
+                }
+            }
+            cur = nxt;
+        }
+    }
+#else
+    for (uint32_t row0 = 0; row0 < n_score; row0 += DS4_DECODE_KV_STAGE_ROWS) {
+        const uint32_t nr = n_score - row0 < DS4_DECODE_KV_STAGE_ROWS
+            ? n_score - row0
+            : DS4_DECODE_KV_STAGE_ROWS;
         for (uint32_t off = threadIdx.x; off < nr * 128u; off += blockDim.x) {
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
@@ -13974,6 +14361,7 @@ attention_decode_mixed_heads8_online_kernel(
         }
         __syncthreads();
     }
+#endif
 
     if (valid_head) {
         const float sink = sinks[head];
@@ -18161,12 +18549,12 @@ extern "C" int ds4_gpu_q8_mma_pipe_last_bn(void) {
 /* The dynamic shared memory opt-in, once per instantiation; done eagerly
  * from ds4_gpu_enable_q8_dense_mma so no launch has to do it inside a
  * stream capture. */
-template <int WM, int WN, int MT, int NT, int G, int STAGES, bool ActPol = false>
+template <int WM, int WN, int MT, int NT, int G, int STAGES, bool ActPol = false, bool CvtC = false>
 static bool cuda_q8_mma_pipe_attr(void) {
-    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES> C;
+    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES, CvtC> C;
     static int state = 0;   /* 0 unset, 1 ok, -1 refused */
     if (state == 0) {
-        state = (cudaFuncSetAttribute(matmul_q8_0_preq_rows_mma_pipe_kernel<WM, WN, MT, NT, G, STAGES, ActPol>,
+        state = (cudaFuncSetAttribute(matmul_q8_0_preq_rows_mma_pipe_kernel<WM, WN, MT, NT, G, STAGES, ActPol, CvtC>,
                                       cudaFuncAttributeMaxDynamicSharedMemorySize,
                                       C::SMEM) == cudaSuccess) ? 1 : -1;
         if (state < 0) (void)cudaGetLastError();
@@ -18193,17 +18581,48 @@ static int cuda_q8_mma_pipe_actpol(void) {
     return cached;
 }
 
+/* DS4_CUDA_Q8_CVTSCALE=0 restores the shipped producer exactly (the
+ * CvtC=false instantiation IS the shipped kernel: the same template
+ * arguments it had before this parameter existed, so the same PTX).  Unset
+ * or anything else converts the weight block scales in the consumer and
+ * drops the producer's `bar.sync 15` rendezvous and its sWs buffer.  The
+ * arithmetic is untouched -- same halfword, same __half2float, same FMA
+ * order -- and the standalone harness word-compares all 1024 x out_dim
+ * outputs against the shipped ladder on five production shapes. */
+static int g_q8_mma_pipe_cvtscale = -1;
+static int cuda_q8_mma_pipe_cvtscale(void) {
+    if (g_q8_mma_pipe_cvtscale < 0) {
+        const char *e = getenv("DS4_CUDA_Q8_CVTSCALE");
+        g_q8_mma_pipe_cvtscale = (e != NULL && e[0] == '0') ? 0 : 1;
+    }
+    return g_q8_mma_pipe_cvtscale;
+}
+
 template <int WM, int WN, int MT, int NT, int G, int STAGES>
 static int cuda_q8_mma_pipe_launch(float *out, const unsigned char *w,
                                    const int8_t *xq, const float *xscale,
                                    uint64_t out_dim, uint32_t n_rows,
                                    uint64_t blocks) {
-    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES> C;
+    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES> C;          /* shipped smem */
+    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES, true> CC;    /* no sWs */
+    /* The BASE opt-in still decides whether this rung exists at all, so the
+     * valve can never make a rung launch that the shipped ladder refuses. */
     if (!cuda_q8_mma_pipe_attr<WM, WN, MT, NT, G, STAGES>()) return 0;
+    const bool cvtc = cuda_q8_mma_pipe_cvtscale() &&
+                      cuda_q8_mma_pipe_attr<WM, WN, MT, NT, G, STAGES, false, true>();
     const bool actpol = out_dim >= 4096u && cuda_q8_mma_pipe_actpol() &&
-                        cuda_q8_mma_pipe_attr<WM, WN, MT, NT, G, STAGES, true>();
+                        (cvtc ? cuda_q8_mma_pipe_attr<WM, WN, MT, NT, G, STAGES, true, true>()
+                              : cuda_q8_mma_pipe_attr<WM, WN, MT, NT, G, STAGES, true>());
     dim3 grid((n_rows + C::BM - 1u) / C::BM, (unsigned)((out_dim + C::BN - 1u) / C::BN), 1u);
-    if (actpol) {
+    if (cvtc) {
+        if (actpol) {
+            matmul_q8_0_preq_rows_mma_pipe_kernel<WM, WN, MT, NT, G, STAGES, true, true>
+                <<<grid, CC::THREADS, CC::SMEM, cuda_decode_stream()>>>(out, w, xq, xscale, out_dim, n_rows, blocks);
+        } else {
+            matmul_q8_0_preq_rows_mma_pipe_kernel<WM, WN, MT, NT, G, STAGES, false, true>
+                <<<grid, CC::THREADS, CC::SMEM, cuda_decode_stream()>>>(out, w, xq, xscale, out_dim, n_rows, blocks);
+        }
+    } else if (actpol) {
         matmul_q8_0_preq_rows_mma_pipe_kernel<WM, WN, MT, NT, G, STAGES, true>
             <<<grid, C::THREADS, C::SMEM, cuda_decode_stream()>>>(out, w, xq, xscale, out_dim, n_rows, blocks);
     } else {
@@ -18219,6 +18638,12 @@ static void cuda_q8_mma_pipe_prepare(void) {
     (void)cuda_q8_mma_pipe_attr<2, 2, 4, 4, 4, 2>();
     (void)cuda_q8_mma_pipe_attr<2, 4, 4, 4, 4, 2>();
     (void)cuda_q8_mma_pipe_attr<2, 8, 4, 4, 4, 2>();
+    (void)cuda_q8_mma_pipe_attr<2, 2, 4, 4, 4, 2, false, true>();
+    (void)cuda_q8_mma_pipe_attr<2, 4, 4, 4, 4, 2, false, true>();
+    (void)cuda_q8_mma_pipe_attr<2, 8, 4, 4, 4, 2, false, true>();
+    (void)cuda_q8_mma_pipe_attr<2, 2, 4, 4, 4, 2, true, true>();
+    (void)cuda_q8_mma_pipe_attr<2, 4, 4, 4, 4, 2, true, true>();
+    (void)cuda_q8_mma_pipe_attr<2, 8, 4, 4, 4, 2, true, true>();
 }
 
 /* The pipelined tile's shape ladder.  Returns 0 when the call is not one it
@@ -19463,6 +19888,22 @@ extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_
  * `take` is uniform across the block, and the reduction runs for all R slots
  * whatever `take` is, so every thread reaches the same barriers.
  */
+/* The tile depth the prefill arm of ds4_gpu_matmul_f32_decode_rows_exact_tensor
+ * asks this kernel for.  The weight row is the traffic: at depth R a column
+ * block reads wr[i] once and spends it on R activation rows, so the F32
+ * projections that decline the warp tile (the GDN in/out panels and the small
+ * [2560, 48] heads, whose out_dim is not a whole number of warp-tile columns)
+ * move half the weight bytes at 16 that they move at 8.  Nothing about the
+ * arithmetic depends on R: each row keeps its own accumulator chain over the
+ * same i walk and its own column of the halving tree, so every output is the
+ * bits the depth-8 launch stored.  The cost is the shared tree, 4R bytes per
+ * thread -- 16 KiB a block at 16, still inside the 48 KiB static limit.
+ * Building with -DDS4_F32_ROWS_EXACT_TILE_R=8 restores the shipped depth in
+ * the same source. */
+#ifndef DS4_F32_ROWS_EXACT_TILE_R
+#define DS4_F32_ROWS_EXACT_TILE_R 16
+#endif
+
 template <int R>
 __global__ static void matmul_f32_rows_exact_tile_kernel(
         float *out,
@@ -20895,7 +21336,14 @@ extern "C" int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
         }
         return cuda_ok(cudaGetLastError(), "matmul_f32 warp tile launch");
     }
-    if (n_rows >= 8u) {
+    if (n_rows >= (uint32_t)DS4_F32_ROWS_EXACT_TILE_R) {
+        const unsigned rtile = (unsigned)DS4_F32_ROWS_EXACT_TILE_R;
+        dim3 grid((unsigned)out_dim, (n_rows + rtile - 1u) / rtile, 1);
+        matmul_f32_rows_exact_tile_kernel<DS4_F32_ROWS_EXACT_TILE_R>
+            <<<grid, 256, 0, cuda_decode_stream()>>>(
+                (float *)out->ptr, (const float *)w, (const float *)x->ptr,
+                in_dim, out_dim, n_rows);
+    } else if (n_rows >= 8u) {
         dim3 grid((unsigned)out_dim, (n_rows + 7u) / 8u, 1);
         matmul_f32_rows_exact_tile_kernel<8>
             <<<grid, 256, 0, cuda_decode_stream()>>>(
@@ -22447,8 +22895,9 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
         if (!use_mask && head_dim == 512u &&
             !g_cuda_no_window_attention) {
             const uint32_t synthetic_pos0 = n_raw - 1u;
-            dim3 online_grid(1, (n_head + 7u) / 8u, 1);
-            attention_decode_mixed_heads8_online_kernel<<<online_grid, 256>>>((float *)heads->ptr,
+            dim3 online_grid(1, (n_head + DS4_DECODE_HEAD_GROUP_W - 1u) / DS4_DECODE_HEAD_GROUP_W, 1);
+            attention_decode_mixed_heads8_online_kernel<DS4_DECODE_HEAD_GROUP_W>
+                <<<online_grid, DS4_DECODE_HEAD_GROUP_W * 32u>>>((float *)heads->ptr,
                                                                               sinks,
                                                                               (const float *)q->ptr,
                                                                               (const float *)raw_kv->ptr,
@@ -22472,8 +22921,9 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
         g_cuda_decode_heads8_online &&
         !g_cuda_no_window_attention) {
         const uint32_t synthetic_pos0 = n_raw - 1u;
-        dim3 online_grid(1, (n_head + 7u) / 8u, 1);
-        attention_decode_mixed_heads8_online_kernel<<<online_grid, 256>>>((float *)heads->ptr,
+        dim3 online_grid(1, (n_head + DS4_DECODE_HEAD_GROUP_W - 1u) / DS4_DECODE_HEAD_GROUP_W, 1);
+        attention_decode_mixed_heads8_online_kernel<DS4_DECODE_HEAD_GROUP_W>
+            <<<online_grid, DS4_DECODE_HEAD_GROUP_W * 32u>>>((float *)heads->ptr,
                                                                           sinks,
                                                                           (const float *)q->ptr,
                                                                           (const float *)raw_kv->ptr,
@@ -23035,7 +23485,7 @@ static int attention_decode_batch_launch(
         if (!use_comp_mask && head_dim == 512u &&
             !g_cuda_no_window_attention) {
             dim3 online_grid(n_tokens, (n_head + 7u) / 8u, 1);
-            attention_decode_mixed_heads8_online_kernel<<<online_grid, 256>>>((float *)heads->ptr,
+            attention_decode_mixed_heads8_online_kernel<8u><<<online_grid, 256>>>((float *)heads->ptr,
                                                                               sinks,
                                                                               (const float *)q->ptr,
                                                                               (const float *)raw_kv->ptr,
@@ -23059,7 +23509,7 @@ static int attention_decode_batch_launch(
         !g_cuda_no_window_attention &&
         (getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL || (!g_quality_mode && n_tokens >= 128u))) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
-        attention_decode_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
+        attention_decode_mixed_heads8_online_kernel<8u><<<grid, 256>>>((float *)heads->ptr,
                                                                    sinks,
                                                                    (const float *)q->ptr,
                                                                    (const float *)raw_kv->ptr,
@@ -23079,8 +23529,9 @@ static int attention_decode_batch_launch(
     if (!use_comp_mask && n_tokens == 1u && head_dim == 512 &&
         g_cuda_decode_heads8_online &&
         !g_cuda_no_window_attention) {
-        dim3 grid(1, (n_head + 7u) / 8u, 1);
-        attention_decode_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
+        dim3 grid(1, (n_head + DS4_DECODE_HEAD_GROUP_W - 1u) / DS4_DECODE_HEAD_GROUP_W, 1);
+        attention_decode_mixed_heads8_online_kernel<DS4_DECODE_HEAD_GROUP_W>
+            <<<grid, DS4_DECODE_HEAD_GROUP_W * 32u>>>((float *)heads->ptr,
                                                                    sinks,
                                                                    (const float *)q->ptr,
                                                                    (const float *)raw_kv->ptr,
@@ -23351,23 +23802,24 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         getenv("DS4_CUDA_NO_INDEXED_HEADS8") == NULL) {
         if (getenv("DS4_CUDA_INDEXED_TWOPASS") == NULL) {
             dim3 grid(n_tokens, (n_head + 15u) / 16u, 1);
-            attention_indexed_mixed_heads8_online_kernel<8, 16><<<grid, 512>>>((float *)heads->ptr,
-                                                                               sinks,
-                                                                               (const float *)q->ptr,
-                                                                               (const float *)raw_kv->ptr,
-                                                                               (const float *)comp_kv->ptr,
-                                                                               topk_ptr,
-                                                                               n_tokens,
-                                                                               pos0,
-                                                                               n_raw,
-                                                                               raw_cap,
-                                                                               raw_start,
-                                                                               n_comp,
-                                                                               top_k,
-                                                                               window,
-                                                                               ratio,
-                                                                               n_head,
-                                                                               head_dim);
+            attention_indexed_mixed_heads8_online_kernel<DS4_QSA_ONLINE_STAGE_ROWS, 16>
+                <<<grid, 512>>>((float *)heads->ptr,
+                                sinks,
+                                (const float *)q->ptr,
+                                (const float *)raw_kv->ptr,
+                                (const float *)comp_kv->ptr,
+                                topk_ptr,
+                                n_tokens,
+                                pos0,
+                                n_raw,
+                                raw_cap,
+                                raw_start,
+                                n_comp,
+                                top_k,
+                                window,
+                                ratio,
+                                n_head,
+                                head_dim);
             return cuda_ok(cudaGetLastError(), "attention indexed online launch");
         }
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
@@ -27788,6 +28240,8 @@ static int routed_moe_decode_q4_graph_launch(
             routed_moe_decode_graph_destroy_one(logical_tier);
             return -1;
         }
+        /* Upload before the step that first launches it; see the helper. */
+        cuda_graph_exec_preupload(c->exec, 0);
         c->n_expert = n_expert;
         c->expert_in_dim = expert_in_dim;
         c->expert_mid_dim = expert_mid_dim;
