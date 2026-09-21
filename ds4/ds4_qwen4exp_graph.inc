@@ -1588,6 +1588,17 @@ static bool qw_qsa_gate_from_doubled(uint32_t n_tokens, uint32_t q_width,
            (inplace_off != 0);
 }
 
+/* MTP3 verifies four rows at once.  The exact GDN/QSA projection kernels and
+ * the joint Q/KV preparation already carry a row-generic path, but the graph
+ * gate historically stopped at the ordinary two-row decode width.  Keep a
+ * single valve for this experiment so the complete four-row seam can be
+ * disabled without changing the official lane. */
+static bool qw_w4_fused(uint32_t n_tokens) {
+    static int on = -1;
+    if (on < 0) on = getenv("DS4_QWEN4EXP_NO_W4_FUSED") == NULL ? 1 : 0;
+    return n_tokens <= 4u && on != 0;
+}
+
 /* The GDN block.  head_layout is TILED for anything the loader bound: the
  * llama.cpp converter reorders the value heads into ggml's broadcast order and
  * the binder does not undo it, so value head j reads key head j % n_key_head. */
@@ -1653,7 +1664,7 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
 #endif
 
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    if (n_tokens<=2u && getenv("DS4_QWEN4EXP_NO_GDN_PROJECTION_FUSION")==NULL) {
+    if (qw_w4_fused(n_tokens) && getenv("DS4_QWEN4EXP_NO_GDN_PROJECTION_FUSION")==NULL) {
         ds4_gpu_tensor *outs[4]={s->gdn_qkv,s->gdn_gate,s->gdn_alpha,s->gdn_beta};
         const void *maps[4]={QW_MAP(m,l->attn_qkv),QW_MAP(m,l->attn_gate),
                             QW_MAP(m,l->ssm_alpha),QW_MAP(m,l->ssm_beta)};
@@ -1823,7 +1834,7 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
 
     /* Projections.  q is DOUBLED: half query, half output gate. */
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    if (n_tokens<=2u && getenv("DS4_QWEN4EXP_NO_QSA_Q8_TRIPLE")==NULL) {
+    if (qw_w4_fused(n_tokens) && getenv("DS4_QWEN4EXP_NO_QSA_Q8_TRIPLE")==NULL) {
         ds4_gpu_tensor *outs[3]={s->qsa_doubled,s->qsa_kin,s->qsa_vin};
         const void *maps[3]={QW_MAP(m,l->attn_q),QW_MAP(m,l->attn_k),QW_MAP(m,l->attn_v)};
         const uint64_t sizes[3]={QW_MAPSZ(m,l->attn_q),QW_MAPSZ(m,l->attn_k),QW_MAPSZ(m,l->attn_v)};
@@ -1853,7 +1864,7 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
     }
 
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    if (n_tokens<=2u) {
+    if (qw_w4_fused(n_tokens)) {
         ds4_gpu_tensor *outs[5]={s->qsa_q,s->qsa_gate,s->qsa_k[il],s->qsa_v[il],NULL};
         const ds4_gpu_tensor *ins[6]={s->qsa_doubled,s->qsa_kin,s->qsa_vin,
                                     s->attn_q_norm[il],s->attn_k_norm[il],s->inv_freq};
