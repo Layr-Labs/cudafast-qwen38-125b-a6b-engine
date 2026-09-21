@@ -33,6 +33,16 @@ static constexpr uint32_t MTP_NATIVE_SCREEN_GROUPS = 24u;
  * so this composes with the deferral below without interacting with it. */
 static constexpr uint32_t MTP_TARGET_NATIVE_CAP = 16384u;
 static constexpr uint32_t MTP_TARGET_NATIVE_SCREEN_GROUPS = 24u;
+/* Dense tape of the coarse-screen groups: packs [0, TAPE_GROUPS) of every
+ * vocabulary row so the two coarse screens stop striding 80*34 over a 24*34
+ * window (2720 mod 128 = 32 wastes ~13.7% of DRAM line fill).  Both screens
+ * share this depth today; the assert freezes that.  DS4_MTP_SCREEN_TAPE=0
+ * restores the shipped slab reads. */
+static constexpr uint32_t MTP_SCREEN_TAPE_GROUPS = MTP_NATIVE_SCREEN_GROUPS;
+static_assert(MTP_TARGET_NATIVE_SCREEN_GROUPS <= MTP_SCREEN_TAPE_GROUPS,
+              "target coarse depth must fit the shared screen tape");
+static_assert(MTP_NATIVE_SCREEN_GROUPS <= MTP_SCREEN_TAPE_GROUPS,
+              "draft coarse depth must fit the shared screen tape");
 static constexpr uint32_t MTP_NATIVE_MAX_WIDTH = 1u << 20;
 template <bool Screen, bool EmitKeys = false>
 __global__ static void mtp_native_projection_kernel(
@@ -40,6 +50,7 @@ __global__ static void mtp_native_projection_kernel(
         const int8_t *xq, const float *xscale,
         uint32_t out_dim,
         const uint32_t *ids, uint32_t n_vocab, uint32_t prefix, uint32_t tail,
+        uint64_t wgroups,
         uint64_t *keys = nullptr, uint32_t *invalid = nullptr) {
     /* All three private launches follow the DIM=2560, one-row guard. */
     constexpr uint64_t blocks = MTP_NATIVE_DIM / 32u;
@@ -62,7 +73,7 @@ __global__ static void mtp_native_projection_kernel(
         ? (row < prefix ? row : n_vocab - tail + (row - prefix)) : ids[row];
     const bool valid = row < out_dim && weight_row < n_vocab;
     if (valid) {
-        const unsigned char *wr = w + (uint64_t)weight_row * blocks * 34u;
+        const unsigned char *wr = w + (uint64_t)weight_row * wgroups * 34u;
         for (uint64_t b = group; b < work_blocks; b += 32u) {
             /* Name both lanes of every live pair even if independent
              * scheduling has temporarily separated their execution. */
@@ -497,6 +508,7 @@ __global__ static void mtp_native_projection2_screen_kernel(
         float *out, const unsigned char *w,
         const int8_t *xq, const float *xscale,
         uint32_t width, uint32_t n_vocab, uint32_t prefix, uint32_t tail,
+        uint64_t wgroups,
         uint64_t *keys = nullptr, uint32_t *invalid = nullptr) {
     constexpr uint64_t blocks = MTP_NATIVE_DIM / 32u;
     constexpr uint64_t work_blocks = MTP_TARGET_NATIVE_SCREEN_GROUPS;
@@ -511,7 +523,7 @@ __global__ static void mtp_native_projection2_screen_kernel(
         : n_vocab - tail + (row - prefix);
     const bool valid = row < width && weight_row < n_vocab;
     if (valid) {
-        const unsigned char *wr = w + (uint64_t)weight_row * blocks * 34u;
+        const unsigned char *wr = w + (uint64_t)weight_row * wgroups * 34u;
         for (uint64_t b = group; b < work_blocks; b += 32u) {
             const uint64_t warp_base = b - (uint64_t)(group & 15u);
             const uint64_t remaining = work_blocks - warp_base;
@@ -606,6 +618,101 @@ __global__ static void mtp_native_unpack_ids_n(
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count) ids[i] = UINT32_MAX - (uint32_t)keys[i];
 }
+
+/* ---- Dense coarse-screen tape -------------------------------------------
+ * Packs groups [0, MTP_SCREEN_TAPE_GROUPS) of every vocabulary row once, so
+ * the two coarse screens walk a tight 24*34 stride instead of 80*34.  The
+ * refinement pass still reads the full slab (wgroups=80).  Valve off with
+ * DS4_MTP_SCREEN_TAPE=0.  Capture / alloc / launch failure falls back to the
+ * shipped slab rather than a wrong answer. */
+__global__ static void mtp_pack_screen_tape_kernel(
+        unsigned char *tape, const unsigned char *w, uint32_t vocab) {
+    constexpr uint32_t TG = MTP_SCREEN_TAPE_GROUPS;
+    constexpr uint32_t FULL = MTP_NATIVE_DIM / 32u;
+    const uint64_t n = (uint64_t)vocab * TG;
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const uint32_t row = (uint32_t)(i / TG);
+    const uint32_t g = (uint32_t)(i - (uint64_t)row * TG);
+    const unsigned char *src = w + ((uint64_t)row * FULL + g) * 34u;
+    unsigned char *dst = tape + ((uint64_t)row * TG + g) * 34u;
+    /* 34-byte Q8_0 group.  Odd groups are only 2-byte aligned in the slab
+     * (stride 34), so a uint32_t overlay would be UB; memcpy is exact. */
+    memcpy(dst, src, 34);
+}
+
+static int mtp_screen_tape_wanted(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_MTP_SCREEN_TAPE");
+        cached = (e != NULL && e[0] == '0') ? 0 : 1;
+    }
+    return cached;
+}
+
+static unsigned char *g_mtp_screen_tape = nullptr;
+static uint32_t g_mtp_screen_tape_vocab = 0;
+static const void *g_mtp_screen_tape_src = nullptr;
+
+/* Returns the weight base the coarse screen should read and the group stride
+ * it should use.  On any miss, *wgroups stays at the full-row 80 and the
+ * shipped slab pointer is returned unchanged. */
+static const unsigned char *mtp_screen_tape_resolve(
+        const unsigned char *w, uint32_t vocab, uint64_t *wgroups) {
+    constexpr uint64_t FULL = MTP_NATIVE_DIM / 32u;
+    *wgroups = FULL;
+    if (!mtp_screen_tape_wanted() || !w || vocab == 0u) return w;
+    if (MTP_NATIVE_SCREEN_GROUPS > MTP_SCREEN_TAPE_GROUPS ||
+        MTP_TARGET_NATIVE_SCREEN_GROUPS > MTP_SCREEN_TAPE_GROUPS) return w;
+    cudaStreamCaptureStatus capture;
+    if (cudaStreamIsCapturing(cuda_decode_stream(), &capture) != cudaSuccess ||
+        capture != cudaStreamCaptureStatusNone) return w;
+    if (g_mtp_screen_tape && g_mtp_screen_tape_vocab == vocab &&
+        g_mtp_screen_tape_src == (const void *)w) {
+        *wgroups = MTP_SCREEN_TAPE_GROUPS;
+        return g_mtp_screen_tape;
+    }
+    if (g_mtp_screen_tape) {
+        (void)cudaFree(g_mtp_screen_tape);
+        g_mtp_screen_tape = nullptr;
+        g_mtp_screen_tape_vocab = 0;
+        g_mtp_screen_tape_src = nullptr;
+    }
+    const uint64_t bytes = (uint64_t)vocab * MTP_SCREEN_TAPE_GROUPS * 34u;
+    /* Refuse the alloc when free device memory cannot hold the tape plus a
+     * 256 MiB headroom for the rest of the decode working set.  A failed
+     * malloc would fall back anyway; this skips the OOM side-effects. */
+    {
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess ||
+            free_b < (size_t)bytes + (256ull << 20)) {
+            (void)cudaGetLastError();
+            return w;
+        }
+    }
+    unsigned char *tape = nullptr;
+    if (cudaMalloc((void **)&tape, (size_t)bytes) != cudaSuccess || !tape) {
+        (void)cudaGetLastError();
+        return w;
+    }
+    const uint64_t n = (uint64_t)vocab * MTP_SCREEN_TAPE_GROUPS;
+    const uint32_t threads = 256u;
+    const uint32_t blocks = (uint32_t)((n + threads - 1u) / threads);
+    mtp_pack_screen_tape_kernel<<<blocks, threads, 0, cuda_decode_stream()>>>(
+        tape, w, vocab);
+    if (cudaGetLastError() != cudaSuccess ||
+        cudaStreamSynchronize(cuda_decode_stream()) != cudaSuccess) {
+        (void)cudaGetLastError();
+        (void)cudaFree(tape);
+        return w;
+    }
+    g_mtp_screen_tape = tape;
+    g_mtp_screen_tape_vocab = vocab;
+    g_mtp_screen_tape_src = (const void *)w;
+    *wgroups = MTP_SCREEN_TAPE_GROUPS;
+    return tape;
+}
+
 /* Moving key writes into projection is equivalent only when scratch writes
  * cannot change another input/output view or a concurrently read weight. */
 static bool mtp_native_key_range_disjoint(const void *a, uint64_t an,
@@ -646,6 +753,9 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
                                           tier, "native MTP output");
     if (!w) return -1;
     if ((uintptr_t)w & 1u) return 0;
+    uint64_t screen_wgroups = 80u;
+    const unsigned char *screen_w = mtp_screen_tape_resolve(
+        (const unsigned char *)w, vocab, &screen_wgroups);
     char *base = (char *)scratch->ptr;
     int8_t *xq = (int8_t *)base;
     float *xs = (float *)(base + MTP_NATIVE_DIM);
@@ -666,12 +776,12 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
         mtp_native_key_range_disjoint(scratch->ptr,scratch->bytes,ids->ptr,ids->bytes);
     if (fuse_keys) {
         mtp_native_projection_kernel<true,true><<<(width+3u)/4u,256,0,cuda_decode_stream()>>>(
-            scores,(const unsigned char *)w,xq,xs,width,nullptr,vocab,prefix,tail,
-            key_in,flag);
+            scores,screen_w,xq,xs,width,nullptr,vocab,prefix,tail,
+            screen_wgroups,key_in,flag);
         if (!cuda_ok(cudaGetLastError(),"native fused screen keys")) return -1;
     } else {
         mtp_native_projection_kernel<true><<<(width+3u)/4u,256,0,cuda_decode_stream()>>>(
-            scores,(const unsigned char *)w,xq,xs,width,nullptr,vocab,prefix,tail);
+            scores,screen_w,xq,xs,width,nullptr,vocab,prefix,tail,screen_wgroups);
         if (!cuda_ok(cudaGetLastError(),"native half-column screen")) return -1;
         mtp_native_keys<<<(width+255u)/256u,256,0,cuda_decode_stream()>>>(
             key_in,flag,scores,width,prefix,tail,vocab);
@@ -742,7 +852,7 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
             "native original-ID sort")) return -1;
     mtp_native_projection_kernel<false><<<(MTP_NATIVE_CAP+3u)/4u,256,0,cuda_decode_stream()>>>(
         (float *)out->ptr,(const unsigned char *)w,xq,xs,MTP_NATIVE_CAP,
-        (const uint32_t *)ids->ptr,vocab,prefix,tail);
+        (const uint32_t *)ids->ptr,vocab,prefix,tail,/*wgroups=*/80u);
     return cuda_ok(cudaGetLastError(),"native exact refinement") ? (int)MTP_NATIVE_CAP : -1;
 }
 
@@ -787,6 +897,9 @@ extern "C" int ds4_gpu_mtp_native_screen2(ds4_gpu_tensor *out,
         "native target output R2");
     if (!w) return -1;
     if ((uintptr_t)w & 1u) return 0;
+    uint64_t screen_wgroups = 80u;
+    const unsigned char *screen_w = mtp_screen_tape_resolve(
+        (const unsigned char *)w, vocab, &screen_wgroups);
 
     char *base = (char *)scratch->ptr;
     int8_t *xq = (int8_t *)base;
@@ -815,15 +928,15 @@ extern "C" int ds4_gpu_mtp_native_screen2(ds4_gpu_tensor *out,
     if (fuse_keys) {
         mtp_native_projection2_screen_kernel<true><<<
             (width + 3u) / 4u, 256, 0, cuda_decode_stream()>>>(
-            scores, (const unsigned char *)w, xq, xs, width, vocab,
-            prefix, tail, key_in, flag);
+            scores, screen_w, xq, xs, width, vocab,
+            prefix, tail, screen_wgroups, key_in, flag);
         if (!cuda_ok(cudaGetLastError(), "native fused R2 screen keys"))
             return -1;
     } else {
         mtp_native_projection2_screen_kernel<false><<<
             (width + 3u) / 4u, 256, 0, cuda_decode_stream()>>>(
-            scores, (const unsigned char *)w, xq, xs, width, vocab,
-            prefix, tail);
+            scores, screen_w, xq, xs, width, vocab,
+            prefix, tail, screen_wgroups);
         if (!cuda_ok(cudaGetLastError(), "native R2 coarse screen"))
             return -1;
         for (uint32_t r = 0; r < 2u; r++) {
@@ -886,7 +999,8 @@ extern "C" int ds4_gpu_mtp_native_screen2(ds4_gpu_tensor *out,
             (const unsigned char *)w,
             xq + (uint64_t)r * MTP_NATIVE_DIM,
             xs + (uint64_t)r * (MTP_NATIVE_DIM / 32u),
-            MTP_TARGET_NATIVE_CAP, iout, vocab, prefix, tail);
+            MTP_TARGET_NATIVE_CAP, iout, vocab, prefix, tail,
+            /*wgroups=*/80u);
         if (!cuda_ok(cudaGetLastError(), "native R2 exact refinement"))
             return -1;
     }

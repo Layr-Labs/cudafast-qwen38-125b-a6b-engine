@@ -1292,6 +1292,46 @@ static void qw_ple_pool_init(void) {
     pthread_mutex_unlock(&g_qw_ple_pool.mutex);
 }
 
+
+/* Ask the kernel to fault the PLE rows we are about to dequant, together.
+ * All ids of a call are known before any row is read (see the two-loop
+ * structure in qwen4exp_graph_ple_gather), so a WILLNEED over the set can
+ * collapse a cold-page tail into one queue of faults instead of serialising
+ * them behind each dequant.  Advisory: never changes a value.  Valve off
+ * with DS4_QWEN4EXP_NO_PLE_WILLNEED=1. */
+static void qw_ple_willneed_rows(const ds4_qwen4exp_ple_table *ple,
+                                 const uint64_t *ids, size_t count) {
+#if defined(POSIX_MADV_WILLNEED)
+    static int wanted = -1;
+    if (wanted < 0) {
+        const char *e = getenv("DS4_QWEN4EXP_NO_PLE_WILLNEED");
+        wanted = (e != NULL && e[0] == '1') ? 0 : 1;
+    }
+    if (!wanted || !ple || !ple->base || !ids || count == 0 ||
+        ple->row_bytes == 0 || ple->bytes == 0) return;
+    const long page_l = sysconf(_SC_PAGESIZE);
+    if (page_l <= 0) return;
+    const size_t page = (size_t)page_l;
+    const uintptr_t map0 = (uintptr_t)ple->base;
+    const uintptr_t map1 = map0 + (uintptr_t)ple->bytes;
+    for (size_t i = 0; i < count; i++) {
+        const uint64_t row = ids[i];
+        if (row >= ple->rows) continue;
+        uintptr_t start = map0 + (uintptr_t)row * (uintptr_t)ple->row_bytes;
+        uintptr_t end = start + (uintptr_t)ple->row_bytes;
+        start -= start % page;
+        end = (end + page - 1u) / page * page;
+        if (start < map0) start = map0;
+        if (end > map1) end = map1;
+        if (end <= start) continue;
+        (void)posix_madvise((void *)start, (size_t)(end - start),
+                            POSIX_MADV_WILLNEED);
+    }
+#else
+    (void)ple; (void)ids; (void)count;
+#endif
+}
+
 static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                                       const ds4_qwen4exp_weights *w,
                                       const int32_t *tokens,
@@ -1351,6 +1391,8 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 s->ple_history_rows[t] = s->ple_history;
             }
         }
+        qw_ple_willneed_rows(&w->ple, s->ple_ids,
+                             (size_t)n_tokens * (size_t)DS4_N_PLE_HEAD);
         for (uint32_t t = 0; t < n_tokens; t++) {
             /* The head's destination strides are constants of the shape, so
              * the token base is hoisted out of the head loop and the head
@@ -1414,6 +1456,8 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
         if (nthreads == 1) {
             ds4_ple_row_ids(&s->ple_constants, &s->ple_history, tokens,
                             n_tokens, s->ple_ids);
+            qw_ple_willneed_rows(&w->ple, s->ple_ids,
+                                 (size_t)n_tokens * (size_t)DS4_N_PLE_HEAD);
             for (uint32_t t = 0; t < n_tokens; t++) {
                 for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
                     const uint64_t row =
@@ -2951,11 +2995,23 @@ static bool qw_decode_graph_chunk(ds4_qwen4exp_session *s,
 #endif
         /* Upload the NEXT chunk while the device runs this one, so its launch
          * finds the graph resident instead of uploading it in front of an idle
-         * GPU.  A miss is a no-op. */
-        if (il_last < g_ds4_qwen4exp.n_layer) {
+         * GPU.  A miss is a no-op.
+         *
+         * Close the chain into a cycle: the last chunk of a forward used to
+         * prefetch nothing, so chunk 0 (the lead chunk tip carves off for the
+         * dry-device launch) was permanently displaced by uploads of 1..N-1 and
+         * re-uploaded inline every round in front of an idle GPU.  Wrapping to
+         * chunk 0 keeps that exec resident.  chunk != 0 guards a single-chunk
+         * round from prefetching the graph it is launching. */
+        {
             ds4_decode_graph_key next = key;
-            next.il = chunk + 1u;
-            (void)ds4_gpu_decode_graph_prefetch(&next);
+            if (il_last < g_ds4_qwen4exp.n_layer) {
+                next.il = chunk + 1u;
+                (void)ds4_gpu_decode_graph_prefetch(&next);
+            } else if (chunk != 0u) {
+                next.il = 0u;
+                (void)ds4_gpu_decode_graph_prefetch(&next);
+            }
         }
         return true;
     }
