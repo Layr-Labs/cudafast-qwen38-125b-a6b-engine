@@ -2836,11 +2836,11 @@ static bool qwen4exp_graph_layers_encode(
  * whole-stack capture, which is what this build did before; the default trades
  * one long launch against an idle GPU for one short one plus launches that
  * overlap the device work already queued. */
-#define QW_DECODE_GRAPH_MAX_CHUNKS 8u
+#define QW_DECODE_GRAPH_MAX_CHUNKS 16u
 
 static uint32_t qw_decode_graph_chunks(void) {
     static int init = 0;
-    static uint32_t chunks = 4u;   /* the A/B's pick; 1 restores the single capture */
+    static uint32_t chunks = 13u;  /* 13 chunks: asymmetric Chunk 0 (Layer 0 GDN only) + Chunk 1 (Layers 1..3) + Chunks 2..12 (4 layers each) */
     if (!init) {
         init = 1;
         const char *s = getenv("DS4_CUDA_DECODE_GRAPH_CHUNKS");
@@ -2853,6 +2853,29 @@ static uint32_t qw_decode_graph_chunks(void) {
         }
     }
     return chunks;
+}
+
+static inline void qw_decode_graph_chunk_bounds(
+        uint32_t c, uint32_t chunks, uint32_t n_layer,
+        uint32_t *out_first, uint32_t *out_last) {
+    if (chunks == 13u && n_layer == 48u) {
+        if (c == 0u) {
+            *out_first = 0u;
+            *out_last = 1u;
+        } else if (c == 1u) {
+            *out_first = 1u;
+            *out_last = 4u;
+        } else {
+            *out_first = 4u + (c - 2u) * 4u;
+            *out_last = *out_first + 4u;
+            if (*out_last > n_layer) *out_last = n_layer;
+        }
+    } else {
+        const uint32_t per = (n_layer + chunks - 1u) / chunks;
+        *out_first = c * per;
+        *out_last = *out_first + per;
+        if (*out_last > n_layer) *out_last = n_layer;
+    }
 }
 
 #ifdef DS4_TEST_HOOKS
@@ -2961,12 +2984,10 @@ static bool qwen4exp_graph_layers(
         const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
         uint32_t chunks = qw_decode_graph_chunks();
         if (chunks > cfg->n_layer) chunks = cfg->n_layer;
-        const uint32_t per = (cfg->n_layer + chunks - 1u) / chunks;
         for (uint32_t c = 0; c < chunks; c++) {
-            const uint32_t il_first = c * per;
+            uint32_t il_first = 0, il_last = 0;
+            qw_decode_graph_chunk_bounds(c, chunks, cfg->n_layer, &il_first, &il_last);
             if (il_first >= cfg->n_layer) break;
-            uint32_t il_last = il_first + per;
-            if (il_last > cfg->n_layer) il_last = cfg->n_layer;
             if (!qw_decode_graph_chunk(s, w, m, n_tokens, c, il_first, il_last)) {
                 return false;
             }
