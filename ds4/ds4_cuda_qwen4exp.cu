@@ -7538,8 +7538,14 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
     const uint32_t row = blockIdx.x * 8u + (threadIdx.x >> 5u);
     const uint32_t tok0 = blockIdx.y * (uint32_t)R;
     if (row >= mid_dim || tok0 >= n_tokens) return;
-    const uint32_t take = n_tokens - tok0 < (uint32_t)R ? n_tokens - tok0
-                                                        : (uint32_t)R;
+    /* A single-token tile is never partial: the early return above
+     * establishes tok0 < n_tokens, so n_tokens - tok0 >= 1 and the min is
+     * 1.  Stating it lets the decode instantiation fold `r < take` out of
+     * the walk instead of carrying a runtime predicate over every group;
+     * every wider R keeps the runtime min unchanged. */
+    const uint32_t take = R == 1
+        ? 1u
+        : (n_tokens - tok0 < (uint32_t)R ? n_tokens - tok0 : (uint32_t)R);
     const char *gate_row = gate + (uint64_t)row * gate_row_bytes;
     const char *up_row = up + (uint64_t)row * up_row_bytes;
 
@@ -7681,8 +7687,12 @@ __global__ static void qwen4exp_shared_down_q_kernel(
     const uint32_t row = blockIdx.x * 8u + (threadIdx.x >> 5u);
     const uint32_t tok0 = blockIdx.y * (uint32_t)R;
     if (row >= out_dim || tok0 >= n_tokens) return;
-    const uint32_t take = n_tokens - tok0 < (uint32_t)R ? n_tokens - tok0
-                                                        : (uint32_t)R;
+    /* Single-token tile, as in the gate/up kernel above: tok0 < n_tokens is
+     * already established, so the min is 1 and the walk's per-row predicate
+     * folds away at decode width. */
+    const uint32_t take = R == 1
+        ? 1u
+        : (n_tokens - tok0 < (uint32_t)R ? n_tokens - tok0 : (uint32_t)R);
     extern __shared__ uint4 qw_shdown_panel[];
     char *const spanel = (char *)qw_shdown_panel;
     if (Stage) {
