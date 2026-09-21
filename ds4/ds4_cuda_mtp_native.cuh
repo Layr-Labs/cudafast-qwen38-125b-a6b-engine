@@ -32,6 +32,12 @@ static constexpr uint32_t MTP_NATIVE_SCREEN_GROUPS = 24u;
  * so this composes with the deferral below without interacting with it. */
 static constexpr uint32_t MTP_TARGET_NATIVE_CAP = 16384u;
 static constexpr uint32_t MTP_TARGET_NATIVE_SCREEN_GROUPS = 24u;
+/* Block shape of the R2 coarse screen: four rows, each of exactly
+ * 2 * SCREEN_GROUPS lanes (one lane per half of one group), so no lane is idle.
+ * Derived from SCREEN_GROUPS rather than written as a literal, because the two
+ * are the same fact -- see the lane-partition note on the screen kernel. */
+static constexpr uint32_t MTP_TARGET_SCREEN2_BLOCK =
+    4u * 2u * MTP_TARGET_NATIVE_SCREEN_GROUPS;
 static constexpr uint32_t MTP_NATIVE_MAX_WIDTH = 1u << 20;
 template <bool Screen, bool EmitKeys = false>
 __global__ static void mtp_native_projection_kernel(
@@ -210,24 +216,63 @@ __global__ static void mtp_native_projection2_screen_kernel(
         uint64_t *keys = nullptr, uint32_t *invalid = nullptr) {
     constexpr uint64_t blocks = MTP_NATIVE_DIM / 32u;
     constexpr uint64_t work_blocks = MTP_TARGET_NATIVE_SCREEN_GROUPS;
-    const uint32_t local_row = threadIdx.x >> 6u;
-    const uint32_t local_lane = threadIdx.x & 63u;
+    /*
+     * LANE PARTITION.  A row's whole job is `work_blocks` groups of two halves
+     * each, so 2 * work_blocks == 48 lanes carry all of it.  The 64-lane
+     * partition this kernel inherited from the 80-group refinement path gave
+     * every row 32 group-lanes, which left groups work_blocks..31 -- sixteen of
+     * every sixty-four lanes -- with zero loop iterations.  Per row that is two
+     * warps issuing the full instruction stream for one and a half warps of
+     * work, and this kernel is instruction-bound, not bandwidth-bound: the
+     * published slice profile puts the whole R2 head at 291.8 MB in 3.47 ms =
+     * 84 GB/s, against 156-161 GB/s achieved by the routed-MoE and GDN families
+     * in the same decode round.  A bandwidth-bound kernel would already be at
+     * 156.
+     *
+     * At 48 lanes per row the same four rows fit in 192 threads with no idle
+     * lane, and eight such blocks are resident per SM where six 256-thread
+     * blocks were, so thirty-two rows are in flight instead of twenty-four.
+     *
+     * THE ARITHMETIC IS UNTOUCHED.  Group g is still computed by the pair
+     * (2g, 2g+1) of its own row, in the same order, over the same bytes, and
+     * still lands in partial[r][row][g].  The 32-wide reduction below still
+     * sums the same 32 slots, of which groups work_blocks..31 are exactly
+     * +0.0f, so the tree and its result are bit-identical: x + 0.0f is x.
+     */
+    static_assert(work_blocks <= 32u,
+                  "screen groups must fit the 32-slot partial reduction");
+    static_assert(work_blocks >= 1u, "screen needs at least one group");
+    constexpr uint32_t row_lanes = 2u * (uint32_t)work_blocks;
+    constexpr uint32_t dead_slots = 32u - (uint32_t)work_blocks;
+    const uint32_t local_row = threadIdx.x / row_lanes;
+    const uint32_t local_lane = threadIdx.x - local_row * row_lanes;
     const uint32_t group = local_lane >> 1u;
     const uint32_t half = local_lane & 1u;
     const uint32_t row = blockIdx.x * 4u + local_row;
     float acc[2] = {0.0f, 0.0f};
+
+    __shared__ float partial[2][4][32];
+    /* No lane writes groups work_blocks..31 any more and the reduction reads
+     * them, so seed exactly the zeros the idle lanes used to store there. */
+    for (uint32_t s = threadIdx.x; s < 2u * 4u * dead_slots; s += blockDim.x) {
+        partial[s / (4u * dead_slots)][(s / dead_slots) & 3u]
+               [(uint32_t)work_blocks + s % dead_slots] = 0.0f;
+    }
 
     const uint32_t weight_row = row < prefix ? row
         : n_vocab - tail + (row - prefix);
     const bool valid = row < width && weight_row < n_vocab;
     if (valid) {
         const unsigned char *wr = w + (uint64_t)weight_row * blocks * 34u;
-        for (uint64_t b = group; b < work_blocks; b += 32u) {
-            const uint64_t warp_base = b - (uint64_t)(group & 15u);
-            const uint64_t remaining = work_blocks - warp_base;
-            const uint32_t live_pairs =
-                (uint32_t)(remaining < 16u ? remaining : 16u);
-            const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
+        for (uint64_t b = group; b < work_blocks; b += work_blocks) {
+            /* The exchange below is laneMask 1 -- purely within the (2g, 2g+1)
+             * pair -- so the pair's own two bits are the exact converged mask.
+             * A row begins at thread row_lanes * local_row and a pair at
+             * + 2 * group; row_lanes is even, so a pair never straddles a
+             * 32-lane warp boundary and both its lanes compute this same mask.
+             * The mask governs convergence, not the value: the exchanged
+             * partial sums, and therefore the bits, are unchanged. */
+            const unsigned active = 3u << ((threadIdx.x & 31u) & ~1u);
             const int8_t *payload =
                 (const int8_t *)(wr + b * 34u + 2u) + half * 16u;
             const uintptr_t address = (uintptr_t)payload;
@@ -264,25 +309,35 @@ __global__ static void mtp_native_projection2_screen_kernel(
         }
     }
 
-    __shared__ float partial[2][4][32];
     if (half == 0u) {
         partial[0][local_row][group] = acc[0];
         partial[1][local_row][group] = acc[1];
     }
     __syncthreads();
-    if (local_lane < 32u) {
+    /* ONE WARP PER ROW.  A row is row_lanes lanes and is no longer warp
+     * aligned, so the old `local_lane < 32` form would hand a row's reduction to
+     * lanes spread over two warps.  Instead warp w reduces row w entirely out of
+     * shared memory: the same 32 slots in the same order through the same
+     * warp_sum_f32, so the same bits.  With four rows per block, warps 0-3 are
+     * fully populated and any remaining warps have nothing to do here. */
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    if (warp < 4u) {
+        const uint32_t orow = blockIdx.x * 4u + warp;
+        const uint32_t oweight = orow < prefix ? orow
+            : n_vocab - tail + (orow - prefix);
+        const bool ovalid = orow < width && oweight < n_vocab;
 #pragma unroll
         for (int r = 0; r < 2; r++) {
-            const float total = warp_sum_f32(
-                partial[r][local_row][local_lane]);
-            if (local_lane == 0u && row < width) {
-                const float value = valid ? total : -INFINITY;
-                const uint64_t at = (uint64_t)r * width + row;
+            const float total = warp_sum_f32(partial[r][warp][lane]);
+            if (lane == 0u && orow < width) {
+                const float value = ovalid ? total : -INFINITY;
+                const uint64_t at = (uint64_t)r * width + orow;
                 if (EmitKeys) {
-                    const uint32_t id = row < prefix ? row
-                        : n_vocab - tail + (row - prefix);
+                    const uint32_t id = orow < prefix ? orow
+                        : n_vocab - tail + (orow - prefix);
                     if (!isfinite(value)) atomicOr(invalid, 1u);
-                    if (!id || row >= prefix)
+                    if (!id || orow >= prefix)
                         keys[at] = UINT64_MAX - id;
                     else
                         keys[at] = q8_top1_pack_key(
@@ -510,14 +565,16 @@ extern "C" int ds4_gpu_mtp_native_screen2(ds4_gpu_tensor *out,
             scratch->ptr, scratch->bytes, ids->ptr, ids->bytes);
     if (fuse_keys) {
         mtp_native_projection2_screen_kernel<true><<<
-            (width + 3u) / 4u, 256, 0, cuda_decode_stream()>>>(
+            (width + 3u) / 4u, MTP_TARGET_SCREEN2_BLOCK, 0,
+            cuda_decode_stream()>>>(
             scores, (const unsigned char *)w, xq, xs, width, vocab,
             prefix, tail, key_in, flag);
         if (!cuda_ok(cudaGetLastError(), "native fused R2 screen keys"))
             return -1;
     } else {
         mtp_native_projection2_screen_kernel<false><<<
-            (width + 3u) / 4u, 256, 0, cuda_decode_stream()>>>(
+            (width + 3u) / 4u, MTP_TARGET_SCREEN2_BLOCK, 0,
+            cuda_decode_stream()>>>(
             scores, (const unsigned char *)w, xq, xs, width, vocab,
             prefix, tail);
         if (!cuda_ok(cudaGetLastError(), "native R2 coarse screen"))
