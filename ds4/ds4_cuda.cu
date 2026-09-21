@@ -10176,6 +10176,17 @@ __global__ static void attention_decode_score_split_scores_kernel(
     const float *qh = q + (uint64_t)h * head_dim;
     float *row_scores = score_out + (uint64_t)h * n_score;
     const float scale = rsqrtf((float)head_dim);
+    /* Every thread of the block walks the same query row, once per score it
+     * owns. Stage it once and read it from shared memory; the dot keeps its
+     * ascending-d order and its operands. */
+    __shared__ float q_stage[512];
+    if (head_dim <= 512u) {
+        for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            q_stage[d] = qh[d];
+        }
+        __syncthreads();
+        qh = q_stage;
+    }
 
     for (uint32_t g = g0 + threadIdx.x; g < g1; g += blockDim.x) {
         float s = -INFINITY;
@@ -10206,6 +10217,15 @@ __device__ __forceinline__ float ds4_dot_scalar_ldg(
         uint32_t n) {
     float dot = 0.0f;
     for (uint32_t d = 0; d < n; d++) dot += __ldg(a + d) * __ldg(b + d);
+    return dot;
+}
+
+__device__ __forceinline__ float ds4_dot_shared_ldg(
+        const float *a,
+        const float *b,
+        uint32_t n) {
+    float dot = 0.0f;
+    for (uint32_t d = 0; d < n; d++) dot += a[d] * __ldg(b + d);
     return dot;
 }
 
@@ -10266,6 +10286,15 @@ __global__ static void attention_decode_score_split_scores_ldg_kernel(
     const float *qh = q + (uint64_t)h * head_dim;
     float *row_scores = score_out + (uint64_t)h * n_score;
     const float scale = rsqrtf((float)head_dim);
+    __shared__ float q_stage[512];
+    const bool q_staged = head_dim <= 512u;
+    if (q_staged) {
+        for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            q_stage[d] = qh[d];
+        }
+        __syncthreads();
+        qh = q_stage;
+    }
 
     for (uint32_t g = g0 + threadIdx.x; g < g1; g += blockDim.x) {
         float s = -INFINITY;
@@ -10273,14 +10302,18 @@ __global__ static void attention_decode_score_split_scores_ldg_kernel(
             const uint32_t raw_row =
                 (raw_start + raw_first_idx + g) % raw_cap;
             const float *kvrow = raw_kv + (uint64_t)raw_row * head_dim;
-            const float dot = ds4_dot_scalar_ldg(qh, kvrow, head_dim);
+            const float dot = q_staged
+                ? ds4_dot_shared_ldg(qh, kvrow, head_dim)
+                : ds4_dot_scalar_ldg(qh, kvrow, head_dim);
             s = dot * scale;
         } else {
             const uint32_t cidx = g - raw_count;
             const float add = use_comp_mask ? comp_mask[(uint64_t)cidx] : 0.0f;
             if (add > -1.0e20f) {
                 const float *kvrow = comp_kv + (uint64_t)cidx * head_dim;
-                const float dot = ds4_dot_scalar_ldg(qh, kvrow, head_dim);
+                const float dot = q_staged
+                    ? ds4_dot_shared_ldg(qh, kvrow, head_dim)
+                    : ds4_dot_scalar_ldg(qh, kvrow, head_dim);
                 s = dot * scale + add;
             }
         }
