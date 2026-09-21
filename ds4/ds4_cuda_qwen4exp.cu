@@ -4316,6 +4316,7 @@ __global__ static void qwen4exp_moe_group_scan_parallel_kernel(
 /* build record 20260920T112423Z-103 */
 /* build record 20260920T120351Z-108 */
 /* build record 20260921T160157Z-8 */
+/* build record 20260921T215753Z-38 */
 __global__ static void qwen4exp_moe_pair_tasks_kernel(
         int32_t *tasks, const int32_t *counts, unsigned total,
         int32_t tile = 32, int32_t lo = 0, int32_t hi = 0x7fffffff) {
