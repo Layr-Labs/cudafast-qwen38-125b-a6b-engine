@@ -27171,6 +27171,19 @@ __global__ static void moe_down_owned_slots_qwarp32_kernel(
         (const cuda_block_q2_K *)(down_base +
             (uint64_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes);
     const cuda_block_q8_K *xq = midq + (uint64_t)slot * midq_blocks;
+    /* Every row this block owns walks the same slot activation, so the whole
+     * block re-reads it once per row. Stage it once when it fits the window
+     * and the grid covers the output width exactly, so no thread of a live
+     * block retires before the barrier. */
+    __shared__ cuda_block_q8_K s_midq[16];
+    if (midq_blocks <= 16u && (out_dim & 31u) == 0u) {
+        const uint32_t words = midq_blocks * (uint32_t)(sizeof(cuda_block_q8_K) / 4u);
+        uint32_t *dst = (uint32_t *)s_midq;
+        const uint32_t *srcw = (const uint32_t *)xq;
+        for (uint32_t i = threadIdx.x; i < words; i += blockDim.x) dst[i] = srcw[i];
+        __syncthreads();
+        xq = s_midq;
+    }
     float acc = 0.0f;
     for (uint32_t b = lane; b < midq_blocks; b += 8u) {
         acc += dev_dot_q2_K_q8_K_block(wr + b, xq + b);
@@ -27401,6 +27414,15 @@ __global__ static void moe_down_q4K_owned_slots_qwarp32_kernel(
         (const cuda_block_q4_K *)(down_base +
             (uint64_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes);
     const cuda_block_q8_K *xq = midq + (uint64_t)slot * midq_blocks;
+    __shared__ cuda_block_q8_K s_midq[16];
+    if (midq_blocks <= 16u && (out_dim & 31u) == 0u) {
+        const uint32_t words = midq_blocks * (uint32_t)(sizeof(cuda_block_q8_K) / 4u);
+        uint32_t *dst = (uint32_t *)s_midq;
+        const uint32_t *srcw = (const uint32_t *)xq;
+        for (uint32_t i = threadIdx.x; i < words; i += blockDim.x) dst[i] = srcw[i];
+        __syncthreads();
+        xq = s_midq;
+    }
     const bool vec_ok = ((((uintptr_t)down_base | down_row_bytes |
                            down_expert_bytes) & 15u) == 0u);
     float acc = 0.0f;
