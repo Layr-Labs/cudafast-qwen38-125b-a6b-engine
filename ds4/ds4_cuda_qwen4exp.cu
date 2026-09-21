@@ -14327,6 +14327,78 @@ __global__ static void qwen4exp_qsa_indexer_scores_kernel(
     if (tid == 0u) *dst = total / norm_divisor;
 }
 
+/* Decode-width indexer scoring, paired by block row.
+ *
+ * A decode or verify step has one or two query rows but still scores every
+ * completed pool row.  The general kernel above gives each (query, pool) pair
+ * its own 128-thread block, so the same four query-head rows are fetched once
+ * per pool row.  This kernel assigns two pool rows to one 256-thread block,
+ * stages each query row once, and keeps each pair's 128-thread reduction tree
+ * unchanged.  The extra pair only shares the read-only query staging; its
+ * arithmetic and reduction order are independent and therefore preserve the
+ * score bits.
+ *
+ * The path is deliberately restricted to the fixed QSA geometry and at most
+ * two rows (the native verify width).
+ * It is a scheduling optimization for decode, not a proposal-policy change.
+ */
+__global__ static void __launch_bounds__(256)
+qwen4exp_qsa_indexer_scores_pair2_kernel(
+        const float *q,
+        const float *pool,
+        float *scores,
+        uint32_t n_tokens,
+        uint32_t n_blocks,
+        uint32_t pos0,
+        uint32_t pool_size,
+        float norm_divisor) {
+    constexpr uint32_t HEAD_DIM = 128u;
+    constexpr uint32_t N_HEAD = 4u;
+    __shared__ float ks[2][HEAD_DIM];
+    __shared__ float qs[N_HEAD][HEAD_DIM];
+    __shared__ float partial[2][HEAD_DIM];
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t pair = tid >> 7u;
+    const uint32_t lane = tid & (HEAD_DIM - 1u);
+    const uint32_t block = blockIdx.x * 2u + pair;
+    const uint32_t token = blockIdx.y;
+    const bool in_range = block < n_blocks;
+    const uint32_t visible = min((pos0 + token + 1u) / pool_size, n_blocks);
+    const bool valid = in_range && block < visible;
+
+    /* Stage the query once for both pair halves and each in-range pool row. */
+    for (uint32_t i = tid; i < N_HEAD * HEAD_DIM; i += 256u) {
+        const uint32_t h = i / HEAD_DIM;
+        const uint32_t d = i & (HEAD_DIM - 1u);
+        qs[h][d] = q[((uint64_t)token * N_HEAD + h) * HEAD_DIM + d];
+    }
+    ks[pair][lane] = in_range
+        ? pool[(uint64_t)block * HEAD_DIM + lane] : 0.0f;
+    __syncthreads();
+
+    float total = 0.0f;
+#pragma unroll
+    for (uint32_t h = 0; h < N_HEAD; h++) {
+        float sum = valid ? ks[pair][lane] * qs[h][lane] : 0.0f;
+        partial[pair][lane] = sum;
+        __syncthreads();
+        for (uint32_t stride = HEAD_DIM >> 1u; stride > 0u; stride >>= 1u) {
+            if (lane < stride)
+                partial[pair][lane] += partial[pair][lane + stride];
+            __syncthreads();
+        }
+        if (lane == 0u && valid)
+            total += fmaxf(partial[pair][0], 0.0f);
+        __syncthreads();
+    }
+
+    if (lane == 0u && in_range) {
+        float *dst = scores + (uint64_t)token * n_blocks + block;
+        *dst = valid ? total / norm_divisor : QWEN4EXP_QSA_MASKED_SCORE;
+    }
+}
+
 __global__ static void qwen4exp_qsa_indexer_select_kernel(
         const float *scores,
         const int32_t *topk,
@@ -16772,6 +16844,17 @@ extern "C" int ds4_gpu_qwen4exp_qsa_indexer_scores_tensor(
                 (float *)scores->ptr, n_tokens, n_blocks, pos0, pool_size,
                 sqrtf((float)head_dim));
         return cuda_ok(cudaGetLastError(), "Qwen4-Exp indexer scores tiled launch");
+    }
+    if (n_tokens <= 2u && head_dim == 128u && n_head == 4u &&
+        n_blocks >= 2u && getenv("DS4_QWEN4EXP_NO_IDX_PAIR2") == NULL) {
+        qwen4exp_qsa_indexer_scores_pair2_kernel<<<
+            dim3((n_blocks + 1u) / 2u, n_tokens), 256u, 0,
+            cuda_decode_stream()>>>(
+                (const float *)q->ptr, (const float *)pool->ptr,
+                (float *)scores->ptr, n_tokens, n_blocks, pos0, pool_size,
+                sqrtf((float)head_dim));
+        return cuda_ok(cudaGetLastError(),
+                       "Qwen4-Exp indexer scores pair2 launch");
     }
     const uint32_t nth = qwen4exp_cuda_threads(head_dim);
     qwen4exp_qsa_indexer_scores_kernel<<<dim3(n_blocks, n_tokens), nth,
