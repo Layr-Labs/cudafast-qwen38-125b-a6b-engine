@@ -648,4 +648,20 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
  * it is outside every timed phase and cannot perturb a measurement. */
 const char *ds4_gpu_hw_limits(void);
 
+/* The per-slice decode profile, for the same reason ds4_gpu_hw_limits exists:
+ * the ranked box carries no profiler, nothing collects a worker's stderr, and
+ * the only channel out of a scored run is the published engine identity.  Armed,
+ * every slice boundary in the qwen4exp forward synchronizes, so the caller must
+ * arm it only around throwaway rounds, BEFORE the resident binds its socket,
+ * and never inside a graph capture or across a duration anything measures.
+ *
+ * _arm(1) zeroes the accumulators and turns the marks on; _arm(0) turns them
+ * off and leaves them readable.  _report renders
+ * `sl[ser=<total>ms <v1>,..,<v11>]` -- per-slice thousandths of the serialised
+ * total, which is a RANKING and deliberately not a throughput claim -- and
+ * returns the length written, or 0 with an empty string if nothing was recorded
+ * or `cap` cannot hold the whole table. */
+void ds4_qwen4exp_slice_profile_arm(int on);
+int  ds4_qwen4exp_slice_profile_report(char *out, size_t cap);
+
 #endif

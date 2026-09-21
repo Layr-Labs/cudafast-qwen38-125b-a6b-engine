@@ -2222,14 +2222,37 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
     return true;
 }
 
-/* One gated residual step: mix down to the block input, run the block, inject
- * the block output back into every hyper-connection stream. */
-#ifdef DS4_TEST_HOOKS
-/* The slice sequence one forward actually ran, recorded at each slice's own
- * call site.  A test asserts the whole sequence, so a slice that is dropped,
- * duplicated or moved -- the PLE block sliding from the head of the layer to
- * the tail, say -- fails rather than passing because the forward still
- * returned true. */
+/* WHERE THE DECODE ROUND'S TIME GOES, PUBLISHED RATHER THAN PRINTED.
+ *
+ * The slice identities and the 34 QW_TRACE call sites that mark them already
+ * exist in the scored source, but the timing half of the instrument was inside
+ * `#ifdef DS4_TEST_HOOKS`, which the scored ds4.o rule does not define (see
+ * ds4/Makefile, the `-c -o $@ ds4.c` rule).  So the marks were compiled out
+ * and the engine shipped with no way to say which slice owns the round.
+ *
+ * Two reasons it has to be PUBLISHED and not printed.  There is no profiler on
+ * the ranked box, and nothing collects a worker's stderr -- the one channel
+ * that comes back from a scored run is officialMetrics.engine_backend, which is
+ * a string this engine builds (ds4_gpu_hw_limits -> ds4s_hw_limits -> the
+ * resident's identity -> hello).  ds4_qwen4exp_slice_profile_report renders the
+ * table into that string's remaining budget.
+ *
+ * SERIALISATION IS THE MEASUREMENT.  Armed, every mark closes the command
+ * batch, waits for the device, and opens a new one, so the wall time between
+ * two marks is that slice's GPU work and nothing else.  The consequence is that
+ * the sum EXCEEDS a real forward, because it has spent all the overlap the
+ * pipeline normally wins.  The published table is a RANKING of where the work
+ * is, never a prediction of the total; the total this engine actually achieves
+ * is what officialMetrics.paired_legs already says.
+ *
+ * WHAT KEEPS IT OFF THE SCORED PATH.  Disarmed -- which is every state except
+ * inside ds4_qwen4exp_slice_profile_arm(1) -- qw_slice_tick does one load of a
+ * file-scope int and returns, and no synchronize, allocation or branch of the
+ * forward changes.  Armed, it must never run inside a CUDA graph capture or
+ * across a measured duration: a capture forbids the synchronize outright, which
+ * is why the five capture sites below refuse while the profiler is on.  The one
+ * caller arms it in ds4s_open, before the resident binds its socket and so
+ * before any phase, let alone any timed window, can exist. */
 typedef enum {
     QW_SLICE_EMBED = 1,
     QW_SLICE_PLE,
@@ -2244,6 +2267,81 @@ typedef enum {
     QW_SLICE_HEAD,
 } qwen4exp_slice;
 
+/* One past QW_SLICE_HEAD: slice 0 is the unused "?" sentinel. */
+#define DS4_QWEN4EXP_N_SLICE 12
+
+static double   g_qwen4exp_slice_sec[DS4_QWEN4EXP_N_SLICE];
+static uint32_t g_qwen4exp_slice_hits[DS4_QWEN4EXP_N_SLICE];
+static double   g_qwen4exp_slice_mark = 0.0;
+static int      g_qw_slice_arm = 0;
+
+/* The env variable stays honoured so a box shell can still drive the stderr
+ * table; the runtime arm is what a scored run uses. */
+static int qw_slice_prof_on(void) {
+    static int env = -1;
+    if (env < 0) env = getenv("DS4_QWEN4EXP_TIME_SLICES") != NULL;
+    return env || g_qw_slice_arm;
+}
+
+static void qw_slice_tick(qwen4exp_slice slice) {
+    if (!qw_slice_prof_on()) return;
+    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize() ||
+        !ds4_gpu_begin_commands()) {
+        return;
+    }
+    const double now = now_sec();
+    if (g_qwen4exp_slice_mark > 0.0 && (int)slice < DS4_QWEN4EXP_N_SLICE) {
+        g_qwen4exp_slice_sec[(int)slice] += now - g_qwen4exp_slice_mark;
+        g_qwen4exp_slice_hits[(int)slice]++;
+    }
+    g_qwen4exp_slice_mark = now;
+}
+
+void ds4_qwen4exp_slice_profile_arm(int on) {
+    g_qw_slice_arm = on ? 1 : 0;
+    if (on) {
+        memset(g_qwen4exp_slice_sec, 0, sizeof(g_qwen4exp_slice_sec));
+        memset(g_qwen4exp_slice_hits, 0, sizeof(g_qwen4exp_slice_hits));
+        g_qwen4exp_slice_mark = 0.0;
+    }
+}
+
+/* `sl[ser=<total>ms <v1>,..,<v11>]`, each v in thousandths of the serialised
+ * total, so the shape survives a 128-byte budget.  Returns 0 and writes an
+ * empty string when nothing was recorded or the buffer cannot hold the whole
+ * table -- a truncated table would be misread as a different ranking. */
+int ds4_qwen4exp_slice_profile_report(char *out, size_t cap) {
+    double total = 0.0;
+    size_t n = 0;
+    int i, w;
+    if (!out || cap == 0) return 0;
+    out[0] = '\0';
+    for (i = 1; i < DS4_QWEN4EXP_N_SLICE; i++) total += g_qwen4exp_slice_sec[i];
+    if (!(total > 0.0)) return 0;
+    w = snprintf(out, cap, "sl[ser=%.1fms", total * 1000.0);
+    if (w < 0 || (size_t)w >= cap) { out[0] = '\0'; return 0; }
+    n = (size_t)w;
+    for (i = 1; i < DS4_QWEN4EXP_N_SLICE; i++) {
+        w = snprintf(out + n, cap - n, "%c%d", i == 1 ? ' ' : ',',
+                     (int)(1000.0 * g_qwen4exp_slice_sec[i] / total + 0.5));
+        if (w < 0 || (size_t)w >= cap - n) { out[0] = '\0'; return 0; }
+        n += (size_t)w;
+    }
+    if (n + 2u > cap) { out[0] = '\0'; return 0; }
+    out[n++] = ']';
+    out[n] = '\0';
+    return (int)n;
+}
+
+/* One gated residual step: mix down to the block input, run the block, inject
+ * the block output back into every hyper-connection stream. */
+#ifdef DS4_TEST_HOOKS
+/* The slice sequence one forward actually ran, recorded at each slice's own
+ * call site.  A test asserts the whole sequence, so a slice that is dropped,
+ * duplicated or moved -- the PLE block sliding from the head of the layer to
+ * the tail, say -- fails rather than passing because the forward still
+ * returned true.  The slice identities themselves are above, because the
+ * always-compiled timer names them too. */
 #define DS4_QWEN4EXP_MAX_TRACE 1024
 static uint8_t  g_qwen4exp_trace[DS4_QWEN4EXP_MAX_TRACE];
 static uint32_t g_qwen4exp_trace_len = 0;
@@ -2268,13 +2366,12 @@ static const char *const g_qwen4exp_slice_name[] = {
     "?", "embed", "ple", "attn_mix", "gdn", "qsa", "attn_inject",
     "ffn_mix", "moe", "ffn_inject", "final_mix", "head",
 };
-#define DS4_QWEN4EXP_N_SLICE \
-    ((int)(sizeof(g_qwen4exp_slice_name) / sizeof(g_qwen4exp_slice_name[0])))
-
-static double   g_qwen4exp_slice_sec[DS4_QWEN4EXP_N_SLICE];
-static uint32_t g_qwen4exp_slice_hits[DS4_QWEN4EXP_N_SLICE];
-static double   g_qwen4exp_slice_mark = 0.0;
-static int      g_qwen4exp_time_slices = -1;
+/* DS4_QWEN4EXP_N_SLICE is a literal now, because the always-compiled timer
+ * needs it without this table.  This refuses to compile if the two drift, so a
+ * new slice cannot be named here and left unsized there. */
+typedef char qwen4exp_slice_name_count_check
+    [(sizeof(g_qwen4exp_slice_name) / sizeof(g_qwen4exp_slice_name[0])) ==
+             DS4_QWEN4EXP_N_SLICE ? 1 : -1];
 
 static void qwen4exp_trace(qwen4exp_slice slice) {
     if (g_qwen4exp_trace_len < DS4_QWEN4EXP_MAX_TRACE) {
@@ -2282,25 +2379,12 @@ static void qwen4exp_trace(qwen4exp_slice slice) {
     } else {
         g_qwen4exp_trace_overflow = true;
     }
-
-    if (g_qwen4exp_time_slices < 0) {
-        g_qwen4exp_time_slices = getenv("DS4_QWEN4EXP_TIME_SLICES") != NULL;
-    }
-    if (!g_qwen4exp_time_slices) return;
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize() ||
-        !ds4_gpu_begin_commands()) {
-        return;
-    }
-    const double now = now_sec();
-    if (g_qwen4exp_slice_mark > 0.0 && (int)slice < DS4_QWEN4EXP_N_SLICE) {
-        g_qwen4exp_slice_sec[(int)slice] += now - g_qwen4exp_slice_mark;
-        g_qwen4exp_slice_hits[(int)slice]++;
-    }
-    g_qwen4exp_slice_mark = now;
+    /* The timing half lives above and runs in every build. */
+    qw_slice_tick(slice);
 }
 
 static void qwen4exp_trace_report(uint32_t n_tokens) {
-    if (g_qwen4exp_time_slices <= 0) return;
+    if (!qw_slice_prof_on()) return;
     double total = 0.0;
     for (int i = 1; i < DS4_QWEN4EXP_N_SLICE; i++) total += g_qwen4exp_slice_sec[i];
     if (!(total > 0.0)) return;
@@ -2321,8 +2405,10 @@ static void qwen4exp_trace_report(uint32_t n_tokens) {
 #define QW_TRACE(slice) qwen4exp_trace(slice)
 #define QW_TRACE_REPORT(n) qwen4exp_trace_report(n)
 #else
-#define QW_TRACE(slice) ((void)0)
-#define QW_TRACE_REPORT(n) ((void)0)
+/* No order record without the test hooks, but the timer is unconditional: the
+ * 34 marks are what make the published table possible at all. */
+#define QW_TRACE(slice) qw_slice_tick(slice)
+#define QW_TRACE_REPORT(n) ((void)(n))
 #endif
 
 
@@ -2530,7 +2616,7 @@ static bool qw_pf_graph_on(uint32_t n_tokens, uint32_t il) {
     return enabled && n_tokens >= DS4_QWEN4EXP_PF_GRAPH_MIN_ROWS &&
            il >= DS4_QWEN4EXP_PF_GRAPH_WARM_LAYERS &&
            /* profilers synchronize between operations, forbidden in capture */
-           !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
+           !qw_hb_time_on() && !qw_slice_prof_on() &&
            ds4_gpu_decode_graphs_supported();
 }
 
@@ -2541,7 +2627,7 @@ static bool qwen4exp_graph_layer_island(
      * capture.  They must also execute the individual call sites on replay. */
     const bool capture_ok =
         n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
-        !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
+        !qw_hb_time_on() && !qw_slice_prof_on() &&
         ds4_gpu_decode_graphs_supported();
     if (capture_ok) {
         ds4_decode_graph_key key;
@@ -2617,7 +2703,7 @@ static bool qwen4exp_graph_qsa_island(
     const bool qsa_capture_ok =
         n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
         (uint64_t)s->pos + n_tokens <= DS4_N_INDEXER_TOP_K &&
-        !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
+        !qw_hb_time_on() && !qw_slice_prof_on() &&
         ds4_gpu_decode_graphs_supported();
     if (qsa_capture_ok) {
         ds4_decode_graph_key key;
@@ -2941,7 +3027,7 @@ static bool qwen4exp_graph_layers(
     bool capture_ok =
         n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
         (uint64_t)s->pos + n_tokens <= DS4_N_INDEXER_TOP_K &&
-        !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
+        !qw_hb_time_on() && !qw_slice_prof_on() &&
         ds4_gpu_decode_graphs_supported();
 #ifdef DS4_TEST_HOOKS
     /* Layer dumps synchronize and must execute every host call site. */
@@ -3061,7 +3147,7 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
                                 float                      *logits_out) {
     const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
     const double wall_t0 =
-        getenv("DS4_QWEN4EXP_TIME_SLICES") != NULL ? now_sec() : 0.0;
+        qw_slice_prof_on() ? now_sec() : 0.0;
 
     /* NO SILENT FALSE.  Every refusal below this line names itself, and so
      * does this one: an argument that is missing is a wiring fault in the
@@ -3777,7 +3863,7 @@ int ds4_qwen4exp_graph_head_block(void *graph, void *cache,
     const bool capture_ok =
         n_tokens <= (uint32_t)DS4_QWEN4EXP_MTP_MAX_COMMIT &&
         (uint64_t)s->pos + n_tokens <= DS4_N_INDEXER_TOP_K &&
-        !qw_hb_time_on() && getenv("DS4_QWEN4EXP_TIME_SLICES") == NULL &&
+        !qw_hb_time_on() && !qw_slice_prof_on() &&
         ds4_gpu_decode_graphs_supported();
     ds4_decode_graph_key key;
     int graph_state = -1;
