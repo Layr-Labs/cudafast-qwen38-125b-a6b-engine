@@ -1,3 +1,4 @@
+#include <cooperative_groups.h>
 /* Current native-head partial screening, then independent exact row dots.
  * Uses the original Q8_0 mapping; no transformed weight storage. New kernels
  * use ordinary stream ordering, not PDL: refinement reads freshly sorted IDs. */
@@ -133,10 +134,270 @@ __global__ static void mtp_native_projection_kernel(
     }
 }
 
+/* ===================================================================
+ * SINGLE-KERNEL TOP-K RADIX-SELECT  (valve: DS4_MTP_NATIVE_SELECT)
+ * ===================================================================
+ * Both screens rank their packed value|id keys with
+ *   cub::DeviceRadixSort::SortKeysDescending(key_in, key_out, width, 32, 64)
+ * and then read only the first CAP entries.  On this device that one call is
+ * SIX kernel launches (Histogram, ExclusiveSum, 4x Onesweep), and the screens
+ * run eagerly -- both of them `return 0` under stream capture -- so cub's own
+ * inter-kernel launch gaps are paid in full.  Measured on a decode trace
+ * (/tmp/compose/D1.3.C.tsv, 72 rounds): the draft chain is 33.7 us of kernel
+ * plus 16.9 us of internal gaps, the target chain 47.0 plus 16.0, and the
+ * unpack that follows adds another launch and another gap.
+ *
+ * This replaces that whole sequence with ONE cooperative launch that
+ * radix-selects the top CAP keys in full 64-bit descending order and writes
+ * the ORIGINAL IDS straight out, so `mtp_native_unpack_ids` goes away too.
+ *
+ * WHY THE RESULT IS BYTE-IDENTICAL, not merely similar:
+ *   - every key is distinct (the low word is 0xffffffff - id and each row
+ *     carries its own id), so "the top CAP keys in 64-bit descending order"
+ *     names a UNIQUE SET, and it is exactly the set cub's stable [32,64) sort
+ *     leaves in key_out[0, CAP) -- the equivalence the sort's own comment
+ *     above already argues, and which the host oracle
+ *     ds4/tests/test_mtp_native_score_sort_oracle.py pins;
+ *   - the ORDER this kernel emits that set in is arbitrary, and that cannot
+ *     matter: the very next thing both screens do is sort the ids ASCENDING
+ *     with a second cub sort, and a sort maps any permutation of one set to
+ *     the same array.  Bit-exactness therefore does not rest on the select
+ *     reproducing cub's ordering, only on the set.
+ * DS4_MTP_NATIVE_SELECT=0 restores the shipped cub path exactly: the scratch
+ * layout collapses back to the shipped offsets (the select arena is zero
+ * bytes) and no kernel in the shipped build changes.
+ */
+#define MTP_NATIVE_SELECT_THREADS 256
+
+__global__ __launch_bounds__(MTP_NATIVE_SELECT_THREADS) static void
+mtp_native_select_kernel(const uint64_t *__restrict__ keys, uint32_t n,
+                         uint32_t *__restrict__ ids, uint32_t cap,
+                         uint32_t *hist, uint32_t *ctl,
+                         uint64_t *candA, uint64_t *candB) {
+    namespace cg = cooperative_groups;
+    cg::grid_group grid = cg::this_grid();
+    __shared__ uint32_t sh[256];
+    __shared__ uint32_t wsum[MTP_NATIVE_SELECT_THREADS / 32];
+    __shared__ uint32_t s_pick;
+    __shared__ uint32_t s_above;
+    __shared__ uint64_t skey[MTP_NATIVE_SELECT_THREADS];
+    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t nthr = gridDim.x * blockDim.x;
+    const uint32_t t0 = threadIdx.x;
+    const uint32_t lane = t0 & 31u;
+    const uint64_t *src = keys;
+    uint64_t *dst = candA;
+    uint32_t cur = n, need = cap;
+
+    if (tid == 0) { ctl[0] = 0u; ctl[1] = 0u; }
+    grid.sync();
+
+    for (int t = 0; t < 8 && need > 0u; ++t) {
+        const int shft = 56 - 8 * t;
+        /* Small-candidate finisher.  `cur` is a grid-uniform scalar read after
+         * a grid.sync, so every block takes this branch together and the
+         * loop's grid-wide barriers are never split.  With no more survivors
+         * than one block has threads, each block ranks them against one
+         * another out of shared memory -- the keys are distinct so the rank is
+         * unique -- and block 0 emits the `need` highest.  Without it the tail
+         * levels grind at cur=2, need=1, paying a full barrier round each. */
+        if (cur <= (uint32_t)MTP_NATIVE_SELECT_THREADS) {
+            if (t0 < cur) skey[t0] = src[t0];
+            __syncthreads();
+            if (blockIdx.x == 0u && t0 < cur) {
+                const uint64_t k = skey[t0];
+                uint32_t cnt = 0u;
+                for (uint32_t j = 0; j < cur; ++j) cnt += (skey[j] > k) ? 1u : 0u;
+                if (cnt < need) ids[cap - need + cnt] = 0xffffffffu - (uint32_t)k;
+            }
+            break;
+        }
+        if (tid == 0) ctl[1] = 0u;
+        for (uint32_t i = tid; i < 256u; i += nthr) hist[i] = 0u;
+        sh[t0] = 0u;
+        __syncthreads();
+        grid.sync();
+
+        /* per-block shared histogram of this digit, one global atomic per bin */
+        for (uint32_t i = tid; i < cur; i += nthr)
+            atomicAdd(&sh[(uint32_t)((src[i] >> shft) & 0xffull)], 1u);
+        __syncthreads();
+        if (sh[t0]) atomicAdd(&hist[t0], sh[t0]);
+        grid.sync();
+
+        /* Boundary scan, BLOCK-LOCAL and identical in every block.
+         * S(b) = sum_{j>=b} hist[j];  bs = max{ b : S(b) >= need }.
+         * The reversed index r = 255 - b turns S into an inclusive prefix
+         * scan.  Doing it redundantly per block rather than in one thread is
+         * what makes this kernel fast: as a serial walk over the 256 GLOBAL
+         * bins it cost 8-19 us a level with the whole grid parked on a
+         * barrier waiting for it. */
+        const uint32_t hb = hist[255u - t0];
+        sh[t0] = hb;
+        uint32_t x = hb;
+#pragma unroll
+        for (int d = 1; d < 32; d <<= 1) {
+            const uint32_t y = __shfl_up_sync(0xffffffffu, x, d);
+            if (lane >= (uint32_t)d) x += y;
+        }
+        if (lane == 31u) wsum[t0 >> 5] = x;
+        if (t0 == 0u) s_pick = 256u;
+        __syncthreads();
+        if (t0 < (MTP_NATIVE_SELECT_THREADS / 32)) {
+            uint32_t y = wsum[t0];
+#pragma unroll
+            for (int d = 1; d < (MTP_NATIVE_SELECT_THREADS / 32); d <<= 1) {
+                const uint32_t z = __shfl_up_sync(
+                    (1u << (MTP_NATIVE_SELECT_THREADS / 32)) - 1u, y, d);
+                if (t0 >= (uint32_t)d) y += z;
+            }
+            wsum[t0] = y;
+        }
+        __syncthreads();
+        const uint32_t S = x + ((t0 >= 32u) ? wsum[(t0 >> 5) - 1u] : 0u);
+        if (S >= need) atomicMin(&s_pick, t0);
+        __syncthreads();
+        const uint32_t pick = s_pick;
+        if (t0 == pick) s_above = S - hb;
+        __syncthreads();
+        const uint32_t bs = (pick < 256u) ? (255u - pick) : 0u;
+        const uint32_t above = (pick < 256u) ? s_above : 0u;
+        const uint32_t hbs = sh[pick < 256u ? pick : 255u];
+        const bool last = (t == 7) || (above + hbs == need);
+
+        /* Warp-aggregated compaction: one global atomicAdd per warp per class.
+         * Every thread makes the same number of trips so the ballots below run
+         * with a full, converged warp. */
+        for (uint32_t base0 = 0u; base0 < cur; base0 += nthr) {
+            const uint32_t i = base0 + tid;
+            const bool live = (i < cur);
+            uint64_t k = 0ull; uint32_t b = 0u;
+            if (live) { k = src[i]; b = (uint32_t)((k >> shft) & 0xffull); }
+            const bool to_out = live && (b > bs || (last && b == bs));
+            const bool to_cand = live && !last && (b == bs);
+            uint32_t m = __ballot_sync(0xffffffffu, to_out);
+            if (m) {
+                uint32_t base;
+                if (lane == (uint32_t)__ffs((int)m) - 1u)
+                    base = atomicAdd(&ctl[0], __popc(m));
+                base = __shfl_sync(0xffffffffu, base, __ffs((int)m) - 1);
+                if (to_out) {
+                    const uint32_t p = base + __popc(m & ((1u << lane) - 1u));
+                    if (p < cap) ids[p] = 0xffffffffu - (uint32_t)k;
+                }
+            }
+            m = __ballot_sync(0xffffffffu, to_cand);
+            if (m) {
+                uint32_t base;
+                if (lane == (uint32_t)__ffs((int)m) - 1u)
+                    base = atomicAdd(&ctl[1], __popc(m));
+                base = __shfl_sync(0xffffffffu, base, __ffs((int)m) - 1);
+                if (to_cand) dst[base + __popc(m & ((1u << lane) - 1u))] = k;
+            }
+        }
+        grid.sync();
+        if (last) break;
+        need -= above;
+        cur = ctl[1];
+        src = dst;
+        dst = (dst == candA) ? candB : candA;
+        grid.sync();
+    }
+}
+
+/* DS4_MTP_NATIVE_SELECT=0 restores the shipped cub screens exactly. */
+static int g_mtp_native_select = -1;
+static int mtp_native_select_enabled(void) {
+    if (g_mtp_native_select < 0) {
+        const char *e = getenv("DS4_MTP_NATIVE_SELECT");
+        g_mtp_native_select = (e != NULL && e[0] == '0') ? 0 : 1;
+    }
+    return g_mtp_native_select;
+}
+/* DS4_MTP_NATIVE_SELECT_VERIFY=1 runs BOTH paths every screen and compares the
+ * candidate SETS on the host, then keeps the cub path's ids so the run stays
+ * on shipped behaviour while being checked.  Host-side only. */
+static int mtp_native_select_verify(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_MTP_NATIVE_SELECT_VERIFY");
+        cached = (e != NULL && e[0] == '1') ? 1 : 0;
+    }
+    return cached;
+}
+/* Verify plumbing.  `begin` snapshots the ids the select just wrote; `end`
+ * compares that snapshot, AS A SET, against the ids cub's sort + unpack wrote
+ * over them.  Both reads are ordinary blocking device reads, so this costs a
+ * full stream sync per screen and is a correctness instrument only. */
+static uint32_t *g_mtp_select_snap = NULL;
+static uint32_t g_mtp_select_snap_n = 0;
+static void mtp_native_select_check_begin(const ds4_gpu_tensor *scratch,
+                                          uint64_t off, uint32_t cap) {
+    if (g_mtp_select_snap_n < cap) {
+        free(g_mtp_select_snap);
+        g_mtp_select_snap = (uint32_t *)malloc((size_t)cap * 4u);
+        g_mtp_select_snap_n = g_mtp_select_snap ? cap : 0u;
+    }
+    if (!g_mtp_select_snap) return;
+    if (!ds4_gpu_tensor_read(scratch, off, g_mtp_select_snap,
+                             (uint64_t)cap * 4u)) g_mtp_select_snap_n = 0u;
+}
+static void mtp_native_select_check_end(const ds4_gpu_tensor *scratch,
+                                        uint64_t off, uint32_t cap,
+                                        const char *what) {
+    static unsigned long long checks = 0ull, bad = 0ull;
+    if (!g_mtp_select_snap || g_mtp_select_snap_n < cap) return;
+    std::vector<uint32_t> ref(cap);
+    if (!ds4_gpu_tensor_read(scratch, off, ref.data(), (uint64_t)cap * 4u)) return;
+    std::vector<uint32_t> got(g_mtp_select_snap, g_mtp_select_snap + cap);
+    std::sort(ref.begin(), ref.end());
+    std::sort(got.begin(), got.end());
+    checks++;
+    if (ref != got) {
+        bad++;
+        fprintf(stderr, "MTP SELECT VERIFY: SET MISMATCH (%s) at check %llu\n",
+                what, checks);
+    }
+    if ((checks % 64ull) == 0ull)
+        fprintf(stderr, "MTP SELECT VERIFY: %llu screens checked, %llu set mismatches\n",
+                checks, bad);
+}
+
+/* Cooperative grid: every block must be resident for grid.sync(), so the grid
+ * is exactly what the occupancy calculator says fits.  0 means "this device
+ * will not take a cooperative launch" and the cub path runs. */
+static int mtp_native_select_grid(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        int dev = 0, coop = 0, nsm = 0, bpsm = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&coop, cudaDevAttrCooperativeLaunch, dev) != cudaSuccess ||
+            !coop ||
+            cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess ||
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &bpsm, mtp_native_select_kernel, MTP_NATIVE_SELECT_THREADS, 0) != cudaSuccess ||
+            nsm <= 0 || bpsm <= 0) {
+            (void)cudaGetLastError();
+            cached = 0;
+        } else {
+            cached = nsm * bpsm;
+        }
+    }
+    return cached;
+}
+
 struct mtp_native_layout {
-    uint64_t scores, key_in, key_out, id_tmp, flag, temporary;
+    uint64_t scores, key_in, key_out, id_tmp, flag, select, temporary;
 };
 static uint64_t mtp_native_align(uint64_t n) { return (n + 255u) & ~255ull; }
+/* The select's own arena: two ping-pong candidate buffers, the 256 global
+ * bins and a 2-slot control word.  ZERO BYTES with the valve off, so
+ * `temporary` lands on exactly the shipped offset. */
+static uint64_t mtp_native_select_arena(uint32_t width) {
+    if (!mtp_native_select_enabled()) return 0;
+    return 2ull * mtp_native_align((uint64_t)width * 8u) +
+           mtp_native_align(256u * 4u + 32u);
+}
 static mtp_native_layout mtp_native_offsets(uint32_t width) {
     mtp_native_layout l;
     l.scores = mtp_native_align(MTP_NATIVE_DIM + (MTP_NATIVE_DIM / 32u) * 4u);
@@ -144,8 +405,33 @@ static mtp_native_layout mtp_native_offsets(uint32_t width) {
     l.key_out = mtp_native_align(l.key_in + (uint64_t)width * 8u);
     l.id_tmp = mtp_native_align(l.key_out + (uint64_t)width * 8u);
     l.flag = mtp_native_align(l.id_tmp + (uint64_t)MTP_NATIVE_CAP * 4u);
-    l.temporary = mtp_native_align(l.flag + 4u);
+    l.select = mtp_native_align(l.flag + 4u);
+    l.temporary = mtp_native_align(l.select + mtp_native_select_arena(width));
     return l;
+}
+/* One cooperative launch in place of a cub sort chain plus its unpack.
+ * Returns 1 when it ran, 0 when the caller must fall back to cub. */
+static int mtp_native_select_launch(char *base, uint64_t select_off,
+                                    uint32_t width, const uint64_t *key_in,
+                                    uint32_t *id_tmp, uint32_t cap) {
+    const int sgrid = mtp_native_select_grid();
+    if (sgrid <= 0) return 0;
+    const uint64_t stride = mtp_native_align((uint64_t)width * 8u);
+    uint64_t *candA = (uint64_t *)(base + select_off);
+    uint64_t *candB = (uint64_t *)(base + select_off + stride);
+    uint32_t *hist = (uint32_t *)(base + select_off + 2ull * stride);
+    uint32_t *ctl = hist + 256u;
+    const uint64_t *keys = key_in;
+    uint32_t n = width, k = cap;
+    void *args[] = { (void *)&keys, (void *)&n, (void *)&id_tmp, (void *)&k,
+                     (void *)&hist, (void *)&ctl, (void *)&candA, (void *)&candB };
+    if (cudaLaunchCooperativeKernel((void *)mtp_native_select_kernel,
+            dim3((unsigned)sgrid), dim3(MTP_NATIVE_SELECT_THREADS), args, 0,
+            cuda_decode_stream()) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return 1;
 }
 extern "C" int ds4_gpu_mtp_native_screen_init(uint32_t width,
         uint64_t *bytes, uint32_t *capacity) {
@@ -168,7 +454,7 @@ extern "C" int ds4_gpu_mtp_native_screen_init(uint32_t width,
  * scores, key sorts, candidate IDs, and exact refinement.  The temporary CUB
  * arena is reused serially after the fused projection. */
 struct mtp_native_layout2 {
-    uint64_t xscale, scores, key_in, key_out, id_tmp, flag, temporary;
+    uint64_t xscale, scores, key_in, key_out, id_tmp, flag, select, temporary;
 };
 static mtp_native_layout2 mtp_native_offsets2(uint32_t width) {
     mtp_native_layout2 l;
@@ -180,7 +466,11 @@ static mtp_native_layout2 mtp_native_offsets2(uint32_t width) {
     l.id_tmp = mtp_native_align(l.key_out + 2ull * width * 8u);
     l.flag = mtp_native_align(
         l.id_tmp + 2ull * MTP_TARGET_NATIVE_CAP * 4u);
-    l.temporary = mtp_native_align(l.flag + 4u);
+    /* The two rows run the select SERIALLY, so one row's arena is enough.
+     * Zero bytes with the valve off, which puts `temporary` back on exactly
+     * the shipped offset. */
+    l.select = mtp_native_align(l.flag + 4u);
+    l.temporary = mtp_native_align(l.select + mtp_native_select_arena(width));
     return l;
 }
 extern "C" int ds4_gpu_mtp_native_screen2_init(uint32_t width,
@@ -405,10 +695,24 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
      * Ranked confirmation: every run carrying it (PRs #531-#535) drafted and
      * accepted exactly as the tip does on the hidden prompt (79 rounds, 49 of
      * 78 drafts accepted). */
-    if (!cuda_ok(cub::DeviceRadixSort::SortKeysDescending(base+l.temporary,temporary,
-            key_in,key_out,width,32,64,cuda_decode_stream()),"native score sort")) return -1;
-    mtp_native_unpack_ids<<<(MTP_NATIVE_CAP+255u)/256u,256,0,cuda_decode_stream()>>>(id_tmp,key_out);
-    if (!cuda_ok(cudaGetLastError(),"native candidate unpack")) return -1;
+    /* DS4_MTP_NATIVE_SELECT: one cooperative radix-select launch in place of
+     * the six-launch cub chain and its unpack.  Same candidate SET, and the
+     * ID sort below makes the order it comes out in irrelevant. */
+    const int selected = mtp_native_select_enabled() &&
+        mtp_native_select_launch(base, l.select, width, key_in, id_tmp,
+                                 MTP_NATIVE_CAP);
+    if (selected && !cuda_ok(cudaGetLastError(), "native candidate select"))
+        return -1;
+    if (!selected || mtp_native_select_verify()) {
+        if (selected) mtp_native_select_check_begin(scratch, l.id_tmp,
+                                                    MTP_NATIVE_CAP);
+        if (!cuda_ok(cub::DeviceRadixSort::SortKeysDescending(base+l.temporary,temporary,
+                key_in,key_out,width,32,64,cuda_decode_stream()),"native score sort")) return -1;
+        mtp_native_unpack_ids<<<(MTP_NATIVE_CAP+255u)/256u,256,0,cuda_decode_stream()>>>(id_tmp,key_out);
+        if (!cuda_ok(cudaGetLastError(),"native candidate unpack")) return -1;
+        if (selected) mtp_native_select_check_end(scratch, l.id_tmp,
+                                                  MTP_NATIVE_CAP, "draft");
+    }
     temporary = (size_t)(scratch->bytes-l.temporary);
     /* RANK ONLY THE BITS A TOKEN ID CAN OCCUPY.
      *
@@ -548,14 +852,27 @@ extern "C" int ds4_gpu_mtp_native_screen2(ds4_gpu_tensor *out,
         uint32_t *itmp = id_tmp + (uint64_t)r * MTP_TARGET_NATIVE_CAP;
         uint32_t *iout = (uint32_t *)ids->ptr +
             (uint64_t)r * MTP_TARGET_NATIVE_CAP;
-        if (!cuda_ok(cub::DeviceRadixSort::SortKeysDescending(
-                base + l.temporary, temporary, kin, kout, width, 32, 64,
-                cuda_decode_stream()), "native R2 score sort")) return -1;
-        mtp_native_unpack_ids_n<<<
-                (MTP_TARGET_NATIVE_CAP + 255u) / 256u, 256, 0,
-                cuda_decode_stream()>>>(itmp, kout, MTP_TARGET_NATIVE_CAP);
-        if (!cuda_ok(cudaGetLastError(), "native R2 candidate unpack"))
-            return -1;
+        const int selected = mtp_native_select_enabled() &&
+            mtp_native_select_launch(base, l.select, width, kin, itmp,
+                                     MTP_TARGET_NATIVE_CAP);
+        if (selected && !cuda_ok(cudaGetLastError(),
+                                 "native R2 candidate select")) return -1;
+        if (!selected || mtp_native_select_verify()) {
+            if (selected) mtp_native_select_check_begin(
+                scratch, l.id_tmp + (uint64_t)r * MTP_TARGET_NATIVE_CAP * 4u,
+                MTP_TARGET_NATIVE_CAP);
+            if (!cuda_ok(cub::DeviceRadixSort::SortKeysDescending(
+                    base + l.temporary, temporary, kin, kout, width, 32, 64,
+                    cuda_decode_stream()), "native R2 score sort")) return -1;
+            mtp_native_unpack_ids_n<<<
+                    (MTP_TARGET_NATIVE_CAP + 255u) / 256u, 256, 0,
+                    cuda_decode_stream()>>>(itmp, kout, MTP_TARGET_NATIVE_CAP);
+            if (!cuda_ok(cudaGetLastError(), "native R2 candidate unpack"))
+                return -1;
+            if (selected) mtp_native_select_check_end(
+                scratch, l.id_tmp + (uint64_t)r * MTP_TARGET_NATIVE_CAP * 4u,
+                MTP_TARGET_NATIVE_CAP, "target");
+        }
         temporary = (size_t)(scratch->bytes - l.temporary);
         if (!cuda_ok(cub::DeviceRadixSort::SortKeys(
                 base + l.temporary, temporary, itmp, iout,
