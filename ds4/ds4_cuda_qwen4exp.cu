@@ -7336,6 +7336,11 @@ template <int R, int DownType = -1, bool Vector = false, bool Stage = false,
  * phase's graph captures. A comparison that does not discard each
  * residency's first run is measuring which arm happened to go first.
  */
+/* Prefetch distance for the routed-down panel stream, in staged steps.
+ * DIST4 measured neutral-to-negative (retry 2.7621 vs 2.7985 crown):
+ * four outstanding panels per stream risks L2 pollution on route
+ * divergence. DIST2 keeps prefetch inside the likely-correct horizon. */
+#define QW_DOWN_L2_DIST 2u
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
@@ -7350,7 +7355,8 @@ __global__ static void qwen4exp_moe_down_q_kernel(
         uint32_t out_dim,
         uint32_t n_tokens,
         uint32_t n_total_expert,
-        uint32_t n_expert_used) {
+        uint32_t n_expert_used,
+        uint32_t l2_ahead) {
     /* Dynamic shared memory is 16-byte aligned by contract, and it is requested
      * only for the Stage instantiations; the others map nothing here. */
     extern __shared__ uint4 qw_down_panel[];
@@ -7430,9 +7436,30 @@ __global__ static void qwen4exp_moe_down_q_kernel(
             }
         }
     };
+    auto qw_l2_ahead = [&](uint32_t k) {
+        if (!(Stage && Async) || !l2_ahead) return;
+        const uint32_t kslot = k / take;
+        if (kslot >= n_expert_used) return;
+        const uint32_t kr = k - kslot * take;
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            if ((uint32_t)r == kr) {
+                const int32_t e = __shfl_sync(0xffffffffu, route[r], kslot);
+                if (e < 0 || (uint32_t)e >= n_total_expert) return;
+                const char *const gp = down +
+                    (uint64_t)(uint32_t)e * down_expert_bytes +
+                    (uint64_t)row0 * down_row_bytes;
+                for (uint64_t o = (uint64_t)threadIdx.x * 128u;
+                     o < panel_bytes; o += (uint64_t)blockDim.x * 128u)
+                    qw_prefetch_l2(gp + o);
+            }
+        }
+    };
     if (Stage) {
         qw_fill_step(0u, 0u, spanel);
         if (Async) qw_cpasync_commit();
+#pragma unroll
+        for (uint32_t k = 1u; k < QW_DOWN_L2_DIST; k++) qw_l2_ahead(k);
     }
     /* PDL consumer fence (ds4_cuda_qwen4exp.cuh).  Everything above it reads
      * only `selected` and `down`:
@@ -7477,6 +7504,7 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                                      (uint64_t)((step + 1u) & 1u) * panel_bytes);
                         if (Async) qw_cpasync_commit();
                     }
+                    qw_l2_ahead(step + QW_DOWN_L2_DIST);
                 }
                 const uint32_t t = tok0 + (uint32_t)r;
                 const int32_t e = Vector ? __shfl_sync(0xffffffffu, route[r], slot)
@@ -9800,6 +9828,11 @@ static int qwen4exp_pdl_routed_down(void) {
     if (v < 0) v = getenv("DS4_QWEN4EXP_NO_PDL_ROUTED_DOWN") == NULL ? 1 : 0;
     return v;
 }
+static int qwen4exp_down_l2ahead(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_NO_DOWN_L2AHEAD") == NULL ? 1 : 0;
+    return v;
+}
 static int qwen4exp_pdl_router_tree(void) {
     static int v = -1;
     if (v < 0) v = getenv("DS4_QWEN4EXP_NO_PDL_ROUTER_TREE") == NULL ? 1 : 0;
@@ -10610,7 +10643,8 @@ static int qwen4exp_routed_moe_cuda(
             (float *)out->ptr, down, (const int32_t *)selected->ptr, \
             sc.mq, sc.ms, sc.msum, \
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
-            mgroups, out_dim, n_tokens, n_total_expert, n_expert_used
+            mgroups, out_dim, n_tokens, n_total_expert, n_expert_used, \
+            (uint32_t)qwen4exp_down_l2ahead()
 #define QWEN4EXP_DOWN_IMPL_S(R, DT, V, S, SH) do { \
     if (n_tokens <= 2u && qwen4exp_pdl_routed_down()) { \
         QWEN4EXP_LAUNCH_PDL((qwen4exp_moe_down_q_kernel<R, DT, V, S>), \
