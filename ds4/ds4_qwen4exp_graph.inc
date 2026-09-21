@@ -2951,11 +2951,23 @@ static bool qw_decode_graph_chunk(ds4_qwen4exp_session *s,
 #endif
         /* Upload the NEXT chunk while the device runs this one, so its launch
          * finds the graph resident instead of uploading it in front of an idle
-         * GPU.  A miss is a no-op. */
-        if (il_last < g_ds4_qwen4exp.n_layer) {
+         * GPU.  A miss is a no-op.
+         *
+         * Close the chain into a cycle: the last chunk of a forward used to
+         * prefetch nothing, so chunk 0 (the lead chunk tip carves off for the
+         * dry-device launch) was permanently displaced by uploads of 1..N-1 and
+         * re-uploaded inline every round in front of an idle GPU.  Wrapping to
+         * chunk 0 keeps that exec resident.  chunk != 0 guards a single-chunk
+         * round from prefetching the graph it is launching. */
+        {
             ds4_decode_graph_key next = key;
-            next.il = chunk + 1u;
-            (void)ds4_gpu_decode_graph_prefetch(&next);
+            if (il_last < g_ds4_qwen4exp.n_layer) {
+                next.il = chunk + 1u;
+                (void)ds4_gpu_decode_graph_prefetch(&next);
+            } else if (chunk != 0u) {
+                next.il = 0u;
+                (void)ds4_gpu_decode_graph_prefetch(&next);
+            }
         }
         return true;
     }
