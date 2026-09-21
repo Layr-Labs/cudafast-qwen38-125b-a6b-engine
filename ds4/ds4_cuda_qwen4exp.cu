@@ -7409,6 +7409,13 @@ __global__ static void qwen4exp_moe_down_q_kernel(
      * rather than incremented, so an out-of-range expert cannot desynchronise
      * the parity from the fill sequence, and acc[r] still absorbs slots 0..
      * n_expert_used-1 in ascending order for each token. */
+    /* The fill walk's geometry is uniform over the block and constant for the
+     * whole kernel: every fill copies the same panel with the same stride, so
+     * the number of FULL sweeps and the offset of the ragged one are the same
+     * for every step this block issues.  Resolved once here rather than
+     * re-derived per sweep per fill. */
+    const uint64_t fill_stride = (uint64_t)blockDim.x * 16u;
+    const uint64_t fill_bulk = panel_bytes / fill_stride * fill_stride;
     auto qw_fill_step = [&](uint32_t slot, uint32_t rr, char *const dst) {
 #pragma unroll
         for (int r = 0; r < R; r++) {
@@ -7418,13 +7425,29 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                 const char *const gp = down +
                     (uint64_t)(uint32_t)e * down_expert_bytes +
                     (uint64_t)row0 * down_row_bytes;
-                for (uint64_t o = (uint64_t)threadIdx.x * 16u;
-                     o < panel_bytes; o += (uint64_t)blockDim.x * 16u) {
+                /* Full sweeps carry no bound test: below `fill_bulk` every
+                 * lane is in range by construction.  The ragged sweep runs
+                 * once, over exactly the offsets the rolled walk's last sweep
+                 * covered -- a lane's visits are tid*16 + k*stride, so the
+                 * only visit that could fall short is the one at `fill_bulk`.
+                 * Same source addresses, same destination offsets, same
+                 * ascending order, same staged bytes. */
+                const uint64_t o0 = (uint64_t)threadIdx.x * 16u;
+                for (uint64_t o = o0; o < fill_bulk; o += fill_stride) {
                     if (Async) {
                         qw_cpasync16((uint32_t)__cvta_generic_to_shared(dst + o),
                                      gp + o);
                     } else {
                         *(uint4 *)(dst + o) = *(const uint4 *)(gp + o);
+                    }
+                }
+                const uint64_t ot = fill_bulk + o0;
+                if (ot < panel_bytes) {
+                    if (Async) {
+                        qw_cpasync16((uint32_t)__cvta_generic_to_shared(dst + ot),
+                                     gp + ot);
+                    } else {
+                        *(uint4 *)(dst + ot) = *(const uint4 *)(gp + ot);
                     }
                 }
             }
