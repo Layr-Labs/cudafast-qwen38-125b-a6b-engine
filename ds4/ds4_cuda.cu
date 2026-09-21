@@ -24984,6 +24984,7 @@ __global__ static void q8_K_quantize_kernel(cuda_block_q8_K *out, const float *x
     __shared__ float val_part[256];
     __shared__ float maxv_s;
     __shared__ float iscale_s;
+    __shared__ int8_t qs_part[CUDA_QK_K];
     uint32_t tid = threadIdx.x;
     float v = tid < CUDA_QK_K ? xr[tid] : 0.0f;
     abs_part[tid] = tid < CUDA_QK_K ? fabsf(v) : 0.0f;
@@ -25009,15 +25010,16 @@ __global__ static void q8_K_quantize_kernel(cuda_block_q8_K *out, const float *x
     }
     __syncthreads();
     if (tid < CUDA_QK_K) {
-        int qv = (int)lrintf(iscale_s * xr[tid]);
+        int qv = (int)lrintf(iscale_s * v);
         if (qv > 127) qv = 127;
         if (qv < -128) qv = -128;
+        qs_part[tid] = (int8_t)qv;
         yb->qs[tid] = (int8_t)qv;
     }
     __syncthreads();
     if (tid < CUDA_QK_K / 16) {
         int sum = 0;
-        for (int i = 0; i < 16; i++) sum += yb->qs[tid * 16 + i];
+        for (int i = 0; i < 16; i++) sum += qs_part[tid * 16 + i];
         yb->bsums[tid] = (int16_t)sum;
     }
     if (tid == 0) yb->d = 1.0f / iscale_s;
@@ -25157,6 +25159,7 @@ __global__ static void q8_K_quantize_owned_kernel(
     __shared__ float val_part[256];
     __shared__ float maxv_s;
     __shared__ float iscale_s;
+    __shared__ int8_t qs_part[CUDA_QK_K];
     const uint32_t tid = threadIdx.x;
     const float v = tid < CUDA_QK_K ? xr[tid] : 0.0f;
     abs_part[tid] = tid < CUDA_QK_K ? fabsf(v) : 0.0f;
@@ -25182,15 +25185,16 @@ __global__ static void q8_K_quantize_owned_kernel(
     }
     __syncthreads();
     if (tid < CUDA_QK_K) {
-        int qv = (int)lrintf(iscale_s * xr[tid]);
+        int qv = (int)lrintf(iscale_s * v);
         if (qv > 127) qv = 127;
         if (qv < -128) qv = -128;
+        qs_part[tid] = (int8_t)qv;
         yb->qs[tid] = (int8_t)qv;
     }
     __syncthreads();
     if (tid < CUDA_QK_K / 16) {
         int sum = 0;
-        for (int i = 0; i < 16; i++) sum += yb->qs[tid * 16 + i];
+        for (int i = 0; i < 16; i++) sum += qs_part[tid * 16 + i];
         yb->bsums[tid] = (int16_t)sum;
     }
     if (tid == 0) yb->d = 1.0f / iscale_s;
@@ -38469,3 +38473,4 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
 #include "ds4_deepseek4_vision_gpu.cuh"
 
 #include "ds4_cuda_mtp_native.cuh"
+#define GAUNTLET_REDRAW_39fe1caf_20260921T031050Z 1
