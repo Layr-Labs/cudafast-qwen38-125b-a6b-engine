@@ -6786,9 +6786,73 @@ __device__ __forceinline__ static bool qw_gu_coop_raw_load(
 #ifndef QW_GU_NREG_Q80
 #define QW_GU_NREG_Q80 64
 #endif
+/* THE q4_K CAP IS 8 REGISTERS TIGHTER THAN FREE, and the paragraph above is
+ * why: it says 32 "was chosen to buy a FOURTH block ... where registers were
+ * the binding constraint", and that rationale is STALE.  Registers are no
+ * longer the binding constraint on the live arm.  At QW_GU_COOP_ROWS * 64 =
+ * 256 threads, against the 11,584-byte q4_K panel:
+ *
+ *   shared    101,376 / 11,584     = 8 blocks
+ *   threads   1,536 / 256          = 6 blocks   <-- BINDS
+ *   registers 65,536 / (32 * 256)  = 8 blocks
+ *
+ * The THREAD ceiling binds at 6, and the probe agrees: gu[occ] reads 6, not the
+ * 4 the comment above is written about.  The paragraph above even does this
+ * arithmetic for the q5_K arm and reaches the same number -- "6 blocks needs
+ * <= 65,536/(6*256) = 42 registers, so 40 is the largest allocation that keeps
+ * the q4_K arm's own residency" -- and then leaves the q4_K arm itself at 32.
+ *
+ * So 33..40 are FREE: 40 * 256 = 10,240 and 65,536 / 10,240 = 6.4 -> 6 blocks,
+ * the same residency 32 gets.  40 and not 42 because ptxas allocates registers
+ * in multiples of 8, so a cap of 42 is allocated as 48, and 48 * 256 = 12,288
+ * -> 5 blocks, which WOULD cost a block.  That rounding is why the paragraph
+ * above picked 40 over its own computed 42.
+ *
+ * WHY THE CAP IS NOT FREE TO LEAVE IN PLACE.  gu[reg] reads exactly 32 against
+ * a cap of 32, so the cap is BINDING -- ptxas wanted more and was forced down.
+ * gu[lmem] is 0, but a zero local frame does not mean the squeeze was free:
+ * with spilling refused, ptxas balances the books by REMATERIALIZING,
+ * recomputing addresses and re-reading shared memory inside the innermost loop,
+ * which is invisible to every field the probe prints.  The paragraph above
+ * supplies the corroboration directly: at this same cap of 32 the two wider
+ * panels DID spill (q5_K 40 B of stack, q8_0 16 B) "in the innermost loop of a
+ * kernel that is already at the memory wall", which is why they were given 40
+ * and 64.  The live q4_K arm is the only one still at 32.
+ *
+ * AND THE THING THE CAP WAS BOUGHT FOR IS MEASURED TO BE WORTH ~NOTHING.  The
+ * down kernel's own comment records `7daa6e85` moving that kernel from 5
+ * resident blocks to 4 with decode moving -0.04%: "4 blocks vs 5 is worth
+ * almost nothing here and residency is not this kernel's constraint either."
+ * These two are the routed-MoE decode pair and they stream at DRAM peak, so
+ * neither has latency slack a further block could hide.  Residency was the
+ * wrong thing to spend registers on -- and this arm spends none of it anyway,
+ * because 40 keeps all 6 blocks.
+ *
+ * READOUT, PRE-COMMITTED (probe fields, published in engine_backend):
+ *
+ *   gu[reg] > 32 and gu[occ] == 6   relaxed at zero residency cost; THE
+ *                                   COMPOSITE ANSWERS THE QUESTION
+ *   gu[reg] still 32                ptxas did not want the registers; the arm
+ *                                   is VOID, read NOTHING from the score
+ *   gu[occ] < 6                     the thread-ceiling arithmetic above is
+ *                                   WRONG; revert regardless of the composite
+ *   gu[lmem] != 0                   a looser cap that spills is incoherent;
+ *                                   revert regardless of the composite
+ *
+ * Drift control: compare mm[reg] and md[reg] against 128 and 79 before
+ * attributing any delta to this arm.  Do NOT use gu5/gu8/dn/gdn as controls --
+ * those probe fields instantiate specializations the live dispatch never
+ * launches.
+ *
+ * Bit-exactness: a register cap changes ALLOCATION only.  ptxas may spill or
+ * rematerialize; it cannot reassociate floating-point arithmetic.  No weight is
+ * re-quantized, re-represented or reformatted, and no cache is introduced. */
+#ifndef QW_GU_NREG_Q4K
+#define QW_GU_NREG_Q4K 255
+#endif
 #define QW_GU_NREG_FOR(T)                                                     \
     ((T) == (int)DS4_QWEN4EXP_TY_q8_0 ? QW_GU_NREG_Q80 :                      \
-     (T) == (int)DS4_QWEN4EXP_TY_q5_K ? QW_GU_NREG_Q5K : 32)
+     (T) == (int)DS4_QWEN4EXP_TY_q5_K ? QW_GU_NREG_Q5K : QW_GU_NREG_Q4K)
 #if defined(__CUDACC__) && CUDART_VERSION >= 12040
 #define QW_GU_MAXNREG __maxnreg__(QW_GU_NREG_FOR(Type))
 #else
