@@ -11217,14 +11217,35 @@ __global__ static void attention_decode_global_softmax_kernel(
         partial[threadIdx.x] = local_max;
     }
     __syncthreads();
-    for (uint32_t stride = score_threads >> 1; stride > 0; stride >>= 1) {
+    for (uint32_t stride = score_threads >> 1; stride > 32u; stride >>= 1) {
         if (threadIdx.x < stride) {
             partial[threadIdx.x] =
                 fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
         }
         __syncthreads();
     }
-    if (threadIdx.x == 0) max_s = partial[0];
+    /* The last six levels of both tournaments are confined to one warp, where
+     * the block barrier orders nothing: the pairings, their order and the
+     * operations are the shared tree's, carried in registers instead. */
+    if (score_threads >= 64u) {
+        if (threadIdx.x < 32u) {
+            float m = fmaxf(partial[threadIdx.x], partial[threadIdx.x + 32u]);
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                m = fmaxf(m, __shfl_down_sync(0xffffffffu, m, offset));
+            }
+            if (threadIdx.x == 0u) max_s = m;
+        }
+    } else {
+        for (uint32_t stride = score_threads >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                partial[threadIdx.x] =
+                    fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) max_s = partial[0];
+    }
     __syncthreads();
 
     float den_local = 0.0f;
@@ -11237,11 +11258,26 @@ __global__ static void attention_decode_global_softmax_kernel(
         partial[threadIdx.x] = den_local;
     }
     __syncthreads();
-    for (uint32_t stride = score_threads >> 1; stride > 0; stride >>= 1) {
+    for (uint32_t stride = score_threads >> 1; stride > 32u; stride >>= 1) {
         if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
         __syncthreads();
     }
-    if (threadIdx.x == 0) denom_s = partial[0] + expf(sinks[h] - max_s);
+    if (score_threads >= 64u) {
+        if (threadIdx.x < 32u) {
+            float d = partial[threadIdx.x] + partial[threadIdx.x + 32u];
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                d += __shfl_down_sync(0xffffffffu, d, offset);
+            }
+            if (threadIdx.x == 0u) denom_s = d + expf(sinks[h] - max_s);
+        }
+    } else {
+        for (uint32_t stride = score_threads >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) denom_s = partial[0] + expf(sinks[h] - max_s);
+    }
     __syncthreads();
 
     if (score_thread) {
