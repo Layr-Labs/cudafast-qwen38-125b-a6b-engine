@@ -17,6 +17,12 @@ struct ds4s_handle {
 /* Why the last open failed, for the caller that got NULL back. */
 static char g_open_err[512];
 
+/* The pre-hello LM-head sub-slice profile, filled once inside ds4s_open and
+ * appended to the engine identity by ds4s_hw_limits.  Empty whenever the warm
+ * block was skipped or the profiler had nothing to report, and an empty one
+ * appends nothing. */
+static char g_head_prof[160];
+
 static void set_err(ds4s_handle *h, const char *msg) {
     if (!h) return;
     snprintf(h->err, sizeof(h->err), "%s", msg ? msg : "unknown ds4 failure");
@@ -148,7 +154,7 @@ ds4s_handle *ds4s_open(const char *model_path, const char *mtp_head_path,
         const int vocab = ds4s_vocab_size(h);
         enum { WARM_PROMPT = 1024, WARM_ROUNDS = 16, WARM_CAP = 8,
                WARM_ROUNDS_CHAIN = 4, WARM_PERIOD = 17,
-               WARM_STRIDE = 7919 };
+               WARM_STRIDE = 7919, WARM_ROUNDS_PROF = 3 };
         if (vocab > 16) {
             int32_t *ids = (int32_t *)malloc((size_t)WARM_PROMPT * sizeof(*ids));
             if (ids) {
@@ -218,6 +224,34 @@ ds4s_handle *ds4s_open(const char *model_path, const char *mtp_head_path,
                             t = (r & 1) ? ds4s_argmax(h)
                                         : ids[(r * 37 + 11) % WARM_PROMPT];
                         }
+                        /* THE HEAD SUB-SLICE PROFILE, and it must come LAST.
+                         *
+                         * Armed, every stage boundary inside the R2 LM-head
+                         * screen synchronizes the decode stream, so these rounds
+                         * are slower than a real one -- which is exactly why they
+                         * run AFTER the blocks above rather than instead of them.
+                         * Those blocks exist to trigger graph captures worth
+                         * +283 ms of prefill on both candidate legs, and arming
+                         * first would forfeit them.
+                         *
+                         * Two rows is required, not incidental: the R2 screen's
+                         * own gate is `logit_rows == 2`, so a 1-row eval would
+                         * measure nothing.  WARM_ROUNDS_PROF rounds is enough --
+                         * these are absolute per-call microseconds, not a
+                         * ranking, so a handful of calls already separates a
+                         * 100 us stage from a 1000 us one.  Still untimed, still
+                         * synthetic, still discarded by the ds4s_invalidate
+                         * below, and still non-fatal if it reports nothing. */
+                        ds4_qwen4exp_head_subslice_arm(1);
+                        for (int r = 0; r < WARM_ROUNDS_PROF; r++) {
+                            const int n = ds4s_eval_speculative(h, t, 2, out,
+                                                                WARM_CAP);
+                            if (n <= 0) break;
+                            t = out[n - 1];
+                        }
+                        ds4_qwen4exp_head_subslice_arm(0);
+                        (void)ds4_qwen4exp_head_subslice_report(
+                            g_head_prof, sizeof(g_head_prof));
                     }
                 }
                 free(ids);
@@ -244,8 +278,18 @@ const char *ds4s_last_error(const ds4s_handle *h) {
 }
 
 const char *ds4s_hw_limits(void) {
+    static char joined[704];
     const char *s = ds4_gpu_hw_limits();
-    return s ? s : "";
+    if (!s) s = "";
+    if (!g_head_prof[0]) return s;
+    /* Truncation would corrupt the table rather than shorten it, so an overlong
+     * join drops the profile and keeps the device limits intact -- the same way
+     * ds4_resident drops the whole limits string rather than truncating it. */
+    if (snprintf(joined, sizeof(joined), "%s %s", s, g_head_prof) >=
+        (int)sizeof(joined)) {
+        return s;
+    }
+    return joined;
 }
 
 int ds4s_vocab_size(const ds4s_handle *h) {

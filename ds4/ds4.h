@@ -648,4 +648,26 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
  * it is outside every timed phase and cannot perturb a measurement. */
 const char *ds4_gpu_hw_limits(void);
 
+/* The LM head's internal sub-slice profile, published through the same channel
+ * and for the same reason as ds4_gpu_hw_limits: a serialised whole-round profile
+ * puts the head at 3.47 ms/token but the two kernels it contains only account
+ * for 2.04 ms at the streaming rate the rest of the round achieves, and the
+ * uncounted work -- two CUB radix sorts per row -- moves too few bytes for byte
+ * counting to price.  This reports where the head's time actually goes.
+ *
+ * Armed, each stage boundary inside the R2 screen synchronizes the decode
+ * stream, so arm it ONLY around throwaway rounds before the resident binds its
+ * socket.  Disarmed, every hook is a load and a branch.  The R2 screen declines
+ * to run under graph capture, so these rounds are always an eager sequence and
+ * the syncs reveal the split without reordering anything.
+ *
+ * _arm(1) zeroes the accumulators and turns the hooks on; _arm(0) turns them off
+ * and leaves them readable.  _report renders
+ * `hd[n=<calls> <screen>,<sort1>,<unpack>,<sort2>,<refine>]` in MICROSECONDS PER
+ * CALL -- absolute times, not shares, because each stage is bracketed by its own
+ * two syncs -- and returns the length written, or 0 with an empty string if
+ * nothing was recorded or `cap` cannot hold the whole line. */
+void ds4_qwen4exp_head_subslice_arm(int on);
+int  ds4_qwen4exp_head_subslice_report(char *out, size_t cap);
+
 #endif
