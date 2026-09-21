@@ -6502,16 +6502,35 @@ qwen4exp_moe_down_mma_kernel(
         }
 
         const uint32_t m0 = warp * 16u + (lane >> 2);
+        /* The two guards this store applies are not per-element questions.
+         * `orow` takes exactly TWO values over the four r steps -- the (r & 2)
+         * bit picks m0 or m0 + 8, and nothing else in it depends on r or nt --
+         * so the out_dim test has two answers for the whole eight-element
+         * epilogue, and the rolled form asked it eight times.  The same holds
+         * for the routing column: nn is nt*8 + (lane&3)*2 + (r&1), so r=0,2
+         * share one column and r=1,3 the next, and the `take` test likewise
+         * has two answers per nt rather than four.  Both are resolved once at
+         * the level they actually vary on, and the store then runs under the
+         * pair of booleans it already implied.  The stored values, their
+         * addresses, the columns that produce a store and the ones that do
+         * not are the rolled store's own. */
+        const uint32_t orow_lo = row0 + m0;
+        const uint32_t orow_hi = row0 + m0 + 8u;
+        const bool row_lo_ok = orow_lo < out_dim;
+        const bool row_hi_ok = orow_hi < out_dim;
 #pragma unroll
         for (int nt = 0; nt < QW_DOWN_MMA_NT; nt++) {
+            const uint32_t nn0 = (uint32_t)nt * 8u + (lane & 3u) * 2u;
+            const bool col0_ok = (int32_t)nn0 < take;
+            const bool col1_ok = (int32_t)(nn0 + 1u) < take;
 #pragma unroll
             for (int r = 0; r < 4; r++) {
-                const uint32_t nn = nt * 8u + (lane & 3u) * 2u + (r & 1);
-                if ((int32_t)nn >= take) continue;
-                const uint32_t mr = m0 + ((r & 2) ? 8u : 0u);
-                const uint32_t orow = row0 + mr;
-                if (orow >= out_dim) continue;
-                partial[(uint64_t)sPair[nn] * out_dim + orow] = acc[nt * 4 + r];
+                if (!((r & 1) ? col1_ok : col0_ok)) continue;
+                if (!((r & 2) ? row_hi_ok : row_lo_ok)) continue;
+                const uint32_t nn = nn0 + (uint32_t)(r & 1);
+                const uint32_t orow = (r & 2) ? orow_hi : orow_lo;
+                partial[(uint64_t)sPair[nn] * out_dim + orow] =
+                        acc[nt * 4 + r];
             }
         }
         __syncthreads();
