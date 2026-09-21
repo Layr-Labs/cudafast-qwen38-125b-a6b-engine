@@ -2194,7 +2194,8 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
             s->moe_selected, s->moe_weights, DS4_N_EXPERT, DS4_N_EXPERT_USED,
             s->mixed, n_tokens, DS4_N_EXPERT_USED * DS4_N_FF_EXP,
             moe_fuse_router ? s->moe_logits : NULL,
-            moe_fuse_router ? s->moe_weights : NULL)) {
+            moe_fuse_router ? s->moe_weights : NULL,
+            qw_moe_in_head_block)) {
         fprintf(stderr, "ds4: qwen4exp routed experts failed at block %u\n", il);
         return false;
     }
