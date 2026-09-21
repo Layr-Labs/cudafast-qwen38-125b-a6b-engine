@@ -10854,7 +10854,10 @@ __global__ static void attention_decode_score_split_finalize_kernel(
     __syncthreads();
     const uint32_t n_score = raw_count + visible_comp;
     const float *row_scores = score_in + (uint64_t)h * n_score;
-    float local_max = sinks[h];
+    /* The head's sink seeds the maximum and closes the denominator; one read
+     * serves both, so the publishing thread needs no global access. */
+    const float sink = sinks[h];
+    float local_max = sink;
     if (score_thread) {
         for (uint32_t i = threadIdx.x; i < n_score; i += score_threads) {
             const float s = row_scores[i];
@@ -10886,7 +10889,7 @@ __global__ static void attention_decode_score_split_finalize_kernel(
         if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
         __syncthreads();
     }
-    if (threadIdx.x == 0) denom = partial[0] + expf(sinks[h] - max_s);
+    if (threadIdx.x == 0) denom = partial[0] + expf(sink - max_s);
     __syncthreads();
     float *oh = heads + (uint64_t)h * head_dim;
     if (head_dim == 512u && blockDim.x >= 512u) {
@@ -11005,7 +11008,8 @@ __global__ static void attention_decode_score_split_finalize_rows_kernel(
     const uint32_t n_score = raw_count + visible_comp;
     const float *row_scores = score_in +
         ((uint64_t)row * n_head + h) * score_stride;
-    float local_max = sinks[h];
+    const float sink = sinks[h];
+    float local_max = sink;
     if (score_thread) {
         for (uint32_t i = threadIdx.x; i < n_score; i += score_threads) {
             const float s = row_scores[i];
@@ -11044,7 +11048,7 @@ __global__ static void attention_decode_score_split_finalize_rows_kernel(
         __syncthreads();
     }
     if (threadIdx.x == 0u) {
-        denom = partial[0] + expf(sinks[h] - max_s);
+        denom = partial[0] + expf(sink - max_s);
     }
     __syncthreads();
 
@@ -11144,7 +11148,8 @@ __global__ static void attention_decode_score_split_finalize_dim2_kernel(
 
     const uint32_t n_score = raw_count + visible_comp;
     const float *row_scores = score_in + (uint64_t)h * n_score;
-    float local_max = sinks[h];
+    const float sink = sinks[h];
+    float local_max = sink;
     for (uint32_t i = threadIdx.x; i < n_score; i += score_threads) {
         const float s = row_scores[i];
         scores[i] = s;
@@ -11173,7 +11178,7 @@ __global__ static void attention_decode_score_split_finalize_dim2_kernel(
         if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
         __syncthreads();
     }
-    if (threadIdx.x == 0) denom = partial[0] + expf(sinks[h] - max_s);
+    if (threadIdx.x == 0) denom = partial[0] + expf(sink - max_s);
     __syncthreads();
 
     const uint32_t d = dim_half * 256u + threadIdx.x;
