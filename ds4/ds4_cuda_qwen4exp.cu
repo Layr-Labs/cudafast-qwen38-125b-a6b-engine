@@ -733,6 +733,40 @@ __global__ static void qwen4exp_gdn_conv_kernel(
     history[(uint64_t)2u * conv_dim + channel] = h2;
 }
 
+/* A channel's four causal-convolution taps are one 16-byte vector.
+ *
+ * Every convolution arm below gives a channel to a thread and reads that
+ * channel's whole filter, `conv_weight[channel * 4 + 0 .. 3]`.  Read as four
+ * scalars they are four loads per thread, each strided sixteen bytes across
+ * the warp, so the warp issues four requests that each touch all of its
+ * sectors and no tap is in a register until the last of them retires.  The
+ * taps are loop invariant and every consumer needs all four, so the fetch is
+ * a serial prologue in front of the window arithmetic rather than something
+ * the loop can overlap.
+ *
+ * One 128-bit load brings the same sixteen bytes in a single instruction and
+ * the warp's vectors form one contiguous span.  Same addresses, same bytes,
+ * same registers, so every product downstream is unchanged and the emitted
+ * tokens are bit-identical.  The vector form needs a sixteen-byte aligned
+ * base, which is checked at the point of use; an unaligned base keeps the
+ * scalar reads.  Building with -DDS4_GDN_CONV_TAP_VEC=0 restores them. */
+#ifndef DS4_GDN_CONV_TAP_VEC
+#define DS4_GDN_CONV_TAP_VEC 1
+#endif
+
+__device__ __forceinline__ static float4 qwen4exp_gdn_conv_taps(
+        const float *conv_weight, uint32_t channel) {
+#if DS4_GDN_CONV_TAP_VEC
+    if ((((uintptr_t)conv_weight) & 15u) == 0u) {
+        return __ldg((const float4 *)conv_weight + channel);
+    }
+#endif
+    return make_float4(conv_weight[(uint64_t)channel * 4u + 0u],
+                       conv_weight[(uint64_t)channel * 4u + 1u],
+                       conv_weight[(uint64_t)channel * 4u + 2u],
+                       conv_weight[(uint64_t)channel * 4u + 3u]);
+}
+
 /* Replay-only twin: original serial convolution followed by gate publication. */
 __global__ static void qwen4exp_gdn_conv_replay_gates_kernel(
         float       *qkv,
@@ -787,10 +821,11 @@ __global__ static void qwen4exp_gdn_conv_replay_gates_kernel(
     float h0 = history_src[channel];
     float h1 = history_src[(uint64_t)conv_dim + channel];
     float h2 = history_src[(uint64_t)2u * conv_dim + channel];
-    const float w0 = conv_weight[(uint64_t)channel * 4u + 0u];
-    const float w1 = conv_weight[(uint64_t)channel * 4u + 1u];
-    const float w2 = conv_weight[(uint64_t)channel * 4u + 2u];
-    const float w3 = conv_weight[(uint64_t)channel * 4u + 3u];
+    const float4 taps = qwen4exp_gdn_conv_taps(conv_weight, channel);
+    const float w0 = taps.x;
+    const float w1 = taps.y;
+    const float w2 = taps.z;
+    const float w3 = taps.w;
 
     float raw = qkv[(uint64_t)row * n_tokens * conv_dim + channel];
     for (uint32_t token = 0; token < n_tokens; token++) {
@@ -926,10 +961,11 @@ __global__ static void qwen4exp_gdn_conv_parallel_kernel(
 
     const float *history = conv_state +
         (uint64_t)row * QWEN4EXP_GDN_HISTORY * conv_dim;
-    const float w0 = conv_weight[(uint64_t)channel * 4u + 0u];
-    const float w1 = conv_weight[(uint64_t)channel * 4u + 1u];
-    const float w2 = conv_weight[(uint64_t)channel * 4u + 2u];
-    const float w3 = conv_weight[(uint64_t)channel * 4u + 3u];
+    const float4 taps = qwen4exp_gdn_conv_taps(conv_weight, channel);
+    const float w0 = taps.x;
+    const float w1 = taps.y;
+    const float w2 = taps.z;
+    const float w3 = taps.w;
 
     /* The window of this token: inputs x[t-3 .. t], the carried history
      * standing in for every x before the chunk. */
@@ -2314,10 +2350,11 @@ qwen4exp_gdn_qkv_conv_mma_pipe_kernel(float *out,
         const int gwarp = warp & 3;
         const uint32_t ch = (uint32_t)gwarp * 32u + lane;
         const uint32_t channel = (uint32_t)n0 + ch;
-        const float w0 = conv_weight[(uint64_t)channel * 4u + 0u];
-        const float w1 = conv_weight[(uint64_t)channel * 4u + 1u];
-        const float w2 = conv_weight[(uint64_t)channel * 4u + 2u];
-        const float w3 = conv_weight[(uint64_t)channel * 4u + 3u];
+        const float4 taps = qwen4exp_gdn_conv_taps(conv_weight, channel);
+        const float w0 = taps.x;
+        const float w1 = taps.y;
+        const float w2 = taps.z;
+        const float w3 = taps.w;
         const uint64_t tile_idx = (uint64_t)blockIdx.x;
         for (int r = grp; r < BM; r += 3) {
             const uint64_t token = (uint64_t)m0 + (uint32_t)r;
@@ -2385,10 +2422,11 @@ __global__ static void qwen4exp_gdn_conv_fixup_kernel(
     const float post_scale = block < n_key_head
         ? 0x1.6a09e6p-4f
         : 1.0f;
-    const float w0 = conv_weight[(uint64_t)channel * 4u + 0u];
-    const float w1 = conv_weight[(uint64_t)channel * 4u + 1u];
-    const float w2 = conv_weight[(uint64_t)channel * 4u + 2u];
-    const float w3 = conv_weight[(uint64_t)channel * 4u + 3u];
+    const float4 taps = qwen4exp_gdn_conv_taps(conv_weight, channel);
+    const float w0 = taps.x;
+    const float w1 = taps.y;
+    const float w2 = taps.z;
+    const float w3 = taps.w;
     /* Raw rows -3..-1 of the tile and its own raw rows 0..2. */
     const float *prev = tile == 0u
         ? conv_state
