@@ -2855,6 +2855,52 @@ static uint32_t qw_decode_graph_chunks(void) {
     return chunks;
 }
 
+/* LAYERS IN THE LEAD CHUNK.
+ *
+ * Only the FIRST chunk of a decode forward can ever be exposed.  The host
+ * reaches its cudaGraphLaunch straight out of the cudaDeviceSynchronize that
+ * read the drafted ids back, with nothing queued in front of it but ~6 us of
+ * eager prologue, and cudaGraphLaunch's HOST cost is linear in the chunk's
+ * node count (measured ~0.43 us/node + ~7 us: 45 us for 6 layers, 133 us for
+ * 12, 292 us for 24).  Every later chunk's launch is issued while the chunk in
+ * front of it is still running on the device and costs nothing.
+ *
+ * So the exposed idle is set by the size of the FIRST chunk alone.  Raising the
+ * CHUNK COUNT shrinks it by shrinking every chunk, which pays one extra
+ * graph-to-graph boundary AND one extra capture per chunk to buy it.  A LEAD
+ * chunk of `lead` layers in front of the ordinary even split buys the same
+ * exposure reduction for ONE boundary and ONE extra capture row, leaving the
+ * rest of the split -- and the rest of the capture count -- alone.
+ *
+ * Measured on this tree, botany1024 depth 1, three cooled traces per arm: the
+ * decode-window GPU idle a chunk split can move (E->G + G->E + G->G) is
+ * 18.17 ms at the shipped even split and 9.38 ms at lead = 1, the two ranges
+ * disjoint, with the exposed launch itself going 13.68 -> 1.18 ms.
+ * The cost is one extra graph-to-graph boundary (+0.79 ms) and one extra chunk
+ * launch per forward, which stops covering ~2.9 ms of long cudaGraphLaunch
+ * stalls that the deeper queue used to hide -- those stalls are present in the
+ * unsplit arm too, at the same sizes and the same points in the window.
+ * 0 is the even split this build shipped.
+ * DS4_CUDA_DECODE_GRAPH_LEAD=<n> selects n. */
+#define QW_DECODE_GRAPH_MAX_LEAD 8u
+
+static uint32_t qw_decode_graph_lead(void) {
+    static int init = 0;
+    static uint32_t lead = 2u;
+    if (!init) {
+        init = 1;
+        const char *s = getenv("DS4_CUDA_DECODE_GRAPH_LEAD");
+        if (s && s[0]) {
+            char *end = NULL;
+            long v = strtol(s, &end, 10);
+            if (end != s && v >= 0 && v <= (long)QW_DECODE_GRAPH_MAX_LEAD) {
+                lead = (uint32_t)v;
+            }
+        }
+    }
+    return lead;
+}
+
 #ifdef DS4_TEST_HOOKS
 /* A replayed chunk runs no host call site, so the logical slice trace the test
  * hooks compare against has to be emitted for the layers it covered. */
@@ -2961,11 +3007,27 @@ static bool qwen4exp_graph_layers(
         const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
         uint32_t chunks = qw_decode_graph_chunks();
         if (chunks > cfg->n_layer) chunks = cfg->n_layer;
-        const uint32_t per = (cfg->n_layer + chunks - 1u) / chunks;
-        for (uint32_t c = 0; c < chunks; c++) {
-            const uint32_t il_first = c * per;
+        /* THE LEAD CHUNK.  `lead` layers are carved off the front and the rest
+         * of the stack is split into `chunks` pieces exactly as before, so the
+         * launch the host pays with a dry device covers `lead` layers instead
+         * of n_layer/chunks of them.  lead == 0 reduces to the even split line
+         * for line: base = 0, per = (n_layer + chunks - 1)/chunks,
+         * pieces = chunks, il_first = c*per, il_last = il_first + per.
+         * See qw_decode_graph_lead() for why only the first chunk matters.
+         *
+         * A chunk boundary carries no state at any layer index -- see the
+         * paragraph above: the only host state that crosses a layer boundary
+         * is s->hc_pending, which is false at EVERY boundary at every
+         * capturing width, so which index the cut lands on is immaterial. */
+        const uint32_t lead = qw_decode_graph_lead();
+        const uint32_t base = (lead > 0u && lead < cfg->n_layer) ? lead : 0u;
+        const uint32_t per = (cfg->n_layer - base + chunks - 1u) / chunks;
+        const uint32_t pieces = base ? chunks + 1u : chunks;
+        for (uint32_t c = 0; c < pieces; c++) {
+            const uint32_t il_first =
+                base ? (c == 0u ? 0u : base + (c - 1u) * per) : c * per;
             if (il_first >= cfg->n_layer) break;
-            uint32_t il_last = il_first + per;
+            uint32_t il_last = (base && c == 0u) ? base : il_first + per;
             if (il_last > cfg->n_layer) il_last = cfg->n_layer;
             if (!qw_decode_graph_chunk(s, w, m, n_tokens, c, il_first, il_last)) {
                 return false;

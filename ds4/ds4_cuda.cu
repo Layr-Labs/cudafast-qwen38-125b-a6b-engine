@@ -7194,7 +7194,14 @@ __device__ __forceinline__ static void q8_mma_bar_arrive(int id, int count) {
 #define Q8_MMA_MINB 1
 #endif
 
-template <int WM, int WN, int MT, int NT, int G, int STAGES>
+/* CvtC: the weight block scales are converted half -> float BY THE CONSUMER,
+ * straight out of sB, instead of by the producer into a separate sWs buffer.
+ * It is the same halfword through the same __half2float feeding the same FMA
+ * in the same order, so it is bit-exact; what it removes is the producer's
+ * `bar.sync 15` rendezvous, which existed only because the conversion loop
+ * read scales that OTHER producer warps had stored.  See
+ * /root/qwen/notes/q8tile-plan.md S2. */
+template <int WM, int WN, int MT, int NT, int G, int STAGES, bool CvtC = false>
 struct q8_mma_pipe_cfg {
     static constexpr int BM = WM * MT * 16;
     static constexpr int BN = WN * NT * 8;
@@ -7212,7 +7219,7 @@ struct q8_mma_pipe_cfg {
     static constexpr int A_BYTES = BM * A_STRIDE;
     static constexpr int B_BYTES = BN * B_STRIDE;
     static constexpr int AS_BYTES = BM * G * 4;
-    static constexpr int WS_BYTES = G * BN * 4;          /* converted weight scales [gg][BN] */
+    static constexpr int WS_BYTES = CvtC ? 0 : (G * BN * 4); /* converted weight scales [gg][BN] */
     static constexpr int STAGE_BYTES = A_BYTES + B_BYTES + AS_BYTES + WS_BYTES;
     static constexpr int SMEM = STAGES * STAGE_BYTES;
     static_assert(G == 2 || G == 4 || G == 8, "G is the k32 steps per stage");
@@ -7223,7 +7230,7 @@ struct q8_mma_pipe_cfg {
     static_assert(B_GCD >= 4, "skew must keep word parity");
 };
 
-template <int WM, int WN, int MT, int NT, int G, int STAGES, bool ActPol = false>
+template <int WM, int WN, int MT, int NT, int G, int STAGES, bool ActPol = false, bool CvtC = false>
 __global__ __launch_bounds__((WM * WN + 4) * 32, Q8_MMA_MINB) static void
 matmul_q8_0_preq_rows_mma_pipe_kernel(float *out,
                                       const unsigned char *w,
@@ -7232,7 +7239,7 @@ matmul_q8_0_preq_rows_mma_pipe_kernel(float *out,
                                       uint64_t out_dim,
                                       uint32_t n_rows,
                                       uint64_t blocks) {
-    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES> C;
+    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES, CvtC> C;
     constexpr int BM = C::BM, BN = C::BN;
     const uint64_t act_pol = ActPol ? q8_mma_pol_last() : 0ull;
 
@@ -7365,6 +7372,19 @@ matmul_q8_0_preq_rows_mma_pipe_kernel(float *out,
                 const int c = idx - r * C::B_CHUNKS;
                 if (idx < BN * C::B_CHUNKS) q8_mma_sts_16(sB + r * C::B_STRIDE + c * 16, rb[k]);
             }
+            if (CvtC) {
+                /* The consumer converts the block scales itself, so no
+                 * producer reads another producer's stores and the four
+                 * warps never rendezvous: a warp whose loads have landed
+                 * issues the next stage without waiting for the slowest.
+                 * `bar.arrive` carries no memory ordering of its own (the
+                 * rendezvous below was providing it as a side effect) and
+                 * `__syncwarp` is intra-warp, so the stores are released
+                 * with an explicit block fence. */
+                __threadfence_block();
+                q8_mma_bar_arrive(1 + 2 * buf, BAR_COUNT);
+                continue;
+            }
             /* Every producer's stores are visible to every producer: the
              * scales below lie in rows another one stored. */
             q8_mma_bar_sync(15, C::PWARPS * 32);
@@ -7457,7 +7477,23 @@ matmul_q8_0_preq_rows_mma_pipe_kernel(float *out,
                     bf[0] = pw[0];
                     bf[1] = pw[4];
                 }
-                const float2 wsp = *(const float2 *)(sWs + gg * BN + c + (int)t4 * 2);
+                float2 wsp;
+                if (CvtC) {
+                    /* The two halfwords are the q8_0 block scales of output
+                     * rows c + t4*2 and c + t4*2 + 1 -- the same bytes the
+                     * producer fed to sWs.  B_STRIDE/4 = 4 (mod 32), so the
+                     * eight distinct rows a warp needs land on eight distinct
+                     * banks and the eight lanes sharing a t4 broadcast; skew
+                     * is even and gg*34 is even, so both are 2-byte aligned. */
+                    const unsigned char *ps = sB + (c + (int)t4 * 2) * C::B_STRIDE + skew + gg * 34;
+                    uint16_t hs0, hs1;
+                    memcpy(&hs0, ps, 2);
+                    memcpy(&hs1, ps + C::B_STRIDE, 2);
+                    wsp = make_float2(__half2float(__ushort_as_half(hs0)),
+                                      __half2float(__ushort_as_half(hs1)));
+                } else {
+                    wsp = *(const float2 *)(sWs + gg * BN + c + (int)t4 * 2);
+                }
                 int32_t d[MT][4];
 #pragma unroll
                 for (int mi = 0; mi < MT; mi++) q8_mma_m16n8k32_seeded(d[mi], af[mi], bf, magic);
@@ -18161,12 +18197,12 @@ extern "C" int ds4_gpu_q8_mma_pipe_last_bn(void) {
 /* The dynamic shared memory opt-in, once per instantiation; done eagerly
  * from ds4_gpu_enable_q8_dense_mma so no launch has to do it inside a
  * stream capture. */
-template <int WM, int WN, int MT, int NT, int G, int STAGES, bool ActPol = false>
+template <int WM, int WN, int MT, int NT, int G, int STAGES, bool ActPol = false, bool CvtC = false>
 static bool cuda_q8_mma_pipe_attr(void) {
-    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES> C;
+    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES, CvtC> C;
     static int state = 0;   /* 0 unset, 1 ok, -1 refused */
     if (state == 0) {
-        state = (cudaFuncSetAttribute(matmul_q8_0_preq_rows_mma_pipe_kernel<WM, WN, MT, NT, G, STAGES, ActPol>,
+        state = (cudaFuncSetAttribute(matmul_q8_0_preq_rows_mma_pipe_kernel<WM, WN, MT, NT, G, STAGES, ActPol, CvtC>,
                                       cudaFuncAttributeMaxDynamicSharedMemorySize,
                                       C::SMEM) == cudaSuccess) ? 1 : -1;
         if (state < 0) (void)cudaGetLastError();
@@ -18193,17 +18229,49 @@ static int cuda_q8_mma_pipe_actpol(void) {
     return cached;
 }
 
+/* DS4_CUDA_Q8_CVTSCALE=0 restores the shipped producer exactly (the
+ * CvtC=false instantiation IS the shipped kernel: the same template
+ * arguments it had before this parameter existed, so the same PTX).  Unset
+ * or anything else converts the weight block scales in the consumer and
+ * drops the producer's `bar.sync 15` rendezvous and its sWs buffer.  The
+ * arithmetic is untouched -- same halfword, same __half2float, same FMA
+ * order -- and the standalone harness word-compares all 1024 x out_dim
+ * outputs against the shipped ladder on five production shapes.
+ * /root/qwen/notes/q8tile-plan.md S2 has the measurements. */
+static int g_q8_mma_pipe_cvtscale = -1;
+static int cuda_q8_mma_pipe_cvtscale(void) {
+    if (g_q8_mma_pipe_cvtscale < 0) {
+        const char *e = getenv("DS4_CUDA_Q8_CVTSCALE");
+        g_q8_mma_pipe_cvtscale = (e != NULL && e[0] == '0') ? 0 : 1;
+    }
+    return g_q8_mma_pipe_cvtscale;
+}
+
 template <int WM, int WN, int MT, int NT, int G, int STAGES>
 static int cuda_q8_mma_pipe_launch(float *out, const unsigned char *w,
                                    const int8_t *xq, const float *xscale,
                                    uint64_t out_dim, uint32_t n_rows,
                                    uint64_t blocks) {
-    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES> C;
+    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES> C;          /* shipped smem */
+    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES, true> CC;    /* no sWs */
+    /* The BASE opt-in still decides whether this rung exists at all, so the
+     * valve can never make a rung launch that the shipped ladder refuses. */
     if (!cuda_q8_mma_pipe_attr<WM, WN, MT, NT, G, STAGES>()) return 0;
+    const bool cvtc = cuda_q8_mma_pipe_cvtscale() &&
+                      cuda_q8_mma_pipe_attr<WM, WN, MT, NT, G, STAGES, false, true>();
     const bool actpol = out_dim >= 4096u && cuda_q8_mma_pipe_actpol() &&
-                        cuda_q8_mma_pipe_attr<WM, WN, MT, NT, G, STAGES, true>();
+                        (cvtc ? cuda_q8_mma_pipe_attr<WM, WN, MT, NT, G, STAGES, true, true>()
+                              : cuda_q8_mma_pipe_attr<WM, WN, MT, NT, G, STAGES, true>());
     dim3 grid((n_rows + C::BM - 1u) / C::BM, (unsigned)((out_dim + C::BN - 1u) / C::BN), 1u);
-    if (actpol) {
+    if (cvtc) {
+        if (actpol) {
+            matmul_q8_0_preq_rows_mma_pipe_kernel<WM, WN, MT, NT, G, STAGES, true, true>
+                <<<grid, CC::THREADS, CC::SMEM, cuda_decode_stream()>>>(out, w, xq, xscale, out_dim, n_rows, blocks);
+        } else {
+            matmul_q8_0_preq_rows_mma_pipe_kernel<WM, WN, MT, NT, G, STAGES, false, true>
+                <<<grid, CC::THREADS, CC::SMEM, cuda_decode_stream()>>>(out, w, xq, xscale, out_dim, n_rows, blocks);
+        }
+    } else if (actpol) {
         matmul_q8_0_preq_rows_mma_pipe_kernel<WM, WN, MT, NT, G, STAGES, true>
             <<<grid, C::THREADS, C::SMEM, cuda_decode_stream()>>>(out, w, xq, xscale, out_dim, n_rows, blocks);
     } else {
@@ -18219,6 +18287,12 @@ static void cuda_q8_mma_pipe_prepare(void) {
     (void)cuda_q8_mma_pipe_attr<2, 2, 4, 4, 4, 2>();
     (void)cuda_q8_mma_pipe_attr<2, 4, 4, 4, 4, 2>();
     (void)cuda_q8_mma_pipe_attr<2, 8, 4, 4, 4, 2>();
+    (void)cuda_q8_mma_pipe_attr<2, 2, 4, 4, 4, 2, false, true>();
+    (void)cuda_q8_mma_pipe_attr<2, 4, 4, 4, 4, 2, false, true>();
+    (void)cuda_q8_mma_pipe_attr<2, 8, 4, 4, 4, 2, false, true>();
+    (void)cuda_q8_mma_pipe_attr<2, 2, 4, 4, 4, 2, true, true>();
+    (void)cuda_q8_mma_pipe_attr<2, 4, 4, 4, 4, 2, true, true>();
+    (void)cuda_q8_mma_pipe_attr<2, 8, 4, 4, 4, 2, true, true>();
 }
 
 /* The pipelined tile's shape ladder.  Returns 0 when the call is not one it
@@ -38469,3 +38543,4 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
 #include "ds4_deepseek4_vision_gpu.cuh"
 
 #include "ds4_cuda_mtp_native.cuh"
+#define GAUNTLET_REDRAW_9abc7a0f_20260921T021838Z 1
