@@ -4371,6 +4371,11 @@ __global__ static void qwen4exp_moe_group_small_kernel(
         uint32_t mid_token_stride) {
     __shared__ int32_t warp_count_prefix[QWEN4EXP_MOE_SCAN_THREADS / 32];
     __shared__ int32_t warp_live_prefix[QWEN4EXP_MOE_SCAN_THREADS / 32];
+    /* Stage the short selected list once when it fits.  The ordinary decode
+     * envelope is at most 256 entries; larger externally supplied k values
+     * retain the original global path, so the public defensive contract is
+     * unchanged. */
+    __shared__ int32_t sh_selected[256];
     /* PDL consumer of the router's top-k, which triggers at its top.  This
      * kernel is one 512-thread block and its very first global read is
      * `selected`, the router's output, so there is no weight load to hoist
@@ -4395,13 +4400,16 @@ __global__ static void qwen4exp_moe_group_small_kernel(
         768u)
         QWEN4EXP_PDL_TRIGGER();
     const uint32_t e = threadIdx.x;
+    if (e < n_pairs && n_pairs <= 256u) sh_selected[e] = selected[e];
+    __syncthreads();
     const uint32_t lane = e & 31u;
     const uint32_t warp = e >> 5u;
 
     int32_t count = 0;
     if (e < n_expert) {
         for (uint32_t p = 0; p < n_pairs; p++) {
-            count += selected[p] == (int32_t)e;
+            const int32_t id = n_pairs <= 256u ? sh_selected[p] : selected[p];
+            count += id == (int32_t)e;
         }
         counts[e] = count;
     }
@@ -4457,7 +4465,8 @@ __global__ static void qwen4exp_moe_group_small_kernel(
         if (count > 0) active[live_prefix] = (int32_t)e;
         int32_t at = offset;
         for (uint32_t p = 0; p < n_pairs; p++) {
-            if (selected[p] == (int32_t)e) pairs[at++] = (int32_t)p;
+            const int32_t id = n_pairs <= 256u ? sh_selected[p] : selected[p];
+            if (id == (int32_t)e) pairs[at++] = (int32_t)p;
         }
     }
     if (e == 0u) {
@@ -4468,7 +4477,7 @@ __global__ static void qwen4exp_moe_group_small_kernel(
      * in the normal case; an invalid pair's one thread writes its short
      * intermediate row here. */
     if (e < n_pairs) {
-        const int32_t expert = selected[e];
+        const int32_t expert = n_pairs <= 256u ? sh_selected[e] : selected[e];
         if (expert < 0 || (uint32_t)expert >= n_expert) {
             const uint32_t token = e / n_expert_used;
             const uint32_t slot = e - token * n_expert_used;
@@ -4521,6 +4530,7 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
         uint32_t n_tokens) {
     __shared__ int32_t warp_count_prefix[QWEN4EXP_MOE_SCAN_THREADS / 32];
     __shared__ int32_t warp_live_prefix[QWEN4EXP_MOE_SCAN_THREADS / 32];
+    __shared__ int32_t sh_selected[256];
     /* Hoisted here from the grouping half: it has to precede the FIRST global
      * read of the fused kernel, which is now the router's `logits`.  A no-op
      * on the plain launch this kernel takes, correct if it is ever launched
@@ -4680,6 +4690,12 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
      * router warps' `selected` stores to every thread of the block before the
      * grouping half's first read of them. */
     __syncthreads();
+    /* The fused path is restricted to n_tokens < 8 and n_expert_used <= 32,
+     * hence n_pairs <= 224.  Cache the router result once for the two scans
+     * below instead of rereading the same short list from global memory. */
+    const uint32_t selected_tid = threadIdx.x;
+    if (selected_tid < n_pairs) sh_selected[selected_tid] = selected[selected_tid];
+    __syncthreads();
     /* PDL consumer of the router's top-k, which triggers at its top.  This
      * kernel is one 512-thread block and its very first global read is
      * `selected`, the router's output, so there is no weight load to hoist
@@ -4697,7 +4713,7 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
     int32_t count = 0;
     if (e < n_expert) {
         for (uint32_t p = 0; p < n_pairs; p++) {
-            count += selected[p] == (int32_t)e;
+            count += sh_selected[p] == (int32_t)e;
         }
         counts[e] = count;
     }
@@ -4753,7 +4769,7 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
         if (count > 0) active[live_prefix] = (int32_t)e;
         int32_t at = offset;
         for (uint32_t p = 0; p < n_pairs; p++) {
-            if (selected[p] == (int32_t)e) pairs[at++] = (int32_t)p;
+            if (sh_selected[p] == (int32_t)e) pairs[at++] = (int32_t)p;
         }
     }
     if (e == 0u) {
@@ -4764,7 +4780,7 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
      * in the normal case; an invalid pair's one thread writes its short
      * intermediate row here. */
     if (e < n_pairs) {
-        const int32_t expert = selected[e];
+        const int32_t expert = sh_selected[e];
         if (expert < 0 || (uint32_t)expert >= n_expert) {
             const uint32_t token = e / n_expert_used;
             const uint32_t slot = e - token * n_expert_used;
@@ -18048,3 +18064,5 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
  * census shows produces a byte-identical capture log. */
 
 #define YUKON_REDRAW_10 10
+
+// Sep23 frontier stack trial: CvtC plus graph lead from ranked tree.
