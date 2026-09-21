@@ -6502,16 +6502,33 @@ qwen4exp_moe_down_mma_kernel(
         }
 
         const uint32_t m0 = warp * 16u + (lane >> 2);
+        /* The four r steps of one nt column address only TWO routing entries:
+         * nn is nt*8 + (lane&3)*2 + (r&1), so r=0,2 share one entry and
+         * r=1,3 share the next.  The rolled store re-read sPair inside the r
+         * step, so each of the four stores waited on its own shared read
+         * before its address existed, and half of those reads were literal
+         * duplicates.  The pair is read once per column here, with the same
+         * `nn < take` validity the rolled store applied, so an entry the
+         * rolled store never touched is still never used -- an out-of-range
+         * column keeps its sentinel and its store is skipped by the same
+         * guard.  Both addresses are then known before the first store of the
+         * column issues; the stored values, the addresses and the guards are
+         * the rolled store's own. */
 #pragma unroll
         for (int nt = 0; nt < QW_DOWN_MMA_NT; nt++) {
+            const uint32_t nn0 = (uint32_t)nt * 8u + (lane & 3u) * 2u;
+            const uint32_t p0 = (int32_t)nn0 < take ? sPair[nn0] : 0xffffffffu;
+            const uint32_t p1 = (int32_t)(nn0 + 1u) < take ? sPair[nn0 + 1u]
+                                                          : 0xffffffffu;
 #pragma unroll
             for (int r = 0; r < 4; r++) {
-                const uint32_t nn = nt * 8u + (lane & 3u) * 2u + (r & 1);
+                const uint32_t nn = nn0 + (uint32_t)(r & 1);
                 if ((int32_t)nn >= take) continue;
                 const uint32_t mr = m0 + ((r & 2) ? 8u : 0u);
                 const uint32_t orow = row0 + mr;
                 if (orow >= out_dim) continue;
-                partial[(uint64_t)sPair[nn] * out_dim + orow] = acc[nt * 4 + r];
+                partial[(uint64_t)((r & 1) ? p1 : p0) * out_dim + orow] =
+                        acc[nt * 4 + r];
             }
         }
         __syncthreads();
@@ -12030,13 +12047,43 @@ __global__ static void qwen4exp_hc_mix_renorm_kernel(
 
     const uint64_t row = ((uint64_t)t * n_hc) * n_embd + d;
 
+    /* The rolled walk below discovers its four per-stream operands in
+     * consumption order, so each stream's element completes a full memory
+     * round trip before the next stream's addresses are even issued; the
+     * grid is single-wave at the two-row decode (20 blocks), so there is no
+     * second wave to hide that latency behind.  The four-stream shape is the
+     * one the decode actually runs, and it is staged instead: the sixteen
+     * loads a thread owns are put in flight together into registers, and the
+     * consume loop then runs the same statements on them in the same
+     * ascending stream order, so the partial sum is the same chain of the
+     * same FFMAs on the same values.  Every other n_hc keeps the rolled walk
+     * verbatim. */
     float acc = 0.0f;
-    for (uint32_t h = 0; h < n_hc; h++) {
-        const uint64_t idx = row + (uint64_t)h * n_embd;
-        const float normed = qwen4exp_hc_normed_value(
-                hyper[idx], nscale[(uint64_t)t * n_hc + h],
-                normw[(uint64_t)h * n_embd + d], weight_bias, round_bf16);
-        acc += qwen4exp_sigmoid(wide[idx]) * normed;
+    if (n_hc == 4u) {
+        const uint64_t srow = (uint64_t)t * n_hc;
+        float hv[4], sc[4], nw[4], wd[4];
+#pragma unroll
+        for (uint32_t h = 0; h < 4u; h++) {
+            const uint64_t idx = row + (uint64_t)h * n_embd;
+            hv[h] = hyper[idx];
+            sc[h] = nscale[srow + h];
+            nw[h] = normw[(uint64_t)h * n_embd + d];
+            wd[h] = wide[idx];
+        }
+#pragma unroll
+        for (uint32_t h = 0; h < 4u; h++) {
+            const float normed = qwen4exp_hc_normed_value(
+                    hv[h], sc[h], nw[h], weight_bias, round_bf16);
+            acc += qwen4exp_sigmoid(wd[h]) * normed;
+        }
+    } else {
+        for (uint32_t h = 0; h < n_hc; h++) {
+            const uint64_t idx = row + (uint64_t)h * n_embd;
+            const float normed = qwen4exp_hc_normed_value(
+                    hyper[idx], nscale[(uint64_t)t * n_hc + h],
+                    normw[(uint64_t)h * n_embd + d], weight_bias, round_bf16);
+            acc += qwen4exp_sigmoid(wide[idx]) * normed;
+        }
     }
     out[(uint64_t)t * n_embd + d] = acc * (1.0f / (float)n_hc);
 }
