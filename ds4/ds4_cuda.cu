@@ -11207,7 +11207,11 @@ __global__ static void attention_decode_global_softmax_kernel(
     const bool score_thread = threadIdx.x < score_threads;
     float *row_scores = score_inout + (uint64_t)h * n_score;
 
-    float local_max = sinks[h];
+    /* The head's sink is needed twice, once to seed the maximum and once to
+     * close the denominator. Read it once, before the staging loop, so the
+     * second use is a register rather than a global access behind a barrier. */
+    const float sink = sinks[h];
+    float local_max = sink;
     if (score_thread) {
         for (uint32_t i = threadIdx.x; i < n_score; i += score_threads) {
             const float s = row_scores[i];
@@ -11241,7 +11245,7 @@ __global__ static void attention_decode_global_softmax_kernel(
         if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
         __syncthreads();
     }
-    if (threadIdx.x == 0) denom_s = partial[0] + expf(sinks[h] - max_s);
+    if (threadIdx.x == 0) denom_s = partial[0] + expf(sink - max_s);
     __syncthreads();
 
     if (score_thread) {
