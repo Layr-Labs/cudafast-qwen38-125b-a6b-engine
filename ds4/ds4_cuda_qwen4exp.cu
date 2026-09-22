@@ -58,6 +58,12 @@
 #include "ds4_qwen4exp_hc_types.h"
 #include "ds4_qwen4exp_qsa_scratch.h"
 
+/* Independent ranked re-measurement of the promoted frontier engine.
+ * This translation unit is byte-identical to the promoted tree except for
+ * this inert definition, which no code references and which changes no
+ * compiled behaviour. */
+#define GAUNTLET_REDRAW_20260922_F9C47F0 1
+
 #define CUDA_QK_K 256
 
 /* ------------------------------------------------------------------
