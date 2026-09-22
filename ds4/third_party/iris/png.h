@@ -305,6 +305,10 @@ static void png_write_text_chunk(FILE *f, const char *keyword, const char *text)
 
 static int png_save_internal(const png_image *img, FILE *f,
                              const char *keyword, const char *text) {
+    if (!img || !img->data || !f || img->width <= 0 || img->height <= 0 ||
+        img->width > PNG_MAX_DIMENSION || img->height > PNG_MAX_DIMENSION ||
+        img->channels < 1 || img->channels > 4 ||
+        (uint64_t)img->width * (uint64_t)img->height > PNG_MAX_PIXELS) return -1;
     /* PNG signature */
     const uint8_t signature[8] = {0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a};
     fwrite(signature, 1, 8, f);
@@ -335,15 +339,20 @@ static int png_save_internal(const png_image *img, FILE *f,
 
     /* Prepare raw image data with filter bytes */
     int channels = img->channels;
-    size_t row_bytes = 1 + img->width * channels;  /* +1 for filter byte */
-    size_t raw_len = img->height * row_bytes;
+    if (img->width <= 0 || img->height <= 0 || channels < 1 || channels > 4 ||
+        (size_t)img->width > (SIZE_MAX - 1) / (size_t)channels) return -1;
+    size_t pixel_bytes = (size_t)img->width * (size_t)channels;
+    size_t row_bytes = 1 + pixel_bytes;  /* +1 for filter byte */
+    if ((size_t)img->height > SIZE_MAX / row_bytes) return -1;
+    size_t raw_len = (size_t)img->height * row_bytes;
     uint8_t *raw = (uint8_t *)malloc(raw_len);
+    if (!raw) return -1;
 
     for (int y = 0; y < img->height; y++) {
         raw[y * row_bytes] = 0;  /* Filter: None */
         memcpy(raw + y * row_bytes + 1,
-               img->data + y * img->width * channels,
-               img->width * channels);
+               img->data + (size_t)y * pixel_bytes,
+               pixel_bytes);
     }
 
     /* Compress with zlib (store mode) */
