@@ -12,7 +12,9 @@ def body(mark):
 old=body('__global__ static void qwen4exp_gdn_conv_kernel(')
 new=body('__global__ static void qwen4exp_gdn_conv_replay_gates_kernel(')
 old=old[old.index('{')+1:old.rindex('}')].strip()
-new=new[new.index('{')+1:new.index('    /* One publisher per head/token.')].strip()
+new=new[new.index('{')+1:new.index('    /* One publisher per head/token.')]
+# The dedicated publisher block's guard sits ahead of the shared bounds test.
+new=re.sub(r'#if QWEN4EXP_GDN_GATES_OWN_BLOCK\n.*?#endif\n','',new,count=1,flags=re.S).strip()
 assert old==new, 'serial convolution changed before publication tail'
 old=body('__global__ static void qwen4exp_gdn_replay_kernel(')
 new=body('__global__ static void qwen4exp_gdn_replay_gates_kernel(')

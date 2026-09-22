@@ -13,7 +13,7 @@ def body(name):
   while d:d+=(s[e]=='{')-(s[e]=='}');e+=1
   return s[a:e]
  raise AssertionError(name)
-names=['warp_sum_f32','warp_sum_all_f32','dot4_f32','qwen4exp_gdn_silu','qwen4exp_gdn_sigmoid','qwen4exp_gdn_softplus','qwen4exp_q8_ftz','qwen4exp_q8_rcp_approx','qwen4exp_gdn_conv_kernel','qwen4exp_gdn_conv_replay_gates_kernel','qwen4exp_gdn_replay_kernel','qwen4exp_gdn_replay_gates_kernel','qwen4exp_gdn_output_kernel','qwen4exp_gdn_output_quant_kernel']
+names=['warp_sum_f32','warp_sum_all_f32','dot4_f32','qwen4exp_gdn_silu','qwen4exp_gdn_sigmoid','qwen4exp_gdn_softplus','qwen4exp_gdn_publish_gates','qwen4exp_q8_ftz','qwen4exp_q8_rcp_approx','qwen4exp_gdn_conv_kernel','qwen4exp_gdn_conv_replay_gates_kernel','qwen4exp_gdn_replay_kernel','qwen4exp_gdn_replay_gates_kernel','qwen4exp_gdn_output_kernel','qwen4exp_gdn_output_quant_kernel']
 source=r'''
 #include <cuda_runtime.h>
 #include <cmath>

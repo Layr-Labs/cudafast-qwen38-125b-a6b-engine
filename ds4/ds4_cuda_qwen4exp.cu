@@ -733,6 +733,39 @@ __global__ static void qwen4exp_gdn_conv_kernel(
     history[(uint64_t)2u * conv_dim + channel] = h2;
 }
 
+/* DEDICATED GATE-PUBLISHER BLOCK (QWEN4EXP_GDN_GATES_OWN_BLOCK, default 1).
+ *
+ * The replay-gates convolution below publishes one (g, beta) pair per
+ * (token, head) for the recurrence that follows it on the stream.  Hosting
+ * that loop as a tail on one of the convolution blocks serialises it
+ * behind that block's whole token walk, and the recurrence cannot launch
+ * until the slowest block retires.  With the switch on, the grid carries
+ * ONE extra block along x (index `blocks`, row 0 only) whose sole work is
+ * the publication: it reads nothing the convolution writes and writes
+ * nothing the convolution reads, so it runs concurrently with every
+ * convolution block from the first cycle instead of after one of them.
+ * The helper holds the parent's loop verbatim -- same thread per head, same
+ * inputs, same expressions -- so every published pair is the same bits,
+ * and the other rows' blocks, which republished identical values, simply no
+ * longer duplicate the stores.  0 restores the tail on block 0. */
+#ifndef QWEN4EXP_GDN_GATES_OWN_BLOCK
+#define QWEN4EXP_GDN_GATES_OWN_BLOCK 1
+#endif
+__device__ __forceinline__ static void qwen4exp_gdn_publish_gates(
+        float2 *gate_pairs, const float *raw_alpha, const float *raw_beta,
+        const float *a_log, const float *dt_bias, uint32_t n_value_head,
+        uint32_t n_tokens, uint32_t tid) {
+    if (tid >= n_value_head) return;
+    const float coeff = a_log[tid];
+    const float bias = dt_bias[tid];
+    for (uint32_t token = 0; token < n_tokens; ++token) {
+        const uint64_t gate = (uint64_t)token * n_value_head + tid;
+        const float g = expf(coeff * qwen4exp_gdn_softplus(raw_alpha[gate] + bias));
+        const float beta = qwen4exp_gdn_sigmoid(raw_beta[gate]);
+        gate_pairs[gate] = make_float2(g, beta);
+    }
+}
+
 /* Replay-only twin: original serial convolution followed by gate publication. */
 __global__ static void qwen4exp_gdn_conv_replay_gates_kernel(
         float       *qkv,
@@ -755,6 +788,16 @@ __global__ static void qwen4exp_gdn_conv_replay_gates_kernel(
     const uint32_t warp = tid >> 5u;
     const uint32_t key_blocks = 2u * n_key_head;
     const uint32_t blocks = key_blocks + n_value_head;
+#if QWEN4EXP_GDN_GATES_OWN_BLOCK
+    if (block == blocks) {
+        /* The extra publisher block: no barrier below is reached by it, and
+         * it leaves as a whole block. */
+        if (row == 0u)
+            qwen4exp_gdn_publish_gates(gate_pairs, raw_alpha, raw_beta, a_log,
+                                       dt_bias, n_value_head, n_tokens, tid);
+        return;
+    }
+#endif
     if (block >= blocks || row >= n_rows) return;
 
     /* Two reduction slots, alternating by token.  One barrier a token then
@@ -852,16 +895,11 @@ __global__ static void qwen4exp_gdn_conv_replay_gates_kernel(
     history[(uint64_t)2u * conv_dim + channel] = h2;
     /* One publisher per head/token. Stream completion orders these pairs
      * before replay; history and raw gate inputs are disjoint allocations. */
-    if (block == 0u && tid < n_value_head) {
-        const float coeff = a_log[tid];
-        const float bias = dt_bias[tid];
-        for (uint32_t token = 0; token < n_tokens; ++token) {
-            const uint64_t gate = (uint64_t)token * n_value_head + tid;
-            const float g = expf(coeff * qwen4exp_gdn_softplus(raw_alpha[gate] + bias));
-            const float beta = qwen4exp_gdn_sigmoid(raw_beta[gate]);
-            gate_pairs[gate] = make_float2(g, beta);
-        }
-    }
+#if !QWEN4EXP_GDN_GATES_OWN_BLOCK
+    if (block == 0u)
+        qwen4exp_gdn_publish_gates(gate_pairs, raw_alpha, raw_beta, a_log,
+                                   dt_bias, n_value_head, n_tokens, tid);
+#endif
 }
 
 /*
@@ -2835,7 +2873,8 @@ static int qwen4exp_cuda_gdn_run(
             return 0;
         }
     } else if (replay_gates) {
-        qwen4exp_gdn_conv_replay_gates_kernel<<<dim3(blocks, n_rows, 1u),
+        qwen4exp_gdn_conv_replay_gates_kernel<<<
+                dim3(blocks + (QWEN4EXP_GDN_GATES_OWN_BLOCK ? 1u : 0u), n_rows, 1u),
                 QWEN4EXP_GDN_DIM, 0, stream>>>(
                 (float *)qkv->ptr, (float *)conv_state->ptr, conv_weight,
                 (float *)conv_snapshot->ptr, n_key_head, n_value_head, n_rows,
