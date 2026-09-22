@@ -9787,6 +9787,17 @@ static uint64_t qwen4exp_quant_bytes(uint64_t rows, uint64_t groups) {
     return rows * groups * (32u + sizeof(float) + sizeof(int32_t));
 }
 
+/* With the 32/64 split, each light expert supplies one task. For a heavy
+ * count c >= 33, ceil(c / 64) <= floor(c / 32), so summing over experts
+ * bounds its task list by floor(n_pairs / 32). Keep the allocated capacity;
+ * only omit grid rows that cannot name a task. */
+static uint32_t qwen4exp_moe_task_grid_limit(
+        uint32_t capacity, uint32_t n_pairs, uint32_t n_total_expert,
+        bool heavy) {
+    const uint32_t bound = heavy ? n_pairs / 32u : n_total_expert;
+    return bound < capacity ? bound : capacity;
+}
+
 /* PER-EDGE PDL VALVES.  ds4_qwen4exp_pdl_enabled() drops the launch attribute
  * for EVERY converted consumer in the engine, so an A/B on it measures all of
  * PDL at once and cannot price one edge.  These two gate only the host's
@@ -10354,6 +10365,17 @@ static int qwen4exp_routed_moe_cuda(
             (gu_heavy_env == NULL || gu_heavy_env[0] != '0');
         int32_t *const gu_tasks_heavy =
             gu_tasks ? gu_tasks + (1u + 2u * task_capacity) : NULL;
+        const bool bounded_task_grid = gu_heavy && QW_MMA_BN == 32u &&
+            QW_GUH_BN == 64u && n_pairs >= 32u &&
+            getenv("DS4_QWEN4EXP_NO_MOE_TASK_GRID_BOUND") == NULL;
+        const uint32_t light_task_grid = bounded_task_grid
+            ? qwen4exp_moe_task_grid_limit((uint32_t)task_capacity,
+                                          n_pairs, n_total_expert, false)
+            : (uint32_t)task_capacity;
+        const uint32_t heavy_task_grid = bounded_task_grid
+            ? qwen4exp_moe_task_grid_limit((uint32_t)task_capacity,
+                                          n_pairs, n_total_expert, true)
+            : (uint32_t)task_capacity;
         if (pair_tasks) {
             qwen4exp_moe_pair_tasks_kernel<<<1, 512, 0, stream>>>(
                     gu_tasks, sc.counts, n_total_expert, 32,
@@ -10391,7 +10413,7 @@ static int qwen4exp_routed_moe_cuda(
             if (!cuda_ok(cudaGetLastError(), "qwen4exp gate/up heavy tasks")) return 0;
             (guh_ahead ? qwen4exp_moe_gateup_heavy_kernel<true>
                        : qwen4exp_moe_gateup_heavy_kernel<false>)<<<
-                    dim3(mid_dim / QW_GUH_BM, (unsigned)task_capacity, 1),
+                    dim3(mid_dim / QW_GUH_BM, heavy_task_grid, 1),
                     QW_GUH_THREADS, QW_GUH_SMEM, stream>>>(
                     sc.mq, sc.ms, sc.msum, gate, up, sc.xq, sc.xs, sc.xsum,
                     sc.pairs, sc.counts, sc.offsets, gu_tasks_heavy,
@@ -10403,7 +10425,7 @@ static int qwen4exp_routed_moe_cuda(
         }
 #define QWEN4EXP_GATEUP_MMA_IMPL(GT, UT, TASKS, DMA) \
         qwen4exp_moe_gateup_mma_kernel<GT, UT, TASKS, DMA><<< \
-                dim3(mid_dim / QW_MMA_BM, TASKS ? (unsigned)task_capacity : gu_rows, 1), \
+                dim3(mid_dim / QW_MMA_BM, TASKS ? light_task_grid : gu_rows, 1), \
                 QW_MMA_THREADS, 0, stream>>>( \
                 (float *)mid->ptr, \
                 moe_epilogue ? sc.mq : NULL, \
