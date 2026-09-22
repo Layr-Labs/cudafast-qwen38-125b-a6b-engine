@@ -6916,7 +6916,8 @@ __device__ __forceinline__ static bool qw_gu_coop_raw_load(
  * cudaOccupancyMaxActiveBlocksPerMultiprocessor, so the third block no longer
  * has to be inferred from arithmetic at all: 2 means the cap did not take. */
 template <int R, int Type, bool Vector = false,
-          unsigned OutputRows = 4, bool Coop = false>
+          unsigned OutputRows = 4, bool Coop = false,
+          bool BroadcastRouteMeta = false>
 __global__ static void QW_GU_MAXNREG
 qwen4exp_moe_gateup_split_kernel(
         float *mid,
@@ -6966,13 +6967,35 @@ qwen4exp_moe_gateup_split_kernel(
      * dependent is safe.  Launched plainly -- three rows, every prefill width
      * -- the fence is a no-op, exactly as it is for the kernel beside it. */
     QWEN4EXP_PDL_SYNC();
-    if (active) {
-        if ((int32_t)blockIdx.y >= active[0]) return;
-        expert = (uint32_t)active[1 + blockIdx.y];
+    int32_t active_count = 0;
+    int32_t cnt = 0;
+    int32_t base = 0;
+    if constexpr (BroadcastRouteMeta) {
+        /* These values are block-uniform.  The original path issued the
+         * active-list, counts and offsets loads in every lane.  Load them
+         * once per warp and broadcast within each warp; no shared state or
+         * barrier is introduced, and all loads remain below PDL_SYNC. */
+        if (lane == 0u) {
+            active_count = active ? active[0] : INT32_MAX;
+            if (active && (int32_t)blockIdx.y < active_count)
+                expert = (uint32_t)active[1 + blockIdx.y];
+            cnt = counts[expert];
+            base = offsets[expert];
+        }
+        active_count = __shfl_sync(0xffffffffu, active_count, 0);
+        if (active && (int32_t)blockIdx.y >= active_count) return;
+        expert = __shfl_sync(0xffffffffu, expert, 0);
+        cnt = __shfl_sync(0xffffffffu, cnt, 0);
+        base = __shfl_sync(0xffffffffu, base, 0);
+    } else {
+        if (active) {
+            if ((int32_t)blockIdx.y >= active[0]) return;
+            expert = (uint32_t)active[1 + blockIdx.y];
+        }
+        cnt = counts[expert];
+        base = offsets[expert];
     }
-    const int32_t cnt = counts[expert];
     if (cnt <= 0) return;
-    const int32_t base = offsets[expert];
     const char *weight_row = (second ? up : gate) +
         (uint64_t)expert * (second ? up_expert_bytes : gate_expert_bytes) +
         (uint64_t)(live ? row : 0u) * (second ? up_row_bytes : gate_row_bytes);
@@ -10542,9 +10565,9 @@ static int qwen4exp_routed_moe_cuda(
             ((uintptr_t)gate & 15u) == 0u && ((uintptr_t)up & 15u) == 0u &&
             (gate_slab->expert_bytes & 15ull) == 0ull &&
             (up_slab->expert_bytes & 15ull) == 0ull;
-#define QWEN4EXP_SPLIT_GATEUP(V, P, C) \
+#define QWEN4EXP_SPLIT_GATEUP(V, P, C, BCAST) \
         QWEN4EXP_LAUNCH_PDL( \
-            (qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P, C>), \
+            (qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P, C, BCAST>), \
             (dim3((mid_dim + P - 1u) / P, gu_rows, 1)), P * 64u, 0, stream, \
             (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum, \
             sc.pairs, sc.counts, sc.offsets, gu_active, \
@@ -10564,9 +10587,9 @@ static int qwen4exp_routed_moe_cuda(
          * is zero for both warps, so each still walks its own row in the
          * same group order through the same warp_sum_f32 tree and every dot
          * is bit-identical.  mid_dim 640 gives 640 blocks. */
-        if (coop) { QWEN4EXP_SPLIT_GATEUP(true, QW_GU_COOP_ROWS, true); }
-        else if (vector) { QWEN4EXP_SPLIT_GATEUP(true, 1u, false); }
-        else { QWEN4EXP_SPLIT_GATEUP(false, 4u, false); }
+        if (coop) { QWEN4EXP_SPLIT_GATEUP(true, QW_GU_COOP_ROWS, true, true); }
+        else if (vector) { QWEN4EXP_SPLIT_GATEUP(true, 1u, false, false); }
+        else { QWEN4EXP_SPLIT_GATEUP(false, 4u, false, false); }
 #undef QWEN4EXP_SPLIT_GATEUP
     }
     /* ---- THE SAME COOPERATIVE PANEL FOR THE TWO LAYERS THAT ARE NOT q4_K ----
@@ -10608,10 +10631,10 @@ static int qwen4exp_routed_moe_cuda(
              ((uintptr_t)gate & 15u) == 0u && ((uintptr_t)up & 15u) == 0u &&
              (gate_slab->expert_bytes & 15ull) == 0ull &&
              (up_slab->expert_bytes & 15ull) == 0ull) {
-#define QWEN4EXP_SPLIT_PANEL(T) \
+#define QWEN4EXP_SPLIT_PANEL(T, BCAST) \
         QWEN4EXP_LAUNCH_PDL( \
             (qwen4exp_moe_gateup_split_kernel<2, T, true, QW_GU_COOP_ROWS, \
-                                              true>), \
+                                              true, BCAST>), \
             (dim3((mid_dim + QW_GU_COOP_ROWS - 1u) / QW_GU_COOP_ROWS, \
                   gu_rows, 1)), \
             QW_GU_COOP_ROWS * 64u, 0, stream, \
@@ -10624,9 +10647,9 @@ static int qwen4exp_routed_moe_cuda(
             mid_token_stride, n_expert_used)
         qw_gu_panel_taken(gate_slab->type, n_tokens, gu_rows);
         if (gate_slab->type == (uint32_t)DS4_QWEN4EXP_TY_q5_K) {
-            QWEN4EXP_SPLIT_PANEL(DS4_QWEN4EXP_TY_q5_K);
+            QWEN4EXP_SPLIT_PANEL(DS4_QWEN4EXP_TY_q5_K, false);
         } else {
-            QWEN4EXP_SPLIT_PANEL(DS4_QWEN4EXP_TY_q8_0);
+            QWEN4EXP_SPLIT_PANEL(DS4_QWEN4EXP_TY_q8_0, false);
         }
 #undef QWEN4EXP_SPLIT_PANEL
     }
