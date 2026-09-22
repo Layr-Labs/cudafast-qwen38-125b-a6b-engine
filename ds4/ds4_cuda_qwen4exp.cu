@@ -11735,12 +11735,15 @@ __device__ __forceinline__ static float qwen4exp_hc_norm_scale(
  * same ascending order, so the sum is the same chain of the same FFMAs.  The
  * elements are xg[s*blockDim.x + threadIdx.x] for s = 0..9, exactly the
  * indices the rolled walk visits at the shape the dispatch gates this on.
+ * The ten stay in the caller's array rather than in a local one: the caller's
+ * own walk wants exactly these values next, and a register that already holds
+ * one is cheaper than the load that would fetch it again.
  * The return line is qwen4exp_hc_norm_scale's own and stays
  * character-identical to it -- the mutant script matches that text wherever
  * it appears, so a forked copy still bites. */
 __device__ __forceinline__ static float qwen4exp_hc_norm_scale_staged(
-        const float *xg, uint32_t group, float eps, float *partial) {
-    float xv[QWEN4EXP_HC_STAGED_STEPS];
+        const float *xg, uint32_t group, float eps, float *partial,
+        float *xv) {
 #pragma unroll
     for (uint32_t s = 0; s < QWEN4EXP_HC_STAGED_STEPS; s++) {
         xv[s] = xg[s * QWEN4EXP_HC_THREADS + threadIdx.x];
@@ -11934,8 +11937,17 @@ __global__ static void qwen4exp_hc_norm_quant_kernel(
     QWEN4EXP_PDL_SYNC();
 
     __shared__ float partial[QWEN4EXP_HC_THREADS];
+    /* The staged arm's scale walk already pulled this thread's ten hyper
+     * values into registers to square them; the quantize walk below wants the
+     * same ten, from the same addresses, in the same order.  It keeps them
+     * instead of reading the row a second time: one pass over the hyper rows
+     * per block rather than two, and the walk starts with its operands in
+     * hand instead of stalling on a reload behind the reduction's barrier.
+     * The rolled arm stages nothing and leaves the array dead, as it does
+     * with the weights above. */
+    float xv[QWEN4EXP_HC_STAGED_STEPS];
     const float scale = Staged
-        ? qwen4exp_hc_norm_scale_staged(xg, group, eps, partial)
+        ? qwen4exp_hc_norm_scale_staged(xg, group, eps, partial, xv)
         : qwen4exp_hc_norm_scale(xg, group, eps, partial);
     if (threadIdx.x == 0u) nscale[(uint64_t)row * (n / group) + g] = scale;
 
@@ -11946,15 +11958,9 @@ __global__ static void qwen4exp_hc_norm_quant_kernel(
     const uint64_t blk0 = (uint64_t)row * row_blocks + (uint64_t)g * (group / 32u);
 
     if (Staged) {
-        /* The quantize walk's ten values staged in registers, then the seam
-         * below on them: lane k of step s owns flat index
-         * s*blockDim.x + warp*32 + lane, exactly the rolled walk's step s,
-         * so the butterfly's lanes and the store's pairs are unchanged. */
-        float xv[QWEN4EXP_HC_STAGED_STEPS];
-#pragma unroll
-        for (uint32_t s = 0; s < QWEN4EXP_HC_STAGED_STEPS; s++) {
-            xv[s] = xg[s * QWEN4EXP_HC_THREADS + threadIdx.x];
-        }
+        /* The quantize seam on the values in hand: lane k of step s owns flat
+         * index s*blockDim.x + warp*32 + lane, exactly the rolled walk's step
+         * s, so the butterfly's lanes and the store's pairs are unchanged. */
 #pragma unroll
         for (uint32_t k = 0; k < QWEN4EXP_HC_STAGED_STEPS; k++) {
             const float v = qwen4exp_hc_normed_value(xv[k], scale, wv[k],
