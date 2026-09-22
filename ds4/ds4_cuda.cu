@@ -20506,7 +20506,7 @@ struct qwen_gdn_projection_args {
 #else
 #define QW_GDN_PROJ_ATTR __launch_bounds__(256)
 #endif
-template<int R, bool Stage=false>
+template<int R, bool Stage=false, bool NativeCopy=false>
 __global__ QW_GDN_PROJ_ATTR
 static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
     extern __shared__ uint4 qw_gdn_panel[];
@@ -20535,22 +20535,40 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
          * request so that read stays inside the allocation. */
         const uint64_t panel_bytes = (uint64_t)(B/64u) * blocks * 34u;
         const char *const gp = (const char *)w + (uint64_t)block * panel_bytes;
-        if (((uintptr_t)gp & 15u) == 0u) {
-            for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
-                 i += (uint64_t)B * 16u) {
-                if (i + 16u <= panel_bytes)
-                    *(uint4 *)(gpanel + i) = *(const uint4 *)(const void *)(gp + i);
-                else
-                    for (uint64_t j = i; j < panel_bytes; j++) gpanel[j] = gp[j];
-            }
+        if (NativeCopy && blocks == 80u && (((uintptr_t)gp & 15u) == 0u)) {
+            /* Native bytes only; retain the runtime arithmetic walk below. */
+            const unsigned t = threadIdx.x;
+            const uint4 *p = (const uint4 *)(const void *)gp;
+            uint4 *d = (uint4 *)(void *)gpanel;
+            const uint4 v0 = p[t];
+            const uint4 v1 = p[t+256u];
+            uint4 v2 = make_uint4(0,0,0,0);
+            if (t < 168u) v2 = p[t+512u];
+            /* Require every load in the batch before its shared stores. */
+            asm volatile("" :: "r"(v0.x),"r"(v0.y),"r"(v0.z),"r"(v0.w),
+                "r"(v1.x),"r"(v1.y),"r"(v1.z),"r"(v1.w),
+                "r"(v2.x),"r"(v2.y),"r"(v2.z),"r"(v2.w) : "memory");
+            d[t] = v0;
+            d[t+256u] = v1;
+            if (t < 168u) d[t+512u] = v2;
         } else {
-            for (uint64_t i = (uint64_t)threadIdx.x * 4u; i < panel_bytes;
-                 i += (uint64_t)B * 4u) {
-                if (i + 4u <= panel_bytes)
-                    *(uint32_t *)(gpanel + i) =
-                        *(const uint32_t *)(const void *)(gp + i);
-                else
-                    for (uint64_t j = i; j < panel_bytes; j++) gpanel[j] = gp[j];
+            if (((uintptr_t)gp & 15u) == 0u) {
+                for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
+                     i += (uint64_t)B * 16u) {
+                    if (i + 16u <= panel_bytes)
+                        *(uint4 *)(gpanel + i) = *(const uint4 *)(const void *)(gp + i);
+                    else
+                        for (uint64_t j = i; j < panel_bytes; j++) gpanel[j] = gp[j];
+                }
+            } else {
+                for (uint64_t i = (uint64_t)threadIdx.x * 4u; i < panel_bytes;
+                     i += (uint64_t)B * 4u) {
+                    if (i + 4u <= panel_bytes)
+                        *(uint32_t *)(gpanel + i) =
+                            *(const uint32_t *)(const void *)(gp + i);
+                    else
+                        for (uint64_t j = i; j < panel_bytes; j++) gpanel[j] = gp[j];
+                }
             }
         }
         /* The drain absorbs the fill; the barrier is nearly satisfied by the
@@ -21132,7 +21150,12 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
                 QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1>),
                                     grid, 256, 0, cuda_decode_stream(), a);
         } else {
-            if (gdn_stage)
+            if (gdn_stage && blocks == 80u &&
+                ((((uintptr_t)a.weights[0]|(uintptr_t)a.weights[1])&15u)==0u) &&
+                getenv("DS4_QWEN4EXP_NO_GDN_COPY_GROUP") == NULL)
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2,true,true>),
+                                    grid, 256, gdn_panel, cuda_decode_stream(), a);
+            else if (gdn_stage)
                 QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2,true>),
                                     grid, 256, gdn_panel, cuda_decode_stream(), a);
             else
