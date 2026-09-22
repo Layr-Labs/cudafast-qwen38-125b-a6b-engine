@@ -11858,14 +11858,21 @@ __global__ static void qwen4exp_gdn_output_quant_kernel(
     const uint64_t base = (uint64_t)token * value_dim +
         head * QWEN4EXP_GDN_DIM;
     const float raw = out[base + tid];
+    /* Neither of these depends on the reduction: the norm weight is indexed
+     * by tid and the gate by the block's own base, never by `total`.  Issued
+     * here they fly under the two-stage sum and its barrier instead of after
+     * it, which is where their DRAM latency used to sit with nothing left in
+     * the kernel to cover it.  Same addresses, same values, and the epilogue
+     * multiplies them in the order it always did. */
+    const float norm_w = output_norm[tid];
+    const float gate_v = qwen4exp_gdn_sigmoid(output_gate[base + tid]);
     float total = warp_sum_f32(raw * raw);
     if (lane == 0u) partial[warp] = total;
     __syncthreads();
     total = lane < 4u ? partial[lane] : 0.0f;
     total = warp_sum_all_f32(total);
     const float scale = rsqrtf(total / (float)QWEN4EXP_GDN_DIM + norm_eps);
-    const float v = raw * scale * output_norm[tid] *
-        qwen4exp_gdn_sigmoid(output_gate[base + tid]);
+    const float v = raw * scale * norm_w * gate_v;
     const float vz = qwen4exp_q8_ftz(v);
     float a = qwen4exp_q8_ftz(fabsf(v));
 #pragma unroll
