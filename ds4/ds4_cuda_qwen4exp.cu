@@ -851,8 +851,30 @@ __global__ static void qwen4exp_gdn_conv_replay_gates_kernel(
     history[(uint64_t)conv_dim + channel] = h1;
     history[(uint64_t)2u * conv_dim + channel] = h2;
     /* One publisher per head/token. Stream completion orders these pairs
-     * before replay; history and raw gate inputs are disjoint allocations. */
-    if (block == 0u && tid < n_value_head) {
+     * before replay; history and raw gate inputs are disjoint allocations.
+     *
+     * Publisher placement (QWEN4EXP_GDN_GATES_ON_VALUE_BLOCK, default 1).
+     * Block 0 is a KEY block: every token it pays a warp reduction, a block
+     * barrier and a second reduction before its rsqrt, so it is among the
+     * last blocks of the grid to finish, and the dependent recurrence launch
+     * waits for the whole grid.  Appending the serial gate loop to it put
+     * n_tokens rounds of two dependent global loads, expf, softplus and
+     * sigmoid behind the grid's longest block.  A VALUE block runs the same
+     * token loop with no reduction and no barrier, so the same tail placed on
+     * the last value block finishes inside the key blocks' shadow.  The
+     * publishing thread keeps its index (tid = head), reads the same inputs
+     * and evaluates the same expressions, so every published pair is the same
+     * bits; only which block's warps issue them moves.  blockDim is
+     * QWEN4EXP_GDN_DIM >= n_value_head either way. */
+#ifndef QWEN4EXP_GDN_GATES_ON_VALUE_BLOCK
+#define QWEN4EXP_GDN_GATES_ON_VALUE_BLOCK 1
+#endif
+#if QWEN4EXP_GDN_GATES_ON_VALUE_BLOCK
+    const uint32_t gate_block = blocks - 1u;
+#else
+    const uint32_t gate_block = 0u;
+#endif
+    if (block == gate_block && tid < n_value_head) {
         const float coeff = a_log[tid];
         const float bias = dt_bias[tid];
         for (uint32_t token = 0; token < n_tokens; ++token) {
@@ -11729,6 +11751,31 @@ __device__ __forceinline__ static float qwen4exp_hc_norm_scale(
     return 1.0f / sqrtf(total / (float)group + eps);
 }
 
+/* The 256-thread HC scale tree, with its first three levels evaluated by
+ * warp zero after one shared-memory publication. Each lane reads the same
+ * eight leaves that the stride-128, stride-64 and stride-32 stages reduced
+ * into that lane. Keep every addition's operands and order unchanged; an
+ * ordinary warp-first block reduction would reassociate the sum.
+ * Only the fixed-width staged norm uses this helper. */
+__device__ __forceinline__ static float qwen4exp_hc_block_sum_staged(
+        float v, float *partial) {
+    const uint32_t tid = threadIdx.x;
+    partial[tid] = v;
+    __syncthreads();
+    if (tid < 32u) {
+        const float p0 = __fadd_rn(partial[tid], partial[tid + 128u]);
+        const float p1 = __fadd_rn(partial[tid + 32u], partial[tid + 160u]);
+        const float p2 = __fadd_rn(partial[tid + 64u], partial[tid + 192u]);
+        const float p3 = __fadd_rn(partial[tid + 96u], partial[tid + 224u]);
+        const float q0 = __fadd_rn(p0, p2);
+        const float q1 = __fadd_rn(p1, p3);
+        const float total = warp_sum_all_f32(__fadd_rn(q0, q1));
+        if (tid == 0u) partial[0] = total;
+    }
+    __syncthreads();
+    return partial[0];
+}
+
 /* The same scale walk with its ten values staged in registers first: the
  * rolled loop issues one load and stalls on it before the next, the staged
  * one puts the ten loads in flight together and then accumulates them in the
@@ -11739,8 +11786,8 @@ __device__ __forceinline__ static float qwen4exp_hc_norm_scale(
  * character-identical to it -- the mutant script matches that text wherever
  * it appears, so a forked copy still bites. */
 __device__ __forceinline__ static float qwen4exp_hc_norm_scale_staged(
-        const float *xg, uint32_t group, float eps, float *partial) {
-    float xv[QWEN4EXP_HC_STAGED_STEPS];
+        const float *xg, uint32_t group, float eps, float *partial,
+        float (&xv)[QWEN4EXP_HC_STAGED_STEPS]) {
 #pragma unroll
     for (uint32_t s = 0; s < QWEN4EXP_HC_STAGED_STEPS; s++) {
         xv[s] = xg[s * QWEN4EXP_HC_THREADS + threadIdx.x];
@@ -11751,7 +11798,7 @@ __device__ __forceinline__ static float qwen4exp_hc_norm_scale_staged(
         const float v = xv[c];
         sum += v * v;
     }
-    const float total = qwen4exp_block_sum_f32(sum, partial);
+    const float total = qwen4exp_hc_block_sum_staged(sum, partial);
     /* 1/sqrt rather than rsqrtf, for the same reason as the unfused kernel. */
     return 1.0f / sqrtf(total / (float)group + eps);
 }
@@ -11934,8 +11981,11 @@ __global__ static void qwen4exp_hc_norm_quant_kernel(
     QWEN4EXP_PDL_SYNC();
 
     __shared__ float partial[QWEN4EXP_HC_THREADS];
+    /* Keep the scale walk's values through the reduction for quantization.
+     * Loads stay below the PDL fence; only their lifetime changes. */
+    float xv[QWEN4EXP_HC_STAGED_STEPS];
     const float scale = Staged
-        ? qwen4exp_hc_norm_scale_staged(xg, group, eps, partial)
+        ? qwen4exp_hc_norm_scale_staged(xg, group, eps, partial, xv)
         : qwen4exp_hc_norm_scale(xg, group, eps, partial);
     if (threadIdx.x == 0u) nscale[(uint64_t)row * (n / group) + g] = scale;
 
@@ -11946,15 +11996,10 @@ __global__ static void qwen4exp_hc_norm_quant_kernel(
     const uint64_t blk0 = (uint64_t)row * row_blocks + (uint64_t)g * (group / 32u);
 
     if (Staged) {
-        /* The quantize walk's ten values staged in registers, then the seam
+        /* The scale walk's ten values retained in registers, then the seam
          * below on them: lane k of step s owns flat index
          * s*blockDim.x + warp*32 + lane, exactly the rolled walk's step s,
          * so the butterfly's lanes and the store's pairs are unchanged. */
-        float xv[QWEN4EXP_HC_STAGED_STEPS];
-#pragma unroll
-        for (uint32_t s = 0; s < QWEN4EXP_HC_STAGED_STEPS; s++) {
-            xv[s] = xg[s * QWEN4EXP_HC_THREADS + threadIdx.x];
-        }
 #pragma unroll
         for (uint32_t k = 0; k < QWEN4EXP_HC_STAGED_STEPS; k++) {
             const float v = qwen4exp_hc_normed_value(xv[k], scale, wv[k],
@@ -12503,9 +12548,11 @@ static int qwen4exp_hc_staged_ok(uint32_t n_embd, uint32_t n_hc) {
 
 
 /* Fuse the low-rank scale/SiLU with its following Q8 activation quantizer.
- * The float result is still written to lowrank, exactly as the separate
- * scale_silu kernel did. The quantizer uses the promoted norm fusion's
- * explicit fast-math seam so it returns the standalone quantizer's bytes. */
+ * The StoreLowrank=true arm keeps the separate scale_silu scratch write for
+ * compatibility; the production arm drops that dead write. The quantizer uses
+ * the promoted norm fusion's explicit fast-math seam so it returns the
+ * standalone quantizer's bytes. */
+template <bool StoreLowrank>
 __global__ static void qwen4exp_hc_silu_quant_kernel(
         float *lowrank, int8_t *xq, float *xscale,
         uint64_t pairs, float scale) {
@@ -12536,7 +12583,7 @@ __global__ static void qwen4exp_hc_silu_quant_kernel(
     const uint64_t i = pair * 32u + lane;
     const float z = lowrank[i] * scale;
     const float v = z * qwen4exp_sigmoid(z);
-    lowrank[i] = v;
+    if (StoreLowrank) lowrank[i] = v;
 
     const float vz = qwen4exp_q8_ftz(v);
     float a = qwen4exp_q8_ftz(fabsf(v));
@@ -12549,6 +12596,23 @@ __global__ static void qwen4exp_hc_silu_quant_kernel(
     int q = (int)lrintf(qwen4exp_q8_ftz(vz * id));
     q = q > 127 ? 127 : (q < -128 ? -128 : q);
     xq[i] = (int8_t)q;
+}
+
+template <bool StoreLowrank>
+static void qwen4exp_hc_silu_quant_launch(
+        float *lowrank, int8_t *xq, float *xscale,
+        uint64_t pairs, float scale, int relay) {
+    const unsigned grid = (unsigned)((pairs + 7u) / 8u);
+    if (relay && pairs <= 20u) {
+        QWEN4EXP_LAUNCH_PDL(
+                (qwen4exp_hc_silu_quant_kernel<StoreLowrank>),
+                grid, 256, 0, cuda_decode_stream(),
+                lowrank, xq, xscale, pairs, scale);
+    } else {
+        qwen4exp_hc_silu_quant_kernel<StoreLowrank>
+            <<<grid, 256, 0, cuda_decode_stream()>>>(
+                lowrank, xq, xscale, pairs, scale);
+    }
 }
 
 /* =========================================================================
@@ -13489,6 +13553,19 @@ static int qwen4exp_hc_relay_enabled(void) {
     return enabled;
 }
 
+/* The Q8 low-rank arm publishes xq/xscale for the up projection.  Its float
+ * lowrank result is an internal scratch value and no consumer reads it after
+ * this arm.  Keep a capture-stable kill switch so an A/B can restore the
+ * historical store without changing the graph's launch topology. */
+static int qwen4exp_hc_silu_dead_store_off(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_QWEN4EXP_NO_HC_SILU_DEAD_STORE");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
 static int qwen4exp_hc_mixer_fused_cuda(
         ds4_gpu_tensor       *mixed,
         ds4_gpu_tensor       *inject,
@@ -13663,6 +13740,18 @@ static int qwen4exp_hc_mixer_fused_cuda(
          * q/scale ranges, leaving the stream norm scales at n_off untouched.
          * The narrow input is no larger than either reserved range. */
         const uint64_t low_pairs = (uint64_t)rows * (n_lowrank / 32u);
+        const uint64_t low_bytes =
+            (uint64_t)rows * n_lowrank * sizeof(float);
+        /* Scratch tensors are separately allocated in the graph, but this
+         * entry is public and tests may provide overlapping views.  Keep the
+         * old write for an overlap: dropping it is valid only when no later
+         * xq/xscale publication can alias the low-rank input/output. */
+        const int drop_lowrank_store =
+            !qwen4exp_hc_silu_dead_store_off() &&
+            qwen4exp_hc_ranges_disjoint(lowrank_scratch->ptr, low_bytes,
+                                        xq, q_bytes) &&
+            qwen4exp_hc_ranges_disjoint(lowrank_scratch->ptr, low_bytes,
+                                        xscale, s_bytes);
         /* THE RELAY.  At the two-row decode width the stream is
          *     hc_norm_quant -> hc_down_pair -> hc_silu_quant -> hc_up
          * and the up projection stages its WHOLE weight slab above its own
@@ -13679,17 +13768,16 @@ static int qwen4exp_hc_mixer_fused_cuda(
          * DS4_HC_PDL_RELAY=0 drops the attribute; the fence in a plainly
          * launched kernel is a no-op and the down trigger fires into
          * nothing, which is the shipped behaviour exactly. */
-        if (low_pairs <= 20u && qwen4exp_hc_relay_enabled()) {
-            QWEN4EXP_LAUNCH_PDL(qwen4exp_hc_silu_quant_kernel,
-                                (unsigned)((low_pairs + 7u) / 8u), 256, 0,
-                                cuda_decode_stream(),
-                                (float *)lowrank_scratch->ptr, xq, xscale,
-                                low_pairs, 1.0f / (float)n_hc);
+        if (drop_lowrank_store) {
+            qwen4exp_hc_silu_quant_launch<false>(
+                    (float *)lowrank_scratch->ptr, xq, xscale, low_pairs,
+                    1.0f / (float)n_hc,
+                    qwen4exp_hc_relay_enabled());
         } else {
-        qwen4exp_hc_silu_quant_kernel<<<(unsigned)((low_pairs + 7u) / 8u),
-                                       256, 0, cuda_decode_stream()>>>(
-                (float *)lowrank_scratch->ptr, xq, xscale, low_pairs,
-                1.0f / (float)n_hc);
+            qwen4exp_hc_silu_quant_launch<true>(
+                    (float *)lowrank_scratch->ptr, xq, xscale, low_pairs,
+                    1.0f / (float)n_hc,
+                    qwen4exp_hc_relay_enabled());
         }
         if (!cuda_ok(cudaGetLastError(), "qwen4exp_hc_silu_quant launch")) return 0;
         if (upw) {
