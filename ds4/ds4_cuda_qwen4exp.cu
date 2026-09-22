@@ -4503,7 +4503,7 @@ __global__ static void qwen4exp_moe_group_small_kernel(
  * its token is threadIdx.x >> 5 where it was blockIdx.x, and every warp
  * intrinsic already uses the full mask and stays inside its own warp.
  */
-template<bool Native, bool KeyMax = false>
+template<bool Native>
 __global__ static void qwen4exp_moe_router_group_small_kernel(
         int32_t *counts,
         int32_t *offsets,
@@ -4588,44 +4588,9 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
         if (e < n_expert) live |= 1u << j;
     }
 
-#if __CUDA_ARCH__ >= 800
-    uint32_t keys[16];
-    if constexpr (Native && KeyMax) {
-#pragma unroll
-    for (uint32_t j = 0; j < 16u; j++) {
-        const float v = scores[j];
-        const uint32_t bits = v == 0.0f ? 0u : __float_as_uint(v);
-        const uint32_t ordered = bits & 0x80000000u ? ~bits : bits ^ 0x80000000u;
-        // Original comparator ignores NaNs/-Inf, but accepts exact -FLT_MAX.
-        keys[j] = v >= -FLT_MAX ? ordered : 0u;
-    }
-    }
-#endif
     for (uint32_t rank = 0; rank < n_expert_used; rank++) {
         float best_v = -FLT_MAX;
         int32_t best_i = INT32_MAX;
-#if __CUDA_ARCH__ >= 800
-        if constexpr (Native && KeyMax) {
-        uint32_t best_key = 0u;
-#pragma unroll
-        for (uint32_t j = 0; j < 16u; j++) {
-            const uint32_t key = keys[j] & (0u - ((live >> j) & 1u));
-            best_key = max(best_key, key);
-        }
-        const uint32_t winning_key = __reduce_max_sync(0xffffffffu, best_key);
-        uint32_t matches = 0u;
-#pragma unroll
-        for (uint32_t j = 0; j < 16u; j++)
-            matches |= (uint32_t)(keys[j] == winning_key) << j;
-        matches &= live;
-        if (winning_key == 0u) matches = 0u;
-        const int32_t local_i = matches
-            ? (int32_t)(lane + ((uint32_t)__ffs(matches) - 1u) * 32u)
-            : INT32_MAX;
-        best_i = __reduce_min_sync(0xffffffffu, local_i);
-        } else
-#endif
-        {
 #pragma unroll
         for (uint32_t j = 0; j < 16u; j++) {
             if ((live & (1u << j)) == 0u) continue;
@@ -4661,7 +4626,6 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
                     best_i = other_i;
                 }
             }
-        }
         }
         const int32_t chosen =
             __shfl_sync(0xffffffffu, best_i, 0u);
@@ -5345,7 +5309,7 @@ __device__ __forceinline__ static void qw_mma_m16n8k32(
  * The ordinary expert list remains the fallback and the down projection's
  * input. No weight or activation representation changes. */
 template <int GateType = -1, int UpType = -1, bool PairTasks = false,
-          int Dma = 0>
+          int Dma = 0, bool NativeDMA = false>
 /* The DMA arms need the occupancy pinned: without a minimum ptxas takes
  * 167 registers (3 CTAs/SM) and throws away the whole point of the 64 B
  * arm, which is that its staging buffer still fits four.
@@ -5436,6 +5400,10 @@ qwen4exp_moe_gateup_mma_kernel(
         uint32_t mid_token_stride,
         uint32_t n_expert_used,
         uint32_t dq_stage) {
+    static_assert(!NativeDMA || (PairTasks && Dma == 6 &&
+                  GateType == DS4_QWEN4EXP_TY_q4_K &&
+                  UpType == DS4_QWEN4EXP_TY_q4_K),
+                  "native light Q4 DMA dispatch");
     /* The bounded Q4_K/Q5_K tasks benefit from distinct banks on MMA
      * fragment reads. Padding only these temporary rows trades staging-store
      * conflicts for cheaper repeated fragment loads. The Q8 task and the
@@ -5551,15 +5519,15 @@ qwen4exp_moe_gateup_mma_kernel(
     int8_t *const sWt = w_tile ? sAu : sAg;
     float *const sWAt = w_tile ? sWAu : sWAg;
     float *const sWBt = w_tile ? sWBu : sWBg;
-    const bool w_fast = (dq_stage & 1u) != 0u &&
+    const bool w_fast = NativeDMA || ((dq_stage & 1u) != 0u &&
         GateType == DS4_QWEN4EXP_TY_q4_K && UpType == DS4_QWEN4EXP_TY_q4_K &&
-        (((uintptr_t)w_row) & 15u) == 0u;
+        (((uintptr_t)w_row) & 15u) == 0u);
     /* Block-uniform by construction (the expert bases and the row stride are
      * the slab's, not the thread's), so the cooperative fill below is either
      * taken by the whole CTA or by none of it.  It also implies w_fast for
      * every thread, and it keeps the dq_stage diagnostic valve meaningful:
      * with dq_stage == 0 the block takes the per-group staging and no DMA. */
-    const bool dma_on = Dma != 0 && (dq_stage & 1u) != 0u &&
+    const bool dma_on = NativeDMA || (Dma != 0 && (dq_stage & 1u) != 0u &&
         GateType == DS4_QWEN4EXP_TY_q4_K && UpType == DS4_QWEN4EXP_TY_q4_K &&
         ((((uintptr_t)gate_e) | ((uintptr_t)up_e) | (uintptr_t)gate_row_bytes |
           (uintptr_t)up_row_bytes) & 15u) == 0u &&
@@ -5567,7 +5535,7 @@ qwen4exp_moe_gateup_mma_kernel(
          * must be a whole number of them or the last fill would read past
          * the row.  Production K is 2560 = 80 groups = 10 super-blocks; any
          * other extent takes the shipped path. */
-        (QW_DMA_PER == 1 || (groups & (QW_DMA_PER == 4 ? 15u : 7u)) == 0u);
+        (QW_DMA_PER == 1 || (groups & (QW_DMA_PER == 4 ? 15u : 7u)) == 0u));
     /* One fill: 64 units x QW_DMA_J sixteen-byte pieces, handed out so that
      * QW_DMA_J consecutive lanes cover one unit's contiguous run.  The FETCH
      * map is decoupled from the tile map; that is the whole mechanism. */
@@ -6349,7 +6317,17 @@ qwen4exp_moe_gateup_heavy_kernel(
  * The activation is the routed intermediate, quantised per (token, slot) pair,
  * so the pair index addresses it directly.
  */
-template <int DownType = -1, bool Wide6 = false>
+template <int I>
+__device__ __forceinline__ static void qw_q51_direct_word(
+        int8_t *dst, uint32_t payload, uint32_t qh) {
+    const uint32_t lo = (((qh >> (4u * I)) & 0x0fu) * 0x02040810u) & 0x10101010u;
+    const uint32_t hi = (((qh >> (16u + 4u * I)) & 0x0fu) * 0x02040810u) & 0x10101010u;
+    uint32_t *const w = (uint32_t *)(void *)dst;
+    w[I] = (payload & 0x0f0f0f0fu) | lo;
+    w[4 + I] = ((payload >> 4u) & 0x0f0f0f0fu) | hi;
+}
+
+template <int DownType = -1, bool Wide6 = false, bool NativeDQ = false>
 __global__ __launch_bounds__(QW_DOWN_MMA_THREADS) static void
 qwen4exp_moe_down_mma_kernel(
         float *partial,
@@ -6367,6 +6345,8 @@ qwen4exp_moe_down_mma_kernel(
         uint32_t groups,
         uint32_t out_dim,
         uint32_t dq_stage) {
+    static_assert(!NativeDQ || (DownType == DS4_QWEN4EXP_TY_q5_1 && Wide6),
+                  "direct native Q5 word staging");
     __shared__ __align__(16) int8_t sA[QW_DOWN_MMA_BM * QW_MMA_LD];
     __shared__ __align__(16) int8_t sB[QW_MMA_BN * QW_MMA_LD];
     __shared__ float  sWA[QW_DOWN_MMA_BM * QW_MMA_G];
@@ -6453,7 +6433,18 @@ qwen4exp_moe_down_mma_kernel(
                 if (orow < out_dim && g < groups) {
                     const char *const drow =
                         down_e + (uint64_t)orow * down_row_bytes;
-                    if (w_dq) {
+                    if constexpr (NativeDQ) {
+                        const uint2 *const raw = (const uint2 *)(const void *)(
+                            drow + (uint64_t)g * sizeof(cuda_block_q5_1));
+                        const uint2 a = raw[0], b = raw[1], c = raw[2];
+                        wa[0] = dev_f16_to_f32((uint16_t)(a.x & 0xffffu));
+                        wb[0] = dev_f16_to_f32((uint16_t)(a.x >> 16u));
+                        int8_t *const dst = &sA[r * QW_MMA_LD + gg * 32];
+                        qw_q51_direct_word<0>(dst, b.x, a.y);
+                        qw_q51_direct_word<1>(dst, b.y, a.y);
+                        qw_q51_direct_word<2>(dst, c.x, a.y);
+                        qw_q51_direct_word<3>(dst, c.y, a.y);
+                    } else if (w_dq) {
                         uint32_t raw[6];
                         dev_qwen4exp_group_decode_w(dtype, drow, g,
                                 qw_raw_load<Wide6>(dtype, drow, g, raw)
@@ -10112,29 +10103,10 @@ static int qwen4exp_routed_moe_cuda(
          * no weight of its own to load; what the edge buys is the launch
          * turnaround, not a prefetch.  DS4_QWEN4EXP_NO_PDL_ROUTER_TREE stands
          * it back down to the plain launch, where the fence is a no-op. */
-        const bool key_max =
-            getenv("DS4_QWEN4EXP_NO_ROUTER_KEYMAX") == NULL;
-        if (qwen4exp_pdl_router_tree() && key_max) {
-            QWEN4EXP_LAUNCH_PDL(
-                    (qwen4exp_moe_router_group_small_kernel<true, true>),
-                    dim3(1u, 1u, 1u), QWEN4EXP_MOE_SCAN_THREADS, 0, stream,
-                    sc.counts, sc.offsets, sc.cursor, sc.active, sc.pairs,
-                    (float *)mid->ptr, (int32_t *)selected->ptr,
-                    n_total_expert, n_pairs, n_expert_used, mid_dim,
-                    mid_token_stride, (float *)weights_rw->ptr,
-                    (const float *)logits->ptr, n_tokens);
-        } else if (qwen4exp_pdl_router_tree()) {
+        if (qwen4exp_pdl_router_tree()) {
             QWEN4EXP_LAUNCH_PDL(
                     (qwen4exp_moe_router_group_small_kernel<true>),
                     dim3(1u, 1u, 1u), QWEN4EXP_MOE_SCAN_THREADS, 0, stream,
-                    sc.counts, sc.offsets, sc.cursor, sc.active, sc.pairs,
-                    (float *)mid->ptr, (int32_t *)selected->ptr,
-                    n_total_expert, n_pairs, n_expert_used, mid_dim,
-                    mid_token_stride, (float *)weights_rw->ptr,
-                    (const float *)logits->ptr, n_tokens);
-        } else if (key_max) {
-            qwen4exp_moe_router_group_small_kernel<true, true>
-                    <<<dim3(1u, 1u, 1u), QWEN4EXP_MOE_SCAN_THREADS, 0, stream>>>(
                     sc.counts, sc.offsets, sc.cursor, sc.active, sc.pairs,
                     (float *)mid->ptr, (int32_t *)selected->ptr,
                     n_total_expert, n_pairs, n_expert_used, mid_dim,
@@ -10456,8 +10428,8 @@ static int qwen4exp_routed_moe_cuda(
                     xgroups, mid_dim, n_expert_used);
             if (!cuda_ok(cudaGetLastError(), "qwen4exp gate/up heavy")) return 0;
         }
-#define QWEN4EXP_GATEUP_MMA_IMPL(GT, UT, TASKS, DMA) \
-        qwen4exp_moe_gateup_mma_kernel<GT, UT, TASKS, DMA><<< \
+#define QWEN4EXP_GATEUP_MMA_NATIVE(GT, UT, TASKS, DMA, NATIVE) \
+        qwen4exp_moe_gateup_mma_kernel<GT, UT, TASKS, DMA, NATIVE><<< \
                 dim3(mid_dim / QW_MMA_BM, TASKS ? (unsigned)task_capacity : gu_rows, 1), \
                 QW_MMA_THREADS, 0, stream>>>( \
                 (float *)mid->ptr, \
@@ -10471,6 +10443,8 @@ static int qwen4exp_routed_moe_cuda(
                 up_slab->expert_bytes, up_slab->row_bytes, \
                 gate_slab->type, up_slab->type, xgroups, mid_dim, \
                 mid_token_stride, n_expert_used, gu_dq_stage)
+#define QWEN4EXP_GATEUP_MMA_IMPL(GT, UT, TASKS, DMA) \
+        QWEN4EXP_GATEUP_MMA_NATIVE(GT, UT, TASKS, DMA, false)
 #define QWEN4EXP_GATEUP_MMA_D(GT, UT, DMA) do { \
         if (pair_tasks) { QWEN4EXP_GATEUP_MMA_IMPL(GT, UT, true, DMA); } \
         else { QWEN4EXP_GATEUP_MMA_IMPL(GT, UT, false, DMA); } \
@@ -10496,9 +10470,16 @@ static int qwen4exp_routed_moe_cuda(
                   (uintptr_t)gate_slab->row_bytes |
                   (uintptr_t)up_slab->row_bytes) & 15u) == 0u;
             if (gu_dma) {
-                QWEN4EXP_GATEUP_MMA_D(DS4_QWEN4EXP_TY_q4_K,
-                                      DS4_QWEN4EXP_TY_q4_K,
-                                      QW_GATEUP_DMA_ARM);
+                if (QW_GATEUP_DMA_ARM == 6 && pair_tasks &&
+                    getenv("DS4_QWEN4EXP_NO_GU_NATIVE_DMA") == NULL) {
+                    QWEN4EXP_GATEUP_MMA_NATIVE(DS4_QWEN4EXP_TY_q4_K,
+                                              DS4_QWEN4EXP_TY_q4_K,
+                                              true, 6, true);
+                } else {
+                    QWEN4EXP_GATEUP_MMA_D(DS4_QWEN4EXP_TY_q4_K,
+                                          DS4_QWEN4EXP_TY_q4_K,
+                                          QW_GATEUP_DMA_ARM);
+                }
             } else {
                 QWEN4EXP_GATEUP_MMA(DS4_QWEN4EXP_TY_q4_K,
                                     DS4_QWEN4EXP_TY_q4_K);
@@ -10512,6 +10493,7 @@ static int qwen4exp_routed_moe_cuda(
 #undef QWEN4EXP_GATEUP_MMA
 #undef QWEN4EXP_GATEUP_MMA_D
 #undef QWEN4EXP_GATEUP_MMA_IMPL
+#undef QWEN4EXP_GATEUP_MMA_NATIVE
     }
     /* The measured Q4 path for the R=2 tile (one-row decode and two-row
      * verify). qwen4exp_moe_tile already returns 2 for n_tokens <= 2, so the
@@ -10706,16 +10688,27 @@ static int qwen4exp_routed_moe_cuda(
          * loads; DS4_QWEN4EXP_NO_Q51_WIDE_LOAD restores the word loop. */
         const bool dn_wide6 =
             getenv("DS4_QWEN4EXP_NO_Q51_WIDE_LOAD") == NULL;
-#define QWEN4EXP_DOWN_MMA(DT, W6) \
-        qwen4exp_moe_down_mma_kernel<DT, W6><<< \
+#define QWEN4EXP_DOWN_MMA_NATIVE(DT, W6, NATIVE) \
+        qwen4exp_moe_down_mma_kernel<DT, W6, NATIVE><<< \
                 dim3(out_dim / QW_DOWN_MMA_BM, gu_rows, 1), \
                 QW_DOWN_MMA_THREADS, 0, stream>>>( \
                 (float *)down_partial->ptr, down, sc.mq, sc.ms, sc.msum, \
                 sc.pairs, sc.counts, sc.offsets, gu_active, \
                 down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
                 mgroups, out_dim, dn_dq_stage)
+#define QWEN4EXP_DOWN_MMA(DT, W6) QWEN4EXP_DOWN_MMA_NATIVE(DT, W6, false)
         if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q5_1) {
-            if (dn_wide6) {
+            const bool native_dq = DS4_QWEN4EXP_WIDE_PAYLOAD != 0 &&
+                dn_dq_stage && dn_wide6 &&
+                ((((uintptr_t)down) | (uintptr_t)down_slab->expert_bytes |
+                  (uintptr_t)down_slab->row_bytes) & 7u) == 0u &&
+                down_slab->row_bytes >= (uint64_t)mgroups * sizeof(cuda_block_q5_1) &&
+                down_slab->row_bytes != 0u &&
+                out_dim <= down_slab->expert_bytes / down_slab->row_bytes &&
+                getenv("DS4_QWEN4EXP_NO_DOWN_NATIVE_DQ") == NULL;
+            if (native_dq) {
+                QWEN4EXP_DOWN_MMA_NATIVE(DS4_QWEN4EXP_TY_q5_1, true, true);
+            } else if (dn_wide6) {
                 QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q5_1, true);
             } else {
                 QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q5_1, false);
@@ -10726,6 +10719,7 @@ static int qwen4exp_routed_moe_cuda(
             QWEN4EXP_DOWN_MMA(-1, false);
         }
 #undef QWEN4EXP_DOWN_MMA
+#undef QWEN4EXP_DOWN_MMA_NATIVE
         if (!cuda_ok(cudaGetLastError(), "qwen4exp MoE down tile launch")) return 0;
         if (getenv("DS4_QWEN4EXP_NO_COMBINE_GRID") == NULL) {
             qwen4exp_moe_down_combine_grid_kernel<<<

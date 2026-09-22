@@ -6667,7 +6667,7 @@ __global__ static void matmul_q8_hc_warp_pair_kernel(
  * reads (xq/xs, the silu kernel's output) and nothing else moves.  The
  * __syncthreads() that publishes the staged run is above the fence for the
  * same reason. */
-template<int R>
+template<int R, bool SharedWords=false>
 __global__ static void matmul_q8_hc_warp_pair_stage_kernel(
         float *out, const unsigned char *w,
         const int8_t *xq, const float *xs, uint64_t out_dim, uint32_t rows) {
@@ -6690,13 +6690,22 @@ __global__ static void matmul_q8_hc_warp_pair_stage_kernel(
         const unsigned char *blk = sw + rl * 340u + group * 34u;
         const unsigned char *payload = blk + 2u + half * 16u;
         const uintptr_t address = (uintptr_t)payload;
-        const unsigned shift = (address & 3u) * 8u;
+        const uint32_t shared_address = SharedWords ? (uint32_t)__cvta_generic_to_shared(payload) : 0u;
+        const unsigned shift = SharedWords ? (shared_address & 3u)*8u : (address & 3u)*8u;
         const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
-        uint32_t previous = words[0];
+        auto read_word = [&](unsigned j) {
+            if constexpr (SharedWords) {
+                uint32_t value;
+                asm volatile("ld.shared.u32 %0, [%1];" : "=r"(value)
+                    : "r"((shared_address & ~3u)+4u*j) : "memory");
+                return value;
+            } else return words[j];
+        };
+        uint32_t previous = read_word(0);
         int32_t wq[4];
 #pragma unroll
         for (int j = 0; j < 3; j++) {
-            const uint32_t next = words[j + 1];
+            const uint32_t next = read_word(j + 1);
             wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
             previous = next;
         }
@@ -18577,7 +18586,15 @@ static int cuda_matmul_q8_0_preq_rows_exact(
                  * shape and neither of which the kernel may assume. */
                 if (cuda_q8_hc_warp_pair_stage() &&
                     (((uintptr_t)wptr & 15u) == 0u) && ((out_dim & 3u) == 0u)) {
-                    QWEN4EXP_LAUNCH_PDL(
+                    if (n_rows == 2u &&
+                        getenv("DS4_QWEN4EXP_NO_HC_SHARED_WORDS") == NULL) {
+                        QWEN4EXP_LAUNCH_PDL(
+                            (matmul_q8_hc_warp_pair_stage_kernel<2,true>),
+                            (unsigned)((out_dim + 3u) / 4u), 128, 0,
+                            cuda_decode_stream(),
+                            (float *)out->ptr, (const unsigned char *)wptr,
+                            xq, xscale, out_dim, n_rows);
+                    } else QWEN4EXP_LAUNCH_PDL(
                             (matmul_q8_hc_warp_pair_stage_kernel<2>),
                             (unsigned)((out_dim + 3u) / 4u), 128, 0,
                             cuda_decode_stream(),
@@ -20506,7 +20523,7 @@ struct qwen_gdn_projection_args {
 #else
 #define QW_GDN_PROJ_ATTR __launch_bounds__(256)
 #endif
-template<int R, bool Stage=false>
+template<int R, bool Stage=false, bool NativeCopy=false>
 __global__ QW_GDN_PROJ_ATTR
 static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
     extern __shared__ uint4 qw_gdn_panel[];
@@ -20535,22 +20552,40 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
          * request so that read stays inside the allocation. */
         const uint64_t panel_bytes = (uint64_t)(B/64u) * blocks * 34u;
         const char *const gp = (const char *)w + (uint64_t)block * panel_bytes;
-        if (((uintptr_t)gp & 15u) == 0u) {
-            for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
-                 i += (uint64_t)B * 16u) {
-                if (i + 16u <= panel_bytes)
-                    *(uint4 *)(gpanel + i) = *(const uint4 *)(const void *)(gp + i);
-                else
-                    for (uint64_t j = i; j < panel_bytes; j++) gpanel[j] = gp[j];
-            }
+        if (NativeCopy && blocks == 80u && (((uintptr_t)gp & 15u) == 0u)) {
+            /* Native bytes only; retain the runtime arithmetic walk below. */
+            const unsigned t = threadIdx.x;
+            const uint4 *p = (const uint4 *)(const void *)gp;
+            uint4 *d = (uint4 *)(void *)gpanel;
+            const uint4 v0 = p[t];
+            const uint4 v1 = p[t+256u];
+            uint4 v2 = make_uint4(0,0,0,0);
+            if (t < 168u) v2 = p[t+512u];
+            /* Require every load in the batch before its shared stores. */
+            asm volatile("" :: "r"(v0.x),"r"(v0.y),"r"(v0.z),"r"(v0.w),
+                "r"(v1.x),"r"(v1.y),"r"(v1.z),"r"(v1.w),
+                "r"(v2.x),"r"(v2.y),"r"(v2.z),"r"(v2.w) : "memory");
+            d[t] = v0;
+            d[t+256u] = v1;
+            if (t < 168u) d[t+512u] = v2;
         } else {
-            for (uint64_t i = (uint64_t)threadIdx.x * 4u; i < panel_bytes;
-                 i += (uint64_t)B * 4u) {
-                if (i + 4u <= panel_bytes)
-                    *(uint32_t *)(gpanel + i) =
-                        *(const uint32_t *)(const void *)(gp + i);
-                else
-                    for (uint64_t j = i; j < panel_bytes; j++) gpanel[j] = gp[j];
+            if (((uintptr_t)gp & 15u) == 0u) {
+                for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
+                     i += (uint64_t)B * 16u) {
+                    if (i + 16u <= panel_bytes)
+                        *(uint4 *)(gpanel + i) = *(const uint4 *)(const void *)(gp + i);
+                    else
+                        for (uint64_t j = i; j < panel_bytes; j++) gpanel[j] = gp[j];
+                }
+            } else {
+                for (uint64_t i = (uint64_t)threadIdx.x * 4u; i < panel_bytes;
+                     i += (uint64_t)B * 4u) {
+                    if (i + 4u <= panel_bytes)
+                        *(uint32_t *)(gpanel + i) =
+                            *(const uint32_t *)(const void *)(gp + i);
+                    else
+                        for (uint64_t j = i; j < panel_bytes; j++) gpanel[j] = gp[j];
+                }
             }
         }
         /* The drain absorbs the fill; the barrier is nearly satisfied by the
@@ -21132,7 +21167,12 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
                 QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1>),
                                     grid, 256, 0, cuda_decode_stream(), a);
         } else {
-            if (gdn_stage)
+            if (gdn_stage && blocks == 80u &&
+                ((((uintptr_t)a.weights[0]|(uintptr_t)a.weights[1])&15u)==0u) &&
+                getenv("DS4_QWEN4EXP_NO_GDN_COPY_GROUP") == NULL)
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2,true,true>),
+                                    grid, 256, gdn_panel, cuda_decode_stream(), a);
+            else if (gdn_stage)
                 QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2,true>),
                                     grid, 256, gdn_panel, cuda_decode_stream(), a);
             else
