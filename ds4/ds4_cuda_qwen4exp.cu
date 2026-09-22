@@ -1,3 +1,6 @@
+/* gateup-down audit split (2026-09-22T20:00Z): this archive keeps the
+ * shared gate/up panel mechanism as an independent ranked measurement.
+ * The comment is provenance only and has no compiled effect. */
 /* redraw rx22532110 (2026-09-17T22:53:21Z): this archive repeats the official evaluation of the
  * same engine. The only textual difference from the previous evaluation
  * is this dated provenance comment. No behaviour changes. */
@@ -4315,7 +4318,6 @@ __global__ static void qwen4exp_moe_group_scan_parallel_kernel(
 /* build record 20260919T203222Z-5 */
 /* build record 20260920T112423Z-103 */
 /* build record 20260920T120351Z-108 */
-/* build record 20260921T160157Z-8 */
 __global__ static void qwen4exp_moe_pair_tasks_kernel(
         int32_t *tasks, const int32_t *counts, unsigned total,
         int32_t tile = 32, int32_t lo = 0, int32_t hi = 0x7fffffff) {
@@ -4372,6 +4374,11 @@ __global__ static void qwen4exp_moe_group_small_kernel(
         uint32_t mid_token_stride) {
     __shared__ int32_t warp_count_prefix[QWEN4EXP_MOE_SCAN_THREADS / 32];
     __shared__ int32_t warp_live_prefix[QWEN4EXP_MOE_SCAN_THREADS / 32];
+    /* Stage the short selected list once when it fits.  The ordinary decode
+     * envelope is at most 256 entries; larger externally supplied k values
+     * retain the original global path, so the public defensive contract is
+     * unchanged. */
+    __shared__ int32_t sh_selected[256];
     /* PDL consumer of the router's top-k, which triggers at its top.  This
      * kernel is one 512-thread block and its very first global read is
      * `selected`, the router's output, so there is no weight load to hoist
@@ -4396,13 +4403,16 @@ __global__ static void qwen4exp_moe_group_small_kernel(
         768u)
         QWEN4EXP_PDL_TRIGGER();
     const uint32_t e = threadIdx.x;
+    if (e < n_pairs && n_pairs <= 256u) sh_selected[e] = selected[e];
+    __syncthreads();
     const uint32_t lane = e & 31u;
     const uint32_t warp = e >> 5u;
 
     int32_t count = 0;
     if (e < n_expert) {
         for (uint32_t p = 0; p < n_pairs; p++) {
-            count += selected[p] == (int32_t)e;
+            const int32_t id = n_pairs <= 256u ? sh_selected[p] : selected[p];
+            count += id == (int32_t)e;
         }
         counts[e] = count;
     }
@@ -4458,7 +4468,8 @@ __global__ static void qwen4exp_moe_group_small_kernel(
         if (count > 0) active[live_prefix] = (int32_t)e;
         int32_t at = offset;
         for (uint32_t p = 0; p < n_pairs; p++) {
-            if (selected[p] == (int32_t)e) pairs[at++] = (int32_t)p;
+            const int32_t id = n_pairs <= 256u ? sh_selected[p] : selected[p];
+            if (id == (int32_t)e) pairs[at++] = (int32_t)p;
         }
     }
     if (e == 0u) {
@@ -4469,7 +4480,7 @@ __global__ static void qwen4exp_moe_group_small_kernel(
      * in the normal case; an invalid pair's one thread writes its short
      * intermediate row here. */
     if (e < n_pairs) {
-        const int32_t expert = selected[e];
+        const int32_t expert = n_pairs <= 256u ? sh_selected[e] : selected[e];
         if (expert < 0 || (uint32_t)expert >= n_expert) {
             const uint32_t token = e / n_expert_used;
             const uint32_t slot = e - token * n_expert_used;
@@ -4522,6 +4533,7 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
         uint32_t n_tokens) {
     __shared__ int32_t warp_count_prefix[QWEN4EXP_MOE_SCAN_THREADS / 32];
     __shared__ int32_t warp_live_prefix[QWEN4EXP_MOE_SCAN_THREADS / 32];
+    __shared__ int32_t sh_selected[256];
     /* Hoisted here from the grouping half: it has to precede the FIRST global
      * read of the fused kernel, which is now the router's `logits`.  A no-op
      * on the plain launch this kernel takes, correct if it is ever launched
@@ -4681,6 +4693,12 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
      * router warps' `selected` stores to every thread of the block before the
      * grouping half's first read of them. */
     __syncthreads();
+    /* The fused path is restricted to n_tokens < 8 and n_expert_used <= 32,
+     * hence n_pairs <= 224.  Cache the router result once for the two scans
+     * below instead of rereading the same short list from global memory. */
+    const uint32_t selected_tid = threadIdx.x;
+    if (selected_tid < n_pairs) sh_selected[selected_tid] = selected[selected_tid];
+    __syncthreads();
     /* PDL consumer of the router's top-k, which triggers at its top.  This
      * kernel is one 512-thread block and its very first global read is
      * `selected`, the router's output, so there is no weight load to hoist
@@ -4698,7 +4716,7 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
     int32_t count = 0;
     if (e < n_expert) {
         for (uint32_t p = 0; p < n_pairs; p++) {
-            count += selected[p] == (int32_t)e;
+            count += sh_selected[p] == (int32_t)e;
         }
         counts[e] = count;
     }
@@ -4754,7 +4772,7 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
         if (count > 0) active[live_prefix] = (int32_t)e;
         int32_t at = offset;
         for (uint32_t p = 0; p < n_pairs; p++) {
-            if (selected[p] == (int32_t)e) pairs[at++] = (int32_t)p;
+            if (sh_selected[p] == (int32_t)e) pairs[at++] = (int32_t)p;
         }
     }
     if (e == 0u) {
@@ -4765,7 +4783,7 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
      * in the normal case; an invalid pair's one thread writes its short
      * intermediate row here. */
     if (e < n_pairs) {
-        const int32_t expert = selected[e];
+        const int32_t expert = sh_selected[e];
         if (expert < 0 || (uint32_t)expert >= n_expert) {
             const uint32_t token = e / n_expert_used;
             const uint32_t slot = e - token * n_expert_used;
@@ -7519,7 +7537,45 @@ __global__ static void qwen4exp_moe_down_q_kernel(
 
 /* The shared expert: no routing, so the tile is consecutive tokens and the
  * decoded group serves all of them. */
-template <int R, int GateType = -1, int UpType = -1, bool Vector = false>
+/* Stage: the block's eight-row gate and up panels, copied once into shared
+ * memory with coalesced 16-byte loads, then decoded out of shared.
+ *
+ * The defect is the one the shared expert's DOWN projection already had fixed
+ * in this tree, at the one projection that fix does not cover.  groups is
+ * small at the checkpoint's shape, so the walk is a single step: `lane <
+ * groups` covers the whole row and the `lane + 32` remainder never runs.
+ * Each working lane then fetches its own group's payload out of TWO row slabs
+ * as several sub-word pieces strided by the group size, so one load
+ * instruction asks for a fistful of scattered four-byte pieces while the
+ * lanes past `groups` sit idle -- and it does that twice, once for gate and
+ * once for up.  Every byte is consumed, but the requests are strided and
+ * under-filled.  The eight rows a block owns are 8 * gate_row_bytes (and
+ * 8 * up_row_bytes) CONSECUTIVE bytes of the single shared-expert slabs, so
+ * the same bytes can be fetched as two dense bursts.
+ *
+ * Bit-exactness.  Each panel is a verbatim byte image of the span the block's
+ * own warps would have read individually; it is written by the block, read by
+ * the block, and dies with the block.  dev_qwen4exp_group_decode is called
+ * with the SAME (type, g) and a row pointer at the same offset within the
+ * panel, so it is character-identical source running on identical bytes, and
+ * the decoder is alignment-agnostic by construction -- it aligns the payload
+ * address down, derives `shift` from the low bits and funnel-shifts the
+ * logical bytes back out.  Accumulation order, the lane-to-group map, the
+ * sigmoid gate and the reduction tree are untouched.
+ *
+ * Fence order.  The fill issues weight loads that do not depend on the input
+ * quantizer, so it goes ABOVE the grid dependency sync and the barrier BELOW
+ * it; the drain then absorbs the fill instead of running after it.  Both
+ * hoisted calls sit at block scope after the kernel's only early return,
+ * which the host makes block-uniform by refusing this arm unless
+ * mid_dim % 8 == 0, and the staged arm skips the sync inside the walk, so a
+ * thread performs exactly one grid dependency sync either way.
+ *
+ * The host refuses the staged arm rather than truncating it when any of the
+ * alignment, the divisibility or the shared-memory budget does not hold, and
+ * DS4_QWEN4EXP_NO_SH_GATEUP_PANEL stands it down. */
+template <int R, int GateType = -1, int UpType = -1, bool Vector = false,
+          bool Stage = false>
 __global__ static void qwen4exp_shared_gateup_q_kernel(
         float *mid,
         const char *gate,
@@ -7540,8 +7596,39 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
     if (row >= mid_dim || tok0 >= n_tokens) return;
     const uint32_t take = n_tokens - tok0 < (uint32_t)R ? n_tokens - tok0
                                                         : (uint32_t)R;
-    const char *gate_row = gate + (uint64_t)row * gate_row_bytes;
-    const char *up_row = up + (uint64_t)row * up_row_bytes;
+    extern __shared__ uint4 qw_shgu_panel[];
+    char *const gpanel = (char *)qw_shgu_panel;
+    char *const upanel = gpanel + (uint64_t)8u * gate_row_bytes;
+    if (Stage) {
+        const uint64_t gbytes = (uint64_t)8u * gate_row_bytes;
+        const uint64_t ubytes = (uint64_t)8u * up_row_bytes;
+        const char *const gsrc =
+            gate + (uint64_t)(blockIdx.x * 8u) * gate_row_bytes;
+        const char *const usrc =
+            up + (uint64_t)(blockIdx.x * 8u) * up_row_bytes;
+        for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < gbytes;
+             i += (uint64_t)blockDim.x * 16u) {
+            if (i + 16u <= gbytes)
+                *(uint4 *)(gpanel + i) = *(const uint4 *)(const void *)(gsrc + i);
+            else
+                for (uint64_t j = i; j < gbytes; j++) gpanel[j] = gsrc[j];
+        }
+        for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < ubytes;
+             i += (uint64_t)blockDim.x * 16u) {
+            if (i + 16u <= ubytes)
+                *(uint4 *)(upanel + i) = *(const uint4 *)(const void *)(usrc + i);
+            else
+                for (uint64_t j = i; j < ubytes; j++) upanel[j] = usrc[j];
+        }
+        QWEN4EXP_PDL_SYNC();
+        __syncthreads();
+    }
+    const char *const gate_row = Stage
+        ? (const char *)(gpanel + (uint64_t)(threadIdx.x >> 5u) * gate_row_bytes)
+        : gate + (uint64_t)row * gate_row_bytes;
+    const char *const up_row = Stage
+        ? (const char *)(upanel + (uint64_t)(threadIdx.x >> 5u) * up_row_bytes)
+        : up + (uint64_t)row * up_row_bytes;
 
     float ag[R];
     float au[R];
@@ -7567,7 +7654,7 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
         dev_qwen4exp_group_decode(
                 UpType < 0 ? up_type : (uint32_t)UpType,
                 up_row, g, uw, ua, ub, &uh);
-        QWEN4EXP_PDL_SYNC();
+        if (!Stage) { QWEN4EXP_PDL_SYNC(); }
 #pragma unroll
         for (int r = 0; r < R; r++) {
             if ((uint32_t)r < take) {
@@ -11072,21 +11159,49 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
  * quantizes the input itself, that quantizer, which triggers too -- and the
  * kernel's weight-group prefetch rides that window
  * (ds4_cuda_qwen4exp.cuh).  Verify and prefill keep the plain launch. */
-#define QWEN4EXP_SH_GATEUP_IMPL(R, GT, UT, V) do { \
+    /* The staged gate/up panel (design note above the kernel).  Every
+     * condition the fill's uint4 copies and the kernel's single barrier rely
+     * on is checked here, once, before the launch: the early return is
+     * block-uniform only when mid_dim % 8 == 0, both panel spans must be
+     * 16-byte multiples over 16-byte aligned slab bases, and the two panels
+     * together must fit the block's shared-memory budget.  Anything short of
+     * that takes the shipped global-decode arm unchanged, and
+     * DS4_QWEN4EXP_NO_SH_GATEUP_PANEL stands the whole thing down. */
+    /* Gate/up owns a larger pair of panels than routed-down: at the
+     * checkpoint shape 8 * (2720 + 2720) = 43520 bytes, well inside the
+     * scored kernel's 101376-byte opt-in shared-memory budget. */
+    const uint64_t sh_gu_bytes =
+        (uint64_t)8u * (gate_slab->row_bytes + up_slab->row_bytes);
+    const int sh_gu_stage =
+        n_tokens <= 2u && (mid_dim % 8u) == 0u &&
+        (((uint64_t)8u * gate_slab->row_bytes) % 16u) == 0u &&
+        (((uint64_t)8u * up_slab->row_bytes) % 16u) == 0u &&
+        ((uintptr_t)gate & 15u) == 0u &&
+        ((uintptr_t)up & 15u) == 0u &&
+        sh_gu_bytes <= 65536u &&
+        getenv("DS4_QWEN4EXP_NO_SH_GATEUP_PANEL") == NULL;
+#define QWEN4EXP_SH_GATEUP_LAUNCH(R, GT, UT, V, S, SH) do { \
     if (n_tokens <= 2u) { \
         QWEN4EXP_LAUNCH_PDL( \
-                (qwen4exp_shared_gateup_q_kernel<R, GT, UT, V>), \
+                (qwen4exp_shared_gateup_q_kernel<R, GT, UT, V, S>), \
                 (dim3((mid_dim + 7u) / 8u, tiles, 1)), \
-                threads, 0, side, \
+                threads, (SH), side, \
                 (float *)mid->ptr, gate, up, xq, xs, xsum, \
                 gate_slab->row_bytes, up_slab->row_bytes, \
                 gate_slab->type, up_slab->type, xgroups, mid_dim, n_tokens); \
     } else { \
-        qwen4exp_shared_gateup_q_kernel<R, GT, UT, V> \
-            <<<dim3((mid_dim + 7u) / 8u, tiles, 1), threads, 0, side>>>( \
+        qwen4exp_shared_gateup_q_kernel<R, GT, UT, V, S> \
+            <<<dim3((mid_dim + 7u) / 8u, tiles, 1), threads, (SH), side>>>( \
                     (float *)mid->ptr, gate, up, xq, xs, xsum, \
                     gate_slab->row_bytes, up_slab->row_bytes, \
                     gate_slab->type, up_slab->type, xgroups, mid_dim, n_tokens); \
+    } \
+} while (0)
+#define QWEN4EXP_SH_GATEUP_IMPL(R, GT, UT, V) do { \
+    if (sh_gu_stage) { \
+        QWEN4EXP_SH_GATEUP_LAUNCH(R, GT, UT, V, true, (size_t)sh_gu_bytes); \
+    } else { \
+        QWEN4EXP_SH_GATEUP_LAUNCH(R, GT, UT, V, false, 0); \
     } \
 } while (0)
 #define QWEN4EXP_SH_GATEUP(R) do { \
@@ -11110,6 +11225,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
     else { QWEN4EXP_SH_GATEUP(1); }
 #undef QWEN4EXP_SH_GATEUP
 #undef QWEN4EXP_SH_GATEUP_IMPL
+#undef QWEN4EXP_SH_GATEUP_LAUNCH
     }
     if (!cuda_ok(cudaGetLastError(), "qwen4exp shared gate/up launch")) return 0;
 
@@ -18049,3 +18165,5 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
  * census shows produces a byte-identical capture log. */
 
 #define YUKON_REDRAW_10 10
+
+// Sep23 frontier stack trial: CvtC plus graph lead from ranked tree.
