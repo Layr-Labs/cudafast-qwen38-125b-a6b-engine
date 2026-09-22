@@ -3944,6 +3944,13 @@ __device__ __forceinline__ static float dev_qwen4exp_block_sum(
 /* The checkpoint asks for ten of at most 512 experts.  One warp can read that
  * envelope as sixteen coalesced rows, keep them in registers, and select the
  * small top-k without sorting the 502 entries the model will discard. */
+/* QWEN4EXP_ROUTER_RANK0_MAX (default 1): the native router softmaxes below
+ * take their maximum from the rank-0 selection instead of rescanning every
+ * selected logit on lane 0 (reasoning at the fused router's copy).  0
+ * restores the scan in both kernels. */
+#ifndef QWEN4EXP_ROUTER_RANK0_MAX
+#define QWEN4EXP_ROUTER_RANK0_MAX 1
+#endif
 template<bool Native>
 __global__ static void qwen4exp_router_select_topk_kernel(
         int32_t *selected,
@@ -4026,6 +4033,14 @@ __global__ static void qwen4exp_router_select_topk_kernel(
     }
 
     if (Native) {
+#if QWEN4EXP_ROUTER_RANK0_MAX
+        /* Rank 0 is the arg-max of the admissible logits and later ranks
+         * never exceed it, so the scan below would stop at lg[sel[0]]. */
+        __syncwarp();
+        const float lv = lane < n_expert_used ? lg[(uint32_t)sel[lane]] : 0.0f;
+        const float m = __shfl_sync(0xffffffffu, lv, 0u);
+        const float e = lane < n_expert_used ? expf(lv - m) : 0.0f;
+#else
         float m = -FLT_MAX;
         if (lane == 0u) {
             for (uint32_t i = 0; i < n_expert_used; i++) {
@@ -4039,6 +4054,7 @@ __global__ static void qwen4exp_router_select_topk_kernel(
         __syncwarp();
         const float e = lane < n_expert_used
                 ? expf(lg[(uint32_t)sel[lane]] - m) : 0.0f;
+#endif
         float sum = 0.0f;
         for (uint32_t i = 0; i < n_expert_used; i++) {
             const float term = __shfl_sync(0xffffffffu, e, i);
@@ -4503,6 +4519,7 @@ __global__ static void qwen4exp_moe_group_small_kernel(
  * its token is threadIdx.x >> 5 where it was blockIdx.x, and every warp
  * intrinsic already uses the full mask and stays inside its own warp.
  */
+/* See QWEN4EXP_ROUTER_RANK0_MAX above qwen4exp_router_select_topk_kernel. */
 template<bool Native, bool KeyMax = false>
 __global__ static void qwen4exp_moe_router_group_small_kernel(
         int32_t *counts,
@@ -4672,6 +4689,25 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
     }
 
     if (Native) {
+#if QWEN4EXP_ROUTER_RANK0_MAX
+        /* RANK-0 MAXIMUM.  The loop above emits experts by repeated
+         * arg-max over the remaining live set, so sel[0] holds the largest
+         * admissible logit and every later rank is <= it (NaN and -inf are
+         * never admitted; +0 and -0 rank equal and the earlier stays
+         * first).  The serial scan it replaces -- m = -FLT_MAX, then
+         * `if (v > m) m = v` over sel[0..k) -- therefore stops at exactly
+         * lg[sel[0]]: the first term is > -FLT_MAX or equal to it, and no
+         * later term is strictly greater.  Each lane now loads its own
+         * selected logit once, lane 0's copy is broadcast as m, and the
+         * exponent reuses the loaded value.  Same m, same differences, same
+         * expf, same serial sum below: every weight is the same bits.  What
+         * goes is lane 0's chain of n_expert_used dependent sel -> logit
+         * round trips ahead of the whole softmax. */
+        __syncwarp();
+        const float lv = lane < n_expert_used ? lg[(uint32_t)sel[lane]] : 0.0f;
+        const float m = __shfl_sync(0xffffffffu, lv, 0u);
+        const float e = lane < n_expert_used ? expf(lv - m) : 0.0f;
+#else
         float m = -FLT_MAX;
         if (lane == 0u) {
             for (uint32_t i = 0; i < n_expert_used; i++) {
@@ -4685,6 +4721,7 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
         __syncwarp();
         const float e = lane < n_expert_used
                 ? expf(lg[(uint32_t)sel[lane]] - m) : 0.0f;
+#endif
         float sum = 0.0f;
         for (uint32_t i = 0; i < n_expert_used; i++) {
             const float term = __shfl_sync(0xffffffffu, e, i);
