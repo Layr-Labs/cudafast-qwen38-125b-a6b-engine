@@ -20,12 +20,17 @@ old=old[old.index('{')+1:old.rindex('}')]
 new=new[new.index('{')+1:new.rindex('}')]
 old=old.replace('    const float decay_coeff = n_tokens ? a_log[head] : 0.0f;\n    const float bias = n_tokens ? dt_bias[head] : 0.0f;\n','')
 old=old.replace('g = expf(decay_coeff * qwen4exp_gdn_softplus(raw_alpha[gate] + bias));\n                beta = qwen4exp_gdn_sigmoid(raw_beta[gate]);','const float2 pair = gate_pairs[gate];\n                g = pair.x; beta = pair.y;')
+new=re.sub(r'    /\* The prefix remains.*?\n    }\n','',new,flags=re.S)
 assert old==new, 'scalar replay changed beyond current gate source'
+fixed=body('__device__ __forceinline__ static void qwen4exp_gdn_replay_gates_fixed(')
+fixed=fixed[fixed.index('{')+1:fixed.rindex('}')]
+fixed=fixed.replace('    constexpr uint32_t prefix = Prefix;\n    constexpr uint32_t n_tokens = 2u;','    const uint32_t prefix = control ? *control : replay_rows;').replace('#pragma unroll\n','')
+assert fixed==new, 'fixed-prefix recurrence changed beyond loop specialization'
 api=body('static int qwen4exp_cuda_gdn_run(')
 # Only launch syntax is translated; arguments and branch/error control stay real.
 api,n=re.subn(r'(qwen4exp_\w+)(?:<[^>]+>)?<<<.*?>>>(\s*)\(',lambda m:'spy("'+m[1]+'", ',api,flags=re.S)
-assert n==13,n
-helper=body('static int qwen4exp_replay_gate_disjoint(')
+assert n==15,n
+helper=body('static int qwen4exp_replay_gate_disjoint(')+'\n'+body('static uint64_t qwen4exp_gdn_conv_side_elements(')
 source=r'''
 #include <cassert>
 #include <cstdint>

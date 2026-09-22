@@ -11,9 +11,10 @@ def body(name):
   if ';' in s[m.end():b]:continue
   e=b+1;d=1
   while d:d+=(s[e]=='{')-(s[e]=='}');e+=1
-  return s[a:e]
+  template = 'template <uint32_t Prefix>\n' if name == 'qwen4exp_gdn_replay_gates_fixed' else 'template <bool Specialize = false>\n' if name == 'qwen4exp_gdn_replay_gates_kernel' else ''
+  return template + s[a:e]
  raise AssertionError(name)
-names=['warp_sum_f32','warp_sum_all_f32','dot4_f32','qwen4exp_gdn_silu','qwen4exp_gdn_sigmoid','qwen4exp_gdn_softplus','qwen4exp_q8_ftz','qwen4exp_q8_rcp_approx','qwen4exp_gdn_conv_kernel','qwen4exp_gdn_conv_replay_gates_kernel','qwen4exp_gdn_replay_kernel','qwen4exp_gdn_replay_gates_kernel','qwen4exp_gdn_output_kernel','qwen4exp_gdn_output_quant_kernel']
+names=['warp_sum_f32','warp_sum_all_f32','dot4_f32','qwen4exp_gdn_silu','qwen4exp_gdn_sigmoid','qwen4exp_gdn_softplus','qwen4exp_q8_ftz','qwen4exp_q8_rcp_approx','qwen4exp_gdn_conv_kernel','qwen4exp_gdn_conv_replay_gates_kernel','qwen4exp_gdn_replay_kernel','qwen4exp_gdn_replay_gates_fixed','qwen4exp_gdn_replay_gates_kernel','qwen4exp_gdn_output_kernel','qwen4exp_gdn_output_quant_kernel']
 source=r'''
 #include <cuda_runtime.h>
 #include <cmath>
@@ -27,6 +28,7 @@ source=r'''
 #define QWEN4EXP_GDN_HISTORY 3u
 #define DS4_QWEN4EXP_GDN_REPLAY_ROWS 2u
 #define QWEN4EXP_Q8_RCP127 0x1.020408p-7f
+#define QWEN4EXP_PDL_TRIGGER() ((void)0)
 #define CK(x) do{auto e=(x);if(e!=cudaSuccess){fprintf(stderr,"CUDA %s:%d\n",cudaGetErrorString(e),__LINE__);exit(1);}}while(0)
 '''+ '\n'.join(body(n) for n in names)+r'''
 struct B{
@@ -61,7 +63,7 @@ int main(){std::mt19937 r(650031);unsigned eager=0,replays=0;cudaStream_t st;CK(
   qwen4exp_gdn_conv_kernel<<<dim3(2*nk+nv,1),128,0,st>>>(q0.d(),h0.d(),cw.d(),ss0.d(),nk,nv,1,2,1,1e-6f,adopt);
   qwen4exp_gdn_conv_replay_gates_kernel<<<dim3(2*nk+nv,1),128,0,st>>>(q1.d(),h1.d(),cw.d(),ss1.d(),nk,nv,1,2,1,1e-6f,adopt,(float2*)pairs.d(),alpha.d(),beta.d(),coeff.d(),bias.d());
   qwen4exp_gdn_replay_kernel<<<dim3(nv,32),128,0,st>>>(o0.d(),s0.d(),c0.d(),t0.d(),q0.d(),alpha.d(),beta.d(),coeff.d(),bias.d(),nk,nv,2,layout,control,0);
-  qwen4exp_gdn_replay_gates_kernel<<<dim3(nv,32),128,0,st>>>(o1.d(),s1.d(),c1.d(),t1.d(),q1.d(),alpha.d(),beta.d(),(float2*)pairs.d(),nk,nv,2,layout,control,0);
+  qwen4exp_gdn_replay_gates_kernel<true><<<dim3(nv,32),128,0,st>>>(o1.d(),s1.d(),c1.d(),t1.d(),q1.d(),alpha.d(),beta.d(),(float2*)pairs.d(),nk,nv,2,layout,control,0);
   if(quant){
    qwen4exp_gdn_output_quant_kernel<<<dim3(2,nv),128,0,st>>>((int8_t*)z0.d(),sc0.d(),o0.d(),gate.d(),norm.d(),nv,2,1e-6f);
    qwen4exp_gdn_output_quant_kernel<<<dim3(2,nv),128,0,st>>>((int8_t*)z1.d(),sc1.d(),o1.d(),gate.d(),norm.d(),nv,2,1e-6f);
