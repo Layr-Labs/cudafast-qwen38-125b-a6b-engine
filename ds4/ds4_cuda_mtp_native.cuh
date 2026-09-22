@@ -4,8 +4,19 @@
  * use ordinary stream ordering, not PDL: refinement reads freshly sorted IDs. */
 /* Refinement shortlist. 276 tail rows plus id 0 hold mandatory slots, so this
  * leaves 1771 score-selected candidates: the top 1.8% of the coarse ranking.
- * Narrowing it is a proposal-policy change, not an exact one. */
-static constexpr uint32_t MTP_NATIVE_CAP = 2048u;
+ * Narrowing it is a proposal-policy change, not an exact one.
+ *
+ * MLXFAST-DRAFT8K: 2048 -> 8192. The draft token is the argmax of this
+ * shortlist, so every round whose true head-argmax falls outside the
+ * shortlist drafts suboptimally and pays a full target pass for 1 token
+ * instead of 2. Ranked evidence (submission a8d3e9b: 49/78 accepted, mean
+ * draft len 1.62) leaves 37% of rounds on the table; each acceptance point
+ * is ~0.6% decode. The draft chain is ~50 us/round against a ~26 ms target
+ * pass, so a 4x wider shortlist costs noise and buys recall. Target-side
+ * recall needed a 16384-wide net for exactness; the draft ran 8x narrower
+ * with no recall measurement. Verification stays exact, so outputs are
+ * unchanged whatever the draft proposes. */
+static constexpr uint32_t MTP_NATIVE_CAP = 8192u;
 static constexpr uint32_t MTP_NATIVE_DIM = 2560u;
 /* Coarse screen depth; full refinement still uses 80 groups. Pairs 24..31 sit
  * out, and the live_pairs mask already names a partial wave (40 groups left the
