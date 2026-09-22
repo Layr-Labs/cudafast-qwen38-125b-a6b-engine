@@ -15638,14 +15638,21 @@ __global__ static void __launch_bounds__(256, 2) qwen4exp_qsa3_attention_group_k
         __syncthreads();
     }
     if (!scorer) {
+        /* The two channels a valuer thread owns are `2*vt` and `2*vt + 1` of
+         * the same head row, so their stores are adjacent and the pair is
+         * eight-byte aligned (head_dim is even and 2*vt is even).  One
+         * vector store retires them together instead of two scalar stores
+         * into the same sector.  Same values, same addresses, same guard --
+         * each channel still divides the accumulator it always divided, by
+         * the same run sum, under the same positivity test. */
 #pragma unroll
-        for (uint32_t c = 0; c < CPT; c++)
-#pragma unroll
-            for (uint32_t h = 0; h < GROUP; h++) {
-                const float rs = st_runsum[h];
-                dst[h * head_dim + 2u * vt + c] =
-                    (rs > 0.0f) ? acc[c][h] / rs : 0.0f;
-            }
+        for (uint32_t h = 0; h < GROUP; h++) {
+            const float rs = st_runsum[h];
+            const bool live = rs > 0.0f;
+            const float2 o = make_float2(live ? acc[0][h] / rs : 0.0f,
+                                         live ? acc[1][h] / rs : 0.0f);
+            *(float2 *)(dst + h * head_dim + 2u * vt) = o;
+        }
     }
 }
 
