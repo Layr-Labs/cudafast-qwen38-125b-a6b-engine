@@ -134,6 +134,99 @@ __global__ static void mtp_native_projection_kernel(
     }
 }
 
+/* Exact two-list refinement. A row in both sorted shortlists is evaluated
+ * once with two independent activation/dot accumulators. Row-zero owns shared
+ * IDs; row-one handles only IDs absent from row-zero. No weight copy, altered
+ * shortlist, floating-point reassociation, or cross-token reduction is used. */
+__global__ static void mtp_native_projection2_refine_kernel(
+        float *out, const unsigned char *w, const int8_t *xq,
+        const float *xscale, uint32_t cap, const uint32_t *ids, uint32_t vocab) {
+    constexpr uint32_t blocks = MTP_NATIVE_DIM / 32u;
+    const uint32_t local_row = threadIdx.x >> 6u;
+    const uint32_t local_lane = threadIdx.x & 63u;
+    const uint32_t group = local_lane >> 1u, half = local_lane & 1u;
+    const uint32_t row = blockIdx.x * 4u + local_row;
+    const uint32_t side = row >= cap ? 1u : 0u;
+    const uint32_t id = row < 2u * cap ? ids[row] : vocab;
+    __shared__ uint32_t partners[4];
+    if (!local_lane) {
+        const uint32_t *other = ids + (1u - side) * cap;
+        uint32_t lo = 0u, hi = cap;
+        while (lo < hi) {
+            const uint32_t mid = lo + (hi - lo) / 2u;
+            if (other[mid] < id) lo = mid + 1u;
+            else hi = mid;
+        }
+        partners[local_row] = lo < cap && other[lo] == id ? lo : cap;
+    }
+    __syncthreads();
+    const uint32_t partner = partners[local_row];
+    const bool valid = row < 2u * cap && id < vocab && (!side || partner == cap);
+    const uint32_t take = !side && partner < cap ? 2u : 1u;
+    float acc[2] = {0.0f, 0.0f};
+    if (valid) {
+        const unsigned char *wr = w + (uint64_t)id * blocks * 34u;
+        for (uint32_t b = group; b < blocks; b += 32u) {
+            const uint32_t warp_base = b - (group & 15u);
+            const uint32_t remaining = blocks - warp_base;
+            const uint32_t live_pairs = remaining < 16u ? remaining : 16u;
+            const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
+            const int8_t *payload = (const int8_t *)(wr + b * 34u + 2u) + half * 16u;
+            const uintptr_t address = (uintptr_t)payload;
+            const uint32_t shift = (uint32_t)(address & 3u) * 8u;
+            const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
+            uint32_t previous = words[0];
+            int32_t wq[4];
+#pragma unroll
+            for (int j = 0; j < 3; ++j) {
+                const uint32_t next = words[j + 1];
+                wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
+                previous = next;
+            }
+            const uint16_t last = *(const uint16_t *)(const void *)(payload + 14);
+            wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
+            const float ws = __half2float(*(const __half *)(wr + b * 34u));
+#pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                if ((uint32_t)r < take) {
+                    const uint32_t at = (side + (uint32_t)r) * blocks + b;
+                    const int32_t *xw = (const int32_t *)(xq + at * 32u + half * 16u);
+                    int dot = 0;
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) dot = __dp4a(wq[j], xw[j], dot);
+                    dot += __shfl_xor_sync(active, dot, 1);
+                    if (!half) acc[r] += ws * xscale[at] * (float)dot;
+                }
+            }
+        }
+    }
+    __shared__ float partial[2][4][32];
+    if (!half) {
+#pragma unroll
+        for (int r = 0; r < 2; ++r) partial[r][local_row][group] = acc[r];
+    }
+    __syncthreads();
+    if (local_lane < 32u) {
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            if ((uint32_t)r < take) {
+                const float total = warp_sum_f32(partial[r][local_row][local_lane]);
+                if (!local_lane && valid)
+                    out[r == 0 ? row : cap + partner] = total;
+            }
+        }
+    }
+}
+
+static int mtp_native_refine_pair_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_MTP_NATIVE_REFINE_PAIR");
+        cached = e != nullptr && e[0] == '0' ? 0 : 1;
+    }
+    return cached;
+}
+
 /* ===================================================================
  * SINGLE-KERNEL TOP-K RADIX-SELECT  (valve: DS4_MTP_NATIVE_SELECT)
  * ===================================================================
@@ -845,6 +938,15 @@ extern "C" int ds4_gpu_mtp_native_screen2(ds4_gpu_tensor *out,
     int id_bits = 1;
     while (id_bits < 32 && ((uint32_t)1u << id_bits) < vocab) id_bits++;
     if (id_bits > 32) id_bits = 32;
+    /* Both lists must be complete before the paired projection. The old first
+     * projection wrote only out; require disjoint ranges before moving it past
+     * the second selection, which reuses scratch but not out. */
+    const bool paired_refine = mtp_native_refine_pair_enabled() && fuse_keys &&
+        mtp_native_key_range_disjoint(out->ptr, out->bytes, scratch->ptr, scratch->bytes) &&
+        mtp_native_key_range_disjoint(out->ptr, out->bytes, ids->ptr, ids->bytes) &&
+        mtp_native_key_range_disjoint(out->ptr, out->bytes, x->ptr, x->bytes) &&
+        mtp_native_key_range_disjoint(out->ptr, out->bytes, w, (uint64_t)vocab * 80u * 34u) &&
+        mtp_native_key_range_disjoint(ids->ptr, ids->bytes, w, (uint64_t)vocab * 80u * 34u);
     for (uint32_t r = 0; r < 2u; r++) {
         size_t temporary = (size_t)(scratch->bytes - l.temporary);
         uint64_t *kin = key_in + (uint64_t)r * width;
@@ -879,15 +981,26 @@ extern "C" int ds4_gpu_mtp_native_screen2(ds4_gpu_tensor *out,
                 MTP_TARGET_NATIVE_CAP,
                 0, id_bits, cuda_decode_stream()),
                 "native R2 original-ID sort")) return -1;
-        mtp_native_projection_kernel<false><<<
-            (MTP_TARGET_NATIVE_CAP + 3u) / 4u, 256, 0,
+        if (!paired_refine) {
+            mtp_native_projection_kernel<false><<<
+                (MTP_TARGET_NATIVE_CAP + 3u) / 4u, 256, 0,
+                cuda_decode_stream()>>>(
+                (float *)out->ptr + (uint64_t)r * MTP_TARGET_NATIVE_CAP,
+                (const unsigned char *)w,
+                xq + (uint64_t)r * MTP_NATIVE_DIM,
+                xs + (uint64_t)r * (MTP_NATIVE_DIM / 32u),
+                MTP_TARGET_NATIVE_CAP, iout, vocab, prefix, tail);
+            if (!cuda_ok(cudaGetLastError(), "native R2 exact refinement"))
+                return -1;
+        }
+    }
+    if (paired_refine) {
+        mtp_native_projection2_refine_kernel<<<
+            (2u * MTP_TARGET_NATIVE_CAP + 3u) / 4u, 256, 0,
             cuda_decode_stream()>>>(
-            (float *)out->ptr + (uint64_t)r * MTP_TARGET_NATIVE_CAP,
-            (const unsigned char *)w,
-            xq + (uint64_t)r * MTP_NATIVE_DIM,
-            xs + (uint64_t)r * (MTP_NATIVE_DIM / 32u),
-            MTP_TARGET_NATIVE_CAP, iout, vocab, prefix, tail);
-        if (!cuda_ok(cudaGetLastError(), "native R2 exact refinement"))
+            (float *)out->ptr, (const unsigned char *)w, xq, xs,
+            MTP_TARGET_NATIVE_CAP, (const uint32_t *)ids->ptr, vocab);
+        if (!cuda_ok(cudaGetLastError(), "native R2 paired exact refinement"))
             return -1;
     }
     return (int)MTP_TARGET_NATIVE_CAP;
