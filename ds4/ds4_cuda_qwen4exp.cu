@@ -58,6 +58,8 @@
 #include "ds4_qwen4exp_hc_types.h"
 #include "ds4_qwen4exp_qsa_scratch.h"
 
+#define DS4_QWEN4EXP_REDRAW_STAMP_20260922T0900 1
+
 #define CUDA_QK_K 256
 
 /* ------------------------------------------------------------------
