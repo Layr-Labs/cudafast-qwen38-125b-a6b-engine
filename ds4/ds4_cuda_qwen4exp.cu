@@ -11858,14 +11858,22 @@ __global__ static void qwen4exp_gdn_output_quant_kernel(
     const uint64_t base = (uint64_t)token * value_dim +
         head * QWEN4EXP_GDN_DIM;
     const float raw = out[base + tid];
+    /* The two per-lane operands the epilogue needs -- this channel's norm
+     * weight and its output gate -- depend on nothing the reduction produces,
+     * so they are issued here, before the barrier, and land while the block
+     * is stalled on it instead of after it.  The four warp partials are then
+     * read straight out of shared memory in the butterfly's own order,
+     * ((p0 + p1) + (p2 + p3)), which is bit for bit what the five-step
+     * all-reduce over the four live lanes and twenty-eight zeros produced,
+     * without the five shuffles or the lane predicate that fed it. */
+    const float norm_w = output_norm[tid];
+    const float gate_v = qwen4exp_gdn_sigmoid(output_gate[base + tid]);
     float total = warp_sum_f32(raw * raw);
     if (lane == 0u) partial[warp] = total;
     __syncthreads();
-    total = lane < 4u ? partial[lane] : 0.0f;
-    total = warp_sum_all_f32(total);
+    total = (partial[0] + partial[1]) + (partial[2] + partial[3]);
     const float scale = rsqrtf(total / (float)QWEN4EXP_GDN_DIM + norm_eps);
-    const float v = raw * scale * output_norm[tid] *
-        qwen4exp_gdn_sigmoid(output_gate[base + tid]);
+    const float v = raw * scale * norm_w * gate_v;
     const float vz = qwen4exp_q8_ftz(v);
     float a = qwen4exp_q8_ftz(fabsf(v));
 #pragma unroll
