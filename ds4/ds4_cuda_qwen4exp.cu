@@ -11501,6 +11501,17 @@ __global__ static void qwen4exp_hc_inject_kernel(
 
     const uint64_t i = ((uint64_t)t * n_hc + h) * n_embd + d;
     const uint64_t bi = (uint64_t)t * n_embd + d;
+    /* Every operand of this element is known from (t, h, d) alone, yet the
+     * parent discovered them in dependency order: the block row, then the
+     * shared expert's gate and reduction under a branch, then the residual
+     * and the per-stream inject scalar inside the stored expression.  The
+     * kernel is one fused multiply-add deep, so there is no arithmetic to
+     * hide any of those round trips behind, and the later loads are issued
+     * only after the earlier ones have landed.  Naming all of them first
+     * lets the four independent reads go out together and the element
+     * completes one latency after the slowest, not after their sum. */
+    const float res = residual[i];
+    const float inj = inject[(uint64_t)t * n_hc + h];
     float blk = block[bi];
     /* The shared expert's down projection rode the fork stream and left its
      * UNSCALED reduction in shexp_tot; this is the accumulate that kernel used
@@ -11509,7 +11520,7 @@ __global__ static void qwen4exp_hc_inject_kernel(
      * so `blk` here equals what the in-place accumulate left in block_out.
      * Null pointer, and this is the shipped kernel. */
     if (shexp_tot) blk += shexp_gate[t] * shexp_tot[bi];
-    out[i] = residual[i] + blk * inject[(uint64_t)t * n_hc + h];
+    out[i] = res + blk * inj;
 }
 
 
@@ -18049,3 +18060,5 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
  * census shows produces a byte-identical capture log. */
 
 #define YUKON_REDRAW_10 10
+#define GAUNTLET_REDRAW_e5967727_20260921T210816Z 1
+#define GAUNTLET_REDRAW_3bc8b952_20260922T025931Z 1
