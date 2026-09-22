@@ -15569,6 +15569,45 @@ __global__ static void __launch_bounds__(256, 2) qwen4exp_qsa3_attention_group_k
              * key serves both chains. */
             const float *vbase = v_cache + (uint64_t)kv_head * head_dim + 2u * vt;
             uint32_t j = 0;
+            /* ---- L2 PREFETCH AHEAD OF THE VALUE GATHER ----
+             *
+             * The valuer half of this kernel is a pure gather: for every key
+             * slot it pulls one eight-byte pair out of the value cache at
+             * `kj[u] * kv_stride`, a stride of n_kv_head * head_dim floats,
+             * so consecutive slots land in different cache lines and each
+             * load is its own memory transaction.  The dependent chain is
+             * short -- the loads feed the FMA block immediately below them --
+             * so with a tile of scattered rows the warp spends the tile
+             * exposed to gather latency rather than issuing.
+             *
+             * The keys for the NEXT step of this loop are already known: the
+             * scorer half published the whole tile's key slots into shared
+             * memory before the barrier above, and this loop walks them in
+             * order.  Their value rows can therefore be pulled towards L2
+             * one step early, while the current step's FMAs run.  A prefetch
+             * moves nothing into a register and nothing into shared memory;
+             * it only asks that the line be resident when the real load
+             * issues, one step later, from the same address.
+             *
+             * Exactness is structural.  `prefetch.global.L2` has no
+             * destination operand and no side effect on program state: it
+             * cannot fault (an unmapped address is dropped), it does not
+             * order or observe any access, and every value the kernel
+             * computes still comes from the same float2 load at the same
+             * address in the same order.  The addresses prefetched are the
+             * addresses the next step's guarded loads will use, and the guard
+             * is re-tested there, so a negative key still contributes the
+             * zero pair it contributed before.
+             *
+             * The prefetch is issued only when a full next step exists, so
+             * the loop's tail and the scalar remainder below are untouched,
+             * and it is skipped for negative keys, which have no row.
+             *
+             * Kill switch: -DQWEN4EXP_QSA3_VPREFETCH=0 removes the block and
+             * restores the shipped gather instruction for instruction. */
+#ifndef QWEN4EXP_QSA3_VPREFETCH
+#define QWEN4EXP_QSA3_VPREFETCH 1
+#endif
             for (; j + QWEN4EXP_QSA3_VSTEP <= n_in_tile; j += QWEN4EXP_QSA3_VSTEP) {
                 int32_t kj[QWEN4EXP_QSA3_VSTEP]; float vv[CPT][QWEN4EXP_QSA3_VSTEP];
 #pragma unroll
@@ -15581,6 +15620,20 @@ __global__ static void __launch_bounds__(256, 2) qwen4exp_qsa3_attention_group_k
                     vv[0][u] = v2.x;
                     vv[1][u] = v2.y;
                 }
+#if QWEN4EXP_QSA3_VPREFETCH
+                if (j + 2u * QWEN4EXP_QSA3_VSTEP <= n_in_tile) {
+#pragma unroll
+                    for (uint32_t u = 0; u < QWEN4EXP_QSA3_VSTEP; u++) {
+                        const int32_t kn = keys[j + QWEN4EXP_QSA3_VSTEP + u];
+                        if (kn >= 0) {
+                            const float *const pp =
+                                vbase + (uint64_t)kn * kv_stride;
+                            asm volatile("prefetch.global.L2 [%0];"
+                                         :: "l"(pp) : "memory");
+                        }
+                    }
+                }
+#endif
 #pragma unroll
                 for (uint32_t h = 0; h < GROUP; h++) {
 #pragma unroll
