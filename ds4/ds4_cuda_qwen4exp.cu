@@ -617,6 +617,7 @@ __device__ __forceinline__ static float qwen4exp_gdn_softplus(float x) {
  * end; a negative value means the work is already hidden and there is
  * nothing to win.
  */
+template <bool ONE_TOKEN>
 __global__ static void qwen4exp_gdn_conv_kernel(
         float       *qkv,
         float       *conv_state,
@@ -690,12 +691,15 @@ __global__ static void qwen4exp_gdn_conv_kernel(
          * A thread only ever reads and writes its own channel, so the two are
          * different elements -- but they travel through one pointer, so the
          * read has to come first in program order to be issued first, and the
-         * memory latency then hides behind the reduction below.  The last
-         * token re-reads its own element, which is still the raw value at
-         * this point and is thrown away. */
-        const uint64_t ahead =
-            index + (token + 1u < n_tokens ? conv_dim : 0u);
-        const float raw_next = qkv[ahead];
+         * memory latency then hides behind the reduction below.  The one-token
+         * decode has no next input, so its compile-time arm avoids re-reading
+         * the element that this iteration is about to overwrite. */
+        float raw_next = raw;
+        if constexpr (!ONE_TOKEN) {
+            const uint64_t ahead =
+                index + (token + 1u < n_tokens ? conv_dim : 0u);
+            raw_next = qkv[ahead];
+        }
 
         /* The window as it stands AFTER this token, which is what a rollback
          * to length token + 1 needs.  Written before the key/value branch
@@ -2843,12 +2847,21 @@ static int qwen4exp_cuda_gdn_run(
                 (const float *)raw_alpha->ptr, (const float *)raw_beta->ptr,
                 a_log, dt_bias);
     } else {
-        qwen4exp_gdn_conv_kernel<<<dim3(blocks, n_rows, 1u),
-                                   QWEN4EXP_GDN_DIM, 0, stream>>>(
-                (float *)qkv->ptr, (float *)conv_state->ptr, conv_weight,
-                conv_snapshot ? (float *)conv_snapshot->ptr : NULL,
-                n_key_head, n_value_head, n_rows, n_tokens, n_snapshot_rows,
-                qk_norm_eps, adopt_row);
+        if (n_tokens == 1u) {
+            qwen4exp_gdn_conv_kernel<true><<<dim3(blocks, n_rows, 1u),
+                                              QWEN4EXP_GDN_DIM, 0, stream>>>(
+                    (float *)qkv->ptr, (float *)conv_state->ptr, conv_weight,
+                    conv_snapshot ? (float *)conv_snapshot->ptr : NULL,
+                    n_key_head, n_value_head, n_rows, n_tokens, n_snapshot_rows,
+                    qk_norm_eps, adopt_row);
+        } else {
+            qwen4exp_gdn_conv_kernel<false><<<dim3(blocks, n_rows, 1u),
+                                               QWEN4EXP_GDN_DIM, 0, stream>>>(
+                    (float *)qkv->ptr, (float *)conv_state->ptr, conv_weight,
+                    conv_snapshot ? (float *)conv_snapshot->ptr : NULL,
+                    n_key_head, n_value_head, n_rows, n_tokens, n_snapshot_rows,
+                    qk_norm_eps, adopt_row);
+        }
     }
     if (!cuda_ok(cudaGetLastError(), "qwen4exp GDN convolution launch")) {
         return 0;
