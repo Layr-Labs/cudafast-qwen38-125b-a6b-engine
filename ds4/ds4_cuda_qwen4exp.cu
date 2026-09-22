@@ -15380,6 +15380,61 @@ __device__ __forceinline__ static void qwen4exp_qsa3_score_tile(
                 : (k_cache + (uint64_t)(live[s] ? key[s] : 0) * kv_stride
                            + (uint64_t)kv_head * head_dim);
         }
+        /* ---- WHOLE-ROW L2 PREFETCH AHEAD OF THE SCORE WALK ----
+         *
+         * Each scorer thread owns KPT key slots, and for each it holds the
+         * base of that key's cache row in `kv[s]`.  The dot-product walk
+         * below then consumes that row a KSTEP chunk at a time.  `words` is
+         * head_dim / 4 and head_dim is a runtime kernel argument, so the `w`
+         * loop is NOT fully unrolled: each iteration issues its own float4
+         * loads and the FMA block immediately below consumes them.  A key row
+         * is 4 * head_dim bytes -- several cache lines -- and under a sparse
+         * or long key set those lines are cold, so the walk pays a miss per
+         * chunk, serialised behind the arithmetic of the chunk before it.
+         * The memory-level parallelism available to the warp is whatever one
+         * iteration issues, not what the row is worth.
+         *
+         * Every one of those addresses is known here, before the first
+         * chunk: `kv[s]` is already computed, the row is contiguous in the
+         * non-tape layout, and its length is `words * 16` bytes.  Asking for
+         * the whole row at 128-byte granularity turns a chain of per-chunk
+         * misses into one burst issued while the first chunk's arithmetic
+         * runs.
+         *
+         * Restricted to the non-tape layout by a compile-time test: the tape
+         * layout spreads one key's dimensions across a stride, so there is no
+         * contiguous row to ask for and the shipping tape instantiation is
+         * untouched.  Dead slots (`live[s]` false) point at row 0 and are
+         * skipped, so no address is touched that the walk does not touch.
+         *
+         * Exactness.  `prefetch.global.L2` has no destination operand, cannot
+         * fault, establishes no ordering and observes none.  Every value the
+         * scorer computes still comes from the same float4 load at the same
+         * address in the same order, folded by the same __fmaf_rn chain into
+         * the same accumulator; no float is re-associated and no slot-to-key
+         * map changes.  The only difference in the generated code is a set of
+         * instructions whose whole semantics is a hint to the cache.
+         *
+         * Kill switch: -DQWEN4EXP_QSA3_KPREFETCH=0 removes the block and
+         * restores the shipped walk instruction for instruction. */
+#ifndef QWEN4EXP_QSA3_KPREFETCH
+#define QWEN4EXP_QSA3_KPREFETCH 1
+#endif
+#if QWEN4EXP_QSA3_KPREFETCH
+        if (!TAPE) {
+            const uint32_t row_bytes = (head_dim >> 2u) * 16u;
+#pragma unroll
+            for (uint32_t s = 0; s < KPT; s++) {
+                if (live[s]) {
+                    for (uint32_t off = 0; off < row_bytes; off += 128u) {
+                        const float *const pp = kv[s] + (off >> 2u);
+                        asm volatile("prefetch.global.L2 [%0];"
+                                     :: "l"(pp) : "memory");
+                    }
+                }
+            }
+        }
+#endif
         float dot[KPT][GROUP];
 #pragma unroll
         for (uint32_t s = 0; s < KPT; s++)
@@ -18049,3 +18104,4 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
  * census shows produces a byte-identical capture log. */
 
 #define YUKON_REDRAW_10 10
+#define GAUNTLET_REDRAW_aa1d16be_20260922T111554Z 1
