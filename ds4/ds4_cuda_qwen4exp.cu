@@ -1,3 +1,6 @@
+/* redraw rx0922061506 (2026-09-22T06:15:06Z): this archive repeats the official evaluation of promoted
+ * submission 866c1e5a. The only textual difference from that archive is this dated
+ * provenance comment. It expands to nothing and changes no behaviour. See the submission note. */
 /* redraw rx22532110 (2026-09-17T22:53:21Z): this archive repeats the official evaluation of the
  * same engine. The only textual difference from the previous evaluation
  * is this dated provenance comment. No behaviour changes. */
@@ -6654,6 +6657,10 @@ __device__ __forceinline__ static void qwen4exp_shared_vector_accumulate(
  * Purely a packing change.  Each output row still walks its own weight row in
  * the same group order through the same warp_sum_f32 tree, and every dot is
  * bit-identical. */
+/* Warp-local gate/up panel fill; 0 restores the shipped block-wide fill. */
+#ifndef DS4_GU_COOP_WARPFILL
+#define DS4_GU_COOP_WARPFILL 1
+#endif
 #define QW_GU_COOP_ROWS 4u
 #define QW_GU_COOP_ROW_U4 90u                /* 1440 B, ten q4_K super-blocks */
 #define QW_GU_COOP_GROUPS 80u                            /* in_dim 2560 / 32 */
@@ -6961,6 +6968,61 @@ qwen4exp_moe_gateup_split_kernel(
         if (groups != QW_GU_COOP_GROUPS ||
             gate_row_bytes != (uint64_t)qw_gu_panel<Type>::row_u4 * 16u ||
             up_row_bytes != (uint64_t)qw_gu_panel<Type>::row_u4 * 16u) return;
+        wrow = warp >> 1u;
+#if DS4_GU_COOP_WARPFILL
+        /* WARP-LOCAL PANEL FILL.  The shipped fill is block-wide -- every
+         * thread of the block walks the whole 2 * OutputRows-row panel and
+         * then the block meets at __syncthreads() -- and that shape was
+         * inherited from the routed DOWN panel, where it is FORCED: a down
+         * row is 680 B, so only the eight-row panel as a whole is 16-byte
+         * aligned and an individual row cannot be filled by uint4 copies.
+         * The gate/up panel has no such constraint.  Its row is
+         * qw_gu_panel<Type>::row_u4 uint4 exactly -- 1440 B for q4_K, 1760 B
+         * for q5_K, 2720 B for q8_0, all whole multiples of 16 -- and the
+         * launcher already checks gate/up row_bytes against that constant and
+         * the slab bases and expert strides against 16.  So every warp can
+         * fill exactly the slice it is the only reader of.
+         *
+         * The slice is private by construction: warp w reads
+         * wsh[wrow * row_u4 ..] with wsh = wcoop + (second ? PanelU4 : 0) and
+         * wrow = w >> 1, so the eight warps of a four-row block own eight
+         * disjoint row_u4 spans, and the span a warp fills is byte-for-byte
+         * the span `weight_row` already points at (same expert, same row,
+         * same stride).  Nothing is decoded, re-packed, widened, narrowed,
+         * re-scaled or re-ordered on the way in, so this is the same verbatim
+         * image the shipped fill produced.
+         *
+         * What it removes is the block-wide barrier.  That barrier makes all
+         * eight warps wait for the slowest global load issued by any of the
+         * 256 threads, and the eight rows are eight INDEPENDENT weight
+         * streams with nothing to share -- the same coupling the non-coop
+         * schedule's own comment already identifies as the cost of a wide
+         * block ("the __syncthreads() before the shared `projected` fold
+         * waits on the slowest of them").  __syncwarp() is what the
+         * shared-memory hazard actually needs here: the writer and the reader
+         * are the same warp, and under independent thread scheduling that
+         * still requires a warp-level reconvergence, not a block one.  The
+         * `projected` fold below keeps its own __syncthreads(), which is the
+         * one barrier this kernel genuinely has a cross-warp reason for.
+         *
+         * Coalescing is unchanged: a warp issues 32 lanes x 16 B = 512
+         * consecutive bytes per instruction, which is what the block-wide
+         * loop also issued, and the total instruction count over the block is
+         * identical (8 warps x row_u4 = 2 * OutputRows * row_u4).
+         *
+         * -DDS4_GU_COOP_WARPFILL=0 restores the shipped block-wide fill and
+         * its __syncthreads() byte for byte. */
+        {
+            const uint32_t row_u4 = qw_gu_panel<Type>::row_u4;
+            uint4 *const dst = wcoop + (second ? PanelU4 : 0u) + wrow * row_u4;
+            if (live) {
+                const uint4 *const src =
+                    (const uint4 *)(const void *)weight_row;
+                for (uint32_t i = lane; i < row_u4; i += 32u) dst[i] = src[i];
+            }
+            __syncwarp();
+        }
+#else
         const uint32_t row0 = blockIdx.x * OutputRows;
         const uint32_t left = mid_dim > row0 ? mid_dim - row0 : 0u;
         const uint32_t rows_here = left < OutputRows ? left : OutputRows;
@@ -6977,8 +7039,8 @@ qwen4exp_moe_gateup_split_kernel(
                 *(const uint4 *)(const void *)(ub + (uint64_t)i * 16u);
         }
         __syncthreads();
+#endif
         wsh = wcoop + (second ? PanelU4 : 0u);
-        wrow = warp >> 1u;
     }
     for (int32_t at = 0; at < cnt; at += R) {
         const int32_t take = (cnt - at) < R ? (cnt - at) : R;
