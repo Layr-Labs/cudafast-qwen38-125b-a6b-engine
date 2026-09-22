@@ -7685,17 +7685,67 @@ __global__ static void qwen4exp_shared_down_q_kernel(
                                                         : (uint32_t)R;
     extern __shared__ uint4 qw_shdown_panel[];
     char *const spanel = (char *)qw_shdown_panel;
+    /* ---- THE SHARED-EXPERT DOWN PANEL IS FILLED WITHOUT REGISTERS ----
+     *
+     * The fill below copies the block's eight-row weight panel into shared
+     * memory.  As shipped it does that the long way: a global load into a
+     * register pair, then a shared store out of it, per sixteen bytes.  Every
+     * one of those copies occupies a register for the whole of its memory
+     * latency, and the block cannot pass its barrier until the last of them
+     * has landed in a register AND been written out again.
+     *
+     * The routed down tile in this same file does not do that.  It fills its
+     * panel with `qw_cpasync16` -- cp.async, the direct global-to-shared copy
+     * that never touches a register -- commits the group, and waits for it.
+     * The shared expert's panel is the same shape of work (one dense span of
+     * one weight slab, sixteen bytes per thread per step, consumed after one
+     * barrier) and it is the only staged fill in the file still doing it
+     * through registers.
+     *
+     * This routes it through the same helper.  The copies are issued, the
+     * group is committed, and the wait sits immediately before the barrier
+     * that already published the panel -- so the PDL drain and the copy
+     * latency overlap, exactly as the routed tile arranged, instead of the
+     * copies being held in registers across it.
+     *
+     * Exactness.  cp.async moves the same sixteen bytes from the same global
+     * address to the same shared address.  It is a copy instruction, not an
+     * arithmetic one: no value is converted, no order of any float changes,
+     * and the panel the walk reads below is the same byte image it read
+     * before.  Completion is established by the commit/wait pair before the
+     * __syncthreads() that already separated the fill from its readers, so
+     * every byte is visible to every reader exactly as it was.  The byte-wise
+     * tail for a span that is not a multiple of sixteen keeps its plain
+     * stores, and those are ordered by the same barrier.
+     *
+     * Kill switch: -DQWEN4EXP_SHDOWN_CPASYNC=0 restores the shipped
+     * register-staged copy loop. */
+#ifndef QWEN4EXP_SHDOWN_CPASYNC
+#define QWEN4EXP_SHDOWN_CPASYNC 1
+#endif
     if (Stage) {
         const uint64_t panel_bytes = (uint64_t)8u * down_row_bytes;
         const char *const gp = down + (uint64_t)(blockIdx.x * 8u) * down_row_bytes;
         for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
              i += (uint64_t)blockDim.x * 16u) {
-            if (i + 16u <= panel_bytes)
+            if (i + 16u <= panel_bytes) {
+#if QWEN4EXP_SHDOWN_CPASYNC
+                qw_cpasync16(
+                    (uint32_t)__cvta_generic_to_shared(spanel + i), gp + i);
+#else
                 *(uint4 *)(spanel + i) = *(const uint4 *)(const void *)(gp + i);
-            else
+#endif
+            } else {
                 for (uint64_t j = i; j < panel_bytes; j++) spanel[j] = gp[j];
+            }
         }
+#if QWEN4EXP_SHDOWN_CPASYNC
+        qw_cpasync_commit();
+#endif
         QWEN4EXP_PDL_SYNC();
+#if QWEN4EXP_SHDOWN_CPASYNC
+        qw_cpasync_wait0();
+#endif
         __syncthreads();
     }
     const char *down_row = Stage
