@@ -7430,6 +7430,89 @@ __global__ static void qwen4exp_moe_down_q_kernel(
             }
         }
     };
+    /* ---- DUPLICATE-EXPERT PANEL DEDUPE (staged routed down) ----
+     *
+     * At the decode widths this kernel runs the staged arm with R == 2: one
+     * block owns eight consecutive output rows and walks the flat
+     * (slot, token) step sequence, staging one eight-row weight panel per
+     * step.  A panel is 8 * down_row_bytes, and it is pulled from global
+     * memory on every one of the twenty steps a block takes per layer.
+     *
+     * The two tokens of a decode tile are adjacent positions of one stream
+     * (the committed token and the speculative one), and the router scores
+     * them from neighbouring hidden states.  A substantial fraction of the
+     * (slot, token) steps therefore names the SAME expert as the step before
+     * it: `selected[t*K + s]` and `selected[(t+1)*K + s]` agree.  When they
+     * do, that step's fill copies, byte for byte, the panel the block is
+     * already holding in its other shared buffer -- a whole redundant panel
+     * of global traffic and a whole redundant cp.async group, spent to
+     * reproduce data that is already resident.
+     *
+     * This is the one place in the routed MoE where the weight stream has
+     * genuine short-range reuse, because it is the only place two tokens that
+     * share a router decision are resident in one block at one time.  The
+     * dedupe is a traffic mechanism, not a cache hint: the redundant load is
+     * never issued.
+     *
+     * Schedule.  The shipped code addressed the two buffers by step parity.
+     * Parity cannot express "the next step reuses this buffer", so the buffer
+     * index becomes explicit state, `cur`.  Every step still reads `cur` and
+     * every prefetch still writes `1 - cur`; when the next step's expert
+     * equals this step's, the prefetch is skipped and `cur` carries forward.
+     * At take == 2 with no duplicates the sequence is 0,1,0,1,... -- exactly
+     * the parity the tree shipped -- so the non-duplicate schedule is
+     * unchanged.
+     *
+     * Hazard.  Writes only ever target `1 - cur`.  Its last readers are steps
+     * strictly before this one, and the __syncthreads() at the top of this
+     * step retired them; a buffer skipped by a duplicate step has no readers
+     * at all.  A duplicate step issues no cp.async group, so its
+     * qw_cpasync_wait0() waits on nothing, and the following step's fill is
+     * still issued ahead of that step's arithmetic.
+     *
+     * Block uniformity.  The duplicate predicate is built from `selected`
+     * alone, through the same warp broadcast of `route[]` the shipped fill
+     * used, so it does not depend on `row`, on the lane or on the warp.
+     * Every lane of the block computes the same `cur`, takes the same branch
+     * and reaches the same barrier the same number of times.  `take` is
+     * block-uniform for the reason the shipped comment gives, so the step
+     * count is too.  The compute guard replaces the old `continue` with an
+     * `if` so that the buffer state is advanced on every step, invalid routes
+     * included.
+     *
+     * Exactness.  A duplicate step reads a panel holding the same bytes the
+     * skipped fill would have written -- same expert, same eight rows, same
+     * slab -- so dev_qwen4exp_group_decode sees identical weights, the
+     * activation operands are untouched, and acc[r] still absorbs slots
+     * 0..K-1 in ascending order with every float added in the same sequence.
+     * No value, no address and no accumulation order changes; only a load
+     * that would have re-fetched resident bytes is not performed.  An
+     * out-of-range expert is excluded from the predicate, so an invalid route
+     * fills and skips exactly as before.
+     *
+     * Kill switch: -DQWEN4EXP_DOWN_DUP_PANEL=0 makes the predicate constant
+     * false and the buffer state degenerates to the shipped parity walk with
+     * a fill on every step. */
+#ifndef QWEN4EXP_DOWN_DUP_PANEL
+#define QWEN4EXP_DOWN_DUP_PANEL 1
+#endif
+    /* The route of (token rr, slot sl), by the same rule the compute step
+     * uses.  `rr` is a runtime value, so the register array is indexed by an
+     * unrolled compare rather than dynamically (a dynamic index would spill
+     * route[] to local memory).  Called only with rr < take. */
+    auto qw_route_of = [&](uint32_t rr, uint32_t sl) -> int32_t {
+        int32_t v = -1;
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            if ((uint32_t)r == rr) {
+                v = Vector ? __shfl_sync(0xffffffffu, route[r], sl)
+                           : selected[(uint64_t)(tok0 + (uint32_t)r) *
+                                          n_expert_used + sl];
+            }
+        }
+        return v;
+    };
+
     if (Stage) {
         qw_fill_step(0u, 0u, spanel);
         if (Async) qw_cpasync_commit();
@@ -7454,11 +7537,14 @@ __global__ static void qwen4exp_moe_down_q_kernel(
      * rule).  On a plain launch the fence is a no-op, which is what verify,
      * prefill and the stood-down valve take. */
     QWEN4EXP_PDL_SYNC();
+    uint32_t cur = 0u;
     for (uint32_t slot = 0; slot < n_expert_used; slot++) {
 #pragma unroll
         for (int r = 0; r < R; r++) {
             if ((uint32_t)r < take) {
-                const uint32_t step = slot * take + (uint32_t)r;
+                const uint32_t t = tok0 + (uint32_t)r;
+                const int32_t e = qw_route_of((uint32_t)r, slot);
+                uint32_t nxt = cur;
                 if (Stage) {
                     /* Each lane waits for its own copies, then the block
                      * publishes the complete panel. The other buffer's next
@@ -7473,37 +7559,44 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                     const uint32_t nslot =
                         (uint32_t)r + 1u < take ? slot : slot + 1u;
                     if (nslot < n_expert_used) {
-                        qw_fill_step(nslot, nr, spanel +
-                                     (uint64_t)((step + 1u) & 1u) * panel_bytes);
-                        if (Async) qw_cpasync_commit();
+                        const int32_t en = qw_route_of(nr, nslot);
+                        const bool dup = QWEN4EXP_DOWN_DUP_PANEL &&
+                            en == e && e >= 0 &&
+                            (uint32_t)e < n_total_expert;
+                        if (!dup) {
+                            nxt = 1u - cur;
+                            qw_fill_step(nslot, nr, spanel +
+                                         (uint64_t)nxt * panel_bytes);
+                            if (Async) qw_cpasync_commit();
+                        }
                     }
                 }
-                const uint32_t t = tok0 + (uint32_t)r;
-                const int32_t e = Vector ? __shfl_sync(0xffffffffu, route[r], slot)
-                    : selected[(uint64_t)t * n_expert_used + slot];
-                if (e < 0 || (uint32_t)e >= n_total_expert) continue;
-                const char *const drow = Stage
-                    ? spanel + (uint64_t)(step & 1u) * panel_bytes +
-                      (uint64_t)(row - row0) * down_row_bytes
-                    : down + (uint64_t)(uint32_t)e * down_expert_bytes +
-                      (uint64_t)row * down_row_bytes;
-                const uint64_t mrow = (uint64_t)t * n_expert_used + slot;
-                for (uint32_t g = lane; g < groups; g += 32u) {
-                    int8_t wq[32];
-                    float wa[2], wb[2];
-                    int halves = 1;
-                    dev_qwen4exp_group_decode(
-                            DownType < 0 ? down_type : (uint32_t)DownType,
-                            drow, g, wq, wa, wb, &halves);
-                    const uint64_t at_g = mrow * groups + g;
-                    if (Vector && halves == 1)
-                        qwen4exp_shared_vector_accumulate(&acc[r], wq, wa[0], wb[0],
-                            mq + at_g * 32u, ms[at_g], msum[at_g]);
-                    else
-                        qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves,
-                                                  mq + at_g * 32u, ms[at_g],
-                                                  msum[at_g]);
+                if (e >= 0 && (uint32_t)e < n_total_expert) {
+                    const char *const drow = Stage
+                        ? spanel + (uint64_t)cur * panel_bytes +
+                          (uint64_t)(row - row0) * down_row_bytes
+                        : down + (uint64_t)(uint32_t)e * down_expert_bytes +
+                          (uint64_t)row * down_row_bytes;
+                    const uint64_t mrow = (uint64_t)t * n_expert_used + slot;
+                    for (uint32_t g = lane; g < groups; g += 32u) {
+                        int8_t wq[32];
+                        float wa[2], wb[2];
+                        int halves = 1;
+                        dev_qwen4exp_group_decode(
+                                DownType < 0 ? down_type : (uint32_t)DownType,
+                                drow, g, wq, wa, wb, &halves);
+                        const uint64_t at_g = mrow * groups + g;
+                        if (Vector && halves == 1)
+                            qwen4exp_shared_vector_accumulate(&acc[r], wq,
+                                wa[0], wb[0], mq + at_g * 32u, ms[at_g],
+                                msum[at_g]);
+                        else
+                            qwen4exp_group_accumulate(&acc[r], wq, wa, wb,
+                                                      halves, mq + at_g * 32u,
+                                                      ms[at_g], msum[at_g]);
+                    }
                 }
+                cur = nxt;
             }
         }
     }
