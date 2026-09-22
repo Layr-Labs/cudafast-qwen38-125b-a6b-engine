@@ -37,6 +37,11 @@
  * ds4_rocm.cu duplicates them for the ROCm backend.
  */
 
+/* Independent ranked re-measurement of this engine: the macro below is an
+ * inert provenance token. It is never referenced; translation-unit content
+ * is otherwise byte-identical to the promoted tree. */
+#define GAUNTLET_REDRAW_20260922_F9C47F0 1
+
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
