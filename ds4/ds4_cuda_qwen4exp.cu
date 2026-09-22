@@ -1067,24 +1067,25 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
         const float v_row = qkv[slot * conv_dim + 2u * (uint64_t)key_dim +
             head * QWEN4EXP_GDN_DIM + value];
         const uint64_t gate = slot * n_value_head + head;
-        float g = 0.0f;
-        float beta = 0.0f;
+        float g;
+        float beta;
         if (PRECOMPUTED_GATES) {
             const float2 pair = gate_pairs[gate];
             g = pair.x;
             beta = pair.y;
         } else {
             /* Every lane in a warp advances adjacent columns of the same
-             * value row with the same token/head gates.  Evaluate the pair
-             * once and broadcast it without a block barrier, which keeps the
-             * short decode and speculative-verify path inexpensive. */
-            if (lane == 0u) {
-                g = expf(decay_coeff *
-                    qwen4exp_gdn_softplus(raw_alpha[gate] + bias));
-                beta = qwen4exp_gdn_sigmoid(raw_beta[gate]);
-            }
-            g = __shfl_sync(0xffffffffu, g, 0);
-            beta = __shfl_sync(0xffffffffu, beta, 0);
+             * value row with the same token/head gates.  Under a lane == 0
+             * guard the warp issues the softplus, the exponential and the
+             * sigmoid anyway, predicated off in thirty-one lanes, and then
+             * pays two dependent broadcasts before the recurrence may start.
+             * Evaluating the pair unpredicated in every lane is the same
+             * expression over the same two values -- both reads are the same
+             * address for the whole warp, so each is one broadcast
+             * transaction -- and it retires the two shuffles. */
+            g = expf(decay_coeff *
+                qwen4exp_gdn_softplus(raw_alpha[gate] + bias));
+            beta = qwen4exp_gdn_sigmoid(raw_beta[gate]);
         }
 
         h.x *= g;
