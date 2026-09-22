@@ -11377,8 +11377,34 @@ __global__ static void qwen4exp_rms_norm_kernel(
     const uint32_t tid = threadIdx.x;
     const uint32_t steps = (group > tid) ? ((group - tid + nth - 1u) / nth) : 0u;
 
+    /* THE FIRST CHUNK IS CARRIED ACROSS THE REDUCTION.  The normalise walk
+     * below re-reads exactly the rows the sum walk just read, and it also
+     * reads the weight row, which the sum does not need at all and which
+     * depends on nothing the reduction produces.  Both of those reads sit
+     * behind the block sum's barrier, where the kernel has nothing left to
+     * cover them.  One chunk's worth of each is held in registers instead:
+     * the weight chunk's loads are issued before the reduction so they fly
+     * under it, and the value chunk is reused rather than re-fetched.  The
+     * accumulation order, the walk order and every stored expression are the
+     * ones the two-pass form had. */
     float sum = 0.0f;
     uint32_t s = 0;
+    float xv0[QWEN4EXP_RMS_STEPS];
+    float wv0[QWEN4EXP_RMS_STEPS];
+    const bool carry = QWEN4EXP_RMS_STEPS <= steps;
+    if (carry) {
+#pragma unroll
+        for (uint32_t u = 0; u < QWEN4EXP_RMS_STEPS; u++) {
+            xv0[u] = xg[tid + u * nth];
+        }
+#pragma unroll
+        for (uint32_t u = 0; u < QWEN4EXP_RMS_STEPS; u++) {
+            wv0[u] = wg[tid + u * nth];
+        }
+#pragma unroll
+        for (uint32_t u = 0; u < QWEN4EXP_RMS_STEPS; u++) sum += xv0[u] * xv0[u];
+        s = QWEN4EXP_RMS_STEPS;
+    }
     for (; s + QWEN4EXP_RMS_STEPS <= steps; s += QWEN4EXP_RMS_STEPS) {
         float xv[QWEN4EXP_RMS_STEPS];
 #pragma unroll
@@ -11400,6 +11426,15 @@ __global__ static void qwen4exp_rms_norm_kernel(
     const float scale = 1.0f / sqrtf(total / (float)group + eps);
 
     s = 0;
+    if (carry) {
+#pragma unroll
+        for (uint32_t u = 0; u < QWEN4EXP_RMS_STEPS; u++) {
+            float normed = xv0[u] * scale;
+            if (round_bf16) normed = qwen4exp_round_bf16(normed);
+            yg[tid + u * nth] = normed * (weight_bias + wv0[u]);
+        }
+        s = QWEN4EXP_RMS_STEPS;
+    }
     for (; s + QWEN4EXP_RMS_STEPS <= steps; s += QWEN4EXP_RMS_STEPS) {
         float xv[QWEN4EXP_RMS_STEPS];
         float wv[QWEN4EXP_RMS_STEPS];
