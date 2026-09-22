@@ -34,6 +34,17 @@ static constexpr uint32_t MTP_NATIVE_SCREEN_GROUPS = 24u;
 static constexpr uint32_t MTP_TARGET_NATIVE_CAP = 16384u;
 static constexpr uint32_t MTP_TARGET_NATIVE_SCREEN_GROUPS = 24u;
 static constexpr uint32_t MTP_NATIVE_MAX_WIDTH = 1u << 20;
+/* ONE WARP PER VOCABULARY ROW.  Both projection kernels used to split a row
+ * across a 64-lane group, two lanes per Q8_0 block, and then reduce the 32
+ * per-block floats through shared memory behind a __syncthreads().  One lane
+ * per block instead keeps the same block -> reduction-slot mapping (lane b
+ * holds block b's term, exactly where partial[..][b] held it) while deleting
+ * the pair shuffle, the shared array, the barrier, and the per-visit live-pair
+ * mask -- and it halves the warps a row costs, so a 256-thread block now
+ * carries EIGHT rows instead of four.  See the block comment on
+ * mtp_native_projection_kernel for why this is bit-exact. */
+static constexpr uint32_t MTP_NATIVE_ROWS_PER_BLOCK = 8u;
+static constexpr uint32_t MTP_NATIVE_PROJ_THREADS = 32u * MTP_NATIVE_ROWS_PER_BLOCK;
 template <bool Screen, bool EmitKeys = false>
 __global__ static void mtp_native_projection_kernel(
         float *out, const unsigned char *w,
@@ -41,17 +52,39 @@ __global__ static void mtp_native_projection_kernel(
         uint32_t out_dim,
         const uint32_t *ids, uint32_t n_vocab, uint32_t prefix, uint32_t tail,
         uint64_t *keys = nullptr, uint32_t *invalid = nullptr) {
-    /* All three private launches follow the DIM=2560, one-row guard. */
+    /* All three private launches follow the DIM=2560, one-row guard.
+     *
+     * ONE WARP PER ROW, ONE LANE PER Q8_0 BLOCK.  This used to be one 64-lane
+     * group per row with two lanes per block, each lane taking 16 of the 32
+     * payload bytes and the pair closing with __shfl_xor_sync(active, dot, 1).
+     * Why the wider lane is bit-exact, term by term:
+     *
+     *   - `dot` is an int32 accumulated only by __dp4a.  Integer addition is
+     *     exact and associative, and |dot| <= 32 * 127 * 127 = 516128, nowhere
+     *     near overflow, so summing all eight words in one lane gives exactly
+     *     the int the two half-lanes used to produce and add.
+     *   - `acc[r] += ws * xscale[at] * (float)dot` is the only float
+     *     arithmetic, and it is unchanged: same ws, same xscale, same dot, and
+     *     the same per-lane visit order b, b+32, b+64 that `group` gave, so a
+     *     lane that accumulates several blocks adds them in the same order.
+     *   - the reduction slot is preserved, which is the part that actually
+     *     constrains this.  warp_sum_f32 is a fixed __shfl_down_sync tree over
+     *     lanes 0..31, and lane b now holds the float that partial[r][.][b]
+     *     used to hold.  Lanes with no block keep acc = 0.0f, exactly as the
+     *     idle groups 24..31 used to store 0.0f.  So the float summation order
+     *     is identical, not merely equivalent.
+     *
+     * What goes away: the shared partial[] round trip, the __syncthreads(), the
+     * per-visit warp_base/remaining/live_pairs/active mask, and one shuffle per
+     * block visit -- and a row now costs one warp instead of two. */
     constexpr uint64_t blocks = MTP_NATIVE_DIM / 32u;
     constexpr int R = 1;
     constexpr bool Streaming = false;
     const uint64_t work_blocks = Screen ? MTP_NATIVE_SCREEN_GROUPS : blocks;
-    const uint32_t local_row = threadIdx.x >> 6u;
-    const uint32_t local_lane = threadIdx.x & 63u;
-    const uint32_t group = local_lane >> 1u;
-    const uint32_t half = local_lane & 1u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
     /* Width <= 2^20; byte addressing is widened separately below. */
-    const uint32_t row = blockIdx.x * 4u + local_row;
+    const uint32_t row = blockIdx.x * MTP_NATIVE_ROWS_PER_BLOCK + warp;
     constexpr uint32_t row0 = 0u;
     constexpr uint32_t take = 1u;
     float acc[R];
@@ -63,30 +96,77 @@ __global__ static void mtp_native_projection_kernel(
     const bool valid = row < out_dim && weight_row < n_vocab;
     if (valid) {
         const unsigned char *wr = w + (uint64_t)weight_row * blocks * 34u;
-        for (uint64_t b = group; b < work_blocks; b += 32u) {
-            /* Name both lanes of every live pair even if independent
-             * scheduling has temporarily separated their execution. */
-            const uint64_t warp_base = b - (uint64_t)(group & 15u);
-            const uint64_t remaining = work_blocks - warp_base;
-            const uint32_t live_pairs = (uint32_t)(remaining < 16u ? remaining : 16u);
-            const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
-            const int8_t *payload = (const int8_t *)(wr + b * 34u + 2u) + half * 16u;
+        for (uint64_t b = lane; b < work_blocks; b += 32u) {
+            const int8_t *payload = (const int8_t *)(wr + b * 34u + 2u);
             const uintptr_t address = (uintptr_t)payload;
             const uint32_t shift = (uint32_t)(address & 3u) * 8u;
-            const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
-            /* Weights stream through each projection once. Mark their reads
-             * evict-first while leaving the reusable activation loads alone. */
-            uint32_t previous = Streaming ? __ldcs(words) : words[0];
-            int32_t wq[4];
+            int32_t wq[8];
+            /* The 32-byte payload assembled from FIVE 8-byte loads instead of
+             * nine 4-byte ones: a 40-byte window covers every alignment the
+             * 34-byte stride can produce, so the same nine words remain the
+             * operands of the same eight funnel shifts.
+             *
+             * `w` is 2-byte aligned and both the 34-byte stride and the `+2`
+             * are even, so `o = address & 7` is one of {0,2,4,6}.  Let
+             * `q = o >> 2`.  Because `address & ~3 == (address & ~7) + 4q`,
+             * loading W[0..9] from `address & ~7` puts the old `words[k]` at
+             * exactly `W[q + k]`.  The old code needed `words[0..8]`, i.e.
+             * `W[q .. q+8]`, and `q <= 1`, so W[0..9] is enough and never more.
+             *
+             * The old tail read a `uint16_t` at `payload + 30` as the high
+             * operand of `wq[7]`.  That is the low half of `W[q+8]`, and at
+             * shift 16 `__funnelshift_r` consumes only that low half (at
+             * shift 0 it consumes none of it).  So `wq[7]` is bit-identical.
+             *
+             * Bounds: the window is [base, base+40) with base = address & ~7.
+             * It runs at most 8 bytes past the payload, which lands inside the
+             * NEXT Q8_0 block -- except at the last block of the last row.  It
+             * starts at most 4 bytes before `wr`, which lands inside the
+             * PREVIOUS row -- except at block 0 of row 0.  Those two blocks
+             * take the original nine-word path, kept verbatim below. */
+            if ((weight_row != 0u || b != 0u) &&
+                (weight_row + 1u < n_vocab || b + 1u < blocks)) {
+                const uint2 *vw = (const uint2 *)(address & ~(uintptr_t)7u);
+                const uint2 ld0 = Streaming ? __ldcs(vw + 0) : vw[0];
+                const uint2 ld1 = Streaming ? __ldcs(vw + 1) : vw[1];
+                const uint2 ld2 = Streaming ? __ldcs(vw + 2) : vw[2];
+                const uint2 ld3 = Streaming ? __ldcs(vw + 3) : vw[3];
+                const uint2 ld4 = Streaming ? __ldcs(vw + 4) : vw[4];
+                if (((uint32_t)address & 7u) < 4u) {
+                    wq[0] = (int32_t)__funnelshift_r(ld0.x, ld0.y, shift);
+                    wq[1] = (int32_t)__funnelshift_r(ld0.y, ld1.x, shift);
+                    wq[2] = (int32_t)__funnelshift_r(ld1.x, ld1.y, shift);
+                    wq[3] = (int32_t)__funnelshift_r(ld1.y, ld2.x, shift);
+                    wq[4] = (int32_t)__funnelshift_r(ld2.x, ld2.y, shift);
+                    wq[5] = (int32_t)__funnelshift_r(ld2.y, ld3.x, shift);
+                    wq[6] = (int32_t)__funnelshift_r(ld3.x, ld3.y, shift);
+                    wq[7] = (int32_t)__funnelshift_r(ld3.y, ld4.x, shift);
+                } else {
+                    wq[0] = (int32_t)__funnelshift_r(ld0.y, ld1.x, shift);
+                    wq[1] = (int32_t)__funnelshift_r(ld1.x, ld1.y, shift);
+                    wq[2] = (int32_t)__funnelshift_r(ld1.y, ld2.x, shift);
+                    wq[3] = (int32_t)__funnelshift_r(ld2.x, ld2.y, shift);
+                    wq[4] = (int32_t)__funnelshift_r(ld2.y, ld3.x, shift);
+                    wq[5] = (int32_t)__funnelshift_r(ld3.x, ld3.y, shift);
+                    wq[6] = (int32_t)__funnelshift_r(ld3.y, ld4.x, shift);
+                    wq[7] = (int32_t)__funnelshift_r(ld4.x, ld4.y, shift);
+                }
+            } else {
+                const uint32_t *words =
+                    (const uint32_t *)(address & ~(uintptr_t)3u);
+                uint32_t previous = Streaming ? __ldcs(words) : words[0];
 #pragma unroll
-            for (int j = 0; j < 3; j++) {
-                const uint32_t next = Streaming ? __ldcs(words + j + 1) : words[j + 1];
-                wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
-                previous = next;
+                for (int j = 0; j < 7; j++) {
+                    const uint32_t next =
+                        Streaming ? __ldcs(words + j + 1) : words[j + 1];
+                    wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
+                    previous = next;
+                }
+                const uint16_t *lastp =
+                    (const uint16_t *)(const void *)(payload + 30);
+                const uint16_t last = Streaming ? __ldcs(lastp) : *lastp;
+                wq[7] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
             }
-            const uint16_t *lastp = (const uint16_t *)(const void *)(payload + 14);
-            const uint16_t last = Streaming ? __ldcs(lastp) : *lastp;
-            wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
             const __half *scale = (const __half *)(wr + b * 34u);
             const float ws = Streaming
                 ? __half2float(__ushort_as_half(__ldcs((const uint16_t *)scale)))
@@ -95,28 +175,37 @@ __global__ static void mtp_native_projection_kernel(
             for (int r = 0; r < R; r++) {
                 if ((uint32_t)r < take) {
                     const uint64_t at = ((uint64_t)row0 + r) * blocks + b;
-                    const int32_t *xw = (const int32_t *)(xq + at * 32u + half * 16u);
+                    /* Two LDG.E.128 where nvcc was forced to emit eight
+                     * LDG.E.32.  `at * 32` is a multiple of 16 and the host
+                     * declines an arena that is not 16-byte aligned, but
+                     * neither fact is visible through an int8_t*, so the
+                     * scalar form cannot be vectorised by the compiler.  Same
+                     * 32 bytes, same little-endian word order, same dp4a
+                     * sequence. */
+                    const int4 xlo = *(const int4 *)(const void *)
+                        (xq + at * 32u);
+                    const int4 xhi = *(const int4 *)(const void *)
+                        (xq + at * 32u + 16u);
                     int dot = 0;
-#pragma unroll
-                    for (int j = 0; j < 4; j++) dot = __dp4a(wq[j], xw[j], dot);
-                    dot += __shfl_xor_sync(active, dot, 1);
-                    if (half == 0u) acc[r] += ws * xscale[at] * (float)dot;
+                    dot = __dp4a(wq[0], xlo.x, dot);
+                    dot = __dp4a(wq[1], xlo.y, dot);
+                    dot = __dp4a(wq[2], xlo.z, dot);
+                    dot = __dp4a(wq[3], xlo.w, dot);
+                    dot = __dp4a(wq[4], xhi.x, dot);
+                    dot = __dp4a(wq[5], xhi.y, dot);
+                    dot = __dp4a(wq[6], xhi.z, dot);
+                    dot = __dp4a(wq[7], xhi.w, dot);
+                    acc[r] += ws * xscale[at] * (float)dot;
                 }
             }
         }
     }
 
-    __shared__ float partial[R][4][32];
-    if (half == 0u) {
-#pragma unroll
-        for (int r = 0; r < R; r++) partial[r][local_row][group] = acc[r];
-    }
-    __syncthreads();
-    if (local_lane < 32u) {
+    {
 #pragma unroll
         for (int r = 0; r < R; r++) {
-            const float total = warp_sum_f32(partial[r][local_row][local_lane]);
-            if (local_lane == 0u && row < out_dim && (uint32_t)r < take) {
+            const float total = warp_sum_f32(acc[r]);
+            if (lane == 0u && row < out_dim && (uint32_t)r < take) {
                 const float value = valid ? total : -INFINITY;
                 if (EmitKeys) {
                     /* Same f32 score and original key statements as the
@@ -500,11 +589,13 @@ __global__ static void mtp_native_projection2_screen_kernel(
         uint64_t *keys = nullptr, uint32_t *invalid = nullptr) {
     constexpr uint64_t blocks = MTP_NATIVE_DIM / 32u;
     constexpr uint64_t work_blocks = MTP_TARGET_NATIVE_SCREEN_GROUPS;
-    const uint32_t local_row = threadIdx.x >> 6u;
-    const uint32_t local_lane = threadIdx.x & 63u;
-    const uint32_t group = local_lane >> 1u;
-    const uint32_t half = local_lane & 1u;
-    const uint32_t row = blockIdx.x * 4u + local_row;
+    /* One warp per row, one lane per Q8_0 block; see the bit-exactness argument
+     * on mtp_native_projection_kernel.  It applies verbatim here, and this
+     * kernel additionally drops TWO pair shuffles per block visit because it
+     * carries two target rows off one weight stream. */
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t row = blockIdx.x * MTP_NATIVE_ROWS_PER_BLOCK + warp;
     float acc[2] = {0.0f, 0.0f};
 
     const uint32_t weight_row = row < prefix ? row
@@ -512,60 +603,86 @@ __global__ static void mtp_native_projection2_screen_kernel(
     const bool valid = row < width && weight_row < n_vocab;
     if (valid) {
         const unsigned char *wr = w + (uint64_t)weight_row * blocks * 34u;
-        for (uint64_t b = group; b < work_blocks; b += 32u) {
-            const uint64_t warp_base = b - (uint64_t)(group & 15u);
-            const uint64_t remaining = work_blocks - warp_base;
-            const uint32_t live_pairs =
-                (uint32_t)(remaining < 16u ? remaining : 16u);
-            const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
-            const int8_t *payload =
-                (const int8_t *)(wr + b * 34u + 2u) + half * 16u;
+        for (uint64_t b = lane; b < work_blocks; b += 32u) {
+            const int8_t *payload = (const int8_t *)(wr + b * 34u + 2u);
             const uintptr_t address = (uintptr_t)payload;
             const uint32_t shift = (uint32_t)(address & 3u) * 8u;
-            const uint32_t *words =
-                (const uint32_t *)(address & ~(uintptr_t)3u);
-            uint32_t previous = words[0];
-            int32_t wq[4];
+            int32_t wq[8];
+            /* Five 8-byte loads in place of nine 4-byte ones; the derivation
+             * and the bounds argument are on mtp_native_projection_kernel and
+             * apply verbatim. */
+            if ((weight_row != 0u || b != 0u) &&
+                (weight_row + 1u < n_vocab || b + 1u < blocks)) {
+                const uint2 *vw = (const uint2 *)(address & ~(uintptr_t)7u);
+                const uint2 ld0 = vw[0];
+                const uint2 ld1 = vw[1];
+                const uint2 ld2 = vw[2];
+                const uint2 ld3 = vw[3];
+                const uint2 ld4 = vw[4];
+                if (((uint32_t)address & 7u) < 4u) {
+                    wq[0] = (int32_t)__funnelshift_r(ld0.x, ld0.y, shift);
+                    wq[1] = (int32_t)__funnelshift_r(ld0.y, ld1.x, shift);
+                    wq[2] = (int32_t)__funnelshift_r(ld1.x, ld1.y, shift);
+                    wq[3] = (int32_t)__funnelshift_r(ld1.y, ld2.x, shift);
+                    wq[4] = (int32_t)__funnelshift_r(ld2.x, ld2.y, shift);
+                    wq[5] = (int32_t)__funnelshift_r(ld2.y, ld3.x, shift);
+                    wq[6] = (int32_t)__funnelshift_r(ld3.x, ld3.y, shift);
+                    wq[7] = (int32_t)__funnelshift_r(ld3.y, ld4.x, shift);
+                } else {
+                    wq[0] = (int32_t)__funnelshift_r(ld0.y, ld1.x, shift);
+                    wq[1] = (int32_t)__funnelshift_r(ld1.x, ld1.y, shift);
+                    wq[2] = (int32_t)__funnelshift_r(ld1.y, ld2.x, shift);
+                    wq[3] = (int32_t)__funnelshift_r(ld2.x, ld2.y, shift);
+                    wq[4] = (int32_t)__funnelshift_r(ld2.y, ld3.x, shift);
+                    wq[5] = (int32_t)__funnelshift_r(ld3.x, ld3.y, shift);
+                    wq[6] = (int32_t)__funnelshift_r(ld3.y, ld4.x, shift);
+                    wq[7] = (int32_t)__funnelshift_r(ld4.x, ld4.y, shift);
+                }
+            } else {
+                const uint32_t *words =
+                    (const uint32_t *)(address & ~(uintptr_t)3u);
+                uint32_t previous = words[0];
 #pragma unroll
-            for (int j = 0; j < 3; j++) {
-                const uint32_t next = words[j + 1];
-                wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
-                previous = next;
+                for (int j = 0; j < 7; j++) {
+                    const uint32_t next = words[j + 1];
+                    wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
+                    previous = next;
+                }
+                const uint16_t last =
+                    *(const uint16_t *)(const void *)(payload + 30);
+                wq[7] = (int32_t)__funnelshift_r(
+                    previous, (uint32_t)last, shift);
             }
-            const uint16_t last =
-                *(const uint16_t *)(const void *)(payload + 14);
-            wq[3] = (int32_t)__funnelshift_r(
-                previous, (uint32_t)last, shift);
             const float ws = __half2float(
                 *(const __half *)(wr + b * 34u));
 #pragma unroll
             for (int r = 0; r < 2; r++) {
                 const uint64_t at = (uint64_t)r * blocks + b;
-                const int32_t *xw =
-                    (const int32_t *)(xq + at * 32u + half * 16u);
+                /* See the identical note in mtp_native_projection_kernel: two
+                 * LDG.E.128 where nvcc was forced to emit eight LDG.E.32. */
+                const int4 xlo = *(const int4 *)(const void *)
+                    (xq + at * 32u);
+                const int4 xhi = *(const int4 *)(const void *)
+                    (xq + at * 32u + 16u);
                 int dot = 0;
-#pragma unroll
-                for (int j = 0; j < 4; j++)
-                    dot = __dp4a(wq[j], xw[j], dot);
-                dot += __shfl_xor_sync(active, dot, 1);
-                if (half == 0u)
-                    acc[r] += ws * xscale[at] * (float)dot;
+                dot = __dp4a(wq[0], xlo.x, dot);
+                dot = __dp4a(wq[1], xlo.y, dot);
+                dot = __dp4a(wq[2], xlo.z, dot);
+                dot = __dp4a(wq[3], xlo.w, dot);
+                dot = __dp4a(wq[4], xhi.x, dot);
+                dot = __dp4a(wq[5], xhi.y, dot);
+                dot = __dp4a(wq[6], xhi.z, dot);
+                dot = __dp4a(wq[7], xhi.w, dot);
+                acc[r] += ws * xscale[at] * (float)dot;
             }
         }
     }
 
-    __shared__ float partial[2][4][32];
-    if (half == 0u) {
-        partial[0][local_row][group] = acc[0];
-        partial[1][local_row][group] = acc[1];
-    }
-    __syncthreads();
-    if (local_lane < 32u) {
+    {
 #pragma unroll
         for (int r = 0; r < 2; r++) {
-            const float total = warp_sum_f32(
-                partial[r][local_row][local_lane]);
-            if (local_lane == 0u && row < width) {
+            const float total = warp_sum_f32(acc[r]);
+            if (lane == 0u && row < width) {
                 const float value = valid ? total : -INFINITY;
                 const uint64_t at = (uint64_t)r * width + row;
                 if (EmitKeys) {
@@ -647,6 +764,11 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
     if (!w) return -1;
     if ((uintptr_t)w & 1u) return 0;
     char *base = (char *)scratch->ptr;
+    /* The projection kernels read the quantized activations as int4.  Every
+     * offset they apply is a multiple of 16, so the arena's own alignment is
+     * the only requirement; decline the fast path rather than fault if a
+     * future allocator ever hands back an odd arena. */
+    if ((uintptr_t)base & 15u) return 0;
     int8_t *xq = (int8_t *)base;
     float *xs = (float *)(base + MTP_NATIVE_DIM);
     float *scores = (float *)(base + l.scores);
@@ -665,12 +787,16 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
         mtp_native_key_range_disjoint(scratch->ptr,scratch->bytes,out->ptr,out->bytes) &&
         mtp_native_key_range_disjoint(scratch->ptr,scratch->bytes,ids->ptr,ids->bytes);
     if (fuse_keys) {
-        mtp_native_projection_kernel<true,true><<<(width+3u)/4u,256,0,cuda_decode_stream()>>>(
+        mtp_native_projection_kernel<true,true><<<
+            (width + MTP_NATIVE_ROWS_PER_BLOCK - 1u) / MTP_NATIVE_ROWS_PER_BLOCK,
+            MTP_NATIVE_PROJ_THREADS, 0, cuda_decode_stream()>>>(
             scores,(const unsigned char *)w,xq,xs,width,nullptr,vocab,prefix,tail,
             key_in,flag);
         if (!cuda_ok(cudaGetLastError(),"native fused screen keys")) return -1;
     } else {
-        mtp_native_projection_kernel<true><<<(width+3u)/4u,256,0,cuda_decode_stream()>>>(
+        mtp_native_projection_kernel<true><<<
+            (width + MTP_NATIVE_ROWS_PER_BLOCK - 1u) / MTP_NATIVE_ROWS_PER_BLOCK,
+            MTP_NATIVE_PROJ_THREADS, 0, cuda_decode_stream()>>>(
             scores,(const unsigned char *)w,xq,xs,width,nullptr,vocab,prefix,tail);
         if (!cuda_ok(cudaGetLastError(),"native half-column screen")) return -1;
         mtp_native_keys<<<(width+255u)/256u,256,0,cuda_decode_stream()>>>(
@@ -740,7 +866,9 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
             id_tmp,(uint32_t *)ids->ptr,MTP_NATIVE_CAP,0,id_bits,
             cuda_decode_stream()),
             "native original-ID sort")) return -1;
-    mtp_native_projection_kernel<false><<<(MTP_NATIVE_CAP+3u)/4u,256,0,cuda_decode_stream()>>>(
+    mtp_native_projection_kernel<false><<<
+        (MTP_NATIVE_CAP + MTP_NATIVE_ROWS_PER_BLOCK - 1u) / MTP_NATIVE_ROWS_PER_BLOCK,
+        MTP_NATIVE_PROJ_THREADS, 0, cuda_decode_stream()>>>(
         (float *)out->ptr,(const unsigned char *)w,xq,xs,MTP_NATIVE_CAP,
         (const uint32_t *)ids->ptr,vocab,prefix,tail);
     return cuda_ok(cudaGetLastError(),"native exact refinement") ? (int)MTP_NATIVE_CAP : -1;
@@ -789,6 +917,7 @@ extern "C" int ds4_gpu_mtp_native_screen2(ds4_gpu_tensor *out,
     if ((uintptr_t)w & 1u) return 0;
 
     char *base = (char *)scratch->ptr;
+    if ((uintptr_t)base & 15u) return 0;   /* int4 activation reads; see above */
     int8_t *xq = (int8_t *)base;
     float *xs = (float *)(base + l.xscale);
     float *scores = (float *)(base + l.scores);
@@ -814,14 +943,16 @@ extern "C" int ds4_gpu_mtp_native_screen2(ds4_gpu_tensor *out,
             scratch->ptr, scratch->bytes, ids->ptr, ids->bytes);
     if (fuse_keys) {
         mtp_native_projection2_screen_kernel<true><<<
-            (width + 3u) / 4u, 256, 0, cuda_decode_stream()>>>(
+            (width + MTP_NATIVE_ROWS_PER_BLOCK - 1u) / MTP_NATIVE_ROWS_PER_BLOCK,
+            MTP_NATIVE_PROJ_THREADS, 0, cuda_decode_stream()>>>(
             scores, (const unsigned char *)w, xq, xs, width, vocab,
             prefix, tail, key_in, flag);
         if (!cuda_ok(cudaGetLastError(), "native fused R2 screen keys"))
             return -1;
     } else {
         mtp_native_projection2_screen_kernel<false><<<
-            (width + 3u) / 4u, 256, 0, cuda_decode_stream()>>>(
+            (width + MTP_NATIVE_ROWS_PER_BLOCK - 1u) / MTP_NATIVE_ROWS_PER_BLOCK,
+            MTP_NATIVE_PROJ_THREADS, 0, cuda_decode_stream()>>>(
             scores, (const unsigned char *)w, xq, xs, width, vocab,
             prefix, tail);
         if (!cuda_ok(cudaGetLastError(), "native R2 coarse screen"))
@@ -880,8 +1011,9 @@ extern "C" int ds4_gpu_mtp_native_screen2(ds4_gpu_tensor *out,
                 0, id_bits, cuda_decode_stream()),
                 "native R2 original-ID sort")) return -1;
         mtp_native_projection_kernel<false><<<
-            (MTP_TARGET_NATIVE_CAP + 3u) / 4u, 256, 0,
-            cuda_decode_stream()>>>(
+            (MTP_TARGET_NATIVE_CAP + MTP_NATIVE_ROWS_PER_BLOCK - 1u)
+                / MTP_NATIVE_ROWS_PER_BLOCK,
+            MTP_NATIVE_PROJ_THREADS, 0, cuda_decode_stream()>>>(
             (float *)out->ptr + (uint64_t)r * MTP_TARGET_NATIVE_CAP,
             (const unsigned char *)w,
             xq + (uint64_t)r * MTP_NATIVE_DIM,
@@ -1009,4 +1141,109 @@ extern "C" int ds4_gpu_mtp_native_scatter2(ds4_gpu_tensor *out,
         defer_invalid ? (const uint32_t *)((const char *)scratch->ptr + l.flag) : nullptr,
         defer_invalid ? (uint32_t *)winner->ptr : nullptr, count, vocab);
     return cuda_ok(cudaGetLastError(), "native target R2 scatter");
+}
+
+/* ---- The MTP-head projection kernels' occupancy, read from the runtime ----
+ *
+ * Three arms in a row (`nb-ldx4` activation vectorization, `nb-warprow` one warp
+ * per vocabulary row, `nb-ldw2` five 8-byte weight loads instead of nine 4-byte
+ * ones) have removed 45% of this region's memory instructions per row and moved
+ * the decode ratio by nothing distinguishable from draw noise.  Every one of
+ * those arms was chosen on an *issue-rate* argument, and each time I assumed the
+ * kernels were resident at the 1536-thread/SM ceiling so that removing work
+ * would show up.  That assumption has never been measured.
+ *
+ * It is the one number that decides whether the whole class was mis-aimed.  At
+ * MTP_NATIVE_PROJ_THREADS = 256 the thread ceiling allows 6 blocks/SM, i.e. 48
+ * warps = 48 vocabulary rows resident per SM.  If `occ` comes back 6, residency
+ * is full, the region is not latency-starved, and a neutral result really does
+ * mean the instruction count was not the bound.  If `occ` comes back below 6,
+ * these kernels have been running with less memory-level parallelism than the
+ * box allows, every removed instruction was spent widening a pipe that was
+ * already idle waiting on DRAM, and the lever is a register cap -- the same
+ * mechanism that bought the third CTA on the routed gate/up kernel, where
+ * __maxnreg__ moved occupancy and __launch_bounds__ could not.
+ *
+ * Reported for the three instantiations that actually launch: the fused screen
+ * (`<true,true>`), the exact refinement (`<false>`), and the two-row target
+ * screen.  Asking the runtime for blocks/SM rather than dividing 65536 by
+ * regs*threads matters here, because that arithmetic has been wrong twice in
+ * this file's own comments.
+ *
+ * This probe is host-side only: cudaFuncGetAttributes and
+ * cudaOccupancyMaxActiveBlocksPerMultiprocessor query a compiled kernel's
+ * metadata.  They launch nothing, synchronise nothing, and touch no stream, so
+ * they cannot interact with decode's graph capture.  It runs once, from
+ * ds4_gpu_hw_limits(), which ds4_resident calls after ds4s_open() has returned
+ * and before the socket binds -- outside every timed phase. */
+static const char *ds4_gpu_mtp_native_kernel_limits(void) {
+    static char buf[160];
+    static int built = 0;
+    if (built) return buf;
+    built = 1;
+    buf[0] = '\0';
+
+    int s_regs = -1, s_smem = -1, s_lmem = -1, s_occ = -1;
+    int r_regs = -1, r_smem = -1, r_lmem = -1, r_occ = -1;
+    int t_regs = -1, t_smem = -1, t_lmem = -1, t_occ = -1;
+    const int threads = (int)MTP_NATIVE_PROJ_THREADS;
+
+    cudaFuncAttributes a;
+    int occ = 0;
+    if (cudaFuncGetAttributes(&a, mtp_native_projection_kernel<true, true>) ==
+        cudaSuccess) {
+        s_regs = a.numRegs;
+        s_smem = (int)a.sharedSizeBytes;
+        s_lmem = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ, mtp_native_projection_kernel<true, true>, threads, 0) ==
+        cudaSuccess) {
+        s_occ = occ;
+    } else {
+        (void)cudaGetLastError();
+    }
+
+    if (cudaFuncGetAttributes(&a, mtp_native_projection_kernel<false>) ==
+        cudaSuccess) {
+        r_regs = a.numRegs;
+        r_smem = (int)a.sharedSizeBytes;
+        r_lmem = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ, mtp_native_projection_kernel<false>, threads, 0) ==
+        cudaSuccess) {
+        r_occ = occ;
+    } else {
+        (void)cudaGetLastError();
+    }
+
+    if (cudaFuncGetAttributes(&a, mtp_native_projection2_screen_kernel<false>) ==
+        cudaSuccess) {
+        t_regs = a.numRegs;
+        t_smem = (int)a.sharedSizeBytes;
+        t_lmem = (int)a.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ, mtp_native_projection2_screen_kernel<false>, threads, 0) ==
+        cudaSuccess) {
+        t_occ = occ;
+    } else {
+        (void)cudaGetLastError();
+    }
+
+    snprintf(buf, sizeof(buf),
+             "mps[reg=%d smem=%d lmem=%d occ=%d] "
+             "mpr[reg=%d smem=%d lmem=%d occ=%d] "
+             "mp2[reg=%d smem=%d lmem=%d occ=%d] mpt=%d",
+             s_regs, s_smem, s_lmem, s_occ,
+             r_regs, r_smem, r_lmem, r_occ,
+             t_regs, t_smem, t_lmem, t_occ, threads);
+    return buf;
 }
