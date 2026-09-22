@@ -1,3 +1,29 @@
+/* independent frontier redraw 2026-09-22T21:31Z; provenance only. */
+// Yukon f9c frontier redraw audit ticket 20260922-1910.
+// Yukon f9c frontier redraw audit ticket 20260922-1851.
+// Yukon f9c frontier redraw audit ticket 20260922-1757.
+// Yukon f9c frontier redraw audit ticket 20260922-1738.
+// Yukon f9c frontier redraw audit ticket 20260922-1650.
+// Yukon f9c frontier redraw audit ticket 20260922-1640.
+// Yukon f9c frontier redraw audit ticket 20260922-1625.
+// Yukon f9c frontier redraw audit ticket 20260922-1615.
+// Yukon f9c frontier redraw audit ticket 20260922-1600.
+// Yukon f9c frontier redraw audit ticket 20260922-1545.
+// Yukon f9c frontier redraw audit ticket 20260922-1540.
+// Yukon f9c frontier redraw audit ticket 20260922-1530.
+// Yukon f9c frontier redraw audit ticket 20260922-1515.
+// Yukon f9c frontier redraw audit ticket 20260922-1505.
+// Yukon f9c frontier redraw audit ticket 20260922-1455.
+// Yukon f9c frontier redraw audit ticket 20260922-1400.
+// Yukon f9c frontier redraw audit ticket 20260922-1350.
+// Yukon f9c frontier redraw audit ticket 20260922-1340.
+// Yukon f9c frontier redraw audit ticket 20260922-1325.
+// Yukon f9c frontier redraw audit ticket 20260922-1315.
+// Yukon f9c frontier redraw audit ticket 20260922-1255.
+// Yukon f9c frontier redraw audit ticket 20260922-1245.
+// Yukon f9c frontier redraw audit ticket 20260922-1230.
+// Yukon f9c frontier redraw audit ticket 20260922-1215.
+// Yukon f9c frontier redraw audit ticket 20260922-1220.
 /* redraw rx22532110 (2026-09-17T22:53:21Z): this archive repeats the official evaluation of the
  * same engine. The only textual difference from the previous evaluation
  * is this dated provenance comment. No behaviour changes. */
