@@ -159,13 +159,13 @@ __global__ static void mtp_native_projection_kernel(
  *     above already argues, and which the host oracle
  *     ds4/tests/test_mtp_native_score_sort_oracle.py pins;
  *   - the ORDER this kernel emits that set in is arbitrary, and that cannot
- *     matter: the very next thing both screens do is sort the ids ASCENDING
- *     with a second cub sort, and a sort maps any permutation of one set to
- *     the same array.  Bit-exactness therefore does not rest on the select
- *     reproducing cub's ordering, only on the set.
- * DS4_MTP_NATIVE_SELECT=0 restores the shipped cub path exactly: the scratch
- * layout collapses back to the shipped offsets (the select arena is zero
- * bytes) and no kernel in the shipped build changes.
+ *     matter: the very next step sorts the ids ASCENDING (one block for the
+ *     2,048-ID draft and CUB for the wider target), and a sort maps any
+ *     permutation of one set to the same array.  Bit-exactness therefore does
+ *     not rest on the select reproducing cub's ordering, only on the set.
+ * DS4_MTP_NATIVE_SELECT=0 restores the shipped CUB candidate selection and
+ * collapses the select arena to zero bytes.  Set
+ * DS4_MTP_NATIVE_BLOCK_ID_SORT=0 as well to restore the draft ID sort.
  */
 #define MTP_NATIVE_SELECT_THREADS 256
 
@@ -305,7 +305,7 @@ mtp_native_select_kernel(const uint64_t *__restrict__ keys, uint32_t n,
     }
 }
 
-/* DS4_MTP_NATIVE_SELECT=0 restores the shipped cub screens exactly. */
+/* DS4_MTP_NATIVE_SELECT=0 restores the shipped CUB candidate selection. */
 static int g_mtp_native_select = -1;
 static int mtp_native_select_enabled(void) {
     if (g_mtp_native_select < 0) {
@@ -313,6 +313,16 @@ static int mtp_native_select_enabled(void) {
         g_mtp_native_select = (e != NULL && e[0] == '0') ? 0 : 1;
     }
     return g_mtp_native_select;
+}
+/* The draft shortlist is exactly one 256-thread block at eight IDs per
+ * thread.  Keep the device-wide CUB path as a diagnostic rollback valve. */
+static int g_mtp_native_block_id_sort = -1;
+static int mtp_native_block_id_sort_enabled(void) {
+    if (g_mtp_native_block_id_sort < 0) {
+        const char *e = getenv("DS4_MTP_NATIVE_BLOCK_ID_SORT");
+        g_mtp_native_block_id_sort = (e != NULL && e[0] == '0') ? 0 : 1;
+    }
+    return g_mtp_native_block_id_sort;
 }
 /* DS4_MTP_NATIVE_SELECT_VERIFY=1 runs BOTH paths every screen and compares the
  * candidate SETS on the host, then keeps the cub path's ids so the run stays
@@ -606,6 +616,29 @@ __global__ static void mtp_native_unpack_ids_n(
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count) ids[i] = UINT32_MAX - (uint32_t)keys[i];
 }
+/* The cooperative selector already emits original IDs into id_tmp.  Sorting
+ * the fixed 2,048-ID draft shortlist inside one block avoids the multi-launch
+ * device radix chain while producing the same ascending permutation.  The
+ * wider 16,384-ID target shortlist deliberately retains DeviceRadixSort. */
+__global__ __launch_bounds__(256) static void mtp_native_sort_ids_2048(
+        uint32_t *out, const uint32_t *in, int id_bits) {
+    constexpr int threads = 256, items = 8;
+    static_assert(threads * items == MTP_NATIVE_CAP,
+                  "block sort covers the complete draft shortlist");
+    using Sort = cub::BlockRadixSort<uint32_t, threads, items,
+                                     cub::NullType, 6>;
+    __shared__ typename Sort::TempStorage storage;
+    uint32_t tile[items];
+#pragma unroll
+    for (int j = 0; j < items; ++j)
+        tile[j] = in[threadIdx.x + j * threads];
+    /* Key-only sorting is independent of the input distribution.  Striped
+     * output makes the final globally ascending stores coalesced. */
+    Sort(storage).SortBlockedToStriped(tile, 0, id_bits);
+#pragma unroll
+    for (int j = 0; j < items; ++j)
+        out[threadIdx.x + j * threads] = tile[j];
+}
 /* Moving key writes into projection is equivalent only when scratch writes
  * cannot change another input/output view or a concurrently read weight. */
 static bool mtp_native_key_range_disjoint(const void *a, uint64_t an,
@@ -736,9 +769,14 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
     int id_bits = 1;
     while (id_bits < 32 && ((uint32_t)1u << id_bits) < vocab) id_bits++;
     if (id_bits > 32) id_bits = 32;
-    if (!cuda_ok(cub::DeviceRadixSort::SortKeys(base+l.temporary,temporary,
-            id_tmp,(uint32_t *)ids->ptr,MTP_NATIVE_CAP,0,id_bits,
-            cuda_decode_stream()),
+    if (mtp_native_block_id_sort_enabled()) {
+        mtp_native_sort_ids_2048<<<1,256,0,cuda_decode_stream()>>>(
+            (uint32_t *)ids->ptr, id_tmp, id_bits);
+        if (!cuda_ok(cudaGetLastError(), "native block original-ID sort"))
+            return -1;
+    } else if (!cuda_ok(cub::DeviceRadixSort::SortKeys(
+            base+l.temporary,temporary,id_tmp,(uint32_t *)ids->ptr,
+            MTP_NATIVE_CAP,0,id_bits,cuda_decode_stream()),
             "native original-ID sort")) return -1;
     mtp_native_projection_kernel<false><<<(MTP_NATIVE_CAP+3u)/4u,256,0,cuda_decode_stream()>>>(
         (float *)out->ptr,(const unsigned char *)w,xq,xs,MTP_NATIVE_CAP,
