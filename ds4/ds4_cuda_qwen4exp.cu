@@ -11861,8 +11861,15 @@ __global__ static void qwen4exp_gdn_output_quant_kernel(
     float total = warp_sum_f32(raw * raw);
     if (lane == 0u) partial[warp] = total;
     __syncthreads();
-    total = lane < 4u ? partial[lane] : 0.0f;
-    total = warp_sum_all_f32(total);
+    /* The second stage is four numbers wide, not thirty-two.  The butterfly's
+     * first three rounds only fold in the exact zeros the padding lanes
+     * carry, and x + 0.0f is the identity, so the five dependent shuffle
+     * rounds and this expression deliver the same float in the same
+     * association -- (p0 + p2) + (p1 + p3) -- which is what every lane of the
+     * butterfly ends up holding.  Reading the four partials straight out of
+     * shared broadcasts the total to all 128 threads with no shuffle at all,
+     * which is where the reduction's latency was. */
+    total = (partial[0] + partial[2]) + (partial[1] + partial[3]);
     const float scale = rsqrtf(total / (float)QWEN4EXP_GDN_DIM + norm_eps);
     const float v = raw * scale * output_norm[tid] *
         qwen4exp_gdn_sigmoid(output_gate[base + tid]);
