@@ -1679,16 +1679,51 @@ qwen4exp_gdn_octet_kernel(
     const uint64_t state_base =
         (((uint64_t)row * n_value_head + head) * QWEN4EXP_GDN_DIM + value0) *
         QWEN4EXP_GDN_DIM + c0;
-    float4 h[R][QWEN4EXP_GDN_OCTET_QUADS];
-#pragma unroll
-    for (unsigned r = 0; r < R; r++) {
-#pragma unroll
-        for (unsigned m = 0; m < QWEN4EXP_GDN_OCTET_QUADS; m++) {
-            h[r][m] = *(const float4 *)(state + state_base +
-                r * QWEN4EXP_GDN_DIM + m * 32u);
-        }
-    }
-
+    /* ---- THE FIRST TOKEN'S OPERANDS ARE ASKED FOR BEFORE THE STATE ----
+     *
+     * Two independent reads open this kernel.  The state prologue pulls this
+     * lane's slice of the recurrent state into `h` -- R * QUADS float4s,
+     * every one of them a separate global access -- and the first token's
+     * operands (its query and key quads, its R values and its gate pair)
+     * come out of `qkv` and `gate_pairs`.  Neither depends on the other:
+     * `state` and `qkv` are distinct __restrict__ buffers, the addresses are
+     * launch math, and no arithmetic separates them.
+     *
+     * As shipped they are nonetheless issued in series.  The cursor setup and
+     * the first operand load sit BELOW the whole state prologue, so the first
+     * step's operands are not even addressed until the last state quad has
+     * been asked for, and the block's opening latency is the state read's
+     * latency plus the operand read's rather than the larger of the two.
+     *
+     * That opening is paid once per block, and this kernel is launched as a
+     * three-dimensional grid over heads, value rows and rows -- thousands of
+     * blocks per layer, in thirty-six of the forty-eight tower blocks, at
+     * every decode step.  A prologue that serialises two independent reads
+     * pays that serialisation every time.
+     *
+     * So the cursors -- pure address arithmetic, no loads -- move above the
+     * state prologue, and the first token's operand load is issued there,
+     * into `o0`.  The two reads are then in flight together and the loops
+     * below take `o0` for the token they were going to load anyway.
+     *
+     * Exactness.  This is a reordering of independent loads and nothing else.
+     * `qkv` and `gate_pairs` are INPUTS to this kernel, written by a stream
+     * predecessor and by no block of this launch, so reading them earlier
+     * cannot observe a different value; `state` is untouched by the move.
+     * Token 0's operands are the same words from the same cursors, and every
+     * later token loads exactly as before.  qwen4exp_gdn_octet_step is called
+     * on the same tokens, in the same order, with the same `h`, so every
+     * float is combined in the same sequence and every output row, snapshot
+     * slot and final state word is written from the same value to the same
+     * address.  The load is guarded by `n_tokens != 0`, which the kernel's
+     * own early return above already guarantees.
+     *
+     * Kill switch: -DQWEN4EXP_GDN_OPEN_PIPE=0 restores the shipped order --
+     * state prologue first, cursors after it, and every token loaded inside
+     * its loop. */
+#ifndef QWEN4EXP_GDN_OPEN_PIPE
+#define QWEN4EXP_GDN_OPEN_PIPE 1
+#endif
     /* Per-token operand cursors. */
     const uint64_t slot0 = (uint64_t)row * n_tokens;
     const float *qp = qkv + slot0 * conv_dim + key_head * QWEN4EXP_GDN_DIM + c0;
@@ -1699,13 +1734,32 @@ qwen4exp_gdn_octet_kernel(
     const uint64_t snap_stride = (uint64_t)n_rows * n_value_head *
         QWEN4EXP_GDN_DIM * QWEN4EXP_GDN_DIM;
 
+    qwen4exp_gdn_octet_ops<R> o0;
+#if QWEN4EXP_GDN_OPEN_PIPE
+    qwen4exp_gdn_octet_load<R>(o0, qp, key_dim, vp, gp);
+#endif
+
+    float4 h[R][QWEN4EXP_GDN_OCTET_QUADS];
+#pragma unroll
+    for (unsigned r = 0; r < R; r++) {
+#pragma unroll
+        for (unsigned m = 0; m < QWEN4EXP_GDN_OCTET_QUADS; m++) {
+            h[r][m] = *(const float4 *)(state + state_base +
+                r * QWEN4EXP_GDN_DIM + m * 32u);
+        }
+    }
+
     uint32_t token = 0;
     /* The snapshot rows (the speculative verify's rollback slots; none at a
      * plain prefill): the simple one-token-at-a-time loop. */
     const uint32_t n_snap = n_snapshot_rows < n_tokens ? n_snapshot_rows : n_tokens;
     for (; token < n_snap; token++) {
         qwen4exp_gdn_octet_ops<R> o;
-        qwen4exp_gdn_octet_load<R>(o, qp, key_dim, vp, gp);
+        if (QWEN4EXP_GDN_OPEN_PIPE && token == 0u) {
+            o = o0;
+        } else {
+            qwen4exp_gdn_octet_load<R>(o, qp, key_dim, vp, gp);
+        }
         float res[R];
         qwen4exp_gdn_octet_step<R>(h, o, res);
         if (j == 0u) {
@@ -1732,7 +1786,11 @@ qwen4exp_gdn_octet_kernel(
      * loaded into the other register set before token t's chains run. */
     if (token < n_tokens) {
         qwen4exp_gdn_octet_ops<R> oa, ob;
-        qwen4exp_gdn_octet_load<R>(oa, qp, key_dim, vp, gp);
+        if (QWEN4EXP_GDN_OPEN_PIPE && token == 0u) {
+            oa = o0;
+        } else {
+            qwen4exp_gdn_octet_load<R>(oa, qp, key_dim, vp, gp);
+        }
         for (;;) {
             float res[R];
             if (token + 1u < n_tokens) {
