@@ -24,8 +24,8 @@ assert old==new, 'scalar replay changed beyond current gate source'
 api=body('static int qwen4exp_cuda_gdn_run(')
 # Only launch syntax is translated; arguments and branch/error control stay real.
 api,n=re.subn(r'(qwen4exp_\w+)(?:<[^>]+>)?<<<.*?>>>(\s*)\(',lambda m:'spy("'+m[1]+'", ',api,flags=re.S)
-assert n==13,n
-helper=body('static int qwen4exp_replay_gate_disjoint(')
+assert n==14,n
+helper=body('static int qwen4exp_replay_gate_disjoint(')+'\n'+body('static uint64_t qwen4exp_gdn_conv_side_elements(')
 source=r'''
 #include <cassert>
 #include <cstdint>

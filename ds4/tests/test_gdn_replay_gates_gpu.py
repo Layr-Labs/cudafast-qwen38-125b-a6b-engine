@@ -27,8 +27,9 @@ source=r'''
 #define QWEN4EXP_GDN_HISTORY 3u
 #define DS4_QWEN4EXP_GDN_REPLAY_ROWS 2u
 #define QWEN4EXP_Q8_RCP127 0x1.020408p-7f
+#define QWEN4EXP_PDL_TRIGGER() ((void)0)
 #define CK(x) do{auto e=(x);if(e!=cudaSuccess){fprintf(stderr,"CUDA %s:%d\n",cudaGetErrorString(e),__LINE__);exit(1);}}while(0)
-'''+ '\n'.join(body(n) for n in names)+r'''
+'''+ '\n'.join(('template<int Opt = 3>\n' if n == 'qwen4exp_gdn_output_quant_kernel' else '')+body(n) for n in names)+r'''
 struct B{
  float*p;size_t n;std::vector<float>h;
  B(size_t count):n(count),h(count+8){CK(cudaMalloc(&p,h.size()*4));}
