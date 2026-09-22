@@ -4315,7 +4315,6 @@ __global__ static void qwen4exp_moe_group_scan_parallel_kernel(
 /* build record 20260919T203222Z-5 */
 /* build record 20260920T112423Z-103 */
 /* build record 20260920T120351Z-108 */
-/* build record 20260921T160157Z-8 */
 __global__ static void qwen4exp_moe_pair_tasks_kernel(
         int32_t *tasks, const int32_t *counts, unsigned total,
         int32_t tile = 32, int32_t lo = 0, int32_t hi = 0x7fffffff) {
@@ -4349,6 +4348,71 @@ __global__ static void qwen4exp_moe_pair_tasks_kernel(
         tasks[2 + 2 * (start + t)] = t * tile;
     }
     if (e == 0) tasks[0] = warp_prefix[15];
+}
+
+/* Fused light and heavy pair-tasks kernel: performs the prefix-scan for both
+ * the 32-pair light tile (0 < c <= 32) and the heavy tile (c > 32) in a single
+ * 512-thread CTA pass, eliminating an extra kernel launch from the stream. */
+__global__ static void qwen4exp_moe_dual_pair_tasks_kernel(
+        int32_t *tasks_light, int32_t *tasks_heavy, const int32_t *counts, unsigned total,
+        int32_t tile_light = 32, int32_t tile_heavy = 64) {
+    __shared__ int32_t warp_prefix_l[16];
+    __shared__ int32_t warp_prefix_h[16];
+    const unsigned e = threadIdx.x, lane = e & 31u, warp = e >> 5u;
+    const int32_t c0 = e < total ? counts[e] : 0;
+    const int32_t count_l = (c0 > 0 && c0 <= 32) ? c0 : 0;
+    const int32_t tiles_l = (count_l + tile_light - 1) / tile_light;
+    int32_t prefix_l = tiles_l;
+
+    const int32_t count_h = (c0 > 32) ? c0 : 0;
+    const int32_t tiles_h = (count_h + tile_heavy - 1) / tile_heavy;
+    int32_t prefix_h = tiles_h;
+
+#pragma unroll
+    for (unsigned d = 1; d < 32; d <<= 1) {
+        int32_t vl = __shfl_up_sync(0xffffffffu, prefix_l, d);
+        if (lane >= d) prefix_l += vl;
+        int32_t vh = __shfl_up_sync(0xffffffffu, prefix_h, d);
+        if (lane >= d) prefix_h += vh;
+    }
+    if (lane == 31) {
+        warp_prefix_l[warp] = prefix_l;
+        warp_prefix_h[warp] = prefix_h;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        int32_t vl = lane < 16 ? warp_prefix_l[lane] : 0;
+        int32_t vh = lane < 16 ? warp_prefix_h[lane] : 0;
+#pragma unroll
+        for (unsigned d = 1; d < 32; d <<= 1) {
+            int32_t pl = __shfl_up_sync(0xffffffffu, vl, d);
+            if (lane >= d) vl += pl;
+            int32_t ph = __shfl_up_sync(0xffffffffu, vh, d);
+            if (lane >= d) vh += ph;
+        }
+        if (lane < 16) {
+            warp_prefix_l[lane] = vl;
+            warp_prefix_h[lane] = vh;
+        }
+    }
+    __syncthreads();
+    if (warp) {
+        prefix_l += warp_prefix_l[warp - 1];
+        prefix_h += warp_prefix_h[warp - 1];
+    }
+    const int32_t start_l = prefix_l - tiles_l;
+    for (int32_t t = 0; t < tiles_l; t++) {
+        tasks_light[1 + 2 * (start_l + t)] = (int32_t)e;
+        tasks_light[2 + 2 * (start_l + t)] = t * tile_light;
+    }
+    if (e == 0) tasks_light[0] = warp_prefix_l[15];
+
+    const int32_t start_h = prefix_h - tiles_h;
+    for (int32_t t = 0; t < tiles_h; t++) {
+        tasks_heavy[1 + 2 * (start_h + t)] = (int32_t)e;
+        tasks_heavy[2 + 2 * (start_h + t)] = t * tile_heavy;
+    }
+    if (e == 0) tasks_heavy[0] = warp_prefix_h[15];
 }
 
 /* At decode and verify widths there are at most seventy pairs.  A single
@@ -7519,7 +7583,45 @@ __global__ static void qwen4exp_moe_down_q_kernel(
 
 /* The shared expert: no routing, so the tile is consecutive tokens and the
  * decoded group serves all of them. */
-template <int R, int GateType = -1, int UpType = -1, bool Vector = false>
+/* Stage: the block's eight-row gate and up panels, copied once into shared
+ * memory with coalesced 16-byte loads, then decoded out of shared.
+ *
+ * The defect is the one the shared expert's DOWN projection already had fixed
+ * in this tree, at the one projection that fix does not cover.  groups is
+ * small at the checkpoint's shape, so the walk is a single step: `lane <
+ * groups` covers the whole row and the `lane + 32` remainder never runs.
+ * Each working lane then fetches its own group's payload out of TWO row slabs
+ * as several sub-word pieces strided by the group size, so one load
+ * instruction asks for a fistful of scattered four-byte pieces while the
+ * lanes past `groups` sit idle -- and it does that twice, once for gate and
+ * once for up.  Every byte is consumed, but the requests are strided and
+ * under-filled.  The eight rows a block owns are 8 * gate_row_bytes (and
+ * 8 * up_row_bytes) CONSECUTIVE bytes of the single shared-expert slabs, so
+ * the same bytes can be fetched as two dense bursts.
+ *
+ * Bit-exactness.  Each panel is a verbatim byte image of the span the block's
+ * own warps would have read individually; it is written by the block, read by
+ * the block, and dies with the block.  dev_qwen4exp_group_decode is called
+ * with the SAME (type, g) and a row pointer at the same offset within the
+ * panel, so it is character-identical source running on identical bytes, and
+ * the decoder is alignment-agnostic by construction -- it aligns the payload
+ * address down, derives `shift` from the low bits and funnel-shifts the
+ * logical bytes back out.  Accumulation order, the lane-to-group map, the
+ * sigmoid gate and the reduction tree are untouched.
+ *
+ * Fence order.  The fill issues weight loads that do not depend on the input
+ * quantizer, so it goes ABOVE the grid dependency sync and the barrier BELOW
+ * it; the drain then absorbs the fill instead of running after it.  Both
+ * hoisted calls sit at block scope after the kernel's only early return,
+ * which the host makes block-uniform by refusing this arm unless
+ * mid_dim % 8 == 0, and the staged arm skips the sync inside the walk, so a
+ * thread performs exactly one grid dependency sync either way.
+ *
+ * The host refuses the staged arm rather than truncating it when any of the
+ * alignment, the divisibility or the shared-memory budget does not hold, and
+ * DS4_QWEN4EXP_NO_SH_GATEUP_PANEL stands it down. */
+template <int R, int GateType = -1, int UpType = -1, bool Vector = false,
+          bool Stage = false>
 __global__ static void qwen4exp_shared_gateup_q_kernel(
         float *mid,
         const char *gate,
@@ -7540,8 +7642,39 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
     if (row >= mid_dim || tok0 >= n_tokens) return;
     const uint32_t take = n_tokens - tok0 < (uint32_t)R ? n_tokens - tok0
                                                         : (uint32_t)R;
-    const char *gate_row = gate + (uint64_t)row * gate_row_bytes;
-    const char *up_row = up + (uint64_t)row * up_row_bytes;
+    extern __shared__ uint4 qw_shgu_panel[];
+    char *const gpanel = (char *)qw_shgu_panel;
+    char *const upanel = gpanel + (uint64_t)8u * gate_row_bytes;
+    if (Stage) {
+        const uint64_t gbytes = (uint64_t)8u * gate_row_bytes;
+        const uint64_t ubytes = (uint64_t)8u * up_row_bytes;
+        const char *const gsrc =
+            gate + (uint64_t)(blockIdx.x * 8u) * gate_row_bytes;
+        const char *const usrc =
+            up + (uint64_t)(blockIdx.x * 8u) * up_row_bytes;
+        for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < gbytes;
+             i += (uint64_t)blockDim.x * 16u) {
+            if (i + 16u <= gbytes)
+                *(uint4 *)(gpanel + i) = *(const uint4 *)(const void *)(gsrc + i);
+            else
+                for (uint64_t j = i; j < gbytes; j++) gpanel[j] = gsrc[j];
+        }
+        for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < ubytes;
+             i += (uint64_t)blockDim.x * 16u) {
+            if (i + 16u <= ubytes)
+                *(uint4 *)(upanel + i) = *(const uint4 *)(const void *)(usrc + i);
+            else
+                for (uint64_t j = i; j < ubytes; j++) upanel[j] = usrc[j];
+        }
+        QWEN4EXP_PDL_SYNC();
+        __syncthreads();
+    }
+    const char *const gate_row = Stage
+        ? (const char *)(gpanel + (uint64_t)(threadIdx.x >> 5u) * gate_row_bytes)
+        : gate + (uint64_t)row * gate_row_bytes;
+    const char *const up_row = Stage
+        ? (const char *)(upanel + (uint64_t)(threadIdx.x >> 5u) * up_row_bytes)
+        : up + (uint64_t)row * up_row_bytes;
 
     float ag[R];
     float au[R];
@@ -7567,7 +7700,7 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
         dev_qwen4exp_group_decode(
                 UpType < 0 ? up_type : (uint32_t)UpType,
                 up_row, g, uw, ua, ub, &uh);
-        QWEN4EXP_PDL_SYNC();
+        if (!Stage) { QWEN4EXP_PDL_SYNC(); }
 #pragma unroll
         for (int r = 0; r < R; r++) {
             if ((uint32_t)r < take) {
@@ -10354,10 +10487,14 @@ static int qwen4exp_routed_moe_cuda(
             (gu_heavy_env == NULL || gu_heavy_env[0] != '0');
         int32_t *const gu_tasks_heavy =
             gu_tasks ? gu_tasks + (1u + 2u * task_capacity) : NULL;
-        if (pair_tasks) {
+        if (pair_tasks && gu_heavy) {
+            qwen4exp_moe_dual_pair_tasks_kernel<<<1, 512, 0, stream>>>(
+                    gu_tasks, gu_tasks_heavy, sc.counts, n_total_expert, 32, (int32_t)QW_GUH_BN);
+            if (!cuda_ok(cudaGetLastError(), "qwen4exp gate/up dual pair tasks")) return 0;
+        } else if (pair_tasks) {
             qwen4exp_moe_pair_tasks_kernel<<<1, 512, 0, stream>>>(
                     gu_tasks, sc.counts, n_total_expert, 32,
-                    0, gu_heavy ? 32 : 0x7fffffff);
+                    0, 0x7fffffff);
             if (!cuda_ok(cudaGetLastError(), "qwen4exp gate/up pair tasks")) return 0;
         }
         if (gu_heavy) {
@@ -10385,10 +10522,12 @@ static int qwen4exp_routed_moe_cuda(
                                 "shared memory\n");
                 return 0;
             }
-            qwen4exp_moe_pair_tasks_kernel<<<1, 512, 0, stream>>>(
-                    gu_tasks_heavy, sc.counts, n_total_expert, (int32_t)QW_GUH_BN,
-                    32, 0x7fffffff);
-            if (!cuda_ok(cudaGetLastError(), "qwen4exp gate/up heavy tasks")) return 0;
+            if (!pair_tasks) {
+                qwen4exp_moe_pair_tasks_kernel<<<1, 512, 0, stream>>>(
+                        gu_tasks_heavy, sc.counts, n_total_expert, (int32_t)QW_GUH_BN,
+                        32, 0x7fffffff);
+                if (!cuda_ok(cudaGetLastError(), "qwen4exp gate/up heavy tasks")) return 0;
+            }
             (guh_ahead ? qwen4exp_moe_gateup_heavy_kernel<true>
                        : qwen4exp_moe_gateup_heavy_kernel<false>)<<<
                     dim3(mid_dim / QW_GUH_BM, (unsigned)task_capacity, 1),
@@ -11072,21 +11211,49 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
  * quantizes the input itself, that quantizer, which triggers too -- and the
  * kernel's weight-group prefetch rides that window
  * (ds4_cuda_qwen4exp.cuh).  Verify and prefill keep the plain launch. */
-#define QWEN4EXP_SH_GATEUP_IMPL(R, GT, UT, V) do { \
+    /* The staged gate/up panel (design note above the kernel).  Every
+     * condition the fill's uint4 copies and the kernel's single barrier rely
+     * on is checked here, once, before the launch: the early return is
+     * block-uniform only when mid_dim % 8 == 0, both panel spans must be
+     * 16-byte multiples over 16-byte aligned slab bases, and the two panels
+     * together must fit the block's shared-memory budget.  Anything short of
+     * that takes the shipped global-decode arm unchanged, and
+     * DS4_QWEN4EXP_NO_SH_GATEUP_PANEL stands the whole thing down. */
+    /* Gate/up owns a larger pair of panels than routed-down: at the
+     * checkpoint shape 8 * (2720 + 2720) = 43520 bytes, well inside the
+     * scored kernel's 101376-byte opt-in shared-memory budget. */
+    const uint64_t sh_gu_bytes =
+        (uint64_t)8u * (gate_slab->row_bytes + up_slab->row_bytes);
+    const int sh_gu_stage =
+        n_tokens <= 2u && (mid_dim % 8u) == 0u &&
+        (((uint64_t)8u * gate_slab->row_bytes) % 16u) == 0u &&
+        (((uint64_t)8u * up_slab->row_bytes) % 16u) == 0u &&
+        ((uintptr_t)gate & 15u) == 0u &&
+        ((uintptr_t)up & 15u) == 0u &&
+        sh_gu_bytes <= 65536u &&
+        getenv("DS4_QWEN4EXP_NO_SH_GATEUP_PANEL") == NULL;
+#define QWEN4EXP_SH_GATEUP_LAUNCH(R, GT, UT, V, S, SH) do { \
     if (n_tokens <= 2u) { \
         QWEN4EXP_LAUNCH_PDL( \
-                (qwen4exp_shared_gateup_q_kernel<R, GT, UT, V>), \
+                (qwen4exp_shared_gateup_q_kernel<R, GT, UT, V, S>), \
                 (dim3((mid_dim + 7u) / 8u, tiles, 1)), \
-                threads, 0, side, \
+                threads, (SH), side, \
                 (float *)mid->ptr, gate, up, xq, xs, xsum, \
                 gate_slab->row_bytes, up_slab->row_bytes, \
                 gate_slab->type, up_slab->type, xgroups, mid_dim, n_tokens); \
     } else { \
-        qwen4exp_shared_gateup_q_kernel<R, GT, UT, V> \
-            <<<dim3((mid_dim + 7u) / 8u, tiles, 1), threads, 0, side>>>( \
+        qwen4exp_shared_gateup_q_kernel<R, GT, UT, V, S> \
+            <<<dim3((mid_dim + 7u) / 8u, tiles, 1), threads, (SH), side>>>( \
                     (float *)mid->ptr, gate, up, xq, xs, xsum, \
                     gate_slab->row_bytes, up_slab->row_bytes, \
                     gate_slab->type, up_slab->type, xgroups, mid_dim, n_tokens); \
+    } \
+} while (0)
+#define QWEN4EXP_SH_GATEUP_IMPL(R, GT, UT, V) do { \
+    if (sh_gu_stage) { \
+        QWEN4EXP_SH_GATEUP_LAUNCH(R, GT, UT, V, true, (size_t)sh_gu_bytes); \
+    } else { \
+        QWEN4EXP_SH_GATEUP_LAUNCH(R, GT, UT, V, false, 0); \
     } \
 } while (0)
 #define QWEN4EXP_SH_GATEUP(R) do { \
@@ -11110,6 +11277,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
     else { QWEN4EXP_SH_GATEUP(1); }
 #undef QWEN4EXP_SH_GATEUP
 #undef QWEN4EXP_SH_GATEUP_IMPL
+#undef QWEN4EXP_SH_GATEUP_LAUNCH
     }
     if (!cuda_ok(cudaGetLastError(), "qwen4exp shared gate/up launch")) return 0;
 
@@ -11453,6 +11621,32 @@ __global__ static void qwen4exp_hc_mix_kernel(
     out[(uint64_t)t * n_embd + d] = acc * (1.0f / (float)n_hc);
 }
 
+/* 128-bit vectorized hyper-connection mixer: processes 4 continuous channels
+ * per thread via float4 LDG/STG, cutting memory instruction count by 4x. */
+__global__ static void qwen4exp_hc_mix_vec4_kernel(
+        float4 *out, const float4 *normed, const float4 *wide,
+        uint32_t n_embd4, uint32_t n_hc, uint32_t n_tokens) {
+    const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t t = blockIdx.y;
+    if (d >= n_embd4 || t >= n_tokens) return;
+
+    const uint64_t row = ((uint64_t)t * n_hc) * n_embd4 + d;
+
+    float acc_x = 0.0f, acc_y = 0.0f, acc_z = 0.0f, acc_w = 0.0f;
+    for (uint32_t h = 0; h < n_hc; h++) {
+        const uint64_t idx = row + (uint64_t)h * n_embd4;
+        const float4 w = wide[idx];
+        const float4 n = normed[idx];
+        acc_x += qwen4exp_sigmoid(w.x) * n.x;
+        acc_y += qwen4exp_sigmoid(w.y) * n.y;
+        acc_z += qwen4exp_sigmoid(w.z) * n.z;
+        acc_w += qwen4exp_sigmoid(w.w) * n.w;
+    }
+    const float inv_hc = 1.0f / (float)n_hc;
+    out[(uint64_t)t * n_embd4 + d] = make_float4(
+        acc_x * inv_hc, acc_y * inv_hc, acc_z * inv_hc, acc_w * inv_hc);
+}
+
 __global__ static void qwen4exp_hc_inject_weights_kernel(
         float *out, const float *normed, const char *w,
         uint32_t n_embd, uint32_t n_hc, uint32_t rows,
@@ -11512,6 +11706,39 @@ __global__ static void qwen4exp_hc_inject_kernel(
     out[i] = residual[i] + blk * inject[(uint64_t)t * n_hc + h];
 }
 
+/* 128-bit vectorized hyper-connection inject: 4 channels per thread via
+ * float4 LDG/STG vector operations. */
+__global__ static void qwen4exp_hc_inject_vec4_kernel(
+        float4 *out, const float4 *residual, const float4 *block,
+        const float *inject, const float4 *shexp_tot, const float *shexp_gate,
+        uint32_t n_embd4, uint32_t n_hc,
+        uint32_t n_tokens) {
+    if (n_tokens <= 2u) QWEN4EXP_PDL_TRIGGER();
+    const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t h = blockIdx.y;
+    const uint32_t t = blockIdx.z;
+    if (d >= n_embd4 || h >= n_hc || t >= n_tokens) return;
+
+    const uint64_t i = ((uint64_t)t * n_hc + h) * n_embd4 + d;
+    const uint64_t bi = (uint64_t)t * n_embd4 + d;
+    float4 blk = block[bi];
+    if (shexp_tot) {
+        const float g = shexp_gate[t];
+        const float4 st = shexp_tot[bi];
+        blk.x += g * st.x;
+        blk.y += g * st.y;
+        blk.z += g * st.z;
+        blk.w += g * st.w;
+    }
+    const float inj = inject[(uint64_t)t * n_hc + h];
+    const float4 res = residual[i];
+    out[i] = make_float4(
+        res.x + blk.x * inj,
+        res.y + blk.y * inj,
+        res.z + blk.z * inj,
+        res.w + blk.w * inj);
+}
+
 
 extern "C" int ds4_gpu_qwen4exp_rms_norm_tensor(
         ds4_gpu_tensor       *out,
@@ -11568,10 +11795,21 @@ extern "C" int ds4_gpu_qwen4exp_hc_mix_tensor(
         wide->bytes < hc_bytes) {
         return 0;
     }
-    qwen4exp_hc_mix_kernel<<<dim3((n_embd + 255u) / 256u, rows, 1u), 256, 0,
-                             cuda_decode_stream()>>>(
-            (float *)out->ptr, (const float *)normed->ptr,
-            (const float *)wide->ptr, n_embd, n_hc, rows);
+    if ((n_embd % 4u) == 0 &&
+        ((uintptr_t)out->ptr % 16u) == 0 &&
+        ((uintptr_t)normed->ptr % 16u) == 0 &&
+        ((uintptr_t)wide->ptr % 16u) == 0) {
+        const uint32_t n_embd4 = n_embd / 4u;
+        qwen4exp_hc_mix_vec4_kernel<<<dim3((n_embd4 + 255u) / 256u, rows, 1u), 256, 0,
+                                      cuda_decode_stream()>>>(
+                (float4 *)out->ptr, (const float4 *)normed->ptr,
+                (const float4 *)wide->ptr, n_embd4, n_hc, rows);
+    } else {
+        qwen4exp_hc_mix_kernel<<<dim3((n_embd + 255u) / 256u, rows, 1u), 256, 0,
+                                 cuda_decode_stream()>>>(
+                (float *)out->ptr, (const float *)normed->ptr,
+                (const float *)wide->ptr, n_embd, n_hc, rows);
+    }
     return cuda_ok(cudaGetLastError(), "qwen4exp_hc_mix launch");
 }
 
@@ -11643,11 +11881,24 @@ extern "C" int ds4_gpu_qwen4exp_hc_inject_tensor(
             sa->armed = 0;
         }
     }
-    qwen4exp_hc_inject_kernel<<<dim3((n_embd + 255u) / 256u, n_hc, rows), 256,
-                                0, cuda_decode_stream()>>>(
-            (float *)out_hc->ptr, (const float *)residual_hc->ptr,
-            (const float *)block_out->ptr, (const float *)inject->ptr,
-            sd_tot, sd_gate, n_embd, n_hc, rows);
+    if ((n_embd % 4u) == 0 &&
+        ((uintptr_t)out_hc->ptr % 16u) == 0 &&
+        ((uintptr_t)residual_hc->ptr % 16u) == 0 &&
+        ((uintptr_t)block_out->ptr % 16u) == 0 &&
+        (!sd_tot || ((uintptr_t)sd_tot % 16u) == 0)) {
+        const uint32_t n_embd4 = n_embd / 4u;
+        qwen4exp_hc_inject_vec4_kernel<<<dim3((n_embd4 + 255u) / 256u, n_hc, rows), 256,
+                                         0, cuda_decode_stream()>>>(
+                (float4 *)out_hc->ptr, (const float4 *)residual_hc->ptr,
+                (const float4 *)block_out->ptr, (const float *)inject->ptr,
+                (const float4 *)sd_tot, sd_gate, n_embd4, n_hc, rows);
+    } else {
+        qwen4exp_hc_inject_kernel<<<dim3((n_embd + 255u) / 256u, n_hc, rows), 256,
+                                    0, cuda_decode_stream()>>>(
+                (float *)out_hc->ptr, (const float *)residual_hc->ptr,
+                (const float *)block_out->ptr, (const float *)inject->ptr,
+                sd_tot, sd_gate, n_embd, n_hc, rows);
+    }
     return cuda_ok(cudaGetLastError(), "qwen4exp_hc_inject launch");
 }
 
@@ -15638,14 +15889,21 @@ __global__ static void __launch_bounds__(256, 2) qwen4exp_qsa3_attention_group_k
         __syncthreads();
     }
     if (!scorer) {
+        /* Valuer vt owns channels 2*vt and 2*vt + 1 of every head row -- the
+         * same pairing this kernel's value loads already take as one eight
+         * byte load.  head_dim is even and 2*vt is even, so the pair is eight
+         * byte aligned and one vector store retires both channels instead of
+         * two scalar stores into the same sector.  Each channel still divides
+         * the accumulator it always divided, by the same run sum, under the
+         * same positivity test. */
 #pragma unroll
-        for (uint32_t c = 0; c < CPT; c++)
-#pragma unroll
-            for (uint32_t h = 0; h < GROUP; h++) {
-                const float rs = st_runsum[h];
-                dst[h * head_dim + 2u * vt + c] =
-                    (rs > 0.0f) ? acc[c][h] / rs : 0.0f;
-            }
+        for (uint32_t h = 0; h < GROUP; h++) {
+            const float rs = st_runsum[h];
+            const bool live = rs > 0.0f;
+            const float2 o = make_float2(live ? acc[0][h] / rs : 0.0f,
+                                         live ? acc[1][h] / rs : 0.0f);
+            *(float2 *)(dst + h * head_dim + 2u * vt) = o;
+        }
     }
 }
 
@@ -16099,6 +16357,17 @@ __global__ static void qwen4exp_qsa_output_gate_quant_kernel(
         const float *gate,
         const float *out,
         uint32_t     n_values) {
+    /* PDL producer for the state-out projection that follows on the stream,
+     * the role and the gate its doubled twin below already carries.  On the
+     * attention layers this kernel, not the gated-deltanet quantizer, is that
+     * projection's stream predecessor, and without a trigger those layers pay
+     * a serialized edge the other layers do not.  The geometry is the twin's
+     * exactly -- the same flat value index, the same 256-thread blocks, the
+     * same n_values / 256 grid from the same entry -- so the single-wave
+     * condition the deadlock rule asks for holds here for the same reason it
+     * holds there.  gridDim is grid-uniform and the bound excludes every
+     * prefill width. */
+    if (gridDim.x <= 48u) QWEN4EXP_PDL_TRIGGER();
     const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
