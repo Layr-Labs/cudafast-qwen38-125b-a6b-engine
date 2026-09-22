@@ -6302,7 +6302,7 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
  * and measures 71.3 and 69.7.  Fewer, deeper blocks win here because each
  * block keeps its next portion in flight on its own, the finding this
  * engine's notes record three times over: residency is not throughput. */
-template <int R, int PB>
+template <int R, int PB, bool SharedWords=false>
 __global__ static void __launch_bounds__(256, 2) matmul_q8_0_preq_pair_lanes_roll_kernel(
         float *out, const unsigned char *w,
         const int8_t *xq, const float *xscale,
@@ -6380,13 +6380,22 @@ __global__ static void __launch_bounds__(256, 2) matmul_q8_0_preq_pair_lanes_rol
                 const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
                 const int8_t *payload = (const int8_t *)(wr + (b - b_lo) * 34u + 2u) + half * 16u;
                 const uintptr_t address = (uintptr_t)payload;
-                const uint32_t shift = (uint32_t)(address & 3u) * 8u;
+                const uint32_t shared_address = SharedWords ? (uint32_t)__cvta_generic_to_shared(payload) : 0u;
+                const uint32_t shift = SharedWords ? (shared_address & 3u)*8u : (uint32_t)(address & 3u)*8u;
                 const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
-                uint32_t previous = words[0];
+                auto read_word = [&](unsigned j) {
+                    if constexpr (SharedWords) {
+                        uint32_t value;
+                        asm volatile("ld.shared.u32 %0, [%1];" : "=r"(value)
+                            : "r"((shared_address & ~3u)+4u*j) : "memory");
+                        return value;
+                    } else return words[j];
+                };
+                uint32_t previous = read_word(0);
                 int32_t wq[4];
 #pragma unroll
                 for (int j = 0; j < 3; j++) {
-                    const uint32_t next = words[j + 1];
+                    const uint32_t next = read_word(j + 1);
                     wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
                     previous = next;
                 }
@@ -18651,7 +18660,14 @@ static int cuda_matmul_q8_0_preq_rows_exact(
             if (n_rows == 1u && pl_roll &&
                 getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL) {
                 /* PDL consumer as below; the first portion rides the window. */
-                QWEN4EXP_LAUNCH_PDL(
+                if (getenv("DS4_QWEN4EXP_NO_ROLL_SHARED_WORDS") == NULL) {
+                    QWEN4EXP_LAUNCH_PDL(
+                        (matmul_q8_0_preq_pair_lanes_roll_kernel<1, 64, true>),
+                        (dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u)),
+                        256, pl_roll_smem, cuda_decode_stream(),
+                        (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
+                        out_dim, n_rows, blocks);
+                } else QWEN4EXP_LAUNCH_PDL(
                         (matmul_q8_0_preq_pair_lanes_roll_kernel<1, 64>),
                         (dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u)),
                         256, pl_roll_smem, cuda_decode_stream(),
@@ -18693,7 +18709,14 @@ static int cuda_matmul_q8_0_preq_rows_exact(
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
                         out_dim, n_rows, blocks);
             } else if (pl_roll) {
-                QWEN4EXP_LAUNCH_PDL(
+                if (getenv("DS4_QWEN4EXP_NO_ROLL_SHARED_WORDS") == NULL) {
+                    QWEN4EXP_LAUNCH_PDL(
+                        (matmul_q8_0_preq_pair_lanes_roll_kernel<2, 64, true>),
+                        (dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u)),
+                        256, pl_roll_smem, cuda_decode_stream(),
+                        (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
+                        out_dim, n_rows, blocks);
+                } else QWEN4EXP_LAUNCH_PDL(
                         (matmul_q8_0_preq_pair_lanes_roll_kernel<2, 64>),
                         (dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u)),
                         256, pl_roll_smem, cuda_decode_stream(),
