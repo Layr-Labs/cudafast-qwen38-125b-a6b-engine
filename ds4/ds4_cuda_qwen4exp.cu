@@ -1703,6 +1703,95 @@ qwen4exp_gdn_octet_kernel(
     /* The snapshot rows (the speculative verify's rollback slots; none at a
      * plain prefill): the simple one-token-at-a-time loop. */
     const uint32_t n_snap = n_snapshot_rows < n_tokens ? n_snapshot_rows : n_tokens;
+    /* ---- THE SNAPSHOT LOOP GETS THE PIPELINE THE OTHER LOOP ALREADY HAS ----
+     *
+     * The tail loop below states the tree's own finding: a token's operands
+     * are loaded into the other register set BEFORE the previous token's
+     * chains run, because the recurrence is a dependent chain and the operand
+     * loads are the only thing that can fly beside it.  The snapshot loop
+     * above it never got that treatment -- it loads, steps, stores, and loads
+     * again, so every token pays full operand latency in front of a chain
+     * that cannot start without it.
+     *
+     * That matters far more than "the rollback slots" suggests.  At the
+     * speculative decode widths the host hands this kernel a snapshot row per
+     * decode token, so n_snap covers the whole token range and the pipelined
+     * loop below runs zero iterations: the entire decode path through
+     * thirty-six linear layers takes the unpipelined loop.  The pipeline is
+     * not a refinement of the rare case, it is missing from the common one.
+     *
+     * This applies the same two-per-trip schedule, verbatim in structure, to
+     * the snapshot loop: two operand register sets, the next token's load
+     * issued before this token's step, and the snapshot store left exactly
+     * where it was, after the step that produced the state it captures.
+     *
+     * Exactness.  Loads move earlier; nothing else moves.  The operands of
+     * token t are the same words read from the same cursors -- `qkv` and the
+     * gate pairs are inputs to this kernel, written by a stream predecessor
+     * and not by this launch, so reading them earlier cannot observe a
+     * different value.  qwen4exp_gdn_octet_step is called on the same tokens
+     * in the same ascending order with the same `h`, so every float is
+     * combined in the same sequence; the output row and the snapshot slot of
+     * token t are written from the same `res` and the same `h` as before, to
+     * the same addresses, and the cursors advance once per token exactly as
+     * they did.  The prefetch is guarded by `token + 1 < n_snap`, so no load
+     * is issued past the snapshot range and the tail loop below still opens
+     * with its own load at the cursors it expects.
+     *
+     * Kill switch: -DQWEN4EXP_GDN_SNAP_PIPE=0 restores the shipped
+     * one-token-at-a-time loop. */
+#ifndef QWEN4EXP_GDN_SNAP_PIPE
+#define QWEN4EXP_GDN_SNAP_PIPE 1
+#endif
+#if QWEN4EXP_GDN_SNAP_PIPE
+    if (token < n_snap) {
+        auto snap_emit = [&](uint32_t t, const float (&res)[R]) {
+            if (j == 0u) {
+#pragma unroll
+                for (unsigned r = 0; r < R; r++) op[r] = res[r];
+            }
+            float *snap = state_snapshot + (uint64_t)t * snap_stride + state_base;
+#pragma unroll
+            for (unsigned r = 0; r < R; r++) {
+#pragma unroll
+                for (unsigned m = 0; m < QWEN4EXP_GDN_OCTET_QUADS; m++) {
+                    float4 *dst = (float4 *)(snap + r * QWEN4EXP_GDN_DIM + m * 32u);
+                    if (snap_plain) {
+                        *dst = h[r][m];
+                    } else {
+                        __stcs(dst, h[r][m]);
+                    }
+                }
+            }
+        };
+        qwen4exp_gdn_octet_ops<R> sa, sb;
+        qwen4exp_gdn_octet_load<R>(sa, qp, key_dim, vp, gp);
+        for (;;) {
+            float res[R];
+            if (token + 1u < n_snap) {
+                qwen4exp_gdn_octet_load<R>(sb, qp + conv_dim, key_dim,
+                                           vp + conv_dim, gp + n_value_head);
+            }
+            qwen4exp_gdn_octet_step<R>(h, sa, res);
+            snap_emit(token, res);
+            op += value_dim;
+            qp += conv_dim; vp += conv_dim; gp += n_value_head;
+            token++;
+            if (token >= n_snap) break;
+
+            if (token + 1u < n_snap) {
+                qwen4exp_gdn_octet_load<R>(sa, qp + conv_dim, key_dim,
+                                           vp + conv_dim, gp + n_value_head);
+            }
+            qwen4exp_gdn_octet_step<R>(h, sb, res);
+            snap_emit(token, res);
+            op += value_dim;
+            qp += conv_dim; vp += conv_dim; gp += n_value_head;
+            token++;
+            if (token >= n_snap) break;
+        }
+    }
+#else
     for (; token < n_snap; token++) {
         qwen4exp_gdn_octet_ops<R> o;
         qwen4exp_gdn_octet_load<R>(o, qp, key_dim, vp, gp);
@@ -1727,6 +1816,7 @@ qwen4exp_gdn_octet_kernel(
         }
         qp += conv_dim; vp += conv_dim; gp += n_value_head; op += value_dim;
     }
+#endif
 
     /* The remaining tokens, two per trip with the operands of token t+1
      * loaded into the other register set before token t's chains run. */
