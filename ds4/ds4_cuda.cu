@@ -18287,6 +18287,9 @@ static void cuda_q8_mma_pipe_prepare(void) {
     (void)cuda_q8_mma_pipe_attr<2, 2, 4, 4, 4, 2>();
     (void)cuda_q8_mma_pipe_attr<2, 4, 4, 4, 4, 2>();
     (void)cuda_q8_mma_pipe_attr<2, 8, 4, 4, 4, 2>();
+    (void)cuda_q8_mma_pipe_attr<2, 2, 4, 4, 4, 2, true>();
+    (void)cuda_q8_mma_pipe_attr<2, 4, 4, 4, 4, 2, true>();
+    (void)cuda_q8_mma_pipe_attr<2, 8, 4, 4, 4, 2, true>();
     (void)cuda_q8_mma_pipe_attr<2, 2, 4, 4, 4, 2, false, true>();
     (void)cuda_q8_mma_pipe_attr<2, 4, 4, 4, 4, 2, false, true>();
     (void)cuda_q8_mma_pipe_attr<2, 8, 4, 4, 4, 2, false, true>();
