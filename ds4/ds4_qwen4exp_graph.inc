@@ -1292,6 +1292,60 @@ static void qw_ple_pool_init(void) {
     pthread_mutex_unlock(&g_qw_ple_pool.mutex);
 }
 
+/* THE PLE GATHER'S SERIAL FAULTS.
+ *
+ * The n-gram table is 26.8 GiB mmapped from SSD and the resident already books
+ * ~103.7 GiB of weights on a 128 GiB box, so the table CANNOT be cached: a row
+ * this call has not touched is a genuine page fault a meaningful fraction of
+ * the time.  Every solver who looked at this closed it on exactly that
+ * arithmetic -- which proves you cannot CACHE the table, and says nothing about
+ * whether the faults have to be SERIAL.  They currently are: the read loop
+ * below walks DS4_N_PLE_HEAD rows per token one at a time, and each
+ * ds4_ple_dequant_iq4_nl touches a page that may not be resident, so the
+ * faults queue one behind the next.  Measured on this tree, same prompt, same
+ * binary, legs differing only in an environment variable that cannot reach this
+ * path: a leg whose table pages had been evicted ran 45.18 ms a round with
+ * 9.16 ms of GPU idle, 6.67 ms of it stalled after an H2D copy, against
+ * 36.3 ms and 0.45 ms back to back.
+ *
+ * The ids for EVERY token and head of this call are already computed, in the
+ * loop above, before any of them is read -- the split exists so the per-row
+ * n-gram history is observed one row at a time.  So the whole row set is known
+ * here and the faults can be asked for together instead of one behind another.
+ *
+ * posix_madvise(WILLNEED) is a HINT: it moves no data into this process, changes
+ * no value, and the read loop below is byte-for-byte the one that ran before.
+ * The gather is therefore bit-exact by construction, in the same class as the
+ * prefetch.global.L2 arm this board promoted.  ds4_qwen4exp_ple.c already ships
+ * ds4_ple_table_prefetch() doing exactly this over its own table type -- written,
+ * unit-tested, and with ZERO production callers; this is that helper transcribed
+ * against the type the graph path holds.
+ *
+ * DS4_QWEN4EXP_NO_PLE_WILLNEED stands it down. */
+static void qw_ple_willneed(const ds4_qwen4exp_ple_table *t,
+                            const uint64_t *ids, uint64_t count) {
+#if defined(POSIX_MADV_WILLNEED)
+    static int on = -1;
+    if (on < 0) on = getenv("DS4_QWEN4EXP_NO_PLE_WILLNEED") == NULL ? 1 : 0;
+    if (on <= 0 || !t || !t->base || !ids || !t->row_bytes) return;
+    static long page_cache = 0;
+    if (page_cache == 0) page_cache = sysconf(_SC_PAGESIZE);
+    if (page_cache <= 0) return;
+    const uintptr_t page = (uintptr_t)page_cache;
+    for (uint64_t i = 0; i < count; i++) {
+        const uint64_t row = ids[i];
+        if (row >= t->rows) continue;
+        uintptr_t a = (uintptr_t)t->base + (uintptr_t)(row * t->row_bytes);
+        uintptr_t e = a + (uintptr_t)t->row_bytes;
+        a -= a % page;
+        e = (e + page - 1u) / page * page;
+        (void)posix_madvise((void *)a, (size_t)(e - a), POSIX_MADV_WILLNEED);
+    }
+#else
+    (void)t; (void)ids; (void)count;
+#endif
+}
+
 static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                                       const ds4_qwen4exp_weights *w,
                                       const int32_t *tokens,
@@ -1351,6 +1405,10 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 s->ple_history_rows[t] = s->ple_history;
             }
         }
+        /* Every row this call will read is now named.  Ask for them together so
+         * the faults overlap instead of queueing; see qw_ple_willneed above. */
+        qw_ple_willneed(&w->ple, s->ple_ids,
+                        (uint64_t)n_tokens * DS4_N_PLE_HEAD);
         for (uint32_t t = 0; t < n_tokens; t++) {
             /* The head's destination strides are constants of the shape, so
              * the token base is hoisted out of the head loop and the head
