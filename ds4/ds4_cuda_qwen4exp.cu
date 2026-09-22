@@ -7688,14 +7688,26 @@ __global__ static void qwen4exp_shared_down_q_kernel(
     if (Stage) {
         const uint64_t panel_bytes = (uint64_t)8u * down_row_bytes;
         const char *const gp = down + (uint64_t)(blockIdx.x * 8u) * down_row_bytes;
+        /* LDGSTS the panel instead of pulling it through registers.  The
+         * bytes, the addresses and the destination offsets are the ones the
+         * uint4 copy used, so the staged panel is identical; what changes is
+         * that the copies are in flight across the grid dependency wait
+         * rather than in front of it.  The weight slab is not the
+         * predecessor's output, so issuing its loads above the fence is the
+         * same licence the walk's first step already takes; the group is
+         * drained below the fence, immediately before the barrier that
+         * publishes the panel. */
         for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
              i += (uint64_t)blockDim.x * 16u) {
             if (i + 16u <= panel_bytes)
-                *(uint4 *)(spanel + i) = *(const uint4 *)(const void *)(gp + i);
+                qw_cpasync16((uint32_t)__cvta_generic_to_shared(spanel + i),
+                             gp + i);
             else
                 for (uint64_t j = i; j < panel_bytes; j++) spanel[j] = gp[j];
         }
+        qw_cpasync_commit();
         QWEN4EXP_PDL_SYNC();
+        qw_cpasync_wait0();
         __syncthreads();
     }
     const char *down_row = Stage
@@ -18049,3 +18061,4 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
  * census shows produces a byte-identical capture log. */
 
 #define YUKON_REDRAW_10 10
+#define GAUNTLET_REDRAW_588c646a_20260922T003221Z 1
