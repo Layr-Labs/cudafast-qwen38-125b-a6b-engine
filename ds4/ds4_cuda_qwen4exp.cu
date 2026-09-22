@@ -4609,7 +4609,11 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
         uint32_t best_key = 0u;
 #pragma unroll
         for (uint32_t j = 0; j < 16u; j++) {
-            const uint32_t key = keys[j] & (0u - ((live >> j) & 1u));
+            // A consumed expert is tombstoned directly in the key array.
+            // Key zero is already treated as an exhausted/invalid key below,
+            // so this is equivalent to the separate live-bit mask while
+            // removing one per-rank mask operation and the live register.
+            const uint32_t key = keys[j];
             best_key = max(best_key, key);
         }
         const uint32_t winning_key = __reduce_max_sync(0xffffffffu, best_key);
@@ -4617,7 +4621,6 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
 #pragma unroll
         for (uint32_t j = 0; j < 16u; j++)
             matches |= (uint32_t)(keys[j] == winning_key) << j;
-        matches &= live;
         if (winning_key == 0u) matches = 0u;
         const int32_t local_i = matches
             ? (int32_t)(lane + ((uint32_t)__ffs(matches) - 1u) * 32u)
@@ -4666,8 +4669,14 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
         const int32_t chosen =
             __shfl_sync(0xffffffffu, best_i, 0u);
         if (lane == 0u) sel[rank] = chosen;
-        if (((uint32_t)chosen & 31u) == lane) {
-            live &= ~(1u << ((uint32_t)chosen >> 5u));
+        if ((uint32_t)chosen < n_expert &&
+            ((uint32_t)chosen & 31u) == lane) {
+#if __CUDA_ARCH__ >= 800
+            if constexpr (Native && KeyMax)
+                keys[(uint32_t)chosen >> 5u] = 0u;
+            else
+#endif
+                live &= ~(1u << ((uint32_t)chosen >> 5u));
         }
     }
 
