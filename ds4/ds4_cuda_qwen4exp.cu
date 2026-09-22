@@ -15380,6 +15380,50 @@ __device__ __forceinline__ static void qwen4exp_qsa3_score_tile(
                 : (k_cache + (uint64_t)(live[s] ? key[s] : 0) * kv_stride
                            + (uint64_t)kv_head * head_dim);
         }
+        /* ---- SEAM 1: THE KEY ROW, PREFETCHED BEFORE THE SCORE WALK ----
+         *
+         * Each scorer thread owns KPT key slots and holds each key's cache
+         * row base in `kv[s]`.  The walk below consumes that row a KSTEP
+         * chunk at a time.  `words` is head_dim / 4 and head_dim is a runtime
+         * kernel argument, so the `w` loop is NOT fully unrolled: each
+         * iteration issues its own float4 loads and the FMA block directly
+         * beneath consumes them.  A key row is 4 * head_dim bytes -- several
+         * cache lines -- so the walk pays a miss per chunk, each one standing
+         * behind the arithmetic of the chunk before it, and the warp's
+         * memory-level parallelism is one iteration's worth rather than the
+         * row's worth.
+         *
+         * Every one of those addresses is known here, a dozen instructions
+         * earlier: `kv[s]` is computed, the row is contiguous in the non-tape
+         * layout, and its length is `words * 16` bytes.  Asking for the whole
+         * row at 128-byte granularity turns a chain of per-chunk misses into
+         * one burst issued while the first chunk's arithmetic runs.
+         *
+         * Restricted to the non-tape layout by a compile-time test: the tape
+         * layout spreads a key's dimensions across a stride, so there is no
+         * contiguous row to ask for, and that instantiation is untouched.
+         * Dead slots point at row 0 and are skipped, so no address is
+         * prefetched that the walk does not itself touch.
+         *
+         * Kill switch: -DQWEN4EXP_QSA3_KPREFETCH=0. */
+#ifndef QWEN4EXP_QSA3_KPREFETCH
+#define QWEN4EXP_QSA3_KPREFETCH 1
+#endif
+#if QWEN4EXP_QSA3_KPREFETCH
+        if (!TAPE) {
+            const uint32_t row_bytes = (head_dim >> 2u) * 16u;
+#pragma unroll
+            for (uint32_t s = 0; s < KPT; s++) {
+                if (live[s]) {
+                    for (uint32_t off = 0; off < row_bytes; off += 128u) {
+                        const float *const pp = kv[s] + (off >> 2u);
+                        asm volatile("prefetch.global.L2 [%0];"
+                                     :: "l"(pp) : "memory");
+                    }
+                }
+            }
+        }
+#endif
         float dot[KPT][GROUP];
 #pragma unroll
         for (uint32_t s = 0; s < KPT; s++)
@@ -15581,6 +15625,43 @@ __global__ static void __launch_bounds__(256, 2) qwen4exp_qsa3_attention_group_k
                     vv[0][u] = v2.x;
                     vv[1][u] = v2.y;
                 }
+                /* ---- SEAM 2: THE VALUE ROWS OF THE NEXT STEP ----
+                 *
+                 * The other seam of the same path.  The valuer's gather is
+                 * scattered by construction -- one eight-byte pair per key at
+                 * a stride of n_kv_head * head_dim floats, a separate line per
+                 * slot -- and the FMA block directly below consumes it, so the
+                 * step is exposed to gather latency with nothing to overlap.
+                 *
+                 * The next step's keys are already known: the scorer half
+                 * published the whole tile's slots into shared memory before
+                 * the barrier above, and this loop walks them in order.  Their
+                 * value rows can be pulled toward L2 one step early, in the
+                 * shadow of this step's arithmetic, at the very addresses the
+                 * next step's guarded loads will use.  The guard is re-tested
+                 * there, so a negative key still contributes its zero pair.
+                 *
+                 * Issued only when a full next step exists, so the loop tail
+                 * and the scalar remainder below are untouched.
+                 *
+                 * Kill switch: -DQWEN4EXP_QSA3_VPREFETCH=0. */
+#ifndef QWEN4EXP_QSA3_VPREFETCH
+#define QWEN4EXP_QSA3_VPREFETCH 1
+#endif
+#if QWEN4EXP_QSA3_VPREFETCH
+                if (j + 2u * QWEN4EXP_QSA3_VSTEP <= n_in_tile) {
+#pragma unroll
+                    for (uint32_t u = 0; u < QWEN4EXP_QSA3_VSTEP; u++) {
+                        const int32_t kn = keys[j + QWEN4EXP_QSA3_VSTEP + u];
+                        if (kn >= 0) {
+                            const float *const pp =
+                                vbase + (uint64_t)kn * kv_stride;
+                            asm volatile("prefetch.global.L2 [%0];"
+                                         :: "l"(pp) : "memory");
+                        }
+                    }
+                }
+#endif
 #pragma unroll
                 for (uint32_t h = 0; h < GROUP; h++) {
 #pragma unroll
