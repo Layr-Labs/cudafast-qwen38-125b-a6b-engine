@@ -722,8 +722,11 @@ __global__ static void qwen4exp_gdn_conv_kernel(
         const float sumsq = warp_sum_f32(activated * activated);
         if (lane == 0u) red[warp] = sumsq;
         __syncthreads();
-        float total = lane < 4u ? red[lane] : 0.0f;
-        total = warp_sum_all_f32(total);
+        /* Four warps wrote four partials; the butterfly's other twenty-eight
+         * lanes carried zeros.  Reading the four out of shared memory in the
+         * butterfly's own order is the same float it produced, without the
+         * lane select or the five shuffles that produced it. */
+        const float total = (red[0] + red[1]) + (red[2] + red[3]);
         qkv[index] = activated *
             rsqrtf(total + qk_norm_eps) * post_scale;
     }
@@ -841,8 +844,11 @@ __global__ static void qwen4exp_gdn_conv_replay_gates_kernel(
         const float sumsq = warp_sum_f32(activated * activated);
         if (lane == 0u) red[warp] = sumsq;
         __syncthreads();
-        float total = lane < 4u ? red[lane] : 0.0f;
-        total = warp_sum_all_f32(total);
+        /* Four warps wrote four partials; the butterfly's other twenty-eight
+         * lanes carried zeros.  Reading the four out of shared memory in the
+         * butterfly's own order is the same float it produced, without the
+         * lane select or the five shuffles that produced it. */
+        const float total = (red[0] + red[1]) + (red[2] + red[3]);
         qkv[index] = activated *
             rsqrtf(total + qk_norm_eps) * post_scale;
     }
@@ -973,8 +979,11 @@ __global__ static void qwen4exp_gdn_conv_parallel_kernel(
     const float sumsq = warp_sum_f32(activated * activated);
     if (lane == 0u) red[warp] = sumsq;
     __syncthreads();
-    float total = lane < 4u ? red[lane] : 0.0f;
-    total = warp_sum_all_f32(total);
+    /* Four warps wrote four partials; the butterfly's other twenty-eight
+     * lanes carried zeros.  Reading the four out of shared memory in the
+     * butterfly's own order is the same float it produced, without the
+     * lane select or the five shuffles that produced it. */
+    const float total = (red[0] + red[1]) + (red[2] + red[3]);
     *dst = activated * rsqrtf(total + qk_norm_eps) * post_scale;
 
     /* This token-wide kernel is already the producer immediately before the
