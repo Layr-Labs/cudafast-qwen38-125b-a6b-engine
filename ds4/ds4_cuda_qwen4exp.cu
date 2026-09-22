@@ -1862,6 +1862,7 @@ static float *qwen4exp_conv_scratch(int tier, uint64_t elements) {
 #define QWEN4EXP_GDN_ADOPT_SLOTS 6u
 
 /* Defined beside the Q8_0 quantize seam it shares with the HC mixer. */
+template<int Opt>
 __global__ static void qwen4exp_gdn_output_quant_kernel(
         int8_t *xq, float *xscale, const float *out, const float *output_gate,
         const float *output_norm, uint32_t n_value_head, uint32_t n_tokens,
@@ -2957,12 +2958,22 @@ static int qwen4exp_cuda_gdn_run(
     }
 
     if (out_q8) {
-        qwen4exp_gdn_output_quant_kernel<<<dim3(n_tokens, n_value_head, 1u),
-                                           QWEN4EXP_GDN_DIM, 0, stream>>>(
-                (int8_t *)((char *)out_q8->ptr + q_offset),
-                (float *)((char *)out_q8->ptr + s_offset),
-                (const float *)out->ptr, (const float *)output_gate->ptr,
-                output_norm, n_value_head, n_tokens, norm_eps);
+        static const int output_opt = []() {
+            const char *e = getenv("DS4_GDN_OUTPUT_OPT");
+            return e && e[0] >= '0' && e[0] <= '3' ? e[0] - '0' : 3;
+        }();
+#define QW_GDN_OUTPUT_LAUNCH(OPT) \
+        qwen4exp_gdn_output_quant_kernel<OPT><<<dim3(n_tokens, n_value_head, 1u), \
+                                           QWEN4EXP_GDN_DIM, 0, stream>>>( \
+                (int8_t *)((char *)out_q8->ptr + q_offset), \
+                (float *)((char *)out_q8->ptr + s_offset), \
+                (const float *)out->ptr, (const float *)output_gate->ptr, \
+                output_norm, n_value_head, n_tokens, norm_eps)
+        if (output_opt == 0) { QW_GDN_OUTPUT_LAUNCH(0); }
+        else if (output_opt == 2) { QW_GDN_OUTPUT_LAUNCH(2); }
+        else if (output_opt == 3) { QW_GDN_OUTPUT_LAUNCH(3); }
+        else { QW_GDN_OUTPUT_LAUNCH(1); }
+#undef QW_GDN_OUTPUT_LAUNCH
         return cuda_ok(cudaGetLastError(),
                        "qwen4exp GDN output norm quantize launch");
     }
@@ -11828,6 +11839,7 @@ __device__ __forceinline__ static float qwen4exp_q8_rcp_approx(float d) {
  * is the standalone kernel's row * blocks + b.  Every group is full, so the
  * standalone kernel's ragged-tail guard has nothing to guard.  One row of
  * prefill only. */
+template<int Opt>
 __global__ static void qwen4exp_gdn_output_quant_kernel(
         int8_t      *xq,
         float       *xscale,
@@ -11858,14 +11870,26 @@ __global__ static void qwen4exp_gdn_output_quant_kernel(
     const uint64_t base = (uint64_t)token * value_dim +
         head * QWEN4EXP_GDN_DIM;
     const float raw = out[base + tid];
+    float norm_w = 0.0f, gate_v = 0.0f;
+    if constexpr (Opt & 2) {
+        norm_w = output_norm[tid];
+        gate_v = qwen4exp_gdn_sigmoid(output_gate[base + tid]);
+    }
     float total = warp_sum_f32(raw * raw);
     if (lane == 0u) partial[warp] = total;
     __syncthreads();
-    total = lane < 4u ? partial[lane] : 0.0f;
-    total = warp_sum_all_f32(total);
+    if constexpr (Opt & 1) {
+        total = (partial[0] + partial[2]) + (partial[1] + partial[3]);
+    } else {
+        total = lane < 4u ? partial[lane] : 0.0f;
+        total = warp_sum_all_f32(total);
+    }
     const float scale = rsqrtf(total / (float)QWEN4EXP_GDN_DIM + norm_eps);
-    const float v = raw * scale * output_norm[tid] *
-        qwen4exp_gdn_sigmoid(output_gate[base + tid]);
+    if constexpr (!(Opt & 2)) {
+        norm_w = output_norm[tid];
+        gate_v = qwen4exp_gdn_sigmoid(output_gate[base + tid]);
+    }
+    const float v = raw * scale * norm_w * gate_v;
     const float vz = qwen4exp_q8_ftz(v);
     float a = qwen4exp_q8_ftz(fabsf(v));
 #pragma unroll
