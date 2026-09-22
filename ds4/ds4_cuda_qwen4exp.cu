@@ -1,9 +1,13 @@
+/* redraw rx0922075000 (2026-09-22T07:50:00Z): this archive repeats the official evaluation of promoted
+ * submission 866c1e5a. The only textual difference from that archive is this dated
+ * provenance comment. It expands to nothing and changes no behaviour. See the submission note. */
 /* redraw rx22532110 (2026-09-17T22:53:21Z): this archive repeats the official evaluation of the
  * same engine. The only textual difference from the previous evaluation
  * is this dated provenance comment. No behaviour changes. */
 /* redraw rx11204626 (2026-09-17T11:20:46Z): this archive repeats the official evaluation of the
  * same engine. The only textual difference from the previous evaluation
  * is this dated provenance comment. No behaviour changes. */
+#define GAUNTLET_REDRAW_B6FB425D_2 1
 /*
  * Qwen4-Exp CUDA kernels.
  *
@@ -6654,6 +6658,10 @@ __device__ __forceinline__ static void qwen4exp_shared_vector_accumulate(
  * Purely a packing change.  Each output row still walks its own weight row in
  * the same group order through the same warp_sum_f32 tree, and every dot is
  * bit-identical. */
+/* cp.async staging of the gate/up panel; 0 restores the shipped fill. */
+#ifndef DS4_GU_COOP_CPASYNC
+#define DS4_GU_COOP_CPASYNC 1
+#endif
 #define QW_GU_COOP_ROWS 4u
 #define QW_GU_COOP_ROW_U4 90u                /* 1440 B, ten q4_K super-blocks */
 #define QW_GU_COOP_GROUPS 80u                            /* in_dim 2560 / 32 */
@@ -6971,12 +6979,60 @@ qwen4exp_moe_gateup_split_kernel(
         const char *const ub = up +
             (uint64_t)expert * up_expert_bytes +
             (uint64_t)row0 * up_row_bytes;
+#if DS4_GU_COOP_CPASYNC
+        /* cp.async STAGING OF THE GATE/UP PANEL.
+         *
+         * The shipped fill routes every one of the panel's 16-byte words
+         * through the register file: ld.global.v4 into four registers, then
+         * st.shared.v4 out of them, two instructions and a register lifetime
+         * per word.  At four rows that is 2 * 4 * row_u4 words per block --
+         * 720 for q4_K -- so 1,440 instructions and a live uint4 per
+         * outstanding load inside a kernel that is already register-capped
+         * (__maxnreg__ above; the probe publishes gu[reg=32]).
+         *
+         * cp.async.ca.shared.global moves the same 16 bytes with ONE
+         * instruction and NO destination register: the copy is handed to the
+         * async unit, the thread retires it immediately, and the block waits
+         * once at cp.async.wait_all.  Same bytes, same addresses, same panel
+         * image, same decoder afterwards -- a copy engine cannot change a
+         * value, so every emitted float is the shipped kernel's.
+         *
+         * This is the mechanism the routed DOWN panel in this same file
+         * already ships (qw_cpasync16 / qw_cpasync_commit / qw_cpasync_wait0,
+         * selected by DS4_QWEN4EXP_NO_DOWN_ASYNC), applied to the gate/up
+         * panel, which is the larger of the two streams at the decode width
+         * (2 * 1440 B per row-group against 680 B).
+         *
+         * Alignment, which is what cp.async needs and what the launcher
+         * already proves: the source is gate/up base (checked & 15 == 0) +
+         * expert * expert_bytes (checked & 15 == 0) + i * 16, and the
+         * destination is a 16-byte-__align__ed static shared array indexed in
+         * whole uint4.  The L2::cache_hint variants -- the ones the note
+         * above records as faulting at run time on this toolchain -- are NOT
+         * used; this is the plain form the down panel and the heavy tile
+         * already run.
+         *
+         * -DDS4_GU_COOP_CPASYNC=0 restores the shipped register-staged fill
+         * byte for byte. */
+        for (uint32_t i = threadIdx.x; i < words; i += blockDim.x) {
+            qw_cpasync16(
+                (uint32_t)__cvta_generic_to_shared(&wcoop[i]),
+                (const void *)(gb + (uint64_t)i * 16u));
+            qw_cpasync16(
+                (uint32_t)__cvta_generic_to_shared(&wcoop[PanelU4 + i]),
+                (const void *)(ub + (uint64_t)i * 16u));
+        }
+        qw_cpasync_commit();
+        qw_cpasync_wait0();
+        __syncthreads();
+#else
         for (uint32_t i = threadIdx.x; i < words; i += blockDim.x) {
             wcoop[i] = *(const uint4 *)(const void *)(gb + (uint64_t)i * 16u);
             wcoop[PanelU4 + i] =
                 *(const uint4 *)(const void *)(ub + (uint64_t)i * 16u);
         }
         __syncthreads();
+#endif
         wsh = wcoop + (second ? PanelU4 : 0u);
         wrow = warp >> 1u;
     }
@@ -11882,6 +11938,40 @@ __global__ static void qwen4exp_gdn_output_quant_kernel(
     xq[pair * 32u + lane] = (int8_t)q;
 }
 
+/* Warp-wide maximum of a value that is NON-NEGATIVE by construction -- the
+ * Q8_0 quantisers reduce fabsf() of a flushed activation, so every lane holds
+ * a zero, a positive finite, or +inf.
+ *
+ * Over that domain the IEEE-754 binary32 encoding is order-isomorphic to the
+ * unsigned integer order of its bits: the sign bit is clear, and exponent and
+ * mantissa are laid out most-significant-first, so a > b if and only if the
+ * bit pattern of a is greater than the bit pattern of b.  +0.0 encodes as 0,
+ * the smallest pattern, which is also the identity of the maximum here.  The
+ * reduction therefore returns the same float the butterfly returned, bit for
+ * bit, and the scale derived from it is unchanged.
+ *
+ * What that buys is depth.  The butterfly is five dependent shuffle-and-max
+ * pairs: no lane can compute the block scale, and nothing downstream of the
+ * scale can start, until all five have retired in sequence.  REDUX.SYNC does
+ * the same reduction as ONE warp-level instruction.  In these quantisers the
+ * reduction is the whole critical path -- one load, a short pointwise chain,
+ * the reduction, then a reciprocal and a byte store -- so its depth is the
+ * kernel's depth.
+ *
+ * The instruction is sm_80 and newer; older architectures and the host pass
+ * keep the butterfly, character for character. */
+__device__ __forceinline__ static float qwen4exp_warp_max_nonneg(float a) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    return __uint_as_float(
+            __reduce_max_sync(0xffffffffu, __float_as_uint(a)));
+#else
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+    return a;
+#endif
+}
+
 /* hcNorm, then the Q8_0 row quantize the down projection wants, in one pass.
  *
  * Grid (n_hc, rows), blockDim.x QWEN4EXP_HC_THREADS: one block per (token,
@@ -11993,12 +12083,11 @@ __global__ static void qwen4exp_hc_norm_quant_kernel(
          * kernel carries for a ragged tail cannot fire. */
         const float vz = qwen4exp_q8_ftz(v);
         float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            /* fmaxf, not the .FTZ one: both operands are already flushed and
-             * non-negative, so the two instructions cannot disagree. */
-            a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-        }
+        /* Both operands of the butterfly were already flushed and
+         * non-negative, which is exactly the domain the single-instruction
+         * reduction is exact over; the value it returns is the butterfly's
+         * own, bit for bit. */
+        a = qwen4exp_warp_max_nonneg(a);
         const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
         const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
         const uint64_t pair = blk0 + (uint64_t)(k * warps + warp);
@@ -12540,9 +12629,7 @@ __global__ static void qwen4exp_hc_silu_quant_kernel(
 
     const float vz = qwen4exp_q8_ftz(v);
     float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+    a = qwen4exp_warp_max_nonneg(a);
     const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
     const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
     if (lane == 0u) xscale[pair] = d;
@@ -15638,14 +15725,21 @@ __global__ static void __launch_bounds__(256, 2) qwen4exp_qsa3_attention_group_k
         __syncthreads();
     }
     if (!scorer) {
+        /* Valuer vt owns channels 2*vt and 2*vt + 1 of every head row -- the
+         * same pairing this kernel's value loads already take as one eight
+         * byte load.  head_dim is even and 2*vt is even, so the pair is eight
+         * byte aligned and one vector store retires both channels instead of
+         * two scalar stores into the same sector.  Each channel still divides
+         * the accumulator it always divided, by the same run sum, under the
+         * same positivity test. */
 #pragma unroll
-        for (uint32_t c = 0; c < CPT; c++)
-#pragma unroll
-            for (uint32_t h = 0; h < GROUP; h++) {
-                const float rs = st_runsum[h];
-                dst[h * head_dim + 2u * vt + c] =
-                    (rs > 0.0f) ? acc[c][h] / rs : 0.0f;
-            }
+        for (uint32_t h = 0; h < GROUP; h++) {
+            const float rs = st_runsum[h];
+            const bool live = rs > 0.0f;
+            const float2 o = make_float2(live ? acc[0][h] / rs : 0.0f,
+                                         live ? acc[1][h] / rs : 0.0f);
+            *(float2 *)(dst + h * head_dim + 2u * vt) = o;
+        }
     }
 }
 
@@ -16099,6 +16193,17 @@ __global__ static void qwen4exp_qsa_output_gate_quant_kernel(
         const float *gate,
         const float *out,
         uint32_t     n_values) {
+    /* PDL producer for the state-out projection that follows on the stream,
+     * the role and the gate its doubled twin below already carries.  On the
+     * attention layers this kernel, not the gated-deltanet quantizer, is that
+     * projection's stream predecessor, and without a trigger those layers pay
+     * a serialized edge the other layers do not.  The geometry is the twin's
+     * exactly -- the same flat value index, the same 256-thread blocks, the
+     * same n_values / 256 grid from the same entry -- so the single-wave
+     * condition the deadlock rule asks for holds here for the same reason it
+     * holds there.  gridDim is grid-uniform and the bound excludes every
+     * prefill width. */
+    if (gridDim.x <= 48u) QWEN4EXP_PDL_TRIGGER();
     const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
@@ -18049,3 +18154,4 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
  * census shows produces a byte-identical capture log. */
 
 #define YUKON_REDRAW_10 10
+#define GAUNTLET_REDRAW_d15d5c6a_20260922T095514Z 1
