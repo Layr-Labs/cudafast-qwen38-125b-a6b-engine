@@ -6533,9 +6533,34 @@ __global__ static void qwen4exp_moe_down_combine_kernel(
     if (idx >= (uint64_t)n_tokens * out_dim) return;
     const uint32_t token = (uint32_t)(idx / out_dim);
     const uint32_t row = (uint32_t)(idx - (uint64_t)token * out_dim);
+    /* The ten slot descriptors are read four at a time.  The walk used to
+     * load selected[pair], test it, and only then address partial[pair], so
+     * every one of the ten partial loads waited on the scalar before it and
+     * the block spent the combine in a chain of dependent round trips.  Four
+     * independent descriptor loads issue together and their partial loads
+     * follow as a group; the tail keeps the original one-at-a-time form for
+     * a slot count the quad does not divide.  The accumulation is untouched:
+     * the same partials, added in the same ascending slot order, under the
+     * same validity test. */
+    const uint64_t pair0 = (uint64_t)token * n_expert_used;
     float acc = 0.0f;
-    for (uint32_t slot = 0; slot < n_expert_used; slot++) {
-        const uint64_t pair = (uint64_t)token * n_expert_used + slot;
+    uint32_t slot = 0;
+    for (; slot + 4u <= n_expert_used; slot += 4u) {
+        const int32_t e0 = selected[pair0 + slot];
+        const int32_t e1 = selected[pair0 + slot + 1u];
+        const int32_t e2 = selected[pair0 + slot + 2u];
+        const int32_t e3 = selected[pair0 + slot + 3u];
+        if (e0 >= 0 && (uint32_t)e0 < n_total_expert)
+            acc += partial[(pair0 + slot) * out_dim + row];
+        if (e1 >= 0 && (uint32_t)e1 < n_total_expert)
+            acc += partial[(pair0 + slot + 1u) * out_dim + row];
+        if (e2 >= 0 && (uint32_t)e2 < n_total_expert)
+            acc += partial[(pair0 + slot + 2u) * out_dim + row];
+        if (e3 >= 0 && (uint32_t)e3 < n_total_expert)
+            acc += partial[(pair0 + slot + 3u) * out_dim + row];
+    }
+    for (; slot < n_expert_used; slot++) {
+        const uint64_t pair = pair0 + slot;
         const int32_t e = selected[pair];
         if (e < 0 || (uint32_t)e >= n_total_expert) continue;
         acc += partial[pair * out_dim + row];
@@ -6563,8 +6588,26 @@ __global__ static void qwen4exp_moe_down_combine_grid_kernel(
     const uint32_t token = blockIdx.y;
     if (row >= out_dim || token >= n_tokens) return;
     const uint64_t pair0 = (uint64_t)token * n_expert_used;
+    /* The quad-at-a-time descriptor read of the flat kernel above, on this
+     * kernel's own (token, row) indices: same partials, same ascending slot
+     * order, same validity test. */
     float acc = 0.0f;
-    for (uint32_t slot = 0; slot < n_expert_used; slot++) {
+    uint32_t slot = 0;
+    for (; slot + 4u <= n_expert_used; slot += 4u) {
+        const int32_t e0 = selected[pair0 + slot];
+        const int32_t e1 = selected[pair0 + slot + 1u];
+        const int32_t e2 = selected[pair0 + slot + 2u];
+        const int32_t e3 = selected[pair0 + slot + 3u];
+        if (e0 >= 0 && (uint32_t)e0 < n_total_expert)
+            acc += partial[(pair0 + slot) * out_dim + row];
+        if (e1 >= 0 && (uint32_t)e1 < n_total_expert)
+            acc += partial[(pair0 + slot + 1u) * out_dim + row];
+        if (e2 >= 0 && (uint32_t)e2 < n_total_expert)
+            acc += partial[(pair0 + slot + 2u) * out_dim + row];
+        if (e3 >= 0 && (uint32_t)e3 < n_total_expert)
+            acc += partial[(pair0 + slot + 3u) * out_dim + row];
+    }
+    for (; slot < n_expert_used; slot++) {
         const uint64_t pair = pair0 + slot;
         const int32_t e = selected[pair];
         if (e < 0 || (uint32_t)e >= n_total_expert) continue;
@@ -18049,3 +18092,4 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
  * census shows produces a byte-identical capture log. */
 
 #define YUKON_REDRAW_10 10
+#define GAUNTLET_REDRAW_f68dddd4_20260922T170705Z 1
