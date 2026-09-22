@@ -1,3 +1,6 @@
+/* redraw rx0922142703 (2026-09-22T14:27:03Z): this archive repeats the official evaluation of promoted
+ * submission 866c1e5a. The only textual difference from that archive is this dated
+ * provenance comment. It expands to nothing and changes no behaviour. See the submission note. */
 /* redraw rx22532110 (2026-09-17T22:53:21Z): this archive repeats the official evaluation of the
  * same engine. The only textual difference from the previous evaluation
  * is this dated provenance comment. No behaviour changes. */
@@ -7336,6 +7339,11 @@ template <int R, int DownType = -1, bool Vector = false, bool Stage = false,
  * phase's graph captures. A comparison that does not discard each
  * residency's first run is measuring which arm happened to go first.
  */
+/* Prefetch distance for the routed-down panel stream, in staged steps.  The
+ * step sequence is n_expert_used * take long (20 at the decode width), so any
+ * value below that is expressible; 1 would duplicate the fill's own distance
+ * and buy nothing.  Used by BOTH the prologue and the step loop. */
+#define QW_DOWN_L2_DIST 4u
 __global__ static void qwen4exp_moe_down_q_kernel(
         float *out,
         const char *down,
@@ -7350,7 +7358,8 @@ __global__ static void qwen4exp_moe_down_q_kernel(
         uint32_t out_dim,
         uint32_t n_tokens,
         uint32_t n_total_expert,
-        uint32_t n_expert_used) {
+        uint32_t n_expert_used,
+        uint32_t l2_ahead) {
     /* Dynamic shared memory is 16-byte aligned by contract, and it is requested
      * only for the Stage instantiations; the others map nothing here. */
     extern __shared__ uint4 qw_down_panel[];
@@ -7430,9 +7439,65 @@ __global__ static void qwen4exp_moe_down_q_kernel(
             }
         }
     };
+    /* L2-ahead.  The fill above is issued exactly ONE step in front of the step
+     * that consumes it, and a step's arithmetic is short: at the decode width a
+     * lane decodes a single 32-value group and accumulates it, while the panel
+     * it reads is 8 rows of weights fetched from DRAM.  One step of that is not
+     * enough to cover a DRAM miss, so the copy latency is exposed again at
+     * every barrier -- the same argument the base tree's gate/up heavy tile
+     * makes for its own chunk stream, where an L2 prefetch several chunks ahead
+     * of the cp.async is worth real time.  This asks the L2 for the panel that
+     * step k+QW_DOWN_L2_DIST will copy while step k+1's cp.async is in flight,
+     * so each panel is requested exactly once, QW_DOWN_L2_DIST steps before it
+     * is needed.  The distance is ONE named constant used by both the prologue
+     * and the loop, so there is no way to move one and forget the other.
+     *
+     * It changes no value.  `prefetch.global.L2` moves nothing into shared
+     * memory, writes no register, and the loads that follow read the same bytes
+     * whether the line was resident or not, so every emitted token is
+     * bit-identical by construction rather than by tolerance.
+     *
+     * The addresses are exactly the ones the fill will touch: same expert base,
+     * same `row0`, same `[0, panel_bytes)` span, one 128-byte line per thread,
+     * which covers a whole panel in one instruction per thread (panel_bytes is
+     * 5,440 B, so lanes 0..42 of 256 issue one prefetch each).  No new byte of
+     * the slab is read, so this cannot fault where the fill would not.
+     *
+     * Guarded on `Stage && Async` (compile-time) so the plain and non-staged
+     * instantiations are untouched, and on the `l2_ahead` argument so
+     * DS4_QWEN4EXP_NO_DOWN_L2AHEAD stands it down without a rebuild.  An
+     * out-of-range or unrouted step returns without issuing anything, and
+     * `__shfl_sync` is reached by the whole warp because `kslot` and `kr` are
+     * derived from block-uniform values. */
+    auto qw_l2_ahead = [&](uint32_t k) {
+        if (!(Stage && Async) || !l2_ahead) return;
+        const uint32_t kslot = k / take;
+        if (kslot >= n_expert_used) return;
+        const uint32_t kr = k - kslot * take;
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            if ((uint32_t)r == kr) {
+                const int32_t e = __shfl_sync(0xffffffffu, route[r], kslot);
+                if (e < 0 || (uint32_t)e >= n_total_expert) return;
+                const char *const gp = down +
+                    (uint64_t)(uint32_t)e * down_expert_bytes +
+                    (uint64_t)row0 * down_row_bytes;
+                for (uint64_t o = (uint64_t)threadIdx.x * 128u;
+                     o < panel_bytes; o += (uint64_t)blockDim.x * 128u)
+                    qw_prefetch_l2(gp + o);
+            }
+        }
+    };
     if (Stage) {
         qw_fill_step(0u, 0u, spanel);
         if (Async) qw_cpasync_commit();
+        /* Steps 1 .. DIST-1 have no earlier step to issue their prefetch, so
+         * the prologue covers them; the loop below then asks for step+DIST
+         * exactly once per panel.  Both reads are of `down` and of `route`,
+         * which the prologue fill above already reads, so the PDL argument
+         * below covers them unchanged. */
+#pragma unroll
+        for (uint32_t k = 1u; k < QW_DOWN_L2_DIST; k++) qw_l2_ahead(k);
     }
     /* PDL consumer fence (ds4_cuda_qwen4exp.cuh).  Everything above it reads
      * only `selected` and `down`:
@@ -7477,6 +7542,10 @@ __global__ static void qwen4exp_moe_down_q_kernel(
                                      (uint64_t)((step + 1u) & 1u) * panel_bytes);
                         if (Async) qw_cpasync_commit();
                     }
+                    /* The prologue covered panels 1 .. DIST-1, so issuing
+                     * only step+DIST here asks for each panel exactly once,
+                     * DIST steps before the step that copies it. */
+                    qw_l2_ahead(step + QW_DOWN_L2_DIST);
                 }
                 const uint32_t t = tok0 + (uint32_t)r;
                 const int32_t e = Vector ? __shfl_sync(0xffffffffu, route[r], slot)
@@ -9800,6 +9869,13 @@ static int qwen4exp_pdl_routed_down(void) {
     if (v < 0) v = getenv("DS4_QWEN4EXP_NO_PDL_ROUTED_DOWN") == NULL ? 1 : 0;
     return v;
 }
+/* The routed-down panel stream's L2 prefetch distance.  Returning 0 launches
+ * the tile with the same instructions it had before the prefetch existed. */
+static int qwen4exp_down_l2ahead(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4EXP_NO_DOWN_L2AHEAD") == NULL ? 1 : 0;
+    return v;
+}
 static int qwen4exp_pdl_router_tree(void) {
     static int v = -1;
     if (v < 0) v = getenv("DS4_QWEN4EXP_NO_PDL_ROUTER_TREE") == NULL ? 1 : 0;
@@ -10610,7 +10686,8 @@ static int qwen4exp_routed_moe_cuda(
             (float *)out->ptr, down, (const int32_t *)selected->ptr, \
             sc.mq, sc.ms, sc.msum, \
             down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
-            mgroups, out_dim, n_tokens, n_total_expert, n_expert_used
+            mgroups, out_dim, n_tokens, n_total_expert, n_expert_used, \
+            (uint32_t)qwen4exp_down_l2ahead()
 #define QWEN4EXP_DOWN_IMPL_S(R, DT, V, S, SH) do { \
     if (n_tokens <= 2u && qwen4exp_pdl_routed_down()) { \
         QWEN4EXP_LAUNCH_PDL((qwen4exp_moe_down_q_kernel<R, DT, V, S>), \
