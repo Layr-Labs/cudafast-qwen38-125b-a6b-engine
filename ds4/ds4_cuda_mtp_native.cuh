@@ -158,22 +158,106 @@ __global__ static void mtp_native_projection_kernel(
  *     leaves in key_out[0, CAP) -- the equivalence the sort's own comment
  *     above already argues, and which the host oracle
  *     ds4/tests/test_mtp_native_score_sort_oracle.py pins;
- *   - the ORDER this kernel emits that set in is arbitrary, and that cannot
- *     matter: the very next thing both screens do is sort the ids ASCENDING
- *     with a second cub sort, and a sort maps any permutation of one set to
- *     the same array.  Bit-exactness therefore does not rest on the select
- *     reproducing cub's ordering, only on the set.
+ *   - the selection emits that set in arbitrary order. The OrderIds variant
+ *     restores ascending ID order with a bitmap before returning; otherwise
+ *     the caller runs the original CUB ID sort. Both produce the same array.
  * DS4_MTP_NATIVE_SELECT=0 restores the shipped cub path exactly: the scratch
  * layout collapses back to the shipped offsets (the select arena is zero
  * bytes) and no kernel in the shipped build changes.
  */
 #define MTP_NATIVE_SELECT_THREADS 256
 
+/* Restore ascending original-ID order without another kernel launch.  Keys
+ * come from the disjoint [0,prefix) and [vocab-tail,vocab) intervals.  Their
+ * compact ordinal occupies [0,n), so even a sparse, very large vocabulary
+ * needs only ceil(n/32) bitmap words.  Unique selected IDs make this a set
+ * encoding, not a lossy sort.  Each block owns a contiguous bitmap interval;
+ * its count and an exclusive prefix of preceding block counts locate output.
+ *
+ * The select is finished before candA is reused.  The launch bounds gridDim
+ * by n, so bitmap + block counts fit in candA's n uint64_t entries:
+ * 4*(ceil(n/32)+gridDim) <= 8*n for n >= 1. */
+__device__ static void mtp_native_order_ids(
+        const uint32_t *ids, uint32_t *ordered, uint32_t cap,
+        uint32_t n, uint32_t prefix, uint32_t tail, uint32_t vocab,
+        uint64_t *arena, uint32_t *scan) {
+    const auto grid = cooperative_groups::this_grid();
+    const uint32_t t = threadIdx.x, lane = t & 31u;
+    const uint32_t tid = blockIdx.x * blockDim.x + t;
+    const uint32_t stride = gridDim.x * blockDim.x;
+    const uint32_t words = (n + 31u) / 32u;
+    uint32_t *bitmap = reinterpret_cast<uint32_t *>(arena);
+    uint32_t *counts = bitmap + words;
+    grid.sync();  // all select readers/writers must finish before arena reuse
+    for (uint32_t i = tid; i < words; i += stride) bitmap[i] = 0u;
+    grid.sync();
+    for (uint32_t i = tid; i < cap; i += stride) {
+        const uint32_t id = ids[i];
+        const uint32_t ordinal = id < prefix ? id : prefix + (id - (vocab - tail));
+        atomicOr(bitmap + (ordinal >> 5u), 1u << (ordinal & 31u));
+    }
+    grid.sync();
+    const uint32_t span = (words + gridDim.x - 1u) / gridDim.x;
+    const uint32_t begin = blockIdx.x * span;
+    const uint32_t end = min(begin + span, words);
+    uint32_t count = 0u;
+    for (uint32_t i = begin + t; i < end; i += blockDim.x)
+        count += __popc(bitmap[i]);
+    scan[t] = count;
+    __syncthreads();
+    for (uint32_t d = blockDim.x / 2u; d; d >>= 1u) {
+        if (t < d) scan[t] += scan[t + d];
+        __syncthreads();
+    }
+    if (!t) counts[blockIdx.x] = scan[0];
+    grid.sync();
+    uint32_t preceding = 0u;
+    for (uint32_t i = t; i < blockIdx.x; i += blockDim.x)
+        preceding += counts[i];
+    scan[t] = preceding;
+    __syncthreads();
+    for (uint32_t d = blockDim.x / 2u; d; d >>= 1u) {
+        if (t < d) scan[t] += scan[t + d];
+        __syncthreads();
+    }
+    uint32_t base = scan[0];
+    __syncthreads();
+    for (uint32_t tile = begin; tile < end; tile += blockDim.x) {
+        const uint32_t word = tile + t < end ? bitmap[tile + t] : 0u;
+        uint32_t rank = __popc(word);
+        const uint32_t own = rank;
+        for (uint32_t d = 1u; d < 32u; d <<= 1u) {
+            const uint32_t v = __shfl_up_sync(0xffffffffu, rank, d);
+            if (lane >= d) rank += v;
+        }
+        if (lane == 31u) scan[t >> 5u] = rank;
+        __syncthreads();
+        uint32_t warp_base = 0u, tile_count = 0u;
+        for (uint32_t w = 0u; w < blockDim.x / 32u; ++w) {
+            if (w < (t >> 5u)) warp_base += scan[w];
+            tile_count += scan[w];
+        }
+        uint32_t at = base + warp_base + rank - own;
+        uint32_t bits = word;
+        while (bits) {
+            const uint32_t ordinal = (tile + t) * 32u + (uint32_t)__ffs(bits) - 1u;
+            ordered[at++] = ordinal < prefix ? ordinal
+                : vocab - tail + (ordinal - prefix);
+            bits &= bits - 1u;
+        }
+        base += tile_count;
+        __syncthreads();  // all warps consumed scan before the next tile
+    }
+}
+
+template <bool OrderIds>
 __global__ __launch_bounds__(MTP_NATIVE_SELECT_THREADS) static void
 mtp_native_select_kernel(const uint64_t *__restrict__ keys, uint32_t n,
                          uint32_t *__restrict__ ids, uint32_t cap,
                          uint32_t *hist, uint32_t *ctl,
-                         uint64_t *candA, uint64_t *candB) {
+                         uint64_t *candA, uint64_t *candB,
+                         uint32_t *ordered, uint32_t prefix,
+                         uint32_t tail, uint32_t vocab) {
     namespace cg = cooperative_groups;
     cg::grid_group grid = cg::this_grid();
     __shared__ uint32_t sh[256];
@@ -303,6 +387,19 @@ mtp_native_select_kernel(const uint64_t *__restrict__ keys, uint32_t n,
         dst = (dst == candA) ? candB : candA;
         grid.sync();
     }
+    if (OrderIds) mtp_native_order_ids(ids, ordered, cap, n, prefix, tail,
+                                      vocab, candA, sh);
+}
+
+/* Zero restores the separate CUB ID sort. Verification mode also uses that
+ * path, so its existing snapshots and reference overwrite remain unchanged. */
+static int mtp_native_order_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_MTP_NATIVE_ORDER_IDS");
+        cached = (e != nullptr && e[0] == '0') ? 0 : 1;
+    }
+    return cached;
 }
 
 /* DS4_MTP_NATIVE_SELECT=0 restores the shipped cub screens exactly. */
@@ -366,6 +463,7 @@ static void mtp_native_select_check_end(const ds4_gpu_tensor *scratch,
 /* Cooperative grid: every block must be resident for grid.sync(), so the grid
  * is exactly what the occupancy calculator says fits.  0 means "this device
  * will not take a cooperative launch" and the cub path runs. */
+template <bool OrderIds>
 static int mtp_native_select_grid(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -375,7 +473,7 @@ static int mtp_native_select_grid(void) {
             !coop ||
             cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess ||
             cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                &bpsm, mtp_native_select_kernel, MTP_NATIVE_SELECT_THREADS, 0) != cudaSuccess ||
+                &bpsm, mtp_native_select_kernel<OrderIds>, MTP_NATIVE_SELECT_THREADS, 0) != cudaSuccess ||
             nsm <= 0 || bpsm <= 0) {
             (void)cudaGetLastError();
             cached = 0;
@@ -413,9 +511,13 @@ static mtp_native_layout mtp_native_offsets(uint32_t width) {
  * Returns 1 when it ran, 0 when the caller must fall back to cub. */
 static int mtp_native_select_launch(char *base, uint64_t select_off,
                                     uint32_t width, const uint64_t *key_in,
-                                    uint32_t *id_tmp, uint32_t cap) {
-    const int sgrid = mtp_native_select_grid();
+                                    uint32_t *id_tmp, uint32_t cap,
+                                    uint32_t *ordered, uint32_t prefix,
+                                    uint32_t tail, uint32_t vocab, bool order_ids) {
+    int sgrid = order_ids ? mtp_native_select_grid<true>()
+                         : mtp_native_select_grid<false>();
     if (sgrid <= 0) return 0;
+    if ((uint32_t)sgrid > width) sgrid = (int)width;
     const uint64_t stride = mtp_native_align((uint64_t)width * 8u);
     uint64_t *candA = (uint64_t *)(base + select_off);
     uint64_t *candB = (uint64_t *)(base + select_off + stride);
@@ -424,8 +526,11 @@ static int mtp_native_select_launch(char *base, uint64_t select_off,
     const uint64_t *keys = key_in;
     uint32_t n = width, k = cap;
     void *args[] = { (void *)&keys, (void *)&n, (void *)&id_tmp, (void *)&k,
-                     (void *)&hist, (void *)&ctl, (void *)&candA, (void *)&candB };
-    if (cudaLaunchCooperativeKernel((void *)mtp_native_select_kernel,
+                     (void *)&hist, (void *)&ctl, (void *)&candA, (void *)&candB,
+                     (void *)&ordered, (void *)&prefix, (void *)&tail, (void *)&vocab };
+    void *kernel = order_ids ? (void *)mtp_native_select_kernel<true>
+                            : (void *)mtp_native_select_kernel<false>;
+    if (cudaLaunchCooperativeKernel(kernel,
             dim3((unsigned)sgrid), dim3(MTP_NATIVE_SELECT_THREADS), args, 0,
             cuda_decode_stream()) != cudaSuccess) {
         (void)cudaGetLastError();
@@ -695,12 +800,15 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
      * Ranked confirmation: every run carrying it (PRs #531-#535) drafted and
      * accepted exactly as the tip does on the hidden prompt (79 rounds, 49 of
      * 78 drafts accepted). */
-    /* DS4_MTP_NATIVE_SELECT: one cooperative radix-select launch in place of
-     * the six-launch cub chain and its unpack.  Same candidate SET, and the
-     * ID sort below makes the order it comes out in irrelevant. */
+    /* The cooperative variant may also restore ID order before returning.
+     * Keep the separate sort if its output aliases the reused select arena. */
+    const bool order_ids = mtp_native_order_enabled() && !mtp_native_select_verify() &&
+        mtp_native_key_range_disjoint(scratch->ptr, scratch->bytes,
+                                     ids->ptr, ids->bytes);
     const int selected = mtp_native_select_enabled() &&
         mtp_native_select_launch(base, l.select, width, key_in, id_tmp,
-                                 MTP_NATIVE_CAP);
+                                 MTP_NATIVE_CAP, (uint32_t *)ids->ptr,
+                                 prefix, tail, vocab, order_ids);
     if (selected && !cuda_ok(cudaGetLastError(), "native candidate select"))
         return -1;
     if (!selected || mtp_native_select_verify()) {
@@ -736,7 +844,8 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
     int id_bits = 1;
     while (id_bits < 32 && ((uint32_t)1u << id_bits) < vocab) id_bits++;
     if (id_bits > 32) id_bits = 32;
-    if (!cuda_ok(cub::DeviceRadixSort::SortKeys(base+l.temporary,temporary,
+    if (!(selected && order_ids) &&
+        !cuda_ok(cub::DeviceRadixSort::SortKeys(base+l.temporary,temporary,
             id_tmp,(uint32_t *)ids->ptr,MTP_NATIVE_CAP,0,id_bits,
             cuda_decode_stream()),
             "native original-ID sort")) return -1;
@@ -852,9 +961,13 @@ extern "C" int ds4_gpu_mtp_native_screen2(ds4_gpu_tensor *out,
         uint32_t *itmp = id_tmp + (uint64_t)r * MTP_TARGET_NATIVE_CAP;
         uint32_t *iout = (uint32_t *)ids->ptr +
             (uint64_t)r * MTP_TARGET_NATIVE_CAP;
+        const bool order_ids = mtp_native_order_enabled() && !mtp_native_select_verify() &&
+            mtp_native_key_range_disjoint(scratch->ptr, scratch->bytes,
+                                         ids->ptr, ids->bytes);
         const int selected = mtp_native_select_enabled() &&
             mtp_native_select_launch(base, l.select, width, kin, itmp,
-                                     MTP_TARGET_NATIVE_CAP);
+                                     MTP_TARGET_NATIVE_CAP, iout,
+                                     prefix, tail, vocab, order_ids);
         if (selected && !cuda_ok(cudaGetLastError(),
                                  "native R2 candidate select")) return -1;
         if (!selected || mtp_native_select_verify()) {
@@ -874,7 +987,7 @@ extern "C" int ds4_gpu_mtp_native_screen2(ds4_gpu_tensor *out,
                 MTP_TARGET_NATIVE_CAP, "target");
         }
         temporary = (size_t)(scratch->bytes - l.temporary);
-        if (!cuda_ok(cub::DeviceRadixSort::SortKeys(
+        if (!(selected && order_ids) && !cuda_ok(cub::DeviceRadixSort::SortKeys(
                 base + l.temporary, temporary, itmp, iout,
                 MTP_TARGET_NATIVE_CAP,
                 0, id_bits, cuda_decode_stream()),
