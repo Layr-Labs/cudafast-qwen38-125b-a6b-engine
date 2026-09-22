@@ -11882,6 +11882,40 @@ __global__ static void qwen4exp_gdn_output_quant_kernel(
     xq[pair * 32u + lane] = (int8_t)q;
 }
 
+/* Warp-wide maximum of a value that is NON-NEGATIVE by construction -- the
+ * Q8_0 quantisers reduce fabsf() of a flushed activation, so every lane holds
+ * a zero, a positive finite, or +inf.
+ *
+ * Over that domain the IEEE-754 binary32 encoding is order-isomorphic to the
+ * unsigned integer order of its bits: the sign bit is clear, and exponent and
+ * mantissa are laid out most-significant-first, so a > b if and only if the
+ * bit pattern of a is greater than the bit pattern of b.  +0.0 encodes as 0,
+ * the smallest pattern, which is also the identity of the maximum here.  The
+ * reduction therefore returns the same float the butterfly returned, bit for
+ * bit, and the scale derived from it is unchanged.
+ *
+ * What that buys is depth.  The butterfly is five dependent shuffle-and-max
+ * pairs: no lane can compute the block scale, and nothing downstream of the
+ * scale can start, until all five have retired in sequence.  REDUX.SYNC does
+ * the same reduction as ONE warp-level instruction.  In these quantisers the
+ * reduction is the whole critical path -- one load, a short pointwise chain,
+ * the reduction, then a reciprocal and a byte store -- so its depth is the
+ * kernel's depth.
+ *
+ * The instruction is sm_80 and newer; older architectures and the host pass
+ * keep the butterfly, character for character. */
+__device__ __forceinline__ static float qwen4exp_warp_max_nonneg(float a) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    return __uint_as_float(
+            __reduce_max_sync(0xffffffffu, __float_as_uint(a)));
+#else
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+    return a;
+#endif
+}
+
 /* hcNorm, then the Q8_0 row quantize the down projection wants, in one pass.
  *
  * Grid (n_hc, rows), blockDim.x QWEN4EXP_HC_THREADS: one block per (token,
@@ -11993,12 +12027,11 @@ __global__ static void qwen4exp_hc_norm_quant_kernel(
          * kernel carries for a ragged tail cannot fire. */
         const float vz = qwen4exp_q8_ftz(v);
         float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            /* fmaxf, not the .FTZ one: both operands are already flushed and
-             * non-negative, so the two instructions cannot disagree. */
-            a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-        }
+        /* Both operands of the butterfly were already flushed and
+         * non-negative, which is exactly the domain the single-instruction
+         * reduction is exact over; the value it returns is the butterfly's
+         * own, bit for bit. */
+        a = qwen4exp_warp_max_nonneg(a);
         const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
         const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
         const uint64_t pair = blk0 + (uint64_t)(k * warps + warp);
@@ -12540,9 +12573,7 @@ __global__ static void qwen4exp_hc_silu_quant_kernel(
 
     const float vz = qwen4exp_q8_ftz(v);
     float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+    a = qwen4exp_warp_max_nonneg(a);
     const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
     const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
     if (lane == 0u) xscale[pair] = d;
@@ -15638,14 +15669,21 @@ __global__ static void __launch_bounds__(256, 2) qwen4exp_qsa3_attention_group_k
         __syncthreads();
     }
     if (!scorer) {
+        /* Valuer vt owns channels 2*vt and 2*vt + 1 of every head row -- the
+         * same pairing this kernel's value loads already take as one eight
+         * byte load.  head_dim is even and 2*vt is even, so the pair is eight
+         * byte aligned and one vector store retires both channels instead of
+         * two scalar stores into the same sector.  Each channel still divides
+         * the accumulator it always divided, by the same run sum, under the
+         * same positivity test. */
 #pragma unroll
-        for (uint32_t c = 0; c < CPT; c++)
-#pragma unroll
-            for (uint32_t h = 0; h < GROUP; h++) {
-                const float rs = st_runsum[h];
-                dst[h * head_dim + 2u * vt + c] =
-                    (rs > 0.0f) ? acc[c][h] / rs : 0.0f;
-            }
+        for (uint32_t h = 0; h < GROUP; h++) {
+            const float rs = st_runsum[h];
+            const bool live = rs > 0.0f;
+            const float2 o = make_float2(live ? acc[0][h] / rs : 0.0f,
+                                         live ? acc[1][h] / rs : 0.0f);
+            *(float2 *)(dst + h * head_dim + 2u * vt) = o;
+        }
     }
 }
 
@@ -16099,6 +16137,17 @@ __global__ static void qwen4exp_qsa_output_gate_quant_kernel(
         const float *gate,
         const float *out,
         uint32_t     n_values) {
+    /* PDL producer for the state-out projection that follows on the stream,
+     * the role and the gate its doubled twin below already carries.  On the
+     * attention layers this kernel, not the gated-deltanet quantizer, is that
+     * projection's stream predecessor, and without a trigger those layers pay
+     * a serialized edge the other layers do not.  The geometry is the twin's
+     * exactly -- the same flat value index, the same 256-thread blocks, the
+     * same n_values / 256 grid from the same entry -- so the single-wave
+     * condition the deadlock rule asks for holds here for the same reason it
+     * holds there.  gridDim is grid-uniform and the bound excludes every
+     * prefill width. */
+    if (gridDim.x <= 48u) QWEN4EXP_PDL_TRIGGER();
     const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
@@ -18049,3 +18098,4 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
  * census shows produces a byte-identical capture log. */
 
 #define YUKON_REDRAW_10 10
+#define GAUNTLET_REDRAW_c5a91e34_20260922T193844Z 1
