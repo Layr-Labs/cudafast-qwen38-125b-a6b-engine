@@ -4503,7 +4503,7 @@ __global__ static void qwen4exp_moe_group_small_kernel(
  * its token is threadIdx.x >> 5 where it was blockIdx.x, and every warp
  * intrinsic already uses the full mask and stays inside its own warp.
  */
-template<bool Native>
+template<bool Native, bool KeyMax = false>
 __global__ static void qwen4exp_moe_router_group_small_kernel(
         int32_t *counts,
         int32_t *offsets,
@@ -4588,9 +4588,44 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
         if (e < n_expert) live |= 1u << j;
     }
 
+#if __CUDA_ARCH__ >= 800
+    uint32_t keys[16];
+    if constexpr (Native && KeyMax) {
+#pragma unroll
+    for (uint32_t j = 0; j < 16u; j++) {
+        const float v = scores[j];
+        const uint32_t bits = v == 0.0f ? 0u : __float_as_uint(v);
+        const uint32_t ordered = bits & 0x80000000u ? ~bits : bits ^ 0x80000000u;
+        // Original comparator ignores NaNs/-Inf, but accepts exact -FLT_MAX.
+        keys[j] = v >= -FLT_MAX ? ordered : 0u;
+    }
+    }
+#endif
     for (uint32_t rank = 0; rank < n_expert_used; rank++) {
         float best_v = -FLT_MAX;
         int32_t best_i = INT32_MAX;
+#if __CUDA_ARCH__ >= 800
+        if constexpr (Native && KeyMax) {
+        uint32_t best_key = 0u;
+#pragma unroll
+        for (uint32_t j = 0; j < 16u; j++) {
+            const uint32_t key = keys[j] & (0u - ((live >> j) & 1u));
+            best_key = max(best_key, key);
+        }
+        const uint32_t winning_key = __reduce_max_sync(0xffffffffu, best_key);
+        uint32_t matches = 0u;
+#pragma unroll
+        for (uint32_t j = 0; j < 16u; j++)
+            matches |= (uint32_t)(keys[j] == winning_key) << j;
+        matches &= live;
+        if (winning_key == 0u) matches = 0u;
+        const int32_t local_i = matches
+            ? (int32_t)(lane + ((uint32_t)__ffs(matches) - 1u) * 32u)
+            : INT32_MAX;
+        best_i = __reduce_min_sync(0xffffffffu, local_i);
+        } else
+#endif
+        {
 #pragma unroll
         for (uint32_t j = 0; j < 16u; j++) {
             if ((live & (1u << j)) == 0u) continue;
@@ -4626,6 +4661,7 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
                     best_i = other_i;
                 }
             }
+        }
         }
         const int32_t chosen =
             __shfl_sync(0xffffffffu, best_i, 0u);
@@ -7517,6 +7553,158 @@ __global__ static void qwen4exp_moe_down_q_kernel(
     }
 }
 
+template<int R,int DownType=-1,bool Vector=false,bool Stage=false,bool Async=false>
+__global__ __launch_bounds__(256, 4) static void qwen4exp_moe_down_q51_warp_kernel(
+        float *out,
+        const char *down,
+        const int32_t *selected,
+        const int8_t *mq,
+        const float *ms,
+        const int32_t *msum,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t down_type,
+        uint32_t groups,
+        uint32_t out_dim,
+        uint32_t n_tokens,
+        uint32_t n_total_expert,
+        uint32_t n_expert_used) {
+    static_assert(R == 2 && DownType == DS4_QWEN4EXP_TY_q5_1 &&
+                  Vector && Stage && Async, "native Q5 warp staging only");
+    /* The caller retains the original Stage guards and additionally requires
+     * row_bytes divisible by 16, so every warp's private copy is aligned. */
+    extern __shared__ uint4 qw_down_panel[];
+    char *const spanel = (char *)qw_down_panel;
+
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t row0 = blockIdx.x * 8u;
+    const uint32_t row = row0 + (threadIdx.x >> 5u);
+    const uint32_t tok0 = blockIdx.y * (uint32_t)R;
+    if (row >= out_dim || tok0 >= n_tokens) return;
+    const uint32_t take = n_tokens - tok0 < (uint32_t)R ? n_tokens - tok0
+                                                        : (uint32_t)R;
+    const uint64_t panel_bytes = (uint64_t)8u * down_row_bytes;
+
+    /* Up to 32 IDs, freshly loaded on every call or graph replay. */
+    int32_t route[R];
+#pragma unroll
+    for (int r = 0; r < R; r++)
+        route[r] = Vector && (uint32_t)r < take && lane < n_expert_used
+            ? selected[(uint64_t)(tok0 + r) * n_expert_used + lane] : -1;
+
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) acc[r] = 0.0f;
+
+    /* Every warp stages its own native Q5 row in each of the two panels.
+     * No row is read or written by another warp.  Slot/token traversal and
+     * the numerical body below match the original staged down kernel. */
+    auto qw_fill_step = [&](uint32_t slot, uint32_t rr, char *const dst) {
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            if ((uint32_t)r == rr) {
+                const int32_t e = __shfl_sync(0xffffffffu, route[r], slot);
+                if (e < 0 || (uint32_t)e >= n_total_expert) return;
+                const char *const gp = down +
+                    (uint64_t)(uint32_t)e * down_expert_bytes +
+                    (uint64_t)row * down_row_bytes;
+                char *const row_dst = dst + (uint64_t)(row - row0) * down_row_bytes;
+                for (uint64_t o = (uint64_t)lane * 16u;
+                     o < down_row_bytes; o += 32u * 16u) {
+                    if (Async) {
+                        qw_cpasync16((uint32_t)__cvta_generic_to_shared(row_dst + o),
+                                     gp + o);
+                    } else {
+                        *(uint4 *)(row_dst + o) = *(const uint4 *)(gp + o);
+                    }
+                }
+            }
+        }
+    };
+    if (Stage) {
+        qw_fill_step(0u, 0u, spanel);
+        if (Async) qw_cpasync_commit();
+    }
+    /* PDL consumer fence (ds4_cuda_qwen4exp.cuh).  Everything above it reads
+     * only `selected` and `down`:
+     *   - `down` is a read-only session weight slab, so the prologue panel
+     *     fill above may fly while the producer drains -- that is the whole
+     *     feature;
+     *   - `selected` is NOT this producer's output.  It is written by the
+     *     router/group kernel, which is a FULL stream predecessor of the mid
+     *     quantizer: the quantizer cannot begin, and so cannot trigger,
+     *     until the router has completed and its writes are visible.  The
+     *     programmatic edge relaxes only the immediately preceding edge, so
+     *     a block of this grid that is running at all is running after the
+     *     router retired.
+     * The producer's own output -- mq / ms / msum -- is read for the first
+     * time inside the slot loop below (`mq + at_g * 32u`, `ms[at_g]`,
+     * `msum[at_g]`), strictly after this fence.  No pointer in the signature
+     * carries __restrict__ and no read in the body uses __ldg, so nothing
+     * here can become an ld.global.nc that the fence does not order (the .NC
+     * rule).  On a plain launch the fence is a no-op, which is what verify,
+     * prefill and the stood-down valve take. */
+    QWEN4EXP_PDL_SYNC();
+    for (uint32_t slot = 0; slot < n_expert_used; slot++) {
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            if ((uint32_t)r < take) {
+                const uint32_t step = slot * take + (uint32_t)r;
+                if (Stage) {
+                    /* Publish this warp's completed row copies and retire
+                     * its previous readers before reusing its other row.
+                     * Invalid routes still commit and wait on an empty group. */
+                    if (Async) qw_cpasync_wait0();
+                    __syncwarp(0xffffffffu);
+                    const uint32_t nr =
+                        (uint32_t)r + 1u < take ? (uint32_t)r + 1u : 0u;
+                    const uint32_t nslot =
+                        (uint32_t)r + 1u < take ? slot : slot + 1u;
+                    if (nslot < n_expert_used) {
+                        qw_fill_step(nslot, nr, spanel +
+                                     (uint64_t)((step + 1u) & 1u) * panel_bytes);
+                        if (Async) qw_cpasync_commit();
+                    }
+                }
+                const uint32_t t = tok0 + (uint32_t)r;
+                const int32_t e = Vector ? __shfl_sync(0xffffffffu, route[r], slot)
+                    : selected[(uint64_t)t * n_expert_used + slot];
+                if (e < 0 || (uint32_t)e >= n_total_expert) continue;
+                const char *const drow = Stage
+                    ? spanel + (uint64_t)(step & 1u) * panel_bytes +
+                      (uint64_t)(row - row0) * down_row_bytes
+                    : down + (uint64_t)(uint32_t)e * down_expert_bytes +
+                      (uint64_t)row * down_row_bytes;
+                const uint64_t mrow = (uint64_t)t * n_expert_used + slot;
+                for (uint32_t g = lane; g < groups; g += 32u) {
+                    int8_t wq[32];
+                    float wa[2], wb[2];
+                    int halves = 1;
+                    dev_qwen4exp_group_decode(
+                            DownType < 0 ? down_type : (uint32_t)DownType,
+                            drow, g, wq, wa, wb, &halves);
+                    const uint64_t at_g = mrow * groups + g;
+                    if (Vector && halves == 1)
+                        qwen4exp_shared_vector_accumulate(&acc[r], wq, wa[0], wb[0],
+                            mq + at_g * 32u, ms[at_g], msum[at_g]);
+                    else
+                        qwen4exp_group_accumulate(&acc[r], wq, wa, wb, halves,
+                                                  mq + at_g * 32u, ms[at_g],
+                                                  msum[at_g]);
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < R; r++) {
+        const float tot = warp_sum_f32(acc[r]);
+        if (lane == 0u && (uint32_t)r < take) {
+            out[(uint64_t)(tok0 + (uint32_t)r) * out_dim + row] = tot;
+        }
+    }
+}
+
 /* The shared expert: no routing, so the tile is consecutive tokens and the
  * decoded group serves all of them. */
 template <int R, int GateType = -1, int UpType = -1, bool Vector = false>
@@ -10076,10 +10264,29 @@ static int qwen4exp_routed_moe_cuda(
          * no weight of its own to load; what the edge buys is the launch
          * turnaround, not a prefetch.  DS4_QWEN4EXP_NO_PDL_ROUTER_TREE stands
          * it back down to the plain launch, where the fence is a no-op. */
-        if (qwen4exp_pdl_router_tree()) {
+        const bool key_max =
+            getenv("DS4_QWEN4EXP_NO_ROUTER_KEYMAX") == NULL;
+        if (qwen4exp_pdl_router_tree() && key_max) {
+            QWEN4EXP_LAUNCH_PDL(
+                    (qwen4exp_moe_router_group_small_kernel<true, true>),
+                    dim3(1u, 1u, 1u), QWEN4EXP_MOE_SCAN_THREADS, 0, stream,
+                    sc.counts, sc.offsets, sc.cursor, sc.active, sc.pairs,
+                    (float *)mid->ptr, (int32_t *)selected->ptr,
+                    n_total_expert, n_pairs, n_expert_used, mid_dim,
+                    mid_token_stride, (float *)weights_rw->ptr,
+                    (const float *)logits->ptr, n_tokens);
+        } else if (qwen4exp_pdl_router_tree()) {
             QWEN4EXP_LAUNCH_PDL(
                     (qwen4exp_moe_router_group_small_kernel<true>),
                     dim3(1u, 1u, 1u), QWEN4EXP_MOE_SCAN_THREADS, 0, stream,
+                    sc.counts, sc.offsets, sc.cursor, sc.active, sc.pairs,
+                    (float *)mid->ptr, (int32_t *)selected->ptr,
+                    n_total_expert, n_pairs, n_expert_used, mid_dim,
+                    mid_token_stride, (float *)weights_rw->ptr,
+                    (const float *)logits->ptr, n_tokens);
+        } else if (key_max) {
+            qwen4exp_moe_router_group_small_kernel<true, true>
+                    <<<dim3(1u, 1u, 1u), QWEN4EXP_MOE_SCAN_THREADS, 0, stream>>>(
                     sc.counts, sc.offsets, sc.cursor, sc.active, sc.pairs,
                     (float *)mid->ptr, (int32_t *)selected->ptr,
                     n_total_expert, n_pairs, n_expert_used, mid_dim,
@@ -10720,7 +10927,24 @@ static int qwen4exp_routed_moe_cuda(
             }
         } else {
             if (dn_stage && getenv("DS4_QWEN4EXP_NO_DOWN_ASYNC") == NULL) {
-                QWEN4EXP_DOWN_ASYNC(DS4_QWEN4EXP_TY_q5_1);
+                if (down_slab->type == DS4_QWEN4EXP_TY_q5_1 &&
+                    (down_slab->row_bytes % 16u) == 0u &&
+                    getenv("DS4_QWEN4EXP_NO_DOWN_WARP_STAGE") == NULL) {
+                    if (n_tokens <= 2u && qwen4exp_pdl_routed_down()) {
+                        QWEN4EXP_LAUNCH_PDL(
+                            (qwen4exp_moe_down_q51_warp_kernel<2,
+                                DS4_QWEN4EXP_TY_q5_1, true, true, true>),
+                            dn_grid, threads, (size_t)dn_shared, stream,
+                            QWEN4EXP_DOWN_ARGS);
+                    } else {
+                        qwen4exp_moe_down_q51_warp_kernel<2,
+                            DS4_QWEN4EXP_TY_q5_1, true, true, true><<<
+                            dn_grid, threads, (size_t)dn_shared, stream>>>(
+                            QWEN4EXP_DOWN_ARGS);
+                    }
+                } else {
+                    QWEN4EXP_DOWN_ASYNC(DS4_QWEN4EXP_TY_q5_1);
+                }
             } else if (dn_stage) {
                 QWEN4EXP_DOWN_IMPL_S(2, DS4_QWEN4EXP_TY_q5_1, true, true,
                                      (size_t)dn_shared);
