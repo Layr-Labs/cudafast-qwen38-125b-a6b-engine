@@ -95,10 +95,20 @@ __global__ static void mtp_native_projection_kernel(
             for (int r = 0; r < R; r++) {
                 if ((uint32_t)r < take) {
                     const uint64_t at = ((uint64_t)row0 + r) * blocks + b;
-                    const int32_t *xw = (const int32_t *)(xq + at * 32u + half * 16u);
+                    /* One LDG.E.128 where nvcc was forced to emit four
+                     * LDG.E.32.  `at * 32 + half * 16` is a multiple of 16 and
+                     * the host refuses a scratch arena that is not 16-byte
+                     * aligned, but neither fact is visible through an int8_t*,
+                     * so the scalar form cannot be vectorised by the compiler.
+                     * Same 16 bytes, same little-endian word order, same dp4a
+                     * sequence, so the accumulator is bit-identical. */
+                    const int4 xv = *(const int4 *)(const void *)
+                        (xq + at * 32u + half * 16u);
                     int dot = 0;
-#pragma unroll
-                    for (int j = 0; j < 4; j++) dot = __dp4a(wq[j], xw[j], dot);
+                    dot = __dp4a(wq[0], xv.x, dot);
+                    dot = __dp4a(wq[1], xv.y, dot);
+                    dot = __dp4a(wq[2], xv.z, dot);
+                    dot = __dp4a(wq[3], xv.w, dot);
                     dot += __shfl_xor_sync(active, dot, 1);
                     if (half == 0u) acc[r] += ws * xscale[at] * (float)dot;
                 }
@@ -541,12 +551,18 @@ __global__ static void mtp_native_projection2_screen_kernel(
 #pragma unroll
             for (int r = 0; r < 2; r++) {
                 const uint64_t at = (uint64_t)r * blocks + b;
-                const int32_t *xw =
-                    (const int32_t *)(xq + at * 32u + half * 16u);
+                /* See the identical note in mtp_native_projection_kernel.  This
+                 * kernel gains twice as much: it drives TWO target rows off one
+                 * weight stream, so its activation reads were EIGHT of the
+                 * thirteen memory instructions per block visit, against five
+                 * for the weights. */
+                const int4 xv = *(const int4 *)(const void *)
+                    (xq + at * 32u + half * 16u);
                 int dot = 0;
-#pragma unroll
-                for (int j = 0; j < 4; j++)
-                    dot = __dp4a(wq[j], xw[j], dot);
+                dot = __dp4a(wq[0], xv.x, dot);
+                dot = __dp4a(wq[1], xv.y, dot);
+                dot = __dp4a(wq[2], xv.z, dot);
+                dot = __dp4a(wq[3], xv.w, dot);
                 dot += __shfl_xor_sync(active, dot, 1);
                 if (half == 0u)
                     acc[r] += ws * xscale[at] * (float)dot;
@@ -647,6 +663,11 @@ extern "C" int ds4_gpu_mtp_native_screen(ds4_gpu_tensor *out,
     if (!w) return -1;
     if ((uintptr_t)w & 1u) return 0;
     char *base = (char *)scratch->ptr;
+    /* The projection kernels read the quantized activations as int4.  Every
+     * offset they apply is a multiple of 16, so the arena's own alignment is
+     * the only requirement; decline the fast path rather than fault if a
+     * future allocator ever hands back an odd arena. */
+    if ((uintptr_t)base & 15u) return 0;
     int8_t *xq = (int8_t *)base;
     float *xs = (float *)(base + MTP_NATIVE_DIM);
     float *scores = (float *)(base + l.scores);
@@ -789,6 +810,7 @@ extern "C" int ds4_gpu_mtp_native_screen2(ds4_gpu_tensor *out,
     if ((uintptr_t)w & 1u) return 0;
 
     char *base = (char *)scratch->ptr;
+    if ((uintptr_t)base & 15u) return 0;   /* int4 activation reads; see above */
     int8_t *xq = (int8_t *)base;
     float *xs = (float *)(base + l.xscale);
     float *scores = (float *)(base + l.scores);
