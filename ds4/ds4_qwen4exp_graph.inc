@@ -398,6 +398,7 @@ struct ds4_qwen4exp_session {
     bool gdn_replay_active;
     bool gdn_replay_previous;
     uint32_t gdn_replay_prefix;
+    uint32_t gdn_replay_device; /* last successfully enqueued device prefix */
     uint32_t gdn_replay_phase; /* physical buffer parity, preserved on reset */
     ds4_gpu_tensor *inv_freq;
 
@@ -3264,9 +3265,18 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     }
     if (replay_step.active) {
         s->gdn_replay_prefix = replay_step.prefix;
-        if (!ds4_gpu_qwen4exp_update_dpos(s->d_gdn_replay, replay_step.prefix)) {
-            fprintf(stderr, "ds4: qwen4exp GDN replay prefix update failed\n");
-            return false;
+        /* Both the host mirror and device buffer begin at zero.  Reset does
+         * not clear the device flag, so the mirror remains valid across it;
+         * stream ordering preserves an already enqueued identical value. */
+        if (s->gdn_replay_device != replay_step.prefix) {
+            if (!ds4_gpu_qwen4exp_update_dpos(
+                    s->d_gdn_replay, replay_step.prefix)) {
+                s->gdn_replay_device = UINT32_MAX;
+                fprintf(stderr,
+                        "ds4: qwen4exp GDN replay prefix update failed\n");
+                return false;
+            }
+            s->gdn_replay_device = replay_step.prefix;
         }
     }
     if (s->d_adopt && s->adopt_device != s->adopt_state) {
