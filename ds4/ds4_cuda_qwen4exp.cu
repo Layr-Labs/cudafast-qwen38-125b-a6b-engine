@@ -4503,7 +4503,7 @@ __global__ static void qwen4exp_moe_group_small_kernel(
  * its token is threadIdx.x >> 5 where it was blockIdx.x, and every warp
  * intrinsic already uses the full mask and stays inside its own warp.
  */
-template<bool Native, bool KeyMax = false>
+template<bool Native>
 __global__ static void qwen4exp_moe_router_group_small_kernel(
         int32_t *counts,
         int32_t *offsets,
@@ -4588,44 +4588,9 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
         if (e < n_expert) live |= 1u << j;
     }
 
-#if __CUDA_ARCH__ >= 800
-    uint32_t keys[16];
-    if constexpr (Native && KeyMax) {
-#pragma unroll
-    for (uint32_t j = 0; j < 16u; j++) {
-        const float v = scores[j];
-        const uint32_t bits = v == 0.0f ? 0u : __float_as_uint(v);
-        const uint32_t ordered = bits & 0x80000000u ? ~bits : bits ^ 0x80000000u;
-        // Original comparator ignores NaNs/-Inf, but accepts exact -FLT_MAX.
-        keys[j] = v >= -FLT_MAX ? ordered : 0u;
-    }
-    }
-#endif
     for (uint32_t rank = 0; rank < n_expert_used; rank++) {
         float best_v = -FLT_MAX;
         int32_t best_i = INT32_MAX;
-#if __CUDA_ARCH__ >= 800
-        if constexpr (Native && KeyMax) {
-        uint32_t best_key = 0u;
-#pragma unroll
-        for (uint32_t j = 0; j < 16u; j++) {
-            const uint32_t key = keys[j] & (0u - ((live >> j) & 1u));
-            best_key = max(best_key, key);
-        }
-        const uint32_t winning_key = __reduce_max_sync(0xffffffffu, best_key);
-        uint32_t matches = 0u;
-#pragma unroll
-        for (uint32_t j = 0; j < 16u; j++)
-            matches |= (uint32_t)(keys[j] == winning_key) << j;
-        matches &= live;
-        if (winning_key == 0u) matches = 0u;
-        const int32_t local_i = matches
-            ? (int32_t)(lane + ((uint32_t)__ffs(matches) - 1u) * 32u)
-            : INT32_MAX;
-        best_i = __reduce_min_sync(0xffffffffu, local_i);
-        } else
-#endif
-        {
 #pragma unroll
         for (uint32_t j = 0; j < 16u; j++) {
             if ((live & (1u << j)) == 0u) continue;
@@ -4661,7 +4626,6 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
                     best_i = other_i;
                 }
             }
-        }
         }
         const int32_t chosen =
             __shfl_sync(0xffffffffu, best_i, 0u);
@@ -10112,29 +10076,10 @@ static int qwen4exp_routed_moe_cuda(
          * no weight of its own to load; what the edge buys is the launch
          * turnaround, not a prefetch.  DS4_QWEN4EXP_NO_PDL_ROUTER_TREE stands
          * it back down to the plain launch, where the fence is a no-op. */
-        const bool key_max =
-            getenv("DS4_QWEN4EXP_NO_ROUTER_KEYMAX") == NULL;
-        if (qwen4exp_pdl_router_tree() && key_max) {
-            QWEN4EXP_LAUNCH_PDL(
-                    (qwen4exp_moe_router_group_small_kernel<true, true>),
-                    dim3(1u, 1u, 1u), QWEN4EXP_MOE_SCAN_THREADS, 0, stream,
-                    sc.counts, sc.offsets, sc.cursor, sc.active, sc.pairs,
-                    (float *)mid->ptr, (int32_t *)selected->ptr,
-                    n_total_expert, n_pairs, n_expert_used, mid_dim,
-                    mid_token_stride, (float *)weights_rw->ptr,
-                    (const float *)logits->ptr, n_tokens);
-        } else if (qwen4exp_pdl_router_tree()) {
+        if (qwen4exp_pdl_router_tree()) {
             QWEN4EXP_LAUNCH_PDL(
                     (qwen4exp_moe_router_group_small_kernel<true>),
                     dim3(1u, 1u, 1u), QWEN4EXP_MOE_SCAN_THREADS, 0, stream,
-                    sc.counts, sc.offsets, sc.cursor, sc.active, sc.pairs,
-                    (float *)mid->ptr, (int32_t *)selected->ptr,
-                    n_total_expert, n_pairs, n_expert_used, mid_dim,
-                    mid_token_stride, (float *)weights_rw->ptr,
-                    (const float *)logits->ptr, n_tokens);
-        } else if (key_max) {
-            qwen4exp_moe_router_group_small_kernel<true, true>
-                    <<<dim3(1u, 1u, 1u), QWEN4EXP_MOE_SCAN_THREADS, 0, stream>>>(
                     sc.counts, sc.offsets, sc.cursor, sc.active, sc.pairs,
                     (float *)mid->ptr, (int32_t *)selected->ptr,
                     n_total_expert, n_pairs, n_expert_used, mid_dim,
