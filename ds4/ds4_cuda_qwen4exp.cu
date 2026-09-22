@@ -851,8 +851,30 @@ __global__ static void qwen4exp_gdn_conv_replay_gates_kernel(
     history[(uint64_t)conv_dim + channel] = h1;
     history[(uint64_t)2u * conv_dim + channel] = h2;
     /* One publisher per head/token. Stream completion orders these pairs
-     * before replay; history and raw gate inputs are disjoint allocations. */
-    if (block == 0u && tid < n_value_head) {
+     * before replay; history and raw gate inputs are disjoint allocations.
+     *
+     * Publisher placement (QWEN4EXP_GDN_GATES_ON_VALUE_BLOCK, default 1).
+     * Block 0 is a KEY block: every token it pays a warp reduction, a block
+     * barrier and a second reduction before its rsqrt, so it is among the
+     * last blocks of the grid to finish, and the dependent recurrence launch
+     * waits for the whole grid.  Appending the serial gate loop to it put
+     * n_tokens rounds of two dependent global loads, expf, softplus and
+     * sigmoid behind the grid's longest block.  A VALUE block runs the same
+     * token loop with no reduction and no barrier, so the same tail placed on
+     * the last value block finishes inside the key blocks' shadow.  The
+     * publishing thread keeps its index (tid = head), reads the same inputs
+     * and evaluates the same expressions, so every published pair is the same
+     * bits; only which block's warps issue them moves.  blockDim is
+     * QWEN4EXP_GDN_DIM >= n_value_head either way. */
+#ifndef QWEN4EXP_GDN_GATES_ON_VALUE_BLOCK
+#define QWEN4EXP_GDN_GATES_ON_VALUE_BLOCK 1
+#endif
+#if QWEN4EXP_GDN_GATES_ON_VALUE_BLOCK
+    const uint32_t gate_block = blocks - 1u;
+#else
+    const uint32_t gate_block = 0u;
+#endif
+    if (block == gate_block && tid < n_value_head) {
         const float coeff = a_log[tid];
         const float bias = dt_bias[tid];
         for (uint32_t token = 0; token < n_tokens; ++token) {
