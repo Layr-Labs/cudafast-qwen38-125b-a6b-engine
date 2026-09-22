@@ -673,10 +673,44 @@ impl<F: EngineFactory> Adapter<F> {
     }
 
     /// Serialize one response as a single NDJSON line (object + '\n') and flush.
+    ///
+    /// The line is written straight through the caller's writer instead of
+    /// being built in a fresh heap buffer first.
+    ///
+    /// Every response the worker produces passes through here, and at the
+    /// decode widths that is one response per protocol step for the whole
+    /// scored window: the shipped form allocated a `Vec<u8>` for each one,
+    /// serialized into it, pushed the newline (a possible reallocation and
+    /// copy, since `to_vec` returns a buffer sized exactly to the payload),
+    /// copied the whole line into the writer's buffer, and dropped the
+    /// allocation. `serde_json::to_writer` emits the same bytes directly into
+    /// the writer, so the per-response allocation, the growth check and one
+    /// full copy of the payload disappear; the newline is a one-byte write
+    /// into the same buffer.
+    ///
+    /// The bytes on the wire are unchanged. `to_writer` and `to_vec` share
+    /// serde_json's formatter, so the object serializes identically, field
+    /// order included; the newline still terminates the line; and the flush
+    /// still happens exactly once, after the complete line, so the writer's
+    /// framing is byte-for-byte what the harness read before.
+    ///
+    /// Error behaviour is preserved deliberately. Serialization is still an
+    /// invariant (`WorkerResponse` is a closed enum of owned data and cannot
+    /// fail), so a serializer error is still a panic rather than a silent
+    /// truncation; only genuine I/O errors are returned, exactly as before.
+    /// The one difference is that an I/O error can now surface mid-object
+    /// rather than after the complete buffer was handed over — and in both
+    /// forms that error is a broken pipe on a dying connection, which the
+    /// caller treats the same way.
     fn emit<W: Write>(&self, output: &mut W, response: &WorkerResponse) -> std::io::Result<()> {
-        let mut line = serde_json::to_vec(response).expect("WorkerResponse serializes");
-        line.push(b'\n');
-        output.write_all(&line)?;
+        serde_json::to_writer(&mut *output, response).map_err(|e| {
+            if e.is_io() {
+                std::io::Error::from(e)
+            } else {
+                panic!("WorkerResponse serializes: {e}")
+            }
+        })?;
+        output.write_all(b"\n")?;
         output.flush()
     }
 }
