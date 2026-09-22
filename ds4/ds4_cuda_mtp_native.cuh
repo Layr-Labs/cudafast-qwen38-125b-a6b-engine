@@ -218,9 +218,29 @@ mtp_native_select_kernel(const uint64_t *__restrict__ keys, uint32_t n,
         __syncthreads();
         grid.sync();
 
-        /* per-block shared histogram of this digit, one global atomic per bin */
+        /* Aggregate equal digits within a warp before touching shared memory.
+         * Score keys often share an exponent byte: 32 equal digits then cost
+         * one atomic addition of 32 instead of 32 contending additions of 1.
+         * The full-warp ballot is outside the live-lane branch, so a partial
+         * final warp supplies exactly the same mask to every matching lane.
+         * Match supplies no memory fence; the block barrier below still owns
+         * publication of the completed shared histogram. */
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        for (uint32_t base0 = 0u; base0 < cur; base0 += nthr) {
+            const uint32_t i = base0 + tid;
+            const bool live = i < cur;
+            const uint32_t live_mask = __ballot_sync(0xffffffffu, live);
+            if (live) {
+                const uint32_t digit = (uint32_t)((src[i] >> shft) & 0xffull);
+                const uint32_t peers = __match_any_sync(live_mask, digit);
+                if (lane == (uint32_t)(__ffs((int)peers) - 1))
+                    atomicAdd(&sh[digit], (uint32_t)__popc(peers));
+            }
+        }
+#else
         for (uint32_t i = tid; i < cur; i += nthr)
             atomicAdd(&sh[(uint32_t)((src[i] >> shft) & 0xffull)], 1u);
+#endif
         __syncthreads();
         if (sh[t0]) atomicAdd(&hist[t0], sh[t0]);
         grid.sync();
@@ -241,7 +261,6 @@ mtp_native_select_kernel(const uint64_t *__restrict__ keys, uint32_t n,
             if (lane >= (uint32_t)d) x += y;
         }
         if (lane == 31u) wsum[t0 >> 5] = x;
-        if (t0 == 0u) s_pick = 256u;
         __syncthreads();
         if (t0 < (MTP_NATIVE_SELECT_THREADS / 32)) {
             uint32_t y = wsum[t0];
@@ -255,14 +274,21 @@ mtp_native_select_kernel(const uint64_t *__restrict__ keys, uint32_t n,
         }
         __syncthreads();
         const uint32_t S = x + ((t0 >= 32u) ? wsum[(t0 >> 5) - 1u] : 0u);
-        if (S >= need) atomicMin(&s_pick, t0);
+        /* Exactly one positive bin crosses need: its inclusive prefix S is
+         * >= need and its exclusive prefix is < need.  The radix invariant
+         * is 0 < need <= cur, and hist sums to cur, so a writer always exists.
+         * Empty-bin plateaus cannot qualify.  Electing that unique writer
+         * avoids the contended atomicMin, initialization and one block
+         * barrier; the single barrier below publishes both words. */
+        if (S >= need && S - hb < need) {
+            s_pick = t0;
+            s_above = S - hb;
+        }
         __syncthreads();
         const uint32_t pick = s_pick;
-        if (t0 == pick) s_above = S - hb;
-        __syncthreads();
-        const uint32_t bs = (pick < 256u) ? (255u - pick) : 0u;
-        const uint32_t above = (pick < 256u) ? s_above : 0u;
-        const uint32_t hbs = sh[pick < 256u ? pick : 255u];
+        const uint32_t bs = 255u - pick;
+        const uint32_t above = s_above;
+        const uint32_t hbs = sh[pick];
         const bool last = (t == 7) || (above + hbs == need);
 
         /* Warp-aggregated compaction: one global atomicAdd per warp per class.
