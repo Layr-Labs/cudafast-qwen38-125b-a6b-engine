@@ -1861,6 +1861,35 @@ static float *qwen4exp_conv_scratch(int tier, uint64_t elements) {
  * allocates and the bound its select applies. */
 #define QWEN4EXP_GDN_ADOPT_SLOTS 6u
 
+/* Warp-wide maximum of a Q8_0 block's flushed magnitudes.
+ *
+ * Every caller reduces qwen4exp_q8_ftz(fabsf(v)): the sign bit is clear and
+ * denormals are already zero, so each lane holds +0, a positive normal, or
+ * +inf.  Over that domain IEEE-754 binary32 is order-isomorphic to the
+ * unsigned order of its bit pattern (biased exponent above mantissa, both
+ * most-significant first), +0 is pattern 0 and the identity of the maximum,
+ * so an unsigned max over the bits selects exactly the lane value the fmaxf
+ * butterfly selects.  The scale derived from it, every quantised byte and
+ * every downstream matmul input are unchanged bit for bit.
+ *
+ * sm_80+ does the whole reduction as one REDUX.SYNC instead of five
+ * dependent shuffle/max pairs; other targets and the host pass keep the
+ * butterfly verbatim.  QWEN4EXP_Q8_BUTTERFLY_ABSMAX=1 restores it
+ * everywhere. */
+#ifndef QWEN4EXP_Q8_BUTTERFLY_ABSMAX
+#define QWEN4EXP_Q8_BUTTERFLY_ABSMAX 0
+#endif
+__device__ __forceinline__ static float qwen4exp_q8_warp_absmax(float a) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !QWEN4EXP_Q8_BUTTERFLY_ABSMAX
+    return __uint_as_float(__reduce_max_sync(0xffffffffu, __float_as_uint(a)));
+#else
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+    return a;
+#endif
+}
+
 /* Defined beside the Q8_0 quantize seam it shares with the HC mixer. */
 __global__ static void qwen4exp_gdn_output_quant_kernel(
         int8_t *xq, float *xscale, const float *out, const float *output_gate,
@@ -11868,10 +11897,7 @@ __global__ static void qwen4exp_gdn_output_quant_kernel(
         qwen4exp_gdn_sigmoid(output_gate[base + tid]);
     const float vz = qwen4exp_q8_ftz(v);
     float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-    }
+    a = qwen4exp_q8_warp_absmax(a);
     const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
     const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
     const uint64_t pair = (uint64_t)token * (value_dim / 32u) +
@@ -11966,12 +11992,7 @@ __global__ static void qwen4exp_hc_norm_quant_kernel(
              * standalone kernel carries for a ragged tail cannot fire. */
             const float vz = qwen4exp_q8_ftz(v);
             float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
-                /* fmaxf, not the .FTZ one: both operands are already flushed
-                 * and non-negative, so the two instructions cannot disagree. */
-                a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-            }
+            a = qwen4exp_q8_warp_absmax(a);
             const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
             const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
             const uint64_t pair = blk0 + (uint64_t)(k * warps + warp);
@@ -11993,12 +12014,7 @@ __global__ static void qwen4exp_hc_norm_quant_kernel(
          * kernel carries for a ragged tail cannot fire. */
         const float vz = qwen4exp_q8_ftz(v);
         float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            /* fmaxf, not the .FTZ one: both operands are already flushed and
-             * non-negative, so the two instructions cannot disagree. */
-            a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-        }
+        a = qwen4exp_q8_warp_absmax(a);
         const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
         const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
         const uint64_t pair = blk0 + (uint64_t)(k * warps + warp);
@@ -12215,10 +12231,7 @@ __global__ static void qwen4exp_hc_mix_inject_dual_kernel(
             const uint32_t warp = threadIdx.x >> 5u;
             const float vz = qwen4exp_q8_ftz(v);
             float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
-                a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-            }
+            a = qwen4exp_q8_warp_absmax(a);
             const float qd = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
             const float id = qd != 0.0f ? qwen4exp_q8_rcp_approx(qd) : 0.0f;
             const uint64_t pair = (uint64_t)t * (n_embd / 32u) +
@@ -12540,9 +12553,7 @@ __global__ static void qwen4exp_hc_silu_quant_kernel(
 
     const float vz = qwen4exp_q8_ftz(v);
     float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+    a = qwen4exp_q8_warp_absmax(a);
     const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
     const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
     if (lane == 0u) xscale[pair] = d;
@@ -12894,10 +12905,7 @@ __global__ static void qwen4exp_hc_norm_quant_inject_kernel(
                                                          weight_bias, round_bf16);
                 const float vz = qwen4exp_q8_ftz(v);
                 float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-                for (int off = 16; off > 0; off >>= 1) {
-                    a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-                }
+                a = qwen4exp_q8_warp_absmax(a);
                 const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
                 const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
                 const uint64_t pair = blk0 + (uint64_t)(k * warps + warp);
@@ -12942,10 +12950,7 @@ __global__ static void qwen4exp_hc_norm_quant_inject_kernel(
                                                      weight_bias, round_bf16);
             const float vz = qwen4exp_q8_ftz(v);
             float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
-                a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-            }
+            a = qwen4exp_q8_warp_absmax(a);
             const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
             const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
             const uint64_t pair = blk0 + (uint64_t)(k * warps + warp);
@@ -16107,10 +16112,7 @@ __global__ static void qwen4exp_qsa_output_gate_quant_kernel(
         : 0.0f;
     const float vz = qwen4exp_q8_ftz(v);
     float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-    }
+    a = qwen4exp_q8_warp_absmax(a);
     const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
     const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
     const uint64_t pair = (uint64_t)blockIdx.x * 8u + warp;
@@ -16150,10 +16152,7 @@ __global__ static void qwen4exp_qsa_output_gate_doubled_quant_kernel(
         : 0.0f;
     const float vz = qwen4exp_q8_ftz(v);
     float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-    }
+    a = qwen4exp_q8_warp_absmax(a);
     const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
     const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
     const uint64_t pair = (uint64_t)blockIdx.x * 8u + warp;
