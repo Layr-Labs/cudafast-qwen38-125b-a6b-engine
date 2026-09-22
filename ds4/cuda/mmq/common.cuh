@@ -1487,3 +1487,4 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_bias = nullptr;
     ggml_glu_op glu_op;
 };
+#define GAUNTLET_REDRAW_f9c47f08_20260922T084318Z 1
