@@ -12540,9 +12540,13 @@ __global__ static void qwen4exp_hc_silu_quant_kernel(
 
     const float vz = qwen4exp_q8_ftz(v);
     float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+    /* `a` is a flushed magnitude: non-negative and finite, and over that
+     * range the IEEE-754 bit pattern is monotone in the value, so the
+     * unsigned maximum of the bit patterns IS the maximum of the floats.
+     * One warp instruction returns exactly what the five-step butterfly
+     * returned, at the one quantiser that sits between the low-rank mixer
+     * and the up projection on the decode relay. */
+    a = __uint_as_float(__reduce_max_sync(0xffffffffu, __float_as_uint(a)));
     const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
     const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
     if (lane == 0u) xscale[pair] = d;
