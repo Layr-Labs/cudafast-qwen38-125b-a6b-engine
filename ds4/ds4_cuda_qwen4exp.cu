@@ -15385,7 +15385,58 @@ __device__ __forceinline__ static void qwen4exp_qsa3_score_tile(
         for (uint32_t s = 0; s < KPT; s++)
 #pragma unroll
             for (uint32_t h = 0; h < GROUP; h++) dot[s][h] = 0.0f;
-        const uint32_t words = head_dim >> 2u;
+        /* ---- THE DEAD SLOTS DO NOT WALK THE ROW ----
+         *
+         * A tile is 256 slots wide and the scorer runs it unconditionally,
+         * but a tile is only as full as the key set makes it: `n_in_tile` is
+         * min(NTH, count - base), and a slot past that end gets key -1 in the
+         * setup above, along with a `kv[s]` deliberately pointed at row 0 so
+         * the walk has something legal to read.
+         *
+         * The walk then reads it, dots it against every query in the group,
+         * and throws the answer away: the publication below writes
+         * `live[s] ? dot[s][h] * scale : QWEN4EXP_QSA_MASKED_SCORE`, so for a
+         * dead slot `dot` is never observed.  A thread whose slots are all
+         * dead performs the entire chain -- words / KSTEP iterations of KPT
+         * float4 loads and GROUP * KSTEP * 4 fused multiply-adds each -- for
+         * a value that is discarded, and it reads row 0 of the key cache to
+         * do it.
+         *
+         * That is not a corner case at decode.  The key set grows one token
+         * at a time while the tile width is fixed at 256, so the final tile
+         * of every layer, every step, is partial by an amount uniformly
+         * distributed over the width; on a short context the partial tile is
+         * a large fraction of all the tiles there are, and its dead slots
+         * outnumber its live ones.  The work has always been there; nothing
+         * consumes it.
+         *
+         * So the walk's trip count becomes zero for a thread that owns no
+         * live slot.  `words` is the loop's only bound, and forcing it to
+         * zero is the whole change: the loads are not issued, the chains are
+         * not run, and row 0 is not touched.
+         *
+         * Exactness.  `dot[s][h]` is initialised to 0.0f above and is read
+         * exactly once, under `live[s]`, so a thread that skips the walk
+         * changes no observed value -- its slots publish
+         * QWEN4EXP_QSA_MASKED_SCORE either way, its `keys[slot]` is -1 either
+         * way, and its contribution to the per-warp maximum is the same
+         * masked constant.  A thread with ANY live slot runs the walk exactly
+         * as before, over the same words, in the same order, with the same
+         * FMA chain, so every live score is bit-identical.  The per-warp
+         * maximum below uses `__shfl_xor_sync` with a full mask, and every
+         * lane still reaches it: the skip changes a loop bound, not a branch
+         * around the reduction, and this function contains no barrier.
+         *
+         * Kill switch: -DQWEN4EXP_QSA3_DEAD_SKIP=0 restores the unconditional
+         * bound, which is the shipped walk. */
+#ifndef QWEN4EXP_QSA3_DEAD_SKIP
+#define QWEN4EXP_QSA3_DEAD_SKIP 1
+#endif
+        bool any_live = false;
+#pragma unroll
+        for (uint32_t s = 0; s < KPT; s++) any_live = any_live || live[s];
+        const uint32_t words = (QWEN4EXP_QSA3_DEAD_SKIP && !any_live)
+            ? 0u : (head_dim >> 2u);
         for (uint32_t w = 0; w + QWEN4EXP_QSA3_KSTEP <= words; w += QWEN4EXP_QSA3_KSTEP) {
             float4 kk[KPT][QWEN4EXP_QSA3_KSTEP];
 #pragma unroll
