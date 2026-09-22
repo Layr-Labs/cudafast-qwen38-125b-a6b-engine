@@ -18,6 +18,14 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#ifndef DS4_PLE_IQ4_NEON
+#define DS4_PLE_IQ4_NEON 1
+#endif
+#if DS4_PLE_IQ4_NEON && defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#define PLE_IQ4_NEON_ACTIVE 1
+#endif
+
 /* =========================================================================
  * Errors.
  * ========================================================================= */
@@ -770,6 +778,17 @@ static float ple_fp16_to_fp32(uint16_t h) {
     return f;
 }
 
+#if defined(PLE_IQ4_NEON_ACTIVE)
+static inline void ple_iq4_store16(float *out, int8x16_t values, float d) {
+    const int16x8_t low = vmovl_s8(vget_low_s8(values));
+    const int16x8_t high = vmovl_s8(vget_high_s8(values));
+    vst1q_f32(out, vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(low))), d));
+    vst1q_f32(out + 4, vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(low))), d));
+    vst1q_f32(out + 8, vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(high))), d));
+    vst1q_f32(out + 12, vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(high))), d));
+}
+#endif
+
 /* `blocks` and `out` never alias: the caller passes a const view of the
  * memory-mapped shard and a disjoint host staging buffer.  Saying so lets
  * the compiler keep the scale and the nibble byte live across the stores
@@ -778,7 +797,6 @@ void ds4_ple_dequant_iq4_nl(const void *__restrict blocks, size_t block_count,
                             float *__restrict out) {
     const uint8_t *__restrict p = (const uint8_t *)blocks;
     if (!p || !out) return;
-
 
     const int8_t *const kv = ple_kvalues_iq4nl;
     for (size_t b = 0; b < block_count; b++) {
@@ -801,6 +819,18 @@ void ds4_ple_dequant_iq4_nl(const void *__restrict blocks, size_t block_count,
          * so the fill overlaps the current block's dequant.  Hint only. */
         if (b + 1u < block_count)
             __builtin_prefetch(y + DS4_PLE_IQ4_NL_BLOCK_ELEMS, 1, 3);
+
+#if defined(PLE_IQ4_NEON_ACTIVE)
+        const uint16_t exponent = half & 0x7c00u;
+        if (exponent != 0u && exponent != 0x7c00u) {
+            const uint8x16_t packed = vld1q_u8(qs);
+            const int8x16_t table = vld1q_s8(kv);
+            ple_iq4_store16(y, vqtbl1q_s8(table, vandq_u8(packed, vdupq_n_u8(15))), d);
+            ple_iq4_store16(y + 16, vqtbl1q_s8(table, vshrq_n_u8(packed, 4)), d);
+            p += DS4_PLE_IQ4_NL_BLOCK_BYTES;
+            continue;
+        }
+#endif
 
         /* Unrolled by two: the block is a fixed sixteen nibble bytes, so the
          * trip count is a compile-time constant and half the loop-carried
