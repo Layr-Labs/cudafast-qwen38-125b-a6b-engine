@@ -7510,8 +7510,15 @@ __global__ static void qwen4exp_moe_down_q_kernel(
 
 #pragma unroll
     for (int r = 0; r < R; r++) {
+        /* A tile row the token count does not reach accumulated nothing and
+         * stores nothing, yet it still folded its zero accumulator through
+         * the five-step butterfly.  `take` is block-uniform -- the kernel's
+         * own barrier-safety argument above rests on that -- so the whole
+         * warp agrees on this test and the reduction it guards stays warp-
+         * wide.  The rows that do store fold exactly as before. */
+        if ((uint32_t)r >= take) continue;
         const float tot = warp_sum_f32(acc[r]);
-        if (lane == 0u && (uint32_t)r < take) {
+        if (lane == 0u) {
             out[(uint64_t)(tok0 + (uint32_t)r) * out_dim + row] = tot;
         }
     }
@@ -7764,8 +7771,12 @@ __global__ static void qwen4exp_shared_down_q_kernel(
 
 #pragma unroll
     for (int r = 0; r < R; r++) {
+        /* Dead tile rows skip the butterfly: `take` is block-uniform, so the
+         * guarded reduction stays warp-wide and the storing rows fold
+         * exactly as before. */
+        if ((uint32_t)r >= take) continue;
         const float tot = warp_sum_f32(acc[r]);
-        if (lane == 0u && (uint32_t)r < take) {
+        if (lane == 0u) {
             const uint64_t off = (uint64_t)(tok0 + (uint32_t)r) * out_dim + row;
             /* Split: store the UNSCALED reduction; the inject folds it in
              * with this same source expression.  Design note above
@@ -8111,8 +8122,12 @@ __global__ static void qwen4exp_shared_down_stage_kernel(
 
 #pragma unroll
     for (int r = 0; r < R; r++) {
+        /* Dead tile rows skip the butterfly: `take` is block-uniform, so the
+         * guarded reduction stays warp-wide and the storing rows fold
+         * exactly as before. */
+        if ((uint32_t)r >= take) continue;
         const float tot = warp_sum_f32(acc[r]);
-        if (lane == 0u && (uint32_t)r < take) {
+        if (lane == 0u) {
             const uint64_t off = (uint64_t)(tok0 + (uint32_t)r) * out_dim + row;
             out[off] += gate_scale[tok0 + (uint32_t)r] * tot;
         }
