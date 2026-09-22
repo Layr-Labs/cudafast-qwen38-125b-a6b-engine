@@ -6302,7 +6302,7 @@ __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
  * and measures 71.3 and 69.7.  Fewer, deeper blocks win here because each
  * block keeps its next portion in flight on its own, the finding this
  * engine's notes record three times over: residency is not throughput. */
-template <int R, int PB>
+template <int R, int PB, bool Async = false>
 __global__ static void __launch_bounds__(256, 2) matmul_q8_0_preq_pair_lanes_roll_kernel(
         float *out, const unsigned char *w,
         const int8_t *xq, const float *xscale,
@@ -6356,8 +6356,38 @@ __global__ static void __launch_bounds__(256, 2) matmul_q8_0_preq_pair_lanes_rol
         }                                                                      \
     } while (0)
 
-    QW_PL_ROLL_FETCH(0u);
-    QW_PL_ROLL_PARK(gpanel);
+    /* Each next portion owns the other buffer. The preceding block barrier
+     * retires its old readers; the wait and following barrier publish the
+     * new bytes before any consumer advances to that portion. */
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#define QW_PL_ROLL_ASYNC(p_, buf_)                                             \
+    do {                                                                     \
+        _Pragma("unroll")                                                    \
+        for (int k = 0; k < NV; k++) {                                       \
+            const uint64_t i_ = ((uint64_t)threadIdx.x + 256u * (uint64_t)k) * 16u; \
+            if (i_ < portion) {                                              \
+                const uint64_t r_ = i_ / PIECE, off_ = i_ - r_ * PIECE;      \
+                const void *src_ = gp + r_ * blocks * 34u +                   \
+                                   (uint64_t)(p_) * PIECE + off_;            \
+                const unsigned dst_ = (unsigned)__cvta_generic_to_shared((buf_) + i_); \
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"     \
+                             :: "r"(dst_), "l"(src_) : "memory");           \
+            }                                                                \
+        }                                                                    \
+        asm volatile("cp.async.commit_group;" ::: "memory");                 \
+    } while (0)
+#define QW_PL_ROLL_WAIT() asm volatile("cp.async.wait_group 0;" ::: "memory")
+#else
+#define QW_PL_ROLL_ASYNC(p_, buf_) do { QW_PL_ROLL_FETCH(p_); QW_PL_ROLL_PARK(buf_); } while (0)
+#define QW_PL_ROLL_WAIT() do {} while (0)
+#endif
+    if (Async) {
+        QW_PL_ROLL_ASYNC(0u, gpanel);
+        QW_PL_ROLL_WAIT();
+    } else {
+        QW_PL_ROLL_FETCH(0u);
+        QW_PL_ROLL_PARK(gpanel);
+    }
     QWEN4EXP_PDL_SYNC();
     __syncthreads();
 
@@ -6365,7 +6395,10 @@ __global__ static void __launch_bounds__(256, 2) matmul_q8_0_preq_pair_lanes_rol
         const char *const cur = gpanel + (p & 1u) * BUF;
         char *const nxt = gpanel + ((p + 1u) & 1u) * BUF;
         const bool more = p + 1u < nph;
-        if (more) QW_PL_ROLL_FETCH(p + 1u);
+        if (more) {
+            if (Async) QW_PL_ROLL_ASYNC(p + 1u, nxt);
+            else QW_PL_ROLL_FETCH(p + 1u);
+        }
         if (row < out_dim) {
             const unsigned char *wr = (const unsigned char *)(cur + (uint64_t)local_row * PIECE);
             const uint64_t b_lo = p * (uint64_t)PB, b_hi = b_lo + (uint64_t)PB;
@@ -6409,11 +6442,16 @@ __global__ static void __launch_bounds__(256, 2) matmul_q8_0_preq_pair_lanes_rol
                 }
             }
         }
-        if (more) QW_PL_ROLL_PARK(nxt);
+        if (more) {
+            if (Async) QW_PL_ROLL_WAIT();
+            else QW_PL_ROLL_PARK(nxt);
+        }
         __syncthreads();
     }
 #undef QW_PL_ROLL_FETCH
 #undef QW_PL_ROLL_PARK
+#undef QW_PL_ROLL_ASYNC
+#undef QW_PL_ROLL_WAIT
 
     /* Pair logical groups g and g + 16 before the remaining four levels
      * of the original 32-leaf reduction tree.  Physical even lanes are
@@ -18648,15 +18686,26 @@ static int cuda_matmul_q8_0_preq_rows_exact(
             const int pl_roll = pl_panel > 12288u && (blocks % 64u) == 0u &&
                 (((uintptr_t)wptr) & 15u) == 0u &&
                 getenv("DS4_QWEN4EXP_NO_PAIR_LANES_ROLL") == NULL;
+            const int pl_async =
+                getenv("DS4_QWEN4EXP_NO_PAIR_LANES_ASYNC") == NULL;
             if (n_rows == 1u && pl_roll &&
                 getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL) {
                 /* PDL consumer as below; the first portion rides the window. */
+                if (pl_async) {
+                    QWEN4EXP_LAUNCH_PDL(
+                        (matmul_q8_0_preq_pair_lanes_roll_kernel<1, 64, true>),
+                        (dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u)),
+                        256, pl_roll_smem, cuda_decode_stream(),
+                        (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
+                        out_dim, n_rows, blocks);
+                } else {
                 QWEN4EXP_LAUNCH_PDL(
                         (matmul_q8_0_preq_pair_lanes_roll_kernel<1, 64>),
                         (dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u)),
                         256, pl_roll_smem, cuda_decode_stream(),
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
                         out_dim, n_rows, blocks);
+                }
             } else if (n_rows == 1u && pl_stage &&
                 getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL) {
                 /* PDL consumer as below; the staged fill rides the window. */
@@ -18693,12 +18742,21 @@ static int cuda_matmul_q8_0_preq_rows_exact(
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
                         out_dim, n_rows, blocks);
             } else if (pl_roll) {
+                if (pl_async) {
+                    QWEN4EXP_LAUNCH_PDL(
+                        (matmul_q8_0_preq_pair_lanes_roll_kernel<2, 64, true>),
+                        (dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u)),
+                        256, pl_roll_smem, cuda_decode_stream(),
+                        (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
+                        out_dim, n_rows, blocks);
+                } else {
                 QWEN4EXP_LAUNCH_PDL(
                         (matmul_q8_0_preq_pair_lanes_roll_kernel<2, 64>),
                         (dim3((unsigned)((out_dim + 3u) / 4u), (n_rows + 1u) / 2u, 1u)),
                         256, pl_roll_smem, cuda_decode_stream(),
                         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
                         out_dim, n_rows, blocks);
+                }
             } else if (pl_stage) {
                 QWEN4EXP_LAUNCH_PDL(
                         (matmul_q8_0_preq_pair_lanes_kernel<2, false, true>),
