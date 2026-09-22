@@ -4,7 +4,7 @@
 /* redraw rx11204626 (2026-09-17T11:20:46Z): this archive repeats the official evaluation of the
  * same engine. The only textual difference from the previous evaluation
  * is this dated provenance comment. No behaviour changes. */
-/*
+/* seams-f9c candidate audit 2026-09-22: paired output-store and PDL seam.
  * Qwen4-Exp CUDA kernels.
  *
  * Every Qwen4-Exp device kernel lives here instead of in ds4_cuda.cu for one
@@ -15380,6 +15380,61 @@ __device__ __forceinline__ static void qwen4exp_qsa3_score_tile(
                 : (k_cache + (uint64_t)(live[s] ? key[s] : 0) * kv_stride
                            + (uint64_t)kv_head * head_dim);
         }
+        /* ---- WHOLE-ROW L2 PREFETCH AHEAD OF THE SCORE WALK ----
+         *
+         * Each scorer thread owns KPT key slots, and for each it holds the
+         * base of that key's cache row in `kv[s]`.  The dot-product walk
+         * below then consumes that row a KSTEP chunk at a time.  `words` is
+         * head_dim / 4 and head_dim is a runtime kernel argument, so the `w`
+         * loop is NOT fully unrolled: each iteration issues its own float4
+         * loads and the FMA block immediately below consumes them.  A key row
+         * is 4 * head_dim bytes -- several cache lines -- and under a sparse
+         * or long key set those lines are cold, so the walk pays a miss per
+         * chunk, serialised behind the arithmetic of the chunk before it.
+         * The memory-level parallelism available to the warp is whatever one
+         * iteration issues, not what the row is worth.
+         *
+         * Every one of those addresses is known here, before the first
+         * chunk: `kv[s]` is already computed, the row is contiguous in the
+         * non-tape layout, and its length is `words * 16` bytes.  Asking for
+         * the whole row at 128-byte granularity turns a chain of per-chunk
+         * misses into one burst issued while the first chunk's arithmetic
+         * runs.
+         *
+         * Restricted to the non-tape layout by a compile-time test: the tape
+         * layout spreads one key's dimensions across a stride, so there is no
+         * contiguous row to ask for and the shipping tape instantiation is
+         * untouched.  Dead slots (`live[s]` false) point at row 0 and are
+         * skipped, so no address is touched that the walk does not touch.
+         *
+         * Exactness.  `prefetch.global.L2` has no destination operand, cannot
+         * fault, establishes no ordering and observes none.  Every value the
+         * scorer computes still comes from the same float4 load at the same
+         * address in the same order, folded by the same __fmaf_rn chain into
+         * the same accumulator; no float is re-associated and no slot-to-key
+         * map changes.  The only difference in the generated code is a set of
+         * instructions whose whole semantics is a hint to the cache.
+         *
+         * Kill switch: -DQWEN4EXP_QSA3_KPREFETCH=0 removes the block and
+         * restores the shipped walk instruction for instruction. */
+#ifndef QWEN4EXP_QSA3_KPREFETCH
+#define QWEN4EXP_QSA3_KPREFETCH 1
+#endif
+#if QWEN4EXP_QSA3_KPREFETCH
+        if (!TAPE) {
+            const uint32_t row_bytes = (head_dim >> 2u) * 16u;
+#pragma unroll
+            for (uint32_t s = 0; s < KPT; s++) {
+                if (live[s]) {
+                    for (uint32_t off = 0; off < row_bytes; off += 128u) {
+                        const float *const pp = kv[s] + (off >> 2u);
+                        asm volatile("prefetch.global.L2 [%0];"
+                                     :: "l"(pp) : "memory");
+                    }
+                }
+            }
+        }
+#endif
         float dot[KPT][GROUP];
 #pragma unroll
         for (uint32_t s = 0; s < KPT; s++)
@@ -15638,14 +15693,21 @@ __global__ static void __launch_bounds__(256, 2) qwen4exp_qsa3_attention_group_k
         __syncthreads();
     }
     if (!scorer) {
+        /* Valuer vt owns channels 2*vt and 2*vt + 1 of every head row -- the
+         * same pairing this kernel's value loads already take as one eight
+         * byte load.  head_dim is even and 2*vt is even, so the pair is eight
+         * byte aligned and one vector store retires both channels instead of
+         * two scalar stores into the same sector.  Each channel still divides
+         * the accumulator it always divided, by the same run sum, under the
+         * same positivity test. */
 #pragma unroll
-        for (uint32_t c = 0; c < CPT; c++)
-#pragma unroll
-            for (uint32_t h = 0; h < GROUP; h++) {
-                const float rs = st_runsum[h];
-                dst[h * head_dim + 2u * vt + c] =
-                    (rs > 0.0f) ? acc[c][h] / rs : 0.0f;
-            }
+        for (uint32_t h = 0; h < GROUP; h++) {
+            const float rs = st_runsum[h];
+            const bool live = rs > 0.0f;
+            const float2 o = make_float2(live ? acc[0][h] / rs : 0.0f,
+                                         live ? acc[1][h] / rs : 0.0f);
+            *(float2 *)(dst + h * head_dim + 2u * vt) = o;
+        }
     }
 }
 
@@ -16099,6 +16161,17 @@ __global__ static void qwen4exp_qsa_output_gate_quant_kernel(
         const float *gate,
         const float *out,
         uint32_t     n_values) {
+    /* PDL producer for the state-out projection that follows on the stream,
+     * the role and the gate its doubled twin below already carries.  On the
+     * attention layers this kernel, not the gated-deltanet quantizer, is that
+     * projection's stream predecessor, and without a trigger those layers pay
+     * a serialized edge the other layers do not.  The geometry is the twin's
+     * exactly -- the same flat value index, the same 256-thread blocks, the
+     * same n_values / 256 grid from the same entry -- so the single-wave
+     * condition the deadlock rule asks for holds here for the same reason it
+     * holds there.  gridDim is grid-uniform and the bound excludes every
+     * prefill width. */
+    if (gridDim.x <= 48u) QWEN4EXP_PDL_TRIGGER();
     const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
