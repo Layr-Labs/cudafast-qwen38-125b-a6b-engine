@@ -1987,7 +1987,10 @@ __device__ __forceinline__ static void q8_mma_bar_arrive(int id, int count) {
 #define Q8_MMA_MINB 1
 #endif
 
-template <int WM, int WN, int MT, int NT, int G, int STAGES>
+/* CvtC: weight-block scales are converted half->float by the consumer,
+ * from the staged q8_0 block, so WS_BYTES is 0 and the producer pool
+ * does not rendezvous.  CvtC=false is the shipped pipe. */
+template <int WM, int WN, int MT, int NT, int G, int STAGES, bool CvtC = false>
 struct q8_mma_pipe_cfg {
     static constexpr int BM = WM * MT * 16;
     static constexpr int BN = WN * NT * 8;
@@ -2005,7 +2008,7 @@ struct q8_mma_pipe_cfg {
     static constexpr int A_BYTES = BM * A_STRIDE;
     static constexpr int B_BYTES = BN * B_STRIDE;
     static constexpr int AS_BYTES = BM * G * 4;
-    static constexpr int WS_BYTES = G * BN * 4;          /* converted weight scales [gg][BN] */
+    static constexpr int WS_BYTES = CvtC ? 0 : (G * BN * 4); /* converted weight scales [gg][BN] */
     static constexpr int STAGE_BYTES = A_BYTES + B_BYTES + AS_BYTES + WS_BYTES;
     static constexpr int SMEM = STAGES * STAGE_BYTES;
     static_assert(G == 2 || G == 4 || G == 8, "G is the k32 steps per stage");
@@ -2016,7 +2019,7 @@ struct q8_mma_pipe_cfg {
     static_assert(B_GCD >= 4, "skew must keep word parity");
 };
 
-template <int WM, int WN, int MT, int NT, int G, int STAGES>
+template <int WM, int WN, int MT, int NT, int G, int STAGES, bool CvtC = false>
 __global__ __launch_bounds__((WM * WN + 4) * 32, Q8_MMA_MINB) static void
 qwen4exp_gdn_qkv_conv_mma_pipe_kernel(float *out,
                                       float *side,
@@ -2030,7 +2033,7 @@ qwen4exp_gdn_qkv_conv_mma_pipe_kernel(float *out,
                                       uint64_t out_dim,
                                       uint32_t n_rows,
                                       uint64_t blocks) {
-    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES> C;
+    typedef q8_mma_pipe_cfg<WM, WN, MT, NT, G, STAGES, CvtC> C;
     constexpr int BM = C::BM, BN = C::BN;
     constexpr int QW_CONV_TS = BN + 4;   /* the tile as rows, 4 mod 8 words apart */
     static_assert(BN == 128, "one head block per column tile");
@@ -2161,6 +2164,16 @@ qwen4exp_gdn_qkv_conv_mma_pipe_kernel(float *out,
                 const int c = idx - r * C::B_CHUNKS;
                 if (idx < BN * C::B_CHUNKS) q8_mma_sts_16(sB + r * C::B_STRIDE + c * 16, rb[k]);
             }
+            if (CvtC) {
+                /* Consumer converts the block scales, so producers never
+                 * read each other's stores and do not rendezvous. bar.arrive
+                 * has no memory order of its own; release the staged stores
+                 * with an explicit block fence (the old bar.sync 15 supplied
+                 * that as a side effect). */
+                __threadfence_block();
+                q8_mma_bar_arrive(1 + 2 * buf, BAR_COUNT);
+                continue;
+            }
             /* Every producer's stores are visible to every producer: the
              * scales below lie in rows another one stored. */
             q8_mma_bar_sync(15, C::PWARPS * 32);
@@ -2251,7 +2264,19 @@ qwen4exp_gdn_qkv_conv_mma_pipe_kernel(float *out,
                     bf[0] = pw[0];
                     bf[1] = pw[4];
                 }
-                const float2 wsp = *(const float2 *)(sWs + gg * BN + c + (int)t4 * 2);
+                float2 wsp;
+                if (CvtC) {
+                    /* Same halfwords the producer used to write into sWs:
+                     * q8_0 block scales of rows c+t4*2 and c+t4*2+1. */
+                    const unsigned char *ps = sB + (c + (int)t4 * 2) * C::B_STRIDE + skew + gg * 34;
+                    uint16_t hs0, hs1;
+                    memcpy(&hs0, ps, 2);
+                    memcpy(&hs1, ps + C::B_STRIDE, 2);
+                    wsp = make_float2(__half2float(__ushort_as_half(hs0)),
+                                      __half2float(__ushort_as_half(hs1)));
+                } else {
+                    wsp = *(const float2 *)(sWs + gg * BN + c + (int)t4 * 2);
+                }
                 int32_t d[MT][4];
 #pragma unroll
                 for (int mi = 0; mi < MT; mi++) q8_mma_m16n8k32_seeded(d[mi], af[mi], bf, magic);
@@ -2450,16 +2475,35 @@ static int qwen4exp_replay_gate_disjoint(const void *a, uint64_t an,
 }
 
 /* The fused kernel's launch geometry is the projection's own rung at these
- * widths: the 128 x 128 tile, 8 consumer and 4 producer warps, two stages. */
-typedef q8_mma_pipe_cfg<2, 4, 4, 4, 4, 2> qwen4exp_gdn_qkv_conv_cfg;
+ * widths: the 128 x 128 tile, 8 consumer and 4 producer warps, two stages.
+ * DS4_QWEN4EXP_GDN_CVTC=0 restores the producer-side scale conversion
+ * (CvtC=false), which is the instantiation this file shipped. */
+typedef q8_mma_pipe_cfg<2, 4, 4, 4, 4, 2, false> qwen4exp_gdn_qkv_conv_cfg;
+typedef q8_mma_pipe_cfg<2, 4, 4, 4, 4, 2, true> qwen4exp_gdn_qkv_conv_cfg_c;
+
+static int qwen4exp_gdn_qkv_conv_cvtc(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_QWEN4EXP_GDN_CVTC");
+        cached = (e != NULL && e[0] == '0') ? 0 : 1;
+    }
+    return cached;
+}
 
 static int qwen4exp_gdn_qkv_conv_attr(void) {
     static int state = 0;   /* 0 unset, 1 ok, -1 refused */
     if (state == 0) {
-        state = (cudaFuncSetAttribute(
-                     qwen4exp_gdn_qkv_conv_mma_pipe_kernel<2, 4, 4, 4, 4, 2>,
-                     cudaFuncAttributeMaxDynamicSharedMemorySize,
-                     qwen4exp_gdn_qkv_conv_cfg::SMEM) == cudaSuccess) ? 1 : -1;
+        const bool cvtc = qwen4exp_gdn_qkv_conv_cvtc();
+        const int smem = cvtc ? qwen4exp_gdn_qkv_conv_cfg_c::SMEM
+                              : qwen4exp_gdn_qkv_conv_cfg::SMEM;
+        cudaError_t st = cvtc
+            ? cudaFuncSetAttribute(
+                  qwen4exp_gdn_qkv_conv_mma_pipe_kernel<2, 4, 4, 4, 4, 2, true>,
+                  cudaFuncAttributeMaxDynamicSharedMemorySize, smem)
+            : cudaFuncSetAttribute(
+                  qwen4exp_gdn_qkv_conv_mma_pipe_kernel<2, 4, 4, 4, 4, 2, false>,
+                  cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        state = (st == cudaSuccess) ? 1 : -1;
         if (state < 0) (void)cudaGetLastError();
     }
     return state > 0;
@@ -2528,13 +2572,23 @@ extern "C" int ds4_gpu_qwen4exp_gdn_qkv_conv_prefill(
         logical_tier, qkv_elements + 2u * gate_elements + side_elements);
     if (!conv_out || !qwen4exp_gdn_qkv_conv_attr()) return 0;
     float *side = conv_out + qkv_elements + 2u * gate_elements;
-    typedef qwen4exp_gdn_qkv_conv_cfg C;
-    dim3 grid(n_tokens / C::BM, (unsigned)(out_dim / C::BN), 1u);
-    qwen4exp_gdn_qkv_conv_mma_pipe_kernel<2, 4, 4, 4, 4, 2>
-        <<<grid, C::THREADS, C::SMEM, cuda_decode_stream()>>>(
-            conv_out, side, conv_weight, n_key_head, n_value_head, qk_norm_eps,
-            reinterpret_cast<const unsigned char *>(wptr), xq, xscale,
-            out_dim, n_tokens, blocks);
+    const bool cvtc = qwen4exp_gdn_qkv_conv_cvtc();
+    typedef qwen4exp_gdn_qkv_conv_cfg C0;
+    typedef qwen4exp_gdn_qkv_conv_cfg_c CC;
+    dim3 grid(n_tokens / C0::BM, (unsigned)(out_dim / C0::BN), 1u);
+    if (cvtc) {
+        qwen4exp_gdn_qkv_conv_mma_pipe_kernel<2, 4, 4, 4, 4, 2, true>
+            <<<grid, CC::THREADS, CC::SMEM, cuda_decode_stream()>>>(
+                conv_out, side, conv_weight, n_key_head, n_value_head, qk_norm_eps,
+                reinterpret_cast<const unsigned char *>(wptr), xq, xscale,
+                out_dim, n_tokens, blocks);
+    } else {
+        qwen4exp_gdn_qkv_conv_mma_pipe_kernel<2, 4, 4, 4, 4, 2, false>
+            <<<grid, C0::THREADS, C0::SMEM, cuda_decode_stream()>>>(
+                conv_out, side, conv_weight, n_key_head, n_value_head, qk_norm_eps,
+                reinterpret_cast<const unsigned char *>(wptr), xq, xscale,
+                out_dim, n_tokens, blocks);
+    }
     return cuda_ok(cudaGetLastError(), "qwen4exp GDN qkv conv projection launch");
 }
 
