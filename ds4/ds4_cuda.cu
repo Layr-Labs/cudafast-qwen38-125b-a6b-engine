@@ -6539,7 +6539,56 @@ __global__ static void matmul_q8_hc_down_pair_kernel(
             if (part == 0u) acc[0] += ws * xs[at] * (float)dot;
         }
     }
-    for (unsigned b = group + 32u; b < 320u; b += 32u) {
+    /* THE WALK'S TRIP COUNT IS NINE, AND SAYING SO IS THE WHOLE CHANGE.
+     *
+     * Every launch site of this kernel passes 32 threads (three sites, the
+     * literal 32 in each), so `group` -- threadIdx.x / L at L = 1 -- is in
+     * [0, 32).  The shipped walk is `b = group + 32; b < 320; b += 32`, so
+     * it runs for b = group + 32k while 32k < 320 - group, i.e. while
+     * k < 10 - group/32.  With 0 <= group <= 31 that bound sits in (9, 10],
+     * so k runs 1..9 for EVERY lane and the last step b = group + 288 <= 319
+     * is always in range.  Nine, always, with no tail.
+     *
+     * nvcc cannot see that, because blockDim.x is a runtime value: the
+     * shipped SASS is ONE loop body -- eleven LDG.E issued at the top and
+     * consumed by the IDP.4A chain in the same body, then a backward branch.
+     * So each lane pays the DRAM latency of step k before step k+1's address
+     * is even issued: NINE serial latency rounds, with a memory-level
+     * parallelism of one walk step per warp.
+     *
+     * Nothing else can cover that here.  This kernel's own note above says
+     * the GRID, not registers, is its limit: 320 output rows x rows tokens of
+     * ONE warp each is 640 blocks at the two-row verify, 13.3 warps on a
+     * 48-SM part that holds 48.  There are no other resident warps to hide
+     * behind, so per-warp MLP is the only lever left, and the rolled walk
+     * pins it at one.
+     *
+     * Rewriting the induction variable as a counted k = 1..9 gives nvcc the
+     * constant trip count, it unrolls, and all nine steps' loads fly
+     * together.  Registers are free to pay for it: the cuobjdump reading of
+     * the shipped kernel is REG:40 at 32 threads, i.e. 1,280 of the SM's
+     * 65,536, and residency here is bounded by the 640-block grid long
+     * before any register file is.
+     *
+     * NOTHING ARITHMETIC MOVES.  b takes the same nine values in the same
+     * ascending order, each step runs the same statements on the same
+     * operands, and `acc[0] += ws * xs[at] * (float)dot` stays a single
+     * left-to-right float chain in that same order.  Unrolling replicates
+     * statements; it does not reassociate them.  The cross-group fold below
+     * is untouched.
+     *
+     * QW_HC_DOWN_UNROLL_STEPS=0 restores the rolled walk from the same source
+     * for an A/B; the emitted values are identical either way. */
+#ifndef QW_HC_DOWN_UNROLL_STEPS
+#define QW_HC_DOWN_UNROLL_STEPS 1
+#endif
+#if QW_HC_DOWN_UNROLL_STEPS
+#pragma unroll 3
+#else
+#pragma unroll 1
+#endif
+    for (unsigned k = 1u; k < 10u; k++) {
+        const unsigned b = group + 32u * k;
         const unsigned char *blk = w + row * 10880u + b * 34u;
         const unsigned char *payload = blk + 2u + part * (32u / L);
         const uintptr_t address = (uintptr_t)payload;
