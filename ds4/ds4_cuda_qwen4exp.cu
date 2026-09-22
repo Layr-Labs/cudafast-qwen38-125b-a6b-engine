@@ -11739,8 +11739,8 @@ __device__ __forceinline__ static float qwen4exp_hc_norm_scale(
  * character-identical to it -- the mutant script matches that text wherever
  * it appears, so a forked copy still bites. */
 __device__ __forceinline__ static float qwen4exp_hc_norm_scale_staged(
-        const float *xg, uint32_t group, float eps, float *partial) {
-    float xv[QWEN4EXP_HC_STAGED_STEPS];
+        const float *xg, uint32_t group, float eps, float *partial,
+        float *xv) {
 #pragma unroll
     for (uint32_t s = 0; s < QWEN4EXP_HC_STAGED_STEPS; s++) {
         xv[s] = xg[s * QWEN4EXP_HC_THREADS + threadIdx.x];
@@ -11934,8 +11934,15 @@ __global__ static void qwen4exp_hc_norm_quant_kernel(
     QWEN4EXP_PDL_SYNC();
 
     __shared__ float partial[QWEN4EXP_HC_THREADS];
+    /* The staged statistic hands its ten elements back instead of dropping
+     * them.  The quantize walk below wants exactly those addresses, and it
+     * used to re-read every one of them after the block reduction, where the
+     * kernel has nothing left to cover a second trip.  Same loads, same
+     * squares in the same order, same block sum, same reciprocal square
+     * root; only the second read of the stream is gone. */
+    float xv[QWEN4EXP_HC_STAGED_STEPS];
     const float scale = Staged
-        ? qwen4exp_hc_norm_scale_staged(xg, group, eps, partial)
+        ? qwen4exp_hc_norm_scale_staged(xg, group, eps, partial, xv)
         : qwen4exp_hc_norm_scale(xg, group, eps, partial);
     if (threadIdx.x == 0u) nscale[(uint64_t)row * (n / group) + g] = scale;
 
@@ -11950,11 +11957,7 @@ __global__ static void qwen4exp_hc_norm_quant_kernel(
          * below on them: lane k of step s owns flat index
          * s*blockDim.x + warp*32 + lane, exactly the rolled walk's step s,
          * so the butterfly's lanes and the store's pairs are unchanged. */
-        float xv[QWEN4EXP_HC_STAGED_STEPS];
-#pragma unroll
-        for (uint32_t s = 0; s < QWEN4EXP_HC_STAGED_STEPS; s++) {
-            xv[s] = xg[s * QWEN4EXP_HC_THREADS + threadIdx.x];
-        }
+        /* xv is the statistic's own staging, above. */
 #pragma unroll
         for (uint32_t k = 0; k < QWEN4EXP_HC_STAGED_STEPS; k++) {
             const float v = qwen4exp_hc_normed_value(xv[k], scale, wv[k],
