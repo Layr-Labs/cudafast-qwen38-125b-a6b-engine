@@ -20506,7 +20506,7 @@ struct qwen_gdn_projection_args {
 #else
 #define QW_GDN_PROJ_ATTR __launch_bounds__(256)
 #endif
-template<int R, bool Stage=false>
+template<int R, bool Stage=false, int FixedBlocks=0>
 __global__ QW_GDN_PROJ_ATTR
 static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
     extern __shared__ uint4 qw_gdn_panel[];
@@ -20522,7 +20522,8 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
         const bool second=qb>=split;
         const uint32_t block=second?qb-split:qb;
         float *out=second?a.out[1]:a.out[0]; const unsigned char *w=second?a.weights[1]:a.weights[0];
-        const uint64_t out_dim=second?a.od[1]:a.od[0],blocks=a.blocks;
+        const uint64_t out_dim=second?a.od[1]:a.od[0];
+        const uint64_t blocks=FixedBlocks ? (uint64_t)FixedBlocks : a.blocks;
         const uint32_t n_rows=a.n_rows;
         const int8_t *xq=a.xq; const float *xscale=a.xscale;
     if (Stage) {
@@ -21122,17 +21123,25 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
             ((((uintptr_t)a.weights[0]|(uintptr_t)a.weights[1])&3u)==0u) &&
             gdn_panel<=49152u &&
             getenv("DS4_QWEN4EXP_NO_GDN_PANEL")==NULL;
+        const int gdn_fixed_blocks = blocks==80u &&
+            getenv("DS4_QWEN4EXP_NO_GDN_FIXED_BLOCKS")==NULL;
         /* PDL consumer: the stream predecessor is the mixed-input quantizer,
          * which triggers at its top at these decode widths. */
         if (rows==1u) {
-            if (gdn_stage)
+            if (gdn_stage && gdn_fixed_blocks)
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1,true,80>),
+                                    grid, 256, gdn_panel, cuda_decode_stream(), a);
+            else if (gdn_stage)
                 QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1,true>),
                                     grid, 256, gdn_panel, cuda_decode_stream(), a);
             else
                 QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1>),
                                     grid, 256, 0, cuda_decode_stream(), a);
         } else {
-            if (gdn_stage)
+            if (gdn_stage && gdn_fixed_blocks)
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2,true,80>),
+                                    grid, 256, gdn_panel, cuda_decode_stream(), a);
+            else if (gdn_stage)
                 QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2,true>),
                                     grid, 256, gdn_panel, cuda_decode_stream(), a);
             else
