@@ -1637,6 +1637,66 @@ __device__ static __forceinline__ void qwen4exp_gdn_octet_step(
     qwen4exp_gdn_octet_sum<R>(res);
 }
 
+/* ---- EVICT-FIRST POLICY FOR THE RECURRENT-STATE STREAM ----
+ *
+ * The gated-deltanet recurrent state is the widest streamed buffer a decode
+ * round touches that is NOT a weight.  At the live shape one layer's state is
+ * n_value_head * QWEN4EXP_GDN_DIM * QWEN4EXP_GDN_DIM floats, and thirty-six of
+ * the forty-eight tower blocks are linear, so a decode token reads the whole
+ * of that stream and writes the whole of it back.
+ *
+ * Inside this kernel every one of those bytes is touched EXACTLY ONCE: the
+ * prologue pulls the lane's quads into `h`, the recurrence then runs entirely
+ * in registers, and the epilogue stores `h` back.  Nothing re-reads a state
+ * line before the block retires, and the next reader of that line is the same
+ * layer on the NEXT decode step -- after the other forty-seven layers, their
+ * expert slabs and their KV have streamed through L2, which is hundreds of
+ * megabytes later.  Under the default write-back policy those bytes are
+ * nevertheless installed at normal priority and evict exactly the lines that
+ * DO get reused inside a round: the routed gate/up and down expert panels,
+ * the attention KV shared by several head groups, and the shared-expert
+ * slabs, each of which is read by several blocks of one launch.
+ *
+ * `.cs` (evict-first) states precisely what is true here -- install it, let it
+ * die first -- so the state stream stops competing for L2 capacity with the
+ * streams it cannot outlive.  The state itself loses nothing: it had no reuse
+ * to lose.
+ *
+ * Exactness is structural.  A cache-policy qualifier changes neither the
+ * address, nor the width, nor the value, nor the order of any access: these
+ * are the same sixteen-byte loads and stores of the same float4s at the same
+ * offsets, and no arithmetic is touched.  Both are coherent, ordinary global
+ * accesses (`.cs` is a replacement-priority hint, not a bypass and not a
+ * relaxed-consistency store), so the state a later kernel reads is the state
+ * this kernel wrote, byte for byte.
+ *
+ * The snapshot path is deliberately NOT routed through here: it already has
+ * its own policy and its own plain-store valve.
+ *
+ * Kill switch: -DQWEN4EXP_GDN_STATE_NT=0 collapses both helpers to the
+ * shipped plain dereferences, which is the byte-for-byte prior kernel. */
+#ifndef QWEN4EXP_GDN_STATE_NT
+#define QWEN4EXP_GDN_STATE_NT 1
+#endif
+
+__device__ static __forceinline__ float4 qwen4exp_gdn_state_load(
+        const float *p) {
+#if QWEN4EXP_GDN_STATE_NT
+    return __ldcs((const float4 *)p);
+#else
+    return *(const float4 *)p;
+#endif
+}
+
+__device__ static __forceinline__ void qwen4exp_gdn_state_store(
+        float *p, const float4 &v) {
+#if QWEN4EXP_GDN_STATE_NT
+    __stcs((float4 *)p, v);
+#else
+    *(float4 *)p = v;
+#endif
+}
+
 template <unsigned R>
 __global__ static void __launch_bounds__(QWEN4EXP_GDN_DIM, QWEN4EXP_GDN_OCTET_BLOCKS_PER_SM)
 qwen4exp_gdn_octet_kernel(
@@ -1684,7 +1744,7 @@ qwen4exp_gdn_octet_kernel(
     for (unsigned r = 0; r < R; r++) {
 #pragma unroll
         for (unsigned m = 0; m < QWEN4EXP_GDN_OCTET_QUADS; m++) {
-            h[r][m] = *(const float4 *)(state + state_base +
+            h[r][m] = qwen4exp_gdn_state_load(state + state_base +
                 r * QWEN4EXP_GDN_DIM + m * 32u);
         }
     }
@@ -1768,8 +1828,9 @@ qwen4exp_gdn_octet_kernel(
     for (unsigned r = 0; r < R; r++) {
 #pragma unroll
         for (unsigned m = 0; m < QWEN4EXP_GDN_OCTET_QUADS; m++) {
-            *(float4 *)(state + state_base + r * QWEN4EXP_GDN_DIM + m * 32u) =
-                h[r][m];
+            qwen4exp_gdn_state_store(
+                state + state_base + r * QWEN4EXP_GDN_DIM + m * 32u,
+                h[r][m]);
         }
     }
 }
