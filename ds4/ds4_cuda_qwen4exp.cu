@@ -1120,6 +1120,37 @@ __global__ static void qwen4exp_gdn_recurrence_kernel(
     *state_ptr = h;
 }
 
+/* EARLY OPERANDS FOR THE DECODE / VERIFY REPLAY RECURRENCE.
+ *
+ * Both replay kernels below run every GDN layer's recurrence at decode and
+ * speculative-verify widths.  Each step's chain is: decay, a 32-lane sum
+ * for h.k, the delta update, then a second 32-lane sum for h.q.  On the
+ * plain form the current row's query quad is loaded only after the delta
+ * update, and on this path that load cannot be scheduled earlier by the
+ * compiler: the pointers carry no __restrict__, and the step first writes
+ * the tape record (and the previous step wrote `out`), so the load is
+ * ordered behind those stores and its global latency sits in the middle of
+ * the chain, between the two reductions.
+ *
+ * With QWEN4EXP_GDN_REPLAY_EARLY_OPERANDS (default 1) the quad is issued at
+ * the top of the step, beside k4 and v_row, so its latency overlaps the
+ * h.k reduction instead of following it.  `qkv` is the convolution output;
+ * `tape`, `checkpoint`, `state` and `out` are separate allocations, so no
+ * store in the step can change the bytes read and the value is the one the
+ * plain form reads.  Replayed rows (no output reader) still read nothing.
+ *
+ * In the gates-published twin, the per-(token, head) gate pair was read by
+ * lane 0 and forwarded with two shuffles.  Its address is warp-uniform, so
+ * every lane now reads it directly: one broadcast transaction, the same two
+ * floats, and two shuffles fewer ahead of the decay multiply.
+ *
+ * Every arithmetic instruction, operand and rounding point is unchanged;
+ * only when two loads issue moves.  Setting the macro to 0 restores the
+ * plain form instruction for instruction. */
+#ifndef QWEN4EXP_GDN_REPLAY_EARLY_OPERANDS
+#define QWEN4EXP_GDN_REPLAY_EARLY_OPERANDS 1
+#endif
+
 /* Bounded input replay for a two-row verify. The base state stays intact
  * across rejection; accepted transitions are replayed in their original
  * order before the current inputs. Only K, V and the already-computed gate
@@ -1168,6 +1199,12 @@ __global__ static void qwen4exp_gdn_replay_kernel(
             ? saved[key_dim + head * QWEN4EXP_GDN_DIM + value]
             : qkv[(uint64_t)token * conv_dim + 2u * key_dim +
                   head * QWEN4EXP_GDN_DIM + value];
+#if QWEN4EXP_GDN_REPLAY_EARLY_OPERANDS
+        /* Current-row query quad, issued beside k4/v_row (see the note above
+         * qwen4exp_gdn_replay_kernel): same address, same value, earlier. */
+        float4 q4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (!replay) q4 = *(const float4 *)(qkv + base + k0);
+#endif
         float g = 0.0f, beta = 0.0f;
         if (replay) {
             const float2 pair = ((const float2 *)(saved + key_dim + value_dim))[head];
@@ -1202,7 +1239,9 @@ __global__ static void qwen4exp_gdn_replay_kernel(
         h.z = fmaf(k4.z, delta_v, h.z);
         h.w = fmaf(k4.w, delta_v, h.w);
         if (!replay) {
+#if !QWEN4EXP_GDN_REPLAY_EARLY_OPERANDS
             const float4 q4 = *(const float4 *)(qkv + base + k0);
+#endif
             const float result = warp_sum_all_f32(dot4_f32(h, q4));
             if (lane == 0u)
                 out[(uint64_t)token * value_dim + head * QWEN4EXP_GDN_DIM + value] = result;
@@ -1249,18 +1288,32 @@ __global__ static void qwen4exp_gdn_replay_gates_kernel(
             ? saved[key_dim + head * QWEN4EXP_GDN_DIM + value]
             : qkv[(uint64_t)token * conv_dim + 2u * key_dim +
                   head * QWEN4EXP_GDN_DIM + value];
+#if QWEN4EXP_GDN_REPLAY_EARLY_OPERANDS
+        float4 q4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (!replay) q4 = *(const float4 *)(qkv + base + k0);
+#endif
         float g = 0.0f, beta = 0.0f;
         if (replay) {
             const float2 pair = ((const float2 *)(saved + key_dim + value_dim))[head];
             g = pair.x; beta = pair.y;
         } else {
             const uint64_t gate = (uint64_t)token * n_value_head + head;
+#if QWEN4EXP_GDN_REPLAY_EARLY_OPERANDS
+            /* Warp-uniform address: every lane reads the same published
+             * pair in one broadcast transaction, so the two shuffles that
+             * forwarded lane 0's copy leave the dependency chain. */
+            {
+                const float2 pair = gate_pairs[gate];
+                g = pair.x; beta = pair.y;
+            }
+#else
             if (lane == 0u) {
                 const float2 pair = gate_pairs[gate];
                 g = pair.x; beta = pair.y;
             }
             g = __shfl_sync(0xffffffffu, g, 0);
             beta = __shfl_sync(0xffffffffu, beta, 0);
+#endif
             if (token == 0u && prefix < DS4_QWEN4EXP_GDN_REPLAY_ROWS) {
                 float *const record = tape + (uint64_t)prefix * tape_stride;
                 if (value == 0u && head == key_writer)
@@ -1283,7 +1336,9 @@ __global__ static void qwen4exp_gdn_replay_gates_kernel(
         h.z = fmaf(k4.z, delta_v, h.z);
         h.w = fmaf(k4.w, delta_v, h.w);
         if (!replay) {
+#if !QWEN4EXP_GDN_REPLAY_EARLY_OPERANDS
             const float4 q4 = *(const float4 *)(qkv + base + k0);
+#endif
             const float result = warp_sum_all_f32(dot4_f32(h, q4));
             if (lane == 0u)
                 out[(uint64_t)token * value_dim + head * QWEN4EXP_GDN_DIM + value] = result;
