@@ -11729,6 +11729,31 @@ __device__ __forceinline__ static float qwen4exp_hc_norm_scale(
     return 1.0f / sqrtf(total / (float)group + eps);
 }
 
+/* The 256-thread HC scale tree, with its first three levels evaluated by
+ * warp zero after one shared-memory publication. Each lane reads the same
+ * eight leaves that the stride-128, stride-64 and stride-32 stages reduced
+ * into that lane. Keep every addition's operands and order unchanged; an
+ * ordinary warp-first block reduction would reassociate the sum.
+ * Only the fixed-width staged norm uses this helper. */
+__device__ __forceinline__ static float qwen4exp_hc_block_sum_staged(
+        float v, float *partial) {
+    const uint32_t tid = threadIdx.x;
+    partial[tid] = v;
+    __syncthreads();
+    if (tid < 32u) {
+        const float p0 = __fadd_rn(partial[tid], partial[tid + 128u]);
+        const float p1 = __fadd_rn(partial[tid + 32u], partial[tid + 160u]);
+        const float p2 = __fadd_rn(partial[tid + 64u], partial[tid + 192u]);
+        const float p3 = __fadd_rn(partial[tid + 96u], partial[tid + 224u]);
+        const float q0 = __fadd_rn(p0, p2);
+        const float q1 = __fadd_rn(p1, p3);
+        const float total = warp_sum_all_f32(__fadd_rn(q0, q1));
+        if (tid == 0u) partial[0] = total;
+    }
+    __syncthreads();
+    return partial[0];
+}
+
 /* The same scale walk with its ten values staged in registers first: the
  * rolled loop issues one load and stalls on it before the next, the staged
  * one puts the ten loads in flight together and then accumulates them in the
@@ -11739,8 +11764,8 @@ __device__ __forceinline__ static float qwen4exp_hc_norm_scale(
  * character-identical to it -- the mutant script matches that text wherever
  * it appears, so a forked copy still bites. */
 __device__ __forceinline__ static float qwen4exp_hc_norm_scale_staged(
-        const float *xg, uint32_t group, float eps, float *partial) {
-    float xv[QWEN4EXP_HC_STAGED_STEPS];
+        const float *xg, uint32_t group, float eps, float *partial,
+        float (&xv)[QWEN4EXP_HC_STAGED_STEPS]) {
 #pragma unroll
     for (uint32_t s = 0; s < QWEN4EXP_HC_STAGED_STEPS; s++) {
         xv[s] = xg[s * QWEN4EXP_HC_THREADS + threadIdx.x];
@@ -11751,7 +11776,7 @@ __device__ __forceinline__ static float qwen4exp_hc_norm_scale_staged(
         const float v = xv[c];
         sum += v * v;
     }
-    const float total = qwen4exp_block_sum_f32(sum, partial);
+    const float total = qwen4exp_hc_block_sum_staged(sum, partial);
     /* 1/sqrt rather than rsqrtf, for the same reason as the unfused kernel. */
     return 1.0f / sqrtf(total / (float)group + eps);
 }
@@ -11934,8 +11959,11 @@ __global__ static void qwen4exp_hc_norm_quant_kernel(
     QWEN4EXP_PDL_SYNC();
 
     __shared__ float partial[QWEN4EXP_HC_THREADS];
+    /* Keep the scale walk's values through the reduction for quantization.
+     * Loads stay below the PDL fence; only their lifetime changes. */
+    float xv[QWEN4EXP_HC_STAGED_STEPS];
     const float scale = Staged
-        ? qwen4exp_hc_norm_scale_staged(xg, group, eps, partial)
+        ? qwen4exp_hc_norm_scale_staged(xg, group, eps, partial, xv)
         : qwen4exp_hc_norm_scale(xg, group, eps, partial);
     if (threadIdx.x == 0u) nscale[(uint64_t)row * (n / group) + g] = scale;
 
@@ -11946,15 +11974,10 @@ __global__ static void qwen4exp_hc_norm_quant_kernel(
     const uint64_t blk0 = (uint64_t)row * row_blocks + (uint64_t)g * (group / 32u);
 
     if (Staged) {
-        /* The quantize walk's ten values staged in registers, then the seam
+        /* The scale walk's ten values retained in registers, then the seam
          * below on them: lane k of step s owns flat index
          * s*blockDim.x + warp*32 + lane, exactly the rolled walk's step s,
          * so the butterfly's lanes and the store's pairs are unchanged. */
-        float xv[QWEN4EXP_HC_STAGED_STEPS];
-#pragma unroll
-        for (uint32_t s = 0; s < QWEN4EXP_HC_STAGED_STEPS; s++) {
-            xv[s] = xg[s * QWEN4EXP_HC_THREADS + threadIdx.x];
-        }
 #pragma unroll
         for (uint32_t k = 0; k < QWEN4EXP_HC_STAGED_STEPS; k++) {
             const float v = qwen4exp_hc_normed_value(xv[k], scale, wv[k],
