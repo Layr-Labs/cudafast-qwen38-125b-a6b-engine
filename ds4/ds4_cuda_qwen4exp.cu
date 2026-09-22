@@ -4579,28 +4579,35 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
     int32_t *sel = selected + (uint64_t)tok * n_expert_used;
     float *w = weights_out + (uint64_t)tok * n_expert_used;
 
+    // The KeyMax specialization does not need the float score array after
+    // converting each input to an ordered integer key.  Avoiding that second
+    // 16-value register array reduces register pressure in the hot native path;
+    // the legacy score array remains for the fallback instantiations.
     float scores[16];
     uint32_t live = 0u;
+#if __CUDA_ARCH__ >= 800
+    uint32_t keys[16];
+    if constexpr (Native && KeyMax) {
+#pragma unroll
+    for (uint32_t j = 0; j < 16u; j++) {
+        const uint32_t e = lane + j * 32u;
+        const float v = e < n_expert ? lg[e] : -FLT_MAX;
+        const uint32_t bits = v == 0.0f ? 0u : __float_as_uint(v);
+        const uint32_t ordered = bits & 0x80000000u ? ~bits : bits ^ 0x80000000u;
+        // Original comparator ignores NaNs/-Inf, but accepts exact -FLT_MAX.
+        keys[j] = v >= -FLT_MAX ? ordered : 0u;
+        if (e < n_expert) live |= 1u << j;
+    }
+    } else
+#endif
+    {
 #pragma unroll
     for (uint32_t j = 0; j < 16u; j++) {
         const uint32_t e = lane + j * 32u;
         scores[j] = e < n_expert ? lg[e] : -FLT_MAX;
         if (e < n_expert) live |= 1u << j;
     }
-
-#if __CUDA_ARCH__ >= 800
-    uint32_t keys[16];
-    if constexpr (Native && KeyMax) {
-#pragma unroll
-    for (uint32_t j = 0; j < 16u; j++) {
-        const float v = scores[j];
-        const uint32_t bits = v == 0.0f ? 0u : __float_as_uint(v);
-        const uint32_t ordered = bits & 0x80000000u ? ~bits : bits ^ 0x80000000u;
-        // Original comparator ignores NaNs/-Inf, but accepts exact -FLT_MAX.
-        keys[j] = v >= -FLT_MAX ? ordered : 0u;
     }
-    }
-#endif
     for (uint32_t rank = 0; rank < n_expert_used; rank++) {
         float best_v = -FLT_MAX;
         int32_t best_i = INT32_MAX;
