@@ -16099,6 +16099,17 @@ __global__ static void qwen4exp_qsa_output_gate_quant_kernel(
         const float *gate,
         const float *out,
         uint32_t     n_values) {
+    /* PDL producer for the state-out projection that follows on the stream,
+     * the role and the gate its doubled twin below already carries.  On the
+     * attention layers this kernel, not the gated-deltanet quantizer, is that
+     * projection's stream predecessor, and without a trigger those layers pay
+     * a serialized edge the other layers do not.  The geometry is the twin's
+     * exactly -- the same flat value index, the same 256-thread blocks, the
+     * same n_values / 256 grid from the same entry -- so the single-wave
+     * condition the deadlock rule asks for holds here for the same reason it
+     * holds there.  gridDim is grid-uniform and the bound excludes every
+     * prefill width. */
+    if (gridDim.x <= 48u) QWEN4EXP_PDL_TRIGGER();
     const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
