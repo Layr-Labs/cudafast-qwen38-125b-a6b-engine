@@ -441,12 +441,14 @@ bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
 
 bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
                                  ds4_kvstore_entry *out) {
-    struct stat st;
-    if (stat(path, &st) != 0 ||
-        st.st_size < (off_t)(DS4_KVSTORE_FIXED_HEADER + 4))
-        return false;
     FILE *fp = fopen(path, "rb");
     if (!fp) return false;
+    struct stat st;
+    if (fstat(fileno(fp), &st) != 0 ||
+        st.st_size < (off_t)(DS4_KVSTORE_FIXED_HEADER + 4)) {
+        fclose(fp);
+        return false;
+    }
     ds4_kvstore_entry e = {0};
     uint32_t text_bytes = 0;
     bool ok = ds4_kvstore_read_header(fp, &e, &text_bytes);
@@ -844,7 +846,6 @@ static bool kv_cache_existing_compatible(ds4_kvstore *kc, const char *path,
                                          const char sha[41],
                                          const char *text, size_t text_len,
                                          int model_id, int quant_bits, int ctx_size) {
-    if (access(path, F_OK) != 0) return false;
     ds4_kvstore_entry e = {0};
     if (!ds4_kvstore_read_entry_file(path, sha, &e)) return false;
     bool compatible = e.model_id == (uint8_t)model_id &&
@@ -853,15 +854,9 @@ static bool kv_cache_existing_compatible(ds4_kvstore *kc, const char *path,
                       e.ctx_size <= (uint32_t)ctx_size &&
                       kv_cache_file_text_matches(path, sha, text, text_len);
     ds4_kvstore_entry_free(&e);
-    if (!compatible) {
-        if (unlink(path) == 0) {
-            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                    "%s: kv cache replaced incompatible file %s",
-                    kv_log_name(kc), path);
-        }
-        return false;
-    }
-    return true;
+    /* Leave incompatible entries until the completed replacement is atomically
+     * renamed into place. An unlink here could delete a concurrent replacement. */
+    return compatible;
 }
 
 static bool kv_trailer_serialized_size(const ds4_kvstore_trailer_hooks *hooks,

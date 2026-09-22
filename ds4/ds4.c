@@ -1966,9 +1966,16 @@ static bool write_f32_binary_file(const char *path, const float *data, uint64_t 
 }
 
 static bool read_f32_binary_file(const char *path, float *data, uint64_t n) {
+    if (n > SIZE_MAX / sizeof(float)) return false;
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        fprintf(stderr, "ds4: failed to open %s for reading: %s\n", path, strerror(errno));
+        return false;
+    }
     struct stat st;
-    if (stat(path, &st) != 0) {
+    if (fstat(fileno(fp), &st) != 0) {
         fprintf(stderr, "ds4: failed to stat %s: %s\n", path, strerror(errno));
+        fclose(fp);
         return false;
     }
     if (st.st_size < 0 || (uint64_t)st.st_size != n * sizeof(float)) {
@@ -1977,16 +1984,12 @@ static bool read_f32_binary_file(const char *path, float *data, uint64_t n) {
                 path,
                 (unsigned long long)st.st_size,
                 (unsigned long long)(n * sizeof(float)));
-        return false;
-    }
-
-    FILE *fp = fopen(path, "rb");
-    if (!fp) {
-        fprintf(stderr, "ds4: failed to open %s for reading: %s\n", path, strerror(errno));
+        fclose(fp);
         return false;
     }
     const size_t nr = fread(data, sizeof(float), (size_t)n, fp);
-    const bool ok = nr == (size_t)n && fclose(fp) == 0;
+    const int close_result = fclose(fp);
+    const bool ok = nr == (size_t)n && close_result == 0;
     if (!ok) {
         fprintf(stderr, "ds4: failed to read %s\n", path);
         return false;
@@ -6061,7 +6064,7 @@ static void weights_validate_glm_dsa_layout(
             tensor_expect_glm_dense_quant_layout(l->attn_v_b, 3,
                                                  DS4_N_KV_LORA, DS4_N_VALUE_MLA, DS4_N_HEAD);
             tensor_expect_glm_dense_quant_layout(l->attn_output, 2,
-                                                 DS4_N_HEAD * DS4_N_VALUE_MLA, DS4_N_EMBD, 0);
+                                                 (uint64_t)DS4_N_HEAD * DS4_N_VALUE_MLA, DS4_N_EMBD, 0);
             tensor_expect_glm_dense_quant_layout(l->indexer_attn_k, 2,
                                                  DS4_N_EMBD, DS4_N_INDEXER_HEAD_DIM, 0);
             tensor_expect_glm_dense_quant_layout(l->indexer_attn_q_b, 2,
@@ -6177,7 +6180,7 @@ static void weights_validate_layout(
         tensor_expect_dense_quant_layout(l->attn_kv,        2, DS4_N_EMBD, DS4_N_HEAD_DIM, 0);
         tensor_expect_layout(l->attn_kv_a_norm, DS4_TENSOR_F32,  1, DS4_N_HEAD_DIM, 0, 0);
         tensor_expect_layout(l->attn_sinks,     DS4_TENSOR_F32,  1, DS4_N_HEAD, 0, 0);
-        tensor_expect_dense_quant_layout(l->attn_output_a,  2, DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low_dim, 0);
+        tensor_expect_dense_quant_layout(l->attn_output_a,  2, (uint64_t)DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low_dim, 0);
         tensor_expect_dense_quant_layout(l->attn_output_b,  2, out_low_dim, DS4_N_EMBD, 0);
 
         if (ratio != 0) {
@@ -6247,7 +6250,7 @@ static void mtp_weights_validate_layout(const ds4_mtp_weights *w) {
     tensor_expect_layout(l->attn_kv,        DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_HEAD_DIM, 0);
     tensor_expect_layout(l->attn_kv_a_norm, DS4_TENSOR_F32,  1, DS4_N_HEAD_DIM, 0, 0);
     tensor_expect_layout(l->attn_sinks,     DS4_TENSOR_F32,  1, DS4_N_HEAD, 0, 0);
-    tensor_expect_layout(l->attn_output_a,  DS4_TENSOR_Q8_0, 2, DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low_dim, 0);
+    tensor_expect_layout(l->attn_output_a,  DS4_TENSOR_Q8_0, 2, (uint64_t)DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low_dim, 0);
     tensor_expect_layout(l->attn_output_b,  DS4_TENSOR_Q8_0, 2, out_low_dim, DS4_N_EMBD, 0);
 
     tensor_expect_plain_layout(l->hc_ffn_fn, 2, hc_dim, hc_mix_dim, 0);
@@ -6430,7 +6433,7 @@ static void dspark_weights_validate_block_layout(
                                   DS4_N_HEAD, 0, 0);
     dspark_validate_tensor_layout(dw, l->attn_output_a, "attn_output_a",
                                   DS4_DSPARK_LAYOUT_DENSE, 2,
-                                  DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP),
+                                  (uint64_t)DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP),
                                   out_low_dim, 0);
     dspark_validate_tensor_layout(dw, l->attn_output_b, "attn_output_b",
                                   DS4_DSPARK_LAYOUT_DENSE, 2,
@@ -11566,7 +11569,7 @@ static void hc_pre_from_state_one_scratch(
     hc_weighted_sum_one(out, residual_hc, split, DS4_N_EMBD, n_hc);
 
     memcpy(post, split + n_hc, n_hc * sizeof(post[0]));
-    memcpy(comb, split + 2 * n_hc, n_hc * n_hc * sizeof(comb[0]));
+    memcpy(comb, split + 2 * n_hc, (size_t)n_hc * n_hc * sizeof(comb[0]));
 }
 
 static void hc_pre_from_state_one(
@@ -58132,18 +58135,20 @@ int ds4_dump_chat_tokenization(const char *model_path,
 static bool imatrix_read_text_file(const char *path, char **out, size_t *len_out) {
     *out = NULL;
     *len_out = 0;
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        fprintf(stderr, "ds4: failed to open imatrix dataset %s: %s\n", path, strerror(errno));
+        return false;
+    }
     struct stat st;
-    if (stat(path, &st) != 0) {
+    if (fstat(fileno(fp), &st) != 0) {
         fprintf(stderr, "ds4: failed to stat imatrix dataset %s: %s\n", path, strerror(errno));
+        fclose(fp);
         return false;
     }
     if (st.st_size < 0 || (uint64_t)st.st_size > SIZE_MAX - 1) {
         fprintf(stderr, "ds4: imatrix dataset is too large: %s\n", path);
-        return false;
-    }
-    FILE *fp = fopen(path, "rb");
-    if (!fp) {
-        fprintf(stderr, "ds4: failed to open imatrix dataset %s: %s\n", path, strerror(errno));
+        fclose(fp);
         return false;
     }
     size_t n = (size_t)st.st_size;
