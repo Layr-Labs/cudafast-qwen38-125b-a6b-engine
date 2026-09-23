@@ -7593,7 +7593,7 @@ __global__ static void qwen4exp_moe_down_q_kernel(
  * alignment, the divisibility or the shared-memory budget does not hold, and
  * DS4_QWEN4EXP_NO_SH_GATEUP_PANEL stands it down. */
 template <int R, int GateType = -1, int UpType = -1, bool Vector = false,
-          bool Stage = false>
+          bool Stage = false, bool Async = false>
 __global__ static void qwen4exp_shared_gateup_q_kernel(
         float *mid,
         const char *gate,
@@ -7626,19 +7626,31 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
             up + (uint64_t)(blockIdx.x * 8u) * up_row_bytes;
         for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < gbytes;
              i += (uint64_t)blockDim.x * 16u) {
-            if (i + 16u <= gbytes)
-                *(uint4 *)(gpanel + i) = *(const uint4 *)(const void *)(gsrc + i);
-            else
+            if (i + 16u <= gbytes) {
+                if constexpr (Async)
+                    qw_cpasync16((uint32_t)__cvta_generic_to_shared(gpanel + i),
+                                 gsrc + i);
+                else
+                    *(uint4 *)(gpanel + i) = *(const uint4 *)(const void *)(gsrc + i);
+            } else if constexpr (!Async) {
                 for (uint64_t j = i; j < gbytes; j++) gpanel[j] = gsrc[j];
+            }
         }
         for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < ubytes;
              i += (uint64_t)blockDim.x * 16u) {
-            if (i + 16u <= ubytes)
-                *(uint4 *)(upanel + i) = *(const uint4 *)(const void *)(usrc + i);
-            else
+            if (i + 16u <= ubytes) {
+                if constexpr (Async)
+                    qw_cpasync16((uint32_t)__cvta_generic_to_shared(upanel + i),
+                                 usrc + i);
+                else
+                    *(uint4 *)(upanel + i) = *(const uint4 *)(const void *)(usrc + i);
+            } else if constexpr (!Async) {
                 for (uint64_t j = i; j < ubytes; j++) upanel[j] = usrc[j];
+            }
         }
+        if constexpr (Async) qw_cpasync_commit();
         QWEN4EXP_PDL_SYNC();
+        if constexpr (Async) qw_cpasync_wait0();
         __syncthreads();
     }
     const char *const gate_row = Stage
@@ -11218,17 +11230,17 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         ((uintptr_t)up & 15u) == 0u &&
         sh_gu_bytes <= 65536u &&
         getenv("DS4_QWEN4EXP_NO_SH_GATEUP_PANEL") == NULL;
-#define QWEN4EXP_SH_GATEUP_LAUNCH(R, GT, UT, V, S, SH) do { \
+#define QWEN4EXP_SH_GATEUP_LAUNCH(R, GT, UT, V, S, A, SH) do { \
     if (n_tokens <= 2u) { \
         QWEN4EXP_LAUNCH_PDL( \
-                (qwen4exp_shared_gateup_q_kernel<R, GT, UT, V, S>), \
+                (qwen4exp_shared_gateup_q_kernel<R, GT, UT, V, S, A>), \
                 (dim3((mid_dim + 7u) / 8u, tiles, 1)), \
                 threads, (SH), side, \
                 (float *)mid->ptr, gate, up, xq, xs, xsum, \
                 gate_slab->row_bytes, up_slab->row_bytes, \
                 gate_slab->type, up_slab->type, xgroups, mid_dim, n_tokens); \
     } else { \
-        qwen4exp_shared_gateup_q_kernel<R, GT, UT, V, S> \
+        qwen4exp_shared_gateup_q_kernel<R, GT, UT, V, S, A> \
             <<<dim3((mid_dim + 7u) / 8u, tiles, 1), threads, (SH), side>>>( \
                     (float *)mid->ptr, gate, up, xq, xs, xsum, \
                     gate_slab->row_bytes, up_slab->row_bytes, \
@@ -11237,9 +11249,9 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
 } while (0)
 #define QWEN4EXP_SH_GATEUP_IMPL(R, GT, UT, V) do { \
     if (sh_gu_stage) { \
-        QWEN4EXP_SH_GATEUP_LAUNCH(R, GT, UT, V, true, (size_t)sh_gu_bytes); \
+        QWEN4EXP_SH_GATEUP_LAUNCH(R, GT, UT, V, true, true, (size_t)sh_gu_bytes); \
     } else { \
-        QWEN4EXP_SH_GATEUP_LAUNCH(R, GT, UT, V, false, 0); \
+        QWEN4EXP_SH_GATEUP_LAUNCH(R, GT, UT, V, false, false, 0); \
     } \
 } while (0)
 #define QWEN4EXP_SH_GATEUP(R) do { \
