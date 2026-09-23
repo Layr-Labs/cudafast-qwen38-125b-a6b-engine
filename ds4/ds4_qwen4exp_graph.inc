@@ -2838,9 +2838,22 @@ static bool qwen4exp_graph_layers_encode(
  * overlap the device work already queued. */
 #define QW_DECODE_GRAPH_MAX_CHUNKS 8u
 
+/* CHUNKS BEHIND THE LEAD.  4 was the even-split A/B's pick, made when the
+ * first chunk was one of the four and its size set the exposed launch.  With
+ * the lead chunk (below) that exposure is one layer's launch whatever the
+ * count is, so the count now only buys boundaries: every chunk after the lead
+ * adds one graph-to-graph gap on the device (~0.79 ms over the decode window
+ * per boundary in the lead A/B) and one more capture per shape.  Each later
+ * chunk's launch is issued while the chunk in front of it runs, and at three
+ * chunks the one launched behind the single lead layer covers 16 layers --
+ * ~0.43 us/node puts its host launch near 180 us, still inside one decode
+ * layer's device time -- so dropping to three removes a boundary without
+ * exposing a launch.  Same layers, same order, same kernels: every chunk
+ * boundary carries no state (see qwen4exp_graph_layers), so the outputs are
+ * the same bits.  DS4_CUDA_DECODE_GRAPH_CHUNKS=4 restores the prior split. */
 static uint32_t qw_decode_graph_chunks(void) {
     static int init = 0;
-    static uint32_t chunks = 4u;   /* the A/B's pick; 1 restores the single capture */
+    static uint32_t chunks = 3u;   /* 1 restores the single capture */
     if (!init) {
         init = 1;
         const char *s = getenv("DS4_CUDA_DECODE_GRAPH_CHUNKS");
