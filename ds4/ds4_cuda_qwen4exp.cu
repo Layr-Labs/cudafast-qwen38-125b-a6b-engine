@@ -6455,10 +6455,13 @@ qwen4exp_moe_down_mma_kernel(
                         down_e + (uint64_t)orow * down_row_bytes;
                     if (w_dq) {
                         uint32_t raw[6];
-                        dev_qwen4exp_group_decode_w(dtype, drow, g,
-                                qw_raw_load<Wide6>(dtype, drow, g, raw)
-                                    ? raw : NULL,
-                                &sA[r * QW_MMA_LD + gg * 32], wa, wb);
+                        if (qw_raw_load<Wide6>(dtype, drow, g, raw)) {
+                            dev_qwen4exp_group_decode_w(dtype, drow, g, raw,
+                                    &sA[r * QW_MMA_LD + gg * 32], wa, wb);
+                        } else {
+                            dev_qwen4exp_group_decode_w(dtype, drow, g, NULL,
+                                    &sA[r * QW_MMA_LD + gg * 32], wa, wb);
+                        }
                     } else {
                         dev_qwen4exp_group_decode(dtype, drow, g,
                                 wq, wa, wb, &halves);
