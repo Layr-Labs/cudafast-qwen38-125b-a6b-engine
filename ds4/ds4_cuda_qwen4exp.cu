@@ -11883,6 +11883,10 @@ __device__ __forceinline__ static float qwen4exp_q8_rcp_approx(float d) {
  * is the standalone kernel's row * blocks + b.  Every group is full, so the
  * standalone kernel's ragged-tail guard has nothing to guard.  One row of
  * prefill only. */
+#ifndef QWEN4EXP_GDN_OUTQ_EARLY_GATE
+#define QWEN4EXP_GDN_OUTQ_EARLY_GATE 1
+#endif
+
 __global__ static void qwen4exp_gdn_output_quant_kernel(
         int8_t      *xq,
         float       *xscale,
@@ -11913,14 +11917,25 @@ __global__ static void qwen4exp_gdn_output_quant_kernel(
     const uint64_t base = (uint64_t)token * value_dim +
         head * QWEN4EXP_GDN_DIM;
     const float raw = out[base + tid];
+#if QWEN4EXP_GDN_OUTQ_EARLY_GATE
+    /* These read-only values are independent of the reduction.  Pulling them
+     * in before the barrier lets their latency overlap the warp reduction and
+     * keeps the post-barrier tail to the scale and the original multiply. */
+    const float norm_weight = output_norm[tid];
+    const float gate_sigmoid = qwen4exp_gdn_sigmoid(output_gate[base + tid]);
+#endif
     float total = warp_sum_f32(raw * raw);
     if (lane == 0u) partial[warp] = total;
     __syncthreads();
     total = lane < 4u ? partial[lane] : 0.0f;
     total = warp_sum_all_f32(total);
     const float scale = rsqrtf(total / (float)QWEN4EXP_GDN_DIM + norm_eps);
+#if QWEN4EXP_GDN_OUTQ_EARLY_GATE
+    const float v = raw * scale * norm_weight * gate_sigmoid;
+#else
     const float v = raw * scale * output_norm[tid] *
         qwen4exp_gdn_sigmoid(output_gate[base + tid]);
+#endif
     const float vz = qwen4exp_q8_ftz(v);
     float a = qwen4exp_q8_ftz(fabsf(v));
 #pragma unroll
