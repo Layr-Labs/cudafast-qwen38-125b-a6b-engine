@@ -3931,12 +3931,16 @@ typedef struct {
      * NULL preserves raw-gate replay. Invalid supplied scratch fails before
      * any kernel launch, including when the diagnostic disables publication. */
     ds4_gpu_tensor *gate_scratch;
+    bool deferred; /* two banks of four rows; control = prefix | bank << 16 */
 } ds4_gpu_qwen4exp_gdn_replay;
 int ds4_gpu_qwen4exp_gdn_replay_supported(void);
 int ds4_gpu_qwen4exp_gdn_replay_materialize(
         ds4_gpu_tensor *state, ds4_gpu_tensor *checkpoint, ds4_gpu_tensor *tape,
         uint32_t replay_rows, uint32_t n_key_head, uint32_t n_value_head,
         uint32_t head_layout);
+int ds4_gpu_qwen4exp_gdn_deferred_materialize(
+        ds4_gpu_tensor *state, ds4_gpu_tensor *checkpoint, ds4_gpu_tensor *tape,
+        uint32_t rows, uint32_t bank, uint32_t nk, uint32_t nv, uint32_t layout);
 int ds4_gpu_qwen4exp_gdn_replay_q8(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *conv_state,

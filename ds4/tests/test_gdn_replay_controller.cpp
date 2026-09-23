@@ -10,6 +10,8 @@
 #include <memory>
 #include <vector>
 #include "ds4_qwen4exp_gdn_replay.h"
+#include "ds4_qwen4exp_gdn_deferred.h"
+static bool deferred_mode=false;
 
 #define DS4_MAX_LAYER 3
 #define DS4_QWEN4EXP_IMPLEMENTED_DEPTH 6u
@@ -26,7 +28,8 @@ struct ds4_qwen4exp_session {
     ds4_gpu_tensor *qsa_k[3]{}, *qsa_v[3]{}, *idx_tape[3]{}, *idx_pool[3]{};
     ds4_gpu_tensor *d_adopt=nullptr,*d_gdn_replay=nullptr,*ple_conv_state=nullptr;
     bool gdn_replay_enabled=true,gdn_replay_active=false,gdn_replay_previous=false;
-    bool state_dirty=false;
+    bool state_dirty=false,gdn_deferred_enabled=false;
+    uint32_t gdn_deferred_bank=0;
     uint32_t gdn_replay_prefix=0,gdn_replay_phase=0;
     uint32_t adopt_state=0,adopt_conv=0,adopt_device=0,spec_snapshot_rows=0;
     uint32_t head_cache_pos=0,pos=0;
@@ -65,22 +68,30 @@ static int ds4_gpu_qwen4exp_gdn_replay_materialize(ds4_gpu_tensor *out,
     for(unsigned i=0;i<rows;i++) h=transition(h,tape->v[i]);
     out->v[0]=h;materializations++;return 1;
 }
+static int ds4_gpu_qwen4exp_gdn_deferred_materialize(ds4_gpu_tensor *out,
+        ds4_gpu_tensor *base,ds4_gpu_tensor *tape,unsigned rows,unsigned bank,unsigned,unsigned,unsigned) {
+    need(rows<=3 && bank<=1,"deferred materialization bounds");
+    uint64_t h=base->v[0];
+    for(unsigned i=0;i<rows;i++) h=transition(h,tape->v.at(bank*4+i));
+    out->v[0]=h;materializations++;return 1;
+}
 #include "gdn_replay_controller.inc"
 
 struct fixture {
     ds4_qwen4exp_session s;
     std::vector<std::unique_ptr<ds4_gpu_tensor>> allocations;
-    std::array<uint64_t,3> state{},conv{};
+    std::array<uint64_t,3> state{},conv{},lastfinal{};
     std::array<std::array<uint64_t,6>,3> snap{},conv_snap{};
     std::map<uint32_t,std::pair<ds4_gpu_tensor*,bool>> graphs;
     uint64_t token=1;
     explicit fixture(bool enabled=true,bool lazy=true) {
         s.gdn_replay_enabled=enabled&&lazy;
+        s.gdn_deferred_enabled=s.gdn_replay_enabled&&deferred_mode;
         if(lazy) s.d_adopt=alloc(1);
         if(enabled&&lazy) s.d_gdn_replay=alloc(1);
         for(unsigned il:{0u,2u}) {
             s.gdn_state[il]=alloc(1);s.gdn_checkpoint[il]=alloc(1);
-            s.gdn_conv[il]=alloc(1);s.gdn_replay_tape[il]=alloc(2);
+            s.gdn_conv[il]=alloc(1);s.gdn_replay_tape[il]=alloc(s.gdn_deferred_enabled?8:2);
             s.gdn_state_snapshot[il]=alloc(6);s.gdn_conv_snapshot[il]=alloc(6);
         }
     }
@@ -105,12 +116,16 @@ struct fixture {
     }
     void inspect() {
         for(unsigned il:{0u,2u}) {
+            if(s.gdn_deferred_enabled && s.gdn_replay_previous) {
+                need(qwen4exp_gdn_deferred_final(&s,il),"final inspection failed");
+                need(s.gdn_state[il]->v[0]==lastfinal[il],"virtual final mismatch");
+            }
             uint64_t live=s.gdn_state[il]->v[0];
-            unsigned prefix=s.gdn_replay_prefix;
+            unsigned prefix=s.gdn_replay_prefix,bank=s.gdn_deferred_bank;
             if(s.gdn_replay_previous) {
                 need(qwen4exp_gdn_replay_snapshot(&s,il,0),"virtual snapshot refused");
                 need(s.gdn_state_snapshot[il]->v[0]==snap[il][0],"virtual snapshot mismatch");
-                need(s.gdn_state[il]->v[0]==live && s.gdn_replay_prefix==prefix,"inspection mutated state");
+                need(s.gdn_state[il]->v[0]==live && s.gdn_replay_prefix==prefix && s.gdn_deferred_bank==bank,"inspection mutated state");
             }
         }
     }
@@ -126,10 +141,12 @@ struct fixture {
             uint64_t c=s.gdn_conv[il]->v[0];
             unsigned adopt=s.d_adopt?(unsigned)s.d_adopt->v[0]:0;
             unsigned prefix=s.d_gdn_replay?(unsigned)s.d_gdn_replay->v[0]:0;
+            unsigned bank=s.gdn_deferred_enabled?prefix>>16u:0;
+            prefix &= 0xffffu;
             if(adopt) c=s.gdn_conv_snapshot[il]->v.at(adopt-1);
             if(s.gdn_replay_active) {
                 h=s.gdn_checkpoint[il]->v[0];
-                for(unsigned i=0;i<prefix;i++) h=transition(h,s.gdn_replay_tape[il]->v.at(i));
+                for(unsigned i=0;i<prefix;i++) h=transition(h,s.gdn_replay_tape[il]->v.at(bank*4+i));
             } else if(adopt) h=s.gdn_state_snapshot[il]->v.at(adopt-1);
             need(h==state[il] && c==conv[il],"forward did not adopt selected state");
             for(unsigned t=0;t<width;t++) {
@@ -140,12 +157,17 @@ struct fixture {
                 need(h==state[il] && c==conv[il],"row output mismatch");
                 if(t<snapshots) {snap[il][t]=state[il];conv_snap[il][t]=conv[il];}
                 if(t<snapshots) s.gdn_conv_snapshot[il]->v[t]=c;
-                if(s.gdn_replay_active && t==0) {
+                if(s.gdn_replay_active && s.gdn_deferred_enabled) {
+                    const bool flush=prefix>=2;
+                    if(flush && t==0) s.gdn_checkpoint[il]->v[0]=h;
+                    else s.gdn_replay_tape[il]->v.at((bank^unsigned(flush))*4+(flush?t-1:prefix+t))=input;
+                } else if(s.gdn_replay_active && t==0) {
                     if(prefix==2) s.gdn_checkpoint[il]->v[0]=h;
                     else s.gdn_replay_tape[il]->v.at(prefix)=input;
                 } else if(!s.gdn_replay_active && t<snapshots) s.gdn_state_snapshot[il]->v[t]=h;
             }
-            s.gdn_state[il]->v[0]=h;s.gdn_conv[il]->v[0]=c;
+            if(!s.gdn_deferred_enabled || !s.gdn_replay_active) s.gdn_state[il]->v[0]=h;
+            lastfinal[il]=h;s.gdn_conv[il]->v[0]=c;
         }
         s.gdn_replay_previous=s.gdn_replay_active;s.adopt_state=0;s.adopt_conv=0;
         token+=width;s.pos+=width;forwards++;
@@ -155,6 +177,8 @@ struct fixture {
 static uint32_t rng=1;
 static uint32_t random_word() {rng=rng*1664525u+1013904223u;return rng;}
 int main() {
+    for(unsigned policy=0;policy<2;policy++) {
+    deferred_mode=policy!=0;
     for(unsigned mask=0;mask<4096;mask++) for(unsigned style=0;style<3;style++) {
         fixture f;
         f.forward(1,0);
@@ -195,6 +219,7 @@ int main() {
         fail_update=true;
         need(!prepare(&f.s,2),"post-swap update failure ignored");
         f.reset();f.forward(2,1,true);cases++;
+    }
     }
     need(!batch,"command batch leaked");
     std::printf("PASS actual graph lifecycle: %u cases, %u forwards, %u materializations\n",cases,forwards,materializations);

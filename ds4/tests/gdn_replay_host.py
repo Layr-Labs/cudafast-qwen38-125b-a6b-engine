@@ -45,11 +45,11 @@ with tempfile.TemporaryDirectory(prefix='gdn-replay-host-') as tmp:
         # copy_layers also has a forward declaration; take its definition.
         first = graph.index('static bool qwen4exp_session_copy_layers(')
         body = graph.index('static bool qwen4exp_session_copy_layers(', first + 1)
-        ctl = definition(graph, 'qwen4exp_gdn_replay_snapshot') + definition(
+        ctl = definition(graph, 'qwen4exp_gdn_deferred_final') + definition(graph, 'qwen4exp_gdn_replay_snapshot') + definition(
             graph[body:], 'qwen4exp_session_copy_layers') + ''.join(
             definition(graph, n) for n in (
                 'qwen4exp_session_select_layers', 'ds4_qwen4exp_session_reset'))
-        start = graph.index('    const ds4_qwen4exp_gdn_replay_step replay_step =')
+        start = graph.index('    ds4_qwen4exp_gdn_replay_step replay_step =')
         end = graph.index('    if (s->d_pos &&', start)
         ctl += ('static bool prepare(ds4_qwen4exp_session *s, uint32_t n_tokens) {\n'
                 'const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;\n' +
