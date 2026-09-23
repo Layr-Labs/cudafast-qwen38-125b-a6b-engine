@@ -27,6 +27,8 @@ source=r'''
 #define QWEN4EXP_GDN_HISTORY 3u
 #define DS4_QWEN4EXP_GDN_REPLAY_ROWS 2u
 #define QWEN4EXP_Q8_RCP127 0x1.020408p-7f
+#define QWEN4EXP_PDL_SYNC() ((void)0)
+#define QWEN4EXP_PDL_TRIGGER() ((void)0)
 #define CK(x) do{auto e=(x);if(e!=cudaSuccess){fprintf(stderr,"CUDA %s:%d\n",cudaGetErrorString(e),__LINE__);exit(1);}}while(0)
 '''+ '\n'.join(body(n) for n in names)+r'''
 struct B{
