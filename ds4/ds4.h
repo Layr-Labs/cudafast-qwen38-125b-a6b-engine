@@ -648,4 +648,16 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
  * it is outside every timed phase and cannot perturb a measurement. */
 const char *ds4_gpu_hw_limits(void);
 
+/* The resident's load-time self-profile, run once after the load and before
+ * its socket binds (harness/protocol-adapter/ds4_shim/ds4_resident.c): arm or
+ * disarm the engine's serialising stage timers -- the forward's slices, the
+ * MoE's stages, the MTP head's block and step -- zeroing them; then report
+ * their per-round sums in milliseconds as one compact line the resident
+ * appends to the identity it publishes.  Diagnostic only: while armed, every
+ * decode graph takes the eager path; disarmed, nothing changes. */
+void ds4_qwen4exp_profile_set(int on);
+size_t ds4_qwen4exp_profile_report(char *buf, size_t cap, uint32_t rounds);
+void ds4_qwen4exp_mtp_profile_set(int on);
+size_t ds4_qwen4exp_mtp_profile_report(char *buf, size_t cap, uint32_t rounds);
+
 #endif

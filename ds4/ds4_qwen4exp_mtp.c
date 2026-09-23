@@ -1081,6 +1081,38 @@ static int mtp_head_time_on(void) {
     return mtp_head_timing;
 }
 
+/* The resident's load-time self-profile (ds4_qwen4exp_profile_set in the
+ * graph arms the tower's half): arm or disarm this step's timer and zero it,
+ * then report the split as milliseconds per verify round.  Declared in ds4.h
+ * for the shim. */
+void ds4_qwen4exp_mtp_profile_set(int on) {
+    mtp_head_timing = on ? 1 : 0;
+    memset(mtp_head_stage_ns, 0, sizeof(mtp_head_stage_ns));
+    mtp_head_stage_calls = 0;
+}
+
+size_t ds4_qwen4exp_mtp_profile_report(char *buf, size_t cap, uint32_t rounds) {
+    static const char *const key[MTP_HEAD_T_N] = {
+        "tok", "mup", "emb", "en", "hn", "ehx", "ehp", "blk",
+        "mix", "lm", "t1", "end", "t1r", "l0r", "mr",
+    };
+    if (!buf || cap == 0) return 0;
+    buf[0] = '\0';
+    if (mtp_head_stage_calls == 0) return 0;
+    const double r = rounds ? (double)rounds : 1.0;
+    int w = snprintf(buf, cap, "mh(%.2f/rd):", (double)mtp_head_stage_calls / r);
+    if (w < 0) return 0;
+    size_t len = (size_t)w < cap ? (size_t)w : cap - 1;
+    for (int i = 0; i < MTP_HEAD_T_N && len + 1 < cap; i++) {
+        if (!mtp_head_stage_ns[i]) continue;
+        w = snprintf(buf + len, cap - len, "%s=%.2f,", key[i],
+                     (double)mtp_head_stage_ns[i] / 1e6 / r);
+        if (w < 0) break;
+        len += (size_t)w < cap - len ? (size_t)w : cap - len - 1;
+    }
+    return len;
+}
+
 #define MTP_HEAD_TICK(slot)                                                   \
     do {                                                                      \
         if (timing) {                                                         \

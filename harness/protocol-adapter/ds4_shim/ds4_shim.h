@@ -55,6 +55,13 @@ const char *ds4s_last_error(const ds4s_handle *h);
  * metrics, where a box with no profiler can still read them. */
 const char *ds4s_hw_limits(void);
 
+/* The resident's load-time self-profile (ds4_qwen4exp_profile_set in ds4.h):
+ * arm or disarm the engine's serialising stage timers, zeroing them, and
+ * report their per-round sums in milliseconds as one compact line. Called only
+ * before the resident binds its socket, so no phase runs armed. */
+void ds4s_profile_set(int on);
+size_t ds4s_profile_report(char *buf, size_t cap, unsigned rounds);
+
 /* Vocabulary size of the loaded model. */
 int ds4s_vocab_size(const ds4s_handle *h);
 

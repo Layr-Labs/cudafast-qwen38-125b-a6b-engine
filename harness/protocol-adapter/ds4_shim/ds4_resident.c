@@ -92,6 +92,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 #define RESIDENT_MAX_TOP_K 64
@@ -526,6 +527,100 @@ static void serve_connection(const resident *r, int fd, int timeout_s) {
     free(in.data);
 }
 
+/* --- load-time self-profile ------------------------------------------------ */
+
+/* Weak: the CI stub engine (tools/ds4/resident-stub-engine.c) carries no
+ * profiler, and a resident linked against it must still link and serve. */
+#pragma weak ds4s_profile_set
+#pragma weak ds4s_profile_report
+
+static double mono_s(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+/* One decode step the way a phase's spec_run takes it: a speculative cycle fed
+ * the pending token, whose frontier argmax is the next pending token; or one
+ * serial eval with no draft head. Returns the tokens committed, -1 on failure. */
+static int profile_step(ds4s_handle *h, int draft_tokens, int32_t *pending) {
+    if (draft_tokens >= 2) {
+        int32_t committed[RESIDENT_MAX_SPEC];
+        const int n = ds4s_eval_speculative(h, *pending, RESIDENT_MAX_RUN, committed,
+                                            RESIDENT_MAX_SPEC);
+        if (n <= 0 || committed[0] != *pending) return -1;
+        *pending = ds4s_argmax(h);
+        return n;
+    }
+    if (ds4s_eval(h, *pending) != 0) return -1;
+    *pending = ds4s_argmax(h);
+    return 1;
+}
+
+enum { PROF_PROMPT = 1024, PROF_WARM = 4, PROF_TIMED = 24, PROF_ARMED = 12 };
+
+static int self_profile_run(ds4s_handle *h, int draft_tokens, char *out, size_t cap) {
+    static int32_t prompt[PROF_PROMPT];
+    const int vocab = ds4s_vocab_size(h);
+    if (vocab < 8192) return -1;
+    /* A fixed pseudo-random prompt of ordinary token ids: the decode it leads
+     * to routes experts like any other text, and the timing needs no tokenizer. */
+    uint32_t x = 0x9e3779b9u;
+    for (int i = 0; i < PROF_PROMPT; i++) {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        prompt[i] = (int32_t)(1000u + x % (uint32_t)(vocab / 2));
+    }
+
+    /* A: the scored path -- decode graphs on, nothing armed. */
+    ds4s_invalidate(h);
+    if (ds4s_sync(h, prompt, PROF_PROMPT) != 0) return -1;
+    int32_t pending = ds4s_argmax(h);
+    for (int i = 0; i < PROF_WARM; i++)
+        if (profile_step(h, draft_tokens, &pending) < 0) return -1;
+    int committed = 0;
+    double t0 = mono_s();
+    for (int i = 0; i < PROF_TIMED; i++) {
+        const int n = profile_step(h, draft_tokens, &pending);
+        if (n < 0) return -1;
+        committed += n;
+    }
+    const double a_ms = (mono_s() - t0) * 1e3 / PROF_TIMED;
+
+    /* B: the same kind of rounds with the serialising stage timers armed. */
+    ds4s_invalidate(h);
+    if (ds4s_sync(h, prompt, PROF_PROMPT) != 0) return -1;
+    pending = ds4s_argmax(h);
+    for (int i = 0; i < PROF_WARM; i++)
+        if (profile_step(h, draft_tokens, &pending) < 0) return -1;
+    ds4s_profile_set(1);
+    t0 = mono_s();
+    for (int i = 0; i < PROF_ARMED; i++)
+        if (profile_step(h, draft_tokens, &pending) < 0) return -1;
+    const double b_ms = (mono_s() - t0) * 1e3 / PROF_ARMED;
+    char rep[720];
+    ds4s_profile_report(rep, sizeof(rep), PROF_ARMED);
+    snprintf(out, cap, "prof[pos=%d a=%.2fms/rd %.2ft/rd b=%.2fms/rd %s]", PROF_PROMPT, a_ms,
+             (double)committed / PROF_TIMED, b_ms, rep);
+    return 0;
+}
+
+/* Run once after the one load and before the socket binds, so no phase can
+ * see it: time the scored decode path, then attribute a dozen rounds to the
+ * engine's stages. The result rides the identity into the run's published
+ * metrics (engine_backend), the only channel a ranked box offers. The session
+ * is invalidated after, as every phase start does anyway. */
+static void self_profile(ds4s_handle *h, int draft_tokens, char *out, size_t cap) {
+    out[0] = '\0';
+    if (!ds4s_profile_set || !ds4s_profile_report) return;
+    const double t0 = mono_s();
+    if (self_profile_run(h, draft_tokens, out, cap) != 0) snprintf(out, cap, "prof[fail]");
+    ds4s_profile_set(0);
+    ds4s_invalidate(h);
+    log_line("self-profile in %.1f s: %s", mono_s() - t0, out);
+}
+
 /* --- main ----------------------------------------------------------------- */
 
 static void unlink_socket(void) {
@@ -592,12 +687,16 @@ int main(void) {
      * can see it.  On failure the string is empty and the identity is exactly
      * what it was, which keeps the `ds4-resident load_epoch=` prefix and the
      * ident that benchd seals unchanged for a non-CUDA build. */
-    char ident_buf[768];
+    char prof[1024];
+    self_profile(h, draft_tokens, prof, sizeof(prof));
+    char ident_buf[2048];
     const char *limits = ds4s_hw_limits();
-    if (limits && limits[0]) {
-        const int n = snprintf(ident_buf, sizeof(ident_buf), "%s %s", ident, limits);
+    if ((limits && limits[0]) || prof[0]) {
+        const bool lim = limits && limits[0];
+        const int n = snprintf(ident_buf, sizeof(ident_buf), "%s%s%s%s%s", ident,
+                               lim ? " " : "", lim ? limits : "", prof[0] ? " " : "", prof);
         if (n > 0 && (size_t)n < sizeof(ident_buf)) ident = ident_buf;
-        log_line("device limits: %s", limits);
+        if (lim) log_line("device limits: %s", limits);
     }
 
     /* Bind only after the load, so a connect that succeeds means the weights

@@ -248,6 +248,22 @@ const char *ds4s_hw_limits(void) {
     return s ? s : "";
 }
 
+void ds4s_profile_set(int on) {
+    ds4_qwen4exp_profile_set(on);
+    ds4_qwen4exp_mtp_profile_set(on);
+}
+
+size_t ds4s_profile_report(char *buf, size_t cap, unsigned rounds) {
+    if (!buf || cap == 0) return 0;
+    size_t n = ds4_qwen4exp_profile_report(buf, cap, (uint32_t)rounds);
+    if (n + 2 < cap) {
+        buf[n++] = ' ';
+        buf[n] = '\0';
+        n += ds4_qwen4exp_mtp_profile_report(buf + n, cap - n, (uint32_t)rounds);
+    }
+    return n;
+}
+
 int ds4s_vocab_size(const ds4s_handle *h) {
     return h && h->engine ? ds4_engine_vocab_size(h->engine) : 0;
 }

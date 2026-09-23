@@ -2135,6 +2135,24 @@ static void qw_moe_time_dump(void) {
         }                                                                     \
     } while (0)
 
+/* LOAD-TIME SELF-PROFILE.  The ranked box runs no profiler and the resident's
+ * stderr never reaches the run log, so the one channel out of it is the
+ * identity the resident publishes -- the route the device-limits probe
+ * already takes (ds4_gpu_hw_limits).  ds4_qwen4exp_profile_set(1) arms the
+ * serialising timers this file already carries -- the head block's and the
+ * MoE's, the MoE's also at verify width -- plus a per-slice timer on the
+ * forward's own trace points, and zeroes them; while armed, every decode graph
+ * takes the eager path, exactly as under DS4_MTP_HEAD_TIME.  The resident arms
+ * it for a dozen verify rounds after the one load and disarms it before its
+ * socket binds, so no phase ever runs with it.  Like the slice trace it
+ * attributes time; the unarmed rounds are the measurement. */
+static int      g_qw_prof_on = 0;
+#define QW_PROF_N_SLICE 12
+static double   g_qw_prof_sec[QW_PROF_N_SLICE];
+static uint32_t g_qw_prof_hits[QW_PROF_N_SLICE];
+static double   g_qw_prof_mark = 0.0;
+static uint32_t g_qw_prof_forwards = 0;
+
 static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
                                      const ds4_qwen4exp_layer_weights *l,
                                      const ds4_model *m,
@@ -2147,7 +2165,8 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
      * softmax weights this feeds scale zeros -- but on a real checkpoint they
      * scale live experts, and the top-k selection they drive is discrete, so a
      * row-count difference here can move which experts a row uses. */
-    const int moe_timing = qw_hb_time_on() && n_tokens == 1u;
+    const int moe_timing = qw_hb_time_on() &&
+                           (n_tokens == 1u || (g_qw_prof_on && n_tokens <= 4u));
     const int moe_lane = qw_moe_in_head_block ? 1 : 0;
     uint64_t moe_mark = moe_timing ? qw_hb_now_ns() : 0;
 
@@ -2321,9 +2340,110 @@ static void qwen4exp_trace_report(uint32_t n_tokens) {
 #define QW_TRACE(slice) qwen4exp_trace(slice)
 #define QW_TRACE_REPORT(n) qwen4exp_trace_report(n)
 #else
-#define QW_TRACE(slice) ((void)0)
-#define QW_TRACE_REPORT(n) ((void)0)
+/* Production builds: the slice points feed only the load-time self-profile
+ * (g_qw_prof_on above), a predicted-false branch unless the resident armed it.
+ * The same serialising measurement as the test build's slice trace. */
+typedef enum {
+    QW_SLICE_EMBED = 1,
+    QW_SLICE_PLE,
+    QW_SLICE_ATTN_MIX,
+    QW_SLICE_GDN,
+    QW_SLICE_QSA,
+    QW_SLICE_ATTN_INJECT,
+    QW_SLICE_FFN_MIX,
+    QW_SLICE_MOE,
+    QW_SLICE_FFN_INJECT,
+    QW_SLICE_FINAL_MIX,
+    QW_SLICE_HEAD,
+} qwen4exp_slice;
+
+static void qwen4exp_prof_slice(int slice) {
+    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize() ||
+        !ds4_gpu_begin_commands()) {
+        return;
+    }
+    const double now = now_sec();
+    if (g_qw_prof_mark > 0.0 && slice > 0 && slice < QW_PROF_N_SLICE) {
+        g_qw_prof_sec[slice] += now - g_qw_prof_mark;
+        g_qw_prof_hits[slice]++;
+    }
+    g_qw_prof_mark = now;
+}
+
+#define QW_TRACE(slice)                                                       \
+    do {                                                                      \
+        if (g_qw_prof_on) qwen4exp_prof_slice((int)(slice));                  \
+    } while (0)
+#define QW_TRACE_REPORT(n)                                                    \
+    do {                                                                      \
+        (void)(n);                                                            \
+        if (g_qw_prof_on) {                                                   \
+            g_qw_prof_mark = 0.0;                                             \
+            g_qw_prof_forwards++;                                             \
+        }                                                                     \
+    } while (0)
 #endif
+
+void ds4_qwen4exp_profile_set(int on) {
+    g_qw_prof_on = on ? 1 : 0;
+    qw_hb_timing = on ? 1 : 0;
+    memset(g_qw_prof_sec, 0, sizeof(g_qw_prof_sec));
+    memset(g_qw_prof_hits, 0, sizeof(g_qw_prof_hits));
+    g_qw_prof_mark = 0.0;
+    g_qw_prof_forwards = 0;
+    memset(qw_hb_stage_ns, 0, sizeof(qw_hb_stage_ns));
+    qw_hb_stage_calls = 0;
+    memset(qw_moe_stage_ns, 0, sizeof(qw_moe_stage_ns));
+    memset(qw_moe_stage_calls, 0, sizeof(qw_moe_stage_calls));
+}
+
+__attribute__((format(printf, 4, 5)))
+static void qw_prof_put(char *buf, size_t cap, size_t *len, const char *fmt, ...) {
+    if (*len + 1 >= cap) return;
+    va_list ap;
+    va_start(ap, fmt);
+    const int w = vsnprintf(buf + *len, cap - *len, fmt, ap);
+    va_end(ap);
+    if (w < 0) return;
+    *len += (size_t)w < cap - *len ? (size_t)w : cap - *len - 1;
+}
+
+/* Milliseconds per round, summed over the armed rounds' calls: the forward's
+ * slices, then the MoE's four stages (lane 0 the tower at verify width, lane
+ * 1 the MTP head's block), then the head block's six stages. */
+size_t ds4_qwen4exp_profile_report(char *buf, size_t cap, uint32_t rounds) {
+    static const char *const sl_key[QW_PROF_N_SLICE] = {
+        "?", "emb", "ple", "amix", "gdn", "qsa", "ainj", "fmix", "moe", "finj", "fmx", "head",
+    };
+    static const char *const moe_key[QW_MOE_T_N] = { "rt", "sel", "rx", "sh" };
+    static const char *const hb_key[QW_HB_T_N] = { "amix", "qsa", "ainj", "fmix", "moe", "finj" };
+    if (!buf || cap == 0) return 0;
+    buf[0] = '\0';
+    size_t len = 0;
+    const double r = rounds ? (double)rounds : 1.0;
+    qw_prof_put(buf, cap, &len, "fw=%.2f sl:", (double)g_qw_prof_forwards / r);
+    for (int i = 1; i < QW_PROF_N_SLICE; i++) {
+        if (!g_qw_prof_hits[i]) continue;
+        qw_prof_put(buf, cap, &len, "%s=%.2f,", sl_key[i], g_qw_prof_sec[i] * 1000.0 / r);
+    }
+    for (int lane = 0; lane < 2; lane++) {
+        if (!qw_moe_stage_calls[lane]) continue;
+        qw_prof_put(buf, cap, &len, " moe%d(%.0f/rd):", lane,
+                    (double)qw_moe_stage_calls[lane] / r);
+        for (int i = 0; i < QW_MOE_T_N; i++) {
+            qw_prof_put(buf, cap, &len, "%s=%.2f,", moe_key[i],
+                        (double)qw_moe_stage_ns[lane][i] / 1e6 / r);
+        }
+    }
+    if (qw_hb_stage_calls) {
+        qw_prof_put(buf, cap, &len, " hb(%.2f/rd):", (double)qw_hb_stage_calls / r);
+        for (int i = 0; i < QW_HB_T_N; i++) {
+            qw_prof_put(buf, cap, &len, "%s=%.2f,", hb_key[i],
+                        (double)qw_hb_stage_ns[i] / 1e6 / r);
+        }
+    }
+    return len;
+}
 
 
 /* The residual inject deferral (prefill only; see ds4_qwen4exp_session::
