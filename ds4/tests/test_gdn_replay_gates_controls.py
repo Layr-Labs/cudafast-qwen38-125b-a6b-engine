@@ -24,7 +24,7 @@ assert old==new, 'scalar replay changed beyond current gate source'
 api=body('static int qwen4exp_cuda_gdn_run(')
 # Only launch syntax is translated; arguments and branch/error control stay real.
 api,n=re.subn(r'(qwen4exp_\w+)(?:<[^>]+>)?<<<.*?>>>(\s*)\(',lambda m:'spy("'+m[1]+'", ',api,flags=re.S)
-assert n==13,n
+assert n==15,n
 helper=body('static int qwen4exp_replay_gate_disjoint(')
 source=r'''
 #include <cassert>
@@ -70,7 +70,7 @@ int main(){unsigned cases=0;const uint64_t cd=10240,vd=6144,state=48ull*128*128;
  ds4_gpu_qwen4exp_gdn_replay rp{&t[11],&t[12],&t[13],&t[14]};
  auto reset=[&](){for(unsigned i=0;i<15;i++)t[i]=saved[i];for(unsigned i=0;i<4;i++)w[i]=savedw[i];rp.gate_scratch=&t[14];calls.clear();queries=fail_query=wrong_device=wrong_type=fail_launch=0;unsetenv("DS4_QWEN4EXP_NO_GDN_REPLAY_GATES");};
  auto run=[&](bool quant=true,unsigned nk=16,unsigned nv=48){cases++;return qwen4exp_cuda_gdn_run(&t[0],&t[1],&t[2],&t[3],&t[4],1,&t[5],&t[6],&t[7],&t[8],&w[0],&w[1],&w[2],&w[3],nk,nv,1,2,1,1e-6f,1e-6f,quant?&t[9]:nullptr,0,2*vd,&t[10],"test",&rp);};
- auto expect=[&](bool gates,bool quant=true){assert(calls.size()==3);assert(calls[0]==(gates?"qwen4exp_gdn_conv_replay_gates_kernel":"qwen4exp_gdn_conv_kernel"));assert(calls[1]==(gates?"qwen4exp_gdn_replay_gates_kernel":"qwen4exp_gdn_replay_kernel"));assert(calls[2]==(quant?"qwen4exp_gdn_output_quant_kernel":"qwen4exp_gdn_output_kernel"));};
+ auto expect=[&](bool gates,bool quant=true){assert(calls.size()==3);assert(calls[0]==(gates?"qwen4exp_gdn_conv_replay_gates_kernel":"qwen4exp_gdn_conv_kernel"));assert(calls[1]==(gates?"qwen4exp_gdn_replay_gates_group_kernel":"qwen4exp_gdn_replay_kernel"));assert(calls[2]==(quant?"qwen4exp_gdn_output_quant_kernel":"qwen4exp_gdn_output_kernel"));};
  for(bool q:{false,true}){reset();assert(run(q));expect(true,q);assert(queries==2);}
  reset();rp.gate_scratch=nullptr;assert(run());expect(false);assert(!queries);
  reset();setenv("DS4_QWEN4EXP_NO_GDN_REPLAY_GATES","1",1);assert(run());expect(false);assert(queries==2);
