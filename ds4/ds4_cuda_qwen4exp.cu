@@ -4607,21 +4607,22 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
 #if __CUDA_ARCH__ >= 800
         if constexpr (Native && KeyMax) {
         uint32_t best_key = 0u;
+        uint32_t best_j = 0u;
 #pragma unroll
         for (uint32_t j = 0; j < 16u; j++) {
             const uint32_t key = keys[j] & (0u - ((live >> j) & 1u));
-            best_key = max(best_key, key);
+            /* Strict comparison retains the first j for equal keys, which is
+             * the lowest expert id within this lane. */
+            if (key > best_key) {
+                best_key = key;
+                best_j = j;
+            }
         }
         const uint32_t winning_key = __reduce_max_sync(0xffffffffu, best_key);
-        uint32_t matches = 0u;
-#pragma unroll
-        for (uint32_t j = 0; j < 16u; j++)
-            matches |= (uint32_t)(keys[j] == winning_key) << j;
-        matches &= live;
-        if (winning_key == 0u) matches = 0u;
-        const int32_t local_i = matches
-            ? (int32_t)(lane + ((uint32_t)__ffs(matches) - 1u) * 32u)
-            : INT32_MAX;
+        const int32_t local_i =
+            winning_key != 0u && best_key == winning_key
+                ? (int32_t)(lane + best_j * 32u)
+                : INT32_MAX;
         best_i = __reduce_min_sync(0xffffffffu, local_i);
         } else
 #endif
