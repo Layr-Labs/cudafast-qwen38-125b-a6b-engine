@@ -29,6 +29,20 @@ const char *ds4_cuda_qwen4exp_weight_ptr(
 /* 1 when the Q8_0 row-exact matmul takes the int8 MMA tile at this width. */
 int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows);
 
+/* ds4_gpu_glm53_matmul_bf16's per-row matvec arm (n_rows <= 8) as a plain
+ * launch on `stream`, for the QSA indexer fork.  ds4_gpu_tensor is complete
+ * here in both units (ds4_gpu_mgpu.h is included ahead of this header). */
+int ds4_cuda_qwen4exp_bf16_matvec_on(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows,
+        cudaStream_t          stream);
+
 /* ------------------------------------------------------------------------
  * Programmatic Dependent Launch (PDL) for the decode-round norm ->
  * pair-projection edges, in its complete form.
@@ -67,6 +81,28 @@ int ds4_cuda_qwen4exp_q8_mma_active(uint32_t n_rows);
  * which the graph-capture ceiling allows up to 7 rows -- bounds its grid to
  * one wave as well, so a verify or prefill launch never carries a live
  * trigger at all.
+ *
+ * That rule is sufficient, not necessary.  PTX griddepcontrol.
+ * launch_dependents lets the dependent be scheduled only once EVERY CTA of
+ * the primary has issued it or exited, and a CTA that has not been
+ * scheduled has done neither -- so no dependent block can come up while a
+ * primary block still waits for a slot, and by induction along the chain
+ * the oldest unfinished grid is always fully resident.  A multi-wave
+ * producer may therefore trigger at its top too (the DS4_QWEN4EXP_NO_EARLY_
+ * TRIG_* edges: matmul_q8_hc_warp_pair_stage_kernel and
+ * qwen4exp_moe_gateup_split_kernel, gated to the <= 2-token geometry, with
+ * the consumer's programmatic launch gated to n_tokens <= 2; likewise
+ * matmul_q8_0_preq_pair_lanes_roll_kernel -> HC inject (..._ROLL),
+ * qwen4exp_moe_down_q_kernel -> FFN HC inject (..._DOWN), whose triggers
+ * take a host-set flag because their successors vary, and the QSA split
+ * chain prep_joint -> scores -> probs -> fold -> output gate (..._QSA)).
+ * Their consumers fence BEFORE their own top trigger, so a consumer's
+ * dependents still only launch after everything upstream of the consumer
+ * has retired, exactly as when the consumer was launched plainly.  A
+ * producer that triggers ABOVE its own fence may release its dependent
+ * while its own predecessor still runs, so such a producer is only given a
+ * trigger where every programmatic successor reads nothing but weights
+ * above its fence.
  *
  * THE .NC RULE, on the fence: cudaGridDependencySynchronize() orders the
  * acquire it emits, but ld.global.nc (const/__restrict__-qualified) loads

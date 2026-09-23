@@ -13,10 +13,14 @@ static void compare_tensor(const char *label, ds4_gpu_tensor *a,
     free(av);free(bv);
 }
 
-static void replay_case(void *model, const weight_set *ws, bool captured) {
+/* defer = 0: the shipped bounded log; N > 0: deferred materialisation on a
+ * double-buffered N-row tape, whose verify writes no recurrent state, so the
+ * final state is compared through the deferred materialise entry. */
+static void replay_case(void *model, const weight_set *ws, bool captured,
+                        unsigned defer) {
     const uint64_t sb=(uint64_t)STATE_ELEMENTS*sizeof(float);
     const uint64_t cb=(uint64_t)HISTORY*CONV_DIM*sizeof(float);
-    const uint64_t tb=DS4_QWEN4EXP_GDN_REPLAY_ROWS*
+    const uint64_t tb=(defer?2ull*defer:DS4_QWEN4EXP_GDN_REPLAY_ROWS)*
         (uint64_t)(KEY_DIM+VALUE_DIM+2*VALUE_HEADS)*sizeof(float);
     const uint64_t qbytes=2u*VALUE_DIM, soff=(qbytes+15u)&~15ull;
     const uint64_t qb=soff+2ull*(VALUE_DIM/32)*sizeof(float);
@@ -33,7 +37,7 @@ static void replay_case(void *model, const weight_set *ws, bool captured) {
     ds4_gpu_tensor *control=ds4_gpu_tensor_alloc(4),*adopt=ds4_gpu_tensor_alloc(4);
     ds4_gpu_tensor *materialized=ds4_gpu_tensor_alloc(sb);
     require_ok(checkpoint && tape && control && adopt && materialized,"replay allocation");
-    ds4_gpu_qwen4exp_gdn_replay replay={checkpoint,tape,control};
+    ds4_gpu_qwen4exp_gdn_replay replay={checkpoint,tape,control,NULL,defer};
     const ds4_gpu_qwen4exp_slab cw=gdn_slab(model,ws->conv_offset);
     const ds4_gpu_qwen4exp_slab aw=gdn_slab(model,ws->a_log_offset);
     const ds4_gpu_qwen4exp_slab dw=gdn_slab(model,ws->dt_bias_offset);
@@ -42,19 +46,22 @@ static void replay_case(void *model, const weight_set *ws, bool captured) {
     float *alpha=require_alloc(2u*VALUE_HEADS*4,"alpha");
     float *beta=require_alloc(2u*VALUE_HEADS*4,"beta");
     float *gate=require_alloc(2u*VALUE_DIM*4,"gate");
-    uint32_t pending=0,prefix=0,phase=0;
+    uint32_t pending=0,prefix=0,phase=0,parity=0;
     bool previous=false;
     const char *pattern="RRRAARRRRRARARAAA";
     unsigned replays=0;
     for(unsigned round=0;round<32;round++) {
-        ds4_qwen4exp_gdn_replay_step p=ds4_qwen4exp_gdn_replay_plan(
+        ds4_qwen4exp_gdn_replay_step p=defer
+            ? ds4_qwen4exp_gdn_defer_plan(true,previous,prefix,parity,defer,2,1,7,pending,pending)
+            : ds4_qwen4exp_gdn_replay_plan(
             true,previous,prefix,DS4_QWEN4EXP_GDN_REPLAY_ROWS,2,1,7,pending,pending);
-        require_ok(!p.settle && p.active,"replay policy");
+        require_ok(!p.settle && !p.flush && p.active,"replay policy");
+        require_ok(!defer || p.swap==!previous,"deferred swap only on entry");
         if(p.swap) {
             ds4_gpu_tensor *old=b[1].state;b[1].state=checkpoint;checkpoint=old;
             replay.checkpoint=checkpoint;phase^=1;
         }
-        prefix=p.prefix;
+        prefix=p.prefix;parity=p.parity;
         for(unsigned i=0;i<2u*CONV_DIM;i++) qkv[i]=(float)(.8*sample(0x1000000ull+round*CONV_DIM*2u+i));
         for(unsigned i=0;i<2u*VALUE_HEADS;i++) {
             alpha[i]=(float)(2*sample(0x4000000ull+round*VALUE_HEADS*2u+i));
@@ -62,7 +69,8 @@ static void replay_case(void *model, const weight_set *ws, bool captured) {
         }
         for(unsigned i=0;i<2u*VALUE_DIM;i++) gate[i]=(float)(1.5*sample(0x6000000ull+round*VALUE_DIM*2u+i));
         require_ok(ds4_gpu_qwen4exp_update_dpos(adopt,pending),"adopt upload");
-        require_ok(ds4_gpu_qwen4exp_update_dpos(control,prefix),"prefix upload");
+        require_ok(ds4_gpu_qwen4exp_update_dpos(control,
+            defer?ds4_qwen4exp_gdn_defer_control(prefix,parity):prefix),"prefix upload");
         for(unsigned j=0;j<2;j++) {
             require_ok(ds4_gpu_tensor_write(b[j].qkv,0,qkv,2u*CONV_DIM*4),"qkv");
             require_ok(ds4_gpu_tensor_write(b[j].alpha,0,alpha,2u*VALUE_HEADS*4),"alpha");
@@ -90,9 +98,22 @@ static void replay_case(void *model, const weight_set *ws, bool captured) {
         require_ok(ds4_gpu_end_commands() && ds4_gpu_synchronize(),"candidate synchronization");
         compare_tensor("output bits",b[0].out,b[1].out,2u*VALUE_DIM*4);
         compare_tensor("quantized output bytes",quant[0],quant[1],qb);
+        if(defer) {
+            uint32_t first=0;
+            const uint32_t rows=ds4_qwen4exp_gdn_defer_rows(prefix,parity,defer,true,&first);
+            require_ok(ds4_gpu_qwen4exp_gdn_defer_materialize(materialized,checkpoint,tape,
+                defer,first,rows,KEY_HEADS,VALUE_HEADS,ws->layout),"materialize final");
+            compare_tensor("deferred final recurrent state bits",b[0].state,materialized,sb);
+        } else
         compare_tensor("final recurrent state bits",b[0].state,b[1].state,sb);
         compare_tensor("final convolution bits",b[0].conv_state,b[1].conv_state,cb);
         compare_tensor("convolution snapshot bits",csnap[0],csnap[1],cb);
+        if(defer) {
+            uint32_t first=0;
+            const uint32_t rows=ds4_qwen4exp_gdn_defer_rows(prefix,parity,defer,false,&first);
+            require_ok(ds4_gpu_qwen4exp_gdn_defer_materialize(materialized,checkpoint,tape,
+                defer,first,rows,KEY_HEADS,VALUE_HEADS,ws->layout),"materialize row zero");
+        } else
         require_ok(ds4_gpu_qwen4exp_gdn_replay_materialize(materialized,checkpoint,tape,
             prefix==DS4_QWEN4EXP_GDN_REPLAY_ROWS?0:prefix+1,
             KEY_HEADS,VALUE_HEADS,ws->layout),"materialize row zero");
@@ -104,7 +125,17 @@ static void replay_case(void *model, const weight_set *ws, bool captured) {
         KEY_HEADS,VALUE_HEADS,ws->layout),"checkpoint alias refused");
     require_ok(!ds4_gpu_qwen4exp_gdn_replay_materialize(materialized,checkpoint,tape,3,
         KEY_HEADS,VALUE_HEADS,ws->layout),"oversized replay refused");
-    printf("PASS CUDA replay layout=%u captured=%u rounds=32 graph_replays=%u\n",ws->layout,captured,replays);
+    if(defer) {
+        require_ok(!ds4_gpu_qwen4exp_gdn_defer_materialize(checkpoint,checkpoint,tape,
+            defer,0,0,KEY_HEADS,VALUE_HEADS,ws->layout),"deferred checkpoint alias refused");
+        require_ok(!ds4_gpu_qwen4exp_gdn_defer_materialize(materialized,checkpoint,tape,
+            defer,0,defer+1,KEY_HEADS,VALUE_HEADS,ws->layout),"oversized deferred replay refused");
+        require_ok(!ds4_gpu_qwen4exp_gdn_defer_materialize(materialized,checkpoint,tape,
+            defer,1,1,KEY_HEADS,VALUE_HEADS,ws->layout),"misaligned deferred buffer refused");
+        require_ok(!ds4_gpu_qwen4exp_gdn_defer_materialize(materialized,checkpoint,tape,
+            defer+1,0,1,KEY_HEADS,VALUE_HEADS,ws->layout),"short deferred tape refused");
+    }
+    printf("PASS CUDA replay layout=%u captured=%u defer=%u rounds=32 graph_replays=%u\n",ws->layout,captured,defer,replays);
     ds4_gpu_decode_graphs_invalidate();
     free(qkv);free(alpha);free(beta);free(gate);
     ds4_gpu_tensor_free(checkpoint);ds4_gpu_tensor_free(tape);
@@ -120,10 +151,11 @@ int main(void) {
     require_ok(model!=MAP_FAILED,"model mmap");memset(model,0,MODEL_BYTES);build_weights(model);
     require_ok(ds4_gpu_init() && ds4_gpu_qwen4exp_gdn_replay_supported(),"single CUDA GPU");
     require_ok(ds4_gpu_set_model_map(model,MODEL_BYTES),"synthetic model map");
+    for(unsigned defer=0;defer<=DS4_QWEN4EXP_GDN_TAPE_ROWS;defer+=DS4_QWEN4EXP_GDN_TAPE_ROWS)
     for(unsigned captured=0;captured<2;captured++) {
-        replay_case(model,&g_grouped,captured);
-        replay_case(model,&g_tiled,captured);
-        replay_case(model,&g_fast_decay,captured);
+        replay_case(model,&g_grouped,captured,defer);
+        replay_case(model,&g_tiled,captured,defer);
+        replay_case(model,&g_fast_decay,captured,defer);
     }
     munmap(model,MODEL_BYTES);return 0;
 }

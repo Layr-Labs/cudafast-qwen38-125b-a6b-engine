@@ -26,7 +26,10 @@ source=r'''
 #define QWEN4EXP_GDN_DIM 128u
 #define QWEN4EXP_GDN_HISTORY 3u
 #define DS4_QWEN4EXP_GDN_REPLAY_ROWS 2u
+#include <cstddef>
 #define QWEN4EXP_Q8_RCP127 0x1.020408p-7f
+#define QWEN4EXP_PDL_SYNC() ((void)0)
+#define QWEN4EXP_PDL_TRIGGER() ((void)0)
 #define CK(x) do{auto e=(x);if(e!=cudaSuccess){fprintf(stderr,"CUDA %s:%d\n",cudaGetErrorString(e),__LINE__);exit(1);}}while(0)
 '''+ '\n'.join(body(n) for n in names)+r'''
 struct B{
@@ -42,16 +45,18 @@ struct B{
 };
 int main(){std::mt19937 r(650031);unsigned eager=0,replays=0;cudaStream_t st;CK(cudaStreamCreate(&st));
  const unsigned nk=16,nv=48,kd=nk*128,vd=nv*128,cd=2*kd+vd,ts=(kd+vd+2*nv+3)&~3u;const size_t cells=(size_t)nv*128*128;
- for(unsigned layout=0;layout<2;layout++)for(unsigned mode=0;mode<9;mode++)for(unsigned quant=0;quant<2;quant++){
- B input(2*cd),hist(3*cd),snap(6*3*cd),base(cells),tapeseed(2*ts),alpha(2*nv),beta(2*nv),coeff(nv),bias(nv),cw(cd*4),gate(2*vd),norm(128);
- B q0(2*cd),q1(2*cd),h0(3*cd),h1(3*cd),ss0(6*3*cd),ss1(6*3*cd),s0(cells),s1(cells),c0(cells),c1(cells),t0(2*ts),t1(2*ts),o0(2*vd),o1(2*vd),pairs(4*nv+16),z0(2*vd/4),z1(2*vd/4),sc0(2*vd/32),sc1(2*vd/32);
+ for(unsigned defer:{0u,6u})for(unsigned layout=0;layout<2;layout++)for(unsigned mode=0;mode<9;mode++)for(unsigned quant=0;quant<2;quant++){
+ const unsigned tr=defer?2*defer:2;
+ B input(2*cd),hist(3*cd),snap(6*3*cd),base(cells),tapeseed(tr*ts),alpha(2*nv),beta(2*nv),coeff(nv),bias(nv),cw(cd*4),gate(2*vd),norm(128);
+ B q0(2*cd),q1(2*cd),h0(3*cd),h1(3*cd),ss0(6*3*cd),ss1(6*3*cd),s0(cells),s1(cells),c0(cells),c1(cells),t0(tr*ts),t1(tr*ts),o0(2*vd),o1(2*vd),pairs(4*nv+16),z0(2*vd/4),z1(2*vd/4),sc0(2*vd/32),sc1(2*vd/32);
  uint32_t*control,*adopt;CK(cudaMalloc(&control,4));CK(cudaMalloc(&adopt,4));
  auto publish=[&](unsigned phase){
   for(B*b:{&input,&hist,&snap,&base,&tapeseed,&alpha,&beta,&coeff,&bias,&cw,&gate,&norm})b->seed(r,mode==1?1e-40f:.0001f);
   for(size_t i=0;i<coeff.n;i++)coeff.h[4+i]=mode==8?(i%3==0?NAN:i%3==1?INFINITY:-INFINITY):-.1f;coeff.up();
   for(size_t i=0;i<alpha.n;i++){if(mode>=2&&mode<=5)alpha.h[4+i]=mode==2?-80.f:mode==3?80.f:mode==4?INFINITY:NAN;beta.h[4+i]=mode==2?-80.f:mode==3?80.f:mode==6?NAN:mode==7?(i%2?INFINITY:-INFINITY):beta.h[4+i];}alpha.up();beta.up();
   for(B*b:{&q0,&q1,&h0,&h1,&ss0,&ss1,&s0,&s1,&c0,&c1,&t0,&t1,&o0,&o1,&pairs,&z0,&z1,&sc0,&sc1})b->seed(r,0.f);
-  uint32_t prefix=phase%3,a=(phase/3)%2;CK(cudaMemcpy(control,&prefix,4,cudaMemcpyHostToDevice));CK(cudaMemcpy(adopt,&a,4,cudaMemcpyHostToDevice));
+  // Deferred: prefix | parity << 8 over prefixes 0..defer (flush at >= defer-1).
+  uint32_t prefix=defer?(phase%(defer+1))|(((phase/2)&1u)<<8):phase%3,a=(phase/3)%2;CK(cudaMemcpy(control,&prefix,4,cudaMemcpyHostToDevice));CK(cudaMemcpy(adopt,&a,4,cudaMemcpyHostToDevice));
  };
  auto copy=[&](B&dst,B&src){CK(cudaMemcpyAsync(dst.d(),src.d(),src.n*4,cudaMemcpyDeviceToDevice,st));};
  auto launch=[&](){
@@ -60,8 +65,8 @@ int main(){std::mt19937 r(650031);unsigned eager=0,replays=0;cudaStream_t st;CK(
   int dev;cudaPointerAttributes at={};CK(cudaGetDevice(&dev));CK(cudaPointerGetAttributes(&at,pairs.d()));if(at.device!=dev||at.type!=cudaMemoryTypeDevice)exit(5);
   qwen4exp_gdn_conv_kernel<<<dim3(2*nk+nv,1),128,0,st>>>(q0.d(),h0.d(),cw.d(),ss0.d(),nk,nv,1,2,1,1e-6f,adopt);
   qwen4exp_gdn_conv_replay_gates_kernel<<<dim3(2*nk+nv,1),128,0,st>>>(q1.d(),h1.d(),cw.d(),ss1.d(),nk,nv,1,2,1,1e-6f,adopt,(float2*)pairs.d(),alpha.d(),beta.d(),coeff.d(),bias.d());
-  qwen4exp_gdn_replay_kernel<<<dim3(nv,32),128,0,st>>>(o0.d(),s0.d(),c0.d(),t0.d(),q0.d(),alpha.d(),beta.d(),coeff.d(),bias.d(),nk,nv,2,layout,control,0);
-  qwen4exp_gdn_replay_gates_kernel<<<dim3(nv,32),128,0,st>>>(o1.d(),s1.d(),c1.d(),t1.d(),q1.d(),alpha.d(),beta.d(),(float2*)pairs.d(),nk,nv,2,layout,control,0);
+  qwen4exp_gdn_replay_kernel<<<dim3(nv,32),128,0,st>>>(o0.d(),s0.d(),c0.d(),t0.d(),q0.d(),alpha.d(),beta.d(),coeff.d(),bias.d(),nk,nv,2,layout,control,0,defer);
+  qwen4exp_gdn_replay_gates_kernel<<<dim3(nv,32),128,0,st>>>(o1.d(),s1.d(),c1.d(),t1.d(),q1.d(),alpha.d(),beta.d(),(float2*)pairs.d(),nk,nv,2,layout,control,0,defer);
   if(quant){
    qwen4exp_gdn_output_quant_kernel<<<dim3(2,nv),128,0,st>>>((int8_t*)z0.d(),sc0.d(),o0.d(),gate.d(),norm.d(),nv,2,1e-6f);
    qwen4exp_gdn_output_quant_kernel<<<dim3(2,nv),128,0,st>>>((int8_t*)z1.d(),sc1.d(),o1.d(),gate.d(),norm.d(),nv,2,1e-6f);
@@ -78,7 +83,7 @@ int main(){std::mt19937 r(650031);unsigned eager=0,replays=0;cudaStream_t st;CK(
  };
  publish(0);launch();check();eager++;
  cudaGraph_t gr;cudaGraphExec_t ex;CK(cudaStreamBeginCapture(st,cudaStreamCaptureModeGlobal));launch();CK(cudaStreamEndCapture(st,&gr));CK(cudaGraphInstantiate(&ex,gr,nullptr,nullptr,0));
- for(unsigned phase=1;phase<=6;phase++){publish(phase);CK(cudaGraphLaunch(ex,st));check();replays++;}
+ for(unsigned phase=1;phase<=(defer?2*defer+2:6);phase++){publish(phase);CK(cudaGraphLaunch(ex,st));check();replays++;}
  CK(cudaGraphExecDestroy(ex));CK(cudaGraphDestroy(gr));CK(cudaFree(control));CK(cudaFree(adopt));
  }
  CK(cudaStreamDestroy(st));printf("PASS gate publication pipeline: %u eager + %u changed-input/prefix/adopt graph replays; float/Q8, full convolution/history/snapshot/state/checkpoint/tape/output, immutable inputs and canaries\n",eager,replays);
