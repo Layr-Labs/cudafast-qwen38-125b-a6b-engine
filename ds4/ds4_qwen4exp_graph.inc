@@ -3411,8 +3411,17 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     }
     QW_TRACE(QW_SLICE_HEAD);
     QW_TRACE_REPORT(n_tokens);
-    /* Commit and wait: the logits are read on the host from here on. */
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
+    /* CUDA end_commands already waits for the device unless the optional
+     * stream-only mode is armed. Other backends retain both calls. */
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    extern int ds4_gpu_qwen4exp_end_and_sync(void) __attribute__((weak));
+    const bool complete = ds4_gpu_qwen4exp_end_and_sync
+        ? ds4_gpu_qwen4exp_end_and_sync() != 0
+        : (ds4_gpu_end_commands() && ds4_gpu_synchronize());
+#else
+    const bool complete = ds4_gpu_end_commands() && ds4_gpu_synchronize();
+#endif
+    if (!complete) {
         fprintf(stderr, "ds4: qwen4exp command batch did not complete\n");
         ds4_gpu_oneshot_graph_retire();
         return false;

@@ -4275,6 +4275,13 @@ extern "C" int ds4_gpu_end_commands(void) {
 }
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
 
+#include "ds4_qwen4exp_end_sync.h"
+extern "C" int ds4_gpu_qwen4exp_end_and_sync(void) {
+    return ds4_qwen4exp_end_and_sync(ds4_gpu_end_commands,
+                                     ds4_gpu_synchronize,
+                                     g_cuda_end_stream_sync);
+}
+
 /* See ds4_gpu.h.  The owner of the mapping tells us it is going away, because
  * once it is unmapped its address proves nothing: the next GGUF can be handed
  * the same base and the same size, and the (base, size) short-circuit below
