@@ -2,7 +2,6 @@
 //   https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#matrix-multiply-accumulate-operation-using-mma-instruction
 //
 // Like with nvcuda::wmma there are three types of matrix tiles: A, B, and C with A @ B = C.
-// The methods get_i and get_j can be used to get the physical 32 bit index of the lth element of a thread within a tile.
 // All matrix tiles have ne physical 32 bit elements per warp.
 //
 // As described in the PTX documentation, all pointers for load_ldmatrix must be to shared memory and aligned to 16 bytes.
@@ -1446,3 +1445,4 @@ namespace ggml_cuda_mma {
 #endif // AMD_WMMA_AVAILABLE
     }
 }
+#define GAUNTLET_REDRAW_1a685bb1_20260923T175841Z 1
