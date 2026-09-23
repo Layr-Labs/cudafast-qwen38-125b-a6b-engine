@@ -20506,9 +20506,10 @@ struct qwen_gdn_projection_args {
 #else
 #define QW_GDN_PROJ_ATTR __launch_bounds__(256)
 #endif
-template<int R, bool Stage=false>
+template<int R, bool Stage=false, bool Async=false>
 __global__ QW_GDN_PROJ_ATTR
 static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
+    static_assert(!Async || Stage, "the asynchronous GDN fill needs the panel");
     extern __shared__ uint4 qw_gdn_panel[];
     char *const gpanel = (char *)qw_gdn_panel;
     constexpr unsigned B=256u;
@@ -20535,7 +20536,20 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
          * request so that read stays inside the allocation. */
         const uint64_t panel_bytes = (uint64_t)(B/64u) * blocks * 34u;
         const char *const gp = (const char *)w + (uint64_t)block * panel_bytes;
-        if (((uintptr_t)gp & 15u) == 0u) {
+        if (Async) {
+            /* The same bytes to the same offsets, carried by cp.async: the
+             * launch selects this arm only when both slabs are 16-byte
+             * aligned and the panel is whole 16-byte chunks (4 * blocks * 34
+             * is 10880 = 680 * 16 in production), so every chunk is aligned
+             * and there is no tail.  No destination registers are tied up,
+             * so each thread's chunks are all in flight at once; the wait
+             * below the grid dependency sync publishes the whole panel. */
+            for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
+                 i += (uint64_t)B * 16u)
+                ds4_cp_async16<1>((float *)(void *)(gpanel + i),
+                                  (const float *)(const void *)(gp + i));
+            ds4_cp_async_commit();
+        } else if (((uintptr_t)gp & 15u) == 0u) {
             for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
                  i += (uint64_t)B * 16u) {
                 if (i + 16u <= panel_bytes)
@@ -20556,6 +20570,7 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
         /* The drain absorbs the fill; the barrier is nearly satisfied by the
          * time it is reached.  Order matters -- see the header. */
         QWEN4EXP_PDL_SYNC();
+        if (Async) ds4_cp_async_wait<0>();
         __syncthreads();
     }
     const uint32_t local_row = threadIdx.x >> 6u;
@@ -21122,17 +21137,31 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
             ((((uintptr_t)a.weights[0]|(uintptr_t)a.weights[1])&3u)==0u) &&
             gdn_panel<=49152u &&
             getenv("DS4_QWEN4EXP_NO_GDN_PANEL")==NULL;
+        /* The cp.async fill: 16-byte slabs and a panel of whole 16-byte
+         * chunks, so every copy is aligned and none is partial.
+         * DS4_QWEN4EXP_NO_GDN_CP_ASYNC restores the register fill. */
+        static const int gdn_async_off =
+            getenv("DS4_QWEN4EXP_NO_GDN_CP_ASYNC")!=NULL;
+        const int gdn_async = gdn_stage && !gdn_async_off &&
+            ((((uintptr_t)a.weights[0]|(uintptr_t)a.weights[1])&15u)==0u) &&
+            ((((uint64_t)(256u/64u)*blocks*34u)&15u)==0u);
         /* PDL consumer: the stream predecessor is the mixed-input quantizer,
          * which triggers at its top at these decode widths. */
         if (rows==1u) {
-            if (gdn_stage)
+            if (gdn_async)
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1,true,true>),
+                                    grid, 256, gdn_panel, cuda_decode_stream(), a);
+            else if (gdn_stage)
                 QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1,true>),
                                     grid, 256, gdn_panel, cuda_decode_stream(), a);
             else
                 QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1>),
                                     grid, 256, 0, cuda_decode_stream(), a);
         } else {
-            if (gdn_stage)
+            if (gdn_async)
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2,true,true>),
+                                    grid, 256, gdn_panel, cuda_decode_stream(), a);
+            else if (gdn_stage)
                 QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2,true>),
                                     grid, 256, gdn_panel, cuda_decode_stream(), a);
             else
