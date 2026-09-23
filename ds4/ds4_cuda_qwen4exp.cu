@@ -9554,7 +9554,7 @@ static int qwen4exp_shared_mma_ok(const uint32_t *types, uint32_t n_types,
         }                                                                    \
     } while (0)
 
-template <int RouterType = -1>
+template <int RouterType = -1, bool Fixed2560 = false>
 /* How many elements of its strided walk a lane asks for before it uses any of
  * them.  Scheduling only, like the norm's own step above. */
 #define QWEN4EXP_SHARED_GATE_STEPS 10u
@@ -9585,9 +9585,22 @@ __global__ static void qwen4exp_shared_gate_kernel(
      * moved. */
     const uint32_t nth = blockDim.x;
     const uint32_t tid = threadIdx.x;
-    const uint32_t steps = (in_dim > tid) ? ((in_dim - tid + nth - 1u) / nth) : 0u;
     float acc = 0.0f;
     uint32_t s = 0;
+    if constexpr (Fixed2560) {
+        float wv[10], xv[10];
+#pragma unroll
+        for (uint32_t u = 0; u < 10u; u++) {
+            const uint32_t k = tid + u * 256u;
+            wv[u] = dev_qwen4exp_weight_value(
+                    RouterType < 0 ? router_type : (uint32_t)RouterType,
+                    router, k);
+            xv[u] = token_x[k];
+        }
+#pragma unroll
+        for (uint32_t u = 0; u < 10u; u++) acc += wv[u] * xv[u];
+    } else {
+    const uint32_t steps = (in_dim > tid) ? ((in_dim - tid + nth - 1u) / nth) : 0u;
     for (; s + QWEN4EXP_SHARED_GATE_STEPS <= steps;
            s += QWEN4EXP_SHARED_GATE_STEPS) {
         float wv[QWEN4EXP_SHARED_GATE_STEPS];
@@ -9610,6 +9623,7 @@ __global__ static void qwen4exp_shared_gate_kernel(
         acc += dev_qwen4exp_weight_value(
                 RouterType < 0 ? router_type : (uint32_t)RouterType,
                 router, k) * token_x[k];
+    }
     }
     const float total = dev_qwen4exp_block_sum(ds4_qwen4exp_smem, acc);
     if (threadIdx.x == 0u) gate_out[token] = 1.0f / (1.0f + expf(-total));
@@ -10970,7 +10984,14 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
      * checkpoint-wide F32 type at launch just as the Q8 projections below do;
      * other supported layouts retain the generic decoder. */
     if (specialize_shared &&
-        router_slab->type == (uint32_t)DS4_QWEN4EXP_TY_f32) {
+        router_slab->type == (uint32_t)DS4_QWEN4EXP_TY_f32 &&
+        in_dim == 2560u && n_tokens <= 2u) {
+        qwen4exp_shared_gate_kernel<DS4_QWEN4EXP_TY_f32, true>
+            <<<n_tokens, threads, shared, side>>>(
+                (float *)gate_scale->ptr, router, (const float *)x->ptr,
+                router_slab->type, in_dim, n_tokens);
+    } else if (specialize_shared &&
+               router_slab->type == (uint32_t)DS4_QWEN4EXP_TY_f32) {
         qwen4exp_shared_gate_kernel<DS4_QWEN4EXP_TY_f32>
             <<<n_tokens, threads, shared, side>>>(
                 (float *)gate_scale->ptr, router, (const float *)x->ptr,
