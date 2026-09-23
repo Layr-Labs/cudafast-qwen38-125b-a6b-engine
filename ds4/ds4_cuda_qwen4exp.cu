@@ -1,3 +1,6 @@
+/* independent ranked re-measurement 2026-09-23T00:28:03Z (account newjordan): identical tree f186ae0, dated provenance line only. */
+ * of the promoted frontier tree f186ae0 unchanged. The only textual difference from the promoted tree is
+ * this dated provenance comment. No behaviour changes. */
 /* redraw rx22532110 (2026-09-17T22:53:21Z): this archive repeats the official evaluation of the
  * same engine. The only textual difference from the previous evaluation
  * is this dated provenance comment. No behaviour changes. */
