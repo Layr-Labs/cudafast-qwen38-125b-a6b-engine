@@ -648,4 +648,30 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
  * it is outside every timed phase and cannot perturb a measurement. */
 const char *ds4_gpu_hw_limits(void);
 
+/* The resident's load-time A/B self-profile
+ * (harness/protocol-adapter/ds4_shim/ds4_resident.c), run once after the load
+ * and before its socket binds: stand down any subset of six qwen4exp decode
+ * arms, each exactly as its env valve does.  Every call synchronizes the
+ * device and retires every captured decode graph, so the next forward
+ * recaptures under the new mask.  0 is the shipped behaviour and the default;
+ * the resident writes 0 back before any phase can connect.
+ *
+ * CUDA builds only.  Metal, ROCm and CPU builds have none of these arms: there
+ * a mask of 0 is a no-op returning 0 and any other mask returns -1, so a
+ * caller fails closed instead of timing six identical runs.
+ * Returns 0 on success, -1 on refusal. */
+#ifndef DS4_QWEN4EXP_AB_ALL
+#define DS4_QWEN4EXP_AB_ROUTER_NARROW 0x01u /* DS4_QWEN4EXP_NO_ROUTER_NARROW_BLOCK */
+#define DS4_QWEN4EXP_AB_GDN_PDL       0x02u /* DS4_QWEN4EXP_NO_GDN_PDL */
+#define DS4_QWEN4EXP_AB_TRIG_HCUP     0x04u /* DS4_QWEN4EXP_NO_EARLY_TRIG_HCUP */
+#define DS4_QWEN4EXP_AB_TRIG_GU       0x08u /* DS4_QWEN4EXP_NO_EARLY_TRIG_GU */
+#define DS4_QWEN4EXP_AB_EARLY_FORK    0x10u /* DS4_QWEN4EXP_NO_EARLY_FORK */
+#define DS4_QWEN4EXP_AB_IDX_FORK      0x20u /* DS4_QWEN4EXP_NO_IDX_FORK */
+#define DS4_QWEN4EXP_AB_TRIG_ROLL     0x40u /* DS4_QWEN4EXP_NO_EARLY_TRIG_ROLL */
+#define DS4_QWEN4EXP_AB_TRIG_DOWN     0x80u /* DS4_QWEN4EXP_NO_EARLY_TRIG_DOWN */
+#define DS4_QWEN4EXP_AB_TRIG_QSA      0x100u /* DS4_QWEN4EXP_NO_EARLY_TRIG_QSA */
+#define DS4_QWEN4EXP_AB_ALL           0x1ffu
+#endif
+int ds4_qwen4exp_ab_set(uint32_t off_mask);
+
 #endif

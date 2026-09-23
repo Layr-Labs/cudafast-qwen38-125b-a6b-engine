@@ -111,7 +111,11 @@ void ds4_qwen4exp_session_plan_compute(ds4_qwen4exp_session_plan *plan,
     /* Reserve the bounded replay checkpoint/log on every platform so a serve
      * plan remains a conservative bound regardless of the runtime valve. */
     act += gdn_state_one * plan->n_gdn_layer;
-    act += (uint64_t)DS4_QWEN4EXP_GDN_REPLAY_ROWS * plan->n_gdn_layer *
+    /* The deferred tape (two buffers of up to DS4_QWEN4EXP_GDN_TAPE_MAX rows)
+     * bounds the shipped ROWS-row log too, so one bound serves both valves. */
+    act += (uint64_t)(2u * DS4_QWEN4EXP_GDN_TAPE_MAX > DS4_QWEN4EXP_GDN_REPLAY_ROWS
+                          ? 2u * DS4_QWEN4EXP_GDN_TAPE_MAX
+                          : DS4_QWEN4EXP_GDN_REPLAY_ROWS) * plan->n_gdn_layer *
         (((uint64_t)DS4_N_GDN_KEY_HEAD + DS4_N_GDN_VALUE_HEAD) *
          DS4_N_GDN_HEAD_DIM + 2ull * DS4_N_GDN_VALUE_HEAD) * f;
     act += sizeof(uint32_t);                      /* replay prefix       */
@@ -399,6 +403,12 @@ struct ds4_qwen4exp_session {
     bool gdn_replay_previous;
     uint32_t gdn_replay_prefix;
     uint32_t gdn_replay_phase; /* physical buffer parity, preserved on reset */
+    /* Deferred GDN state materialisation (ds4_qwen4exp_gdn_defer_plan): rows
+     * per tape buffer, 0 when DS4_QWEN4EXP_NO_GDN_DEFER (or no replay) keeps
+     * the shipped swap/controller; and the tape buffer the last replay round
+     * read (control bit 8), reset with the prefix. */
+    uint32_t gdn_defer_rows;
+    uint32_t gdn_replay_parity;
     ds4_gpu_tensor *inv_freq;
 
     /* Activations.  All sized for n_batch tokens and reused every layer. */
@@ -625,6 +635,15 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
         getenv("DS4_QWEN4EXP_NO_GDN_REPLAY") == NULL &&
         getenv("DS4_QWEN4EXP_NO_LAZY_ROLLBACK") == NULL &&
         ds4_gpu_qwen4exp_gdn_replay_supported();
+    if (s->gdn_replay_enabled && getenv("DS4_QWEN4EXP_NO_GDN_DEFER") == NULL) {
+        /* DS4_QWEN4EXP_GDN_TAPE_ROWS=N (2..8) is the A/B knob for the tape
+         * length; anything else keeps the default. */
+        const char *rows_env = getenv("DS4_QWEN4EXP_GDN_TAPE_ROWS");
+        const long rows = rows_env ? strtol(rows_env, NULL, 10) : 0;
+        s->gdn_defer_rows = rows >= (long)DS4_QWEN4EXP_GDN_TAPE_MIN &&
+                            rows <= (long)DS4_QWEN4EXP_GDN_TAPE_MAX
+            ? (uint32_t)rows : DS4_QWEN4EXP_GDN_TAPE_ROWS;
+    }
 #endif
 
     const uint64_t E = DS4_N_EMBD;
@@ -762,7 +781,9 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
             s->gdn_state[il] = qwen4exp_alloc_zeroed(state_bytes, &ok);
             if (s->gdn_replay_enabled) {
                 s->gdn_checkpoint[il] = qwen4exp_alloc_zeroed(state_bytes, &ok);
-                const uint64_t tape_bytes = DS4_QWEN4EXP_GDN_REPLAY_ROWS *
+                const uint64_t tape_bytes =
+                    (s->gdn_defer_rows ? 2ull * s->gdn_defer_rows
+                                       : (uint64_t)DS4_QWEN4EXP_GDN_REPLAY_ROWS) *
                     (((uint64_t)DS4_N_GDN_KEY_HEAD + DS4_N_GDN_VALUE_HEAD) *
                      DS4_N_GDN_HEAD_DIM + 2ull * DS4_N_GDN_VALUE_HEAD) * f;
                 s->gdn_replay_tape[il] = qwen4exp_alloc_zeroed(tape_bytes, &ok);
@@ -1048,6 +1069,7 @@ void ds4_qwen4exp_session_reset(ds4_qwen4exp_session *s) {
     s->gdn_replay_active = false;
     s->gdn_replay_previous = false;
     s->gdn_replay_prefix = 0u;
+    s->gdn_replay_parity = 0u;
     if (!s->state_dirty) {
         /* Already at the reset state and nothing has written since, so every
          * store below would write the value the buffer already holds.  `pos`
@@ -1720,7 +1742,7 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
     if (s->gdn_replay_active) {
         const ds4_gpu_qwen4exp_gdn_replay replay = {
             s->gdn_checkpoint[il], s->gdn_replay_tape[il], s->d_gdn_replay,
-            s->gdn_replay_gates};
+            s->gdn_replay_gates, s->gdn_defer_rows};
         rc = ds4_gpu_qwen4exp_gdn_replay_q8(
             s->gdn_out, s->gdn_conv[il], s->gdn_state[il],
             s->gdn_conv_snapshot[il], s->gdn_state_snapshot[il],
@@ -1793,11 +1815,11 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
     return true;
 }
 
-static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
-                                     const ds4_qwen4exp_layer_weights *l,
-                                     const ds4_model *m,
-                                     uint32_t il,
-                                     uint32_t n_tokens) {
+static bool qwen4exp_graph_qsa_block_encode(ds4_qwen4exp_session *s,
+                                            const ds4_qwen4exp_layer_weights *l,
+                                            const ds4_model *m,
+                                            uint32_t il,
+                                            uint32_t n_tokens) {
     const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
     const uint32_t head_dim = DS4_N_HEAD_DIM;
     const uint32_t q_width = DS4_N_HEAD * head_dim;
@@ -1806,6 +1828,7 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
     const uint32_t max_selected = DS4_QWEN4EXP_MAX_SELECTED(top_k, ratio);
     const uint32_t n_blocks = s->plan.n_ctx / ratio;
     const uint32_t pos0 = s->pos;
+    const bool indexed = (uint64_t)pos0 + n_tokens > DS4_N_INDEXER_TOP_K;
 
     /* Pre-quantize s->mixed ONCE for Q, K, and V projections. */
     const uint64_t q8_blocks = (uint64_t)DS4_N_EMBD / 32u;
@@ -1851,6 +1874,32 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
         fprintf(stderr, "ds4: qwen4exp QSA projections failed at block %u\n", il);
         return false;
     }
+
+    /* The indexer key maintenance (the idx_k projection and the pool update
+     * below) feeds only carried state while !indexed, so at the decode widths
+     * it forks onto the side stream here, behind the Q/K/V projection, and
+     * overlaps the prep and the attention; qwen4exp_graph_qsa_block joins it
+     * after the output projection.  It reads `mixed` (final here) and writes
+     * only idx_k, idx_tape[il] and idx_pool[il].  0 = declined, nothing
+     * issued (DS4_QWEN4EXP_NO_IDX_FORK among others): the two calls below run
+     * in stream order exactly as before. */
+    int idx_fork = 0;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (!indexed && n_tokens <= 2u) {
+        idx_fork = ds4_gpu_qwen4exp_qsa_indexer_fork(
+                s->idx_k, QW_MAP(m, l->indexer_k_proj),
+                QW_MAPSZ(m, l->indexer_k_proj), QW_OFF(l->indexer_k_proj),
+                DS4_N_EMBD, cfg->indexer_k_dim, s->mixed,
+                s->idx_pool[il], s->idx_tape[il], s->idx_k_norm[il],
+                s->inv_freq, pos0, n_tokens, s->plan.n_ctx,
+                DS4_N_INDEXER_HEAD_DIM, ratio, DS4_N_ROT, DS4_RMS_EPS,
+                l->indexer_k_norm_offset, s->d_pos);
+        if (idx_fork < 0) {
+            fprintf(stderr, "ds4: qwen4exp indexer fork failed at block %u\n", il);
+            return false;
+        }
+    }
+#endif
 
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (n_tokens<=2u) {
@@ -1902,10 +1951,10 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
      * projection feeds only the norm/rope/scores/select chain below, and that
      * chain runs only when `indexed`.  Below the budget its result was written
      * and never read, so it moves under the same condition.  This removes a
-     * computation whose output no reader observes; it does not change one. */
-    const bool indexed = (uint64_t)pos0 + n_tokens > DS4_N_INDEXER_TOP_K;
-
-    if (!ds4_qwen4exp_matmul_bf16(s->idx_k, QW_MAP(m, l->indexer_k_proj),
+     * computation whose output no reader observes; it does not change one.
+     * (`indexed` is computed at the top, for the fork.) */
+    if (!idx_fork &&
+        !ds4_qwen4exp_matmul_bf16(s->idx_k, QW_MAP(m, l->indexer_k_proj),
                                   QW_MAPSZ(m, l->indexer_k_proj),
                                   QW_OFF(l->indexer_k_proj),
                                   DS4_N_EMBD, cfg->indexer_k_dim,
@@ -1922,7 +1971,8 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
         fprintf(stderr, "ds4: qwen4exp indexer projections failed at block %u\n", il);
         return false;
     }
-    if (!ds4_gpu_qwen4exp_qsa_indexer_pool_update_dpos_tensor(
+    if (!idx_fork &&
+        !ds4_gpu_qwen4exp_qsa_indexer_pool_update_dpos_tensor(
             s->idx_pool[il], s->idx_tape[il], s->idx_k, s->idx_k_norm[il],
             s->inv_freq, pos0, n_tokens, s->plan.n_ctx,
             DS4_N_INDEXER_HEAD_DIM, ratio, DS4_N_ROT, DS4_RMS_EPS,
@@ -2012,6 +2062,27 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
         return false;
     }
     return true;
+}
+
+/* The QSA block, joined: when the encode above forked the indexer key
+ * maintenance, the decode stream waits for the side stream here -- after the
+ * output projection, before the attention inject (the next launch, and the
+ * first one outside the block) -- on the success path and on every error path
+ * alike, so no capture of this block ever ends with the side stream unjoined.
+ * Nothing pending (no fork taken, or DS4_QWEN4EXP_NO_IDX_FORK): a no-op. */
+static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
+                                     const ds4_qwen4exp_layer_weights *l,
+                                     const ds4_model *m,
+                                     uint32_t il,
+                                     uint32_t n_tokens) {
+    const bool ok = qwen4exp_graph_qsa_block_encode(s, l, m, il, n_tokens);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (!ds4_gpu_qwen4exp_qsa_indexer_join(s->idx_k)) {
+        fprintf(stderr, "ds4: qwen4exp indexer fork join failed at block %u\n", il);
+        return false;
+    }
+#endif
+    return ok;
 }
 
 /* Which head mapping has already been announced resident, so a per-session
@@ -2151,6 +2222,30 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
     const int moe_lane = qw_moe_in_head_block ? 1 : 0;
     uint64_t moe_mark = moe_timing ? qw_hb_now_ns() : 0;
 
+    /* Expert types vary per block and per artifact: UD-Q4_K_XL stores block 2
+     * gate/up at Q5_K and five blocks' down at Q8_0, the MQ recipes go further,
+     * and the MTP head is Q8_0 throughout.  There is no type check here: the
+     * loader binds these tensors from ds4_qwen4exp_moe_types.h and the kernels
+     * expand the same table, so a bound expert tensor is one the GEMM decodes.
+     *
+     * Every slab carries its own shard mapping, so a block whose expert
+     * tensors landed in different shards runs like any other: blocks 11 and 41
+     * of UD-Q4_K_XL do. */
+    const ds4_gpu_qwen4exp_slab gate_slab = QW_SLAB(m, l->ffn_gate_exps);
+    const ds4_gpu_qwen4exp_slab up_slab = QW_SLAB(m, l->ffn_up_exps);
+    const ds4_gpu_qwen4exp_slab down_slab = QW_SLAB(m, l->ffn_down_exps);
+    /* The shared-expert fork event, recorded here -- after the FFN mixer that
+     * already produced the quantized `mixed`, before the router -- when the
+     * backend can prove the routed call below will consume that exact prefix
+     * (n_tokens <= 2 only).  A decline is not a failure: the routed call then
+     * records it itself.  Host call order is unchanged. */
+    if (n_tokens <= 2u) {
+        (void)ds4_gpu_qwen4exp_moe_fork_early(
+                s->mixed, &gate_slab, &up_slab, &down_slab,
+                DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT, DS4_N_EXPERT_USED,
+                n_tokens);
+    }
+
     if (!ds4_qwen4exp_matmul_f32(s->moe_logits, QW_MAP(m, l->ffn_gate_inp),
                                    QW_MAPSZ(m, l->ffn_gate_inp),
                                    QW_OFF(l->ffn_gate_inp),
@@ -2175,18 +2270,7 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
     }
     QW_MOE_TICK(QW_MOE_T_SELECT);
 
-    /* Expert types vary per block and per artifact: UD-Q4_K_XL stores block 2
-     * gate/up at Q5_K and five blocks' down at Q8_0, the MQ recipes go further,
-     * and the MTP head is Q8_0 throughout.  There is no type check here: the
-     * loader binds these tensors from ds4_qwen4exp_moe_types.h and the kernels
-     * expand the same table, so a bound expert tensor is one the GEMM decodes.
-     *
-     * Every slab carries its own shard mapping, so a block whose expert
-     * tensors landed in different shards runs like any other: blocks 11 and 41
-     * of UD-Q4_K_XL do. */
-    const ds4_gpu_qwen4exp_slab gate_slab = QW_SLAB(m, l->ffn_gate_exps);
-    const ds4_gpu_qwen4exp_slab up_slab = QW_SLAB(m, l->ffn_up_exps);
-    const ds4_gpu_qwen4exp_slab down_slab = QW_SLAB(m, l->ffn_down_exps);
+    /* gate_slab / up_slab / down_slab: built above the router (early fork). */
     if (!ds4_gpu_qwen4exp_routed_moe_router_tensor(
             s->block_out, s->moe_mid, s->moe_down_partial,
             &gate_slab, &up_slab, &down_slab,
@@ -3098,6 +3182,19 @@ static bool qwen4exp_gdn_replay_snapshot(const ds4_qwen4exp_session *s,
     if (!s->gdn_replay_previous) return true;
     if (row != 0u) return false;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (s->gdn_defer_rows) {
+        /* Deferred: checkpoint . tape[parity][0 .. prefix + 1), or the bare
+         * checkpoint when the last round published row zero into it. */
+        uint32_t first = 0u;
+        const uint32_t rows = ds4_qwen4exp_gdn_defer_rows(
+            s->gdn_replay_prefix, s->gdn_replay_parity, s->gdn_defer_rows,
+            false, &first);
+        return ds4_gpu_qwen4exp_gdn_defer_materialize(
+            s->gdn_state_snapshot[il], s->gdn_checkpoint[il],
+            s->gdn_replay_tape[il], s->gdn_defer_rows, first, rows,
+            DS4_N_GDN_KEY_HEAD, DS4_N_GDN_VALUE_HEAD,
+            DS4_QWEN4EXP_GDN_HEADS_TILED) != 0;
+    }
     const uint32_t rows = s->gdn_replay_prefix == DS4_QWEN4EXP_GDN_REPLAY_ROWS
         ? 0u : s->gdn_replay_prefix + 1u;
     return ds4_gpu_qwen4exp_gdn_replay_materialize(
@@ -3107,6 +3204,42 @@ static bool qwen4exp_gdn_replay_snapshot(const ds4_qwen4exp_session *s,
 #else
     return false;
 #endif
+}
+
+/* Deferred mode: rebuild layer il's live final state (after both rows of the
+ * last replay round) in gdn_state[il], which no deferred verify reads or
+ * writes.  Idempotent, and changes neither the checkpoint, the tape nor the
+ * controller, so inspection may call it any number of times. */
+static bool qwen4exp_gdn_defer_live(const ds4_qwen4exp_session *s, uint32_t il) {
+    if (!s->gdn_defer_rows || !s->gdn_replay_previous) return true;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    uint32_t first = 0u;
+    const uint32_t rows = ds4_qwen4exp_gdn_defer_rows(
+        s->gdn_replay_prefix, s->gdn_replay_parity, s->gdn_defer_rows,
+        true, &first);
+    return ds4_gpu_qwen4exp_gdn_defer_materialize(
+        s->gdn_state[il], s->gdn_checkpoint[il], s->gdn_replay_tape[il],
+        s->gdn_defer_rows, first, rows, DS4_N_GDN_KEY_HEAD,
+        DS4_N_GDN_VALUE_HEAD, DS4_QWEN4EXP_GDN_HEADS_TILED) != 0;
+#else
+    (void)il;
+    return false;
+#endif
+}
+
+/* Leaving the deferred tape with the recurrent state accepted (a width-1
+ * forward, unequal adoption flags): make gdn_state the live buffer again, in
+ * one batch behind one drain, as the settle copy does. */
+static bool qwen4exp_gdn_defer_flush(ds4_qwen4exp_session *s) {
+    const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
+    if (!ds4_gpu_begin_commands()) return false;
+    bool ok = true;
+    for (uint32_t il = 0; il < cfg->n_layer && ok; il++) {
+        if (s->gdn_state[il]) ok = qwen4exp_gdn_defer_live(s, il);
+    }
+    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) return false;
+    if (ok) s->gdn_replay_previous = false;
+    return ok;
 }
 
 /* Today's GDN rollback copy; graph_forward runs it when a pending lazy
@@ -3208,10 +3341,22 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     /* Plan before changing any pointers. A rejecting replay round continues
      * from the same checkpoint plus its committed row-zero transition. Other
      * adoptions first become ordinary materialized state when necessary. */
-    const ds4_qwen4exp_gdn_replay_step replay_step = ds4_qwen4exp_gdn_replay_plan(
+    const ds4_qwen4exp_gdn_replay_step replay_step = s->gdn_defer_rows
+        ? ds4_qwen4exp_gdn_defer_plan(
+              s->gdn_replay_enabled, s->gdn_replay_previous, s->gdn_replay_prefix,
+              s->gdn_replay_parity, s->gdn_defer_rows, n_tokens,
+              s->spec_snapshot_rows, DS4_QWEN4EXP_MTP_MAX_COMMIT,
+              s->adopt_state, s->adopt_conv)
+        : ds4_qwen4exp_gdn_replay_plan(
         s->gdn_replay_enabled, s->gdn_replay_previous, s->gdn_replay_prefix,
         DS4_QWEN4EXP_GDN_REPLAY_ROWS, n_tokens, s->spec_snapshot_rows,
         DS4_QWEN4EXP_MTP_MAX_COMMIT, s->adopt_state, s->adopt_conv);
+    /* Deferred only: the recurrent buffer is stale and nothing below rebuilds
+     * it (a recurrent settle would), so materialise the live state first. */
+    if (replay_step.flush && !qwen4exp_gdn_defer_flush(s)) {
+        fprintf(stderr, "ds4: qwen4exp GDN deferred state could not materialise\n");
+        return false;
+    }
     if (replay_step.settle) {
         const uint32_t rs = s->adopt_state, rc = s->adopt_conv;
         /* ONE BATCH, ONE SYNCHRONIZE, when both halves settle the same row.
@@ -3264,7 +3409,11 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     }
     if (replay_step.active) {
         s->gdn_replay_prefix = replay_step.prefix;
-        if (!ds4_gpu_qwen4exp_update_dpos(s->d_gdn_replay, replay_step.prefix)) {
+        s->gdn_replay_parity = replay_step.parity;
+        if (!ds4_gpu_qwen4exp_update_dpos(s->d_gdn_replay, s->gdn_defer_rows
+                ? ds4_qwen4exp_gdn_defer_control(replay_step.prefix,
+                                                 replay_step.parity)
+                : replay_step.prefix)) {
             fprintf(stderr, "ds4: qwen4exp GDN replay prefix update failed\n");
             return false;
         }
@@ -4152,6 +4301,10 @@ static double qwen4exp_gdn_checksum(const ds4_qwen4exp_session *s, uint32_t il,
     const ds4_gpu_tensor *snap =
         recurrent ? s->gdn_state_snapshot[il] : s->gdn_conv_snapshot[il];
     const uint32_t pending = recurrent ? s->adopt_state : s->adopt_conv;
+    /* Deferred: the live recurrent state is checkpoint + tape until a forward
+     * materialises it; rebuild it into the (otherwise unread) live buffer. */
+    if (recurrent && live && pending == 0u && !qwen4exp_gdn_defer_live(s, il))
+        return -2.0;
     if (!live || !snap || pending == 0u) return qwen4exp_state_checksum(live);
     if (recurrent && !qwen4exp_gdn_replay_snapshot(s, il, pending - 1u)) return -2.0;
     const uint64_t bytes = ds4_gpu_tensor_bytes(live);
@@ -4787,3 +4940,16 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
 }
 
 #endif /* DS4_NO_GPU */
+
+/* The resident's load-time A/B self-profile (declared in ds4.h).  Every arm it
+ * toggles, and every graph cache it must retire, lives in the CUDA backend
+ * (ds4_gpu_qwen4exp_ab_set in ds4_cuda_qwen4exp.cu), so this forwards there on
+ * a CUDA build and is the documented no-op everywhere else, under the same
+ * guard the rest of this file's CUDA-only calls use. */
+int ds4_qwen4exp_ab_set(uint32_t off_mask) {
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    return ds4_gpu_qwen4exp_ab_set(off_mask);
+#else
+    return off_mask == 0u ? 0 : -1;
+#endif
+}

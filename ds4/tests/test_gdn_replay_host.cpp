@@ -89,8 +89,14 @@ static void __stcs(float4 *p,float4 v) { *p=v; }
 #define __global__
 #define __forceinline__ inline
 #define QWEN4EXP_GDN_DIM 128u
+#define QWEN4EXP_PDL_SYNC() ((void)0)
 #include "ds4_qwen4exp_gdn_replay.h"
+/* qwen4exp_gdn_replay_gates_kernel keeps the raw-gate pointers it no longer
+ * reads, for the launch signature's sake. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-parameter"
 #include "gdn_replay_bodies.inc"
+#pragma GCC diagnostic pop
 static void cta(int nth,std::function<void()> f) {
     threads=nth;body=std::move(f);block_arrivals=0;
     std::fill(std::begin(arrivals),std::end(arrivals),0);
@@ -180,7 +186,7 @@ static void trial(unsigned nk,unsigned nv,unsigned layout,unsigned rounds,bool s
             cta(128,[&]{qwen4exp_gdn_replay_kernel(
                 out.data(),live->data(),base->data(),tape.data(),qkv.data(),
                 alpha.data(),beta.data(),decay.data(),bias.data(),nk,nv,2,
-                layout,&prefix,0);});
+                layout,&prefix,0,0);});
         }
         if(prefix==2) need(tape.a==tape_before,"flush must not overwrite a tape reader");
         else for(unsigned i=0;i<prefix*stride;i++)
@@ -197,7 +203,7 @@ static void trial(unsigned nk,unsigned nv,unsigned layout,unsigned rounds,bool s
             blockIdx={c/32,c%32,0};
             cta(128,[&]{qwen4exp_gdn_replay_kernel(
                 nullptr,materialized.data(),base->data(),tape.data(),nullptr,
-                nullptr,nullptr,nullptr,nullptr,nk,nv,0,layout,nullptr,rows);});
+                nullptr,nullptr,nullptr,nullptr,nk,nv,0,layout,nullptr,rows,0);});
         }
         for(unsigned c:cells) for(unsigned v=0;v<4;v++) {
             unsigned index=(c/32)*128+(c%32)*4+v;
@@ -213,7 +219,124 @@ static void trial(unsigned nk,unsigned nv,unsigned layout,unsigned rounds,bool s
     std::printf("PASS kernel nk=%u nv=%u layout=%u rounds=%u value_blocks=%zu flushes=%u\n",
                 nk,nv,layout,rounds,cells.size(),flushes);
 }
+/* Deferred materialisation: both live rows on a double-buffered N-row tape,
+ * no state store, checkpoint published only when prefix + 2 > N.  Both the
+ * raw-gate and the published-gate kernel run every round from the same
+ * checkpoint/tape copies and must agree bit for bit with each other and with
+ * the ordinary recurrence (outputs, row-zero snapshot, final state). */
+static void defer_trial(unsigned nk,unsigned nv,unsigned layout,unsigned rounds,
+                        unsigned n,bool sample_rows) {
+    const unsigned kd=nk*128, vd=nv*128, cd=2*kd+vd;
+    const unsigned stride=(kd+vd+2*nv+3)&~3u;
+    guarded old_state(vd*128), old_snap(vd*128), b0(vd*128), b1(vd*128);
+    guarded tape(stride*2*n), tape_g(stride*2*n), base_g(vd*128), materialized(vd*128);
+    guarded out(2*vd), out_g(2*vd), ref(2*vd), qkv(2*cd), alpha(2*nv), beta(2*nv);
+    guarded pairs(4*nv);
+    std::vector<float> decay(nv),bias(nv);
+    for(unsigned i=0;i<vd*128;i++) old_state.data()[i]=b0.data()[i]=random_float(.03f);
+    for(unsigned i=0;i<vd*128;i++) b1.data()[i]=-4097.5f; /* never read */
+    for(unsigned h=0;h<nv;h++) {
+        decay[h]=-(.03f+float(h%5)*.04f); bias[h]=random_float(.2f);
+    }
+    guarded *live=&b0, *base=&b1;
+    std::vector<unsigned> cells;
+    for(unsigned h=0;h<nv;h++) for(unsigned y=0;y<32;y++)
+        if(!sample_rows || y==0 || y==11 || y==31) cells.push_back(h*32+y);
+    bool previous=false;
+    unsigned prefix=0, parity=0, pending=0, flushes=0, longest=0;
+    const char *pattern="RAAARRAAAAAARARAARRAAAAAAAAARRR";
+    for(unsigned r=0;r<rounds;r++) {
+        auto p=ds4_qwen4exp_gdn_defer_plan(true,previous,prefix,parity,n,2,1,7,pending,pending);
+        need(!p.settle && p.active && !p.flush,"deferred two-row continuation");
+        need(p.swap==!previous,"deferred swap only on entry");
+        if(p.swap) std::swap(live,base);
+        prefix=p.prefix; parity=p.parity;
+        need(prefix<=n,"bounded deferred prefix");
+        longest=std::max(longest,prefix);
+        const bool flush=ds4_qwen4exp_gdn_defer_flushes(prefix,n);
+        flushes+=flush;
+        uint32_t ctrl=ds4_qwen4exp_gdn_defer_control(prefix,parity);
+        for(unsigned i=0;i<2*cd;i++) qkv.data()[i]=random_float(.08f);
+        for(unsigned i=0;i<2*nv;i++) {
+            alpha.data()[i]=random_float(2.f);beta.data()[i]=random_float(2.f);
+        }
+        for(unsigned i=0;i<2*nv;i++) {
+            const unsigned h=i%nv;
+            pairs.data()[2*i]=expf(decay[h]*qwen4exp_gdn_softplus(alpha.data()[i]+bias[h]));
+            pairs.data()[2*i+1]=qwen4exp_gdn_sigmoid(beta.data()[i]);
+        }
+        if(r%2) std::reverse(cells.begin(),cells.end());
+        for(unsigned c:cells) {
+            blockIdx={c/32,c%32,0};
+            cta(128,[&]{qwen4exp_gdn_recurrence_kernel<false>(
+                ref.data(),old_state.data(),qkv.data(),alpha.data(),beta.data(),
+                decay.data(),bias.data(),nullptr,old_snap.data(),
+                nk,nv,1,2,layout,1,0,&pending);});
+        }
+        tape_g.a=tape.a; base_g.a=base->a;
+        const auto tape_before=tape.a;
+        const auto live_before=live->a;
+        for(unsigned c:cells) {
+            blockIdx={c/32,c%32,0};
+            cta(128,[&]{qwen4exp_gdn_replay_kernel(
+                out.data(),live->data(),base->data(),tape.data(),qkv.data(),
+                alpha.data(),beta.data(),decay.data(),bias.data(),nk,nv,2,
+                layout,&ctrl,0,n);});
+        }
+        for(unsigned c:cells) {
+            blockIdx={c/32,c%32,0};
+            cta(128,[&]{qwen4exp_gdn_replay_gates_kernel(
+                out_g.data(),live->data(),base_g.data(),tape_g.data(),qkv.data(),
+                alpha.data(),beta.data(),(const float2 *)pairs.data(),nk,nv,2,
+                layout,&ctrl,0,n);});
+        }
+        need(live->a==live_before,"deferred verify wrote the live state");
+        need(tape_g.a==tape.a && base_g.a==base->a,"published-gate kernel differs");
+        const size_t cur=(size_t)parity*n*stride, other=(size_t)(parity^1u)*n*stride;
+        /* The rows every CTA replays are never written; a flush leaves the
+         * whole current buffer alone and appends to the other one. */
+        const size_t keep=flush?(size_t)n*stride:(size_t)prefix*stride;
+        for(size_t i=0;i<keep;i++) same(tape.data()[cur+i],tape_before[4+cur+i],"deferred replay rows");
+        if(flush) for(size_t i=stride;i<(size_t)n*stride;i++)
+            same(tape.data()[other+i],tape_before[4+other+i],"deferred flush touched other rows");
+        for(unsigned c:cells) for(unsigned v=0;v<4;v++) {
+            unsigned index=(c/32)*128+(c%32)*4+v;
+            for(unsigned t=0;t<2;t++) {
+                same(out.data()[t*vd+index],ref.data()[t*vd+index],"deferred output bits");
+                same(out_g.data()[t*vd+index],ref.data()[t*vd+index],"deferred gate output bits");
+            }
+        }
+        for(unsigned which=0;which<2;which++) {
+            uint32_t first=0;
+            const uint32_t rows=ds4_qwen4exp_gdn_defer_rows(prefix,parity,n,which==1,&first);
+            for(unsigned c:cells) {
+                blockIdx={c/32,c%32,0};
+                cta(128,[&]{qwen4exp_gdn_replay_kernel(
+                    nullptr,materialized.data(),base->data(),tape.data()+(size_t)first*stride,
+                    nullptr,nullptr,nullptr,nullptr,nullptr,nk,nv,0,layout,nullptr,rows,n);});
+            }
+            const guarded &want=which?old_state:old_snap;
+            for(unsigned c:cells) for(unsigned v=0;v<4;v++) {
+                unsigned index=(c/32)*128+(c%32)*4+v;
+                for(unsigned k=0;k<128;k++)
+                    same(materialized.data()[index*128+k],want.a[4+index*128+k],
+                         which?"deferred final state bits":"deferred row-zero snapshot bits");
+            }
+        }
+        for(auto g:{&old_state,&old_snap,&b0,&b1,&tape,&tape_g,&base_g,&materialized,&out,&out_g,&ref,&qkv,&alpha,&beta,&pairs}) g->check();
+        pending=pattern[r%31]=='R'?1:0;
+        previous=true;
+    }
+    need(flushes!=0 && longest+1>=n,"deferred flush and a full tape exercised");
+    std::printf("PASS deferred kernel nk=%u nv=%u layout=%u N=%u rounds=%u value_blocks=%zu flushes=%u\n",
+                nk,nv,layout,n,rounds,cells.size(),flushes);
+}
 int main() {
+    defer_trial(1,1,0,40,DS4_QWEN4EXP_GDN_TAPE_ROWS,false);
+    defer_trial(1,1,1,24,2,false);
+    defer_trial(2,4,0,20,DS4_QWEN4EXP_GDN_TAPE_ROWS,false);
+    defer_trial(2,4,1,20,3,false);
+    defer_trial(16,48,1,12,DS4_QWEN4EXP_GDN_TAPE_ROWS,true);
     trial(1,1,0,16,false);
     trial(2,4,0,7,false);
     trial(2,4,1,7,false);

@@ -44,7 +44,7 @@ source=r'''
 struct alignas(8) float2{float x,y;};
 struct ds4_gpu_tensor{void*ptr;uint64_t bytes;int owner,device_id;};
 struct ds4_gpu_qwen4exp_slab{const void*map;uint64_t map_size,offset;};
-struct ds4_gpu_qwen4exp_gdn_replay{ds4_gpu_tensor*checkpoint,*tape;const ds4_gpu_tensor*control;ds4_gpu_tensor*gate_scratch;};
+struct ds4_gpu_qwen4exp_gdn_replay{ds4_gpu_tensor*checkpoint,*tape;const ds4_gpu_tensor*control;ds4_gpu_tensor*gate_scratch;uint32_t defer_rows;};
 struct dim3{dim3(unsigned,unsigned,unsigned){}};
 using cudaStream_t=int;
 static std::vector<std::string>calls;static int queries,fail_query,wrong_device,wrong_type,fail_launch;
