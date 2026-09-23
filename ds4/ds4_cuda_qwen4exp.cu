@@ -11913,14 +11913,15 @@ __global__ static void qwen4exp_gdn_output_quant_kernel(
     const uint64_t base = (uint64_t)token * value_dim +
         head * QWEN4EXP_GDN_DIM;
     const float raw = out[base + tid];
+    const float nw = output_norm[tid];
+    const float sg = qwen4exp_gdn_sigmoid(output_gate[base + tid]);
     float total = warp_sum_f32(raw * raw);
     if (lane == 0u) partial[warp] = total;
     __syncthreads();
     total = lane < 4u ? partial[lane] : 0.0f;
     total = warp_sum_all_f32(total);
     const float scale = rsqrtf(total / (float)QWEN4EXP_GDN_DIM + norm_eps);
-    const float v = raw * scale * output_norm[tid] *
-        qwen4exp_gdn_sigmoid(output_gate[base + tid]);
+    const float v = raw * scale * nw * sg;
     const float vz = qwen4exp_q8_ftz(v);
     float a = qwen4exp_q8_ftz(fabsf(v));
 #pragma unroll
