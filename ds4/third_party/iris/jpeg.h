@@ -1399,7 +1399,7 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
                 /* Allocate component planes */
                 int y_stride = dec.mcus_x * dec.comp[0].h_samp * 8;
                 int y_height = dec.mcus_y * dec.comp[0].v_samp * 8;
-                uint8_t *y_data = (uint8_t *)calloc(y_stride * y_height, 1);
+                uint8_t *y_data = (uint8_t *)calloc((size_t)y_stride, (size_t)y_height);
                 if (!y_data) goto fail;
 
                 uint8_t *cb_data = NULL;
@@ -1409,11 +1409,11 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
                 if (dec.num_components >= 3) {
                     cb_stride = dec.mcus_x * dec.comp[1].h_samp * 8;
                     int cb_height = dec.mcus_y * dec.comp[1].v_samp * 8;
-                    cb_data = (uint8_t *)calloc(cb_stride * cb_height, 1);
+                    cb_data = (uint8_t *)calloc((size_t)cb_stride, (size_t)cb_height);
 
                     cr_stride = dec.mcus_x * dec.comp[2].h_samp * 8;
                     int cr_height = dec.mcus_y * dec.comp[2].v_samp * 8;
-                    cr_data = (uint8_t *)calloc(cr_stride * cr_height, 1);
+                    cr_data = (uint8_t *)calloc((size_t)cr_stride, (size_t)cr_height);
 
                     if (!cb_data || !cr_data) {
                         free(y_data);
@@ -1483,7 +1483,7 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
 
         for (int i = 0; i < dec.num_components; i++) {
             strides[i] = dec.comp[i].blocks_x * 8;
-            planes[i] = (uint8_t *)calloc(strides[i] * dec.comp[i].blocks_y * 8, 1);
+            planes[i] = (uint8_t *)calloc((size_t)strides[i], (size_t)dec.comp[i].blocks_y * 8u);
             if (!planes[i]) {
                 for (int j = 0; j < i; j++) free(planes[j]);
                 goto fail;
