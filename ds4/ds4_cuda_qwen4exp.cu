@@ -4503,7 +4503,7 @@ __global__ static void qwen4exp_moe_group_small_kernel(
  * its token is threadIdx.x >> 5 where it was blockIdx.x, and every warp
  * intrinsic already uses the full mask and stays inside its own warp.
  */
-template<bool Native, bool KeyMax = false>
+template<bool Native, bool KeyMax = false, bool PairRank = false>
 __global__ static void qwen4exp_moe_router_group_small_kernel(
         int32_t *counts,
         int32_t *offsets,
@@ -4527,6 +4527,11 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
      * on the plain launch this kernel takes, correct if it is ever launched
      * with the programmatic attribute. */
     QWEN4EXP_PDL_SYNC();
+    // The existing router barrier publishes these zeros before live counts.
+    if constexpr (PairRank) {
+        for (uint32_t e = threadIdx.x; e < n_expert; e += blockDim.x)
+            counts[e] = 0;
+    }
     /* AND THE TRIGGER, RESTORED FOR THE KERNEL THAT NOW FOLLOWS THIS ONE.
      *
      * The comment this replaces said the standalone top-k's trigger was
@@ -4717,6 +4722,49 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
      * router warps' `selected` stores to every thread of the block before the
      * grouping half's first read of them. */
     __syncthreads();
+    if constexpr (PairRank) {
+        // At most 32 pairs: stable integer rank reproduces expert-major,
+        // then original-pair order, including experts shared by two tokens.
+        if (threadIdx.x < 32u) {
+            const uint32_t p = threadIdx.x;
+            const int32_t expert = p < n_pairs ? selected[p] : INT32_MAX;
+            const bool valid = p < n_pairs && expert >= 0 &&
+                               (uint32_t)expert < n_expert;
+            const uint32_t valid_mask = __ballot_sync(0xffffffffu, valid);
+            const uint32_t equal_mask =
+                __match_any_sync(0xffffffffu, expert) & valid_mask;
+            const bool leader = valid && (__ffs(equal_mask) - 1 == (int)p);
+            const uint32_t leaders = __ballot_sync(0xffffffffu, leader);
+            int32_t offset = 0, active_rank = 0;
+            for (uint32_t q = 0; q < n_pairs; ++q) {
+                const int32_t other = __shfl_sync(0xffffffffu, expert, q);
+                const bool lower = other < expert;
+                offset += lower && ((valid_mask >> q) & 1u);
+                active_rank += lower && ((leaders >> q) & 1u);
+            }
+            if (valid) {
+                const uint32_t earlier = equal_mask & ((1u << p) - 1u);
+                pairs[offset + __popc(earlier)] = (int32_t)p;
+                if (leader) {
+                    const int32_t count = __popc(equal_mask);
+                    counts[expert] = count;
+                    offsets[expert] = offset;
+                    cursor[expert] = offset + count;
+                    active[1 + active_rank] = expert;
+                }
+            } else if (p < n_pairs) {
+                const uint32_t token = p / n_expert_used;
+                const uint32_t slot = p - token * n_expert_used;
+                float *dst = mid + (uint64_t)token * mid_token_stride +
+                             (uint64_t)slot * mid_dim;
+                for (uint32_t row = 0; row < mid_dim; ++row) dst[row] = 0.0f;
+            }
+            if (p == 0u) active[0] = __popc(leaders);
+        }
+        // Inactive offsets/cursor have no consumer at these widths. Counts
+        // remain zero for the optional noncompact projection path.
+        return;
+    }
     /* PDL consumer of the router's top-k, which triggers at its top.  This
      * kernel is one 512-thread block and its very first global read is
      * `selected`, the router's output, so there is no weight load to hoist
@@ -10114,6 +10162,43 @@ static int qwen4exp_routed_moe_cuda(
          * it back down to the plain launch, where the fence is a no-op. */
         const bool key_max =
             getenv("DS4_QWEN4EXP_NO_ROUTER_KEYMAX") == NULL;
+        if (n_tokens <= 2u && n_pairs <= 32u) {
+        if (qwen4exp_pdl_router_tree() && key_max) {
+            QWEN4EXP_LAUNCH_PDL(
+                    (qwen4exp_moe_router_group_small_kernel<true, true, true>),
+                    dim3(1u, 1u, 1u), 64u, 0, stream,
+                    sc.counts, sc.offsets, sc.cursor, sc.active, sc.pairs,
+                    (float *)mid->ptr, (int32_t *)selected->ptr,
+                    n_total_expert, n_pairs, n_expert_used, mid_dim,
+                    mid_token_stride, (float *)weights_rw->ptr,
+                    (const float *)logits->ptr, n_tokens);
+        } else if (qwen4exp_pdl_router_tree()) {
+            QWEN4EXP_LAUNCH_PDL(
+                    (qwen4exp_moe_router_group_small_kernel<true, false, true>),
+                    dim3(1u, 1u, 1u), 64u, 0, stream,
+                    sc.counts, sc.offsets, sc.cursor, sc.active, sc.pairs,
+                    (float *)mid->ptr, (int32_t *)selected->ptr,
+                    n_total_expert, n_pairs, n_expert_used, mid_dim,
+                    mid_token_stride, (float *)weights_rw->ptr,
+                    (const float *)logits->ptr, n_tokens);
+        } else if (key_max) {
+            qwen4exp_moe_router_group_small_kernel<true, true, true>
+                    <<<dim3(1u, 1u, 1u), 64u, 0, stream>>>(
+                    sc.counts, sc.offsets, sc.cursor, sc.active, sc.pairs,
+                    (float *)mid->ptr, (int32_t *)selected->ptr,
+                    n_total_expert, n_pairs, n_expert_used, mid_dim,
+                    mid_token_stride, (float *)weights_rw->ptr,
+                    (const float *)logits->ptr, n_tokens);
+        } else {
+            qwen4exp_moe_router_group_small_kernel<true, false, true>
+                    <<<dim3(1u, 1u, 1u), 64u, 0, stream>>>(
+                    sc.counts, sc.offsets, sc.cursor, sc.active, sc.pairs,
+                    (float *)mid->ptr, (int32_t *)selected->ptr,
+                    n_total_expert, n_pairs, n_expert_used, mid_dim,
+                    mid_token_stride, (float *)weights_rw->ptr,
+                    (const float *)logits->ptr, n_tokens);
+        }
+        } else {
         if (qwen4exp_pdl_router_tree() && key_max) {
             QWEN4EXP_LAUNCH_PDL(
                     (qwen4exp_moe_router_group_small_kernel<true, true>),
@@ -10148,6 +10233,7 @@ static int qwen4exp_routed_moe_cuda(
                     n_total_expert, n_pairs, n_expert_used, mid_dim,
                     mid_token_stride, (float *)weights_rw->ptr,
                     (const float *)logits->ptr, n_tokens);
+        }
         }
     } else if (small_group) {
         /* PSS: the router's top-k is the stream predecessor and triggers at
