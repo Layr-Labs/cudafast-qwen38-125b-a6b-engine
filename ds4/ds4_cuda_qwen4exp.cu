@@ -1491,6 +1491,150 @@ __global__ static void qwen4exp_gdn_split_reduce_kernel(
 }
 
 /*
+ * DECODE-WIDTH RECURRENCE, EIGHT LANES PER VALUE ROW.
+ *
+ * The decode and speculative-verify widths carry no precomputed gates, so
+ * they ran qwen4exp_gdn_recurrence_kernel<false>: one WARP per value row,
+ * lane L owning key columns 4L..4L+3, and two full five-step butterflies
+ * (warp_sum_all_f32) per row per token -- ten shuffles and ten dependent adds
+ * on every value row of every GDN layer, 36 layers a forward.
+ *
+ * This is the split-reduce kernel's lane layout carried to those widths:
+ * one value row per eight-lane group, four rows a warp; lane n of a group
+ * holds the float4 chunks at key columns 4n, 4n+32, 4n+64, 4n+96 (the
+ * columns of the one-warp kernel's lanes n, n+8, n+16, n+24) and reduces with
+ * qwen4exp_gdn_fold4 then qwen4exp_gdn_group_sum_f32 -- the first two levels
+ * of warp_sum_all_f32's tree done locally on the same operand pairs, the last
+ * three as in-group xor shuffles -- so each dot product is the same float in
+ * every lane (the helpers' comments state the identity).  Decay is the same
+ * FMUL per element, delta the same FSUB then FMUL, the update the same FFMA.
+ *
+ * The gates are computed exactly as the one-warp kernel computes them: lane
+ * 0 of the warp evaluates expf(a_log * softplus(alpha + dt_bias)) and
+ * sigmoid(beta) and the warp broadcasts them with one shuffle each.  All four
+ * rows of a warp belong to the same (row, head, token), so one evaluation
+ * serves four rows where it used to serve one.
+ *
+ * The lazy rollback (adopt_row) reads the base state from snapshot slot k at
+ * the same stride, the per-token snapshots and the carried state are stored
+ * at the same addresses with the same values, and the output is written once
+ * per row by the group's first lane.  Geometry: 128 threads carry 16 value
+ * rows, so the grid is (n_value_head, 128 / 16, n_rows) -- one quarter of the
+ * one-warp kernel's blocks for the same state traffic.
+ *
+ * DS4_QWEN4EXP_DECODE_GDN_WARP_ROW=1 restores the one-warp-per-row kernel.
+ */
+__global__ static void qwen4exp_gdn_decode_group_kernel(
+        float *__restrict__ out, float *__restrict__ state,
+        const float *__restrict__ qkv,
+        const float *__restrict__ raw_alpha,
+        const float *__restrict__ raw_beta,
+        const float *__restrict__ a_log,
+        const float *__restrict__ dt_bias,
+        float *state_snapshot,
+        uint32_t n_key_head, uint32_t n_value_head, uint32_t n_rows,
+        uint32_t n_tokens, uint32_t head_layout, uint32_t n_snapshot_rows,
+        uint32_t snap_plain, const uint32_t *adopt_row) {
+    const uint32_t head = blockIdx.x;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t grp = lane >> 3u;
+    const uint32_t col0 = 4u * (lane & 7u);
+    const uint32_t value =
+        (blockIdx.y * 4u + (threadIdx.x >> 5u)) * 4u + grp;
+    const uint32_t row = blockIdx.z;
+    /* Whole warps only: every lane of a warp shares head and row, and value
+     * stays below QWEN4EXP_GDN_DIM for the full grid, so the shuffles below
+     * never see an exited lane. */
+    if (head >= n_value_head || value >= QWEN4EXP_GDN_DIM || row >= n_rows) {
+        return;
+    }
+    const uint32_t key_dim = n_key_head * QWEN4EXP_GDN_DIM;
+    const uint32_t value_dim = n_value_head * QWEN4EXP_GDN_DIM;
+    const uint32_t conv_dim = 2u * key_dim + value_dim;
+    const uint32_t key_head = head_layout != 0u
+        ? head % n_key_head : head / (n_value_head / n_key_head);
+    const uint64_t state_base =
+        (((uint64_t)row * n_value_head + head) * QWEN4EXP_GDN_DIM + value) *
+        QWEN4EXP_GDN_DIM + col0;
+    const uint64_t snap_stride = (uint64_t)n_rows * n_value_head *
+        QWEN4EXP_GDN_DIM * QWEN4EXP_GDN_DIM;
+    const uint32_t adopt = adopt_row ? *adopt_row : 0u;
+    const float *const state_src = adopt
+        ? state_snapshot + (uint64_t)(adopt - 1u) * snap_stride + state_base
+        : state + state_base;
+    float4 h[4];
+#pragma unroll
+    for (unsigned c = 0; c < 4u; c++) {
+        h[c] = *(const float4 *)(state_src + 32u * c);
+    }
+    const float decay_coeff = a_log[head];
+    const float bias = dt_bias[head];
+    for (uint32_t token = 0; token < n_tokens; token++) {
+        const uint64_t slot = (uint64_t)row * n_tokens + token;
+        const uint64_t base =
+            slot * conv_dim + key_head * QWEN4EXP_GDN_DIM + col0;
+        float4 q4[4], k4[4];
+#pragma unroll
+        for (unsigned c = 0; c < 4u; c++) {
+            q4[c] = *(const float4 *)(qkv + base + 32u * c);
+            k4[c] = *(const float4 *)(qkv + base + key_dim + 32u * c);
+        }
+        const float v_row = qkv[slot * conv_dim + 2u * (uint64_t)key_dim +
+            head * QWEN4EXP_GDN_DIM + value];
+        const uint64_t gate = slot * n_value_head + head;
+        float g = 0.0f;
+        float beta = 0.0f;
+        if (lane == 0u) {
+            g = expf(decay_coeff *
+                qwen4exp_gdn_softplus(raw_alpha[gate] + bias));
+            beta = qwen4exp_gdn_sigmoid(raw_beta[gate]);
+        }
+        g = __shfl_sync(0xffffffffu, g, 0);
+        beta = __shfl_sync(0xffffffffu, beta, 0);
+#pragma unroll
+        for (unsigned c = 0; c < 4u; c++) {
+            h[c].x *= g;
+            h[c].y *= g;
+            h[c].z *= g;
+            h[c].w *= g;
+        }
+        const float hk = qwen4exp_gdn_group_sum_f32(qwen4exp_gdn_fold4(
+            dot4_f32(h[0], k4[0]), dot4_f32(h[1], k4[1]),
+            dot4_f32(h[2], k4[2]), dot4_f32(h[3], k4[3])));
+        const float delta_v = (v_row - hk) * beta;
+#pragma unroll
+        for (unsigned c = 0; c < 4u; c++) {
+            h[c].x = fmaf(k4[c].x, delta_v, h[c].x);
+            h[c].y = fmaf(k4[c].y, delta_v, h[c].y);
+            h[c].z = fmaf(k4[c].z, delta_v, h[c].z);
+            h[c].w = fmaf(k4[c].w, delta_v, h[c].w);
+        }
+        const float result = qwen4exp_gdn_group_sum_f32(qwen4exp_gdn_fold4(
+            dot4_f32(h[0], q4[0]), dot4_f32(h[1], q4[1]),
+            dot4_f32(h[2], q4[2]), dot4_f32(h[3], q4[3])));
+        if (col0 == 0u) {
+            out[slot * value_dim + head * QWEN4EXP_GDN_DIM + value] = result;
+        }
+        if (token < n_snapshot_rows) {
+            float4 *snap = (float4 *)(state_snapshot +
+                (uint64_t)token * snap_stride + state_base);
+#pragma unroll
+            for (unsigned c = 0; c < 4u; c++) {
+                if (snap_plain) {
+                    snap[8u * c] = h[c];
+                } else {
+                    __stcs(snap + 8u * c, h[c]);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (unsigned c = 0; c < 4u; c++) {
+        *(float4 *)(state + state_base + 32u * c) = h[c];
+    }
+}
+
+/*
  * PREFILL-WIDTH RECURRENCE, EIGHT LANES PER VALUE ROW.
  *
  * The value-reuse kernel above spends most of its issue slots on the two
@@ -2938,6 +3082,20 @@ static int qwen4exp_cuda_gdn_run(
                     getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u,
                     NULL);
         }
+    } else if (getenv("DS4_QWEN4EXP_DECODE_GDN_WARP_ROW") == NULL) {
+        /* Four value rows a warp, eight lanes a row: 16 rows a block. */
+        qwen4exp_gdn_decode_group_kernel<<<
+                dim3(n_value_head, QWEN4EXP_GDN_DIM / 16u, n_rows),
+                QWEN4EXP_GDN_DIM, 0, stream>>>(
+                (float *)out->ptr, (float *)recurrent_state->ptr,
+                (const float *)qkv->ptr,
+                (const float *)raw_alpha->ptr,
+                (const float *)raw_beta->ptr, a_log, dt_bias,
+                state_snapshot ? (float *)state_snapshot->ptr : NULL,
+                n_key_head, n_value_head, n_rows, n_tokens, head_layout,
+                n_snapshot_rows,
+                getenv("DS4_QWEN4EXP_SNAP_PLAIN") != NULL ? 1u : 0u,
+                adopt_row);
     } else {
         qwen4exp_gdn_recurrence_kernel<false><<<
                 recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
