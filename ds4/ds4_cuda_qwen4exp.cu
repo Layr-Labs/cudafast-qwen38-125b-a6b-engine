@@ -11883,6 +11883,12 @@ __device__ __forceinline__ static float qwen4exp_q8_rcp_approx(float d) {
  * is the standalone kernel's row * blocks + b.  Every group is full, so the
  * standalone kernel's ragged-tail guard has nothing to guard.  One row of
  * prefill only. */
+/* QWEN4EXP_GDN_OUTQ_EARLY_GATE (default 1): the kernel below issues its
+ * norm-weight and output-gate loads beside its first load instead of after
+ * the block reduction.  0 restores the late loads. */
+#ifndef QWEN4EXP_GDN_OUTQ_EARLY_GATE
+#define QWEN4EXP_GDN_OUTQ_EARLY_GATE 1
+#endif
 __global__ static void qwen4exp_gdn_output_quant_kernel(
         int8_t      *xq,
         float       *xscale,
@@ -11913,14 +11919,32 @@ __global__ static void qwen4exp_gdn_output_quant_kernel(
     const uint64_t base = (uint64_t)token * value_dim +
         head * QWEN4EXP_GDN_DIM;
     const float raw = out[base + tid];
+#if QWEN4EXP_GDN_OUTQ_EARLY_GATE
+    /* EARLY GATE AND NORM OPERANDS.  The norm weight and the output gate are
+     * read-only here and independent of the reduction, but on the plain form
+     * they are loaded -- and the gate's sigmoid evaluated -- only after the
+     * block barrier, and the compiler does not move global loads across
+     * __syncthreads, so their full memory latency plus an expf and a divide
+     * followed the reduction on every GDN layer.  Issued beside `raw`, the
+     * three loads overlap each other and the barrier.  Nothing this kernel
+     * stores precedes them (the only earlier store is to shared `partial`),
+     * so they read the bytes the late loads read; the product keeps its
+     * association raw * scale * weight * gate, so v is the same bits. */
+    const float nw = output_norm[tid];
+    const float sg = qwen4exp_gdn_sigmoid(output_gate[base + tid]);
+#endif
     float total = warp_sum_f32(raw * raw);
     if (lane == 0u) partial[warp] = total;
     __syncthreads();
     total = lane < 4u ? partial[lane] : 0.0f;
     total = warp_sum_all_f32(total);
     const float scale = rsqrtf(total / (float)QWEN4EXP_GDN_DIM + norm_eps);
+#if QWEN4EXP_GDN_OUTQ_EARLY_GATE
+    const float v = raw * scale * nw * sg;
+#else
     const float v = raw * scale * output_norm[tid] *
         qwen4exp_gdn_sigmoid(output_gate[base + tid]);
+#endif
     const float vz = qwen4exp_q8_ftz(v);
     float a = qwen4exp_q8_ftz(fabsf(v));
 #pragma unroll
