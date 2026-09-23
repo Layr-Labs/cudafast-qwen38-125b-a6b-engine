@@ -6694,6 +6694,9 @@ __device__ __forceinline__ static void qwen4exp_shared_vector_accumulate(
 #define QW_GU_COOP_ROW_U4 90u                /* 1440 B, ten q4_K super-blocks */
 #define QW_GU_COOP_GROUPS 80u                            /* in_dim 2560 / 32 */
 #define QW_GU_COOP_U4 (QW_GU_COOP_ROWS * QW_GU_COOP_ROW_U4)
+#ifndef DS4_GU_COOP_CPASYNC
+#define DS4_GU_COOP_CPASYNC 1
+#endif
 
 /* The eight payload words qw_raw_load's q4_K arm returns for (row, group),
  * read out of the staged copy of the identical row bytes.  A q4_K row is 90
@@ -7007,12 +7010,24 @@ qwen4exp_moe_gateup_split_kernel(
         const char *const ub = up +
             (uint64_t)expert * up_expert_bytes +
             (uint64_t)row0 * up_row_bytes;
+#if DS4_GU_COOP_CPASYNC
+        for (uint32_t i = threadIdx.x; i < words; i += blockDim.x) {
+            qw_cpasync16((uint32_t)__cvta_generic_to_shared(&wcoop[i]),
+                         (const void *)(gb + (uint64_t)i * 16u));
+            qw_cpasync16((uint32_t)__cvta_generic_to_shared(&wcoop[PanelU4 + i]),
+                         (const void *)(ub + (uint64_t)i * 16u));
+        }
+        qw_cpasync_commit();
+        qw_cpasync_wait0();
+        __syncthreads();
+#else
         for (uint32_t i = threadIdx.x; i < words; i += blockDim.x) {
             wcoop[i] = *(const uint4 *)(const void *)(gb + (uint64_t)i * 16u);
             wcoop[PanelU4 + i] =
                 *(const uint4 *)(const void *)(ub + (uint64_t)i * 16u);
         }
         __syncthreads();
+#endif
         wsh = wcoop + (second ? PanelU4 : 0u);
         wrow = warp >> 1u;
     }
