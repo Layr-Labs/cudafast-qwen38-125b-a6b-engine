@@ -276,7 +276,7 @@ def main() -> int:
     observed_providers = set()
     total = min(args.count, len(prompts))
     print(f"model={args.model} endpoint={args.endpoint}", file=sys.stderr)
-    print(f"key_env={api_key_env} token_field={token_limit_field} thinking={thinking} reasoning={reasoning_effort}",
+    print(f"token_field={token_limit_field} thinking={thinking} reasoning={reasoning_effort}",
           file=sys.stderr)
     if provider_order or provider_require_parameters:
         print(f"provider_order={','.join(provider_order) or '-'} "
