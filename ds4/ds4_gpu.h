@@ -662,6 +662,37 @@ int ds4_gpu_qwen4exp_qsa_indexer_pool_update_dpos_tensor(
         float                 weight_offset,
         const ds4_gpu_tensor *d_pos);
 
+/* The indexer key projection (BF16 matvec of `mixed` into idx_k) and the pool
+ * update above, issued on the qwen4exp fork side stream behind an event on
+ * the decode stream (CUDA only, n_tokens <= 2).  1: issued, and the caller
+ * must call ds4_gpu_qwen4exp_qsa_indexer_join before anything reads or
+ * overwrites what they touch.  0: declined with nothing issued (valve
+ * DS4_QWEN4EXP_NO_IDX_FORK, no side stream, width); run the two calls in
+ * stream order.  -1: a launch failed after the side stream joined; the join
+ * still has to run.  The join is a no-op returning 1 when nothing is pending. */
+int ds4_gpu_qwen4exp_qsa_indexer_fork(
+        ds4_gpu_tensor       *idx_k,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              in_dim,
+        uint32_t              k_dim,
+        const ds4_gpu_tensor *mixed,
+        ds4_gpu_tensor       *pool,
+        ds4_gpu_tensor       *tape,
+        const ds4_gpu_tensor *k_norm_weight,
+        const ds4_gpu_tensor *inv_freq,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              cache_cap,
+        uint32_t              head_dim,
+        uint32_t              pool_size,
+        uint32_t              rot_dim,
+        float                 eps,
+        float                 k_norm_offset,
+        const ds4_gpu_tensor *d_pos);
+int ds4_gpu_qwen4exp_qsa_indexer_join(const ds4_gpu_tensor *idx_k);
+
 int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *q,
@@ -3052,6 +3083,24 @@ int ds4_gpu_qwen4exp_routed_moe_router_tensor(
         const ds4_gpu_tensor        *logits,
         ds4_gpu_tensor              *weights_rw);
 
+/* CUDA: record the shared-expert fork event right after the FFN mixer (before
+ * the router matmul) when the mixer's MoE input prequant already produced the
+ * quantized `x` the routed call below will consume, at n_tokens <= 2 only.
+ * Takes the routed call's own expert slabs and dims, which size its scratch.
+ * Returns 1 when armed, 0 when declined (the routed call then records the
+ * event itself, as before); a decline is not an error.
+ * DS4_QWEN4EXP_NO_EARLY_FORK always declines. */
+int ds4_gpu_qwen4exp_moe_fork_early(
+        const ds4_gpu_tensor        *x,
+        const ds4_gpu_qwen4exp_slab *gate,
+        const ds4_gpu_qwen4exp_slab *up,
+        const ds4_gpu_qwen4exp_slab *down,
+        uint32_t                     in_dim,
+        uint32_t                     mid_dim,
+        uint32_t                     n_total_expert,
+        uint32_t                     n_expert_used,
+        uint32_t                     n_tokens);
+
 int ds4_gpu_qwen4exp_shared_expert_tensor(
         ds4_gpu_tensor              *out,
         ds4_gpu_tensor              *mid,
@@ -4075,6 +4124,30 @@ int  ds4_gpu_qwen4exp_update_dpos(
 int  ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graphs_invalidate(void);
+
+/* The load-time A/B mask over six qwen4exp decode arms (CUDA only; defined in
+ * ds4_cuda_qwen4exp.cu, reached through ds4_qwen4exp_ab_set in ds4.h, which
+ * compiles it out on Metal, ROCm and CPU builds).  A set bit stands its arm
+ * down exactly as the named env valve does; 0 is the shipped behaviour.  The
+ * bit block is repeated token for token in ds4.h under the same guard, so a
+ * translation unit that includes both takes whichever it sees first. */
+#ifndef DS4_QWEN4EXP_AB_ALL
+#define DS4_QWEN4EXP_AB_ROUTER_NARROW 0x01u /* DS4_QWEN4EXP_NO_ROUTER_NARROW_BLOCK */
+#define DS4_QWEN4EXP_AB_GDN_PDL       0x02u /* DS4_QWEN4EXP_NO_GDN_PDL */
+#define DS4_QWEN4EXP_AB_TRIG_HCUP     0x04u /* DS4_QWEN4EXP_NO_EARLY_TRIG_HCUP */
+#define DS4_QWEN4EXP_AB_TRIG_GU       0x08u /* DS4_QWEN4EXP_NO_EARLY_TRIG_GU */
+#define DS4_QWEN4EXP_AB_EARLY_FORK    0x10u /* DS4_QWEN4EXP_NO_EARLY_FORK */
+#define DS4_QWEN4EXP_AB_IDX_FORK      0x20u /* DS4_QWEN4EXP_NO_IDX_FORK */
+#define DS4_QWEN4EXP_AB_TRIG_ROLL     0x40u /* DS4_QWEN4EXP_NO_EARLY_TRIG_ROLL */
+#define DS4_QWEN4EXP_AB_TRIG_DOWN     0x80u /* DS4_QWEN4EXP_NO_EARLY_TRIG_DOWN */
+#define DS4_QWEN4EXP_AB_TRIG_QSA      0x100u /* DS4_QWEN4EXP_NO_EARLY_TRIG_QSA */
+#define DS4_QWEN4EXP_AB_ALL           0x1ffu
+#endif
+/* Synchronize the device, set the mask, and retire every captured decode
+ * executable (ds4_gpu_decode_graphs_invalidate) so no graph outlives the mask
+ * it was captured under.  Between forwards only.  0 on success, -1 on refusal;
+ * a request for 0 always leaves the mask at 0. */
+int  ds4_gpu_qwen4exp_ab_set(uint32_t off_mask);
 
 /* =========================================================================
  * Qwen4exp Hyper-Connections, Norms, RoPE, Embedding and Head.

@@ -1793,11 +1793,11 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
     return true;
 }
 
-static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
-                                     const ds4_qwen4exp_layer_weights *l,
-                                     const ds4_model *m,
-                                     uint32_t il,
-                                     uint32_t n_tokens) {
+static bool qwen4exp_graph_qsa_block_encode(ds4_qwen4exp_session *s,
+                                            const ds4_qwen4exp_layer_weights *l,
+                                            const ds4_model *m,
+                                            uint32_t il,
+                                            uint32_t n_tokens) {
     const ds4_qwen4exp_config *cfg = &g_ds4_qwen4exp;
     const uint32_t head_dim = DS4_N_HEAD_DIM;
     const uint32_t q_width = DS4_N_HEAD * head_dim;
@@ -1806,6 +1806,7 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
     const uint32_t max_selected = DS4_QWEN4EXP_MAX_SELECTED(top_k, ratio);
     const uint32_t n_blocks = s->plan.n_ctx / ratio;
     const uint32_t pos0 = s->pos;
+    const bool indexed = (uint64_t)pos0 + n_tokens > DS4_N_INDEXER_TOP_K;
 
     /* Pre-quantize s->mixed ONCE for Q, K, and V projections. */
     const uint64_t q8_blocks = (uint64_t)DS4_N_EMBD / 32u;
@@ -1851,6 +1852,32 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
         fprintf(stderr, "ds4: qwen4exp QSA projections failed at block %u\n", il);
         return false;
     }
+
+    /* The indexer key maintenance (the idx_k projection and the pool update
+     * below) feeds only carried state while !indexed, so at the decode widths
+     * it forks onto the side stream here, behind the Q/K/V projection, and
+     * overlaps the prep and the attention; qwen4exp_graph_qsa_block joins it
+     * after the output projection.  It reads `mixed` (final here) and writes
+     * only idx_k, idx_tape[il] and idx_pool[il].  0 = declined, nothing
+     * issued (DS4_QWEN4EXP_NO_IDX_FORK among others): the two calls below run
+     * in stream order exactly as before. */
+    int idx_fork = 0;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (!indexed && n_tokens <= 2u) {
+        idx_fork = ds4_gpu_qwen4exp_qsa_indexer_fork(
+                s->idx_k, QW_MAP(m, l->indexer_k_proj),
+                QW_MAPSZ(m, l->indexer_k_proj), QW_OFF(l->indexer_k_proj),
+                DS4_N_EMBD, cfg->indexer_k_dim, s->mixed,
+                s->idx_pool[il], s->idx_tape[il], s->idx_k_norm[il],
+                s->inv_freq, pos0, n_tokens, s->plan.n_ctx,
+                DS4_N_INDEXER_HEAD_DIM, ratio, DS4_N_ROT, DS4_RMS_EPS,
+                l->indexer_k_norm_offset, s->d_pos);
+        if (idx_fork < 0) {
+            fprintf(stderr, "ds4: qwen4exp indexer fork failed at block %u\n", il);
+            return false;
+        }
+    }
+#endif
 
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (n_tokens<=2u) {
@@ -1902,10 +1929,10 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
      * projection feeds only the norm/rope/scores/select chain below, and that
      * chain runs only when `indexed`.  Below the budget its result was written
      * and never read, so it moves under the same condition.  This removes a
-     * computation whose output no reader observes; it does not change one. */
-    const bool indexed = (uint64_t)pos0 + n_tokens > DS4_N_INDEXER_TOP_K;
-
-    if (!ds4_qwen4exp_matmul_bf16(s->idx_k, QW_MAP(m, l->indexer_k_proj),
+     * computation whose output no reader observes; it does not change one.
+     * (`indexed` is computed at the top, for the fork.) */
+    if (!idx_fork &&
+        !ds4_qwen4exp_matmul_bf16(s->idx_k, QW_MAP(m, l->indexer_k_proj),
                                   QW_MAPSZ(m, l->indexer_k_proj),
                                   QW_OFF(l->indexer_k_proj),
                                   DS4_N_EMBD, cfg->indexer_k_dim,
@@ -1922,7 +1949,8 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
         fprintf(stderr, "ds4: qwen4exp indexer projections failed at block %u\n", il);
         return false;
     }
-    if (!ds4_gpu_qwen4exp_qsa_indexer_pool_update_dpos_tensor(
+    if (!idx_fork &&
+        !ds4_gpu_qwen4exp_qsa_indexer_pool_update_dpos_tensor(
             s->idx_pool[il], s->idx_tape[il], s->idx_k, s->idx_k_norm[il],
             s->inv_freq, pos0, n_tokens, s->plan.n_ctx,
             DS4_N_INDEXER_HEAD_DIM, ratio, DS4_N_ROT, DS4_RMS_EPS,
@@ -2012,6 +2040,27 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
         return false;
     }
     return true;
+}
+
+/* The QSA block, joined: when the encode above forked the indexer key
+ * maintenance, the decode stream waits for the side stream here -- after the
+ * output projection, before the attention inject (the next launch, and the
+ * first one outside the block) -- on the success path and on every error path
+ * alike, so no capture of this block ever ends with the side stream unjoined.
+ * Nothing pending (no fork taken, or DS4_QWEN4EXP_NO_IDX_FORK): a no-op. */
+static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
+                                     const ds4_qwen4exp_layer_weights *l,
+                                     const ds4_model *m,
+                                     uint32_t il,
+                                     uint32_t n_tokens) {
+    const bool ok = qwen4exp_graph_qsa_block_encode(s, l, m, il, n_tokens);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (!ds4_gpu_qwen4exp_qsa_indexer_join(s->idx_k)) {
+        fprintf(stderr, "ds4: qwen4exp indexer fork join failed at block %u\n", il);
+        return false;
+    }
+#endif
+    return ok;
 }
 
 /* Which head mapping has already been announced resident, so a per-session
@@ -2151,6 +2200,30 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
     const int moe_lane = qw_moe_in_head_block ? 1 : 0;
     uint64_t moe_mark = moe_timing ? qw_hb_now_ns() : 0;
 
+    /* Expert types vary per block and per artifact: UD-Q4_K_XL stores block 2
+     * gate/up at Q5_K and five blocks' down at Q8_0, the MQ recipes go further,
+     * and the MTP head is Q8_0 throughout.  There is no type check here: the
+     * loader binds these tensors from ds4_qwen4exp_moe_types.h and the kernels
+     * expand the same table, so a bound expert tensor is one the GEMM decodes.
+     *
+     * Every slab carries its own shard mapping, so a block whose expert
+     * tensors landed in different shards runs like any other: blocks 11 and 41
+     * of UD-Q4_K_XL do. */
+    const ds4_gpu_qwen4exp_slab gate_slab = QW_SLAB(m, l->ffn_gate_exps);
+    const ds4_gpu_qwen4exp_slab up_slab = QW_SLAB(m, l->ffn_up_exps);
+    const ds4_gpu_qwen4exp_slab down_slab = QW_SLAB(m, l->ffn_down_exps);
+    /* The shared-expert fork event, recorded here -- after the FFN mixer that
+     * already produced the quantized `mixed`, before the router -- when the
+     * backend can prove the routed call below will consume that exact prefix
+     * (n_tokens <= 2 only).  A decline is not a failure: the routed call then
+     * records it itself.  Host call order is unchanged. */
+    if (n_tokens <= 2u) {
+        (void)ds4_gpu_qwen4exp_moe_fork_early(
+                s->mixed, &gate_slab, &up_slab, &down_slab,
+                DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT, DS4_N_EXPERT_USED,
+                n_tokens);
+    }
+
     if (!ds4_qwen4exp_matmul_f32(s->moe_logits, QW_MAP(m, l->ffn_gate_inp),
                                    QW_MAPSZ(m, l->ffn_gate_inp),
                                    QW_OFF(l->ffn_gate_inp),
@@ -2175,18 +2248,7 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
     }
     QW_MOE_TICK(QW_MOE_T_SELECT);
 
-    /* Expert types vary per block and per artifact: UD-Q4_K_XL stores block 2
-     * gate/up at Q5_K and five blocks' down at Q8_0, the MQ recipes go further,
-     * and the MTP head is Q8_0 throughout.  There is no type check here: the
-     * loader binds these tensors from ds4_qwen4exp_moe_types.h and the kernels
-     * expand the same table, so a bound expert tensor is one the GEMM decodes.
-     *
-     * Every slab carries its own shard mapping, so a block whose expert
-     * tensors landed in different shards runs like any other: blocks 11 and 41
-     * of UD-Q4_K_XL do. */
-    const ds4_gpu_qwen4exp_slab gate_slab = QW_SLAB(m, l->ffn_gate_exps);
-    const ds4_gpu_qwen4exp_slab up_slab = QW_SLAB(m, l->ffn_up_exps);
-    const ds4_gpu_qwen4exp_slab down_slab = QW_SLAB(m, l->ffn_down_exps);
+    /* gate_slab / up_slab / down_slab: built above the router (early fork). */
     if (!ds4_gpu_qwen4exp_routed_moe_router_tensor(
             s->block_out, s->moe_mid, s->moe_down_partial,
             &gate_slab, &up_slab, &down_slab,
@@ -4787,3 +4849,16 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
 }
 
 #endif /* DS4_NO_GPU */
+
+/* The resident's load-time A/B self-profile (declared in ds4.h).  Every arm it
+ * toggles, and every graph cache it must retire, lives in the CUDA backend
+ * (ds4_gpu_qwen4exp_ab_set in ds4_cuda_qwen4exp.cu), so this forwards there on
+ * a CUDA build and is the documented no-op everywhere else, under the same
+ * guard the rest of this file's CUDA-only calls use. */
+int ds4_qwen4exp_ab_set(uint32_t off_mask) {
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    return ds4_gpu_qwen4exp_ab_set(off_mask);
+#else
+    return off_mask == 0u ? 0 : -1;
+#endif
+}

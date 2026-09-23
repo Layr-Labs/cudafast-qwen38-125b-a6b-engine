@@ -11,6 +11,7 @@
 struct ds4s_handle {
     ds4_engine *engine;
     ds4_session *session;
+    int mtp_draft_tokens;   /* as opened; ds4s_rewarm replays the warm-up with it */
     char err[512];
 };
 
@@ -25,6 +26,93 @@ static void set_err(ds4s_handle *h, const char *msg) {
 static void set_open_err(const char *msg) {
     snprintf(g_open_err, sizeof(g_open_err), "%s", msg ? msg : "unknown ds4 open failure");
     fprintf(stderr, "ds4_shim: %s\n", g_open_err);
+}
+
+/* THE SCORED-SHAPE WARM-UP (see "WARM THE SCORED SHAPES HERE" in ds4s_open),
+ * a function so the resident can run the very same sequence again after its
+ * load-time A/B self-profile has retired every captured graph
+ * (ds4s_rewarm).  The body is the block that sat inline in ds4s_open, moved
+ * unchanged. */
+static void shim_warm_scored_shapes(ds4s_handle *h, int mtp_draft_tokens) {
+    const int vocab = ds4s_vocab_size(h);
+    enum { WARM_PROMPT = 1024, WARM_ROUNDS = 16, WARM_CAP = 8,
+           WARM_ROUNDS_CHAIN = 4, WARM_PERIOD = 17,
+           WARM_STRIDE = 7919 };
+    if (vocab > 16) {
+        int32_t *ids = (int32_t *)malloc((size_t)WARM_PROMPT * sizeof(*ids));
+        if (ids) {
+            const int32_t span = (int32_t)(vocab - 8);
+            /* A SHORT REPEATING CYCLE, NOT A 248k-LONG RAMP.
+             *
+             * `1 + i % span` with span near the vocabulary size never
+             * repeats inside 1024 tokens, so the drafter has nothing to
+             * predict and the warm-up only ever walks the REJECTING
+             * trajectory.  The graph key folds the GDN replay parity
+             * (variant bit 16) and the parity moves only on a swap, whose
+             * condition depends on what the round accepted -- so the
+             * accepting side's identities were never captured here and
+             * were still being captured inside the timed decode.
+             *
+             * A period of WARM_PERIOD distinct ids is predictable, so the
+             * rounds accept.  It is still input-independent: a compile
+             * time constant and a fixed stride, reading no request. */
+            for (int i = 0; i < WARM_PROMPT; i++)
+                ids[i] = (int32_t)(1 + ((int64_t)(i % WARM_PERIOD) *
+                                        WARM_STRIDE) % span);
+            if (ds4s_sync(h, ids, (size_t)WARM_PROMPT) == 0) {
+                /* the 1-row teacher-forced shape */
+                (void)ds4s_eval(h, ids[WARM_PROMPT - 1]);
+                /* the speculative shapes: the 2-row verify and the head's
+                 * own island, which only a speculative cycle reaches */
+                if (mtp_draft_tokens >= 1) {
+                    int32_t out[WARM_CAP];
+                    int32_t t = ds4s_argmax(h);
+                    /* WALK BOTH PARITIES, AND WIDTH 1 AT EACH OF THEM.
+                     *
+                     * Following the chain with `t = out[n - 1]` every
+                     * round takes only the accepting branch, so the
+                     * rejecting branch's snapshot count and the other
+                     * parity were first seen inside the timed window.
+                     * Alternating follow and break walks both.  The
+                     * ds4s_eval after each round warms width 1 at
+                     * whatever parity that round left -- an eval cannot
+                     * move the parity itself, because a swap needs
+                     * width 2 and exactly one snapshot, so it samples the
+                     * parity rather than advancing it.
+                     *
+                     * A round that refuses ends the loop exactly as
+                     * before; nothing here is load bearing and the
+                     * invalidate below resets the session either way.
+                     *
+                     * ADDITIVE, NOT A REPLACEMENT.  The original four
+                     * CONSECUTIVE chain-following rounds run first and
+                     * unchanged, because consecutive spec rounds are the
+                     * only way to reach the `reuse` path
+                     * (reuse = active && PREVIOUS && recurrent == 1 &&
+                     * conv == 1), and that path is what the scored decode
+                     * takes on consecutive accepts.  Interleaving a 1-row
+                     * eval clears `previous`, so the second block alone
+                     * would never walk it. */
+                    for (int r = 0; r < WARM_ROUNDS_CHAIN; r++) {
+                        const int n = ds4s_eval_speculative(h, t, 2, out,
+                                                            WARM_CAP);
+                        if (n <= 0) break;
+                        t = out[n - 1];
+                    }
+                    for (int r = 0; r < WARM_ROUNDS; r++) {
+                        const int n = ds4s_eval_speculative(h, t, 2, out,
+                                                            WARM_CAP);
+                        if (n <= 0) break;
+                        (void)ds4s_eval(h, out[n - 1]);
+                        t = (r & 1) ? ds4s_argmax(h)
+                                    : ids[(r * 37 + 11) % WARM_PROMPT];
+                    }
+                }
+            }
+            free(ids);
+        }
+    }
+    ds4s_invalidate(h);
 }
 
 ds4s_handle *ds4s_open(const char *model_path, const char *mtp_head_path,
@@ -51,6 +139,7 @@ ds4s_handle *ds4s_open(const char *model_path, const char *mtp_head_path,
      * clamp here would make that refusal unreachable. */
     opt.mtp_draft_tokens = mtp_draft_tokens;
     opt.mtp_margin = 3.0f;
+    h->mtp_draft_tokens = mtp_draft_tokens;
     if (ds4_engine_open(&h->engine, &opt) != 0 || !h->engine) {
         char msg[512];
         snprintf(msg, sizeof(msg), "ds4_engine_open failed for %s", model_path);
@@ -144,87 +233,7 @@ ds4s_handle *ds4s_open(const char *model_path, const char *mtp_head_path,
      * regardless, so a warm-up that cannot run leaves exactly the tree that
      * shipped before it. DS4_SHIM_NO_WARMUP=1 stands it down in the same binary.
      */
-    if (getenv("DS4_SHIM_NO_WARMUP") == NULL) {
-        const int vocab = ds4s_vocab_size(h);
-        enum { WARM_PROMPT = 1024, WARM_ROUNDS = 16, WARM_CAP = 8,
-               WARM_ROUNDS_CHAIN = 4, WARM_PERIOD = 17,
-               WARM_STRIDE = 7919 };
-        if (vocab > 16) {
-            int32_t *ids = (int32_t *)malloc((size_t)WARM_PROMPT * sizeof(*ids));
-            if (ids) {
-                const int32_t span = (int32_t)(vocab - 8);
-                /* A SHORT REPEATING CYCLE, NOT A 248k-LONG RAMP.
-                 *
-                 * `1 + i % span` with span near the vocabulary size never
-                 * repeats inside 1024 tokens, so the drafter has nothing to
-                 * predict and the warm-up only ever walks the REJECTING
-                 * trajectory.  The graph key folds the GDN replay parity
-                 * (variant bit 16) and the parity moves only on a swap, whose
-                 * condition depends on what the round accepted -- so the
-                 * accepting side's identities were never captured here and
-                 * were still being captured inside the timed decode.
-                 *
-                 * A period of WARM_PERIOD distinct ids is predictable, so the
-                 * rounds accept.  It is still input-independent: a compile
-                 * time constant and a fixed stride, reading no request. */
-                for (int i = 0; i < WARM_PROMPT; i++)
-                    ids[i] = (int32_t)(1 + ((int64_t)(i % WARM_PERIOD) *
-                                            WARM_STRIDE) % span);
-                if (ds4s_sync(h, ids, (size_t)WARM_PROMPT) == 0) {
-                    /* the 1-row teacher-forced shape */
-                    (void)ds4s_eval(h, ids[WARM_PROMPT - 1]);
-                    /* the speculative shapes: the 2-row verify and the head's
-                     * own island, which only a speculative cycle reaches */
-                    if (mtp_draft_tokens >= 1) {
-                        int32_t out[WARM_CAP];
-                        int32_t t = ds4s_argmax(h);
-                        /* WALK BOTH PARITIES, AND WIDTH 1 AT EACH OF THEM.
-                         *
-                         * Following the chain with `t = out[n - 1]` every
-                         * round takes only the accepting branch, so the
-                         * rejecting branch's snapshot count and the other
-                         * parity were first seen inside the timed window.
-                         * Alternating follow and break walks both.  The
-                         * ds4s_eval after each round warms width 1 at
-                         * whatever parity that round left -- an eval cannot
-                         * move the parity itself, because a swap needs
-                         * width 2 and exactly one snapshot, so it samples the
-                         * parity rather than advancing it.
-                         *
-                         * A round that refuses ends the loop exactly as
-                         * before; nothing here is load bearing and the
-                         * invalidate below resets the session either way.
-                         *
-                         * ADDITIVE, NOT A REPLACEMENT.  The original four
-                         * CONSECUTIVE chain-following rounds run first and
-                         * unchanged, because consecutive spec rounds are the
-                         * only way to reach the `reuse` path
-                         * (reuse = active && PREVIOUS && recurrent == 1 &&
-                         * conv == 1), and that path is what the scored decode
-                         * takes on consecutive accepts.  Interleaving a 1-row
-                         * eval clears `previous`, so the second block alone
-                         * would never walk it. */
-                        for (int r = 0; r < WARM_ROUNDS_CHAIN; r++) {
-                            const int n = ds4s_eval_speculative(h, t, 2, out,
-                                                                WARM_CAP);
-                            if (n <= 0) break;
-                            t = out[n - 1];
-                        }
-                        for (int r = 0; r < WARM_ROUNDS; r++) {
-                            const int n = ds4s_eval_speculative(h, t, 2, out,
-                                                                WARM_CAP);
-                            if (n <= 0) break;
-                            (void)ds4s_eval(h, out[n - 1]);
-                            t = (r & 1) ? ds4s_argmax(h)
-                                        : ids[(r * 37 + 11) % WARM_PROMPT];
-                        }
-                    }
-                }
-                free(ids);
-            }
-        }
-        ds4s_invalidate(h);
-    }
+    if (getenv("DS4_SHIM_NO_WARMUP") == NULL) shim_warm_scored_shapes(h, mtp_draft_tokens);
     return h;
 }
 
@@ -246,6 +255,34 @@ const char *ds4s_last_error(const ds4s_handle *h) {
 const char *ds4s_hw_limits(void) {
     const char *s = ds4_gpu_hw_limits();
     return s ? s : "";
+}
+
+/* The shim's bits are the engine's (ds4.h); the resident sees only ds4_shim.h. */
+_Static_assert(DS4S_AB_ROUTER_NARROW == DS4_QWEN4EXP_AB_ROUTER_NARROW &&
+               DS4S_AB_GDN_PDL == DS4_QWEN4EXP_AB_GDN_PDL &&
+               DS4S_AB_TRIG_HCUP == DS4_QWEN4EXP_AB_TRIG_HCUP &&
+               DS4S_AB_TRIG_GU == DS4_QWEN4EXP_AB_TRIG_GU &&
+               DS4S_AB_EARLY_FORK == DS4_QWEN4EXP_AB_EARLY_FORK &&
+               DS4S_AB_IDX_FORK == DS4_QWEN4EXP_AB_IDX_FORK &&
+               DS4S_AB_TRIG_ROLL == DS4_QWEN4EXP_AB_TRIG_ROLL &&
+               DS4S_AB_TRIG_DOWN == DS4_QWEN4EXP_AB_TRIG_DOWN &&
+               DS4S_AB_TRIG_QSA == DS4_QWEN4EXP_AB_TRIG_QSA &&
+               DS4S_AB_ALL == DS4_QWEN4EXP_AB_ALL,
+               "ds4_shim.h DS4S_AB_* must match ds4.h DS4_QWEN4EXP_AB_*");
+
+int ds4s_ab_set(uint32_t off_mask) {
+    return ds4_qwen4exp_ab_set(off_mask);
+}
+
+int ds4s_rewarm(ds4s_handle *h) {
+    if (!h || !h->session) return -1;
+    /* From position 0, as at open: the warm-up's first sync must forward its
+     * whole prompt, not be read as a suffix of whatever the caller left. */
+    ds4s_invalidate(h);
+    if (getenv("DS4_SHIM_NO_WARMUP") == NULL) {
+        shim_warm_scored_shapes(h, h->mtp_draft_tokens);   /* ends invalidated */
+    }
+    return 0;
 }
 
 int ds4s_vocab_size(const ds4s_handle *h) {

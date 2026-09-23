@@ -55,6 +55,34 @@ const char *ds4s_last_error(const ds4s_handle *h);
  * metrics, where a box with no profiler can still read them. */
 const char *ds4s_hw_limits(void);
 
+/* The resident's load-time A/B self-profile (ds4_qwen4exp_ab_set in ds4.h).
+ * A set bit stands one qwen4exp decode arm down exactly as its env valve does;
+ * 0 is the shipped behaviour and the default.  Every call synchronizes the
+ * device and retires every captured decode graph.  Called only before the
+ * resident binds its socket, and always left at 0.  CUDA builds only: on any
+ * other build a non-zero mask returns -1 and 0 is a no-op.
+ * Returns 0 on success, -1 on refusal. */
+#define DS4S_AB_ROUTER_NARROW 0x01u /* DS4_QWEN4EXP_NO_ROUTER_NARROW_BLOCK */
+#define DS4S_AB_GDN_PDL       0x02u /* DS4_QWEN4EXP_NO_GDN_PDL */
+#define DS4S_AB_TRIG_HCUP     0x04u /* DS4_QWEN4EXP_NO_EARLY_TRIG_HCUP */
+#define DS4S_AB_TRIG_GU       0x08u /* DS4_QWEN4EXP_NO_EARLY_TRIG_GU */
+#define DS4S_AB_EARLY_FORK    0x10u /* DS4_QWEN4EXP_NO_EARLY_FORK */
+#define DS4S_AB_IDX_FORK      0x20u /* DS4_QWEN4EXP_NO_IDX_FORK */
+#define DS4S_AB_TRIG_ROLL     0x40u /* DS4_QWEN4EXP_NO_EARLY_TRIG_ROLL */
+#define DS4S_AB_TRIG_DOWN     0x80u /* DS4_QWEN4EXP_NO_EARLY_TRIG_DOWN */
+#define DS4S_AB_TRIG_QSA      0x100u /* DS4_QWEN4EXP_NO_EARLY_TRIG_QSA */
+#define DS4S_AB_ALL           0x1ffu
+int ds4s_ab_set(uint32_t off_mask);
+
+/* Run the open-time scored-shape warm-up again from a reset session (the same
+ * synthetic sequence ds4s_open runs, then ds4s_invalidate), so the decode graph
+ * cache a phase
+ * finds is the one a plain open leaves.  The resident calls it after the A/B
+ * self-profile, whose mask switches retire every captured graph.  Honors
+ * DS4_SHIM_NO_WARMUP exactly as the open does (then it only invalidates).
+ * Returns 0, or -1 for a NULL handle. */
+int ds4s_rewarm(ds4s_handle *h);
+
 /* Vocabulary size of the loaded model. */
 int ds4s_vocab_size(const ds4s_handle *h);
 

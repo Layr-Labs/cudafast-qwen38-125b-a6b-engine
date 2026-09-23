@@ -77,6 +77,9 @@
  *   DS4_RESIDENT_PHASE_TIMEOUT_S idle ceiling on one connection (default 1800)
  *   DS4_RESIDENT_NO_SPEC_RUN     1 = do not offer spec_run, so clients drive one
  *                                speculative cycle per request (A/B valve)
+ *   DS4_RESIDENT_NO_AB           1 = skip the load-time A/B self-profile
+ *                                (self_profile_ab below); the identity is then
+ *                                exactly what it was without it
  */
 #include "ds4_shim.h"
 
@@ -92,6 +95,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 #define RESIDENT_MAX_TOP_K 64
@@ -526,6 +530,261 @@ static void serve_connection(const resident *r, int fd, int timeout_s) {
     free(in.data);
 }
 
+/* --- load-time A/B self-profile ------------------------------------------- */
+
+/* WHY.  The ranked box runs no profiler and the resident's stderr never
+ * reaches the run log; the one channel out is the identity this process
+ * publishes, which benchd seals as engine_backend.  So, once, after the one
+ * load and BEFORE the socket binds, time the scored decode path with each of
+ * six decode arms stood down in turn and append the per-round means to the
+ * identity: an A/B of every arm on the ranked hardware, in one process, from
+ * one binary.
+ *
+ * WHY NO PHASE CAN SEE IT.  (1) It runs before bind(), so no client can
+ * connect while it runs.  (2) It ends with ds4s_ab_set(0) -- the engine's arm
+ * mask back at the shipped value, and 0 always lands -- then ds4s_rewarm, the
+ * shim's own open-time warm-up replayed from an empty graph cache, then
+ * ds4s_invalidate.  (3) Every phase starts with ds4s_invalidate anyway
+ * (serve_connection).  (4) Every mask switch retires every captured decode
+ * graph, so no executable captured under a stood-down arm survives.
+ *
+ * Optional entries: the CI stub engine (tools/ds4/resident-stub-engine.c) has
+ * neither, and a resident linked against it must still link and serve -- it
+ * then skips the profile and publishes the identity it always did.  On ELF
+ * (CI, the box, where they come from libds4qwen.so) they are weak references,
+ * which link as NULL when nothing defines them.  Mach-O's static linker
+ * refuses an undefined weak reference, and tools/test-ds4-resident.sh and
+ * tools/three-flows-dry-run.sh build this file over the stub on a macOS
+ * laptop, so there they are looked up at run time instead and this file never
+ * names them to the linker. */
+typedef int (*ab_set_fn)(uint32_t off_mask);
+typedef int (*ab_rewarm_fn)(ds4s_handle *h);
+static ab_set_fn g_ab_set;
+static ab_rewarm_fn g_ab_rewarm;
+#if defined(__APPLE__)
+#include <dlfcn.h>
+static void ab_resolve(void) {
+    void *p = dlsym(RTLD_DEFAULT, "ds4s_ab_set");
+    memcpy(&g_ab_set, &p, sizeof(p));
+    p = dlsym(RTLD_DEFAULT, "ds4s_rewarm");
+    memcpy(&g_ab_rewarm, &p, sizeof(p));
+}
+#else
+#pragma weak ds4s_ab_set
+#pragma weak ds4s_rewarm
+static void ab_resolve(void) {
+    g_ab_set = ds4s_ab_set;
+    g_ab_rewarm = ds4s_rewarm;
+}
+#endif
+
+static double mono_s(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+/* One decode step the way a phase's spec_run takes it: a speculative cycle fed
+ * the pending token, whose frontier argmax is the next pending token.  Writes
+ * the committed tokens to out[0..n) and returns n, or -1 on failure. */
+static int ab_step(ds4s_handle *h, int32_t *pending, int32_t *out) {
+    const int n = ds4s_eval_speculative(h, *pending, RESIDENT_MAX_RUN, out, RESIDENT_MAX_SPEC);
+    if (n <= 0 || out[0] != *pending) return -1;
+    *pending = ds4s_argmax(h);
+    return n;
+}
+
+enum {
+    AB_PROMPT = 256,  /* synthetic prompt rows (one prefill per run) */
+    AB_WARM = 6,      /* rounds per run that re-warm and recapture the graphs
+                       * (both GDN replay parities and the head graphs need
+                       * two visits each before they replay, so captures stay
+                       * out of the timed window) */
+    AB_TIMED = 16,    /* timed rounds per run */
+    AB_CFGS = 6,      /* C0 all on, C1 all off, C2..C5 leave-one-group-out */
+    AB_PASSES = 2,    /* C0..C5, then C5..C0: linear drift cancels */
+    AB_RUNS = AB_CFGS * AB_PASSES,
+};
+
+/* C0 = every arm on (the scored path), C1 = every arm off, C2..C5 = one arm
+ * group off each: the GDN replay PDL chain, every early-trigger edge class
+ * (HC up, routed gate/up, roll projection, routed down, QSA split chain), the
+ * early shared-expert fork, and the QSA indexer fork.  The key names the
+ * group stood down.  The narrow router launch is only in C1 (it measured
+ * neutral on its own in PR #5307) to keep the load-time GPU work short. */
+#define DS4S_AB_TRIG_GROUP (DS4S_AB_TRIG_HCUP | DS4S_AB_TRIG_GU | \
+                            DS4S_AB_TRIG_ROLL | DS4S_AB_TRIG_DOWN | \
+                            DS4S_AB_TRIG_QSA)
+static const uint32_t ab_mask[AB_CFGS] = {
+    0u,
+    DS4S_AB_ALL,
+    DS4S_AB_GDN_PDL,
+    DS4S_AB_TRIG_GROUP,
+    DS4S_AB_EARLY_FORK,
+    DS4S_AB_IDX_FORK,
+};
+static const char *const ab_key[AB_CFGS] = {
+    "on", "off", "-gdn", "-trig", "-efk", "-idx",
+};
+
+typedef struct {
+    int cfg;
+    int pass;
+    double ms_per_round;
+    int committed;
+    uint64_t hash;
+    double wall_s;
+} ab_run;
+
+/* 64-bit FNV-1a over the committed ids, four little-endian bytes each. */
+static uint64_t fnv1a_tokens(uint64_t hash, const int32_t *ids, int n) {
+    for (int i = 0; i < n; i++) {
+        const uint32_t v = (uint32_t)ids[i];
+        for (int b = 0; b < 4; b++) {
+            hash ^= (uint64_t)((v >> (8 * b)) & 0xffu);
+            hash *= 1099511628211ull;
+        }
+    }
+    return hash;
+}
+
+/* One run: mask, full reset, the prompt, AB_WARM untimed rounds (the first
+ * rounds after a mask switch warm and capture the decode graphs afresh), then
+ * AB_TIMED timed rounds.  Returns NULL on success or the failing stage. */
+static const char *ab_one_run(ds4s_handle *h, const int32_t *prompt, uint32_t mask,
+                              ab_run *run) {
+    const double w0 = mono_s();
+    if (g_ab_set(mask) != 0) return "set";
+    ds4s_invalidate(h);
+    if (ds4s_sync(h, prompt, AB_PROMPT) != 0) return "sync";
+    int32_t pending = ds4s_argmax(h);
+    int32_t out[RESIDENT_MAX_SPEC];
+    for (int i = 0; i < AB_WARM; i++)
+        if (ab_step(h, &pending, out) < 0) return "warm";
+    uint64_t hash = 14695981039346656037ull;
+    int committed = 0;
+    const double t0 = mono_s();
+    for (int i = 0; i < AB_TIMED; i++) {
+        const int n = ab_step(h, &pending, out);
+        if (n < 0) return "timed";
+        committed += n;
+        hash = fnv1a_tokens(hash, out, n);
+    }
+    const double t1 = mono_s();
+    run->ms_per_round = (t1 - t0) * 1e3 / AB_TIMED;
+    run->committed = committed;
+    run->hash = hash;
+    run->wall_s = t1 - w0;
+    return NULL;
+}
+
+static const char *self_profile_ab_run(ds4s_handle *h, ab_run *runs, int *n_runs) {
+    static int32_t prompt[AB_PROMPT];
+    const int vocab = ds4s_vocab_size(h);
+    if (vocab < 8192) return "vocab";
+    /* #5300's fixed pseudo-random prompt of ordinary token ids (xorshift32
+     * from the same seed), 512 rows: the decode it leads to routes experts
+     * like any other text, and the timing needs no tokenizer. */
+    uint32_t x = 0x9e3779b9u;
+    for (int i = 0; i < AB_PROMPT; i++) {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        prompt[i] = (int32_t)(1000u + x % (uint32_t)(vocab / 2));
+    }
+    *n_runs = 0;
+    for (int pass = 0; pass < AB_PASSES; pass++) {
+        for (int k = 0; k < AB_CFGS; k++) {
+            const int cfg = (pass & 1) ? AB_CFGS - 1 - k : k;
+            ab_run *run = &runs[*n_runs];
+            memset(run, 0, sizeof(*run));
+            run->cfg = cfg;
+            run->pass = pass;
+            const char *stage = ab_one_run(h, prompt, ab_mask[cfg], run);
+            if (stage) return stage;
+            (*n_runs)++;
+        }
+    }
+    return NULL;
+}
+
+/* Run once after the load and before the socket binds; see the block comment
+ * above.  Writes "ab[...]" (or "ab[fail:<stage>]") to out, or leaves it empty
+ * when the profile does not apply: no MTP head (draft_tokens < 2), an engine
+ * without the entries (the CI stub), or DS4_RESIDENT_NO_AB=1. */
+static void self_profile_ab(ds4s_handle *h, int draft_tokens, char *out, size_t cap) {
+    out[0] = '\0';
+    ab_resolve();
+    if (draft_tokens < 2 || !g_ab_set || !g_ab_rewarm) return;
+    if (env_int("DS4_RESIDENT_NO_AB", 0) != 0) {
+        log_line("A/B self-profile skipped (DS4_RESIDENT_NO_AB)");
+        return;
+    }
+    const double t0 = mono_s();
+    ab_run runs[AB_RUNS];
+    int n_runs = 0;
+    const char *stage = self_profile_ab_run(h, runs, &n_runs);
+    const double t_prof = mono_s() - t0;
+
+    /* ALWAYS, success or not: the shipped arms, a warm cache, a clean session. */
+    const int restore_rc = g_ab_set(0);
+    const double t1 = mono_s();
+    const int rewarm_rc = g_ab_rewarm(h);
+    ds4s_invalidate(h);
+    const double t_rewarm = mono_s() - t1;
+    if (!stage && restore_rc != 0) stage = "restore";
+    if (!stage && rewarm_rc != 0) stage = "rewarm";
+
+    log_line("A/B self-profile: %d run(s), prompt %d, warm %d, timed %d rounds per run",
+             n_runs, (int)AB_PROMPT, (int)AB_WARM, (int)AB_TIMED);
+    log_line("  run pass cfg   mask  ms/round committed hash             wall_s");
+    for (int i = 0; i < n_runs; i++) {
+        const ab_run *r = &runs[i];
+        log_line("  %3d %4d %-5s 0x%02x %9.3f %9d %016" PRIx64 " %6.2f", i, r->pass,
+                 ab_key[r->cfg], (unsigned)ab_mask[r->cfg], r->ms_per_round, r->committed,
+                 r->hash, r->wall_s);
+    }
+    log_line("A/B self-profile wall: %.1f s profile + %.1f s restore/rewarm = %.1f s%s%s",
+             t_prof, t_rewarm, t_prof + t_rewarm, stage ? "; FAILED at " : "",
+             stage ? stage : "");
+
+    if (stage) {
+        snprintf(out, cap, "ab[fail:%s]", stage);
+        return;
+    }
+
+    double sum[AB_CFGS] = {0};
+    double pass_ms[AB_CFGS][AB_PASSES] = {{0}};
+    int same = 1;
+    long total_committed = 0;
+    for (int i = 0; i < n_runs; i++) {
+        sum[runs[i].cfg] += runs[i].ms_per_round;
+        pass_ms[runs[i].cfg][runs[i].pass] = runs[i].ms_per_round;
+        total_committed += runs[i].committed;
+        if (runs[i].hash != runs[0].hash) same = 0;
+    }
+    /* nz: the largest pass-to-pass difference of any one config -- the noise
+     * floor a difference between two configs has to clear. */
+    double nz = 0.0;
+    for (int c = 0; c < AB_CFGS; c++) {
+        const double d = pass_ms[c][0] - pass_ms[c][1];
+        if (d > nz) nz = d;
+        if (-d > nz) nz = -d;
+    }
+    size_t len = 0;
+    int w = snprintf(out, cap, "ab[n=%d r=%d", (int)AB_PROMPT, (int)AB_TIMED);
+    for (int c = 0; w >= 0 && (size_t)w < cap - len && c < AB_CFGS; c++) {
+        len += (size_t)w;
+        w = snprintf(out + len, cap - len, " %s=%.3f", ab_key[c], sum[c] / AB_PASSES);
+    }
+    if (w >= 0 && (size_t)w < cap - len) {
+        len += (size_t)w;
+        w = snprintf(out + len, cap - len, " same=%d t/rd=%.2f nz=%.3f]", same,
+                     (double)total_committed / ((double)n_runs * AB_TIMED), nz);
+    }
+    if (w < 0 || (size_t)w >= cap - len) snprintf(out, cap, "ab[fail:format]");
+}
+
 /* --- main ----------------------------------------------------------------- */
 
 static void unlink_socket(void) {
@@ -598,6 +857,19 @@ int main(void) {
         const int n = snprintf(ident_buf, sizeof(ident_buf), "%s %s", ident, limits);
         if (n > 0 && (size_t)n < sizeof(ident_buf)) ident = ident_buf;
         log_line("device limits: %s", limits);
+    }
+
+    /* The load-time A/B self-profile (self_profile_ab), appended AFTER the
+     * pieces above, which stay exactly as they were.  Still before bind(), so
+     * no phase can see it; the session and the engine's arm mask are back at
+     * the shipped state when it returns.  Empty when it does not apply. */
+    char ab[640];
+    self_profile_ab(h, draft_tokens, ab, sizeof(ab));
+    char ident_ab_buf[sizeof(ident_buf) + sizeof(ab) + 1];
+    if (ab[0]) {
+        const int n = snprintf(ident_ab_buf, sizeof(ident_ab_buf), "%s %s", ident, ab);
+        if (n > 0 && (size_t)n < sizeof(ident_ab_buf)) ident = ident_ab_buf;
+        log_line("A/B self-profile: %s", ab);
     }
 
     /* Bind only after the load, so a connect that succeeds means the weights
