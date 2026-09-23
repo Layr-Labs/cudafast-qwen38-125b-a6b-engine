@@ -18287,6 +18287,9 @@ static void cuda_q8_mma_pipe_prepare(void) {
     (void)cuda_q8_mma_pipe_attr<2, 2, 4, 4, 4, 2>();
     (void)cuda_q8_mma_pipe_attr<2, 4, 4, 4, 4, 2>();
     (void)cuda_q8_mma_pipe_attr<2, 8, 4, 4, 4, 2>();
+    (void)cuda_q8_mma_pipe_attr<2, 2, 4, 4, 4, 2, true>();
+    (void)cuda_q8_mma_pipe_attr<2, 4, 4, 4, 4, 2, true>();
+    (void)cuda_q8_mma_pipe_attr<2, 8, 4, 4, 4, 2, true>();
     (void)cuda_q8_mma_pipe_attr<2, 2, 4, 4, 4, 2, false, true>();
     (void)cuda_q8_mma_pipe_attr<2, 4, 4, 4, 4, 2, false, true>();
     (void)cuda_q8_mma_pipe_attr<2, 8, 4, 4, 4, 2, false, true>();
@@ -38543,3 +38546,5 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
 #include "ds4_deepseek4_vision_gpu.cuh"
 
 #include "ds4_cuda_mtp_native.cuh"
+#define GAUNTLET_REDRAW_6813fdb6_20260922T232807Z 1
+#define GAUNTLET_REDRAW_eb8cd793_20260923T005836Z 1
