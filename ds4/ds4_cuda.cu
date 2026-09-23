@@ -6671,6 +6671,12 @@ template<int R>
 __global__ static void matmul_q8_hc_warp_pair_stage_kernel(
         float *out, const unsigned char *w,
         const int8_t *xq, const float *xs, uint64_t out_dim, uint32_t rows) {
+    /* Early trigger (DS4_QWEN4EXP_NO_EARLY_TRIG_HCUP): the multi-wave grid
+     * may trigger at its top (ds4_cuda_qwen4exp.cuh), so the HC dual behind
+     * it comes up during the last wave and parks at its fence.  Row-gated to
+     * the verify/head widths; a trigger with no programmatic dependent (the
+     * valve, or a plain successor) is a no-op. */
+    if (rows <= 2u) QWEN4EXP_PDL_TRIGGER();
     __shared__ __align__(16) unsigned char sw[4 * 340];
     const unsigned lane = threadIdx.x & 31u;
     const unsigned group = lane >> 1u, half = lane & 1u;
@@ -32539,6 +32545,51 @@ extern "C" int ds4_gpu_glm53_matmul_bf16(
             out->ptr, CUDA_R_32F, (int)out_dim,
             CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
     return cublas_ok(status, "GLM-5.3 BF16 matmul");
+}
+
+/* ds4_gpu_glm53_matmul_bf16's per-row matvec arm on an explicit stream, for
+ * the qwen4exp QSA indexer fork (ds4_cuda_qwen4exp.cu).  The same validation,
+ * the same weight resolution, the same kernel and the same grid; only the
+ * stream is the caller's, and the launch is always PLAIN -- on the fork's side
+ * stream the predecessor is the event the side stream waited on, so the
+ * kernel's fence is the no-op it is in every other plain launch.  Kept in this
+ * unit so the kernel keeps this unit's compile flags.  Refuses (0, nothing
+ * launched) above eight rows, where the entry above would take cuBLAS. */
+int ds4_cuda_qwen4exp_bf16_matvec_on(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows,
+        cudaStream_t          stream) {
+    if (!out || !x || !model_map || !g_cublas_ready || in_dim == 0u ||
+        out_dim == 0u || n_rows == 0u || n_rows > 8u ||
+        (uint64_t)out_dim > UINT64_MAX / in_dim ||
+        weight_offset > model_size) {
+        return 0;
+    }
+    const uint64_t weight_elements = (uint64_t)out_dim * in_dim;
+    const uint64_t weight_bytes = weight_elements * sizeof(uint16_t);
+    const uint64_t input_elements = (uint64_t)n_rows * in_dim;
+    const uint64_t output_elements = (uint64_t)n_rows * out_dim;
+    if (weight_bytes > model_size - weight_offset ||
+        x->bytes < input_elements * sizeof(float) ||
+        out->bytes < output_elements * sizeof(float)) {
+        return 0;
+    }
+    const int logical_tier = ds4_tensor_device_idx(out);
+    const char *weights = cuda_resolve_weight_ptr(
+            model_map, weight_offset, weight_bytes, logical_tier,
+            "GLM-5.3 BF16 matrix");
+    if (!weights) return 0;
+    const dim3 grid((out_dim + 7u) / 8u, n_rows, 1u);
+    glm53_matvec_bf16_f32_kernel<<<grid, 256u, 0, stream>>>(
+            (float *)out->ptr, (const uint16_t *)weights,
+            (const float *)x->ptr, in_dim, out_dim);
+    return cuda_ok(cudaGetLastError(), "GLM-5.3 BF16/F32 matvec launch");
 }
 
 enum {

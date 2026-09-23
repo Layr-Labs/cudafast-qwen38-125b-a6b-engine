@@ -662,6 +662,37 @@ int ds4_gpu_qwen4exp_qsa_indexer_pool_update_dpos_tensor(
         float                 weight_offset,
         const ds4_gpu_tensor *d_pos);
 
+/* The indexer key projection (BF16 matvec of `mixed` into idx_k) and the pool
+ * update above, issued on the qwen4exp fork side stream behind an event on
+ * the decode stream (CUDA only, n_tokens <= 2).  1: issued, and the caller
+ * must call ds4_gpu_qwen4exp_qsa_indexer_join before anything reads or
+ * overwrites what they touch.  0: declined with nothing issued (valve
+ * DS4_QWEN4EXP_NO_IDX_FORK, no side stream, width); run the two calls in
+ * stream order.  -1: a launch failed after the side stream joined; the join
+ * still has to run.  The join is a no-op returning 1 when nothing is pending. */
+int ds4_gpu_qwen4exp_qsa_indexer_fork(
+        ds4_gpu_tensor       *idx_k,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              in_dim,
+        uint32_t              k_dim,
+        const ds4_gpu_tensor *mixed,
+        ds4_gpu_tensor       *pool,
+        ds4_gpu_tensor       *tape,
+        const ds4_gpu_tensor *k_norm_weight,
+        const ds4_gpu_tensor *inv_freq,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              cache_cap,
+        uint32_t              head_dim,
+        uint32_t              pool_size,
+        uint32_t              rot_dim,
+        float                 eps,
+        float                 k_norm_offset,
+        const ds4_gpu_tensor *d_pos);
+int ds4_gpu_qwen4exp_qsa_indexer_join(const ds4_gpu_tensor *idx_k);
+
 int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *q,
@@ -3051,6 +3082,24 @@ int ds4_gpu_qwen4exp_routed_moe_router_tensor(
         uint32_t                     mid_token_stride,
         const ds4_gpu_tensor        *logits,
         ds4_gpu_tensor              *weights_rw);
+
+/* CUDA: record the shared-expert fork event right after the FFN mixer (before
+ * the router matmul) when the mixer's MoE input prequant already produced the
+ * quantized `x` the routed call below will consume, at n_tokens <= 2 only.
+ * Takes the routed call's own expert slabs and dims, which size its scratch.
+ * Returns 1 when armed, 0 when declined (the routed call then records the
+ * event itself, as before); a decline is not an error.
+ * DS4_QWEN4EXP_NO_EARLY_FORK always declines. */
+int ds4_gpu_qwen4exp_moe_fork_early(
+        const ds4_gpu_tensor        *x,
+        const ds4_gpu_qwen4exp_slab *gate,
+        const ds4_gpu_qwen4exp_slab *up,
+        const ds4_gpu_qwen4exp_slab *down,
+        uint32_t                     in_dim,
+        uint32_t                     mid_dim,
+        uint32_t                     n_total_expert,
+        uint32_t                     n_expert_used,
+        uint32_t                     n_tokens);
 
 int ds4_gpu_qwen4exp_shared_expert_tensor(
         ds4_gpu_tensor              *out,
