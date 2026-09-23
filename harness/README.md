@@ -42,3 +42,11 @@ GPU drive is box-validated by `tools/ds4/mtp-exactness-gate.py`.
 
 
 Infrastructure retry marker: 2026-09-23T10:38Z.
+
+<!-- terrapinelf controlled remeasurement 2026-09-23T18:31Z -->
+
+<!-- terrapinelf controlled remeasurement retry 2026-09-23T18:34Z -->
+
+<!-- terrapinelf controlled remeasurement retry2 2026-09-23T18:36Z -->
+
+<!-- terrapinelf controlled promoted-source redraw 2 2026-09-23T19:15Z -->
