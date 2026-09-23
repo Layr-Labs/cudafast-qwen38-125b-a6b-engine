@@ -4731,6 +4731,90 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
     const uint32_t lane = e & 31u;
     const uint32_t warp = e >> 5u;
 
+    /* For native decode and verify widths the fused router emits at most 32
+     * pairs. Sort those pairs by (expert, original pair index) in one warp,
+     * preserving the stable scatter order while avoiding the 512-thread
+     * expert scans and prefix scans. Wider and non-native calls retain the
+     * shipped path below. */
+    if constexpr (Native) {
+        if (n_pairs <= 32u) {
+            if (e < n_expert) counts[e] = 0;
+            __syncthreads();
+
+            if (warp == 0u) {
+                uint32_t key = 0xffffffffu;
+                if (lane < n_pairs) {
+                    const int32_t expert = selected[lane];
+                    if (expert >= 0 && (uint32_t)expert < n_expert)
+                        key = ((uint32_t)expert << 5u) | lane;
+                }
+#pragma unroll
+                for (uint32_t width = 2u; width <= 16u; width <<= 1u) {
+#pragma unroll
+                    for (uint32_t stride = width >> 1u; stride > 0u;
+                         stride >>= 1u) {
+                        const uint32_t other =
+                            __shfl_xor_sync(0xffffffffu, key, stride);
+                        const bool ascending = (lane & width) == 0u;
+                        const bool lower_lane = (lane & stride) == 0u;
+                        key = ascending == lower_lane
+                            ? min(key, other) : max(key, other);
+                    }
+                }
+                if (n_pairs > 16u) {
+#pragma unroll
+                    for (uint32_t stride = 16u; stride > 0u; stride >>= 1u) {
+                        const uint32_t other =
+                            __shfl_xor_sync(0xffffffffu, key, stride);
+                        const bool lower_lane = (lane & stride) == 0u;
+                        key = lower_lane ? min(key, other) : max(key, other);
+                    }
+                }
+
+                const bool valid = key != 0xffffffffu;
+                const uint32_t valid_mask = __ballot_sync(0xffffffffu, valid);
+                const uint32_t expert = key >> 5u;
+                const uint32_t previous =
+                    __shfl_up_sync(0xffffffffu, expert, 1u);
+                const bool begins = valid &&
+                    (lane == 0u || expert != previous);
+                const uint32_t begin_mask =
+                    __ballot_sync(0xffffffffu, begins);
+
+                if (valid) pairs[lane] = (int32_t)(key & 31u);
+                if (lane == 0u) active[0] = (int32_t)__popc(begin_mask);
+                if (begins) {
+                    uint32_t later = 0u;
+                    if (lane < 31u)
+                        later = begin_mask & ~((1u << (lane + 1u)) - 1u);
+                    const uint32_t end = later
+                        ? (uint32_t)__ffs((int)later) - 1u
+                        : (uint32_t)__popc(valid_mask);
+                    const uint32_t rank =
+                        __popc(begin_mask & ((1u << lane) - 1u));
+                    active[1u + rank] = (int32_t)expert;
+                    counts[expert] = (int32_t)(end - lane);
+                    offsets[expert] = (int32_t)lane;
+                    cursor[expert] = (int32_t)end;
+                }
+            }
+
+            /* Preserve the helper's defensive invalid-id zeroing semantics. */
+            if (e < n_pairs) {
+                const int32_t expert = selected[e];
+                if (expert < 0 || (uint32_t)expert >= n_expert) {
+                    const uint32_t token = e / n_expert_used;
+                    const uint32_t slot = e - token * n_expert_used;
+                    float *dst = mid + (uint64_t)token * mid_token_stride +
+                                 (uint64_t)slot * mid_dim;
+                    for (uint32_t row = 0; row < mid_dim; row++)
+                        dst[row] = 0.0f;
+                }
+            }
+            return;
+        }
+    }
+
     int32_t count = 0;
     if (e < n_expert) {
         for (uint32_t p = 0; p < n_pairs; p++) {
