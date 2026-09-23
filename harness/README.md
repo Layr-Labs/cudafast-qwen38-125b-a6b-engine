@@ -42,3 +42,5 @@ GPU drive is box-validated by `tools/ds4/mtp-exactness-gate.py`.
 
 
 Infrastructure retry marker: 2026-09-23T10:38Z.
+<!-- promoted frontier independent redraw archive marker -->
+<!-- promoted frontier second independent redraw archive marker -->
