@@ -6437,6 +6437,137 @@ __global__ static void __launch_bounds__(256, 2) matmul_q8_0_preq_pair_lanes_rol
     }
 }
 
+/* Dense-panel arm for the 6144 -> 2560 output projection shared by the GDN
+ * and QSA blocks.  The shipped pair-lanes kernel has four independent output
+ * rows per block.  Each row's two warps issue narrow, unaligned loads at
+ * 34-byte centres across a 6528-byte Q8_0 slab.  Copying two or four complete
+ * rows as one contiguous run gives the memory system a dense request stream;
+ * every lane then decodes the same bytes at the same relative address from
+ * shared memory.
+ *
+ * This is deliberately not the old one-row cp.async submission.  That arm
+ * launched 2560 64-thread blocks and paid a wait/barrier for each 1088-byte
+ * chunk.  Here one block copies its entire 13 or 26 KiB panel with ordinary
+ * vector loads and pays one barrier for two or four output rows.  PANEL_ROWS=2
+ * preserves more residency; PANEL_ROWS=4 preserves the shipped grid.  Both
+ * remain available in one binary for a traced ablation.
+ *
+ * Exactness: the panel is a byte-for-byte image of consecutive weight rows.
+ * The integer dots, per-group float accumulation order, cross-warp remap and
+ * final reduction tree below are the shipped pair-lanes body.  The copy is
+ * issued above the PDL fence and the block barrier below it, matching the
+ * already-promoted GDN panel's dependency order. */
+template <int R, int PANEL_ROWS>
+__global__ static void matmul_q8_0_preq_pair_lanes_panel_kernel(
+        float *out, const unsigned char *w,
+        const int8_t *xq, const float *xscale,
+        uint64_t out_dim, uint32_t n_rows, uint64_t blocks) {
+    static_assert(PANEL_ROWS == 2 || PANEL_ROWS == 4,
+                  "Q8 output panel supports two or four rows");
+    constexpr uint32_t THREADS = PANEL_ROWS * 64u;
+    extern __shared__ uint4 panel_words[];
+    char *const panel = (char *)panel_words;
+    const uint64_t row_bytes = blocks * 34u;
+    const uint64_t panel_bytes = (uint64_t)PANEL_ROWS * row_bytes;
+    const char *const gp = (const char *)w +
+        (uint64_t)blockIdx.x * panel_bytes;
+
+    /* The production gate requires a 16-byte base and blocks=192, making the
+     * row and panel strides multiples of sixteen. */
+    for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
+         i += (uint64_t)THREADS * 16u) {
+        *(uint4 *)(panel + i) = *(const uint4 *)(const void *)(gp + i);
+    }
+    QWEN4EXP_PDL_SYNC();
+    __syncthreads();
+
+    const uint32_t local_row = threadIdx.x >> 6u;
+    const uint32_t local_lane = threadIdx.x & 63u;
+    const uint32_t group = local_lane >> 1u;
+    const uint32_t half = local_lane & 1u;
+    const uint64_t row = (uint64_t)blockIdx.x * PANEL_ROWS + local_row;
+    const uint32_t row0 = blockIdx.y * R;
+    const uint32_t take = n_rows - row0 < R ? n_rows - row0 : R;
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) acc[r] = 0.0f;
+
+    if (row < out_dim) {
+        const unsigned char *wr =
+            (const unsigned char *)(panel + (uint64_t)local_row * row_bytes);
+        for (uint64_t b = group; b < blocks; b += 32u) {
+            const uint64_t warp_base = b - (uint64_t)(group & 15u);
+            const uint64_t remaining = blocks - warp_base;
+            const uint32_t live_pairs =
+                (uint32_t)(remaining < 16u ? remaining : 16u);
+            const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
+            const int8_t *payload =
+                (const int8_t *)(wr + b * 34u + 2u) + half * 16u;
+            const uintptr_t address = (uintptr_t)payload;
+            const uint32_t shift = (uint32_t)(address & 3u) * 8u;
+            const uint32_t *words =
+                (const uint32_t *)(address & ~(uintptr_t)3u);
+            uint32_t previous = words[0];
+            int32_t wq[4];
+#pragma unroll
+            for (int j = 0; j < 3; j++) {
+                const uint32_t next = words[j + 1];
+                wq[j] = (int32_t)__funnelshift_r(previous, next, shift);
+                previous = next;
+            }
+            const uint16_t last =
+                *(const uint16_t *)(const void *)(payload + 14);
+            wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
+            const float ws =
+                __half2float(*(const __half *)(const void *)(wr + b * 34u));
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                if ((uint32_t)r < take) {
+                    const uint64_t at =
+                        ((uint64_t)row0 + r) * blocks + b;
+                    const int32_t *xw = (const int32_t *)(
+                        xq + at * 32u + half * 16u);
+                    int dot = 0;
+#pragma unroll
+                    for (int j = 0; j < 4; j++)
+                        dot = __dp4a(wq[j], xw[j], dot);
+                    dot += __shfl_xor_sync(active, dot, 1);
+                    if (half == 0u)
+                        acc[r] += ws * xscale[at] * (float)dot;
+                }
+            }
+        }
+    }
+
+    __shared__ float upper[R][PANEL_ROWS][16];
+    if (half == 0u && local_lane >= 32u) {
+#pragma unroll
+        for (int r = 0; r < R; r++)
+            upper[r][local_row][group - 16u] = acc[r];
+    }
+    __syncthreads();
+    if (local_lane < 32u && half == 0u) {
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            float total = acc[r] + upper[r][local_row][group];
+#pragma unroll
+            for (int d = 16; d >= 2; d >>= 1)
+                total += __shfl_down_sync(0x55555555u, total, d);
+            if (local_lane == 0u && row < out_dim && (uint32_t)r < take)
+                out[((uint64_t)row0 + r) * out_dim + row] = total;
+        }
+    }
+}
+
+/* 0 is the shipped pair-lanes kernel, 2 and 4 select the dense panel above.
+ * Default to the residency-preserving two-row arm for the candidate. */
+static int cuda_q8_output_panel_rows(void) {
+    const char *e = getenv("DS4_Q8_OUTPUT_PANEL_ROWS");
+    if (e == NULL) return 2;
+    const int rows = atoi(e);
+    return rows == 2 || rows == 4 ? rows : 0;
+}
+
 /* HC down has only 320 outputs. Two lanes per group expose more integer
  * work while one 64-thread block owns each output. Retain all 32 original
  * float chains and their reduction tree; only the integer dot is split.
@@ -18602,6 +18733,54 @@ static int cuda_matmul_q8_0_preq_rows_exact(
                         out_dim, n_rows, blocks);
             }
         } else {
+            /* GDN ssm_out and QSA output share the exact 6144 -> 2560 shape.
+             * Keep the original kernel in the same binary (mode 0) and expose
+             * both whole-panel geometries for paired traces. */
+            const int output_panel_rows =
+                n_rows <= 2u && in_dim == 6144u && out_dim == 2560u &&
+                blocks == 192u && (((uintptr_t)wptr & 15u) == 0u)
+                    ? cuda_q8_output_panel_rows() : 0;
+            if (output_panel_rows != 0) {
+                const int use_r1 = n_rows == 1u &&
+                    getenv("DS4_QWEN4EXP_PAIR_LANES_R2") == NULL;
+                if (output_panel_rows == 2) {
+                    const size_t smem = 2u * (size_t)blocks * 34u;
+                    if (use_r1) {
+                        QWEN4EXP_LAUNCH_PDL(
+                            (matmul_q8_0_preq_pair_lanes_panel_kernel<1, 2>),
+                            (dim3((unsigned)((out_dim + 1u) / 2u), 1u, 1u)),
+                            128, smem, cuda_decode_stream(),
+                            (float *)out->ptr, (const unsigned char *)wptr,
+                            xq, xscale, out_dim, n_rows, blocks);
+                    } else {
+                        QWEN4EXP_LAUNCH_PDL(
+                            (matmul_q8_0_preq_pair_lanes_panel_kernel<2, 2>),
+                            (dim3((unsigned)((out_dim + 1u) / 2u), 1u, 1u)),
+                            128, smem, cuda_decode_stream(),
+                            (float *)out->ptr, (const unsigned char *)wptr,
+                            xq, xscale, out_dim, n_rows, blocks);
+                    }
+                } else {
+                    const size_t smem = 4u * (size_t)blocks * 34u;
+                    if (use_r1) {
+                        QWEN4EXP_LAUNCH_PDL(
+                            (matmul_q8_0_preq_pair_lanes_panel_kernel<1, 4>),
+                            (dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u)),
+                            256, smem, cuda_decode_stream(),
+                            (float *)out->ptr, (const unsigned char *)wptr,
+                            xq, xscale, out_dim, n_rows, blocks);
+                    } else {
+                        QWEN4EXP_LAUNCH_PDL(
+                            (matmul_q8_0_preq_pair_lanes_panel_kernel<2, 4>),
+                            (dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u)),
+                            256, smem, cuda_decode_stream(),
+                            (float *)out->ptr, (const unsigned char *)wptr,
+                            xq, xscale, out_dim, n_rows, blocks);
+                    }
+                }
+                return cuda_ok(cudaGetLastError(),
+                               "q8 output dense panel launch");
+            }
             /* Retain the promoted call-width specialization for the
              * general dense projections. The HC warp geometry above is
              * independent of this two-warp kernel's token-row bound. */
