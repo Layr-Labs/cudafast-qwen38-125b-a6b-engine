@@ -606,6 +606,73 @@ __global__ static void mtp_native_unpack_ids_n(
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count) ids[i] = UINT32_MAX - (uint32_t)keys[i];
 }
+
+/* The target screen produces two exact 16,384-ID sets.  A device-wide radix
+ * sort for each set pays global dispatch/scratch traffic for a tile that one
+ * CTA can own.  Each CTA below sorts one row; the cooperative selector and
+ * its occupancy are unaffected because this is a separate kernel. */
+static constexpr int MTP_TARGET_ID_SORT_THREADS = 512;
+static constexpr int MTP_TARGET_ID_SORT_ITEMS = 32;
+using mtp_target_id_sort_t = cub::BlockRadixSort<
+    uint32_t, MTP_TARGET_ID_SORT_THREADS, MTP_TARGET_ID_SORT_ITEMS>;
+
+__global__ __launch_bounds__(MTP_TARGET_ID_SORT_THREADS) static void
+mtp_native_sort_target_ids_16384x2(uint32_t *out, const uint32_t *in,
+                                   int id_bits) {
+    static_assert(MTP_TARGET_ID_SORT_THREADS * MTP_TARGET_ID_SORT_ITEMS ==
+                  MTP_TARGET_NATIVE_CAP, "target ID tile must be exact");
+    extern __shared__ __align__(32) unsigned char sort_smem[];
+    auto &storage =
+        *reinterpret_cast<mtp_target_id_sort_t::TempStorage *>(sort_smem);
+    const uint64_t row0 = (uint64_t)blockIdx.x * MTP_TARGET_NATIVE_CAP;
+    uint32_t tile[MTP_TARGET_ID_SORT_ITEMS];
+#pragma unroll
+    for (int j = 0; j < MTP_TARGET_ID_SORT_ITEMS; ++j)
+        tile[j] = in[row0 + threadIdx.x +
+                     (uint32_t)j * MTP_TARGET_ID_SORT_THREADS];
+    mtp_target_id_sort_t(storage).SortBlockedToStriped(tile, 0, id_bits);
+#pragma unroll
+    for (int j = 0; j < MTP_TARGET_ID_SORT_ITEMS; ++j)
+        out[row0 + threadIdx.x +
+            (uint32_t)j * MTP_TARGET_ID_SORT_THREADS] = tile[j];
+}
+
+/* Cache capability before decode graph capture.  Unsupported devices retain
+ * the existing DeviceRadixSort path exactly; 0 also provides an A/B valve. */
+static int mtp_native_target_id_block_sort_ready(void) {
+    static int ready = -1;
+    if (ready >= 0) return ready;
+    const char *e = getenv("DS4_MTP_NATIVE_TARGET_BLOCK_ID_SORT");
+    if (e && e[0] == '0') return ready = 0;
+    const int smem = (int)sizeof(mtp_target_id_sort_t::TempStorage);
+    int dev = 0, limit = 0, active = 0;
+    ready = 0;
+    cudaError_t rc = cudaGetDevice(&dev);
+    if (rc == cudaSuccess)
+        rc = cudaDeviceGetAttribute(
+            &limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+    if (rc == cudaSuccess && limit >= smem)
+        rc = cudaFuncSetAttribute(
+            mtp_native_sort_target_ids_16384x2,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    if (rc == cudaSuccess && limit >= smem)
+        rc = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &active, mtp_native_sort_target_ids_16384x2,
+            MTP_TARGET_ID_SORT_THREADS, smem);
+    if (rc == cudaSuccess && limit >= smem && active > 0) ready = 1;
+    else (void)cudaGetLastError();
+    return ready;
+}
+
+static int mtp_native_target_id_block_sort_launch(
+        uint32_t *out, const uint32_t *in, int id_bits) {
+    const int smem = (int)sizeof(mtp_target_id_sort_t::TempStorage);
+    mtp_native_sort_target_ids_16384x2<<<
+        2, MTP_TARGET_ID_SORT_THREADS, (size_t)smem,
+        cuda_decode_stream()>>>(out, in, id_bits);
+    return cuda_ok(cudaGetLastError(), "native R2 target-ID block sort")
+        ? 1 : -1;
+}
 /* Moving key writes into projection is equivalent only when scratch writes
  * cannot change another input/output view or a concurrently read weight. */
 static bool mtp_native_key_range_disjoint(const void *a, uint64_t an,
@@ -845,6 +912,7 @@ extern "C" int ds4_gpu_mtp_native_screen2(ds4_gpu_tensor *out,
     int id_bits = 1;
     while (id_bits < 32 && ((uint32_t)1u << id_bits) < vocab) id_bits++;
     if (id_bits > 32) id_bits = 32;
+    const int target_block_ids = mtp_native_target_id_block_sort_ready();
     for (uint32_t r = 0; r < 2u; r++) {
         size_t temporary = (size_t)(scratch->bytes - l.temporary);
         uint64_t *kin = key_in + (uint64_t)r * width;
@@ -873,22 +941,42 @@ extern "C" int ds4_gpu_mtp_native_screen2(ds4_gpu_tensor *out,
                 scratch, l.id_tmp + (uint64_t)r * MTP_TARGET_NATIVE_CAP * 4u,
                 MTP_TARGET_NATIVE_CAP, "target");
         }
-        temporary = (size_t)(scratch->bytes - l.temporary);
-        if (!cuda_ok(cub::DeviceRadixSort::SortKeys(
-                base + l.temporary, temporary, itmp, iout,
-                MTP_TARGET_NATIVE_CAP,
-                0, id_bits, cuda_decode_stream()),
-                "native R2 original-ID sort")) return -1;
-        mtp_native_projection_kernel<false><<<
-            (MTP_TARGET_NATIVE_CAP + 3u) / 4u, 256, 0,
-            cuda_decode_stream()>>>(
-            (float *)out->ptr + (uint64_t)r * MTP_TARGET_NATIVE_CAP,
-            (const unsigned char *)w,
-            xq + (uint64_t)r * MTP_NATIVE_DIM,
-            xs + (uint64_t)r * (MTP_NATIVE_DIM / 32u),
-            MTP_TARGET_NATIVE_CAP, iout, vocab, prefix, tail);
-        if (!cuda_ok(cudaGetLastError(), "native R2 exact refinement"))
-            return -1;
+        if (!target_block_ids) {
+            temporary = (size_t)(scratch->bytes - l.temporary);
+            if (!cuda_ok(cub::DeviceRadixSort::SortKeys(
+                    base + l.temporary, temporary, itmp, iout,
+                    MTP_TARGET_NATIVE_CAP,
+                    0, id_bits, cuda_decode_stream()),
+                    "native R2 original-ID sort")) return -1;
+            mtp_native_projection_kernel<false><<<
+                (MTP_TARGET_NATIVE_CAP + 3u) / 4u, 256, 0,
+                cuda_decode_stream()>>>(
+                (float *)out->ptr + (uint64_t)r * MTP_TARGET_NATIVE_CAP,
+                (const unsigned char *)w,
+                xq + (uint64_t)r * MTP_NATIVE_DIM,
+                xs + (uint64_t)r * (MTP_NATIVE_DIM / 32u),
+                MTP_TARGET_NATIVE_CAP, iout, vocab, prefix, tail);
+            if (!cuda_ok(cudaGetLastError(), "native R2 exact refinement"))
+                return -1;
+        }
+    }
+    if (target_block_ids) {
+        if (mtp_native_target_id_block_sort_launch(
+                (uint32_t *)ids->ptr, id_tmp, id_bits) < 0) return -1;
+        for (uint32_t r = 0; r < 2u; r++) {
+            uint32_t *iout = (uint32_t *)ids->ptr +
+                (uint64_t)r * MTP_TARGET_NATIVE_CAP;
+            mtp_native_projection_kernel<false><<<
+                (MTP_TARGET_NATIVE_CAP + 3u) / 4u, 256, 0,
+                cuda_decode_stream()>>>(
+                (float *)out->ptr + (uint64_t)r * MTP_TARGET_NATIVE_CAP,
+                (const unsigned char *)w,
+                xq + (uint64_t)r * MTP_NATIVE_DIM,
+                xs + (uint64_t)r * (MTP_NATIVE_DIM / 32u),
+                MTP_TARGET_NATIVE_CAP, iout, vocab, prefix, tail);
+            if (!cuda_ok(cudaGetLastError(), "native R2 exact refinement"))
+                return -1;
+        }
     }
     return (int)MTP_TARGET_NATIVE_CAP;
 }
