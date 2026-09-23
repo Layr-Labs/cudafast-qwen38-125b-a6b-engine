@@ -497,6 +497,41 @@ __device__ static float warp_sum_all_f32(float v) {
     return v;
 }
 
+
+/* Warp-wide maximum of a value that is NON-NEGATIVE by construction -- the
+ * Q8_0 quantisers reduce fabsf() of a flushed activation, so every lane holds
+ * a zero, a positive finite, or +inf.
+ *
+ * Over that domain the IEEE-754 binary32 encoding is order-isomorphic to the
+ * unsigned integer order of its bits: the sign bit is clear, and exponent and
+ * mantissa are laid out most-significant-first, so a > b if and only if the
+ * bit pattern of a is greater than the bit pattern of b.  +0.0 encodes as 0,
+ * the smallest pattern, which is also the identity of the maximum here.  The
+ * reduction therefore returns the same float the butterfly returned, bit for
+ * bit, and the scale derived from it is unchanged.
+ *
+ * What that buys is depth.  The butterfly is five dependent shuffle-and-max
+ * pairs: no lane can compute the block scale, and nothing downstream of the
+ * scale can start, until all five have retired in sequence.  REDUX.SYNC does
+ * the same reduction as ONE warp-level instruction.  In these quantisers the
+ * reduction is the whole critical path -- one load, a short pointwise chain,
+ * the reduction, then a reciprocal and a byte store -- so its depth is the
+ * kernel's depth.
+ *
+ * The instruction is sm_80 and newer; older architectures and the host pass
+ * keep the butterfly, character for character. */
+__device__ __forceinline__ static float qwen4exp_warp_max_nonneg(float a) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    return __uint_as_float(
+            __reduce_max_sync(0xffffffffu, __float_as_uint(a)));
+#else
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+    return a;
+#endif
+}
+
 __device__ static float dot4_f32(float4 a, float4 b) {
     return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
 }
@@ -3824,12 +3859,11 @@ __device__ __forceinline__ static void dev_qwen4exp_quantize_group(
      * pass. */
     float a = 0.0f;
     if (lane < n) a = fabsf(xr[lane]);
-    float m = a;
-#pragma unroll
-    for (uint32_t stride = 16u; stride > 0u; stride >>= 1u) {
-        m = fmaxf(m, __shfl_down_sync(0xffffffffu, m, stride));
-    }
-    m = __shfl_sync(0xffffffffu, m, 0);
+    /* The tree's leaves are zero or positive, which is exactly the domain the
+     * single-instruction reduction is exact over; REDUX leaves the maximum in
+     * EVERY lane, so the broadcast shuffle goes away.  The value is the
+     * tree's own, bit for bit. */
+    const float m = qwen4exp_warp_max_nonneg(a);
     const float d = m / 127.0f;
     const float id = d != 0.0f ? 1.0f / d : 0.0f;
     if (lane == 0u) xscale[at] = d;
@@ -3842,12 +3876,20 @@ __device__ __forceinline__ static void dev_qwen4exp_quantize_group(
     }
     dst[lane] = (int8_t)v;
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    /* Integer REDUX over exactly the lanes the shuffle tree paired, in one
+     * instruction; two's-complement wraparound, if it ever happens, is the
+     * wrap the tree itself produced. */
+    const int sv = __reduce_add_sync(0xffffffffu, v);
+    if (lane == 0u) xsum[at] = sv;
+#else
     int sv = v;
 #pragma unroll
     for (uint32_t stride = 16u; stride > 0u; stride >>= 1u) {
         sv += __shfl_down_sync(0xffffffffu, sv, stride);
     }
     if (lane == 0u) xsum[at] = sv;
+#endif
 }
 
 /* Q8_0 quantisation of one activation row, plus the integer sum of each group
@@ -9813,10 +9855,10 @@ __global__ static void qwen4exp_ehx_pack_quant_kernel(
                       : hidden[row * n_embd + (k - n_embd)])
         : 0.0f;
     float a = fabsf(xv);
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-    }
+    /* Both operands of the butterfly are non-negative, which is exactly the
+     * domain the single-instruction reduction is exact over; the value it
+     * returns is the butterfly's own, bit for bit. */
+    a = qwen4exp_warp_max_nonneg(a);
     const float d = a / 127.0f;
     const float id = d != 0.0f ? 1.0f / d : 0.0f;
     if (lane == 0u) xscale[pair] = d;
@@ -12022,10 +12064,10 @@ __global__ static void qwen4exp_gdn_output_quant_kernel(
         qwen4exp_gdn_sigmoid(output_gate[base + tid]);
     const float vz = qwen4exp_q8_ftz(v);
     float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-    }
+    /* Both operands of the butterfly were already flushed and non-negative,
+     * which is exactly the domain the single-instruction reduction is exact
+     * over; the value it returns is the butterfly's own, bit for bit. */
+    a = qwen4exp_warp_max_nonneg(a);
     const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
     const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
     const uint64_t pair = (uint64_t)token * (value_dim / 32u) +
@@ -12120,12 +12162,10 @@ __global__ static void qwen4exp_hc_norm_quant_kernel(
              * standalone kernel carries for a ragged tail cannot fire. */
             const float vz = qwen4exp_q8_ftz(v);
             float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
-                /* fmaxf, not the .FTZ one: both operands are already flushed
-                 * and non-negative, so the two instructions cannot disagree. */
-                a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-            }
+            /* The rolled arm's single-instruction reduction, on the same
+             * flushed, non-negative domain: the value it returns is the
+             * butterfly's own, bit for bit. */
+            a = qwen4exp_warp_max_nonneg(a);
             const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
             const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
             const uint64_t pair = blk0 + (uint64_t)(k * warps + warp);
@@ -12147,12 +12187,11 @@ __global__ static void qwen4exp_hc_norm_quant_kernel(
          * kernel carries for a ragged tail cannot fire. */
         const float vz = qwen4exp_q8_ftz(v);
         float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            /* fmaxf, not the .FTZ one: both operands are already flushed and
-             * non-negative, so the two instructions cannot disagree. */
-            a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-        }
+        /* Both operands of the butterfly were already flushed and
+         * non-negative, which is exactly the domain the single-instruction
+         * reduction is exact over; the value it returns is the butterfly's
+         * own, bit for bit. */
+        a = qwen4exp_warp_max_nonneg(a);
         const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
         const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
         const uint64_t pair = blk0 + (uint64_t)(k * warps + warp);
@@ -12369,10 +12408,10 @@ __global__ static void qwen4exp_hc_mix_inject_dual_kernel(
             const uint32_t warp = threadIdx.x >> 5u;
             const float vz = qwen4exp_q8_ftz(v);
             float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
-                a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-            }
+            /* The single-instruction reduction, on the same flushed,
+             * non-negative domain: the value it returns is the butterfly's
+             * own, bit for bit. */
+            a = qwen4exp_warp_max_nonneg(a);
             const float qd = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
             const float id = qd != 0.0f ? qwen4exp_q8_rcp_approx(qd) : 0.0f;
             const uint64_t pair = (uint64_t)t * (n_embd / 32u) +
@@ -12694,9 +12733,7 @@ __global__ static void qwen4exp_hc_silu_quant_kernel(
 
     const float vz = qwen4exp_q8_ftz(v);
     float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+    a = qwen4exp_warp_max_nonneg(a);
     const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
     const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
     if (lane == 0u) xscale[pair] = d;
@@ -13048,10 +13085,10 @@ __global__ static void qwen4exp_hc_norm_quant_inject_kernel(
                                                          weight_bias, round_bf16);
                 const float vz = qwen4exp_q8_ftz(v);
                 float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-                for (int off = 16; off > 0; off >>= 1) {
-                    a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-                }
+                /* The single-instruction reduction, on the same flushed,
+                 * non-negative domain: the value it returns is the butterfly's
+                 * own, bit for bit. */
+                a = qwen4exp_warp_max_nonneg(a);
                 const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
                 const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
                 const uint64_t pair = blk0 + (uint64_t)(k * warps + warp);
@@ -13096,10 +13133,10 @@ __global__ static void qwen4exp_hc_norm_quant_inject_kernel(
                                                      weight_bias, round_bf16);
             const float vz = qwen4exp_q8_ftz(v);
             float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
-                a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-            }
+            /* The single-instruction reduction, on the same flushed,
+             * non-negative domain: the value it returns is the butterfly's
+             * own, bit for bit. */
+            a = qwen4exp_warp_max_nonneg(a);
             const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
             const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
             const uint64_t pair = blk0 + (uint64_t)(k * warps + warp);
@@ -16275,10 +16312,10 @@ __global__ static void qwen4exp_qsa_output_gate_quant_kernel(
         : 0.0f;
     const float vz = qwen4exp_q8_ftz(v);
     float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-    }
+    /* Both operands of the butterfly were already flushed and non-negative,
+     * which is exactly the domain the single-instruction reduction is exact
+     * over; the value it returns is the butterfly's own, bit for bit. */
+    a = qwen4exp_warp_max_nonneg(a);
     const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
     const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
     const uint64_t pair = (uint64_t)blockIdx.x * 8u + warp;
@@ -16318,10 +16355,10 @@ __global__ static void qwen4exp_qsa_output_gate_doubled_quant_kernel(
         : 0.0f;
     const float vz = qwen4exp_q8_ftz(v);
     float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-    }
+    /* Both operands of the butterfly were already flushed and non-negative,
+     * which is exactly the domain the single-instruction reduction is exact
+     * over; the value it returns is the butterfly's own, bit for bit. */
+    a = qwen4exp_warp_max_nonneg(a);
     const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
     const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
     const uint64_t pair = (uint64_t)blockIdx.x * 8u + warp;
