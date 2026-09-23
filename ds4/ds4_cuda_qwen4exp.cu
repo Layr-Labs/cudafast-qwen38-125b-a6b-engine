@@ -4503,6 +4503,12 @@ __global__ static void qwen4exp_moe_group_small_kernel(
  * its token is threadIdx.x >> 5 where it was blockIdx.x, and every warp
  * intrinsic already uses the full mask and stays inside its own warp.
  */
+/* QWEN4EXP_ROUTER_SHARED_PICKS (default 1): the fused router below keeps its
+ * picks in a block-shared row for its own grouping half.  0 restores the
+ * global-only reads. */
+#ifndef QWEN4EXP_ROUTER_SHARED_PICKS
+#define QWEN4EXP_ROUTER_SHARED_PICKS 1
+#endif
 template<bool Native, bool KeyMax = false>
 __global__ static void qwen4exp_moe_router_group_small_kernel(
         int32_t *counts,
@@ -4522,6 +4528,30 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
         uint32_t n_tokens) {
     __shared__ int32_t warp_count_prefix[QWEN4EXP_MOE_SCAN_THREADS / 32];
     __shared__ int32_t warp_live_prefix[QWEN4EXP_MOE_SCAN_THREADS / 32];
+#if QWEN4EXP_ROUTER_SHARED_PICKS
+    /* SHARED PICKS.  The router warps below store every pick to `selected`
+     * in global memory, and after the block barrier the grouping half reads
+     * the whole `selected` row back twice per expert thread -- once to count,
+     * once to scatter -- plus once more for the invalid-id check: up to
+     * 2 * n_pairs + 1 global loads per thread, the first of each warp going to
+     * L2 because the stores that produced them are only a barrier old.  The
+     * same lane-0 store now also writes the pick into this block-shared row,
+     * and the barrier that already publishes the global stores publishes it
+     * too, so the grouping half reads shared memory.  The global stores stay
+     * (the gate/up projection reads `selected`).  The row is used only when
+     * the router warps cover every pair slot exactly -- n_pairs equals
+     * n_tokens * n_expert_used and fits -- a block-uniform test; otherwise
+     * every read is the parent's global read.  Same values, same order, same
+     * counts, offsets, cursors, actives and pairs. */
+    __shared__ int32_t sh_picks[QWEN4EXP_MOE_SCAN_THREADS];
+    const bool picks_shared =
+        n_pairs == n_tokens * n_expert_used &&
+        n_pairs <= (uint32_t)QWEN4EXP_MOE_SCAN_THREADS &&
+        n_tokens <= (uint32_t)(QWEN4EXP_MOE_SCAN_THREADS / 32);
+#else
+    const bool picks_shared = false;
+    int32_t *const sh_picks = selected;
+#endif
     /* Hoisted here from the grouping half: it has to precede the FIRST global
      * read of the fused kernel, which is now the router's `logits`.  A no-op
      * on the plain launch this kernel takes, correct if it is ever launched
@@ -4665,7 +4695,10 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
         }
         const int32_t chosen =
             __shfl_sync(0xffffffffu, best_i, 0u);
-        if (lane == 0u) sel[rank] = chosen;
+        if (lane == 0u) {
+            sel[rank] = chosen;
+            if (picks_shared) sh_picks[tok * n_expert_used + rank] = chosen;
+        }
         if (((uint32_t)chosen & 31u) == lane) {
             live &= ~(1u << ((uint32_t)chosen >> 5u));
         }
@@ -4731,10 +4764,13 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
     const uint32_t lane = e & 31u;
     const uint32_t warp = e >> 5u;
 
+    /* Pair p's expert: the shared copy when the router warps filled it (see
+     * SHARED PICKS above), else the global row, exactly as before. */
+#define QW_PICK(p) (picks_shared ? sh_picks[(p)] : selected[(p)])
     int32_t count = 0;
     if (e < n_expert) {
         for (uint32_t p = 0; p < n_pairs; p++) {
-            count += selected[p] == (int32_t)e;
+            count += QW_PICK(p) == (int32_t)e;
         }
         counts[e] = count;
     }
@@ -4790,7 +4826,7 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
         if (count > 0) active[live_prefix] = (int32_t)e;
         int32_t at = offset;
         for (uint32_t p = 0; p < n_pairs; p++) {
-            if (selected[p] == (int32_t)e) pairs[at++] = (int32_t)p;
+            if (QW_PICK(p) == (int32_t)e) pairs[at++] = (int32_t)p;
         }
     }
     if (e == 0u) {
@@ -4801,7 +4837,7 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
      * in the normal case; an invalid pair's one thread writes its short
      * intermediate row here. */
     if (e < n_pairs) {
-        const int32_t expert = selected[e];
+        const int32_t expert = QW_PICK(e);
         if (expert < 0 || (uint32_t)expert >= n_expert) {
             const uint32_t token = e / n_expert_used;
             const uint32_t slot = e - token * n_expert_used;
@@ -4809,7 +4845,9 @@ __global__ static void qwen4exp_moe_router_group_small_kernel(
                          (uint64_t)slot * mid_dim;
             for (uint32_t row = 0; row < mid_dim; row++) dst[row] = 0.0f;
         }
-    }}
+    }
+#undef QW_PICK
+}
 
 /* Does this shape take the fused router+grouping launch?  BOTH sites that
  * must agree read THIS function and nothing else: the graph body, to decide
