@@ -4,8 +4,25 @@
  * use ordinary stream ordering, not PDL: refinement reads freshly sorted IDs. */
 /* Refinement shortlist. 276 tail rows plus id 0 hold mandatory slots, so this
  * leaves 1771 score-selected candidates: the top 1.8% of the coarse ranking.
- * Narrowing it is a proposal-policy change, not an exact one. */
-static constexpr uint32_t MTP_NATIVE_CAP = 2048u;
+ * Narrowing it is a proposal-policy change, not an exact one.
+ *
+ * MLXFAST-DRAFTNARROW: 2048 -> 1024. Sealed verdict on the sibling DRAFT8K
+ * rung (submission f5c0e29, 2.7610): widening to 8192 left acceptance
+ * bit-identical at 49/78 (62.82%, same numerator AND denominator as the
+ * 2048 baseline) while decode fell 2.483 -> 2.4655. The coarse screen
+ * already recalls everything the refinement can use, so shortlist width is
+ * pure cost. Halving the width halves the exact-refinement projection and
+ * sort work at (to be measured) unchanged recall. Verification stays exact,
+ * so outputs are unchanged whatever the draft proposes.
+ *
+ * MLXFAST-NARROW-REFIRE: comment-only new surface for a near-bar re-draw.
+ * First draw (3b0e6029): 2.79711863488237, acceptance 49/78 (recall held),
+ * decode 2.4876102206486213 (best measured), prefill 3.9764593660086223
+ * (likely lucky). Gap to crown 0.23% is inside board noise; re-firing an
+ * unchanged tree rather than over-interpreting one draw. The 512 rung
+ * (47fae1c1, 2.7429, acceptance 48/79) bracketed the recall cliff below,
+ * confirming 1024 as the width optimum. */
+static constexpr uint32_t MTP_NATIVE_CAP = 1024u;
 static constexpr uint32_t MTP_NATIVE_DIM = 2560u;
 /* Coarse screen depth; full refinement still uses 80 groups. Pairs 24..31 sit
  * out, and the live_pairs mask already names a partial wave (40 groups left the
