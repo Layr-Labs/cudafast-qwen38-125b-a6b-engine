@@ -7624,21 +7624,25 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
             gate + (uint64_t)(blockIdx.x * 8u) * gate_row_bytes;
         const char *const usrc =
             up + (uint64_t)(blockIdx.x * 8u) * up_row_bytes;
+        /* The panels are 16-byte aligned and their guarded spans are exact
+         * multiples of 16 on the scored arm.  Issue both panel copies through
+         * the same ca cp.async path already used by the routed gate/up tile.
+         * Commit before the programmatic dependency fence so the independent
+         * weight stream can overlap the producer drain; wait before the CTA
+         * barrier publishes the complete byte image. */
         for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < gbytes;
              i += (uint64_t)blockDim.x * 16u) {
-            if (i + 16u <= gbytes)
-                *(uint4 *)(gpanel + i) = *(const uint4 *)(const void *)(gsrc + i);
-            else
-                for (uint64_t j = i; j < gbytes; j++) gpanel[j] = gsrc[j];
+            qw_cpasync16((uint32_t)__cvta_generic_to_shared(gpanel + i),
+                         (const void *)(gsrc + i));
         }
         for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < ubytes;
              i += (uint64_t)blockDim.x * 16u) {
-            if (i + 16u <= ubytes)
-                *(uint4 *)(upanel + i) = *(const uint4 *)(const void *)(usrc + i);
-            else
-                for (uint64_t j = i; j < ubytes; j++) upanel[j] = usrc[j];
+            qw_cpasync16((uint32_t)__cvta_generic_to_shared(upanel + i),
+                         (const void *)(usrc + i));
         }
+        qw_cpasync_commit();
         QWEN4EXP_PDL_SYNC();
+        qw_cpasync_wait0();
         __syncthreads();
     }
     const char *const gate_row = Stage
