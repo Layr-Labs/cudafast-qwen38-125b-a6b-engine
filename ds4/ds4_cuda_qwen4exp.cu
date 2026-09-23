@@ -6916,7 +6916,7 @@ __device__ __forceinline__ static bool qw_gu_coop_raw_load(
  * cudaOccupancyMaxActiveBlocksPerMultiprocessor, so the third block no longer
  * has to be inferred from arithmetic at all: 2 means the cap did not take. */
 template <int R, int Type, bool Vector = false,
-          unsigned OutputRows = 4, bool Coop = false>
+          unsigned OutputRows = 4, bool Coop = false, bool CpA = false>
 __global__ static void QW_GU_MAXNREG
 qwen4exp_moe_gateup_split_kernel(
         float *mid,
@@ -7007,12 +7007,52 @@ qwen4exp_moe_gateup_split_kernel(
         const char *const ub = up +
             (uint64_t)expert * up_expert_bytes +
             (uint64_t)row0 * up_row_bytes;
-        for (uint32_t i = threadIdx.x; i < words; i += blockDim.x) {
-            wcoop[i] = *(const uint4 *)(const void *)(gb + (uint64_t)i * 16u);
-            wcoop[PanelU4 + i] =
-                *(const uint4 *)(const void *)(ub + (uint64_t)i * 16u);
+        if (CpA) {
+            /* cp.async PANEL FILL.  The shipped fill routes every one of the
+             * panel's 16-byte words through the register file: ld.global.v4
+             * into four registers, st.shared.v4 out of them, two instructions
+             * and a live uint4 per outstanding word inside a kernel that is
+             * register-capped on purpose (QW_GU_MAXNREG above).  At four rows
+             * that is 2 * 4 * row_u4 words per block -- 720 for q4_K -- so
+             * 1,440 instructions.  cp.async.ca.shared.global moves the same
+             * 16 bytes with ONE instruction and NO destination register: the
+             * copy is handed to the async unit and the block waits once.
+             * Same bytes, same addresses, same panel image, same decoder
+             * afterwards -- a copy engine cannot change a value, so every
+             * emitted float is the shipped fill's.
+             *
+             * This is the mechanism the routed DOWN panel in this same file
+             * already ships (qw_cpasync16 / qw_cpasync_commit /
+             * qw_cpasync_wait0, selected by DS4_QWEN4EXP_NO_DOWN_ASYNC),
+             * applied to the gate/up panel, the larger of the two streams at
+             * the decode width.  Alignment is what the launcher already
+             * proves: gate/up bases are 16-byte aligned, expert_bytes is a
+             * 16-byte multiple, row_bytes is 1440, and wcoop is
+             * __align__(16) indexed in whole uint4.  The L2::cache_hint
+             * variants -- the ones recorded above as faulting at run time on
+             * this toolchain -- are NOT used; this is the plain form the
+             * down panel and the heavy tile already run.  The host selects
+             * this instantiation, and DS4_QWEN4EXP_NO_GU_COOP_CPASYNC
+             * restores the register-staged fill below, byte for byte. */
+            for (uint32_t i = threadIdx.x; i < words; i += blockDim.x) {
+                qw_cpasync16(
+                    (uint32_t)__cvta_generic_to_shared(&wcoop[i]),
+                    (const void *)(gb + (uint64_t)i * 16u));
+                qw_cpasync16(
+                    (uint32_t)__cvta_generic_to_shared(&wcoop[PanelU4 + i]),
+                    (const void *)(ub + (uint64_t)i * 16u));
+            }
+            qw_cpasync_commit();
+            qw_cpasync_wait0();
+            __syncthreads();
+        } else {
+            for (uint32_t i = threadIdx.x; i < words; i += blockDim.x) {
+                wcoop[i] = *(const uint4 *)(const void *)(gb + (uint64_t)i * 16u);
+                wcoop[PanelU4 + i] =
+                    *(const uint4 *)(const void *)(ub + (uint64_t)i * 16u);
+            }
+            __syncthreads();
         }
-        __syncthreads();
         wsh = wcoop + (second ? PanelU4 : 0u);
         wrow = warp >> 1u;
     }
@@ -10611,9 +10651,9 @@ static int qwen4exp_routed_moe_cuda(
             ((uintptr_t)gate & 15u) == 0u && ((uintptr_t)up & 15u) == 0u &&
             (gate_slab->expert_bytes & 15ull) == 0ull &&
             (up_slab->expert_bytes & 15ull) == 0ull;
-#define QWEN4EXP_SPLIT_GATEUP(V, P, C) \
+#define QWEN4EXP_SPLIT_GATEUP(V, P, C, A) \
         QWEN4EXP_LAUNCH_PDL( \
-            (qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P, C>), \
+            (qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, V, P, C, A>), \
             (dim3((mid_dim + P - 1u) / P, gu_rows, 1)), P * 64u, 0, stream, \
             (float *)mid->ptr, gate, up, sc.xq, sc.xs, sc.xsum, \
             sc.pairs, sc.counts, sc.offsets, gu_active, \
@@ -10632,10 +10672,20 @@ static int qwen4exp_routed_moe_cuda(
          * admits.  Purely a packing change: with OutputRows one, `warp >> 1`
          * is zero for both warps, so each still walks its own row in the
          * same group order through the same warp_sum_f32 tree and every dot
-         * is bit-identical.  mid_dim 640 gives 640 blocks. */
-        if (coop) { QWEN4EXP_SPLIT_GATEUP(true, QW_GU_COOP_ROWS, true); }
-        else if (vector) { QWEN4EXP_SPLIT_GATEUP(true, 1u, false); }
-        else { QWEN4EXP_SPLIT_GATEUP(false, 4u, false); }
+         * bit-identical.  mid_dim 640 gives 640 blocks. */
+        /* cp.async panel fill (kernel comment at the fill): the copy engine
+         * moves the same bytes with no register round trip.  Default on for
+         * the cooperative panel; DS4_QWEN4EXP_NO_GU_COOP_CPASYNC selects the
+         * register-staged fill in the same binary.  The fill's alignment
+         * premises are exactly the ones `coop` already proves above. */
+        const bool gu_cpasync =
+            getenv("DS4_QWEN4EXP_NO_GU_COOP_CPASYNC") == NULL;
+        if (coop && gu_cpasync) {
+            QWEN4EXP_SPLIT_GATEUP(true, QW_GU_COOP_ROWS, true, true);
+        }
+        else if (coop) { QWEN4EXP_SPLIT_GATEUP(true, QW_GU_COOP_ROWS, true, false); }
+        else if (vector) { QWEN4EXP_SPLIT_GATEUP(true, 1u, false, false); }
+        else { QWEN4EXP_SPLIT_GATEUP(false, 4u, false, false); }
 #undef QWEN4EXP_SPLIT_GATEUP
     }
     /* ---- THE SAME COOPERATIVE PANEL FOR THE TWO LAYERS THAT ARE NOT q4_K ----
@@ -18010,10 +18060,12 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
     int gd_regs = -1, gd_lmem = -1;
 
     cudaFuncAttributes a;
+    /* The CpA=true instantiation is the default shipped path now, so it is
+     * the one the spill guard must read. */
     if (cudaFuncGetAttributes(
             &a,
             qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, true,
-                                             QW_GU_COOP_ROWS, true>) ==
+                                             QW_GU_COOP_ROWS, true, true>) ==
         cudaSuccess) {
         gu_regs = a.numRegs;
         gu_smem = (int)a.sharedSizeBytes;
@@ -18087,10 +18139,11 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
      * gu[occ] is the whole experiment for the __maxnreg__(40) cap above: 3 means
      * the cap took and bought the third block, 2 means it did not. */
     int occ = 0;
+    /* As above, the CpA=true instantiation is the default launched path. */
     if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
             &occ,
             qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, true,
-                                             QW_GU_COOP_ROWS, true>,
+                                             QW_GU_COOP_ROWS, true, true>,
             (int)(QW_GU_COOP_ROWS * 64u), 0) == cudaSuccess) {
         gu_occ = occ;
     } else {
