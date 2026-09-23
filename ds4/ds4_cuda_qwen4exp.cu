@@ -16052,12 +16052,16 @@ qwen4exp_qsa_split_probs_kernel(
          * where no key in the tile is masked (the per-head kernel's own
          * batch and its own argument); the products still land j ascending. */
         if (!sparse) {
+            const bool dense_direct =
+                (uint64_t)base + n_in_tile <= cache_cap &&
+                (uint64_t)base + n_in_tile <= (uint64_t)INT32_MAX + 1u;
             for (; j + VSTEP <= n_in_tile;
                    j += VSTEP) {
                 float a[VSTEP];
 #pragma unroll
                 for (uint32_t i = 0; i < VSTEP; i++) {
-                    a[i] = vh[(uint64_t)keys[j + i] * kv_stride];
+                    a[i] = vh[(uint64_t)(dense_direct ? (int32_t)(base + j + i)
+                                                 : keys[j + i]) * kv_stride];
                 }
                 asm volatile("" ::: "memory");   /* as in the scores kernel */
 #pragma unroll
