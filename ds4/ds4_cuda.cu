@@ -20228,6 +20228,149 @@ static void matmul_f32_warp_tile8_stage_kernel(
     }
 }
 
+/* matmul_f32_warp_tile8_stage_kernel over TWO projections of one input --
+ * the staged form of matmul_f32_warp_tile8_pair_kernel.  The body is the
+ * staged kernel's text with the pair kernel's weight/output switch in front
+ * of it (a column tile never straddles the two projections, and the switch
+ * is block-uniform, see below), so every output is the bits the unstaged
+ * pair launch stores: same stage contents, same chains, same folds. */
+template <int TM, int TN, int WR, int WC, int MC, int STAGES, int CG>
+__global__ __launch_bounds__(32 * WR * WC, 1)
+static void matmul_f32_warp_tile8_stage_pair_kernel(
+        float *out,
+        const float *w,
+        float *out2,
+        const float *w2,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint32_t n_rows) {
+    const int NW = WC * TN;            /* 16 weight columns per block  */
+    const int NX = WR * TM;            /* 24 activation rows per block */
+    const int SROW = 64;               /* two 32-chunks, ja then jb    */
+    const int SSZ = (NW + NX) * SROW;  /* 2560 floats = 10,240 B       */
+    __shared__ float st[STAGES * SSZ];
+
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5;
+    const uint32_t wr_i = warp / (uint32_t)WC, wc_i = warp % (uint32_t)WC;
+    const uint32_t ntn = (uint32_t)(out_dim / (uint64_t)TN);
+    /* Two projections of one input in one launch, as the unstaged pair
+     * kernel: column tiles past the first take the second weight and write
+     * the second output.  The launcher requires ntn % WC == 0, so the choice
+     * is uniform over the block and the stage below is filled from ONE
+     * weight; a block's first tile is tile_base, and tile_base * TN is the
+     * blockIdx.x * NW the single-projection kernel stages from. */
+    uint32_t tile_base = blockIdx.x * (uint32_t)WC;
+    if (tile_base >= ntn) {
+        tile_base -= ntn;
+        w = w2;
+        out = out2;
+    }
+    const uint32_t tile = tile_base + wc_i;
+    const bool live_col = tile < ntn;
+    const uint32_t col0 = live_col ? tile * (uint32_t)TN : 0u;
+    const uint32_t row0_raw = (blockIdx.y * (uint32_t)WR + wr_i) * (uint32_t)TM;
+    const bool live_row = row0_raw < n_rows;
+    const uint32_t row0 = live_row ? row0_raw : 0u;
+    const uint32_t take = live_row
+        ? (n_rows - row0 < (uint32_t)TM ? n_rows - row0 : (uint32_t)TM)
+        : (uint32_t)TM;
+
+    /* Fill assignment, fixed for the kernel.  NW*64/4 = 256 weight chunks:
+     * thread tid takes chunk tid.  NX*64/4 = 384 activation chunks: thread tid
+     * takes tid, and tid < 128 takes 256 + tid.  A chunk is 4 consecutive
+     * floats inside one 32-element half, so it never straddles the ja|jb seam. */
+    const uint32_t tid = threadIdx.x;
+    const uint32_t wq_row = tid >> 4, wq_k = (tid & 15u) << 2;
+    const uint32_t xq0_row = tid >> 4, xq0_k = (tid & 15u) << 2;
+    const uint32_t xq1 = tid + 256u;
+    const uint32_t xq1_row = xq1 >> 4, xq1_k = (xq1 & 15u) << 2;
+
+    const uint32_t gcol = tile_base * (uint32_t)TN + wq_row;
+    const uint32_t gcol_c = (uint64_t)gcol < out_dim ? gcol : 0u;
+
+    ds4_stage_fill_ctx f;
+    f.wsrc = w + (uint64_t)gcol_c * in_dim + (wq_k & 31u);
+    {   /* per-ROW-GROUP source row, with the shipping substitution */
+        const uint32_t g0 = xq0_row / (uint32_t)TM, t0i = xq0_row % (uint32_t)TM;
+        const uint32_t rb0 = (blockIdx.y * (uint32_t)WR + g0) * (uint32_t)TM;
+        const uint32_t tk0 = rb0 < n_rows
+            ? (n_rows - rb0 < (uint32_t)TM ? n_rows - rb0 : (uint32_t)TM) : 0u;
+        const uint32_t sr0 = rb0 < n_rows ? (rb0 + (t0i < tk0 ? t0i : 0u)) : 0u;
+        const uint32_t g1 = xq1_row / (uint32_t)TM, t1i = xq1_row % (uint32_t)TM;
+        const uint32_t rb1 = (blockIdx.y * (uint32_t)WR + g1) * (uint32_t)TM;
+        const uint32_t tk1 = rb1 < n_rows
+            ? (n_rows - rb1 < (uint32_t)TM ? n_rows - rb1 : (uint32_t)TM) : 0u;
+        const uint32_t sr1 = rb1 < n_rows ? (rb1 + (t1i < tk1 ? t1i : 0u)) : 0u;
+        f.x0src = x + (uint64_t)sr0 * in_dim + (xq0_k & 31u);
+        f.x1src = x + (uint64_t)sr1 * in_dim + (xq1_k & 31u);
+    }
+    f.wdst  = &st[wq_row * SROW + wq_k];
+    f.x0dst = &st[(NW + xq0_row) * SROW + xq0_k];
+    f.x1dst = &st[(NW + xq1_row) * SROW + xq1_k];
+    f.wj_hi  = wq_k  >= 32u ? 1u : 0u;
+    f.x0j_hi = xq0_k >= 32u ? 1u : 0u;
+    f.x1j_hi = xq1_k >= 32u ? 1u : 0u;
+    f.xq1_live = tid < 128u;
+
+#pragma unroll
+    for (int s = 0; s < STAGES - 1; s++)
+        ds4_stage_fill<CG>(f, s / MC, s % MC, s % STAGES, SSZ);
+
+    float A[TM][TN], B[TM][TN], t0[TM][TN], t1[TM][TN];
+    const float *sw = &st[wc_i * (uint32_t)TN * SROW];
+    const float *sx = &st[(NW + wr_i * (uint32_t)TM) * SROW];
+
+    /* h(p,64) = (c_p + c_{p+128}) + (c_{p+64} + c_{p+192}) */
+    ds4_stage_pair<TM, TN, MC, STAGES, 0, SROW, SSZ, CG>(t0, t1, sw, sx, lane, f);
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int c = 0; c < TN; c++) A[t][c] = t0[t][c] + t1[t][c];
+    ds4_stage_pair<TM, TN, MC, STAGES, 1, SROW, SSZ, CG>(t0, t1, sw, sx, lane, f);
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int c = 0; c < TN; c++) A[t][c] = A[t][c] + (t0[t][c] + t1[t][c]);
+    /* h(p+32,64) = (c_{p+32} + c_{p+160}) + (c_{p+96} + c_{p+224}) */
+    ds4_stage_pair<TM, TN, MC, STAGES, 2, SROW, SSZ, CG>(t0, t1, sw, sx, lane, f);
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int c = 0; c < TN; c++) B[t][c] = t0[t][c] + t1[t][c];
+    ds4_stage_pair<TM, TN, MC, STAGES, 3, SROW, SSZ, CG>(t0, t1, sw, sx, lane, f);
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int c = 0; c < TN; c++) B[t][c] = B[t][c] + (t0[t][c] + t1[t][c]);
+
+    /* h(p,32) = h(p,64) + h(p+32,64), then strides 16, 8, 4, 2, 1. */
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int c = 0; c < TN; c++) {
+            float s = A[t][c] + B[t][c];
+#pragma unroll
+            for (int d = 16; d > 0; d >>= 1) {
+                s = s + __shfl_down_sync(0xffffffffu, s, d);
+            }
+            A[t][c] = s;
+        }
+    if (lane == 0u && live_col && live_row) {
+#pragma unroll
+        for (int t = 0; t < TM; t++) {
+            if ((uint32_t)t < take) {
+#pragma unroll
+                for (int c = 0; c < TN; c++) {
+                    out[(uint64_t)(row0 + (uint32_t)t) * out_dim +
+                        (uint64_t)(col0 + (uint32_t)c)] = A[t][c];
+                }
+            }
+        }
+    }
+}
+
 /* The eight-warp arrangement: four row groups by two column groups, so a
  * block covers 24 rows by 16 columns.  DS4_F32_NO_WARP_TILE8 keeps the
  * four-warp kernel above. */
@@ -21047,6 +21190,28 @@ extern "C" int ds4_gpu_matmul_f32_pair_decode_rows_exact_tensor(
     if (!w0 || !w1) return 0;
     const unsigned ntn = (unsigned)(out_dim / (uint64_t)DS4_F32_WARP_TILE_TN);
     dim3 grid8((2u * ntn + wc8 - 1u) / wc8, (unsigned)ytiles8, 1);
+    /* The staged pair kernel is BIT-IDENTICAL to the one below (the staged
+     * single-projection kernel's text with the pair switch in front of it),
+     * so this is a speed split, not a numeric one.  Its stage is filled from
+     * one weight per block, which needs the first projection's tile count to
+     * be a whole number of blocks; cp.async needs the three sources 16-byte
+     * aligned.  DS4_F32_NO_WARP_TILE8_STAGE falls back to the unstaged pair
+     * kernel, as it does for the single projection. */
+    if ((ntn % wc8) == 0u &&
+        (((uintptr_t)w0 | (uintptr_t)w1 | (uintptr_t)x->ptr) & 15u) == 0u &&
+        !matmul_f32_warp_tile8_stage_off()) {
+        matmul_f32_warp_tile8_stage_pair_kernel<
+                DS4_F32_WARP_TILE_TM, DS4_F32_WARP_TILE_TN,
+                DS4_F32_WARP_TILE8_WR, DS4_F32_WARP_TILE8_WC,
+                2560 / 256, DS4_F32_WARP_TILE8_STAGES,
+                DS4_F32_WARP_TILE8_STAGE_CG>
+            <<<grid8, 32 * wr8 * wc8, 0, cuda_decode_stream()>>>(
+                (float *)out0->ptr, (const float *)w0,
+                (float *)out1->ptr, (const float *)w1,
+                (const float *)x->ptr, in_dim, out_dim, n_rows);
+        return cuda_ok(cudaGetLastError(),
+                       "matmul_f32 pair warp tile8 stage launch");
+    }
     matmul_f32_warp_tile8_pair_kernel<DS4_F32_WARP_TILE_TM,
                                       DS4_F32_WARP_TILE_TN,
                                       DS4_F32_WARP_TILE8_WR,
@@ -32389,6 +32554,140 @@ static void glm53_matvec_bf16_f32_tile_kernel(
 #define DS4_BF16_TILE_TM 4
 #define DS4_BF16_TILE_TN 8
 
+/* glm53_matvec_bf16_f32_tile_kernel with a SHARED-MEMORY STAGE in front of
+ * its operand reads, the way matmul_f32_warp_tile8_stage_kernel fronts the
+ * f32 tile.  Not one operand, one fmaf or one shuffle moves: warp w still
+ * owns columns (blockIdx.x * 8 + w) * TN .. + TN - 1 over the block's TM
+ * rows, lane l still walks k = l + 32m for m ascending in one fmaf chain
+ * from 0.0f per output, and the fold is the same warp_sum_f32.  Only the
+ * PATH changes -- global -> shared -> register instead of global -> register
+ * -- and the path is walked by cp.async, which needs no destination
+ * register and so buys prefetch depth the one-chain-per-output loop above
+ * never had (its loads are two-byte bf16 words, twelve per lane per step).
+ *
+ * STAGE.  One stage is what the block consumes in one step m: the 8 * TN =
+ * 64 weight columns over k = 32m .. 32m + 31 as [col][32] bf16 (64 B per
+ * column, 4 KiB) and the TM = 4 activation rows over the same k as [row][32]
+ * f32 (512 B).  4608 B per stage, STAGES of them.  Fill: thread tid copies
+ * weight chunk tid (column tid / 4, words (tid % 4) * 8 ..) and, for
+ * tid < 32, activation chunk tid (row tid / 8, floats (tid % 8) * 4 ..).
+ * A warp reading s[col][lane] touches 64 contiguous bytes, two lanes per
+ * bank word: no conflict.
+ *
+ * SUBSTITUTION.  The tile kernel gives a column past out_dim the address of
+ * the warp's col0 and a row past `take` the address of row0, and never
+ * stores them; the stage does the same per column and per row, so the
+ * bytes a lane reads for those are the same bytes as before.  A warp whose
+ * col0 is past out_dim, which the tile kernel drops with an early return,
+ * cannot return here (every thread must reach every barrier): its columns
+ * stage column 0 and its stores are predicated off.
+ *
+ * Needs in_dim % 32 == 0 (whole steps) and 16-byte aligned weights and x
+ * (cp.async); the caller checks both and keeps the tile kernel otherwise. */
+template <int TM, int TN, int STAGES, int CG>
+__global__ __launch_bounds__(256)
+static void glm53_matvec_bf16_f32_stage_kernel(
+        float *out,
+        const uint16_t *weights,
+        const float *x,
+        uint32_t in_dim,
+        uint32_t out_dim,
+        uint32_t n_rows) {
+    constexpr int NC = 8 * TN;                 /* 64 weight columns per block */
+    constexpr int WBYTES = NC * 32 * 2;        /* 4096 B of bf16 per stage    */
+    constexpr int XBYTES = TM * 32 * 4;        /* 512 B of f32 per stage      */
+    constexpr int SBYTES = WBYTES + XBYTES;    /* 4608 B                      */
+    static_assert(TM == 4 && TN == 8, "fill assignment below is for 4 x 8");
+    __shared__ __align__(16) unsigned char st[STAGES * SBYTES];
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t warp = tid >> 5u;
+    const uint32_t lane = tid & 31u;
+    const uint32_t col0 = (blockIdx.x * 8u + warp) * (uint32_t)TN;
+    const uint32_t row0 = blockIdx.y * (uint32_t)TM;
+    if (row0 >= n_rows) return;               /* grid-uniform per blockIdx.y */
+    const bool live_col = col0 < out_dim;
+    const uint32_t take = n_rows - row0 < (uint32_t)TM ? n_rows - row0
+                                                       : (uint32_t)TM;
+
+    /* Fill sources, fixed for the kernel. */
+    const uint32_t wcol = tid >> 2u, wk = (tid & 3u) * 8u;
+    const uint32_t gcol_raw = blockIdx.x * (uint32_t)NC + wcol;
+    /* The tile kernel's substitution: a column past out_dim reads its warp's
+     * col0; a warp entirely past out_dim (which it skipped) reads column 0. */
+    const uint32_t wcol_col0 = (blockIdx.x * 8u + (wcol / (uint32_t)TN)) * (uint32_t)TN;
+    const uint32_t gcol = gcol_raw < out_dim ? gcol_raw
+                        : (wcol_col0 < out_dim ? wcol_col0 : 0u);
+    const uint16_t *wsrc = weights + (uint64_t)gcol * in_dim + wk;
+    unsigned char *wdst = st + wcol * 64u + wk * 2u;
+    const uint32_t xrow = tid >> 3u, xk = (tid & 7u) * 4u;
+    const uint32_t xrow_s = xrow < take ? xrow : 0u;
+    const float *xsrc = x + (uint64_t)(row0 + xrow_s) * in_dim + xk;
+    unsigned char *xdst = st + WBYTES + xrow * 128u + xk * 4u;
+    const bool xfill = tid < 32u;
+
+    const int MC = (int)(in_dim >> 5u);
+    const int LAST = MC - 1;
+#pragma unroll
+    for (int s = 0; s < STAGES - 1; s++) {
+        if (s <= LAST) {
+            ds4_cp_async16<CG>((float *)(wdst + s * SBYTES), (const float *)(wsrc + 32u * s));
+            if (xfill) ds4_cp_async16<CG>((float *)(xdst + s * SBYTES), xsrc + 32u * s);
+        }
+        ds4_cp_async_commit();
+    }
+
+    float sum[TM][TN];
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int c = 0; c < TN; c++) sum[t][c] = 0.0f;
+
+    for (int m = 0; m < MC; m++) {
+        const int nxt = m + STAGES - 1;
+        const int waitn = (STAGES - 2) < (LAST - m) ? (STAGES - 2) : (LAST - m);
+        ds4_cp_async_wait_n(waitn);
+        __syncthreads();
+        if (nxt <= LAST) {
+            const int buf = nxt % STAGES;
+            ds4_cp_async16<CG>((float *)(wdst + buf * SBYTES), (const float *)(wsrc + 32u * nxt));
+            if (xfill) ds4_cp_async16<CG>((float *)(xdst + buf * SBYTES), xsrc + 32u * nxt);
+        }
+        ds4_cp_async_commit();
+        const unsigned char *sb = st + (m % STAGES) * SBYTES;
+        const uint16_t *sw = (const uint16_t *)(sb + (warp * (uint32_t)TN) * 64u);
+        const float *sx = (const float *)(sb + WBYTES);
+        float w[TN], xv[TM];
+#pragma unroll
+        for (int c = 0; c < TN; c++) w[c] = __uint_as_float((uint32_t)sw[c * 32 + lane] << 16);
+#pragma unroll
+        for (int t = 0; t < TM; t++) xv[t] = sx[t * 32 + lane];
+#pragma unroll
+        for (int t = 0; t < TM; t++)
+#pragma unroll
+            for (int c = 0; c < TN; c++) sum[t][c] = fmaf(w[c], xv[t], sum[t][c]);
+    }
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int c = 0; c < TN; c++) sum[t][c] = warp_sum_f32(sum[t][c]);
+    if (lane == 0u && live_col) {
+#pragma unroll
+        for (int t = 0; t < TM; t++) {
+            if ((uint32_t)t >= take) continue;
+#pragma unroll
+            for (int c = 0; c < TN; c++) {
+                if (col0 + (uint32_t)c < out_dim) {
+                    out[(uint64_t)(row0 + (uint32_t)t) * out_dim +
+                        (uint64_t)(col0 + (uint32_t)c)] = sum[t][c];
+                }
+            }
+        }
+    }
+}
+#define DS4_BF16_TILE_STAGES 4
+#define DS4_BF16_TILE_STAGE_CG 1
+
 /* Qwen prefill needs the float-input decode tree at every row count. Use the
  * original matvec kernel on one row grid rather than issuing eight-row chunks. */
 extern "C" int ds4_gpu_qwen4exp_bf16_prefill_exact_tensor(
@@ -32410,6 +32709,21 @@ extern "C" int ds4_gpu_qwen4exp_bf16_prefill_exact_tensor(
     if (rows >= 8u && getenv("DS4_QWEN4EXP_NO_BF16_TILE") == NULL) {
         const unsigned ctiles = (out_dim + DS4_BF16_TILE_TN - 1u) / DS4_BF16_TILE_TN;
         const dim3 tgrid((ctiles + 7u) / 8u, (rows + DS4_BF16_TILE_TM - 1u) / DS4_BF16_TILE_TM, 1u);
+        /* The staged kernel is BIT-IDENTICAL to the tile kernel below (its
+         * text with the operand reads served out of a cp.async shared stage),
+         * so this is a speed split, not a numeric one.  Whole 32-wide steps
+         * and 16-byte aligned sources are its two conditions;
+         * DS4_QWEN4EXP_NO_BF16_TILE_STAGE keeps the tile kernel. */
+        if ((in_dim & 31u) == 0u &&
+            (((uintptr_t)weights | (uintptr_t)x->ptr) & 15u) == 0u &&
+            getenv("DS4_QWEN4EXP_NO_BF16_TILE_STAGE") == NULL) {
+            glm53_matvec_bf16_f32_stage_kernel<DS4_BF16_TILE_TM, DS4_BF16_TILE_TN,
+                                               DS4_BF16_TILE_STAGES, DS4_BF16_TILE_STAGE_CG>
+                <<<tgrid, 256u, 0, cuda_decode_stream()>>>(
+                    (float *)out->ptr, (const uint16_t *)weights, (const float *)x->ptr,
+                    in_dim, out_dim, rows);
+            return cuda_ok(cudaGetLastError(), "Qwen BF16 exact prefill stage launch");
+        }
         glm53_matvec_bf16_f32_tile_kernel<DS4_BF16_TILE_TM, DS4_BF16_TILE_TN>
             <<<tgrid, 256u, 0, cuda_decode_stream()>>>(
                 (float *)out->ptr, (const uint16_t *)weights, (const float *)x->ptr,
