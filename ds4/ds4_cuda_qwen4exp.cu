@@ -18218,3 +18218,4 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
 
 #define YUKON_REDRAW_10 10
 #define GAUNTLET_REDRAW_f930ccfb_20260923T164214Z 1
+#define GAUNTLET_REDRAW_7c4fb6ab_20260923T172652Z 1
