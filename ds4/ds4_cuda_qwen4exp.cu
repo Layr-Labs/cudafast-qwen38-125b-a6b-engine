@@ -2005,7 +2005,7 @@ struct q8_mma_pipe_cfg {
     static constexpr int A_BYTES = BM * A_STRIDE;
     static constexpr int B_BYTES = BN * B_STRIDE;
     static constexpr int AS_BYTES = BM * G * 4;
-    static constexpr int WS_BYTES = G * BN * 4;          /* converted weight scales [gg][BN] */
+    static constexpr int WS_BYTES = 0;                   /* scales are converted by the consumer at point of use */
     static constexpr int STAGE_BYTES = A_BYTES + B_BYTES + AS_BYTES + WS_BYTES;
     static constexpr int SMEM = STAGES * STAGE_BYTES;
     static_assert(G == 2 || G == 4 || G == 8, "G is the k32 steps per stage");
@@ -2161,23 +2161,15 @@ qwen4exp_gdn_qkv_conv_mma_pipe_kernel(float *out,
                 const int c = idx - r * C::B_CHUNKS;
                 if (idx < BN * C::B_CHUNKS) q8_mma_sts_16(sB + r * C::B_STRIDE + c * 16, rb[k]);
             }
-            /* Every producer's stores are visible to every producer: the
-             * scales below lie in rows another one stored. */
-            q8_mma_bar_sync(15, C::PWARPS * 32);
-
-            /* Weight scales, half -> float, [gg][BN]. */
-#pragma unroll
-            for (int j = 0; j < (G * BN + PT - 1) / PT; j++) {
-                const int i = pl + j * PT;
-                if (i < G * BN) {
-                    const int gg = i / BN;
-                    const int rr = i - gg * BN;
-                    uint16_t h;
-                    memcpy(&h, sB + rr * C::B_STRIDE + skew + gg * 34, 2);
-                    sWs[gg * BN + rr] = __half2float(__ushort_as_half(h));
-                }
-            }
-            __syncwarp();
+            /* The consumer converts the block scales itself, so no producer
+             * reads another producer's stores and the four producer warps
+             * never rendezvous: a warp whose loads have landed issues the next
+             * stage without waiting for the slowest.  `bar.arrive` carries no
+             * memory ordering of its own (the removed producer rendezvous was
+             * providing it as a side effect), so the stores are released with
+             * an explicit block fence.  Same change as the dense
+             * matmul_q8_0_preq_rows_mma_pipe_kernel CvtC path in ds4_cuda.cu. */
+            __threadfence_block();
             q8_mma_bar_arrive(1 + 2 * buf, BAR_COUNT);
         }
     } else {
@@ -2251,7 +2243,16 @@ qwen4exp_gdn_qkv_conv_mma_pipe_kernel(float *out,
                     bf[0] = pw[0];
                     bf[1] = pw[4];
                 }
-                const float2 wsp = *(const float2 *)(sWs + gg * BN + c + (int)t4 * 2);
+                /* The two halfwords are the q8_0 block scales of output rows
+                 * c + t4*2 and c + t4*2 + 1 -- the same bytes the producer used
+                 * to convert into a separate buffer; skew and gg*34 are even, so
+                 * both reads are 2-byte aligned. */
+                const unsigned char *ps = sB + (c + (int)t4 * 2) * C::B_STRIDE + skew + gg * 34;
+                uint16_t hs0, hs1;
+                memcpy(&hs0, ps, 2);
+                memcpy(&hs1, ps + C::B_STRIDE, 2);
+                const float2 wsp = make_float2(__half2float(__ushort_as_half(hs0)),
+                                               __half2float(__ushort_as_half(hs1)));
                 int32_t d[MT][4];
 #pragma unroll
                 for (int mi = 0; mi < MT; mi++) q8_mma_m16n8k32_seeded(d[mi], af[mi], bf, magic);
@@ -4316,6 +4317,7 @@ __global__ static void qwen4exp_moe_group_scan_parallel_kernel(
 /* build record 20260920T112423Z-103 */
 /* build record 20260920T120351Z-108 */
 /* build record 20260921T160157Z-8 */
+/* build record 20260923T224306Z-10 */
 __global__ static void qwen4exp_moe_pair_tasks_kernel(
         int32_t *tasks, const int32_t *counts, unsigned total,
         int32_t tile = 32, int32_t lo = 0, int32_t hi = 0x7fffffff) {
