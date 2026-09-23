@@ -7358,6 +7358,11 @@ __global__ static void qwen4exp_moe_gateup_q_kernel(
  * almost nothing here and that residency is not this kernel's constraint
  * either.  If registers ever need to come down, it has to be by removing live
  * state at source. */
+/* -DDS4_QWEN4EXP_DOWN_MERGE_BUILD=0 compiles the two-row shared-expert merge
+ * out of the routed down kernel and restores the flat (slot, token) walk. */
+#ifndef DS4_QWEN4EXP_DOWN_MERGE_BUILD
+#define DS4_QWEN4EXP_DOWN_MERGE_BUILD 1
+#endif
 template <int R, int DownType = -1, bool Vector = false, bool Stage = false,
           bool Async = false>
 /* This build's note auto09171641_2 records that the scored decode window is
@@ -7466,6 +7471,132 @@ __global__ static void qwen4exp_moe_down_q_kernel(
             }
         }
     };
+#if DS4_QWEN4EXP_DOWN_MERGE_BUILD
+    /* SHARED-EXPERT MERGE ON THE TWO-ROW VERIFY TILE.
+     *
+     * The flat (slot, token) walk below fills one panel per (token, slot):
+     * twenty fills per block per layer at top-10, even when both verify rows
+     * routed to the same expert, in which case the second fill re-reads the
+     * exact bytes the first one read.  Here the two rows' slot lists are
+     * walked as a merge instead.  A step is either ONE row's next slot or a
+     * JOINT step where both rows' next slots name the same valid expert; a
+     * joint step fills and decodes the panel once and accumulates it into
+     * both rows.
+     *
+     * Bit-exact by construction: the rows' accumulators are independent, and
+     * each one still absorbs its slots 0..n-1 in ascending order, group by
+     * group in the same lane, through the same decode of the same bytes and
+     * the same accumulate call on the same mq/ms/msum row.  Only the order in
+     * which the two rows' otherwise independent chains interleave changes.
+     *
+     * Merge rule (block-uniform: every warp holds identical routes, so every
+     * shuffle and ballot below agrees across the block and all barriers are
+     * reached by all lanes):
+     *   - both heads name the same valid expert           -> joint step;
+     *   - row 0's head occurs later in row 1's list and row 1's head does
+     *     not occur later in row 0's list                  -> row 1 alone;
+     *   - otherwise                                        -> row 0 alone.
+     * Crossing matches cost one lost merge; nothing else.  Double buffering
+     * is the step-parity scheme below, unchanged. */
+    if constexpr (R == 2 && Vector && Stage && Async) {
+        if (take == 2u) {
+            const uint32_t n = n_expert_used;
+            auto qw_merge_desc = [&](uint32_t i, uint32_t j, int32_t *ex) {
+                /* Returns the step mask: bit 0 row 0 at slot i, bit 1 row 1
+                 * at slot j; 0 when both lists are exhausted. */
+                if (i >= n && j >= n) return 0u;
+                if (j >= n) { *ex = __shfl_sync(0xffffffffu, route[0], i); return 1u; }
+                if (i >= n) { *ex = __shfl_sync(0xffffffffu, route[1], j); return 2u; }
+                const int32_t e0 = __shfl_sync(0xffffffffu, route[0], i);
+                const int32_t e1 = __shfl_sync(0xffffffffu, route[1], j);
+                const bool v0 = e0 >= 0 && (uint32_t)e0 < n_total_expert;
+                const bool v1 = e1 >= 0 && (uint32_t)e1 < n_total_expert;
+                if (v0 && e0 == e1) { *ex = e0; return 3u; }
+                const bool e0_later_in_1 = __ballot_sync(0xffffffffu,
+                    v0 && lane > j && lane < n && route[1] == e0) != 0u;
+                const bool e1_later_in_0 = __ballot_sync(0xffffffffu,
+                    v1 && lane > i && lane < n && route[0] == e1) != 0u;
+                if (e0_later_in_1 && !e1_later_in_0) { *ex = e1; return 2u; }
+                *ex = e0;
+                return 1u;
+            };
+            auto qw_fill_expert = [&](int32_t e, char *const dst) {
+                if (e < 0 || (uint32_t)e >= n_total_expert) return;
+                const char *const gp = down +
+                    (uint64_t)(uint32_t)e * down_expert_bytes +
+                    (uint64_t)row0 * down_row_bytes;
+                for (uint64_t o = (uint64_t)threadIdx.x * 16u;
+                     o < panel_bytes; o += (uint64_t)blockDim.x * 16u) {
+                    qw_cpasync16((uint32_t)__cvta_generic_to_shared(dst + o),
+                                 gp + o);
+                }
+            };
+            uint32_t i = 0u, j = 0u, step = 0u;
+            int32_t e = -1;
+            uint32_t mask = qw_merge_desc(i, j, &e);
+            qw_fill_expert(e, spanel);
+            qw_cpasync_commit();
+            /* Same PDL consumer fence as the flat walk: everything above
+             * reads only `selected` and the read-only `down` slab. */
+            QWEN4EXP_PDL_SYNC();
+            while (mask != 0u) {
+                qw_cpasync_wait0();
+                __syncthreads();
+                const uint32_t ni = i + (mask & 1u);
+                const uint32_t nj = j + (mask >> 1);
+                int32_t ne = -1;
+                const uint32_t nmask = qw_merge_desc(ni, nj, &ne);
+                if (nmask != 0u) {
+                    qw_fill_expert(ne, spanel +
+                                   (uint64_t)((step + 1u) & 1u) * panel_bytes);
+                    qw_cpasync_commit();
+                }
+                if (e >= 0 && (uint32_t)e < n_total_expert) {
+                    const char *const drow = spanel +
+                        (uint64_t)(step & 1u) * panel_bytes +
+                        (uint64_t)(row - row0) * down_row_bytes;
+                    const uint64_t mrow0 = (uint64_t)tok0 * n + i;
+                    const uint64_t mrow1 = (uint64_t)(tok0 + 1u) * n + j;
+                    for (uint32_t g = lane; g < groups; g += 32u) {
+                        int8_t wq[32];
+                        float wa[2], wb[2];
+                        int halves = 1;
+                        dev_qwen4exp_group_decode(
+                                DownType < 0 ? down_type : (uint32_t)DownType,
+                                drow, g, wq, wa, wb, &halves);
+#pragma unroll
+                        for (int r = 0; r < 2; r++) {
+                            if (((mask >> r) & 1u) == 0u) continue;
+                            const uint64_t at_g =
+                                (r == 0 ? mrow0 : mrow1) * groups + g;
+                            if (halves == 1)
+                                qwen4exp_shared_vector_accumulate(
+                                    &acc[r], wq, wa[0], wb[0],
+                                    mq + at_g * 32u, ms[at_g], msum[at_g]);
+                            else
+                                qwen4exp_group_accumulate(
+                                    &acc[r], wq, wa, wb, halves,
+                                    mq + at_g * 32u, ms[at_g], msum[at_g]);
+                        }
+                    }
+                }
+                i = ni;
+                j = nj;
+                e = ne;
+                mask = nmask;
+                step++;
+            }
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                const float tot = warp_sum_f32(acc[r]);
+                if (lane == 0u) {
+                    out[(uint64_t)(tok0 + (uint32_t)r) * out_dim + row] = tot;
+                }
+            }
+            return;
+        }
+    }
+#endif
     if (Stage) {
         qw_fill_step(0u, 0u, spanel);
         if (Async) qw_cpasync_commit();
@@ -18218,3 +18349,6 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
 
 #define YUKON_REDRAW_10 10
 #define GAUNTLET_REDRAW_f930ccfb_20260923T164214Z 1
+#define GAUNTLET_REDRAW_89779edd_20260923T175646Z 1
+#define GAUNTLET_REDRAW_658dae86_20260923T180951Z 1
+#define GAUNTLET_REDRAW_23e57738_20260923T184520Z 1
