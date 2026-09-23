@@ -4,8 +4,13 @@
  * use ordinary stream ordering, not PDL: refinement reads freshly sorted IDs. */
 /* Refinement shortlist. 276 tail rows plus id 0 hold mandatory slots, so this
  * leaves 1771 score-selected candidates: the top 1.8% of the coarse ranking.
- * Narrowing it is a proposal-policy change, not an exact one. */
-static constexpr uint32_t MTP_NATIVE_CAP = 2048u;
+ * Narrowing it is a proposal-policy change, not an exact one.
+ *
+ * MLXFAST-DRAFT512: 2048 -> 512 (staged; fires only if the 1024 rung's sealed
+ * acceptance holds at 49/78). DRAFT8K proved recall saturated at 2048
+ * (acceptance identical 49/78 at 8192, decode −0.7% on pure cost). 512 keeps
+ * 277 mandatory + 235 score-selected (top ~0.24%). Verification stays exact. */
+static constexpr uint32_t MTP_NATIVE_CAP = 512u;
 static constexpr uint32_t MTP_NATIVE_DIM = 2560u;
 /* Coarse screen depth; full refinement still uses 80 groups. Pairs 24..31 sit
  * out, and the live_pairs mask already names a partial wave (40 groups left the
