@@ -11,6 +11,7 @@
 #include "ds4_qwen4exp_model_registration.h"
 #include "ds4_qwen4exp_qsa_scratch.h"
 #include "ds4_qwen4exp_gdn_replay.h"
+#include "ds4_qwen4exp_gdn_deferred.h"
 
 /* CUDA supplies the native output-row screen.  Keep these weak just like the
  * MTP hook binding does: Metal/ROCm and CPU-only test links have no such
@@ -111,7 +112,7 @@ void ds4_qwen4exp_session_plan_compute(ds4_qwen4exp_session_plan *plan,
     /* Reserve the bounded replay checkpoint/log on every platform so a serve
      * plan remains a conservative bound regardless of the runtime valve. */
     act += gdn_state_one * plan->n_gdn_layer;
-    act += (uint64_t)DS4_QWEN4EXP_GDN_REPLAY_ROWS * plan->n_gdn_layer *
+    act += 8ull * plan->n_gdn_layer *
         (((uint64_t)DS4_N_GDN_KEY_HEAD + DS4_N_GDN_VALUE_HEAD) *
          DS4_N_GDN_HEAD_DIM + 2ull * DS4_N_GDN_VALUE_HEAD) * f;
     act += sizeof(uint32_t);                      /* replay prefix       */
@@ -395,6 +396,8 @@ struct ds4_qwen4exp_session {
     ds4_gpu_tensor *d_gdn_replay;
     ds4_gpu_tensor *gdn_replay_gates;
     bool gdn_replay_enabled;
+    bool gdn_deferred_enabled;
+    uint32_t gdn_deferred_bank;
     bool gdn_replay_active;
     bool gdn_replay_previous;
     uint32_t gdn_replay_prefix;
@@ -625,6 +628,8 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
         getenv("DS4_QWEN4EXP_NO_GDN_REPLAY") == NULL &&
         getenv("DS4_QWEN4EXP_NO_LAZY_ROLLBACK") == NULL &&
         ds4_gpu_qwen4exp_gdn_replay_supported();
+    s->gdn_deferred_enabled = s->gdn_replay_enabled &&
+        getenv("DS4_QWEN4EXP_NO_GDN_DEFERRED") == NULL;
 #endif
 
     const uint64_t E = DS4_N_EMBD;
@@ -762,7 +767,7 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
             s->gdn_state[il] = qwen4exp_alloc_zeroed(state_bytes, &ok);
             if (s->gdn_replay_enabled) {
                 s->gdn_checkpoint[il] = qwen4exp_alloc_zeroed(state_bytes, &ok);
-                const uint64_t tape_bytes = DS4_QWEN4EXP_GDN_REPLAY_ROWS *
+                const uint64_t tape_bytes = (s->gdn_deferred_enabled ? 8u : DS4_QWEN4EXP_GDN_REPLAY_ROWS) *
                     (((uint64_t)DS4_N_GDN_KEY_HEAD + DS4_N_GDN_VALUE_HEAD) *
                      DS4_N_GDN_HEAD_DIM + 2ull * DS4_N_GDN_VALUE_HEAD) * f;
                 s->gdn_replay_tape[il] = qwen4exp_alloc_zeroed(tape_bytes, &ok);
@@ -1048,6 +1053,7 @@ void ds4_qwen4exp_session_reset(ds4_qwen4exp_session *s) {
     s->gdn_replay_active = false;
     s->gdn_replay_previous = false;
     s->gdn_replay_prefix = 0u;
+    s->gdn_deferred_bank = 0u;
     if (!s->state_dirty) {
         /* Already at the reset state and nothing has written since, so every
          * store below would write the value the buffer already holds.  `pos`
@@ -1720,7 +1726,7 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
     if (s->gdn_replay_active) {
         const ds4_gpu_qwen4exp_gdn_replay replay = {
             s->gdn_checkpoint[il], s->gdn_replay_tape[il], s->d_gdn_replay,
-            s->gdn_replay_gates};
+            s->gdn_replay_gates, s->gdn_deferred_enabled};
         rc = ds4_gpu_qwen4exp_gdn_replay_q8(
             s->gdn_out, s->gdn_conv[il], s->gdn_state[il],
             s->gdn_conv_snapshot[il], s->gdn_state_snapshot[il],
@@ -3090,6 +3096,22 @@ static bool qwen4exp_graph_layers(
     return qwen4exp_graph_layers_encode(s, w, m, n_tokens, true);
 }
 
+/* Materialization preserves replay provenance: row-zero snapshots may still
+ * be inspected or adopted after a read of the virtual final state. */
+static bool qwen4exp_gdn_deferred_final(const ds4_qwen4exp_session *s, uint32_t il) {
+    if (!s->gdn_deferred_enabled || !s->gdn_replay_previous || !s->gdn_state[il]) return true;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    const ds4_qwen4exp_gdn_deferred_output o = ds4_qwen4exp_gdn_deferred_output_plan(
+        s->gdn_replay_prefix, s->gdn_deferred_bank);
+    return o.valid && ds4_gpu_qwen4exp_gdn_deferred_materialize(
+        s->gdn_state[il], s->gdn_checkpoint[il], s->gdn_replay_tape[il],
+        o.final_rows, o.bank, DS4_N_GDN_KEY_HEAD, DS4_N_GDN_VALUE_HEAD,
+        DS4_QWEN4EXP_GDN_HEADS_TILED);
+#else
+    return false;
+#endif
+}
+
 /* Diagnostic/fallback bridge: publish the virtual row-zero snapshot into
  * its original slot without changing either the canonical final state or
  * the replay controller. Repeated selections therefore remain well defined. */
@@ -3098,6 +3120,14 @@ static bool qwen4exp_gdn_replay_snapshot(const ds4_qwen4exp_session *s,
     if (!s->gdn_replay_previous) return true;
     if (row != 0u) return false;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (s->gdn_deferred_enabled) {
+        const ds4_qwen4exp_gdn_deferred_output o = ds4_qwen4exp_gdn_deferred_output_plan(
+            s->gdn_replay_prefix, s->gdn_deferred_bank);
+        return o.valid && ds4_gpu_qwen4exp_gdn_deferred_materialize(
+            s->gdn_state_snapshot[il], s->gdn_checkpoint[il], s->gdn_replay_tape[il],
+            o.snapshot_rows, o.bank, DS4_N_GDN_KEY_HEAD, DS4_N_GDN_VALUE_HEAD,
+            DS4_QWEN4EXP_GDN_HEADS_TILED);
+    }
     const uint32_t rows = s->gdn_replay_prefix == DS4_QWEN4EXP_GDN_REPLAY_ROWS
         ? 0u : s->gdn_replay_prefix + 1u;
     return ds4_gpu_qwen4exp_gdn_replay_materialize(
@@ -3208,10 +3238,24 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     /* Plan before changing any pointers. A rejecting replay round continues
      * from the same checkpoint plus its committed row-zero transition. Other
      * adoptions first become ordinary materialized state when necessary. */
-    const ds4_qwen4exp_gdn_replay_step replay_step = ds4_qwen4exp_gdn_replay_plan(
+    ds4_qwen4exp_gdn_replay_step replay_step = ds4_qwen4exp_gdn_replay_plan(
         s->gdn_replay_enabled, s->gdn_replay_previous, s->gdn_replay_prefix,
         DS4_QWEN4EXP_GDN_REPLAY_ROWS, n_tokens, s->spec_snapshot_rows,
         DS4_QWEN4EXP_MTP_MAX_COMMIT, s->adopt_state, s->adopt_conv);
+    const ds4_qwen4exp_gdn_deferred_step deferred_step = ds4_qwen4exp_gdn_deferred_plan(
+        s->gdn_replay_enabled, s->gdn_replay_previous, s->gdn_replay_prefix,
+        s->gdn_deferred_bank, n_tokens, s->spec_snapshot_rows, s->adopt_state, s->adopt_conv);
+    if (s->gdn_deferred_enabled) {
+        if (!deferred_step.valid) return false;
+        if (deferred_step.needs_final) {
+            for (uint32_t il = 0; il < cfg->n_layer; il++)
+                if (!qwen4exp_gdn_deferred_final(s, il)) return false;
+        }
+        replay_step.active = deferred_step.active;
+        replay_step.settle = deferred_step.settle;
+        replay_step.swap = deferred_step.swap;
+        replay_step.prefix = deferred_step.prefix;
+    }
     if (replay_step.settle) {
         const uint32_t rs = s->adopt_state, rc = s->adopt_conv;
         /* ONE BATCH, ONE SYNCHRONIZE, when both halves settle the same row.
@@ -3264,7 +3308,10 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     }
     if (replay_step.active) {
         s->gdn_replay_prefix = replay_step.prefix;
-        if (!ds4_gpu_qwen4exp_update_dpos(s->d_gdn_replay, replay_step.prefix)) {
+        if (s->gdn_deferred_enabled) s->gdn_deferred_bank = deferred_step.bank;
+        const uint32_t control = replay_step.prefix |
+            (s->gdn_deferred_enabled ? s->gdn_deferred_bank << 16u : 0u);
+        if (!ds4_gpu_qwen4exp_update_dpos(s->d_gdn_replay, control)) {
             fprintf(stderr, "ds4: qwen4exp GDN replay prefix update failed\n");
             return false;
         }
@@ -3303,8 +3350,8 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
          * it is on the copy path; `state_dirty` is set above. */
         return qwen4exp_forward_fail();
     }
-    /* Every GDN launch has read the flag; the live buffers are current again.
-     * A replay row-zero snapshot remains virtual until adopted or inspected. */
+    /* Every GDN launch has read the flag. Deferred recurrence retains virtual
+     * final and row-zero states until continued, adopted or inspected. */
     s->gdn_replay_previous = s->gdn_replay_active;
     s->adopt_state = 0u;
     s->adopt_conv = 0u;
@@ -4152,6 +4199,7 @@ static double qwen4exp_gdn_checksum(const ds4_qwen4exp_session *s, uint32_t il,
     const ds4_gpu_tensor *snap =
         recurrent ? s->gdn_state_snapshot[il] : s->gdn_conv_snapshot[il];
     const uint32_t pending = recurrent ? s->adopt_state : s->adopt_conv;
+    if (recurrent && pending == 0u && !qwen4exp_gdn_deferred_final(s, il)) return -2.0;
     if (!live || !snap || pending == 0u) return qwen4exp_state_checksum(live);
     if (recurrent && !qwen4exp_gdn_replay_snapshot(s, il, pending - 1u)) return -2.0;
     const uint64_t bytes = ds4_gpu_tensor_bytes(live);
