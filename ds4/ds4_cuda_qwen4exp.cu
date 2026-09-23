@@ -3944,7 +3944,7 @@ __device__ __forceinline__ static float dev_qwen4exp_block_sum(
 /* The checkpoint asks for ten of at most 512 experts.  One warp can read that
  * envelope as sixteen coalesced rows, keep them in registers, and select the
  * small top-k without sorting the 502 entries the model will discard. */
-template<bool Native>
+template<bool Native, bool KeyMax = false>
 __global__ static void qwen4exp_router_select_topk_kernel(
         int32_t *selected,
         float *weights_out,
@@ -3978,9 +3978,55 @@ __global__ static void qwen4exp_router_select_topk_kernel(
         if (e < n_expert) live |= 1u << j;
     }
 
+    /* KEY-ORDERED ARG-MAX, the crown's fused-router selection carried to this
+     * standalone top-k (every width the fused router does not take: prefill
+     * and the wider verify rows).  Each lane converts its sixteen logits to
+     * order-preserving keys ONCE; every rank is then a sixteen-way integer
+     * max over the still-live keys, one warp max, a sixteen-way match and one
+     * warp min over indices -- instead of sixteen predicated float compares
+     * with index tie-breaks per rank.  The mapping is the fused kernel's,
+     * character for character: canonical zero, NaN and -inf to key 0 (never
+     * chosen, as the float compare never chose them), exact -FLT_MAX kept.
+     * Ties resolve to the lowest expert index exactly as before, so every
+     * pick, and therefore every weight below, is unchanged. */
+#if __CUDA_ARCH__ >= 800
+    uint32_t keys[16];
+    if constexpr (Native && KeyMax) {
+#pragma unroll
+    for (uint32_t j = 0; j < 16u; j++) {
+        const float v = scores[j];
+        const uint32_t bits = v == 0.0f ? 0u : __float_as_uint(v);
+        const uint32_t ordered = bits & 0x80000000u ? ~bits : bits ^ 0x80000000u;
+        keys[j] = v >= -FLT_MAX ? ordered : 0u;
+    }
+    }
+#endif
+
     for (uint32_t rank = 0; rank < n_expert_used; rank++) {
         float best_v = -FLT_MAX;
         int32_t best_i = INT32_MAX;
+#if __CUDA_ARCH__ >= 800
+        if constexpr (Native && KeyMax) {
+        uint32_t best_key = 0u;
+#pragma unroll
+        for (uint32_t j = 0; j < 16u; j++) {
+            const uint32_t key = keys[j] & (0u - ((live >> j) & 1u));
+            best_key = max(best_key, key);
+        }
+        const uint32_t winning_key = __reduce_max_sync(0xffffffffu, best_key);
+        uint32_t matches = 0u;
+#pragma unroll
+        for (uint32_t j = 0; j < 16u; j++)
+            matches |= (uint32_t)(keys[j] == winning_key) << j;
+        matches &= live;
+        if (winning_key == 0u) matches = 0u;
+        const int32_t local_i = matches
+            ? (int32_t)(lane + ((uint32_t)__ffs(matches) - 1u) * 32u)
+            : INT32_MAX;
+        best_i = __reduce_min_sync(0xffffffffu, local_i);
+        } else
+#endif
+        {
 #pragma unroll
         for (uint32_t j = 0; j < 16u; j++) {
             if ((live & (1u << j)) == 0u) continue;
@@ -4016,6 +4062,7 @@ __global__ static void qwen4exp_router_select_topk_kernel(
                     best_i = other_i;
                 }
             }
+        }
         }
         const int32_t chosen =
             __shfl_sync(0xffffffffu, best_i, 0u);
@@ -9644,7 +9691,15 @@ extern "C" int ds4_gpu_qwen4exp_router_select_tensor(
         return 0;
     }
     if (n_expert_used <= 32u) {
-        if (getenv("DS4_QWEN4EXP_NO_ROUTER_NATIVE") == NULL) {
+        if (getenv("DS4_QWEN4EXP_NO_ROUTER_NATIVE") == NULL &&
+            getenv("DS4_QWEN4EXP_NO_ROUTER_KEYMAX") == NULL) {
+            qwen4exp_router_select_topk_kernel<true, true><<<
+                n_tokens, 32u, 0, cuda_decode_stream()>>>(
+                (int32_t *)selected->ptr,
+                (float *)weights->ptr,
+                (const float *)logits->ptr,
+                n_expert, n_expert_used, n_tokens);
+        } else if (getenv("DS4_QWEN4EXP_NO_ROUTER_NATIVE") == NULL) {
             qwen4exp_router_select_topk_kernel<true><<<
                 n_tokens, 32u, 0, cuda_decode_stream()>>>(
                 (int32_t *)selected->ptr,
