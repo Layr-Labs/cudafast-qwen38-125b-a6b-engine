@@ -5,7 +5,7 @@
 /* Refinement shortlist. 276 tail rows plus id 0 hold mandatory slots, so this
  * leaves 1771 score-selected candidates: the top 1.8% of the coarse ranking.
  * Narrowing it is a proposal-policy change, not an exact one. */
-static constexpr uint32_t MTP_NATIVE_CAP = 2048u;
+static constexpr uint32_t MTP_NATIVE_CAP = 1024u;
 static constexpr uint32_t MTP_NATIVE_DIM = 2560u;
 /* Coarse screen depth; full refinement still uses 80 groups. Pairs 24..31 sit
  * out, and the live_pairs mask already names a partial wave (40 groups left the

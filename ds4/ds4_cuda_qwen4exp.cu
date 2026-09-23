@@ -4351,6 +4351,71 @@ __global__ static void qwen4exp_moe_pair_tasks_kernel(
     if (e == 0) tasks[0] = warp_prefix[15];
 }
 
+/* Fused light and heavy pair-tasks kernel: performs the prefix-scan for both
+ * the 32-pair light tile (0 < c <= 32) and the heavy tile (c > 32) in a single
+ * 512-thread CTA pass, eliminating an extra kernel launch from the stream. */
+__global__ static void qwen4exp_moe_dual_pair_tasks_kernel(
+        int32_t *tasks_light, int32_t *tasks_heavy, const int32_t *counts, unsigned total,
+        int32_t tile_light = 32, int32_t tile_heavy = 64) {
+    __shared__ int32_t warp_prefix_l[16];
+    __shared__ int32_t warp_prefix_h[16];
+    const unsigned e = threadIdx.x, lane = e & 31u, warp = e >> 5u;
+    const int32_t c0 = e < total ? counts[e] : 0;
+    const int32_t count_l = (c0 > 0 && c0 <= 32) ? c0 : 0;
+    const int32_t tiles_l = (count_l + tile_light - 1) / tile_light;
+    int32_t prefix_l = tiles_l;
+
+    const int32_t count_h = (c0 > 32) ? c0 : 0;
+    const int32_t tiles_h = (count_h + tile_heavy - 1) / tile_heavy;
+    int32_t prefix_h = tiles_h;
+
+#pragma unroll
+    for (unsigned d = 1; d < 32; d <<= 1) {
+        int32_t vl = __shfl_up_sync(0xffffffffu, prefix_l, d);
+        if (lane >= d) prefix_l += vl;
+        int32_t vh = __shfl_up_sync(0xffffffffu, prefix_h, d);
+        if (lane >= d) prefix_h += vh;
+    }
+    if (lane == 31) {
+        warp_prefix_l[warp] = prefix_l;
+        warp_prefix_h[warp] = prefix_h;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        int32_t vl = lane < 16 ? warp_prefix_l[lane] : 0;
+        int32_t vh = lane < 16 ? warp_prefix_h[lane] : 0;
+#pragma unroll
+        for (unsigned d = 1; d < 32; d <<= 1) {
+            int32_t pl = __shfl_up_sync(0xffffffffu, vl, d);
+            if (lane >= d) vl += pl;
+            int32_t ph = __shfl_up_sync(0xffffffffu, vh, d);
+            if (lane >= d) vh += ph;
+        }
+        if (lane < 16) {
+            warp_prefix_l[lane] = vl;
+            warp_prefix_h[lane] = vh;
+        }
+    }
+    __syncthreads();
+    if (warp) {
+        prefix_l += warp_prefix_l[warp - 1];
+        prefix_h += warp_prefix_h[warp - 1];
+    }
+    const int32_t start_l = prefix_l - tiles_l;
+    for (int32_t t = 0; t < tiles_l; t++) {
+        tasks_light[1 + 2 * (start_l + t)] = (int32_t)e;
+        tasks_light[2 + 2 * (start_l + t)] = t * tile_light;
+    }
+    if (e == 0) tasks_light[0] = warp_prefix_l[15];
+
+    const int32_t start_h = prefix_h - tiles_h;
+    for (int32_t t = 0; t < tiles_h; t++) {
+        tasks_heavy[1 + 2 * (start_h + t)] = (int32_t)e;
+        tasks_heavy[2 + 2 * (start_h + t)] = t * tile_heavy;
+    }
+    if (e == 0) tasks_heavy[0] = warp_prefix_h[15];
+}
+
 /* At decode and verify widths there are at most seventy pairs.  A single
  * 512-thread block can build the complete expert metadata without a memset,
  * count launch, scan launch, scatter launch, or inter-block atomics.  Each
@@ -10409,10 +10474,14 @@ static int qwen4exp_routed_moe_cuda(
             (gu_heavy_env == NULL || gu_heavy_env[0] != '0');
         int32_t *const gu_tasks_heavy =
             gu_tasks ? gu_tasks + (1u + 2u * task_capacity) : NULL;
-        if (pair_tasks) {
+        if (pair_tasks && gu_heavy) {
+            qwen4exp_moe_dual_pair_tasks_kernel<<<1, 512, 0, stream>>>(
+                    gu_tasks, gu_tasks_heavy, sc.counts, n_total_expert, 32, (int32_t)QW_GUH_BN);
+            if (!cuda_ok(cudaGetLastError(), "qwen4exp gate/up dual pair tasks")) return 0;
+        } else if (pair_tasks) {
             qwen4exp_moe_pair_tasks_kernel<<<1, 512, 0, stream>>>(
                     gu_tasks, sc.counts, n_total_expert, 32,
-                    0, gu_heavy ? 32 : 0x7fffffff);
+                    0, 0x7fffffff);
             if (!cuda_ok(cudaGetLastError(), "qwen4exp gate/up pair tasks")) return 0;
         }
         if (gu_heavy) {
@@ -10440,10 +10509,12 @@ static int qwen4exp_routed_moe_cuda(
                                 "shared memory\n");
                 return 0;
             }
-            qwen4exp_moe_pair_tasks_kernel<<<1, 512, 0, stream>>>(
-                    gu_tasks_heavy, sc.counts, n_total_expert, (int32_t)QW_GUH_BN,
-                    32, 0x7fffffff);
-            if (!cuda_ok(cudaGetLastError(), "qwen4exp gate/up heavy tasks")) return 0;
+            if (!pair_tasks) {
+                qwen4exp_moe_pair_tasks_kernel<<<1, 512, 0, stream>>>(
+                        gu_tasks_heavy, sc.counts, n_total_expert, (int32_t)QW_GUH_BN,
+                        32, 0x7fffffff);
+                if (!cuda_ok(cudaGetLastError(), "qwen4exp gate/up heavy tasks")) return 0;
+            }
             (guh_ahead ? qwen4exp_moe_gateup_heavy_kernel<true>
                        : qwen4exp_moe_gateup_heavy_kernel<false>)<<<
                     dim3(mid_dim / QW_GUH_BM, (unsigned)task_capacity, 1),
