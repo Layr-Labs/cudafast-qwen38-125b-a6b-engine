@@ -18119,6 +18119,18 @@ extern "C" void ds4_gpu_set_q8_mma_pipe_wide(int mode) {
     g_q8_mma_pipe_wide = mode;
 }
 
+/* The GDN projection bandwidth pair, defined next to the kernel it measures a
+ * couple of thousand lines below.  Forward-declared here because the kernel is
+ * `static` in this translation unit and so the probe has to be too, while the
+ * only channel that reaches a ranked run's metrics is this function. */
+#ifndef DS4_GPROJ_BW_PROBE_BUILD
+#define DS4_GPROJ_BW_PROBE_BUILD 1
+#endif
+#if DS4_GPROJ_BW_PROBE_BUILD
+static int qw_gproj_bw_probe(int *real_gbs, int *copy_gbs, int *occ_real,
+                            int *occ_copy, int *regs, int *lmem);
+#endif
+
 /* The device's occupancy limits, as a compact string the caller can append to
  * an identity that reaches the run's metrics.  See ds4.h for why this is worth
  * publishing.
@@ -18176,6 +18188,36 @@ extern "C" const char *ds4_gpu_hw_limits(void) {
                      "smem/blk_optin=%d sm=%d cc=%d.%d integrated=%d coop=%d",
                      got[0], got[1], got[2], got[3], got[4], got[5]);
     if (n < 0) { buf[0] = '\0'; return buf; }
+#if DS4_GPROJ_BW_PROBE_BUILD
+    /* The GDN projection pair, emitted BEFORE the routed-MoE string for the same
+     * reason that string reports its own bandwidth legs early: this buffer is
+     * what truncates, and if anything has to be lost it should be the gu8[] tail,
+     * which is a known constant, rather than a number nobody has.  Measured
+     * budget with every field at its realistic width: 55 (attributes) + 41
+     * (this) + 1 + 307 (routed-MoE) = 404 of 447, so nothing is lost today.
+     *
+     * Same latch discipline as the probes in the other translation unit: run
+     * once, cache, and survive a future second caller by going stale rather than
+     * by charging ~15 ms of GPU work to a timed path. */
+    {
+        static int gp_done = 0;
+        static int gp_c[7] = {-1, -1, -1, -1, -1, -1, 0};
+        if (!gp_done) {
+            gp_done = 1;
+            const char *const gp_env = getenv("DS4_NO_GPROJ_PROBE");
+            if (gp_env == NULL || gp_env[0] == '\0')
+                gp_c[6] = qw_gproj_bw_probe(&gp_c[0], &gp_c[1], &gp_c[2],
+                                            &gp_c[3], &gp_c[4], &gp_c[5]);
+        }
+        if ((size_t)n + 2u < sizeof(buf)) {
+            const int m = snprintf(buf + n, sizeof(buf) - (size_t)n,
+                                   " gp[r=%d c=%d or=%d oc=%d rg=%d lm=%d s=%d]",
+                                   gp_c[0], gp_c[1], gp_c[2], gp_c[3], gp_c[4],
+                                   gp_c[5], gp_c[6]);
+            if (m > 0 && (size_t)(n + m) < sizeof(buf)) n += m;
+        }
+    }
+#endif
     /* The register/shared footprint of the two routed-MoE decode kernels, from
      * the translation unit that owns them.  Truncation is harmless: the string
      * is diagnostic only and snprintf keeps it terminated. */
@@ -20803,6 +20845,297 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
     }
     }
 }
+
+/* ===== gp[]: PRICING THE LARGEST UNPRICED KERNEL IN THE DECODE ROUND =====
+ *
+ * `qwen_gdn_projection_kernel` carries attn_qkv + attn_gate at the decode
+ * width.  Its own header above says so and says nobody has measured it; the
+ * probe that header refers to (the one reaching `engine_backend`) covers the
+ * three routed-MoE kernels, the gate/up fills and the GDN state stream, and
+ * this kernel is in none of them.  The bytes, from this file's own shape
+ * constants (in_dim 2560 -> 80 q8_0 blocks -> a 2720-byte row):
+ *
+ *   (qkv_dim 10240 + gate_dim 6144) * 2720 B = 44.56 MB per layer
+ *   * 36 gated-deltanet layers                = 1.604 GB per decode token
+ *
+ * Against a 51.37 ms decode token that is 15% of the round at 207 GB/s and 26%
+ * at 120 GB/s.  The span between those two rates alone is 3.0 ms = 5.9% of
+ * decode.  Which end of it this kernel actually sits at is unknown, and the
+ * whole point of the boot probe is that a question of that size should not stay
+ * unknown when the answer costs one untimed launch pair.
+ *
+ * The pair, deliberately shaped so the ratio is the reading:
+ *
+ *   gp[r=...]  the real instantiation the decode dispatch selects,
+ *              qwen_gdn_projection_kernel<2,true,true>, at the real grid
+ *              (96 f32 blocks + 4096 q8 blocks = 4192), 256 threads and the
+ *              real 10,896-byte dynamic panel.
+ *   gp[c=...]  the same panel fetched as the same dense uint4 run at the same
+ *              grid, block shape and dynamic smem, with the funnel-shift
+ *              decode, the __dp4a walk and both reduction trees removed.
+ *
+ * REPORT THE RATIO, NOT EITHER NUMBER.  The gate/up probe taught this the
+ * expensive way: its invariant leg spanned 6.7% across four boots on
+ * byte-identical code, which is larger than the effect I had published off a
+ * single boot.  r/c is a within-boot paired quantity and the box speed divides
+ * out of it; r and c on their own are not comparable between draws.
+ *
+ * Byte accounting.  Only the q8 panel bytes are counted, in BOTH legs.  The
+ * f32 half's weights live in the small shared buffer and are the same 983,040 B
+ * on every set, so they are L2-resident after the first launch; they cost time
+ * in both legs and are counted in neither, which is a common factor that
+ * divides out of r/c.  The activation reads (x, xq, xscale) are a few KB, are
+ * L2-resident for the whole grid, and are present in the real leg only.
+ *
+ * Occupancy is reported for both legs (or/oc) and the copy leg carries the same
+ * QW_GDN_PROJ_ATTR cap and the same dynamic smem request, because a ceiling leg
+ * that gets more blocks/SM than the kernel it bounds is not a ceiling.  If
+ * or != oc, discount the pair.
+ *
+ * rg/lm are `cudaFuncGetAttributes` on the real instantiation.  That reading is
+ * not incidental: the __maxnreg__(40) cap above pre-committed to being reverted
+ * if the built library reports lmem != 0 for an R=2 instantiation, and this is
+ * the only channel on this board that can adjudicate that from a ranked run.
+ *
+ * Every buffer is zero-filled and that is safe here: a zero __half scale gives
+ * ws = 0, xscale = 0, every __dp4a accumulates 0, nothing in the path divides,
+ * and no branch is data-dependent -- so the arithmetic stays finite and the
+ * instruction stream stays data-independent.  The slab adds 32 bytes of slop
+ * between and after the two weight planes so the decoder's unaligned last word
+ * pair and the launch's +16 stay inside the allocation, exactly as the real
+ * dispatch does.
+ *
+ * PDL.  The kernel contains QWEN4EXP_PDL_SYNC() and this launch is plain, with
+ * no programmatic-completion attribute.  Two independent statements in this tree
+ * say that is safe -- the valve comment in ds4_cuda_qwen4exp.cuh ("plain
+ * launches, the triggers fire into nothing, the fences are no-ops") and the
+ * plain-launch note on the three-row path a few hundred lines below -- and it
+ * matches the documented semantics of the intrinsic.  DS4_NO_GPROJ_PROBE
+ * disables the whole thing at run time without a rebuild, so if a box ever
+ * disagrees the reading is recoverable and the engine is not. */
+#ifndef DS4_GPROJ_BW_PROBE_BUILD
+#define DS4_GPROJ_BW_PROBE_BUILD 1
+#endif
+#if DS4_GPROJ_BW_PROBE_BUILD
+__global__ QW_GDN_PROJ_ATTR static void qw_gproj_bw_copy_kernel(
+        qwen_gdn_projection_args a) {
+    extern __shared__ uint4 qw_gproj_cpanel[];
+    char *const gpanel = (char *)qw_gproj_cpanel;
+    constexpr unsigned B = 256u;
+    const uint32_t split = (uint32_t)((a.od[0] + B / 64u - 1u) / (B / 64u));
+    if (blockIdx.x >= 96u) {
+        const uint32_t qb = blockIdx.x - 96u;
+        const bool second = qb >= split;
+        const uint32_t block = second ? qb - split : qb;
+        const unsigned char *const w = second ? a.weights[1] : a.weights[0];
+        const uint64_t panel_bytes = (uint64_t)(B / 64u) * a.blocks * 34u;
+        const char *const gp = (const char *)w + (uint64_t)block * panel_bytes;
+        /* The real kernel's cp.async arm, verbatim, because the real leg is the
+         * CpA=true instantiation.  Using the plain uint4 fill here instead would
+         * have handed the ceiling leg a fill that the gate/up probe measured as
+         * ~1.4% FASTER than cp.async on this box, biasing the ratio down by a
+         * known amount for no reason.  Matching the fill exactly makes the walk
+         * the only difference between the two legs, which is the contrast this
+         * pair exists to draw. */
+        if (((uintptr_t)gp & 15u) == 0u) {
+            for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
+                 i += (uint64_t)B * 16u) {
+                if (i + 16u <= panel_bytes)
+                    tt_cp_async_16B(gpanel + i, gp + i, true);
+                else
+                    for (uint64_t j = i; j < panel_bytes; j++) gpanel[j] = gp[j];
+            }
+            tt_cp_async_commit();
+            tt_cp_async_wait_group<0>();
+        } else {
+            /* The same fallback the real kernel keeps, so a slab that is only
+             * word-aligned cannot make the two legs take different paths.  The
+             * probe's own slab is 256-aligned and the panel stride is a multiple
+             * of 16, so this arm is unreachable here by construction; it exists
+             * so that stays true if the allocation ever changes. */
+            for (uint64_t i = (uint64_t)threadIdx.x * 4u; i < panel_bytes;
+                 i += (uint64_t)B * 4u) {
+                if (i + 4u <= panel_bytes)
+                    *(uint32_t *)(gpanel + i) =
+                        *(const uint32_t *)(const void *)(gp + i);
+                else
+                    for (uint64_t j = i; j < panel_bytes; j++) gpanel[j] = gp[j];
+            }
+        }
+        __syncthreads();
+        /* Sink.  Every thread re-reads the first byte of each 16-byte word it
+         * filled, so no global load is dead; the data is zero so the store never
+         * executes, and the compiler cannot know that. */
+        int s = 0;
+        for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
+             i += (uint64_t)B * 16u)
+            s += (int)(unsigned char)gpanel[i];
+        if (s != 0) (second ? a.out[1] : a.out[0])[threadIdx.x] = (float)s;
+    } else {
+        const uint32_t fp_index = blockIdx.x;
+        const float *const w =
+            (const float *)(fp_index >= 48u ? a.weights[3] : a.weights[2]);
+        const uint64_t col = fp_index % 48u;
+        float s = 0.0f;
+        if (threadIdx.x < 128u) {
+            for (int m = 0; m < 10; m++) {
+                const unsigned at = 2u * threadIdx.x + 256u * (unsigned)m;
+                float wv[2];
+                qwen_f32_vector_read<2>(wv, w + col * 2560u + at);
+                s += wv[0] + wv[1];
+            }
+        }
+        if (s != 0.0f) (fp_index >= 48u ? a.out[3] : a.out[2])[0] = s;
+    }
+}
+
+static int qw_gproj_bw_probe(int *real_gbs, int *copy_gbs, int *occ_real,
+                             int *occ_copy, int *regs, int *lmem) {
+    enum { IN = 2560, BLK = IN / 32, ROWB = BLK * 34, QKV = 10240, GATE = 6144,
+           NROWS = 2, THREADS = 256, PER = THREADS / 64, PANEL = PER * ROWB,
+           SPLIT = QKV / PER, GBLK = GATE / PER, QB = SPLIT + GBLK,
+           GRID = 96 + QB, SMEM = PANEL + 16, PASSES = 2, WANT = 4 };
+    const uint64_t w0 = (uint64_t)SPLIT * (uint64_t)PANEL;   /* 27,852,800 */
+    const uint64_t w1 = (uint64_t)GBLK * (uint64_t)PANEL;    /* 16,711,680 */
+    const uint64_t q8_bytes = w0 + w1;                       /* 44,564,480 */
+    const uint64_t set_bytes = (w0 + 32u + w1 + 32u + 255u) & ~(uint64_t)255u;
+
+    char *slab = NULL;
+    int sets = WANT;
+    while (sets >= 1) {
+        if (cudaMalloc((void **)&slab, (size_t)(set_bytes * (uint64_t)sets)) ==
+            cudaSuccess)
+            break;
+        (void)cudaGetLastError();
+        slab = NULL;
+        sets = sets > 1 ? sets / 2 : 0;
+    }
+    if (!slab) return 0;
+    /* out0 81,920 @ 0 | out1 49,152 @ 131,072 | out2 384 @ 196,608
+     * out3 384 @ 200,704 | fw2 491,520 @ 262,144 | fw3 491,520 @ 786,432
+     * x 20,480 @ 1,310,720 | xq 5,120 @ 1,343,488 | xs 640 @ 1,376,256 */
+    const size_t small_bytes = 1572864;
+    char *small = NULL;
+    if (cudaMalloc((void **)&small, small_bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        cudaFree(slab);
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (cudaMemset(slab, 0, (size_t)(set_bytes * (uint64_t)sets)) !=
+            cudaSuccess ||
+        cudaMemset(small, 0, small_bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        cudaFree(small);
+        cudaFree(slab);
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    qwen_gdn_projection_args a;
+    a.out[0] = (float *)(void *)(small + 0);
+    a.out[1] = (float *)(void *)(small + 131072);
+    a.out[2] = (float *)(void *)(small + 196608);
+    a.out[3] = (float *)(void *)(small + 200704);
+    a.weights[2] = (const unsigned char *)(void *)(small + 262144);
+    a.weights[3] = (const unsigned char *)(void *)(small + 786432);
+    a.x = (const float *)(void *)(small + 1310720);
+    a.xq = (const int8_t *)(void *)(small + 1343488);
+    a.xscale = (const float *)(void *)(small + 1376256);
+    a.od[0] = (uint64_t)QKV;
+    a.od[1] = (uint64_t)GATE;
+    a.n_rows = (uint32_t)NROWS;
+    a.blocks = (uint64_t)BLK;
+
+    cudaEvent_t e0, e1;
+    if (cudaEventCreate(&e0) != cudaSuccess) {
+        (void)cudaGetLastError();
+        cudaFree(small);
+        cudaFree(slab);
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (cudaEventCreate(&e1) != cudaSuccess) {
+        (void)cudaGetLastError();
+        cudaEventDestroy(e0);
+        cudaFree(small);
+        cudaFree(slab);
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    auto launch = [&](int leg, int s) {
+        qwen_gdn_projection_args b = a;
+        char *const base = slab + (uint64_t)s * set_bytes;
+        b.weights[0] = (const unsigned char *)(void *)base;
+        b.weights[1] = (const unsigned char *)(void *)(base + w0 + 32u);
+        if (leg == 0)
+            qwen_gdn_projection_kernel<2, true, true>
+                <<<(unsigned)GRID, (unsigned)THREADS, (size_t)SMEM>>>(b);
+        else
+            qw_gproj_bw_copy_kernel
+                <<<(unsigned)GRID, (unsigned)THREADS, (size_t)SMEM>>>(b);
+    };
+    auto time_leg = [&](int leg) -> int {
+        launch(leg, 0);
+        if (cudaDeviceSynchronize() != cudaSuccess) {
+            (void)cudaGetLastError();
+            return -1;
+        }
+        if (cudaEventRecord(e0, 0) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return -1;
+        }
+        for (int p = 0; p < PASSES; p++)
+            for (int s = 0; s < sets; s++) launch(leg, s);
+        if (cudaEventRecord(e1, 0) != cudaSuccess ||
+            cudaDeviceSynchronize() != cudaSuccess) {
+            (void)cudaGetLastError();
+            return -1;
+        }
+        float ms = 0.0f;
+        if (cudaEventElapsedTime(&ms, e0, e1) != cudaSuccess || !(ms > 0.0f)) {
+            (void)cudaGetLastError();
+            return -1;
+        }
+        const double bytes =
+            (double)q8_bytes * (double)sets * (double)PASSES;
+        return (int)(bytes / ((double)ms * 1.0e6) + 0.5);
+    };
+
+    *real_gbs = time_leg(0);
+    *copy_gbs = time_leg(1);
+    int occ = -1;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ, qwen_gdn_projection_kernel<2, true, true>, (int)THREADS,
+            (size_t)SMEM) == cudaSuccess)
+        *occ_real = occ;
+    else
+        (void)cudaGetLastError();
+    occ = -1;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ, qw_gproj_bw_copy_kernel, (int)THREADS, (size_t)SMEM) ==
+        cudaSuccess)
+        *occ_copy = occ;
+    else
+        (void)cudaGetLastError();
+    cudaFuncAttributes fa;
+    if (cudaFuncGetAttributes(&fa, qwen_gdn_projection_kernel<2, true, true>) ==
+        cudaSuccess) {
+        *regs = fa.numRegs;
+        *lmem = (int)fa.localSizeBytes;
+    } else {
+        (void)cudaGetLastError();
+    }
+
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+    cudaFree(small);
+    cudaFree(slab);
+    (void)cudaGetLastError();
+    return sets;
+}
+#endif  /* DS4_GPROJ_BW_PROBE_BUILD */
 
 extern "C" int ds4_gpu_matmul_f32_decode_rows_exact_tensor(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
