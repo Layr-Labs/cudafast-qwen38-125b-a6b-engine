@@ -497,6 +497,64 @@ __device__ static float warp_sum_all_f32(float v) {
     return v;
 }
 
+/* Warp REDUX maxima for the Q8_0 group-scale reductions, and the matching
+ * integer group sum.
+ *
+ * MAX.  The reduced value at every site this replaces is `fabsf()` of an
+ * activation, at nine of the ten sites additionally flushed by
+ * qwen4exp_q8_ftz: zero, a positive finite float, or +inf.  Over that domain
+ * the binary32 bit pattern is order-isomorphic to its unsigned integer
+ * pattern -- the sign bit is 0, so the biased exponent field dominates and
+ * the mantissa breaks ties in the same direction the real order does -- so
+ * __reduce_max_sync over the bits selects the SAME operand the shuffle
+ * butterfly selected, bit for bit, and the derived scale is unchanged.  Only
+ * the value is needed (never which lane held it), and equal maxima are equal
+ * bit patterns, so the choice of winner is unobservable.  REDUX also leaves
+ * the maximum in EVERY lane, which is what the xor butterflies already
+ * relied on and what lets the __shfl_down form's broadcast shuffle go away.
+ * This is the same argument the promoted router KeyMax carries for its
+ * packed integer keys; here the domain is the non-negative float one.
+ *
+ * DISCLOSED BOUNDARY.  Were a lane's value NaN the two forms would differ:
+ * fmaxf returns the non-NaN operand, while the unsigned bit compare ranks a
+ * NaN above +inf.  The claim is therefore exactness on the flushed
+ * non-negative domain conditional on finiteness, not unconditional
+ * exactness.  A NaN activation is not a case the engine tolerates anywhere
+ * upstream of these quantisers -- it would already have failed the
+ * correctness gate -- and every local leg of this tree reports
+ * max_abs_diff=0 against the public golden.
+ *
+ * SUM.  __reduce_add_sync sums the same 32 int32 operands as the
+ * __shfl_down tree.  Two's-complement int32 addition is associative and
+ * commutative modulo 2^32 and wraps identically, so the total is the tree's
+ * bit for bit -- no reassociation hazard of the kind a float sum would carry.
+ * The collective returns to every lane, so the CALL must sit outside any lane
+ * guard (a full-mask collective that only some lanes reach is undefined);
+ * only the store stays lane-0, exactly as before.
+ *
+ * Both are sm_80+; the pre-sm_80 build keeps the shipped butterflies. */
+__device__ __forceinline__ static float qwen4exp_warp_max_nonneg(float a) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    return __uint_as_float(__reduce_max_sync(0xffffffffu, __float_as_uint(a)));
+#else
+    for (int off = 16; off > 0; off >>= 1) {
+        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+    }
+    return a;
+#endif
+}
+
+__device__ __forceinline__ static int qwen4exp_warp_add_i32(int v) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    return (int)__reduce_add_sync(0xffffffffu, (unsigned)v);
+#else
+    for (uint32_t stride = 16u; stride > 0u; stride >>= 1u) {
+        v += __shfl_down_sync(0xffffffffu, v, stride);
+    }
+    return v;
+#endif
+}
+
 __device__ static float dot4_f32(float4 a, float4 b) {
     return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
 }
@@ -3824,12 +3882,10 @@ __device__ __forceinline__ static void dev_qwen4exp_quantize_group(
      * pass. */
     float a = 0.0f;
     if (lane < n) a = fabsf(xr[lane]);
-    float m = a;
-#pragma unroll
-    for (uint32_t stride = 16u; stride > 0u; stride >>= 1u) {
-        m = fmaxf(m, __shfl_down_sync(0xffffffffu, m, stride));
-    }
-    m = __shfl_sync(0xffffffffu, m, 0);
+    /* Lanes at or past n contribute +0.0f, the maximum's identity, so the
+     * padding cannot select anything; the helper leaves the maximum in every
+     * lane, which is what the broadcast shuffle used to establish. */
+    const float m = qwen4exp_warp_max_nonneg(a);
     const float d = m / 127.0f;
     const float id = d != 0.0f ? 1.0f / d : 0.0f;
     if (lane == 0u) xscale[at] = d;
@@ -3842,11 +3898,9 @@ __device__ __forceinline__ static void dev_qwen4exp_quantize_group(
     }
     dst[lane] = (int8_t)v;
 
-    int sv = v;
-#pragma unroll
-    for (uint32_t stride = 16u; stride > 0u; stride >>= 1u) {
-        sv += __shfl_down_sync(0xffffffffu, sv, stride);
-    }
+    /* Outside the lane guard: the full-mask collective must be reached by
+     * every lane.  Only the store is lane-0, as it was. */
+    const int sv = qwen4exp_warp_add_i32(v);
     if (lane == 0u) xsum[at] = sv;
 }
 
@@ -7660,7 +7714,7 @@ __global__ static void qwen4exp_moe_down_q_kernel(
  * alignment, the divisibility or the shared-memory budget does not hold, and
  * DS4_QWEN4EXP_NO_SH_GATEUP_PANEL stands it down. */
 template <int R, int GateType = -1, int UpType = -1, bool Vector = false,
-          bool Stage = false>
+          bool Stage = false, bool CpA = false>
 __global__ static void qwen4exp_shared_gateup_q_kernel(
         float *mid,
         const char *gate,
@@ -7691,6 +7745,39 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
             gate + (uint64_t)(blockIdx.x * 8u) * gate_row_bytes;
         const char *const usrc =
             up + (uint64_t)(blockIdx.x * 8u) * up_row_bytes;
+        if (CpA) {
+            /* cp.async PANEL FILL, and the same reordering the routed down
+             * panel and the GDN projection's staged panel carry: issue, commit,
+             * THEN the grid-dependency fence, then the wait, then the barrier.
+             * The shipped synchronous fill stalls its threads on the loads
+             * before the fence, so the panel completes in front of the
+             * producer's drain instead of riding it.  Two panels, two dense
+             * bursts, one commit group; the copy engine moves identical bytes
+             * with no destination register, so the panel image -- and every
+             * float the group decoder later computes from it -- is the shipped
+             * fill's.  Partial trailing words keep the per-byte path.
+             * DS4_QWEN4EXP_NO_SH_GATEUP_CPASYNC restores the shipped fill. */
+            for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < gbytes;
+                 i += (uint64_t)blockDim.x * 16u) {
+                if (i + 16u <= gbytes)
+                    qw_cpasync16((uint32_t)__cvta_generic_to_shared(gpanel + i),
+                                 (const void *)(gsrc + i));
+                else
+                    for (uint64_t j = i; j < gbytes; j++) gpanel[j] = gsrc[j];
+            }
+            for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < ubytes;
+                 i += (uint64_t)blockDim.x * 16u) {
+                if (i + 16u <= ubytes)
+                    qw_cpasync16((uint32_t)__cvta_generic_to_shared(upanel + i),
+                                 (const void *)(usrc + i));
+                else
+                    for (uint64_t j = i; j < ubytes; j++) upanel[j] = usrc[j];
+            }
+            qw_cpasync_commit();
+            QWEN4EXP_PDL_SYNC();
+            qw_cpasync_wait0();
+            __syncthreads();
+        } else {
         for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < gbytes;
              i += (uint64_t)blockDim.x * 16u) {
             if (i + 16u <= gbytes)
@@ -7707,6 +7794,7 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
         }
         QWEN4EXP_PDL_SYNC();
         __syncthreads();
+        }
     }
     const char *const gate_row = Stage
         ? (const char *)(gpanel + (uint64_t)(threadIdx.x >> 5u) * gate_row_bytes)
@@ -7835,7 +7923,8 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
  * is block-uniform once out_dim % 8 == 0 -- required at the launch before this
  * arm is selected -- and the staged arm skips the deep call inside the walk, so
  * a thread performs exactly one grid dependency sync either way. */
-template <int R, int DownType = -1, bool Vector = false, bool Stage = false>
+template <int R, int DownType = -1, bool Vector = false, bool Stage = false,
+          bool CpA = false>
 __global__ static void qwen4exp_shared_down_q_kernel(
         float *out,
         const char *down,
@@ -7860,15 +7949,47 @@ __global__ static void qwen4exp_shared_down_q_kernel(
     if (Stage) {
         const uint64_t panel_bytes = (uint64_t)8u * down_row_bytes;
         const char *const gp = down + (uint64_t)(blockIdx.x * 8u) * down_row_bytes;
-        for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
-             i += (uint64_t)blockDim.x * 16u) {
-            if (i + 16u <= panel_bytes)
-                *(uint4 *)(spanel + i) = *(const uint4 *)(const void *)(gp + i);
-            else
-                for (uint64_t j = i; j < panel_bytes; j++) spanel[j] = gp[j];
+        if (CpA) {
+            /* cp.async PANEL FILL.  The shipped fill routes every 16-byte word
+             * through the register file (ld.global.v4 then st.shared.v4, a live
+             * uint4 per outstanding word) and the thread stalls on those loads
+             * BEFORE it reaches the grid-dependency fence, so the panel cannot
+             * actually ride the producer's drain -- it completes in front of it.
+             * cp.async hands the same 16 bytes to the copy engine with one
+             * instruction and no destination register, so the thread reaches the
+             * fence immediately and the copies fly across the producer's drain;
+             * the wait moves to after the fence, just before the barrier that
+             * publishes the panel.  This is the same reordering the GDN
+             * projection's staged panel carries.  Same source bytes, same panel
+             * image, same decoder afterwards -- a copy engine cannot change a
+             * value.  A partial trailing word keeps the per-byte path, so the
+             * panel is byte-identical either way.  The plain form is used, not
+             * an L2::cache_hint variant (those are recorded in this file as
+             * faulting at run time on this toolchain).
+             * DS4_QWEN4EXP_NO_SH_DOWN_CPASYNC restores the shipped fill. */
+            for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
+                 i += (uint64_t)blockDim.x * 16u) {
+                if (i + 16u <= panel_bytes)
+                    qw_cpasync16((uint32_t)__cvta_generic_to_shared(spanel + i),
+                                 (const void *)(gp + i));
+                else
+                    for (uint64_t j = i; j < panel_bytes; j++) spanel[j] = gp[j];
+            }
+            qw_cpasync_commit();
+            QWEN4EXP_PDL_SYNC();
+            qw_cpasync_wait0();
+            __syncthreads();
+        } else {
+            for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
+                 i += (uint64_t)blockDim.x * 16u) {
+                if (i + 16u <= panel_bytes)
+                    *(uint4 *)(spanel + i) = *(const uint4 *)(const void *)(gp + i);
+                else
+                    for (uint64_t j = i; j < panel_bytes; j++) spanel[j] = gp[j];
+            }
+            QWEN4EXP_PDL_SYNC();
+            __syncthreads();
         }
-        QWEN4EXP_PDL_SYNC();
-        __syncthreads();
     }
     const char *down_row = Stage
         ? (spanel + (uint64_t)(threadIdx.x >> 5u) * down_row_bytes)
@@ -9880,10 +10001,7 @@ __global__ static void qwen4exp_ehx_pack_quant_kernel(
                       : hidden[row * n_embd + (k - n_embd)])
         : 0.0f;
     float a = fabsf(xv);
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-    }
+a = qwen4exp_warp_max_nonneg(a);
     const float d = a / 127.0f;
     const float id = d != 0.0f ? 1.0f / d : 0.0f;
     if (lane == 0u) xscale[pair] = d;
@@ -11296,17 +11414,24 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         ((uintptr_t)up & 15u) == 0u &&
         sh_gu_bytes <= 65536u &&
         getenv("DS4_QWEN4EXP_NO_SH_GATEUP_PANEL") == NULL;
-#define QWEN4EXP_SH_GATEUP_LAUNCH(R, GT, UT, V, S, SH) do { \
+    /* cp.async panel fill for the staged arm (kernel comment at the fill).
+     * sh_gu_stage already proves the 16-byte slab alignment and the 16-byte
+     * panel spans that the copies need.  Default on;
+     * DS4_QWEN4EXP_NO_SH_GATEUP_CPASYNC selects the register-staged fill in
+     * the same binary. */
+    const int sh_gu_cpasync = sh_gu_stage &&
+        getenv("DS4_QWEN4EXP_NO_SH_GATEUP_CPASYNC") == NULL;
+#define QWEN4EXP_SH_GATEUP_LAUNCH(R, GT, UT, V, S, SH, CPA) do { \
     if (n_tokens <= 2u) { \
         QWEN4EXP_LAUNCH_PDL( \
-                (qwen4exp_shared_gateup_q_kernel<R, GT, UT, V, S>), \
+                (qwen4exp_shared_gateup_q_kernel<R, GT, UT, V, S, CPA>), \
                 (dim3((mid_dim + 7u) / 8u, tiles, 1)), \
                 threads, (SH), side, \
                 (float *)mid->ptr, gate, up, xq, xs, xsum, \
                 gate_slab->row_bytes, up_slab->row_bytes, \
                 gate_slab->type, up_slab->type, xgroups, mid_dim, n_tokens); \
     } else { \
-        qwen4exp_shared_gateup_q_kernel<R, GT, UT, V, S> \
+        qwen4exp_shared_gateup_q_kernel<R, GT, UT, V, S, CPA> \
             <<<dim3((mid_dim + 7u) / 8u, tiles, 1), threads, (SH), side>>>( \
                     (float *)mid->ptr, gate, up, xq, xs, xsum, \
                     gate_slab->row_bytes, up_slab->row_bytes, \
@@ -11315,9 +11440,13 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
 } while (0)
 #define QWEN4EXP_SH_GATEUP_IMPL(R, GT, UT, V) do { \
     if (sh_gu_stage) { \
-        QWEN4EXP_SH_GATEUP_LAUNCH(R, GT, UT, V, true, (size_t)sh_gu_bytes); \
+        if (sh_gu_cpasync) { \
+            QWEN4EXP_SH_GATEUP_LAUNCH(R, GT, UT, V, true, (size_t)sh_gu_bytes, true); \
+        } else { \
+            QWEN4EXP_SH_GATEUP_LAUNCH(R, GT, UT, V, true, (size_t)sh_gu_bytes, false); \
+        } \
     } else { \
-        QWEN4EXP_SH_GATEUP_LAUNCH(R, GT, UT, V, false, 0); \
+        QWEN4EXP_SH_GATEUP_LAUNCH(R, GT, UT, V, false, 0, false); \
     } \
 } while (0)
 #define QWEN4EXP_SH_GATEUP(R) do { \
@@ -11452,11 +11581,20 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
         ((uintptr_t)down & 15u) == 0u &&
         sd_panel <= QW_DOWN_PANEL_MAX_BYTES &&
         getenv("DS4_QWEN4EXP_NO_SHARED_DOWN_PANEL") == NULL;
-#define QWEN4EXP_SH_DOWN_IMPL(R, DT, V) do { \
+    /* cp.async panel fill for the staged arm (kernel comment at the fill).
+     * Its alignment premises are sd_stage's own: a 16-byte aligned slab base
+     * and a panel that is a whole number of 16-byte words, with any trailing
+     * partial word still filled per byte.  Default on;
+     * DS4_QWEN4EXP_NO_SH_DOWN_CPASYNC selects the register-staged fill in the
+     * same binary, and CpA=false is a compile-time elimination of the new
+     * code, so that control arm is the shipped instantiation. */
+    const int sd_cpasync = sd_stage &&
+        getenv("DS4_QWEN4EXP_NO_SH_DOWN_CPASYNC") == NULL;
+#define QWEN4EXP_SH_DOWN_IMPL(R, DT, V, CPA) do { \
     if (n_tokens <= 2u) { \
         if (sd_stage) { \
             QWEN4EXP_LAUNCH_PDL( \
-                    (qwen4exp_shared_down_q_kernel<R, DT, V, true>), \
+                    (qwen4exp_shared_down_q_kernel<R, DT, V, true, CPA>), \
                     (dim3((out_dim + 7u) / 8u, tiles, 1)), \
                     threads, (size_t)sd_panel, sd_stream, \
                     (float *)out->ptr, down, mq, ms, msum, \
@@ -11472,7 +11610,7 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
                     down_slab->type, mgroups, out_dim, n_tokens); \
         } \
     } else if (sd_stage) { \
-        qwen4exp_shared_down_q_kernel<R, DT, V, true> \
+        qwen4exp_shared_down_q_kernel<R, DT, V, true, CPA> \
             <<<dim3((out_dim + 7u) / 8u, tiles, 1), threads, \
                (size_t)sd_panel, sd_stream>>>( \
                     (float *)out->ptr, down, mq, ms, msum, \
@@ -11489,12 +11627,15 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_preq_tensor(
 #define QWEN4EXP_SH_DOWN(R) do { \
     if (specialize_shared && down_slab->type == DS4_QWEN4EXP_TY_q8_0) { \
         if (vector_shared && (((uintptr_t)mq & 15u) == 0u)) { \
-            QWEN4EXP_SH_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q8_0, true); \
+            if (sd_cpasync) { QWEN4EXP_SH_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q8_0, true, true); } \
+            else { QWEN4EXP_SH_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q8_0, true, false); } \
         } else { \
-            QWEN4EXP_SH_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q8_0, false); \
+            if (sd_cpasync) { QWEN4EXP_SH_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q8_0, false, true); } \
+            else { QWEN4EXP_SH_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q8_0, false, false); } \
         } \
     } else { \
-        QWEN4EXP_SH_DOWN_IMPL(R, -1, false); \
+        if (sd_cpasync) { QWEN4EXP_SH_DOWN_IMPL(R, -1, false, true); } \
+        else { QWEN4EXP_SH_DOWN_IMPL(R, -1, false, false); } \
     } \
 } while (0)
     if (tile == 8) { QWEN4EXP_SH_DOWN(8); }
@@ -12100,10 +12241,7 @@ __global__ static void qwen4exp_gdn_output_quant_kernel(
         qwen4exp_gdn_sigmoid(output_gate[base + tid]);
     const float vz = qwen4exp_q8_ftz(v);
     float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-    }
+a = qwen4exp_warp_max_nonneg(a);
     const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
     const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
     const uint64_t pair = (uint64_t)token * (value_dim / 32u) +
@@ -12198,12 +12336,12 @@ __global__ static void qwen4exp_hc_norm_quant_kernel(
              * standalone kernel carries for a ragged tail cannot fire. */
             const float vz = qwen4exp_q8_ftz(v);
             float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
-                /* fmaxf, not the .FTZ one: both operands are already flushed
-                 * and non-negative, so the two instructions cannot disagree. */
-                a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-            }
+            /* REDUX.MAX, not the butterfly: the operand is already flushed and
+             * non-negative, so its bits order like its value (see the helper).
+             * The shipped comment's point stands -- fmaxf and its .FTZ twin
+             * cannot disagree on this domain -- and REDUX returns the very
+             * operand the butterfly returned. */
+            a = qwen4exp_warp_max_nonneg(a);
             const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
             const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
             const uint64_t pair = blk0 + (uint64_t)(k * warps + warp);
@@ -12225,12 +12363,9 @@ __global__ static void qwen4exp_hc_norm_quant_kernel(
          * kernel carries for a ragged tail cannot fire. */
         const float vz = qwen4exp_q8_ftz(v);
         float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            /* fmaxf, not the .FTZ one: both operands are already flushed and
-             * non-negative, so the two instructions cannot disagree. */
-            a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-        }
+        /* REDUX.MAX, not the butterfly: the operand is already flushed and
+         * non-negative, so its bits order like its value (see the helper). */
+        a = qwen4exp_warp_max_nonneg(a);
         const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
         const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
         const uint64_t pair = blk0 + (uint64_t)(k * warps + warp);
@@ -12447,10 +12582,7 @@ __global__ static void qwen4exp_hc_mix_inject_dual_kernel(
             const uint32_t warp = threadIdx.x >> 5u;
             const float vz = qwen4exp_q8_ftz(v);
             float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
-                a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-            }
+a = qwen4exp_warp_max_nonneg(a);
             const float qd = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
             const float id = qd != 0.0f ? qwen4exp_q8_rcp_approx(qd) : 0.0f;
             const uint64_t pair = (uint64_t)t * (n_embd / 32u) +
@@ -12772,9 +12904,7 @@ __global__ static void qwen4exp_hc_silu_quant_kernel(
 
     const float vz = qwen4exp_q8_ftz(v);
     float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+a = qwen4exp_warp_max_nonneg(a);
     const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
     const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
     if (lane == 0u) xscale[pair] = d;
@@ -13126,10 +13256,7 @@ __global__ static void qwen4exp_hc_norm_quant_inject_kernel(
                                                          weight_bias, round_bf16);
                 const float vz = qwen4exp_q8_ftz(v);
                 float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-                for (int off = 16; off > 0; off >>= 1) {
-                    a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-                }
+a = qwen4exp_warp_max_nonneg(a);
                 const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
                 const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
                 const uint64_t pair = blk0 + (uint64_t)(k * warps + warp);
@@ -13174,10 +13301,7 @@ __global__ static void qwen4exp_hc_norm_quant_inject_kernel(
                                                      weight_bias, round_bf16);
             const float vz = qwen4exp_q8_ftz(v);
             float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
-                a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-            }
+a = qwen4exp_warp_max_nonneg(a);
             const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
             const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
             const uint64_t pair = blk0 + (uint64_t)(k * warps + warp);
@@ -16353,10 +16477,7 @@ __global__ static void qwen4exp_qsa_output_gate_quant_kernel(
         : 0.0f;
     const float vz = qwen4exp_q8_ftz(v);
     float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-    }
+a = qwen4exp_warp_max_nonneg(a);
     const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
     const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
     const uint64_t pair = (uint64_t)blockIdx.x * 8u + warp;
@@ -16396,10 +16517,7 @@ __global__ static void qwen4exp_qsa_output_gate_doubled_quant_kernel(
         : 0.0f;
     const float vz = qwen4exp_q8_ftz(v);
     float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-    }
+a = qwen4exp_warp_max_nonneg(a);
     const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
     const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
     const uint64_t pair = (uint64_t)blockIdx.x * 8u + warp;
