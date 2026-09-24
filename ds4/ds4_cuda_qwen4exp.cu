@@ -13309,7 +13309,7 @@ qwen4exp_hc_up_mix_pipe_kernel(
         float *mixed, const unsigned char *w, const int8_t *xq,
         const float *xscale, const float *hyper, const float *nscale,
         const float *normw, uint32_t n_embd, uint32_t n_rows,
-        uint64_t blocks, float weight_bias, int round_bf16) {
+        uint64_t blocks, float weight_bias, int round_bf16, int chan_fast) {
     extern __shared__ __align__(16) unsigned char qhp_smem[];
     unsigned char *sA_all = qhp_smem;
     unsigned char *sB_all = sA_all + QHP_STAGES * QHP_A_BYTES;
@@ -13319,8 +13319,14 @@ qwen4exp_hc_up_mix_pipe_kernel(
     const int tid = (int)threadIdx.x;
     const uint32_t lane = threadIdx.x & 31u;
     const int warp = tid >> 5;
-    const uint32_t m0 = blockIdx.x * (uint32_t)QHP_BM;
-    const uint32_t d0 = blockIdx.y * (uint32_t)QHP_BC;
+    /* chan_fast: grid (channel slabs, token tiles), channel-fastest with the
+     * token tiles walked high to low.  norm_quant_inject rewrote `hyper` in
+     * ascending token order just before the hc down/silu passes, so its last
+     * token tile is the part still in L2; consume it first.  Either way each
+     * block owns exactly one (token tile, channel slab); no value moves. */
+    const uint32_t m0 = (chan_fast ? (gridDim.y - 1u - blockIdx.y) : blockIdx.x)
+        * (uint32_t)QHP_BM;
+    const uint32_t d0 = (chan_fast ? blockIdx.x : blockIdx.y) * (uint32_t)QHP_BC;
     if (m0 >= n_rows || d0 >= n_embd) return;
     const uint32_t nstage = (uint32_t)((blocks + (uint64_t)QHP_G - 1u) / (uint64_t)QHP_G);
     const uint64_t w_row_bytes = blocks * 34u;
@@ -13660,11 +13666,23 @@ static int qwen4exp_hc_up_mix_pipe_launch(
         if (attr < 0) (void)cudaGetLastError();
     }
     if (attr < 0) return 0;
+    /* DS4_QWEN4EXP_NO_HC_UP_DESC=1 restores the token-tile-fastest grid.
+     * Same instantiation either way (a kernel argument, not a template
+     * parameter), so the shared-memory opt-in above covers both. */
+    static int chan_fast = -1;
+    if (chan_fast < 0) {
+        const char *e = getenv("DS4_QWEN4EXP_NO_HC_UP_DESC");
+        chan_fast = (e && e[0] && e[0] != '0') ? 0 : 1;
+    }
+    const unsigned m_tiles = (unsigned)((rows + QHP_BM - 1u) / QHP_BM);
+    const unsigned d_tiles = (unsigned)((n_embd + QHP_BC - 1u) / QHP_BC);
+    const dim3 up_grid = chan_fast ? dim3(d_tiles, m_tiles, 1u)
+                                   : dim3(m_tiles, d_tiles, 1u);
     qwen4exp_hc_up_mix_pipe_kernel<0>
-        <<<dim3((rows + QHP_BM - 1u) / QHP_BM, (n_embd + QHP_BC - 1u) / QHP_BC, 1u),
+        <<<up_grid,
            QHP_THREADS, QHP_SMEM, cuda_decode_stream()>>>(
             mixed, upw, xq, xscale, hyper, nscale, normw, n_embd, rows,
-            blocks, weight_bias, round_bf16);
+            blocks, weight_bias, round_bf16, chan_fast);
     return 1;
 }
 
