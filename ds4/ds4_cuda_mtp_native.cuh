@@ -510,8 +510,72 @@ __global__ static void mtp_native_projection2_screen_kernel(
     const uint32_t weight_row = row < prefix ? row
         : n_vocab - tail + (row - prefix);
     const bool valid = row < width && weight_row < n_vocab;
+
+    /* Stage this block's four weight windows through shared memory.
+     *
+     * WHY.  The boot probe timed this kernel at 117 GB/s, its own arithmetic-free
+     * ceiling at 129, and a whole-row contiguous variant of that ceiling at 186
+     * (`hd[sc/lo/dn]`).  So deleting the funnelshift/dp4a chain is worth only
+     * ~158 us of a 1701.9 us stage, far under the bar, and the cost is in how the
+     * bytes are fetched rather than in what is done with them.
+     *
+     * The fetch below is the reason.  A 34-byte group stride leaves each 16-byte
+     * payload 2-byte aligned, so every lane issues FOUR scalar 32-bit loads plus
+     * a realigning funnelshift.  Across 32 consecutive lanes one of those loads
+     * spreads its addresses over ~544 bytes to deliver 128, so the kernel pays
+     * several times the transactions its bytes require -- and it does so while
+     * reading a window that is perfectly contiguous (groups 0..23 are bytes
+     * 0..815 of the row) and could be fetched at full width.
+     *
+     * So fetch it at full width, once, cooperatively, and let the misaligned
+     * reads happen in shared memory where alignment is free and where bank
+     * conflicts are separately measured to be free on this box.  64 lanes cover
+     * 204 words in 4 fully-coalesced passes, versus 4 scalar loads per lane for
+     * 16 bytes.  The 13 lanes this block never uses for arithmetic (pairs 24..31
+     * fail `b < work_blocks` immediately) help with the fetch.
+     *
+     * BIT-EXACTNESS.  Nothing about the values changes: the same bytes are
+     * reconstructed by the same funnelshift in the same order, and dp4a and the
+     * shuffle reduction are untouched.  The argument is an equality of residues,
+     * NOT a claim that the reconstruction ignores alignment.  It does not: the
+     * top `addr & 3` bytes of `wq[3]` come from a uint16 read at `payload + 14`,
+     * which supplies the right bytes only while `addr & 3` is EVEN.  A host
+     * parity rig that stages into deliberately odd-skewed buffers shows that
+     * boundary breaking, so this is a real precondition and not a formality.
+     * It holds here by construction and with nothing to spare: `staged` requires
+     * `w & 3 == 0`, and the row offset is a multiple of `blocks * 34 == 2720`,
+     * itself a multiple of 4 -- so `wr` is 4-byte aligned, `srow` is declared
+     * 16-byte aligned, and both bases are 0 mod 4.  Every payload offset within
+     * the row is therefore identical mod 4 on the two paths, `shift` is the same
+     * value, and the reconstruction is the same arithmetic on the same bytes.
+     *
+     * The staged path needs a 4-byte-aligned source, which the caller does not
+     * guarantee (it only rejects an ODD `w`).  `blocks * 34 == 2720` is a
+     * multiple of 16, so every row shares `w`'s residue and one uniform test
+     * decides for the whole launch; when it fails, `base` stays the global
+     * pointer and this kernel is byte-for-byte the shipped one. */
+    constexpr uint32_t row_bytes = (uint32_t)(work_blocks * 34u);
+    constexpr uint32_t row_words = row_bytes / 4u;
+    static_assert(row_bytes % 4u == 0u,
+                  "staged window must be a whole number of 32-bit words");
+    __shared__ __align__(16) unsigned char srow[4][row_bytes];
+    const unsigned char *const wr = valid
+        ? w + (uint64_t)weight_row * blocks * 34u : w;
+    const bool staged = (((uintptr_t)w & 3u) == 0u);
+    if (staged) {
+        if (valid) {
+            const uint32_t *__restrict__ s32 = (const uint32_t *)wr;
+            uint32_t *d32 = (uint32_t *)&srow[local_row][0];
+            for (uint32_t i = local_lane; i < row_words; i += 64u)
+                d32[i] = s32[i];
+        }
+        /* `staged` is uniform across the block -- it reads only `w` -- so this
+         * barrier is reached by every thread or by none. */
+        __syncthreads();
+    }
+    const unsigned char *const base = staged ? &srow[local_row][0] : wr;
+
     if (valid) {
-        const unsigned char *wr = w + (uint64_t)weight_row * blocks * 34u;
         for (uint64_t b = group; b < work_blocks; b += 32u) {
             const uint64_t warp_base = b - (uint64_t)(group & 15u);
             const uint64_t remaining = work_blocks - warp_base;
@@ -519,7 +583,7 @@ __global__ static void mtp_native_projection2_screen_kernel(
                 (uint32_t)(remaining < 16u ? remaining : 16u);
             const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
             const int8_t *payload =
-                (const int8_t *)(wr + b * 34u + 2u) + half * 16u;
+                (const int8_t *)(base + b * 34u + 2u) + half * 16u;
             const uintptr_t address = (uintptr_t)payload;
             const uint32_t shift = (uint32_t)(address & 3u) * 8u;
             const uint32_t *words =
@@ -537,7 +601,7 @@ __global__ static void mtp_native_projection2_screen_kernel(
             wq[3] = (int32_t)__funnelshift_r(
                 previous, (uint32_t)last, shift);
             const float ws = __half2float(
-                *(const __half *)(wr + b * 34u));
+                *(const __half *)(const void *)(base + b * 34u));
 #pragma unroll
             for (int r = 0; r < 2; r++) {
                 const uint64_t at = (uint64_t)r * blocks + b;
