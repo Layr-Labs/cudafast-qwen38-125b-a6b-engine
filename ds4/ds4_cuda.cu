@@ -38586,3 +38586,279 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
 #include "ds4_deepseek4_vision_gpu.cuh"
 
 #include "ds4_cuda_mtp_native.cuh"
+
+/* ===================================================================
+ * The R2 coarse-screen RATE instrument.
+ *
+ * WHY THIS EXISTS.  The LM head is the last large region of the decode
+ * round with no priced ceiling.  Its five stages were split and self-timed
+ * once: stage 0 (this coarse screen, plus both key builds) 1701.9 us of a
+ * 3034.5 us serialised head, and the promotion bar is 595 us per decode
+ * round -- 35% of stage 0 alone.  Stage 0 moves 202.6 MB (248,320 rows x
+ * 816 B) in 1701.9 us, which is 119 GB/s.  The routed gate/up probe in
+ * ds4_cuda_qwen4exp.cu measures this box doing 207-223 GB/s on dense q4_K
+ * panels.  So EITHER stage 0 leaves ~40% of the achievable rate on the
+ * floor, in which case an arm worth more than the whole bar exists here,
+ * OR 119 GB/s is what this access pattern is worth and the head is closed
+ * for good.  Four arms have been drawn at this kernel without settling
+ * that, because a scored draw cannot see a 300 us change: the decode-ratio
+ * instrument's n=1 sd is 0.82-1.65%, which is 425-855 us.
+ *
+ * WHAT THREE LEGS BUY.  Every absolute GB/s previously attributed to this
+ * region came from the slice profiler and is RETRACTED -- that profiler is
+ * ordinal only, and the 84 GB/s figure it produced for the head is exactly
+ * what drew three wasted arms here after the region was already closed.  So
+ * this probe compares nothing to a remembered number.  All three legs are
+ * timed in one bracket, on one box, in one draw, against each other:
+ *
+ *   hd[sc=..]  the REAL mtp_native_projection2_screen_kernel<true> -- the
+ *              live instantiation (fuse_keys is true on the scored path) --
+ *              at the real 248,320-row shape and the real <<<w/4, 256>>>.
+ *   hd[lo=..]  the same addressing, the same 816-byte coalesced burst, the
+ *              same block and grid, the same shared array and the same
+ *              trip count, with the funnelshift/dp4a/shfl/xscale chain
+ *              removed.  This is the ceiling FOR THIS ACCESS PATTERN.
+ *   hd[dn=..]  the same load twin walking all 80 groups instead of 24, so
+ *              each row is read whole and contiguous (2720 B, not 816 of
+ *              2720) at an identical instruction-per-byte ratio.
+ *
+ * READING IT.  lo/sc is the fraction of stage 0's time that is arithmetic
+ * rather than fetch, so 1701.9 * (1 - sc/lo) us is the MOST any amount of
+ * instruction removal in this kernel can ever return.  That has to beat
+ * 595 us to be an arm on its own, which needs lo >= 1.54 x sc; below
+ * 1.04 x sc it cannot even clear the 10-bip acceptance floor and the
+ * kernel is closed.  dn then says WHY lo is what it is: dn ~= lo means the
+ * 816-of-2720 stride costs nothing and the pattern is simply at the box's
+ * limit, while dn >> lo prices the stride (and note that reading whole rows
+ * to exploit it would cost 3.33x the bytes, so it pays only if
+ * dn > 3.33 x lo -- this leg is a diagnosis, not a candidate arm).
+ *
+ * hd[v=..] is leg sc measured a SECOND time, after the other two, purely so
+ * the probe reports its own repeatability instead of assuming it.  A |v-sc|
+ * spread of the same order as lo-sc means this instrument cannot see the
+ * effect either and no leg here should be believed.
+ *
+ * hd[os=..]/hd[ol=..] are blocks/SM for the real kernel and the load twin.
+ * A ceiling leg that gets more blocks per SM than the kernel it bounds is
+ * not a ceiling; if they differ, discount the pair.
+ *
+ * COST AND SAFETY.  ~30 ms of GPU work, all of it inside ds4s_hw_limits(),
+ * which ds4_resident calls after ds4s_open() returns and before the socket
+ * binds -- no timed phase observes it.  Nothing here touches a real weight,
+ * a real activation or any scored buffer: the slab is a private cudaMalloc
+ * filled with 0x11 so every decoded scale is a small finite half, and every
+ * other buffer is zero-filled, which makes the arithmetic finite and the
+ * instruction stream data-independent.  Failure is silent and total: any
+ * error frees what it took, clears the sticky error and reports -1, so a
+ * box that cannot spare the slab loses the reading and nothing else.
+ * =================================================================== */
+#ifndef DS4_HD_BW_PROBE_BUILD
+#define DS4_HD_BW_PROBE_BUILD 1
+#endif
+#if DS4_HD_BW_PROBE_BUILD
+
+/* The load twin.  The lane map is copied from the kernel AS IT STANDS ON THIS
+ * BASE: 64 lanes to a row, `group = local_lane >> 1` over 32 pairs, and a walk
+ * that steps by 32.  (A sibling arm rewrote this map to 48 lanes in a
+ * 192-thread block to reclaim the idle pairs 24..31; it was drawn, falsified
+ * and dropped, so the shipped map is the 64-lane one and that is what a ceiling
+ * for it has to use.  Getting this wrong is silent: the twin would still run
+ * and still report a number, just not a number about this kernel.)
+ *
+ * `Groups` is the only difference between the ceiling leg (24, the real
+ * footprint) and the dense control (80, the whole row).  With the real stride
+ * of 32, Groups == 24 gives pairs 0..23 exactly one trip and leaves 24..31
+ * idle -- precisely what the shipped kernel does -- while Groups == 80 gives
+ * pairs 0..15 three trips and 16..31 two, covering each of the 80 groups
+ * exactly once.  So both legs issue the same 34-byte group from the same lane
+ * at the same offset as the real kernel, and the 816-byte contiguous burst is
+ * held fixed.  The shared array, the block shape and the syncthreads are kept
+ * so occupancy is not accidentally better than the kernel this bounds. */
+template <uint32_t Groups>
+__global__ static void mtp_hd_bw_load_kernel(
+        float *out, const unsigned char *w, uint32_t width) {
+    constexpr uint64_t blocks = MTP_NATIVE_DIM / 32u;
+    constexpr uint32_t step = 32u;
+    const uint32_t local_row = threadIdx.x >> 6u;
+    const uint32_t local_lane = threadIdx.x & 63u;
+    const uint32_t group = local_lane >> 1u;
+    const uint32_t half = local_lane & 1u;
+    const uint32_t row = blockIdx.x * 4u + local_row;
+    uint32_t acc = 0u;
+    if (row < width) {
+        const unsigned char *wr = w + (uint64_t)row * blocks * 34u;
+        for (uint32_t b = group; b < Groups; b += step) {
+            /* Copied from the real kernel so the addresses are identical. */
+            const int8_t *payload =
+                (const int8_t *)(wr + b * 34u + 2u) + half * 16u;
+            const uintptr_t address = (uintptr_t)payload;
+            const uint32_t *words =
+                (const uint32_t *)(address & ~(uintptr_t)3u);
+            uint32_t s = words[0];
+#pragma unroll
+            for (int j = 0; j < 3; j++) s += words[j + 1];
+            s += *(const uint16_t *)(const void *)(payload + 14);
+            s += *(const uint16_t *)(const void *)(wr + b * 34u);
+            acc ^= s;
+        }
+    }
+    /* Same 1 KiB of shared memory the real kernel declares, actually stored
+     * to, and sunk behind a predicate on a runtime argument that no caller
+     * ever passes -- so ptxas cannot delete the loads it is here to time. */
+    __shared__ float partial[2][4][32];
+    if (half == 0u) partial[0][local_row][group] = (float)acc;
+    __syncthreads();
+    if (width == 0xffffffffu) out[0] = partial[0][local_row][group];
+}
+
+/* Returns the row count it managed to allocate, or -1.  Every out-parameter
+ * is GB/s, or -1 for a leg that did not produce one. */
+extern "C" int ds4_gpu_mtp_hd_bw_probe(int *sc_gbs, int *lo_gbs, int *dn_gbs,
+                                       int *sc2_gbs, int *occ_sc,
+                                       int *occ_lo) {
+    *sc_gbs = *lo_gbs = *dn_gbs = *sc2_gbs = -1;
+    *occ_sc = *occ_lo = -1;
+    enum { GROUPS = 80, LIVE = 24, THREADS = 256, PASSES = 2 };
+    /* The scored width first.  Stepping down keeps the reading honest rather
+     * than shrinking into L2: the row count is reported so a small slab is
+     * visible as a small slab instead of passing for the real shape. */
+    const uint32_t want[3] = {248320u, 131072u, 65536u};
+    unsigned char *slab = NULL;
+    uint32_t rows = 0u;
+    for (int i = 0; i < 3 && slab == NULL; i++) {
+        if (cudaMalloc((void **)&slab,
+                       (size_t)want[i] * GROUPS * 34u) == cudaSuccess) {
+            rows = want[i];
+        } else {
+            (void)cudaGetLastError();
+            slab = NULL;
+        }
+    }
+    if (slab == NULL) { (void)cudaGetLastError(); return -1; }
+    if (cudaMemset(slab, 0x11, (size_t)rows * GROUPS * 34u) != cudaSuccess) {
+        (void)cudaGetLastError();
+        cudaFree(slab);
+        (void)cudaGetLastError();
+        return -1;
+    }
+    /* One allocation, hand-partitioned at generous offsets: scores 2*rows
+     * floats, keys 2*rows uint64, then the tiny quantized activation the
+     * real kernel reads.  All zero, so no key is non-finite and the
+     * atomicOr in the EmitKeys tail never fires. */
+    const size_t out_off = 0u;
+    const size_t keys_off = (size_t)rows * 8u + 4096u;
+    const size_t xq_off = keys_off + (size_t)rows * 16u + 4096u;
+    const size_t xs_off = xq_off + 8192u;
+    const size_t flag_off = xs_off + 4096u;
+    const size_t small_bytes = flag_off + 4096u;
+    unsigned char *small = NULL;
+    if (cudaMalloc((void **)&small, small_bytes) != cudaSuccess ||
+        cudaMemset(small, 0, small_bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        if (small) cudaFree(small);
+        cudaFree(slab);
+        (void)cudaGetLastError();
+        return -1;
+    }
+    float *out = (float *)(small + out_off);
+    uint64_t *keys = (uint64_t *)(small + keys_off);
+    int8_t *xq = (int8_t *)(small + xq_off);
+    float *xs = (float *)(small + xs_off);
+    uint32_t *flag = (uint32_t *)(small + flag_off);
+
+    cudaEvent_t e0, e1;
+    if (cudaEventCreate(&e0) != cudaSuccess) {
+        (void)cudaGetLastError();
+        cudaFree(small); cudaFree(slab);
+        (void)cudaGetLastError();
+        return -1;
+    }
+    if (cudaEventCreate(&e1) != cudaSuccess) {
+        (void)cudaGetLastError();
+        cudaEventDestroy(e0);
+        cudaFree(small); cudaFree(slab);
+        (void)cudaGetLastError();
+        return -1;
+    }
+
+    const uint32_t width = rows;
+    const uint32_t grid = (width + 3u) / 4u;
+    /* prefix == width and tail == 0 makes weight_row == row for every row,
+     * so the slab is read once, in order, exactly as the scored launch
+     * reads the real vocabulary. */
+    auto launch = [&](int leg) {
+        if (leg == 0)
+            mtp_native_projection2_screen_kernel<true><<<grid, THREADS, 0, 0>>>(
+                out, slab, xq, xs, width, rows, width, 0u, keys, flag);
+        else if (leg == 1)
+            mtp_hd_bw_load_kernel<LIVE><<<grid, THREADS, 0, 0>>>(
+                out, slab, width);
+        else
+            mtp_hd_bw_load_kernel<GROUPS><<<grid, THREADS, 0, 0>>>(
+                out, slab, width);
+    };
+    auto time_leg = [&](int leg, double bytes_each) -> int {
+        launch(leg);
+        if (cudaDeviceSynchronize() != cudaSuccess) {
+            (void)cudaGetLastError();
+            return -1;
+        }
+        if (cudaEventRecord(e0, 0) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return -1;
+        }
+        for (int p = 0; p < PASSES; p++) launch(leg);
+        if (cudaEventRecord(e1, 0) != cudaSuccess ||
+            cudaDeviceSynchronize() != cudaSuccess) {
+            (void)cudaGetLastError();
+            return -1;
+        }
+        float ms = 0.0f;
+        if (cudaEventElapsedTime(&ms, e0, e1) != cudaSuccess || !(ms > 0.0f)) {
+            (void)cudaGetLastError();
+            return -1;
+        }
+        return (int)(bytes_each * (double)PASSES / ((double)ms * 1.0e6) + 0.5);
+    };
+
+    const double live_bytes = (double)rows * (double)LIVE * 34.0;
+    const double dense_bytes = (double)rows * (double)GROUPS * 34.0;
+    *sc_gbs = time_leg(0, live_bytes);
+    *lo_gbs = time_leg(1, live_bytes);
+    *dn_gbs = time_leg(2, dense_bytes);
+    *sc2_gbs = time_leg(0, live_bytes);
+
+    int occ = -1;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ, mtp_native_projection2_screen_kernel<true>,
+            (int)THREADS, 0) == cudaSuccess)
+        *occ_sc = occ;
+    else
+        (void)cudaGetLastError();
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ, mtp_hd_bw_load_kernel<LIVE>,
+            (int)THREADS, 0) == cudaSuccess)
+        *occ_lo = occ;
+    else
+        (void)cudaGetLastError();
+
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+    cudaFree(small);
+    cudaFree(slab);
+    (void)cudaGetLastError();
+    return (int)rows;
+}
+#else
+/* The caller's build gate (DS4_GU_BW_PROBE_BUILD) lives in the other
+ * translation unit, so the two cannot be kept in agreement by the
+ * preprocessor.  Define the symbol either way: disabling this probe must cost
+ * the reading, not the link. */
+extern "C" int ds4_gpu_mtp_hd_bw_probe(int *sc_gbs, int *lo_gbs, int *dn_gbs,
+                                       int *sc2_gbs, int *occ_sc,
+                                       int *occ_lo) {
+    *sc_gbs = *lo_gbs = *dn_gbs = *sc2_gbs = -1;
+    *occ_sc = *occ_lo = -1;
+    return -1;
+}
+#endif /* DS4_HD_BW_PROBE_BUILD */
