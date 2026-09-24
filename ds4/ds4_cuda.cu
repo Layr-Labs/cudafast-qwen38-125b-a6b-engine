@@ -6056,11 +6056,25 @@ __global__ static void matmul_q8_0_preq_rows_exact_tile_kernel(
 /* Two adjacent lanes share a Q8 group. Their integer partials may be
  * combined freely; each even lane keeps its original float group chain.
  * Shared memory remaps the 32 finished chains onto one reduction warp. */
-template <int R, bool Streaming = true, bool Stage = false>
+template <int R, bool Streaming = true, bool Stage = false, bool Relay = false>
 __global__ static void matmul_q8_0_preq_pair_lanes_kernel(
         float *out, const unsigned char *w,
         const int8_t *xq, const float *xscale,
         uint64_t out_dim, uint32_t n_rows, uint64_t blocks) {
+    /* PDL PRODUCER, for the one dispatch that asks for it: the HC down
+     * projection at the two-row decode width, where the kernel this template
+     * replaced carried a trigger for the silu/quantize behind it and the swap
+     * would otherwise cost that successor its early start.
+     * THE DEADLOCK RULE (ds4_cuda_qwen4exp.cuh): a trigger may only ride a
+     * producer that is single-wave at every width a PSS-attributed consumer
+     * can follow it at.  The Relay arm is instantiated from exactly one launch,
+     * (out_dim + 3) / 4 = 80 blocks of 256 threads at out_dim 320, against the
+     * five resident blocks per SM this tile measures at 46-48 registers x 48
+     * SMs = 240 slots, so every block is resident before any dependent block
+     * can take one.  Every other instantiation keeps Relay = false and this
+     * statement compiles away, so no other launch's register allocation or
+     * scheduling can move: the arm is the trigger and nothing else. */
+    if (Relay) QWEN4EXP_PDL_TRIGGER();
     extern __shared__ uint4 qw_pl_panel[];
     char *const gpanel = (char *)qw_pl_panel;
     const uint32_t local_row = threadIdx.x >> 6u;
@@ -18119,6 +18133,252 @@ extern "C" void ds4_gpu_set_q8_mma_pipe_wide(int mode) {
     g_q8_mma_pipe_wide = mode;
 }
 
+/* Leg 3 of the boot instrument: the hyper-connection down projection, which is
+ * the ONE number the whole HC region hangs on.
+ *
+ * The byte map is complete and every region except this one is priced.  HC is
+ * 668.5 MB of Q8_0 weight per decode token -- the same size as the entire LM
+ * head -- read across 96 qwen4exp_graph_residual calls (two per layer x 48
+ * layers).  The down projection is the half this tree carries a number for,
+ * and that number is a COMMENT: ds4_cuda_qwen4exp.cu says 17.5 us at the
+ * two-row width, which over 96 calls is 1.68 ms for down's 334 MB = 199 GB/s,
+ * i.e. already at peak and the region is closed at ~30 bips.  The competing
+ * estimate -- a per-kernel scored profile read as 8.9% of the round -- says
+ * 4.6 ms, i.e. the region is open and worth 60-120 bips.  A comment is not a
+ * measurement, the two disagree by 2.7x, and no draw can settle it because a
+ * 0.7 ms effect is well inside the score channel's own n=1 noise.  So measure
+ * it on the free channel instead, where the reading is published whether or
+ * not the submission is accepted.
+ *
+ *   hcd[r1=...]  matmul_q8_hc_down_pair_kernel at grid(320, 1), 32 threads:
+ *                320 blocks of one warp, each reducing a whole K = 10240 row
+ *                on its own.
+ *   hcd[r2=...]  the SAME kernel at grid(320, 2) -- the scored decode width,
+ *                draft_tokens = 2.  Block (j,0) and block (j,1) each read the
+ *                same 10,880-byte weight row, so the region REQUESTS twice its
+ *                bytes; r2 ~= r1 is the direct test of whether L2 absorbs that
+ *                duplicate read, which so far is an argument and not a number.
+ *   hcd[t4=...]  matmul_q8_0_preq_pair_lanes_kernel<4, false> at the same
+ *                rows = 2: the weight-reuse tile.  It launches (320 + 3) / 4
+ *                = 80 blocks on a 48-SM part, 1.67 waves, which is why this
+ *                engine's own comment says a projection this narrow leaves
+ *                most of the device idle on the widest tile.  The registered
+ *                condition was "t4 >= r2 prices that argument instead of
+ *                asserting it, and t4 < r2 would be the arm", and it FIRED:
+ *                r1 27,224, r2 32,164, t4 30,410 ns.  So in THIS tree the
+ *                dispatch at rows = 2 takes the tile and t4 is the leg that
+ *                times the live kernel, with r2 kept as the ex-incumbent
+ *                control.  A repeat of t4 < r2 on another box is the
+ *                replication this pair exists to give.
+ *
+ *   hcd[t2=...]  the SAME tile at R = 2 instead of R = 4, same grid, same
+ *                rows = 2.  R is the tile's TOKEN-row capacity, not its output
+ *                width: a block always owns four output rows, and the walk
+ *                runs `for (r = 0; r < R; r++) if (r < take)`, so at the
+ *                scored width two of R = 4's four unrolled arms are predicated
+ *                off at run time and R = 4 also carries acc[4] and a
+ *                1,024-byte upper[] against R = 2's 512.  t2 prices what that
+ *                spare capacity costs.  R = 2 is not new code: this engine
+ *                already dispatches <2, false> and <2, false, true> elsewhere.
+ *   hcd[w1=...]  the R = 4 tile at grid.x = 48 instead of 80 -- one block per
+ *                SM, so 192 of the 320 output rows and 48/80 = 0.60 of the
+ *                bytes.  The output is partial, which a probe on a scratch
+ *                buffer does not care about; what it measures is the SHAPE of
+ *                the kernel's cost curve, and that is the one question left
+ *                open in this region.
+ *
+ * PRE-REGISTERED FOR THE TWO NEW LEGS, BEFORE ANY READING EXISTS.
+ *
+ * w1/t4 separates the two hypotheses that survive the first reading, and they
+ * predict different numbers:
+ *
+ *   w1/t4 ~= 0.60  ->  the kernel is DRAM-BOUND: time follows bytes, 80 blocks
+ *                      cost 80/48 of 48 blocks, and the 1.67-wave grid costs
+ *                      nothing.  Then wave quantisation is NOT a lever and a
+ *                      two-output-row variant (160 blocks) is dead on arrival.
+ *   w1/t4 ~= 0.50  ->  the kernel is PER-SM ISSUE-BOUND: 32 of the 48 SMs get
+ *                      two blocks and 16 get one, the twos set the finish
+ *                      line, and 80 blocks cost exactly what 96 would.  Then
+ *                      ~20% of this kernel's time is idle tail, a 160-block
+ *                      two-row variant halves that to ~10%, and at 7.33% of a
+ *                      decode round that is worth roughly 50 bips.
+ *   w1/t4 < 0.45   ->  NO READING: 48 blocks did not saturate the path at all
+ *                      and the comparison is not measuring quantisation.
+ *
+ * t2 vs t4 is deliberately registered WITHOUT a fine threshold.  This probe has
+ * been read exactly once, so its own reproducibility is unknown; the two trees
+ * this pair ships re-read r1, r2 and t4 on other boxes and THAT spread is the
+ * resolution t2 must clear.  Until it exists: call t2 only on a difference
+ * larger than the spread those three legs show across the pair, treat anything
+ * smaller as UNMEASURED, and keep R = 4 on a tie because it is the
+ * instantiation the dispatch already ships.
+ *
+ * All five are nanoseconds per launch over the same 3,481,600-byte weight
+ * slab, so they are comparable to each other directly and, through the
+ * invariant bw[ld=] panel-fill leg in the same readout, across boots.  w1 is
+ * the one leg that does not do the same amount of work as the others, by
+ * construction, and its ratio to t4 is the whole point of it.
+ *
+ * PRE-REGISTERED, BEFORE ANY READING EXISTS.  3,481,600 B / r2 gives GB/s:
+ *
+ *   r2 = 15-20 us   ->  175-232 GB/s  ->  region CLOSED at ~6 bips, walk away
+ *   r2 = 20-26 us   ->  134-174 GB/s  ->  re-open; 60-120 bips in reach
+ *   r2 > 26 us      ->  < 134 GB/s    ->  the 8.9%-derived 4.6 ms was right
+ *   r2 < 13 us      ->  > 268 GB/s    ->  ABOVE ROOFLINE, so NO READING: the
+ *                                         slab went L2-resident and this is
+ *                                         not the scored regime
+ *
+ * THE VALIDITY GATE IS THE WHOLE DESIGN.  A single 3.48 MB slab FITS in a
+ * GB10-class L2, so a probe that allocates one slab and launches it twice
+ * measures L2 and not memory.  The scored path re-reads each HC slab once per
+ * token with 6.3 GB of other weights in between, so there it is cold every
+ * time.  This probe therefore allocates up to 64 DISJOINT 3.48 MB windows
+ * (222.8 MB, far past any L2) and advances to the next window on every single
+ * launch; `n` reports how many windows it actually got, and a small n is
+ * grounds to discount the reading rather than to believe it.
+ *
+ * Every buffer is memset to 0x11.  A Q8_0 block's first two bytes are an fp16
+ * scale (0x1111 = 6.25e-4) and its payload bytes are int8 17, so every dot is
+ * finite; nothing here divides and no branch is data-dependent, so the
+ * instruction stream does not depend on the fill.  The kernel's PDL trigger
+ * and fence are no-ops on a plain launch, which is exactly what
+ * DS4_QWEN4EXP_NO_PDL_PREFETCH already relies on.
+ *
+ * WHERE IT RUNS, AND WHAT IT COSTS THE SCORE: nothing.  ds4_gpu_hw_limits() is
+ * called once from ds4_resident after the one weight load and before the
+ * socket binds, so no timed phase can observe it.  -DDS4_HCD_PROBE_BUILD=0
+ * removes it; DS4_HC_DOWN_PROBE=0 stands it down at run time. */
+#ifndef DS4_HCD_PROBE_BUILD
+#define DS4_HCD_PROBE_BUILD 1
+#endif
+#if DS4_HCD_PROBE_BUILD
+static int ds4_hc_down_probe(int *r1_ns, int *r2_ns, int *t4_ns,
+                             int *t2_ns, int *w1_ns) {
+    /* The shape is the shipped one and it is hardcoded inside the kernel:
+     * grid.x = 320 = n_hc_lowrank outputs, 320 Q8_0 groups of 34 B per output
+     * row = 10,880 B a row, so the slab is exactly one HC down tensor. */
+    enum { OUT = 320, GROUPS = 320, ROWBYTES = 10880, PASSES = 2, WANT = 64 };
+    const uint64_t slab_bytes = (uint64_t)OUT * (uint64_t)ROWBYTES;
+    unsigned char *slab = NULL;
+    int wins = WANT;
+    while (wins >= 1) {
+        if (cudaMalloc((void **)&slab,
+                       (size_t)(slab_bytes * (uint64_t)wins)) == cudaSuccess)
+            break;
+        (void)cudaGetLastError();
+        slab = NULL;
+        wins = wins > 1 ? wins / 2 : 0;
+    }
+    if (!slab) return 0;
+    /* xq  needs 4 * 320 * 32 B = 40,960 B  -> at      0
+     * xs  needs 4 * 320 floats =  5,120 B  -> at 40,960
+     * out needs 4 * 320 floats =  5,120 B  -> at 49,152 */
+    const size_t small_bytes = 65536;
+    unsigned char *small = NULL;
+    if (cudaMalloc((void **)&small, small_bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        cudaFree(slab);
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (cudaMemset(slab, 0x11, (size_t)(slab_bytes * (uint64_t)wins)) !=
+            cudaSuccess ||
+        cudaMemset(small, 0x11, small_bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        cudaFree(small);
+        cudaFree(slab);
+        (void)cudaGetLastError();
+        return 0;
+    }
+    const int8_t *const xq = (const int8_t *)(void *)(small + 0);
+    const float *const xs = (const float *)(void *)(small + 40960);
+    float *const out = (float *)(void *)(small + 49152);
+
+    cudaEvent_t e0, e1;
+    if (cudaEventCreate(&e0) != cudaSuccess) {
+        (void)cudaGetLastError();
+        cudaFree(small);
+        cudaFree(slab);
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (cudaEventCreate(&e1) != cudaSuccess) {
+        (void)cudaGetLastError();
+        cudaEventDestroy(e0);
+        cudaFree(small);
+        cudaFree(slab);
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    auto launch = [&](int leg, int win) {
+        const unsigned char *const w = slab + (uint64_t)win * slab_bytes;
+        if (leg == 2)
+            matmul_q8_0_preq_pair_lanes_kernel<4, false><<<
+                    dim3((unsigned)((OUT + 3) / 4), 1u, 1u), 256>>>(
+                    out, w, xq, xs, (uint64_t)OUT, 2u, (uint64_t)GROUPS);
+        else if (leg == 3)
+            /* The same tile with the token-row capacity cut to the width that
+             * is actually being asked for.  Same grid, same 256 threads, same
+             * rows = 2, so the only difference is R. */
+            matmul_q8_0_preq_pair_lanes_kernel<2, false><<<
+                    dim3((unsigned)((OUT + 3) / 4), 1u, 1u), 256>>>(
+                    out, w, xq, xs, (uint64_t)OUT, 2u, (uint64_t)GROUPS);
+        else if (leg == 4)
+            /* One block per SM: 48 blocks cover output rows 0..191 and read
+             * 48/80 of the slab.  out[] is a scratch buffer and the rows this
+             * leg does not write are never read, so a partial result is the
+             * intended shape of the experiment, not a defect in it. */
+            matmul_q8_0_preq_pair_lanes_kernel<4, false><<<
+                    dim3(48u, 1u, 1u), 256>>>(
+                    out, w, xq, xs, (uint64_t)OUT, 2u, (uint64_t)GROUPS);
+        else
+            matmul_q8_hc_down_pair_kernel<<<
+                    dim3((unsigned)OUT, leg == 0 ? 1u : 2u, 1u), 32>>>(
+                    out, w, xq, xs, leg == 0 ? 1u : 2u);
+    };
+    /* One untimed warm-up per leg, so no leg pays for its own first launch.
+     * It touches window 0 only, one of wins * PASSES timed launches. */
+    auto time_leg = [&](int leg) -> int {
+        launch(leg, 0);
+        if (cudaDeviceSynchronize() != cudaSuccess) {
+            (void)cudaGetLastError();
+            return -1;
+        }
+        if (cudaEventRecord(e0, 0) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return -1;
+        }
+        for (int p = 0; p < PASSES; p++)
+            for (int win = 0; win < wins; win++) launch(leg, win);
+        if (cudaEventRecord(e1, 0) != cudaSuccess ||
+            cudaDeviceSynchronize() != cudaSuccess) {
+            (void)cudaGetLastError();
+            return -1;
+        }
+        float ms = 0.0f;
+        if (cudaEventElapsedTime(&ms, e0, e1) != cudaSuccess || !(ms > 0.0f)) {
+            (void)cudaGetLastError();
+            return -1;
+        }
+        const double launches = (double)wins * (double)PASSES;
+        return (int)((double)ms * 1.0e6 / launches + 0.5);
+    };
+    *r1_ns = time_leg(0);
+    *r2_ns = time_leg(1);
+    *t4_ns = time_leg(2);
+    *t2_ns = time_leg(3);
+    *w1_ns = time_leg(4);
+
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+    cudaFree(small);
+    cudaFree(slab);
+    (void)cudaGetLastError();
+    return wins;
+}
+#endif  /* DS4_HCD_PROBE_BUILD */
+
 /* The device's occupancy limits, as a compact string the caller can append to
  * an identity that reaches the run's metrics.  See ds4.h for why this is worth
  * publishing.
@@ -18181,8 +18441,38 @@ extern "C" const char *ds4_gpu_hw_limits(void) {
      * is diagnostic only and snprintf keeps it terminated. */
     const char *kl = ds4_gpu_qwen4exp_kernel_limits();
     if (kl && kl[0] && (size_t)n + 2u < sizeof(buf)) {
-        snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", kl);
+        const int m = snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", kl);
+        if (m > 0) {
+            n += m;
+            if ((size_t)n >= sizeof(buf)) n = (int)sizeof(buf) - 1;
+        }
     }
+#if DS4_HCD_PROBE_BUILD
+    /* The HC down leg, latched in its own cache so a failure here cannot cost
+     * the device attributes or the routed-MoE limits above it.  The whole
+     * readout is 361 chars today and this adds 55 with five legs (37 at
+     * three), so buf[448] and
+     * ds4_resident's own ident_buf[768] both still hold it -- worth checking,
+     * because ds4_resident DROPS the entire limits string rather than
+     * truncating it if it does not fit. */
+    {
+        static int hcd_done = 0;
+        static int hcd_v[6] = {-1, -1, -1, -1, -1, 0};
+        if (!hcd_done) {
+            hcd_done = 1;
+            const char *const hcd_env = getenv("DS4_HC_DOWN_PROBE");
+            if (hcd_env == NULL || hcd_env[0] != '0')
+                hcd_v[5] = ds4_hc_down_probe(&hcd_v[0], &hcd_v[1],
+                                             &hcd_v[2], &hcd_v[3],
+                                             &hcd_v[4]);
+        }
+        if ((size_t)n + 2u < sizeof(buf))
+            snprintf(buf + n, sizeof(buf) - (size_t)n,
+                     " hcd[r1=%d r2=%d t4=%d t2=%d w1=%d n=%d]",
+                     hcd_v[0], hcd_v[1], hcd_v[2], hcd_v[3], hcd_v[4],
+                     hcd_v[5]);
+    }
+#endif
     return buf;
 }
 
@@ -18520,6 +18810,78 @@ static int cuda_matmul_q8_0_preq_rows_exact(
                     xq + 2u * blocks * 32u, xscale + 2u * blocks, 1u);
             return cuda_ok(cudaGetLastError(), "q8 HC down pair launch (3 rows)");
         }
+        /* MEASURED SWAP, at the two-row decode width only: the four-row tile
+         * instead of the 320 x n_rows one-warp grid.  The pair kernel gives
+         * each (row, token) its own block, so a token's 10,880-byte weight row
+         * is requested twice; the tile gives a block four rows and walks both
+         * tokens against one register copy of every weight word.  This
+         * engine's own boot probe (hcd[] above) timed all three shapes on the
+         * same 3,481,600-byte slab over n=64 windows, so no leg got an
+         * L2-residency discount the others did not:
+         *
+         *     320 x 1 pair   27,224 ns    one token, 128 GB/s
+         *     320 x 2 pair   32,164 ns    the shipping width, 108 GB/s
+         *     four-row tile  30,410 ns    -5.45%
+         *
+         * so the duplicate request costs 18% at this width and the tile
+         * recovers a third of it.  At 96 calls a token that is 0.168 ms, about
+         * 0.4% of a decode round.
+         *
+         * BIT-EXACTNESS, which is why the kernel picked here is the identical
+         * <4, false> instantiation the three-row path above already dispatches
+         * for this exact projection: that launch's own comment states the
+         * identity being relied on ("the weight block is read once for all
+         * three rows ... Same per-row chains"), and
+         * ds4/tests/test_q8_decode_pairs.c asserts it by memcmp against the
+         * per-row reference kernel at 10240 -> 320 for widths 1, 2, 3, 4 and 7.
+         * The leaves are the same 32 group partials in the same order -- each
+         * lane walks b = group, group + 32, ... and forms ws * xscale[at] *
+         * (float)dot, with the integer dot split across a lane pair and
+         * combined by an integer add -- and the tile's fold, one add of group g
+         * to group g + 16 followed by shuffle distances 8, 4, 2 and 1, is
+         * warp_sum_f32's own tree over that same order.
+         *
+         * WHAT THIS GIVES UP, stated so a draw can falsify it: the pair kernel
+         * is also a PDL *producer* for the silu/quantize behind it, and the
+         * tile carries no trigger, so that successor loses its early start.
+         * The consumer half is kept -- the tile's first walk step issues its
+         * weight loads above the same fence -- and both probe legs above were
+         * timed with no fence at all, so the 5.45% is the two kernels alone.
+         * R = 2, NOT R = 4, AND WHY THAT IS THE SAME ARITHMETIC.  R is the
+         * tile's token-row CAPACITY: a block owns four output rows whatever R
+         * is, and the walk runs `for (r = 0; r < R; r++) if (r < take)` with
+         * take = min(rows, R).  At the scored width take is 2, so R = 4 runs
+         * the same two arms this does and predicates the other two off; each
+         * token row's accumulator, its ascending walk over b, its lane-pair
+         * integer recombination and its reduction tree are per-row and do not
+         * depend on R at all.  What R changes is acc[R], the upper[] staging
+         * array (512 B here against 1,024) and two dead unrolled arms.  The
+         * instantiation is not new: <2, false> and <2, false, true> are both
+         * already dispatched by this ladder at other shapes.  The probe leg
+         * hcd[t2=] times this kernel and hcd[t4=] is kept as the R = 4
+         * control, so one draw prices the change on the boot channel next to
+         * the score.
+         *
+         * THIS TREE IS THE PAIRED PARTNER of the one that swapped the kernel
+         * without the trigger: the Relay template parameter re-arms it, so the
+         * two trees differ by exactly one PTX instruction and the difference
+         * between their draws IS what the relay is worth.  The cost of finding
+         * out is that <4, false, false, true> is a fresh instantiation and
+         * ptxas re-chooses on each one -- this template's own fill comment
+         * records a __launch_bounds__ moving it 46 -> 62 registers and dropping
+         * a resident block -- which is why the unrelayed tree exists and ships
+         * the instantiation the probe actually timed.
+         * DS4_Q8_NO_HC_DOWN_TILE restores the pair grid. */
+#define DS4_Q8_HC_DOWN_TILE matmul_q8_0_preq_pair_lanes_kernel<2, false, false, true>
+        if (getenv("DS4_Q8_NO_HC_DOWN_TILE") == NULL) {
+            QWEN4EXP_LAUNCH_PDL(DS4_Q8_HC_DOWN_TILE,
+                                dim3((unsigned)((out_dim + 3u) / 4u), 1u, 1u),
+                                256, 0, cuda_decode_stream(),
+                    (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
+                    out_dim, n_rows, blocks);
+            return cuda_ok(cudaGetLastError(), "q8 HC down tile launch");
+        }
+#undef DS4_Q8_HC_DOWN_TILE
         /* PDL consumer: the stream predecessor is qwen4exp_hc_norm_quant,
          * which triggers at its top, and the kernel's weight-word prefetch
          * rides the norm's window (ds4_cuda_qwen4exp.cuh). */
