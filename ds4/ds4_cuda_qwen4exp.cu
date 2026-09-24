@@ -497,6 +497,64 @@ __device__ static float warp_sum_all_f32(float v) {
     return v;
 }
 
+/* Warp REDUX maxima for the Q8_0 group-scale reductions, and the matching
+ * integer group sum.
+ *
+ * MAX.  The reduced value at every site this replaces is `fabsf()` of an
+ * activation, at nine of the ten sites additionally flushed by
+ * qwen4exp_q8_ftz: zero, a positive finite float, or +inf.  Over that domain
+ * the binary32 bit pattern is order-isomorphic to its unsigned integer
+ * pattern -- the sign bit is 0, so the biased exponent field dominates and
+ * the mantissa breaks ties in the same direction the real order does -- so
+ * __reduce_max_sync over the bits selects the SAME operand the shuffle
+ * butterfly selected, bit for bit, and the derived scale is unchanged.  Only
+ * the value is needed (never which lane held it), and equal maxima are equal
+ * bit patterns, so the choice of winner is unobservable.  REDUX also leaves
+ * the maximum in EVERY lane, which is what the xor butterflies already
+ * relied on and what lets the __shfl_down form's broadcast shuffle go away.
+ * This is the same argument the promoted router KeyMax carries for its
+ * packed integer keys; here the domain is the non-negative float one.
+ *
+ * DISCLOSED BOUNDARY.  Were a lane's value NaN the two forms would differ:
+ * fmaxf returns the non-NaN operand, while the unsigned bit compare ranks a
+ * NaN above +inf.  The claim is therefore exactness on the flushed
+ * non-negative domain conditional on finiteness, not unconditional
+ * exactness.  A NaN activation is not a case the engine tolerates anywhere
+ * upstream of these quantisers -- it would already have failed the
+ * correctness gate -- and every local leg of this tree reports
+ * max_abs_diff=0 against the public golden.
+ *
+ * SUM.  __reduce_add_sync sums the same 32 int32 operands as the
+ * __shfl_down tree.  Two's-complement int32 addition is associative and
+ * commutative modulo 2^32 and wraps identically, so the total is the tree's
+ * bit for bit -- no reassociation hazard of the kind a float sum would carry.
+ * The collective returns to every lane, so the CALL must sit outside any lane
+ * guard (a full-mask collective that only some lanes reach is undefined);
+ * only the store stays lane-0, exactly as before.
+ *
+ * Both are sm_80+; the pre-sm_80 build keeps the shipped butterflies. */
+__device__ __forceinline__ static float qwen4exp_warp_max_nonneg(float a) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    return __uint_as_float(__reduce_max_sync(0xffffffffu, __float_as_uint(a)));
+#else
+    for (int off = 16; off > 0; off >>= 1) {
+        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+    }
+    return a;
+#endif
+}
+
+__device__ __forceinline__ static int qwen4exp_warp_add_i32(int v) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    return (int)__reduce_add_sync(0xffffffffu, (unsigned)v);
+#else
+    for (uint32_t stride = 16u; stride > 0u; stride >>= 1u) {
+        v += __shfl_down_sync(0xffffffffu, v, stride);
+    }
+    return v;
+#endif
+}
+
 __device__ static float dot4_f32(float4 a, float4 b) {
     return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
 }
@@ -3824,12 +3882,10 @@ __device__ __forceinline__ static void dev_qwen4exp_quantize_group(
      * pass. */
     float a = 0.0f;
     if (lane < n) a = fabsf(xr[lane]);
-    float m = a;
-#pragma unroll
-    for (uint32_t stride = 16u; stride > 0u; stride >>= 1u) {
-        m = fmaxf(m, __shfl_down_sync(0xffffffffu, m, stride));
-    }
-    m = __shfl_sync(0xffffffffu, m, 0);
+    /* Lanes at or past n contribute +0.0f, the maximum's identity, so the
+     * padding cannot select anything; the helper leaves the maximum in every
+     * lane, which is what the broadcast shuffle used to establish. */
+    const float m = qwen4exp_warp_max_nonneg(a);
     const float d = m / 127.0f;
     const float id = d != 0.0f ? 1.0f / d : 0.0f;
     if (lane == 0u) xscale[at] = d;
@@ -3842,11 +3898,9 @@ __device__ __forceinline__ static void dev_qwen4exp_quantize_group(
     }
     dst[lane] = (int8_t)v;
 
-    int sv = v;
-#pragma unroll
-    for (uint32_t stride = 16u; stride > 0u; stride >>= 1u) {
-        sv += __shfl_down_sync(0xffffffffu, sv, stride);
-    }
+    /* Outside the lane guard: the full-mask collective must be reached by
+     * every lane.  Only the store is lane-0, as it was. */
+    const int sv = qwen4exp_warp_add_i32(v);
     if (lane == 0u) xsum[at] = sv;
 }
 
@@ -9880,10 +9934,7 @@ __global__ static void qwen4exp_ehx_pack_quant_kernel(
                       : hidden[row * n_embd + (k - n_embd)])
         : 0.0f;
     float a = fabsf(xv);
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-    }
+a = qwen4exp_warp_max_nonneg(a);
     const float d = a / 127.0f;
     const float id = d != 0.0f ? 1.0f / d : 0.0f;
     if (lane == 0u) xscale[pair] = d;
@@ -12100,10 +12151,7 @@ __global__ static void qwen4exp_gdn_output_quant_kernel(
         qwen4exp_gdn_sigmoid(output_gate[base + tid]);
     const float vz = qwen4exp_q8_ftz(v);
     float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-    }
+a = qwen4exp_warp_max_nonneg(a);
     const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
     const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
     const uint64_t pair = (uint64_t)token * (value_dim / 32u) +
@@ -12198,12 +12246,12 @@ __global__ static void qwen4exp_hc_norm_quant_kernel(
              * standalone kernel carries for a ragged tail cannot fire. */
             const float vz = qwen4exp_q8_ftz(v);
             float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
-                /* fmaxf, not the .FTZ one: both operands are already flushed
-                 * and non-negative, so the two instructions cannot disagree. */
-                a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-            }
+            /* REDUX.MAX, not the butterfly: the operand is already flushed and
+             * non-negative, so its bits order like its value (see the helper).
+             * The shipped comment's point stands -- fmaxf and its .FTZ twin
+             * cannot disagree on this domain -- and REDUX returns the very
+             * operand the butterfly returned. */
+            a = qwen4exp_warp_max_nonneg(a);
             const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
             const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
             const uint64_t pair = blk0 + (uint64_t)(k * warps + warp);
@@ -12225,12 +12273,9 @@ __global__ static void qwen4exp_hc_norm_quant_kernel(
          * kernel carries for a ragged tail cannot fire. */
         const float vz = qwen4exp_q8_ftz(v);
         float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            /* fmaxf, not the .FTZ one: both operands are already flushed and
-             * non-negative, so the two instructions cannot disagree. */
-            a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-        }
+        /* REDUX.MAX, not the butterfly: the operand is already flushed and
+         * non-negative, so its bits order like its value (see the helper). */
+        a = qwen4exp_warp_max_nonneg(a);
         const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
         const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
         const uint64_t pair = blk0 + (uint64_t)(k * warps + warp);
@@ -12447,10 +12492,7 @@ __global__ static void qwen4exp_hc_mix_inject_dual_kernel(
             const uint32_t warp = threadIdx.x >> 5u;
             const float vz = qwen4exp_q8_ftz(v);
             float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
-                a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-            }
+a = qwen4exp_warp_max_nonneg(a);
             const float qd = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
             const float id = qd != 0.0f ? qwen4exp_q8_rcp_approx(qd) : 0.0f;
             const uint64_t pair = (uint64_t)t * (n_embd / 32u) +
@@ -12772,9 +12814,7 @@ __global__ static void qwen4exp_hc_silu_quant_kernel(
 
     const float vz = qwen4exp_q8_ftz(v);
     float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+a = qwen4exp_warp_max_nonneg(a);
     const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
     const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
     if (lane == 0u) xscale[pair] = d;
@@ -13126,10 +13166,7 @@ __global__ static void qwen4exp_hc_norm_quant_inject_kernel(
                                                          weight_bias, round_bf16);
                 const float vz = qwen4exp_q8_ftz(v);
                 float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-                for (int off = 16; off > 0; off >>= 1) {
-                    a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-                }
+a = qwen4exp_warp_max_nonneg(a);
                 const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
                 const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
                 const uint64_t pair = blk0 + (uint64_t)(k * warps + warp);
@@ -13174,10 +13211,7 @@ __global__ static void qwen4exp_hc_norm_quant_inject_kernel(
                                                      weight_bias, round_bf16);
             const float vz = qwen4exp_q8_ftz(v);
             float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
-                a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-            }
+a = qwen4exp_warp_max_nonneg(a);
             const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
             const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
             const uint64_t pair = blk0 + (uint64_t)(k * warps + warp);
@@ -16353,10 +16387,7 @@ __global__ static void qwen4exp_qsa_output_gate_quant_kernel(
         : 0.0f;
     const float vz = qwen4exp_q8_ftz(v);
     float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-    }
+a = qwen4exp_warp_max_nonneg(a);
     const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
     const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
     const uint64_t pair = (uint64_t)blockIdx.x * 8u + warp;
@@ -16396,10 +16427,7 @@ __global__ static void qwen4exp_qsa_output_gate_doubled_quant_kernel(
         : 0.0f;
     const float vz = qwen4exp_q8_ftz(v);
     float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-    }
+a = qwen4exp_warp_max_nonneg(a);
     const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
     const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
     const uint64_t pair = (uint64_t)blockIdx.x * 8u + warp;
