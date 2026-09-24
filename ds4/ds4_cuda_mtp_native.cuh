@@ -34,13 +34,15 @@ static constexpr uint32_t MTP_NATIVE_SCREEN_GROUPS = 24u;
 static constexpr uint32_t MTP_TARGET_NATIVE_CAP = 16384u;
 static constexpr uint32_t MTP_TARGET_NATIVE_SCREEN_GROUPS = 24u;
 static constexpr uint32_t MTP_NATIVE_MAX_WIDTH = 1u << 20;
-template <bool Screen, bool EmitKeys = false>
+template <bool Screen, bool EmitKeys = false, bool Pair = false>
 __global__ static void mtp_native_projection_kernel(
         float *out, const unsigned char *w,
         const int8_t *xq, const float *xscale,
         uint32_t out_dim,
         const uint32_t *ids, uint32_t n_vocab, uint32_t prefix, uint32_t tail,
         uint64_t *keys = nullptr, uint32_t *invalid = nullptr) {
+    static_assert(!(Pair && (Screen || EmitKeys)),
+                  "paired rows are the exact refinement only");
     /* All three private launches follow the DIM=2560, one-row guard. */
     constexpr uint64_t blocks = MTP_NATIVE_DIM / 32u;
     constexpr int R = 1;
@@ -50,8 +52,20 @@ __global__ static void mtp_native_projection_kernel(
     const uint32_t local_lane = threadIdx.x & 63u;
     const uint32_t group = local_lane >> 1u;
     const uint32_t half = local_lane & 1u;
+    /* PAIRED TWO-ROW REFINEMENT (R2 target screen): block 2k+r is block k of
+     * row r, so a vocabulary row that both ascending shortlists hold is read
+     * by nearby blocks and its second read hits L2.  Each (row, id) still
+     * gets exactly the one-row launch's operands, lanes and reduction. */
+    const uint32_t bx = Pair ? (blockIdx.x >> 1u) : blockIdx.x;
+    if (Pair) {
+        const uint32_t pr = blockIdx.x & 1u;
+        out += (uint64_t)pr * out_dim;
+        ids += (uint64_t)pr * out_dim;
+        xq += (uint64_t)pr * MTP_NATIVE_DIM;
+        xscale += (uint64_t)pr * (MTP_NATIVE_DIM / 32u);
+    }
     /* Width <= 2^20; byte addressing is widened separately below. */
-    const uint32_t row = blockIdx.x * 4u + local_row;
+    const uint32_t row = bx * 4u + local_row;
     constexpr uint32_t row0 = 0u;
     constexpr uint32_t take = 1u;
     float acc[R];
@@ -323,6 +337,16 @@ static int mtp_native_select_verify(void) {
         const char *e = getenv("DS4_MTP_NATIVE_SELECT_VERIFY");
         cached = (e != NULL && e[0] == '1') ? 1 : 0;
     }
+    return cached;
+}
+/* DS4_MTP_NO_R2_PAIR_REFINE=1 restores the R2 screen's two per-row exact
+ * refinement launches in their shipped places inside the per-row loop.  With
+ * it unset both rows are selected and id-sorted first and ONE row-interleaved
+ * launch refines them (same per-(row, id) arithmetic, same outputs). */
+static int mtp_native_pair_refine_enabled(void) {
+    static int cached = -1;
+    if (cached < 0)
+        cached = getenv("DS4_MTP_NO_R2_PAIR_REFINE") == NULL ? 1 : 0;
     return cached;
 }
 /* Verify plumbing.  `begin` snapshots the ids the select just wrote; `end`
@@ -845,6 +869,7 @@ extern "C" int ds4_gpu_mtp_native_screen2(ds4_gpu_tensor *out,
     int id_bits = 1;
     while (id_bits < 32 && ((uint32_t)1u << id_bits) < vocab) id_bits++;
     if (id_bits > 32) id_bits = 32;
+    const int pair_refine = mtp_native_pair_refine_enabled();
     for (uint32_t r = 0; r < 2u; r++) {
         size_t temporary = (size_t)(scratch->bytes - l.temporary);
         uint64_t *kin = key_in + (uint64_t)r * width;
@@ -879,15 +904,32 @@ extern "C" int ds4_gpu_mtp_native_screen2(ds4_gpu_tensor *out,
                 MTP_TARGET_NATIVE_CAP,
                 0, id_bits, cuda_decode_stream()),
                 "native R2 original-ID sort")) return -1;
-        mtp_native_projection_kernel<false><<<
-            (MTP_TARGET_NATIVE_CAP + 3u) / 4u, 256, 0,
+        if (!pair_refine) {
+            mtp_native_projection_kernel<false><<<
+                (MTP_TARGET_NATIVE_CAP + 3u) / 4u, 256, 0,
+                cuda_decode_stream()>>>(
+                (float *)out->ptr + (uint64_t)r * MTP_TARGET_NATIVE_CAP,
+                (const unsigned char *)w,
+                xq + (uint64_t)r * MTP_NATIVE_DIM,
+                xs + (uint64_t)r * (MTP_NATIVE_DIM / 32u),
+                MTP_TARGET_NATIVE_CAP, iout, vocab, prefix, tail);
+            if (!cuda_ok(cudaGetLastError(), "native R2 exact refinement"))
+                return -1;
+        }
+    }
+    /* Row 1's select and sorts write only the select arena, the cub
+     * temporary, key_out/id_tmp row 1 and ids row 1, none of which row 0's
+     * refinement reads (xq/xs prefix, ids row 0, w) or writes (out row 0),
+     * so deferring row 0's refinement to here is order-safe. */
+    if (pair_refine) {
+        mtp_native_projection_kernel<false, false, true><<<
+            2u * ((MTP_TARGET_NATIVE_CAP + 3u) / 4u), 256, 0,
             cuda_decode_stream()>>>(
-            (float *)out->ptr + (uint64_t)r * MTP_TARGET_NATIVE_CAP,
-            (const unsigned char *)w,
-            xq + (uint64_t)r * MTP_NATIVE_DIM,
-            xs + (uint64_t)r * (MTP_NATIVE_DIM / 32u),
-            MTP_TARGET_NATIVE_CAP, iout, vocab, prefix, tail);
-        if (!cuda_ok(cudaGetLastError(), "native R2 exact refinement"))
+            (float *)out->ptr, (const unsigned char *)w, xq, xs,
+            MTP_TARGET_NATIVE_CAP, (const uint32_t *)ids->ptr,
+            vocab, prefix, tail);
+        if (!cuda_ok(cudaGetLastError(),
+                     "native R2 paired exact refinement"))
             return -1;
     }
     return (int)MTP_TARGET_NATIVE_CAP;
