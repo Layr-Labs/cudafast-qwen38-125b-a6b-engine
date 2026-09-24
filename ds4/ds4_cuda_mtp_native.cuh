@@ -45,7 +45,9 @@ __global__ static void mtp_native_projection_kernel(
     constexpr uint64_t blocks = MTP_NATIVE_DIM / 32u;
     constexpr int R = 1;
     constexpr bool Streaming = false;
-    const uint64_t work_blocks = Screen ? MTP_NATIVE_SCREEN_GROUPS : blocks;
+    /* `constexpr`, not `const`: both operands are compile-time and the value
+     * now sizes a __shared__ array below.  No codegen consequence. */
+    constexpr uint64_t work_blocks = Screen ? MTP_NATIVE_SCREEN_GROUPS : blocks;
     const uint32_t local_row = threadIdx.x >> 6u;
     const uint32_t local_lane = threadIdx.x & 63u;
     const uint32_t group = local_lane >> 1u;
@@ -61,8 +63,83 @@ __global__ static void mtp_native_projection_kernel(
     const uint32_t weight_row = row >= out_dim ? n_vocab : Screen
         ? (row < prefix ? row : n_vocab - tail + (row - prefix)) : ids[row];
     const bool valid = row < out_dim && weight_row < n_vocab;
+
+    /* Stage this block's four weight rows through shared memory.
+     *
+     * WHY.  The 34-byte group stride leaves each 16-byte payload only 2-byte
+     * aligned, so every lane issues FOUR scalar 32-bit loads plus a realigning
+     * funnelshift.  Across 32 consecutive lanes one of those loads spreads its
+     * addresses over ~544 bytes to deliver 128, so the kernel pays several times
+     * the transactions its bytes require -- while reading a window that is
+     * perfectly contiguous and could be fetched at full width.  So fetch it at
+     * full width, once, cooperatively, and let the misaligned reads happen in
+     * shared memory, where alignment is free and bank conflicts are separately
+     * measured to be free on this box.
+     *
+     * DENSITY IS THE PRECONDITION, and it is why this kernel and not the coarse
+     * screen.  The same edit on `mtp_native_projection2_screen_kernel` was
+     * measured at -26.5% (`hd[sc]` 117 -> 86 GB/s, draw cef0345f) and reverted:
+     * that kernel walks only MTP_NATIVE_SCREEN_GROUPS = 24 of a row's 80 groups,
+     * so its four staged windows are 816-byte runs at 2720-byte stride --
+     * 36.4% dense.  The copy reproduced the very scatter it was meant to remove
+     * and added a barrier the original never paid; `hd[lo]` did not move
+     * (129 -> 130, transactions unchanged) while `lo/sc` went 1.103 -> 1.512,
+     * locating the whole cost in the prologue fill.  Here the staged window is
+     * the WHOLE 2720-byte row and the span is 100% dense, which is the only
+     * configuration in which the fill has nothing to pay for.  Before extending
+     * this to a third kernel, compute
+     *     window * rows / ((rows - 1) * stride + window)
+     * and do not write it below ~100%.
+     *
+     * The live consumer here is the `<false>` exact-refinement launch, which
+     * runs TWICE per decode round at MTP_TARGET_NATIVE_CAP rows over all 80
+     * groups: 2 x 16384 x 2720 = 89.1 MB per round, against the coarse screen's
+     * 202.6 MB.  Rows are gathered through `ids[row]` and so are scattered, but
+     * each row's 2720 bytes are one contiguous run, which is all staging needs.
+     *
+     * Per lane the instruction count barely moves -- ~10 dependent scalar loads
+     * before, ~11 independent coalesced ones after -- so this is a transaction
+     * trade, not a load-count trade, exactly as on the screen.
+     *
+     * BIT-EXACTNESS is an equality of residues, NOT a claim that the
+     * reconstruction ignores alignment.  It does not: `wq[3]`'s top `addr & 3`
+     * bytes come from the uint16 read at `payload + 14`, which supplies the
+     * right bytes only while `addr & 3` is EVEN.  A host parity rig that stages
+     * into deliberately odd-skewed buffers shows that boundary breaking on
+     * ~20434 of 20480 comparisons, so the precondition is real and not a
+     * formality.  It holds here by construction: `staged` requires
+     * `w & 3 == 0`, and the row offset is a multiple of `blocks * 34 == 2720`,
+     * itself a multiple of 4 -- so `wr` is 4-byte aligned, `srow` is declared
+     * 16-byte aligned, and both bases are 0 mod 4.  Every payload offset within
+     * the row is therefore identical mod 4 on the two paths, `shift` is the same
+     * value, and the reconstruction is the same arithmetic on the same bytes.
+     *
+     * The caller guarantees only that `w` is EVEN, not 4-byte aligned.  Because
+     * 2720 is a multiple of 16 every row shares `w`'s residue, so one uniform
+     * test decides for the whole launch; when it fails, `base` stays the global
+     * pointer and this kernel is byte-for-byte the shipped one. */
+    constexpr uint32_t row_bytes = (uint32_t)(work_blocks * 34u);
+    static_assert(row_bytes % 4u == 0u,
+                  "staged window must be a whole number of 32-bit words");
+    constexpr uint32_t row_words = row_bytes / 4u;
+    __shared__ __align__(16) unsigned char srow[4][row_bytes];
+    const unsigned char *const wr = valid
+        ? w + (uint64_t)weight_row * blocks * 34u : w;
+    const bool staged = (((uintptr_t)w & 3u) == 0u);
+    if (staged) {
+        if (valid) {
+            const uint32_t *__restrict__ s32 = (const uint32_t *)wr;
+            uint32_t *d32 = (uint32_t *)&srow[local_row][0];
+            for (uint32_t i = local_lane; i < row_words; i += 64u)
+                d32[i] = s32[i];
+        }
+        /* `staged` reads only `w`, so it is grid-uniform and this barrier is
+         * reached by every thread of the block or by none. */
+        __syncthreads();
+    }
+    const unsigned char *const base = staged ? &srow[local_row][0] : wr;
+
     if (valid) {
-        const unsigned char *wr = w + (uint64_t)weight_row * blocks * 34u;
         for (uint64_t b = group; b < work_blocks; b += 32u) {
             /* Name both lanes of every live pair even if independent
              * scheduling has temporarily separated their execution. */
@@ -70,7 +147,7 @@ __global__ static void mtp_native_projection_kernel(
             const uint64_t remaining = work_blocks - warp_base;
             const uint32_t live_pairs = (uint32_t)(remaining < 16u ? remaining : 16u);
             const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
-            const int8_t *payload = (const int8_t *)(wr + b * 34u + 2u) + half * 16u;
+            const int8_t *payload = (const int8_t *)(base + b * 34u + 2u) + half * 16u;
             const uintptr_t address = (uintptr_t)payload;
             const uint32_t shift = (uint32_t)(address & 3u) * 8u;
             const uint32_t *words = (const uint32_t *)(address & ~(uintptr_t)3u);
@@ -87,7 +164,7 @@ __global__ static void mtp_native_projection_kernel(
             const uint16_t *lastp = (const uint16_t *)(const void *)(payload + 14);
             const uint16_t last = Streaming ? __ldcs(lastp) : *lastp;
             wq[3] = (int32_t)__funnelshift_r(previous, (uint32_t)last, shift);
-            const __half *scale = (const __half *)(wr + b * 34u);
+            const __half *scale = (const __half *)(const void *)(base + b * 34u);
             const float ws = Streaming
                 ? __half2float(__ushort_as_half(__ldcs((const uint16_t *)scale)))
                 : __half2float(*scale);
