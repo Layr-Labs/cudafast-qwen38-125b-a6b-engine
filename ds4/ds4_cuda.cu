@@ -20506,7 +20506,7 @@ struct qwen_gdn_projection_args {
 #else
 #define QW_GDN_PROJ_ATTR __launch_bounds__(256)
 #endif
-template<int R, bool Stage=false, bool CpA=false>
+template<int R, bool Stage=false>
 __global__ QW_GDN_PROJ_ATTR
 static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
     extern __shared__ uint4 qw_gdn_panel[];
@@ -20536,41 +20536,12 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
         const uint64_t panel_bytes = (uint64_t)(B/64u) * blocks * 34u;
         const char *const gp = (const char *)w + (uint64_t)block * panel_bytes;
         if (((uintptr_t)gp & 15u) == 0u) {
-            if (CpA) {
-                /* cp.async PANEL FILL.  The shipped fill routes every 16-byte
-                 * word through the register file (ld.global.v4, st.shared.v4,
-                 * a live uint4 per outstanding word) on a kernel whose header
-                 * records REGISTERS as the binding resource under the
-                 * QW_GDN_PROJ_ATTR cap.  cp.async.cg.shared.global moves the
-                 * same bytes with one instruction and no destination register,
-                 * and it retires without the thread waiting on the data: the
-                 * thread reaches the grid-dependency fence below immediately
-                 * and the copies fly across the producer's drain instead of
-                 * completing in front of it.  Same source bytes, same panel
-                 * image, same decoder -- a copy engine cannot change a value.
-                 * This file's own tt_cp_async trio is the mechanism the KV
-                 * staging above already ships.  A merely word-aligned slab
-                 * keeps the shipped 4-byte loop below, and a partial tail
-                 * word keeps its per-byte fill, both byte-identical.  The
-                 * host selects this instantiation and
-                 * DS4_QWEN4EXP_NO_GDN_PROJ_CPASYNC restores the
-                 * register-staged fill, byte for byte. */
-                for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
-                     i += (uint64_t)B * 16u) {
-                    if (i + 16u <= panel_bytes)
-                        tt_cp_async_16B(gpanel + i, gp + i, true);
-                    else
-                        for (uint64_t j = i; j < panel_bytes; j++) gpanel[j] = gp[j];
-                }
-                tt_cp_async_commit();
-            } else {
-                for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
-                     i += (uint64_t)B * 16u) {
-                    if (i + 16u <= panel_bytes)
-                        *(uint4 *)(gpanel + i) = *(const uint4 *)(const void *)(gp + i);
-                    else
-                        for (uint64_t j = i; j < panel_bytes; j++) gpanel[j] = gp[j];
-                }
+            for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < panel_bytes;
+                 i += (uint64_t)B * 16u) {
+                if (i + 16u <= panel_bytes)
+                    *(uint4 *)(gpanel + i) = *(const uint4 *)(const void *)(gp + i);
+                else
+                    for (uint64_t j = i; j < panel_bytes; j++) gpanel[j] = gp[j];
             }
         } else {
             for (uint64_t i = (uint64_t)threadIdx.x * 4u; i < panel_bytes;
@@ -20585,7 +20556,6 @@ static void qwen_gdn_projection_kernel(qwen_gdn_projection_args a) {
         /* The drain absorbs the fill; the barrier is nearly satisfied by the
          * time it is reached.  Order matters -- see the header. */
         QWEN4EXP_PDL_SYNC();
-        if (CpA) tt_cp_async_wait_group<0>();
         __syncthreads();
     }
     const uint32_t local_row = threadIdx.x >> 6u;
@@ -21154,29 +21124,16 @@ extern "C" int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
             getenv("DS4_QWEN4EXP_NO_GDN_PANEL")==NULL;
         /* PDL consumer: the stream predecessor is the mixed-input quantizer,
          * which triggers at its top at these decode widths. */
-        /* cp.async panel fill (kernel comment at the fill): same bytes, no
-         * register round trip on the register-capped kernel, and the copies
-         * fly across the producer's drain.  Default on for the staged arm;
-         * DS4_QWEN4EXP_NO_GDN_PROJ_CPASYNC selects the register-staged fill
-         * in the same binary. */
-        const int gdn_cpasync = gdn_stage &&
-            getenv("DS4_QWEN4EXP_NO_GDN_PROJ_CPASYNC")==NULL;
         if (rows==1u) {
-            if (gdn_cpasync)
-                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1,true,true>),
-                                    grid, 256, gdn_panel, cuda_decode_stream(), a);
-            else if (gdn_stage)
-                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1,true,false>),
+            if (gdn_stage)
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1,true>),
                                     grid, 256, gdn_panel, cuda_decode_stream(), a);
             else
                 QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<1>),
                                     grid, 256, 0, cuda_decode_stream(), a);
         } else {
-            if (gdn_cpasync)
-                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2,true,true>),
-                                    grid, 256, gdn_panel, cuda_decode_stream(), a);
-            else if (gdn_stage)
-                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2,true,false>),
+            if (gdn_stage)
+                QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2,true>),
                                     grid, 256, gdn_panel, cuda_decode_stream(), a);
             else
                 QWEN4EXP_LAUNCH_PDL((qwen_gdn_projection_kernel<2>),
