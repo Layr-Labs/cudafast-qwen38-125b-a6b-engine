@@ -6405,7 +6405,7 @@ qwen4exp_moe_gateup_heavy_kernel(
  * The activation is the routed intermediate, quantised per (token, slot) pair,
  * so the pair index addresses it directly.
  */
-template <int DownType = -1, bool Wide6 = false>
+template <int DownType = -1, bool Wide6 = false, bool Fused = false>
 __global__ __launch_bounds__(QW_DOWN_MMA_THREADS) static void
 qwen4exp_moe_down_mma_kernel(
         float *partial,
@@ -6423,7 +6423,13 @@ qwen4exp_moe_down_mma_kernel(
         uint32_t groups,
         uint32_t out_dim,
         uint32_t dq_stage,
-        uint32_t layout_kc) {
+        uint32_t layout_kc,
+        int32_t *arrive,
+        const int32_t *selected,
+        float *out,
+        uint32_t n_tokens,
+        uint32_t n_expert_used,
+        uint32_t n_total_expert) {
     __shared__ __align__(16) int8_t sA[QW_DOWN_MMA_BM * QW_MMA_LD];
     __shared__ __align__(16) int8_t sB[QW_MMA_BN * QW_MMA_LD];
     __shared__ float  sWA[QW_DOWN_MMA_BM * QW_MMA_G];
@@ -6434,11 +6440,16 @@ qwen4exp_moe_down_mma_kernel(
     const uint32_t tid  = threadIdx.x;
     const uint32_t warp = tid >> 5;
     const uint32_t lane = tid & 31;
-    const uint32_t row0 = blockIdx.x * QW_DOWN_MMA_BM;
+    /* FUSED: the expert slot is the fastest grid index and the row block the
+     * slowest, so one sweep over every expert completes each token's 64-row
+     * stripe while its partials are still in L2.  Unfused, rb is blockIdx.x
+     * and ey is blockIdx.y, exactly the mapping this kernel always had. */
+    const uint32_t rb = Fused ? blockIdx.y : blockIdx.x;
+    const uint32_t ey = Fused ? blockIdx.x : blockIdx.y;
+    const uint32_t row0 = rb * QW_DOWN_MMA_BM;
     if (row0 >= out_dim) return;
-    if (active && (int32_t)blockIdx.y >= active[0]) return;
-    const uint32_t expert = active ? (uint32_t)active[1 + blockIdx.y]
-                                   : blockIdx.y;
+    if (active && (int32_t)ey >= active[0]) return;
+    const uint32_t expert = active ? (uint32_t)active[1 + ey] : ey;
     const int32_t cnt = counts[expert];
     if (cnt <= 0) return;
     const int32_t base = offsets[expert];
@@ -6547,10 +6558,33 @@ qwen4exp_moe_down_mma_kernel(
                                           (uint32_t)(nbase + (int32_t)tk), g,
                                           groups)
                         : (uint64_t)p * groups + g;
-                    qw_tile_copy_group(&sB[tk * QW_MMA_LD + gg * 32],
-                                       mq + at * 32u);
-                    sXS  [tk * QW_MMA_G + gg] = ms[at];
-                    sXSUM[tk * QW_MMA_G + gg] = (float)msum[at];
+                    if (Fused) {
+                        /* The sweep order re-reads every expert's routed
+                         * activations once per row block: keep them in L2.
+                         * A cache hint only -- the same eight words
+                         * qw_tile_copy_group copies, the same scale and the
+                         * same sum.  mq is only word aligned at prefill, so
+                         * 32-bit hinted loads (qw_load_words8_pol's 16-byte
+                         * arm would never fire and drop the hint). */
+                        const uint64_t fz_pol = qw_pol_last();
+                        const int32_t *const fz_src =
+                            (const int32_t *)(const void *)(mq + at * 32u);
+                        uint32_t *const fz_dst =
+                            (uint32_t *)(void *)&sB[tk * QW_MMA_LD + gg * 32];
+#pragma unroll
+                        for (int fz_i = 0; fz_i < 8; fz_i++) {
+                            fz_dst[fz_i] =
+                                (uint32_t)qw_ldg32i_pol(fz_src + fz_i, fz_pol);
+                        }
+                        sXS  [tk * QW_MMA_G + gg] = qw_ldg32f_pol(ms + at, fz_pol);
+                        sXSUM[tk * QW_MMA_G + gg] =
+                            (float)qw_ldg32i_pol(msum + at, fz_pol);
+                    } else {
+                        qw_tile_copy_group(&sB[tk * QW_MMA_LD + gg * 32],
+                                           mq + at * 32u);
+                        sXS  [tk * QW_MMA_G + gg] = ms[at];
+                        sXSUM[tk * QW_MMA_G + gg] = (float)msum[at];
+                    }
                 } else {
                     qw_tile_store_zero(&sB[tk * QW_MMA_LD + gg * 32]);
                     sXS[tk * QW_MMA_G + gg] = 0.0f;
@@ -6617,6 +6651,46 @@ qwen4exp_moe_down_mma_kernel(
                 partial[(uint64_t)sPair[nn] * out_dim + orow] = acc[nt * 4 + r];
             }
         }
+        if (Fused) {
+            /* ARRIVAL.  Every thread's partial stores are fenced to device
+             * scope, then one thread per pair of this chunk decrements its
+             * (row block, token) counter; the block that takes it to zero
+             * owns that token's combine for these 64 rows.  The done mark is
+             * bit 31 of sPair (pair ids are below 2^31, checked on the host),
+             * so the tile keeps its shared-memory footprint.  take is
+             * block-uniform, so every barrier here is reached by all threads.
+             * This is the threadFenceReduction pattern: store, fence, barrier,
+             * atomic; atomic, barrier, fence, L2 load. */
+            __threadfence();
+            __syncthreads();
+            if ((int32_t)tid < take) {
+                const uint32_t fz_p = sPair[tid];
+                const uint32_t fz_t = fz_p / n_expert_used;
+                if (atomicAdd(&arrive[(uint64_t)rb * n_tokens + fz_t], -1) == 1)
+                    sPair[tid] = fz_p | 0x80000000u;
+            }
+            __syncthreads();
+            __threadfence();
+            /* COMBINE: qwen4exp_moe_down_combine_grid_kernel's statement,
+             * the same operands in the same ascending slot order, read from
+             * the L2 (__ldcg, never a stale L1 line). */
+            const uint32_t fz_row = row0 + (tid & 63u);
+            for (uint32_t fz_i = tid >> 6; fz_i < (uint32_t)take;
+                 fz_i += QW_DOWN_MMA_THREADS / 64u) {
+                const uint32_t fz_v = sPair[fz_i];
+                if ((fz_v & 0x80000000u) == 0u || fz_row >= out_dim) continue;
+                const uint32_t fz_t = (fz_v & 0x7fffffffu) / n_expert_used;
+                const uint64_t fz_p0 = (uint64_t)fz_t * n_expert_used;
+                float fz_acc = 0.0f;
+                for (uint32_t slot = 0; slot < n_expert_used; slot++) {
+                    const uint64_t fz_pair = fz_p0 + slot;
+                    const int32_t fz_e = selected[fz_pair];
+                    if (fz_e < 0 || (uint32_t)fz_e >= n_total_expert) continue;
+                    fz_acc += __ldcg(partial + fz_pair * out_dim + fz_row);
+                }
+                out[(uint64_t)fz_t * out_dim + fz_row] = fz_acc;
+            }
+        }
         __syncthreads();
     }
 }
@@ -6674,6 +6748,37 @@ __global__ static void qwen4exp_moe_down_combine_grid_kernel(
         acc += partial[pair * out_dim + row];
     }
     out[(uint64_t)token * out_dim + row] = acc;
+}
+
+/* FUSED DOWN COMBINE arrival counters.  arrive[rb * n_tokens + t] starts at
+ * token t's number of valid slots; each fused down block that stored one of
+ * those slots' partials for row block rb decrements it once, and the block
+ * that takes it to zero writes out[t][rb*64 .. +63].  A token with no valid
+ * slot has no owner block, so its rows get the combine's value here: 0.0f.
+ * Launched in stream order before every fused down tile, so a graph replay
+ * re-arms the counters exactly as an eager call does. */
+__global__ static void qwen4exp_moe_down_arrive_init_kernel(
+        int32_t *arrive,
+        float *out,
+        const int32_t *selected,
+        uint32_t n_tokens,
+        uint32_t n_expert_used,
+        uint32_t n_total_expert,
+        uint32_t out_dim) {
+    const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t rb = blockIdx.y;
+    if (t >= n_tokens) return;
+    int32_t nv = 0;
+    for (uint32_t slot = 0; slot < n_expert_used; slot++) {
+        const int32_t e = selected[(uint64_t)t * n_expert_used + slot];
+        if (e >= 0 && (uint32_t)e < n_total_expert) nv++;
+    }
+    arrive[(uint64_t)rb * n_tokens + t] = nv;
+    if (nv == 0) {
+        const uint64_t o =
+            (uint64_t)t * out_dim + (uint64_t)rb * QW_DOWN_MMA_BM;
+        for (uint32_t r = 0; r < QW_DOWN_MMA_BM; r++) out[o + r] = 0.0f;
+    }
 }
 
 
@@ -10182,8 +10287,26 @@ static int qwen4exp_routed_moe_cuda(
     /* Align short-down scratch; preserve shared input and metadata offsets. */
     if (down_vector) mq_offset = (mq_offset + 15u) & ~uint64_t(15u);
 
+    /* FUSED DOWN COMBINE (prefill widths; the down tile below is the only
+     * user).  One int32 arrival counter per (64-row block, token), appended
+     * after the task list at a 256-byte aligned offset, so every existing
+     * offset is unchanged.  The pool is grow-only and the prefill's eager
+     * warm layers size it before any capture.  DS4_QWEN4EXP_NO_DOWN_FUSED=1
+     * (or DS4_QWEN4EXP_NO_COMBINE_GRID) restores the separate combine launch
+     * byte for byte. */
+    const bool fz_on = n_tokens >= 64u && (out_dim % QW_DOWN_MMA_BM) == 0u &&
+        (out_dim / QW_DOWN_MMA_BM) <= 65535u && n_pairs <= 0x7fffffffu &&
+        getenv("DS4_QWEN4EXP_NO_DOWN_FUSED") == NULL &&
+        getenv("DS4_QWEN4EXP_NO_COMBINE_GRID") == NULL;
+    const uint64_t fz_off =
+        (mq_offset + mq_bytes + task_bytes + 255u) & ~(uint64_t)255u;
+    const uint64_t fz_bytes = fz_on
+        ? (uint64_t)(out_dim / QW_DOWN_MMA_BM) * n_tokens * sizeof(int32_t)
+        : 0u;
+
     char *base = (char *)qwen4exp_group_scratch(
-            logical_tier, mq_offset + mq_bytes + task_bytes);
+            logical_tier,
+            fz_on ? fz_off + fz_bytes : mq_offset + mq_bytes + task_bytes);
     if (!base) return 0;
     /* The immediately following shared expert consumes this same input.
      * Keep its quantized bytes/scales/sums at the shared scratch prefix;
@@ -10853,14 +10976,45 @@ static int qwen4exp_routed_moe_cuda(
          * loads; DS4_QWEN4EXP_NO_Q51_WIDE_LOAD restores the word loop. */
         const bool dn_wide6 =
             getenv("DS4_QWEN4EXP_NO_Q51_WIDE_LOAD") == NULL;
-#define QWEN4EXP_DOWN_MMA(DT, W6) \
-        qwen4exp_moe_down_mma_kernel<DT, W6><<< \
-                dim3(out_dim / QW_DOWN_MMA_BM, gu_rows, 1), \
-                QW_DOWN_MMA_THREADS, 0, stream>>>( \
-                (float *)down_partial->ptr, down, sc.mq, sc.ms, sc.msum, \
-                sc.pairs, sc.counts, sc.offsets, gu_active, \
-                down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
-                mgroups, out_dim, dn_dq_stage, moe_layout_kc)
+        /* FUSED DOWN COMBINE: re-arm the arrival counters (and zero the rows
+         * of any token with no valid slot), then the down tile on the
+         * expert-fastest grid combines each (row block, token) in-kernel and
+         * neither combine kernel is launched. */
+        int32_t *const fz_arrive =
+            fz_on ? (int32_t *)(void *)(base + fz_off) : NULL;
+        if (fz_on) {
+            qwen4exp_moe_down_arrive_init_kernel<<<
+                    dim3((n_tokens + 255u) / 256u, out_dim / QW_DOWN_MMA_BM, 1),
+                    256, 0, stream>>>(
+                    fz_arrive, (float *)out->ptr,
+                    (const int32_t *)selected->ptr,
+                    n_tokens, n_expert_used, n_total_expert, out_dim);
+            if (!cuda_ok(cudaGetLastError(), "qwen4exp MoE down arrival init"))
+                return 0;
+        }
+#define QWEN4EXP_DOWN_MMA(DT, W6) do { \
+        if (fz_on) { \
+            qwen4exp_moe_down_mma_kernel<DT, W6, true><<< \
+                    dim3(gu_rows, out_dim / QW_DOWN_MMA_BM, 1), \
+                    QW_DOWN_MMA_THREADS, 0, stream>>>( \
+                    (float *)down_partial->ptr, down, sc.mq, sc.ms, sc.msum, \
+                    sc.pairs, sc.counts, sc.offsets, gu_active, \
+                    down_slab->expert_bytes, down_slab->row_bytes, \
+                    down_slab->type, mgroups, out_dim, dn_dq_stage, \
+                    moe_layout_kc, fz_arrive, \
+                    (const int32_t *)selected->ptr, (float *)out->ptr, \
+                    n_tokens, n_expert_used, n_total_expert); \
+        } else { \
+            qwen4exp_moe_down_mma_kernel<DT, W6, false><<< \
+                    dim3(out_dim / QW_DOWN_MMA_BM, gu_rows, 1), \
+                    QW_DOWN_MMA_THREADS, 0, stream>>>( \
+                    (float *)down_partial->ptr, down, sc.mq, sc.ms, sc.msum, \
+                    sc.pairs, sc.counts, sc.offsets, gu_active, \
+                    down_slab->expert_bytes, down_slab->row_bytes, \
+                    down_slab->type, mgroups, out_dim, dn_dq_stage, \
+                    moe_layout_kc, (int32_t *)NULL, (const int32_t *)NULL, \
+                    (float *)NULL, 0u, 0u, 0u); \
+        } } while (0)
         if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q5_1) {
             if (dn_wide6) {
                 QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q5_1, true);
@@ -10874,6 +11028,7 @@ static int qwen4exp_routed_moe_cuda(
         }
 #undef QWEN4EXP_DOWN_MMA
         if (!cuda_ok(cudaGetLastError(), "qwen4exp MoE down tile launch")) return 0;
+        if (fz_on) return 1;
         if (getenv("DS4_QWEN4EXP_NO_COMBINE_GRID") == NULL) {
             qwen4exp_moe_down_combine_grid_kernel<<<
                     dim3((out_dim + threads - 1u) / threads, n_tokens, 1),
@@ -18256,7 +18411,7 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
      * compilation of this template and the reg/smem shape is the template's, not
      * a guess -- but read it as indicative rather than as the launched kernel. */
     if (cudaFuncGetAttributes(
-            &a, qwen4exp_moe_down_mma_kernel<DS4_QWEN4EXP_TY_q8_0, true>) ==
+            &a, qwen4exp_moe_down_mma_kernel<DS4_QWEN4EXP_TY_q8_0, true, true>) ==
         cudaSuccess) {
         md_regs = a.numRegs;
         md_smem = (int)a.sharedSizeBytes;
@@ -18265,7 +18420,7 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
         (void)cudaGetLastError();
     }
     if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &occ, qwen4exp_moe_down_mma_kernel<DS4_QWEN4EXP_TY_q8_0, true>,
+            &occ, qwen4exp_moe_down_mma_kernel<DS4_QWEN4EXP_TY_q8_0, true, true>,
             (int)QW_DOWN_MMA_THREADS, 0) == cudaSuccess) {
         md_occ = occ;
     } else {
