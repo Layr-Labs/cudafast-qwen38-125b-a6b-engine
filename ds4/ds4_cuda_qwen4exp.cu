@@ -6761,6 +6761,9 @@ __device__ __forceinline__ static void qwen4exp_shared_vector_accumulate(
 #define QW_GU_COOP_ROW_U4 90u                /* 1440 B, ten q4_K super-blocks */
 #define QW_GU_COOP_GROUPS 80u                            /* in_dim 2560 / 32 */
 #define QW_GU_COOP_U4 (QW_GU_COOP_ROWS * QW_GU_COOP_ROW_U4)
+#ifndef DS4_GU_COOP_CPASYNC
+#define DS4_GU_COOP_CPASYNC 1
+#endif
 
 /* The eight payload words qw_raw_load's q4_K arm returns for (row, group),
  * read out of the staged copy of the identical row bytes.  A q4_K row is 90
@@ -7074,12 +7077,24 @@ qwen4exp_moe_gateup_split_kernel(
         const char *const ub = up +
             (uint64_t)expert * up_expert_bytes +
             (uint64_t)row0 * up_row_bytes;
+#if DS4_GU_COOP_CPASYNC
+        for (uint32_t i = threadIdx.x; i < words; i += blockDim.x) {
+            qw_cpasync16((uint32_t)__cvta_generic_to_shared(&wcoop[i]),
+                         (const void *)(gb + (uint64_t)i * 16u));
+            qw_cpasync16((uint32_t)__cvta_generic_to_shared(&wcoop[PanelU4 + i]),
+                         (const void *)(ub + (uint64_t)i * 16u));
+        }
+        qw_cpasync_commit();
+        qw_cpasync_wait0();
+        __syncthreads();
+#else
         for (uint32_t i = threadIdx.x; i < words; i += blockDim.x) {
             wcoop[i] = *(const uint4 *)(const void *)(gb + (uint64_t)i * 16u);
             wcoop[PanelU4 + i] =
                 *(const uint4 *)(const void *)(ub + (uint64_t)i * 16u);
         }
         __syncthreads();
+#endif
         wsh = wcoop + (second ? PanelU4 : 0u);
         wrow = warp >> 1u;
     }
@@ -12114,6 +12129,40 @@ __global__ static void qwen4exp_gdn_output_quant_kernel(
     xq[pair * 32u + lane] = (int8_t)q;
 }
 
+/* Warp-wide maximum of a value that is NON-NEGATIVE by construction -- the
+ * Q8_0 quantisers reduce fabsf() of a flushed activation, so every lane holds
+ * a zero, a positive finite, or +inf.
+ *
+ * Over that domain the IEEE-754 binary32 encoding is order-isomorphic to the
+ * unsigned integer order of its bits: the sign bit is clear, and exponent and
+ * mantissa are laid out most-significant-first, so a > b if and only if the
+ * bit pattern of a is greater than the bit pattern of b.  +0.0 encodes as 0,
+ * the smallest pattern, which is also the identity of the maximum here.  The
+ * reduction therefore returns the same float the butterfly returned, bit for
+ * bit, and the scale derived from it is unchanged.
+ *
+ * What that buys is depth.  The butterfly is five dependent shuffle-and-max
+ * pairs: no lane can compute the block scale, and nothing downstream of the
+ * scale can start, until all five have retired in sequence.  REDUX.SYNC does
+ * the same reduction as ONE warp-level instruction.  In these quantisers the
+ * reduction is the whole critical path -- one load, a short pointwise chain,
+ * the reduction, then a reciprocal and a byte store -- so its depth is the
+ * kernel's depth.
+ *
+ * The instruction is sm_80 and newer; older architectures and the host pass
+ * keep the butterfly, character for character. */
+__device__ __forceinline__ static float qwen4exp_warp_max_nonneg(float a) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    return __uint_as_float(
+            __reduce_max_sync(0xffffffffu, __float_as_uint(a)));
+#else
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+    return a;
+#endif
+}
+
 /* hcNorm, then the Q8_0 row quantize the down projection wants, in one pass.
  *
  * Grid (n_hc, rows), blockDim.x QWEN4EXP_HC_THREADS: one block per (token,
@@ -12225,12 +12274,11 @@ __global__ static void qwen4exp_hc_norm_quant_kernel(
          * kernel carries for a ragged tail cannot fire. */
         const float vz = qwen4exp_q8_ftz(v);
         float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            /* fmaxf, not the .FTZ one: both operands are already flushed and
-             * non-negative, so the two instructions cannot disagree. */
-            a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-        }
+        /* Both operands of the butterfly were already flushed and
+         * non-negative, which is exactly the domain the single-instruction
+         * reduction is exact over; the value it returns is the butterfly's
+         * own, bit for bit. */
+        a = qwen4exp_warp_max_nonneg(a);
         const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
         const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
         const uint64_t pair = blk0 + (uint64_t)(k * warps + warp);
@@ -12772,9 +12820,7 @@ __global__ static void qwen4exp_hc_silu_quant_kernel(
 
     const float vz = qwen4exp_q8_ftz(v);
     float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+    a = qwen4exp_warp_max_nonneg(a);
     const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
     const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
     if (lane == 0u) xscale[pair] = d;
@@ -15683,7 +15729,7 @@ __device__ __forceinline__ static void qwen4exp_qsa3_score_tile(
     }
 }
 
-template <uint32_t GROUP, bool TAPE = false>
+template <uint32_t GROUP, bool TAPE = false, bool VPref = false>
 __global__ static void __launch_bounds__(256, 2) qwen4exp_qsa3_attention_group_kernel(
         const float *q, const float *k_cache, const float *v_cache,
         const int32_t *selected, const int32_t *counts, float *out,
@@ -15812,6 +15858,20 @@ __global__ static void __launch_bounds__(256, 2) qwen4exp_qsa3_attention_group_k
                         : make_float2(0.0f, 0.0f);
                     vv[0][u] = v2.x;
                     vv[1][u] = v2.y;
+                }
+                if constexpr (VPref) {
+                    if (n_tokens == 1u && j + 2u * QWEN4EXP_QSA3_VSTEP <= n_in_tile) {
+#pragma unroll
+                        for (uint32_t u = 0; u < QWEN4EXP_QSA3_VSTEP; u++) {
+                            const int32_t kn = keys[j + QWEN4EXP_QSA3_VSTEP + u];
+                            if (kn >= 0) {
+                                const float *const pp =
+                                    vbase + (uint64_t)kn * kv_stride;
+                                asm volatile("prefetch.global.L2 [%0];"
+                                             :: "l"(pp) : "memory");
+                            }
+                        }
+                    }
                 }
 #if QWEN4EXP_QSA3_VPREFETCH
                 if (n_tokens == 1u && j + 2u * QWEN4EXP_QSA3_VSTEP <= n_in_tile) {
@@ -16339,12 +16399,19 @@ __global__ static void qwen4exp_qsa_output_gate_kernel(
  * flat value index -- and a q_width row is a whole number of blocks (the entry
  * refuses a count that is not), so block b's warp w is Q8_0 pair 8b + w, the
  * standalone kernel's row * blocks + group. */
+template <bool PDL>
 __global__ static void qwen4exp_qsa_output_gate_quant_kernel(
         int8_t      *xq,
         float       *xscale,
         const float *gate,
         const float *out,
         uint32_t     n_values) {
+    /* PDL producer for the state-out projection that follows on the stream,
+     * the role and the gate its doubled twin below already carries; the
+     * twin's geometry carries the single-wave condition, and
+     * gridDim.x <= 48 excludes every prefill width.  PDL=false keeps the
+     * shipped kernel; DS4_QWEN4EXP_NO_QSA_GATE_PDL selects it. */
+    if (PDL && gridDim.x <= 48u) QWEN4EXP_PDL_TRIGGER();
     const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
@@ -16353,10 +16420,7 @@ __global__ static void qwen4exp_qsa_output_gate_quant_kernel(
         : 0.0f;
     const float vz = qwen4exp_q8_ftz(v);
     float a = qwen4exp_q8_ftz(fabsf(v));
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-    }
+    a = qwen4exp_warp_max_nonneg(a);
     const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
     const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
     const uint64_t pair = (uint64_t)blockIdx.x * 8u + warp;
@@ -17647,14 +17711,27 @@ extern "C" int ds4_gpu_qwen4exp_qsa_attention_dpos_tensor(
                     return cuda_ok(cudaGetLastError(),
                                    "Qwen4-Exp QSA grouped attention (3, K tape) launch");
                 }
-                qwen4exp_qsa3_attention_group_kernel<12u><<<grid, nth, gshared3,
-                    cuda_decode_stream()>>>(
-                        (const float *)q->ptr, (const float *)k_cache->ptr,
-                        (const float *)v_cache->ptr,
-                        sparse ? (const int32_t *)selected->ptr : NULL,
-                        sparse ? (const int32_t *)counts->ptr : NULL,
-                        (float *)out->ptr, n_tokens, n_head, n_kv_head, head_dim,
-                        pos0, cache_cap, max_selected, sparse ? 1u : 0u, scale, d_pos_ptr);
+                const bool qsa3_vpref =
+                    getenv("DS4_QWEN4EXP_NO_QSA3_VPREFETCH") == NULL;
+                if (qsa3_vpref) {
+                    qwen4exp_qsa3_attention_group_kernel<12u, false, true>
+                        <<< grid, nth, gshared3, cuda_decode_stream() >>>
+                        ((const float *)q->ptr, (const float *)k_cache->ptr,
+                         (const float *)v_cache->ptr,
+                         sparse ? (const int32_t *)selected->ptr : NULL,
+                         sparse ? (const int32_t *)counts->ptr : NULL,
+                         (float *)out->ptr, n_tokens, n_head, n_kv_head, head_dim,
+                         pos0, cache_cap, max_selected, sparse ? 1u : 0u, scale, d_pos_ptr);
+                } else {
+                    qwen4exp_qsa3_attention_group_kernel<12u>
+                        <<< grid, nth, gshared3, cuda_decode_stream() >>>
+                        ((const float *)q->ptr, (const float *)k_cache->ptr,
+                         (const float *)v_cache->ptr,
+                         sparse ? (const int32_t *)selected->ptr : NULL,
+                         sparse ? (const int32_t *)counts->ptr : NULL,
+                         (float *)out->ptr, n_tokens, n_head, n_kv_head, head_dim,
+                         pos0, cache_cap, max_selected, sparse ? 1u : 0u, scale, d_pos_ptr);
+                }
                 return cuda_ok(cudaGetLastError(),
                                "Qwen4-Exp QSA grouped attention (3) launch");
             }
@@ -17766,11 +17843,19 @@ extern "C" int ds4_gpu_qwen4exp_qsa_output_gate_q8_tensor(
         ds4_tensor_device_idx(q8) != ds4_tensor_device_idx(out)) {
         return 0;
     }
-    qwen4exp_qsa_output_gate_quant_kernel<<<
-        (unsigned)(n_values / 256u), 256u, 0, cuda_decode_stream()>>>(
-            (int8_t *)((char *)q8->ptr + q_offset),
-            (float *)((char *)q8->ptr + s_offset),
-            (const float *)gate->ptr, (const float *)out->ptr, n_values);
+    if (getenv("DS4_QWEN4EXP_NO_QSA_GATE_PDL") == NULL) {
+        qwen4exp_qsa_output_gate_quant_kernel<true>
+            <<< (unsigned)(n_values / 256u), 256u, 0, cuda_decode_stream() >>>
+            ((int8_t *)((char *)q8->ptr + q_offset),
+             (float *)((char *)q8->ptr + s_offset),
+             (const float *)gate->ptr, (const float *)out->ptr, n_values);
+    } else {
+        qwen4exp_qsa_output_gate_quant_kernel<false>
+            <<< (unsigned)(n_values / 256u), 256u, 0, cuda_decode_stream() >>>
+            ((int8_t *)((char *)q8->ptr + q_offset),
+             (float *)((char *)q8->ptr + s_offset),
+             (const float *)gate->ptr, (const float *)out->ptr, n_values);
+    }
     return cuda_ok(cudaGetLastError(), "Qwen4-Exp QSA output gate quantize launch");
 }
 
