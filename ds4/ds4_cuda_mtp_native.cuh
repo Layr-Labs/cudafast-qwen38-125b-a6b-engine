@@ -500,8 +500,26 @@ __global__ static void mtp_native_projection2_screen_kernel(
         uint64_t *keys = nullptr, uint32_t *invalid = nullptr) {
     constexpr uint64_t blocks = MTP_NATIVE_DIM / 32u;
     constexpr uint64_t work_blocks = MTP_TARGET_NATIVE_SCREEN_GROUPS;
-    const uint32_t local_row = threadIdx.x >> 6u;
-    const uint32_t local_lane = threadIdx.x & 63u;
+    /* ROW LANES = 2 * work_blocks = 48, not 64.  The 64-lane map gives
+     * `group = local_lane >> 1` 32 pairs while the walk below only has
+     * `work_blocks == 24` of them, so pairs 24..31 -- a QUARTER of every
+     * block -- failed `b < work_blocks` on the first test, issued no load,
+     * and existed only to write 0.0f into `partial[]`.  Allocating 48 lanes
+     * per row instead leaves the ADDRESSING untouched: group g still reads
+     * `wr + g*34 + 2 + half*16`, so a row's 24 live pairs still issue 24
+     * consecutive 34-byte groups in one instruction, from the same lanes, in
+     * the same order.  That matters, because the 16-lane variant of this idea
+     * measured -50 bips and its stated mechanism was a 3x NARROWER coalesced
+     * burst (816 B in one instruction -> 272 B over three steps).  Holding the
+     * burst fixed makes that mechanism absent by construction.  What is bought
+     * is concurrency: 192-thread blocks put 4 rows in 192 threads instead of
+     * 256, so at the SM's 1536-thread ceiling 32 rows are in flight instead of
+     * 24 -- 33% more outstanding weight streams per SM, which is a real lever
+     * only because this screen is NOT bandwidth-saturated (it runs at 0.52x
+     * the rate two byte-proportional families reach in the same round). */
+    constexpr uint32_t row_lanes = 2u * (uint32_t)work_blocks;
+    const uint32_t local_row = threadIdx.x / row_lanes;
+    const uint32_t local_lane = threadIdx.x - local_row * row_lanes;
     const uint32_t group = local_lane >> 1u;
     const uint32_t half = local_lane & 1u;
     const uint32_t row = blockIdx.x * 4u + local_row;
@@ -510,14 +528,18 @@ __global__ static void mtp_native_projection2_screen_kernel(
     const uint32_t weight_row = row < prefix ? row
         : n_vocab - tail + (row - prefix);
     const bool valid = row < width && weight_row < n_vocab;
+    /* A row no longer occupies whole warps, so a warp can hold lanes from a
+     * valid and an invalid row at once and the old `live_pairs` arithmetic --
+     * which assumed one row spanned two whole warps -- can no longer name the
+     * participating set.  Ballot it instead: every lane of a valid row enters
+     * the walk and every lane of an invalid row skips it, so this IS the
+     * participating set, exactly, in every case.  Computed above `if (valid)`
+     * so all 32 lanes of every warp reach it.  The mask changes only the
+     * synchronisation set, never an exchanged value. */
+    const unsigned active = __ballot_sync(0xffffffffu, valid);
     if (valid) {
         const unsigned char *wr = w + (uint64_t)weight_row * blocks * 34u;
-        for (uint64_t b = group; b < work_blocks; b += 32u) {
-            const uint64_t warp_base = b - (uint64_t)(group & 15u);
-            const uint64_t remaining = work_blocks - warp_base;
-            const uint32_t live_pairs =
-                (uint32_t)(remaining < 16u ? remaining : 16u);
-            const unsigned active = 0xffffffffu >> (32u - 2u * live_pairs);
+        for (uint64_t b = group; b < work_blocks; b += (uint64_t)work_blocks) {
             const int8_t *payload =
                 (const int8_t *)(wr + b * 34u + 2u) + half * 16u;
             const uintptr_t address = (uintptr_t)payload;
@@ -558,21 +580,41 @@ __global__ static void mtp_native_projection2_screen_kernel(
     if (half == 0u) {
         partial[0][local_row][group] = acc[0];
         partial[1][local_row][group] = acc[1];
+        /* The eight slots that pairs 24..31 used to fill with their untouched
+         * zero accumulators.  They are kept, and kept zero, so the fold below
+         * sums the SAME 32 values in the SAME tree as the 64-lane map: folding
+         * 24 leaves instead of 32 would re-associate the sum and is not what
+         * this change is allowed to do. */
+        if (group < 32u - (uint32_t)work_blocks) {
+            partial[0][local_row][(uint32_t)work_blocks + group] = 0.0f;
+            partial[1][local_row][(uint32_t)work_blocks + group] = 0.0f;
+        }
     }
     __syncthreads();
-    if (local_lane < 32u) {
+    /* `warp_sum_f32` hardcodes a 0xffffffff mask, so it needs a FULL warp; at
+     * 48 lanes per row the row's own threads are no longer one.  Give each of
+     * the first four warps one row: warp w folds `partial[r][w][0..31]` with
+     * all 32 of its lanes, which is the same 32 slots in the same order the
+     * 64-lane map read.  Warps 4 and 5 sit out this tail. */
+    const uint32_t fold_warp = threadIdx.x >> 5u;
+    const uint32_t fold_lane = threadIdx.x & 31u;
+    if (fold_warp < 4u) {
+        const uint32_t frow = blockIdx.x * 4u + fold_warp;
+        const uint32_t fweight_row = frow < prefix ? frow
+            : n_vocab - tail + (frow - prefix);
+        const bool fvalid = frow < width && fweight_row < n_vocab;
 #pragma unroll
         for (int r = 0; r < 2; r++) {
             const float total = warp_sum_f32(
-                partial[r][local_row][local_lane]);
-            if (local_lane == 0u && row < width) {
-                const float value = valid ? total : -INFINITY;
-                const uint64_t at = (uint64_t)r * width + row;
+                partial[r][fold_warp][fold_lane]);
+            if (fold_lane == 0u && frow < width) {
+                const float value = fvalid ? total : -INFINITY;
+                const uint64_t at = (uint64_t)r * width + frow;
                 if (EmitKeys) {
-                    const uint32_t id = row < prefix ? row
-                        : n_vocab - tail + (row - prefix);
+                    const uint32_t id = frow < prefix ? frow
+                        : n_vocab - tail + (frow - prefix);
                     if (!isfinite(value)) atomicOr(invalid, 1u);
-                    if (!id || row >= prefix)
+                    if (!id || frow >= prefix)
                         keys[at] = UINT64_MAX - id;
                     else
                         keys[at] = q8_top1_pack_key(
@@ -813,15 +855,19 @@ extern "C" int ds4_gpu_mtp_native_screen2(ds4_gpu_tensor *out,
         mtp_native_key_range_disjoint(
             scratch->ptr, scratch->bytes, ids->ptr, ids->bytes);
     if (fuse_keys) {
+        /* 192 = 4 rows x 48 lanes.  See the lane-map comment in the kernel:
+         * the 24 live pairs are unchanged, so the coalesced burst is held
+         * fixed and what the narrower block buys is 8 blocks/SM instead of 6
+         * at the 1536-thread ceiling. */
         mtp_native_projection2_screen_kernel<true><<<
-            (width + 3u) / 4u, 256, 0, cuda_decode_stream()>>>(
+            (width + 3u) / 4u, 192, 0, cuda_decode_stream()>>>(
             scores, (const unsigned char *)w, xq, xs, width, vocab,
             prefix, tail, key_in, flag);
         if (!cuda_ok(cudaGetLastError(), "native fused R2 screen keys"))
             return -1;
     } else {
         mtp_native_projection2_screen_kernel<false><<<
-            (width + 3u) / 4u, 256, 0, cuda_decode_stream()>>>(
+            (width + 3u) / 4u, 192, 0, cuda_decode_stream()>>>(
             scores, (const unsigned char *)w, xq, xs, width, vocab,
             prefix, tail);
         if (!cuda_ok(cudaGetLastError(), "native R2 coarse screen"))
