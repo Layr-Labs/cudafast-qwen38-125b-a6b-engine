@@ -20228,6 +20228,151 @@ static void matmul_f32_warp_tile8_stage_kernel(
     }
 }
 
+/* matmul_f32_warp_tile8_stage_kernel over TWO projections of one input: the
+ * staged text above with matmul_f32_warp_tile8_pair_kernel's column rule.
+ * Column tiles [0, ntn) take (w, out) and tiles [ntn, 2*ntn) take (w2, out2)
+ * at tile - ntn; the staged weight row of global column gcol in [0, 2*out_dim)
+ * is w's row gcol or w2's row gcol - out_dim, i.e. exactly the row that the
+ * unstaged pair kernel's wr[c] walks for that column.  out_dim is a whole
+ * number of TN-column tiles, so a tile never straddles the two projections.
+ * Every stage fill, wait, barrier, operand read, FMA chain, fold and shuffle
+ * below is the single-projection staged kernel's, statement for statement,
+ * which that kernel's header proves bit-identical to the unstaged walk: every
+ * stored output is the value the unstaged pair launch stores.  A column tile
+ * past 2*ntn cannot return (every thread must reach every barrier); it
+ * stages w's row 0 and its store is predicated off, as the staged kernel
+ * does for a tile past ntn.  Prefill only (the pair entry needs n_rows >= 8):
+ * the GDN alpha/beta projections, 36 launches per 1024-token forward.
+ * Off by default; DS4_QWEN4EXP_F32_PAIR_STAGE=1 enables it. */
+template <int TM, int TN, int WR, int WC, int MC, int STAGES, int CG>
+__global__ __launch_bounds__(32 * WR * WC, 1)
+static void matmul_f32_warp_tile8_stage_pair_kernel(
+        float *out,
+        const float *w,
+        float *out2,
+        const float *w2,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint32_t n_rows) {
+    const int NW = WC * TN;            /* 16 weight columns per block  */
+    const int NX = WR * TM;            /* 24 activation rows per block */
+    const int SROW = 64;               /* two 32-chunks, ja then jb    */
+    const int SSZ = (NW + NX) * SROW;  /* 2560 floats = 10,240 B       */
+    __shared__ float st[STAGES * SSZ];
+
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5;
+    const uint32_t wr_i = warp / (uint32_t)WC, wc_i = warp % (uint32_t)WC;
+    const uint32_t tile = blockIdx.x * (uint32_t)WC + wc_i;
+    const uint32_t ntn = (uint32_t)(out_dim / (uint64_t)TN);
+    const bool live_col = tile < 2u * ntn;
+    const bool second = live_col && tile >= ntn;
+    float *const outp = second ? out2 : out;
+    const uint32_t col0 = live_col ? (second ? tile - ntn : tile) * (uint32_t)TN
+                                   : 0u;
+    const uint32_t row0_raw = (blockIdx.y * (uint32_t)WR + wr_i) * (uint32_t)TM;
+    const bool live_row = row0_raw < n_rows;
+    const uint32_t row0 = live_row ? row0_raw : 0u;
+    const uint32_t take = live_row
+        ? (n_rows - row0 < (uint32_t)TM ? n_rows - row0 : (uint32_t)TM)
+        : (uint32_t)TM;
+
+    /* Fill assignment: the staged kernel's, verbatim. */
+    const uint32_t tid = threadIdx.x;
+    const uint32_t wq_row = tid >> 4, wq_k = (tid & 15u) << 2;
+    const uint32_t xq0_row = tid >> 4, xq0_k = (tid & 15u) << 2;
+    const uint32_t xq1 = tid + 256u;
+    const uint32_t xq1_row = xq1 >> 4, xq1_k = (xq1 & 15u) << 2;
+
+    /* The pair's column rule on the weight side. */
+    const uint64_t gcol = (uint64_t)blockIdx.x * (uint64_t)NW + wq_row;
+    const float *wsrc_row;
+    if (gcol < out_dim)            wsrc_row = w + gcol * in_dim;
+    else if (gcol < 2u * out_dim)  wsrc_row = w2 + (gcol - out_dim) * in_dim;
+    else                           wsrc_row = w;
+
+    ds4_stage_fill_ctx f;
+    f.wsrc = wsrc_row + (wq_k & 31u);
+    {   /* per-ROW-GROUP source row, with the shipping substitution */
+        const uint32_t g0 = xq0_row / (uint32_t)TM, t0i = xq0_row % (uint32_t)TM;
+        const uint32_t rb0 = (blockIdx.y * (uint32_t)WR + g0) * (uint32_t)TM;
+        const uint32_t tk0 = rb0 < n_rows
+            ? (n_rows - rb0 < (uint32_t)TM ? n_rows - rb0 : (uint32_t)TM) : 0u;
+        const uint32_t sr0 = rb0 < n_rows ? (rb0 + (t0i < tk0 ? t0i : 0u)) : 0u;
+        const uint32_t g1 = xq1_row / (uint32_t)TM, t1i = xq1_row % (uint32_t)TM;
+        const uint32_t rb1 = (blockIdx.y * (uint32_t)WR + g1) * (uint32_t)TM;
+        const uint32_t tk1 = rb1 < n_rows
+            ? (n_rows - rb1 < (uint32_t)TM ? n_rows - rb1 : (uint32_t)TM) : 0u;
+        const uint32_t sr1 = rb1 < n_rows ? (rb1 + (t1i < tk1 ? t1i : 0u)) : 0u;
+        f.x0src = x + (uint64_t)sr0 * in_dim + (xq0_k & 31u);
+        f.x1src = x + (uint64_t)sr1 * in_dim + (xq1_k & 31u);
+    }
+    f.wdst  = &st[wq_row * SROW + wq_k];
+    f.x0dst = &st[(NW + xq0_row) * SROW + xq0_k];
+    f.x1dst = &st[(NW + xq1_row) * SROW + xq1_k];
+    f.wj_hi  = wq_k  >= 32u ? 1u : 0u;
+    f.x0j_hi = xq0_k >= 32u ? 1u : 0u;
+    f.x1j_hi = xq1_k >= 32u ? 1u : 0u;
+    f.xq1_live = tid < 128u;
+
+#pragma unroll
+    for (int s = 0; s < STAGES - 1; s++)
+        ds4_stage_fill<CG>(f, s / MC, s % MC, s % STAGES, SSZ);
+
+    float A[TM][TN], B[TM][TN], t0[TM][TN], t1[TM][TN];
+    const float *sw = &st[wc_i * (uint32_t)TN * SROW];
+    const float *sx = &st[(NW + wr_i * (uint32_t)TM) * SROW];
+
+    /* h(p,64) = (c_p + c_{p+128}) + (c_{p+64} + c_{p+192}) */
+    ds4_stage_pair<TM, TN, MC, STAGES, 0, SROW, SSZ, CG>(t0, t1, sw, sx, lane, f);
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int c = 0; c < TN; c++) A[t][c] = t0[t][c] + t1[t][c];
+    ds4_stage_pair<TM, TN, MC, STAGES, 1, SROW, SSZ, CG>(t0, t1, sw, sx, lane, f);
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int c = 0; c < TN; c++) A[t][c] = A[t][c] + (t0[t][c] + t1[t][c]);
+    /* h(p+32,64) = (c_{p+32} + c_{p+160}) + (c_{p+96} + c_{p+224}) */
+    ds4_stage_pair<TM, TN, MC, STAGES, 2, SROW, SSZ, CG>(t0, t1, sw, sx, lane, f);
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int c = 0; c < TN; c++) B[t][c] = t0[t][c] + t1[t][c];
+    ds4_stage_pair<TM, TN, MC, STAGES, 3, SROW, SSZ, CG>(t0, t1, sw, sx, lane, f);
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int c = 0; c < TN; c++) B[t][c] = B[t][c] + (t0[t][c] + t1[t][c]);
+
+    /* h(p,32) = h(p,64) + h(p+32,64), then strides 16, 8, 4, 2, 1. */
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+#pragma unroll
+        for (int c = 0; c < TN; c++) {
+            float s = A[t][c] + B[t][c];
+#pragma unroll
+            for (int d = 16; d > 0; d >>= 1) {
+                s = s + __shfl_down_sync(0xffffffffu, s, d);
+            }
+            A[t][c] = s;
+        }
+    if (lane == 0u && live_col && live_row) {
+#pragma unroll
+        for (int t = 0; t < TM; t++) {
+            if ((uint32_t)t < take) {
+#pragma unroll
+                for (int c = 0; c < TN; c++) {
+                    outp[(uint64_t)(row0 + (uint32_t)t) * out_dim +
+                         (uint64_t)(col0 + (uint32_t)c)] = A[t][c];
+                }
+            }
+        }
+    }
+}
+
 /* The eight-warp arrangement: four row groups by two column groups, so a
  * block covers 24 rows by 16 columns.  DS4_F32_NO_WARP_TILE8 keeps the
  * four-warp kernel above. */
@@ -20252,6 +20397,17 @@ static inline int matmul_f32_warp_tile8_stage_off(void) {
     static int cached = -1;
     if (cached < 0)
         cached = getenv("DS4_F32_NO_WARP_TILE8_STAGE") != NULL ? 1 : 0;
+    return cached;
+}
+
+/* Valve for the staged GDN alpha/beta pair tile (prefill only); default ON. */
+static inline int matmul_f32_pair_stage_off(void) {
+    static int cached = -1;
+    if (cached < 0)
+        /* Opt-in: ranked run ca186f8a with this path on measured decode
+         * 2.436 vs 2.503 without it on the same box; keep it off by default
+         * until the decode effect is understood. */
+        cached = getenv("DS4_QWEN4EXP_F32_PAIR_STAGE") != NULL ? 0 : 1;
     return cached;
 }
 
@@ -21077,6 +21233,26 @@ extern "C" int ds4_gpu_matmul_f32_pair_decode_rows_exact_tensor(
     if (!w0 || !w1) return 0;
     const unsigned ntn = (unsigned)(out_dim / (uint64_t)DS4_F32_WARP_TILE_TN);
     dim3 grid8((2u * ntn + wc8 - 1u) / wc8, (unsigned)ytiles8, 1);
+    /* The staged pair kernel is BIT-IDENTICAL to the unstaged one below (the
+     * router's staged tile text under the pair's column rule), on the same
+     * grid.  cp.async moves 16 B and needs all three bases 16-byte aligned;
+     * every offset it adds is a multiple of four floats and in_dim is 2560
+     * here.  DS4_QWEN4EXP_NO_F32_PAIR_STAGE (or the router's
+     * DS4_F32_NO_WARP_TILE8_STAGE) keeps the unstaged pair kernel. */
+    if ((((uintptr_t)w0 | (uintptr_t)w1 | (uintptr_t)x->ptr) & 15u) == 0u &&
+        !matmul_f32_warp_tile8_stage_off() &&
+        !matmul_f32_pair_stage_off()) {
+        matmul_f32_warp_tile8_stage_pair_kernel<
+                DS4_F32_WARP_TILE_TM, DS4_F32_WARP_TILE_TN,
+                DS4_F32_WARP_TILE8_WR, DS4_F32_WARP_TILE8_WC,
+                2560 / 256, DS4_F32_WARP_TILE8_STAGES,
+                DS4_F32_WARP_TILE8_STAGE_CG>
+            <<<grid8, 32 * wr8 * wc8, 0, cuda_decode_stream()>>>(
+                (float *)out0->ptr, (const float *)w0,
+                (float *)out1->ptr, (const float *)w1,
+                (const float *)x->ptr, in_dim, out_dim, n_rows);
+        return cuda_ok(cudaGetLastError(), "matmul_f32 pair warp tile8 stage launch");
+    }
     matmul_f32_warp_tile8_pair_kernel<DS4_F32_WARP_TILE_TM,
                                       DS4_F32_WARP_TILE_TN,
                                       DS4_F32_WARP_TILE8_WR,
