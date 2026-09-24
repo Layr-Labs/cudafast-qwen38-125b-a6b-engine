@@ -3927,6 +3927,45 @@ __global__ static void __launch_bounds__(256) qwen4exp_quantize_rows_wide_kernel
                                 (uint64_t)r * groups + g);
 }
 
+/* K-CHUNK-MAJOR SCRATCH LAYOUT for the prefill routed-MoE Q8_0 scratch
+ * (mq/ms/msum), selected by the host with DS4_QWEN4EXP_NO_MOE_LAYOUT_KC and
+ * applied identically by the two fused gate/up epilogues that write the
+ * scratch and the down MMA tile that reads it.
+ *
+ * The shipped layout is pair-major: group g of global pair p lives at
+ * p*G+g.  The down tile consumes it in K chunks of QW_MMA_G groups, and the
+ * (pair, group) elements of one chunk sit G groups apart -- a 640-byte
+ * stride at the tower shape -- so a tile's 32x4 group staging asks for 128
+ * scattered 32-byte pieces.  The permutation below keeps the same scratch
+ * capacity and gives every (expert, K chunk) segment one contiguous home:
+ * with base = offsets[expert], count = counts[expert], j the pair's index
+ * within its expert, G = mid_dim/32, kc = g & ~3 and width = min(4, G-kc),
+ *
+ *     at = base*G + kc*count + j*width + (g - kc)
+ *
+ * the chunk's elements for pairs j, j+1, ... fill
+ * [kc*count + j0*width, kc*count + (j0+take)*width) with no holes, so the
+ * down tile's existing staging loop becomes a dense address-ordered run by
+ * construction, and each producer's per-(pair, group) store moves from a
+ * 640-byte stride to a 128-byte one.  Every (pair, group) keeps exactly one
+ * owner and every quantise input float is the shipped kernel's own, so the
+ * bytes written are identical; only their addresses move.  The down
+ * partial stays pair-major and the slot combine is untouched.  Inactive
+ * paths (the standalone second-pass quantiser, the decode/verify down
+ * kernels, the shared expert) never select this layout: the host passes the
+ * flag only on the moe_epilogue chain, where these three kernels are the
+ * scratch's only writers and reader.  Host-side coverage of the map
+ * (unique writes, no holes, producer/consumer agreement, chunk contiguity)
+ * is machine-checked off-tree; this comment is the contract, not the
+ * proof. */
+__device__ __forceinline__ static uint64_t qw_moe_kc_index(
+        uint32_t base, uint32_t count, uint32_t j, uint32_t g, uint32_t G) {
+    const uint32_t kc = g & ~3u;
+    const uint32_t width = (G - kc) < 4u ? (G - kc) : 4u;
+    return (uint64_t)base * G + (uint64_t)kc * count +
+           (uint64_t)j * width + (g - kc);
+}
+
 /* Block-wide sum over blockDim.x threads using a caller-supplied scratch of
  * blockDim.x floats.  The reduction tree matches the Metal kernels. */
 __device__ __forceinline__ static float dev_qwen4exp_block_sum(
@@ -5435,7 +5474,8 @@ qwen4exp_moe_gateup_mma_kernel(
         uint32_t mid_dim,
         uint32_t mid_token_stride,
         uint32_t n_expert_used,
-        uint32_t dq_stage) {
+        uint32_t dq_stage,
+        uint32_t layout_kc) {
     /* The bounded Q4_K/Q5_K tasks benefit from distinct banks on MMA
      * fragment reads. Padding only these temporary rows trades staging-store
      * conflicts for cheaper repeated fragment loads. The Q8 task and the
@@ -5987,12 +6027,19 @@ qwen4exp_moe_gateup_mma_kernel(
              * the columns nn = w, w+4, ... and runs the standalone quantise on
              * each: lane i is element i of the group, the same shuffle trees
              * reduce the same values, and `at` is the pair-major group index
-             * the down tile reads.  take is block-uniform, so every lane of a
+             * the down tile reads -- or its K-chunk-major image when the
+             * host selected that layout for the whole epilogue/down chain
+             * (qw_moe_kc_index above; j is the pair's index within its
+             * expert, nbase + nn).  take is block-uniform, so every lane of a
              * warp visits the same columns and the shuffles stay collective. */
             for (uint32_t nn = warp; nn < (uint32_t)take; nn += QW_MMA_WARPS) {
                 dev_qwen4exp_quantize_group(
                         mq, ms, msum, &sMid[nn * 32u], lane, 32u,
-                        (uint64_t)sTok[nn] * (mid_dim / 32u) + blockIdx.x);
+                        layout_kc
+                            ? qw_moe_kc_index((uint32_t)base, (uint32_t)cnt,
+                                              (uint32_t)(nbase + (int32_t)nn),
+                                              blockIdx.x, mid_dim / 32u)
+                            : (uint64_t)sTok[nn] * (mid_dim / 32u) + blockIdx.x);
             }
         } else {
 #pragma unroll
@@ -6100,7 +6147,8 @@ qwen4exp_moe_gateup_heavy_kernel(
         uint64_t up_row_bytes,
         uint32_t groups,
         uint32_t mid_dim,
-        uint32_t n_expert_used) {
+        uint32_t n_expert_used,
+        uint32_t layout_kc) {
     extern __shared__ __align__(16) unsigned char guh_smem[];
     __shared__ uint32_t sTok[QW_GUH_BN];
     const uint32_t tid = threadIdx.x;
@@ -6324,9 +6372,17 @@ qwen4exp_moe_gateup_heavy_kernel(
     for (uint32_t it = warp; it < (uint32_t)take * halves; it += QW_GUH_THREADS / 32u) {
         const uint32_t nn = it / halves, h = it - nn * halves;
         if (row0 + h * 32u >= mid_dim) continue;
+        /* The group index is blockIdx.x * halves + h; j is the pair's index
+         * within its expert (nbase + nn).  Same bytes, new home when the
+         * host selected the K-chunk-major layout (qw_moe_kc_index). */
         dev_qwen4exp_quantize_group(
                 mq, ms, msum, &sMid[nn * QW_GUH_BM + h * 32u], lane, 32u,
-                (uint64_t)sTok[nn] * (mid_dim / 32u) + blockIdx.x * halves + h);
+                layout_kc
+                    ? qw_moe_kc_index((uint32_t)base, (uint32_t)cnt,
+                                      (uint32_t)(nbase + (int32_t)nn),
+                                      blockIdx.x * halves + h, mid_dim / 32u)
+                    : (uint64_t)sTok[nn] * (mid_dim / 32u) +
+                      blockIdx.x * halves + h);
     }
 }
 
@@ -6366,7 +6422,8 @@ qwen4exp_moe_down_mma_kernel(
         uint32_t down_type,
         uint32_t groups,
         uint32_t out_dim,
-        uint32_t dq_stage) {
+        uint32_t dq_stage,
+        uint32_t layout_kc) {
     __shared__ __align__(16) int8_t sA[QW_DOWN_MMA_BM * QW_MMA_LD];
     __shared__ __align__(16) int8_t sB[QW_MMA_BN * QW_MMA_LD];
     __shared__ float  sWA[QW_DOWN_MMA_BM * QW_MMA_G];
@@ -6479,7 +6536,17 @@ qwen4exp_moe_down_mma_kernel(
                 const uint32_t g = kc + gg;
                 const uint32_t p = sPair[tk];
                 if (p != 0xffffffffu && g < groups) {
-                    const uint64_t at = (uint64_t)p * groups + g;
+                    /* K-chunk-major when the host selected it: j is the
+                     * pair's index within its expert (nbase + tk), and the
+                     * tile's take*width groups of this chunk are one dense
+                     * run, so consecutive tid read consecutive 32-byte
+                     * groups (qw_moe_kc_index above).  Same bytes either
+                     * way. */
+                    const uint64_t at = layout_kc
+                        ? qw_moe_kc_index((uint32_t)base, (uint32_t)cnt,
+                                          (uint32_t)(nbase + (int32_t)tk), g,
+                                          groups)
+                        : (uint64_t)p * groups + g;
                     qw_tile_copy_group(&sB[tk * QW_MMA_LD + gg * 32],
                                        mq + at * 32u);
                     sXS  [tk * QW_MMA_G + gg] = ms[at];
@@ -10375,6 +10442,17 @@ static int qwen4exp_routed_moe_cuda(
     const int moe_epilogue = down_mma &&
         getenv("DS4_QWEN4EXP_NO_MOE_EPILOGUE") == NULL;
 
+    /* K-CHUNK-MAJOR SCRATCH LAYOUT (qw_moe_kc_index).  Only on the
+     * moe_epilogue chain: there the two fused gate/up epilogues are the
+     * scratch's only writers and the down MMA tile its only reader, so one
+     * host-computed flag keeps producer and consumer on the same address
+     * map.  The standalone second-pass quantiser, the decode/verify down
+     * kernels and the shared expert never see the flag and keep pair-major.
+     * DS4_QWEN4EXP_NO_MOE_LAYOUT_KC restores the pair-major map on the
+     * whole chain, byte for byte. */
+    const uint32_t moe_layout_kc = (uint32_t)moe_epilogue &&
+        getenv("DS4_QWEN4EXP_NO_MOE_LAYOUT_KC") == NULL;
+
     /* One block row per expert the call CHOSE, not per expert that exists.
      * n_pairs bounds the number of distinct experts, and the kernel exits the
      * rows past active[0]. */
@@ -10522,7 +10600,7 @@ static int qwen4exp_routed_moe_cuda(
                     (const float *)weights->ptr,
                     gate_slab->expert_bytes, gate_slab->row_bytes,
                     up_slab->expert_bytes, up_slab->row_bytes,
-                    xgroups, mid_dim, n_expert_used);
+                    xgroups, mid_dim, n_expert_used, moe_layout_kc);
             if (!cuda_ok(cudaGetLastError(), "qwen4exp gate/up heavy")) return 0;
         }
 #define QWEN4EXP_GATEUP_MMA_IMPL(GT, UT, TASKS, DMA) \
@@ -10539,7 +10617,7 @@ static int qwen4exp_routed_moe_cuda(
                 gate_slab->expert_bytes, gate_slab->row_bytes, \
                 up_slab->expert_bytes, up_slab->row_bytes, \
                 gate_slab->type, up_slab->type, xgroups, mid_dim, \
-                mid_token_stride, n_expert_used, gu_dq_stage)
+                mid_token_stride, n_expert_used, gu_dq_stage, moe_layout_kc)
 #define QWEN4EXP_GATEUP_MMA_D(GT, UT, DMA) do { \
         if (pair_tasks) { QWEN4EXP_GATEUP_MMA_IMPL(GT, UT, true, DMA); } \
         else { QWEN4EXP_GATEUP_MMA_IMPL(GT, UT, false, DMA); } \
@@ -10782,7 +10860,7 @@ static int qwen4exp_routed_moe_cuda(
                 (float *)down_partial->ptr, down, sc.mq, sc.ms, sc.msum, \
                 sc.pairs, sc.counts, sc.offsets, gu_active, \
                 down_slab->expert_bytes, down_slab->row_bytes, down_slab->type, \
-                mgroups, out_dim, dn_dq_stage)
+                mgroups, out_dim, dn_dq_stage, moe_layout_kc)
         if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q5_1) {
             if (dn_wide6) {
                 QWEN4EXP_DOWN_MMA(DS4_QWEN4EXP_TY_q5_1, true);
