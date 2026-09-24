@@ -523,6 +523,21 @@ __device__ __forceinline__ static float qwen4exp_gdn_group_sum_f32(float v) {
     return v;
 }
 
+/* The four outer levels, offsets 8, 4, 2 and 1 in that order, which stay inside
+ * a sixteen-lane half-warp.  Composed with a single __fadd_rn over the two
+ * dot4s a lane holds -- columns 4m and 4m+64, the columns of the original lanes
+ * m and m+16, so the add IS warp_sum_all_f32's offset-16 step -- this is that
+ * function's tree over the same 32 leaves, in the same order, one shuffle
+ * cheaper.  None of the four offsets flips bit 4, so the two halves reduce
+ * independently and no value crosses between them. */
+__device__ __forceinline__ static float qwen4exp_gdn_half_sum_f32(float v) {
+    v += __shfl_xor_sync(0xffffffffu, v, 8);
+    v += __shfl_xor_sync(0xffffffffu, v, 4);
+    v += __shfl_xor_sync(0xffffffffu, v, 2);
+    v += __shfl_xor_sync(0xffffffffu, v, 1);
+    return v;
+}
+
 /* =========================================================================
  * Qwen4-Exp gated delta net (GDN), the CUDA twin of metal/qwen4exp_gdn.metal.
  *
@@ -1292,6 +1307,152 @@ __global__ static void qwen4exp_gdn_replay_gates_kernel(
         }
     }
     *(float4 *)(state + state_off) = h;
+}
+
+/* The replay-gates recurrence with V value rows per warp, so each of its two
+ * warp reductions costs 5 - log2(V) shuffles instead of 5.
+ *
+ * A lane keeps V float4 column blocks at stride QWEN4EXP_GDN_DIM / V, which are
+ * exactly the leaves of the V original lanes it stands in for: at V=4 lane n
+ * holds columns 4n, 4n+32, 4n+64 and 4n+96, the columns of lanes n, n+8, n+16
+ * and n+24, so qwen4exp_gdn_fold4 performs the offset-16 and offset-8 butterfly
+ * levels in-register and only offsets 4, 2, 1 remain (qwen4exp_gdn_fold4's own
+ * comment is the proof).  At V=2 lane m holds columns 4m and 4m+64, the columns
+ * of lanes m and m+16, so one __fadd_rn is the offset-16 level and offsets 8, 4,
+ * 2, 1 remain.  Same leaves, same tree, same order, so the reduction returns the
+ * same float bit for bit.  __fadd_rn rather than `+` so the compiler cannot
+ * contract a dot4 product into the fold and round once where the butterfly
+ * rounds twice.
+ *
+ * Nothing else changes: no state crosses value rows, every load is the same
+ * address, and every store covers the same bytes -- the V column blocks of a
+ * grp==0 lane cover the key row the tape writer used to cover with 32 lanes, and
+ * the one-scalar-per-value stores move from `lane == 0` to `col0 == 0`, which is
+ * one lane per value row either way.  Proven byte-identical against
+ * qwen4exp_gdn_replay_gates_kernel by the ucontext host rig in
+ * tests/ (both head layouts, every prefix the bounded replay log can present,
+ * n_tokens 1..3, and both the replay and current-gate branches). */
+template <unsigned V>
+__global__ static void qwen4exp_gdn_replay_gates_fold_kernel(
+        float *out, float *state, float *checkpoint, float *tape,
+        const float *qkv, const float *raw_alpha, const float *raw_beta,
+        const float2 *gate_pairs,
+        uint32_t n_key_head, uint32_t n_value_head, uint32_t n_tokens,
+        uint32_t head_layout, const uint32_t *control, uint32_t replay_rows) {
+    const uint32_t head = blockIdx.x;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t grp = lane / (32u / V);
+    const uint32_t col0 = 4u * (lane % (32u / V));
+    const uint32_t cstride = QWEN4EXP_GDN_DIM / V;
+    const uint32_t row = (blockIdx.y * 4u + (threadIdx.x >> 5u)) * V;
+    const uint32_t value = row + grp;
+    /* Warp-uniform on purpose: `value` now varies inside the warp, and a guard
+     * that retired some lanes of a warp would invalidate the full shuffle mask
+     * below.  The launch sizes grid.y so that row < QWEN4EXP_GDN_DIM always. */
+    if (head >= n_value_head || row >= QWEN4EXP_GDN_DIM) return;
+    const uint32_t prefix = control ? *control : replay_rows;
+    if (prefix > DS4_QWEN4EXP_GDN_REPLAY_ROWS) return;
+    const uint32_t key_dim = n_key_head * QWEN4EXP_GDN_DIM;
+    const uint32_t value_dim = n_value_head * QWEN4EXP_GDN_DIM;
+    const uint32_t conv_dim = 2u * key_dim + value_dim;
+    const uint32_t tape_stride = (key_dim + value_dim + 2u * n_value_head + 3u) & ~3u;
+    const uint32_t repeats = n_value_head / n_key_head;
+    const uint32_t key_head = head_layout != 0u ? head % n_key_head : head / repeats;
+    const uint32_t key_writer = head_layout != 0u ? key_head : key_head * repeats;
+    const uint64_t state_base = ((uint64_t)head * QWEN4EXP_GDN_DIM + value) *
+                               QWEN4EXP_GDN_DIM + col0;
+    float4 h[4], k4[4], q4[4];
+#pragma unroll
+    for (unsigned c = 0; c < V; c++)
+        h[c] = *(const float4 *)(checkpoint + state_base + cstride * c);
+    for (uint32_t step = 0; step < prefix + n_tokens; step++) {
+        const bool replay = step < prefix;
+        const uint32_t token = replay ? 0u : step - prefix;
+        const float *const saved = tape + (uint64_t)(replay ? step : 0u) * tape_stride;
+        const uint64_t base = (uint64_t)token * conv_dim + key_head * QWEN4EXP_GDN_DIM;
+#pragma unroll
+        for (unsigned c = 0; c < V; c++)
+            k4[c] = *(const float4 *)(replay
+                ? saved + key_head * QWEN4EXP_GDN_DIM + col0 + cstride * c
+                : qkv + base + key_dim + col0 + cstride * c);
+        const float v_row = replay
+            ? saved[key_dim + head * QWEN4EXP_GDN_DIM + value]
+            : qkv[(uint64_t)token * conv_dim + 2u * key_dim +
+                  head * QWEN4EXP_GDN_DIM + value];
+        float g = 0.0f, beta = 0.0f;
+        if (replay) {
+            const float2 pair = ((const float2 *)(saved + key_dim + value_dim))[head];
+            g = pair.x; beta = pair.y;
+        } else {
+            const uint64_t gate = (uint64_t)token * n_value_head + head;
+            if (lane == 0u) {
+                const float2 pair = gate_pairs[gate];
+                g = pair.x; beta = pair.y;
+            }
+            g = __shfl_sync(0xffffffffu, g, 0);
+            beta = __shfl_sync(0xffffffffu, beta, 0);
+            if (token == 0u && prefix < DS4_QWEN4EXP_GDN_REPLAY_ROWS) {
+                float *const record = tape + (uint64_t)prefix * tape_stride;
+                if (value == 0u && head == key_writer) {
+#pragma unroll
+                    for (unsigned c = 0; c < V; c++)
+                        *(float4 *)(record + key_head * QWEN4EXP_GDN_DIM +
+                                    col0 + cstride * c) = k4[c];
+                }
+                if (col0 == 0u) {
+                    record[key_dim + head * QWEN4EXP_GDN_DIM + value] = v_row;
+                    if (value == 0u)
+                        ((float2 *)(record + key_dim + value_dim))[head] =
+                            make_float2(g, beta);
+                }
+            }
+        }
+#pragma unroll
+        for (unsigned c = 0; c < V; c++) {
+            h[c].x *= g;
+            h[c].y *= g;
+            h[c].z *= g;
+            h[c].w *= g;
+        }
+        float dk[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+#pragma unroll
+        for (unsigned c = 0; c < V; c++) dk[c] = dot4_f32(h[c], k4[c]);
+        const float hk = V == 4u
+            ? qwen4exp_gdn_group_sum_f32(
+                  qwen4exp_gdn_fold4(dk[0], dk[1], dk[2], dk[3]))
+            : qwen4exp_gdn_half_sum_f32(__fadd_rn(dk[0], dk[1]));
+        const float delta_v = (v_row - hk) * beta;
+#pragma unroll
+        for (unsigned c = 0; c < V; c++) {
+            h[c].x = fmaf(k4[c].x, delta_v, h[c].x);
+            h[c].y = fmaf(k4[c].y, delta_v, h[c].y);
+            h[c].z = fmaf(k4[c].z, delta_v, h[c].z);
+            h[c].w = fmaf(k4[c].w, delta_v, h[c].w);
+        }
+        if (!replay) {
+#pragma unroll
+            for (unsigned c = 0; c < V; c++)
+                q4[c] = *(const float4 *)(qkv + base + col0 + cstride * c);
+            float dq[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+#pragma unroll
+            for (unsigned c = 0; c < V; c++) dq[c] = dot4_f32(h[c], q4[c]);
+            const float result = V == 4u
+                ? qwen4exp_gdn_group_sum_f32(
+                      qwen4exp_gdn_fold4(dq[0], dq[1], dq[2], dq[3]))
+                : qwen4exp_gdn_half_sum_f32(__fadd_rn(dq[0], dq[1]));
+            if (col0 == 0u)
+                out[(uint64_t)token * value_dim +
+                    head * QWEN4EXP_GDN_DIM + value] = result;
+            if (token == 0u && prefix == DS4_QWEN4EXP_GDN_REPLAY_ROWS) {
+#pragma unroll
+                for (unsigned c = 0; c < V; c++)
+                    *(float4 *)(checkpoint + state_base + cstride * c) = h[c];
+            }
+        }
+    }
+#pragma unroll
+    for (unsigned c = 0; c < V; c++)
+        *(float4 *)(state + state_base + cstride * c) = h[c];
 }
 
 /* Long chunks reuse one Q/K vector and gate pair across four independent
@@ -2857,7 +3018,9 @@ static int qwen4exp_cuda_gdn_run(
     const dim3 recurrence_grid(
         n_value_head, QWEN4EXP_GDN_DIM / 4u, n_rows);
     if (replay_gates) {
-        qwen4exp_gdn_replay_gates_kernel<<<recurrence_grid, QWEN4EXP_GDN_DIM, 0, stream>>>(
+        qwen4exp_gdn_replay_gates_fold_kernel<4u><<<
+                dim3(n_value_head, QWEN4EXP_GDN_DIM / (4u * 4u), n_rows),
+                QWEN4EXP_GDN_DIM, 0, stream>>>(
             (float *)out->ptr, (float *)recurrent_state->ptr,
             (float *)replay->checkpoint->ptr, (float *)replay->tape->ptr,
             (const float *)qkv->ptr, (const float *)raw_alpha->ptr,
@@ -6757,6 +6920,10 @@ __device__ __forceinline__ static void qwen4exp_shared_vector_accumulate(
  * Purely a packing change.  Each output row still walks its own weight row in
  * the same group order through the same warp_sum_f32 tree, and every dot is
  * bit-identical. */
+/* cp.async staging of the gate/up panel; 0 restores the shipped fill. */
+#ifndef DS4_GU_COOP_CPASYNC
+#define DS4_GU_COOP_CPASYNC 1
+#endif
 #define QW_GU_COOP_ROWS 4u
 #define QW_GU_COOP_ROW_U4 90u                /* 1440 B, ten q4_K super-blocks */
 #define QW_GU_COOP_GROUPS 80u                            /* in_dim 2560 / 32 */
@@ -7074,12 +7241,60 @@ qwen4exp_moe_gateup_split_kernel(
         const char *const ub = up +
             (uint64_t)expert * up_expert_bytes +
             (uint64_t)row0 * up_row_bytes;
+#if DS4_GU_COOP_CPASYNC
+        /* cp.async STAGING OF THE GATE/UP PANEL.
+         *
+         * The shipped fill routes every one of the panel's 16-byte words
+         * through the register file: ld.global.v4 into four registers, then
+         * st.shared.v4 out of them, two instructions and a register lifetime
+         * per word.  At four rows that is 2 * 4 * row_u4 words per block --
+         * 720 for q4_K -- so 1,440 instructions and a live uint4 per
+         * outstanding load inside a kernel that is already register-capped
+         * (__maxnreg__ above; the probe publishes gu[reg=32]).
+         *
+         * cp.async.ca.shared.global moves the same 16 bytes with ONE
+         * instruction and NO destination register: the copy is handed to the
+         * async unit, the thread retires it immediately, and the block waits
+         * once at cp.async.wait_all.  Same bytes, same addresses, same panel
+         * image, same decoder afterwards -- a copy engine cannot change a
+         * value, so every emitted float is the shipped kernel's.
+         *
+         * This is the mechanism the routed DOWN panel in this same file
+         * already ships (qw_cpasync16 / qw_cpasync_commit / qw_cpasync_wait0,
+         * selected by DS4_QWEN4EXP_NO_DOWN_ASYNC), applied to the gate/up
+         * panel, which is the larger of the two streams at the decode width
+         * (2 * 1440 B per row-group against 680 B).
+         *
+         * Alignment, which is what cp.async needs and what the launcher
+         * already proves: the source is gate/up base (checked & 15 == 0) +
+         * expert * expert_bytes (checked & 15 == 0) + i * 16, and the
+         * destination is a 16-byte-__align__ed static shared array indexed in
+         * whole uint4.  The L2::cache_hint variants -- the ones the note
+         * above records as faulting at run time on this toolchain -- are NOT
+         * used; this is the plain form the down panel and the heavy tile
+         * already run.
+         *
+         * -DDS4_GU_COOP_CPASYNC=0 restores the shipped register-staged fill
+         * byte for byte. */
+        for (uint32_t i = threadIdx.x; i < words; i += blockDim.x) {
+            qw_cpasync16(
+                (uint32_t)__cvta_generic_to_shared(&wcoop[i]),
+                (const void *)(gb + (uint64_t)i * 16u));
+            qw_cpasync16(
+                (uint32_t)__cvta_generic_to_shared(&wcoop[PanelU4 + i]),
+                (const void *)(ub + (uint64_t)i * 16u));
+        }
+        qw_cpasync_commit();
+        qw_cpasync_wait0();
+        __syncthreads();
+#else
         for (uint32_t i = threadIdx.x; i < words; i += blockDim.x) {
             wcoop[i] = *(const uint4 *)(const void *)(gb + (uint64_t)i * 16u);
             wcoop[PanelU4 + i] =
                 *(const uint4 *)(const void *)(ub + (uint64_t)i * 16u);
         }
         __syncthreads();
+#endif
         wsh = wcoop + (second ? PanelU4 : 0u);
         wrow = warp >> 1u;
     }
@@ -7691,19 +7906,39 @@ __global__ static void qwen4exp_shared_gateup_q_kernel(
             gate + (uint64_t)(blockIdx.x * 8u) * gate_row_bytes;
         const char *const usrc =
             up + (uint64_t)(blockIdx.x * 8u) * up_row_bytes;
-        for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < gbytes;
+        /* gui: ONE fill loop carrying BOTH panels, instead of the gate loop
+         * followed by the up loop.  Bit-exact by construction -- the same
+         * bytes are read from the same addresses and written to the same
+         * destinations; only the ORDER in which the two global streams are
+         * issued changes.  Gate and up are disjoint slabs with no dependency
+         * between them, so interleaving them puts two loads per thread
+         * outstanding at once instead of one, which is the only way to raise
+         * memory-level parallelism here without touching occupancy: the
+         * sequential form drains the gate stream before it issues a single up
+         * request, and a panel is only 8 rows, so neither loop alone has
+         * enough iterations to cover a miss.
+         *
+         * The bound is the LONGER of the two so a short panel simply stops
+         * contributing; each copy keeps its own independent `i < bytes` guard
+         * and its own tail path, so a partial trailing chunk is handled
+         * exactly as before. */
+        const uint64_t nmax = gbytes > ubytes ? gbytes : ubytes;
+        for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < nmax;
              i += (uint64_t)blockDim.x * 16u) {
-            if (i + 16u <= gbytes)
-                *(uint4 *)(gpanel + i) = *(const uint4 *)(const void *)(gsrc + i);
-            else
-                for (uint64_t j = i; j < gbytes; j++) gpanel[j] = gsrc[j];
-        }
-        for (uint64_t i = (uint64_t)threadIdx.x * 16u; i < ubytes;
-             i += (uint64_t)blockDim.x * 16u) {
-            if (i + 16u <= ubytes)
-                *(uint4 *)(upanel + i) = *(const uint4 *)(const void *)(usrc + i);
-            else
-                for (uint64_t j = i; j < ubytes; j++) upanel[j] = usrc[j];
+            if (i < gbytes) {
+                if (i + 16u <= gbytes)
+                    *(uint4 *)(gpanel + i) =
+                        *(const uint4 *)(const void *)(gsrc + i);
+                else
+                    for (uint64_t j = i; j < gbytes; j++) gpanel[j] = gsrc[j];
+            }
+            if (i < ubytes) {
+                if (i + 16u <= ubytes)
+                    *(uint4 *)(upanel + i) =
+                        *(const uint4 *)(const void *)(usrc + i);
+                else
+                    for (uint64_t j = i; j < ubytes; j++) upanel[j] = usrc[j];
+            }
         }
         QWEN4EXP_PDL_SYNC();
         __syncthreads();
@@ -11685,6 +11920,32 @@ __global__ static void qwen4exp_hc_mix_kernel(
     out[(uint64_t)t * n_embd + d] = acc * (1.0f / (float)n_hc);
 }
 
+/* 128-bit vectorized hyper-connection mixer: processes 4 continuous channels
+ * per thread via float4 LDG/STG, cutting memory instruction count by 4x. */
+__global__ static void qwen4exp_hc_mix_vec4_kernel(
+        float4 *out, const float4 *normed, const float4 *wide,
+        uint32_t n_embd4, uint32_t n_hc, uint32_t n_tokens) {
+    const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t t = blockIdx.y;
+    if (d >= n_embd4 || t >= n_tokens) return;
+
+    const uint64_t row = ((uint64_t)t * n_hc) * n_embd4 + d;
+
+    float acc_x = 0.0f, acc_y = 0.0f, acc_z = 0.0f, acc_w = 0.0f;
+    for (uint32_t h = 0; h < n_hc; h++) {
+        const uint64_t idx = row + (uint64_t)h * n_embd4;
+        const float4 w = wide[idx];
+        const float4 n = normed[idx];
+        acc_x += qwen4exp_sigmoid(w.x) * n.x;
+        acc_y += qwen4exp_sigmoid(w.y) * n.y;
+        acc_z += qwen4exp_sigmoid(w.z) * n.z;
+        acc_w += qwen4exp_sigmoid(w.w) * n.w;
+    }
+    const float inv_hc = 1.0f / (float)n_hc;
+    out[(uint64_t)t * n_embd4 + d] = make_float4(
+        acc_x * inv_hc, acc_y * inv_hc, acc_z * inv_hc, acc_w * inv_hc);
+}
+
 __global__ static void qwen4exp_hc_inject_weights_kernel(
         float *out, const float *normed, const char *w,
         uint32_t n_embd, uint32_t n_hc, uint32_t rows,
@@ -11744,6 +12005,39 @@ __global__ static void qwen4exp_hc_inject_kernel(
     out[i] = residual[i] + blk * inject[(uint64_t)t * n_hc + h];
 }
 
+/* 128-bit vectorized hyper-connection inject: 4 channels per thread via
+ * float4 LDG/STG vector operations. */
+__global__ static void qwen4exp_hc_inject_vec4_kernel(
+        float4 *out, const float4 *residual, const float4 *block,
+        const float *inject, const float4 *shexp_tot, const float *shexp_gate,
+        uint32_t n_embd4, uint32_t n_hc,
+        uint32_t n_tokens) {
+    if (n_tokens <= 2u) QWEN4EXP_PDL_TRIGGER();
+    const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t h = blockIdx.y;
+    const uint32_t t = blockIdx.z;
+    if (d >= n_embd4 || h >= n_hc || t >= n_tokens) return;
+
+    const uint64_t i = ((uint64_t)t * n_hc + h) * n_embd4 + d;
+    const uint64_t bi = (uint64_t)t * n_embd4 + d;
+    float4 blk = block[bi];
+    if (shexp_tot) {
+        const float g = shexp_gate[t];
+        const float4 st = shexp_tot[bi];
+        blk.x += g * st.x;
+        blk.y += g * st.y;
+        blk.z += g * st.z;
+        blk.w += g * st.w;
+    }
+    const float inj = inject[(uint64_t)t * n_hc + h];
+    const float4 res = residual[i];
+    out[i] = make_float4(
+        res.x + blk.x * inj,
+        res.y + blk.y * inj,
+        res.z + blk.z * inj,
+        res.w + blk.w * inj);
+}
+
 
 extern "C" int ds4_gpu_qwen4exp_rms_norm_tensor(
         ds4_gpu_tensor       *out,
@@ -11800,10 +12094,21 @@ extern "C" int ds4_gpu_qwen4exp_hc_mix_tensor(
         wide->bytes < hc_bytes) {
         return 0;
     }
-    qwen4exp_hc_mix_kernel<<<dim3((n_embd + 255u) / 256u, rows, 1u), 256, 0,
-                             cuda_decode_stream()>>>(
-            (float *)out->ptr, (const float *)normed->ptr,
-            (const float *)wide->ptr, n_embd, n_hc, rows);
+    if ((n_embd % 4u) == 0 &&
+        ((uintptr_t)out->ptr % 16u) == 0 &&
+        ((uintptr_t)normed->ptr % 16u) == 0 &&
+        ((uintptr_t)wide->ptr % 16u) == 0) {
+        const uint32_t n_embd4 = n_embd / 4u;
+        qwen4exp_hc_mix_vec4_kernel<<<dim3((n_embd4 + 127u) / 128u, rows, 1u), 128, 0,
+                                      cuda_decode_stream()>>>(
+                (float4 *)out->ptr, (const float4 *)normed->ptr,
+                (const float4 *)wide->ptr, n_embd4, n_hc, rows);
+    } else {
+        qwen4exp_hc_mix_kernel<<<dim3((n_embd + 255u) / 256u, rows, 1u), 256, 0,
+                                 cuda_decode_stream()>>>(
+                (float *)out->ptr, (const float *)normed->ptr,
+                (const float *)wide->ptr, n_embd, n_hc, rows);
+    }
     return cuda_ok(cudaGetLastError(), "qwen4exp_hc_mix launch");
 }
 
@@ -11875,11 +12180,24 @@ extern "C" int ds4_gpu_qwen4exp_hc_inject_tensor(
             sa->armed = 0;
         }
     }
-    qwen4exp_hc_inject_kernel<<<dim3((n_embd + 255u) / 256u, n_hc, rows), 256,
-                                0, cuda_decode_stream()>>>(
-            (float *)out_hc->ptr, (const float *)residual_hc->ptr,
-            (const float *)block_out->ptr, (const float *)inject->ptr,
-            sd_tot, sd_gate, n_embd, n_hc, rows);
+    if ((n_embd % 4u) == 0 &&
+        ((uintptr_t)out_hc->ptr % 16u) == 0 &&
+        ((uintptr_t)residual_hc->ptr % 16u) == 0 &&
+        ((uintptr_t)block_out->ptr % 16u) == 0 &&
+        (!sd_tot || ((uintptr_t)sd_tot % 16u) == 0)) {
+        const uint32_t n_embd4 = n_embd / 4u;
+        qwen4exp_hc_inject_vec4_kernel<<<dim3((n_embd4 + 127u) / 128u, n_hc, rows), 128,
+                                         0, cuda_decode_stream()>>>(
+                (float4 *)out_hc->ptr, (const float4 *)residual_hc->ptr,
+                (const float4 *)block_out->ptr, (const float *)inject->ptr,
+                (const float4 *)sd_tot, sd_gate, n_embd4, n_hc, rows);
+    } else {
+        qwen4exp_hc_inject_kernel<<<dim3((n_embd + 255u) / 256u, n_hc, rows), 256,
+                                    0, cuda_decode_stream()>>>(
+                (float *)out_hc->ptr, (const float *)residual_hc->ptr,
+                (const float *)block_out->ptr, (const float *)inject->ptr,
+                sd_tot, sd_gate, n_embd, n_hc, rows);
+    }
     return cuda_ok(cudaGetLastError(), "qwen4exp_hc_inject launch");
 }
 
@@ -18023,6 +18341,474 @@ extern "C" int ds4_gpu_qwen4exp_shared_expert_tensor(
             in_dim, mid_dim, out_dim, x, n_tokens, 0);
 }
 
+/* ---- THE ACHIEVED-BANDWIDTH PROBE ON THE ROUTED GATE/UP DECODE KERNEL ----
+ *
+ * WHAT QUESTION THIS ANSWERS.  The routed gate/up decode kernel reads 1.77 GB
+ * per decode round -- the largest single stream in the engine, 27% of a 6.58 GB
+ * round -- and its bytes are irreducible (weights frozen, experts already
+ * deduped structurally).  So the only thing left to ask about it is a RATE: does
+ * it move those bytes at the part's ceiling, or well under it?  Nobody knows.
+ * Every per-region GB/s figure this line of work has published was a ranking
+ * share from the serialising slice profiler multiplied by a wall clock measured
+ * elsewhere, and that conversion is invalid -- the profiler's own comment says
+ * its numbers are "a ranking of where the work is, not a prediction of the
+ * total".  With those retracted, this region is UNMEASURED, and the standing
+ * hypothesis for the engine's ~57%-of-ceiling deficit (that decode is
+ * weight-unpack-INSTRUCTION-bound rather than bandwidth-bound) has never been
+ * tested, because it wants `ncu` and this box's profiler refuses to attach.
+ *
+ * THE SUBSTITUTE.  Three timed legs at the real kernel's real shape:
+ *   ld  the panel fill ALONE, shipped register-staged form (ld.global.v4 ->
+ *       st.shared.v4), same block shape, same shared footprint, same register
+ *       cap -- so the same occupancy.  This is the fetch on its own.
+ *   cp  the same fill through cp.async.ca.shared.global.  The difference
+ *       ld -> cp prices the staging instruction form directly, which is an arm
+ *       this line of work has drawn and never resolved: at a 1.9% per-draw SD a
+ *       sub-percent mechanism is invisible in a score.
+ *   re  the REAL kernel, qwen4exp_moe_gateup_split_kernel<2, q4_K, true,
+ *       QW_GU_COOP_ROWS, true>, the exact instantiation the decode launcher
+ *       takes, launched on a synthetic slab.  Not a replica: the same
+ *       compilation, the same instruction stream, the same register allocation.
+ * `re` against `ld` is the fork that matters.  If they agree, the fetch is the
+ * limit and unpack is free; the arm is then load shape or reads-in-flight.  If
+ * `ld` is near the ceiling and `re` is far below it, the unpack really is the
+ * limit and the arm is fewer unpack instructions per weight byte, on 1.77 GB.
+ *
+ * WHY THIS IS HONEST ABOUT ITS OWN SHAPE.  Everything the real kernel sees is
+ * the real thing except the CONTENT of the weights, and weight content cannot
+ * change the timing of a read-once stream: no branch in the decoder is
+ * data-dependent, and the grid, block, panel, occupancy, expert count, row
+ * stride, group count and token count are all the scored ones (20 active
+ * experts, 640 rows, two verify rows, 80 groups, 1440-byte rows).  The slab is
+ * 2 x 20 x 640 x 1440 B = 36.9 MB per set, which IS the region's per-call
+ * footprint, and the legs walk `sets` disjoint copies so that L2 (24 MB) cannot
+ * serve a second pass -- a probe that measured L2 would report the ceiling and
+ * teach nothing.
+ *
+ * WHERE IT RUNS, AND WHAT IT COSTS THE SCORE: nothing.  ds4_gpu_hw_limits() is
+ * called once by ds4_resident AFTER the single model load and AFTER the shim's
+ * warm-up, and BEFORE the socket binds, so no timed phase can see it and no
+ * scored kernel changes.  The whole probe is ~10 ms of GPU work against a
+ * warm-up that already spends 1.9 s on a 1024-row prefill.  It adds no launch,
+ * no barrier and no shared byte to any kernel the engine runs.
+ *
+ * FAILURE IS SILENT AND TOTAL.  Every allocation, event and launch is checked;
+ * any failure frees what it took, clears the sticky error and reports -1, which
+ * leaves the identity string exactly what it was.  The slab size steps down
+ * 8 -> 4 -> 2 -> 1 sets if the box cannot spare 281 MB beside a 103.7 GiB
+ * resident.  Every index is bounded by construction: the activation reads are
+ * pinned to token 0 by a pairs table of zeros (at_g < 80), the output row is
+ * < 640, and the weight reads top out at exactly one set.
+ *
+ * -DDS4_GU_BW_PROBE_BUILD=0 removes it; DS4_GU_BW_PROBE=0 stands it down in the
+ * same binary. */
+#ifndef DS4_GU_BW_PROBE_BUILD
+#define DS4_GU_BW_PROBE_BUILD 1
+#endif
+#if DS4_GU_BW_PROBE_BUILD
+
+/* The panel fill alone, at the real kernel's block shape, shared footprint and
+ * register cap.  `projected` is the real kernel's fold buffer, declared here so
+ * the shared footprint -- and therefore the occupancy -- is the same; the two
+ * stores below keep it live. */
+template <int Type, unsigned OutputRows, bool Async>
+__global__ static void QW_GU_MAXNREG
+qw_gu_bw_fill_kernel(
+        const char *gate,
+        const char *up,
+        uint64_t expert_bytes,
+        uint32_t mid_dim,
+        float *sink) {
+    __shared__ __align__(16) uint4 wcoop[2u * OutputRows *
+                                        qw_gu_panel<Type>::row_u4];
+    __shared__ float projected[2][OutputRows * 2u];
+    const uint32_t row_u4 = (uint32_t)qw_gu_panel<Type>::row_u4;
+    const uint32_t panel_u4 = (uint32_t)OutputRows * row_u4;
+    const uint32_t row0 = blockIdx.x * OutputRows;
+    const uint32_t left = mid_dim > row0 ? mid_dim - row0 : 0u;
+    const uint32_t rows_here = left < OutputRows ? left : (uint32_t)OutputRows;
+    const uint32_t words = rows_here * row_u4;
+    const char *const gb = gate + (uint64_t)blockIdx.y * expert_bytes +
+                           (uint64_t)row0 * row_u4 * 16u;
+    const char *const ub = up + (uint64_t)blockIdx.y * expert_bytes +
+                           (uint64_t)row0 * row_u4 * 16u;
+    for (uint32_t i = threadIdx.x; i < words; i += blockDim.x) {
+        if (Async) {
+            qw_cpasync16((uint32_t)__cvta_generic_to_shared(&wcoop[i]),
+                         (const void *)(gb + (uint64_t)i * 16u));
+            qw_cpasync16((uint32_t)__cvta_generic_to_shared(&wcoop[panel_u4 + i]),
+                         (const void *)(ub + (uint64_t)i * 16u));
+        } else {
+            wcoop[i] = *(const uint4 *)(const void *)(gb + (uint64_t)i * 16u);
+            wcoop[panel_u4 + i] =
+                *(const uint4 *)(const void *)(ub + (uint64_t)i * 16u);
+        }
+    }
+    if (Async) {
+        qw_cpasync_commit();
+        qw_cpasync_wait0();
+    }
+    __syncthreads();
+    /* Touch EVERY staged word, so no part of the fill is dead code ptxas may
+     * delete, then sink the result behind a condition that cannot fire. */
+    uint32_t acc = 0u;
+    for (uint32_t i = threadIdx.x; i < 2u * words; i += blockDim.x)
+        acc ^= wcoop[i].x;
+    if (threadIdx.x < 2u) projected[threadIdx.x][0] = (float)acc;
+    __syncthreads();
+    if (acc == 0xdeadbeefu && projected[0][0] == projected[1][0])
+        sink[0] = (float)acc;
+}
+
+/* GB/s for each leg, or -1.  Returns the number of disjoint 36.9 MB sets the
+ * legs walked (0 if the probe could not run at all). */
+static int qw_gu_bw_probe(int *ld_gbs, int *cp_gbs, int *re_gbs, int *occ_fill) {
+    enum { NE = 20, ROWS = 640, NEU = 8, PASSES = 2, SMALL = 36864 };
+    const uint64_t row_bytes = (uint64_t)QW_GU_COOP_ROW_U4 * 16u;   /* 1440 */
+    const uint64_t eb = (uint64_t)ROWS * row_bytes;                 /* 921,600 */
+    const uint64_t set_bytes = 2ull * (uint64_t)NE * eb;            /* 36.86 MB */
+    const uint32_t threads = QW_GU_COOP_ROWS * 64u;
+    const dim3 grid((ROWS + QW_GU_COOP_ROWS - 1u) / QW_GU_COOP_ROWS, NE, 1);
+
+    char *slab = NULL;
+    int sets = 8;
+    while (sets >= 1) {
+        if (cudaMalloc((void **)&slab, (size_t)(set_bytes * (uint64_t)sets)) ==
+            cudaSuccess)
+            break;
+        (void)cudaGetLastError();
+        slab = NULL;
+        sets >>= 1;
+    }
+    if (!slab) return 0;
+    char *small = NULL;
+    if (cudaMalloc((void **)&small, SMALL) != cudaSuccess) {
+        (void)cudaGetLastError();
+        cudaFree(slab);
+        (void)cudaGetLastError();
+        return 0;
+    }
+    /* A fixed non-zero pattern, so every decoded scale is finite and the
+     * measurement is the same on every box. */
+    if (cudaMemset(slab, 0x11, (size_t)(set_bytes * (uint64_t)sets)) !=
+            cudaSuccess ||
+        cudaMemset(small, 0, SMALL) != cudaSuccess) {
+        (void)cudaGetLastError();
+        cudaFree(small);
+        cudaFree(slab);
+        (void)cudaGetLastError();
+        return 0;
+    }
+    /* One small allocation, hand-partitioned at generous offsets. */
+    float   *const mid     = (float *)(void *)(small +     0);   /* 1024 f */
+    int8_t  *const xq      = (int8_t *)(void *)(small +  4096);  /* 80*32 B */
+    float   *const xs      = (float *)(void *)(small +  8192);   /* 80 f */
+    int32_t *const xsum    = (int32_t *)(void *)(small + 12288); /* 80 i */
+    int32_t *const pairs   = (int32_t *)(void *)(small + 16384); /* 64 i */
+    int32_t *const counts  = (int32_t *)(void *)(small + 20480); /* NE i */
+    int32_t *const offsets = (int32_t *)(void *)(small + 24576); /* NE i */
+    float   *const wts     = (float *)(void *)(small + 28672);   /* 64 f */
+    float   *const sink    = (float *)(void *)(small + 32768);   /* 4 f */
+    {
+        /* Two pairs per expert, both naming token 0 slot 0, so every activation
+         * read lands inside xq[0,2560) / xs[0,80) / xsum[0,80). */
+        int32_t hc[NE], ho[NE];
+        for (int e = 0; e < NE; e++) { hc[e] = 2; ho[e] = 2 * e; }
+        float hw[64];
+        for (int i = 0; i < 64; i++) hw[i] = 1.0f;
+        if (cudaMemcpy(counts, hc, sizeof(hc), cudaMemcpyHostToDevice) !=
+                cudaSuccess ||
+            cudaMemcpy(offsets, ho, sizeof(ho), cudaMemcpyHostToDevice) !=
+                cudaSuccess ||
+            cudaMemcpy(wts, hw, sizeof(hw), cudaMemcpyHostToDevice) !=
+                cudaSuccess) {
+            (void)cudaGetLastError();
+            cudaFree(small);
+            cudaFree(slab);
+            (void)cudaGetLastError();
+            return 0;
+        }
+    }
+    cudaEvent_t e0, e1;
+    if (cudaEventCreate(&e0) != cudaSuccess) {
+        (void)cudaGetLastError();
+        cudaFree(small);
+        cudaFree(slab);
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (cudaEventCreate(&e1) != cudaSuccess) {
+        (void)cudaGetLastError();
+        cudaEventDestroy(e0);
+        cudaFree(small);
+        cudaFree(slab);
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    auto launch = [&](int leg, int s) {
+        const char *const g = slab + (uint64_t)s * set_bytes;
+        const char *const u = g + (uint64_t)NE * eb;
+        if (leg == 0) {
+            qw_gu_bw_fill_kernel<DS4_QWEN4EXP_TY_q4_K, QW_GU_COOP_ROWS, false>
+                <<<grid, threads>>>(g, u, eb, ROWS, sink);
+        } else if (leg == 1) {
+            qw_gu_bw_fill_kernel<DS4_QWEN4EXP_TY_q4_K, QW_GU_COOP_ROWS, true>
+                <<<grid, threads>>>(g, u, eb, ROWS, sink);
+        } else {
+            qwen4exp_moe_gateup_split_kernel<2, DS4_QWEN4EXP_TY_q4_K, true,
+                                             QW_GU_COOP_ROWS, true>
+                <<<grid, threads>>>(
+                    mid, g, u, xq, xs, xsum, pairs, counts, offsets,
+                    (const int32_t *)NULL, wts, eb, row_bytes, eb, row_bytes,
+                    (uint32_t)DS4_QWEN4EXP_TY_q4_K,
+                    (uint32_t)DS4_QWEN4EXP_TY_q4_K,
+                    QW_GU_COOP_GROUPS, (uint32_t)ROWS, (uint32_t)ROWS,
+                    (uint32_t)NEU);
+        }
+    };
+    auto time_leg = [&](int leg) -> int {
+        launch(leg, 0);
+        if (cudaDeviceSynchronize() != cudaSuccess) {
+            (void)cudaGetLastError();
+            return -1;
+        }
+        if (cudaEventRecord(e0, 0) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return -1;
+        }
+        for (int p = 0; p < PASSES; p++)
+            for (int s = 0; s < sets; s++) launch(leg, s);
+        if (cudaEventRecord(e1, 0) != cudaSuccess ||
+            cudaDeviceSynchronize() != cudaSuccess) {
+            (void)cudaGetLastError();
+            return -1;
+        }
+        float ms = 0.0f;
+        if (cudaEventElapsedTime(&ms, e0, e1) != cudaSuccess || !(ms > 0.0f)) {
+            (void)cudaGetLastError();
+            return -1;
+        }
+        const double bytes =
+            (double)set_bytes * (double)sets * (double)PASSES;
+        return (int)(bytes / ((double)ms * 1.0e6) + 0.5);
+    };
+
+    *ld_gbs = time_leg(0);
+    *cp_gbs = time_leg(1);
+    *re_gbs = time_leg(2);
+    int occ = -1;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ,
+            qw_gu_bw_fill_kernel<DS4_QWEN4EXP_TY_q4_K, QW_GU_COOP_ROWS, false>,
+            (int)threads, 0) == cudaSuccess)
+        *occ_fill = occ;
+    else
+        (void)cudaGetLastError();
+
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+    cudaFree(small);
+    cudaFree(slab);
+    (void)cudaGetLastError();
+    return sets;
+}
+
+/* Leg 2 of the instrument: the GDN recurrence state stream.
+ *
+ * The routed gate/up probe above answered its question (fetch is at ~92-98% of
+ * the read ceiling and the q4_K unpack on top of it costs ~2%), which closes the
+ * engine's LARGEST stream at 85-91% of roofline and therefore moves the whole
+ * open question to the second largest: the GDN recurrent state, 226 MB/token
+ * across the 36 gated-deltanet layers.
+ *
+ * That stream has a property gate/up does not: it is a read-modify-write of
+ * float4 per lane with TWO full warp reductions per step
+ * (warp_sum_all_f32(dot4_f32(...)) for h.k and again for h.q), so its
+ * instruction-per-byte ratio is an order of magnitude worse than a q4_K unpack.
+ * Whether that matters is exactly what is unmeasured, so this mirrors the
+ * gate/up design: one leg is the REAL kernel, one leg is the same traffic with
+ * the recurrence removed.
+ *
+ *   gd[r=...]  the live decode recurrence, which in THIS tree is
+ *              qwen4exp_gdn_replay_gates_fold_kernel<4u> at grid.y / 4u -- the
+ *              same bytes from the same addresses with 4 value rows per warp, so
+ *              gd[c] is still its ceiling and gd[r] is directly comparable to
+ *              the base tree's reading of the same leg.  A drop in (c-r)/r
+ *              against base IS this arm working; or vs oc says whether 4 rows
+ *              per warp kept occupancy.
+ *   gd[c=...]  the same 3 MB read + 3 MB write at the same grid, block shape
+ *              and float4 access pattern, with no recurrence arithmetic
+ *
+ * r << c says the recurrence is instruction-bound and the arm is the warp
+ * reductions.  r ~= c says the state stream is bandwidth-bound and the region
+ * is closed at whatever fraction of ceiling c reports.  Both occupancies are
+ * reported (or=real, oc=copy) because a ceiling leg that gets more blocks/SM
+ * than the kernel it bounds is not a ceiling; if or != oc, discount the pair.
+ *
+ * Every buffer is zero-filled.  Unlike the q4_K path there is no packed scale
+ * to decode, nothing here divides, and no branch is data-dependent, so zeros
+ * produce finite arithmetic and a data-independent instruction stream.  Passing
+ * control=NULL with replay_rows=0 makes prefix=0: no replay step runs, the tape
+ * is written once at token 0 and never read, and `checkpoint` stays read-only
+ * (it is rewritten only when prefix == DS4_QWEN4EXP_GDN_REPLAY_ROWS).  So the
+ * timed traffic is exactly one state read plus one state write per launch,
+ * which is what a decode token costs per GDN layer. */
+__global__ static void qw_gdn_bw_copy_kernel(
+        float *state, const float *checkpoint,
+        uint32_t n_value_head, uint32_t n_tokens) {
+    const uint32_t head = blockIdx.x;
+    const uint32_t value = blockIdx.y * 4u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (head >= n_value_head || value >= QWEN4EXP_GDN_DIM) return;
+    const uint64_t state_off = ((uint64_t)head * QWEN4EXP_GDN_DIM + value) *
+                               QWEN4EXP_GDN_DIM + lane * 4u;
+    float4 h = *(const float4 *)(checkpoint + state_off);
+    /* The real kernel's per-step work is elided on purpose; n_tokens is
+     * consumed so the signature cannot drift from the shape being bounded. */
+    if (n_tokens == 0xffffffffu) h.x = -h.x;
+    *(float4 *)(state + state_off) = h;
+}
+
+static int qw_gdn_bw_probe(int *real_gbs, int *copy_gbs,
+                           int *occ_real, int *occ_copy) {
+    enum { NKH = 16, NVH = 48, NT = 2, ROWS = 1, PASSES = 2, WANT = 36 };
+    const uint32_t dim = QWEN4EXP_GDN_DIM;                    /* 128 */
+    const uint32_t key_dim = (uint32_t)NKH * dim;              /* 2048 */
+    const uint32_t value_dim = (uint32_t)NVH * dim;            /* 6144 */
+    const uint32_t conv_dim = 2u * key_dim + value_dim;        /* 10240 */
+    const uint32_t tape_stride = (key_dim + value_dim + 2u * (uint32_t)NVH + 3u)
+                                 & ~3u;                        /* 8288 */
+    const uint64_t state_floats = (uint64_t)NVH * dim * dim;   /* 786,432 */
+    const uint64_t state_bytes = state_floats * sizeof(float); /* 3,145,728 */
+    const uint64_t set_bytes = 2ull * state_bytes;             /* 6,291,456 */
+    const dim3 grid((unsigned)NVH, dim / 4u, (unsigned)ROWS);
+    const uint32_t threads = dim;
+
+    char *slab = NULL;
+    int sets = WANT;
+    while (sets >= 1) {
+        if (cudaMalloc((void **)&slab, (size_t)(set_bytes * (uint64_t)sets)) ==
+            cudaSuccess)
+            break;
+        (void)cudaGetLastError();
+        slab = NULL;
+        sets = sets > 1 ? sets / 2 : 0;
+    }
+    if (!slab) return 0;
+    /* out + qkv + tape + gate_pairs, hand-partitioned at generous offsets. */
+    const size_t small_bytes = 262144;
+    char *small = NULL;
+    if (cudaMalloc((void **)&small, small_bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        cudaFree(slab);
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (cudaMemset(slab, 0, (size_t)(set_bytes * (uint64_t)sets)) !=
+            cudaSuccess ||
+        cudaMemset(small, 0, small_bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        cudaFree(small);
+        cudaFree(slab);
+        (void)cudaGetLastError();
+        return 0;
+    }
+    /* out   needs NT*value_dim  = 12,288 f =  49,152 B  -> at      0
+     * qkv   needs NT*conv_dim   = 20,480 f =  81,920 B  -> at  65,536
+     * tape  needs 3*tape_stride = 24,864 f =  99,456 B  -> at 155,648
+     * pairs needs NT*NVH float2 =     96 f =     768 B  -> at 258,048 */
+    float *const out = (float *)(void *)(small + 0);
+    float *const qkv = (float *)(void *)(small + 65536);
+    float *const tape = (float *)(void *)(small + 155648);
+    float2 *const gate_pairs = (float2 *)(void *)(small + 258048);
+
+    cudaEvent_t e0, e1;
+    if (cudaEventCreate(&e0) != cudaSuccess) {
+        (void)cudaGetLastError();
+        cudaFree(small);
+        cudaFree(slab);
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (cudaEventCreate(&e1) != cudaSuccess) {
+        (void)cudaGetLastError();
+        cudaEventDestroy(e0);
+        cudaFree(small);
+        cudaFree(slab);
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    auto launch = [&](int leg, int s) {
+        float *const ck = (float *)(void *)(slab + (uint64_t)s * set_bytes);
+        float *const st = (float *)(void *)((char *)(void *)ck + state_bytes);
+        if (leg == 0) {
+            qwen4exp_gdn_replay_gates_fold_kernel<4u><<<
+                    dim3(grid.x, grid.y / 4u, grid.z), threads>>>(
+                    out, st, ck, tape, qkv,
+                    (const float *)NULL, (const float *)NULL, gate_pairs,
+                    (uint32_t)NKH, (uint32_t)NVH, (uint32_t)NT, 0u,
+                    (const uint32_t *)NULL, 0u);
+        } else {
+            qw_gdn_bw_copy_kernel<<<grid, threads>>>(
+                    st, ck, (uint32_t)NVH, (uint32_t)NT);
+        }
+    };
+    auto time_leg = [&](int leg) -> int {
+        launch(leg, 0);
+        if (cudaDeviceSynchronize() != cudaSuccess) {
+            (void)cudaGetLastError();
+            return -1;
+        }
+        if (cudaEventRecord(e0, 0) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return -1;
+        }
+        for (int p = 0; p < PASSES; p++)
+            for (int s = 0; s < sets; s++) launch(leg, s);
+        if (cudaEventRecord(e1, 0) != cudaSuccess ||
+            cudaDeviceSynchronize() != cudaSuccess) {
+            (void)cudaGetLastError();
+            return -1;
+        }
+        float ms = 0.0f;
+        if (cudaEventElapsedTime(&ms, e0, e1) != cudaSuccess || !(ms > 0.0f)) {
+            (void)cudaGetLastError();
+            return -1;
+        }
+        const double bytes =
+            (double)set_bytes * (double)sets * (double)PASSES;
+        return (int)(bytes / ((double)ms * 1.0e6) + 0.5);
+    };
+
+    (void)conv_dim;
+    (void)tape_stride;
+    *real_gbs = time_leg(0);
+    *copy_gbs = time_leg(1);
+    int occ = -1;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ, qwen4exp_gdn_replay_gates_fold_kernel<4u>, (int)threads, 0) ==
+        cudaSuccess)
+        *occ_real = occ;
+    else
+        (void)cudaGetLastError();
+    occ = -1;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ, qw_gdn_bw_copy_kernel, (int)threads, 0) == cudaSuccess)
+        *occ_copy = occ;
+    else
+        (void)cudaGetLastError();
+
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+    cudaFree(small);
+    cudaFree(slab);
+    (void)cudaGetLastError();
+    return sets;
+}
+#endif  /* DS4_GU_BW_PROBE_BUILD */
+
 /* Occupancy introspection for the two routed-MoE decode kernels.
  *
  * Every Qwen4-Exp kernel is `static` in this translation unit, so its address
@@ -18118,14 +18904,24 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
         g8_lmem = (int)a.localSizeBytes;
     } else { (void)cudaGetLastError(); }
 
+    /* ARITY FIX.  This read named <2, q8_0, true, true> for its whole history,
+     * which is neither the type nor the arity the decode launcher takes: the
+     * ladder above reaches QWEN4EXP_DOWN_ASYNC(q5_1), i.e.
+     * <2, q5_1, Vector=true, Stage=true, Async=true>, and it passes 2*dn_panel
+     * as DYNAMIC shared.  The reported dn[reg=] was therefore a kernel that
+     * never launches.  dn[smem=] stays 0 and that is correct rather than broken:
+     * cudaFuncGetAttributes reports only STATIC shared, and this kernel's panel
+     * is dynamic, so occ= below is an upper bound that ignores the panel. */
     if (cudaFuncGetAttributes(
             &a,
-            qwen4exp_moe_down_q_kernel<2, DS4_QWEN4EXP_TY_q8_0, true, true>) ==
+            qwen4exp_moe_down_q_kernel<2, DS4_QWEN4EXP_TY_q5_1, true, true,
+                                       true>) ==
         cudaSuccess) {
         dn_regs = a.numRegs;
         dn_smem = (int)a.sharedSizeBytes;
         dn_lmem = (int)a.localSizeBytes;
         dn_maxt = a.maxThreadsPerBlock;
+        (void)dn_maxt;  /* read, not reported: 1024, and gu[maxt=] already shows it */
     } else {
         (void)cudaGetLastError();
     }
@@ -18175,7 +18971,8 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
         (void)cudaGetLastError();
     }
     if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &occ, qwen4exp_moe_down_q_kernel<2, DS4_QWEN4EXP_TY_q8_0, true, true>,
+            &occ, qwen4exp_moe_down_q_kernel<2, DS4_QWEN4EXP_TY_q5_1, true, true,
+                                       true>,
             256, 0) == cudaSuccess) {
         dn_occ = occ;
     } else {
@@ -18272,15 +19069,64 @@ extern "C" const char *ds4_gpu_qwen4exp_kernel_limits(void) {
         (void)cudaGetLastError();
     }
 
+    /* The achieved-bandwidth probe.  Placed LAST among the measurements so a
+     * failure cannot cost any of the attribute reads above, and reported EARLY
+     * in the string below: ds4_gpu_hw_limits() truncates this buffer into its
+     * own 448 bytes, and if anything is lost I would rather lose the gu8[] tail,
+     * which is a known constant, than the one number nobody has. */
+    int bw_ld = -1, bw_cp = -1, bw_re = -1, bw_fo = -1, bw_sets = 0;
+#if DS4_GU_BW_PROBE_BUILD
+    /* A LATCH, not an optimisation.  Today this function has exactly one caller
+     * (ds4_cuda.cu's ds4_gpu_hw_limits, itself called once from ds4_resident
+     * before the socket binds), so the probe runs once by construction.  The
+     * latch is insurance against a future second caller putting ~10 ms of GPU
+     * work on a path that IS timed: the numbers are then stale rather than
+     * charged to the score, which is the right way to fail. */
+    {
+        static int bw_done = 0;
+        static int bw_c[5] = {-1, -1, -1, -1, 0};
+        if (!bw_done) {
+            bw_done = 1;
+            const char *const bw_env = getenv("DS4_GU_BW_PROBE");
+            if (bw_env == NULL || bw_env[0] != '0')
+                bw_c[4] = qw_gu_bw_probe(&bw_c[0], &bw_c[1], &bw_c[2], &bw_c[3]);
+        }
+        bw_ld = bw_c[0]; bw_cp = bw_c[1]; bw_re = bw_c[2];
+        bw_fo = bw_c[3]; bw_sets = bw_c[4];
+    }
+#endif
+    int gr_r = -1, gr_c = -1, gr_or = -1, gr_oc = -1, gr_sets = 0;
+#if DS4_GU_BW_PROBE_BUILD
+    /* Same latch discipline as above, separate cache so a failure in one leg
+     * pair cannot cost the other. */
+    {
+        static int gr_done = 0;
+        static int gr_v[5] = {-1, -1, -1, -1, 0};
+        if (!gr_done) {
+            gr_done = 1;
+            const char *const gr_env = getenv("DS4_GDN_BW_PROBE");
+            if (gr_env == NULL || gr_env[0] != '0')
+                gr_v[4] = qw_gdn_bw_probe(&gr_v[0], &gr_v[1], &gr_v[2],
+                                          &gr_v[3]);
+        }
+        gr_r = gr_v[0]; gr_c = gr_v[1]; gr_or = gr_v[2];
+        gr_oc = gr_v[3]; gr_sets = gr_v[4];
+    }
+#endif
+
     snprintf(buf, sizeof(buf),
-             "gu[reg=%d smem=%d lmem=%d maxt=%d occ=%d] dn[reg=%d smem=%d "
-             "lmem=%d maxt=%d occ=%d] gdn[reg=%d lmem=%d] "
+             "gu[reg=%d smem=%d lmem=%d maxt=%d occ=%d] "
+             "bw[ld=%d cp=%d re=%d fo=%d s=%d] "
+             "gd[r=%d c=%d or=%d oc=%d s=%d] "
+             "dn[reg=%d smem=%d lmem=%d occ=%d] gdn[reg=%d lmem=%d] "
              "mm[reg=%d smem=%d lmem=%d occ=%d] "
              "md[reg=%d smem=%d lmem=%d occ=%d] "
              "gu5[reg=%d smem=%d lmem=%d occ=%d] "
              "gu8[reg=%d smem=%d lmem=%d occ=%d]",
              gu_regs, gu_smem, gu_lmem, gu_maxt, gu_occ,
-             dn_regs, dn_smem, dn_lmem, dn_maxt, dn_occ,
+             bw_ld, bw_cp, bw_re, bw_fo, bw_sets,
+             gr_r, gr_c, gr_or, gr_oc, gr_sets,
+             dn_regs, dn_smem, dn_lmem, dn_occ,
              gd_regs, gd_lmem,
              mg_regs, mg_smem, mg_lmem, mg_occ,
              md_regs, md_smem, md_lmem, md_occ,

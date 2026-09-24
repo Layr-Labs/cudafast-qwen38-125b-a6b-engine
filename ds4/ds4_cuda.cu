@@ -18119,6 +18119,185 @@ extern "C" void ds4_gpu_set_q8_mma_pipe_wide(int mode) {
     g_q8_mma_pipe_wide = mode;
 }
 
+/* Leg 3 of the boot instrument: the hyper-connection down projection, which is
+ * the ONE number the whole HC region hangs on.
+ *
+ * The byte map is complete and every region except this one is priced.  HC is
+ * 668.5 MB of Q8_0 weight per decode token -- the same size as the entire LM
+ * head -- read across 96 qwen4exp_graph_residual calls (two per layer x 48
+ * layers).  The down projection is the half this tree carries a number for,
+ * and that number is a COMMENT: ds4_cuda_qwen4exp.cu says 17.5 us at the
+ * two-row width, which over 96 calls is 1.68 ms for down's 334 MB = 199 GB/s,
+ * i.e. already at peak and the region is closed at ~30 bips.  The competing
+ * estimate -- a per-kernel scored profile read as 8.9% of the round -- says
+ * 4.6 ms, i.e. the region is open and worth 60-120 bips.  A comment is not a
+ * measurement, the two disagree by 2.7x, and no draw can settle it because a
+ * 0.7 ms effect is well inside the score channel's own n=1 noise.  So measure
+ * it on the free channel instead, where the reading is published whether or
+ * not the submission is accepted.
+ *
+ *   hcd[r1=...]  matmul_q8_hc_down_pair_kernel at grid(320, 1), 32 threads:
+ *                320 blocks of one warp, each reducing a whole K = 10240 row
+ *                on its own.
+ *   hcd[r2=...]  the SAME kernel at grid(320, 2) -- the scored decode width,
+ *                draft_tokens = 2.  Block (j,0) and block (j,1) each read the
+ *                same 10,880-byte weight row, so the region REQUESTS twice its
+ *                bytes; r2 ~= r1 is the direct test of whether L2 absorbs that
+ *                duplicate read, which so far is an argument and not a number.
+ *   hcd[t4=...]  matmul_q8_0_preq_pair_lanes_kernel<4, false> at the same
+ *                rows = 2: the weight-reuse tile an arm here would swap in.
+ *                It launches (320 + 3) / 4 = 80 blocks on a 48-SM part, 1.67
+ *                waves, which is why this engine's own comment says a
+ *                projection this narrow leaves most of the device idle on the
+ *                widest tile.  t4 >= r2 prices that argument instead of
+ *                asserting it, and t4 < r2 would be the arm.
+ *
+ * All three are nanoseconds per launch over the same 3,481,600-byte weight
+ * slab, so they are comparable to each other directly and, through the
+ * invariant bw[ld=] panel-fill leg in the same readout, across boots.
+ *
+ * PRE-REGISTERED, BEFORE ANY READING EXISTS.  3,481,600 B / r2 gives GB/s:
+ *
+ *   r2 = 15-20 us   ->  175-232 GB/s  ->  region CLOSED at ~6 bips, walk away
+ *   r2 = 20-26 us   ->  134-174 GB/s  ->  re-open; 60-120 bips in reach
+ *   r2 > 26 us      ->  < 134 GB/s    ->  the 8.9%-derived 4.6 ms was right
+ *   r2 < 13 us      ->  > 268 GB/s    ->  ABOVE ROOFLINE, so NO READING: the
+ *                                         slab went L2-resident and this is
+ *                                         not the scored regime
+ *
+ * THE VALIDITY GATE IS THE WHOLE DESIGN.  A single 3.48 MB slab FITS in a
+ * GB10-class L2, so a probe that allocates one slab and launches it twice
+ * measures L2 and not memory.  The scored path re-reads each HC slab once per
+ * token with 6.3 GB of other weights in between, so there it is cold every
+ * time.  This probe therefore allocates up to 64 DISJOINT 3.48 MB windows
+ * (222.8 MB, far past any L2) and advances to the next window on every single
+ * launch; `n` reports how many windows it actually got, and a small n is
+ * grounds to discount the reading rather than to believe it.
+ *
+ * Every buffer is memset to 0x11.  A Q8_0 block's first two bytes are an fp16
+ * scale (0x1111 = 6.25e-4) and its payload bytes are int8 17, so every dot is
+ * finite; nothing here divides and no branch is data-dependent, so the
+ * instruction stream does not depend on the fill.  The kernel's PDL trigger
+ * and fence are no-ops on a plain launch, which is exactly what
+ * DS4_QWEN4EXP_NO_PDL_PREFETCH already relies on.
+ *
+ * WHERE IT RUNS, AND WHAT IT COSTS THE SCORE: nothing.  ds4_gpu_hw_limits() is
+ * called once from ds4_resident after the one weight load and before the
+ * socket binds, so no timed phase can observe it.  -DDS4_HCD_PROBE_BUILD=0
+ * removes it; DS4_HC_DOWN_PROBE=0 stands it down at run time. */
+#ifndef DS4_HCD_PROBE_BUILD
+#define DS4_HCD_PROBE_BUILD 1
+#endif
+#if DS4_HCD_PROBE_BUILD
+static int ds4_hc_down_probe(int *r1_ns, int *r2_ns, int *t4_ns) {
+    /* The shape is the shipped one and it is hardcoded inside the kernel:
+     * grid.x = 320 = n_hc_lowrank outputs, 320 Q8_0 groups of 34 B per output
+     * row = 10,880 B a row, so the slab is exactly one HC down tensor. */
+    enum { OUT = 320, GROUPS = 320, ROWBYTES = 10880, PASSES = 2, WANT = 64 };
+    const uint64_t slab_bytes = (uint64_t)OUT * (uint64_t)ROWBYTES;
+    unsigned char *slab = NULL;
+    int wins = WANT;
+    while (wins >= 1) {
+        if (cudaMalloc((void **)&slab,
+                       (size_t)(slab_bytes * (uint64_t)wins)) == cudaSuccess)
+            break;
+        (void)cudaGetLastError();
+        slab = NULL;
+        wins = wins > 1 ? wins / 2 : 0;
+    }
+    if (!slab) return 0;
+    /* xq  needs 4 * 320 * 32 B = 40,960 B  -> at      0
+     * xs  needs 4 * 320 floats =  5,120 B  -> at 40,960
+     * out needs 4 * 320 floats =  5,120 B  -> at 49,152 */
+    const size_t small_bytes = 65536;
+    unsigned char *small = NULL;
+    if (cudaMalloc((void **)&small, small_bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        cudaFree(slab);
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (cudaMemset(slab, 0x11, (size_t)(slab_bytes * (uint64_t)wins)) !=
+            cudaSuccess ||
+        cudaMemset(small, 0x11, small_bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        cudaFree(small);
+        cudaFree(slab);
+        (void)cudaGetLastError();
+        return 0;
+    }
+    const int8_t *const xq = (const int8_t *)(void *)(small + 0);
+    const float *const xs = (const float *)(void *)(small + 40960);
+    float *const out = (float *)(void *)(small + 49152);
+
+    cudaEvent_t e0, e1;
+    if (cudaEventCreate(&e0) != cudaSuccess) {
+        (void)cudaGetLastError();
+        cudaFree(small);
+        cudaFree(slab);
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (cudaEventCreate(&e1) != cudaSuccess) {
+        (void)cudaGetLastError();
+        cudaEventDestroy(e0);
+        cudaFree(small);
+        cudaFree(slab);
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    auto launch = [&](int leg, int win) {
+        const unsigned char *const w = slab + (uint64_t)win * slab_bytes;
+        if (leg == 2)
+            matmul_q8_0_preq_pair_lanes_kernel<4, false><<<
+                    dim3((unsigned)((OUT + 3) / 4), 1u, 1u), 256>>>(
+                    out, w, xq, xs, (uint64_t)OUT, 2u, (uint64_t)GROUPS);
+        else
+            matmul_q8_hc_down_pair_kernel<<<
+                    dim3((unsigned)OUT, leg == 0 ? 1u : 2u, 1u), 32>>>(
+                    out, w, xq, xs, leg == 0 ? 1u : 2u);
+    };
+    /* One untimed warm-up per leg, so no leg pays for its own first launch.
+     * It touches window 0 only, one of wins * PASSES timed launches. */
+    auto time_leg = [&](int leg) -> int {
+        launch(leg, 0);
+        if (cudaDeviceSynchronize() != cudaSuccess) {
+            (void)cudaGetLastError();
+            return -1;
+        }
+        if (cudaEventRecord(e0, 0) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return -1;
+        }
+        for (int p = 0; p < PASSES; p++)
+            for (int win = 0; win < wins; win++) launch(leg, win);
+        if (cudaEventRecord(e1, 0) != cudaSuccess ||
+            cudaDeviceSynchronize() != cudaSuccess) {
+            (void)cudaGetLastError();
+            return -1;
+        }
+        float ms = 0.0f;
+        if (cudaEventElapsedTime(&ms, e0, e1) != cudaSuccess || !(ms > 0.0f)) {
+            (void)cudaGetLastError();
+            return -1;
+        }
+        const double launches = (double)wins * (double)PASSES;
+        return (int)((double)ms * 1.0e6 / launches + 0.5);
+    };
+    *r1_ns = time_leg(0);
+    *r2_ns = time_leg(1);
+    *t4_ns = time_leg(2);
+
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+    cudaFree(small);
+    cudaFree(slab);
+    (void)cudaGetLastError();
+    return wins;
+}
+#endif  /* DS4_HCD_PROBE_BUILD */
+
 /* The device's occupancy limits, as a compact string the caller can append to
  * an identity that reaches the run's metrics.  See ds4.h for why this is worth
  * publishing.
@@ -18181,8 +18360,34 @@ extern "C" const char *ds4_gpu_hw_limits(void) {
      * is diagnostic only and snprintf keeps it terminated. */
     const char *kl = ds4_gpu_qwen4exp_kernel_limits();
     if (kl && kl[0] && (size_t)n + 2u < sizeof(buf)) {
-        snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", kl);
+        const int m = snprintf(buf + n, sizeof(buf) - (size_t)n, " %s", kl);
+        if (m > 0) {
+            n += m;
+            if ((size_t)n >= sizeof(buf)) n = (int)sizeof(buf) - 1;
+        }
     }
+#if DS4_HCD_PROBE_BUILD
+    /* The HC down leg, latched in its own cache so a failure here cannot cost
+     * the device attributes or the routed-MoE limits above it.  The whole
+     * readout is 361 chars today and this adds 37, so buf[448] and
+     * ds4_resident's own ident_buf[768] both still hold it -- worth checking,
+     * because ds4_resident DROPS the entire limits string rather than
+     * truncating it if it does not fit. */
+    {
+        static int hcd_done = 0;
+        static int hcd_v[4] = {-1, -1, -1, 0};
+        if (!hcd_done) {
+            hcd_done = 1;
+            const char *const hcd_env = getenv("DS4_HC_DOWN_PROBE");
+            if (hcd_env == NULL || hcd_env[0] != '0')
+                hcd_v[3] = ds4_hc_down_probe(&hcd_v[0], &hcd_v[1], &hcd_v[2]);
+        }
+        if ((size_t)n + 2u < sizeof(buf))
+            snprintf(buf + n, sizeof(buf) - (size_t)n,
+                     " hcd[r1=%d r2=%d t4=%d n=%d]",
+                     hcd_v[0], hcd_v[1], hcd_v[2], hcd_v[3]);
+    }
+#endif
     return buf;
 }
 
