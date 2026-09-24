@@ -1866,6 +1866,14 @@ __global__ static void qwen4exp_gdn_output_quant_kernel(
         int8_t *xq, float *xscale, const float *out, const float *output_gate,
         const float *output_norm, uint32_t n_value_head, uint32_t n_tokens,
         float norm_eps);
+/* The same quantize for the prefill widths, one warp per (token, head) row;
+ * defined beside the kernel above. */
+#define QWEN4EXP_GDN_OQ_WARPS 4u
+__global__ static void __launch_bounds__(32 * QWEN4EXP_GDN_OQ_WARPS)
+qwen4exp_gdn_output_quant_warp_kernel(
+        int8_t *xq, float *xscale, const float *out, const float *output_gate,
+        const float *output_norm, uint32_t n_value_head, uint32_t n_tokens,
+        float norm_eps);
 
 /* =========================================================================
  * PREFILL: the attn_qkv projection with the gated delta net's depthwise
@@ -2005,7 +2013,7 @@ struct q8_mma_pipe_cfg {
     static constexpr int A_BYTES = BM * A_STRIDE;
     static constexpr int B_BYTES = BN * B_STRIDE;
     static constexpr int AS_BYTES = BM * G * 4;
-    static constexpr int WS_BYTES = G * BN * 4;          /* converted weight scales [gg][BN] */
+    static constexpr int WS_BYTES = 0;                   /* scales are converted by the consumer at point of use */
     static constexpr int STAGE_BYTES = A_BYTES + B_BYTES + AS_BYTES + WS_BYTES;
     static constexpr int SMEM = STAGES * STAGE_BYTES;
     static_assert(G == 2 || G == 4 || G == 8, "G is the k32 steps per stage");
@@ -2161,23 +2169,15 @@ qwen4exp_gdn_qkv_conv_mma_pipe_kernel(float *out,
                 const int c = idx - r * C::B_CHUNKS;
                 if (idx < BN * C::B_CHUNKS) q8_mma_sts_16(sB + r * C::B_STRIDE + c * 16, rb[k]);
             }
-            /* Every producer's stores are visible to every producer: the
-             * scales below lie in rows another one stored. */
-            q8_mma_bar_sync(15, C::PWARPS * 32);
-
-            /* Weight scales, half -> float, [gg][BN]. */
-#pragma unroll
-            for (int j = 0; j < (G * BN + PT - 1) / PT; j++) {
-                const int i = pl + j * PT;
-                if (i < G * BN) {
-                    const int gg = i / BN;
-                    const int rr = i - gg * BN;
-                    uint16_t h;
-                    memcpy(&h, sB + rr * C::B_STRIDE + skew + gg * 34, 2);
-                    sWs[gg * BN + rr] = __half2float(__ushort_as_half(h));
-                }
-            }
-            __syncwarp();
+            /* The consumer converts the block scales itself, so no producer
+             * reads another producer's stores and the four producer warps
+             * never rendezvous: a warp whose loads have landed issues the next
+             * stage without waiting for the slowest.  `bar.arrive` carries no
+             * memory ordering of its own (the removed producer rendezvous was
+             * providing it as a side effect), so the stores are released with
+             * an explicit block fence.  Same change as the dense
+             * matmul_q8_0_preq_rows_mma_pipe_kernel CvtC path in ds4_cuda.cu. */
+            __threadfence_block();
             q8_mma_bar_arrive(1 + 2 * buf, BAR_COUNT);
         }
     } else {
@@ -2251,7 +2251,16 @@ qwen4exp_gdn_qkv_conv_mma_pipe_kernel(float *out,
                     bf[0] = pw[0];
                     bf[1] = pw[4];
                 }
-                const float2 wsp = *(const float2 *)(sWs + gg * BN + c + (int)t4 * 2);
+                /* The two halfwords are the q8_0 block scales of output rows
+                 * c + t4*2 and c + t4*2 + 1 -- the same bytes the producer used
+                 * to convert into a separate buffer; skew and gg*34 are even, so
+                 * both reads are 2-byte aligned. */
+                const unsigned char *ps = sB + (c + (int)t4 * 2) * C::B_STRIDE + skew + gg * 34;
+                uint16_t hs0, hs1;
+                memcpy(&hs0, ps, 2);
+                memcpy(&hs1, ps + C::B_STRIDE, 2);
+                const float2 wsp = make_float2(__half2float(__ushort_as_half(hs0)),
+                                               __half2float(__ushort_as_half(hs1)));
                 int32_t d[MT][4];
 #pragma unroll
                 for (int mi = 0; mi < MT; mi++) q8_mma_m16n8k32_seeded(d[mi], af[mi], bf, magic);
@@ -2957,6 +2966,23 @@ static int qwen4exp_cuda_gdn_run(
     }
 
     if (out_q8) {
+        /* The warp-per-row kernel for the prefill widths (bit-identical
+         * output, see its note).  The decode widths keep the block kernel,
+         * whose PDL trigger rests on its own grid; the float4 loads need
+         * 16-byte aligned out / output_gate, which is checked, not assumed
+         * (xq is aligned by the q_offset gate above). */
+        if (n_tokens > 64u && (n_value_head % QWEN4EXP_GDN_OQ_WARPS) == 0u &&
+            (((uintptr_t)out->ptr | (uintptr_t)output_gate->ptr) & 15u) == 0u) {
+            qwen4exp_gdn_output_quant_warp_kernel<<<
+                    dim3(n_value_head / QWEN4EXP_GDN_OQ_WARPS, n_tokens, 1u),
+                    32u * QWEN4EXP_GDN_OQ_WARPS, 0, stream>>>(
+                    (int8_t *)((char *)out_q8->ptr + q_offset),
+                    (float *)((char *)out_q8->ptr + s_offset),
+                    (const float *)out->ptr, (const float *)output_gate->ptr,
+                    output_norm, n_value_head, n_tokens, norm_eps);
+            return cuda_ok(cudaGetLastError(),
+                           "qwen4exp GDN output norm quantize (warp) launch");
+        }
         qwen4exp_gdn_output_quant_kernel<<<dim3(n_tokens, n_value_head, 1u),
                                            QWEN4EXP_GDN_DIM, 0, stream>>>(
                 (int8_t *)((char *)out_q8->ptr + q_offset),
@@ -4316,6 +4342,7 @@ __global__ static void qwen4exp_moe_group_scan_parallel_kernel(
 /* build record 20260920T112423Z-103 */
 /* build record 20260920T120351Z-108 */
 /* build record 20260921T160157Z-8 */
+/* build record 20260923T235139Z-15 */
 __global__ static void qwen4exp_moe_pair_tasks_kernel(
         int32_t *tasks, const int32_t *counts, unsigned total,
         int32_t tile = 32, int32_t lo = 0, int32_t hi = 0x7fffffff) {
@@ -12034,6 +12061,122 @@ __global__ static void qwen4exp_gdn_output_quant_kernel(
     int q = (int)lrintf(qwen4exp_q8_ftz(vz * id));
     q = q > 127 ? 127 : (q < -128 ? -128 : q);
     xq[pair * 32u + lane] = (int8_t)q;
+}
+
+/* qwen4exp_gdn_output_quant_kernel for the prefill widths: one WARP owns one
+ * (token, value head) row of 128 values as a float4 per lane.
+ *
+ * The kernel above gives each thread one f32 of `out` and one of
+ * `output_gate` (LDG.32) and one byte of output (STG.U8), and its two DRAM
+ * reads are separated by a block barrier.  At 1024 tokens that is 50 MB read
+ * and 7 MB written per launch at ~224 GB/s, 3-4% under the streaming limit
+ * this device reaches for the same byte profile (a bare read-two-write-one
+ * probe at 16 B per lane runs at 231 GB/s, and so does this kernel).  Here
+ * lane L holds elements 4L..4L+3 of the row as 16-byte loads, the four warps
+ * of a block take four consecutive heads of one token (so a block's loads
+ * are 2 KiB contiguous), the Q8_0 bytes leave as one coalesced 128-byte
+ * char4 store per warp and the four scales of a row as four adjacent floats
+ * from lanes 0, 8, 16 and 24.  No shared memory, no block barrier.
+ *
+ * BIT-EXACT with the kernel above, and the argument is the reduction tree,
+ * not the arithmetic (everything per element is the same instruction on the
+ * same operands).  The RMS sum above is warp_sum_f32 (shfl_down 16, 8, 4, 2,
+ * 1) over elements 32w + l, then partial[0..3] through warp_sum_all_f32 with
+ * lanes 4..31 zero, which collapses to (S0 + S2) + (S1 + S3).  Element
+ * 32w + l sits here at lane 8w + (l >> 2), component (l & 3), so the same
+ * leaf pairing is: shfl_xor 4 / 2 / 1 on the float4 components (levels 16, 8
+ * and 4 of the old tree, lanes inside an eight-lane group), then
+ * qwen4exp_gdn_fold4 over the four components (levels 2 and 1), which leaves
+ * S_w in every lane of group w, then xor 16 (S0 + S2, S1 + S3) and xor 8.
+ * xor against down only swaps addend order, which IEEE addition is symmetric
+ * under.  fold4 drops the three +0.0f adds warp_sum_all_f32 performs on its
+ * zero lanes; that is exact ONLY because S_w is a sum of squares and can
+ * never be -0.0 -- do not reuse it on a signed sum.  The fmaxf group max is
+ * the same five levels in the same (own, partner) argument order.  Compared
+ * word for word against the kernel above on all-zero, denormal, 3e30 and
+ * +/-1.5 rows in /root/qwen/wgq/gq_bench.cu (0 of 6,291,456 bytes and 0 of
+ * 196,608 scales differ), and hashed in the engine.
+ *
+ * Grid (n_value_head / 4, n_tokens).  The caller keeps the kernel above for
+ * the decode widths, whose PDL trigger rests on that kernel's own
+ * "ninety-six blocks = one wave" argument; this grid is never asked for one.
+ * Requires n_value_head % 4 == 0 and 16-byte aligned out / output_gate; xq
+ * is 16-byte aligned by the (q_offset & 15u) == 0 gate of the prefill entry.
+ * output_norm is a GGUF slab offset with no alignment promise: scalar. */
+__global__ static void __launch_bounds__(32 * QWEN4EXP_GDN_OQ_WARPS)
+qwen4exp_gdn_output_quant_warp_kernel(
+        int8_t      *xq,
+        float       *xscale,
+        const float *out,
+        const float *output_gate,
+        const float *output_norm,
+        uint32_t     n_value_head,
+        uint32_t     n_tokens,
+        float        norm_eps) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t head = blockIdx.x * (uint32_t)QWEN4EXP_GDN_OQ_WARPS + warp;
+    const uint32_t token = blockIdx.y;
+    if (token >= n_tokens || head >= n_value_head) return;
+    const uint32_t value_dim = n_value_head * QWEN4EXP_GDN_DIM;
+    const uint64_t base = (uint64_t)token * value_dim +
+        head * QWEN4EXP_GDN_DIM;
+    const uint32_t c0 = lane * 4u;
+    const float4 r4 = *(const float4 *)(out + base + c0);
+    const float4 g4 = *(const float4 *)(output_gate + base + c0);
+    const float w0 = output_norm[c0];
+    const float w1 = output_norm[c0 + 1u];
+    const float w2 = output_norm[c0 + 2u];
+    const float w3 = output_norm[c0 + 3u];
+
+    float s0 = r4.x * r4.x, s1 = r4.y * r4.y;
+    float s2 = r4.z * r4.z, s3 = r4.w * r4.w;
+#pragma unroll
+    for (int off = 4; off > 0; off >>= 1) {
+        s0 += __shfl_xor_sync(0xffffffffu, s0, off);
+        s1 += __shfl_xor_sync(0xffffffffu, s1, off);
+        s2 += __shfl_xor_sync(0xffffffffu, s2, off);
+        s3 += __shfl_xor_sync(0xffffffffu, s3, off);
+    }
+    float total = qwen4exp_gdn_fold4(s0, s1, s2, s3);
+    total += __shfl_xor_sync(0xffffffffu, total, 16);
+    total += __shfl_xor_sync(0xffffffffu, total, 8);
+
+    const float scale = rsqrtf(total / (float)QWEN4EXP_GDN_DIM + norm_eps);
+    const float v0 = r4.x * scale * w0 * qwen4exp_gdn_sigmoid(g4.x);
+    const float v1 = r4.y * scale * w1 * qwen4exp_gdn_sigmoid(g4.y);
+    const float v2 = r4.z * scale * w2 * qwen4exp_gdn_sigmoid(g4.z);
+    const float v3 = r4.w * scale * w3 * qwen4exp_gdn_sigmoid(g4.w);
+
+    float a0 = qwen4exp_q8_ftz(fabsf(v0));
+    float a1 = qwen4exp_q8_ftz(fabsf(v1));
+    float a2 = qwen4exp_q8_ftz(fabsf(v2));
+    float a3 = qwen4exp_q8_ftz(fabsf(v3));
+#pragma unroll
+    for (int off = 4; off > 0; off >>= 1) {
+        a0 = fmaxf(a0, __shfl_xor_sync(0xffffffffu, a0, off));
+        a1 = fmaxf(a1, __shfl_xor_sync(0xffffffffu, a1, off));
+        a2 = fmaxf(a2, __shfl_xor_sync(0xffffffffu, a2, off));
+        a3 = fmaxf(a3, __shfl_xor_sync(0xffffffffu, a3, off));
+    }
+    const float a = fmaxf(fmaxf(a0, a2), fmaxf(a1, a3));
+
+    const float d = qwen4exp_q8_ftz(a * QWEN4EXP_Q8_RCP127);
+    const float id = d != 0.0f ? qwen4exp_q8_rcp_approx(d) : 0.0f;
+    const uint64_t pair0 = (uint64_t)token * (value_dim / 32u) + head * 4u;
+    if ((lane & 7u) == 0u) xscale[pair0 + (lane >> 3u)] = d;
+
+    char4 o;
+    int q;
+    q = (int)lrintf(qwen4exp_q8_ftz(qwen4exp_q8_ftz(v0) * id));
+    o.x = (signed char)(q > 127 ? 127 : (q < -128 ? -128 : q));
+    q = (int)lrintf(qwen4exp_q8_ftz(qwen4exp_q8_ftz(v1) * id));
+    o.y = (signed char)(q > 127 ? 127 : (q < -128 ? -128 : q));
+    q = (int)lrintf(qwen4exp_q8_ftz(qwen4exp_q8_ftz(v2) * id));
+    o.z = (signed char)(q > 127 ? 127 : (q < -128 ? -128 : q));
+    q = (int)lrintf(qwen4exp_q8_ftz(qwen4exp_q8_ftz(v3) * id));
+    o.w = (signed char)(q > 127 ? 127 : (q < -128 ? -128 : q));
+    *(char4 *)(xq + base + c0) = o;
 }
 
 /* hcNorm, then the Q8_0 row quantize the down projection wants, in one pass.
